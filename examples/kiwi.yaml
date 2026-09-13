@@ -1,0 +1,51 @@
+version: 1
+name: kiwi-self-test
+
+defaults:
+  shell: bash
+  timeout: 10m
+  retry:
+    max: 1
+    backoff: 1s
+
+env:
+  CGO_ENABLED: "0"
+
+concurrency:
+  group: "${{ repo }}:${{ branch }}"
+  cancel_in_progress: true
+
+jobs:
+  quality:
+    runtime: native
+    steps:
+      - name: format
+        run: test -z "$(gofmt -l .)"
+      - name: vet
+        run: go vet ./...
+
+  test:
+    needs: [quality]
+    matrix:
+      GO_VERSION: ["1.23"]
+    cache:
+      - name: go-modules
+        key: "go-modules-${{ matrix.GO_VERSION }}"
+        hash_files: [go.sum]
+        paths:
+          - .kiwi/go-cache
+    steps:
+      - name: test
+        run: go test ./...
+    artifacts:
+      - name: source-snapshot
+        if: failure()
+        paths: ["*.md"]
+
+  macos-vm-example:
+    if: "false"
+    runtime: tart
+    vm: ghcr.io/cirruslabs/macos-tahoe-base:latest
+    steps:
+      - name: verify-macos
+        run: sw_vers
