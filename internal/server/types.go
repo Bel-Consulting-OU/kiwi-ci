@@ -65,3 +65,19 @@ type Complete struct {
 	Outputs         map[string]string `json:"outputs,omitempty"`
 	Results         any               `json:"results,omitempty"`
 }
+
+// EnrollRequest asks the control plane to sign a runner's certificate
+// request. The caller authenticates with the enrollment token; CSR is the
+// PEM certificate request base64 (standard) encoded.
+type EnrollRequest struct {
+	RunnerID string `json:"runner_id"`
+	CSR      string `json:"csr"`
+}
+
+// EnrollResponse carries the freshly issued runner certificate, the CA
+// certificate that signed it, and the certificate lifetime.
+type EnrollResponse struct {
+	Certificate   string `json:"certificate"`
+	CACertificate string `json:"ca_certificate"`
+	TTLSeconds    int64  `json:"ttl_seconds"`
+}

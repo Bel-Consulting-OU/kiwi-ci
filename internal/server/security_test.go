@@ -72,7 +72,7 @@ func leaseJob(t *testing.T, c *testClient) (runID, jobID, runnerID, leaseToken s
 		t.Fatal(err)
 	}
 	runID = run.ID
-	w = c.do(http.MethodPost, "/api/v1/runners/register", map[string]any{"name": "r1", "capacity": 1, "labels": []string{"container"}}, nil)
+	w = c.do(http.MethodPost, "/api/v1/runners/register", map[string]any{"name": "r1", "capacity": 1, "labels": []string{"container"}, "protocol_min": 3, "protocol_max": 3}, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d %s", w.Code, w.Body.String())
 	}

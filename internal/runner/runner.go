@@ -3,7 +3,9 @@ package runner
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -24,6 +26,7 @@ import (
 	"github.com/kiwici/kiwi/internal/model"
 	"github.com/kiwici/kiwi/internal/pipeline"
 	"github.com/kiwici/kiwi/internal/policy"
+	"github.com/kiwici/kiwi/internal/runnerpki"
 	"github.com/kiwici/kiwi/internal/secrets"
 	"github.com/kiwici/kiwi/internal/server"
 	"github.com/kiwici/kiwi/internal/testintel"
@@ -34,7 +37,15 @@ const (
 	envAllowedSSHHosts    = "KIWI_GIT_ALLOWED_SSH_HOSTS"
 	envAllowedHTTPSHosts  = "KIWI_GIT_ALLOWED_HTTPS_HOSTS"
 	envRunnerAllowInsec   = "KIWI_RUNNER_ALLOW_INSECURE"
+	envRunnerRegion       = "KIWI_RUNNER_REGION"
+	// runnerProtocol is the runner API protocol version spoken by this
+	// runner; it must overlap the control plane's ProtocolMin/Max.
+	runnerProtocol = 3
 )
+
+// RunnerVersion is the software version reported at registration and can be
+// overridden at build time via -ldflags.
+var RunnerVersion = "dev"
 
 type Config struct {
 	Server, Token, Name string
@@ -42,6 +53,17 @@ type Config struct {
 	Poll                time.Duration
 	Heartbeat           time.Duration
 	Concurrency         int
+	// CACert, Cert and Key are PEM contents or file paths for the runner
+	// mTLS identity: CACert verifies the server, Cert/Key present the
+	// runner's client certificate. ServerName overrides the TLS server name
+	// (defaults to the server URL host).
+	CACert     string
+	Cert       string
+	Key        string
+	ServerName string
+	// EnrollToken bootstraps the mTLS identity: with a CA configured but no
+	// client certificate, the runner enrolls a fresh key with this token.
+	EnrollToken string
 }
 type Runner struct {
 	Cfg    Config
@@ -50,12 +72,6 @@ type Runner struct {
 }
 
 func (r *Runner) Run(ctx context.Context) error {
-	if r.Client == nil {
-		r.Client = &http.Client{Timeout: 65 * time.Second}
-	}
-	// Credential-bearing runner traffic must never follow redirects to a
-	// different origin.
-	r.Client = server.NoRedirectClient(r.Client)
 	if r.Cfg.Poll == 0 {
 		r.Cfg.Poll = 2 * time.Second
 	}
@@ -68,6 +84,22 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err := validateServerURL(r.Cfg.Server); err != nil {
 		return err
 	}
+	if r.ID == "" {
+		id, err := newRunnerID()
+		if err != nil {
+			return err
+		}
+		r.ID = id
+	}
+	if err := r.prepareClient(ctx); err != nil {
+		return err
+	}
+	if r.Client == nil {
+		r.Client = &http.Client{Timeout: 65 * time.Second}
+	}
+	// Credential-bearing runner traffic must never follow redirects to a
+	// different origin.
+	r.Client = server.NoRedirectClient(r.Client)
 	if err := r.register(ctx); err != nil {
 		return err
 	}
@@ -99,15 +131,27 @@ func (r *Runner) Run(ctx context.Context) error {
 func (r *Runner) register(ctx context.Context) error {
 	labels := append([]string{}, r.Cfg.Labels...)
 	labels = append(labels, "os:"+runtime.GOOS, "arch:"+runtime.GOARCH, "native")
+	capabilities := []string{"native"}
 	if _, err := exec.LookPath("docker"); err == nil {
 		labels = append(labels, "container")
+		capabilities = append(capabilities, "container")
 	}
 	if runtime.GOOS == "darwin" {
 		if _, err := exec.LookPath("tart"); err == nil {
 			labels = append(labels, "tart")
+			capabilities = append(capabilities, "tart")
 		}
 	}
-	in := model.Runner{ID: r.ID, Name: r.Cfg.Name, Labels: unique(labels), Metadata: map[string]string{"go": runtime.Version()}, Capacity: r.Cfg.Concurrency}
+	in := model.Runner{
+		ID: r.ID, Name: r.Cfg.Name, Labels: unique(labels),
+		Metadata:     map[string]string{"go": runtime.Version()},
+		Capacity:     r.Cfg.Concurrency,
+		ProtocolMin:  runnerProtocol,
+		ProtocolMax:  runnerProtocol,
+		Version:      RunnerVersion,
+		Region:       os.Getenv(envRunnerRegion),
+		Capabilities: capabilities,
+	}
 	var out model.Runner
 	if err := r.post(ctx, "/api/v1/runners/register", in, &out); err != nil {
 		return err
@@ -601,6 +645,128 @@ func (r *Runner) auth(req *http.Request) {
 	if r.Cfg.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+r.Cfg.Token)
 	}
+}
+
+// prepareClient builds the mTLS HTTP client when certificate material or an
+// enrollment token is configured. Without any of them the client stays nil
+// (plain HTTP dev mode). Certificate-bearing configurations require an https
+// server URL.
+func (r *Runner) prepareClient(ctx context.Context) error {
+	if r.Cfg.CACert == "" && r.Cfg.Cert == "" && r.Cfg.Key == "" && r.Cfg.EnrollToken == "" {
+		return nil
+	}
+	u, err := url.Parse(r.Cfg.Server)
+	if err != nil {
+		return fmt.Errorf("invalid server URL %q: %w", r.Cfg.Server, err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("runner certificates require an https server URL, got %q", r.Cfg.Server)
+	}
+	caPEM, err := loadPEM(r.Cfg.CACert)
+	if err != nil {
+		return fmt.Errorf("runner CA certificate: %w", err)
+	}
+	certPEM, err := loadPEM(r.Cfg.Cert)
+	if err != nil {
+		return fmt.Errorf("runner certificate: %w", err)
+	}
+	keyPEM, err := loadPEM(r.Cfg.Key)
+	if err != nil {
+		return fmt.Errorf("runner key: %w", err)
+	}
+	if (len(certPEM) == 0) != (len(keyPEM) == 0) {
+		return fmt.Errorf("runner certificate and key must be provided together")
+	}
+	if len(certPEM) == 0 && r.Cfg.EnrollToken != "" {
+		// Ephemeral bootstrap: mint a fresh key, enroll it with the
+		// enrollment token, and use the returned certificate for all
+		// subsequent requests. The identity is per-process and stateless.
+		newKey, csrPEM, err := runnerpki.GenerateKeyAndCSR(r.ID)
+		if err != nil {
+			return fmt.Errorf("generate enrollment key: %w", err)
+		}
+		keyPEM = newKey
+		enc, err := r.enroll(ctx, caPEM, csrPEM)
+		if err != nil {
+			return err
+		}
+		certPEM = []byte(enc.Certificate)
+		if len(caPEM) == 0 {
+			caPEM = []byte(enc.CACertificate)
+		}
+	}
+	tlsConf, err := runnerpki.TLSClientConfig(certPEM, keyPEM, caPEM, r.serverName())
+	if err != nil {
+		return err
+	}
+	r.Client = &http.Client{Timeout: 65 * time.Second, Transport: &http.Transport{TLSClientConfig: tlsConf}}
+	return nil
+}
+
+// enroll requests a runner certificate for r.ID in exchange for the
+// enrollment token, using a client that only trusts caPEM.
+func (r *Runner) enroll(ctx context.Context, caPEM, csrPEM []byte) (*server.EnrollResponse, error) {
+	if r.Cfg.EnrollToken == "" {
+		return nil, fmt.Errorf("runner enrollment token is empty")
+	}
+	tlsConf, err := runnerpki.TLSClientConfig(nil, nil, caPEM, r.serverName())
+	if err != nil {
+		return nil, err
+	}
+	client := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{TLSClientConfig: tlsConf}}
+	b, _ := json.Marshal(server.EnrollRequest{RunnerID: r.ID, CSR: base64.StdEncoding.EncodeToString(csrPEM)})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.Cfg.Server+"/api/v1/runners/enroll", bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+r.Cfg.EnrollToken)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("enroll: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		bb, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("enroll: %s: %s", resp.Status, bb)
+	}
+	var out server.EnrollResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (r *Runner) serverName() string {
+	if r.Cfg.ServerName != "" {
+		return r.Cfg.ServerName
+	}
+	if u, err := url.Parse(r.Cfg.Server); err == nil {
+		return u.Hostname()
+	}
+	return ""
+}
+
+// loadPEM accepts PEM contents directly or a path to a PEM file.
+func loadPEM(v string) ([]byte, error) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return nil, nil
+	}
+	if strings.Contains(v, "-----BEGIN") {
+		return []byte(v), nil
+	}
+	return os.ReadFile(v)
+}
+
+// newRunnerID returns a 128-bit crypto/rand identifier hex-encoded. The
+// runner generates its own stable-per-process identity for enrollment.
+func newRunnerID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 // validateServerURL rejects plaintext-HTTP control-plane URLs that are not

@@ -25,6 +25,9 @@ func Server(ctx context.Context, args []string) error {
 	externalURL := fs.String("external-url", os.Getenv("KIWI_EXTERNAL_URL"), "public base URL (required for OIDC)")
 	tlsCert := fs.String("tls-cert", "", "TLS certificate file (enables HTTPS)")
 	tlsKey := fs.String("tls-key", "", "TLS private key file")
+	runnerCACert := fs.String("runner-ca-cert", "", "runner CA certificate PEM (enables runner certificate enrollment)")
+	runnerCAKey := fs.String("runner-ca-key", "", "runner CA private key PEM")
+	runnerEnrollToken := fs.String("runner-enroll-token", os.Getenv("KIWI_RUNNER_ENROLL_TOKEN"), "token authorizing runner certificate enrollment")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -51,6 +54,22 @@ func Server(ctx context.Context, args []string) error {
 	srv.GitHubToken = *githubToken
 	srv.PipelinePath = *pipelinePath
 	srv.ExternalURL = *externalURL
+	srv.RunnerEnrollToken = *runnerEnrollToken
+	if *runnerCACert != "" || *runnerCAKey != "" {
+		if *runnerCACert == "" || *runnerCAKey == "" {
+			return fmt.Errorf("--runner-ca-cert and --runner-ca-key must be set together")
+		}
+		if err := srv.SetRunnerCA(*runnerCACert, *runnerCAKey); err != nil {
+			return err
+		}
+	} else if *runnerEnrollToken != "" {
+		if *dataDir == "" {
+			return fmt.Errorf("runner enrollment requires --data-dir (to persist the runner CA) or explicit --runner-ca-cert/--runner-ca-key")
+		}
+		if err := srv.EnsureRunnerCA(*dataDir); err != nil {
+			return err
+		}
+	}
 	h := &http.Server{
 		Addr:              *listen,
 		Handler:           srv.Handler(),
@@ -89,12 +108,33 @@ func Runner(ctx context.Context, args []string) error {
 	token := fs.String("token", os.Getenv("KIWI_RUNNER_TOKEN"), "runner token")
 	name := fs.String("name", "", "runner name")
 	labels := fs.String("labels", "", "comma-separated labels")
+	runnerCACert := fs.String("runner-ca-cert", "", "CA certificate PEM used to verify the server (path or contents)")
+	runnerCert := fs.String("runner-cert", "", "runner client certificate PEM (path or contents)")
+	runnerKey := fs.String("runner-key", "", "runner client private key PEM (path or contents)")
+	runnerEnrollToken := fs.String("runner-enroll-token", os.Getenv("KIWI_RUNNER_ENROLL_TOKEN"), "enrollment token to obtain a runner certificate")
+	runnerMTLS := fs.Bool("runner-mtls", false, "require mTLS (explicit client certificate or enrollment)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg := runner.Config{Server: strings.TrimRight(*url, "/"), Token: *token, Name: *name}
+	cfg := runner.Config{
+		Server:      strings.TrimRight(*url, "/"),
+		Token:       *token,
+		Name:        *name,
+		CACert:      *runnerCACert,
+		Cert:        *runnerCert,
+		Key:         *runnerKey,
+		EnrollToken: *runnerEnrollToken,
+	}
 	if *labels != "" {
 		cfg.Labels = strings.Split(*labels, ",")
+	}
+	if *runnerMTLS {
+		if (cfg.Cert == "") != (cfg.Key == "") {
+			return fmt.Errorf("--runner-cert and --runner-key must be set together")
+		}
+		if cfg.Cert == "" && cfg.Key == "" && cfg.EnrollToken == "" {
+			return fmt.Errorf("--runner-mtls requires --runner-cert/--runner-key or --runner-enroll-token")
+		}
 	}
 	return (&runner.Runner{Cfg: cfg}).Run(ctx)
 }

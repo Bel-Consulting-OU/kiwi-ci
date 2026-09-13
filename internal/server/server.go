@@ -25,6 +25,7 @@ import (
 	"github.com/kiwici/kiwi/internal/model"
 	"github.com/kiwici/kiwi/internal/pipeline"
 	"github.com/kiwici/kiwi/internal/policy"
+	"github.com/kiwici/kiwi/internal/runnerpki"
 	"github.com/kiwici/kiwi/internal/secretbroker"
 	"github.com/kiwici/kiwi/internal/storage"
 )
@@ -53,6 +54,14 @@ type Server struct {
 	// SecretBroker resolves declared secrets for trusted jobs holding an
 	// active lease. A nil broker disables the secrets endpoint (503).
 	SecretBroker secretbroker.Broker
+
+	// RunnerCA signs runner client certificates for enrollment and mTLS
+	// identity binding. Nil disables runner certificate enrollment and
+	// binding (bearer-token mode).
+	RunnerCA *runnerpki.CA
+	// RunnerEnrollToken authorizes POST /api/v1/runners/enroll. Empty
+	// disables the endpoint.
+	RunnerEnrollToken string
 
 	mu          sync.Mutex
 	runs        map[string]model.Run
@@ -151,6 +160,9 @@ func NewPersistent(runnerToken, adminToken, dataDir string) (*Server, error) {
 		return nil, err
 	}
 	s.leaseKey = key
+	if err := s.loadRunnerCA(dataDir); err != nil {
+		return nil, err
+	}
 	snap, err := s.store.Load()
 	if err != nil {
 		return nil, err
@@ -240,6 +252,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/jobs/{id}/log", s.log)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/complete", s.complete)
 	mux.HandleFunc("POST /api/v1/runners/register", s.register)
+	mux.HandleFunc("POST /api/v1/runners/enroll", s.enroll)
 	mux.HandleFunc("POST /api/v1/runners/{id}/next", s.next)
 	mux.HandleFunc("GET /api/v1/runners", s.listRunners)
 	mux.HandleFunc("GET /api/v1/audit", s.listAudit)
@@ -250,6 +263,21 @@ func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		if strings.HasPrefix(path, "/hooks/") || path == "/" || path == "/.well-known/openid-configuration" || path == "/api/v1/oidc/jwks" || (r.Method == http.MethodPost && strings.HasSuffix(path, "/oidc")) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// Runner enrollment authenticates with the enrollment token instead
+		// of the runner token; the certificate it returns is what the runner
+		// uses for everything after.
+		if path == "/api/v1/runners/enroll" && r.Method == http.MethodPost {
+			if s.RunnerEnrollToken == "" || s.RunnerCA == nil {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			if !bearerOK(r.Header.Get("Authorization"), s.RunnerEnrollToken) && !bearerOK(r.Header.Get("X-Kiwi-Enroll-Token"), s.RunnerEnrollToken) {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -537,6 +565,36 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
+	// The runner API protocol is mandatory: runners that cannot declare a
+	// version range are rejected rather than silently bound to an old
+	// contract.
+	if in.ProtocolMin == 0 && in.ProtocolMax == 0 {
+		http.Error(w, "protocol version required", http.StatusBadRequest)
+		return
+	}
+	if in.ProtocolMax < ProtocolMin || in.ProtocolMin > ProtocolMax {
+		http.Error(w, "unsupported protocol version", http.StatusBadRequest)
+		return
+	}
+	if in.ProtocolMin < ProtocolMin {
+		in.ProtocolMin = ProtocolMin
+	}
+	if in.ProtocolMax > ProtocolMax {
+		in.ProtocolMax = ProtocolMax
+	}
+	// With runner mTLS enabled the TLS peer certificate is the identity: it
+	// must match the claimed ID (an empty ID adopts the certificate
+	// identity). Without mTLS the bearer token authenticated by auth() is
+	// the identity.
+	if err := s.bindRunnerIdentity(r, in.ID); err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+	if in.ID == "" && s.RunnerCA != nil {
+		if peerID, err := s.peerRunnerID(r); err == nil {
+			in.ID = peerID
+		}
+	}
 	if in.ID == "" {
 		id, err := newID()
 		if err != nil {
@@ -590,6 +648,10 @@ func (s *Server) listRunners(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if !s.verifyRunnerIdentity(r, id) {
+		http.Error(w, "runner identity mismatch", http.StatusForbidden)
+		return
+	}
 	now := time.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -684,6 +746,10 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
+	if !s.verifyRunnerIdentity(r, in.RunnerID) {
+		http.Error(w, "runner identity mismatch", http.StatusForbidden)
+		return
+	}
 	now := time.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -719,6 +785,10 @@ func (s *Server) log(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(in.Step) > 128 || len(in.Line) > 1<<20 || len(in.JobKey) > 512 {
 		http.Error(w, "log line exceeds size limits", http.StatusBadRequest)
+		return
+	}
+	if !s.verifyRunnerIdentity(r, in.RunnerID) {
+		http.Error(w, "runner identity mismatch", http.StatusForbidden)
 		return
 	}
 	now := time.Now().UTC()
@@ -757,6 +827,10 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(in.Error) > 64<<10 {
 		http.Error(w, "error message exceeds 64 KiB", http.StatusBadRequest)
+		return
+	}
+	if !s.verifyRunnerIdentity(r, in.RunnerID) {
+		http.Error(w, "runner identity mismatch", http.StatusForbidden)
 		return
 	}
 	hash, err := completionResultHash(in.Status, in.Error, in.Outputs)

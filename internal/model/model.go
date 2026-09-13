@@ -104,6 +104,26 @@ type Runner struct {
 	ActiveJobs []string          `json:"active_jobs,omitempty"`
 	CurrentJob string            `json:"current_job,omitempty"`
 	Busy       bool              `json:"busy"`
+
+	// Admission control.
+	Disabled bool `json:"disabled,omitempty"`
+	Draining bool `json:"draining,omitempty"`
+
+	// Descriptive and protocol metadata reported at registration.
+	Region              string   `json:"region,omitempty"`
+	Version             string   `json:"version,omitempty"`
+	ProtocolMin         int      `json:"protocol_min,omitempty"`
+	ProtocolMax         int      `json:"protocol_max,omitempty"`
+	Capabilities        []string `json:"capabilities,omitempty"`
+	AllowedRepositories []string `json:"allowed_repositories,omitempty"`
+
+	// Cost accounting.
+	CostPerHour float64 `json:"cost_per_hour,omitempty"`
+	PowerWatts  float64 `json:"power_watts,omitempty"`
+
+	// Runner certificate state.
+	CertSerial string     `json:"cert_serial,omitempty"`
+	RevokedAt  *time.Time `json:"revoked_at,omitempty"`
 }
 
 type ArtifactRecord struct {
