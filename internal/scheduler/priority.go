@@ -1,8 +1,8 @@
 package scheduler
 
 import (
-	"github.com/kiwici/kiwi/internal/model"
-	"github.com/kiwici/kiwi/internal/pipeline"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
 // DownstreamDepth returns the longest chain of jobs that (transitively) need

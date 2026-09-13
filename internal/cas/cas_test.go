@@ -8,7 +8,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/kiwici/kiwi/internal/blob"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/blob"
 )
 
 func TestCASPutOpen(t *testing.T) {

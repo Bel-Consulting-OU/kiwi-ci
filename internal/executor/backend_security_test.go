@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kiwici/kiwi/internal/pipeline"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
 // TestServiceNetworkInternalFlag asserts the pure args builder adds --internal

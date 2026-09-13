@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kiwici/kiwi/internal/forge"
-	"github.com/kiwici/kiwi/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/forge"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
 // publishGitHubStatus mirrors run state to the forge via the durable

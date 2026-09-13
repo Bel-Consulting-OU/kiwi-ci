@@ -9,7 +9,7 @@ import (
 	"runtime"
 	"syscall"
 
-	"github.com/kiwici/kiwi/internal/app"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/app"
 )
 
 const version = "0.1.0-dev"

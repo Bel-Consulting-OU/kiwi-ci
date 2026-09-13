@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kiwici/kiwi/internal/provenance"
-	"github.com/kiwici/kiwi/internal/server"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/provenance"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
 )
 
 // VerifyArtifact downloads an artifact and its DSSE provenance, verifies the

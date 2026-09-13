@@ -23,14 +23,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kiwici/kiwi/internal/auth"
-	"github.com/kiwici/kiwi/internal/model"
-	"github.com/kiwici/kiwi/internal/pipeline"
-	"github.com/kiwici/kiwi/internal/policy"
-	"github.com/kiwici/kiwi/internal/runnerpki"
-	"github.com/kiwici/kiwi/internal/scheduler"
-	"github.com/kiwici/kiwi/internal/secretbroker"
-	"github.com/kiwici/kiwi/internal/storage"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runnerpki"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/scheduler"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secretbroker"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 const (

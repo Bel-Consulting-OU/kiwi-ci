@@ -15,9 +15,9 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/kiwici/kiwi/internal/model"
-	"github.com/kiwici/kiwi/internal/pipeline"
-	"github.com/kiwici/kiwi/internal/storage/migrations"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage/migrations"
 )
 
 // PostgresStore is the durable SQL implementation of Store, backed by a

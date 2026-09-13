@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/kiwici/kiwi/internal/pipeline"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
 func mustParse(t *testing.T, y string) *pipeline.Spec {

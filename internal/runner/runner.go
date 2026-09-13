@@ -19,17 +19,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kiwici/kiwi/internal/artifact"
-	"github.com/kiwici/kiwi/internal/cache"
-	"github.com/kiwici/kiwi/internal/executor"
-	"github.com/kiwici/kiwi/internal/logging"
-	"github.com/kiwici/kiwi/internal/model"
-	"github.com/kiwici/kiwi/internal/pipeline"
-	"github.com/kiwici/kiwi/internal/policy"
-	"github.com/kiwici/kiwi/internal/runnerpki"
-	"github.com/kiwici/kiwi/internal/secrets"
-	"github.com/kiwici/kiwi/internal/server"
-	"github.com/kiwici/kiwi/internal/testintel"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/artifact"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cache"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executor"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/logging"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runnerpki"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secrets"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/testintel"
 )
 
 const (

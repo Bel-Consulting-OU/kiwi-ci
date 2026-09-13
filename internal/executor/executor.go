@@ -11,12 +11,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kiwici/kiwi/internal/artifact"
-	"github.com/kiwici/kiwi/internal/cache"
-	"github.com/kiwici/kiwi/internal/logging"
-	"github.com/kiwici/kiwi/internal/model"
-	"github.com/kiwici/kiwi/internal/pipeline"
-	"github.com/kiwici/kiwi/internal/secrets"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/artifact"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cache"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/logging"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secrets"
 )
 
 type Options struct {

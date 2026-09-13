@@ -1,8 +1,8 @@
 package scheduler
 
 import (
-	"github.com/kiwici/kiwi/internal/model"
-	"github.com/kiwici/kiwi/internal/pipeline"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
 // DependencyOutcome evaluates a job's dependency set: whether every upstream

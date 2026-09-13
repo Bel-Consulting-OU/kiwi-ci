@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kiwici/kiwi/internal/secrets"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secrets"
 )
 
 type Sink interface{ WriteLine(job, step, line string) }

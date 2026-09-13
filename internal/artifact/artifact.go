@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kiwici/kiwi/internal/safefs"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/safefs"
 )
 
 type Store struct {

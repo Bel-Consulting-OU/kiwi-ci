@@ -6,9 +6,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/kiwici/kiwi/internal/pipeline"
-	"github.com/kiwici/kiwi/internal/secretbroker"
-	"github.com/kiwici/kiwi/internal/storage"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secretbroker"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 // SecretRequest asks the control plane to deliver one declared secret value

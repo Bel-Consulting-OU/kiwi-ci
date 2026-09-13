@@ -1,6 +1,6 @@
 package scheduler
 
-import "github.com/kiwici/kiwi/internal/model"
+import "github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 
 // EnvironmentAtCapacity reports whether a candidate job's environment has
 // reached its concurrency limit: it counts other running jobs targeting the

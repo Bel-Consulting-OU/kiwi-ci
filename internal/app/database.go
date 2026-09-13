@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/kiwici/kiwi/internal/storage"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 // DatabaseMigrate applies pending schema migrations to the PostgreSQL

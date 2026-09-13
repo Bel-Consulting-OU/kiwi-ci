@@ -1,4 +1,4 @@
-module github.com/kiwici/kiwi
+module github.com/Bel-Consulting-OU/kiwi-ci
 
 go 1.23
 

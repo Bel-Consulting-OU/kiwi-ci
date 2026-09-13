@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kiwici/kiwi/internal/model"
-	"github.com/kiwici/kiwi/internal/secretbroker"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secretbroker"
 )
 
 // seedJob inserts a running job holding a valid lease directly into the

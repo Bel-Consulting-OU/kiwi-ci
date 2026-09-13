@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kiwici/kiwi/internal/forge"
-	"github.com/kiwici/kiwi/internal/storage"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/forge"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 const (

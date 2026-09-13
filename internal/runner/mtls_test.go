@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kiwici/kiwi/internal/runnerpki"
-	"github.com/kiwici/kiwi/internal/server"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runnerpki"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
 )
 
 func selfSignedServerCert(t *testing.T) (certPEM, keyPEM []byte) {

@@ -1,7 +1,7 @@
 package policy
 
 import (
-	"github.com/kiwici/kiwi/internal/pipeline"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
 // NetworkCapability is the strongest egress mode a capability set permits.

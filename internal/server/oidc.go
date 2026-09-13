@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kiwici/kiwi/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
 type oidcSigner struct {

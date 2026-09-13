@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kiwici/kiwi/internal/model"
-	"github.com/kiwici/kiwi/internal/pipeline"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
 // TestReadFileNoFollowDirect verifies the native ReadFile refuses a symlink

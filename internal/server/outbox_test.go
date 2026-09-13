@@ -6,8 +6,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/kiwici/kiwi/internal/forge"
-	"github.com/kiwici/kiwi/internal/storage"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/forge"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 func testOutboxItem(t *testing.T, kind, payload string) forge.OutboxItem {

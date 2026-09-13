@@ -5,8 +5,8 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/kiwici/kiwi/internal/forge"
-	"github.com/kiwici/kiwi/internal/pipeline"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/forge"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
 func (s *Server) gitLabForge() *forge.GitLab {

@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kiwici/kiwi/internal/server"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
 )
 
 func TestHeartbeatTick(t *testing.T) {

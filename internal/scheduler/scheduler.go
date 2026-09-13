@@ -19,8 +19,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/kiwici/kiwi/internal/model"
-	"github.com/kiwici/kiwi/internal/storage"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 // ErrNotLeader is returned by leader-only operations when this instance does

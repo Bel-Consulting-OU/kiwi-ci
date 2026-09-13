@@ -13,11 +13,11 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/kiwici/kiwi/internal/executor"
-	"github.com/kiwici/kiwi/internal/logging"
-	"github.com/kiwici/kiwi/internal/model"
-	"github.com/kiwici/kiwi/internal/pipeline"
-	"github.com/kiwici/kiwi/internal/secrets"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executor"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/logging"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secrets"
 )
 
 func pipelineFlag(fs *flag.FlagSet) *string {

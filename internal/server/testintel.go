@@ -7,8 +7,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/kiwici/kiwi/internal/model"
-	"github.com/kiwici/kiwi/internal/storage"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {

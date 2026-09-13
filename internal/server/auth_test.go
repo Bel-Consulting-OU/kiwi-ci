@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kiwici/kiwi/internal/auth"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
 )
 
 const approvalPipeline = `version: 1

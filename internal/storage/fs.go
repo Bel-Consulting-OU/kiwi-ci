@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kiwici/kiwi/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
 // Snapshot is the durable control-plane state. The filesystem implementation is

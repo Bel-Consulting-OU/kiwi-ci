@@ -16,10 +16,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kiwici/kiwi/internal/model"
-	"github.com/kiwici/kiwi/internal/pipeline"
-	"github.com/kiwici/kiwi/internal/provenance"
-	"github.com/kiwici/kiwi/internal/storage"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/provenance"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 const maxBlobBytes int64 = 8 << 30 // 8 GiB hard safety limit for the built-in store.

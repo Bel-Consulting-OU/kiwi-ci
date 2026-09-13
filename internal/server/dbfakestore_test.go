@@ -5,8 +5,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kiwici/kiwi/internal/model"
-	"github.com/kiwici/kiwi/internal/storage"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 // dbFakeStore is a compact behavioral storage.Store for DB-mode server

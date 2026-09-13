@@ -13,7 +13,7 @@ import (
 	"path"
 	"strings"
 
-	"github.com/kiwici/kiwi/internal/pipeline"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
 // Repository is the minimal forge repository coordinate needed by the

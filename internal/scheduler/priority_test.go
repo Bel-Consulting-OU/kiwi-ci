@@ -3,8 +3,8 @@ package scheduler
 import (
 	"testing"
 
-	"github.com/kiwici/kiwi/internal/model"
-	"github.com/kiwici/kiwi/internal/pipeline"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
 func TestDownstreamDepth(t *testing.T) {

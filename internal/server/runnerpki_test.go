@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kiwici/kiwi/internal/runnerpki"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runnerpki"
 )
 
 // pkiRequest serves one request against the handler, optionally carrying a

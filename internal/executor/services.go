@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kiwici/kiwi/internal/pipeline"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
 // serviceNetworkArgs builds the `docker network create` arguments for the

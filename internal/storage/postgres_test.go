@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kiwici/kiwi/internal/model"
-	"github.com/kiwici/kiwi/internal/storage/migrations"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage/migrations"
 )
 
 // requiredTables are the 22 tables audit item 5 mandates in 0001_init.sql.

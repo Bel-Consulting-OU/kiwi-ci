@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/kiwici/kiwi/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
 type Suite struct {

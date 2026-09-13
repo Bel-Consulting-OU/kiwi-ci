@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kiwici/kiwi/internal/runner"
-	"github.com/kiwici/kiwi/internal/server"
-	"github.com/kiwici/kiwi/internal/storage"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runner"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 // productionConfig is the pure input to validateProductionConfig, extracted

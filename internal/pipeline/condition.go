@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/kiwici/kiwi/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
 type EvalContext struct {

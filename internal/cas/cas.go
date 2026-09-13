@@ -10,7 +10,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/kiwici/kiwi/internal/blob"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/blob"
 )
 
 type CAS struct {
