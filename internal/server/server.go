@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kiwici/kiwi/internal/auth"
 	"github.com/kiwici/kiwi/internal/model"
 	"github.com/kiwici/kiwi/internal/pipeline"
 	"github.com/kiwici/kiwi/internal/policy"
@@ -63,6 +64,13 @@ type Server struct {
 	// disables the endpoint.
 	RunnerEnrollToken string
 
+	// AuthStore maps hashed bearer tokens to principals for admin/API
+	// authorization. An empty store keeps legacy AdminToken/RunnerToken
+	// mode. AuthFile is the JSON token-store path for persistent
+	// deployments; callers load it into AuthStore after construction.
+	AuthStore *auth.TokenStore
+	AuthFile  string
+
 	mu          sync.Mutex
 	runs        map[string]model.Run
 	jobs        map[string]model.Job
@@ -95,7 +103,8 @@ func New(token string) *Server {
 		Token: token, RunnerToken: token, AdminToken: token,
 		LeaseDuration: defaultLeaseDuration,
 		runs:          map[string]model.Run{}, jobs: map[string]model.Job{}, runners: map[string]model.Runner{}, artifacts: map[string]model.ArtifactRecord{}, reports: map[string]model.TestReport{}, deliveries: map[string]string{}, completions: map[string]model.CompletionReceipt{}, leaseKey: key, oidc: newOIDCSigner(),
-		outbox: NewOutbox(nil),
+		outbox:    NewOutbox(nil),
+		AuthStore: auth.NewTokenStore(),
 	}
 }
 
@@ -256,7 +265,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/runners/{id}/next", s.next)
 	mux.HandleFunc("GET /api/v1/runners", s.listRunners)
 	mux.HandleFunc("GET /api/v1/audit", s.listAudit)
-	return requestID(recoverer(statusLogger(s.auth(mux))))
+	// The auth middleware runs inside statusLogger/recoverer and outside
+	// s.auth so authenticated principals are available to handlers; s.auth
+	// keeps the legacy bearer checks and classifies routes.
+	return requestID(recoverer(statusLogger(auth.Middleware(s.AuthStore, s.AdminToken, s.auth(mux), log.Printf))))
 }
 
 func (s *Server) auth(next http.Handler) http.Handler {
@@ -291,16 +303,86 @@ func (s *Server) auth(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		want := s.AdminToken
 		if runnerOnly {
-			want = s.RunnerToken
-		}
-		if want != "" && !bearerOK(r.Header.Get("Authorization"), want) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			if s.RunnerToken != "" && !bearerOK(r.Header.Get("Authorization"), s.RunnerToken) {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			next.ServeHTTP(w, r)
 			return
+		}
+		// Admin-tier routes: the AdminToken bearer, a store principal with
+		// the admin role, or any authenticated store principal on the RBAC
+		// action routes (per-action roles are enforced in the handlers via
+		// requireAction). Nothing configured is the legacy open mode.
+		if !s.adminOK(r) {
+			if s.AdminToken == "" && (s.AuthStore == nil || s.AuthStore.Empty()) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if !rbacActionRoute(r) {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			if _, ok := auth.PrincipalFrom(r); !ok {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// adminOK authorizes admin-tier routes: the AdminToken bearer or a store
+// principal holding the admin role.
+func (s *Server) adminOK(r *http.Request) bool {
+	if s.AdminToken != "" && bearerOK(r.Header.Get("Authorization"), s.AdminToken) {
+		return true
+	}
+	p, ok := auth.PrincipalFrom(r)
+	return ok && p.Has(auth.RoleAdmin)
+}
+
+// rbacActionRoute identifies the admin API routes whose permissions are
+// enforced per action by requireAction rather than by the admin-only gate.
+func rbacActionRoute(r *http.Request) bool {
+	switch {
+	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/runs":
+		return true
+	case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/approve"):
+		return true
+	case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/cancel"):
+		return true
+	case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/rerun"):
+		return true
+	}
+	return false
+}
+
+// requireAction enforces the per-action RBAC decision for authenticated
+// store principals. Requests without a principal are legacy mode: no admin
+// token and no store tokens are configured, so auth() gates nothing and
+// there is no identity to authorize against.
+func (s *Server) requireAction(w http.ResponseWriter, r *http.Request, action auth.Action, repo string, trusted bool) bool {
+	p, ok := auth.PrincipalFrom(r)
+	if !ok {
+		return true
+	}
+	if auth.Authorize(p, action, repo, trusted) {
+		return true
+	}
+	http.Error(w, "forbidden", http.StatusForbidden)
+	return false
+}
+
+// actorFrom returns the audit actor for admin actions: the authenticated
+// principal's subject. "api" is kept only for unauthenticated legacy mode
+// where no principal exists; the X-Kiwi-Actor header is not trusted.
+func actorFrom(r *http.Request) string {
+	if p, ok := auth.PrincipalFrom(r); ok && p.Subject != "" {
+		return p.Subject
+	}
+	return "api"
 }
 
 func bearerOK(header, want string) bool {
@@ -314,6 +396,9 @@ func bearerOK(header, want string) bool {
 func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	var in SubmitRun
 	if !decode(w, r, &in) {
+		return
+	}
+	if !s.requireAction(w, r, auth.ActionRun, in.RepoURL, false) {
 		return
 	}
 	// Direct API submissions are never trusted; only the forge webhook path
@@ -954,13 +1039,20 @@ func (s *Server) validActiveLease(j model.Job, runnerID, token string, generatio
 
 func (s *Server) approveJob(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("id")
-	actor := strings.TrimSpace(r.Header.Get("X-Kiwi-Actor"))
-	if actor == "" {
-		actor = "api"
+	actor := actorFrom(r)
+	s.mu.Lock()
+	j, ok := s.jobs[jobID]
+	s.mu.Unlock()
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	if !s.requireAction(w, r, auth.ActionApprove, j.RepoURL, false) {
+		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	j, ok := s.jobs[jobID]
+	j, ok = s.jobs[jobID]
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -1003,6 +1095,9 @@ func (s *Server) rerunRun(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if !s.requireAction(w, r, auth.ActionRerun, old.Repo, false) {
+		return
+	}
 	meta := cloneMap(old.Metadata)
 	if meta == nil {
 		meta = map[string]string{}
@@ -1023,9 +1118,16 @@ func (s *Server) rerunRun(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	actor := strings.TrimSpace(r.Header.Get("X-Kiwi-Actor"))
-	if actor == "" {
-		actor = "api"
+	actor := actorFrom(r)
+	s.mu.Lock()
+	run, ok := s.runs[id]
+	s.mu.Unlock()
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	if !s.requireAction(w, r, auth.ActionCancel, run.Repo, false) {
+		return
 	}
 	s.mu.Lock()
 	if _, ok := s.runs[id]; !ok {
@@ -1034,7 +1136,7 @@ func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.cancelRunLocked(id, "cancelled by "+actor, actor)
-	run := s.runs[id]
+	run = s.runs[id]
 	_ = s.persistLocked()
 	s.mu.Unlock()
 	s.publishGitHubStatus(run)
