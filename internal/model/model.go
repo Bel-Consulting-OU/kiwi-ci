@@ -45,39 +45,44 @@ type Run struct {
 // carries the pipeline text so a restarted control plane and its runners can
 // recompile deterministically without an external store.
 type Job struct {
-	ID                     string                       `json:"id"`
-	RunID                  string                       `json:"run_id"`
-	Key                    string                       `json:"key"`
-	BaseKey                string                       `json:"base_key,omitempty"`
-	RepoURL                string                       `json:"repo_url"`
-	Ref                    string                       `json:"ref,omitempty"`
-	SHA                    string                       `json:"sha,omitempty"`
-	Event                  string                       `json:"event,omitempty"`
-	Condition              string                       `json:"condition,omitempty"`
-	DependencyStatus       Status                       `json:"dependency_status"`
-	Pipeline               string                       `json:"pipeline"`
-	Trusted                bool                         `json:"trusted"`
-	ChangedFiles           []string                     `json:"changed_files,omitempty"`
-	Needs                  []string                     `json:"needs,omitempty"`
-	RequiredLabels         []string                     `json:"required_labels,omitempty"`
-	Network                string                       `json:"network,omitempty"`
-	Environment            string                       `json:"environment,omitempty"`
-	ApprovalRequired       bool                         `json:"approval_required,omitempty"`
-	EnvironmentBranches    []string                     `json:"environment_branches,omitempty"`
-	EnvironmentConcurrency int                          `json:"environment_concurrency,omitempty"`
-	OIDCAllowed            bool                         `json:"oidc_allowed,omitempty"`
-	OIDCAudiences          []string                     `json:"oidc_audiences,omitempty"`
-	Status                 Status                       `json:"status"`
-	Priority               int                          `json:"priority,omitempty"`
-	MaxInfraRetries        int                          `json:"max_infra_retries,omitempty"`
-	CreatedAt              time.Time                    `json:"created_at"`
-	StartedAt              *time.Time                   `json:"started_at,omitempty"`
-	FinishedAt             *time.Time                   `json:"finished_at,omitempty"`
-	Error                  string                       `json:"error,omitempty"`
-	Outputs                map[string]string            `json:"outputs,omitempty"`
-	NeedsOutputs           map[string]map[string]string `json:"needs_outputs,omitempty"`
-	Attempts               int                          `json:"attempts"`
-	LeaseRunnerID          string                       `json:"lease_runner_id,omitempty"`
+	ID                     string   `json:"id"`
+	RunID                  string   `json:"run_id"`
+	Key                    string   `json:"key"`
+	BaseKey                string   `json:"base_key,omitempty"`
+	RepoURL                string   `json:"repo_url"`
+	Ref                    string   `json:"ref,omitempty"`
+	SHA                    string   `json:"sha,omitempty"`
+	Event                  string   `json:"event,omitempty"`
+	Condition              string   `json:"condition,omitempty"`
+	DependencyStatus       Status   `json:"dependency_status"`
+	Pipeline               string   `json:"pipeline"`
+	Trusted                bool     `json:"trusted"`
+	ChangedFiles           []string `json:"changed_files,omitempty"`
+	Needs                  []string `json:"needs,omitempty"`
+	RequiredLabels         []string `json:"required_labels,omitempty"`
+	Network                string   `json:"network,omitempty"`
+	Environment            string   `json:"environment,omitempty"`
+	ApprovalRequired       bool     `json:"approval_required,omitempty"`
+	EnvironmentBranches    []string `json:"environment_branches,omitempty"`
+	EnvironmentConcurrency int      `json:"environment_concurrency,omitempty"`
+	OIDCAllowed            bool     `json:"oidc_allowed,omitempty"`
+	OIDCAudiences          []string `json:"oidc_audiences,omitempty"`
+	// DeclaredSecrets is the deduplicated union of the run's global secrets
+	// and every step secret of this job, compiled at enqueue time. It is the
+	// per-step scoping allowlist the control plane enforces when a runner
+	// requests a secret value.
+	DeclaredSecrets []string                     `json:"declared_secrets,omitempty"`
+	Status          Status                       `json:"status"`
+	Priority        int                          `json:"priority,omitempty"`
+	MaxInfraRetries int                          `json:"max_infra_retries,omitempty"`
+	CreatedAt       time.Time                    `json:"created_at"`
+	StartedAt       *time.Time                   `json:"started_at,omitempty"`
+	FinishedAt      *time.Time                   `json:"finished_at,omitempty"`
+	Error           string                       `json:"error,omitempty"`
+	Outputs         map[string]string            `json:"outputs,omitempty"`
+	NeedsOutputs    map[string]map[string]string `json:"needs_outputs,omitempty"`
+	Attempts        int                          `json:"attempts"`
+	LeaseRunnerID   string                       `json:"lease_runner_id,omitempty"`
 	// LeaseTokenHash is the HMAC-SHA256 of the raw lease token under the
 	// server's lease key. The raw token is never persisted anywhere.
 	LeaseTokenHash  []byte     `json:"lease_token_hash,omitempty"`

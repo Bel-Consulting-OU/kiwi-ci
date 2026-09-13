@@ -343,7 +343,10 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			backoff = time.Second
 		}
 		stepEnvMap := mergeEnvMap(jobEnv, st.Env)
-		stepSecrets, secErr := e.resolveSecrets(ctx, st.Secrets, secretCache)
+		// Step secret values live only in this step's env map; a fresh cache
+		// per step means no step secret is retained in any map that outlives
+		// the step.
+		stepSecrets, secErr := e.resolveSecrets(ctx, st.Secrets, map[string]string{})
 		if secErr != nil {
 			res.Status = model.StatusFailure
 			res.Error = secErr.Error()
@@ -463,7 +466,7 @@ func (e *Executor) saveArtifacts(_ *pipeline.Spec, cj pipeline.CompiledJob, stat
 }
 func (e *Executor) log(j, s, l string) {
 	if e.Opt.Logs != nil {
-		e.Opt.Logs.WriteLine(j, s, e.Masker.Mask(l))
+		e.Opt.Logs.WriteLine(j, s, e.Masker.MaskMulti(l))
 	}
 }
 func finish(r model.JobResult) model.JobResult {

@@ -25,6 +25,7 @@ import (
 	"github.com/kiwici/kiwi/internal/model"
 	"github.com/kiwici/kiwi/internal/pipeline"
 	"github.com/kiwici/kiwi/internal/policy"
+	"github.com/kiwici/kiwi/internal/secretbroker"
 	"github.com/kiwici/kiwi/internal/storage"
 )
 
@@ -49,6 +50,9 @@ type Server struct {
 	PipelinePath         string
 	ExternalURL          string
 	LeaseDuration        time.Duration
+	// SecretBroker resolves declared secrets for trusted jobs holding an
+	// active lease. A nil broker disables the secrets endpoint (503).
+	SecretBroker secretbroker.Broker
 
 	mu          sync.Mutex
 	runs        map[string]model.Run
@@ -214,6 +218,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /.well-known/openid-configuration", s.oidcConfiguration)
 	mux.HandleFunc("GET /api/v1/oidc/jwks", s.oidcJWKS)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/oidc", s.issueOIDC)
+	mux.HandleFunc("POST /api/v1/jobs/{id}/secrets", s.issueSecret)
 	mux.HandleFunc("GET /api/v1/runs", s.listRuns)
 	mux.HandleFunc("POST /api/v1/runs", s.submit)
 	mux.HandleFunc("GET /api/v1/runs/{id}", s.getRun)
@@ -248,7 +253,7 @@ func (s *Server) auth(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		runnerOnly := strings.HasPrefix(path, "/api/v1/runners/") || path == "/api/v1/runners/register" || strings.HasPrefix(path, "/api/v1/cache/") || (strings.HasPrefix(path, "/api/v1/jobs/") && (strings.Contains(path, "/artifacts/") || strings.HasSuffix(path, "/heartbeat") || strings.HasSuffix(path, "/log") || strings.HasSuffix(path, "/complete") || strings.HasSuffix(path, "/tests")))
+		runnerOnly := strings.HasPrefix(path, "/api/v1/runners/") || path == "/api/v1/runners/register" || strings.HasPrefix(path, "/api/v1/cache/") || (strings.HasPrefix(path, "/api/v1/jobs/") && (strings.Contains(path, "/artifacts/") || strings.HasSuffix(path, "/heartbeat") || strings.HasSuffix(path, "/log") || strings.HasSuffix(path, "/complete") || strings.HasSuffix(path, "/tests") || strings.HasSuffix(path, "/secrets")))
 		sharedRead := r.Method == http.MethodGet && (strings.HasPrefix(path, "/api/v1/artifacts/") || (strings.HasPrefix(path, "/api/v1/runs/") && strings.HasSuffix(path, "/artifacts")))
 		if sharedRead {
 			if s.AdminToken != "" && !bearerOK(r.Header.Get("Authorization"), s.AdminToken) && !bearerOK(r.Header.Get("Authorization"), s.RunnerToken) {
@@ -354,7 +359,8 @@ func (s *Server) enqueue(in SubmitRun) (model.Run, error) {
 			ID: jobIDs[key], RunID: runID, Key: key, BaseKey: cj.BaseID, RepoURL: in.RepoURL, Ref: in.Ref, SHA: in.SHA,
 			Event: in.Event, Condition: cj.Job.If, DependencyStatus: model.StatusSuccess, Pipeline: in.Pipeline, Trusted: in.Trusted, ChangedFiles: append([]string{}, in.ChangedFiles...), Needs: needs,
 			RequiredLabels: labelsForJob(cj.Job), Network: effectiveNetwork, Environment: env, ApprovalRequired: cj.Job.Environment.Approval, EnvironmentBranches: append([]string{}, cj.Job.Environment.Branches...), EnvironmentConcurrency: cj.Job.Environment.Concurrency, OIDCAllowed: cj.Job.Permissions.IDToken, OIDCAudiences: cloneStrings(oidcAudiences),
-			Status: model.StatusQueued, Priority: downstreamDepth(g, key), MaxInfraRetries: infraRetries, CreatedAt: now,
+			DeclaredSecrets: declaredSecrets(spec, cj.Job),
+			Status:          model.StatusQueued, Priority: downstreamDepth(g, key), MaxInfraRetries: infraRetries, CreatedAt: now,
 		}
 	}
 
