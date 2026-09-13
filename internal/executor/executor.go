@@ -494,16 +494,7 @@ func depsOutcome(needs []string, statuses map[string]model.Status) (bool, model.
 }
 
 func dependencyConditionAllows(expr string, status model.Status) bool {
-	switch strings.TrimSpace(expr) {
-	case "always()":
-		return true
-	case "failure()":
-		return status == model.StatusFailure
-	case "cancelled()":
-		return status == model.StatusCancelled
-	default:
-		return false
-	}
+	return pipeline.ConditionAllows(expr, status)
 }
 func secureWorkingDir(workspace, rel string) (string, error) {
 	root, err := filepath.Abs(workspace)

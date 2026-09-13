@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"github.com/kiwici/kiwi/internal/model"
 	"github.com/kiwici/kiwi/internal/pipeline"
 	"github.com/kiwici/kiwi/internal/provenance"
+	"github.com/kiwici/kiwi/internal/storage"
 )
 
 const maxBlobBytes int64 = 8 << 30 // 8 GiB hard safety limit for the built-in store.
@@ -37,16 +39,24 @@ func (s *Server) uploadArtifact(w http.ResponseWriter, r *http.Request) {
 	token := r.Header.Get("X-Kiwi-Lease-Token")
 	gen, _ := strconv.ParseInt(r.Header.Get("X-Kiwi-Lease-Generation"), 10, 64)
 	now := time.Now().UTC()
-	s.mu.Lock()
-	j, ok := s.jobs[jobID]
-	run := s.runs[j.RunID]
-	valid := ok && s.validActiveLease(j, runnerID, token, gen, now)
-	s.mu.Unlock()
-	if !ok {
+	j, err := s.jobForLease(r.Context(), jobID)
+	if errors.Is(err, storage.ErrNotFound) {
 		http.NotFound(w, r)
 		return
 	}
-	if !valid {
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	run := model.Run{}
+	if s.DB != nil {
+		run, _ = s.DB.GetRun(r.Context(), j.RunID)
+	} else {
+		s.mu.Lock()
+		run = s.runs[j.RunID]
+		s.mu.Unlock()
+	}
+	if !s.validActiveLease(j, runnerID, token, gen, now) {
 		http.Error(w, "stale or invalid lease", http.StatusConflict)
 		return
 	}
@@ -109,12 +119,33 @@ func (s *Server) uploadArtifact(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	current, still := s.jobs[jobID]
-	if !still || !s.validActiveLease(current, runnerID, token, gen, time.Now().UTC()) {
-		s.mu.Unlock()
+	leaseValid := still && s.validActiveLease(current, runnerID, token, gen, time.Now().UTC())
+	s.mu.Unlock()
+	if s.DB != nil {
+		current, gerr := s.jobForLease(r.Context(), jobID)
+		if gerr != nil || !s.validActiveLease(current, runnerID, token, gen, time.Now().UTC()) {
+			_ = os.Remove(dst)
+			http.Error(w, "lease expired during upload", http.StatusConflict)
+			return
+		}
+		leaseValid = true
+	}
+	if !leaseValid {
 		_ = os.Remove(dst)
 		http.Error(w, "lease expired during upload", http.StatusConflict)
 		return
 	}
+	if s.DB != nil {
+		if err := s.DB.InsertArtifact(r.Context(), rec); err != nil {
+			_ = os.Remove(dst)
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		s.auditLocked("artifact.uploaded", runnerID, j.RunID, j.ID, "artifact uploaded", map[string]string{"name": name, "sha256": rec.SHA256})
+		writeJSON(w, http.StatusCreated, rec)
+		return
+	}
+	s.mu.Lock()
 	s.artifacts[id] = rec
 	s.auditLocked("artifact.uploaded", runnerID, j.RunID, j.ID, "artifact uploaded", map[string]string{"name": name, "sha256": rec.SHA256})
 	_ = s.persistLocked()
@@ -124,6 +155,26 @@ func (s *Server) uploadArtifact(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) listArtifacts(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
+	if s.DB != nil {
+		if _, err := s.DB.GetRun(r.Context(), runID); errors.Is(err, storage.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		} else if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		out, err := s.DB.ListArtifacts(r.Context(), runID)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		for i := range out {
+			out[i].Path = ""
+			out[i].ProvenancePath = ""
+		}
+		writeJSON(w, 200, out)
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.runs[runID]; !ok {

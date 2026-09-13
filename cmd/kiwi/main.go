@@ -36,6 +36,8 @@ func main() {
 		err = app.Server(ctx, os.Args[2:])
 	case "runner":
 		err = app.Runner(ctx, os.Args[2:])
+	case "database":
+		err = databaseCommand(ctx, os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Printf("kiwi %s (%s/%s)\n", version, runtime.GOOS, runtime.GOARCH)
 		return
@@ -53,6 +55,20 @@ func main() {
 	}
 }
 
+func databaseCommand(ctx context.Context, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("database requires a subcommand: migrate or status")
+	}
+	switch args[0] {
+	case "migrate":
+		return app.DatabaseMigrate(ctx, args[1:])
+	case "status":
+		return app.DatabaseStatus(ctx, args[1:])
+	default:
+		return fmt.Errorf("unknown database subcommand %q (want migrate or status)", args[0])
+	}
+}
+
 func usage() {
 	out := flag.CommandLine.Output()
 	fmt.Fprintln(out, `Kiwi CI — local-first CI/CD for fast, reproducible builds.
@@ -62,7 +78,8 @@ Usage:
   kiwi validate [-f .kiwi/pipeline.yaml]
   kiwi explain  [-f .kiwi/pipeline.yaml]
   kiwi doctor
-  kiwi server   [--listen :8080]
+  kiwi server   [--listen :8080] [--mode dev|production] [--database-url URL]
+  kiwi database migrate|status --database-url URL
   kiwi runner   --server http://127.0.0.1:8080 --token TOKEN
   kiwi version
 

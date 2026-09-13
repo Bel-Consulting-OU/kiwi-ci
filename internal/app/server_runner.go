@@ -11,7 +11,53 @@ import (
 
 	"github.com/kiwici/kiwi/internal/runner"
 	"github.com/kiwici/kiwi/internal/server"
+	"github.com/kiwici/kiwi/internal/storage"
 )
+
+// productionConfig is the pure input to validateProductionConfig, extracted
+// so production-mode flag requirements are unit-testable without a network.
+type productionConfig struct {
+	Mode             string
+	DatabaseURL      string
+	RunnerToken      string
+	AdminToken       string
+	ExternalURL      string
+	TLSCert          string
+	TLSKey           string
+	AllowSharedToken bool
+}
+
+// validateProductionConfig enforces the production-mode startup contract:
+// a database URL, distinct admin/runner credentials (or an explicit
+// --allow-shared-token), an external URL (the OIDC issuer always serves in
+// production), and TLS. Dev mode has no additional requirements.
+func validateProductionConfig(cfg productionConfig) error {
+	switch cfg.Mode {
+	case "dev", "production":
+	case "":
+		cfg.Mode = "dev"
+	default:
+		return fmt.Errorf("--mode must be \"dev\" or \"production\", got %q", cfg.Mode)
+	}
+	if cfg.Mode != "production" {
+		return nil
+	}
+	if cfg.DatabaseURL == "" {
+		return fmt.Errorf("production mode requires --database-url")
+	}
+	if cfg.AdminToken == "" || cfg.AdminToken == cfg.RunnerToken {
+		if !cfg.AllowSharedToken {
+			return fmt.Errorf("production mode requires distinct --admin-token and --runner-token (or --allow-shared-token to acknowledge the shared credential)")
+		}
+	}
+	if cfg.ExternalURL == "" {
+		return fmt.Errorf("production mode requires --external-url (the OIDC issuer always serves in production)")
+	}
+	if cfg.TLSCert == "" || cfg.TLSKey == "" {
+		return fmt.Errorf("production mode requires --tls-cert and --tls-key")
+	}
+	return nil
+}
 
 func Server(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("server", flag.ContinueOnError)
@@ -28,6 +74,9 @@ func Server(ctx context.Context, args []string) error {
 	runnerCACert := fs.String("runner-ca-cert", "", "runner CA certificate PEM (enables runner certificate enrollment)")
 	runnerCAKey := fs.String("runner-ca-key", "", "runner CA private key PEM")
 	runnerEnrollToken := fs.String("runner-enroll-token", os.Getenv("KIWI_RUNNER_ENROLL_TOKEN"), "token authorizing runner certificate enrollment")
+	databaseURL := fs.String("database-url", os.Getenv("KIWI_DATABASE_URL"), "PostgreSQL connection URL (wires the durable SQL control plane)")
+	mode := fs.String("mode", "dev", "server mode: dev (in-memory, default) or production")
+	allowSharedToken := fs.Bool("allow-shared-token", false, "production: allow --admin-token to equal --runner-token")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -37,9 +86,47 @@ func Server(ctx context.Context, args []string) error {
 	if *tlsCert != "" && *tlsKey == "" {
 		return fmt.Errorf("--tls-cert requires --tls-key")
 	}
+	if err := validateProductionConfig(productionConfig{
+		Mode:             *mode,
+		DatabaseURL:      *databaseURL,
+		RunnerToken:      *token,
+		AdminToken:       *adminToken,
+		ExternalURL:      *externalURL,
+		TLSCert:          *tlsCert,
+		TLSKey:           *tlsKey,
+		AllowSharedToken: *allowSharedToken,
+	}); err != nil {
+		return err
+	}
 	var srv *server.Server
 	var err error
-	if *dataDir != "" {
+	if *databaseURL != "" {
+		// DB mode: the SQL store is the source of truth. A data-dir is still
+		// used when set (lease key, OIDC signer, artifact bytes); without it
+		// artifact storage is unavailable.
+		db, derr := storage.NewPostgres(ctx, *databaseURL)
+		if derr != nil {
+			return derr
+		}
+		defer db.Close()
+		if merr := db.Migrate(ctx); merr != nil {
+			return fmt.Errorf("auto-migrate: %w", merr)
+		}
+		if *dataDir != "" {
+			srv, err = server.NewPersistent(*token, *adminToken, *dataDir)
+		} else {
+			srv = server.New(*token)
+			if *adminToken != "" {
+				srv.AdminToken = *adminToken
+			}
+		}
+		if err != nil {
+			return err
+		}
+		if err := srv.SwitchToDB(db); err != nil {
+			return err
+		}
+	} else if *dataDir != "" {
 		srv, err = server.NewPersistent(*token, *adminToken, *dataDir)
 		if err != nil {
 			return err

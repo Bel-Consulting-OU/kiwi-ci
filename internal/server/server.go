@@ -8,6 +8,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -27,6 +28,7 @@ import (
 	"github.com/kiwici/kiwi/internal/pipeline"
 	"github.com/kiwici/kiwi/internal/policy"
 	"github.com/kiwici/kiwi/internal/runnerpki"
+	"github.com/kiwici/kiwi/internal/scheduler"
 	"github.com/kiwici/kiwi/internal/secretbroker"
 	"github.com/kiwici/kiwi/internal/storage"
 )
@@ -84,6 +86,15 @@ type Server struct {
 	store       *storage.Repository
 	oidc        *oidcSigner
 	outbox      *Outbox
+
+	// DB mode: when Sched is non-nil the PostgreSQL store is the source of
+	// truth and scheduler operations delegate to it. The in-memory maps
+	// remain only for dev mode. s.mu guards the memory maps and dev-mode
+	// scheduling; DB paths must not hold s.mu across store calls.
+	DB        storage.Store
+	Sched     *scheduler.DBScheduler
+	LeaderKey string
+	leader    bool
 
 	// Forge API base overrides, used by tests to point adapters at local
 	// HTTP servers; empty means the public API endpoints.
@@ -229,9 +240,34 @@ func NewPersistent(runnerToken, adminToken, dataDir string) (*Server, error) {
 	return s, nil
 }
 
+// SwitchToDB wires the PostgreSQL control plane into an already-constructed
+// Server: Sched backs enqueue/lease/heartbeat/complete/cancel/recover and the
+// SQL store becomes the source of truth. The in-memory maps are kept but
+// ignored while Sched is set. A hard store failure is returned; losing the
+// leadership claim to another live instance is not an error — the server
+// starts as a standby (leader=false) and Maintain polls for promotion.
+func (s *Server) SwitchToDB(db storage.Store) error {
+	// Tokens are HMACed with the server lease key before persistence so the
+	// durable row validates under validActiveLease on every instance that
+	// shares the key (persisted via data-dir in production).
+	sched := scheduler.NewDB(db, s.leaseDuration(), nil, func(raw string) []byte {
+		return hashLeaseToken(s.leaseKey, raw)
+	})
+	if err := sched.InitErr(); err != nil {
+		return fmt.Errorf("server: switch to db: %w", err)
+	}
+	s.Sched = sched
+	s.DB = db
+	s.LeaderKey = sched.LeaderKey
+	s.leader = sched.IsLeader(context.Background())
+	return nil
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.ui)
+	mux.HandleFunc("GET /readiness", s.readiness)
+	mux.HandleFunc("GET /liveness", s.liveness)
 	mux.HandleFunc("POST /hooks/github", s.githubWebhook)
 	mux.HandleFunc("POST /hooks/gitlab", s.gitlabWebhook)
 	mux.HandleFunc("POST /hooks/forgejo", s.forgejoWebhook)
@@ -274,7 +310,7 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
-		if strings.HasPrefix(path, "/hooks/") || path == "/" || path == "/.well-known/openid-configuration" || path == "/api/v1/oidc/jwks" || (r.Method == http.MethodPost && strings.HasSuffix(path, "/oidc")) {
+		if strings.HasPrefix(path, "/hooks/") || path == "/" || path == "/readiness" || path == "/liveness" || path == "/.well-known/openid-configuration" || path == "/api/v1/oidc/jwks" || (r.Method == http.MethodPost && strings.HasSuffix(path, "/oidc")) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -473,8 +509,12 @@ func (s *Server) enqueue(in SubmitRun) (model.Run, error) {
 			Event: in.Event, Condition: cj.Job.If, DependencyStatus: model.StatusSuccess, Pipeline: in.Pipeline, Trusted: in.Trusted, ChangedFiles: append([]string{}, in.ChangedFiles...), Needs: needs,
 			RequiredLabels: labelsForJob(cj.Job), Network: effectiveNetwork, Environment: env, ApprovalRequired: cj.Job.Environment.Approval, EnvironmentBranches: append([]string{}, cj.Job.Environment.Branches...), EnvironmentConcurrency: cj.Job.Environment.Concurrency, OIDCAllowed: cj.Job.Permissions.IDToken, OIDCAudiences: cloneStrings(oidcAudiences),
 			DeclaredSecrets: declaredSecrets(spec, cj.Job),
-			Status:          model.StatusQueued, Priority: downstreamDepth(g, key), MaxInfraRetries: infraRetries, CreatedAt: now,
+			Status:          model.StatusQueued, Priority: scheduler.DownstreamDepth(g, key), MaxInfraRetries: infraRetries, CreatedAt: now,
 		}
+	}
+
+	if s.Sched != nil {
+		return s.enqueueDB(in, run, created, group, spec.Concurrency.CancelInProgress, now)
 	}
 
 	s.mu.Lock()
@@ -520,6 +560,62 @@ func (s *Server) enqueue(in SubmitRun) (model.Run, error) {
 	return run, nil
 }
 
+// enqueueDB persists a compiled run through the PostgreSQL scheduler. It
+// mirrors enqueue's dedupe and supersession semantics against the durable
+// delivery table and the SQL run list, decides approval/environment gating
+// up front (the SQL completion path does not re-run the full schedule pass),
+// and emits the run.queued audit event through the DB audit funnel.
+func (s *Server) enqueueDB(in SubmitRun, run model.Run, created map[string]model.Job, group string, cancelInProgress bool, now time.Time) (model.Run, error) {
+	ctx := context.Background()
+	forge, delivery, ok := webhookDeliveryForge(in.Metadata)
+	if ok {
+		if existingID, found, err := s.DB.FindDelivery(ctx, forge, delivery); err != nil {
+			return model.Run{}, fmt.Errorf("lookup delivery: %w", err)
+		} else if found {
+			if prior, gerr := s.DB.GetRun(ctx, existingID); gerr == nil && prior.RepoFullName == in.RepoFullName {
+				return prior, nil
+			}
+		}
+	}
+	for id, j := range created {
+		switch {
+		case len(j.EnvironmentBranches) > 0 && !environmentBranchAllowed(run.Ref, j.EnvironmentBranches):
+			j.Status = model.StatusBlocked
+			j.Error = "ref is not allowed to deploy to environment " + j.Environment
+			j.FinishedAt = &now
+		case j.ApprovalRequired && j.ApprovedBy == "":
+			j.Status = model.StatusWaitingApproval
+		}
+		created[id] = j
+	}
+	deps := make(map[string][]string, len(created))
+	for id, j := range created {
+		deps[id] = append([]string(nil), j.Needs...)
+	}
+	if err := s.Sched.Enqueue(ctx, run, created, deps, cancelInProgress && group != ""); err != nil {
+		return model.Run{}, err
+	}
+	if ok {
+		if err := s.DB.UpsertDelivery(ctx, forge, delivery, run.ID, ""); err != nil {
+			log.Printf("server: delivery upsert failed: %v", err)
+		}
+	}
+	s.auditLocked("run.queued", "scheduler", run.ID, "", "run queued", map[string]string{"event": in.Event})
+	s.publishGitHubStatus(run)
+	return run, nil
+}
+
+// webhookDeliveryForge extracts the forge and delivery ID from submit
+// metadata, if any.
+func webhookDeliveryForge(meta map[string]string) (forge, delivery string, ok bool) {
+	for _, key := range []string{"github_delivery", "gitlab_delivery", "forgejo_delivery"} {
+		if v := strings.TrimSpace(meta[key]); v != "" {
+			return strings.TrimSuffix(key, "_delivery"), v, true
+		}
+	}
+	return "", "", false
+}
+
 // webhookDelivery extracts the forge delivery ID from submit metadata, if
 // any. The keys are recorded on the run's Metadata so a restarted control
 // plane can rebuild its deliveries map from persisted runs.
@@ -555,35 +651,21 @@ func labelsForJob(j pipeline.Job) []string {
 	return out
 }
 
-func downstreamDepth(g *pipeline.Graph, key string) int {
-	memo := map[string]int{}
-	var visit func(string) int
-	visit = func(k string) int {
-		if v, ok := memo[k]; ok {
-			return v
-		}
-		best := 0
-		for child, cj := range g.Jobs {
-			for _, dep := range cj.Needs {
-				if dep == k {
-					if d := 1 + visit(child); d > best {
-						best = d
-					}
-				}
-			}
-		}
-		memo[k] = best
-		return best
-	}
-	return visit(key)
-}
-
 func expandConcurrency(v string, in SubmitRun) string {
 	r := strings.NewReplacer("${{ ref }}", in.Ref, "${{ref}}", in.Ref, "${{ event }}", in.Event, "${{event}}", in.Event, "${{ sha }}", in.SHA, "${{sha}}", in.SHA)
 	return strings.TrimSpace(r.Replace(v))
 }
 
-func (s *Server) listRuns(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
+	if s.DB != nil {
+		out, err := s.DB.ListRuns(r.Context(), 1000)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]model.Run, 0, len(s.runs))
@@ -595,6 +677,19 @@ func (s *Server) listRuns(w http.ResponseWriter, _ *http.Request) {
 }
 func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if s.DB != nil {
+		v, err := s.DB.GetRun(r.Context(), id)
+		if errors.Is(err, storage.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		writeJSON(w, http.StatusOK, v)
+		return
+	}
 	s.mu.Lock()
 	v, ok := s.runs[id]
 	s.mu.Unlock()
@@ -606,6 +701,26 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
+	if s.DB != nil {
+		if _, err := s.DB.GetRun(r.Context(), runID); errors.Is(err, storage.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		} else if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		jobs, err := s.DB.ListJobsByRun(r.Context(), runID)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		out := make([]model.Job, 0, len(jobs))
+		for _, j := range jobs {
+			out = append(out, redactJob(j))
+		}
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.runs[runID]; !ok {
@@ -632,6 +747,15 @@ func (s *Server) getLogs(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if s.DB != nil {
+		v, err := s.DB.ReadLogs(r.Context(), id, after, limit)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		writeJSON(w, http.StatusOK, v)
+		return
+	}
 	if s.store != nil {
 		v, err := s.store.ReadLogs(id, after, limit)
 		if err != nil {
@@ -692,6 +816,39 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		in.Name = in.ID
 	}
 	now := time.Now().UTC()
+	if s.DB != nil {
+		old, gerr := s.DB.GetRunner(r.Context(), in.ID)
+		if gerr != nil && !errors.Is(gerr, storage.ErrNotFound) {
+			http.Error(w, gerr.Error(), 500)
+			return
+		}
+		if old.Registered.IsZero() {
+			in.Registered = now
+		} else {
+			in.Registered = old.Registered
+			in.Completed = old.Completed
+			in.Failed = old.Failed
+		}
+		if in.Capacity < 1 {
+			in.Capacity = 1
+		}
+		in.LastSeen = now
+		in.ActiveJobs = append([]string{}, old.ActiveJobs...)
+		if len(in.ActiveJobs) == 0 && old.CurrentJob != "" {
+			in.ActiveJobs = []string{old.CurrentJob}
+		}
+		in.Busy = len(in.ActiveJobs) >= in.Capacity
+		if len(in.ActiveJobs) > 0 {
+			in.CurrentJob = in.ActiveJobs[0]
+		}
+		if err := s.DB.UpsertRunner(r.Context(), in); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		s.auditLocked("runner.register", in.Name, "", "", "runner registered", nil)
+		writeJSON(w, http.StatusOK, in)
+		return
+	}
 	s.mu.Lock()
 	old := s.runners[in.ID]
 	if old.Registered.IsZero() {
@@ -720,7 +877,16 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, in)
 }
-func (s *Server) listRunners(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
+	if s.DB != nil {
+		out, err := s.DB.ListRunners(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]model.Runner, 0, len(s.runners))
@@ -735,6 +901,10 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !s.verifyRunnerIdentity(r, id) {
 		http.Error(w, "runner identity mismatch", http.StatusForbidden)
+		return
+	}
+	if s.Sched != nil {
+		s.nextDB(w, r, id)
 		return
 	}
 	now := time.Now().UTC()
@@ -766,7 +936,7 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 		if !labelsSatisfied(ri.Labels, j.RequiredLabels) {
 			continue
 		}
-		if environmentAtCapacity(j, s.jobs) {
+		if scheduler.EnvironmentAtCapacity(j, s.jobs) {
 			continue
 		}
 		candidates = append(candidates, j)
@@ -784,7 +954,7 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 		return candidates[i].CreatedAt.Before(candidates[j].CreatedAt)
 	})
 	j := candidates[0]
-	j.NeedsOutputs = collectServerNeedsOutputs(j, s.jobs)
+	j.NeedsOutputs = scheduler.CollectNeedsOutputs(j, s.jobs)
 	exp := now.Add(s.leaseDuration())
 	t1, err := newID()
 	if err != nil {
@@ -825,6 +995,38 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, task)
 }
 
+// nextDB leases through the PostgreSQL scheduler. No in-memory lock is held:
+// the SQL rows are authoritative and the store serializes competing claims.
+func (s *Server) nextDB(w http.ResponseWriter, r *http.Request, id string) {
+	ctx := r.Context()
+	if _, err := s.DB.GetRunner(ctx, id); errors.Is(err, storage.ErrNotFound) {
+		http.Error(w, "runner not registered", http.StatusNotFound)
+		return
+	} else if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	j, rawToken, exp, err := s.Sched.Lease(ctx, id, time.Now().UTC())
+	switch {
+	case errors.Is(err, scheduler.ErrNotLeader):
+		http.Error(w, "scheduler standby", http.StatusServiceUnavailable)
+		return
+	case errors.Is(err, scheduler.ErrNoJobs), errors.Is(err, storage.ErrLeaseConflict):
+		w.WriteHeader(http.StatusNoContent)
+		return
+	case errors.Is(err, storage.ErrNotFound):
+		http.Error(w, "runner not registered", http.StatusNotFound)
+		return
+	case err != nil:
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	taskJob := *j
+	taskJob.LeaseTokenHash = nil
+	task := Task{Job: taskJob, LeaseToken: rawToken, LeaseGeneration: j.LeaseGeneration, LeaseExpiresAt: exp}
+	writeJSON(w, http.StatusOK, task)
+}
+
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("id")
 	var in Heartbeat
@@ -833,6 +1035,10 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	if !s.verifyRunnerIdentity(r, in.RunnerID) {
 		http.Error(w, "runner identity mismatch", http.StatusForbidden)
+		return
+	}
+	if s.Sched != nil {
+		s.heartbeatDB(w, r, jobID, in)
 		return
 	}
 	now := time.Now().UTC()
@@ -862,6 +1068,42 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, HeartbeatResponse{LeaseExpiresAt: exp})
 }
 
+// heartbeatDB validates the lease against the durable job row (the in-memory
+// map may be stale) and delegates the extension to the scheduler, which also
+// reports a concurrent cancellation.
+func (s *Server) heartbeatDB(w http.ResponseWriter, r *http.Request, jobID string, in Heartbeat) {
+	ctx := r.Context()
+	now := time.Now().UTC()
+	j, err := s.DB.GetJob(ctx, jobID)
+	if errors.Is(err, storage.ErrNotFound) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if j.Status == model.StatusCancelled {
+		writeJSON(w, http.StatusOK, HeartbeatResponse{Cancel: true})
+		return
+	}
+	if !s.validActiveLease(j, in.RunnerID, in.LeaseToken, in.LeaseGeneration, now) {
+		http.Error(w, "stale or invalid lease", http.StatusConflict)
+		return
+	}
+	exp := now.Add(s.leaseDuration())
+	cancelled, err := s.Sched.Heartbeat(ctx, jobID, in.RunnerID, hashLeaseToken(s.leaseKey, in.LeaseToken), in.LeaseGeneration, exp)
+	if errors.Is(err, storage.ErrLeaseConflict) || errors.Is(err, storage.ErrGenerationMismatch) {
+		http.Error(w, "stale or invalid lease", http.StatusConflict)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	writeJSON(w, http.StatusOK, HeartbeatResponse{Cancel: cancelled, LeaseExpiresAt: exp})
+}
+
 func (s *Server) log(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("id")
 	var in LogLine
@@ -877,6 +1119,10 @@ func (s *Server) log(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
+	if s.DB != nil {
+		s.logDB(w, r, jobID, in, now)
+		return
+	}
 	s.mu.Lock()
 	j, ok := s.jobs[jobID]
 	if !ok {
@@ -904,6 +1150,32 @@ func (s *Server) log(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// logDB validates the lease against the durable job row and appends the log
+// line through the store. The seq is a wall-clock nanosecond timestamp so it
+// stays monotonic across restarts and instances without a shared counter.
+func (s *Server) logDB(w http.ResponseWriter, r *http.Request, jobID string, in LogLine, now time.Time) {
+	ctx := r.Context()
+	j, err := s.DB.GetJob(ctx, jobID)
+	if errors.Is(err, storage.ErrNotFound) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if !s.validActiveLease(j, in.RunnerID, in.LeaseToken, in.LeaseGeneration, now) {
+		http.Error(w, "stale or invalid lease", http.StatusConflict)
+		return
+	}
+	e := model.LogEntry{Seq: time.Now().UnixNano(), RunID: j.RunID, JobID: j.ID, JobKey: j.Key, Step: in.Step, Line: in.Line, CreatedAt: time.Now().UTC()}
+	if err := s.DB.AppendLog(ctx, e); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("id")
 	var in Complete
@@ -921,6 +1193,10 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	hash, err := completionResultHash(in.Status, in.Error, in.Outputs)
 	if err != nil {
 		http.Error(w, "invalid outputs payload", http.StatusBadRequest)
+		return
+	}
+	if s.Sched != nil {
+		s.completeDB(w, r, jobID, in, hash)
 		return
 	}
 	now := time.Now().UTC()
@@ -976,6 +1252,62 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	_ = s.persistLocked()
 	s.mu.Unlock()
 	if run.Status.Terminal() {
+		s.publishGitHubStatus(run)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// completeDB applies the completion through the scheduler's transactional
+// CompleteJob. Idempotent replay is recognized from the durable receipt
+// first (fast path), and again after a lease-conflict error in case the
+// completion raced a concurrent replay.
+func (s *Server) completeDB(w http.ResponseWriter, r *http.Request, jobID string, in Complete, hash string) {
+	ctx := r.Context()
+	if rec, has, err := s.DB.HasCompletionReceipt(ctx, jobID, in.LeaseGeneration, in.RunnerID); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	} else if has && rec.ResultHash == hash {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	j, err := s.DB.GetJob(ctx, jobID)
+	if errors.Is(err, storage.ErrNotFound) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if !s.validActiveLease(j, in.RunnerID, in.LeaseToken, in.LeaseGeneration, time.Now().UTC()) {
+		http.Error(w, "stale or invalid lease", http.StatusConflict)
+		return
+	}
+	st := in.Status
+	if st != model.StatusSuccess && st != model.StatusFailure && st != model.StatusCancelled && st != model.StatusSkipped {
+		st = model.StatusFailure
+	}
+	errMsg := in.Error
+	outputs := map[string]string{}
+	if validJobOutputs(in.Outputs) {
+		outputs = cloneMap(in.Outputs)
+	} else {
+		st = model.StatusFailure
+		errMsg = "runner returned invalid or oversized job outputs"
+	}
+	if err := s.Sched.Complete(ctx, jobID, in.LeaseGeneration, in.RunnerID, st, errMsg, outputs, hash); err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		if rec, has, herr := s.DB.HasCompletionReceipt(ctx, jobID, in.LeaseGeneration, in.RunnerID); herr == nil && has && rec.ResultHash == hash {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		http.Error(w, "stale or invalid lease", http.StatusConflict)
+		return
+	}
+	if run, gerr := s.DB.GetRun(ctx, j.RunID); gerr == nil && run.Status.Terminal() {
 		s.publishGitHubStatus(run)
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -1037,9 +1369,29 @@ func (s *Server) validActiveLease(j model.Job, runnerID, token string, generatio
 	return subtle.ConstantTimeCompare(hashLeaseToken(s.leaseKey, token), j.LeaseTokenHash) == 1
 }
 
+// jobForLease returns the job addressed by jobID: from the store in DB mode
+// (the in-memory map may be stale there) or from the in-memory map in dev
+// mode. ErrNotFound means the job does not exist.
+func (s *Server) jobForLease(ctx context.Context, jobID string) (model.Job, error) {
+	if s.DB != nil {
+		return s.DB.GetJob(ctx, jobID)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j, ok := s.jobs[jobID]
+	if !ok {
+		return model.Job{}, storage.ErrNotFound
+	}
+	return j, nil
+}
+
 func (s *Server) approveJob(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("id")
 	actor := actorFrom(r)
+	if s.DB != nil {
+		s.approveJobDB(w, r, jobID, actor)
+		return
+	}
 	s.mu.Lock()
 	j, ok := s.jobs[jobID]
 	s.mu.Unlock()
@@ -1077,8 +1429,48 @@ func (s *Server) approveJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, redactJob(j))
 }
 
+// approveJobDB approves an environment-gated job durably: the job row is the
+// source of truth, and the update goes through the store.
+func (s *Server) approveJobDB(w http.ResponseWriter, r *http.Request, jobID, actor string) {
+	ctx := r.Context()
+	j, err := s.DB.GetJob(ctx, jobID)
+	if errors.Is(err, storage.ErrNotFound) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if !s.requireAction(w, r, auth.ActionApprove, j.RepoURL, false) {
+		return
+	}
+	if !j.ApprovalRequired {
+		http.Error(w, "job does not require approval", http.StatusConflict)
+		return
+	}
+	if j.Status.Terminal() {
+		http.Error(w, "job is already terminal", http.StatusConflict)
+		return
+	}
+	j.ApprovedBy = actor
+	if j.Status == model.StatusWaitingApproval {
+		j.Status = model.StatusQueued
+	}
+	if err := s.DB.UpdateJob(ctx, j); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	s.auditLocked("job.approved", actor, j.RunID, j.ID, "environment approved", map[string]string{"environment": j.Environment})
+	writeJSON(w, http.StatusOK, redactJob(j))
+}
+
 func (s *Server) rerunRun(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if s.DB != nil {
+		s.rerunRunDB(w, r, id)
+		return
+	}
 	s.mu.Lock()
 	old, ok := s.runs[id]
 	var pipelineText string
@@ -1116,9 +1508,61 @@ func (s *Server) rerunRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, run)
 }
 
+// rerunRunDB reads the previous run and its pipeline text from the store,
+// then enqueues through the DB path.
+func (s *Server) rerunRunDB(w http.ResponseWriter, r *http.Request, id string) {
+	ctx := r.Context()
+	old, err := s.DB.GetRun(ctx, id)
+	if errors.Is(err, storage.ErrNotFound) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	jobs, err := s.DB.ListJobsByRun(ctx, id)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	var pipelineText string
+	for _, j := range jobs {
+		if j.Pipeline != "" {
+			pipelineText = j.Pipeline
+			break
+		}
+	}
+	if pipelineText == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if !s.requireAction(w, r, auth.ActionRerun, old.Repo, false) {
+		return
+	}
+	meta := cloneMap(old.Metadata)
+	if meta == nil {
+		meta = map[string]string{}
+	}
+	for _, key := range []string{"github_delivery", "gitlab_delivery", "forgejo_delivery"} {
+		delete(meta, key)
+	}
+	meta["rerun_of"] = id
+	run, err := s.enqueue(SubmitRun{RepoURL: old.Repo, RepoFullName: old.RepoFullName, Ref: old.Ref, SHA: old.SHA, Event: old.Event, Pipeline: pipelineText, Trusted: old.Trusted, Metadata: meta})
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, run)
+}
+
 func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	actor := actorFrom(r)
+	if s.Sched != nil {
+		s.cancelRunDB(w, r, id, actor)
+		return
+	}
 	s.mu.Lock()
 	run, ok := s.runs[id]
 	s.mu.Unlock()
@@ -1139,6 +1583,35 @@ func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 	run = s.runs[id]
 	_ = s.persistLocked()
 	s.mu.Unlock()
+	s.publishGitHubStatus(run)
+	writeJSON(w, http.StatusOK, run)
+}
+
+// cancelRunDB cancels through the store's transactional CancelRunJobs and
+// emits the audit event through the DB audit funnel.
+func (s *Server) cancelRunDB(w http.ResponseWriter, r *http.Request, id, actor string) {
+	ctx := r.Context()
+	run, err := s.DB.GetRun(ctx, id)
+	if errors.Is(err, storage.ErrNotFound) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if !s.requireAction(w, r, auth.ActionCancel, run.Repo, false) {
+		return
+	}
+	reason := "cancelled by " + actor
+	if err := s.Sched.CancelRun(ctx, id, reason); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	s.auditLocked("run.cancelled", actor, id, "", reason, nil)
+	if cur, gerr := s.DB.GetRun(ctx, id); gerr == nil {
+		run = cur
+	}
 	s.publishGitHubStatus(run)
 	writeJSON(w, http.StatusOK, run)
 }
@@ -1169,6 +1642,12 @@ func (s *Server) cancelRunLocked(runID, reason, actor string) {
 }
 
 func (s *Server) scheduleStateLocked() {
+	if s.Sched != nil {
+		// DB mode: dependency/approval recomputation happens in SQL
+		// (CompleteJob) and in the scheduler's recovery pass; the memory
+		// maps are not authoritative.
+		return
+	}
 	changed := true
 	for changed {
 		changed = false
@@ -1181,7 +1660,7 @@ func (s *Server) scheduleStateLocked() {
 				continue
 			}
 			j.DependencyStatus = depStatus
-			if depStatus != model.StatusSuccess && !dependencyConditionAllows(j.Condition, depStatus) {
+			if depStatus != model.StatusSuccess && !scheduler.ConditionAllows(j.Condition, depStatus) {
 				now := time.Now().UTC()
 				j.Status = model.StatusBlocked
 				j.Error = "dependency failed"
@@ -1218,47 +1697,29 @@ func (s *Server) scheduleStateLocked() {
 	}
 }
 
+// dependencyOutcomeLocked wraps the scheduler's unified DependencyOutcome
+// over the in-memory job map (dev mode).
 func dependencyOutcomeLocked(j model.Job, jobs map[string]model.Job) (bool, model.Status) {
-	outcome := model.StatusSuccess
-	for _, depID := range j.Needs {
-		d, ok := jobs[depID]
-		if !ok {
-			return true, model.StatusFailure
-		}
-		if !d.Status.Terminal() {
-			return false, model.StatusPending
-		}
-		switch d.Status {
-		case model.StatusFailure, model.StatusBlocked:
-			outcome = model.StatusFailure
-		case model.StatusCancelled:
-			if outcome != model.StatusFailure {
-				outcome = model.StatusCancelled
-			}
-		}
-	}
-	return true, outcome
+	return scheduler.DependencyOutcome(j.Needs, nil, func(id string) (model.Status, bool) {
+		d, ok := jobs[id]
+		return d.Status, ok
+	})
 }
 
-func dependencyConditionAllows(expr string, status model.Status) bool {
-	switch strings.TrimSpace(expr) {
-	case "always()":
-		return true
-	case "failure()":
-		return status == model.StatusFailure
-	case "cancelled()":
-		return status == model.StatusCancelled
-	default:
-		return false
-	}
-}
-
+// depsReadyLocked reports whether a queued job's dependencies allow it to be
+// leased. Condition evaluation uses the unified evaluator so the dev-mode
+// gate and the SQL scheduler decide identically.
 func depsReadyLocked(j model.Job, jobs map[string]model.Job) bool {
 	ready, status := dependencyOutcomeLocked(j, jobs)
-	return ready && (status == model.StatusSuccess || dependencyConditionAllows(j.Condition, status))
+	return ready && (status == model.StatusSuccess || scheduler.ConditionAllows(j.Condition, status))
 }
 
 func (s *Server) refreshRunLocked(runID string) {
+	if s.Sched != nil {
+		// DB mode: run recomputation happens in SQL (CompleteJob) and in
+		// the scheduler's recovery pass.
+		return
+	}
 	run, ok := s.runs[runID]
 	if !ok {
 		return
@@ -1330,6 +1791,11 @@ func (s *Server) refreshRunLocked(runID string) {
 }
 
 func (s *Server) recoverLeasesLocked(now time.Time, startup bool) {
+	if s.Sched != nil {
+		// DB mode: expired-lease recovery is the leader's job and runs
+		// through Sched.RecoverExpired in Maintain.
+		return
+	}
 	_ = startup // Signature kept for call-site stability; startup no longer forces expiry: unexpired leases survive restart.
 	for id, j := range s.jobs {
 		if j.Status != model.StatusRunning {
@@ -1385,8 +1851,11 @@ func (s *Server) releaseRunnerLocked(runnerID, jobID string, status model.Status
 	s.runners[runnerID] = ri
 }
 
+// auditLocked is the single audit funnel. In DB mode events go through the
+// store (AppendAudit); failures are logged, never silently dropped. In dev
+// mode events are appended to the filesystem repository when one is attached.
 func (s *Server) auditLocked(action, actor, runID, jobID, msg string, meta map[string]string) {
-	if s.store == nil {
+	if s.store == nil && s.DB == nil {
 		return
 	}
 	id, err := newID()
@@ -1395,9 +1864,25 @@ func (s *Server) auditLocked(action, actor, runID, jobID, msg string, meta map[s
 		return
 	}
 	e := model.AuditEvent{ID: id, Action: action, Actor: actor, RunID: runID, JobID: jobID, Message: msg, Metadata: meta, CreatedAt: time.Now().UTC()}
+	if s.DB != nil {
+		if err := s.DB.AppendAudit(context.Background(), e); err != nil {
+			log.Printf("audit: append %q failed: %v", action, err)
+		}
+		return
+	}
 	_ = s.store.AppendAudit(e)
 }
 func (s *Server) listAudit(w http.ResponseWriter, r *http.Request) {
+	if s.DB != nil {
+		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		v, err := s.DB.ReadAudit(r.Context(), limit)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		writeJSON(w, 200, v)
+		return
+	}
 	if s.store == nil {
 		writeJSON(w, 200, []model.AuditEvent{})
 		return
@@ -1412,7 +1897,9 @@ func (s *Server) listAudit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) persistLocked() error {
-	if s.store == nil {
+	if s.store == nil || s.DB != nil {
+		// DB mode: the SQL store is the source of truth; the filesystem
+		// snapshot must not be overwritten with stale memory maps.
 		return nil
 	}
 	return s.store.Save(storage.Snapshot{Version: 1, Runs: s.runs, Jobs: s.jobs, Runners: s.runners, Artifacts: s.artifacts, Reports: s.reports})
@@ -1441,23 +1928,6 @@ func environmentBranchAllowed(ref string, patterns []string) bool {
 	return false
 }
 
-func environmentAtCapacity(j model.Job, jobs map[string]model.Job) bool {
-	if j.Environment == "" || j.EnvironmentConcurrency <= 0 {
-		return false
-	}
-	active := 0
-	for _, other := range jobs {
-		if other.ID == j.ID || other.Environment != j.Environment || other.Status != model.StatusRunning {
-			continue
-		}
-		active++
-		if active >= j.EnvironmentConcurrency {
-			return true
-		}
-	}
-	return false
-}
-
 func labelsSatisfied(have, need []string) bool {
 	m := map[string]bool{}
 	for _, x := range have {
@@ -1470,27 +1940,6 @@ func labelsSatisfied(have, need []string) bool {
 	}
 	return true
 }
-func collectServerNeedsOutputs(j model.Job, jobs map[string]model.Job) map[string]map[string]string {
-	out := map[string]map[string]string{}
-	baseCount := map[string]int{}
-	for _, id := range j.Needs {
-		if d, ok := jobs[id]; ok {
-			baseCount[d.BaseKey]++
-		}
-	}
-	for _, id := range j.Needs {
-		d, ok := jobs[id]
-		if !ok || len(d.Outputs) == 0 {
-			continue
-		}
-		out[d.Key] = cloneMap(d.Outputs)
-		if baseCount[d.BaseKey] == 1 {
-			out[d.BaseKey] = cloneMap(d.Outputs)
-		}
-	}
-	return out
-}
-
 func validJobOutputs(in map[string]string) bool {
 	if len(in) > 256 {
 		return false
@@ -1545,7 +1994,11 @@ func cloneStrings(in []string) []string {
 	return append([]string(nil), in...)
 }
 
-func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
+	if s.DB != nil {
+		s.metricsDB(w, r)
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	counts := map[model.Status]int{}
@@ -1578,6 +2031,57 @@ func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintf(w, "kiwi_jobs{status=%q} %d\n", st, n)
 	}
 	fmt.Fprintf(w, "kiwi_runners %d\nkiwi_runner_slots %d\nkiwi_runner_slots_busy %d\n", len(s.runners), capacity, busy)
+}
+
+// metricsDB serves the same gauges from the SQL store, bounded to the most
+// recent runs so a scrape cannot degenerate into a full-table scan.
+func (s *Server) metricsDB(w http.ResponseWriter, r *http.Request) {
+	runs, err := s.DB.ListRuns(r.Context(), 100)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	counts := map[model.Status]int{}
+	jobs := map[model.Status]int{}
+	for _, run := range runs {
+		counts[run.Status]++
+		if run.Status.Terminal() {
+			continue
+		}
+		runJobs, err := s.DB.ListJobsByRun(r.Context(), run.ID)
+		if err != nil {
+			continue
+		}
+		for _, j := range runJobs {
+			jobs[j.Status]++
+		}
+	}
+	busy := 0
+	capacity := 0
+	allRunners, err := s.DB.ListRunners(r.Context())
+	if err != nil {
+		allRunners = nil
+	}
+	for _, ri := range allRunners {
+		busy += len(ri.ActiveJobs)
+		c := ri.Capacity
+		if c < 1 {
+			c = 1
+		}
+		capacity += c
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	fmt.Fprintln(w, "# HELP kiwi_runs Number of CI runs by status")
+	fmt.Fprintln(w, "# TYPE kiwi_runs gauge")
+	for st, n := range counts {
+		fmt.Fprintf(w, "kiwi_runs{status=%q} %d\n", st, n)
+	}
+	fmt.Fprintln(w, "# HELP kiwi_jobs Number of CI jobs by status")
+	fmt.Fprintln(w, "# TYPE kiwi_jobs gauge")
+	for st, n := range jobs {
+		fmt.Fprintf(w, "kiwi_jobs{status=%q} %d\n", st, n)
+	}
+	fmt.Fprintf(w, "kiwi_runners %d\nkiwi_runner_slots %d\nkiwi_runner_slots_busy %d\n", len(allRunners), capacity, busy)
 }
 
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
@@ -1717,6 +2221,10 @@ func (s *Server) Maintain(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
+			if s.Sched != nil {
+				s.maintainDB(ctx, now.UTC())
+				continue
+			}
 			s.mu.Lock()
 			before := map[string]model.Status{}
 			for id, r := range s.runs {
@@ -1738,4 +2246,36 @@ func (s *Server) Maintain(ctx context.Context) {
 			s.flushOutbox()
 		}
 	}
+}
+
+// maintainDB is the DB-mode housekeeping tick. The leader recovers expired
+// leases, flushes the outbox, and garbage-collects memory artifacts (artifact
+// bytes still live on the local filesystem, so DB-mode GC covers memory
+// records only). A standby serves reads and polls the leadership claim; on
+// promotion it runs RecoverExpired once so leases orphaned by the previous
+// leader are reclaimed immediately.
+func (s *Server) maintainDB(ctx context.Context, now time.Time) {
+	if !s.leader {
+		if !s.Sched.IsLeader(ctx) {
+			return
+		}
+		s.leader = true
+		log.Printf("server: promoted to leader (key %s)", s.LeaderKey)
+		if err := s.Sched.RecoverExpired(ctx, now); err != nil {
+			log.Printf("server: post-promotion recovery: %v", err)
+		}
+		return
+	}
+	if !s.Sched.IsLeader(ctx) {
+		s.leader = false
+		log.Printf("server: demoted to standby (key %s)", s.LeaderKey)
+		return
+	}
+	if err := s.Sched.RecoverExpired(ctx, now); err != nil && !errors.Is(err, scheduler.ErrNotLeader) {
+		log.Printf("server: lease recovery: %v", err)
+	}
+	s.flushOutbox()
+	s.mu.Lock()
+	s.cleanupExpiredArtifactsLocked(now)
+	s.mu.Unlock()
 }

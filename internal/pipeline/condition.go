@@ -200,3 +200,18 @@ func hasOuterParens(s string) bool {
 	}
 	return depth == 0
 }
+
+// ConditionAllows reports whether a job whose dependencies reached the given
+// status may run. This is the single unified gate used by the control plane,
+// the SQL scheduler, and the executor (audit item 7). An empty condition
+// behaves like success(): a job without an explicit condition is blocked when
+// a dependency failed, matching GitHub Actions semantics and Kiwi's DAG
+// guarantees. Evaluation errors yield false.
+func ConditionAllows(expr string, status model.Status) bool {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		expr = "success()"
+	}
+	ok, err := Eval(expr, EvalContext{Status: status})
+	return err == nil && ok
+}

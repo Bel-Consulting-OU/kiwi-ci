@@ -8,6 +8,7 @@ import (
 
 	"github.com/kiwici/kiwi/internal/pipeline"
 	"github.com/kiwici/kiwi/internal/secretbroker"
+	"github.com/kiwici/kiwi/internal/storage"
 )
 
 // SecretRequest asks the control plane to deliver one declared secret value
@@ -65,33 +66,31 @@ func (s *Server) issueSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	s.mu.Lock()
-	j, ok := s.jobs[jobID]
-	if !ok {
-		s.mu.Unlock()
+	j, err := s.jobForLease(r.Context(), jobID)
+	if errors.Is(err, storage.ErrNotFound) {
 		http.NotFound(w, r)
 		return
 	}
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
 	if !s.validActiveLease(j, in.RunnerID, in.LeaseToken, in.LeaseGeneration, now) {
-		s.mu.Unlock()
 		http.Error(w, "stale or invalid lease", http.StatusConflict)
 		return
 	}
 	// Defense in depth: admission already strips secrets from untrusted
 	// pipelines, and the declared allowlist is compiled at enqueue time.
 	if !j.Trusted || !containsString(j.DeclaredSecrets, in.Name) {
-		s.mu.Unlock()
 		http.Error(w, "secret not declared for this job", http.StatusForbidden)
 		return
 	}
 	if s.SecretBroker == nil {
-		s.mu.Unlock()
 		http.Error(w, "secret broker not configured", http.StatusServiceUnavailable)
 		return
 	}
 	value, err := s.SecretBroker.Resolve(r.Context(), in.Name, secretbroker.SecretScope{Repository: j.RepoURL, Environment: j.Environment, Trusted: j.Trusted})
 	if err != nil {
-		s.mu.Unlock()
 		if errors.Is(err, secretbroker.ErrAlreadyDelivered) {
 			http.Error(w, "secret already delivered", http.StatusConflict)
 			return
@@ -101,7 +100,6 @@ func (s *Server) issueSecret(w http.ResponseWriter, r *http.Request) {
 	}
 	pubRaw, err := base64.StdEncoding.DecodeString(in.EphemeralPublic)
 	if err != nil || len(pubRaw) != 32 {
-		s.mu.Unlock()
 		http.Error(w, "invalid ephemeral_public: want base64-encoded 32 bytes", http.StatusBadRequest)
 		return
 	}
@@ -109,14 +107,12 @@ func (s *Server) issueSecret(w http.ResponseWriter, r *http.Request) {
 	copy(pub[:], pubRaw)
 	enc, err := secretbroker.SealEnvelope([]byte(value), pub)
 	if err != nil {
-		s.mu.Unlock()
 		http.Error(w, "sealing secret failed", http.StatusInternalServerError)
 		return
 	}
 	// The audit trail records the secret name only, never the value.
 	s.auditLocked("secret.issued", in.RunnerID, j.RunID, j.ID, "secret delivered", map[string]string{"secret": in.Name})
 	generation := j.LeaseGeneration
-	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, SecretResponse{
 		Ciphertext:      base64.StdEncoding.EncodeToString(enc.Ciphertext),
 		EphemeralPublic: base64.StdEncoding.EncodeToString(enc.EphemeralPublic),
