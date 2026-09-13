@@ -1,8 +1,6 @@
 package cache
 
 import (
-	"archive/tar"
-	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -12,16 +10,20 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/kiwici/kiwi/internal/safefs"
 )
 
-// Store is a content-addressed cache archive store. When RemoteURL is set the
-// local cache transparently falls back to (restore) and mirrors (save) the
-// control plane's cache endpoints, authenticated with the runner token.
+// Store is a content-addressed cache archive store. Extraction goes through
+// safefs (no symlink following, hard resource limits). When RemoteURL is set
+// the local cache transparently falls back to (restore) and mirrors (save)
+// the control plane's cache endpoints, authenticated with the runner token.
 type Store struct {
-	Root      string
-	RemoteURL string
-	Token     string
-	Client    *http.Client
+	Root          string
+	RemoteURL     string
+	Token         string
+	Client        *http.Client
+	MaxCacheBytes int64
 }
 
 func Default() *Store {
@@ -79,43 +81,10 @@ func (s *Store) restoreLocal(key, workspace string, paths []string) (bool, error
 		return false, err
 	}
 	defer f.Close()
-	gz, err := gzip.NewReader(f)
-	if err != nil {
-		return false, err
-	}
-	defer gz.Close()
-	tr := tar.NewReader(gz)
-	allowed := cleanRoots(paths)
-	for {
-		h, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return false, err
-		}
-		target := filepath.Join(workspace, filepath.Clean(h.Name))
-		if !within(target, workspace) {
-			return false, fmt.Errorf("unsafe cache path %q", h.Name)
-		}
-		if !underAllowed(h.Name, allowed) {
-			continue
-		}
-		switch h.Typeflag {
-		case tar.TypeDir:
-			os.MkdirAll(target, 0o755)
-		case tar.TypeReg:
-			os.MkdirAll(filepath.Dir(target), 0o755)
-			out, e := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(h.Mode))
-			if e != nil {
-				return false, e
-			}
-			_, e = io.Copy(out, tr)
-			out.Close()
-			if e != nil {
-				return false, e
-			}
-		}
+	limits := safefs.DefaultLimits()
+	limits.Allowed = cleanRoots(paths)
+	if _, err := safefs.Extract(f, workspace, limits); err != nil {
+		return false, fmt.Errorf("cache restore: %w", err)
 	}
 	return true, nil
 }
@@ -124,67 +93,22 @@ func (s *Store) Save(key, workspace string, paths []string) error {
 	if err := os.MkdirAll(s.Root, 0o755); err != nil {
 		return err
 	}
+	if err := safefs.FitsAvailable(s.Root, s.MaxCacheBytes); err != nil {
+		return err
+	}
 	tmp := filepath.Join(s.Root, key+".tmp")
 	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
-	gz := gzip.NewWriter(f)
-	tw := tar.NewWriter(gz)
-	fail := func(e error) error { tw.Close(); gz.Close(); f.Close(); os.Remove(tmp); return e }
-	for _, p := range paths {
-		abs := filepath.Join(workspace, p)
-		info, err := os.Stat(abs)
-		if os.IsNotExist(err) {
-			continue
-		}
-		if err != nil {
-			return fail(err)
-		}
-		root := abs
-		err = filepath.Walk(root, func(path string, fi os.FileInfo, walkErr error) error {
-			if walkErr != nil {
-				return walkErr
-			}
-			rel, err := filepath.Rel(workspace, path)
-			if err != nil {
-				return err
-			}
-			if strings.HasPrefix(rel, "..") {
-				return nil
-			}
-			h, err := tar.FileInfoHeader(fi, "")
-			if err != nil {
-				return err
-			}
-			h.Name = filepath.ToSlash(rel)
-			if err := tw.WriteHeader(h); err != nil {
-				return err
-			}
-			if fi.Mode().IsRegular() {
-				rf, err := os.Open(path)
-				if err != nil {
-					return err
-				}
-				_, err = io.Copy(tw, rf)
-				rf.Close()
-				return err
-			}
-			return nil
-		})
-		_ = info
-		if err != nil {
-			return fail(err)
-		}
-	}
-	if err := tw.Close(); err != nil {
-		return fail(err)
-	}
-	if err := gz.Close(); err != nil {
-		return fail(err)
+	if err := safefs.WriteTarGz(f, workspace, paths, false); err != nil {
+		f.Close()
+		_ = os.Remove(tmp)
+		return err
 	}
 	if err := f.Close(); err != nil {
-		return fail(err)
+		_ = os.Remove(tmp)
+		return err
 	}
 	if err := os.Rename(tmp, filepath.Join(s.Root, key+".tar.gz")); err != nil {
 		return err
@@ -199,9 +123,11 @@ func (s *Store) Save(key, workspace string, paths []string) error {
 
 func (s *Store) client() *http.Client {
 	if s.Client != nil {
-		return s.Client
+		c := *s.Client
+		c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		return &c
 	}
-	return http.DefaultClient
+	return &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }
 
 func (s *Store) fetchRemote(key string) error {
@@ -282,17 +208,4 @@ func cleanRoots(in []string) []string {
 		}
 	}
 	return out
-}
-func underAllowed(name string, roots []string) bool {
-	name = filepath.ToSlash(filepath.Clean(name))
-	for _, r := range roots {
-		if name == r || strings.HasPrefix(name, r+"/") {
-			return true
-		}
-	}
-	return false
-}
-func within(target, root string) bool {
-	r, err := filepath.Rel(root, target)
-	return err == nil && r != ".." && !strings.HasPrefix(r, ".."+string(filepath.Separator))
 }

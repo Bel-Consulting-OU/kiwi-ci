@@ -1,9 +1,11 @@
 package executor
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -19,6 +21,14 @@ type ContainerBackend struct {
 	docker    string
 	container string
 	workspace string
+	// RequireImmutableImages rejects images that are not pinned by an
+	// @sha256: digest. Set by the executor from Options for untrusted jobs.
+	RequireImmutableImages bool
+	// Rootless demands a rootless Docker daemon (verified via
+	// `docker info --format {{.SecurityOptions}}`).
+	Rootless bool
+	// ReadOnlyRootFS mounts the job container root filesystem read-only.
+	ReadOnlyRootFS bool
 }
 
 func (*ContainerBackend) Name() string { return "container" }
@@ -30,9 +40,20 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 	if b.Image == "" {
 		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("container runtime requires job.image")}
 	}
+	// Digest pinning is checked before any docker invocation so a missing
+	// daemon can never mask an unpinned image. Production policy should
+	// always require digests for untrusted jobs (see RequireImmutableImages).
+	if b.RequireImmutableImages && !strings.Contains(b.Image, "@sha256:") {
+		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("container image %q is not pinned by an @sha256: digest (require_immutable_images)", b.Image)}
+	}
 	docker, err := exec.LookPath("docker")
 	if err != nil {
 		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("docker not found: %w", err)}
+	}
+	if b.Rootless {
+		if err := b.verifyRootlessDaemon(ctx, docker); err != nil {
+			return err
+		}
 	}
 	abs, err := filepath.Abs(workspace)
 	if err != nil {
@@ -48,13 +69,36 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 		"run", "-d", "--rm", "--init", "--network=" + network,
 		"--cap-drop=ALL", "--security-opt=no-new-privileges",
 		"-v", abs + ":/workspace", "-w", "/workspace", "--name", b.container,
-		b.Image, "sh", "-c", "while :; do sleep 3600; done",
 	}
+	if b.Rootless || b.ReadOnlyRootFS {
+		args = append(args,
+			"--read-only",
+			"--tmpfs", "/tmp:rw,nosuid,nodev",
+			"--tmpfs", "/run:rw,nosuid,nodev",
+			"--user=65534:65534",
+		)
+	}
+	args = append(args, b.Image, "sh", "-c", "while :; do sleep 3600; done")
 	out, err := exec.CommandContext(ctx, docker, args...).CombinedOutput()
 	if err != nil {
 		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("start job container: %v: %s", err, strings.TrimSpace(string(out)))}
 	}
 	emit("job container started " + b.container)
+	return nil
+}
+
+// verifyRootlessDaemon requires `docker info --format {{.SecurityOptions}}`
+// to report "rootless". sandbox.rootless is an explicit promise to the job
+// author; if the daemon is a privileged rootful one we must refuse rather
+// than silently run with weaker isolation.
+func (b *ContainerBackend) verifyRootlessDaemon(ctx context.Context, docker string) error {
+	out, err := exec.CommandContext(ctx, docker, "info", "--format", "{{.SecurityOptions}}").CombinedOutput()
+	if err != nil {
+		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("inspect docker daemon: %v: %s", err, strings.TrimSpace(string(out)))}
+	}
+	if !strings.Contains(strings.ToLower(string(out)), "rootless") {
+		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("sandbox.rootless requested but the docker daemon is not rootless (security options: %s)", strings.TrimSpace(string(out)))}
+	}
 	return nil
 }
 
@@ -68,6 +112,50 @@ func (b *ContainerBackend) CloseJob() error {
 		return fmt.Errorf("remove job container: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// ReadFile reads a workspace file from inside the job container via
+// `docker exec <container> cat`, capped at maxBytes. Paths are constrained to
+// the mounted workspace and resolved against the container's view, so a
+// symlink planted in the workspace can only resolve inside the sandbox.
+func (b *ContainerBackend) ReadFile(ctx context.Context, path string, maxBytes int64) ([]byte, error) {
+	if b.container == "" || b.docker == "" {
+		return nil, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("container job session is not started")}
+	}
+	rel, err := filepath.Rel(b.workspace, path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil, fmt.Errorf("output path is outside mounted workspace")
+	}
+	containerPath := "/workspace"
+	if rel != "." && rel != "" {
+		containerPath += "/" + filepath.ToSlash(rel)
+	}
+	cmd := exec.CommandContext(ctx, b.docker, "exec", b.container, "cat", containerPath)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(stdout, maxBytes+1))
+	waitErr := cmd.Wait()
+	if waitErr != nil {
+		msg := strings.ToLower(stderr.String())
+		if strings.Contains(msg, "no such file") || strings.Contains(msg, "cannot open") {
+			return nil, os.ErrNotExist
+		}
+		return nil, fmt.Errorf("read output file in container: %v: %s", waitErr, strings.TrimSpace(stderr.String()))
+	}
+	if readErr != nil {
+		return nil, readErr
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("output file exceeds %d byte limit", maxBytes)
+	}
+	return data, nil
 }
 
 func (b *ContainerBackend) Run(ctx context.Context, c Command, emit func(string)) error {
@@ -122,14 +210,10 @@ func streamCommand(ctx context.Context, cmd *exec.Cmd, emit func(string)) error 
 		return &RunError{Kind: ErrorInfra, Err: err}
 	}
 	done := make(chan struct{}, 2)
-	for _, r := range []interface{ Read([]byte) (int, error) }{stdout, stderr} {
-		go func(rd interface{ Read([]byte) (int, error) }) {
-			s := bufio.NewScanner(rd)
-			s.Buffer(make([]byte, 64*1024), 1<<20)
-			for s.Scan() {
-				emit(strings.TrimRight(s.Text(), "\r"))
-			}
-			done <- struct{}{}
+	for _, r := range []io.Reader{stdout, stderr} {
+		go func(rd io.Reader) {
+			defer func() { done <- struct{}{} }()
+			streamLines(rd, defaultMaxLine, emit)
 		}(r)
 	}
 	err = cmd.Wait()

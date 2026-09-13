@@ -35,6 +35,18 @@ type Options struct {
 	DependencyStatus model.Status
 	NeedsOutputs     map[string]map[string]string
 	CacheNamespace   string
+	// InheritEnv opts into inheriting the full host environment instead of
+	// the minimal clean env. Local trusted runs only; distributed runners
+	// must never set this.
+	InheritEnv bool
+	// PassEnv is an explicit allowlist of extra host env var names carried
+	// into job environments. Together with the clean env, these are the only
+	// host variables that reach remote jobs.
+	PassEnv []string
+	// RequireImmutableImages rejects container images and Tart VM references
+	// that are not pinned by an @sha256: digest. The server enables this for
+	// untrusted jobs.
+	RequireImmutableImages bool
 }
 
 type Executor struct {
@@ -174,29 +186,30 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		ctx, cancel = context.WithTimeout(ctx, jobTimeout)
 		defer cancel()
 	}
-	env := mergeEnv(os.Environ(), s.Env, cj.Job.Env)
-	env = append(env, "KIWI=true", "KIWI_RUN_ID="+e.Opt.RunID, "KIWI_JOB_ID="+cj.ID)
-	allSecrets := append([]string{}, s.Secrets...)
-	for _, st := range cj.Job.Steps {
-		allSecrets = append(allSecrets, st.Secrets...)
+	baseEnv := cleanExecutionEnv()
+	if e.Opt.InheritEnv {
+		// Local trusted opt-in only; distributed runners must never set it.
+		baseEnv = osEnvironMap()
 	}
-	if e.Opt.SecretProvider != nil {
-		seen := map[string]bool{}
-		for _, name := range allSecrets {
-			if seen[name] {
-				continue
-			}
-			seen[name] = true
-			v, er := e.Opt.SecretProvider.Get(ctx, name)
-			if er != nil {
-				res.Status = model.StatusFailure
-				res.Error = er.Error()
-				return finish(res)
-			}
-			e.Masker.Add(v)
-			env = append(env, secretEnvName(name)+"="+v)
+	for _, name := range e.Opt.PassEnv {
+		if v, ok := os.LookupEnv(name); ok {
+			baseEnv[name] = v
 		}
 	}
+	jobEnv := mergeEnvMap(baseEnv, s.Env, cj.Job.Env)
+	secretCache := map[string]string{}
+	jobSecrets, secErr := e.resolveSecrets(ctx, s.Secrets, secretCache)
+	if secErr != nil {
+		res.Status = model.StatusFailure
+		res.Error = secErr.Error()
+		return finish(res)
+	}
+	for k, v := range jobSecrets {
+		jobEnv[k] = v
+	}
+	jobEnv["KIWI"] = "true"
+	jobEnv["KIWI_RUN_ID"] = e.Opt.RunID
+	jobEnv["KIWI_JOB_ID"] = cj.ID
 	for _, c := range cj.Job.Cache {
 		bases := append([]string{c.Key}, c.RestoreKeys...)
 		restored := false
@@ -225,23 +238,40 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			e.log(cj.ID, "cache", "miss "+cacheName(c))
 		}
 	}
+	networkPolicy := cj.Job.Sandbox.Network
+	if networkPolicy == pipeline.NetworkPolicyDefault && cj.Job.Network == "none" {
+		networkPolicy = pipeline.NetworkPolicyNone
+	}
 	network := cj.Job.Network
 	cleanupServices := func() {}
 	if cj.Job.Runtime == "container" && len(cj.Job.Services) > 0 {
+		isolated := networkPolicy == pipeline.NetworkPolicyNone || networkPolicy == pipeline.NetworkPolicyServicesOnly
 		var er error
-		network, cleanupServices, er = startContainerServices(ctx, e.Opt.RunID, cj.ID, cj.Job.Services, cj.Job.Network == "none", func(line string) { e.log(cj.ID, "service", line) })
+		network, cleanupServices, er = startContainerServices(ctx, e.Opt.RunID, cj.ID, cj.Job.Services, isolated, func(line string) { e.log(cj.ID, "service", line) })
 		if er != nil {
 			res.Status = model.StatusFailure
 			res.Error = er.Error()
 			return finish(res)
 		}
 		defer cleanupServices()
+	} else if networkPolicy == pipeline.NetworkPolicyNone || networkPolicy == pipeline.NetworkPolicyServicesOnly {
+		// No services to reach: fully disable networking. The container
+		// backend honors network "none"; the tart backend fails closed.
+		network = "none"
 	}
 	backend, err := BackendForNetwork(cj.Job.Runtime, cj.Job.Image, cj.Job.VM, network)
 	if err != nil {
 		res.Status = model.StatusFailure
 		res.Error = err.Error()
 		return finish(res)
+	}
+	switch b := backend.(type) {
+	case *ContainerBackend:
+		b.RequireImmutableImages = e.Opt.RequireImmutableImages
+		b.Rootless = cj.Job.Sandbox.Rootless
+		b.ReadOnlyRootFS = cj.Job.Sandbox.ReadOnlyRootFS
+	case *TartBackend:
+		b.RequireImmutableImages = e.Opt.RequireImmutableImages
 	}
 	if lifecycle, ok := backend.(JobLifecycle); ok {
 		if err := lifecycle.StartJob(ctx, e.Opt.Workspace, func(line string) { e.log(cj.ID, "runtime", line) }); err != nil {
@@ -312,13 +342,32 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		if backoff == 0 {
 			backoff = time.Second
 		}
-		stepEnv := mergeEnv(env, st.Env)
+		stepEnvMap := mergeEnvMap(jobEnv, st.Env)
+		stepSecrets, secErr := e.resolveSecrets(ctx, st.Secrets, secretCache)
+		if secErr != nil {
+			res.Status = model.StatusFailure
+			res.Error = secErr.Error()
+			res.Outputs = pipeline.InterpolateOutputMap(cj.Job.Outputs, needsOutputs, stepOutputs)
+			e.saveArtifacts(s, cj, res.Status)
+			return finish(res)
+		}
+		for k, v := range stepSecrets {
+			stepEnvMap[k] = v
+		}
 		outputFile := filepath.Join(dir, fmt.Sprintf(".kiwi-output-%d", i+1))
-		_ = os.Remove(outputFile)
-		stepEnv = mergeEnv(stepEnv, map[string]string{"KIWI_OUTPUT": filepath.Base(outputFile)})
+		if _, isNative := backend.(*NativeBackend); isNative {
+			// Only the native backend may touch the workspace on the host;
+			// container/Tart output files are cleaned up inside the sandbox
+			// or together with the workspace temp dir.
+			_ = os.Remove(outputFile)
+		}
+		stepEnvMap["KIWI_OUTPUT"] = filepath.Base(outputFile)
+		stepEnv := envSlice(stepEnvMap)
 		var runErr error
 		for attempt := 1; attempt <= attempts; attempt++ {
-			_ = os.Remove(outputFile)
+			if _, isNative := backend.(*NativeBackend); isNative {
+				_ = os.Remove(outputFile)
+			}
 			res.Attempts++
 			e.log(cj.ID, name, fmt.Sprintf("running on %s (attempt %d/%d)", backend.Name(), attempt, attempts))
 			runErr = backend.Run(ctx, Command{Shell: shell, Script: st.Run, Dir: dir, Env: stepEnv, TimeoutSeconds: int64(timeout.Seconds())}, func(line string) { e.log(cj.ID, name, line) })
@@ -340,14 +389,23 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			}
 		}
 		if st.ID != "" {
-			vals, outErr := readOutputFile(outputFile)
-			_ = os.Remove(outputFile)
-			if outErr != nil {
+			data, outErr := backend.ReadFile(ctx, outputFile, 1<<20)
+			switch {
+			case errors.Is(outErr, os.ErrNotExist):
+				// Step wrote no outputs; treat as empty.
+				stepOutputs[st.ID] = map[string]string{}
+			case outErr != nil:
 				runErr = &RunError{Kind: ErrorFailure, Err: fmt.Errorf("step outputs: %w", outErr)}
-			} else {
-				stepOutputs[st.ID] = vals
+			default:
+				vals, parseErr := readOutputFile(data)
+				if parseErr != nil {
+					runErr = &RunError{Kind: ErrorFailure, Err: fmt.Errorf("step outputs: %w", parseErr)}
+				} else {
+					stepOutputs[st.ID] = vals
+				}
 			}
-		} else {
+		}
+		if _, isNative := backend.(*NativeBackend); isNative {
 			_ = os.Remove(outputFile)
 		}
 		if runErr != nil {
@@ -504,31 +562,35 @@ func cloneOutputs(in map[string]string) map[string]string {
 	return out
 }
 
-func mergeEnv(base []string, maps ...map[string]string) []string {
-	m := map[string]string{}
-	for _, e := range base {
-		if i := strings.IndexByte(e, '='); i > 0 {
-			m[e[:i]] = e[i+1:]
-		}
-	}
-	for _, x := range maps {
-		for k, v := range x {
-			m[k] = v
-		}
-	}
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	out := make([]string, 0, len(keys))
-	for _, k := range keys {
-		out = append(out, k+"="+m[k])
-	}
-	return out
-}
 func secretEnvName(s string) string {
 	return "KIWI_SECRET_" + strings.ToUpper(strings.NewReplacer("-", "_", ".", "_").Replace(s))
+}
+
+// resolveSecrets fetches the named secrets (deduplicated via cache), registers
+// their values with the masker, and returns them as KIWI_SECRET_* env pairs.
+// Job-level secrets are resolved once into the job env (job-wide); step-level
+// secrets are resolved into that step's env only, so a secret declared on one
+// step never reaches other steps, and secret values never reach cache keys or
+// persisted state.
+func (e *Executor) resolveSecrets(ctx context.Context, names []string, cache map[string]string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, name := range names {
+		v, ok := cache[name]
+		if !ok {
+			if e.Opt.SecretProvider == nil {
+				continue
+			}
+			var er error
+			v, er = e.Opt.SecretProvider.Get(ctx, name)
+			if er != nil {
+				return nil, er
+			}
+			e.Masker.Add(v)
+			cache[name] = v
+		}
+		out[secretEnvName(name)] = v
+	}
+	return out, nil
 }
 func defaultShell(runtimeKind string) string {
 	if runtimeKind == "container" {

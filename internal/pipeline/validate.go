@@ -35,6 +35,14 @@ func Validate(s *Spec) error {
 		default:
 			return fmt.Errorf("job %q has unsupported runtime %q", id, j.Runtime)
 		}
+		switch j.Network {
+		case "", "bridge", "host", "none":
+		default:
+			return fmt.Errorf("job %q has unsupported network %q (want one of bridge, host, none)", id, j.Network)
+		}
+		if j.Sandbox.Network < NetworkPolicyDefault || j.Sandbox.Network > NetworkPolicyInternet {
+			return fmt.Errorf("job %q has invalid sandbox.network value %d", id, j.Sandbox.Network)
+		}
 	}
 	if cyc := findCycle(s.Jobs); len(cyc) > 0 {
 		return fmt.Errorf("dependency cycle: %s", strings.Join(cyc, " -> "))

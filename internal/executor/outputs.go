@@ -2,23 +2,16 @@ package executor
 
 import (
 	"errors"
-	"os"
 	"strings"
 )
 
-// readOutputFile parses a step's KIWI_OUTPUT file. The format is one KEY=VALUE
-// pair per line; a value may contain '='. A missing file (the step wrote no
-// outputs) yields an empty map rather than an error.
-func readOutputFile(path string) (map[string]string, error) {
+// readOutputFile parses a step's KIWI_OUTPUT file content. The format is one
+// KEY=VALUE pair per line; a value may contain '='. A missing file (the step
+// wrote no outputs) is handled by the caller, which yields an empty map rather
+// than an error.
+func readOutputFile(data []byte) (map[string]string, error) {
 	out := map[string]string{}
-	b, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return out, nil
-	}
-	if err != nil {
-		return out, err
-	}
-	for _, line := range strings.Split(string(b), "\n") {
+	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimRight(line, "\r")
 		if strings.TrimSpace(line) == "" {
 			continue

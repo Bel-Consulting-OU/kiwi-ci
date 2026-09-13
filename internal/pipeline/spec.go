@@ -85,6 +85,24 @@ type Permissions struct {
 	IDToken bool `yaml:"id_token,omitempty" json:"id_token,omitempty"`
 }
 
+// NetworkPolicy declares how strongly a job's network access is restricted.
+type NetworkPolicy int
+
+const (
+	NetworkPolicyDefault      NetworkPolicy = iota // runtime default / bridge
+	NetworkPolicyNone                              // no network at all
+	NetworkPolicyServicesOnly                      // only the job's declared services
+	NetworkPolicyInternet                          // unrestricted internet access
+)
+
+// Sandbox collects job-level sandboxing requirements. Enforced by the
+// executor backends; distributed runners must honor them for untrusted jobs.
+type Sandbox struct {
+	Rootless       bool          `yaml:"rootless,omitempty" json:"rootless,omitempty"`
+	ReadOnlyRootFS bool          `yaml:"read_only_rootfs,omitempty" json:"read_only_rootfs,omitempty"`
+	Network        NetworkPolicy `yaml:"network,omitempty" json:"network,omitempty"`
+}
+
 type Job struct {
 	Name         string            `yaml:"name,omitempty" json:"name,omitempty"`
 	Needs        []string          `yaml:"needs,omitempty" json:"needs,omitempty"`
@@ -111,6 +129,7 @@ type Job struct {
 	InfraRetries int               `yaml:"infra_retries,omitempty" json:"infra_retries,omitempty"`
 	Permissions  Permissions       `yaml:"permissions,omitempty" json:"permissions,omitempty"`
 	Outputs      map[string]string `yaml:"outputs,omitempty" json:"outputs,omitempty"`
+	Sandbox      Sandbox           `yaml:"sandbox,omitempty" json:"sandbox,omitempty"`
 }
 
 type Service struct {

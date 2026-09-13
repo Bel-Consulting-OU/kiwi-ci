@@ -10,14 +10,26 @@ import (
 	"github.com/kiwici/kiwi/internal/pipeline"
 )
 
+// serviceNetworkArgs builds the `docker network create` arguments for the
+// job's services network. A plain user-defined bridge HAS a route to the
+// outside world by default; the --internal flag removes that route, which is
+// what preserves the isolation guarantee when untrusted jobs declare
+// services. Extracted as a pure function so it can be unit tested without a
+// docker daemon.
+func serviceNetworkArgs(isolated bool) []string {
+	args := []string{"create", "--driver", "bridge"}
+	if isolated {
+		args = append(args, "--internal")
+	}
+	return args
+}
+
 // startContainerServices creates one dedicated user-defined bridge network for
 // the job, starts every declared service container on it, and waits for their
 // healthchecks. The job container itself is attached to this same network, so
-// services resolve by name. A dedicated bridge has no route to the outside
-// world, which preserves the "none" isolation guarantee even when untrusted
-// jobs declare services.
+// services resolve by name. When isolated is true the network is created with
+// --internal, giving the job and its services no route to the outside world.
 func startContainerServices(ctx context.Context, runID, jobID string, services []pipeline.Service, isolated bool, emit func(string)) (string, func(), error) {
-	_ = isolated
 	docker, err := exec.LookPath("docker")
 	if err != nil {
 		return "", func() {}, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("docker not found: %w", err)}
@@ -27,7 +39,8 @@ func startContainerServices(ctx context.Context, runID, jobID string, services [
 	if len(network) > 60 {
 		network = network[:60]
 	}
-	if out, err := exec.CommandContext(ctx, docker, "network", "create", "--driver", "bridge", network).CombinedOutput(); err != nil {
+	createArgs := append(serviceNetworkArgs(isolated), network)
+	if out, err := exec.CommandContext(ctx, docker, append([]string{"network"}, createArgs...)...).CombinedOutput(); err != nil {
 		return "", func() {}, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("create services network: %v: %s", err, strings.TrimSpace(string(out)))}
 	}
 	containers := make([]string, 0, len(services))
@@ -50,7 +63,15 @@ func startContainerServices(ctx context.Context, runID, jobID string, services [
 			cleanupAll()
 			return "", func() {}, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("service %q has no image", name)}
 		}
-		args := []string{"run", "-d", "--rm", "--network=" + network, "--name", name}
+		// Every service runs maximally hardened. The user is hard-coded to
+		// 65534:65534 (nobody) rather than omitted: images known to require
+		// root are not a reason to weaken isolation for the rest.
+		args := []string{"run", "-d", "--rm", "--network=" + network, "--name", name,
+			"--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
+			"--tmpfs", "/tmp:rw,nosuid,nodev",
+			"--pids-limit=256", "--memory=2g", "--cpus=2",
+			"--user=65534:65534",
+		}
 		for k, v := range svc.Env {
 			args = append(args, "-e", k+"="+v)
 		}

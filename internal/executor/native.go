@@ -1,18 +1,26 @@
 package executor
 
 import (
-	"bufio"
 	"context"
 	"fmt"
-	"io"
 	"os/exec"
-	"strings"
 	"time"
 )
 
 type NativeBackend struct{}
 
 func (*NativeBackend) Name() string { return "native" }
+
+// ReadFile reads a workspace file on the host without following symlinks in
+// the final path component, so an attacker-controlled workspace cannot
+// redirect step-output reads to arbitrary host files.
+func (*NativeBackend) ReadFile(ctx context.Context, path string, maxBytes int64) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return readFileNoFollow(path, maxBytes)
+}
+
 func (*NativeBackend) Run(ctx context.Context, c Command, emit func(string)) error {
 	shell := c.Shell
 	if shell == "" {
@@ -37,8 +45,8 @@ func (*NativeBackend) Run(ctx context.Context, c Command, emit func(string)) err
 		return &RunError{Kind: ErrorInfra, Err: err}
 	}
 	done := make(chan struct{}, 2)
-	go scan(stdout, emit, done)
-	go scan(stderr, emit, done)
+	go func() { defer func() { done <- struct{}{} }(); streamLines(stdout, defaultMaxLine, emit) }()
+	go func() { defer func() { done <- struct{}{} }(); streamLines(stderr, defaultMaxLine, emit) }()
 	wait := make(chan error, 1)
 	go func() { wait <- cmd.Wait() }()
 	select {
@@ -64,14 +72,5 @@ func (*NativeBackend) Run(ctx context.Context, c Command, emit func(string)) err
 			kind = ErrorTimeout
 		}
 		return &RunError{Kind: kind, Err: fmt.Errorf("command stopped: %w", ctx.Err())}
-	}
-}
-func scan(r io.Reader, emit func(string), done chan<- struct{}) {
-	defer func() { done <- struct{}{} }()
-	s := bufio.NewScanner(r)
-	buf := make([]byte, 64*1024)
-	s.Buffer(buf, 1024*1024)
-	for s.Scan() {
-		emit(strings.TrimRight(s.Text(), "\r"))
 	}
 }
