@@ -7,13 +7,16 @@ import (
 )
 
 type SubmitRun struct {
-	RepoURL      string            `json:"repo_url"`
-	RepoFullName string            `json:"repo_full_name,omitempty"`
-	Ref          string            `json:"ref"`
-	SHA          string            `json:"sha,omitempty"`
-	Event        string            `json:"event,omitempty"`
-	Pipeline     string            `json:"pipeline"`
-	Trusted      bool              `json:"trusted"`
+	RepoURL      string `json:"repo_url"`
+	RepoFullName string `json:"repo_full_name,omitempty"`
+	Ref          string `json:"ref"`
+	SHA          string `json:"sha,omitempty"`
+	Event        string `json:"event,omitempty"`
+	Pipeline     string `json:"pipeline"`
+	// Trusted is deliberately never accepted from client JSON: direct API
+	// submissions are untrusted. Only forge webhook handlers and internal
+	// reruns (which copy the previous run's trust) set it in Go code.
+	Trusted      bool              `json:"-"`
 	ChangedFiles []string          `json:"changed_files,omitempty"`
 	Metadata     map[string]string `json:"metadata,omitempty"`
 }

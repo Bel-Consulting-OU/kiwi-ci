@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -28,6 +30,12 @@ func RunLocal(ctx context.Context, args []string) error {
 	job := fs.String("job", "", "run one job and its matrix variants")
 	parallel := fs.Int("max-parallel", 0, "maximum concurrent jobs")
 	jsonOut := fs.Bool("json", false, "print final results as JSON")
+	// Local runs inherit the host environment by default for parity with a
+	// developer shell; distributed runners never inherit. --no-inherit-env
+	// and --pass-env make the boundary explicit.
+	inheritEnv := fs.Bool("inherit-env", true, "inherit the host environment for local runs")
+	noInheritEnv := fs.Bool("no-inherit-env", false, "start from the clean environment instead of the host environment")
+	passEnv := fs.String("pass-env", "", "comma-separated host environment variables to pass (overrides --inherit-env)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -43,10 +51,22 @@ func RunLocal(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	runID, err := newLocalRunID()
+	if err != nil {
+		return err
+	}
 	masker := &secrets.Masker{}
 	logs := &logging.Console{Writer: os.Stdout, Masker: masker}
 	provider := secrets.Chain{secrets.EnvProvider{Prefix: "KIWI_SECRET_"}, secrets.MacKeychainProvider{Service: "kiwi-ci"}}
-	ex := executor.Executor{Opt: executor.Options{Workspace: wd, MaxParallel: *parallel, OnlyJob: *job, ChangedFiles: detectChangedFiles(wd), SecretProvider: provider, Logs: logs}, Masker: masker}
+	opts := executor.Options{Workspace: wd, RunID: runID, MaxParallel: *parallel, OnlyJob: *job, ChangedFiles: detectChangedFiles(wd), SecretProvider: provider, Logs: logs}
+	if vars := splitEnvNames(*passEnv); len(vars) > 0 {
+		// Explicit allowlist: only these vars plus the clean env; the
+		// inherit-env default is ignored.
+		opts.PassEnv = vars
+	} else {
+		opts.InheritEnv = *inheritEnv && !*noInheritEnv
+	}
+	ex := executor.Executor{Opt: opts, Masker: masker}
 	res, runErr := ex.Run(ctx, g)
 	if *jsonOut {
 		b, _ := json.MarshalIndent(res, "", "  ")
@@ -55,6 +75,24 @@ func RunLocal(ctx context.Context, args []string) error {
 		printSummary(res)
 	}
 	return runErr
+}
+
+func newLocalRunID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func splitEnvNames(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 func Validate(args []string) error {

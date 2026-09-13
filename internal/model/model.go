@@ -66,6 +66,7 @@ type Job struct {
 	EnvironmentBranches    []string                     `json:"environment_branches,omitempty"`
 	EnvironmentConcurrency int                          `json:"environment_concurrency,omitempty"`
 	OIDCAllowed            bool                         `json:"oidc_allowed,omitempty"`
+	OIDCAudiences          []string                     `json:"oidc_audiences,omitempty"`
 	Status                 Status                       `json:"status"`
 	Priority               int                          `json:"priority,omitempty"`
 	MaxInfraRetries        int                          `json:"max_infra_retries,omitempty"`
@@ -77,10 +78,12 @@ type Job struct {
 	NeedsOutputs           map[string]map[string]string `json:"needs_outputs,omitempty"`
 	Attempts               int                          `json:"attempts"`
 	LeaseRunnerID          string                       `json:"lease_runner_id,omitempty"`
-	LeaseToken             string                       `json:"lease_token,omitempty"`
-	LeaseGeneration        int64                        `json:"lease_generation,omitempty"`
-	LeaseExpiresAt         *time.Time                   `json:"lease_expires_at,omitempty"`
-	ApprovedBy             string                       `json:"approved_by,omitempty"`
+	// LeaseTokenHash is the HMAC-SHA256 of the raw lease token under the
+	// server's lease key. The raw token is never persisted anywhere.
+	LeaseTokenHash  []byte     `json:"lease_token_hash,omitempty"`
+	LeaseGeneration int64      `json:"lease_generation,omitempty"`
+	LeaseExpiresAt  *time.Time `json:"lease_expires_at,omitempty"`
+	ApprovedBy      string     `json:"approved_by,omitempty"`
 }
 
 type Runner struct {
@@ -165,4 +168,14 @@ type JobResult struct {
 	Attempts   int               `json:"attempts"`
 	Error      string            `json:"error,omitempty"`
 	Outputs    map[string]string `json:"outputs,omitempty"`
+}
+
+// CompletionReceipt deduplicates runner completion requests so a retried
+// complete() after a lost response is idempotent for the same generation.
+// ResultHash is the SHA-256 of the canonicalized completion payload.
+type CompletionReceipt struct {
+	JobID      string `json:"job_id"`
+	Generation int64  `json:"generation"`
+	RunnerID   string `json:"runner_id"`
+	ResultHash string `json:"result_hash"`
 }

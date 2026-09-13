@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,6 +29,13 @@ import (
 	"github.com/kiwici/kiwi/internal/testintel"
 )
 
+const (
+	envAllowInsecureClone = "KIWI_ALLOW_INSECURE_CLONE"
+	envAllowedSSHHosts    = "KIWI_GIT_ALLOWED_SSH_HOSTS"
+	envAllowedHTTPSHosts  = "KIWI_GIT_ALLOWED_HTTPS_HOSTS"
+	envRunnerAllowInsec   = "KIWI_RUNNER_ALLOW_INSECURE"
+)
+
 type Config struct {
 	Server, Token, Name string
 	Labels              []string
@@ -45,6 +53,9 @@ func (r *Runner) Run(ctx context.Context) error {
 	if r.Client == nil {
 		r.Client = &http.Client{Timeout: 65 * time.Second}
 	}
+	// Credential-bearing runner traffic must never follow redirects to a
+	// different origin.
+	r.Client = server.NoRedirectClient(r.Client)
 	if r.Cfg.Poll == 0 {
 		r.Cfg.Poll = 2 * time.Second
 	}
@@ -53,6 +64,9 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	if r.Cfg.Concurrency <= 0 {
 		r.Cfg.Concurrency = 1
+	}
+	if err := validateServerURL(r.Cfg.Server); err != nil {
+		return err
 	}
 	if err := r.register(ctx); err != nil {
 		return err
@@ -186,7 +200,10 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	cacheStore := cache.Default()
 	cacheStore.RemoteURL, cacheStore.Token, cacheStore.Client = r.Cfg.Server, r.Cfg.Token, r.Client
 	reporter := func(_ string, name, path string) error { return r.uploadArtifact(parent, t, name, path) }
-	ex := executor.Executor{Opt: executor.Options{Workspace: tmp, RunID: t.Job.RunID, Event: t.Job.Event, Branch: branchFromRef(t.Job.Ref), ChangedFiles: effectiveChangedFiles(t.Job.ChangedFiles, tmp), SecretProvider: provider, Logs: sink, Cache: cacheStore, ArtifactReporter: reporter, DependencyStatus: t.Job.DependencyStatus, NeedsOutputs: t.Job.NeedsOutputs, CacheNamespace: cacheNamespace(t.Job)}, Masker: masker}
+	// Distributed runs always start from the clean env (InheritEnv is left
+	// false and no PassEnv allowlist is set); untrusted jobs additionally
+	// require image references pinned by digest.
+	ex := executor.Executor{Opt: executor.Options{Workspace: tmp, RunID: t.Job.RunID, Event: t.Job.Event, Branch: branchFromRef(t.Job.Ref), ChangedFiles: effectiveChangedFiles(t.Job.ChangedFiles, tmp), SecretProvider: provider, Logs: sink, Cache: cacheStore, ArtifactReporter: reporter, DependencyStatus: t.Job.DependencyStatus, NeedsOutputs: t.Job.NeedsOutputs, CacheNamespace: cacheNamespace(t.Job), RequireImmutableImages: !t.Job.Trusted}, Masker: masker}
 	res := ex.RunCompiledJob(ctx, spec, cj)
 	if len(cj.Job.TestReports) > 0 {
 		report, er := testintel.Aggregate(tmp, cj.Job.TestReports)
@@ -207,26 +224,53 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 }
 
 func (r *Runner) heartbeatLoop(ctx context.Context, cancel context.CancelFunc, t server.Task, done <-chan struct{}) {
-	ticker := time.NewTicker(r.Cfg.Heartbeat)
+	interval := r.Cfg.Heartbeat
+	// The interval must stay comfortably below the control-plane lease
+	// duration so the pre-emptive self-cancel never fires on a healthy
+	// connection.
+	if interval > 15*time.Second {
+		interval = 15 * time.Second
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	deadline := t.LeaseExpiresAt
+	if deadline.IsZero() {
+		deadline = time.Now().Add(30 * time.Second)
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-done:
 			return
-		case <-ticker.C:
+		case now := <-ticker.C:
 			var out server.HeartbeatResponse
 			err := r.post(ctx, "/api/v1/jobs/"+t.Job.ID+"/heartbeat", server.Heartbeat{RunnerID: r.ID, LeaseToken: t.LeaseToken, LeaseGeneration: t.LeaseGeneration}, &out)
-			if err != nil {
-				continue
-			}
-			if out.Cancel {
+			var cancelNow bool
+			deadline, cancelNow = heartbeatTick(now, deadline, &out, err)
+			if cancelNow {
 				cancel()
 				return
 			}
 		}
 	}
+}
+
+// heartbeatTick decides the next lease deadline and whether the job must be
+// cancelled now. When the control plane is unreachable the deadline is not
+// extended, so a job self-cancels before its lease expires and the control
+// plane can safely requeue it.
+func heartbeatTick(now, deadline time.Time, resp *server.HeartbeatResponse, err error) (time.Time, bool) {
+	if now.Add(2 * time.Second).After(deadline) {
+		return deadline, true
+	}
+	if err != nil {
+		return deadline, false
+	}
+	if resp.Cancel {
+		return deadline, true
+	}
+	return resp.LeaseExpiresAt, false
 }
 
 func statusForErr(ctx context.Context, err error) model.Status {
@@ -269,12 +313,13 @@ func changedFiles(dir string) []string {
 }
 
 func (r *Runner) checkout(ctx context.Context, j model.Job, dir string) error {
+	gitEnv, err := gitEnvForRepo(j.RepoURL, os.Environ())
+	if err != nil {
+		return err
+	}
 	args := []string{"clone", "--filter=blob:none", "--no-checkout", j.RepoURL, dir}
 	cmdClone := exec.CommandContext(ctx, "git", args...)
-	cmdClone.Env = os.Environ()
-	if token := os.Getenv("KIWI_GITHUB_TOKEN"); token != "" {
-		cmdClone.Env = append(cmdClone.Env, "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=http.extraHeader", "GIT_CONFIG_VALUE_0=Authorization: Bearer "+token)
-	}
+	cmdClone.Env = gitEnv
 	if out, err := cmdClone.CombinedOutput(); err != nil {
 		return fmt.Errorf("git clone: %v: %s", err, out)
 	}
@@ -286,10 +331,104 @@ func (r *Runner) checkout(ctx context.Context, j model.Job, dir string) error {
 		ref = "HEAD"
 	}
 	cmd := exec.CommandContext(ctx, "git", "-C", dir, "checkout", "--force", ref)
+	cmd.Env = gitEnv
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git checkout: %v: %s", err, out)
 	}
 	return nil
+}
+
+// gitEnvForRepo builds the environment for git clone/checkout commands from
+// a repo URL. It rejects URLs that could exfiltrate credentials or trick git
+// options, strips KIWI_GIT_TOKEN_* values from the environment entirely, and
+// injects host-scoped (never global) Authorization config for https clones.
+func gitEnvForRepo(repoURL string, osEnv []string) ([]string, error) {
+	if strings.HasPrefix(repoURL, "-") {
+		return nil, fmt.Errorf("refusing git repo URL that looks like an option: %q", repoURL)
+	}
+	u, err := url.Parse(repoURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid repo URL: %w", err)
+	}
+	// Embedded credentials are never accepted, except the conventional
+	// username-only ssh form (git@host): a password in a URL always leaks.
+	if u.User != nil {
+		_, hasPass := u.User.Password()
+		if u.Scheme != "ssh" || hasPass {
+			return nil, fmt.Errorf("refusing repo URL with embedded credentials")
+		}
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("refusing repo URL with query or fragment")
+	}
+	host := u.Hostname()
+	switch u.Scheme {
+	case "https":
+		allowed := append([]string{"github.com"}, splitCSV(os.Getenv(envAllowedHTTPSHosts))...)
+		if !containsHost(allowed, host) {
+			return nil, fmt.Errorf("https clone from host %q is not allowed (see %s)", host, envAllowedHTTPSHosts)
+		}
+	case "ssh":
+		allowed := append([]string{"github.com"}, splitCSV(os.Getenv(envAllowedSSHHosts))...)
+		if !containsHost(allowed, host) {
+			return nil, fmt.Errorf("ssh clone from host %q is not allowed (see %s)", host, envAllowedSSHHosts)
+		}
+	case "http":
+		if !isLoopbackHost(host) || os.Getenv(envAllowInsecureClone) != "1" {
+			return nil, fmt.Errorf("refusing insecure http clone from %q (loopback + %s=1 required)", host, envAllowInsecureClone)
+		}
+	case "file", "git":
+		return nil, fmt.Errorf("refusing %s clone URL", u.Scheme)
+	default:
+		return nil, fmt.Errorf("unsupported or missing clone URL scheme %q", u.Scheme)
+	}
+
+	// Copy the environment, stripping every KIWI_GIT_TOKEN_* value so deploy
+	// tokens never leak into the job environment.
+	out := make([]string, 0, len(osEnv)+3)
+	for _, kv := range osEnv {
+		if strings.HasPrefix(kv, "KIWI_GIT_TOKEN_") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	if u.Scheme == "https" {
+		// Exact-host token match: KIWI_GIT_TOKEN_<HOST with . and - mapped
+		// to _>. The git config is scoped to this host only.
+		tokenVar := "KIWI_GIT_TOKEN_" + strings.ToUpper(strings.NewReplacer(".", "_", "-", "_").Replace(host))
+		if token := os.Getenv(tokenVar); token != "" {
+			out = append(out,
+				"GIT_CONFIG_COUNT=1",
+				"GIT_CONFIG_KEY_0=http.https://"+host+"/.extraHeader",
+				"GIT_CONFIG_VALUE_0=Authorization: Bearer "+token,
+			)
+		}
+	}
+	return out, nil
+}
+
+func isLoopbackHost(host string) bool {
+	switch host {
+	case "127.0.0.1", "localhost", "::1":
+		return true
+	}
+	return false
+}
+
+func containsHost(list []string, host string) bool {
+	for _, h := range list {
+		if h = strings.TrimSpace(h); h != "" && h == host {
+			return true
+		}
+	}
+	return false
+}
+
+func splitCSV(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	return strings.Split(s, ",")
 }
 func (r *Runner) restoreDownloads(ctx context.Context, t server.Task, inputs []pipeline.ArtifactInput, workspace string) error {
 	if len(inputs) == 0 {
@@ -462,4 +601,30 @@ func (r *Runner) auth(req *http.Request) {
 	if r.Cfg.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+r.Cfg.Token)
 	}
+}
+
+// validateServerURL rejects plaintext-HTTP control-plane URLs that are not
+// loopback: runner tokens are bearer credentials and must not travel
+// unencrypted off-host. KIWI_RUNNER_ALLOW_INSECURE=1 bypasses the check with
+// a warning for explicitly trusted networks.
+func validateServerURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid server URL %q: %w", raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("server URL %q must use http or https", raw)
+	}
+	if u.Scheme == "https" {
+		return nil
+	}
+	switch u.Hostname() {
+	case "127.0.0.1", "localhost", "::1":
+		return nil
+	}
+	if os.Getenv(envRunnerAllowInsec) == "1" {
+		fmt.Printf("warning: connecting to non-loopback server %q over plaintext HTTP (KIWI_RUNNER_ALLOW_INSECURE=1)\n", raw)
+		return nil
+	}
+	return fmt.Errorf("refusing plaintext HTTP to non-loopback server %q: use https:// or set KIWI_RUNNER_ALLOW_INSECURE=1", raw)
 }

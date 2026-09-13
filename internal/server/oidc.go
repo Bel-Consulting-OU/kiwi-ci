@@ -118,16 +118,32 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "job does not have permissions.id_token", 403)
 		return
 	}
+	// Defense in depth: admission already denies OIDC for untrusted jobs.
+	if !j.Trusted {
+		http.Error(w, "untrusted jobs may not issue id_tokens", 403)
+		return
+	}
+	// Per-job audience allowlist compiled from capabilities at enqueue time;
+	// nil means any audience.
+	if j.OIDCAudiences != nil && !containsString(j.OIDCAudiences, in.Audience) {
+		http.Error(w, "audience not allowed for this job", 403)
+		return
+	}
 	if j.Status != model.StatusRunning || j.LeaseExpiresAt == nil || !j.LeaseExpiresAt.After(now) {
 		http.Error(w, "job lease is not active", 409)
 		return
 	}
-	if len(token) != len(j.LeaseToken) || subtle.ConstantTimeCompare([]byte(token), []byte(j.LeaseToken)) != 1 {
+	if len(j.LeaseTokenHash) == 0 || subtle.ConstantTimeCompare(hashLeaseToken(s.leaseKey, token), j.LeaseTokenHash) != 1 {
 		http.Error(w, "invalid job token", 401)
 		return
 	}
 	sub := "repo:" + run.RepoFullName + ":ref:" + run.Ref + ":job:" + j.Key
-	claims := map[string]any{"iss": iss, "sub": sub, "aud": in.Audience, "iat": now.Unix(), "nbf": now.Add(-5 * time.Second).Unix(), "exp": now.Add(5 * time.Minute).Unix(), "jti": newID(), "repository": run.RepoFullName, "ref": run.Ref, "sha": run.SHA, "event": run.Event, "run_id": run.ID, "job_id": j.ID, "job": j.Key, "environment": j.Environment, "trusted": j.Trusted}
+	jti, err := newID()
+	if err != nil {
+		http.Error(w, "internal server error", 500)
+		return
+	}
+	claims := map[string]any{"iss": iss, "sub": sub, "aud": in.Audience, "iat": now.Unix(), "nbf": now.Add(-5 * time.Second).Unix(), "exp": now.Add(5 * time.Minute).Unix(), "jti": jti, "repository": run.RepoFullName, "ref": run.Ref, "sha": run.SHA, "event": run.Event, "run_id": run.ID, "job_id": j.ID, "job": j.Key, "environment": j.Environment, "trusted": j.Trusted}
 	jwt, err := s.signJWT(claims)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
@@ -149,4 +165,13 @@ func (s *Server) signJWT(claims map[string]any) (string, error) {
 	input := enc(h) + "." + enc(c)
 	sig := ed25519.Sign(s.oidc.Private, []byte(input))
 	return input + "." + enc(sig), nil
+}
+
+func containsString(list []string, v string) bool {
+	for _, e := range list {
+		if e == v {
+			return true
+		}
+	}
+	return false
 }

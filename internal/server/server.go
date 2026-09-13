@@ -2,14 +2,20 @@ package server
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
+	"os"
 	"path"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,7 +28,10 @@ import (
 	"github.com/kiwici/kiwi/internal/storage"
 )
 
-const defaultLeaseDuration = 45 * time.Second
+const (
+	defaultLeaseDuration  = 45 * time.Second
+	maxCompletionReceipts = 4096
+)
 
 type Server struct {
 	// Token remains for source compatibility; RunnerToken/AdminToken are authoritative.
@@ -35,24 +44,75 @@ type Server struct {
 	ExternalURL         string
 	LeaseDuration       time.Duration
 
-	mu         sync.Mutex
-	runs       map[string]model.Run
-	jobs       map[string]model.Job
-	runners    map[string]model.Runner
-	artifacts  map[string]model.ArtifactRecord
-	reports    map[string]model.TestReport
-	deliveries map[string]string
-	logSeq     int64
-	store      *storage.Repository
-	oidc       *oidcSigner
+	mu          sync.Mutex
+	runs        map[string]model.Run
+	jobs        map[string]model.Job
+	runners     map[string]model.Runner
+	artifacts   map[string]model.ArtifactRecord
+	reports     map[string]model.TestReport
+	deliveries  map[string]string
+	completions map[string]model.CompletionReceipt
+	leaseKey    []byte
+	logSeq      int64
+	store       *storage.Repository
+	oidc        *oidcSigner
 }
 
 func New(token string) *Server {
+	key, err := newLeaseKey()
+	if err != nil {
+		// A fresh lease key is security-critical state; without entropy the
+		// control plane must not start.
+		panic("kiwi server: failed to generate lease key: " + err.Error())
+	}
 	return &Server{
 		Token: token, RunnerToken: token, AdminToken: token,
 		LeaseDuration: defaultLeaseDuration,
-		runs:          map[string]model.Run{}, jobs: map[string]model.Job{}, runners: map[string]model.Runner{}, artifacts: map[string]model.ArtifactRecord{}, reports: map[string]model.TestReport{}, deliveries: map[string]string{}, oidc: newOIDCSigner(),
+		runs:          map[string]model.Run{}, jobs: map[string]model.Job{}, runners: map[string]model.Runner{}, artifacts: map[string]model.ArtifactRecord{}, reports: map[string]model.TestReport{}, deliveries: map[string]string{}, completions: map[string]model.CompletionReceipt{}, leaseKey: key, oidc: newOIDCSigner(),
 	}
+}
+
+// newLeaseKey generates a 32-byte lease HMAC key from crypto/rand.
+func newLeaseKey() ([]byte, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+// loadLeaseKey loads the persisted lease HMAC key from dataDir, generating and
+// persisting a fresh one on first use. The key is what lets lease tokens
+// survive control-plane restarts: only their HMAC is stored in job state.
+func loadLeaseKey(root string) ([]byte, error) {
+	path := filepath.Join(root, "lease.key")
+	if b, err := os.ReadFile(path); err == nil {
+		raw, er := hex.DecodeString(strings.TrimSpace(string(b)))
+		if er != nil {
+			return nil, er
+		}
+		if len(raw) != 32 {
+			return nil, fmt.Errorf("invalid lease key size")
+		}
+		return raw, nil
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	key, err := newLeaseKey()
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return nil, err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(hex.EncodeToString(key)), 0o600); err != nil {
+		return nil, err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return nil, err
+	}
+	return key, nil
 }
 
 func NewPersistent(runnerToken, adminToken, dataDir string) (*Server, error) {
@@ -67,6 +127,11 @@ func NewPersistent(runnerToken, adminToken, dataDir string) (*Server, error) {
 	} else {
 		s.oidc = signer
 	}
+	key, err := loadLeaseKey(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	s.leaseKey = key
 	snap, err := s.store.Load()
 	if err != nil {
 		return nil, err
@@ -89,14 +154,31 @@ func NewPersistent(runnerToken, adminToken, dataDir string) (*Server, error) {
 		}
 		s.artifacts[id] = a
 	}
-	// A restarted control plane must not assume an old process is still polling.
+	// A restarted control plane must not blindly assume an old process is
+	// still polling, but it also must not duplicate jobs whose leases are
+	// still valid: rebuild each runner's ActiveJobs from the jobs whose
+	// unexpired running leases it actually still holds.
+	now := time.Now().UTC()
 	for id, r := range s.runners {
-		r.Busy = false
+		var active []string
+		for _, j := range s.jobs {
+			if j.LeaseRunnerID == id && j.Status == model.StatusRunning && j.LeaseExpiresAt != nil && j.LeaseExpiresAt.After(now) {
+				active = append(active, j.ID)
+			}
+		}
+		if r.Capacity < 1 {
+			r.Capacity = 1
+		}
+		r.ActiveJobs = active
+		r.Busy = len(active) >= r.Capacity
 		r.CurrentJob = ""
+		if len(active) > 0 {
+			r.CurrentJob = active[0]
+		}
 		s.runners[id] = r
 	}
 	s.mu.Lock()
-	s.recoverLeasesLocked(time.Now(), true)
+	s.recoverLeasesLocked(now, true)
 	err = s.persistLocked()
 	s.mu.Unlock()
 	if err != nil {
@@ -137,7 +219,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/runners/{id}/next", s.next)
 	mux.HandleFunc("GET /api/v1/runners", s.listRunners)
 	mux.HandleFunc("GET /api/v1/audit", s.listAudit)
-	return recoverer(s.auth(mux))
+	return requestID(recoverer(statusLogger(s.auth(mux))))
 }
 
 func (s *Server) auth(next http.Handler) http.Handler {
@@ -182,8 +264,10 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	// Authenticated direct API submissions are trusted. Webhook trust is derived from forge data.
-	in.Trusted = true
+	// Direct API submissions are never trusted; only the forge webhook path
+	// (and internal reruns of previously trusted runs) set Trusted. The
+	// `trusted` field is not accepted from client JSON (json:"-").
+	in.Trusted = false
 	run, err := s.enqueue(in)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -201,18 +285,33 @@ func (s *Server) enqueue(in SubmitRun) (model.Run, error) {
 	if err != nil {
 		return model.Run{}, err
 	}
-	if err = policy.ValidateAdmission(spec, in.Trusted); err != nil {
+	caps := policy.DefaultUntrustedCapabilities()
+	if in.Trusted {
+		caps = policy.DefaultTrustedCapabilities()
+	}
+	// The hard trust floor is applied after defaults; repository/org policy
+	// compilation lands in a later phase and will Intersect on top of these.
+	caps = caps.Effective(in.Trusted)
+	if err = policy.ValidateAdmissionWithCapabilities(spec, caps); err != nil {
 		return model.Run{}, err
 	}
+	oidcAudiences := policy.OIDCFromCapabilities(caps).AllowedAudiences
 	now := time.Now().UTC()
-	runID := newID()
+	runID, err := newID()
+	if err != nil {
+		return model.Run{}, fmt.Errorf("generate run id: %w", err)
+	}
 	group := expandConcurrency(spec.Concurrency.Group, in)
 	run := model.Run{ID: runID, Repo: in.RepoURL, RepoFullName: in.RepoFullName, Ref: in.Ref, SHA: in.SHA, Event: in.Event,
 		Status: model.StatusQueued, Trusted: in.Trusted, ConcurrencyGroup: group, CreatedAt: now, Metadata: cloneMap(in.Metadata)}
 
 	jobIDs := make(map[string]string, len(g.Jobs))
 	for key := range g.Jobs {
-		jobIDs[key] = newID()
+		id, idErr := newID()
+		if idErr != nil {
+			return model.Run{}, fmt.Errorf("generate job id: %w", idErr)
+		}
+		jobIDs[key] = id
 	}
 	created := make(map[string]model.Job, len(g.Jobs))
 	for key, cj := range g.Jobs {
@@ -235,7 +334,7 @@ func (s *Server) enqueue(in SubmitRun) (model.Run, error) {
 		created[jobIDs[key]] = model.Job{
 			ID: jobIDs[key], RunID: runID, Key: key, BaseKey: cj.BaseID, RepoURL: in.RepoURL, Ref: in.Ref, SHA: in.SHA,
 			Event: in.Event, Condition: cj.Job.If, DependencyStatus: model.StatusSuccess, Pipeline: in.Pipeline, Trusted: in.Trusted, ChangedFiles: append([]string{}, in.ChangedFiles...), Needs: needs,
-			RequiredLabels: labelsForJob(cj.Job), Network: effectiveNetwork, Environment: env, ApprovalRequired: cj.Job.Environment.Approval, EnvironmentBranches: append([]string{}, cj.Job.Environment.Branches...), EnvironmentConcurrency: cj.Job.Environment.Concurrency, OIDCAllowed: cj.Job.Permissions.IDToken,
+			RequiredLabels: labelsForJob(cj.Job), Network: effectiveNetwork, Environment: env, ApprovalRequired: cj.Job.Environment.Approval, EnvironmentBranches: append([]string{}, cj.Job.Environment.Branches...), EnvironmentConcurrency: cj.Job.Environment.Concurrency, OIDCAllowed: cj.Job.Permissions.IDToken, OIDCAudiences: cloneStrings(oidcAudiences),
 			Status: model.StatusQueued, Priority: downstreamDepth(g, key), MaxInfraRetries: infraRetries, CreatedAt: now,
 		}
 	}
@@ -357,7 +456,7 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 	})
 	writeJSON(w, http.StatusOK, out)
 }
-func redactJob(j model.Job) model.Job { j.Pipeline = ""; j.LeaseToken = ""; return j }
+func redactJob(j model.Job) model.Job { j.Pipeline = ""; j.LeaseTokenHash = nil; return j }
 
 func (s *Server) getLogs(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
@@ -382,7 +481,12 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if in.ID == "" {
-		in.ID = newID()
+		id, err := newID()
+		if err != nil {
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+			return
+		}
+		in.ID = id
 	}
 	if in.Name == "" {
 		in.Name = in.ID
@@ -478,10 +582,21 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	j := candidates[0]
 	j.NeedsOutputs = collectServerNeedsOutputs(j, s.jobs)
 	exp := now.Add(s.leaseDuration())
+	t1, err := newID()
+	if err != nil {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	t2, err := newID()
+	if err != nil {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	rawToken := t1 + t2
 	j.Status = model.StatusRunning
 	j.Attempts++
 	j.LeaseRunnerID = id
-	j.LeaseToken = newID() + newID()
+	j.LeaseTokenHash = hashLeaseToken(s.leaseKey, rawToken)
 	j.LeaseGeneration++
 	j.LeaseExpiresAt = &exp
 	if j.StartedAt == nil {
@@ -498,7 +613,11 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	s.refreshRunLocked(j.RunID)
 	s.auditLocked("job.leased", ri.Name, j.RunID, j.ID, "job leased", map[string]string{"job": j.Key, "generation": strconv.FormatInt(j.LeaseGeneration, 10)})
 	_ = s.persistLocked()
-	task := Task{Job: j, LeaseToken: j.LeaseToken, LeaseGeneration: j.LeaseGeneration, LeaseExpiresAt: exp}
+	// The raw token travels on the wire once; the hash is not needed by the
+	// runner and is stripped from the task job.
+	taskJob := j
+	taskJob.LeaseTokenHash = nil
+	task := Task{Job: taskJob, LeaseToken: rawToken, LeaseGeneration: j.LeaseGeneration, LeaseExpiresAt: exp}
 	writeJSON(w, http.StatusOK, task)
 }
 
@@ -520,7 +639,7 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, HeartbeatResponse{Cancel: true})
 		return
 	}
-	if !validLease(j, in.RunnerID, in.LeaseToken, in.LeaseGeneration) {
+	if !s.validActiveLease(j, in.RunnerID, in.LeaseToken, in.LeaseGeneration, now) {
 		http.Error(w, "stale or invalid lease", http.StatusConflict)
 		return
 	}
@@ -538,9 +657,14 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 func (s *Server) log(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("id")
 	var in LogLine
-	if !decode(w, r, &in) {
+	if !decodeLimit(w, r, &in, 1<<20) {
 		return
 	}
+	if len(in.Step) > 128 || len(in.Line) > 1<<20 || len(in.JobKey) > 512 {
+		http.Error(w, "log line exceeds size limits", http.StatusBadRequest)
+		return
+	}
+	now := time.Now().UTC()
 	s.mu.Lock()
 	j, ok := s.jobs[jobID]
 	if !ok {
@@ -548,7 +672,10 @@ func (s *Server) log(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if !validLease(j, in.RunnerID, in.LeaseToken, in.LeaseGeneration) && j.Status != model.StatusCancelled {
+	// Strict: a cancelled (or otherwise non-running) job no longer accepts
+	// log lines. The runner logs cancellation locally before completing, so
+	// no final flush grace window is needed.
+	if !s.validActiveLease(j, in.RunnerID, in.LeaseToken, in.LeaseGeneration, now) {
 		s.mu.Unlock()
 		http.Error(w, "stale or invalid lease", http.StatusConflict)
 		return
@@ -571,6 +698,15 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
+	if len(in.Error) > 64<<10 {
+		http.Error(w, "error message exceeds 64 KiB", http.StatusBadRequest)
+		return
+	}
+	hash, err := completionResultHash(in.Status, in.Error, in.Outputs)
+	if err != nil {
+		http.Error(w, "invalid outputs payload", http.StatusBadRequest)
+		return
+	}
 	now := time.Now().UTC()
 	s.mu.Lock()
 	j, ok := s.jobs[jobID]
@@ -579,11 +715,12 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	// Completion is idempotent for the active generation. A cancellation may have already made the job terminal.
-	if !validLease(j, in.RunnerID, in.LeaseToken, in.LeaseGeneration) {
-		if j.Status.Terminal() && j.LeaseGeneration == in.LeaseGeneration && j.LeaseRunnerID == in.RunnerID {
-			s.releaseRunnerLocked(in.RunnerID, j.ID, j.Status)
-			_ = s.persistLocked()
+	// Completion is idempotent for the active generation. A previous
+	// completion may already have made the job terminal and cleared its
+	// lease; a duplicate delivery of the same result is acknowledged from
+	// the receipt instead of being rejected.
+	if !s.validActiveLease(j, in.RunnerID, in.LeaseToken, in.LeaseGeneration, now) {
+		if rec, has := s.completions[completionReceiptKey(jobID, in.LeaseGeneration, in.RunnerID)]; has && rec.ResultHash == hash {
 			s.mu.Unlock()
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -607,6 +744,12 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		}
 		j.FinishedAt = &now
 	}
+	// The lease is spent: clear all lease state so nothing can reuse it,
+	// then dedupe future retries of this exact completion via the receipt.
+	j.LeaseRunnerID = ""
+	j.LeaseTokenHash = nil
+	j.LeaseExpiresAt = nil
+	s.recordCompletionReceiptLocked(jobID, in.LeaseGeneration, in.RunnerID, hash)
 	runID := j.RunID
 	s.jobs[jobID] = j
 	s.releaseRunnerLocked(in.RunnerID, j.ID, j.Status)
@@ -622,8 +765,60 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func validLease(j model.Job, runnerID, token string, gen int64) bool {
-	return j.LeaseRunnerID == runnerID && j.LeaseToken != "" && subtle.ConstantTimeCompare([]byte(j.LeaseToken), []byte(token)) == 1 && j.LeaseGeneration == gen
+// completionResultHash canonicalizes a completion payload so identical
+// retries can be recognized. encoding/json sorts map keys, making outputs
+// deterministic.
+func completionResultHash(status model.Status, errMsg string, outputs map[string]string) (string, error) {
+	outJSON, err := json.Marshal(outputs)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	_, _ = h.Write([]byte(status))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(errMsg))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write(outJSON)
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func completionReceiptKey(jobID string, generation int64, runnerID string) string {
+	return jobID + "|" + strconv.FormatInt(generation, 10) + "|" + runnerID
+}
+
+// recordCompletionReceiptLocked keeps a bounded in-memory dedupe record.
+// Receipts are intentionally not persisted in the filesystem snapshot; the
+// PostgreSQL phase will store them durably. The bound keeps memory flat and
+// evicts an arbitrary oldest entry when full.
+func (s *Server) recordCompletionReceiptLocked(jobID string, generation int64, runnerID, resultHash string) {
+	if len(s.completions) >= maxCompletionReceipts {
+		for k := range s.completions {
+			delete(s.completions, k)
+			break
+		}
+	}
+	s.completions[completionReceiptKey(jobID, generation, runnerID)] = model.CompletionReceipt{JobID: jobID, Generation: generation, RunnerID: runnerID, ResultHash: resultHash}
+}
+
+// hashLeaseToken computes the HMAC-SHA256 of a raw lease token under the
+// server lease key. Only this digest is ever persisted or compared.
+func hashLeaseToken(key []byte, raw string) []byte {
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte(raw))
+	return mac.Sum(nil)
+}
+
+// validActiveLease authorizes a runner action against a job's live lease:
+// the job must be running, the lease unexpired, the runner and generation
+// must match, and the presented token must hash to the stored digest.
+func (s *Server) validActiveLease(j model.Job, runnerID, token string, generation int64, now time.Time) bool {
+	if j.Status != model.StatusRunning || j.LeaseExpiresAt == nil || !j.LeaseExpiresAt.After(now) {
+		return false
+	}
+	if j.LeaseRunnerID != runnerID || j.LeaseGeneration != generation || len(j.LeaseTokenHash) == 0 {
+		return false
+	}
+	return subtle.ConstantTimeCompare(hashLeaseToken(s.leaseKey, token), j.LeaseTokenHash) == 1
 }
 
 func (s *Server) approveJob(w http.ResponseWriter, r *http.Request) {
@@ -719,6 +914,11 @@ func (s *Server) cancelRunLocked(runID, reason, actor string) {
 		j.Status = model.StatusCancelled
 		j.Error = reason
 		j.FinishedAt = &now
+		// Cancellation immediately voids the lease so the runner's next
+		// heartbeat learns the job is cancelled and any stale token is dead.
+		j.LeaseRunnerID = ""
+		j.LeaseTokenHash = nil
+		j.LeaseExpiresAt = nil
 		s.jobs[id] = j
 	}
 	run, ok := s.runs[runID]
@@ -892,11 +1092,12 @@ func (s *Server) refreshRunLocked(runID string) {
 }
 
 func (s *Server) recoverLeasesLocked(now time.Time, startup bool) {
+	_ = startup // Signature kept for call-site stability; startup no longer forces expiry: unexpired leases survive restart.
 	for id, j := range s.jobs {
 		if j.Status != model.StatusRunning {
 			continue
 		}
-		expired := startup || j.LeaseExpiresAt == nil || !j.LeaseExpiresAt.After(now)
+		expired := j.LeaseExpiresAt == nil || !j.LeaseExpiresAt.After(now)
 		if !expired {
 			continue
 		}
@@ -905,13 +1106,16 @@ func (s *Server) recoverLeasesLocked(now time.Time, startup bool) {
 			j.Status = model.StatusQueued
 			j.Error = "runner lease expired; retrying"
 			j.LeaseRunnerID = ""
-			j.LeaseToken = ""
+			j.LeaseTokenHash = nil
 			j.LeaseExpiresAt = nil
 			s.auditLocked("job.lease_expired", "scheduler", j.RunID, j.ID, "job requeued after lost runner", map[string]string{"job": j.Key})
 		} else {
 			j.Status = model.StatusFailure
 			j.Error = "runner lease expired and infrastructure retry budget exhausted"
 			j.FinishedAt = &now
+			j.LeaseRunnerID = ""
+			j.LeaseTokenHash = nil
+			j.LeaseExpiresAt = nil
 			s.auditLocked("job.lost_runner", "scheduler", j.RunID, j.ID, j.Error, map[string]string{"job": j.Key})
 		}
 		s.jobs[id] = j
@@ -947,7 +1151,12 @@ func (s *Server) auditLocked(action, actor, runID, jobID, msg string, meta map[s
 	if s.store == nil {
 		return
 	}
-	e := model.AuditEvent{ID: newID(), Action: action, Actor: actor, RunID: runID, JobID: jobID, Message: msg, Metadata: meta, CreatedAt: time.Now().UTC()}
+	id, err := newID()
+	if err != nil {
+		log.Printf("audit: dropping %q event: %v", action, err)
+		return
+	}
+	e := model.AuditEvent{ID: id, Action: action, Actor: actor, RunID: runID, JobID: jobID, Message: msg, Metadata: meta, CreatedAt: time.Now().UTC()}
 	_ = s.store.AppendAudit(e)
 }
 func (s *Server) listAudit(w http.ResponseWriter, r *http.Request) {
@@ -1091,6 +1300,13 @@ func cloneMap(in map[string]string) map[string]string {
 	return out
 }
 
+func cloneStrings(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	return append([]string(nil), in...)
+}
+
 func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1127,11 +1343,22 @@ func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
 }
 
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
+	return decodeLimit(w, r, v, 8<<20)
+}
+
+// decodeLimit strictly decodes one JSON object from the request body,
+// rejecting unknown fields and trailing data. Endpoints with tighter
+// integrity budgets pass a smaller max.
+func decodeLimit(w http.ResponseWriter, r *http.Request, v any, max int64) bool {
 	defer r.Body.Close()
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20))
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, max))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
 		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return false
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		http.Error(w, "bad json: trailing data", http.StatusBadRequest)
 		return false
 	}
 	return true
@@ -1141,12 +1368,100 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
-func newID() string { b := make([]byte, 12); _, _ = rand.Read(b); return hex.EncodeToString(b) }
+
+// newID returns a 128-bit crypto/rand identifier hex-encoded.
+func newID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// requestID is the outermost middleware: it accepts a client-supplied
+// X-Kiwi-Request-ID (bounded, safe charset) or mints one, echoes it on the
+// response, and stores it in the request context for error logging.
+func requestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get("X-Kiwi-Request-ID")
+		if !validRequestID(id) {
+			gen, err := newID()
+			if err != nil {
+				// Entropy failure is unrecoverable; leave the ID empty so
+				// error responses still render.
+				gen = ""
+			}
+			id = gen
+		}
+		w.Header().Set("X-Kiwi-Request-ID", id)
+		r = r.WithContext(context.WithValue(r.Context(), requestIDContextKey{}, id))
+		next.ServeHTTP(w, r)
+	})
+}
+
+type requestIDContextKey struct{}
+
+func requestIDFrom(r *http.Request) string {
+	if id, ok := r.Context().Value(requestIDContextKey{}).(string); ok {
+		return id
+	}
+	return ""
+}
+
+func validRequestID(id string) bool {
+	if id == "" || len(id) > 128 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '_', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	if r.status == 0 {
+		r.status = code
+	}
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	return r.ResponseWriter.Write(b)
+}
+
+// statusLogger logs server-side errors (500+) with the request ID.
+func statusLogger(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec := &statusRecorder{ResponseWriter: w}
+		next.ServeHTTP(rec, r)
+		if rec.status >= 500 {
+			log.Printf("request_id=%s %s %s -> %d", requestIDFrom(r), r.Method, r.URL.Path, rec.status)
+		}
+	})
+}
+
+// recoverer converts panics into opaque 500 responses: the panic text and
+// stack stay in the server log and never reach clients.
 func recoverer(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if x := recover(); x != nil {
-				http.Error(w, fmt.Sprint(x), 500)
+				id := requestIDFrom(r)
+				log.Printf("panic serving %s %s (request_id=%s): %v\n%s", r.Method, r.URL.Path, id, x, debug.Stack())
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error", "request_id": id})
 			}
 		}()
 		next.ServeHTTP(w, r)

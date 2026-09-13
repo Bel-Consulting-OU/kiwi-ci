@@ -27,12 +27,17 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if !validLease(j, in.RunnerID, in.LeaseToken, in.LeaseGeneration) {
+	if !s.validActiveLease(j, in.RunnerID, in.LeaseToken, in.LeaseGeneration, time.Now().UTC()) {
 		http.Error(w, "stale or invalid lease", http.StatusConflict)
 		return
 	}
 	rep := in.Report
-	rep.ID = newID()
+	id, err := newID()
+	if err != nil {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	rep.ID = id
 	rep.RunID = j.RunID
 	rep.JobID = j.ID
 	rep.JobKey = j.Key

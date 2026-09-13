@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/kiwici/kiwi/internal/provenance"
+	"github.com/kiwici/kiwi/internal/server"
 )
 
 // VerifyArtifact downloads an artifact and its DSSE provenance, verifies the
@@ -32,7 +33,8 @@ func VerifyArtifact(args []string) error {
 	}
 	id := fs.Arg(0)
 	base := strings.TrimRight(*serverURL, "/")
-	client := &http.Client{Timeout: 10 * time.Minute}
+	// The token is a bearer credential: redirects must never be followed.
+	client := server.NoRedirectClient(&http.Client{Timeout: 10 * time.Minute})
 
 	req, err := http.NewRequest(http.MethodGet, base+"/api/v1/artifacts/"+id, nil)
 	if err != nil {

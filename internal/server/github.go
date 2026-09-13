@@ -13,8 +13,6 @@ import (
 	"net/url"
 	"strings"
 	"time"
-
-	"github.com/kiwici/kiwi/internal/policy"
 )
 
 type githubRepo struct {
@@ -81,7 +79,7 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "fetch pipeline: "+err.Error(), 502)
 			return
 		}
-		run, err := s.enqueue(SubmitRun{RepoURL: p.Repository.CloneURL, Ref: p.Ref, SHA: p.After, Event: "push", Pipeline: content, Trusted: true})
+		run, err := s.enqueue(SubmitRun{RepoURL: p.Repository.CloneURL, RepoFullName: p.Repository.FullName, Ref: p.Ref, SHA: p.After, Event: "push", Pipeline: content, Trusted: true})
 		if err != nil {
 			http.Error(w, err.Error(), 400)
 			return
@@ -108,7 +106,10 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "fetch pipeline: "+err.Error(), 502)
 			return
 		}
-		in := SubmitRun{RepoURL: p.PullRequest.Head.Repo.CloneURL, Ref: p.PullRequest.Head.Ref, SHA: p.PullRequest.Head.SHA, Event: "pull_request", Pipeline: content, Trusted: trusted}
+		// The base repository is the canonical coordinate for policy and
+		// status publishing; the head repo URL is what gets cloned (a fork
+		// keeps untrusted head code out of trusted policy).
+		in := SubmitRun{RepoURL: p.PullRequest.Head.Repo.CloneURL, RepoFullName: p.Repository.FullName, Ref: p.PullRequest.Head.Ref, SHA: p.PullRequest.Head.SHA, Event: "pull_request", Pipeline: content, Trusted: trusted}
 		run, err := s.enqueue(in)
 		if err != nil {
 			http.Error(w, err.Error(), 400)
@@ -152,7 +153,7 @@ func (s *Server) fetchGitHubFile(ctx context.Context, repo, path, ref string) (s
 	if s.GitHubToken != "" {
 		req.Header.Set("Authorization", "Bearer "+s.GitHubToken)
 	}
-	client := &http.Client{Timeout: 20 * time.Second}
+	client := NoRedirectClient(&http.Client{Timeout: 20 * time.Second})
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -178,5 +179,3 @@ func (s *Server) fetchGitHubFile(ctx context.Context, repo, path, ref string) (s
 	}
 	return string(b), nil
 }
-
-var _ = policy.ValidateAdmission

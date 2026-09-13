@@ -57,7 +57,7 @@ func (s *Server) publishGitHubStatus(run model.Run) {
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("Authorization", "Bearer "+s.GitHubToken)
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := NoRedirectClient(&http.Client{Timeout: 15 * time.Second})
 	resp, err := client.Do(req)
 	if err != nil {
 		return

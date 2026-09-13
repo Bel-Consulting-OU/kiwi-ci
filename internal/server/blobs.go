@@ -36,10 +36,11 @@ func (s *Server) uploadArtifact(w http.ResponseWriter, r *http.Request) {
 	runnerID := r.Header.Get("X-Kiwi-Runner-ID")
 	token := r.Header.Get("X-Kiwi-Lease-Token")
 	gen, _ := strconv.ParseInt(r.Header.Get("X-Kiwi-Lease-Generation"), 10, 64)
+	now := time.Now().UTC()
 	s.mu.Lock()
 	j, ok := s.jobs[jobID]
 	run := s.runs[j.RunID]
-	valid := ok && validLease(j, runnerID, token, gen)
+	valid := ok && s.validActiveLease(j, runnerID, token, gen, now)
 	s.mu.Unlock()
 	if !ok {
 		http.NotFound(w, r)
@@ -50,7 +51,11 @@ func (s *Server) uploadArtifact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id := newID()
+	id, err := newID()
+	if err != nil {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
 	dir := filepath.Join(s.store.Root, "artifacts", j.RunID, j.ID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		http.Error(w, err.Error(), 500)
@@ -104,7 +109,7 @@ func (s *Server) uploadArtifact(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	current, still := s.jobs[jobID]
-	if !still || !validLease(current, runnerID, token, gen) {
+	if !still || !s.validActiveLease(current, runnerID, token, gen, time.Now().UTC()) {
 		s.mu.Unlock()
 		_ = os.Remove(dst)
 		http.Error(w, "lease expired during upload", http.StatusConflict)
@@ -172,7 +177,12 @@ func (s *Server) uploadCache(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	tmp := filepath.Join(dir, "."+key+"."+newID()+".tmp")
+	uniq, err := newID()
+	if err != nil {
+		http.Error(w, "internal server error", 500)
+		return
+	}
+	tmp := filepath.Join(dir, "."+key+"."+uniq+".tmp")
 	dst := filepath.Join(dir, key+".tar.gz")
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
