@@ -35,14 +35,20 @@ const (
 
 type Server struct {
 	// Token remains for source compatibility; RunnerToken/AdminToken are authoritative.
-	Token               string
-	RunnerToken         string
-	AdminToken          string
-	GitHubWebhookSecret string
-	GitHubToken         string
-	PipelinePath        string
-	ExternalURL         string
-	LeaseDuration       time.Duration
+	Token                string
+	RunnerToken          string
+	AdminToken           string
+	GitHubWebhookSecret  string
+	GitHubToken          string
+	GitHubAppID          int64
+	GitHubAppPrivateKey  string
+	GitLabWebhookSecret  string
+	GitLabToken          string
+	ForgejoWebhookSecret string
+	ForgejoToken         string
+	PipelinePath         string
+	ExternalURL          string
+	LeaseDuration        time.Duration
 
 	mu          sync.Mutex
 	runs        map[string]model.Run
@@ -56,6 +62,13 @@ type Server struct {
 	logSeq      int64
 	store       *storage.Repository
 	oidc        *oidcSigner
+	outbox      *Outbox
+
+	// Forge API base overrides, used by tests to point adapters at local
+	// HTTP servers; empty means the public API endpoints.
+	gitHubAPIBase  string
+	gitLabAPIBase  string
+	forgejoAPIBase string
 }
 
 func New(token string) *Server {
@@ -69,6 +82,7 @@ func New(token string) *Server {
 		Token: token, RunnerToken: token, AdminToken: token,
 		LeaseDuration: defaultLeaseDuration,
 		runs:          map[string]model.Run{}, jobs: map[string]model.Job{}, runners: map[string]model.Runner{}, artifacts: map[string]model.ArtifactRecord{}, reports: map[string]model.TestReport{}, deliveries: map[string]string{}, completions: map[string]model.CompletionReceipt{}, leaseKey: key, oidc: newOIDCSigner(),
+		outbox: NewOutbox(nil),
 	}
 }
 
@@ -122,6 +136,7 @@ func NewPersistent(runnerToken, adminToken, dataDir string) (*Server, error) {
 	s := New(runnerToken)
 	s.AdminToken = adminToken
 	s.store = storage.New(dataDir)
+	s.outbox = NewOutbox(s.store)
 	if signer, err := loadOIDCSigner(dataDir); err != nil {
 		return nil, err
 	} else {
@@ -143,8 +158,10 @@ func NewPersistent(runnerToken, adminToken, dataDir string) (*Server, error) {
 		s.logSeq = seq
 	}
 	for id, run := range s.runs {
-		if delivery := strings.TrimSpace(run.Metadata["github_delivery"]); delivery != "" {
-			s.deliveries[delivery] = id
+		for _, key := range []string{"github_delivery", "gitlab_delivery", "forgejo_delivery"} {
+			if delivery := strings.TrimSpace(run.Metadata[key]); delivery != "" {
+				s.deliveries[delivery] = id
+			}
 		}
 	}
 	for id, a := range s.artifacts {
@@ -191,6 +208,8 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.ui)
 	mux.HandleFunc("POST /hooks/github", s.githubWebhook)
+	mux.HandleFunc("POST /hooks/gitlab", s.gitlabWebhook)
+	mux.HandleFunc("POST /hooks/forgejo", s.forgejoWebhook)
 	mux.HandleFunc("GET /metrics", s.metrics)
 	mux.HandleFunc("GET /.well-known/openid-configuration", s.oidcConfiguration)
 	mux.HandleFunc("GET /api/v1/oidc/jwks", s.oidcJWKS)
@@ -340,7 +359,18 @@ func (s *Server) enqueue(in SubmitRun) (model.Run, error) {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	// Webhook dedupe: forge retries reuse the delivery ID, so a second
+	// submission for the same delivery returns the original run instead of
+	// enqueueing a duplicate. Checked under the run lock to close the race
+	// between the handler fast path and concurrent deliveries.
+	if delivery, ok := webhookDelivery(in.Metadata); ok {
+		if existing, ok := s.deliveries[delivery]; ok {
+			if prior, ok := s.runs[existing]; ok && prior.RepoFullName == in.RepoFullName {
+				s.mu.Unlock()
+				return prior, nil
+			}
+		}
+	}
 	if group != "" && spec.Concurrency.CancelInProgress {
 		for id, old := range s.runs {
 			if old.ID != runID && old.Repo == in.RepoURL && old.ConcurrencyGroup == group && !old.Status.Terminal() {
@@ -355,11 +385,32 @@ func (s *Server) enqueue(in SubmitRun) (model.Run, error) {
 	s.auditLocked("run.queued", "scheduler", runID, "", "run queued", map[string]string{"event": in.Event})
 	s.scheduleStateLocked()
 	if err := s.persistLocked(); err != nil {
+		s.mu.Unlock()
 		return model.Run{}, err
 	}
 	run = s.runs[runID]
-	go s.publishGitHubStatus(run)
+	for _, key := range []string{"github_delivery", "gitlab_delivery", "forgejo_delivery"} {
+		if delivery := in.Metadata[key]; delivery != "" {
+			if _, exists := s.deliveries[delivery]; !exists {
+				s.deliveries[delivery] = runID
+			}
+		}
+	}
+	s.mu.Unlock()
+	s.publishGitHubStatus(run)
 	return run, nil
+}
+
+// webhookDelivery extracts the forge delivery ID from submit metadata, if
+// any. The keys are recorded on the run's Metadata so a restarted control
+// plane can rebuild its deliveries map from persisted runs.
+func webhookDelivery(meta map[string]string) (string, bool) {
+	for _, key := range []string{"github_delivery", "gitlab_delivery", "forgejo_delivery"} {
+		if v := strings.TrimSpace(meta[key]); v != "" {
+			return v, true
+		}
+	}
+	return "", false
 }
 
 func labelsForJob(j pipeline.Job) []string {
@@ -760,7 +811,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	_ = s.persistLocked()
 	s.mu.Unlock()
 	if run.Status.Terminal() {
-		go s.publishGitHubStatus(run)
+		s.publishGitHubStatus(run)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -876,6 +927,11 @@ func (s *Server) rerunRun(w http.ResponseWriter, r *http.Request) {
 	if meta == nil {
 		meta = map[string]string{}
 	}
+	// A rerun is a new webhook-independent submission: drop the forge
+	// delivery IDs so it cannot be confused with the original delivery.
+	for _, key := range []string{"github_delivery", "gitlab_delivery", "forgejo_delivery"} {
+		delete(meta, key)
+	}
 	meta["rerun_of"] = id
 	run, err := s.enqueue(SubmitRun{RepoURL: old.Repo, RepoFullName: old.RepoFullName, Ref: old.Ref, SHA: old.SHA, Event: old.Event, Pipeline: pipelineText, Trusted: old.Trusted, Metadata: meta})
 	if err != nil {
@@ -901,7 +957,7 @@ func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 	run := s.runs[id]
 	_ = s.persistLocked()
 	s.mu.Unlock()
-	go s.publishGitHubStatus(run)
+	s.publishGitHubStatus(run)
 	writeJSON(w, http.StatusOK, run)
 }
 
@@ -1495,8 +1551,9 @@ func (s *Server) Maintain(ctx context.Context) {
 			}
 			s.mu.Unlock()
 			for _, r := range changed {
-				go s.publishGitHubStatus(r)
+				s.publishGitHubStatus(r)
 			}
+			s.flushOutbox()
 		}
 	}
 }

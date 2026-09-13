@@ -1,48 +1,30 @@
 package server
 
 import (
-	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
-	"encoding/json"
-	"fmt"
 	"io"
+	"log"
 	"net/http"
-	"net/url"
-	"strings"
-	"time"
+
+	"github.com/kiwici/kiwi/internal/forge"
+	"github.com/kiwici/kiwi/internal/model"
+	"github.com/kiwici/kiwi/internal/pipeline"
 )
 
-type githubRepo struct {
-	FullName string `json:"full_name"`
-	CloneURL string `json:"clone_url"`
-}
-
-type githubPush struct {
-	Ref        string     `json:"ref"`
-	After      string     `json:"after"`
-	Deleted    bool       `json:"deleted"`
-	Repository githubRepo `json:"repository"`
-}
-
-type githubPullRequest struct {
-	Action      string     `json:"action"`
-	Number      int        `json:"number"`
-	Repository  githubRepo `json:"repository"`
-	PullRequest struct {
-		Head struct {
-			SHA  string     `json:"sha"`
-			Ref  string     `json:"ref"`
-			Repo githubRepo `json:"repo"`
-		} `json:"head"`
-		Base struct {
-			SHA  string     `json:"sha"`
-			Ref  string     `json:"ref"`
-			Repo githubRepo `json:"repo"`
-		} `json:"base"`
-	} `json:"pull_request"`
+// gitHubForge builds the forge adapter from the server's current
+// configuration. It is cheap to construct and safe to rebuild per use, so
+// late-bound config (webhook secret, tokens, App credentials, test base
+// URLs) is always honored.
+func (s *Server) gitHubForge() *forge.GitHub {
+	g := &forge.GitHub{
+		Secret:  s.GitHubWebhookSecret,
+		Token:   s.GitHubToken,
+		BaseURL: s.gitHubAPIBase,
+	}
+	if s.GitHubAppID > 0 && s.GitHubAppPrivateKey != "" {
+		g.App = forge.NewApp(s.GitHubAppID, []byte(s.GitHubAppPrivateKey))
+		g.App.BaseURL = s.gitHubAPIBase
+	}
+	return g
 }
 
 func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
@@ -55,84 +37,103 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GitHub webhook secret is not configured", http.StatusServiceUnavailable)
 		return
 	}
-	if !verifyGitHubSignature(s.GitHubWebhookSecret, r.Header.Get("X-Hub-Signature-256"), body) {
+	fg := s.gitHubForge()
+	if err := fg.VerifyWebhook(body, s.GitHubWebhookSecret, r.Header); err != nil {
 		http.Error(w, "invalid webhook signature", http.StatusUnauthorized)
 		return
 	}
 	event := r.Header.Get("X-GitHub-Event")
-	switch event {
-	case "ping":
+	if event == "ping" {
 		w.WriteHeader(http.StatusNoContent)
 		return
-	case "push":
-		var p githubPush
-		if err := json.Unmarshal(body, &p); err != nil {
-			http.Error(w, "bad push payload", 400)
-			return
-		}
-		if p.Deleted {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		content, err := s.fetchGitHubFile(r.Context(), p.Repository.FullName, s.pipelinePath(), p.After)
-		if err != nil {
-			http.Error(w, "fetch pipeline: "+err.Error(), 502)
-			return
-		}
-		run, err := s.enqueue(SubmitRun{RepoURL: p.Repository.CloneURL, RepoFullName: p.Repository.FullName, Ref: p.Ref, SHA: p.After, Event: "push", Pipeline: content, Trusted: true})
-		if err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		writeJSON(w, http.StatusAccepted, run)
-		return
-	case "pull_request":
-		var p githubPullRequest
-		if err := json.Unmarshal(body, &p); err != nil {
-			http.Error(w, "bad pull_request payload", 400)
-			return
-		}
-		if !map[string]bool{"opened": true, "reopened": true, "synchronize": true, "ready_for_review": true}[p.Action] {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		trusted := p.PullRequest.Head.Repo.FullName == p.PullRequest.Base.Repo.FullName
-		pipelineSHA := p.PullRequest.Head.SHA
-		if !trusted {
-			pipelineSHA = p.PullRequest.Base.SHA
-		}
-		content, err := s.fetchGitHubFile(r.Context(), p.PullRequest.Base.Repo.FullName, s.pipelinePath(), pipelineSHA)
-		if err != nil {
-			http.Error(w, "fetch pipeline: "+err.Error(), 502)
-			return
-		}
-		// The base repository is the canonical coordinate for policy and
-		// status publishing; the head repo URL is what gets cloned (a fork
-		// keeps untrusted head code out of trusted policy).
-		in := SubmitRun{RepoURL: p.PullRequest.Head.Repo.CloneURL, RepoFullName: p.Repository.FullName, Ref: p.PullRequest.Head.Ref, SHA: p.PullRequest.Head.SHA, Event: "pull_request", Pipeline: content, Trusted: trusted}
-		run, err := s.enqueue(in)
-		if err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		writeJSON(w, http.StatusAccepted, run)
-		return
-	default:
-		w.WriteHeader(http.StatusNoContent)
 	}
-}
-
-func verifyGitHubSignature(secret, header string, body []byte) bool {
-	if !strings.HasPrefix(header, "sha256=") {
-		return false
-	}
-	got, err := hex.DecodeString(strings.TrimPrefix(header, "sha256="))
+	ec, err := fg.ParseEvent(body)
 	if err != nil {
-		return false
+		http.Error(w, "bad webhook payload: "+err.Error(), http.StatusBadRequest)
+		return
 	}
-	mac := hmac.New(sha256.New, []byte(secret))
-	_, _ = mac.Write(body)
-	return hmac.Equal(got, mac.Sum(nil))
+	if ec.Event == "" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if ec.Event == "push" {
+		if ec.HeadSHA == "" {
+			// Branch/tag deletion.
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	} else if ec.Event == "pull_request" {
+		switch ec.Action {
+		case "opened", "reopened", "synchronize", "ready_for_review":
+		default:
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
+
+	// The base repository is the canonical coordinate for policy and
+	// status publishing. Fork PRs fetch the pipeline from the base
+	// repository at the base revision (head code is untrusted); the head
+	// repository is what gets cloned.
+	pipelineSHA := ec.HeadSHA
+	if !ec.Trusted {
+		pipelineSHA = ec.BaseSHA
+	}
+	content, err := fg.FetchFile(r.Context(), ec.Repository.FullName, s.pipelinePath(), pipelineSHA)
+	if err != nil {
+		http.Error(w, "fetch pipeline: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	spec, err := pipeline.Parse([]byte(content))
+	if err != nil {
+		http.Error(w, "parse pipeline: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	ok, matched := forge.MatchesTrigger(spec.On, ec)
+	if !ok {
+		// The event does not match the pipeline's on section: acknowledge
+		// without enqueueing. Logged so silenced pipelines are discoverable.
+		log.Printf("webhook: github %s %s ignored (trigger %q)", ec.Event, ec.Repository.FullName, matched)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	// Server-side changed-file fetch for path filters. The runner must not
+	// be the source of truth here: the list is evaluated before a run
+	// exists. Errors degrade to nil (no path filtering) rather than
+	// dropping the event.
+	files, err := fg.ChangedFiles(r.Context(), ec)
+	if err != nil {
+		log.Printf("webhook: changed files for %s: %v", ec.Repository.FullName, err)
+		files = nil
+	}
+	ec.ChangedFiles = files
+
+	delivery := r.Header.Get("X-GitHub-Delivery")
+	if delivery != "" {
+		if run, ok := s.dedupeRun(delivery, ec.Repository.FullName); ok {
+			writeJSON(w, http.StatusOK, run)
+			return
+		}
+	}
+	in := SubmitRun{
+		RepoURL:      ec.HeadRepository.CloneURL,
+		RepoFullName: ec.Repository.FullName,
+		Ref:          ec.Ref,
+		SHA:          ec.HeadSHA,
+		Event:        ec.Event,
+		Pipeline:     content,
+		Trusted:      ec.Trusted,
+		ChangedFiles: files,
+		Metadata:     map[string]string{"github_delivery": delivery},
+	}
+	run, err := s.enqueue(in)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.recordDelivery(delivery, run.ID)
+	writeJSON(w, http.StatusAccepted, run)
 }
 
 func (s *Server) pipelinePath() string {
@@ -142,40 +143,41 @@ func (s *Server) pipelinePath() string {
 	return s.PipelinePath
 }
 
-func (s *Server) fetchGitHubFile(ctx context.Context, repo, path, ref string) (string, error) {
-	u := "https://api.github.com/repos/" + repo + "/contents/" + strings.TrimPrefix(path, "/") + "?ref=" + url.QueryEscape(ref)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return "", err
+// dedupeRun returns the run already created for a webhook delivery ID, so
+// forge retries (which reuse the delivery ID) acknowledge the original run
+// instead of enqueueing a duplicate. The stored run must belong to the same
+// canonical repository.
+func (s *Server) dedupeRun(delivery, repoFullName string) (model.Run, bool) {
+	if delivery == "" {
+		return model.Run{}, false
 	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	if s.GitHubToken != "" {
-		req.Header.Set("Authorization", "Bearer "+s.GitHubToken)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, ok := s.deliveries[delivery]
+	if !ok {
+		return model.Run{}, false
 	}
-	client := NoRedirectClient(&http.Client{Timeout: 20 * time.Second})
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
+	run, ok := s.runs[id]
+	if !ok {
+		return model.Run{}, false
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return "", fmt.Errorf("GitHub API %s: %s", resp.Status, strings.TrimSpace(string(b)))
+	if repoFullName != "" && run.RepoFullName != repoFullName {
+		return model.Run{}, false
 	}
-	var v struct {
-		Content  string `json:"content"`
-		Encoding string `json:"encoding"`
+	return run, true
+}
+
+// recordDelivery remembers a delivery ID after a successful enqueue. The
+// authoritative check-and-set lives in enqueue (under the same lock as run
+// creation); this call only fills the map for in-memory servers that were
+// not routed through the metadata path.
+func (s *Server) recordDelivery(delivery, runID string) {
+	if delivery == "" {
+		return
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
-		return "", err
+	s.mu.Lock()
+	if _, exists := s.deliveries[delivery]; !exists {
+		s.deliveries[delivery] = runID
 	}
-	if v.Encoding != "base64" {
-		return "", fmt.Errorf("unsupported GitHub content encoding %q", v.Encoding)
-	}
-	b, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(v.Content, "\n", ""))
-	if err != nil {
-		return "", err
-	}
-	return string(b), nil
+	s.mu.Unlock()
 }
