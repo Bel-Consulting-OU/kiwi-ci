@@ -28,6 +28,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/queue"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runnerpki"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/scheduler"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secretbroker"
@@ -976,6 +977,10 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 		candidates = append(candidates, j)
 	}
 	if len(candidates) == 0 {
+		// Explainable queueing: annotate every waiting job with the reason
+		// it is not leasable by this runner. In-memory mode only; the DB
+		// scheduler records its own reasons (TODO: parity pass).
+		s.applyQueueReasonsLocked(ri)
 		s.runners[id] = ri
 		_ = s.persistLocked()
 		w.WriteHeader(http.StatusNoContent)
@@ -988,6 +993,8 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 		return candidates[i].CreatedAt.Before(candidates[j].CreatedAt)
 	})
 	j := candidates[0]
+	j.QueueReason = ""
+	s.jobs[j.ID] = j
 	j.NeedsOutputs = scheduler.CollectNeedsOutputs(j, s.jobs)
 	exp := now.Add(s.leaseDuration())
 	t1, err := newID()
@@ -1731,6 +1738,33 @@ func (s *Server) scheduleStateLocked() {
 	}
 }
 
+// applyQueueReasonsLocked annotates every waiting job with the queue reason
+// explaining why it is not leasable by runner ri. Only the reasons the
+// spec models are assigned: dependency gating, label mismatch, environment
+// capacity and pending approval.
+func (s *Server) applyQueueReasonsLocked(ri model.Runner) {
+	for id, j := range s.jobs {
+		reason := queue.None
+		switch j.Status {
+		case model.StatusWaitingApproval:
+			reason = queue.WaitingApproval
+		case model.StatusQueued:
+			switch {
+			case !depsReadyLocked(j, s.jobs):
+				reason = queue.WaitingDependency
+			case !labelsSatisfied(ri.Labels, j.RequiredLabels):
+				reason = queue.NoCompatibleRunner
+			case scheduler.EnvironmentAtCapacity(j, s.jobs):
+				reason = queue.EnvironmentLocked
+			}
+		}
+		if j.QueueReason != string(reason) {
+			j.QueueReason = string(reason)
+			s.jobs[id] = j
+		}
+	}
+}
+
 // dependencyOutcomeLocked wraps the scheduler's unified DependencyOutcome
 // over the in-memory job map (dev mode).
 func dependencyOutcomeLocked(j model.Job, jobs map[string]model.Job) (bool, model.Status) {
@@ -2053,6 +2087,12 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 		}
 		capacity += c
 	}
+	queueReasons := map[string]int{}
+	for _, j := range s.jobs {
+		if j.QueueReason != "" && (j.Status == model.StatusQueued || j.Status == model.StatusWaitingApproval) {
+			queueReasons[j.QueueReason]++
+		}
+	}
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	fmt.Fprintln(w, "# HELP kiwi_runs Number of CI runs by status")
 	fmt.Fprintln(w, "# TYPE kiwi_runs gauge")
@@ -2063,6 +2103,11 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "# TYPE kiwi_jobs gauge")
 	for st, n := range jobs {
 		fmt.Fprintf(w, "kiwi_jobs{status=%q} %d\n", st, n)
+	}
+	fmt.Fprintln(w, "# HELP kiwi_jobs_queue_reason Number of queued jobs by queue reason")
+	fmt.Fprintln(w, "# TYPE kiwi_jobs_queue_reason gauge")
+	for reason, n := range queueReasons {
+		fmt.Fprintf(w, "kiwi_jobs_queue_reason{reason=%q} %d\n", reason, n)
 	}
 	fmt.Fprintf(w, "kiwi_runners %d\nkiwi_runner_slots %d\nkiwi_runner_slots_busy %d\n", len(s.runners), capacity, busy)
 }
@@ -2265,7 +2310,6 @@ func (s *Server) Maintain(ctx context.Context) {
 				before[id] = r.Status
 			}
 			s.recoverLeasesLocked(now.UTC(), false)
-			s.cleanupExpiredArtifactsLocked(now.UTC())
 			_ = s.persistLocked()
 			var changed []model.Run
 			for id, r := range s.runs {
@@ -2277,6 +2321,7 @@ func (s *Server) Maintain(ctx context.Context) {
 			for _, r := range changed {
 				s.publishGitHubStatus(r)
 			}
+			s.GC(ctx, now.UTC())
 			s.flushOutbox()
 		}
 	}
@@ -2309,7 +2354,5 @@ func (s *Server) maintainDB(ctx context.Context, now time.Time) {
 		log.Printf("server: lease recovery: %v", err)
 	}
 	s.flushOutbox()
-	s.mu.Lock()
-	s.cleanupExpiredArtifactsLocked(now)
-	s.mu.Unlock()
+	s.GC(ctx, now)
 }

@@ -89,6 +89,10 @@ type Job struct {
 	LeaseGeneration int64      `json:"lease_generation,omitempty"`
 	LeaseExpiresAt  *time.Time `json:"lease_expires_at,omitempty"`
 	ApprovedBy      string     `json:"approved_by,omitempty"`
+	// QueueReason records why a queued job has not been leased yet. It is
+	// a queue.QueueReason code (e.g. WAITING_DEPENDENCY, NO_COMPATIBLE_RUNNER)
+	// set by the control plane's scheduling pass; empty means no reason.
+	QueueReason string `json:"queue_reason,omitempty"`
 }
 
 type Runner struct {
@@ -147,6 +151,7 @@ type TestResult struct {
 	Class    string  `json:"class,omitempty"`
 	Duration float64 `json:"duration,omitempty"`
 	Passed   bool    `json:"passed"`
+	Skipped  bool    `json:"skipped,omitempty"`
 	Message  string  `json:"message,omitempty"`
 }
 
@@ -158,6 +163,8 @@ type TestReport struct {
 	Path      string       `json:"path"`
 	Tests     int          `json:"tests"`
 	Failures  int          `json:"failures"`
+	Errors    int          `json:"errors,omitempty"`
+	Skipped   int          `json:"skipped,omitempty"`
 	Duration  float64      `json:"duration,omitempty"`
 	Cases     []TestResult `json:"cases,omitempty"`
 	CreatedAt time.Time    `json:"created_at"`

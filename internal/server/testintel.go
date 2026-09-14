@@ -97,60 +97,49 @@ func (s *Server) listTestReports(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// testIntelligence is the v0.1 foundation for flaky-test history: it reports
-// tests whose outcome changed across runs, plus report volume and totals.
+// testIntelligence reports flaky-test history and report volume for one
+// repository. The repo query parameter is required: reports are keyed by
+// run, and the run's RepoFullName scopes the aggregation so a control plane
+// hosting many repositories never leaks cross-repo test history.
 func (s *Server) testIntelligence(w http.ResponseWriter, r *http.Request) {
+	repo := r.URL.Query().Get("repo")
+	if repo == "" {
+		http.Error(w, "repo query parameter is required (e.g. ?repo=owner/name)", http.StatusBadRequest)
+		return
+	}
 	if s.DB != nil {
 		reports, err := s.DB.ListTestReportsAll(r.Context())
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		writeJSON(w, http.StatusOK, summarizeTestIntelligence(reports))
+		filtered := make([]model.TestReport, 0, len(reports))
+		for _, rep := range reports {
+			run, gerr := s.DB.GetRun(r.Context(), rep.RunID)
+			if gerr == nil && run.RepoFullName == repo {
+				filtered = append(filtered, rep)
+			}
+		}
+		out := summarizeTestIntelligence(filtered)
+		out["repo"] = repo
+		writeJSON(w, http.StatusOK, out)
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	history := map[string][]bool{}
-	totals := map[string]model.TestReport{}
-	var tests, failures int
+	filtered := []model.TestReport{}
 	for _, rep := range s.reports {
-		tests += rep.Tests
-		failures += rep.Failures
-		for _, c := range rep.Cases {
-			key := c.Name
-			if c.Class != "" {
-				key = c.Class + "." + c.Name
-			}
-			history[key] = append(history[key], c.Passed)
-		}
-		totals[rep.ID] = rep
-	}
-	flaky := []string{}
-	for name, results := range history {
-		var pass, fail bool
-		for _, ok := range results {
-			if ok {
-				pass = true
-			} else {
-				fail = true
-			}
-		}
-		if pass && fail {
-			flaky = append(flaky, name)
+		if run, ok := s.runs[rep.RunID]; ok && run.RepoFullName == repo {
+			filtered = append(filtered, rep)
 		}
 	}
-	sort.Strings(flaky)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"reports":     len(s.reports),
-		"total_tests": tests,
-		"failures":    failures,
-		"flaky_tests": flaky,
-	})
+	out := summarizeTestIntelligence(filtered)
+	out["repo"] = repo
+	writeJSON(w, http.StatusOK, out)
 }
 
 // summarizeTestIntelligence computes the flaky-test summary from an explicit
-// report list (the DB path).
+// report list (both the DB and the in-memory path feed pre-filtered lists).
 func summarizeTestIntelligence(reports []model.TestReport) map[string]any {
 	history := map[string][]bool{}
 	var tests, failures int

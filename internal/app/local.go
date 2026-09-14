@@ -125,6 +125,9 @@ func Validate(args []string) error {
 func Explain(args []string) error {
 	fs := flag.NewFlagSet("explain", flag.ContinueOnError)
 	file := pipelineFlag(fs)
+	why := fs.String("why", "", "explain why one compiled job would run (event, branch, paths, condition, dependencies)")
+	event := fs.String("event", "push", "event name for --why evaluation")
+	branch := fs.String("branch", "", "branch name for --why evaluation")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -135,6 +138,9 @@ func Explain(args []string) error {
 	g, err := pipeline.Compile(s)
 	if err != nil {
 		return err
+	}
+	if *why != "" {
+		return explainWhy(g, *why, explainArgs{Event: *event, Branch: *branch})
 	}
 	ids := make([]string, 0, len(g.Jobs))
 	for id := range g.Jobs {
