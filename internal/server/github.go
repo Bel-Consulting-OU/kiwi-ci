@@ -8,6 +8,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/forge"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // gitHubForge builds the forge adapter from the server's current
@@ -28,6 +29,9 @@ func (s *Server) gitHubForge() *forge.GitHub {
 }
 
 func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
+	ctx, span := s.startSpan(r.Context(), "forge.webhook.github")
+	defer span.End()
+	span.SetAttributes(attribute.String("kiwi.event", r.Header.Get("X-GitHub-Event")))
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4<<20))
 	if err != nil {
 		http.Error(w, "invalid body", http.StatusBadRequest)
@@ -79,7 +83,7 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 	if !ec.Trusted {
 		pipelineSHA = ec.BaseSHA
 	}
-	content, err := fg.FetchFile(r.Context(), ec.Repository.FullName, s.pipelinePath(), pipelineSHA)
+	content, err := fg.FetchFile(ctx, ec.Repository.FullName, s.pipelinePath(), pipelineSHA)
 	if err != nil {
 		http.Error(w, "fetch pipeline: "+err.Error(), http.StatusBadGateway)
 		return
@@ -102,7 +106,7 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 	// be the source of truth here: the list is evaluated before a run
 	// exists. Errors degrade to nil (no path filtering) rather than
 	// dropping the event.
-	files, err := fg.ChangedFiles(r.Context(), ec)
+	files, err := fg.ChangedFiles(ctx, ec)
 	if err != nil {
 		log.Printf("webhook: changed files for %s: %v", ec.Repository.FullName, err)
 		files = nil

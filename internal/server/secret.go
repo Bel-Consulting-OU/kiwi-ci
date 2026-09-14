@@ -116,6 +116,7 @@ func (s *Server) issueSecret(w http.ResponseWriter, r *http.Request) {
 	}
 	// The audit trail records the secret name only, never the value.
 	s.auditLocked("secret.issued", in.RunnerID, j.RunID, j.ID, "secret delivered", map[string]string{"secret": in.Name})
+	s.metricAdd("kiwi_secret_deliveries_total", 1, nil)
 	generation := j.LeaseGeneration
 	writeJSON(w, http.StatusOK, SecretResponse{
 		Ciphertext:      base64.StdEncoding.EncodeToString(enc.Ciphertext),

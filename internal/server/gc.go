@@ -29,12 +29,25 @@ func (s *Server) GC(ctx context.Context, now time.Time) GCStats {
 	s.mu.Lock()
 	stats.ArtifactsRemoved = s.cleanupExpiredArtifactsLocked(now)
 	s.pruneDeliveriesLocked(now)
+	if s.DB == nil {
+		s.pruneJobLocksLocked()
+	}
 	s.mu.Unlock()
 	if s.store != nil {
 		stats.TempFilesRemoved = sweepTempFiles(s.store.Root, now)
 	}
 	_ = ctx
 	return stats
+}
+
+// pruneJobLocksLocked drops the per-job upload mutexes for jobs that no
+// longer exist, so the lock map stays bounded over a long-lived process.
+func (s *Server) pruneJobLocksLocked() {
+	for id := range s.jobLocks {
+		if _, ok := s.jobs[id]; !ok {
+			delete(s.jobLocks, id)
+		}
+	}
 }
 
 // pruneDeliveriesLocked drops webhook delivery dedupe records older than the

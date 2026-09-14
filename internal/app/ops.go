@@ -17,6 +17,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 // Ops dispatches the operator CLI commands that talk to a Kiwi server over
@@ -162,6 +163,7 @@ func opsLogs(ctx context.Context, args []string) error {
 	tok := fs.String("token", os.Getenv("KIWI_ADMIN_TOKEN"), "admin bearer token")
 	job := fs.String("job", "", "only print entries for this job key")
 	follow := fs.Bool("follow", false, "follow the SSE log stream after the backlog")
+	interactive := fs.Bool("interactive", false, "open the interactive TUI log viewer (same as kiwi tui)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -169,6 +171,14 @@ func opsLogs(ctx context.Context, args []string) error {
 		return fmt.Errorf("kiwi logs requires a run ID")
 	}
 	runID := fs.Arg(0)
+	if *interactive {
+		tuiArgs := []string{"--server", *srv, "--token", *tok, "--job", *job}
+		if *follow {
+			tuiArgs = append(tuiArgs, "--follow")
+		}
+		tuiArgs = append(tuiArgs, runID)
+		return tuiWithIO(ctx, tuiArgs, os.Stdout, os.Stdin)
+	}
 	c := newOpsClient(*srv, *tok)
 
 	var entries []model.LogEntry
@@ -283,15 +293,53 @@ func opsArtifacts(ctx context.Context, args []string) error {
 	return nil
 }
 
-// opsSchedules implements kiwi schedules list|trigger. Server-side
-// schedules are deferred, so both forms report that clearly.
+// opsSchedules implements kiwi schedules list|trigger:
+//
+//	kiwi schedules list            — GET /api/v1/schedules
+//	kiwi schedules trigger ID      — POST /api/v1/schedules/{id}/trigger
 func opsSchedules(ctx context.Context, args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("kiwi schedules requires a subcommand: list or trigger")
 	}
 	switch args[0] {
-	case "list", "trigger":
-		fmt.Println("schedules are not yet implemented (server-side schedules are deferred)")
+	case "list":
+		serverURL, token, rest, err := opsFlags("schedules list", args[1:])
+		if err != nil {
+			return err
+		}
+		if len(rest) != 0 {
+			return fmt.Errorf("kiwi schedules list takes no arguments")
+		}
+		var out []storage.Schedule
+		if err := newOpsClient(serverURL, token).do(ctx, http.MethodGet, "/api/v1/schedules", nil, &out); err != nil {
+			return err
+		}
+		if len(out) == 0 {
+			fmt.Println("no schedules")
+			return nil
+		}
+		fmt.Printf("%-10s %-28s %-24s %-8s %s\n", "ID", "REPOSITORY", "SPEC", "ENABLED", "LAST RUN")
+		for _, sc := range out {
+			last := "-"
+			if sc.LastRun != nil {
+				last = sc.LastRun.Format(time.RFC3339)
+			}
+			fmt.Printf("%-10s %-28s %-24s %-8t %s\n", truncate(sc.ID, 10), truncate(sc.Repository, 28), truncate(sc.Spec, 24), sc.Enabled, last)
+		}
+		return nil
+	case "trigger":
+		serverURL, token, rest, err := opsFlags("schedules trigger", args[1:])
+		if err != nil {
+			return err
+		}
+		if len(rest) != 1 {
+			return fmt.Errorf("kiwi schedules trigger requires a schedule ID")
+		}
+		var run model.Run
+		if err := newOpsClient(serverURL, token).do(ctx, http.MethodPost, "/api/v1/schedules/"+rest[0]+"/trigger", struct{}{}, &run); err != nil {
+			return err
+		}
+		fmt.Printf("triggered schedule %s: run %s (%s)\n", rest[0], run.ID, run.Status)
 		return nil
 	default:
 		return fmt.Errorf("unknown schedules subcommand %q (want list or trigger)", args[0])

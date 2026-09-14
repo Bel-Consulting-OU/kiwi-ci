@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,8 @@ import (
 	"strings"
 	"testing"
 )
+
+const pipelineText = "version: 1\njobs:\n  build:\n    steps:\n      - run: echo hi\n"
 
 func TestRepoCoords(t *testing.T) {
 	cases := []struct {
@@ -84,15 +87,64 @@ func TestDispatchSubmitsRun(t *testing.T) {
 	}
 }
 
-func TestDispatchRequiresRepoAndPipeline(t *testing.T) {
+func TestDispatchRequiresRepo(t *testing.T) {
 	if err := Dispatch(context.Background(), nil); err == nil || !strings.Contains(err.Error(), "--repo") {
 		t.Fatalf("want --repo error, got %v", err)
 	}
-	if err := Dispatch(context.Background(), []string{"--repo", "acme/app"}); err == nil || !strings.Contains(err.Error(), "--pipeline") {
-		t.Fatalf("want --pipeline error, got %v", err)
-	}
 	if err := Dispatch(context.Background(), []string{"--repo", "acme/app", "--pipeline", "nope.yaml"}); err == nil {
 		t.Fatal("missing pipeline file must fail")
+	}
+}
+
+func TestDispatchFetchesPipelineFromForge(t *testing.T) {
+	// A fake GitHub API serves the pipeline contents endpoint; the real
+	// submission target is a second fake server.
+	fetched := false
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/repos/acme/app/contents/.kiwi/pipeline.yaml" {
+			t.Errorf("unexpected forge request: %s %s", r.Method, r.URL.Path)
+		}
+		if ref := r.URL.Query().Get("ref"); ref != "main" {
+			t.Errorf("ref = %q, want main", ref)
+		}
+		fetched = true
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"content":"` + base64.StdEncoding.EncodeToString([]byte(pipelineText)) + `","encoding":"base64"}`))
+	}))
+	defer github.Close()
+	t.Setenv("KIWI_GITHUB_API_BASE", github.URL)
+
+	var gotBody map[string]any
+	kiwi := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/runs" || r.Method != http.MethodPost {
+			t.Errorf("unexpected server request: %s %s", r.Method, r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"id":"run-2","event":"manual","status":"queued"}`))
+	}))
+	defer kiwi.Close()
+
+	err := Dispatch(context.Background(), []string{
+		"--server", kiwi.URL,
+		"--token", "admin-token",
+		"--repo", "acme/app",
+		"--ref", "main",
+	})
+	if err != nil {
+		t.Fatalf("dispatch with forge fetch: %v", err)
+	}
+	if !fetched {
+		t.Fatal("pipeline was not fetched from the forge")
+	}
+	if p, _ := gotBody["pipeline"].(string); p != pipelineText {
+		t.Fatalf("submitted pipeline = %q, want the fetched text", p)
+	}
+	if gotBody["repo_full_name"] != "acme/app" {
+		t.Fatalf("repo_full_name = %v", gotBody["repo_full_name"])
 	}
 }
 

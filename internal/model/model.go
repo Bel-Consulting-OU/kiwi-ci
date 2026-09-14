@@ -100,6 +100,14 @@ type Job struct {
 	// the job was built from, when the job was declared via
 	// `component: name@sha256:...`. Empty for regular jobs.
 	ComponentDigest string `json:"component_digest,omitempty"`
+	// CompiledJobPayload carries the deterministic enqueue-time compilation
+	// record for this job: pipeline and job digests, the effective compiled
+	// job JSON, and the effective policy capabilities. Additive: runners
+	// that predate it simply ignore it.
+	CompiledJobPayload *CompiledJobPayload `json:"compiled_job_payload,omitempty"`
+	// WaitingSince records when an approval-gated job entered the waiting
+	// state; approval metrics derive the wait duration from it. Additive.
+	WaitingSince *time.Time `json:"waiting_since,omitempty"`
 }
 
 type Runner struct {
@@ -137,6 +145,20 @@ type Runner struct {
 	RevokedAt  *time.Time `json:"revoked_at,omitempty"`
 }
 
+// CompiledJobPayload is the enqueue-time compilation record persisted on a
+// job. PipelineDigest and JobDigest are content addresses the runner can
+// verify against its own recompilation; EffectiveJob is the canonical JSON
+// of the pipeline.CompiledJob and EffectivePolicy the effective capability
+// set JSON the job was admitted under.
+type CompiledJobPayload struct {
+	SchemaVersion   int    `json:"schema_version"`
+	CompilerVersion string `json:"compiler_version"`
+	PipelineDigest  string `json:"pipeline_digest"`
+	JobDigest       string `json:"job_digest"`
+	EffectiveJob    any    `json:"effective_job,omitempty"`
+	EffectivePolicy any    `json:"effective_policy,omitempty"`
+}
+
 type ArtifactRecord struct {
 	ID               string     `json:"id"`
 	RunID            string     `json:"run_id"`
@@ -151,6 +173,17 @@ type ArtifactRecord struct {
 	ExpiresAt        *time.Time `json:"expires_at,omitempty"`
 	ProvenancePath   string     `json:"provenance_path,omitempty"`
 	ProvenanceSHA256 string     `json:"provenance_sha256,omitempty"`
+	// LeaseGeneration is the job lease generation the artifact was uploaded
+	// under; upload idempotency is scoped to (job, generation, name).
+	LeaseGeneration int64 `json:"lease_generation,omitempty"`
+	// SBOMPath/SBOMSHA256 locate the attached SBOM document validated
+	// against the job's artifact contract.
+	SBOMPath   string `json:"sbom_path,omitempty"`
+	SBOMSHA256 string `json:"sbom_sha256,omitempty"`
+	// SigstorePath/SigstoreSHA256 locate the verified Sigstore bundle
+	// attestation for this artifact.
+	SigstorePath   string `json:"sigstore_path,omitempty"`
+	SigstoreSHA256 string `json:"sigstore_sha256,omitempty"`
 }
 
 type TestResult struct {

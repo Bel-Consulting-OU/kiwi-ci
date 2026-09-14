@@ -33,14 +33,39 @@ func TestOpsPolicyCheck(t *testing.T) {
 	}
 }
 
-func TestOpsSchedulesStub(t *testing.T) {
-	err := Ops(context.Background(), "schedules", []string{"list"})
-	if err != nil {
+func TestOpsSchedulesHitsEndpoints(t *testing.T) {
+	srv, seen := fakeAPIServer(t)
+	flags := []string{"--server", srv.URL, "--token", "admin-token"}
+	if err := Ops(context.Background(), "schedules", append([]string{"list"}, flags...)); err != nil {
 		t.Fatalf("schedules list: %v", err)
 	}
-	err = Ops(context.Background(), "schedules", []string{"trigger"})
-	if err != nil {
+	if err := Ops(context.Background(), "schedules", []string{"trigger", "--server", srv.URL, "--token", "admin-token", "sch1"}); err != nil {
 		t.Fatalf("schedules trigger: %v", err)
+	}
+	want := []string{
+		"GET /api/v1/schedules",
+		"POST /api/v1/schedules/sch1/trigger",
+	}
+	if len(*seen) != len(want) {
+		t.Fatalf("requests = %v, want %v", *seen, want)
+	}
+	for i, w := range want {
+		if (*seen)[i] != w {
+			t.Fatalf("request %d = %q, want %q", i, (*seen)[i], w)
+		}
+	}
+}
+
+func TestOpsSchedulesArgumentErrors(t *testing.T) {
+	if err := Ops(context.Background(), "schedules", nil); err == nil {
+		t.Fatal("schedules without a subcommand succeeded")
+	}
+	if err := Ops(context.Background(), "schedules", []string{"bogus"}); err == nil {
+		t.Fatal("unknown schedules subcommand succeeded")
+	}
+	srv, _ := fakeAPIServer(t)
+	if err := Ops(context.Background(), "schedules", []string{"trigger", "--server", srv.URL, "--token", "admin-token"}); err == nil {
+		t.Fatal("trigger without a schedule ID succeeded")
 	}
 }
 
@@ -72,6 +97,10 @@ func fakeAPIServer(t *testing.T) (*httptest.Server, *[]string) {
 			_, _ = w.Write([]byte(`[{"id":"art1","job_key":"test","name":"bin.tar.gz","size":42,"sha256":"abc"}]`))
 		case strings.HasSuffix(r.URL.Path, "/logs") && r.Method == http.MethodGet:
 			_, _ = w.Write([]byte(`[{"seq":1,"job_key":"test","step":"s","line":"hello","run_id":"run1","job_id":"job1"}]`))
+		case r.URL.Path == "/api/v1/schedules" && r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(`[{"id":"sch1","repository":"acme/app","spec":"0 * * * *","enabled":true,"created_at":"2026-09-14T00:00:00Z"}]`))
+		case strings.HasSuffix(r.URL.Path, "/trigger") && r.Method == http.MethodPost:
+			_, _ = w.Write([]byte(`{"id":"run9","status":"queued"}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -110,6 +139,12 @@ func TestOpsServerCommands(t *testing.T) {
 	if err := run("logs", "run1"); err != nil {
 		t.Fatalf("logs: %v", err)
 	}
+	if err := Ops(context.Background(), "schedules", []string{"list", "--server", url, "--token", "admin-token"}); err != nil {
+		t.Fatalf("schedules list: %v", err)
+	}
+	if err := Ops(context.Background(), "schedules", []string{"trigger", "--server", url, "--token", "admin-token", "sch1"}); err != nil {
+		t.Fatalf("schedules trigger: %v", err)
+	}
 
 	want := []string{
 		"GET /api/v1/runs",
@@ -119,6 +154,8 @@ func TestOpsServerCommands(t *testing.T) {
 		"POST /api/v1/jobs/job1/approve",
 		"GET /api/v1/runs/run1/artifacts",
 		"GET /api/v1/runs/run1/logs",
+		"GET /api/v1/schedules",
+		"POST /api/v1/schedules/sch1/trigger",
 	}
 	if len(*seen) != len(want) {
 		t.Fatalf("requests = %v, want %v", *seen, want)

@@ -41,6 +41,25 @@ func TestSchemaJSONParsesAndIsStrict(t *testing.T) {
 		if !ok {
 			t.Fatalf("$defs.%s missing", name)
 		}
+		// oneOf definitions (trigger) are strict per-branch: every branch
+		// that defines a property shape must forbid additional properties.
+		if branches, ok := d["oneOf"].([]any); ok {
+			for _, b := range branches {
+				if obj, ok := b.(map[string]any); ok {
+					if _, hasProps := obj["properties"]; hasProps {
+						if obj["additionalProperties"] != false {
+							t.Fatalf("$defs.%s oneOf branch additionalProperties = %v, want false", name, obj["additionalProperties"])
+						}
+					}
+					if items, ok := obj["items"].(map[string]any); ok {
+						if items["additionalProperties"] != false {
+							t.Fatalf("$defs.%s oneOf items additionalProperties = %v, want false", name, items["additionalProperties"])
+						}
+					}
+				}
+			}
+			continue
+		}
 		if d["additionalProperties"] != false {
 			t.Fatalf("$defs.%s additionalProperties = %v, want false", name, d["additionalProperties"])
 		}

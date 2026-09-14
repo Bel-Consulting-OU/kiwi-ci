@@ -145,14 +145,63 @@ type ComponentUse struct {
 }
 
 type Trigger struct {
-	Branches       []string `yaml:"branches,omitempty" json:"branches,omitempty"`
-	BranchesIgnore []string `yaml:"branches_ignore,omitempty" json:"branches_ignore,omitempty"`
-	Tags           []string `yaml:"tags,omitempty" json:"tags,omitempty"`
-	TagsIgnore     []string `yaml:"tags_ignore,omitempty" json:"tags_ignore,omitempty"`
-	Paths          []string `yaml:"paths,omitempty" json:"paths,omitempty"`
-	PathsIgnore    []string `yaml:"paths_ignore,omitempty" json:"paths_ignore,omitempty"`
-	Actions        []string `yaml:"actions,omitempty" json:"actions,omitempty"`
-	Draft          *bool    `yaml:"draft,omitempty" json:"draft,omitempty"`
+	Branches       []string    `yaml:"branches,omitempty" json:"branches,omitempty"`
+	BranchesIgnore []string    `yaml:"branches_ignore,omitempty" json:"branches_ignore,omitempty"`
+	Tags           []string    `yaml:"tags,omitempty" json:"tags,omitempty"`
+	TagsIgnore     []string    `yaml:"tags_ignore,omitempty" json:"tags_ignore,omitempty"`
+	Paths          []string    `yaml:"paths,omitempty" json:"paths,omitempty"`
+	PathsIgnore    []string    `yaml:"paths_ignore,omitempty" json:"paths_ignore,omitempty"`
+	Actions        []string    `yaml:"actions,omitempty" json:"actions,omitempty"`
+	Draft          *bool       `yaml:"draft,omitempty" json:"draft,omitempty"`
+	Cron           []CronEntry `yaml:"cron,omitempty" json:"cron,omitempty"`
+}
+
+// CronEntry is one scheduled occurrence declaration under on.schedule.
+type CronEntry struct {
+	Cron     string   `yaml:"cron" json:"cron"`
+	Branches []string `yaml:"branches,omitempty" json:"branches,omitempty"`
+}
+
+// UnmarshalYAML accepts a plain trigger mapping (push, pull_request, ...),
+// a sequence of cron entries, or a single bare cron string (on.schedule).
+func (t *Trigger) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		t.Cron = []CronEntry{{Cron: strings.TrimSpace(node.Value)}}
+		return nil
+	case yaml.SequenceNode:
+		var entries []CronEntry
+		if err := node.Decode(&entries); err != nil {
+			return err
+		}
+		t.Cron = entries
+		return nil
+	case yaml.MappingNode:
+		hasCron := false
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			if node.Content[i].Value == "cron" {
+				hasCron = true
+				break
+			}
+		}
+		if hasCron {
+			var entry CronEntry
+			if err := node.Decode(&entry); err != nil {
+				return err
+			}
+			t.Cron = []CronEntry{entry}
+			return nil
+		}
+		type plain Trigger
+		var p plain
+		if err := node.Decode(&p); err != nil {
+			return err
+		}
+		*t = Trigger(p)
+		return nil
+	default:
+		return fmt.Errorf("trigger must be a mapping or a list of cron entries")
+	}
 }
 
 type Defaults struct {
@@ -360,6 +409,7 @@ type Artifact struct {
 	Retention string          `yaml:"retention,omitempty" json:"retention,omitempty"`
 	SBOM      string          `yaml:"sbom,omitempty" json:"sbom,omitempty"`
 	Sigstore  *SigstoreConfig `yaml:"sigstore,omitempty" json:"sigstore,omitempty"`
+	Required  bool            `yaml:"required,omitempty" json:"required,omitempty"`
 }
 
 // SigstoreConfig declares Sigstore attestation requirements for an artifact.

@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	v1 "github.com/Bel-Consulting-OU/kiwi-ci/internal/api/v1"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/components"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/expr"
@@ -36,6 +37,8 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/scheduler"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secretbroker"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/version"
+	"go.opentelemetry.io/otel/codes"
 )
 
 const (
@@ -148,6 +151,46 @@ type Server struct {
 	// snapshots records uploaded workspace snapshots per run
 	// (memory-backed; DB persistence is deferred — see snapshots.go).
 	snapshots map[string]model.SnapshotRecord
+
+	// dataDir is the persistent state root ("" for in-memory servers).
+	dataDir string
+
+	// contracts holds the per-job artifact contract sets (memory mode;
+	// DB mode persists them through ArtifactContractStore).
+	contracts map[string]map[string]storage.ArtifactContract
+	// jobLocks serializes the upload critical section per job so staging,
+	// idempotency checks and record insertion are atomic per (job, name).
+	jobLocks   map[string]*sync.Mutex
+	jobLocksMu sync.Mutex
+
+	// provenance is the artifact provenance signing key. It is a distinct
+	// trust root from the OIDC signing key (see keys.go).
+	provenance *provenanceSigner
+	// cacheSigner signs cache manifests in DB mode (keys.go).
+	cacheSigner *cacheSigner
+
+	// crl maps revoked runner certificate serials to runner IDs; persisted
+	// as runner-crl.json under dataDir (crl.go).
+	crl map[string]string
+
+	// history is the persistent test-intelligence history (testshards.go).
+	history *testintelHistory
+
+	// schedules/occurrences are the memory-mode schedule store; DB mode
+	// uses storage.ScheduleStore (schedules.go).
+	schedules   map[string]storage.Schedule
+	occurrences map[string]map[int64]string
+
+	// opaPolicy is the compiled OPA deny gate (nil when no rules are
+	// configured); opaBroken is set when a configured gate failed to
+	// compile, which fails every admission closed.
+	opaPolicy *policy.OPAPolicy
+	opaBroken bool
+
+	// OTel tracing (tracing.go).
+	OTelEndpoint string
+	otelShutdown func(context.Context) error
+	otelEnabled  bool
 }
 
 func New(token string) *Server {
@@ -165,6 +208,12 @@ func New(token string) *Server {
 		AuthStore:   auth.NewTokenStore(),
 		deployments: map[string]model.Deployment{},
 		snapshots:   map[string]model.SnapshotRecord{},
+		contracts:   map[string]map[string]storage.ArtifactContract{},
+		jobLocks:    map[string]*sync.Mutex{},
+		crl:         map[string]string{},
+		history:     newTestintelHistory(""),
+		schedules:   map[string]storage.Schedule{},
+		occurrences: map[string]map[int64]string{},
 		Logger:      logging.NewStructured(os.Stderr),
 		Metrics:     NewMetrics(),
 	}
@@ -219,6 +268,7 @@ func NewPersistent(runnerToken, adminToken, dataDir string) (*Server, error) {
 	}
 	s := New(runnerToken)
 	s.AdminToken = adminToken
+	s.dataDir = dataDir
 	s.store = storage.New(dataDir)
 	s.outbox = NewOutbox(s.store)
 	if signer, err := loadOIDCSigner(dataDir); err != nil {
@@ -234,11 +284,32 @@ func NewPersistent(runnerToken, adminToken, dataDir string) (*Server, error) {
 	if err := s.loadRunnerCA(dataDir); err != nil {
 		return nil, err
 	}
+	// Distinct signing roots: artifact provenance, cache manifests and web
+	// session cookies each get their own persisted key material.
+	if err := s.loadProvenanceKey(dataDir); err != nil {
+		return nil, err
+	}
+	if err := s.loadCacheSigner(dataDir); err != nil {
+		return nil, err
+	}
+	if err := s.loadWebSessionSecret(dataDir); err != nil {
+		return nil, err
+	}
+	if err := s.loadCRL(dataDir); err != nil {
+		return nil, err
+	}
+	if err := s.loadTestintelHistory(dataDir); err != nil {
+		return nil, err
+	}
+	if err := s.loadSchedules(dataDir); err != nil {
+		return nil, err
+	}
 	snap, err := s.store.Load()
 	if err != nil {
 		return nil, err
 	}
 	s.runs, s.jobs, s.runners, s.artifacts, s.reports = snap.Runs, snap.Jobs, snap.Runners, snap.Artifacts, snap.Reports
+	s.rebuildArtifactContractsLocked()
 	if seq, err := s.store.MaxLogSeq(); err != nil {
 		return nil, err
 	} else {
@@ -288,6 +359,10 @@ func NewPersistent(runnerToken, adminToken, dataDir string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := s.ConfigureOPA(); err != nil {
+		return nil, err
+	}
+	s.initTracingFromEnv()
 	return s, nil
 }
 
@@ -311,6 +386,19 @@ func (s *Server) SwitchToDB(db storage.Store) error {
 	s.DB = db
 	s.LeaderKey = sched.LeaderKey
 	s.leader = sched.IsLeader(context.Background())
+	// DB mode: the durable outbox, schedules and artifact contracts move
+	// into the SQL store.
+	s.outbox.AttachDB(db)
+	if err := s.outbox.ReplayDB(context.Background()); err != nil {
+		s.logError("outbox: db replay failed", "error", err.Error())
+	}
+	if err := s.reloadSchedulesDB(context.Background()); err != nil {
+		s.logError("schedules: db load failed", "error", err.Error())
+	}
+	if err := s.ConfigureOPA(); err != nil {
+		return fmt.Errorf("server: compile OPA policy: %w", err)
+	}
+	s.initTracingFromEnv()
 	return nil
 }
 
@@ -342,9 +430,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/runs/{id}/tests", s.listTestReports)
 	mux.HandleFunc("GET /api/v1/test-intelligence", s.testIntelligence)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/tests", s.uploadTestReport)
+	mux.HandleFunc("GET /api/v1/jobs/{id}/test-shards", s.testShards)
 	mux.HandleFunc("GET /api/v1/artifacts/{id}", s.downloadArtifact)
 	mux.HandleFunc("GET /api/v1/artifacts/{id}/provenance", s.downloadProvenance)
 	mux.HandleFunc("PUT /api/v1/jobs/{id}/artifacts/{name}", s.uploadArtifact)
+	mux.HandleFunc("GET /api/v1/jobs/{id}/dependencies/{producer}/{artifact}", s.downloadDependency)
+	mux.HandleFunc("GET /api/v1/schedules", s.listSchedules)
+	mux.HandleFunc("PUT /api/v1/schedules", s.upsertSchedule)
+	mux.HandleFunc("POST /api/v1/schedules/{id}/trigger", s.triggerSchedule)
 	mux.HandleFunc("GET /api/v1/cache/{key}", s.downloadCache)
 	mux.HandleFunc("PUT /api/v1/cache/{key}", s.uploadCache)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/approve", s.approveJob)
@@ -377,6 +470,7 @@ func (s *Server) Handler() http.Handler {
 	h = s.auth(h)
 	h = auth.Middleware(s.AuthStore, s.AdminToken, h, s.logf)
 	h = s.observeHTTP(h)
+	h = s.tracingMiddleware(h)
 	return requestID(s.recoverer(s.statusLogger(h)))
 }
 
@@ -405,7 +499,7 @@ func (s *Server) auth(next http.Handler) http.Handler {
 		// Runner drain/disable/enable are admin-tier operations: a runner
 		// token must never be able to disable its peers or itself.
 		runnerAdminOp := strings.HasPrefix(path, "/api/v1/runners/") && (strings.HasSuffix(path, "/drain") || strings.HasSuffix(path, "/disable") || strings.HasSuffix(path, "/enable"))
-		runnerOnly := (!runnerAdminOp && strings.HasPrefix(path, "/api/v1/runners/")) || path == "/api/v1/runners/register" || strings.HasPrefix(path, "/api/v1/cache/") || (strings.HasPrefix(path, "/api/v1/jobs/") && (strings.Contains(path, "/artifacts/") || strings.HasSuffix(path, "/heartbeat") || strings.HasSuffix(path, "/log") || strings.HasSuffix(path, "/complete") || strings.HasSuffix(path, "/tests") || strings.HasSuffix(path, "/secrets") || strings.HasSuffix(path, "/snapshots")))
+		runnerOnly := (!runnerAdminOp && strings.HasPrefix(path, "/api/v1/runners/")) || path == "/api/v1/runners/register" || strings.HasPrefix(path, "/api/v1/cache/") || (strings.HasPrefix(path, "/api/v1/jobs/") && (strings.Contains(path, "/artifacts/") || strings.Contains(path, "/dependencies/") || strings.HasSuffix(path, "/heartbeat") || strings.HasSuffix(path, "/log") || strings.HasSuffix(path, "/complete") || strings.HasSuffix(path, "/tests") || strings.HasSuffix(path, "/test-shards") || strings.HasSuffix(path, "/secrets") || strings.HasSuffix(path, "/snapshots")))
 		sharedRead := r.Method == http.MethodGet && (strings.HasPrefix(path, "/api/v1/artifacts/") || (strings.HasPrefix(path, "/api/v1/runs/") && strings.HasSuffix(path, "/artifacts")))
 		if sharedRead {
 			if s.AdminToken != "" && !bearerOK(r.Header.Get("Authorization"), s.AdminToken) && !bearerOK(r.Header.Get("Authorization"), s.RunnerToken) {
@@ -559,6 +653,11 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	in.Trusted = false
 	run, err := s.enqueue(in)
 	if err != nil {
+		var denial *opaDenialError
+		if errors.As(err, &denial) {
+			http.Error(w, denial.Error(), http.StatusForbidden)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -566,11 +665,20 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) enqueue(in SubmitRun) (model.Run, error) {
+	return s.enqueueID(in, "")
+}
+
+// enqueueID is enqueue with an optional pre-generated run ID (schedules
+// claim their occurrence before enqueueing and therefore need the ID up
+// front).
+func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
+	ctx, span := s.startSpan(context.Background(), "server.enqueue")
+	defer span.End()
 	// Server-side pipeline resolution: components are resolved and merged,
 	// inputs validated and injected, and the canonical pipeline text
 	// replaces the submission so every persisted job carries a
 	// self-contained, deterministic pipeline.
-	spec, pipelineText, componentDigests, err := s.resolvePipeline(context.Background(), in)
+	spec, pipelineText, componentDigests, err := s.resolvePipeline(ctx, in)
 	if err != nil {
 		return model.Run{}, err
 	}
@@ -593,14 +701,32 @@ func (s *Server) enqueue(in SubmitRun) (model.Run, error) {
 		caps = policy.Intersect(caps, s.Policy.CapabilitiesFor(in.RepoFullName))
 	}
 	caps = caps.Effective(in.Trusted)
+	// The OPA deny gate evaluates BEFORE capability admission: a denial is
+	// cheaper than full admission validation and must win even when the
+	// capability pass would also reject the submission.
+	oidcAudiences := policy.OIDCFromCapabilities(caps).AllowedAudiences
+	if denial := s.opaAdmissionCheck(ctx, in, g, caps, oidcAudiences); denial != nil {
+		span.SetStatus(codes.Error, "opa denial")
+		return model.Run{}, denial
+	}
 	if err = policy.ValidateAdmissionWithCapabilities(spec, caps); err != nil {
 		return model.Run{}, err
 	}
-	oidcAudiences := policy.OIDCFromCapabilities(caps).AllowedAudiences
-	now := time.Now().UTC()
-	runID, err := newID()
+	pipelineDigest, err := pipeline.PipelineDigest(spec)
 	if err != nil {
-		return model.Run{}, fmt.Errorf("generate run id: %w", err)
+		return model.Run{}, err
+	}
+	policyJSON, err := json.Marshal(caps)
+	if err != nil {
+		return model.Run{}, err
+	}
+	now := time.Now().UTC()
+	runID := preRunID
+	if runID == "" {
+		runID, err = newID()
+		if err != nil {
+			return model.Run{}, fmt.Errorf("generate run id: %w", err)
+		}
 	}
 	group := expandConcurrency(spec.Concurrency.Group, in)
 	run := model.Run{ID: runID, Repo: in.RepoURL, RepoFullName: in.RepoFullName, Ref: in.Ref, SHA: in.SHA, Event: in.Event,
@@ -615,6 +741,7 @@ func (s *Server) enqueue(in SubmitRun) (model.Run, error) {
 		jobIDs[key] = id
 	}
 	created := make(map[string]model.Job, len(g.Jobs))
+	jobContracts := map[string]map[string]storage.ArtifactContract{}
 	for key, cj := range g.Jobs {
 		needs := make([]string, 0, len(cj.Needs))
 		for _, dep := range cj.Needs {
@@ -632,6 +759,15 @@ func (s *Server) enqueue(in SubmitRun) (model.Run, error) {
 		if !in.Trusted && cj.Job.Runtime == "container" {
 			effectiveNetwork = "none"
 		}
+		// The compiled job payload is the deterministic enqueue-time record
+		// the runner can verify its own recompilation against.
+		cjJSON, mErr := json.Marshal(cj)
+		if mErr != nil {
+			return model.Run{}, mErr
+		}
+		digestSum := sha256.Sum256(cjJSON)
+		jobDigest := hex.EncodeToString(digestSum[:])
+		jobContracts[jobIDs[key]] = buildJobContracts(cj)
 		created[jobIDs[key]] = model.Job{
 			ID: jobIDs[key], RunID: runID, Key: key, BaseKey: cj.BaseID, RepoURL: in.RepoURL, Ref: in.Ref, SHA: in.SHA,
 			Event: in.Event, Condition: cj.Job.If, DependencyStatus: model.StatusSuccess, Pipeline: in.Pipeline, Trusted: in.Trusted, ChangedFiles: append([]string{}, in.ChangedFiles...), Needs: needs,
@@ -640,7 +776,20 @@ func (s *Server) enqueue(in SubmitRun) (model.Run, error) {
 			Status:          model.StatusQueued, Priority: scheduler.DownstreamDepth(g, key), MaxInfraRetries: infraRetries, CreatedAt: now,
 			PlacementRegions: append([]string{}, cj.Job.Placement.Regions...),
 			ComponentDigest:  componentDigests[cj.BaseID],
+			CompiledJobPayload: &model.CompiledJobPayload{
+				SchemaVersion:   1,
+				CompilerVersion: version.Version,
+				PipelineDigest:  pipelineDigest,
+				JobDigest:       jobDigest,
+				EffectiveJob:    json.RawMessage(cjJSON),
+				EffectivePolicy: json.RawMessage(policyJSON),
+			},
 		}
+	}
+	// Artifact contracts are persisted alongside the jobs so uploads can be
+	// verified against them without recompiling the pipeline.
+	for id, contracts := range jobContracts {
+		s.persistJobContracts(ctx, id, contracts)
 	}
 
 	if s.Sched != nil {
@@ -670,6 +819,9 @@ func (s *Server) enqueue(in SubmitRun) (model.Run, error) {
 	s.runs[runID] = run
 	for id, j := range created {
 		s.jobs[id] = j
+		if contracts, ok := jobContracts[id]; ok {
+			s.contracts[id] = contracts
+		}
 	}
 	s.auditLocked("run.queued", "scheduler", runID, "", "run queued", map[string]string{"event": in.Event})
 	s.scheduleStateLocked()
@@ -715,6 +867,9 @@ func (s *Server) enqueueDB(in SubmitRun, run model.Run, created map[string]model
 			j.FinishedAt = &now
 		case j.ApprovalRequired && j.ApprovedBy == "":
 			j.Status = model.StatusWaitingApproval
+			if j.WaitingSince == nil {
+				j.WaitingSince = &now
+			}
 		}
 		created[id] = j
 	}
@@ -826,7 +981,11 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		writeJSON(w, http.StatusOK, out)
+		dto := make([]v1.RunDTO, 0, len(out))
+		for _, v := range out {
+			dto = append(dto, v1.RunDTOFrom(v))
+		}
+		writeJSON(w, http.StatusOK, dto)
 		return
 	}
 	s.mu.Lock()
@@ -836,7 +995,11 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 		out = append(out, v)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
-	writeJSON(w, http.StatusOK, out)
+	dto := make([]v1.RunDTO, 0, len(out))
+	for _, v := range out {
+		dto = append(dto, v1.RunDTOFrom(v))
+	}
+	writeJSON(w, http.StatusOK, dto)
 }
 func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
@@ -850,7 +1013,7 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		writeJSON(w, http.StatusOK, v)
+		writeJSON(w, http.StatusOK, v1.RunDTOFrom(v))
 		return
 	}
 	s.mu.Lock()
@@ -860,7 +1023,7 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	writeJSON(w, http.StatusOK, v)
+	writeJSON(w, http.StatusOK, v1.RunDTOFrom(v))
 }
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
@@ -877,9 +1040,9 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		out := make([]model.Job, 0, len(jobs))
+		out := make([]v1.JobDTO, 0, len(jobs))
 		for _, j := range jobs {
-			out = append(out, redactJob(j))
+			out = append(out, v1.JobDTOFrom(j))
 		}
 		writeJSON(w, http.StatusOK, out)
 		return
@@ -890,10 +1053,10 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	out := make([]model.Job, 0)
+	out := make([]v1.JobDTO, 0)
 	for _, j := range s.jobs {
 		if j.RunID == runID {
-			out = append(out, redactJob(j))
+			out = append(out, v1.JobDTOFrom(j))
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -1058,7 +1221,11 @@ func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		writeJSON(w, http.StatusOK, out)
+		dto := make([]v1.RunnerDTO, 0, len(out))
+		for _, x := range out {
+			dto = append(dto, v1.RunnerDTOFrom(x))
+		}
+		writeJSON(w, http.StatusOK, dto)
 		return
 	}
 	s.mu.Lock()
@@ -1068,7 +1235,11 @@ func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
 		out = append(out, x)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	writeJSON(w, http.StatusOK, out)
+	dto := make([]v1.RunnerDTO, 0, len(out))
+	for _, x := range out {
+		dto = append(dto, v1.RunnerDTOFrom(x))
+	}
+	writeJSON(w, http.StatusOK, dto)
 }
 
 // runnerDrain marks a runner as draining: it finishes its active jobs and
@@ -1111,9 +1282,9 @@ func (s *Server) runnerDrain(w http.ResponseWriter, r *http.Request) {
 
 // runnerDisable takes a runner out of service: it is marked disabled, its
 // active jobs are cancelled with "runner disabled", and next() refuses to
-// lease to it. Re-registration cannot clear the flag. NOTE: in mTLS mode the
-// runner's certificate serial should also be revoked (runnerpki revocation
-// is not persisted yet — deferred).
+// lease to it. Re-registration cannot clear the flag. In mTLS mode the
+// runner's certificate serial is also revoked (persisted CRL, see crl.go)
+// so a disabled runner's still-valid certificate cannot be replayed.
 func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	actor := actorFrom(r)
@@ -1128,24 +1299,31 @@ func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		ri.Disabled = true
+		if ri.CertSerial != "" && ri.RevokedAt == nil {
+			now := time.Now().UTC()
+			ri.RevokedAt = &now
+		}
 		if err := s.DB.UpsertRunner(r.Context(), ri); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		// TODO: cancel the runner's active jobs in DB mode (per-job
-		// cancellation is not exposed by the scheduler yet).
+		s.revokeRunnerCert(ri, actor)
 		s.auditLocked("runner.disable", actor, "", "", "runner disabled", map[string]string{"runner": id})
 		writeJSON(w, http.StatusOK, ri)
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	ri, ok := s.runners[id]
 	if !ok {
+		s.mu.Unlock()
 		http.NotFound(w, r)
 		return
 	}
 	ri.Disabled = true
+	if ri.CertSerial != "" && ri.RevokedAt == nil {
+		now := time.Now().UTC()
+		ri.RevokedAt = &now
+	}
 	now := time.Now().UTC()
 	for jobID, j := range s.jobs {
 		if j.Status != model.StatusRunning || j.LeaseRunnerID != id {
@@ -1168,6 +1346,8 @@ func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
 	}
 	s.auditLocked("runner.disable", actor, "", "", "runner disabled", map[string]string{"runner": id})
 	_ = s.persistLocked()
+	s.mu.Unlock()
+	s.revokeRunnerCert(ri, actor)
 	writeJSON(w, http.StatusOK, ri)
 }
 
@@ -1307,6 +1487,8 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
+	_, leaseSpan := s.startSpan(r.Context(), "server.lease")
+	leaseSpan.SetAttributes(spanInt("kiwi.job_id_bytes", int64(len(j.ID))))
 	rawToken := t1 + t2
 	j.Status = model.StatusRunning
 	j.Attempts++
@@ -1337,6 +1519,7 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	taskJob := j
 	taskJob.LeaseTokenHash = nil
 	task := Task{Job: taskJob, LeaseToken: rawToken, LeaseGeneration: j.LeaseGeneration, LeaseExpiresAt: exp}
+	leaseSpan.End()
 	writeJSON(w, http.StatusOK, task)
 }
 
@@ -1371,6 +1554,7 @@ func (s *Server) nextDB(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, "scheduler standby", http.StatusServiceUnavailable)
 		return
 	case errors.Is(err, scheduler.ErrNoJobs), errors.Is(err, storage.ErrLeaseConflict):
+		s.applyQueueReasonsDB(ctx, ri)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	case errors.Is(err, storage.ErrNotFound):
@@ -1383,6 +1567,10 @@ func (s *Server) nextDB(w http.ResponseWriter, r *http.Request, id string) {
 	taskJob := *j
 	taskJob.LeaseTokenHash = nil
 	task := Task{Job: taskJob, LeaseToken: rawToken, LeaseGeneration: j.LeaseGeneration, LeaseExpiresAt: exp}
+	if j.Environment != "" {
+		s.recordDeploymentDB(ctx, *j, time.Now().UTC())
+	}
+	s.metricObserve("kiwi_queue_latency_seconds", time.Since(j.CreatedAt).Seconds(), nil)
 	writeJSON(w, http.StatusOK, task)
 }
 
@@ -1536,6 +1724,8 @@ func (s *Server) logDB(w http.ResponseWriter, r *http.Request, jobID string, in 
 }
 
 func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
+	_, span := s.startSpan(r.Context(), "server.complete")
+	defer span.End()
 	jobID := r.PathValue("id")
 	var in Complete
 	if !decode(w, r, &in) {
@@ -1674,10 +1864,25 @@ func (s *Server) completeDB(w http.ResponseWriter, r *http.Request, jobID string
 		http.Error(w, "stale or invalid lease", http.StatusConflict)
 		return
 	}
+	s.finishDeploymentDB(ctx, j, st, time.Now().UTC())
+	s.metricObserve("kiwi_job_duration_seconds", completionDurationSeconds(j), nil)
 	if run, gerr := s.DB.GetRun(ctx, j.RunID); gerr == nil && run.Status.Terminal() {
 		s.publishGitHubStatus(run)
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// completionDurationSeconds derives the wall-clock job duration at
+// completion from the job's start/finish timestamps.
+func completionDurationSeconds(j model.Job) float64 {
+	if j.StartedAt == nil {
+		return 0
+	}
+	finish := time.Now().UTC()
+	if j.FinishedAt != nil {
+		finish = *j.FinishedAt
+	}
+	return finish.Sub(*j.StartedAt).Seconds()
 }
 
 // completionResultHash canonicalizes a completion payload so identical
@@ -1788,6 +1993,7 @@ func (s *Server) approveJob(w http.ResponseWriter, r *http.Request) {
 	if j.Status == model.StatusWaitingApproval {
 		j.Status = model.StatusQueued
 	}
+	s.observeApprovalWait(&j)
 	s.jobs[jobID] = j
 	s.auditLocked("job.approved", actor, j.RunID, j.ID, "environment approved", map[string]string{"environment": j.Environment})
 	s.scheduleStateLocked()
@@ -1824,12 +2030,25 @@ func (s *Server) approveJobDB(w http.ResponseWriter, r *http.Request, jobID, act
 	if j.Status == model.StatusWaitingApproval {
 		j.Status = model.StatusQueued
 	}
+	s.observeApprovalWait(&j)
 	if err := s.DB.UpdateJob(ctx, j); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
 	s.auditLocked("job.approved", actor, j.RunID, j.ID, "environment approved", map[string]string{"environment": j.Environment})
 	writeJSON(w, http.StatusOK, redactJob(j))
+}
+
+// observeApprovalWait records how long an approval-gated job waited from
+// entering the waiting state to approval and clears the marker.
+func (s *Server) observeApprovalWait(j *model.Job) {
+	if j.WaitingSince == nil {
+		return
+	}
+	wait := time.Since(*j.WaitingSince).Seconds()
+	s.metricObserve("kiwi_approval_wait_seconds", wait, nil)
+	s.metricObserve("kiwi_environment_wait_seconds", wait, nil)
+	j.WaitingSince = nil
 }
 
 func (s *Server) rerunRun(w http.ResponseWriter, r *http.Request) {
@@ -2049,6 +2268,10 @@ func (s *Server) scheduleStateLocked() {
 			if j.ApprovalRequired && j.ApprovedBy == "" {
 				if j.Status != model.StatusWaitingApproval {
 					j.Status = model.StatusWaitingApproval
+					if j.WaitingSince == nil {
+						w := time.Now().UTC()
+						j.WaitingSince = &w
+					}
 					s.jobs[id] = j
 					changed = true
 				}
@@ -2715,6 +2938,9 @@ func (s *Server) Maintain(ctx context.Context) {
 			loopStart := time.Now()
 			if s.Sched != nil {
 				s.maintainDB(ctx, tick.UTC())
+				if s.leader {
+					s.fireDueSchedules(ctx, tick.UTC())
+				}
 				s.metricObserve("kiwi_scheduler_loop_duration_seconds", time.Since(loopStart).Seconds(), nil)
 				continue
 			}
@@ -2737,6 +2963,7 @@ func (s *Server) Maintain(ctx context.Context) {
 			}
 			s.GC(ctx, tick.UTC())
 			s.flushOutbox()
+			s.fireDueSchedules(ctx, tick.UTC())
 			s.metricObserve("kiwi_scheduler_loop_duration_seconds", time.Since(loopStart).Seconds(), nil)
 		}
 	}

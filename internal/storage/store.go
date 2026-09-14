@@ -170,12 +170,16 @@ type SnapshotStore interface {
 // ArtifactContract declares the artifacts a job promises to produce,
 // persisted per job so consumers can verify uploads before use.
 type ArtifactContract struct {
-	Name      string        `json:"name"`
-	Paths     []string      `json:"paths,omitempty"`
-	Required  bool          `json:"required,omitempty"`
-	Retention time.Duration `json:"retention,omitempty"`
-	MaxSize   int64         `json:"max_size,omitempty"`
-	SHA256    string        `json:"sha256,omitempty"`
+	Name             string        `json:"name"`
+	Paths            []string      `json:"paths,omitempty"`
+	Required         bool          `json:"required,omitempty"`
+	Retention        time.Duration `json:"retention,omitempty"`
+	MaxSize          int64         `json:"max_size,omitempty"`
+	SHA256           string        `json:"sha256,omitempty"`
+	SBOM             string        `json:"sbom,omitempty"`
+	SigstoreRequired bool          `json:"sigstore_required,omitempty"`
+	SigstoreIssuer   string        `json:"sigstore_issuer,omitempty"`
+	SigstoreIdentity string        `json:"sigstore_identity,omitempty"`
 }
 
 // ArtifactContractStore is the durable per-job artifact contract contract.

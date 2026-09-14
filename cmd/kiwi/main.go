@@ -45,6 +45,8 @@ func main() {
 		err = app.Init(os.Args[2:])
 	case "runs", "jobs", "logs", "cancel", "approve", "rerun", "artifacts", "schedules", "policy":
 		err = app.Ops(ctx, os.Args[1], os.Args[2:])
+	case "tui":
+		err = app.TUI(ctx, os.Args[2:])
 	case "database":
 		err = databaseCommand(ctx, os.Args[2:])
 	case "config":
@@ -124,7 +126,8 @@ Usage:
   kiwi dispatch --repo owner/name --ref main --input k=v --pipeline FILE
   kiwi runs [--server URL] [--token ADMIN_TOKEN]
   kiwi jobs RUN [--server URL] [--token ADMIN_TOKEN]
-  kiwi logs RUN [--job KEY] [--follow] [--server URL] [--token ADMIN_TOKEN]
+  kiwi logs RUN [--job KEY] [--follow] [--interactive] [--server URL] [--token ADMIN_TOKEN]
+  kiwi tui RUN [--job KEY] [--follow] [--search TEXT] [--server URL] [--token ADMIN_TOKEN]
   kiwi cancel RUN | kiwi rerun RUN | kiwi approve JOB | kiwi artifacts RUN
   kiwi schedules list|trigger
   kiwi policy check [-f .kiwi/pipeline.yaml] [--trusted]

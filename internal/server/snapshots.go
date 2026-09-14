@@ -113,11 +113,19 @@ func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
 	s.snapshots[id] = rec
 	s.auditLocked("snapshot.uploaded", runnerID, j.RunID, j.ID, "workspace snapshot uploaded", map[string]string{"sha256": rec.SHA256})
 	s.mu.Unlock()
+	if s.DB != nil {
+		if ss, ok := s.DB.(storage.SnapshotStore); ok {
+			if err := ss.InsertSnapshotRecord(r.Context(), rec); err != nil {
+				s.logError("snapshot record insert failed", "snapshot", id, "error", err.Error())
+			}
+		}
+	}
 	writeJSON(w, http.StatusCreated, redactSnapshot(rec))
 }
 
 // listSnapshots is GET /api/v1/runs/{id}/snapshots: the manifests of every
-// snapshot uploaded by the run's jobs.
+// snapshot uploaded by the run's jobs. DB mode merges the SQL records with
+// the in-memory copy (which holds the local archive paths).
 func (s *Server) listSnapshots(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
 	s.mu.Lock()
@@ -130,7 +138,32 @@ func (s *Server) listSnapshots(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-	} else if _, ok := s.runs[runID]; !ok {
+		out := []model.SnapshotRecord{}
+		seen := map[string]bool{}
+		if ss, ok := s.DB.(storage.SnapshotStore); ok {
+			recs, err := ss.ListSnapshotsByRun(r.Context(), runID)
+			if err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			for _, rec := range recs {
+				if cur, ok := s.snapshots[rec.ID]; ok {
+					rec.Path = cur.Path
+				}
+				out = append(out, redactSnapshot(rec))
+				seen[rec.ID] = true
+			}
+		}
+		for _, rec := range s.snapshots {
+			if rec.RunID == runID && !seen[rec.ID] {
+				out = append(out, redactSnapshot(rec))
+			}
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	if _, ok := s.runs[runID]; !ok {
 		http.NotFound(w, r)
 		return
 	}

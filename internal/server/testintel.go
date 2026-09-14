@@ -50,6 +50,24 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 	rep.JobID = j.ID
 	rep.JobKey = j.Key
 	rep.CreatedAt = time.Now().UTC()
+	// Persistent test history: every uploaded case feeds the flaky/sharding
+	// model, and the history file is the durable store in both modes.
+	repo := ""
+	if s.DB != nil {
+		if run, gerr := s.DB.GetRun(r.Context(), j.RunID); gerr == nil {
+			repo = run.RepoFullName
+		}
+	} else {
+		s.mu.Lock()
+		if run, ok := s.runs[j.RunID]; ok {
+			repo = run.RepoFullName
+		}
+		s.mu.Unlock()
+	}
+	for _, c := range rep.Cases {
+		s.metricObserve("kiwi_test_duration_seconds", c.Duration, nil)
+	}
+	s.recordTestReportHistory(repo, rep)
 	if s.DB != nil {
 		if err := s.DB.InsertTestReport(r.Context(), rep); err != nil {
 			http.Error(w, err.Error(), 500)
@@ -126,6 +144,7 @@ func (s *Server) testIntelligence(w http.ResponseWriter, r *http.Request) {
 		}
 		out := summarizeTestIntelligence(filtered)
 		out["repo"] = repo
+		s.mergeHistoryFlaky(repo, out)
 		writeJSON(w, http.StatusOK, out)
 		return
 	}
@@ -139,6 +158,7 @@ func (s *Server) testIntelligence(w http.ResponseWriter, r *http.Request) {
 	}
 	out := summarizeTestIntelligence(filtered)
 	out["repo"] = repo
+	s.mergeHistoryFlaky(repo, out)
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -179,4 +199,22 @@ func summarizeTestIntelligence(reports []model.TestReport) map[string]any {
 		"failures":    failures,
 		"flaky_tests": flaky,
 	}
+}
+
+// mergeHistoryFlaky unions the report-derived flaky set with the persisted
+// history's flaky set for a repository.
+func (s *Server) mergeHistoryFlaky(repo string, out map[string]any) {
+	existing, _ := out["flaky_tests"].([]string)
+	seen := map[string]bool{}
+	for _, name := range existing {
+		seen[name] = true
+	}
+	for _, name := range s.flakyFromHistory(repo) {
+		if !seen[name] {
+			seen[name] = true
+			existing = append(existing, name)
+		}
+	}
+	sort.Strings(existing)
+	out["flaky_tests"] = existing
 }

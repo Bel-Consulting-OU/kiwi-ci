@@ -394,6 +394,7 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.auditLocked("oidc.issued", j.LeaseRunnerID, j.RunID, j.ID, "OIDC id_token issued", map[string]string{"job": j.Key, "audience": in.Audience, "kid": signer.KID})
+	s.metricAdd("kiwi_oidc_issues_total", 1, nil)
 	writeJSON(w, 200, map[string]any{"value": jwt, "expires_at": now.Add(5 * time.Minute)})
 }
 

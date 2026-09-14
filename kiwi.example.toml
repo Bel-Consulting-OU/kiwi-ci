@@ -64,12 +64,24 @@
 # token = ""
 
 [policy]
-# Repository/organization policy document.
-# file = "/etc/kiwi/policy.rego"
+# Repository/organization policy document (strict YAML, fail-closed).
+# file = "/etc/kiwi/policy.yaml"
+
+# Optional OPA/Rego deny rules (fail-closed, in-process).
+# opa_file = "/etc/kiwi/policy.rego"
+# opa_rules = """
+# package kiwi
+# default allow := false
+# allow if input.trusted
+# deny contains "untrusted production" if {
+#   not input.trusted
+#   input.environment == "production"
+# }
+# """
 
 [observability]
-# OpenTelemetry collector endpoint. Accepted for forward compatibility;
-# tracing export is not implemented yet (no-op).
+# OpenTelemetry collector endpoint (OTLP/HTTP): request spans and
+# forge/enqueue/lease/completion traces are exported when set.
 # otel_endpoint = ""
 
 # Serve /metrics on a separate listen address when set.

@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,11 +17,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/artifact"
-	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cache"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executor"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/logging"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
@@ -41,7 +42,16 @@ const (
 	// runnerProtocol is the runner API protocol version spoken by this
 	// runner; it must overlap the control plane's ProtocolMin/Max.
 	runnerProtocol = 3
+	// gcInterval is how often the runner reaps stale runtime resources.
+	gcInterval = time.Hour
+	// gcOlderThan is the executor.GC staleness window.
+	gcOlderThan = 24 * time.Hour
 )
+
+// ErrRunnerDisabledOrRevoked reports that the control plane has disabled
+// this runner or revoked its certificate: the runner must be re-enrolled
+// with fresh credentials and must not loop re-registering.
+var ErrRunnerDisabledOrRevoked = errors.New("runner disabled or certificate revoked; re-enroll required")
 
 // RunnerVersion is the software version reported at registration and can be
 // overridden at build time via -ldflags.
@@ -67,11 +77,42 @@ type Config struct {
 	// Drain makes the runner register as draining: it takes no new jobs,
 	// finishes its active work, and exits once its slots are free.
 	Drain bool
+	// CaptureSnapshots uploads a workspace snapshot after each finished job
+	// (POST /api/v1/jobs/{id}/snapshots). Upload failures are warnings and
+	// never fail the job. The CLI enables this by default.
+	CaptureSnapshots bool
+	// Prewarm lists digest-pinned image references pulled after
+	// registration and refreshed every PrewarmInterval. Anything not pinned
+	// by @sha256: is rejected at startup.
+	Prewarm         []string
+	PrewarmInterval time.Duration
+	// PrewarmStateFile persists the bounded set of previously prewarmed
+	// references (default: ~/.kiwi/prewarm.json).
+	PrewarmStateFile string
+	// GCInterval bounds how often the runner reaps stale runtime resources
+	// via executor.GC (default: hourly); WorkDir is the GC subprocess
+	// working directory (default: system temp).
+	GCInterval time.Duration
+	WorkDir    string
+	// MetricsListen exposes the Prometheus text metrics endpoint when set
+	// (e.g. ":9091").
+	MetricsListen string
+	// CacheRoot is the root for the runner's local cache and artifact
+	// stores (default: ~/.kiwi).
+	CacheRoot string
+	// SigstoreKeyPath is a PKCS8 PEM Ed25519 private key used to sign
+	// Sigstore attestations for artifacts whose contract declares a
+	// sigstore gate.
+	SigstoreKeyPath string
+	// CheckoutFn replaces the default git checkout (test seam / custom
+	// workspace provisioning). Jobs execute in the directory it populates.
+	CheckoutFn func(ctx context.Context, j model.Job, dir string) error
 }
 type Runner struct {
-	Cfg    Config
-	ID     string
-	Client *http.Client
+	Cfg     Config
+	ID      string
+	Client  *http.Client
+	Metrics *Metrics
 }
 
 func (r *Runner) Run(ctx context.Context) error {
@@ -83,6 +124,25 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	if r.Cfg.Concurrency <= 0 {
 		r.Cfg.Concurrency = 1
+	}
+	if r.Cfg.PrewarmInterval <= 0 {
+		r.Cfg.PrewarmInterval = prewarmDefaultInterval
+	}
+	if r.Cfg.GCInterval <= 0 {
+		r.Cfg.GCInterval = gcInterval
+	}
+	if r.Cfg.WorkDir == "" {
+		r.Cfg.WorkDir = os.TempDir()
+	}
+	if r.Cfg.PrewarmStateFile == "" {
+		home, _ := os.UserHomeDir()
+		r.Cfg.PrewarmStateFile = filepath.Join(home, ".kiwi", "prewarm.json")
+	}
+	if r.Metrics == nil {
+		r.Metrics = NewMetrics()
+	}
+	if err := validatePrewarmRefs(r.Cfg.Prewarm); err != nil {
+		return err
 	}
 	if err := validateServerURL(r.Cfg.Server); err != nil {
 		return err
@@ -106,6 +166,14 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err := r.register(ctx); err != nil {
 		return err
 	}
+	if r.Cfg.MetricsListen != "" {
+		r.startMetricsServer(ctx)
+	}
+	prewarmer := newPrewarmer(r.Cfg)
+	go prewarmer.run(ctx)
+	lastPrewarm := time.Now()
+	lastGC := time.Now()
+	maint := maintenanceSchedule{GCInterval: r.Cfg.GCInterval, PrewarmInterval: r.Cfg.PrewarmInterval}
 	done := make(chan struct{}, r.Cfg.Concurrency)
 	active := 0
 	// Draining starts from the local --drain flag; the server may also
@@ -117,7 +185,14 @@ func (r *Runner) Run(ctx context.Context) error {
 		// independently capacity-checks this runner, so a race cannot over-lease it.
 		for active < r.Cfg.Concurrency {
 			task, drainSignal, err := r.next(ctx)
-			if err != nil || task == nil {
+			if err != nil {
+				if errors.Is(err, ErrRunnerDisabledOrRevoked) {
+					return err
+				}
+				fmt.Fprintf(os.Stderr, "kiwi runner %s: next: %v\n", r.ID, err)
+				break
+			}
+			if task == nil {
 				if drainSignal {
 					draining = true
 				}
@@ -140,7 +215,39 @@ func (r *Runner) Run(ctx context.Context) error {
 			active--
 		case <-time.After(r.Cfg.Poll):
 		}
+		if gcDue, prewarmDue := maint.due(time.Now(), lastGC, lastPrewarm); gcDue || prewarmDue {
+			if gcDue {
+				lastGC = time.Now()
+				go func() {
+					rep := executor.GC(ctx, r.Cfg.WorkDir, gcOlderThan)
+					if rep.Containers > 0 || rep.Networks > 0 || rep.VMs > 0 {
+						fmt.Printf("kiwi runner %s: gc removed %d containers, %d networks, %d VMs\n", r.ID, rep.Containers, rep.Networks, rep.VMs)
+					}
+				}()
+			}
+			if prewarmDue {
+				lastPrewarm = time.Now()
+				go prewarmer.run(ctx)
+			}
+		}
 	}
+}
+
+// startMetricsServer serves the Prometheus text metrics on the configured
+// listen address for the runner's lifetime.
+func (r *Runner) startMetricsServer(ctx context.Context) {
+	srv := newMetricsServer(r.Cfg.MetricsListen, r.Metrics)
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			fmt.Fprintf(os.Stderr, "kiwi runner metrics: %v\n", err)
+		}
+	}()
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
 }
 func (r *Runner) register(ctx context.Context) error {
 	labels := append([]string{}, r.Cfg.Labels...)
@@ -169,6 +276,12 @@ func (r *Runner) register(ctx context.Context) error {
 	}
 	var out model.Runner
 	if err := r.post(ctx, "/api/v1/runners/register", in, &out); err != nil {
+		if isHTTPStatus(err, http.StatusForbidden) {
+			// 403 on registration means the runner was disabled or its
+			// certificate serial was revoked: re-registering cannot clear
+			// either and must not be retried.
+			return fmt.Errorf("%w (server: %v)", ErrRunnerDisabledOrRevoked, err)
+		}
 		return err
 	}
 	r.ID = out.ID
@@ -178,7 +291,9 @@ func (r *Runner) register(ctx context.Context) error {
 
 // next polls for work. The boolean reports the server's drain signal
 // (X-Kiwi-Draining on a 204): the runner is draining and should exit once
-// its active slots are free.
+// its active slots are free. A disabled runner (X-Kiwi-Disabled) or a
+// rejected identity (403 — certificate revoked) is a terminal
+// ErrRunnerDisabledOrRevoked: the runner exits instead of re-polling.
 func (r *Runner) next(ctx context.Context) (*server.Task, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.Cfg.Server+"/api/v1/runners/"+r.ID+"/next", bytes.NewReader([]byte("{}")))
 	if err != nil {
@@ -190,8 +305,15 @@ func (r *Runner) next(ctx context.Context) (*server.Task, bool, error) {
 		return nil, false, err
 	}
 	defer resp.Body.Close()
+	if resp.Header.Get("X-Kiwi-Disabled") == "true" {
+		return nil, false, ErrRunnerDisabledOrRevoked
+	}
 	if resp.StatusCode == http.StatusNoContent {
 		return nil, resp.Header.Get("X-Kiwi-Draining") == "true", nil
+	}
+	if resp.StatusCode == http.StatusForbidden {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, false, fmt.Errorf("%w (server: %s: %s)", ErrRunnerDisabledOrRevoked, resp.Status, strings.TrimSpace(string(b)))
 	}
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
@@ -217,10 +339,12 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		return
 	}
 	defer os.RemoveAll(tmp)
-	if err = r.checkout(ctx, t.Job, tmp); err != nil {
+	checkoutStart := time.Now()
+	if err = r.checkoutTask(ctx, t.Job, tmp); err != nil {
 		r.complete(parent, t, statusForErr(ctx, err), err, nil)
 		return
 	}
+	r.Metrics.Observe("kiwi_runner_checkout_duration_seconds", time.Since(checkoutStart).Seconds())
 	spec, err := pipeline.Parse([]byte(t.Job.Pipeline))
 	if err != nil {
 		r.complete(parent, t, model.StatusFailure, err, nil)
@@ -230,15 +354,37 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		r.complete(parent, t, model.StatusFailure, err, nil)
 		return
 	}
-	g, err := pipeline.Compile(spec)
-	if err != nil {
-		r.complete(parent, t, model.StatusFailure, err, nil)
-		return
-	}
-	cj, ok := g.Jobs[t.Job.Key]
-	if !ok {
-		r.complete(parent, t, model.StatusFailure, fmt.Errorf("compiled job %q not found", t.Job.Key), nil)
-		return
+	// When the control plane attached the enqueue-time compilation record,
+	// verify its digests and execute the payload's EffectiveJob instead of
+	// recompiling/selecting locally. The baseline admission check above
+	// stays; the payload's effective policy narrows it further.
+	var cj pipeline.CompiledJob
+	if t.Job.CompiledJobPayload != nil {
+		var caps policy.Capabilities
+		var policyOK bool
+		cj, caps, policyOK, err = verifyCompiledPayload(spec, t.Job.CompiledJobPayload, t.Job.Trusted)
+		if err != nil {
+			r.complete(parent, t, model.StatusFailure, err, nil)
+			return
+		}
+		if policyOK {
+			if err := policy.ValidateAdmissionWithCapabilities(spec, caps); err != nil {
+				r.complete(parent, t, model.StatusFailure, fmt.Errorf("compiled payload policy admission: %w", err), nil)
+				return
+			}
+		}
+	} else {
+		g, gerr := pipeline.Compile(spec)
+		if gerr != nil {
+			r.complete(parent, t, model.StatusFailure, gerr, nil)
+			return
+		}
+		var ok bool
+		cj, ok = g.Jobs[t.Job.Key]
+		if !ok {
+			r.complete(parent, t, model.StatusFailure, fmt.Errorf("compiled job %q not found", t.Job.Key), nil)
+			return
+		}
 	}
 	cj.Job.Network = t.Job.Network
 	masker := &secrets.Masker{}
@@ -259,15 +405,27 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		fmt.Printf("[%s/%s] %s\n", job, step, msg)
 		_ = r.post(parent, "/api/v1/jobs/"+t.Job.ID+"/log", server.LogLine{RunnerID: r.ID, LeaseToken: t.LeaseToken, LeaseGeneration: t.LeaseGeneration, JobKey: job, Step: step, Line: msg}, nil)
 	})
+	stepTimer := &stepTimer{m: r.Metrics}
+	if cj.Job.Tests.Shards > 0 {
+		if err := r.applyTestShards(ctx, t, &cj); err != nil {
+			sink.WriteLine(cj.ID, "tests", "shard warning: "+err.Error())
+		}
+	}
 	provider := secrets.Chain{secrets.EnvProvider{Prefix: "KIWI_SECRET_"}, secrets.MacKeychainProvider{Service: "kiwi-ci"}}
-	cacheStore := cache.Default()
-	cacheStore.RemoteURL, cacheStore.Token, cacheStore.Client = r.Cfg.Server, r.Cfg.Token, r.Client
-	reporter := func(_ string, name, path string) error { return r.uploadArtifact(parent, t, name, path) }
+	cacheStore := r.newJobCache(t.Job.RepoURL, t.Job.Trusted, r.Metrics)
+	artifactStore := artifact.Default()
+	if r.Cfg.CacheRoot != "" {
+		artifactStore = &artifact.Store{Root: filepath.Join(r.Cfg.CacheRoot, "artifacts")}
+	}
+	reporter := func(_ string, name, path string) error {
+		return r.uploadArtifactWithAttestations(parent, t, cj, name, path)
+	}
 	// Distributed runs always start from the clean env (InheritEnv is left
 	// false and no PassEnv allowlist is set); untrusted jobs additionally
 	// require image references pinned by digest.
-	ex := executor.Executor{Opt: executor.Options{Workspace: tmp, RunID: t.Job.RunID, Event: t.Job.Event, Branch: branchFromRef(t.Job.Ref), ChangedFiles: effectiveChangedFiles(t.Job.ChangedFiles, tmp), SecretProvider: provider, Logs: sink, Cache: cacheStore, ArtifactReporter: reporter, DependencyStatus: t.Job.DependencyStatus, NeedsOutputs: t.Job.NeedsOutputs, CacheNamespace: cacheNamespace(t.Job), RequireImmutableImages: !t.Job.Trusted}, Masker: masker}
+	ex := executor.Executor{Opt: executor.Options{Workspace: tmp, RunID: t.Job.RunID, Event: t.Job.Event, Branch: branchFromRef(t.Job.Ref), ChangedFiles: effectiveChangedFiles(t.Job.ChangedFiles, tmp), SecretProvider: provider, Logs: logging.Func(func(job, step, line string) { sink.WriteLine(job, step, line); stepTimer.WriteLine(job, step, line) }), Cache: cacheStore, Artifacts: artifactStore, ArtifactReporter: reporter, DependencyStatus: t.Job.DependencyStatus, NeedsOutputs: t.Job.NeedsOutputs, CacheNamespace: cacheNamespace(t.Job), RequireImmutableImages: !t.Job.Trusted}, Masker: masker}
 	res := ex.RunCompiledJob(ctx, spec, cj)
+	stepTimer.flush()
 	if len(cj.Job.TestReports) > 0 {
 		report, er := testintel.Aggregate(tmp, cj.Job.TestReports)
 		if er != nil {
@@ -279,6 +437,14 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 			}
 		}
 	}
+	if r.Cfg.CaptureSnapshots && res.Status != model.StatusSkipped && res.Status != model.StatusBlocked {
+		snapStart := time.Now()
+		if err := r.uploadJobSnapshot(parent, t, tmp); err != nil {
+			sink.WriteLine(cj.ID, "snapshot", "upload warning: "+err.Error())
+		} else {
+			r.Metrics.Observe("kiwi_runner_snapshot_duration_seconds", time.Since(snapStart).Seconds())
+		}
+	}
 	var runErr error
 	if res.Error != "" {
 		runErr = fmt.Errorf("%s", res.Error)
@@ -286,8 +452,71 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	r.complete(parent, t, res.Status, runErr, res.Outputs)
 }
 
+// applyTestShards fetches the deterministic shard assignment for the job
+// from the control plane and injects the env_contract variables
+// (KIWI_TEST_SHARD_TOTAL / KIWI_TEST_SHARD_INDEX) into the job env. The
+// per-run shard index is derived from the lease attempt number (attempts
+// increment per lease, so each retry deterministically gets one shard
+// slice). Failures are returned to the caller, which logs them as warnings
+// and never fails the job.
+func (r *Runner) applyTestShards(ctx context.Context, t server.Task, cj *pipeline.CompiledJob) error {
+	shards := cj.Job.Tests.Shards
+	if shards < 1 {
+		return nil
+	}
+	idx := int(t.Job.Attempts) % shards
+	if idx < 0 {
+		idx = 0
+	}
+	url := r.Cfg.Server + "/api/v1/jobs/" + t.Job.ID + "/test-shards?shards=" + strconv.Itoa(shards) + "&shard=" + strconv.Itoa(idx)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	r.auth(req)
+	req.Header.Set("X-Kiwi-Runner-ID", r.ID)
+	req.Header.Set("X-Kiwi-Lease-Token", t.LeaseToken)
+	req.Header.Set("X-Kiwi-Lease-Generation", fmt.Sprint(t.LeaseGeneration))
+	resp, err := r.Client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("test-shards %s: %s", resp.Status, strings.TrimSpace(string(b)))
+	}
+	var out struct {
+		EnvContract map[string]string `json:"env_contract"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return err
+	}
+	if cj.Job.Env == nil {
+		cj.Job.Env = map[string]string{}
+	}
+	for k, v := range out.EnvContract {
+		if k != "" && v != "" {
+			cj.Job.Env[k] = v
+		}
+	}
+	return nil
+}
+
+// checkoutTask provisions the job workspace: the default git checkout or
+// the configured replacement.
+func (r *Runner) checkoutTask(ctx context.Context, j model.Job, dir string) error {
+	if r.Cfg.CheckoutFn != nil {
+		return r.Cfg.CheckoutFn(ctx, j, dir)
+	}
+	return r.checkout(ctx, j, dir)
+}
+
 func (r *Runner) heartbeatLoop(ctx context.Context, cancel context.CancelFunc, t server.Task, done <-chan struct{}) {
 	interval := r.Cfg.Heartbeat
+	if interval <= 0 {
+		interval = 10 * time.Second
+	}
 	// The interval must stay comfortably below the control-plane lease
 	// duration so the pre-emptive self-cancel never fires on a healthy
 	// connection.
@@ -598,6 +827,9 @@ func (r *Runner) uploadArtifact(ctx context.Context, t server.Task, name, path s
 		return err
 	}
 	defer f.Close()
+	if st, serr := f.Stat(); serr == nil {
+		r.Metrics.Counter("kiwi_runner_artifact_bytes", float64(st.Size()))
+	}
 	url := r.Cfg.Server + "/api/v1/jobs/" + t.Job.ID + "/artifacts/" + name
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, f)
 	if err != nil {
@@ -659,6 +891,13 @@ func unique(in []string) []string {
 		}
 	}
 	return out
+}
+
+// isHTTPStatus reports whether err was produced by r.post or a runner HTTP
+// call failing with the given status (the error strings embed "STATUS
+// TEXT").
+func isHTTPStatus(err error, status int) bool {
+	return err != nil && strings.HasPrefix(err.Error(), fmt.Sprintf("%d ", status))
 }
 func (r *Runner) auth(req *http.Request) {
 	if r.Cfg.Token != "" {

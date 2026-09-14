@@ -28,10 +28,15 @@ const (
 // intents against that done set. Dispatch is expected to be idempotent by
 // item ID (forge check runs use stable external_ids), so an at-least-once
 // replay cannot duplicate published state.
+//
+// In DB mode the outbox delegates persistence to storage.OutboxStore:
+// OutboxAppend on enqueue, OutboxPending on startup, OutboxAck after a
+// successful dispatch. The filesystem JSONL stays the fs-mode store.
 type Outbox struct {
 	mu    sync.Mutex
 	items []forge.OutboxItem
 	store *storage.Repository
+	db    storage.OutboxStore
 	done  map[string]bool
 }
 
@@ -46,6 +51,38 @@ func NewOutbox(store *storage.Repository) *Outbox {
 		log.Printf("outbox: replay failed, starting empty: %v", err)
 	}
 	return o
+}
+
+// AttachDB wires a durable SQL outbox store. DB and fs persistence are
+// mutually exclusive: once attached, intents flow through the store.
+func (o *Outbox) AttachDB(db storage.Store) {
+	if ds, ok := db.(storage.OutboxStore); ok {
+		o.db = ds
+	}
+}
+
+// ReplayDB loads unacked intents from the SQL store into memory (FIFO).
+func (o *Outbox) ReplayDB(ctx context.Context) error {
+	if o.db == nil {
+		return nil
+	}
+	items, err := o.db.OutboxPending(ctx)
+	if err != nil {
+		return err
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	seen := map[string]bool{}
+	for _, it := range o.items {
+		seen[it.ID] = true
+	}
+	for _, it := range items {
+		if seen[it.ID] {
+			continue
+		}
+		o.items = append(o.items, forge.OutboxItem{ID: it.ID, Kind: it.Kind, Payload: it.Payload, CreatedAt: it.CreatedAt})
+	}
+	return nil
 }
 
 func (o *Outbox) loadLocked() error {
@@ -106,8 +143,9 @@ func (o *Outbox) readItems() ([]forge.OutboxItem, error) {
 }
 
 // Enqueue appends one intent to the queue and, when persistent, to the
-// outbox.jsonl file. It returns an error only when persistence fails; the
-// item is still queued in memory in that case.
+// durable store (SQL in DB mode, outbox.jsonl in fs mode). It returns an
+// error only when persistence fails; the item is still queued in memory in
+// that case.
 func (o *Outbox) Enqueue(item forge.OutboxItem) error {
 	if item.ID == "" {
 		id, err := newID()
@@ -122,6 +160,11 @@ func (o *Outbox) Enqueue(item forge.OutboxItem) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.items = append(o.items, item)
+	if o.db != nil {
+		return o.db.OutboxAppend(context.Background(), storage.OutboxItem{
+			ID: item.ID, Kind: item.Kind, Payload: item.Payload, CreatedAt: item.CreatedAt,
+		})
+	}
 	if o.store == nil {
 		return nil
 	}
@@ -155,8 +198,9 @@ func (o *Outbox) Pending() []forge.OutboxItem {
 
 // Flush dispatches queued intents in FIFO order. A failed dispatch stops
 // the batch and leaves the item (and everything after it) queued for the
-// next flush; a successful dispatch removes the item and records its ID in
-// the done file so replay skips it. Returns the number of intents dispatched.
+// next flush; a successful dispatch removes the item and records its ID
+// (SQL ack in DB mode, done-file line in fs mode) so replay skips it.
+// Returns the number of intents dispatched.
 func (o *Outbox) Flush(ctx context.Context, dispatch func(context.Context, forge.OutboxItem) error) (int, error) {
 	if dispatch == nil {
 		return 0, nil
@@ -172,6 +216,12 @@ func (o *Outbox) Flush(ctx context.Context, dispatch func(context.Context, forge
 		o.items = o.items[1:]
 		o.done[it.ID] = true
 		dispatched++
+		if o.db != nil {
+			if err := o.db.OutboxAck(ctx, it.ID); err != nil {
+				return dispatched, err
+			}
+			continue
+		}
 		if err := o.appendJSONLLocked(outboxDoneFile, struct {
 			ID string `json:"id"`
 		}{ID: it.ID}); err != nil {

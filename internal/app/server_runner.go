@@ -88,7 +88,7 @@ func Server(ctx context.Context, args []string) error {
 	mode := fs.String("mode", "", "server mode: dev (in-memory, default) or production")
 	allowSharedToken := fs.Bool("allow-shared-token", false, "production: allow --admin-token to equal --runner-token")
 	configPath := fs.String("config", "", "TOML configuration file (kiwi.toml); CLI flags override it")
-	otelEndpoint := fs.String("otel-endpoint", "", "OpenTelemetry collector endpoint (accepted for compatibility; tracing is a no-op for now)")
+	otelEndpoint := fs.String("otel-endpoint", "", "OpenTelemetry OTLP/HTTP collector endpoint (enables tracing)")
 	rateLimitPerSecond := fs.Float64("rate-limit-per-second", 0, "global request rate limit per principal/runner/IP (0 disables)")
 	rateLimitBurst := fs.Int("rate-limit-burst", 0, "rate limit burst size (default 100)")
 	if err := fs.Parse(args); err != nil {
@@ -116,13 +116,10 @@ func Server(ctx context.Context, args []string) error {
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
-	if *otelEndpoint != "" || cfg.Observability.OTelEndpoint != "" {
-		fmt.Fprintln(os.Stderr, "kiwi: --otel-endpoint/observability.otel_endpoint is accepted but OpenTelemetry tracing is not implemented yet (no-op)")
-	}
 	// The flag pointers exist only to register the flags; their values are
 	// read back through config.OverrideFromFlags (which inspects only
 	// explicitly set flags).
-	discard(listen, token, adminToken, webhookSecret, githubToken, externalURL, tlsCert, tlsKey, runnerCACert, runnerCAKey, runnerEnrollToken, databaseURL, mode, rateLimitPerSecond, rateLimitBurst)
+	discard(listen, token, adminToken, webhookSecret, githubToken, externalURL, tlsCert, tlsKey, runnerCACert, runnerCAKey, runnerEnrollToken, databaseURL, mode, rateLimitPerSecond, rateLimitBurst, otelEndpoint)
 
 	// Effective values after the precedence merge.
 	listenV := cfg.Server.Listen
@@ -209,6 +206,12 @@ func Server(ctx context.Context, args []string) error {
 	srv.PipelinePath = *pipelinePath
 	srv.ExternalURL = externalURLV
 	srv.RunnerEnrollToken = runnerEnrollTokenV
+	if ep := strings.TrimSpace(cfg.Observability.OTelEndpoint); ep != "" {
+		if err := srv.ConfigureTracing(ctx, ep); err != nil {
+			return fmt.Errorf("otel: %w", err)
+		}
+		defer srv.ShutdownTracing(context.Background())
+	}
 	if cfg.Policy.File != "" {
 		pol, perr := policy.Load(cfg.Policy.File)
 		if perr != nil {
@@ -284,18 +287,29 @@ func Runner(ctx context.Context, args []string) error {
 	runnerEnrollToken := fs.String("runner-enroll-token", os.Getenv("KIWI_RUNNER_ENROLL_TOKEN"), "enrollment token to obtain a runner certificate")
 	runnerMTLS := fs.Bool("runner-mtls", false, "require mTLS (explicit client certificate or enrollment)")
 	drain := fs.Bool("drain", false, "register as draining: finish active jobs, take no new work, then exit")
+	captureSnapshots := fs.Bool("capture-snapshots", true, "upload a workspace snapshot after each job (failures are warnings)")
+	var prewarmRefs stringList
+	fs.Var(&prewarmRefs, "prewarm", "digest-pinned image reference to prewarm (repeatable, require @sha256:)")
+	metricsListen := fs.String("metrics-listen", "", "serve Prometheus text metrics on this address (e.g. :9091)")
+	sigstoreKey := fs.String("sigstore-key", "", "PKCS8 PEM Ed25519 private key for Sigstore artifact attestations (path or contents)")
+	workDir := fs.String("work-dir", "", "working directory for garbage-collection subprocesses (default: system temp)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	cfg := runner.Config{
-		Server:      strings.TrimRight(*url, "/"),
-		Token:       *token,
-		Name:        *name,
-		CACert:      *runnerCACert,
-		Cert:        *runnerCert,
-		Key:         *runnerKey,
-		EnrollToken: *runnerEnrollToken,
-		Drain:       *drain,
+		Server:           strings.TrimRight(*url, "/"),
+		Token:            *token,
+		Name:             *name,
+		CACert:           *runnerCACert,
+		Cert:             *runnerCert,
+		Key:              *runnerKey,
+		EnrollToken:      *runnerEnrollToken,
+		Drain:            *drain,
+		CaptureSnapshots: *captureSnapshots,
+		Prewarm:          prewarmRefs.values(),
+		MetricsListen:    *metricsListen,
+		SigstoreKeyPath:  *sigstoreKey,
+		WorkDir:          *workDir,
 	}
 	if *labels != "" {
 		cfg.Labels = strings.Split(*labels, ",")
@@ -310,6 +324,24 @@ func Runner(ctx context.Context, args []string) error {
 	}
 	return (&runner.Runner{Cfg: cfg}).Run(ctx)
 }
+
+// stringList collects repeatable comma-separated string flags.
+type stringList struct {
+	items []string
+}
+
+func (s *stringList) String() string { return strings.Join(s.items, ",") }
+
+func (s *stringList) Set(v string) error {
+	for _, part := range strings.Split(v, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			s.items = append(s.items, part)
+		}
+	}
+	return nil
+}
+
+func (s *stringList) values() []string { return append([]string{}, s.items...) }
 
 // RunnerAdmin implements the admin-side runner control commands:
 //

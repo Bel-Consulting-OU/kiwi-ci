@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -11,6 +12,9 @@ import (
 
 // dbFakeStore is a compact behavioral storage.Store for DB-mode server
 // tests: a statuses map plus receipts, with recorded scheduler-facing calls.
+// It also implements the storage extension interfaces (OutboxStore,
+// ScheduleStore, DeploymentStore, SnapshotStore, ArtifactContractStore,
+// QueueReasonStore) so DB-mode server tests exercise the durable paths.
 type dbFakeStore struct {
 	mu        sync.Mutex
 	runs      map[string]model.Run
@@ -21,6 +25,16 @@ type dbFakeStore struct {
 	logs      []model.LogEntry
 	artifacts []model.ArtifactRecord
 	reports   []model.TestReport
+
+	outboxItems      []storage.OutboxItem
+	outboxAcked      []string
+	schedules        map[string]storage.Schedule
+	occurrences      map[string][]storage.Occurrence
+	deployments      map[string]model.Deployment
+	snapshots        []model.SnapshotRecord
+	contracts        map[string]map[string]storage.ArtifactContract
+	queueReasons     map[string]string
+	queueReasonsErrs int
 
 	leaderOK  bool
 	leaderErr error
@@ -65,14 +79,25 @@ type cancelRunArgs struct {
 }
 
 var _ storage.Store = (*dbFakeStore)(nil)
+var _ storage.OutboxStore = (*dbFakeStore)(nil)
+var _ storage.ScheduleStore = (*dbFakeStore)(nil)
+var _ storage.DeploymentStore = (*dbFakeStore)(nil)
+var _ storage.SnapshotStore = (*dbFakeStore)(nil)
+var _ storage.ArtifactContractStore = (*dbFakeStore)(nil)
+var _ storage.QueueReasonStore = (*dbFakeStore)(nil)
 
 func newDBFakeStore() *dbFakeStore {
 	return &dbFakeStore{
-		runs:     map[string]model.Run{},
-		jobs:     map[string]model.Job{},
-		runners:  map[string]model.Runner{},
-		receipts: map[string]model.CompletionReceipt{},
-		leaderOK: true,
+		runs:         map[string]model.Run{},
+		jobs:         map[string]model.Job{},
+		runners:      map[string]model.Runner{},
+		receipts:     map[string]model.CompletionReceipt{},
+		schedules:    map[string]storage.Schedule{},
+		occurrences:  map[string][]storage.Occurrence{},
+		deployments:  map[string]model.Deployment{},
+		contracts:    map[string]map[string]storage.ArtifactContract{},
+		queueReasons: map[string]string{},
+		leaderOK:     true,
 	}
 }
 
@@ -455,4 +480,163 @@ func itoa(v int64) string {
 		b[i] = '-'
 	}
 	return string(b[i:])
+}
+
+// ---------------------------------------------------------------------------
+// storage extension interfaces
+// ---------------------------------------------------------------------------
+
+func (f *dbFakeStore) OutboxAppend(ctx context.Context, e storage.OutboxItem) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.outboxItems = append(f.outboxItems, e)
+	return nil
+}
+
+func (f *dbFakeStore) OutboxAck(ctx context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.outboxAcked = append(f.outboxAcked, id)
+	kept := f.outboxItems[:0]
+	for _, it := range f.outboxItems {
+		if it.ID != id {
+			kept = append(kept, it)
+		}
+	}
+	f.outboxItems = kept
+	return nil
+}
+
+func (f *dbFakeStore) OutboxPending(ctx context.Context) ([]storage.OutboxItem, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]storage.OutboxItem(nil), f.outboxItems...), nil
+}
+
+func (f *dbFakeStore) UpsertSchedule(ctx context.Context, sc storage.Schedule) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.schedules[sc.ID] = sc
+	return nil
+}
+
+func (f *dbFakeStore) ListSchedules(ctx context.Context) ([]storage.Schedule, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]storage.Schedule, 0, len(f.schedules))
+	for _, sc := range f.schedules {
+		out = append(out, sc)
+	}
+	return out, nil
+}
+
+func (f *dbFakeStore) ClaimScheduleOccurrence(ctx context.Context, scheduleID string, nominal time.Time, runID string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, o := range f.occurrences[scheduleID] {
+		if o.Nominal.Equal(nominal) {
+			return o.RunID == runID, nil
+		}
+	}
+	f.occurrences[scheduleID] = append(f.occurrences[scheduleID], storage.Occurrence{ScheduleID: scheduleID, Nominal: nominal, RunID: runID})
+	return true, nil
+}
+
+func (f *dbFakeStore) ListOccurrences(ctx context.Context, scheduleID string) ([]storage.Occurrence, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]storage.Occurrence(nil), f.occurrences[scheduleID]...), nil
+}
+
+func (f *dbFakeStore) InsertDeployment(ctx context.Context, d model.Deployment) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deployments[d.ID] = d
+	return nil
+}
+
+func (f *dbFakeStore) ListDeploymentsByRun(ctx context.Context, runID string) ([]model.Deployment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []model.Deployment{}
+	for _, d := range f.deployments {
+		if d.RunID == runID {
+			out = append(out, d)
+		}
+	}
+	return out, nil
+}
+
+func (f *dbFakeStore) UpdateDeploymentStatus(ctx context.Context, id string, status model.Status, finishedAt *time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	d, ok := f.deployments[id]
+	if !ok {
+		return storage.ErrNotFound
+	}
+	d.Status = status
+	if finishedAt != nil {
+		d.FinishedAt = finishedAt
+	}
+	f.deployments[id] = d
+	return nil
+}
+
+func (f *dbFakeStore) InsertSnapshotRecord(ctx context.Context, rec model.SnapshotRecord) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.snapshots = append(f.snapshots, rec)
+	return nil
+}
+
+func (f *dbFakeStore) ListSnapshotsByRun(ctx context.Context, runID string) ([]model.SnapshotRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []model.SnapshotRecord{}
+	for _, rec := range f.snapshots {
+		if rec.RunID == runID {
+			out = append(out, rec)
+		}
+	}
+	return out, nil
+}
+
+func (f *dbFakeStore) InsertJobContracts(ctx context.Context, jobID string, contracts map[string]storage.ArtifactContract) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.contracts[jobID] = contracts
+	return nil
+}
+
+func (f *dbFakeStore) GetJobContracts(ctx context.Context, jobID string) (map[string]storage.ArtifactContract, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	m, ok := f.contracts[jobID]
+	if !ok {
+		return nil, false, nil
+	}
+	return m, true, nil
+}
+
+func (f *dbFakeStore) SetQueueReasons(ctx context.Context, reasons map[string]string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.queueReasonsErrs > 0 {
+		f.queueReasonsErrs--
+		return fmt.Errorf("queue reasons: injected failure")
+	}
+	for id, reason := range reasons {
+		f.queueReasons[id] = reason
+		if j, ok := f.jobs[id]; ok {
+			j.QueueReason = reason
+			f.jobs[id] = j
+		}
+	}
+	return nil
+}
+
+func (f *dbFakeStore) queueReason(id string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.queueReasons[id]
 }

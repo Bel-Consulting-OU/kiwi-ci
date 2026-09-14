@@ -14,6 +14,7 @@ import (
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/forge"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // publishGitHubStatus mirrors run state to the forge via the durable
@@ -22,6 +23,8 @@ import (
 // safe to call while holding the server lock. Dispatch happens in
 // Maintain's flushOutbox tick and is best-effort by design.
 func (s *Server) publishGitHubStatus(run model.Run) {
+	_, span := s.startSpan(context.Background(), "forge.status.publish")
+	defer span.End()
 	if run.RepoFullName == "" || run.SHA == "" {
 		return
 	}
@@ -33,6 +36,7 @@ func (s *Server) publishGitHubStatus(run model.Run) {
 	status, conclusion := checkStateForRun(run.Status)
 	summary := "pipeline " + string(run.Status)
 	items := []forge.OutboxItem{s.checkIntent(run, "Pipeline", status, conclusion, summary, nil)}
+	span.SetAttributes(attribute.String("kiwi.run_status", string(run.Status)))
 
 	s.mu.Lock()
 	var jobIntents []forge.OutboxItem

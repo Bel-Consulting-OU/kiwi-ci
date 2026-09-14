@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Metrics is a dependency-free Prometheus-style registry: cumulative
@@ -82,6 +83,7 @@ func NewMetrics() *Metrics {
 	m.declare("kiwi_environment_wait_seconds", "Time jobs waited for an environment lock", "histogram", defaultHistogramBounds)
 	m.declare("kiwi_approval_wait_seconds", "Time jobs waited for approval", "histogram", defaultHistogramBounds)
 	m.declare("kiwi_test_duration_seconds", "Test report test duration", "histogram", defaultHistogramBounds)
+	m.declare("kiwi_http_duration_seconds", "HTTP request handling latency", "histogram", defaultHistogramBounds)
 	m.declare("kiwi_cas_latency_seconds", "Content-addressed storage latency", "histogram", defaultHistogramBounds)
 	m.declare("kiwi_scheduler_loop_duration_seconds", "Scheduler housekeeping loop duration", "histogram", defaultHistogramBounds)
 	m.declare("kiwi_runner_saturation", "Fraction of runner capacity in use (busy slots / total slots)", "gauge", nil)
@@ -150,6 +152,25 @@ func (m *Metrics) SetGauge(name string, v float64, labels map[string]string) {
 		return
 	}
 	vec[k] = v
+}
+
+// Reset zeroes every counter, gauge vector and histogram while keeping the
+// pre-declared HELP/TYPE surface. Tests use it to assert call-site
+// behavior without cross-test pollution.
+func (m *Metrics) Reset() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for name := range m.counters {
+		m.counters[name] = map[string]float64{"": 0}
+	}
+	for name := range m.gauges {
+		m.gauges[name] = map[string]float64{}
+	}
+	for name, meta := range m.meta {
+		if meta.typ == "histogram" {
+			m.histograms[name] = map[string]*histogram{"": {bounds: meta.bounds, counts: make([]uint64, len(meta.bounds))}}
+		}
+	}
 }
 
 // WritePrometheus renders the registry in Prometheus text format 0.0.4.
@@ -333,11 +354,12 @@ func (s *Server) metricSet(name string, v float64, labels map[string]string) {
 	}
 }
 
-// observeHTTP records kiwi_http_requests_total for every request that
-// passes through, including 401/429 responses produced by the middleware
-// chain inside it.
+// observeHTTP records kiwi_http_requests_total and the request latency
+// histogram for every request that passes through, including 401/429
+// responses produced by the middleware chain inside it.
 func (s *Server) observeHTTP(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w}
 		next.ServeHTTP(rec, r)
 		code := rec.status
@@ -346,6 +368,10 @@ func (s *Server) observeHTTP(next http.Handler) http.Handler {
 		}
 		s.metricAdd("kiwi_http_requests_total", 1, map[string]string{
 			"code":       strconv.Itoa(code),
+			"method":     normMethod(r.Method),
+			"path_class": metricsPathClass(r.URL.Path),
+		})
+		s.metricObserve("kiwi_http_duration_seconds", time.Since(start).Seconds(), map[string]string{
 			"method":     normMethod(r.Method),
 			"path_class": metricsPathClass(r.URL.Path),
 		})

@@ -157,6 +157,9 @@ func (s *Server) bindRunnerIdentity(r *http.Request, id string) error {
 // matches the runner ID a request acts for. Lease tokens remain the
 // capability; this pins the transport identity to the claimed runner. With
 // mTLS disabled the bearer token is authoritative and this accepts.
+// Revoked certificates (CRL, see crl.go) are rejected after the identity
+// check: revocation is a control-plane decision that must not be bypassed
+// by reusing a still-valid certificate.
 func (s *Server) verifyRunnerIdentity(r *http.Request, payloadRunnerID string) bool {
 	if s.RunnerCA == nil {
 		return true
@@ -165,5 +168,14 @@ func (s *Server) verifyRunnerIdentity(r *http.Request, payloadRunnerID string) b
 	if err != nil {
 		return false
 	}
-	return peerID == payloadRunnerID
+	if peerID != payloadRunnerID {
+		return false
+	}
+	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 && r.TLS.PeerCertificates[0] != nil {
+		serial := r.TLS.PeerCertificates[0].SerialNumber.Text(16)
+		if s.certSerialRevoked(serial) {
+			return false
+		}
+	}
+	return true
 }
