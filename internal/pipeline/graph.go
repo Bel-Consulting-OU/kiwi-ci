@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/expr"
 )
 
 type CompiledJob struct {
@@ -165,12 +167,66 @@ func interpolateSteps(in []Step, m map[string]string) []Step {
 	return out
 }
 
+// Interpolate resolves matrix holes at compile time. Holes are parsed and
+// evaluated with the expression engine against a matrix-only Context. Only
+// holes that reference the matrix context (and whose referenced keys exist)
+// are substituted; everything else is left untouched, preserving the exact
+// legacy behavior for non-matrix holes (needs/steps/env/... are resolved
+// later, at execution time). Both "${{ matrix.X }}" and the tight
+// "${{matrix.X}}" form are accepted, and substitution is a single
+// deterministic pass.
 func Interpolate(s string, m map[string]string) string {
-	for k, v := range m {
-		s = strings.ReplaceAll(s, "${{ matrix."+k+" }}", v)
-		s = strings.ReplaceAll(s, "${{matrix."+k+"}}", v)
+	if !strings.Contains(s, "${{") {
+		return s
 	}
-	return s
+	holes, err := expr.Holes(s)
+	if err != nil || len(holes) == 0 {
+		return s
+	}
+	c := expr.Context{Matrix: m}
+	return interpolateLenient(s, holes, c, map[string]bool{"matrix": true})
+}
+
+// interpolateLenient substitutes the holes that reference only the allowed
+// contexts and evaluate cleanly against the given context; every other hole
+// stays as literal text. At least one context reference is required so pure
+// literal holes are never expanded here.
+func interpolateLenient(s string, holes []expr.Hole, c expr.Context, allowed map[string]bool) string {
+	var b strings.Builder
+	last := 0
+	replaced := false
+	for _, h := range holes {
+		e, err := expr.Parse(h.Body)
+		if err != nil {
+			continue
+		}
+		refs := e.Contexts()
+		if len(refs) == 0 || !contextsAllowed(refs, allowed) {
+			continue
+		}
+		v, err := e.Eval(c)
+		if err != nil {
+			continue
+		}
+		b.WriteString(s[last:h.Start])
+		b.WriteString(v)
+		last = h.End
+		replaced = true
+	}
+	if !replaced {
+		return s
+	}
+	b.WriteString(s[last:])
+	return b.String()
+}
+
+func contextsAllowed(refs []string, allowed map[string]bool) bool {
+	for _, r := range refs {
+		if !allowed[r] {
+			return false
+		}
+	}
+	return true
 }
 
 func matrixEnv(m map[string]string) map[string]string {
@@ -195,20 +251,35 @@ func mergeStringMaps(a, b map[string]string) map[string]string {
 // InterpolateOutputs resolves runtime output contexts after upstream jobs or
 // earlier steps have completed. Unlike matrix interpolation this happens at
 // execution time because values do not exist when the DAG is compiled.
+// Holes are evaluated with the expression engine against flattened
+// needs/steps output maps ("job.outputs.name" keys); holes that do not
+// resolve (missing outputs, other contexts such as env) stay literal, which
+// matches the previous ReplaceAll-based behavior.
 func InterpolateOutputs(v string, needs, steps map[string]map[string]string) string {
-	for job, outputs := range needs {
+	if !strings.Contains(v, "${{") {
+		return v
+	}
+	holes, err := expr.Holes(v)
+	if err != nil || len(holes) == 0 {
+		return v
+	}
+	c := expr.Context{
+		Needs: flattenOutputs(needs),
+		Steps: flattenOutputs(steps),
+	}
+	return interpolateLenient(v, holes, c, map[string]bool{"needs": true, "steps": true})
+}
+
+// flattenOutputs rewrites a nested outputs map ("job" -> "name" -> value)
+// into the engine's flat key form ("job.outputs.name").
+func flattenOutputs(in map[string]map[string]string) map[string]string {
+	out := map[string]string{}
+	for owner, outputs := range in {
 		for name, value := range outputs {
-			v = strings.ReplaceAll(v, "${{ needs."+job+".outputs."+name+" }}", value)
-			v = strings.ReplaceAll(v, "${{needs."+job+".outputs."+name+"}}", value)
+			out[owner+".outputs."+name] = value
 		}
 	}
-	for step, outputs := range steps {
-		for name, value := range outputs {
-			v = strings.ReplaceAll(v, "${{ steps."+step+".outputs."+name+" }}", value)
-			v = strings.ReplaceAll(v, "${{steps."+step+".outputs."+name+"}}", value)
-		}
-	}
-	return v
+	return out
 }
 
 func InterpolateOutputMap(in map[string]string, needs, steps map[string]map[string]string) map[string]string {

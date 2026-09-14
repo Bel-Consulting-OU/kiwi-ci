@@ -1,0 +1,8 @@
+{
+  "yaml.schemas": {
+    ".kiwi/schema.json": [".kiwi/pipeline.yaml", "*.kiwi.yaml", ".kiwi/*.yaml"]
+  },
+  "json.schemas": [
+    {"fileMatch": [".kiwi/schema.json"], "url": "https://json-schema.org/draft/2020-12/schema"}
+  ]
+}

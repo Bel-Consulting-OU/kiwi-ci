@@ -1,0 +1,339 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kiwi.ci/schemas/pipeline.json",
+  "title": "Kiwi CI pipeline",
+  "description": "JSON Schema for the Kiwi CI pipeline language (version 1).",
+  "type": "object",
+  "required": ["jobs"],
+  "properties": {
+    "version": {"type": "integer", "const": 1, "default": 1},
+    "name": {"type": "string"},
+    "on": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/trigger"}
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/input"}
+    },
+    "env": {"$ref": "#/$defs/stringMap"},
+    "secrets": {"type": "array", "items": {"type": "string"}},
+    "defaults": {"$ref": "#/$defs/defaults"},
+    "permissions": {"$ref": "#/$defs/permissions"},
+    "concurrency": {"$ref": "#/$defs/concurrency"},
+    "packages": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/package"}
+    },
+    "components": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/component"}
+    },
+    "jobs": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"$ref": "#/$defs/job"}
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "duration": {
+      "type": "string",
+      "pattern": "^\\+?([0-9]+(\\.[0-9]+)?|\\.[0-9]+)(ns|us|µs|μs|ms|s|m|h)([0-9]+(\\.[0-9]+)?(ns|us|µs|μs|ms|s|m|h))*$"
+    },
+    "byteSize": {
+      "type": ["integer", "string"],
+      "minimum": 0,
+      "pattern": "^[0-9]+(\\.[0-9]+)?\\s*([KkMmGgTtPp]?[Ii]?[Bb]?)?$"
+    },
+    "stringArray": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "stringMap": {
+      "type": "object",
+      "additionalProperties": {"type": ["string", "integer", "number", "boolean", "null"]}
+    },
+    "shell": {
+      "type": "string",
+      "enum": ["bash", "sh", "zsh", "pwsh", "powershell", "fish", "dash", "ksh", "python"]
+    },
+    "trigger": {
+      "type": "object",
+      "properties": {
+        "branches": {"$ref": "#/$defs/stringArray"},
+        "branches_ignore": {"$ref": "#/$defs/stringArray"},
+        "tags": {"$ref": "#/$defs/stringArray"},
+        "tags_ignore": {"$ref": "#/$defs/stringArray"},
+        "paths": {"$ref": "#/$defs/stringArray"},
+        "paths_ignore": {"$ref": "#/$defs/stringArray"},
+        "actions": {"$ref": "#/$defs/stringArray"},
+        "draft": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "input": {
+      "type": "object",
+      "properties": {
+        "type": {"enum": ["string", "boolean", "integer"]},
+        "required": {"type": "boolean"},
+        "default": true,
+        "options": {"$ref": "#/$defs/stringArray"},
+        "description": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "defaults": {
+      "type": "object",
+      "properties": {
+        "shell": {"$ref": "#/$defs/shell"},
+        "timeout": {"$ref": "#/$defs/duration"},
+        "retry": {"$ref": "#/$defs/retry"}
+      },
+      "additionalProperties": false
+    },
+    "retry": {
+      "type": "object",
+      "properties": {
+        "max": {"type": "integer", "minimum": 0},
+        "backoff": {"$ref": "#/$defs/duration"},
+        "on": {
+          "type": "array",
+          "items": {"enum": ["failure", "infra", "timeout", "cancelled", "command", "any"]}
+        }
+      },
+      "additionalProperties": false
+    },
+    "permissions": {
+      "type": "object",
+      "properties": {
+        "id_token": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "concurrency": {
+      "type": "object",
+      "properties": {
+        "group": {"type": "string"},
+        "cancel_in_progress": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "package": {
+      "type": "object",
+      "properties": {
+        "paths": {"$ref": "#/$defs/stringArray"},
+        "depends_on": {"$ref": "#/$defs/stringArray"}
+      },
+      "additionalProperties": false
+    },
+    "component": {
+      "type": "object",
+      "properties": {
+        "ref": {"type": "string"},
+        "with": {"$ref": "#/$defs/stringMap"}
+      },
+      "additionalProperties": false
+    },
+    "environment": {
+      "type": "object",
+      "properties": {
+        "name": {"type": "string"},
+        "url": {"type": "string"},
+        "approval": {"type": "boolean"},
+        "branches": {"$ref": "#/$defs/stringArray"},
+        "concurrency": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "sandbox": {
+      "type": "object",
+      "properties": {
+        "rootless": {"type": "boolean"},
+        "read_only_rootfs": {"type": "boolean"},
+        "network": {"enum": ["default", "none", "services-only", "internet"]}
+      },
+      "additionalProperties": false
+    },
+    "placement": {
+      "type": "object",
+      "properties": {
+        "regions": {"$ref": "#/$defs/stringArray"},
+        "labels": {"$ref": "#/$defs/stringArray"}
+      },
+      "additionalProperties": false
+    },
+    "resources": {
+      "type": "object",
+      "properties": {
+        "cpu": {"type": "number", "minimum": 0},
+        "memory": {"$ref": "#/$defs/byteSize"},
+        "disk": {"$ref": "#/$defs/byteSize"},
+        "pids": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "tests": {
+      "type": "object",
+      "properties": {
+        "reports": {"$ref": "#/$defs/stringArray"},
+        "manifest": {"type": "string"},
+        "shards": {"type": "integer", "minimum": 0},
+        "retry_failed": {"type": "integer", "minimum": 0},
+        "quarantine_flaky": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "generate": {
+      "type": "object",
+      "properties": {
+        "path": {"type": "string"},
+        "max_jobs": {"type": "integer", "minimum": 0},
+        "max_depth": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "downstream": {
+      "type": "object",
+      "properties": {
+        "repository": {"type": "string"},
+        "ref": {"type": "string"},
+        "event": {"type": "string"},
+        "inputs": {"$ref": "#/$defs/stringMap"},
+        "wait": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "snapshot": {
+      "type": "object",
+      "properties": {
+        "on": {"$ref": "#/$defs/stringArray"}
+      },
+      "additionalProperties": false
+    },
+    "step": {
+      "type": "object",
+      "required": ["run"],
+      "properties": {
+        "id": {"type": "string"},
+        "name": {"type": "string"},
+        "run": {"type": "string", "minLength": 1},
+        "if": {"type": "string"},
+        "shell": {"$ref": "#/$defs/shell"},
+        "working_directory": {"type": "string"},
+        "env": {"$ref": "#/$defs/stringMap"},
+        "secrets": {"$ref": "#/$defs/stringArray"},
+        "timeout": {"$ref": "#/$defs/duration"},
+        "retry": {"$ref": "#/$defs/retry"},
+        "continue_on_error": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "deployment": {
+      "type": "object",
+      "properties": {
+        "canary": {"type": "array", "items": {"$ref": "#/$defs/step"}},
+        "verify": {"type": "array", "items": {"$ref": "#/$defs/step"}},
+        "rollback": {"type": "array", "items": {"$ref": "#/$defs/step"}}
+      },
+      "additionalProperties": false
+    },
+    "service": {
+      "type": "object",
+      "required": ["image"],
+      "properties": {
+        "name": {"type": "string"},
+        "image": {"type": "string"},
+        "env": {"$ref": "#/$defs/stringMap"},
+        "healthcheck": {"type": "string"},
+        "interval": {"$ref": "#/$defs/duration"},
+        "timeout": {"$ref": "#/$defs/duration"},
+        "retries": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "cache": {
+      "type": "object",
+      "required": ["paths"],
+      "properties": {
+        "name": {"type": "string"},
+        "paths": {"$ref": "#/$defs/stringArray"},
+        "key": {"type": "string"},
+        "hash_files": {"$ref": "#/$defs/stringArray"},
+        "restore_keys": {"$ref": "#/$defs/stringArray"}
+      },
+      "additionalProperties": false
+    },
+    "artifact": {
+      "type": "object",
+      "required": ["paths"],
+      "properties": {
+        "name": {"type": "string"},
+        "paths": {"$ref": "#/$defs/stringArray"},
+        "if": {"type": "string"},
+        "retention": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "download": {
+      "type": "object",
+      "properties": {
+        "from": {"type": "string"},
+        "name": {"type": "string"},
+        "path": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "matrix": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "minItems": 1,
+        "items": {"type": ["string", "number", "boolean"]}
+      }
+    },
+    "job": {
+      "type": "object",
+      "required": ["steps"],
+      "properties": {
+        "name": {"type": "string"},
+        "needs": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "if": {"type": "string"},
+        "runner": {"$ref": "#/$defs/stringArray"},
+        "runtime": {"enum": ["native", "container", "tart"]},
+        "image": {"type": "string"},
+        "network": {"enum": ["bridge", "host", "none"]},
+        "vm": {"type": "string"},
+        "shell": {"$ref": "#/$defs/shell"},
+        "timeout": {"$ref": "#/$defs/duration"},
+        "queue_timeout": {"$ref": "#/$defs/duration"},
+        "retry": {"$ref": "#/$defs/retry"},
+        "env": {"$ref": "#/$defs/stringMap"},
+        "matrix": {"$ref": "#/$defs/matrix"},
+        "paths": {"$ref": "#/$defs/stringArray"},
+        "paths_ignore": {"$ref": "#/$defs/stringArray"},
+        "services": {"type": "array", "items": {"$ref": "#/$defs/service"}},
+        "steps": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/step"}},
+        "cache": {"type": "array", "items": {"$ref": "#/$defs/cache"}},
+        "artifacts": {"type": "array", "items": {"$ref": "#/$defs/artifact"}},
+        "downloads": {"type": "array", "items": {"$ref": "#/$defs/download"}},
+        "test_reports": {"$ref": "#/$defs/stringArray"},
+        "environment": {"$ref": "#/$defs/environment"},
+        "infra_retries": {"type": "integer", "minimum": 0},
+        "permissions": {"$ref": "#/$defs/permissions"},
+        "outputs": {"$ref": "#/$defs/stringMap"},
+        "placement": {"$ref": "#/$defs/placement"},
+        "sandbox": {"$ref": "#/$defs/sandbox"},
+        "resources": {"$ref": "#/$defs/resources"},
+        "tests": {"$ref": "#/$defs/tests"},
+        "generate": {"$ref": "#/$defs/generate"},
+        "downstream": {"$ref": "#/$defs/downstream"},
+        "deployment": {"$ref": "#/$defs/deployment"},
+        "snapshot": {"$ref": "#/$defs/snapshot"},
+        "component": {"type": "string"},
+        "with": {"$ref": "#/$defs/stringMap"}
+      },
+      "additionalProperties": false
+    }
+  }
+}

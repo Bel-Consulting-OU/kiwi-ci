@@ -20,7 +20,15 @@ import (
 )
 
 type Options struct {
-	Workspace        string
+	Workspace string
+	// WorkspaceFor resolves the per-job workspace directory. When set,
+	// runJob calls it once per job (after condition/path gating), defers
+	// the returned cleanup until the job is finished, and uses the
+	// returned directory for caches, artifacts, steps, and the runtime
+	// workspace. A nil value keeps the single Workspace directory for
+	// every job (historical behavior; distributed runners pass fresh
+	// per-task clones instead).
+	WorkspaceFor     func(jobID string) (string, func(), error)
 	RunID            string
 	MaxParallel      int
 	OnlyJob          string
@@ -186,6 +194,17 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		ctx, cancel = context.WithTimeout(ctx, jobTimeout)
 		defer cancel()
 	}
+	workspace := e.Opt.Workspace
+	if e.Opt.WorkspaceFor != nil {
+		dir, cleanup, werr := e.Opt.WorkspaceFor(cj.ID)
+		if werr != nil {
+			res.Status = model.StatusFailure
+			res.Error = werr.Error()
+			return finish(res)
+		}
+		workspace = dir
+		defer cleanup()
+	}
 	baseEnv := cleanExecutionEnv()
 	if e.Opt.InheritEnv {
 		// Local trusted opt-in only; distributed runners must never set it.
@@ -214,12 +233,12 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		bases := append([]string{c.Key}, c.RestoreKeys...)
 		restored := false
 		for i, base := range bases {
-			key, er := e.Opt.Cache.Key(e.cacheBase(base)+"|"+runtime.GOOS+"|"+runtime.GOARCH+"|"+cj.Job.Runtime, e.Opt.Workspace, c.HashFiles)
+			key, er := e.Opt.Cache.Key(e.cacheBase(base)+"|"+runtime.GOOS+"|"+runtime.GOARCH+"|"+cj.Job.Runtime, workspace, c.HashFiles)
 			if er != nil {
 				e.log(cj.ID, "cache", "key warning: "+er.Error())
 				break
 			}
-			hit, er := e.Opt.Cache.Restore(key, e.Opt.Workspace, c.Paths)
+			hit, er := e.Opt.Cache.Restore(key, workspace, c.Paths)
 			if er != nil {
 				e.log(cj.ID, "cache", "restore warning: "+er.Error())
 				break
@@ -274,7 +293,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		b.RequireImmutableImages = e.Opt.RequireImmutableImages
 	}
 	if lifecycle, ok := backend.(JobLifecycle); ok {
-		if err := lifecycle.StartJob(ctx, e.Opt.Workspace, func(line string) { e.log(cj.ID, "runtime", line) }); err != nil {
+		if err := lifecycle.StartJob(ctx, workspace, func(line string) { e.log(cj.ID, "runtime", line) }); err != nil {
 			res.Status = model.StatusFailure
 			res.Error = err.Error()
 			return finish(res)
@@ -286,6 +305,11 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		}()
 	}
 	stepOutputs := map[string]map[string]string{}
+	// currentStatus drives step condition evaluation. A hard step failure
+	// does NOT abort the job: later steps whose conditions explicitly allow
+	// the new status (always(), failure(), cancelled(), ...) still run.
+	currentStatus := model.StatusSuccess
+	var cleanupCtx context.Context
 	for i, st := range cj.Job.Steps {
 		st.Name = pipeline.InterpolateOutputs(st.Name, needsOutputs, stepOutputs)
 		st.Run = pipeline.InterpolateOutputs(st.Run, needsOutputs, stepOutputs)
@@ -296,15 +320,28 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		if name == "" {
 			name = fmt.Sprintf("step-%d", i+1)
 		}
-		ok, er := pipeline.Eval(st.If, pipeline.EvalContext{Status: res.Status, Env: cj.Job.Env, Event: e.Opt.Event, Branch: e.Opt.Branch})
+		ok, er := pipeline.Eval(defaultCondition(st.If), pipeline.EvalContext{Status: currentStatus, Env: cj.Job.Env, Event: e.Opt.Event, Branch: e.Opt.Branch})
 		if er != nil {
-			res.Status = model.StatusFailure
-			res.Error = er.Error()
-			return finish(res)
+			e.log(cj.ID, name, "condition error: "+er.Error())
+			if currentStatus == model.StatusSuccess {
+				currentStatus = model.StatusFailure
+			}
+			if res.Error == "" {
+				res.Error = er.Error()
+			}
+			continue
 		}
 		if !ok {
 			e.log(cj.ID, name, "skipped")
 			continue
+		}
+		// Cancelled jobs may only run steps whose condition explicitly
+		// admits the cancelled state, and those steps run under a bounded
+		// cleanup context; every other step runs under the job's
+		// execution context.
+		stepCtx := ctx
+		if currentStatus == model.StatusCancelled {
+			stepCtx = cleanupCtx
 		}
 		shell := st.Shell
 		if shell == "" {
@@ -316,13 +353,16 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		if shell == "" {
 			shell = defaultShell(cj.Job.Runtime)
 		}
-		dir, dirErr := secureWorkingDir(e.Opt.Workspace, st.WorkingDirectory)
+		dir, dirErr := secureWorkingDir(workspace, st.WorkingDirectory)
 		if dirErr != nil {
-			res.Status = model.StatusFailure
-			res.Error = dirErr.Error()
-			res.Outputs = pipeline.InterpolateOutputMap(cj.Job.Outputs, needsOutputs, stepOutputs)
-			e.saveArtifacts(s, cj, res.Status)
-			return finish(res)
+			e.log(cj.ID, name, "working directory: "+dirErr.Error())
+			if currentStatus == model.StatusSuccess {
+				currentStatus = model.StatusFailure
+			}
+			if res.Error == "" {
+				res.Error = dirErr.Error()
+			}
+			continue
 		}
 		// Job/default timeout is a total job deadline. A step timeout, when set,
 		// is an additional tighter deadline for this individual command.
@@ -346,13 +386,16 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		// Step secret values live only in this step's env map; a fresh cache
 		// per step means no step secret is retained in any map that outlives
 		// the step.
-		stepSecrets, secErr := e.resolveSecrets(ctx, st.Secrets, map[string]string{})
+		stepSecrets, secErr := e.resolveSecrets(stepCtx, st.Secrets, map[string]string{})
 		if secErr != nil {
-			res.Status = model.StatusFailure
-			res.Error = secErr.Error()
-			res.Outputs = pipeline.InterpolateOutputMap(cj.Job.Outputs, needsOutputs, stepOutputs)
-			e.saveArtifacts(s, cj, res.Status)
-			return finish(res)
+			e.log(cj.ID, name, "secrets: "+secErr.Error())
+			if currentStatus == model.StatusSuccess {
+				currentStatus = model.StatusFailure
+			}
+			if res.Error == "" {
+				res.Error = secErr.Error()
+			}
+			continue
 		}
 		for k, v := range stepSecrets {
 			stepEnvMap[k] = v
@@ -373,7 +416,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			}
 			res.Attempts++
 			e.log(cj.ID, name, fmt.Sprintf("running on %s (attempt %d/%d)", backend.Name(), attempt, attempts))
-			runErr = backend.Run(ctx, Command{Shell: shell, Script: st.Run, Dir: dir, Env: stepEnv, TimeoutSeconds: int64(timeout.Seconds())}, func(line string) { e.log(cj.ID, name, line) })
+			runErr = backend.Run(stepCtx, Command{Shell: shell, Script: st.Run, Dir: dir, Env: stepEnv, TimeoutSeconds: int64(timeout.Seconds())}, func(line string) { e.log(cj.ID, name, line) })
 			if runErr == nil {
 				break
 			}
@@ -383,8 +426,8 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			if attempt < attempts {
 				e.log(cj.ID, name, fmt.Sprintf("retrying after error: %v", runErr))
 				select {
-				case <-ctx.Done():
-					runErr = ctx.Err()
+				case <-stepCtx.Done():
+					runErr = stepCtx.Err()
 					attempt = attempts
 				case <-time.After(backoff):
 				}
@@ -392,7 +435,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			}
 		}
 		if st.ID != "" {
-			data, outErr := backend.ReadFile(ctx, outputFile, 1<<20)
+			data, outErr := backend.ReadFile(stepCtx, outputFile, 1<<20)
 			switch {
 			case errors.Is(outErr, os.ErrNotExist):
 				// Step wrote no outputs; treat as empty.
@@ -416,40 +459,64 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 				e.log(cj.ID, name, "failed but continue_on_error=true: "+runErr.Error())
 				continue
 			}
-			if errorKind(runErr) == ErrorCancelled || errors.Is(ctx.Err(), context.Canceled) {
-				res.Status = model.StatusCancelled
-			} else {
-				res.Status = model.StatusFailure
+			if errorKind(runErr) == ErrorCancelled || ctx.Err() != nil {
+				currentStatus = model.StatusCancelled
+				if cleanupCtx == nil {
+					var cleanupCancel context.CancelFunc
+					cleanupCtx, cleanupCancel = context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+					defer cleanupCancel()
+				}
+				if res.Error == "" {
+					res.Error = runErr.Error()
+				}
+				continue
 			}
-			res.Error = runErr.Error()
-			res.Outputs = pipeline.InterpolateOutputMap(cj.Job.Outputs, needsOutputs, stepOutputs)
-			e.saveArtifacts(s, cj, res.Status)
-			return finish(res)
-		}
-	}
-	for _, c := range cj.Job.Cache {
-		key, er := e.Opt.Cache.Key(e.cacheBase(c.Key)+"|"+runtime.GOOS+"|"+runtime.GOARCH+"|"+cj.Job.Runtime, e.Opt.Workspace, c.HashFiles)
-		if er == nil {
-			if er = e.Opt.Cache.Save(key, e.Opt.Workspace, c.Paths); er != nil {
-				e.log(cj.ID, "cache", "save warning: "+er.Error())
-			} else {
-				e.log(cj.ID, "cache", "saved "+cacheName(c)+" ("+key[:12]+")")
+			currentStatus = model.StatusFailure
+			if res.Error == "" {
+				res.Error = runErr.Error()
 			}
 		}
 	}
-	res.Status = model.StatusSuccess
+	if currentStatus == model.StatusSuccess {
+		for _, c := range cj.Job.Cache {
+			key, er := e.Opt.Cache.Key(e.cacheBase(c.Key)+"|"+runtime.GOOS+"|"+runtime.GOARCH+"|"+cj.Job.Runtime, workspace, c.HashFiles)
+			if er == nil {
+				if er = e.Opt.Cache.Save(key, workspace, c.Paths); er != nil {
+					e.log(cj.ID, "cache", "save warning: "+er.Error())
+				} else {
+					e.log(cj.ID, "cache", "saved "+cacheName(c)+" ("+key[:12]+")")
+				}
+			}
+		}
+	}
+	res.Status = currentStatus
 	res.Outputs = pipeline.InterpolateOutputMap(cj.Job.Outputs, needsOutputs, stepOutputs)
-	e.saveArtifacts(s, cj, res.Status)
+	e.saveArtifacts(s, cj, workspace, res.Status)
 	return finish(res)
 }
 
-func (e *Executor) saveArtifacts(_ *pipeline.Spec, cj pipeline.CompiledJob, status model.Status) {
+// defaultCondition supplies the implicit step condition: a step without an
+// explicit `if` runs only while the job status still admits success().
+func defaultCondition(cond string) string {
+	if strings.TrimSpace(cond) == "" {
+		return "success()"
+	}
+	return cond
+}
+
+// cleanupTimeout bounds the cleanup phase that runs after a job is
+// cancelled: steps whose conditions admit the cancelled state execute under
+// a fresh context with this budget because the job's own execution context
+// is already dead.
+const cleanupTimeout = 60 * time.Second
+
+func (e *Executor) saveArtifacts(_ *pipeline.Spec, cj pipeline.CompiledJob, workspace string, status model.Status) {
 	for _, a := range cj.Job.Artifacts {
 		ok, err := pipeline.Eval(a.If, pipeline.EvalContext{Status: status})
 		if err != nil || !ok {
 			continue
 		}
-		p, err := e.Opt.Artifacts.Save(e.Opt.RunID, cj.ID, a.Name, e.Opt.Workspace, a.Paths)
+		p, err := e.Opt.Artifacts.Save(e.Opt.RunID, cj.ID, a.Name, workspace, a.Paths)
 		if err != nil {
 			e.log(cj.ID, "artifact", "save warning: "+err.Error())
 			continue
@@ -586,16 +653,23 @@ func (e *Executor) resolveSecrets(ctx context.Context, names []string, cache map
 	}
 	return out, nil
 }
+
+// defaultShell is the final fallback for an unspecified shell, per runtime
+// kind: containers run sh, Tart guests run bash, native hosts run pwsh on
+// Windows and bash everywhere else. The full resolution order is
+// step.Shell > job.Shell > spec.Defaults.Shell > defaultShell(runtime).
 func defaultShell(runtimeKind string) string {
-	if runtimeKind == "container" {
+	switch runtimeKind {
+	case "container":
 		return "sh"
-	}
-	if runtimeKind == "native" || runtimeKind == "" {
+	case "tart":
+		return "bash"
+	default: // native, ""
 		if runtime.GOOS == "windows" {
 			return "pwsh"
 		}
+		return "bash"
 	}
-	return "bash"
 }
 
 func (e *Executor) cacheBase(base string) string {

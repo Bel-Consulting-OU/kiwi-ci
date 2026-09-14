@@ -18,6 +18,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secrets"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/workspace"
 )
 
 func pipelineFlag(fs *flag.FlagSet) *string {
@@ -51,6 +52,14 @@ func RunLocal(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	// Local runs get per-job workspaces: parallel matrix jobs must never
+	// share one checkout. The manager snapshots the current directory for
+	// each job and cleans every workspace up when the run finishes.
+	wm, err := workspace.NewManager(wd)
+	if err != nil {
+		return err
+	}
+	defer wm.Close()
 	runID, err := newLocalRunID()
 	if err != nil {
 		return err
@@ -58,7 +67,7 @@ func RunLocal(ctx context.Context, args []string) error {
 	masker := &secrets.Masker{}
 	logs := &logging.Console{Writer: os.Stdout, Masker: masker}
 	provider := secrets.Chain{secrets.EnvProvider{Prefix: "KIWI_SECRET_"}, secrets.MacKeychainProvider{Service: "kiwi-ci"}}
-	opts := executor.Options{Workspace: wd, RunID: runID, MaxParallel: *parallel, OnlyJob: *job, ChangedFiles: detectChangedFiles(wd), SecretProvider: provider, Logs: logs}
+	opts := executor.Options{Workspace: wd, WorkspaceFor: func(jobID string) (string, func(), error) { return wm.Prepare(ctx, jobID) }, RunID: runID, MaxParallel: *parallel, OnlyJob: *job, ChangedFiles: detectChangedFiles(wd), SecretProvider: provider, Logs: logs}
 	if vars := splitEnvNames(*passEnv); len(vars) > 0 {
 		// Explicit allowlist: only these vars plus the clean env; the
 		// inherit-env default is ignored.

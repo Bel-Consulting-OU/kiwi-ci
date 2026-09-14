@@ -3,25 +3,43 @@ package pipeline
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
-type Duration struct{ time.Duration }
+type Duration struct {
+	time.Duration
+	// Set records whether the duration was explicitly present in the source
+	// document. Validation uses it to reject explicit non-positive values
+	// while still treating absent values as "unset".
+	Set bool `yaml:"-" json:"-"`
+}
 
 func (d *Duration) UnmarshalJSON(b []byte) error {
 	if string(b) == "null" || string(b) == `""` {
 		d.Duration = 0
+		d.Set = false
 		return nil
 	}
 	var s string
 	if err := json.Unmarshal(b, &s); err != nil {
 		return fmt.Errorf("duration must be a string: %w", err)
 	}
+	if s == "" {
+		d.Duration = 0
+		d.Set = false
+		return nil
+	}
 	v, err := time.ParseDuration(s)
 	if err != nil {
 		return err
 	}
 	d.Duration = v
+	d.Set = true
 	return nil
 }
 
@@ -32,6 +50,7 @@ func (d *Duration) UnmarshalYAML(unmarshal func(any) error) error {
 	}
 	if s == "" {
 		d.Duration = 0
+		d.Set = false
 		return nil
 	}
 	v, err := time.ParseDuration(s)
@@ -39,18 +58,90 @@ func (d *Duration) UnmarshalYAML(unmarshal func(any) error) error {
 		return err
 	}
 	d.Duration = v
+	d.Set = true
+	return nil
+}
+
+func (d Duration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(d.Duration.String())
+}
+
+// ByteSize is a memory or disk size in bytes. UnmarshalYAML accepts plain
+// byte counts ("1073741824") as well as binary-suffixed values ("512Mi",
+// "512MiB", "2Gi", "1T").
+type ByteSize int64
+
+var byteSizeRegexp = regexp.MustCompile(`^([0-9]+(?:\.[0-9]+)?)\s*([KkMmGgTtPp]?[Ii]?[Bb]?)$`)
+
+func (b *ByteSize) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind != yaml.ScalarNode {
+		return fmt.Errorf("byte size must be a scalar (line %d)", value.Line)
+	}
+	s := strings.TrimSpace(value.Value)
+	if s == "" {
+		*b = 0
+		return nil
+	}
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		*b = ByteSize(n)
+		return nil
+	}
+	m := byteSizeRegexp.FindStringSubmatch(s)
+	if m == nil {
+		return fmt.Errorf("invalid byte size %q (want e.g. \"512Mi\", \"2Gi\" or plain bytes)", s)
+	}
+	f, err := strconv.ParseFloat(m[1], 64)
+	if err != nil {
+		return fmt.Errorf("invalid byte size %q: %w", s, err)
+	}
+	multipliers := map[string]float64{
+		"": 1, "b": 1,
+		"k": 1 << 10, "ki": 1 << 10, "kib": 1 << 10, "kb": 1 << 10,
+		"m": 1 << 20, "mi": 1 << 20, "mib": 1 << 20, "mb": 1 << 20,
+		"g": 1 << 30, "gi": 1 << 30, "gib": 1 << 30, "gb": 1 << 30,
+		"t": 1 << 40, "ti": 1 << 40, "tib": 1 << 40, "tb": 1 << 40,
+		"p": 1 << 50, "pi": 1 << 50, "pib": 1 << 50, "pb": 1 << 50,
+	}
+	suffix := strings.ToLower(m[2])
+	mult, ok := multipliers[suffix]
+	if !ok {
+		return fmt.Errorf("invalid byte size suffix %q", m[2])
+	}
+	*b = ByteSize(f * mult)
 	return nil
 }
 
 type Spec struct {
-	Version     int                `yaml:"version" json:"version"`
-	Name        string             `yaml:"name,omitempty" json:"name,omitempty"`
-	Env         map[string]string  `yaml:"env,omitempty" json:"env,omitempty"`
-	Secrets     []string           `yaml:"secrets,omitempty" json:"secrets,omitempty"`
-	Concurrency Concurrency        `yaml:"concurrency,omitempty" json:"concurrency,omitempty"`
-	Defaults    Defaults           `yaml:"defaults,omitempty" json:"defaults,omitempty"`
-	On          map[string]Trigger `yaml:"on,omitempty" json:"on,omitempty"`
-	Jobs        map[string]Job     `yaml:"jobs" json:"jobs"`
+	Version     int                     `yaml:"version" json:"version"`
+	Name        string                  `yaml:"name,omitempty" json:"name,omitempty"`
+	On          map[string]Trigger      `yaml:"on,omitempty" json:"on,omitempty"`
+	Inputs      map[string]Input        `yaml:"inputs,omitempty" json:"inputs,omitempty"`
+	Env         map[string]string       `yaml:"env,omitempty" json:"env,omitempty"`
+	Secrets     []string                `yaml:"secrets,omitempty" json:"secrets,omitempty"`
+	Defaults    Defaults                `yaml:"defaults,omitempty" json:"defaults,omitempty"`
+	Permissions Permissions             `yaml:"permissions,omitempty" json:"permissions,omitempty"`
+	Concurrency Concurrency             `yaml:"concurrency,omitempty" json:"concurrency,omitempty"`
+	Packages    map[string]Package      `yaml:"packages,omitempty" json:"packages,omitempty"`
+	Components  map[string]ComponentUse `yaml:"components,omitempty" json:"components,omitempty"`
+	Jobs        map[string]Job          `yaml:"jobs" json:"jobs"`
+}
+
+type Input struct {
+	Type        string   `yaml:"type,omitempty" json:"type,omitempty"`
+	Required    bool     `yaml:"required,omitempty" json:"required,omitempty"`
+	Default     any      `yaml:"default,omitempty" json:"default,omitempty"`
+	Options     []string `yaml:"options,omitempty" json:"options,omitempty"`
+	Description string   `yaml:"description,omitempty" json:"description,omitempty"`
+}
+
+type Package struct {
+	Paths     []string `yaml:"paths,omitempty" json:"paths,omitempty"`
+	DependsOn []string `yaml:"depends_on,omitempty" json:"depends_on,omitempty"`
+}
+
+type ComponentUse struct {
+	Ref  string            `yaml:"ref" json:"ref"`
+	With map[string]string `yaml:"with,omitempty" json:"with,omitempty"`
 }
 
 type Trigger struct {
@@ -60,6 +151,8 @@ type Trigger struct {
 	TagsIgnore     []string `yaml:"tags_ignore,omitempty" json:"tags_ignore,omitempty"`
 	Paths          []string `yaml:"paths,omitempty" json:"paths,omitempty"`
 	PathsIgnore    []string `yaml:"paths_ignore,omitempty" json:"paths_ignore,omitempty"`
+	Actions        []string `yaml:"actions,omitempty" json:"actions,omitempty"`
+	Draft          *bool    `yaml:"draft,omitempty" json:"draft,omitempty"`
 }
 
 type Defaults struct {
@@ -95,12 +188,86 @@ const (
 	NetworkPolicyInternet                          // unrestricted internet access
 )
 
+func (n *NetworkPolicy) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.ScalarNode {
+		return fmt.Errorf("network policy must be a string or integer")
+	}
+	switch strings.TrimSpace(strings.ToLower(node.Value)) {
+	case "", "default", "bridge":
+		*n = NetworkPolicyDefault
+	case "none":
+		*n = NetworkPolicyNone
+	case "services-only", "services_only":
+		*n = NetworkPolicyServicesOnly
+	case "internet", "host":
+		*n = NetworkPolicyInternet
+	default:
+		if v, err := strconv.Atoi(node.Value); err == nil && v >= 0 && v <= 3 {
+			*n = NetworkPolicy(v)
+			return nil
+		}
+		return fmt.Errorf("unknown network policy %q", node.Value)
+	}
+	return nil
+}
+
 // Sandbox collects job-level sandboxing requirements. Enforced by the
 // executor backends; distributed runners must honor them for untrusted jobs.
 type Sandbox struct {
 	Rootless       bool          `yaml:"rootless,omitempty" json:"rootless,omitempty"`
 	ReadOnlyRootFS bool          `yaml:"read_only_rootfs,omitempty" json:"read_only_rootfs,omitempty"`
 	Network        NetworkPolicy `yaml:"network,omitempty" json:"network,omitempty"`
+}
+
+// Placement steers a job towards runner regions and label sets.
+type Placement struct {
+	Regions []string `yaml:"regions,omitempty" json:"regions,omitempty"`
+	Labels  []string `yaml:"labels,omitempty" json:"labels,omitempty"`
+}
+
+// Resources declares the compute resources a job requires.
+type Resources struct {
+	CPU    float64  `yaml:"cpu,omitempty" json:"cpu,omitempty"`
+	Memory ByteSize `yaml:"memory,omitempty" json:"memory,omitempty"`
+	Disk   ByteSize `yaml:"disk,omitempty" json:"disk,omitempty"`
+	PIDs   int      `yaml:"pids,omitempty" json:"pids,omitempty"`
+}
+
+// TestConfig carries test-running metadata for a job.
+type TestConfig struct {
+	Reports         []string `yaml:"reports,omitempty" json:"reports,omitempty"`
+	Manifest        string   `yaml:"manifest,omitempty" json:"manifest,omitempty"`
+	Shards          int      `yaml:"shards,omitempty" json:"shards,omitempty"`
+	RetryFailed     int      `yaml:"retry_failed,omitempty" json:"retry_failed,omitempty"`
+	QuarantineFlaky bool     `yaml:"quarantine_flaky,omitempty" json:"quarantine_flaky,omitempty"`
+}
+
+// GenerateSpec requests a downstream child pipeline generation.
+type GenerateSpec struct {
+	Path     string `yaml:"path,omitempty" json:"path,omitempty"`
+	MaxJobs  int    `yaml:"max_jobs,omitempty" json:"max_jobs,omitempty"`
+	MaxDepth int    `yaml:"max_depth,omitempty" json:"max_depth,omitempty"`
+}
+
+// DownstreamSpec triggers a pipeline in another repository.
+type DownstreamSpec struct {
+	Repository string            `yaml:"repository,omitempty" json:"repository,omitempty"`
+	Ref        string            `yaml:"ref,omitempty" json:"ref,omitempty"`
+	Event      string            `yaml:"event,omitempty" json:"event,omitempty"`
+	Inputs     map[string]string `yaml:"inputs,omitempty" json:"inputs,omitempty"`
+	Wait       bool              `yaml:"wait,omitempty" json:"wait,omitempty"`
+}
+
+// SnapshotSpec captures a snapshot on the listed events.
+type SnapshotSpec struct {
+	On []string `yaml:"on,omitempty" json:"on,omitempty"`
+}
+
+// DeploymentSpec carries the three deployment phases as step lists.
+type DeploymentSpec struct {
+	Canary   []Step `yaml:"canary,omitempty" json:"canary,omitempty"`
+	Verify   []Step `yaml:"verify,omitempty" json:"verify,omitempty"`
+	Rollback []Step `yaml:"rollback,omitempty" json:"rollback,omitempty"`
 }
 
 type Job struct {
@@ -130,6 +297,16 @@ type Job struct {
 	Permissions  Permissions       `yaml:"permissions,omitempty" json:"permissions,omitempty"`
 	Outputs      map[string]string `yaml:"outputs,omitempty" json:"outputs,omitempty"`
 	Sandbox      Sandbox           `yaml:"sandbox,omitempty" json:"sandbox,omitempty"`
+	Placement    Placement         `yaml:"placement,omitempty" json:"placement,omitempty"`
+	Resources    Resources         `yaml:"resources,omitempty" json:"resources,omitempty"`
+	Tests        TestConfig        `yaml:"tests,omitempty" json:"tests,omitempty"`
+	Generate     GenerateSpec      `yaml:"generate,omitempty" json:"generate,omitempty"`
+	Downstream   DownstreamSpec    `yaml:"downstream,omitempty" json:"downstream,omitempty"`
+	Deployment   DeploymentSpec    `yaml:"deployment,omitempty" json:"deployment,omitempty"`
+	Snapshot     SnapshotSpec      `yaml:"snapshot,omitempty" json:"snapshot,omitempty"`
+	Component    string            `yaml:"component,omitempty" json:"component,omitempty"`
+	With         map[string]string `yaml:"with,omitempty" json:"with,omitempty"`
+	QueueTimeout Duration          `yaml:"queue_timeout,omitempty" json:"queue_timeout,omitempty"`
 }
 
 type Service struct {

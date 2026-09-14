@@ -1,427 +1,306 @@
 package pipeline
 
-// This file intentionally implements the small, predictable YAML subset Kiwi
-// needs for pipeline files. Keeping the bootstrap parser in-tree means the Kiwi
-// binary has zero runtime or module dependencies. It supports indentation maps,
-// sequences, inline arrays/maps, quoted and plain scalars, comments, and |/> block
-// strings. It deliberately rejects aliases, tags, merge keys and other YAML features
-// that are a frequent source of surprising CI configuration behavior.
+// This file replaces the hand-rolled subset YAML parser with a strict
+// yaml.v3 node-based pipeline. The typed Spec is decoded through yaml.v3
+// itself, so scalars (numbers, booleans, timestamps) are resolved by the same
+// core schema that performs the decode. Before decoding, the raw node tree is
+// validated for the features Kiwi rejects: aliases, anchors, merge keys,
+// custom tags, duplicate keys, excessive nesting, oversized scalars, invalid
+// UTF-8 and oversized sources. Known-field strictness is enforced by
+// validateKnownFields below (yaml.v3's own KnownFields mode cannot express
+// the per-section tables and their line-accurate errors).
 
 import (
-	"encoding/json"
+	"bytes"
 	"fmt"
-	"strconv"
-	"strings"
-	"unicode"
+	"io"
+	"unicode/utf8"
+
+	"gopkg.in/yaml.v3"
 )
 
-type yamlLine struct {
-	indent int
-	text   string
-	raw    string
-	line   int
+const (
+	maxPipelineBytes = 2 << 20 // 2 MiB source limit
+	maxScalarBytes   = 1 << 20 // 1 MiB per scalar
+	maxYAMLDepth     = 100
+	maxYAMLNodes     = 1_000_000
+)
+
+// allowedYAMLTags are the only tags permitted in pipeline documents. Custom
+// tags ("!foo") and other resolved tags fail admission.
+var allowedYAMLTags = map[string]bool{
+	"": true, "!!str": true, "!!bool": true, "!!int": true,
+	"!!float": true, "!!null": true, "!!map": true, "!!seq": true,
+	"!!timestamp": true,
 }
 
 func parseYAML(data []byte, out any) error {
-	lines, err := lexYAML(string(data))
-	if err != nil {
-		return err
+	if len(data) > maxPipelineBytes {
+		return fmt.Errorf("yaml: source size %d exceeds %d byte limit", len(data), maxPipelineBytes)
 	}
-	if len(lines) == 0 {
+	if !utf8.Valid(data) {
+		off := firstInvalidUTF8Offset(data)
+		line, col := lineCol(data, off)
+		return fmt.Errorf("yaml: invalid UTF-8 at byte %d (line %d, column %d)", off, line, col)
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	var doc yaml.Node
+	if err := dec.Decode(&doc); err != nil {
+		if err == io.EOF {
+			return fmt.Errorf("empty pipeline")
+		}
+		return yamlError(err)
+	}
+	var extra yaml.Node
+	if err := dec.Decode(&extra); err == nil {
+		return fmt.Errorf("yaml: line %d: multiple documents are not allowed", extra.Line)
+	} else if err != io.EOF {
+		return yamlError(err)
+	}
+	if doc.Kind == 0 || (doc.Kind == yaml.DocumentNode && len(doc.Content) == 0) {
 		return fmt.Errorf("empty pipeline")
 	}
-	v, next, err := parseYAMLBlock(lines, 0, lines[0].indent)
-	if err != nil {
+	nodes := 0
+	if err := validateYAMLNode(&doc, 0, &nodes); err != nil {
 		return err
 	}
-	if next != len(lines) {
-		return fmt.Errorf("yaml: unexpected content near line %d", lines[next].line)
-	}
-	b, err := json.Marshal(v)
-	if err != nil {
+	if err := validateKnownFields(&doc, ""); err != nil {
 		return err
 	}
-	if err := json.Unmarshal(b, out); err != nil {
-		return fmt.Errorf("decode pipeline: %w", err)
+	target := doc
+	if doc.Kind == yaml.DocumentNode && len(doc.Content) == 1 {
+		target = *doc.Content[0]
+	}
+	if target.Kind != yaml.MappingNode {
+		return fmt.Errorf("yaml: line %d: pipeline must be a mapping", target.Line)
+	}
+	if err := target.Decode(out); err != nil {
+		return fmt.Errorf("yaml: %w", err)
 	}
 	return nil
 }
 
-func lexYAML(s string) ([]yamlLine, error) {
-	rawLines := strings.Split(strings.ReplaceAll(s, "\r\n", "\n"), "\n")
-	out := make([]yamlLine, 0, len(rawLines))
-	for i, raw := range rawLines {
-		if strings.ContainsRune(raw, '\t') {
-			return nil, fmt.Errorf("yaml line %d: tabs are not allowed for indentation", i+1)
-		}
-		trimRight := strings.TrimRightFunc(raw, unicode.IsSpace)
-		if strings.TrimSpace(trimRight) == "" {
-			continue
-		}
-		indent := len(trimRight) - len(strings.TrimLeft(trimRight, " "))
-		text := stripYAMLComment(strings.TrimLeft(trimRight, " "))
-		if strings.TrimSpace(text) == "" {
-			continue
-		}
-		out = append(out, yamlLine{indent: indent, text: strings.TrimSpace(text), raw: trimRight, line: i + 1})
+func yamlError(err error) error {
+	if err == nil {
+		return nil
 	}
-	return out, nil
+	msg := err.Error()
+	if len(msg) >= 5 && msg[:5] == "yaml:" {
+		return err
+	}
+	return fmt.Errorf("yaml: %w", err)
 }
 
-func stripYAMLComment(s string) string {
-	var quote rune
-	escaped := false
-	for i, r := range s {
-		if escaped {
-			escaped = false
-			continue
+func firstInvalidUTF8Offset(b []byte) int {
+	for i := 0; i < len(b); {
+		r, size := utf8.DecodeRune(b[i:])
+		if r == utf8.RuneError && size == 1 {
+			return i
 		}
-		if quote == '"' && r == '\\' {
-			escaped = true
-			continue
-		}
-		if r == '\'' || r == '"' {
-			if quote == 0 {
-				quote = r
-			} else if quote == r {
-				quote = 0
-			}
-			continue
-		}
-		if r == '#' && quote == 0 && (i == 0 || unicode.IsSpace(rune(s[i-1]))) {
-			return strings.TrimSpace(s[:i])
-		}
+		i += size
 	}
-	return s
+	return -1
 }
 
-func parseYAMLBlock(lines []yamlLine, i, indent int) (any, int, error) {
-	if i >= len(lines) {
-		return nil, i, nil
-	}
-	if lines[i].indent != indent {
-		return nil, i, fmt.Errorf("yaml line %d: unexpected indentation", lines[i].line)
-	}
-	if strings.HasPrefix(lines[i].text, "- ") || lines[i].text == "-" {
-		return parseYAMLSeq(lines, i, indent)
-	}
-	return parseYAMLMap(lines, i, indent)
-}
-
-func parseYAMLMap(lines []yamlLine, i, indent int) (any, int, error) {
-	m := map[string]any{}
-	for i < len(lines) {
-		ln := lines[i]
-		if ln.indent < indent {
-			break
-		}
-		if ln.indent > indent {
-			return nil, i, fmt.Errorf("yaml line %d: unexpected indentation", ln.line)
-		}
-		if strings.HasPrefix(ln.text, "- ") || ln.text == "-" {
-			break
-		}
-		key, rest, ok := splitYAMLKey(ln.text)
-		if !ok {
-			return nil, i, fmt.Errorf("yaml line %d: expected key: value", ln.line)
-		}
-		if _, exists := m[key]; exists {
-			return nil, i, fmt.Errorf("yaml line %d: duplicate key %q", ln.line, key)
-		}
-		i++
-		if rest == "|" || rest == ">" {
-			v, ni := parseBlockString(lines, i, indent, rest == ">")
-			m[key] = v
-			i = ni
-			continue
-		}
-		if rest != "" {
-			v, err := parseYAMLScalar(rest)
-			if err != nil {
-				return nil, i, fmt.Errorf("yaml line %d: %w", ln.line, err)
-			}
-			m[key] = v
-			continue
-		}
-		if i < len(lines) && lines[i].indent > indent {
-			childIndent := lines[i].indent
-			v, ni, err := parseYAMLBlock(lines, i, childIndent)
-			if err != nil {
-				return nil, i, err
-			}
-			m[key] = v
-			i = ni
+func lineCol(data []byte, off int) (line, col int) {
+	line, col = 1, 1
+	for i := 0; i < off && i < len(data); i++ {
+		if data[i] == '\n' {
+			line++
+			col = 1
 		} else {
-			m[key] = nil
+			col++
 		}
 	}
-	return m, i, nil
+	return line, col
 }
 
-func parseYAMLSeq(lines []yamlLine, i, indent int) (any, int, error) {
-	var a []any
-	for i < len(lines) {
-		ln := lines[i]
-		if ln.indent < indent {
-			break
-		}
-		if ln.indent != indent || !(strings.HasPrefix(ln.text, "- ") || ln.text == "-") {
-			break
-		}
-		rest := strings.TrimSpace(strings.TrimPrefix(ln.text, "-"))
-		i++
-		if rest == "" {
-			if i >= len(lines) || lines[i].indent <= indent {
-				a = append(a, nil)
-				continue
+func validateYAMLNode(n *yaml.Node, depth int, nodes *int) error {
+	if depth > maxYAMLDepth {
+		return fmt.Errorf("yaml: line %d: nesting exceeds %d levels", n.Line, maxYAMLDepth)
+	}
+	*nodes++
+	if *nodes > maxYAMLNodes {
+		return fmt.Errorf("yaml: line %d: document exceeds %d nodes", n.Line, maxYAMLNodes)
+	}
+	switch n.Kind {
+	case yaml.AliasNode:
+		return fmt.Errorf("yaml: line %d: aliases are not allowed", n.Line)
+	case yaml.DocumentNode:
+		for _, c := range n.Content {
+			if err := validateYAMLNode(c, depth+1, nodes); err != nil {
+				return err
 			}
-			v, ni, err := parseYAMLBlock(lines, i, lines[i].indent)
-			if err != nil {
-				return nil, i, err
-			}
-			a = append(a, v)
-			i = ni
-			continue
 		}
-		if key, first, ok := splitYAMLKey(rest); ok {
-			item := map[string]any{}
-			if first == "|" || first == ">" {
-				v, ni := parseBlockString(lines, i, indent, first == ">")
-				item[key] = v
-				i = ni
-			} else if first != "" {
-				v, err := parseYAMLScalar(first)
-				if err != nil {
-					return nil, i, fmt.Errorf("yaml line %d: %w", ln.line, err)
-				}
-				item[key] = v
-			} else if i < len(lines) && lines[i].indent > indent {
-				v, ni, err := parseYAMLBlock(lines, i, lines[i].indent)
-				if err != nil {
-					return nil, i, err
-				}
-				item[key] = v
-				i = ni
-			} else {
-				item[key] = nil
+		return nil
+	}
+	if n.Anchor != "" {
+		return fmt.Errorf("yaml: line %d: anchors are not allowed (&%s)", n.Line, n.Anchor)
+	}
+	if n.Kind == yaml.ScalarNode && len(n.Value) > maxScalarBytes {
+		return fmt.Errorf("yaml: line %d: scalar exceeds %d byte limit", n.Line, maxScalarBytes)
+	}
+	if n.Tag == "!!merge" {
+		return fmt.Errorf("yaml: line %d: merge keys (<<) are not allowed", n.Line)
+	}
+	if !allowedYAMLTags[n.Tag] {
+		return fmt.Errorf("yaml: line %d: unsupported tag %q", n.Line, n.Tag)
+	}
+	if n.Kind == yaml.MappingNode {
+		seen := map[string]int{}
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			k, v := n.Content[i], n.Content[i+1]
+			if k.Tag == "!!merge" || (k.Kind == yaml.ScalarNode && k.Value == "<<") {
+				return fmt.Errorf("yaml: line %d: merge keys (<<) are not allowed", k.Line)
 			}
-			// Consume sibling mapping keys belonging to this list item.
-			if i < len(lines) && lines[i].indent > indent && !(strings.HasPrefix(lines[i].text, "- ") || lines[i].text == "-") {
-				childIndent := lines[i].indent
-				v, ni, err := parseYAMLMap(lines, i, childIndent)
-				if err != nil {
-					return nil, i, err
+			if first, ok := seen[k.Value]; ok {
+				return fmt.Errorf("yaml: line %d: duplicate key %q (first at line %d)", k.Line, k.Value, first)
+			}
+			seen[k.Value] = k.Line
+			if err := validateYAMLNode(k, depth+1, nodes); err != nil {
+				return err
+			}
+			if err := validateYAMLNode(v, depth+1, nodes); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, c := range n.Content {
+		if err := validateYAMLNode(c, depth+1, nodes); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// knownFieldTables maps canonical section paths to the fields allowed there.
+// A "*" segment stands for any key of a map-of-sections (jobs, on, inputs,
+// packages, components) or any sequence item. Paths not present in the table
+// are free-form maps (env, matrix, outputs, with, downstream inputs) and are
+// not key-checked, though the node-level walk above still applies.
+var knownFieldTables = map[string]map[string]bool{
+	"": {
+		"version": true, "name": true, "on": true, "inputs": true, "env": true,
+		"secrets": true, "defaults": true, "permissions": true, "concurrency": true,
+		"packages": true, "components": true, "jobs": true,
+	},
+	"defaults":       {"shell": true, "timeout": true, "retry": true},
+	"concurrency":    {"group": true, "cancel_in_progress": true},
+	"permissions":    {"id_token": true},
+	"defaults.retry": {"max": true, "backoff": true, "on": true},
+	"on.*": {
+		"branches": true, "branches_ignore": true, "tags": true, "tags_ignore": true,
+		"paths": true, "paths_ignore": true, "actions": true, "draft": true,
+	},
+	"inputs.*":     {"type": true, "required": true, "default": true, "options": true, "description": true},
+	"packages.*":   {"paths": true, "depends_on": true},
+	"components.*": {"ref": true, "with": true},
+	"jobs.*": {
+		"name": true, "needs": true, "if": true, "runner": true, "runtime": true,
+		"image": true, "network": true, "vm": true, "shell": true, "timeout": true,
+		"retry": true, "env": true, "matrix": true, "paths": true, "paths_ignore": true,
+		"services": true, "steps": true, "cache": true, "artifacts": true,
+		"downloads": true, "test_reports": true, "environment": true,
+		"infra_retries": true, "permissions": true, "outputs": true,
+		"placement": true, "sandbox": true, "resources": true, "workflow": true,
+		"tests": true, "generate": true, "downstream": true, "deployment": true,
+		"snapshot": true, "component": true, "with": true, "queue_timeout": true,
+	},
+	"jobs.*.retry":                       {"max": true, "backoff": true, "on": true},
+	"jobs.*.environment":                 {"name": true, "url": true, "approval": true, "branches": true, "concurrency": true},
+	"jobs.*.sandbox":                     {"rootless": true, "read_only_rootfs": true, "network": true},
+	"jobs.*.placement":                   {"regions": true, "labels": true},
+	"jobs.*.resources":                   {"cpu": true, "memory": true, "disk": true, "pids": true},
+	"jobs.*.tests":                       {"reports": true, "manifest": true, "shards": true, "retry_failed": true, "quarantine_flaky": true},
+	"jobs.*.generate":                    {"path": true, "max_jobs": true, "max_depth": true},
+	"jobs.*.downstream":                  {"repository": true, "ref": true, "event": true, "inputs": true, "wait": true},
+	"jobs.*.snapshot":                    {"on": true},
+	"jobs.*.deployment":                  {"canary": true, "verify": true, "rollback": true},
+	"jobs.*.services.*":                  {"name": true, "image": true, "env": true, "healthcheck": true, "interval": true, "timeout": true, "retries": true},
+	"jobs.*.steps.*":                     {"id": true, "name": true, "run": true, "if": true, "shell": true, "working_directory": true, "env": true, "secrets": true, "timeout": true, "retry": true, "continue_on_error": true},
+	"jobs.*.steps.*.retry":               {"max": true, "backoff": true, "on": true},
+	"jobs.*.cache.*":                     {"name": true, "paths": true, "key": true, "hash_files": true, "restore_keys": true},
+	"jobs.*.artifacts.*":                 {"name": true, "paths": true, "if": true, "retention": true},
+	"jobs.*.downloads.*":                 {"from": true, "name": true, "path": true},
+	"jobs.*.deployment.canary.*":         {"id": true, "name": true, "run": true, "if": true, "shell": true, "working_directory": true, "env": true, "secrets": true, "timeout": true, "retry": true, "continue_on_error": true},
+	"jobs.*.deployment.verify.*":         {"id": true, "name": true, "run": true, "if": true, "shell": true, "working_directory": true, "env": true, "secrets": true, "timeout": true, "retry": true, "continue_on_error": true},
+	"jobs.*.deployment.rollback.*":       {"id": true, "name": true, "run": true, "if": true, "shell": true, "working_directory": true, "env": true, "secrets": true, "timeout": true, "retry": true, "continue_on_error": true},
+	"jobs.*.deployment.canary.*.retry":   {"max": true, "backoff": true, "on": true},
+	"jobs.*.deployment.verify.*.retry":   {"max": true, "backoff": true, "on": true},
+	"jobs.*.deployment.rollback.*.retry": {"max": true, "backoff": true, "on": true},
+}
+
+// sequenceSections are job fields whose sequence items are mappings with
+// their own known-field table.
+var sequenceSections = map[string]bool{
+	"jobs.*.steps": true, "jobs.*.services": true, "jobs.*.cache": true,
+	"jobs.*.artifacts": true, "jobs.*.downloads": true,
+	"jobs.*.deployment.canary": true, "jobs.*.deployment.verify": true, "jobs.*.deployment.rollback": true,
+}
+
+func validateKnownFields(n *yaml.Node, path string) error {
+	switch n.Kind {
+	case yaml.DocumentNode:
+		for _, c := range n.Content {
+			if err := validateKnownFields(c, path); err != nil {
+				return err
+			}
+		}
+		return nil
+	case yaml.MappingNode:
+		if table, ok := knownFieldTables[path]; ok {
+			for i := 0; i+1 < len(n.Content); i += 2 {
+				k := n.Content[i]
+				if !table[k.Value] {
+					return fmt.Errorf("yaml: line %d: unknown field %q", k.Line, k.Value)
 				}
-				for k, vv := range v.(map[string]any) {
-					if _, dup := item[k]; dup {
-						return nil, i, fmt.Errorf("yaml line %d: duplicate key %q", lines[i].line, k)
+			}
+		}
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			k, v := n.Content[i], n.Content[i+1]
+			if err := validateKnownFields(v, childPath(path, k.Value)); err != nil {
+				return err
+			}
+		}
+		return nil
+	case yaml.SequenceNode:
+		if sequenceSections[path] {
+			for _, item := range n.Content {
+				if item.Kind == yaml.MappingNode {
+					if err := validateKnownFields(item, path+".*"); err != nil {
+						return err
 					}
-					item[k] = vv
-				}
-				i = ni
-			}
-			a = append(a, item)
-			continue
-		}
-		v, err := parseYAMLScalar(rest)
-		if err != nil {
-			return nil, i, fmt.Errorf("yaml line %d: %w", ln.line, err)
-		}
-		a = append(a, v)
-	}
-	return a, i, nil
-}
-
-func parseBlockString(lines []yamlLine, i, parentIndent int, folded bool) (string, int) {
-	if i >= len(lines) || lines[i].indent <= parentIndent {
-		return "", i
-	}
-	base := lines[i].indent
-	var parts []string
-	for i < len(lines) && lines[i].indent > parentIndent {
-		ln := lines[i]
-		text := ln.raw
-		if len(text) >= base {
-			text = text[base:]
-		}
-		parts = append(parts, text)
-		i++
-	}
-	sep := "\n"
-	if folded {
-		sep = " "
-	}
-	return strings.Join(parts, sep) + "\n", i
-}
-
-func splitYAMLKey(s string) (string, string, bool) {
-	var quote rune
-	depth := 0
-	escaped := false
-	for i, r := range s {
-		if escaped {
-			escaped = false
-			continue
-		}
-		if quote == '"' && r == '\\' {
-			escaped = true
-			continue
-		}
-		if r == '\'' || r == '"' {
-			if quote == 0 {
-				quote = r
-			} else if quote == r {
-				quote = 0
-			}
-			continue
-		}
-		if quote != 0 {
-			continue
-		}
-		switch r {
-		case '[', '{':
-			depth++
-		case ']', '}':
-			depth--
-		case ':':
-			if depth == 0 {
-				key := strings.TrimSpace(s[:i])
-				if key == "" {
-					return "", "", false
-				}
-				if (strings.HasPrefix(key, "\"") && strings.HasSuffix(key, "\"")) || (strings.HasPrefix(key, "'") && strings.HasSuffix(key, "'")) {
-					if v, err := parseYAMLScalar(key); err == nil {
-						key = fmt.Sprint(v)
+				} else {
+					if err := validateKnownFields(item, path); err != nil {
+						return err
 					}
 				}
-				return key, strings.TrimSpace(s[i+1:]), true
+			}
+			return nil
+		}
+		for _, item := range n.Content {
+			if err := validateKnownFields(item, path); err != nil {
+				return err
 			}
 		}
+		return nil
 	}
-	return "", "", false
+	return nil
 }
 
-func parseYAMLScalar(s string) (any, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return "", nil
+func childPath(path, key string) string {
+	switch path {
+	case "":
+		return key
+	case "on", "inputs", "packages", "components":
+		return path + ".*"
+	case "jobs":
+		return "jobs.*"
+	case "jobs.*":
+		return "jobs.*." + key
+	case "jobs.*.deployment":
+		return "jobs.*.deployment." + key
 	}
-	if strings.HasPrefix(s, "[") {
-		if !strings.HasSuffix(s, "]") {
-			return nil, fmt.Errorf("unterminated inline array")
-		}
-		inner := strings.TrimSpace(s[1 : len(s)-1])
-		if inner == "" {
-			return []any{}, nil
-		}
-		parts, err := splitYAMLInline(inner)
-		if err != nil {
-			return nil, err
-		}
-		out := make([]any, 0, len(parts))
-		for _, p := range parts {
-			v, err := parseYAMLScalar(p)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, v)
-		}
-		return out, nil
-	}
-	if strings.HasPrefix(s, "{") {
-		if !strings.HasSuffix(s, "}") {
-			return nil, fmt.Errorf("unterminated inline map")
-		}
-		inner := strings.TrimSpace(s[1 : len(s)-1])
-		m := map[string]any{}
-		if inner == "" {
-			return m, nil
-		}
-		parts, err := splitYAMLInline(inner)
-		if err != nil {
-			return nil, err
-		}
-		for _, p := range parts {
-			k, v, ok := splitYAMLKey(p)
-			if !ok {
-				return nil, fmt.Errorf("invalid inline map item %q", p)
-			}
-			vv, err := parseYAMLScalar(v)
-			if err != nil {
-				return nil, err
-			}
-			m[k] = vv
-		}
-		return m, nil
-	}
-	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
-		var v string
-		if err := json.Unmarshal([]byte(s), &v); err != nil {
-			return nil, err
-		}
-		return v, nil
-	}
-	if len(s) >= 2 && s[0] == '\'' && s[len(s)-1] == '\'' {
-		return strings.ReplaceAll(s[1:len(s)-1], "''", "'"), nil
-	}
-	switch strings.ToLower(s) {
-	case "true":
-		return true, nil
-	case "false":
-		return false, nil
-	case "null", "~":
-		return nil, nil
-	}
-	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
-		return n, nil
-	}
-	if f, err := strconv.ParseFloat(s, 64); err == nil && strings.ContainsAny(s, ".eE") {
-		return f, nil
-	}
-	return s, nil
-}
-
-func splitYAMLInline(s string) ([]string, error) {
-	var out []string
-	var quote rune
-	depth := 0
-	start := 0
-	escaped := false
-	for i, r := range s {
-		if escaped {
-			escaped = false
-			continue
-		}
-		if quote == '"' && r == '\\' {
-			escaped = true
-			continue
-		}
-		if r == '\'' || r == '"' {
-			if quote == 0 {
-				quote = r
-			} else if quote == r {
-				quote = 0
-			}
-			continue
-		}
-		if quote != 0 {
-			continue
-		}
-		switch r {
-		case '[', '{':
-			depth++
-		case ']', '}':
-			depth--
-		case ',':
-			if depth == 0 {
-				out = append(out, strings.TrimSpace(s[start:i]))
-				start = i + 1
-			}
-		}
-	}
-	if quote != 0 || depth != 0 {
-		return nil, fmt.Errorf("malformed inline value")
-	}
-	out = append(out, strings.TrimSpace(s[start:]))
-	return out, nil
+	return path + "." + key
 }

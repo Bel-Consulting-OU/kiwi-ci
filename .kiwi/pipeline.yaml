@@ -1,0 +1,43 @@
+# Kiwi CI's own self-hosted pipeline.
+#
+# IMPORTANT: the golang image below is pinned to a placeholder digest and
+# MUST be replaced with a real golang@sha256:... digest before this pipeline
+# is used, so that jobs cannot be swapped by mutable image tags.
+version: 1
+name: kiwi-ci-self-host
+
+defaults:
+  shell: bash
+
+env:
+  GOCACHE: .kiwi/go-cache
+
+jobs:
+  quality:
+    runtime: container
+    image: golang@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    sandbox:
+      rootless: true
+      network: none
+    steps:
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      - name: vet
+        run: go vet ./...
+
+  test:
+    needs: [quality]
+    runtime: container
+    image: golang@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    sandbox:
+      rootless: true
+      network: none
+    cache:
+      - name: go-cache
+        paths: [.kiwi/go-cache]
+        hash_files: [go.sum]
+    steps:
+      - name: build
+        run: go build ./...
+      - name: test
+        run: go test -race ./...

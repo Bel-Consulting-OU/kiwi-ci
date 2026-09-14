@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/expr"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
@@ -651,9 +652,42 @@ func labelsForJob(j pipeline.Job) []string {
 	return out
 }
 
+// expandConcurrency resolves the concurrency group template against the
+// submission context using the expression engine. Supported contexts:
+// ${{ repo }}, ${{ repo.full_name }}, ${{ branch }}, ${{ ref }}, ${{ sha }},
+// ${{ event }}, ${{ git.branch }}, ${{ git.ref }}, ${{ git.sha }} (tight
+// brace forms too). Holes that fail to parse or evaluate are left literal,
+// matching the previous replacer behavior. The branch context is derived
+// from the ref: refs/heads/<name> yields <name>, a bare ref is used as-is,
+// and other refs (e.g. refs/tags/...) yield an empty branch.
 func expandConcurrency(v string, in SubmitRun) string {
-	r := strings.NewReplacer("${{ ref }}", in.Ref, "${{ref}}", in.Ref, "${{ event }}", in.Event, "${{event}}", in.Event, "${{ sha }}", in.SHA, "${{sha}}", in.SHA)
-	return strings.TrimSpace(r.Replace(v))
+	if !strings.Contains(v, "${{") {
+		return strings.TrimSpace(v)
+	}
+	c := expr.Context{
+		Event:    in.Event,
+		Branch:   branchFromRef(in.Ref),
+		Ref:      in.Ref,
+		SHA:      in.SHA,
+		Repo:     in.RepoURL,
+		RepoFull: in.RepoFullName,
+	}
+	out, err := expr.EvalString(v, c)
+	if err != nil {
+		return strings.TrimSpace(v)
+	}
+	return strings.TrimSpace(out)
+}
+
+// branchFromRef derives the branch context value from a git ref.
+func branchFromRef(ref string) string {
+	if strings.HasPrefix(ref, "refs/heads/") {
+		return strings.TrimPrefix(ref, "refs/heads/")
+	}
+	if strings.HasPrefix(ref, "refs/") {
+		return ""
+	}
+	return ref
 }
 
 func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
