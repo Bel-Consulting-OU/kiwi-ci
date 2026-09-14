@@ -55,23 +55,54 @@ func pairs[V any](m map[string]V) orderedMap {
 	return out
 }
 
+// canonicalDuration renders a Duration as a string that is omitted when the
+// duration was never set. Duration itself cannot use omitempty (structs are
+// never "empty"), and an always-present zero duration would round-trip
+// through Parse as an explicit non-positive value, which validation rejects.
+type canonicalDuration string
+
+func durOf(d Duration) canonicalDuration {
+	if !d.Set {
+		return ""
+	}
+	return canonicalDuration(d.Duration.String())
+}
+
+// canonicalRetry is Retry with the same omittable-duration treatment.
+type canonicalRetry struct {
+	Max     int               `json:"max,omitempty"`
+	Backoff canonicalDuration `json:"backoff,omitempty"`
+	On      []string          `json:"on,omitempty"`
+}
+
+func retryOf(r Retry) canonicalRetry {
+	return canonicalRetry{Max: r.Max, Backoff: durOf(r.Backoff), On: r.On}
+}
+
+// canonicalDefaults is Defaults with omittable durations.
+type canonicalDefaults struct {
+	Shell   string            `json:"shell,omitempty"`
+	Timeout canonicalDuration `json:"timeout,omitempty"`
+	Retry   canonicalRetry    `json:"retry,omitempty"`
+}
+
 // canonicalSpec mirrors Spec but with map-typed fields replaced by ordered
 // maps. Struct fields keep their declaration order, and every map renders in
 // sorted key order, so two semantically identical specs always produce
 // identical bytes.
 type canonicalSpec struct {
-	Version     int         `json:"version"`
-	Name        string      `json:"name,omitempty"`
-	Env         orderedMap  `json:"env,omitempty"`
-	Secrets     []string    `json:"secrets,omitempty"`
-	Concurrency Concurrency `json:"concurrency,omitempty"`
-	Defaults    Defaults    `json:"defaults,omitempty"`
-	Permissions Permissions `json:"permissions,omitempty"`
-	On          orderedMap  `json:"on,omitempty"`
-	Inputs      orderedMap  `json:"inputs,omitempty"`
-	Packages    orderedMap  `json:"packages,omitempty"`
-	Components  orderedMap  `json:"components,omitempty"`
-	Jobs        orderedMap  `json:"jobs"`
+	Version     int               `json:"version"`
+	Name        string            `json:"name,omitempty"`
+	Env         orderedMap        `json:"env,omitempty"`
+	Secrets     []string          `json:"secrets,omitempty"`
+	Concurrency Concurrency       `json:"concurrency,omitempty"`
+	Defaults    canonicalDefaults `json:"defaults,omitempty"`
+	Permissions Permissions       `json:"permissions,omitempty"`
+	On          orderedMap        `json:"on,omitempty"`
+	Inputs      orderedMap        `json:"inputs,omitempty"`
+	Packages    orderedMap        `json:"packages,omitempty"`
+	Components  orderedMap        `json:"components,omitempty"`
+	Jobs        orderedMap        `json:"jobs"`
 }
 
 type canonicalJob struct {
@@ -84,8 +115,8 @@ type canonicalJob struct {
 	Network      string              `json:"network,omitempty"`
 	VM           string              `json:"vm,omitempty"`
 	Shell        string              `json:"shell,omitempty"`
-	Timeout      Duration            `json:"timeout,omitempty"`
-	Retry        Retry               `json:"retry,omitempty"`
+	Timeout      canonicalDuration   `json:"timeout,omitempty"`
+	Retry        canonicalRetry      `json:"retry,omitempty"`
 	Env          orderedMap          `json:"env,omitempty"`
 	Matrix       orderedMap          `json:"matrix,omitempty"`
 	Paths        []string            `json:"paths,omitempty"`
@@ -110,31 +141,31 @@ type canonicalJob struct {
 	Snapshot     SnapshotSpec        `json:"snapshot,omitempty"`
 	Component    string              `json:"component,omitempty"`
 	With         orderedMap          `json:"with,omitempty"`
-	QueueTimeout Duration            `json:"queue_timeout,omitempty"`
+	QueueTimeout canonicalDuration   `json:"queue_timeout,omitempty"`
 }
 
 type canonicalService struct {
-	Name        string     `json:"name"`
-	Image       string     `json:"image"`
-	Env         orderedMap `json:"env,omitempty"`
-	Healthcheck string     `json:"healthcheck,omitempty"`
-	Interval    Duration   `json:"interval,omitempty"`
-	Timeout     Duration   `json:"timeout,omitempty"`
-	Retries     int        `json:"retries,omitempty"`
+	Name        string            `json:"name"`
+	Image       string            `json:"image"`
+	Env         orderedMap        `json:"env,omitempty"`
+	Healthcheck string            `json:"healthcheck,omitempty"`
+	Interval    canonicalDuration `json:"interval,omitempty"`
+	Timeout     canonicalDuration `json:"timeout,omitempty"`
+	Retries     int               `json:"retries,omitempty"`
 }
 
 type canonicalStep struct {
-	ID               string     `json:"id,omitempty"`
-	Name             string     `json:"name,omitempty"`
-	Run              string     `json:"run"`
-	If               string     `json:"if,omitempty"`
-	Shell            string     `json:"shell,omitempty"`
-	WorkingDirectory string     `json:"working_directory,omitempty"`
-	Env              orderedMap `json:"env,omitempty"`
-	Secrets          []string   `json:"secrets,omitempty"`
-	Timeout          Duration   `json:"timeout,omitempty"`
-	Retry            Retry      `json:"retry,omitempty"`
-	ContinueOnError  bool       `json:"continue_on_error,omitempty"`
+	ID               string            `json:"id,omitempty"`
+	Name             string            `json:"name,omitempty"`
+	Run              string            `json:"run"`
+	If               string            `json:"if,omitempty"`
+	Shell            string            `json:"shell,omitempty"`
+	WorkingDirectory string            `json:"working_directory,omitempty"`
+	Env              orderedMap        `json:"env,omitempty"`
+	Secrets          []string          `json:"secrets,omitempty"`
+	Timeout          canonicalDuration `json:"timeout,omitempty"`
+	Retry            canonicalRetry    `json:"retry,omitempty"`
+	ContinueOnError  bool              `json:"continue_on_error,omitempty"`
 }
 
 type canonicalDownstream struct {
@@ -160,7 +191,7 @@ func canonicalJobOf(j Job) canonicalJob {
 	c := canonicalJob{
 		Name: j.Name, Needs: j.Needs, If: j.If, Runner: j.Runner,
 		Runtime: j.Runtime, Image: j.Image, Network: j.Network, VM: j.VM,
-		Shell: j.Shell, Timeout: j.Timeout, Retry: j.Retry,
+		Shell: j.Shell, Timeout: durOf(j.Timeout), Retry: retryOf(j.Retry),
 		Env: pairs(j.Env), Matrix: pairs(j.Matrix),
 		Paths: j.Paths, PathsIgnore: j.PathsIgnore,
 		Cache: j.Cache, Artifacts: j.Artifacts, Downloads: j.Downloads,
@@ -169,14 +200,14 @@ func canonicalJobOf(j Job) canonicalJob {
 		Outputs: pairs(j.Outputs), Sandbox: j.Sandbox, Placement: j.Placement,
 		Resources: j.Resources, Tests: j.Tests, Generate: j.Generate,
 		Snapshot: j.Snapshot, Component: j.Component, With: pairs(j.With),
-		QueueTimeout: j.QueueTimeout,
+		QueueTimeout: durOf(j.QueueTimeout),
 	}
 	c.Services = make([]canonicalService, len(j.Services))
 	for i := range j.Services {
 		c.Services[i] = canonicalService{
 			Name: j.Services[i].Name, Image: j.Services[i].Image,
 			Env: pairs(j.Services[i].Env), Healthcheck: j.Services[i].Healthcheck,
-			Interval: j.Services[i].Interval, Timeout: j.Services[i].Timeout,
+			Interval: durOf(j.Services[i].Interval), Timeout: durOf(j.Services[i].Timeout),
 			Retries: j.Services[i].Retries,
 		}
 	}
@@ -201,7 +232,7 @@ func canonicalSteps(in []Step) []canonicalStep {
 			ID: in[i].ID, Name: in[i].Name, Run: in[i].Run, If: in[i].If,
 			Shell: in[i].Shell, WorkingDirectory: in[i].WorkingDirectory,
 			Env: pairs(in[i].Env), Secrets: in[i].Secrets,
-			Timeout: in[i].Timeout, Retry: in[i].Retry,
+			Timeout: durOf(in[i].Timeout), Retry: retryOf(in[i].Retry),
 			ContinueOnError: in[i].ContinueOnError,
 		}
 	}
@@ -214,7 +245,8 @@ func canonicalSteps(in []Step) []canonicalStep {
 func canonicalize(s *Spec) canonicalSpec {
 	c := canonicalSpec{
 		Version: s.Version, Name: s.Name,
-		Env: pairs(s.Env), Concurrency: s.Concurrency, Defaults: s.Defaults,
+		Env: pairs(s.Env), Concurrency: s.Concurrency,
+		Defaults:    canonicalDefaults{Shell: s.Defaults.Shell, Timeout: durOf(s.Defaults.Timeout), Retry: retryOf(s.Defaults.Retry)},
 		Permissions: s.Permissions, On: pairs(s.On), Inputs: pairs(s.Inputs),
 		Packages: pairs(s.Packages),
 	}

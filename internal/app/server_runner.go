@@ -2,13 +2,16 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runner"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
@@ -190,6 +193,12 @@ func Server(ctx context.Context, args []string) error {
 	return serveErr
 }
 func Runner(ctx context.Context, args []string) error {
+	if len(args) > 0 {
+		switch args[0] {
+		case "list", "drain", "disable", "enable":
+			return RunnerAdmin(ctx, args[0], args[1:])
+		}
+	}
 	fs := flag.NewFlagSet("runner", flag.ContinueOnError)
 	url := fs.String("server", "http://127.0.0.1:8080", "Kiwi server URL")
 	token := fs.String("token", os.Getenv("KIWI_RUNNER_TOKEN"), "runner token")
@@ -200,6 +209,7 @@ func Runner(ctx context.Context, args []string) error {
 	runnerKey := fs.String("runner-key", "", "runner client private key PEM (path or contents)")
 	runnerEnrollToken := fs.String("runner-enroll-token", os.Getenv("KIWI_RUNNER_ENROLL_TOKEN"), "enrollment token to obtain a runner certificate")
 	runnerMTLS := fs.Bool("runner-mtls", false, "require mTLS (explicit client certificate or enrollment)")
+	drain := fs.Bool("drain", false, "register as draining: finish active jobs, take no new work, then exit")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -211,6 +221,7 @@ func Runner(ctx context.Context, args []string) error {
 		Cert:        *runnerCert,
 		Key:         *runnerKey,
 		EnrollToken: *runnerEnrollToken,
+		Drain:       *drain,
 	}
 	if *labels != "" {
 		cfg.Labels = strings.Split(*labels, ",")
@@ -224,4 +235,88 @@ func Runner(ctx context.Context, args []string) error {
 		}
 	}
 	return (&runner.Runner{Cfg: cfg}).Run(ctx)
+}
+
+// RunnerAdmin implements the admin-side runner control commands:
+//
+//	kiwi runner list                 — GET /api/v1/runners
+//	kiwi runner drain   RUNNER_ID    — POST /api/v1/runners/{id}/drain
+//	kiwi runner disable RUNNER_ID    — POST /api/v1/runners/{id}/disable
+//	kiwi runner enable  RUNNER_ID    — POST /api/v1/runners/{id}/enable
+//
+// These are admin-tier server operations; --token must be an admin token.
+func RunnerAdmin(ctx context.Context, sub string, args []string) error {
+	fs := flag.NewFlagSet("runner "+sub, flag.ContinueOnError)
+	url := fs.String("server", "http://127.0.0.1:8080", "Kiwi server URL")
+	token := fs.String("token", os.Getenv("KIWI_ADMIN_TOKEN"), "admin bearer token")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	base := strings.TrimRight(*url, "/")
+	client := &http.Client{Timeout: 30 * time.Second}
+	do := func(method, path string, out any) error {
+		var body io.Reader
+		if method == http.MethodPost {
+			body = strings.NewReader("{}")
+		}
+		req, err := http.NewRequestWithContext(ctx, method, base+path, body)
+		if err != nil {
+			return err
+		}
+		if *token != "" {
+			req.Header.Set("Authorization", "Bearer "+*token)
+		}
+		if method == http.MethodPost {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			return fmt.Errorf("%s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(b)))
+		}
+		if out != nil {
+			return json.NewDecoder(resp.Body).Decode(out)
+		}
+		return nil
+	}
+	switch sub {
+	case "list":
+		var out []model.Runner
+		if err := do(http.MethodGet, "/api/v1/runners", &out); err != nil {
+			return err
+		}
+		if len(out) == 0 {
+			fmt.Println("no runners registered")
+			return nil
+		}
+		fmt.Printf("%-8s %-24s %-12s %-5s %-9s %-9s %-8s %s\n", "ID", "NAME", "REGION", "BUSY", "DISABLED", "DRAINING", "CAPACITY", "LABELS")
+		for _, rn := range out {
+			fmt.Printf("%-8s %-24s %-12s %-5t %-9t %-9t %-8d %s\n", rn.ID[:min(8, len(rn.ID))], rn.Name, rn.Region, rn.Busy, rn.Disabled, rn.Draining, rn.Capacity, strings.Join(rn.Labels, ","))
+		}
+		return nil
+	case "drain", "disable", "enable":
+		id := fs.Arg(0)
+		if id == "" {
+			return fmt.Errorf("runner %s requires a runner ID argument", sub)
+		}
+		var out model.Runner
+		if err := do(http.MethodPost, "/api/v1/runners/"+id+"/"+sub, &out); err != nil {
+			return err
+		}
+		fmt.Printf("runner %s (%s): %s\n", out.Name, out.ID, sub)
+		return nil
+	default:
+		return fmt.Errorf("unknown runner admin subcommand %q", sub)
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

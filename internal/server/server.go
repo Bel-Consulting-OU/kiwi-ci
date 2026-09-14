@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/components"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/expr"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
@@ -103,6 +104,24 @@ type Server struct {
 	gitHubAPIBase  string
 	gitLabAPIBase  string
 	forgejoAPIBase string
+
+	// ComponentRegistry resolves job component references server-side at
+	// enqueue time (see resolvePipeline). A nil registry rejects pipelines
+	// that reference components.
+	ComponentRegistry components.Registry
+
+	// AdmissionCapabilities, when non-nil, overrides the trust-default
+	// capabilities used for pipeline admission. This is the seam repository
+	// and organization policy compilation plugs into (a later phase);
+	// tests use it to grant capabilities such as deployments.
+	AdmissionCapabilities *policy.Capabilities
+
+	// deployments records environment deployment lifecycles per job
+	// (memory-backed; DB persistence is deferred — see deployments.go).
+	deployments map[string]model.Deployment
+	// snapshots records uploaded workspace snapshots per run
+	// (memory-backed; DB persistence is deferred — see snapshots.go).
+	snapshots map[string]model.SnapshotRecord
 }
 
 func New(token string) *Server {
@@ -116,8 +135,10 @@ func New(token string) *Server {
 		Token: token, RunnerToken: token, AdminToken: token,
 		LeaseDuration: defaultLeaseDuration,
 		runs:          map[string]model.Run{}, jobs: map[string]model.Job{}, runners: map[string]model.Runner{}, artifacts: map[string]model.ArtifactRecord{}, reports: map[string]model.TestReport{}, deliveries: map[string]string{}, completions: map[string]model.CompletionReceipt{}, leaseKey: key, oidc: newOIDCSigner(),
-		outbox:    NewOutbox(nil),
-		AuthStore: auth.NewTokenStore(),
+		outbox:      NewOutbox(nil),
+		AuthStore:   auth.NewTokenStore(),
+		deployments: map[string]model.Deployment{},
+		snapshots:   map[string]model.SnapshotRecord{},
 	}
 }
 
@@ -298,10 +319,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/jobs/{id}/heartbeat", s.heartbeat)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/log", s.log)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/complete", s.complete)
+	mux.HandleFunc("POST /api/v1/jobs/{id}/snapshots", s.uploadSnapshot)
+	mux.HandleFunc("GET /api/v1/runs/{id}/snapshots", s.listSnapshots)
+	mux.HandleFunc("POST /api/v1/jobs/{id}/deployments", s.recordDeployment)
+	mux.HandleFunc("GET /api/v1/runs/{id}/deployments", s.listDeployments)
 	mux.HandleFunc("POST /api/v1/runners/register", s.register)
 	mux.HandleFunc("POST /api/v1/runners/enroll", s.enroll)
 	mux.HandleFunc("POST /api/v1/runners/{id}/next", s.next)
 	mux.HandleFunc("GET /api/v1/runners", s.listRunners)
+	mux.HandleFunc("POST /api/v1/runners/{id}/drain", s.runnerDrain)
+	mux.HandleFunc("POST /api/v1/runners/{id}/disable", s.runnerDisable)
+	mux.HandleFunc("POST /api/v1/runners/{id}/enable", s.runnerEnable)
 	mux.HandleFunc("GET /api/v1/audit", s.listAudit)
 	// The auth middleware runs inside statusLogger/recoverer and outside
 	// s.auth so authenticated principals are available to handlers; s.auth
@@ -331,7 +359,10 @@ func (s *Server) auth(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		runnerOnly := strings.HasPrefix(path, "/api/v1/runners/") || path == "/api/v1/runners/register" || strings.HasPrefix(path, "/api/v1/cache/") || (strings.HasPrefix(path, "/api/v1/jobs/") && (strings.Contains(path, "/artifacts/") || strings.HasSuffix(path, "/heartbeat") || strings.HasSuffix(path, "/log") || strings.HasSuffix(path, "/complete") || strings.HasSuffix(path, "/tests") || strings.HasSuffix(path, "/secrets")))
+		// Runner drain/disable/enable are admin-tier operations: a runner
+		// token must never be able to disable its peers or itself.
+		runnerAdminOp := strings.HasPrefix(path, "/api/v1/runners/") && (strings.HasSuffix(path, "/drain") || strings.HasSuffix(path, "/disable") || strings.HasSuffix(path, "/enable"))
+		runnerOnly := (!runnerAdminOp && strings.HasPrefix(path, "/api/v1/runners/")) || path == "/api/v1/runners/register" || strings.HasPrefix(path, "/api/v1/cache/") || (strings.HasPrefix(path, "/api/v1/jobs/") && (strings.Contains(path, "/artifacts/") || strings.HasSuffix(path, "/heartbeat") || strings.HasSuffix(path, "/log") || strings.HasSuffix(path, "/complete") || strings.HasSuffix(path, "/tests") || strings.HasSuffix(path, "/secrets") || strings.HasSuffix(path, "/snapshots")))
 		sharedRead := r.Method == http.MethodGet && (strings.HasPrefix(path, "/api/v1/artifacts/") || (strings.HasPrefix(path, "/api/v1/runs/") && strings.HasSuffix(path, "/artifacts")))
 		if sharedRead {
 			if s.AdminToken != "" && !bearerOK(r.Header.Get("Authorization"), s.AdminToken) && !bearerOK(r.Header.Get("Authorization"), s.RunnerToken) {
@@ -452,10 +483,15 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) enqueue(in SubmitRun) (model.Run, error) {
-	spec, err := pipeline.Parse([]byte(in.Pipeline))
+	// Server-side pipeline resolution: components are resolved and merged,
+	// inputs validated and injected, and the canonical pipeline text
+	// replaces the submission so every persisted job carries a
+	// self-contained, deterministic pipeline.
+	spec, pipelineText, componentDigests, err := s.resolvePipeline(context.Background(), in)
 	if err != nil {
 		return model.Run{}, err
 	}
+	in.Pipeline = pipelineText
 	g, err := pipeline.Compile(spec)
 	if err != nil {
 		return model.Run{}, err
@@ -463,6 +499,9 @@ func (s *Server) enqueue(in SubmitRun) (model.Run, error) {
 	caps := policy.DefaultUntrustedCapabilities()
 	if in.Trusted {
 		caps = policy.DefaultTrustedCapabilities()
+	}
+	if s.AdmissionCapabilities != nil {
+		caps = *s.AdmissionCapabilities
 	}
 	// The hard trust floor is applied after defaults; repository/org policy
 	// compilation lands in a later phase and will Intersect on top of these.
@@ -512,6 +551,8 @@ func (s *Server) enqueue(in SubmitRun) (model.Run, error) {
 			RequiredLabels: labelsForJob(cj.Job), Network: effectiveNetwork, Environment: env, ApprovalRequired: cj.Job.Environment.Approval, EnvironmentBranches: append([]string{}, cj.Job.Environment.Branches...), EnvironmentConcurrency: cj.Job.Environment.Concurrency, OIDCAllowed: cj.Job.Permissions.IDToken, OIDCAudiences: cloneStrings(oidcAudiences),
 			DeclaredSecrets: declaredSecrets(spec, cj.Job),
 			Status:          model.StatusQueued, Priority: scheduler.DownstreamDepth(g, key), MaxInfraRetries: infraRetries, CreatedAt: now,
+			PlacementRegions: append([]string{}, cj.Job.Placement.Regions...),
+			ComponentDigest:  componentDigests[cj.BaseID],
 		}
 	}
 
@@ -857,6 +898,11 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, gerr.Error(), 500)
 			return
 		}
+		// Re-registration must not clear admin state: a disabled runner
+		// stays disabled and a draining runner keeps draining until an
+		// admin re-enables it.
+		in.Disabled = old.Disabled || in.Disabled
+		in.Draining = old.Draining || in.Draining
 		if old.Registered.IsZero() {
 			in.Registered = now
 		} else {
@@ -886,6 +932,12 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	old := s.runners[in.ID]
+	// Re-registration must not clear admin state: a disabled runner stays
+	// disabled and a draining runner keeps draining until an admin
+	// re-enables it. Runners may also self-drain at registration
+	// (kiwi runner --drain).
+	in.Disabled = old.Disabled || in.Disabled
+	in.Draining = old.Draining || in.Draining
 	if old.Registered.IsZero() {
 		in.Registered = now
 	} else {
@@ -932,6 +984,145 @@ func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// runnerDrain marks a runner as draining: it finishes its active jobs and
+// receives no new leases. next() advertises the state via the
+// X-Kiwi-Draining header so a drained runner exits its poll loop.
+func (s *Server) runnerDrain(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if s.DB != nil {
+		ri, err := s.DB.GetRunner(r.Context(), id)
+		if errors.Is(err, storage.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		ri.Draining = true
+		if err := s.DB.UpsertRunner(r.Context(), ri); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		s.auditLocked("runner.drain", actorFrom(r), "", "", "runner draining", map[string]string{"runner": id})
+		writeJSON(w, http.StatusOK, ri)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ri, ok := s.runners[id]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	ri.Draining = true
+	s.runners[id] = ri
+	s.auditLocked("runner.drain", actorFrom(r), "", "", "runner draining", map[string]string{"runner": id})
+	_ = s.persistLocked()
+	writeJSON(w, http.StatusOK, ri)
+}
+
+// runnerDisable takes a runner out of service: it is marked disabled, its
+// active jobs are cancelled with "runner disabled", and next() refuses to
+// lease to it. Re-registration cannot clear the flag. NOTE: in mTLS mode the
+// runner's certificate serial should also be revoked (runnerpki revocation
+// is not persisted yet — deferred).
+func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	actor := actorFrom(r)
+	if s.DB != nil {
+		ri, err := s.DB.GetRunner(r.Context(), id)
+		if errors.Is(err, storage.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		ri.Disabled = true
+		if err := s.DB.UpsertRunner(r.Context(), ri); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		// TODO: cancel the runner's active jobs in DB mode (per-job
+		// cancellation is not exposed by the scheduler yet).
+		s.auditLocked("runner.disable", actor, "", "", "runner disabled", map[string]string{"runner": id})
+		writeJSON(w, http.StatusOK, ri)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ri, ok := s.runners[id]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	ri.Disabled = true
+	now := time.Now().UTC()
+	for jobID, j := range s.jobs {
+		if j.Status != model.StatusRunning || j.LeaseRunnerID != id {
+			continue
+		}
+		j.Status = model.StatusCancelled
+		j.Error = "runner disabled"
+		j.FinishedAt = &now
+		j.LeaseRunnerID = ""
+		j.LeaseTokenHash = nil
+		j.LeaseExpiresAt = nil
+		s.jobs[jobID] = j
+	}
+	ri.ActiveJobs = nil
+	ri.Busy = false
+	ri.CurrentJob = ""
+	s.runners[id] = ri
+	for runID := range s.runs {
+		s.refreshRunLocked(runID)
+	}
+	s.auditLocked("runner.disable", actor, "", "", "runner disabled", map[string]string{"runner": id})
+	_ = s.persistLocked()
+	writeJSON(w, http.StatusOK, ri)
+}
+
+// runnerEnable returns a runner to service, clearing both the disabled and
+// draining flags.
+func (s *Server) runnerEnable(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if s.DB != nil {
+		ri, err := s.DB.GetRunner(r.Context(), id)
+		if errors.Is(err, storage.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		ri.Disabled = false
+		ri.Draining = false
+		if err := s.DB.UpsertRunner(r.Context(), ri); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		s.auditLocked("runner.enable", actorFrom(r), "", "", "runner enabled", map[string]string{"runner": id})
+		writeJSON(w, http.StatusOK, ri)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ri, ok := s.runners[id]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	ri.Disabled = false
+	ri.Draining = false
+	s.runners[id] = ri
+	s.auditLocked("runner.enable", actorFrom(r), "", "", "runner enabled", map[string]string{"runner": id})
+	_ = s.persistLocked()
+	writeJSON(w, http.StatusOK, ri)
+}
+
 func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !s.verifyRunnerIdentity(r, id) {
@@ -956,6 +1147,25 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	if ri.Capacity < 1 {
 		ri.Capacity = 1
 	}
+	// Disabled runners receive no leases at all: their active jobs were
+	// cancelled at disable time, and re-registering cannot clear the flag.
+	if ri.Disabled {
+		w.Header().Set("X-Kiwi-Disabled", "true")
+		s.runners[id] = ri
+		_ = s.persistLocked()
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	// Draining runners finish their active jobs but take no new work. The
+	// response header lets a runner that has no active work exit its poll
+	// loop instead of spinning forever.
+	if ri.Draining {
+		w.Header().Set("X-Kiwi-Draining", "true")
+		s.runners[id] = ri
+		_ = s.persistLocked()
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if len(ri.ActiveJobs) >= ri.Capacity {
 		ri.Busy = true
 		s.runners[id] = ri
@@ -971,7 +1181,10 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 		if !labelsSatisfied(ri.Labels, j.RequiredLabels) {
 			continue
 		}
-		if scheduler.EnvironmentAtCapacity(j, s.jobs) {
+		if !regionSatisfied(ri.Region, j.PlacementRegions) {
+			continue
+		}
+		if environmentAtCapacityScoped(j, s.jobs) {
 			continue
 		}
 		candidates = append(candidates, j)
@@ -1026,6 +1239,9 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	ri.LastSeen = now
 	s.runners[id] = ri
 	s.refreshRunLocked(j.RunID)
+	if j.Environment != "" {
+		s.recordDeploymentLocked(j, now)
+	}
 	s.auditLocked("job.leased", ri.Name, j.RunID, j.ID, "job leased", map[string]string{"job": j.Key, "generation": strconv.FormatInt(j.LeaseGeneration, 10)})
 	_ = s.persistLocked()
 	// The raw token travels on the wire once; the hash is not needed by the
@@ -1038,13 +1254,27 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 
 // nextDB leases through the PostgreSQL scheduler. No in-memory lock is held:
 // the SQL rows are authoritative and the store serializes competing claims.
+// Runner admission (disabled/draining) is checked here; region filtering is
+// not yet applied in the SQL lease pass (TODO: push placement regions into
+// the scheduler's candidate query).
 func (s *Server) nextDB(w http.ResponseWriter, r *http.Request, id string) {
 	ctx := r.Context()
-	if _, err := s.DB.GetRunner(ctx, id); errors.Is(err, storage.ErrNotFound) {
+	ri, err := s.DB.GetRunner(ctx, id)
+	if errors.Is(err, storage.ErrNotFound) {
 		http.Error(w, "runner not registered", http.StatusNotFound)
 		return
 	} else if err != nil {
 		http.Error(w, err.Error(), 500)
+		return
+	}
+	if ri.Disabled {
+		w.Header().Set("X-Kiwi-Disabled", "true")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if ri.Draining {
+		w.Header().Set("X-Kiwi-Draining", "true")
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	j, rawToken, exp, err := s.Sched.Lease(ctx, id, time.Now().UTC())
@@ -1285,6 +1515,11 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	s.recordCompletionReceiptLocked(jobID, in.LeaseGeneration, in.RunnerID, hash)
 	runID := j.RunID
 	s.jobs[jobID] = j
+	if d, ok := s.deployments[jobID]; ok {
+		d.Status = j.Status
+		d.FinishedAt = j.FinishedAt
+		s.deployments[jobID] = d
+	}
 	s.releaseRunnerLocked(in.RunnerID, j.ID, j.Status)
 	s.auditLocked("job.completed", in.RunnerID, runID, j.ID, string(j.Status), map[string]string{"job": j.Key})
 	s.scheduleStateLocked()
@@ -1754,7 +1989,9 @@ func (s *Server) applyQueueReasonsLocked(ri model.Runner) {
 				reason = queue.WaitingDependency
 			case !labelsSatisfied(ri.Labels, j.RequiredLabels):
 				reason = queue.NoCompatibleRunner
-			case scheduler.EnvironmentAtCapacity(j, s.jobs):
+			case !regionSatisfied(ri.Region, j.PlacementRegions):
+				reason = queue.RegionUnavailable
+			case environmentAtCapacityScoped(j, s.jobs):
 				reason = queue.EnvironmentLocked
 			}
 		}
@@ -2007,6 +2244,47 @@ func labelsSatisfied(have, need []string) bool {
 		}
 	}
 	return true
+}
+
+// regionSatisfied reports whether a runner in the given region may take a
+// job: a job with placement regions only leases to a runner whose region is
+// in the set. Runners without a region and jobs without region constraints
+// are unaffected (label matching is unchanged).
+func regionSatisfied(region string, allowed []string) bool {
+	if len(allowed) == 0 || region == "" {
+		return true
+	}
+	for _, a := range allowed {
+		if a == region {
+			return true
+		}
+	}
+	return false
+}
+
+// environmentAtCapacityScoped is the scheduling-time environment concurrency
+// gate. The concurrency key is repo+environment: an environment name is not
+// a global lock across repositories. Kept in the server so next() and the
+// queue-reason pass share one rule; the SQL lease pass still uses the
+// scheduler's unscoped check (TODO: push the scoped key into the scheduler).
+func environmentAtCapacityScoped(j model.Job, jobs map[string]model.Job) bool {
+	if j.Environment == "" || j.EnvironmentConcurrency <= 0 {
+		return false
+	}
+	active := 0
+	for _, other := range jobs {
+		if other.ID == j.ID || other.Status != model.StatusRunning {
+			continue
+		}
+		if other.Environment != j.Environment || other.RepoURL != j.RepoURL {
+			continue
+		}
+		active++
+		if active >= j.EnvironmentConcurrency {
+			return true
+		}
+	}
+	return false
 }
 func validJobOutputs(in map[string]string) bool {
 	if len(in) > 256 {

@@ -93,6 +93,13 @@ type Job struct {
 	// a queue.QueueReason code (e.g. WAITING_DEPENDENCY, NO_COMPATIBLE_RUNNER)
 	// set by the control plane's scheduling pass; empty means no reason.
 	QueueReason string `json:"queue_reason,omitempty"`
+	// PlacementRegions is the job's placement.regions list resolved at
+	// enqueue; scheduling filters runners by it (see [71]).
+	PlacementRegions []string `json:"placement_regions,omitempty"`
+	// ComponentDigest records the content digest of the resolved component
+	// the job was built from, when the job was declared via
+	// `component: name@sha256:...`. Empty for regular jobs.
+	ComponentDigest string `json:"component_digest,omitempty"`
 }
 
 type Runner struct {
@@ -210,4 +217,47 @@ type CompletionReceipt struct {
 	Generation int64  `json:"generation"`
 	RunnerID   string `json:"runner_id"`
 	ResultHash string `json:"result_hash"`
+}
+
+// Deployment is the server-side record of one environment deployment. It is
+// created when a job targeting an environment starts (or explicitly via
+// POST /api/v1/jobs/{id}/deployments) and follows the job's lifecycle.
+type Deployment struct {
+	ID          string     `json:"id"`
+	RunID       string     `json:"run_id"`
+	JobID       string     `json:"job_id"`
+	Repository  string     `json:"repository,omitempty"`
+	Environment string     `json:"environment,omitempty"`
+	URL         string     `json:"url,omitempty"`
+	Commit      string     `json:"commit,omitempty"`
+	Status      Status     `json:"status"`
+	ApprovedBy  string     `json:"approved_by,omitempty"`
+	ApprovedAt  *time.Time `json:"approved_at,omitempty"`
+	StartedAt   *time.Time `json:"started_at,omitempty"`
+	FinishedAt  *time.Time `json:"finished_at,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+}
+
+// SnapshotEntry is one regular file in a workspace snapshot manifest.
+type SnapshotEntry struct {
+	Path   string `json:"path"`
+	Mode   uint32 `json:"mode"`
+	Size   int64  `json:"size"`
+	SHA256 string `json:"sha256"`
+}
+
+// SnapshotRecord is the server-side record of an uploaded workspace
+// snapshot: the archive location, its digest, and the entry manifest.
+type SnapshotRecord struct {
+	ID         string          `json:"id"`
+	RunID      string          `json:"run_id"`
+	JobID      string          `json:"job_id"`
+	JobKey     string          `json:"job_key"`
+	Path       string          `json:"path,omitempty"`
+	Size       int64           `json:"size"`
+	SHA256     string          `json:"sha256"`
+	Version    int             `json:"version"`
+	RootSHA256 string          `json:"root_sha256"`
+	Entries    []SnapshotEntry `json:"entries,omitempty"`
+	CreatedAt  time.Time       `json:"created_at"`
 }

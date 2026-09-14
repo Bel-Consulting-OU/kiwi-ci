@@ -36,6 +36,8 @@ func main() {
 		err = app.Server(ctx, os.Args[2:])
 	case "runner":
 		err = app.Runner(ctx, os.Args[2:])
+	case "dispatch":
+		err = app.Dispatch(ctx, os.Args[2:])
 	case "database":
 		err = databaseCommand(ctx, os.Args[2:])
 	case "version", "--version", "-v":
@@ -80,7 +82,9 @@ Usage:
   kiwi doctor
   kiwi server   [--listen :8080] [--mode dev|production] [--database-url URL]
   kiwi database migrate|status --database-url URL
-  kiwi runner   --server http://127.0.0.1:8080 --token TOKEN
+  kiwi runner   --server http://127.0.0.1:8080 --token TOKEN [--drain]
+  kiwi runner list|drain|disable|enable --server URL --token ADMIN_TOKEN [RUNNER_ID]
+  kiwi dispatch --repo owner/name --ref main --input k=v --pipeline FILE
   kiwi version
 
 Design goals:

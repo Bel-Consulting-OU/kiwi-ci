@@ -64,6 +64,9 @@ type Config struct {
 	// EnrollToken bootstraps the mTLS identity: with a CA configured but no
 	// client certificate, the runner enrolls a fresh key with this token.
 	EnrollToken string
+	// Drain makes the runner register as draining: it takes no new jobs,
+	// finishes its active work, and exits once its slots are free.
+	Drain bool
 }
 type Runner struct {
 	Cfg    Config
@@ -105,12 +108,19 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	done := make(chan struct{}, r.Cfg.Concurrency)
 	active := 0
+	// Draining starts from the local --drain flag; the server may also
+	// advertise the state on next() responses (an admin drained the runner
+	// remotely), which flips this to true mid-run.
+	draining := r.Cfg.Drain
 	for {
 		// Fill every free local execution slot before sleeping. The control plane
 		// independently capacity-checks this runner, so a race cannot over-lease it.
 		for active < r.Cfg.Concurrency {
-			task, err := r.next(ctx)
+			task, drainSignal, err := r.next(ctx)
 			if err != nil || task == nil {
+				if drainSignal {
+					draining = true
+				}
 				break
 			}
 			active++
@@ -118,6 +128,10 @@ func (r *Runner) Run(ctx context.Context) error {
 				r.execute(ctx, t)
 				done <- struct{}{}
 			}(*task)
+		}
+		if draining && active == 0 {
+			fmt.Printf("kiwi runner %s drained: no active work, exiting\n", r.ID)
+			return nil
 		}
 		select {
 		case <-ctx.Done():
@@ -151,6 +165,7 @@ func (r *Runner) register(ctx context.Context) error {
 		Version:      RunnerVersion,
 		Region:       os.Getenv(envRunnerRegion),
 		Capabilities: capabilities,
+		Draining:     r.Cfg.Drain,
 	}
 	var out model.Runner
 	if err := r.post(ctx, "/api/v1/runners/register", in, &out); err != nil {
@@ -160,29 +175,33 @@ func (r *Runner) register(ctx context.Context) error {
 	fmt.Printf("kiwi runner %s registered (%s/%s) labels=%s\n", r.ID, runtime.GOOS, runtime.GOARCH, strings.Join(out.Labels, ","))
 	return nil
 }
-func (r *Runner) next(ctx context.Context) (*server.Task, error) {
+
+// next polls for work. The boolean reports the server's drain signal
+// (X-Kiwi-Draining on a 204): the runner is draining and should exit once
+// its active slots are free.
+func (r *Runner) next(ctx context.Context) (*server.Task, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.Cfg.Server+"/api/v1/runners/"+r.ID+"/next", bytes.NewReader([]byte("{}")))
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	r.auth(req)
 	resp, err := r.Client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNoContent {
-		return nil, nil
+		return nil, resp.Header.Get("X-Kiwi-Draining") == "true", nil
 	}
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("next: %s: %s", resp.Status, b)
+		return nil, false, fmt.Errorf("next: %s: %s", resp.Status, b)
 	}
 	var t server.Task
 	if err := json.NewDecoder(resp.Body).Decode(&t); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return &t, nil
+	return &t, false, nil
 }
 
 func (r *Runner) execute(parent context.Context, t server.Task) {

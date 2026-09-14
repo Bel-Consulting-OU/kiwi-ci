@@ -93,7 +93,7 @@ func TestMTLSEnrollAndRegister(t *testing.T) {
 	if r.ID != "runner-test-1" {
 		t.Fatalf("runner id changed: %q", r.ID)
 	}
-	if _, err := r.next(ctx); err != nil {
+	if _, _, err := r.next(ctx); err != nil {
 		t.Fatalf("next over mTLS: %v", err)
 	}
 }
