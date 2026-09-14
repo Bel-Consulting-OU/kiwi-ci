@@ -61,10 +61,9 @@ its DSSE signature against the server JWKS, binding the subject digest.
 ## Transport
 
 Artifact bytes travel through `PUT /api/v1/jobs/{id}/artifacts/{name}`
-with integrity hashes checked by the server, and are stored in the
-blob backend (`fs` or `s3`). Wiring artifact transport through the
-CAS layer (so a payload shared with cache entries is stored once) is a
-known deferred item; today the artifact endpoint stores its own copy.
+with integrity hashes checked by the server, staged to a temporary
+blob, and committed atomically only after the metadata transaction
+succeeds — clients never observe half-created artifacts.
 
 ## Limits
 

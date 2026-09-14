@@ -35,9 +35,9 @@ up out-of-band with restricted access. Losing them:
 
 - **lease.key** — running leases become unverifiable; cancel all runs
   and restart clean. A new key is generated on next start.
-- **oidc-ed25519.key** — issued tokens become unverifiable; providers
-  must be reconfigured for the new key (see [oidc.md](oidc.md) for the
-  rotation TODO).
+- **oidc-keyring.json** — issued tokens become unverifiable; providers
+  must be reconfigured for the new keys (see [oidc.md](oidc.md) for the
+  rotation model).
 - **runner CA** — enrolled runners fail mTLS; re-enroll or reload the
   CA from backup.
 

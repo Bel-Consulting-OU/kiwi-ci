@@ -1,7 +1,8 @@
 // Package snapshot captures and restores workspace snapshots: a
 // deterministic tar.gz of the workspace plus a manifest of per-entry
 // digests. Snapshots are the substrate for workspace replay (kiwi replay,
-// deferred) and for cross-job workspace handoff.
+// which restores the exact snapshot then re-executes the resolved job) and
+// for cross-job workspace handoff.
 //
 // Only regular files are captured; symlinks, devices and other special
 // files are never archived, and extraction goes through the hardened safefs

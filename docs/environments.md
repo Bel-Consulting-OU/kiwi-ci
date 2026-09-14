@@ -62,10 +62,11 @@ time, approving actor, commit, and final status. Records are exposed
 via `POST /api/v1/jobs/{id}/deployments` (explicit record creation) and
 `GET /api/v1/runs/{id}/deployments` (listing).
 
-## Current limitations
+## Persistence
 
-Deployment and snapshot records persist in server memory (DB
-persistence is deferred), so a restart loses the record history even
-though scheduling semantics are enforced. Keep deployment capability on
-dedicated runner pools and use environment concurrency to serialize
-production deployments.
+Deployment records persist durably: through `DeploymentStore` in
+PostgreSQL mode, and through the data-dir state file in filesystem
+mode. Snapshot records persist through `SnapshotStore` in DB mode and
+the state file otherwise. Keep deployment capability on dedicated
+runner pools and use environment concurrency to serialize production
+deployments.

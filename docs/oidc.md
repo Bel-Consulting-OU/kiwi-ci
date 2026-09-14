@@ -46,20 +46,24 @@ Ed25519-signed ID token with:
 
 ## Key material
 
-The signing key is a persisted Ed25519 key (`oidc-ed25519.key` in the
-data directory) so tokens survive restarts. The `kid` is derived from
-the public key.
+The signing key material is a persisted Ed25519 key ring
+(`oidc-keyring.json` in the data directory) so tokens survive restarts.
+Each key carries a 32-hex `kid` derived from 16 bytes of `crypto/rand`.
 
-## TODO: rotation
+## Rotation
 
-Key rotation is not implemented. The current model is a single active
-key with no previous-verification window:
+Key rotation is fully implemented:
 
-- `kid`-indexed active and previous verification keys;
-- `not-before` / `retire-after` timestamps;
-- retire, then verify, then delete, so the trust root is never
-  replaced atomically;
-- `Cache-Control`/`ETag` on the JWKS document.
+- active + previous verification keys, each `kid`-indexed;
+- `not-before` / `retire-after` timestamps (previous keys stay
+  verifiable for 72h after rotation);
+- active keys older than 30 days rotate automatically at issuance;
+- the trust root is never replaced atomically — previous keys remain in
+  the JWKS until retired;
+- the JWKS document serves `Cache-Control: public, max-age=300` and an
+  `ETag` with `If-None-Match` 304 handling;
+- every issuance is audited (`oidc.issued`) with job, audience, and
+  `kid` metadata.
 
-Until rotation lands, plan for a short provider-side trust window when
-the key must be replaced.
+Legacy single-key files (`oidc-ed25519.key`) migrate into the ring on
+load, keeping their sha256-derived `kid`.

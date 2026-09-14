@@ -125,11 +125,13 @@ The embedded dashboard listens on the server address (`GET /`). Admin
 login uses the admin token (`POST /api/v1/login`) with HMAC-signed
 session cookies and CSRF protection.
 
-## What production does not do yet
+## Production capabilities
 
-- Server-side schedules (cron) — the CLI scaffold exists, firing is
-  deferred.
-- OIDC signing-key rotation — see [oidc.md](oidc.md).
-- OpenTelemetry export — the endpoint is accepted but a no-op.
-- Deployment and snapshot records persist only in memory (DB
-  persistence deferred); the scheduling semantics are enforced.
+- Server-side schedules: cron-parsed, leader-gated firing with
+  exactly-once nominal occurrence claims (`schedule_occurrences`).
+- OIDC signing-key rotation: active + previous verification keys with
+  retire-after windows — see [oidc.md](oidc.md).
+- OpenTelemetry export: OTLP/HTTP traces for requests, forge intake,
+  enqueue, lease, and completion spans.
+- Deployment and snapshot records persist durably (PostgreSQL or
+  data-dir state file); scheduling semantics are enforced either way.

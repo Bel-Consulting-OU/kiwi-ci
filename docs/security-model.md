@@ -89,12 +89,12 @@ accepted.
 
 ## OIDC
 
-The control plane is an OIDC issuer (Ed25519, single key) with discovery
+The control plane is an OIDC issuer (Ed25519 key ring) with discovery
 at `/.well-known/openid-configuration` and JWKS at
 `/api/v1/oidc/jwks`. Tokens are audience-scoped and issued per job under
 an active lease. Untrusted jobs cannot request tokens, and audiences are
-policy-controlled. Key rotation is not implemented yet; see
-[oidc.md](oidc.md).
+policy-controlled. Keys rotate automatically (30-day active lifetime) with
+a 72-hour previous-verification window; see [oidc.md](oidc.md).
 
 ## AuthN/AuthZ for operators
 

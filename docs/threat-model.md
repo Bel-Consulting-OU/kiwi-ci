@@ -17,7 +17,7 @@ privilege). Status: **Mitigated** (implemented and tested), **Partial**
 | Rootless promise not honored by daemon | E | `docker info` verification refuses rootful daemons | Mitigated |
 | SSH host spoofing on Tart | S | Host authentication not disabled; workspace mounted and commands run over authenticated channel | Mitigated |
 | Oversized output line deadlocks job | D | Streaming splitter drains continuously; truncation markers | Mitigated |
-| Windows cancellation kills only the shell | D | Process-group termination helper; Job Object killing is deferred | Partial |
+| Windows cancellation kills only the shell | D | Kill-on-close Job Object assigned to every child process | Mitigated |
 | Cache/artifact archive escapes workspace | T/E | `safefs` extraction: no symlinks/hardlinks/devices, duplicate/`..`/absolute rejection, size/depth/ratio limits, declared roots only | Mitigated |
 | Step output file read through host-side symlink | T/E | Outputs read inside the sandbox via the backend, capped at 1 MiB | Mitigated |
 | Native backend executes anything | E | Policy: native denied for untrusted pipelines; trusted-only capability | Mitigated |
@@ -56,7 +56,7 @@ privilege). Status: **Mitigated** (implemented and tested), **Partial**
 | Audit trail forged or lost | R | Server-side audit events with principal actor; DB-mode append failures logged, never silently dropped | Mitigated |
 | Multi-instance divergence | T | Postgres is the source of truth in DB mode; in-memory maps dev-only | Mitigated |
 | State snapshot corruption (fs mode) | T | Atomic temp+rename snapshot; append-only logs | Mitigated (dev scope) |
-| Schedules fired twice | T | Schedule idempotency key by (schedule ID, nominal time) defined; server-side firing deferred | Deferred |
+| Schedules fired twice | T | Nominal occurrence claims idempotent by (schedule ID, nominal) across restarts and leaders | Mitigated |
 
 ## Secrets
 
@@ -83,7 +83,7 @@ privilege). Status: **Mitigated** (implemented and tested), **Partial**
 | Threat | Class | Mitigation | Status |
 |---|---|---|---|
 | Token minted for wrong audience | E | Audience allowlist per policy; per-job subject | Mitigated |
-| Key compromise with no rotation path | T/I | Single Ed25519 key persisted in data dir; rotation not implemented | Deferred |
+| Key compromise with no rotation path | T/I | Key ring with 30-day active rotation and 72h previous-verification window | Mitigated |
 | Issuer spoofing via lookalike URL | S | Scheme must be `https://` (exact loopback allowed for dev) | Mitigated |
 
 ## Residual risks to track
