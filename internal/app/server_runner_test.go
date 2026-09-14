@@ -1,6 +1,7 @@
 package app
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -87,13 +88,14 @@ func containsStr(s, sub string) bool {
 
 // fakeDrainServer is a drainableServer test double.
 type fakeDrainServer struct {
-	active  int
-	reason  string
+	active  atomic.Int64
 	drained bool
+	reason  string
 }
 
 func (f *fakeDrainServer) BeginDrain(reason string) { f.drained = true; f.reason = reason }
-func (f *fakeDrainServer) ActiveJobs() int          { return f.active }
+func (f *fakeDrainServer) ActiveJobs() int          { return int(f.active.Load()) }
+func (f *fakeDrainServer) setActive(n int)          { f.active.Store(int64(n)) }
 
 func TestWaitForDrainIdle(t *testing.T) {
 	s := &fakeDrainServer{}
@@ -103,10 +105,11 @@ func TestWaitForDrainIdle(t *testing.T) {
 }
 
 func TestWaitForDrainCompletesWhenJobsFinish(t *testing.T) {
-	s := &fakeDrainServer{active: 2}
+	s := &fakeDrainServer{}
+	s.setActive(2)
 	go func() {
 		time.Sleep(150 * time.Millisecond)
-		s.active = 0
+		s.setActive(0)
 	}()
 	if !waitForDrain(s, 2*time.Second) {
 		t.Fatal("drain must complete once active jobs reach zero")
@@ -114,7 +117,8 @@ func TestWaitForDrainCompletesWhenJobsFinish(t *testing.T) {
 }
 
 func TestWaitForDrainTimesOut(t *testing.T) {
-	s := &fakeDrainServer{active: 1}
+	s := &fakeDrainServer{}
+	s.setActive(1)
 	if waitForDrain(s, 100*time.Millisecond) {
 		t.Fatal("drain with active jobs must time out")
 	}

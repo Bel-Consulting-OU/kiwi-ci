@@ -125,9 +125,10 @@ type Server struct {
 	ComponentRegistry components.Registry
 
 	// AdmissionCapabilities, when non-nil, overrides the trust-default
-	// capabilities used for pipeline admission. This is the seam repository
-	// and organization policy compilation plugs into (a later phase);
-	// tests use it to grant capabilities such as deployments.
+	// capabilities used for pipeline admission. The loaded organization
+	// policy file (Policy) is intersected — and its explicit grants
+	// applied — on top of this; tests use the field to grant capabilities
+	// such as deployments directly.
 	AdmissionCapabilities *policy.Capabilities
 
 	// Policy is the loaded organization policy file; its repository
@@ -169,11 +170,13 @@ type Server struct {
 	// without new entries (default 30s).
 	LogStreamIdleTimeout time.Duration
 
-	// deployments records environment deployment lifecycles per job
-	// (memory-backed; DB persistence is deferred — see deployments.go).
+	// deployments records environment deployment lifecycles per job. It is
+	// the dev-mode mirror: DB mode persists through DeploymentStore (see
+	// deployments.go).
 	deployments map[string]model.Deployment
-	// snapshots records uploaded workspace snapshots per run
-	// (memory-backed; DB persistence is deferred — see snapshots.go).
+	// snapshots records uploaded workspace snapshots per run. It is the
+	// dev-mode mirror: DB mode persists through SnapshotStore (see
+	// snapshots.go).
 	snapshots map[string]model.SnapshotRecord
 
 	// dataDir is the persistent state root ("" for in-memory servers).
@@ -1556,8 +1559,8 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(candidates) == 0 {
 		// Explainable queueing: annotate every waiting job with the reason
-		// it is not leasable by this runner. In-memory mode only; the DB
-		// scheduler records its own reasons (TODO: parity pass).
+		// it is not leasable by this runner. In-memory mode; nextDB applies
+		// the same rules through applyQueueReasonsDB.
 		s.applyQueueReasonsLocked(ri)
 		s.runners[id] = ri
 		_ = s.persistLocked()
@@ -1627,9 +1630,8 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 
 // nextDB leases through the PostgreSQL scheduler. No in-memory lock is held:
 // the SQL rows are authoritative and the store serializes competing claims.
-// Runner admission (disabled/draining) is checked here; region filtering is
-// not yet applied in the SQL lease pass (TODO: push placement regions into
-// the scheduler's candidate query).
+// Runner admission (disabled/draining) is checked here; placement-region
+// filtering happens inside scheduler.Lease against the runner's region.
 func (s *Server) nextDB(w http.ResponseWriter, r *http.Request, id string) {
 	ctx := r.Context()
 	ri, err := s.DB.GetRunner(ctx, id)
@@ -2740,10 +2742,10 @@ func regionSatisfied(region string, allowed []string) bool {
 }
 
 // environmentAtCapacityScoped is the scheduling-time environment concurrency
-// gate. The concurrency key is repo+environment: an environment name is not
-// a global lock across repositories. Kept in the server so next() and the
-// queue-reason pass share one rule; the SQL lease pass still uses the
-// scheduler's unscoped check (TODO: push the scoped key into the scheduler).
+// gate for in-memory mode. The concurrency key is repo+environment: an
+// environment name is not a global lock across repositories. The SQL lease
+// pass applies the identical repo-scoped rule via
+// Store.ListJobsByEnvironment inside scheduler.Lease.
 func environmentAtCapacityScoped(j model.Job, jobs map[string]model.Job) bool {
 	if j.Environment == "" || j.EnvironmentConcurrency <= 0 {
 		return false

@@ -88,38 +88,11 @@ extensions not yet implemented.
 
 ## P1 — remaining
 
-- Server-side schedules: cron storage, leader-fired occurrences, and
-  the `kiwi schedules` implementation (idempotency keys already exist
-  in `internal/trigger`).
-- Live TUI with searchable, virtualized, collapsible logs.
-- OpenTelemetry traces and export (endpoint currently accepted as a
-  no-op).
-- Replay CLI: wire `kiwi` completion-replay tooling over the existing
-  generation-bound receipts.
-- Artifact transport through the CAS layer so payloads shared with
-  cache entries are stored once.
-- Nightly fuzz CI for the parser, expression engine, and `safefs`
-  extraction.
-- OIDC signing-key rotation with a previous-verification window.
-- Deployment and snapshot record persistence in PostgreSQL (currently
-  memory-backed).
-- Windows Job Object cancellation for full descendant killing.
-- SBOM attachment and Sigstore-style signature verification gates.
-- Pipeline debugger: rerun one failed step against the exact workspace
-  snapshot.
-- Repository/organization policy file compilation (the
-  `AdmissionCapabilities` seam exists; policy files are not compiled
-  yet).
-- Job-level heterogeneous runners across one DAG with
-  runner-to-runner artifact/CAS transfer.
-- Dynamic pipelines: typed generated child graphs end-to-end
-  (`generate` parsed and validated; execution wiring incomplete).
-- Cross-repository downstream pipelines end-to-end (`downstream`
-  parsed and validated; execution wiring incomplete).
 - Concurrency groups beyond supersession (queue serialization of
   in-progress groups).
-- Scheduled/manual/API event parity for trigger matching (manual and
-  API paths exist; scheduled firing does not).
+- Pipeline debugger beyond `kiwi replay RUN JOB [STEP]`: interactive
+  per-step diffing against the snapshot.
+- OpenTelemetry metrics/logs export in addition to traces.
 
 ## P2 — governance and observability
 

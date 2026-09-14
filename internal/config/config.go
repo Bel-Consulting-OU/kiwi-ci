@@ -80,7 +80,7 @@ type PolicyConfig struct {
 
 type ObservabilityConfig struct {
 	// OTelEndpoint is accepted for forward compatibility; OpenTelemetry
-	// export is not implemented yet (no-op).
+	// endpoint receives OTLP/HTTP traces from the control plane.
 	OTelEndpoint string `toml:"otel_endpoint"`
 	// MetricsListen optionally serves /metrics on a separate address.
 	MetricsListen string `toml:"metrics_listen"`

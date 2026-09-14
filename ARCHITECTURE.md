@@ -73,8 +73,9 @@ forge webhook → verify + dedupe → fetch pipeline (base commit for forks)
 20. `internal/forge` — GitHub, GitLab, and Forgejo adapters: webhook
     verification, event parsing, file/diff fetching, trigger matching,
     check/status publishing, GitHub App auth.
-21. `internal/trigger` — trigger matching and schedule idempotency keys
-    (server-side firing deferred).
+21. `internal/trigger` — trigger matching and schedule idempotency keys;
+    `internal/server/schedules.go` fires leader-gated occurrences with
+    exactly-once nominal claims.
 22. `internal/importer` — migration importers for GitHub Actions,
     GitLab CI, CircleCI, and Woodpecker.
 23. `internal/impact` — monorepo package graphs and affected-package

@@ -31,10 +31,16 @@ type Options struct {
 	// workspace. A nil value keeps the single Workspace directory for
 	// every job (historical behavior; distributed runners pass fresh
 	// per-task clones instead).
-	WorkspaceFor     func(jobID string) (string, func(), error)
-	RunID            string
-	MaxParallel      int
-	OnlyJob          string
+	WorkspaceFor func(jobID string) (string, func(), error)
+	RunID        string
+	MaxParallel  int
+	OnlyJob      string
+	// OnlyStep, when set, executes just the named step (by step ID or by
+	// resolved name, including canary./verify./rollback. prefixes) of the
+	// selected job. Used by `kiwi replay RUN JOB STEP`. Steps that do not
+	// match are skipped without side effects; the matched step runs with
+	// dependency outputs interpolated as in the full job.
+	OnlyStep         string
 	Event            string
 	Branch           string
 	ChangedFiles     []string
@@ -348,6 +354,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	// the new status (always(), failure(), cancelled(), ...) still run.
 	currentStatus := model.StatusSuccess
 	var cleanupCtx context.Context
+	matchedStep := false
 	for i, st := range effectiveSteps(cj) {
 		st.Name = pipeline.InterpolateOutputs(st.Name, needsOutputs, stepOutputs)
 		st.Run = pipeline.InterpolateOutputs(st.Run, needsOutputs, stepOutputs)
@@ -357,6 +364,15 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		name := st.Name
 		if name == "" {
 			name = fmt.Sprintf("step-%d", i+1)
+		}
+		if e.Opt.OnlyStep != "" && st.ID != e.Opt.OnlyStep && name != e.Opt.OnlyStep {
+			e.log(cj.ID, "replay", "skipped "+name+" (replaying only "+e.Opt.OnlyStep+")")
+			continue
+		}
+		matchedStep = true
+		if e.Opt.OnlyStep != "" && st.ID != e.Opt.OnlyStep && name != e.Opt.OnlyStep {
+			e.log(cj.ID, "replay", "skipped "+name+" (replaying only "+e.Opt.OnlyStep+")")
+			continue
 		}
 		ok, er := pipeline.Eval(defaultCondition(st.If), pipeline.EvalContext{Status: currentStatus, Env: cj.Job.Env, Event: e.Opt.Event, Branch: e.Opt.Branch})
 		if er != nil {
@@ -522,6 +538,11 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 				res.Error = runErr.Error()
 			}
 		}
+	}
+	if e.Opt.OnlyStep != "" && !matchedStep {
+		res.Status = model.StatusFailure
+		res.Error = fmt.Sprintf("step %q not found in job", e.Opt.OnlyStep)
+		return finish(res)
 	}
 	if currentStatus == model.StatusSuccess {
 		for _, c := range cj.Job.Cache {

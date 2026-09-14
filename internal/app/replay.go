@@ -24,7 +24,7 @@ import (
 // workspace; the pipeline file recompiles to the same resolved job. Secrets
 // are freshly authorized from the local provider — never captured.
 //
-// Usage: kiwi replay RUN JOB --server URL --token TOKEN --pipeline FILE
+// Usage: kiwi replay RUN JOB [STEP] --server URL --token TOKEN --pipeline FILE
 func Replay(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("replay", flag.ContinueOnError)
 	server := fs.String("server", os.Getenv("KIWI_SERVER"), "control plane URL")
@@ -33,13 +33,17 @@ func Replay(ctx context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 2 {
-		return fmt.Errorf("usage: kiwi replay RUN JOB --server URL --token TOKEN --pipeline FILE")
+	if fs.NArg() != 2 && fs.NArg() != 3 {
+		return fmt.Errorf("usage: kiwi replay RUN JOB [STEP] --server URL --token TOKEN --pipeline FILE")
 	}
 	if *server == "" {
 		return fmt.Errorf("--server (or KIWI_SERVER) is required")
 	}
 	runID, jobKey := fs.Arg(0), fs.Arg(1)
+	var stepID string
+	if fs.NArg() == 3 {
+		stepID = fs.Arg(2)
+	}
 	client := &http.Client{
 		Timeout: 120 * time.Second,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -136,6 +140,7 @@ func Replay(ctx context.Context, args []string) error {
 	opts := executor.Options{
 		Workspace:              ws,
 		RunID:                  runIDLocal,
+		OnlyStep:               stepID,
 		RequireImmutableImages: true,
 		InheritEnv:             false,
 		SecretProvider:         provider,

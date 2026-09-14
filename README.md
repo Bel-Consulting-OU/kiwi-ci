@@ -137,7 +137,8 @@ kiwi config check | kiwi database migrate|status
 kiwi runner [--server URL --token TOKEN] | kiwi runner list|drain|disable|enable
 kiwi dispatch | kiwi runs | kiwi jobs | kiwi logs [--follow]
 kiwi cancel | kiwi approve | kiwi rerun | kiwi artifacts
-kiwi schedules list|trigger   (scaffold; server-side schedules deferred)
+kiwi replay RUN JOB [STEP]   (restores the exact workspace snapshot)
+kiwi schedules list|trigger
 kiwi policy check [-f FILE] [--trusted]
 kiwi version
 ```
