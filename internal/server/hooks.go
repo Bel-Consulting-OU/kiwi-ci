@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -8,6 +10,45 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/forge"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
+
+// triggerFilesFetch fetches the authoritative changed-file list BEFORE
+// trigger evaluation when the pipeline declares include-path filters:
+// matching against an empty list is fail-open. When the pipeline only uses
+// paths_ignore the fetch is best-effort (a missing list cannot wrongly
+// admit an event). Returns the files and whether a fetch error must fail
+// the webhook closed.
+func (s *Server) triggerFilesFetch(ctx context.Context, fg forge.Forge, spec *pipeline.Spec, ec *forge.EventContext) (files []string, mustFail error) {
+	needsInclude := false
+	for _, t := range spec.On {
+		if len(t.Paths) > 0 {
+			needsInclude = true
+			break
+		}
+	}
+	got, err := fg.ChangedFiles(ctx, *ec)
+	if err != nil {
+		if needsInclude {
+			return nil, fmt.Errorf("changed files unavailable for path-filtered trigger: %w", err)
+		}
+		log.Printf("webhook: changed files for %s: %v", ec.Repository.FullName, err)
+		return nil, nil
+	}
+	return got, nil
+}
+
+// evalTriggerMatches evaluates the pipeline trigger with authoritative
+// changed files populated. A failed include-path fetch fails closed.
+func (s *Server) evalTriggerMatches(ctx context.Context, fg forge.Forge, spec *pipeline.Spec, ec *forge.EventContext) (bool, string, error) {
+	files, err := s.triggerFilesFetch(ctx, fg, spec, ec)
+	if err != nil {
+		return false, "", err
+	}
+	if files != nil {
+		ec.ChangedFiles = files
+	}
+	ok, matched := forge.MatchesTrigger(spec.On, *ec)
+	return ok, matched, nil
+}
 
 func (s *Server) gitLabForge() *forge.GitLab {
 	return &forge.GitLab{SecretToken: s.GitLabWebhookSecret, Token: s.GitLabToken, BaseURL: s.gitLabAPIBase}
@@ -73,18 +114,18 @@ func (s *Server) gitlabWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "parse pipeline: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	ok, matched := forge.MatchesTrigger(spec.On, ec)
+	ok, matched, terr := s.evalTriggerMatches(r.Context(), fg, spec, &ec)
+	if terr != nil {
+		http.Error(w, terr.Error(), http.StatusBadGateway)
+		return
+	}
 	if !ok {
 		log.Printf("webhook: gitlab %s %s ignored (trigger %q)", ec.Event, ec.Repository.FullName, matched)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	files, err := fg.ChangedFiles(r.Context(), ec)
-	if err != nil {
-		log.Printf("webhook: changed files for %s: %v", ec.Repository.FullName, err)
-		files = nil
-	}
+	files := ec.ChangedFiles
 
 	delivery := r.Header.Get("X-GitLab-Event-UUID")
 	if delivery != "" {
@@ -173,18 +214,18 @@ func (s *Server) forgejoWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "parse pipeline: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	ok, matched := forge.MatchesTrigger(spec.On, ec)
+	ok, matched, terr := s.evalTriggerMatches(r.Context(), fg, spec, &ec)
+	if terr != nil {
+		http.Error(w, terr.Error(), http.StatusBadGateway)
+		return
+	}
 	if !ok {
 		log.Printf("webhook: forgejo %s %s ignored (trigger %q)", ec.Event, ec.Repository.FullName, matched)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	files, err := fg.ChangedFiles(r.Context(), ec)
-	if err != nil {
-		log.Printf("webhook: changed files for %s: %v", ec.Repository.FullName, err)
-		files = nil
-	}
+	files := ec.ChangedFiles
 
 	delivery := r.Header.Get("X-Forgejo-Delivery")
 	if delivery != "" {

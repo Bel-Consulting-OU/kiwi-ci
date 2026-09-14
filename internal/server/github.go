@@ -93,7 +93,11 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "parse pipeline: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	ok, matched := forge.MatchesTrigger(spec.On, ec)
+	ok, matched, terr := s.evalTriggerMatches(ctx, fg, spec, &ec)
+	if terr != nil {
+		http.Error(w, terr.Error(), http.StatusBadGateway)
+		return
+	}
 	if !ok {
 		// The event does not match the pipeline's on section: acknowledge
 		// without enqueueing. Logged so silenced pipelines are discoverable.
@@ -102,16 +106,10 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Server-side changed-file fetch for path filters. The runner must not
-	// be the source of truth here: the list is evaluated before a run
-	// exists. Errors degrade to nil (no path filtering) rather than
-	// dropping the event.
-	files, err := fg.ChangedFiles(ctx, ec)
-	if err != nil {
-		log.Printf("webhook: changed files for %s: %v", ec.Repository.FullName, err)
-		files = nil
-	}
-	ec.ChangedFiles = files
+	// Authoritative changed files were populated by evalTriggerMatches
+	// before trigger evaluation: the runner is never the source of truth,
+	// and include-path triggers fail closed when the list is unobtainable.
+	files := ec.ChangedFiles
 
 	delivery := r.Header.Get("X-GitHub-Delivery")
 	if delivery != "" {
