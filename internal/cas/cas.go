@@ -1,17 +1,29 @@
 // Package cas provides a content-addressed object wrapper over a blob.Store.
 // Objects are addressed by their SHA-256 digest; the store verifies integrity
-// on both write and read.
+// on both write and read: Put hashes the stream and names the object after
+// its digest, and Open wraps the returned reader in a verifying reader that
+// hashes while streaming and fails at EOF when the content does not match
+// the requested digest. cas is the digest-verified layer; the underlying
+// blob stores trust their object keys.
 package cas
 
 import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"fmt"
+	"hash"
 	"io"
 	"os"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/blob"
 )
+
+// ErrDigestMismatch is reported by Open's reader when the streamed content
+// does not hash to the requested digest. It surfaces at EOF (Read returning
+// the error, or Close when the consumer never read to EOF).
+var ErrDigestMismatch = errors.New("cas: content digest mismatch")
 
 type CAS struct {
 	Blobs blob.Store
@@ -42,10 +54,79 @@ func (c *CAS) Put(ctx context.Context, r io.Reader) (blob.Object, error) {
 	return blob.Object{Key: key, SHA256: obj.SHA256, Size: n}, nil
 }
 
+// Open returns a digest-verified stream for the object addressed by
+// sha256hex: the reader hashes the bytes while they stream and reports
+// ErrDigestMismatch at EOF (or on Close when the stream was not fully
+// read) when the content does not match the requested digest.
 func (c *CAS) Open(ctx context.Context, sha256hex string) (io.ReadCloser, blob.Object, error) {
-	return c.Blobs.Open(ctx, sha256hex)
+	rc, obj, err := c.Blobs.Open(ctx, sha256hex)
+	if err != nil {
+		return nil, blob.Object{}, err
+	}
+	return &verifyingReader{r: rc, h: sha256.New(), want: sha256hex}, obj, nil
 }
 
 func (c *CAS) Delete(ctx context.Context, sha256hex string) error {
 	return c.Blobs.Delete(ctx, sha256hex)
+}
+
+// verifyingReader is the hash-while-stream reader: bytes pass through while
+// being hashed, and the digest is compared at EOF. A mismatch turns the
+// final read (or Close) into ErrDigestMismatch so consumers can never
+// silently accept corrupted content.
+type verifyingReader struct {
+	r    io.ReadCloser
+	h    hash.Hash
+	want string
+	done bool
+	err  error
+}
+
+func (v *verifyingReader) Read(p []byte) (int, error) {
+	if v.err != nil {
+		return 0, v.err
+	}
+	n, err := v.r.Read(p)
+	if n > 0 {
+		_, _ = v.h.Write(p[:n])
+	}
+	if err == io.EOF {
+		v.err = v.verify()
+		if v.err != nil {
+			return n, v.err
+		}
+		v.err = io.EOF
+	}
+	if err != nil {
+		v.err = err
+	}
+	return n, v.err
+}
+
+// verify compares the accumulated hash with the requested digest. It is
+// idempotent: once verified (or failed) it reports the same outcome.
+func (v *verifyingReader) verify() error {
+	if v.done {
+		if errors.Is(v.err, ErrDigestMismatch) {
+			return v.err
+		}
+		return nil
+	}
+	v.done = true
+	got := hex.EncodeToString(v.h.Sum(nil))
+	if got != v.want {
+		v.err = fmt.Errorf("%w: want %s, got %s", ErrDigestMismatch, v.want, got)
+		return v.err
+	}
+	return nil
+}
+
+// Close releases the underlying reader and, when the stream was never read
+// to EOF, reports a digest mismatch that would otherwise be lost.
+func (v *verifyingReader) Close() error {
+	if err := v.verify(); err != nil {
+		_ = v.r.Close()
+		return err
+	}
+	return v.r.Close()
 }

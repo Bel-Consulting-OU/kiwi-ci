@@ -76,6 +76,12 @@ func (s *FS) Put(ctx context.Context, key string, r io.Reader, size int64) (Obje
 	return Object{Key: key, SHA256: key, Size: n}, nil
 }
 
+// Open returns a stream for the object addressed by key. It verifies the
+// object's existence and reports the stat'd size, but it does NOT verify
+// the content digest: blob.FS trusts the key (Put hashed the content into
+// the key before the atomic rename), and digest verification is the
+// responsibility of the cas layer, which wraps this reader in a
+// hash-while-stream verifying reader.
 func (s *FS) Open(ctx context.Context, key string) (io.ReadCloser, Object, error) {
 	if !keyRE.MatchString(key) {
 		return nil, Object{}, fmt.Errorf("blob: invalid key %q", key)

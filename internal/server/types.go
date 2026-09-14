@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 type SubmitRun struct {
@@ -19,6 +20,11 @@ type SubmitRun struct {
 	Trusted      bool              `json:"-"`
 	ChangedFiles []string          `json:"changed_files,omitempty"`
 	Metadata     map[string]string `json:"metadata,omitempty"`
+	// scheduleClaim, when set, claims the (schedule, nominal) occurrence
+	// atomically with the enqueue (DB mode: inside InsertCompiledRun;
+	// memory mode: under s.mu after the run is inserted). It is never
+	// accepted from client JSON.
+	ScheduleClaim *storage.ScheduleClaim `json:"-"`
 }
 
 type Task struct {

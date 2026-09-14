@@ -16,7 +16,20 @@ import (
 const (
 	queueReasonDailyCostExceeded   = "DAILY_COST_EXCEEDED"
 	queueReasonDailyEnergyExceeded = "DAILY_ENERGY_EXCEEDED"
+	// queueReasonBudgetStateUnavailable marks that the usage store could
+	// not answer the budget query, so the gate fails closed.
+	queueReasonBudgetStateUnavailable = "BUDGET_STATE_UNAVAILABLE"
 )
+
+// budgetUnavailableError refuses an enqueue/lease when the usage store
+// cannot answer the daily-budget query and QuotaFailOpen is false.
+type budgetUnavailableError struct {
+	Reason string
+}
+
+func (e *budgetUnavailableError) Error() string {
+	return e.Reason + ": quota budget state unavailable"
+}
 
 // usageEntry is one completed job's recorded usage for the trailing-24h
 // in-memory budget window (memory/fs mode).
@@ -160,10 +173,21 @@ func (s *Server) recordJobUsage(j *model.Job, finished time.Time) {
 // sums the in-memory window. The returned reason is the queue reason code
 // to attach to waiting jobs while leases are refused.
 func (s *Server) dailyBudgetExceeded(ctx context.Context) (reason string, exceeded bool) {
+	reason, exceeded, _ = s.dailyBudgetStateDB(ctx)
+	return reason, exceeded
+}
+
+// dailyBudgetStateDB evaluates the trailing-24h daily budget: memory mode
+// never errors; DB mode queries UsageStore.RecentUsage and reports its
+// error so the gate can fail closed when QuotaFailOpen is false.
+func (s *Server) dailyBudgetStateDB(ctx context.Context) (reason string, exceeded bool, err error) {
 	var cost, energy float64
 	if s.DB != nil {
 		if us, ok := s.DB.(storage.UsageStore); ok {
-			cost, energy, _ = us.RecentUsage(ctx, time.Now().UTC().Add(-24*time.Hour))
+			cost, energy, err = us.RecentUsage(ctx, time.Now().UTC().Add(-24*time.Hour))
+			if err != nil {
+				return "", false, err
+			}
 		}
 	} else {
 		s.usageMu.Lock()
@@ -178,11 +202,11 @@ func (s *Server) dailyBudgetExceeded(ctx context.Context) (reason string, exceed
 	}
 	switch {
 	case s.DailyCostLimit > 0 && cost >= s.DailyCostLimit:
-		return queueReasonDailyCostExceeded, true
+		return queueReasonDailyCostExceeded, true, nil
 	case s.DailyEnergyLimit > 0 && energy >= s.DailyEnergyLimit:
-		return queueReasonDailyEnergyExceeded, true
+		return queueReasonDailyEnergyExceeded, true, nil
 	}
-	return "", false
+	return "", false, nil
 }
 
 // markQueueReasonsAll annotates every queued job with reason so operators

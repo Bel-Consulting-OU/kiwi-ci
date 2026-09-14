@@ -3,7 +3,9 @@ package storage
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -55,11 +57,17 @@ var (
 	_ ArtifactContractStore = (*FaultyStore)(nil)
 	_ QueueReasonStore      = (*FaultyStore)(nil)
 	_ DynamicStore          = (*FaultyStore)(nil)
+	_ DynamicStoreTx        = (*FaultyStore)(nil)
 	_ DownstreamStore       = (*FaultyStore)(nil)
 	_ UsageStore            = (*FaultyStore)(nil)
 	_ RunDownstreamStore    = (*FaultyStore)(nil)
 	_ ArtifactLookupStore   = (*FaultyStore)(nil)
 	_ RunnerJobStore        = (*FaultyStore)(nil)
+	_ RunEnqueueStore       = (*FaultyStore)(nil)
+	_ AtomicLeaseStore      = (*FaultyStore)(nil)
+	_ QuotaCounterStore     = (*FaultyStore)(nil)
+	_ CacheManifestStore    = (*FaultyStore)(nil)
+	_ ArtifactSidecarStore  = (*FaultyStore)(nil)
 )
 
 func (f *FaultyStore) Close() error { return f.Inner.Close() }
@@ -471,6 +479,100 @@ func (f *FaultyStore) GetArtifact(ctx context.Context, id string) (model.Artifac
 	return f.Inner.(ArtifactLookupStore).GetArtifact(ctx, id)
 }
 
+// ---------------------------------------------------------------------------
+// atomicity/storage round extension methods. The Inner Store must also
+// implement these interfaces (the fault-injection memStore does).
+// ---------------------------------------------------------------------------
+
+func (f *FaultyStore) InsertCompiledRun(ctx context.Context, req InsertCompiledRunRequest) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(RunEnqueueStore).InsertCompiledRun(ctx, req)
+}
+
+func (f *FaultyStore) AcquireLeaseAtomic(ctx context.Context, jobID, runnerID string, tokenHash []byte, generation int64, expiresAt time.Time, runnerCapacity int) (model.Job, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return model.Job{}, err
+	}
+	return f.Inner.(AtomicLeaseStore).AcquireLeaseAtomic(ctx, jobID, runnerID, tokenHash, generation, expiresAt, runnerCapacity)
+}
+
+func (f *FaultyStore) AdjustQuotaCounter(ctx context.Context, repoKey, teamKey string, runningDelta, queuedDelta int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(QuotaCounterStore).AdjustQuotaCounter(ctx, repoKey, teamKey, runningDelta, queuedDelta)
+}
+
+func (f *FaultyStore) QuotaCounts(ctx context.Context, repoKey, teamKey string) (int, int, error) {
+	return f.Inner.(QuotaCounterStore).QuotaCounts(ctx, repoKey, teamKey)
+}
+
+func (f *FaultyStore) ReserveDownstreamLaunch(ctx context.Context, parentJobID, targetRepo, targetRef, launchToken string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return false, err
+	}
+	return f.Inner.(DownstreamStore).ReserveDownstreamLaunch(ctx, parentJobID, targetRepo, targetRef, launchToken)
+}
+
+func (f *FaultyStore) ReleaseDownstreamReservation(ctx context.Context, parentJobID, targetRepo, targetRef string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(DownstreamStore).ReleaseDownstreamReservation(ctx, parentJobID, targetRepo, targetRef)
+}
+
+func (f *FaultyStore) ExpireDownstreamReservations(ctx context.Context, olderThan time.Time) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return 0, err
+	}
+	return f.Inner.(DownstreamStore).ExpireDownstreamReservations(ctx, olderThan)
+}
+
+func (f *FaultyStore) InsertGeneratedJobsTx(ctx context.Context, parentJobID string, depth int, jobs map[string]model.Job, deps map[string][]string, verify GeneratedJobVerifier) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(DynamicStoreTx).InsertGeneratedJobsTx(ctx, parentJobID, depth, jobs, deps, verify)
+}
+
+func (f *FaultyStore) PutCacheManifest(ctx context.Context, rec CacheManifestRecord) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(CacheManifestStore).PutCacheManifest(ctx, rec)
+}
+
+func (f *FaultyStore) GetCacheManifest(ctx context.Context, repo, trustDomain, logicalKey string) (CacheManifestRecord, bool, error) {
+	return f.Inner.(CacheManifestStore).GetCacheManifest(ctx, repo, trustDomain, logicalKey)
+}
+
+func (f *FaultyStore) SetArtifactSidecars(ctx context.Context, id, sbomPath, sbomSHA256, sigstorePath, sigstoreSHA256 string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(ArtifactSidecarStore).SetArtifactSidecars(ctx, id, sbomPath, sbomSHA256, sigstorePath, sigstoreSHA256)
+}
+
 // memStore is a fully functional in-memory Store used as the fault-free
 // baseline underneath FaultyStore in fault-injection tests.
 type memStore struct {
@@ -491,6 +593,14 @@ type memStore struct {
 	snapshots   []model.SnapshotRecord
 	contracts   map[string]map[string]ArtifactContract
 	downstream  map[string]DownstreamLink
+	quotas      map[string]quotaCounts
+	cacheMans   map[string]CacheManifestRecord
+}
+
+// quotaCounts is the in-memory reserved counter pair for one quota key.
+type quotaCounts struct {
+	running int
+	queued  int
 }
 
 func newMemStore() *memStore {
@@ -504,6 +614,8 @@ func newMemStore() *memStore {
 		occurrences: map[string]map[time.Time]string{},
 		contracts:   map[string]map[string]ArtifactContract{},
 		downstream:  map[string]DownstreamLink{},
+		quotas:      map[string]quotaCounts{},
+		cacheMans:   map[string]CacheManifestRecord{},
 	}
 }
 
@@ -517,11 +629,17 @@ var (
 	_ ArtifactContractStore = (*memStore)(nil)
 	_ QueueReasonStore      = (*memStore)(nil)
 	_ DynamicStore          = (*memStore)(nil)
+	_ DynamicStoreTx        = (*memStore)(nil)
 	_ DownstreamStore       = (*memStore)(nil)
 	_ UsageStore            = (*memStore)(nil)
 	_ RunDownstreamStore    = (*memStore)(nil)
 	_ ArtifactLookupStore   = (*memStore)(nil)
 	_ RunnerJobStore        = (*memStore)(nil)
+	_ RunEnqueueStore       = (*memStore)(nil)
+	_ AtomicLeaseStore      = (*memStore)(nil)
+	_ QuotaCounterStore     = (*memStore)(nil)
+	_ CacheManifestStore    = (*memStore)(nil)
+	_ ArtifactSidecarStore  = (*memStore)(nil)
 )
 
 func (m *memStore) Close() error { return nil }
@@ -660,6 +778,7 @@ func (m *memStore) AcquireLease(ctx context.Context, jobID, runnerID string, tok
 	j.LeaseGeneration = generation
 	j.LeaseExpiresAt = &expiresAt
 	m.jobs[jobID] = j
+	m.adjustQuotaLocked(j.RepoURL, 1, -1)
 	return j, nil
 }
 
@@ -702,6 +821,7 @@ func (m *memStore) CompleteJob(ctx context.Context, jobID string, generation int
 	j.LeaseExpiresAt = nil
 	m.jobs[jobID] = j
 	m.receipts[key] = receipt
+	m.adjustQuotaLocked(j.RepoURL, -1, 0)
 	return nil
 }
 
@@ -714,6 +834,7 @@ func (m *memStore) CancelRunJobs(ctx context.Context, runID string, reason strin
 		if j.RunID != runID || j.Status.Terminal() {
 			continue
 		}
+		wasRunning := j.Status == model.StatusRunning
 		j.Status = model.StatusCancelled
 		j.Error = reason
 		j.FinishedAt = &now
@@ -721,6 +842,11 @@ func (m *memStore) CancelRunJobs(ctx context.Context, runID string, reason strin
 		j.LeaseTokenHash = nil
 		j.LeaseExpiresAt = nil
 		m.jobs[id] = j
+		if wasRunning {
+			m.adjustQuotaLocked(j.RepoURL, -1, 0)
+		} else {
+			m.adjustQuotaLocked(j.RepoURL, 0, -1)
+		}
 		ids = append(ids, id)
 	}
 	if r, ok := m.runs[runID]; ok && !r.Status.Terminal() {
@@ -773,6 +899,13 @@ func (m *memStore) ReleaseRunnerJob(ctx context.Context, runnerID, jobID string,
 	}
 	r.ActiveJobs = active
 	m.runners[runnerID] = r
+	if j, jok := m.jobs[jobID]; jok {
+		queuedDelta := 0
+		if j.Status == model.StatusQueued {
+			queuedDelta = 1
+		}
+		m.adjustQuotaLocked(j.RepoURL, -1, queuedDelta)
+	}
 	return nil
 }
 
@@ -1102,6 +1235,61 @@ func (m *memStore) GetDownstreamLink(ctx context.Context, parentJobID, targetRep
 	return l, ok, nil
 }
 
+func (m *memStore) ReserveDownstreamLaunch(ctx context.Context, parentJobID, targetRepo, targetRef, launchToken string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := parentJobID + "\x00" + targetRepo + "\x00" + targetRef
+	l, ok := m.downstream[key]
+	if !ok {
+		now := time.Now().UTC()
+		m.downstream[key] = DownstreamLink{ParentJobID: parentJobID, TargetRepo: targetRepo, TargetRef: targetRef, LaunchToken: launchToken, Reserved: true, ReservedAt: &now, CreatedAt: now}
+		return true, nil
+	}
+	if l.ChildRunID != "" || l.Reserved {
+		return false, nil
+	}
+	now := time.Now().UTC()
+	l.Reserved = true
+	l.ReservedAt = &now
+	if l.LaunchToken == "" {
+		l.LaunchToken = launchToken
+	}
+	m.downstream[key] = l
+	return true, nil
+}
+
+func (m *memStore) ReleaseDownstreamReservation(ctx context.Context, parentJobID, targetRepo, targetRef string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := parentJobID + "\x00" + targetRepo + "\x00" + targetRef
+	l, ok := m.downstream[key]
+	if !ok || l.ChildRunID != "" {
+		return nil
+	}
+	l.Reserved = false
+	l.ReservedAt = nil
+	m.downstream[key] = l
+	return nil
+}
+
+func (m *memStore) ExpireDownstreamReservations(ctx context.Context, olderThan time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for key, l := range m.downstream {
+		if !l.Reserved || l.ChildRunID != "" {
+			continue
+		}
+		if l.ReservedAt == nil || l.ReservedAt.Before(olderThan) {
+			l.Reserved = false
+			l.ReservedAt = nil
+			m.downstream[key] = l
+			n++
+		}
+	}
+	return n, nil
+}
+
 func (m *memStore) MarkDownstreamLaunched(ctx context.Context, parentJobID, targetRepo, targetRef, childRunID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1111,6 +1299,8 @@ func (m *memStore) MarkDownstreamLaunched(ctx context.Context, parentJobID, targ
 		return nil
 	}
 	l.ChildRunID = childRunID
+	l.Reserved = false
+	l.ReservedAt = nil
 	m.downstream[key] = l
 	return nil
 }
@@ -1171,4 +1361,277 @@ func (m *memStore) GetArtifact(ctx context.Context, id string) (model.ArtifactRe
 		}
 	}
 	return model.ArtifactRecord{}, ErrNotFound
+}
+
+// ---------------------------------------------------------------------------
+// atomicity/storage round extension methods (in-memory)
+// ---------------------------------------------------------------------------
+
+// memQuotaKeys mirrors the SQL quota key derivation for one repository URL.
+func memQuotaKeys(repoURL string) []string {
+	repo := strings.TrimSpace(repoURL)
+	if repo == "" {
+		return nil
+	}
+	team := repo
+	if u, err := url.Parse(repo); err == nil && u.Host != "" {
+		parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+		if len(parts) > 0 && parts[0] != "" {
+			team = u.Host + "/" + parts[0]
+		} else {
+			team = u.Host
+		}
+	}
+	if team == repo {
+		return []string{repo}
+	}
+	return []string{repo, team}
+}
+
+// adjustQuotaLocked shifts counters for the repo/team keys (caller holds
+// m.mu). Missing rows are tolerated.
+func (m *memStore) adjustQuotaLocked(repoURL string, runningDelta, queuedDelta int) {
+	for _, key := range memQuotaKeys(repoURL) {
+		c := m.quotas[key]
+		c.running += runningDelta
+		if c.running < 0 {
+			c.running = 0
+		}
+		c.queued += queuedDelta
+		if c.queued < 0 {
+			c.queued = 0
+		}
+		m.quotas[key] = c
+	}
+}
+
+// InsertCompiledRun applies the whole atomic-enqueue request under m.mu:
+// every write is staged and only committed when the whole request validates
+// (delivery dedupe, quota limits, schedule claim), so a rejected request
+// leaves zero partial state.
+func (m *memStore) InsertCompiledRun(ctx context.Context, req InsertCompiledRunRequest) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	runID := req.Run.ID
+	if runID == "" {
+		return fmt.Errorf("storage: empty run id")
+	}
+	if req.WebhookClaim != nil {
+		if _, exists := m.deliveries[req.WebhookClaim.Forge+"/"+req.WebhookClaim.DeliveryID]; exists {
+			return ErrDeliveryDuplicate
+		}
+	}
+	// Quota reservation: re-enforce limits against the reserved counters.
+	if req.Quota != nil {
+		jobCount := req.Quota.JobCount
+		if jobCount < 0 {
+			jobCount = 0
+		}
+		keys := []string{req.Quota.RepoKey}
+		if req.Quota.TeamKey != "" && req.Quota.TeamKey != req.Quota.RepoKey {
+			keys = append(keys, req.Quota.TeamKey)
+		}
+		for _, key := range keys {
+			c := m.quotas[key]
+			c.queued += jobCount
+			isTeam := key == req.Quota.TeamKey
+			runningLimit, queueLimit := req.Quota.RepoConcurrency, req.Quota.RepoQueueDepth
+			reason, scope := "REPO_QUOTA", "repository"
+			if isTeam {
+				runningLimit, queueLimit = req.Quota.TeamConcurrency, req.Quota.TeamQueueDepth
+				reason, scope = "TEAM_QUOTA", "team"
+			}
+			if runningLimit > 0 && float64(c.running) >= runningLimit {
+				return &QuotaExceededError{Reason: reason, Msg: fmt.Sprintf("%s already has %d running job(s), concurrency limit %g", scope, c.running, runningLimit)}
+			}
+			if queueLimit > 0 && float64(c.queued) > queueLimit {
+				return &QuotaExceededError{Reason: reason, Msg: fmt.Sprintf("%s queue depth would reach %d, limit %g", scope, c.queued, queueLimit)}
+			}
+			m.quotas[key] = c
+		}
+	}
+	if req.ScheduleClaim != nil {
+		byNominal, ok := m.occurrences[req.ScheduleClaim.ScheduleID]
+		if !ok {
+			byNominal = map[time.Time]string{}
+			m.occurrences[req.ScheduleClaim.ScheduleID] = byNominal
+		}
+		if existing, exists := byNominal[req.ScheduleClaim.Nominal]; exists && existing != runID {
+			return ErrScheduleClaimLost
+		}
+	}
+	now := time.Now().UTC()
+	m.runs[runID] = req.Run
+	for id, j := range req.Jobs {
+		m.jobs[id] = j
+		if contracts, ok := req.Contracts[id]; ok {
+			m.contracts[id] = contracts
+		}
+	}
+	for _, id := range req.CancelPrevious {
+		j, ok := m.jobs[id]
+		if !ok || j.Status.Terminal() {
+			continue
+		}
+		wasRunning := j.Status == model.StatusRunning
+		j.Status = model.StatusCancelled
+		j.Error = "superseded by run " + runID
+		j.FinishedAt = &now
+		j.LeaseRunnerID = ""
+		j.LeaseTokenHash = nil
+		j.LeaseExpiresAt = nil
+		m.jobs[id] = j
+		m.audit = append(m.audit, model.AuditEvent{ID: id + "|audit", Action: "job.superseded", Actor: "scheduler", RunID: j.RunID, JobID: id, Message: "cancelled", CreatedAt: now})
+		if wasRunning {
+			m.adjustQuotaLocked(j.RepoURL, -1, 0)
+		} else {
+			m.adjustQuotaLocked(j.RepoURL, 0, -1)
+		}
+	}
+	if req.WebhookClaim != nil {
+		m.deliveries[req.WebhookClaim.Forge+"/"+req.WebhookClaim.DeliveryID] = runID + "/" + req.WebhookClaim.PayloadDigest
+	}
+	if req.ScheduleClaim != nil {
+		m.occurrences[req.ScheduleClaim.ScheduleID][req.ScheduleClaim.Nominal] = runID
+	}
+	return nil
+}
+
+// AcquireLeaseAtomic mirrors the SQL atomic lease: the job claim and the
+// runner capacity slot update commit or fail together under m.mu.
+func (m *memStore) AcquireLeaseAtomic(ctx context.Context, jobID, runnerID string, tokenHash []byte, generation int64, expiresAt time.Time, runnerCapacity int) (model.Job, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	j, ok := m.jobs[jobID]
+	if !ok {
+		return model.Job{}, ErrNotFound
+	}
+	if j.Status != model.StatusQueued {
+		return model.Job{}, ErrLeaseConflict
+	}
+	r, rok := m.runners[runnerID]
+	if !rok {
+		return model.Job{}, ErrNoCapacity
+	}
+	if runnerCapacity > 0 && len(r.ActiveJobs) >= runnerCapacity {
+		return model.Job{}, ErrNoCapacity
+	}
+	j.Status = model.StatusRunning
+	j.Attempts++
+	j.LeaseRunnerID = runnerID
+	j.LeaseTokenHash = tokenHash
+	j.LeaseGeneration = generation
+	j.LeaseExpiresAt = &expiresAt
+	m.jobs[jobID] = j
+	r.ActiveJobs = append(r.ActiveJobs, jobID)
+	r.Busy = runnerCapacity > 0 && len(r.ActiveJobs) >= runnerCapacity
+	if len(r.ActiveJobs) > 0 {
+		r.CurrentJob = r.ActiveJobs[0]
+	}
+	m.runners[runnerID] = r
+	m.adjustQuotaLocked(j.RepoURL, 1, -1)
+	return j, nil
+}
+
+func (m *memStore) AdjustQuotaCounter(ctx context.Context, repoKey, teamKey string, runningDelta, queuedDelta int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, key := range []string{repoKey, teamKey} {
+		if key == "" {
+			continue
+		}
+		c := m.quotas[key]
+		c.running += runningDelta
+		if c.running < 0 {
+			c.running = 0
+		}
+		c.queued += queuedDelta
+		if c.queued < 0 {
+			c.queued = 0
+		}
+		m.quotas[key] = c
+	}
+	return nil
+}
+
+func (m *memStore) QuotaCounts(ctx context.Context, repoKey, teamKey string) (int, int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var running, queued int
+	for _, key := range []string{repoKey, teamKey} {
+		if key == "" {
+			continue
+		}
+		c := m.quotas[key]
+		running += c.running
+		queued += c.queued
+	}
+	return running, queued, nil
+}
+
+func (m *memStore) InsertGeneratedJobsTx(ctx context.Context, parentJobID string, depth int, jobs map[string]model.Job, deps map[string][]string, verify GeneratedJobVerifier) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	parent, ok := m.jobs[parentJobID]
+	if !ok {
+		return ErrNotFound
+	}
+	count := 0
+	for _, j := range m.jobs {
+		if j.RunID == parent.RunID {
+			count++
+		}
+	}
+	if verify != nil {
+		if err := verify(parent, count); err != nil {
+			return err
+		}
+	}
+	for id, j := range jobs {
+		m.jobs[id] = j
+	}
+	return nil
+}
+
+func (m *memStore) PutCacheManifest(ctx context.Context, rec CacheManifestRecord) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if rec.CreatedAt.IsZero() {
+		rec.CreatedAt = time.Now().UTC()
+	}
+	m.cacheMans[rec.Repo+"\x00"+rec.TrustDomain+"\x00"+rec.LogicalKey] = rec
+	return nil
+}
+
+func (m *memStore) GetCacheManifest(ctx context.Context, repo, trustDomain, logicalKey string) (CacheManifestRecord, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rec, ok := m.cacheMans[repo+"\x00"+trustDomain+"\x00"+logicalKey]
+	return rec, ok, nil
+}
+
+// SetArtifactSidecars updates one artifact record's sidecar references.
+func (m *memStore) SetArtifactSidecars(ctx context.Context, id, sbomPath, sbomSHA256, sigstorePath, sigstoreSHA256 string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, a := range m.artifacts {
+		if a.ID != id {
+			continue
+		}
+		if sbomPath != "" {
+			a.SBOMPath = sbomPath
+		}
+		if sbomSHA256 != "" {
+			a.SBOMSHA256 = sbomSHA256
+		}
+		if sigstorePath != "" {
+			a.SigstorePath = sigstorePath
+		}
+		if sigstoreSHA256 != "" {
+			a.SigstoreSHA256 = sigstoreSHA256
+		}
+		m.artifacts[i] = a
+		return nil
+	}
+	return ErrNotFound
 }

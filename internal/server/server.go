@@ -144,6 +144,11 @@ type Server struct {
 	// energy budget; exceeding them refuses new leases (0 = unlimited).
 	DailyCostLimit   float64
 	DailyEnergyLimit float64
+	// QuotaFailOpen, when true, lets enqueues and leases proceed when the
+	// usage store is unavailable instead of refusing them with
+	// BUDGET_STATE_UNAVAILABLE. Default false: the budget gate fails
+	// closed.
+	QuotaFailOpen bool
 
 	// BlobStore is the shared content-addressed blob backend for DB mode.
 	// CAS wraps it with digest-verified put/open. When nil (or dataDir is
@@ -201,6 +206,11 @@ type Server struct {
 	// contracts holds the per-job artifact contract sets (memory mode;
 	// DB mode persists them through ArtifactContractStore).
 	contracts map[string]map[string]storage.ArtifactContract
+	// pendingSidecars maps (jobID, base, kind) to the CAS digest of a
+	// sidecar uploaded before its artifact payload in DB mode; the payload
+	// upload gate resolves the bytes through CAS instead of node-local
+	// sidecar files. Guarded by s.mu.
+	pendingSidecars map[string]string
 	// jobLocks serializes the upload critical section per job so staging,
 	// idempotency checks and record insertion are atomic per (job, name).
 	jobLocks   map[string]*sync.Mutex
@@ -273,6 +283,7 @@ func New(token string) *Server {
 		deployments:     map[string]model.Deployment{},
 		snapshots:       map[string]model.SnapshotRecord{},
 		contracts:       map[string]map[string]storage.ArtifactContract{},
+		pendingSidecars: map[string]string{},
 		jobLocks:        map[string]*sync.Mutex{},
 		crl:             map[string]string{},
 		history:         newTestintelHistory(""),
@@ -781,6 +792,12 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, denial.Error(), http.StatusForbidden)
 			return
 		}
+		var budget *budgetUnavailableError
+		if errors.As(err, &budget) {
+			w.Header().Set("X-Kiwi-Quota", budget.Reason)
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": budget.Error(), "reason": budget.Reason})
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -919,20 +936,29 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 			},
 		}
 	}
-	// Artifact contracts are persisted alongside the jobs so uploads can be
-	// verified against them without recompiling the pipeline.
-	for id, contracts := range jobContracts {
-		s.persistJobContracts(ctx, id, contracts)
-	}
+	// Artifact contracts ride the enqueue transaction (InsertCompiledRun)
+	// in DB mode and the in-memory maps in memory mode; nothing is
+	// persisted before the run and its jobs exist.
 
 	if s.Sched != nil {
-		if err := s.admitQuotaLocked(run, len(g.Jobs)); err != nil {
-			return model.Run{}, err
-		}
-		return s.enqueueDB(in, run, created, group, spec.Concurrency.CancelInProgress, now)
+		return s.enqueueDB(in, run, created, jobContracts, group, spec.Concurrency.CancelInProgress, now)
 	}
 
 	s.mu.Lock()
+	// Schedule occurrence atomicity (memory mode): a conflicting claim for
+	// the same nominal aborts before anything is inserted, and the claim
+	// itself lands only after the run and its jobs are committed to the
+	// in-memory maps, so a failed enqueue leaves the occurrence unclaimed
+	// and the next tick refires it.
+	if in.ScheduleClaim != nil {
+		occ := s.occurrences[in.ScheduleClaim.ScheduleID]
+		if occ != nil {
+			if existing, ok := occ[in.ScheduleClaim.Nominal.UTC().Unix()]; ok && existing != runID {
+				s.mu.Unlock()
+				return model.Run{}, storage.ErrScheduleClaimLost
+			}
+		}
+	}
 	// Quota admission happens inside the run lock so the concurrency and
 	// queue-depth counts are race-free with concurrent enqueues.
 	if err := s.admitQuotaLocked(run, len(g.Jobs)); err != nil {
@@ -965,11 +991,20 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 			s.contracts[id] = contracts
 		}
 	}
+	if in.ScheduleClaim != nil {
+		s.claimScheduleOccurrenceLocked(in.ScheduleClaim.ScheduleID, in.ScheduleClaim.Nominal, runID)
+	}
 	s.auditLocked("run.queued", "scheduler", runID, "", "run queued", map[string]string{"event": in.Event})
 	s.scheduleStateLocked()
 	if err := s.persistLocked(); err != nil {
 		s.mu.Unlock()
 		return model.Run{}, err
+	}
+	if in.ScheduleClaim != nil {
+		if err := s.persistSchedulesLocked(); err != nil {
+			s.mu.Unlock()
+			return model.Run{}, err
+		}
 	}
 	run = s.runs[runID]
 	for _, key := range []string{"github_delivery", "gitlab_delivery", "forgejo_delivery"} {
@@ -984,22 +1019,21 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 	return run, nil
 }
 
-// enqueueDB persists a compiled run through the PostgreSQL scheduler. It
-// mirrors enqueue's dedupe and supersession semantics against the durable
-// delivery table and the SQL run list, decides approval/environment gating
-// up front (the SQL completion path does not re-run the full schedule pass),
-// and emits the run.queued audit event through the DB audit funnel.
-func (s *Server) enqueueDB(in SubmitRun, run model.Run, created map[string]model.Job, group string, cancelInProgress bool, now time.Time) (model.Run, error) {
+// enqueueDB persists a compiled run through the storage.RunEnqueueStore:
+// ONE InsertCompiledRun transaction inserts the run, jobs, dependencies and
+// artifact contracts, cancels the superseded jobs with audit rows, and
+// claims the webhook delivery, quota reservation and (optionally) schedule
+// occurrence. It mirrors enqueue's dedupe and supersession semantics
+// against the durable delivery table and the SQL run list, decides
+// approval/environment gating up front (the SQL completion path does not
+// re-run the full schedule pass), and emits the run.queued audit event
+// through the DB audit funnel.
+func (s *Server) enqueueDB(in SubmitRun, run model.Run, created map[string]model.Job, jobContracts map[string]map[string]storage.ArtifactContract, group string, cancelInProgress bool, now time.Time) (model.Run, error) {
 	ctx := context.Background()
-	forge, delivery, ok := webhookDeliveryForge(in.Metadata)
-	if ok {
-		if existingID, found, err := s.DB.FindDelivery(ctx, forge, delivery); err != nil {
-			return model.Run{}, fmt.Errorf("lookup delivery: %w", err)
-		} else if found {
-			if prior, gerr := s.DB.GetRun(ctx, existingID); gerr == nil && prior.RepoFullName == in.RepoFullName {
-				return prior, nil
-			}
-		}
+	// Daily budget state: enqueues are refused while the usage store is
+	// unavailable unless the operator explicitly fails open.
+	if _, _, err := s.dailyBudgetStateDB(ctx); err != nil && !s.QuotaFailOpen {
+		return model.Run{}, &budgetUnavailableError{Reason: queueReasonBudgetStateUnavailable}
 	}
 	for id, j := range created {
 		switch {
@@ -1019,12 +1053,93 @@ func (s *Server) enqueueDB(in SubmitRun, run model.Run, created map[string]model
 	for id, j := range created {
 		deps[id] = append([]string(nil), j.Needs...)
 	}
-	if err := s.Sched.Enqueue(ctx, run, created, deps, cancelInProgress && group != ""); err != nil {
-		return model.Run{}, err
+	// Concurrency supersession: collect the non-terminal job IDs of the
+	// runs sharing this repository and concurrency group so the enqueue
+	// transaction cancels them atomically with the insert.
+	var cancelPrevious []string
+	if cancelInProgress && group != "" {
+		runs, err := s.DB.ListRuns(ctx, 10000)
+		if err != nil {
+			return model.Run{}, fmt.Errorf("list runs for supersession: %w", err)
+		}
+		for _, old := range runs {
+			if old.ID == run.ID || old.Repo != run.Repo || old.ConcurrencyGroup != group || old.Status.Terminal() {
+				continue
+			}
+			jobs, err := s.DB.ListJobsByRun(ctx, old.ID)
+			if err != nil {
+				return model.Run{}, fmt.Errorf("list jobs for supersession: %w", err)
+			}
+			for _, j := range jobs {
+				if !j.Status.Terminal() {
+					cancelPrevious = append(cancelPrevious, j.ID)
+				}
+			}
+		}
 	}
-	if ok {
-		if err := s.DB.UpsertDelivery(ctx, forge, delivery, run.ID, ""); err != nil {
-			s.logError("delivery upsert failed", "error", err.Error())
+	req := storage.InsertCompiledRunRequest{
+		Run:            run,
+		Jobs:           created,
+		Deps:           deps,
+		Contracts:      jobContracts,
+		CancelPrevious: cancelPrevious,
+	}
+	if forge, delivery, ok := webhookDeliveryForge(in.Metadata); ok {
+		req.WebhookClaim = &storage.WebhookClaim{Forge: forge, DeliveryID: delivery, RunID: run.ID}
+	}
+	req.Quota = &storage.QuotaReservation{
+		RepoKey:         run.Repo,
+		TeamKey:         repoURLTeam(run.Repo),
+		JobCount:        len(created),
+		RepoConcurrency: s.QuotaLimits.RepoConcurrency,
+		TeamConcurrency: s.QuotaLimits.TeamConcurrency,
+		RepoQueueDepth:  s.QuotaLimits.RepoQueueDepth,
+		TeamQueueDepth:  s.QuotaLimits.TeamQueueDepth,
+	}
+	if in.ScheduleClaim != nil {
+		req.ScheduleClaim = in.ScheduleClaim
+	}
+	rs, ok := s.DB.(storage.RunEnqueueStore)
+	if !ok {
+		// Fallback for stores predating the atomic enqueue: the old
+		// scheduler sequence plus a best-effort delivery upsert.
+		if err := s.Sched.Enqueue(ctx, run, created, deps, cancelInProgress && group != ""); err != nil {
+			return model.Run{}, err
+		}
+		if req.WebhookClaim != nil {
+			if err := s.DB.UpsertDelivery(ctx, req.WebhookClaim.Forge, req.WebhookClaim.DeliveryID, run.ID, ""); err != nil {
+				s.logError("delivery upsert failed", "error", err.Error())
+			}
+		}
+		s.auditLocked("run.queued", "scheduler", run.ID, "", "run queued", map[string]string{"event": in.Event})
+		s.publishGitHubStatus(run)
+		return run, nil
+	}
+	err := rs.InsertCompiledRun(ctx, req)
+	switch {
+	case errors.Is(err, storage.ErrDeliveryDuplicate):
+		// A forge retry replayed this delivery: return the ORIGINAL run
+		// instead of the duplicate submission.
+		if req.WebhookClaim == nil {
+			return model.Run{}, err
+		}
+		if existingID, found, ferr := s.DB.FindDelivery(ctx, req.WebhookClaim.Forge, req.WebhookClaim.DeliveryID); ferr != nil {
+			return model.Run{}, fmt.Errorf("lookup delivery: %w", ferr)
+		} else if found {
+			if prior, gerr := s.DB.GetRun(ctx, existingID); gerr == nil && prior.RepoFullName == in.RepoFullName {
+				return prior, nil
+			}
+		}
+		return model.Run{}, err
+	case errors.Is(err, storage.ErrScheduleClaimLost):
+		return model.Run{}, err
+	default:
+		var qe *storage.QuotaExceededError
+		if errors.As(err, &qe) {
+			return model.Run{}, &admissionError{Status: http.StatusTooManyRequests, Reason: qe.Reason, Msg: qe.Msg}
+		}
+		if err != nil {
+			return model.Run{}, err
 		}
 	}
 	s.auditLocked("run.queued", "scheduler", run.ID, "", "run queued", map[string]string{"event": in.Event})
@@ -1658,16 +1773,16 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "control plane draining", http.StatusServiceUnavailable)
 		return
 	}
+	if s.Sched != nil {
+		s.nextDB(w, r, id)
+		return
+	}
 	// Daily budget: leases are refused while the trailing-24h budget is
 	// exhausted; waiting jobs are annotated with the reason.
 	if reason, exceeded := s.dailyBudgetExceeded(r.Context()); exceeded {
 		s.markQueueReasonsAll(r.Context(), reason)
 		w.Header().Set("X-Kiwi-Quota", reason)
 		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	if s.Sched != nil {
-		s.nextDB(w, r, id)
 		return
 	}
 	now := time.Now().UTC()
@@ -1799,10 +1914,26 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 
 // nextDB leases through the PostgreSQL scheduler. No in-memory lock is held:
 // the SQL rows are authoritative and the store serializes competing claims.
+// The daily-budget gate runs BEFORE any lease: an unavailable usage store
+// refuses leases (fail closed, BUDGET_STATE_UNAVAILABLE) unless
+// QuotaFailOpen is set; an exhausted budget refuses with the budget reason.
 // Runner admission (disabled/draining) is checked here; placement-region
 // filtering happens inside scheduler.Lease against the runner's region.
 func (s *Server) nextDB(w http.ResponseWriter, r *http.Request, id string) {
 	ctx := r.Context()
+	reason, exceeded, err := s.dailyBudgetStateDB(ctx)
+	switch {
+	case err != nil && !s.QuotaFailOpen:
+		s.markQueueReasonsAll(ctx, queueReasonBudgetStateUnavailable)
+		w.Header().Set("X-Kiwi-Quota", queueReasonBudgetStateUnavailable)
+		http.Error(w, "quota budget state unavailable", http.StatusServiceUnavailable)
+		return
+	case exceeded:
+		s.markQueueReasonsAll(ctx, reason)
+		w.Header().Set("X-Kiwi-Quota", reason)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	ri, err := s.DB.GetRunner(ctx, id)
 	if errors.Is(err, storage.ErrNotFound) {
 		http.Error(w, "runner not registered", http.StatusNotFound)
@@ -2067,6 +2198,15 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 			j.Status = model.StatusFailure
 			j.Error = "runner returned invalid or oversized job outputs"
 		}
+		// Required-artifact enforcement: a SUCCESSFUL completion must have
+		// an artifact record for every contract entry with Required=true.
+		if j.Status == model.StatusSuccess {
+			if missing := s.requiredArtifactsMissingLocked(j); missing != "" {
+				j.Status = model.StatusFailure
+				j.Error = "required artifact " + missing + " missing"
+				s.auditLocked("job.required_artifact_missing", in.RunnerID, j.RunID, j.ID, j.Error, map[string]string{"job": j.Key, "artifact": missing})
+			}
+		}
 		j.FinishedAt = &now
 	}
 	if j.StartedAt != nil && j.FinishedAt != nil {
@@ -2160,6 +2300,31 @@ func (s *Server) completeDB(w http.ResponseWriter, r *http.Request, jobID string
 		http.Error(w, "stale or invalid lease", http.StatusConflict)
 		return
 	}
+	// Required-artifact enforcement (DB mode): a SUCCESSFUL completion must
+	// have an artifact record for every contract entry with Required=true.
+	// A missing required artifact flips the job to failure, emits the audit
+	// event, and recomputes the run.
+	if st == model.StatusSuccess {
+		if missing, merr := s.requiredArtifactsMissingDB(ctx, j); merr == nil && missing != "" {
+			if cur, gerr := s.DB.GetJob(ctx, jobID); gerr == nil && cur.Status == model.StatusSuccess {
+				fin := time.Now().UTC()
+				cur.Status = model.StatusFailure
+				cur.Error = "required artifact " + missing + " missing"
+				cur.FinishedAt = &fin
+				cur.LeaseRunnerID = ""
+				cur.LeaseTokenHash = nil
+				cur.LeaseExpiresAt = nil
+				if uerr := s.DB.UpdateJob(ctx, cur); uerr != nil {
+					s.logError("complete: required-artifact failure persist failed", "job", jobID, "error", uerr.Error())
+				}
+				s.auditLocked("job.required_artifact_missing", in.RunnerID, j.RunID, jobID, cur.Error, map[string]string{"job": j.Key, "artifact": missing})
+				s.recomputeRunDB(ctx, j.RunID)
+			}
+			st = model.StatusFailure
+		} else if merr != nil {
+			s.logError("complete: required-artifact check failed", "job", jobID, "error", merr.Error())
+		}
+	}
 	s.finishDeploymentDB(ctx, j, st, time.Now().UTC())
 	s.metricObserve("kiwi_job_duration_seconds", completionDurationSeconds(j), nil)
 	// Usage accounting: cost/energy from the frozen lease-time rates, then
@@ -2205,6 +2370,79 @@ func completionDurationSeconds(j model.Job) float64 {
 		finish = *j.FinishedAt
 	}
 	return finish.Sub(*j.StartedAt).Seconds()
+}
+
+// recomputeRunDB recomputes one run's status from its jobs in DB mode,
+// mirroring refreshRunLocked. Used when a server-side post-completion
+// correction (required-artifact failure) changes a job state after the
+// store's transactional recomputation already ran.
+func (s *Server) recomputeRunDB(ctx context.Context, runID string) {
+	run, err := s.DB.GetRun(ctx, runID)
+	if err != nil || run.Status == model.StatusCancelled {
+		return
+	}
+	jobs, err := s.DB.ListJobsByRun(ctx, runID)
+	if err != nil {
+		return
+	}
+	var total, terminal int
+	var anyRunning, anyFailure, anyCancelled, anyWaiting bool
+	var firstStart, lastFinish *time.Time
+	for _, j := range jobs {
+		total++
+		if j.StartedAt != nil && (firstStart == nil || j.StartedAt.Before(*firstStart)) {
+			t := *j.StartedAt
+			firstStart = &t
+		}
+		if j.Status.Terminal() {
+			terminal++
+			if j.FinishedAt != nil && (lastFinish == nil || j.FinishedAt.After(*lastFinish)) {
+				t := *j.FinishedAt
+				lastFinish = &t
+			}
+		}
+		switch j.Status {
+		case model.StatusRunning:
+			anyRunning = true
+		case model.StatusFailure, model.StatusBlocked:
+			anyFailure = true
+		case model.StatusCancelled:
+			anyCancelled = true
+		case model.StatusWaitingApproval:
+			anyWaiting = true
+		}
+	}
+	if total == 0 {
+		return
+	}
+	switch {
+	case terminal == total:
+		switch {
+		case anyFailure:
+			run.Status = model.StatusFailure
+		case anyCancelled:
+			run.Status = model.StatusCancelled
+		default:
+			run.Status = model.StatusSuccess
+		}
+		run.FinishedAt = lastFinish
+		if run.FinishedAt == nil {
+			n := time.Now().UTC()
+			run.FinishedAt = &n
+		}
+	case anyRunning:
+		run.Status = model.StatusRunning
+	case anyWaiting:
+		run.Status = model.StatusWaitingApproval
+	default:
+		run.Status = model.StatusQueued
+	}
+	if run.StartedAt == nil && firstStart != nil {
+		run.StartedAt = firstStart
+	}
+	if err := s.DB.UpdateRunStatus(ctx, runID, run.Status, run.StartedAt, run.FinishedAt); err != nil {
+		s.logError("complete: run recompute failed", "run", runID, "error", err.Error())
+	}
 }
 
 // completionResultHash canonicalizes a completion payload so identical
@@ -3323,6 +3561,7 @@ func (s *Server) maintainDB(ctx context.Context, now time.Time) {
 	if err := s.Sched.RecoverExpired(ctx, now); err != nil && !errors.Is(err, scheduler.ErrNotLeader) {
 		s.logError("lease recovery", "error", err.Error())
 	}
+	s.recoverDownstreamReservations(ctx, now)
 	s.flushOutbox()
 	s.GC(ctx, now)
 }

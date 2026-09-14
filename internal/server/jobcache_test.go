@@ -2,8 +2,6 @@ package server
 
 import (
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -144,13 +142,36 @@ func TestCacheManifestCarriesServerDerivedNamespace(t *testing.T) {
 		t.Fatal("missing cache manifest digest header")
 	}
 	repo, trust := cacheNamespace(s.mustJob("job-a"))
-	manifest := readFile(t, s.store.Root, "cache", cacheFileKey(repo, trust, key)+".manifest.json")
-	m, err := cache.VerifyManifest(manifest, s.ensureCacheSigner().Public)
+	f.mu.Lock()
+	rec, ok := f.cacheMans[repo+"\x00"+trust+"\x00"+key]
+	f.mu.Unlock()
+	if !ok {
+		t.Fatal("manifest row not persisted through CacheManifestStore")
+	}
+	m, err := cache.VerifyManifest(rec.Envelope, s.ensureCacheSigner().Public)
 	if err != nil {
 		t.Fatalf("verify manifest: %v", err)
 	}
 	if m.Repository != "o/repo-a" || m.TrustDomain != "trusted" || m.LogicalKey != key {
 		t.Fatalf("manifest namespace mismatch: repo=%q trust=%q key=%q", m.Repository, m.TrustDomain, m.LogicalKey)
+	}
+	if rec.BlobSHA256 != m.BlobSHA256 || rec.BlobSHA256 == "" {
+		t.Fatalf("manifest blob digest mismatch: %q", rec.BlobSHA256)
+	}
+	if rec.ProducerRun != "run-c" || rec.ProducerJob != "job-a" {
+		t.Fatalf("manifest producer provenance = %s/%s", rec.ProducerRun, rec.ProducerJob)
+	}
+	// GET resolves the manifest row and streams the blob from CAS; the
+	// runner-facing digest header matches the content.
+	w = doJSONHeaders(t, s, http.MethodGet, "/api/v1/jobs/job-a/cache/"+key, "runner-tok", "", hdrs)
+	if w.Code != http.StatusOK {
+		t.Fatalf("cache get = %d: %s", w.Code, w.Body.String())
+	}
+	if w.Body.String() != "payload" {
+		t.Fatalf("cache payload = %q", w.Body.String())
+	}
+	if got := w.Header().Get("X-Kiwi-Cache-SHA256"); got != m.BlobSHA256 {
+		t.Fatalf("X-Kiwi-Cache-SHA256 = %q, want %q", got, m.BlobSHA256)
 	}
 }
 
@@ -158,13 +179,4 @@ func (s *Server) mustJob(id string) model.Job {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.jobs[id]
-}
-
-func readFile(t *testing.T, root string, parts ...string) []byte {
-	t.Helper()
-	b, err := os.ReadFile(filepath.Join(append([]string{root}, parts...)...))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return b
 }

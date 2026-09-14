@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
@@ -69,7 +70,9 @@ type DBScheduler struct {
 	LeaderTTL time.Duration
 
 	// leader is true while this instance holds the leadership claim.
-	leader bool
+	// Access is atomic: Lease and IsLeader can run concurrently from
+	// runner poll goroutines.
+	leader atomic.Bool
 	// initErr records a leadership acquisition failure at construction.
 	initErr error
 }
@@ -105,7 +108,7 @@ func NewDB(store storage.Store, leaseDur time.Duration, newToken func() (string,
 	if err != nil {
 		s.initErr = err
 	} else {
-		s.leader = got
+		s.leader.Store(got)
 	}
 	return s
 }
@@ -127,7 +130,7 @@ func (s *DBScheduler) IsLeader(ctx context.Context) bool {
 		log.Printf("scheduler: leadership check failed: %v", err)
 		return false
 	}
-	s.leader = got
+	s.leader.Store(got)
 	return got
 }
 
@@ -250,6 +253,26 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 		}
 		expires := LeaseExpiry(now, s.LeaseDuration)
 		generation := candidate.LeaseGeneration + 1
+		// Capacity-atomic lease: when the store supports it, the job claim
+		// and the runner's active-jobs append happen in ONE transaction, so
+		// two concurrent leases can never exceed the runner's capacity. The
+		// separate UpsertRunner afterwards is skipped because the store
+		// already updated the runner row.
+		if as, ok := s.Store.(storage.AtomicLeaseStore); ok {
+			j, err := as.AcquireLeaseAtomic(ctx, candidate.ID, runnerID, s.HashToken(raw), generation, expires, ri.Capacity)
+			if errors.Is(err, storage.ErrLeaseConflict) {
+				continue
+			}
+			if errors.Is(err, storage.ErrNoCapacity) {
+				// The runner filled up between the read and the claim.
+				return nil, "", time.Time{}, ErrNoJobs
+			}
+			if err != nil {
+				return nil, "", time.Time{}, err
+			}
+			j.NeedsOutputs = CollectNeedsOutputs(candidate, jobs)
+			return &j, raw, expires, nil
+		}
 		j, err := s.Store.AcquireLease(ctx, candidate.ID, runnerID, s.HashToken(raw), generation, expires)
 		if errors.Is(err, storage.ErrLeaseConflict) {
 			// Another leader raced us (or the row moved); try the next candidate.

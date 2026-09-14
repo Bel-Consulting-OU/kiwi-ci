@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +21,18 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/version"
 )
+
+// subtleCompare compares two byte slices in constant time.
+func subtleCompare(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	var v byte
+	for i := range a {
+		v |= a[i] ^ b[i]
+	}
+	return v == 0
+}
 
 const (
 	// maxGeneratedFragmentBytes bounds one generated graph fragment upload.
@@ -206,18 +219,30 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 	}
 	now := time.Now().UTC()
 
-	// Map fragment keys to fresh job IDs and resolve dep edges.
-	keyIDs := make(map[string]string, len(g.Jobs))
-	created := make(map[string]model.Job, len(g.Jobs))
-	jobContracts := map[string]map[string]storage.ArtifactContract{}
-	var keys, ids []string
-	for key, cj := range g.Jobs {
+	// Two-pass ID allocation: EVERY fragment key gets its job ID first, and
+	// only then are the jobs and their dependency edges built. Iterating the
+	// compiled graph once would read keyIDs[dep] for dependencies whose IDs
+	// the map iteration order has not allocated yet, producing empty
+	// dependency IDs.
+	keys := make([]string, 0, len(g.Jobs))
+	for key := range g.Jobs {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	keyIDs := make(map[string]string, len(keys))
+	for _, key := range keys {
 		id, idErr := newID()
 		if idErr != nil {
 			return nil, fmt.Errorf("generate job id: %w", idErr)
 		}
 		keyIDs[key] = id
-		keys = append(keys, key)
+	}
+	created := make(map[string]model.Job, len(keys))
+	jobContracts := map[string]map[string]storage.ArtifactContract{}
+	ids := make([]string, 0, len(keys))
+	for _, key := range keys {
+		cj := g.Jobs[key]
+		id := keyIDs[key]
 		ids = append(ids, id)
 		cjJSON, mErr := json.Marshal(cj)
 		if mErr != nil {
@@ -226,7 +251,11 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 		digestSum := sha256.Sum256(cjJSON)
 		needs := []string{parent.ID}
 		for _, dep := range in.Deps[key] {
-			needs = append(needs, keyIDs[dep])
+			depID := keyIDs[dep]
+			if depID == "" {
+				return nil, fmt.Errorf("generated job %q depends on unresolved fragment job %q", key, dep)
+			}
+			needs = append(needs, depID)
 		}
 		env := cj.Job.Environment.Name
 		infraRetries := cj.Job.InfraRetries
@@ -261,19 +290,35 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 	}
 
 	if s.DB != nil {
-		ds, ok := s.DB.(storage.DynamicStore)
+		ds, ok := s.DB.(storage.DynamicStoreTx)
 		if !ok {
-			return nil, fmt.Errorf("store does not support dynamic job insertion")
+			return nil, fmt.Errorf("store does not support transactional dynamic job insertion")
 		}
 		deps := make(map[string][]string, len(created))
 		for id, j := range created {
 			deps[id] = append([]string(nil), j.Needs...)
 		}
-		if err := ds.InsertGeneratedJobs(ctx, parent.ID, childDepth, created, deps); err != nil {
-			return nil, err
+		// Transactional recheck: the store locks the parent FOR UPDATE and
+		// counts the run's jobs inside the transaction; the closure
+		// re-validates {job, runner, generation, token, expiry} and the
+		// max-jobs-per-run bound against that fresh state.
+		verify := func(fresh model.Job, runJobCount int) error {
+			if fresh.Status != model.StatusRunning || fresh.LeaseExpiresAt == nil || !fresh.LeaseExpiresAt.After(time.Now().UTC()) {
+				return fmt.Errorf("parent lease expired during generation")
+			}
+			if fresh.LeaseRunnerID != parent.LeaseRunnerID || fresh.LeaseGeneration != parent.LeaseGeneration {
+				return fmt.Errorf("parent lease changed during generation")
+			}
+			if !subtleCompare(fresh.LeaseTokenHash, parent.LeaseTokenHash) {
+				return fmt.Errorf("parent lease token changed during generation")
+			}
+			if runJobCount+len(created) > maxJobsPerRun {
+				return fmt.Errorf("run would grow to %d jobs, limit is %d", runJobCount+len(created), maxJobsPerRun)
+			}
+			return nil
 		}
-		for id, contracts := range jobContracts {
-			s.persistJobContracts(ctx, id, contracts)
+		if err := ds.InsertGeneratedJobsTx(ctx, parent.ID, childDepth, created, deps, verify); err != nil {
+			return nil, err
 		}
 		return &generatedResponse{ParentJobID: parent.ID, RunID: parent.RunID, Depth: childDepth, JobIDs: ids, Keys: keys}, nil
 	}

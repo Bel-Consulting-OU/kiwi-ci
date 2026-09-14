@@ -92,13 +92,17 @@ func TestDBModeSmoke(t *testing.T) {
 	}
 	f.mu.Lock()
 	inserted := len(f.insertRunCalls)
-	jobCount := len(f.insertJobCalls)
+	compiled := len(f.compiledCalls)
+	jobCount := len(f.jobs)
 	f.mu.Unlock()
 	if inserted != 1 {
-		t.Fatalf("InsertRun calls = %d, want 1", inserted)
+		t.Fatalf("run inserts = %d, want 1", inserted)
+	}
+	if compiled != 1 {
+		t.Fatalf("InsertCompiledRun calls = %d, want 1 (atomic enqueue)", compiled)
 	}
 	if jobCount != 1 {
-		t.Fatalf("InsertJob calls = %d, want 1", jobCount)
+		t.Fatalf("jobs stored = %d, want 1", jobCount)
 	}
 
 	// Register a runner, then lease through next().

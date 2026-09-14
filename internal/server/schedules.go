@@ -354,22 +354,37 @@ func (s *Server) scheduleByID(ctx context.Context, id string) (storage.Schedule,
 }
 
 // fireDueSchedules is the Maintain-tick entry point: it fires every
-// enabled schedule for every nominal occurrence due at the tick time.
-// LastRun advances with each fire, so the loop naturally sweeps multiple
-// missed nominals; the bound keeps a wedged claim from spinning forever.
+// due nominal occurrence. The occurrence claim rides INSIDE the enqueue
+// transaction, so a failed enqueue leaves the nominal unclaimed and the
+// next tick refires it; only successful enqueues (or occurrences claimed
+// by another instance) advance LastRun.
 func (s *Server) fireDueSchedules(ctx context.Context, now time.Time) {
+	// Collect the due occurrences first (without advancing) so a failing
+	// schedule cannot spin the tick loop or starve other schedules.
+	type dueFire struct {
+		sc      storage.Schedule
+		nominal time.Time
+	}
+	seen := map[string]bool{}
+	var dues []dueFire
 	for i := 0; i < 100; i++ {
-		sc, nominal, ok := s.nextDueSchedule(now)
+		sc, nominal, ok := s.nextDueScheduleFrom(now, seen)
 		if !ok {
-			return
+			break
 		}
-		if _, fired, err := s.fireSchedule(ctx, sc, nominal); err != nil {
-			s.logError("schedule fire failed", "schedule", sc.ID, "error", err.Error())
-			s.advanceSchedulePast(ctx, sc, nominal)
-			return
+		key := sc.ID + "\x00" + nominal.UTC().Format(time.RFC3339Nano)
+		seen[key] = true
+		dues = append(dues, dueFire{sc, nominal})
+	}
+	for _, d := range dues {
+		if _, fired, err := s.fireSchedule(ctx, d.sc, d.nominal); err != nil {
+			s.logError("schedule fire failed", "schedule", d.sc.ID, "error", err.Error())
+			// The occurrence claim was rolled back with the failed
+			// enqueue: leave LastRun so the next tick refires it.
+			continue
 		} else if !fired {
 			// Another instance claimed this nominal; skip ahead.
-			s.advanceSchedulePast(ctx, sc, nominal)
+			s.advanceSchedulePast(ctx, d.sc, d.nominal)
 			continue
 		}
 	}
@@ -387,9 +402,11 @@ func (s *Server) advanceSchedulePast(ctx context.Context, sc storage.Schedule, n
 	}
 }
 
-// nextDueSchedule returns the next enabled schedule with a due nominal
-// occurrence, or ok=false when nothing is due.
-func (s *Server) nextDueSchedule(now time.Time) (storage.Schedule, time.Time, bool) {
+// nextDueScheduleFrom returns the next enabled schedule with a due nominal
+// occurrence not already in seen (the collection loop's skip set), or
+// ok=false when nothing is due. Nominals are derived from LastRun/CreatedAt
+// without advancing anything.
+func (s *Server) nextDueScheduleFrom(now time.Time, seen map[string]bool) (storage.Schedule, time.Time, bool) {
 	now = now.UTC()
 	s.mu.Lock()
 	ids := make([]string, 0, len(s.schedules))
@@ -413,31 +430,36 @@ func (s *Server) nextDueSchedule(now time.Time) (storage.Schedule, time.Time, bo
 		if sc.LastRun != nil {
 			base = *sc.LastRun
 		}
-		next := cron.next(base)
-		if next.IsZero() {
-			continue
-		}
-		if !next.After(now) {
-			return sc, next, true
+		for i := 0; i < 64; i++ {
+			next := cron.next(base)
+			if next.IsZero() {
+				break
+			}
+			if !next.After(now) {
+				key := sc.ID + "\x00" + next.UTC().Format(time.RFC3339Nano)
+				if !seen[key] {
+					return sc, next, true
+				}
+				base = next
+				continue
+			}
+			break
 		}
 	}
 	return storage.Schedule{}, time.Time{}, false
 }
 
-// fireSchedule claims the (schedule, nominal) occurrence idempotently and
-// enqueues the scheduled run. It reports fired=false when the nominal was
-// already claimed by another run (duplicate trigger or another instance).
+// fireSchedule enqueues the scheduled run with its occurrence claim carried
+// INSIDE the enqueue: in DB mode InsertCompiledRun inserts the occurrence
+// row in the same transaction as the run (a failed enqueue leaves the
+// occurrence unclaimed and the next tick refires it); in memory mode the
+// claim lands under s.mu only after the run is committed. It reports
+// fired=false when the nominal was already claimed by another run
+// (duplicate trigger or another instance).
 func (s *Server) fireSchedule(ctx context.Context, sc storage.Schedule, nominal time.Time) (model.Run, bool, error) {
 	preID, err := newID()
 	if err != nil {
 		return model.Run{}, false, err
-	}
-	claimed, err := s.claimScheduleOccurrence(ctx, sc.ID, nominal, preID)
-	if err != nil {
-		return model.Run{}, false, err
-	}
-	if !claimed {
-		return model.Run{}, false, nil
 	}
 	_, ref, err := parseScheduleSpec(sc.Spec)
 	if err != nil {
@@ -451,9 +473,15 @@ func (s *Server) fireSchedule(ctx context.Context, sc storage.Schedule, nominal 
 		Pipeline:     sanitizeScheduleSpec(sc.Spec),
 		Trusted:      true,
 		Metadata:     map[string]string{"schedule_id": sc.ID, "schedule_nominal": nominal.Format(time.RFC3339)},
+		// The occurrence claim commits atomically with the run.
+		ScheduleClaim: &storage.ScheduleClaim{ScheduleID: sc.ID, Nominal: nominal},
 	}
 	run, err := s.enqueueID(in, preID)
 	if err != nil {
+		if errors.Is(err, storage.ErrScheduleClaimLost) {
+			// Another instance claimed this nominal with a different run.
+			return model.Run{}, false, nil
+		}
 		s.auditLocked("schedule.trigger_failed", "scheduler", "", "", "scheduled run rejected", map[string]string{"schedule": sc.ID, "error": err.Error()})
 		return model.Run{}, false, err
 	}
@@ -475,27 +503,19 @@ func (s *Server) fireSchedule(ctx context.Context, sc storage.Schedule, nominal 
 	return run, true, nil
 }
 
-// claimScheduleOccurrence atomically reserves the (schedule, nominal)
-// firing for runID. Returns true only when this call made the claim.
-func (s *Server) claimScheduleOccurrence(ctx context.Context, scheduleID string, nominal time.Time, runID string) (bool, error) {
-	if ss, ok := s.scheduleStoreDB(); ok {
-		return ss.ClaimScheduleOccurrence(ctx, scheduleID, nominal, runID)
-	}
+// claimScheduleOccurrenceLocked claims the (schedule, nominal) firing for
+// runID under s.mu, reporting whether this call made the claim. A memory
+// mode firing claims only after a successful in-memory enqueue.
+func (s *Server) claimScheduleOccurrenceLocked(scheduleID string, nominal time.Time, runID string) bool {
 	key := nominal.UTC().Unix()
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	occ := s.occurrences[scheduleID]
 	if occ == nil {
 		occ = map[int64]string{}
 		s.occurrences[scheduleID] = occ
 	}
 	if existing, ok := occ[key]; ok {
-		return existing == runID, nil
+		return existing == runID
 	}
 	occ[key] = runID
-	if err := s.persistSchedulesLocked(); err != nil {
-		delete(occ, key)
-		return false, err
-	}
-	return true, nil
+	return true
 }

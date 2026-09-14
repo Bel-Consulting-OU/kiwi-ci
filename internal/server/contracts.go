@@ -213,6 +213,72 @@ func contractRetention(d time.Duration) time.Duration {
 	}
 }
 
+// requiredArtifactsMissingLocked returns the name of the first contract
+// entry with Required=true that has no artifact record for (job, name), or
+// "" when every required artifact is present. The caller holds s.mu.
+func (s *Server) requiredArtifactsMissingLocked(j model.Job) string {
+	contracts := s.contracts[j.ID]
+	if len(contracts) == 0 {
+		if cj, ok := compileJobFromPipeline(j); ok {
+			contracts = buildJobContracts(cj)
+		}
+	}
+	for name, c := range contracts {
+		if !c.Required {
+			continue
+		}
+		found := false
+		for _, a := range s.artifacts {
+			if a.JobID == j.ID && a.Name == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return name
+		}
+	}
+	return ""
+}
+
+// requiredArtifactsMissingDB is the DB-mode equivalent: contracts come from
+// the store (or the job's pipeline) and artifact records from the artifact
+// table.
+func (s *Server) requiredArtifactsMissingDB(ctx context.Context, j model.Job) (string, error) {
+	contracts, ok, err := s.jobContracts(ctx, j.ID)
+	if err != nil {
+		return "", err
+	}
+	if !ok || len(contracts) == 0 {
+		if cj, ok := compileJobFromPipeline(j); ok {
+			contracts = buildJobContracts(cj)
+		}
+	}
+	var records []model.ArtifactRecord
+	for name, c := range contracts {
+		if !c.Required {
+			continue
+		}
+		if records == nil {
+			records, err = s.DB.ListArtifacts(ctx, j.RunID)
+			if err != nil {
+				return "", err
+			}
+		}
+		found := false
+		for _, a := range records {
+			if a.JobID == j.ID && a.Name == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return name, nil
+		}
+	}
+	return "", nil
+}
+
 // findArtifactByJobName returns every artifact record uploaded for a
 // (job, name) pair. DB mode lists through the store; memory mode scans the
 // in-memory map.

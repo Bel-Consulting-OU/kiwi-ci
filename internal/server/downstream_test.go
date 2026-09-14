@@ -161,7 +161,9 @@ func TestDownstreamLaunchExactlyOnceAcrossRestart(t *testing.T) {
 		}
 		return childPipeline, nil
 	}
-	// Simulate a crash between the child launch and the outbox ack: dispatch
+	// Reserve-first flow: the link reservation is claimed BEFORE the child
+	// run is enqueued, so a crash between the launch and the outbox ack
+	// leaves a launched link that a replayed dispatch must skip. Dispatch
 	// the intent directly (no ack), then restart the control plane.
 	if err := s.dispatchOutbox(context.Background(), item); err != nil {
 		t.Fatalf("dispatch: %v", err)
@@ -174,7 +176,10 @@ func TestDownstreamLaunchExactlyOnceAcrossRestart(t *testing.T) {
 		t.Fatalf("link: ok=%v err=%v", ok, err)
 	}
 	if link.ChildRunID == "" {
-		t.Fatal("link was not claimed")
+		t.Fatal("link was not launched")
+	}
+	if link.Reserved {
+		t.Fatal("mark-launched must consume the reservation")
 	}
 
 	// Restart from the same dataDir: the outbox replays the unacked intent,

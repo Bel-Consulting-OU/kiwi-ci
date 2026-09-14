@@ -36,10 +36,24 @@ type dbFakeStore struct {
 	queueReasons     map[string]string
 	queueReasonsErrs int
 	downstreamLinks  map[string]storage.DownstreamLink
+	deliveries       map[string]string
+	quotas           map[string][2]int
+	cacheMans        map[string]storage.CacheManifestRecord
 
 	leaderOK  bool
 	leaderErr error
 	schemaErr error
+
+	// usageErr, when non-nil, makes RecentUsage fail (budget-state
+	// fail-closed tests).
+	usageErr error
+	// enqueueFailOnce makes the next InsertCompiledRun fail (schedule
+	// atomicity tests).
+	enqueueFailOnce bool
+	// atomicLeaseCapacity limits AcquireLeaseAtomic; <=0 means unlimited.
+	atomicLeaseCapacity int
+	// atomicLeaseErrs makes AcquireLeaseAtomic fail a number of times.
+	atomicLeaseErrs int
 
 	insertRunCalls []model.Run
 	insertJobCalls []model.Job
@@ -48,6 +62,7 @@ type dbFakeStore struct {
 	completeCalls  []completeArgs
 	cancelRunCalls []cancelRunArgs
 	updateJobCalls []model.Job
+	compiledCalls  []storage.InsertCompiledRunRequest
 }
 
 type acquireArgs struct {
@@ -86,11 +101,17 @@ var _ storage.SnapshotStore = (*dbFakeStore)(nil)
 var _ storage.ArtifactContractStore = (*dbFakeStore)(nil)
 var _ storage.QueueReasonStore = (*dbFakeStore)(nil)
 var _ storage.DynamicStore = (*dbFakeStore)(nil)
+var _ storage.DynamicStoreTx = (*dbFakeStore)(nil)
 var _ storage.DownstreamStore = (*dbFakeStore)(nil)
 var _ storage.UsageStore = (*dbFakeStore)(nil)
 var _ storage.RunDownstreamStore = (*dbFakeStore)(nil)
 var _ storage.ArtifactLookupStore = (*dbFakeStore)(nil)
 var _ storage.RunnerJobStore = (*dbFakeStore)(nil)
+var _ storage.RunEnqueueStore = (*dbFakeStore)(nil)
+var _ storage.AtomicLeaseStore = (*dbFakeStore)(nil)
+var _ storage.QuotaCounterStore = (*dbFakeStore)(nil)
+var _ storage.CacheManifestStore = (*dbFakeStore)(nil)
+var _ storage.ArtifactSidecarStore = (*dbFakeStore)(nil)
 
 func newDBFakeStore() *dbFakeStore {
 	return &dbFakeStore{
@@ -104,6 +125,9 @@ func newDBFakeStore() *dbFakeStore {
 		contracts:       map[string]map[string]storage.ArtifactContract{},
 		queueReasons:    map[string]string{},
 		downstreamLinks: map[string]storage.DownstreamLink{},
+		deliveries:      map[string]string{},
+		quotas:          map[string][2]int{},
+		cacheMans:       map[string]storage.CacheManifestRecord{},
 		leaderOK:        true,
 	}
 }
@@ -444,11 +468,17 @@ func (f *dbFakeStore) HasCompletionReceipt(ctx context.Context, jobID string, ge
 }
 
 func (f *dbFakeStore) UpsertDelivery(ctx context.Context, forge, deliveryID string, runID string, payloadDigest string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deliveries[forge+"/"+deliveryID] = runID
 	return nil
 }
 
 func (f *dbFakeStore) FindDelivery(ctx context.Context, forge, deliveryID string) (string, bool, error) {
-	return "", false, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	v, ok := f.deliveries[forge+"/"+deliveryID]
+	return v, ok, nil
 }
 
 func (f *dbFakeStore) TryAcquireLeadership(ctx context.Context, key string, ttl time.Duration) (bool, error) {
@@ -714,6 +744,9 @@ func (f *dbFakeStore) MarkDownstreamLaunched(ctx context.Context, parentJobID, t
 func (f *dbFakeStore) RecentUsage(ctx context.Context, since time.Time) (float64, float64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.usageErr != nil {
+		return 0, 0, f.usageErr
+	}
 	var cost, energy float64
 	for _, j := range f.jobs {
 		if j.FinishedAt == nil || j.FinishedAt.Before(since) {
@@ -767,4 +800,294 @@ func (f *dbFakeStore) GetArtifact(ctx context.Context, id string) (model.Artifac
 		}
 	}
 	return model.ArtifactRecord{}, storage.ErrNotFound
+}
+
+// ---------------------------------------------------------------------------
+// atomicity/storage round extension interfaces
+// ---------------------------------------------------------------------------
+
+// InsertCompiledRun applies the atomic enqueue in memory: the run, jobs,
+// contracts, delivery claim, quota reservation and schedule claim commit
+// together (or none of them do).
+func (f *dbFakeStore) InsertCompiledRun(ctx context.Context, req storage.InsertCompiledRunRequest) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.compiledCalls = append(f.compiledCalls, req)
+	if f.enqueueFailOnce {
+		f.enqueueFailOnce = false
+		return fmt.Errorf("enqueue: injected failure")
+	}
+	if req.WebhookClaim != nil {
+		if _, exists := f.deliveries[req.WebhookClaim.Forge+"/"+req.WebhookClaim.DeliveryID]; exists {
+			return storage.ErrDeliveryDuplicate
+		}
+	}
+	if req.ScheduleClaim != nil {
+		for _, o := range f.occurrences[req.ScheduleClaim.ScheduleID] {
+			if o.Nominal.Equal(req.ScheduleClaim.Nominal) {
+				if o.RunID != req.Run.ID {
+					return storage.ErrScheduleClaimLost
+				}
+			}
+		}
+	}
+	if req.Quota != nil {
+		jobCount := req.Quota.JobCount
+		if jobCount < 0 {
+			jobCount = 0
+		}
+		keys := []string{req.Quota.RepoKey}
+		if req.Quota.TeamKey != "" && req.Quota.TeamKey != req.Quota.RepoKey {
+			keys = append(keys, req.Quota.TeamKey)
+		}
+		for _, key := range keys {
+			c := f.quotas[key]
+			c[1] += jobCount
+			isTeam := key == req.Quota.TeamKey
+			runningLimit, queueLimit := req.Quota.RepoConcurrency, req.Quota.RepoQueueDepth
+			reason := "REPO_QUOTA"
+			if isTeam {
+				runningLimit, queueLimit = req.Quota.TeamConcurrency, req.Quota.TeamQueueDepth
+				reason = "TEAM_QUOTA"
+			}
+			if runningLimit > 0 && float64(c[0]) >= runningLimit {
+				return &storage.QuotaExceededError{Reason: reason, Msg: fmt.Sprintf("concurrency limit %g", runningLimit)}
+			}
+			if queueLimit > 0 && float64(c[1]) > queueLimit {
+				return &storage.QuotaExceededError{Reason: reason, Msg: fmt.Sprintf("queue depth limit %g", queueLimit)}
+			}
+			f.quotas[key] = c
+		}
+	}
+	now := time.Now().UTC()
+	f.insertRunCalls = append(f.insertRunCalls, req.Run)
+	f.runs[req.Run.ID] = req.Run
+	for id, j := range req.Jobs {
+		f.jobs[id] = j
+		if contracts, ok := req.Contracts[id]; ok {
+			f.contracts[id] = contracts
+		}
+	}
+	for _, id := range req.CancelPrevious {
+		j, ok := f.jobs[id]
+		if !ok || j.Status.Terminal() {
+			continue
+		}
+		j.Status = model.StatusCancelled
+		j.Error = "superseded by run " + req.Run.ID
+		j.FinishedAt = &now
+		j.LeaseRunnerID = ""
+		j.LeaseTokenHash = nil
+		j.LeaseExpiresAt = nil
+		f.jobs[id] = j
+		f.audit = append(f.audit, model.AuditEvent{ID: id + "|audit", Action: "job.superseded", Actor: "scheduler", RunID: j.RunID, JobID: id, CreatedAt: now})
+	}
+	if req.WebhookClaim != nil {
+		f.deliveries[req.WebhookClaim.Forge+"/"+req.WebhookClaim.DeliveryID] = req.Run.ID
+	}
+	if req.ScheduleClaim != nil {
+		f.occurrences[req.ScheduleClaim.ScheduleID] = append(f.occurrences[req.ScheduleClaim.ScheduleID], storage.Occurrence{ScheduleID: req.ScheduleClaim.ScheduleID, Nominal: req.ScheduleClaim.Nominal, RunID: req.Run.ID})
+	}
+	return nil
+}
+
+// AcquireLeaseAtomic mirrors the SQL atomic lease: the job claim and the
+// runner capacity slot commit or fail together.
+func (f *dbFakeStore) AcquireLeaseAtomic(ctx context.Context, jobID, runnerID string, tokenHash []byte, generation int64, expiresAt time.Time, runnerCapacity int) (model.Job, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.atomicLeaseErrs > 0 {
+		f.atomicLeaseErrs--
+		return model.Job{}, storage.ErrLeaseConflict
+	}
+	f.acquireCalls = append(f.acquireCalls, acquireArgs{jobID, runnerID, tokenHash, generation, expiresAt})
+	j, ok := f.jobs[jobID]
+	if !ok {
+		return model.Job{}, storage.ErrNotFound
+	}
+	if j.Status != model.StatusQueued {
+		return model.Job{}, storage.ErrLeaseConflict
+	}
+	r, rok := f.runners[runnerID]
+	if !rok {
+		return model.Job{}, storage.ErrNoCapacity
+	}
+	cap := runnerCapacity
+	if cap <= 0 {
+		cap = f.atomicLeaseCapacity
+	}
+	if cap > 0 && len(r.ActiveJobs) >= cap {
+		return model.Job{}, storage.ErrNoCapacity
+	}
+	j.Status = model.StatusRunning
+	j.Attempts++
+	j.LeaseRunnerID = runnerID
+	j.LeaseTokenHash = tokenHash
+	j.LeaseGeneration = generation
+	j.LeaseExpiresAt = &expiresAt
+	f.jobs[jobID] = j
+	r.ActiveJobs = append(r.ActiveJobs, jobID)
+	if len(r.ActiveJobs) > 0 {
+		r.CurrentJob = r.ActiveJobs[0]
+	}
+	r.Busy = cap > 0 && len(r.ActiveJobs) >= cap
+	f.runners[runnerID] = r
+	return j, nil
+}
+
+func (f *dbFakeStore) AdjustQuotaCounter(ctx context.Context, repoKey, teamKey string, runningDelta, queuedDelta int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, key := range []string{repoKey, teamKey} {
+		if key == "" {
+			continue
+		}
+		c := f.quotas[key]
+		c[0] += runningDelta
+		if c[0] < 0 {
+			c[0] = 0
+		}
+		c[1] += queuedDelta
+		if c[1] < 0 {
+			c[1] = 0
+		}
+		f.quotas[key] = c
+	}
+	return nil
+}
+
+func (f *dbFakeStore) QuotaCounts(ctx context.Context, repoKey, teamKey string) (int, int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var running, queued int
+	for _, key := range []string{repoKey, teamKey} {
+		if key == "" {
+			continue
+		}
+		c := f.quotas[key]
+		running += c[0]
+		queued += c[1]
+	}
+	return running, queued, nil
+}
+
+func (f *dbFakeStore) ReserveDownstreamLaunch(ctx context.Context, parentJobID, targetRepo, targetRef, launchToken string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := parentJobID + "\x00" + targetRepo + "\x00" + targetRef
+	l, ok := f.downstreamLinks[key]
+	if !ok {
+		now := time.Now().UTC()
+		f.downstreamLinks[key] = storage.DownstreamLink{ParentJobID: parentJobID, TargetRepo: targetRepo, TargetRef: targetRef, LaunchToken: launchToken, Reserved: true, ReservedAt: &now, CreatedAt: now}
+		return true, nil
+	}
+	if l.ChildRunID != "" || l.Reserved {
+		return false, nil
+	}
+	now := time.Now().UTC()
+	l.Reserved = true
+	l.ReservedAt = &now
+	if l.LaunchToken == "" {
+		l.LaunchToken = launchToken
+	}
+	f.downstreamLinks[key] = l
+	return true, nil
+}
+
+func (f *dbFakeStore) ReleaseDownstreamReservation(ctx context.Context, parentJobID, targetRepo, targetRef string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := parentJobID + "\x00" + targetRepo + "\x00" + targetRef
+	l, ok := f.downstreamLinks[key]
+	if !ok || l.ChildRunID != "" {
+		return nil
+	}
+	l.Reserved = false
+	l.ReservedAt = nil
+	f.downstreamLinks[key] = l
+	return nil
+}
+
+func (f *dbFakeStore) ExpireDownstreamReservations(ctx context.Context, olderThan time.Time) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for key, l := range f.downstreamLinks {
+		if !l.Reserved || l.ChildRunID != "" {
+			continue
+		}
+		if l.ReservedAt == nil || l.ReservedAt.Before(olderThan) {
+			l.Reserved = false
+			l.ReservedAt = nil
+			f.downstreamLinks[key] = l
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (f *dbFakeStore) InsertGeneratedJobsTx(ctx context.Context, parentJobID string, depth int, jobs map[string]model.Job, deps map[string][]string, verify storage.GeneratedJobVerifier) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	parent, ok := f.jobs[parentJobID]
+	if !ok {
+		return storage.ErrNotFound
+	}
+	count := 0
+	for _, j := range f.jobs {
+		if j.RunID == parent.RunID {
+			count++
+		}
+	}
+	if verify != nil {
+		if err := verify(parent, count); err != nil {
+			return err
+		}
+	}
+	for id, j := range jobs {
+		f.jobs[id] = j
+	}
+	return nil
+}
+
+func (f *dbFakeStore) PutCacheManifest(ctx context.Context, rec storage.CacheManifestRecord) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if rec.CreatedAt.IsZero() {
+		rec.CreatedAt = time.Now().UTC()
+	}
+	f.cacheMans[rec.Repo+"\x00"+rec.TrustDomain+"\x00"+rec.LogicalKey] = rec
+	return nil
+}
+
+func (f *dbFakeStore) GetCacheManifest(ctx context.Context, repo, trustDomain, logicalKey string) (storage.CacheManifestRecord, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	rec, ok := f.cacheMans[repo+"\x00"+trustDomain+"\x00"+logicalKey]
+	return rec, ok, nil
+}
+
+func (f *dbFakeStore) SetArtifactSidecars(ctx context.Context, id, sbomPath, sbomSHA256, sigstorePath, sigstoreSHA256 string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, a := range f.artifacts {
+		if a.ID != id {
+			continue
+		}
+		if sbomPath != "" {
+			a.SBOMPath = sbomPath
+		}
+		if sbomSHA256 != "" {
+			a.SBOMSHA256 = sbomSHA256
+		}
+		if sigstorePath != "" {
+			a.SigstorePath = sigstorePath
+		}
+		if sigstoreSHA256 != "" {
+			a.SigstoreSHA256 = sigstoreSHA256
+		}
+		f.artifacts[i] = a
+		return nil
+	}
+	return storage.ErrNotFound
 }

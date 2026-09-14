@@ -125,7 +125,9 @@ func hmacSHA256(key []byte, data string) []byte {
 
 func (s *S3) Put(ctx context.Context, key string, r io.Reader, size int64) (Object, error) {
 	// Buffer to compute MD5 and SHA256 before sending; S3 PutObject requires
-	// the body hash for SigV4.
+	// the body hash for SigV4. The read is bounded to size+1 so a stream
+	// longer than the declared size is rejected instead of silently
+	// uploaded; short streams fail the exact-size check below.
 	tmp, err := os.CreateTemp("", "kiwi-s3-put-*")
 	if err != nil {
 		return Object{}, err
@@ -134,9 +136,12 @@ func (s *S3) Put(ctx context.Context, key string, r io.Reader, size int64) (Obje
 	defer tmp.Close()
 	h := sha256.New()
 	m := md5.New()
-	n, err := io.Copy(io.MultiWriter(tmp, h, m), r)
+	n, err := io.Copy(io.MultiWriter(tmp, h, m), io.LimitReader(r, size+1))
 	if err != nil {
 		return Object{}, err
+	}
+	if n != size {
+		return Object{}, fmt.Errorf("blob: s3 put size mismatch: wrote %d bytes, expected %d", n, size)
 	}
 	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
 		return Object{}, err

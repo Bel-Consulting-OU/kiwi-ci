@@ -175,6 +175,10 @@ func TestScheduleTriggerOncePerNominalMemoryMode(t *testing.T) {
 	if runs2 != runs {
 		t.Fatalf("second fire added runs: %d -> %d", runs, runs2)
 	}
+	// Re-fire at the current time so the CURRENT nominal is claimed before
+	// the manual trigger below (a minute rollover between the fires above
+	// and the trigger must not leave it unclaimed).
+	s.fireDueSchedules(context.Background(), time.Now().UTC())
 	// Manual trigger in the same nominal minute conflicts.
 	w = doJSON(t, s, http.MethodPost, "/api/v1/schedules/"+sc.ID+"/trigger", "token", "")
 	if w.Code == http.StatusAccepted {

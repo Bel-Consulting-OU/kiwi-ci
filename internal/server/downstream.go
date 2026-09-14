@@ -34,7 +34,9 @@ type downstreamPayload struct {
 // recordDownstreamIntents resolves a successfully completed job's
 // downstream declaration into a durable launch claim and an outbox intent.
 // Idempotent: the claim row (or fs-mode snapshot entry) is only created
-// once, and the outbox dedupes by item ID across replays.
+// once, and the outbox dedupes by item ID across replays. The link carries
+// the forge identity coordinates (forge kind, API base URL override, repo
+// ID) so dispatch never re-derives hosts from hard-coded public endpoints.
 func (s *Server) recordDownstreamIntents(ctx context.Context, j model.Job, run model.Run) {
 	cj, ok := compileJobFromPipeline(j)
 	if !ok {
@@ -58,12 +60,16 @@ func (s *Server) recordDownstreamIntents(ctx context.Context, j model.Job, run m
 		s.logError("downstream: launch token generation failed", "error", err.Error())
 		return
 	}
+	forgeKind := forgeKindForHost(repoURLHost(run.Repo))
 	link := storage.DownstreamLink{
-		ParentJobID: j.ID,
-		TargetRepo:  targetRepo,
-		TargetRef:   targetRef,
-		LaunchToken: token,
-		CreatedAt:   time.Now().UTC(),
+		ParentJobID:   j.ID,
+		TargetRepo:    targetRepo,
+		TargetRef:     targetRef,
+		LaunchToken:   token,
+		TargetForge:   forgeKind,
+		TargetBaseURL: s.forgeBaseURL(forgeKind),
+		TargetRepoID:  targetRepo,
+		CreatedAt:     time.Now().UTC(),
 	}
 	if err := s.insertDownstreamLink(ctx, link); err != nil {
 		s.logError("downstream: link insert failed", "error", err.Error())
@@ -78,7 +84,7 @@ func (s *Server) recordDownstreamIntents(ctx context.Context, j model.Job, run m
 		Event:       event,
 		Wait:        d.Wait,
 		Inputs:      cloneMap(d.Inputs),
-		Forge:       forgeKindForHost(repoURLHost(run.Repo)),
+		Forge:       forgeKind,
 		Trusted:     downstreamChildTrusted(j),
 	}
 	raw, err := json.Marshal(payload)
@@ -89,6 +95,33 @@ func (s *Server) recordDownstreamIntents(ctx context.Context, j model.Job, run m
 	item := forge.OutboxItem{Kind: forge.OutboxKindDownstream, Payload: raw, CreatedAt: time.Now().UTC()}
 	if err := s.outbox.Enqueue(item); err != nil {
 		s.logError("downstream: outbox enqueue failed", "error", err.Error())
+	}
+}
+
+// forgeBaseURL returns the configured API base URL override for a forge
+// kind (empty means the forge's public endpoint).
+func (s *Server) forgeBaseURL(forgeKind string) string {
+	switch forgeKind {
+	case "github":
+		return s.gitHubAPIBase
+	case "gitlab":
+		return s.gitLabAPIBase
+	case "forgejo":
+		return s.forgejoAPIBase
+	}
+	return ""
+}
+
+// SetForgeBaseURL overrides the API base URL for one forge adapter (the
+// production wiring sets it for self-hosted Forgejo/GitLab instances).
+func (s *Server) SetForgeBaseURL(forgeName, baseURL string) {
+	switch forgeName {
+	case "github":
+		s.gitHubAPIBase = baseURL
+	case "gitlab":
+		s.gitLabAPIBase = baseURL
+	case "forgejo":
+		s.forgejoAPIBase = baseURL
 	}
 }
 
@@ -160,44 +193,17 @@ func (s *Server) getDownstreamLink(ctx context.Context, parentJobID, targetRepo,
 	return l, ok, nil
 }
 
-// markDownstreamLaunched claims the link for childRunID and reports whether
-// this call won the claim (the stored ChildRunID is childRunID afterwards).
-func (s *Server) markDownstreamLaunched(ctx context.Context, parentJobID, targetRepo, targetRef, childRunID string) (bool, error) {
-	if ds, ok := s.downstreamStore(); ok {
-		if err := ds.MarkDownstreamLaunched(ctx, parentJobID, targetRepo, targetRef, childRunID); err != nil {
-			return false, err
-		}
-		l, _, err := ds.GetDownstreamLink(ctx, parentJobID, targetRepo, targetRef)
-		if err != nil {
-			return false, err
-		}
-		return l.ChildRunID == childRunID, nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	key := downstreamLinkKey(parentJobID, targetRepo, targetRef)
-	l, ok := s.downstreamLinks[key]
-	if !ok || l.ChildRunID != "" {
-		return l.ChildRunID == childRunID, nil
-	}
-	l.ChildRunID = childRunID
-	s.downstreamLinks[key] = l
-	if err := s.persistLocked(); err != nil {
-		delete(s.downstreamLinks, key)
-		return false, err
-	}
-	return true, nil
-}
-
 func downstreamLinkKey(parentJobID, targetRepo, targetRef string) string {
 	return parentJobID + "\x00" + targetRepo + "\x00" + targetRef
 }
 
-// dispatchDownstream processes one downstream outbox intent: claim the
-// link (skip when already launched), fetch the target pipeline through the
-// forge adapter, and submit the child run to the local enqueue. A failure
-// leaves the intent queued for the next flush; the link row guarantees a
-// child is never launched twice even across restarts.
+// dispatchDownstream processes one downstream outbox intent with the
+// reserve-first flow: the link reservation is claimed atomically BEFORE the
+// child run is enqueued, so concurrent flushers (and restarts) can never
+// launch the same child twice. A crash between reserve and enqueue leaves a
+// reserved-but-unlaunched link that the Maintain recovery pass expires
+// after one hour. A failed fetch/enqueue releases the reservation so the
+// next flush can retry.
 func (s *Server) dispatchDownstream(ctx context.Context, item forge.OutboxItem) error {
 	var p downstreamPayload
 	if err := json.Unmarshal(item.Payload, &p); err != nil {
@@ -206,31 +212,44 @@ func (s *Server) dispatchDownstream(ctx context.Context, item forge.OutboxItem) 
 	if p.ParentJobID == "" || p.TargetRepo == "" || p.TargetRef == "" {
 		return fmt.Errorf("downstream: incomplete intent payload")
 	}
-	// Re-establish the claim if a restart dropped the in-memory copy
-	// (fs mode) — the payload itself is the durable intent.
+	// The persisted link carries the forge identity coordinates; a replay
+	// that dropped the in-memory copy falls back to the payload.
 	link, ok, err := s.getDownstreamLink(ctx, p.ParentJobID, p.TargetRepo, p.TargetRef)
 	if err != nil {
 		return err
 	}
-	if !ok {
-		if err := s.insertDownstreamLink(ctx, storage.DownstreamLink{
-			ParentJobID: p.ParentJobID, TargetRepo: p.TargetRepo, TargetRef: p.TargetRef,
-			LaunchToken: p.LaunchToken, CreatedAt: time.Now().UTC(),
-		}); err != nil {
-			return err
+	forgeKind := p.Forge
+	baseURL := ""
+	if ok {
+		if link.ChildRunID != "" {
+			s.metricAdd("kiwi_downstream_skips_total", 1, nil)
+			return nil
 		}
-	} else if link.ChildRunID != "" {
+		if link.TargetForge != "" {
+			forgeKind = link.TargetForge
+		}
+		baseURL = link.TargetBaseURL
+	}
+	// Reserve FIRST: the reservation is the exactly-once claim. Exactly one
+	// concurrent flusher wins; the others skip.
+	won, err := s.reserveDownstreamLaunch(ctx, p.ParentJobID, p.TargetRepo, p.TargetRef, p.LaunchToken)
+	if err != nil {
+		return err
+	}
+	if !won {
 		s.metricAdd("kiwi_downstream_skips_total", 1, nil)
 		return nil
 	}
 
-	content, err := s.fetchDownstreamPipeline(ctx, p.Forge, p.TargetRepo, p.TargetRef)
+	content, err := s.fetchDownstreamPipeline(ctx, forgeKind, baseURL, p.TargetRepo, p.TargetRef)
 	if err != nil {
+		s.releaseDownstreamReservation(ctx, p.ParentJobID, p.TargetRepo, p.TargetRef)
 		return fmt.Errorf("downstream: fetch pipeline for %s@%s: %w", p.TargetRepo, p.TargetRef, err)
 	}
 
 	preID, err := newID()
 	if err != nil {
+		s.releaseDownstreamReservation(ctx, p.ParentJobID, p.TargetRepo, p.TargetRef)
 		return err
 	}
 	meta := map[string]string{
@@ -242,7 +261,7 @@ func (s *Server) dispatchDownstream(ctx context.Context, item forge.OutboxItem) 
 		meta["input."+k] = v
 	}
 	child, err := s.enqueueID(SubmitRun{
-		RepoURL:      downstreamCloneURL(p.Forge, p.TargetRepo),
+		RepoURL:      downstreamCloneURL(forgeKind, baseURL, p.TargetRepo),
 		RepoFullName: p.TargetRepo,
 		Ref:          p.TargetRef,
 		Event:        p.Event,
@@ -251,18 +270,11 @@ func (s *Server) dispatchDownstream(ctx context.Context, item forge.OutboxItem) 
 		Metadata:     meta,
 	}, preID)
 	if err != nil {
+		s.releaseDownstreamReservation(ctx, p.ParentJobID, p.TargetRepo, p.TargetRef)
 		return fmt.Errorf("downstream: enqueue child run: %w", err)
 	}
-	won, err := s.markDownstreamLaunched(ctx, p.ParentJobID, p.TargetRepo, p.TargetRef, child.ID)
-	if err != nil {
+	if err := s.markDownstreamLaunched(ctx, p.ParentJobID, p.TargetRepo, p.TargetRef, child.ID); err != nil {
 		return err
-	}
-	if !won {
-		// A concurrent claim won the link: roll our duplicate child back.
-		s.logInfo("downstream: claim lost to concurrent launch", "child", child.ID)
-		s.cancelDuplicateDownstream(child.ID)
-		s.metricAdd("kiwi_downstream_skips_total", 1, nil)
-		return nil
 	}
 	if p.Wait {
 		s.appendDownstreamRun(ctx, p.ParentRunID, child.ID)
@@ -272,20 +284,126 @@ func (s *Server) dispatchDownstream(ctx context.Context, item forge.OutboxItem) 
 	return nil
 }
 
-// cancelDuplicateDownstream rolls back a child run whose launch claim was
-// lost to a concurrent flusher.
-func (s *Server) cancelDuplicateDownstream(childRunID string) {
-	ctx := context.Background()
-	if s.Sched != nil {
-		if err := s.Sched.CancelRun(ctx, childRunID, "duplicate downstream launch superseded"); err != nil {
-			s.logError("downstream: cancel duplicate child failed", "run", childRunID, "error", err.Error())
+// reserveDownstreamLaunch claims the link reservation through the store
+// (DB mode) or the fs-mode map.
+func (s *Server) reserveDownstreamLaunch(ctx context.Context, parentJobID, targetRepo, targetRef, launchToken string) (bool, error) {
+	if ds, ok := s.downstreamStore(); ok {
+		return ds.ReserveDownstreamLaunch(ctx, parentJobID, targetRepo, targetRef, launchToken)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := downstreamLinkKey(parentJobID, targetRepo, targetRef)
+	l, exists := s.downstreamLinks[key]
+	if !exists {
+		now := time.Now().UTC()
+		s.downstreamLinks[key] = storage.DownstreamLink{ParentJobID: parentJobID, TargetRepo: targetRepo, TargetRef: targetRef, LaunchToken: launchToken, Reserved: true, ReservedAt: &now, CreatedAt: now}
+		return true, s.persistLocked()
+	}
+	if l.ChildRunID != "" || l.Reserved {
+		return false, nil
+	}
+	now := time.Now().UTC()
+	l.Reserved = true
+	l.ReservedAt = &now
+	if l.LaunchToken == "" {
+		l.LaunchToken = launchToken
+	}
+	s.downstreamLinks[key] = l
+	if err := s.persistLocked(); err != nil {
+		l.Reserved = false
+		l.ReservedAt = nil
+		s.downstreamLinks[key] = l
+		return false, err
+	}
+	return true, nil
+}
+
+// releaseDownstreamReservation clears a reservation whose launch failed.
+func (s *Server) releaseDownstreamReservation(ctx context.Context, parentJobID, targetRepo, targetRef string) {
+	if ds, ok := s.downstreamStore(); ok {
+		if err := ds.ReleaseDownstreamReservation(ctx, parentJobID, targetRepo, targetRef); err != nil {
+			s.logError("downstream: release reservation failed", "error", err.Error())
 		}
 		return
 	}
 	s.mu.Lock()
-	s.cancelRunLocked(childRunID, "duplicate downstream launch superseded", "scheduler")
+	defer s.mu.Unlock()
+	key := downstreamLinkKey(parentJobID, targetRepo, targetRef)
+	l, ok := s.downstreamLinks[key]
+	if !ok || l.ChildRunID != "" {
+		return
+	}
+	l.Reserved = false
+	l.ReservedAt = nil
+	s.downstreamLinks[key] = l
 	_ = s.persistLocked()
-	s.mu.Unlock()
+}
+
+// recoverDownstreamReservations expires reservations older than one hour
+// whose child never launched (crash between reserve and enqueue) so a
+// replayed dispatch can re-reserve and launch them. Leader-only in DB mode.
+func (s *Server) recoverDownstreamReservations(ctx context.Context, now time.Time) {
+	if ds, ok := s.downstreamStore(); ok {
+		if n, err := ds.ExpireDownstreamReservations(ctx, now.Add(-time.Hour)); err != nil {
+			s.logError("downstream: reservation expiry failed", "error", err.Error())
+		} else if n > 0 {
+			s.logInfo("downstream: expired reserved-but-unlaunched links", "count", n)
+		}
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed := false
+	for key, l := range s.downstreamLinks {
+		if !l.Reserved || l.ChildRunID != "" {
+			continue
+		}
+		if l.ReservedAt == nil || l.ReservedAt.Before(now.Add(-time.Hour)) {
+			l.Reserved = false
+			l.ReservedAt = nil
+			s.downstreamLinks[key] = l
+			changed = true
+		}
+	}
+	if changed {
+		_ = s.persistLocked()
+	}
+}
+
+// markDownstreamLaunched records the child run ID on the reserved link.
+func (s *Server) markDownstreamLaunched(ctx context.Context, parentJobID, targetRepo, targetRef, childRunID string) error {
+	if ds, ok := s.downstreamStore(); ok {
+		if err := ds.MarkDownstreamLaunched(ctx, parentJobID, targetRepo, targetRef, childRunID); err != nil {
+			return err
+		}
+		l, _, err := ds.GetDownstreamLink(ctx, parentJobID, targetRepo, targetRef)
+		if err != nil {
+			return err
+		}
+		if l.ChildRunID != childRunID {
+			return fmt.Errorf("downstream: launch claim lost")
+		}
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := downstreamLinkKey(parentJobID, targetRepo, targetRef)
+	l, ok := s.downstreamLinks[key]
+	if !ok || l.ChildRunID != "" {
+		if ok && l.ChildRunID == childRunID {
+			return nil
+		}
+		return fmt.Errorf("downstream: launch claim lost")
+	}
+	l.ChildRunID = childRunID
+	l.Reserved = false
+	l.ReservedAt = nil
+	s.downstreamLinks[key] = l
+	if err := s.persistLocked(); err != nil {
+		delete(s.downstreamLinks, key)
+		return err
+	}
+	return nil
 }
 
 // appendDownstreamRun records the child run on the parent run for wait=true
@@ -316,22 +434,37 @@ func (s *Server) appendDownstreamRun(ctx context.Context, parentRunID, childRunI
 }
 
 // fetchDownstreamPipeline resolves the target pipeline text: the injected
-// test seam wins; otherwise the forge adapter matching the parent run's
-// repository host fetches the configured pipeline file at the target ref.
-func (s *Server) fetchDownstreamPipeline(ctx context.Context, forgeKind, targetRepo, targetRef string) (string, error) {
+// test seam wins; otherwise the forge adapter named by the persisted forge
+// coordinates fetches the configured pipeline file at the target ref. The
+// baseURL override (persisted on the link) replaces the API host for
+// self-hosted Forgejo/GitLab instances — no host heuristics from
+// hard-coded public endpoints.
+func (s *Server) fetchDownstreamPipeline(ctx context.Context, forgeKind, baseURL, targetRepo, targetRef string) (string, error) {
 	if s.DownstreamPipelineFetcher != nil {
 		return s.DownstreamPipelineFetcher(ctx, targetRepo, targetRef)
 	}
 	path := s.pipelinePath()
 	switch forgeKind {
 	case "github":
-		return s.gitHubForge().FetchFile(ctx, targetRepo, path, targetRef)
+		f := s.gitHubForge()
+		if baseURL != "" {
+			f.BaseURL = baseURL
+		}
+		return f.FetchFile(ctx, targetRepo, path, targetRef)
 	case "gitlab":
-		return s.gitLabForge().FetchFile(ctx, targetRepo, path, targetRef)
+		f := s.gitLabForge()
+		if baseURL != "" {
+			f.BaseURL = baseURL
+		}
+		return f.FetchFile(ctx, targetRepo, path, targetRef)
 	case "forgejo":
-		return s.forgejoForge().FetchFile(ctx, targetRepo, path, targetRef)
+		f := s.forgejoForge()
+		if baseURL != "" {
+			f.BaseURL = baseURL
+		}
+		return f.FetchFile(ctx, targetRepo, path, targetRef)
 	default:
-		// Unknown host: try the forges in order; the first success wins.
+		// Unknown forge: try the adapters in order; the first success wins.
 		var lastErr error
 		for _, f := range []forge.Forge{s.gitHubForge(), s.gitLabForge(), s.forgejoForge()} {
 			content, err := f.FetchFile(ctx, targetRepo, path, targetRef)
@@ -344,7 +477,8 @@ func (s *Server) fetchDownstreamPipeline(ctx context.Context, forgeKind, targetR
 	}
 }
 
-// forgeKindForHost maps a repository host to its forge adapter kind.
+// forgeKindForHost maps a repository host to its forge adapter kind. This
+// runs once at record time; dispatch uses the persisted coordinates.
 func forgeKindForHost(host string) string {
 	switch {
 	case host == "github.com" || strings.HasSuffix(host, ".github.com"):
@@ -358,15 +492,19 @@ func forgeKindForHost(host string) string {
 	}
 }
 
-// downstreamCloneURL reconstructs the child run's clone URL on the same
-// forge host the dispatch originated from.
-func downstreamCloneURL(forgeKind, repo string) string {
+// downstreamCloneURL reconstructs the child run's clone URL from the
+// persisted forge coordinates: the base URL override (self-hosted) wins,
+// otherwise the forge's public host.
+func downstreamCloneURL(forgeKind, baseURL, repo string) string {
+	if baseURL != "" {
+		return strings.TrimRight(baseURL, "/") + "/" + repo
+	}
 	host := "github.com"
 	switch forgeKind {
 	case "gitlab":
 		host = "gitlab.com"
 	case "forgejo":
-		host = "forgejo.example.com"
+		host = "codeberg.org"
 	}
 	return "https://" + host + "/" + repo
 }

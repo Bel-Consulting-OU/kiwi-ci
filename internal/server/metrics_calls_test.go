@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdh"
 	"crypto/rand"
@@ -11,7 +12,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cache"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secretbroker"
 )
@@ -54,7 +57,7 @@ func TestMetricsCallSitesIncrement(t *testing.T) {
 	cj := s.jobs[task.Job.ID]
 	s.mu.Unlock()
 	repo, trust := cacheNamespace(cj)
-	if err := writeCacheBlob(s.store.Root, cacheFileKey(repo, trust, key), []byte("cached-data")); err != nil {
+	if err := seedCacheEntry(s, cacheFileKey(repo, trust, key), key, repo, trust, []byte("cached-data")); err != nil {
 		t.Fatal(err)
 	}
 	if w := doJSONHeaders(t, s, http.MethodGet, "/api/v1/jobs/"+task.Job.ID+"/cache/"+key, "token", "", hdrs); w.Code != http.StatusOK {
@@ -139,16 +142,28 @@ func ephemeralPubForTest(t *testing.T) string {
 	return base64.StdEncoding.EncodeToString(k.PublicKey().Bytes())
 }
 
-// writeCacheBlob seeds a cache entry on disk.
-func writeCacheBlob(root, key string, data []byte) error {
-	dir := filepath.Join(root, "cache")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+// seedCacheEntry stores a cache payload in the server's CAS and writes the
+// signed manifest file for the fs-mode lookup path.
+func seedCacheEntry(s *Server, fileKey, logicalKey, repo, trust string, data []byte) error {
+	ctx := context.Background()
+	obj, err := s.CAS.Put(ctx, bytes.NewReader(data))
+	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(dir, key+".tar.gz"), data, 0o600); err != nil {
+	signer := s.ensureCacheSigner()
+	m := cache.CacheManifest{
+		Version: 1, Repository: repo, TrustDomain: trust, LogicalKey: logicalKey,
+		BlobSHA256: obj.SHA256, BlobSize: obj.Size, CreatedAt: time.Now().UTC(),
+	}
+	b, err := cache.SignManifest(m, signer.KID, signer.Private)
+	if err != nil {
 		return err
 	}
-	return nil
+	path := filepath.Join(s.store.Root, "cache", fileKey+".manifest.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return writeFileAtomic(path, b, 0o600)
 }
 
 var _ = model.StatusSuccess

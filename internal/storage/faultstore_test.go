@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,11 +33,21 @@ type memSnapshot struct {
 	snapshots    []model.SnapshotRecord
 	jobContracts map[string]map[string]ArtifactContract
 	downstream   map[string]DownstreamLink
+	quotas       map[string]quotaCounts
+	cacheMans    map[string]CacheManifestRecord
 }
 
 func (m *memStore) snapshot() memSnapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	quotas := make(map[string]quotaCounts, len(m.quotas))
+	for k, v := range m.quotas {
+		quotas[k] = v
+	}
+	cacheMans := make(map[string]CacheManifestRecord, len(m.cacheMans))
+	for k, v := range m.cacheMans {
+		cacheMans[k] = v
+	}
 	return memSnapshot{
 		runs:         cloneRuns(m.runs),
 		jobs:         cloneJobs(m.jobs),
@@ -54,6 +65,8 @@ func (m *memStore) snapshot() memSnapshot {
 		snapshots:    append([]model.SnapshotRecord(nil), m.snapshots...),
 		jobContracts: cloneJobContracts(m.contracts),
 		downstream:   cloneDownstreamLinks(m.downstream),
+		quotas:       quotas,
+		cacheMans:    cacheMans,
 	}
 }
 
@@ -392,6 +405,105 @@ func faultOps() []opCase {
 			},
 			call: func(s Store) error {
 				return s.(RunDownstreamStore).ReopenRunForChildren(ctx(), testRun.ID)
+			},
+		},
+		{
+			name: "InsertCompiledRun",
+			setup: func(m *memStore) {
+				// A queued predecessor job that the enqueue supersedes.
+				_ = m.InsertRun(ctx(), testRun)
+				old := testJob
+				old.ID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac"
+				old.Status = model.StatusQueued
+				old.RepoURL = "https://github.com/o/r.git"
+				_ = m.InsertJob(ctx(), old)
+			},
+			call: func(s Store) error {
+				return s.(RunEnqueueStore).InsertCompiledRun(ctx(), InsertCompiledRunRequest{
+					Run:            model.Run{ID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad", Repo: "https://github.com/o/r.git", Status: model.StatusQueued, ConcurrencyGroup: "grp", CreatedAt: time.Unix(2000, 0).UTC()},
+					Jobs:           map[string]model.Job{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaae": {ID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaae", RunID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad", Key: "new", RepoURL: "https://github.com/o/r.git", Status: model.StatusQueued, CreatedAt: time.Unix(2001, 0).UTC()}},
+					CancelPrevious: []string{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac"},
+					WebhookClaim:   &WebhookClaim{Forge: "github", DeliveryID: "del-1", RunID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad"},
+					Quota:          &QuotaReservation{RepoKey: "https://github.com/o/r.git", JobCount: 1},
+				})
+			},
+		},
+		{
+			name:  "AcquireLeaseAtomic",
+			setup: func(m *memStore) { seedRunAndJob(m); seedRunner(m) },
+			call: func(s Store) error {
+				_, err := s.(AtomicLeaseStore).AcquireLeaseAtomic(ctx(), testJob.ID, testRunner.ID, []byte("hash"), 1, time.Unix(2000, 0).UTC(), 2)
+				return err
+			},
+		},
+		{
+			name: "AdjustQuotaCounter",
+			setup: func(m *memStore) {
+				_ = m.AdjustQuotaCounter(ctx(), "repo", "team", 2, 3)
+			},
+			call: func(s Store) error {
+				return s.(QuotaCounterStore).AdjustQuotaCounter(ctx(), "repo", "team", -1, 1)
+			},
+		},
+		{
+			name: "InsertGeneratedJobsTx",
+			setup: func(m *memStore) {
+				seedRunAndJob(m)
+			},
+			call: func(s Store) error {
+				child := testJob
+				child.ID = "ffffffffffffffffffffffffffffffff"
+				child.Key = "generated"
+				child.DynamicDepth = 1
+				return s.(DynamicStoreTx).InsertGeneratedJobsTx(ctx(), testJob.ID, 1, map[string]model.Job{child.ID: child}, map[string][]string{child.ID: nil}, func(parent model.Job, count int) error {
+					if count != 1 {
+						return fmt.Errorf("unexpected run job count %d", count)
+					}
+					return nil
+				})
+			},
+		},
+		{
+			name: "ReserveDownstreamLaunch",
+			setup: func(m *memStore) {
+				seedRunAndJob(m)
+				_ = m.InsertDownstreamLink(ctx(), testDownstreamLink)
+			},
+			call: func(s Store) error {
+				_, err := s.(DownstreamStore).ReserveDownstreamLaunch(ctx(), testDownstreamLink.ParentJobID, testDownstreamLink.TargetRepo, testDownstreamLink.TargetRef, "tok")
+				return err
+			},
+		},
+		{
+			name: "ReleaseDownstreamReservation",
+			setup: func(m *memStore) {
+				seedRunAndJob(m)
+				_ = m.InsertDownstreamLink(ctx(), testDownstreamLink)
+				_, _ = m.ReserveDownstreamLaunch(ctx(), testDownstreamLink.ParentJobID, testDownstreamLink.TargetRepo, testDownstreamLink.TargetRef, "tok")
+			},
+			call: func(s Store) error {
+				return s.(DownstreamStore).ReleaseDownstreamReservation(ctx(), testDownstreamLink.ParentJobID, testDownstreamLink.TargetRepo, testDownstreamLink.TargetRef)
+			},
+		},
+		{
+			name: "ExpireDownstreamReservations",
+			setup: func(m *memStore) {
+				seedRunAndJob(m)
+				_ = m.InsertDownstreamLink(ctx(), testDownstreamLink)
+				_, _ = m.ReserveDownstreamLaunch(ctx(), testDownstreamLink.ParentJobID, testDownstreamLink.TargetRepo, testDownstreamLink.TargetRef, "tok")
+			},
+			call: func(s Store) error {
+				_, err := s.(DownstreamStore).ExpireDownstreamReservations(ctx(), time.Now().UTC().Add(time.Hour))
+				return err
+			},
+		},
+		{
+			name:  "PutCacheManifest",
+			setup: func(m *memStore) {},
+			call: func(s Store) error {
+				return s.(CacheManifestStore).PutCacheManifest(ctx(), CacheManifestRecord{
+					Repo: "o/r", TrustDomain: "trusted", LogicalKey: strings.Repeat("a", 64), BlobSHA256: strings.Repeat("b", 64), BlobSize: 3,
+				})
 			},
 		},
 	}

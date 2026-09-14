@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -167,7 +168,7 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 	// SBOM/sigstore attestation gate: required attestations must be
 	// present and valid before the payload is committed. The frozen
 	// artifact contract is authoritative — the pipeline is never re-parsed.
-	if code, msg := s.gateArtifactAttestations(contract, j, name, digest, dir); code != 0 {
+	if code, msg := s.gateArtifactAttestations(ctx, contract, j, name, digest, dir); code != 0 {
 		_ = os.Remove(tmp)
 		http.Error(w, msg, code)
 		return
@@ -230,7 +231,7 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 		expires := createdAt.Add(retention)
 		rec.ExpiresAt = &expires
 	}
-	attachSidecarsToRecord(&rec, j, name, dir)
+	s.attachSidecarsToRecord(r.Context(), &rec, j, name, dir)
 	// Provenance signs with the dedicated provenance key — never the OIDC
 	// key — so the two trust roots stay independent.
 	finished := time.Now().UTC()
@@ -239,11 +240,22 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 	st.Builder = provenance.BuilderPlaceholder
 	if env, er := provenance.Sign(st, signer.KID, signer.Private); er == nil {
 		if ab, mer := json.MarshalIndent(env, "", "  "); mer == nil {
-			ap := dst + ".intoto.json"
-			if os.WriteFile(ap, ab, 0o600) == nil {
-				sum := sha256.Sum256(ab)
-				rec.ProvenancePath = ap
-				rec.ProvenanceSHA256 = hex.EncodeToString(sum[:])
+			sum := sha256.Sum256(ab)
+			provDigest := hex.EncodeToString(sum[:])
+			// HA sidecars: the envelope bytes live in the shared CAS store
+			// and the record carries the digest reference; fs dev mode
+			// keeps the local sidecar file for compatibility.
+			if casMode {
+				if _, perr := s.CAS.Put(ctx, bytes.NewReader(ab)); perr == nil {
+					rec.ProvenancePath = "cas:" + provDigest
+					rec.ProvenanceSHA256 = provDigest
+				}
+			} else {
+				ap := dst + ".intoto.json"
+				if os.WriteFile(ap, ab, 0o600) == nil {
+					rec.ProvenancePath = ap
+					rec.ProvenanceSHA256 = provDigest
+				}
 			}
 		}
 	}
@@ -458,13 +470,21 @@ func (s *Server) cacheLease(w http.ResponseWriter, r *http.Request) (model.Job, 
 	return j, runnerID, true
 }
 
-// uploadJobCache implements PUT /api/v1/jobs/{id}/cache/{key}. The entry is
-// stored under the namespace derived from the leased job; the response
-// carries the content digest and, in DB mode, a signed manifest bound to
-// the same namespace.
+// uploadJobCache implements PUT /api/v1/jobs/{id}/cache/{key}. The payload
+// is streamed into the shared content-addressed store (CAS) in BOTH modes —
+// a filesystem-backed CAS under dataDir/cas in dev, the configured blob
+// backend in HA — so dev and HA behave identically. A signed manifest
+// binds (repo, trust_domain, logical_key) to the blob digest: persisted in
+// the cache_manifests table in DB mode, next to the dataDir in fs mode.
+// The namespace is derived from the leased job; the response carries the
+// content digest and the manifest digest.
 func (s *Server) uploadJobCache(w http.ResponseWriter, r *http.Request) {
 	if s.store == nil {
 		http.Error(w, "cache storage requires persistent server", http.StatusServiceUnavailable)
+		return
+	}
+	if s.CAS == nil {
+		http.Error(w, "cache storage requires a blob store", http.StatusServiceUnavailable)
 		return
 	}
 	j, runnerID, ok := s.cacheLease(w, r)
@@ -478,55 +498,27 @@ func (s *Server) uploadJobCache(w http.ResponseWriter, r *http.Request) {
 	}
 	repo, trust := cacheNamespace(j)
 	fileKey := cacheFileKey(repo, trust, key)
-	dir := filepath.Join(s.store.Root, "cache")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	uniq, err := newID()
-	if err != nil {
-		http.Error(w, "internal server error", 500)
-		return
-	}
-	tmp := filepath.Join(dir, "."+fileKey+"."+uniq+".tmp")
-	dst := filepath.Join(dir, fileKey+".tar.gz")
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	obj, err := s.CAS.Put(r.Context(), http.MaxBytesReader(w, r.Body, maxBlobBytes))
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	h := sha256.New()
-	n, e1 := io.Copy(io.MultiWriter(f, h), http.MaxBytesReader(w, r.Body, maxBlobBytes))
-	e2 := f.Sync()
-	e3 := f.Close()
-	if err := firstErr(e1, e2, e3); err != nil {
-		_ = os.Remove(tmp)
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	if err := os.Rename(tmp, dst); err != nil {
-		_ = os.Remove(tmp)
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	sum := hex.EncodeToString(h.Sum(nil))
-	_ = os.WriteFile(dst+".sha256", []byte(sum), 0o600)
+	sum := obj.SHA256
+	size := obj.Size
+	s.metricAdd("kiwi_cache_bytes_total", float64(size), nil)
+	w.Header().Set("X-Kiwi-Cache-SHA256", sum)
 	w.Header().Set("X-Kiwi-Content-SHA256", sum)
-	s.metricAdd("kiwi_cache_bytes_total", float64(n), nil)
-	if s.DB != nil {
-		s.writeCacheManifest(w, r, fileKey, key, repo, trust, sum, n)
-	}
+	s.writeCacheManifest(w, r.Context(), fileKey, key, repo, trust, sum, size, j)
 	s.auditLocked("cache.uploaded", runnerID, j.RunID, j.ID, "cache entry stored", map[string]string{"key": key, "repository": repo, "trust_domain": trust})
 	w.WriteHeader(http.StatusCreated)
 }
 
-// writeCacheManifest records a signed cache manifest next to the blob in DB
-// mode. The namespace is server-derived from the leased job — repository and
-// trust domain never come from client headers — and the manifest is signed
-// with the dedicated cache signing key so cache consumers can pin one trust
-// root.
-func (s *Server) writeCacheManifest(w http.ResponseWriter, r *http.Request, fileKey, logicalKey, repo, trust, sum string, size int64) {
-	_ = r
+// writeCacheManifest signs the cache manifest with the dedicated cache
+// signing key and stores it: in DB mode as a cache_manifests row, in fs
+// mode as the manifest file next to the dataDir. The namespace is
+// server-derived from the leased job — repository and trust domain never
+// come from client headers.
+func (s *Server) writeCacheManifest(w http.ResponseWriter, ctx context.Context, fileKey, logicalKey, repo, trust, sum string, size int64, j model.Job) {
 	signer := s.ensureCacheSigner()
 	m := cache.CacheManifest{
 		Version:     1,
@@ -541,17 +533,48 @@ func (s *Server) writeCacheManifest(w http.ResponseWriter, r *http.Request, file
 	if err != nil {
 		return
 	}
+	if s.DB != nil {
+		if cs, ok := s.DB.(storage.CacheManifestStore); ok {
+			if err := cs.PutCacheManifest(ctx, storage.CacheManifestRecord{
+				Repo:        repo,
+				TrustDomain: trust,
+				LogicalKey:  logicalKey,
+				BlobSHA256:  sum,
+				BlobSize:    size,
+				ProducerRun: j.RunID,
+				ProducerJob: j.ID,
+				CreatedAt:   m.CreatedAt,
+				Envelope:    b,
+			}); err != nil {
+				s.logError("cache: manifest persist failed", "error", err.Error())
+				return
+			}
+		}
+		w.Header().Set("X-Kiwi-Cache-Manifest-SHA256", manifestDigestOf(b))
+		return
+	}
 	path := filepath.Join(s.store.Root, "cache", fileKey+".manifest.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		s.logError("cache: manifest dir failed", "error", err.Error())
+		return
+	}
 	_ = writeFileAtomic(path, b, 0o600)
 	w.Header().Set("X-Kiwi-Cache-Manifest-SHA256", manifestDigestOf(b))
 }
 
-// downloadJobCache implements GET /api/v1/jobs/{id}/cache/{key}. The lookup
-// is namespaced by the leased job's repository and trust domain: a runner
-// for a different repository resolves a different key and gets a 404.
+// downloadJobCache implements GET /api/v1/jobs/{id}/cache/{key}. The
+// namespace is resolved from the leased job, the manifest row (DB mode) or
+// manifest file (fs mode) maps it to the blob digest, and the bytes stream
+// from the shared CAS store so every replica serves the same entry. The
+// response headers keep the runner-facing contract: X-Kiwi-Cache-SHA256 is
+// the manifest digest of the archive bytes.
 func (s *Server) downloadJobCache(w http.ResponseWriter, r *http.Request) {
 	if s.store == nil {
 		http.Error(w, "cache storage requires persistent server", http.StatusServiceUnavailable)
+		return
+	}
+	if s.CAS == nil {
+		http.Error(w, "cache storage requires a blob store", http.StatusServiceUnavailable)
 		return
 	}
 	j, runnerID, ok := s.cacheLease(w, r)
@@ -564,11 +587,42 @@ func (s *Server) downloadJobCache(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	repo, trust := cacheNamespace(j)
-	fileKey := cacheFileKey(repo, trust, key)
-	path := filepath.Join(s.store.Root, "cache", fileKey+".tar.gz")
-	f, err := os.Open(path)
+	var (
+		digest   string
+		envelope []byte
+	)
+	if s.DB != nil {
+		if cs, ok := s.DB.(storage.CacheManifestStore); ok {
+			rec, found, err := cs.GetCacheManifest(r.Context(), repo, trust, key)
+			if err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			if !found || rec.BlobSHA256 == "" {
+				s.metricAdd("kiwi_cache_misses_total", 1, nil)
+				http.NotFound(w, r)
+				return
+			}
+			digest = rec.BlobSHA256
+			envelope = rec.Envelope
+		}
+	} else {
+		fileKey := cacheFileKey(repo, trust, key)
+		if b, err := os.ReadFile(filepath.Join(s.store.Root, "cache", fileKey+".manifest.json")); err == nil {
+			envelope = b
+			if m, verr := cache.VerifyManifest(b, s.ensureCacheSigner().Public); verr == nil {
+				digest = m.BlobSHA256
+			}
+		}
+	}
+	if digest == "" {
+		s.metricAdd("kiwi_cache_misses_total", 1, nil)
+		http.NotFound(w, r)
+		return
+	}
+	rc, _, err := s.CAS.Open(r.Context(), digest)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, blob.ErrNotFound) {
 			s.metricAdd("kiwi_cache_misses_total", 1, nil)
 			http.NotFound(w, r)
 			return
@@ -576,16 +630,15 @@ func (s *Server) downloadJobCache(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	defer f.Close()
+	defer rc.Close()
 	s.metricAdd("kiwi_cache_hits_total", 1, nil)
-	if b, err := os.ReadFile(path + ".sha256"); err == nil {
-		w.Header().Set("X-Kiwi-Content-SHA256", strings.TrimSpace(string(b)))
-	}
-	if b, err := os.ReadFile(path + ".manifest.json"); err == nil {
-		w.Header().Set("X-Kiwi-Cache-Manifest-SHA256", manifestDigestOf(b))
+	w.Header().Set("X-Kiwi-Cache-SHA256", digest)
+	w.Header().Set("X-Kiwi-Content-SHA256", digest)
+	if len(envelope) > 0 {
+		w.Header().Set("X-Kiwi-Cache-Manifest-SHA256", manifestDigestOf(envelope))
 	}
 	w.Header().Set("Content-Type", "application/gzip")
-	n, _ := io.Copy(w, f)
+	n, _ := io.Copy(w, rc)
 	s.metricAdd("kiwi_cache_bytes_total", float64(n), nil)
 	s.auditLocked("cache.downloaded", runnerID, j.RunID, j.ID, "cache entry read", map[string]string{"key": key, "repository": repo, "trust_domain": trust})
 }
@@ -599,24 +652,43 @@ func manifestDigestOf(b []byte) string {
 
 func (s *Server) downloadProvenance(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	s.mu.Lock()
-	a, ok := s.artifacts[id]
-	s.mu.Unlock()
-	if !ok || a.ProvenancePath == "" {
+	a, err := s.artifactRecord(r.Context(), id)
+	if err != nil || a.ProvenanceSHA256 == "" {
 		http.NotFound(w, r)
 		return
 	}
 	if !s.requireArtifactRead(w, r, a) {
 		return
 	}
-	b, err := os.ReadFile(a.ProvenancePath)
+	rc, err := s.openSidecar(r.Context(), a.ProvenancePath, a.ProvenanceSHA256)
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
+	defer rc.Close()
 	w.Header().Set("Content-Type", "application/vnd.dsse.envelope.v1+json")
 	w.Header().Set("X-Kiwi-Content-SHA256", a.ProvenanceSHA256)
-	_, _ = w.Write(b)
+	_, _ = io.Copy(w, rc)
+}
+
+// openSidecar resolves a sidecar (provenance/SBOM/sigstore) byte stream:
+// records with a cas: digest reference stream from the shared CAS store;
+// everything else falls back to the legacy local file (fs dev mode).
+func (s *Server) openSidecar(ctx context.Context, pathRef, digest string) (io.ReadCloser, error) {
+	if s.CAS != nil && strings.HasPrefix(pathRef, "cas:") {
+		want := strings.TrimPrefix(pathRef, "cas:")
+		if want == "" && digest != "" {
+			want = digest
+		}
+		if want != "" {
+			rc, _, err := s.CAS.Open(ctx, want)
+			return rc, err
+		}
+	}
+	if pathRef == "" {
+		return nil, os.ErrNotExist
+	}
+	return os.Open(pathRef)
 }
 
 func (s *Server) cleanupExpiredArtifactsLocked(now time.Time) int {
