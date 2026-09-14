@@ -26,10 +26,12 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/components"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/expr"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/logging"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/queue"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/ratelimit"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runnerpki"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/scheduler"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secretbroker"
@@ -60,6 +62,12 @@ type Server struct {
 	// SecretBroker resolves declared secrets for trusted jobs holding an
 	// active lease. A nil broker disables the secrets endpoint (503).
 	SecretBroker secretbroker.Broker
+
+	// WebSessionSecret is the HMAC key for short-lived web UI session
+	// cookies (see session.go). It is 32 bytes, generated from crypto/rand
+	// or the KIWI_WEB_SESSION_SECRET env var on first use. Empty disables
+	// cookie authentication until a login is attempted.
+	WebSessionSecret []byte
 
 	// RunnerCA signs runner client certificates for enrollment and mTLS
 	// identity binding. Nil disables runner certificate enrollment and
@@ -116,6 +124,19 @@ type Server struct {
 	// tests use it to grant capabilities such as deployments.
 	AdmissionCapabilities *policy.Capabilities
 
+	// Logger writes operational (control-plane) logs as structured JSON
+	// lines. Build logs stay in LogEntry paths. Defaults to os.Stderr.
+	Logger *logging.Structured
+	// Metrics is the Prometheus-style registry rendered on /metrics
+	// alongside the state gauges.
+	Metrics *Metrics
+	// RateLimiter, when non-nil, enforces per-class request rate limits
+	// in front of the authorization chain.
+	RateLimiter *ratelimit.Middleware
+	// LogStreamIdleTimeout bounds how long the SSE log stream stays open
+	// without new entries (default 30s).
+	LogStreamIdleTimeout time.Duration
+
 	// deployments records environment deployment lifecycles per job
 	// (memory-backed; DB persistence is deferred — see deployments.go).
 	deployments map[string]model.Deployment
@@ -139,6 +160,8 @@ func New(token string) *Server {
 		AuthStore:   auth.NewTokenStore(),
 		deployments: map[string]model.Deployment{},
 		snapshots:   map[string]model.SnapshotRecord{},
+		Logger:      logging.NewStructured(os.Stderr),
+		Metrics:     NewMetrics(),
 	}
 }
 
@@ -289,6 +312,9 @@ func (s *Server) SwitchToDB(db storage.Store) error {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.ui)
+	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServerFS(webAssets())))
+	mux.HandleFunc("POST /api/v1/login", s.webLogin)
+	mux.HandleFunc("GET /api/v1/logout", s.webLogout)
 	mux.HandleFunc("GET /readiness", s.readiness)
 	mux.HandleFunc("GET /liveness", s.liveness)
 	mux.HandleFunc("POST /hooks/github", s.githubWebhook)
@@ -306,6 +332,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/runs/{id}/rerun", s.rerunRun)
 	mux.HandleFunc("GET /api/v1/runs/{id}/jobs", s.listJobs)
 	mux.HandleFunc("GET /api/v1/runs/{id}/logs", s.getLogs)
+	mux.HandleFunc("GET /api/v1/runs/{id}/logs/stream", s.streamLogs)
 	mux.HandleFunc("GET /api/v1/runs/{id}/artifacts", s.listArtifacts)
 	mux.HandleFunc("GET /api/v1/runs/{id}/tests", s.listTestReports)
 	mux.HandleFunc("GET /api/v1/test-intelligence", s.testIntelligence)
@@ -333,14 +360,24 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/audit", s.listAudit)
 	// The auth middleware runs inside statusLogger/recoverer and outside
 	// s.auth so authenticated principals are available to handlers; s.auth
-	// keeps the legacy bearer checks and classifies routes.
-	return requestID(recoverer(statusLogger(auth.Middleware(s.AuthStore, s.AdminToken, s.auth(mux), log.Printf))))
+	// keeps the legacy bearer checks and classifies routes. The rate
+	// limiter runs between them: it sees the authenticated principal but
+	// sits in front of authorization so 429s are cheap. observeHTTP
+	// records kiwi_http_requests_total for every request.
+	var h http.Handler = mux
+	if s.RateLimiter != nil {
+		h = s.RateLimiter.Wrap(h)
+	}
+	h = s.auth(h)
+	h = auth.Middleware(s.AuthStore, s.AdminToken, h, s.logf)
+	h = s.observeHTTP(h)
+	return requestID(s.recoverer(s.statusLogger(h)))
 }
 
 func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
-		if strings.HasPrefix(path, "/hooks/") || path == "/" || path == "/readiness" || path == "/liveness" || path == "/.well-known/openid-configuration" || path == "/api/v1/oidc/jwks" || (r.Method == http.MethodPost && strings.HasSuffix(path, "/oidc")) {
+		if strings.HasPrefix(path, "/hooks/") || path == "/" || strings.HasPrefix(path, "/static/") || path == "/api/v1/login" || path == "/api/v1/logout" || path == "/readiness" || path == "/liveness" || path == "/.well-known/openid-configuration" || path == "/api/v1/oidc/jwks" || (r.Method == http.MethodPost && strings.HasSuffix(path, "/oidc")) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -375,6 +412,18 @@ func (s *Server) auth(next http.Handler) http.Handler {
 		if runnerOnly {
 			if s.RunnerToken != "" && !bearerOK(r.Header.Get("Authorization"), s.RunnerToken) {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
+		// Web sessions: a valid kiwi_session cookie authorizes admin-tier
+		// routes like the admin bearer token. Mutating requests
+		// authenticated this way must also present the double-submit CSRF
+		// token in the X-Kiwi-CSRF header.
+		if s.webSessionOK(r) {
+			if webMutatingMethod(r.Method) && !s.webCSRFOK(r) {
+				http.Error(w, "invalid csrf token", http.StatusForbidden)
 				return
 			}
 			next.ServeHTTP(w, r)
@@ -460,6 +509,34 @@ func bearerOK(header, want string) bool {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+// logf routes formatted messages (the auth middleware callback contract)
+// into the structured operational logger.
+func (s *Server) logf(format string, args ...any) {
+	if s.Logger == nil {
+		log.Printf(format, args...)
+		return
+	}
+	s.Logger.Warn(fmt.Sprintf(format, args...))
+}
+
+// logInfo/logError emit structured operational logs, falling back to the
+// standard logger when no structured logger is configured.
+func (s *Server) logInfo(msg string, kv ...any) {
+	if s.Logger == nil {
+		log.Printf("server: %s %v", msg, kv)
+		return
+	}
+	s.Logger.Info(msg, kv...)
+}
+
+func (s *Server) logError(msg string, kv ...any) {
+	if s.Logger == nil {
+		log.Printf("server: %s %v", msg, kv)
+		return
+	}
+	s.Logger.Error(msg, kv...)
 }
 
 func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
@@ -640,7 +717,7 @@ func (s *Server) enqueueDB(in SubmitRun, run model.Run, created map[string]model
 	}
 	if ok {
 		if err := s.DB.UpsertDelivery(ctx, forge, delivery, run.ID, ""); err != nil {
-			log.Printf("server: delivery upsert failed: %v", err)
+			s.logError("delivery upsert failed", "error", err.Error())
 		}
 	}
 	s.auditLocked("run.queued", "scheduler", run.ID, "", "run queued", map[string]string{"event": in.Event})
@@ -1243,6 +1320,7 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 		s.recordDeploymentLocked(j, now)
 	}
 	s.auditLocked("job.leased", ri.Name, j.RunID, j.ID, "job leased", map[string]string{"job": j.Key, "generation": strconv.FormatInt(j.LeaseGeneration, 10)})
+	s.metricObserve("kiwi_queue_latency_seconds", now.Sub(j.CreatedAt).Seconds(), nil)
 	_ = s.persistLocked()
 	// The raw token travels on the wire once; the hash is not needed by the
 	// runner and is stripped from the task job.
@@ -1506,6 +1584,9 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 			j.Error = "runner returned invalid or oversized job outputs"
 		}
 		j.FinishedAt = &now
+	}
+	if j.StartedAt != nil && j.FinishedAt != nil {
+		s.metricObserve("kiwi_job_duration_seconds", j.FinishedAt.Sub(*j.StartedAt).Seconds(), nil)
 	}
 	// The lease is spent: clear all lease state so nothing can reuse it,
 	// then dedupe future retries of this exact completion via the receipt.
@@ -2102,6 +2183,8 @@ func (s *Server) recoverLeasesLocked(now time.Time, startup bool) {
 		return
 	}
 	_ = startup // Signature kept for call-site stability; startup no longer forces expiry: unexpired leases survive restart.
+	expirations := 0
+	lost := 0
 	for id, j := range s.jobs {
 		if j.Status != model.StatusRunning {
 			continue
@@ -2110,6 +2193,7 @@ func (s *Server) recoverLeasesLocked(now time.Time, startup bool) {
 		if !expired {
 			continue
 		}
+		expirations++
 		runnerID := j.LeaseRunnerID
 		if j.Attempts <= j.MaxInfraRetries {
 			j.Status = model.StatusQueued
@@ -2119,6 +2203,7 @@ func (s *Server) recoverLeasesLocked(now time.Time, startup bool) {
 			j.LeaseExpiresAt = nil
 			s.auditLocked("job.lease_expired", "scheduler", j.RunID, j.ID, "job requeued after lost runner", map[string]string{"job": j.Key})
 		} else {
+			lost++
 			j.Status = model.StatusFailure
 			j.Error = "runner lease expired and infrastructure retry budget exhausted"
 			j.FinishedAt = &now
@@ -2130,6 +2215,8 @@ func (s *Server) recoverLeasesLocked(now time.Time, startup bool) {
 		s.jobs[id] = j
 		s.releaseRunnerLocked(runnerID, j.ID, model.StatusFailure)
 	}
+	s.metricAdd("kiwi_lease_expirations_total", float64(expirations), nil)
+	s.metricAdd("kiwi_lost_runners_total", float64(lost), nil)
 	s.scheduleStateLocked()
 }
 
@@ -2165,13 +2252,13 @@ func (s *Server) auditLocked(action, actor, runID, jobID, msg string, meta map[s
 	}
 	id, err := newID()
 	if err != nil {
-		log.Printf("audit: dropping %q event: %v", action, err)
+		s.logError("audit: dropping event", "action", action, "error", err.Error())
 		return
 	}
 	e := model.AuditEvent{ID: id, Action: action, Actor: actor, RunID: runID, JobID: jobID, Message: msg, Metadata: meta, CreatedAt: time.Now().UTC()}
 	if s.DB != nil {
 		if err := s.DB.AppendAudit(context.Background(), e); err != nil {
-			log.Printf("audit: append %q failed: %v", action, err)
+			s.logError("audit: append failed", "action", action, "error", err.Error())
 		}
 		return
 	}
@@ -2341,10 +2428,21 @@ func cloneStrings(in []string) []string {
 }
 
 func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	if s.DB != nil {
 		s.metricsDB(w, r)
-		return
+	} else {
+		s.metricsMemory(w, r)
 	}
+	// The process-wide registry (counters/histograms/gauges) renders after
+	// the state gauges so a scrape always sees both surfaces.
+	if s.Metrics != nil {
+		s.Metrics.WritePrometheus(w)
+	}
+}
+
+// metricsMemory renders the state gauges from the in-memory maps.
+func (s *Server) metricsMemory(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	counts := map[model.Status]int{}
@@ -2371,7 +2469,6 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 			queueReasons[j.QueueReason]++
 		}
 	}
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	fmt.Fprintln(w, "# HELP kiwi_runs Number of CI runs by status")
 	fmt.Fprintln(w, "# TYPE kiwi_runs gauge")
 	for st, n := range counts {
@@ -2388,6 +2485,9 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "kiwi_jobs_queue_reason{reason=%q} %d\n", reason, n)
 	}
 	fmt.Fprintf(w, "kiwi_runners %d\nkiwi_runner_slots %d\nkiwi_runner_slots_busy %d\n", len(s.runners), capacity, busy)
+	if capacity > 0 {
+		s.metricSet("kiwi_runner_saturation", float64(busy)/float64(capacity), nil)
+	}
 }
 
 // metricsDB serves the same gauges from the SQL store, bounded to the most
@@ -2427,7 +2527,6 @@ func (s *Server) metricsDB(w http.ResponseWriter, r *http.Request) {
 		}
 		capacity += c
 	}
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	fmt.Fprintln(w, "# HELP kiwi_runs Number of CI runs by status")
 	fmt.Fprintln(w, "# TYPE kiwi_runs gauge")
 	for st, n := range counts {
@@ -2439,6 +2538,9 @@ func (s *Server) metricsDB(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "kiwi_jobs{status=%q} %d\n", st, n)
 	}
 	fmt.Fprintf(w, "kiwi_runners %d\nkiwi_runner_slots %d\nkiwi_runner_slots_busy %d\n", len(allRunners), capacity, busy)
+	if capacity > 0 {
+		s.metricSet("kiwi_runner_saturation", float64(busy)/float64(capacity), nil)
+	}
 }
 
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
@@ -2541,25 +2643,47 @@ func (r *statusRecorder) Write(b []byte) (int, error) {
 	return r.ResponseWriter.Write(b)
 }
 
-// statusLogger logs server-side errors (500+) with the request ID.
-func statusLogger(next http.Handler) http.Handler {
+// Flush forwards stream flushes (SSE) to the underlying writer.
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// statusLogger logs server-side errors (500+) with the request ID through
+// the structured operational logger.
+func (s *Server) statusLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rec := &statusRecorder{ResponseWriter: w}
 		next.ServeHTTP(rec, r)
 		if rec.status >= 500 {
-			log.Printf("request_id=%s %s %s -> %d", requestIDFrom(r), r.Method, r.URL.Path, rec.status)
+			s.logError("request failed", "request_id", requestIDFrom(r), "method", r.Method, "path", r.URL.Path, "status", rec.status)
 		}
 	})
 }
 
 // recoverer converts panics into opaque 500 responses: the panic text and
-// stack stay in the server log and never reach clients.
+// stack stay in the server log and never reach clients. The package-level
+// function logs via the standard logger; Server.recoverer routes through
+// the structured operational logger.
 func recoverer(next http.Handler) http.Handler {
+	return recovererWith(next, func(id, method, path string, x any, stack string) {
+		log.Printf("panic serving %s %s (request_id=%s): %v\n%s", method, path, id, x, stack)
+	})
+}
+
+func (s *Server) recoverer(next http.Handler) http.Handler {
+	return recovererWith(next, func(id, method, path string, x any, stack string) {
+		s.logError("panic serving request", "request_id", id, "method", method, "path", path, "panic", x, "stack", stack)
+	})
+}
+
+func recovererWith(next http.Handler, onPanic func(id, method, path string, x any, stack string)) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if x := recover(); x != nil {
 				id := requestIDFrom(r)
-				log.Printf("panic serving %s %s (request_id=%s): %v\n%s", r.Method, r.URL.Path, id, x, debug.Stack())
+				onPanic(id, r.Method, r.URL.Path, x, string(debug.Stack()))
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error", "request_id": id})
 			}
 		}()
@@ -2577,9 +2701,11 @@ func (s *Server) Maintain(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case now := <-ticker.C:
+		case tick := <-ticker.C:
+			loopStart := time.Now()
 			if s.Sched != nil {
-				s.maintainDB(ctx, now.UTC())
+				s.maintainDB(ctx, tick.UTC())
+				s.metricObserve("kiwi_scheduler_loop_duration_seconds", time.Since(loopStart).Seconds(), nil)
 				continue
 			}
 			s.mu.Lock()
@@ -2587,7 +2713,7 @@ func (s *Server) Maintain(ctx context.Context) {
 			for id, r := range s.runs {
 				before[id] = r.Status
 			}
-			s.recoverLeasesLocked(now.UTC(), false)
+			s.recoverLeasesLocked(tick.UTC(), false)
 			_ = s.persistLocked()
 			var changed []model.Run
 			for id, r := range s.runs {
@@ -2599,8 +2725,9 @@ func (s *Server) Maintain(ctx context.Context) {
 			for _, r := range changed {
 				s.publishGitHubStatus(r)
 			}
-			s.GC(ctx, now.UTC())
+			s.GC(ctx, tick.UTC())
 			s.flushOutbox()
+			s.metricObserve("kiwi_scheduler_loop_duration_seconds", time.Since(loopStart).Seconds(), nil)
 		}
 	}
 }
@@ -2617,19 +2744,19 @@ func (s *Server) maintainDB(ctx context.Context, now time.Time) {
 			return
 		}
 		s.leader = true
-		log.Printf("server: promoted to leader (key %s)", s.LeaderKey)
+		s.logInfo("promoted to leader", "key", s.LeaderKey)
 		if err := s.Sched.RecoverExpired(ctx, now); err != nil {
-			log.Printf("server: post-promotion recovery: %v", err)
+			s.logError("post-promotion recovery", "error", err.Error())
 		}
 		return
 	}
 	if !s.Sched.IsLeader(ctx) {
 		s.leader = false
-		log.Printf("server: demoted to standby (key %s)", s.LeaderKey)
+		s.logInfo("demoted to standby", "key", s.LeaderKey)
 		return
 	}
 	if err := s.Sched.RecoverExpired(ctx, now); err != nil && !errors.Is(err, scheduler.ErrNotLeader) {
-		log.Printf("server: lease recovery: %v", err)
+		s.logError("lease recovery", "error", err.Error())
 	}
 	s.flushOutbox()
 	s.GC(ctx, now)

@@ -71,13 +71,17 @@ func Middleware(store *TokenStore, adminToken string, next http.Handler, logger 
 }
 
 // isPublicPath mirrors the server's own public-path classification (webhook
-// intake, dashboard, OIDC discovery/JWKS and OIDC token issuance) so that
-// strict token-store mode does not lock out forge webhooks or the dashboard.
-// Authorization for these paths is enforced by the server's auth() chain.
+// intake, dashboard + its assets, login/logout, OIDC discovery/JWKS and OIDC
+// token issuance) so that strict token-store mode does not lock out forge
+// webhooks or the dashboard. Authorization for these paths is enforced by
+// the server's auth() chain.
 func isPublicPath(r *http.Request) bool {
 	p := r.URL.Path
 	return strings.HasPrefix(p, "/hooks/") ||
 		p == "/" ||
+		strings.HasPrefix(p, "/static/") ||
+		p == "/api/v1/login" ||
+		p == "/api/v1/logout" ||
 		p == "/.well-known/openid-configuration" ||
 		p == "/api/v1/oidc/jwks" ||
 		(r.Method == http.MethodPost && strings.HasSuffix(p, "/oidc"))

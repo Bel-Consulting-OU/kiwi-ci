@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kiwi CI</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header>
+  <div class="mark">K</div>
+  <div class="brand">Kiwi CI</div>
+  <div class="subtitle">control plane dashboard</div>
+  <div class="spacer"></div>
+  <span id="conn" class="pill hidden">offline</span>
+  <form id="login" class="login">
+    <input id="token" type="password" name="token" placeholder="admin token" autocomplete="current-password" required>
+    <button type="submit">Sign in</button>
+  </form>
+  <button id="logout" class="hidden">Sign out</button>
+</header>
+<main>
+  <section id="stats" class="stats"></section>
+  <section class="toolbar">
+    <h1>Runs</h1>
+    <button id="refresh">Refresh</button>
+  </section>
+  <div id="error" class="error hidden"></div>
+  <table id="runs">
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Status</th>
+        <th>Event</th>
+        <th>Repository</th>
+        <th>Trusted</th>
+        <th>Age</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+  <section id="detail" class="hidden">
+    <div class="toolbar"><h1>Jobs</h1></div>
+    <table id="jobs">
+      <thead>
+        <tr><th>ID</th><th>Key</th><th>Status</th><th>Attempts</th><th>Runner</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>

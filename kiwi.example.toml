@@ -1,0 +1,109 @@
+# Kiwi CI server configuration
+#
+# Precedence: CLI flags > KIWI_* environment variables > this file > defaults.
+# Every key shown here is optional; defaults are documented per key.
+
+[server]
+# Public base URL advertised to runners, for OIDC issuer and forge statuses.
+# Required and https:// in production mode.
+# external_url = "https://ci.example.com"
+
+# HTTP listen address. Default ":8080".
+# listen = ":8080"
+
+# TLS certificate and private key. Both must be set to enable HTTPS.
+# tls_cert = "/etc/kiwi/server.crt"
+# tls_key  = "/etc/kiwi/server.key"
+
+# Server mode: "dev" (in-memory state, default) or "production".
+# mode = "dev"
+
+[database]
+# PostgreSQL connection URL; enables the durable SQL control plane.
+# url = "postgres://kiwi:secret@db:5432/kiwi"
+
+# Maximum connections in the pgx pool. Default: driver default.
+# max_connections = 25
+
+[runner_pki]
+# Runner certificate enrollment and mTLS identity binding.
+# enabled = true
+# ca_cert = "/etc/kiwi/runner-ca.crt"
+# ca_key  = "/etc/kiwi/runner-ca.key"
+
+# Token authorizing POST /api/v1/runners/enroll.
+# enroll_token = "change-me"
+
+[blob]
+# Artifact blob storage backend: "fs" (local data dir, default) or "s3".
+# backend = "fs"
+# path = "/var/lib/kiwi/blobs"
+
+# S3 settings, required when backend = "s3".
+# s3_endpoint  = "https://s3.example.com"
+# s3_bucket    = "kiwi-artifacts"
+# s3_region    = "eu-central-1"
+# s3_access_key = ""
+# s3_secret_key = ""
+
+[github]
+# GitHub App ID and private key for the API client.
+# app_id = 0
+# private_key_path = "/etc/kiwi/github.pem"
+
+# Webhook HMAC secret and API token.
+# webhook_secret = ""
+# token = ""
+
+[gitlab]
+# webhook_secret = ""
+# token = ""
+
+[forgejo]
+# webhook_secret = ""
+# token = ""
+
+[policy]
+# Repository/organization policy document.
+# file = "/etc/kiwi/policy.rego"
+
+[observability]
+# OpenTelemetry collector endpoint. Accepted for forward compatibility;
+# tracing export is not implemented yet (no-op).
+# otel_endpoint = ""
+
+# Serve /metrics on a separate listen address when set.
+# metrics_listen = ":9090"
+
+[rate_limit]
+# Per-request rate limits, applied per principal / runner / client IP.
+# 0 (the default) disables limiting.
+# per_second = 0
+
+# Burst: instantaneous token budget before the per_second rate applies.
+# Default 100.
+# burst = 100
+
+# Per-class overrides (tokens/second); each falls back to per_second.
+# next_per_second             = 0
+# heartbeat_per_second        = 0
+# logs_per_second             = 0
+# artifact_upload_per_second  = 0
+# cache_upload_per_second     = 0
+# dispatch_per_second         = 0
+# webhooks_per_second         = 0
+# enroll_per_second           = 0
+# register_per_second         = 0
+# oidc_per_second             = 0
+# secrets_per_second          = 0
+# login_per_second            = 0
+
+[auth]
+# Admin bearer token (admin-tier API routes).
+# admin_token = ""
+
+# Runner bearer token shared by all runners.
+# runner_token = ""
+
+# JSON token-store path for fine-grained principals (auth.TokenStore format).
+# tokens_file = "/etc/kiwi/tokens.json"

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/config"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runner"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
@@ -18,7 +19,9 @@ import (
 )
 
 // productionConfig is the pure input to validateProductionConfig, extracted
-// so production-mode flag requirements are unit-testable without a network.
+// so production-mode requirements are unit-testable without a network.
+// Server() fills it from the merged configuration (CLI > environment >
+// config file > defaults).
 type productionConfig struct {
 	Mode             string
 	DatabaseURL      string
@@ -64,50 +67,110 @@ func validateProductionConfig(cfg productionConfig) error {
 
 func Server(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("server", flag.ContinueOnError)
-	listen := fs.String("listen", ":8080", "listen address")
-	token := fs.String("runner-token", os.Getenv("KIWI_RUNNER_TOKEN"), "runner/API bearer token")
-	adminToken := fs.String("admin-token", os.Getenv("KIWI_ADMIN_TOKEN"), "admin bearer token (defaults to runner token)")
-	webhookSecret := fs.String("github-webhook-secret", os.Getenv("KIWI_GITHUB_WEBHOOK_SECRET"), "GitHub webhook HMAC secret")
-	githubToken := fs.String("github-token", os.Getenv("KIWI_GITHUB_TOKEN"), "GitHub token for private pipeline fetches")
+	// Flags default to empty: effective values come from the merged
+	// configuration (CLI > environment > config file > defaults). Only
+	// explicitly set flags override the config.
+	listen := fs.String("listen", "", "listen address (default: \":8080\")")
+	token := fs.String("runner-token", "", "runner/API bearer token")
+	adminToken := fs.String("admin-token", "", "admin bearer token (defaults to runner token)")
+	webhookSecret := fs.String("github-webhook-secret", "", "GitHub webhook HMAC secret")
+	githubToken := fs.String("github-token", "", "GitHub token for private pipeline fetches")
 	pipelinePath := fs.String("pipeline-path", ".kiwi/pipeline.yaml", "pipeline path in repositories")
 	dataDir := fs.String("data-dir", "", "persistent state directory (default: in-memory; production deployments should always set this)")
-	externalURL := fs.String("external-url", os.Getenv("KIWI_EXTERNAL_URL"), "public base URL (required for OIDC)")
+	externalURL := fs.String("external-url", "", "public base URL (required for OIDC)")
 	tlsCert := fs.String("tls-cert", "", "TLS certificate file (enables HTTPS)")
 	tlsKey := fs.String("tls-key", "", "TLS private key file")
 	runnerCACert := fs.String("runner-ca-cert", "", "runner CA certificate PEM (enables runner certificate enrollment)")
 	runnerCAKey := fs.String("runner-ca-key", "", "runner CA private key PEM")
-	runnerEnrollToken := fs.String("runner-enroll-token", os.Getenv("KIWI_RUNNER_ENROLL_TOKEN"), "token authorizing runner certificate enrollment")
-	databaseURL := fs.String("database-url", os.Getenv("KIWI_DATABASE_URL"), "PostgreSQL connection URL (wires the durable SQL control plane)")
-	mode := fs.String("mode", "dev", "server mode: dev (in-memory, default) or production")
+	runnerEnrollToken := fs.String("runner-enroll-token", "", "token authorizing runner certificate enrollment")
+	databaseURL := fs.String("database-url", "", "PostgreSQL connection URL (wires the durable SQL control plane)")
+	mode := fs.String("mode", "", "server mode: dev (in-memory, default) or production")
 	allowSharedToken := fs.Bool("allow-shared-token", false, "production: allow --admin-token to equal --runner-token")
+	configPath := fs.String("config", "", "TOML configuration file (kiwi.toml); CLI flags override it")
+	otelEndpoint := fs.String("otel-endpoint", "", "OpenTelemetry collector endpoint (accepted for compatibility; tracing is a no-op for now)")
+	rateLimitPerSecond := fs.Float64("rate-limit-per-second", 0, "global request rate limit per principal/runner/IP (0 disables)")
+	rateLimitBurst := fs.Int("rate-limit-burst", 0, "rate limit burst size (default 100)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *tlsCert == "" && *tlsKey != "" {
+
+	// Merge the configuration: config file (or built-in defaults), then
+	// environment, then explicitly set CLI flags.
+	var cfg *config.Config
+	var err error
+	if *configPath != "" {
+		cfg, err = config.Load(*configPath)
+		if err != nil {
+			return fmt.Errorf("config: %w", err)
+		}
+	} else {
+		cfg = config.Default()
+	}
+	if err := cfg.ApplyEnv(); err != nil {
+		return err
+	}
+	if err := cfg.OverrideFromFlags(fs); err != nil {
+		return err
+	}
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+	if *otelEndpoint != "" || cfg.Observability.OTelEndpoint != "" {
+		fmt.Fprintln(os.Stderr, "kiwi: --otel-endpoint/observability.otel_endpoint is accepted but OpenTelemetry tracing is not implemented yet (no-op)")
+	}
+	// The flag pointers exist only to register the flags; their values are
+	// read back through config.OverrideFromFlags (which inspects only
+	// explicitly set flags).
+	discard(listen, token, adminToken, webhookSecret, githubToken, externalURL, tlsCert, tlsKey, runnerCACert, runnerCAKey, runnerEnrollToken, databaseURL, mode, rateLimitPerSecond, rateLimitBurst)
+
+	// Effective values after the precedence merge.
+	listenV := cfg.Server.Listen
+	if listenV == "" {
+		listenV = ":8080"
+	}
+	tokenV := cfg.Auth.RunnerToken
+	adminTokenV := cfg.Auth.AdminToken
+	if adminTokenV == "" {
+		adminTokenV = tokenV
+	}
+	modeV := cfg.Server.Mode
+	if modeV == "" {
+		modeV = "dev"
+	}
+	databaseURLV := cfg.Database.URL
+	externalURLV := cfg.Server.ExternalURL
+	tlsCertV := cfg.Server.TLSCert
+	tlsKeyV := cfg.Server.TLSKey
+	webhookSecretV := cfg.GitHub.WebhookSecret
+	githubTokenV := cfg.GitHub.Token
+	runnerEnrollTokenV := cfg.RunnerPKI.EnrollToken
+	runnerCACertV := cfg.RunnerPKI.CACert
+	runnerCAKeyV := cfg.RunnerPKI.CAKey
+
+	if tlsCertV == "" && tlsKeyV != "" {
 		return fmt.Errorf("--tls-key requires --tls-cert")
 	}
-	if *tlsCert != "" && *tlsKey == "" {
+	if tlsCertV != "" && tlsKeyV == "" {
 		return fmt.Errorf("--tls-cert requires --tls-key")
 	}
 	if err := validateProductionConfig(productionConfig{
-		Mode:             *mode,
-		DatabaseURL:      *databaseURL,
-		RunnerToken:      *token,
-		AdminToken:       *adminToken,
-		ExternalURL:      *externalURL,
-		TLSCert:          *tlsCert,
-		TLSKey:           *tlsKey,
+		Mode:             modeV,
+		DatabaseURL:      databaseURLV,
+		RunnerToken:      tokenV,
+		AdminToken:       adminTokenV,
+		ExternalURL:      externalURLV,
+		TLSCert:          tlsCertV,
+		TLSKey:           tlsKeyV,
 		AllowSharedToken: *allowSharedToken,
 	}); err != nil {
 		return err
 	}
 	var srv *server.Server
-	var err error
-	if *databaseURL != "" {
+	if databaseURLV != "" {
 		// DB mode: the SQL store is the source of truth. A data-dir is still
 		// used when set (lease key, OIDC signer, artifact bytes); without it
 		// artifact storage is unavailable.
-		db, derr := storage.NewPostgres(ctx, *databaseURL)
+		db, derr := storage.NewPostgres(ctx, databaseURLV)
 		if derr != nil {
 			return derr
 		}
@@ -116,11 +179,11 @@ func Server(ctx context.Context, args []string) error {
 			return fmt.Errorf("auto-migrate: %w", merr)
 		}
 		if *dataDir != "" {
-			srv, err = server.NewPersistent(*token, *adminToken, *dataDir)
+			srv, err = server.NewPersistent(tokenV, adminTokenV, *dataDir)
 		} else {
-			srv = server.New(*token)
-			if *adminToken != "" {
-				srv.AdminToken = *adminToken
+			srv = server.New(tokenV)
+			if adminTokenV != "" {
+				srv.AdminToken = adminTokenV
 			}
 		}
 		if err != nil {
@@ -130,29 +193,32 @@ func Server(ctx context.Context, args []string) error {
 			return err
 		}
 	} else if *dataDir != "" {
-		srv, err = server.NewPersistent(*token, *adminToken, *dataDir)
+		srv, err = server.NewPersistent(tokenV, adminTokenV, *dataDir)
 		if err != nil {
 			return err
 		}
 	} else {
-		srv = server.New(*token)
-		if *adminToken != "" {
-			srv.AdminToken = *adminToken
+		srv = server.New(tokenV)
+		if adminTokenV != "" {
+			srv.AdminToken = adminTokenV
 		}
 	}
-	srv.GitHubWebhookSecret = *webhookSecret
-	srv.GitHubToken = *githubToken
+	srv.GitHubWebhookSecret = webhookSecretV
+	srv.GitHubToken = githubTokenV
 	srv.PipelinePath = *pipelinePath
-	srv.ExternalURL = *externalURL
-	srv.RunnerEnrollToken = *runnerEnrollToken
-	if *runnerCACert != "" || *runnerCAKey != "" {
-		if *runnerCACert == "" || *runnerCAKey == "" {
+	srv.ExternalURL = externalURLV
+	srv.RunnerEnrollToken = runnerEnrollTokenV
+	if m := cfg.RateLimitMiddleware(); m != nil {
+		srv.RateLimiter = m
+	}
+	if runnerCACertV != "" || runnerCAKeyV != "" {
+		if runnerCACertV == "" || runnerCAKeyV == "" {
 			return fmt.Errorf("--runner-ca-cert and --runner-ca-key must be set together")
 		}
-		if err := srv.SetRunnerCA(*runnerCACert, *runnerCAKey); err != nil {
+		if err := srv.SetRunnerCA(runnerCACertV, runnerCAKeyV); err != nil {
 			return err
 		}
-	} else if *runnerEnrollToken != "" {
+	} else if runnerEnrollTokenV != "" {
 		if *dataDir == "" {
 			return fmt.Errorf("runner enrollment requires --data-dir (to persist the runner CA) or explicit --runner-ca-cert/--runner-ca-key")
 		}
@@ -161,7 +227,7 @@ func Server(ctx context.Context, args []string) error {
 		}
 	}
 	h := &http.Server{
-		Addr:              *listen,
+		Addr:              listenV,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
@@ -177,13 +243,13 @@ func Server(ctx context.Context, args []string) error {
 		_ = h.Shutdown(c)
 	}()
 	scheme := "http"
-	if *tlsCert != "" {
+	if tlsCertV != "" {
 		scheme = "https"
 	}
-	fmt.Printf("Kiwi server listening on %s://%s\n", scheme, *listen)
+	fmt.Printf("Kiwi server listening on %s://%s\n", scheme, listenV)
 	var serveErr error
-	if *tlsCert != "" {
-		serveErr = h.ListenAndServeTLS(*tlsCert, *tlsKey)
+	if tlsCertV != "" {
+		serveErr = h.ListenAndServeTLS(tlsCertV, tlsKeyV)
 	} else {
 		serveErr = h.ListenAndServe()
 	}
@@ -320,3 +386,6 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+// discard marks values as intentionally read elsewhere.
+func discard(_ ...any) {}

@@ -10,9 +10,8 @@ import (
 	"syscall"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/app"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/version"
 )
-
-const version = "0.1.0-dev"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -38,10 +37,29 @@ func main() {
 		err = app.Runner(ctx, os.Args[2:])
 	case "dispatch":
 		err = app.Dispatch(ctx, os.Args[2:])
+	case "init":
+		err = app.Init(os.Args[2:])
+	case "runs", "jobs", "logs", "cancel", "approve", "rerun", "artifacts", "schedules", "policy":
+		err = app.Ops(ctx, os.Args[1], os.Args[2:])
 	case "database":
 		err = databaseCommand(ctx, os.Args[2:])
+	case "config":
+		err = configCommand(ctx, os.Args[2:])
 	case "version", "--version", "-v":
-		fmt.Printf("kiwi %s (%s/%s)\n", version, runtime.GOOS, runtime.GOARCH)
+		fmt.Printf("kiwi %s (%s/%s)\n", version.String(), runtime.GOOS, runtime.GOARCH)
+		if v := version.Full(); v["commit"] != "" || v["build_date"] != "" {
+			extra := ""
+			if v["commit"] != "" {
+				extra = "commit " + v["commit"]
+			}
+			if v["build_date"] != "" {
+				if extra != "" {
+					extra += " "
+				}
+				extra += "built " + v["build_date"]
+			}
+			fmt.Printf("  %s\n", extra)
+		}
 		return
 	case "help", "--help", "-h":
 		usage()
@@ -71,20 +89,41 @@ func databaseCommand(ctx context.Context, args []string) error {
 	}
 }
 
+func configCommand(ctx context.Context, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("config requires a subcommand: check")
+	}
+	switch args[0] {
+	case "check":
+		return app.ConfigCheck(ctx, args[1:])
+	default:
+		return fmt.Errorf("unknown config subcommand %q (want check)", args[0])
+	}
+}
+
 func usage() {
 	out := flag.CommandLine.Output()
 	fmt.Fprintln(out, `Kiwi CI — local-first CI/CD for fast, reproducible builds.
 
 Usage:
+  kiwi init     [--force] [-f .kiwi/pipeline.yaml]
   kiwi run      [-f .kiwi/pipeline.yaml] [--job NAME] [--max-parallel N]
   kiwi validate [-f .kiwi/pipeline.yaml]
   kiwi explain  [-f .kiwi/pipeline.yaml]
   kiwi doctor
   kiwi server   [--listen :8080] [--mode dev|production] [--database-url URL]
+                [--config kiwi.toml]
+  kiwi config check --config kiwi.toml
   kiwi database migrate|status --database-url URL
   kiwi runner   --server http://127.0.0.1:8080 --token TOKEN [--drain]
   kiwi runner list|drain|disable|enable --server URL --token ADMIN_TOKEN [RUNNER_ID]
   kiwi dispatch --repo owner/name --ref main --input k=v --pipeline FILE
+  kiwi runs [--server URL] [--token ADMIN_TOKEN]
+  kiwi jobs RUN [--server URL] [--token ADMIN_TOKEN]
+  kiwi logs RUN [--job KEY] [--follow] [--server URL] [--token ADMIN_TOKEN]
+  kiwi cancel RUN | kiwi rerun RUN | kiwi approve JOB | kiwi artifacts RUN
+  kiwi schedules list|trigger
+  kiwi policy check [-f .kiwi/pipeline.yaml] [--trusted]
   kiwi version
 
 Design goals:

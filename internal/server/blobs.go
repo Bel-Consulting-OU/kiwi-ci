@@ -273,6 +273,7 @@ func (s *Server) downloadCache(w http.ResponseWriter, r *http.Request) {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			s.metricAdd("kiwi_cache_misses_total", 1, nil)
 			http.NotFound(w, r)
 			return
 		}
@@ -280,6 +281,7 @@ func (s *Server) downloadCache(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
+	s.metricAdd("kiwi_cache_hits_total", 1, nil)
 	if b, err := os.ReadFile(path + ".sha256"); err == nil {
 		w.Header().Set("X-Kiwi-Content-SHA256", strings.TrimSpace(string(b)))
 	}
