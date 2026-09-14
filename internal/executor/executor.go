@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -17,6 +18,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secrets"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/snapshot"
 )
 
 type Options struct {
@@ -55,6 +57,10 @@ type Options struct {
 	// that are not pinned by an @sha256: digest. The server enables this for
 	// untrusted jobs.
 	RequireImmutableImages bool
+	// CaptureSnapshot archives the job workspace after its steps ran (for
+	// any status other than skipped/blocked) under the host temp dir.
+	// Snapshot failures are logged as warnings and never change job status.
+	CaptureSnapshot bool
 }
 
 type Executor struct {
@@ -289,6 +295,8 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		b.RequireImmutableImages = e.Opt.RequireImmutableImages
 		b.Rootless = cj.Job.Sandbox.Rootless
 		b.ReadOnlyRootFS = cj.Job.Sandbox.ReadOnlyRootFS
+		b.RunID = e.Opt.RunID
+		b.JobID = cj.ID
 	case *TartBackend:
 		b.RequireImmutableImages = e.Opt.RequireImmutableImages
 	}
@@ -379,9 +387,10 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			attempts = 1
 		}
 		backoff := retry.Backoff.Duration
-		if backoff == 0 {
+		if backoff <= 0 {
 			backoff = time.Second
 		}
+		seed := retrySeed(e.Opt.RunID, cj.ID)
 		stepEnvMap := mergeEnvMap(jobEnv, st.Env)
 		// Step secret values live only in this step's env map; a fresh cache
 		// per step means no step secret is retained in any map that outlives
@@ -429,9 +438,8 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 				case <-stepCtx.Done():
 					runErr = stepCtx.Err()
 					attempt = attempts
-				case <-time.After(backoff):
+				case <-time.After(backoffFor(attempt, backoff, maxRetryBackoff, seed)):
 				}
-				backoff *= 2
 			}
 		}
 		if st.ID != "" {
@@ -489,10 +497,41 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			}
 		}
 	}
+	if e.Opt.CaptureSnapshot && currentStatus != model.StatusSkipped && currentStatus != model.StatusBlocked {
+		e.captureSnapshot(cj.ID, workspace)
+	}
 	res.Status = currentStatus
 	res.Outputs = pipeline.InterpolateOutputMap(cj.Job.Outputs, needsOutputs, stepOutputs)
 	e.saveArtifacts(s, cj, workspace, res.Status)
 	return finish(res)
+}
+
+// captureSnapshot archives the job workspace after its steps ran. It writes
+// under the host temp dir (filepath.Join(os.TempDir(), "kiwi-snapshots",
+// runID, jobID+".tar.gz")) using the snapshot package's own workspace scan.
+// Any failure is logged as a warning; snapshot capture never changes job
+// status.
+func (e *Executor) captureSnapshot(jobID, workspace string) {
+	dest := filepath.Join(os.TempDir(), "kiwi-snapshots", e.Opt.RunID, jobID+".tar.gz")
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		e.log(jobID, "snapshot", "warning: "+err.Error())
+		return
+	}
+	f, err := os.Create(dest)
+	if err != nil {
+		e.log(jobID, "snapshot", "warning: "+err.Error())
+		return
+	}
+	if _, err := snapshot.Create(workspace, f); err != nil {
+		_ = f.Close()
+		e.log(jobID, "snapshot", "warning: "+err.Error())
+		return
+	}
+	if err := f.Close(); err != nil {
+		e.log(jobID, "snapshot", "warning: "+err.Error())
+		return
+	}
+	e.log(jobID, "snapshot", "saved "+dest)
 }
 
 // defaultCondition supplies the implicit step condition: a step without an
@@ -694,11 +733,14 @@ func retryAllows(r pipeline.Retry, err error) bool {
 		return false
 	}
 	kind := errorKind(err)
-	if kind == ErrorCancelled {
+	class := failureClass(err)
+	if class == CancelledFailure {
 		return false
 	}
 	if len(r.On) == 0 {
-		return true
+		// Default policy: only transient failure classes retry; policy,
+		// configuration, cancellation, and lost-runner failures never do.
+		return retryableClass(class)
 	}
 	for _, x := range r.On {
 		x = strings.ToLower(strings.TrimSpace(x))
@@ -707,6 +749,17 @@ func retryAllows(r pipeline.Retry, err error) bool {
 		}
 	}
 	return false
+}
+
+// retrySeed derives a per-job seed for the retry backoff jitter so jobs
+// retrying at the same time do not retry in lockstep.
+func retrySeed(parts ...string) uint64 {
+	h := fnv.New64a()
+	for _, p := range parts {
+		_, _ = h.Write([]byte(p))
+		_, _ = h.Write([]byte{0})
+	}
+	return h.Sum64()
 }
 
 func max(a, b int) int {

@@ -39,16 +39,22 @@ func (*NativeBackend) Run(ctx context.Context, c Command, emit func(string)) err
 	cmd.Dir = c.Dir
 	cmd.Env = c.Env
 	configureProcess(cmd)
+	cleanup := setupChildJob(cmd)
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
 	if err := cmd.Start(); err != nil {
+		cleanup()
 		return &RunError{Kind: ErrorInfra, Err: err}
 	}
 	done := make(chan struct{}, 2)
 	go func() { defer func() { done <- struct{}{} }(); streamLines(stdout, defaultMaxLine, emit) }()
 	go func() { defer func() { done <- struct{}{} }(); streamLines(stderr, defaultMaxLine, emit) }()
 	wait := make(chan error, 1)
-	go func() { wait <- cmd.Wait() }()
+	go func() {
+		err := cmd.Wait()
+		cleanup()
+		wait <- err
+	}()
 	select {
 	case err := <-wait:
 		<-done

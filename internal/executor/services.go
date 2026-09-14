@@ -39,7 +39,7 @@ func startContainerServices(ctx context.Context, runID, jobID string, services [
 	if len(network) > 60 {
 		network = network[:60]
 	}
-	createArgs := append(serviceNetworkArgs(isolated), network)
+	createArgs := append(serviceNetworkArgs(isolated), "--label", "kiwi.run="+runID, network)
 	if out, err := exec.CommandContext(ctx, docker, append([]string{"network"}, createArgs...)...).CombinedOutput(); err != nil {
 		return "", func() {}, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("create services network: %v: %s", err, strings.TrimSpace(string(out)))}
 	}
@@ -72,6 +72,7 @@ func startContainerServices(ctx context.Context, runID, jobID string, services [
 			"--pids-limit=256", "--memory=2g", "--cpus=2",
 			"--user=65534:65534",
 		}
+		args = append(args, containerLabels(runID, jobID)...)
 		for k, v := range svc.Env {
 			args = append(args, "-e", k+"="+v)
 		}

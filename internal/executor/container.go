@@ -21,6 +21,10 @@ type ContainerBackend struct {
 	docker    string
 	container string
 	workspace string
+	// RunID and JobID identify the owning run/job for the kiwi.run/kiwi.job
+	// labels applied to the job container so GC can find stale ones.
+	RunID string
+	JobID string
 	// RequireImmutableImages rejects images that are not pinned by an
 	// @sha256: digest. Set by the executor from Options for untrusted jobs.
 	RequireImmutableImages bool
@@ -70,6 +74,7 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 		"--cap-drop=ALL", "--security-opt=no-new-privileges",
 		"-v", abs + ":/workspace", "-w", "/workspace", "--name", b.container,
 	}
+	args = append(args, containerLabels(b.RunID, b.JobID)...)
 	if b.Rootless || b.ReadOnlyRootFS {
 		args = append(args,
 			"--read-only",
