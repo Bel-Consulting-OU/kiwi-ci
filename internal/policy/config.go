@@ -1,21 +1,242 @@
 package policy
 
-// OIDCPolicy declares which audiences a job may request OIDC id_tokens for.
-type OIDCPolicy struct {
-	AllowedAudiences []string
+import (
+	"fmt"
+	"os"
+
+	"gopkg.in/yaml.v3"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
+)
+
+// Config is the organization-wide policy file loaded from disk. Every field
+// is a restriction: anything absent stays at the platform default. Unknown
+// keys are rejected so policy typos fail closed.
+type Config struct {
+	AllowedCloneHosts  []string              `yaml:"allowed_clone_hosts"`
+	AllowedRunnerPools []string              `yaml:"allowed_runner_pools"`
+	AllowedRegions     []string              `yaml:"allowed_regions"`
+	RequireDigestPins  bool                  `yaml:"require_digest_pins"`
+	RequireRootless    bool                  `yaml:"require_rootless"`
+	Network            string                `yaml:"network"`
+	SecretAllowlist    []string              `yaml:"secret_allowlist"`
+	OIDCAudiences      []string              `yaml:"oidc_audiences"`
+	EnvironmentRules   map[string]EnvRule    `yaml:"environment_rules"`
+	Repositories       map[string]RepoPolicy `yaml:"repositories"`
 }
 
-// Allows reports whether audience is permitted. A nil AllowedAudiences means
-// no restriction (trusted default); an empty non-nil slice denies everything.
-func (p OIDCPolicy) Allows(audience string) bool {
-	if p.AllowedAudiences == nil {
-		return true
+// EnvRule restricts a named deployment environment.
+type EnvRule struct {
+	AllowedBranches   []string `yaml:"allowed_branches"`
+	RequiredApprovers int      `yaml:"required_approvers"`
+	Concurrency       int      `yaml:"concurrency"`
+	OIDCAudiences     []string `yaml:"oidc_audiences"`
+}
+
+// RepoPolicy carries per-repository restrictions.
+type RepoPolicy struct {
+	AllowedCloneHosts  []string `yaml:"allowed_clone_hosts"`
+	AllowedRunnerPools []string `yaml:"allowed_runner_pools"`
+	AllowedRegions     []string `yaml:"allowed_regions"`
+	RequireDigestPins  *bool    `yaml:"require_digest_pins"`
+	RequireRootless    *bool    `yaml:"require_rootless"`
+	Network            string   `yaml:"network"`
+	SecretAllowlist    []string `yaml:"secret_allowlist"`
+	OIDCAudiences      []string `yaml:"oidc_audiences"`
+	Deployments        *bool    `yaml:"deployments"`
+	CrossRepoTrigger   *bool    `yaml:"cross_repo_trigger"`
+	GenerateChildGraph *bool    `yaml:"generate_child_graph"`
+}
+
+// knownConfigKeys is the strict allowlist for the policy file: unknown keys
+// fail closed so a policy typo can never silently widen permissions.
+var knownConfigKeys = map[string]map[string]bool{
+	"": {
+		"allowed_clone_hosts": true, "allowed_runner_pools": true, "allowed_regions": true,
+		"require_digest_pins": true, "require_rootless": true, "network": true,
+		"secret_allowlist": true, "oidc_audiences": true, "environment_rules": true,
+		"repositories": true,
+	},
+	"environment_rules": {
+		"allowed_branches": true, "required_approvers": true, "concurrency": true,
+		"oidc_audiences": true,
+	},
+	"repo": {
+		"allowed_clone_hosts": true, "allowed_runner_pools": true, "allowed_regions": true,
+		"require_digest_pins": true, "require_rootless": true, "network": true,
+		"secret_allowlist": true, "oidc_audiences": true, "deployments": true,
+		"cross_repo_trigger": true, "generate_child_graph": true,
+	},
+	"repositories": {
+		"allowed_clone_hosts": true, "allowed_runner_pools": true, "allowed_regions": true,
+		"require_digest_pins": true, "require_rootless": true, "network": true,
+		"secret_allowlist": true, "oidc_audiences": true, "deployments": true,
+		"cross_repo_trigger": true, "generate_child_graph": true,
+	},
+}
+
+// validateConfigNode rejects unknown keys and non-mapping shapes with
+// line/column context.
+func validateConfigNode(n *yaml.Node, section string, depth int) error {
+	if depth > 32 {
+		return fmt.Errorf("policy: line %d: nesting too deep", n.Line)
 	}
-	return containsString(p.AllowedAudiences, audience)
+	if n.Kind == yaml.ScalarNode {
+		return nil
+	}
+	if n.Kind == yaml.SequenceNode {
+		for _, item := range n.Content {
+			if err := validateConfigNode(item, section, depth+1); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if n.Kind != yaml.MappingNode {
+		return fmt.Errorf("policy: line %d: unexpected node", n.Line)
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		key := n.Content[i].Value
+		// The repositories map is keyed by arbitrary repository names; its
+		// values follow the repository-policy shape.
+		if section == "repositories" {
+			if err := validateConfigNode(n.Content[i+1], "repo", depth+1); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, ok := knownConfigKeys[section][key]; !ok {
+			return fmt.Errorf("policy: line %d: unknown field %q", n.Content[i].Line, key)
+		}
+		childSection := section
+		switch {
+		case section == "" && (key == "environment_rules" || key == "repositories"):
+			childSection = key
+		case section == "environment_rules" || section == "repo":
+		}
+		if err := validateConfigNode(n.Content[i+1], childSection, depth+1); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// OIDCFromCapabilities converts a capability set's OIDC audiences into an
-// OIDCPolicy for id_token issuance checks.
-func OIDCFromCapabilities(c Capabilities) OIDCPolicy {
-	return OIDCPolicy{AllowedAudiences: c.OIDC}
+// Load reads and validates the policy file with strict unknown-key checking.
+func Load(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > 1<<20 {
+		return nil, fmt.Errorf("policy: file exceeds 1 MiB")
+	}
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return nil, fmt.Errorf("policy: %w", err)
+	}
+	if len(root.Content) == 0 {
+		return &Config{}, nil
+	}
+	doc := root.Content[0]
+	if err := validateConfigNode(doc, "", 0); err != nil {
+		return nil, err
+	}
+	var cfg Config
+	if err := doc.Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("policy: %w", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+func (c *Config) Validate() error {
+	if c.Network != "" {
+		if _, err := parseNetworkPolicy(c.Network); err != nil {
+			return fmt.Errorf("policy: %w", err)
+		}
+	}
+	for repo, rp := range c.Repositories {
+		if repo == "" {
+			return fmt.Errorf("policy: empty repository name")
+		}
+		if rp.Network != "" {
+			if _, err := parseNetworkPolicy(rp.Network); err != nil {
+				return fmt.Errorf("policy: repository %q: %w", repo, err)
+			}
+		}
+	}
+	return nil
+}
+
+func parseNetworkPolicy(s string) (pipeline.NetworkPolicy, error) {
+	var n pipeline.NetworkPolicy
+	if err := n.UnmarshalYAML(&yaml.Node{Kind: yaml.ScalarNode, Value: s}); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// CapabilitiesFor derives the capability intersection for a repository from
+// org-level and repo-level policy. The result must always be further
+// intersected with the caller's base capabilities and the trust floor.
+func (c *Config) CapabilitiesFor(repoFullName string) Capabilities {
+	rest := Capabilities{
+		Network: pipeline.NetworkPolicyDefault,
+	}
+	if c.RequireRootless {
+		rest.NativeExecution = false
+	}
+	if len(c.SecretAllowlist) > 0 {
+		m := map[string]bool{}
+		for _, s := range c.SecretAllowlist {
+			m[s] = true
+		}
+		rest.Secrets = m
+	}
+	if len(c.OIDCAudiences) > 0 {
+		rest.OIDC = append([]string(nil), c.OIDCAudiences...)
+	}
+	if len(c.AllowedRunnerPools) > 0 {
+		rest.RunnerLabels = append([]string(nil), c.AllowedRunnerPools...)
+	}
+	if c.Network != "" {
+		if n, err := parseNetworkPolicy(c.Network); err == nil {
+			rest.Network = n
+		}
+	}
+	if rp, ok := c.Repositories[repoFullName]; ok {
+		if len(rp.SecretAllowlist) > 0 {
+			m := map[string]bool{}
+			for _, s := range rp.SecretAllowlist {
+				m[s] = true
+			}
+			rest.Secrets = intersectSecrets(rest.Secrets, m)
+		}
+		if len(rp.OIDCAudiences) > 0 {
+			rest.OIDC = intersectStrings(rest.OIDC, rp.OIDCAudiences)
+		}
+		if len(rp.AllowedRunnerPools) > 0 {
+			rest.RunnerLabels = intersectStrings(rest.RunnerLabels, rp.AllowedRunnerPools)
+		}
+		if rp.RequireRootless != nil && *rp.RequireRootless {
+			rest.NativeExecution = false
+		}
+		if rp.Deployments != nil {
+			rest.Deployments = *rp.Deployments
+		}
+		if rp.CrossRepoTrigger != nil {
+			rest.CrossRepoTrigger = *rp.CrossRepoTrigger
+		}
+		if rp.GenerateChildGraph != nil {
+			rest.GenerateChildGraph = *rp.GenerateChildGraph
+		}
+		if rp.Network != "" {
+			if n, err := parseNetworkPolicy(rp.Network); err == nil {
+				rest.Network = n
+			}
+		}
+	}
+	return rest
 }

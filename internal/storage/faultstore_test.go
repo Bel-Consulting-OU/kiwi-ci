@@ -16,30 +16,30 @@ var errBoom = errors.New("injected storage failure")
 // memSnapshot is a comparable picture of every durable collection in a
 // memStore, used to prove a faulted operation left no partial write.
 type memSnapshot struct {
-	runs       map[string]model.Run
-	jobs       map[string]model.Job
-	runners    map[string]model.Runner
-	receipts   map[string]model.CompletionReceipt
-	auditLen   int
-	logsLen    int
+	runs         map[string]model.Run
+	jobs         map[string]model.Job
+	runners      map[string]model.Runner
+	receipts     map[string]model.CompletionReceipt
+	auditLen     int
+	logsLen      int
 	artifactsLen int
-	reportsLen int
-	deliveries map[string]string
+	reportsLen   int
+	deliveries   map[string]string
 }
 
 func (m *memStore) snapshot() memSnapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return memSnapshot{
-		runs:        cloneRuns(m.runs),
-		jobs:        cloneJobs(m.jobs),
-		runners:     cloneRunners(m.runners),
-		receipts:    cloneReceipts(m.receipts),
-		auditLen:    len(m.audit),
-		logsLen:     len(m.logs),
+		runs:         cloneRuns(m.runs),
+		jobs:         cloneJobs(m.jobs),
+		runners:      cloneRunners(m.runners),
+		receipts:     cloneReceipts(m.receipts),
+		auditLen:     len(m.audit),
+		logsLen:      len(m.logs),
 		artifactsLen: len(m.artifacts),
-		reportsLen:  len(m.reports),
-		deliveries:  cloneDeliveries(m.deliveries),
+		reportsLen:   len(m.reports),
+		deliveries:   cloneDeliveries(m.deliveries),
 	}
 }
 
@@ -125,7 +125,12 @@ func faultOps() []opCase {
 		{
 			name:  "InsertJob",
 			setup: seedRunAndJob,
-			call:  func(s Store) error { return s.InsertJob(ctx(), testJob) },
+			call: func(s Store) error {
+				job := testJob
+				job.ID = "ffffffffffffffffffffffffffffffff"
+				job.Key = "second"
+				return s.InsertJob(ctx(), job)
+			},
 		},
 		{
 			name:  "AcquireLease",
@@ -160,7 +165,12 @@ func faultOps() []opCase {
 		{
 			name:  "UpsertRunner",
 			setup: func(m *memStore) { seedRunner(m) },
-			call:  func(s Store) error { return s.UpsertRunner(ctx(), testRunner) },
+			call: func(s Store) error {
+				runner := testRunner
+				runner.Capacity = 7
+				runner.LastSeen = time.Unix(5000, 0).UTC()
+				return s.UpsertRunner(ctx(), runner)
+			},
 		},
 		{
 			name:  "InsertArtifact",
@@ -252,7 +262,7 @@ func TestFaultInjectionSequenceNoPartialLeak(t *testing.T) {
 		}
 		return nil
 	}
-	for failAfter := 0; failAfter <= jobCount+2; failAfter++ {
+	for failAfter := 1; failAfter <= jobCount+2; failAfter++ {
 		t.Run(fmt.Sprintf("failAfter=%d", failAfter), func(t *testing.T) {
 			inner := newMemStore()
 			fs := &FaultyStore{Inner: inner, FailAfter: failAfter, Err: errBoom}

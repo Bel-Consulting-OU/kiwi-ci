@@ -44,6 +44,9 @@ type Store interface {
 	InsertJob(ctx context.Context, job model.Job) error
 	GetJob(ctx context.Context, id string) (model.Job, error)
 	ListJobsByRun(ctx context.Context, runID string) ([]model.Job, error)
+	// ListJobsByEnvironment returns all jobs holding the given
+	// repository-scoped environment, for environment concurrency accounting.
+	ListJobsByEnvironment(ctx context.Context, repoURL, environment string) ([]model.Job, error)
 	ListQueuedJobs(ctx context.Context) ([]model.Job, error)
 	UpdateJob(ctx context.Context, job model.Job) error
 

@@ -102,12 +102,21 @@ func Intersect(base, restriction Capabilities) Capabilities {
 
 // Effective applies the hard trust floor: untrusted capability sets are
 // intersected with DefaultUntrustedCapabilities so no source can lift an
-// untrusted pipeline above the floor. Trusted sets are returned unchanged.
+// untrusted pipeline above the floor. The floor's explicit deny-all forms
+// (empty non-nil Secrets/OIDC) are always preserved. Trusted sets are
+// returned unchanged.
 func (c Capabilities) Effective(trusted bool) Capabilities {
 	if trusted {
 		return c
 	}
-	return Intersect(c, DefaultUntrustedCapabilities())
+	eff := Intersect(c, DefaultUntrustedCapabilities())
+	if eff.Secrets == nil {
+		eff.Secrets = map[string]bool{}
+	}
+	if eff.OIDC == nil {
+		eff.OIDC = []string{}
+	}
+	return eff
 }
 
 // OIDCAllows reports whether the capability set permits id_token issuance for
@@ -117,6 +126,30 @@ func (c Capabilities) OIDCAllows(audience string) bool {
 		return true
 	}
 	return containsString(c.OIDC, audience)
+}
+
+// OIDCPolicy is the OIDC audience policy derived from a capability set.
+// AllowedAudiences is nil when the set permits any audience.
+type OIDCPolicy struct {
+	AllowedAudiences []string
+}
+
+// Allows reports whether the policy permits id_token issuance for audience.
+func (p OIDCPolicy) Allows(audience string) bool {
+	if p.AllowedAudiences == nil {
+		return true
+	}
+	return containsString(p.AllowedAudiences, audience)
+}
+
+// OIDCFromCapabilities derives the OIDC audience policy from a capability
+// set: a nil OIDC slice (any audience) maps to a nil allowlist; an explicit
+// allowlist is copied.
+func OIDCFromCapabilities(c Capabilities) OIDCPolicy {
+	if c.OIDC == nil {
+		return OIDCPolicy{}
+	}
+	return OIDCPolicy{AllowedAudiences: append([]string(nil), c.OIDC...)}
 }
 
 // networkStrength orders network policies for least-privilege comparison:
@@ -184,7 +217,9 @@ func cloneStrings(s []string) []string {
 	if s == nil {
 		return nil
 	}
-	return append([]string(nil), s...)
+	out := make([]string, 0, len(s))
+	out = append(out, s...)
+	return out
 }
 
 func cloneBoolMap(m map[string]bool) map[string]bool {

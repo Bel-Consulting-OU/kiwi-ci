@@ -75,6 +75,10 @@ func (s *Server) issueSecret(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	if !s.verifyRunnerIdentity(r, in.RunnerID) {
+		http.Error(w, "runner identity mismatch", http.StatusForbidden)
+		return
+	}
 	if !s.validActiveLease(j, in.RunnerID, in.LeaseToken, in.LeaseGeneration, now) {
 		http.Error(w, "stale or invalid lease", http.StatusConflict)
 		return

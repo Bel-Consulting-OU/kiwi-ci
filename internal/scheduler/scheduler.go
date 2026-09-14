@@ -192,8 +192,12 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 		return queued[i].CreatedAt.Before(queued[j].CreatedAt)
 	})
 	runJobs := map[string]map[string]model.Job{}
+	envJobs := map[string][]model.Job{}
 	for _, candidate := range queued {
 		if !satisfiesLabels(ri.Labels, candidate.RequiredLabels) {
+			continue
+		}
+		if len(candidate.PlacementRegions) > 0 && ri.Region != "" && !containsStr(candidate.PlacementRegions, ri.Region) {
 			continue
 		}
 		jobs, ok := runJobs[candidate.RunID]
@@ -208,8 +212,24 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 			}
 			runJobs[candidate.RunID] = jobs
 		}
-		if EnvironmentAtCapacity(candidate, jobs) {
-			continue
+		if candidate.Environment != "" && candidate.EnvironmentConcurrency > 0 {
+			key := candidate.RepoURL + "\x00" + candidate.Environment
+			active, ok := envJobs[key]
+			if !ok {
+				all, err := s.Store.ListJobsByEnvironment(ctx, candidate.RepoURL, candidate.Environment)
+				if err != nil {
+					return nil, "", time.Time{}, err
+				}
+				envJobs[key] = all
+				active = all
+			}
+			byID := make(map[string]model.Job, len(active))
+			for _, j := range active {
+				byID[j.ID] = j
+			}
+			if EnvironmentAtCapacity(candidate, byID) {
+				continue
+			}
 		}
 		ready, outcome := DependencyOutcome(candidate.Needs, nil, func(id string) (model.Status, bool) {
 			d, ok := jobs[id]
@@ -478,6 +498,16 @@ func satisfiesLabels(have, need []string) bool {
 		}
 	}
 	return true
+}
+
+// containsStr reports whether list contains v.
+func containsStr(list []string, v string) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 func appendUnique(in []string, v string) []string {

@@ -144,6 +144,35 @@ func (s *Server) listSnapshots(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// downloadSnapshot is GET /api/v1/runs/{id}/snapshots/{sid}: streams one
+// uploaded workspace snapshot archive for replay/debugging (admin tier).
+func (s *Server) downloadSnapshot(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("sid")
+	s.mu.Lock()
+	rec, ok := s.snapshots[sid]
+	s.mu.Unlock()
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	if rec.RunID != r.PathValue("id") {
+		http.NotFound(w, r)
+		return
+	}
+	f, err := os.Open(rec.Path)
+	if err != nil {
+		http.Error(w, "snapshot archive missing", http.StatusNotFound)
+		return
+	}
+	defer f.Close()
+	w.Header().Set("Content-Type", "application/gzip")
+	w.Header().Set("Content-Length", strconv.FormatInt(rec.Size, 10))
+	w.Header().Set("X-Kiwi-Snapshot-SHA256", rec.SHA256)
+	if _, err := io.Copy(w, f); err != nil {
+		s.logf("snapshot download: %v", err)
+	}
+}
+
 // redactSnapshot strips the server-local archive path before a record
 // leaves the control plane.
 func redactSnapshot(rec model.SnapshotRecord) model.SnapshotRecord {

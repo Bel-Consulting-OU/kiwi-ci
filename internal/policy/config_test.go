@@ -1,34 +1,78 @@
 package policy
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
 
-func TestOIDCPolicyAllows(t *testing.T) {
-	unrestricted := OIDCPolicy{AllowedAudiences: nil}
-	if !unrestricted.Allows("anything") {
-		t.Fatal("nil AllowedAudiences must allow any audience")
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
+)
+
+func writePolicy(t *testing.T, content string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "policy.yaml")
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	deny := OIDCPolicy{AllowedAudiences: []string{}}
-	if deny.Allows("anything") {
-		t.Fatal("empty AllowedAudiences must deny every audience")
+	return p
+}
+
+func TestLoadValidPolicy(t *testing.T) {
+	p := writePolicy(t, `
+require_rootless: true
+network: none
+secret_allowlist: [DEPLOY_KEY]
+oidc_audiences: ["sts.amazonaws.com"]
+repositories:
+  org/app:
+    network: services-only
+    deployments: true
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
 	}
-	restricted := OIDCPolicy{AllowedAudiences: []string{"ci.example.com"}}
-	if !restricted.Allows("ci.example.com") {
-		t.Fatal("allowlisted audience must be allowed")
+	caps := cfg.CapabilitiesFor("org/app")
+	if caps.NativeExecution {
+		t.Fatal("require_rootless must deny native execution")
 	}
-	if restricted.Allows("evil.example.com") {
-		t.Fatal("non-allowlisted audience must be denied")
+	if caps.Deployments != true {
+		t.Fatal("repo deployments flag not applied")
+	}
+	if !caps.OIDCAllows("sts.amazonaws.com") || caps.OIDCAllows("https://evil.example") {
+		t.Fatal("OIDC audience allowlist wrong")
+	}
+	if caps.OIDCAllows("anything") {
+		t.Fatal("network policy from repo not applied")
+	}
+	base := cfg.CapabilitiesFor("org/other")
+	if base.Network != pipeline.NetworkPolicyNone {
+		t.Fatalf("org-level network restriction missing for other repos: %v", base.Network)
 	}
 }
 
-func TestOIDCFromCapabilities(t *testing.T) {
-	if p := OIDCFromCapabilities(DefaultTrustedCapabilities()); !p.Allows("any") {
-		t.Fatal("trusted capabilities must map to an unrestricted OIDCPolicy")
+func TestLoadRejectsUnknownField(t *testing.T) {
+	p := writePolicy(t, "require_rootles: true\n")
+	if _, err := Load(p); err == nil {
+		t.Fatal("policy typo must fail closed")
 	}
-	if p := OIDCFromCapabilities(DefaultUntrustedCapabilities()); p.Allows("any") {
-		t.Fatal("untrusted capabilities must map to a deny-all OIDCPolicy")
+}
+
+func TestLoadRejectsBadNetwork(t *testing.T) {
+	p := writePolicy(t, "network: everywhere\n")
+	if _, err := Load(p); err == nil {
+		t.Fatal("invalid network value must be rejected")
 	}
-	p := OIDCFromCapabilities(Capabilities{OIDC: []string{"aud1"}})
-	if !p.Allows("aud1") || p.Allows("aud2") {
-		t.Fatal("OIDCPolicy must mirror the capability audiences")
+}
+
+func TestLoadEmptyPolicy(t *testing.T) {
+	p := writePolicy(t, "# empty\n")
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caps := cfg.CapabilitiesFor("org/app")
+	if caps.Network != pipeline.NetworkPolicyDefault {
+		t.Fatalf("empty policy must not restrict network, got %v", caps.Network)
 	}
 }

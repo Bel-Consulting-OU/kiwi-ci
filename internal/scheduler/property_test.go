@@ -21,16 +21,17 @@ import (
 // seeds so failures reproduce exactly.
 
 type propWorld struct {
-	t       *testing.T
-	ctx     context.Context
-	store   *fakeStore
-	sched   *DBScheduler
-	rng     *rand.Rand
-	runners []string
-	runIDs  []string
-	prev    map[string]model.Job
-	prevGen map[string]int64
-	now     time.Time
+	t         *testing.T
+	ctx       context.Context
+	store     *fakeStore
+	sched     *DBScheduler
+	rng       *rand.Rand
+	runners   []string
+	runIDs    []string
+	envLimits map[string]int
+	prev      map[string]model.Job
+	prevGen   map[string]int64
+	now       time.Time
 }
 
 func propNewWorld(t *testing.T, seed int64) *propWorld {
@@ -43,14 +44,15 @@ func propNewWorld(t *testing.T, seed int64) *propWorld {
 	}
 	rng := rand.New(rand.NewSource(seed))
 	w := &propWorld{
-		t:       t,
-		ctx:     context.Background(),
-		store:   store,
-		sched:   sched,
-		rng:     rng,
-		prev:    map[string]model.Job{},
-		prevGen: map[string]int64{},
-		now:     time.Now().UTC().Truncate(time.Second),
+		t:         t,
+		ctx:       context.Background(),
+		store:     store,
+		sched:     sched,
+		rng:       rng,
+		envLimits: map[string]int{"staging": 1 + rng.Intn(2), "prod": 1 + rng.Intn(2)},
+		prev:      map[string]model.Job{},
+		prevGen:   map[string]int64{},
+		now:       time.Now().UTC().Truncate(time.Second),
 	}
 	for i := 0; i < 3; i++ {
 		cap := 1 + rng.Intn(3)
@@ -68,11 +70,21 @@ func propNewWorld(t *testing.T, seed int64) *propWorld {
 }
 
 // propDAG builds a small deterministic dependency graph: a -> b,c;
-// b,c -> d; d -> f; c -> e; e -> f. Conditions and environments are random.
+// b,c -> d; d -> f; c -> e; e -> f. Conditions are random; environment
+// concurrency is a fixed per-environment limit shared by every job in the
+// world (a limit is a property of the environment, not of the job).
 func propDAG(w *propWorld, runID string) []model.Job {
-	needs := map[string][]string{
+	baseNeeds := map[string][]string{
 		"a": {}, "b": {"a"}, "c": {"a"}, "d": {"b", "c"},
 		"e": {"c"}, "f": {"d", "e"},
+	}
+	needs := map[string][]string{}
+	for k, deps := range baseNeeds {
+		full := make([]string, 0, len(deps))
+		for _, dep := range deps {
+			full = append(full, runID+"-"+dep)
+		}
+		needs[k] = full
 	}
 	conditions := []string{"", "success()", "always()", "failure()"}
 	envs := []string{"", "staging", "prod"}
@@ -84,10 +96,6 @@ func propDAG(w *propWorld, runID string) []model.Job {
 	sort.Strings(keys)
 	for _, key := range keys {
 		env := envs[w.rng.Intn(len(envs))]
-		concurrency := 0
-		if env != "" {
-			concurrency = 1 + w.rng.Intn(2)
-		}
 		out = append(out, model.Job{
 			ID:                     runID + "-" + key,
 			RunID:                  runID,
@@ -98,7 +106,7 @@ func propDAG(w *propWorld, runID string) []model.Job {
 			CreatedAt:              w.now,
 			Priority:               w.rng.Intn(5),
 			Environment:            env,
-			EnvironmentConcurrency: concurrency,
+			EnvironmentConcurrency: w.envLimits[env],
 		})
 	}
 	return out
@@ -309,8 +317,11 @@ func (w *propWorld) assertInvariants() {
 		}
 	}
 
-	// A running job's dependencies must all be terminal and permitted by
-	// the unified condition gate.
+	// A running job's dependencies must all be terminal. The condition gate
+	// mirrors the lease filter: when the dependency outcome is not success,
+	// the condition must permit it; a success outcome always permits the
+	// lease (jobs with `if: failure()` are skipped at execution time by the
+	// executor, not by the scheduler).
 	for id, j := range jobs {
 		if j.Status != model.StatusRunning {
 			continue
@@ -322,7 +333,7 @@ func (w *propWorld) assertInvariants() {
 		if !ready {
 			w.t.Fatalf("running job %s has non-terminal dependencies", id)
 		}
-		if !ConditionAllows(j.Condition, outcome) {
+		if outcome != model.StatusSuccess && !ConditionAllows(j.Condition, outcome) {
 			w.t.Fatalf("running job %s has dependency outcome %s not permitted by condition %q", id, outcome, j.Condition)
 		}
 	}
@@ -470,8 +481,8 @@ func TestPropertyCapabilitiesMonotone(t *testing.T) {
 		got := policy.Intersect(a, b)
 
 		booleans := []struct {
-			name                    string
-			va, vb, vg              bool
+			name       string
+			va, vb, vg bool
 		}{
 			{"NativeExecution", a.NativeExecution, b.NativeExecution, got.NativeExecution},
 			{"Container", a.Container, b.Container, got.Container},
@@ -504,16 +515,19 @@ func TestPropertyCapabilitiesMonotone(t *testing.T) {
 			}
 		}
 		for _, l := range got.RunnerLabels {
-			if !containsStringProp(a.RunnerLabels, l) || !containsStringProp(b.RunnerLabels, l) {
-				t.Fatalf("seed %d: Intersect grants runner label %q absent from an input", seed, l)
+			if a.RunnerLabels != nil && !containsStringProp(a.RunnerLabels, l) {
+				t.Fatalf("seed %d: Intersect grants runner label %q absent from input a", seed, l)
+			}
+			if b.RunnerLabels != nil && !containsStringProp(b.RunnerLabels, l) {
+				t.Fatalf("seed %d: Intersect grants runner label %q absent from input b", seed, l)
 			}
 		}
 
 		// Untrusted floor: Effective(false) must be a subset of the floor.
 		eff := got.Effective(false)
 		effBools := []struct {
-			name          string
-			veff, vfloor  bool
+			name         string
+			veff, vfloor bool
 		}{
 			{"NativeExecution", eff.NativeExecution, floor.NativeExecution},
 			{"Container", eff.Container, floor.Container},
@@ -549,21 +563,26 @@ func TestPropertyCapabilitiesMonotone(t *testing.T) {
 // TestPropertyEnvironmentAtCapacityMath pins the environment concurrency
 // helper's boundary arithmetic used by the scheduler lease path.
 func TestPropertyEnvironmentAtCapacityMath(t *testing.T) {
-	mk := func(id, env string, status model.Status) model.Job {
-		return model.Job{ID: id, Environment: env, Status: status, EnvironmentConcurrency: 2}
+	mk := func(id, env string, status model.Status, limit int) model.Job {
+		return model.Job{ID: id, Environment: env, Status: status, EnvironmentConcurrency: limit}
 	}
 	jobs := map[string]model.Job{
-		"a": mk("a", "staging", model.StatusRunning),
-		"b": mk("b", "staging", model.StatusRunning),
-		"c": mk("c", "staging", model.StatusQueued),
-		"d": mk("d", "prod", model.StatusRunning),
-		"e": mk("e", "", model.StatusRunning),
+		"a": mk("a", "staging", model.StatusRunning, 2),
+		"b": mk("b", "staging", model.StatusRunning, 2),
+		"c": mk("c", "staging", model.StatusQueued, 2),
+		"d": mk("d", "prod", model.StatusRunning, 2),
+		"e": mk("e", "", model.StatusRunning, 2),
+		"f": mk("f", "solo", model.StatusRunning, 1),
+		"g": mk("g", "solo", model.StatusRunning, 1),
 	}
 	if !EnvironmentAtCapacity(jobs["c"], jobs) {
 		t.Fatal("staging at concurrency 2 with two active jobs must be at capacity")
 	}
-	if !EnvironmentAtCapacity(jobs["a"], jobs) {
-		t.Fatal("a running staging job observes one other active job, at limit")
+	if EnvironmentAtCapacity(jobs["a"], jobs) {
+		t.Fatal("a running staging job with limit 2 and one other active must not be at capacity")
+	}
+	if !EnvironmentAtCapacity(jobs["f"], jobs) {
+		t.Fatal("a running solo job with limit 1 and one other active must be at capacity")
 	}
 	if EnvironmentAtCapacity(jobs["d"], jobs) {
 		t.Fatal("prod has only one active job, must not be at capacity")

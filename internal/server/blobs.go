@@ -39,6 +39,10 @@ func (s *Server) uploadArtifact(w http.ResponseWriter, r *http.Request) {
 	token := r.Header.Get("X-Kiwi-Lease-Token")
 	gen, _ := strconv.ParseInt(r.Header.Get("X-Kiwi-Lease-Generation"), 10, 64)
 	now := time.Now().UTC()
+	if !s.verifyRunnerIdentity(r, runnerID) {
+		http.Error(w, "runner identity mismatch", http.StatusForbidden)
+		return
+	}
 	j, err := s.jobForLease(r.Context(), jobID)
 	if errors.Is(err, storage.ErrNotFound) {
 		http.NotFound(w, r)

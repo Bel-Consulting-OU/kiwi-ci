@@ -13,6 +13,7 @@ import (
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/config"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runner"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
@@ -208,6 +209,13 @@ func Server(ctx context.Context, args []string) error {
 	srv.PipelinePath = *pipelinePath
 	srv.ExternalURL = externalURLV
 	srv.RunnerEnrollToken = runnerEnrollTokenV
+	if cfg.Policy.File != "" {
+		pol, perr := policy.Load(cfg.Policy.File)
+		if perr != nil {
+			return fmt.Errorf("policy: %w", perr)
+		}
+		srv.Policy = pol
+	}
 	if m := cfg.RateLimitMiddleware(); m != nil {
 		srv.RateLimiter = m
 	}

@@ -124,6 +124,11 @@ type Server struct {
 	// tests use it to grant capabilities such as deployments.
 	AdmissionCapabilities *policy.Capabilities
 
+	// Policy is the loaded organization policy file; its repository
+	// restrictions are intersected into every admission decision and can
+	// only narrow the effective capabilities.
+	Policy *policy.Config
+
 	// Logger writes operational (control-plane) logs as structured JSON
 	// lines. Build logs stay in LogEntry paths. Defaults to os.Stderr.
 	Logger *logging.Structured
@@ -348,6 +353,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/jobs/{id}/complete", s.complete)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/snapshots", s.uploadSnapshot)
 	mux.HandleFunc("GET /api/v1/runs/{id}/snapshots", s.listSnapshots)
+	mux.HandleFunc("GET /api/v1/runs/{id}/snapshots/{sid}", s.downloadSnapshot)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/deployments", s.recordDeployment)
 	mux.HandleFunc("GET /api/v1/runs/{id}/deployments", s.listDeployments)
 	mux.HandleFunc("POST /api/v1/runners/register", s.register)
@@ -580,8 +586,12 @@ func (s *Server) enqueue(in SubmitRun) (model.Run, error) {
 	if s.AdmissionCapabilities != nil {
 		caps = *s.AdmissionCapabilities
 	}
-	// The hard trust floor is applied after defaults; repository/org policy
-	// compilation lands in a later phase and will Intersect on top of these.
+	// Repository/org policy file restrictions are intersected on top of the
+	// defaults, then the hard trust floor is applied. A policy file can only
+	// ever narrow capabilities.
+	if s.Policy != nil {
+		caps = policy.Intersect(caps, s.Policy.CapabilitiesFor(in.RepoFullName))
+	}
 	caps = caps.Effective(in.Trusted)
 	if err = policy.ValidateAdmissionWithCapabilities(spec, caps); err != nil {
 		return model.Run{}, err

@@ -411,6 +411,27 @@ func (s *PostgresStore) ListJobsByRun(ctx context.Context, runID string) ([]mode
 	return out, rows.Err()
 }
 
+func (s *PostgresStore) ListJobsByEnvironment(ctx context.Context, repoURL, environment string) ([]model.Job, error) {
+	rows, err := s.pool.Query(ctx, `SELECT `+jobCols+` FROM jobs WHERE payload->>'repo_url'=$1 AND payload->>'environment'=$2 ORDER BY created_at ASC, id ASC`, repoURL, environment)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.Job{}
+	for rows.Next() {
+		js := jobScanner{}
+		if err := rows.Scan(jobTargets(&js)...); err != nil {
+			return nil, err
+		}
+		j, err := js.job()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
 func (s *PostgresStore) ListQueuedJobs(ctx context.Context) ([]model.Job, error) {
 	rows, err := s.pool.Query(ctx, `SELECT `+jobCols+` FROM jobs WHERE status='queued' ORDER BY priority DESC, created_at ASC, id ASC`)
 	if err != nil {

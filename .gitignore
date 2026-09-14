@@ -13,3 +13,6 @@
 
 # macOS
 .DS_Store
+
+# Fuzz corpus/crash artifacts
+testdata/fuzz/

@@ -175,6 +175,18 @@ func (f *fakeStore) ListQueuedJobs(ctx context.Context) ([]model.Job, error) {
 	return out, nil
 }
 
+func (f *fakeStore) ListJobsByEnvironment(ctx context.Context, repoURL, environment string) ([]model.Job, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []model.Job{}
+	for _, j := range f.jobs {
+		if j.Environment == environment && j.RepoURL == repoURL {
+			out = append(out, j)
+		}
+	}
+	return out, nil
+}
+
 func (f *fakeStore) UpdateJob(ctx context.Context, job model.Job) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

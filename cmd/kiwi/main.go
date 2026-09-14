@@ -37,6 +37,10 @@ func main() {
 		err = app.Runner(ctx, os.Args[2:])
 	case "dispatch":
 		err = app.Dispatch(ctx, os.Args[2:])
+	case "import":
+		err = app.Import(os.Args[2:])
+	case "replay":
+		err = app.Replay(ctx, os.Args[2:])
 	case "init":
 		err = app.Init(os.Args[2:])
 	case "runs", "jobs", "logs", "cancel", "approve", "rerun", "artifacts", "schedules", "policy":

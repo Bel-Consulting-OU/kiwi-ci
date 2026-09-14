@@ -95,6 +95,10 @@ func (f *FaultyStore) ListQueuedJobs(ctx context.Context) ([]model.Job, error) {
 	return f.Inner.ListQueuedJobs(ctx)
 }
 
+func (f *FaultyStore) ListJobsByEnvironment(ctx context.Context, repoURL, environment string) ([]model.Job, error) {
+	return f.Inner.ListJobsByEnvironment(ctx, repoURL, environment)
+}
+
 func (f *FaultyStore) UpdateJob(ctx context.Context, job model.Job) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -282,24 +286,24 @@ func (f *FaultyStore) SchemaVersion(ctx context.Context) (int, error) {
 // memStore is a fully functional in-memory Store used as the fault-free
 // baseline underneath FaultyStore in fault-injection tests.
 type memStore struct {
-	mu        sync.Mutex
-	runs      map[string]model.Run
-	jobs      map[string]model.Job
-	runners   map[string]model.Runner
-	receipts  map[string]model.CompletionReceipt
-	audit     []model.AuditEvent
-	logs      []model.LogEntry
-	artifacts []model.ArtifactRecord
-	reports   []model.TestReport
+	mu         sync.Mutex
+	runs       map[string]model.Run
+	jobs       map[string]model.Job
+	runners    map[string]model.Runner
+	receipts   map[string]model.CompletionReceipt
+	audit      []model.AuditEvent
+	logs       []model.LogEntry
+	artifacts  []model.ArtifactRecord
+	reports    []model.TestReport
 	deliveries map[string]string
 }
 
 func newMemStore() *memStore {
 	return &memStore{
-		runs:      map[string]model.Run{},
-		jobs:      map[string]model.Job{},
-		runners:   map[string]model.Runner{},
-		receipts:  map[string]model.CompletionReceipt{},
+		runs:       map[string]model.Run{},
+		jobs:       map[string]model.Job{},
+		runners:    map[string]model.Runner{},
+		receipts:   map[string]model.CompletionReceipt{},
 		deliveries: map[string]string{},
 	}
 }
@@ -388,6 +392,18 @@ func (m *memStore) ListQueuedJobs(ctx context.Context) ([]model.Job, error) {
 	out := []model.Job{}
 	for _, j := range m.jobs {
 		if j.Status == model.StatusQueued {
+			out = append(out, j)
+		}
+	}
+	return out, nil
+}
+
+func (m *memStore) ListJobsByEnvironment(ctx context.Context, repoURL, environment string) ([]model.Job, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []model.Job{}
+	for _, j := range m.jobs {
+		if j.Environment == environment && j.RepoURL == repoURL {
 			out = append(out, j)
 		}
 	}

@@ -37,6 +37,10 @@ func RunLocal(ctx context.Context, args []string) error {
 	inheritEnv := fs.Bool("inherit-env", true, "inherit the host environment for local runs")
 	noInheritEnv := fs.Bool("no-inherit-env", false, "start from the clean environment instead of the host environment")
 	passEnv := fs.String("pass-env", "", "comma-separated host environment variables to pass (overrides --inherit-env)")
+	base := fs.String("base", "", "base ref for changed-file detection (default HEAD~1)")
+	head := fs.String("head", "HEAD", "head ref for changed-file detection")
+	mergeBase := fs.String("merge-base", "", "compute the base as the merge base of HEAD and this ref")
+	changedFile := fs.String("changed-file", "", "explicit changed files (comma-separated); overrides git detection")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -67,7 +71,7 @@ func RunLocal(ctx context.Context, args []string) error {
 	masker := &secrets.Masker{}
 	logs := &logging.Console{Writer: os.Stdout, Masker: masker}
 	provider := secrets.Chain{secrets.EnvProvider{Prefix: "KIWI_SECRET_"}, secrets.MacKeychainProvider{Service: "kiwi-ci"}}
-	opts := executor.Options{Workspace: wd, WorkspaceFor: func(jobID string) (string, func(), error) { return wm.Prepare(ctx, jobID) }, RunID: runID, MaxParallel: *parallel, OnlyJob: *job, ChangedFiles: detectChangedFiles(wd), SecretProvider: provider, Logs: logs}
+	opts := executor.Options{Workspace: wd, WorkspaceFor: func(jobID string) (string, func(), error) { return wm.Prepare(ctx, jobID) }, RunID: runID, MaxParallel: *parallel, OnlyJob: *job, ChangedFiles: detectChangedFilesOpts(wd, *base, *head, *mergeBase, *changedFile), SecretProvider: provider, Logs: logs}
 	if vars := splitEnvNames(*passEnv); len(vars) > 0 {
 		// Explicit allowlist: only these vars plus the clean env; the
 		// inherit-env default is ignored.
@@ -170,7 +174,33 @@ func Explain(args []string) error {
 }
 
 func detectChangedFiles(workspace string) []string {
-	cmd := exec.Command("git", "-C", workspace, "diff", "--name-only", "HEAD~1", "HEAD")
+	return detectChangedFilesOpts(workspace, "", "HEAD", "", "")
+}
+
+// detectChangedFilesOpts resolves the changed-file list from explicit input
+// or git. For PR/MR execution forge changed-file data is authoritative; these
+// flags cover local parity.
+func detectChangedFilesOpts(workspace, base, head, mergeBase, changedFile string) []string {
+	if strings.TrimSpace(changedFile) != "" {
+		var out []string
+		for _, s := range strings.Split(changedFile, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	if mergeBase != "" {
+		b, err := exec.Command("git", "-C", workspace, "merge-base", "HEAD", mergeBase).Output()
+		if err != nil {
+			return nil
+		}
+		base = strings.TrimSpace(string(b))
+	}
+	if base == "" {
+		base = "HEAD~1"
+	}
+	cmd := exec.Command("git", "-C", workspace, "diff", "--name-only", base, head)
 	b, err := cmd.Output()
 	if err != nil {
 		return nil

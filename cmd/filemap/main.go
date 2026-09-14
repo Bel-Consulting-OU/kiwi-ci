@@ -24,6 +24,7 @@ const (
 func main() {
 	root := flag.String("root", ".", "repository root to walk")
 	out := flag.String("out", "", "output path (default: <root>/FILE_MAP.md)")
+	check := flag.Bool("check", false, "fail if FILE_MAP.md is stale instead of writing")
 	flag.Parse()
 
 	abs, err := filepath.Abs(*root)
@@ -50,12 +51,15 @@ func main() {
 		}
 		if d.IsDir() {
 			switch d.Name() {
-			case ".git", "dist", "tmp":
+			case ".git", "dist", "tmp", "vendor", "testdata":
 				return filepath.SkipDir
 			}
 			return nil
 		}
 		if d.Name() == outputName && rel == outputName {
+			return nil
+		}
+		if skipFile(rel, d) {
 			return nil
 		}
 		paths = append(paths, rel)
@@ -75,11 +79,60 @@ func main() {
 	for _, p := range paths {
 		fmt.Fprintf(&b, "| `%s` | %s |\n", p, describe(p, filepath.Join(abs, filepath.FromSlash(p))))
 	}
-	if err := os.WriteFile(dest, []byte(b.String()), 0o644); err != nil {
+	generated := b.String()
+	if *check {
+		existing, rerr := os.ReadFile(dest)
+		if rerr == nil && string(existing) == generated {
+			fmt.Printf("filemap: %s is up to date (%d files)\n", dest, len(paths))
+			return
+		}
+		fmt.Fprintf(os.Stderr, "filemap: %s is stale; run `go run ./cmd/filemap` to regenerate\n", dest)
+		os.Exit(1)
+	}
+	if err := os.WriteFile(dest, []byte(generated), 0o644); err != nil {
 		fmt.Fprintln(os.Stderr, "filemap:", err)
 		os.Exit(1)
 	}
 	fmt.Printf("filemap: wrote %s (%d files)\n", dest, len(paths))
+}
+
+// skipFile filters out generated metadata and non-source artifacts that must
+// not appear in the inventory.
+func skipFile(rel string, d fs.DirEntry) bool {
+	name := d.Name()
+	if name == ".DS_Store" || name == "Thumbs.db" || name == "desktop.ini" {
+		return true
+	}
+	if strings.HasSuffix(name, ".tmp") || strings.HasSuffix(name, ".prof") || strings.HasSuffix(name, ".out") {
+		return true
+	}
+	if rel == "go.sum" {
+		return false
+	}
+	if info, err := d.Info(); err == nil && info.Mode().IsRegular() {
+		if b, rerr := os.ReadFile(filepath.Join(".", filepath.FromSlash(rel))); rerr == nil && !isText(b) {
+			return true
+		}
+	}
+	return false
+}
+
+// isText reports whether the buffer looks like human-readable text (UTF-8
+// with printable content) rather than a binary artifact.
+func isText(b []byte) bool {
+	if len(b) == 0 {
+		return true
+	}
+	n := len(b)
+	if n > 512 {
+		n = 512
+	}
+	for _, c := range b[:n] {
+		if c == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // describe returns a short, single-line description for the file at path
