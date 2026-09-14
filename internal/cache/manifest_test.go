@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -74,6 +75,9 @@ func strings64(c string) string {
 }
 
 func TestRestoreRejectsSymlinkParent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation needs privileges on windows")
+	}
 	ws := t.TempDir()
 	root := t.TempDir()
 	s := &Store{Root: root}

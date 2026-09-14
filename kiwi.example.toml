@@ -119,3 +119,24 @@
 
 # JSON token-store path for fine-grained principals (auth.TokenStore format).
 # tokens_file = "/etc/kiwi/tokens.json"
+
+[quota]
+# Repository/team admission and cost budgets.
+# repo_concurrency = 0
+# team_concurrency = 0
+# repo_queue_depth = 0
+# team_queue_depth = 0
+# daily_cost_limit = 0
+# daily_energy_limit = 0
+# fail_open = false
+
+[secret_broker]
+# backend = "static"   # vault | aws | gcp | azure | onepassword | static
+# vault_addr = ""
+# vault_token = ""
+# static = ["DEPLOY_KEY=value"]
+
+[components]
+# registry_dir = "/etc/kiwi/components"
+# remote = ""
+# remote_token = ""

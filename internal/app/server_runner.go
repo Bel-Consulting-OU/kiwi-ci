@@ -157,6 +157,45 @@ func Server(ctx context.Context, args []string) error {
 	rateLimitPerSecond := fs.Float64("rate-limit-per-second", 0, "global request rate limit per principal/runner/IP (0 disables)")
 	rateLimitBurst := fs.Int("rate-limit-burst", 0, "rate limit burst size (default 100)")
 	drainOnSigterm := fs.Bool("drain-on-sigterm", false, "on SIGTERM/SIGINT drain active jobs (up to 30s) before shutting down")
+	githubAppID := fs.String("github-app-id", "", "GitHub App ID (enables installation-token auth for private pipeline fetches/statuses)")
+	githubAppPrivateKey := fs.String("github-app-private-key", "", "GitHub App private key PEM file (requires --github-app-id)")
+	gitlabToken := fs.String("gitlab-token", "", "GitLab API token for pipeline fetches and status publishing")
+	gitlabWebhookSecret := fs.String("gitlab-webhook-secret", "", "GitLab webhook secret token")
+	gitlabBaseURL := fs.String("gitlab-base-url", "", "self-managed GitLab instance root (default https://gitlab.com)")
+	forgejoToken := fs.String("forgejo-token", "", "Forgejo API token for pipeline fetches and status publishing")
+	forgejoWebhookSecret := fs.String("forgejo-webhook-secret", "", "Forgejo webhook HMAC secret")
+	forgejoBaseURL := fs.String("forgejo-base-url", "", "self-managed Forgejo instance root (default https://codeberg.org)")
+	tokensFile := fs.String("tokens-file", "", "JSON token-store file for fine-grained principal tokens")
+	databaseMaxConnections := fs.String("database-max-connections", "", "PostgreSQL pool max connections")
+	metricsListen := fs.String("metrics-listen", "", "serve /metrics on a separate listener address (e.g. :9091)")
+	secretBroker := fs.String("secret-broker", "", "secret backend: vault, aws, gcp, azure, onepassword or static")
+	vaultAddr := fs.String("vault-addr", "", "HashiCorp Vault address (requires --secret-broker vault)")
+	vaultToken := fs.String("vault-token", "", "HashiCorp Vault token")
+	awsRegion := fs.String("aws-region", "", "AWS region (requires --secret-broker aws)")
+	awsAccessKey := fs.String("aws-access-key", "", "AWS access key ID")
+	awsSecretKey := fs.String("aws-secret-key", "", "AWS secret access key")
+	awsToken := fs.String("aws-token", "", "AWS session token")
+	gcpCredentials := fs.String("gcp-credentials", "", "GCP service-account JSON credentials file (requires --secret-broker gcp)")
+	gcpProject := fs.String("gcp-project", "", "GCP project (requires --secret-broker gcp)")
+	azureTenant := fs.String("azure-tenant", "", "Azure tenant ID (requires --secret-broker azure)")
+	azureClientID := fs.String("azure-client-id", "", "Azure client ID")
+	azureClientSecret := fs.String("azure-client-secret", "", "Azure client secret")
+	azureVaultURL := fs.String("azure-vault-url", "", "Azure Key Vault URL")
+	onePasswordHost := fs.String("onepassword-host", "", "1Password Connect host (requires --secret-broker onepassword)")
+	onePasswordToken := fs.String("onepassword-token", "", "1Password Connect bearer token")
+	onePasswordVault := fs.String("onepassword-vault", "", "1Password Connect vault ID")
+	var secretStatic stringList
+	fs.Var(&secretStatic, "secret-static", "static secret k=v (repeatable; served by the static broker)")
+	componentRegistryDir := fs.String("component-registry-dir", "", "directory of component spec files (server-side component registry)")
+	componentRemote := fs.String("component-remote", "", "remote component registry base URL (https required)")
+	componentRemoteToken := fs.String("component-remote-token", "", "bearer token for the remote component registry")
+	repoConcurrency := fs.String("repo-concurrency", "", "per-repository running-job concurrency limit (0 = unlimited)")
+	teamConcurrency := fs.String("team-concurrency", "", "per-team running-job concurrency limit (0 = unlimited)")
+	repoQueueDepth := fs.String("repo-queue-depth", "", "per-repository queued-job depth limit (0 = unlimited)")
+	teamQueueDepth := fs.String("team-queue-depth", "", "per-team queued-job depth limit (0 = unlimited)")
+	dailyCostLimit := fs.String("daily-cost-limit", "", "trailing-24h cost budget (0 = unlimited)")
+	dailyEnergyLimit := fs.String("daily-energy-limit", "", "trailing-24h energy budget in Wh (0 = unlimited)")
+	quotaFailOpen := fs.Bool("quota-fail-open", false, "let enqueues/leases proceed when the usage store is unavailable instead of failing closed")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -185,7 +224,7 @@ func Server(ctx context.Context, args []string) error {
 	// The flag pointers exist only to register the flags; their values are
 	// read back through config.OverrideFromFlags (which inspects only
 	// explicitly set flags).
-	discard(listen, token, adminToken, webhookSecret, githubToken, externalURL, tlsCert, tlsKey, runnerCACert, runnerCAKey, runnerEnrollToken, databaseURL, mode, rateLimitPerSecond, rateLimitBurst, otelEndpoint, drainOnSigterm)
+	discard(listen, token, adminToken, webhookSecret, githubToken, externalURL, tlsCert, tlsKey, runnerCACert, runnerCAKey, runnerEnrollToken, databaseURL, mode, rateLimitPerSecond, rateLimitBurst, otelEndpoint, drainOnSigterm, githubAppID, githubAppPrivateKey, gitlabToken, gitlabWebhookSecret, gitlabBaseURL, forgejoToken, forgejoWebhookSecret, forgejoBaseURL, tokensFile, databaseMaxConnections, metricsListen, secretBroker, vaultAddr, vaultToken, awsRegion, awsAccessKey, awsSecretKey, awsToken, gcpCredentials, gcpProject, azureTenant, azureClientID, azureClientSecret, azureVaultURL, onePasswordHost, onePasswordToken, onePasswordVault, componentRegistryDir, componentRemote, componentRemoteToken, repoConcurrency, teamConcurrency, repoQueueDepth, teamQueueDepth, dailyCostLimit, dailyEnergyLimit, quotaFailOpen)
 
 	// Effective values after the precedence merge.
 	listenV := cfg.Server.Listen
@@ -205,8 +244,6 @@ func Server(ctx context.Context, args []string) error {
 	externalURLV := cfg.Server.ExternalURL
 	tlsCertV := cfg.Server.TLSCert
 	tlsKeyV := cfg.Server.TLSKey
-	webhookSecretV := cfg.GitHub.WebhookSecret
-	githubTokenV := cfg.GitHub.Token
 	runnerEnrollTokenV := cfg.RunnerPKI.EnrollToken
 	runnerCACertV := cfg.RunnerPKI.CACert
 	runnerCAKeyV := cfg.RunnerPKI.CAKey
@@ -241,7 +278,11 @@ func Server(ctx context.Context, args []string) error {
 		// DB mode: the SQL store is the source of truth. A data-dir is still
 		// used when set (lease key, OIDC signer, artifact bytes); without it
 		// artifact storage is unavailable.
-		db, derr := storage.NewPostgres(ctx, databaseURLV)
+		var pgOpts []storage.PostgresOption
+		if cfg.Database.MaxConnections > 0 {
+			pgOpts = append(pgOpts, storage.WithMaxConnections(cfg.Database.MaxConnections))
+		}
+		db, derr := storage.NewPostgresOpt(ctx, databaseURLV, pgOpts...)
 		if derr != nil {
 			return derr
 		}
@@ -289,8 +330,23 @@ func Server(ctx context.Context, args []string) error {
 			srv.AdminToken = adminTokenV
 		}
 	}
-	srv.GitHubWebhookSecret = webhookSecretV
-	srv.GitHubToken = githubTokenV
+	if err := applyForgeConfig(srv, cfg); err != nil {
+		return err
+	}
+	if err := applyAuthConfig(srv, cfg); err != nil {
+		return err
+	}
+	applyQuotaConfig(srv, cfg)
+	if broker, err := buildSecretBroker(cfg.SecretBroker); err != nil {
+		return err
+	} else if broker != nil {
+		srv.SecretBroker = broker
+	}
+	if reg, err := buildComponentRegistry(cfg.Components); err != nil {
+		return err
+	} else if reg != nil {
+		srv.ComponentRegistry = reg
+	}
 	srv.PipelinePath = *pipelinePath
 	srv.ExternalURL = externalURLV
 	srv.RunnerEnrollToken = runnerEnrollTokenV
@@ -342,7 +398,7 @@ func Server(ctx context.Context, args []string) error {
 	// Graceful drain on signal: intercept SIGTERM/SIGINT before the context
 	// shutdown path, ask the control plane to drain, and keep the listener
 	// up until active jobs finish (bounded by drainTimeout).
-	var drainDone <-chan struct{}
+	drainDone := (<-chan struct{})(nil)
 	if *drainOnSigterm {
 		ds, ok := any(srv).(drainableServer)
 		if !ok {
@@ -384,6 +440,17 @@ func Server(ctx context.Context, args []string) error {
 		h.TLSConfig = tlsConf
 	}
 	go srv.Maintain(ctx)
+	// Dedicated metrics listener: when observability.metrics_listen is set,
+	// the Prometheus surface binds on its own address (binding failure is a
+	// startup error). The main listener keeps its /metrics route.
+	if maddr := strings.TrimSpace(cfg.Observability.MetricsListen); maddr != "" {
+		_, stop, merr := startMetricsListener(srv, maddr)
+		if merr != nil {
+			return merr
+		}
+		defer stop()
+		fmt.Printf("Kiwi metrics listening on http://%s\n", maddr)
+	}
 	go func() {
 		<-ctx.Done()
 		if drainDone != nil {
@@ -401,8 +468,7 @@ func Server(ctx context.Context, args []string) error {
 		scheme = "https"
 	}
 	fmt.Printf("Kiwi server listening on %s://%s\n", scheme, listenV)
-	var serveErr error
-	serveErr = h.ListenAndServe()
+	serveErr := h.ListenAndServe()
 	if serveErr == http.ErrServerClosed {
 		return nil
 	}

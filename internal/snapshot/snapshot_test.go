@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -20,7 +21,11 @@ func symlinkArchive() []byte {
 	return buf.Bytes()
 }
 
-func writeTree(t *testing.T, root string) {
+// writeTree plants a regular-file tree plus one symlink and reports whether
+// the symlink could be created. On Windows symlink creation needs
+// privileges; when it fails there, callers that specifically need the link
+// skip while the tree-only tests still run.
+func writeTree(t *testing.T, root string) (symlinkCreated bool) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Join(root, "sub"), 0o755); err != nil {
 		t.Fatal(err)
@@ -33,11 +38,15 @@ func writeTree(t *testing.T, root string) {
 	}
 	// Symlinks and special files are never captured.
 	if err := os.Symlink("a.txt", filepath.Join(root, "link")); err != nil {
+		if runtime.GOOS == "windows" {
+			return false
+		}
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, ".hidden"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	return true
 }
 
 func TestCreateRestoreRoundtrip(t *testing.T) {
@@ -105,7 +114,9 @@ func TestCreateRestoreRoundtrip(t *testing.T) {
 
 func TestManifestForSkippedSymlinks(t *testing.T) {
 	root := t.TempDir()
-	writeTree(t, root)
+	if !writeTree(t, root) {
+		t.Skip("symlink creation needs privileges on windows")
+	}
 	m, err := ManifestFor(root)
 	if err != nil {
 		t.Fatal(err)

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
@@ -68,7 +69,9 @@ jobs:
 		if err != nil {
 			t.Fatal(err)
 		}
-		if string(data) != "snapshot-marker\n" {
+		// The native shell writes its platform newline (LF on Unix,
+		// CRLF on Windows); normalize before comparing.
+		if got := strings.TrimRight(string(data), "\r\n"); got != "snapshot-marker" {
 			t.Fatalf("marker.txt content = %q", data)
 		}
 		found = true

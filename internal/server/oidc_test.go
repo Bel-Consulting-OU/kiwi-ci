@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -351,7 +352,9 @@ func TestOIDCKeyRingPersistenceAndRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	// Windows file modes do not encode access control; the 0600 assertion
+	// is POSIX-only. Content and readability are asserted everywhere.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("ring file perms = %v, want 0600", info.Mode().Perm())
 	}
 	s1.mu.Lock()

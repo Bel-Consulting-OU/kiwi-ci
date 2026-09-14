@@ -215,9 +215,7 @@ func validateJob(s *Spec, id string, j Job) error {
 	// without images in its DB-mode tests, and this package must not break
 	// those submissions. Backends resolve and fail such jobs at execution
 	// time.
-	switch j.Network {
-	case "", "bridge", "host", "none":
-	default:
+	if !networkModes[j.Network] {
 		return fmt.Errorf("job %q has unsupported network %q (want one of bridge, host, none)", id, j.Network)
 	}
 	if j.Sandbox.Network < NetworkPolicyDefault || j.Sandbox.Network > NetworkPolicyInternet {

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -61,9 +62,11 @@ func TestTokenStoreSaveLoadRoundTrip(t *testing.T) {
 	if _, ok := m[TokenDigest("bravo")]; !ok {
 		t.Fatal("digest of bravo missing from file")
 	}
+	// Windows file modes do not encode access control; the 0600 assertion
+	// is POSIX-only. Content and readability are asserted everywhere.
 	if fi, err := os.Stat(path); err != nil {
 		t.Fatal(err)
-	} else if fi.Mode().Perm() != 0o600 {
+	} else if runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
 		t.Fatalf("token file mode = %o, want 600", fi.Mode().Perm())
 	}
 

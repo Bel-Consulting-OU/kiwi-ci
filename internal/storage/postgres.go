@@ -60,9 +60,31 @@ var (
 
 // NewPostgres opens a pool and verifies connectivity.
 func NewPostgres(ctx context.Context, dsn string) (*PostgresStore, error) {
+	return NewPostgresOpt(ctx, dsn)
+}
+
+// PostgresOption mutates the pool configuration before the pool opens.
+type PostgresOption func(*pgxpool.Config)
+
+// WithMaxConnections caps the connection pool size (wired from
+// database.max_connections). Values <= 0 keep the pgxpool default.
+func WithMaxConnections(n int) PostgresOption {
+	return func(c *pgxpool.Config) {
+		if n > 0 {
+			c.MaxConns = int32(n)
+		}
+	}
+}
+
+// NewPostgresOpt opens a pool like NewPostgres but applies opts to the
+// pool configuration first, and verifies connectivity.
+func NewPostgresOpt(ctx context.Context, dsn string, opts ...PostgresOption) (*PostgresStore, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("storage: parse dsn: %w", err)
+	}
+	for _, o := range opts {
+		o(cfg)
 	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {

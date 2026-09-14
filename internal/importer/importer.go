@@ -162,7 +162,7 @@ func SanitizeID(name string, taken map[string]bool) string {
 	if id == "" {
 		id = "job"
 	}
-	if id[0] >= '0' && id[0] <= '9' {
+	if !idRegexp.MatchString(id) {
 		id = "job-" + id
 	}
 	if len(id) > 128 {

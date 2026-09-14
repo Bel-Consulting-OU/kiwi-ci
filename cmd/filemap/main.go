@@ -196,10 +196,7 @@ func firstGoDocComment(s string) string {
 			comment = append(comment, strings.TrimSpace(strings.TrimPrefix(t, "/*")))
 			continue
 		}
-		if strings.HasPrefix(t, "package ") {
-			break
-		}
-		// A non-comment line before the package clause ends the doc block.
+		// A non-comment line (including the package clause) ends the doc block.
 		break
 	}
 	if len(comment) == 0 {

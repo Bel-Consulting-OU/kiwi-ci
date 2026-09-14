@@ -4,6 +4,8 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -55,6 +57,38 @@ func fuzzTarGz(t *testing.T, entries map[string]string) []byte {
 		t.Fatal(err)
 	}
 	return buf.Bytes()
+}
+
+// TestFuzzTarGzRoundTrip drives the deterministic archive builder through
+// the hardened extractor: every regular entry is materialized under the
+// destination with its content intact.
+func TestFuzzTarGzRoundTrip(t *testing.T) {
+	data := fuzzTarGz(t, map[string]string{"a.txt": "hi\n", "dir/b.txt": "ok\n"})
+	dest := t.TempDir()
+	stats, err := Extract(bytes.NewReader(data), dest, fuzzExtractLimits())
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if stats.Files != 2 || stats.Bytes != 6 {
+		t.Fatalf("stats = %+v, want 2 files and 6 bytes", stats)
+	}
+	if b, err := os.ReadFile(filepath.Join(dest, "a.txt")); err != nil || string(b) != "hi\n" {
+		t.Fatalf("a.txt = %q, %v", b, err)
+	}
+	if b, err := os.ReadFile(filepath.Join(dest, "dir", "b.txt")); err != nil || string(b) != "ok\n" {
+		t.Fatalf("dir/b.txt = %q, %v", b, err)
+	}
+}
+
+// TestFuzzTarGzTraversalRejected verifies the extractor's confinement
+// boundary: an entry that escapes the workspace is an error, never a write
+// outside the destination.
+func TestFuzzTarGzTraversalRejected(t *testing.T) {
+	data := fuzzTarGz(t, map[string]string{"../evil.txt": "x"})
+	dest := t.TempDir()
+	if _, err := Extract(bytes.NewReader(data), dest, fuzzExtractLimits()); err == nil {
+		t.Fatal("expected parent-traversal entry to be rejected")
+	}
 }
 
 // FuzzArtifactExtract drives the hardened extractor with an arbitrary

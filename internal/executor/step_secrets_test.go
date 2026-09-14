@@ -34,6 +34,18 @@ func TestStepSecretsDoNotReachOtherSteps(t *testing.T) {
 		"step-a":        "avalue",
 		"step-b":        "bvalue",
 	}
+	// Each step writes the secret env name into its file when the secret
+	// is visible to it. The syntax is per-host: POSIX test on Unix,
+	// PowerShell on Windows (the native default shell).
+	probe := func(name, file string) string {
+		return nativeScript(
+			`          [ -n "$KIWI_SECRET_`+name+`" ] && echo KIWI_SECRET_`+name+` > `+file+` || true
+`,
+			`          if ($env:KIWI_SECRET_`+name+`) { "KIWI_SECRET_`+name+`" | Out-File -Encoding utf8 `+file+` }
+`)
+	}
+	stepOne := probe("STEP_A", "step1_a.txt") + probe("STEP_B", "step1_b.txt") + probe("GLOBAL_SECRET", "step1_g.txt")
+	stepTwo := probe("STEP_A", "step2_a.txt") + probe("STEP_B", "step2_b.txt") + probe("GLOBAL_SECRET", "step2_g.txt")
 	g := stepSecretGraph(t, `version: 1
 secrets: [global-secret]
 jobs:
@@ -42,16 +54,10 @@ jobs:
       - id: one
         secrets: [step-a]
         run: |
-          env | grep KIWI_SECRET_STEP_A > step1_a.txt || true
-          env | grep KIWI_SECRET_STEP_B > step1_b.txt || true
-          env | grep KIWI_SECRET_GLOBAL_SECRET > step1_g.txt || true
-      - id: two
+`+stepOne+`      - id: two
         secrets: [step-b]
         run: |
-          env | grep KIWI_SECRET_STEP_A > step2_a.txt || true
-          env | grep KIWI_SECRET_STEP_B > step2_b.txt || true
-          env | grep KIWI_SECRET_GLOBAL_SECRET > step2_g.txt || true
-`)
+`+stepTwo)
 	ex := Executor{Opt: Options{Workspace: ws, SecretProvider: provider}}
 	res, err := ex.Run(context.Background(), g)
 	if err != nil {
@@ -63,6 +69,10 @@ jobs:
 	read := func(name string) string {
 		t.Helper()
 		b, err := os.ReadFile(filepath.Join(ws, name))
+		if os.IsNotExist(err) {
+			// A secret invisible to the step leaves no file at all.
+			return ""
+		}
 		if err != nil {
 			t.Fatalf("read %s: %v", name, err)
 		}
@@ -98,12 +108,18 @@ func TestStepSecretMaskedInLogs(t *testing.T) {
 		lines = append(lines, line)
 		mu.Unlock()
 	})
+	// The echo uses the native shell's env syntax: $VAR on Unix,
+	// $env:VAR on Windows PowerShell.
+	echoScript := nativeScript(
+		`echo "token is $KIWI_SECRET_STEP_A"`,
+		`echo "token is $env:KIWI_SECRET_STEP_A"`,
+	)
 	g := stepSecretGraph(t, `version: 1
 jobs:
   probe:
     steps:
       - secrets: [step-a]
-        run: echo "token is $KIWI_SECRET_STEP_A"
+        run: `+echoScript+`
 `)
 	ex := Executor{Opt: Options{Workspace: ws, SecretProvider: provider, Logs: sink}}
 	res, err := ex.Run(context.Background(), g)

@@ -276,7 +276,7 @@ func (b *TartBackend) sshRun(ctx context.Context, stdin io.Reader, command strin
 
 func (b *TartBackend) Run(ctx context.Context, c Command, emit func(string)) error {
 	if b.ip == "" || b.ssh == "" {
-		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("Tart job session is not started")}
+		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("tart job session is not started")}
 	}
 	if c.TimeoutSeconds > 0 {
 		var cancel context.CancelFunc
@@ -317,7 +317,7 @@ func (b *TartBackend) Run(ctx context.Context, c Command, emit func(string)) err
 // os.ErrNotExist so callers can treat "step wrote no outputs" uniformly.
 func (b *TartBackend) ReadFile(ctx context.Context, path string, maxBytes int64) ([]byte, error) {
 	if b.ip == "" || b.ssh == "" {
-		return nil, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("Tart job session is not started")}
+		return nil, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("tart job session is not started")}
 	}
 	rel, err := filepath.Rel(b.workspace, path)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {

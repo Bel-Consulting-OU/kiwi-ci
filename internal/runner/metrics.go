@@ -65,18 +65,14 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	}
 }
 
-// stepReporterFunc is the expected executor.Options.StepReporter signature:
-// it receives a completed step's wall-clock duration as measured by the
-// executor, which is the real measurement (the sink-derived approximation
-// was removed).
-type stepReporterFunc func(jobID, step string, d time.Duration)
-
 // applyStepReporter wires the executor's StepReporter hook into the
-// kiwi_runner_step_duration_seconds counter. The hook is added by the
-// executor workstream; until it lands, the field is absent and the function
-// returns false (step durations are then simply not collected). The wiring
-// is reflection-based so this package builds against executor versions with
-// and without the field.
+// kiwi_runner_step_duration_seconds counter. The hook has the signature
+// func(jobID, stepID string, d time.Duration) and carries the REAL
+// executor-measured per-step wall-clock duration (the sink-derived
+// approximation was removed). The wiring is reflection-based so this
+// package builds against executor versions with and without the field;
+// when the field is absent it returns false and step durations are then
+// simply not collected.
 func applyStepReporter(opts *executor.Options, m *Metrics) bool {
 	v := reflect.ValueOf(opts).Elem()
 	f := v.FieldByName("StepReporter")

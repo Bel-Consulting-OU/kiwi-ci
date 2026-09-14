@@ -2,6 +2,7 @@ package executor
 
 import (
 	"os/exec"
+	"runtime"
 	"testing"
 )
 
@@ -66,16 +67,12 @@ func TestJobSupervisionPhaseOrder(t *testing.T) {
 // TestSuperviseChildOrdering asserts the portable supervision wrapper performs
 // the platform assignment synchronously, in the caller goroutine, before
 // returning: the tracked phases must be exactly start then assigned, with
-// nothing in between, and a non-nil cleanup must be returned.
+// nothing in between. On Unix the wrapper is a no-op that returns a non-nil
+// cleanup; on Windows it must refuse a nil child process (there is nothing to
+// assign to a Job Object) rather than supervise nothing.
 func TestSuperviseChildOrdering(t *testing.T) {
 	var track []string
 	cleanup, err := superviseChildNow(&exec.Cmd{}, &track)
-	if err != nil {
-		t.Fatalf("superviseChildNow: %v", err)
-	}
-	if cleanup == nil {
-		t.Fatal("superviseChildNow returned nil cleanup")
-	}
 	want := []string{"start", "assigned"}
 	if len(track) != len(want) {
 		t.Fatalf("supervision phases = %v, want %v", track, want)
@@ -84,6 +81,18 @@ func TestSuperviseChildOrdering(t *testing.T) {
 		if track[i] != want[i] {
 			t.Fatalf("supervision phases = %v, want %v", track, want)
 		}
+	}
+	if runtime.GOOS == "windows" {
+		if err == nil {
+			t.Fatal("superviseChildNow accepted a nil child process on Windows")
+		}
+		return
+	}
+	if err != nil {
+		t.Fatalf("superviseChildNow: %v", err)
+	}
+	if cleanup == nil {
+		t.Fatal("superviseChildNow returned nil cleanup")
 	}
 	cleanup()
 }

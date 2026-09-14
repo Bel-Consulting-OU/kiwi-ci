@@ -143,7 +143,7 @@ func TestExecuteCompiledPayloadRunsEffectiveJob(t *testing.T) {
 	}
 	evil := g.Jobs["build"]
 	marker := filepath.Join(t.TempDir(), "effective-ran")
-	evil.Job.Steps = append(evil.Job.Steps, pipeline.Step{Run: "touch " + marker})
+	evil.Job.Steps = append(evil.Job.Steps, pipeline.Step{Run: makeFileScript(marker)})
 	evilJSON, err := json.Marshal(evil)
 	if err != nil {
 		t.Fatal(err)
@@ -218,8 +218,13 @@ func TestExecuteUploadsAttestationsBeforePayloadAndSnapshot(t *testing.T) {
 	// The pipeline YAML schema does not yet admit artifact sbom/sigstore
 	// keys, so the effective compiled job (which carries them as JSON,
 	// exactly like the control plane's compiled payload does) declares the
-	// attestation contract.
-	base := "version: 1\njobs:\n  build:\n    steps:\n      - run: mkdir -p out .cache && echo hello > out/app.txt && echo c > .cache/f.txt\n    cache:\n      - name: deps\n        paths: [.cache]\n        key: v1\n    artifacts:\n      - name: app\n        paths: [out]\n"
+	// attestation contract. The step fixture writes the artifact and cache
+	// payloads with the native shell (POSIX on Unix, PowerShell on Windows).
+	buildStep := nativeScript(
+		"mkdir -p out .cache && echo hello > out/app.txt && echo c > .cache/f.txt",
+		"New-Item -ItemType Directory -Force -Path out,.cache | Out-Null; 'hello' | Out-File -Encoding utf8 out/app.txt; 'c' | Out-File -Encoding utf8 .cache/f.txt",
+	)
+	base := "version: 1\njobs:\n  build:\n    steps:\n      - run: " + buildStep + "\n    cache:\n      - name: deps\n        paths: [.cache]\n        key: v1\n    artifacts:\n      - name: app\n        paths: [out]\n"
 	payload := buildPayload(t, base, "build")
 	var eff pipeline.CompiledJob
 	if err := json.Unmarshal(mustJSON(t, payload.EffectiveJob), &eff); err != nil {
@@ -242,10 +247,7 @@ func TestExecuteUploadsAttestationsBeforePayloadAndSnapshot(t *testing.T) {
 	r.execute(context.Background(), task)
 
 	// Attestations must precede the payload upload.
-	var uploads []string
-	for _, p := range fsrv.pathsFor("/api/v1/jobs/job-1/artifacts/") {
-		uploads = append(uploads, p)
-	}
+	uploads := fsrv.pathsFor("/api/v1/jobs/job-1/artifacts/")
 	want := []string{"app.sbom", "app.sigstore", "app"}
 	if len(uploads) != len(want) {
 		t.Fatalf("artifact uploads = %v, want %v", uploads, want)
@@ -345,7 +347,13 @@ func TestExecuteInjectsTestShardEnv(t *testing.T) {
 	// The compile-time reality: tests.shards expands into variants and each
 	// variant carries the shard env contract. The runner executes the
 	// variant the control plane leased; no runtime shard endpoint exists.
-	base := "version: 1\njobs:\n  build:\n    tests:\n      shards: 2\n    steps:\n      - run: test \"$KIWI_TEST_SHARD_TOTAL\" = \"2\" && test \"$KIWI_TEST_SHARD_INDEX\" = \"1\"\n"
+	// The probe asserts the env contract in the native shell (POSIX on
+	// Unix, PowerShell on Windows).
+	shardProbe := nativeScript(
+		`test "$KIWI_TEST_SHARD_TOTAL" = "2" && test "$KIWI_TEST_SHARD_INDEX" = "1"`,
+		`if ($env:KIWI_TEST_SHARD_TOTAL -ne '2') { exit 1 }; if ($env:KIWI_TEST_SHARD_INDEX -ne '1') { exit 1 }`,
+	)
+	base := "version: 1\njobs:\n  build:\n    tests:\n      shards: 2\n    steps:\n      - run: " + shardProbe + "\n"
 	spec, err := pipeline.Parse([]byte(base))
 	if err != nil {
 		t.Fatal(err)
@@ -477,7 +485,7 @@ func TestExecutePayloadNetworkCeilingRefused(t *testing.T) {
 	defer ts.Close()
 
 	marker := filepath.Join(t.TempDir(), "must-not-run")
-	base := "version: 1\njobs:\n  build:\n    sandbox:\n      network: internet\n    steps:\n      - run: touch " + marker + "\n"
+	base := "version: 1\njobs:\n  build:\n    sandbox:\n      network: internet\n    steps:\n      - run: " + makeFileScript(marker) + "\n"
 	payload := buildPayload(t, base, "build")
 	payload.EffectivePolicy = mustJSON(t, policy.Capabilities{
 		NativeExecution: true,

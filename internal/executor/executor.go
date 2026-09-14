@@ -304,7 +304,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		networkPolicy = pipeline.NetworkPolicyNone
 	}
 	network := cj.Job.Network
-	cleanupServices := func() {}
+	var cleanupServices func()
 	if cj.Job.Runtime == "container" && len(cj.Job.Services) > 0 {
 		isolated := networkPolicy == pipeline.NetworkPolicyNone || networkPolicy == pipeline.NetworkPolicyServicesOnly
 		var er error

@@ -11,6 +11,13 @@ import (
 
 func TestDAGAndRetry(t *testing.T) {
 	ws := t.TempDir()
+	// The first step fails while the marker is absent and succeeds on
+	// retry once it has created it. The shell syntax is per-host: POSIX on
+	// Unix, PowerShell on Windows (the native default shell).
+	first := nativeScript(
+		`if [ ! -f marker ]; then touch marker; exit 1; fi`,
+		`if (-not (Test-Path marker)) { Set-Content marker x; exit 1 }`,
+	)
 	s, err := pipeline.Parse([]byte(`version: 1
 defaults:
   retry:
@@ -20,7 +27,7 @@ jobs:
   first:
     steps:
       - run: |
-          if [ ! -f marker ]; then touch marker; exit 1; fi
+          ` + first + `
   second:
     needs: [first]
     steps:

@@ -21,7 +21,7 @@ func deployGraph(t *testing.T, deployment string) (string, map[string]model.JobR
 jobs:
   j:
     steps:
-      - run: "true"
+      - run: exit 0
 `+deployment)
 	ex := Executor{Opt: Options{Workspace: ws, MaxParallel: 1}}
 	res, _ := ex.Run(context.Background(), g)
@@ -147,7 +147,7 @@ func TestDeploymentStepNamespacesInLogs(t *testing.T) {
 jobs:
   j:
     steps:
-      - run: "true"
+      - run: exit 0
     deployment:
       canary:
         - name: boom
@@ -186,7 +186,7 @@ func TestDeploymentUnnamedStepNamespace(t *testing.T) {
 jobs:
   j:
     steps:
-      - run: "true"
+      - run: exit 0
     deployment:
       canary:
         - run: echo ok > ok.txt

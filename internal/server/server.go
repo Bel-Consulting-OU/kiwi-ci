@@ -3240,6 +3240,14 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// MetricsHandler returns a handler serving the Prometheus metrics surface.
+// The app wiring mounts it on the dedicated metrics listener
+// (observability.metrics_listen); the main listener keeps its /metrics
+// route.
+func (s *Server) MetricsHandler() http.Handler {
+	return http.HandlerFunc(s.metrics)
+}
+
 // metricsMemory renders the state gauges from the in-memory maps.
 func (s *Server) metricsMemory(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()

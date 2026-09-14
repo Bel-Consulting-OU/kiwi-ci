@@ -3,6 +3,7 @@ package pipeline
 import (
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -88,7 +89,10 @@ func TestSchemaJSONMatchesKiwiFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading .kiwi/schema.json: %v", err)
 	}
-	if string(onDisk) != string(SchemaJSON) {
+	// .gitattributes enforces eol=lf, but a checkout with different
+	// autocrlf settings can still land CRLF bytes; compare line-ending
+	// normalized content against the embedded constant.
+	if got := strings.ReplaceAll(string(onDisk), "\r\n", "\n"); got != string(SchemaJSON) {
 		t.Fatalf(".kiwi/schema.json diverges from embedded SchemaJSON (%d vs %d bytes)", len(onDisk), len(SchemaJSON))
 	}
 }

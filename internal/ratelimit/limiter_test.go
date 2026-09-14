@@ -54,8 +54,11 @@ func TestLimiterRefill(t *testing.T) {
 
 func TestLimiterZeroRate(t *testing.T) {
 	l := New(0, 2)
-	if !l.Allow("k") || !l.Allow("k") {
-		t.Fatal("burst tokens should be available even at zero rate")
+	if !l.Allow("k") {
+		t.Fatal("first burst token should be available even at zero rate")
+	}
+	if !l.Allow("k") {
+		t.Fatal("second burst token should be available even at zero rate")
 	}
 	if l.Allow("k") {
 		t.Fatal("zero rate must deny after burst")

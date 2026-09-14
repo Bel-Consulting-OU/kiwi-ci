@@ -33,14 +33,18 @@ func TestFSRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rc.Close()
 	b, _ := io.ReadAll(rc)
+	if err := rc.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if !bytes.Equal(b, data) {
 		t.Fatal("content mismatch")
 	}
 	if got.Size != int64(len(data)) {
 		t.Fatal("size mismatch")
 	}
+	// Close the reader before Delete: Windows cannot remove an open file,
+	// and the blob.FS contract does not promise delete-while-open.
 	if err := s.Delete(context.Background(), key); err != nil {
 		t.Fatal(err)
 	}

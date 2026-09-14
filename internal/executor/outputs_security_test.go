@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -20,7 +21,7 @@ func TestReadFileNoFollowDirect(t *testing.T) {
 	}
 	link := filepath.Join(t.TempDir(), "link.txt")
 	if err := os.Symlink(target, link); err != nil {
-		t.Fatal(err)
+		t.Skipf("symlink creation unavailable (Windows needs privileges): %v", err)
 	}
 	nb := &NativeBackend{}
 	if _, err := nb.ReadFile(context.Background(), link, 1<<20); err == nil {
@@ -32,6 +33,9 @@ func TestReadFileNoFollowDirect(t *testing.T) {
 // outside the workspace. The step output read must fail rather than follow the
 // symlink and leak the outside file into job outputs.
 func TestStepOutputSymlinkRejected(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink step-output attack needs POSIX ln plus symlink creation privileges")
+	}
 	ws := t.TempDir()
 	outside := filepath.Join(t.TempDir(), "secret.txt")
 	if err := os.WriteFile(outside, []byte("KEY=stolen\n"), 0o644); err != nil {
@@ -73,12 +77,15 @@ jobs:
 // ReadFile cap instead of being buffered and parsed.
 func TestOutputFileTooLarge(t *testing.T) {
 	ws := t.TempDir()
+	// Write the oversized output file with the native shell: dd on Unix,
+	// an in-process byte-array write on Windows PowerShell.
+	big := writeBytesScript(".kiwi-output-1", 1048577)
 	s, err := pipeline.Parse([]byte(`version: 1
 jobs:
   big:
     steps:
       - id: out
-        run: dd if=/dev/zero of=.kiwi-output-1 bs=1048577 count=1 2>/dev/null
+        run: ` + big + `
 `))
 	if err != nil {
 		t.Fatal(err)

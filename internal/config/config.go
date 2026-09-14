@@ -12,10 +12,12 @@ package config
 import (
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/quotas"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/ratelimit"
 )
 
@@ -67,11 +69,16 @@ type GitHubConfig struct {
 type GitLabConfig struct {
 	WebhookSecret string `toml:"webhook_secret"`
 	Token         string `toml:"token"`
+	// BaseURL is the GitLab instance root (default https://gitlab.com).
+	BaseURL string `toml:"base_url"`
 }
 
 type ForgejoConfig struct {
 	WebhookSecret string `toml:"webhook_secret"`
 	Token         string `toml:"token"`
+	// BaseURL is the Forgejo/Gitea instance root (default
+	// https://codeberg.org).
+	BaseURL string `toml:"base_url"`
 }
 
 type PolicyConfig struct {
@@ -115,6 +122,59 @@ type AuthConfig struct {
 	TokensFile string `toml:"tokens_file"`
 }
 
+// QuotaConfig holds the enqueue and daily-budget quota policy. All counts
+// are float for parity with quotas.Limits; 0 means unlimited.
+type QuotaConfig struct {
+	RepoConcurrency  float64 `toml:"repo_concurrency"`
+	TeamConcurrency  float64 `toml:"team_concurrency"`
+	RepoQueueDepth   float64 `toml:"repo_queue_depth"`
+	TeamQueueDepth   float64 `toml:"team_queue_depth"`
+	DailyCostLimit   float64 `toml:"daily_cost_limit"`
+	DailyEnergyLimit float64 `toml:"daily_energy_limit"`
+	// FailOpen lets enqueues and leases proceed when the usage store is
+	// unavailable instead of failing closed.
+	FailOpen bool `toml:"fail_open"`
+}
+
+// SecretBrokerConfig selects the secret backend (vault, aws, gcp, azure,
+// onepassword or static) and its credentials. Only the fields of the
+// selected broker are required.
+type SecretBrokerConfig struct {
+	// Broker selects the provider; empty disables secret resolution.
+	Broker           string `toml:"broker"`
+	VaultAddr        string `toml:"vault_addr"`
+	VaultToken       string `toml:"vault_token"`
+	AWSRegion        string `toml:"aws_region"`
+	AWSAccessKey     string `toml:"aws_access_key"`
+	AWSSecretKey     string `toml:"aws_secret_key"`
+	AWSToken         string `toml:"aws_token"`
+	GCPCredentials   string `toml:"gcp_credentials"`
+	GCPProject       string `toml:"gcp_project"`
+	AzureTenant      string `toml:"azure_tenant"`
+	AzureClientID    string `toml:"azure_client_id"`
+	AzureSecret      string `toml:"azure_client_secret"`
+	AzureVaultURL    string `toml:"azure_vault_url"`
+	OnePasswordHost  string `toml:"onepassword_host"`
+	OnePasswordToken string `toml:"onepassword_token"`
+	OnePasswordVault string `toml:"onepassword_vault"`
+	// Static is a comma-separated list of k=v entries served by the
+	// static broker (the repeatable --secret-static flag joins the same
+	// way).
+	Static string `toml:"static"`
+}
+
+// ComponentsConfig configures server-side component resolution: a local
+// directory registry and/or a remote registry HTTP API.
+type ComponentsConfig struct {
+	// RegistryDir loads component spec files (.yaml/.json) from a local
+	// directory.
+	RegistryDir string `toml:"registry_dir"`
+	// RemoteURL is the remote registry base URL (https required).
+	RemoteURL string `toml:"remote_url"`
+	// RemoteToken is the bearer token for the remote registry.
+	RemoteToken string `toml:"remote_token"`
+}
+
 type Config struct {
 	Server        ServerConfig        `toml:"server"`
 	Database      DatabaseConfig      `toml:"database"`
@@ -127,6 +187,9 @@ type Config struct {
 	Observability ObservabilityConfig `toml:"observability"`
 	RateLimit     RateLimitConfig     `toml:"rate_limit"`
 	Auth          AuthConfig          `toml:"auth"`
+	Quota         QuotaConfig         `toml:"quota"`
+	SecretBroker  SecretBrokerConfig  `toml:"secret_broker"`
+	Components    ComponentsConfig    `toml:"components"`
 }
 
 // Default returns the built-in defaults (the bottom of the precedence
@@ -174,6 +237,102 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("blob.backend \"s3\" requires blob.s3_endpoint, blob.s3_bucket and blob.s3_region")
 		}
 	}
+	// GitHub App credentials are a pair: an app ID without a private key
+	// (or a key without an ID) can never authenticate.
+	switch {
+	case c.GitHub.AppID != 0 && c.GitHub.PrivateKeyPath == "":
+		return fmt.Errorf("github.app_id requires github.private_key_path (the App private key PEM)")
+	case c.GitHub.AppID == 0 && c.GitHub.PrivateKeyPath != "":
+		return fmt.Errorf("github.private_key_path requires github.app_id")
+	}
+	if c.RunnerPKI.Enabled && c.RunnerPKI.CACert == "" && c.RunnerPKI.CAKey == "" && c.RunnerPKI.EnrollToken == "" {
+		return fmt.Errorf("runner_pki.enabled requires runner_pki.ca_cert/ca_key or runner_pki.enroll_token")
+	}
+	if c.Database.MaxConnections < 0 {
+		return fmt.Errorf("database.max_connections must not be negative, got %d", c.Database.MaxConnections)
+	}
+	ql := quotas.Limits{
+		RepoConcurrency: c.Quota.RepoConcurrency,
+		TeamConcurrency: c.Quota.TeamConcurrency,
+		RepoQueueDepth:  c.Quota.RepoQueueDepth,
+		TeamQueueDepth:  c.Quota.TeamQueueDepth,
+		DailyCost:       c.Quota.DailyCostLimit,
+		DailyEnergy:     c.Quota.DailyEnergyLimit,
+	}
+	if err := ql.Validate(); err != nil {
+		return fmt.Errorf("quota: %w", err)
+	}
+	if err := validateSecretBroker(c.SecretBroker); err != nil {
+		return err
+	}
+	if c.Components.RemoteURL != "" {
+		u, err := url.Parse(c.Components.RemoteURL)
+		if err != nil {
+			return fmt.Errorf("components.remote_url: %w", err)
+		}
+		if u.Scheme != "https" {
+			return fmt.Errorf("components.remote_url must use https:// (got %q)", c.Components.RemoteURL)
+		}
+		if u.Host == "" {
+			return fmt.Errorf("components.remote_url has no host: %q", c.Components.RemoteURL)
+		}
+	}
+	for name, base := range map[string]string{
+		"gitlab.base_url":  c.GitLab.BaseURL,
+		"forgejo.base_url": c.Forgejo.BaseURL,
+	} {
+		if base == "" {
+			continue
+		}
+		u, err := url.Parse(base)
+		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+			return fmt.Errorf("%s must be an http(s):// URL, got %q", name, base)
+		}
+	}
+	return nil
+}
+
+// secretBrokerProviders are the supported secret brokers.
+var secretBrokerProviders = map[string]bool{
+	"vault": true, "aws": true, "gcp": true, "azure": true, "onepassword": true, "static": true,
+}
+
+// validateSecretBroker enforces the per-provider credential requirements so
+// a misconfigured broker surfaces at startup instead of at first resolve.
+func validateSecretBroker(c SecretBrokerConfig) error {
+	b := c.Broker
+	if b == "" {
+		return nil
+	}
+	if !secretBrokerProviders[b] {
+		return fmt.Errorf("secret_broker.broker must be one of vault, aws, gcp, azure, onepassword, static, got %q", b)
+	}
+	switch b {
+	case "vault":
+		if c.VaultAddr == "" {
+			return fmt.Errorf("secret_broker.broker \"vault\" requires secret_broker.vault_addr")
+		}
+	case "aws":
+		if c.AWSRegion == "" {
+			return fmt.Errorf("secret_broker.broker \"aws\" requires secret_broker.aws_region")
+		}
+	case "gcp":
+		if c.GCPProject == "" || c.GCPCredentials == "" {
+			return fmt.Errorf("secret_broker.broker \"gcp\" requires secret_broker.gcp_project and secret_broker.gcp_credentials")
+		}
+	case "azure":
+		if c.AzureTenant == "" || c.AzureClientID == "" || c.AzureSecret == "" || c.AzureVaultURL == "" {
+			return fmt.Errorf("secret_broker.broker \"azure\" requires secret_broker.azure_tenant, azure_client_id, azure_client_secret and azure_vault_url")
+		}
+	case "onepassword":
+		if c.OnePasswordHost == "" || c.OnePasswordToken == "" || c.OnePasswordVault == "" {
+			return fmt.Errorf("secret_broker.broker \"onepassword\" requires secret_broker.onepassword_host, onepassword_token and onepassword_vault")
+		}
+	case "static":
+		if strings.TrimSpace(c.Static) == "" {
+			return fmt.Errorf("secret_broker.broker \"static\" requires at least one secret_broker.static k=v entry")
+		}
+	}
 	return nil
 }
 
@@ -194,15 +353,40 @@ func (c *Config) ApplyEnv() error {
 		{"KIWI_DATABASE_URL", &c.Database.URL},
 		{"KIWI_GITHUB_WEBHOOK_SECRET", &c.GitHub.WebhookSecret},
 		{"KIWI_GITHUB_TOKEN", &c.GitHub.Token},
+		{"KIWI_GITHUB_PRIVATE_KEY_PATH", &c.GitHub.PrivateKeyPath},
 		{"KIWI_GITLAB_WEBHOOK_SECRET", &c.GitLab.WebhookSecret},
 		{"KIWI_GITLAB_TOKEN", &c.GitLab.Token},
+		{"KIWI_GITLAB_BASE_URL", &c.GitLab.BaseURL},
 		{"KIWI_FORGEJO_WEBHOOK_SECRET", &c.Forgejo.WebhookSecret},
 		{"KIWI_FORGEJO_TOKEN", &c.Forgejo.Token},
+		{"KIWI_FORGEJO_BASE_URL", &c.Forgejo.BaseURL},
 		{"KIWI_RUNNER_TOKEN", &c.Auth.RunnerToken},
 		{"KIWI_ADMIN_TOKEN", &c.Auth.AdminToken},
+		{"KIWI_AUTH_TOKENS_FILE", &c.Auth.TokensFile},
 		{"KIWI_RUNNER_ENROLL_TOKEN", &c.RunnerPKI.EnrollToken},
 		{"KIWI_BLOB_BACKEND", &c.Blob.Backend},
 		{"KIWI_OTEL_ENDPOINT", &c.Observability.OTelEndpoint},
+		{"KIWI_METRICS_LISTEN", &c.Observability.MetricsListen},
+		{"KIWI_SECRET_BROKER", &c.SecretBroker.Broker},
+		{"KIWI_VAULT_ADDR", &c.SecretBroker.VaultAddr},
+		{"KIWI_VAULT_TOKEN", &c.SecretBroker.VaultToken},
+		{"KIWI_AWS_REGION", &c.SecretBroker.AWSRegion},
+		{"KIWI_AWS_ACCESS_KEY", &c.SecretBroker.AWSAccessKey},
+		{"KIWI_AWS_SECRET_KEY", &c.SecretBroker.AWSSecretKey},
+		{"KIWI_AWS_TOKEN", &c.SecretBroker.AWSToken},
+		{"KIWI_GCP_CREDENTIALS", &c.SecretBroker.GCPCredentials},
+		{"KIWI_GCP_PROJECT", &c.SecretBroker.GCPProject},
+		{"KIWI_AZURE_TENANT", &c.SecretBroker.AzureTenant},
+		{"KIWI_AZURE_CLIENT_ID", &c.SecretBroker.AzureClientID},
+		{"KIWI_AZURE_CLIENT_SECRET", &c.SecretBroker.AzureSecret},
+		{"KIWI_AZURE_VAULT_URL", &c.SecretBroker.AzureVaultURL},
+		{"KIWI_ONEPASSWORD_HOST", &c.SecretBroker.OnePasswordHost},
+		{"KIWI_ONEPASSWORD_TOKEN", &c.SecretBroker.OnePasswordToken},
+		{"KIWI_ONEPASSWORD_VAULT", &c.SecretBroker.OnePasswordVault},
+		{"KIWI_SECRET_STATIC", &c.SecretBroker.Static},
+		{"KIWI_COMPONENT_REGISTRY_DIR", &c.Components.RegistryDir},
+		{"KIWI_COMPONENT_REMOTE", &c.Components.RemoteURL},
+		{"KIWI_COMPONENT_REMOTE_TOKEN", &c.Components.RemoteToken},
 	}
 	for _, e := range vars {
 		if v, ok := os.LookupEnv(e.name); ok {
@@ -214,7 +398,38 @@ func (c *Config) ApplyEnv() error {
 			c.Database.MaxConnections = n
 		}
 	}
+	if v, ok := os.LookupEnv("KIWI_GITHUB_APP_ID"); ok {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			c.GitHub.AppID = n
+		}
+	}
+	if v, ok := os.LookupEnv("KIWI_QUOTA_FAIL_OPEN"); ok {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Quota.FailOpen = b
+		}
+	}
+	applyEnvFloats(map[string]*float64{
+		"KIWI_REPO_CONCURRENCY":   &c.Quota.RepoConcurrency,
+		"KIWI_TEAM_CONCURRENCY":   &c.Quota.TeamConcurrency,
+		"KIWI_REPO_QUEUE_DEPTH":   &c.Quota.RepoQueueDepth,
+		"KIWI_TEAM_QUEUE_DEPTH":   &c.Quota.TeamQueueDepth,
+		"KIWI_DAILY_COST_LIMIT":   &c.Quota.DailyCostLimit,
+		"KIWI_DAILY_ENERGY_LIMIT": &c.Quota.DailyEnergyLimit,
+	})
 	return nil
+}
+
+// applyEnvFloats overlays numeric environment variables best-effort:
+// invalid values are ignored so a bad env var cannot break startup, while
+// valid values win over the config file.
+func applyEnvFloats(vars map[string]*float64) {
+	for name, dst := range vars {
+		if v, ok := os.LookupEnv(name); ok {
+			if f, err := strconv.ParseFloat(v, 64); err == nil {
+				*dst = f
+			}
+		}
+	}
 }
 
 // OverrideFromFlags applies CLI flags that were explicitly set (flags left
@@ -254,6 +469,115 @@ func (c *Config) OverrideFromFlags(fs *flag.FlagSet) error {
 			c.GitHub.WebhookSecret = f.Value.String()
 		case "github-token":
 			c.GitHub.Token = f.Value.String()
+		case "github-app-id":
+			if f.Value.String() != "" {
+				v, perr := strconv.ParseInt(f.Value.String(), 10, 64)
+				if perr != nil {
+					err = fmt.Errorf("--github-app-id: %w", perr)
+				} else {
+					c.GitHub.AppID = v
+				}
+			}
+		case "github-app-private-key":
+			c.GitHub.PrivateKeyPath = f.Value.String()
+		case "gitlab-token":
+			c.GitLab.Token = f.Value.String()
+		case "gitlab-webhook-secret":
+			c.GitLab.WebhookSecret = f.Value.String()
+		case "gitlab-base-url":
+			c.GitLab.BaseURL = f.Value.String()
+		case "forgejo-token":
+			c.Forgejo.Token = f.Value.String()
+		case "forgejo-webhook-secret":
+			c.Forgejo.WebhookSecret = f.Value.String()
+		case "forgejo-base-url":
+			c.Forgejo.BaseURL = f.Value.String()
+		case "tokens-file":
+			c.Auth.TokensFile = f.Value.String()
+		case "database-max-connections":
+			if f.Value.String() != "" {
+				v, perr := strconv.Atoi(f.Value.String())
+				if perr != nil {
+					err = fmt.Errorf("--database-max-connections: %w", perr)
+				} else {
+					c.Database.MaxConnections = v
+				}
+			}
+		case "metrics-listen":
+			c.Observability.MetricsListen = f.Value.String()
+		case "secret-broker":
+			c.SecretBroker.Broker = f.Value.String()
+		case "vault-addr":
+			c.SecretBroker.VaultAddr = f.Value.String()
+		case "vault-token":
+			c.SecretBroker.VaultToken = f.Value.String()
+		case "aws-region":
+			c.SecretBroker.AWSRegion = f.Value.String()
+		case "aws-access-key":
+			c.SecretBroker.AWSAccessKey = f.Value.String()
+		case "aws-secret-key":
+			c.SecretBroker.AWSSecretKey = f.Value.String()
+		case "aws-token":
+			c.SecretBroker.AWSToken = f.Value.String()
+		case "gcp-credentials":
+			c.SecretBroker.GCPCredentials = f.Value.String()
+		case "gcp-project":
+			c.SecretBroker.GCPProject = f.Value.String()
+		case "azure-tenant":
+			c.SecretBroker.AzureTenant = f.Value.String()
+		case "azure-client-id":
+			c.SecretBroker.AzureClientID = f.Value.String()
+		case "azure-client-secret":
+			c.SecretBroker.AzureSecret = f.Value.String()
+		case "azure-vault-url":
+			c.SecretBroker.AzureVaultURL = f.Value.String()
+		case "onepassword-host":
+			c.SecretBroker.OnePasswordHost = f.Value.String()
+		case "onepassword-token":
+			c.SecretBroker.OnePasswordToken = f.Value.String()
+		case "onepassword-vault":
+			c.SecretBroker.OnePasswordVault = f.Value.String()
+		case "secret-static":
+			c.SecretBroker.Static = f.Value.String()
+		case "component-registry-dir":
+			c.Components.RegistryDir = f.Value.String()
+		case "component-remote":
+			c.Components.RemoteURL = f.Value.String()
+		case "component-remote-token":
+			c.Components.RemoteToken = f.Value.String()
+		case "repo-concurrency":
+			if perr := flagFloat(f, &c.Quota.RepoConcurrency); perr != nil {
+				err = perr
+			}
+		case "team-concurrency":
+			if perr := flagFloat(f, &c.Quota.TeamConcurrency); perr != nil {
+				err = perr
+			}
+		case "repo-queue-depth":
+			if perr := flagFloat(f, &c.Quota.RepoQueueDepth); perr != nil {
+				err = perr
+			}
+		case "team-queue-depth":
+			if perr := flagFloat(f, &c.Quota.TeamQueueDepth); perr != nil {
+				err = perr
+			}
+		case "daily-cost-limit":
+			if perr := flagFloat(f, &c.Quota.DailyCostLimit); perr != nil {
+				err = perr
+			}
+		case "daily-energy-limit":
+			if perr := flagFloat(f, &c.Quota.DailyEnergyLimit); perr != nil {
+				err = perr
+			}
+		case "quota-fail-open":
+			if f.Value.String() != "" {
+				v, perr := strconv.ParseBool(f.Value.String())
+				if perr != nil {
+					err = fmt.Errorf("--quota-fail-open: %w", perr)
+				} else {
+					c.Quota.FailOpen = v
+				}
+			}
 		case "otel-endpoint":
 			c.Observability.OTelEndpoint = f.Value.String()
 		case "rate-limit-per-second":
@@ -275,6 +599,20 @@ func (c *Config) OverrideFromFlags(fs *flag.FlagSet) error {
 		}
 	})
 	return err
+}
+
+// flagFloat parses a non-empty float flag value into dst. Empty values
+// (flags left unset) are ignored.
+func flagFloat(f *flag.Flag, dst *float64) error {
+	if f.Value.String() == "" {
+		return nil
+	}
+	v, err := strconv.ParseFloat(f.Value.String(), 64)
+	if err != nil {
+		return fmt.Errorf("--%s: %w", f.Name, err)
+	}
+	*dst = v
+	return nil
 }
 
 // RateLimitClasses returns the effective per-class rates: each class uses
