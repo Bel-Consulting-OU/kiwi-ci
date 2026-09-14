@@ -1,0 +1,14 @@
+# Default owner for the whole repository.
+* @sbelakho2
+
+# Security-sensitive areas get the same owner; adjust when a security
+# team exists.
+/internal/executor/ @sbelakho2
+/internal/policy/ @sbelakho2
+/internal/safefs/ @sbelakho2
+/internal/runnerpki/ @sbelakho2
+/internal/server/ @sbelakho2
+/internal/storage/ @sbelakho2
+/SECURITY.md @sbelakho2
+/docs/security-model.md @sbelakho2
+/docs/threat-model.md @sbelakho2

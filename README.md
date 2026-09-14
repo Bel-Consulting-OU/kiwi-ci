@@ -1,120 +1,156 @@
-# 🥝 Kiwi CI
+# Kiwi CI
 
-Kiwi CI is a local-first CI/CD engine inspired by Woodpecker's small server/agent architecture, but designed around reproducibility, explainability, macOS, and safer execution boundaries.
+Kiwi CI is a single-binary CI/CD engine: one Go program runs as a local
+CLI, a control plane, and a runner. It executes the same compiled
+pipeline DAG locally and remotely, with first-class caches, artifacts,
+retries, cancellation, secrets, and an auditable execution boundary for
+untrusted code.
 
-## What Kiwi fixes
+## What exists
 
-- **No local/CI split:** `kiwi run` executes the same compiled DAG as a remote runner.
-- **macOS is first-class:** trusted jobs can run natively; untrusted/reproducible jobs can run in disposable Tart VMs on Apple Silicon.
-- **Caching is built in:** content-addressed cache archives keyed by declared inputs/lockfiles.
-- **Retries are explicit:** step, job, and default retry policy with exponential backoff.
-- **Cancellation is real:** native jobs run in their own process group so cancellation terminates children too.
-- **Secrets resolve on the runner:** not in the server-side compiled plan; logs are masked before emission.
-- **DAGs are explainable:** `kiwi explain` shows matrix expansion, dependencies, runtime, and commands.
-- **Matrices are deterministic:** no silent axis truncation.
-- **Artifacts are core:** no plugin required.
-- **No mandatory cloud:** one Go binary can be a CLI, server, or runner.
-- **Portable backends:** native, Docker, and Tart are behind one interface.
-- **Supply-chain-ready:** provenance primitives are included; OIDC and policy enforcement are designed as first-class extensions.
+- **Pipeline language v1**: jobs with `needs` dependencies, matrices,
+  conditions, expressions, caches, artifacts, downloads, services,
+  environments with approvals, sandboxing, placement, test
+  intelligence, downstream pipelines, deployments, snapshots, and
+  digest-pinned reusable components. See
+  [docs/pipeline-reference.md](docs/pipeline-reference.md).
+- **Local/remote parity**: `kiwi run` and remote runners execute the
+  same compiled DAG. Local runs get isolated per-job workspaces.
+- **Backends**: native (process-group cancellation), hardened Docker
+  containers (rootless verification, capability drop, immutable image
+  enforcement), and disposable Tart VMs on Apple Silicon.
+- **Control plane**: PostgreSQL-backed scheduler with per-job leases,
+  HA leader election, REST API, web dashboard, audit log, and
+  Prometheus metrics.
+- **Security**: capability-based admission policy with a deny-by-default
+  untrusted floor, mTLS runner enrollment, HMAC-only lease tokens,
+  sealed secret delivery, OIDC token issuance, and hardened archive
+  extraction. See [docs/security-model.md](docs/security-model.md).
+- **Forge integrations**: GitHub (App auth, Checks API), GitLab, and
+  Forgejo webhooks with verified signatures, trigger matching, and
+  deduplicated deliveries.
+- **Explainability**: `kiwi explain --why JOB` shows why a job would or
+  would not run; queued jobs carry machine-readable queue reasons.
 
-## Quick start on a Mac
+## Requirements
+
+- Go 1.23 or later.
+- `git` on the PATH.
+- Docker (for `runtime: container`) and Tart (for `runtime: tart`)
+  only where those runtimes are used.
+
+## Quick start
+
+Build from source:
 
 ```bash
-brew install go
+go install github.com/Bel-Consulting-OU/kiwi-ci/cmd/kiwi@latest
+# or:
+git clone https://github.com/Bel-Consulting-OU/kiwi-ci.git
+cd kiwi-ci && go build -o kiwi ./cmd/kiwi
+```
 
-git clone <your-kiwi-repo>
-cd kiwi-ci
-go build -o kiwi ./cmd/kiwi
+Check the host, then validate and run the example pipeline:
 
+```bash
 ./kiwi doctor
 ./kiwi validate -f examples/kiwi.yaml
-./kiwi explain -f examples/kiwi.yaml
+./kiwi explain --why test -f examples/kiwi.yaml
 ./kiwi run -f examples/kiwi.yaml
 ```
 
-For isolated macOS jobs on Apple Silicon:
+`kiwi init` scaffolds a `.kiwi/pipeline.yaml` in the current
+repository.
+
+## Server
+
+Dev mode (in-memory state, no external services):
 
 ```bash
-brew install openai/tools/tart
-tart clone ghcr.io/cirruslabs/macos-tahoe-base:latest tahoe-base
-```
-
-Then:
-
-```yaml
-jobs:
-  xcode:
-    runtime: tart
-    vm: tahoe-base
-    steps:
-      - run: xcodebuild -version
-```
-
-## Pipeline example
-
-```yaml
-version: 1
-name: app
-
-defaults:
-  timeout: 15m
-  retry:
-    max: 1
-    backoff: 2s
-
-jobs:
-  test:
-    matrix:
-      GO: ["1.23", "1.24"]
-    cache:
-      - name: deps
-        key: "go-${{ matrix.GO }}"
-        hash_files: [go.sum]
-        paths: [".cache/go"]
-    steps:
-      - name: test
-        run: go test ./...
-
-  build:
-    needs: [test]
-    steps:
-      - run: go build ./...
-```
-
-## GitHub webhook mode
-
-Run the control plane with a high-entropy webhook secret and runner/API token:
-
-```bash
-export KIWI_RUNNER_TOKEN='runner-and-api-token'
-export KIWI_GITHUB_WEBHOOK_SECRET='high-entropy-webhook-secret'
-export KIWI_GITHUB_TOKEN='optional-token-for-private-repos'
+export KIWI_RUNNER_TOKEN='runner-token'
 ./kiwi server --listen :8080
 ```
 
-Configure the GitHub repository webhook to `https://your-kiwi.example/hooks/github`, content type `application/json`, and the same secret. Kiwi verifies `X-Hub-Signature-256` before processing the payload. Pushes are trusted. Fork pull requests are untrusted: Kiwi reads the pipeline definition from the base commit, checks out the fork code separately, forbids secrets, and refuses `runtime: native`; use `container` or `tart` instead.
-
-## Server + Mac runner
-
-Terminal 1:
+Production mode (PostgreSQL, TLS, distinct admin/runner credentials):
 
 ```bash
-export KIWI_RUNNER_TOKEN='change-me'
-./kiwi server --listen :8080
+./kiwi server \
+  --mode production \
+  --listen :8443 \
+  --external-url https://ci.example.com \
+  --database-url "postgres://kiwi:pass@db:5432/kiwi" \
+  --admin-token "$ADMIN_TOKEN" \
+  --runner-token "$RUNNER_TOKEN" \
+  --tls-cert /etc/kiwi/server.crt \
+  --tls-key /etc/kiwi/server.key \
+  --data-dir /var/lib/kiwi
 ```
 
-Terminal 2:
+Production mode enforces its contract at startup: database URL,
+distinct tokens (or `--allow-shared-token`), an `https://` external URL
+(the OIDC issuer), and TLS. See
+[docs/production-deployment.md](docs/production-deployment.md).
+
+Configuration can also come from a `kiwi.toml` file
+(`--config kiwi.toml`, checked with `kiwi config check`); precedence is
+CLI flags > `KIWI_*` environment variables > config file > defaults.
+
+## Runner
 
 ```bash
-./kiwi runner --server http://127.0.0.1:8080 --token "$KIWI_RUNNER_TOKEN" --labels macos,arm64,xcode
+./kiwi runner --server http://127.0.0.1:8080 \
+  --token "$KIWI_RUNNER_TOKEN" --labels macos,arm64
 ```
 
-Submit a run through `POST /api/v1/runs` with repository URL, ref, and pipeline YAML. The runner clones the ref and executes the same graph used locally.
+For mTLS identity binding, create a runner CA (or let the server
+persist one with `--data-dir`), set `--runner-enroll-token`, and start
+the runner with `--runner-enroll-token`/`--runner-mtls`. The runner
+negotiates protocol v3, drains cleanly on `--drain`, and self-cancels
+if it loses contact with the control plane past its lease deadline.
+
+Manage runners with `kiwi runner list|drain|disable|enable`.
+
+## Webhooks
+
+Point the forge at `https://<host>/hooks/github`, `/hooks/gitlab`, or
+`/hooks/forgejo` with the matching webhook secret configured. Kiwi
+verifies the signature before processing anything, applies the
+pipeline's `on` triggers, and publishes checks/statuses back. Fork pull
+requests are untrusted: the pipeline comes from the base commit, the
+fork code is checked out separately, and the untrusted capability floor
+applies (no secrets, no OIDC, no native execution, no egress,
+digest-pinned images). See [docs/github-app.md](docs/github-app.md).
+
+Manual dispatch:
+
+```bash
+./kiwi dispatch --repo owner/name --ref main \
+  --input environment=staging --pipeline .kiwi/pipeline.yaml
+```
+
+## CLI overview
+
+```
+kiwi init | run | validate | explain [--why JOB] | doctor
+kiwi server [--mode dev|production] [--config kiwi.toml]
+kiwi config check | kiwi database migrate|status
+kiwi runner [--server URL --token TOKEN] | kiwi runner list|drain|disable|enable
+kiwi dispatch | kiwi runs | kiwi jobs | kiwi logs [--follow]
+kiwi cancel | kiwi approve | kiwi rerun | kiwi artifacts
+kiwi schedules list|trigger   (scaffold; server-side schedules deferred)
+kiwi policy check [-f FILE] [--trusted]
+kiwi version
+```
 
 ## Repository layout
 
-See `ARCHITECTURE.md`. Every non-generated source file is intentionally small enough to audit.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the component map and
+[FILE_MAP.md](FILE_MAP.md) for a per-file inventory (generated by
+`cmd/filemap`).
 
 ## Status
 
-This repository is a **compiling v0.1 foundation**, not a claim that a few thousand lines can already replace every production feature of GitHub Actions, GitLab CI, Buildkite, or Woodpecker. The architecture intentionally makes the difficult pieces—security boundaries, caching, cancellation, provenance, local parity, and backend isolation—first-class rather than afterthoughts. See `ROADMAP.md` for the path to a production-grade v1.
+v0.1 development series. The core is a compiling, tested engine rather
+than a claim of feature parity with GitHub Actions or GitLab CI; the
+parts that exist are built as security boundaries first. See
+[ROADMAP.md](ROADMAP.md) for what is done and what remains.

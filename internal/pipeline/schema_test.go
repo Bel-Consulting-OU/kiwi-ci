@@ -290,6 +290,38 @@ jobs:
 			name: "bad shell",
 			doc:  "version: 1\njobs:\n  a:\n    shell: csh\n    steps:\n      - run: echo hi\n",
 		},
+		{
+			name: "negative retry max",
+			doc:  "version: 1\njobs:\n  a:\n    retry:\n      max: -2\n    steps:\n      - run: echo hi\n",
+		},
+		{
+			name: "unsupported defaults shell",
+			doc:  "version: 1\ndefaults:\n  shell: csh\njobs:\n  a:\n    steps:\n      - run: echo hi\n",
+		},
+		{
+			name: "unsupported version",
+			doc:  "version: 2\njobs:\n  a:\n    steps:\n      - run: echo hi\n",
+		},
+		{
+			name: "multiple documents",
+			doc:  "version: 1\njobs:\n  a:\n    steps:\n      - run: echo hi\n---\nversion: 1\njobs: {}\n",
+		},
+		{
+			name: "step run as mapping",
+			doc:  "version: 1\njobs:\n  a:\n    steps:\n      - run:\n          nested: yes\n",
+		},
+		{
+			name: "custom tag",
+			doc:  "version: 1\njobs:\n  a:\n    steps:\n      - run: !custom hello\n",
+		},
+		{
+			name: "merge key",
+			doc:  "version: 1\njobs:\n  a:\n    steps:\n      - run: echo hi\n  b:\n    <<: a\n    steps:\n      - run: echo bye\n",
+		},
+		{
+			name: "empty service image",
+			doc:  "version: 1\njobs:\n  a:\n    services:\n      - name: db\n        image: \"\"\n    steps:\n      - run: echo hi\n",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
