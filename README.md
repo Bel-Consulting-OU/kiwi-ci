@@ -180,3 +180,22 @@ docker run --rm -p 8080:8080 ghcr.io/bel-consulting-ou/kiwi-ci:v0.1.0
 
 Build your own with `make release` (cross-compiled bundle) and
 `make docker-build`.
+
+## CI status
+
+Every push to `main` and every pull request runs the full matrix in
+`.github/workflows/ci.yml`: `format`, `vet`, `unit` on Ubuntu, macOS
+and Windows, `race` on Ubuntu and macOS, a Windows concurrent stress
+lane (the race detector is unavailable on Windows), `adversarial`,
+`fuzz-smoke`, `schema`, `cross`, `staticcheck`, `govulncheck`,
+`license`, `docs`, and `repro`. A nightly fuzz run
+(`nightly-fuzz.yml`) keeps the fuzz corpus warm, and releases are
+gated on `govulncheck` plus mandatory provenance signing (see
+`.github/workflows/release.yml`).
+
+`main` is branch-protected: merges require a pull request, all
+required checks green, and the branch up-to-date with `main`; admins
+are not exempt. The protection rule is applied idempotently by
+`make protect-branch` (`scripts/gh-branch-protection.sh`, repo-admin
+token required). Dependabot keeps Go modules and GitHub Actions up to
+date with weekly PRs (`.github/dependabot.yml`).

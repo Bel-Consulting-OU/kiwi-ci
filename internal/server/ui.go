@@ -38,10 +38,3 @@ func (s *Server) ui(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	_, _ = w.Write(index)
 }
-
-// static serves the embedded JS/CSS assets under /static/.
-func (s *Server) static(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Security-Policy", webCSP)
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	http.FileServerFS(webAssets()).ServeHTTP(w, r)
-}

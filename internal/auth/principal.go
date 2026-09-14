@@ -53,10 +53,11 @@ func (p Principal) Has(role Role) bool {
 }
 
 // RepoPerm returns the effective permission set for repo. A repo-specific
-// entry, when present, is authoritative; otherwise permissions derive from
-// roles (admin grants everything).
+// entry, when present (keyed by canonical ID or bare full name), is
+// authoritative; otherwise permissions derive from roles (admin grants
+// everything).
 func (p Principal) RepoPerm(repo string) RepositoryPermission {
-	if perm, ok := p.Repositories[repo]; ok {
+	if perm, ok := p.repoEntry(repo); ok {
 		return perm
 	}
 	admin := p.Has(RoleAdmin)

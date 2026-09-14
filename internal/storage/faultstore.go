@@ -59,6 +59,7 @@ var (
 	_ UsageStore            = (*FaultyStore)(nil)
 	_ RunDownstreamStore    = (*FaultyStore)(nil)
 	_ ArtifactLookupStore   = (*FaultyStore)(nil)
+	_ RunnerJobStore        = (*FaultyStore)(nil)
 )
 
 func (f *FaultyStore) Close() error { return f.Inner.Close() }
@@ -112,6 +113,10 @@ func (f *FaultyStore) ListQueuedJobs(ctx context.Context) ([]model.Job, error) {
 
 func (f *FaultyStore) ListJobsByEnvironment(ctx context.Context, repoURL, environment string) ([]model.Job, error) {
 	return f.Inner.ListJobsByEnvironment(ctx, repoURL, environment)
+}
+
+func (f *FaultyStore) ListJobsByRunner(ctx context.Context, runnerID string) ([]model.Job, error) {
+	return f.Inner.(RunnerJobStore).ListJobsByRunner(ctx, runnerID)
 }
 
 func (f *FaultyStore) UpdateJob(ctx context.Context, job model.Job) error {
@@ -516,6 +521,7 @@ var (
 	_ UsageStore            = (*memStore)(nil)
 	_ RunDownstreamStore    = (*memStore)(nil)
 	_ ArtifactLookupStore   = (*memStore)(nil)
+	_ RunnerJobStore        = (*memStore)(nil)
 )
 
 func (m *memStore) Close() error { return nil }
@@ -612,6 +618,18 @@ func (m *memStore) ListJobsByEnvironment(ctx context.Context, repoURL, environme
 	out := []model.Job{}
 	for _, j := range m.jobs {
 		if j.Environment == environment && j.RepoURL == repoURL {
+			out = append(out, j)
+		}
+	}
+	return out, nil
+}
+
+func (m *memStore) ListJobsByRunner(ctx context.Context, runnerID string) ([]model.Job, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []model.Job{}
+	for _, j := range m.jobs {
+		if j.Status == model.StatusRunning && j.LeaseRunnerID == runnerID {
 			out = append(out, j)
 		}
 	}

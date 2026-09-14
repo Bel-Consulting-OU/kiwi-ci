@@ -199,17 +199,6 @@ func (b *TartBackend) hardenedSSHArgs(host, command string) []string {
 	}
 }
 
-// legacySSHArgs reproduces the pre-hardening behavior (no host-key
-// verification, no key identity). Used only as a last-resort fallback when the
-// ephemeral key cannot authenticate; see sshRun.
-func (b *TartBackend) legacySSHArgs(host, command string) []string {
-	return []string{
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
-		host, command,
-	}
-}
-
 // sshRunOnce executes one ssh invocation. stdout and stderr are drained
 // through separate consumers (never stopped; consumers must read to EOF).
 // It returns the ssh exit code and a *RunError on failure.
@@ -267,28 +256,21 @@ func (b *TartBackend) sshRunOnce(ctx context.Context, args []string, stdin io.Re
 	return exitCode, nil
 }
 
-// sshRun executes command on the VM with hardened, job-scoped SSH options.
-// If and only if ssh reports an authentication failure (exit code 255 per
-// ssh(1)), it retries once with the legacy host-verification options: legacy
-// Tart VM images provision only the VM's default admin credential and cannot
-// accept the ephemeral per-job key, and failing those jobs outright would
-// break every existing image. This is a deliberately narrow exception — host
-// keys stay pinned for any VM that accepts the ephemeral key.
-func (b *TartBackend) sshRun(ctx context.Context, stdin io.Reader, command string, reset func(), consumeOut, consumeErr func(io.Reader) error, warn func(string)) error {
+// sshRun executes command on the VM with hardened, job-scoped SSH options and
+// nothing else: StrictHostKeyChecking=accept-new pinned to the per-job
+// known_hosts file, UserKnownHostsFile scoped to this job, IdentitiesOnly=yes,
+// and -i with the ephemeral per-job key. There is deliberately no fallback to
+// legacy host-verification options: if the VM image cannot authenticate the
+// ephemeral key (or its host key fails verification), the job fails hard
+// instead of being retried through an insecure path.
+func (b *TartBackend) sshRun(ctx context.Context, stdin io.Reader, command string, consumeOut, consumeErr func(io.Reader) error) error {
 	code, err := b.sshRunOnce(ctx, b.hardenedSSHArgs("admin@"+b.ip, command), stdin, consumeOut, consumeErr)
 	if err == nil {
 		return nil
 	}
-	if code != 255 || ctx.Err() != nil {
-		return err
+	if code == 255 && ctx.Err() == nil {
+		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("ssh failed with exit code 255 (authentication or host-key verification failure); the ephemeral per-job key is the only accepted credential and no insecure fallback exists: %w", err)}
 	}
-	if warn != nil {
-		warn("ssh authentication with the ephemeral job key failed (exit code 255); falling back to legacy host verification")
-	}
-	if reset != nil {
-		reset()
-	}
-	_, err = b.sshRunOnce(ctx, b.legacySSHArgs("admin@"+b.ip, command), stdin, consumeOut, consumeErr)
 	return err
 }
 
@@ -321,13 +303,13 @@ func (b *TartBackend) Run(ctx context.Context, c Command, emit func(string)) err
 	}
 	script.WriteString(c.Script)
 	script.WriteByte('\n')
-	return b.sshRun(ctx, &script, remote, nil, func(r io.Reader) error {
+	return b.sshRun(ctx, &script, remote, func(r io.Reader) error {
 		streamLines(r, defaultMaxLine, emit)
 		return nil
 	}, func(r io.Reader) error {
 		streamLines(r, defaultMaxLine, emit)
 		return nil
-	}, emit)
+	})
 }
 
 // ReadFile reads a workspace file from inside the VM over the authenticated
@@ -367,14 +349,7 @@ func (b *TartBackend) ReadFile(ctx context.Context, path string, maxBytes int64)
 		_, err := io.Copy(&stderrBuf, r)
 		return err
 	}
-	reset := func() {
-		mu.Lock()
-		data = nil
-		limitExceeded = false
-		mu.Unlock()
-		stderrBuf.Reset()
-	}
-	if err := b.sshRun(ctx, nil, remote, reset, consumeOut, consumeErr, nil); err != nil {
+	if err := b.sshRun(ctx, nil, remote, consumeOut, consumeErr); err != nil {
 		if strings.Contains(strings.ToLower(stderrBuf.String()), "no such file") {
 			return nil, os.ErrNotExist
 		}

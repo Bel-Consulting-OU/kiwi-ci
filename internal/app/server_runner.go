@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -146,6 +147,8 @@ func Server(ctx context.Context, args []string) error {
 	runnerCACert := fs.String("runner-ca-cert", "", "runner CA certificate PEM (enables runner certificate enrollment)")
 	runnerCAKey := fs.String("runner-ca-key", "", "runner CA private key PEM")
 	runnerEnrollToken := fs.String("runner-enroll-token", "", "token authorizing runner certificate enrollment")
+	runnerRequireClientCerts := fs.Bool("runner-require-client-certs", true, "require runner client certificates at the TLS handshake when a runner CA is configured (default true)")
+	clusterKeyDir := fs.String("cluster-key-dir", "", "shared cluster key store directory (HA replicas share signing material); requires --data-dir")
 	databaseURL := fs.String("database-url", "", "PostgreSQL connection URL (wires the durable SQL control plane)")
 	mode := fs.String("mode", "", "server mode: dev (in-memory, default) or production")
 	allowSharedToken := fs.Bool("allow-shared-token", false, "production: allow --admin-token to equal --runner-token")
@@ -227,6 +230,13 @@ func Server(ctx context.Context, args []string) error {
 		return err
 	}
 	var srv *server.Server
+	var clusterStore *server.FSClusterKeyStore
+	if *clusterKeyDir != "" {
+		if *dataDir == "" {
+			return fmt.Errorf("--cluster-key-dir requires --data-dir (the persistent state root)")
+		}
+		clusterStore = &server.FSClusterKeyStore{Dir: *clusterKeyDir}
+	}
 	if databaseURLV != "" {
 		// DB mode: the SQL store is the source of truth. A data-dir is still
 		// used when set (lease key, OIDC signer, artifact bytes); without it
@@ -239,7 +249,9 @@ func Server(ctx context.Context, args []string) error {
 		if merr := db.Migrate(ctx); merr != nil {
 			return fmt.Errorf("auto-migrate: %w", merr)
 		}
-		if *dataDir != "" {
+		if clusterStore != nil {
+			srv, err = server.NewPersistentWithCluster(tokenV, adminTokenV, *dataDir, clusterStore)
+		} else if *dataDir != "" {
 			srv, err = server.NewPersistent(tokenV, adminTokenV, *dataDir)
 		} else {
 			srv = server.New(tokenV)
@@ -251,6 +263,19 @@ func Server(ctx context.Context, args []string) error {
 			return err
 		}
 		if err := srv.SwitchToDB(db); err != nil {
+			return err
+		}
+		// A production DB control plane without a cluster key store would
+		// mint per-replica signing material: replicas could not verify each
+		// other's tokens. Surface that at startup.
+		if modeV == "production" {
+			if err := srv.ValidateHAReady(); err != nil {
+				return err
+			}
+		}
+	} else if clusterStore != nil {
+		srv, err = server.NewPersistentWithCluster(tokenV, adminTokenV, *dataDir, clusterStore)
+		if err != nil {
 			return err
 		}
 	} else if *dataDir != "" {
@@ -300,6 +325,11 @@ func Server(ctx context.Context, args []string) error {
 			return err
 		}
 	}
+	// With a runner CA present (configured or enrolled), the TLS listener
+	// verifies runner client certificates against it. Requiring the
+	// certificate is the default; --runner-require-client-certs=false
+	// downgrades to verify-if-given.
+	applyRunnerTLSConfig(srv, *runnerRequireClientCerts)
 	// Blob backend wiring: an s3 backend or an explicit data-dir feeds the
 	// server's blob store when the server build provides SetBlobStore.
 	if cfg.Blob.Backend == "s3" || *dataDir != "" {
@@ -343,6 +373,16 @@ func Server(ctx context.Context, args []string) error {
 		IdleTimeout:       90 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
+	// The TLS identity comes from the server's own certificate pair plus the
+	// runner client CA trust settings (Server.TLSConfig), so the listener
+	// verifies runner certificates at the handshake.
+	if tlsCertV != "" {
+		tlsConf, terr := srv.TLSConfig(tlsCertV, tlsKeyV)
+		if terr != nil {
+			return fmt.Errorf("TLS configuration: %w", terr)
+		}
+		h.TLSConfig = tlsConf
+	}
 	go srv.Maintain(ctx)
 	go func() {
 		<-ctx.Done()
@@ -362,16 +402,28 @@ func Server(ctx context.Context, args []string) error {
 	}
 	fmt.Printf("Kiwi server listening on %s://%s\n", scheme, listenV)
 	var serveErr error
-	if tlsCertV != "" {
-		serveErr = h.ListenAndServeTLS(tlsCertV, tlsKeyV)
-	} else {
-		serveErr = h.ListenAndServe()
-	}
+	serveErr = h.ListenAndServe()
 	if serveErr == http.ErrServerClosed {
 		return nil
 	}
 	return serveErr
 }
+
+// applyRunnerTLSConfig populates the server's runner client certificate
+// trust settings from its runner CA: the TLS listener verifies presented
+// client certificates against the CA, and require decides whether the
+// certificate is mandatory at the handshake. Without a runner CA the
+// settings stay untouched (bearer-token mode).
+func applyRunnerTLSConfig(srv *server.Server, require bool) {
+	if srv.RunnerCA == nil {
+		return
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(srv.RunnerCA.Cert)
+	srv.RunnerClientCAPool = pool
+	srv.RequireRunnerClientCerts = require
+}
+
 func Runner(ctx context.Context, args []string) error {
 	if len(args) > 0 {
 		switch args[0] {

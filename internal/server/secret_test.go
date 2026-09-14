@@ -88,7 +88,7 @@ func TestIssueSecretDecryptableEnvelope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plain, err := secretbroker.OpenEnvelope(secretbroker.EncryptedDelivery{Ciphertext: ct, EphemeralPublic: ep, Nonce: nonce}, priv)
+	plain, err := secretbroker.OpenEnvelope(secretbroker.EncryptedDelivery{Ciphertext: ct, EphemeralPublic: ep, Nonce: nonce}, priv, secretAAD(runnerID, jobID, gen, "tok"))
 	if err != nil {
 		t.Fatalf("open envelope: %v", err)
 	}
@@ -177,6 +177,77 @@ func TestIssueSecretDuplicateDelivery(t *testing.T) {
 	req.EphemeralPublic = pubB64
 	if w := issue(t, c, jobID, req); w.Code != http.StatusConflict {
 		t.Fatalf("second issue: want 409, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestIssueSecretReceiptServerOwned proves the durable once-only record is
+// server-owned: a plain (non-OneTime) broker still gets exactly one delivery
+// per (job, generation, secret), a new generation delivers again, and a
+// different secret name is independent.
+func TestIssueSecretReceiptServerOwned(t *testing.T) {
+	s := New("secret")
+	s.SecretBroker = secretbroker.StaticBroker{"tok": "v"}
+	c := newTestClient(t, s.Handler(), "secret")
+	jobID, runnerID, token, gen := seedJob(t, s, true, []string{"tok", "other"})
+
+	_, pubB64 := ephemeralKey(t)
+	req := SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pubB64}
+	if w := issue(t, c, jobID, req); w.Code != http.StatusOK {
+		t.Fatalf("first issue: %d %s", w.Code, w.Body.String())
+	}
+	_, pubB64 = ephemeralKey(t)
+	req.EphemeralPublic = pubB64
+	if w := issue(t, c, jobID, req); w.Code != http.StatusConflict {
+		t.Fatalf("replay without OneTime broker: want 409, got %d: %s", w.Code, w.Body.String())
+	}
+	// A different generation is a new delivery (the receipt is generation
+	// scoped).
+	s.mu.Lock()
+	j := s.jobs[jobID]
+	j.LeaseGeneration++
+	s.jobs[jobID] = j
+	s.mu.Unlock()
+	_, pubB64 = ephemeralKey(t)
+	req.LeaseGeneration = gen + 1
+	req.EphemeralPublic = pubB64
+	if w := issue(t, c, jobID, req); w.Code != http.StatusOK {
+		t.Fatalf("new generation issue: want 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestIssueSecretReceiptSurvivesRestart proves the delivery receipt persists
+// through the dataDir receipt file: replaying after a restart conflicts.
+func TestIssueSecretReceiptSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	s1, err := NewPersistent("secret", "secret", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1.SecretBroker = secretbroker.StaticBroker{"tok": "v"}
+	c := newTestClient(t, s1.Handler(), "secret")
+	jobID, runnerID, token, gen := seedJob(t, s1, true, []string{"tok"})
+	// seedJob writes the run/job into the memory maps only; persist them so
+	// the restarted server sees the same job.
+	s1.mu.Lock()
+	_ = s1.persistLocked()
+	s1.mu.Unlock()
+
+	_, pubB64 := ephemeralKey(t)
+	req := SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pubB64}
+	if w := issue(t, c, jobID, req); w.Code != http.StatusOK {
+		t.Fatalf("first issue: %d %s", w.Code, w.Body.String())
+	}
+
+	s2, err := NewPersistent("secret", "secret", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2.SecretBroker = secretbroker.StaticBroker{"tok": "v"}
+	c2 := newTestClient(t, s2.Handler(), "secret")
+	_, pubB64 = ephemeralKey(t)
+	req.EphemeralPublic = pubB64
+	if w := issue(t, c2, jobID, req); w.Code != http.StatusConflict {
+		t.Fatalf("replay after restart: want 409, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

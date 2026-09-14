@@ -199,50 +199,6 @@ func compileJobFromPipeline(j model.Job) (pipeline.CompiledJob, bool) {
 	return cj, ok
 }
 
-// jobArtifactSpec returns the pipeline.Artifact declaration for name on the
-// job. The strict compile path (which handles matrix interpolation) is
-// preferred; when the pipeline schema does not yet admit sbom/sigstore
-// keys, a lenient raw-YAML parse of the job's artifact declarations is the
-// fallback so the attestation gate works independently of schema rollout.
-func jobArtifactSpec(j model.Job, name string) (pipeline.Artifact, bool) {
-	if cj, ok := compileJobFromPipeline(j); ok {
-		for _, a := range cj.Job.Artifacts {
-			if a.Name == name {
-				return a, true
-			}
-		}
-		return pipeline.Artifact{}, false
-	}
-	var raw struct {
-		Jobs map[string]struct {
-			Artifacts []struct {
-				Name     string                   `yaml:"name"`
-				SBOM     string                   `yaml:"sbom"`
-				Sigstore *pipeline.SigstoreConfig `yaml:"sigstore"`
-			} `yaml:"artifacts"`
-		} `yaml:"jobs"`
-	}
-	if err := yaml.Unmarshal([]byte(j.Pipeline), &raw); err != nil {
-		return pipeline.Artifact{}, false
-	}
-	lookup := []string{j.Key}
-	if j.BaseKey != "" && j.BaseKey != j.Key {
-		lookup = append(lookup, j.BaseKey)
-	}
-	for _, key := range lookup {
-		job, ok := raw.Jobs[key]
-		if !ok {
-			continue
-		}
-		for _, a := range job.Artifacts {
-			if a.Name == name {
-				return pipeline.Artifact{Name: a.Name, SBOM: a.SBOM, Sigstore: a.Sigstore}, true
-			}
-		}
-	}
-	return pipeline.Artifact{}, false
-}
-
 // contractRetention maps a contract retention onto the concrete expiry
 // offset: 0 (unset) yields the platform default, negative means never
 // expire, positive is used verbatim.

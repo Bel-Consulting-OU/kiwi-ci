@@ -76,8 +76,10 @@ const envelopeInfo = "kiwi-ci secret-broker envelope v1"
 
 // SealEnvelope encrypts plain for the owner of the 32-byte X25519 public key
 // peerPub. The returned delivery carries the ephemeral public key and nonce
-// required to open it.
-func SealEnvelope(plain []byte, peerPub [32]byte) (EncryptedDelivery, error) {
+// required to open it. aad is additional authenticated data bound into the
+// AEAD seal: opening with a different aad fails, so a delivery cannot be
+// replayed in a different (runner, job, generation, secret) context.
+func SealEnvelope(plain []byte, peerPub [32]byte, aad []byte) (EncryptedDelivery, error) {
 	peer, err := ecdh.X25519().NewPublicKey(peerPub[:])
 	if err != nil {
 		return EncryptedDelivery{}, fmt.Errorf("seal: peer public key: %w", err)
@@ -104,14 +106,15 @@ func SealEnvelope(plain []byte, peerPub [32]byte) (EncryptedDelivery, error) {
 		return EncryptedDelivery{}, fmt.Errorf("seal: nonce: %w", err)
 	}
 	return EncryptedDelivery{
-		Ciphertext:      aead.Seal(nil, nonce, plain, nil),
+		Ciphertext:      aead.Seal(nil, nonce, plain, aad),
 		EphemeralPublic: eph.PublicKey().Bytes(),
 		Nonce:           nonce,
 	}, nil
 }
 
 // OpenEnvelope decrypts d using the recipient's 32-byte X25519 private key.
-func OpenEnvelope(d EncryptedDelivery, ownPriv [32]byte) ([]byte, error) {
+// aad must match the authenticated data SealEnvelope was called with.
+func OpenEnvelope(d EncryptedDelivery, ownPriv [32]byte, aad []byte) ([]byte, error) {
 	priv, err := ecdh.X25519().NewPrivateKey(ownPriv[:])
 	if err != nil {
 		return nil, fmt.Errorf("open: private key: %w", err)
@@ -136,7 +139,7 @@ func OpenEnvelope(d EncryptedDelivery, ownPriv [32]byte) ([]byte, error) {
 	if len(d.Nonce) != aead.NonceSize() {
 		return nil, fmt.Errorf("open: nonce length %d, want %d", len(d.Nonce), aead.NonceSize())
 	}
-	plain, err := aead.Open(nil, d.Nonce, d.Ciphertext, nil)
+	plain, err := aead.Open(nil, d.Nonce, d.Ciphertext, aad)
 	if err != nil {
 		return nil, fmt.Errorf("open: %w", err)
 	}

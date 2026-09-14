@@ -1,6 +1,6 @@
 .PHONY: build test test-unit test-race test-integration test-adversarial test-shuffle test-stress \
 	fuzz coverage staticcheck govulncheck cross schema-check docs-check license-check repro-build \
-	fmt lint run clean
+	fmt lint run clean protect-branch
 
 VERSION ?= 0.1.0-dev
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -82,6 +82,12 @@ run:
 
 clean:
 	rm -rf dist coverage.out .kiwi/cache .kiwi/artifacts .kiwi/runs .kiwi/workspaces
+
+# Applies main-branch protection (required PRs, required CI matrix,
+# up-to-date branches, admins not exempt). Idempotent; requires repo
+# admin; run once manually. See scripts/gh-branch-protection.sh.
+protect-branch:
+	./scripts/gh-branch-protection.sh
 
 .PHONY: release docker-build
 

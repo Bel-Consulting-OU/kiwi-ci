@@ -41,14 +41,13 @@ type dbFakeStore struct {
 	leaderErr error
 	schemaErr error
 
-	insertRunCalls  []model.Run
-	insertJobCalls  []model.Job
-	acquireCalls    []acquireArgs
-	heartbeatCalls  []heartbeatArgs
-	completeCalls   []completeArgs
-	cancelRunCalls  []cancelRunArgs
-	updateJobCalls  []model.Job
-	appendAuditErrs int
+	insertRunCalls []model.Run
+	insertJobCalls []model.Job
+	acquireCalls   []acquireArgs
+	heartbeatCalls []heartbeatArgs
+	completeCalls  []completeArgs
+	cancelRunCalls []cancelRunArgs
+	updateJobCalls []model.Job
 }
 
 type acquireArgs struct {
@@ -91,6 +90,7 @@ var _ storage.DownstreamStore = (*dbFakeStore)(nil)
 var _ storage.UsageStore = (*dbFakeStore)(nil)
 var _ storage.RunDownstreamStore = (*dbFakeStore)(nil)
 var _ storage.ArtifactLookupStore = (*dbFakeStore)(nil)
+var _ storage.RunnerJobStore = (*dbFakeStore)(nil)
 
 func newDBFakeStore() *dbFakeStore {
 	return &dbFakeStore{
@@ -204,6 +204,18 @@ func (f *dbFakeStore) ListQueuedJobs(ctx context.Context) ([]model.Job, error) {
 	out := []model.Job{}
 	for _, j := range f.jobs {
 		if j.Status == model.StatusQueued {
+			out = append(out, j)
+		}
+	}
+	return out, nil
+}
+
+func (f *dbFakeStore) ListJobsByRunner(ctx context.Context, runnerID string) ([]model.Job, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []model.Job{}
+	for _, j := range f.jobs {
+		if j.Status == model.StatusRunning && j.LeaseRunnerID == runnerID {
 			out = append(out, j)
 		}
 	}

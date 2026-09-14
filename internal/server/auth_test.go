@@ -106,7 +106,9 @@ func TestAdminStorePrincipalOnAdminRoutes(t *testing.T) {
 		want  int
 	}{
 		{"admin store principal", "ops-token", http.StatusOK},
-		{"run-only principal denied", "ci-token", http.StatusUnauthorized},
+		// A run-only principal lacks the read role for the run list: the
+		// route is RBAC-mapped to ActionRead, so it is rejected (403).
+		{"run-only principal denied", "ci-token", http.StatusForbidden},
 	} {
 		req := httptest.NewRequest(http.MethodGet, "/api/v1/runs", nil)
 		req.Header.Set("Authorization", "Bearer "+tc.token)

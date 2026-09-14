@@ -51,6 +51,9 @@ type oidcSigner struct {
 	NotBefore time.Time
 	Previous  []oidcPreviousKey
 	ringPath  string
+	// cluster, when non-nil, is the shared key store the ring persists
+	// through (HA deployments); ringPath stays empty in that mode.
+	cluster ClusterKeyStore
 }
 
 // oidcKeyRingJSON is the on-disk key ring format written to
@@ -163,9 +166,6 @@ func oidcSignerFromRing(b []byte) (*oidcSigner, error) {
 }
 
 func persistOIDCKeyRing(s *oidcSigner) error {
-	if s.ringPath == "" {
-		return nil
-	}
 	rf := oidcKeyRingJSON{
 		Active: oidcActiveKeyFile{
 			KID:       s.KID,
@@ -186,8 +186,19 @@ func persistOIDCKeyRing(s *oidcSigner) error {
 	if err != nil {
 		return err
 	}
+	b = append(b, '\n')
+	if s.cluster != nil {
+		writer, ok := s.cluster.(ClusterKeyWriter)
+		if !ok {
+			return fmt.Errorf("oidc key ring: cluster key store does not support writes")
+		}
+		return writer.Store(clusterKindOIDC, b)
+	}
+	if s.ringPath == "" {
+		return nil
+	}
 	tmp := s.ringPath + ".tmp"
-	if err := os.WriteFile(tmp, append(b, '\n'), 0o600); err != nil {
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, s.ringPath); err != nil {
@@ -250,6 +261,7 @@ func (s *Server) rotateOIDCKeyLocked(now time.Time) {
 	next := newOIDCSigner()
 	next.NotBefore = now
 	next.ringPath = s.oidc.ringPath
+	next.cluster = s.oidc.cluster
 	next.Previous = make([]oidcPreviousKey, 0, len(s.oidc.Previous)+1)
 	for _, p := range s.oidc.Previous {
 		if p.RetireAfter.After(now) {
@@ -282,7 +294,7 @@ func (s *Server) oidcIssuer() (string, error) {
 func (s *Server) oidcConfiguration(w http.ResponseWriter, r *http.Request) {
 	iss, err := s.oidcIssuer()
 	if err != nil {
-		http.Error(w, err.Error(), 503)
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 	w.Header().Set("Cache-Control", "public, max-age=300")
@@ -298,7 +310,7 @@ func (s *Server) oidcJWKS(w http.ResponseWriter, r *http.Request) {
 	signer := s.oidc
 	s.mu.Unlock()
 	if signer == nil {
-		http.Error(w, "OIDC unavailable", 503)
+		http.Error(w, "OIDC unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	now := time.Now().UTC()
@@ -311,7 +323,7 @@ func (s *Server) oidcJWKS(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := json.Marshal(map[string]any{"keys": keys})
 	if err != nil {
-		http.Error(w, "internal server error", 500)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 	sum := sha256.Sum256(body)
@@ -330,7 +342,7 @@ func (s *Server) oidcJWKS(w http.ResponseWriter, r *http.Request) {
 func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 	iss, err := s.oidcIssuer()
 	if err != nil {
-		http.Error(w, err.Error(), 503)
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 	jobID := r.PathValue("id")
@@ -341,7 +353,7 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.TrimSpace(in.Audience) == "" || len(in.Audience) > 512 {
-		http.Error(w, "audience is required", 400)
+		http.Error(w, "audience is required", http.StatusBadRequest)
 		return
 	}
 	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
@@ -359,38 +371,38 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !j.OIDCAllowed {
-		http.Error(w, "job does not have permissions.id_token", 403)
+		http.Error(w, "job does not have permissions.id_token", http.StatusForbidden)
 		return
 	}
 	// Defense in depth: admission already denies OIDC for untrusted jobs.
 	if !j.Trusted {
-		http.Error(w, "untrusted jobs may not issue id_tokens", 403)
+		http.Error(w, "untrusted jobs may not issue id_tokens", http.StatusForbidden)
 		return
 	}
 	// Per-job audience allowlist compiled from capabilities at enqueue time;
 	// nil means any audience.
 	if j.OIDCAudiences != nil && !containsString(j.OIDCAudiences, in.Audience) {
-		http.Error(w, "audience not allowed for this job", 403)
+		http.Error(w, "audience not allowed for this job", http.StatusForbidden)
 		return
 	}
 	if j.Status != model.StatusRunning || j.LeaseExpiresAt == nil || !j.LeaseExpiresAt.After(now) {
-		http.Error(w, "job lease is not active", 409)
+		http.Error(w, "job lease is not active", http.StatusConflict)
 		return
 	}
 	if len(j.LeaseTokenHash) == 0 || subtle.ConstantTimeCompare(hashLeaseToken(s.leaseKey, token), j.LeaseTokenHash) != 1 {
-		http.Error(w, "invalid job token", 401)
+		http.Error(w, "invalid job token", http.StatusUnauthorized)
 		return
 	}
 	sub := "repo:" + run.RepoFullName + ":ref:" + run.Ref + ":job:" + j.Key
 	jti, err := newID()
 	if err != nil {
-		http.Error(w, "internal server error", 500)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 	claims := map[string]any{"iss": iss, "sub": sub, "aud": in.Audience, "iat": now.Unix(), "nbf": now.Add(-5 * time.Second).Unix(), "exp": now.Add(5 * time.Minute).Unix(), "jti": jti, "repository": run.RepoFullName, "ref": run.Ref, "sha": run.SHA, "event": run.Event, "run_id": run.ID, "job_id": j.ID, "job": j.Key, "environment": j.Environment, "trusted": j.Trusted}
 	jwt, err := s.signJWT(signer, claims)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	s.auditLocked("oidc.issued", j.LeaseRunnerID, j.RunID, j.ID, "OIDC id_token issued", map[string]string{"job": j.Key, "audience": in.Audience, "kid": signer.KID})

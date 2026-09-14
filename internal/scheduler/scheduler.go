@@ -197,7 +197,13 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 		if !satisfiesLabels(ri.Labels, candidate.RequiredLabels) {
 			continue
 		}
-		if len(candidate.PlacementRegions) > 0 && ri.Region != "" && !containsStr(candidate.PlacementRegions, ri.Region) {
+		// Placement regions: a region-constrained job only leases to a
+		// runner whose region is in the set. A runner without a region can
+		// never satisfy the constraint (empty region fails matching).
+		if len(candidate.PlacementRegions) > 0 && ri.Region == "" {
+			continue
+		}
+		if len(candidate.PlacementRegions) > 0 && !containsStr(candidate.PlacementRegions, ri.Region) {
 			continue
 		}
 		jobs, ok := runJobs[candidate.RunID]
@@ -314,6 +320,82 @@ func (s *DBScheduler) CancelRun(ctx context.Context, runID, reason string) error
 		return err
 	}
 	return nil
+}
+
+// CancelJobsByRunner is the runner disable kill switch: it invalidates every
+// active lease the runner holds in one pass. Each running job either
+// requeues (attempts++ and the infrastructure retry budget still available)
+// or cancels; lease fields are cleared so a stale lease token is dead, the
+// runner's counters are released, dependent jobs and run statuses are
+// recomputed, and audit events are emitted through the store. It returns
+// the number of invalidated leases.
+func (s *DBScheduler) CancelJobsByRunner(ctx context.Context, runnerID, reason string) (int, error) {
+	if runnerID == "" {
+		return 0, fmt.Errorf("scheduler: cancel jobs by runner: empty runner id")
+	}
+	rj, ok := s.Store.(storage.RunnerJobStore)
+	if !ok {
+		return 0, fmt.Errorf("scheduler: store does not support listing jobs by runner")
+	}
+	jobs, err := rj.ListJobsByRunner(ctx, runnerID)
+	if err != nil {
+		return 0, err
+	}
+	now := time.Now().UTC()
+	affected := map[string]map[string]model.Job{}
+	count := 0
+	var firstErr error
+	for _, j := range jobs {
+		if j.Status != model.StatusRunning {
+			continue
+		}
+		j.Attempts++
+		if j.Attempts <= j.MaxInfraRetries {
+			j.Status = model.StatusQueued
+			j.Error = reason + "; retrying"
+			s.appendAudit(ctx, "job.runner_disabled_requeued", "admin", j.RunID, j.ID, reason, map[string]string{"job": j.Key, "runner": runnerID})
+		} else {
+			fin := now
+			j.Status = model.StatusCancelled
+			j.Error = reason
+			j.FinishedAt = &fin
+			s.appendAudit(ctx, "job.runner_disabled_cancelled", "admin", j.RunID, j.ID, reason, map[string]string{"job": j.Key, "runner": runnerID})
+		}
+		j.LeaseRunnerID = ""
+		j.LeaseTokenHash = nil
+		j.LeaseExpiresAt = nil
+		if err := s.Store.UpdateJob(ctx, j); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			log.Printf("scheduler: kill switch: update job %s: %v", j.ID, err)
+			continue
+		}
+		if err := s.Store.ReleaseRunnerJob(ctx, runnerID, j.ID, model.StatusFailure); err != nil && !errors.Is(err, storage.ErrNotFound) {
+			log.Printf("scheduler: kill switch: release runner %s job %s: %v", runnerID, j.ID, err)
+		}
+		count++
+		if affected[j.RunID] == nil {
+			affected[j.RunID] = map[string]model.Job{}
+		}
+		affected[j.RunID][j.ID] = j
+	}
+	for runID := range affected {
+		all, err := s.Store.ListJobsByRun(ctx, runID)
+		if err != nil {
+			log.Printf("scheduler: kill switch: list run %s jobs: %v", runID, err)
+			continue
+		}
+		jobs := make(map[string]model.Job, len(all))
+		for _, j := range all {
+			jobs[j.ID] = j
+		}
+		s.recomputeDependents(ctx, jobs)
+		if run, err := s.Store.GetRun(ctx, runID); err == nil {
+			s.recomputeRun(ctx, run, jobs)
+		}
+	}
+	return count, firstErr
 }
 
 // RecoverExpired requeues or fails jobs whose leases expired, mirrors the

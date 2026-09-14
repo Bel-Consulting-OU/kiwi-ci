@@ -39,12 +39,22 @@ func (*NativeBackend) Run(ctx context.Context, c Command, emit func(string)) err
 	cmd.Dir = c.Dir
 	cmd.Env = c.Env
 	configureProcess(cmd)
-	cleanup := setupChildJob(cmd)
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
 	if err := cmd.Start(); err != nil {
-		cleanup()
 		return &RunError{Kind: ErrorInfra, Err: err}
+	}
+	// superviseChildNow must run synchronously here: after cmd.Start() has
+	// materialized cmd.Process and before any supervision goroutine reads it.
+	// On Windows it creates the Job Object and assigns the just-started child
+	// before returning, so no goroutine can observe an unassigned process.
+	cleanup, err := superviseChildNow(cmd, nil)
+	if err != nil {
+		_ = stdout.Close()
+		_ = stderr.Close()
+		_ = terminateProcess(cmd)
+		_ = cmd.Wait()
+		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("attach child process supervision: %w", err)}
 	}
 	done := make(chan struct{}, 2)
 	go func() { defer func() { done <- struct{}{} }(); streamLines(stdout, defaultMaxLine, emit) }()

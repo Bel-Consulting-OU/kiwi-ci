@@ -184,12 +184,13 @@ const schemaSource = `{
           "type": "array",
           "items": {
             "enum": [
+              "any",
+              "artifact",
+              "cache",
+              "command",
               "failure",
               "infra",
-              "timeout",
-              "cancelled",
-              "command",
-              "any"
+              "timeout"
             ]
           }
         }
@@ -326,7 +327,8 @@ const schemaSource = `{
         },
         "shards": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "maximum": 1024
         },
         "retry_failed": {
           "type": "integer",

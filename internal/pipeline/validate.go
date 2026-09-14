@@ -21,21 +21,30 @@ const (
 	maxEnvValueBytes  = 64 << 10
 	maxArtifactDefs   = 128
 	maxOutputKeys     = 256
+	maxShardsPerJob   = 1024
 )
 
 var (
 	idRegexp      = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.-]{0,127}$`)
 	envNameRegexp = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 	labelRegexp   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9.:_-]{0,63}$`)
+	// inputNameRegexp pins the input identifier grammar: a leading ASCII
+	// letter or underscore followed by up to 63 letters, digits,
+	// underscores or hyphens.
+	inputNameRegexp = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]{0,63}$`)
 
 	shellNames = map[string]bool{
 		"": true, "bash": true, "sh": true, "zsh": true, "pwsh": true,
 		"powershell": true, "fish": true, "dash": true, "ksh": true, "python": true,
 	}
 	networkModes = map[string]bool{"": true, "bridge": true, "host": true, "none": true}
+	// retryClasses is the executor's retry-class vocabulary. "cancelled" is
+	// deliberately absent: the executor never retries cancellations, and a
+	// pipeline that declares it fails validation instead of silently
+	// relying on a semantic that never fires.
 	retryClasses = map[string]bool{
+		"any": true, "artifact": true, "cache": true, "command": true,
 		"failure": true, "infra": true, "timeout": true,
-		"cancelled": true, "command": true, "any": true,
 	}
 	interpContexts = map[string]bool{
 		"matrix": true, "needs": true, "steps": true, "env": true, "github": true,
@@ -78,6 +87,9 @@ func Validate(s *Spec) error {
 		if strings.TrimSpace(name) == "" {
 			return fmt.Errorf("secret name cannot be empty")
 		}
+	}
+	if err := validateInputs(s); err != nil {
+		return err
 	}
 	for id, j := range s.Jobs {
 		if !idRegexp.MatchString(id) {
@@ -161,7 +173,14 @@ func ValidateLimits(s *Spec) error {
 		if combos == 0 {
 			combos = 1
 		}
-		totalExpanded += combos
+		shardCount := 1
+		if j.Tests.Shards > maxShardsPerJob {
+			return fmt.Errorf("job %q tests.shards %d exceeds the limit of %d", id, j.Tests.Shards, maxShardsPerJob)
+		}
+		if j.Tests.Shards > 0 {
+			shardCount = j.Tests.Shards
+		}
+		totalExpanded += combos * shardCount
 	}
 	if totalExpanded > maxExpandedJobs {
 		return fmt.Errorf("pipeline expands to %d jobs, limit is %d", totalExpanded, maxExpandedJobs)
@@ -419,6 +438,14 @@ func validateJob(s *Spec, id string, j Job) error {
 	if j.Tests.Shards < 0 || j.Tests.RetryFailed < 0 {
 		return fmt.Errorf("job %q tests shards/retry_failed must not be negative", id)
 	}
+	if j.Tests.Shards > 0 {
+		if _, reserved := j.Matrix["test_shard"]; reserved {
+			return fmt.Errorf("job %q matrix dimension %q is reserved for tests.shards", id, "test_shard")
+		}
+	}
+	if err := checkRelPath(fmt.Sprintf("job %q tests.manifest", id), j.Tests.Manifest); err != nil {
+		return err
+	}
 	for name, pkg := range s.Packages {
 		if err := checkRelPath(fmt.Sprintf("package %q", name), pkg.Paths...); err != nil {
 			return err
@@ -548,6 +575,40 @@ func validateDuration(d Duration, where string) error {
 	return nil
 }
 
+// validateInputs enforces the input identifier grammar and the env
+// projection contract: no two declared inputs may project to the same
+// KIWI_INPUT_<NAME> environment variable under the canonical projection
+// (pipeline.ProjectInputName). CompileWithInputs and the server's
+// enqueue-time injection use the same projection, so a colliding spec
+// would otherwise silently shadow an input value.
+func validateInputs(s *Spec) error {
+	names := make([]string, 0, len(s.Inputs))
+	for name := range s.Inputs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return checkInputNames(names)
+}
+
+// checkInputNames validates each input name against the identifier grammar
+// and rejects name sets that collide under the canonical env projection.
+// Both declared inputs (Validate) and provided inputs (CompileWithInputs)
+// go through this check.
+func checkInputNames(names []string) error {
+	seen := map[string]string{}
+	for _, name := range names {
+		if !inputNameRegexp.MatchString(name) {
+			return fmt.Errorf("input name %q is invalid (must match %s)", name, inputNameRegexp.String())
+		}
+		proj := ProjectInputName(name)
+		if prev, dup := seen[proj]; dup {
+			return fmt.Errorf("inputs %q and %q both project to KIWI_INPUT_%s", prev, name, proj)
+		}
+		seen[proj] = name
+	}
+	return nil
+}
+
 func validateRetry(r Retry, where string) error {
 	if r.Max < 0 {
 		return fmt.Errorf("%s max must not be negative", where)
@@ -557,7 +618,7 @@ func validateRetry(r Retry, where string) error {
 	}
 	for _, class := range r.On {
 		if !retryClasses[strings.ToLower(strings.TrimSpace(class))] {
-			return fmt.Errorf("%s has invalid retry class %q (want one of failure, infra, timeout, cancelled, command, any)", where, class)
+			return fmt.Errorf("%s has invalid retry class %q (want one of any, artifact, cache, command, failure, infra, timeout)", where, class)
 		}
 	}
 	return nil

@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -182,6 +183,21 @@ type Server struct {
 	// dataDir is the persistent state root ("" for in-memory servers).
 	dataDir string
 
+	// ClusterKeys, when non-nil, is the shared key store backing every
+	// signing material (lease HMAC key, OIDC ring, provenance key, cache
+	// signing key, web session secret, runner CA) so replicas of an HA
+	// control plane verify each other's tokens (see clusterkeys.go).
+	ClusterKeys ClusterKeyStore
+
+	// RunnerClientCAPool is the trust pool of runner client CAs. When
+	// non-nil, presented client certificates are verified against it at
+	// the TLS handshake (see TLSConfig). Derived from RunnerCA by the app
+	// wiring when runner mTLS is enabled.
+	RunnerClientCAPool *x509.CertPool
+	// RequireRunnerClientCerts rejects connections without a valid runner
+	// client certificate at the handshake (tls.RequireAndVerifyClientCert).
+	RequireRunnerClientCerts bool
+
 	// contracts holds the per-job artifact contract sets (memory mode;
 	// DB mode persists them through ArtifactContractStore).
 	contracts map[string]map[string]storage.ArtifactContract
@@ -199,6 +215,11 @@ type Server struct {
 	// crl maps revoked runner certificate serials to runner IDs; persisted
 	// as runner-crl.json under dataDir (crl.go).
 	crl map[string]string
+
+	// secretReceipts is the durable one-time secret delivery record keyed by
+	// (jobID, generation, secret name); persisted as secrets-receipts.json
+	// under dataDir (secret.go). Guarded by s.mu.
+	secretReceipts map[string]bool
 
 	// history is the persistent test-intelligence history (testshards.go).
 	history *testintelHistory
@@ -307,39 +328,77 @@ func loadLeaseKey(root string) ([]byte, error) {
 }
 
 func NewPersistent(runnerToken, adminToken, dataDir string) (*Server, error) {
+	// The filesystem cluster key store under dataDir reproduces the legacy
+	// per-file key layout exactly (see FSClusterKeyStore), so existing
+	// deployments keep their key material and behavior unchanged while the
+	// cluster identity is present for HA validation.
+	return NewPersistentWithCluster(runnerToken, adminToken, dataDir, &FSClusterKeyStore{Dir: dataDir})
+}
+
+// NewPersistentWithCluster is NewPersistent with an explicit cluster key
+// store. A nil store keeps the legacy data-dir loaders. When the store is
+// non-nil every signing material loads and persists through it.
+func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster ClusterKeyStore) (*Server, error) {
 	if adminToken == "" {
 		adminToken = runnerToken
 	}
 	s := New(runnerToken)
 	s.AdminToken = adminToken
 	s.dataDir = dataDir
+	s.ClusterKeys = cluster
 	s.store = storage.New(dataDir)
 	s.outbox = NewOutbox(s.store)
-	if signer, err := loadOIDCSigner(dataDir); err != nil {
-		return nil, err
+	if cluster != nil {
+		if signer, err := s.loadOIDCSignerCluster(cluster); err != nil {
+			return nil, err
+		} else {
+			s.oidc = signer
+		}
+		if err := s.loadLeaseKeyCluster(cluster); err != nil {
+			return nil, err
+		}
+		if err := s.loadRunnerCACluster(cluster); err != nil {
+			return nil, err
+		}
+		if err := s.loadProvenanceCluster(cluster); err != nil {
+			return nil, err
+		}
+		if err := s.loadCacheSignerCluster(cluster); err != nil {
+			return nil, err
+		}
+		if err := s.loadWebSessionCluster(cluster); err != nil {
+			return nil, err
+		}
 	} else {
-		s.oidc = signer
-	}
-	key, err := loadLeaseKey(dataDir)
-	if err != nil {
-		return nil, err
-	}
-	s.leaseKey = key
-	if err := s.loadRunnerCA(dataDir); err != nil {
-		return nil, err
-	}
-	// Distinct signing roots: artifact provenance, cache manifests and web
-	// session cookies each get their own persisted key material.
-	if err := s.loadProvenanceKey(dataDir); err != nil {
-		return nil, err
-	}
-	if err := s.loadCacheSigner(dataDir); err != nil {
-		return nil, err
-	}
-	if err := s.loadWebSessionSecret(dataDir); err != nil {
-		return nil, err
+		if signer, err := loadOIDCSigner(dataDir); err != nil {
+			return nil, err
+		} else {
+			s.oidc = signer
+		}
+		key, err := loadLeaseKey(dataDir)
+		if err != nil {
+			return nil, err
+		}
+		s.leaseKey = key
+		if err := s.loadRunnerCA(dataDir); err != nil {
+			return nil, err
+		}
+		// Distinct signing roots: artifact provenance, cache manifests and web
+		// session cookies each get their own persisted key material.
+		if err := s.loadProvenanceKey(dataDir); err != nil {
+			return nil, err
+		}
+		if err := s.loadCacheSigner(dataDir); err != nil {
+			return nil, err
+		}
+		if err := s.loadWebSessionSecret(dataDir); err != nil {
+			return nil, err
+		}
 	}
 	if err := s.loadCRL(dataDir); err != nil {
+		return nil, err
+	}
+	if err := s.loadSecretReceipts(dataDir); err != nil {
 		return nil, err
 	}
 	if err := s.loadTestintelHistory(dataDir); err != nil {
@@ -497,8 +556,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/schedules", s.listSchedules)
 	mux.HandleFunc("PUT /api/v1/schedules", s.upsertSchedule)
 	mux.HandleFunc("POST /api/v1/schedules/{id}/trigger", s.triggerSchedule)
-	mux.HandleFunc("GET /api/v1/cache/{key}", s.downloadCache)
-	mux.HandleFunc("PUT /api/v1/cache/{key}", s.uploadCache)
+	// Cache transport is a job-lease operation: the namespace derives from
+	// the leased job's repository and trust domain, never from client
+	// headers (see P0-3 in blobs.go).
+	mux.HandleFunc("GET /api/v1/jobs/{id}/cache/{key}", s.downloadJobCache)
+	mux.HandleFunc("PUT /api/v1/jobs/{id}/cache/{key}", s.uploadJobCache)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/approve", s.approveJob)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/heartbeat", s.heartbeat)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/log", s.log)
@@ -538,15 +600,14 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Path
-		if strings.HasPrefix(path, "/hooks/") || path == "/" || strings.HasPrefix(path, "/static/") || path == "/api/v1/login" || path == "/api/v1/logout" || path == "/readiness" || path == "/liveness" || path == "/.well-known/openid-configuration" || path == "/api/v1/oidc/jwks" || (r.Method == http.MethodPost && strings.HasSuffix(path, "/oidc")) {
+		switch classifyRoute(r) {
+		case tierPublic:
 			next.ServeHTTP(w, r)
 			return
-		}
-		// Runner enrollment authenticates with the enrollment token instead
-		// of the runner token; the certificate it returns is what the runner
-		// uses for everything after.
-		if path == "/api/v1/runners/enroll" && r.Method == http.MethodPost {
+		case tierEnroll:
+			// Runner enrollment authenticates with the enrollment token instead
+			// of the runner token; the certificate it returns is what the runner
+			// uses for everything after.
 			if s.RunnerEnrollToken == "" || s.RunnerCA == nil {
 				http.Error(w, "not found", http.StatusNotFound)
 				return
@@ -557,59 +618,70 @@ func (s *Server) auth(next http.Handler) http.Handler {
 			}
 			next.ServeHTTP(w, r)
 			return
-		}
-		// Runner drain/disable/enable are admin-tier operations: a runner
-		// token must never be able to disable its peers or itself.
-		runnerAdminOp := strings.HasPrefix(path, "/api/v1/runners/") && (strings.HasSuffix(path, "/drain") || strings.HasSuffix(path, "/disable") || strings.HasSuffix(path, "/enable"))
-		runnerOnly := (!runnerAdminOp && strings.HasPrefix(path, "/api/v1/runners/")) || path == "/api/v1/runners/register" || strings.HasPrefix(path, "/api/v1/cache/") || (strings.HasPrefix(path, "/api/v1/jobs/") && (strings.Contains(path, "/artifacts/") || strings.Contains(path, "/dependencies/") || strings.HasSuffix(path, "/heartbeat") || strings.HasSuffix(path, "/log") || strings.HasSuffix(path, "/complete") || strings.HasSuffix(path, "/generated") || strings.HasSuffix(path, "/tests") || strings.HasSuffix(path, "/test-shards") || strings.HasSuffix(path, "/secrets") || strings.HasSuffix(path, "/snapshots")))
-		sharedRead := r.Method == http.MethodGet && (strings.HasPrefix(path, "/api/v1/artifacts/") || (strings.HasPrefix(path, "/api/v1/runs/") && strings.HasSuffix(path, "/artifacts")))
-		if sharedRead {
-			if s.AdminToken != "" && !bearerOK(r.Header.Get("Authorization"), s.AdminToken) && !bearerOK(r.Header.Get("Authorization"), s.RunnerToken) {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
-			}
-			next.ServeHTTP(w, r)
-			return
-		}
-		if runnerOnly {
+		case tierRunner:
+			// Runner-tier routes: only the runner token bearer may pass.
+			// Handlers enforce the lease and mTLS identity binding on top.
 			if s.RunnerToken != "" && !bearerOK(r.Header.Get("Authorization"), s.RunnerToken) {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
 			next.ServeHTTP(w, r)
 			return
-		}
-		// Web sessions: a valid kiwi_session cookie authorizes admin-tier
-		// routes like the admin bearer token. Mutating requests
-		// authenticated this way must also present the double-submit CSRF
-		// token in the X-Kiwi-CSRF header.
-		if s.webSessionOK(r) {
-			if webMutatingMethod(r.Method) && !s.webCSRFOK(r) {
-				http.Error(w, "invalid csrf token", http.StatusForbidden)
-				return
-			}
-			next.ServeHTTP(w, r)
-			return
-		}
-		// Admin-tier routes: the AdminToken bearer, a store principal with
-		// the admin role, or any authenticated store principal on the RBAC
-		// action routes (per-action roles are enforced in the handlers via
-		// requireAction). Nothing configured is the legacy open mode.
-		if !s.adminOK(r) {
-			if s.AdminToken == "" && (s.AuthStore == nil || s.AuthStore.Empty()) {
+		case tierRBAC:
+			// RBAC action routes: the per-action role (read, artifact_read,
+			// run, approve, cancel, rerun, runner_manage, policy_manage) is
+			// enforced in the handlers via requireAction with the resolved
+			// repository scope. Web sessions authenticate as admin-tier; a
+			// store principal is required otherwise.
+			if s.webSessionOK(r) {
+				if webMutatingMethod(r.Method) && !s.webCSRFOK(r) {
+					http.Error(w, "invalid csrf token", http.StatusForbidden)
+					return
+				}
 				next.ServeHTTP(w, r)
 				return
 			}
-			if !rbacActionRoute(r) {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
+			if s.adminOK(r) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if s.AdminToken == "" && (s.AuthStore == nil || s.AuthStore.Empty()) {
+				// Legacy open mode: nothing is configured, so there is no
+				// identity to authorize against.
+				next.ServeHTTP(w, r)
 				return
 			}
 			if _, ok := auth.PrincipalFrom(r); !ok {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
+			next.ServeHTTP(w, r)
+			return
+		case tierAdmin:
+			// Web sessions: a valid kiwi_session cookie authorizes admin-tier
+			// routes like the admin bearer token. Mutating requests
+			// authenticated this way must also present the double-submit CSRF
+			// token in the X-Kiwi-CSRF header.
+			if s.webSessionOK(r) {
+				if webMutatingMethod(r.Method) && !s.webCSRFOK(r) {
+					http.Error(w, "invalid csrf token", http.StatusForbidden)
+					return
+				}
+				next.ServeHTTP(w, r)
+				return
+			}
+			// Admin-tier routes: the AdminToken bearer or a store principal
+			// with the admin role. Nothing configured is the legacy open mode.
+			if !s.adminOK(r) {
+				if s.AdminToken == "" && (s.AuthStore == nil || s.AuthStore.Empty()) {
+					next.ServeHTTP(w, r)
+					return
+				}
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			next.ServeHTTP(w, r)
 		}
-		next.ServeHTTP(w, r)
 	})
 }
 
@@ -621,22 +693,6 @@ func (s *Server) adminOK(r *http.Request) bool {
 	}
 	p, ok := auth.PrincipalFrom(r)
 	return ok && p.Has(auth.RoleAdmin)
-}
-
-// rbacActionRoute identifies the admin API routes whose permissions are
-// enforced per action by requireAction rather than by the admin-only gate.
-func rbacActionRoute(r *http.Request) bool {
-	switch {
-	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/runs":
-		return true
-	case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/approve"):
-		return true
-	case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/cancel"):
-		return true
-	case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/rerun"):
-		return true
-	}
-	return false
 }
 
 // requireAction enforces the per-action RBAC decision for authenticated
@@ -706,7 +762,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	if !s.requireAction(w, r, auth.ActionRun, in.RepoURL, false) {
+	if !s.requireAction(w, r, auth.ActionRun, auth.CanonicalRepoID(repoHost(in.RepoURL), in.RepoFullName), false) {
 		return
 	}
 	// Direct API submissions are never trusted; only the forge webhook path
@@ -1061,6 +1117,12 @@ func branchFromRef(ref string) string {
 }
 
 func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAction(w, r, auth.ActionRead, "", false) {
+		return
+	}
+	// Scoped list: non-admin principals see only the repositories their
+	// grants cover.
+	visible := func(run model.Run) bool { return s.repoVisible(r, run) }
 	if s.DB != nil {
 		out, err := s.DB.ListRuns(r.Context(), 1000)
 		if err != nil {
@@ -1069,6 +1131,9 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 		}
 		dto := make([]v1.RunDTO, 0, len(out))
 		for _, v := range out {
+			if !visible(v) {
+				continue
+			}
 			dto = append(dto, v1.RunDTOFrom(v))
 		}
 		writeJSON(w, http.StatusOK, dto)
@@ -1078,6 +1143,9 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.Unlock()
 	out := make([]model.Run, 0, len(s.runs))
 	for _, v := range s.runs {
+		if !visible(v) {
+			continue
+		}
 		out = append(out, v)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
@@ -1099,6 +1167,9 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
+		if !s.requireRunRead(w, r, v) {
+			return
+		}
 		writeJSON(w, http.StatusOK, v1.RunDTOFrom(v))
 		return
 	}
@@ -1109,16 +1180,23 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if !s.requireRunRead(w, r, v) {
+		return
+	}
 	writeJSON(w, http.StatusOK, v1.RunDTOFrom(v))
 }
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
 	if s.DB != nil {
-		if _, err := s.DB.GetRun(r.Context(), runID); errors.Is(err, storage.ErrNotFound) {
+		run, err := s.DB.GetRun(r.Context(), runID)
+		if errors.Is(err, storage.ErrNotFound) {
 			http.NotFound(w, r)
 			return
 		} else if err != nil {
 			http.Error(w, err.Error(), 500)
+			return
+		}
+		if !s.requireRunRead(w, r, run) {
 			return
 		}
 		jobs, err := s.DB.ListJobsByRun(r.Context(), runID)
@@ -1135,8 +1213,12 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.runs[runID]; !ok {
+	run, ok := s.runs[runID]
+	if !ok {
 		http.NotFound(w, r)
+		return
+	}
+	if !s.requireRunRead(w, r, run) {
 		return
 	}
 	out := make([]v1.JobDTO, 0)
@@ -1157,6 +1239,18 @@ func redactJob(j model.Job) model.Job { j.Pipeline = ""; j.LeaseTokenHash = nil;
 
 func (s *Server) getLogs(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	run, err := s.runForAuth(r.Context(), id)
+	if errors.Is(err, storage.ErrNotFound) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if !s.requireRunRead(w, r, run) {
+		return
+	}
 	after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	if s.DB != nil {
@@ -1301,6 +1395,12 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, in)
 }
 func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAction(w, r, auth.ActionRead, "", false) {
+		return
+	}
+	// Scoped list: a repository-scoped principal sees runners that serve
+	// (or are about to serve) its repositories; idle runners carry no
+	// repository data and stay visible.
 	if s.DB != nil {
 		out, err := s.DB.ListRunners(r.Context())
 		if err != nil {
@@ -1309,15 +1409,25 @@ func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
 		}
 		dto := make([]v1.RunnerDTO, 0, len(out))
 		for _, x := range out {
+			if !s.runnerVisible(r, x) {
+				continue
+			}
 			dto = append(dto, v1.RunnerDTOFrom(x))
 		}
 		writeJSON(w, http.StatusOK, dto)
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]model.Runner, 0, len(s.runners))
+	snapshot := make([]model.Runner, 0, len(s.runners))
 	for _, x := range s.runners {
+		snapshot = append(snapshot, x)
+	}
+	s.mu.Unlock()
+	out := make([]model.Runner, 0, len(snapshot))
+	for _, x := range snapshot {
+		if !s.runnerVisible(r, x) {
+			continue
+		}
 		out = append(out, x)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
@@ -1328,11 +1438,43 @@ func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, dto)
 }
 
+// runnerVisible reports whether a runner is visible to the request's
+// principal. Runners without active jobs are visible to any reader; runners
+// with active jobs are visible when at least one of those jobs' repositories
+// is.
+func (s *Server) runnerVisible(r *http.Request, ri model.Runner) bool {
+	if len(ri.ActiveJobs) == 0 {
+		return true
+	}
+	allowed, restricted := s.visibleRepos(r)
+	if !restricted {
+		return true
+	}
+	for _, jobID := range ri.ActiveJobs {
+		job, err := s.jobForLease(r.Context(), jobID)
+		if err != nil {
+			continue
+		}
+		run, err := s.runForAuth(r.Context(), job.RunID)
+		if err != nil {
+			continue
+		}
+		canon := canonicalRepoForRun(run)
+		if allowed[canon] || allowed[run.RepoFullName] || allowed[auth.CanonicalRepoID("", run.RepoFullName)] {
+			return true
+		}
+	}
+	return false
+}
+
 // runnerDrain marks a runner as draining: it finishes its active jobs and
 // receives no new leases. next() advertises the state via the
 // X-Kiwi-Draining header so a drained runner exits its poll loop.
 func (s *Server) runnerDrain(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if !s.requireAction(w, r, auth.ActionRunnerManage, "", false) {
+		return
+	}
 	if s.DB != nil {
 		ri, err := s.DB.GetRunner(r.Context(), id)
 		if errors.Is(err, storage.ErrNotFound) {
@@ -1366,6 +1508,18 @@ func (s *Server) runnerDrain(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, ri)
 }
 
+// revokeRunnerDB invalidates every active lease held by the runner through
+// the SQL scheduler: running jobs requeue (retry budget permitting) or
+// cancel, their lease fields are cleared, and audit events are emitted.
+// It is the DB-mode half of the runner disable kill switch and returns the
+// number of invalidated leases.
+func (s *Server) revokeRunnerDB(ctx context.Context, runnerID, reason string) (int, error) {
+	if s.Sched == nil {
+		return 0, errors.New("server: db runner revocation requires the sql scheduler")
+	}
+	return s.Sched.CancelJobsByRunner(ctx, runnerID, reason)
+}
+
 // runnerDisable takes a runner out of service: it is marked disabled, its
 // active jobs are cancelled with "runner disabled", and next() refuses to
 // lease to it. Re-registration cannot clear the flag. In mTLS mode the
@@ -1374,6 +1528,9 @@ func (s *Server) runnerDrain(w http.ResponseWriter, r *http.Request) {
 func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	actor := actorFrom(r)
+	if !s.requireAction(w, r, auth.ActionRunnerManage, "", false) {
+		return
+	}
 	if s.DB != nil {
 		ri, err := s.DB.GetRunner(r.Context(), id)
 		if errors.Is(err, storage.ErrNotFound) {
@@ -1393,6 +1550,15 @@ func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
+		// The disable flag alone does not stop a job already in flight: the
+		// kill switch atomically invalidates every active lease held by the
+		// runner so no further work can run.
+		revoked, err := s.revokeRunnerDB(r.Context(), id, "runner disabled")
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		s.metricAdd("kiwi_runner_killswitch_jobs_total", float64(revoked), nil)
 		s.revokeRunnerCert(ri, actor)
 		s.auditLocked("runner.disable", actor, "", "", "runner disabled", map[string]string{"runner": id})
 		writeJSON(w, http.StatusOK, ri)
@@ -1441,6 +1607,9 @@ func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
 // draining flags.
 func (s *Server) runnerEnable(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if !s.requireAction(w, r, auth.ActionRunnerManage, "", false) {
+		return
+	}
 	if s.DB != nil {
 		ri, err := s.DB.GetRunner(r.Context(), id)
 		if errors.Is(err, storage.ErrNotFound) {
@@ -2124,7 +2293,7 @@ func (s *Server) approveJob(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if !s.requireAction(w, r, auth.ActionApprove, j.RepoURL, false) {
+	if !s.requireAction(w, r, auth.ActionApprove, canonicalRepoForJob(j), false) {
 		return
 	}
 	s.mu.Lock()
@@ -2168,7 +2337,7 @@ func (s *Server) approveJobDB(w http.ResponseWriter, r *http.Request, jobID, act
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	if !s.requireAction(w, r, auth.ActionApprove, j.RepoURL, false) {
+	if !s.requireAction(w, r, auth.ActionApprove, canonicalRepoForJob(j), false) {
 		return
 	}
 	if !j.ApprovalRequired {
@@ -2226,7 +2395,7 @@ func (s *Server) rerunRun(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if !s.requireAction(w, r, auth.ActionRerun, old.Repo, false) {
+	if !s.requireAction(w, r, auth.ActionRerun, canonicalRepoForRun(old), false) {
 		return
 	}
 	meta := cloneMap(old.Metadata)
@@ -2276,7 +2445,7 @@ func (s *Server) rerunRunDB(w http.ResponseWriter, r *http.Request, id string) {
 		http.NotFound(w, r)
 		return
 	}
-	if !s.requireAction(w, r, auth.ActionRerun, old.Repo, false) {
+	if !s.requireAction(w, r, auth.ActionRerun, canonicalRepoForRun(old), false) {
 		return
 	}
 	meta := cloneMap(old.Metadata)
@@ -2309,7 +2478,7 @@ func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if !s.requireAction(w, r, auth.ActionCancel, run.Repo, false) {
+	if !s.requireAction(w, r, auth.ActionCancel, canonicalRepoForRun(run), false) {
 		return
 	}
 	s.mu.Lock()
@@ -2339,7 +2508,7 @@ func (s *Server) cancelRunDB(w http.ResponseWriter, r *http.Request, id, actor s
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	if !s.requireAction(w, r, auth.ActionCancel, run.Repo, false) {
+	if !s.requireAction(w, r, auth.ActionCancel, canonicalRepoForRun(run), false) {
 		return
 	}
 	reason := "cancelled by " + actor

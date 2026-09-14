@@ -131,11 +131,15 @@ func (s *Server) listSnapshots(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.DB != nil {
-		if _, err := s.DB.GetRun(r.Context(), runID); errors.Is(err, storage.ErrNotFound) {
+		run, err := s.DB.GetRun(r.Context(), runID)
+		if errors.Is(err, storage.ErrNotFound) {
 			http.NotFound(w, r)
 			return
 		} else if err != nil {
 			http.Error(w, err.Error(), 500)
+			return
+		}
+		if !s.requireRunRead(w, r, run) {
 			return
 		}
 		out := []model.SnapshotRecord{}
@@ -163,8 +167,12 @@ func (s *Server) listSnapshots(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, out)
 		return
 	}
-	if _, ok := s.runs[runID]; !ok {
+	run, ok := s.runs[runID]
+	if !ok {
 		http.NotFound(w, r)
+		return
+	}
+	if !s.requireRunRead(w, r, run) {
 		return
 	}
 	out := []model.SnapshotRecord{}
@@ -190,6 +198,14 @@ func (s *Server) downloadSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 	if rec.RunID != r.PathValue("id") {
 		http.NotFound(w, r)
+		return
+	}
+	run, err := s.runForAuth(r.Context(), rec.RunID)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if !s.requireRunRead(w, r, run) {
 		return
 	}
 	f, err := os.Open(rec.Path)

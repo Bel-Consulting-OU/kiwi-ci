@@ -2,6 +2,9 @@ package executor
 
 import (
 	"context"
+	"io"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -93,6 +96,85 @@ func TestTartImmutableRefRejected(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "tart not found") {
 		t.Fatalf("digest check ran after tart lookup: %v", err)
+	}
+}
+
+// TestTartSSHArgsAreHardened asserts every ssh argument set the tart backend
+// constructs carries the hardened, job-scoped posture — StrictHostKeyChecking
+// accept-new pinned to the per-job known_hosts file, IdentitiesOnly=yes, and
+// -i with the ephemeral per-job key — and that no insecure host-verification
+// options (StrictHostKeyChecking=no, UserKnownHostsFile=/dev/null) appear
+// anywhere in the constructed args.
+func TestTartSSHArgsAreHardened(t *testing.T) {
+	b := &TartBackend{sshDir: "/tmp/kiwi-ssh-42", ip: "192.0.2.1"}
+	args := b.hardenedSSHArgs("admin@"+b.ip, "true")
+	if !contains(args, "StrictHostKeyChecking=accept-new") {
+		t.Fatalf("missing accept-new host-key posture: %v", args)
+	}
+	if !contains(args, "UserKnownHostsFile="+b.knownHostsFile()) {
+		t.Fatalf("missing per-job known_hosts file: %v", args)
+	}
+	if !contains(args, "IdentitiesOnly=yes") {
+		t.Fatalf("missing IdentitiesOnly=yes: %v", args)
+	}
+	if !contains(args, "-i") {
+		t.Fatalf("missing -i flag: %v", args)
+	}
+	if !contains(args, b.keyFile()) {
+		t.Fatalf("missing ephemeral key path: %v", args)
+	}
+	joined := strings.Join(args, " ")
+	for _, insecure := range []string{"StrictHostKeyChecking=no", "UserKnownHostsFile=/dev/null", "/dev/null"} {
+		if strings.Contains(joined, insecure) {
+			t.Fatalf("insecure ssh option %q present in %v", insecure, args)
+		}
+	}
+}
+
+// TestTartSSHAuthFailureIsHardError simulates ssh exiting 255 (the ssh(1)
+// authentication/host-key failure code) with a fake ssh script that records
+// every invocation, and asserts the tart backend fails hard: exactly one ssh
+// invocation, no retry, and no insecure options in the args the fake ssh
+// received.
+func TestTartSSHAuthFailureIsHardError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake ssh script is a POSIX shell script")
+	}
+	dir := t.TempDir()
+	record := filepath.Join(dir, "invocations")
+	fake := filepath.Join(dir, "ssh")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + shellQuote(record) + "\necho 'Permission denied (publickey).' >&2\nexit 255\n"
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b := &TartBackend{ssh: fake, ip: "192.0.2.1", sshDir: dir}
+	consume := func(r io.Reader) error {
+		_, err := io.ReadAll(r)
+		return err
+	}
+	err := b.sshRun(context.Background(), nil, "true", consume, consume)
+	if err == nil {
+		t.Fatal("expected hard error on ssh exit 255")
+	}
+	if !strings.Contains(err.Error(), "255") {
+		t.Fatalf("error does not surface the ssh exit code: %v", err)
+	}
+	lines, rerr := os.ReadFile(record)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	invocations := strings.Split(strings.TrimSpace(string(lines)), "\n")
+	if len(invocations) != 1 || invocations[0] == "" {
+		t.Fatalf("ssh invocations = %q, want exactly one", lines)
+	}
+	argsLine := invocations[0]
+	if !strings.Contains(argsLine, "IdentitiesOnly=yes") || !strings.Contains(argsLine, "-i "+b.keyFile()) {
+		t.Fatalf("invocation is missing hardened identity options: %s", argsLine)
+	}
+	for _, insecure := range []string{"StrictHostKeyChecking=no", "UserKnownHostsFile=/dev/null", "/dev/null"} {
+		if strings.Contains(argsLine, insecure) {
+			t.Fatalf("insecure ssh option %q present in invocation: %s", insecure, argsLine)
+		}
 	}
 }
 

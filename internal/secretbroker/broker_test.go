@@ -19,7 +19,7 @@ func TestSealOpenRoundTrip(t *testing.T) {
 	copy(pubArr[:], pub)
 	plain := []byte("s3cr3t-value-with-arbitrary-bytes \x00\xff")
 
-	env, err := SealEnvelope(plain, pubArr)
+	env, err := SealEnvelope(plain, pubArr, nil)
 	if err != nil {
 		t.Fatalf("SealEnvelope: %v", err)
 	}
@@ -30,7 +30,7 @@ func TestSealOpenRoundTrip(t *testing.T) {
 	privArr := priv.Bytes()
 	var key [32]byte
 	copy(key[:], privArr)
-	got, err := OpenEnvelope(env, key)
+	got, err := OpenEnvelope(env, key, nil)
 	if err != nil {
 		t.Fatalf("OpenEnvelope: %v", err)
 	}
@@ -50,14 +50,35 @@ func TestOpenEnvelopeWrongKeyFails(t *testing.T) {
 	}
 	var pubArr [32]byte
 	copy(pubArr[:], priv.PublicKey().Bytes())
-	env, err := SealEnvelope([]byte("classified"), pubArr)
+	env, err := SealEnvelope([]byte("classified"), pubArr, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var otherKey [32]byte
 	copy(otherKey[:], other.Bytes())
-	if _, err := OpenEnvelope(env, otherKey); err == nil {
+	if _, err := OpenEnvelope(env, otherKey, nil); err == nil {
 		t.Fatal("expected error opening with wrong key")
+	}
+}
+
+func TestOpenEnvelopeWrongAADFails(t *testing.T) {
+	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pubArr [32]byte
+	copy(pubArr[:], priv.PublicKey().Bytes())
+	env, err := SealEnvelope([]byte("classified"), pubArr, []byte("kiwi-secret-v1\x00runner-1\x00job-1\x007\x00tok"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var key [32]byte
+	copy(key[:], priv.Bytes())
+	if _, err := OpenEnvelope(env, key, []byte("kiwi-secret-v1\x00runner-2\x00job-1\x007\x00tok")); err == nil {
+		t.Fatal("expected error opening with different aad")
+	}
+	if got, err := OpenEnvelope(env, key, []byte("kiwi-secret-v1\x00runner-1\x00job-1\x007\x00tok")); err != nil || string(got) != "classified" {
+		t.Fatalf("matching aad must decrypt: got %q, %v", got, err)
 	}
 }
 
@@ -68,7 +89,7 @@ func TestOpenEnvelopeTamperFails(t *testing.T) {
 	}
 	var pubArr [32]byte
 	copy(pubArr[:], priv.PublicKey().Bytes())
-	env, err := SealEnvelope([]byte("classified"), pubArr)
+	env, err := SealEnvelope([]byte("classified"), pubArr, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,14 +99,14 @@ func TestOpenEnvelopeTamperFails(t *testing.T) {
 	tampered := env
 	tampered.Ciphertext = append([]byte(nil), env.Ciphertext...)
 	tampered.Ciphertext[len(tampered.Ciphertext)/2] ^= 0x01
-	if _, err := OpenEnvelope(tampered, key); err == nil {
+	if _, err := OpenEnvelope(tampered, key, nil); err == nil {
 		t.Fatal("expected error opening tampered ciphertext")
 	}
 
 	tampered = env
 	tampered.Nonce = append([]byte(nil), env.Nonce...)
 	tampered.Nonce[0] ^= 0x01
-	if _, err := OpenEnvelope(tampered, key); err == nil {
+	if _, err := OpenEnvelope(tampered, key, nil); err == nil {
 		t.Fatal("expected error opening tampered nonce")
 	}
 }
@@ -97,14 +118,14 @@ func TestOpenEnvelopeBadNonceLength(t *testing.T) {
 	}
 	var pubArr [32]byte
 	copy(pubArr[:], priv.PublicKey().Bytes())
-	env, err := SealEnvelope([]byte("x"), pubArr)
+	env, err := SealEnvelope([]byte("x"), pubArr, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var key [32]byte
 	copy(key[:], priv.Bytes())
 	env.Nonce = []byte("short")
-	if _, err := OpenEnvelope(env, key); err == nil {
+	if _, err := OpenEnvelope(env, key, nil); err == nil {
 		t.Fatal("expected error for short nonce")
 	}
 }

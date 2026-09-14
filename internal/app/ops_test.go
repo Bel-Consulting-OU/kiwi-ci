@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -183,14 +184,30 @@ func TestOpsRequiresRunID(t *testing.T) {
 func TestOpsLogsFollow(t *testing.T) {
 	dataDir := t.TempDir()
 	st := storage.New(dataDir)
-	for i := int64(1); i <= 3; i++ {
-		if err := st.AppendLog(model.LogEntry{Seq: i, RunID: "run1", JobID: "j1", JobKey: "build", Step: "s", Line: "line", CreatedAt: time.Now().UTC()}); err != nil {
-			t.Fatal(err)
-		}
-	}
 	srv, err := server.NewPersistent("secret", "secret", dataDir)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Seed a real run through the API so the scoped read path (which
+	// resolves the run's repository before serving logs) authorizes it.
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/runs",
+		strings.NewReader(`{"repo_url":"https://github.com/acme/app.git","repo_full_name":"acme/app","ref":"refs/heads/main","sha":"abc","event":"push","pipeline":"version: 1\njobs:\n  build:\n    runtime: container\n    image: alpine\n    steps:\n      - run: echo ok\n"}`))
+	req.Header.Set("Authorization", "Bearer secret")
+	submit := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(submit, req)
+	if submit.Code != http.StatusOK && submit.Code != http.StatusAccepted {
+		t.Fatalf("submit: %d %s", submit.Code, submit.Body.String())
+	}
+	var run struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(submit.Body.Bytes(), &run); err != nil {
+		t.Fatal(err)
+	}
+	for i := int64(1); i <= 3; i++ {
+		if err := st.AppendLog(model.LogEntry{Seq: i, RunID: run.ID, JobID: "j1", JobKey: "build", Step: "s", Line: "line", CreatedAt: time.Now().UTC()}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	srv.LogStreamIdleTimeout = 300 * time.Millisecond
 	ts := httptest.NewServer(srv.Handler())
@@ -198,7 +215,7 @@ func TestOpsLogsFollow(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	err = Ops(ctx, "logs", []string{"--server", ts.URL, "--token", "secret", "--follow", "run1"})
+	err = Ops(ctx, "logs", []string{"--server", ts.URL, "--token", "secret", "--follow", run.ID})
 	if err != nil {
 		t.Fatalf("logs --follow: %v", err)
 	}

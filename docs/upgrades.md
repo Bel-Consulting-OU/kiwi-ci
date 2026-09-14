@@ -83,3 +83,36 @@ redeploying the old binary plus its data directory files.
   tokens) are stable across restarts within protocol v3.
 - Deployment and snapshot records are memory-backed; treat them as
   ephemeral across upgrades until their persistence lands.
+
+## Dependency upgrade policy
+
+- Dependabot opens weekly pull requests for Go modules (`gomod`,
+  commit prefix `deps`) and GitHub Actions (`github-actions`, commit
+  prefix `ci`), capped at 5 open PRs per ecosystem
+  (`.github/dependabot.yml`). A full CI matrix runs on every
+  dependency PR; merge only when it is green.
+- CI tooling versions are pinned, not floating:
+  - `staticcheck` `honnef.co/go/tools/cmd/staticcheck@v0.6.1`
+    (staticcheck 2025.1.1): the latest release compatible with the
+    repository's Go 1.23 toolchain. Newer releases require Go 1.25+;
+    when the module's `go` directive is bumped, move the pin forward
+    in `.github/workflows/ci.yml` and re-run the baseline.
+  - `govulncheck` `golang.org/x/vuln/cmd/govulncheck@v1.1.4`: the
+    latest release compatible with Go 1.23, used both in CI and as a
+    release gate.
+  - Workflow actions are pinned to full commit SHAs; a tag move
+    cannot change what CI runs. When upgrading an action, resolve the
+    new tag to its commit SHA (`gh api repos/<owner>/<repo>/commits/<tag>`)
+    and update the tag→SHA comment next to the step.
+- Upgrading the Go toolchain (the `go` directive in `go.mod` and the
+  `go-version` inputs in the workflows) must happen before bumping
+  the staticcheck/govulncheck pins, and is a separate PR from
+  dependency bumps so bisection stays clean.
+- Docker base images are digest-pinned in the `Dockerfile`; re-resolve
+  digests (`docker buildx imagetools inspect <image>`) whenever the
+  image tag is bumped.
+- Release signing is mandatory: `scripts/release.sh` fails closed
+  without `KIWI_RELEASE_SIGNING_KEY`. Unsigned releases are only
+  possible through an explicit `allow_unsigned` workflow dispatch
+  (`KIWI_ALLOW_UNSIGNED_RELEASE=1`) and must be treated as a
+  disaster-recovery exception, never the norm.

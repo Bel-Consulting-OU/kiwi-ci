@@ -253,6 +253,13 @@ type ArtifactLookupStore interface {
 	GetArtifact(ctx context.Context, id string) (model.ArtifactRecord, error)
 }
 
+// RunnerJobStore lists the currently running jobs leased by one runner. It
+// backs the runner disable kill switch: the control plane invalidates every
+// active lease the runner holds in one atomic pass.
+type RunnerJobStore interface {
+	ListJobsByRunner(ctx context.Context, runnerID string) ([]model.Job, error)
+}
+
 // ValidateID checks the canonical control-plane identifier format produced
 // by the server's crypto/rand ID generator: 32 lowercase hex characters.
 // Runs, jobs, runners, artifacts, reports, and audit events all share it.

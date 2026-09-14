@@ -3,11 +3,11 @@
 # ---------------------------------------------------------------------------
 # Build stage.
 #
-# Pin this image by digest before cutting a release, e.g.
-#   docker buildx imagetools inspect golang:1.23-alpine
-# then replace the tag with golang:1.23-alpine@sha256:<digest>.
+# Pinned by digest (multi-arch OCI index) on 2026-09-14:
+#   golang:1.23-alpine@sha256:383395b794dffa5b53012a212365d40c8e37109a626ca30d6151c8348d380b5f
+# Re-resolve before bumping the Go minor: docker buildx imagetools inspect golang:1.23-alpine
 # ---------------------------------------------------------------------------
-FROM golang:1.23-alpine AS build
+FROM golang:1.23-alpine@sha256:383395b794dffa5b53012a212365d40c8e37109a626ca30d6151c8348d380b5f AS build
 
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
@@ -34,16 +34,16 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # ---------------------------------------------------------------------------
 # Runtime stage.
 #
-# Pin this image by digest before cutting a release, e.g.
-#   docker buildx imagetools inspect gcr.io/distroless/static-debian12:nonroot
-# then replace the tag with gcr.io/distroless/static-debian12@sha256:<digest>.
+# Pinned by digest (multi-arch OCI index) on 2026-09-14:
+#   gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
+# Re-resolve before bumping: docker buildx imagetools inspect gcr.io/distroless/static-debian12:nonroot
 #
 # distroless has no shell and no package manager, so a Dockerfile HEALTHCHECK
 # instruction is not possible; orchestrators must probe the HTTP endpoints
 # instead: GET /readiness (ready to serve; checks the store in DB mode) and
 # GET /liveness (process up). The image runs as the nonroot uid 65532.
 # ---------------------------------------------------------------------------
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 
 ARG VERSION=dev
 ARG COMMIT=unknown

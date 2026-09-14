@@ -47,19 +47,23 @@ func TestMetricsCallSitesIncrement(t *testing.T) {
 	if v := counterValue(s, "kiwi_secret_deliveries_total"); v != 1 {
 		t.Fatalf("secret deliveries = %v, want 1", v)
 	}
-	// Cache endpoints record hits/misses/bytes.
+	// Cache endpoints record hits/misses/bytes via the job-lease routes;
+	// the namespace is derived from the leased job.
 	key := strings.Repeat("a", 64)
-	dir := s.store.Root
-	if err := writeCacheBlob(dir, key, []byte("cached-data")); err != nil {
+	s.mu.Lock()
+	cj := s.jobs[task.Job.ID]
+	s.mu.Unlock()
+	repo, trust := cacheNamespace(cj)
+	if err := writeCacheBlob(s.store.Root, cacheFileKey(repo, trust, key), []byte("cached-data")); err != nil {
 		t.Fatal(err)
 	}
-	if w := doJSON(t, s, http.MethodGet, "/api/v1/cache/"+key, "token", ""); w.Code != http.StatusOK {
-		t.Fatalf("cache get = %d", w.Code)
+	if w := doJSONHeaders(t, s, http.MethodGet, "/api/v1/jobs/"+task.Job.ID+"/cache/"+key, "token", "", hdrs); w.Code != http.StatusOK {
+		t.Fatalf("cache get = %d: %s", w.Code, w.Body.String())
 	}
 	if v := counterValue(s, "kiwi_cache_hits_total"); v != 1 {
 		t.Fatalf("cache hits = %v, want 1", v)
 	}
-	if w := doJSON(t, s, http.MethodGet, "/api/v1/cache/"+strings.Repeat("b", 64), "token", ""); w.Code != http.StatusNotFound {
+	if w := doJSONHeaders(t, s, http.MethodGet, "/api/v1/jobs/"+task.Job.ID+"/cache/"+strings.Repeat("b", 64), "token", "", hdrs); w.Code != http.StatusNotFound {
 		t.Fatalf("cache miss = %d", w.Code)
 	}
 	if v := counterValue(s, "kiwi_cache_misses_total"); v != 1 {

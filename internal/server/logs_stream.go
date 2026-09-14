@@ -33,6 +33,22 @@ const (
 // Streaming requires a persistent store; in-memory servers answer 503.
 func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if s.DB == nil && s.store == nil {
+		http.Error(w, "log streaming requires a persistent server", http.StatusServiceUnavailable)
+		return
+	}
+	run, err := s.runForAuth(r.Context(), id)
+	if errors.Is(err, storage.ErrNotFound) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if !s.requireRunRead(w, r, run) {
+		return
+	}
 	after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	if limit <= 0 || limit > logStreamMaxChunk {
@@ -50,10 +66,6 @@ func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request) {
 	fl, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
-		return
-	}
-	if s.DB == nil && s.store == nil {
-		http.Error(w, "log streaming requires a persistent server", http.StatusServiceUnavailable)
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")

@@ -1,12 +1,14 @@
 package app
 
 import (
+	"crypto/tls"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/blob"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/config"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runnerpki"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
 )
 
@@ -18,6 +20,52 @@ var (
 	_ drainableServer = (*server.Server)(nil)
 	_ blobStoreSetter = (*server.Server)(nil)
 )
+
+// tlsConfigBuilder is the compile-checkable adoption seam for the server's
+// listener TLS configuration: the app wires Server.TLSConfig into the
+// http.Server so runner client certificates are verified at the handshake.
+type tlsConfigBuilder interface {
+	TLSConfig(certFile, keyFile string) (*tls.Config, error)
+}
+
+var _ tlsConfigBuilder = (*server.Server)(nil)
+
+// clusterKeyAdopter is the compile-checkable adoption seam for the server's
+// shared cluster key store (NewPersistentWithCluster).
+var _ server.ClusterKeyStore = (*server.FSClusterKeyStore)(nil)
+
+func TestApplyRunnerTLSConfig(t *testing.T) {
+	ca, err := runnerpki.NewCA("test-runner-ca", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Run("runner CA populates pool and requirement", func(t *testing.T) {
+		s := server.New("runner-token")
+		s.RunnerCA = ca
+		applyRunnerTLSConfig(s, true)
+		if s.RunnerClientCAPool == nil {
+			t.Fatal("RunnerClientCAPool not populated")
+		}
+		if !s.RequireRunnerClientCerts {
+			t.Fatal("RequireRunnerClientCerts = false, want true")
+		}
+	})
+	t.Run("optional client certs", func(t *testing.T) {
+		s := server.New("runner-token")
+		s.RunnerCA = ca
+		applyRunnerTLSConfig(s, false)
+		if s.RunnerClientCAPool == nil || s.RequireRunnerClientCerts {
+			t.Fatalf("verify-if-given not honored: pool=%v require=%t", s.RunnerClientCAPool, s.RequireRunnerClientCerts)
+		}
+	})
+	t.Run("no runner CA leaves bearer mode untouched", func(t *testing.T) {
+		s := server.New("runner-token")
+		applyRunnerTLSConfig(s, true)
+		if s.RunnerClientCAPool != nil || s.RequireRunnerClientCerts {
+			t.Fatalf("bearer-token server got runner cert settings: pool=%v require=%t", s.RunnerClientCAPool, s.RequireRunnerClientCerts)
+		}
+	})
+}
 
 func TestValidateProductionConfig(t *testing.T) {
 	valid := productionConfig{

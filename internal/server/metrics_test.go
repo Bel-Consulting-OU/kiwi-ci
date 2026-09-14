@@ -109,7 +109,7 @@ func TestMetricsPathClass(t *testing.T) {
 		{"/api/v1/runs/r1/logs", "logs"},
 		{"/api/v1/jobs/j1/log", "logs"},
 		{"/api/v1/runs/r1/artifacts", "artifacts"},
-		{"/api/v1/cache/key", "cache"},
+		{"/api/v1/jobs/j1/cache/key", "cache"},
 		{"/api/v1/runners", "runners"},
 		{"/api/v1/runners/r1/next", "runners"},
 		{"/api/v1/runs", "runs"},

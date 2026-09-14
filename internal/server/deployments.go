@@ -86,11 +86,15 @@ func (s *Server) recordDeployment(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listDeployments(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
 	if s.DB != nil {
-		if _, err := s.DB.GetRun(r.Context(), runID); err == storage.ErrNotFound {
+		run, err := s.DB.GetRun(r.Context(), runID)
+		if err == storage.ErrNotFound {
 			http.NotFound(w, r)
 			return
 		} else if err != nil {
 			http.Error(w, err.Error(), 500)
+			return
+		}
+		if !s.requireRunRead(w, r, run) {
 			return
 		}
 		out := []model.Deployment{}
@@ -119,8 +123,12 @@ func (s *Server) listDeployments(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.runs[runID]; !ok {
+	run, ok := s.runs[runID]
+	if !ok {
 		http.NotFound(w, r)
+		return
+	}
+	if !s.requireRunRead(w, r, run) {
 		return
 	}
 	out := []model.Deployment{}

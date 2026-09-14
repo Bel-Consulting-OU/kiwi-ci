@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
@@ -168,8 +169,12 @@ func (s *Server) persistSchedulesLocked() error {
 	return marshalJSONFile(joinDataDir(s.dataDir, schedulesFile), f)
 }
 
-// listSchedules implements GET /api/v1/schedules (admin tier).
+// listSchedules implements GET /api/v1/schedules. Authorization requires
+// the policy-manage role (or admin).
 func (s *Server) listSchedules(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAction(w, r, auth.ActionPolicyManage, "", false) {
+		return
+	}
 	if ss, ok := s.scheduleStoreDB(); ok {
 		out, err := ss.ListSchedules(r.Context())
 		if err != nil {
@@ -190,9 +195,13 @@ func (s *Server) listSchedules(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// upsertSchedule implements PUT /api/v1/schedules (admin tier). The spec
-// is the full pipeline text; its on.schedule.cron drives firing.
+// upsertSchedule implements PUT /api/v1/schedules. Authorization requires
+// the policy-manage role (or admin). The spec is the full pipeline text;
+// its on.schedule.cron drives firing.
 func (s *Server) upsertSchedule(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAction(w, r, auth.ActionPolicyManage, "", false) {
+		return
+	}
 	var in scheduleRequest
 	if !decode(w, r, &in) {
 		return
@@ -290,8 +299,12 @@ func (s *Server) upsertSchedule(w http.ResponseWriter, r *http.Request) {
 }
 
 // triggerSchedule implements POST /api/v1/schedules/{id}/trigger: it fires
-// the schedule immediately for the current nominal minute.
+// the schedule immediately for the current nominal minute. Authorization
+// requires the policy-manage role (or admin).
 func (s *Server) triggerSchedule(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAction(w, r, auth.ActionPolicyManage, "", false) {
+		return
+	}
 	id := r.PathValue("id")
 	actor := actorFrom(r)
 	sc, err := s.scheduleByID(r.Context(), id)

@@ -26,6 +26,9 @@ func TestStreamLogsDeliversAndResumes(t *testing.T) {
 		t.Fatal(err)
 	}
 	runID := "run1"
+	s.mu.Lock()
+	s.runs[runID] = model.Run{ID: runID, Repo: "https://github.com/kiwi/repo.git", RepoFullName: "kiwi/repo", Status: model.StatusRunning}
+	s.mu.Unlock()
 	appendLog := func(seq int64, line string) {
 		t.Helper()
 		if err := s.store.AppendLog(model.LogEntry{Seq: seq, RunID: runID, JobID: "j1", JobKey: "build", Step: "s", Line: line, CreatedAt: time.Now().UTC()}); err != nil {
@@ -61,6 +64,9 @@ func TestStreamLogsIdleTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.LogStreamIdleTimeout = 200 * time.Millisecond
+	s.mu.Lock()
+	s.runs["nope"] = model.Run{ID: "nope", Repo: "https://github.com/kiwi/repo.git", RepoFullName: "kiwi/repo", Status: model.StatusRunning}
+	s.mu.Unlock()
 	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
 	ctx, cancel := context.WithCancel(context.Background())

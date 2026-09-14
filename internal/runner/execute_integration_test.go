@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/snapshot"
 )
@@ -34,7 +36,6 @@ type fakeRunnerServer struct {
 	complete []server.Complete
 	// snapshotBodies holds the raw bytes of every snapshot upload.
 	snapshotBodies [][]byte
-	testShardQuery []string
 }
 
 type recordedRequest struct {
@@ -55,9 +56,6 @@ func (f *fakeRunnerServer) handler() http.Handler {
 		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/snapshots") {
 			f.snapshotBodies = append(f.snapshotBodies, body)
 		}
-		if strings.Contains(r.URL.Path, "/test-shards") {
-			f.testShardQuery = append(f.testShardQuery, r.URL.RawQuery)
-		}
 		f.requests = append(f.requests, recordedRequest{Method: r.Method, Path: r.URL.Path, Header: r.Header.Clone()})
 		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/complete") {
 			var c server.Complete
@@ -66,11 +64,7 @@ func (f *fakeRunnerServer) handler() http.Handler {
 		}
 		f.mu.Unlock()
 		switch {
-		case strings.HasSuffix(r.URL.Path, "/test-shards"):
-			idx := "1"
-			total := "4"
-			_, _ = io.WriteString(w, `{"env_contract":{"KIWI_TEST_SHARD_TOTAL":"`+total+`","KIWI_TEST_SHARD_INDEX":"`+idx+`"}}`)
-		case strings.HasPrefix(r.URL.Path, "/api/v1/cache/") && r.Method == http.MethodGet:
+		case strings.HasPrefix(r.URL.Path, "/api/v1/jobs/") && strings.Contains(r.URL.Path, "/cache/") && r.Method == http.MethodGet:
 			http.NotFound(w, r)
 		default:
 			w.WriteHeader(http.StatusOK)
@@ -277,16 +271,27 @@ func TestExecuteUploadsAttestationsBeforePayloadAndSnapshot(t *testing.T) {
 		t.Fatal("snapshot archive has no entries")
 	}
 
-	// Cache PUT carries the repository/trust-domain contract headers.
-	h := fsrv.headerOf(http.MethodPut, "/api/v1/cache/")
+	// Cache PUT targets the job-scoped route with the runner lease
+	// contract headers. The old repository/trust-domain contract headers
+	// must never be sent (the server derives them from the job).
+	h := fsrv.headerOf(http.MethodPut, "/api/v1/jobs/job-1/cache/")
 	if h == nil {
-		t.Fatal("no cache PUT recorded")
+		t.Fatal("no cache PUT recorded on the job-scoped route")
 	}
-	if got := h.Get("X-Kiwi-Repository"); got != "https://github.com/acme/app.git" {
-		t.Fatalf("cache PUT X-Kiwi-Repository = %q", got)
+	if got := h.Get("X-Kiwi-Runner-ID"); got != "runner-1" {
+		t.Fatalf("cache PUT X-Kiwi-Runner-ID = %q, want runner-1", got)
 	}
-	if got := h.Get("X-Kiwi-Trust-Domain"); got != "trusted" {
-		t.Fatalf("cache PUT X-Kiwi-Trust-Domain = %q", got)
+	if got := h.Get("X-Kiwi-Lease-Token"); got != "lease-token" {
+		t.Fatalf("cache PUT X-Kiwi-Lease-Token = %q, want lease-token", got)
+	}
+	if got := h.Get("X-Kiwi-Lease-Generation"); got != "3" {
+		t.Fatalf("cache PUT X-Kiwi-Lease-Generation = %q, want 3", got)
+	}
+	if got := h.Get("X-Kiwi-Repository"); got != "" {
+		t.Fatalf("cache PUT must not send X-Kiwi-Repository, got %q", got)
+	}
+	if got := h.Get("X-Kiwi-Trust-Domain"); got != "" {
+		t.Fatalf("cache PUT must not send X-Kiwi-Trust-Domain, got %q", got)
 	}
 
 	c, ok := fsrv.lastComplete()
@@ -298,14 +303,72 @@ func TestExecuteUploadsAttestationsBeforePayloadAndSnapshot(t *testing.T) {
 	}
 }
 
+// TestCompileExpandsShardedJobIntoVariants asserts the compile-time shard
+// reality: tests.shards expands into N compiled jobs, each with the shard
+// matrix key and the env contract baked in. No runtime endpoint exists.
+func TestCompileExpandsShardedJobIntoVariants(t *testing.T) {
+	base := "version: 1\njobs:\n  build:\n    tests:\n      shards: 3\n    steps:\n      - run: echo shard $KIWI_TEST_SHARD_INDEX/$KIWI_TEST_SHARD_TOTAL\n"
+	spec, err := pipeline.Parse([]byte(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := pipeline.Compile(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(g.Jobs) != 3 {
+		t.Fatalf("compiled %d jobs, want 3 shard variants", len(g.Jobs))
+	}
+	for i := 0; i < 3; i++ {
+		id := "build[test_shard=" + strconv.Itoa(i) + "]"
+		cj, ok := g.Jobs[id]
+		if !ok {
+			t.Fatalf("missing compiled variant %q", id)
+		}
+		if got := cj.Matrix["test_shard"]; got != strconv.Itoa(i) {
+			t.Errorf("%s matrix test_shard = %q, want %d", id, got, i)
+		}
+		if got := cj.Job.Env["KIWI_TEST_SHARD_TOTAL"]; got != "3" {
+			t.Errorf("%s KIWI_TEST_SHARD_TOTAL = %q, want 3", id, got)
+		}
+		if got := cj.Job.Env["KIWI_TEST_SHARD_INDEX"]; got != strconv.Itoa(i) {
+			t.Errorf("%s KIWI_TEST_SHARD_INDEX = %q, want %d", id, got, i)
+		}
+	}
+}
+
 func TestExecuteInjectsTestShardEnv(t *testing.T) {
 	fsrv := &fakeRunnerServer{}
 	ts := httptest.NewServer(fsrv.handler())
 	defer ts.Close()
 
-	base := "version: 1\njobs:\n  build:\n    tests:\n      shards: 4\n    steps:\n      - run: test \"$KIWI_TEST_SHARD_TOTAL\" = \"4\" && test \"$KIWI_TEST_SHARD_INDEX\" = \"1\"\n"
+	// The compile-time reality: tests.shards expands into variants and each
+	// variant carries the shard env contract. The runner executes the
+	// variant the control plane leased; no runtime shard endpoint exists.
+	base := "version: 1\njobs:\n  build:\n    tests:\n      shards: 2\n    steps:\n      - run: test \"$KIWI_TEST_SHARD_TOTAL\" = \"2\" && test \"$KIWI_TEST_SHARD_INDEX\" = \"1\"\n"
+	spec, err := pipeline.Parse([]byte(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := pipeline.Compile(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(g.Jobs) != 2 {
+		t.Fatalf("compiled %d jobs, want 2 shard variants", len(g.Jobs))
+	}
+	variant := "build[test_shard=1]"
+	cj, ok := g.Jobs[variant]
+	if !ok {
+		t.Fatalf("no compiled variant %q", variant)
+	}
+	if got := cj.Job.Env["KIWI_TEST_SHARD_TOTAL"]; got != "2" || cj.Job.Env["KIWI_TEST_SHARD_INDEX"] != "1" {
+		t.Fatalf("variant env = %v, want KIWI_TEST_SHARD_TOTAL=2 KIWI_TEST_SHARD_INDEX=1", cj.Job.Env)
+	}
+
 	task := basicTask(base)
-	task.Job.CompiledJobPayload = buildPayload(t, base, "build")
+	task.Job.Key = variant
+	task.Job.CompiledJobPayload = buildPayload(t, base, variant)
 
 	r := testRunnerFor(t, ts, Config{CaptureSnapshots: false})
 	r.Cfg.CheckoutFn = func(_ context.Context, _ model.Job, dir string) error {
@@ -313,11 +376,10 @@ func TestExecuteInjectsTestShardEnv(t *testing.T) {
 	}
 	r.execute(context.Background(), task)
 
-	fsrv.mu.Lock()
-	queries := append([]string{}, fsrv.testShardQuery...)
-	fsrv.mu.Unlock()
-	if len(queries) != 1 || !strings.Contains(queries[0], "shards=4") || !strings.Contains(queries[0], "shard=1") {
-		t.Fatalf("test-shards queries = %v, want shards=4 shard=1", queries)
+	for _, p := range fsrv.pathsFor("/api/v1/jobs/job-1/") {
+		if strings.Contains(p, "test-shards") {
+			t.Fatalf("runner called the retired test-shards endpoint: %s", p)
+		}
 	}
 	c, ok := fsrv.lastComplete()
 	if !ok {
@@ -325,6 +387,129 @@ func TestExecuteInjectsTestShardEnv(t *testing.T) {
 	}
 	if c.Status != model.StatusSuccess {
 		t.Fatalf("shard env not honored: status=%s error=%s", c.Status, c.Error)
+	}
+}
+
+func TestExecuteRefusesCompiledJobWithoutShardAssignment(t *testing.T) {
+	fsrv := &fakeRunnerServer{}
+	ts := httptest.NewServer(fsrv.handler())
+	defer ts.Close()
+
+	base := "version: 1\njobs:\n  build:\n    steps:\n      - run: echo hi\n"
+	payload := buildPayload(t, base, "build")
+	var eff pipeline.CompiledJob
+	if err := json.Unmarshal(mustJSON(t, payload.EffectiveJob), &eff); err != nil {
+		t.Fatal(err)
+	}
+	eff.Job.Tests.Shards = 2
+	eff.Job.Env = nil
+	effJSON := mustJSON(t, eff)
+	sum := sha256.Sum256(effJSON)
+	payload.EffectiveJob = json.RawMessage(effJSON)
+	payload.JobDigest = hex.EncodeToString(sum[:])
+
+	task := basicTask(base)
+	task.Job.CompiledJobPayload = payload
+
+	r := testRunnerFor(t, ts, Config{CaptureSnapshots: false})
+	r.Cfg.CheckoutFn = func(_ context.Context, _ model.Job, dir string) error {
+		return os.WriteFile(filepath.Join(dir, "hello.txt"), []byte("hi"), 0o644)
+	}
+	r.execute(context.Background(), task)
+
+	c, ok := fsrv.lastComplete()
+	if !ok {
+		t.Fatal("no completion recorded")
+	}
+	if c.Status != model.StatusFailure {
+		t.Fatalf("status = %s, want failure", c.Status)
+	}
+	if !strings.Contains(c.Error, "compiled job lacks shard assignment") {
+		t.Fatalf("error = %q, want shard assignment refusal", c.Error)
+	}
+}
+
+func TestApplyEffectiveNetwork(t *testing.T) {
+	cases := []struct {
+		name       string
+		jobNetwork string
+		sandbox    pipeline.NetworkPolicy
+		ceiling    pipeline.NetworkPolicy
+		want       pipeline.NetworkPolicy
+		wantErr    bool
+	}{
+		{"default inherits services-only ceiling", "", pipeline.NetworkPolicyDefault, pipeline.NetworkPolicyServicesOnly, pipeline.NetworkPolicyServicesOnly, false},
+		{"default inherits none ceiling", "", pipeline.NetworkPolicyDefault, pipeline.NetworkPolicyNone, pipeline.NetworkPolicyNone, false},
+		{"explicit none stays none", "none", pipeline.NetworkPolicyDefault, pipeline.NetworkPolicyInternet, pipeline.NetworkPolicyNone, false},
+		{"internet request stays under internet ceiling", "", pipeline.NetworkPolicyInternet, pipeline.NetworkPolicyInternet, pipeline.NetworkPolicyInternet, false},
+		{"default under internet ceiling stays default", "", pipeline.NetworkPolicyDefault, pipeline.NetworkPolicyInternet, pipeline.NetworkPolicyDefault, false},
+		{"services-only stays under internet ceiling", "", pipeline.NetworkPolicyServicesOnly, pipeline.NetworkPolicyInternet, pipeline.NetworkPolicyServicesOnly, false},
+		{"internet request under none ceiling refused", "", pipeline.NetworkPolicyInternet, pipeline.NetworkPolicyNone, 0, true},
+		{"internet request under services-only ceiling refused", "", pipeline.NetworkPolicyInternet, pipeline.NetworkPolicyServicesOnly, 0, true},
+		{"services-only request under none ceiling refused", "", pipeline.NetworkPolicyServicesOnly, pipeline.NetworkPolicyNone, 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cj := &pipeline.CompiledJob{ID: "build", Job: pipeline.Job{Network: tc.jobNetwork, Sandbox: pipeline.Sandbox{Network: tc.sandbox}}}
+			err := applyEffectiveNetwork(cj, policy.Capabilities{Network: tc.ceiling})
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("network request accepted, want refusal")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("applyEffectiveNetwork: %v", err)
+			}
+			if cj.Job.Sandbox.Network != tc.want {
+				t.Fatalf("sandbox.network = %d, want %d", cj.Job.Sandbox.Network, tc.want)
+			}
+		})
+	}
+}
+
+// TestExecutePayloadNetworkCeilingRefused exercises the payload-path
+// refusal end to end: a compiled payload whose effective policy disallows
+// the network the job requests must fail the job, never execute it.
+func TestExecutePayloadNetworkCeilingRefused(t *testing.T) {
+	fsrv := &fakeRunnerServer{}
+	ts := httptest.NewServer(fsrv.handler())
+	defer ts.Close()
+
+	marker := filepath.Join(t.TempDir(), "must-not-run")
+	base := "version: 1\njobs:\n  build:\n    sandbox:\n      network: internet\n    steps:\n      - run: touch " + marker + "\n"
+	payload := buildPayload(t, base, "build")
+	payload.EffectivePolicy = mustJSON(t, policy.Capabilities{
+		NativeExecution: true,
+		Container:       true,
+		Tart:            true,
+		Network:         pipeline.NetworkPolicyNone,
+		Secrets:         map[string]bool{},
+		OIDC:            []string{},
+		CacheRead:       true,
+		CacheWrite:      true,
+	})
+	task := basicTask(base)
+	task.Job.CompiledJobPayload = payload
+
+	r := testRunnerFor(t, ts, Config{CaptureSnapshots: false})
+	r.Cfg.CheckoutFn = func(_ context.Context, _ model.Job, dir string) error {
+		return os.WriteFile(filepath.Join(dir, "hello.txt"), []byte("hi"), 0o644)
+	}
+	r.execute(context.Background(), task)
+
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("job ran despite the network policy ceiling refusing it")
+	}
+	c, ok := fsrv.lastComplete()
+	if !ok {
+		t.Fatal("no completion recorded")
+	}
+	if c.Status != model.StatusFailure {
+		t.Fatalf("status = %s, want failure", c.Status)
+	}
+	if !strings.Contains(c.Error, "egress") {
+		t.Fatalf("error = %q, want egress refusal", c.Error)
 	}
 }
 

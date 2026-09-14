@@ -17,7 +17,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"time"
 
@@ -357,7 +356,10 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// When the control plane attached the enqueue-time compilation record,
 	// verify its digests and execute the payload's EffectiveJob instead of
 	// recompiling/selecting locally. The baseline admission check above
-	// stays; the payload's effective policy narrows it further.
+	// stays; the payload's effective policy narrows it further. The
+	// effective network also comes from the payload (the compiled job's
+	// sandbox/network intersected with the effective policy ceiling), never
+	// from the legacy job.Network reinterpretation.
 	var cj pipeline.CompiledJob
 	if t.Job.CompiledJobPayload != nil {
 		var caps policy.Capabilities
@@ -370,6 +372,10 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		if policyOK {
 			if err := policy.ValidateAdmissionWithCapabilities(spec, caps); err != nil {
 				r.complete(parent, t, model.StatusFailure, fmt.Errorf("compiled payload policy admission: %w", err), nil)
+				return
+			}
+			if err := applyEffectiveNetwork(&cj, caps); err != nil {
+				r.complete(parent, t, model.StatusFailure, fmt.Errorf("compiled payload network admission: %w", err), nil)
 				return
 			}
 		}
@@ -385,8 +391,14 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 			r.complete(parent, t, model.StatusFailure, fmt.Errorf("compiled job %q not found", t.Job.Key), nil)
 			return
 		}
+		// Legacy path: the control plane did not attach a compilation
+		// record, so the job-level network field is authoritative.
+		cj.Job.Network = t.Job.Network
 	}
-	cj.Job.Network = t.Job.Network
+	if err := checkShardAssignment(cj); err != nil {
+		r.complete(parent, t, model.StatusFailure, err, nil)
+		return
+	}
 	masker := &secrets.Masker{}
 	if cj.Job.Permissions.IDToken {
 		if cj.Job.Env == nil {
@@ -405,13 +417,8 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		fmt.Printf("[%s/%s] %s\n", job, step, msg)
 		_ = r.post(parent, "/api/v1/jobs/"+t.Job.ID+"/log", server.LogLine{RunnerID: r.ID, LeaseToken: t.LeaseToken, LeaseGeneration: t.LeaseGeneration, JobKey: job, Step: step, Line: msg}, nil)
 	})
-	if cj.Job.Tests.Shards > 0 {
-		if err := r.applyTestShards(ctx, t, &cj); err != nil {
-			sink.WriteLine(cj.ID, "tests", "shard warning: "+err.Error())
-		}
-	}
 	provider := secrets.Chain{secrets.EnvProvider{Prefix: "KIWI_SECRET_"}, secrets.MacKeychainProvider{Service: "kiwi-ci"}}
-	cacheStore := r.newJobCache(t.Job.RepoURL, t.Job.Trusted, r.Metrics)
+	cacheStore := r.newJobCache(t, r.Metrics)
 	artifactStore := artifact.Default()
 	if r.Cfg.CacheRoot != "" {
 		artifactStore = &artifact.Store{Root: filepath.Join(r.Cfg.CacheRoot, "artifacts")}
@@ -454,55 +461,86 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	r.complete(parent, t, res.Status, runErr, res.Outputs)
 }
 
-// applyTestShards fetches the deterministic shard assignment for the job
-// from the control plane and injects the env_contract variables
-// (KIWI_TEST_SHARD_TOTAL / KIWI_TEST_SHARD_INDEX) into the job env. The
-// per-run shard index is derived from the lease attempt number (attempts
-// increment per lease, so each retry deterministically gets one shard
-// slice). Failures are returned to the caller, which logs them as warnings
-// and never fails the job.
-func (r *Runner) applyTestShards(ctx context.Context, t server.Task, cj *pipeline.CompiledJob) error {
-	shards := cj.Job.Tests.Shards
-	if shards < 1 {
+// checkShardAssignment verifies the compile-time shard contract: the
+// control plane compiles tests.shards = N (N > 1) into N jobs whose env
+// carries KIWI_TEST_SHARD_TOTAL and KIWI_TEST_SHARD_INDEX. A compiled job
+// missing the assignment is a configuration error, not something the runner
+// can reconstruct at runtime.
+func checkShardAssignment(cj pipeline.CompiledJob) error {
+	if cj.Job.Tests.Shards <= 1 {
 		return nil
 	}
-	idx := int(t.Job.Attempts) % shards
-	if idx < 0 {
-		idx = 0
-	}
-	url := r.Cfg.Server + "/api/v1/jobs/" + t.Job.ID + "/test-shards?shards=" + strconv.Itoa(shards) + "&shard=" + strconv.Itoa(idx)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
-	}
-	r.auth(req)
-	req.Header.Set("X-Kiwi-Runner-ID", r.ID)
-	req.Header.Set("X-Kiwi-Lease-Token", t.LeaseToken)
-	req.Header.Set("X-Kiwi-Lease-Generation", fmt.Sprint(t.LeaseGeneration))
-	resp, err := r.Client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("test-shards %s: %s", resp.Status, strings.TrimSpace(string(b)))
-	}
-	var out struct {
-		EnvContract map[string]string `json:"env_contract"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return err
-	}
-	if cj.Job.Env == nil {
-		cj.Job.Env = map[string]string{}
-	}
-	for k, v := range out.EnvContract {
-		if k != "" && v != "" {
-			cj.Job.Env[k] = v
-		}
+	total := cj.Job.Env["KIWI_TEST_SHARD_TOTAL"]
+	index := cj.Job.Env["KIWI_TEST_SHARD_INDEX"]
+	if total == "" || index == "" {
+		return fmt.Errorf("compiled job lacks shard assignment: %q declares tests.shards=%d without KIWI_TEST_SHARD_TOTAL/KIWI_TEST_SHARD_INDEX", cj.ID, cj.Job.Tests.Shards)
 	}
 	return nil
+}
+
+// applyEffectiveNetwork computes the minimal network policy for a payload
+// compiled job: the job's own request (sandbox.network, or network "none")
+// intersected with the payload's effective policy ceiling. A request that
+// exceeds the ceiling is refused; a default request (no explicit egress
+// declaration) inherits the ceiling. The result is written into the
+// compiled job's sandbox.network, which the executor backend derives
+// isolation from.
+func applyEffectiveNetwork(cj *pipeline.CompiledJob, caps policy.Capabilities) error {
+	requested := requestedNetworkPolicy(cj.Job)
+	ceiling := caps.Network
+	if ceiling == pipeline.NetworkPolicyDefault {
+		ceiling = pipeline.NetworkPolicyInternet
+	}
+	if requested != pipeline.NetworkPolicyDefault && networkPolicyStrength(requested) > networkPolicyStrength(ceiling) {
+		return fmt.Errorf("job requests network %s which exceeds the compiled policy ceiling %s", networkPolicyName(requested), networkPolicyName(ceiling))
+	}
+	effective := pipeline.NetworkPolicyDefault
+	if networkPolicyStrength(requested) < networkPolicyStrength(ceiling) {
+		effective = requested
+	} else if ceiling != pipeline.NetworkPolicyInternet {
+		effective = ceiling
+	}
+	if effective != pipeline.NetworkPolicyDefault {
+		cj.Job.Sandbox.Network = effective
+	}
+	return nil
+}
+
+// requestedNetworkPolicy mirrors the policy engine's derivation of the
+// network a job requests: an explicit sandbox.network declaration,
+// NetworkPolicyNone for network "none", and NetworkPolicyDefault otherwise.
+func requestedNetworkPolicy(j pipeline.Job) pipeline.NetworkPolicy {
+	if j.Network == "none" {
+		return pipeline.NetworkPolicyNone
+	}
+	return j.Sandbox.Network
+}
+
+// networkPolicyStrength orders network policies for least-privilege
+// comparison: None < ServicesOnly < Internet, with Default compared as
+// Internet.
+func networkPolicyStrength(p pipeline.NetworkPolicy) int {
+	switch p {
+	case pipeline.NetworkPolicyNone:
+		return 0
+	case pipeline.NetworkPolicyServicesOnly:
+		return 1
+	default:
+		return 2
+	}
+}
+
+func networkPolicyName(p pipeline.NetworkPolicy) string {
+	switch p {
+	case pipeline.NetworkPolicyNone:
+		return "none"
+	case pipeline.NetworkPolicyServicesOnly:
+		return "services-only"
+	case pipeline.NetworkPolicyInternet:
+		return "internet"
+	default:
+		return "default"
+	}
 }
 
 // checkoutTask provisions the job workspace: the default git checkout or

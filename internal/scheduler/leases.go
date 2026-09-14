@@ -12,11 +12,3 @@ func LeaseExpiry(now time.Time, dur time.Duration) time.Time {
 	}
 	return now.Add(dur)
 }
-
-// leaseDuration returns the configured lease duration or the default.
-func (s *DBScheduler) leaseDuration() time.Duration {
-	if s.LeaseDuration <= 0 {
-		return DefaultLeaseDuration
-	}
-	return s.LeaseDuration
-}

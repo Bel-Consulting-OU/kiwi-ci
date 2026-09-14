@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"sort"
 
-	"github.com/open-policy-agent/opa/ast"
-	"github.com/open-policy-agent/opa/rego"
+	"github.com/open-policy-agent/opa/v1/ast"
+	"github.com/open-policy-agent/opa/v1/rego"
 )
 
 // OPA integration is a fail-closed DENY GATE layered on top of the

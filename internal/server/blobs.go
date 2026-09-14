@@ -291,11 +291,15 @@ func jobStart(j model.Job) time.Time {
 func (s *Server) listArtifacts(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
 	if s.DB != nil {
-		if _, err := s.DB.GetRun(r.Context(), runID); errors.Is(err, storage.ErrNotFound) {
+		run, err := s.DB.GetRun(r.Context(), runID)
+		if errors.Is(err, storage.ErrNotFound) {
 			http.NotFound(w, r)
 			return
 		} else if err != nil {
 			http.Error(w, err.Error(), 500)
+			return
+		}
+		if !s.requireRunArtifactRead(w, r, run) {
 			return
 		}
 		out, err := s.DB.ListArtifacts(r.Context(), runID)
@@ -311,8 +315,16 @@ func (s *Server) listArtifacts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
+	run, ok := s.runs[runID]
+	if ok {
+		s.mu.Unlock()
+		if !s.requireRunArtifactRead(w, r, run) {
+			return
+		}
+		s.mu.Lock()
+	}
 	defer s.mu.Unlock()
-	if _, ok := s.runs[runID]; !ok {
+	if !ok {
 		http.NotFound(w, r)
 		return
 	}
@@ -335,6 +347,9 @@ func (s *Server) downloadArtifact(w http.ResponseWriter, r *http.Request) {
 	rec, err := s.artifactRecord(r.Context(), id)
 	if err != nil {
 		http.NotFound(w, r)
+		return
+	}
+	if !s.requireArtifactRead(w, r, rec) {
 		return
 	}
 	f, err := s.openArtifact(r.Context(), rec)
@@ -384,9 +399,76 @@ func (s *Server) openArtifact(ctx context.Context, rec model.ArtifactRecord) (io
 	return os.Open(rec.Path)
 }
 
-func (s *Server) uploadCache(w http.ResponseWriter, r *http.Request) {
+// cacheNamespace derives the cache namespace from the leased job: the
+// repository identity (preferring the full name, falling back to the repo
+// URL) and the trust domain. Clients can never influence the namespace:
+// the legacy X-Kiwi-Repository/X-Kiwi-Trust-Domain headers are rejected.
+func cacheNamespace(j model.Job) (repo, trust string) {
+	repo = j.RepoFullName
+	if repo == "" {
+		repo = j.RepoURL
+	}
+	repo = strings.TrimSpace(repo)
+	trust = "untrusted"
+	if j.Trusted {
+		trust = "trusted"
+	}
+	return repo, trust
+}
+
+// cacheFileKey maps the server-derived (repo, trust, logicalKey) triple onto
+// the 64-hex on-disk key so a cache entry can never collide across
+// repositories or trust domains.
+func cacheFileKey(repo, trust, logicalKey string) string {
+	sum := sha256.Sum256([]byte(repo + "\x00" + trust + "\x00" + logicalKey))
+	return hex.EncodeToString(sum[:])
+}
+
+// cacheLease verifies the job-lease contract for a cache request: identity
+// binding, a live lease, and the absence of the forbidden legacy namespace
+// headers. On success it returns the leased job.
+func (s *Server) cacheLease(w http.ResponseWriter, r *http.Request) (model.Job, string, bool) {
+	jobID := r.PathValue("id")
+	// The namespace is server-derived; stale clients that still send the
+	// repository/trust-domain headers are rejected so they fail loudly.
+	if r.Header.Get("X-Kiwi-Repository") != "" || r.Header.Get("X-Kiwi-Trust-Domain") != "" {
+		http.Error(w, "cache namespace headers are not accepted: the namespace is derived from the job lease", http.StatusBadRequest)
+		return model.Job{}, "", false
+	}
+	runnerID := r.Header.Get("X-Kiwi-Runner-ID")
+	token := r.Header.Get("X-Kiwi-Lease-Token")
+	gen, _ := strconv.ParseInt(r.Header.Get("X-Kiwi-Lease-Generation"), 10, 64)
+	if !s.verifyRunnerIdentity(r, runnerID) {
+		http.Error(w, "runner identity mismatch", http.StatusForbidden)
+		return model.Job{}, "", false
+	}
+	j, err := s.jobForLease(r.Context(), jobID)
+	if errors.Is(err, storage.ErrNotFound) {
+		http.NotFound(w, r)
+		return model.Job{}, "", false
+	}
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return model.Job{}, "", false
+	}
+	if !s.validActiveLease(j, runnerID, token, gen, time.Now().UTC()) {
+		http.Error(w, "stale or invalid lease", http.StatusConflict)
+		return model.Job{}, "", false
+	}
+	return j, runnerID, true
+}
+
+// uploadJobCache implements PUT /api/v1/jobs/{id}/cache/{key}. The entry is
+// stored under the namespace derived from the leased job; the response
+// carries the content digest and, in DB mode, a signed manifest bound to
+// the same namespace.
+func (s *Server) uploadJobCache(w http.ResponseWriter, r *http.Request) {
 	if s.store == nil {
-		http.Error(w, "cache storage requires persistent server", 503)
+		http.Error(w, "cache storage requires persistent server", http.StatusServiceUnavailable)
+		return
+	}
+	j, runnerID, ok := s.cacheLease(w, r)
+	if !ok {
 		return
 	}
 	key := r.PathValue("key")
@@ -394,6 +476,8 @@ func (s *Server) uploadCache(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid cache key", 400)
 		return
 	}
+	repo, trust := cacheNamespace(j)
+	fileKey := cacheFileKey(repo, trust, key)
 	dir := filepath.Join(s.store.Root, "cache")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		http.Error(w, err.Error(), 500)
@@ -404,8 +488,8 @@ func (s *Server) uploadCache(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal server error", 500)
 		return
 	}
-	tmp := filepath.Join(dir, "."+key+"."+uniq+".tmp")
-	dst := filepath.Join(dir, key+".tar.gz")
+	tmp := filepath.Join(dir, "."+fileKey+"."+uniq+".tmp")
+	dst := filepath.Join(dir, fileKey+".tar.gz")
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
@@ -430,30 +514,25 @@ func (s *Server) uploadCache(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Kiwi-Content-SHA256", sum)
 	s.metricAdd("kiwi_cache_bytes_total", float64(n), nil)
 	if s.DB != nil {
-		s.writeCacheManifest(w, r, key, sum, n)
+		s.writeCacheManifest(w, r, fileKey, key, repo, trust, sum, n)
 	}
+	s.auditLocked("cache.uploaded", runnerID, j.RunID, j.ID, "cache entry stored", map[string]string{"key": key, "repository": repo, "trust_domain": trust})
 	w.WriteHeader(http.StatusCreated)
 }
 
 // writeCacheManifest records a signed cache manifest next to the blob in DB
-// mode. The namespace is derived from the request's repository/trust-domain
-// headers (set by the runner client); the manifest is signed with the
-// dedicated cache signing key so cache consumers can pin one trust root.
-func (s *Server) writeCacheManifest(w http.ResponseWriter, r *http.Request, key, sum string, size int64) {
-	repo := cleanBlobName(r.Header.Get("X-Kiwi-Repository"))
-	trust := cleanBlobName(r.Header.Get("X-Kiwi-Trust-Domain"))
-	if repo == "" {
-		return
-	}
-	if trust == "" {
-		trust = "untrusted"
-	}
+// mode. The namespace is server-derived from the leased job — repository and
+// trust domain never come from client headers — and the manifest is signed
+// with the dedicated cache signing key so cache consumers can pin one trust
+// root.
+func (s *Server) writeCacheManifest(w http.ResponseWriter, r *http.Request, fileKey, logicalKey, repo, trust, sum string, size int64) {
+	_ = r
 	signer := s.ensureCacheSigner()
 	m := cache.CacheManifest{
 		Version:     1,
 		Repository:  repo,
 		TrustDomain: trust,
-		LogicalKey:  key,
+		LogicalKey:  logicalKey,
 		BlobSHA256:  sum,
 		BlobSize:    size,
 		CreatedAt:   time.Now().UTC(),
@@ -462,13 +541,21 @@ func (s *Server) writeCacheManifest(w http.ResponseWriter, r *http.Request, key,
 	if err != nil {
 		return
 	}
-	path := filepath.Join(s.store.Root, "cache", key+".manifest.json")
+	path := filepath.Join(s.store.Root, "cache", fileKey+".manifest.json")
 	_ = writeFileAtomic(path, b, 0o600)
 	w.Header().Set("X-Kiwi-Cache-Manifest-SHA256", manifestDigestOf(b))
 }
-func (s *Server) downloadCache(w http.ResponseWriter, r *http.Request) {
+
+// downloadJobCache implements GET /api/v1/jobs/{id}/cache/{key}. The lookup
+// is namespaced by the leased job's repository and trust domain: a runner
+// for a different repository resolves a different key and gets a 404.
+func (s *Server) downloadJobCache(w http.ResponseWriter, r *http.Request) {
 	if s.store == nil {
-		http.Error(w, "cache storage requires persistent server", 503)
+		http.Error(w, "cache storage requires persistent server", http.StatusServiceUnavailable)
+		return
+	}
+	j, runnerID, ok := s.cacheLease(w, r)
+	if !ok {
 		return
 	}
 	key := r.PathValue("key")
@@ -476,7 +563,9 @@ func (s *Server) downloadCache(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid cache key", 400)
 		return
 	}
-	path := filepath.Join(s.store.Root, "cache", key+".tar.gz")
+	repo, trust := cacheNamespace(j)
+	fileKey := cacheFileKey(repo, trust, key)
+	path := filepath.Join(s.store.Root, "cache", fileKey+".tar.gz")
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -498,6 +587,7 @@ func (s *Server) downloadCache(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/gzip")
 	n, _ := io.Copy(w, f)
 	s.metricAdd("kiwi_cache_bytes_total", float64(n), nil)
+	s.auditLocked("cache.downloaded", runnerID, j.RunID, j.ID, "cache entry read", map[string]string{"key": key, "repository": repo, "trust_domain": trust})
 }
 
 // manifestDigestOf hashes a serialized manifest envelope for the response
@@ -514,6 +604,9 @@ func (s *Server) downloadProvenance(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	if !ok || a.ProvenancePath == "" {
 		http.NotFound(w, r)
+		return
+	}
+	if !s.requireArtifactRead(w, r, a) {
 		return
 	}
 	b, err := os.ReadFile(a.ProvenancePath)

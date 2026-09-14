@@ -467,6 +467,30 @@ func (s *PostgresStore) ListQueuedJobs(ctx context.Context) ([]model.Job, error)
 	return out, rows.Err()
 }
 
+func (s *PostgresStore) ListJobsByRunner(ctx context.Context, runnerID string) ([]model.Job, error) {
+	if err := ValidateRunnerID(runnerID); err != nil {
+		return nil, err
+	}
+	rows, err := s.pool.Query(ctx, `SELECT `+jobCols+` FROM jobs WHERE lease_runner_id=$1 AND status='running' ORDER BY created_at ASC, id ASC`, runnerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.Job{}
+	for rows.Next() {
+		js := jobScanner{}
+		if err := rows.Scan(jobTargets(&js)...); err != nil {
+			return nil, err
+		}
+		j, err := js.job()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
 func (s *PostgresStore) UpdateJob(ctx context.Context, job model.Job) error {
 	if err := ValidateJobID(job.ID); err != nil {
 		return err
@@ -1814,10 +1838,6 @@ func (s *PostgresStore) InsertGeneratedJobs(ctx context.Context, parentJobID str
 // ---------------------------------------------------------------------------
 // downstream dispatch claims
 // ---------------------------------------------------------------------------
-
-func downstreamLinkKey(parentJobID, targetRepo, targetRef string) string {
-	return parentJobID + "\x00" + targetRepo + "\x00" + targetRef
-}
 
 // InsertDownstreamLink records one downstream launch claim. Re-inserting the
 // same (parent, repo, ref) keeps the existing claim (ON CONFLICT DO NOTHING)

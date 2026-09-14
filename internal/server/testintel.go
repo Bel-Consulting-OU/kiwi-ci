@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
@@ -88,11 +89,15 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listTestReports(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
 	if s.DB != nil {
-		if _, err := s.DB.GetRun(r.Context(), runID); errors.Is(err, storage.ErrNotFound) {
+		run, err := s.DB.GetRun(r.Context(), runID)
+		if errors.Is(err, storage.ErrNotFound) {
 			http.NotFound(w, r)
 			return
 		} else if err != nil {
 			http.Error(w, err.Error(), 500)
+			return
+		}
+		if !s.requireRunRead(w, r, run) {
 			return
 		}
 		out, err := s.DB.ListTestReports(r.Context(), runID)
@@ -105,8 +110,12 @@ func (s *Server) listTestReports(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.runs[runID]; !ok {
+	run, ok := s.runs[runID]
+	if !ok {
 		http.NotFound(w, r)
+		return
+	}
+	if !s.requireRunRead(w, r, run) {
 		return
 	}
 	out := []model.TestReport{}
@@ -127,6 +136,13 @@ func (s *Server) testIntelligence(w http.ResponseWriter, r *http.Request) {
 	repo := r.URL.Query().Get("repo")
 	if repo == "" {
 		http.Error(w, "repo query parameter is required (e.g. ?repo=owner/name)", http.StatusBadRequest)
+		return
+	}
+	if !s.requireAction(w, r, auth.ActionRead, auth.CanonicalRepoID("", repo), false) {
+		return
+	}
+	if !s.repoVisibleByName(r, repo) {
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 	if s.DB != nil {

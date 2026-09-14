@@ -171,18 +171,3 @@ func (c cronSchedule) next(t time.Time) time.Time {
 // minute granularity); beyond it the expression is treated as never
 // matching.
 const maxCronScanMinutes = 366 * 24 * 60 * 2
-
-// nextN enumerates up to n upcoming occurrences after t, in order.
-func (c cronSchedule) nextN(t time.Time, n int) []time.Time {
-	out := []time.Time{}
-	cur := t
-	for i := 0; i < n; i++ {
-		next := c.next(cur)
-		if next.IsZero() {
-			break
-		}
-		out = append(out, next)
-		cur = next
-	}
-	return out
-}
