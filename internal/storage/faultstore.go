@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -45,6 +46,15 @@ func (f *FaultyStore) Mutations() int {
 }
 
 var _ Store = (*FaultyStore)(nil)
+
+var (
+	_ OutboxStore           = (*FaultyStore)(nil)
+	_ ScheduleStore         = (*FaultyStore)(nil)
+	_ DeploymentStore       = (*FaultyStore)(nil)
+	_ SnapshotStore         = (*FaultyStore)(nil)
+	_ ArtifactContractStore = (*FaultyStore)(nil)
+	_ QueueReasonStore      = (*FaultyStore)(nil)
+)
 
 func (f *FaultyStore) Close() error { return f.Inner.Close() }
 
@@ -283,32 +293,161 @@ func (f *FaultyStore) SchemaVersion(ctx context.Context) (int, error) {
 	return f.Inner.SchemaVersion(ctx)
 }
 
+// ---------------------------------------------------------------------------
+// DB-mode extension stores. The Inner Store must also implement these
+// interfaces (the fault-injection memStore does); the assertions panic
+// loudly if a non-extended inner is ever used with the extension methods.
+// ---------------------------------------------------------------------------
+
+func (f *FaultyStore) OutboxAppend(ctx context.Context, e OutboxItem) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(OutboxStore).OutboxAppend(ctx, e)
+}
+
+func (f *FaultyStore) OutboxAck(ctx context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(OutboxStore).OutboxAck(ctx, id)
+}
+
+func (f *FaultyStore) OutboxPending(ctx context.Context) ([]OutboxItem, error) {
+	return f.Inner.(OutboxStore).OutboxPending(ctx)
+}
+
+func (f *FaultyStore) UpsertSchedule(ctx context.Context, sc Schedule) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(ScheduleStore).UpsertSchedule(ctx, sc)
+}
+
+func (f *FaultyStore) ListSchedules(ctx context.Context) ([]Schedule, error) {
+	return f.Inner.(ScheduleStore).ListSchedules(ctx)
+}
+
+func (f *FaultyStore) ClaimScheduleOccurrence(ctx context.Context, scheduleID string, nominal time.Time, runID string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return false, err
+	}
+	return f.Inner.(ScheduleStore).ClaimScheduleOccurrence(ctx, scheduleID, nominal, runID)
+}
+
+func (f *FaultyStore) ListOccurrences(ctx context.Context, scheduleID string) ([]Occurrence, error) {
+	return f.Inner.(ScheduleStore).ListOccurrences(ctx, scheduleID)
+}
+
+func (f *FaultyStore) InsertDeployment(ctx context.Context, d model.Deployment) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(DeploymentStore).InsertDeployment(ctx, d)
+}
+
+func (f *FaultyStore) ListDeploymentsByRun(ctx context.Context, runID string) ([]model.Deployment, error) {
+	return f.Inner.(DeploymentStore).ListDeploymentsByRun(ctx, runID)
+}
+
+func (f *FaultyStore) UpdateDeploymentStatus(ctx context.Context, id string, status model.Status, finishedAt *time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(DeploymentStore).UpdateDeploymentStatus(ctx, id, status, finishedAt)
+}
+
+func (f *FaultyStore) InsertSnapshotRecord(ctx context.Context, rec model.SnapshotRecord) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(SnapshotStore).InsertSnapshotRecord(ctx, rec)
+}
+
+func (f *FaultyStore) ListSnapshotsByRun(ctx context.Context, runID string) ([]model.SnapshotRecord, error) {
+	return f.Inner.(SnapshotStore).ListSnapshotsByRun(ctx, runID)
+}
+
+func (f *FaultyStore) InsertJobContracts(ctx context.Context, jobID string, contracts map[string]ArtifactContract) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(ArtifactContractStore).InsertJobContracts(ctx, jobID, contracts)
+}
+
+func (f *FaultyStore) GetJobContracts(ctx context.Context, jobID string) (map[string]ArtifactContract, bool, error) {
+	return f.Inner.(ArtifactContractStore).GetJobContracts(ctx, jobID)
+}
+
+func (f *FaultyStore) SetQueueReasons(ctx context.Context, reasons map[string]string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(QueueReasonStore).SetQueueReasons(ctx, reasons)
+}
+
 // memStore is a fully functional in-memory Store used as the fault-free
 // baseline underneath FaultyStore in fault-injection tests.
 type memStore struct {
-	mu         sync.Mutex
-	runs       map[string]model.Run
-	jobs       map[string]model.Job
-	runners    map[string]model.Runner
-	receipts   map[string]model.CompletionReceipt
-	audit      []model.AuditEvent
-	logs       []model.LogEntry
-	artifacts  []model.ArtifactRecord
-	reports    []model.TestReport
-	deliveries map[string]string
+	mu          sync.Mutex
+	runs        map[string]model.Run
+	jobs        map[string]model.Job
+	runners     map[string]model.Runner
+	receipts    map[string]model.CompletionReceipt
+	audit       []model.AuditEvent
+	logs        []model.LogEntry
+	artifacts   []model.ArtifactRecord
+	reports     []model.TestReport
+	deliveries  map[string]string
+	outbox      []OutboxItem
+	schedules   map[string]Schedule
+	occurrences map[string]map[time.Time]string
+	deployments []model.Deployment
+	snapshots   []model.SnapshotRecord
+	contracts   map[string]map[string]ArtifactContract
 }
 
 func newMemStore() *memStore {
 	return &memStore{
-		runs:       map[string]model.Run{},
-		jobs:       map[string]model.Job{},
-		runners:    map[string]model.Runner{},
-		receipts:   map[string]model.CompletionReceipt{},
-		deliveries: map[string]string{},
+		runs:        map[string]model.Run{},
+		jobs:        map[string]model.Job{},
+		runners:     map[string]model.Runner{},
+		receipts:    map[string]model.CompletionReceipt{},
+		deliveries:  map[string]string{},
+		schedules:   map[string]Schedule{},
+		occurrences: map[string]map[time.Time]string{},
+		contracts:   map[string]map[string]ArtifactContract{},
 	}
 }
 
 var _ Store = (*memStore)(nil)
+
+var (
+	_ OutboxStore           = (*memStore)(nil)
+	_ ScheduleStore         = (*memStore)(nil)
+	_ DeploymentStore       = (*memStore)(nil)
+	_ SnapshotStore         = (*memStore)(nil)
+	_ ArtifactContractStore = (*memStore)(nil)
+	_ QueueReasonStore      = (*memStore)(nil)
+)
 
 func (m *memStore) Close() error { return nil }
 
@@ -666,4 +805,178 @@ func (m *memStore) SchemaVersion(ctx context.Context) (int, error) { return 1, n
 
 func (m *memStore) receiptKey(jobID string, generation int64, runnerID string) string {
 	return fmt.Sprintf("%s|%d|%s", jobID, generation, runnerID)
+}
+
+// ---------------------------------------------------------------------------
+// DB-mode extension stores (in-memory)
+// ---------------------------------------------------------------------------
+
+func (m *memStore) OutboxAppend(ctx context.Context, e OutboxItem) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.outbox = append(m.outbox, e)
+	return nil
+}
+
+func (m *memStore) OutboxAck(ctx context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := m.outbox[:0]
+	for _, it := range m.outbox {
+		if it.ID != id {
+			out = append(out, it)
+		}
+	}
+	m.outbox = out
+	return nil
+}
+
+func (m *memStore) OutboxPending(ctx context.Context) ([]OutboxItem, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]OutboxItem(nil), m.outbox...), nil
+}
+
+func (m *memStore) UpsertSchedule(ctx context.Context, sc Schedule) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if sc.CreatedAt.IsZero() {
+		if prev, ok := m.schedules[sc.ID]; ok {
+			sc.CreatedAt = prev.CreatedAt
+		}
+	}
+	m.schedules[sc.ID] = sc
+	return nil
+}
+
+func (m *memStore) ListSchedules(ctx context.Context) ([]Schedule, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]Schedule, 0, len(m.schedules))
+	for _, sc := range m.schedules {
+		out = append(out, sc)
+	}
+	return out, nil
+}
+
+func (m *memStore) ClaimScheduleOccurrence(ctx context.Context, scheduleID string, nominal time.Time, runID string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	byNominal, ok := m.occurrences[scheduleID]
+	if !ok {
+		byNominal = map[time.Time]string{}
+		m.occurrences[scheduleID] = byNominal
+	}
+	if existing, ok := byNominal[nominal]; ok {
+		return existing == runID, nil
+	}
+	byNominal[nominal] = runID
+	return true, nil
+}
+
+func (m *memStore) ListOccurrences(ctx context.Context, scheduleID string) ([]Occurrence, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	byNominal := m.occurrences[scheduleID]
+	out := make([]Occurrence, 0, len(byNominal))
+	for nominal, runID := range byNominal {
+		out = append(out, Occurrence{ScheduleID: scheduleID, Nominal: nominal, RunID: runID})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Nominal.Before(out[j].Nominal) })
+	return out, nil
+}
+
+func (m *memStore) InsertDeployment(ctx context.Context, d model.Deployment) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.deployments = append(m.deployments, d)
+	return nil
+}
+
+func (m *memStore) ListDeploymentsByRun(ctx context.Context, runID string) ([]model.Deployment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []model.Deployment{}
+	for _, d := range m.deployments {
+		if d.RunID == runID {
+			out = append(out, d)
+		}
+	}
+	return out, nil
+}
+
+func (m *memStore) UpdateDeploymentStatus(ctx context.Context, id string, status model.Status, finishedAt *time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, d := range m.deployments {
+		if d.ID != id {
+			continue
+		}
+		d.Status = status
+		if finishedAt != nil {
+			d.FinishedAt = finishedAt
+		}
+		m.deployments[i] = d
+		return nil
+	}
+	return ErrNotFound
+}
+
+func (m *memStore) InsertSnapshotRecord(ctx context.Context, rec model.SnapshotRecord) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.snapshots = append(m.snapshots, rec)
+	return nil
+}
+
+func (m *memStore) ListSnapshotsByRun(ctx context.Context, runID string) ([]model.SnapshotRecord, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []model.SnapshotRecord{}
+	for _, rec := range m.snapshots {
+		if rec.RunID == runID {
+			out = append(out, rec)
+		}
+	}
+	return out, nil
+}
+
+func (m *memStore) InsertJobContracts(ctx context.Context, jobID string, contracts map[string]ArtifactContract) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.jobs[jobID]; !ok {
+		return ErrNotFound
+	}
+	cp := make(map[string]ArtifactContract, len(contracts))
+	for k, v := range contracts {
+		cp[k] = v
+	}
+	m.contracts[jobID] = cp
+	return nil
+}
+
+func (m *memStore) GetJobContracts(ctx context.Context, jobID string) (map[string]ArtifactContract, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.contracts[jobID]
+	if !ok {
+		return nil, false, nil
+	}
+	cp := make(map[string]ArtifactContract, len(c))
+	for k, v := range c {
+		cp[k] = v
+	}
+	return cp, true, nil
+}
+
+func (m *memStore) SetQueueReasons(ctx context.Context, reasons map[string]string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id, reason := range reasons {
+		if j, ok := m.jobs[id]; ok {
+			j.QueueReason = reason
+			m.jobs[id] = j
+		}
+	}
+	return nil
 }

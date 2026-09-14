@@ -23,6 +23,13 @@ type Config struct {
 	OIDCAudiences      []string              `yaml:"oidc_audiences"`
 	EnvironmentRules   map[string]EnvRule    `yaml:"environment_rules"`
 	Repositories       map[string]RepoPolicy `yaml:"repositories"`
+
+	// OPAFile is the path to a Rego policy loaded at startup. OPA is a
+	// fail-closed deny gate evaluated before admission; see CompileOPA.
+	OPAFile string `yaml:"opa_file"`
+	// OPARules embeds the Rego policy source inline. Mutually exclusive
+	// with OPAFile.
+	OPARules string `yaml:"opa_rules"`
 }
 
 // EnvRule restricts a named deployment environment.
@@ -55,7 +62,7 @@ var knownConfigKeys = map[string]map[string]bool{
 		"allowed_clone_hosts": true, "allowed_runner_pools": true, "allowed_regions": true,
 		"require_digest_pins": true, "require_rootless": true, "network": true,
 		"secret_allowlist": true, "oidc_audiences": true, "environment_rules": true,
-		"repositories": true,
+		"repositories": true, "opa_file": true, "opa_rules": true,
 	},
 	"environment_rules": {
 		"allowed_branches": true, "required_approvers": true, "concurrency": true,
@@ -157,6 +164,14 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("policy: %w", err)
 		}
 	}
+	if c.OPAFile != "" && c.OPARules != "" {
+		return fmt.Errorf("policy: opa_file and opa_rules are mutually exclusive")
+	}
+	if c.OPAFile != "" {
+		if _, err := os.ReadFile(c.OPAFile); err != nil {
+			return fmt.Errorf("policy: opa_file: %w", err)
+		}
+	}
 	for repo, rp := range c.Repositories {
 		if repo == "" {
 			return fmt.Errorf("policy: empty repository name")
@@ -176,6 +191,32 @@ func parseNetworkPolicy(s string) (pipeline.NetworkPolicy, error) {
 		return 0, err
 	}
 	return n, nil
+}
+
+// CompileOPA loads and compiles the configured OPA policy into a prepared
+// query, or returns nil when neither opa_file nor opa_rules is set (OPA is
+// optional). An error means the policy is unusable and the caller must
+// refuse to start: OPA is a deny gate and an unloadable gate is a security
+// failure, never a silent pass.
+func (c *Config) CompileOPA() (*OPAPolicy, error) {
+	if c == nil {
+		return nil, nil
+	}
+	if c.OPAFile != "" && c.OPARules != "" {
+		return nil, fmt.Errorf("policy: opa_file and opa_rules are mutually exclusive")
+	}
+	src := c.OPARules
+	if c.OPAFile != "" {
+		data, err := os.ReadFile(c.OPAFile)
+		if err != nil {
+			return nil, fmt.Errorf("policy: opa_file: %w", err)
+		}
+		src = string(data)
+	}
+	if src == "" {
+		return nil, nil
+	}
+	return LoadOPAPolicy(src)
 }
 
 // CapabilitiesFor derives the capability intersection for a repository from

@@ -35,6 +35,15 @@ type PostgresStore struct {
 
 var _ Store = (*PostgresStore)(nil)
 
+var (
+	_ OutboxStore           = (*PostgresStore)(nil)
+	_ ScheduleStore         = (*PostgresStore)(nil)
+	_ DeploymentStore       = (*PostgresStore)(nil)
+	_ SnapshotStore         = (*PostgresStore)(nil)
+	_ ArtifactContractStore = (*PostgresStore)(nil)
+	_ QueueReasonStore      = (*PostgresStore)(nil)
+)
+
 // NewPostgres opens a pool and verifies connectivity.
 func NewPostgres(ctx context.Context, dsn string) (*PostgresStore, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
@@ -1411,6 +1420,340 @@ func (s *PostgresStore) FindDelivery(ctx context.Context, forge, deliveryID stri
 		return "", false, err
 	}
 	return runID, true, nil
+}
+
+// ---------------------------------------------------------------------------
+// outbox
+// ---------------------------------------------------------------------------
+
+func (s *PostgresStore) OutboxAppend(ctx context.Context, e OutboxItem) error {
+	if e.ID == "" {
+		id, err := newID()
+		if err != nil {
+			return err
+		}
+		e.ID = id
+	}
+	if e.CreatedAt.IsZero() {
+		e.CreatedAt = time.Now().UTC()
+	}
+	payload := e.Payload
+	if len(payload) == 0 {
+		payload = []byte("{}")
+	}
+	_, err := s.pool.Exec(ctx, `INSERT INTO outbox (id, kind, payload, created_at) VALUES ($1, $2, $3, $4)`,
+		e.ID, e.Kind, payload, e.CreatedAt)
+	return err
+}
+
+func (s *PostgresStore) OutboxAck(ctx context.Context, id string) error {
+	if id == "" {
+		return fmt.Errorf("storage: empty outbox id")
+	}
+	_, err := s.pool.Exec(ctx, `DELETE FROM outbox WHERE id=$1`, id)
+	return err
+}
+
+func (s *PostgresStore) OutboxPending(ctx context.Context) ([]OutboxItem, error) {
+	rows, err := s.pool.Query(ctx, `SELECT id, kind, payload, created_at FROM outbox ORDER BY created_at ASC, id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []OutboxItem{}
+	for rows.Next() {
+		var it OutboxItem
+		if err := rows.Scan(&it.ID, &it.Kind, &it.Payload, &it.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
+// schedules
+// ---------------------------------------------------------------------------
+
+func (s *PostgresStore) UpsertSchedule(ctx context.Context, sc Schedule) error {
+	if sc.ID == "" {
+		return fmt.Errorf("storage: empty schedule id")
+	}
+	_, err := s.pool.Exec(ctx, `INSERT INTO schedules (id, repository, spec, enabled, last_run, created_at) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO UPDATE SET repository=EXCLUDED.repository, spec=EXCLUDED.spec, enabled=EXCLUDED.enabled, last_run=EXCLUDED.last_run`,
+		sc.ID, sc.Repository, sc.Spec, sc.Enabled, sc.LastRun, sc.CreatedAt)
+	return err
+}
+
+func (s *PostgresStore) ListSchedules(ctx context.Context) ([]Schedule, error) {
+	rows, err := s.pool.Query(ctx, `SELECT id, repository, spec, enabled, last_run, created_at FROM schedules ORDER BY created_at ASC, id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Schedule{}
+	for rows.Next() {
+		var sc Schedule
+		if err := rows.Scan(&sc.ID, &sc.Repository, &sc.Spec, &sc.Enabled, &sc.LastRun, &sc.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, sc)
+	}
+	return out, rows.Err()
+}
+
+// ClaimScheduleOccurrence atomically reserves the (schedule, nominal) firing
+// for runID. The INSERT ... ON CONFLICT DO NOTHING makes concurrent claims
+// race-free: exactly one caller wins the row. Re-claiming the same nominal
+// for the same runID is idempotent and reports true.
+func (s *PostgresStore) ClaimScheduleOccurrence(ctx context.Context, scheduleID string, nominal time.Time, runID string) (bool, error) {
+	if scheduleID == "" || runID == "" {
+		return false, fmt.Errorf("storage: empty schedule or run id")
+	}
+	ct, err := s.pool.Exec(ctx, `INSERT INTO schedule_occurrences (schedule_id, nominal, run_id) VALUES ($1, $2, $3) ON CONFLICT (schedule_id, nominal) DO NOTHING`,
+		scheduleID, nominal, runID)
+	if err != nil {
+		return false, err
+	}
+	if ct.RowsAffected() == 1 {
+		return true, nil
+	}
+	var existing string
+	err = s.pool.QueryRow(ctx, `SELECT run_id FROM schedule_occurrences WHERE schedule_id=$1 AND nominal=$2`, scheduleID, nominal).Scan(&existing)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return existing == runID, nil
+}
+
+func (s *PostgresStore) ListOccurrences(ctx context.Context, scheduleID string) ([]Occurrence, error) {
+	if scheduleID == "" {
+		return nil, fmt.Errorf("storage: empty schedule id")
+	}
+	rows, err := s.pool.Query(ctx, `SELECT schedule_id, nominal, run_id FROM schedule_occurrences WHERE schedule_id=$1 ORDER BY nominal ASC`, scheduleID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Occurrence{}
+	for rows.Next() {
+		var o Occurrence
+		if err := rows.Scan(&o.ScheduleID, &o.Nominal, &o.RunID); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
+// deployments
+// ---------------------------------------------------------------------------
+
+func (s *PostgresStore) InsertDeployment(ctx context.Context, d model.Deployment) error {
+	if err := ValidateID(d.ID); err != nil {
+		return err
+	}
+	if err := ValidateRunID(d.RunID); err != nil {
+		return err
+	}
+	payload, err := json.Marshal(d)
+	if err != nil {
+		return err
+	}
+	_, err = s.pool.Exec(ctx, `INSERT INTO deployments (id, run_id, job_id, environment, created_at, payload) VALUES ($1, $2, $3, $4, $5, $6)`,
+		d.ID, d.RunID, nullText(d.JobID), d.Environment, d.CreatedAt, payload)
+	return err
+}
+
+func (s *PostgresStore) ListDeploymentsByRun(ctx context.Context, runID string) ([]model.Deployment, error) {
+	if err := ValidateRunID(runID); err != nil {
+		return nil, err
+	}
+	rows, err := s.pool.Query(ctx, `SELECT payload FROM deployments WHERE run_id=$1 ORDER BY created_at ASC, id ASC`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.Deployment{}
+	for rows.Next() {
+		var (
+			payload []byte
+			d       model.Deployment
+		)
+		if err := rows.Scan(&payload); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(payload, &d); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// UpdateDeploymentStatus locks the deployment row, rewrites status and
+// finished_at inside the payload, and commits. A missing deployment returns
+// ErrNotFound.
+func (s *PostgresStore) UpdateDeploymentStatus(ctx context.Context, id string, status model.Status, finishedAt *time.Time) error {
+	if err := ValidateID(id); err != nil {
+		return err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var payload []byte
+	err = tx.QueryRow(ctx, `SELECT payload FROM deployments WHERE id=$1 FOR UPDATE`, id).Scan(&payload)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	var d model.Deployment
+	if err := json.Unmarshal(payload, &d); err != nil {
+		return err
+	}
+	d.Status = status
+	if finishedAt != nil {
+		d.FinishedAt = finishedAt
+	}
+	dp, err := json.Marshal(d)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE deployments SET payload=$2 WHERE id=$1`, id, dp); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// ---------------------------------------------------------------------------
+// workspace snapshots
+// ---------------------------------------------------------------------------
+
+func (s *PostgresStore) InsertSnapshotRecord(ctx context.Context, rec model.SnapshotRecord) error {
+	if err := ValidateID(rec.ID); err != nil {
+		return err
+	}
+	if err := ValidateRunID(rec.RunID); err != nil {
+		return err
+	}
+	payload, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	_, err = s.pool.Exec(ctx, `INSERT INTO workspace_snapshots (id, run_id, job_id, created_at, payload) VALUES ($1, $2, $3, $4, $5)`,
+		rec.ID, rec.RunID, nullText(rec.JobID), rec.CreatedAt, payload)
+	return err
+}
+
+func (s *PostgresStore) ListSnapshotsByRun(ctx context.Context, runID string) ([]model.SnapshotRecord, error) {
+	if err := ValidateRunID(runID); err != nil {
+		return nil, err
+	}
+	rows, err := s.pool.Query(ctx, `SELECT payload FROM workspace_snapshots WHERE run_id=$1 ORDER BY created_at ASC, id ASC`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.SnapshotRecord{}
+	for rows.Next() {
+		var (
+			payload []byte
+			rec     model.SnapshotRecord
+		)
+		if err := rows.Scan(&payload); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(payload, &rec); err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
+// artifact contracts
+// ---------------------------------------------------------------------------
+
+// InsertJobContracts overwrites the job's artifact_contracts jsonb key with
+// the marshaled contract set. The update is a single jsonb_set so concurrent
+// job updates cannot lose unrelated payload fields.
+func (s *PostgresStore) InsertJobContracts(ctx context.Context, jobID string, contracts map[string]ArtifactContract) error {
+	if err := ValidateJobID(jobID); err != nil {
+		return err
+	}
+	cp, err := json.Marshal(contracts)
+	if err != nil {
+		return err
+	}
+	ct, err := s.pool.Exec(ctx, `UPDATE jobs SET payload = jsonb_set(payload, '{artifact_contracts}', $2::jsonb, true) WHERE id=$1`, jobID, cp)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *PostgresStore) GetJobContracts(ctx context.Context, jobID string) (map[string]ArtifactContract, bool, error) {
+	if err := ValidateJobID(jobID); err != nil {
+		return nil, false, err
+	}
+	var raw []byte
+	err := s.pool.QueryRow(ctx, `SELECT payload->'artifact_contracts' FROM jobs WHERE id=$1`, jobID).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if len(raw) == 0 {
+		return nil, false, nil
+	}
+	out := map[string]ArtifactContract{}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, false, err
+	}
+	return out, true, nil
+}
+
+// ---------------------------------------------------------------------------
+// queue reasons
+// ---------------------------------------------------------------------------
+
+// SetQueueReasons persists each job's scheduling queue reason with one
+// jsonb_set per job inside a single transaction. An empty reason removes the
+// queue_reason key so reads never observe a stale reason; missing jobs are
+// skipped (the scheduling pass may have raced a cancellation).
+func (s *PostgresStore) SetQueueReasons(ctx context.Context, reasons map[string]string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	for id, reason := range reasons {
+		if err := ValidateJobID(id); err != nil {
+			return err
+		}
+		if reason == "" {
+			if _, err := tx.Exec(ctx, `UPDATE jobs SET payload = payload - 'queue_reason' WHERE id=$1`, id); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, err := tx.Exec(ctx, `UPDATE jobs SET payload = jsonb_set(payload, '{queue_reason}', to_jsonb($2::text), true) WHERE id=$1`, id, reason); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 // ---------------------------------------------------------------------------

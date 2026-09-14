@@ -95,6 +95,104 @@ type Store interface {
 	SchemaVersion(ctx context.Context) (int, error)
 }
 
+// ---------------------------------------------------------------------------
+// DB-mode extension stores
+// ---------------------------------------------------------------------------
+//
+// These interfaces deliberately extend Store instead of widening it: they
+// cover control-plane areas (durable outbox, cron schedules, deployments,
+// workspace snapshots, artifact contracts, queue reasons) whose server wiring
+// lands in a later phase. PostgresStore and the fault-injection memStore
+// implement them so persistence and fault coverage exist before adoption;
+// other Store implementations (the server/scheduler test fakes) compile
+// unchanged because the Store interface itself is untouched.
+
+// OutboxItem is one durable publish intent queued for dispatch.
+type OutboxItem struct {
+	ID        string    `json:"id"`
+	Kind      string    `json:"kind"`
+	Payload   []byte    `json:"payload"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// OutboxStore is the durable outbox contract. OutboxAppend enqueues an item,
+// OutboxAck removes a successfully dispatched item, and OutboxPending returns
+// the unacked items in FIFO order.
+type OutboxStore interface {
+	OutboxAppend(ctx context.Context, e OutboxItem) error
+	OutboxAck(ctx context.Context, id string) error
+	OutboxPending(ctx context.Context) ([]OutboxItem, error)
+}
+
+// Schedule is one cron-triggered pipeline schedule.
+type Schedule struct {
+	ID         string     `json:"id"`
+	Repository string     `json:"repository"`
+	Spec       string     `json:"spec"`
+	Enabled    bool       `json:"enabled"`
+	LastRun    *time.Time `json:"last_run,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+}
+
+// Occurrence is one claimed firing of a schedule: the nominal time the cron
+// spec resolved to and the run that was created for it.
+type Occurrence struct {
+	ScheduleID string    `json:"schedule_id"`
+	Nominal    time.Time `json:"nominal"`
+	RunID      string    `json:"run_id"`
+}
+
+// ScheduleStore is the durable schedule contract. ClaimScheduleOccurrence
+// atomically reserves the (schedule, nominal) firing for runID and reports
+// whether this call made the claim; re-claiming the same nominal for the same
+// runID is idempotent and reports true, while a conflicting runID reports
+// false.
+type ScheduleStore interface {
+	UpsertSchedule(ctx context.Context, s Schedule) error
+	ListSchedules(ctx context.Context) ([]Schedule, error)
+	ClaimScheduleOccurrence(ctx context.Context, scheduleID string, nominal time.Time, runID string) (bool, error)
+	ListOccurrences(ctx context.Context, scheduleID string) ([]Occurrence, error)
+}
+
+// DeploymentStore is the durable deployment record contract.
+type DeploymentStore interface {
+	InsertDeployment(ctx context.Context, d model.Deployment) error
+	ListDeploymentsByRun(ctx context.Context, runID string) ([]model.Deployment, error)
+	UpdateDeploymentStatus(ctx context.Context, id string, status model.Status, finishedAt *time.Time) error
+}
+
+// SnapshotStore is the durable workspace snapshot record contract.
+type SnapshotStore interface {
+	InsertSnapshotRecord(ctx context.Context, rec model.SnapshotRecord) error
+	ListSnapshotsByRun(ctx context.Context, runID string) ([]model.SnapshotRecord, error)
+}
+
+// ArtifactContract declares the artifacts a job promises to produce,
+// persisted per job so consumers can verify uploads before use.
+type ArtifactContract struct {
+	Name      string        `json:"name"`
+	Paths     []string      `json:"paths,omitempty"`
+	Required  bool          `json:"required,omitempty"`
+	Retention time.Duration `json:"retention,omitempty"`
+	MaxSize   int64         `json:"max_size,omitempty"`
+	SHA256    string        `json:"sha256,omitempty"`
+}
+
+// ArtifactContractStore is the durable per-job artifact contract contract.
+// InsertJobContracts overwrites the full contract set for jobID; the bool
+// returned by GetJobContracts reports whether a set is stored for the job.
+type ArtifactContractStore interface {
+	InsertJobContracts(ctx context.Context, jobID string, contracts map[string]ArtifactContract) error
+	GetJobContracts(ctx context.Context, jobID string) (map[string]ArtifactContract, bool, error)
+}
+
+// QueueReasonStore persists scheduling queue reasons without rewriting whole
+// job payloads: one jsonb_set per job. An empty reason removes the stored
+// reason for that job.
+type QueueReasonStore interface {
+	SetQueueReasons(ctx context.Context, reasons map[string]string) error
+}
+
 // ValidateID checks the canonical control-plane identifier format produced
 // by the server's crypto/rand ID generator: 32 lowercase hex characters.
 // Runs, jobs, runners, artifacts, reports, and audit events all share it.

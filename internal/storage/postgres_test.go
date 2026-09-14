@@ -24,6 +24,12 @@ var requiredTables = []string{
 	"webhook_deliveries", "downstream_links", "workspace_snapshots",
 }
 
+// requiredTables0002 are the tables the outbox/schedules migration adds
+// (0002 supersedes 0001's provisional schedules table with the full shape).
+var requiredTables0002 = []string{
+	"outbox", "schedules", "schedule_occurrences",
+}
+
 // requiredIndexes are the hot-path indexes the audit calls out; their names
 // appear in 0001_init.sql.
 var requiredIndexes = []string{
@@ -81,6 +87,17 @@ func TestMigrationFilesOrderedAndComplete(t *testing.T) {
 	// schema_migrations is created by the same file so Migrate is self-bootstrapping.
 	if !regexp.MustCompile(`(?i)\bCREATE TABLE\s+schema_migrations\b`).Match(raw) {
 		t.Error("0001_init.sql is missing CREATE TABLE schema_migrations")
+	}
+
+	raw2, err := migrations.FS.ReadFile("0002_outbox_schedules.sql")
+	if err != nil {
+		t.Fatalf("read 0002_outbox_schedules.sql: %v", err)
+	}
+	for _, name := range requiredTables0002 {
+		re := regexp.MustCompile(`(?i)\bCREATE TABLE\s+` + regexp.QuoteMeta(name) + `\b`)
+		if !re.Match(raw2) {
+			t.Errorf("0002_outbox_schedules.sql is missing CREATE TABLE %s", name)
+		}
 	}
 }
 
@@ -328,6 +345,103 @@ func TestModelJSONRoundTrip(t *testing.T) {
 		}
 		if out != r {
 			t.Errorf("receipt changed: %+v", out)
+		}
+	})
+
+	t.Run("Deployment", func(t *testing.T) {
+		d := model.Deployment{
+			ID: "dep", RunID: "run", JobID: "job", Repository: "https://example.com/repo.git",
+			Environment: "staging", URL: "https://staging.example.com", Commit: "abc123",
+			Status: model.StatusSuccess, ApprovedBy: "alice", ApprovedAt: &now,
+			StartedAt: &now, FinishedAt: &later, CreatedAt: now,
+		}
+		var out model.Deployment
+		if err := roundTrip(t, d, &out); err != nil {
+			return
+		}
+		if out.ID != d.ID || out.RunID != d.RunID || out.JobID != d.JobID ||
+			out.Environment != d.Environment || out.Status != d.Status || out.Commit != d.Commit {
+			t.Errorf("identity fields lost: %+v", out)
+		}
+		if out.ApprovedAt == nil || !out.ApprovedAt.Equal(now) || out.FinishedAt == nil || !out.FinishedAt.Equal(later) {
+			t.Errorf("timestamps changed: %v %v", out.ApprovedAt, out.FinishedAt)
+		}
+	})
+
+	t.Run("SnapshotRecord", func(t *testing.T) {
+		rec := model.SnapshotRecord{
+			ID: "snap", RunID: "run", JobID: "job", JobKey: "build", Path: "/snapshots/snap.tar",
+			Size: 4096, SHA256: "sha256", Version: 3, RootSHA256: "root",
+			Entries:   []model.SnapshotEntry{{Path: "a.go", Mode: 0o644, Size: 10, SHA256: "a"}},
+			CreatedAt: now,
+		}
+		var out model.SnapshotRecord
+		if err := roundTrip(t, rec, &out); err != nil {
+			return
+		}
+		if out.ID != rec.ID || out.RunID != rec.RunID || out.JobID != rec.JobID ||
+			out.Size != rec.Size || out.SHA256 != rec.SHA256 || out.Version != rec.Version || out.RootSHA256 != rec.RootSHA256 {
+			t.Errorf("identity fields lost: %+v", out)
+		}
+		if len(out.Entries) != 1 || out.Entries[0].Path != "a.go" || out.Entries[0].Mode != 0o644 {
+			t.Errorf("entries changed: %+v", out.Entries)
+		}
+	})
+
+	t.Run("OutboxItem", func(t *testing.T) {
+		it := OutboxItem{ID: "out1", Kind: "github_check", Payload: []byte(`{"sha":"abc123"}`), CreatedAt: now}
+		var out OutboxItem
+		if err := roundTrip(t, it, &out); err != nil {
+			return
+		}
+		if out.ID != it.ID || out.Kind != it.Kind || !bytes.Equal(out.Payload, it.Payload) || !out.CreatedAt.Equal(now) {
+			t.Errorf("outbox item changed: %+v", out)
+		}
+	})
+
+	t.Run("Schedule", func(t *testing.T) {
+		sc := Schedule{
+			ID: "sched", Repository: "https://example.com/repo.git", Spec: "0 2 * * *",
+			Enabled: true, LastRun: &later, CreatedAt: now,
+		}
+		var out Schedule
+		if err := roundTrip(t, sc, &out); err != nil {
+			return
+		}
+		if out.ID != sc.ID || out.Repository != sc.Repository || out.Spec != sc.Spec || !out.Enabled {
+			t.Errorf("schedule changed: %+v", out)
+		}
+		if out.LastRun == nil || !out.LastRun.Equal(later) || !out.CreatedAt.Equal(now) {
+			t.Errorf("schedule timestamps changed: %v", out.LastRun)
+		}
+	})
+
+	t.Run("Occurrence", func(t *testing.T) {
+		o := Occurrence{ScheduleID: "sched", Nominal: now, RunID: "run"}
+		var out Occurrence
+		if err := roundTrip(t, o, &out); err != nil {
+			return
+		}
+		if out.ScheduleID != o.ScheduleID || !out.Nominal.Equal(now) || out.RunID != o.RunID {
+			t.Errorf("occurrence changed: %+v", out)
+		}
+	})
+
+	t.Run("ArtifactContract", func(t *testing.T) {
+		c := ArtifactContract{
+			Name: "bundle", Paths: []string{"dist/", "build/"}, Required: true,
+			Retention: 24 * time.Hour, MaxSize: 8192, SHA256: "sha256",
+		}
+		var out ArtifactContract
+		if err := roundTrip(t, c, &out); err != nil {
+			return
+		}
+		if out.Name != c.Name || out.Required != c.Required || out.Retention != c.Retention ||
+			out.MaxSize != c.MaxSize || out.SHA256 != c.SHA256 {
+			t.Errorf("artifact contract changed: %+v", out)
+		}
+		if !reflect.DeepEqual(out.Paths, c.Paths) {
+			t.Errorf("artifact contract paths changed: %v", out.Paths)
 		}
 	})
 }

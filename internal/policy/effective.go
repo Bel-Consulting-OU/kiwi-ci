@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -67,6 +68,32 @@ func ValidatePipeline(s *pipeline.Spec, caps Capabilities) error {
 // before calling. ValidateAdmission keeps working for legacy call sites.
 func ValidateAdmissionWithCapabilities(s *pipeline.Spec, caps Capabilities) error {
 	return ValidatePipeline(s, caps)
+}
+
+// OPADenies evaluates the OPA deny gate for an admission request and must
+// run BEFORE the capability-based admission. It returns whether the request
+// is denied, the deny reasons, and any error. OPA is purely a deny gate:
+// capabilities still come from the deterministic Config intersection, and
+// OPA contributes only boolean deny rules. Every failure mode denies: a
+// policy that cannot be compiled or evaluated returns denied=true so the
+// caller rejects the request. When no OPA policy is configured, denied is
+// false.
+func (c *Config) OPADenies(ctx context.Context, in OPAInput) (denied bool, reasons []string, err error) {
+	p, err := c.CompileOPA()
+	if err != nil {
+		return true, []string{"opa policy failed to compile: " + err.Error()}, err
+	}
+	if p == nil {
+		return false, nil, nil
+	}
+	d, err := p.Decide(ctx, in)
+	if err != nil {
+		return true, []string{"opa decision failed: " + err.Error()}, err
+	}
+	if !d.Allow {
+		return true, d.Reasons, nil
+	}
+	return false, nil, nil
 }
 
 func validateJob(id string, job pipeline.Job, caps Capabilities) error {

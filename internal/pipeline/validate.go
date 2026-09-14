@@ -353,6 +353,14 @@ func validateJob(s *Spec, id string, j Job) error {
 				return fmt.Errorf("job %q artifact %q retention must be positive or \"forever\"", id, a.Name)
 			}
 		}
+		switch a.SBOM {
+		case "", "spdx-json", "cyclonedx-json":
+		default:
+			return fmt.Errorf("job %q artifact %q has invalid sbom format %q (want spdx-json or cyclonedx-json)", id, a.Name, a.SBOM)
+		}
+		if a.Sigstore != nil && a.Sigstore.Required && (strings.TrimSpace(a.Sigstore.Issuer) == "" || strings.TrimSpace(a.Sigstore.Identity) == "") {
+			return fmt.Errorf("job %q artifact %q: sigstore.required demands both issuer and identity", id, a.Name)
+		}
 	}
 	for i := range j.Downloads {
 		d := &j.Downloads[i]

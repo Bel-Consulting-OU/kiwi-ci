@@ -354,8 +354,17 @@ type ArtifactInput struct {
 }
 
 type Artifact struct {
-	Name      string   `yaml:"name" json:"name"`
-	Paths     []string `yaml:"paths" json:"paths"`
-	If        string   `yaml:"if,omitempty" json:"if,omitempty"`
-	Retention string   `yaml:"retention,omitempty" json:"retention,omitempty"`
+	Name      string          `yaml:"name" json:"name"`
+	Paths     []string        `yaml:"paths" json:"paths"`
+	If        string          `yaml:"if,omitempty" json:"if,omitempty"`
+	Retention string          `yaml:"retention,omitempty" json:"retention,omitempty"`
+	SBOM      string          `yaml:"sbom,omitempty" json:"sbom,omitempty"`
+	Sigstore  *SigstoreConfig `yaml:"sigstore,omitempty" json:"sigstore,omitempty"`
+}
+
+// SigstoreConfig declares Sigstore attestation requirements for an artifact.
+type SigstoreConfig struct {
+	Required bool   `yaml:"required,omitempty" json:"required,omitempty"`
+	Issuer   string `yaml:"issuer,omitempty" json:"issuer,omitempty"`
+	Identity string `yaml:"identity,omitempty" json:"identity,omitempty"`
 }

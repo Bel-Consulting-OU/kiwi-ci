@@ -25,6 +25,12 @@ type memSnapshot struct {
 	artifactsLen int
 	reportsLen   int
 	deliveries   map[string]string
+	outbox       []OutboxItem
+	schedules    map[string]Schedule
+	occurrences  map[string]map[time.Time]string
+	deployments  []model.Deployment
+	snapshots    []model.SnapshotRecord
+	jobContracts map[string]map[string]ArtifactContract
 }
 
 func (m *memStore) snapshot() memSnapshot {
@@ -40,6 +46,12 @@ func (m *memStore) snapshot() memSnapshot {
 		artifactsLen: len(m.artifacts),
 		reportsLen:   len(m.reports),
 		deliveries:   cloneDeliveries(m.deliveries),
+		outbox:       append([]OutboxItem(nil), m.outbox...),
+		schedules:    cloneSchedules(m.schedules),
+		occurrences:  cloneOccurrences(m.occurrences),
+		deployments:  append([]model.Deployment(nil), m.deployments...),
+		snapshots:    append([]model.SnapshotRecord(nil), m.snapshots...),
+		jobContracts: cloneJobContracts(m.contracts),
 	}
 }
 
@@ -83,6 +95,38 @@ func cloneDeliveries(in map[string]string) map[string]string {
 	return out
 }
 
+func cloneSchedules(in map[string]Schedule) map[string]Schedule {
+	out := make(map[string]Schedule, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneOccurrences(in map[string]map[time.Time]string) map[string]map[time.Time]string {
+	out := make(map[string]map[time.Time]string, len(in))
+	for k, byNominal := range in {
+		cp := make(map[time.Time]string, len(byNominal))
+		for nominal, runID := range byNominal {
+			cp[nominal] = runID
+		}
+		out[k] = cp
+	}
+	return out
+}
+
+func cloneJobContracts(in map[string]map[string]ArtifactContract) map[string]map[string]ArtifactContract {
+	out := make(map[string]map[string]ArtifactContract, len(in))
+	for k, contracts := range in {
+		cp := make(map[string]ArtifactContract, len(contracts))
+		for name, c := range contracts {
+			cp[name] = c
+		}
+		out[k] = cp
+	}
+	return out
+}
+
 func ctx() context.Context { return context.Background() }
 
 var testRun = model.Run{ID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Status: model.StatusQueued, CreatedAt: time.Unix(1000, 0).UTC()}
@@ -90,6 +134,16 @@ var testRun = model.Run{ID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Status: model.St
 var testJob = model.Job{ID: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", RunID: testRun.ID, Key: "build", Status: model.StatusQueued, CreatedAt: time.Unix(1001, 0).UTC()}
 
 var testRunner = model.Runner{ID: "cccccccccccccccccccccccccccccccc", Capacity: 2, ActiveJobs: []string{}}
+
+var testSchedule = Schedule{ID: "11111111111111111111111111111111", Repository: "https://example.com/repo.git", Spec: "@daily", Enabled: true, CreatedAt: time.Unix(1010, 0).UTC()}
+
+var testDeployment = model.Deployment{ID: "22222222222222222222222222222222", RunID: testRun.ID, JobID: testJob.ID, Repository: "https://example.com/repo.git", Environment: "staging", Status: model.StatusRunning, CreatedAt: time.Unix(1011, 0).UTC()}
+
+var testSnapshot = model.SnapshotRecord{ID: "33333333333333333333333333333333", RunID: testRun.ID, JobID: testJob.ID, JobKey: "build", Size: 10, SHA256: "abc", Version: 1, RootSHA256: "root", CreatedAt: time.Unix(1012, 0).UTC()}
+
+var testContracts = map[string]ArtifactContract{
+	"bundle": {Name: "bundle", Paths: []string{"dist/"}, Required: true, Retention: 24 * time.Hour, MaxSize: 4096, SHA256: "sha"},
+}
 
 func seedRunAndJob(m *memStore) {
 	_ = m.InsertRun(ctx(), testRun)
@@ -198,6 +252,78 @@ func faultOps() []opCase {
 			setup: seedRunAndJob,
 			call: func(s Store) error {
 				return s.InsertCompletionReceipt(ctx(), model.CompletionReceipt{JobID: testJob.ID, Generation: 1, RunnerID: testRunner.ID, ResultHash: "h"})
+			},
+		},
+		{
+			name:  "OutboxAppend",
+			setup: func(m *memStore) {},
+			call: func(s Store) error {
+				return s.(OutboxStore).OutboxAppend(ctx(), OutboxItem{ID: "44444444444444444444444444444444", Kind: "github_check", Payload: []byte(`{"sha":"abc"}`), CreatedAt: time.Unix(1013, 0).UTC()})
+			},
+		},
+		{
+			name: "OutboxAck",
+			setup: func(m *memStore) {
+				_ = m.OutboxAppend(ctx(), OutboxItem{ID: "44444444444444444444444444444444", Kind: "github_check", Payload: []byte(`{"sha":"abc"}`), CreatedAt: time.Unix(1013, 0).UTC()})
+			},
+			call: func(s Store) error {
+				return s.(OutboxStore).OutboxAck(ctx(), "44444444444444444444444444444444")
+			},
+		},
+		{
+			name:  "UpsertSchedule",
+			setup: func(m *memStore) { _ = m.UpsertSchedule(ctx(), testSchedule) },
+			call: func(s Store) error {
+				sc := testSchedule
+				sc.Spec = "@hourly"
+				return s.(ScheduleStore).UpsertSchedule(ctx(), sc)
+			},
+		},
+		{
+			name:  "ClaimScheduleOccurrence",
+			setup: func(m *memStore) { _ = m.UpsertSchedule(ctx(), testSchedule) },
+			call: func(s Store) error {
+				_, err := s.(ScheduleStore).ClaimScheduleOccurrence(ctx(), testSchedule.ID, time.Unix(20000, 0).UTC(), testRun.ID)
+				return err
+			},
+		},
+		{
+			name:  "InsertDeployment",
+			setup: seedRunAndJob,
+			call: func(s Store) error {
+				return s.(DeploymentStore).InsertDeployment(ctx(), testDeployment)
+			},
+		},
+		{
+			name: "UpdateDeploymentStatus",
+			setup: func(m *memStore) {
+				seedRunAndJob(m)
+				_ = m.InsertDeployment(ctx(), testDeployment)
+			},
+			call: func(s Store) error {
+				fin := time.Unix(20001, 0).UTC()
+				return s.(DeploymentStore).UpdateDeploymentStatus(ctx(), testDeployment.ID, model.StatusSuccess, &fin)
+			},
+		},
+		{
+			name:  "InsertSnapshotRecord",
+			setup: seedRunAndJob,
+			call: func(s Store) error {
+				return s.(SnapshotStore).InsertSnapshotRecord(ctx(), testSnapshot)
+			},
+		},
+		{
+			name:  "InsertJobContracts",
+			setup: seedRunAndJob,
+			call: func(s Store) error {
+				return s.(ArtifactContractStore).InsertJobContracts(ctx(), testJob.ID, testContracts)
+			},
+		},
+		{
+			name:  "SetQueueReasons",
+			setup: seedRunAndJob,
+			call: func(s Store) error {
+				return s.(QueueReasonStore).SetQueueReasons(ctx(), map[string]string{testJob.ID: "WAITING_DEPENDENCY"})
 			},
 		},
 	}
