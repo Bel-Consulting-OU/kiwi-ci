@@ -3,7 +3,7 @@
 // deployment step lists (canary, verify, rollback) declared on a job.
 //
 // The normalized form is what a caller (the executor or a sub-DAG runner)
-// executes: canary steps run first, then verify steps (defaulting to
+// executes: canary steps run first, then verify steps (both defaulting to
 // success()), then rollback steps (defaulting to failure()) when the deploy
 // did not verify. Rollback is a conservative default: a deployment that
 // failed verification always rolls back unless a step's condition says
@@ -21,6 +21,10 @@ import (
 // condition: roll back when the deployment failed or was blocked.
 const DefaultRollbackCondition = "failure()"
 
+// DefaultCanaryCondition is applied to canary steps without an explicit
+// condition: run the canary while the deployment still admits success.
+const DefaultCanaryCondition = "success()"
+
 // DefaultVerifyCondition is applied to verify steps without an explicit
 // condition: verify only when the canary phase succeeded.
 const DefaultVerifyCondition = "success()"
@@ -33,7 +37,8 @@ type Deployment = model.Deployment
 // NormalizedDeployment is a DeploymentSpec with defaults resolved. Canary,
 // Verify and Rollback hold the original step lists (rollback steps receive
 // their default condition at Normalize time); EffectiveSteps renders the
-// ordered execution list with the remaining defaults applied.
+// ordered execution list with the remaining defaults (canary and verify
+// success()) applied.
 type NormalizedDeployment struct {
 	Canary   []pipeline.Step
 	Verify   []pipeline.Step
@@ -63,13 +68,19 @@ func Normalize(d pipeline.DeploymentSpec) NormalizedDeployment {
 }
 
 // EffectiveSteps returns the ordered step list a caller executes as a
-// sub-DAG: canary steps first (conditions untouched), then verify steps
-// defaulting to success(), then rollback steps defaulting to failure().
-// Steps already carry conditions in Normalize-time order, so this is the
-// complete execution plan for one deployment.
+// sub-DAG: canary steps first, then verify steps, then rollback steps.
+// Canary and verify steps default to success(); rollback steps default to
+// failure() (already applied at Normalize time). Steps that declared an
+// explicit condition keep it. This is the complete execution plan for one
+// deployment.
 func (n NormalizedDeployment) EffectiveSteps() []pipeline.Step {
 	out := make([]pipeline.Step, 0, len(n.Canary)+len(n.Verify)+len(n.Rollback))
-	out = append(out, n.Canary...)
+	for _, st := range n.Canary {
+		if st.If == "" {
+			st.If = DefaultCanaryCondition
+		}
+		out = append(out, st)
+	}
 	for _, st := range n.Verify {
 		if st.If == "" {
 			st.If = DefaultVerifyCondition

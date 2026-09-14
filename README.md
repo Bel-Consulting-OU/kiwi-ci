@@ -154,3 +154,28 @@ v0.1 development series. The core is a compiling, tested engine rather
 than a claim of feature parity with GitHub Actions or GitLab CI; the
 parts that exist are built as security boundaries first. See
 [ROADMAP.md](ROADMAP.md) for what is done and what remains.
+
+## Install
+
+Prebuilt binaries for macOS (Intel/Apple Silicon), Linux (amd64/arm64)
+and Windows are attached to every
+[GitHub release](https://github.com/Bel-Consulting-OU/kiwi-ci/releases)
+together with `SHA256SUMS`, per-binary CycloneDX SBOMs, and signed
+provenance envelopes.
+
+macOS via Homebrew (bottle-less formula in `Formula/kiwi.rb`):
+
+```bash
+brew install ./Formula/kiwi.rb
+# or host the formula in a tap and `brew tap`/`brew install` from there
+```
+
+Docker (distroless, nonroot, static binary):
+
+```bash
+docker pull ghcr.io/bel-consulting-ou/kiwi-ci:v0.1.0
+docker run --rm -p 8080:8080 ghcr.io/bel-consulting-ou/kiwi-ci:v0.1.0
+```
+
+Build your own with `make release` (cross-compiled bundle) and
+`make docker-build`.

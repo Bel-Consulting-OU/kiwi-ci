@@ -1,0 +1,50 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+# The release job writes binaries, SBOMs and provenance to the GitHub
+# release, so contents: write is required.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      # KIWI_RELEASE_SIGNING_KEY is an optional repository secret holding an
+      # Ed25519 PKCS#8 private key in PEM form. When the secret is not
+      # configured, scripts/release.sh skips provenance signing and prints a
+      # warning; the release still publishes the binaries, SHA256SUMS and
+      # per-binary SBOMs. To enable signed provenance, generate a key with
+      # `openssl genpkey -algorithm ed25519` and store the PEM in the secret.
+      - name: Build release bundle
+        run: ./scripts/release.sh "${{ github.ref_name }}"
+        env:
+          VERSION: ${{ github.ref_name }}
+          REPO: ${{ github.server_url }}/${{ github.repository }}
+          KIWI_RELEASE_SIGNING_KEY: ${{ secrets.KIWI_RELEASE_SIGNING_KEY }}
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/release/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

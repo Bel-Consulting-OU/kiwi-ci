@@ -113,9 +113,9 @@ func usage() {
 
 Usage:
   kiwi init     [--force] [-f .kiwi/pipeline.yaml]
-  kiwi run      [-f .kiwi/pipeline.yaml] [--job NAME] [--max-parallel N]
+  kiwi run      [-f .kiwi/pipeline.yaml] [--job NAME] [--max-parallel N] [--input k=v]
   kiwi validate [-f .kiwi/pipeline.yaml]
-  kiwi explain  [-f .kiwi/pipeline.yaml]
+  kiwi explain  [-f .kiwi/pipeline.yaml] [--input k=v] [--why JOB]
   kiwi doctor
   kiwi server   [--listen :8080] [--mode dev|production] [--database-url URL]
                 [--config kiwi.toml]

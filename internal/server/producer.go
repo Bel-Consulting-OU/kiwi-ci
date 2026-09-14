@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"time"
 
@@ -122,7 +121,7 @@ func (s *Server) downloadDependency(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rec := matches[0]
-	f, err := os.Open(rec.Path)
+	f, err := s.openArtifact(r.Context(), rec)
 	if err != nil {
 		http.Error(w, "artifact bytes missing", http.StatusNotFound)
 		return

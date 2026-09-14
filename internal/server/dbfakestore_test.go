@@ -35,6 +35,7 @@ type dbFakeStore struct {
 	contracts        map[string]map[string]storage.ArtifactContract
 	queueReasons     map[string]string
 	queueReasonsErrs int
+	downstreamLinks  map[string]storage.DownstreamLink
 
 	leaderOK  bool
 	leaderErr error
@@ -85,19 +86,25 @@ var _ storage.DeploymentStore = (*dbFakeStore)(nil)
 var _ storage.SnapshotStore = (*dbFakeStore)(nil)
 var _ storage.ArtifactContractStore = (*dbFakeStore)(nil)
 var _ storage.QueueReasonStore = (*dbFakeStore)(nil)
+var _ storage.DynamicStore = (*dbFakeStore)(nil)
+var _ storage.DownstreamStore = (*dbFakeStore)(nil)
+var _ storage.UsageStore = (*dbFakeStore)(nil)
+var _ storage.RunDownstreamStore = (*dbFakeStore)(nil)
+var _ storage.ArtifactLookupStore = (*dbFakeStore)(nil)
 
 func newDBFakeStore() *dbFakeStore {
 	return &dbFakeStore{
-		runs:         map[string]model.Run{},
-		jobs:         map[string]model.Job{},
-		runners:      map[string]model.Runner{},
-		receipts:     map[string]model.CompletionReceipt{},
-		schedules:    map[string]storage.Schedule{},
-		occurrences:  map[string][]storage.Occurrence{},
-		deployments:  map[string]model.Deployment{},
-		contracts:    map[string]map[string]storage.ArtifactContract{},
-		queueReasons: map[string]string{},
-		leaderOK:     true,
+		runs:            map[string]model.Run{},
+		jobs:            map[string]model.Job{},
+		runners:         map[string]model.Runner{},
+		receipts:        map[string]model.CompletionReceipt{},
+		schedules:       map[string]storage.Schedule{},
+		occurrences:     map[string][]storage.Occurrence{},
+		deployments:     map[string]model.Deployment{},
+		contracts:       map[string]map[string]storage.ArtifactContract{},
+		queueReasons:    map[string]string{},
+		downstreamLinks: map[string]storage.DownstreamLink{},
+		leaderOK:        true,
 	}
 }
 
@@ -639,4 +646,113 @@ func (f *dbFakeStore) queueReason(id string) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.queueReasons[id]
+}
+
+// ---------------------------------------------------------------------------
+// extension stores: dynamic generation, downstream claims, usage, artifact
+// lookup, run downstream tracking
+// ---------------------------------------------------------------------------
+
+func (f *dbFakeStore) InsertGeneratedJobs(ctx context.Context, parentJobID string, depth int, jobs map[string]model.Job, deps map[string][]string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.jobs[parentJobID]; !ok {
+		return storage.ErrNotFound
+	}
+	for id, j := range jobs {
+		f.jobs[id] = j
+	}
+	return nil
+}
+
+func (f *dbFakeStore) InsertDownstreamLink(ctx context.Context, l storage.DownstreamLink) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := l.ParentJobID + "\x00" + l.TargetRepo + "\x00" + l.TargetRef
+	if l.CreatedAt.IsZero() {
+		l.CreatedAt = time.Now().UTC()
+	}
+	if _, ok := f.downstreamLinks[key]; ok {
+		return nil
+	}
+	f.downstreamLinks[key] = l
+	return nil
+}
+
+func (f *dbFakeStore) GetDownstreamLink(ctx context.Context, parentJobID, targetRepo, targetRef string) (storage.DownstreamLink, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	l, ok := f.downstreamLinks[parentJobID+"\x00"+targetRepo+"\x00"+targetRef]
+	return l, ok, nil
+}
+
+func (f *dbFakeStore) MarkDownstreamLaunched(ctx context.Context, parentJobID, targetRepo, targetRef, childRunID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := parentJobID + "\x00" + targetRepo + "\x00" + targetRef
+	l, ok := f.downstreamLinks[key]
+	if !ok || l.ChildRunID != "" {
+		return nil
+	}
+	l.ChildRunID = childRunID
+	f.downstreamLinks[key] = l
+	return nil
+}
+
+func (f *dbFakeStore) RecentUsage(ctx context.Context, since time.Time) (float64, float64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var cost, energy float64
+	for _, j := range f.jobs {
+		if j.FinishedAt == nil || j.FinishedAt.Before(since) {
+			continue
+		}
+		cost += j.Cost
+		energy += j.EnergyWh
+	}
+	return cost, energy, nil
+}
+
+func (f *dbFakeStore) AppendDownstreamRun(ctx context.Context, runID, childRunID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.runs[runID]
+	if !ok {
+		return storage.ErrNotFound
+	}
+	for _, id := range r.DownstreamRuns {
+		if id == childRunID {
+			return nil
+		}
+	}
+	r.DownstreamRuns = append(r.DownstreamRuns, childRunID)
+	f.runs[runID] = r
+	return nil
+}
+
+func (f *dbFakeStore) ReopenRunForChildren(ctx context.Context, runID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.runs[runID]
+	if !ok {
+		return storage.ErrNotFound
+	}
+	if r.Status != model.StatusSuccess {
+		return nil
+	}
+	r.Status = model.StatusRunning
+	r.FinishedAt = nil
+	f.runs[runID] = r
+	return nil
+}
+
+func (f *dbFakeStore) GetArtifact(ctx context.Context, id string) (model.ArtifactRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, a := range f.artifacts {
+		if a.ID == id {
+			return a, nil
+		}
+	}
+	return model.ArtifactRecord{}, storage.ErrNotFound
 }

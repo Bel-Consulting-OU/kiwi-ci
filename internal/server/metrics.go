@@ -88,6 +88,12 @@ func NewMetrics() *Metrics {
 	m.declare("kiwi_scheduler_loop_duration_seconds", "Scheduler housekeeping loop duration", "histogram", defaultHistogramBounds)
 	m.declare("kiwi_runner_saturation", "Fraction of runner capacity in use (busy slots / total slots)", "gauge", nil)
 	m.declare("kiwi_db_pool", "Database pool statistics by stat name", "gauge", nil)
+	m.declare("kiwi_usage_cost_total", "Aggregated job cost recorded at completion", "counter", nil)
+	m.declare("kiwi_usage_energy_total", "Aggregated job energy (Wh) recorded at completion", "counter", nil)
+	m.declare("kiwi_dynamic_jobs_generated_total", "Dynamically generated child jobs admitted", "counter", nil)
+	m.declare("kiwi_dynamic_jobs_rejected_total", "Dynamically generated child jobs rejected", "counter", nil)
+	m.declare("kiwi_downstream_launches_total", "Cross-repo downstream runs launched", "counter", nil)
+	m.declare("kiwi_downstream_skips_total", "Cross-repo downstream dispatches skipped (already launched)", "counter", nil)
 	return m
 }
 

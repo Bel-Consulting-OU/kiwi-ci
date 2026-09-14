@@ -15,8 +15,15 @@ func (s *Server) liveness(w http.ResponseWriter, _ *http.Request) {
 
 // readiness reports whether the control plane can serve traffic. In dev mode
 // the in-memory maps are always ready. In DB mode the store must answer a
-// probe (leader or standby with a live pool); otherwise 503.
+// probe (leader or standby with a live pool); otherwise 503. A draining
+// control plane is deliberately not ready: new leases are refused, so a load
+// balancer must route traffic away while in-flight jobs finish.
 func (s *Server) readiness(w http.ResponseWriter, r *http.Request) {
+	if s.isDraining() {
+		w.Header().Set("X-Kiwi-Draining", "true")
+		http.Error(w, "control plane draining", http.StatusServiceUnavailable)
+		return
+	}
 	if s.DB == nil {
 		w.WriteHeader(http.StatusOK)
 		return

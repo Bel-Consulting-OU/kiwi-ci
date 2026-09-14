@@ -72,7 +72,13 @@ func TestLoadEmptyPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	caps := cfg.CapabilitiesFor("org/app")
-	if caps.Network != pipeline.NetworkPolicyDefault {
-		t.Fatalf("empty policy must not restrict network, got %v", caps.Network)
+	if caps.Network != pipeline.NetworkPolicyInternet {
+		t.Fatalf("empty policy must pass network through unrestricted, got %v", caps.Network)
+	}
+	if !caps.Container || !caps.NativeExecution {
+		t.Fatal("empty policy must pass runtime capabilities through unrestricted")
+	}
+	if !caps.OIDCAllows("any-audience.example") {
+		t.Fatal("empty policy must pass OIDC through unrestricted")
 	}
 }

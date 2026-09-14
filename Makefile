@@ -82,3 +82,12 @@ run:
 
 clean:
 	rm -rf dist coverage.out .kiwi/cache .kiwi/artifacts .kiwi/runs .kiwi/workspaces
+
+.PHONY: release docker-build
+
+release:
+	./scripts/release.sh $(TAG)
+
+docker-build:
+	docker build --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) \
+		-t ghcr.io/bel-consulting-ou/kiwi-ci:$(VERSION) .

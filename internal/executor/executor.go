@@ -17,6 +17,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/logging"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/safefs"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secrets"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/snapshot"
 )
@@ -61,6 +62,18 @@ type Options struct {
 	// any status other than skipped/blocked) under the host temp dir.
 	// Snapshot failures are logged as warnings and never change job status.
 	CaptureSnapshot bool
+	// WorkspaceMaxBytes rejects a job before execution when the filesystem
+	// containing the workspace reports fewer free bytes than the quota, so
+	// an oversized workspace never half-runs. Zero disables the check.
+	WorkspaceMaxBytes int64
+	// LogMaxBytes caps the per-job log stream forwarded to Logs. Once the
+	// quota is exhausted, further lines are dropped after a single terminal
+	// "log quota exceeded" marker. Zero means unlimited.
+	LogMaxBytes int64
+	// StepReporter, when set, is called once per executed step with the
+	// step's wall time (including retries and backoff). Steps that were
+	// skipped or never executed are not reported.
+	StepReporter func(jobID, stepID string, d time.Duration)
 }
 
 type Executor struct {
@@ -170,6 +183,14 @@ func (e *Executor) Run(ctx context.Context, g *pipeline.Graph) (map[string]model
 }
 
 func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.CompiledJob, dependencyStatus model.Status, needsOutputs map[string]map[string]string) model.JobResult {
+	if e.Opt.LogMaxBytes > 0 {
+		// The log quota is scoped per job: wrap the shared sink in a
+		// counting sink on a shallow copy so concurrent jobs keep their own
+		// counters and the shared Options stay untouched.
+		scoped := *e
+		scoped.Opt.Logs = limitedSink(e.Opt.Logs, e.Opt.LogMaxBytes)
+		e = &scoped
+	}
 	start := time.Now()
 	res := model.JobResult{JobID: cj.ID, Status: model.StatusRunning, StartedAt: start}
 	cj.Job.If = pipeline.InterpolateOutputs(cj.Job.If, needsOutputs, nil)
@@ -210,6 +231,15 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		}
 		workspace = dir
 		defer cleanup()
+	}
+	if e.Opt.WorkspaceMaxBytes > 0 {
+		if err := safefs.FitsAvailable(workspace, e.Opt.WorkspaceMaxBytes); err != nil {
+			infra := &RunError{Kind: ErrorInfra, Err: fmt.Errorf("workspace quota: %v", err)}
+			e.log(cj.ID, "workspace", infra.Error())
+			res.Status = model.StatusFailure
+			res.Error = infra.Error()
+			return finish(res)
+		}
 	}
 	baseEnv := cleanExecutionEnv()
 	if e.Opt.InheritEnv {
@@ -318,7 +348,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	// the new status (always(), failure(), cancelled(), ...) still run.
 	currentStatus := model.StatusSuccess
 	var cleanupCtx context.Context
-	for i, st := range cj.Job.Steps {
+	for i, st := range effectiveSteps(cj) {
 		st.Name = pipeline.InterpolateOutputs(st.Name, needsOutputs, stepOutputs)
 		st.Run = pipeline.InterpolateOutputs(st.Run, needsOutputs, stepOutputs)
 		st.If = pipeline.InterpolateOutputs(st.If, needsOutputs, stepOutputs)
@@ -418,6 +448,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		}
 		stepEnvMap["KIWI_OUTPUT"] = filepath.Base(outputFile)
 		stepEnv := envSlice(stepEnvMap)
+		stepStart := time.Now()
 		var runErr error
 		for attempt := 1; attempt <= attempts; attempt++ {
 			if _, isNative := backend.(*NativeBackend); isNative {
@@ -461,6 +492,13 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		}
 		if _, isNative := backend.(*NativeBackend); isNative {
 			_ = os.Remove(outputFile)
+		}
+		if e.Opt.StepReporter != nil {
+			id := st.ID
+			if id == "" {
+				id = name
+			}
+			e.Opt.StepReporter(cj.ID, id, time.Since(stepStart))
 		}
 		if runErr != nil {
 			if st.ContinueOnError {

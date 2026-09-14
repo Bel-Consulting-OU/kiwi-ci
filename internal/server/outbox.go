@@ -256,7 +256,9 @@ func (s *Server) dispatchOutbox(ctx context.Context, item forge.OutboxItem) erro
 			return err
 		}
 		return s.publishGitHubStatusFromPayload(ctx, p)
-	case forge.OutboxKindDownstream, forge.OutboxKindWebhookCall:
+	case forge.OutboxKindDownstream:
+		return s.dispatchDownstream(ctx, item)
+	case forge.OutboxKindWebhookCall:
 		log.Printf("outbox: dropping reserved intent %s (kind %s)", item.ID, item.Kind)
 		return nil
 	default:

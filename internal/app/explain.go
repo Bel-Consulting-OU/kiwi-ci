@@ -1,11 +1,18 @@
 package app
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cache"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/explain"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
@@ -101,4 +108,75 @@ func detectCurrentBranch(workspace string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(b))
+}
+
+// lockfileDigest computes the SHA-256 cache-key digest of a job's lock
+// files with exactly cache.Store.Key semantics: the empty base, a NUL
+// separator, then each glob-matched file's workspace-relative path followed
+// by its content, in sorted path order. It is deterministic and matches the
+// digest the executor derives for a cache entry with an empty key base.
+func lockfileDigest(workspace string, hashFiles []string) (string, error) {
+	h := sha256.New()
+	io.WriteString(h, "\x00")
+	var files []string
+	for _, p := range hashFiles {
+		matches, _ := filepath.Glob(filepath.Join(workspace, p))
+		files = append(files, matches...)
+	}
+	sort.Strings(files)
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			return "", err
+		}
+		rel, _ := filepath.Rel(workspace, f)
+		io.WriteString(h, rel)
+		h.Write(b)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// printCacheInputs renders the cache-key inputs of one compiled job's cache
+// entries: the exact lock files hashed, the computed lockfile digest, the
+// key and restore keys, the toolchain (runtime + os/arch), the trust domain
+// and the restore fallback order.
+func printCacheInputs(w io.Writer, j pipeline.CompiledJob, workspace string) {
+	for i, c := range j.Job.Cache {
+		name := c.Name
+		if name == "" {
+			name = fmt.Sprintf("cache-%d", i+1)
+		}
+		digest := "(none)"
+		if len(c.HashFiles) > 0 {
+			if d, err := lockfileDigest(workspace, c.HashFiles); err == nil {
+				digest = d
+			} else {
+				digest = "(unreadable: " + err.Error() + ")"
+			}
+		}
+		runtimeName := defaultString(j.Job.Runtime, "native")
+		trust := "trusted (local)"
+		fmt.Fprintf(w, "  cache %s:\n", name)
+		fmt.Fprintf(w, "    hash_files: %s\n", strings.Join(c.HashFiles, ", "))
+		fmt.Fprintf(w, "    lockfile digest: %s\n", digest)
+		fmt.Fprintf(w, "    key: %s\n", defaultString(c.Key, "(unset)"))
+		fmt.Fprintf(w, "    restore_keys: %s\n", strings.Join(c.RestoreKeys, ", "))
+		fmt.Fprintf(w, "    toolchain: %s (%s/%s)\n", runtimeName, runtime.GOOS, runtime.GOARCH)
+		fmt.Fprintf(w, "    trust domain: %s\n", trust)
+		fmt.Fprintf(w, "    restore fallback: local then remote\n")
+	}
+}
+
+// printCacheCandidates surfaces cache.InferLockfiles / cache.SuggestCaches
+// candidates for the workspace. These are candidate lines only: nothing is
+// enabled.
+func printCacheCandidates(w io.Writer, workspace string) {
+	suggestions := cache.SuggestCaches(workspace)
+	if len(suggestions) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "cache candidates:\n")
+	for _, s := range suggestions {
+		fmt.Fprintf(w, "  - %s: key_template %q hash_files %s paths %s (%s)\n", s.Name, s.KeyTemplate, strings.Join(s.HashFiles, ", "), strings.Join(s.Paths, ", "), s.Reason)
+	}
 }

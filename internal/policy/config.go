@@ -222,9 +222,38 @@ func (c *Config) CompileOPA() (*OPAPolicy, error) {
 // CapabilitiesFor derives the capability intersection for a repository from
 // org-level and repo-level policy. The result must always be further
 // intersected with the caller's base capabilities and the trust floor.
+// GrantsFor returns the boolean capabilities explicitly granted by the
+// policy file for a repository: Deployments, CrossRepoTrigger, and
+// GenerateChildGraph are denied by the trust-domain defaults and can only be
+// enabled by an explicit policy statement. Unspecified grants stay false.
+func (c *Config) GrantsFor(repoFullName string) Capabilities {
+	var g Capabilities
+	rp, ok := c.Repositories[repoFullName]
+	if !ok {
+		return g
+	}
+	g.Deployments = rp.Deployments != nil && *rp.Deployments
+	g.CrossRepoTrigger = rp.CrossRepoTrigger != nil && *rp.CrossRepoTrigger
+	g.GenerateChildGraph = rp.GenerateChildGraph != nil && *rp.GenerateChildGraph
+	return g
+}
+
+// CapabilitiesFor derives the capability RESTRICTION for a repository from
+// org-level and repo-level policy. Unspecified fields pass through
+// unrestricted (booleans true, Network Internet, nil sets), because the
+// result is intersected with the caller's base capabilities: a zero-value
+// field here would silently deny everything.
 func (c *Config) CapabilitiesFor(repoFullName string) Capabilities {
 	rest := Capabilities{
-		Network: pipeline.NetworkPolicyDefault,
+		NativeExecution:    true,
+		Container:          true,
+		Tart:               true,
+		Network:            pipeline.NetworkPolicyInternet,
+		CacheRead:          true,
+		CacheWrite:         true,
+		Deployments:        true,
+		GenerateChildGraph: true,
+		CrossRepoTrigger:   true,
 	}
 	if c.RequireRootless {
 		rest.NativeExecution = false

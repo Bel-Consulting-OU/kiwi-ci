@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
@@ -26,6 +27,8 @@ type Config struct {
 func Run(ctx context.Context, cfg Config, out io.Writer, in io.Reader) error {
 	lines := NewRing[string](10_000)
 	client := &Client{Server: cfg.Server, Token: cfg.Token}
+	filter := newJobFilter(client, cfg.RunID, cfg.JobKey)
+	state := &logState{}
 	after := int64(0)
 	for {
 		page, err := client.ReadPage(ctx, cfg.RunID, after, 1000)
@@ -33,7 +36,8 @@ func Run(ctx context.Context, cfg Config, out io.Writer, in io.Reader) error {
 			return fmt.Errorf("tui: read logs: %w", err)
 		}
 		for _, e := range page {
-			if cfg.JobKey != "" && e.JobKey != cfg.JobKey {
+			state.set(e.Seq)
+			if !filter.matches(e.JobKey) {
 				continue
 			}
 			lines.Append(formatEntry(entryFromModel(e)))
@@ -53,7 +57,11 @@ func Run(ctx context.Context, cfg Config, out io.Writer, in io.Reader) error {
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- client.Follow(streamCtx, cfg.RunID, after, func(e model.LogEntry) {
-			if cfg.JobKey == "" || e.JobKey == cfg.JobKey {
+			if e.Seq <= state.get() {
+				return
+			}
+			state.set(e.Seq)
+			if filter.matches(e.JobKey) {
 				lines.Append(formatEntry(entryFromModel(e)))
 			}
 		})
@@ -71,7 +79,124 @@ func Run(ctx context.Context, cfg Config, out io.Writer, in io.Reader) error {
 		return renderPlain(lines.Slice(), cfg.Search, out)
 	}
 	defer term.Restore()
-	return runInteractive(ctx, lines, cfg, out, in, errCh)
+	return runInteractive(ctx, lines, &cfg, out, in, errCh, filter, state)
+}
+
+// logState tracks the highest log sequence consumed across the initial
+// read, job-filter refetches and the follow stream so entries are never
+// rendered twice when a refetch re-reads the backlog.
+type logState struct {
+	mu    sync.Mutex
+	after int64
+}
+
+func (s *logState) get() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.after
+}
+
+func (s *logState) set(v int64) {
+	s.mu.Lock()
+	if v > s.after {
+		s.after = v
+	}
+	s.mu.Unlock()
+}
+
+// jobFilter is the interactive job-key filter: the full job list is fetched
+// from GET /api/v1/runs/{id}/jobs once (lazily, on the first "j" press) and
+// each "j" press cycles the active key. An empty key means "all jobs".
+type jobFilter struct {
+	mu     sync.Mutex
+	client *Client
+	runID  string
+	key    string
+	jobs   []string
+	loaded bool
+}
+
+func newJobFilter(client *Client, runID, key string) *jobFilter {
+	return &jobFilter{client: client, runID: runID, key: key}
+}
+
+func (f *jobFilter) matches(jobKey string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.key == "" || jobKey == f.key
+}
+
+// cycle fetches the job list once, cycles the active filter key and
+// returns the new key. A fetch failure leaves the filter unchanged.
+func (f *jobFilter) cycle(ctx context.Context) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.loaded {
+		jobs, err := f.client.ListJobs(ctx, f.runID)
+		if err != nil {
+			return f.key, err
+		}
+		f.jobs = jobs
+		f.loaded = true
+	}
+	if len(f.jobs) == 0 {
+		return f.key, nil
+	}
+	f.key = cycleJobFilter(f.jobs, f.key)
+	return f.key, nil
+}
+
+// cycleJobFilter returns the next job filter after current. The cycle is
+// "" (all jobs) -> first job -> ... -> last job -> "" (all jobs). A current
+// key that is not in the list moves to the first job.
+func cycleJobFilter(jobs []string, current string) string {
+	if len(jobs) == 0 {
+		return current
+	}
+	if current == "" {
+		return jobs[0]
+	}
+	for i, j := range jobs {
+		if j == current {
+			if i+1 < len(jobs) {
+				return jobs[i+1]
+			}
+			return ""
+		}
+	}
+	return jobs[0]
+}
+
+// refetchLogs re-reads the full backlog under the given job filter and
+// replaces the ring contents, advancing the shared sequence cursor so the
+// follow stream does not re-deliver entries already consumed here.
+func refetchLogs(ctx context.Context, client *Client, runID, jobKey string, lines *Ring[string], state *logState) error {
+	after := int64(0)
+	var collected []string
+	for {
+		page, err := client.ReadPage(ctx, runID, after, 1000)
+		if err != nil {
+			return err
+		}
+		for _, e := range page {
+			state.set(e.Seq)
+			if jobKey != "" && e.JobKey != jobKey {
+				continue
+			}
+			collected = append(collected, formatEntry(entryFromModel(e)))
+		}
+		if len(page) < 1000 {
+			break
+		}
+		for _, e := range page {
+			after = e.Seq
+		}
+	}
+	lines.Reset()
+	for _, l := range collected {
+		lines.Append(l)
+	}
+	return nil
 }
 
 // logEntry is the minimal internal log record the TUI renders.
@@ -104,7 +229,7 @@ func renderPlain(lines []string, search string, out io.Writer) error {
 	return nil
 }
 
-func runInteractive(ctx context.Context, lines *Ring[string], cfg Config, out io.Writer, in io.Reader, errCh <-chan error) error {
+func runInteractive(ctx context.Context, lines *Ring[string], cfg *Config, out io.Writer, in io.Reader, errCh <-chan error, filter *jobFilter, state *logState) error {
 	cursor := 0
 	pattern := cfg.Search
 	matches := []int{}
@@ -115,8 +240,12 @@ func runInteractive(ctx context.Context, lines *Ring[string], cfg Config, out io
 	frame := func() {
 		slice := lines.Slice()
 		matches = findMatches(slice, pattern)
+		jobLabel := cfg.JobKey
+		if jobLabel == "" {
+			jobLabel = "all"
+		}
 		fmt.Fprint(out, "\x1b[2J\x1b[H")
-		fmt.Fprintf(out, "run %s | job %s | %d lines | /search: %q | q quit\n", cfg.RunID, cfg.JobKey, len(slice), pattern)
+		fmt.Fprintf(out, "run %s | job %s | %d lines | j cycle job | /search: %q | q quit\n", cfg.RunID, jobLabel, len(slice), pattern)
 		for _, l := range renderFrame(slice, cursor, stepCollapsed, matches, 30, 132) {
 			fmt.Fprintln(out, l)
 		}
@@ -163,13 +292,27 @@ func runInteractive(ctx context.Context, lines *Ring[string], cfg Config, out io
 			case "end":
 				cursor = len(slice) - 1
 			case "tab":
-				if group := stepName(slice[cursor]); group != "" {
-					stepCollapsed[group] = !stepCollapsed[group]
+				if len(slice) > 0 && cursor < len(slice) {
+					if group := stepName(slice[cursor]); group != "" {
+						stepCollapsed[group] = !stepCollapsed[group]
+					}
 				}
 			case "j":
-				// cycle job filter: the full job list is fetched lazily; the
-				// interactive session refines the filter from the stream.
-				// (jobs endpoint integration lives in the CLI wiring phase.)
+				// Cycle the active job-key filter: the job list is fetched
+				// once from GET /api/v1/runs/{id}/jobs, the filter advances
+				// to the next job key (wrapping back to "all"), the log
+				// backlog is refetched under the new filter, and the header
+				// reflects the new active job.
+				key, err := filter.cycle(ctx)
+				if err != nil {
+					fmt.Fprintf(out, "\njob list fetch failed: %v\n", err)
+					break
+				}
+				cfg.JobKey = key
+				if err := refetchLogs(ctx, filter.client, cfg.RunID, key, lines, state); err != nil {
+					fmt.Fprintf(out, "\nlog refetch failed: %v\n", err)
+				}
+				cursor = 0
 			case "f":
 				for i, l := range slice {
 					if strings.Contains(strings.ToLower(l), "fail") || strings.Contains(l, "error:") {

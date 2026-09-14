@@ -197,6 +197,62 @@ type QueueReasonStore interface {
 	SetQueueReasons(ctx context.Context, reasons map[string]string) error
 }
 
+// DownstreamLink is one cross-repo dispatch claim: a parent job's downstream
+// declaration resolved to a target repository/ref. The link row is the
+// exactly-once claim: MarkDownstreamLaunched records the child run ID, and a
+// link whose ChildRunID is already set is never launched twice.
+type DownstreamLink struct {
+	ParentJobID string    `json:"parent_job_id"`
+	TargetRepo  string    `json:"target_repo"`
+	TargetRef   string    `json:"target_ref"`
+	LaunchToken string    `json:"launch_token"`
+	ChildRunID  string    `json:"child_run_id,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// DynamicStore persists atomically generated child jobs uploaded by a
+// runner under an active lease (dynamic pipeline generation). The jobs are
+// already fully compiled (IDs, needs resolved); the transaction makes the
+// whole fragment visible or nothing.
+type DynamicStore interface {
+	InsertGeneratedJobs(ctx context.Context, parentJobID string, depth int, jobs map[string]model.Job, deps map[string][]string) error
+}
+
+// DownstreamStore is the durable cross-repo dispatch claim contract.
+// InsertDownstreamLink records a launch intent (the link row is the claim);
+// GetDownstreamLink reads it; MarkDownstreamLaunched atomically sets the
+// child run ID only when it is not already set (idempotent exactly-once
+// launch).
+type DownstreamStore interface {
+	InsertDownstreamLink(ctx context.Context, l DownstreamLink) error
+	GetDownstreamLink(ctx context.Context, parentJobID, targetRepo, targetRef string) (DownstreamLink, bool, error)
+	MarkDownstreamLaunched(ctx context.Context, parentJobID, targetRepo, targetRef, childRunID string) error
+}
+
+// UsageStore reports aggregated cost and energy usage since a cutoff time
+// (the trailing daily-budget window). PostgresStore derives it from the
+// cost/energy fields stored inside the jobs payload column.
+type UsageStore interface {
+	RecentUsage(ctx context.Context, since time.Time) (cost, energy float64, err error)
+}
+
+// RunDownstreamStore persists the parent run's child-run tracking for
+// downstream wait=true aggregation: AppendDownstreamRun appends childRunID
+// to the run's downstream_runs payload key exactly once (idempotent), and
+// ReopenRunForChildren marks a terminal-success run running again while
+// its wait=true children are still in flight (clearing finished_at).
+type RunDownstreamStore interface {
+	AppendDownstreamRun(ctx context.Context, runID, childRunID string) error
+	ReopenRunForChildren(ctx context.Context, runID string) error
+}
+
+// ArtifactLookupStore resolves one artifact record by ID (the artifact
+// download path in DB mode). PostgresStore reads the artifacts table's
+// payload column.
+type ArtifactLookupStore interface {
+	GetArtifact(ctx context.Context, id string) (model.ArtifactRecord, error)
+}
+
 // ValidateID checks the canonical control-plane identifier format produced
 // by the server's crypto/rand ID generator: 32 lowercase hex characters.
 // Runs, jobs, runners, artifacts, reports, and audit events all share it.

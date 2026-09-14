@@ -54,6 +54,11 @@ var (
 	_ SnapshotStore         = (*FaultyStore)(nil)
 	_ ArtifactContractStore = (*FaultyStore)(nil)
 	_ QueueReasonStore      = (*FaultyStore)(nil)
+	_ DynamicStore          = (*FaultyStore)(nil)
+	_ DownstreamStore       = (*FaultyStore)(nil)
+	_ UsageStore            = (*FaultyStore)(nil)
+	_ RunDownstreamStore    = (*FaultyStore)(nil)
+	_ ArtifactLookupStore   = (*FaultyStore)(nil)
 )
 
 func (f *FaultyStore) Close() error { return f.Inner.Close() }
@@ -404,6 +409,63 @@ func (f *FaultyStore) SetQueueReasons(ctx context.Context, reasons map[string]st
 	return f.Inner.(QueueReasonStore).SetQueueReasons(ctx, reasons)
 }
 
+func (f *FaultyStore) InsertGeneratedJobs(ctx context.Context, parentJobID string, depth int, jobs map[string]model.Job, deps map[string][]string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(DynamicStore).InsertGeneratedJobs(ctx, parentJobID, depth, jobs, deps)
+}
+
+func (f *FaultyStore) InsertDownstreamLink(ctx context.Context, l DownstreamLink) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(DownstreamStore).InsertDownstreamLink(ctx, l)
+}
+
+func (f *FaultyStore) GetDownstreamLink(ctx context.Context, parentJobID, targetRepo, targetRef string) (DownstreamLink, bool, error) {
+	return f.Inner.(DownstreamStore).GetDownstreamLink(ctx, parentJobID, targetRepo, targetRef)
+}
+
+func (f *FaultyStore) MarkDownstreamLaunched(ctx context.Context, parentJobID, targetRepo, targetRef, childRunID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(DownstreamStore).MarkDownstreamLaunched(ctx, parentJobID, targetRepo, targetRef, childRunID)
+}
+
+func (f *FaultyStore) RecentUsage(ctx context.Context, since time.Time) (float64, float64, error) {
+	return f.Inner.(UsageStore).RecentUsage(ctx, since)
+}
+
+func (f *FaultyStore) AppendDownstreamRun(ctx context.Context, runID, childRunID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(RunDownstreamStore).AppendDownstreamRun(ctx, runID, childRunID)
+}
+
+func (f *FaultyStore) ReopenRunForChildren(ctx context.Context, runID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(RunDownstreamStore).ReopenRunForChildren(ctx, runID)
+}
+
+func (f *FaultyStore) GetArtifact(ctx context.Context, id string) (model.ArtifactRecord, error) {
+	return f.Inner.(ArtifactLookupStore).GetArtifact(ctx, id)
+}
+
 // memStore is a fully functional in-memory Store used as the fault-free
 // baseline underneath FaultyStore in fault-injection tests.
 type memStore struct {
@@ -423,6 +485,7 @@ type memStore struct {
 	deployments []model.Deployment
 	snapshots   []model.SnapshotRecord
 	contracts   map[string]map[string]ArtifactContract
+	downstream  map[string]DownstreamLink
 }
 
 func newMemStore() *memStore {
@@ -435,6 +498,7 @@ func newMemStore() *memStore {
 		schedules:   map[string]Schedule{},
 		occurrences: map[string]map[time.Time]string{},
 		contracts:   map[string]map[string]ArtifactContract{},
+		downstream:  map[string]DownstreamLink{},
 	}
 }
 
@@ -447,6 +511,11 @@ var (
 	_ SnapshotStore         = (*memStore)(nil)
 	_ ArtifactContractStore = (*memStore)(nil)
 	_ QueueReasonStore      = (*memStore)(nil)
+	_ DynamicStore          = (*memStore)(nil)
+	_ DownstreamStore       = (*memStore)(nil)
+	_ UsageStore            = (*memStore)(nil)
+	_ RunDownstreamStore    = (*memStore)(nil)
+	_ ArtifactLookupStore   = (*memStore)(nil)
 )
 
 func (m *memStore) Close() error { return nil }
@@ -979,4 +1048,109 @@ func (m *memStore) SetQueueReasons(ctx context.Context, reasons map[string]strin
 		}
 	}
 	return nil
+}
+
+func (m *memStore) InsertGeneratedJobs(ctx context.Context, parentJobID string, depth int, jobs map[string]model.Job, deps map[string][]string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.jobs[parentJobID]; !ok {
+		return ErrNotFound
+	}
+	for id, j := range jobs {
+		m.jobs[id] = j
+	}
+	return nil
+}
+
+func (m *memStore) InsertDownstreamLink(ctx context.Context, l DownstreamLink) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := l.ParentJobID + "\x00" + l.TargetRepo + "\x00" + l.TargetRef
+	if l.CreatedAt.IsZero() {
+		l.CreatedAt = time.Now().UTC()
+	}
+	if prev, ok := m.downstream[key]; ok {
+		_ = prev
+		return nil
+	}
+	m.downstream[key] = l
+	return nil
+}
+
+func (m *memStore) GetDownstreamLink(ctx context.Context, parentJobID, targetRepo, targetRef string) (DownstreamLink, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	l, ok := m.downstream[parentJobID+"\x00"+targetRepo+"\x00"+targetRef]
+	return l, ok, nil
+}
+
+func (m *memStore) MarkDownstreamLaunched(ctx context.Context, parentJobID, targetRepo, targetRef, childRunID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := parentJobID + "\x00" + targetRepo + "\x00" + targetRef
+	l, ok := m.downstream[key]
+	if !ok || l.ChildRunID != "" {
+		return nil
+	}
+	l.ChildRunID = childRunID
+	m.downstream[key] = l
+	return nil
+}
+
+func (m *memStore) RecentUsage(ctx context.Context, since time.Time) (float64, float64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var cost, energy float64
+	for _, j := range m.jobs {
+		if j.FinishedAt == nil || j.FinishedAt.Before(since) {
+			continue
+		}
+		cost += j.Cost
+		energy += j.EnergyWh
+	}
+	return cost, energy, nil
+}
+
+func (m *memStore) AppendDownstreamRun(ctx context.Context, runID, childRunID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.runs[runID]
+	if !ok {
+		return ErrNotFound
+	}
+	for _, id := range r.DownstreamRuns {
+		if id == childRunID {
+			return nil
+		}
+	}
+	r.DownstreamRuns = append(r.DownstreamRuns, childRunID)
+	m.runs[runID] = r
+	return nil
+}
+
+func (m *memStore) ReopenRunForChildren(ctx context.Context, runID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.runs[runID]
+	if !ok {
+		return ErrNotFound
+	}
+	if r.Status != model.StatusSuccess {
+		return nil
+	}
+	r.Status = model.StatusRunning
+	r.FinishedAt = nil
+	m.runs[runID] = r
+	return nil
+}
+
+func (m *memStore) GetArtifact(ctx context.Context, id string) (model.ArtifactRecord, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, a := range m.artifacts {
+		if a.ID == id {
+			return a, nil
+		}
+	}
+	return model.ArtifactRecord{}, ErrNotFound
 }

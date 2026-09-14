@@ -2,7 +2,8 @@
 #
 # IMPORTANT: the golang image below is pinned to a placeholder digest and
 # MUST be replaced with a real golang@sha256:... digest before this pipeline
-# is used, so that jobs cannot be swapped by mutable image tags.
+# is used (pin before use), so that jobs cannot be swapped by mutable image
+# tags.
 version: 1
 name: kiwi-ci-self-host
 
@@ -10,12 +11,16 @@ defaults:
   shell: bash
 
 env:
-  GOCACHE: .kiwi/go-cache
+  GOCACHE: /kiwi/cache
+
+concurrency:
+  group: "${{ repo.full_name }}:${{ git.branch }}"
+  cancel_in_progress: true
 
 jobs:
   quality:
     runtime: container
-    image: golang@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    image: golang@sha256:0000000000000000000000000000000000000000000000000000000000000000 # pin before use
     sandbox:
       rootless: true
       network: none
@@ -28,13 +33,13 @@ jobs:
   test:
     needs: [quality]
     runtime: container
-    image: golang@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    image: golang@sha256:0000000000000000000000000000000000000000000000000000000000000000 # pin before use
     sandbox:
       rootless: true
       network: none
     cache:
       - name: go-cache
-        paths: [.kiwi/go-cache]
+        paths: [.kiwi/cache]
         hash_files: [go.sum]
     steps:
       - name: build

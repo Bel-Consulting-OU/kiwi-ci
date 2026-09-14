@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -18,7 +19,9 @@ import (
 	"time"
 
 	v1 "github.com/Bel-Consulting-OU/kiwi-ci/internal/api/v1"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/blob"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cache"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cas"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/provenance"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
@@ -170,16 +173,40 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 		return
 	}
 	dst := filepath.Join(dir, id+".tar.gz")
-	if err := os.Rename(tmp, dst); err != nil {
+	// DB-mode CAS transport: the payload bytes become a CAS blob object
+	// addressed by their digest (shared across replicas); the artifact
+	// record carries the "cas:" marker path so downloads resolve through
+	// the shared store. Legacy local files remain the fallback.
+	casMode := s.DB != nil && s.CAS != nil
+	if casMode {
+		tf, oerr := os.Open(tmp)
+		if oerr != nil {
+			_ = os.Remove(tmp)
+			http.Error(w, oerr.Error(), 500)
+			return
+		}
+		if _, perr := s.CAS.Put(ctx, tf); perr != nil {
+			_ = tf.Close()
+			_ = os.Remove(tmp)
+			http.Error(w, perr.Error(), 500)
+			return
+		}
+		_ = tf.Close()
 		_ = os.Remove(tmp)
-		http.Error(w, err.Error(), 500)
-		return
+	} else {
+		if err := os.Rename(tmp, dst); err != nil {
+			_ = os.Remove(tmp)
+			http.Error(w, err.Error(), 500)
+			return
+		}
 	}
 	// The lease must still be live at commit time.
 	if s.DB != nil {
 		current, gerr := s.jobForLease(ctx, j.ID)
 		if gerr != nil || !s.validActiveLease(current, runnerID, token, gen, time.Now().UTC()) {
-			_ = os.Remove(dst)
+			if !casMode {
+				_ = os.Remove(dst)
+			}
 			http.Error(w, "lease expired during upload", http.StatusConflict)
 			return
 		}
@@ -196,6 +223,9 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 	}
 	createdAt := time.Now().UTC()
 	rec := model.ArtifactRecord{ID: id, RunID: j.RunID, JobID: j.ID, JobKey: j.Key, Name: name, Path: dst, Size: n, SHA256: digest, ContentType: "application/gzip", CreatedAt: createdAt, LeaseGeneration: gen}
+	if casMode {
+		rec.Path = "cas:" + digest
+	}
 	if retention := contractRetention(contract.Retention); retention > 0 {
 		expires := createdAt.Add(retention)
 		rec.ExpiresAt = &expires
@@ -302,24 +332,56 @@ func (s *Server) listArtifacts(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) downloadArtifact(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	s.mu.Lock()
-	a, ok := s.artifacts[id]
-	s.mu.Unlock()
-	if !ok {
+	rec, err := s.artifactRecord(r.Context(), id)
+	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	f, err := os.Open(a.Path)
+	f, err := s.openArtifact(r.Context(), rec)
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
 	defer f.Close()
-	w.Header().Set("Content-Type", a.ContentType)
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.tar.gz"`, cleanBlobName(a.Name)))
-	w.Header().Set("X-Kiwi-Content-SHA256", a.SHA256)
-	w.Header().Set("Content-Length", strconv.FormatInt(a.Size, 10))
+	w.Header().Set("Content-Type", rec.ContentType)
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.tar.gz"`, cleanBlobName(rec.Name)))
+	w.Header().Set("X-Kiwi-Content-SHA256", rec.SHA256)
+	w.Header().Set("Content-Length", strconv.FormatInt(rec.Size, 10))
 	_, _ = io.Copy(w, f)
+}
+
+// artifactRecord loads one artifact record: from the store in DB mode
+// (the shared artifact table is authoritative there), from the in-memory
+// map otherwise.
+func (s *Server) artifactRecord(ctx context.Context, id string) (model.ArtifactRecord, error) {
+	if s.DB != nil {
+		if ls, ok := s.DB.(storage.ArtifactLookupStore); ok {
+			return ls.GetArtifact(ctx, id)
+		}
+		return model.ArtifactRecord{}, storage.ErrNotFound
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a, ok := s.artifacts[id]
+	if !ok {
+		return model.ArtifactRecord{}, storage.ErrNotFound
+	}
+	return a, nil
+}
+
+// openArtifact resolves an artifact's bytes: CAS mode records (marker path
+// "cas:" prefix, or DB-mode records with a digest and no local path)
+// resolve through the shared content-addressed store; everything else
+// falls back to the legacy local file.
+func (s *Server) openArtifact(ctx context.Context, rec model.ArtifactRecord) (io.ReadCloser, error) {
+	if s.CAS != nil && (strings.HasPrefix(rec.Path, "cas:") || (rec.Path == "" && rec.SHA256 != "")) {
+		rc, _, err := s.CAS.Open(ctx, rec.SHA256)
+		return rc, err
+	}
+	if rec.Path == "" {
+		return nil, os.ErrNotExist
+	}
+	return os.Open(rec.Path)
 }
 
 func (s *Server) uploadCache(w http.ResponseWriter, r *http.Request) {
@@ -470,7 +532,11 @@ func (s *Server) cleanupExpiredArtifactsLocked(now time.Time) int {
 		if a.ExpiresAt == nil || a.ExpiresAt.After(now) {
 			continue
 		}
-		_ = os.Remove(a.Path)
+		// CAS-mode records share content-addressed blobs; only the record
+		// is removed, never the blob (other records may reference it).
+		if !strings.HasPrefix(a.Path, "cas:") {
+			_ = os.Remove(a.Path)
+		}
 		if a.ProvenancePath != "" {
 			_ = os.Remove(a.ProvenancePath)
 		}
@@ -479,6 +545,14 @@ func (s *Server) cleanupExpiredArtifactsLocked(now time.Time) int {
 		s.auditLocked("artifact.expired", "scheduler", a.RunID, a.JobID, "artifact retention expired", map[string]string{"name": a.Name})
 	}
 	return removed
+}
+
+// SetBlobStore replaces the CAS blob backend (the app agent wires the S3
+// backend here when config selects blob.backend = "s3"; the default remains
+// the filesystem store under dataDir/cas).
+func (s *Server) SetBlobStore(b blob.Store) {
+	s.BlobStore = b
+	s.CAS = cas.New(b)
 }
 
 func cleanBlobName(s string) string {

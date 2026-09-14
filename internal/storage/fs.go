@@ -24,6 +24,11 @@ type Snapshot struct {
 	Runners   map[string]model.Runner         `json:"runners"`
 	Artifacts map[string]model.ArtifactRecord `json:"artifacts,omitempty"`
 	Reports   map[string]model.TestReport     `json:"reports,omitempty"`
+	// DownstreamLinks persists the fs-mode downstream dispatch claims
+	// (downstream_links equivalents) so a restarted control plane cannot
+	// launch the same child run twice. Additive; older snapshots load with
+	// a nil map.
+	DownstreamLinks map[string]DownstreamLink `json:"downstream_links,omitempty"`
 }
 
 type Repository struct {
@@ -65,6 +70,9 @@ func (r *Repository) loadLocked() (Snapshot, error) {
 	}
 	if s.Reports == nil {
 		s.Reports = map[string]model.TestReport{}
+	}
+	if s.DownstreamLinks == nil {
+		s.DownstreamLinks = map[string]DownstreamLink{}
 	}
 	return s, nil
 }

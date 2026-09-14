@@ -405,7 +405,6 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		fmt.Printf("[%s/%s] %s\n", job, step, msg)
 		_ = r.post(parent, "/api/v1/jobs/"+t.Job.ID+"/log", server.LogLine{RunnerID: r.ID, LeaseToken: t.LeaseToken, LeaseGeneration: t.LeaseGeneration, JobKey: job, Step: step, Line: msg}, nil)
 	})
-	stepTimer := &stepTimer{m: r.Metrics}
 	if cj.Job.Tests.Shards > 0 {
 		if err := r.applyTestShards(ctx, t, &cj); err != nil {
 			sink.WriteLine(cj.ID, "tests", "shard warning: "+err.Error())
@@ -423,9 +422,12 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// Distributed runs always start from the clean env (InheritEnv is left
 	// false and no PassEnv allowlist is set); untrusted jobs additionally
 	// require image references pinned by digest.
-	ex := executor.Executor{Opt: executor.Options{Workspace: tmp, RunID: t.Job.RunID, Event: t.Job.Event, Branch: branchFromRef(t.Job.Ref), ChangedFiles: effectiveChangedFiles(t.Job.ChangedFiles, tmp), SecretProvider: provider, Logs: logging.Func(func(job, step, line string) { sink.WriteLine(job, step, line); stepTimer.WriteLine(job, step, line) }), Cache: cacheStore, Artifacts: artifactStore, ArtifactReporter: reporter, DependencyStatus: t.Job.DependencyStatus, NeedsOutputs: t.Job.NeedsOutputs, CacheNamespace: cacheNamespace(t.Job), RequireImmutableImages: !t.Job.Trusted}, Masker: masker}
+	opts := executor.Options{Workspace: tmp, RunID: t.Job.RunID, Event: t.Job.Event, Branch: branchFromRef(t.Job.Ref), ChangedFiles: effectiveChangedFiles(t.Job.ChangedFiles, tmp), SecretProvider: provider, Logs: logging.Func(func(job, step, line string) { sink.WriteLine(job, step, line) }), Cache: cacheStore, Artifacts: artifactStore, ArtifactReporter: reporter, DependencyStatus: t.Job.DependencyStatus, NeedsOutputs: t.Job.NeedsOutputs, CacheNamespace: cacheNamespace(t.Job), RequireImmutableImages: !t.Job.Trusted}
+	// Step durations come from the executor's wall-clock step measurements
+	// (StepReporter), never from sink-derived log timing.
+	applyStepReporter(&opts, r.Metrics)
+	ex := executor.Executor{Opt: opts, Masker: masker}
 	res := ex.RunCompiledJob(ctx, spec, cj)
-	stepTimer.flush()
 	if len(cj.Job.TestReports) > 0 {
 		report, er := testintel.Aggregate(tmp, cj.Job.TestReports)
 		if er != nil {

@@ -39,6 +39,11 @@ type Run struct {
 	StartedAt        *time.Time        `json:"started_at,omitempty"`
 	FinishedAt       *time.Time        `json:"finished_at,omitempty"`
 	Metadata         map[string]string `json:"metadata,omitempty"`
+	// DownstreamRuns lists the child runs launched by this run's downstream
+	// dispatches (cross-repo triggering). Non-empty only for runs whose jobs
+	// declare downstream with wait=true; the run's aggregation keeps those
+	// child runs in view until they finish. Additive.
+	DownstreamRuns []string `json:"downstream_runs,omitempty"`
 }
 
 // Job is the control-plane representation of one compiled job. It deliberately
@@ -50,6 +55,7 @@ type Job struct {
 	Key                    string   `json:"key"`
 	BaseKey                string   `json:"base_key,omitempty"`
 	RepoURL                string   `json:"repo_url"`
+	RepoFullName           string   `json:"repo_full_name,omitempty"`
 	Ref                    string   `json:"ref,omitempty"`
 	SHA                    string   `json:"sha,omitempty"`
 	Event                  string   `json:"event,omitempty"`
@@ -108,6 +114,20 @@ type Job struct {
 	// WaitingSince records when an approval-gated job entered the waiting
 	// state; approval metrics derive the wait duration from it. Additive.
 	WaitingSince *time.Time `json:"waiting_since,omitempty"`
+	// DynamicDepth is the generation depth of a dynamically generated job:
+	// 0 for compiled pipeline jobs, parent depth+1 for generated children.
+	// The control plane bounds it (maxDynamicDepth) so a runner cannot grow
+	// a run's job graph without limit. Additive.
+	DynamicDepth int `json:"dynamic_depth,omitempty"`
+	// CostRate and PowerWatts are the runner's registered rates frozen into
+	// the job at lease time; completion multiplies them by the wall-clock
+	// duration to derive Cost and EnergyWh via quotas.ComputeUsage.
+	// Additive.
+	CostRate   float64 `json:"cost_rate,omitempty"`
+	PowerWatts float64 `json:"power_watts,omitempty"`
+	// Cost and EnergyWh are the usage recorded at completion. Additive.
+	Cost     float64 `json:"cost,omitempty"`
+	EnergyWh float64 `json:"energy_wh,omitempty"`
 }
 
 type Runner struct {

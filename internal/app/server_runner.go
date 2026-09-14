@@ -8,9 +8,13 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/blob"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/config"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
@@ -38,6 +42,64 @@ type productionConfig struct {
 // a database URL, distinct admin/runner credentials (or an explicit
 // --allow-shared-token), an external URL (the OIDC issuer always serves in
 // production), and TLS. Dev mode has no additional requirements.
+// drainTimeout bounds the graceful drain wait on signal.
+const drainTimeout = 30 * time.Second
+
+// drainableServer is the compile-checkable adoption seam for the server
+// agent's graceful-drain methods: BeginDrain marks the control plane
+// draining (no new jobs, runners finish active work) and ActiveJobs reports
+// the number of in-flight jobs. Once *server.Server implements both, the
+// --drain-on-sigterm flag activates automatically.
+type drainableServer interface {
+	BeginDrain(reason string)
+	ActiveJobs() int
+}
+
+// blobStoreSetter is the compile-checkable adoption seam for the server
+// agent's SetBlobStore method: when the server build provides it, the blob
+// backend configured via config (s3 or the data-dir filesystem) is wired
+// in; otherwise a warning is printed and the server defaults apply.
+type blobStoreSetter interface {
+	SetBlobStore(store blob.Store)
+}
+
+// waitForDrain polls ActiveJobs until it is zero or the timeout elapses. It
+// reports whether the drain completed within the bound.
+func waitForDrain(s drainableServer, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if s.ActiveJobs() == 0 {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// buildBlobStore constructs the blob backend from the merged config: s3
+// when blob.backend is s3, otherwise the filesystem rooted at blob.path or
+// <data-dir>/blobs.
+func buildBlobStore(cfg config.BlobConfig, dataDir string) blob.Store {
+	switch cfg.Backend {
+	case "s3":
+		return &blob.S3{
+			Endpoint:        cfg.S3Endpoint,
+			Region:          cfg.S3Region,
+			Bucket:          cfg.S3Bucket,
+			AccessKeyID:     cfg.S3AccessKey,
+			SecretAccessKey: cfg.S3SecretKey,
+		}
+	default:
+		root := cfg.Path
+		if root == "" {
+			root = filepath.Join(dataDir, "blobs")
+		}
+		return blob.NewFS(root)
+	}
+}
+
 func validateProductionConfig(cfg productionConfig) error {
 	switch cfg.Mode {
 	case "dev", "production":
@@ -91,6 +153,7 @@ func Server(ctx context.Context, args []string) error {
 	otelEndpoint := fs.String("otel-endpoint", "", "OpenTelemetry OTLP/HTTP collector endpoint (enables tracing)")
 	rateLimitPerSecond := fs.Float64("rate-limit-per-second", 0, "global request rate limit per principal/runner/IP (0 disables)")
 	rateLimitBurst := fs.Int("rate-limit-burst", 0, "rate limit burst size (default 100)")
+	drainOnSigterm := fs.Bool("drain-on-sigterm", false, "on SIGTERM/SIGINT drain active jobs (up to 30s) before shutting down")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -119,7 +182,7 @@ func Server(ctx context.Context, args []string) error {
 	// The flag pointers exist only to register the flags; their values are
 	// read back through config.OverrideFromFlags (which inspects only
 	// explicitly set flags).
-	discard(listen, token, adminToken, webhookSecret, githubToken, externalURL, tlsCert, tlsKey, runnerCACert, runnerCAKey, runnerEnrollToken, databaseURL, mode, rateLimitPerSecond, rateLimitBurst, otelEndpoint)
+	discard(listen, token, adminToken, webhookSecret, githubToken, externalURL, tlsCert, tlsKey, runnerCACert, runnerCAKey, runnerEnrollToken, databaseURL, mode, rateLimitPerSecond, rateLimitBurst, otelEndpoint, drainOnSigterm)
 
 	// Effective values after the precedence merge.
 	listenV := cfg.Server.Listen
@@ -237,6 +300,40 @@ func Server(ctx context.Context, args []string) error {
 			return err
 		}
 	}
+	// Blob backend wiring: an s3 backend or an explicit data-dir feeds the
+	// server's blob store when the server build provides SetBlobStore.
+	if cfg.Blob.Backend == "s3" || *dataDir != "" {
+		if bs, ok := any(srv).(blobStoreSetter); ok {
+			bs.SetBlobStore(buildBlobStore(cfg.Blob, *dataDir))
+		} else if cfg.Blob.Backend == "s3" {
+			fmt.Println("warning: blob.backend=s3 configured but this server build does not implement SetBlobStore; the s3 backend is inactive")
+		}
+	}
+	// Graceful drain on signal: intercept SIGTERM/SIGINT before the context
+	// shutdown path, ask the control plane to drain, and keep the listener
+	// up until active jobs finish (bounded by drainTimeout).
+	var drainDone <-chan struct{}
+	if *drainOnSigterm {
+		ds, ok := any(srv).(drainableServer)
+		if !ok {
+			return fmt.Errorf("--drain-on-sigterm requires server support (BeginDrain/ActiveJobs), which this build does not provide")
+		}
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+		done := make(chan struct{})
+		drainDone = done
+		go func() {
+			<-sig
+			ds.BeginDrain("signal")
+			fmt.Println("Kiwi server: drain on signal — waiting for active jobs")
+			if waitForDrain(ds, drainTimeout) {
+				fmt.Println("Kiwi server: drained, no active jobs")
+			} else {
+				fmt.Printf("Kiwi server: drain timed out after %s\n", drainTimeout)
+			}
+			close(done)
+		}()
+	}
 	h := &http.Server{
 		Addr:              listenV,
 		Handler:           srv.Handler(),
@@ -249,6 +346,12 @@ func Server(ctx context.Context, args []string) error {
 	go srv.Maintain(ctx)
 	go func() {
 		<-ctx.Done()
+		if drainDone != nil {
+			select {
+			case <-drainDone:
+			case <-time.After(drainTimeout):
+			}
+		}
 		c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = h.Shutdown(c)

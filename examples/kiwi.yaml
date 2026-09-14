@@ -1,4 +1,9 @@
 # yaml-language-server: $schema=../.kiwi/schema.json
+#
+# Kiwi self-test pipeline. Both jobs run in the golang container image,
+# sandboxed (rootless, no network). The image digest below is a PLACEHOLDER:
+# pin before use — replace it with a real golang@sha256:... digest so jobs
+# cannot be swapped by mutable image tags.
 version: 1
 name: kiwi-self-test
 
@@ -11,14 +16,19 @@ defaults:
 
 env:
   CGO_ENABLED: "0"
+  GOCACHE: /kiwi/cache
 
 concurrency:
-  group: "${{ repo }}:${{ branch }}"
+  group: "${{ repo.full_name }}:${{ git.branch }}"
   cancel_in_progress: true
 
 jobs:
   quality:
-    runtime: native
+    runtime: container
+    image: golang@sha256:0000000000000000000000000000000000000000000000000000000000000000 # pin before use
+    sandbox:
+      rootless: true
+      network: none
     steps:
       - name: format
         run: test -z "$(gofmt -l .)"
@@ -27,14 +37,19 @@ jobs:
 
   test:
     needs: [quality]
+    runtime: container
+    image: golang@sha256:0000000000000000000000000000000000000000000000000000000000000000 # pin before use
+    sandbox:
+      rootless: true
+      network: none
     matrix:
       GO_VERSION: ["1.23"]
     cache:
-      - name: go-modules
-        key: "go-modules-${{ matrix.GO_VERSION }}"
+      - name: go-cache
+        key: "go-cache-${{ matrix.GO_VERSION }}"
         hash_files: [go.sum]
         paths:
-          - .kiwi/go-cache
+          - .kiwi/cache
     steps:
       - name: test
         run: go test ./...
@@ -42,11 +57,3 @@ jobs:
       - name: source-snapshot
         if: failure()
         paths: ["*.md"]
-
-  macos-vm-example:
-    if: "false"
-    runtime: tart
-    vm: ghcr.io/cirruslabs/macos-tahoe-base:latest
-    steps:
-      - name: verify-macos
-        run: sw_vers

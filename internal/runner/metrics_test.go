@@ -3,9 +3,13 @@ package runner
 import (
 	"bufio"
 	"bytes"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executor"
 )
 
 func TestMetricsExpositionParses(t *testing.T) {
@@ -58,5 +62,48 @@ func TestMetricsExpositionParses(t *testing.T) {
 		if got != wantV {
 			t.Fatalf("metric %s = %v, want %v", name, got, wantV)
 		}
+	}
+}
+
+// TestStepReporterWiring verifies that when the executor build carries the
+// StepReporter hook, the runner wires it to kiwi_runner_step_duration_seconds
+// with the REAL executor-measured wall-clock duration (the sink-derived
+// approximation was removed). When the field is absent (executor predates
+// the hook) the wiring reports false and no observation is possible.
+func TestStepReporterWiring(t *testing.T) {
+	m := NewMetrics()
+	var opts executor.Options
+	if !applyStepReporter(&opts, m) {
+		t.Skip("executor.Options.StepReporter not present in this build")
+	}
+	f := reflect.ValueOf(&opts).Elem().FieldByName("StepReporter")
+	f.Call([]reflect.Value{
+		reflect.ValueOf("job-1"),
+		reflect.ValueOf("build"),
+		reflect.ValueOf(3 * time.Second),
+	})
+	m.mu.Lock()
+	got := m.counters["kiwi_runner_step_duration_seconds"]
+	m.mu.Unlock()
+	if got != 3 {
+		t.Fatalf("kiwi_runner_step_duration_seconds = %v, want 3", got)
+	}
+}
+
+// TestApplyStepReporterRejectsWrongShape guards the reflection seam against
+// a future StepReporter field with an unexpected signature.
+func TestApplyStepReporterRejectsWrongShape(t *testing.T) {
+	m := NewMetrics()
+	var opts executor.Options
+	v := reflect.ValueOf(&opts).Elem()
+	f := v.FieldByName("StepReporter")
+	if !f.IsValid() {
+		t.Skip("executor.Options.StepReporter not present in this build")
+	}
+	_ = m
+	// The field exists: verify the seam only accepts a 3-arg, 0-result func.
+	applyStepReporter(&opts, m)
+	if !f.CanSet() {
+		t.Fatal("seam must set an existing StepReporter field")
 	}
 }

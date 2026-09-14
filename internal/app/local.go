@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,6 +42,8 @@ func RunLocal(ctx context.Context, args []string) error {
 	head := fs.String("head", "HEAD", "head ref for changed-file detection")
 	mergeBase := fs.String("merge-base", "", "compute the base as the merge base of HEAD and this ref")
 	changedFile := fs.String("changed-file", "", "explicit changed files (comma-separated); overrides git detection")
+	var inputs kvFlags
+	fs.Var(&inputs, "input", "pipeline input k=v (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -48,7 +51,11 @@ func RunLocal(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	g, err := pipeline.Compile(spec)
+	var inputsMap map[string]string
+	if len(inputs.pairs) > 0 {
+		inputsMap = inputs.pairs
+	}
+	g, err := pipeline.CompileWithInputs(spec, inputsMap)
 	if err != nil {
 		return err
 	}
@@ -132,6 +139,8 @@ func Explain(args []string) error {
 	why := fs.String("why", "", "explain why one compiled job would run (event, branch, paths, condition, dependencies)")
 	event := fs.String("event", "push", "event name for --why evaluation")
 	branch := fs.String("branch", "", "branch name for --why evaluation")
+	var inputs kvFlags
+	fs.Var(&inputs, "input", "pipeline input k=v (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -139,13 +148,27 @@ func Explain(args []string) error {
 	if err != nil {
 		return err
 	}
-	g, err := pipeline.Compile(s)
+	var inputsMap map[string]string
+	if len(inputs.pairs) > 0 {
+		inputsMap = inputs.pairs
+	}
+	g, err := pipeline.CompileWithInputs(s, inputsMap)
 	if err != nil {
 		return err
 	}
 	if *why != "" {
 		return explainWhy(g, *why, explainArgs{Event: *event, Branch: *branch})
 	}
+	wd, werr := os.Getwd()
+	if werr != nil {
+		return werr
+	}
+	return explainGraph(os.Stdout, g, wd)
+}
+
+// explainGraph renders the compiled DAG plus cache-key inputs and cache
+// candidates (never enabled) for the local explain command.
+func explainGraph(out io.Writer, g *pipeline.Graph, workspace string) error {
 	ids := make([]string, 0, len(g.Jobs))
 	for id := range g.Jobs {
 		ids = append(ids, id)
@@ -153,23 +176,25 @@ func Explain(args []string) error {
 	sort.Strings(ids)
 	for _, id := range ids {
 		j := g.Jobs[id]
-		fmt.Printf("%s\n", id)
-		fmt.Printf("  runtime: %s\n", defaultString(j.Job.Runtime, "native"))
+		fmt.Fprintf(out, "%s\n", id)
+		fmt.Fprintf(out, "  runtime: %s\n", defaultString(j.Job.Runtime, "native"))
 		if len(j.Needs) > 0 {
-			fmt.Printf("  needs: %v\n", j.Needs)
+			fmt.Fprintf(out, "  needs: %v\n", j.Needs)
 		}
 		if len(j.Matrix) > 0 {
-			fmt.Printf("  matrix: %v\n", j.Matrix)
+			fmt.Fprintf(out, "  matrix: %v\n", j.Matrix)
 		}
-		fmt.Printf("  steps: %d\n", len(j.Job.Steps))
+		fmt.Fprintf(out, "  steps: %d\n", len(j.Job.Steps))
 		for i, st := range j.Job.Steps {
 			n := st.Name
 			if n == "" {
 				n = fmt.Sprintf("step-%d", i+1)
 			}
-			fmt.Printf("    - %s: %s\n", n, oneLine(st.Run))
+			fmt.Fprintf(out, "    - %s: %s\n", n, oneLine(st.Run))
 		}
+		printCacheInputs(out, j, workspace)
 	}
+	printCacheCandidates(out, workspace)
 	return nil
 }
 

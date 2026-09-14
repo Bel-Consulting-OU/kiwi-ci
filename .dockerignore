@@ -1,0 +1,23 @@
+# Build-context exclusions for the release Docker image. Only Go sources and
+# module files are needed; everything below stays out of the context and the
+# image.
+
+.git
+.github
+.kiwi
+
+dist
+tmp
+
+testdata
+docs
+scripts
+
+coverage.out
+coverage.html
+
+Formula
+
+.env
+*.pem
+.DS_Store

@@ -31,6 +31,7 @@ type memSnapshot struct {
 	deployments  []model.Deployment
 	snapshots    []model.SnapshotRecord
 	jobContracts map[string]map[string]ArtifactContract
+	downstream   map[string]DownstreamLink
 }
 
 func (m *memStore) snapshot() memSnapshot {
@@ -52,7 +53,16 @@ func (m *memStore) snapshot() memSnapshot {
 		deployments:  append([]model.Deployment(nil), m.deployments...),
 		snapshots:    append([]model.SnapshotRecord(nil), m.snapshots...),
 		jobContracts: cloneJobContracts(m.contracts),
+		downstream:   cloneDownstreamLinks(m.downstream),
 	}
+}
+
+func cloneDownstreamLinks(in map[string]DownstreamLink) map[string]DownstreamLink {
+	out := make(map[string]DownstreamLink, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 func cloneRuns(in map[string]model.Run) map[string]model.Run {
@@ -143,6 +153,14 @@ var testSnapshot = model.SnapshotRecord{ID: "33333333333333333333333333333333", 
 
 var testContracts = map[string]ArtifactContract{
 	"bundle": {Name: "bundle", Paths: []string{"dist/"}, Required: true, Retention: 24 * time.Hour, MaxSize: 4096, SHA256: "sha"},
+}
+
+var testDownstreamLink = DownstreamLink{
+	ParentJobID: testJob.ID,
+	TargetRepo:  "acme/child",
+	TargetRef:   "refs/heads/main",
+	LaunchToken: "tok",
+	CreatedAt:   time.Unix(1014, 0).UTC(),
 }
 
 func seedRunAndJob(m *memStore) {
@@ -326,6 +344,56 @@ func faultOps() []opCase {
 				return s.(QueueReasonStore).SetQueueReasons(ctx(), map[string]string{testJob.ID: "WAITING_DEPENDENCY"})
 			},
 		},
+		{
+			name: "InsertGeneratedJobs",
+			setup: func(m *memStore) {
+				seedRunAndJob(m)
+			},
+			call: func(s Store) error {
+				child := testJob
+				child.ID = "ffffffffffffffffffffffffffffffff"
+				child.Key = "generated"
+				child.DynamicDepth = 1
+				return s.(DynamicStore).InsertGeneratedJobs(ctx(), testJob.ID, 1, map[string]model.Job{child.ID: child}, map[string][]string{child.ID: nil})
+			},
+		},
+		{
+			name: "InsertDownstreamLink",
+			setup: func(m *memStore) {
+				seedRunAndJob(m)
+			},
+			call: func(s Store) error {
+				return s.(DownstreamStore).InsertDownstreamLink(ctx(), testDownstreamLink)
+			},
+		},
+		{
+			name: "MarkDownstreamLaunched",
+			setup: func(m *memStore) {
+				seedRunAndJob(m)
+				_ = m.InsertDownstreamLink(ctx(), testDownstreamLink)
+			},
+			call: func(s Store) error {
+				return s.(DownstreamStore).MarkDownstreamLaunched(ctx(), testDownstreamLink.ParentJobID, testDownstreamLink.TargetRepo, testDownstreamLink.TargetRef, testRun.ID)
+			},
+		},
+		{
+			name: "AppendDownstreamRun",
+			setup: func(m *memStore) {
+				seedRunAndJob(m)
+			},
+			call: func(s Store) error {
+				return s.(RunDownstreamStore).AppendDownstreamRun(ctx(), testRun.ID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab")
+			},
+		},
+		{
+			name: "ReopenRunForChildren",
+			setup: func(m *memStore) {
+				_ = m.InsertRun(ctx(), model.Run{ID: testRun.ID, Status: model.StatusSuccess, CreatedAt: time.Unix(1000, 0).UTC()})
+			},
+			call: func(s Store) error {
+				return s.(RunDownstreamStore).ReopenRunForChildren(ctx(), testRun.ID)
+			},
+		},
 	}
 }
 
@@ -443,5 +511,18 @@ func TestFaultInjectionReadsUnaffected(t *testing.T) {
 	}
 	if _, ok, err := fs.HasCompletionReceipt(ctx(), testJob.ID, 1, testRunner.ID); err != nil || ok {
 		t.Fatalf("HasCompletionReceipt: ok=%v err=%v", ok, err)
+	}
+	cost, energy, err := fs.RecentUsage(ctx(), time.Unix(0, 0).UTC())
+	if err != nil {
+		t.Fatalf("RecentUsage: %v", err)
+	}
+	if cost != 0 || energy != 0 {
+		t.Fatalf("RecentUsage on empty store = %g/%g", cost, energy)
+	}
+	if _, ok, err := fs.GetDownstreamLink(ctx(), testJob.ID, "acme/child", "refs/heads/main"); err != nil || ok {
+		t.Fatalf("GetDownstreamLink: ok=%v err=%v", ok, err)
+	}
+	if _, err := fs.GetArtifact(ctx(), "dddddddddddddddddddddddddddddddd"); err == nil {
+		t.Fatal("GetArtifact on empty store must not succeed")
 	}
 }

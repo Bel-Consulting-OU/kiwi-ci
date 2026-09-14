@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -62,6 +63,45 @@ func paginateURL(base, runID string, after int64, limit int) string {
 // streamURL builds the SSE follow URL.
 func streamURL(base, runID string, after int64) string {
 	return strings.TrimRight(base, "/") + "/api/v1/runs/" + url.PathEscape(runID) + "/logs/stream?after=" + strconv.FormatInt(after, 10)
+}
+
+// jobsURL builds the run job-list URL (GET /api/v1/runs/{id}/jobs).
+func jobsURL(base, runID string) string {
+	return strings.TrimRight(base, "/") + "/api/v1/runs/" + url.PathEscape(runID) + "/jobs"
+}
+
+// ListJobs fetches the run's job keys from the jobs endpoint (the listJobs
+// response is []api/v1 JobDTO, which carries the job "key"). Keys are
+// returned sorted for deterministic filter cycling.
+func (c *Client) ListJobs(ctx context.Context, runID string) ([]string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, jobsURL(c.Server, runID), nil)
+	if err != nil {
+		return nil, err
+	}
+	c.auth(req)
+	resp, err := c.client().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("jobs %s: %s", resp.Status, strings.TrimSpace(string(b)))
+	}
+	var out []struct {
+		Key string `json:"key"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	keys := make([]string, 0, len(out))
+	for _, j := range out {
+		if j.Key != "" {
+			keys = append(keys, j.Key)
+		}
+	}
+	sort.Strings(keys)
+	return keys, nil
 }
 
 // ReadPage fetches one page of log entries.

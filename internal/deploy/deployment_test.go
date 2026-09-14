@@ -43,9 +43,9 @@ func TestEffectiveStepsOrderAndDefaults(t *testing.T) {
 			t.Fatalf("step %d run = %q, want %q (order violated)", i, st.Run, order[i])
 		}
 	}
-	// Canary steps keep no default condition.
-	if steps[0].If != "" {
-		t.Fatalf("canary step got a default condition %q", steps[0].If)
+	// Canary steps default to success().
+	if steps[0].If != "success()" {
+		t.Fatalf("canary default = %q, want success()", steps[0].If)
 	}
 	// Verify defaults to success().
 	if steps[2].If != "success()" {
@@ -58,9 +58,12 @@ func TestEffectiveStepsOrderAndDefaults(t *testing.T) {
 	if steps[4].If != "failure()" {
 		t.Fatalf("rollback default = %q, want failure()", steps[4].If)
 	}
-	// EffectiveSteps does not mutate the normalized step lists: verify
-	// steps still have no condition and rollback defaults were set at
+	// EffectiveSteps does not mutate the normalized step lists: canary and
+	// verify steps still have no condition and rollback defaults were set at
 	// Normalize time, not by EffectiveSteps.
+	if n.Canary[0].If != "" {
+		t.Fatal("EffectiveSteps mutated the canary step list")
+	}
 	if n.Verify[0].If != "" {
 		t.Fatal("EffectiveSteps mutated the verify step list")
 	}
@@ -73,6 +76,56 @@ func TestNormalizeEmpty(t *testing.T) {
 	}
 	if n.DefaultRollbackCondition != DefaultRollbackCondition {
 		t.Fatal("empty spec must still carry the default rollback condition")
+	}
+}
+
+func TestDefaultConditions(t *testing.T) {
+	if DefaultCanaryCondition != "success()" {
+		t.Fatalf("canary default = %q, want success()", DefaultCanaryCondition)
+	}
+	if DefaultVerifyCondition != "success()" {
+		t.Fatalf("verify default = %q, want success()", DefaultVerifyCondition)
+	}
+	if DefaultRollbackCondition != "failure()" {
+		t.Fatalf("rollback default = %q, want failure()", DefaultRollbackCondition)
+	}
+}
+
+func TestEffectiveStepsCanaryDefault(t *testing.T) {
+	n := Normalize(pipeline.DeploymentSpec{
+		Canary: []pipeline.Step{{Run: "c1"}, {Run: "c2", If: "always()"}},
+	})
+	steps := n.EffectiveSteps()
+	if len(steps) != 2 {
+		t.Fatalf("steps = %d, want 2", len(steps))
+	}
+	if steps[0].If != "success()" {
+		t.Fatalf("unnamed-condition canary default = %q, want success()", steps[0].If)
+	}
+	if steps[1].If != "always()" {
+		t.Fatalf("explicit canary condition clobbered: %q", steps[1].If)
+	}
+	// Normalize does not apply the canary default: only EffectiveSteps does.
+	if n.Canary[0].If != "" {
+		t.Fatalf("Normalize applied a canary default: %q", n.Canary[0].If)
+	}
+}
+
+func TestEffectiveStepsOverridesRespected(t *testing.T) {
+	n := Normalize(pipeline.DeploymentSpec{
+		Canary:   []pipeline.Step{{Run: "c", If: "always()"}},
+		Verify:   []pipeline.Step{{Run: "v", If: "cancelled()"}},
+		Rollback: []pipeline.Step{{Run: "r", If: "always()"}},
+	})
+	steps := n.EffectiveSteps()
+	want := []string{"always()", "cancelled()", "always()"}
+	if len(steps) != len(want) {
+		t.Fatalf("steps = %d, want %d", len(steps), len(want))
+	}
+	for i, st := range steps {
+		if st.If != want[i] {
+			t.Fatalf("step %d condition = %q, want %q", i, st.If, want[i])
+		}
 	}
 }
 

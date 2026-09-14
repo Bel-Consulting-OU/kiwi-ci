@@ -43,6 +43,16 @@ func (r *Ring[T]) Len() int { return r.count }
 
 func (r *Ring[T]) Capacity() int { return len(r.buf) }
 
+// Reset drops every buffered entry.
+func (r *Ring[T]) Reset() {
+	r.head = 0
+	r.count = 0
+	var zero T
+	for i := range r.buf {
+		r.buf[i] = zero
+	}
+}
+
 // Slice returns the buffered entries from oldest to newest.
 func (r *Ring[T]) Slice() []T {
 	out := make([]T, 0, r.count)

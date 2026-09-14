@@ -25,6 +25,8 @@ import (
 
 	v1 "github.com/Bel-Consulting-OU/kiwi-ci/internal/api/v1"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/blob"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cas"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/components"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/expr"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/logging"
@@ -32,6 +34,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/queue"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/quotas"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/ratelimit"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runnerpki"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/scheduler"
@@ -132,6 +135,27 @@ type Server struct {
 	// only narrow the effective capabilities.
 	Policy *policy.Config
 
+	// QuotaLimits bounds per-repository and per-team concurrency and queue
+	// depth at enqueue (quotas.Limits; every field 0 means unlimited).
+	QuotaLimits quotas.Limits
+	// DailyCostLimit/DailyEnergyLimit bound the trailing-24h cost and
+	// energy budget; exceeding them refuses new leases (0 = unlimited).
+	DailyCostLimit   float64
+	DailyEnergyLimit float64
+
+	// BlobStore is the shared content-addressed blob backend for DB mode.
+	// CAS wraps it with digest-verified put/open. When nil (or dataDir is
+	// set at construction) the server uses a filesystem blob store under
+	// dataDir/cas. SetBlobStore overrides both.
+	BlobStore blob.Store
+	CAS       *cas.CAS
+
+	// DownstreamPipelineFetcher, when non-nil, overrides the forge-based
+	// pipeline fetch for downstream dispatch (tests inject a stub; the
+	// default resolves the target forge adapter from the parent run's
+	// repository host).
+	DownstreamPipelineFetcher func(ctx context.Context, targetRepo, targetRef string) (string, error)
+
 	// Logger writes operational (control-plane) logs as structured JSON
 	// lines. Build logs stay in LogEntry paths. Defaults to os.Stderr.
 	Logger *logging.Structured
@@ -187,6 +211,22 @@ type Server struct {
 	opaPolicy *policy.OPAPolicy
 	opaBroken bool
 
+	// drain state: draining refuses new leases, readiness reports 503, and
+	// GET /api/v1/drain exposes the state. drainMu guards the flags; the
+	// drain.flag file under dataDir persists the state across restarts.
+	drainMu     sync.Mutex
+	draining    bool
+	drainReason string
+
+	// downstreamLinks holds the fs-mode downstream dispatch claims
+	// (memory/fs servers). DB mode claims live in the DownstreamStore.
+	downstreamLinks map[string]storage.DownstreamLink
+
+	// usage tracks completed jobs' cost/energy for the trailing-24h daily
+	// budget in memory/fs mode. DB mode queries UsageStore.RecentUsage.
+	usageMu sync.Mutex
+	usage   []usageEntry
+
 	// OTel tracing (tracing.go).
 	OTelEndpoint string
 	otelShutdown func(context.Context) error
@@ -204,18 +244,19 @@ func New(token string) *Server {
 		Token: token, RunnerToken: token, AdminToken: token,
 		LeaseDuration: defaultLeaseDuration,
 		runs:          map[string]model.Run{}, jobs: map[string]model.Job{}, runners: map[string]model.Runner{}, artifacts: map[string]model.ArtifactRecord{}, reports: map[string]model.TestReport{}, deliveries: map[string]string{}, completions: map[string]model.CompletionReceipt{}, leaseKey: key, oidc: newOIDCSigner(),
-		outbox:      NewOutbox(nil),
-		AuthStore:   auth.NewTokenStore(),
-		deployments: map[string]model.Deployment{},
-		snapshots:   map[string]model.SnapshotRecord{},
-		contracts:   map[string]map[string]storage.ArtifactContract{},
-		jobLocks:    map[string]*sync.Mutex{},
-		crl:         map[string]string{},
-		history:     newTestintelHistory(""),
-		schedules:   map[string]storage.Schedule{},
-		occurrences: map[string]map[int64]string{},
-		Logger:      logging.NewStructured(os.Stderr),
-		Metrics:     NewMetrics(),
+		outbox:          NewOutbox(nil),
+		AuthStore:       auth.NewTokenStore(),
+		deployments:     map[string]model.Deployment{},
+		snapshots:       map[string]model.SnapshotRecord{},
+		contracts:       map[string]map[string]storage.ArtifactContract{},
+		jobLocks:        map[string]*sync.Mutex{},
+		crl:             map[string]string{},
+		history:         newTestintelHistory(""),
+		schedules:       map[string]storage.Schedule{},
+		occurrences:     map[string]map[int64]string{},
+		downstreamLinks: map[string]storage.DownstreamLink{},
+		Logger:          logging.NewStructured(os.Stderr),
+		Metrics:         NewMetrics(),
 	}
 }
 
@@ -309,7 +350,22 @@ func NewPersistent(runnerToken, adminToken, dataDir string) (*Server, error) {
 		return nil, err
 	}
 	s.runs, s.jobs, s.runners, s.artifacts, s.reports = snap.Runs, snap.Jobs, snap.Runners, snap.Artifacts, snap.Reports
+	s.downstreamLinks = snap.DownstreamLinks
+	if s.downstreamLinks == nil {
+		s.downstreamLinks = map[string]storage.DownstreamLink{}
+	}
 	s.rebuildArtifactContractsLocked()
+	// DB-mode artifact transport: payload bytes move through the shared
+	// CAS blob store (default: filesystem under dataDir/cas) so downloads
+	// resolve on any replica. The app agent overrides the backend via
+	// SetBlobStore when config selects S3.
+	if s.BlobStore == nil {
+		s.BlobStore = blob.NewFS(filepath.Join(dataDir, "cas"))
+	}
+	s.CAS = cas.New(s.BlobStore)
+	if err := s.loadDrainFlag(dataDir); err != nil {
+		return nil, err
+	}
 	if seq, err := s.store.MaxLogSeq(); err != nil {
 		return nil, err
 	} else {
@@ -444,11 +500,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/jobs/{id}/heartbeat", s.heartbeat)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/log", s.log)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/complete", s.complete)
+	mux.HandleFunc("POST /api/v1/jobs/{id}/generated", s.generateJobs)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/snapshots", s.uploadSnapshot)
 	mux.HandleFunc("GET /api/v1/runs/{id}/snapshots", s.listSnapshots)
 	mux.HandleFunc("GET /api/v1/runs/{id}/snapshots/{sid}", s.downloadSnapshot)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/deployments", s.recordDeployment)
 	mux.HandleFunc("GET /api/v1/runs/{id}/deployments", s.listDeployments)
+	mux.HandleFunc("POST /api/v1/drain", s.drainServer)
+	mux.HandleFunc("GET /api/v1/drain", s.drainStatus)
 	mux.HandleFunc("POST /api/v1/runners/register", s.register)
 	mux.HandleFunc("POST /api/v1/runners/enroll", s.enroll)
 	mux.HandleFunc("POST /api/v1/runners/{id}/next", s.next)
@@ -499,7 +558,7 @@ func (s *Server) auth(next http.Handler) http.Handler {
 		// Runner drain/disable/enable are admin-tier operations: a runner
 		// token must never be able to disable its peers or itself.
 		runnerAdminOp := strings.HasPrefix(path, "/api/v1/runners/") && (strings.HasSuffix(path, "/drain") || strings.HasSuffix(path, "/disable") || strings.HasSuffix(path, "/enable"))
-		runnerOnly := (!runnerAdminOp && strings.HasPrefix(path, "/api/v1/runners/")) || path == "/api/v1/runners/register" || strings.HasPrefix(path, "/api/v1/cache/") || (strings.HasPrefix(path, "/api/v1/jobs/") && (strings.Contains(path, "/artifacts/") || strings.Contains(path, "/dependencies/") || strings.HasSuffix(path, "/heartbeat") || strings.HasSuffix(path, "/log") || strings.HasSuffix(path, "/complete") || strings.HasSuffix(path, "/tests") || strings.HasSuffix(path, "/test-shards") || strings.HasSuffix(path, "/secrets") || strings.HasSuffix(path, "/snapshots")))
+		runnerOnly := (!runnerAdminOp && strings.HasPrefix(path, "/api/v1/runners/")) || path == "/api/v1/runners/register" || strings.HasPrefix(path, "/api/v1/cache/") || (strings.HasPrefix(path, "/api/v1/jobs/") && (strings.Contains(path, "/artifacts/") || strings.Contains(path, "/dependencies/") || strings.HasSuffix(path, "/heartbeat") || strings.HasSuffix(path, "/log") || strings.HasSuffix(path, "/complete") || strings.HasSuffix(path, "/generated") || strings.HasSuffix(path, "/tests") || strings.HasSuffix(path, "/test-shards") || strings.HasSuffix(path, "/secrets") || strings.HasSuffix(path, "/snapshots")))
 		sharedRead := r.Method == http.MethodGet && (strings.HasPrefix(path, "/api/v1/artifacts/") || (strings.HasPrefix(path, "/api/v1/runs/") && strings.HasSuffix(path, "/artifacts")))
 		if sharedRead {
 			if s.AdminToken != "" && !bearerOK(r.Header.Get("Authorization"), s.AdminToken) && !bearerOK(r.Header.Get("Authorization"), s.RunnerToken) {
@@ -653,6 +712,11 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	in.Trusted = false
 	run, err := s.enqueue(in)
 	if err != nil {
+		var adm *admissionError
+		if errors.As(err, &adm) {
+			writeJSON(w, adm.Status, map[string]string{"error": adm.Msg, "reason": adm.Reason})
+			return
+		}
 		var denial *opaDenialError
 		if errors.As(err, &denial) {
 			http.Error(w, denial.Error(), http.StatusForbidden)
@@ -699,6 +763,10 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 	// ever narrow capabilities.
 	if s.Policy != nil {
 		caps = policy.Intersect(caps, s.Policy.CapabilitiesFor(in.RepoFullName))
+		grants := s.Policy.GrantsFor(in.RepoFullName)
+		caps.Deployments = caps.Deployments || grants.Deployments
+		caps.GenerateChildGraph = caps.GenerateChildGraph || grants.GenerateChildGraph
+		caps.CrossRepoTrigger = caps.CrossRepoTrigger || grants.CrossRepoTrigger
 	}
 	caps = caps.Effective(in.Trusted)
 	// The OPA deny gate evaluates BEFORE capability admission: a denial is
@@ -710,6 +778,12 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 		return model.Run{}, denial
 	}
 	if err = policy.ValidateAdmissionWithCapabilities(spec, caps); err != nil {
+		return model.Run{}, err
+	}
+	// Organization policy restrictions (clone hosts, regions, digest pins)
+	// and capability-scoped declarations (downstream, generate) are
+	// enforced in the same admission step.
+	if err = s.admitPolicyRestrictions(in, spec, caps); err != nil {
 		return model.Run{}, err
 	}
 	pipelineDigest, err := pipeline.PipelineDigest(spec)
@@ -769,7 +843,7 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 		jobDigest := hex.EncodeToString(digestSum[:])
 		jobContracts[jobIDs[key]] = buildJobContracts(cj)
 		created[jobIDs[key]] = model.Job{
-			ID: jobIDs[key], RunID: runID, Key: key, BaseKey: cj.BaseID, RepoURL: in.RepoURL, Ref: in.Ref, SHA: in.SHA,
+			ID: jobIDs[key], RunID: runID, Key: key, BaseKey: cj.BaseID, RepoURL: in.RepoURL, RepoFullName: in.RepoFullName, Ref: in.Ref, SHA: in.SHA,
 			Event: in.Event, Condition: cj.Job.If, DependencyStatus: model.StatusSuccess, Pipeline: in.Pipeline, Trusted: in.Trusted, ChangedFiles: append([]string{}, in.ChangedFiles...), Needs: needs,
 			RequiredLabels: labelsForJob(cj.Job), Network: effectiveNetwork, Environment: env, ApprovalRequired: cj.Job.Environment.Approval, EnvironmentBranches: append([]string{}, cj.Job.Environment.Branches...), EnvironmentConcurrency: cj.Job.Environment.Concurrency, OIDCAllowed: cj.Job.Permissions.IDToken, OIDCAudiences: cloneStrings(oidcAudiences),
 			DeclaredSecrets: declaredSecrets(spec, cj.Job),
@@ -793,10 +867,19 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 	}
 
 	if s.Sched != nil {
+		if err := s.admitQuotaLocked(run, len(g.Jobs)); err != nil {
+			return model.Run{}, err
+		}
 		return s.enqueueDB(in, run, created, group, spec.Concurrency.CancelInProgress, now)
 	}
 
 	s.mu.Lock()
+	// Quota admission happens inside the run lock so the concurrency and
+	// queue-depth counts are race-free with concurrent enqueues.
+	if err := s.admitQuotaLocked(run, len(g.Jobs)); err != nil {
+		s.mu.Unlock()
+		return model.Run{}, err
+	}
 	// Webhook dedupe: forge retries reuse the delivery ID, so a second
 	// submission for the same delivery returns the original run instead of
 	// enqueueing a duplicate. Checked under the run lock to close the race
@@ -1396,6 +1479,21 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "runner identity mismatch", http.StatusForbidden)
 		return
 	}
+	// Graceful drain: no new leases while the control plane is draining;
+	// heartbeats and completions keep working so in-flight jobs finish.
+	if s.isDraining() {
+		w.Header().Set("X-Kiwi-Draining", "true")
+		http.Error(w, "control plane draining", http.StatusServiceUnavailable)
+		return
+	}
+	// Daily budget: leases are refused while the trailing-24h budget is
+	// exhausted; waiting jobs are annotated with the reason.
+	if reason, exceeded := s.dailyBudgetExceeded(r.Context()); exceeded {
+		s.markQueueReasonsAll(r.Context(), reason)
+		w.Header().Set("X-Kiwi-Quota", reason)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if s.Sched != nil {
 		s.nextDB(w, r, id)
 		return
@@ -1496,6 +1594,10 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	j.LeaseTokenHash = hashLeaseToken(s.leaseKey, rawToken)
 	j.LeaseGeneration++
 	j.LeaseExpiresAt = &exp
+	// The runner's registered rates are frozen into the job at lease time;
+	// completion derives cost/energy from them and the wall-clock duration.
+	j.CostRate = ri.CostPerHour
+	j.PowerWatts = ri.PowerWatts
 	if j.StartedAt == nil {
 		j.StartedAt = &now
 	}
@@ -1566,6 +1668,17 @@ func (s *Server) nextDB(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	taskJob := *j
 	taskJob.LeaseTokenHash = nil
+	// Freeze the runner's registered rates into the leased job so
+	// completion can derive cost/energy deterministically. The persisted
+	// copy keeps the lease token hash; only the wire task strips it.
+	stored := *j
+	stored.CostRate = ri.CostPerHour
+	stored.PowerWatts = ri.PowerWatts
+	if err := s.DB.UpdateJob(ctx, stored); err != nil {
+		s.logError("lease: persist frozen rates failed", "job", stored.ID, "error", err.Error())
+	}
+	taskJob.CostRate = stored.CostRate
+	taskJob.PowerWatts = stored.PowerWatts
 	task := Task{Job: taskJob, LeaseToken: rawToken, LeaseGeneration: j.LeaseGeneration, LeaseExpiresAt: exp}
 	if j.Environment != "" {
 		s.recordDeploymentDB(ctx, *j, time.Now().UTC())
@@ -1788,6 +1901,10 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	if j.StartedAt != nil && j.FinishedAt != nil {
 		s.metricObserve("kiwi_job_duration_seconds", j.FinishedAt.Sub(*j.StartedAt).Seconds(), nil)
 	}
+	// Usage accounting: cost/energy from the frozen lease-time rates and
+	// the wall-clock duration, aggregated into the usage metrics and the
+	// trailing-24h budget window.
+	s.recordJobUsage(&j, now)
 	// The lease is spent: clear all lease state so nothing can reuse it,
 	// then dedupe future retries of this exact completion via the receipt.
 	j.LeaseRunnerID = ""
@@ -1805,9 +1922,17 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	s.auditLocked("job.completed", in.RunnerID, runID, j.ID, string(j.Status), map[string]string{"job": j.Key})
 	s.scheduleStateLocked()
 	s.refreshRunLocked(runID)
+	// The completed job's run may itself be a wait=true downstream child of
+	// another run: re-aggregate the parents.
+	s.refreshDownstreamParentsLocked(runID)
 	run := s.runs[runID]
 	_ = s.persistLocked()
 	s.mu.Unlock()
+	// A successful job with a downstream declaration records the launch
+	// claim and enqueues the dispatch intent (exactly-once via the claim).
+	if j.Status == model.StatusSuccess {
+		s.recordDownstreamIntents(context.Background(), j, run)
+	}
 	if run.Status.Terminal() {
 		s.publishGitHubStatus(run)
 	}
@@ -1866,6 +1991,32 @@ func (s *Server) completeDB(w http.ResponseWriter, r *http.Request, jobID string
 	}
 	s.finishDeploymentDB(ctx, j, st, time.Now().UTC())
 	s.metricObserve("kiwi_job_duration_seconds", completionDurationSeconds(j), nil)
+	// Usage accounting: cost/energy from the frozen lease-time rates, then
+	// persisted back into the job payload for UsageStore.RecentUsage.
+	if cur, gerr := s.DB.GetJob(ctx, jobID); gerr == nil {
+		if cur.StartedAt != nil {
+			finished := time.Now().UTC()
+			if cur.FinishedAt != nil {
+				finished = *cur.FinishedAt
+			}
+			s.recordJobUsage(&cur, finished)
+			if uerr := s.DB.UpdateJob(ctx, cur); uerr != nil {
+				s.logError("complete: persist job usage failed", "job", jobID, "error", uerr.Error())
+			}
+		}
+		// A successful job with a downstream declaration records the launch
+		// claim and enqueues the dispatch intent (exactly-once via the
+		// claim row).
+		if st == model.StatusSuccess {
+			if run, gerr := s.DB.GetRun(ctx, j.RunID); gerr == nil {
+				s.recordDownstreamIntents(ctx, cur, run)
+			}
+		}
+	}
+	// wait=true aggregation: the completed job's run may have downstream
+	// children of its own, and may itself be a child of another run.
+	s.adjustRunForChildrenDB(ctx, j.RunID)
+	s.refreshDownstreamParentsDB(ctx, j.RunID)
 	if run, gerr := s.DB.GetRun(ctx, j.RunID); gerr == nil && run.Status.Terminal() {
 		s.publishGitHubStatus(run)
 	}
@@ -2224,6 +2375,9 @@ func (s *Server) cancelRunLocked(runID, reason, actor string) {
 		run.FinishedAt = &now
 		s.runs[runID] = run
 	}
+	// A cancelled run may be a wait=true downstream child of another run:
+	// re-aggregate the parents.
+	s.refreshDownstreamParentsLocked(runID)
 	s.auditLocked("run.cancelled", actor, runID, "", reason, nil)
 }
 
@@ -2406,6 +2560,9 @@ func (s *Server) refreshRunLocked(runID string) {
 	if run.StartedAt == nil && firstStart != nil {
 		run.StartedAt = firstStart
 	}
+	// wait=true downstream aggregation: a run that waits on child runs stays
+	// open until the children finish and inherits their failures.
+	s.applyDownstreamChildrenLocked(runID, &run)
 	s.runs[runID] = run
 }
 
@@ -2527,7 +2684,7 @@ func (s *Server) persistLocked() error {
 		// snapshot must not be overwritten with stale memory maps.
 		return nil
 	}
-	return s.store.Save(storage.Snapshot{Version: 1, Runs: s.runs, Jobs: s.jobs, Runners: s.runners, Artifacts: s.artifacts, Reports: s.reports})
+	return s.store.Save(storage.Snapshot{Version: 1, Runs: s.runs, Jobs: s.jobs, Runners: s.runners, Artifacts: s.artifacts, Reports: s.reports, DownstreamLinks: s.downstreamLinks})
 }
 func (s *Server) leaseDuration() time.Duration {
 	if s.LeaseDuration <= 0 {

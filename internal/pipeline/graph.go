@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -21,7 +22,22 @@ type Graph struct {
 	Jobs map[string]CompiledJob `json:"jobs"`
 }
 
+// Compile validates and compiles a pipeline with no pipeline inputs. Holes
+// referencing the inputs context are left literal, preserving the legacy
+// behavior for callers that resolve inputs later (server enqueue).
 func Compile(s *Spec) (*Graph, error) {
+	return CompileWithInputs(s, nil)
+}
+
+// CompileWithInputs validates and compiles a pipeline with the given
+// pipeline inputs. Inputs participate in compile-time interpolation
+// alongside the matrix: "${{ inputs.<name> }}" holes resolve against the
+// map, and each input is also injected into every job's environment as
+// KIWI_INPUT_<NAME> (the executor-visible form, matching server enqueue).
+// When inputs is non-nil a hole that references a missing input key is a
+// compile error (the expr engine's missing-key error); a nil map keeps the
+// legacy lenient behavior and leaves inputs holes untouched.
+func CompileWithInputs(s *Spec, inputs map[string]string) (*Graph, error) {
 	if err := Validate(s); err != nil {
 		return nil, err
 	}
@@ -46,8 +62,14 @@ func Compile(s *Spec) (*Graph, error) {
 				}
 				cid += "[" + strings.Join(parts, ",") + "]"
 			}
-			cj := CompiledJob{ID: cid, BaseID: id, Job: interpolateJob(j, m), Matrix: m}
+			cj := CompiledJob{ID: cid, BaseID: id, Job: interpolateJob(j, m, inputs), Matrix: m}
 			cj.Job.Env = mergeStringMaps(cj.Job.Env, matrixEnv(m))
+			if inputs != nil {
+				cj.Job.Env = mergeStringMaps(cj.Job.Env, inputEnv(inputs))
+				if err := validateInputsResolved(cid, cj.Job, m, inputs); err != nil {
+					return nil, err
+				}
+			}
 			g.Jobs[cid] = cj
 			expanded[id] = append(expanded[id], cid)
 		}
@@ -94,73 +116,74 @@ func matrixCombinations(m map[string][]any) []map[string]string {
 	return out
 }
 
-func interpolateJob(j Job, m map[string]string) Job {
-	j.Name = Interpolate(j.Name, m)
-	j.If = Interpolate(j.If, m)
-	j.Image = Interpolate(j.Image, m)
-	j.Network = Interpolate(j.Network, m)
-	j.VM = Interpolate(j.VM, m)
-	j.Shell = Interpolate(j.Shell, m)
-	j.Env = interpolateMap(j.Env, m)
-	j.Outputs = interpolateMap(j.Outputs, m)
-	j.Steps = interpolateSteps(j.Steps, m)
+func interpolateJob(j Job, m map[string]string, inputs map[string]string) Job {
+	interp := func(s string) string { return InterpolateWithInputs(s, m, inputs) }
+	j.Name = interp(j.Name)
+	j.If = interp(j.If)
+	j.Image = interp(j.Image)
+	j.Network = interp(j.Network)
+	j.VM = interp(j.VM)
+	j.Shell = interp(j.Shell)
+	j.Env = interpolateMap(j.Env, m, inputs)
+	j.Outputs = interpolateMap(j.Outputs, m, inputs)
+	j.Steps = interpolateSteps(j.Steps, m, inputs)
 	for i := range j.Services {
-		j.Services[i].Name = Interpolate(j.Services[i].Name, m)
-		j.Services[i].Image = Interpolate(j.Services[i].Image, m)
-		j.Services[i].Healthcheck = Interpolate(j.Services[i].Healthcheck, m)
-		j.Services[i].Env = interpolateMap(j.Services[i].Env, m)
+		j.Services[i].Name = interp(j.Services[i].Name)
+		j.Services[i].Image = interp(j.Services[i].Image)
+		j.Services[i].Healthcheck = interp(j.Services[i].Healthcheck)
+		j.Services[i].Env = interpolateMap(j.Services[i].Env, m, inputs)
 	}
 	for i := range j.Cache {
-		j.Cache[i].Name = Interpolate(j.Cache[i].Name, m)
-		j.Cache[i].Key = Interpolate(j.Cache[i].Key, m)
+		j.Cache[i].Name = interp(j.Cache[i].Name)
+		j.Cache[i].Key = interp(j.Cache[i].Key)
 		for k := range j.Cache[i].Paths {
-			j.Cache[i].Paths[k] = Interpolate(j.Cache[i].Paths[k], m)
+			j.Cache[i].Paths[k] = interp(j.Cache[i].Paths[k])
 		}
 		for k := range j.Cache[i].HashFiles {
-			j.Cache[i].HashFiles[k] = Interpolate(j.Cache[i].HashFiles[k], m)
+			j.Cache[i].HashFiles[k] = interp(j.Cache[i].HashFiles[k])
 		}
 		for k := range j.Cache[i].RestoreKeys {
-			j.Cache[i].RestoreKeys[k] = Interpolate(j.Cache[i].RestoreKeys[k], m)
+			j.Cache[i].RestoreKeys[k] = interp(j.Cache[i].RestoreKeys[k])
 		}
 	}
 	for i := range j.TestReports {
-		j.TestReports[i] = Interpolate(j.TestReports[i], m)
+		j.TestReports[i] = interp(j.TestReports[i])
 	}
 	for i := range j.Downloads {
-		j.Downloads[i].From = Interpolate(j.Downloads[i].From, m)
-		j.Downloads[i].Name = Interpolate(j.Downloads[i].Name, m)
-		j.Downloads[i].Path = Interpolate(j.Downloads[i].Path, m)
+		j.Downloads[i].From = interp(j.Downloads[i].From)
+		j.Downloads[i].Name = interp(j.Downloads[i].Name)
+		j.Downloads[i].Path = interp(j.Downloads[i].Path)
 	}
 	for i := range j.Artifacts {
-		j.Artifacts[i].Name = Interpolate(j.Artifacts[i].Name, m)
-		j.Artifacts[i].If = Interpolate(j.Artifacts[i].If, m)
+		j.Artifacts[i].Name = interp(j.Artifacts[i].Name)
+		j.Artifacts[i].If = interp(j.Artifacts[i].If)
 		for k := range j.Artifacts[i].Paths {
-			j.Artifacts[i].Paths[k] = Interpolate(j.Artifacts[i].Paths[k], m)
+			j.Artifacts[i].Paths[k] = interp(j.Artifacts[i].Paths[k])
 		}
 	}
 	return j
 }
 
-func interpolateMap(in map[string]string, m map[string]string) map[string]string {
+func interpolateMap(in map[string]string, m map[string]string, inputs map[string]string) map[string]string {
 	out := map[string]string{}
 	for k, v := range in {
-		out[k] = Interpolate(v, m)
+		out[k] = InterpolateWithInputs(v, m, inputs)
 	}
 	return out
 }
 
-func interpolateSteps(in []Step, m map[string]string) []Step {
+func interpolateSteps(in []Step, m map[string]string, inputs map[string]string) []Step {
 	out := make([]Step, len(in))
 	copy(out, in)
 	for i := range out {
-		out[i].ID = Interpolate(out[i].ID, m)
-		out[i].Name = Interpolate(out[i].Name, m)
-		out[i].Run = Interpolate(out[i].Run, m)
-		out[i].WorkingDirectory = Interpolate(out[i].WorkingDirectory, m)
-		out[i].Shell = Interpolate(out[i].Shell, m)
+		out[i].ID = InterpolateWithInputs(out[i].ID, m, inputs)
+		out[i].Name = InterpolateWithInputs(out[i].Name, m, inputs)
+		out[i].Run = InterpolateWithInputs(out[i].Run, m, inputs)
+		out[i].WorkingDirectory = InterpolateWithInputs(out[i].WorkingDirectory, m, inputs)
+		out[i].Shell = InterpolateWithInputs(out[i].Shell, m, inputs)
 		env := map[string]string{}
 		for k, v := range out[i].Env {
-			env[k] = Interpolate(v, m)
+			env[k] = InterpolateWithInputs(v, m, inputs)
 		}
 		out[i].Env = env
 	}
@@ -176,6 +199,17 @@ func interpolateSteps(in []Step, m map[string]string) []Step {
 // "${{matrix.X}}" form are accepted, and substitution is a single
 // deterministic pass.
 func Interpolate(s string, m map[string]string) string {
+	return InterpolateWithInputs(s, m, nil)
+}
+
+// InterpolateWithInputs resolves matrix and pipeline-input holes at compile
+// time. With a nil inputs map it behaves exactly like Interpolate (inputs
+// holes stay literal, the legacy behavior); with a non-nil map, holes that
+// reference the inputs context are evaluated against it and substituted
+// when all their referenced keys resolve. Unresolvable holes stay literal:
+// callers that provided inputs (CompileWithInputs) reject leftover inputs
+// holes as compile errors.
+func InterpolateWithInputs(s string, m map[string]string, inputs map[string]string) string {
 	if !strings.Contains(s, "${{") {
 		return s
 	}
@@ -183,8 +217,12 @@ func Interpolate(s string, m map[string]string) string {
 	if err != nil || len(holes) == 0 {
 		return s
 	}
-	c := expr.Context{Matrix: m}
-	return interpolateLenient(s, holes, c, map[string]bool{"matrix": true})
+	c := expr.Context{Matrix: m, Inputs: inputs}
+	allowed := map[string]bool{"matrix": true}
+	if inputs != nil {
+		allowed["inputs"] = true
+	}
+	return interpolateLenient(s, holes, c, allowed)
 }
 
 // interpolateLenient substitutes the holes that reference only the allowed
@@ -235,6 +273,54 @@ func matrixEnv(m map[string]string) map[string]string {
 		out["KIWI_MATRIX_"+strings.ToUpper(strings.ReplaceAll(k, "-", "_"))] = v
 	}
 	return out
+}
+
+// inputEnv mirrors the server's enqueue-time injection: every pipeline
+// input reaches the executor as KIWI_INPUT_<NAME>.
+func inputEnv(inputs map[string]string) map[string]string {
+	out := map[string]string{}
+	for k, v := range inputs {
+		out["KIWI_INPUT_"+strings.ToUpper(strings.ReplaceAll(k, "-", "_"))] = v
+	}
+	return out
+}
+
+// validateInputsResolved enforces the compile-time inputs contract after
+// interpolation: with inputs in play, a hole that still references the
+// inputs context must not evaluate against the provided map. Missing input
+// keys surface as the expr engine's missing-key error (key ... not found in
+// context "inputs"), wrapped with the job and hole body. Holes that also
+// reference runtime contexts (needs/steps) legitimately stay literal and
+// are skipped because their evaluation error names a different context.
+func validateInputsResolved(jobID string, j Job, m, inputs map[string]string) error {
+	b, err := json.Marshal(j)
+	if err != nil {
+		return err
+	}
+	holes, err := expr.Holes(string(b))
+	if err != nil {
+		return nil
+	}
+	for _, h := range holes {
+		e, err := expr.Parse(h.Body)
+		if err != nil {
+			continue
+		}
+		refsInputs := false
+		for _, c := range e.Contexts() {
+			if c == "inputs" {
+				refsInputs = true
+				break
+			}
+		}
+		if !refsInputs {
+			continue
+		}
+		if _, err := e.Eval(expr.Context{Matrix: m, Inputs: inputs}); err != nil && strings.Contains(err.Error(), "inputs") {
+			return fmt.Errorf("job %q: ${{ %s }}: %w", jobID, h.Body, err)
+		}
+	}
+	return nil
 }
 
 func mergeStringMaps(a, b map[string]string) map[string]string {

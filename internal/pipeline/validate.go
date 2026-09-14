@@ -41,6 +41,7 @@ var (
 		"matrix": true, "needs": true, "steps": true, "env": true, "github": true,
 		"inputs": true, "vars": true, "secrets": true, "runner": true,
 		"ref": true, "event": true, "sha": true, "repo": true, "branch": true,
+		"git": true,
 	}
 )
 

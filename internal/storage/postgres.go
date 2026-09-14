@@ -42,6 +42,11 @@ var (
 	_ SnapshotStore         = (*PostgresStore)(nil)
 	_ ArtifactContractStore = (*PostgresStore)(nil)
 	_ QueueReasonStore      = (*PostgresStore)(nil)
+	_ DynamicStore          = (*PostgresStore)(nil)
+	_ DownstreamStore       = (*PostgresStore)(nil)
+	_ UsageStore            = (*PostgresStore)(nil)
+	_ RunDownstreamStore    = (*PostgresStore)(nil)
+	_ ArtifactLookupStore   = (*PostgresStore)(nil)
 )
 
 // NewPostgres opens a pool and verifies connectivity.
@@ -1217,6 +1222,28 @@ func (s *PostgresStore) ListArtifacts(ctx context.Context, runID string) ([]mode
 	return out, rows.Err()
 }
 
+// GetArtifact resolves one artifact record by ID.
+func (s *PostgresStore) GetArtifact(ctx context.Context, id string) (model.ArtifactRecord, error) {
+	if err := ValidateID(id); err != nil {
+		return model.ArtifactRecord{}, err
+	}
+	var (
+		payload []byte
+		a       model.ArtifactRecord
+	)
+	err := s.pool.QueryRow(ctx, `SELECT payload FROM artifacts WHERE id=$1`, id).Scan(&payload)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return model.ArtifactRecord{}, ErrNotFound
+	}
+	if err != nil {
+		return model.ArtifactRecord{}, err
+	}
+	if err := json.Unmarshal(payload, &a); err != nil {
+		return model.ArtifactRecord{}, err
+	}
+	return a, nil
+}
+
 func (s *PostgresStore) InsertTestReport(ctx context.Context, rep model.TestReport) error {
 	if err := ValidateID(rep.ID); err != nil {
 		return err
@@ -1757,8 +1784,160 @@ func (s *PostgresStore) SetQueueReasons(ctx context.Context, reasons map[string]
 }
 
 // ---------------------------------------------------------------------------
-// leader / HA
+// dynamic pipeline generation
 // ---------------------------------------------------------------------------
+
+// InsertGeneratedJobs atomically inserts a generated job fragment uploaded
+// by a runner under an active lease. Each job is fully compiled by the
+// server (IDs, needs resolved); the transaction makes the whole fragment
+// visible or nothing, so a partial fragment can never be scheduled.
+func (s *PostgresStore) InsertGeneratedJobs(ctx context.Context, parentJobID string, depth int, jobs map[string]model.Job, deps map[string][]string) error {
+	if err := ValidateJobID(parentJobID); err != nil {
+		return err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	for id, j := range jobs {
+		if err := ValidateJobID(id); err != nil {
+			return err
+		}
+		if err := s.insertJobTx(ctx, tx, j); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+// ---------------------------------------------------------------------------
+// downstream dispatch claims
+// ---------------------------------------------------------------------------
+
+func downstreamLinkKey(parentJobID, targetRepo, targetRef string) string {
+	return parentJobID + "\x00" + targetRepo + "\x00" + targetRef
+}
+
+// InsertDownstreamLink records one downstream launch claim. Re-inserting the
+// same (parent, repo, ref) keeps the existing claim (ON CONFLICT DO NOTHING)
+// so a replayed completion can never reset an already-launched link.
+func (s *PostgresStore) InsertDownstreamLink(ctx context.Context, l DownstreamLink) error {
+	if err := ValidateJobID(l.ParentJobID); err != nil {
+		return err
+	}
+	if l.TargetRepo == "" || l.TargetRef == "" || l.LaunchToken == "" {
+		return fmt.Errorf("storage: incomplete downstream link")
+	}
+	if l.CreatedAt.IsZero() {
+		l.CreatedAt = time.Now().UTC()
+	}
+	_, err := s.pool.Exec(ctx, `INSERT INTO downstream_links (parent_job_id, target_repo, target_ref, launch_token, child_run_id, created_at) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (parent_job_id, target_repo, target_ref) DO NOTHING`,
+		l.ParentJobID, l.TargetRepo, l.TargetRef, l.LaunchToken, l.ChildRunID, l.CreatedAt)
+	return err
+}
+
+// GetDownstreamLink reads one downstream launch claim.
+func (s *PostgresStore) GetDownstreamLink(ctx context.Context, parentJobID, targetRepo, targetRef string) (DownstreamLink, bool, error) {
+	if err := ValidateJobID(parentJobID); err != nil {
+		return DownstreamLink{}, false, err
+	}
+	var l DownstreamLink
+	err := s.pool.QueryRow(ctx, `SELECT parent_job_id, target_repo, target_ref, launch_token, COALESCE(child_run_id, ''), created_at FROM downstream_links WHERE parent_job_id=$1 AND target_repo=$2 AND target_ref=$3`,
+		parentJobID, targetRepo, targetRef).Scan(&l.ParentJobID, &l.TargetRepo, &l.TargetRef, &l.LaunchToken, &l.ChildRunID, &l.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return DownstreamLink{}, false, nil
+	}
+	if err != nil {
+		return DownstreamLink{}, false, err
+	}
+	return l, true, nil
+}
+
+// MarkDownstreamLaunched atomically sets the child run ID on a link whose
+// claim is still open (child_run_id empty). A concurrent claim wins the
+// row and the loser's update affects zero rows; callers re-read the link
+// to learn the winning child run ID.
+func (s *PostgresStore) MarkDownstreamLaunched(ctx context.Context, parentJobID, targetRepo, targetRef, childRunID string) error {
+	if err := ValidateJobID(parentJobID); err != nil {
+		return err
+	}
+	if childRunID == "" {
+		return fmt.Errorf("storage: empty child run id")
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE downstream_links SET child_run_id=$4 WHERE parent_job_id=$1 AND target_repo=$2 AND target_ref=$3 AND (child_run_id IS NULL OR child_run_id='')`,
+		parentJobID, targetRepo, targetRef, childRunID)
+	return err
+}
+
+// ---------------------------------------------------------------------------
+// usage accounting
+// ---------------------------------------------------------------------------
+
+// RecentUsage sums the cost and energy recorded on jobs finished since the
+// cutoff (the trailing 24h daily-budget window). Cost/energy are persisted
+// inside the jobs payload (payload->>'cost', payload->>'energy_wh'); jobs
+// that predate usage accounting contribute zero.
+func (s *PostgresStore) RecentUsage(ctx context.Context, since time.Time) (cost, energy float64, err error) {
+	err = s.pool.QueryRow(ctx, `SELECT COALESCE(SUM(COALESCE((payload->>'cost')::float8, 0)), 0), COALESCE(SUM(COALESCE((payload->>'energy_wh')::float8, 0)), 0) FROM jobs WHERE finished_at >= $1`,
+		since).Scan(&cost, &energy)
+	return cost, energy, err
+}
+
+// AppendDownstreamRun appends childRunID to the parent run's downstream_runs
+// payload key exactly once (idempotent): the row is locked FOR UPDATE and
+// the append is skipped when the ID is already present.
+func (s *PostgresStore) AppendDownstreamRun(ctx context.Context, runID, childRunID string) error {
+	if err := ValidateRunID(runID); err != nil {
+		return err
+	}
+	if childRunID == "" {
+		return fmt.Errorf("storage: empty child run id")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var payload []byte
+	err = tx.QueryRow(ctx, `SELECT payload FROM runs WHERE id=$1 FOR UPDATE`, runID).Scan(&payload)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	var run model.Run
+	if err := json.Unmarshal(payload, &run); err != nil {
+		return err
+	}
+	for _, id := range run.DownstreamRuns {
+		if id == childRunID {
+			return tx.Commit(ctx)
+		}
+	}
+	run.DownstreamRuns = append(run.DownstreamRuns, childRunID)
+	rp, err := json.Marshal(run)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE runs SET payload=$2 WHERE id=$1`, runID, rp); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// ReopenRunForChildren marks a terminal-success run as running again while
+// wait=true downstream children are still in flight. The real status column
+// and the payload status field are updated together and finished_at is
+// cleared.
+func (s *PostgresStore) ReopenRunForChildren(ctx context.Context, runID string) error {
+	if err := ValidateRunID(runID); err != nil {
+		return err
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE runs SET status='running', finished_at=NULL, payload = jsonb_set(payload, '{status}', '"running"', true) WHERE id=$1 AND status='success'`, runID)
+	return err
+}
 
 // TryAcquireLeadership takes a session-level Postgres advisory lock on a
 // dedicated connection held outside the pool. Advisory locks die with the

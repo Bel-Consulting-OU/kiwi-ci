@@ -1,6 +1,22 @@
 package app
 
-import "testing"
+import (
+	"testing"
+	"time"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/blob"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/config"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
+)
+
+// Compile-time adoption checks: once *server.Server implements the drain
+// and blob seams, the --drain-on-sigterm flag and the blob backend wiring
+// activate automatically. A signature change on the server side breaks
+// these assertions, surfacing the drift immediately.
+var (
+	_ drainableServer = (*server.Server)(nil)
+	_ blobStoreSetter = (*server.Server)(nil)
+)
 
 func TestValidateProductionConfig(t *testing.T) {
 	valid := productionConfig{
@@ -67,4 +83,77 @@ func containsStr(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+// fakeDrainServer is a drainableServer test double.
+type fakeDrainServer struct {
+	active  int
+	reason  string
+	drained bool
+}
+
+func (f *fakeDrainServer) BeginDrain(reason string) { f.drained = true; f.reason = reason }
+func (f *fakeDrainServer) ActiveJobs() int          { return f.active }
+
+func TestWaitForDrainIdle(t *testing.T) {
+	s := &fakeDrainServer{}
+	if !waitForDrain(s, 2*time.Second) {
+		t.Fatal("idle server must drain immediately")
+	}
+}
+
+func TestWaitForDrainCompletesWhenJobsFinish(t *testing.T) {
+	s := &fakeDrainServer{active: 2}
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		s.active = 0
+	}()
+	if !waitForDrain(s, 2*time.Second) {
+		t.Fatal("drain must complete once active jobs reach zero")
+	}
+}
+
+func TestWaitForDrainTimesOut(t *testing.T) {
+	s := &fakeDrainServer{active: 1}
+	if waitForDrain(s, 100*time.Millisecond) {
+		t.Fatal("drain with active jobs must time out")
+	}
+}
+
+func TestBuildBlobStoreS3(t *testing.T) {
+	cfg := config.BlobConfig{
+		Backend:     "s3",
+		S3Endpoint:  "http://s3.local",
+		S3Bucket:    "kiwi-artifacts",
+		S3Region:    "us-east-1",
+		S3AccessKey: "ak",
+		S3SecretKey: "sk",
+	}
+	store := buildBlobStore(cfg, "")
+	s3, ok := store.(*blob.S3)
+	if !ok {
+		t.Fatalf("s3 backend produced %T, want *blob.S3", store)
+	}
+	if s3.Bucket != "kiwi-artifacts" || s3.Region != "us-east-1" || s3.Endpoint != "http://s3.local" {
+		t.Fatalf("s3 config not carried: %+v", s3)
+	}
+}
+
+func TestBuildBlobStoreFSFromDataDir(t *testing.T) {
+	store := buildBlobStore(config.BlobConfig{Backend: "fs"}, "/var/lib/kiwi")
+	fs, ok := store.(*blob.FS)
+	if !ok {
+		t.Fatalf("fs backend produced %T, want *blob.FS", store)
+	}
+	if fs.Root != "/var/lib/kiwi/blobs" {
+		t.Fatalf("fs root = %q, want /var/lib/kiwi/blobs", fs.Root)
+	}
+}
+
+func TestBuildBlobStoreFSPathPrecedence(t *testing.T) {
+	store := buildBlobStore(config.BlobConfig{Backend: "fs", Path: "/custom/blobs"}, "/var/lib/kiwi")
+	fs := store.(*blob.FS)
+	if fs.Root != "/custom/blobs" {
+		t.Fatalf("fs root = %q, want explicit blob.path", fs.Root)
+	}
 }

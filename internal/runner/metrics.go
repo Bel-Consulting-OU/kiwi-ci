@@ -4,9 +4,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executor"
 )
 
 // Metrics is the runner's minimal Prometheus text-format metric registry.
@@ -62,44 +65,35 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	}
 }
 
-// stepTimer derives per-step wall-clock durations from the executor's log
-// sink. Every executed step emits a "running on <backend> (attempt …)" line
-// before running, so the first line seen for a (job, step) key marks the
-// step start; the duration is finalised when the next step starts and by
-// flush() after the job finishes. Skipped steps never emit lines and are
-// never counted.
-type stepTimer struct {
-	m       *Metrics
-	mu      sync.Mutex
-	started map[string]time.Time
-	active  string
-}
+// stepReporterFunc is the expected executor.Options.StepReporter signature:
+// it receives a completed step's wall-clock duration as measured by the
+// executor, which is the real measurement (the sink-derived approximation
+// was removed).
+type stepReporterFunc func(jobID, step string, d time.Duration)
 
-func (st *stepTimer) WriteLine(job, step, line string) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if st.started == nil {
-		st.started = map[string]time.Time{}
+// applyStepReporter wires the executor's StepReporter hook into the
+// kiwi_runner_step_duration_seconds counter. The hook is added by the
+// executor workstream; until it lands, the field is absent and the function
+// returns false (step durations are then simply not collected). The wiring
+// is reflection-based so this package builds against executor versions with
+// and without the field.
+func applyStepReporter(opts *executor.Options, m *Metrics) bool {
+	v := reflect.ValueOf(opts).Elem()
+	f := v.FieldByName("StepReporter")
+	if !f.IsValid() || f.Kind() != reflect.Func || !f.CanSet() {
+		return false
 	}
-	key := job + "\x00" + step
-	if st.active != "" && st.active != key {
-		if t0, ok := st.started[st.active]; ok {
-			st.m.Observe("kiwi_runner_step_duration_seconds", time.Since(t0).Seconds())
+	t := f.Type()
+	if t.NumIn() != 3 || t.NumOut() != 0 {
+		return false
+	}
+	f.Set(reflect.MakeFunc(t, func(args []reflect.Value) []reflect.Value {
+		if len(args) == 3 {
+			if d, ok := args[2].Interface().(time.Duration); ok {
+				m.Observe("kiwi_runner_step_duration_seconds", d.Seconds())
+			}
 		}
-	}
-	if _, ok := st.started[key]; !ok {
-		st.started[key] = time.Now()
-	}
-	st.active = key
-}
-
-func (st *stepTimer) flush() {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if st.active != "" {
-		if t0, ok := st.started[st.active]; ok {
-			st.m.Observe("kiwi_runner_step_duration_seconds", time.Since(t0).Seconds())
-		}
-		st.active = ""
-	}
+		return nil
+	}))
+	return true
 }
