@@ -138,7 +138,8 @@ func (s *Server) peerRunnerID(r *http.Request) (string, error) {
 // bindRunnerIdentity binds a runner request to its TLS peer identity when
 // runner mTLS is enabled. The verified peer runner ID must match id (an empty
 // id skips the comparison, letting register() adopt the peer identity). With
-// mTLS disabled the bearer token is the identity and binding is a no-op.
+// mTLS disabled the bearer token is the identity and no additional
+// binding check applies.
 func (s *Server) bindRunnerIdentity(r *http.Request, id string) error {
 	if s.RunnerCA == nil {
 		return nil

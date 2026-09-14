@@ -21,8 +21,8 @@ import (
 // uploadSnapshot is POST /api/v1/jobs/{id}/snapshots: the runner uploads a
 // workspace snapshot tar.gz under its active lease. The archive is stored
 // under the server data dir (snapshots/<runID>/<jobID>.tar.gz) together
-// with a manifest sidecar, and the record is kept in memory (DB persistence
-// is deferred — see the report's deferred items).
+// with a manifest sidecar; the record is mirrored in memory and persisted
+// through SnapshotStore in DB mode.
 func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
 	if s.store == nil {
 		http.Error(w, "snapshot storage requires persistent server", http.StatusServiceUnavailable)

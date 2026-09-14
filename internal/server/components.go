@@ -110,9 +110,9 @@ func validateRunInputs(spec *pipeline.Spec, meta map[string]string) (map[string]
 }
 
 // applyInputEnv injects validated input values into every job's environment
-// as KIWI_INPUT_<NAME>, the executor-visible form of inputs (minimal v1:
-// inputs reach steps through env; the expr `inputs.*` context wiring in the
-// executor is a deferred integration).
+// as KIWI_INPUT_<NAME>, the executor-visible form of inputs. The `inputs.*`
+// expression context resolves at compile time (pipeline.CompileWithInputs),
+// so env injection and expression interpolation stay consistent.
 func applyInputEnv(spec *pipeline.Spec, inputs map[string]string) {
 	if len(inputs) == 0 {
 		return
