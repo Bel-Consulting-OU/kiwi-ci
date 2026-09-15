@@ -46,6 +46,9 @@ const (
 	gcInterval = time.Hour
 	// gcOlderThan is the executor.GC staleness window.
 	gcOlderThan = 24 * time.Hour
+	// maxGeneratedFragmentBytes mirrors the control plane's upload bound
+	// for one generated graph fragment (POST /api/v1/jobs/{id}/generated).
+	maxGeneratedFragmentBytes = 256 << 10
 )
 
 // ErrRunnerDisabledOrRevoked reports that the control plane has disabled
@@ -495,6 +498,21 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	applyStepReporter(&opts, r.Metrics)
 	ex := executor.Executor{Opt: opts, Masker: masker}
 	res := ex.RunCompiledJob(ctx, spec, cj)
+	// P2-30 generate wiring: a successful job whose effective compiled job
+	// declares generate.path produced a downstream child-graph fragment in
+	// the workspace. It is located, parsed ({jobs, deps}), and POSTed to
+	// /api/v1/jobs/{id}/generated under the active lease. A non-2xx
+	// response (the control plane may reject per policy/caps/depth) does
+	// NOT change the job outcome: the failure is reported in logs and the
+	// completion proceeds — the rejected children then never exist, which
+	// is the enforced semantics.
+	if res.Status == model.StatusSuccess && cj.Job.Generate.Path != "" {
+		if err := r.uploadGeneratedFragment(parent, t, tmp, cj.Job.Generate.Path); err != nil {
+			sink.WriteLine(cj.ID, "generate", "fragment upload failed: "+err.Error())
+		} else {
+			sink.WriteLine(cj.ID, "generate", "generated fragment uploaded from "+cj.Job.Generate.Path)
+		}
+	}
 	if len(cj.Job.TestReports) > 0 {
 		report, er := testintel.Aggregate(tmp, cj.Job.TestReports)
 		if er != nil {
@@ -506,7 +524,10 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 			}
 		}
 	}
-	if r.Cfg.CaptureSnapshots && res.Status != model.StatusSkipped && res.Status != model.StatusBlocked {
+	// CaptureSnapshots is the master switch; when set, the job's
+	// snapshot.on declaration governs which outcomes are captured (an empty
+	// on captures every outcome).
+	if r.Cfg.CaptureSnapshots && snapshotRequested(cj.Job.Snapshot, res.Status) {
 		snapStart := time.Now()
 		if err := r.uploadJobSnapshot(parent, t, tmp); err != nil {
 			sink.WriteLine(cj.ID, "snapshot", "upload warning: "+err.Error())
@@ -943,6 +964,84 @@ func (r *Runner) complete(ctx context.Context, t server.Task, st model.Status, e
 		msg = err.Error()
 	}
 	_ = r.post(ctx, "/api/v1/jobs/"+t.Job.ID+"/complete", server.Complete{RunnerID: r.ID, LeaseToken: t.LeaseToken, LeaseGeneration: t.LeaseGeneration, Status: st, Error: msg, Outputs: outputs}, nil)
+}
+
+// snapshotRequested reports whether the job's snapshot declaration captures
+// this final status. An empty snapshot.on captures every outcome; a
+// non-empty list captures only the listed final status strings
+// (success/failure/cancelled). The caller applies CaptureSnapshots as the
+// master switch before consulting this predicate.
+func snapshotRequested(s pipeline.SnapshotSpec, st model.Status) bool {
+	if len(s.On) == 0 {
+		return true
+	}
+	for _, o := range s.On {
+		if strings.EqualFold(strings.TrimSpace(o), string(st)) {
+			return true
+		}
+	}
+	return false
+}
+
+// generatedFragment is the POST /api/v1/jobs/{id}/generated body: the child
+// graph a generator produced. jobs maps the child key to its pipeline job
+// spec; deps carries fragment-internal dependency edges (the generating job
+// is the implicit dependency of every child on the control plane).
+type generatedFragment struct {
+	Jobs map[string]pipeline.Job `json:"jobs"`
+	Deps map[string][]string     `json:"deps"`
+}
+
+// uploadGeneratedFragment reads the generator's fragment file from the job
+// workspace (bounded read), parses {jobs, deps}, and POSTs it to
+// /api/v1/jobs/{id}/generated under the active lease. A non-2xx response is
+// returned as an error: the caller reports it as a non-fatal failure and
+// the job completion proceeds — the server may reject the fragment per
+// policy, in which case the run's children never exist.
+func (r *Runner) uploadGeneratedFragment(ctx context.Context, t server.Task, workspace, path string) error {
+	clean := filepath.Clean(path)
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) || filepath.IsAbs(clean) {
+		return fmt.Errorf("generate.path %q escapes the workspace", path)
+	}
+	f, err := os.Open(filepath.Join(workspace, clean))
+	if err != nil {
+		return fmt.Errorf("open generated fragment %q: %w", path, err)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxGeneratedFragmentBytes+1))
+	_ = f.Close()
+	if err != nil {
+		return fmt.Errorf("read generated fragment %q: %w", path, err)
+	}
+	if len(data) > maxGeneratedFragmentBytes {
+		return fmt.Errorf("generated fragment %q exceeds %d bytes", path, maxGeneratedFragmentBytes)
+	}
+	var frag generatedFragment
+	if err := json.Unmarshal(data, &frag); err != nil {
+		return fmt.Errorf("parse generated fragment %q: %w", path, err)
+	}
+	body, err := json.Marshal(frag)
+	if err != nil {
+		return fmt.Errorf("encode generated fragment: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.Cfg.Server+"/api/v1/jobs/"+t.Job.ID+"/generated", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	r.auth(req)
+	req.Header.Set("X-Kiwi-Runner-ID", r.ID)
+	req.Header.Set("X-Kiwi-Lease-Token", t.LeaseToken)
+	req.Header.Set("X-Kiwi-Lease-Generation", fmt.Sprint(t.LeaseGeneration))
+	resp, err := r.Client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("generated fragment upload: %s: %s", resp.Status, strings.TrimSpace(string(b)))
+	}
+	return nil
 }
 func (r *Runner) post(ctx context.Context, path string, in, out any) error {
 	b, _ := json.Marshal(in)

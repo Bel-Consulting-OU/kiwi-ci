@@ -206,17 +206,3 @@ jobs:
 		t.Fatalf("want enum error, got %d %s", w.Code, w.Body.String())
 	}
 }
-
-func TestEnvNameNormalization(t *testing.T) {
-	cases := map[string]string{
-		"environment":  "ENVIRONMENT",
-		"deploy-tag":   "DEPLOY_TAG",
-		"service.name": "SERVICE_NAME",
-		"MiXeD":        "MIXED",
-	}
-	for in, want := range cases {
-		if got := envName(in); got != want {
-			t.Errorf("envName(%q) = %q, want %q", in, got, want)
-		}
-	}
-}

@@ -2,8 +2,10 @@ package app
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
@@ -11,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -219,6 +222,14 @@ func Server(ctx context.Context, args []string) error {
 	dailyCostLimit := fs.String("daily-cost-limit", "", "trailing-24h cost budget (0 = unlimited)")
 	dailyEnergyLimit := fs.String("daily-energy-limit", "", "trailing-24h energy budget in Wh (0 = unlimited)")
 	quotaFailOpen := fs.Bool("quota-fail-open", false, "let enqueues/leases proceed when the usage store is unavailable instead of failing closed")
+	var downstreamAllow repeatFlag
+	fs.Var(&downstreamAllow, "downstream-allow", "downstream dispatch authorization: target=src[,src...] (repeatable; a target with no sources allows any source)")
+	var downstreamTrustedIngress repeatFlag
+	fs.Var(&downstreamTrustedIngress, "downstream-trusted-ingress", "downstream target inheriting the parent's trust: target=true|false (repeatable)")
+	var sigstoreTrustKeys repeatFlag
+	fs.Var(&sigstoreTrustKeys, "sigstore-key", "Sigstore verification key: id=/path/to/ed25519-public-key-pem (repeatable)")
+	rekorPublicKey := fs.String("rekor-public-key", "", "Rekor transparency-log Ed25519 public key (PEM file or contents)")
+	rekorBaseURL := fs.String("rekor-base-url", "", "Rekor transparency-log base URL (activates inclusion verification together with --rekor-public-key)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -361,6 +372,31 @@ func Server(ctx context.Context, args []string) error {
 		return err
 	}
 	applyQuotaConfig(srv, cfg)
+	// Downstream authorization and Sigstore trust roots are repeatable map
+	// flags (not config-merged: the TOML schema does not model them).
+	if allowlist, perr := parseDownstreamAllowlist(downstreamAllow.values()); perr != nil {
+		return perr
+	} else if len(allowlist) > 0 {
+		srv.DownstreamAllowlist = allowlist
+	}
+	if ingress, perr := parseDownstreamTrustedIngress(downstreamTrustedIngress.values()); perr != nil {
+		return perr
+	} else if len(ingress) > 0 {
+		srv.DownstreamTrustedIngress = ingress
+	}
+	if sigstoreKeys, perr := parseSigstoreKeys(sigstoreTrustKeys.values()); perr != nil {
+		return perr
+	} else {
+		var rekorPub ed25519.PublicKey
+		if v := strings.TrimSpace(*rekorPublicKey); v != "" {
+			if rekorPub, perr = loadEd25519PublicKey(v); perr != nil {
+				return fmt.Errorf("--rekor-public-key: %w", perr)
+			}
+		}
+		if len(sigstoreKeys) > 0 || len(rekorPub) > 0 || strings.TrimSpace(*rekorBaseURL) != "" {
+			srv.SetSigstoreTrustRoot(sigstoreKeys, rekorPub, strings.TrimSpace(*rekorBaseURL))
+		}
+	}
 	if broker, err := buildSecretBroker(cfg.SecretBroker); err != nil {
 		return err
 	} else if broker != nil {
@@ -539,6 +575,9 @@ func Runner(ctx context.Context, args []string) error {
 	runnerKey := fs.String("runner-key", "", "runner client private key PEM (path or contents)")
 	runnerEnrollToken := fs.String("runner-enroll-token", os.Getenv("KIWI_RUNNER_ENROLL_TOKEN"), "enrollment token to obtain a runner certificate")
 	runnerMTLS := fs.Bool("runner-mtls", false, "require mTLS (explicit client certificate or enrollment)")
+	var enrollLabels repeatFlag
+	fs.Var(&enrollLabels, "enroll-label", "label sent with the enrollment request (repeatable; required for label-bound enrollment grants)")
+	identityDir := fs.String("identity-dir", "", "directory for the persisted enrollment identity (default ~/.kiwi/runner)")
 	drain := fs.Bool("drain", false, "register as draining: finish active jobs, take no new work, then exit")
 	captureSnapshots := fs.Bool("capture-snapshots", true, "upload a workspace snapshot after each job (failures are warnings)")
 	var prewarmRefs stringList
@@ -557,6 +596,8 @@ func Runner(ctx context.Context, args []string) error {
 		Cert:             *runnerCert,
 		Key:              *runnerKey,
 		EnrollToken:      *runnerEnrollToken,
+		EnrollLabels:     enrollLabels.values(),
+		IdentityDir:      *identityDir,
 		Drain:            *drain,
 		CaptureSnapshots: *captureSnapshots,
 		Prewarm:          prewarmRefs.values(),
@@ -595,6 +636,116 @@ func (s *stringList) Set(v string) error {
 }
 
 func (s *stringList) values() []string { return append([]string{}, s.items...) }
+
+// repeatFlag collects repeatable string flags WITHOUT splitting on commas,
+// for flags whose values carry commas themselves (downstream-allow's
+// target=src1,src2 form).
+type repeatFlag struct {
+	items []string
+}
+
+func (r *repeatFlag) String() string { return strings.Join(r.items, ",") }
+
+func (r *repeatFlag) Set(v string) error {
+	if v = strings.TrimSpace(v); v != "" {
+		r.items = append(r.items, v)
+	}
+	return nil
+}
+
+func (r *repeatFlag) values() []string { return append([]string{}, r.items...) }
+
+// parseDownstreamAllowlist parses repeatable --downstream-allow entries of
+// the form target=src[,src...] into the server's bilateral downstream
+// authorization map. A target with an empty source list allows any source
+// (matching the server's semantics for a nil/empty source list).
+func parseDownstreamAllowlist(entries []string) (map[string][]string, error) {
+	out := map[string][]string{}
+	for _, item := range entries {
+		target, sources, ok := strings.Cut(item, "=")
+		target = strings.TrimSpace(target)
+		if !ok || target == "" {
+			return nil, fmt.Errorf("--downstream-allow requires target=src[,src...] entries, got %q", item)
+		}
+		var srcs []string
+		for _, s := range strings.Split(sources, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				srcs = append(srcs, s)
+			}
+		}
+		out[target] = srcs
+	}
+	return out, nil
+}
+
+// parseDownstreamTrustedIngress parses repeatable
+// --downstream-trusted-ingress entries of the form target=bool.
+func parseDownstreamTrustedIngress(entries []string) (map[string]bool, error) {
+	out := map[string]bool{}
+	for _, item := range entries {
+		target, val, ok := strings.Cut(item, "=")
+		target = strings.TrimSpace(target)
+		if !ok || target == "" {
+			return nil, fmt.Errorf("--downstream-trusted-ingress requires target=true|false entries, got %q", item)
+		}
+		b, err := strconv.ParseBool(strings.TrimSpace(val))
+		if err != nil {
+			return nil, fmt.Errorf("--downstream-trusted-ingress %q: %w", item, err)
+		}
+		out[target] = b
+	}
+	return out, nil
+}
+
+// parseSigstoreKeys parses repeatable --sigstore-key entries of the form
+// id=/path/to/pem (or id=<PEM contents>) into Ed25519 verification keys.
+func parseSigstoreKeys(entries []string) (map[string]ed25519.PublicKey, error) {
+	out := map[string]ed25519.PublicKey{}
+	for _, item := range entries {
+		id, ref, ok := strings.Cut(item, "=")
+		id = strings.TrimSpace(id)
+		if !ok || id == "" || strings.TrimSpace(ref) == "" {
+			return nil, fmt.Errorf("--sigstore-key requires id=/path/to/pem entries, got %q", item)
+		}
+		pub, err := loadEd25519PublicKey(strings.TrimSpace(ref))
+		if err != nil {
+			return nil, fmt.Errorf("--sigstore-key %s: %w", id, err)
+		}
+		out[id] = pub
+	}
+	return out, nil
+}
+
+// loadEd25519PublicKey loads an Ed25519 verification key from PEM contents
+// (PKIX "PUBLIC KEY"), a PEM file path, or a raw 32-byte file.
+func loadEd25519PublicKey(v string) (ed25519.PublicKey, error) {
+	v = strings.TrimSpace(v)
+	b := []byte(v)
+	if !strings.Contains(v, "-----BEGIN") {
+		raw, err := os.ReadFile(v)
+		if err != nil {
+			return nil, err
+		}
+		b = raw
+	}
+	if strings.Contains(string(b), "-----BEGIN") {
+		block, _ := pem.Decode(b)
+		if block == nil {
+			return nil, fmt.Errorf("invalid PEM contents")
+		}
+		b = block.Bytes
+	}
+	if k, err := x509.ParsePKIXPublicKey(b); err == nil {
+		if pub, ok := k.(ed25519.PublicKey); ok {
+			return pub, nil
+		}
+		return nil, fmt.Errorf("key is not an Ed25519 public key")
+	}
+	if len(b) == ed25519.PublicKeySize {
+		return ed25519.PublicKey(append([]byte{}, b...)), nil
+	}
+	return nil, fmt.Errorf("unsupported public key encoding (want PKIX Ed25519 PEM or raw 32 bytes)")
+}
 
 // RunnerAdmin implements the admin-side runner control commands:
 //

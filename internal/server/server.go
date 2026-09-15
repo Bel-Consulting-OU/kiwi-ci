@@ -2258,22 +2258,30 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		if st != model.StatusSuccess && st != model.StatusFailure && st != model.StatusCancelled && st != model.StatusSkipped {
 			st = model.StatusFailure
 		}
+		outputsValid := validJobOutputs(in.Outputs)
+		if !outputsValid {
+			st = model.StatusFailure
+		}
+		// Required-artifact enforcement mirrors the DB-mode fail-closed
+		// semantics: a SUCCESSFUL completion with a missing required
+		// artifact is refused (422) with the audit and the job stays
+		// RUNNING — never flipped to failure post-hoc — so the runner can
+		// upload the artifact and retry.
+		if st == model.StatusSuccess {
+			if missing := s.requiredArtifactsMissingLocked(j); missing != "" {
+				errMsg := "required artifact " + missing + " missing"
+				s.auditLocked("job.required_artifact_missing", in.RunnerID, j.RunID, j.ID, errMsg, map[string]string{"job": j.Key, "artifact": missing})
+				s.mu.Unlock()
+				http.Error(w, errMsg, http.StatusUnprocessableEntity)
+				return
+			}
+		}
 		j.Status = st
 		j.Error = in.Error
-		if validJobOutputs(in.Outputs) {
+		if outputsValid {
 			j.Outputs = cloneMap(in.Outputs)
 		} else {
-			j.Status = model.StatusFailure
 			j.Error = "runner returned invalid or oversized job outputs"
-		}
-		// Required-artifact enforcement: a SUCCESSFUL completion must have
-		// an artifact record for every contract entry with Required=true.
-		if j.Status == model.StatusSuccess {
-			if missing := s.requiredArtifactsMissingLocked(j); missing != "" {
-				j.Status = model.StatusFailure
-				j.Error = "required artifact " + missing + " missing"
-				s.auditLocked("job.required_artifact_missing", in.RunnerID, j.RunID, j.ID, j.Error, map[string]string{"job": j.Key, "artifact": missing})
-			}
 		}
 		j.FinishedAt = &now
 	}

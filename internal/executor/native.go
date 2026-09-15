@@ -5,11 +5,34 @@ import (
 	"fmt"
 	"os/exec"
 	"time"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
 type NativeBackend struct{}
 
 func (*NativeBackend) Name() string { return "native" }
+
+// nativeResourceAdvisory reports the resource requests the native backend
+// cannot enforce. The native runtime has no container boundary to apply
+// them to, so the requests are logged as advisory and never change job
+// status.
+func nativeResourceAdvisory(r pipeline.Resources) []string {
+	var lines []string
+	if r.CPU > 0 {
+		lines = append(lines, fmt.Sprintf("advisory: native backend does not enforce cpu requests (requested %v)", r.CPU))
+	}
+	if r.Memory > 0 {
+		lines = append(lines, fmt.Sprintf("advisory: native backend does not enforce memory requests (requested %d bytes)", int64(r.Memory)))
+	}
+	if r.Disk > 0 {
+		lines = append(lines, fmt.Sprintf("advisory: native backend does not enforce disk requests (requested %d bytes)", int64(r.Disk)))
+	}
+	if r.PIDs > 0 {
+		lines = append(lines, fmt.Sprintf("advisory: native backend does not enforce pids requests (requested %d)", r.PIDs))
+	}
+	return lines
+}
 
 // ReadFile reads a workspace file on the host without following symlinks in
 // the final path component, so an attacker-controlled workspace cannot

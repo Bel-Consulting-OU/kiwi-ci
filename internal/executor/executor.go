@@ -351,8 +351,17 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		b.ReadOnlyRootFS = cj.Job.Sandbox.ReadOnlyRootFS
 		b.RunID = e.Opt.RunID
 		b.JobID = cj.ID
+		b.Resources = cj.Job.Resources
 	case *TartBackend:
 		b.RequireImmutableImages = e.Opt.RequireImmutableImages
+		b.Resources = cj.Job.Resources
+	case *NativeBackend:
+		// The native runtime has no container boundary to apply resource
+		// requests to: they are logged as advisory and never change job
+		// status.
+		for _, line := range nativeResourceAdvisory(cj.Job.Resources) {
+			e.log(cj.ID, "resources", line)
+		}
 	}
 	if lifecycle, ok := backend.(JobLifecycle); ok {
 		if err := lifecycle.StartJob(ctx, workspace, func(line string) { e.log(cj.ID, "runtime", line) }); err != nil {
@@ -579,6 +588,16 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	}
 	res.Status = currentStatus
 	res.Outputs = pipeline.InterpolateOutputMap(cj.Job.Outputs, needsOutputs, stepOutputs)
+	// Taint gate: declared job outputs interpolate step outputs, so both
+	// are checked before anything persists. An output that carries a
+	// registered secret fails the job and drops the outputs entirely —
+	// secret values never reach persisted job outputs.
+	if err := e.Masker.TaintCheck(res.Outputs, stepOutputs); err != nil {
+		e.log(cj.ID, "outputs", err.Error())
+		res.Status = model.StatusFailure
+		res.Error = err.Error()
+		res.Outputs = nil
+	}
 	e.saveArtifacts(s, cj, workspace, res.Status)
 	return finish(res)
 }
@@ -748,7 +767,9 @@ func secretEnvName(s string) string {
 // Job-level secrets are resolved once into the job env (job-wide); step-level
 // secrets are resolved into that step's env only, so a secret declared on one
 // step never reaches other steps, and secret values never reach cache keys or
-// persisted state.
+// persisted state. Masker registration is strict: a secret value the masker
+// cannot hold (capacity or outside the masking window) fails the job closed —
+// an unmaskable secret must never run.
 func (e *Executor) resolveSecrets(ctx context.Context, names []string, cache map[string]string) (map[string]string, error) {
 	out := map[string]string{}
 	for _, name := range names {
@@ -762,7 +783,9 @@ func (e *Executor) resolveSecrets(ctx context.Context, names []string, cache map
 			if er != nil {
 				return nil, er
 			}
-			e.Masker.Add(v)
+			if err := e.Masker.AddStrict(v); err != nil {
+				return nil, &RunError{Kind: ErrorConfig, Err: fmt.Errorf("secret %q cannot be masked; refusing to run: %w", name, err)}
+			}
 			cache[name] = v
 		}
 		out[secretEnvName(name)] = v

@@ -9,8 +9,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
 var dockerNameClean = regexp.MustCompile(`[^a-zA-Z0-9_.-]`)
@@ -33,6 +36,10 @@ type ContainerBackend struct {
 	Rootless bool
 	// ReadOnlyRootFS mounts the job container root filesystem read-only.
 	ReadOnlyRootFS bool
+	// Resources carries the job's resource requests, rendered into docker
+	// run flags by StartJob. Values are already admission-checked by
+	// pipeline validation; zero requests produce no flags.
+	Resources pipeline.Resources
 }
 
 func (*ContainerBackend) Name() string { return "container" }
@@ -74,6 +81,7 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 		"--cap-drop=ALL", "--security-opt=no-new-privileges",
 		"-v", abs + ":/workspace", "-w", "/workspace", "--name", b.container,
 	}
+	args = append(args, resourceArgsFor(b.Resources)...)
 	args = append(args, containerLabels(b.RunID, b.JobID)...)
 	if b.Rootless || b.ReadOnlyRootFS {
 		args = append(args,
@@ -90,6 +98,31 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 	}
 	emit("job container started " + b.container)
 	return nil
+}
+
+// containerResourceArgs renders the docker run flags enforcing a job's
+// resource requests: resources.cpu -> --cpus, resources.memory -> --memory,
+// resources.pids -> --pids-limit. Zero/absent requests produce no flags; the
+// values themselves are already range-checked by pipeline admission. The
+// disk request has no docker run equivalent and is not rendered.
+func containerResourceArgs(j pipeline.Job) []string {
+	return resourceArgsFor(j.Resources)
+}
+
+// resourceArgsFor renders the docker run resource flags for a Resources
+// value (shared by containerResourceArgs and the container backend).
+func resourceArgsFor(r pipeline.Resources) []string {
+	var args []string
+	if r.CPU > 0 {
+		args = append(args, "--cpus", strconv.FormatFloat(r.CPU, 'f', -1, 64))
+	}
+	if r.Memory > 0 {
+		args = append(args, "--memory", strconv.FormatInt(int64(r.Memory), 10))
+	}
+	if r.PIDs > 0 {
+		args = append(args, "--pids-limit", strconv.Itoa(r.PIDs))
+	}
+	return args
 }
 
 // securityOptionsRootless reports whether a `docker info --format

@@ -108,35 +108,3 @@ func validateRunInputs(spec *pipeline.Spec, meta map[string]string) (map[string]
 	}
 	return out, nil
 }
-
-// applyInputEnv injects validated input values into every job's environment
-// as KIWI_INPUT_<NAME>, the executor-visible form of inputs. The `inputs.*`
-// expression context resolves at compile time (pipeline.CompileWithInputs),
-// so env injection and expression interpolation stay consistent.
-func applyInputEnv(spec *pipeline.Spec, inputs map[string]string) {
-	if len(inputs) == 0 {
-		return
-	}
-	for key, j := range spec.Jobs {
-		if j.Env == nil {
-			j.Env = map[string]string{}
-		}
-		for name, v := range inputs {
-			j.Env["KIWI_INPUT_"+envName(name)] = v
-		}
-		spec.Jobs[key] = j
-	}
-}
-
-func envName(name string) string {
-	var b strings.Builder
-	for _, r := range name {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
-			b.WriteRune(r)
-		default:
-			b.WriteByte('_')
-		}
-	}
-	return strings.ToUpper(b.String())
-}

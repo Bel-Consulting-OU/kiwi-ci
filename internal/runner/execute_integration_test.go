@@ -36,6 +36,13 @@ type fakeRunnerServer struct {
 	complete []server.Complete
 	// snapshotBodies holds the raw bytes of every snapshot upload.
 	snapshotBodies [][]byte
+	// generatedBodies holds the raw bytes of every generated-fragment POST.
+	generatedBodies [][]byte
+	// logLines records the step/line pairs posted to /log.
+	logLines []string
+	// generatedStatus, when non-zero, is the status the fake returns for
+	// POST /api/v1/jobs/{id}/generated (default: 200 OK).
+	generatedStatus int
 }
 
 type recordedRequest struct {
@@ -49,12 +56,17 @@ func (f *fakeRunnerServer) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		var body []byte
-		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/snapshots") {
+		isSnapshot := r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/snapshots")
+		isGenerated := r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/generated")
+		if isSnapshot || isGenerated {
 			body, _ = io.ReadAll(r.Body)
 		}
 		f.mu.Lock()
-		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/snapshots") {
+		if isSnapshot {
 			f.snapshotBodies = append(f.snapshotBodies, body)
+		}
+		if isGenerated {
+			f.generatedBodies = append(f.generatedBodies, body)
 		}
 		f.requests = append(f.requests, recordedRequest{Method: r.Method, Path: r.URL.Path, Header: r.Header.Clone()})
 		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/complete") {
@@ -62,10 +74,17 @@ func (f *fakeRunnerServer) handler() http.Handler {
 			_ = json.NewDecoder(r.Body).Decode(&c)
 			f.complete = append(f.complete, c)
 		}
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/log") {
+			var l server.LogLine
+			_ = json.NewDecoder(r.Body).Decode(&l)
+			f.logLines = append(f.logLines, l.Step+": "+l.Line)
+		}
 		f.mu.Unlock()
 		switch {
 		case strings.HasPrefix(r.URL.Path, "/api/v1/jobs/") && strings.Contains(r.URL.Path, "/cache/") && r.Method == http.MethodGet:
 			http.NotFound(w, r)
+		case f.generatedStatus != 0 && isGenerated:
+			w.WriteHeader(f.generatedStatus)
 		default:
 			w.WriteHeader(http.StatusOK)
 		}

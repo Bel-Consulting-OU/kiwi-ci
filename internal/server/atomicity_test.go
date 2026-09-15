@@ -253,22 +253,40 @@ func TestCompleteRequiresDeclaredArtifacts(t *testing.T) {
 		t.Fatal(err)
 	}
 	runnerID, task := leaseArtifactJob(t, s, requiredArtifactPipeline)
-	// Success without the required artifact must become a failure.
-	if w := completeTask(t, s, task, runnerID, "success"); w.Code != http.StatusNoContent {
+	// Success without the required artifact fails closed BEFORE the job
+	// becomes terminal: the completion is refused (422) and the job stays
+	// running — not terminal — so the runner can upload the artifact and
+	// retry, mirroring the DB-mode semantics.
+	if w := completeTask(t, s, task, runnerID, "success"); w.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("complete = %d: %s", w.Code, w.Body.String())
 	}
 	s.mu.Lock()
 	j := s.jobs[task.Job.ID]
 	run := s.runs[j.RunID]
 	s.mu.Unlock()
-	if j.Status != model.StatusFailure {
-		t.Fatalf("job status = %s, want failure", j.Status)
+	if j.Status != model.StatusRunning {
+		t.Fatalf("job status = %s, want running (completion refused)", j.Status)
 	}
-	if j.Error != "required artifact bin missing" {
-		t.Fatalf("job error = %q", j.Error)
+	if run.Status == model.StatusSuccess || run.Status == model.StatusFailure {
+		t.Fatalf("run status = %s, want not terminal", run.Status)
 	}
-	if run.Status != model.StatusFailure {
-		t.Fatalf("run status = %s, want failure", run.Status)
+	// Upload the required artifact and retry: the completion succeeds.
+	hdrs := leaseHeaders(task, runnerID)
+	if w := doJSONHeaders(t, s, http.MethodPut, "/api/v1/jobs/"+task.Job.ID+"/artifacts/bin", "token", "payload", hdrs); w.Code != http.StatusCreated {
+		t.Fatalf("artifact upload = %d: %s", w.Code, w.Body.String())
+	}
+	if w := completeTask(t, s, task, runnerID, "success"); w.Code != http.StatusNoContent {
+		t.Fatalf("retried complete = %d: %s", w.Code, w.Body.String())
+	}
+	s.mu.Lock()
+	j = s.jobs[task.Job.ID]
+	run = s.runs[j.RunID]
+	s.mu.Unlock()
+	if j.Status != model.StatusSuccess {
+		t.Fatalf("job status after retry = %s, want success", j.Status)
+	}
+	if run.Status != model.StatusSuccess {
+		t.Fatalf("run status after retry = %s, want success", run.Status)
 	}
 }
 

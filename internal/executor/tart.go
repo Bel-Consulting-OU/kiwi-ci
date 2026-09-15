@@ -15,9 +15,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
 type TartBackend struct {
@@ -26,13 +29,17 @@ type TartBackend struct {
 	// RequireImmutableImages rejects VM references that are not pinned by an
 	// @sha256: digest. Set by the executor from Options for untrusted jobs.
 	RequireImmutableImages bool
-	tart                   string
-	ssh                    string
-	clone                  string
-	ip                     string
-	workspace              string
-	sshDir                 string
-	run                    *exec.Cmd
+	// Resources carries the job's resource requests. CPU/memory map onto
+	// the tart run flags the installed CLI supports; disk is advisory.
+	// PIDs requests never reach here (admission rejects them for tart).
+	Resources pipeline.Resources
+	tart      string
+	ssh       string
+	clone     string
+	ip        string
+	workspace string
+	sshDir    string
+	run       *exec.Cmd
 }
 
 func (*TartBackend) Name() string { return "tart" }
@@ -81,7 +88,18 @@ func (b *TartBackend) StartJob(ctx context.Context, workspace string, emit func(
 		_ = b.CloseJob()
 		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("tart clone: %v: %s", err, strings.TrimSpace(string(out)))}
 	}
-	b.run = exec.CommandContext(ctx, tart, "run", "--dir=workspace:"+abs, "--no-graphics", b.clone)
+	// Resource requests map onto the tart run flags the installed CLI
+	// actually supports; unsupported requests are reported as advisory
+	// lines (the requests themselves were already admission-checked).
+	runHelp, _ := exec.CommandContext(ctx, tart, "run", "--help").CombinedOutput()
+	flags, advisory := tartResourceFlags(b.Resources, string(runHelp))
+	for _, a := range advisory {
+		emit(a)
+	}
+	runArgs := []string{"run", "--no-graphics"}
+	runArgs = append(runArgs, flags...)
+	runArgs = append(runArgs, "--dir=workspace:"+abs, b.clone)
+	b.run = exec.CommandContext(ctx, tart, runArgs...)
 	if err := b.run.Start(); err != nil {
 		_ = exec.Command(tart, "delete", b.clone).Run()
 		_ = b.CloseJob()
@@ -242,6 +260,34 @@ func postAuthorizedKey(ctx context.Context, endpoint, pubKey string, client *htt
 		return fmt.Errorf("agent returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
 	return nil
+}
+
+// tartResourceFlags renders the tart run resource flags a job's requests map
+// onto, honoring what the installed tart CLI supports (runHelp is the
+// `tart run --help` output). Requests whose flags the CLI does not support
+// are returned as advisory lines instead of flags; the disk request has no
+// tart run equivalent and is always advisory.
+func tartResourceFlags(r pipeline.Resources, runHelp string) (flags, advisory []string) {
+	cpuOK := strings.Contains(runHelp, "--cpu")
+	memOK := strings.Contains(runHelp, "--memory")
+	if r.CPU > 0 {
+		if cpuOK {
+			flags = append(flags, "--cpu", strconv.FormatInt(int64(r.CPU), 10))
+		} else {
+			advisory = append(advisory, fmt.Sprintf("advisory: tart CLI does not support --cpu; cpu request %v ignored", r.CPU))
+		}
+	}
+	if r.Memory > 0 {
+		if memOK {
+			flags = append(flags, "--memory", strconv.FormatInt(int64(r.Memory)/(1<<20), 10))
+		} else {
+			advisory = append(advisory, fmt.Sprintf("advisory: tart CLI does not support --memory; memory request %d bytes ignored", int64(r.Memory)))
+		}
+	}
+	if r.Disk > 0 {
+		advisory = append(advisory, fmt.Sprintf("advisory: tart CLI does not support disk requests; disk request %d bytes ignored", int64(r.Disk)))
+	}
+	return flags, advisory
 }
 
 // setupSSHDir creates a per-job temp dir holding the job's known_hosts file

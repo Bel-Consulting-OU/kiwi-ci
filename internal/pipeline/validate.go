@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secrets"
 )
 
 const (
@@ -15,13 +17,17 @@ const (
 	maxMatrixCombos   = 512
 	maxStepsPerJob    = 512
 	maxServicesPerJob = 32
-	maxSecretsPerJob  = 128
-	maxEnvVarsPerJob  = 1024
-	maxCommandBytes   = 1 << 20 // 1 MiB
-	maxEnvValueBytes  = 64 << 10
-	maxArtifactDefs   = 128
-	maxOutputKeys     = 256
-	maxShardsPerJob   = 1024
+	// maxSecretsPerJob is the per-job declared-secret-name cap. It is the
+	// shared capacity agreement with the execution masker: a job that
+	// passes admission can never silently lose secrets to masking because
+	// the Masker holds exactly secrets.MaxSecretNames values.
+	maxSecretsPerJob = secrets.MaxSecretNames
+	maxEnvVarsPerJob = 1024
+	maxCommandBytes  = 1 << 20 // 1 MiB
+	maxEnvValueBytes = 64 << 10
+	maxArtifactDefs  = 128
+	maxOutputKeys    = 256
+	maxShardsPerJob  = 1024
 )
 
 var (
