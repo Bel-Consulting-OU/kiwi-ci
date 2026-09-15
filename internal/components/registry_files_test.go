@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
 const buildComponentYAML = `name: build
@@ -156,6 +158,31 @@ func TestRemoteRegistryStrictHTTPSAndNoRedirect(t *testing.T) {
 	reg.Client = c
 	if _, _, err := reg.Resolve(context.Background(), "build@sha256:"+strings.Repeat("ab", 32)); err == nil {
 		t.Fatal("redirecting registry resolved")
+	}
+}
+
+func TestRemoteRegistryOversizeResponseRejected(t *testing.T) {
+	// A spec response larger than the 1 MiB bound must fail the resolve
+	// instead of being decoded.
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/components/") {
+			http.NotFound(w, r)
+			return
+		}
+		big := Spec{Name: "big", Steps: make([]pipeline.Step, 20000)}
+		for i := range big.Steps {
+			big.Steps[i] = pipeline.Step{ID: "s" + strings.Repeat("x", 40), Run: "echo hi"}
+		}
+		_ = json.NewEncoder(w).Encode(big)
+	}))
+	defer ts.Close()
+	reg, err := NewRemoteRegistry(ts.URL, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg.Client = ts.Client()
+	if _, _, err := reg.Resolve(context.Background(), "build@sha256:"+strings.Repeat("ab", 32)); err == nil {
+		t.Fatal("oversize registry response must be rejected")
 	}
 }
 

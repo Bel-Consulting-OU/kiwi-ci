@@ -57,15 +57,91 @@ var (
 	ErrDuplicateEntry = errors.New("safefs: duplicate archive entry")
 	ErrLimits         = errors.New("safefs: archive exceeds configured limits")
 	ErrCompression    = errors.New("safefs: compression ratio exceeded")
+	ErrCapExceeded    = errors.New("safefs: output exceeds cap")
 )
 
-func Extract(r io.Reader, dest string, limits ExtractLimits) (*ExtractStats, error) {
-	limits = applyDefaults(limits)
-	root, err := openRoot(dest)
+// Root is an opened, canonicalized extraction root: a held directory handle
+// (opened with O_NOFOLLOW so a symlinked destination is rejected outright)
+// plus the directory's canonical path resolved once at open time.
+type Root struct {
+	F         *os.File
+	Canonical string
+}
+
+// Close releases the held directory handle.
+func (r *Root) Close() error {
+	if r == nil || r.F == nil {
+		return nil
+	}
+	return r.F.Close()
+}
+
+// OpenRootNoFollow opens an existing directory as an extraction root. The
+// directory must already exist and must not be a symlink; its canonical path
+// (all symlink components resolved) is recorded once. Every later operation
+// is anchored to the held handle, so renaming or replacing ancestors of the
+// destination path cannot redirect extraction.
+func OpenRootNoFollow(path string) (*Root, error) {
+	f, err := openRootHandle(path)
 	if err != nil {
 		return nil, err
 	}
-	defer root.Close()
+	canonical, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return &Root{F: f, Canonical: canonical}, nil
+}
+
+// CappedWriter limits the total number of bytes written to the underlying
+// writer. A limit <= 0 disables the cap. Once the budget is exhausted,
+// Write returns ErrCapExceeded.
+type CappedWriter struct {
+	w         io.Writer
+	limit     int64
+	remaining int64
+}
+
+// NewCappedWriter returns a CappedWriter that allows at most limit bytes to
+// reach w.
+func NewCappedWriter(w io.Writer, limit int64) *CappedWriter {
+	return &CappedWriter{w: w, limit: limit, remaining: limit}
+}
+
+func (c *CappedWriter) Write(p []byte) (int, error) {
+	if c.limit <= 0 {
+		return c.w.Write(p)
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if c.remaining <= 0 {
+		return 0, fmt.Errorf("%w: limit %d bytes", ErrCapExceeded, c.limit)
+	}
+	if int64(len(p)) > c.remaining {
+		n, _ := c.w.Write(p[:c.remaining])
+		c.remaining -= int64(n)
+		return n, fmt.Errorf("%w: limit %d bytes", ErrCapExceeded, c.limit)
+	}
+	n, err := c.w.Write(p)
+	c.remaining -= int64(n)
+	return n, err
+}
+
+// Extract extracts a gzip-compressed tar stream beneath the held extraction
+// root. All component traversal and creation happens relative to the root
+// handle with a no-follow component discipline: every component is opened
+// with O_NOFOLLOW|O_DIRECTORY, missing directories are created one component
+// at a time (never MkdirAll) and immediately re-opened with O_NOFOLLOW, and
+// final files are opened O_CREAT|O_EXCL|O_NOFOLLOW. Every component is thus
+// re-verified at open time, and the root itself was opened no-follow and
+// canonicalized once.
+func Extract(root *Root, r io.Reader, limits ExtractLimits) (*ExtractStats, error) {
+	if root == nil || root.F == nil {
+		return nil, fmt.Errorf("safefs: nil extraction root")
+	}
+	limits = applyDefaults(limits)
 	compressed := &countReader{r: r}
 	gz, err := gzip.NewReader(compressed)
 	if err != nil {
@@ -150,6 +226,22 @@ func Extract(r io.Reader, dest string, limits ExtractLimits) (*ExtractStats, err
 			stats.Bytes += h.Size
 		}
 	}
+}
+
+// ExtractPath is the deprecated path-based entry point: it opens the
+// destination directory itself and extracts beneath it. The destination must
+// already exist. New callers should hold the directory handle explicitly via
+// OpenRootNoFollow and call Extract so extraction stays anchored to the
+// opened directory even if the path's ancestors change underneath it.
+//
+// Deprecated: use OpenRootNoFollow plus Extract.
+func ExtractPath(path string, r io.Reader, limits ExtractLimits) (*ExtractStats, error) {
+	root, err := OpenRootNoFollow(path)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	return Extract(root, r, limits)
 }
 
 func applyDefaults(l ExtractLimits) ExtractLimits {

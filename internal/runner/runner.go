@@ -27,6 +27,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runnerpki"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secretbroker"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secrets"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/testintel"
@@ -72,7 +73,17 @@ type Config struct {
 	ServerName string
 	// EnrollToken bootstraps the mTLS identity: with a CA configured but no
 	// client certificate, the runner enrolls a fresh key with this token.
+	// The enrolled identity is persisted under IdentityDir and reused while
+	// its certificate stays valid; an expired or revoked certificate is
+	// re-enrolled once under the same runner ID.
 	EnrollToken string
+	// IdentityDir is the directory for the persisted enrollment identity
+	// (default: ~/.kiwi/runner).
+	IdentityDir string
+	// EnrollLabels are the labels sent with the enrollment request. A
+	// label-bound enrollment grant requires every bound label to be
+	// reproduced here.
+	EnrollLabels []string
 	// Drain makes the runner register as draining: it takes no new jobs,
 	// finishes its active work, and exits once its slots are free.
 	Drain bool
@@ -112,6 +123,10 @@ type Runner struct {
 	ID      string
 	Client  *http.Client
 	Metrics *Metrics
+	// store is the identity store used when enrollment persistence is
+	// active (IdentityDir configured); it clears the persisted certificate
+	// when the control plane disables or revokes this runner.
+	store IdentityStore
 }
 
 func (r *Runner) Run(ctx context.Context) error {
@@ -153,6 +168,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 		r.ID = id
 	}
+	r.resolveIdentityDir()
 	if err := r.prepareClient(ctx); err != nil {
 		return err
 	}
@@ -275,11 +291,13 @@ func (r *Runner) register(ctx context.Context) error {
 	}
 	var out model.Runner
 	if err := r.post(ctx, "/api/v1/runners/register", in, &out); err != nil {
-		if isHTTPStatus(err, http.StatusForbidden) {
-			// 403 on registration means the runner was disabled or its
-			// certificate serial was revoked: re-registering cannot clear
-			// either and must not be retried.
-			return fmt.Errorf("%w (server: %v)", ErrRunnerDisabledOrRevoked, err)
+		if isHTTPStatus(err, http.StatusForbidden) || isHTTPStatus(err, http.StatusUnauthorized) {
+			// 401/403 on registration means the runner was disabled or
+			// its certificate serial was revoked: re-registering cannot
+			// clear either and must not be retried. The persisted
+			// certificate is cleared (the ID is kept) so the next start
+			// re-enrolls under the same identity.
+			return r.onDisabled(fmt.Errorf("%w (server: %v)", ErrRunnerDisabledOrRevoked, err))
 		}
 		return err
 	}
@@ -305,14 +323,14 @@ func (r *Runner) next(ctx context.Context) (*server.Task, bool, error) {
 	}
 	defer resp.Body.Close()
 	if resp.Header.Get("X-Kiwi-Disabled") == "true" {
-		return nil, false, ErrRunnerDisabledOrRevoked
+		return nil, false, r.onDisabled(ErrRunnerDisabledOrRevoked)
 	}
 	if resp.StatusCode == http.StatusNoContent {
 		return nil, resp.Header.Get("X-Kiwi-Draining") == "true", nil
 	}
-	if resp.StatusCode == http.StatusForbidden {
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
 		b, _ := io.ReadAll(resp.Body)
-		return nil, false, fmt.Errorf("%w (server: %s: %s)", ErrRunnerDisabledOrRevoked, resp.Status, strings.TrimSpace(string(b)))
+		return nil, false, r.onDisabled(fmt.Errorf("%w (server: %s: %s)", ErrRunnerDisabledOrRevoked, resp.Status, strings.TrimSpace(string(b))))
 	}
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
@@ -323,6 +341,21 @@ func (r *Runner) next(ctx context.Context) (*server.Task, bool, error) {
 		return nil, false, err
 	}
 	return &t, false, nil
+}
+
+// onDisabled handles the terminal disabled/revoked signal from the control
+// plane: the persisted certificate is cleared (the runner ID and key are
+// kept so a later re-enrollment continues the same identity), a re-enroll
+// hint is logged, and the sentinel error is returned so Run exits nonzero
+// without re-registering or re-enrolling in a loop.
+func (r *Runner) onDisabled(err error) error {
+	if r.store.Dir != "" {
+		if rmErr := r.store.ClearCert(); rmErr != nil {
+			fmt.Fprintf(os.Stderr, "kiwi runner %s: clear persisted certificate: %v\n", r.ID, rmErr)
+		}
+	}
+	fmt.Fprintf(os.Stderr, "kiwi runner %s: runner disabled or certificate revoked; re-enroll required\n", r.ID)
+	return err
 }
 
 func (r *Runner) execute(parent context.Context, t server.Task) {
@@ -395,6 +428,16 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		// record, so the job-level network field is authoritative.
 		cj.Job.Network = t.Job.Network
 	}
+	// Copy the effective policy's sandbox requirements onto the compiled
+	// job before execution: the executor derives daemon-level promises
+	// (rootless, read-only rootfs) from cj.Job.Sandbox alone, and the
+	// verified payload is the only authoritative policy record.
+	effSandbox, serr := payloadSandboxRequirements(t.Job.CompiledJobPayload)
+	if serr != nil {
+		r.complete(parent, t, model.StatusFailure, fmt.Errorf("compiled payload sandbox requirements: %w", serr), nil)
+		return
+	}
+	applyEffectiveSandbox(&cj, effSandbox)
 	if err := checkShardAssignment(cj); err != nil {
 		r.complete(parent, t, model.StatusFailure, err, nil)
 		return
@@ -417,7 +460,22 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		fmt.Printf("[%s/%s] %s\n", job, step, msg)
 		_ = r.post(parent, "/api/v1/jobs/"+t.Job.ID+"/log", server.LogLine{RunnerID: r.ID, LeaseToken: t.LeaseToken, LeaseGeneration: t.LeaseGeneration, JobKey: job, Step: step, Line: msg}, nil)
 	})
-	provider := secrets.Chain{secrets.EnvProvider{Prefix: "KIWI_SECRET_"}, secrets.MacKeychainProvider{Service: "kiwi-ci"}}
+	// Distributed runs resolve secrets exclusively through the control
+	// plane's lease-bound delivery endpoint. Host env/Keychain providers
+	// are local-CLI-only (app.RunLocal keeps that chain); the runner never
+	// falls back to them, so a job without a lease gets no secrets at all.
+	var provider secrets.Provider
+	if t.LeaseToken != "" {
+		provider = &secretbroker.RemoteProvider{
+			Server:          r.Cfg.Server,
+			Token:           r.Cfg.Token,
+			JobID:           t.Job.ID,
+			LeaseToken:      t.LeaseToken,
+			LeaseGeneration: t.LeaseGeneration,
+			RunnerID:        r.ID,
+			Client:          r.Client,
+		}
+	}
 	cacheStore := r.newJobCache(t, r.Metrics)
 	artifactStore := artifact.Default()
 	if r.Cfg.CacheRoot != "" {
@@ -428,7 +486,9 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	}
 	// Distributed runs always start from the clean env (InheritEnv is left
 	// false and no PassEnv allowlist is set); untrusted jobs additionally
-	// require image references pinned by digest.
+	// require image references pinned by digest. The untrusted floor is
+	// unconditional here: nothing may override RequireImmutableImages for
+	// an untrusted job.
 	opts := executor.Options{Workspace: tmp, RunID: t.Job.RunID, Event: t.Job.Event, Branch: branchFromRef(t.Job.Ref), ChangedFiles: effectiveChangedFiles(t.Job.ChangedFiles, tmp), SecretProvider: provider, Logs: logging.Func(func(job, step, line string) { sink.WriteLine(job, step, line) }), Cache: cacheStore, Artifacts: artifactStore, ArtifactReporter: reporter, DependencyStatus: t.Job.DependencyStatus, NeedsOutputs: t.Job.NeedsOutputs, CacheNamespace: cacheNamespace(t.Job), RequireImmutableImages: !t.Job.Trusted}
 	// Step durations come from the executor's wall-clock step measurements
 	// (StepReporter), never from sink-derived log timing.
@@ -762,103 +822,88 @@ func splitCSV(s string) []string {
 	}
 	return strings.Split(s, ",")
 }
+
+// restoreDownloads fetches the job's declared dependency artifacts through
+// the lease-bound dependency endpoint (GET /api/v1/jobs/{id}/dependencies/
+// {producer}/{artifact}) — never through the run-level artifact list API.
+// Only declared (producer, artifact) pairs are fetched: the server rejects
+// undeclared downloads, and the runner never enumerates run artifacts to
+// pick by name. Matrix producers follow the compiled Downloads semantics:
+// From may name a BaseKey or a compiled Key and is passed through verbatim.
 func (r *Runner) restoreDownloads(ctx context.Context, t server.Task, inputs []pipeline.ArtifactInput, workspace string) error {
-	if len(inputs) == 0 {
-		return nil
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.Cfg.Server+"/api/v1/runs/"+t.Job.RunID+"/artifacts", nil)
-	if err != nil {
-		return err
-	}
-	r.auth(req)
-	resp, err := r.Client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("list artifacts %s: %s", resp.Status, strings.TrimSpace(string(b)))
-	}
-	var records []model.ArtifactRecord
-	if err := json.NewDecoder(resp.Body).Decode(&records); err != nil {
-		return err
-	}
 	for _, in := range inputs {
-		dest := workspace
-		if in.Path != "" {
-			clean := filepath.Clean(in.Path)
-			if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-				return fmt.Errorf("unsafe download path %q", in.Path)
-			}
-			dest = filepath.Join(workspace, clean)
+		dest, err := safeDownloadDest(workspace, in.Path)
+		if err != nil {
+			return err
 		}
-		matches := 0
-		for _, a := range records {
-			base := a.JobKey
-			if i := strings.IndexByte(base, '['); i >= 0 {
-				base = base[:i]
-			}
-			if a.Name != in.Name || (a.JobKey != in.From && base != in.From) {
-				continue
-			}
-			matches++
-			tmp, err := os.CreateTemp("", "kiwi-artifact-*.tar.gz")
-			if err != nil {
-				return err
-			}
-			tmpPath := tmp.Name()
-			h := sha256.New()
-			url := r.Cfg.Server + "/api/v1/artifacts/" + a.ID
-			dreq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-			if err == nil {
-				r.auth(dreq)
-			}
-			if err != nil {
-				tmp.Close()
-				os.Remove(tmpPath)
-				return err
-			}
-			dresp, err := r.Client.Do(dreq)
-			if err != nil {
-				tmp.Close()
-				os.Remove(tmpPath)
-				return err
-			}
-			if dresp.StatusCode != 200 {
-				b, _ := io.ReadAll(io.LimitReader(dresp.Body, 4096))
-				dresp.Body.Close()
-				tmp.Close()
-				os.Remove(tmpPath)
-				return fmt.Errorf("download artifact %s: %s: %s", a.Name, dresp.Status, strings.TrimSpace(string(b)))
-			}
-			_, cp := io.Copy(io.MultiWriter(tmp, h), dresp.Body)
-			dresp.Body.Close()
-			cl := tmp.Close()
-			if cp != nil {
-				os.Remove(tmpPath)
-				return cp
-			}
-			if cl != nil {
-				os.Remove(tmpPath)
-				return cl
-			}
-			got := hex.EncodeToString(h.Sum(nil))
-			if a.SHA256 != "" && got != a.SHA256 {
-				os.Remove(tmpPath)
-				return fmt.Errorf("artifact %s integrity mismatch", a.Name)
-			}
-			if err := artifact.Extract(tmpPath, dest); err != nil {
-				os.Remove(tmpPath)
-				return err
-			}
+		producer := strings.TrimSpace(in.From)
+		name := strings.TrimSpace(in.Name)
+		if producer == "" || name == "" {
+			return fmt.Errorf("invalid download declaration (from=%q name=%q)", in.From, in.Name)
+		}
+		url := r.Cfg.Server + "/api/v1/jobs/" + t.Job.ID + "/dependencies/" + url.PathEscape(producer) + "/" + url.PathEscape(name)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return err
+		}
+		r.auth(req)
+		req.Header.Set("X-Kiwi-Runner-ID", r.ID)
+		req.Header.Set("X-Kiwi-Lease-Token", t.LeaseToken)
+		req.Header.Set("X-Kiwi-Lease-Generation", fmt.Sprint(t.LeaseGeneration))
+		resp, err := r.Client.Do(req)
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode != 200 {
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			return fmt.Errorf("download dependency %s from %s: %s: %s", name, producer, resp.Status, strings.TrimSpace(string(b)))
+		}
+		tmp, err := os.CreateTemp("", "kiwi-artifact-*.tar.gz")
+		if err != nil {
+			resp.Body.Close()
+			return err
+		}
+		tmpPath := tmp.Name()
+		h := sha256.New()
+		_, cp := io.Copy(io.MultiWriter(tmp, h), resp.Body)
+		resp.Body.Close()
+		cl := tmp.Close()
+		if cp != nil {
 			os.Remove(tmpPath)
+			return cp
 		}
-		if matches == 0 {
-			return fmt.Errorf("required artifact %s from %s not found", in.Name, in.From)
+		if cl != nil {
+			os.Remove(tmpPath)
+			return cl
 		}
+		if want := resp.Header.Get("X-Kiwi-Content-SHA256"); want != "" {
+			if got := hex.EncodeToString(h.Sum(nil)); got != want {
+				os.Remove(tmpPath)
+				return fmt.Errorf("artifact %s from %s integrity mismatch", name, producer)
+			}
+		}
+		if err := artifact.Extract(tmpPath, dest); err != nil {
+			os.Remove(tmpPath)
+			return err
+		}
+		os.Remove(tmpPath)
 	}
 	return nil
+}
+
+// safeDownloadDest resolves a declared download path against the workspace
+// and rejects anything that escapes it.
+func safeDownloadDest(workspace, inPath string) (string, error) {
+	dest := workspace
+	if inPath != "" {
+		clean := filepath.Clean(inPath)
+		if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+			return "", fmt.Errorf("unsafe download path %q", inPath)
+		}
+		dest = filepath.Join(workspace, clean)
+	}
+	return dest, nil
 }
 
 func (r *Runner) uploadArtifact(ctx context.Context, t server.Task, name, path string) error {
@@ -945,11 +990,26 @@ func (r *Runner) auth(req *http.Request) {
 	}
 }
 
+// resolveIdentityDir defaults the identity directory to ~/.kiwi/runner
+// when enrollment is active and installs the identity store on the runner.
+// Without enrollment (or an explicit IdentityDir) the store stays empty and
+// the disabled/revoked path leaves the filesystem alone.
+func (r *Runner) resolveIdentityDir() {
+	if r.Cfg.IdentityDir == "" && r.Cfg.EnrollToken != "" {
+		home, _ := os.UserHomeDir()
+		r.Cfg.IdentityDir = filepath.Join(home, ".kiwi", "runner")
+	}
+	if r.Cfg.IdentityDir != "" {
+		r.store = IdentityStore{Dir: r.Cfg.IdentityDir}
+	}
+}
+
 // prepareClient builds the mTLS HTTP client when certificate material or an
 // enrollment token is configured. Without any of them the client stays nil
 // (plain HTTP dev mode). Certificate-bearing configurations require an https
 // server URL.
 func (r *Runner) prepareClient(ctx context.Context) error {
+	r.resolveIdentityDir()
 	if r.Cfg.CACert == "" && r.Cfg.Cert == "" && r.Cfg.Key == "" && r.Cfg.EnrollToken == "" {
 		return nil
 	}
@@ -976,21 +1036,50 @@ func (r *Runner) prepareClient(ctx context.Context) error {
 		return fmt.Errorf("runner certificate and key must be provided together")
 	}
 	if len(certPEM) == 0 && r.Cfg.EnrollToken != "" {
-		// Ephemeral bootstrap: mint a fresh key, enroll it with the
-		// enrollment token, and use the returned certificate for all
-		// subsequent requests. The identity is per-process and stateless.
-		newKey, csrPEM, err := runnerpki.GenerateKeyAndCSR(r.ID)
-		if err != nil {
-			return fmt.Errorf("generate enrollment key: %w", err)
-		}
-		keyPEM = newKey
-		enc, err := r.enroll(ctx, caPEM, csrPEM)
-		if err != nil {
-			return err
-		}
-		certPEM = []byte(enc.Certificate)
-		if len(caPEM) == 0 {
-			caPEM = []byte(enc.CACertificate)
+		// Persistent bootstrap: a persisted identity whose certificate
+		// still has enough remaining validity is reused verbatim (no
+		// enrollment, no new key). Otherwise the runner enrolls once under
+		// a stable ID: the persisted runner-id is reused when present so
+		// revocation/drain/audit history stays continuous, and only a
+		// brand-new runner has no ID to reuse. The authoritative runner_id
+		// from the enroll response is what gets persisted.
+		id, complete := r.store.Load()
+		if complete && id.CertUsable() {
+			r.ID = id.ID
+			certPEM, keyPEM = id.CertPEM, id.KeyPEM
+			if len(caPEM) == 0 {
+				caPEM = id.CACertPEM
+			}
+		} else {
+			if id.ID != "" {
+				r.ID = id.ID
+			}
+			if r.ID == "" {
+				fresh, err := newRunnerID()
+				if err != nil {
+					return err
+				}
+				r.ID = fresh
+			}
+			newKey, csrPEM, err := runnerpki.GenerateKeyAndCSR(r.ID)
+			if err != nil {
+				return fmt.Errorf("generate enrollment key: %w", err)
+			}
+			enc, err := r.enroll(ctx, caPEM, csrPEM)
+			if err != nil {
+				return err
+			}
+			keyPEM = newKey
+			certPEM = []byte(enc.Certificate)
+			if len(caPEM) == 0 {
+				caPEM = []byte(enc.CACertificate)
+			}
+			if authoritative := strings.TrimSpace(enc.RunnerID); authoritative != "" {
+				r.ID = authoritative
+			}
+			if err := r.store.Save(Identity{ID: r.ID, KeyPEM: keyPEM, CertPEM: certPEM, CACertPEM: caPEM}); err != nil {
+				return fmt.Errorf("persist runner identity: %w", err)
+			}
 		}
 	}
 	tlsConf, err := runnerpki.TLSClientConfig(certPEM, keyPEM, caPEM, r.serverName())
@@ -1012,7 +1101,7 @@ func (r *Runner) enroll(ctx context.Context, caPEM, csrPEM []byte) (*server.Enro
 		return nil, err
 	}
 	client := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{TLSClientConfig: tlsConf}}
-	b, _ := json.Marshal(server.EnrollRequest{RunnerID: r.ID, CSR: base64.StdEncoding.EncodeToString(csrPEM)})
+	b, _ := json.Marshal(server.EnrollRequest{RunnerID: r.ID, CSR: base64.StdEncoding.EncodeToString(csrPEM), Labels: r.Cfg.EnrollLabels})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.Cfg.Server+"/api/v1/runners/enroll", bytes.NewReader(b))
 	if err != nil {
 		return nil, err

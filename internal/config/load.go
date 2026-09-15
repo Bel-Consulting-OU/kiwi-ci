@@ -102,10 +102,21 @@ func fieldByTag(v reflect.Value, name string) reflect.Value {
 	return reflect.Value{}
 }
 
-// stripComment removes a # comment outside of quoted strings.
+// stripComment removes a # comment outside of quoted strings. It is
+// escape-aware: inside a basic ("...") string a backslash escapes the next
+// character, so \" does not toggle the in-string state (and \\ before "
+// keeps the quote opening the string), while '#' stays a literal inside
+// any quoted string.
 func stripComment(s string) string {
 	var quote byte
 	for i := 0; i < len(s); i++ {
+		if quote == '"' && s[i] == '\\' && i+1 < len(s) {
+			// Inside a basic string, a backslash escapes the next
+			// character: an escaped quote must not toggle the string
+			// state.
+			i++
+			continue
+		}
 		switch s[i] {
 		case '"', '\'':
 			if quote == 0 {

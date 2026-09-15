@@ -59,13 +59,24 @@ func fuzzTarGz(t *testing.T, entries map[string]string) []byte {
 	return buf.Bytes()
 }
 
+// extractTo runs the hardened extractor beneath a held destination handle.
+func extractTo(t *testing.T, data []byte, dest string, limits ExtractLimits) (*ExtractStats, error) {
+	t.Helper()
+	root, err := OpenRootNoFollow(dest)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	return Extract(root, bytes.NewReader(data), limits)
+}
+
 // TestFuzzTarGzRoundTrip drives the deterministic archive builder through
 // the hardened extractor: every regular entry is materialized under the
 // destination with its content intact.
 func TestFuzzTarGzRoundTrip(t *testing.T) {
 	data := fuzzTarGz(t, map[string]string{"a.txt": "hi\n", "dir/b.txt": "ok\n"})
 	dest := t.TempDir()
-	stats, err := Extract(bytes.NewReader(data), dest, fuzzExtractLimits())
+	stats, err := extractTo(t, data, dest, fuzzExtractLimits())
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
@@ -86,7 +97,7 @@ func TestFuzzTarGzRoundTrip(t *testing.T) {
 func TestFuzzTarGzTraversalRejected(t *testing.T) {
 	data := fuzzTarGz(t, map[string]string{"../evil.txt": "x"})
 	dest := t.TempDir()
-	if _, err := Extract(bytes.NewReader(data), dest, fuzzExtractLimits()); err == nil {
+	if _, err := extractTo(t, data, dest, fuzzExtractLimits()); err == nil {
 		t.Fatal("expected parent-traversal entry to be rejected")
 	}
 }
@@ -101,7 +112,12 @@ func FuzzArtifactExtract(f *testing.F) {
 	f.Add([]byte{})
 	f.Fuzz(func(t *testing.T, data []byte) {
 		dest := t.TempDir()
-		_, _ = Extract(bytes.NewReader(data), dest, fuzzExtractLimits())
+		root, err := OpenRootNoFollow(dest)
+		if err != nil {
+			return
+		}
+		defer root.Close()
+		_, _ = Extract(root, bytes.NewReader(data), fuzzExtractLimits())
 	})
 }
 
@@ -113,7 +129,12 @@ func FuzzCacheExtract(f *testing.F) {
 	f.Add([]byte("garbage-garbage-garbage"))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		dest := t.TempDir()
-		_, _ = Extract(bytes.NewReader(data), dest, fuzzExtractLimits())
+		root, err := OpenRootNoFollow(dest)
+		if err != nil {
+			return
+		}
+		defer root.Close()
+		_, _ = Extract(root, bytes.NewReader(data), fuzzExtractLimits())
 	})
 }
 

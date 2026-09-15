@@ -81,9 +81,17 @@ func (s *Store) restoreLocal(key, workspace string, paths []string) (bool, error
 		return false, err
 	}
 	defer f.Close()
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		return false, fmt.Errorf("cache restore: %w", err)
+	}
+	root, err := safefs.OpenRootNoFollow(workspace)
+	if err != nil {
+		return false, fmt.Errorf("cache restore: %w", err)
+	}
+	defer root.Close()
 	limits := safefs.DefaultLimits()
 	limits.Allowed = cleanRoots(paths)
-	if _, err := safefs.Extract(f, workspace, limits); err != nil {
+	if _, err := safefs.Extract(root, f, limits); err != nil {
 		return false, fmt.Errorf("cache restore: %w", err)
 	}
 	return true, nil
@@ -101,7 +109,11 @@ func (s *Store) Save(key, workspace string, paths []string) error {
 	if err != nil {
 		return err
 	}
-	if err := safefs.WriteTarGz(f, workspace, paths, false); err != nil {
+	var w io.Writer = f
+	if s.MaxCacheBytes > 0 {
+		w = safefs.NewCappedWriter(f, s.MaxCacheBytes)
+	}
+	if err := safefs.WriteTarGz(w, workspace, paths, false); err != nil {
 		f.Close()
 		_ = os.Remove(tmp)
 		return err

@@ -7,9 +7,11 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -54,8 +56,8 @@ func (b *TartBackend) StartJob(ctx context.Context, workspace string, emit func(
 	default:
 		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("tart runtime does not support network mode %q; refusing to run job", b.Network)}
 	}
-	if b.RequireImmutableImages && !strings.Contains(b.VM, "@sha256:") {
-		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("tart VM %q is not pinned by an @sha256: digest (require_immutable_images)", b.VM)}
+	if b.RequireImmutableImages && !digestPinned(b.VM) {
+		return unpinnedImageError("tart VM", b.VM)
 	}
 	tart, err := exec.LookPath("tart")
 	if err != nil {
@@ -102,7 +104,143 @@ func (b *TartBackend) StartJob(ctx context.Context, workspace string, emit func(
 		_ = b.CloseJob()
 		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("tart VM did not obtain an IP")}
 	}
+	// Kiwi ssh bootstrap contract: before the first SSH attempt the image
+	// must declare the bootstrap capability and accept the runner-injected
+	// ephemeral authorized key. There is no insecure fallback: an image
+	// that cannot authenticate the injected key fails the job.
+	if err := b.verifyBootstrapContract(ctx, tart); err != nil {
+		_ = b.CloseJob()
+		return err
+	}
+	if err := b.injectBootstrapKey(ctx); err != nil {
+		_ = b.CloseJob()
+		return err
+	}
 	emit("Tart VM ready " + b.clone)
+	return nil
+}
+
+// tartBootstrapLabel is the capability label a Tart image must carry to
+// declare the kiwi ssh bootstrap contract: the guest installs the
+// runner-injected authorized key for the ssh user ("admin") before the
+// first ssh attempt. Images without the label are refused.
+const tartBootstrapLabel = "kiwi.ssh.bootstrap"
+
+// tartAgentPort is the TCP port the guest's kiwi-agent listens on for key
+// injection over the tart NAT; tartAgentKeyPath is the injection route.
+const (
+	tartAgentPort    = 4545
+	tartAgentKeyPath = "/kiwi/v1/bootstrap/authorized-key"
+)
+
+// tartGetArgs builds the `tart get --format json <vm>` invocation used to
+// query an image's labels. Pure helper so the invocation shape is testable.
+func tartGetArgs(vm string) []string {
+	return []string{"get", "--format", "json", vm}
+}
+
+// tartGetOutput is the minimal JSON shape `tart get --format json` emits:
+// the VM name and its label map.
+type tartGetOutput struct {
+	Name   string            `json:"name"`
+	Labels map[string]string `json:"labels"`
+}
+
+// parseTartGetJSON decodes `tart get --format json` output.
+func parseTartGetJSON(b []byte) (tartGetOutput, error) {
+	var out tartGetOutput
+	if err := json.Unmarshal(b, &out); err != nil {
+		return out, fmt.Errorf("parse tart get output: %w", err)
+	}
+	return out, nil
+}
+
+// bootstrapContractDeclared reports whether the image labels declare the
+// kiwi ssh bootstrap contract. The label value is informational: "true",
+// "1", "yes", "enabled", or an empty value all declare it; a missing label
+// or any other value does not.
+func bootstrapContractDeclared(labels map[string]string) bool {
+	v, ok := labels[tartBootstrapLabel]
+	if !ok {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "", "true", "1", "yes", "enabled":
+		return true
+	default:
+		return false
+	}
+}
+
+// tartBootstrapConfigError is the configuration failure for an image that
+// does not declare the bootstrap contract. ErrorConfig is deliberately not
+// retried: re-running against the same image cannot succeed.
+func tartBootstrapConfigError() error {
+	return &RunError{Kind: ErrorConfig, Err: fmt.Errorf("image does not declare the kiwi ssh bootstrap contract; pin an image that installs the runner-injected authorized key (tart label %s)", tartBootstrapLabel)}
+}
+
+// verifyBootstrapContract queries the cloned VM's labels and refuses the
+// job when the bootstrap contract is not declared.
+func (b *TartBackend) verifyBootstrapContract(ctx context.Context, tart string) error {
+	out, err := exec.CommandContext(ctx, tart, tartGetArgs(b.clone)...).Output()
+	if err != nil {
+		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("tart get %s: %v: %s", b.clone, err, strings.TrimSpace(string(out)))}
+	}
+	meta, perr := parseTartGetJSON(out)
+	if perr != nil {
+		return &RunError{Kind: ErrorInfra, Err: perr}
+	}
+	if !bootstrapContractDeclared(meta.Labels) {
+		return tartBootstrapConfigError()
+	}
+	return nil
+}
+
+// injectBootstrapKey pushes the ephemeral public key to the guest's
+// kiwi-agent over the tart NAT. If the agent is unreachable the job fails:
+// the contract requires the image to accept the injected key, and there is
+// no fallback credential.
+func (b *TartBackend) injectBootstrapKey(ctx context.Context) error {
+	pub, err := os.ReadFile(b.keyFile() + ".pub")
+	if err != nil {
+		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("read ephemeral public key: %w", err)}
+	}
+	endpoint := fmt.Sprintf("http://%s:%d%s", b.ip, tartAgentPort, tartAgentKeyPath)
+	if err := postAuthorizedKey(ctx, endpoint, string(pub), tartBootstrapHTTPClient()); err != nil {
+		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("kiwi-agent key injection failed (image must support the kiwi ssh bootstrap contract): %w", err)}
+	}
+	return nil
+}
+
+// tartBootstrapHTTPClient is the bounded, redirect-refusing client used for
+// the kiwi-agent bootstrap call.
+func tartBootstrapHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+// postAuthorizedKey POSTs one OpenSSH authorized-keys line to the guest's
+// kiwi-agent endpoint. The response is bounded and non-2xx responses fail
+// the injection. Free function so the wire call is testable.
+func postAuthorizedKey(ctx context.Context, endpoint, pubKey string, client *http.Client) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(pubKey))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "text/plain")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("agent returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
 	return nil
 }
 

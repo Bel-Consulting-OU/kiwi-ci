@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -420,5 +421,194 @@ func TestOIDCLegacyKeyMigration(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, oidcKeyRingFile)); err != nil {
 		t.Fatalf("ring file not created on legacy migration: %v", err)
+	}
+}
+
+// seedDBOIDCJob installs a trusted running job into the DB-fake store ONLY:
+// if issuance read the in-memory maps it would 404, proving the DB-mode
+// accessors are used.
+func seedDBOIDCJob(t *testing.T, f *dbFakeStore, s *Server, leaseToken string) (runID, jobID string) {
+	t.Helper()
+	runID, jobID = "run-oidc", "job-oidc"
+	exp := time.Now().Add(time.Minute)
+	f.mu.Lock()
+	f.runs[runID] = model.Run{ID: runID, RepoFullName: "kiwi/repo", Ref: "main", SHA: "abc123", Event: "push", Status: model.StatusRunning}
+	f.jobs[jobID] = model.Job{ID: jobID, RunID: runID, Key: "build", Status: model.StatusRunning, Trusted: true, OIDCAllowed: true, LeaseExpiresAt: &exp, LeaseTokenHash: hashLeaseToken(s.leaseKey, leaseToken), LeaseRunnerID: "runner-1"}
+	f.mu.Unlock()
+	return runID, jobID
+}
+
+// TestOIDCIssuanceDBModeReadsStore proves DB-mode issuance authorizes the
+// lease and builds the claims from the SQL store, not the in-memory maps.
+func TestOIDCIssuanceDBModeReadsStore(t *testing.T) {
+	f := newDBFakeStore()
+	s := New("secret")
+	if err := s.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	s.ExternalURL = "https://ci.example.com"
+	_, jobID := seedDBOIDCJob(t, f, s, "lease1")
+
+	tok := issueOIDCToken(t, s, jobID, "lease1", "https://aud.example.com")
+	jwt := parseTestJWT(t, tok)
+	s.mu.Lock()
+	signer := s.oidc
+	s.mu.Unlock()
+	if jwt.headerKID != signer.KID {
+		t.Fatalf("token kid %q != active kid %q", jwt.headerKID, signer.KID)
+	}
+	// The claims carry the store's run coordinates.
+	parts := strings.Split(tok, ".")
+	cb, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(cb, &claims); err != nil {
+		t.Fatal(err)
+	}
+	if claims["repository"] != "kiwi/repo" || claims["job_id"] != "job-oidc" {
+		t.Fatalf("claims not derived from the store: %v", claims)
+	}
+	// A job that exists only in the memory maps must not authorize.
+	ghostExp := time.Now().Add(time.Minute)
+	s.mu.Lock()
+	s.jobs["job-ghost"] = model.Job{ID: "job-ghost", RunID: "run-oidc", Key: "ghost", Status: model.StatusRunning, Trusted: true, OIDCAllowed: true, LeaseExpiresAt: &ghostExp, LeaseTokenHash: hashLeaseToken(s.leaseKey, "lease1"), LeaseRunnerID: "runner-1"}
+	s.mu.Unlock()
+	c := newTestClient(t, s.Handler(), "lease1")
+	w := c.do(http.MethodPost, "/api/v1/jobs/job-ghost/oidc", map[string]any{"audience": "a"}, nil)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("memory-only job issuance = %d, want 404 (store is the source of truth)", w.Code)
+	}
+}
+
+// TestOIDCIssuanceFailsClosedOnAuditFailure proves an audit persistence
+// failure fails the issuance (500) instead of log-and-continue.
+func TestOIDCIssuanceFailsClosedOnAuditFailure(t *testing.T) {
+	f := newDBFakeStore()
+	s := New("secret")
+	if err := s.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	s.ExternalURL = "https://ci.example.com"
+	_, jobID := seedDBOIDCJob(t, f, s, "lease1")
+	f.mu.Lock()
+	f.auditErr = fmt.Errorf("audit: injected failure")
+	f.mu.Unlock()
+	c := newTestClient(t, s.Handler(), "lease1")
+	w := c.do(http.MethodPost, "/api/v1/jobs/"+jobID+"/oidc", map[string]any{"audience": "https://aud.example.com"}, nil)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("issuance with audit failure = %d, want 500: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), `"value"`) {
+		t.Fatalf("token returned despite audit failure: %s", w.Body.String())
+	}
+}
+
+// failingWriteClusterStore wraps the static store and injects write
+// failures for rotation-coordination tests.
+type failingWriteClusterStore struct {
+	*StaticClusterKeyStore
+	FailStore bool
+}
+
+func (f *failingWriteClusterStore) Store(kind string, data []byte) error {
+	if f.FailStore {
+		return fmt.Errorf("injected store failure")
+	}
+	return f.StaticClusterKeyStore.Store(kind, data)
+}
+
+// TestOIDCRotationPersistBeforeActivate proves the new ring is persisted
+// BEFORE activation: an interrupted write leaves the old ring active.
+func TestOIDCRotationPersistBeforeActivate(t *testing.T) {
+	shared := &failingWriteClusterStore{StaticClusterKeyStore: &StaticClusterKeyStore{Keys: map[string][]byte{}}}
+	s, err := NewPersistentWithCluster("t", "t", t.TempDir(), shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	oldKID := s.oidc.KID
+	s.mu.Unlock()
+	shared.FailStore = true
+	s.mu.Lock()
+	s.rotateOIDCKeyLocked(time.Now().UTC())
+	active := s.oidc.KID
+	s.mu.Unlock()
+	if active != oldKID {
+		t.Fatalf("rotation activated despite failed persistence: active %q != old %q", active, oldKID)
+	}
+	// The JWKS still advertises only the old key.
+	keys := fetchJWKS(t, s)
+	if len(keys) != 1 || keys[0].KID != oldKID {
+		t.Fatalf("JWKS = %+v, want only the old active key %q", keys, oldKID)
+	}
+	// Once persistence recovers, the next rotation activates.
+	shared.FailStore = false
+	s.mu.Lock()
+	s.rotateOIDCKeyLocked(time.Now().UTC())
+	active = s.oidc.KID
+	s.mu.Unlock()
+	if active == oldKID {
+		t.Fatal("rotation did not activate after persistence recovered")
+	}
+}
+
+// TestOIDCReplicaReloadsRotatedRing proves a second replica reloads the
+// ring from the shared cluster store on token issuance (check-on-issue).
+func TestOIDCReplicaReloadsRotatedRing(t *testing.T) {
+	shared := &StaticClusterKeyStore{Keys: map[string][]byte{}}
+	s1, err := NewPersistentWithCluster("t", "t", t.TempDir(), shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := NewPersistentWithCluster("t", "t", t.TempDir(), shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2.ExternalURL = "https://ci.example.com"
+	_, jobID := seedOIDCJob(t, s2, "lease1")
+
+	// Rotate on the first replica (persist through the shared store).
+	s1.mu.Lock()
+	s1.rotateOIDCKeyLocked(time.Now().UTC())
+	newKID := s1.oidc.KID
+	s1.mu.Unlock()
+
+	// The second replica's next issuance reloads the ring and signs with
+	// the rotated key.
+	tok := issueOIDCToken(t, s2, jobID, "lease1", "https://aud.example.com")
+	jwt := parseTestJWT(t, tok)
+	if jwt.headerKID != newKID {
+		t.Fatalf("replica signed with kid %q, want reloaded %q", jwt.headerKID, newKID)
+	}
+	s2.mu.Lock()
+	if s2.oidc.KID != newKID {
+		t.Fatalf("replica active kid %q, want %q", s2.oidc.KID, newKID)
+	}
+	s2.mu.Unlock()
+}
+
+// TestOIDCRotationPersistBeforeActivateFileMode is the file-mode variant:
+// making the ring file unwritable keeps the old ring active.
+func TestOIDCRotationPersistBeforeActivateFileMode(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewPersistent("t", "t", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	oldKID := s.oidc.KID
+	s.mu.Unlock()
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(dir, 0o700)
+	s.mu.Lock()
+	s.rotateOIDCKeyLocked(time.Now().UTC())
+	active := s.oidc.KID
+	s.mu.Unlock()
+	if active != oldKID {
+		t.Fatalf("rotation activated despite failed ring write: active %q != old %q", active, oldKID)
 	}
 }

@@ -77,7 +77,28 @@ const (
 	maskReplacement  = "***"
 	maskMinSecretLen = 3
 	maskMaxSecretLen = 8192
-	maskMaxSecrets   = 64
+	maskMaxSecrets   = MaxSecretNames
+)
+
+// MaxSecretNames is the shared capacity agreement for one execution's
+// secret set: pipeline admission caps a job's declared secret names at this
+// value and the Masker's capacity equals it, so a job that passes
+// admission can never silently lose secrets to masking. The pipeline
+// admission layer (maxSecretsPerJob in internal/pipeline) is already
+// aligned at 128; it should import this constant in a later round so the
+// two can never drift again.
+const MaxSecretNames = 128
+
+var (
+	// ErrMaskerCapacity is returned by AddStrict when the masker already
+	// holds Capacity() secrets and the caller asked for strict admission.
+	ErrMaskerCapacity = errors.New("secrets: masker capacity exhausted")
+	// ErrMaskValueInvalid is returned by AddStrict when a secret value is
+	// shorter than 3 bytes or longer than 8192 bytes (the masking window).
+	ErrMaskValueInvalid = errors.New("secrets: secret value outside supported length")
+	// ErrTainted is returned by TaintCheck when an output value contains a
+	// registered secret (raw or derived form).
+	ErrTainted = errors.New("secrets: output contains a registered secret")
 )
 
 type Masker struct {
@@ -85,23 +106,82 @@ type Masker struct {
 	values        []string
 	rawReplacer   *strings.Replacer
 	multiReplacer *strings.Replacer
+	multiForms    []string
 }
 
 // Add registers a secret for masking. Secrets shorter than 3 or longer than
-// 8192 bytes are ignored, as are additions beyond 64 secrets.
+// 8192 bytes are ignored, as are additions beyond the masker capacity
+// (MaxSecretNames). Kept for source compatibility; execution paths that
+// must not silently lose secrets use AddStrict.
 func (m *Masker) Add(v string) {
+	_ = m.AddStrict(v)
+}
+
+// AddStrict registers a secret for masking and fails closed when the value
+// is outside the masking window (ErrMaskValueInvalid) or the masker already
+// holds Capacity() secrets (ErrMaskerCapacity). A successful call masks the
+// value (and its derived forms) exactly once.
+func (m *Masker) AddStrict(v string) error {
 	if len(v) < maskMinSecretLen || len(v) > maskMaxSecretLen {
-		return
+		return ErrMaskValueInvalid
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if len(m.values) >= maskMaxSecrets {
-		return
+		return ErrMaskerCapacity
 	}
 	m.values = append(m.values, v)
 	sort.Slice(m.values, func(i, j int) bool { return len(m.values[i]) > len(m.values[j]) })
 	m.rawReplacer = newMaskReplacer(m.values)
-	m.multiReplacer = newMaskReplacer(maskForms(m.values))
+	m.multiForms = maskForms(m.values)
+	m.multiReplacer = newMaskReplacer(m.multiForms)
+	return nil
+}
+
+// Capacity reports the maximum number of secret values the masker holds
+// (MaxSecretNames, matching the pipeline admission cap).
+func (m *Masker) Capacity() int { return maskMaxSecrets }
+
+// Len reports the number of registered secrets.
+func (m *Masker) Len() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.values)
+}
+
+// ContainsSecret reports whether s contains a registered secret value or
+// any of its derived forms (URL-escaped, base64, hex, JSON-quoted,
+// shell-quoted, multiline fragments). It is the taint predicate: a string
+// reporting true must not leave the trust boundary unmasked.
+func (m *Masker) ContainsSecret(s string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, f := range m.multiForms {
+		if strings.Contains(s, f) {
+			return true
+		}
+	}
+	return false
+}
+
+// TaintCheck validates persisted job outputs against the registered
+// secrets. It returns ErrTainted wrapped with the offending key when any
+// output value (top-level or per-step) contains a registered secret.
+// Execution paths call this before persisting JobResult.Outputs.
+func (m *Masker) TaintCheck(outputs map[string]string, stepOutputs map[string]map[string]string) error {
+	for k, v := range outputs {
+		if m.ContainsSecret(v) {
+			return fmt.Errorf("%w: output %q", ErrTainted, k)
+		}
+	}
+	for step, outs := range stepOutputs {
+		for k, v := range outs {
+			if m.ContainsSecret(v) {
+				return fmt.Errorf("%w: step %q output %q", ErrTainted, step, k)
+			}
+		}
+	}
+	return nil
 }
 
 // Mask replaces occurrences of the raw registered secret values.

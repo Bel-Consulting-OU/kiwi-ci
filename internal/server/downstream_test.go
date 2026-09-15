@@ -46,13 +46,15 @@ jobs:
 
 // downstreamServer builds a persistent server whose policy grants
 // cross_repo_trigger for repo o/r and enqueues a trusted run declaring a
-// downstream dispatch.
+// downstream dispatch. The target policy consent (DownstreamAllowlist) is
+// configured so the dispatch is authorized.
 func downstreamServer(t *testing.T, pipelineText string) (*Server, model.Run) {
 	t.Helper()
 	s, err := NewPersistent("token", "token", t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.DownstreamAllowlist = map[string][]string{"acme/child": {"o/r"}}
 	s.Policy = &policy.Config{
 		Repositories: map[string]policy.RepoPolicy{
 			"o/r": {CrossRepoTrigger: boolPtr(true)},
@@ -188,6 +190,7 @@ func TestDownstreamLaunchExactlyOnceAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s2.DownstreamAllowlist = map[string][]string{"acme/child": {"o/r"}}
 	s2.DownstreamPipelineFetcher = func(ctx context.Context, repo, ref string) (string, error) {
 		return childPipeline, nil
 	}
@@ -287,6 +290,7 @@ func TestDownstreamDBModeExactlyOnce(t *testing.T) {
 	if err := s.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
+	s.DownstreamAllowlist = map[string][]string{"acme/child": {"o/r"}}
 	s.Policy = &policy.Config{Repositories: map[string]policy.RepoPolicy{"o/r": {CrossRepoTrigger: boolPtr(true)}}}
 	if _, err := s.enqueue(SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
@@ -311,6 +315,7 @@ func TestDownstreamDBModeExactlyOnce(t *testing.T) {
 	if err := s2.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
+	s2.DownstreamAllowlist = map[string][]string{"acme/child": {"o/r"}}
 	s2.DownstreamPipelineFetcher = func(ctx context.Context, repo, ref string) (string, error) {
 		return childPipeline, nil
 	}
@@ -333,5 +338,153 @@ func TestDownstreamDBModeExactlyOnce(t *testing.T) {
 	f.mu.Unlock()
 	if childCount != 1 {
 		t.Fatalf("child runs in store = %d, want exactly 1", childCount)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Bilateral authorization (target policy consent)
+// ---------------------------------------------------------------------------
+
+// TestDownstreamRefusedWithoutTargetConsent: without a DownstreamAllowlist
+// entry for the target repository the dispatch is refused, audited, and the
+// outbox intent is dropped.
+func TestDownstreamRefusedWithoutTargetConsent(t *testing.T) {
+	s, err := NewPersistent("token", "token", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Policy = &policy.Config{Repositories: map[string]policy.RepoPolicy{"o/r": {CrossRepoTrigger: boolPtr(true)}}}
+	// No DownstreamAllowlist at all: default deny.
+	if _, err := s.enqueue(SubmitRun{
+		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
+		Ref: "refs/heads/main", SHA: "abc", Event: "push",
+		Pipeline: downstreamPipeline, Trusted: true,
+	}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	runnerID, task := leaseRunJob(t, s)
+	if w := completeTask(t, s, task, runnerID, "success"); w.Code != http.StatusNoContent {
+		t.Fatalf("complete = %d: %s", w.Code, w.Body.String())
+	}
+	fetched := false
+	s.DownstreamPipelineFetcher = func(ctx context.Context, repo, ref string) (string, error) {
+		fetched = true
+		return childPipeline, nil
+	}
+	s.flushOutbox()
+	if fetched {
+		t.Fatal("pipeline fetched despite missing target consent")
+	}
+	if got := childRunsOf(s); len(got) != 0 {
+		t.Fatalf("child runs = %d, want 0 (refused)", len(got))
+	}
+	// The outbox intent was dropped.
+	if got := s.outbox.Pending(); len(got) != 0 {
+		t.Fatalf("outbox not drained after refusal: %d intents", len(got))
+	}
+	// The refusal is audited.
+	events, err := s.store.ReadAudit(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refused := false
+	for _, e := range events {
+		if e.Action == "downstream.refused" {
+			refused = true
+		}
+	}
+	if !refused {
+		t.Fatal("refused dispatch was not audited")
+	}
+}
+
+// TestDownstreamAllowlistedSourceUntrustedChild: an allowlisted source is
+// enqueued, but the child inherits trust only when the target explicitly
+// grants trusted ingress.
+func TestDownstreamAllowlistedSourceUntrustedChild(t *testing.T) {
+	s, _ := downstreamServer(t, downstreamPipeline)
+	runnerID, task := leaseRunJob(t, s)
+	if w := completeTask(t, s, task, runnerID, "success"); w.Code != http.StatusNoContent {
+		t.Fatalf("complete = %d: %s", w.Code, w.Body.String())
+	}
+	s.DownstreamPipelineFetcher = func(ctx context.Context, repo, ref string) (string, error) {
+		return childPipeline, nil
+	}
+	s.flushOutbox()
+	children := childRunsOf(s)
+	if len(children) != 1 {
+		t.Fatalf("child runs = %d, want 1", len(children))
+	}
+	if children[0].Trusted {
+		t.Fatal("child must be untrusted without trusted ingress consent")
+	}
+}
+
+// TestDownstreamTrustedIngressPreservesTrust: a target with trusted
+// ingress consent receives a trusted child.
+func TestDownstreamTrustedIngressPreservesTrust(t *testing.T) {
+	s, _ := downstreamServer(t, downstreamPipeline)
+	s.DownstreamTrustedIngress = map[string]bool{"acme/child": true}
+	runnerID, task := leaseRunJob(t, s)
+	if w := completeTask(t, s, task, runnerID, "success"); w.Code != http.StatusNoContent {
+		t.Fatalf("complete = %d: %s", w.Code, w.Body.String())
+	}
+	s.DownstreamPipelineFetcher = func(ctx context.Context, repo, ref string) (string, error) {
+		return childPipeline, nil
+	}
+	s.flushOutbox()
+	children := childRunsOf(s)
+	if len(children) != 1 {
+		t.Fatalf("child runs = %d, want 1", len(children))
+	}
+	if !children[0].Trusted {
+		t.Fatal("child must be trusted with trusted-ingress consent")
+	}
+}
+
+// TestDownstreamRefusedDBMode: the same default-deny refusal on the DB-mode
+// dispatch path.
+func TestDownstreamRefusedDBMode(t *testing.T) {
+	f := newDBFakeStore()
+	s, err := NewPersistent("token", "token", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	// No allowlist: default deny.
+	s.Policy = &policy.Config{Repositories: map[string]policy.RepoPolicy{"o/r": {CrossRepoTrigger: boolPtr(true)}}}
+	if _, err := s.enqueue(SubmitRun{
+		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
+		Ref: "refs/heads/main", SHA: "abc", Event: "push",
+		Pipeline: downstreamPipeline, Trusted: true,
+	}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	runnerID, task := leaseRunJob(t, s)
+	if w := completeTask(t, s, task, runnerID, "success"); w.Code != http.StatusNoContent {
+		t.Fatalf("complete = %d: %s", w.Code, w.Body.String())
+	}
+	s.flushOutbox()
+	f.mu.Lock()
+	childCount := 0
+	refused := false
+	for _, r := range f.runs {
+		if r.RepoFullName == "acme/child" {
+			childCount++
+		}
+	}
+	for _, e := range f.audit {
+		if e.Action == "downstream.refused" {
+			refused = true
+		}
+	}
+	f.mu.Unlock()
+	if childCount != 0 {
+		t.Fatalf("child runs in store = %d, want 0 (refused)", childCount)
+	}
+	if !refused {
+		t.Fatal("DB-mode refusal was not audited")
 	}
 }

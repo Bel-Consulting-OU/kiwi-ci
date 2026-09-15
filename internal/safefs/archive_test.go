@@ -4,11 +4,16 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"crypto/rand"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func tarGz(t *testing.T, entries []tarEntry) []byte {
@@ -43,7 +48,17 @@ type tarEntry struct {
 
 func extract(t *testing.T, data []byte, dest string) error {
 	t.Helper()
-	_, err := Extract(bytes.NewReader(data), dest, DefaultLimits())
+	return extractWith(t, data, dest, DefaultLimits())
+}
+
+func extractWith(t *testing.T, data []byte, dest string, limits ExtractLimits) error {
+	t.Helper()
+	root, err := OpenRootNoFollow(dest)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	_, err = Extract(root, bytes.NewReader(data), limits)
 	return err
 }
 
@@ -164,8 +179,7 @@ func TestExtractRejectsCompressionBomb(t *testing.T) {
 	data := tarGz(t, []tarEntry{{name: "bomb", data: big, typeflag: tar.TypeReg}})
 	limits := DefaultLimits()
 	limits.MaxCompressionRatio = 10 // 64MiB zeros compress far beyond 10x
-	_, err := Extract(bytes.NewReader(data), dest, limits)
-	if err == nil {
+	if err := extractWith(t, data, dest, limits); err == nil {
 		t.Fatal("expected compression ratio rejection")
 	}
 }
@@ -175,7 +189,7 @@ func TestExtractEnforcesFileLimit(t *testing.T) {
 	data := tarGz(t, []tarEntry{{name: "big", data: bytes.Repeat([]byte("B"), 1024), typeflag: tar.TypeReg}})
 	limits := DefaultLimits()
 	limits.MaxFileBytes = 512
-	if _, err := Extract(bytes.NewReader(data), dest, limits); err == nil {
+	if err := extractWith(t, data, dest, limits); err == nil {
 		t.Fatal("expected file size limit rejection")
 	}
 }
@@ -198,7 +212,7 @@ func TestExtractEnforcesEntryLimit(t *testing.T) {
 	data := tarGz(t, entries)
 	limits := DefaultLimits()
 	limits.MaxEntries = 5
-	if _, err := Extract(bytes.NewReader(data), dest, limits); err == nil {
+	if err := extractWith(t, data, dest, limits); err == nil {
 		t.Fatal("expected entry count rejection")
 	}
 }
@@ -211,7 +225,7 @@ func TestExtractAllowedFilter(t *testing.T) {
 	})
 	limits := DefaultLimits()
 	limits.Allowed = []string{"keep"}
-	if _, err := Extract(bytes.NewReader(data), dest, limits); err != nil {
+	if err := extractWith(t, data, dest, limits); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(dest, "keep", "a")); err != nil {
@@ -249,7 +263,7 @@ func TestWriteTarGzDeterministicAndSafe(t *testing.T) {
 		t.Fatal("archives not deterministic")
 	}
 	dest := t.TempDir()
-	if _, err := Extract(bytes.NewReader(b1.Bytes()), dest, DefaultLimits()); err != nil {
+	if err := extract(t, b1.Bytes(), dest); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(dest, "sub", "a.txt")); err != nil {
@@ -257,5 +271,202 @@ func TestWriteTarGzDeterministicAndSafe(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(dest, "link")); !os.IsNotExist(err) {
 		t.Fatal("symlink must not be archived")
+	}
+}
+
+func TestExtractPathShimStillWorks(t *testing.T) {
+	dest := t.TempDir()
+	data := tarGz(t, []tarEntry{
+		{name: "dir/", typeflag: tar.TypeDir},
+		{name: "dir/file.txt", data: []byte("hello"), typeflag: tar.TypeReg},
+	})
+	if _, err := ExtractPath(dest, bytes.NewReader(data), DefaultLimits()); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := os.ReadFile(filepath.Join(dest, "dir", "file.txt")); err != nil || string(b) != "hello" {
+		t.Fatalf("shim extraction wrong: %q %v", b, err)
+	}
+}
+
+func TestOpenRootNoFollowRejectsSymlinkDest(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation needs privileges on windows")
+	}
+	real := t.TempDir()
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenRootNoFollow(link); !errors.Is(err, ErrSymlinkParent) {
+		t.Fatalf("expected ErrSymlinkParent, got %v", err)
+	}
+}
+
+func TestOpenRootNoFollowRequiresExistingDir(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "nope")
+	if _, err := OpenRootNoFollow(missing); err == nil {
+		t.Fatal("expected error for missing destination")
+	}
+}
+
+func TestExtractIntoPrecreatedLeafDirs(t *testing.T) {
+	dest := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dest, "cache"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dest, "other", "leaf"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data := tarGz(t, []tarEntry{
+		{name: "cache/hit.txt", data: []byte("cached"), typeflag: tar.TypeReg},
+		{name: "other/leaf/deep.txt", data: []byte("deep"), typeflag: tar.TypeReg},
+		{name: "fresh/dir/new.txt", data: []byte("new"), typeflag: tar.TypeReg},
+	})
+	if err := extract(t, data, dest); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ path, want string }{
+		{filepath.Join(dest, "cache", "hit.txt"), "cached"},
+		{filepath.Join(dest, "other", "leaf", "deep.txt"), "deep"},
+		{filepath.Join(dest, "fresh", "dir", "new.txt"), "new"},
+	} {
+		b, err := os.ReadFile(tc.path)
+		if err != nil || string(b) != tc.want {
+			t.Fatalf("file %s = %q, %v; want %q", tc.path, b, err, tc.want)
+		}
+	}
+}
+
+// TestExtractParentSwapNeverEscapes opens the root handle, then concurrently
+// replaces the root's parent directory with a symlink to an unrelated
+// directory while extraction runs. Because all writes are anchored to the
+// held descriptor, every file must land in the original directory and none
+// may escape through the swapped parent.
+func TestExtractParentSwapNeverEscapes(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink/rename swap needs unix semantics")
+	}
+	base := t.TempDir()
+	parent := filepath.Join(base, "parent")
+	if err := os.Mkdir(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(parent, "dest")
+	if err := os.Mkdir(dest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	root, err := OpenRootNoFollow(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+
+	evil := t.TempDir()
+	const nFiles = 300
+	var entries []tarEntry
+	for i := 0; i < nFiles; i++ {
+		entries = append(entries, tarEntry{
+			name:     fmt.Sprintf("d%d/f%d.txt", i%30, i),
+			data:     []byte(fmt.Sprintf("payload-%04d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", i)),
+			typeflag: tar.TypeReg,
+		})
+	}
+	data := tarGz(t, entries)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		moved := parent + ".moved"
+		for {
+			select {
+			case <-stop:
+				_ = os.Remove(parent)
+				_ = os.Rename(moved, parent)
+				return
+			default:
+			}
+			_ = os.Rename(parent, moved)
+			_ = os.Symlink(evil, parent)
+			time.Sleep(200 * time.Microsecond)
+			_ = os.Remove(parent)
+			_ = os.Rename(moved, parent)
+			time.Sleep(200 * time.Microsecond)
+		}
+	}()
+
+	stats, err := Extract(root, bytes.NewReader(data), DefaultLimits())
+	close(stop)
+	wg.Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Files != nFiles {
+		t.Fatalf("files = %d, want %d", stats.Files, nFiles)
+	}
+	for i := 0; i < nFiles; i++ {
+		p := filepath.Join(parent, "dest", fmt.Sprintf("d%d", i%30), fmt.Sprintf("f%d.txt", i))
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("file %d missing after swap: %v", i, err)
+		}
+		if !strings.HasPrefix(string(b), fmt.Sprintf("payload-%04d-", i)) {
+			t.Fatalf("file %d content corrupted: %q", i, b)
+		}
+	}
+	ents, err := os.ReadDir(evil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 0 {
+		t.Fatalf("extraction escaped through swapped parent: %d entries outside root", len(ents))
+	}
+}
+
+func TestCappedWriterEnforcesLimit(t *testing.T) {
+	var buf bytes.Buffer
+	cw := NewCappedWriter(&buf, 10)
+	n, err := cw.Write([]byte("1234567890"))
+	if err != nil || n != 10 {
+		t.Fatalf("first write = %d, %v", n, err)
+	}
+	if _, err := cw.Write([]byte("x")); !errors.Is(err, ErrCapExceeded) {
+		t.Fatalf("expected ErrCapExceeded, got %v", err)
+	} else if !strings.Contains(err.Error(), "cap") {
+		t.Fatalf("error %q does not mention cap", err)
+	}
+	if buf.String() != "1234567890" {
+		t.Fatalf("underlying writer got %q", buf.String())
+	}
+}
+
+func TestCappedWriterUnlimitedWhenZero(t *testing.T) {
+	var buf bytes.Buffer
+	cw := NewCappedWriter(&buf, 0)
+	if _, err := cw.Write([]byte("no limit")); err != nil {
+		t.Fatal(err)
+	}
+	if buf.String() != "no limit" {
+		t.Fatalf("got %q", buf.String())
+	}
+}
+
+func TestWriteTarGzPropagatesCapError(t *testing.T) {
+	ws := t.TempDir()
+	payload := make([]byte, 4096)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "big.bin"), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	err := WriteTarGz(NewCappedWriter(&buf, 512), ws, []string{"."}, false)
+	if err == nil {
+		t.Fatal("expected cap error to propagate")
+	}
+	if !strings.Contains(err.Error(), "cap") {
+		t.Fatalf("error %q does not mention cap", err)
 	}
 }

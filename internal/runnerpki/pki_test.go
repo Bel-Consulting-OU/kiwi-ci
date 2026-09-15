@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"testing"
 	"time"
@@ -88,8 +89,13 @@ func TestSignRunnerCSR(t *testing.T) {
 	if cert.KeyUsage != x509.KeyUsageDigitalSignature {
 		t.Fatalf("KeyUsage = %v", cert.KeyUsage)
 	}
-	if !hasEKU(cert.ExtKeyUsage, x509.ExtKeyUsageClientAuth) || !hasEKU(cert.ExtKeyUsage, x509.ExtKeyUsageServerAuth) {
-		t.Fatalf("EKU = %v, want client+server auth", cert.ExtKeyUsage)
+	// Runner leaf certificates are ClientAuth-only: they can never
+	// authenticate a TLS server.
+	if !hasEKU(cert.ExtKeyUsage, x509.ExtKeyUsageClientAuth) || hasEKU(cert.ExtKeyUsage, x509.ExtKeyUsageServerAuth) {
+		t.Fatalf("EKU = %v, want client auth only", cert.ExtKeyUsage)
+	}
+	if len(cert.DNSNames) != 0 || len(cert.IPAddresses) != 0 || len(cert.EmailAddresses) != 0 {
+		t.Fatalf("leaf carries requester-derived SANs: %v %v %v", cert.DNSNames, cert.IPAddresses, cert.EmailAddresses)
 	}
 	roots := Pool(caCertPEM(t, ca))
 	chains, err := cert.Verify(x509.VerifyOptions{Roots: roots, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}})
@@ -126,18 +132,49 @@ func TestSignRunnerCSRRejectsTamperedSignature(t *testing.T) {
 	}
 }
 
-func TestSignRunnerCSRRequiresMatchingCN(t *testing.T) {
+func TestSignRunnerCSRSynthesizesIdentity(t *testing.T) {
 	ca, err := NewCA("test", time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, csrPEM, err := GenerateKeyAndCSR("runner-a")
+	// A hostile CSR: the requester claims CN=victim and a raft of SANs.
+	// The server ignores all of it and signs ONLY the synthesized
+	// identity from the authenticated runner ID.
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ca.SignRunnerCSR(csrPEM, "runner-b", time.Hour, nil); err == nil {
-		t.Fatal("CN mismatch must be rejected")
+	hostileURI, err := url.Parse("spiffe://evil.example/admin")
+	if err != nil {
+		t.Fatal(err)
 	}
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
+		Subject:  pkix.Name{CommonName: "victim", Organization: []string{"evil"}},
+		URIs:     []*url.URL{hostileURI},
+		DNSNames: []string{"evil.example"},
+	}, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
+	certPEM, err := ca.SignRunnerCSR(csrPEM, "runner-a", time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert := parseCert(t, certPEM)
+	if cert.Subject.CommonName != "runner-a" {
+		t.Fatalf("CN = %q, want runner-a", cert.Subject.CommonName)
+	}
+	if len(cert.Subject.Organization) != 0 {
+		t.Fatalf("CSR subject leaked into certificate: %+v", cert.Subject)
+	}
+	if len(cert.URIs) != 1 || cert.URIs[0].String() != RunnerURIPrefix+"runner-a" {
+		t.Fatalf("URIs = %v, want only the synthesized spiffe identity", cert.URIs)
+	}
+	if len(cert.DNSNames) != 0 {
+		t.Fatalf("CSR DNS SANs leaked: %v", cert.DNSNames)
+	}
+	_ = pub
 }
 
 func TestSignRunnerCSRFillsEmptyCN(t *testing.T) {
@@ -243,6 +280,57 @@ func TestLoadOrCreateCA(t *testing.T) {
 	if _, err := LoadOrCreateCA(filepath.Join(dir, "nested")); err != nil {
 		t.Fatalf("fresh nested dir: %v", err)
 	}
+}
+
+func TestLoadCARejectsMismatchedKey(t *testing.T) {
+	ca1, err := NewCA("first", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca2, err := NewCA("second", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := caCertPEM(t, ca1)
+	keyDER, err := x509.MarshalPKCS8PrivateKey(ca2.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	if _, err := LoadCA(certPEM, keyPEM); err == nil {
+		t.Fatal("cert/key from different CAs must fail to load")
+	}
+}
+
+func TestLeafSerialsUniqueAcrossGenerations(t *testing.T) {
+	// Serial numbers come from crypto/rand, not process-local counters:
+	// two fresh CAs (e.g. two control-plane generations) must not issue
+	// colliding leaf serials, and one CA must issue distinct serials.
+	ca1, err := NewCA("generation one", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca2, err := NewCA("generation two", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, certPEM1, cert1 := signRunner(t, ca1, "runner-1")
+	_, certPEM2, cert2 := signRunner(t, ca1, "runner-2")
+	_, certPEM3, cert3 := signRunner(t, ca2, "runner-3")
+	if cert1.SerialNumber.Cmp(cert2.SerialNumber) == 0 {
+		t.Fatal("leaf serials within one CA collided")
+	}
+	if cert1.SerialNumber.Cmp(cert3.SerialNumber) == 0 || cert2.SerialNumber.Cmp(cert3.SerialNumber) == 0 {
+		t.Fatal("leaf serials across CA generations collided")
+	}
+	for i, cert := range []*x509.Certificate{cert1, cert2, cert3} {
+		if cert.SerialNumber.BitLen() > 128 || cert.SerialNumber.Sign() <= 0 {
+			t.Fatalf("leaf %d serial %v is not a positive 128-bit number", i, cert.SerialNumber)
+		}
+	}
+	_ = certPEM1
+	_ = certPEM2
+	_ = certPEM3
 }
 
 func selfSignedServerCert(t *testing.T) (certPEM, keyPEM []byte) {

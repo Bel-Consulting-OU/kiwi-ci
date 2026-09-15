@@ -79,6 +79,7 @@ func TestMTLSEnrollAndRegister(t *testing.T) {
 		Token:       "runner-token",
 		EnrollToken: "enroll-secret",
 		CACert:      string(serverCertPEM),
+		IdentityDir: t.TempDir(),
 	}, ID: "runner-test-1"}
 	if err := r.prepareClient(ctx); err != nil {
 		t.Fatalf("prepareClient: %v", err)
@@ -95,6 +96,11 @@ func TestMTLSEnrollAndRegister(t *testing.T) {
 	}
 	if _, _, err := r.next(ctx); err != nil {
 		t.Fatalf("next over mTLS: %v", err)
+	}
+	// The enrolled identity must be persisted for reuse on the next start.
+	id, ok := IdentityStore{Dir: r.Cfg.IdentityDir}.Load()
+	if !ok || id.ID != "runner-test-1" || !id.CertUsable() {
+		t.Fatal("enrolled identity not persisted")
 	}
 }
 

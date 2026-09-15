@@ -39,6 +39,20 @@ type dbFakeStore struct {
 	deliveries       map[string]string
 	quotas           map[string][2]int
 	cacheMans        map[string]storage.CacheManifestRecord
+	secretClaims     map[string]bool
+
+	// claimErr, when non-nil, makes ClaimSecretDelivery fail (fail-closed
+	// secret delivery tests).
+	claimErr error
+	// contractsErr, when non-nil, makes CompleteJob's required-artifact
+	// verification fail (completion rolls back, job stays running).
+	contractsErr error
+	// snapshotErr, when non-nil, makes InsertSnapshotRecord fail (P2-31
+	// fail-closed snapshot upload tests).
+	snapshotErr error
+	// auditErr, when non-nil, makes AppendAudit fail (OIDC issuance
+	// fail-closed tests).
+	auditErr error
 
 	leaderOK  bool
 	leaderErr error
@@ -112,6 +126,8 @@ var _ storage.AtomicLeaseStore = (*dbFakeStore)(nil)
 var _ storage.QuotaCounterStore = (*dbFakeStore)(nil)
 var _ storage.CacheManifestStore = (*dbFakeStore)(nil)
 var _ storage.ArtifactSidecarStore = (*dbFakeStore)(nil)
+var _ storage.SecretClaimStore = (*dbFakeStore)(nil)
+var _ storage.SecretClaimReleaser = (*dbFakeStore)(nil)
 
 func newDBFakeStore() *dbFakeStore {
 	return &dbFakeStore{
@@ -128,6 +144,7 @@ func newDBFakeStore() *dbFakeStore {
 		deliveries:      map[string]string{},
 		quotas:          map[string][2]int{},
 		cacheMans:       map[string]storage.CacheManifestRecord{},
+		secretClaims:    map[string]bool{},
 		leaderOK:        true,
 	}
 }
@@ -306,6 +323,30 @@ func (f *dbFakeStore) CompleteJob(ctx context.Context, jobID string, generation 
 		}
 		return storage.ErrGenerationMismatch
 	}
+	// Required-artifact verification inside the completion: mirrors the
+	// PostgresStore transaction. A successful completion must have an
+	// artifact record for every Required contract; a missing artifact (or a
+	// contract-store failure) fails closed and leaves the job running.
+	if status == model.StatusSuccess {
+		if f.contractsErr != nil {
+			return f.contractsErr
+		}
+		for name, c := range f.contracts[jobID] {
+			if !c.Required {
+				continue
+			}
+			found := false
+			for _, a := range f.artifacts {
+				if a.JobID == jobID && a.Name == name {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("%w: %s", storage.ErrRequiredArtifactMissing, name)
+			}
+		}
+	}
 	j.Status = status
 	j.Error = errMsg
 	j.Outputs = outputs
@@ -443,6 +484,9 @@ func (f *dbFakeStore) ReadLogs(ctx context.Context, runID string, after int64, l
 func (f *dbFakeStore) AppendAudit(ctx context.Context, e model.AuditEvent) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.auditErr != nil {
+		return f.auditErr
+	}
 	f.audit = append(f.audit, e)
 	return nil
 }
@@ -634,6 +678,9 @@ func (f *dbFakeStore) UpdateDeploymentStatus(ctx context.Context, id string, sta
 func (f *dbFakeStore) InsertSnapshotRecord(ctx context.Context, rec model.SnapshotRecord) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.snapshotErr != nil {
+		return f.snapshotErr
+	}
 	f.snapshots = append(f.snapshots, rec)
 	return nil
 }
@@ -1090,4 +1137,25 @@ func (f *dbFakeStore) SetArtifactSidecars(ctx context.Context, id, sbomPath, sbo
 		return nil
 	}
 	return storage.ErrNotFound
+}
+
+func (f *dbFakeStore) ClaimSecretDelivery(ctx context.Context, jobID string, generation int64, secretName string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.claimErr != nil {
+		return false, f.claimErr
+	}
+	key := jobID + "|" + itoa(generation) + "|" + secretName
+	if f.secretClaims[key] {
+		return false, nil
+	}
+	f.secretClaims[key] = true
+	return true, nil
+}
+
+func (f *dbFakeStore) ReleaseSecretDelivery(ctx context.Context, jobID string, generation int64, secretName string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.secretClaims, jobID+"|"+itoa(generation)+"|"+secretName)
+	return nil
 }

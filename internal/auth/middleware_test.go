@@ -159,3 +159,68 @@ func TestMiddlewareLogsRequestIDOn401(t *testing.T) {
 		t.Fatalf("401 not logged with request id: %v", logged)
 	}
 }
+
+func TestPublicRouteTable(t *testing.T) {
+	public := []struct{ method, path string }{
+		{http.MethodPost, "/hooks/github"},
+		{http.MethodPost, "/hooks/gitlab"},
+		{http.MethodGet, "/"},
+		{http.MethodGet, "/static/app.js"},
+		{http.MethodPost, "/api/v1/login"},
+		{http.MethodGet, "/api/v1/logout"},
+		{http.MethodGet, "/readiness"},
+		{http.MethodGet, "/liveness"},
+		{http.MethodGet, "/.well-known/openid-configuration"},
+		{http.MethodGet, "/api/v1/oidc/jwks"},
+		{http.MethodPost, "/api/v1/jobs/j1/oidc"},
+		{http.MethodPost, "/api/v1/runners/enroll"},
+	}
+	for _, p := range public {
+		if !PublicRoute(p.method, p.path) {
+			t.Errorf("PublicRoute(%s %s) = false, want true", p.method, p.path)
+		}
+	}
+	private := []struct{ method, path string }{
+		{http.MethodGet, "/api/v1/runs"},
+		{http.MethodPost, "/api/v1/runs"},
+		{http.MethodGet, "/metrics"},
+		{http.MethodPost, "/api/v1/runners/register"},
+		{http.MethodGet, "/api/v1/runners/enroll"},
+		{http.MethodGet, "/api/v1/audit"},
+	}
+	for _, p := range private {
+		if PublicRoute(p.method, p.path) {
+			t.Errorf("PublicRoute(%s %s) = true, want false", p.method, p.path)
+		}
+	}
+}
+
+func TestMiddlewarePassesPublicPathsWithPopulatedStore(t *testing.T) {
+	store := NewTokenStore()
+	if err := store.AddToken("store-token", Principal{Subject: "bot"}); err != nil {
+		t.Fatal(err)
+	}
+	paths := []struct {
+		method, path, body string
+	}{
+		{http.MethodGet, "/readiness", ""},
+		{http.MethodGet, "/liveness", ""},
+		{http.MethodPost, "/api/v1/runners/enroll", `{}`},
+		{http.MethodPost, "/hooks/github", `{}`},
+	}
+	for _, p := range paths {
+		called := false
+		h := Middleware(store, "admin-token", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			called = true
+		}), nil)
+		req := httptest.NewRequest(p.method, p.path, strings.NewReader(p.body))
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Errorf("%s %s: got %d, want 200 (public path must reach the handler)", p.method, p.path, w.Code)
+		}
+		if !called {
+			t.Errorf("%s %s: handler not reached", p.method, p.path)
+		}
+	}
+}

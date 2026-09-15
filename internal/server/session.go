@@ -18,19 +18,26 @@ import (
 // Sessions are opaque, short-lived cookies issued by POST /api/v1/login
 // against the admin token. The cookie value is
 //
-//	hex(hmac-sha256(secret, "web:"+expiry)) + "|" + expiry
+//	hex(nonce) + "|" + mac + "|" + expiry
 //
-// with the expiry as a Unix timestamp, so the server needs no session
-// store: the HMAC proves the cookie was issued by this control plane and
-// the expiry bounds its lifetime. The CSRF token is the same construction
-// with the "csrf:" tag: it is a true double-submit token because it is
-// HMACed over the same expiry as the session cookie, so an attacker who
-// can read the cookie cannot forge the header and vice versa.
+// where the nonce is 16 fresh random bytes per session (crypto/rand, never
+// expiry-derived), the expiry is a Unix timestamp, and the mac is
+// hex(hmac-sha256(secret, tag+":"+nonce+":"+expiry)) — the HMAC proves the
+// cookie was issued by this control plane and the integrity of both the
+// nonce and the expiry. The server needs no session store: the MAC
+// authenticates the value and the expiry bounds its lifetime. The CSRF
+// token is the same construction with the "csrf" tag over the SAME nonce
+// and expiry as the session cookie, so it is a true double-submit token:
+// an attacker who can read the cookie cannot forge the header and vice
+// versa, and a CSRF token from another session never validates.
+//
+// Validation compares MACs in constant time.
 
 const (
-	webSessionCookie = "kiwi_session"
-	webCSRFHeader    = "X-Kiwi-CSRF"
-	webSessionTTL    = 8 * time.Hour
+	webSessionCookie  = "kiwi_session"
+	webCSRFHeader     = "X-Kiwi-CSRF"
+	webSessionTTL     = 8 * time.Hour
+	webSessionNonceSz = 16
 )
 
 // webSessionSecret returns the web session HMAC key: the
@@ -57,18 +64,56 @@ func (s *Server) ensureWebSessionSecret() {
 	s.WebSessionSecret = webSessionSecret()
 }
 
-// webMAC returns hex(hmac-sha256(secret, tag+":"+expiry)).
-func webMAC(secret []byte, tag, expiry string) string {
+// webMAC returns hex(hmac-sha256(secret, tag+":"+payload)).
+func webMAC(secret []byte, tag, payload string) string {
 	mac := hmac.New(sha256.New, secret)
 	mac.Write([]byte(tag))
 	mac.Write([]byte(":"))
-	mac.Write([]byte(expiry))
+	mac.Write([]byte(payload))
 	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// newWebToken mints a fresh random nonce and returns the signed token
+// value (nonce|mac|expiry) plus its expiry, or an error when the entropy
+// source fails.
+func newWebToken(secret []byte, tag string) (value string, expiry int64, err error) {
+	nonce := make([]byte, webSessionNonceSz)
+	if _, err = rand.Read(nonce); err != nil {
+		return "", 0, err
+	}
+	nonceHex := hex.EncodeToString(nonce)
+	expiry = time.Now().UTC().Add(webSessionTTL).Unix()
+	expStr := strconv.FormatInt(expiry, 10)
+	return nonceHex + "|" + webMAC(secret, tag, nonceHex+":"+expStr) + "|" + expStr, expiry, nil
+}
+
+// parseWebToken splits a token value into its nonce, MAC and expiry parts.
+func parseWebToken(v string) (nonce, mac, expStr string, ok bool) {
+	parts := strings.Split(v, "|")
+	if len(parts) != 3 {
+		return "", "", "", false
+	}
+	return parts[0], parts[1], parts[2], true
+}
+
+// webTokenOK validates a signed token: a valid MAC (constant time) over a
+// non-expired nonce+expiry pair.
+func webTokenOK(secret []byte, tag, v string) bool {
+	nonce, mac, expStr, ok := parseWebToken(v)
+	if !ok {
+		return false
+	}
+	expiry, err := strconv.ParseInt(expStr, 10, 64)
+	if err != nil || time.Now().Unix() > expiry {
+		return false
+	}
+	want := webMAC(secret, tag, nonce+":"+expStr)
+	return subtle.ConstantTimeCompare([]byte(mac), []byte(want)) == 1
 }
 
 // webLogin implements POST /api/v1/login: it verifies the submitted token
 // against the admin token (constant time) and issues the session cookie
-// plus the CSRF token.
+// plus the CSRF token, both bound to the same fresh random nonce.
 func (s *Server) webLogin(w http.ResponseWriter, r *http.Request) {
 	s.ensureWebSessionSecret()
 	var in struct {
@@ -81,18 +126,23 @@ func (s *Server) webLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid token", http.StatusUnauthorized)
 		return
 	}
-	expiry := time.Now().UTC().Add(webSessionTTL).Unix()
-	expStr := strconv.FormatInt(expiry, 10)
+	sessionValue, expiry, err := newWebToken(s.WebSessionSecret, "web")
+	if err != nil {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	nonce, _, expStr, _ := parseWebToken(sessionValue)
+	csrfValue := nonce + "|" + webMAC(s.WebSessionSecret, "csrf", nonce+":"+expStr) + "|" + expStr
 	http.SetCookie(w, &http.Cookie{
 		Name:     webSessionCookie,
-		Value:    webMAC(s.WebSessionSecret, "web", expStr) + "|" + expStr,
+		Value:    sessionValue,
 		Path:     "/",
 		HttpOnly: true,
 		Secure:   true,
 		SameSite: http.SameSiteStrictMode,
 		Expires:  time.Unix(expiry, 0),
 	})
-	w.Header().Set(webCSRFHeader, webMAC(s.WebSessionSecret, "csrf", expStr)+"|"+expStr)
+	w.Header().Set(webCSRFHeader, csrfValue)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -110,8 +160,8 @@ func (s *Server) webLogout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// webSessionOK validates the session cookie: a valid HMAC over a
-// non-expired timestamp.
+// webSessionOK validates the session cookie: a valid HMAC (constant time)
+// over a non-expired nonce+expiry pair.
 func (s *Server) webSessionOK(r *http.Request) bool {
 	if len(s.WebSessionSecret) != 32 {
 		return false
@@ -120,51 +170,33 @@ func (s *Server) webSessionOK(r *http.Request) bool {
 	if err != nil || c.Value == "" {
 		return false
 	}
-	mac, expStr, ok := strings.Cut(c.Value, "|")
-	if !ok {
-		return false
-	}
-	expiry, err := strconv.ParseInt(expStr, 10, 64)
-	if err != nil || time.Now().Unix() > expiry {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(mac), []byte(webMAC(s.WebSessionSecret, "web", expStr))) == 1
-}
-
-// webSessionExpiry returns the expiry carried by a valid session cookie,
-// or 0.
-func (s *Server) webSessionExpiry(r *http.Request) int64 {
-	c, err := r.Cookie(webSessionCookie)
-	if err != nil {
-		return 0
-	}
-	_, expStr, ok := strings.Cut(c.Value, "|")
-	if !ok {
-		return 0
-	}
-	expiry, err := strconv.ParseInt(expStr, 10, 64)
-	if err != nil {
-		return 0
-	}
-	return expiry
+	return webTokenOK(s.WebSessionSecret, "web", c.Value)
 }
 
 // webCSRFOK validates the double-submit CSRF token for a cookie-authenticated
-// request: the X-Kiwi-CSRF header must carry the HMAC over the same expiry
-// as the session cookie, binding the two submissions to one session.
+// request: the X-Kiwi-CSRF header must carry a valid "csrf" MAC over the
+// SAME nonce and expiry as the session cookie, binding the two submissions
+// to one session. All comparisons are constant time.
 func (s *Server) webCSRFOK(r *http.Request) bool {
-	if !s.webSessionOK(r) {
+	c, err := r.Cookie(webSessionCookie)
+	if err != nil {
 		return false
 	}
-	expiry := s.webSessionExpiry(r)
-	if expiry == 0 {
+	cNonce, _, cExp, ok := parseWebToken(c.Value)
+	if !ok {
 		return false
 	}
-	mac, expStr, ok := strings.Cut(r.Header.Get(webCSRFHeader), "|")
-	if !ok || expStr != strconv.FormatInt(expiry, 10) {
+	hNonce, hMAC, hExp, ok := parseWebToken(r.Header.Get(webCSRFHeader))
+	if !ok {
 		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(mac), []byte(webMAC(s.WebSessionSecret, "csrf", expStr))) == 1
+	// The header must submit the exact nonce/expiry of the session cookie
+	// (double-submit binding).
+	if !constantTimeString(cNonce, hNonce) || !constantTimeString(cExp, hExp) {
+		return false
+	}
+	want := webMAC(s.WebSessionSecret, "csrf", hNonce+":"+hExp)
+	return subtle.ConstantTimeCompare([]byte(hMAC), []byte(want)) == 1
 }
 
 // webMutatingMethod reports whether the method mutates server state and so

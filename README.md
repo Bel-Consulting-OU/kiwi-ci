@@ -88,7 +88,11 @@ Production mode (PostgreSQL, TLS, distinct admin/runner credentials):
 
 Production mode enforces its contract at startup: database URL,
 distinct tokens (or `--allow-shared-token`), an `https://` external URL
-(the OIDC issuer), and TLS. See
+(the OIDC issuer), and TLS. The `--runner-token` is a SHARED credential
+across all runners — not a per-runner identity — so production strongly
+prefers persistent per-runner mTLS identities (`--runner-ca-cert`/
+`--runner-ca-key` plus enrollment); without a runner token, enforced
+runner mTLS is required. See
 [docs/production-deployment.md](docs/production-deployment.md).
 
 Configuration can also come from a `kiwi.toml` file
@@ -105,8 +109,13 @@ CLI flags > `KIWI_*` environment variables > config file > defaults.
 For mTLS identity binding, create a runner CA (or let the server
 persist one with `--data-dir`), set `--runner-enroll-token`, and start
 the runner with `--runner-enroll-token`/`--runner-mtls`. The runner
-negotiates protocol v3, drains cleanly on `--drain`, and self-cancels
-if it loses contact with the control plane past its lease deadline.
+generates its key locally; the server signs a certificate with a
+server-synthesized `spiffe://kiwi/runner/<id>` identity (the CSR's own
+identity fields are ignored), so each runner has a persistent,
+revocable per-runner identity — unlike the shared runner bearer token.
+The runner negotiates protocol v3, drains cleanly on `--drain`, and
+self-cancels if it loses contact with the control plane past its lease
+deadline.
 
 Manage runners with `kiwi runner list|drain|disable|enable`.
 

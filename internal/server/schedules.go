@@ -24,13 +24,6 @@ type schedulesFileJSON struct {
 	Occurrences map[string]map[int64]string `json:"occurrences"`
 }
 
-// scheduleTriggerJSON extracts the on.schedule block from a pipeline spec
-// so the server can read the cron expression and default branch without
-// importing pipeline schema changes.
-type scheduleTriggerJSON struct {
-	On map[string]pipeline.Trigger `yaml:"on"`
-}
-
 // scheduleRequest is the PUT /api/v1/schedules body.
 type scheduleRequest struct {
 	ID         string `json:"id,omitempty"`
@@ -39,28 +32,21 @@ type scheduleRequest struct {
 	Enabled    *bool  `json:"enabled,omitempty"`
 }
 
-// parseScheduleSpec validates a schedule's pipeline text and extracts the
-// cron expression plus the optional default branch. Parsing is lenient:
-// the strict pipeline schema does not yet admit on.schedule (that schema
-// change lands with the pipeline phase), so only structural sanity and the
-// cron expression are checked here; the schedule trigger is stripped before
-// the spec is enqueued (sanitizeScheduleSpec).
+// parseScheduleSpec validates a schedule's pipeline text with the SAME
+// strict parser used for every pipeline admission (pipeline.Parse) and
+// extracts the cron expression plus the optional default branch from
+// spec.On["schedule"]. The strict parse rejects malformed specs with line
+// numbers before the cron is ever read; the schedule trigger is stripped
+// before the spec is enqueued (sanitizeScheduleSpec).
 func parseScheduleSpec(specText string) (cronSchedule, string, error) {
-	if len(specText) > maxPipelineBytes {
-		return cronSchedule{}, "", errors.New("schedule spec exceeds size limit")
-	}
-	var raw pipeline.Spec
-	if err := yaml.Unmarshal([]byte(specText), &raw); err != nil {
+	spec, err := pipeline.Parse([]byte(specText))
+	if err != nil {
 		return cronSchedule{}, "", err
 	}
-	if len(raw.Jobs) == 0 {
+	if len(spec.Jobs) == 0 {
 		return cronSchedule{}, "", errors.New("schedule spec must declare at least one job")
 	}
-	var trig scheduleTriggerJSON
-	if err := yaml.Unmarshal([]byte(specText), &trig); err != nil {
-		return cronSchedule{}, "", err
-	}
-	sc := trig.On["schedule"]
+	sc := spec.On["schedule"]
 	if len(sc.Cron) == 0 || sc.Cron[0].Cron == "" {
 		return cronSchedule{}, "", errors.New("schedule spec must declare on.schedule.cron")
 	}

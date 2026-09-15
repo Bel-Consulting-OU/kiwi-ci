@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
@@ -19,15 +20,14 @@ import (
 )
 
 // uploadSnapshot is POST /api/v1/jobs/{id}/snapshots: the runner uploads a
-// workspace snapshot tar.gz under its active lease. The archive is stored
-// under the server data dir (snapshots/<runID>/<jobID>.tar.gz) together
-// with a manifest sidecar; the record is mirrored in memory and persisted
-// through SnapshotStore in DB mode.
+// workspace snapshot tar.gz under its active lease. In memory mode the
+// archive is stored under the server data dir (snapshots/<runID>/<jobID>)
+// with a manifest sidecar and the record lives in the in-memory map. In DB
+// mode the archive bytes go into CAS (content-addressed, digest-addressed
+// for any replica) and the record is persisted through SnapshotStore in the
+// same flow; a record-insertion failure fails the upload (503) instead of
+// logging, and the in-memory map is not the source of truth.
 func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
-	if s.store == nil {
-		http.Error(w, "snapshot storage requires persistent server", http.StatusServiceUnavailable)
-		return
-	}
 	jobID := r.PathValue("id")
 	runnerID := r.Header.Get("X-Kiwi-Runner-ID")
 	token := r.Header.Get("X-Kiwi-Lease-Token")
@@ -44,6 +44,18 @@ func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 	if !s.validActiveLease(j, runnerID, token, gen, now) {
 		http.Error(w, "stale or invalid lease", http.StatusConflict)
+		return
+	}
+	if s.DB != nil {
+		if s.CAS == nil {
+			http.Error(w, "snapshot storage requires a CAS blob store in DB mode", http.StatusServiceUnavailable)
+			return
+		}
+		s.uploadSnapshotDB(w, r, j, runnerID)
+		return
+	}
+	if s.store == nil {
+		http.Error(w, "snapshot storage requires persistent server", http.StatusServiceUnavailable)
 		return
 	}
 	dir := filepath.Join(s.store.Root, "snapshots", j.RunID, j.ID)
@@ -111,21 +123,95 @@ func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	s.snapshots[id] = rec
-	s.auditLocked("snapshot.uploaded", runnerID, j.RunID, j.ID, "workspace snapshot uploaded", map[string]string{"sha256": rec.SHA256})
 	s.mu.Unlock()
-	if s.DB != nil {
-		if ss, ok := s.DB.(storage.SnapshotStore); ok {
-			if err := ss.InsertSnapshotRecord(r.Context(), rec); err != nil {
-				s.logError("snapshot record insert failed", "snapshot", id, "error", err.Error())
-			}
-		}
+	// The audit trail records the digest, never the archive contents.
+	s.auditLocked("snapshot.uploaded", runnerID, j.RunID, j.ID, "workspace snapshot uploaded", map[string]string{"sha256": rec.SHA256})
+	writeJSON(w, http.StatusCreated, redactSnapshot(rec))
+}
+
+// uploadSnapshotDB is the DB-mode upload: the archive bytes are stored in
+// CAS and the record is inserted through SnapshotStore in the same flow.
+// Insertion failure fails the upload (503) and removes the orphaned CAS
+// blob; a CAS failure fails the upload (503). The record's Path is the
+// cas:<digest> reference, so any replica resolves the archive by digest.
+func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j model.Job, runnerID string) {
+	ctx := r.Context()
+	tmp, err := os.CreateTemp("", "kiwi-snapshot-*")
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
 	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	defer tmp.Close()
+	h := sha256.New()
+	n, copyErr := io.Copy(io.MultiWriter(tmp, h), http.MaxBytesReader(w, r.Body, maxBlobBytes))
+	if err := firstErr(copyErr); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	m, err := snapshot.Parse(tmp)
+	if err != nil {
+		http.Error(w, "invalid snapshot archive: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	id, err := newID()
+	if err != nil {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	obj, err := s.CAS.Put(ctx, tmp)
+	if err != nil {
+		http.Error(w, "snapshot storage failed", http.StatusServiceUnavailable)
+		return
+	}
+	rec := model.SnapshotRecord{
+		ID:         id,
+		RunID:      j.RunID,
+		JobID:      j.ID,
+		JobKey:     j.Key,
+		Path:       "cas:" + obj.SHA256,
+		Size:       n,
+		SHA256:     obj.SHA256,
+		Version:    m.Version,
+		RootSHA256: m.RootSHA256,
+		CreatedAt:  time.Now().UTC(),
+	}
+	for _, e := range m.Entries {
+		rec.Entries = append(rec.Entries, model.SnapshotEntry{Path: e.Path, Mode: e.Mode, Size: e.Size, SHA256: e.SHA256})
+	}
+	ss, ok := s.DB.(storage.SnapshotStore)
+	if !ok {
+		_ = s.CAS.Delete(ctx, obj.SHA256)
+		http.Error(w, "snapshot record storage unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if err := ss.InsertSnapshotRecord(ctx, rec); err != nil {
+		// Fail the upload instead of logging: a snapshot whose record is
+		// not durable must not be acknowledged. The orphaned CAS blob is
+		// removed again so retries re-put the same digest.
+		if derr := s.CAS.Delete(ctx, obj.SHA256); derr != nil {
+			s.logError("snapshot: CAS cleanup after record failure", "error", derr.Error())
+		}
+		http.Error(w, "snapshot record persistence failed", http.StatusServiceUnavailable)
+		return
+	}
+	s.auditLocked("snapshot.uploaded", runnerID, j.RunID, j.ID, "workspace snapshot uploaded", map[string]string{"sha256": rec.SHA256})
 	writeJSON(w, http.StatusCreated, redactSnapshot(rec))
 }
 
 // listSnapshots is GET /api/v1/runs/{id}/snapshots: the manifests of every
-// snapshot uploaded by the run's jobs. DB mode merges the SQL records with
-// the in-memory copy (which holds the local archive paths).
+// snapshot uploaded by the run's jobs. DB mode reads the SQL records
+// (SnapshotStore) as the single source of truth; memory mode reads the
+// in-memory map.
 func (s *Server) listSnapshots(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
 	s.mu.Lock()
@@ -143,7 +229,6 @@ func (s *Server) listSnapshots(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		out := []model.SnapshotRecord{}
-		seen := map[string]bool{}
 		if ss, ok := s.DB.(storage.SnapshotStore); ok {
 			recs, err := ss.ListSnapshotsByRun(r.Context(), runID)
 			if err != nil {
@@ -151,15 +236,6 @@ func (s *Server) listSnapshots(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			for _, rec := range recs {
-				if cur, ok := s.snapshots[rec.ID]; ok {
-					rec.Path = cur.Path
-				}
-				out = append(out, redactSnapshot(rec))
-				seen[rec.ID] = true
-			}
-		}
-		for _, rec := range s.snapshots {
-			if rec.RunID == runID && !seen[rec.ID] {
 				out = append(out, redactSnapshot(rec))
 			}
 		}
@@ -187,7 +263,13 @@ func (s *Server) listSnapshots(w http.ResponseWriter, r *http.Request) {
 
 // downloadSnapshot is GET /api/v1/runs/{id}/snapshots/{sid}: streams one
 // uploaded workspace snapshot archive for replay/debugging (admin tier).
+// DB mode resolves the record through SnapshotStore and the bytes from CAS
+// by digest (any replica); memory mode streams the node-local archive.
 func (s *Server) downloadSnapshot(w http.ResponseWriter, r *http.Request) {
+	if s.DB != nil {
+		s.downloadSnapshotDB(w, r)
+		return
+	}
 	sid := r.PathValue("sid")
 	s.mu.Lock()
 	rec, ok := s.snapshots[sid]
@@ -220,6 +302,84 @@ func (s *Server) downloadSnapshot(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.Copy(w, f); err != nil {
 		s.logf("snapshot download: %v", err)
 	}
+}
+
+// downloadSnapshotDB streams one snapshot in DB mode: the record comes
+// from the SnapshotStore (not the in-memory map) and the archive bytes
+// from CAS by digest, so a fresh replica with the same store+CAS serves
+// the download. Records with a node-local Path (legacy) fall back to the
+// local file.
+func (s *Server) downloadSnapshotDB(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	runID := r.PathValue("id")
+	sid := r.PathValue("sid")
+	run, err := s.DB.GetRun(ctx, runID)
+	if errors.Is(err, storage.ErrNotFound) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if !s.requireRunRead(w, r, run) {
+		return
+	}
+	ss, ok := s.DB.(storage.SnapshotStore)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	recs, err := ss.ListSnapshotsByRun(ctx, runID)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	var rec model.SnapshotRecord
+	found := false
+	for _, c := range recs {
+		if c.ID == sid {
+			rec = c
+			found = true
+			break
+		}
+	}
+	if !found {
+		http.NotFound(w, r)
+		return
+	}
+	if strings.HasPrefix(rec.Path, "cas:") {
+		digest := strings.TrimPrefix(rec.Path, "cas:")
+		rc, obj, err := s.CAS.Open(ctx, digest)
+		if err != nil {
+			http.Error(w, "snapshot archive missing", http.StatusNotFound)
+			return
+		}
+		defer rc.Close()
+		w.Header().Set("Content-Type", "application/gzip")
+		w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
+		w.Header().Set("X-Kiwi-Snapshot-SHA256", digest)
+		if _, err := io.Copy(w, rc); err != nil {
+			s.logf("snapshot download: %v", err)
+		}
+		return
+	}
+	if rec.Path != "" {
+		f, err := os.Open(rec.Path)
+		if err != nil {
+			http.Error(w, "snapshot archive missing", http.StatusNotFound)
+			return
+		}
+		defer f.Close()
+		w.Header().Set("Content-Type", "application/gzip")
+		w.Header().Set("Content-Length", strconv.FormatInt(rec.Size, 10))
+		w.Header().Set("X-Kiwi-Snapshot-SHA256", rec.SHA256)
+		if _, err := io.Copy(w, f); err != nil {
+			s.logf("snapshot download: %v", err)
+		}
+		return
+	}
+	http.NotFound(w, r)
 }
 
 // redactSnapshot strips the server-local archive path before a record

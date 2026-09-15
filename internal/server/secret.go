@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secretbroker"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
@@ -44,7 +45,11 @@ type SecretResponse struct {
 const secretAADPrefix = "kiwi-secret-v1\x00"
 
 // secretReceiptsFile is the durable one-time delivery receipt file under
-// dataDir (both dev and DB mode; the value never leaves the broker).
+// dataDir in MEMORY mode (dev/local deployments). The receipt set is
+// data-dir state: a server restarted on the same dataDir refuses replays of
+// already-delivered secrets. In DB mode the once-only record is the SQL
+// secret_claims table (storage.SecretClaimStore) instead; the value never
+// leaves the broker.
 const secretReceiptsFile = "secrets-receipts.json"
 
 // secretAAD renders the authenticated data for a delivery.
@@ -87,44 +92,49 @@ func (s *Server) loadSecretReceipts(dataDir string) error {
 }
 
 // persistSecretReceiptsLocked atomically writes the receipt set to dataDir.
-// The caller must hold s.mu.
-func (s *Server) persistSecretReceiptsLocked() {
+// The caller must hold s.mu. A write failure is returned so callers fail
+// closed: a delivery whose receipt cannot be persisted is refused.
+func (s *Server) persistSecretReceiptsLocked() error {
 	if s.dataDir == "" {
-		return
+		return nil
 	}
 	keys := make([]string, 0, len(s.secretReceipts))
 	for k := range s.secretReceipts {
 		keys = append(keys, k)
 	}
-	if err := marshalJSONFile(filepath.Join(s.dataDir, secretReceiptsFile), keys); err != nil {
-		s.logError("secret receipts: persist failed", "error", err.Error())
-	}
+	return marshalJSONFile(filepath.Join(s.dataDir, secretReceiptsFile), keys)
 }
 
 // markSecretDelivered records the delivery receipt durably. It reports
-// false when the receipt already existed (replay).
-func (s *Server) markSecretDelivered(key string) bool {
+// false when the receipt already existed (replay); a non-nil error means
+// the receipt could not be persisted and the delivery must fail closed.
+func (s *Server) markSecretDelivered(key string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.secretReceipts == nil {
 		s.secretReceipts = map[string]bool{}
 	}
 	if s.secretReceipts[key] {
-		return false
+		return false, nil
 	}
 	s.secretReceipts[key] = true
-	s.persistSecretReceiptsLocked()
-	return true
+	if err := s.persistSecretReceiptsLocked(); err != nil {
+		// Roll the in-memory mark back so the delivery can be retried once
+		// the data dir is healthy again.
+		delete(s.secretReceipts, key)
+		return false, err
+	}
+	return true, nil
 }
 
 // releaseSecretReceipt removes a receipt recorded for a delivery whose
 // resolution subsequently failed, so a failed resolution never consumes the
-// delivery.
-func (s *Server) releaseSecretReceipt(key string) {
+// delivery. A persistence failure is returned so the caller fails closed.
+func (s *Server) releaseSecretReceipt(key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.secretReceipts, key)
-	s.persistSecretReceiptsLocked()
+	return s.persistSecretReceiptsLocked()
 }
 
 // resolveBroker resolves a secret through the configured broker. A OneTime
@@ -174,8 +184,12 @@ func declaredSecrets(spec *pipeline.Spec, job pipeline.Job) []string {
 // active lease, sealed with an ephemeral X25519 key the runner just minted.
 // The value never reaches server logs, audit records, or persistence. The
 // durable delivery receipt is server-owned and keyed by (jobID, generation,
-// secret name): replaying the same delivery conflicts (409), and the sealed
-// envelope is bound to the delivery context via AEAD authenticated data.
+// secret name): in DB mode it is the SQL secret_claims row claimed through
+// storage.SecretClaimStore BEFORE the broker is resolved (claim-first), and
+// in memory mode it is the secrets-receipts.json file under dataDir. A
+// replayed delivery conflicts (409); a claim/persistence failure fails
+// closed (503/500) without ever returning an envelope. The sealed envelope
+// is bound to the delivery context via AEAD authenticated data.
 func (s *Server) issueSecret(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("id")
 	var in SecretRequest
@@ -210,18 +224,67 @@ func (s *Server) issueSecret(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "secret broker not configured", http.StatusServiceUnavailable)
 		return
 	}
-	// The server-owned receipt is the once-only record: the same (job,
-	// lease generation, secret) is delivered exactly once, even across
-	// control-plane restarts.
 	receiptKey := secretReceiptKey(jobID, in.LeaseGeneration, in.Name)
-	if !s.markSecretDelivered(receiptKey) {
+	if s.DB != nil {
+		// DB mode: the durable once-only record is the SQL claim row.
+		// Claim FIRST: exactly one of concurrent or replayed deliveries of
+		// the same (job, generation, name) wins, and only a successful
+		// durable claim can return the sealed envelope. Claim errors fail
+		// closed (503): an envelope is never delivered without a durable
+		// claim.
+		cs, ok := s.DB.(storage.SecretClaimStore)
+		if !ok {
+			http.Error(w, "secret delivery claims unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		claimed, err := cs.ClaimSecretDelivery(r.Context(), jobID, in.LeaseGeneration, in.Name)
+		if err != nil {
+			http.Error(w, "secret delivery claim failed", http.StatusServiceUnavailable)
+			return
+		}
+		if !claimed {
+			http.Error(w, "secret already delivered for this lease generation", http.StatusConflict)
+			return
+		}
+		s.deliverSecret(w, r, j, in, jobID, true)
+		return
+	}
+	// Memory mode: the receipt file under dataDir is the once-only record.
+	// A persistence failure fails closed (500): no delivery state, no
+	// envelope — never log-and-continue for delivery state.
+	claimed, err := s.markSecretDelivered(receiptKey)
+	if err != nil {
+		http.Error(w, "secret delivery receipt persistence failed", http.StatusInternalServerError)
+		return
+	}
+	if !claimed {
 		http.Error(w, "secret already delivered for this lease generation", http.StatusConflict)
 		return
 	}
+	s.deliverSecret(w, r, j, in, jobID, false)
+}
+
+// deliverSecret resolves the broker, seals the value for the runner's
+// ephemeral key, and writes the response for an already-claimed delivery.
+// Any post-claim failure releases the claim (SQL row or memory receipt) so
+// a failed resolution never consumes the once-only delivery.
+func (s *Server) deliverSecret(w http.ResponseWriter, r *http.Request, j model.Job, in SecretRequest, jobID string, dbClaimed bool) {
+	release := func() {
+		if dbClaimed {
+			if rel, ok := s.DB.(storage.SecretClaimReleaser); ok {
+				if err := rel.ReleaseSecretDelivery(r.Context(), jobID, in.LeaseGeneration, in.Name); err != nil {
+					s.logError("secret delivery: claim release failed", "error", err.Error())
+				}
+			}
+			return
+		}
+		if err := s.releaseSecretReceipt(secretReceiptKey(jobID, in.LeaseGeneration, in.Name)); err != nil {
+			s.logError("secret receipts: release persist failed", "error", err.Error())
+		}
+	}
 	value, err := s.resolveBroker(r, in.Name, secretbroker.SecretScope{Repository: j.RepoURL, Environment: j.Environment, Trusted: j.Trusted})
 	if err != nil {
-		// A failed resolution does not consume the delivery.
-		s.releaseSecretReceipt(receiptKey)
+		release()
 		if errors.Is(err, secretbroker.ErrAlreadyDelivered) {
 			http.Error(w, "secret already delivered", http.StatusConflict)
 			return
@@ -231,7 +294,7 @@ func (s *Server) issueSecret(w http.ResponseWriter, r *http.Request) {
 	}
 	pubRaw, err := base64.StdEncoding.DecodeString(in.EphemeralPublic)
 	if err != nil || len(pubRaw) != 32 {
-		s.releaseSecretReceipt(receiptKey)
+		release()
 		http.Error(w, "invalid ephemeral_public: want base64-encoded 32 bytes", http.StatusBadRequest)
 		return
 	}
@@ -240,7 +303,7 @@ func (s *Server) issueSecret(w http.ResponseWriter, r *http.Request) {
 	aad := secretAAD(in.RunnerID, jobID, in.LeaseGeneration, in.Name)
 	enc, err := secretbroker.SealEnvelope([]byte(value), pub, aad)
 	if err != nil {
-		s.releaseSecretReceipt(receiptKey)
+		release()
 		http.Error(w, "sealing secret failed", http.StatusInternalServerError)
 		return
 	}

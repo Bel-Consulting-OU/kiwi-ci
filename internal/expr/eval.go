@@ -12,6 +12,14 @@ import (
 	"strings"
 )
 
+// hashFiles hashing bounds: a total content budget (streamed, error on
+// overflow) and a matched-file count cap, both hard bounds against
+// workspace-exhausting cache keys.
+const (
+	hashFilesMaxBytes = 64 << 20
+	hashFilesMaxFiles = 4096
+)
+
 // EvalString interpolates a text containing ${{ ... }} holes. Text outside
 // holes is copied verbatim; each hole is parsed and evaluated against the
 // context, and the resulting string replaces the hole. Parse errors (unknown
@@ -194,10 +202,26 @@ func jsonFunc(name string, arg Expr, c Context) (string, error) {
 // content, mirroring cache.Key, and returns the first 12 hex characters of
 // the SHA-256 digest, like GitHub Actions. An empty workspace, a bad glob or
 // an unreadable file is an evaluation error. The result is deterministic.
+//
+// Confinement bounds: every pattern is canonicalized (Abs + Clean) and
+// absolute patterns or patterns with ".." components are rejected; every
+// glob match must resolve beneath the workspace (matches that escape it
+// through symlinks are rejected); matches are deduplicated; at most
+// hashFilesMaxFiles files and hashFilesMaxBytes total content are hashed,
+// streamed through a shared budget that errors on overflow.
 func hashFilesFunc(c Context, args []Expr) (string, error) {
 	if strings.TrimSpace(c.Workspace) == "" {
 		return "", fmt.Errorf("hashFiles: workspace is not set")
 	}
+	workspace, err := filepath.Abs(c.Workspace)
+	if err != nil {
+		return "", fmt.Errorf("hashFiles: workspace %q: %w", c.Workspace, err)
+	}
+	workspace, err = filepath.EvalSymlinks(workspace)
+	if err != nil {
+		return "", fmt.Errorf("hashFiles: workspace %q: %w", c.Workspace, err)
+	}
+	workspace = filepath.Clean(workspace)
 	var globs []string
 	for _, a := range args {
 		v, err := a.Eval(c)
@@ -211,26 +235,58 @@ func hashFilesFunc(c Context, args []Expr) (string, error) {
 		}
 	}
 	var files []string
+	seen := map[string]bool{}
 	for _, g := range globs {
-		matches, err := filepath.Glob(filepath.Join(c.Workspace, g))
+		if filepath.IsAbs(g) || strings.HasPrefix(g, "/") {
+			return "", fmt.Errorf("hashFiles: absolute pattern %q is not allowed", g)
+		}
+		for _, part := range strings.FieldsFunc(g, func(r rune) bool { return r == '/' || r == '\\' }) {
+			if part == ".." {
+				return "", fmt.Errorf("hashFiles: pattern %q contains a .. component", g)
+			}
+		}
+		full := filepath.Clean(filepath.Join(workspace, g))
+		matches, err := filepath.Glob(full)
 		if err != nil {
 			return "", fmt.Errorf("hashFiles: invalid glob %q: %w", g, err)
 		}
-		files = append(files, matches...)
+		for _, f := range matches {
+			if seen[f] {
+				continue
+			}
+			seen[f] = true
+			files = append(files, f)
+		}
+	}
+	if len(files) > hashFilesMaxFiles {
+		return "", fmt.Errorf("hashFiles: %d files matched, limit is %d", len(files), hashFilesMaxFiles)
 	}
 	sort.Strings(files)
 	h := sha256.New()
+	remaining := int64(hashFilesMaxBytes)
 	for _, f := range files {
-		b, err := os.ReadFile(f)
+		resolved, err := filepath.EvalSymlinks(f)
 		if err != nil {
 			return "", fmt.Errorf("hashFiles: %w", err)
 		}
-		rel, err := filepath.Rel(c.Workspace, f)
-		if err != nil {
-			rel = f
+		rel, err := filepath.Rel(workspace, resolved)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return "", fmt.Errorf("hashFiles: match %q escapes the workspace", f)
 		}
 		io.WriteString(h, rel)
-		h.Write(b)
+		fh, err := os.Open(f)
+		if err != nil {
+			return "", fmt.Errorf("hashFiles: %w", err)
+		}
+		n, err := io.Copy(h, io.LimitReader(fh, remaining+1))
+		fh.Close()
+		if err != nil {
+			return "", fmt.Errorf("hashFiles: %w", err)
+		}
+		if n > remaining {
+			return "", fmt.Errorf("hashFiles: total size exceeds the %d byte budget", int64(hashFilesMaxBytes))
+		}
+		remaining -= n
 	}
 	return hex.EncodeToString(h.Sum(nil))[:12], nil
 }

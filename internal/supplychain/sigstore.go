@@ -51,15 +51,50 @@ type VerifyOptions struct {
 	Ref        string
 }
 
+// SigstoreTrustRoot is the operator-configured trust material Sigstore
+// bundle verification is anchored in. A bundle can never be its own trust
+// root: verification fails closed unless at least one of Keys or Rekor is
+// configured and satisfied.
+type SigstoreTrustRoot struct {
+	// Keys pins the only acceptable verification keys, keyed by key ID
+	// (the DSSE signature keyid). When non-empty, the bundle's
+	// verification key must match one of these pins, either by key ID or
+	// by key content.
+	Keys map[string]ed25519.PublicKey
+	// Rekor, when non-nil, requires every bundle to carry a log entry
+	// that passes transparency-log inclusion verification (the signed
+	// entry timestamp). A key is never trusted merely because it appears
+	// in the log.
+	Rekor *RekorConfig
+}
+
+// RekorConfig configures inclusion verification against a
+// Rekor-compatible transparency log.
+type RekorConfig struct {
+	// PublicKey is the log's Ed25519 key that verifies signed entry
+	// timestamps.
+	PublicKey ed25519.PublicKey
+	// BaseURL is the log's HTTPS base URL. Log entries are fetched from
+	// {BaseURL}/api/v1/log/entries/{uuid} over strict HTTPS without
+	// following redirects, with responses bounded at 1 MiB.
+	BaseURL string
+}
+
 // SigstoreVerifyConfig is the verification gate configuration for Sigstore
-// bundles: every non-empty expectation must match, and TrustedKey pins the
-// only acceptable verification key.
+// bundles: every non-empty expectation must match, and TrustRoot anchors
+// the only acceptable verification key and transparency log.
 type SigstoreVerifyConfig struct {
 	ExpectedIssuer   string
 	ExpectedIdentity string
 	ExpectedRepo     string
 	ExpectedRef      string
-	TrustedKey       ed25519.PublicKey
+	// TrustedKey is a legacy single-key pin; it is honored only when
+	// TrustRoot.Keys is empty and is otherwise equivalent to pinning one
+	// key by content.
+	TrustedKey ed25519.PublicKey
+	// TrustRoot is the verification trust anchor. When neither Keys nor
+	// Rekor are configured, verification fails closed.
+	TrustRoot SigstoreTrustRoot
 }
 
 type Statement struct {
@@ -191,17 +226,20 @@ type bundlePublicKey struct {
 }
 
 type bundleLogEntry struct {
+	UUID           string `json:"uuid"`
 	IntegratedTime int64  `json:"integratedTime"`
 	BodyHash       string `json:"bodyHash"`
 }
 
-// VerifySigstoreBundle strictly parses a Sigstore bundle (DSSE envelope plus
-// verification material). The envelope signature must verify against the
-// configured trusted key or the key embedded in the bundle, the statement
-// digest must match artifactDigest, every non-empty expectation must match,
-// and any log entries must carry an integratedTime and a body hash equal to
-// the SHA-256 of the statement payload. Any parse inconsistency fails the
-// verification.
+// VerifySigstoreBundle strictly parses a Sigstore bundle (DSSE envelope
+// plus verification material) and verifies it against the configured
+// trust root. The envelope signature must verify against a pinned trust
+// key (or, only when Rekor inclusion verification is configured and
+// passes, the key embedded in the bundle), the statement digest must match
+// artifactDigest, and every non-empty expectation must match. A bundle
+// carrying log entries cannot be verified without a configured Rekor log.
+// Without any configured trust root, verification fails closed. Any parse
+// inconsistency fails the verification.
 func VerifySigstoreBundle(bundle []byte, artifactDigest string, verifyCfg SigstoreVerifyConfig) error {
 	if len(bundle) > maxEnvelopeBytes {
 		return fmt.Errorf("supplychain: bundle exceeds %d byte limit", maxEnvelopeBytes)
@@ -235,13 +273,33 @@ func VerifySigstoreBundle(bundle []byte, artifactDigest string, verifyCfg Sigsto
 	if err != nil {
 		return fmt.Errorf("supplychain: decode signature: %w", err)
 	}
-	var pub ed25519.PublicKey
-	if len(verifyCfg.TrustedKey) > 0 {
-		pub = verifyCfg.TrustedKey
-	} else {
-		if b.VerificationMaterial.PublicKey == nil || b.VerificationMaterial.PublicKey.RawBytes == "" {
-			return fmt.Errorf("supplychain: bundle has no verification key")
+
+	// Trust-root resolution: the pinned keys are the primary anchor; the
+	// legacy single-key pin is honored only when no key map is configured.
+	keys := verifyCfg.TrustRoot.Keys
+	if len(keys) == 0 && len(verifyCfg.TrustedKey) > 0 {
+		keys = map[string]ed25519.PublicKey{"": verifyCfg.TrustedKey}
+	}
+	rekor := verifyCfg.TrustRoot.Rekor
+	if len(keys) == 0 && rekor == nil {
+		return fmt.Errorf("supplychain: no sigstore trust root configured")
+	}
+	for id, pk := range keys {
+		if len(pk) != ed25519.PublicKeySize {
+			return fmt.Errorf("supplychain: invalid pinned trust key %q", id)
 		}
+	}
+	if rekor != nil {
+		if len(rekor.PublicKey) != ed25519.PublicKeySize {
+			return fmt.Errorf("supplychain: invalid Rekor public key")
+		}
+		if rekor.BaseURL == "" {
+			return fmt.Errorf("supplychain: Rekor base URL is not configured")
+		}
+	}
+
+	var bundlePub ed25519.PublicKey
+	if b.VerificationMaterial.PublicKey != nil && b.VerificationMaterial.PublicKey.RawBytes != "" {
 		raw, derr := base64.StdEncoding.DecodeString(b.VerificationMaterial.PublicKey.RawBytes)
 		if derr != nil {
 			return fmt.Errorf("supplychain: decode embedded key: %w", derr)
@@ -249,7 +307,23 @@ func VerifySigstoreBundle(bundle []byte, artifactDigest string, verifyCfg Sigsto
 		if len(raw) != ed25519.PublicKeySize {
 			return fmt.Errorf("supplychain: embedded key is not Ed25519")
 		}
-		pub = ed25519.PublicKey(raw)
+		bundlePub = ed25519.PublicKey(raw)
+	}
+	keyID := env.Signatures[0].KeyID
+	var pub ed25519.PublicKey
+	if len(keys) > 0 {
+		pub, err = pinnedVerificationKey(keys, keyID, bundlePub)
+		if err != nil {
+			return err
+		}
+	} else {
+		// Rekor-only trust root: the embedded key verifies the envelope
+		// but is never a trust root by itself — acceptance additionally
+		// requires a valid inclusion proof below.
+		if bundlePub == nil {
+			return fmt.Errorf("supplychain: bundle has no verification key and no pinned trust keys")
+		}
+		pub = bundlePub
 	}
 	if !ed25519.Verify(pub, pae(env.PayloadType, payload), sig) {
 		return fmt.Errorf("supplychain: invalid attestation signature")
@@ -270,23 +344,59 @@ func VerifySigstoreBundle(bundle []byte, artifactDigest string, verifyCfg Sigsto
 	if len(b.VerificationMaterial.LogEntries) > maxLogEntries {
 		return fmt.Errorf("supplychain: bundle has %d log entries, limit is %d", len(b.VerificationMaterial.LogEntries), maxLogEntries)
 	}
-	sum := sha256.Sum256(payload)
-	for _, le := range b.VerificationMaterial.LogEntries {
-		if le.IntegratedTime <= 0 {
-			return fmt.Errorf("supplychain: log entry missing integratedTime")
+	if rekor != nil {
+		if len(b.VerificationMaterial.LogEntries) == 0 {
+			return fmt.Errorf("supplychain: bundle has no log entry: Rekor inclusion verification is required")
 		}
-		if le.BodyHash == "" {
-			return fmt.Errorf("supplychain: log entry missing body hash")
+		payloadSum := sha256.Sum256(payload)
+		for _, le := range b.VerificationMaterial.LogEntries {
+			if le.UUID == "" {
+				return fmt.Errorf("supplychain: log entry missing uuid")
+			}
+			if le.IntegratedTime <= 0 {
+				return fmt.Errorf("supplychain: log entry missing integratedTime")
+			}
+			if le.BodyHash == "" {
+				return fmt.Errorf("supplychain: log entry missing body hash")
+			}
+			bodyHash, derr := base64.StdEncoding.DecodeString(le.BodyHash)
+			if derr != nil {
+				return fmt.Errorf("supplychain: decode log entry body hash: %w", derr)
+			}
+			if !bytes.Equal(bodyHash, payloadSum[:]) {
+				return fmt.Errorf("supplychain: log entry body hash does not match the statement payload")
+			}
+			if verr := verifyRekorInclusion(*rekor, le.UUID, bodyHash, le.IntegratedTime); verr != nil {
+				return verr
+			}
 		}
-		bodyHash, derr := base64.StdEncoding.DecodeString(le.BodyHash)
-		if derr != nil {
-			return fmt.Errorf("supplychain: decode log entry body hash: %w", derr)
-		}
-		if !bytes.Equal(bodyHash, sum[:]) {
-			return fmt.Errorf("supplychain: log entry body hash mismatch")
-		}
+	} else if len(b.VerificationMaterial.LogEntries) > 0 {
+		return fmt.Errorf("supplychain: bundle log entries cannot be verified: no Rekor trust root configured")
 	}
 	return nil
+}
+
+// pinnedVerificationKey resolves the bundle's verification key against the
+// pinned trust keys. A match is accepted either by key ID (the DSSE
+// signature keyid naming a pinned key) or by key content; when the bundle
+// also embeds key material, it must be consistent with the matched pin.
+func pinnedVerificationKey(keys map[string]ed25519.PublicKey, keyID string, bundlePub ed25519.PublicKey) (ed25519.PublicKey, error) {
+	if keyID != "" {
+		if pk, ok := keys[keyID]; ok {
+			if bundlePub != nil && !bytes.Equal(bundlePub, pk) {
+				return nil, fmt.Errorf("supplychain: embedded key does not match pinned key %q", keyID)
+			}
+			return pk, nil
+		}
+	}
+	if bundlePub != nil {
+		for _, pk := range keys {
+			if bytes.Equal(pk, bundlePub) {
+				return pk, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("supplychain: verification key is not a pinned trust key")
 }
 
 func parseEnvelope(envelope []byte) (*dsseEnvelope, []byte, error) {

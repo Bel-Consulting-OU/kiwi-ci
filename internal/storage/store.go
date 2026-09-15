@@ -32,6 +32,13 @@ var (
 	// already claimed by a different run inside InsertCompiledRun; the
 	// whole enqueue rolled back.
 	ErrScheduleClaimLost = errors.New("storage: schedule occurrence claimed by another run")
+	// ErrRequiredArtifactMissing means a successful job completion was
+	// rolled back inside CompleteJob because the job's artifact contracts
+	// declare a Required artifact with no matching artifact row yet. The
+	// job stays running (not terminal) so the runner can upload the
+	// artifact and retry the completion. The wrapped message names the
+	// missing artifact.
+	ErrRequiredArtifactMissing = errors.New("storage: required artifact missing")
 )
 
 // QuotaExceededError is returned by quota admission inside InsertCompiledRun
@@ -426,6 +433,25 @@ type CacheManifestStore interface {
 // values are written.
 type ArtifactSidecarStore interface {
 	SetArtifactSidecars(ctx context.Context, id, sbomPath, sbomSHA256, sigstorePath, sigstoreSHA256 string) error
+}
+
+// SecretClaimStore is the durable once-only secret delivery claim contract
+// (SQL mode). ClaimSecretDelivery reserves the (job, lease generation,
+// secret name) triple with INSERT ... ON CONFLICT DO NOTHING and reports
+// whether this call made the claim; only a true result authorizes the
+// caller to deliver the sealed value. A replayed or concurrent delivery of
+// the same triple reports false. Errors are returned for persistence
+// failures and must fail closed (no envelope is ever delivered without a
+// durable claim).
+type SecretClaimStore interface {
+	ClaimSecretDelivery(ctx context.Context, jobID string, generation int64, secretName string) (bool, error)
+}
+
+// SecretClaimReleaser optionally releases a claimed secret delivery whose
+// resolution subsequently failed, so a failed resolution never consumes the
+// once-only claim.
+type SecretClaimReleaser interface {
+	ReleaseSecretDelivery(ctx context.Context, jobID string, generation int64, secretName string) error
 }
 
 // ValidateID checks the canonical control-plane identifier format produced

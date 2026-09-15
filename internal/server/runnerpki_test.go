@@ -121,7 +121,7 @@ func TestEnrollEndpoint(t *testing.T) {
 	}
 }
 
-func TestEnrollRejectsIdentityMismatch(t *testing.T) {
+func TestEnrollSynthesizesServerIdentity(t *testing.T) {
 	ca, err := runnerpki.NewCA("test ca", time.Hour)
 	if err != nil {
 		t.Fatal(err)
@@ -129,13 +129,28 @@ func TestEnrollRejectsIdentityMismatch(t *testing.T) {
 	s := New("runner-token")
 	s.RunnerCA = ca
 	s.RunnerEnrollToken = "enroll-secret"
+	// The CSR claims a different identity: the server must ignore the
+	// requester-controlled CSR identity entirely and sign the identity
+	// authenticated by the enroll request.
 	_, csrPEM, err := runnerpki.GenerateKeyAndCSR("runner-43")
 	if err != nil {
 		t.Fatal(err)
 	}
 	body := EnrollRequest{RunnerID: "runner-42", CSR: base64.StdEncoding.EncodeToString(csrPEM)}
-	if w := pkiRequest(t, s.Handler(), http.MethodPost, "/api/v1/runners/enroll", body, "enroll-secret", nil); w.Code != http.StatusBadRequest {
-		t.Fatalf("CN mismatch: %d %s", w.Code, w.Body.String())
+	w := pkiRequest(t, s.Handler(), http.MethodPost, "/api/v1/runners/enroll", body, "enroll-secret", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("enroll with mismatched CSR identity: %d %s", w.Code, w.Body.String())
+	}
+	var out EnrollResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.RunnerID != "runner-42" {
+		t.Fatalf("response runner_id = %q, want server-synthesized runner-42", out.RunnerID)
+	}
+	cert := pkiParseCert(t, []byte(out.Certificate))
+	if cert.Subject.CommonName != "runner-42" {
+		t.Fatalf("cert CN = %q, want runner-42 (CSR identity discarded)", cert.Subject.CommonName)
 	}
 }
 

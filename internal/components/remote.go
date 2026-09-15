@@ -15,12 +15,16 @@ import (
 // RemoteRegistry resolves digest-pinned component refs from a remote
 // component registry HTTP API. Transport security is strict: the base URL
 // must be https:// and the client never follows redirects, so bearer
-// credentials cannot leak to another origin.
+// credentials cannot leak to another origin. Registry responses are
+// bounded at 1 MiB.
 type RemoteRegistry struct {
 	BaseURL string
 	Token   string
 	Client  *http.Client
 }
+
+// maxRegistryResponseBytes bounds one registry spec response.
+const maxRegistryResponseBytes = 1 << 20
 
 // NewRemoteRegistry validates the base URL and returns a registry client.
 // http:// base URLs are rejected outright (strict HTTPS).
@@ -80,7 +84,7 @@ func (r *RemoteRegistry) Resolve(ctx context.Context, ref string) (Spec, string,
 		return Spec{}, "", fmt.Errorf("components: registry %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
 	var spec Spec
-	if err := json.NewDecoder(resp.Body).Decode(&spec); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxRegistryResponseBytes)).Decode(&spec); err != nil {
 		return Spec{}, "", fmt.Errorf("components: decode %s: %w", name, err)
 	}
 	digest, err := Digest(spec)

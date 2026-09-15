@@ -37,12 +37,21 @@ type productionConfig struct {
 	TLSCert          string
 	TLSKey           string
 	AllowSharedToken bool
+	// RunnerMTLSEnforced reports whether runner client certificates are
+	// mandatory (runner CA configured and --runner-require-client-certs
+	// not disabled). When enforced, the runner bearer token becomes
+	// optional in production.
+	RunnerMTLSEnforced bool
 }
 
 // validateProductionConfig enforces the production-mode startup contract:
 // a database URL, distinct admin/runner credentials (or an explicit
 // --allow-shared-token), an external URL (the OIDC issuer always serves in
-// production), and TLS. Dev mode has no additional requirements.
+// production), TLS, and a working runner credential. The runner bearer
+// token is a SHARED credential, not a per-runner identity; when an admin
+// token is configured but no runner token, enforced runner mTLS is the
+// only acceptable runner authentication (fail closed). Dev mode has no
+// additional requirements.
 // drainTimeout bounds the graceful drain wait on signal.
 const drainTimeout = 30 * time.Second
 
@@ -126,6 +135,12 @@ func validateProductionConfig(cfg productionConfig) error {
 	if cfg.TLSCert == "" || cfg.TLSKey == "" {
 		return fmt.Errorf("production mode requires --tls-cert and --tls-key")
 	}
+	// Fail closed: an admin token without any runner credential would serve
+	// 503s on every runner route (the server's own fail-closed tier), so
+	// refuse it at startup unless runner mTLS is enforced.
+	if cfg.AdminToken != "" && cfg.RunnerToken == "" && !cfg.RunnerMTLSEnforced {
+		return fmt.Errorf("production mode with an admin token requires --runner-token or enforced runner mTLS (--runner-ca-cert/--runner-ca-key with --runner-require-client-certs)")
+	}
 	return nil
 }
 
@@ -135,7 +150,11 @@ func Server(ctx context.Context, args []string) error {
 	// configuration (CLI > environment > config file > defaults). Only
 	// explicitly set flags override the config.
 	listen := fs.String("listen", "", "listen address (default: \":8080\")")
-	token := fs.String("runner-token", "", "runner/API bearer token")
+	// The runner bearer token is a SHARED credential across all runners,
+	// not a per-runner identity. Production strongly prefers persistent
+	// per-runner mTLS identities (--runner-ca-cert/--runner-ca-key +
+	// enrollment); the control plane fails closed when neither is present.
+	token := fs.String("runner-token", "", "runner bearer token shared by all runners (prefer per-runner mTLS certificates in production)")
 	adminToken := fs.String("admin-token", "", "admin bearer token (defaults to runner token)")
 	webhookSecret := fs.String("github-webhook-secret", "", "GitHub webhook HMAC secret")
 	githubToken := fs.String("github-token", "", "GitHub token for private pipeline fetches")
@@ -144,10 +163,14 @@ func Server(ctx context.Context, args []string) error {
 	externalURL := fs.String("external-url", "", "public base URL (required for OIDC)")
 	tlsCert := fs.String("tls-cert", "", "TLS certificate file (enables HTTPS)")
 	tlsKey := fs.String("tls-key", "", "TLS private key file")
-	runnerCACert := fs.String("runner-ca-cert", "", "runner CA certificate PEM (enables runner certificate enrollment)")
+	runnerCACert := fs.String("runner-ca-cert", "", "runner CA certificate PEM (enables runner certificate enrollment and per-runner mTLS identity)")
 	runnerCAKey := fs.String("runner-ca-key", "", "runner CA private key PEM")
 	runnerEnrollToken := fs.String("runner-enroll-token", "", "token authorizing runner certificate enrollment")
-	runnerRequireClientCerts := fs.Bool("runner-require-client-certs", true, "require runner client certificates at the TLS handshake when a runner CA is configured (default true)")
+	// The shared TLS listener always uses VerifyClientCertIfGiven: the
+	// certificate requirement for runner-tier routes is enforced at the
+	// HTTP authorization layer, keeping admin/forge/enrollment traffic on
+	// the same listener.
+	runnerRequireClientCerts := fs.Bool("runner-require-client-certs", true, "require runner client certificates on runner-tier routes when a runner CA is configured (default true)")
 	clusterKeyDir := fs.String("cluster-key-dir", "", "shared cluster key store directory (HA replicas share signing material); requires --data-dir")
 	databaseURL := fs.String("database-url", "", "PostgreSQL connection URL (wires the durable SQL control plane)")
 	mode := fs.String("mode", "", "server mode: dev (in-memory, default) or production")
@@ -255,14 +278,15 @@ func Server(ctx context.Context, args []string) error {
 		return fmt.Errorf("--tls-cert requires --tls-key")
 	}
 	if err := validateProductionConfig(productionConfig{
-		Mode:             modeV,
-		DatabaseURL:      databaseURLV,
-		RunnerToken:      tokenV,
-		AdminToken:       adminTokenV,
-		ExternalURL:      externalURLV,
-		TLSCert:          tlsCertV,
-		TLSKey:           tlsKeyV,
-		AllowSharedToken: *allowSharedToken,
+		Mode:               modeV,
+		DatabaseURL:        databaseURLV,
+		RunnerToken:        tokenV,
+		AdminToken:         adminTokenV,
+		ExternalURL:        externalURLV,
+		TLSCert:            tlsCertV,
+		TLSKey:             tlsKeyV,
+		AllowSharedToken:   *allowSharedToken,
+		RunnerMTLSEnforced: runnerCACertV != "" && runnerCAKeyV != "" && *runnerRequireClientCerts,
 	}); err != nil {
 		return err
 	}
@@ -366,9 +390,14 @@ func Server(ctx context.Context, args []string) error {
 	if m := cfg.RateLimitMiddleware(); m != nil {
 		srv.RateLimiter = m
 	}
-	if runnerCACertV != "" || runnerCAKeyV != "" {
+	// runner_pki.enabled is authoritative: when enabled, the CA pair is
+	// mandatory at startup (config.Validate already enforces it; this is
+	// the belt-and-braces check for direct flag use). An enroll token
+	// without an explicit pair lets the server persist a generated CA in
+	// the data dir.
+	if cfg.RunnerPKI.Enabled || runnerCACertV != "" || runnerCAKeyV != "" {
 		if runnerCACertV == "" || runnerCAKeyV == "" {
-			return fmt.Errorf("--runner-ca-cert and --runner-ca-key must be set together")
+			return fmt.Errorf("runner_pki enabled requires --runner-ca-cert and --runner-ca-key")
 		}
 		if err := srv.SetRunnerCA(runnerCACertV, runnerCAKeyV); err != nil {
 			return err
@@ -382,9 +411,10 @@ func Server(ctx context.Context, args []string) error {
 		}
 	}
 	// With a runner CA present (configured or enrolled), the TLS listener
-	// verifies runner client certificates against it. Requiring the
-	// certificate is the default; --runner-require-client-certs=false
-	// downgrades to verify-if-given.
+	// verifies runner client certificates against it and runner-tier
+	// routes require the certificate when --runner-require-client-certs
+	// (default) is set. The shared listener itself stays
+	// VerifyClientCertIfGiven so non-runner traffic keeps working.
 	applyRunnerTLSConfig(srv, *runnerRequireClientCerts)
 	// Blob backend wiring: an s3 backend or an explicit data-dir feeds the
 	// server's blob store when the server build provides SetBlobStore.
@@ -478,8 +508,10 @@ func Server(ctx context.Context, args []string) error {
 // applyRunnerTLSConfig populates the server's runner client certificate
 // trust settings from its runner CA: the TLS listener verifies presented
 // client certificates against the CA, and require decides whether the
-// certificate is mandatory at the handshake. Without a runner CA the
-// settings stay untouched (bearer-token mode).
+// certificate is mandatory for runner-tier routes (enforced at the HTTP
+// authorization layer — the shared listener always uses
+// VerifyClientCertIfGiven). Without a runner CA the settings stay
+// untouched (bearer-token mode).
 func applyRunnerTLSConfig(srv *server.Server, require bool) {
 	if srv.RunnerCA == nil {
 		return

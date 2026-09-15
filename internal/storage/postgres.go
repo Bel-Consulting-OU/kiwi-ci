@@ -56,6 +56,8 @@ var (
 	_ QuotaCounterStore     = (*PostgresStore)(nil)
 	_ CacheManifestStore    = (*PostgresStore)(nil)
 	_ ArtifactSidecarStore  = (*PostgresStore)(nil)
+	_ SecretClaimStore      = (*PostgresStore)(nil)
+	_ SecretClaimReleaser   = (*PostgresStore)(nil)
 )
 
 // NewPostgres opens a pool and verifies connectivity.
@@ -993,6 +995,19 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 	if st != model.StatusSuccess && st != model.StatusFailure && st != model.StatusCancelled && st != model.StatusSkipped {
 		st = model.StatusFailure
 	}
+	// Required-artifact verification INSIDE the completion transaction: a
+	// successful completion must have an artifact row for every contract
+	// entry with Required=true. A missing artifact fails closed: the whole
+	// completion rolls back (the job stays running, not terminal) with
+	// ErrRequiredArtifactMissing so the runner can upload the artifact and
+	// retry. A read/decode error also rolls the completion back.
+	if st == model.StatusSuccess {
+		if missing, err := s.requiredArtifactMissingTx(ctx, tx, jobID, payload); err != nil {
+			return err
+		} else if missing != "" {
+			return fmt.Errorf("%w: %s", ErrRequiredArtifactMissing, missing)
+		}
+	}
 	now := time.Now().UTC()
 	j.Status = st
 	j.Error = errMsg
@@ -1040,6 +1055,33 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// requiredArtifactMissingTx checks the completing job's artifact contracts
+// (the payload jsonb key artifact_contracts) against the artifacts table
+// inside the caller's transaction and returns the name of the first
+// Required contract entry without a matching artifact row, or "" when every
+// required artifact is present.
+func (s *PostgresStore) requiredArtifactMissingTx(ctx context.Context, tx pgx.Tx, jobID string, payload []byte) (string, error) {
+	var wrapper struct {
+		ArtifactContracts map[string]ArtifactContract `json:"artifact_contracts"`
+	}
+	if err := json.Unmarshal(payload, &wrapper); err != nil {
+		return "", err
+	}
+	for name, c := range wrapper.ArtifactContracts {
+		if !c.Required {
+			continue
+		}
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM artifacts WHERE job_id=$1 AND name=$2)`, jobID, name).Scan(&exists); err != nil {
+			return "", err
+		}
+		if !exists {
+			return name, nil
+		}
+	}
+	return "", nil
 }
 
 // completeRunnerTx updates the completing runner's counters and drops the
@@ -1597,6 +1639,48 @@ func (s *PostgresStore) ReleaseRunnerJob(ctx context.Context, runnerID, jobID st
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// ---------------------------------------------------------------------------
+// secret delivery claims
+// ---------------------------------------------------------------------------
+
+// ClaimSecretDelivery reserves the (job, generation, secret name) once-only
+// secret delivery claim. The INSERT ... ON CONFLICT DO NOTHING is the
+// arbitration: exactly one concurrent or replayed delivery reports true.
+func (s *PostgresStore) ClaimSecretDelivery(ctx context.Context, jobID string, generation int64, secretName string) (bool, error) {
+	if err := ValidateJobID(jobID); err != nil {
+		return false, err
+	}
+	if generation < 0 {
+		return false, fmt.Errorf("storage: invalid lease generation %d", generation)
+	}
+	if strings.TrimSpace(secretName) == "" {
+		return false, fmt.Errorf("storage: empty secret name")
+	}
+	ct, err := s.pool.Exec(ctx, `INSERT INTO secret_claims (job_id, generation, secret_name) VALUES ($1, $2, $3) ON CONFLICT (job_id, generation, secret_name) DO NOTHING`,
+		jobID, generation, secretName)
+	if err != nil {
+		return false, err
+	}
+	return ct.RowsAffected() == 1, nil
+}
+
+// ReleaseSecretDelivery drops a claim whose resolution failed, so a failed
+// resolution never consumes the once-only delivery.
+func (s *PostgresStore) ReleaseSecretDelivery(ctx context.Context, jobID string, generation int64, secretName string) error {
+	if err := ValidateJobID(jobID); err != nil {
+		return err
+	}
+	if generation < 0 {
+		return fmt.Errorf("storage: invalid lease generation %d", generation)
+	}
+	if strings.TrimSpace(secretName) == "" {
+		return fmt.Errorf("storage: empty secret name")
+	}
+	_, err := s.pool.Exec(ctx, `DELETE FROM secret_claims WHERE job_id=$1 AND generation=$2 AND secret_name=$3`,
+		jobID, generation, secretName)
+	return err
 }
 
 // ---------------------------------------------------------------------------

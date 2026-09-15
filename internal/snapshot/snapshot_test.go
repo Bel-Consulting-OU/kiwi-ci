@@ -4,10 +4,14 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/safefs"
 )
 
 // symlinkArchive builds a tar.gz with a single symlink entry.
@@ -148,5 +152,69 @@ func TestCreateEmptyWorkspace(t *testing.T) {
 	}
 	if len(m.Entries) != 0 {
 		t.Fatalf("empty workspace has %d entries", len(m.Entries))
+	}
+}
+
+func TestParseRejectsOversizedEntry(t *testing.T) {
+	// A tar entry declaring > 1 GiB must be rejected from the header alone,
+	// before its body is read.
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	if err := tw.WriteHeader(&tar.Header{Name: "bomb", Typeflag: tar.TypeReg, Mode: 0o644, Size: 2 << 30}); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = tw.Write([]byte("tiny body"))
+	_ = tw.Close()
+	_ = gz.Close()
+	if _, err := Parse(bytes.NewReader(buf.Bytes())); err == nil {
+		t.Fatal("oversized entry must be rejected")
+	}
+	if _, err := ParseWithLimits(bytes.NewReader(buf.Bytes()), safefs.ExtractLimits{}); err == nil {
+		t.Fatal("oversized entry must be rejected with default limits")
+	}
+}
+
+func TestParseEnforcesEntryCap(t *testing.T) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	for i := 0; i < 5; i++ {
+		if err := tw.WriteHeader(&tar.Header{Name: "f" + string(rune('a'+i)), Typeflag: tar.TypeReg, Mode: 0o644, Size: 1}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = tw.Close()
+	_ = gz.Close()
+	limits := safefs.ExtractLimits{MaxEntries: 3}
+	_, err := ParseWithLimits(bytes.NewReader(buf.Bytes()), limits)
+	if err == nil || !errors.Is(err, safefs.ErrLimits) {
+		t.Fatalf("expected entry-cap rejection, got %v", err)
+	}
+}
+
+func TestParseEnforcesPathBounds(t *testing.T) {
+	mk := func(name string) []byte {
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		tw := tar.NewWriter(gz)
+		if err := tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeReg, Mode: 0o644, Size: 1}); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = tw.Write([]byte("x"))
+		_ = tw.Close()
+		_ = gz.Close()
+		return buf.Bytes()
+	}
+	long := strings.Repeat("a", 2049)
+	if _, err := Parse(bytes.NewReader(mk(long))); err == nil {
+		t.Fatal("over-long path must be rejected")
+	}
+	deep := strings.Repeat("d/", 64) + "f"
+	if _, err := Parse(bytes.NewReader(mk(deep))); err == nil {
+		t.Fatal("over-deep path must be rejected")
 	}
 }

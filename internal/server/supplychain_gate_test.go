@@ -7,7 +7,10 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,11 +47,28 @@ jobs:
       - run: echo hi
 `
 
+const sigstoreOptionalPipeline = `version: 1
+jobs:
+  build:
+    runtime: container
+    artifacts:
+      - name: bin
+        paths:
+          - out/
+        sigstore:
+          issuer: https://token.actions.githubusercontent.com
+          identity: my-identity
+    steps:
+      - run: echo hi
+`
+
 const validSPDX = `{"SPDXID":"SPDXRef-DOCUMENT","spdxVersion":"SPDX-2.3","name":"bin","dataLicense":"CC0-1.0","documentNamespace":"https://kiwi-ci.dev/sbom/x","creationInfo":{"created":"2026-01-01T00:00:00Z","creators":["Tool: kiwi-ci"]},"packages":[{"SPDXID":"SPDXRef-Package-bin","name":"bin","downloadLocation":"NOASSERTION","filesAnalyzed":true}],"files":[]}`
 
 // buildSigstoreBundle crafts a Sigstore bundle attesting digest with the
-// expected issuer/identity claims, embedded key verification material.
-func buildSigstoreBundle(t *testing.T, digest string) []byte {
+// expected issuer/identity claims, embedded key verification material. The
+// generated verification public key is returned so tests can pin it as the
+// server's trust root.
+func buildSigstoreBundle(t *testing.T, digest string) ([]byte, ed25519.PublicKey) {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -80,7 +100,13 @@ func buildSigstoreBundle(t *testing.T, digest string) []byte {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return b
+	return b, pub
+}
+
+// pinSigstoreRoot pins the given verification key under keyID as the
+// server's Sigstore trust root.
+func pinSigstoreRoot(s *Server, keyID string, pub ed25519.PublicKey) {
+	s.SetSigstoreTrustRoot(map[string]ed25519.PublicKey{keyID: pub}, nil, "")
 }
 
 func digestOf(b []byte) string {
@@ -153,12 +179,15 @@ func TestSBOMAndSigstoreGateHappyPath(t *testing.T) {
 	_, jobID, hdrs := seedLeasedArtifactJob(t, s, sigstorePipeline)
 	jobPath := "/api/v1/jobs/" + jobID + "/artifacts/"
 
+	bundle, pub := buildSigstoreBundle(t, digestOf([]byte("other")))
+	pinSigstoreRoot(s, "key-1", pub)
+
 	// The artifact payload is gated on the sigstore bundle.
 	if w := doJSONHeaders(t, s, http.MethodPut, jobPath+"bin", "token", "signed-bytes", hdrs); w.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("missing sigstore = %d, want 422: %s", w.Code, w.Body.String())
 	}
-	// A bundle whose claims do not match the artifact digest is rejected.
-	bundle := buildSigstoreBundle(t, digestOf([]byte("other")))
+	// A bundle attesting a different digest is stored (verification
+	// happens against the payload at gate time).
 	if w := doJSONHeaders(t, s, http.MethodPut, jobPath+"bin.sigstore", "token", string(bundle), hdrs); w.Code != http.StatusCreated {
 		t.Fatalf("sigstore upload = %d: %s", w.Code, w.Body.String())
 	}
@@ -174,10 +203,149 @@ func TestSigstoreRequiredMissingIs422(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinSigstoreRoot(s, "key-1", pub)
 	_, jobID, hdrs := seedLeasedArtifactJob(t, s, sigstorePipeline)
 	w := doJSONHeaders(t, s, http.MethodPut, "/api/v1/jobs/"+jobID+"/artifacts/bin", "token", "payload", hdrs)
 	if w.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("sigstore required missing = %d, want 422: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "required sigstore bundle missing") {
+		t.Fatalf("unexpected rejection reason: %s", w.Body.String())
+	}
+}
+
+func TestSigstoreUploadWithoutTrustRootRejected(t *testing.T) {
+	s, err := NewPersistent("token", "token", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No trust root configured: the upload must fail closed.
+	_, jobID, hdrs := seedLeasedArtifactJob(t, s, sigstorePipeline)
+	bundle, _ := buildSigstoreBundle(t, digestOf([]byte("payload")))
+	w := doJSONHeaders(t, s, http.MethodPut, "/api/v1/jobs/"+jobID+"/artifacts/bin.sigstore", "token", string(bundle), hdrs)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("sigstore upload without trust root = %d, want 422: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "trust root") {
+		t.Fatalf("unexpected rejection reason: %s", w.Body.String())
+	}
+}
+
+func TestSigstoreRequiredArtifactWithoutTrustRootRejected(t *testing.T) {
+	s, err := NewPersistent("token", "token", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, jobID, hdrs := seedLeasedArtifactJob(t, s, sigstorePipeline)
+	w := doJSONHeaders(t, s, http.MethodPut, "/api/v1/jobs/"+jobID+"/artifacts/bin", "token", "payload", hdrs)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("sigstore required without trust root = %d, want 422: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "trust root") {
+		t.Fatalf("unexpected rejection reason: %s", w.Body.String())
+	}
+}
+
+func TestSigstoreUploadPinnedKeyMatchAccepted(t *testing.T) {
+	s, err := NewPersistent("token", "token", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, jobID, hdrs := seedLeasedArtifactJob(t, s, sigstoreOptionalPipeline)
+	jobPath := "/api/v1/jobs/" + jobID + "/artifacts/"
+	if w := doJSONHeaders(t, s, http.MethodPut, jobPath+"bin", "token", "signed-bytes", hdrs); w.Code != http.StatusCreated {
+		t.Fatalf("artifact upload = %d: %s", w.Code, w.Body.String())
+	}
+	bundle, pub := buildSigstoreBundle(t, digestOf([]byte("signed-bytes")))
+	pinSigstoreRoot(s, "key-1", pub)
+	if w := doJSONHeaders(t, s, http.MethodPut, jobPath+"bin.sigstore", "token", string(bundle), hdrs); w.Code != http.StatusCreated {
+		t.Fatalf("pinned-key sigstore upload = %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestSigstoreUploadPinnedKeyMismatchRejected(t *testing.T) {
+	s, err := NewPersistent("token", "token", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinned, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, jobID, hdrs := seedLeasedArtifactJob(t, s, sigstoreOptionalPipeline)
+	jobPath := "/api/v1/jobs/" + jobID + "/artifacts/"
+	if w := doJSONHeaders(t, s, http.MethodPut, jobPath+"bin", "token", "signed-bytes", hdrs); w.Code != http.StatusCreated {
+		t.Fatalf("artifact upload = %d: %s", w.Code, w.Body.String())
+	}
+	// The bundle is signed by a key that is not pinned.
+	bundle, _ := buildSigstoreBundle(t, digestOf([]byte("signed-bytes")))
+	pinSigstoreRoot(s, "pinned-key", pinned)
+	if w := doJSONHeaders(t, s, http.MethodPut, jobPath+"bin.sigstore", "token", string(bundle), hdrs); w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("unpinned-key sigstore upload = %d, want 422: %s", w.Code, w.Body.String())
+	}
+}
+
+// blockingBody yields its data and then blocks forever, so a handler that
+// keeps reading past its size limit hangs instead of returning.
+type blockingBody struct {
+	data  []byte
+	read  int
+	block chan struct{}
+}
+
+func (b *blockingBody) Read(p []byte) (int, error) {
+	if b.read >= len(b.data) {
+		<-b.block
+		return 0, io.EOF
+	}
+	n := copy(p, b.data[b.read:])
+	b.read += n
+	return n, nil
+}
+
+func (b *blockingBody) Close() error {
+	select {
+	case <-b.block:
+	default:
+		close(b.block)
+	}
+	return nil
+}
+
+func TestSigstoreUploadOversizeRejectedWithoutReadingBody(t *testing.T) {
+	s, err := NewPersistent("token", "token", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinSigstoreRoot(s, "key-1", pub)
+	_, jobID, hdrs := seedLeasedArtifactJob(t, s, sigstorePipeline)
+	body := &blockingBody{data: make([]byte, maxSigstoreBytes+64), block: make(chan struct{})}
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/jobs/"+jobID+"/artifacts/bin.sigstore", body)
+	req.Header.Set("Authorization", "Bearer token")
+	for k, v := range hdrs {
+		req.Header.Set(k, v)
+	}
+	w := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		s.Handler().ServeHTTP(w, req)
+		close(done)
+	}()
+	select {
+	case <-done:
+		if w.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("oversized sigstore bundle = %d, want 422: %s", w.Code, w.Body.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not return: the body was being read past the size limit")
 	}
 }
 

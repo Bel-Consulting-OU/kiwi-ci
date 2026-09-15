@@ -151,7 +151,7 @@ func (s *Server) testShards(w http.ResponseWriter, r *http.Request) {
 		"flaky_tests": flaky,
 		"env_contract": map[string]any{
 			"KIWI_TEST_SHARD_TOTAL": strconv.Itoa(shards),
-			"KIWI_TEST_SHARD_INDEX": "${{ matrix.shard }}",
+			"KIWI_TEST_SHARD_INDEX": "${{ matrix.test_shard }}",
 		},
 	}
 	if v := r.URL.Query().Get("shard"); v != "" {

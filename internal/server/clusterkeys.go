@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -184,12 +185,10 @@ func (s *FSClusterKeyStore) LoadOrCreate(kind string) ([]byte, error) {
 	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
 		return nil, err
 	}
-	var created []byte
-	var err error
-	switch kind {
-	case clusterKindWebSession:
-		created, err = createWebSessionKey()
-	case clusterKindRunnerCA:
+	if kind == clusterKindRunnerCA {
+		// The runner CA loader materializes cert+key through its own
+		// create-if-absent flow; the persisted files are the source of
+		// truth and are read back below.
 		if _, err := runnerpki.LoadOrCreateCA(s.Dir); err != nil {
 			return nil, err
 		}
@@ -202,16 +201,126 @@ func (s *FSClusterKeyStore) LoadOrCreate(kind string) ([]byte, error) {
 			return nil, cerr
 		}
 		return append(append([]byte{}, certPEM...), keyPEM...), nil
+	}
+	var created []byte
+	var err error
+	switch kind {
+	case clusterKindWebSession:
+		created, err = createWebSessionKey()
 	default:
 		created, err = createClusterKey(kind)
 	}
 	if err != nil {
 		return nil, err
 	}
-	if err := s.Store(kind, created); err != nil {
+	// Atomic create-if-absent: the hard link is the CAS primitive. Only the
+	// creator whose link won returns its freshly generated material; every
+	// concurrent creator whose link hit EEXIST re-reads the winning file,
+	// so freshly generated material is NEVER returned when the file
+	// already exists.
+	enc, err := s.encodedBytes(kind, created)
+	if err != nil {
 		return nil, err
 	}
+	path, err := s.path(kind)
+	if err != nil {
+		return nil, err
+	}
+	if err := createFileCAS(path, enc); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+		existing, ok, lerr := s.Lookup(kind)
+		if lerr != nil {
+			return nil, lerr
+		}
+		if !ok {
+			return nil, fmt.Errorf("cluster keys: %s was created concurrently but cannot be read", kind)
+		}
+		return existing, nil
+	}
+	// Sidecar publications for key-pair kinds are best effort after the
+	// CAS link: the key file is authoritative and a missing public sidecar
+	// is tolerated by Lookup.
+	if kind == clusterKindProvenance || kind == clusterKindCacheSigning {
+		priv, perr := parseEd25519PrivatePEM(created)
+		if perr != nil {
+			return nil, perr
+		}
+		pub, perr := encodeEd25519PublicPEM(priv.Public().(ed25519.PublicKey))
+		if perr != nil {
+			return nil, perr
+		}
+		pubPath := filepath.Join(s.Dir, "provenance.pub")
+		if kind == clusterKindCacheSigning {
+			pubPath = filepath.Join(s.Dir, cacheSigningPubFile)
+		}
+		if perr := writeFileAtomic(pubPath, pub, 0o644); perr != nil {
+			return nil, perr
+		}
+	}
 	return created, nil
+}
+
+// encodedBytes renders the canonical on-disk encoding for one kind without
+// touching the filesystem (hex for raw 32-byte material, identity for the
+// self-describing formats).
+func (s *FSClusterKeyStore) encodedBytes(kind string, data []byte) ([]byte, error) {
+	switch kind {
+	case clusterKindLease, clusterKindWebSession:
+		return []byte(hex.EncodeToString(data)), nil
+	case clusterKindOIDC, clusterKindProvenance, clusterKindCacheSigning:
+		return data, nil
+	default:
+		return nil, fmt.Errorf("cluster keys: unknown key kind %q", kind)
+	}
+}
+
+// createFileCAS publishes data at path with create-if-absent semantics: the
+// bytes are written to a unique temp file, fsynced, and hard-linked into
+// place. A link racing an existing file fails with os.ErrExist. On Windows
+// (where hard links can be unsupported on some filesystems) the O_CREATE|
+// O_EXCL fallback is used instead.
+func createFileCAS(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".cas-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if runtime.GOOS == "windows" {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil {
+			return err
+		}
+		if _, err := f.Write(data); err != nil {
+			f.Close()
+			return err
+		}
+		return f.Close()
+	}
+	if err := os.Link(tmpName, path); err != nil {
+		if os.IsExist(err) {
+			return os.ErrExist
+		}
+		return err
+	}
+	return nil
 }
 
 // Lookup reports the stored bytes for kind without creating anything.
@@ -358,12 +467,19 @@ func (s *FSClusterKeyStore) Store(kind string, data []byte) error {
 // StaticClusterKeyStore
 // ---------------------------------------------------------------------------
 
+// LoadOrCreate returns the stored bytes for kind, creating them when
+// absent. Creation is race-free: the map is re-checked under the lock after
+// the (potentially expensive) key generation, and the STORED value is
+// always returned — a concurrent creator's material wins when the call lost
+// the race, so freshly generated material is never returned when the store
+// already holds a value.
 func (s *StaticClusterKeyStore) LoadOrCreate(kind string) ([]byte, error) {
 	s.mu.Lock()
 	if s.Keys != nil {
 		if b, ok := s.Keys[kind]; ok {
+			out := append([]byte(nil), b...)
 			s.mu.Unlock()
-			return append([]byte(nil), b...), nil
+			return out, nil
 		}
 	}
 	s.mu.Unlock()
@@ -380,10 +496,20 @@ func (s *StaticClusterKeyStore) LoadOrCreate(kind string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := s.Store(kind, b); err != nil {
-		return nil, err
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Keys != nil {
+		if existing, ok := s.Keys[kind]; ok {
+			// Lost the race to a concurrent creator: the stored material
+			// is authoritative.
+			return append([]byte(nil), existing...), nil
+		}
 	}
-	return b, nil
+	if s.Keys == nil {
+		s.Keys = map[string][]byte{}
+	}
+	s.Keys[kind] = append([]byte(nil), b...)
+	return append([]byte(nil), b...), nil
 }
 
 func (s *StaticClusterKeyStore) Lookup(kind string) ([]byte, bool, error) {
@@ -502,6 +628,8 @@ func (s *Server) loadOIDCSignerCluster(store ClusterKeyStore) (*oidcSigner, erro
 		return nil, err
 	}
 	signer.cluster = store
+	sum := sha256.Sum256(b)
+	signer.ringDigest = hex.EncodeToString(sum[:])
 	return signer, nil
 }
 

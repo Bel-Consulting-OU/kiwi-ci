@@ -1,6 +1,9 @@
 package pipeline
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -25,9 +28,14 @@ type Graph struct {
 
 // Compile validates and compiles a pipeline with no pipeline inputs. Holes
 // referencing the inputs context are left literal, preserving the legacy
-// behavior for callers that resolve inputs later (server enqueue).
+// behavior for callers that resolve inputs later (server enqueue). A spec
+// carrying ProvidedInputs (set by ResolveInputs) compiles with full input
+// semantics via CompileWithInputs.
 func Compile(s *Spec) (*Graph, error) {
-	return CompileWithInputs(s, nil)
+	if s == nil {
+		return CompileWithInputs(nil, nil)
+	}
+	return CompileWithInputs(s, s.ProvidedInputs)
 }
 
 // CompileWithInputs validates and compiles a pipeline with the given
@@ -82,6 +90,9 @@ func CompileWithInputs(s *Spec, inputs map[string]string) (*Graph, error) {
 				if j.Tests.Shards > 1 {
 					cj.Job.Env = mergeStringMaps(cj.Job.Env, shardEnv(j.Tests.Shards, v["test_shard"]))
 				}
+				if err := ValidateCompiledJob(cj); err != nil {
+					return nil, err
+				}
 				g.Jobs[cid] = cj
 				expanded[id] = append(expanded[id], cid)
 			}
@@ -120,6 +131,17 @@ func shardVariants(m map[string]string, shards int) []map[string]string {
 
 // matrixSuffix renders the stable "[key=value,...]" compiled-job ID suffix
 // for a variant matrix (keys sorted), and "" for an empty matrix.
+//
+// The encoding is canonical and collision-free:
+//   - values consisting solely of [A-Za-z0-9._-] stay literal, preserving
+//     every historically canonical ID;
+//   - any other value is base64url-encoded and prefixed with "~" (a byte
+//     that can never occur in a literal value, matrix name or job id), so
+//     two different unsafe values can never render identically and an
+//     encoded value can never collide with a literal one;
+//   - when the raw rendered suffix would exceed maxMatrixSuffixBytes the
+//     whole suffix collapses to "[~<sha256(raw)[:16 bytes]>]", keeping long
+//     matrix values out of job keys while staying deterministic.
 func matrixSuffix(m map[string]string) string {
 	if len(m) == 0 {
 		return ""
@@ -129,11 +151,38 @@ func matrixSuffix(m map[string]string) string {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
+	raw := make([]string, 0, len(keys))
+	for _, k := range keys {
+		raw = append(raw, k+"="+m[k])
+	}
+	full := "[" + strings.Join(raw, ",") + "]"
+	if len(full) > maxMatrixSuffixBytes {
+		sum := sha256.Sum256([]byte(full))
+		return "[~" + hex.EncodeToString(sum[:16]) + "]"
+	}
 	parts := make([]string, 0, len(keys))
 	for _, k := range keys {
-		parts = append(parts, fmt.Sprintf("%s=%s", k, m[k]))
+		v := m[k]
+		if !matrixValueSafe(v) {
+			v = "~" + base64.RawURLEncoding.EncodeToString([]byte(v))
+		}
+		parts = append(parts, k+"="+v)
 	}
 	return "[" + strings.Join(parts, ",") + "]"
+}
+
+// matrixValueSafe reports whether a matrix value may appear literally in a
+// compiled-job ID suffix. Everything else is base64url-encoded.
+func matrixValueSafe(v string) bool {
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '_', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // shardEnv is the executor contract for compile-time test sharding:
@@ -178,6 +227,10 @@ func matrixCombinations(m map[string][]any) []map[string]string {
 	return out
 }
 
+// interpolateJob renders one job against a variant matrix and the provided
+// inputs. Every composite field is copied before interpolation so variants
+// never mutate the spec's shared slices (a second variant must interpolate
+// the ORIGINAL text, not the first variant's result).
 func interpolateJob(j Job, m map[string]string, inputs map[string]string) Job {
 	interp := func(s string) string { return InterpolateWithInputs(s, m, inputs) }
 	j.Name = interp(j.Name)
@@ -189,41 +242,55 @@ func interpolateJob(j Job, m map[string]string, inputs map[string]string) Job {
 	j.Env = interpolateMap(j.Env, m, inputs)
 	j.Outputs = interpolateMap(j.Outputs, m, inputs)
 	j.Steps = interpolateSteps(j.Steps, m, inputs)
-	for i := range j.Services {
-		j.Services[i].Name = interp(j.Services[i].Name)
-		j.Services[i].Image = interp(j.Services[i].Image)
-		j.Services[i].Healthcheck = interp(j.Services[i].Healthcheck)
-		j.Services[i].Env = interpolateMap(j.Services[i].Env, m, inputs)
+	services := make([]Service, len(j.Services))
+	copy(services, j.Services)
+	for i := range services {
+		services[i].Name = interp(services[i].Name)
+		services[i].Image = interp(services[i].Image)
+		services[i].Healthcheck = interp(services[i].Healthcheck)
+		services[i].Env = interpolateMap(services[i].Env, m, inputs)
 	}
-	for i := range j.Cache {
-		j.Cache[i].Name = interp(j.Cache[i].Name)
-		j.Cache[i].Key = interp(j.Cache[i].Key)
-		for k := range j.Cache[i].Paths {
-			j.Cache[i].Paths[k] = interp(j.Cache[i].Paths[k])
-		}
-		for k := range j.Cache[i].HashFiles {
-			j.Cache[i].HashFiles[k] = interp(j.Cache[i].HashFiles[k])
-		}
-		for k := range j.Cache[i].RestoreKeys {
-			j.Cache[i].RestoreKeys[k] = interp(j.Cache[i].RestoreKeys[k])
-		}
+	j.Services = services
+	cache := make([]Cache, len(j.Cache))
+	copy(cache, j.Cache)
+	for i := range cache {
+		cache[i].Name = interp(cache[i].Name)
+		cache[i].Key = interp(cache[i].Key)
+		cache[i].Paths = interpolateSlice(cache[i].Paths, m, inputs)
+		cache[i].HashFiles = interpolateSlice(cache[i].HashFiles, m, inputs)
+		cache[i].RestoreKeys = interpolateSlice(cache[i].RestoreKeys, m, inputs)
 	}
-	for i := range j.TestReports {
-		j.TestReports[i] = interp(j.TestReports[i])
+	j.Cache = cache
+	j.TestReports = interpolateSlice(j.TestReports, m, inputs)
+	downloads := make([]ArtifactInput, len(j.Downloads))
+	copy(downloads, j.Downloads)
+	for i := range downloads {
+		downloads[i].From = interp(downloads[i].From)
+		downloads[i].Name = interp(downloads[i].Name)
+		downloads[i].Path = interp(downloads[i].Path)
 	}
-	for i := range j.Downloads {
-		j.Downloads[i].From = interp(j.Downloads[i].From)
-		j.Downloads[i].Name = interp(j.Downloads[i].Name)
-		j.Downloads[i].Path = interp(j.Downloads[i].Path)
+	j.Downloads = downloads
+	artifacts := make([]Artifact, len(j.Artifacts))
+	copy(artifacts, j.Artifacts)
+	for i := range artifacts {
+		artifacts[i].Name = interp(artifacts[i].Name)
+		artifacts[i].If = interp(artifacts[i].If)
+		artifacts[i].Paths = interpolateSlice(artifacts[i].Paths, m, inputs)
 	}
-	for i := range j.Artifacts {
-		j.Artifacts[i].Name = interp(j.Artifacts[i].Name)
-		j.Artifacts[i].If = interp(j.Artifacts[i].If)
-		for k := range j.Artifacts[i].Paths {
-			j.Artifacts[i].Paths[k] = interp(j.Artifacts[i].Paths[k])
-		}
-	}
+	j.Artifacts = artifacts
 	return j
+}
+
+func interpolateSlice(in []string, m map[string]string, inputs map[string]string) []string {
+	if in == nil {
+		return nil
+	}
+	out := make([]string, len(in))
+	copy(out, in)
+	for i := range out {
+		out[i] = InterpolateWithInputs(out[i], m, inputs)
+	}
+	return out
 }
 
 func interpolateMap(in map[string]string, m map[string]string, inputs map[string]string) map[string]string {
@@ -332,9 +399,48 @@ func contextsAllowed(refs []string, allowed map[string]bool) bool {
 func matrixEnv(m map[string]string) map[string]string {
 	out := map[string]string{}
 	for k, v := range m {
-		out["KIWI_MATRIX_"+strings.ToUpper(strings.ReplaceAll(k, "-", "_"))] = v
+		out["KIWI_MATRIX_"+ProjectInputName(k)] = v
 	}
 	return out
+}
+
+// ResolveInputs returns the effective spec for the given validated run
+// inputs: every job body is interpolated against the inputs context
+// (matrix holes stay literal for the per-variant compile pass), every input
+// is injected into each job's environment as KIWI_INPUT_<ProjectInputName>,
+// and the inputs are recorded on the returned spec so Compile picks them up
+// through CompileWithInputs. Inputs that reference a missing key surface as
+// the expr engine's missing-key error. A nil or empty inputs map returns the
+// spec unchanged (except for the recorded inputs).
+func ResolveInputs(s *Spec, inputs map[string]string) (*Spec, error) {
+	if s == nil {
+		return nil, fmt.Errorf("nil pipeline")
+	}
+	if inputs != nil {
+		names := make([]string, 0, len(inputs))
+		for name := range inputs {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		if err := checkInputNames(names); err != nil {
+			return nil, err
+		}
+	}
+	out := *s
+	if len(inputs) > 0 {
+		jobs := make(map[string]Job, len(s.Jobs))
+		for id, j := range s.Jobs {
+			j2 := interpolateJob(j, nil, inputs)
+			j2.Env = mergeStringMaps(j2.Env, inputEnv(inputs))
+			if err := validateInputsResolved(id, j2, nil, inputs); err != nil {
+				return nil, err
+			}
+			jobs[id] = j2
+		}
+		out.Jobs = jobs
+	}
+	out.ProvidedInputs = inputs
+	return &out, nil
 }
 
 // ProjectInputName is the canonical input-name -> environment-variable

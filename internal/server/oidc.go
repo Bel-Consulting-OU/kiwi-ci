@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 const (
@@ -51,6 +53,13 @@ type oidcSigner struct {
 	NotBefore time.Time
 	Previous  []oidcPreviousKey
 	ringPath  string
+	// ringMod/ringSize track the identity of the file-backed ring so a
+	// replica can detect a peer's rotation with a cheap stat.
+	ringMod  time.Time
+	ringSize int64
+	// ringDigest is the sha256 hex of the persisted ring bytes in cluster
+	// mode; replicas reload when the stored digest changes.
+	ringDigest string
 	// cluster, when non-nil, is the shared key store the ring persists
 	// through (HA deployments); ringPath stays empty in that mode.
 	cluster ClusterKeyStore
@@ -192,7 +201,12 @@ func persistOIDCKeyRing(s *oidcSigner) error {
 		if !ok {
 			return fmt.Errorf("oidc key ring: cluster key store does not support writes")
 		}
-		return writer.Store(clusterKindOIDC, b)
+		if err := writer.Store(clusterKindOIDC, b); err != nil {
+			return err
+		}
+		sum := sha256.Sum256(b)
+		s.ringDigest = hex.EncodeToString(sum[:])
+		return nil
 	}
 	if s.ringPath == "" {
 		return nil
@@ -203,6 +217,10 @@ func persistOIDCKeyRing(s *oidcSigner) error {
 	}
 	if err := os.Rename(tmp, s.ringPath); err != nil {
 		return err
+	}
+	if info, err := os.Stat(s.ringPath); err == nil {
+		s.ringMod = info.ModTime()
+		s.ringSize = info.Size()
 	}
 	return nil
 }
@@ -215,6 +233,10 @@ func loadOIDCSigner(root string) (*oidcSigner, error) {
 			return nil, er
 		}
 		s.ringPath = ringPath
+		if info, serr := os.Stat(ringPath); serr == nil {
+			s.ringMod = info.ModTime()
+			s.ringSize = info.Size()
+		}
 		return s, nil
 	} else if !os.IsNotExist(err) {
 		return nil, err
@@ -252,7 +274,10 @@ func loadOIDCSigner(root string) (*oidcSigner, error) {
 
 // rotateOIDCKeyLocked moves the active signing key into the retired-previous
 // ring (advertised for oidcPreviousKeyRetireAfter more) and installs a fresh
-// active key. The caller must hold s.mu. It is internal to this file.
+// active key. The new ring is persisted BEFORE activation: an interrupted
+// write leaves the old ring active everywhere, never a ring only this
+// replica can verify. The caller must hold s.mu. It is internal to this
+// file.
 func (s *Server) rotateOIDCKeyLocked(now time.Time) {
 	if s.oidc == nil {
 		s.oidc = newOIDCSigner()
@@ -262,6 +287,9 @@ func (s *Server) rotateOIDCKeyLocked(now time.Time) {
 	next.NotBefore = now
 	next.ringPath = s.oidc.ringPath
 	next.cluster = s.oidc.cluster
+	next.ringMod = s.oidc.ringMod
+	next.ringSize = s.oidc.ringSize
+	next.ringDigest = s.oidc.ringDigest
 	next.Previous = make([]oidcPreviousKey, 0, len(s.oidc.Previous)+1)
 	for _, p := range s.oidc.Previous {
 		if p.RetireAfter.After(now) {
@@ -274,10 +302,73 @@ func (s *Server) rotateOIDCKeyLocked(now time.Time) {
 		NotBefore:   s.oidc.NotBefore,
 		RetireAfter: now.Add(oidcPreviousKeyRetireAfter),
 	})
-	s.oidc = next
 	if err := persistOIDCKeyRing(next); err != nil {
-		s.logError("oidc: key rotation not persisted", "error", err.Error())
+		s.logError("oidc: key rotation not persisted; keeping current ring active", "error", err.Error())
+		return
 	}
+	s.oidc = next
+}
+
+// reloadOIDCRingLocked replaces the in-memory signer when the persisted
+// ring changed since it was loaded — another replica rotated it. The caller
+// must hold s.mu. File mode compares the ring file's mtime/size; cluster
+// mode compares the stored bytes' digest. A changed ring that fails to
+// parse keeps the current signer active (fail closed).
+func (s *Server) reloadOIDCRingLocked() {
+	if s.oidc == nil {
+		return
+	}
+	if s.oidc.cluster != nil {
+		lookup, ok := s.oidc.cluster.(ClusterKeyLookup)
+		if !ok {
+			return
+		}
+		b, found, err := lookup.Lookup(clusterKindOIDC)
+		if err != nil {
+			s.logError("oidc: ring reload lookup failed", "error", err.Error())
+			return
+		}
+		if !found {
+			return
+		}
+		sum := sha256.Sum256(b)
+		digest := hex.EncodeToString(sum[:])
+		if s.oidc.ringDigest == digest {
+			return
+		}
+		signer, err := oidcSignerFromRing(b)
+		if err != nil {
+			s.logError("oidc: ring reload parse failed", "error", err.Error())
+			return
+		}
+		signer.cluster = s.oidc.cluster
+		signer.ringDigest = digest
+		s.oidc = signer
+		return
+	}
+	if s.oidc.ringPath == "" {
+		return
+	}
+	info, err := os.Stat(s.oidc.ringPath)
+	if err != nil {
+		return
+	}
+	if info.ModTime().Equal(s.oidc.ringMod) && info.Size() == s.oidc.ringSize {
+		return
+	}
+	b, err := os.ReadFile(s.oidc.ringPath)
+	if err != nil {
+		return
+	}
+	signer, err := oidcSignerFromRing(b)
+	if err != nil {
+		s.logError("oidc: ring reload parse failed", "error", err.Error())
+		return
+	}
+	signer.ringPath = s.oidc.ringPath
+	signer.ringMod = info.ModTime()
+	signer.ringSize = info.Size()
+	s.oidc = signer
 }
 
 func (s *Server) oidcIssuer() (string, error) {
@@ -359,16 +450,46 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	now := time.Now().UTC()
 	s.mu.Lock()
+	s.reloadOIDCRingLocked()
 	if s.oidc == nil || now.Sub(s.oidc.NotBefore) > oidcActiveKeyMaxAge {
 		s.rotateOIDCKeyLocked(now)
 	}
 	signer := s.oidc
-	j, ok := s.jobs[jobID]
-	run := s.runs[j.RunID]
 	s.mu.Unlock()
-	if !ok {
-		http.NotFound(w, r)
-		return
+	// DB mode: the store is the source of truth for the lease/audience
+	// checks; the in-memory maps are only the dev-mode mirror.
+	var j model.Job
+	var run model.Run
+	if s.DB != nil {
+		var err error
+		j, err = s.DB.GetJob(r.Context(), jobID)
+		if errors.Is(err, storage.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		run, err = s.DB.GetRun(r.Context(), j.RunID)
+		if errors.Is(err, storage.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+	} else {
+		s.mu.Lock()
+		ok := false
+		j, ok = s.jobs[jobID]
+		run = s.runs[j.RunID]
+		s.mu.Unlock()
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
 	}
 	if !j.OIDCAllowed {
 		http.Error(w, "job does not have permissions.id_token", http.StatusForbidden)
@@ -405,9 +526,38 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.auditLocked("oidc.issued", j.LeaseRunnerID, j.RunID, j.ID, "OIDC id_token issued", map[string]string{"job": j.Key, "audience": in.Audience, "kid": signer.KID})
+	// The audit trail records the issuance before the token is returned; a
+	// persistence failure fails the issuance closed (no log-and-continue).
+	if err := s.auditOIDCIssuance(r, j.LeaseRunnerID, j.RunID, j.ID, signer.KID, j.Key, in.Audience); err != nil {
+		http.Error(w, "OIDC issuance audit failed", http.StatusInternalServerError)
+		return
+	}
 	s.metricAdd("kiwi_oidc_issues_total", 1, nil)
 	writeJSON(w, 200, map[string]any{"value": jwt, "expires_at": now.Add(5 * time.Minute)})
+}
+
+// auditOIDCIssuance appends the oidc.issued audit event (kid, audience —
+// never the token) and returns any persistence error so issuance can fail
+// closed. A server without a store (pure in-memory dev mode) has no audit
+// sink and reports success.
+func (s *Server) auditOIDCIssuance(r *http.Request, actor, runID, jobID, kid, job, audience string) error {
+	if s.store == nil && s.DB == nil {
+		return nil
+	}
+	id, err := newID()
+	if err != nil {
+		return err
+	}
+	e := model.AuditEvent{
+		ID: id, Action: "oidc.issued", Actor: actor, RunID: runID, JobID: jobID,
+		Message:   "OIDC id_token issued",
+		Metadata:  map[string]string{"job": job, "audience": audience, "kid": kid},
+		CreatedAt: time.Now().UTC(),
+	}
+	if s.DB != nil {
+		return s.DB.AppendAudit(r.Context(), e)
+	}
+	return s.store.AppendAudit(e)
 }
 
 func (s *Server) signJWT(signer *oidcSigner, claims map[string]any) (string, error) {

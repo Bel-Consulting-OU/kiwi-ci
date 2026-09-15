@@ -289,18 +289,50 @@ func TestCompleteDBRequiresDeclaredArtifacts(t *testing.T) {
 		t.Fatalf("enqueue: %v", err)
 	}
 	runnerID, task := leaseRunJob(t, s)
-	if w := completeTask(t, s, task, runnerID, "success"); w.Code != http.StatusNoContent {
+	// Success without the required artifact fails closed INSIDE the
+	// completion transaction: the completion is refused (422) and the job
+	// stays running — not terminal — so the runner can upload the artifact
+	// and retry.
+	if w := completeTask(t, s, task, runnerID, "success"); w.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("complete = %d: %s", w.Code, w.Body.String())
 	}
 	f.mu.Lock()
 	j := f.jobs[task.Job.ID]
 	run := f.runs[j.RunID]
 	f.mu.Unlock()
-	if j.Status != model.StatusFailure || j.Error != "required artifact bin missing" {
-		t.Fatalf("job = %s/%q, want failure", j.Status, j.Error)
+	if j.Status != model.StatusRunning {
+		t.Fatalf("job status = %s, want running (completion rolled back)", j.Status)
 	}
-	if run.Status != model.StatusFailure {
-		t.Fatalf("run status = %s, want failure", run.Status)
+	if run.Status == model.StatusSuccess || run.Status == model.StatusFailure {
+		t.Fatalf("run status = %s, want not terminal", run.Status)
+	}
+	// The refusal is audited.
+	f.mu.Lock()
+	audited := false
+	for _, e := range f.audit {
+		if e.Action == "job.required_artifact_missing" {
+			audited = true
+		}
+	}
+	f.mu.Unlock()
+	if !audited {
+		t.Fatal("missing-artifact completion was not audited")
+	}
+	// Upload the required artifact and retry: the completion succeeds.
+	if err := f.InsertArtifact(context.Background(), model.ArtifactRecord{
+		ID: strings.Repeat("a", 32), RunID: j.RunID, JobID: j.ID, Name: "bin",
+		Size: 3, SHA256: "abc", CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if w := completeTask(t, s, task, runnerID, "success"); w.Code != http.StatusNoContent {
+		t.Fatalf("retried complete = %d: %s", w.Code, w.Body.String())
+	}
+	f.mu.Lock()
+	j = f.jobs[task.Job.ID]
+	f.mu.Unlock()
+	if j.Status != model.StatusSuccess {
+		t.Fatalf("job status after retry = %s, want success", j.Status)
 	}
 }
 
@@ -334,6 +366,7 @@ func TestDownstreamConcurrentFlushOneChild(t *testing.T) {
 	if err := s.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
+	s.DownstreamAllowlist = map[string][]string{"acme/child": {"o/r"}}
 	s.Policy = &policy.Config{Repositories: map[string]policy.RepoPolicy{"o/r": {CrossRepoTrigger: boolPtr(true)}}}
 	if _, err := s.enqueue(SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
@@ -394,6 +427,7 @@ func TestDownstreamReservedLinkRecoveredByMaintain(t *testing.T) {
 	if err := s.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
+	s.DownstreamAllowlist = map[string][]string{"acme/child": {"o/r"}}
 	s.Policy = &policy.Config{Repositories: map[string]policy.RepoPolicy{"o/r": {CrossRepoTrigger: boolPtr(true)}}}
 	if _, err := s.enqueue(SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",

@@ -1,9 +1,12 @@
 package server
 
 import (
+	"bytes"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 )
@@ -210,5 +213,101 @@ func TestStaticClusterKeyStoreCreatesMissingKinds(t *testing.T) {
 	}
 	if again, err := shared.LoadOrCreate(clusterKindLease); err != nil || !reflect.DeepEqual(b, again) {
 		t.Fatalf("LoadOrCreate not stable: %v %v", again, err)
+	}
+}
+
+func TestFSClusterKeyStoreConcurrentCreatorsIdentical(t *testing.T) {
+	dir := t.TempDir()
+	store := &FSClusterKeyStore{Dir: dir}
+	const n = 16
+	results := make(chan []byte, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			b, err := store.LoadOrCreate(clusterKindLease)
+			if err != nil {
+				t.Errorf("LoadOrCreate: %v", err)
+				return
+			}
+			results <- b
+		}()
+	}
+	wg.Wait()
+	close(results)
+	var first []byte
+	for b := range results {
+		if first == nil {
+			first = b
+			continue
+		}
+		if !bytes.Equal(first, b) {
+			t.Fatal("concurrent creators returned different key material")
+		}
+	}
+	if len(first) != 32 {
+		t.Fatalf("lease key size = %d, want 32", len(first))
+	}
+}
+
+func TestFSClusterKeyStorePreExistingFileWins(t *testing.T) {
+	dir := t.TempDir()
+	want := make([]byte, 32)
+	for i := range want {
+		want[i] = byte(i + 1)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "lease.key"), []byte(hex.EncodeToString(want)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := &FSClusterKeyStore{Dir: dir}
+	got, err := store.LoadOrCreate(clusterKindLease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("pre-existing key file was replaced by freshly generated material")
+	}
+	// The file still holds the pre-existing material.
+	raw, err := os.ReadFile(filepath.Join(dir, "lease.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != hex.EncodeToString(want) {
+		t.Fatal("pre-existing key file was overwritten")
+	}
+}
+
+func TestStaticClusterKeyStoreConcurrentCreatorsIdentical(t *testing.T) {
+	shared := &StaticClusterKeyStore{}
+	const n = 16
+	results := make(chan []byte, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			b, err := shared.LoadOrCreate(clusterKindLease)
+			if err != nil {
+				t.Errorf("LoadOrCreate: %v", err)
+				return
+			}
+			results <- b
+		}()
+	}
+	wg.Wait()
+	close(results)
+	var first []byte
+	for b := range results {
+		if first == nil {
+			first = b
+			continue
+		}
+		if !bytes.Equal(first, b) {
+			t.Fatal("concurrent creators returned different key material")
+		}
+	}
+	if len(first) != 32 {
+		t.Fatalf("lease key size = %d, want 32", len(first))
 	}
 }

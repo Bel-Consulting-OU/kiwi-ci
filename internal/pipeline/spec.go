@@ -63,6 +63,11 @@ func (d *Duration) UnmarshalYAML(unmarshal func(any) error) error {
 }
 
 func (d Duration) MarshalJSON() ([]byte, error) {
+	// An unset duration marshals as null so a JSON round-trip does not turn
+	// "absent" into an explicit zero value (which validation rejects).
+	if !d.Set {
+		return []byte("null"), nil
+	}
 	return json.Marshal(d.Duration.String())
 }
 
@@ -124,6 +129,13 @@ type Spec struct {
 	Packages    map[string]Package      `yaml:"packages,omitempty" json:"packages,omitempty"`
 	Components  map[string]ComponentUse `yaml:"components,omitempty" json:"components,omitempty"`
 	Jobs        map[string]Job          `yaml:"jobs" json:"jobs"`
+	// ProvidedInputs carries the validated run inputs resolved by
+	// ResolveInputs (server enqueue). Compile forwards it to
+	// CompileWithInputs so the effective compiled jobs, digests and payloads
+	// derive from the input-interpolated spec. It is never part of the
+	// serialized pipeline: yaml/json decoding leave it nil and canonical
+	// rendering ignores it.
+	ProvidedInputs map[string]string `yaml:"-" json:"-"`
 }
 
 type Input struct {

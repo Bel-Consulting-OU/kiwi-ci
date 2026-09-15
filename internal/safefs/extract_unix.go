@@ -9,95 +9,111 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
-// openRoot opens the destination directory with O_NOFOLLOW so a symlinked
-// destination is rejected outright.
-func openRoot(dest string) (*os.File, error) {
-	if err := os.MkdirAll(dest, 0o755); err != nil {
-		return nil, err
-	}
-	fd, err := syscall.Open(dest, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+// openRootHandle opens the destination directory with O_NOFOLLOW so a
+// symlinked destination is rejected outright. The directory must already
+// exist: no component is ever created here. With O_DIRECTORY a symlinked
+// destination surfaces as ENOTDIR on some platforms, not ELOOP.
+func openRootHandle(path string) (*os.File, error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		if errors.Is(err, syscall.ELOOP) {
+		if errors.Is(err, unix.ELOOP) || errors.Is(err, unix.ENOTDIR) {
 			return nil, ErrSymlinkParent
 		}
 		return nil, err
 	}
-	return os.NewFile(uintptr(fd), dest), nil
+	return os.NewFile(uintptr(fd), path), nil
 }
 
-// ensureParentDirs creates each missing component of name under root and
-// verifies every existing component is a real directory (never a symlink)
-// using O_NOFOLLOW at every step.
-func ensureParentDirs(root *os.File, name string) (string, error) {
-	rootName := root.Name()
-	comp := rootName
+// openParentChain walks the parent components of name beneath the held root
+// descriptor one component at a time: each existing component is opened with
+// O_NOFOLLOW|O_DIRECTORY, and each missing component is created with a
+// single-component mkdirat followed by an immediate O_NOFOLLOW re-open.
+// Every open is relative to a held descriptor (openat), never to a path, so
+// renames or symlink swaps above or inside the root cannot redirect the
+// write. The caller owns the returned descriptor of the deepest parent.
+func openParentChain(root *Root, name string) (int, error) {
+	fd, err := unix.Dup(int(root.F.Fd()))
+	if err != nil {
+		return -1, err
+	}
 	parts := strings.Split(name, "/")
 	for _, p := range parts[:len(parts)-1] {
 		if p == "" {
 			continue
 		}
-		comp = filepath.Join(comp, p)
-		fd, err := syscall.Open(comp, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+		child, err := unix.Openat(fd, p, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 		if err == nil {
-			syscall.Close(fd)
+			unix.Close(fd)
+			fd = child
 			continue
 		}
-		if err != syscall.ENOENT {
-			if errors.Is(err, syscall.ELOOP) {
-				return "", ErrSymlinkParent
+		if err != unix.ENOENT {
+			unix.Close(fd)
+			if errors.Is(err, unix.ELOOP) {
+				return -1, ErrSymlinkParent
 			}
-			return "", err
+			return -1, err
 		}
-		if e := os.Mkdir(comp, 0o755); e != nil && !errors.Is(e, syscall.EEXIST) && !os.IsExist(e) {
-			return "", e
+		if e := unix.Mkdirat(fd, p, 0o755); e != nil && !errors.Is(e, unix.EEXIST) {
+			unix.Close(fd)
+			return -1, e
 		}
-		fd, err = syscall.Open(comp, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+		child, err = unix.Openat(fd, p, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		unix.Close(fd)
 		if err != nil {
-			if errors.Is(err, syscall.ELOOP) {
-				return "", ErrSymlinkParent
+			if errors.Is(err, unix.ELOOP) {
+				return -1, ErrSymlinkParent
 			}
-			return "", err
+			return -1, err
 		}
-		syscall.Close(fd)
+		fd = child
 	}
-	return filepath.Join(rootName, filepath.FromSlash(name)), nil
+	return fd, nil
 }
 
-// mkdirNoFollow creates the directory entry name (and parents) under root,
-// requiring every component to be a real directory.
-func mkdirNoFollow(root *os.File, name string) error {
-	target, err := ensureParentDirs(root, name)
+// mkdirNoFollow creates the directory entry name (and parents) under the
+// root handle, requiring every component to be a real directory.
+func mkdirNoFollow(root *Root, name string) error {
+	parentFd, err := openParentChain(root, name)
 	if err != nil {
 		return err
 	}
-	if err := os.Mkdir(target, 0o755); err != nil && !os.IsExist(err) {
+	defer unix.Close(parentFd)
+	parts := strings.Split(name, "/")
+	base := parts[len(parts)-1]
+	if err := unix.Mkdirat(parentFd, base, 0o755); err != nil && !errors.Is(err, unix.EEXIST) {
 		return err
 	}
-	fd, err := syscall.Open(target, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	fd, err := unix.Openat(parentFd, base, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		if errors.Is(err, syscall.ELOOP) {
+		if errors.Is(err, unix.ELOOP) {
 			return ErrSymlinkParent
 		}
 		return err
 	}
-	return syscall.Close(fd)
+	return unix.Close(fd)
 }
 
-func writeFileNoFollow(root *os.File, name string, r io.Reader, size int64, limits ExtractLimits) error {
-	target, err := ensureParentDirs(root, name)
+func writeFileNoFollow(root *Root, name string, r io.Reader, size int64, limits ExtractLimits) error {
+	parentFd, err := openParentChain(root, name)
 	if err != nil {
 		return err
 	}
-	fd, err := syscall.Open(target, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o644)
+	defer unix.Close(parentFd)
+	parts := strings.Split(name, "/")
+	base := parts[len(parts)-1]
+	fd, err := unix.Openat(parentFd, base, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o644)
 	if err != nil {
-		if errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.EEXIST) || errors.Is(err, syscall.EPERM) {
+		if errors.Is(err, unix.ELOOP) || errors.Is(err, unix.EEXIST) || errors.Is(err, syscall.EPERM) {
 			return ErrSymlinkParent
 		}
 		return err
 	}
-	f := os.NewFile(uintptr(fd), target)
+	f := os.NewFile(uintptr(fd), filepath.Join(root.Canonical, filepath.FromSlash(name)))
 	defer f.Close()
 	if _, err := io.CopyN(f, r, size); err != nil {
 		return err

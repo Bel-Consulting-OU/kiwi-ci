@@ -17,6 +17,22 @@ func Load(path string) (*Spec, error) {
 }
 
 func Parse(b []byte) (*Spec, error) {
+	return parseSpec(b, false)
+}
+
+// ParseWithComponents is the server-side enqueue resolution parse: the
+// ORIGINAL document is parsed with the full strict parser (node-level
+// alias/merge/tag/duplicate/size checks and known-field validation with
+// line numbers) BEFORE any normalization, with ONE relaxation — a job that
+// declares `component:` (plus `with:`) may omit its own steps, because the
+// component fragment supplies them. Everything else is validated exactly as
+// in Parse; the caller resolves the components and must re-validate the
+// assembled spec with Parse.
+func ParseWithComponents(b []byte) (*Spec, error) {
+	return parseSpec(b, true)
+}
+
+func parseSpec(b []byte, relaxComponentJobs bool) (*Spec, error) {
 	if len(b) > maxPipelineBytes {
 		return nil, fmt.Errorf("pipeline exceeds %d byte limit", maxPipelineBytes)
 	}
@@ -33,7 +49,7 @@ func Parse(b []byte) (*Spec, error) {
 	if len(s.Jobs) == 0 {
 		return nil, fmt.Errorf("pipeline has no jobs")
 	}
-	if err := Validate(&s); err != nil {
+	if err := validateSpec(&s, relaxComponentJobs); err != nil {
 		return nil, err
 	}
 	canonicalizeSpec(&s)

@@ -68,6 +68,8 @@ var (
 	_ QuotaCounterStore     = (*FaultyStore)(nil)
 	_ CacheManifestStore    = (*FaultyStore)(nil)
 	_ ArtifactSidecarStore  = (*FaultyStore)(nil)
+	_ SecretClaimStore      = (*FaultyStore)(nil)
+	_ SecretClaimReleaser   = (*FaultyStore)(nil)
 )
 
 func (f *FaultyStore) Close() error { return f.Inner.Close() }
@@ -573,6 +575,24 @@ func (f *FaultyStore) SetArtifactSidecars(ctx context.Context, id, sbomPath, sbo
 	return f.Inner.(ArtifactSidecarStore).SetArtifactSidecars(ctx, id, sbomPath, sbomSHA256, sigstorePath, sigstoreSHA256)
 }
 
+func (f *FaultyStore) ClaimSecretDelivery(ctx context.Context, jobID string, generation int64, secretName string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return false, err
+	}
+	return f.Inner.(SecretClaimStore).ClaimSecretDelivery(ctx, jobID, generation, secretName)
+}
+
+func (f *FaultyStore) ReleaseSecretDelivery(ctx context.Context, jobID string, generation int64, secretName string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(SecretClaimReleaser).ReleaseSecretDelivery(ctx, jobID, generation, secretName)
+}
+
 // memStore is a fully functional in-memory Store used as the fault-free
 // baseline underneath FaultyStore in fault-injection tests.
 type memStore struct {
@@ -595,6 +615,7 @@ type memStore struct {
 	downstream  map[string]DownstreamLink
 	quotas      map[string]quotaCounts
 	cacheMans   map[string]CacheManifestRecord
+	claims      map[string]time.Time
 }
 
 // quotaCounts is the in-memory reserved counter pair for one quota key.
@@ -616,6 +637,7 @@ func newMemStore() *memStore {
 		downstream:  map[string]DownstreamLink{},
 		quotas:      map[string]quotaCounts{},
 		cacheMans:   map[string]CacheManifestRecord{},
+		claims:      map[string]time.Time{},
 	}
 }
 
@@ -640,6 +662,8 @@ var (
 	_ QuotaCounterStore     = (*memStore)(nil)
 	_ CacheManifestStore    = (*memStore)(nil)
 	_ ArtifactSidecarStore  = (*memStore)(nil)
+	_ SecretClaimStore      = (*memStore)(nil)
+	_ SecretClaimReleaser   = (*memStore)(nil)
 )
 
 func (m *memStore) Close() error { return nil }
@@ -810,6 +834,17 @@ func (m *memStore) CompleteJob(ctx context.Context, jobID string, generation int
 			return nil
 		}
 		return ErrGenerationMismatch
+	}
+	// Required-artifact verification inside the completion: a successful
+	// completion must have an artifact row for every Required contract.
+	// A missing artifact fails closed (the job stays running) with
+	// ErrRequiredArtifactMissing; a contract-store failure does the same.
+	if status == model.StatusSuccess {
+		if missing, err := m.requiredArtifactMissingLocked(jobID); err != nil {
+			return err
+		} else if missing != "" {
+			return fmt.Errorf("%w: %s", ErrRequiredArtifactMissing, missing)
+		}
 	}
 	j.Status = status
 	j.Error = errMsg
@@ -1634,4 +1669,51 @@ func (m *memStore) SetArtifactSidecars(ctx context.Context, id, sbomPath, sbomSH
 		return nil
 	}
 	return ErrNotFound
+}
+
+// requiredArtifactMissingLocked returns the name of the first Required
+// contract entry with no artifact record for (job, name), or "" when every
+// required artifact is present. The caller holds m.mu.
+func (m *memStore) requiredArtifactMissingLocked(jobID string) (string, error) {
+	contracts, ok := m.contracts[jobID]
+	if !ok || len(contracts) == 0 {
+		return "", nil
+	}
+	for name, c := range contracts {
+		if !c.Required {
+			continue
+		}
+		found := false
+		for _, a := range m.artifacts {
+			if a.JobID == jobID && a.Name == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return name, nil
+		}
+	}
+	return "", nil
+}
+
+// ClaimSecretDelivery reserves the once-only (job, generation, secret name)
+// claim under m.mu; the first claim reports true, replays report false.
+func (m *memStore) ClaimSecretDelivery(ctx context.Context, jobID string, generation int64, secretName string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%s|%d|%s", jobID, generation, secretName)
+	if _, exists := m.claims[key]; exists {
+		return false, nil
+	}
+	m.claims[key] = time.Now().UTC()
+	return true, nil
+}
+
+// ReleaseSecretDelivery drops a claimed delivery whose resolution failed.
+func (m *memStore) ReleaseSecretDelivery(ctx context.Context, jobID string, generation int64, secretName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.claims, fmt.Sprintf("%s|%d|%s", jobID, generation, secretName))
+	return nil
 }

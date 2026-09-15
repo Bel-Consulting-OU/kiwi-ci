@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -25,12 +26,51 @@ import (
 // contract and gates the artifact payload itself, so a required-but-missing
 // attestation can never ship.
 
-const maxSBOMBytes = 8 << 20
+const (
+	maxSBOMBytes     = 8 << 20
+	maxSigstoreBytes = 8 << 20
+)
 
 // artifactSidecarPath is the deterministic sidecar location next to a job's
 // artifacts: <dir>/<base>.<kind>.json.
 func artifactSidecarPath(dir, base, kind string) string {
 	return filepath.Join(dir, cleanBlobName(base)+"."+kind+".json")
+}
+
+// SetSigstoreTrustRoot pins the Sigstore verification trust root: the
+// accepted signing keys (keyed by key ID) and, when both rekorPub and
+// rekorBaseURL are set, the Rekor transparency log used for inclusion
+// verification. Without any configured root, sigstore uploads fail closed
+// (422). Configure before serving traffic.
+func (s *Server) SetSigstoreTrustRoot(keys map[string]ed25519.PublicKey, rekorPub ed25519.PublicKey, rekorBaseURL string) {
+	if keys == nil {
+		s.SigstoreTrustedKeys = nil
+	} else {
+		m := make(map[string]ed25519.PublicKey, len(keys))
+		for id, k := range keys {
+			m[id] = append(ed25519.PublicKey(nil), k...)
+		}
+		s.SigstoreTrustedKeys = m
+	}
+	s.RekorPublicKey = append(ed25519.PublicKey(nil), rekorPub...)
+	s.RekorBaseURL = rekorBaseURL
+}
+
+// sigstoreTrustRoot returns the configured Sigstore verification trust
+// root. Rekor inclusion verification is active only when both the Rekor
+// public key and the base URL are configured.
+func (s *Server) sigstoreTrustRoot() supplychain.SigstoreTrustRoot {
+	root := supplychain.SigstoreTrustRoot{Keys: s.SigstoreTrustedKeys}
+	if len(s.RekorPublicKey) == ed25519.PublicKeySize && s.RekorBaseURL != "" {
+		root.Rekor = &supplychain.RekorConfig{PublicKey: s.RekorPublicKey, BaseURL: s.RekorBaseURL}
+	}
+	return root
+}
+
+// hasSigstoreTrustRoot reports whether any Sigstore trust root is
+// configured. Without one, sigstore gates fail closed.
+func (s *Server) hasSigstoreTrustRoot() bool {
+	return len(s.SigstoreTrustedKeys) > 0 || (len(s.RekorPublicKey) == ed25519.PublicKeySize && s.RekorBaseURL != "")
 }
 
 // validateSBOMDocument checks the payload parses as JSON in the declared
@@ -68,11 +108,13 @@ func validateSBOMDocument(b []byte, format supplychain.SBOMFormat) error {
 }
 
 // sigstoreVerifyConfig derives the verification expectations for an
-// artifact from its frozen contract declaration.
-func sigstoreVerifyConfig(c storage.ArtifactContract) supplychain.SigstoreVerifyConfig {
+// artifact from its frozen contract declaration, anchored in the server's
+// configured Sigstore trust root.
+func (s *Server) sigstoreVerifyConfig(c storage.ArtifactContract) supplychain.SigstoreVerifyConfig {
 	return supplychain.SigstoreVerifyConfig{
 		ExpectedIssuer:   c.SigstoreIssuer,
 		ExpectedIdentity: c.SigstoreIdentity,
+		TrustRoot:        s.sigstoreTrustRoot(),
 	}
 }
 
@@ -148,12 +190,24 @@ func (s *Server) uploadSigstore(w http.ResponseWriter, r *http.Request, j model.
 		http.Error(w, "artifact contract does not declare a sigstore gate", http.StatusUnprocessableEntity)
 		return
 	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBlobBytes))
+	if !s.hasSigstoreTrustRoot() {
+		s.auditLocked("artifact.sigstore_rejected", j.LeaseRunnerID, j.RunID, j.ID, "sigstore upload without configured trust root", map[string]string{"name": base})
+		http.Error(w, "sigstore trust root is not configured", http.StatusUnprocessableEntity)
+		return
+	}
+	// Dedicated bound applied before any allocation: oversized bundles are
+	// rejected without reading the full body.
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxSigstoreBytes))
 	if err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			http.Error(w, "sigstore bundle exceeds 8 MiB limit", http.StatusUnprocessableEntity)
+			return
+		}
 		http.Error(w, "invalid sigstore bundle", http.StatusBadRequest)
 		return
 	}
-	cfg := sigstoreVerifyConfig(c)
+	cfg := s.sigstoreVerifyConfig(c)
 	if recs, lerr := s.findArtifactByJobName(r.Context(), j.RunID, j.ID, base); lerr == nil && len(recs) > 0 {
 		latest := recs[len(recs)-1]
 		if err := supplychain.VerifySigstoreBundle(body, latest.SHA256, cfg); err != nil {
@@ -276,12 +330,16 @@ func (s *Server) gateArtifactAttestations(ctx context.Context, c storage.Artifac
 		}
 	}
 	if c.SigstoreRequired {
+		if !s.hasSigstoreTrustRoot() {
+			s.auditLocked("artifact.sigstore_rejected", j.LeaseRunnerID, j.RunID, j.ID, "required sigstore gate without configured trust root", map[string]string{"name": base})
+			return http.StatusUnprocessableEntity, "sigstore trust root is not configured"
+		}
 		b, rerr := s.sidecarBytes(ctx, j, base, "sigstore", dir)
 		if rerr != nil {
 			s.auditLocked("artifact.sigstore_missing", j.LeaseRunnerID, j.RunID, j.ID, "required sigstore missing at artifact upload", map[string]string{"name": base})
 			return http.StatusUnprocessableEntity, "required sigstore bundle missing: upload <name>.sigstore before the artifact"
 		}
-		if verr := supplychain.VerifySigstoreBundle(b, digest, sigstoreVerifyConfig(c)); verr != nil {
+		if verr := supplychain.VerifySigstoreBundle(b, digest, s.sigstoreVerifyConfig(c)); verr != nil {
 			s.auditLocked("artifact.sigstore_rejected", j.LeaseRunnerID, j.RunID, j.ID, "required sigstore bundle failed verification", map[string]string{"name": base, "error": verr.Error()})
 			return http.StatusUnprocessableEntity, verr.Error()
 		}

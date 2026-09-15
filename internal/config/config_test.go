@@ -31,6 +31,8 @@ max_connections = 25
 
 [runner_pki]
 enabled = true
+ca_cert = "/etc/kiwi/runner-ca.crt"
+ca_key = "/etc/kiwi/runner-ca.key"
 enroll_token = "enroll-secret"
 
 [blob]
@@ -83,7 +85,7 @@ tokens_file = "/etc/kiwi/tokens.json"
 	if cfg.Database.URL != "postgres://kiwi:secret@db:5432/kiwi" || cfg.Database.MaxConnections != 25 {
 		t.Errorf("database section not applied: %+v", cfg.Database)
 	}
-	if !cfg.RunnerPKI.Enabled || cfg.RunnerPKI.EnrollToken != "enroll-secret" {
+	if !cfg.RunnerPKI.Enabled || cfg.RunnerPKI.EnrollToken != "enroll-secret" || cfg.RunnerPKI.CACert != "/etc/kiwi/runner-ca.crt" || cfg.RunnerPKI.CAKey != "/etc/kiwi/runner-ca.key" {
 		t.Errorf("runner_pki section not applied: %+v", cfg.RunnerPKI)
 	}
 	if cfg.Blob.Backend != "s3" || cfg.Blob.S3Bucket != "kiwi-artifacts" {
@@ -246,4 +248,166 @@ func contains(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+func TestValidateRunnerPKIMatrix(t *testing.T) {
+	// enabled is authoritative: it demands the full CA pair. The enroll
+	// token is optional (single-use grants may be used instead). A
+	// half-configured pair is an error regardless of enabled.
+	valid := Default()
+	valid.RunnerPKI.Enabled = true
+	valid.RunnerPKI.CACert = "/etc/kiwi/runner-ca.crt"
+	valid.RunnerPKI.CAKey = "/etc/kiwi/runner-ca.key"
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("enabled with full CA pair rejected: %v", err)
+	}
+	validEnroll := valid
+	validEnroll.RunnerPKI.EnrollToken = "enroll-secret"
+	if err := validEnroll.Validate(); err != nil {
+		t.Fatalf("enabled with CA pair + enroll token rejected: %v", err)
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{"enabled without any material", func(c *Config) { c.RunnerPKI.Enabled = true }},
+		{"enabled with cert only", func(c *Config) { c.RunnerPKI.Enabled = true; c.RunnerPKI.CACert = "/ca.crt" }},
+		{"enabled with key only", func(c *Config) { c.RunnerPKI.Enabled = true; c.RunnerPKI.CAKey = "/ca.key" }},
+		{"enabled with cert+enroll token but no key", func(c *Config) {
+			c.RunnerPKI.Enabled = true
+			c.RunnerPKI.CACert = "/ca.crt"
+			c.RunnerPKI.EnrollToken = "t"
+		}},
+		{"cert only without enabled", func(c *Config) { c.RunnerPKI.CACert = "/ca.crt" }},
+		{"key only without enabled", func(c *Config) { c.RunnerPKI.CAKey = "/ca.key" }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := Default()
+			c.mutate(cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatalf("Validate accepted %s config", c.name)
+			}
+		})
+	}
+	// A disabled runner_pki with a full pair validates (material present
+	// but inactive), and an enroll token without enabled keeps the legacy
+	// data-dir CA generation path valid.
+	inactive := Default()
+	inactive.RunnerPKI.CACert = "/ca.crt"
+	inactive.RunnerPKI.CAKey = "/ca.key"
+	if err := inactive.Validate(); err != nil {
+		t.Fatalf("disabled runner_pki with a full pair rejected: %v", err)
+	}
+	if err := func() error {
+		c := Default()
+		c.RunnerPKI.EnrollToken = "enroll-secret"
+		return c.Validate()
+	}(); err != nil {
+		t.Fatalf("enroll token without enabled rejected: %v", err)
+	}
+}
+
+func TestStripCommentEscapeAware(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{"escaped quote keeps in-string state", `key = "a\"#b"`, `key = "a\"#b"`},
+		{"double backslash before closing quote strips comment", `key = "a\\" # comment`, `key = "a\\" `},
+		{"full line comment", `# full line`, ``},
+		{"comment after single-quoted string", `key = 'a#b' # comment`, `key = 'a#b' `},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := stripComment(c.in); got != c.want {
+				t.Fatalf("stripComment(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+	// The escaped-quote value survives a full Load: the # stays part of the
+	// string value and a trailing comment is stripped.
+	p := writeTemp(t, `
+[server]
+listen = "a\"#b"
+mode = "dev"  # trailing
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Server.Listen != `a"#b` {
+		t.Fatalf("listen = %q, want %q", cfg.Server.Listen, `a"#b`)
+	}
+}
+
+func TestApplyEnvStrictNumeric(t *testing.T) {
+	unset := func(names ...string) {
+		for _, n := range names {
+			os.Unsetenv(n)
+			t.Cleanup(func() { os.Unsetenv(n) })
+		}
+	}
+	// An explicitly provided malformed numeric env var must fail startup,
+	// not silently fall back to the config-file/default value.
+	t.Setenv("KIWI_QUOTA_REPO_CONCURRENCY", "abc")
+	if err := Default().ApplyEnv(); err == nil {
+		t.Fatal("KIWI_QUOTA_REPO_CONCURRENCY=abc must fail ApplyEnv")
+	}
+	t.Setenv("KIWI_QUOTA_REPO_CONCURRENCY", "4")
+	t.Setenv("KIWI_DAILY_COST_LIMIT", "not-a-number")
+	if err := Default().ApplyEnv(); err == nil {
+		t.Fatal("KIWI_DAILY_COST_LIMIT=not-a-number must fail ApplyEnv")
+	}
+	unset("KIWI_DAILY_COST_LIMIT")
+	t.Setenv("KIWI_DATABASE_MAX_CONNECTIONS", "many")
+	if err := Default().ApplyEnv(); err == nil {
+		t.Fatal("KIWI_DATABASE_MAX_CONNECTIONS=many must fail ApplyEnv")
+	}
+	unset("KIWI_DATABASE_MAX_CONNECTIONS")
+	t.Setenv("KIWI_GITHUB_APP_ID", "0x10")
+	if err := Default().ApplyEnv(); err == nil {
+		t.Fatal("KIWI_GITHUB_APP_ID=0x10 must fail ApplyEnv")
+	}
+	unset("KIWI_GITHUB_APP_ID")
+	t.Setenv("KIWI_QUOTA_FAIL_OPEN", "sometimes")
+	if err := Default().ApplyEnv(); err == nil {
+		t.Fatal("KIWI_QUOTA_FAIL_OPEN=sometimes must fail ApplyEnv")
+	}
+	unset("KIWI_QUOTA_FAIL_OPEN")
+	unset("KIWI_QUOTA_REPO_CONCURRENCY")
+
+	// Absent env vars leave the defaults untouched.
+	cfg := Default()
+	if err := cfg.ApplyEnv(); err != nil {
+		t.Fatalf("ApplyEnv with absent numeric env vars: %v", err)
+	}
+	if cfg.Quota.RepoConcurrency != 0 || cfg.Database.MaxConnections != 0 || cfg.GitHub.AppID != 0 || cfg.Quota.FailOpen {
+		t.Fatalf("defaults drifted: %+v %+v %+v", cfg.Quota, cfg.Database, cfg.GitHub)
+	}
+
+	// Valid values still win over the defaults.
+	t.Setenv("KIWI_QUOTA_REPO_CONCURRENCY", "7")
+	t.Setenv("KIWI_DATABASE_MAX_CONNECTIONS", "19")
+	t.Setenv("KIWI_GITHUB_APP_ID", "4242")
+	t.Setenv("KIWI_QUOTA_FAIL_OPEN", "true")
+	cfg = Default()
+	if err := cfg.ApplyEnv(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Quota.RepoConcurrency != 7 || cfg.Database.MaxConnections != 19 || cfg.GitHub.AppID != 4242 || !cfg.Quota.FailOpen {
+		t.Fatalf("valid numeric env not applied: %+v %+v %+v", cfg.Quota, cfg.Database, cfg.GitHub)
+	}
+
+	// The legacy unprefixed spellings still work (canonical KIWI_QUOTA_*
+	// wins when both are set).
+	t.Setenv("KIWI_REPO_CONCURRENCY", "5")
+	t.Setenv("KIWI_QUOTA_REPO_CONCURRENCY", "9")
+	cfg = Default()
+	if err := cfg.ApplyEnv(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Quota.RepoConcurrency != 9 {
+		t.Fatalf("canonical KIWI_QUOTA_REPO_CONCURRENCY must win over legacy, got %v", cfg.Quota.RepoConcurrency)
+	}
 }

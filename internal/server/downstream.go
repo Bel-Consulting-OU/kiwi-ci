@@ -34,17 +34,20 @@ type downstreamPayload struct {
 // recordDownstreamIntents resolves a successfully completed job's
 // downstream declaration into a durable launch claim and an outbox intent.
 // Idempotent: the claim row (or fs-mode snapshot entry) is only created
-// once, and the outbox dedupes by item ID across replays. The link carries
-// the forge identity coordinates (forge kind, API base URL override, repo
-// ID) so dispatch never re-derives hosts from hard-coded public endpoints.
-func (s *Server) recordDownstreamIntents(ctx context.Context, j model.Job, run model.Run) {
+// once, and the dispatch is exactly-once via the reservation. The link
+// carries the forge identity coordinates (forge kind, API base URL
+// override, repo ID) so dispatch never re-derives hosts from hard-coded
+// public endpoints. Persistence failures are returned — never
+// log-and-continue — so the completion response can fail and the
+// idempotent replay can re-attempt the recording.
+func (s *Server) recordDownstreamIntents(ctx context.Context, j model.Job, run model.Run) error {
 	cj, ok := compileJobFromPipeline(j)
 	if !ok {
-		return
+		return nil
 	}
 	d := cj.Job.Downstream
 	if strings.TrimSpace(d.Repository) == "" {
-		return
+		return nil
 	}
 	targetRepo := strings.TrimSpace(d.Repository)
 	targetRef := strings.TrimSpace(d.Ref)
@@ -57,8 +60,7 @@ func (s *Server) recordDownstreamIntents(ctx context.Context, j model.Job, run m
 	}
 	token, err := newID()
 	if err != nil {
-		s.logError("downstream: launch token generation failed", "error", err.Error())
-		return
+		return err
 	}
 	forgeKind := forgeKindForHost(repoURLHost(run.Repo))
 	link := storage.DownstreamLink{
@@ -72,8 +74,7 @@ func (s *Server) recordDownstreamIntents(ctx context.Context, j model.Job, run m
 		CreatedAt:     time.Now().UTC(),
 	}
 	if err := s.insertDownstreamLink(ctx, link); err != nil {
-		s.logError("downstream: link insert failed", "error", err.Error())
-		return
+		return fmt.Errorf("downstream: link insert failed: %w", err)
 	}
 	payload := downstreamPayload{
 		ParentJobID: j.ID,
@@ -89,13 +90,42 @@ func (s *Server) recordDownstreamIntents(ctx context.Context, j model.Job, run m
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
-		s.logError("downstream: payload marshal failed", "error", err.Error())
-		return
+		return err
 	}
 	item := forge.OutboxItem{Kind: forge.OutboxKindDownstream, Payload: raw, CreatedAt: time.Now().UTC()}
 	if err := s.outbox.Enqueue(item); err != nil {
-		s.logError("downstream: outbox enqueue failed", "error", err.Error())
+		return fmt.Errorf("downstream: outbox enqueue failed: %w", err)
 	}
+	return nil
+}
+
+// recordDownstreamIntentsForCompleted re-applies the downstream intent
+// recording for an already-completed job. It is the recovery path for a
+// completion whose durable commit succeeded but whose intent recording
+// failed: the idempotent completion replay calls it before acknowledging.
+func (s *Server) recordDownstreamIntentsForCompleted(ctx context.Context, jobID string) error {
+	if s.DB != nil {
+		j, err := s.DB.GetJob(ctx, jobID)
+		if err != nil {
+			return err
+		}
+		if j.Status != model.StatusSuccess {
+			return nil
+		}
+		run, err := s.DB.GetRun(ctx, j.RunID)
+		if err != nil {
+			return err
+		}
+		return s.recordDownstreamIntents(ctx, j, run)
+	}
+	s.mu.Lock()
+	j, ok := s.jobs[jobID]
+	run, runOK := s.runs[j.RunID]
+	s.mu.Unlock()
+	if !ok || !runOK || j.Status != model.StatusSuccess {
+		return nil
+	}
+	return s.recordDownstreamIntents(ctx, j, run)
 }
 
 // forgeBaseURL returns the configured API base URL override for a forge
@@ -212,6 +242,15 @@ func (s *Server) dispatchDownstream(ctx context.Context, item forge.OutboxItem) 
 	if p.ParentJobID == "" || p.TargetRepo == "" || p.TargetRef == "" {
 		return fmt.Errorf("downstream: incomplete intent payload")
 	}
+	// Bilateral authorization: the TARGET repository's policy must consent
+	// to the dispatch. Without an allowlist entry for the target (default
+	// deny) the intent is refused with an audit event and dropped (a nil
+	// error acks the outbox item, removing it from the queue).
+	if !s.downstreamAllowed(ctx, p) {
+		s.metricAdd("kiwi_downstream_skips_total", 1, nil)
+		s.auditLocked("downstream.refused", "scheduler", p.ParentRunID, p.ParentJobID, "downstream dispatch refused: target policy does not allow this source repository", map[string]string{"target_repo": p.TargetRepo, "target_ref": p.TargetRef})
+		return nil
+	}
 	// The persisted link carries the forge identity coordinates; a replay
 	// that dropped the in-memory copy falls back to the payload.
 	link, ok, err := s.getDownstreamLink(ctx, p.ParentJobID, p.TargetRepo, p.TargetRef)
@@ -260,13 +299,17 @@ func (s *Server) dispatchDownstream(ctx context.Context, item forge.OutboxItem) 
 	for k, v := range p.Inputs {
 		meta["input."+k] = v
 	}
+	// Trust ingress: the child inherits the parent's trust only when the
+	// target repository's policy explicitly grants trusted ingress; every
+	// other target receives an untrusted child.
+	trusted := p.Trusted && s.DownstreamTrustedIngress[p.TargetRepo]
 	child, err := s.enqueueID(SubmitRun{
 		RepoURL:      downstreamCloneURL(forgeKind, baseURL, p.TargetRepo),
 		RepoFullName: p.TargetRepo,
 		Ref:          p.TargetRef,
 		Event:        p.Event,
 		Pipeline:     content,
-		Trusted:      p.Trusted,
+		Trusted:      trusted,
 		Metadata:     meta,
 	}, preID)
 	if err != nil {
@@ -282,6 +325,43 @@ func (s *Server) dispatchDownstream(ctx context.Context, item forge.OutboxItem) 
 	s.metricAdd("kiwi_downstream_launches_total", 1, nil)
 	s.auditLocked("downstream.launched", "scheduler", p.ParentRunID, p.ParentJobID, "downstream run launched", map[string]string{"target_repo": p.TargetRepo, "target_ref": p.TargetRef, "child_run": child.ID})
 	return nil
+}
+
+// downstreamAllowed enforces the target repository's policy consent for one
+// dispatch intent. A target without a DownstreamAllowlist entry refuses
+// every source (default deny); an entry with an empty/nil source list
+// allows any source; otherwise only the listed source repositories are
+// allowed. A parent run that cannot be resolved refuses the dispatch
+// (fail closed).
+func (s *Server) downstreamAllowed(ctx context.Context, p downstreamPayload) bool {
+	sources, ok := s.DownstreamAllowlist[p.TargetRepo]
+	if !ok {
+		return false
+	}
+	if len(sources) == 0 {
+		return true
+	}
+	var run model.Run
+	if s.DB != nil {
+		r, err := s.DB.GetRun(ctx, p.ParentRunID)
+		if err != nil {
+			return false
+		}
+		run = r
+	} else {
+		s.mu.Lock()
+		r, rok := s.runs[p.ParentRunID]
+		s.mu.Unlock()
+		if !rok {
+			return false
+		}
+		run = r
+	}
+	source := run.RepoFullName
+	if strings.TrimSpace(source) == "" {
+		source = run.Repo
+	}
+	return stringSliceContains(sources, source)
 }
 
 // reserveDownstreamLaunch claims the link reservation through the store

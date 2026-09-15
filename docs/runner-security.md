@@ -85,8 +85,13 @@ the job's infrastructure retry budget.
   machines with no valuable host credentials.
 - Use a rootless Docker daemon and digest-pinned images for
   container jobs.
-- Give each runner a dedicated enrollment (certificate or token), and
-  revoke the certificate when a runner is decommissioned.
+- Give each runner a dedicated enrollment: a per-runner certificate via
+  the single-use enrollment grant/token flow, and revoke the certificate
+  when a runner is decommissioned. The runner BEARER token is a shared
+  credential across all runners — it is not a per-runner identity, and a
+  bearer-token deployment cannot attribute traffic to one runner or
+  revoke one runner without rotating the shared token. Prefer persistent
+  mTLS identities in production.
 - Keep deployment-capable runners separate from ordinary build runners
   (see [environments.md](environments.md)).
 - Drain runners before maintenance: `kiwi runner drain <id>`.

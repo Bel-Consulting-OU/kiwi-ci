@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -305,10 +306,27 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	}
 	network := cj.Job.Network
 	var cleanupServices func()
+	// sandbox.rootless is a promise about the daemon, not the container:
+	// verify it before any service container or job container is started on
+	// that daemon, so services never run on a rootful daemon for a job that
+	// demanded rootless isolation.
+	if cj.Job.Runtime == "container" && cj.Job.Sandbox.Rootless {
+		docker, derr := exec.LookPath("docker")
+		if derr != nil {
+			res.Status = model.StatusFailure
+			res.Error = (&RunError{Kind: ErrorInfra, Err: fmt.Errorf("docker not found: %w", derr)}).Error()
+			return finish(res)
+		}
+		if rerr := requireRootlessDaemon(ctx, docker); rerr != nil {
+			res.Status = model.StatusFailure
+			res.Error = rerr.Error()
+			return finish(res)
+		}
+	}
 	if cj.Job.Runtime == "container" && len(cj.Job.Services) > 0 {
 		isolated := networkPolicy == pipeline.NetworkPolicyNone || networkPolicy == pipeline.NetworkPolicyServicesOnly
 		var er error
-		network, cleanupServices, er = startContainerServices(ctx, e.Opt.RunID, cj.ID, cj.Job.Services, isolated, func(line string) { e.log(cj.ID, "service", line) })
+		network, cleanupServices, er = startContainerServices(ctx, e.Opt.RunID, cj.ID, cj.Job.Services, isolated, e.Opt.RequireImmutableImages, func(line string) { e.log(cj.ID, "service", line) })
 		if er != nil {
 			res.Status = model.StatusFailure
 			res.Error = er.Error()

@@ -1,6 +1,7 @@
 package forge
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -218,12 +219,38 @@ func TestGitLabFetchFileAndChangedFiles(t *testing.T) {
 	if !strings.Contains(got, "version: 1") {
 		t.Fatalf("bad content: %q", got)
 	}
-	files, err := g.ChangedFiles(context.Background(), EventContext{Repository: Repository{FullName: "mike/diaspora"}, BaseSHA: "a", HeadSHA: "b"})
+	res, err := g.ChangedFiles(context.Background(), EventContext{Repository: Repository{FullName: "mike/diaspora"}, BaseSHA: "a", HeadSHA: "b"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(files) != 2 || files[0] != "b.txt" || files[1] != "c.txt" {
-		t.Fatalf("unexpected files: %v", files)
+	if !res.Complete || len(res.Files) != 2 || res.Files[0] != "b.txt" || res.Files[1] != "c.txt" {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+}
+
+func TestGitLabChangedFiles4xxIncomplete(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+	g := &GitLab{BaseURL: ts.URL}
+	res, err := g.ChangedFiles(context.Background(), EventContext{Repository: Repository{FullName: "mike/diaspora"}, BaseSHA: "a", HeadSHA: "b"})
+	if err != nil {
+		t.Fatalf("4xx compare must not error, got %v", err)
+	}
+	if res.Complete || len(res.Files) != 0 {
+		t.Fatalf("4xx diff must be an incomplete empty result: %+v", res)
+	}
+}
+
+func TestGitLabFetchFileOversizeRejected(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(bytes.Repeat([]byte{'a'}, maxFetchFileBytes+1))
+	}))
+	defer ts.Close()
+	g := &GitLab{BaseURL: ts.URL}
+	if _, err := g.FetchFile(context.Background(), "mike/diaspora", ".kiwi/pipeline.yaml", "main"); err == nil {
+		t.Fatal("oversize file must be rejected")
 	}
 }
 

@@ -60,6 +60,14 @@ var (
 // sanity. It preserves the historical error messages existing consumers and
 // tests rely on.
 func Validate(s *Spec) error {
+	return validateSpec(s, false)
+}
+
+// validateSpec is Validate with the component resolution relaxation used by
+// ParseWithComponents: when relaxComponentJobs is set, a job that declares
+// `component:` may omit its own steps (the component fragment supplies
+// them); every other rule applies unchanged.
+func validateSpec(s *Spec, relaxComponentJobs bool) error {
 	if s == nil {
 		return fmt.Errorf("nil pipeline")
 	}
@@ -95,7 +103,7 @@ func Validate(s *Spec) error {
 		if !idRegexp.MatchString(id) {
 			return fmt.Errorf("invalid job id %q", id)
 		}
-		if len(j.Steps) == 0 {
+		if len(j.Steps) == 0 && !(relaxComponentJobs && j.Component != "") {
 			return fmt.Errorf("job %q has no steps", id)
 		}
 		seenDeps := map[string]bool{}
@@ -135,8 +143,9 @@ func ValidateLimits(s *Spec) error {
 	}
 	totalExpanded := 0
 	for id, j := range s.Jobs {
-		if len(j.Steps) > maxStepsPerJob {
-			return fmt.Errorf("job %q declares %d steps, limit is %d", id, len(j.Steps), maxStepsPerJob)
+		totalSteps := len(j.Steps) + len(j.Deployment.Canary) + len(j.Deployment.Verify) + len(j.Deployment.Rollback)
+		if totalSteps > maxStepsPerJob {
+			return fmt.Errorf("job %q declares %d steps across steps and deployment phases, limit is %d", id, totalSteps, maxStepsPerJob)
 		}
 		if len(j.Services) > maxServicesPerJob {
 			return fmt.Errorf("job %q declares %d services, limit is %d", id, len(j.Services), maxServicesPerJob)
@@ -151,7 +160,12 @@ func ValidateLimits(s *Spec) error {
 			return fmt.Errorf("job %q declares %d env vars, limit is %d", id, len(j.Env), maxEnvVarsPerJob)
 		}
 		secretCount := len(s.Secrets)
-		for _, st := range j.Steps {
+		allSteps := make([]Step, 0, totalSteps)
+		allSteps = append(allSteps, j.Steps...)
+		allSteps = append(allSteps, j.Deployment.Canary...)
+		allSteps = append(allSteps, j.Deployment.Verify...)
+		allSteps = append(allSteps, j.Deployment.Rollback...)
+		for _, st := range allSteps {
 			if len(st.Run) > maxCommandBytes {
 				return fmt.Errorf("job %q step %q command exceeds %d byte limit", id, st.ID, maxCommandBytes)
 			}
@@ -257,6 +271,9 @@ func validateJob(s *Spec, id string, j Job) error {
 			return fmt.Errorf("job %q has invalid placement label %q", id, label)
 		}
 	}
+	if err := validateResources(fmt.Sprintf("job %q", id), j.Runtime, j.Resources); err != nil {
+		return err
+	}
 	for name, v := range j.Env {
 		if len(v) > maxEnvValueBytes {
 			return fmt.Errorf("job %q env var %q exceeds %d byte limit", id, name, maxEnvValueBytes)
@@ -294,10 +311,15 @@ func validateJob(s *Spec, id string, j Job) error {
 	if err := validateMatrix(fmt.Sprintf("job %q", id), j.Matrix); err != nil {
 		return err
 	}
+	seenAliases := map[string]bool{}
 	for i := range j.Services {
 		if err := validateService(id, &j.Services[i]); err != nil {
 			return err
 		}
+		if seenAliases[j.Services[i].Name] {
+			return fmt.Errorf("job %q declares service alias %q more than once", id, j.Services[i].Name)
+		}
+		seenAliases[j.Services[i].Name] = true
 	}
 	seenStepIDs := map[string]bool{}
 	for i := range j.Steps {
@@ -547,7 +569,16 @@ func validateMatrix(where string, m map[string][]any) error {
 		names = append(names, k)
 	}
 	sort.Strings(names)
+	projected := map[string]string{}
 	for _, dim := range names {
+		if !matrixNameRegexp.MatchString(dim) {
+			return fmt.Errorf("%s matrix dimension %q is invalid (must match %s)", where, dim, matrixNameRegexp.String())
+		}
+		proj := ProjectInputName(dim)
+		if prev, dup := projected[proj]; dup {
+			return fmt.Errorf("%s matrix dimensions %q and %q both project to KIWI_MATRIX_%s", where, prev, dim, proj)
+		}
+		projected[proj] = dim
 		vals := m[dim]
 		if len(vals) == 0 {
 			return fmt.Errorf("matrix dimension %q has no values", dim)

@@ -3,6 +3,7 @@ package snapshot
 import (
 	"fmt"
 	"io"
+	"os"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/safefs"
 )
@@ -16,7 +17,15 @@ func Restore(r io.Reader, dest string) (Manifest, error) {
 	if dest == "" {
 		return Manifest{}, fmt.Errorf("snapshot: empty destination")
 	}
-	if _, err := safefs.Extract(r, dest, safefs.DefaultLimits()); err != nil {
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		return Manifest{}, fmt.Errorf("snapshot: prepare destination: %w", err)
+	}
+	root, err := safefs.OpenRootNoFollow(dest)
+	if err != nil {
+		return Manifest{}, fmt.Errorf("snapshot: open root: %w", err)
+	}
+	defer root.Close()
+	if _, err := safefs.Extract(root, r, safefs.DefaultLimits()); err != nil {
 		return Manifest{}, fmt.Errorf("snapshot: extract: %w", err)
 	}
 	m, err := ManifestFor(dest)

@@ -5,9 +5,13 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runnerpki"
 )
 
 // TestDisabledRunnerExitsNonzero drives a full Runner.Run against a control
@@ -74,5 +78,52 @@ func assertRunnerExitsDisabled(t *testing.T, serverURL string) {
 		}
 	case <-ctx.Done():
 		t.Fatal("runner did not exit after being disabled")
+	}
+}
+
+// TestDisabledClearsPersistedCertificate verifies the persistence-aware
+// disabled path: when the control plane rejects the runner during
+// register/next, the persisted certificate is cleared while the runner ID
+// (and key) survive, so a later re-enrollment continues the same identity
+// instead of burning a fresh one.
+func TestDisabledClearsPersistedCertificate(t *testing.T) {
+	dir := t.TempDir()
+	ca, err := runnerpki.NewCA("test ca", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM, certPEM := signIdentity(t, ca, "runner-d", time.Hour, 0)
+	store := IdentityStore{Dir: dir}
+	if err := store.Save(Identity{ID: "runner-d", KeyPEM: keyPEM, CertPEM: certPEM, CACertPEM: caCertPEM(t, ca)}); err != nil {
+		t.Fatal(err)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v1/runners/register":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"runner-d","name":"runner-d","capacity":1}`))
+		case strings.HasSuffix(r.URL.Path, "/next"):
+			http.Error(w, "runner identity mismatch", http.StatusForbidden)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	r := &Runner{Cfg: Config{Server: ts.URL, Token: "runner-tok", Poll: 10 * time.Millisecond, IdentityDir: dir}, ID: "runner-d"}
+	if err := r.Run(ctx); !errors.Is(err, ErrRunnerDisabledOrRevoked) {
+		t.Fatalf("Run = %v, want disabled/revoked sentinel", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, identityCertFile)); !os.IsNotExist(err) {
+		t.Fatal("persisted certificate must be cleared on disable/revocation")
+	}
+	if id, ok := store.LoadID(); !ok || id != "runner-d" {
+		t.Fatalf("persisted runner ID must survive: %q, %v", id, ok)
+	}
+	if _, err := os.Stat(filepath.Join(dir, identityKeyFile)); err != nil {
+		t.Fatal("persisted key must survive for re-enrollment")
 	}
 }

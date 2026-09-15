@@ -47,8 +47,8 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 	// Digest pinning is checked before any docker invocation so a missing
 	// daemon can never mask an unpinned image. Production policy should
 	// always require digests for untrusted jobs (see RequireImmutableImages).
-	if b.RequireImmutableImages && !strings.Contains(b.Image, "@sha256:") {
-		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("container image %q is not pinned by an @sha256: digest (require_immutable_images)", b.Image)}
+	if b.RequireImmutableImages && !digestPinned(b.Image) {
+		return unpinnedImageError("container image", b.Image)
 	}
 	docker, err := exec.LookPath("docker")
 	if err != nil {
@@ -92,19 +92,36 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 	return nil
 }
 
-// verifyRootlessDaemon requires `docker info --format {{.SecurityOptions}}`
+// securityOptionsRootless reports whether a `docker info --format
+// {{.SecurityOptions}}` report claims a rootless daemon. The daemon emits
+// the option list as bracketed entries (e.g. "[name=seccomp,profile=builtin
+// name=rootless]"), so a case-insensitive substring match on the whole
+// report is the robust check. Pure helper so it can be tested without a
+// daemon.
+func securityOptionsRootless(report string) bool {
+	return strings.Contains(strings.ToLower(report), "rootless")
+}
+
+// requireRootlessDaemon requires `docker info --format {{.SecurityOptions}}`
 // to report "rootless". sandbox.rootless is an explicit promise to the job
 // author; if the daemon is a privileged rootful one we must refuse rather
 // than silently run with weaker isolation.
-func (b *ContainerBackend) verifyRootlessDaemon(ctx context.Context, docker string) error {
+func requireRootlessDaemon(ctx context.Context, docker string) error {
 	out, err := exec.CommandContext(ctx, docker, "info", "--format", "{{.SecurityOptions}}").CombinedOutput()
 	if err != nil {
 		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("inspect docker daemon: %v: %s", err, strings.TrimSpace(string(out)))}
 	}
-	if !strings.Contains(strings.ToLower(string(out)), "rootless") {
+	if !securityOptionsRootless(string(out)) {
 		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("sandbox.rootless requested but the docker daemon is not rootless (security options: %s)", strings.TrimSpace(string(out)))}
 	}
 	return nil
+}
+
+// verifyRootlessDaemon re-checks the daemon from the container backend
+// itself (defense in depth: the executor hoists this check before services
+// start, and StartJob re-verifies it for direct backend users).
+func (b *ContainerBackend) verifyRootlessDaemon(ctx context.Context, docker string) error {
+	return requireRootlessDaemon(ctx, docker)
 }
 
 func (b *ContainerBackend) CloseJob() error {

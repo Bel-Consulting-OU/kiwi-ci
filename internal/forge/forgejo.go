@@ -137,14 +137,14 @@ func (f *Forgejo) FetchFile(ctx context.Context, repoFullName, path, ref string)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, maxAPIErrorBodyBytes))
 		return "", fmt.Errorf("Forgejo API %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
 	var v struct {
 		Content  string `json:"content"`
 		Encoding string `json:"encoding"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxPipelineJSONBytes)).Decode(&v); err != nil {
 		return "", err
 	}
 	if v.Encoding != "base64" {
@@ -154,43 +154,65 @@ func (f *Forgejo) FetchFile(ctx context.Context, repoFullName, path, ref string)
 	if err != nil {
 		return "", err
 	}
+	if len(b) > maxFetchFileBytes {
+		return "", fmt.Errorf("Forgejo file exceeds %d byte limit", maxFetchFileBytes)
+	}
 	return string(b), nil
 }
 
-func (f *Forgejo) ChangedFiles(ctx context.Context, ec EventContext) ([]string, error) {
+// Forgejo compare mirrors GitHub: pages of 100, hard cap at 300 files. A
+// complete list is only claimed when pagination terminated on a short
+// page.
+func (f *Forgejo) ChangedFiles(ctx context.Context, ec EventContext) (ChangedFilesResult, error) {
 	if ec.HeadSHA == "" || ec.BaseSHA == "" || ec.Repository.FullName == "" {
-		return nil, nil
+		return ChangedFilesResult{}, nil
 	}
-	u := fmt.Sprintf("%s/repos/%s/compare/%s...%s", f.apiBase(), ec.Repository.FullName, url.PathEscape(ec.BaseSHA), url.PathEscape(ec.HeadSHA))
+	files := make([]string, 0, githubComparePerPage)
+	for page := 1; page <= githubCompareMaxPages; page++ {
+		u := fmt.Sprintf("%s/repos/%s/compare/%s...%s?per_page=%d&page=%d",
+			f.apiBase(), ec.Repository.FullName, url.PathEscape(ec.BaseSHA), url.PathEscape(ec.HeadSHA), githubComparePerPage, page)
+		pageFiles, pageFull, err := f.changedFilesPage(ctx, ec.Repository.FullName, u)
+		if err != nil {
+			return ChangedFilesResult{}, err
+		}
+		files = append(files, pageFiles...)
+		if !pageFull {
+			return ChangedFilesResult{Files: files, Complete: true}, nil
+		}
+	}
+	return ChangedFilesResult{Files: files, Complete: false}, nil
+}
+
+func (f *Forgejo) changedFilesPage(ctx context.Context, repoFullName, u string) ([]string, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if tok := f.apiToken(); tok != "" {
 		req.Header.Set("Authorization", "token "+tok)
 	}
 	resp, err := f.httpClient().Do(req)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("Forgejo compare API %s: %s", resp.Status, strings.TrimSpace(string(b)))
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, maxAPIErrorBodyBytes))
+		return nil, false, fmt.Errorf("Forgejo compare API %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
 	var v struct {
 		Files []struct {
 			Filename string `json:"filename"`
 		} `json:"files"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
-		return nil, err
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxDiffResponseBytes)).Decode(&v); err != nil {
+		return nil, false, err
 	}
 	files := make([]string, 0, len(v.Files))
 	for _, file := range v.Files {
 		files = append(files, file.Filename)
 	}
-	return files, nil
+	return files, len(files) == githubComparePerPage, nil
 }
 
 // PublishCheck falls back to a commit status (Forgejo's check-run support

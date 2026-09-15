@@ -116,7 +116,11 @@ type RateLimitConfig struct {
 
 type AuthConfig struct {
 	AdminToken string `toml:"admin_token"`
-	// RunnerToken is the bearer token shared by all runners.
+	// RunnerToken is the bearer token shared by ALL runners. It is a
+	// shared credential, not a per-runner identity: it cannot distinguish
+	// runners. Production strongly prefers persistent per-runner mTLS
+	// identities (runner_pki); the control plane refuses to serve runner
+	// traffic with neither a runner token nor enforced runner mTLS.
 	RunnerToken string `toml:"runner_token"`
 	// TokensFile is the JSON token-store path for fine-grained principals.
 	TokensFile string `toml:"tokens_file"`
@@ -245,8 +249,17 @@ func (c *Config) Validate() error {
 	case c.GitHub.AppID == 0 && c.GitHub.PrivateKeyPath != "":
 		return fmt.Errorf("github.private_key_path requires github.app_id")
 	}
-	if c.RunnerPKI.Enabled && c.RunnerPKI.CACert == "" && c.RunnerPKI.CAKey == "" && c.RunnerPKI.EnrollToken == "" {
-		return fmt.Errorf("runner_pki.enabled requires runner_pki.ca_cert/ca_key or runner_pki.enroll_token")
+	// Runner PKI: enabled is authoritative — it demands the full CA pair at
+	// startup (the enroll token stays optional; single-use grants may be
+	// used instead). A half-configured pair is an error regardless of
+	// enabled: cert-only/key-only can never authenticate anything.
+	switch {
+	case c.RunnerPKI.CACert != "" && c.RunnerPKI.CAKey == "":
+		return fmt.Errorf("runner_pki.ca_cert requires runner_pki.ca_key")
+	case c.RunnerPKI.CAKey != "" && c.RunnerPKI.CACert == "":
+		return fmt.Errorf("runner_pki.ca_key requires runner_pki.ca_cert")
+	case c.RunnerPKI.Enabled && (c.RunnerPKI.CACert == "" || c.RunnerPKI.CAKey == ""):
+		return fmt.Errorf("runner_pki.enabled requires runner_pki.ca_cert and runner_pki.ca_key")
 	}
 	if c.Database.MaxConnections < 0 {
 		return fmt.Errorf("database.max_connections must not be negative, got %d", c.Database.MaxConnections)
@@ -337,8 +350,10 @@ func validateSecretBroker(c SecretBrokerConfig) error {
 }
 
 // ApplyEnv overlays KIWI_* environment variables onto the config (env
-// beats config file, loses to CLI flags). It cannot fail; the error return
-// keeps the precedence pipeline uniform.
+// beats config file, loses to CLI flags). Parsing is strict: an explicitly
+// provided malformed numeric/bool environment variable fails startup
+// instead of silently falling back to the config file or default — a typo
+// in an env override must never produce a silently different deployment.
 func (c *Config) ApplyEnv() error {
 	vars := []struct {
 		name string
@@ -394,42 +409,54 @@ func (c *Config) ApplyEnv() error {
 		}
 	}
 	if v, ok := os.LookupEnv("KIWI_DATABASE_MAX_CONNECTIONS"); ok {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("KIWI_DATABASE_MAX_CONNECTIONS: invalid integer %q", v)
+		}
+		if n > 0 {
 			c.Database.MaxConnections = n
 		}
 	}
 	if v, ok := os.LookupEnv("KIWI_GITHUB_APP_ID"); ok {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			c.GitHub.AppID = n
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return fmt.Errorf("KIWI_GITHUB_APP_ID: invalid integer %q", v)
 		}
+		c.GitHub.AppID = n
 	}
 	if v, ok := os.LookupEnv("KIWI_QUOTA_FAIL_OPEN"); ok {
-		if b, err := strconv.ParseBool(v); err == nil {
-			c.Quota.FailOpen = b
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("KIWI_QUOTA_FAIL_OPEN: invalid boolean %q", v)
 		}
+		c.Quota.FailOpen = b
 	}
-	applyEnvFloats(map[string]*float64{
-		"KIWI_REPO_CONCURRENCY":   &c.Quota.RepoConcurrency,
-		"KIWI_TEAM_CONCURRENCY":   &c.Quota.TeamConcurrency,
-		"KIWI_REPO_QUEUE_DEPTH":   &c.Quota.RepoQueueDepth,
-		"KIWI_TEAM_QUEUE_DEPTH":   &c.Quota.TeamQueueDepth,
-		"KIWI_DAILY_COST_LIMIT":   &c.Quota.DailyCostLimit,
-		"KIWI_DAILY_ENERGY_LIMIT": &c.Quota.DailyEnergyLimit,
-	})
-	return nil
-}
-
-// applyEnvFloats overlays numeric environment variables best-effort:
-// invalid values are ignored so a bad env var cannot break startup, while
-// valid values win over the config file.
-func applyEnvFloats(vars map[string]*float64) {
-	for name, dst := range vars {
-		if v, ok := os.LookupEnv(name); ok {
-			if f, err := strconv.ParseFloat(v, 64); err == nil {
-				*dst = f
+	// Numeric quota overrides: the KIWI_QUOTA_-prefixed spellings are the
+	// canonical names and win over the legacy unprefixed ones.
+	for _, q := range []struct {
+		name, legacy string
+		dst          *float64
+	}{
+		{"KIWI_QUOTA_REPO_CONCURRENCY", "KIWI_REPO_CONCURRENCY", &c.Quota.RepoConcurrency},
+		{"KIWI_QUOTA_TEAM_CONCURRENCY", "KIWI_TEAM_CONCURRENCY", &c.Quota.TeamConcurrency},
+		{"KIWI_QUOTA_REPO_QUEUE_DEPTH", "KIWI_REPO_QUEUE_DEPTH", &c.Quota.RepoQueueDepth},
+		{"KIWI_QUOTA_TEAM_QUEUE_DEPTH", "KIWI_TEAM_QUEUE_DEPTH", &c.Quota.TeamQueueDepth},
+		{"KIWI_QUOTA_DAILY_COST_LIMIT", "KIWI_DAILY_COST_LIMIT", &c.Quota.DailyCostLimit},
+		{"KIWI_QUOTA_DAILY_ENERGY_LIMIT", "KIWI_DAILY_ENERGY_LIMIT", &c.Quota.DailyEnergyLimit},
+	} {
+		v, ok := os.LookupEnv(q.name)
+		if !ok {
+			v, ok = os.LookupEnv(q.legacy)
+		}
+		if ok {
+			f, err := strconv.ParseFloat(v, 64)
+			if err != nil {
+				return fmt.Errorf("%s: invalid number %q", q.name, v)
 			}
+			*q.dst = f
 		}
 	}
+	return nil
 }
 
 // OverrideFromFlags applies CLI flags that were explicitly set (flags left

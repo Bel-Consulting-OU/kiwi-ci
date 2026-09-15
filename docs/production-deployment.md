@@ -91,6 +91,13 @@ kiwi runner --server https://ci.example.com \
   --token "$RUNNER_TOKEN" --labels linux,x64
 ```
 
+The runner bearer token is a SHARED credential: every runner presents the
+same token, so it authenticates "some registered runner" but is not a
+per-runner identity and cannot distinguish runners. Production strongly
+prefers persistent per-runner mTLS identities. The control plane fails
+closed: in production, an admin token without either a runner token or
+enforced runner mTLS is a startup error.
+
 For mTLS identity binding, create a runner CA once:
 
 ```bash
@@ -108,9 +115,18 @@ kiwi runner --server https://ci.example.com \
 ```
 
 The runner generates its key locally, the server signs a certificate
-with a `spiffe://kiwi/runner/<id>` identity, and all subsequent traffic
-is mutually authenticated. Keep the enrollment token short-lived; it is
-the bootstrap credential for runner identities.
+with a server-synthesized `spiffe://kiwi/runner/<id>` identity (CSR
+identity fields are discarded), and all subsequent traffic is mutually
+authenticated. Keep the enrollment token short-lived; it is the
+bootstrap credential for runner identities. Enrollment also supports
+single-use grants (`CreateEnrollGrant`) with expiry and optional label
+binding for automated runner provisioning.
+
+When a runner CA is configured, the shared HTTPS listener verifies
+client certificates when presented (`VerifyClientCertIfGiven`), and
+runner-tier routes demand a valid runner certificate
+(`--runner-require-client-certs`, default on); admin, forge and
+enrollment traffic stays reachable on the same listener.
 
 ## Health and metrics
 

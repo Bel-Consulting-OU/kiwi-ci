@@ -88,7 +88,12 @@ func (s *Server) SetRunnerCA(certPath, keyPath string) error {
 }
 
 // enroll signs a runner CSR after the enrollment token check already
-// performed by auth(). The issued certificate binds the runner to its ID.
+// performed by auth(). A request authenticated with a single-use grant
+// instead of the static enroll token has the grant consumed here (atomic
+// single-use, expiry and label binding) before any certificate is signed.
+// The issued certificate binds the runner to its authenticated ID; the CSR's
+// own identity fields are discarded (server-synthesized identity, see
+// runnerpki.SignRunnerCSR).
 func (s *Server) enroll(w http.ResponseWriter, r *http.Request) {
 	if s.RunnerCA == nil {
 		http.Error(w, "runner CA not configured", http.StatusServiceUnavailable)
@@ -103,6 +108,16 @@ func (s *Server) enroll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "runner_id is required", http.StatusBadRequest)
 		return
 	}
+	tok := enrollTokenFrom(r)
+	if s.RunnerEnrollToken == "" || !bearerOK(tok, s.RunnerEnrollToken) {
+		// Not the static enrollment token: the request must have been
+		// gated by a grant. Consume it (single-use + expiry + label
+		// binding) before signing.
+		if err := s.consumeEnrollGrant(tok, in.Labels); err != nil {
+			http.Error(w, err.Error(), http.StatusUnauthorized)
+			return
+		}
+	}
 	csrPEM, err := base64.StdEncoding.DecodeString(in.CSR)
 	if err != nil || len(csrPEM) == 0 || len(csrPEM) > 64<<10 {
 		http.Error(w, "csr must be base64-encoded PEM", http.StatusBadRequest)
@@ -116,6 +131,7 @@ func (s *Server) enroll(w http.ResponseWriter, r *http.Request) {
 	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: s.RunnerCA.Cert.Raw})
 	s.auditLocked("runner.enrolled", runnerID, "", "", "runner certificate enrolled", nil)
 	writeJSON(w, http.StatusOK, EnrollResponse{
+		RunnerID:      runnerID,
 		Certificate:   string(certPEM),
 		CACertificate: string(caPEM),
 		TTLSeconds:    int64(runnerCertTTL / time.Second),

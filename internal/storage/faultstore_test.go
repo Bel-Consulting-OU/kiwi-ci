@@ -35,6 +35,7 @@ type memSnapshot struct {
 	downstream   map[string]DownstreamLink
 	quotas       map[string]quotaCounts
 	cacheMans    map[string]CacheManifestRecord
+	claims       map[string]time.Time
 }
 
 func (m *memStore) snapshot() memSnapshot {
@@ -67,7 +68,16 @@ func (m *memStore) snapshot() memSnapshot {
 		downstream:   cloneDownstreamLinks(m.downstream),
 		quotas:       quotas,
 		cacheMans:    cacheMans,
+		claims:       cloneClaims(m.claims),
 	}
+}
+
+func cloneClaims(in map[string]time.Time) map[string]time.Time {
+	out := make(map[string]time.Time, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 func cloneDownstreamLinks(in map[string]DownstreamLink) map[string]DownstreamLink {
@@ -348,6 +358,24 @@ func faultOps() []opCase {
 			setup: seedRunAndJob,
 			call: func(s Store) error {
 				return s.(ArtifactContractStore).InsertJobContracts(ctx(), testJob.ID, testContracts)
+			},
+		},
+		{
+			name:  "ClaimSecretDelivery",
+			setup: seedRunAndJob,
+			call: func(s Store) error {
+				_, err := s.(SecretClaimStore).ClaimSecretDelivery(ctx(), testJob.ID, 1, "tok")
+				return err
+			},
+		},
+		{
+			name: "ReleaseSecretDelivery",
+			setup: func(m *memStore) {
+				seedRunAndJob(m)
+				_, _ = m.ClaimSecretDelivery(ctx(), testJob.ID, 1, "tok")
+			},
+			call: func(s Store) error {
+				return s.(SecretClaimReleaser).ReleaseSecretDelivery(ctx(), testJob.ID, 1, "tok")
 			},
 		},
 		{

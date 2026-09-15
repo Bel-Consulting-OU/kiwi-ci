@@ -1,8 +1,11 @@
 package forge
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -90,18 +93,79 @@ func TestForgejoChangedFilesAndStatus(t *testing.T) {
 	}))
 	defer ts.Close()
 	f := &Forgejo{BaseURL: ts.URL}
-	files, err := f.ChangedFiles(context.Background(), EventContext{Repository: Repository{FullName: "octocat/hello-world"}, BaseSHA: "a", HeadSHA: "b"})
+	res, err := f.ChangedFiles(context.Background(), EventContext{Repository: Repository{FullName: "octocat/hello-world"}, BaseSHA: "a", HeadSHA: "b"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(files) != 2 || files[0] != "go.mod" {
-		t.Fatalf("unexpected files: %v", files)
+	if !res.Complete || len(res.Files) != 2 || res.Files[0] != "go.mod" {
+		t.Fatalf("unexpected result: %+v", res)
 	}
 	if err := f.PublishCheck(context.Background(), "octocat/hello-world", "sha", "build", "completed", "cancelled", "", "cancelled", nil); err != nil {
 		t.Fatal(err)
 	}
 	if statusBody["state"] != "error" || statusBody["context"] != "Kiwi / build" {
 		t.Fatalf("bad status body: %v", statusBody)
+	}
+}
+
+func TestForgejoChangedFilesCompleteness(t *testing.T) {
+	ec := EventContext{Event: "push", HeadSHA: "abc", BaseSHA: "def", Repository: Repository{FullName: "octocat/hello-world"}}
+	// Three full pages hit the 300-file cap: possibly truncated.
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/compare/") {
+			http.NotFound(w, r)
+			return
+		}
+		files := []map[string]string{}
+		for i := 0; i < githubComparePerPage; i++ {
+			files = append(files, map[string]string{"filename": fmt.Sprintf("f%02d.go", i)})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"files": files})
+	}))
+	f := &Forgejo{BaseURL: ts.URL}
+	res, err := f.ChangedFiles(context.Background(), ec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Complete {
+		t.Fatalf("300-file diff must be marked incomplete: %+v", res)
+	}
+	if len(res.Files) != githubComparePerPage*githubCompareMaxPages {
+		t.Fatalf("want %d files, got %d", githubComparePerPage*githubCompareMaxPages, len(res.Files))
+	}
+	ts.Close()
+
+	// A short page is the full diff: complete.
+	ts2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/compare/") {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]string{{"filename": "a.go"}}})
+	}))
+	defer ts2.Close()
+	f2 := &Forgejo{BaseURL: ts2.URL}
+	res, err = f2.ChangedFiles(context.Background(), ec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Complete || len(res.Files) != 1 || res.Files[0] != "a.go" {
+		t.Fatalf("short diff must be complete: %+v", res)
+	}
+}
+
+func TestForgejoFetchFileOversizeRejected(t *testing.T) {
+	big := bytes.Repeat([]byte{'a'}, maxFetchFileBytes+1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"content":  base64.StdEncoding.EncodeToString(big),
+			"encoding": "base64",
+		})
+	}))
+	defer ts.Close()
+	f := &Forgejo{BaseURL: ts.URL}
+	if _, err := f.FetchFile(context.Background(), "octocat/hello-world", ".kiwi/pipeline.yaml", "main"); err == nil {
+		t.Fatal("oversize file must be rejected")
 	}
 }
 

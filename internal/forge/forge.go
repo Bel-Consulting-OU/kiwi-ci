@@ -55,6 +55,18 @@ type CheckAnnotation struct {
 	Message string `json:"message"`
 }
 
+// ChangedFilesResult is the outcome of a changed-files fetch.
+type ChangedFilesResult struct {
+	// Files is the list of files changed between the event's base and
+	// head commits.
+	Files []string
+	// Complete is true only when Files is the authoritative full diff:
+	// not truncated, not a pagination-limited partial view, not a
+	// fallback. Trigger evaluation with include-path filters must fail
+	// closed when Complete is false.
+	Complete bool
+}
+
 // Forge is the integration surface for one forge. Implementations must be
 // safe for concurrent use.
 type Forge interface {
@@ -68,9 +80,11 @@ type Forge interface {
 	// FetchFile returns a raw file's contents at ref.
 	FetchFile(ctx context.Context, repoFullName, path, ref string) (string, error)
 	// ChangedFiles lists files changed between the event's base and head
-	// commits. Implementations may return (nil, nil) when the diff cannot
-	// be computed.
-	ChangedFiles(ctx context.Context, ec EventContext) ([]string, error)
+	// commits. Complete reports whether the list is the authoritative
+	// full diff; when it is false the caller must not use Files for
+	// include-path trigger decisions (fail closed) or treat the list as
+	// exhaustive.
+	ChangedFiles(ctx context.Context, ec EventContext) (ChangedFilesResult, error)
 	// PublishCheck publishes pipeline state. On GitHub this creates or
 	// updates a check run; on GitLab/Forgejo it falls back to a commit
 	// status. Implementations must be idempotent for identical arguments.
@@ -108,6 +122,16 @@ func NoRedirectClient(base *http.Client) *http.Client {
 	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return &c
 }
+
+// Response-size bounds for forge API GETs. Pipeline files are fetched into
+// memory wholesale, so 8 MiB caps them; compare (diff) payloads are capped
+// at 16 MiB; API error bodies at 4 KiB.
+const (
+	maxFetchFileBytes    = 8 << 20
+	maxPipelineJSONBytes = 16 << 20 // base64-encoded content plus envelope
+	maxDiffResponseBytes = 16 << 20
+	maxAPIErrorBodyBytes = 4096
+)
 
 // MatchesTrigger evaluates a pipeline's `on` section against a webhook
 // event. It returns whether the event should enqueue a run and the trigger

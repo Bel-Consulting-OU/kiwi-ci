@@ -192,6 +192,7 @@ var knownFieldTables = map[string]map[string]bool{
 	"on.*": {
 		"branches": true, "branches_ignore": true, "tags": true, "tags_ignore": true,
 		"paths": true, "paths_ignore": true, "actions": true, "draft": true,
+		"cron": true,
 	},
 	"inputs.*":     {"type": true, "required": true, "default": true, "options": true, "description": true},
 	"packages.*":   {"paths": true, "depends_on": true},

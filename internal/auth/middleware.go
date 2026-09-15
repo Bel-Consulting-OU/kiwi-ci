@@ -70,21 +70,47 @@ func Middleware(store *TokenStore, adminToken string, next http.Handler, logger 
 	})
 }
 
-// isPublicPath mirrors the server's own public-path classification (webhook
-// intake, dashboard + its assets, login/logout, OIDC discovery/JWKS and OIDC
-// token issuance) so that strict token-store mode does not lock out forge
-// webhooks or the dashboard. Authorization for these paths is enforced by
-// the server's auth() chain.
+// PublicRoute is the single route classifier shared by the auth middleware
+// and the server's tier classification (internal/server/tiers.go): it
+// reports whether a request needs no bearer-token/store-principal
+// authentication at the auth layer. The shared table covers webhook intake,
+// the dashboard and its assets, login/logout, OIDC discovery/JWKS/token
+// issuance, the health endpoints, and runner enrollment (which
+// authenticates with the enrollment token/grant inside the server's own
+// tier gate instead of a store principal). /metrics stays admin-tier:
+// operational state is not public.
+func PublicRoute(method, path string) bool {
+	if strings.HasPrefix(path, "/hooks/") ||
+		path == "/" ||
+		strings.HasPrefix(path, "/static/") ||
+		path == "/api/v1/login" ||
+		path == "/api/v1/logout" ||
+		path == "/readiness" ||
+		path == "/liveness" ||
+		path == "/.well-known/openid-configuration" ||
+		path == "/api/v1/oidc/jwks" {
+		return true
+	}
+	// The job OIDC issuance endpoint is public at the auth layer because it
+	// authenticates with the lease token embedded in the body.
+	if method == http.MethodPost && strings.HasSuffix(path, "/oidc") {
+		return true
+	}
+	// Runner enrollment is public to the middleware (the enrollment
+	// token/grant is not a store principal); the server's auth() tier gate
+	// authenticates it.
+	if method == http.MethodPost && path == "/api/v1/runners/enroll" {
+		return true
+	}
+	return false
+}
+
+// isPublicPath delegates to the shared PublicRoute classifier so strict
+// token-store mode does not lock out forge webhooks, the dashboard, health
+// probes or enrollment. Authorization for these paths is enforced by the
+// server's auth() chain.
 func isPublicPath(r *http.Request) bool {
-	p := r.URL.Path
-	return strings.HasPrefix(p, "/hooks/") ||
-		p == "/" ||
-		strings.HasPrefix(p, "/static/") ||
-		p == "/api/v1/login" ||
-		p == "/api/v1/logout" ||
-		p == "/.well-known/openid-configuration" ||
-		p == "/api/v1/oidc/jwks" ||
-		(r.Method == http.MethodPost && strings.HasSuffix(p, "/oidc"))
+	return PublicRoute(r.Method, r.URL.Path)
 }
 
 func tokenMatches(got, want string) bool {

@@ -75,3 +75,43 @@ func verifyCompiledPayload(spec *pipeline.Spec, p *model.CompiledJobPayload, tru
 	}
 	return cj, caps, true, nil
 }
+
+// effectivePolicySandbox is the runner-side extension of the compiled
+// payload's effective policy: policy.Capabilities carries the capability
+// intersection, and the daemon-level sandbox requirements (rootless,
+// read_only_rootfs) ride the same policy JSON as additive fields emitted by
+// the control plane's policy compilation. Absent fields decode as false, so
+// legacy payloads that carry no sandbox requirements are no-ops.
+type effectivePolicySandbox struct {
+	Rootless       bool `json:"rootless"`
+	ReadOnlyRootFS bool `json:"read_only_rootfs"`
+}
+
+// payloadSandboxRequirements decodes the sandbox requirements the effective
+// policy demands. A nil payload or a payload without an effective policy
+// yields no requirements (the local legacy compile path is authoritative
+// for those).
+func payloadSandboxRequirements(p *model.CompiledJobPayload) (effectivePolicySandbox, error) {
+	var out effectivePolicySandbox
+	if p == nil || p.EffectivePolicy == nil {
+		return out, nil
+	}
+	raw, err := json.Marshal(p.EffectivePolicy)
+	if err != nil {
+		return out, fmt.Errorf("encode effective policy: %w", err)
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return out, fmt.Errorf("decode effective policy: %w", err)
+	}
+	return out, nil
+}
+
+// applyEffectiveSandbox copies the effective policy's sandbox requirements
+// into the compiled job before execution. Requirements can only strengthen:
+// a job that did not request rootless gains the requirement when the
+// effective policy demands it, and an explicit job-level request is never
+// weakened.
+func applyEffectiveSandbox(cj *pipeline.CompiledJob, req effectivePolicySandbox) {
+	cj.Job.Sandbox.Rootless = cj.Job.Sandbox.Rootless || req.Rootless
+	cj.Job.Sandbox.ReadOnlyRootFS = cj.Job.Sandbox.ReadOnlyRootFS || req.ReadOnlyRootFS
+}

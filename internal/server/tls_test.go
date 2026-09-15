@@ -106,8 +106,12 @@ func TestTLSConfigVerifiesRunnerClientCerts(t *testing.T) {
 	if tlsCfg.MinVersion != tls.VersionTLS12 {
 		t.Fatalf("MinVersion = %d, want TLS 1.2 floor", tlsCfg.MinVersion)
 	}
-	if tlsCfg.ClientAuth != tls.RequireAndVerifyClientCert {
-		t.Fatalf("ClientAuth = %v, want RequireAndVerifyClientCert", tlsCfg.ClientAuth)
+	// The listener is SHARED with admin/forge/dashboard traffic: the
+	// handshake verifies client certificates when presented but never
+	// requires them. The mandatory-certificate rule lives in the
+	// runner-tier HTTP authorization.
+	if tlsCfg.ClientAuth != tls.VerifyClientCertIfGiven {
+		t.Fatalf("ClientAuth = %v, want VerifyClientCertIfGiven on the shared listener", tlsCfg.ClientAuth)
 	}
 	ts := httptest.NewUnstartedServer(s.Handler())
 	ts.TLS = tlsCfg
@@ -145,11 +149,29 @@ func TestTLSConfigVerifiesRunnerClientCerts(t *testing.T) {
 		t.Fatalf("next with valid client cert: got %d, want 200/204", resp.StatusCode)
 	}
 
-	// Without a client certificate the handshake itself fails.
+	// Without a client certificate the handshake still succeeds (shared
+	// listener), but runner-tier routes are refused at the HTTP layer even
+	// with a valid runner bearer: 401.
 	noCert := ts.Client()
 	noCert.Transport = &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: true}}
-	if _, err := noCert.Get(ts.URL + "/readiness"); err == nil {
-		t.Fatal("expected handshake failure without a client certificate")
+	publicResp, err := noCert.Get(ts.URL + "/readiness")
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicResp.Body.Close()
+	if publicResp.StatusCode != http.StatusOK {
+		t.Fatalf("cert-less /readiness on shared listener: got %d, want 200", publicResp.StatusCode)
+	}
+	noCertReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/runners/runner-1/next", stringsReader("{}"))
+	noCertReq.Header.Set("Authorization", "Bearer runner-tok")
+	noCertReq.Header.Set("Content-Type", "application/json")
+	noCertResp, err := noCert.Do(noCertReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noCertResp.Body.Close()
+	if noCertResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("runner-tier route without client cert: got %d, want 401", noCertResp.StatusCode)
 	}
 
 	// A valid certificate acting for a different runner ID fails the

@@ -128,6 +128,20 @@ type Job struct {
 	// Cost and EnergyWh are the usage recorded at completion. Additive.
 	Cost     float64 `json:"cost,omitempty"`
 	EnergyWh float64 `json:"energy_wh,omitempty"`
+	// CPURequest/MemoryRequest/DiskRequest/PIDsRequest carry the job's
+	// declared resource requirements (pipeline Job.Resources), persisted in
+	// the job payload so scheduling and future runner/backend enforcement
+	// can read them without recompiling. Additive.
+	CPURequest    float64 `json:"cpu_request,omitempty"`
+	MemoryRequest int64   `json:"memory_request,omitempty"`
+	DiskRequest   int64   `json:"disk_request,omitempty"`
+	PIDsRequest   int     `json:"pids_request,omitempty"`
+	// QueueDeadline is the absolute queue-residence deadline derived from
+	// the job's queue_timeout at enqueue (CreatedAt + queue_timeout). The
+	// scheduler skips candidates past the deadline and RecoverExpired
+	// cancels them with reason "queue timeout". Nil means no timeout.
+	// Additive; payload-based, no dedicated storage column.
+	QueueDeadline *time.Time `json:"queue_deadline,omitempty"`
 }
 
 type Runner struct {

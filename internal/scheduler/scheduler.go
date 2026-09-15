@@ -13,6 +13,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
@@ -139,11 +141,22 @@ func (s *DBScheduler) IsLeader(ctx context.Context) bool {
 // and concurrency group are cancelled the same way the in-memory scheduler's
 // cancelRunLocked does. deps carries the same dependency edges already
 // embedded in each job's Needs field.
+//
+// Queue deadlines are materialized here: a job whose QueueDeadline is unset
+// but whose compiled payload declares a queue_timeout gets its deadline
+// (CreatedAt + timeout) persisted with the insert, so the deadline is set at
+// enqueue for every DB-mode job.
 func (s *DBScheduler) Enqueue(ctx context.Context, run model.Run, jobs map[string]model.Job, deps map[string][]string, cancelInProgress bool) error {
 	if err := s.Store.InsertRun(ctx, run); err != nil {
 		return fmt.Errorf("scheduler: insert run: %w", err)
 	}
 	for id, j := range jobs {
+		if j.QueueDeadline == nil {
+			if to := queueTimeoutFromPayload(j); to > 0 {
+				dl := j.CreatedAt.Add(to)
+				j.QueueDeadline = &dl
+			}
+		}
 		if err := s.Store.InsertJob(ctx, j); err != nil {
 			return fmt.Errorf("scheduler: insert job %s: %w", id, err)
 		}
@@ -198,6 +211,12 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 	envJobs := map[string][]model.Job{}
 	for _, candidate := range queued {
 		if !satisfiesLabels(ri.Labels, candidate.RequiredLabels) {
+			continue
+		}
+		// Queue-timeout expiry: a candidate whose queue deadline has passed
+		// is never leased; RecoverExpired cancels it. Both the atomic-lease
+		// and the plain-lease branches below share this gate.
+		if dl := queueDeadlineFor(candidate); dl != nil && !dl.After(now) {
 			continue
 		}
 		// Placement regions: a region-constrained job only leases to a
@@ -444,6 +463,30 @@ func (s *DBScheduler) RecoverExpired(ctx context.Context, now time.Time) error {
 		}
 		changed := false
 		for _, j := range all {
+			// Queue-timeout expiry: a queued (or approval-waiting) job past
+			// its queue deadline is cancelled terminally, independent of its
+			// attempt count, and dependents are recomputed below.
+			if j.Status == model.StatusQueued || j.Status == model.StatusWaitingApproval {
+				dl := queueDeadlineFor(j)
+				if dl == nil || dl.After(now) {
+					continue
+				}
+				fin := now
+				j.Status = model.StatusCancelled
+				j.Error = "queue timeout"
+				j.FinishedAt = &fin
+				j.LeaseRunnerID = ""
+				j.LeaseTokenHash = nil
+				j.LeaseExpiresAt = nil
+				s.appendAudit(ctx, "job.queue_timeout", "scheduler", j.RunID, j.ID, "job cancelled after queue deadline", map[string]string{"job": j.Key})
+				if err := s.Store.UpdateJob(ctx, j); err != nil {
+					log.Printf("scheduler: expire queue deadline for job %s: %v", j.ID, err)
+					continue
+				}
+				jobs[j.ID] = j
+				changed = true
+				continue
+			}
 			if j.Status != model.StatusRunning {
 				continue
 			}
@@ -631,6 +674,54 @@ func defaultToken() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// queueDeadlineFor returns the job's queue deadline: the persisted
+// QueueDeadline field when present, otherwise the deadline derived from the
+// compiled payload's queue_timeout (CreatedAt + timeout). Jobs without
+// either have no deadline and never expire. The payload fallback keeps
+// rows persisted before the QueueDeadline field existed expiring correctly.
+func queueDeadlineFor(j model.Job) *time.Time {
+	if j.QueueDeadline != nil {
+		return j.QueueDeadline
+	}
+	to := queueTimeoutFromPayload(j)
+	if to <= 0 {
+		return nil
+	}
+	dl := j.CreatedAt.Add(to)
+	return &dl
+}
+
+// queueTimeoutFromPayload extracts the compiled job's queue_timeout from
+// the stored compiled payload (CompiledJobPayload.EffectiveJob), so queue
+// deadlines are payload-based and need no dedicated storage column.
+func queueTimeoutFromPayload(j model.Job) time.Duration {
+	if j.CompiledJobPayload == nil || j.CompiledJobPayload.EffectiveJob == nil {
+		return 0
+	}
+	var b []byte
+	switch v := j.CompiledJobPayload.EffectiveJob.(type) {
+	case json.RawMessage:
+		b = v
+	case []byte:
+		b = v
+	case string:
+		b = []byte(v)
+	default:
+		var err error
+		if b, err = json.Marshal(v); err != nil {
+			return 0
+		}
+	}
+	var cj pipeline.CompiledJob
+	if err := json.Unmarshal(b, &cj); err != nil {
+		return 0
+	}
+	if cj.Job.QueueTimeout.Duration <= 0 {
+		return 0
+	}
+	return cj.Job.QueueTimeout.Duration
 }
 
 // newID returns a 128-bit crypto/rand identifier hex-encoded, matching the

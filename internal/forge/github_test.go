@@ -1,9 +1,11 @@
 package forge
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -241,15 +243,103 @@ func TestGitHubChangedFiles(t *testing.T) {
 		Event: "pull_request", HeadSHA: "abc", BaseSHA: "def",
 		Repository: Repository{Forge: "github", FullName: "octocat/hello-world"},
 	}
-	files, err := g.ChangedFiles(context.Background(), ec)
+	res, err := g.ChangedFiles(context.Background(), ec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(files) != 2 || files[0] != "src/main.go" || files[1] != "docs/readme.md" {
-		t.Fatalf("unexpected files: %v", files)
+	if !res.Complete || len(res.Files) != 2 || res.Files[0] != "src/main.go" || res.Files[1] != "docs/readme.md" {
+		t.Fatalf("unexpected result: %+v", res)
 	}
-	if files, err = g.ChangedFiles(context.Background(), EventContext{}); err != nil || files != nil {
-		t.Fatalf("empty event should yield nil files: %v %v", files, err)
+	if res, err = g.ChangedFiles(context.Background(), EventContext{}); err != nil || res.Complete || res.Files != nil {
+		t.Fatalf("empty event should yield an incomplete result with nil files: %+v %v", res, err)
+	}
+}
+
+func TestGitHubChangedFilesCompleteness(t *testing.T) {
+	ec := EventContext{Event: "pull_request", HeadSHA: "abc", BaseSHA: "def", Repository: Repository{FullName: "octocat/hello-world"}}
+
+	// A short first page is the full diff: complete.
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/compare/") {
+			http.NotFound(w, r)
+			return
+		}
+		files := []map[string]string{}
+		for i := 0; i < 7; i++ {
+			files = append(files, map[string]string{"filename": fmt.Sprintf("f%02d.go", i)})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"files": files})
+	}))
+	g := &GitHub{BaseURL: ts.URL}
+	res, err := g.ChangedFiles(context.Background(), ec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Complete || len(res.Files) != 7 {
+		t.Fatalf("short diff must be complete: %+v", res)
+	}
+	ts.Close()
+
+	// Three full pages hit the 300-file API cap: possibly truncated.
+	ts2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/compare/") {
+			http.NotFound(w, r)
+			return
+		}
+		files := []map[string]string{}
+		for i := 0; i < githubComparePerPage; i++ {
+			files = append(files, map[string]string{"filename": fmt.Sprintf("f%02d.go", i)})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"files": files})
+	}))
+	defer ts2.Close()
+	g2 := &GitHub{BaseURL: ts2.URL}
+	res, err = g2.ChangedFiles(context.Background(), ec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Complete {
+		t.Fatalf("300-file diff must be marked incomplete: %+v", res)
+	}
+	if len(res.Files) != githubComparePerPage*githubCompareMaxPages {
+		t.Fatalf("want %d files, got %d", githubComparePerPage*githubCompareMaxPages, len(res.Files))
+	}
+
+	// API errors propagate.
+	ts3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer ts3.Close()
+	g3 := &GitHub{BaseURL: ts3.URL}
+	if _, err := g3.ChangedFiles(context.Background(), ec); err == nil {
+		t.Fatal("API error must propagate")
+	}
+}
+
+func TestGitHubChangedFilesOversizeResponseRejected(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(strings.Repeat("x", maxDiffResponseBytes+1)))
+	}))
+	defer ts.Close()
+	g := &GitHub{BaseURL: ts.URL}
+	ec := EventContext{Event: "push", HeadSHA: "a", BaseSHA: "b", Repository: Repository{FullName: "o/r"}}
+	if _, err := g.ChangedFiles(context.Background(), ec); err == nil {
+		t.Fatal("oversize compare response must be rejected")
+	}
+}
+
+func TestGitHubFetchFileOversizeRejected(t *testing.T) {
+	big := bytes.Repeat([]byte{'a'}, maxFetchFileBytes+1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"content":  base64.StdEncoding.EncodeToString(big),
+			"encoding": "base64",
+		})
+	}))
+	defer ts.Close()
+	g := &GitHub{BaseURL: ts.URL}
+	if _, err := g.FetchFile(context.Background(), "octocat/hello-world", ".kiwi/pipeline.yaml", "main"); err == nil {
+		t.Fatal("oversize file must be rejected")
 	}
 }
 

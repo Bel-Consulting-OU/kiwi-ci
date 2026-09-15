@@ -231,12 +231,15 @@ func (g *GitLab) FetchFile(ctx context.Context, repoFullName, path, ref string) 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, maxAPIErrorBodyBytes))
 		return "", fmt.Errorf("GitLab API %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
-	b, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	b, err := io.ReadAll(io.LimitReader(resp.Body, maxFetchFileBytes+1))
 	if err != nil {
 		return "", err
+	}
+	if len(b) > maxFetchFileBytes {
+		return "", fmt.Errorf("GitLab file exceeds %d byte limit", maxFetchFileBytes)
 	}
 	return string(b), nil
 }
@@ -248,40 +251,57 @@ type gitLabComparePayload struct {
 	} `json:"diffs"`
 }
 
-func (g *GitLab) ChangedFiles(ctx context.Context, ec EventContext) ([]string, error) {
+// GitLab compare paginates diffs (per_page up to 100). A complete list is
+// claimed only when pagination terminates on a short page; a 4xx (unknown
+// refs, private repo, ...) means the diff is not available and yields an
+// incomplete result instead of an error.
+const gitLabComparePerPage = 100
+
+func (g *GitLab) ChangedFiles(ctx context.Context, ec EventContext) (ChangedFilesResult, error) {
 	if ec.HeadSHA == "" || ec.BaseSHA == "" || ec.Repository.FullName == "" {
-		return nil, nil
+		return ChangedFilesResult{}, nil
 	}
-	u := fmt.Sprintf("%s/projects/%s/repository/compare?from=%s&to=%s", g.apiBase(), url.QueryEscape(ec.Repository.FullName), url.QueryEscape(ec.BaseSHA), url.QueryEscape(ec.HeadSHA))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return nil, err
-	}
-	if tok := g.apiToken(); tok != "" {
-		req.Header.Set("PRIVATE-TOKEN", tok)
-	}
-	resp, err := g.httpClient().Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("GitLab compare API %s: %s", resp.Status, strings.TrimSpace(string(b)))
-	}
-	var v gitLabComparePayload
-	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
-		return nil, err
-	}
-	files := make([]string, 0, len(v.Diffs))
-	for _, d := range v.Diffs {
-		name := d.NewPath
-		if name == "" {
-			name = d.OldPath
+	files := make([]string, 0, gitLabComparePerPage)
+	for page := 1; ; page++ {
+		u := fmt.Sprintf("%s/projects/%s/repository/compare?from=%s&to=%s&per_page=%d&page=%d",
+			g.apiBase(), url.QueryEscape(ec.Repository.FullName), url.QueryEscape(ec.BaseSHA), url.QueryEscape(ec.HeadSHA), gitLabComparePerPage, page)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return ChangedFilesResult{}, err
 		}
-		files = append(files, name)
+		if tok := g.apiToken(); tok != "" {
+			req.Header.Set("PRIVATE-TOKEN", tok)
+		}
+		resp, err := g.httpClient().Do(req)
+		if err != nil {
+			return ChangedFilesResult{}, err
+		}
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			resp.Body.Close()
+			return ChangedFilesResult{Files: files, Complete: false}, nil
+		}
+		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, maxAPIErrorBodyBytes))
+			resp.Body.Close()
+			return ChangedFilesResult{}, fmt.Errorf("GitLab compare API %s: %s", resp.Status, strings.TrimSpace(string(b)))
+		}
+		var v gitLabComparePayload
+		err = json.NewDecoder(io.LimitReader(resp.Body, maxDiffResponseBytes)).Decode(&v)
+		resp.Body.Close()
+		if err != nil {
+			return ChangedFilesResult{}, err
+		}
+		for _, d := range v.Diffs {
+			name := d.NewPath
+			if name == "" {
+				name = d.OldPath
+			}
+			files = append(files, name)
+		}
+		if len(v.Diffs) < gitLabComparePerPage {
+			return ChangedFilesResult{Files: files, Complete: true}, nil
+		}
 	}
-	return files, nil
 }
 
 // PublishCheck falls back to a commit status: GitLab has no check-runs

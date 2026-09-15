@@ -3,6 +3,7 @@ package secrets
 import (
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -91,12 +92,99 @@ func TestMaskerMaskMultiCRLFLines(t *testing.T) {
 
 func TestMaskerOverLimitSecretsIgnored(t *testing.T) {
 	m := &Masker{}
-	for i := 0; i < 64; i++ {
+	for i := 0; i < MaxSecretNames; i++ {
 		m.Add(fmt.Sprintf("secret-%03d-value", i))
 	}
 	m.Add("extra-secret-999")
 	if got := m.MaskMulti("extra-secret-999"); got != "extra-secret-999" {
-		t.Fatalf("secret beyond the 64 limit should be ignored, got %q", got)
+		t.Fatalf("secret beyond the capacity should be ignored, got %q", got)
+	}
+}
+
+func TestMaskerAddStrictCapacityBoundary(t *testing.T) {
+	m := &Masker{}
+	for i := 0; i < MaxSecretNames; i++ {
+		if err := m.AddStrict(fmt.Sprintf("secret-%03d-value", i)); err != nil {
+			t.Fatalf("AddStrict within capacity: %v", err)
+		}
+	}
+	if m.Len() != MaxSecretNames {
+		t.Fatalf("Len = %d, want %d", m.Len(), MaxSecretNames)
+	}
+	if m.Capacity() != MaxSecretNames {
+		t.Fatalf("Capacity = %d, want %d", m.Capacity(), MaxSecretNames)
+	}
+	// The capacity+1-th addition fails closed instead of being dropped.
+	err := m.AddStrict("extra-secret-999")
+	if !errors.Is(err, ErrMaskerCapacity) {
+		t.Fatalf("AddStrict beyond capacity: want ErrMaskerCapacity, got %v", err)
+	}
+	if m.Len() != MaxSecretNames {
+		t.Fatalf("Len after rejected add = %d, want %d", m.Len(), MaxSecretNames)
+	}
+	// Add (compat) silently drops the same overflow.
+	m.Add("extra-secret-999")
+	if m.Len() != MaxSecretNames {
+		t.Fatalf("Add overflow mutated the masker: Len = %d", m.Len())
+	}
+}
+
+func TestMaskerAddStrictOversizedValue(t *testing.T) {
+	m := &Masker{}
+	if err := m.AddStrict(strings.Repeat("x", 8193)); !errors.Is(err, ErrMaskValueInvalid) {
+		t.Fatalf("oversized value: want ErrMaskValueInvalid, got %v", err)
+	}
+	if err := m.AddStrict("ab"); !errors.Is(err, ErrMaskValueInvalid) {
+		t.Fatalf("short value: want ErrMaskValueInvalid, got %v", err)
+	}
+	if m.Len() != 0 {
+		t.Fatalf("rejected values registered: Len = %d", m.Len())
+	}
+}
+
+func TestMaskerContainsSecretRawAndDerived(t *testing.T) {
+	raw := "tok:en abc/123"
+	m := &Masker{}
+	m.Add(raw)
+	if !m.ContainsSecret("value=" + raw) {
+		t.Fatal("raw secret not detected")
+	}
+	if !m.ContainsSecret("v=" + url.QueryEscape(raw)) {
+		t.Fatal("query-escaped secret not detected")
+	}
+	if !m.ContainsSecret("h=" + hex.EncodeToString([]byte(raw))) {
+		t.Fatal("hex secret not detected")
+	}
+	if !m.ContainsSecret("b=" + base64.StdEncoding.EncodeToString([]byte(raw))) {
+		t.Fatal("base64 secret not detected")
+	}
+	if m.ContainsSecret("clean output with nothing sensitive") {
+		t.Fatal("false positive on clean output")
+	}
+}
+
+func TestMaskerTaintCheckOutputs(t *testing.T) {
+	m := &Masker{}
+	m.Add("sup3r-secret")
+	err := m.TaintCheck(
+		map[string]string{"out": "clean value", "leak": "token=sup3r-secret"},
+		nil,
+	)
+	if !errors.Is(err, ErrTainted) {
+		t.Fatalf("tainted top-level output: want ErrTainted, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "leak") {
+		t.Fatalf("taint error must name the offending key: %v", err)
+	}
+	err = m.TaintCheck(
+		map[string]string{"out": "clean"},
+		map[string]map[string]string{"deploy": {"token": "echo sup3r-secret"}},
+	)
+	if !errors.Is(err, ErrTainted) || !strings.Contains(err.Error(), "deploy") {
+		t.Fatalf("tainted step output: want ErrTainted naming the step, got %v", err)
+	}
+	if err := m.TaintCheck(map[string]string{"a": "1"}, map[string]map[string]string{"s": {"b": "2"}}); err != nil {
+		t.Fatalf("clean outputs rejected: %v", err)
 	}
 }
 

@@ -26,17 +26,15 @@ const (
 )
 
 // publicPath reports whether the request is public (no bearer token
-// required). The job OIDC issuance endpoint is public at the auth layer
-// because it authenticates with the lease token embedded in the body.
+// required). It delegates to the shared auth.PublicRoute classifier so the
+// auth middleware and the tier gate can never drift; enrollment is carved
+// out because it needs its own tier gate (the enrollment token/grant) even
+// though the middleware treats it as public.
 func publicPath(r *http.Request) bool {
-	path := r.URL.Path
-	if strings.HasPrefix(path, "/hooks/") || path == "/" || strings.HasPrefix(path, "/static/") ||
-		path == "/api/v1/login" || path == "/api/v1/logout" ||
-		path == "/readiness" || path == "/liveness" ||
-		path == "/.well-known/openid-configuration" || path == "/api/v1/oidc/jwks" {
-		return true
+	if r.Method == http.MethodPost && r.URL.Path == "/api/v1/runners/enroll" {
+		return false
 	}
-	return r.Method == http.MethodPost && strings.HasSuffix(path, "/oidc")
+	return auth.PublicRoute(r.Method, r.URL.Path)
 }
 
 // runnerPath reports whether the route is runner-tier: the bearer must be

@@ -196,14 +196,14 @@ func (g *GitHub) FetchFile(ctx context.Context, repoFullName, path, ref string) 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, maxAPIErrorBodyBytes))
 		return "", fmt.Errorf("GitHub API %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
 	var v struct {
 		Content  string `json:"content"`
 		Encoding string `json:"encoding"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxPipelineJSONBytes)).Decode(&v); err != nil {
 		return "", err
 	}
 	if v.Encoding != "base64" {
@@ -212,6 +212,9 @@ func (g *GitHub) FetchFile(ctx context.Context, repoFullName, path, ref string) 
 	b, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(v.Content, "\n", ""))
 	if err != nil {
 		return "", err
+	}
+	if len(b) > maxFetchFileBytes {
+		return "", fmt.Errorf("GitHub file exceeds %d byte limit", maxFetchFileBytes)
 	}
 	return string(b), nil
 }
@@ -222,39 +225,65 @@ type githubComparePayload struct {
 	} `json:"files"`
 }
 
-func (g *GitHub) ChangedFiles(ctx context.Context, ec EventContext) ([]string, error) {
+// GitHub caps compare-API diffs at 300 files; pages are fetched 100 at a
+// time. A complete list is only claimed when pagination terminated on a
+// short page, so exactly-300-file diffs are conservatively incomplete.
+const (
+	githubComparePerPage  = 100
+	githubCompareMaxPages = 3
+)
+
+func (g *GitHub) ChangedFiles(ctx context.Context, ec EventContext) (ChangedFilesResult, error) {
 	if ec.HeadSHA == "" || ec.BaseSHA == "" || ec.Repository.FullName == "" {
-		return nil, nil
+		return ChangedFilesResult{}, nil
 	}
-	u := fmt.Sprintf("%s/repos/%s/compare/%s...%s", g.apiBase(), ec.Repository.FullName, url.PathEscape(ec.BaseSHA), url.PathEscape(ec.HeadSHA))
+	files := make([]string, 0, githubComparePerPage)
+	for page := 1; page <= githubCompareMaxPages; page++ {
+		u := fmt.Sprintf("%s/repos/%s/compare/%s...%s?per_page=%d&page=%d",
+			g.apiBase(), ec.Repository.FullName, url.PathEscape(ec.BaseSHA), url.PathEscape(ec.HeadSHA), githubComparePerPage, page)
+		pageFiles, pageFull, err := g.changedFilesPage(ctx, ec.Repository.FullName, u)
+		if err != nil {
+			return ChangedFilesResult{}, err
+		}
+		files = append(files, pageFiles...)
+		if !pageFull {
+			return ChangedFilesResult{Files: files, Complete: true}, nil
+		}
+	}
+	// Three full pages: the API truncates compare diffs at 300 files, so
+	// the list may be incomplete.
+	return ChangedFilesResult{Files: files, Complete: false}, nil
+}
+
+func (g *GitHub) changedFilesPage(ctx context.Context, repoFullName, u string) ([]string, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
-	if tok, err := g.authToken(ctx, ec.Repository.FullName); err != nil {
-		return nil, err
+	if tok, err := g.authToken(ctx, repoFullName); err != nil {
+		return nil, false, err
 	} else if tok != "" {
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 	resp, err := g.httpClient().Do(req)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("GitHub compare API %s: %s", resp.Status, strings.TrimSpace(string(b)))
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, maxAPIErrorBodyBytes))
+		return nil, false, fmt.Errorf("GitHub compare API %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
 	var v githubComparePayload
-	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
-		return nil, err
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxDiffResponseBytes)).Decode(&v); err != nil {
+		return nil, false, err
 	}
 	files := make([]string, 0, len(v.Files))
 	for _, f := range v.Files {
 		files = append(files, f.Filename)
 	}
-	return files, nil
+	return files, len(files) == githubComparePerPage, nil
 }
 
 // PublishCheck creates or updates the "Kiwi / <name>" check run for sha.

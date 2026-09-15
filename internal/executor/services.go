@@ -24,12 +24,47 @@ func serviceNetworkArgs(isolated bool) []string {
 	return args
 }
 
+// serviceContainerName derives the deterministic docker container name for
+// one declared service.
+func serviceContainerName(runID, jobID string, index int, svc pipeline.Service) string {
+	name := dockerNameClean.ReplaceAllString(fmt.Sprintf("kiwi-svc-%s-%s-%d", runID, jobID, index+1), "-")
+	if svc.Name != "" {
+		custom := dockerNameClean.ReplaceAllString(svc.Name, "-")
+		if custom != "" {
+			name = strings.ToLower(custom)
+		}
+	}
+	return name
+}
+
+// validateServiceImages pre-checks every declared service before any docker
+// invocation: an image must exist and, when the job is untrusted
+// (requireImmutable), carry a strict @sha256:<64-hex> digest pin. A missing
+// daemon can never mask an unpinned service image.
+func validateServiceImages(services []pipeline.Service, runID, jobID string, requireImmutable bool) error {
+	for i, svc := range services {
+		name := serviceContainerName(runID, jobID, i, svc)
+		if svc.Image == "" {
+			return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("service %q has no image", name)}
+		}
+		if requireImmutable && !digestPinned(svc.Image) {
+			return unpinnedImageError("service "+name+" image", svc.Image)
+		}
+	}
+	return nil
+}
+
 // startContainerServices creates one dedicated user-defined bridge network for
 // the job, starts every declared service container on it, and waits for their
 // healthchecks. The job container itself is attached to this same network, so
 // services resolve by name. When isolated is true the network is created with
 // --internal, giving the job and its services no route to the outside world.
-func startContainerServices(ctx context.Context, runID, jobID string, services []pipeline.Service, isolated bool, emit func(string)) (string, func(), error) {
+// requireImmutable rejects any service image without a strict digest pin
+// before docker is ever invoked.
+func startContainerServices(ctx context.Context, runID, jobID string, services []pipeline.Service, isolated, requireImmutable bool, emit func(string)) (string, func(), error) {
+	if err := validateServiceImages(services, runID, jobID, requireImmutable); err != nil {
+		return "", func() {}, err
+	}
 	docker, err := exec.LookPath("docker")
 	if err != nil {
 		return "", func() {}, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("docker not found: %w", err)}
@@ -52,17 +87,7 @@ func startContainerServices(ctx context.Context, runID, jobID string, services [
 	}
 	cleanupAll := func() { cleanup() }
 	for i, svc := range services {
-		name := dockerNameClean.ReplaceAllString(fmt.Sprintf("kiwi-svc-%s-%s-%d", runID, jobID, i+1), "-")
-		if svc.Name != "" {
-			custom := dockerNameClean.ReplaceAllString(svc.Name, "-")
-			if custom != "" {
-				name = strings.ToLower(custom)
-			}
-		}
-		if svc.Image == "" {
-			cleanupAll()
-			return "", func() {}, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("service %q has no image", name)}
-		}
+		name := serviceContainerName(runID, jobID, i, svc)
 		// Every service runs maximally hardened. The user is hard-coded to
 		// 65534:65534 (nobody) rather than omitted: images known to require
 		// root are not a reason to weaken isolation for the rest.

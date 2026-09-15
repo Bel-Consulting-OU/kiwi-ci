@@ -13,10 +13,13 @@ import (
 
 // triggerFilesFetch fetches the authoritative changed-file list BEFORE
 // trigger evaluation when the pipeline declares include-path filters:
-// matching against an empty list is fail-open. When the pipeline only uses
-// paths_ignore the fetch is best-effort (a missing list cannot wrongly
-// admit an event). Returns the files and whether a fetch error must fail
-// the webhook closed.
+// matching against an empty or partial list is fail-open. The fetch must
+// also be complete: an include-path trigger with a truncated or
+// best-effort diff fails the webhook closed. When the pipeline only uses
+// paths_ignore the fetch is best-effort — a missing or incomplete list
+// cannot wrongly admit an event, because a paths_ignore filter never
+// matches an empty list. Returns the files and whether a fetch error must
+// fail the webhook closed.
 func (s *Server) triggerFilesFetch(ctx context.Context, fg forge.Forge, spec *pipeline.Spec, ec *forge.EventContext) (files []string, mustFail error) {
 	needsInclude := false
 	for _, t := range spec.On {
@@ -25,7 +28,7 @@ func (s *Server) triggerFilesFetch(ctx context.Context, fg forge.Forge, spec *pi
 			break
 		}
 	}
-	got, err := fg.ChangedFiles(ctx, *ec)
+	res, err := fg.ChangedFiles(ctx, *ec)
 	if err != nil {
 		if needsInclude {
 			return nil, fmt.Errorf("changed files unavailable for path-filtered trigger: %w", err)
@@ -33,7 +36,17 @@ func (s *Server) triggerFilesFetch(ctx context.Context, fg forge.Forge, spec *pi
 		log.Printf("webhook: changed files for %s: %v", ec.Repository.FullName, err)
 		return nil, nil
 	}
-	return got, nil
+	if !res.Complete {
+		if needsInclude {
+			return nil, fmt.Errorf("changed files incomplete for path-filtered trigger")
+		}
+		// Ignore-only trigger: proceeding without the list is safe — a
+		// paths_ignore filter never matches an empty list, so an
+		// incomplete diff cannot wrongly admit an event.
+		log.Printf("webhook: changed files for %s: incomplete diff (ignore-only trigger)", ec.Repository.FullName)
+		return nil, nil
+	}
+	return res.Files, nil
 }
 
 // evalTriggerMatches evaluates the pipeline trigger with authoritative

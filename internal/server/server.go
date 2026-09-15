@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -84,6 +85,21 @@ type Server struct {
 	// disables the endpoint.
 	RunnerEnrollToken string
 
+	// SigstoreTrustedKeys pins the only Sigstore bundle verification keys
+	// accepted for artifact attestation, keyed by key ID. RekorPublicKey
+	// and RekorBaseURL configure Rekor transparency-log inclusion
+	// verification; both must be set to activate it. Configure through
+	// SetSigstoreTrustRoot — without any configured root, sigstore
+	// uploads fail closed (422).
+	SigstoreTrustedKeys map[string]ed25519.PublicKey
+	RekorPublicKey      ed25519.PublicKey
+	RekorBaseURL        string
+	// EnrollGrants maps SHA-256 digests of single-use enrollment grants to
+	// their remaining state (expiry, label binding, used). Grants are
+	// persisted as enroll-grants.json under dataDir; raw grant values are
+	// never stored. Guarded by s.mu.
+	EnrollGrants map[string]EnrollGrant
+
 	// AuthStore maps hashed bearer tokens to principals for admin/API
 	// authorization. An empty store keeps legacy AdminToken/RunnerToken
 	// mode. AuthFile is the JSON token-store path for persistent
@@ -163,6 +179,18 @@ type Server struct {
 	// repository host).
 	DownstreamPipelineFetcher func(ctx context.Context, targetRepo, targetRef string) (string, error)
 
+	// DownstreamAllowlist is the bilateral downstream authorization map:
+	// targetRepo -> allowed source repositories. A target without an entry
+	// refuses every dispatch (default deny); an entry with an empty/nil
+	// source list allows any source; otherwise only the listed sources are
+	// allowed. A refused intent is audited and dropped from the outbox.
+	DownstreamAllowlist map[string][]string
+	// DownstreamTrustedIngress marks the target repositories whose policy
+	// explicitly grants trusted ingress: a child run of such a target may
+	// inherit the parent's trust. Every other target receives an untrusted
+	// child even when the parent was trusted.
+	DownstreamTrustedIngress map[string]bool
+
 	// Logger writes operational (control-plane) logs as structured JSON
 	// lines. Build logs stay in LogEntry paths. Defaults to os.Stderr.
 	Logger *logging.Structured
@@ -199,8 +227,11 @@ type Server struct {
 	// the TLS handshake (see TLSConfig). Derived from RunnerCA by the app
 	// wiring when runner mTLS is enabled.
 	RunnerClientCAPool *x509.CertPool
-	// RequireRunnerClientCerts rejects connections without a valid runner
-	// client certificate at the handshake (tls.RequireAndVerifyClientCert).
+	// RequireRunnerClientCerts makes runner client certificates mandatory
+	// for runner-tier routes. The shared TLS listener always uses
+	// VerifyClientCertIfGiven (admin/forge/enrollment traffic must reach
+	// the same listener); the requirement is enforced at the HTTP
+	// authorization layer in auth()'s tierRunner branch.
 	RequireRunnerClientCerts bool
 
 	// contracts holds the per-job artifact contract sets (memory mode;
@@ -286,6 +317,7 @@ func New(token string) *Server {
 		pendingSidecars: map[string]string{},
 		jobLocks:        map[string]*sync.Mutex{},
 		crl:             map[string]string{},
+		EnrollGrants:    map[string]EnrollGrant{},
 		history:         newTestintelHistory(""),
 		schedules:       map[string]storage.Schedule{},
 		occurrences:     map[string]map[int64]string{},
@@ -407,6 +439,9 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 		}
 	}
 	if err := s.loadCRL(dataDir); err != nil {
+		return nil, err
+	}
+	if err := s.loadEnrollGrants(dataDir); err != nil {
 		return nil, err
 	}
 	if err := s.loadSecretReceipts(dataDir); err != nil {
@@ -616,25 +651,51 @@ func (s *Server) auth(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		case tierEnroll:
-			// Runner enrollment authenticates with the enrollment token instead
-			// of the runner token; the certificate it returns is what the runner
-			// uses for everything after.
-			if s.RunnerEnrollToken == "" || s.RunnerCA == nil {
+			// Runner enrollment authenticates with the enrollment token or a
+			// single-use enrollment grant instead of the runner token; the
+			// certificate it returns is what the runner uses for everything
+			// after. Enrollment is exempt from the runner client
+			// certificate requirement.
+			if s.RunnerCA == nil {
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
-			if !bearerOK(r.Header.Get("Authorization"), s.RunnerEnrollToken) && !bearerOK(r.Header.Get("X-Kiwi-Enroll-Token"), s.RunnerEnrollToken) {
+			tok := enrollTokenFrom(r)
+			switch {
+			case s.RunnerEnrollToken != "" && bearerOK(tok, s.RunnerEnrollToken):
+			case s.enrollGrantOK(tok):
+			default:
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
 			next.ServeHTTP(w, r)
 			return
 		case tierRunner:
+			// Fail closed: a runner-tier route must have a working runner
+			// credential. Either a non-empty runner bearer token or an
+			// enforced runner mTLS mode is required; a server with neither
+			// must refuse instead of silently accepting unauthenticated
+			// runner traffic.
+			if s.RunnerToken == "" && !(s.RunnerCA != nil && s.RequireRunnerClientCerts) {
+				http.Error(w, "runner authentication is not configured", http.StatusServiceUnavailable)
+				return
+			}
 			// Runner-tier routes: only the runner token bearer may pass.
 			// Handlers enforce the lease and mTLS identity binding on top.
 			if s.RunnerToken != "" && !bearerOK(r.Header.Get("Authorization"), s.RunnerToken) {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
+			}
+			// The shared TLS listener verifies client certificates only
+			// when presented; enforced runner mTLS demands the certificate
+			// here. The peer identity must bind (a valid runner certificate
+			// chaining to the runner CA); per-route identity checks still
+			// run inside the handlers.
+			if s.RunnerCA != nil && s.RequireRunnerClientCerts {
+				if err := s.bindRunnerIdentity(r, ""); err != nil {
+					http.Error(w, "runner client certificate required", http.StatusUnauthorized)
+					return
+				}
 			}
 			next.ServeHTTP(w, r)
 			return
@@ -1395,23 +1456,24 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	// The runner API protocol is mandatory: runners that cannot declare a
-	// version range are rejected rather than silently bound to an old
-	// contract.
-	if in.ProtocolMin == 0 && in.ProtocolMax == 0 {
-		http.Error(w, "protocol version required", http.StatusBadRequest)
+	// Server-side registration validation: protocol range (clamped),
+	// capacity, labels, region and finite non-negative usage rates. The
+	// validation writes the clamped protocol range back into in.
+	info := RunnerInfo{
+		ID:          in.ID,
+		Labels:      in.Labels,
+		Region:      in.Region,
+		Capacity:    in.Capacity,
+		ProtocolMin: in.ProtocolMin,
+		ProtocolMax: in.ProtocolMax,
+		CostPerHour: in.CostPerHour,
+		PowerWatts:  in.PowerWatts,
+	}
+	if err := validateRunnerRegistration(&info); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if in.ProtocolMax < ProtocolMin || in.ProtocolMin > ProtocolMax {
-		http.Error(w, "unsupported protocol version", http.StatusBadRequest)
-		return
-	}
-	if in.ProtocolMin < ProtocolMin {
-		in.ProtocolMin = ProtocolMin
-	}
-	if in.ProtocolMax > ProtocolMax {
-		in.ProtocolMax = ProtocolMax
-	}
+	in.ProtocolMin, in.ProtocolMax = info.ProtocolMin, info.ProtocolMax
 	// With runner mTLS enabled the TLS peer certificate is the identity: it
 	// must match the claimed ID (an empty ID adopts the certificate
 	// identity). Without mTLS the bearer token authenticated by auth() is
@@ -2178,6 +2240,12 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	if !s.validActiveLease(j, in.RunnerID, in.LeaseToken, in.LeaseGeneration, now) {
 		if rec, has := s.completions[completionReceiptKey(jobID, in.LeaseGeneration, in.RunnerID)]; has && rec.ResultHash == hash {
 			s.mu.Unlock()
+			// Idempotent replay: re-apply post-completion effects that may
+			// have failed after the durable completion committed.
+			if derr := s.recordDownstreamIntentsForCompleted(context.Background(), jobID); derr != nil {
+				http.Error(w, derr.Error(), http.StatusInternalServerError)
+				return
+			}
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -2241,8 +2309,14 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	// A successful job with a downstream declaration records the launch
 	// claim and enqueues the dispatch intent (exactly-once via the claim).
+	// A persistence failure fails the completion response (500): the
+	// completion stands, and the idempotent replay re-attempts the
+	// recording.
 	if j.Status == model.StatusSuccess {
-		s.recordDownstreamIntents(context.Background(), j, run)
+		if err := s.recordDownstreamIntents(context.Background(), j, run); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 	if run.Status.Terminal() {
 		s.publishGitHubStatus(run)
@@ -2293,37 +2367,29 @@ func (s *Server) completeDB(w http.ResponseWriter, r *http.Request, jobID string
 			http.NotFound(w, r)
 			return
 		}
+		// Required-artifact enforcement happens INSIDE the store's
+		// completion transaction: a successful completion with a missing
+		// required artifact (or a contract-store failure) rolled the whole
+		// completion back, so the job is still running — not terminal — and
+		// the runner can upload the artifact and retry.
+		if errors.Is(err, storage.ErrRequiredArtifactMissing) {
+			missing := strings.TrimPrefix(err.Error(), storage.ErrRequiredArtifactMissing.Error()+": ")
+			s.auditLocked("job.required_artifact_missing", in.RunnerID, j.RunID, jobID, err.Error(), map[string]string{"job": j.Key, "artifact": missing})
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
 		if rec, has, herr := s.DB.HasCompletionReceipt(ctx, jobID, in.LeaseGeneration, in.RunnerID); herr == nil && has && rec.ResultHash == hash {
+			// Idempotent replay: re-apply post-completion effects that may
+			// have failed after the durable completion committed.
+			if derr := s.recordDownstreamIntentsForCompleted(ctx, jobID); derr != nil {
+				http.Error(w, derr.Error(), http.StatusInternalServerError)
+				return
+			}
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		http.Error(w, "stale or invalid lease", http.StatusConflict)
 		return
-	}
-	// Required-artifact enforcement (DB mode): a SUCCESSFUL completion must
-	// have an artifact record for every contract entry with Required=true.
-	// A missing required artifact flips the job to failure, emits the audit
-	// event, and recomputes the run.
-	if st == model.StatusSuccess {
-		if missing, merr := s.requiredArtifactsMissingDB(ctx, j); merr == nil && missing != "" {
-			if cur, gerr := s.DB.GetJob(ctx, jobID); gerr == nil && cur.Status == model.StatusSuccess {
-				fin := time.Now().UTC()
-				cur.Status = model.StatusFailure
-				cur.Error = "required artifact " + missing + " missing"
-				cur.FinishedAt = &fin
-				cur.LeaseRunnerID = ""
-				cur.LeaseTokenHash = nil
-				cur.LeaseExpiresAt = nil
-				if uerr := s.DB.UpdateJob(ctx, cur); uerr != nil {
-					s.logError("complete: required-artifact failure persist failed", "job", jobID, "error", uerr.Error())
-				}
-				s.auditLocked("job.required_artifact_missing", in.RunnerID, j.RunID, jobID, cur.Error, map[string]string{"job": j.Key, "artifact": missing})
-				s.recomputeRunDB(ctx, j.RunID)
-			}
-			st = model.StatusFailure
-		} else if merr != nil {
-			s.logError("complete: required-artifact check failed", "job", jobID, "error", merr.Error())
-		}
 	}
 	s.finishDeploymentDB(ctx, j, st, time.Now().UTC())
 	s.metricObserve("kiwi_job_duration_seconds", completionDurationSeconds(j), nil)
@@ -2342,10 +2408,15 @@ func (s *Server) completeDB(w http.ResponseWriter, r *http.Request, jobID string
 		}
 		// A successful job with a downstream declaration records the launch
 		// claim and enqueues the dispatch intent (exactly-once via the
-		// claim row).
-		if st == model.StatusSuccess {
+		// claim row). A persistence failure fails the completion response
+		// (500): the durable completion stands, and the idempotent replay
+		// re-attempts the recording.
+		if cur.Status == model.StatusSuccess {
 			if run, gerr := s.DB.GetRun(ctx, j.RunID); gerr == nil {
-				s.recordDownstreamIntents(ctx, cur, run)
+				if derr := s.recordDownstreamIntents(ctx, cur, run); derr != nil {
+					http.Error(w, derr.Error(), http.StatusInternalServerError)
+					return
+				}
 			}
 		}
 	}
@@ -2370,79 +2441,6 @@ func completionDurationSeconds(j model.Job) float64 {
 		finish = *j.FinishedAt
 	}
 	return finish.Sub(*j.StartedAt).Seconds()
-}
-
-// recomputeRunDB recomputes one run's status from its jobs in DB mode,
-// mirroring refreshRunLocked. Used when a server-side post-completion
-// correction (required-artifact failure) changes a job state after the
-// store's transactional recomputation already ran.
-func (s *Server) recomputeRunDB(ctx context.Context, runID string) {
-	run, err := s.DB.GetRun(ctx, runID)
-	if err != nil || run.Status == model.StatusCancelled {
-		return
-	}
-	jobs, err := s.DB.ListJobsByRun(ctx, runID)
-	if err != nil {
-		return
-	}
-	var total, terminal int
-	var anyRunning, anyFailure, anyCancelled, anyWaiting bool
-	var firstStart, lastFinish *time.Time
-	for _, j := range jobs {
-		total++
-		if j.StartedAt != nil && (firstStart == nil || j.StartedAt.Before(*firstStart)) {
-			t := *j.StartedAt
-			firstStart = &t
-		}
-		if j.Status.Terminal() {
-			terminal++
-			if j.FinishedAt != nil && (lastFinish == nil || j.FinishedAt.After(*lastFinish)) {
-				t := *j.FinishedAt
-				lastFinish = &t
-			}
-		}
-		switch j.Status {
-		case model.StatusRunning:
-			anyRunning = true
-		case model.StatusFailure, model.StatusBlocked:
-			anyFailure = true
-		case model.StatusCancelled:
-			anyCancelled = true
-		case model.StatusWaitingApproval:
-			anyWaiting = true
-		}
-	}
-	if total == 0 {
-		return
-	}
-	switch {
-	case terminal == total:
-		switch {
-		case anyFailure:
-			run.Status = model.StatusFailure
-		case anyCancelled:
-			run.Status = model.StatusCancelled
-		default:
-			run.Status = model.StatusSuccess
-		}
-		run.FinishedAt = lastFinish
-		if run.FinishedAt == nil {
-			n := time.Now().UTC()
-			run.FinishedAt = &n
-		}
-	case anyRunning:
-		run.Status = model.StatusRunning
-	case anyWaiting:
-		run.Status = model.StatusWaitingApproval
-	default:
-		run.Status = model.StatusQueued
-	}
-	if run.StartedAt == nil && firstStart != nil {
-		run.StartedAt = firstStart
-	}
-	if err := s.DB.UpdateRunStatus(ctx, runID, run.Status, run.StartedAt, run.FinishedAt); err != nil {
-		s.logError("complete: run recompute failed", "run", runID, "error", err.Error())
-	}
 }
 
 // completionResultHash canonicalizes a completion payload so identical
@@ -2646,7 +2644,7 @@ func (s *Server) rerunRun(w http.ResponseWriter, r *http.Request) {
 		delete(meta, key)
 	}
 	meta["rerun_of"] = id
-	run, err := s.enqueue(SubmitRun{RepoURL: old.Repo, RepoFullName: old.RepoFullName, Ref: old.Ref, SHA: old.SHA, Event: old.Event, Pipeline: pipelineText, Trusted: old.Trusted, Metadata: meta})
+	run, err := s.enqueue(SubmitRun{RepoURL: old.Repo, RepoFullName: old.RepoFullName, Ref: old.Ref, SHA: old.SHA, Event: old.Event, Pipeline: pipelineText, Trusted: rerunTrusted(r, old), Metadata: meta})
 	if err != nil {
 		http.Error(w, err.Error(), 400)
 		return
@@ -2694,12 +2692,30 @@ func (s *Server) rerunRunDB(w http.ResponseWriter, r *http.Request, id string) {
 		delete(meta, key)
 	}
 	meta["rerun_of"] = id
-	run, err := s.enqueue(SubmitRun{RepoURL: old.Repo, RepoFullName: old.RepoFullName, Ref: old.Ref, SHA: old.SHA, Event: old.Event, Pipeline: pipelineText, Trusted: old.Trusted, Metadata: meta})
+	run, err := s.enqueue(SubmitRun{RepoURL: old.Repo, RepoFullName: old.RepoFullName, Ref: old.Ref, SHA: old.SHA, Event: old.Event, Pipeline: pipelineText, Trusted: rerunTrusted(r, old), Metadata: meta})
 	if err != nil {
 		http.Error(w, err.Error(), 400)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, run)
+}
+
+// rerunTrusted decides whether a rerun of old may keep the source run's
+// trust: the caller must hold ActionRerun AND, when the source run was
+// trusted, ActionTrustedRun for the same repository. A principal with rerun
+// but without trusted_run gets the rerun downgraded to untrusted; the
+// rerun itself is not refused.
+func rerunTrusted(r *http.Request, old model.Run) bool {
+	if !old.Trusted {
+		return false
+	}
+	p, ok := auth.PrincipalFrom(r)
+	if !ok {
+		// Legacy mode: no principal store is configured, so there is no
+		// identity to authorize; keep the previous trust.
+		return true
+	}
+	return auth.Authorize(p, auth.ActionTrustedRun, canonicalRepoForRun(old), true)
 }
 
 func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
