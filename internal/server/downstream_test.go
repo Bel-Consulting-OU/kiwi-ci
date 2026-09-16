@@ -17,6 +17,7 @@ const downstreamPipeline = `version: 1
 jobs:
   build:
     runtime: container
+    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     downstream:
       repository: acme/child
       ref: refs/heads/main
@@ -28,6 +29,7 @@ const downstreamWaitPipeline = `version: 1
 jobs:
   build:
     runtime: container
+    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     downstream:
       repository: acme/child
       ref: refs/heads/main
@@ -36,10 +38,25 @@ jobs:
       - run: echo build
 `
 
+// downstreamPendingItem returns the queued downstream dispatch intent. A
+// completion also queues its marker-guarded effect intents, so the
+// downstream intent is located by kind rather than position.
+func downstreamPendingItem(t *testing.T, s *Server) forge.OutboxItem {
+	t.Helper()
+	for _, it := range s.outbox.Pending() {
+		if it.Kind == forge.OutboxKindDownstream {
+			return it
+		}
+	}
+	t.Fatal("no downstream dispatch intent queued")
+	return forge.OutboxItem{}
+}
+
 const childPipeline = `version: 1
 jobs:
   child-build:
     runtime: container
+    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     steps:
       - run: echo child
 `
@@ -131,6 +148,7 @@ func TestDownstreamInvalidRepositoryRejected(t *testing.T) {
 jobs:
   build:
     runtime: container
+    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     downstream:
       repository: "not-an-owner-name"
     steps:
@@ -151,12 +169,9 @@ func TestDownstreamLaunchExactlyOnceAcrossRestart(t *testing.T) {
 	if w := completeTask(t, s, task, runnerID, "success"); w.Code != http.StatusNoContent {
 		t.Fatalf("complete = %d: %s", w.Code, w.Body.String())
 	}
-	// The completion recorded the claim and enqueued the dispatch intent.
-	pending := s.outbox.Pending()
-	if len(pending) != 1 || pending[0].Kind != forge.OutboxKindDownstream {
-		t.Fatalf("outbox = %+v, want one downstream intent", pending)
-	}
-	item := pending[0]
+	// The completion recorded the claim and enqueued the dispatch intent
+	// (alongside the marker-guarded completion effect intents).
+	item := downstreamPendingItem(t, s)
 	s.DownstreamPipelineFetcher = func(ctx context.Context, repo, ref string) (string, error) {
 		if repo != "acme/child" || ref != "refs/heads/main" {
 			return "", fmt.Errorf("unexpected fetch %s@%s", repo, ref)
@@ -184,8 +199,9 @@ func TestDownstreamLaunchExactlyOnceAcrossRestart(t *testing.T) {
 		t.Fatal("mark-launched must consume the reservation")
 	}
 
-	// Restart from the same dataDir: the outbox replays the unacked intent,
-	// the link row (snapshot) is the claim, and dispatch must skip.
+	// Restart from the same dataDir: the outbox replays the unacked intents
+	// (the downstream intent plus the completion effects), the link row
+	// (snapshot) is the claim, and dispatch must skip.
 	s2, err := NewPersistent("token", "token", s.dataDir)
 	if err != nil {
 		t.Fatal(err)
@@ -195,8 +211,8 @@ func TestDownstreamLaunchExactlyOnceAcrossRestart(t *testing.T) {
 		return childPipeline, nil
 	}
 	replayed := s2.outbox.Pending()
-	if len(replayed) != 1 {
-		t.Fatalf("replayed intents = %d, want 1", len(replayed))
+	if downstreamPendingItem(t, s2).Kind != forge.OutboxKindDownstream {
+		t.Fatalf("replayed intents missing the downstream intent: %d items", len(replayed))
 	}
 	s2.flushOutbox()
 	if got := childRunsOf(s2); len(got) != 1 {
@@ -310,7 +326,9 @@ func TestDownstreamDBModeExactlyOnce(t *testing.T) {
 		t.Fatal("downstream link was not persisted through DownstreamStore")
 	}
 
-	// A second server on the same store replays the pending outbox intent.
+	// A second server on the same store replays the pending outbox intents
+	// (the completion effects created inside the completion transaction
+	// plus the downstream dispatch intent).
 	s2 := New("token")
 	if err := s2.SwitchToDB(f); err != nil {
 		t.Fatal(err)
@@ -319,12 +337,9 @@ func TestDownstreamDBModeExactlyOnce(t *testing.T) {
 	s2.DownstreamPipelineFetcher = func(ctx context.Context, repo, ref string) (string, error) {
 		return childPipeline, nil
 	}
-	pending := s2.outbox.Pending()
-	if len(pending) != 1 {
-		t.Fatalf("replayed intents = %d, want 1", len(pending))
-	}
+	item := downstreamPendingItem(t, s2)
 	// Crash between launch and ack: dispatch the intent directly first.
-	if err := s2.dispatchOutbox(context.Background(), pending[0]); err != nil {
+	if err := s2.dispatchOutbox(context.Background(), item); err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
 	s2.flushOutbox()

@@ -13,7 +13,6 @@ import (
 )
 
 func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("id")
 	var in struct {
 		RunnerID        string           `json:"runner_id"`
 		LeaseToken      string           `json:"lease_token"`
@@ -23,21 +22,9 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	j, err := s.jobForLease(r.Context(), jobID)
-	if errors.Is(err, storage.ErrNotFound) {
-		http.NotFound(w, r)
-		return
-	}
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	if !s.verifyRunnerIdentity(r, in.RunnerID) {
-		http.Error(w, "runner identity mismatch", http.StatusForbidden)
-		return
-	}
-	if !s.validActiveLease(j, in.RunnerID, in.LeaseToken, in.LeaseGeneration, time.Now().UTC()) {
-		http.Error(w, "stale or invalid lease", http.StatusConflict)
+	j, authErr := s.authorizeRunnerLease(r, in.RunnerID, in.LeaseToken, in.LeaseGeneration)
+	if authErr != nil {
+		s.writeLeaseAuthError(w, r, authErr)
 		return
 	}
 	rep := in.Report
@@ -51,8 +38,6 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 	rep.JobID = j.ID
 	rep.JobKey = j.Key
 	rep.CreatedAt = time.Now().UTC()
-	// Persistent test history: every uploaded case feeds the flaky/sharding
-	// model, and the history file is the durable store in both modes.
 	repo := ""
 	if s.DB != nil {
 		if run, gerr := s.DB.GetRun(r.Context(), j.RunID); gerr == nil {
@@ -68,21 +53,28 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 	for _, c := range rep.Cases {
 		s.metricObserve("kiwi_test_duration_seconds", c.Duration, nil)
 	}
-	s.recordTestReportHistory(repo, rep)
+	// The durable report commits FIRST; the test-history update follows in
+	// the same flow so a failed history write can never lose the report.
 	if s.DB != nil {
 		if err := s.DB.InsertTestReport(r.Context(), rep); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
+		s.recordTestReportHistory(repo, rep)
 		s.auditLocked("tests.uploaded", in.RunnerID, j.RunID, j.ID, "test report uploaded", map[string]string{"job": j.Key, "tests": strconv.Itoa(rep.Tests), "failures": strconv.Itoa(rep.Failures)})
 		writeJSON(w, http.StatusCreated, rep)
 		return
 	}
 	s.mu.Lock()
 	s.reports[rep.ID] = rep
-	s.auditLocked("tests.uploaded", in.RunnerID, j.RunID, j.ID, "test report uploaded", map[string]string{"job": j.Key, "tests": strconv.Itoa(rep.Tests), "failures": strconv.Itoa(rep.Failures)})
-	_ = s.persistLocked()
+	perr := s.persistLocked()
 	s.mu.Unlock()
+	if perr != nil {
+		http.Error(w, perr.Error(), 500)
+		return
+	}
+	s.recordTestReportHistory(repo, rep)
+	s.auditLocked("tests.uploaded", in.RunnerID, j.RunID, j.ID, "test report uploaded", map[string]string{"job": j.Key, "tests": strconv.Itoa(rep.Tests), "failures": strconv.Itoa(rep.Failures)})
 	writeJSON(w, http.StatusCreated, rep)
 }
 
@@ -146,6 +138,7 @@ func (s *Server) testIntelligence(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.DB != nil {
+		s.syncTestHistoryDB(r.Context())
 		reports, err := s.DB.ListTestReportsAll(r.Context())
 		if err != nil {
 			http.Error(w, err.Error(), 500)

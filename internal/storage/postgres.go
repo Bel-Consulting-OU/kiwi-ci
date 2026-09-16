@@ -347,7 +347,8 @@ func (s *PostgresStore) reserveQuotaTx(ctx context.Context, tx pgx.Tx, q *QuotaR
 // InsertCompiledRun implements the atomic enqueue: one transaction inserts
 // the run, every job, the dependency edges, the artifact contracts, cancels
 // the superseded jobs with audit rows, and claims the delivery/quota/
-// schedule reservations. Any failure rolls everything back.
+// schedule/downstream-launch reservations. Any failure rolls everything
+// back.
 func (s *PostgresStore) InsertCompiledRun(ctx context.Context, req InsertCompiledRunRequest) error {
 	if err := ValidateRunID(req.Run.ID); err != nil {
 		return err
@@ -358,6 +359,16 @@ func (s *PostgresStore) InsertCompiledRun(ctx context.Context, req InsertCompile
 	}
 	defer tx.Rollback(ctx)
 
+	// The downstream launch claim is resolved BEFORE the run row is
+	// inserted: a link already launched with the SAME stable child ID
+	// rolls the enqueue back with ErrDownstreamLaunched (the caller
+	// re-reads the existing child run), while a conflicting child ID fails
+	// closed.
+	if req.DownstreamLaunch != nil {
+		if err := s.claimDownstreamLaunchTx(ctx, tx, req.DownstreamLaunch, req.Run.ID); err != nil {
+			return err
+		}
+	}
 	if err := s.insertRunTx(ctx, tx, req.Run); err != nil {
 		return err
 	}
@@ -530,6 +541,47 @@ func (s *PostgresStore) insertScheduleClaimTx(ctx context.Context, tx pgx.Tx, c 
 		return ErrScheduleClaimLost
 	}
 	return nil
+}
+
+// claimDownstreamLaunchTx resolves the downstream launch claim inside the
+// enqueue transaction. The link row is locked FOR UPDATE: an unlaunched
+// link is marked launched with the stable child ID (reservation consumed);
+// a link already launched with the SAME child ID returns
+// ErrDownstreamLaunched so the caller can return the existing run; any
+// other state fails closed (the claim was lost to a concurrent flusher).
+func (s *PostgresStore) claimDownstreamLaunchTx(ctx context.Context, tx pgx.Tx, c *DownstreamLaunchClaim, childRunID string) error {
+	parts := strings.Split(c.LinkKey, "\x00")
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+		return fmt.Errorf("storage: malformed downstream launch claim")
+	}
+	if len(c.StableChildID) != 64 {
+		return fmt.Errorf("storage: malformed downstream stable child id")
+	}
+	parentJobID, targetRepo, targetRef := parts[0], parts[1], parts[2]
+	if err := ValidateJobID(parentJobID); err != nil {
+		return err
+	}
+	if err := ValidateRunID(childRunID); err != nil {
+		return err
+	}
+	var existing string
+	err := tx.QueryRow(ctx, `SELECT COALESCE(child_run_id, '') FROM downstream_links WHERE parent_job_id=$1 AND target_repo=$2 AND target_ref=$3 FOR UPDATE`,
+		parentJobID, targetRepo, targetRef).Scan(&existing)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("storage: downstream launch claim link missing")
+	}
+	if err != nil {
+		return err
+	}
+	if existing != "" {
+		if existing == childRunID {
+			return ErrDownstreamLaunched
+		}
+		return fmt.Errorf("storage: downstream launch claim lost")
+	}
+	_, err = tx.Exec(ctx, `UPDATE downstream_links SET child_run_id=$4, stable_child_id=$5, reserved=FALSE, reserved_at=NULL WHERE parent_job_id=$1 AND target_repo=$2 AND target_ref=$3 AND (child_run_id IS NULL OR child_run_id='')`,
+		parentJobID, targetRepo, targetRef, childRunID, c.StableChildID)
+	return err
 }
 
 // ---------------------------------------------------------------------------
@@ -1054,7 +1106,33 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 		auditID, "job.completed", runnerID, curRunID, jobID, string(st), meta, now); err != nil {
 		return err
 	}
+	// Post-transaction completion effects ride the SAME transaction as
+	// durable outbox intents: downstream dispatch recording, deployment
+	// finishing, usage accounting, run aggregation and forge status
+	// publishing are triggered by the outbox flush (and the defensive
+	// receipt replay), each guarded by its own durable marker.
+	if err := s.insertCompletionEffectsTx(ctx, tx, jobID, curRunID, generation, now); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
+}
+
+// insertCompletionEffectsTx inserts one durable outbox intent per completion
+// effect kind inside the caller's transaction. IDs are the deterministic
+// CompletionEffectID values so the completing server can queue and ack the
+// very rows this transaction created.
+func (s *PostgresStore) insertCompletionEffectsTx(ctx context.Context, tx pgx.Tx, jobID, runID string, generation int64, now time.Time) error {
+	payload, err := json.Marshal(CompletionEffectsPayload{JobID: jobID, RunID: runID})
+	if err != nil {
+		return err
+	}
+	for _, kind := range CompletionEffectKinds() {
+		if _, err := tx.Exec(ctx, `INSERT INTO outbox (id, kind, payload, created_at) VALUES ($1, $2, $3, $4)`,
+			CompletionEffectID(jobID, generation, kind), kind, payload, now); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // requiredArtifactMissingTx checks the completing job's artifact contracts
@@ -1822,16 +1900,17 @@ func (s *PostgresStore) listTestReports(ctx context.Context, query string, args 
 	return out, rows.Err()
 }
 
+// AppendLog inserts one log line into the identity-sequenced log_entries
+// table. The caller-supplied e.Seq is ignored: the sequence is allocated by
+// Postgres inside the insert transaction (INSERT ... RETURNING seq), so
+// appends stay strictly increasing regardless of clock ordering across
+// replicas or restarts.
 func (s *PostgresStore) AppendLog(ctx context.Context, e model.LogEntry) error {
 	if err := ValidateRunID(e.RunID); err != nil {
 		return err
 	}
-	id, err := newID()
-	if err != nil {
-		return err
-	}
-	_, err = s.pool.Exec(ctx, `INSERT INTO log_chunks (id, run_id, job_id, job_key, step, seq, line, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-		id, e.RunID, nullText(e.JobID), nullText(e.JobKey), nullText(e.Step), e.Seq, e.Line, e.CreatedAt)
+	err := s.pool.QueryRow(ctx, `INSERT INTO log_entries (run_id, job_id, job_key, step, line, created_at) VALUES ($1, $2, $3, $4, $5, $6) RETURNING seq`,
+		e.RunID, nullText(e.JobID), nullText(e.JobKey), nullText(e.Step), e.Line, e.CreatedAt).Scan(&e.Seq)
 	return err
 }
 
@@ -1842,7 +1921,7 @@ func (s *PostgresStore) ReadLogs(ctx context.Context, runID string, after int64,
 	if limit <= 0 || limit > 10000 {
 		limit = 2000
 	}
-	rows, err := s.pool.Query(ctx, `SELECT COALESCE(job_id, ''), COALESCE(job_key, ''), COALESCE(step, ''), seq, line, created_at FROM log_chunks WHERE run_id=$1 AND seq>$2 ORDER BY seq ASC LIMIT $3`, runID, after, limit)
+	rows, err := s.pool.Query(ctx, `SELECT COALESCE(job_id, ''), COALESCE(job_key, ''), COALESCE(step, ''), seq, line, created_at FROM log_entries WHERE run_id=$1 AND seq>$2 ORDER BY seq ASC LIMIT $3`, runID, after, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -2013,13 +2092,13 @@ func (s *PostgresStore) UpsertSchedule(ctx context.Context, sc Schedule) error {
 	if sc.ID == "" {
 		return fmt.Errorf("storage: empty schedule id")
 	}
-	_, err := s.pool.Exec(ctx, `INSERT INTO schedules (id, repository, spec, enabled, last_run, created_at) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO UPDATE SET repository=EXCLUDED.repository, spec=EXCLUDED.spec, enabled=EXCLUDED.enabled, last_run=EXCLUDED.last_run`,
-		sc.ID, sc.Repository, sc.Spec, sc.Enabled, sc.LastRun, sc.CreatedAt)
+	_, err := s.pool.Exec(ctx, `INSERT INTO schedules (id, repository, repo_id, repo_url, forge, trusted, spec, enabled, last_run, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (id) DO UPDATE SET repository=EXCLUDED.repository, repo_id=EXCLUDED.repo_id, repo_url=EXCLUDED.repo_url, forge=EXCLUDED.forge, trusted=EXCLUDED.trusted, spec=EXCLUDED.spec, enabled=EXCLUDED.enabled, last_run=EXCLUDED.last_run`,
+		sc.ID, sc.Repository, sc.RepoID, sc.RepoURL, sc.Forge, sc.Trusted, sc.Spec, sc.Enabled, sc.LastRun, sc.CreatedAt)
 	return err
 }
 
 func (s *PostgresStore) ListSchedules(ctx context.Context) ([]Schedule, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id, repository, spec, enabled, last_run, created_at FROM schedules ORDER BY created_at ASC, id ASC`)
+	rows, err := s.pool.Query(ctx, `SELECT id, repository, COALESCE(repo_id, ''), COALESCE(repo_url, ''), COALESCE(forge, ''), trusted, spec, enabled, last_run, created_at FROM schedules ORDER BY created_at ASC, id ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -2027,7 +2106,7 @@ func (s *PostgresStore) ListSchedules(ctx context.Context) ([]Schedule, error) {
 	out := []Schedule{}
 	for rows.Next() {
 		var sc Schedule
-		if err := rows.Scan(&sc.ID, &sc.Repository, &sc.Spec, &sc.Enabled, &sc.LastRun, &sc.CreatedAt); err != nil {
+		if err := rows.Scan(&sc.ID, &sc.Repository, &sc.RepoID, &sc.RepoURL, &sc.Forge, &sc.Trusted, &sc.Spec, &sc.Enabled, &sc.LastRun, &sc.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, sc)
@@ -2322,9 +2401,12 @@ func (s *PostgresStore) InsertGeneratedJobs(ctx context.Context, parentJobID str
 // closure in the SAME transaction: the parent job is locked FOR UPDATE and
 // the run's current job count is read inside the transaction, then the
 // verifier re-checks {job, runner, generation, token, expiry} and the
-// max-jobs-per-run bound against that fresh state. A rejected verification
+// max-jobs-per-run bound against that fresh state. The fragment's artifact
+// contracts commit in the same transaction as the jobs, so a generated job
+// with a Required artifact has its contract row present before any
+// completion can run. A rejected verification (or a failed contract write)
 // rolls the whole fragment back.
-func (s *PostgresStore) InsertGeneratedJobsTx(ctx context.Context, parentJobID string, depth int, jobs map[string]model.Job, deps map[string][]string, verify GeneratedJobVerifier) error {
+func (s *PostgresStore) InsertGeneratedJobsTx(ctx context.Context, parentJobID string, depth int, jobs map[string]model.Job, deps map[string][]string, contracts map[string]map[string]ArtifactContract, verify GeneratedJobVerifier) error {
 	if err := ValidateJobID(parentJobID); err != nil {
 		return err
 	}
@@ -2367,6 +2449,18 @@ func (s *PostgresStore) InsertGeneratedJobsTx(ctx context.Context, parentJobID s
 			return err
 		}
 	}
+	for id, cs := range contracts {
+		if err := ValidateJobID(id); err != nil {
+			return err
+		}
+		cp, err := json.Marshal(cs)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE jobs SET payload = jsonb_set(payload, '{artifact_contracts}', $2::jsonb, true) WHERE id=$1`, id, cp); err != nil {
+			return err
+		}
+	}
 	return tx.Commit(ctx)
 }
 
@@ -2391,8 +2485,8 @@ func (s *PostgresStore) InsertDownstreamLink(ctx context.Context, l DownstreamLi
 	if l.ReservedAt != nil {
 		reservedAt = l.ReservedAt
 	}
-	_, err := s.pool.Exec(ctx, `INSERT INTO downstream_links (parent_job_id, target_repo, target_ref, launch_token, child_run_id, reserved, reserved_at, target_forge, target_base_url, target_repo_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (parent_job_id, target_repo, target_ref) DO NOTHING`,
-		l.ParentJobID, l.TargetRepo, l.TargetRef, l.LaunchToken, l.ChildRunID, l.Reserved, reservedAt, l.TargetForge, l.TargetBaseURL, l.TargetRepoID, l.CreatedAt)
+	_, err := s.pool.Exec(ctx, `INSERT INTO downstream_links (parent_job_id, target_repo, target_ref, launch_token, child_run_id, reserved, reserved_at, target_forge, target_base_url, target_repo_id, stable_child_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (parent_job_id, target_repo, target_ref) DO NOTHING`,
+		l.ParentJobID, l.TargetRepo, l.TargetRef, l.LaunchToken, l.ChildRunID, l.Reserved, reservedAt, l.TargetForge, l.TargetBaseURL, l.TargetRepoID, l.StableChildID, l.CreatedAt)
 	return err
 }
 
@@ -2402,8 +2496,8 @@ func (s *PostgresStore) GetDownstreamLink(ctx context.Context, parentJobID, targ
 		return DownstreamLink{}, false, err
 	}
 	var l DownstreamLink
-	err := s.pool.QueryRow(ctx, `SELECT parent_job_id, target_repo, target_ref, launch_token, COALESCE(child_run_id, ''), reserved, reserved_at, COALESCE(target_forge, ''), COALESCE(target_base_url, ''), COALESCE(target_repo_id, ''), created_at FROM downstream_links WHERE parent_job_id=$1 AND target_repo=$2 AND target_ref=$3`,
-		parentJobID, targetRepo, targetRef).Scan(&l.ParentJobID, &l.TargetRepo, &l.TargetRef, &l.LaunchToken, &l.ChildRunID, &l.Reserved, &l.ReservedAt, &l.TargetForge, &l.TargetBaseURL, &l.TargetRepoID, &l.CreatedAt)
+	err := s.pool.QueryRow(ctx, `SELECT parent_job_id, target_repo, target_ref, launch_token, COALESCE(child_run_id, ''), reserved, reserved_at, COALESCE(target_forge, ''), COALESCE(target_base_url, ''), COALESCE(target_repo_id, ''), COALESCE(stable_child_id, ''), created_at FROM downstream_links WHERE parent_job_id=$1 AND target_repo=$2 AND target_ref=$3`,
+		parentJobID, targetRepo, targetRef).Scan(&l.ParentJobID, &l.TargetRepo, &l.TargetRef, &l.LaunchToken, &l.ChildRunID, &l.Reserved, &l.ReservedAt, &l.TargetForge, &l.TargetBaseURL, &l.TargetRepoID, &l.StableChildID, &l.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return DownstreamLink{}, false, nil
 	}
@@ -2689,6 +2783,40 @@ func (s *PostgresStore) ReopenRunForChildren(ctx context.Context, runID string) 
 	return err
 }
 
+// LoadTestHistory reads the cached test-history aggregates and their
+// version (migration 0008). A missing row reports version 0 with empty
+// stats so a fresh database behaves like an empty history file.
+func (s *PostgresStore) LoadTestHistory(ctx context.Context) (int64, []byte, error) {
+	var (
+		version int64
+		stats   []byte
+	)
+	err := s.pool.QueryRow(ctx, `SELECT version, stats::text FROM test_history WHERE id=1`).Scan(&version, &stats)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, nil, nil
+	}
+	if err != nil {
+		return 0, nil, err
+	}
+	if string(stats) == "{}" {
+		stats = nil
+	}
+	return version, stats, nil
+}
+
+// SaveTestHistory writes the serialized history aggregates and bumps the
+// cache version atomically in the same statement, so every committed upload
+// advances the version exactly once and replicas reload on the next read.
+func (s *PostgresStore) SaveTestHistory(ctx context.Context, stats []byte) (int64, error) {
+	if len(stats) == 0 {
+		stats = []byte("{}")
+	}
+	var version int64
+	err := s.pool.QueryRow(ctx, `INSERT INTO test_history (id, version, stats) VALUES (1, 1, $2::jsonb) ON CONFLICT (id) DO UPDATE SET version = test_history.version + 1, stats = EXCLUDED.stats, updated_at = now() RETURNING version`,
+		version, string(stats)).Scan(&version)
+	return version, err
+}
+
 // TryAcquireLeadership takes a session-level Postgres advisory lock on a
 // dedicated connection held outside the pool. Advisory locks die with the
 // connection, so a crashed leader's lease is released automatically.
@@ -2825,6 +2953,306 @@ func (s *PostgresStore) SchemaVersion(ctx context.Context) (int, error) {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// runner profiles, per-runner tokens, revocations, enrollment grants
+// (migration 0006)
+// ---------------------------------------------------------------------------
+
+var (
+	_ ProfileStore        = (*PostgresStore)(nil)
+	_ RunnerTokenStore    = (*PostgresStore)(nil)
+	_ CertRevocationStore = (*PostgresStore)(nil)
+	_ EnrollGrantStore    = (*PostgresStore)(nil)
+	_ TestHistoryStore    = (*PostgresStore)(nil)
+)
+
+// scanProfile reads one runner_profiles row into a model.RunnerProfile.
+func scanProfile(row pgx.Row) (model.RunnerProfile, error) {
+	var (
+		p           model.RunnerProfile
+		labels      []byte
+		region      string
+		repos       []byte
+		caps        []byte
+		maxCapacity int
+		cost        float64
+		watts       float64
+	)
+	err := row.Scan(&p.ID, &labels, &region, &repos, &caps, &maxCapacity, &cost, &watts, &p.CreatedAt)
+	if err != nil {
+		return p, err
+	}
+	if err := json.Unmarshal(labels, &p.Labels); err != nil {
+		return p, fmt.Errorf("storage: decode profile labels: %w", err)
+	}
+	if err := json.Unmarshal(repos, &p.Repositories); err != nil {
+		return p, fmt.Errorf("storage: decode profile repositories: %w", err)
+	}
+	if err := json.Unmarshal(caps, &p.Capabilities); err != nil {
+		return p, fmt.Errorf("storage: decode profile capabilities: %w", err)
+	}
+	p.Region = region
+	p.MaxCapacity = maxCapacity
+	p.CostPerHour = cost
+	p.PowerWatts = watts
+	return p, nil
+}
+
+const profileCols = "id, labels, region, repositories, capabilities, max_capacity, cost_per_hour, power_watts, created_at"
+
+func (s *PostgresStore) UpsertProfile(ctx context.Context, p model.RunnerProfile) error {
+	if p.ID == "" {
+		return fmt.Errorf("storage: profile id is required")
+	}
+	labels, err := json.Marshal(p.Labels)
+	if err != nil {
+		return err
+	}
+	if len(labels) == 0 || string(labels) == "null" {
+		labels = []byte("[]")
+	}
+	repos, err := json.Marshal(p.Repositories)
+	if err != nil {
+		return err
+	}
+	if len(repos) == 0 || string(repos) == "null" {
+		repos = []byte("[]")
+	}
+	caps, err := json.Marshal(p.Capabilities)
+	if err != nil {
+		return err
+	}
+	if len(caps) == 0 || string(caps) == "null" {
+		caps = []byte("[]")
+	}
+	created := p.CreatedAt
+	if created.IsZero() {
+		created = time.Now().UTC()
+	}
+	_, err = s.pool.Exec(ctx, `INSERT INTO runner_profiles (id, labels, region, repositories, capabilities, max_capacity, cost_per_hour, power_watts, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (id) DO UPDATE SET labels=EXCLUDED.labels, region=EXCLUDED.region, repositories=EXCLUDED.repositories, capabilities=EXCLUDED.capabilities, max_capacity=EXCLUDED.max_capacity, cost_per_hour=EXCLUDED.cost_per_hour, power_watts=EXCLUDED.power_watts`,
+		p.ID, labels, p.Region, repos, caps, p.MaxCapacity, p.CostPerHour, p.PowerWatts, created)
+	return err
+}
+
+func (s *PostgresStore) GetProfile(ctx context.Context, id string) (model.RunnerProfile, error) {
+	p, err := scanProfile(s.pool.QueryRow(ctx, `SELECT `+profileCols+` FROM runner_profiles WHERE id=$1`, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return model.RunnerProfile{}, ErrNotFound
+	}
+	return p, err
+}
+
+func (s *PostgresStore) ListProfiles(ctx context.Context) ([]model.RunnerProfile, error) {
+	rows, err := s.pool.Query(ctx, `SELECT `+profileCols+` FROM runner_profiles ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.RunnerProfile{}
+	for rows.Next() {
+		p, err := scanProfile(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (s *PostgresStore) BindCertProfile(ctx context.Context, serial, profileID string) error {
+	if serial == "" {
+		return fmt.Errorf("storage: certificate serial is required")
+	}
+	if profileID == "" {
+		return fmt.Errorf("storage: profile id is required")
+	}
+	if _, err := s.pool.Exec(ctx, `INSERT INTO cert_profile_links (serial, profile_id) VALUES ($1,$2) ON CONFLICT (serial) DO UPDATE SET profile_id=EXCLUDED.profile_id`, serial, profileID); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *PostgresStore) ProfileForSerial(ctx context.Context, serial string) (model.RunnerProfile, bool, error) {
+	if serial == "" {
+		return model.RunnerProfile{}, false, nil
+	}
+	var (
+		p           model.RunnerProfile
+		labels      []byte
+		region      string
+		repos       []byte
+		caps        []byte
+		maxCapacity int
+		cost        float64
+		watts       float64
+	)
+	err := s.pool.QueryRow(ctx, `SELECT rp.id, rp.labels, rp.region, rp.repositories, rp.capabilities, rp.max_capacity, rp.cost_per_hour, rp.power_watts, rp.created_at FROM cert_profile_links cl JOIN runner_profiles rp ON rp.id = cl.profile_id WHERE cl.serial=$1`, serial).
+		Scan(&p.ID, &labels, &region, &repos, &caps, &maxCapacity, &cost, &watts, &p.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return model.RunnerProfile{}, false, nil
+	}
+	if err != nil {
+		return model.RunnerProfile{}, false, err
+	}
+	if err := json.Unmarshal(labels, &p.Labels); err != nil {
+		return model.RunnerProfile{}, false, fmt.Errorf("storage: decode profile labels: %w", err)
+	}
+	if err := json.Unmarshal(repos, &p.Repositories); err != nil {
+		return model.RunnerProfile{}, false, fmt.Errorf("storage: decode profile repositories: %w", err)
+	}
+	if err := json.Unmarshal(caps, &p.Capabilities); err != nil {
+		return model.RunnerProfile{}, false, fmt.Errorf("storage: decode profile capabilities: %w", err)
+	}
+	p.Region = region
+	p.MaxCapacity = maxCapacity
+	p.CostPerHour = cost
+	p.PowerWatts = watts
+	return p, true, nil
+}
+
+func (s *PostgresStore) UpsertRunnerToken(ctx context.Context, runnerID, tokenDigest string) error {
+	if runnerID == "" {
+		return fmt.Errorf("storage: runner id is required")
+	}
+	if tokenDigest == "" {
+		return fmt.Errorf("storage: token digest is required")
+	}
+	_, err := s.pool.Exec(ctx, `INSERT INTO runner_bearer_tokens (runner_id, token_digest) VALUES ($1,$2) ON CONFLICT (runner_id) DO UPDATE SET token_digest=EXCLUDED.token_digest`, runnerID, tokenDigest)
+	return err
+}
+
+func (s *PostgresStore) RunnerIDForToken(ctx context.Context, tokenDigest string) (string, bool, error) {
+	if tokenDigest == "" {
+		return "", false, nil
+	}
+	var id string
+	err := s.pool.QueryRow(ctx, `SELECT runner_id FROM runner_bearer_tokens WHERE token_digest=$1`, tokenDigest).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return id, true, nil
+}
+
+func (s *PostgresStore) HasRunnerTokens(ctx context.Context) (bool, error) {
+	var exists bool
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM runner_bearer_tokens LIMIT 1)`).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+func (s *PostgresStore) RevokeCert(ctx context.Context, serial, runnerID, reason string) error {
+	if serial == "" {
+		return fmt.Errorf("storage: certificate serial is required")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `INSERT INTO cert_revocations (serial, revoked_at, reason, runner_id) VALUES ($1, now(), $2, $3) ON CONFLICT (serial) DO NOTHING`, serial, reason, runnerID); err != nil {
+		return err
+	}
+	// The runner row's revoked_at mirrors the durable revocation so the
+	// disable flow and identity verification see the same state.
+	if runnerID != "" {
+		if _, err := tx.Exec(ctx, `UPDATE runners SET payload = jsonb_set(payload, '{revoked_at}', to_jsonb(now()::text), true) WHERE id=$1`, runnerID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *PostgresStore) CertRevoked(ctx context.Context, serial string) (bool, error) {
+	if serial == "" {
+		return false, nil
+	}
+	var exists bool
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM cert_revocations WHERE serial=$1)`, serial).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+func (s *PostgresStore) PutEnrollGrant(ctx context.Context, digest string, expiresAt time.Time, boundLabels []string) error {
+	if digest == "" {
+		return fmt.Errorf("storage: enroll grant digest is required")
+	}
+	labels, err := json.Marshal(boundLabels)
+	if err != nil {
+		return err
+	}
+	if len(labels) == 0 || string(labels) == "null" {
+		labels = []byte("[]")
+	}
+	_, err = s.pool.Exec(ctx, `INSERT INTO enrollment_grants (digest, expires_at, bound_labels) VALUES ($1,$2,$3) ON CONFLICT (digest) DO NOTHING`, digest, expiresAt, labels)
+	return err
+}
+
+func (s *PostgresStore) GetEnrollGrant(ctx context.Context, digest string) (EnrollGrantRecord, bool, error) {
+	if digest == "" {
+		return EnrollGrantRecord{}, false, nil
+	}
+	var (
+		rec        EnrollGrantRecord
+		labelsJSON []byte
+		consumedAt *time.Time
+	)
+	err := s.pool.QueryRow(ctx, `SELECT expires_at, bound_labels, consumed_at FROM enrollment_grants WHERE digest=$1`, digest).
+		Scan(&rec.ExpiresAt, &labelsJSON, &consumedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return EnrollGrantRecord{}, false, nil
+	}
+	if err != nil {
+		return EnrollGrantRecord{}, false, err
+	}
+	if err := json.Unmarshal(labelsJSON, &rec.BoundLabels); err != nil {
+		return EnrollGrantRecord{}, false, fmt.Errorf("storage: decode grant bound labels: %w", err)
+	}
+	rec.Consumed = consumedAt != nil
+	return rec, true, nil
+}
+
+// ConsumeEnrollGrant is the atomic single-use claim: the conditional UPDATE
+// matches only rows with consumed_at IS NULL and expires_at in the future,
+// so two concurrent enrollments of the same grant yield exactly one winner.
+// On no match the row state is re-read to report the precise failure reason
+// (unknown vs consumed vs expired).
+func (s *PostgresStore) ConsumeEnrollGrant(ctx context.Context, digest string, consumedBy string) (EnrollGrantRecord, error) {
+	if digest == "" {
+		return EnrollGrantRecord{}, ErrNotFound
+	}
+	var rec EnrollGrantRecord
+	var labelsJSON []byte
+	err := s.pool.QueryRow(ctx, `UPDATE enrollment_grants SET consumed_at=now(), consumed_by=$2 WHERE digest=$1 AND consumed_at IS NULL AND expires_at > now() RETURNING expires_at, bound_labels`, digest, consumedBy).
+		Scan(&rec.ExpiresAt, &labelsJSON)
+	if err == nil {
+		if uerr := json.Unmarshal(labelsJSON, &rec.BoundLabels); uerr != nil {
+			return EnrollGrantRecord{}, fmt.Errorf("storage: decode grant bound labels: %w", uerr)
+		}
+		rec.Consumed = true
+		return rec, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return EnrollGrantRecord{}, err
+	}
+	// No row matched: distinguish unknown vs consumed vs expired.
+	existing, ok, gerr := s.GetEnrollGrant(ctx, digest)
+	if gerr != nil {
+		return EnrollGrantRecord{}, gerr
+	}
+	if !ok {
+		return EnrollGrantRecord{}, ErrNotFound
+	}
+	if existing.Consumed {
+		return EnrollGrantRecord{}, ErrGrantConsumed
+	}
+	return EnrollGrantRecord{}, ErrGrantExpired
+}
 
 func newID() (string, error) {
 	b := make([]byte, 16)

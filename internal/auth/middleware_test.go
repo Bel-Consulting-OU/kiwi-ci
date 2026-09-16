@@ -224,3 +224,44 @@ func TestMiddlewarePassesPublicPathsWithPopulatedStore(t *testing.T) {
 		}
 	}
 }
+
+// TestMiddlewareWithClassifierRunnerTierPassthrough: the unified middleware
+// classifies routes BEFORE generic bearer authentication — a runner-tier
+// route must reach the next handler even when the principal store is
+// populated and the bearer is not a store token (the server's runner tier
+// gate authenticates runner credentials).
+func TestMiddlewareWithClassifierRunnerTierPassthrough(t *testing.T) {
+	store := NewTokenStore()
+	if err := store.AddToken("store-token", Principal{Subject: "bot"}); err != nil {
+		t.Fatal(err)
+	}
+	runnerRoute := func(r *http.Request) bool {
+		return r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/v1/runners/")
+	}
+	called := false
+	h := MiddlewareWithClassifier(store, "admin-token", runnerRoute, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}), nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/runners/register", strings.NewReader("{}"))
+	req.Header.Set("Authorization", "Bearer runner-tok")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !called {
+		t.Fatalf("runner bearer blocked by generic middleware: %d called=%v", w.Code, called)
+	}
+	if _, ok := PrincipalFrom(req); ok {
+		t.Fatal("runner bearer must not bind a store principal")
+	}
+	// A non-runner, non-public path with the same unknown bearer still 401s.
+	called = false
+	h2 := MiddlewareWithClassifier(store, "admin-token", runnerRoute, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}), nil)
+	req2 := httptest.NewRequest(http.MethodGet, "/api/v1/runs", nil)
+	req2.Header.Set("Authorization", "Bearer runner-tok")
+	w2 := httptest.NewRecorder()
+	h2.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusUnauthorized || called {
+		t.Fatalf("unknown bearer outside the classified routes: %d called=%v", w2.Code, called)
+	}
+}

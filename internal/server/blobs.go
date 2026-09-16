@@ -45,7 +45,7 @@ func (s *Server) uploadArtifact(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "artifact storage requires persistent server", http.StatusServiceUnavailable)
 		return
 	}
-	jobID, name := r.PathValue("id"), cleanBlobName(r.PathValue("name"))
+	name := cleanBlobName(r.PathValue("name"))
 	if name == "" {
 		http.Error(w, "invalid artifact name", http.StatusBadRequest)
 		return
@@ -53,18 +53,9 @@ func (s *Server) uploadArtifact(w http.ResponseWriter, r *http.Request) {
 	runnerID := r.Header.Get("X-Kiwi-Runner-ID")
 	token := r.Header.Get("X-Kiwi-Lease-Token")
 	gen, _ := strconv.ParseInt(r.Header.Get("X-Kiwi-Lease-Generation"), 10, 64)
-	now := time.Now().UTC()
-	if !s.verifyRunnerIdentity(r, runnerID) {
-		http.Error(w, "runner identity mismatch", http.StatusForbidden)
-		return
-	}
-	j, err := s.jobForLease(r.Context(), jobID)
-	if errors.Is(err, storage.ErrNotFound) {
-		http.NotFound(w, r)
-		return
-	}
-	if err != nil {
-		http.Error(w, err.Error(), 500)
+	j, authErr := s.authorizeRunnerLease(r, runnerID, token, gen)
+	if authErr != nil {
+		s.writeLeaseAuthError(w, r, authErr)
 		return
 	}
 	run := model.Run{}
@@ -74,10 +65,6 @@ func (s *Server) uploadArtifact(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		run = s.runs[j.RunID]
 		s.mu.Unlock()
-	}
-	if !s.validActiveLease(j, runnerID, token, gen, now) {
-		http.Error(w, "stale or invalid lease", http.StatusConflict)
-		return
 	}
 	// Contract resolution: every upload name must trace to a declared
 	// artifact (or its .sbom/.sigstore attestation sibling).
@@ -436,11 +423,11 @@ func cacheFileKey(repo, trust, logicalKey string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// cacheLease verifies the job-lease contract for a cache request: identity
-// binding, a live lease, and the absence of the forbidden legacy namespace
-// headers. On success it returns the leased job.
+// cacheLease verifies the job-lease contract for a cache request via the
+// shared authorizeRunnerLease gate: identity binding, a live lease, and the
+// absence of the forbidden legacy namespace headers. On success it returns
+// the leased job.
 func (s *Server) cacheLease(w http.ResponseWriter, r *http.Request) (model.Job, string, bool) {
-	jobID := r.PathValue("id")
 	// The namespace is server-derived; stale clients that still send the
 	// repository/trust-domain headers are rejected so they fail loudly.
 	if r.Header.Get("X-Kiwi-Repository") != "" || r.Header.Get("X-Kiwi-Trust-Domain") != "" {
@@ -450,21 +437,9 @@ func (s *Server) cacheLease(w http.ResponseWriter, r *http.Request) (model.Job, 
 	runnerID := r.Header.Get("X-Kiwi-Runner-ID")
 	token := r.Header.Get("X-Kiwi-Lease-Token")
 	gen, _ := strconv.ParseInt(r.Header.Get("X-Kiwi-Lease-Generation"), 10, 64)
-	if !s.verifyRunnerIdentity(r, runnerID) {
-		http.Error(w, "runner identity mismatch", http.StatusForbidden)
-		return model.Job{}, "", false
-	}
-	j, err := s.jobForLease(r.Context(), jobID)
-	if errors.Is(err, storage.ErrNotFound) {
-		http.NotFound(w, r)
-		return model.Job{}, "", false
-	}
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return model.Job{}, "", false
-	}
-	if !s.validActiveLease(j, runnerID, token, gen, time.Now().UTC()) {
-		http.Error(w, "stale or invalid lease", http.StatusConflict)
+	j, authErr := s.authorizeRunnerLease(r, runnerID, token, gen)
+	if authErr != nil {
+		s.writeLeaseAuthError(w, r, authErr)
 		return model.Job{}, "", false
 	}
 	return j, runnerID, true
@@ -477,7 +452,10 @@ func (s *Server) cacheLease(w http.ResponseWriter, r *http.Request) (model.Job, 
 // binds (repo, trust_domain, logical_key) to the blob digest: persisted in
 // the cache_manifests table in DB mode, next to the dataDir in fs mode.
 // The namespace is derived from the leased job; the response carries the
-// content digest and the manifest digest.
+// content digest and the manifest digest. The manifest must commit
+// durably BEFORE the 201: a manifest failure removes the orphaned CAS blob
+// and fails the upload (5xx) so a cache entry can never exist without its
+// signed mapping.
 func (s *Server) uploadJobCache(w http.ResponseWriter, r *http.Request) {
 	if s.store == nil {
 		http.Error(w, "cache storage requires persistent server", http.StatusServiceUnavailable)
@@ -505,20 +483,33 @@ func (s *Server) uploadJobCache(w http.ResponseWriter, r *http.Request) {
 	}
 	sum := obj.SHA256
 	size := obj.Size
+	envelope, err := s.writeCacheManifest(r.Context(), fileKey, key, repo, trust, sum, size, j)
+	if err != nil {
+		// The manifest is the durable mapping: without it the blob is an
+		// unreachable orphan, so it is removed and the upload fails closed.
+		if derr := s.CAS.Delete(r.Context(), sum); derr != nil {
+			s.logError("cache: orphan blob removal failed", "sha256", sum, "error", derr.Error())
+		}
+		s.logError("cache: manifest persist failed", "error", err.Error())
+		http.Error(w, "cache manifest persist failed", http.StatusInternalServerError)
+		return
+	}
 	s.metricAdd("kiwi_cache_bytes_total", float64(size), nil)
 	w.Header().Set("X-Kiwi-Cache-SHA256", sum)
 	w.Header().Set("X-Kiwi-Content-SHA256", sum)
-	s.writeCacheManifest(w, r.Context(), fileKey, key, repo, trust, sum, size, j)
+	w.Header().Set("X-Kiwi-Cache-Manifest-SHA256", manifestDigestOf(envelope))
 	s.auditLocked("cache.uploaded", runnerID, j.RunID, j.ID, "cache entry stored", map[string]string{"key": key, "repository": repo, "trust_domain": trust})
 	w.WriteHeader(http.StatusCreated)
 }
 
 // writeCacheManifest signs the cache manifest with the dedicated cache
-// signing key and stores it: in DB mode as a cache_manifests row, in fs
-// mode as the manifest file next to the dataDir. The namespace is
-// server-derived from the leased job — repository and trust domain never
-// come from client headers.
-func (s *Server) writeCacheManifest(w http.ResponseWriter, ctx context.Context, fileKey, logicalKey, repo, trust, sum string, size int64, j model.Job) {
+// signing key and stores it durably: in DB mode as a cache_manifests row
+// (the signed envelope rides the payload column), in fs mode as the
+// manifest file next to the dataDir written atomically and fsynced. The
+// namespace is server-derived from the leased job — repository and trust
+// domain never come from client headers. It returns the signed envelope
+// bytes and any persistence error.
+func (s *Server) writeCacheManifest(ctx context.Context, fileKey, logicalKey, repo, trust, sum string, size int64, j model.Job) ([]byte, error) {
 	signer := s.ensureCacheSigner()
 	m := cache.CacheManifest{
 		Version:     1,
@@ -527,47 +518,72 @@ func (s *Server) writeCacheManifest(w http.ResponseWriter, ctx context.Context, 
 		LogicalKey:  logicalKey,
 		BlobSHA256:  sum,
 		BlobSize:    size,
+		ProducerRun: j.RunID,
+		ProducerJob: j.ID,
 		CreatedAt:   time.Now().UTC(),
 	}
 	b, err := cache.SignManifest(m, signer.KID, signer.Private)
 	if err != nil {
-		return
+		return nil, err
 	}
 	if s.DB != nil {
-		if cs, ok := s.DB.(storage.CacheManifestStore); ok {
-			if err := cs.PutCacheManifest(ctx, storage.CacheManifestRecord{
-				Repo:        repo,
-				TrustDomain: trust,
-				LogicalKey:  logicalKey,
-				BlobSHA256:  sum,
-				BlobSize:    size,
-				ProducerRun: j.RunID,
-				ProducerJob: j.ID,
-				CreatedAt:   m.CreatedAt,
-				Envelope:    b,
-			}); err != nil {
-				s.logError("cache: manifest persist failed", "error", err.Error())
-				return
-			}
+		if cs, ok := s.DB.(storage.CacheManifestStore); !ok {
+			return nil, fmt.Errorf("cache manifest store unavailable")
+		} else if err := cs.PutCacheManifest(ctx, storage.CacheManifestRecord{
+			Repo:        repo,
+			TrustDomain: trust,
+			LogicalKey:  logicalKey,
+			BlobSHA256:  sum,
+			BlobSize:    size,
+			ProducerRun: j.RunID,
+			ProducerJob: j.ID,
+			CreatedAt:   m.CreatedAt,
+			Envelope:    b,
+		}); err != nil {
+			return nil, err
 		}
-		w.Header().Set("X-Kiwi-Cache-Manifest-SHA256", manifestDigestOf(b))
-		return
+		return b, nil
 	}
 	path := filepath.Join(s.store.Root, "cache", fileKey+".manifest.json")
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		s.logError("cache: manifest dir failed", "error", err.Error())
-		return
+		return nil, err
 	}
-	_ = writeFileAtomic(path, b, 0o600)
-	w.Header().Set("X-Kiwi-Cache-Manifest-SHA256", manifestDigestOf(b))
+	if err := writeFileSync(path, b, 0o600); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+// writeFileSync writes data atomically via a temp file + rename and fsyncs
+// the file before the rename so a durable manifest write cannot be lost by
+// a crash.
+func writeFileSync(path string, data []byte, mode os.FileMode) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, mode); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(tmp, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // downloadJobCache implements GET /api/v1/jobs/{id}/cache/{key}. The
 // namespace is resolved from the leased job, the manifest row (DB mode) or
 // manifest file (fs mode) maps it to the blob digest, and the bytes stream
 // from the shared CAS store so every replica serves the same entry. The
-// response headers keep the runner-facing contract: X-Kiwi-Cache-SHA256 is
-// the manifest digest of the archive bytes.
+// signed envelope is verified in BOTH modes before any bytes are served: a
+// tampered or unverifiable manifest never resolves a payload. The response
+// headers keep the runner-facing contract: X-Kiwi-Cache-SHA256 is the
+// manifest digest of the archive bytes.
 func (s *Server) downloadJobCache(w http.ResponseWriter, r *http.Request) {
 	if s.store == nil {
 		http.Error(w, "cache storage requires persistent server", http.StatusServiceUnavailable)
@@ -603,7 +619,24 @@ func (s *Server) downloadJobCache(w http.ResponseWriter, r *http.Request) {
 				http.NotFound(w, r)
 				return
 			}
-			digest = rec.BlobSHA256
+			// DB restore verifies the signed envelope exactly like fs mode:
+			// the persisted envelope is the authoritative record, and its
+			// signature and digest must verify before the payload resolves.
+			// A tampered row serves nothing — never a corrupt payload.
+			m, verr := cache.VerifyManifest(rec.Envelope, s.ensureCacheSigner().Public)
+			if verr != nil {
+				s.metricAdd("kiwi_cache_misses_total", 1, nil)
+				s.logError("cache: manifest verification failed", "error", verr.Error())
+				http.Error(w, "cache manifest verification failed", http.StatusInternalServerError)
+				return
+			}
+			if m.BlobSHA256 != rec.BlobSHA256 || m.BlobSHA256 == "" {
+				s.metricAdd("kiwi_cache_misses_total", 1, nil)
+				s.logError("cache: manifest digest mismatch", "row", rec.BlobSHA256, "envelope", m.BlobSHA256)
+				http.NotFound(w, r)
+				return
+			}
+			digest = m.BlobSHA256
 			envelope = rec.Envelope
 		}
 	} else {

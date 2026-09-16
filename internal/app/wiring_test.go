@@ -243,7 +243,7 @@ func TestGitLabWebhookBaseURL(t *testing.T) {
 		if strings.HasSuffix(r.URL.Path, "/raw") {
 			fetchCalls.Add(1)
 			sawToken.Store(r.Header.Get("PRIVATE-TOKEN"))
-			io.WriteString(w, "version: 1\njobs:\n  build:\n    runtime: container\n    steps:\n      - run: echo hi\n")
+			io.WriteString(w, "version: 1\njobs:\n  build:\n    runtime: container\n    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n    steps:\n      - run: echo hi\n")
 			return
 		}
 		http.NotFound(w, r)

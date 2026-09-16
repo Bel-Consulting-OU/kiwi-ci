@@ -5,17 +5,12 @@
 // draft PRs never match, ref filters apply to branches or tags, and path
 // filters evaluate against the event's changed files.
 //
-// The duplication with forge.MatchesTrigger is deliberate: forge must not
-// import this package (trigger imports forge for EventContext), and the
-// server's webhook path keeps using forge.MatchesTrigger. Any semantic
-// change must be applied to both; the tests in forge/matches_test.go and
-// trigger/trigger_test.go keep them in lockstep.
+// Matching DELEGATES to forge.MatchesTrigger (the authoritative
+// implementation); this package exists so forge never imports trigger.
 package trigger
 
 import (
 	"fmt"
-	"path"
-	"strings"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/forge"
@@ -42,22 +37,6 @@ func (t TriggerSet) Matches(ec forge.EventContext) (bool, string) {
 // and forge never imports trigger, so the dependency direction is clean.
 func Matches(triggers map[string]pipeline.Trigger, ec forge.EventContext) (bool, string) {
 	return forge.MatchesTrigger(triggers, ec)
-}
-
-func matchRefPatterns(name string, patterns []string) bool {
-	for _, ptn := range patterns {
-		ptn = strings.TrimSpace(ptn)
-		if ptn == "" {
-			continue
-		}
-		if ptn == name {
-			return true
-		}
-		if ok, err := path.Match(ptn, name); err == nil && ok {
-			return true
-		}
-	}
-	return false
 }
 
 // ScheduleKey returns the stable idempotency key for one nominal schedule

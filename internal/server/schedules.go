@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -24,12 +25,39 @@ type schedulesFileJSON struct {
 	Occurrences map[string]map[int64]string `json:"occurrences"`
 }
 
-// scheduleRequest is the PUT /api/v1/schedules body.
+// scheduleRequest is the PUT /api/v1/schedules body. Repository is the
+// repository full name (owner/name) — the identity, no longer the clone
+// URL; RepoURL is the clone URL; Trusted requests a trusted schedule
+// (requires the repo-scoped trusted_run grant on top of policy_manage).
+// The canonical RepoID and the Forge kind are derived server-side from
+// (RepoURL, Repository) and stored, so automatic firing uses the immutable
+// stored identity — never the request context.
 type scheduleRequest struct {
 	ID         string `json:"id,omitempty"`
 	Repository string `json:"repository"`
+	RepoURL    string `json:"repo_url,omitempty"`
 	Spec       string `json:"spec"`
 	Enabled    *bool  `json:"enabled,omitempty"`
+	Trusted    bool   `json:"trusted,omitempty"`
+}
+
+// scheduleRepoID resolves the stored canonical repository identity of a
+// schedule: the RepoID field when present, otherwise the legacy Repository
+// value (old rows stored the clone URL as both identity and clone URL).
+func scheduleRepoID(sc storage.Schedule) string {
+	if sc.RepoID != "" {
+		return sc.RepoID
+	}
+	return sc.Repository
+}
+
+// scheduleRepoURL resolves the stored clone URL of a schedule: the RepoURL
+// field when present, otherwise the legacy Repository value.
+func scheduleRepoURL(sc storage.Schedule) string {
+	if sc.RepoURL != "" {
+		return sc.RepoURL
+	}
+	return sc.Repository
 }
 
 // parseScheduleSpec validates a schedule's pipeline text with the SAME
@@ -206,6 +234,28 @@ func (s *Server) upsertSchedule(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid schedule spec: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	// Identity derivation: Repository is the full name (identity), RepoURL
+	// the clone URL. The canonical RepoID and the Forge kind are derived
+	// once and stored, so automatic firing uses the immutable stored
+	// identity. Legacy rows (created before repo_url existed) stored the
+	// clone URL in repository: a URL-shaped repository keeps working as its
+	// own identity and clone URL.
+	repoURL := strings.TrimSpace(in.RepoURL)
+	if repoURL == "" {
+		repoURL = in.Repository
+	}
+	repoID := auth.CanonicalRepoID(repoHost(repoURL), in.Repository)
+	if u, err := url.Parse(in.Repository); err == nil && u.Host != "" {
+		repoID = in.Repository
+	}
+	if in.Trusted {
+		// A TRUSTED schedule fires with trusted capabilities: creating or
+		// updating one requires the repo-scoped trusted_run grant for the
+		// schedule's repository, in addition to policy_manage.
+		if !s.requireAction(w, r, auth.ActionTrustedRun, repoID, true) {
+			return
+		}
+	}
 	now := time.Now().UTC()
 	enabled := true
 	if in.Enabled != nil {
@@ -241,6 +291,10 @@ func (s *Server) upsertSchedule(w http.ResponseWriter, r *http.Request) {
 			action = "schedule.created"
 		}
 		sc.Repository = in.Repository
+		sc.RepoID = repoID
+		sc.RepoURL = repoURL
+		sc.Forge = forgeKindForHost(repoHost(repoURL))
+		sc.Trusted = in.Trusted
 		sc.Spec = in.Spec
 		sc.Enabled = enabled
 		if err := ss.UpsertSchedule(r.Context(), sc); err != nil {
@@ -270,6 +324,10 @@ func (s *Server) upsertSchedule(w http.ResponseWriter, r *http.Request) {
 			action = "schedule.created"
 		}
 		sc.Repository = in.Repository
+		sc.RepoID = repoID
+		sc.RepoURL = repoURL
+		sc.Forge = forgeKindForHost(repoHost(repoURL))
+		sc.Trusted = in.Trusted
 		sc.Spec = in.Spec
 		sc.Enabled = enabled
 		s.schedules[sc.ID] = sc
@@ -300,6 +358,13 @@ func (s *Server) triggerSchedule(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		http.Error(w, err.Error(), 500)
+		return
+	}
+	// Manual trigger re-checks the trusted_run grant for TRUSTED schedules:
+	// a principal whose grant was revoked after creation must not be able
+	// to fire the schedule manually. The re-check resolves the schedule's
+	// STORED identity, never the request context.
+	if sc.Trusted && !s.requireAction(w, r, auth.ActionTrustedRun, scheduleRepoID(sc), true) {
 		return
 	}
 	nominal := time.Now().UTC().Truncate(time.Minute)
@@ -441,7 +506,9 @@ func (s *Server) nextDueScheduleFrom(now time.Time, seen map[string]bool) (stora
 // occurrence unclaimed and the next tick refires it); in memory mode the
 // claim lands under s.mu only after the run is committed. It reports
 // fired=false when the nominal was already claimed by another run
-// (duplicate trigger or another instance).
+// (duplicate trigger or another instance). The run is enqueued under the
+// schedule's STORED immutable identity (RepoID, RepoURL, Trusted) — never
+// the caller's request context.
 func (s *Server) fireSchedule(ctx context.Context, sc storage.Schedule, nominal time.Time) (model.Run, bool, error) {
 	preID, err := newID()
 	if err != nil {
@@ -452,12 +519,12 @@ func (s *Server) fireSchedule(ctx context.Context, sc storage.Schedule, nominal 
 		return model.Run{}, false, err
 	}
 	in := SubmitRun{
-		RepoURL:      sc.Repository,
-		RepoFullName: sc.Repository,
+		RepoURL:      scheduleRepoURL(sc),
+		RepoFullName: scheduleRepoID(sc),
 		Ref:          ref,
 		Event:        "schedule",
 		Pipeline:     sanitizeScheduleSpec(sc.Spec),
-		Trusted:      true,
+		Trusted:      sc.Trusted,
 		Metadata:     map[string]string{"schedule_id": sc.ID, "schedule_nominal": nominal.Format(time.RFC3339)},
 		// The occurrence claim commits atomically with the run.
 		ScheduleClaim: &storage.ScheduleClaim{ScheduleID: sc.ID, Nominal: nominal},

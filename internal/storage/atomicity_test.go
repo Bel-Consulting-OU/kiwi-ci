@@ -245,7 +245,10 @@ func TestMemStoreInsertGeneratedJobsTxVerifier(t *testing.T) {
 	child := testJob
 	child.ID = "ffffffffffffffffffffffffffffffff"
 	child.Key = "generated"
-	err := m.InsertGeneratedJobsTx(ctx(), testJob.ID, 1, map[string]model.Job{child.ID: child}, nil, func(parent model.Job, count int) error {
+	contracts := map[string]map[string]ArtifactContract{
+		child.ID: {"dist": {Name: "dist", Required: true}},
+	}
+	err := m.InsertGeneratedJobsTx(ctx(), testJob.ID, 1, map[string]model.Job{child.ID: child}, nil, contracts, func(parent model.Job, count int) error {
 		return errors.New("rejected by verifier")
 	})
 	if err == nil {
@@ -254,8 +257,12 @@ func TestMemStoreInsertGeneratedJobsTxVerifier(t *testing.T) {
 	if _, gerr := m.GetJob(ctx(), child.ID); !errors.Is(gerr, ErrNotFound) {
 		t.Fatalf("rejected fragment leaked a job: %v", gerr)
 	}
-	// Acceptance inserts the fragment.
-	if err := m.InsertGeneratedJobsTx(ctx(), testJob.ID, 1, map[string]model.Job{child.ID: child}, nil, func(parent model.Job, count int) error {
+	// A rejected fragment must not leak its contracts either.
+	if got, ok, _ := m.GetJobContracts(ctx(), child.ID); ok || got != nil {
+		t.Fatalf("rejected fragment leaked contracts: %v", got)
+	}
+	// Acceptance inserts the fragment AND its contracts atomically.
+	if err := m.InsertGeneratedJobsTx(ctx(), testJob.ID, 1, map[string]model.Job{child.ID: child}, nil, contracts, func(parent model.Job, count int) error {
 		if count != 1 {
 			t.Fatalf("run job count = %d, want 1", count)
 		}
@@ -265,6 +272,9 @@ func TestMemStoreInsertGeneratedJobsTxVerifier(t *testing.T) {
 	}
 	if _, err := m.GetJob(ctx(), child.ID); err != nil {
 		t.Fatalf("accepted fragment missing: %v", err)
+	}
+	if got, ok, err := m.GetJobContracts(ctx(), child.ID); err != nil || !ok || got["dist"].Name != "dist" {
+		t.Fatalf("accepted fragment contracts = %v, ok=%v, err=%v", got, ok, err)
 	}
 }
 

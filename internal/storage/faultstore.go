@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"sort"
@@ -70,6 +71,11 @@ var (
 	_ ArtifactSidecarStore  = (*FaultyStore)(nil)
 	_ SecretClaimStore      = (*FaultyStore)(nil)
 	_ SecretClaimReleaser   = (*FaultyStore)(nil)
+	_ ProfileStore          = (*FaultyStore)(nil)
+	_ RunnerTokenStore      = (*FaultyStore)(nil)
+	_ CertRevocationStore   = (*FaultyStore)(nil)
+	_ EnrollGrantStore      = (*FaultyStore)(nil)
+	_ TestHistoryStore      = (*FaultyStore)(nil)
 )
 
 func (f *FaultyStore) Close() error { return f.Inner.Close() }
@@ -544,13 +550,13 @@ func (f *FaultyStore) ExpireDownstreamReservations(ctx context.Context, olderTha
 	return f.Inner.(DownstreamStore).ExpireDownstreamReservations(ctx, olderThan)
 }
 
-func (f *FaultyStore) InsertGeneratedJobsTx(ctx context.Context, parentJobID string, depth int, jobs map[string]model.Job, deps map[string][]string, verify GeneratedJobVerifier) error {
+func (f *FaultyStore) InsertGeneratedJobsTx(ctx context.Context, parentJobID string, depth int, jobs map[string]model.Job, deps map[string][]string, contracts map[string]map[string]ArtifactContract, verify GeneratedJobVerifier) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(DynamicStoreTx).InsertGeneratedJobsTx(ctx, parentJobID, depth, jobs, deps, verify)
+	return f.Inner.(DynamicStoreTx).InsertGeneratedJobsTx(ctx, parentJobID, depth, jobs, deps, contracts, verify)
 }
 
 func (f *FaultyStore) PutCacheManifest(ctx context.Context, rec CacheManifestRecord) error {
@@ -593,6 +599,101 @@ func (f *FaultyStore) ReleaseSecretDelivery(ctx context.Context, jobID string, g
 	return f.Inner.(SecretClaimReleaser).ReleaseSecretDelivery(ctx, jobID, generation, secretName)
 }
 
+func (f *FaultyStore) UpsertProfile(ctx context.Context, p model.RunnerProfile) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(ProfileStore).UpsertProfile(ctx, p)
+}
+
+func (f *FaultyStore) GetProfile(ctx context.Context, id string) (model.RunnerProfile, error) {
+	return f.Inner.(ProfileStore).GetProfile(ctx, id)
+}
+
+func (f *FaultyStore) ListProfiles(ctx context.Context) ([]model.RunnerProfile, error) {
+	return f.Inner.(ProfileStore).ListProfiles(ctx)
+}
+
+func (f *FaultyStore) BindCertProfile(ctx context.Context, serial, profileID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(ProfileStore).BindCertProfile(ctx, serial, profileID)
+}
+
+func (f *FaultyStore) ProfileForSerial(ctx context.Context, serial string) (model.RunnerProfile, bool, error) {
+	return f.Inner.(ProfileStore).ProfileForSerial(ctx, serial)
+}
+
+func (f *FaultyStore) UpsertRunnerToken(ctx context.Context, runnerID, tokenDigest string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(RunnerTokenStore).UpsertRunnerToken(ctx, runnerID, tokenDigest)
+}
+
+func (f *FaultyStore) RunnerIDForToken(ctx context.Context, tokenDigest string) (string, bool, error) {
+	return f.Inner.(RunnerTokenStore).RunnerIDForToken(ctx, tokenDigest)
+}
+
+func (f *FaultyStore) HasRunnerTokens(ctx context.Context) (bool, error) {
+	return f.Inner.(RunnerTokenStore).HasRunnerTokens(ctx)
+}
+
+func (f *FaultyStore) RevokeCert(ctx context.Context, serial, runnerID, reason string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(CertRevocationStore).RevokeCert(ctx, serial, runnerID, reason)
+}
+
+func (f *FaultyStore) CertRevoked(ctx context.Context, serial string) (bool, error) {
+	return f.Inner.(CertRevocationStore).CertRevoked(ctx, serial)
+}
+
+func (f *FaultyStore) PutEnrollGrant(ctx context.Context, digest string, expiresAt time.Time, boundLabels []string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(EnrollGrantStore).PutEnrollGrant(ctx, digest, expiresAt, boundLabels)
+}
+
+func (f *FaultyStore) GetEnrollGrant(ctx context.Context, digest string) (EnrollGrantRecord, bool, error) {
+	return f.Inner.(EnrollGrantStore).GetEnrollGrant(ctx, digest)
+}
+
+func (f *FaultyStore) ConsumeEnrollGrant(ctx context.Context, digest string, consumedBy string) (EnrollGrantRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return EnrollGrantRecord{}, err
+	}
+	return f.Inner.(EnrollGrantStore).ConsumeEnrollGrant(ctx, digest, consumedBy)
+}
+
+func (f *FaultyStore) LoadTestHistory(ctx context.Context) (int64, []byte, error) {
+	return f.Inner.(TestHistoryStore).LoadTestHistory(ctx)
+}
+
+func (f *FaultyStore) SaveTestHistory(ctx context.Context, stats []byte) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return 0, err
+	}
+	return f.Inner.(TestHistoryStore).SaveTestHistory(ctx, stats)
+}
+
 // memStore is a fully functional in-memory Store used as the fault-free
 // baseline underneath FaultyStore in fault-injection tests.
 type memStore struct {
@@ -616,6 +717,15 @@ type memStore struct {
 	quotas      map[string]quotaCounts
 	cacheMans   map[string]CacheManifestRecord
 	claims      map[string]time.Time
+
+	profiles     map[string]model.RunnerProfile
+	certProfiles map[string]string
+	runnerTokens map[string]string
+	revocations  map[string]string
+	grants       map[string]EnrollGrantRecord
+
+	testHistoryVersion int64
+	testHistoryStats   []byte
 }
 
 // quotaCounts is the in-memory reserved counter pair for one quota key.
@@ -626,18 +736,23 @@ type quotaCounts struct {
 
 func newMemStore() *memStore {
 	return &memStore{
-		runs:        map[string]model.Run{},
-		jobs:        map[string]model.Job{},
-		runners:     map[string]model.Runner{},
-		receipts:    map[string]model.CompletionReceipt{},
-		deliveries:  map[string]string{},
-		schedules:   map[string]Schedule{},
-		occurrences: map[string]map[time.Time]string{},
-		contracts:   map[string]map[string]ArtifactContract{},
-		downstream:  map[string]DownstreamLink{},
-		quotas:      map[string]quotaCounts{},
-		cacheMans:   map[string]CacheManifestRecord{},
-		claims:      map[string]time.Time{},
+		runs:         map[string]model.Run{},
+		jobs:         map[string]model.Job{},
+		runners:      map[string]model.Runner{},
+		receipts:     map[string]model.CompletionReceipt{},
+		deliveries:   map[string]string{},
+		schedules:    map[string]Schedule{},
+		occurrences:  map[string]map[time.Time]string{},
+		contracts:    map[string]map[string]ArtifactContract{},
+		downstream:   map[string]DownstreamLink{},
+		quotas:       map[string]quotaCounts{},
+		cacheMans:    map[string]CacheManifestRecord{},
+		claims:       map[string]time.Time{},
+		profiles:     map[string]model.RunnerProfile{},
+		certProfiles: map[string]string{},
+		runnerTokens: map[string]string{},
+		revocations:  map[string]string{},
+		grants:       map[string]EnrollGrantRecord{},
 	}
 }
 
@@ -664,6 +779,11 @@ var (
 	_ ArtifactSidecarStore  = (*memStore)(nil)
 	_ SecretClaimStore      = (*memStore)(nil)
 	_ SecretClaimReleaser   = (*memStore)(nil)
+	_ ProfileStore          = (*memStore)(nil)
+	_ RunnerTokenStore      = (*memStore)(nil)
+	_ CertRevocationStore   = (*memStore)(nil)
+	_ EnrollGrantStore      = (*memStore)(nil)
+	_ TestHistoryStore      = (*memStore)(nil)
 )
 
 func (m *memStore) Close() error { return nil }
@@ -857,6 +977,16 @@ func (m *memStore) CompleteJob(ctx context.Context, jobID string, generation int
 	m.jobs[jobID] = j
 	m.receipts[key] = receipt
 	m.adjustQuotaLocked(j.RepoURL, -1, 0)
+	// Post-transaction completion effects mirror the SQL contract: one
+	// outbox intent per effect kind, committed with the completion under
+	// the deterministic effect IDs the completing server queues locally.
+	payload, merr := json.Marshal(CompletionEffectsPayload{JobID: jobID, RunID: j.RunID})
+	if merr != nil {
+		return merr
+	}
+	for _, kind := range CompletionEffectKinds() {
+		m.outbox = append(m.outbox, OutboxItem{ID: CompletionEffectID(jobID, generation, kind), Kind: kind, Payload: payload, CreatedAt: now})
+	}
 	return nil
 }
 
@@ -1456,6 +1586,31 @@ func (m *memStore) InsertCompiledRun(ctx context.Context, req InsertCompiledRunR
 			return ErrDeliveryDuplicate
 		}
 	}
+	if req.DownstreamLaunch != nil {
+		parts := strings.Split(req.DownstreamLaunch.LinkKey, "\x00")
+		if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+			return fmt.Errorf("storage: malformed downstream launch claim")
+		}
+		if len(req.DownstreamLaunch.StableChildID) != 64 {
+			return fmt.Errorf("storage: malformed downstream stable child id")
+		}
+		key := req.DownstreamLaunch.LinkKey
+		l, ok := m.downstream[key]
+		if !ok {
+			return fmt.Errorf("storage: downstream launch claim link missing")
+		}
+		if l.ChildRunID != "" {
+			if l.ChildRunID == runID {
+				return ErrDownstreamLaunched
+			}
+			return fmt.Errorf("storage: downstream launch claim lost")
+		}
+		l.ChildRunID = runID
+		l.StableChildID = req.DownstreamLaunch.StableChildID
+		l.Reserved = false
+		l.ReservedAt = nil
+		m.downstream[key] = l
+	}
 	// Quota reservation: re-enforce limits against the reserved counters.
 	if req.Quota != nil {
 		jobCount := req.Quota.JobCount
@@ -1604,7 +1759,7 @@ func (m *memStore) QuotaCounts(ctx context.Context, repoKey, teamKey string) (in
 	return running, queued, nil
 }
 
-func (m *memStore) InsertGeneratedJobsTx(ctx context.Context, parentJobID string, depth int, jobs map[string]model.Job, deps map[string][]string, verify GeneratedJobVerifier) error {
+func (m *memStore) InsertGeneratedJobsTx(ctx context.Context, parentJobID string, depth int, jobs map[string]model.Job, deps map[string][]string, contracts map[string]map[string]ArtifactContract, verify GeneratedJobVerifier) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	parent, ok := m.jobs[parentJobID]
@@ -1622,8 +1777,28 @@ func (m *memStore) InsertGeneratedJobsTx(ctx context.Context, parentJobID string
 			return err
 		}
 	}
+	// Stage the whole fragment first (mirroring the SQL transaction: any
+	// validation failure — including a malformed contract job ID — rolls
+	// the ENTIRE fragment back, leaving no partial jobs or contracts).
+	for id := range jobs {
+		if err := ValidateJobID(id); err != nil {
+			return err
+		}
+	}
+	for id := range contracts {
+		if err := ValidateJobID(id); err != nil {
+			return err
+		}
+	}
 	for id, j := range jobs {
 		m.jobs[id] = j
+	}
+	for id, cs := range contracts {
+		cp := make(map[string]ArtifactContract, len(cs))
+		for k, v := range cs {
+			cp[k] = v
+		}
+		m.contracts[id] = cp
 	}
 	return nil
 }
@@ -1716,4 +1891,143 @@ func (m *memStore) ReleaseSecretDelivery(ctx context.Context, jobID string, gene
 	defer m.mu.Unlock()
 	delete(m.claims, fmt.Sprintf("%s|%d|%s", jobID, generation, secretName))
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// runner profiles, per-runner tokens, revocations, enrollment grants
+// ---------------------------------------------------------------------------
+
+func (m *memStore) UpsertProfile(ctx context.Context, p model.RunnerProfile) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = time.Now().UTC()
+	}
+	m.profiles[p.ID] = p
+	return nil
+}
+
+func (m *memStore) GetProfile(ctx context.Context, id string) (model.RunnerProfile, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.profiles[id]
+	if !ok {
+		return model.RunnerProfile{}, ErrNotFound
+	}
+	return p, nil
+}
+
+func (m *memStore) ListProfiles(ctx context.Context) ([]model.RunnerProfile, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]model.RunnerProfile, 0, len(m.profiles))
+	for _, p := range m.profiles {
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+func (m *memStore) BindCertProfile(ctx context.Context, serial, profileID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.certProfiles[serial] = profileID
+	return nil
+}
+
+func (m *memStore) ProfileForSerial(ctx context.Context, serial string) (model.RunnerProfile, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	id, ok := m.certProfiles[serial]
+	if !ok {
+		return model.RunnerProfile{}, false, nil
+	}
+	p, ok := m.profiles[id]
+	if !ok {
+		return model.RunnerProfile{}, false, nil
+	}
+	return p, true, nil
+}
+
+func (m *memStore) UpsertRunnerToken(ctx context.Context, runnerID, tokenDigest string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.runnerTokens[tokenDigest] = runnerID
+	return nil
+}
+
+func (m *memStore) RunnerIDForToken(ctx context.Context, tokenDigest string) (string, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	id, ok := m.runnerTokens[tokenDigest]
+	return id, ok, nil
+}
+
+func (m *memStore) HasRunnerTokens(ctx context.Context) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.runnerTokens) > 0, nil
+}
+
+func (m *memStore) RevokeCert(ctx context.Context, serial, runnerID, reason string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.revocations[serial] = runnerID
+	return nil
+}
+
+func (m *memStore) CertRevoked(ctx context.Context, serial string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.revocations[serial]
+	return ok, nil
+}
+
+func (m *memStore) PutEnrollGrant(ctx context.Context, digest string, expiresAt time.Time, boundLabels []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.grants[digest] = EnrollGrantRecord{ExpiresAt: expiresAt, BoundLabels: append([]string(nil), boundLabels...)}
+	return nil
+}
+
+func (m *memStore) GetEnrollGrant(ctx context.Context, digest string) (EnrollGrantRecord, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rec, ok := m.grants[digest]
+	return rec, ok, nil
+}
+
+// ConsumeEnrollGrant mirrors the SQL conditional update under m.mu: exactly
+// one consumer of a grant succeeds; unknown digests return ErrNotFound,
+// consumed ones ErrGrantConsumed and expired ones ErrGrantExpired.
+func (m *memStore) ConsumeEnrollGrant(ctx context.Context, digest string, consumedBy string) (EnrollGrantRecord, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rec, ok := m.grants[digest]
+	if !ok {
+		return EnrollGrantRecord{}, ErrNotFound
+	}
+	if rec.Consumed {
+		return EnrollGrantRecord{}, ErrGrantConsumed
+	}
+	if !time.Now().UTC().Before(rec.ExpiresAt) {
+		return EnrollGrantRecord{}, ErrGrantExpired
+	}
+	rec.Consumed = true
+	m.grants[digest] = rec
+	return rec, nil
+}
+
+func (m *memStore) LoadTestHistory(ctx context.Context) (int64, []byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.testHistoryVersion, append([]byte(nil), m.testHistoryStats...), nil
+}
+
+func (m *memStore) SaveTestHistory(ctx context.Context, stats []byte) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.testHistoryVersion++
+	m.testHistoryStats = append([]byte(nil), stats...)
+	return m.testHistoryVersion, nil
 }

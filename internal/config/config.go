@@ -120,10 +120,18 @@ type AuthConfig struct {
 	// shared credential, not a per-runner identity: it cannot distinguish
 	// runners. Production strongly prefers persistent per-runner mTLS
 	// identities (runner_pki); the control plane refuses to serve runner
-	// traffic with neither a runner token nor enforced runner mTLS.
+	// traffic with neither a runner token nor enforced runner mTLS. In
+	// production the shared token is dev/bootstrap-only: runner
+	// authentication must be per-runner mTLS or per-runner bearer tokens
+	// (runner_tokens_file).
 	RunnerToken string `toml:"runner_token"`
 	// TokensFile is the JSON token-store path for fine-grained principals.
 	TokensFile string `toml:"tokens_file"`
+	// RunnerTokensFile is a JSON file of per-runner bearer credentials:
+	// {"<runner-id>": "<sha256-hex-token-digest>"}. The server provisions
+	// these into the durable runner_bearer_tokens table in DB mode and
+	// keeps them in memory otherwise.
+	RunnerTokensFile string `toml:"runner_tokens_file"`
 }
 
 // QuotaConfig holds the enqueue and daily-budget quota policy. All counts
@@ -378,6 +386,7 @@ func (c *Config) ApplyEnv() error {
 		{"KIWI_RUNNER_TOKEN", &c.Auth.RunnerToken},
 		{"KIWI_ADMIN_TOKEN", &c.Auth.AdminToken},
 		{"KIWI_AUTH_TOKENS_FILE", &c.Auth.TokensFile},
+		{"KIWI_AUTH_RUNNER_TOKENS_FILE", &c.Auth.RunnerTokensFile},
 		{"KIWI_RUNNER_ENROLL_TOKEN", &c.RunnerPKI.EnrollToken},
 		{"KIWI_BLOB_BACKEND", &c.Blob.Backend},
 		{"KIWI_OTEL_ENDPOINT", &c.Observability.OTelEndpoint},
@@ -521,6 +530,8 @@ func (c *Config) OverrideFromFlags(fs *flag.FlagSet) error {
 			c.Forgejo.BaseURL = f.Value.String()
 		case "tokens-file":
 			c.Auth.TokensFile = f.Value.String()
+		case "runner-tokens-file":
+			c.Auth.RunnerTokensFile = f.Value.String()
 		case "database-max-connections":
 			if f.Value.String() != "" {
 				v, perr := strconv.Atoi(f.Value.String())

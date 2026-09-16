@@ -25,11 +25,57 @@ import (
 // the error, or Close when the consumer never read to EOF).
 var ErrDigestMismatch = errors.New("cas: content digest mismatch")
 
+// ErrBlobTooLarge is returned by Put when the stream exceeds MaxBlobBytes.
+var ErrBlobTooLarge = errors.New("cas: blob exceeds maximum size")
+
+// DefaultMaxBlobBytes is the default per-object size bound (4 GiB) applied
+// by Put when MaxBlobBytes is not configured.
+const DefaultMaxBlobBytes int64 = 4 << 30
+
 type CAS struct {
 	Blobs blob.Store
+	// MaxBlobBytes bounds a single Put stream. Zero/negative means the
+	// DefaultMaxBlobBytes default.
+	MaxBlobBytes int64
 }
 
 func New(b blob.Store) *CAS { return &CAS{Blobs: b} }
+
+// maxBytes resolves the effective per-object size bound.
+func (c *CAS) maxBytes() int64 {
+	if c.MaxBlobBytes <= 0 {
+		return DefaultMaxBlobBytes
+	}
+	return c.MaxBlobBytes
+}
+
+// countingReader is the bounded counting reader enforcing MaxBlobBytes: it
+// counts every byte that passes and fails the stream with ErrBlobTooLarge
+// as soon as the bound would be exceeded, so an oversized object is never
+// written to the blob store.
+type countingReader struct {
+	r    io.Reader
+	max  int64
+	read int64
+	err  error
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	if c.err != nil {
+		return 0, c.err
+	}
+	room := c.max + 1 - c.read
+	if int64(len(p)) > room {
+		p = p[:room]
+	}
+	n, err := c.r.Read(p)
+	c.read += int64(n)
+	if c.read > c.max {
+		c.err = ErrBlobTooLarge
+		return n, ErrBlobTooLarge
+	}
+	return n, err
+}
 
 func (c *CAS) Put(ctx context.Context, r io.Reader) (blob.Object, error) {
 	tmp, err := os.CreateTemp("", "kiwi-cas-*")
@@ -39,7 +85,7 @@ func (c *CAS) Put(ctx context.Context, r io.Reader) (blob.Object, error) {
 	defer os.Remove(tmp.Name())
 	defer tmp.Close()
 	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(tmp, h), r)
+	n, err := io.Copy(io.MultiWriter(tmp, h), &countingReader{r: r, max: c.maxBytes()})
 	if err != nil {
 		return blob.Object{}, err
 	}

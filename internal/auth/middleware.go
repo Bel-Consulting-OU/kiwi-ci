@@ -43,8 +43,25 @@ func AdminPrincipal() Principal {
 // The request ID survives untouched; 401s are logged with it for
 // correlation.
 func Middleware(store *TokenStore, adminToken string, next http.Handler, logger func(string, ...any)) http.Handler {
+	return MiddlewareWithClassifier(store, adminToken, nil, next, logger)
+}
+
+// MiddlewareWithClassifier is Middleware with explicit route classification
+// running BEFORE any generic bearer authentication: requests the classifier
+// reports as non-principal routes (public intake and the runner tier, whose
+// credentials — enrollment grants/tokens, per-runner bearer tokens, runner
+// mTLS — are not store principals) pass straight through to the server's
+// tier gate. This is the unified middleware: the generic store-principal
+// authenticator must never reject runner bearers just because the store is
+// non-empty. A nil classifier behaves like Middleware (only the shared
+// PublicRoute classifier applies).
+func MiddlewareWithClassifier(store *TokenStore, adminToken string, classifier func(*http.Request) bool, next http.Handler, logger func(string, ...any)) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if isPublicPath(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if classifier != nil && classifier(r) {
 			next.ServeHTTP(w, r)
 			return
 		}

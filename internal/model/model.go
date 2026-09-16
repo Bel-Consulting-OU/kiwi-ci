@@ -50,20 +50,26 @@ type Run struct {
 // carries the pipeline text so a restarted control plane and its runners can
 // recompile deterministically without an external store.
 type Job struct {
-	ID                     string   `json:"id"`
-	RunID                  string   `json:"run_id"`
-	Key                    string   `json:"key"`
-	BaseKey                string   `json:"base_key,omitempty"`
-	RepoURL                string   `json:"repo_url"`
-	RepoFullName           string   `json:"repo_full_name,omitempty"`
-	Ref                    string   `json:"ref,omitempty"`
-	SHA                    string   `json:"sha,omitempty"`
-	Event                  string   `json:"event,omitempty"`
-	Condition              string   `json:"condition,omitempty"`
-	DependencyStatus       Status   `json:"dependency_status"`
-	Pipeline               string   `json:"pipeline"`
-	Trusted                bool     `json:"trusted"`
-	ChangedFiles           []string `json:"changed_files,omitempty"`
+	ID               string   `json:"id"`
+	RunID            string   `json:"run_id"`
+	Key              string   `json:"key"`
+	BaseKey          string   `json:"base_key,omitempty"`
+	RepoURL          string   `json:"repo_url"`
+	RepoFullName     string   `json:"repo_full_name,omitempty"`
+	Ref              string   `json:"ref,omitempty"`
+	SHA              string   `json:"sha,omitempty"`
+	Event            string   `json:"event,omitempty"`
+	Condition        string   `json:"condition,omitempty"`
+	DependencyStatus Status   `json:"dependency_status"`
+	Pipeline         string   `json:"pipeline"`
+	Trusted          bool     `json:"trusted"`
+	ChangedFiles     []string `json:"changed_files,omitempty"`
+	// ChangedFilesKnown records whether the ChangedFiles list is the
+	// authoritative forge-fetched diff (complete=true). When set, an EMPTY
+	// list stays empty: the runner must not fall back to a local git diff.
+	// Additive: jobs persisted by older control planes default to false and
+	// keep the legacy fallback.
+	ChangedFilesKnown      bool     `json:"changed_files_known,omitempty"`
 	Needs                  []string `json:"needs,omitempty"`
 	RequiredLabels         []string `json:"required_labels,omitempty"`
 	Network                string   `json:"network,omitempty"`
@@ -128,6 +134,11 @@ type Job struct {
 	// Cost and EnergyWh are the usage recorded at completion. Additive.
 	Cost     float64 `json:"cost,omitempty"`
 	EnergyWh float64 `json:"energy_wh,omitempty"`
+	// UsageRecorded marks that completion usage accounting has been applied
+	// to this job. The completion usage_account effect sets it after
+	// recording cost/energy, so replayed reconciliations (outbox flush,
+	// receipt replay) can never double-account. Additive.
+	UsageRecorded bool `json:"usage_recorded,omitempty"`
 	// CPURequest/MemoryRequest/DiskRequest/PIDsRequest carry the job's
 	// declared resource requirements (pipeline Job.Resources), persisted in
 	// the job payload so scheduling and future runner/backend enforcement
@@ -177,6 +188,25 @@ type Runner struct {
 	// Runner certificate state.
 	CertSerial string     `json:"cert_serial,omitempty"`
 	RevokedAt  *time.Time `json:"revoked_at,omitempty"`
+}
+
+// RunnerProfile is the server-owned runner identity profile. Every
+// scheduling-relevant runner attribute (labels, region, repository scope,
+// capabilities, capacity, cost/energy rates) is server-owned: runners may
+// not self-report any of it at registration — the profile supplies it, and
+// a runner without a linked profile registers empty (capacity 0, no
+// labels/region, no rates). Repositories holds canonical repo IDs
+// ("<forgeHost>/<owner>/<name>"); empty means any repository.
+type RunnerProfile struct {
+	ID           string    `json:"id"`
+	Labels       []string  `json:"labels,omitempty"`
+	Region       string    `json:"region,omitempty"`
+	Repositories []string  `json:"repositories,omitempty"`
+	Capabilities []string  `json:"capabilities,omitempty"`
+	MaxCapacity  int       `json:"max_capacity,omitempty"`
+	CostPerHour  float64   `json:"cost_per_hour,omitempty"`
+	PowerWatts   float64   `json:"power_watts,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 // CompiledJobPayload is the enqueue-time compilation record persisted on a

@@ -142,7 +142,9 @@ func (s *Server) listDeployments(w http.ResponseWriter, r *http.Request) {
 }
 
 // finishDeploymentDB marks the deployment for a completed environment job
-// with the job's terminal status.
+// with the job's terminal status. A deployment whose finished_at is already
+// set is the idempotency marker for the completion deployment_finish effect:
+// replays skip it instead of re-auditing or overwriting the record.
 func (s *Server) finishDeploymentDB(ctx context.Context, j model.Job, status model.Status, finishedAt time.Time) {
 	if j.Environment == "" {
 		return
@@ -164,6 +166,9 @@ func (s *Server) finishDeploymentDB(ctx context.Context, j model.Job, status mod
 		}
 	}
 	if d.ID == "" {
+		return
+	}
+	if d.FinishedAt != nil {
 		return
 	}
 	d.Status = status

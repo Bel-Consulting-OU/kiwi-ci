@@ -69,13 +69,15 @@ func TestApplyRunnerTLSConfig(t *testing.T) {
 
 func TestValidateProductionConfig(t *testing.T) {
 	valid := productionConfig{
-		Mode:        "production",
-		DatabaseURL: "postgres://db",
-		RunnerToken: "runner",
-		AdminToken:  "admin",
-		ExternalURL: "https://ci.example.com",
-		TLSCert:     "cert.pem",
-		TLSKey:      "key.pem",
+		Mode:                   "production",
+		DatabaseURL:            "postgres://db",
+		RunnerToken:            "runner",
+		AdminToken:             "admin",
+		ExternalURL:            "https://ci.example.com",
+		TLSCert:                "cert.pem",
+		TLSKey:                 "key.pem",
+		RunnerMTLSEnforced:     true,
+		RunnerTokensConfigured: false,
 	}
 	if err := validateProductionConfig(valid); err != nil {
 		t.Fatalf("valid production config rejected: %v", err)
@@ -93,6 +95,7 @@ func TestValidateProductionConfig(t *testing.T) {
 		{"missing tls cert", func(c *productionConfig) { c.TLSCert = "" }, "--tls-cert"},
 		{"missing tls key", func(c *productionConfig) { c.TLSKey = "" }, "--tls-key"},
 		{"unknown mode", func(c *productionConfig) { c.Mode = "staging" }, "--mode"},
+		{"shared token without per-runner credentials", func(c *productionConfig) { c.RunnerMTLSEnforced = false }, "shared runner token is dev-only"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -134,29 +137,42 @@ func TestValidateProductionRunnerCredentialMatrix(t *testing.T) {
 		TLSCert:     "cert.pem",
 		TLSKey:      "key.pem",
 	}
-	// Admin token + runner token: fine without mTLS.
-	withRunner := base
-	withRunner.RunnerToken = "runner"
-	if err := validateProductionConfig(withRunner); err != nil {
-		t.Fatalf("admin+runner tokens rejected: %v", err)
-	}
-	// Admin token + no runner token + enforced runner mTLS: fine (the
-	// runner token becomes optional).
+	// Runner token + enforced mTLS: fine.
 	withMTLS := base
+	withMTLS.RunnerToken = "runner"
 	withMTLS.RunnerMTLSEnforced = true
 	if err := validateProductionConfig(withMTLS); err != nil {
+		t.Fatalf("runner token + enforced mTLS rejected: %v", err)
+	}
+	// Admin token + enforced runner mTLS (no bearer): fine.
+	mtlsOnly := base
+	mtlsOnly.RunnerMTLSEnforced = true
+	if err := validateProductionConfig(mtlsOnly); err != nil {
 		t.Fatalf("admin token + enforced runner mTLS rejected: %v", err)
 	}
-	// Admin token + no runner token + no enforced mTLS: fail closed at
-	// startup.
+	// Admin token + per-runner bearer tokens: fine without mTLS.
+	withTokens := base
+	withTokens.RunnerTokensConfigured = true
+	if err := validateProductionConfig(withTokens); err != nil {
+		t.Fatalf("admin token + per-runner tokens rejected: %v", err)
+	}
+	// Admin token + shared runner token + no mTLS + no per-runner tokens:
+	// the shared token is dev-only and production refuses to start.
+	shared := base
+	shared.RunnerToken = "runner"
+	if err := validateProductionConfig(shared); err == nil || !containsStr(err.Error(), "shared runner token is dev-only") {
+		t.Fatalf("shared runner token without per-runner credentials: %v", err)
+	}
+	// Admin token + no runner credential at all: fail closed at startup.
 	if err := validateProductionConfig(base); err == nil {
 		t.Fatal("admin token without runner credential accepted, want startup error")
 	}
 	// Runner token without an admin token stays subject to the existing
-	// shared-credential rule, not the fail-closed runner rule.
+	// shared-credential rule, not the runner-credential rule.
 	noAdmin := base
 	noAdmin.AdminToken = ""
 	noAdmin.RunnerToken = "runner"
+	noAdmin.RunnerTokensConfigured = true
 	if err := validateProductionConfig(noAdmin); err == nil || !containsStr(err.Error(), "--allow-shared-token") {
 		t.Fatalf("runner-only production config: %v", err)
 	}

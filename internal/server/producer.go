@@ -2,15 +2,12 @@ package server
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
-	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 // downloadDependency implements
@@ -21,7 +18,6 @@ import (
 // exist — ambiguous matches are rejected rather than silently picked.
 
 func (s *Server) downloadDependency(w http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("id")
 	producer := r.PathValue("producer")
 	artifact := cleanBlobName(r.PathValue("artifact"))
 	if artifact == "" {
@@ -31,22 +27,9 @@ func (s *Server) downloadDependency(w http.ResponseWriter, r *http.Request) {
 	runnerID := r.Header.Get("X-Kiwi-Runner-ID")
 	token := r.Header.Get("X-Kiwi-Lease-Token")
 	gen, _ := strconv.ParseInt(r.Header.Get("X-Kiwi-Lease-Generation"), 10, 64)
-	now := time.Now().UTC()
-	j, err := s.jobForLease(r.Context(), jobID)
-	if errors.Is(err, storage.ErrNotFound) {
-		http.NotFound(w, r)
-		return
-	}
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	if !s.verifyRunnerIdentity(r, runnerID) {
-		http.Error(w, "runner identity mismatch", http.StatusForbidden)
-		return
-	}
-	if !s.validActiveLease(j, runnerID, token, gen, now) {
-		http.Error(w, "stale or invalid lease", http.StatusConflict)
+	j, authErr := s.authorizeRunnerLease(r, runnerID, token, gen)
+	if authErr != nil {
+		s.writeLeaseAuthError(w, r, authErr)
 		return
 	}
 	// The consumer must declare a download of this artifact from the

@@ -125,8 +125,11 @@ func repoHost(repoURL string) string {
 // visibleRepos returns the set of repository identities a principal may
 // read. ok=false means the request has no principal-based restriction
 // (legacy mode, admin principal, or a principal without a repository map:
-// role-granted read covers everything). The set contains both the raw map
-// keys and their canonicalized forms so either keying convention matches.
+// role-granted read covers everything). The set contains exactly the
+// DECLARED map keys: canonical IDs ("forge-host/owner/name") and explicitly
+// configured bare aliases. Bare forms are never derived implicitly from
+// canonical keys — a principal keyed for github.com/acme/service grants
+// nothing for gitlab.example/acme/service.
 func (s *Server) visibleRepos(r *http.Request) (map[string]bool, bool) {
 	p, ok := auth.PrincipalFrom(r)
 	if !ok || p.Has(auth.RoleAdmin) || len(p.Repositories) == 0 {
@@ -135,10 +138,6 @@ func (s *Server) visibleRepos(r *http.Request) (map[string]bool, bool) {
 	allowed := map[string]bool{}
 	for key := range p.Repositories {
 		allowed[key] = true
-		allowed[auth.CanonicalRepoID("", key)] = true
-		if _, bare, hasHost := splitCanonicalKey(key); hasHost {
-			allowed[bare] = true
-		}
 	}
 	return allowed, true
 }
@@ -153,25 +152,120 @@ func splitCanonicalKey(key string) (host, bare string, hasHost bool) {
 }
 
 // repoVisible reports whether a run's repository is visible to the request's
-// principal. It is used by the scoped list endpoints.
+// principal. It is used by the scoped list endpoints. Resolution is
+// STRICTLY canonical: the run's identity is forge-host/owner/name. A
+// declared canonical key matches only its exact identity; a bare key in
+// the principal map is honored as an EXPLICITLY configured alias (it
+// matches the run's bare full name across forges) — aliases are never
+// derived implicitly.
 func (s *Server) repoVisible(r *http.Request, run model.Run) bool {
 	allowed, restricted := s.visibleRepos(r)
 	if !restricted {
 		return true
 	}
 	canon := canonicalRepoForRun(run)
-	return allowed[canon] || allowed[run.RepoFullName] || allowed[auth.CanonicalRepoID("", run.RepoFullName)]
+	if allowed[canon] || allowed[run.RepoFullName] {
+		return true
+	}
+	if _, bare, hasHost := splitCanonicalKey(canon); hasHost && allowed[bare] {
+		return true
+	}
+	return false
 }
 
 // repoVisibleByName reports whether a repository full name is visible to the
 // request's principal (used by endpoints addressed by repo name instead of
-// run ID).
+// run ID). A declared canonical key matches its exact identity or its bare
+// full name; a declared bare alias matches the bare full name. Nothing is
+// derived implicitly.
 func (s *Server) repoVisibleByName(r *http.Request, fullName string) bool {
 	allowed, restricted := s.visibleRepos(r)
 	if !restricted {
 		return true
 	}
-	return allowed[fullName] || allowed[auth.CanonicalRepoID("", fullName)]
+	if allowed[fullName] {
+		return true
+	}
+	canon := auth.CanonicalRepoID("", fullName)
+	if canon != fullName && allowed[canon] {
+		return true
+	}
+	if _, bare, hasHost := splitCanonicalKey(canon); hasHost && allowed[bare] {
+		return true
+	}
+	return false
+}
+
+// authorizeRepo is the canonical-only repository authorization gate. The
+// repo entry is resolved STRICTLY by the exact canonical identity; a bare
+// key in the principal map is honored only as an explicitly configured
+// alias (matching the bare full name across forges) — it is never derived
+// implicitly, so gitlab.example/acme/service and github.com/acme/service
+// never share authorization unless a bare alias is literally declared.
+// Non-repo-scoped actions and the role fallback mirror auth.Authorize.
+func authorizeRepo(p auth.Principal, action auth.Action, repo string, trusted bool) bool {
+	if p.Has(auth.RoleAdmin) {
+		return true
+	}
+	if repo != "" {
+		if perm, ok := p.Repositories[repo]; ok {
+			return repoPermAllows(perm, action, trusted)
+		}
+		if _, bare, hasHost := splitCanonicalKey(repo); hasHost {
+			if perm, ok := p.Repositories[bare]; ok {
+				return repoPermAllows(perm, action, trusted)
+			}
+		}
+	}
+	switch action {
+	case auth.ActionRead:
+		return p.Has(auth.RoleRead)
+	case auth.ActionRun:
+		if trusted {
+			return p.Has(auth.RoleTrustedRun)
+		}
+		return p.Has(auth.RoleRun)
+	case auth.ActionTrustedRun:
+		return p.Has(auth.RoleTrustedRun)
+	case auth.ActionApprove:
+		return p.Has(auth.RoleApprove)
+	case auth.ActionCancel:
+		return p.Has(auth.RoleCancel)
+	case auth.ActionRerun:
+		return p.Has(auth.RoleRerun)
+	case auth.ActionArtifactRead:
+		return p.Has(auth.RoleArtifactRead)
+	case auth.ActionRunnerManage:
+		return p.Has(auth.RoleRunnerManage)
+	case auth.ActionPolicyManage:
+		return p.Has(auth.RolePolicyManage)
+	}
+	return false
+}
+
+// repoPermAllows maps a repo-specific permission set onto one repo-scoped
+// action (the trusted_run resolution for ActionRun mirrors auth.Authorize).
+func repoPermAllows(perm auth.RepositoryPermission, action auth.Action, trusted bool) bool {
+	switch action {
+	case auth.ActionRead:
+		return perm.Read
+	case auth.ActionRun:
+		if trusted {
+			return perm.TrustedRun
+		}
+		return perm.Run
+	case auth.ActionTrustedRun:
+		return perm.TrustedRun
+	case auth.ActionApprove:
+		return perm.Approve
+	case auth.ActionCancel:
+		return perm.Cancel
+	case auth.ActionRerun:
+		return perm.Rerun
+	case auth.ActionArtifactRead:
+		return perm.ArtifactRead
+	}
+	return false
 }
 
 // runForAuth resolves the run addressed by id (store in DB mode, memory map

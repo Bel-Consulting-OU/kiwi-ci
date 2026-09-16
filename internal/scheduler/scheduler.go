@@ -18,9 +18,11 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
@@ -191,8 +193,11 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 	if err != nil {
 		return nil, "", time.Time{}, err
 	}
-	if ri.Capacity < 1 {
-		ri.Capacity = 1
+	// Profile semantics: capacity 0 means the runner takes no work (a
+	// runner without a linked profile registers capacity 0). The legacy
+	// clamp to 1 is gone — zero is meaningful now.
+	if ri.Capacity <= 0 {
+		return nil, "", time.Time{}, ErrNoJobs
 	}
 	if len(ri.ActiveJobs) >= ri.Capacity {
 		return nil, "", time.Time{}, ErrNoJobs
@@ -211,6 +216,19 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 	envJobs := map[string][]model.Job{}
 	for _, candidate := range queued {
 		if !satisfiesLabels(ri.Labels, candidate.RequiredLabels) {
+			continue
+		}
+		// Canonical repository authorization is part of the atomic claim
+		// predicate: a runner whose profile restricts repositories never
+		// sees candidates outside its canonical repo allowlist.
+		if !s.runnerAllowedRepo(ri, candidate) {
+			continue
+		}
+		// Capability compatibility is part of the claim predicate too: a
+		// job whose runtime demands a capability the runner does not
+		// declare is never leased to it. Empty declared capabilities keep
+		// the check vacuous (discovered-only intersection).
+		if !s.runnerHasCapability(ri, candidate) {
 			continue
 		}
 		// Queue-timeout expiry: a candidate whose queue deadline has passed
@@ -646,6 +664,101 @@ func satisfiesLabels(have, need []string) bool {
 		}
 	}
 	return true
+}
+
+// runnerAllowedRepo reports whether a candidate job is inside the runner's
+// repository scope. A runner with an empty AllowedRepositories has no
+// restriction; otherwise the job's canonical repo ID ("<forgeHost>/<full
+// name>") — and its bare full name, for profiles that store either form —
+// must appear in the list.
+func (s *DBScheduler) runnerAllowedRepo(ri model.Runner, candidate model.Job) bool {
+	if len(ri.AllowedRepositories) == 0 {
+		return true
+	}
+	canon := auth.CanonicalRepoID(repoHostFromURL(candidate.RepoURL), candidate.RepoFullName)
+	for _, allowed := range ri.AllowedRepositories {
+		if allowed == canon || (candidate.RepoFullName != "" && allowed == candidate.RepoFullName) {
+			return true
+		}
+	}
+	return false
+}
+
+// runnerHasCapability reports whether the candidate's runtime capability is
+// declared by the runner. Empty declared capabilities make the check
+// vacuous (the profile has no capability list; the runner's discovered
+// capabilities are its own intersection). A job whose runtime cannot be
+// derived (no compiled payload, or an empty/unknown runtime) is not
+// constrained by this predicate.
+func (s *DBScheduler) runnerHasCapability(ri model.Runner, candidate model.Job) bool {
+	if len(ri.Capabilities) == 0 {
+		return true
+	}
+	runtime := jobRuntimeCapability(candidate)
+	if runtime == "" {
+		return true
+	}
+	return containsStr(ri.Capabilities, runtime)
+}
+
+// jobRuntimeCapability extracts the job's runtime capability
+// (container/tart/native) from the persisted compiled payload, mirroring
+// queueTimeoutFromPayload's payload-based derivation. Jobs without a
+// compiled payload (or with an unknown runtime) yield "".
+func jobRuntimeCapability(j model.Job) string {
+	if j.CompiledJobPayload == nil || j.CompiledJobPayload.EffectiveJob == nil {
+		return ""
+	}
+	var b []byte
+	switch v := j.CompiledJobPayload.EffectiveJob.(type) {
+	case json.RawMessage:
+		b = v
+	case []byte:
+		b = v
+	case string:
+		b = []byte(v)
+	default:
+		var err error
+		if b, err = json.Marshal(v); err != nil {
+			return ""
+		}
+	}
+	var cj pipeline.CompiledJob
+	if err := json.Unmarshal(b, &cj); err != nil {
+		return ""
+	}
+	switch cj.Job.Runtime {
+	case "container", "tart", "native":
+		return cj.Job.Runtime
+	default:
+		return ""
+	}
+}
+
+// repoHostFromURL extracts the forge host from a repo URL in the common
+// forms (https://host/owner/repo, ssh://git@host/owner/repo and the
+// scp-like git@host:owner/repo), mirroring the server's host derivation so
+// canonical repo IDs agree across packages.
+func repoHostFromURL(repoURL string) string {
+	u := strings.TrimSpace(repoURL)
+	if i := strings.Index(u, "://"); i >= 0 {
+		u = u[i+3:]
+	}
+	if at := strings.Index(u, "@"); at >= 0 {
+		u = u[at+1:]
+	}
+	slash := strings.Index(u, "/")
+	colon := strings.Index(u, ":")
+	switch {
+	case slash < 0 && colon < 0:
+		return u
+	case slash < 0:
+		return u[:colon]
+	case colon >= 0 && colon < slash:
+		return u[:colon]
+	default:
+		return u[:slash]
+	}
 }
 
 // containsStr reports whether list contains v.

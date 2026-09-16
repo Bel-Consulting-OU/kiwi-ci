@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
@@ -196,22 +195,9 @@ func (s *Server) issueSecret(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	now := time.Now().UTC()
-	j, err := s.jobForLease(r.Context(), jobID)
-	if errors.Is(err, storage.ErrNotFound) {
-		http.NotFound(w, r)
-		return
-	}
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	if !s.verifyRunnerIdentity(r, in.RunnerID) {
-		http.Error(w, "runner identity mismatch", http.StatusForbidden)
-		return
-	}
-	if !s.validActiveLease(j, in.RunnerID, in.LeaseToken, in.LeaseGeneration, now) {
-		http.Error(w, "stale or invalid lease", http.StatusConflict)
+	j, authErr := s.authorizeRunnerLease(r, in.RunnerID, in.LeaseToken, in.LeaseGeneration)
+	if authErr != nil {
+		s.writeLeaseAuthError(w, r, authErr)
 		return
 	}
 	// Defense in depth: admission already strips secrets from untrusted

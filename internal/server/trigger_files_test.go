@@ -45,7 +45,7 @@ func TestTriggerFilesFetchFailsClosedOnIncludePaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	ec := forge.EventContext{Event: "push", Repository: forge.Repository{FullName: "o/r"}}
-	if _, err := s.triggerFilesFetch(context.Background(), fg, spec, &ec); err == nil {
+	if _, _, err := s.triggerFilesFetch(context.Background(), fg, spec, &ec); err == nil {
 		t.Fatal("include-path trigger with unavailable changed files must fail closed")
 	}
 	if fg.calls == 0 {
@@ -61,7 +61,7 @@ func TestTriggerFilesFetchIncompleteIncludePathsFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	ec := forge.EventContext{Event: "push", Repository: forge.Repository{FullName: "o/r"}}
-	if _, err := s.triggerFilesFetch(context.Background(), fg, spec, &ec); err == nil {
+	if _, _, err := s.triggerFilesFetch(context.Background(), fg, spec, &ec); err == nil {
 		t.Fatal("include-path trigger with an incomplete diff must fail closed")
 	}
 }
@@ -74,9 +74,9 @@ func TestTriggerFilesFetchIncompleteIgnoreOnlyProceeds(t *testing.T) {
 		t.Fatal(err)
 	}
 	ec := forge.EventContext{Event: "push", Repository: forge.Repository{FullName: "o/r"}}
-	files, err := s.triggerFilesFetch(context.Background(), fg, spec, &ec)
-	if err != nil || files != nil {
-		t.Fatalf("ignore-only trigger with an incomplete diff must degrade to nil, got %v %v", files, err)
+	files, complete, err := s.triggerFilesFetch(context.Background(), fg, spec, &ec)
+	if err != nil || files != nil || complete {
+		t.Fatalf("ignore-only trigger with an incomplete diff must degrade to nil and incomplete, got %v %v %v", files, complete, err)
 	}
 }
 
@@ -88,7 +88,7 @@ func TestTriggerFilesFetchBestEffortWithoutIncludePaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	ec := forge.EventContext{Event: "push", Repository: forge.Repository{FullName: "o/r"}}
-	files, err := s.triggerFilesFetch(context.Background(), fg, spec, &ec)
+	files, _, err := s.triggerFilesFetch(context.Background(), fg, spec, &ec)
 	if err != nil || files != nil {
 		t.Fatalf("ignore-only trigger must degrade gracefully, got %v %v", files, err)
 	}
@@ -102,16 +102,19 @@ func TestEvalTriggerMatchesPopulatesChangedFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	ec := forge.EventContext{Event: "push", Ref: "refs/heads/main", Repository: forge.Repository{FullName: "o/r"}}
-	ok, _, err := s.evalTriggerMatches(context.Background(), fg, spec, &ec)
+	ok, _, known, err := s.evalTriggerMatches(context.Background(), fg, spec, &ec)
 	if err != nil || !ok {
 		t.Fatalf("matching push must pass: %v %v", ok, err)
+	}
+	if !known {
+		t.Fatal("a complete fetch must report the changed-files list as known")
 	}
 	if len(ec.ChangedFiles) != 1 || ec.ChangedFiles[0] != "svc/main.go" {
 		t.Fatalf("changed files not populated: %v", ec.ChangedFiles)
 	}
 	ec2 := forge.EventContext{Event: "push", Ref: "refs/heads/main", Repository: forge.Repository{FullName: "o/r"}}
 	fg.files = []string{"docs/readme.md"}
-	ok, _, err = s.evalTriggerMatches(context.Background(), fg, spec, &ec2)
+	ok, _, _, err = s.evalTriggerMatches(context.Background(), fg, spec, &ec2)
 	if err != nil || ok {
 		t.Fatalf("non-matching paths must not pass: %v %v", ok, err)
 	}

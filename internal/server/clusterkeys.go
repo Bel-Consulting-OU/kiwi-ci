@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -30,6 +31,10 @@ const (
 	clusterKindCacheSigning = "cache-signing"
 	clusterKindWebSession   = "web-session"
 	clusterKindRunnerCA     = "runner-ca"
+
+	// runnerCAObjectFile is the single atomic object holding the runner CA
+	// (cert PEM + "\x00" + key PEM); ca.crt/ca.key are derived sidecars.
+	runnerCAObjectFile = "runner-ca.pem"
 )
 
 // ClusterKeyStore loads a shared key material by kind, creating and
@@ -63,7 +68,10 @@ type ClusterKeyLookup interface {
 //	provenance    provenance.key        PKCS8 PEM (provenance.pub sidecar)
 //	cache-signing cache-signing.key     PKCS8 PEM (cache-signing.pem sidecar)
 //	web-session   web-session.key       hex(32 raw bytes)
-//	runner-ca     ca.crt + ca.key       cert PEM + key PEM concatenated
+//	runner-ca     runner-ca.pem         ONE atomic object: cert PEM + "\x00"
+//	                                    + key PEM; ca.crt (0644) and ca.key
+//	                                    (0600) are derived sidecars published
+//	                                    from the object
 type FSClusterKeyStore struct {
 	Dir string
 }
@@ -129,7 +137,14 @@ func createClusterKey(kind string) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		return append(append([]byte{}, certPEM...), keyDER...), nil
+		// The runner CA is ONE atomic cluster-key object: certificate PEM,
+		// a NUL separator, private key PEM. Loaders split on the NUL; the
+		// PEM-boundary split is kept only for pre-existing objects.
+		obj := make([]byte, 0, len(certPEM)+1+len(keyDER))
+		obj = append(obj, certPEM...)
+		obj = append(obj, 0)
+		obj = append(obj, keyDER...)
+		return obj, nil
 	default:
 		return nil, fmt.Errorf("cluster keys: unknown key kind %q", kind)
 	}
@@ -170,7 +185,7 @@ func (s *FSClusterKeyStore) path(kind string) (string, error) {
 	case clusterKindWebSession:
 		return filepath.Join(s.Dir, webSessionKeyFile), nil
 	case clusterKindRunnerCA:
-		return filepath.Join(s.Dir, "ca.crt"), nil
+		return filepath.Join(s.Dir, runnerCAObjectFile), nil
 	default:
 		return "", fmt.Errorf("cluster keys: unknown key kind %q", kind)
 	}
@@ -186,21 +201,35 @@ func (s *FSClusterKeyStore) LoadOrCreate(kind string) ([]byte, error) {
 		return nil, err
 	}
 	if kind == clusterKindRunnerCA {
-		// The runner CA loader materializes cert+key through its own
-		// create-if-absent flow; the persisted files are the source of
-		// truth and are read back below.
-		if _, err := runnerpki.LoadOrCreateCA(s.Dir); err != nil {
+		// The runner CA is one atomic object: create-if-absent, then
+		// publish the ca.crt/ca.key sidecars from it. The object file is
+		// authoritative; a concurrent creator's material wins via the CAS
+		// link and is read back.
+		created, err := createClusterKey(kind)
+		if err != nil {
 			return nil, err
 		}
-		certPEM, cerr := os.ReadFile(filepath.Join(s.Dir, "ca.crt"))
-		if cerr != nil {
-			return nil, cerr
+		path, err := s.path(kind)
+		if err != nil {
+			return nil, err
 		}
-		keyPEM, cerr := os.ReadFile(filepath.Join(s.Dir, "ca.key"))
-		if cerr != nil {
-			return nil, cerr
+		if err := createFileCAS(path, created); err != nil {
+			if !errors.Is(err, os.ErrExist) {
+				return nil, err
+			}
+			existing, ok, lerr := s.Lookup(kind)
+			if lerr != nil {
+				return nil, lerr
+			}
+			if !ok {
+				return nil, fmt.Errorf("cluster keys: runner-ca was created concurrently but cannot be read")
+			}
+			return existing, nil
 		}
-		return append(append([]byte{}, certPEM...), keyPEM...), nil
+		if err := s.publishRunnerCASidecars(created); err != nil {
+			return nil, err
+		}
+		return created, nil
 	}
 	var created []byte
 	var err error
@@ -399,12 +428,31 @@ func (s *FSClusterKeyStore) Lookup(kind string) ([]byte, bool, error) {
 		}
 		return keyPEM, true, nil
 	case clusterKindRunnerCA:
+		obj, err := os.ReadFile(filepath.Join(s.Dir, runnerCAObjectFile))
+		if err == nil {
+			if _, _, serr := splitRunnerCAPEMs(obj); serr != nil {
+				return nil, false, serr
+			}
+			return obj, true, nil
+		}
+		if !os.IsNotExist(err) {
+			return nil, false, err
+		}
+		// Migrate the legacy split files (ca.crt + ca.key) into the single
+		// atomic object once; from then on the object is authoritative.
 		certPEM, certErr := os.ReadFile(filepath.Join(s.Dir, "ca.crt"))
 		keyPEM, keyErr := os.ReadFile(filepath.Join(s.Dir, "ca.key"))
 		if certErr != nil || keyErr != nil {
 			return nil, false, nil
 		}
-		return append(append([]byte{}, certPEM...), keyPEM...), true, nil
+		migrated := make([]byte, 0, len(certPEM)+1+len(keyPEM))
+		migrated = append(migrated, certPEM...)
+		migrated = append(migrated, 0)
+		migrated = append(migrated, keyPEM...)
+		if werr := createFileCAS(filepath.Join(s.Dir, runnerCAObjectFile), migrated); werr != nil && !errors.Is(werr, os.ErrExist) {
+			return nil, false, werr
+		}
+		return migrated, true, nil
 	default:
 		return nil, false, fmt.Errorf("cluster keys: unknown key kind %q", kind)
 	}
@@ -450,17 +498,36 @@ func (s *FSClusterKeyStore) Store(kind string, data []byte) error {
 		}
 		return writeFileAtomic(filepath.Join(s.Dir, cacheSigningPubFile), pub, 0o644)
 	case clusterKindRunnerCA:
-		certPEM, keyPEM, err := splitRunnerCAPEMs(data)
-		if err != nil {
-			return err
+		if err := createFileCAS(filepath.Join(s.Dir, runnerCAObjectFile), data); err != nil {
+			if errors.Is(err, os.ErrExist) {
+				// The object already exists: overwrite semantics need the
+				// explicit Store path, which the CAS link cannot provide.
+				if werr := writeFileAtomic(filepath.Join(s.Dir, runnerCAObjectFile), data, 0o600); werr != nil {
+					return werr
+				}
+			} else {
+				return err
+			}
 		}
-		if err := writeFileAtomic(filepath.Join(s.Dir, "ca.crt"), certPEM, 0o644); err != nil {
-			return err
-		}
-		return writeFileAtomic(filepath.Join(s.Dir, "ca.key"), keyPEM, 0o600)
+		return s.publishRunnerCASidecars(data)
 	default:
 		return fmt.Errorf("cluster keys: unknown key kind %q", kind)
 	}
+}
+
+// publishRunnerCASidecars writes the ca.crt (0644) and ca.key (0600)
+// sidecars derived from the single runner-ca object so legacy consumers
+// (data-dir readers, operator tooling) keep working. Both sidecars are
+// written atomically from the same object.
+func (s *FSClusterKeyStore) publishRunnerCASidecars(obj []byte) error {
+	certPEM, keyPEM, err := splitRunnerCAPEMs(obj)
+	if err != nil {
+		return err
+	}
+	if err := writeFileAtomic(filepath.Join(s.Dir, "ca.crt"), certPEM, 0o644); err != nil {
+		return err
+	}
+	return writeFileAtomic(filepath.Join(s.Dir, "ca.key"), keyPEM, 0o600)
 }
 
 // ---------------------------------------------------------------------------
@@ -567,9 +634,20 @@ func legacyOIDCRingBytes(dir string) ([]byte, error) {
 	return json.MarshalIndent(rf, "", "  ")
 }
 
-// splitRunnerCAPEMs splits a concatenated certPEM+keyPEM blob back into its
-// two PEM documents.
+// splitRunnerCAPEMs splits a runner CA cluster object into its certificate
+// and private key PEM documents. The canonical object format separates the
+// two PEM documents with a single NUL byte; objects written before that
+// format concatenated the PEMs directly, so the PEM-boundary split is kept
+// as a fallback.
 func splitRunnerCAPEMs(data []byte) (certPEM, keyPEM []byte, err error) {
+	if i := bytes.IndexByte(data, 0); i >= 0 {
+		certPEM = data[:i]
+		keyPEM = data[i+1:]
+		if len(bytes.TrimSpace(certPEM)) == 0 || len(bytes.TrimSpace(keyPEM)) == 0 {
+			return nil, nil, fmt.Errorf("cluster keys: runner CA blob is empty on one side of the separator")
+		}
+		return certPEM, keyPEM, nil
+	}
 	i := indexOfPEMBoundary(data, "CERTIFICATE")
 	if i < 0 {
 		return nil, nil, fmt.Errorf("cluster keys: runner CA blob missing certificate")
@@ -697,16 +775,26 @@ func (s *Server) loadRunnerCACluster(store ClusterKeyStore) error {
 // setRunnerCAFromBlob parses a concatenated cert+key PEM blob into the
 // server's runner CA.
 func (s *Server) setRunnerCAFromBlob(b []byte) error {
-	certPEM, keyPEM, err := splitRunnerCAPEMs(b)
+	ca, err := s.parseRunnerCABlob(b)
 	if err != nil {
-		return fmt.Errorf("cluster runner CA: %w", err)
-	}
-	ca, err := runnerpki.LoadCA(certPEM, keyPEM)
-	if err != nil {
-		return fmt.Errorf("load runner CA: %w", err)
+		return err
 	}
 	s.RunnerCA = ca
 	return nil
+}
+
+// parseRunnerCABlob parses a runner CA cluster object (cert PEM + NUL + key
+// PEM, or the legacy concatenated PEMs) into a CA.
+func (s *Server) parseRunnerCABlob(b []byte) (*runnerpki.CA, error) {
+	certPEM, keyPEM, err := splitRunnerCAPEMs(b)
+	if err != nil {
+		return nil, fmt.Errorf("cluster runner CA: %w", err)
+	}
+	ca, err := runnerpki.LoadCA(certPEM, keyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("load runner CA: %w", err)
+	}
+	return ca, nil
 }
 
 // KeyFingerprints returns the stable key id (hex sha256 truncated to 16
@@ -742,10 +830,36 @@ func (s *Server) KeyFingerprints() map[string]string {
 // ValidateHAReady reports whether the control plane may serve as part of an
 // HA deployment. A server with a database but no cluster key store would
 // generate per-replica signing material, so replicas could not verify each
-// other's lease tokens, OIDC tokens, provenance or cache signatures.
+// other's lease tokens, OIDC tokens, provenance or cache signatures. When
+// runner CA material is loaded, it must additionally resolve identically
+// through the cluster store: the shared object must parse to a CA whose
+// certificate fingerprint equals the loaded CA's, so a replica cannot hold
+// a divergent runner CA.
 func (s *Server) ValidateHAReady() error {
 	if s.DB != nil && s.ClusterKeys == nil {
 		return errors.New("HA deployments require a cluster key store")
+	}
+	if s.RunnerCA != nil && s.ClusterKeys != nil {
+		var shared []byte
+		var err error
+		if lookup, ok := s.ClusterKeys.(ClusterKeyLookup); ok {
+			shared, _, err = lookup.Lookup(clusterKindRunnerCA)
+		} else {
+			shared, err = s.ClusterKeys.LoadOrCreate(clusterKindRunnerCA)
+		}
+		if err != nil {
+			return fmt.Errorf("HA validation: resolve shared runner CA: %w", err)
+		}
+		if len(shared) == 0 {
+			return fmt.Errorf("HA validation: runner CA is loaded but the cluster key store has no shared runner CA material")
+		}
+		sharedCA, perr := s.parseRunnerCABlob(shared)
+		if perr != nil {
+			return fmt.Errorf("HA validation: shared runner CA: %w", perr)
+		}
+		if !bytes.Equal(sharedCA.Cert.Raw, s.RunnerCA.Cert.Raw) {
+			return fmt.Errorf("HA validation: runner CA fingerprint mismatch between the loaded CA and the cluster key store")
+		}
 	}
 	return nil
 }

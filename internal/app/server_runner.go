@@ -45,16 +45,21 @@ type productionConfig struct {
 	// not disabled). When enforced, the runner bearer token becomes
 	// optional in production.
 	RunnerMTLSEnforced bool
+	// RunnerTokensConfigured reports whether per-runner bearer credentials
+	// are provisioned (auth.runner_tokens_file, or rows already in the
+	// runner_bearer_tokens table checked after the DB connects). With
+	// per-runner credentials the shared runner token is dev-only.
+	RunnerTokensConfigured bool
 }
 
 // validateProductionConfig enforces the production-mode startup contract:
 // a database URL, distinct admin/runner credentials (or an explicit
 // --allow-shared-token), an external URL (the OIDC issuer always serves in
-// production), TLS, and a working runner credential. The runner bearer
-// token is a SHARED credential, not a per-runner identity; when an admin
-// token is configured but no runner token, enforced runner mTLS is the
-// only acceptable runner authentication (fail closed). Dev mode has no
-// additional requirements.
+// production), TLS, and per-runner runner credentials. The shared runner
+// bearer token is a SHARED credential, not a per-runner identity, and is
+// dev/bootstrap-only: production requires runner mTLS or per-runner bearer
+// tokens (auth.runner_tokens_file / DB runner_bearer_tokens). Dev mode has
+// no additional requirements.
 // drainTimeout bounds the graceful drain wait on signal.
 const drainTimeout = 30 * time.Second
 
@@ -140,9 +145,17 @@ func validateProductionConfig(cfg productionConfig) error {
 	}
 	// Fail closed: an admin token without any runner credential would serve
 	// 503s on every runner route (the server's own fail-closed tier), so
-	// refuse it at startup unless runner mTLS is enforced.
-	if cfg.AdminToken != "" && cfg.RunnerToken == "" && !cfg.RunnerMTLSEnforced {
-		return fmt.Errorf("production mode with an admin token requires --runner-token or enforced runner mTLS (--runner-ca-cert/--runner-ca-key with --runner-require-client-certs)")
+	// refuse it at startup unless runner mTLS is enforced or per-runner
+	// tokens are provisioned.
+	if cfg.AdminToken != "" && cfg.RunnerToken == "" && !cfg.RunnerMTLSEnforced && !cfg.RunnerTokensConfigured {
+		return fmt.Errorf("production mode with an admin token requires --runner-token, enforced runner mTLS (--runner-ca-cert/--runner-ca-key with --runner-require-client-certs) or per-runner credentials (--runner-tokens-file)")
+	}
+	// The shared runner token is a shared credential: production must not
+	// rely on it. Runner traffic needs per-runner identity (mTLS) or
+	// per-runner bearer tokens; a global runner token alone refuses to
+	// start.
+	if cfg.RunnerToken != "" && !cfg.RunnerMTLSEnforced && !cfg.RunnerTokensConfigured {
+		return fmt.Errorf("production requires runner mTLS or per-runner credentials; the shared runner token is dev-only")
 	}
 	return nil
 }
@@ -192,6 +205,7 @@ func Server(ctx context.Context, args []string) error {
 	forgejoWebhookSecret := fs.String("forgejo-webhook-secret", "", "Forgejo webhook HMAC secret")
 	forgejoBaseURL := fs.String("forgejo-base-url", "", "self-managed Forgejo instance root (default https://codeberg.org)")
 	tokensFile := fs.String("tokens-file", "", "JSON token-store file for fine-grained principal tokens")
+	runnerTokensFile := fs.String("runner-tokens-file", "", "JSON file of per-runner bearer credentials (runner ID -> SHA-256 token digest); production accepts runner mTLS or these per-runner tokens")
 	databaseMaxConnections := fs.String("database-max-connections", "", "PostgreSQL pool max connections")
 	metricsListen := fs.String("metrics-listen", "", "serve /metrics on a separate listener address (e.g. :9091)")
 	secretBroker := fs.String("secret-broker", "", "secret backend: vault, aws, gcp, azure, onepassword or static")
@@ -258,7 +272,7 @@ func Server(ctx context.Context, args []string) error {
 	// The flag pointers exist only to register the flags; their values are
 	// read back through config.OverrideFromFlags (which inspects only
 	// explicitly set flags).
-	discard(listen, token, adminToken, webhookSecret, githubToken, externalURL, tlsCert, tlsKey, runnerCACert, runnerCAKey, runnerEnrollToken, databaseURL, mode, rateLimitPerSecond, rateLimitBurst, otelEndpoint, drainOnSigterm, githubAppID, githubAppPrivateKey, gitlabToken, gitlabWebhookSecret, gitlabBaseURL, forgejoToken, forgejoWebhookSecret, forgejoBaseURL, tokensFile, databaseMaxConnections, metricsListen, secretBroker, vaultAddr, vaultToken, awsRegion, awsAccessKey, awsSecretKey, awsToken, gcpCredentials, gcpProject, azureTenant, azureClientID, azureClientSecret, azureVaultURL, onePasswordHost, onePasswordToken, onePasswordVault, componentRegistryDir, componentRemote, componentRemoteToken, repoConcurrency, teamConcurrency, repoQueueDepth, teamQueueDepth, dailyCostLimit, dailyEnergyLimit, quotaFailOpen)
+	discard(listen, token, adminToken, webhookSecret, githubToken, externalURL, tlsCert, tlsKey, runnerCACert, runnerCAKey, runnerEnrollToken, databaseURL, mode, rateLimitPerSecond, rateLimitBurst, otelEndpoint, drainOnSigterm, githubAppID, githubAppPrivateKey, gitlabToken, gitlabWebhookSecret, gitlabBaseURL, forgejoToken, forgejoWebhookSecret, forgejoBaseURL, tokensFile, runnerTokensFile, databaseMaxConnections, metricsListen, secretBroker, vaultAddr, vaultToken, awsRegion, awsAccessKey, awsSecretKey, awsToken, gcpCredentials, gcpProject, azureTenant, azureClientID, azureClientSecret, azureVaultURL, onePasswordHost, onePasswordToken, onePasswordVault, componentRegistryDir, componentRemote, componentRemoteToken, repoConcurrency, teamConcurrency, repoQueueDepth, teamQueueDepth, dailyCostLimit, dailyEnergyLimit, quotaFailOpen)
 
 	// Effective values after the precedence merge.
 	listenV := cfg.Server.Listen
@@ -288,16 +302,24 @@ func Server(ctx context.Context, args []string) error {
 	if tlsCertV != "" && tlsKeyV == "" {
 		return fmt.Errorf("--tls-cert requires --tls-key")
 	}
+	// Per-runner bearer credentials: auth.runner_tokens_file maps runner
+	// IDs to SHA-256 token digests. In DB mode these are provisioned into
+	// runner_bearer_tokens; otherwise they stay in server memory.
+	runnerTokens, err := loadRunnerTokensFile(cfg.Auth.RunnerTokensFile)
+	if err != nil {
+		return err
+	}
 	if err := validateProductionConfig(productionConfig{
-		Mode:               modeV,
-		DatabaseURL:        databaseURLV,
-		RunnerToken:        tokenV,
-		AdminToken:         adminTokenV,
-		ExternalURL:        externalURLV,
-		TLSCert:            tlsCertV,
-		TLSKey:             tlsKeyV,
-		AllowSharedToken:   *allowSharedToken,
-		RunnerMTLSEnforced: runnerCACertV != "" && runnerCAKeyV != "" && *runnerRequireClientCerts,
+		Mode:                   modeV,
+		DatabaseURL:            databaseURLV,
+		RunnerToken:            tokenV,
+		AdminToken:             adminTokenV,
+		ExternalURL:            externalURLV,
+		TLSCert:                tlsCertV,
+		TLSKey:                 tlsKeyV,
+		AllowSharedToken:       *allowSharedToken,
+		RunnerMTLSEnforced:     runnerCACertV != "" && runnerCAKeyV != "" && *runnerRequireClientCerts,
+		RunnerTokensConfigured: len(runnerTokens) > 0,
 	}); err != nil {
 		return err
 	}
@@ -348,6 +370,22 @@ func Server(ctx context.Context, args []string) error {
 			if err := srv.ValidateHAReady(); err != nil {
 				return err
 			}
+			// Runner credentials: per-runner tokens may also live in the
+			// runner_bearer_tokens table (provisioned out of band). A
+			// production runner-tier without mTLS and without any token
+			// rows refuses to start.
+			if !(runnerCACertV != "" && runnerCAKeyV != "" && *runnerRequireClientCerts) && len(runnerTokens) == 0 {
+				if has, herr := hasProvisionedRunnerTokens(ctx, db); herr != nil {
+					return fmt.Errorf("check per-runner credentials: %w", herr)
+				} else if !has {
+					return fmt.Errorf("production requires runner mTLS or per-runner credentials; the shared runner token is dev-only")
+				}
+			}
+		}
+		if len(runnerTokens) > 0 {
+			if err := srv.ProvisionRunnerTokensDB(ctx, runnerTokens); err != nil {
+				return err
+			}
 		}
 	} else if clusterStore != nil {
 		srv, err = server.NewPersistentWithCluster(tokenV, adminTokenV, *dataDir, clusterStore)
@@ -364,6 +402,18 @@ func Server(ctx context.Context, args []string) error {
 		if adminTokenV != "" {
 			srv.AdminToken = adminTokenV
 		}
+	}
+	// Profile enforcement is a production hardening: runner-supplied
+	// scheduling attributes are ignored and only a certificate-bound
+	// runner profile supplies them (a profile-less runner registers with
+	// capacity 0). Dev mode keeps the legacy self-reported registration.
+	if modeV == "production" {
+		srv.RequireProfiles = true
+	}
+	// Per-runner bearer credentials in memory/fs mode (DB mode provisioned
+	// them through ProvisionRunnerTokensDB above).
+	if len(runnerTokens) > 0 && databaseURLV == "" {
+		srv.LoadRunnerTokens(runnerTokens)
 	}
 	if err := applyForgeConfig(srv, cfg); err != nil {
 		return err
@@ -440,9 +490,9 @@ func Server(ctx context.Context, args []string) error {
 		}
 	} else if runnerEnrollTokenV != "" {
 		if *dataDir == "" {
-			return fmt.Errorf("runner enrollment requires --data-dir (to persist the runner CA) or explicit --runner-ca-cert/--runner-ca-key")
+			return fmt.Errorf("runner enrollment requires --data-dir (to persist the shared runner CA through the cluster key store) or explicit --runner-ca-cert/--runner-ca-key")
 		}
-		if err := srv.EnsureRunnerCA(*dataDir); err != nil {
+		if err := srv.EnsureRunnerCA(); err != nil {
 			return err
 		}
 	}
@@ -833,3 +883,41 @@ func min(a, b int) int {
 
 // discard marks values as intentionally read elsewhere.
 func discard(_ ...any) {}
+
+// loadRunnerTokensFile reads the auth.runner_tokens_file JSON map
+// (runner ID -> SHA-256 hex token digest). An unset path yields an empty
+// map; a configured path must parse and every entry must be well formed.
+func loadRunnerTokensFile(path string) (map[string]string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil, nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("runner tokens file: %w", err)
+	}
+	m := map[string]string{}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, fmt.Errorf("runner tokens file %s: %w", path, err)
+	}
+	out := map[string]string{}
+	for id, digest := range m {
+		id = strings.TrimSpace(id)
+		digest = strings.TrimSpace(digest)
+		if id == "" || len(digest) != 64 {
+			return nil, fmt.Errorf("runner tokens file %s: entry %q must map a runner id to a 64-char SHA-256 hex digest", path, id)
+		}
+		out[id] = digest
+	}
+	return out, nil
+}
+
+// hasProvisionedRunnerTokens reports whether the durable
+// runner_bearer_tokens table already holds per-runner credentials.
+func hasProvisionedRunnerTokens(ctx context.Context, db storage.Store) (bool, error) {
+	ts, ok := db.(storage.RunnerTokenStore)
+	if !ok {
+		return false, nil
+	}
+	return ts.HasRunnerTokens(ctx)
+}

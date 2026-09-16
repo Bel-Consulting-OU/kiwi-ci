@@ -2,7 +2,10 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,7 +42,14 @@ type dbFakeStore struct {
 	deliveries       map[string]string
 	quotas           map[string][2]int
 	cacheMans        map[string]storage.CacheManifestRecord
+	cacheManErr      error
 	secretClaims     map[string]bool
+
+	profiles     map[string]model.RunnerProfile
+	certProfiles map[string]string
+	runnerTokens map[string]string
+	revocations  map[string]string
+	grants       map[string]storage.EnrollGrantRecord
 
 	// claimErr, when non-nil, makes ClaimSecretDelivery fail (fail-closed
 	// secret delivery tests).
@@ -68,6 +78,18 @@ type dbFakeStore struct {
 	atomicLeaseCapacity int
 	// atomicLeaseErrs makes AcquireLeaseAtomic fail a number of times.
 	atomicLeaseErrs int
+
+	// logSeq is the identity-style log sequence counter: AppendLog ignores
+	// the caller's Seq and assigns the next value, mirroring the
+	// GENERATED ALWAYS AS IDENTITY column.
+	logSeq int64
+	// testHistoryVersion/testHistoryStats back the TestHistoryStore cache;
+	// testHistorySaveErr makes SaveTestHistory fail (report durability
+	// tests).
+	testHistoryVersion   int64
+	testHistoryStats     []byte
+	testHistorySaveErr   error
+	testHistorySaveCalls int
 
 	insertRunCalls []model.Run
 	insertJobCalls []model.Job
@@ -128,6 +150,11 @@ var _ storage.CacheManifestStore = (*dbFakeStore)(nil)
 var _ storage.ArtifactSidecarStore = (*dbFakeStore)(nil)
 var _ storage.SecretClaimStore = (*dbFakeStore)(nil)
 var _ storage.SecretClaimReleaser = (*dbFakeStore)(nil)
+var _ storage.ProfileStore = (*dbFakeStore)(nil)
+var _ storage.RunnerTokenStore = (*dbFakeStore)(nil)
+var _ storage.CertRevocationStore = (*dbFakeStore)(nil)
+var _ storage.EnrollGrantStore = (*dbFakeStore)(nil)
+var _ storage.TestHistoryStore = (*dbFakeStore)(nil)
 
 func newDBFakeStore() *dbFakeStore {
 	return &dbFakeStore{
@@ -145,6 +172,11 @@ func newDBFakeStore() *dbFakeStore {
 		quotas:          map[string][2]int{},
 		cacheMans:       map[string]storage.CacheManifestRecord{},
 		secretClaims:    map[string]bool{},
+		profiles:        map[string]model.RunnerProfile{},
+		certProfiles:    map[string]string{},
+		runnerTokens:    map[string]string{},
+		revocations:     map[string]string{},
+		grants:          map[string]storage.EnrollGrantRecord{},
 		leaderOK:        true,
 	}
 }
@@ -357,6 +389,21 @@ func (f *dbFakeStore) CompleteJob(ctx context.Context, jobID string, generation 
 	j.LeaseExpiresAt = nil
 	f.jobs[jobID] = j
 	f.receipts[key] = receipt
+	// Completion effect intents ride the completion, mirroring the SQL
+	// contract: one durable outbox item per effect kind under the
+	// deterministic effect IDs.
+	payload, perr := json.Marshal(storage.CompletionEffectsPayload{JobID: jobID, RunID: j.RunID})
+	if perr != nil {
+		return perr
+	}
+	for _, kind := range storage.CompletionEffectKinds() {
+		f.outboxItems = append(f.outboxItems, storage.OutboxItem{
+			ID:        storage.CompletionEffectID(jobID, generation, kind),
+			Kind:      kind,
+			Payload:   payload,
+			CreatedAt: now,
+		})
+	}
 	return nil
 }
 
@@ -465,6 +512,10 @@ func (f *dbFakeStore) ListTestReportsAll(ctx context.Context) ([]model.TestRepor
 func (f *dbFakeStore) AppendLog(ctx context.Context, e model.LogEntry) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Identity-sequence semantics: the store assigns the next sequence in
+	// the append, ignoring any caller-supplied (wall-clock) value.
+	f.logSeq++
+	e.Seq = f.logSeq
 	f.logs = append(f.logs, e)
 	return nil
 }
@@ -477,6 +528,10 @@ func (f *dbFakeStore) ReadLogs(ctx context.Context, runID string, after int64, l
 		if e.RunID == runID && e.Seq > after {
 			out = append(out, e)
 		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
 	}
 	return out, nil
 }
@@ -604,6 +659,24 @@ func (f *dbFakeStore) OutboxPending(ctx context.Context) ([]storage.OutboxItem, 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]storage.OutboxItem(nil), f.outboxItems...), nil
+}
+
+func (f *dbFakeStore) LoadTestHistory(ctx context.Context) (int64, []byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.testHistoryVersion, append([]byte(nil), f.testHistoryStats...), nil
+}
+
+func (f *dbFakeStore) SaveTestHistory(ctx context.Context, stats []byte) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.testHistorySaveCalls++
+	if f.testHistorySaveErr != nil {
+		return 0, f.testHistorySaveErr
+	}
+	f.testHistoryVersion++
+	f.testHistoryStats = append([]byte(nil), stats...)
+	return f.testHistoryVersion, nil
 }
 
 func (f *dbFakeStore) UpsertSchedule(ctx context.Context, sc storage.Schedule) error {
@@ -869,6 +942,30 @@ func (f *dbFakeStore) InsertCompiledRun(ctx context.Context, req storage.InsertC
 			return storage.ErrDeliveryDuplicate
 		}
 	}
+	if req.DownstreamLaunch != nil {
+		parts := strings.Split(req.DownstreamLaunch.LinkKey, "\x00")
+		if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+			return fmt.Errorf("storage: malformed downstream launch claim")
+		}
+		if len(req.DownstreamLaunch.StableChildID) != 64 {
+			return fmt.Errorf("storage: malformed downstream stable child id")
+		}
+		l, ok := f.downstreamLinks[req.DownstreamLaunch.LinkKey]
+		if !ok {
+			return fmt.Errorf("storage: downstream launch claim link missing")
+		}
+		if l.ChildRunID != "" {
+			if l.ChildRunID == req.Run.ID {
+				return storage.ErrDownstreamLaunched
+			}
+			return fmt.Errorf("storage: downstream launch claim lost")
+		}
+		l.ChildRunID = req.Run.ID
+		l.StableChildID = req.DownstreamLaunch.StableChildID
+		l.Reserved = false
+		l.ReservedAt = nil
+		f.downstreamLinks[req.DownstreamLaunch.LinkKey] = l
+	}
 	if req.ScheduleClaim != nil {
 		for _, o := range f.occurrences[req.ScheduleClaim.ScheduleID] {
 			if o.Nominal.Equal(req.ScheduleClaim.Nominal) {
@@ -1073,7 +1170,7 @@ func (f *dbFakeStore) ExpireDownstreamReservations(ctx context.Context, olderTha
 	return n, nil
 }
 
-func (f *dbFakeStore) InsertGeneratedJobsTx(ctx context.Context, parentJobID string, depth int, jobs map[string]model.Job, deps map[string][]string, verify storage.GeneratedJobVerifier) error {
+func (f *dbFakeStore) InsertGeneratedJobsTx(ctx context.Context, parentJobID string, depth int, jobs map[string]model.Job, deps map[string][]string, contracts map[string]map[string]storage.ArtifactContract, verify storage.GeneratedJobVerifier) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	parent, ok := f.jobs[parentJobID]
@@ -1094,12 +1191,18 @@ func (f *dbFakeStore) InsertGeneratedJobsTx(ctx context.Context, parentJobID str
 	for id, j := range jobs {
 		f.jobs[id] = j
 	}
+	for id, cs := range contracts {
+		f.contracts[id] = cs
+	}
 	return nil
 }
 
 func (f *dbFakeStore) PutCacheManifest(ctx context.Context, rec storage.CacheManifestRecord) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.cacheManErr != nil {
+		return f.cacheManErr
+	}
 	if rec.CreatedAt.IsZero() {
 		rec.CreatedAt = time.Now().UTC()
 	}
@@ -1158,4 +1261,118 @@ func (f *dbFakeStore) ReleaseSecretDelivery(ctx context.Context, jobID string, g
 	defer f.mu.Unlock()
 	delete(f.secretClaims, jobID+"|"+itoa(generation)+"|"+secretName)
 	return nil
+}
+
+func (f *dbFakeStore) UpsertProfile(ctx context.Context, p model.RunnerProfile) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = time.Now().UTC()
+	}
+	f.profiles[p.ID] = p
+	return nil
+}
+
+func (f *dbFakeStore) GetProfile(ctx context.Context, id string) (model.RunnerProfile, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p, ok := f.profiles[id]
+	if !ok {
+		return model.RunnerProfile{}, storage.ErrNotFound
+	}
+	return p, nil
+}
+
+func (f *dbFakeStore) ListProfiles(ctx context.Context) ([]model.RunnerProfile, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]model.RunnerProfile, 0, len(f.profiles))
+	for _, p := range f.profiles {
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+func (f *dbFakeStore) BindCertProfile(ctx context.Context, serial, profileID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.certProfiles[serial] = profileID
+	return nil
+}
+
+func (f *dbFakeStore) ProfileForSerial(ctx context.Context, serial string) (model.RunnerProfile, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	id, ok := f.certProfiles[serial]
+	if !ok {
+		return model.RunnerProfile{}, false, nil
+	}
+	p, ok := f.profiles[id]
+	return p, ok, nil
+}
+
+func (f *dbFakeStore) UpsertRunnerToken(ctx context.Context, runnerID, tokenDigest string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.runnerTokens[tokenDigest] = runnerID
+	return nil
+}
+
+func (f *dbFakeStore) RunnerIDForToken(ctx context.Context, tokenDigest string) (string, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	id, ok := f.runnerTokens[tokenDigest]
+	return id, ok, nil
+}
+
+func (f *dbFakeStore) HasRunnerTokens(ctx context.Context) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.runnerTokens) > 0, nil
+}
+
+func (f *dbFakeStore) RevokeCert(ctx context.Context, serial, runnerID, reason string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.revocations[serial] = runnerID
+	return nil
+}
+
+func (f *dbFakeStore) CertRevoked(ctx context.Context, serial string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.revocations[serial]
+	return ok, nil
+}
+
+func (f *dbFakeStore) PutEnrollGrant(ctx context.Context, digest string, expiresAt time.Time, boundLabels []string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.grants[digest] = storage.EnrollGrantRecord{ExpiresAt: expiresAt, BoundLabels: append([]string(nil), boundLabels...)}
+	return nil
+}
+
+func (f *dbFakeStore) GetEnrollGrant(ctx context.Context, digest string) (storage.EnrollGrantRecord, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	rec, ok := f.grants[digest]
+	return rec, ok, nil
+}
+
+func (f *dbFakeStore) ConsumeEnrollGrant(ctx context.Context, digest string, consumedBy string) (storage.EnrollGrantRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	rec, ok := f.grants[digest]
+	if !ok {
+		return storage.EnrollGrantRecord{}, storage.ErrNotFound
+	}
+	if rec.Consumed {
+		return storage.EnrollGrantRecord{}, storage.ErrGrantConsumed
+	}
+	if !time.Now().UTC().Before(rec.ExpiresAt) {
+		return storage.EnrollGrantRecord{}, storage.ErrGrantExpired
+	}
+	rec.Consumed = true
+	f.grants[digest] = rec
+	return rec, nil
 }

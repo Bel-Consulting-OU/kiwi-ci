@@ -196,16 +196,19 @@ const queuePipeline = `version: 1
 jobs:
   first:
     runtime: container
+    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     steps:
       - run: echo first
   second:
     runtime: container
+    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     needs:
       - first
     steps:
       - run: echo second
   third:
     runtime: container
+    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     runner:
       - gigantic
     steps:

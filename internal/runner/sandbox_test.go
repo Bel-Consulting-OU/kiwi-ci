@@ -24,14 +24,15 @@ func TestPayloadSandboxRequirementsDecode(t *testing.T) {
 	}
 	withSandbox["rootless"] = true
 	withSandbox["read_only_rootfs"] = true
+	withSandbox["non_root"] = true
 	payload.EffectivePolicy = mustJSON(t, withSandbox)
 
 	req, err := payloadSandboxRequirements(payload)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if !req.Rootless || !req.ReadOnlyRootFS {
-		t.Fatalf("requirements = %+v, want both flags", req)
+	if !req.Rootless || !req.ReadOnlyRootFS || !req.NonRoot {
+		t.Fatalf("requirements = %+v, want all three flags (non_root included)", req)
 	}
 
 	// A legacy payload whose policy carries no sandbox fields decodes
@@ -41,7 +42,7 @@ func TestPayloadSandboxRequirementsDecode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("legacy policy decode: %v", err)
 	}
-	if req.Rootless || req.ReadOnlyRootFS {
+	if req.Rootless || req.ReadOnlyRootFS || req.NonRoot {
 		t.Fatalf("legacy policy unexpectedly demands sandbox: %+v", req)
 	}
 

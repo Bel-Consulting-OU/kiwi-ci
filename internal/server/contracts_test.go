@@ -37,6 +37,7 @@ const artifactsPipeline = `version: 1
 jobs:
   build:
     runtime: container
+    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     artifacts:
       - name: bin
         paths:

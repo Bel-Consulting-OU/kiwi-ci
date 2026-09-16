@@ -52,10 +52,7 @@ const schemaSource = `{
       "$ref": "#/$defs/stringMap"
     },
     "secrets": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
+      "$ref": "#/$defs/secrets"
     },
     "defaults": {
       "$ref": "#/$defs/defaults"
@@ -800,6 +797,13 @@ const schemaSource = `{
         }
       },
       "additionalProperties": false
+    },
+    "secrets": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$"
+      }
     }
   }
 }

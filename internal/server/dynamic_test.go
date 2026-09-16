@@ -14,6 +14,7 @@ const generatePipeline = `version: 1
 jobs:
   gen:
     runtime: container
+    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     generate:
       path: generated.yaml
       max_jobs: 16
@@ -74,7 +75,7 @@ func leaseRunJob(t *testing.T, s *Server) (string, Task) {
 func TestDynamicGenerateHappyPath(t *testing.T) {
 	s, run := trustedGenerateServer(t)
 	runnerID, task := leaseRunJob(t, s)
-	frag := `{"jobs":{"child-a":{"runtime":"container","steps":[{"run":"echo child"}]}},"deps":{}}`
+	frag := `{"jobs":{"child-a":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo child"}]}},"deps":{}}`
 	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", frag, leaseHeaders(task, runnerID))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("generated = %d: %s", w.Code, w.Body.String())
@@ -116,7 +117,7 @@ func TestDynamicGenerateDepthLimit(t *testing.T) {
 	parent.DynamicDepth = 2
 	s.jobs[task.Job.ID] = parent
 	s.mu.Unlock()
-	frag := `{"jobs":{"child-a":{"runtime":"container","steps":[{"run":"echo child"}]}},"deps":{}}`
+	frag := `{"jobs":{"child-a":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo child"}]}},"deps":{}}`
 	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", frag, leaseHeaders(task, runnerIDFor(s, task.Job.ID)))
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("depth-3 generation = %d, want 400: %s", w.Code, w.Body.String())
@@ -145,7 +146,7 @@ func TestDynamicGenerateRejectsFragmentTooLarge(t *testing.T) {
 		if i > 0 {
 			b.WriteString(",")
 		}
-		b.WriteString(`"j` + string(rune('a'+i%26)) + jsonInt(i) + `":{"runtime":"container","steps":[{"run":"echo x"}]}`)
+		b.WriteString(`"j` + string(rune('a'+i%26)) + jsonInt(i) + `":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo x"}]}`)
 	}
 	b.WriteString(`},"deps":{}}`)
 	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", b.String(), leaseHeaders(task, runnerID))
@@ -162,7 +163,7 @@ func jsonInt(i int) string {
 func TestDynamicGenerateRejectsUnknownDeps(t *testing.T) {
 	s, _ := trustedGenerateServer(t)
 	runnerID, task := leaseRunJob(t, s)
-	frag := `{"jobs":{"child-a":{"runtime":"container","steps":[{"run":"echo child"}]}},"deps":{"child-a":["nope"]}}`
+	frag := `{"jobs":{"child-a":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo child"}]}},"deps":{"child-a":["nope"]}}`
 	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", frag, leaseHeaders(task, runnerID))
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("unknown dep = %d, want 400: %s", w.Code, w.Body.String())
@@ -190,7 +191,7 @@ func TestDynamicGenerateTrustReduction(t *testing.T) {
 	}
 	_ = run
 	runnerID, task := leaseRunJob(t, s)
-	frag := `{"jobs":{"child-a":{"runtime":"container","steps":[{"run":"echo child","secrets":["forbidden-secret"]}]}},"deps":{}}`
+	frag := `{"jobs":{"child-a":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo child","secrets":["forbidden-secret"]}]}},"deps":{}}`
 	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", frag, leaseHeaders(task, runnerID))
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("secret over parent caps = %d, want 400: %s", w.Code, w.Body.String())
@@ -203,7 +204,7 @@ func TestDynamicGenerateTrustReduction(t *testing.T) {
 func TestDynamicGenerateRequiresLease(t *testing.T) {
 	s, _ := trustedGenerateServer(t)
 	runnerID, task := leaseRunJob(t, s)
-	frag := `{"jobs":{"child-a":{"runtime":"container","steps":[{"run":"echo child"}]}},"deps":{}}`
+	frag := `{"jobs":{"child-a":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo child"}]}},"deps":{}}`
 	hdrs := leaseHeaders(task, runnerID)
 	hdrs["X-Kiwi-Lease-Token"] = "wrong-token"
 	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", frag, hdrs)
@@ -234,7 +235,7 @@ func TestDynamicGenerateDBMode(t *testing.T) {
 		t.Fatalf("enqueue: %v", err)
 	}
 	runnerID, task := leaseRunJob(t, s)
-	frag := `{"jobs":{"child-a":{"runtime":"container","steps":[{"run":"echo child"}]}},"deps":{}}`
+	frag := `{"jobs":{"child-a":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo child"}]}},"deps":{}}`
 	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", frag, leaseHeaders(task, runnerID))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("db generated = %d: %s", w.Code, w.Body.String())
@@ -251,7 +252,7 @@ func TestDynamicGenerateDBMode(t *testing.T) {
 	}
 	_ = runnerID
 	// The parent's lease must still be valid for a second fragment.
-	w = doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", `{"jobs":{"child-b":{"runtime":"container","steps":[{"run":"echo b"}]}},"deps":{}}`, leaseHeaders(task, runnerID))
+	w = doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", `{"jobs":{"child-b":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo b"}]}},"deps":{}}`, leaseHeaders(task, runnerID))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("db second fragment = %d: %s", w.Code, w.Body.String())
 	}
@@ -265,7 +266,7 @@ func TestDynamicGenerateRejectedWithoutCapability(t *testing.T) {
 	_, task := leaseRunJob(t, s)
 	runnerID := runnerIDFor(s, task.Job.ID)
 	s.Policy = &policy.Config{}
-	frag := `{"jobs":{"child-a":{"runtime":"container","steps":[{"run":"echo child"}]}},"deps":{}}`
+	frag := `{"jobs":{"child-a":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo child"}]}},"deps":{}}`
 	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", frag, leaseHeaders(task, runnerID))
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("no-capability generation = %d, want 403: %s", w.Code, w.Body.String())

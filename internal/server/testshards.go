@@ -1,13 +1,12 @@
 package server
 
 import (
-	"errors"
+	"context"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
-	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
@@ -64,9 +63,24 @@ func (s *Server) commitTestintelHistoryLocked() error {
 }
 
 // recordTestReportHistory folds one uploaded test report into the
-// persistent history under s.mu.
+// persistent history. In memory mode the history file under dataDir is the
+// durable store; in DB mode the durable reports are the source of truth and
+// the history is rebuilt from them and cached with a version bump (see
+// rebuildTestHistoryDB).
 func (s *Server) recordTestReportHistory(repo string, rep model.TestReport) {
 	if s.history == nil {
+		return
+	}
+	if s.DB != nil {
+		// Fold into the in-memory history first so this instance serves the
+		// new data immediately, then rebuild the durable cache from the
+		// committed reports (the upload already persisted the report).
+		s.mu.Lock()
+		for _, c := range rep.Cases {
+			s.history.h.Record(repo, rep.JobKey, c.Class, c.Name, c.Duration, c.Passed, rep.CreatedAt)
+		}
+		s.mu.Unlock()
+		s.rebuildTestHistoryDB(context.Background())
 		return
 	}
 	s.mu.Lock()
@@ -79,6 +93,125 @@ func (s *Server) recordTestReportHistory(repo string, rep model.TestReport) {
 		s.logError("test history: commit failed", "error", err.Error())
 	}
 	s.mu.Unlock()
+}
+
+// rebuildTestHistoryDB recomputes the full test history from the durable
+// reports and caches the serialized aggregates with a version bump. Every
+// replica that rebuilds from the same committed reports derives the same
+// history, so shard assignments converge. A failure only logs: the durable
+// reports are untouched and the in-memory history (already folded with the
+// new report) keeps serving locally.
+func (s *Server) rebuildTestHistoryDB(ctx context.Context) {
+	ts, ok := s.DB.(storage.TestHistoryStore)
+	if !ok {
+		return
+	}
+	reports, err := s.DB.ListTestReportsAll(ctx)
+	if err != nil {
+		s.logError("test history: list reports failed", "error", err.Error())
+		return
+	}
+	h := testintel.NewHistory()
+	repoForRun := map[string]string{}
+	for _, r := range reports {
+		repo, cached := repoForRun[r.RunID]
+		if !cached {
+			if run, gerr := s.DB.GetRun(ctx, r.RunID); gerr == nil {
+				repo = run.RepoFullName
+			}
+			repoForRun[r.RunID] = repo
+		}
+		for _, c := range r.Cases {
+			h.Record(repo, r.JobKey, c.Class, c.Name, c.Duration, c.Passed, r.CreatedAt)
+		}
+	}
+	stats, err := historyStats(h)
+	if err != nil {
+		s.logError("test history: serialize failed", "error", err.Error())
+		return
+	}
+	version, err := ts.SaveTestHistory(ctx, stats)
+	if err != nil {
+		s.logError("test history: cache save failed", "error", err.Error())
+		return
+	}
+	s.mu.Lock()
+	s.history.h = h
+	s.historyDBVersion = version
+	s.mu.Unlock()
+}
+
+// syncTestHistoryDB converges the in-memory history with the durable cache
+// when its version advanced (another replica uploaded reports). A load
+// failure keeps the current in-memory history.
+func (s *Server) syncTestHistoryDB(ctx context.Context) {
+	ts, ok := s.DB.(storage.TestHistoryStore)
+	if !ok {
+		return
+	}
+	version, stats, err := ts.LoadTestHistory(ctx)
+	if err != nil {
+		s.logError("test history: cache load failed", "error", err.Error())
+		return
+	}
+	s.mu.Lock()
+	local := s.historyDBVersion
+	s.mu.Unlock()
+	if version <= local {
+		return
+	}
+	if len(stats) == 0 {
+		s.mu.Lock()
+		s.historyDBVersion = version
+		s.mu.Unlock()
+		return
+	}
+	h, err := historyFromStats(stats)
+	if err != nil {
+		s.logError("test history: decode cached stats failed", "error", err.Error())
+		return
+	}
+	s.mu.Lock()
+	s.history.h = h
+	s.historyDBVersion = version
+	s.mu.Unlock()
+}
+
+// historyStats serializes the current in-memory history in the same JSON
+// shape the history file uses (testintel.History.Save).
+func historyStats(h *testintel.History) ([]byte, error) {
+	f, err := os.CreateTemp("", "kiwi-history-*")
+	if err != nil {
+		return nil, err
+	}
+	path := f.Name()
+	defer os.Remove(path)
+	if err := h.Save(path); err != nil {
+		f.Close()
+		return nil, err
+	}
+	if err := f.Close(); err != nil {
+		return nil, err
+	}
+	return os.ReadFile(path)
+}
+
+// historyFromStats restores a testintel.History from serialized stats bytes.
+func historyFromStats(stats []byte) (*testintel.History, error) {
+	f, err := os.CreateTemp("", "kiwi-history-*")
+	if err != nil {
+		return nil, err
+	}
+	path := f.Name()
+	defer os.Remove(path)
+	if _, err := f.Write(stats); err != nil {
+		f.Close()
+		return nil, err
+	}
+	if err := f.Close(); err != nil {
+		return nil, err
+	}
+	return testintel.LoadHistory(path)
 }
 
 // flakyFromHistory returns the persisted-history flaky set for a repo.
@@ -100,23 +233,15 @@ func (s *Server) testShards(w http.ResponseWriter, r *http.Request) {
 	runnerID := r.Header.Get("X-Kiwi-Runner-ID")
 	token := r.Header.Get("X-Kiwi-Lease-Token")
 	gen, _ := strconv.ParseInt(r.Header.Get("X-Kiwi-Lease-Generation"), 10, 64)
-	now := time.Now().UTC()
-	j, err := s.jobForLease(r.Context(), jobID)
-	if errors.Is(err, storage.ErrNotFound) {
-		http.NotFound(w, r)
+	j, authErr := s.authorizeRunnerLease(r, runnerID, token, gen)
+	if authErr != nil {
+		s.writeLeaseAuthError(w, r, authErr)
 		return
 	}
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	if !s.verifyRunnerIdentity(r, runnerID) {
-		http.Error(w, "runner identity mismatch", http.StatusForbidden)
-		return
-	}
-	if !s.validActiveLease(j, runnerID, token, gen, now) {
-		http.Error(w, "stale or invalid lease", http.StatusConflict)
-		return
+	// DB mode: converge the in-memory test history with the durable cache
+	// before any decision so replicas shard identically.
+	if s.DB != nil {
+		s.syncTestHistoryDB(r.Context())
 	}
 	run := model.Run{}
 	if s.DB != nil {

@@ -22,6 +22,7 @@ const sbomPipeline = `version: 1
 jobs:
   build:
     runtime: container
+    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     artifacts:
       - name: bin
         paths:
@@ -35,6 +36,7 @@ const sigstorePipeline = `version: 1
 jobs:
   build:
     runtime: container
+    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     artifacts:
       - name: bin
         paths:
@@ -51,6 +53,7 @@ const sigstoreOptionalPipeline = `version: 1
 jobs:
   build:
     runtime: container
+    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     artifacts:
       - name: bin
         paths:

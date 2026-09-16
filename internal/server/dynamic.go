@@ -70,7 +70,6 @@ type generatedResponse struct {
 // under the parent's effective capabilities (children can only inherit or
 // reduce trust), depth- and size-bounded, and inserted atomically.
 func (s *Server) generateJobs(w http.ResponseWriter, r *http.Request) {
-	parentID := r.PathValue("id")
 	var in generatedFragment
 	if !decodeLimit(w, r, &in, maxGeneratedFragmentBytes) {
 		return
@@ -78,22 +77,10 @@ func (s *Server) generateJobs(w http.ResponseWriter, r *http.Request) {
 	runnerID := r.Header.Get("X-Kiwi-Runner-ID")
 	token := r.Header.Get("X-Kiwi-Lease-Token")
 	gen, _ := strconv.ParseInt(r.Header.Get("X-Kiwi-Lease-Generation"), 10, 64)
-	if !s.verifyRunnerIdentity(r, runnerID) {
-		http.Error(w, "runner identity mismatch", http.StatusForbidden)
-		return
-	}
 	ctx := r.Context()
-	parent, err := s.jobForLease(ctx, parentID)
-	if errors.Is(err, storage.ErrNotFound) {
-		http.NotFound(w, r)
-		return
-	}
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	if !s.validActiveLease(parent, runnerID, token, gen, time.Now().UTC()) {
-		http.Error(w, "stale or invalid lease", http.StatusConflict)
+	parent, authErr := s.authorizeRunnerLease(r, runnerID, token, gen)
+	if authErr != nil {
+		s.writeLeaseAuthError(w, r, authErr)
 		return
 	}
 	res, aerr := s.processGeneratedFragment(ctx, parent, in)
@@ -168,13 +155,16 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 	// parent's stored effective policy is the ceiling, narrowed by the
 	// current policy file and the trust floor.
 	childCaps := s.generatedChildCapabilities(parent)
-	oidcAudiences := policy.OIDCFromCapabilities(childCaps).AllowedAudiences
-	if err := policy.ValidateAdmissionWithCapabilities(synth, childCaps); err != nil {
-		return nil, fmt.Errorf("generated fragment admission: %w", err)
-	}
 	// The parent's own capabilities must permit child graph generation.
 	if !childCaps.GenerateChildGraph {
 		return nil, policyDenied("parent job's capabilities do not permit generated child graphs")
+	}
+	// Canonical admission: the FULL admission path (structural validation,
+	// capability admission, downstream/generate declaration invariants,
+	// and the org policy's host/region/digest restrictions) runs with the
+	// child caps — generated fragments have no second-class path.
+	if err := s.admitCompiledSpec(repoIdentityOfJob(parent), synth, childCaps); err != nil {
+		return nil, fmt.Errorf("generated fragment admission: %w", err)
 	}
 	// Total jobs per run bound (enforced against the existing run).
 	existing := 0
@@ -240,10 +230,26 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 	created := make(map[string]model.Job, len(keys))
 	jobContracts := map[string]map[string]storage.ArtifactContract{}
 	ids := make([]string, 0, len(keys))
+	oidcAudiences := policy.OIDCFromCapabilities(childCaps).AllowedAudiences
 	for _, key := range keys {
 		cj := g.Jobs[key]
 		id := keyIDs[key]
 		ids = append(ids, id)
+		env := cj.Job.Environment.Name
+		infraRetries := cj.Job.InfraRetries
+		if infraRetries <= 0 {
+			infraRetries = 2
+		}
+		effectiveNetwork := cj.Job.Network
+		if effectiveNetwork == "" {
+			effectiveNetwork = "bridge"
+		}
+		if !parent.Trusted && cj.Job.Runtime == "container" {
+			effectiveNetwork = "none"
+		}
+		// Untrusted children get the server-side resource ceilings just
+		// like initial enqueues, BEFORE the compiled payload is marshaled.
+		cj = s.applyUntrustedResourceCeilings(cj, parent.Trusted)
 		cjJSON, mErr := json.Marshal(cj)
 		if mErr != nil {
 			return nil, mErr
@@ -257,21 +263,9 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 			}
 			needs = append(needs, depID)
 		}
-		env := cj.Job.Environment.Name
-		infraRetries := cj.Job.InfraRetries
-		if infraRetries <= 0 {
-			infraRetries = 2
-		}
-		effectiveNetwork := cj.Job.Network
-		if effectiveNetwork == "" {
-			effectiveNetwork = "bridge"
-		}
-		if !parent.Trusted && cj.Job.Runtime == "container" {
-			effectiveNetwork = "none"
-		}
-		created[id] = model.Job{
+		j := model.Job{
 			ID: id, RunID: parent.RunID, Key: key, BaseKey: cj.BaseID, RepoURL: parent.RepoURL, RepoFullName: parent.RepoFullName, Ref: parent.Ref, SHA: parent.SHA,
-			Event: parent.Event, Condition: cj.Job.If, DependencyStatus: model.StatusSuccess, Pipeline: string(canonical), Trusted: parent.Trusted, ChangedFiles: append([]string{}, parent.ChangedFiles...), Needs: needs,
+			Event: parent.Event, Condition: cj.Job.If, DependencyStatus: model.StatusSuccess, Pipeline: string(canonical), Trusted: parent.Trusted, ChangedFiles: append([]string{}, parent.ChangedFiles...), ChangedFilesKnown: parent.ChangedFilesKnown, Needs: needs,
 			RequiredLabels: labelsForJob(cj.Job), Network: effectiveNetwork, Environment: env, ApprovalRequired: cj.Job.Environment.Approval, EnvironmentBranches: append([]string{}, cj.Job.Environment.Branches...), EnvironmentConcurrency: cj.Job.Environment.Concurrency, OIDCAllowed: cj.Job.Permissions.IDToken, OIDCAudiences: cloneStrings(oidcAudiences),
 			DeclaredSecrets: declaredSecrets(strictSpec, cj.Job),
 			Status:          model.StatusQueued, Priority: scheduler.DownstreamDepth(g, key), MaxInfraRetries: infraRetries, CreatedAt: now,
@@ -286,6 +280,8 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 				EffectivePolicy: json.RawMessage(policyJSON),
 			},
 		}
+		applyCompiledJobFields(&j, cj, now)
+		created[id] = j
 		jobContracts[id] = buildJobContracts(cj)
 	}
 
@@ -317,7 +313,7 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 			}
 			return nil
 		}
-		if err := ds.InsertGeneratedJobsTx(ctx, parent.ID, childDepth, created, deps, verify); err != nil {
+		if err := ds.InsertGeneratedJobsTx(ctx, parent.ID, childDepth, created, deps, jobContracts, verify); err != nil {
 			return nil, err
 		}
 		return &generatedResponse{ParentJobID: parent.ID, RunID: parent.RunID, Depth: childDepth, JobIDs: ids, Keys: keys}, nil
@@ -387,4 +383,15 @@ func repoFullNameOf(j model.Job) string {
 		return j.RepoURL
 	}
 	return u.Host + strings.TrimSuffix(u.Path, ".git")
+}
+
+// repoIdentityOfJob resolves the repository identity a job is admitted
+// under: its clone URL and full name (reconstructed from the URL when the
+// stored full name is empty).
+func repoIdentityOfJob(j model.Job) repoIdentity {
+	id := repoIdentity{RepoURL: j.RepoURL, RepoFullName: j.RepoFullName}
+	if id.RepoFullName == "" {
+		id.RepoFullName = repoFullNameOf(j)
+	}
+	return id
 }

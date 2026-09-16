@@ -70,6 +70,7 @@ func TestAllowedRegionsRejected(t *testing.T) {
 jobs:
   build:
     runtime: container
+    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     placement:
       regions:
         - us-east-1
@@ -83,6 +84,7 @@ jobs:
 jobs:
   build:
     runtime: container
+    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     placement:
       regions:
         - eu-west-1

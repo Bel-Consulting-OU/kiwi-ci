@@ -7,8 +7,11 @@ package storage
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
@@ -32,6 +35,11 @@ var (
 	// already claimed by a different run inside InsertCompiledRun; the
 	// whole enqueue rolled back.
 	ErrScheduleClaimLost = errors.New("storage: schedule occurrence claimed by another run")
+	// ErrDownstreamLaunched means the downstream launch claim inside
+	// InsertCompiledRun matched a link that is already launched with the
+	// SAME stable child ID: the enqueue rolled back and the caller must
+	// return the existing child run instead of creating a duplicate.
+	ErrDownstreamLaunched = errors.New("storage: downstream link already launched")
 	// ErrRequiredArtifactMissing means a successful job completion was
 	// rolled back inside CompleteJob because the job's artifact contracts
 	// declare a Required artifact with no matching artifact row yet. The
@@ -39,6 +47,12 @@ var (
 	// artifact and retry the completion. The wrapped message names the
 	// missing artifact.
 	ErrRequiredArtifactMissing = errors.New("storage: required artifact missing")
+	// ErrGrantConsumed means an enrollment grant's conditional consume
+	// matched a row whose consumed_at is already set (a concurrent or
+	// replayed enrollment): the grant is single-use and this caller lost.
+	ErrGrantConsumed = errors.New("storage: enrollment grant already consumed")
+	// ErrGrantExpired means an enrollment grant's expires_at has passed.
+	ErrGrantExpired = errors.New("storage: enrollment grant expired")
 )
 
 // QuotaExceededError is returned by quota admission inside InsertCompiledRun
@@ -150,6 +164,49 @@ type OutboxItem struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// Completion post-transaction effect outbox kinds. CompleteJob inserts one
+// intent per kind INSIDE the completion transaction, so a crash after the
+// durable completion commits can never lose the effects: the outbox flush
+// (and the defensive receipt-replay reconciliation) re-runs them, and each
+// effect checks its own durable marker before acting.
+const (
+	OutboxKindDownstreamCheck  = "downstream_check"
+	OutboxKindDeploymentFinish = "deployment_finish"
+	OutboxKindUsageAccount     = "usage_account"
+	OutboxKindRunAggregate     = "run_aggregate"
+	OutboxKindForgeStatus      = "forge_status"
+)
+
+// CompletionEffectsPayload is the outbox payload carried by completion
+// effect intents.
+type CompletionEffectsPayload struct {
+	JobID string `json:"job_id"`
+	RunID string `json:"run_id"`
+}
+
+// CompletionEffectKinds lists the effect kinds inserted by a completion, in
+// dispatch order.
+func CompletionEffectKinds() []string {
+	return []string{
+		OutboxKindDownstreamCheck,
+		OutboxKindDeploymentFinish,
+		OutboxKindUsageAccount,
+		OutboxKindRunAggregate,
+		OutboxKindForgeStatus,
+	}
+}
+
+// CompletionEffectID derives the deterministic outbox item ID for one
+// completion effect: sha256(job, lease generation, kind) truncated to the
+// canonical 128-bit ID format. The store inserts effect rows under these
+// IDs inside the completion transaction and the completing server queues
+// the same IDs in memory, so the flush's OutboxAck removes the actual
+// transaction rows.
+func CompletionEffectID(jobID string, generation int64, kind string) string {
+	sum := sha256.Sum256([]byte("kiwi-completion-effect\x00" + jobID + "\x00" + strconv.FormatInt(generation, 10) + "\x00" + kind))
+	return hex.EncodeToString(sum[:16])
+}
+
 // OutboxStore is the durable outbox contract. OutboxAppend enqueues an item,
 // OutboxAck removes a successfully dispatched item, and OutboxPending returns
 // the unacked items in FIFO order.
@@ -159,10 +216,21 @@ type OutboxStore interface {
 	OutboxPending(ctx context.Context) ([]OutboxItem, error)
 }
 
-// Schedule is one cron-triggered pipeline schedule.
+// Schedule is one cron-triggered pipeline schedule. Repository is the
+// repository full name (owner/name); RepoID is the canonical repository
+// identity (forge host + full name); RepoURL is the clone URL; Forge is the
+// forge adapter kind ("github"/"gitlab"/"forgejo"); Trusted marks a trusted
+// schedule (creation/update/manual trigger require the repo-scoped
+// trusted_run grant). Automatic firing uses these stored identity fields —
+// never the request context — so sc.Repository is no longer both the clone
+// URL and the identity.
 type Schedule struct {
 	ID         string     `json:"id"`
 	Repository string     `json:"repository"`
+	RepoID     string     `json:"repo_id,omitempty"`
+	RepoURL    string     `json:"repo_url,omitempty"`
+	Forge      string     `json:"forge,omitempty"`
+	Trusted    bool       `json:"trusted,omitempty"`
 	Spec       string     `json:"spec"`
 	Enabled    bool       `json:"enabled"`
 	LastRun    *time.Time `json:"last_run,omitempty"`
@@ -250,7 +318,13 @@ type DownstreamLink struct {
 	TargetForge   string     `json:"target_forge,omitempty"`
 	TargetBaseURL string     `json:"target_base_url,omitempty"`
 	TargetRepoID  string     `json:"target_repo_id,omitempty"`
-	CreatedAt     time.Time  `json:"created_at"`
+	// StableChildID is the derived launch idempotency key
+	// (sha256(parent_job, target_repo, target_ref) hex). Every launch of
+	// this link uses the SAME child run ID (the first 32 hex chars of the
+	// key), so a crash between reservation and child launch can never
+	// produce a duplicate child.
+	StableChildID string    `json:"stable_child_id,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 // DynamicStore persists atomically generated child jobs uploaded by a
@@ -270,9 +344,11 @@ type GeneratedJobVerifier func(parent model.Job, runJobCount int) error
 // DynamicStoreTx is the transactional dynamic-fragment contract: the
 // verification closure runs inside the same transaction as the fragment
 // insertion, so a stale lease or an over-cap run rejects the fragment
-// atomically.
+// atomically. The fragment's artifact contracts commit in the SAME
+// transaction as the jobs — a generated job with a required artifact has
+// its contract row visible before any completion can run.
 type DynamicStoreTx interface {
-	InsertGeneratedJobsTx(ctx context.Context, parentJobID string, depth int, jobs map[string]model.Job, deps map[string][]string, verify GeneratedJobVerifier) error
+	InsertGeneratedJobsTx(ctx context.Context, parentJobID string, depth int, jobs map[string]model.Job, deps map[string][]string, contracts map[string]map[string]ArtifactContract, verify GeneratedJobVerifier) error
 }
 
 // DownstreamStore is the durable cross-repo dispatch claim contract.
@@ -360,19 +436,35 @@ type ScheduleClaim struct {
 	Nominal    time.Time `json:"nominal"`
 }
 
+// DownstreamLaunchClaim folds the downstream child launch into the enqueue
+// transaction: the child run insertion and the downstream link update
+// (ChildRunID + StableChildID, reservation consumed) commit atomically, so
+// a crash between the reservation and the child launch can never produce a
+// duplicate child. LinkKey is the (parent_job, target_repo, target_ref)
+// claim key; StableChildID is the derived launch idempotency key (sha256
+// hex) whose first 32 hex chars are the child run ID. When the link is
+// already launched with the SAME stable child ID the enqueue returns
+// ErrDownstreamLaunched (the caller re-reads the existing child run).
+type DownstreamLaunchClaim struct {
+	LinkKey       string `json:"link_key"`
+	StableChildID string `json:"stable_child_id"`
+}
+
 // InsertCompiledRunRequest is the full atomic-enqueue payload: one run, its
 // compiled jobs, dependency edges, artifact contracts, superseded job IDs,
-// and the optional webhook-dedupe, quota-reservation and schedule-occurrence
-// claims. Everything commits in a single transaction or nothing does.
+// and the optional webhook-dedupe, quota-reservation, schedule-occurrence
+// and downstream-launch claims. Everything commits in a single transaction
+// or nothing does.
 type InsertCompiledRunRequest struct {
-	Run            model.Run
-	Jobs           map[string]model.Job
-	Deps           map[string][]string
-	Contracts      map[string]map[string]ArtifactContract
-	CancelPrevious []string
-	WebhookClaim   *WebhookClaim
-	Quota          *QuotaReservation
-	ScheduleClaim  *ScheduleClaim
+	Run              model.Run
+	Jobs             map[string]model.Job
+	Deps             map[string][]string
+	Contracts        map[string]map[string]ArtifactContract
+	CancelPrevious   []string
+	WebhookClaim     *WebhookClaim
+	Quota            *QuotaReservation
+	ScheduleClaim    *ScheduleClaim
+	DownstreamLaunch *DownstreamLaunchClaim
 }
 
 // RunEnqueueStore is the atomic enqueue contract: InsertCompiledRun persists
@@ -452,6 +544,82 @@ type SecretClaimStore interface {
 // once-only claim.
 type SecretClaimReleaser interface {
 	ReleaseSecretDelivery(ctx context.Context, jobID string, generation int64, secretName string) error
+}
+
+// ProfileStore is the durable server-owned runner-profile contract
+// (migration 0006). Profiles are the only source of a runner's scheduling
+// attributes: registration applies the profile linked to the runner's
+// certificate serial and ignores runner-supplied labels/region/capacity/
+// cost/capabilities/repositories. GetProfile/ListProfiles return
+// ErrNotFound for an unknown profile ID.
+type ProfileStore interface {
+	UpsertProfile(ctx context.Context, p model.RunnerProfile) error
+	GetProfile(ctx context.Context, id string) (model.RunnerProfile, error)
+	ListProfiles(ctx context.Context) ([]model.RunnerProfile, error)
+	// BindCertProfile links a certificate serial to a profile. A serial
+	// can only bind one profile; re-binding replaces the link.
+	BindCertProfile(ctx context.Context, serial, profileID string) error
+	// ProfileForSerial resolves the profile bound to a certificate serial
+	// (false when nothing is linked).
+	ProfileForSerial(ctx context.Context, serial string) (model.RunnerProfile, bool, error)
+}
+
+// RunnerTokenStore is the durable per-runner bearer credential contract
+// (migration 0006: runner_bearer_tokens). Only the SHA-256 digest of a
+// token is ever stored. RunnerIDForToken resolves a presented token digest
+// to its bound runner ID (false when unknown); HasRunnerTokens reports
+// whether any per-runner token exists (the server rejects the shared
+// dev-only runner token on runner-tier routes once per-runner credentials
+// are provisioned).
+type RunnerTokenStore interface {
+	UpsertRunnerToken(ctx context.Context, runnerID, tokenDigest string) error
+	RunnerIDForToken(ctx context.Context, tokenDigest string) (string, bool, error)
+	HasRunnerTokens(ctx context.Context) (bool, error)
+}
+
+// CertRevocationStore is the durable certificate revocation contract
+// (migration 0006: cert_revocations). RevokeCert records the revocation
+// transactionally so every replica rejects the serial; CertRevoked is the
+// replica-side check behind the server's short-TTL cache.
+type CertRevocationStore interface {
+	RevokeCert(ctx context.Context, serial, runnerID, reason string) error
+	CertRevoked(ctx context.Context, serial string) (bool, error)
+}
+
+// EnrollGrantRecord is the durable state of one single-use enrollment
+// grant. Raw grant values are never stored (the digest is the key).
+type EnrollGrantRecord struct {
+	ExpiresAt   time.Time
+	BoundLabels []string
+	Consumed    bool
+}
+
+// EnrollGrantStore is the durable enrollment grant contract (migration
+// 0006: enrollment_grants). PutEnrollGrant stores a fresh grant (digest is
+// the SHA-256 of the raw grant); GetEnrollGrant reads its state;
+// ConsumeEnrollGrant is the atomic single-use claim — the conditional
+// UPDATE matches only rows with consumed_at IS NULL and expires_at in the
+// future, so concurrent consumers yield exactly one winner. Unknown
+// digests return ErrNotFound, consumed rows ErrGrantConsumed and expired
+// rows ErrGrantExpired.
+type EnrollGrantStore interface {
+	PutEnrollGrant(ctx context.Context, digest string, expiresAt time.Time, boundLabels []string) error
+	GetEnrollGrant(ctx context.Context, digest string) (EnrollGrantRecord, bool, error)
+	ConsumeEnrollGrant(ctx context.Context, digest string, consumedBy string) (EnrollGrantRecord, error)
+}
+
+// TestHistoryStore is the SQL-backed test-intelligence history cache
+// (migration 0008: test_history). The single-row cache stores the
+// serialized per-test history aggregates (the same JSON shape the
+// filesystem history file uses) with a monotonically increasing version:
+// SaveTestHistory bumps the version atomically with the write, and
+// LoadTestHistory returns the current version so replicas reload the cache
+// when it advances and converge on identical sharding decisions. The
+// canonical history is always re-derivable from the durable test_results
+// reports; the cache is a read accelerator, never the source of truth.
+type TestHistoryStore interface {
+	LoadTestHistory(ctx context.Context) (version int64, stats []byte, err error)
+	SaveTestHistory(ctx context.Context, stats []byte) (version int64, err error)
 }
 
 // ValidateID checks the canonical control-plane identifier format produced

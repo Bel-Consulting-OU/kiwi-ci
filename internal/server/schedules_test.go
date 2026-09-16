@@ -20,6 +20,7 @@ on:
 jobs:
   nightly:
     runtime: container
+    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     steps:
       - run: echo nightly
 `

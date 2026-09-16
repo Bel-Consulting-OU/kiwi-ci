@@ -79,12 +79,19 @@ func verifyCompiledPayload(spec *pipeline.Spec, p *model.CompiledJobPayload, tru
 // effectivePolicySandbox is the runner-side extension of the compiled
 // payload's effective policy: policy.Capabilities carries the capability
 // intersection, and the daemon-level sandbox requirements (rootless,
-// read_only_rootfs) ride the same policy JSON as additive fields emitted by
-// the control plane's policy compilation. Absent fields decode as false, so
-// legacy payloads that carry no sandbox requirements are no-ops.
+// read_only_rootfs, non_root) ride the same policy JSON as additive fields
+// emitted by the control plane's policy compilation. Absent fields decode
+// as false, so legacy payloads that carry no sandbox requirements are
+// no-ops.
 type effectivePolicySandbox struct {
 	Rootless       bool `json:"rootless"`
 	ReadOnlyRootFS bool `json:"read_only_rootfs"`
+	// NonRoot demands the job run as an unprivileged user. The executor's
+	// pipeline.Sandbox struct has no NonRoot field yet, so there is no
+	// backend handoff today: the value is decoded (and surfaced to tests)
+	// but enforcement is pending executor adoption (container backend
+	// --user=65534:65534).
+	NonRoot bool `json:"non_root"`
 }
 
 // payloadSandboxRequirements decodes the sandbox requirements the effective
@@ -110,7 +117,9 @@ func payloadSandboxRequirements(p *model.CompiledJobPayload) (effectivePolicySan
 // into the compiled job before execution. Requirements can only strengthen:
 // a job that did not request rootless gains the requirement when the
 // effective policy demands it, and an explicit job-level request is never
-// weakened.
+// weakened. NonRoot has no pipeline.Sandbox field to hand off to (the
+// executor honors only Rootless/ReadOnlyRootFS today), so it is decoded but
+// left for the executor's non-root adoption.
 func applyEffectiveSandbox(cj *pipeline.CompiledJob, req effectivePolicySandbox) {
 	cj.Job.Sandbox.Rootless = cj.Job.Sandbox.Rootless || req.Rootless
 	cj.Job.Sandbox.ReadOnlyRootFS = cj.Job.Sandbox.ReadOnlyRootFS || req.ReadOnlyRootFS

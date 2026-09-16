@@ -55,18 +55,23 @@ func (s *Server) loadRunnerCA(dataDir string) error {
 	return nil
 }
 
-// EnsureRunnerCA makes sure a runner CA is available for enrollment,
-// generating and persisting one in dataDir when needed.
-func (s *Server) EnsureRunnerCA(dataDir string) error {
-	if s.RunnerCA != nil || dataDir == "" {
+// EnsureRunnerCA makes sure a runner CA is available for enrollment. Every
+// auto-CA path goes through the cluster key store: the CA material is ONE
+// atomic cluster-key object ("runner-ca") shared by all replicas, never
+// node-local dataDir files. In DB mode without a cluster key store this
+// refuses — a data-dir-local CA could never be shared with replicas.
+func (s *Server) EnsureRunnerCA() error {
+	if s.RunnerCA != nil {
 		return nil
 	}
-	ca, err := runnerpki.LoadOrCreateCA(dataDir)
+	if s.ClusterKeys == nil {
+		return fmt.Errorf("runner CA requires a cluster key store: configure --cluster-key-dir (with --data-dir) or pass explicit --runner-ca-cert/--runner-ca-key")
+	}
+	b, err := s.ClusterKeys.LoadOrCreate(clusterKindRunnerCA)
 	if err != nil {
 		return err
 	}
-	s.RunnerCA = ca
-	return nil
+	return s.setRunnerCAFromBlob(b)
 }
 
 // SetRunnerCA installs a runner CA from explicit PEM file paths.
@@ -151,12 +156,34 @@ func (s *Server) peerRunnerID(r *http.Request) (string, error) {
 	return s.RunnerCA.VerifyPeer(r.TLS.PeerCertificates[0], roots)
 }
 
-// bindRunnerIdentity binds a runner request to its TLS peer identity when
-// runner mTLS is enabled. The verified peer runner ID must match id (an empty
-// id skips the comparison, letting register() adopt the peer identity). With
-// mTLS disabled the bearer token is the identity and no additional
-// binding check applies.
+// bindRunnerIdentity binds a runner request to its authenticated identity:
+// the per-runner bearer token's bound runner ID and/or the TLS peer
+// certificate identity. When both mechanisms carry an identity they must
+// agree; a claimed id must equal the authenticated one (an empty id skips
+// the comparison, letting register() adopt the identity). With neither
+// mechanism configured the legacy shared bearer token is the identity and
+// no additional binding check applies.
 func (s *Server) bindRunnerIdentity(r *http.Request, id string) error {
+	bearerID, hasBearer := s.runnerBearerID(r)
+	if s.RunnerCA != nil && s.RequireRunnerClientCerts {
+		peerID, err := s.peerRunnerID(r)
+		if err != nil {
+			return err
+		}
+		if id != "" && id != peerID {
+			return fmt.Errorf("certificate identity %q does not match runner id %q", peerID, id)
+		}
+		if hasBearer && bearerID != peerID {
+			return fmt.Errorf("bearer identity %q does not match certificate identity %q", bearerID, peerID)
+		}
+		return nil
+	}
+	if hasBearer {
+		if id != "" && id != bearerID {
+			return fmt.Errorf("bearer identity %q does not match runner id %q", bearerID, id)
+		}
+		return nil
+	}
 	if s.RunnerCA == nil {
 		return nil
 	}
@@ -170,29 +197,50 @@ func (s *Server) bindRunnerIdentity(r *http.Request, id string) error {
 	return nil
 }
 
-// verifyRunnerIdentity reports whether the TLS peer certificate identity
-// matches the runner ID a request acts for. Lease tokens remain the
-// capability; this pins the transport identity to the claimed runner. With
-// mTLS disabled the bearer token is authoritative and this accepts.
-// Revoked certificates (CRL, see crl.go) are rejected after the identity
-// check: revocation is a control-plane decision that must not be bypassed
-// by reusing a still-valid certificate.
+// verifyRunnerIdentity reports whether the request's authenticated identity
+// matches the runner ID it acts for. Lease tokens remain the capability;
+// this pins the transport identity (per-runner bearer token and/or TLS
+// peer certificate) to the claimed runner. With neither configured (legacy
+// shared bearer mode) this accepts. Revoked certificates (CRL, see crl.go)
+// are rejected after the identity check: revocation is a control-plane
+// decision that must not be bypassed by reusing a still-valid certificate.
 func (s *Server) verifyRunnerIdentity(r *http.Request, payloadRunnerID string) bool {
-	if s.RunnerCA == nil {
-		return true
-	}
-	peerID, err := s.peerRunnerID(r)
-	if err != nil {
-		return false
-	}
-	if peerID != payloadRunnerID {
-		return false
-	}
-	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 && r.TLS.PeerCertificates[0] != nil {
-		serial := r.TLS.PeerCertificates[0].SerialNumber.Text(16)
-		if s.certSerialRevoked(serial) {
+	bearerID, hasBearer := s.runnerBearerID(r)
+	if s.RunnerCA != nil {
+		peerID, err := s.peerRunnerID(r)
+		if err != nil {
 			return false
 		}
+		if peerID != payloadRunnerID {
+			return false
+		}
+		if hasBearer && bearerID != payloadRunnerID {
+			return false
+		}
+		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 && r.TLS.PeerCertificates[0] != nil {
+			serial := r.TLS.PeerCertificates[0].SerialNumber.Text(16)
+			if s.certSerialRevoked(serial) {
+				return false
+			}
+		}
+		return true
+	}
+	if hasBearer {
+		return bearerID == payloadRunnerID
 	}
 	return true
+}
+
+// requestCertSerial resolves the certificate serial identifying the
+// registering runner: the TLS peer certificate when runner mTLS is in
+// play, otherwise the payload's cert_serial (bearer mode, where the serial
+// is the profile binding key). An empty result means no binding.
+func (s *Server) requestCertSerial(r *http.Request, payloadSerial string) string {
+	if s.RunnerCA != nil {
+		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 && r.TLS.PeerCertificates[0] != nil {
+			return r.TLS.PeerCertificates[0].SerialNumber.Text(16)
+		}
+		return ""
+	}
+	return strings.TrimSpace(payloadSerial)
 }

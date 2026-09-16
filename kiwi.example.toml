@@ -114,11 +114,21 @@
 # Admin bearer token (admin-tier API routes).
 # admin_token = ""
 
-# Runner bearer token shared by all runners.
+# Runner bearer token shared by all runners. This is a SHARED credential
+# without per-runner identity, so production refuses to rely on it: in
+# production runner traffic must authenticate with per-runner mTLS
+# certificates (runner_pki) or per-runner bearer tokens (runner_tokens_file
+# below). Dev/bootstrap only.
 # runner_token = ""
 
 # JSON token-store path for fine-grained principals (auth.TokenStore format).
 # tokens_file = "/etc/kiwi/tokens.json"
+
+# JSON file of per-runner bearer credentials: maps a runner ID to the
+# SHA-256 hex digest of that runner's token. In DB mode these are
+# provisioned into the durable runner_bearer_tokens table at startup;
+# in memory/fs mode they are kept in server memory.
+# runner_tokens_file = "/etc/kiwi/runner-tokens.json"
 
 [quota]
 # Repository/team admission and cost budgets.

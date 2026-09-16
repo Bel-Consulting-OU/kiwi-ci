@@ -16,6 +16,7 @@ const smokePipeline = `version: 1
 jobs:
   build:
     runtime: container
+    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     steps:
       - run: echo hi
 `

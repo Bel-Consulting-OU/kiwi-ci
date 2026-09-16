@@ -160,6 +160,14 @@ type Server struct {
 	// energy budget; exceeding them refuses new leases (0 = unlimited).
 	DailyCostLimit   float64
 	DailyEnergyLimit float64
+	// UntrustedCPUCeiling/UntrustedMemoryCeiling/UntrustedPIDCeiling are
+	// the server-side resource ceilings applied at enqueue to UNTRUSTED
+	// jobs that declare no CPU/memory/PID requests of their own: the
+	// executor then always applies limits to untrusted work. Defaults:
+	// 2.0 CPU, 4 GiB memory, 256 PIDs.
+	UntrustedCPUCeiling    float64
+	UntrustedMemoryCeiling int64
+	UntrustedPIDCeiling    int
 	// QuotaFailOpen, when true, lets enqueues and leases proceed when the
 	// usage store is unavailable instead of refusing them with
 	// BUDGET_STATE_UNAVAILABLE. Default false: the budget gate fails
@@ -256,6 +264,36 @@ type Server struct {
 	// crl maps revoked runner certificate serials to runner IDs; persisted
 	// as runner-crl.json under dataDir (crl.go).
 	crl map[string]string
+	// crlCache caches DB-mode revocation decisions (short TTL, backed by
+	// the durable cert_revocations rows) so any replica rejects a revoked
+	// certificate. crlMu guards it.
+	crlMu    sync.Mutex
+	crlCache map[string]crlCacheEntry
+
+	// RequireProfiles switches registration to profile-enforced semantics:
+	// runner-supplied labels/region/repositories/capacity/cost/power are
+	// ignored, capabilities are intersected with the linked profile (never
+	// enlarged), and a runner without a linked profile registers empty
+	// (capacity 0, no labels/region, no rates). Production wiring sets
+	// this; dev mode keeps the legacy self-reported registration.
+	RequireProfiles bool
+
+	// profiles and certProfiles are the memory-mode mirror of the durable
+	// runner_profiles/cert_profile_links tables (profiles.go); DB mode
+	// reads and writes go through the ProfileStore. Guarded by s.mu and
+	// persisted in the fs snapshot.
+	profiles     map[string]model.RunnerProfile
+	certProfiles map[string]string
+
+	// runnerTokens maps SHA-256 token digests to runner IDs for
+	// per-runner bearer credentials in memory/fs mode; DB mode consults
+	// the durable runner_bearer_tokens table. Guarded by s.mu.
+	runnerTokens map[string]string
+	// runnerTokensDBKnown caches the DB-mode "any per-runner tokens
+	// provisioned" answer for a short window.
+	runnerTokensDBMu    sync.Mutex
+	runnerTokensDBKnown bool
+	runnerTokensDBAt    time.Time
 
 	// secretReceipts is the durable one-time secret delivery record keyed by
 	// (jobID, generation, secret name); persisted as secrets-receipts.json
@@ -264,6 +302,9 @@ type Server struct {
 
 	// history is the persistent test-intelligence history (testshards.go).
 	history *testintelHistory
+	// historyDBVersion is the last durable test-history cache version loaded
+	// into the in-memory history in DB mode; guarded by s.mu.
+	historyDBVersion int64
 
 	// schedules/occurrences are the memory-mode schedule store; DB mode
 	// uses storage.ScheduleStore (schedules.go).
@@ -307,8 +348,11 @@ func New(token string) *Server {
 	}
 	return &Server{
 		Token: token, RunnerToken: token, AdminToken: token,
-		LeaseDuration: defaultLeaseDuration,
-		runs:          map[string]model.Run{}, jobs: map[string]model.Job{}, runners: map[string]model.Runner{}, artifacts: map[string]model.ArtifactRecord{}, reports: map[string]model.TestReport{}, deliveries: map[string]string{}, completions: map[string]model.CompletionReceipt{}, leaseKey: key, oidc: newOIDCSigner(),
+		LeaseDuration:          defaultLeaseDuration,
+		UntrustedCPUCeiling:    2.0,
+		UntrustedMemoryCeiling: 4 << 30,
+		UntrustedPIDCeiling:    256,
+		runs:                   map[string]model.Run{}, jobs: map[string]model.Job{}, runners: map[string]model.Runner{}, artifacts: map[string]model.ArtifactRecord{}, reports: map[string]model.TestReport{}, deliveries: map[string]string{}, completions: map[string]model.CompletionReceipt{}, leaseKey: key, oidc: newOIDCSigner(),
 		outbox:          NewOutbox(nil),
 		AuthStore:       auth.NewTokenStore(),
 		deployments:     map[string]model.Deployment{},
@@ -322,6 +366,9 @@ func New(token string) *Server {
 		schedules:       map[string]storage.Schedule{},
 		occurrences:     map[string]map[int64]string{},
 		downstreamLinks: map[string]storage.DownstreamLink{},
+		profiles:        map[string]model.RunnerProfile{},
+		certProfiles:    map[string]string{},
+		runnerTokens:    map[string]string{},
 		Logger:          logging.NewStructured(os.Stderr),
 		Metrics:         NewMetrics(),
 	}
@@ -462,6 +509,14 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 	if s.downstreamLinks == nil {
 		s.downstreamLinks = map[string]storage.DownstreamLink{}
 	}
+	s.profiles = snap.Profiles
+	if s.profiles == nil {
+		s.profiles = map[string]model.RunnerProfile{}
+	}
+	s.certProfiles = snap.CertProfileLinks
+	if s.certProfiles == nil {
+		s.certProfiles = map[string]string{}
+	}
 	s.rebuildArtifactContractsLocked()
 	// DB-mode artifact transport: payload bytes move through the shared
 	// CAS blob store (default: filesystem under dataDir/cas) so downloads
@@ -505,7 +560,7 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 				active = append(active, j.ID)
 			}
 		}
-		if r.Capacity < 1 {
+		if r.Capacity < 1 && !s.RequireProfiles {
 			r.Capacity = 1
 		}
 		r.ActiveJobs = active
@@ -623,9 +678,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/runners/enroll", s.enroll)
 	mux.HandleFunc("POST /api/v1/runners/{id}/next", s.next)
 	mux.HandleFunc("GET /api/v1/runners", s.listRunners)
+	mux.HandleFunc("GET /api/v1/runners/serving", s.listServingRunners)
 	mux.HandleFunc("POST /api/v1/runners/{id}/drain", s.runnerDrain)
 	mux.HandleFunc("POST /api/v1/runners/{id}/disable", s.runnerDisable)
 	mux.HandleFunc("POST /api/v1/runners/{id}/enable", s.runnerEnable)
+	mux.HandleFunc("POST /api/v1/runner-profiles", s.createRunnerProfile)
+	mux.HandleFunc("GET /api/v1/runner-profiles", s.listRunnerProfiles)
+	mux.HandleFunc("GET /api/v1/runner-profiles/{id}", s.getRunnerProfile)
+	mux.HandleFunc("PUT /api/v1/runner-profiles/{id}", s.updateRunnerProfile)
+	mux.HandleFunc("PUT /api/v1/runner-profiles/{id}/cert/{serial}", s.bindRunnerProfileCert)
 	mux.HandleFunc("GET /api/v1/audit", s.listAudit)
 	// The auth middleware runs inside statusLogger/recoverer and outside
 	// s.auth so authenticated principals are available to handlers; s.auth
@@ -638,7 +699,13 @@ func (s *Server) Handler() http.Handler {
 		h = s.RateLimiter.Wrap(h)
 	}
 	h = s.auth(h)
-	h = auth.Middleware(s.AuthStore, s.AdminToken, h, s.logf)
+	// The unified middleware classifies routes BEFORE generic bearer
+	// authentication: runner-tier routes (and public intake) pass through
+	// so the server's runner tier gate authenticates runner credentials —
+	// a non-empty principal store must never reject runner bearers.
+	h = auth.MiddlewareWithClassifier(s.AuthStore, s.AdminToken, func(r *http.Request) bool {
+		return runnerPath(r.Method, r.URL.Path)
+	}, h, s.logf)
 	h = s.observeHTTP(h)
 	h = s.tracingMiddleware(h)
 	return requestID(s.recoverer(s.statusLogger(h)))
@@ -672,17 +739,29 @@ func (s *Server) auth(next http.Handler) http.Handler {
 			return
 		case tierRunner:
 			// Fail closed: a runner-tier route must have a working runner
-			// credential. Either a non-empty runner bearer token or an
-			// enforced runner mTLS mode is required; a server with neither
-			// must refuse instead of silently accepting unauthenticated
-			// runner traffic.
-			if s.RunnerToken == "" && !(s.RunnerCA != nil && s.RequireRunnerClientCerts) {
+			// credential. Either a non-empty runner bearer token, enforced
+			// runner mTLS, or provisioned per-runner bearer tokens are
+			// required; a server with none must refuse instead of silently
+			// accepting unauthenticated runner traffic.
+			if s.RunnerToken == "" && !(s.RunnerCA != nil && s.RequireRunnerClientCerts) && !s.runnerTokensConfigured(r) {
 				http.Error(w, "runner authentication is not configured", http.StatusServiceUnavailable)
 				return
 			}
-			// Runner-tier routes: only the runner token bearer may pass.
-			// Handlers enforce the lease and mTLS identity binding on top.
-			if s.RunnerToken != "" && !bearerOK(r.Header.Get("Authorization"), s.RunnerToken) {
+			// Runner-tier routes authenticate with per-runner bearer
+			// tokens, enforced runner mTLS, or — in dev/legacy mode only —
+			// the shared runner token. Once per-runner credentials exist
+			// the shared token is rejected here (it is dev-only and can
+			// never impersonate a specific runner ID).
+			if s.runnerTokensConfigured(r) {
+				if _, ok := s.runnerBearerID(r); !ok {
+					if s.RunnerCA != nil && s.RequireRunnerClientCerts {
+						// mTLS-only runner: no bearer required.
+					} else {
+						http.Error(w, "unauthorized", http.StatusUnauthorized)
+						return
+					}
+				}
+			} else if s.RunnerToken != "" && !bearerOK(r.Header.Get("Authorization"), s.RunnerToken) {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
@@ -770,13 +849,16 @@ func (s *Server) adminOK(r *http.Request) bool {
 // requireAction enforces the per-action RBAC decision for authenticated
 // store principals. Requests without a principal are legacy mode: no admin
 // token and no store tokens are configured, so auth() gates nothing and
-// there is no identity to authorize against.
+// there is no identity to authorize against. Repository-scoped decisions
+// resolve STRICTLY to the canonical forge-host/owner/name identity (see
+// authorizeRepo): bare aliases are honored only when the principal map
+// explicitly declares them.
 func (s *Server) requireAction(w http.ResponseWriter, r *http.Request, action auth.Action, repo string, trusted bool) bool {
 	p, ok := auth.PrincipalFrom(r)
 	if !ok {
 		return true
 	}
-	if auth.Authorize(p, action, repo, trusted) {
+	if authorizeRepo(p, action, repo, trusted) {
 		return true
 	}
 	http.Error(w, "forbidden", http.StatusForbidden)
@@ -914,13 +996,12 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 		span.SetStatus(codes.Error, "opa denial")
 		return model.Run{}, denial
 	}
-	if err = policy.ValidateAdmissionWithCapabilities(spec, caps); err != nil {
-		return model.Run{}, err
-	}
-	// Organization policy restrictions (clone hosts, regions, digest pins)
-	// and capability-scoped declarations (downstream, generate) are
-	// enforced in the same admission step.
-	if err = s.admitPolicyRestrictions(in, spec, caps); err != nil {
+	// Canonical admission: structural validation, capability admission,
+	// capability-scoped declaration invariants, and (when a policy file is
+	// loaded) the org-policy host/region/digest restrictions. Generated
+	// fragments, schedules and downstream children use the SAME path — no
+	// second-class admission.
+	if err = s.admitCompiledSpec(repoIdentity{RepoURL: in.RepoURL, RepoFullName: in.RepoFullName}, spec, caps); err != nil {
 		return model.Run{}, err
 	}
 	pipelineDigest, err := pipeline.PipelineDigest(spec)
@@ -970,6 +1051,11 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 		if !in.Trusted && cj.Job.Runtime == "container" {
 			effectiveNetwork = "none"
 		}
+		// Untrusted jobs without declared resources get the server-side
+		// ceilings BEFORE the compiled payload is marshaled, so both the
+		// effective-job record and the persisted request fields carry them
+		// and the executor always applies limits to untrusted work.
+		cj = s.applyUntrustedResourceCeilings(cj, in.Trusted)
 		// The compiled job payload is the deterministic enqueue-time record
 		// the runner can verify its own recompilation against.
 		cjJSON, mErr := json.Marshal(cj)
@@ -979,9 +1065,9 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 		digestSum := sha256.Sum256(cjJSON)
 		jobDigest := hex.EncodeToString(digestSum[:])
 		jobContracts[jobIDs[key]] = buildJobContracts(cj)
-		created[jobIDs[key]] = model.Job{
+		j := model.Job{
 			ID: jobIDs[key], RunID: runID, Key: key, BaseKey: cj.BaseID, RepoURL: in.RepoURL, RepoFullName: in.RepoFullName, Ref: in.Ref, SHA: in.SHA,
-			Event: in.Event, Condition: cj.Job.If, DependencyStatus: model.StatusSuccess, Pipeline: in.Pipeline, Trusted: in.Trusted, ChangedFiles: append([]string{}, in.ChangedFiles...), Needs: needs,
+			Event: in.Event, Condition: cj.Job.If, DependencyStatus: model.StatusSuccess, Pipeline: in.Pipeline, Trusted: in.Trusted, ChangedFiles: append([]string{}, in.ChangedFiles...), ChangedFilesKnown: in.ChangedFilesKnown, Needs: needs,
 			RequiredLabels: labelsForJob(cj.Job), Network: effectiveNetwork, Environment: env, ApprovalRequired: cj.Job.Environment.Approval, EnvironmentBranches: append([]string{}, cj.Job.Environment.Branches...), EnvironmentConcurrency: cj.Job.Environment.Concurrency, OIDCAllowed: cj.Job.Permissions.IDToken, OIDCAudiences: cloneStrings(oidcAudiences),
 			DeclaredSecrets: declaredSecrets(spec, cj.Job),
 			Status:          model.StatusQueued, Priority: scheduler.DownstreamDepth(g, key), MaxInfraRetries: infraRetries, CreatedAt: now,
@@ -996,6 +1082,8 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 				EffectivePolicy: json.RawMessage(policyJSON),
 			},
 		}
+		applyCompiledJobFields(&j, cj, now)
+		created[jobIDs[key]] = j
 	}
 	// Artifact contracts ride the enqueue transaction (InsertCompiledRun)
 	// in DB mode and the in-memory maps in memory mode; nothing is
@@ -1017,6 +1105,23 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 			if existing, ok := occ[in.ScheduleClaim.Nominal.UTC().Unix()]; ok && existing != runID {
 				s.mu.Unlock()
 				return model.Run{}, storage.ErrScheduleClaimLost
+			}
+		}
+	}
+	// Downstream launch claim (memory mode): the link row and the child run
+	// commit under the SAME lock as the run insertion. A link already
+	// launched with the same stable child ID is an idempotent replay (the
+	// existing child run is returned); any other state fails closed.
+	if in.DownstreamLaunch != nil {
+		link, exists := s.downstreamLinks[in.DownstreamLaunch.LinkKey]
+		if exists && link.ChildRunID != "" {
+			if link.ChildRunID != runID {
+				s.mu.Unlock()
+				return model.Run{}, fmt.Errorf("downstream: launch claim lost")
+			}
+			if prior, ok := s.runs[runID]; ok {
+				s.mu.Unlock()
+				return prior, nil
 			}
 		}
 	}
@@ -1054,6 +1159,17 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 	}
 	if in.ScheduleClaim != nil {
 		s.claimScheduleOccurrenceLocked(in.ScheduleClaim.ScheduleID, in.ScheduleClaim.Nominal, runID)
+	}
+	if in.DownstreamLaunch != nil {
+		link, exists := s.downstreamLinks[in.DownstreamLaunch.LinkKey]
+		if !exists {
+			link = storage.DownstreamLink{CreatedAt: now}
+		}
+		link.ChildRunID = runID
+		link.StableChildID = in.DownstreamLaunch.StableChildID
+		link.Reserved = false
+		link.ReservedAt = nil
+		s.downstreamLinks[in.DownstreamLaunch.LinkKey] = link
 	}
 	s.auditLocked("run.queued", "scheduler", runID, "", "run queued", map[string]string{"event": in.Event})
 	s.scheduleStateLocked()
@@ -1145,6 +1261,9 @@ func (s *Server) enqueueDB(in SubmitRun, run model.Run, created map[string]model
 		Contracts:      jobContracts,
 		CancelPrevious: cancelPrevious,
 	}
+	if in.DownstreamLaunch != nil {
+		req.DownstreamLaunch = in.DownstreamLaunch
+	}
 	if forge, delivery, ok := webhookDeliveryForge(in.Metadata); ok {
 		req.WebhookClaim = &storage.WebhookClaim{Forge: forge, DeliveryID: delivery, RunID: run.ID}
 	}
@@ -1193,6 +1312,14 @@ func (s *Server) enqueueDB(in SubmitRun, run model.Run, created map[string]model
 		}
 		return model.Run{}, err
 	case errors.Is(err, storage.ErrScheduleClaimLost):
+		return model.Run{}, err
+	case errors.Is(err, storage.ErrDownstreamLaunched):
+		// The link was already launched with the SAME stable child ID (a
+		// replayed dispatch): return the existing child run instead of a
+		// duplicate.
+		if prior, gerr := s.DB.GetRun(ctx, run.ID); gerr == nil {
+			return prior, nil
+		}
 		return model.Run{}, err
 	default:
 		var qe *storage.QuotaExceededError
@@ -1456,28 +1583,34 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	// Server-side registration validation: protocol range (clamped),
-	// capacity, labels, region and finite non-negative usage rates. The
-	// validation writes the clamped protocol range back into in.
+	// The runner may report version, protocol and health/load only. The
+	// scheduling attributes (labels, region, repositories, capacity, cost,
+	// power, capabilities) are server-owned: with profile enforcement the
+	// payload values are ignored entirely and the linked profile supplies
+	// them; the hardware capabilities the runner reports are INTERSECTED
+	// with the profile (never enlarging it).
 	info := RunnerInfo{
 		ID:          in.ID,
-		Labels:      in.Labels,
-		Region:      in.Region,
-		Capacity:    in.Capacity,
 		ProtocolMin: in.ProtocolMin,
 		ProtocolMax: in.ProtocolMax,
-		CostPerHour: in.CostPerHour,
-		PowerWatts:  in.PowerWatts,
+	}
+	if !s.RequireProfiles {
+		// Legacy dev-mode registration keeps validating (and consuming)
+		// the self-reported scheduling attributes so existing dev flows
+		// behave unchanged.
+		info.Labels = in.Labels
+		info.Region = in.Region
+		info.Capacity = in.Capacity
+		info.CostPerHour = in.CostPerHour
+		info.PowerWatts = in.PowerWatts
 	}
 	if err := validateRunnerRegistration(&info); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	in.ProtocolMin, in.ProtocolMax = info.ProtocolMin, info.ProtocolMax
-	// With runner mTLS enabled the TLS peer certificate is the identity: it
-	// must match the claimed ID (an empty ID adopts the certificate
-	// identity). Without mTLS the bearer token authenticated by auth() is
-	// the identity.
+	// Identity binding: mTLS peer certificate and/or the per-runner bearer
+	// token must agree with the claimed ID (an empty ID adopts them).
 	if err := s.bindRunnerIdentity(r, in.ID); err != nil {
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
@@ -1485,6 +1618,11 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	if in.ID == "" && s.RunnerCA != nil {
 		if peerID, err := s.peerRunnerID(r); err == nil {
 			in.ID = peerID
+		}
+	}
+	if in.ID == "" {
+		if rid, ok := s.runnerBearerID(r); ok {
+			in.ID = rid
 		}
 	}
 	if in.ID == "" {
@@ -1498,6 +1636,36 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	if in.Name == "" {
 		in.Name = in.ID
 	}
+	// Profile resolution: the certificate serial (TLS peer cert, or the
+	// payload cert_serial in bearer mode where it is the profile binding
+	// key) selects the profile that supplies every scheduling attribute.
+	serial := s.requestCertSerial(r, in.CertSerial)
+	reported := append([]string{}, in.Capabilities...)
+	profile, hasProfile, perr := s.profileForSerial(r.Context(), serial)
+	if perr != nil {
+		s.logError("register: profile lookup failed", "serial", serial, "error", perr.Error())
+	}
+	if hasProfile {
+		in.Labels = append([]string(nil), profile.Labels...)
+		in.Region = profile.Region
+		in.AllowedRepositories = append([]string(nil), profile.Repositories...)
+		in.Capabilities = intersectCapabilities(profile.Capabilities, reported)
+		in.Capacity = profile.MaxCapacity
+		in.CostPerHour = profile.CostPerHour
+		in.PowerWatts = profile.PowerWatts
+	} else if s.RequireProfiles {
+		// Without a linked profile the runner registers empty: no labels,
+		// no region (cannot match constrained jobs), capacity 0 (receives
+		// nothing) and no cost rates.
+		in.Labels = nil
+		in.Region = ""
+		in.AllowedRepositories = nil
+		in.Capabilities = nil
+		in.Capacity = 0
+		in.CostPerHour = 0
+		in.PowerWatts = 0
+	}
+	in.CertSerial = serial
 	now := time.Now().UTC()
 	if s.DB != nil {
 		old, gerr := s.DB.GetRunner(r.Context(), in.ID)
@@ -1517,7 +1685,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 			in.Completed = old.Completed
 			in.Failed = old.Failed
 		}
-		if in.Capacity < 1 {
+		if in.Capacity < 1 && !s.RequireProfiles {
 			in.Capacity = 1
 		}
 		in.LastSeen = now
@@ -1552,7 +1720,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		in.Completed = old.Completed
 		in.Failed = old.Failed
 	}
-	if in.Capacity < 1 {
+	if in.Capacity < 1 && !s.RequireProfiles {
 		in.Capacity = 1
 	}
 	in.LastSeen = now
@@ -1571,13 +1739,14 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, in)
 }
+
+// listRunners is the FULL runner inventory: it requires runner_manage (or
+// admin). Repository-scoped readers use /runners/serving for the redacted
+// projection instead.
 func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAction(w, r, auth.ActionRead, "", false) {
+	if !s.requireAction(w, r, auth.ActionRunnerManage, "", false) {
 		return
 	}
-	// Scoped list: a repository-scoped principal sees runners that serve
-	// (or are about to serve) its repositories; idle runners carry no
-	// repository data and stay visible.
 	if s.DB != nil {
 		out, err := s.DB.ListRunners(r.Context())
 		if err != nil {
@@ -1586,9 +1755,6 @@ func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
 		}
 		dto := make([]v1.RunnerDTO, 0, len(out))
 		for _, x := range out {
-			if !s.runnerVisible(r, x) {
-				continue
-			}
 			dto = append(dto, v1.RunnerDTOFrom(x))
 		}
 		writeJSON(w, http.StatusOK, dto)
@@ -1600,13 +1766,7 @@ func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
 		snapshot = append(snapshot, x)
 	}
 	s.mu.Unlock()
-	out := make([]model.Runner, 0, len(snapshot))
-	for _, x := range snapshot {
-		if !s.runnerVisible(r, x) {
-			continue
-		}
-		out = append(out, x)
-	}
+	out := append([]model.Runner(nil), snapshot...)
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	dto := make([]v1.RunnerDTO, 0, len(out))
 	for _, x := range out {
@@ -1615,33 +1775,72 @@ func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, dto)
 }
 
-// runnerVisible reports whether a runner is visible to the request's
-// principal. Runners without active jobs are visible to any reader; runners
-// with active jobs are visible when at least one of those jobs' repositories
-// is.
-func (s *Server) runnerVisible(r *http.Request, ri model.Runner) bool {
-	if len(ri.ActiveJobs) == 0 {
-		return true
+// listServingRunners implements GET /api/v1/runners/serving: the redacted
+// runner projection for read principals. Only runners actively serving at
+// least one job whose repository the principal may read are returned, and
+// the DTO exposes just {ID, Name, Busy, LastSeen, ActiveJobs (filtered to
+// visible repositories)} — no labels, no metadata, no region.
+func (s *Server) listServingRunners(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAction(w, r, auth.ActionRead, "", false) {
+		return
+	}
+	var all []model.Runner
+	if s.DB != nil {
+		out, err := s.DB.ListRunners(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		all = out
+	} else {
+		s.mu.Lock()
+		for _, x := range s.runners {
+			all = append(all, x)
+		}
+		s.mu.Unlock()
 	}
 	allowed, restricted := s.visibleRepos(r)
-	if !restricted {
-		return true
-	}
-	for _, jobID := range ri.ActiveJobs {
-		job, err := s.jobForLease(r.Context(), jobID)
-		if err != nil {
+	repoFilter := strings.TrimSpace(r.URL.Query().Get("repo"))
+	dto := make([]v1.RunnerServingDTO, 0)
+	for _, ri := range all {
+		var visibleJobs []string
+		for _, jobID := range ri.ActiveJobs {
+			job, err := s.jobForLease(r.Context(), jobID)
+			if err != nil {
+				continue
+			}
+			run, err := s.runForAuth(r.Context(), job.RunID)
+			if err != nil {
+				continue
+			}
+			if repoFilter != "" {
+				canon := canonicalRepoForRun(run)
+				if repoFilter != run.RepoFullName && repoFilter != canon && repoFilter != auth.CanonicalRepoID("", run.RepoFullName) {
+					continue
+				}
+			}
+			if !restricted {
+				visibleJobs = append(visibleJobs, jobID)
+				continue
+			}
+			canon := canonicalRepoForRun(run)
+			if allowed[canon] || allowed[run.RepoFullName] {
+				visibleJobs = append(visibleJobs, jobID)
+				continue
+			}
+			if _, bare, hasHost := splitCanonicalKey(canon); hasHost && allowed[bare] {
+				visibleJobs = append(visibleJobs, jobID)
+			}
+		}
+		if len(visibleJobs) == 0 {
 			continue
 		}
-		run, err := s.runForAuth(r.Context(), job.RunID)
-		if err != nil {
-			continue
-		}
-		canon := canonicalRepoForRun(run)
-		if allowed[canon] || allowed[run.RepoFullName] || allowed[auth.CanonicalRepoID("", run.RepoFullName)] {
-			return true
-		}
+		dto = append(dto, v1.RunnerServingDTOFrom(ri, visibleJobs))
 	}
-	return false
+	if dto == nil {
+		dto = []v1.RunnerServingDTO{}
+	}
+	writeJSON(w, http.StatusOK, dto)
 }
 
 // runnerDrain marks a runner as draining: it finishes its active jobs and
@@ -1859,6 +2058,15 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	}
 	ri.LastSeen = now
 	if ri.Capacity < 1 {
+		if s.RequireProfiles {
+			// Profile semantics: capacity 0 (no linked profile) receives
+			// nothing. The legacy clamp below applies only to the
+			// self-reported dev-mode registration.
+			s.runners[id] = ri
+			_ = s.persistLocked()
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		ri.Capacity = 1
 	}
 	// Disabled runners receive no leases at all: their active jobs were
@@ -1896,6 +2104,15 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if !regionSatisfied(ri.Region, j.PlacementRegions) {
+			continue
+		}
+		// The claim predicate mirrors scheduler.Lease: canonical repo
+		// authorization and capability compatibility gate candidates
+		// before they can be leased.
+		if !runnerAllowedRepoMemory(ri, j) {
+			continue
+		}
+		if !runnerHasCapabilityMemory(ri, j) {
 			continue
 		}
 		if environmentAtCapacityScoped(j, s.jobs) {
@@ -2057,8 +2274,17 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	if !s.verifyRunnerIdentity(r, in.RunnerID) {
-		http.Error(w, "runner identity mismatch", http.StatusForbidden)
+	_, authErr := s.authorizeRunnerLease(r, in.RunnerID, in.LeaseToken, in.LeaseGeneration)
+	if authErr != nil {
+		if errors.Is(authErr, errStaleLease) {
+			// A cancelled job's lease is dead; report the cancellation
+			// instead of a conflict so the runner stops work immediately.
+			if cur, gerr := s.jobForLease(r.Context(), jobID); gerr == nil && cur.Status == model.StatusCancelled {
+				writeJSON(w, http.StatusOK, HeartbeatResponse{Cancel: true})
+				return
+			}
+		}
+		s.writeLeaseAuthError(w, r, authErr)
 		return
 	}
 	if s.Sched != nil {
@@ -2068,22 +2294,22 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	j, ok := s.jobs[jobID]
+	cur, ok := s.jobs[jobID]
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
-	if j.Status == model.StatusCancelled {
+	if cur.Status == model.StatusCancelled {
 		writeJSON(w, http.StatusOK, HeartbeatResponse{Cancel: true})
 		return
 	}
-	if !s.validActiveLease(j, in.RunnerID, in.LeaseToken, in.LeaseGeneration, now) {
+	if !s.validActiveLease(cur, in.RunnerID, in.LeaseToken, in.LeaseGeneration, now) {
 		http.Error(w, "stale or invalid lease", http.StatusConflict)
 		return
 	}
 	exp := now.Add(s.leaseDuration())
-	j.LeaseExpiresAt = &exp
-	s.jobs[jobID] = j
+	cur.LeaseExpiresAt = &exp
+	s.jobs[jobID] = cur
 	if ri, ok := s.runners[in.RunnerID]; ok {
 		ri.LastSeen = now
 		s.runners[in.RunnerID] = ri
@@ -2138,17 +2364,18 @@ func (s *Server) log(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "log line exceeds size limits", http.StatusBadRequest)
 		return
 	}
-	if !s.verifyRunnerIdentity(r, in.RunnerID) {
-		http.Error(w, "runner identity mismatch", http.StatusForbidden)
+	j, authErr := s.authorizeRunnerLease(r, in.RunnerID, in.LeaseToken, in.LeaseGeneration)
+	if authErr != nil {
+		s.writeLeaseAuthError(w, r, authErr)
 		return
 	}
 	now := time.Now().UTC()
 	if s.DB != nil {
-		s.logDB(w, r, jobID, in, now)
+		s.logDB(w, r, jobID, in, j, now)
 		return
 	}
 	s.mu.Lock()
-	j, ok := s.jobs[jobID]
+	cur, ok := s.jobs[jobID]
 	if !ok {
 		s.mu.Unlock()
 		http.NotFound(w, r)
@@ -2157,13 +2384,13 @@ func (s *Server) log(w http.ResponseWriter, r *http.Request) {
 	// Strict: a cancelled (or otherwise non-running) job no longer accepts
 	// log lines. The runner logs cancellation locally before completing, so
 	// no final flush grace window is needed.
-	if !s.validActiveLease(j, in.RunnerID, in.LeaseToken, in.LeaseGeneration, now) {
+	if !s.validActiveLease(cur, in.RunnerID, in.LeaseToken, in.LeaseGeneration, now) {
 		s.mu.Unlock()
 		http.Error(w, "stale or invalid lease", http.StatusConflict)
 		return
 	}
 	s.logSeq++
-	e := model.LogEntry{Seq: s.logSeq, RunID: j.RunID, JobID: j.ID, JobKey: j.Key, Step: in.Step, Line: in.Line, CreatedAt: time.Now().UTC()}
+	e := model.LogEntry{Seq: s.logSeq, RunID: cur.RunID, JobID: cur.ID, JobKey: cur.Key, Step: in.Step, Line: in.Line, CreatedAt: time.Now().UTC()}
 	s.mu.Unlock()
 	if s.store != nil {
 		if err := s.store.AppendLog(e); err != nil {
@@ -2174,25 +2401,14 @@ func (s *Server) log(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// logDB validates the lease against the durable job row and appends the log
-// line through the store. The seq is a wall-clock nanosecond timestamp so it
-// stays monotonic across restarts and instances without a shared counter.
-func (s *Server) logDB(w http.ResponseWriter, r *http.Request, jobID string, in LogLine, now time.Time) {
+// logDB appends the log line through the store. The sequence is NOT
+// wall-clock derived: the store allocates it from the identity-sequenced
+// log_entries table inside the append transaction (INSERT ... RETURNING
+// seq), so appends stay strictly increasing regardless of clock ordering
+// across replicas.
+func (s *Server) logDB(w http.ResponseWriter, r *http.Request, jobID string, in LogLine, j model.Job, now time.Time) {
 	ctx := r.Context()
-	j, err := s.DB.GetJob(ctx, jobID)
-	if errors.Is(err, storage.ErrNotFound) {
-		http.NotFound(w, r)
-		return
-	}
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	if !s.validActiveLease(j, in.RunnerID, in.LeaseToken, in.LeaseGeneration, now) {
-		http.Error(w, "stale or invalid lease", http.StatusConflict)
-		return
-	}
-	e := model.LogEntry{Seq: time.Now().UnixNano(), RunID: j.RunID, JobID: j.ID, JobKey: j.Key, Step: in.Step, Line: in.Line, CreatedAt: time.Now().UTC()}
+	e := model.LogEntry{RunID: j.RunID, JobID: j.ID, JobKey: j.Key, Step: in.Step, Line: in.Line, CreatedAt: now}
 	if err := s.DB.AppendLog(ctx, e); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -2212,10 +2428,6 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "error message exceeds 64 KiB", http.StatusBadRequest)
 		return
 	}
-	if !s.verifyRunnerIdentity(r, in.RunnerID) {
-		http.Error(w, "runner identity mismatch", http.StatusForbidden)
-		return
-	}
 	hash, err := completionResultHash(in.Status, in.Error, in.Outputs)
 	if err != nil {
 		http.Error(w, "invalid outputs payload", http.StatusBadRequest)
@@ -2226,23 +2438,43 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
+	j, authErr := s.authorizeRunnerLease(r, in.RunnerID, in.LeaseToken, in.LeaseGeneration)
+	if authErr != nil {
+		if errors.Is(authErr, errStaleLease) {
+			// Completion is idempotent for the active generation. A previous
+			// completion may already have made the job terminal and cleared
+			// its lease; a duplicate delivery of the same result is
+			// acknowledged from the receipt instead of being rejected, and
+			// re-runs the post-completion effects that may have failed after
+			// the durable completion committed.
+			s.mu.Lock()
+			rec, has := s.completions[completionReceiptKey(jobID, in.LeaseGeneration, in.RunnerID)]
+			s.mu.Unlock()
+			if has && rec.ResultHash == hash {
+				if derr := s.reconcileCompletionEffects(context.Background(), jobID); derr != nil {
+					http.Error(w, derr.Error(), http.StatusInternalServerError)
+					return
+				}
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+		}
+		s.writeLeaseAuthError(w, r, authErr)
+		return
+	}
 	s.mu.Lock()
-	j, ok := s.jobs[jobID]
-	if !ok {
+	// Re-validate against the live job under the lock: a concurrent
+	// completion of the same job may have raced the authorization above.
+	cur, still := s.jobs[jobID]
+	if !still {
 		s.mu.Unlock()
 		http.NotFound(w, r)
 		return
 	}
-	// Completion is idempotent for the active generation. A previous
-	// completion may already have made the job terminal and cleared its
-	// lease; a duplicate delivery of the same result is acknowledged from
-	// the receipt instead of being rejected.
-	if !s.validActiveLease(j, in.RunnerID, in.LeaseToken, in.LeaseGeneration, now) {
+	if !s.validActiveLease(cur, in.RunnerID, in.LeaseToken, in.LeaseGeneration, now) {
 		if rec, has := s.completions[completionReceiptKey(jobID, in.LeaseGeneration, in.RunnerID)]; has && rec.ResultHash == hash {
 			s.mu.Unlock()
-			// Idempotent replay: re-apply post-completion effects that may
-			// have failed after the durable completion committed.
-			if derr := s.recordDownstreamIntentsForCompleted(context.Background(), jobID); derr != nil {
+			if derr := s.reconcileCompletionEffects(context.Background(), jobID); derr != nil {
 				http.Error(w, derr.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -2253,6 +2485,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "stale or invalid lease", http.StatusConflict)
 		return
 	}
+	j = cur
 	if !j.Status.Terminal() {
 		st := in.Status
 		if st != model.StatusSuccess && st != model.StatusFailure && st != model.StatusCancelled && st != model.StatusSkipped {
@@ -2290,8 +2523,10 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	}
 	// Usage accounting: cost/energy from the frozen lease-time rates and
 	// the wall-clock duration, aggregated into the usage metrics and the
-	// trailing-24h budget window.
+	// trailing-24h budget window. The usage_recorded marker makes the
+	// outbox-carried usage_account effect a no-op on replay.
 	s.recordJobUsage(&j, now)
+	j.UsageRecorded = true
 	// The lease is spent: clear all lease state so nothing can reuse it,
 	// then dedupe future retries of this exact completion via the receipt.
 	j.LeaseRunnerID = ""
@@ -2315,6 +2550,13 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	run := s.runs[runID]
 	_ = s.persistLocked()
 	s.mu.Unlock()
+	// The completion effects are recorded durably into the outbox (they run
+	// again — as marker-guarded no-ops — when the flush dispatches them, and
+	// for real when a crash lost the inline pass above).
+	if err := s.enqueueCompletionEffects(j, run); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	// A successful job with a downstream declaration records the launch
 	// claim and enqueues the dispatch intent (exactly-once via the claim).
 	// A persistence failure fails the completion response (500): the
@@ -2333,29 +2575,50 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 }
 
 // completeDB applies the completion through the scheduler's transactional
-// CompleteJob. Idempotent replay is recognized from the durable receipt
-// first (fast path), and again after a lease-conflict error in case the
-// completion raced a concurrent replay.
+// CompleteJob. The transport identity binds first; idempotent replay is
+// recognized from the durable receipt before any lease validation (fast
+// path), and the shared authorizeRunnerLease gate validates job + lease for
+// the primary path. Every post-transaction effect runs through the
+// idempotent reconcileCompletionEffects: the completion transaction already
+// queued the effect intents durably, and the markers prevent replays from
+// double-accounting.
 func (s *Server) completeDB(w http.ResponseWriter, r *http.Request, jobID string, in Complete, hash string) {
 	ctx := r.Context()
+	// The identity gate runs before everything, including the receipt fast
+	// path: a replay must still present the bound transport identity.
+	if !s.verifyRunnerIdentity(r, in.RunnerID) {
+		http.Error(w, "runner identity mismatch", http.StatusForbidden)
+		return
+	}
+	// Fast path: the exact completion (job, generation, runner) was already
+	// applied and its receipt persisted; acknowledge it and defensively
+	// reconcile the post-completion effects before acknowledging.
 	if rec, has, err := s.DB.HasCompletionReceipt(ctx, jobID, in.LeaseGeneration, in.RunnerID); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	} else if has && rec.ResultHash == hash {
+		if derr := s.reconcileCompletionEffects(ctx, jobID); derr != nil {
+			http.Error(w, derr.Error(), http.StatusInternalServerError)
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	j, err := s.DB.GetJob(ctx, jobID)
-	if errors.Is(err, storage.ErrNotFound) {
-		http.NotFound(w, r)
-		return
-	}
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	if !s.validActiveLease(j, in.RunnerID, in.LeaseToken, in.LeaseGeneration, time.Now().UTC()) {
-		http.Error(w, "stale or invalid lease", http.StatusConflict)
+	j, authErr := s.authorizeRunnerLease(r, in.RunnerID, in.LeaseToken, in.LeaseGeneration)
+	if authErr != nil {
+		if errors.Is(authErr, errStaleLease) {
+			// The completion may have raced a concurrent replay: the durable
+			// receipt wins, and its effects are reconciled before ack.
+			if rec, has, herr := s.DB.HasCompletionReceipt(ctx, jobID, in.LeaseGeneration, in.RunnerID); herr == nil && has && rec.ResultHash == hash {
+				if derr := s.reconcileCompletionEffects(ctx, jobID); derr != nil {
+					http.Error(w, derr.Error(), http.StatusInternalServerError)
+					return
+				}
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+		}
+		s.writeLeaseAuthError(w, r, authErr)
 		return
 	}
 	st := in.Status
@@ -2389,7 +2652,7 @@ func (s *Server) completeDB(w http.ResponseWriter, r *http.Request, jobID string
 		if rec, has, herr := s.DB.HasCompletionReceipt(ctx, jobID, in.LeaseGeneration, in.RunnerID); herr == nil && has && rec.ResultHash == hash {
 			// Idempotent replay: re-apply post-completion effects that may
 			// have failed after the durable completion committed.
-			if derr := s.recordDownstreamIntentsForCompleted(ctx, jobID); derr != nil {
+			if derr := s.reconcileCompletionEffects(ctx, jobID); derr != nil {
 				http.Error(w, derr.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -2399,56 +2662,18 @@ func (s *Server) completeDB(w http.ResponseWriter, r *http.Request, jobID string
 		http.Error(w, "stale or invalid lease", http.StatusConflict)
 		return
 	}
-	s.finishDeploymentDB(ctx, j, st, time.Now().UTC())
-	s.metricObserve("kiwi_job_duration_seconds", completionDurationSeconds(j), nil)
-	// Usage accounting: cost/energy from the frozen lease-time rates, then
-	// persisted back into the job payload for UsageStore.RecentUsage.
-	if cur, gerr := s.DB.GetJob(ctx, jobID); gerr == nil {
-		if cur.StartedAt != nil {
-			finished := time.Now().UTC()
-			if cur.FinishedAt != nil {
-				finished = *cur.FinishedAt
-			}
-			s.recordJobUsage(&cur, finished)
-			if uerr := s.DB.UpdateJob(ctx, cur); uerr != nil {
-				s.logError("complete: persist job usage failed", "job", jobID, "error", uerr.Error())
-			}
-		}
-		// A successful job with a downstream declaration records the launch
-		// claim and enqueues the dispatch intent (exactly-once via the
-		// claim row). A persistence failure fails the completion response
-		// (500): the durable completion stands, and the idempotent replay
-		// re-attempts the recording.
-		if cur.Status == model.StatusSuccess {
-			if run, gerr := s.DB.GetRun(ctx, j.RunID); gerr == nil {
-				if derr := s.recordDownstreamIntents(ctx, cur, run); derr != nil {
-					http.Error(w, derr.Error(), http.StatusInternalServerError)
-					return
-				}
-			}
-		}
-	}
-	// wait=true aggregation: the completed job's run may have downstream
-	// children of its own, and may itself be a child of another run.
-	s.adjustRunForChildrenDB(ctx, j.RunID)
-	s.refreshDownstreamParentsDB(ctx, j.RunID)
-	if run, gerr := s.DB.GetRun(ctx, j.RunID); gerr == nil && run.Status.Terminal() {
-		s.publishGitHubStatus(run)
+	// The completion transaction already created the durable effect intents
+	// under their deterministic IDs; queue the local copies so this
+	// instance's flush loop dispatches (and acks) them promptly.
+	s.enqueueCompletionEffectsLocal(jobID, j.RunID, in.LeaseGeneration)
+	// Apply every post-transaction effect now; a failure fails the
+	// completion response (500) and the idempotent receipt replay
+	// re-attempts the reconciliation.
+	if derr := s.reconcileCompletionEffects(ctx, jobID); derr != nil {
+		http.Error(w, derr.Error(), http.StatusInternalServerError)
+		return
 	}
 	w.WriteHeader(http.StatusNoContent)
-}
-
-// completionDurationSeconds derives the wall-clock job duration at
-// completion from the job's start/finish timestamps.
-func completionDurationSeconds(j model.Job) float64 {
-	if j.StartedAt == nil {
-		return 0
-	}
-	finish := time.Now().UTC()
-	if j.FinishedAt != nil {
-		finish = *j.FinishedAt
-	}
-	return finish.Sub(*j.StartedAt).Seconds()
 }
 
 // completionResultHash canonicalizes a completion payload so identical
@@ -2723,7 +2948,7 @@ func rerunTrusted(r *http.Request, old model.Run) bool {
 		// identity to authorize; keep the previous trust.
 		return true
 	}
-	return auth.Authorize(p, auth.ActionTrustedRun, canonicalRepoForRun(old), true)
+	return authorizeRepo(p, auth.ActionTrustedRun, canonicalRepoForRun(old), true)
 }
 
 func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
@@ -3117,7 +3342,7 @@ func (s *Server) persistLocked() error {
 		// snapshot must not be overwritten with stale memory maps.
 		return nil
 	}
-	return s.store.Save(storage.Snapshot{Version: 1, Runs: s.runs, Jobs: s.jobs, Runners: s.runners, Artifacts: s.artifacts, Reports: s.reports, DownstreamLinks: s.downstreamLinks})
+	return s.store.Save(storage.Snapshot{Version: 1, Runs: s.runs, Jobs: s.jobs, Runners: s.runners, Artifacts: s.artifacts, Reports: s.reports, DownstreamLinks: s.downstreamLinks, Profiles: s.profiles, CertProfileLinks: s.certProfiles})
 }
 func (s *Server) leaseDuration() time.Duration {
 	if s.LeaseDuration <= 0 {
@@ -3143,6 +3368,75 @@ func environmentBranchAllowed(ref string, patterns []string) bool {
 	return false
 }
 
+// runnerAllowedRepoMemory mirrors scheduler.Lease's canonical repository
+// authorization for the in-memory next(): a runner whose profile restricts
+// repositories only sees candidates inside its allowlist.
+func runnerAllowedRepoMemory(ri model.Runner, j model.Job) bool {
+	if len(ri.AllowedRepositories) == 0 {
+		return true
+	}
+	canon := auth.CanonicalRepoID(repoHost(j.RepoURL), j.RepoFullName)
+	for _, allowed := range ri.AllowedRepositories {
+		if allowed == canon || (j.RepoFullName != "" && allowed == j.RepoFullName) {
+			return true
+		}
+	}
+	return false
+}
+
+// runnerHasCapabilityMemory mirrors scheduler.Lease's capability
+// compatibility for the in-memory next(): a job whose runtime capability
+// the runner does not declare is never leased. Empty declared capabilities
+// (or an undeterminable job runtime) keep the check vacuous.
+func runnerHasCapabilityMemory(ri model.Runner, j model.Job) bool {
+	if len(ri.Capabilities) == 0 {
+		return true
+	}
+	runtime := jobRuntimeCapabilityMemory(j)
+	if runtime == "" {
+		return true
+	}
+	for _, c := range ri.Capabilities {
+		if c == runtime {
+			return true
+		}
+	}
+	return false
+}
+
+// jobRuntimeCapabilityMemory extracts the job's runtime capability from the
+// compiled payload (the memory-mode mirror of the scheduler's payload-based
+// derivation).
+func jobRuntimeCapabilityMemory(j model.Job) string {
+	if j.CompiledJobPayload == nil || j.CompiledJobPayload.EffectiveJob == nil {
+		return ""
+	}
+	var b []byte
+	switch v := j.CompiledJobPayload.EffectiveJob.(type) {
+	case json.RawMessage:
+		b = v
+	case []byte:
+		b = v
+	case string:
+		b = []byte(v)
+	default:
+		var err error
+		if b, err = json.Marshal(v); err != nil {
+			return ""
+		}
+	}
+	var cj pipeline.CompiledJob
+	if err := json.Unmarshal(b, &cj); err != nil {
+		return ""
+	}
+	switch cj.Job.Runtime {
+	case "container", "tart", "native":
+		return cj.Job.Runtime
+	default:
+		return ""
+	}
+}
+
 func labelsSatisfied(have, need []string) bool {
 	m := map[string]bool{}
 	for _, x := range have {
@@ -3158,11 +3452,15 @@ func labelsSatisfied(have, need []string) bool {
 
 // regionSatisfied reports whether a runner in the given region may take a
 // job: a job with placement regions only leases to a runner whose region is
-// in the set. Runners without a region and jobs without region constraints
-// are unaffected (label matching is unchanged).
+// in the set. A runner WITHOUT a region can never satisfy a region-
+// constrained job (empty region fails matching — parity with the DB
+// scheduler), and a job without region constraints leases to any runner.
 func regionSatisfied(region string, allowed []string) bool {
-	if len(allowed) == 0 || region == "" {
+	if len(allowed) == 0 {
 		return true
+	}
+	if region == "" {
+		return false
 	}
 	for _, a := range allowed {
 		if a == region {

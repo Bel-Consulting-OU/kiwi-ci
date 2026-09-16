@@ -25,6 +25,7 @@ const requiredArtifactPipeline = `version: 1
 jobs:
   build:
     runtime: container
+    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     artifacts:
       - name: bin
         paths:
@@ -38,6 +39,7 @@ const optionalArtifactPipeline = `version: 1
 jobs:
   build:
     runtime: container
+    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     artifacts:
       - name: bin
         paths:
@@ -53,6 +55,7 @@ concurrency:
 jobs:
   build:
     runtime: container
+    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     steps:
       - run: echo hi
 `
@@ -397,7 +400,7 @@ func TestDownstreamConcurrentFlushOneChild(t *testing.T) {
 	if w := completeTask(t, s, task, runnerID, "success"); w.Code != http.StatusNoContent {
 		t.Fatalf("complete = %d: %s", w.Code, w.Body.String())
 	}
-	item := s.outbox.Pending()[0]
+	item := downstreamPendingItem(t, s)
 	s.DownstreamPipelineFetcher = func(ctx context.Context, repo, ref string) (string, error) {
 		return childPipeline, nil
 	}
@@ -458,7 +461,7 @@ func TestDownstreamReservedLinkRecoveredByMaintain(t *testing.T) {
 	if w := completeTask(t, s, task, runnerID, "success"); w.Code != http.StatusNoContent {
 		t.Fatalf("complete = %d: %s", w.Code, w.Body.String())
 	}
-	item := s.outbox.Pending()[0]
+	item := downstreamPendingItem(t, s)
 	// Simulate a crash between reserve and enqueue: the link is reserved
 	// two hours ago with no child.
 	old := time.Now().UTC().Add(-2 * time.Hour)
@@ -647,7 +650,7 @@ func TestDynamicDependencyIDsNeverEmpty(t *testing.T) {
 	// A fragment whose dependency edges reference keys in an order the map
 	// iteration cannot guarantee (child-b depends on child-a; child-c on
 	// both) is the regression fixture for the empty-dependency-ID bug.
-	frag := `{"jobs":{"child-b":{"runtime":"container","needs":["child-a"],"steps":[{"run":"echo b"}]},"child-c":{"runtime":"container","needs":["child-a","child-b"],"steps":[{"run":"echo c"}]},"child-a":{"runtime":"container","steps":[{"run":"echo a"}]}},"deps":{"child-b":["child-a"],"child-c":["child-a","child-b"]}}`
+	frag := `{"jobs":{"child-b":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","needs":["child-a"],"steps":[{"run":"echo b"}]},"child-c":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","needs":["child-a","child-b"],"steps":[{"run":"echo c"}]},"child-a":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo a"}]}},"deps":{"child-b":["child-a"],"child-c":["child-a","child-b"]}}`
 	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", frag, leaseHeaders(task, runnerID))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("generated = %d: %s", w.Code, w.Body.String())
@@ -691,7 +694,7 @@ func TestDynamicFragmentBeyondCapRejectedInTransaction(t *testing.T) {
 		f.jobs[id] = model.Job{ID: id, RunID: task.Job.RunID, Status: model.StatusQueued}
 	}
 	f.mu.Unlock()
-	frag := `{"jobs":{"child-a":{"runtime":"container","steps":[{"run":"echo child"}]}},"deps":{}}`
+	frag := `{"jobs":{"child-a":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo child"}]}},"deps":{}}`
 	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", frag, leaseHeaders(task, runnerID))
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("over-cap fragment = %d, want 400: %s", w.Code, w.Body.String())
@@ -816,6 +819,7 @@ func TestSidecarDBModeCASRoundTrip(t *testing.T) {
 jobs:
   build:
     runtime: container
+    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     artifacts:
       - name: bin
         sbom: cyclonedx-json

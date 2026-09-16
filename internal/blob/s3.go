@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,6 +19,47 @@ import (
 )
 
 const emptyPayloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+// s3RequestDeadlines bound requests whose caller context carries no
+// deadline, so a stalled S3 endpoint can never hang a request forever.
+const (
+	s3PutTimeout    = 30 * time.Minute
+	s3GetTimeout    = 2 * time.Minute
+	s3DeleteTimeout = 2 * time.Minute
+)
+
+// withDeadline returns ctx unchanged when it already has a deadline,
+// otherwise a copy bounded by d. The returned cancel is a no-op in the
+// former case.
+func withDeadline(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, d)
+}
+
+// s3Dialer is the dialer behind the default S3 transport: 10s connection
+// establishment and 30s keep-alive.
+var s3Dialer = &net.Dialer{
+	Timeout:   10 * time.Second,
+	KeepAlive: 30 * time.Second,
+}
+
+// s3Transport builds the default S3 HTTP transport with explicit
+// connection timeouts and idle limits: 10s dial, 90s idle connection
+// lifetime, 10s TLS handshake, 30s response header, and bounded idle
+// connection counts.
+func s3Transport() *http.Transport {
+	return &http.Transport{
+		DialContext:           s3Dialer.DialContext,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+}
 
 // S3 is an S3-compatible Store using AWS Signature Version 4 implemented with
 // the standard library only.
@@ -33,12 +75,15 @@ type S3 struct {
 }
 
 func (s *S3) client() *http.Client {
+	var c *http.Client
 	if s.Client != nil {
-		c := *s.Client
-		c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-		return &c
+		cc := *s.Client
+		c = &cc
+	} else {
+		c = &http.Client{Transport: s3Transport()}
 	}
-	return &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return c
 }
 
 func (s *S3) objectURL(key string) string {
@@ -124,6 +169,8 @@ func hmacSHA256(key []byte, data string) []byte {
 }
 
 func (s *S3) Put(ctx context.Context, key string, r io.Reader, size int64) (Object, error) {
+	ctx, cancel := withDeadline(ctx, s3PutTimeout)
+	defer cancel()
 	// Buffer to compute MD5 and SHA256 before sending; S3 PutObject requires
 	// the body hash for SigV4. The read is bounded to size+1 so a stream
 	// longer than the declared size is rejected instead of silently
@@ -180,6 +227,8 @@ func (s *S3) Put(ctx context.Context, key string, r io.Reader, size int64) (Obje
 }
 
 func (s *S3) Open(ctx context.Context, key string) (io.ReadCloser, Object, error) {
+	ctx, cancel := withDeadline(ctx, s3GetTimeout)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.objectURL(key), nil)
 	if err != nil {
 		return nil, Object{}, err
@@ -202,6 +251,8 @@ func (s *S3) Open(ctx context.Context, key string) (io.ReadCloser, Object, error
 }
 
 func (s *S3) Delete(ctx context.Context, key string) error {
+	ctx, cancel := withDeadline(ctx, s3DeleteTimeout)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, s.objectURL(key), nil)
 	if err != nil {
 		return err

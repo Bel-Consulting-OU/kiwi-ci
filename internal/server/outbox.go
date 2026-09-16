@@ -171,6 +171,25 @@ func (o *Outbox) Enqueue(item forge.OutboxItem) error {
 	return o.appendJSONLLocked(outboxFile, item)
 }
 
+// EnqueueLocal queues one intent in memory only, without touching the
+// durable store. It is used for intents whose rows were already created
+// inside another transaction (completion effect intents written by
+// storage.CompleteJob): the local copy lets this instance dispatch and ack
+// the pre-existing rows under the same IDs.
+func (o *Outbox) EnqueueLocal(item forge.OutboxItem) {
+	if item.CreatedAt.IsZero() {
+		item.CreatedAt = time.Now().UTC()
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for _, it := range o.items {
+		if it.ID == item.ID {
+			return
+		}
+	}
+	o.items = append(o.items, item)
+}
+
 func (o *Outbox) appendJSONLLocked(name string, v any) error {
 	if o.store == nil {
 		return nil
@@ -200,35 +219,51 @@ func (o *Outbox) Pending() []forge.OutboxItem {
 // the batch and leaves the item (and everything after it) queued for the
 // next flush; a successful dispatch removes the item and records its ID
 // (SQL ack in DB mode, done-file line in fs mode) so replay skips it.
-// Returns the number of intents dispatched.
+// The dispatch runs WITHOUT the outbox lock so dispatched intents may
+// enqueue follow-up intents (e.g. a completion effect recording downstream
+// launch intents) without deadlocking. Returns the number of intents
+// dispatched.
 func (o *Outbox) Flush(ctx context.Context, dispatch func(context.Context, forge.OutboxItem) error) (int, error) {
 	if dispatch == nil {
 		return 0, nil
 	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
 	dispatched := 0
-	for len(o.items) > 0 {
+	for {
+		o.mu.Lock()
+		if len(o.items) == 0 {
+			o.mu.Unlock()
+			return dispatched, nil
+		}
 		it := o.items[0]
+		o.mu.Unlock()
+
 		if err := dispatch(ctx, it); err != nil {
 			return dispatched, err
 		}
-		o.items = o.items[1:]
+
+		o.mu.Lock()
+		// Remove the dispatched item when it is still at the head (a
+		// concurrent enqueue only ever appends, so the head is stable
+		// between the peek above and this point).
+		if len(o.items) > 0 && o.items[0].ID == it.ID {
+			o.items = o.items[1:]
+		}
 		o.done[it.ID] = true
 		dispatched++
+		var ackErr error
 		if o.db != nil {
-			if err := o.db.OutboxAck(ctx, it.ID); err != nil {
-				return dispatched, err
-			}
-			continue
+			ackErr = o.db.OutboxAck(ctx, it.ID)
+		} else if o.store != nil {
+			ackErr = o.appendJSONLLocked(outboxDoneFile, struct {
+				ID string `json:"id"`
+			}{ID: it.ID})
 		}
-		if err := o.appendJSONLLocked(outboxDoneFile, struct {
-			ID string `json:"id"`
-		}{ID: it.ID}); err != nil {
-			return dispatched, err
+		if ackErr != nil {
+			o.mu.Unlock()
+			return dispatched, ackErr
 		}
+		o.mu.Unlock()
 	}
-	return dispatched, nil
 }
 
 // flushOutbox drains the server's outbox through the forge dispatch path.
@@ -258,6 +293,17 @@ func (s *Server) dispatchOutbox(ctx context.Context, item forge.OutboxItem) erro
 		return s.publishGitHubStatusFromPayload(ctx, p)
 	case forge.OutboxKindDownstream:
 		return s.dispatchDownstream(ctx, item)
+	case storage.OutboxKindDownstreamCheck, storage.OutboxKindDeploymentFinish,
+		storage.OutboxKindUsageAccount, storage.OutboxKindRunAggregate, storage.OutboxKindForgeStatus:
+		var p storage.CompletionEffectsPayload
+		if err := json.Unmarshal(item.Payload, &p); err != nil {
+			return err
+		}
+		if p.JobID == "" {
+			log.Printf("outbox: dropping completion effect %s with empty job id", item.Kind)
+			return nil
+		}
+		return s.reconcileCompletionEffects(ctx, p.JobID)
 	case forge.OutboxKindWebhookCall:
 		log.Printf("outbox: dropping reserved intent %s (kind %s)", item.ID, item.Kind)
 		return nil

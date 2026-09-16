@@ -113,6 +113,30 @@ type RunnerDTO struct {
 	RevokedAt  *time.Time `json:"revoked_at,omitempty"`
 }
 
+// RunnerServingDTO is the redacted runner projection served to read
+// principals by GET /api/v1/runners/serving. Only runners actively serving
+// the principal's visible repositories appear, and only the minimal
+// operational fields are exposed: no labels, metadata, region, rates or
+// certificate state. ActiveJobs is pre-filtered to the visible jobs.
+type RunnerServingDTO struct {
+	ID         string    `json:"id"`
+	Name       string    `json:"name"`
+	Busy       bool      `json:"busy"`
+	LastSeen   time.Time `json:"last_seen"`
+	ActiveJobs []string  `json:"active_jobs,omitempty"`
+}
+
+// RunnerServingDTOFrom maps a runner into the redacted serving projection.
+func RunnerServingDTOFrom(rn model.Runner, visibleJobs []string) RunnerServingDTO {
+	return RunnerServingDTO{
+		ID:         rn.ID,
+		Name:       rn.Name,
+		Busy:       rn.Busy,
+		LastSeen:   time.Time(rn.LastSeen),
+		ActiveJobs: visibleJobs,
+	}
+}
+
 // ArtifactDTO mirrors the redacted artifact record returned by listing:
 // server-local filesystem paths are always stripped.
 type ArtifactDTO struct {

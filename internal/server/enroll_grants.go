@@ -1,9 +1,11 @@
 package server
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 const enrollGrantsFile = "enroll-grants.json"
@@ -43,7 +46,9 @@ func enrollTokenFrom(r *http.Request) string {
 
 // CreateEnrollGrant mints a single-use enrollment grant: 32 random bytes
 // returned raw (hex) to the operator/runner agent, stored server-side only
-// as its SHA-256 digest with the given lifetime and label binding.
+// as its SHA-256 digest with the given lifetime and label binding. In DB
+// mode the grant row is written through the durable EnrollGrantStore so
+// every replica honors the same single-use claim.
 func (s *Server) CreateEnrollGrant(ttl time.Duration, boundLabels []string) (string, error) {
 	if ttl <= 0 {
 		return "", fmt.Errorf("enroll grant ttl must be positive")
@@ -53,6 +58,15 @@ func (s *Server) CreateEnrollGrant(ttl time.Duration, boundLabels []string) (str
 		return "", fmt.Errorf("generate enroll grant: %w", err)
 	}
 	token := hex.EncodeToString(raw)
+	expires := time.Now().UTC().Add(ttl)
+	if s.DB != nil {
+		if gs, ok := s.DB.(storage.EnrollGrantStore); ok {
+			if err := gs.PutEnrollGrant(context.Background(), auth.TokenDigest(token), expires, boundLabels); err != nil {
+				return "", err
+			}
+			return token, nil
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.EnrollGrants == nil {
@@ -60,7 +74,7 @@ func (s *Server) CreateEnrollGrant(ttl time.Duration, boundLabels []string) (str
 	}
 	s.pruneEnrollGrantsLocked(time.Now().UTC())
 	s.EnrollGrants[auth.TokenDigest(token)] = EnrollGrant{
-		ExpiresAt:   time.Now().UTC().Add(ttl),
+		ExpiresAt:   expires,
 		BoundLabels: append([]string(nil), boundLabels...),
 	}
 	if err := s.persistEnrollGrants(); err != nil {
@@ -72,27 +86,61 @@ func (s *Server) CreateEnrollGrant(ttl time.Duration, boundLabels []string) (str
 
 // enrollGrantOK reports whether tok corresponds to a grant that is still
 // valid: known, unused and unexpired. It is the auth() tier gate; the
-// enroll handler re-checks atomically under s.mu (consumeEnrollGrant) to
-// close the replay race.
+// enroll handler re-checks atomically under consumeEnrollGrant to close the
+// replay race.
 func (s *Server) enrollGrantOK(tok string) bool {
 	if tok == "" {
 		return false
 	}
+	digest := auth.TokenDigest(tok)
+	if s.DB != nil {
+		if gs, ok := s.DB.(storage.EnrollGrantStore); ok {
+			rec, found, err := gs.GetEnrollGrant(context.Background(), digest)
+			if err != nil || !found {
+				return false
+			}
+			return !rec.Consumed && time.Now().UTC().Before(rec.ExpiresAt)
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	g, ok := s.EnrollGrants[auth.TokenDigest(tok)]
+	g, ok := s.EnrollGrants[digest]
 	return ok && !g.Used && time.Now().UTC().Before(g.ExpiresAt)
 }
 
 // consumeEnrollGrant atomically validates and consumes the grant presented
 // by an enroll request: known, unused, unexpired, and — when the grant is
-// label-bound — the request must carry every bound label. On success the
-// grant is marked used and persisted before any certificate is signed.
+// label-bound — the request must carry every bound label. In DB mode the
+// consumption is the store's conditional UPDATE (consumed_at IS NULL AND
+// expires_at > now()), so concurrent enrollments of the same grant yield
+// exactly one winner; memory mode consumes under s.mu. On success the grant
+// is marked used and persisted before any certificate is signed.
 func (s *Server) consumeEnrollGrant(tok string, requestLabels []string) error {
 	if tok == "" {
 		return fmt.Errorf("enrollment grant required")
 	}
 	digest := auth.TokenDigest(tok)
+	if s.DB != nil {
+		if gs, ok := s.DB.(storage.EnrollGrantStore); ok {
+			rec, err := gs.ConsumeEnrollGrant(context.Background(), digest, "")
+			switch {
+			case errors.Is(err, storage.ErrNotFound):
+				return fmt.Errorf("unknown enrollment grant")
+			case errors.Is(err, storage.ErrGrantConsumed):
+				return fmt.Errorf("enrollment grant already used")
+			case errors.Is(err, storage.ErrGrantExpired):
+				return fmt.Errorf("enrollment grant expired")
+			case err != nil:
+				return fmt.Errorf("consume enrollment grant: %w", err)
+			}
+			for _, want := range rec.BoundLabels {
+				if !containsLabel(requestLabels, want) {
+					return fmt.Errorf("enrollment grant requires label %q", want)
+				}
+			}
+			return nil
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	g, ok := s.EnrollGrants[digest]

@@ -17,14 +17,24 @@ type SubmitRun struct {
 	// Trusted is deliberately never accepted from client JSON: direct API
 	// submissions are untrusted. Only forge webhook handlers and internal
 	// reruns (which copy the previous run's trust) set it in Go code.
-	Trusted      bool              `json:"-"`
-	ChangedFiles []string          `json:"changed_files,omitempty"`
-	Metadata     map[string]string `json:"metadata,omitempty"`
+	Trusted      bool     `json:"-"`
+	ChangedFiles []string `json:"changed_files,omitempty"`
+	// ChangedFilesKnown marks the ChangedFiles list as the authoritative
+	// forge-fetched diff: the enqueue persists it on every job so the
+	// runner keeps a known-empty list empty instead of falling back to a
+	// local git diff.
+	ChangedFilesKnown bool              `json:"changed_files_known,omitempty"`
+	Metadata          map[string]string `json:"metadata,omitempty"`
 	// scheduleClaim, when set, claims the (schedule, nominal) occurrence
 	// atomically with the enqueue (DB mode: inside InsertCompiledRun;
 	// memory mode: under s.mu after the run is inserted). It is never
 	// accepted from client JSON.
 	ScheduleClaim *storage.ScheduleClaim `json:"-"`
+	// DownstreamLaunch, when set, folds the downstream child launch claim
+	// into the enqueue: the child run and the downstream link update
+	// (ChildRunID + StableChildID) commit atomically. It is never accepted
+	// from client JSON.
+	DownstreamLaunch *storage.DownstreamLaunchClaim `json:"-"`
 }
 
 type Task struct {

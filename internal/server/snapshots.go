@@ -28,22 +28,12 @@ import (
 // same flow; a record-insertion failure fails the upload (503) instead of
 // logging, and the in-memory map is not the source of truth.
 func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("id")
 	runnerID := r.Header.Get("X-Kiwi-Runner-ID")
 	token := r.Header.Get("X-Kiwi-Lease-Token")
 	gen, _ := strconv.ParseInt(r.Header.Get("X-Kiwi-Lease-Generation"), 10, 64)
-	now := time.Now().UTC()
-	j, err := s.jobForLease(r.Context(), jobID)
-	if errors.Is(err, storage.ErrNotFound) {
-		http.NotFound(w, r)
-		return
-	}
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	if !s.validActiveLease(j, runnerID, token, gen, now) {
-		http.Error(w, "stale or invalid lease", http.StatusConflict)
+	j, authErr := s.authorizeRunnerLease(r, runnerID, token, gen)
+	if authErr != nil {
+		s.writeLeaseAuthError(w, r, authErr)
 		return
 	}
 	if s.DB != nil {

@@ -2,13 +2,17 @@ package server
 
 import (
 	"bytes"
+	"crypto/x509"
 	"encoding/hex"
+	"encoding/pem"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runnerpki"
 )
 
 func TestClusterKeysSharedAcrossInstances(t *testing.T) {
@@ -100,9 +104,9 @@ func TestFSClusterKeyStoreMatchesLegacyLayout(t *testing.T) {
 
 func TestFSClusterKeyStoreRunnerCACompatible(t *testing.T) {
 	dir := t.TempDir()
-	// Create the CA the legacy way and make sure NewPersistent picks it up
-	// through the FS cluster store.
-	if err := (&Server{}).EnsureRunnerCA(dir); err != nil {
+	// Create the CA through the FS cluster store and make sure
+	// NewPersistent picks it up.
+	if err := (&Server{ClusterKeys: &FSClusterKeyStore{Dir: dir}}).EnsureRunnerCA(); err != nil {
 		t.Fatal(err)
 	}
 	s, err := NewPersistent("t", "t", dir)
@@ -187,7 +191,7 @@ func TestOIDCRotationPersistsThroughClusterStore(t *testing.T) {
 
 func TestKeyFingerprintsIncludesAllMaterials(t *testing.T) {
 	dir := t.TempDir()
-	if err := (&Server{}).EnsureRunnerCA(dir); err != nil {
+	if err := (&Server{ClusterKeys: &FSClusterKeyStore{Dir: dir}}).EnsureRunnerCA(); err != nil {
 		t.Fatal(err)
 	}
 	s, err := NewPersistent("t", "t", dir)
@@ -199,6 +203,75 @@ func TestKeyFingerprintsIncludesAllMaterials(t *testing.T) {
 		if fp[kind] == "" {
 			t.Fatalf("missing fingerprint for %q: %v", kind, fp)
 		}
+	}
+}
+
+// TestFSClusterKeyStoreRunnerCASingleObject: the runner CA lives in ONE
+// atomic object file (cert PEM + NUL + key PEM) with ca.crt/ca.key derived
+// sidecars; legacy split files migrate into the object on first lookup.
+func TestFSClusterKeyStoreRunnerCASingleObject(t *testing.T) {
+	dir := t.TempDir()
+	store := &FSClusterKeyStore{Dir: dir}
+	obj, err := store.LoadOrCreate(clusterKindRunnerCA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The object file exists and carries the NUL separator.
+	onDisk, err := os.ReadFile(filepath.Join(dir, runnerCAObjectFile))
+	if err != nil {
+		t.Fatalf("runner-ca object file missing: %v", err)
+	}
+	if !bytes.Contains(onDisk, []byte{0}) {
+		t.Fatal("runner-ca object must store cert PEM + NUL + key PEM")
+	}
+	certPEM, keyPEM, err := splitRunnerCAPEMs(obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(certPEM, []byte("-----BEGIN CERTIFICATE-----")) || !bytes.Contains(keyPEM, []byte("-----BEGIN PRIVATE KEY-----")) {
+		t.Fatal("object does not split into cert+key PEM")
+	}
+	// The derived sidecars exist and match the object.
+	sideCert, err := os.ReadFile(filepath.Join(dir, "ca.crt"))
+	if err != nil || !bytes.Equal(bytes.TrimSpace(sideCert), bytes.TrimSpace(certPEM)) {
+		t.Fatalf("ca.crt sidecar mismatch: %v", err)
+	}
+	sideKey, err := os.ReadFile(filepath.Join(dir, "ca.key"))
+	if err != nil || !bytes.Equal(bytes.TrimSpace(sideKey), bytes.TrimSpace(keyPEM)) {
+		t.Fatalf("ca.key sidecar mismatch: %v", err)
+	}
+	if _, err := runnerpki.LoadCA(certPEM, keyPEM); err != nil {
+		t.Fatalf("object does not parse as a CA pair: %v", err)
+	}
+
+	// Legacy split files without the object migrate on Lookup.
+	dir2 := t.TempDir()
+	ca, err := runnerpki.NewCA("legacy", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyCert := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca.Cert.Raw})
+	legacyKeyDER, err := x509.MarshalPKCS8PrivateKey(ca.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyKey := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: legacyKeyDER})
+	if err := os.WriteFile(filepath.Join(dir2, "ca.crt"), legacyCert, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir2, "ca.key"), legacyKey, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store2 := &FSClusterKeyStore{Dir: dir2}
+	migrated, ok, err := store2.Lookup(clusterKindRunnerCA)
+	if err != nil || !ok {
+		t.Fatalf("legacy migration lookup: ok=%v err=%v", ok, err)
+	}
+	if !bytes.Equal(migrated, append(append(append([]byte{}, legacyCert...), 0), legacyKey...)) {
+		t.Fatal("migrated object does not match the legacy pair")
+	}
+	if _, err := os.Stat(filepath.Join(dir2, runnerCAObjectFile)); err != nil {
+		t.Fatalf("migration must persist the object file: %v", err)
 	}
 }
 

@@ -127,6 +127,18 @@ type Runner struct {
 	// active (IdentityDir configured); it clears the persisted certificate
 	// when the control plane disables or revokes this runner.
 	store IdentityStore
+	// clientCertPEM is the runner's own client certificate PEM (explicit
+	// or enrolled); its serial is advertised at registration so the
+	// control plane can bind the runner's profile to it.
+	clientCertPEM []byte
+	// effectiveCapabilities is the intersection of the hardware
+	// capabilities discovered on this host and the profile capabilities
+	// returned by the register response — it can only shrink the profile,
+	// never enlarge it. capEnforced reports whether the server declared a
+	// profile capability ceiling (legacy servers without profiles leave
+	// both empty).
+	effectiveCapabilities []string
+	capEnforced           bool
 }
 
 func (r *Runner) Run(ctx context.Context) error {
@@ -267,17 +279,8 @@ func (r *Runner) startMetricsServer(ctx context.Context) {
 func (r *Runner) register(ctx context.Context) error {
 	labels := append([]string{}, r.Cfg.Labels...)
 	labels = append(labels, "os:"+runtime.GOOS, "arch:"+runtime.GOARCH, "native")
-	capabilities := []string{"native"}
-	if _, err := exec.LookPath("docker"); err == nil {
-		labels = append(labels, "container")
-		capabilities = append(capabilities, "container")
-	}
-	if runtime.GOOS == "darwin" {
-		if _, err := exec.LookPath("tart"); err == nil {
-			labels = append(labels, "tart")
-			capabilities = append(capabilities, "tart")
-		}
-	}
+	discovered := discoveredCapabilities()
+	labels = append(labels, discovered...)
 	in := model.Runner{
 		ID: r.ID, Name: r.Cfg.Name, Labels: unique(labels),
 		Metadata:     map[string]string{"go": runtime.Version()},
@@ -286,7 +289,8 @@ func (r *Runner) register(ctx context.Context) error {
 		ProtocolMax:  runnerProtocol,
 		Version:      RunnerVersion,
 		Region:       os.Getenv(envRunnerRegion),
-		Capabilities: capabilities,
+		Capabilities: discovered,
+		CertSerial:   r.clientCertSerial(),
 		Draining:     r.Cfg.Drain,
 	}
 	var out model.Runner
@@ -302,8 +306,64 @@ func (r *Runner) register(ctx context.Context) error {
 		return err
 	}
 	r.ID = out.ID
-	fmt.Printf("kiwi runner %s registered (%s/%s) labels=%s\n", r.ID, runtime.GOOS, runtime.GOARCH, strings.Join(out.Labels, ","))
+	// Capability intersection: the profile capabilities in the response
+	// are the ceiling; the runner advertises (and enforces) only the
+	// intersection with what this host actually discovered, so a job
+	// requiring a runtime the host cannot provide never starts here.
+	if len(out.Capabilities) > 0 {
+		r.capEnforced = true
+	}
+	r.effectiveCapabilities = intersectStringLists(out.Capabilities, discovered)
+	fmt.Printf("kiwi runner %s registered (%s/%s) labels=%s caps=%s\n", r.ID, runtime.GOOS, runtime.GOARCH, strings.Join(out.Labels, ","), strings.Join(r.effectiveCapabilities, ","))
 	return nil
+}
+
+// discoveredCapabilities reports the runtime capabilities this host
+// actually provides: native always, container when docker is on PATH, tart
+// on macOS when the tart CLI is on PATH.
+func discoveredCapabilities() []string {
+	caps := []string{"native"}
+	if _, err := exec.LookPath("docker"); err == nil {
+		caps = append(caps, "container")
+	}
+	if runtime.GOOS == "darwin" {
+		if _, err := exec.LookPath("tart"); err == nil {
+			caps = append(caps, "tart")
+		}
+	}
+	return caps
+}
+
+// clientCertSerial returns the serial of the runner's own client
+// certificate (hex), or "" without one.
+func (r *Runner) clientCertSerial() string {
+	if len(r.clientCertPEM) == 0 {
+		return ""
+	}
+	cert, err := runnerpki.ParseCertPEM(r.clientCertPEM)
+	if err != nil || cert.SerialNumber == nil {
+		return ""
+	}
+	return cert.SerialNumber.Text(16)
+}
+
+// intersectStringLists returns the elements of a that are also in b,
+// preserving a's order.
+func intersectStringLists(a, b []string) []string {
+	if len(a) == 0 || len(b) == 0 {
+		return nil
+	}
+	have := map[string]bool{}
+	for _, x := range b {
+		have[x] = true
+	}
+	out := make([]string, 0, len(a))
+	for _, x := range a {
+		if have[x] {
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 // next polls for work. The boolean reports the server's drain signal
@@ -438,6 +498,14 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		return
 	}
 	applyEffectiveSandbox(&cj, effSandbox)
+	// Capability intersection enforcement: when the profile declared a
+	// capability ceiling, a job whose runtime capability this host did not
+	// discover is refused up front (never silently executed by a backend
+	// the host cannot provide).
+	if err := r.checkCapability(cj.Job.Runtime); err != nil {
+		r.complete(parent, t, model.StatusFailure, err, nil)
+		return
+	}
 	if err := checkShardAssignment(cj); err != nil {
 		r.complete(parent, t, model.StatusFailure, err, nil)
 		return
@@ -489,7 +557,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// require image references pinned by digest. The untrusted floor is
 	// unconditional here: nothing may override RequireImmutableImages for
 	// an untrusted job.
-	opts := executor.Options{Workspace: tmp, RunID: t.Job.RunID, Event: t.Job.Event, Branch: branchFromRef(t.Job.Ref), ChangedFiles: effectiveChangedFiles(t.Job.ChangedFiles, tmp), SecretProvider: provider, Logs: logging.Func(func(job, step, line string) { sink.WriteLine(job, step, line) }), Cache: cacheStore, Artifacts: artifactStore, ArtifactReporter: reporter, DependencyStatus: t.Job.DependencyStatus, NeedsOutputs: t.Job.NeedsOutputs, CacheNamespace: cacheNamespace(t.Job), RequireImmutableImages: !t.Job.Trusted}
+	opts := executor.Options{Workspace: tmp, RunID: t.Job.RunID, Event: t.Job.Event, Branch: branchFromRef(t.Job.Ref), ChangedFiles: effectiveChangedFiles(t.Job.ChangedFiles, t.Job.ChangedFilesKnown, tmp), SecretProvider: provider, Logs: logging.Func(func(job, step, line string) { sink.WriteLine(job, step, line) }), Cache: cacheStore, Artifacts: artifactStore, ArtifactReporter: reporter, DependencyStatus: t.Job.DependencyStatus, NeedsOutputs: t.Job.NeedsOutputs, CacheNamespace: cacheNamespace(t.Job), RequireImmutableImages: !t.Job.Trusted}
 	// Step durations come from the executor's wall-clock step measurements
 	// (StepReporter), never from sink-derived log timing.
 	applyStepReporter(&opts, r.Metrics)
@@ -540,11 +608,25 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	r.complete(parent, t, res.Status, runErr, res.Outputs)
 }
 
-// checkShardAssignment verifies the compile-time shard contract: the
-// control plane compiles tests.shards = N (N > 1) into N jobs whose env
+// checkShardAssignment verifies the compile-time shard contract: the// control plane compiles tests.shards = N (N > 1) into N jobs whose env
 // carries KIWI_TEST_SHARD_TOTAL and KIWI_TEST_SHARD_INDEX. A compiled job
 // missing the assignment is a configuration error, not something the runner
 // can reconstruct at runtime.
+// checkCapability enforces the runner-side capability intersection: when
+// the register response declared a profile capability ceiling, a job whose
+// runtime capability is not in the runner's effective (discovered ∩
+// profile) set is refused before execution. Without a ceiling (legacy
+// server) every runtime is accepted.
+func (r *Runner) checkCapability(runtime string) error {
+	if !r.capEnforced || runtime == "" {
+		return nil
+	}
+	if !containsString(r.effectiveCapabilities, runtime) {
+		return fmt.Errorf("runtime %q is outside this runner's profile capability intersection", runtime)
+	}
+	return nil
+}
+
 func checkShardAssignment(cj pipeline.CompiledJob) error {
 	if cj.Job.Tests.Shards <= 1 {
 		return nil
@@ -703,7 +785,14 @@ func cacheNamespace(j model.Job) string {
 func branchFromRef(ref string) string {
 	return strings.TrimPrefix(strings.TrimPrefix(ref, "refs/heads/"), "refs/")
 }
-func effectiveChangedFiles(serverFiles []string, dir string) []string {
+func effectiveChangedFiles(serverFiles []string, known bool, dir string) []string {
+	// ChangedFilesKnown marks the server-side list as the authoritative
+	// forge-fetched diff: it is returned as-is, so a known-EMPTY list stays
+	// empty (no local git fallback). The fallback applies only when the
+	// server did not authoritatively know the diff.
+	if known {
+		return append([]string{}, serverFiles...)
+	}
 	if len(serverFiles) > 0 {
 		return append([]string{}, serverFiles...)
 	}
@@ -1064,6 +1153,16 @@ func unique(in []string) []string {
 	return out
 }
 
+// containsString reports whether list contains v.
+func containsString(list []string, v string) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
 // isHTTPStatus reports whether err was produced by r.post or a runner HTTP
 // call failing with the given status (the error strings embed "STATUS
 // TEXT").
@@ -1172,6 +1271,7 @@ func (r *Runner) prepareClient(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	r.clientCertPEM = append([]byte(nil), certPEM...)
 	r.Client = &http.Client{Timeout: 65 * time.Second, Transport: &http.Transport{TLSClientConfig: tlsConf}}
 	return nil
 }

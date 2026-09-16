@@ -30,6 +30,14 @@ var requiredTables0002 = []string{
 	"outbox", "schedules", "schedule_occurrences",
 }
 
+// requiredTables0006 are the tables migration 0006 adds for server-owned
+// runner profiles, per-runner bearer tokens, durable certificate
+// revocations and enrollment grants.
+var requiredTables0006 = []string{
+	"runner_profiles", "cert_profile_links", "runner_bearer_tokens",
+	"cert_revocations", "enrollment_grants",
+}
+
 // requiredIndexes are the hot-path indexes the audit calls out; their names
 // appear in 0001_init.sql.
 var requiredIndexes = []string{
@@ -97,6 +105,17 @@ func TestMigrationFilesOrderedAndComplete(t *testing.T) {
 		re := regexp.MustCompile(`(?i)\bCREATE TABLE\s+` + regexp.QuoteMeta(name) + `\b`)
 		if !re.Match(raw2) {
 			t.Errorf("0002_outbox_schedules.sql is missing CREATE TABLE %s", name)
+		}
+	}
+
+	raw6, err := migrations.FS.ReadFile("0006_runner_profiles.sql")
+	if err != nil {
+		t.Fatalf("read 0006_runner_profiles.sql: %v", err)
+	}
+	for _, name := range requiredTables0006 {
+		re := regexp.MustCompile(`(?i)\bCREATE TABLE\s+` + regexp.QuoteMeta(name) + `\b`)
+		if !re.Match(raw6) {
+			t.Errorf("0006_runner_profiles.sql is missing CREATE TABLE %s", name)
 		}
 	}
 }

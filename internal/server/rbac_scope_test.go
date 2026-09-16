@@ -128,12 +128,16 @@ func TestScopedRunReadDeniesForeignRepo(t *testing.T) {
 
 func TestScopedRunnersFilteredByActiveJobRepo(t *testing.T) {
 	s := scopedStoreServer(t)
-	w := doJSON(t, s, http.MethodGet, "/api/v1/runners", "reader", "")
+	w := doJSON(t, s, http.MethodGet, "/api/v1/runners/serving", "reader", "")
 	if w.Code != http.StatusOK {
-		t.Fatalf("list runners = %d", w.Code)
+		t.Fatalf("list serving runners = %d: %s", w.Code, w.Body.String())
 	}
 	var out []struct {
-		ID string `json:"id"`
+		ID         string   `json:"id"`
+		Name       string   `json:"name"`
+		Busy       bool     `json:"busy"`
+		LastSeen   string   `json:"last_seen"`
+		ActiveJobs []string `json:"active_jobs"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
 		t.Fatal(err)
@@ -147,6 +151,10 @@ func TestScopedRunnersFilteredByActiveJobRepo(t *testing.T) {
 	}
 	if got["r-b"] {
 		t.Fatal("runner serving a foreign repo leaked into the scoped list")
+	}
+	// The full inventory is an operations surface: a read principal gets 403.
+	if w := doJSON(t, s, http.MethodGet, "/api/v1/runners", "reader", ""); w.Code != http.StatusForbidden {
+		t.Fatalf("full runner inventory for a reader: want 403 got %d", w.Code)
 	}
 }
 

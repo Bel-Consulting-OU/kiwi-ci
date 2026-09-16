@@ -483,7 +483,7 @@ func faultOps() []opCase {
 				child.ID = "ffffffffffffffffffffffffffffffff"
 				child.Key = "generated"
 				child.DynamicDepth = 1
-				return s.(DynamicStoreTx).InsertGeneratedJobsTx(ctx(), testJob.ID, 1, map[string]model.Job{child.ID: child}, map[string][]string{child.ID: nil}, func(parent model.Job, count int) error {
+				return s.(DynamicStoreTx).InsertGeneratedJobsTx(ctx(), testJob.ID, 1, map[string]model.Job{child.ID: child}, map[string][]string{child.ID: nil}, map[string]map[string]ArtifactContract{child.ID: {"dist": {Name: "dist"}}}, func(parent model.Job, count int) error {
 					if count != 1 {
 						return fmt.Errorf("unexpected run job count %d", count)
 					}

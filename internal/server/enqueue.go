@@ -17,6 +17,30 @@ func jobResourceRequests(cj pipeline.CompiledJob) (cpu float64, memory, disk int
 	return r.CPU, int64(r.Memory), int64(r.Disk), r.PIDs
 }
 
+// applyUntrustedResourceCeilings sets the server-side resource ceilings on
+// the compiled job of an UNTRUSTED run whenever the job declares no request
+// of its own: the executor then always applies CPU/memory/PID limits to
+// untrusted work, even for pipelines that never mention resources. Only
+// fields the job's runtime backend can actually enforce are filled (see
+// pipeline.ResourceCapabilities); trusted jobs and jobs with explicit
+// requests are untouched.
+func (s *Server) applyUntrustedResourceCeilings(cj pipeline.CompiledJob, trusted bool) pipeline.CompiledJob {
+	if trusted {
+		return cj
+	}
+	cpu, mem, _, pids := pipeline.ResourceCapabilities(cj.Job.Runtime)
+	if cpu && cj.Job.Resources.CPU == 0 && s.UntrustedCPUCeiling > 0 {
+		cj.Job.Resources.CPU = s.UntrustedCPUCeiling
+	}
+	if mem && cj.Job.Resources.Memory == 0 && s.UntrustedMemoryCeiling > 0 {
+		cj.Job.Resources.Memory = pipeline.ByteSize(s.UntrustedMemoryCeiling)
+	}
+	if pids && cj.Job.Resources.PIDs == 0 && s.UntrustedPIDCeiling > 0 {
+		cj.Job.Resources.PIDs = s.UntrustedPIDCeiling
+	}
+	return cj
+}
+
 // jobQueueDeadline computes the queue deadline for a compiled job whose
 // queue_timeout is set: enqueue time plus the timeout. Nil means no
 // timeout and therefore no expiry.

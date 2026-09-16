@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -71,6 +73,9 @@ func (s *Server) recordDownstreamIntents(ctx context.Context, j model.Job, run m
 		TargetForge:   forgeKind,
 		TargetBaseURL: s.forgeBaseURL(forgeKind),
 		TargetRepoID:  targetRepo,
+		// The stable launch key is derived at record time so every launch
+		// of this link reuses the SAME child run ID.
+		StableChildID: downstreamStableKey(j.ID, targetRepo, targetRef),
 		CreatedAt:     time.Now().UTC(),
 	}
 	if err := s.insertDownstreamLink(ctx, link); err != nil {
@@ -230,10 +235,13 @@ func downstreamLinkKey(parentJobID, targetRepo, targetRef string) string {
 // dispatchDownstream processes one downstream outbox intent with the
 // reserve-first flow: the link reservation is claimed atomically BEFORE the
 // child run is enqueued, so concurrent flushers (and restarts) can never
-// launch the same child twice. A crash between reserve and enqueue leaves a
-// reserved-but-unlaunched link that the Maintain recovery pass expires
-// after one hour. A failed fetch/enqueue releases the reservation so the
-// next flush can retry.
+// launch the same child twice. The child run ID is the STABLE launch key
+// derived from (parent_job, target_repo, target_ref): the child run and the
+// link update (ChildRunID + stable key) commit in ONE transaction inside
+// the enqueue, so a crash between the reservation and the child launch
+// leaves a reserved-but-unlaunched link that recovery re-dispatches with
+// the SAME stable child ID (never a duplicate). A failed fetch/enqueue
+// releases the reservation so the next flush can retry.
 func (s *Server) dispatchDownstream(ctx context.Context, item forge.OutboxItem) error {
 	var p downstreamPayload
 	if err := json.Unmarshal(item.Payload, &p); err != nil {
@@ -242,6 +250,9 @@ func (s *Server) dispatchDownstream(ctx context.Context, item forge.OutboxItem) 
 	if p.ParentJobID == "" || p.TargetRepo == "" || p.TargetRef == "" {
 		return fmt.Errorf("downstream: incomplete intent payload")
 	}
+	// The stable launch key: deterministic across replays and restarts.
+	stableKey := downstreamStableKey(p.ParentJobID, p.TargetRepo, p.TargetRef)
+	stableChildID := downstreamStableChildRunID(stableKey)
 	// Bilateral authorization: the TARGET repository's policy must consent
 	// to the dispatch. Without an allowlist entry for the target (default
 	// deny) the intent is refused with an audit event and dropped (a nil
@@ -286,11 +297,6 @@ func (s *Server) dispatchDownstream(ctx context.Context, item forge.OutboxItem) 
 		return fmt.Errorf("downstream: fetch pipeline for %s@%s: %w", p.TargetRepo, p.TargetRef, err)
 	}
 
-	preID, err := newID()
-	if err != nil {
-		s.releaseDownstreamReservation(ctx, p.ParentJobID, p.TargetRepo, p.TargetRef)
-		return err
-	}
 	meta := map[string]string{
 		"downstream_of":    p.ParentRunID,
 		"downstream_job":   p.ParentJobID,
@@ -303,6 +309,10 @@ func (s *Server) dispatchDownstream(ctx context.Context, item forge.OutboxItem) 
 	// target repository's policy explicitly grants trusted ingress; every
 	// other target receives an untrusted child.
 	trusted := p.Trusted && s.DownstreamTrustedIngress[p.TargetRepo]
+	// The child enqueue carries the downstream launch claim: the child run
+	// (ID = the stable child ID) and the link update commit atomically.
+	// A replayed dispatch whose link is already launched with the same
+	// stable ID returns the existing child run.
 	child, err := s.enqueueID(SubmitRun{
 		RepoURL:      downstreamCloneURL(forgeKind, baseURL, p.TargetRepo),
 		RepoFullName: p.TargetRepo,
@@ -311,13 +321,14 @@ func (s *Server) dispatchDownstream(ctx context.Context, item forge.OutboxItem) 
 		Pipeline:     content,
 		Trusted:      trusted,
 		Metadata:     meta,
-	}, preID)
+		DownstreamLaunch: &storage.DownstreamLaunchClaim{
+			LinkKey:       downstreamLinkKey(p.ParentJobID, p.TargetRepo, p.TargetRef),
+			StableChildID: stableKey,
+		},
+	}, stableChildID)
 	if err != nil {
 		s.releaseDownstreamReservation(ctx, p.ParentJobID, p.TargetRepo, p.TargetRef)
 		return fmt.Errorf("downstream: enqueue child run: %w", err)
-	}
-	if err := s.markDownstreamLaunched(ctx, p.ParentJobID, p.TargetRepo, p.TargetRef, child.ID); err != nil {
-		return err
 	}
 	if p.Wait {
 		s.appendDownstreamRun(ctx, p.ParentRunID, child.ID)
@@ -325,6 +336,25 @@ func (s *Server) dispatchDownstream(ctx context.Context, item forge.OutboxItem) 
 	s.metricAdd("kiwi_downstream_launches_total", 1, nil)
 	s.auditLocked("downstream.launched", "scheduler", p.ParentRunID, p.ParentJobID, "downstream run launched", map[string]string{"target_repo": p.TargetRepo, "target_ref": p.TargetRef, "child_run": child.ID})
 	return nil
+}
+
+// downstreamStableKey derives the launch idempotency key for one
+// downstream link: the sha256 hex of (parent_job, target_repo, target_ref).
+// It is deterministic across replays, restarts and replicas, so every
+// launch attempt of a link targets the SAME child run.
+func downstreamStableKey(parentJobID, targetRepo, targetRef string) string {
+	sum := sha256.Sum256([]byte(parentJobID + "\x00" + targetRepo + "\x00" + targetRef))
+	return hex.EncodeToString(sum[:])
+}
+
+// downstreamStableChildRunID derives the child run ID from the stable
+// launch key: the first 32 hex chars (the canonical 128-bit run-ID
+// format), so recovery re-launches reuse the identical child ID.
+func downstreamStableChildRunID(stableKey string) string {
+	if len(stableKey) < 32 {
+		return stableKey
+	}
+	return stableKey[:32]
 }
 
 // downstreamAllowed enforces the target repository's policy consent for one
@@ -448,42 +478,6 @@ func (s *Server) recoverDownstreamReservations(ctx context.Context, now time.Tim
 	if changed {
 		_ = s.persistLocked()
 	}
-}
-
-// markDownstreamLaunched records the child run ID on the reserved link.
-func (s *Server) markDownstreamLaunched(ctx context.Context, parentJobID, targetRepo, targetRef, childRunID string) error {
-	if ds, ok := s.downstreamStore(); ok {
-		if err := ds.MarkDownstreamLaunched(ctx, parentJobID, targetRepo, targetRef, childRunID); err != nil {
-			return err
-		}
-		l, _, err := ds.GetDownstreamLink(ctx, parentJobID, targetRepo, targetRef)
-		if err != nil {
-			return err
-		}
-		if l.ChildRunID != childRunID {
-			return fmt.Errorf("downstream: launch claim lost")
-		}
-		return nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	key := downstreamLinkKey(parentJobID, targetRepo, targetRef)
-	l, ok := s.downstreamLinks[key]
-	if !ok || l.ChildRunID != "" {
-		if ok && l.ChildRunID == childRunID {
-			return nil
-		}
-		return fmt.Errorf("downstream: launch claim lost")
-	}
-	l.ChildRunID = childRunID
-	l.Reserved = false
-	l.ReservedAt = nil
-	s.downstreamLinks[key] = l
-	if err := s.persistLocked(); err != nil {
-		delete(s.downstreamLinks, key)
-		return err
-	}
-	return nil
 }
 
 // appendDownstreamRun records the child run on the parent run for wait=true

@@ -45,6 +45,10 @@ func TestCompiledJobPayloadInTask(t *testing.T) {
 	if !ok {
 		t.Fatalf("no compiled job for key %q", task.Job.Key)
 	}
+	// The enqueue applies the untrusted resource ceilings to the compiled
+	// job BEFORE marshaling the payload, so the recomputation must mirror
+	// that step to derive the same digest.
+	cj = s.applyUntrustedResourceCeilings(cj, task.Job.Trusted)
 	cjJSON, err := json.Marshal(cj)
 	if err != nil {
 		t.Fatal(err)

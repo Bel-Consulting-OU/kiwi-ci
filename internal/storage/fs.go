@@ -29,6 +29,11 @@ type Snapshot struct {
 	// launch the same child run twice. Additive; older snapshots load with
 	// a nil map.
 	DownstreamLinks map[string]DownstreamLink `json:"downstream_links,omitempty"`
+	// Profiles persists the fs-mode server-owned runner profiles and their
+	// certificate-serial bindings (runner_profiles/cert_profile_links
+	// equivalents). Additive; older snapshots load with nil maps.
+	Profiles         map[string]model.RunnerProfile `json:"profiles,omitempty"`
+	CertProfileLinks map[string]string              `json:"cert_profile_links,omitempty"`
 }
 
 type Repository struct {
@@ -73,6 +78,12 @@ func (r *Repository) loadLocked() (Snapshot, error) {
 	}
 	if s.DownstreamLinks == nil {
 		s.DownstreamLinks = map[string]DownstreamLink{}
+	}
+	if s.Profiles == nil {
+		s.Profiles = map[string]model.RunnerProfile{}
+	}
+	if s.CertProfileLinks == nil {
+		s.CertProfileLinks = map[string]string{}
 	}
 	return s, nil
 }

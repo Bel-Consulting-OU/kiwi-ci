@@ -93,7 +93,7 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "parse pipeline: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	ok, matched, terr := s.evalTriggerMatches(ctx, fg, spec, &ec)
+	ok, matched, filesKnown, terr := s.evalTriggerMatches(ctx, fg, spec, &ec)
 	if terr != nil {
 		http.Error(w, terr.Error(), http.StatusBadGateway)
 		return
@@ -119,15 +119,16 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	in := SubmitRun{
-		RepoURL:      ec.HeadRepository.CloneURL,
-		RepoFullName: ec.Repository.FullName,
-		Ref:          ec.Ref,
-		SHA:          ec.HeadSHA,
-		Event:        ec.Event,
-		Pipeline:     content,
-		Trusted:      ec.Trusted,
-		ChangedFiles: files,
-		Metadata:     map[string]string{"github_delivery": delivery},
+		RepoURL:           ec.HeadRepository.CloneURL,
+		RepoFullName:      ec.Repository.FullName,
+		Ref:               ec.Ref,
+		SHA:               ec.HeadSHA,
+		Event:             ec.Event,
+		Pipeline:          content,
+		Trusted:           ec.Trusted,
+		ChangedFiles:      files,
+		ChangedFilesKnown: filesKnown,
+		Metadata:          map[string]string{"github_delivery": delivery},
 	}
 	run, err := s.enqueue(in)
 	if err != nil {

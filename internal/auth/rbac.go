@@ -206,6 +206,12 @@ func ActionFor(method, path string) (Action, string, bool) {
 		}
 	case "runners":
 		if len(rest) == 1 && method == "GET" {
+			// The full runner inventory is an operations surface: only
+			// runner_manage (or admin) principals may list it. Readers
+			// use the redacted /runners/serving projection instead.
+			return ActionRunnerManage, "", true
+		}
+		if len(rest) == 2 && rest[1] == "serving" && method == "GET" {
 			return ActionRead, "", true
 		}
 		if len(rest) == 3 && method == "POST" {
@@ -213,6 +219,16 @@ func ActionFor(method, path string) (Action, string, bool) {
 			case "drain", "disable", "enable":
 				return ActionRunnerManage, "", true
 			}
+		}
+	case "runner-profiles":
+		if len(rest) == 1 && (method == "GET" || method == "POST") {
+			return ActionPolicyManage, "", true
+		}
+		if len(rest) == 2 && (method == "GET" || method == "PUT") {
+			return ActionPolicyManage, "", true
+		}
+		if len(rest) == 4 && rest[2] == "cert" && method == "PUT" {
+			return ActionPolicyManage, "", true
 		}
 	case "test-intelligence":
 		if len(rest) == 1 && method == "GET" {
