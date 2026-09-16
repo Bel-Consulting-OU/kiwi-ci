@@ -22,7 +22,7 @@ jobs:
       # actions/setup-go v7.0.0 -> b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          go-version: "1.23"
+          go-version-file: go.mod
       - name: gofmt
         run: test -z "$(gofmt -l .)"
 
@@ -34,7 +34,7 @@ jobs:
       # actions/setup-go v7.0.0 -> b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          go-version: "1.23"
+          go-version-file: go.mod
       - run: go vet ./...
 
   unit:
@@ -49,7 +49,7 @@ jobs:
       # actions/setup-go v7.0.0 -> b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          go-version: "1.23"
+          go-version-file: go.mod
       - run: go test -shuffle=on ./...
 
   race:
@@ -64,7 +64,7 @@ jobs:
       # actions/setup-go v7.0.0 -> b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          go-version: "1.23"
+          go-version-file: go.mod
       - run: go test -race -shuffle=on ./...
 
   # Windows has no race detector, so the concurrent-heavy packages get a
@@ -77,7 +77,7 @@ jobs:
       # actions/setup-go v7.0.0 -> b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          go-version: "1.23"
+          go-version-file: go.mod
       - name: Concurrent stress
         run: go test -count=10 -run 'Concurrent|Race|Parallel' ./internal/executor ./internal/server ./internal/storage ./internal/scheduler
 
@@ -89,7 +89,7 @@ jobs:
       # actions/setup-go v7.0.0 -> b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          go-version: "1.23"
+          go-version-file: go.mod
       - run: go test -run 'Adversarial|Security|Property|Fault|Symlink|Traversal|Tamper|Reject|Evil|Bomb' -shuffle=on ./...
 
   fuzz-smoke:
@@ -100,7 +100,7 @@ jobs:
       # actions/setup-go v7.0.0 -> b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          go-version: "1.23"
+          go-version-file: go.mod
       - run: ./scripts/fuzz-smoke.sh 10s
 
   schema:
@@ -111,7 +111,7 @@ jobs:
       # actions/setup-go v7.0.0 -> b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          go-version: "1.23"
+          go-version-file: go.mod
       - run: go test -run Schema ./internal/pipeline
       - run: go run ./cmd/filemap --check
 
@@ -123,7 +123,7 @@ jobs:
       # actions/setup-go v7.0.0 -> b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          go-version: "1.23"
+          go-version-file: go.mod
       - run: make cross
 
   # Installs staticcheck with the repo Go toolchain (setup-go above) rather
@@ -138,7 +138,7 @@ jobs:
       # actions/setup-go v7.0.0 -> b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          go-version: "1.23"
+          go-version-file: go.mod
       # actions/cache v6.1.0 -> 55cc8345863c7cc4c66a329aec7e433d2d1c52a9
       # Persists the module cache and the installed tool binary so the
       # analysis-time download is minimal on subsequent runs.
@@ -166,7 +166,7 @@ jobs:
       # actions/setup-go v7.0.0 -> b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          go-version: "1.23"
+          go-version-file: go.mod
       # actions/cache v6.1.0 -> 55cc8345863c7cc4c66a329aec7e433d2d1c52a9
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -199,5 +199,5 @@ jobs:
       # actions/setup-go v7.0.0 -> b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          go-version: "1.23"
+          go-version-file: go.mod
       - run: ./scripts/repro-build.sh

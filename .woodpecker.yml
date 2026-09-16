@@ -7,66 +7,66 @@
 
 steps:
   format:
-    image: golang:1.25
+    image: golang:1.26
     commands:
       - test -z "$(gofmt -l .)"
     when:
       - event: [push, pull_request, manual]
 
   vet:
-    image: golang:1.25
+    image: golang:1.26
     commands:
       - go vet ./...
 
   unit:
-    image: golang:1.25
+    image: golang:1.26
     environment:
       GOTOOLCHAIN: local
     commands:
       - go test -shuffle=on ./...
 
   race:
-    image: golang:1.25
+    image: golang:1.26
     commands:
       - go test -race -shuffle=on ./...
 
   adversarial:
-    image: golang:1.25
+    image: golang:1.26
     commands:
       - go test -run 'Adversarial|Security|Property|Fault|Symlink|Traversal|Tamper|Reject|Evil|Bomb' -shuffle=on ./...
 
   schema:
-    image: golang:1.25
+    image: golang:1.26
     commands:
       - go test -run Schema ./internal/pipeline
       - go run ./cmd/filemap --check
 
   cross:
-    image: golang:1.25
+    image: golang:1.26
     commands:
       - make cross
 
   license:
-    image: golang:1.25
+    image: golang:1.26
     commands:
       - make license-check
 
   docs:
-    image: golang:1.25
+    image: golang:1.26
     commands:
       - make docs-check
 
   repro:
-    image: golang:1.25
+    image: golang:1.26
     commands:
       - ./scripts/repro-build.sh
 
   govulncheck:
-    image: golang:1.25
+    image: golang:1.26
     commands:
       - go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
 
   staticcheck:
-    image: golang:1.25
+    image: golang:1.26
     commands:
       - go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...

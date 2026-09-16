@@ -4,10 +4,10 @@
 # Build stage.
 #
 # Pinned by digest (multi-arch OCI index) on 2026-09-14:
-#   golang:1.23-alpine@sha256:383395b794dffa5b53012a212365d40c8e37109a626ca30d6151c8348d380b5f
-# Re-resolve before bumping the Go minor: docker buildx imagetools inspect golang:1.23-alpine
+#   golang:1.26-alpine@sha256:ce864e7223ac17b1775e6fd0b4c0db580c2eb50e7953a427916379e4b92a1628
+# Re-resolve before bumping the Go minor: docker buildx imagetools inspect golang:1.26-alpine
 # ---------------------------------------------------------------------------
-FROM golang:1.23-alpine@sha256:383395b794dffa5b53012a212365d40c8e37109a626ca30d6151c8348d380b5f AS build
+FROM golang:1.26-alpine@sha256:ce864e7223ac17b1775e6fd0b4c0db580c2eb50e7953a427916379e4b92a1628 AS build
 
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
