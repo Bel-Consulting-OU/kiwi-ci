@@ -459,6 +459,8 @@ func (s *PostgresStore) cancelSupersededTx(ctx context.Context, tx pgx.Tx, jobID
 			return err
 		}
 		reason := "superseded by run " + newRunID
+		wasRunning := model.Status(status) == model.StatusRunning
+		runnerID := j.LeaseRunnerID
 		j.Status = model.StatusCancelled
 		j.Error = reason
 		j.FinishedAt = &now
@@ -473,6 +475,14 @@ func (s *PostgresStore) cancelSupersededTx(ctx context.Context, tx pgx.Tx, jobID
 			id, reason, now, jp); err != nil {
 			return err
 		}
+		// The cancelled job releases its runner slot in the SAME
+		// transaction: a superseded running job must never leave its
+		// runner's active_jobs entry behind.
+		if wasRunning && runnerID != "" {
+			if err := s.releaseRunnerSlotTx(ctx, tx, runnerID, id); err != nil {
+				return err
+			}
+		}
 		auditID, err := newID()
 		if err != nil {
 			return err
@@ -483,7 +493,6 @@ func (s *PostgresStore) cancelSupersededTx(ctx context.Context, tx pgx.Tx, jobID
 			return err
 		}
 		// The cancelled job releases its quota slot (running or queued).
-		wasRunning := model.Status(status) == model.StatusRunning
 		if wasRunning {
 			if err := s.adjustQuotaTx(ctx, tx, j.RepoURL, -1, 0); err != nil {
 				return err
@@ -901,7 +910,10 @@ func (s *PostgresStore) AcquireLease(ctx context.Context, jobID, runnerID string
 		return model.Job{}, fmt.Errorf("storage: empty runner id")
 	}
 	js := jobScanner{}
-	err := s.pool.QueryRow(ctx, `UPDATE jobs SET status='running', lease_runner_id=$2, lease_token_hash=$3, lease_generation=$4, lease_expires_at=$5 WHERE id=$1 AND status='queued' AND (lease_expires_at IS NULL OR lease_expires_at < now()) RETURNING `+jobCols,
+	// attempts increments exactly once per lease; started_at is stamped on
+	// the FIRST lease only (COALESCE) so requeues and lost-runner re-leases
+	// preserve the original start time.
+	err := s.pool.QueryRow(ctx, `UPDATE jobs SET status='running', attempts = attempts + 1, started_at = COALESCE(started_at, now()), lease_runner_id=$2, lease_token_hash=$3, lease_generation=$4, lease_expires_at=$5 WHERE id=$1 AND status='queued' AND (lease_expires_at IS NULL OR lease_expires_at < now()) RETURNING `+jobCols,
 		jobID, runnerID, tokenHash, generation, expiresAt).Scan(jobTargets(&js)...)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return model.Job{}, ErrLeaseConflict
@@ -912,17 +924,139 @@ func (s *PostgresStore) AcquireLease(ctx context.Context, jobID, runnerID string
 	return js.job()
 }
 
+// leaseRates resolves the usage rates frozen into a leased job: the live
+// profile's rates when the runner is linked, the runner row's registered
+// rates otherwise. The caller holds the runner row (and its profile) from
+// the same transaction.
+func leaseRates(linked bool, p model.RunnerProfile, runnerCost, runnerWatts float64) (float64, float64) {
+	if linked {
+		return p.CostPerHour, p.PowerWatts
+	}
+	return runnerCost, runnerWatts
+}
+
+// profileForSerialTx resolves the LIVE profile bound to a certificate serial
+// inside the caller's transaction. linked reports whether a
+// cert_profile_links row exists; found reports whether its profile row
+// exists. A linked-but-missing profile fails the claim closed.
+func profileForSerialTx(ctx context.Context, tx pgx.Tx, serial string) (p model.RunnerProfile, linked, found bool, err error) {
+	if strings.TrimSpace(serial) == "" {
+		return model.RunnerProfile{}, false, false, nil
+	}
+	var profileID string
+	err = tx.QueryRow(ctx, `SELECT profile_id FROM cert_profile_links WHERE serial=$1`, serial).Scan(&profileID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return model.RunnerProfile{}, false, false, nil
+	}
+	if err != nil {
+		return model.RunnerProfile{}, false, false, err
+	}
+	p, err = scanProfile(tx.QueryRow(ctx, `SELECT `+profileCols+` FROM runner_profiles WHERE id=$1`, profileID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return model.RunnerProfile{}, true, false, nil
+	}
+	if err != nil {
+		return model.RunnerProfile{}, false, false, err
+	}
+	return p, true, true, nil
+}
+
+// profileAllowsCandidate evaluates the live profile's scheduling
+// predicates against one candidate job: runtime capability, canonical repo
+// allowlist, required labels and placement regions. An empty profile field
+// imposes no restriction (matching the registration-time semantics).
+func profileAllowsCandidate(p model.RunnerProfile, jobRuntime, canonRepoID, repoFullName string, requiredLabels, placementRegions []string) bool {
+	if len(p.Capabilities) > 0 && jobRuntime != "" && !containsString(p.Capabilities, jobRuntime) {
+		return false
+	}
+	if len(p.Repositories) > 0 {
+		ok := false
+		for _, allowed := range p.Repositories {
+			if allowed == canonRepoID || (repoFullName != "" && allowed == repoFullName) {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return false
+		}
+	}
+	if len(requiredLabels) > 0 {
+		have := map[string]bool{}
+		for _, l := range p.Labels {
+			have[l] = true
+		}
+		for _, l := range requiredLabels {
+			if !have[l] {
+				return false
+			}
+		}
+	}
+	if len(placementRegions) > 0 && !containsString(placementRegions, p.Region) {
+		return false
+	}
+	return true
+}
+
+// claimQuotaTx moves one reservation slot from queued to running for the
+// repository and team keys, CONDITIONALLY: the UPDATE only matches while the
+// row is below the configured concurrency limit (limit <= 0 means
+// unlimited), so a concurrent claim can never push running over the limit.
+// Zero matched rows rolls the caller's lease back with ErrQuotaExceeded.
+func (s *PostgresStore) claimQuotaTx(ctx context.Context, tx pgx.Tx, repoURL string, repoLimit, teamLimit float64) error {
+	keys := quotaKeys(repoURL)
+	for i, key := range keys {
+		limit := repoLimit
+		reason, scope := "REPO_QUOTA", "repository"
+		if i > 0 {
+			limit = teamLimit
+			reason, scope = "TEAM_QUOTA", "team"
+		}
+		// Ensure the counter row exists so the conditional UPDATE has a row
+		// to evaluate; the row is then locked by the UPDATE for the rest of
+		// the transaction.
+		if _, err := tx.Exec(ctx, `INSERT INTO quota_reservations (key, running, queued) VALUES ($1, 0, 0) ON CONFLICT (key) DO NOTHING`, key); err != nil {
+			return err
+		}
+		ct, err := tx.Exec(ctx, `UPDATE quota_reservations SET running = running + 1, queued = GREATEST(queued - 1, 0), updated_at = now() WHERE key = $1 AND ($2::double precision <= 0 OR running < $2::double precision)`,
+			key, limit)
+		if err != nil {
+			return err
+		}
+		if ct.RowsAffected() == 0 {
+			return &QuotaExceededError{Reason: reason, Msg: fmt.Sprintf("%s %s already holds the maximum %g running job(s)", scope, key, limit)}
+		}
+	}
+	return nil
+}
+
 // AcquireLeaseAtomic claims a queued job and reserves the runner capacity
-// slot in ONE transaction: the job UPDATE takes the lease, the runner
-// UPDATE appends the job to active_jobs guarded by the capacity predicate,
-// and the quota counters move one slot from queued to running. When the
-// runner is at capacity the job lease is rolled back and ErrNoCapacity is
-// returned.
-func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, jobID, runnerID string, tokenHash []byte, generation int64, expiresAt time.Time, runnerCapacity int) (model.Job, error) {
-	if err := ValidateJobID(jobID); err != nil {
+// slot in ONE transaction. Lock order is job row first, then runner row —
+// the same order CompleteJob uses — so lease and completion can never
+// deadlock. Inside the transaction:
+//
+//  1. the environment concurrency slot is reserved under a per-key advisory
+//     lock with an in-transaction running-count check;
+//  2. the job row is locked and claimed (queued only) with attempts
+//     incremented once and started_at stamped on the first lease only;
+//  3. the runner row is locked and its live admin state (disabled/draining,
+//     capacity, cert serial, registered rates) is read;
+//  4. the LIVE profile is resolved through cert_profile_links (a profile
+//     edit takes effect on the next lease) and its capacity/repo ACL/
+//     capabilities/labels/region/rates replace the registration snapshot;
+//  5. the frozen usage rates are written into the job payload;
+//  6. the quota queued->running transition is conditional;
+//  7. the runner slot update enforces disabled/draining, capacity > 0, the
+//     capacity bound and the live profile predicates in SQL.
+//
+// Any failed predicate rolls every step back and returns the matching
+// sentinel error (ErrNoCapacity, ErrEnvConcurrency, ErrQuotaExceeded,
+// ErrLeaseConflict).
+func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim) (model.Job, error) {
+	if err := ValidateJobID(claim.JobID); err != nil {
 		return model.Job{}, err
 	}
-	if runnerID == "" {
+	if claim.RunnerID == "" {
 		return model.Job{}, fmt.Errorf("storage: empty runner id")
 	}
 	tx, err := s.pool.Begin(ctx)
@@ -930,29 +1064,149 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, jobID, runnerID 
 		return model.Job{}, err
 	}
 	defer tx.Rollback(ctx)
-	js := jobScanner{}
-	err = tx.QueryRow(ctx, `UPDATE jobs SET status='running', lease_runner_id=$2, lease_token_hash=$3, lease_generation=$4, lease_expires_at=$5 WHERE id=$1 AND status='queued' AND (lease_expires_at IS NULL OR lease_expires_at < now()) RETURNING `+jobCols,
-		jobID, runnerID, tokenHash, generation, expiresAt).Scan(jobTargets(&js)...)
+
+	// Step 1: lock the job row first (job -> runner ordering, matching
+	// CompleteJob) and fail fast when the job is not queued.
+	var jobStatus string
+	err = tx.QueryRow(ctx, `SELECT status FROM jobs WHERE id=$1 FOR UPDATE`, claim.JobID).Scan(&jobStatus)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return model.Job{}, ErrLeaseConflict
 	}
 	if err != nil {
 		return model.Job{}, err
 	}
-	ct, err := tx.Exec(ctx, `UPDATE runners SET active_jobs = COALESCE(active_jobs, '[]'::jsonb) || to_jsonb($1::text), busy = TRUE, current_job = CASE WHEN COALESCE(current_job, '') = '' THEN $1 ELSE current_job END, last_seen = now() WHERE id = $2 AND ($3 <= 0 OR jsonb_array_length(COALESCE(active_jobs, '[]'::jsonb)) < $3)`,
-		jobID, runnerID, runnerCapacity)
+	if model.Status(jobStatus) != model.StatusQueued {
+		return model.Job{}, ErrLeaseConflict
+	}
+
+	// Step 2: environment concurrency is reserved inside this transaction:
+	// the per-key advisory lock serializes concurrent claims of the same
+	// (repo, environment) key, and the running count is read after taking
+	// the lock, so two polls can never both win the last slot.
+	if envKey := claim.EnvKey(); envKey != "" && claim.EnvironmentConcurrency > 0 {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "kiwi-env\x00"+envKey); err != nil {
+			return model.Job{}, err
+		}
+		var running int
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE status='running' AND payload->>'repo_url'=$1 AND payload->>'environment'=$2 AND id<>$3`,
+			claim.RepoURL, claim.Environment, claim.JobID).Scan(&running); err != nil {
+			return model.Job{}, err
+		}
+		if running >= claim.EnvironmentConcurrency {
+			return model.Job{}, ErrEnvConcurrency
+		}
+	}
+
+	// Step 3: lock the runner row and read its live admin state.
+	var (
+		runnerCapacity   int
+		runnerCost       float64
+		runnerWatts      float64
+		runnerDisabled   bool
+		runnerDraining   bool
+		runnerCertSerial string
+	)
+	err = tx.QueryRow(ctx, `SELECT capacity, COALESCE((payload->>'cost_per_hour')::double precision, 0), COALESCE((payload->>'power_watts')::double precision, 0), disabled, draining, COALESCE(payload->>'cert_serial', '') FROM runners WHERE id=$1 FOR UPDATE`, claim.RunnerID).
+		Scan(&runnerCapacity, &runnerCost, &runnerWatts, &runnerDisabled, &runnerDraining, &runnerCertSerial)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return model.Job{}, ErrNoCapacity
+	}
 	if err != nil {
 		return model.Job{}, err
 	}
-	if ct.RowsAffected() == 0 {
+	if runnerDisabled || runnerDraining {
 		return model.Job{}, ErrNoCapacity
+	}
+
+	// Step 4: resolve the LIVE profile and replace the registration
+	// snapshot with its values for every scheduling predicate.
+	profile, linked, found, err := profileForSerialTx(ctx, tx, runnerCertSerial)
+	if err != nil {
+		return model.Job{}, err
+	}
+	if linked && !found {
+		// A runner whose linked profile vanished takes no work: fail closed.
+		return model.Job{}, ErrNoCapacity
+	}
+	capacity := runnerCapacity
+	if linked {
+		capacity = profile.MaxCapacity
+		if !profileAllowsCandidate(profile, claim.Runtime, claim.CanonRepoID, claim.RepoFullName, claim.RequiredLabels, claim.PlacementRegions) {
+			return model.Job{}, ErrNoCapacity
+		}
+	}
+	if capacity <= 0 {
+		return model.Job{}, ErrNoCapacity
+	}
+	costRate, powerWatts := leaseRates(linked, profile, runnerCost, runnerWatts)
+
+	// Step 5: claim the job (queued -> running) with attempts/started_at.
+	js := jobScanner{}
+	err = tx.QueryRow(ctx, `UPDATE jobs SET status='running', attempts = attempts + 1, started_at = COALESCE(started_at, now()), lease_runner_id=$2, lease_token_hash=$3, lease_generation=$4, lease_expires_at=$5 WHERE id=$1 AND status='queued' AND (lease_expires_at IS NULL OR lease_expires_at < now()) RETURNING `+jobCols,
+		claim.JobID, claim.RunnerID, claim.TokenHash, claim.Generation, claim.ExpiresAt).Scan(jobTargets(&js)...)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return model.Job{}, ErrLeaseConflict
+	}
+	if err != nil {
+		return model.Job{}, err
 	}
 	j, err := js.job()
 	if err != nil {
 		return model.Job{}, err
 	}
-	if err := s.adjustQuotaTx(ctx, tx, j.RepoURL, 1, -1); err != nil {
+	// The job row is held by this transaction: freeze the live usage rates
+	// into the payload, and mirror them on the returned job.
+	if _, err := tx.Exec(ctx, `UPDATE jobs SET payload = jsonb_set(jsonb_set(payload, '{cost_rate}', to_jsonb($2::double precision), true), '{power_watts}', to_jsonb($3::double precision), true) WHERE id=$1`,
+		claim.JobID, costRate, powerWatts); err != nil {
 		return model.Job{}, err
+	}
+	j.CostRate = costRate
+	j.PowerWatts = powerWatts
+
+	// Step 6: conditional queued -> running quota transition.
+	if err := s.claimQuotaTx(ctx, tx, j.RepoURL, claim.RepoConcurrency, claim.TeamConcurrency); err != nil {
+		return model.Job{}, err
+	}
+
+	// Step 7: reserve the runner slot. The predicates are evaluated in SQL
+	// against the live row + resolved profile values: disabled/draining,
+	// capacity > 0, capacity bound, runtime capability, repo allowlist,
+	// required labels and placement regions. profileJSON carries every
+	// predicate field explicitly (empty arrays, never omitted keys) so the
+	// jsonb operators never see NULL.
+	var profileJSON []byte
+	if linked {
+		view := struct {
+			Labels       []string `json:"labels"`
+			Region       string   `json:"region"`
+			Repositories []string `json:"repositories"`
+			Capabilities []string `json:"capabilities"`
+		}{
+			Labels:       append([]string{}, profile.Labels...),
+			Region:       profile.Region,
+			Repositories: append([]string{}, profile.Repositories...),
+			Capabilities: append([]string{}, profile.Capabilities...),
+		}
+		profileJSON, err = json.Marshal(view)
+		if err != nil {
+			return model.Job{}, err
+		}
+	}
+	labelsJSON, err := json.Marshal(append([]string{}, claim.RequiredLabels...))
+	if err != nil {
+		return model.Job{}, err
+	}
+	regionsJSON, err := json.Marshal(append([]string{}, claim.PlacementRegions...))
+	if err != nil {
+		return model.Job{}, err
+	}
+	ct, err := tx.Exec(ctx, `UPDATE runners SET active_jobs = COALESCE(active_jobs, '[]'::jsonb) || to_jsonb($1::text), busy = TRUE, current_job = CASE WHEN COALESCE(current_job, '') = '' THEN $1 ELSE current_job END, last_seen = now() WHERE id = $2 AND disabled = FALSE AND draining = FALSE AND $3 > 0 AND jsonb_array_length(COALESCE(active_jobs, '[]'::jsonb)) < $3 AND ($4::jsonb IS NULL OR ((jsonb_array_length(COALESCE($4::jsonb->'capabilities', '[]'::jsonb)) = 0 OR $5 = '' OR ($4::jsonb->'capabilities') ? $5) AND (jsonb_array_length(COALESCE($4::jsonb->'repositories', '[]'::jsonb)) = 0 OR ($4::jsonb->'repositories') ? $6 OR ($7 <> '' AND ($4::jsonb->'repositories') ? $7)) AND (jsonb_array_length($8::jsonb) = 0 OR COALESCE($4::jsonb->'labels', '[]'::jsonb) @> $8::jsonb) AND (jsonb_array_length($9::jsonb) = 0 OR COALESCE($4::jsonb->>'region', '') IN (SELECT jsonb_array_elements_text($9::jsonb)))))`,
+		claim.JobID, claim.RunnerID, capacity, profileJSON, claim.Runtime, claim.CanonRepoID, claim.RepoFullName, labelsJSON, regionsJSON)
+	if err != nil {
+		return model.Job{}, err
+	}
+	if ct.RowsAffected() == 0 {
+		return model.Job{}, ErrNoCapacity
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return model.Job{}, err
@@ -1190,15 +1444,15 @@ func (s *PostgresStore) completeRunnerTx(ctx context.Context, tx pgx.Tx, runnerI
 		return err
 	}
 	active = removeString(active, jobID)
-	if capacity < 1 {
-		capacity = 1
-	}
+	// Capacity 0 means "take no work" and must survive completion: the
+	// clamp to 1 is deliberately gone. A zero-capacity runner reports
+	// non-busy (it has no leased work) but is never leased a new job.
 	r.ActiveJobs = active
 	r.CurrentJob = ""
 	if len(active) > 0 {
 		r.CurrentJob = active[0]
 	}
-	r.Busy = len(active) >= capacity
+	r.Busy = capacity > 0 && len(active) >= capacity
 	r.Capacity = capacity
 	if st == model.StatusSuccess {
 		completed++
@@ -1475,6 +1729,21 @@ func dependencyConditionAllows(expr string, status model.Status) bool {
 	return pipeline.ConditionAllows(expr, status)
 }
 
+// cancelTarget is one row drained from the CancelRunJobs FOR UPDATE
+// cursor. The rows are collected and the cursor closed BEFORE any update
+// runs: pgx forbids issuing tx.Exec while a Query cursor is still open on
+// the same connection.
+type cancelTarget struct {
+	id         string
+	payload    []byte
+	wasRunning bool
+	runnerID   string
+}
+
+// CancelRunJobs cancels every non-terminal job of the run and the run
+// itself in one transaction. Every cancelled RUNNING job releases its
+// runner's active_jobs slot (and its quota running slot) in the SAME
+// transaction, so a cancelled run can never leak a runner slot.
 func (s *PostgresStore) CancelRunJobs(ctx context.Context, runID string, reason string) ([]string, error) {
 	if err := ValidateRunID(runID); err != nil {
 		return nil, err
@@ -1485,26 +1754,40 @@ func (s *PostgresStore) CancelRunJobs(ctx context.Context, runID string, reason 
 	}
 	defer tx.Rollback(ctx)
 	now := time.Now().UTC()
-	ids := []string{}
-	rows, err := tx.Query(ctx, `SELECT id, payload FROM jobs WHERE run_id=$1 AND NOT (status IN ('success', 'failure', 'cancelled', 'skipped', 'blocked')) ORDER BY id FOR UPDATE`, runID)
+	// Phase 1: lock and collect the target rows. The cursor is closed before
+	// any tx.Exec so this never nests a query on an open cursor.
+	rows, err := tx.Query(ctx, `SELECT id, payload, status, COALESCE(lease_runner_id, '') FROM jobs WHERE run_id=$1 AND NOT (status IN ('success', 'failure', 'cancelled', 'skipped', 'blocked')) ORDER BY id FOR UPDATE`, runID)
 	if err != nil {
 		return nil, err
 	}
+	targets := []cancelTarget{}
 	for rows.Next() {
 		var (
-			id      string
-			payload []byte
+			t             cancelTarget
+			status        string
+			leaseRunnerID string
+			payload       []byte
 		)
-		if err := rows.Scan(&id, &payload); err != nil {
+		if err := rows.Scan(&t.id, &payload, &status, &leaseRunnerID); err != nil {
 			rows.Close()
 			return nil, err
 		}
+		t.payload = payload
+		t.wasRunning = model.Status(status) == model.StatusRunning
+		t.runnerID = leaseRunnerID
+		targets = append(targets, t)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Phase 2: apply every cancellation in the same transaction.
+	ids := []string{}
+	for _, t := range targets {
 		var j model.Job
-		if err := json.Unmarshal(payload, &j); err != nil {
-			rows.Close()
+		if err := json.Unmarshal(t.payload, &j); err != nil {
 			return nil, err
 		}
-		wasRunning := j.Status == model.StatusRunning
 		j.Status = model.StatusCancelled
 		j.Error = reason
 		j.FinishedAt = &now
@@ -1513,29 +1796,30 @@ func (s *PostgresStore) CancelRunJobs(ctx context.Context, runID string, reason 
 		j.LeaseExpiresAt = nil
 		jp, err := json.Marshal(j)
 		if err != nil {
-			rows.Close()
 			return nil, err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE jobs SET status='cancelled', error=$2, finished_at=$3, lease_runner_id=NULL, lease_token_hash=NULL, lease_expires_at=NULL, payload=$4 WHERE id=$1`,
-			id, reason, now, jp); err != nil {
-			rows.Close()
+			t.id, reason, now, jp); err != nil {
 			return nil, err
 		}
 		// The cancelled job releases its reserved slot (running or queued).
-		if wasRunning {
-			err = s.adjustQuotaTx(ctx, tx, j.RepoURL, -1, 0)
+		if t.wasRunning {
+			if err := s.adjustQuotaTx(ctx, tx, j.RepoURL, -1, 0); err != nil {
+				return nil, err
+			}
+			// A running job also held a runner capacity slot: splice it out
+			// of the runner's active set in the same transaction.
+			if t.runnerID != "" {
+				if err := s.releaseRunnerSlotTx(ctx, tx, t.runnerID, t.id); err != nil {
+					return nil, err
+				}
+			}
 		} else {
-			err = s.adjustQuotaTx(ctx, tx, j.RepoURL, 0, -1)
+			if err := s.adjustQuotaTx(ctx, tx, j.RepoURL, 0, -1); err != nil {
+				return nil, err
+			}
 		}
-		if err != nil {
-			rows.Close()
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, err
+		ids = append(ids, t.id)
 	}
 	// Cancel the run itself, mirroring the in-memory cancelRunLocked.
 	var (
@@ -1592,8 +1876,8 @@ func (s *PostgresStore) UpsertRunner(ctx context.Context, runner model.Runner) e
 	if !runner.LastSeen.IsZero() {
 		lastSeen = runner.LastSeen
 	}
-	_, err = s.pool.Exec(ctx, `INSERT INTO runners (id, busy, capacity, completed, failed, current_job, active_jobs, registered, last_seen, payload) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (id) DO UPDATE SET busy=EXCLUDED.busy, capacity=EXCLUDED.capacity, completed=EXCLUDED.completed, failed=EXCLUDED.failed, current_job=EXCLUDED.current_job, active_jobs=EXCLUDED.active_jobs, registered=EXCLUDED.registered, last_seen=EXCLUDED.last_seen, payload=EXCLUDED.payload`,
-		runner.ID, runner.Busy, runner.Capacity, runner.Completed, runner.Failed, nullText(runner.CurrentJob), activeJSON, registered, lastSeen, payload)
+	_, err = s.pool.Exec(ctx, `INSERT INTO runners (id, busy, capacity, completed, failed, current_job, active_jobs, registered, last_seen, payload, disabled, draining) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (id) DO UPDATE SET busy=EXCLUDED.busy, capacity=EXCLUDED.capacity, completed=EXCLUDED.completed, failed=EXCLUDED.failed, current_job=EXCLUDED.current_job, active_jobs=EXCLUDED.active_jobs, registered=EXCLUDED.registered, last_seen=EXCLUDED.last_seen, payload=EXCLUDED.payload, disabled=EXCLUDED.disabled, draining=EXCLUDED.draining`,
+		runner.ID, runner.Busy, runner.Capacity, runner.Completed, runner.Failed, nullText(runner.CurrentJob), activeJSON, registered, lastSeen, payload, runner.Disabled, runner.Draining)
 	return err
 }
 
@@ -1669,15 +1953,14 @@ func (s *PostgresStore) ReleaseRunnerJob(ctx context.Context, runnerID, jobID st
 		return err
 	}
 	active = removeString(active, jobID)
-	if capacity < 1 {
-		capacity = 1
-	}
+	// Capacity 0 survives release: zero means "take no work", so the
+	// runner stays non-leasable instead of being clamped back to 1.
 	r.ActiveJobs = active
 	r.CurrentJob = ""
 	if len(active) > 0 {
 		r.CurrentJob = active[0]
 	}
-	r.Busy = len(active) >= capacity
+	r.Busy = capacity > 0 && len(active) >= capacity
 	r.Capacity = capacity
 	if status == model.StatusSuccess {
 		completed++
@@ -1717,6 +2000,25 @@ func (s *PostgresStore) ReleaseRunnerJob(ctx context.Context, runnerID, jobID st
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// releaseRunnerSlotTx splices one job ID out of a runner's active_jobs set
+// inside the caller's transaction, recomputing busy and current_job from the
+// remaining set. Capacity 0 survives (busy stays false: a zero-capacity
+// runner holds no leasable work). Missing runners are tolerated.
+func (s *PostgresStore) releaseRunnerSlotTx(ctx context.Context, tx pgx.Tx, runnerID, jobID string) error {
+	_, err := tx.Exec(ctx, `WITH kept AS (
+    SELECT COALESCE(jsonb_agg(e), '[]'::jsonb) AS active
+    FROM jsonb_array_elements(COALESCE((SELECT active_jobs FROM runners WHERE id=$2), '[]'::jsonb)) e
+    WHERE e <> to_jsonb($1::text)
+)
+UPDATE runners SET
+    active_jobs = (SELECT active FROM kept),
+    busy = CASE WHEN capacity > 0 THEN jsonb_array_length((SELECT active FROM kept)) >= capacity ELSE FALSE END,
+    current_job = CASE WHEN jsonb_array_length((SELECT active FROM kept)) > 0 THEN (SELECT active FROM kept)->>0 ELSE NULL END,
+    last_seen = now()
+WHERE id = $2`, jobID, runnerID)
+	return err
 }
 
 // ---------------------------------------------------------------------------
@@ -1776,9 +2078,64 @@ func (s *PostgresStore) InsertArtifact(ctx context.Context, a model.ArtifactReco
 	if err != nil {
 		return err
 	}
-	_, err = s.pool.Exec(ctx, `INSERT INTO artifacts (id, run_id, job_id, job_key, name, size, sha256, created_at, expires_at, payload) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-		a.ID, a.RunID, nullText(a.JobID), nullText(a.JobKey), a.Name, a.Size, nullText(a.SHA256), a.CreatedAt, a.ExpiresAt, payload)
+	_, err = s.pool.Exec(ctx, `INSERT INTO artifacts (id, run_id, job_id, job_key, name, size, sha256, created_at, expires_at, job_generation, payload) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		a.ID, a.RunID, nullText(a.JobID), nullText(a.JobKey), a.Name, a.Size, nullText(a.SHA256), a.CreatedAt, a.ExpiresAt, a.LeaseGeneration, payload)
 	return err
+}
+
+// InsertArtifactOnce is the authoritative idempotent artifact insert: the
+// (job_id, job_generation, name) unique index arbitrates concurrent replicas
+// staging the same artifact name. A conflict returns the STORED record with
+// created=false (same digest) or ErrArtifactDigestConflict (different
+// digest); the stored record is never overwritten and no second row is
+// created.
+func (s *PostgresStore) InsertArtifactOnce(ctx context.Context, a model.ArtifactRecord) (model.ArtifactRecord, bool, error) {
+	if err := ValidateID(a.ID); err != nil {
+		return model.ArtifactRecord{}, false, err
+	}
+	if err := ValidateRunID(a.RunID); err != nil {
+		return model.ArtifactRecord{}, false, err
+	}
+	payload, err := json.Marshal(a)
+	if err != nil {
+		return model.ArtifactRecord{}, false, err
+	}
+	ct, err := s.pool.Exec(ctx, `INSERT INTO artifacts (id, run_id, job_id, job_key, name, size, sha256, created_at, expires_at, job_generation, payload) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (job_id, job_generation, name) DO NOTHING`,
+		a.ID, a.RunID, nullText(a.JobID), nullText(a.JobKey), a.Name, a.Size, nullText(a.SHA256), a.CreatedAt, a.ExpiresAt, a.LeaseGeneration, payload)
+	if err != nil {
+		return model.ArtifactRecord{}, false, err
+	}
+	if ct.RowsAffected() == 1 {
+		return a, true, nil
+	}
+	// A conflicting row exists (a NULL job_id never conflicts, so JobID is
+	// non-empty on this path).
+	existing, err := s.artifactByGenerationKey(ctx, a.JobID, a.LeaseGeneration, a.Name)
+	if err != nil {
+		return model.ArtifactRecord{}, false, err
+	}
+	if existing.SHA256 != a.SHA256 {
+		return existing, false, ErrArtifactDigestConflict
+	}
+	return existing, false, nil
+}
+
+// artifactByGenerationKey reads the artifact row under the idempotency key.
+func (s *PostgresStore) artifactByGenerationKey(ctx context.Context, jobID string, generation int64, name string) (model.ArtifactRecord, error) {
+	var payload []byte
+	err := s.pool.QueryRow(ctx, `SELECT payload FROM artifacts WHERE job_id=$1 AND job_generation=$2 AND name=$3 LIMIT 1`,
+		jobID, generation, name).Scan(&payload)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return model.ArtifactRecord{}, ErrNotFound
+	}
+	if err != nil {
+		return model.ArtifactRecord{}, err
+	}
+	var a model.ArtifactRecord
+	if err := json.Unmarshal(payload, &a); err != nil {
+		return model.ArtifactRecord{}, err
+	}
+	return a, nil
 }
 
 func (s *PostgresStore) ListArtifacts(ctx context.Context, runID string) ([]model.ArtifactRecord, error) {
@@ -2063,6 +2420,8 @@ func (s *PostgresStore) OutboxAck(ctx context.Context, id string) error {
 	if id == "" {
 		return fmt.Errorf("storage: empty outbox id")
 	}
+	// Deleting the row clears its claim atomically with the ack: a claimed
+	// but crash-stranded row can only be reclaimed for OutboxClaimTTL.
 	_, err := s.pool.Exec(ctx, `DELETE FROM outbox WHERE id=$1`, id)
 	return err
 }
@@ -2084,6 +2443,54 @@ func (s *PostgresStore) OutboxPending(ctx context.Context) ([]OutboxItem, error)
 	return out, rows.Err()
 }
 
+// ClaimOutbox atomically claims up to limit dispatchable rows for claimer:
+// rows that are unclaimed or whose claim is older than OutboxClaimTTL are
+// selected in FIFO order with FOR UPDATE SKIP LOCKED, so concurrent flushers
+// on different replicas claim disjoint batches and never double-dispatch.
+func (s *PostgresStore) ClaimOutbox(ctx context.Context, claimer string, limit int) ([]OutboxItem, error) {
+	if strings.TrimSpace(claimer) == "" {
+		return nil, fmt.Errorf("storage: empty outbox claimer")
+	}
+	if limit <= 0 {
+		return nil, nil
+	}
+	cutoff := time.Now().UTC().Add(-OutboxClaimTTL)
+	rows, err := s.pool.Query(ctx, `UPDATE outbox o SET claimed_at = now(), claimed_by = $1
+		FROM (
+			SELECT id FROM outbox
+			WHERE claimed_at IS NULL OR claimed_at < $3
+			ORDER BY created_at ASC, id ASC
+			LIMIT $2
+			FOR UPDATE SKIP LOCKED
+		) c
+		WHERE o.id = c.id
+		RETURNING o.id, o.kind, o.payload, o.created_at`, claimer, limit, cutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []OutboxItem{}
+	for rows.Next() {
+		var it OutboxItem
+		if err := rows.Scan(&it.ID, &it.Kind, &it.Payload, &it.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+// ReleaseOutboxClaim drops a claim the caller made but did not dispatch, so a
+// retry can claim the row again immediately instead of waiting out the TTL.
+// Only the claiming flusher can release: a stale claim is reclaimed by TTL.
+func (s *PostgresStore) ReleaseOutboxClaim(ctx context.Context, id, claimer string) error {
+	if id == "" {
+		return fmt.Errorf("storage: empty outbox id")
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE outbox SET claimed_at = NULL, claimed_by = NULL WHERE id=$1 AND claimed_by=$2`, id, claimer)
+	return err
+}
+
 // ---------------------------------------------------------------------------
 // schedules
 // ---------------------------------------------------------------------------
@@ -2092,13 +2499,13 @@ func (s *PostgresStore) UpsertSchedule(ctx context.Context, sc Schedule) error {
 	if sc.ID == "" {
 		return fmt.Errorf("storage: empty schedule id")
 	}
-	_, err := s.pool.Exec(ctx, `INSERT INTO schedules (id, repository, repo_id, repo_url, forge, trusted, spec, enabled, last_run, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (id) DO UPDATE SET repository=EXCLUDED.repository, repo_id=EXCLUDED.repo_id, repo_url=EXCLUDED.repo_url, forge=EXCLUDED.forge, trusted=EXCLUDED.trusted, spec=EXCLUDED.spec, enabled=EXCLUDED.enabled, last_run=EXCLUDED.last_run`,
-		sc.ID, sc.Repository, sc.RepoID, sc.RepoURL, sc.Forge, sc.Trusted, sc.Spec, sc.Enabled, sc.LastRun, sc.CreatedAt)
+	_, err := s.pool.Exec(ctx, `INSERT INTO schedules (id, repository, repo_id, repo_url, forge, trusted, spec, enabled, last_run, created_at, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (id) DO UPDATE SET repository=EXCLUDED.repository, repo_id=EXCLUDED.repo_id, repo_url=EXCLUDED.repo_url, forge=EXCLUDED.forge, trusted=EXCLUDED.trusted, spec=EXCLUDED.spec, enabled=EXCLUDED.enabled, last_run=EXCLUDED.last_run, created_by=EXCLUDED.created_by`,
+		sc.ID, sc.Repository, sc.RepoID, sc.RepoURL, sc.Forge, sc.Trusted, sc.Spec, sc.Enabled, sc.LastRun, sc.CreatedAt, sc.CreatedBy)
 	return err
 }
 
 func (s *PostgresStore) ListSchedules(ctx context.Context) ([]Schedule, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id, repository, COALESCE(repo_id, ''), COALESCE(repo_url, ''), COALESCE(forge, ''), trusted, spec, enabled, last_run, created_at FROM schedules ORDER BY created_at ASC, id ASC`)
+	rows, err := s.pool.Query(ctx, `SELECT id, repository, COALESCE(repo_id, ''), COALESCE(repo_url, ''), COALESCE(forge, ''), trusted, spec, enabled, last_run, created_at, COALESCE(created_by, '') FROM schedules ORDER BY created_at ASC, id ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -2106,7 +2513,7 @@ func (s *PostgresStore) ListSchedules(ctx context.Context) ([]Schedule, error) {
 	out := []Schedule{}
 	for rows.Next() {
 		var sc Schedule
-		if err := rows.Scan(&sc.ID, &sc.Repository, &sc.RepoID, &sc.RepoURL, &sc.Forge, &sc.Trusted, &sc.Spec, &sc.Enabled, &sc.LastRun, &sc.CreatedAt); err != nil {
+		if err := rows.Scan(&sc.ID, &sc.Repository, &sc.RepoID, &sc.RepoURL, &sc.Forge, &sc.Trusted, &sc.Spec, &sc.Enabled, &sc.LastRun, &sc.CreatedAt, &sc.CreatedBy); err != nil {
 			return nil, err
 		}
 		out = append(out, sc)
@@ -2397,71 +2804,157 @@ func (s *PostgresStore) InsertGeneratedJobs(ctx context.Context, parentJobID str
 	return tx.Commit(ctx)
 }
 
-// InsertGeneratedJobsTx inserts the fragment and runs the verification
-// closure in the SAME transaction: the parent job is locked FOR UPDATE and
-// the run's current job count is read inside the transaction, then the
-// verifier re-checks {job, runner, generation, token, expiry} and the
-// max-jobs-per-run bound against that fresh state. The fragment's artifact
-// contracts commit in the same transaction as the jobs, so a generated job
-// with a Required artifact has its contract row present before any
-// completion can run. A rejected verification (or a failed contract write)
-// rolls the whole fragment back.
-func (s *PostgresStore) InsertGeneratedJobsTx(ctx context.Context, parentJobID string, depth int, jobs map[string]model.Job, deps map[string][]string, contracts map[string]map[string]ArtifactContract, verify GeneratedJobVerifier) error {
+// GetGeneratedFragment reads one fragment idempotency receipt. found=false
+// means the fragment was never admitted under this (parent, generation,
+// fragment id) triple.
+func (s *PostgresStore) GetGeneratedFragment(ctx context.Context, parentJobID string, generation int64, fragmentID string) (GeneratedFragmentReceipt, bool, error) {
 	if err := ValidateJobID(parentJobID); err != nil {
-		return err
+		return GeneratedFragmentReceipt{}, false, err
+	}
+	if fragmentID == "" {
+		return GeneratedFragmentReceipt{}, false, error(fmt.Errorf("storage: empty fragment id"))
+	}
+	var (
+		raw []byte
+		ts  time.Time
+	)
+	err := s.pool.QueryRow(ctx, `SELECT children, created_at FROM generated_fragments WHERE parent_job_id=$1 AND lease_generation=$2 AND fragment_id=$3`,
+		parentJobID, generation, fragmentID).Scan(&raw, &ts)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return GeneratedFragmentReceipt{}, false, nil
+	}
+	if err != nil {
+		return GeneratedFragmentReceipt{}, false, err
+	}
+	rec := GeneratedFragmentReceipt{ParentJobID: parentJobID, LeaseGeneration: generation, FragmentID: fragmentID, CreatedAt: ts}
+	if err := json.Unmarshal(raw, &rec.Children); err != nil {
+		return GeneratedFragmentReceipt{}, false, err
+	}
+	return rec, true, nil
+}
+
+// InsertGeneratedFragmentTx inserts the fragment and its idempotency receipt
+// and runs the verification closure in the SAME transaction:
+//
+//  1. a committed receipt for the same (parent, generation, fragment id) is
+//     returned with replayed=true and nothing is inserted (the lost-response
+//     replay path);
+//  2. the parent job is locked FOR UPDATE and the run's current job count is
+//     read inside the transaction, then the verifier re-checks {job, runner,
+//     generation, token, expiry} and the max-jobs-per-run bound against that
+//     fresh state;
+//  3. the child jobs, dependency edges, artifact contracts and the receipt
+//     commit together — a generated job with a Required artifact has its
+//     contract row present before any completion can run, and a crash can
+//     never leave a receipt without its children (or children without a
+//     receipt).
+//
+// A concurrent duplicate insert that loses the receipt race rolls its own
+// job rows back and returns the winner's receipt, so exactly one fragment is
+// ever visible.
+func (s *PostgresStore) InsertGeneratedFragmentTx(ctx context.Context, req GeneratedFragmentRequest, verify GeneratedJobVerifier) (GeneratedFragmentReceipt, bool, error) {
+	if err := ValidateJobID(req.ParentJobID); err != nil {
+		return GeneratedFragmentReceipt{}, false, err
+	}
+	if req.FragmentID == "" {
+		return GeneratedFragmentReceipt{}, false, fmt.Errorf("storage: empty fragment id")
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return err
+		return GeneratedFragmentReceipt{}, false, err
 	}
 	defer tx.Rollback(ctx)
+	// Replay fast path inside the transaction.
+	var raw []byte
+	err = tx.QueryRow(ctx, `SELECT children FROM generated_fragments WHERE parent_job_id=$1 AND lease_generation=$2 AND fragment_id=$3 FOR UPDATE`,
+		req.ParentJobID, req.LeaseGeneration, req.FragmentID).Scan(&raw)
+	if err == nil {
+		rec := GeneratedFragmentReceipt{ParentJobID: req.ParentJobID, LeaseGeneration: req.LeaseGeneration, FragmentID: req.FragmentID}
+		if err := json.Unmarshal(raw, &rec.Children); err != nil {
+			return GeneratedFragmentReceipt{}, false, err
+		}
+		return rec, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return GeneratedFragmentReceipt{}, false, err
+	}
 	js := jobScanner{}
-	err = tx.QueryRow(ctx, `SELECT `+jobCols+` FROM jobs WHERE id=$1 FOR UPDATE`, parentJobID).Scan(jobTargets(&js)...)
+	err = tx.QueryRow(ctx, `SELECT `+jobCols+` FROM jobs WHERE id=$1 FOR UPDATE`, req.ParentJobID).Scan(jobTargets(&js)...)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrNotFound
+		return GeneratedFragmentReceipt{}, false, ErrNotFound
 	}
 	if err != nil {
-		return err
+		return GeneratedFragmentReceipt{}, false, err
 	}
 	parent, err := js.job()
 	if err != nil {
-		return err
+		return GeneratedFragmentReceipt{}, false, err
 	}
 	var runJobCount int
 	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM jobs WHERE run_id=$1`, parent.RunID).Scan(&runJobCount); err != nil {
-		return err
+		return GeneratedFragmentReceipt{}, false, err
 	}
 	if verify != nil {
 		if err := verify(parent, runJobCount); err != nil {
-			return err
+			return GeneratedFragmentReceipt{}, false, err
 		}
 	}
-	for _, j := range jobs {
+	for _, j := range req.Jobs {
 		if err := ValidateJobID(j.ID); err != nil {
-			return err
+			return GeneratedFragmentReceipt{}, false, err
 		}
 		if err := s.insertJobRowTx(ctx, tx, j); err != nil {
-			return err
+			return GeneratedFragmentReceipt{}, false, err
 		}
 	}
-	for _, j := range jobs {
+	for _, j := range req.Jobs {
 		if err := s.replaceDependenciesTx(ctx, tx, j); err != nil {
-			return err
+			return GeneratedFragmentReceipt{}, false, err
 		}
 	}
-	for id, cs := range contracts {
+	for id, cs := range req.Contracts {
 		if err := ValidateJobID(id); err != nil {
-			return err
+			return GeneratedFragmentReceipt{}, false, err
 		}
 		cp, err := json.Marshal(cs)
 		if err != nil {
-			return err
+			return GeneratedFragmentReceipt{}, false, err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE jobs SET payload = jsonb_set(payload, '{artifact_contracts}', $2::jsonb, true) WHERE id=$1`, id, cp); err != nil {
-			return err
+			return GeneratedFragmentReceipt{}, false, err
 		}
 	}
-	return tx.Commit(ctx)
+	now := time.Now().UTC()
+	// Canonical order contract: the caller passes Children in sorted-key
+	// order (the same order its response reported).
+	children := append([]GeneratedFragmentChild(nil), req.Children...)
+	cb, err := json.Marshal(children)
+	if err != nil {
+		return GeneratedFragmentReceipt{}, false, err
+	}
+	ct, err := tx.Exec(ctx, `INSERT INTO generated_fragments (parent_job_id, lease_generation, fragment_id, children, created_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (parent_job_id, lease_generation, fragment_id) DO NOTHING`,
+		req.ParentJobID, req.LeaseGeneration, req.FragmentID, cb, now)
+	if err != nil {
+		return GeneratedFragmentReceipt{}, false, err
+	}
+	if ct.RowsAffected() == 0 {
+		// A concurrent duplicate committed first: discard this transaction's
+		// job rows and return the winner's receipt.
+		var winner []byte
+		if err := tx.QueryRow(ctx, `SELECT children FROM generated_fragments WHERE parent_job_id=$1 AND lease_generation=$2 AND fragment_id=$3`,
+			req.ParentJobID, req.LeaseGeneration, req.FragmentID).Scan(&winner); err != nil {
+			return GeneratedFragmentReceipt{}, false, err
+		}
+		rec := GeneratedFragmentReceipt{ParentJobID: req.ParentJobID, LeaseGeneration: req.LeaseGeneration, FragmentID: req.FragmentID}
+		if err := json.Unmarshal(winner, &rec.Children); err != nil {
+			return GeneratedFragmentReceipt{}, false, err
+		}
+		return rec, true, nil
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return GeneratedFragmentReceipt{}, false, err
+	}
+	return GeneratedFragmentReceipt{ParentJobID: req.ParentJobID, LeaseGeneration: req.LeaseGeneration, FragmentID: req.FragmentID, Children: children, CreatedAt: now}, false, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -3284,4 +3777,13 @@ func removeString(in []string, v string) []string {
 		}
 	}
 	return out
+}
+
+func containsString(in []string, v string) bool {
+	for _, x := range in {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -30,20 +31,35 @@ const (
 // replay cannot duplicate published state.
 //
 // In DB mode the outbox delegates persistence to storage.OutboxStore:
-// OutboxAppend on enqueue, OutboxPending on startup, OutboxAck after a
-// successful dispatch. The filesystem JSONL stays the fs-mode store.
+// OutboxAppend on enqueue, OutboxPending on startup, ClaimOutbox before a
+// flush dispatches (cross-replica claim lease, migration 0010) and OutboxAck
+// after a successful dispatch. The filesystem JSONL stays the fs-mode store.
+//
+// Flush always acks durably BEFORE removing an item from the local queue: a
+// failed ack leaves the intent queued (and un-dispatched-but-idempotent) for
+// the next tick instead of losing it from this process.
 type Outbox struct {
 	mu    sync.Mutex
 	items []forge.OutboxItem
 	store *storage.Repository
 	db    storage.OutboxStore
 	done  map[string]bool
+	// localOnly marks DB-mode items whose durable append failed: they have
+	// no row to claim, so they are dispatched directly (at-least-once),
+	// preserving Enqueue's "persistence failed but still queued" contract.
+	localOnly map[string]bool
+	// claimer uniquely identifies this process in the durable outbox claim
+	// lease. Lazily initialized.
+	claimer string
+	// flushMu serializes flushes on one instance so two concurrent Flush
+	// calls cannot dispatch the same claimed/local-only item twice.
+	flushMu sync.Mutex
 }
 
 // NewOutbox creates an outbox. When store is non-nil, unflushed intents
 // from a previous process are replayed into the queue.
 func NewOutbox(store *storage.Repository) *Outbox {
-	o := &Outbox{store: store, done: map[string]bool{}}
+	o := &Outbox{store: store, done: map[string]bool{}, localOnly: map[string]bool{}}
 	if store == nil {
 		return o
 	}
@@ -161,9 +177,16 @@ func (o *Outbox) Enqueue(item forge.OutboxItem) error {
 	defer o.mu.Unlock()
 	o.items = append(o.items, item)
 	if o.db != nil {
-		return o.db.OutboxAppend(context.Background(), storage.OutboxItem{
+		if err := o.db.OutboxAppend(context.Background(), storage.OutboxItem{
 			ID: item.ID, Kind: item.Kind, Payload: item.Payload, CreatedAt: item.CreatedAt,
-		})
+		}); err != nil {
+			// The durable append failed, but the caller was promised the
+			// intent stays queued in memory: mark it local-only so the
+			// claim-gated flush still dispatches it.
+			o.localOnly[item.ID] = true
+			return err
+		}
+		return nil
 	}
 	if o.store == nil {
 		return nil
@@ -215,10 +238,20 @@ func (o *Outbox) Pending() []forge.OutboxItem {
 	return append([]forge.OutboxItem(nil), o.items...)
 }
 
-// Flush dispatches queued intents in FIFO order. A failed dispatch stops
-// the batch and leaves the item (and everything after it) queued for the
-// next flush; a successful dispatch removes the item and records its ID
-// (SQL ack in DB mode, done-file line in fs mode) so replay skips it.
+// Flush dispatches queued intents in FIFO order. The order is always
+// dispatch (idempotent by stable item ID) → durable ACK (DB OutboxAck /
+// fs done-file append) → local removal: an ACK failure keeps the item queued
+// so the intent can never be lost from this process by a failed ack, and the
+// next tick retries the dispatch idempotently.
+//
+// In DB mode each flush first claims a batch of rows atomically
+// (storage.ClaimOutbox): rows claimed by another replica within
+// storage.OutboxClaimTTL are skipped, so two control planes flush disjoint
+// batches and never double-dispatch. A claim is released on dispatch or ack
+// failure so the retry does not wait out the TTL. Local-only items (durable
+// append failed at enqueue time) are dispatched directly, since there is no
+// row to claim.
+//
 // The dispatch runs WITHOUT the outbox lock so dispatched intents may
 // enqueue follow-up intents (e.g. a completion effect recording downstream
 // launch intents) without deadlocking. Returns the number of intents
@@ -227,6 +260,17 @@ func (o *Outbox) Flush(ctx context.Context, dispatch func(context.Context, forge
 	if dispatch == nil {
 		return 0, nil
 	}
+	o.flushMu.Lock()
+	defer o.flushMu.Unlock()
+	if o.db != nil {
+		return o.flushDB(ctx, dispatch)
+	}
+	return o.flushLocal(ctx, dispatch)
+}
+
+// flushLocal drains the in-memory/fs queue: dispatch → durable done-file
+// ack → local pop.
+func (o *Outbox) flushLocal(ctx context.Context, dispatch func(context.Context, forge.OutboxItem) error) (int, error) {
 	dispatched := 0
 	for {
 		o.mu.Lock()
@@ -240,7 +284,15 @@ func (o *Outbox) Flush(ctx context.Context, dispatch func(context.Context, forge
 		if err := dispatch(ctx, it); err != nil {
 			return dispatched, err
 		}
-
+		// Durable ack BEFORE the local removal: a failed ack leaves the
+		// intent queued and it is retried (idempotently) next tick.
+		if o.store != nil {
+			if err := o.appendJSONLLocked(outboxDoneFile, struct {
+				ID string `json:"id"`
+			}{ID: it.ID}); err != nil {
+				return dispatched, err
+			}
+		}
 		o.mu.Lock()
 		// Remove the dispatched item when it is still at the head (a
 		// concurrent enqueue only ever appends, so the head is stable
@@ -250,20 +302,149 @@ func (o *Outbox) Flush(ctx context.Context, dispatch func(context.Context, forge
 		}
 		o.done[it.ID] = true
 		dispatched++
-		var ackErr error
-		if o.db != nil {
-			ackErr = o.db.OutboxAck(ctx, it.ID)
-		} else if o.store != nil {
-			ackErr = o.appendJSONLLocked(outboxDoneFile, struct {
-				ID string `json:"id"`
-			}{ID: it.ID})
-		}
-		if ackErr != nil {
-			o.mu.Unlock()
-			return dispatched, ackErr
-		}
 		o.mu.Unlock()
 	}
+}
+
+// outboxFlushMaxBatches bounds how many claim batches one Flush call
+// processes, so a dispatch path that keeps enqueueing follow-up intents can
+// never trap the flush in an unbounded loop (the remainder waits for the
+// next tick).
+const outboxFlushMaxBatches = 64
+
+// flushDB claims and dispatches batches of durable rows until no more rows
+// are claimable, dispatching exactly the items this flusher owns: its fresh
+// claims plus local-only items. Claiming before each batch is what keeps
+// concurrent replicas on disjoint work while still draining follow-up
+// intents queued during dispatch.
+func (o *Outbox) flushDB(ctx context.Context, dispatch func(context.Context, forge.OutboxItem) error) (int, error) {
+	total := 0
+	for batch := 0; batch < outboxFlushMaxBatches; batch++ {
+		n, claimed, err := o.flushDBBatch(ctx, dispatch)
+		total += n
+		if err != nil {
+			return total, err
+		}
+		if claimed == 0 {
+			return total, nil
+		}
+	}
+	return total, nil
+}
+
+// flushDBBatch claims one batch of durable rows and dispatches the items this
+// flusher owns. claimed reports how many rows the claim covered (zero means
+// the durable outbox is fully claimed or empty).
+func (o *Outbox) flushDBBatch(ctx context.Context, dispatch func(context.Context, forge.OutboxItem) error) (int, int, error) {
+	claimer := o.claimerID()
+	claimed, err := o.db.ClaimOutbox(ctx, claimer, storage.OutboxClaimBatch)
+	if err != nil {
+		return 0, 0, err
+	}
+	// Even with an empty claim, local-only items (durable append failed at
+	// enqueue time) are dispatched below: they have no row to claim.
+	owned := make(map[string]bool, len(claimed))
+	o.mu.Lock()
+	known := make(map[string]bool, len(o.items))
+	for _, it := range o.items {
+		known[it.ID] = true
+	}
+	for _, it := range claimed {
+		owned[it.ID] = true
+		if !known[it.ID] {
+			o.items = append(o.items, forge.OutboxItem{ID: it.ID, Kind: it.Kind, Payload: it.Payload, CreatedAt: it.CreatedAt})
+		}
+	}
+	o.mu.Unlock()
+
+	dispatched := 0
+	for {
+		o.mu.Lock()
+		idx := -1
+		for i, it := range o.items {
+			if owned[it.ID] || o.localOnly[it.ID] {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			o.mu.Unlock()
+			break
+		}
+		it := o.items[idx]
+		o.mu.Unlock()
+
+		if err := dispatch(ctx, it); err != nil {
+			if owned[it.ID] {
+				_ = o.db.ReleaseOutboxClaim(ctx, it.ID, claimer)
+			}
+			return dispatched, len(claimed), err
+		}
+		// Durable ACK BEFORE the local removal (and before the claim is
+		// considered satisfied): an ack failure keeps the item queued and
+		// releases the claim so the retry does not wait out the TTL.
+		if err := o.db.OutboxAck(ctx, it.ID); err != nil {
+			if owned[it.ID] {
+				_ = o.db.ReleaseOutboxClaim(ctx, it.ID, claimer)
+			}
+			return dispatched, len(claimed), err
+		}
+		o.mu.Lock()
+		o.removeLocked(it.ID)
+		o.done[it.ID] = true
+		delete(o.localOnly, it.ID)
+		dispatched++
+		o.mu.Unlock()
+	}
+	o.pruneDB(ctx)
+	return dispatched, len(claimed), nil
+}
+
+// removeLocked drops one item from the local queue. The caller holds o.mu.
+func (o *Outbox) removeLocked(id string) {
+	for i, it := range o.items {
+		if it.ID == id {
+			o.items = append(o.items[:i], o.items[i+1:]...)
+			return
+		}
+	}
+}
+
+// pruneDB drops local copies of rows another replica has acknowledged, so
+// the in-memory queue does not grow without bound in HA. Local-only items
+// (no durable row) are never pruned.
+func (o *Outbox) pruneDB(ctx context.Context) {
+	pending, err := o.db.OutboxPending(ctx)
+	if err != nil {
+		return
+	}
+	live := make(map[string]bool, len(pending))
+	for _, it := range pending {
+		live[it.ID] = true
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	kept := o.items[:0]
+	for _, it := range o.items {
+		if live[it.ID] || o.localOnly[it.ID] {
+			kept = append(kept, it)
+		}
+	}
+	o.items = kept
+}
+
+// claimerID lazily derives this process's unique outbox claim identity.
+func (o *Outbox) claimerID() string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.claimer == "" {
+		if id, err := newID(); err == nil {
+			o.claimer = "outbox-" + id
+		} else {
+			o.claimer = fmt.Sprintf("outbox-%d", time.Now().UnixNano())
+		}
+	}
+	return o.claimer
 }
 
 // flushOutbox drains the server's outbox through the forge dispatch path.

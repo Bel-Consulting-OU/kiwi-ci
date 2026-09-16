@@ -350,6 +350,9 @@ const schemaSource = `{
         "max_depth": {
           "type": "integer",
           "minimum": 0
+        },
+        "optional": {
+          "type": "boolean"
         }
       },
       "additionalProperties": false

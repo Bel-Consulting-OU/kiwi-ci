@@ -247,9 +247,32 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 		}
 	}
 	if s.DB != nil {
-		if err := s.DB.InsertArtifact(ctx, rec); err != nil {
+		// PostgreSQL is authoritative: the (job, generation, name) unique
+		// index admits exactly one record across replicas. Losing a race to
+		// a concurrent upload returns the stored record (same digest, 200)
+		// or conflicts (409); the stored record is never overwritten.
+		idem, ok := s.DB.(storage.ArtifactIdempotentStore)
+		if !ok {
 			_ = os.Remove(dst)
-			http.Error(w, err.Error(), 500)
+			http.Error(w, "artifact store does not support idempotent artifact insertion", 500)
+			return
+		}
+		stored, created, ierr := idem.InsertArtifactOnce(ctx, rec)
+		if errors.Is(ierr, storage.ErrArtifactDigestConflict) {
+			removeStagedArtifact(dst, casMode)
+			s.auditLocked("artifact.contract_violation", runnerID, j.RunID, j.ID, "artifact digest changed within one lease generation", map[string]string{"name": name, "existing": stored.SHA256, "incoming": digest})
+			http.Error(w, "artifact already uploaded for this lease generation with a different digest", http.StatusConflict)
+			return
+		}
+		if ierr != nil {
+			removeStagedArtifact(dst, casMode)
+			http.Error(w, ierr.Error(), 500)
+			return
+		}
+		if !created {
+			removeStagedArtifact(dst, casMode)
+			s.auditLocked("artifact.idempotent_replay", runnerID, j.RunID, j.ID, "duplicate artifact upload acknowledged", map[string]string{"name": name, "sha256": stored.SHA256})
+			writeJSON(w, http.StatusOK, stored)
 			return
 		}
 		s.metricAdd("kiwi_artifact_bytes_total", float64(n), nil)
@@ -258,14 +281,73 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 		writeJSON(w, http.StatusCreated, rec)
 		return
 	}
+	// Memory mode: the IDENTICAL (job, generation, name)/digest semantics
+	// under s.mu, so concurrent uploads on one instance resolve exactly like
+	// the SQL unique key.
 	s.mu.Lock()
-	s.artifacts[id] = rec
+	stored, created, merr := s.insertArtifactMemoryLocked(rec)
+	switch {
+	case errors.Is(merr, storage.ErrArtifactDigestConflict):
+		s.mu.Unlock()
+		_ = os.Remove(dst)
+		_ = os.Remove(dst + ".intoto.json")
+		s.auditLocked("artifact.contract_violation", runnerID, j.RunID, j.ID, "artifact digest changed within one lease generation", map[string]string{"name": name, "existing": stored.SHA256, "incoming": digest})
+		http.Error(w, "artifact already uploaded for this lease generation with a different digest", http.StatusConflict)
+		return
+	case merr != nil:
+		s.mu.Unlock()
+		_ = os.Remove(dst)
+		http.Error(w, merr.Error(), 500)
+		return
+	case !created:
+		s.mu.Unlock()
+		_ = os.Remove(dst)
+		_ = os.Remove(dst + ".intoto.json")
+		s.auditLocked("artifact.idempotent_replay", runnerID, j.RunID, j.ID, "duplicate artifact upload acknowledged", map[string]string{"name": name, "sha256": stored.SHA256})
+		writeJSON(w, http.StatusOK, stored)
+		return
+	}
 	s.auditLocked("artifact.uploaded", runnerID, j.RunID, j.ID, "artifact uploaded", map[string]string{"name": name, "sha256": rec.SHA256, "provenance_kid": signer.KID})
 	_ = s.persistLocked()
 	s.mu.Unlock()
 	s.metricAdd("kiwi_artifact_bytes_total", float64(n), nil)
 	s.metricObserve("kiwi_cas_latency_seconds", time.Since(start).Seconds(), nil)
 	writeJSON(w, http.StatusCreated, rec)
+}
+
+// insertArtifactMemoryLocked is the memory-mode equivalent of the
+// authoritative SQL insert: the (job, generation, name) key admits exactly
+// one record and a different digest for the same key conflicts. The caller
+// holds s.mu.
+func (s *Server) insertArtifactMemoryLocked(rec model.ArtifactRecord) (model.ArtifactRecord, bool, error) {
+	if rec.JobID == "" {
+		// Matches SQL NULL semantics: rows without a job never join the key.
+		s.artifacts[rec.ID] = rec
+		return rec, true, nil
+	}
+	for _, existing := range s.artifacts {
+		if existing.JobID != rec.JobID || existing.LeaseGeneration != rec.LeaseGeneration || existing.Name != rec.Name {
+			continue
+		}
+		if existing.SHA256 != rec.SHA256 {
+			return existing, false, storage.ErrArtifactDigestConflict
+		}
+		return existing, false, nil
+	}
+	s.artifacts[rec.ID] = rec
+	return rec, true, nil
+}
+
+// removeStagedArtifact cleans up the local staging artifacts of a lost or
+// conflicting upload race. CAS blobs are content-addressed and deduplicated,
+// so they are left for the blob GC: deleting a digest could remove content
+// another record references.
+func removeStagedArtifact(dst string, casMode bool) {
+	if casMode {
+		return
+	}
+	_ = os.Remove(dst)
+	_ = os.Remove(dst + ".intoto.json")
 }
 
 // jobLock returns the per-job upload mutex.

@@ -125,13 +125,9 @@ func (s *Server) admitOrgPolicyRestrictions(id repoIdentity, spec *pipeline.Spec
 	repoPolicy, hasRepo := s.Policy.Repositories[id.RepoFullName]
 
 	// Allowed clone hosts: org-level allowlist intersected with the
-	// repo-level allowlist (nil = no restriction from that level). A
-	// non-empty effective list must contain the run's repository host.
-	hosts := s.Policy.AllowedCloneHosts
-	if hasRepo && len(repoPolicy.AllowedCloneHosts) > 0 {
-		hosts = intersectLists(hosts, repoPolicy.AllowedCloneHosts)
-	}
-	if len(hosts) > 0 {
+	// repo-level allowlist. Nil means the level imposes no restriction;
+	// a non-nil EMPTY result (disjoint restrictions) denies every host.
+	if hosts := s.Policy.AllowedCloneHostsFor(id.RepoFullName); hosts != nil {
 		host := repoURLHost(id.RepoURL)
 		if host == "" || !containsList(hosts, host) {
 			return policyDenied(fmt.Sprintf("repository host %q is not in the allowed clone hosts", host))
@@ -139,12 +135,9 @@ func (s *Server) admitOrgPolicyRestrictions(id repoIdentity, spec *pipeline.Spec
 	}
 
 	// Allowed regions: every placement.regions entry must be inside the
-	// effective allowlist.
-	regions := s.Policy.AllowedRegions
-	if hasRepo && len(repoPolicy.AllowedRegions) > 0 {
-		regions = intersectLists(regions, repoPolicy.AllowedRegions)
-	}
-	if len(regions) > 0 {
+	// effective allowlist. Same nil/empty semantics as clone hosts: a
+	// non-nil empty intersection denies every region.
+	if regions := s.Policy.AllowedRegionsFor(id.RepoFullName); regions != nil {
 		for id, j := range spec.Jobs {
 			for _, r := range j.Placement.Regions {
 				if !containsList(regions, r) {
@@ -230,24 +223,6 @@ func repoURLTeam(repoURL string) string {
 		return u.Host
 	}
 	return u.Host + "/" + parts[0]
-}
-
-// intersectLists returns the set intersection of a and b, where nil is the
-// universal set (no restriction from that side).
-func intersectLists(a, b []string) []string {
-	if a == nil {
-		return append([]string(nil), b...)
-	}
-	if b == nil {
-		return append([]string(nil), a...)
-	}
-	out := make([]string, 0, len(a))
-	for _, v := range a {
-		if containsList(b, v) {
-			out = append(out, v)
-		}
-	}
-	return out
 }
 
 func containsList(list []string, v string) bool {

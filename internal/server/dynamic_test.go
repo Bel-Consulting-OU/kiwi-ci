@@ -72,11 +72,31 @@ func leaseRunJob(t *testing.T, s *Server) (string, Task) {
 	return ri.ID, task
 }
 
+// fragmentBody injects the deterministic fragment_id into a raw fragment
+// body exactly as the runner does before POSTing.
+func fragmentBody(t *testing.T, raw string) string {
+	t.Helper()
+	var frag generatedFragment
+	if err := json.Unmarshal([]byte(raw), &frag); err != nil {
+		t.Fatalf("parse fragment body: %v", err)
+	}
+	id, err := frag.Digest()
+	if err != nil {
+		t.Fatalf("fragment digest: %v", err)
+	}
+	frag.FragmentID = id
+	b, err := json.Marshal(frag)
+	if err != nil {
+		t.Fatalf("marshal fragment body: %v", err)
+	}
+	return string(b)
+}
+
 func TestDynamicGenerateHappyPath(t *testing.T) {
 	s, run := trustedGenerateServer(t)
 	runnerID, task := leaseRunJob(t, s)
 	frag := `{"jobs":{"child-a":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo child"}]}},"deps":{}}`
-	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", frag, leaseHeaders(task, runnerID))
+	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", fragmentBody(t, frag), leaseHeaders(task, runnerID))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("generated = %d: %s", w.Code, w.Body.String())
 	}
@@ -118,7 +138,7 @@ func TestDynamicGenerateDepthLimit(t *testing.T) {
 	s.jobs[task.Job.ID] = parent
 	s.mu.Unlock()
 	frag := `{"jobs":{"child-a":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo child"}]}},"deps":{}}`
-	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", frag, leaseHeaders(task, runnerIDFor(s, task.Job.ID)))
+	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", fragmentBody(t, frag), leaseHeaders(task, runnerIDFor(s, task.Job.ID)))
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("depth-3 generation = %d, want 400: %s", w.Code, w.Body.String())
 	}
@@ -149,7 +169,7 @@ func TestDynamicGenerateRejectsFragmentTooLarge(t *testing.T) {
 		b.WriteString(`"j` + string(rune('a'+i%26)) + jsonInt(i) + `":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo x"}]}`)
 	}
 	b.WriteString(`},"deps":{}}`)
-	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", b.String(), leaseHeaders(task, runnerID))
+	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", fragmentBody(t, b.String()), leaseHeaders(task, runnerID))
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("129-job fragment = %d, want 400: %s", w.Code, w.Body.String())
 	}
@@ -164,7 +184,7 @@ func TestDynamicGenerateRejectsUnknownDeps(t *testing.T) {
 	s, _ := trustedGenerateServer(t)
 	runnerID, task := leaseRunJob(t, s)
 	frag := `{"jobs":{"child-a":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo child"}]}},"deps":{"child-a":["nope"]}}`
-	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", frag, leaseHeaders(task, runnerID))
+	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", fragmentBody(t, frag), leaseHeaders(task, runnerID))
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("unknown dep = %d, want 400: %s", w.Code, w.Body.String())
 	}
@@ -192,7 +212,7 @@ func TestDynamicGenerateTrustReduction(t *testing.T) {
 	_ = run
 	runnerID, task := leaseRunJob(t, s)
 	frag := `{"jobs":{"child-a":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo child","secrets":["forbidden-secret"]}]}},"deps":{}}`
-	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", frag, leaseHeaders(task, runnerID))
+	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", fragmentBody(t, frag), leaseHeaders(task, runnerID))
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("secret over parent caps = %d, want 400: %s", w.Code, w.Body.String())
 	}
@@ -207,7 +227,7 @@ func TestDynamicGenerateRequiresLease(t *testing.T) {
 	frag := `{"jobs":{"child-a":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo child"}]}},"deps":{}}`
 	hdrs := leaseHeaders(task, runnerID)
 	hdrs["X-Kiwi-Lease-Token"] = "wrong-token"
-	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", frag, hdrs)
+	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", fragmentBody(t, frag), hdrs)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("bad lease = %d, want 409: %s", w.Code, w.Body.String())
 	}
@@ -236,7 +256,7 @@ func TestDynamicGenerateDBMode(t *testing.T) {
 	}
 	runnerID, task := leaseRunJob(t, s)
 	frag := `{"jobs":{"child-a":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo child"}]}},"deps":{}}`
-	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", frag, leaseHeaders(task, runnerID))
+	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", fragmentBody(t, frag), leaseHeaders(task, runnerID))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("db generated = %d: %s", w.Code, w.Body.String())
 	}
@@ -252,7 +272,7 @@ func TestDynamicGenerateDBMode(t *testing.T) {
 	}
 	_ = runnerID
 	// The parent's lease must still be valid for a second fragment.
-	w = doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", `{"jobs":{"child-b":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo b"}]}},"deps":{}}`, leaseHeaders(task, runnerID))
+	w = doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", fragmentBody(t, `{"jobs":{"child-b":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo b"}]}},"deps":{}}`), leaseHeaders(task, runnerID))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("db second fragment = %d: %s", w.Code, w.Body.String())
 	}
@@ -267,7 +287,7 @@ func TestDynamicGenerateRejectedWithoutCapability(t *testing.T) {
 	runnerID := runnerIDFor(s, task.Job.ID)
 	s.Policy = &policy.Config{}
 	frag := `{"jobs":{"child-a":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo child"}]}},"deps":{}}`
-	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", frag, leaseHeaders(task, runnerID))
+	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", fragmentBody(t, frag), leaseHeaders(task, runnerID))
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("no-capability generation = %d, want 403: %s", w.Code, w.Body.String())
 	}

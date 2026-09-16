@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +22,7 @@ type atomicFakeStore struct {
 	mu       sync.Mutex
 	capacity map[string]int
 	active   map[string][]string
+	quotas   map[string]int
 }
 
 func newAtomicFakeStore() *atomicFakeStore {
@@ -35,35 +37,132 @@ func newAtomicFakeStore() *atomicFakeStore {
 
 var _ storage.AtomicLeaseStore = (*atomicFakeStore)(nil)
 
-func (a *atomicFakeStore) AcquireLeaseAtomic(ctx context.Context, jobID, runnerID string, tokenHash []byte, generation int64, expiresAt time.Time, runnerCapacity int) (model.Job, error) {
+// AcquireLeaseAtomic mirrors the SQL claim: the shared lease predicate
+// (storage.LeasePredicate) gates the claim, the job claim and the runner
+// active-set update commit together, and the runner's capacity can be
+// pinned by the test through the capacity map.
+func (a *atomicFakeStore) AcquireLeaseAtomic(ctx context.Context, claim storage.LeaseClaim) (model.Job, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if _, ok := a.capacity[runnerID]; !ok {
-		a.capacity[runnerID] = runnerCapacity
+	if _, ok := a.capacity[claim.RunnerID]; !ok {
+		a.capacity[claim.RunnerID] = claim.RunnerCapacity
 	}
-	cap := a.capacity[runnerID]
-	if cap <= 0 {
-		cap = runnerCapacity
-	}
-	if cap > 0 && len(a.active[runnerID]) >= cap {
+	cap := a.capacity[claim.RunnerID]
+	ri, err := a.fakeStore.GetRunner(ctx, claim.RunnerID)
+	if err != nil {
 		return model.Job{}, storage.ErrNoCapacity
 	}
-	j, err := a.fakeStore.AcquireLease(ctx, jobID, runnerID, tokenHash, generation, expiresAt)
+	eff := ri
+	if ri.CertSerial != "" {
+		if p, linked, perr := a.fakeStore.ProfileForSerial(ctx, ri.CertSerial); perr != nil {
+			return model.Job{}, perr
+		} else if linked {
+			eff = storage.ResolveRunnerProfile(ri, p, true)
+		}
+	}
+	if eff.Disabled || eff.Draining || cap <= 0 || len(a.active[claim.RunnerID]) >= cap {
+		return model.Job{}, storage.ErrNoCapacity
+	}
+	j, err := a.fakeStore.GetJob(ctx, claim.JobID)
 	if err != nil {
+		return model.Job{}, err
+	}
+	envRunning := 0
+	if claim.Environment != "" && claim.EnvironmentConcurrency > 0 {
+		all, _ := a.fakeStore.ListJobsByEnvironment(ctx, claim.RepoURL, claim.Environment)
+		for _, other := range all {
+			if other.ID != claim.JobID && other.Status == model.StatusRunning {
+				envRunning++
+			}
+		}
+	}
+	runtimes, enforced := storage.LeasePolicyRuntimes(j)
+	eff.Capacity = cap
+	eff.ActiveJobs = append([]string(nil), a.active[claim.RunnerID]...)
+	if !(storage.LeasePredicate{Runner: eff, Job: j, EnvRunning: envRunning, PolicyEnforced: enforced, PolicyRuntimes: runtimes}).Allows() {
+		if claim.Environment != "" && claim.EnvironmentConcurrency > 0 && envRunning >= claim.EnvironmentConcurrency {
+			return model.Job{}, storage.ErrEnvConcurrency
+		}
+		return model.Job{}, storage.ErrNoCapacity
+	}
+	if claim.RepoURL != "" {
+		if m := a.fakeQuotas(); m != nil {
+			keys := []string{claim.RepoURL}
+			if team := repoTeamKey(claim.RepoURL); team != claim.RepoURL {
+				keys = append(keys, team)
+			}
+			for i, key := range keys {
+				limit := claim.RepoConcurrency
+				if i > 0 {
+					limit = claim.TeamConcurrency
+				}
+				if limit > 0 && float64(m[key]) >= limit {
+					reason := "REPO_QUOTA"
+					if i > 0 {
+						reason = "TEAM_QUOTA"
+					}
+					return model.Job{}, &storage.QuotaExceededError{Reason: reason, Msg: "concurrency limit reached"}
+				}
+			}
+			for _, key := range keys {
+				m[key]++
+			}
+		}
+	}
+	leased, err := a.fakeStore.AcquireLease(ctx, claim.JobID, claim.RunnerID, claim.TokenHash, claim.Generation, claim.ExpiresAt)
+	if err != nil {
+		return model.Job{}, err
+	}
+	leased.CostRate = eff.CostPerHour
+	leased.PowerWatts = eff.PowerWatts
+	if err := a.fakeStore.UpdateJob(ctx, leased); err != nil {
 		return model.Job{}, err
 	}
 	// Mirror the SQL atomic lease: the runner's active set is updated in
 	// the same critical section as the job claim.
-	a.active[runnerID] = append(a.active[runnerID], jobID)
-	if ri, rerr := a.fakeStore.GetRunner(ctx, runnerID); rerr == nil {
-		ri.ActiveJobs = append([]string(nil), a.active[runnerID]...)
+	a.active[claim.RunnerID] = append(a.active[claim.RunnerID], claim.JobID)
+	if ri, rerr := a.fakeStore.GetRunner(ctx, claim.RunnerID); rerr == nil {
+		ri.ActiveJobs = append([]string(nil), a.active[claim.RunnerID]...)
 		ri.Busy = cap > 0 && len(ri.ActiveJobs) >= cap
 		if len(ri.ActiveJobs) > 0 {
 			ri.CurrentJob = ri.ActiveJobs[0]
 		}
 		_ = a.fakeStore.UpsertRunner(ctx, ri)
 	}
-	return j, nil
+	return leased, nil
+}
+
+// fakeQuotas is a lazily initialized in-memory running-counter map used by
+// atomicFakeStore's conditional quota transition.
+func (a *atomicFakeStore) fakeQuotas() map[string]int {
+	if a.quotas == nil {
+		a.quotas = map[string]int{}
+	}
+	return a.quotas
+}
+
+// repoTeamKey mirrors storage's team quota key derivation.
+func repoTeamKey(repoURL string) string {
+	u := repoURL
+	if i := strings.Index(u, "://"); i >= 0 {
+		u = u[i+3:]
+	}
+	if at := strings.Index(u, "@"); at >= 0 {
+		u = u[at+1:]
+	}
+	slash := strings.Index(u, "/")
+	if slash < 0 {
+		return repoURL
+	}
+	rest := u[slash+1:]
+	seg := rest
+	if i := strings.Index(rest, "/"); i >= 0 {
+		seg = rest[:i]
+	}
+	if seg == "" {
+		return repoURL
+	}
+	return u[:slash] + "/" + seg
 }
 
 func (a *atomicFakeStore) jobStatus(jobID string) (model.Status, string) {

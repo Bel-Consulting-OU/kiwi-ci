@@ -82,11 +82,11 @@ func TestExecuteUploadsGeneratedFragment(t *testing.T) {
 	}
 }
 
-// TestExecuteGeneratedFragmentRejectedStillCompletes drives a non-2xx
-// response from the /generated endpoint: the job completion must proceed
-// unchanged (the children never exist) and the failure must be reported in
-// the job logs.
-func TestExecuteGeneratedFragmentRejectedStillCompletes(t *testing.T) {
+// TestExecuteGeneratedFragmentRejectedFailsJob drives a non-2xx response
+// from the /generated endpoint on a job WITHOUT generate.optional: the job
+// completion must fail with the "generated graph rejected" error, so a run
+// can never silently lose its declared children.
+func TestExecuteGeneratedFragmentRejectedFailsJob(t *testing.T) {
 	fsrv := &fakeRunnerServer{generatedStatus: http.StatusUnprocessableEntity}
 	ts := httptest.NewServer(fsrv.handler())
 	defer ts.Close()
@@ -105,17 +105,47 @@ func TestExecuteGeneratedFragmentRejectedStillCompletes(t *testing.T) {
 	if !ok {
 		t.Fatal("no completion recorded")
 	}
-	if c.Status != model.StatusSuccess {
-		t.Fatalf("status = %s (%s), want success (rejection is non-fatal)", c.Status, c.Error)
+	if c.Status != model.StatusFailure {
+		t.Fatalf("status = %s (%s), want failure for a rejected generated graph", c.Status, c.Error)
+	}
+	if !strings.Contains(c.Error, "generated graph rejected") {
+		t.Fatalf("completion error = %q, want the generated-graph rejection", c.Error)
 	}
 	if h := fsrv.headerOf(http.MethodPost, "/api/v1/jobs/job-1/generated"); h == nil {
 		t.Fatal("no /generated POST recorded")
 	}
+}
+
+// TestExecuteGeneratedFragmentRejectedOptionalCompletes pins the opt-out:
+// with generate.optional=true the same non-2xx response stays a warning and
+// the job completes successfully.
+func TestExecuteGeneratedFragmentRejectedOptionalCompletes(t *testing.T) {
+	fsrv := &fakeRunnerServer{generatedStatus: http.StatusUnprocessableEntity}
+	ts := httptest.NewServer(fsrv.handler())
+	defer ts.Close()
+
+	base := "version: 1\njobs:\n  build:\n    generate:\n      path: generated.json\n      optional: true\n    steps:\n      - run: echo hi\n"
+	task := basicTask(base)
+	task.Job.CompiledJobPayload = buildPayload(t, base, "build")
+
+	r := testRunnerFor(t, ts, Config{CaptureSnapshots: false})
+	r.Cfg.CheckoutFn = func(_ context.Context, _ model.Job, dir string) error {
+		return os.WriteFile(filepath.Join(dir, "generated.json"), []byte(`{"jobs":{},"deps":{}}`), 0o644)
+	}
+	r.execute(context.Background(), task)
+
+	c, ok := fsrv.lastComplete()
+	if !ok {
+		t.Fatal("no completion recorded")
+	}
+	if c.Status != model.StatusSuccess {
+		t.Fatalf("status = %s (%s), want success (generate.optional downgrades the rejection)", c.Status, c.Error)
+	}
 	fsrv.mu.Lock()
 	logs := strings.Join(fsrv.logLines, "\n")
 	fsrv.mu.Unlock()
-	if !strings.Contains(logs, "fragment upload failed") {
-		t.Fatalf("generate failure not reported in logs: %q", logs)
+	if !strings.Contains(logs, "generate.optional=true") {
+		t.Fatalf("optional rejection not reported as a warning: %q", logs)
 	}
 }
 

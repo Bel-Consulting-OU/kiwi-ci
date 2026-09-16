@@ -24,7 +24,10 @@ func TestMemStoreGeneratedContractFailureRollsBackJobs(t *testing.T) {
 	badContracts := map[string]map[string]ArtifactContract{
 		"NOT-A-VALID-ID": {"dist": {Name: "dist", Required: true}},
 	}
-	err := m.InsertGeneratedJobsTx(ctx(), testJob.ID, 1, map[string]model.Job{child.ID: child}, nil, badContracts, nil)
+	_, _, err := m.InsertGeneratedFragmentTx(ctx(), GeneratedFragmentRequest{
+		ParentJobID: testJob.ID, Depth: 1, FragmentID: "frag-bad-contract",
+		Jobs: map[string]model.Job{child.ID: child}, Contracts: badContracts, Children: []GeneratedFragmentChild{{Key: child.Key, ID: child.ID}},
+	}, nil)
 	if err == nil {
 		t.Fatal("malformed contract job id must fail the fragment")
 	}
@@ -51,8 +54,11 @@ func TestMemStoreGeneratedContractsVisibleBeforeCompletion(t *testing.T) {
 	contracts := map[string]map[string]ArtifactContract{
 		child.ID: {"dist": {Name: "dist", Required: true}},
 	}
-	if err := m.InsertGeneratedJobsTx(ctx(), testJob.ID, 1, map[string]model.Job{child.ID: child}, nil, contracts, nil); err != nil {
-		t.Fatalf("InsertGeneratedJobsTx: %v", err)
+	if _, _, err := m.InsertGeneratedFragmentTx(ctx(), GeneratedFragmentRequest{
+		ParentJobID: testJob.ID, Depth: 1, FragmentID: "frag-contracts",
+		Jobs: map[string]model.Job{child.ID: child}, Contracts: contracts, Children: []GeneratedFragmentChild{{Key: child.Key, ID: child.ID}},
+	}, nil); err != nil {
+		t.Fatalf("InsertGeneratedFragmentTx: %v", err)
 	}
 	got, ok, err := m.GetJobContracts(ctx(), child.ID)
 	if err != nil || !ok {

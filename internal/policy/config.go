@@ -243,6 +243,12 @@ func (c *Config) GrantsFor(repoFullName string) Capabilities {
 // unrestricted (booleans true, Network Internet, nil sets), because the
 // result is intersected with the caller's base capabilities: a zero-value
 // field here would silently deny everything.
+//
+// List-typed restrictions follow the policy-wide nil rules exactly: nil is
+// the universal set (no restriction from that level) while an explicitly
+// EMPTY list is a deny-all allowlist. A disjoint org/repo intersection is
+// therefore a non-nil empty list that denies everything, never an
+// unrestricted pass. The returned set is authoritative (Enforced=true).
 func (c *Config) CapabilitiesFor(repoFullName string) Capabilities {
 	rest := Capabilities{
 		NativeExecution:    true,
@@ -254,22 +260,26 @@ func (c *Config) CapabilitiesFor(repoFullName string) Capabilities {
 		Deployments:        true,
 		GenerateChildGraph: true,
 		CrossRepoTrigger:   true,
+		Enforced:           true,
 	}
 	if c.RequireRootless {
 		rest.NativeExecution = false
+		rest.RequireRootless = true
+		rest.RequireReadOnlyRootFS = true
+		rest.RequireNonRoot = true
 	}
-	if len(c.SecretAllowlist) > 0 {
+	if c.SecretAllowlist != nil {
 		m := map[string]bool{}
 		for _, s := range c.SecretAllowlist {
 			m[s] = true
 		}
 		rest.Secrets = m
 	}
-	if len(c.OIDCAudiences) > 0 {
-		rest.OIDC = append([]string(nil), c.OIDCAudiences...)
+	if c.OIDCAudiences != nil {
+		rest.OIDC = cloneStrings(c.OIDCAudiences)
 	}
-	if len(c.AllowedRunnerPools) > 0 {
-		rest.RunnerLabels = append([]string(nil), c.AllowedRunnerPools...)
+	if c.AllowedRunnerPools != nil {
+		rest.RunnerLabels = cloneStrings(c.AllowedRunnerPools)
 	}
 	if c.Network != "" {
 		if n, err := parseNetworkPolicy(c.Network); err == nil {
@@ -277,21 +287,24 @@ func (c *Config) CapabilitiesFor(repoFullName string) Capabilities {
 		}
 	}
 	if rp, ok := c.Repositories[repoFullName]; ok {
-		if len(rp.SecretAllowlist) > 0 {
+		if rp.SecretAllowlist != nil {
 			m := map[string]bool{}
 			for _, s := range rp.SecretAllowlist {
 				m[s] = true
 			}
 			rest.Secrets = intersectSecrets(rest.Secrets, m)
 		}
-		if len(rp.OIDCAudiences) > 0 {
+		if rp.OIDCAudiences != nil {
 			rest.OIDC = intersectStrings(rest.OIDC, rp.OIDCAudiences)
 		}
-		if len(rp.AllowedRunnerPools) > 0 {
+		if rp.AllowedRunnerPools != nil {
 			rest.RunnerLabels = intersectStrings(rest.RunnerLabels, rp.AllowedRunnerPools)
 		}
 		if rp.RequireRootless != nil && *rp.RequireRootless {
 			rest.NativeExecution = false
+			rest.RequireRootless = true
+			rest.RequireReadOnlyRootFS = true
+			rest.RequireNonRoot = true
 		}
 		if rp.Deployments != nil {
 			rest.Deployments = *rp.Deployments
@@ -302,11 +315,52 @@ func (c *Config) CapabilitiesFor(repoFullName string) Capabilities {
 		if rp.GenerateChildGraph != nil {
 			rest.GenerateChildGraph = *rp.GenerateChildGraph
 		}
+		// A repository network policy can only narrow the organization
+		// policy: the effective policy is the weaker of the two, so a repo
+		// level "internet" can never widen an org level "none".
 		if rp.Network != "" {
 			if n, err := parseNetworkPolicy(rp.Network); err == nil {
-				rest.Network = n
+				rest.Network = minNetwork(rest.Network, n)
 			}
 		}
 	}
 	return rest
+}
+
+// AllowedCloneHostsFor returns the effective clone-host allowlist for a
+// repository: the organization allowlist intersected with the repository
+// allowlist. nil means unrestricted, an empty non-nil list denies every
+// host (a disjoint org/repo intersection is deny-all, never "no
+// restriction"), and a non-empty list restricts to its entries.
+func (c *Config) AllowedCloneHostsFor(repoFullName string) []string {
+	return intersectStrings(c.AllowedCloneHosts, c.Repositories[repoFullName].AllowedCloneHosts)
+}
+
+// AllowedRegionsFor returns the effective placement-region allowlist for a
+// repository with the same nil/empty rules as AllowedCloneHostsFor.
+func (c *Config) AllowedRegionsFor(repoFullName string) []string {
+	return intersectStrings(c.AllowedRegions, c.Repositories[repoFullName].AllowedRegions)
+}
+
+// CloneHostAllowed reports whether host is admitted by the effective
+// clone-host allowlist for repoFullName. A nil allowlist is unrestricted; a
+// non-nil allowlist admits only its entries, so an empty allowlist denies
+// every host — including an empty/unparseable host, which fails closed.
+func (c *Config) CloneHostAllowed(repoFullName, host string) bool {
+	allowed := c.AllowedCloneHostsFor(repoFullName)
+	if allowed == nil {
+		return true
+	}
+	return host != "" && containsString(allowed, host)
+}
+
+// RegionAllowed reports whether region is admitted by the effective
+// placement-region allowlist for repoFullName, with the same nil/empty
+// rules as CloneHostAllowed.
+func (c *Config) RegionAllowed(repoFullName, region string) bool {
+	allowed := c.AllowedRegionsFor(repoFullName)
+	if allowed == nil {
+		return true
+	}
+	return region != "" && containsString(allowed, region)
 }

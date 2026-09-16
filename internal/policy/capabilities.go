@@ -21,6 +21,15 @@ type NetworkCapability = pipeline.NetworkPolicy
 //     denies id_token issuance entirely.
 //   - RunnerLabels: nil means any label. A non-nil slice is an explicit
 //     allowlist and an empty non-nil slice denies all runner labels.
+//
+// Enforced marks the set as an authoritative authorization restriction set:
+// the runner's profile/registration claim and the policy file's
+// CapabilitiesFor result set it, while the trust defaults
+// (DefaultTrustedCapabilities/DefaultUntrustedCapabilities) leave it false.
+// An ENFORCED set that grants no runtime backend at all denies every job —
+// an empty enforced set means "run nothing", never "no restriction". An
+// unenforced (base) set has no such meaning: its empty lists are still the
+// documented per-field universal sets.
 type Capabilities struct {
 	NativeExecution    bool
 	Container          bool
@@ -44,6 +53,14 @@ type Capabilities struct {
 	RequireRootless       bool `json:"rootless"`
 	RequireReadOnlyRootFS bool `json:"read_only_rootfs"`
 	RequireNonRoot        bool `json:"non_root"`
+	// Enforced is true when this set is an authoritative authorization
+	// record (repository/org policy compilation or a runner registration
+	// profile) rather than a permissive policy base. It is monotone across
+	// Intersect/Effective: any enforced layer makes the result enforced.
+	// An enforced set that grants no runtime (native/container/tart all
+	// false) denies every runtime; the runner-side equivalent is an
+	// enforced, empty capability list.
+	Enforced bool `json:"enforced"`
 }
 
 // DefaultTrustedCapabilities returns the capabilities granted to trusted
@@ -120,6 +137,10 @@ func Intersect(base, restriction Capabilities) Capabilities {
 		RequireRootless:       base.RequireRootless || restriction.RequireRootless,
 		RequireReadOnlyRootFS: base.RequireReadOnlyRootFS || restriction.RequireReadOnlyRootFS,
 		RequireNonRoot:        base.RequireNonRoot || restriction.RequireNonRoot,
+		// Enforcement is monotone like the sandbox requirements: a result
+		// derived from an authoritative layer stays authoritative even when
+		// the other layer is a permissive base.
+		Enforced: base.Enforced || restriction.Enforced,
 	}
 }
 

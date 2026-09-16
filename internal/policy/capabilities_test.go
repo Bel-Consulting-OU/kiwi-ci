@@ -30,6 +30,9 @@ func TestDefaultTrustedCapabilities(t *testing.T) {
 	if c.RequireRootless || c.RequireReadOnlyRootFS || c.RequireNonRoot {
 		t.Fatalf("trusted defaults must not demand sandbox requirements: %+v", c)
 	}
+	if c.Enforced {
+		t.Fatalf("trusted defaults are a policy base, not an enforced set: %+v", c)
+	}
 }
 
 func TestDefaultUntrustedCapabilities(t *testing.T) {
@@ -60,6 +63,48 @@ func TestDefaultUntrustedCapabilities(t *testing.T) {
 	}
 	if !c.RequireRootless || !c.RequireReadOnlyRootFS || !c.RequireNonRoot {
 		t.Fatalf("untrusted defaults must demand rootless/read-only-rootfs/non-root: %+v", c)
+	}
+	if c.Enforced {
+		t.Fatalf("untrusted defaults are a policy base, not an enforced set: %+v", c)
+	}
+}
+
+// TestIntersectEnforcedIsMonotoneOR pins the Enforced propagation rule: any
+// layer that is authoritative makes the intersection authoritative, so an
+// empty restriction from that layer can never be reinterpreted as
+// "unrestricted" by a permissive base.
+func TestIntersectEnforcedIsMonotoneOR(t *testing.T) {
+	cases := []struct {
+		name                string
+		baseEnforced        bool
+		restrictionEnforced bool
+		want                bool
+	}{
+		{"neither enforced", false, false, false},
+		{"base enforced", true, false, true},
+		{"restriction enforced", false, true, true},
+		{"both enforced", true, true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Intersect(
+				Capabilities{Enforced: tc.baseEnforced},
+				Capabilities{Enforced: tc.restrictionEnforced},
+			)
+			if got.Enforced != tc.want {
+				t.Fatalf("Intersect enforcement = %t, want %t", got.Enforced, tc.want)
+			}
+		})
+	}
+	// Effective must never launder enforcement away, trusted or untrusted.
+	enforced := Capabilities{Enforced: true, NativeExecution: true, Container: true}
+	if !enforced.Effective(true).Enforced || !enforced.Effective(false).Enforced {
+		t.Fatal("Effective dropped the enforcement flag")
+	}
+	// idempotence still holds with enforcement involved
+	once := Intersect(enforced, DefaultTrustedCapabilities())
+	if again := Intersect(once, DefaultTrustedCapabilities()); !reflect.DeepEqual(once, again) {
+		t.Fatalf("Intersect not idempotent with enforcement:\n%+v\n%+v", once, again)
 	}
 }
 

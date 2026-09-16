@@ -651,7 +651,7 @@ func TestDynamicDependencyIDsNeverEmpty(t *testing.T) {
 	// iteration cannot guarantee (child-b depends on child-a; child-c on
 	// both) is the regression fixture for the empty-dependency-ID bug.
 	frag := `{"jobs":{"child-b":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","needs":["child-a"],"steps":[{"run":"echo b"}]},"child-c":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","needs":["child-a","child-b"],"steps":[{"run":"echo c"}]},"child-a":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo a"}]}},"deps":{"child-b":["child-a"],"child-c":["child-a","child-b"]}}`
-	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", frag, leaseHeaders(task, runnerID))
+	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", fragmentBody(t, frag), leaseHeaders(task, runnerID))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("generated = %d: %s", w.Code, w.Body.String())
 	}
@@ -695,7 +695,7 @@ func TestDynamicFragmentBeyondCapRejectedInTransaction(t *testing.T) {
 	}
 	f.mu.Unlock()
 	frag := `{"jobs":{"child-a":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo child"}]}},"deps":{}}`
-	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", frag, leaseHeaders(task, runnerID))
+	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", fragmentBody(t, frag), leaseHeaders(task, runnerID))
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("over-cap fragment = %d, want 400: %s", w.Code, w.Body.String())
 	}

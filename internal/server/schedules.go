@@ -297,6 +297,7 @@ func (s *Server) upsertSchedule(w http.ResponseWriter, r *http.Request) {
 		sc.Trusted = in.Trusted
 		sc.Spec = in.Spec
 		sc.Enabled = enabled
+		sc.CreatedBy = actorFrom(r)
 		if err := ss.UpsertSchedule(r.Context(), sc); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
@@ -330,6 +331,7 @@ func (s *Server) upsertSchedule(w http.ResponseWriter, r *http.Request) {
 		sc.Trusted = in.Trusted
 		sc.Spec = in.Spec
 		sc.Enabled = enabled
+		sc.CreatedBy = actorFrom(r)
 		s.schedules[sc.ID] = sc
 		persistErr := s.persistSchedulesLocked()
 		s.mu.Unlock()
@@ -429,6 +431,12 @@ func (s *Server) fireDueSchedules(ctx context.Context, now time.Time) {
 	}
 	for _, d := range dues {
 		if _, fired, err := s.fireSchedule(ctx, d.sc, d.nominal); err != nil {
+			if errors.Is(err, errScheduleUnauthorized) {
+				// Trust revoked: skip this occurrence (already audited) and
+				// advance, so the schedule does not spin retrying it.
+				s.advanceSchedulePast(ctx, d.sc, d.nominal)
+				continue
+			}
 			s.logError("schedule fire failed", "schedule", d.sc.ID, "error", err.Error())
 			// The occurrence claim was rolled back with the failed
 			// enqueue: leave LastRun so the next tick refires it.
@@ -439,6 +447,33 @@ func (s *Server) fireDueSchedules(ctx context.Context, now time.Time) {
 			continue
 		}
 	}
+}
+
+// errScheduleUnauthorized marks a trusted occurrence whose creator lost the
+// trusted_run grant: the caller advances the schedule past the nominal so it
+// does not retry forever, and the skip is audited.
+var errScheduleUnauthorized = errors.New("schedule trust revoked")
+
+// scheduleTrustStillGranted reports whether the stored creator principal
+// still holds trusted_run for the schedule's repository. Legacy open mode
+// (no principal store configured) preserves historical behavior.
+func (s *Server) scheduleTrustStillGranted(sc storage.Schedule) bool {
+	if s.AuthStore == nil || s.AuthStore.Empty() {
+		// Open mode: no principal-based authorization is configured, so
+		// creation-time trusted_run was vacuous too. Revocation applies
+		// only once principals exist.
+		return true
+	}
+	if sc.CreatedBy == "" {
+		// Pre-migration rows have no creator: fail closed when a principal
+		// store exists, because no one can be re-authorized.
+		return false
+	}
+	p, ok := s.AuthStore.PrincipalBySubject(sc.CreatedBy)
+	if !ok {
+		return false
+	}
+	return auth.Authorize(p, auth.ActionTrustedRun, scheduleRepoID(sc), true)
 }
 
 // advanceSchedulePast moves the in-memory schedule's LastRun marker past a
@@ -510,6 +545,17 @@ func (s *Server) nextDueScheduleFrom(now time.Time, seen map[string]bool) (stora
 // schedule's STORED immutable identity (RepoID, RepoURL, Trusted) — never
 // the caller's request context.
 func (s *Server) fireSchedule(ctx context.Context, sc storage.Schedule, nominal time.Time) (model.Run, bool, error) {
+	// Trusted schedules are a REVOCABLE delegation: automatic firing
+	// re-checks the creator principal's CURRENT grants (trusted_run for the
+	// schedule's stored repository) when a principal store is configured.
+	// A revoked creator stops producing trusted runs at the next
+	// occurrence; the occurrence is skipped and audited, never downgraded
+	// silently to an untrusted run.
+	if sc.Trusted && !s.scheduleTrustStillGranted(sc) {
+		s.auditLocked("schedule.unauthorized", "scheduler", "", "", "trusted schedule skipped: creator no longer holds trusted_run",
+			map[string]string{"schedule": sc.ID, "creator": sc.CreatedBy, "repository": scheduleRepoID(sc)})
+		return model.Run{}, false, errScheduleUnauthorized
+	}
 	preID, err := newID()
 	if err != nil {
 		return model.Run{}, false, err

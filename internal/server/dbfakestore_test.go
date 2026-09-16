@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,8 +30,13 @@ type dbFakeStore struct {
 	artifacts []model.ArtifactRecord
 	reports   []model.TestReport
 
-	outboxItems      []storage.OutboxItem
-	outboxAcked      []string
+	outboxItems  []storage.OutboxItem
+	outboxAcked  []string
+	outboxClaims map[string]fakeOutboxClaim
+	fragments    map[string]storage.GeneratedFragmentReceipt
+	// outboxAppendErr/outboxAckErr inject durable-append/ack failures.
+	outboxAppendErr  error
+	outboxAckErr     error
 	schedules        map[string]storage.Schedule
 	occurrences      map[string][]storage.Occurrence
 	deployments      map[string]model.Deployment
@@ -155,6 +161,8 @@ var _ storage.RunnerTokenStore = (*dbFakeStore)(nil)
 var _ storage.CertRevocationStore = (*dbFakeStore)(nil)
 var _ storage.EnrollGrantStore = (*dbFakeStore)(nil)
 var _ storage.TestHistoryStore = (*dbFakeStore)(nil)
+var _ storage.ArtifactIdempotentStore = (*dbFakeStore)(nil)
+var _ storage.GeneratedFragmentStore = (*dbFakeStore)(nil)
 
 func newDBFakeStore() *dbFakeStore {
 	return &dbFakeStore{
@@ -172,6 +180,8 @@ func newDBFakeStore() *dbFakeStore {
 		quotas:          map[string][2]int{},
 		cacheMans:       map[string]storage.CacheManifestRecord{},
 		secretClaims:    map[string]bool{},
+		outboxClaims:    map[string]fakeOutboxClaim{},
+		fragments:       map[string]storage.GeneratedFragmentReceipt{},
 		profiles:        map[string]model.RunnerProfile{},
 		certProfiles:    map[string]string{},
 		runnerTokens:    map[string]string{},
@@ -389,6 +399,18 @@ func (f *dbFakeStore) CompleteJob(ctx context.Context, jobID string, generation 
 	j.LeaseExpiresAt = nil
 	f.jobs[jobID] = j
 	f.receipts[key] = receipt
+	// Release the completing runner's slot and counters in the same critical
+	// section, mirroring the SQL completeRunnerTx (capacity 0 survives).
+	if r, rok := f.runners[runnerID]; rok {
+		if status == model.StatusSuccess {
+			r.Completed++
+		} else if status == model.StatusFailure {
+			r.Failed++
+		}
+		r.LastSeen = now
+		f.runners[runnerID] = r
+		f.releaseRunnerSlotLocked(runnerID, jobID)
+	}
 	// Completion effect intents ride the completion, mirroring the SQL
 	// contract: one durable outbox item per effect kind under the
 	// deterministic effect IDs.
@@ -417,6 +439,8 @@ func (f *dbFakeStore) CancelRunJobs(ctx context.Context, runID string, reason st
 		if j.RunID != runID || j.Status.Terminal() {
 			continue
 		}
+		wasRunning := j.Status == model.StatusRunning
+		runnerID := j.LeaseRunnerID
 		j.Status = model.StatusCancelled
 		j.Error = reason
 		j.FinishedAt = &now
@@ -424,6 +448,11 @@ func (f *dbFakeStore) CancelRunJobs(ctx context.Context, runID string, reason st
 		j.LeaseTokenHash = nil
 		j.LeaseExpiresAt = nil
 		f.jobs[id] = j
+		// A cancelled running job releases its runner slot immediately,
+		// mirroring the SQL transaction.
+		if wasRunning && runnerID != "" {
+			f.releaseRunnerSlotLocked(runnerID, id)
+		}
 		ids = append(ids, id)
 	}
 	if r, ok := f.runs[runID]; ok && !r.Status.Terminal() {
@@ -432,6 +461,32 @@ func (f *dbFakeStore) CancelRunJobs(ctx context.Context, runID string, reason st
 		f.runs[runID] = r
 	}
 	return ids, nil
+}
+
+// releaseRunnerSlotLocked splices a job out of a runner's active set and
+// recomputes busy/current_job; capacity 0 survives.
+func (f *dbFakeStore) releaseRunnerSlotLocked(runnerID, jobID string) {
+	r, ok := f.runners[runnerID]
+	if !ok {
+		return
+	}
+	r.ActiveJobs = removeStrings(r.ActiveJobs, jobID)
+	r.CurrentJob = ""
+	if len(r.ActiveJobs) > 0 {
+		r.CurrentJob = r.ActiveJobs[0]
+	}
+	r.Busy = r.Capacity > 0 && len(r.ActiveJobs) >= r.Capacity
+	f.runners[runnerID] = r
+}
+
+func removeStrings(in []string, v string) []string {
+	out := in[:0]
+	for _, x := range in {
+		if x != v {
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 func (f *dbFakeStore) UpsertRunner(ctx context.Context, runner model.Runner) error {
@@ -462,6 +517,20 @@ func (f *dbFakeStore) ListRunners(ctx context.Context) ([]model.Runner, error) {
 }
 
 func (f *dbFakeStore) ReleaseRunnerJob(ctx context.Context, runnerID, jobID string, status model.Status) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.runners[runnerID]
+	if !ok {
+		return storage.ErrNotFound
+	}
+	if status == model.StatusSuccess {
+		r.Completed++
+	} else if status == model.StatusFailure {
+		r.Failed++
+	}
+	r.LastSeen = time.Now().UTC()
+	f.runners[runnerID] = r
+	f.releaseRunnerSlotLocked(runnerID, jobID)
 	return nil
 }
 
@@ -470,6 +539,28 @@ func (f *dbFakeStore) InsertArtifact(ctx context.Context, a model.ArtifactRecord
 	defer f.mu.Unlock()
 	f.artifacts = append(f.artifacts, a)
 	return nil
+}
+
+// InsertArtifactOnce mirrors the artifacts (job_id, job_generation, name)
+// unique index: the first insert wins, a same-digest conflict returns the
+// stored record, a different-digest conflict returns
+// storage.ErrArtifactDigestConflict.
+func (f *dbFakeStore) InsertArtifactOnce(ctx context.Context, a model.ArtifactRecord) (model.ArtifactRecord, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if a.JobID != "" {
+		for _, existing := range f.artifacts {
+			if existing.JobID != a.JobID || existing.LeaseGeneration != a.LeaseGeneration || existing.Name != a.Name {
+				continue
+			}
+			if existing.SHA256 != a.SHA256 {
+				return existing, false, storage.ErrArtifactDigestConflict
+			}
+			return existing, false, nil
+		}
+	}
+	f.artifacts = append(f.artifacts, a)
+	return a, true, nil
 }
 
 func (f *dbFakeStore) ListArtifacts(ctx context.Context, runID string) ([]model.ArtifactRecord, error) {
@@ -637,6 +728,9 @@ func itoa(v int64) string {
 func (f *dbFakeStore) OutboxAppend(ctx context.Context, e storage.OutboxItem) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.outboxAppendErr != nil {
+		return f.outboxAppendErr
+	}
 	f.outboxItems = append(f.outboxItems, e)
 	return nil
 }
@@ -644,6 +738,9 @@ func (f *dbFakeStore) OutboxAppend(ctx context.Context, e storage.OutboxItem) er
 func (f *dbFakeStore) OutboxAck(ctx context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.outboxAckErr != nil {
+		return f.outboxAckErr
+	}
 	f.outboxAcked = append(f.outboxAcked, id)
 	kept := f.outboxItems[:0]
 	for _, it := range f.outboxItems {
@@ -652,6 +749,7 @@ func (f *dbFakeStore) OutboxAck(ctx context.Context, id string) error {
 		}
 	}
 	f.outboxItems = kept
+	delete(f.outboxClaims, id)
 	return nil
 }
 
@@ -659,6 +757,45 @@ func (f *dbFakeStore) OutboxPending(ctx context.Context) ([]storage.OutboxItem, 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]storage.OutboxItem(nil), f.outboxItems...), nil
+}
+
+// fakeOutboxClaim mirrors the outbox claimed_at/claimed_by columns.
+type fakeOutboxClaim struct {
+	claimer string
+	at      time.Time
+}
+
+// ClaimOutbox atomically claims up to limit dispatchable rows for claimer:
+// unclaimed rows plus rows whose claim is older than storage.OutboxClaimTTL,
+// in FIFO order. Two concurrent flushers can never claim the same row.
+func (f *dbFakeStore) ClaimOutbox(ctx context.Context, claimer string, limit int) ([]storage.OutboxItem, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if claimer == "" || limit <= 0 {
+		return nil, nil
+	}
+	cutoff := time.Now().UTC().Add(-storage.OutboxClaimTTL)
+	out := []storage.OutboxItem{}
+	for _, it := range f.outboxItems {
+		if len(out) >= limit {
+			break
+		}
+		if c, ok := f.outboxClaims[it.ID]; ok && c.at.After(cutoff) {
+			continue
+		}
+		f.outboxClaims[it.ID] = fakeOutboxClaim{claimer: claimer, at: time.Now().UTC()}
+		out = append(out, it)
+	}
+	return out, nil
+}
+
+func (f *dbFakeStore) ReleaseOutboxClaim(ctx context.Context, id, claimer string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if c, ok := f.outboxClaims[id]; ok && c.claimer == claimer {
+		delete(f.outboxClaims, id)
+	}
+	return nil
 }
 
 func (f *dbFakeStore) LoadTestHistory(ctx context.Context) (int64, []byte, error) {
@@ -1017,6 +1154,8 @@ func (f *dbFakeStore) InsertCompiledRun(ctx context.Context, req storage.InsertC
 		if !ok || j.Status.Terminal() {
 			continue
 		}
+		wasRunning := j.Status == model.StatusRunning
+		runnerID := j.LeaseRunnerID
 		j.Status = model.StatusCancelled
 		j.Error = "superseded by run " + req.Run.ID
 		j.FinishedAt = &now
@@ -1025,6 +1164,11 @@ func (f *dbFakeStore) InsertCompiledRun(ctx context.Context, req storage.InsertC
 		j.LeaseExpiresAt = nil
 		f.jobs[id] = j
 		f.audit = append(f.audit, model.AuditEvent{ID: id + "|audit", Action: "job.superseded", Actor: "scheduler", RunID: j.RunID, JobID: id, CreatedAt: now})
+		// A superseded running job releases its runner slot in the same
+		// transaction, mirroring the SQL cancel-superseded path.
+		if wasRunning && runnerID != "" {
+			f.releaseRunnerSlotLocked(runnerID, id)
+		}
 	}
 	if req.WebhookClaim != nil {
 		f.deliveries[req.WebhookClaim.Forge+"/"+req.WebhookClaim.DeliveryID] = req.Run.ID
@@ -1035,47 +1179,106 @@ func (f *dbFakeStore) InsertCompiledRun(ctx context.Context, req storage.InsertC
 	return nil
 }
 
-// AcquireLeaseAtomic mirrors the SQL atomic lease: the job claim and the
-// runner capacity slot commit or fail together.
-func (f *dbFakeStore) AcquireLeaseAtomic(ctx context.Context, jobID, runnerID string, tokenHash []byte, generation int64, expiresAt time.Time, runnerCapacity int) (model.Job, error) {
+// AcquireLeaseAtomic mirrors the SQL atomic lease: the shared
+// storage.LeasePredicate gates the claim (disabled/draining, capacity,
+// labels, repo ACL, runtime capability, enforced-policy runtime grant and
+// environment concurrency), the conditional quota transition and the job
+// claim + runner slot commit together.
+func (f *dbFakeStore) AcquireLeaseAtomic(ctx context.Context, claim storage.LeaseClaim) (model.Job, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.atomicLeaseErrs > 0 {
 		f.atomicLeaseErrs--
 		return model.Job{}, storage.ErrLeaseConflict
 	}
-	f.acquireCalls = append(f.acquireCalls, acquireArgs{jobID, runnerID, tokenHash, generation, expiresAt})
-	j, ok := f.jobs[jobID]
+	f.acquireCalls = append(f.acquireCalls, acquireArgs{claim.JobID, claim.RunnerID, claim.TokenHash, claim.Generation, claim.ExpiresAt})
+	j, ok := f.jobs[claim.JobID]
 	if !ok {
 		return model.Job{}, storage.ErrNotFound
 	}
 	if j.Status != model.StatusQueued {
 		return model.Job{}, storage.ErrLeaseConflict
 	}
-	r, rok := f.runners[runnerID]
+	r, rok := f.runners[claim.RunnerID]
 	if !rok {
 		return model.Job{}, storage.ErrNoCapacity
 	}
-	cap := runnerCapacity
-	if cap <= 0 {
-		cap = f.atomicLeaseCapacity
+	eff := r
+	if strings.TrimSpace(r.CertSerial) != "" {
+		if profileID, linked := f.certProfiles[r.CertSerial]; linked {
+			p, pok := f.profiles[profileID]
+			if !pok {
+				return model.Job{}, storage.ErrNoCapacity
+			}
+			eff = storage.ResolveRunnerProfile(r, p, true)
+		}
 	}
-	if cap > 0 && len(r.ActiveJobs) >= cap {
+	if f.atomicLeaseCapacity > 0 {
+		eff.Capacity = f.atomicLeaseCapacity
+	}
+	envRunning := 0
+	if j.Environment != "" && j.EnvironmentConcurrency > 0 {
+		for _, other := range f.jobs {
+			if other.ID == j.ID || other.Status != model.StatusRunning {
+				continue
+			}
+			if other.Environment == j.Environment && other.RepoURL == j.RepoURL {
+				envRunning++
+			}
+		}
+	}
+	runtimes, enforced := storage.LeasePolicyRuntimes(j)
+	if !(storage.LeasePredicate{Runner: eff, Job: j, EnvRunning: envRunning, PolicyEnforced: enforced, PolicyRuntimes: runtimes}).Allows() {
+		if j.Environment != "" && j.EnvironmentConcurrency > 0 && envRunning >= j.EnvironmentConcurrency {
+			return model.Job{}, storage.ErrEnvConcurrency
+		}
 		return model.Job{}, storage.ErrNoCapacity
 	}
+	keys := []string{claim.RepoURL}
+	if team := repoURLTeam(claim.RepoURL); team != "" && team != claim.RepoURL {
+		keys = append(keys, team)
+	}
+	for i, key := range keys {
+		limit := claim.RepoConcurrency
+		reason := "REPO_QUOTA"
+		if i > 0 {
+			limit = claim.TeamConcurrency
+			reason = "TEAM_QUOTA"
+		}
+		if limit <= 0 {
+			continue
+		}
+		if float64(f.quotas[key][0]) >= limit {
+			return model.Job{}, &storage.QuotaExceededError{Reason: reason, Msg: fmt.Sprintf("%s concurrency limit %g reached", key, limit)}
+		}
+	}
+	now := time.Now().UTC()
 	j.Status = model.StatusRunning
 	j.Attempts++
-	j.LeaseRunnerID = runnerID
-	j.LeaseTokenHash = tokenHash
-	j.LeaseGeneration = generation
-	j.LeaseExpiresAt = &expiresAt
-	f.jobs[jobID] = j
-	r.ActiveJobs = append(r.ActiveJobs, jobID)
+	if j.StartedAt == nil {
+		j.StartedAt = &now
+	}
+	j.CostRate = eff.CostPerHour
+	j.PowerWatts = eff.PowerWatts
+	j.LeaseRunnerID = claim.RunnerID
+	j.LeaseTokenHash = claim.TokenHash
+	j.LeaseGeneration = claim.Generation
+	j.LeaseExpiresAt = &claim.ExpiresAt
+	f.jobs[claim.JobID] = j
+	r.ActiveJobs = append(r.ActiveJobs, claim.JobID)
+	r.Busy = eff.Capacity > 0 && len(r.ActiveJobs) >= eff.Capacity
 	if len(r.ActiveJobs) > 0 {
 		r.CurrentJob = r.ActiveJobs[0]
 	}
-	r.Busy = cap > 0 && len(r.ActiveJobs) >= cap
-	f.runners[runnerID] = r
+	f.runners[claim.RunnerID] = r
+	for _, key := range keys {
+		c := f.quotas[key]
+		c[0]++
+		if c[1] > 0 {
+			c[1]--
+		}
+		f.quotas[key] = c
+	}
 	return j, nil
 }
 
@@ -1170,12 +1373,32 @@ func (f *dbFakeStore) ExpireDownstreamReservations(ctx context.Context, olderTha
 	return n, nil
 }
 
-func (f *dbFakeStore) InsertGeneratedJobsTx(ctx context.Context, parentJobID string, depth int, jobs map[string]model.Job, deps map[string][]string, contracts map[string]map[string]storage.ArtifactContract, verify storage.GeneratedJobVerifier) error {
+func (f *dbFakeStore) GetGeneratedFragment(ctx context.Context, parentJobID string, generation int64, fragmentID string) (storage.GeneratedFragmentReceipt, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	parent, ok := f.jobs[parentJobID]
+	rec, ok := f.fragments[fragmentReceiptKey(parentJobID, generation, fragmentID)]
+	return rec, ok, nil
+}
+
+// fragmentReceiptKey mirrors the generated_fragments primary key.
+func fragmentReceiptKey(parentJobID string, generation int64, fragmentID string) string {
+	return parentJobID + "|" + strconv.FormatInt(generation, 10) + "|" + fragmentID
+}
+
+// InsertGeneratedFragmentTx mirrors the SQL transaction under f.mu: a
+// committed receipt is returned with replayed=true and nothing is inserted;
+// otherwise the verifier runs with the run's job count read under the same
+// lock and the fragment + receipt commit atomically.
+func (f *dbFakeStore) InsertGeneratedFragmentTx(ctx context.Context, req storage.GeneratedFragmentRequest, verify storage.GeneratedJobVerifier) (storage.GeneratedFragmentReceipt, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := fragmentReceiptKey(req.ParentJobID, req.LeaseGeneration, req.FragmentID)
+	if rec, ok := f.fragments[key]; ok {
+		return rec, true, nil
+	}
+	parent, ok := f.jobs[req.ParentJobID]
 	if !ok {
-		return storage.ErrNotFound
+		return storage.GeneratedFragmentReceipt{}, false, storage.ErrNotFound
 	}
 	count := 0
 	for _, j := range f.jobs {
@@ -1185,16 +1408,24 @@ func (f *dbFakeStore) InsertGeneratedJobsTx(ctx context.Context, parentJobID str
 	}
 	if verify != nil {
 		if err := verify(parent, count); err != nil {
-			return err
+			return storage.GeneratedFragmentReceipt{}, false, err
 		}
 	}
-	for id, j := range jobs {
+	for id, j := range req.Jobs {
 		f.jobs[id] = j
 	}
-	for id, cs := range contracts {
+	for id, cs := range req.Contracts {
 		f.contracts[id] = cs
 	}
-	return nil
+	rec := storage.GeneratedFragmentReceipt{
+		ParentJobID:     req.ParentJobID,
+		LeaseGeneration: req.LeaseGeneration,
+		FragmentID:      req.FragmentID,
+		Children:        append([]storage.GeneratedFragmentChild(nil), req.Children...),
+		CreatedAt:       time.Now().UTC(),
+	}
+	f.fragments[key] = rec
+	return rec, false, nil
 }
 
 func (f *dbFakeStore) PutCacheManifest(ctx context.Context, rec storage.CacheManifestRecord) error {

@@ -115,11 +115,16 @@ type Server struct {
 	reports     map[string]model.TestReport
 	deliveries  map[string]string
 	completions map[string]model.CompletionReceipt
-	leaseKey    []byte
-	logSeq      int64
-	store       *storage.Repository
-	oidc        *oidcSigner
-	outbox      *Outbox
+	// generatedFragments is the in-memory generated-fragment idempotency
+	// receipt table (migration 0010's generated_fragments in DB mode). It is
+	// NOT part of the fs snapshot: a dev-mode restart re-admits a replayed
+	// fragment, which is the pre-receipt behavior.
+	generatedFragments map[string]storage.GeneratedFragmentReceipt
+	leaseKey           []byte
+	logSeq             int64
+	store              *storage.Repository
+	oidc               *oidcSigner
+	outbox             *Outbox
 
 	// DB mode: when Sched is non-nil the PostgreSQL store is the source of
 	// truth and scheduler operations delegate to it. The in-memory maps
@@ -352,7 +357,7 @@ func New(token string) *Server {
 		UntrustedCPUCeiling:    2.0,
 		UntrustedMemoryCeiling: 4 << 30,
 		UntrustedPIDCeiling:    256,
-		runs:                   map[string]model.Run{}, jobs: map[string]model.Job{}, runners: map[string]model.Runner{}, artifacts: map[string]model.ArtifactRecord{}, reports: map[string]model.TestReport{}, deliveries: map[string]string{}, completions: map[string]model.CompletionReceipt{}, leaseKey: key, oidc: newOIDCSigner(),
+		runs:                   map[string]model.Run{}, jobs: map[string]model.Job{}, runners: map[string]model.Runner{}, artifacts: map[string]model.ArtifactRecord{}, reports: map[string]model.TestReport{}, deliveries: map[string]string{}, completions: map[string]model.CompletionReceipt{}, generatedFragments: map[string]storage.GeneratedFragmentReceipt{}, leaseKey: key, oidc: newOIDCSigner(),
 		outbox:          NewOutbox(nil),
 		AuthStore:       auth.NewTokenStore(),
 		deployments:     map[string]model.Deployment{},
@@ -601,6 +606,11 @@ func (s *Server) SwitchToDB(db storage.Store) error {
 	if err := sched.InitErr(); err != nil {
 		return fmt.Errorf("server: switch to db: %w", err)
 	}
+	// The atomic lease's conditional queued->running transition enforces
+	// the same repo/team concurrency limits the enqueue admission uses.
+	// The server reapplies them on every lease (SetQuotaLimits), so config
+	// applied after SwitchToDB is still enforced.
+	sched.SetQuotaLimits(s.QuotaLimits.RepoConcurrency, s.QuotaLimits.TeamConcurrency)
 	s.Sched = sched
 	s.DB = db
 	s.LeaderKey = sched.LeaderKey
@@ -1578,6 +1588,27 @@ func (s *Server) getLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, []model.LogEntry{})
 }
 
+// registerResponse always carries the capability claim, even when it is an
+// empty (enforced) list: model.Runner's omitempty would drop an empty claim
+// and the runner would misread a profile-bound deny-all as "no restriction".
+type registerResponse struct {
+	model.Runner
+	Capabilities         []string `json:"capabilities"`
+	CapabilitiesEnforced bool     `json:"capabilities_enforced"`
+}
+
+func newRegisterResponse(in model.Runner, profileBound bool) registerResponse {
+	caps := in.Capabilities
+	if caps == nil {
+		caps = []string{}
+	}
+	return registerResponse{
+		Runner:               in,
+		Capabilities:         caps,
+		CapabilitiesEnforced: profileBound,
+	}
+}
+
 func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	var in model.Runner
 	if !decode(w, r, &in) {
@@ -1702,7 +1733,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.auditLocked("runner.register", in.Name, "", "", "runner registered", nil)
-		writeJSON(w, http.StatusOK, in)
+		writeJSON(w, http.StatusOK, newRegisterResponse(in, s.RequireProfiles || hasProfile))
 		return
 	}
 	s.mu.Lock()
@@ -1737,7 +1768,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	s.auditLocked("runner.register", in.Name, "", "", "runner registered", nil)
 	_ = s.persistLocked()
 	s.mu.Unlock()
-	writeJSON(w, http.StatusOK, in)
+	writeJSON(w, http.StatusOK, newRegisterResponse(in, s.RequireProfiles || hasProfile))
 }
 
 // listRunners is the FULL runner inventory: it requires runner_manage (or
@@ -2057,8 +2088,13 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ri.LastSeen = now
+	// Live profile resolution at lease time: a linked profile's current
+	// attributes (labels/region/repo ACL/capabilities/capacity/rates)
+	// replace the registration snapshot, and a linked-but-missing profile
+	// fails closed with capacity 0.
+	ri, profileLinked := s.liveRunnerLocked(ri)
 	if ri.Capacity < 1 {
-		if s.RequireProfiles {
+		if s.RequireProfiles || profileLinked {
 			// Profile semantics: capacity 0 (no linked profile) receives
 			// nothing. The legacy clamp below applies only to the
 			// self-reported dev-mode registration.
@@ -2096,26 +2132,53 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	candidates := make([]model.Job, 0)
+	// Lease-time quota transition: a queued job may only move to running
+	// while the repository/team running count is below the configured
+	// concurrency (the SQL claim applies the same conditional transition
+	// against quota_reservations inside its transaction).
+	repoRunning := map[string]int{}
+	teamRunning := map[string]int{}
+	for _, other := range s.jobs {
+		if other.Status != model.StatusRunning {
+			continue
+		}
+		repoRunning[other.RepoURL]++
+		teamRunning[repoURLTeam(other.RepoURL)]++
+	}
 	for _, j := range s.jobs {
 		if j.Status != model.StatusQueued || !depsReadyLocked(j, s.jobs) {
 			continue
 		}
-		if !labelsSatisfied(ri.Labels, j.RequiredLabels) {
+		if s.QuotaLimits.RepoConcurrency > 0 && float64(repoRunning[j.RepoURL]) >= s.QuotaLimits.RepoConcurrency {
 			continue
 		}
-		if !regionSatisfied(ri.Region, j.PlacementRegions) {
+		if s.QuotaLimits.TeamConcurrency > 0 && float64(teamRunning[repoURLTeam(j.RepoURL)]) >= s.QuotaLimits.TeamConcurrency {
 			continue
 		}
-		// The claim predicate mirrors scheduler.Lease: canonical repo
-		// authorization and capability compatibility gate candidates
-		// before they can be leased.
-		if !runnerAllowedRepoMemory(ri, j) {
-			continue
+		// The shared lease predicate is the SAME decision the SQL claim and
+		// the in-memory stores apply (labels, canonical repo ACL, runtime
+		// capability, enforced-policy runtime grant, regions, environment
+		// concurrency); dependency readiness is the only memory-specific
+		// gate layered on top.
+		envRunning := 0
+		if j.Environment != "" && j.EnvironmentConcurrency > 0 {
+			for _, other := range s.jobs {
+				if other.ID == j.ID || other.Status != model.StatusRunning {
+					continue
+				}
+				if other.Environment == j.Environment && other.RepoURL == j.RepoURL {
+					envRunning++
+				}
+			}
 		}
-		if !runnerHasCapabilityMemory(ri, j) {
-			continue
-		}
-		if environmentAtCapacityScoped(j, s.jobs) {
+		policyRuntimes, policyEnforced := storage.LeasePolicyRuntimes(j)
+		if !(storage.LeasePredicate{
+			Runner:         ri,
+			Job:            j,
+			EnvRunning:     envRunning,
+			PolicyEnforced: policyEnforced,
+			PolicyRuntimes: policyRuntimes,
+		}).Allows() {
 			continue
 		}
 		candidates = append(candidates, j)
@@ -2231,12 +2294,16 @@ func (s *Server) nextDB(w http.ResponseWriter, r *http.Request, id string) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	// Quota limits are re-applied on every lease: the scheduler enforces
+	// them inside the claim's conditional queued->running transition.
+	s.Sched.SetQuotaLimits(s.QuotaLimits.RepoConcurrency, s.QuotaLimits.TeamConcurrency)
 	j, rawToken, exp, err := s.Sched.Lease(ctx, id, time.Now().UTC())
 	switch {
 	case errors.Is(err, scheduler.ErrNotLeader):
 		http.Error(w, "scheduler standby", http.StatusServiceUnavailable)
 		return
-	case errors.Is(err, scheduler.ErrNoJobs), errors.Is(err, storage.ErrLeaseConflict):
+	case errors.Is(err, scheduler.ErrNoJobs), errors.Is(err, storage.ErrLeaseConflict),
+		errors.Is(err, storage.ErrEnvConcurrency), errors.Is(err, storage.ErrQuotaExceeded):
 		s.applyQueueReasonsDB(ctx, ri)
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -2247,19 +2314,11 @@ func (s *Server) nextDB(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	// The claim transaction froze the runner's live usage rates (and
+	// attempts/started_at) into the persisted job; the wire task must carry
+	// the same values, and no post-claim rewrite is needed.
 	taskJob := *j
 	taskJob.LeaseTokenHash = nil
-	// Freeze the runner's registered rates into the leased job so
-	// completion can derive cost/energy deterministically. The persisted
-	// copy keeps the lease token hash; only the wire task strips it.
-	stored := *j
-	stored.CostRate = ri.CostPerHour
-	stored.PowerWatts = ri.PowerWatts
-	if err := s.DB.UpdateJob(ctx, stored); err != nil {
-		s.logError("lease: persist frozen rates failed", "job", stored.ID, "error", err.Error())
-	}
-	taskJob.CostRate = stored.CostRate
-	taskJob.PowerWatts = stored.PowerWatts
 	task := Task{Job: taskJob, LeaseToken: rawToken, LeaseGeneration: j.LeaseGeneration, LeaseExpiresAt: exp}
 	if j.Environment != "" {
 		s.recordDeploymentDB(ctx, *j, time.Now().UTC())
@@ -3017,6 +3076,8 @@ func (s *Server) cancelRunLocked(runID, reason, actor string) {
 		if j.RunID != runID || j.Status.Terminal() {
 			continue
 		}
+		wasRunning := j.Status == model.StatusRunning
+		runnerID := j.LeaseRunnerID
 		j.Status = model.StatusCancelled
 		j.Error = reason
 		j.FinishedAt = &now
@@ -3026,6 +3087,12 @@ func (s *Server) cancelRunLocked(runID, reason, actor string) {
 		j.LeaseTokenHash = nil
 		j.LeaseExpiresAt = nil
 		s.jobs[id] = j
+		// A cancelled RUNNING job releases its runner slot in the same
+		// critical section: the runner becomes immediately schedulable
+		// again instead of leaking the slot until the lease expires.
+		if wasRunning && runnerID != "" {
+			s.releaseRunnerLocked(runnerID, id, model.StatusCancelled)
+		}
 	}
 	run, ok := s.runs[runID]
 	if ok && !run.Status.Terminal() {
@@ -3274,10 +3341,9 @@ func (s *Server) releaseRunnerLocked(runnerID, jobID string, status model.Status
 		return
 	}
 	ri.ActiveJobs = removeString(ri.ActiveJobs, jobID)
-	if ri.Capacity < 1 {
-		ri.Capacity = 1
-	}
-	ri.Busy = len(ri.ActiveJobs) >= ri.Capacity
+	// Capacity 0 means "take no work" and survives release: no clamp back
+	// to 1. A zero-capacity runner is never busy.
+	ri.Busy = ri.Capacity > 0 && len(ri.ActiveJobs) >= ri.Capacity
 	ri.CurrentJob = ""
 	if len(ri.ActiveJobs) > 0 {
 		ri.CurrentJob = ri.ActiveJobs[0]
@@ -3368,73 +3434,24 @@ func environmentBranchAllowed(ref string, patterns []string) bool {
 	return false
 }
 
-// runnerAllowedRepoMemory mirrors scheduler.Lease's canonical repository
-// authorization for the in-memory next(): a runner whose profile restricts
-// repositories only sees candidates inside its allowlist.
-func runnerAllowedRepoMemory(ri model.Runner, j model.Job) bool {
-	if len(ri.AllowedRepositories) == 0 {
-		return true
+// liveRunnerLocked resolves the LIVE linked profile for the in-memory
+// scheduling path (caller holds s.mu): a profile edit takes effect on the
+// next lease. A linked-but-missing profile fails closed as a zero-capacity
+// runner. linked reports whether a cert_profile_links row exists.
+func (s *Server) liveRunnerLocked(ri model.Runner) (model.Runner, bool) {
+	if strings.TrimSpace(ri.CertSerial) == "" {
+		return ri, false
 	}
-	canon := auth.CanonicalRepoID(repoHost(j.RepoURL), j.RepoFullName)
-	for _, allowed := range ri.AllowedRepositories {
-		if allowed == canon || (j.RepoFullName != "" && allowed == j.RepoFullName) {
-			return true
-		}
+	profileID, ok := s.certProfiles[ri.CertSerial]
+	if !ok {
+		return ri, false
 	}
-	return false
-}
-
-// runnerHasCapabilityMemory mirrors scheduler.Lease's capability
-// compatibility for the in-memory next(): a job whose runtime capability
-// the runner does not declare is never leased. Empty declared capabilities
-// (or an undeterminable job runtime) keep the check vacuous.
-func runnerHasCapabilityMemory(ri model.Runner, j model.Job) bool {
-	if len(ri.Capabilities) == 0 {
-		return true
+	p, ok := s.profiles[profileID]
+	if !ok {
+		ri.Capacity = 0
+		return ri, true
 	}
-	runtime := jobRuntimeCapabilityMemory(j)
-	if runtime == "" {
-		return true
-	}
-	for _, c := range ri.Capabilities {
-		if c == runtime {
-			return true
-		}
-	}
-	return false
-}
-
-// jobRuntimeCapabilityMemory extracts the job's runtime capability from the
-// compiled payload (the memory-mode mirror of the scheduler's payload-based
-// derivation).
-func jobRuntimeCapabilityMemory(j model.Job) string {
-	if j.CompiledJobPayload == nil || j.CompiledJobPayload.EffectiveJob == nil {
-		return ""
-	}
-	var b []byte
-	switch v := j.CompiledJobPayload.EffectiveJob.(type) {
-	case json.RawMessage:
-		b = v
-	case []byte:
-		b = v
-	case string:
-		b = []byte(v)
-	default:
-		var err error
-		if b, err = json.Marshal(v); err != nil {
-			return ""
-		}
-	}
-	var cj pipeline.CompiledJob
-	if err := json.Unmarshal(b, &cj); err != nil {
-		return ""
-	}
-	switch cj.Job.Runtime {
-	case "container", "tart", "native":
-		return cj.Job.Runtime
-	default:
-		return ""
-	}
+	return storage.ResolveRunnerProfile(ri, p, true), true
 }
 
 func labelsSatisfied(have, need []string) bool {

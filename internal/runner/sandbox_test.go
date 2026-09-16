@@ -56,6 +56,31 @@ func TestPayloadSandboxRequirementsDecode(t *testing.T) {
 	}
 }
 
+// TestPayloadSandboxRequirementsFromPolicyCompiledRootless is the
+// end-to-end rootless regression: a policy with require_rootless compiles
+// into effective capabilities whose JSON the runner decodes as rootless,
+// read-only-rootfs and non-root requirements.
+func TestPayloadSandboxRequirementsFromPolicyCompiledRootless(t *testing.T) {
+	cfg := &policy.Config{RequireRootless: true}
+	caps := cfg.CapabilitiesFor("org/app")
+	if caps.NativeExecution {
+		t.Fatal("policy require_rootless must deny native execution")
+	}
+	payload := buildPayload(t, payloadPipeline, "build")
+	payload.EffectivePolicy = mustJSON(t, caps)
+
+	req, err := payloadSandboxRequirements(payload)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !req.Rootless || !req.ReadOnlyRootFS || !req.NonRoot {
+		t.Fatalf("requirements = %+v, want rootless/read-only-rootfs/non-root from the policy", req)
+	}
+	if !caps.Enforced {
+		t.Fatal("policy-compiled capabilities must be enforced")
+	}
+}
+
 // TestApplyEffectiveSandboxStrengthensOnly verifies the handoff copies
 // effective-policy requirements onto the compiled job and never weakens an
 // explicit job-level request.

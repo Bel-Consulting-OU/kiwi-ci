@@ -53,6 +53,22 @@ var (
 	ErrGrantConsumed = errors.New("storage: enrollment grant already consumed")
 	// ErrGrantExpired means an enrollment grant's expires_at has passed.
 	ErrGrantExpired = errors.New("storage: enrollment grant expired")
+	// ErrEnvConcurrency means the atomic lease's environment concurrency
+	// predicate rejected the candidate: another running job already holds
+	// the last slot of the candidate's (repo, environment) concurrency key.
+	// The lease transaction rolled back; the scheduler tries the next
+	// candidate.
+	ErrEnvConcurrency = errors.New("storage: environment at capacity")
+	// ErrQuotaExceeded means the atomic lease's conditional queued->running
+	// quota transition matched zero rows: running+1 would exceed the
+	// repository or team concurrency limit. The whole lease rolled back.
+	// QuotaExceededError unwraps to this sentinel.
+	ErrQuotaExceeded = errors.New("storage: quota concurrency exceeded")
+	// ErrArtifactDigestConflict means an artifact row already exists for the
+	// same (job_id, job_generation, name) idempotency key with a DIFFERENT
+	// SHA256: the upload must be answered 409 and the stored record is never
+	// overwritten.
+	ErrArtifactDigestConflict = errors.New("storage: artifact digest conflict")
 )
 
 // QuotaExceededError is returned by quota admission inside InsertCompiledRun
@@ -70,6 +86,11 @@ func (e *QuotaExceededError) Error() string {
 	}
 	return e.Msg
 }
+
+// Unwrap exposes the ErrQuotaExceeded sentinel so callers can match quota
+// rejections with errors.Is regardless of which admission path (enqueue or
+// atomic lease) produced them.
+func (e *QuotaExceededError) Unwrap() error { return ErrQuotaExceeded }
 
 // Store is the durable SQL contract for the control plane. It is separate
 // from the filesystem Repository: the scheduler phase will back the server's
@@ -207,13 +228,31 @@ func CompletionEffectID(jobID string, generation int64, kind string) string {
 	return hex.EncodeToString(sum[:16])
 }
 
+// OutboxClaimTTL is how long a flush's claim on an outbox row is honored
+// before another replica may reclaim it. A claim is held between the atomic
+// claim (SELECT ... FOR UPDATE SKIP LOCKED) and the durable ack; a flusher
+// that crashes in between loses its claim after this TTL and the intent is
+// retried by another replica.
+const OutboxClaimTTL = 5 * time.Minute
+
+// OutboxClaimBatch bounds how many rows one flush claims at a time. A crash
+// can therefore strand at most this many intents for the TTL window.
+const OutboxClaimBatch = 64
+
 // OutboxStore is the durable outbox contract. OutboxAppend enqueues an item,
-// OutboxAck removes a successfully dispatched item, and OutboxPending returns
-// the unacked items in FIFO order.
+// OutboxAck removes a successfully dispatched item (clearing any claim),
+// OutboxPending returns the unacked items in FIFO order for startup replay,
+// and ClaimOutbox atomically claims a batch of dispatchable rows for one
+// flusher so two replicas never dispatch the same intent: rows already
+// claimed within OutboxClaimTTL are skipped and stale claims are reclaimable.
+// ReleaseOutboxClaim returns an un-dispatched claim so a retry does not wait
+// for the TTL.
 type OutboxStore interface {
 	OutboxAppend(ctx context.Context, e OutboxItem) error
 	OutboxAck(ctx context.Context, id string) error
 	OutboxPending(ctx context.Context) ([]OutboxItem, error)
+	ClaimOutbox(ctx context.Context, claimer string, limit int) ([]OutboxItem, error)
+	ReleaseOutboxClaim(ctx context.Context, id, claimer string) error
 }
 
 // Schedule is one cron-triggered pipeline schedule. Repository is the
@@ -235,6 +274,10 @@ type Schedule struct {
 	Enabled    bool       `json:"enabled"`
 	LastRun    *time.Time `json:"last_run,omitempty"`
 	CreatedAt  time.Time  `json:"created_at"`
+	// CreatedBy is the authenticated principal subject that created or last
+	// updated the schedule. Trusted schedules are re-authorized against the
+	// current principal store at automatic fire time, so trust is revocable.
+	CreatedBy string `json:"created_by,omitempty"`
 }
 
 // Occurrence is one claimed firing of a schedule: the nominal time the cron
@@ -341,14 +384,62 @@ type DynamicStore interface {
 // fresh state; a returned error rolls the whole fragment back.
 type GeneratedJobVerifier func(parent model.Job, runJobCount int) error
 
-// DynamicStoreTx is the transactional dynamic-fragment contract: the
-// verification closure runs inside the same transaction as the fragment
-// insertion, so a stale lease or an over-cap run rejects the fragment
-// atomically. The fragment's artifact contracts commit in the SAME
-// transaction as the jobs — a generated job with a required artifact has
-// its contract row visible before any completion can run.
+// GeneratedFragmentChild is one created child of a generated fragment: the
+// compiled fragment key (matrix/shard suffixes included) and the assigned
+// job ID, in the order the admitting server reported them.
+type GeneratedFragmentChild struct {
+	Key string `json:"key"`
+	ID  string `json:"id"`
+}
+
+// GeneratedFragmentReceipt is the durable idempotency receipt of one
+// generated fragment upload: the (parent job, lease generation, fragment
+// digest) triple maps to the children created for it, in canonical
+// (sorted-key) order, so a replay reconstructs the original response
+// exactly.
+type GeneratedFragmentReceipt struct {
+	ParentJobID     string                   `json:"parent_job_id"`
+	LeaseGeneration int64                    `json:"lease_generation"`
+	FragmentID      string                   `json:"fragment_id"`
+	Children        []GeneratedFragmentChild `json:"children"`
+	CreatedAt       time.Time                `json:"created_at"`
+}
+
+// GeneratedFragmentRequest is the full transactional fragment payload: the
+// receipt identity, the already-compiled child jobs, their dependency edges
+// and artifact contracts. The verification closure and the receipt are
+// evaluated inside the same transaction as the insertion. Children lists the
+// created child key/ID pairs in canonical (sorted fragment key) order,
+// matching the response the admitting server reported.
+type GeneratedFragmentRequest struct {
+	ParentJobID     string
+	Depth           int
+	LeaseGeneration int64
+	FragmentID      string
+	Jobs            map[string]model.Job
+	Deps            map[string][]string
+	Contracts       map[string]map[string]ArtifactContract
+	Children        []GeneratedFragmentChild
+}
+
+// GeneratedFragmentStore reads the idempotency receipt of a previously
+// admitted fragment so a replayed upload returns the same children without
+// re-inserting anything.
+type GeneratedFragmentStore interface {
+	GetGeneratedFragment(ctx context.Context, parentJobID string, generation int64, fragmentID string) (GeneratedFragmentReceipt, bool, error)
+}
+
+// DynamicStoreTx is the transactional dynamic-fragment contract. The
+// verification closure and the idempotency receipt are evaluated inside the
+// same transaction as the fragment insertion, so a stale lease or an
+// over-cap run rejects the fragment atomically and a replayed fragment
+// (same parent, generation and fragment id) returns the ORIGINAL receipt
+// with replayed=true and inserts nothing. The fragment's artifact contracts
+// commit in the SAME transaction as the jobs — a generated job with a
+// required artifact has its contract row visible before any completion can
+// run.
 type DynamicStoreTx interface {
-	InsertGeneratedJobsTx(ctx context.Context, parentJobID string, depth int, jobs map[string]model.Job, deps map[string][]string, contracts map[string]map[string]ArtifactContract, verify GeneratedJobVerifier) error
+	InsertGeneratedFragmentTx(ctx context.Context, req GeneratedFragmentRequest, verify GeneratedJobVerifier) (GeneratedFragmentReceipt, bool, error)
 }
 
 // DownstreamStore is the durable cross-repo dispatch claim contract.
@@ -391,6 +482,18 @@ type RunDownstreamStore interface {
 // payload column.
 type ArtifactLookupStore interface {
 	GetArtifact(ctx context.Context, id string) (model.ArtifactRecord, error)
+}
+
+// ArtifactIdempotentStore is the authoritative artifact-upload idempotency
+// contract: the (job_id, job_generation, name) unique key makes the database
+// the arbiter when two replicas stage the same artifact name concurrently.
+// InsertArtifactOnce inserts the record unless the key already exists; on a
+// conflict it returns the STORED record with created=false — and
+// ErrArtifactDigestConflict when the stored SHA256 differs from the incoming
+// digest. The caller answers 200/existing for the same digest and 409 for a
+// different one; the stored record is never overwritten.
+type ArtifactIdempotentStore interface {
+	InsertArtifactOnce(ctx context.Context, a model.ArtifactRecord) (model.ArtifactRecord, bool, error)
 }
 
 // RunnerJobStore lists the currently running jobs leased by one runner. It
@@ -478,13 +581,75 @@ type RunEnqueueStore interface {
 	InsertCompiledRun(ctx context.Context, req InsertCompiledRunRequest) error
 }
 
+// LeaseClaim is the full atomic-lease request. JobID/RunnerID/TokenHash/
+// Generation/ExpiresAt carry the lease itself; every other field is a
+// scheduling predicate that the claim transaction MUST enforce before the
+// runner slot is appended:
+//
+//   - RunnerCapacity is the caller's registration snapshot. The SQL claim
+//     reads the runner's live capacity column instead, and when the runner
+//     has a live profile link the profile's MaxCapacity wins over both, so
+//     a profile edit takes effect on the very next lease. Memory stores
+//     that keep no live row read this field.
+//   - Runtime/CanonRepoID/RepoFullName/RequiredLabels/PlacementRegions are
+//     checked against the LIVE profile rows (cert_profile_links ->
+//     runner_profiles) when the runner is linked; an unlinked runner keeps
+//     the legacy behavior (predicates evaluated by the caller's snapshot).
+//   - Environment/EnvironmentConcurrency reserve an environment slot inside
+//     the transaction under a per-key advisory lock, so two concurrent
+//     claims can never both take the last slot.
+//   - RepoConcurrency/TeamConcurrency gate the queued->running quota
+//     transition: the quota_reservations row is updated conditionally and
+//     zero matched rows rolls the whole lease back with ErrQuotaExceeded.
+type LeaseClaim struct {
+	JobID      string
+	RunnerID   string
+	TokenHash  []byte
+	Generation int64
+	ExpiresAt  time.Time
+
+	RunnerCapacity int
+
+	Runtime          string
+	CanonRepoID      string
+	RepoFullName     string
+	RequiredLabels   []string
+	PlacementRegions []string
+
+	Environment            string
+	EnvironmentConcurrency int
+	RepoURL                string
+	RepoConcurrency        float64
+	TeamConcurrency        float64
+}
+
+// EnvKey names the environment concurrency key: the repository URL plus the
+// environment name. An environment name is not a global lock across
+// repositories.
+func (c LeaseClaim) EnvKey() string {
+	if c.RepoURL == "" || c.Environment == "" {
+		return ""
+	}
+	return c.RepoURL + "\x00" + c.Environment
+}
+
 // AtomicLeaseStore acquires a job lease and reserves the runner capacity
-// slot in the SAME transaction: the job UPDATE claims the lease, then the
-// runner UPDATE appends the job to active_jobs guarded by a capacity check;
-// a runner at capacity rolls the job lease back and returns ErrNoCapacity.
-// Postgres only; single-lock memory mode keeps its separate operations.
+// slot in the SAME transaction: the job UPDATE claims the lease (incrementing
+// attempts once, stamping started_at only on the first lease, freezing the
+// live usage rates), then the runner UPDATE appends the job to active_jobs
+// guarded by the full claim predicate (disabled/draining, capacity, live
+// profile repo ACL, runtime capability, labels, region), and the quota
+// counters move one slot from queued to running conditionally. Any rejected
+// predicate rolls the job lease back:
+//
+//   - ErrNoCapacity: the runner is at capacity, disabled, or draining.
+//   - ErrEnvConcurrency: the environment slot was taken concurrently.
+//   - ErrQuotaExceeded: the repo/team concurrency limit would be exceeded.
+//
+// Implemented by the SQL store and by the in-memory store (used by
+// fault-injection and server tests) with identical predicate ordering.
 type AtomicLeaseStore interface {
-	AcquireLeaseAtomic(ctx context.Context, jobID, runnerID string, tokenHash []byte, generation int64, expiresAt time.Time, runnerCapacity int) (model.Job, error)
+	AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim) (model.Job, error)
 }
 
 // QuotaCounterStore adjusts the reserved running/queued counters for a

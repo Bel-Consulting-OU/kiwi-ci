@@ -18,6 +18,7 @@ const (
 	ViolationKindOIDC       = "oidc"
 	ViolationKindLabels     = "runner_labels"
 	ViolationKindDeployment = "deployments"
+	ViolationKindRuntime    = "runtime"
 )
 
 // Violation is a typed policy admission failure.
@@ -46,6 +47,13 @@ func IsViolation(err error) bool {
 func ValidatePipeline(s *pipeline.Spec, caps Capabilities) error {
 	if s == nil {
 		return &Violation{Kind: "spec", Detail: "nil pipeline"}
+	}
+	// An enforced capability set that grants no runtime at all denies every
+	// job: an empty enforced set means "run nothing", never "no
+	// restriction" (the runner-side equivalent is an enforced empty
+	// capability-list intersection).
+	if caps.Enforced && !caps.NativeExecution && !caps.Container && !caps.Tart {
+		return &Violation{Kind: ViolationKindRuntime, Detail: "the enforced capability set grants no runtime backend"}
 	}
 	if len(s.Secrets) > 0 && caps.Secrets != nil {
 		for _, name := range s.Secrets {

@@ -84,10 +84,14 @@ type Options struct {
 	StepReporter func(jobID, stepID string, d time.Duration)
 	// GenerateUpload, when set, is called for a successful job that declares
 	// generate.path, with the fragment's contents read through the job's
-	// live backend session (ReadJobFile) while it is still running. An
-	// upload error is reported as a warning and never changes job status; a
-	// read error fails the job. The distributed runner wires its fragment
-	// POST here; local runs leave it nil and only validate the read.
+	// live backend session (ReadJobFile) while it is still running. Unless
+	// the job's generate.optional is true, an upload error (server
+	// rejection, non-2xx response, network failure) FAILS the job with a
+	// "generated graph rejected" error: a generator that declares a graph
+	// must not silently succeed without it. With generate.optional the error
+	// stays a warning and the job succeeds. A read error always fails the
+	// job. The distributed runner wires its fragment POST here; local runs
+	// leave it nil and only validate the read.
 	GenerateUpload func(jobID, path string, data []byte) error
 }
 
@@ -654,6 +658,8 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	// session is closed only by the deferred cleanup above). The fragment is
 	// read through the backend with a hard cap, never host-side by name: a
 	// fragment that cannot be safely read fails the job with a clear error.
+	// A fragment that is read but rejected by the upload hook fails the job
+	// too unless generate.optional downgraded it to a warning.
 	if currentStatus == model.StatusSuccess && strings.TrimSpace(cj.Job.Generate.Path) != "" {
 		genPath := strings.TrimSpace(cj.Job.Generate.Path)
 		clean := filepath.Clean(genPath)
@@ -671,7 +677,18 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 				res.Error = genErr.Error()
 			} else if e.Opt.GenerateUpload != nil {
 				if uerr := e.Opt.GenerateUpload(cj.ID, genPath, data); uerr != nil {
-					e.log(cj.ID, "generate", "fragment upload failed: "+uerr.Error())
+					if cj.Job.Generate.Optional {
+						e.log(cj.ID, "generate", "fragment upload warning (generate.optional=true): "+uerr.Error())
+					} else {
+						// Default semantics: a declared generated graph that
+						// the control plane rejects (or that cannot be
+						// delivered) is a job failure, never a silent
+						// success with missing children.
+						genErr := fmt.Errorf("generated graph rejected: %w", uerr)
+						e.log(cj.ID, "generate", genErr.Error())
+						currentStatus = model.StatusFailure
+						res.Error = genErr.Error()
+					}
 				}
 			}
 		}

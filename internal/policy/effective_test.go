@@ -296,6 +296,62 @@ jobs:
 	}
 }
 
+// TestEnforcedEmptyCapabilitySetDeniesEveryRuntime covers CRITICAL-3 on the
+// admission side: an enforced set that grants no runtime denies every job,
+// including the default native runtime, instead of falling through as "no
+// restriction".
+func TestEnforcedEmptyCapabilitySetDeniesEveryRuntime(t *testing.T) {
+	specs := map[string]*pipeline.Spec{
+		"native": mustParse(t, `version: 1
+jobs:
+  x:
+    steps:
+      - run: echo hi
+`),
+		"container": mustParse(t, `version: 1
+jobs:
+  x:
+    runtime: container
+    image: alpine
+    steps:
+      - run: echo hi
+`),
+		"tart": mustParse(t, `version: 1
+jobs:
+  x:
+    runtime: tart
+    vm: macos
+    steps:
+      - run: echo hi
+`),
+	}
+	for name, spec := range specs {
+		t.Run(name, func(t *testing.T) {
+			err := ValidatePipeline(spec, Capabilities{Enforced: true})
+			if err == nil {
+				t.Fatal("enforced empty capability set admitted a job")
+			}
+			var v *Violation
+			if !errors.As(err, &v) || v.Kind != ViolationKindRuntime {
+				t.Fatalf("violation = %v, want kind %q", err, ViolationKindRuntime)
+			}
+		})
+	}
+	// The same zero grants WITHOUT enforcement are a policy base whose
+	// fields deny individually — the explicit enforcement flag is what makes
+	// the empty set deny-all rather than per-field.
+	if err := ValidatePipeline(specs["native"], Capabilities{}); err == nil {
+		t.Fatal("native job must still be denied without the native grant")
+	}
+	// An enforced set that grants the needed runtime stays permissive.
+	if err := ValidatePipeline(specs["native"], Capabilities{Enforced: true, NativeExecution: true}); err != nil {
+		t.Fatalf("enforced native grant rejected: %v", err)
+	}
+	if err := ValidatePipeline(specs["container"], Capabilities{Enforced: true, Container: true, Network: pipeline.NetworkPolicyInternet}); err != nil {
+		t.Fatalf("enforced container grant rejected: %v", err)
+	}
+}
+
 func TestValidateAdmissionWithCapabilities(t *testing.T) {
 	native := mustParse(t, `version: 1
 jobs:

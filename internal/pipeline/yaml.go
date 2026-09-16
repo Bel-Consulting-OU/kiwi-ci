@@ -214,7 +214,7 @@ var knownFieldTables = map[string]map[string]bool{
 	"jobs.*.placement":                   {"regions": true, "labels": true},
 	"jobs.*.resources":                   {"cpu": true, "memory": true, "disk": true, "pids": true},
 	"jobs.*.tests":                       {"reports": true, "manifest": true, "shards": true, "retry_failed": true, "quarantine_flaky": true},
-	"jobs.*.generate":                    {"path": true, "max_jobs": true, "max_depth": true},
+	"jobs.*.generate":                    {"path": true, "max_jobs": true, "max_depth": true, "optional": true},
 	"jobs.*.downstream":                  {"repository": true, "ref": true, "event": true, "inputs": true, "wait": true},
 	"jobs.*.snapshot":                    {"on": true},
 	"jobs.*.deployment":                  {"canary": true, "verify": true, "rollback": true},

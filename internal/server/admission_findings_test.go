@@ -133,7 +133,7 @@ func TestGeneratedFragmentRequireDigestPinsEnforced(t *testing.T) {
 	}
 	runnerID, task := leaseRunJob(t, s)
 	frag := `{"jobs":{"child-a":{"runtime":"container","image":"alpine:latest","steps":[{"run":"echo child"}]}},"deps":{}}`
-	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", frag, leaseHeaders(task, runnerID))
+	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", fragmentBody(t, frag), leaseHeaders(task, runnerID))
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("unpinned fragment under require_digest_pins = %d, want 403: %s", w.Code, w.Body.String())
 	}
@@ -142,7 +142,7 @@ func TestGeneratedFragmentRequireDigestPinsEnforced(t *testing.T) {
 	}
 	// A pinned fragment passes.
 	frag = `{"jobs":{"child-a":{"runtime":"container","image":"alpine@sha256:` + pinnedImageDigest + `","steps":[{"run":"echo child"}]}},"deps":{}}`
-	w = doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", frag, leaseHeaders(task, runnerID))
+	w = doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", fragmentBody(t, frag), leaseHeaders(task, runnerID))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("pinned fragment = %d, want 201: %s", w.Code, w.Body.String())
 	}
@@ -160,7 +160,7 @@ func TestGeneratedFragmentRegionAllowlistEnforced(t *testing.T) {
 	}
 	runnerID, task := leaseRunJob(t, s)
 	frag := `{"jobs":{"child-a":{"runtime":"container","image":"alpine@sha256:` + pinnedImageDigest + `","placement":{"regions":["us-east-1"]},"steps":[{"run":"echo child"}]}},"deps":{}}`
-	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", frag, leaseHeaders(task, runnerID))
+	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", fragmentBody(t, frag), leaseHeaders(task, runnerID))
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("fragment outside allowed regions = %d, want 403: %s", w.Code, w.Body.String())
 	}
@@ -172,7 +172,7 @@ func TestGeneratedFragmentContainerImageRequired(t *testing.T) {
 	s, _ := trustedGenerateServer(t)
 	runnerID, task := leaseRunJob(t, s)
 	frag := `{"jobs":{"child-a":{"runtime":"container","steps":[{"run":"echo child"}]}},"deps":{}}`
-	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", frag, leaseHeaders(task, runnerID))
+	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", fragmentBody(t, frag), leaseHeaders(task, runnerID))
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("imageless container fragment = %d, want 400: %s", w.Code, w.Body.String())
 	}

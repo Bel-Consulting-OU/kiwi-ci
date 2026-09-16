@@ -104,7 +104,7 @@ func TestMemStoreQuotaReservationLifecycle(t *testing.T) {
 		t.Fatalf("after enqueue = %d/%d, want 0/1", running, queued)
 	}
 	// Lease moves the slot queued -> running.
-	if _, err := m.AcquireLeaseAtomic(ctx(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaae", testRunner.ID, []byte("h"), 1, time.Unix(3000, 0).UTC(), 2); err != nil {
+	if _, err := m.AcquireLeaseAtomic(ctx(), LeaseClaim{JobID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaae", RunnerID: testRunner.ID, TokenHash: []byte("h"), Generation: 1, ExpiresAt: time.Unix(3000, 0).UTC(), RunnerCapacity: 2}); err != nil {
 		t.Fatal(err)
 	}
 	running, queued, _ = m.QuotaCounts(ctx(), repo, "")
@@ -168,16 +168,24 @@ func TestMemStoreAcquireLeaseAtomicCapacity(t *testing.T) {
 	seedRunAndJob(m)
 	seedRunner(m)
 	// The runner has capacity 2; take it once.
-	if _, err := m.AcquireLeaseAtomic(ctx(), testJob.ID, testRunner.ID, []byte("h"), 1, time.Unix(3000, 0).UTC(), 2); err != nil {
+	if _, err := m.AcquireLeaseAtomic(ctx(), LeaseClaim{JobID: testJob.ID, RunnerID: testRunner.ID, TokenHash: []byte("h"), Generation: 1, ExpiresAt: time.Unix(3000, 0).UTC(), RunnerCapacity: 2}); err != nil {
 		t.Fatal(err)
 	}
-	// Second job against the same runner with capacity 1 must fail.
+	// The live runner row now has capacity 1: a second job must fail.
+	ri, err := m.GetRunner(ctx(), testRunner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ri.Capacity = 1
+	if err := m.UpsertRunner(ctx(), ri); err != nil {
+		t.Fatal(err)
+	}
 	second := testJob
 	second.ID = "ffffffffffffffffffffffffffffffff"
 	second.Key = "second"
 	second.Status = model.StatusQueued
 	_ = m.InsertJob(ctx(), second)
-	if _, err := m.AcquireLeaseAtomic(ctx(), second.ID, testRunner.ID, []byte("h"), 1, time.Unix(3000, 0).UTC(), 1); !errors.Is(err, ErrNoCapacity) {
+	if _, err := m.AcquireLeaseAtomic(ctx(), LeaseClaim{JobID: second.ID, RunnerID: testRunner.ID, TokenHash: []byte("h"), Generation: 1, ExpiresAt: time.Unix(3000, 0).UTC(), RunnerCapacity: 1}); !errors.Is(err, ErrNoCapacity) {
 		t.Fatalf("over-capacity lease = %v, want ErrNoCapacity", err)
 	}
 	j, err := m.GetJob(ctx(), second.ID)
@@ -237,9 +245,10 @@ func TestMemStoreDownstreamReservationExpiry(t *testing.T) {
 	}
 }
 
-// TestMemStoreInsertGeneratedJobsTxVerifier proves the transactional
-// verifier rejection leaves zero rows.
-func TestMemStoreInsertGeneratedJobsTxVerifier(t *testing.T) {
+// TestMemStoreInsertGeneratedFragmentTxVerifier proves the transactional
+// verifier rejection leaves zero rows and that acceptance commits the
+// fragment together with its idempotency receipt.
+func TestMemStoreInsertGeneratedFragmentTxVerifier(t *testing.T) {
 	m := newMemStore()
 	seedRunAndJob(m)
 	child := testJob
@@ -248,7 +257,11 @@ func TestMemStoreInsertGeneratedJobsTxVerifier(t *testing.T) {
 	contracts := map[string]map[string]ArtifactContract{
 		child.ID: {"dist": {Name: "dist", Required: true}},
 	}
-	err := m.InsertGeneratedJobsTx(ctx(), testJob.ID, 1, map[string]model.Job{child.ID: child}, nil, contracts, func(parent model.Job, count int) error {
+	req := GeneratedFragmentRequest{
+		ParentJobID: testJob.ID, Depth: 1, FragmentID: "frag-1",
+		Jobs: map[string]model.Job{child.ID: child}, Contracts: contracts, Children: []GeneratedFragmentChild{{Key: child.Key, ID: child.ID}},
+	}
+	_, _, err := m.InsertGeneratedFragmentTx(ctx(), req, func(parent model.Job, count int) error {
 		return errors.New("rejected by verifier")
 	})
 	if err == nil {
@@ -261,20 +274,41 @@ func TestMemStoreInsertGeneratedJobsTxVerifier(t *testing.T) {
 	if got, ok, _ := m.GetJobContracts(ctx(), child.ID); ok || got != nil {
 		t.Fatalf("rejected fragment leaked contracts: %v", got)
 	}
+	if _, found, _ := m.GetGeneratedFragment(ctx(), testJob.ID, 0, "frag-1"); found {
+		t.Fatal("rejected fragment left a receipt")
+	}
 	// Acceptance inserts the fragment AND its contracts atomically.
-	if err := m.InsertGeneratedJobsTx(ctx(), testJob.ID, 1, map[string]model.Job{child.ID: child}, nil, contracts, func(parent model.Job, count int) error {
+	rec, replayed, err := m.InsertGeneratedFragmentTx(ctx(), req, func(parent model.Job, count int) error {
 		if count != 1 {
 			t.Fatalf("run job count = %d, want 1", count)
 		}
 		return nil
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if replayed || len(rec.Children) != 1 || rec.Children[0].ID != child.ID {
+		t.Fatalf("receipt = %+v replayed=%v", rec, replayed)
 	}
 	if _, err := m.GetJob(ctx(), child.ID); err != nil {
 		t.Fatalf("accepted fragment missing: %v", err)
 	}
 	if got, ok, err := m.GetJobContracts(ctx(), child.ID); err != nil || !ok || got["dist"].Name != "dist" {
 		t.Fatalf("accepted fragment contracts = %v, ok=%v, err=%v", got, ok, err)
+	}
+	// A replay returns the SAME receipt and inserts nothing new.
+	again, replayed, err := m.InsertGeneratedFragmentTx(ctx(), req, func(parent model.Job, count int) error {
+		t.Fatalf("replay must not run the verifier (count=%d)", count)
+		return nil
+	})
+	if err != nil || !replayed {
+		t.Fatalf("replay = replayed=%v err=%v", replayed, err)
+	}
+	if len(again.Children) != 1 || again.Children[0].ID != child.ID {
+		t.Fatalf("replayed receipt = %+v", again)
+	}
+	if n := len(m.jobs); n != 2 {
+		t.Fatalf("replay duplicated rows: %d jobs, want 2 (run job + child)", n)
 	}
 }
 

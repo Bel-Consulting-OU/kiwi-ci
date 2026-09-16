@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	v1 "github.com/Bel-Consulting-OU/kiwi-ci/internal/api/v1"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
@@ -50,19 +51,21 @@ const (
 // uploads the child graph its generator produced. jobs maps the child key to
 // its pipeline job spec; deps carries the fragment-internal dependency edges
 // (both keys must reference fragment keys; the generating job is the
-// implicit dependency of every child).
-type generatedFragment struct {
-	Jobs map[string]pipeline.Job `json:"jobs"`
-	Deps map[string][]string     `json:"deps"`
-}
+// implicit dependency of every child). The wire type is shared with the
+// runner so fragment_id is derived from the identical parsed shape on both
+// sides.
+type generatedFragment = v1.GeneratedFragment
 
-// generatedResponse reports the admitted fragment.
+// generatedResponse reports the admitted fragment. Replayed marks a response
+// served from the idempotency receipt: the SAME children the original
+// admission created, returned with 200 instead of 201.
 type generatedResponse struct {
 	ParentJobID string   `json:"parent_job_id"`
 	RunID       string   `json:"run_id"`
 	Depth       int      `json:"depth"`
 	JobIDs      []string `json:"job_ids"`
 	Keys        []string `json:"keys"`
+	Replayed    bool     `json:"replayed,omitempty"`
 }
 
 // generateJobs implements POST /api/v1/jobs/{id}/generated. The caller must
@@ -95,14 +98,80 @@ func (s *Server) generateJobs(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, aerr.Error(), http.StatusBadRequest)
 		return
 	}
+	if res.Replayed {
+		s.auditLocked("generate.replayed", runnerID, parent.RunID, parent.ID, fmt.Sprintf("replayed fragment with %d children", len(res.JobIDs)), map[string]string{"job": parent.Key, "depth": strconv.Itoa(res.Depth)})
+		writeJSON(w, http.StatusOK, res)
+		return
+	}
 	s.auditLocked("generate.admitted", runnerID, parent.RunID, parent.ID, fmt.Sprintf("generated %d child jobs", len(res.JobIDs)), map[string]string{"job": parent.Key, "depth": strconv.Itoa(res.Depth)})
 	s.metricAdd("kiwi_dynamic_jobs_generated_total", float64(len(res.JobIDs)), nil)
 	writeJSON(w, http.StatusCreated, res)
 }
 
+// verifyGeneratedParentState is the single lease/state predicate applied at
+// fragment insertion time in BOTH storage modes (the DB transaction verifier
+// and the memory-mode critical section): the parent must still be running
+// under the same runner, lease generation and token hash, with a live lease,
+// and the run must stay within the max-jobs-per-run cap. snapshot is the
+// authorized parent the handler admitted against; fresh is the current
+// durable/in-memory state.
+func verifyGeneratedParentState(snapshot, fresh model.Job, runJobCount, childCount int) error {
+	if fresh.ID != snapshot.ID {
+		return fmt.Errorf("parent job changed during generation")
+	}
+	if fresh.Status != model.StatusRunning || fresh.LeaseExpiresAt == nil || !fresh.LeaseExpiresAt.After(time.Now().UTC()) {
+		return fmt.Errorf("parent lease expired during generation")
+	}
+	if fresh.LeaseRunnerID != snapshot.LeaseRunnerID || fresh.LeaseGeneration != snapshot.LeaseGeneration {
+		return fmt.Errorf("parent lease changed during generation")
+	}
+	if len(fresh.LeaseTokenHash) == 0 || !subtleCompare(fresh.LeaseTokenHash, snapshot.LeaseTokenHash) {
+		return fmt.Errorf("parent lease token changed during generation")
+	}
+	if runJobCount+childCount > maxJobsPerRun {
+		return fmt.Errorf("run would grow to %d jobs, limit is %d", runJobCount+childCount, maxJobsPerRun)
+	}
+	return nil
+}
+
+// replayGeneratedResponse rebuilds the original admission response from a
+// stored receipt: the same child IDs and keys, in the same order.
+func replayGeneratedResponse(parent model.Job, depth int, rec storage.GeneratedFragmentReceipt) *generatedResponse {
+	ids := make([]string, 0, len(rec.Children))
+	keys := make([]string, 0, len(rec.Children))
+	for _, c := range rec.Children {
+		ids = append(ids, c.ID)
+		keys = append(keys, c.Key)
+	}
+	return &generatedResponse{ParentJobID: parent.ID, RunID: parent.RunID, Depth: depth, JobIDs: ids, Keys: keys, Replayed: true}
+}
+
 // processGeneratedFragment validates and inserts one generated fragment.
-// It is the shared admission path for both storage modes.
+// It is the shared admission path for both storage modes. The body must carry
+// the deterministic fragment_id (sha256 hex of the canonical {jobs, deps});
+// the server recomputes it and rejects a missing or mismatching id with 400.
+// A fragment already admitted under the same (parent, lease generation,
+// fragment id) is answered idempotently with the originally created children.
 func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job, in generatedFragment) (*generatedResponse, error) {
+	fragmentID, err := in.Digest()
+	if err != nil {
+		return nil, err
+	}
+	if in.FragmentID == "" {
+		return nil, fmt.Errorf("generated fragment is missing fragment_id")
+	}
+	if in.FragmentID != fragmentID {
+		return nil, fmt.Errorf("generated fragment_id does not match the fragment digest")
+	}
+	childDepth := parent.DynamicDepth + 1
+	// Replay fast path: a committed receipt returns the original children
+	// without re-running admission (a replay must survive policy edits and a
+	// changed compiler exactly as the original admission did).
+	if rec, found, rerr := s.generatedFragmentReceipt(ctx, parent.ID, parent.LeaseGeneration, fragmentID); rerr != nil {
+		return nil, rerr
+	} else if found {
+		return replayGeneratedResponse(parent, childDepth, rec), nil
+	}
 	if len(in.Jobs) == 0 {
 		return nil, fmt.Errorf("generated fragment declares no jobs")
 	}
@@ -110,7 +179,6 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 		return nil, fmt.Errorf("generated fragment declares %d jobs, limit is %d", len(in.Jobs), maxGeneratedJobsPerFragment)
 	}
 	// Depth: children inherit parent depth + 1 and never exceed the cap.
-	childDepth := parent.DynamicDepth + 1
 	if childDepth > maxDynamicDepth {
 		return nil, fmt.Errorf("generation depth %d exceeds maximum %d", childDepth, maxDynamicDepth)
 	}
@@ -285,6 +353,13 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 		jobContracts[id] = buildJobContracts(cj)
 	}
 
+	// Canonical children order: the response order (sorted compiled keys),
+	// stored in the receipt so a replay reconstructs it exactly.
+	children := make([]storage.GeneratedFragmentChild, 0, len(keys))
+	for _, key := range keys {
+		children = append(children, storage.GeneratedFragmentChild{Key: key, ID: keyIDs[key]})
+	}
+
 	if s.DB != nil {
 		ds, ok := s.DB.(storage.DynamicStoreTx)
 		if !ok {
@@ -294,43 +369,57 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 		for id, j := range created {
 			deps[id] = append([]string(nil), j.Needs...)
 		}
-		// Transactional recheck: the store locks the parent FOR UPDATE and
-		// counts the run's jobs inside the transaction; the closure
-		// re-validates {job, runner, generation, token, expiry} and the
-		// max-jobs-per-run bound against that fresh state.
+		// Transactional recheck: the store locks the parent FOR UPDATE, counts
+		// the run's jobs and records the idempotency receipt in the SAME
+		// transaction; the closure re-validates {job, runner, generation,
+		// token, expiry} and the max-jobs-per-run bound against that fresh
+		// state. A concurrently committed duplicate returns the winner's
+		// receipt instead of inserting a second fragment.
 		verify := func(fresh model.Job, runJobCount int) error {
-			if fresh.Status != model.StatusRunning || fresh.LeaseExpiresAt == nil || !fresh.LeaseExpiresAt.After(time.Now().UTC()) {
-				return fmt.Errorf("parent lease expired during generation")
-			}
-			if fresh.LeaseRunnerID != parent.LeaseRunnerID || fresh.LeaseGeneration != parent.LeaseGeneration {
-				return fmt.Errorf("parent lease changed during generation")
-			}
-			if !subtleCompare(fresh.LeaseTokenHash, parent.LeaseTokenHash) {
-				return fmt.Errorf("parent lease token changed during generation")
-			}
-			if runJobCount+len(created) > maxJobsPerRun {
-				return fmt.Errorf("run would grow to %d jobs, limit is %d", runJobCount+len(created), maxJobsPerRun)
-			}
-			return nil
+			return verifyGeneratedParentState(parent, fresh, runJobCount, len(created))
 		}
-		if err := ds.InsertGeneratedJobsTx(ctx, parent.ID, childDepth, created, deps, jobContracts, verify); err != nil {
+		rec, replayed, err := ds.InsertGeneratedFragmentTx(ctx, storage.GeneratedFragmentRequest{
+			ParentJobID:     parent.ID,
+			Depth:           childDepth,
+			LeaseGeneration: parent.LeaseGeneration,
+			FragmentID:      fragmentID,
+			Jobs:            created,
+			Deps:            deps,
+			Contracts:       jobContracts,
+			Children:        children,
+		}, verify)
+		if err != nil {
 			return nil, err
+		}
+		if replayed {
+			return replayGeneratedResponse(parent, childDepth, rec), nil
 		}
 		return &generatedResponse{ParentJobID: parent.ID, RunID: parent.RunID, Depth: childDepth, JobIDs: ids, Keys: keys}, nil
 	}
 
-	// Memory mode: re-verify the lease under the lock, then insert the
-	// whole fragment atomically with the in-memory maps.
+	// Memory mode: the IDENTICAL lease/state predicate runs inside the same
+	// critical section as the job-count check and the insertion, so a
+	// concurrent fragment can neither race the cap nor slip past a lease
+	// that changed while this request was being admitted.
 	s.mu.Lock()
 	current, still := s.jobs[parent.ID]
 	if !still {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("parent job disappeared")
 	}
-	leaseNow := time.Now().UTC()
-	if current.Status != model.StatusRunning || current.LeaseExpiresAt == nil || !current.LeaseExpiresAt.After(leaseNow) {
+	runJobCount := 0
+	for _, j := range s.jobs {
+		if j.RunID == parent.RunID {
+			runJobCount++
+		}
+	}
+	if verr := verifyGeneratedParentState(parent, current, runJobCount, len(created)); verr != nil {
 		s.mu.Unlock()
-		return nil, fmt.Errorf("parent lease expired during generation")
+		return nil, verr
+	}
+	if rec, found := s.memoryGeneratedFragment(parent.ID, parent.LeaseGeneration, fragmentID); found {
+		s.mu.Unlock()
+		return replayGeneratedResponse(parent, childDepth, rec), nil
 	}
 	for id, j := range created {
 		s.jobs[id] = j
@@ -338,12 +427,50 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 			s.contracts[id] = contracts
 		}
 	}
+	s.generatedFragments[generatedFragmentKey(parent.ID, parent.LeaseGeneration, fragmentID)] = storage.GeneratedFragmentReceipt{
+		ParentJobID:     parent.ID,
+		LeaseGeneration: parent.LeaseGeneration,
+		FragmentID:      fragmentID,
+		Children:        children,
+		CreatedAt:       time.Now().UTC(),
+	}
 	if err := s.persistLocked(); err != nil {
 		s.mu.Unlock()
 		return nil, err
 	}
 	s.mu.Unlock()
 	return &generatedResponse{ParentJobID: parent.ID, RunID: parent.RunID, Depth: childDepth, JobIDs: ids, Keys: keys}, nil
+}
+
+// generatedFragmentKey is the in-memory primary key of the fragment
+// receipts, mirroring the generated_fragments table key.
+func generatedFragmentKey(parentJobID string, generation int64, fragmentID string) string {
+	return parentJobID + "\x00" + strconv.FormatInt(generation, 10) + "\x00" + fragmentID
+}
+
+// generatedFragmentReceipt resolves the idempotency receipt of a fragment:
+// from the durable store in DB mode (when it implements the receipt store),
+// from the in-memory map otherwise.
+func (s *Server) generatedFragmentReceipt(ctx context.Context, parentJobID string, generation int64, fragmentID string) (storage.GeneratedFragmentReceipt, bool, error) {
+	if s.DB != nil {
+		if gs, ok := s.DB.(storage.GeneratedFragmentStore); ok {
+			return gs.GetGeneratedFragment(ctx, parentJobID, generation, fragmentID)
+		}
+		// Stores without the receipt read still dedupe inside
+		// InsertGeneratedFragmentTx; the fast path is simply skipped.
+		return storage.GeneratedFragmentReceipt{}, false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.memoryGeneratedFragment(parentJobID, generation, fragmentID)
+	return rec, ok, nil
+}
+
+// memoryGeneratedFragment reads the in-memory receipt map. The caller holds
+// s.mu.
+func (s *Server) memoryGeneratedFragment(parentJobID string, generation int64, fragmentID string) (storage.GeneratedFragmentReceipt, bool) {
+	rec, ok := s.generatedFragments[generatedFragmentKey(parentJobID, generation, fragmentID)]
+	return rec, ok
 }
 
 // generatedChildCapabilities derives the capability ceiling for generated

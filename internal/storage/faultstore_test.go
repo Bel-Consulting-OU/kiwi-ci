@@ -36,6 +36,8 @@ type memSnapshot struct {
 	quotas       map[string]quotaCounts
 	cacheMans    map[string]CacheManifestRecord
 	claims       map[string]time.Time
+	outboxClaims map[string]outboxClaim
+	fragments    map[string]GeneratedFragmentReceipt
 }
 
 func (m *memStore) snapshot() memSnapshot {
@@ -69,7 +71,25 @@ func (m *memStore) snapshot() memSnapshot {
 		quotas:       quotas,
 		cacheMans:    cacheMans,
 		claims:       cloneClaims(m.claims),
+		outboxClaims: cloneOutboxClaims(m.outboxClaims),
+		fragments:    cloneFragments(m.fragments),
 	}
+}
+
+func cloneOutboxClaims(in map[string]outboxClaim) map[string]outboxClaim {
+	out := make(map[string]outboxClaim, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneFragments(in map[string]GeneratedFragmentReceipt) map[string]GeneratedFragmentReceipt {
+	out := make(map[string]GeneratedFragmentReceipt, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 func cloneClaims(in map[string]time.Time) map[string]time.Time {
@@ -460,7 +480,7 @@ func faultOps() []opCase {
 			name:  "AcquireLeaseAtomic",
 			setup: func(m *memStore) { seedRunAndJob(m); seedRunner(m) },
 			call: func(s Store) error {
-				_, err := s.(AtomicLeaseStore).AcquireLeaseAtomic(ctx(), testJob.ID, testRunner.ID, []byte("hash"), 1, time.Unix(2000, 0).UTC(), 2)
+				_, err := s.(AtomicLeaseStore).AcquireLeaseAtomic(ctx(), LeaseClaim{JobID: testJob.ID, RunnerID: testRunner.ID, TokenHash: []byte("hash"), Generation: 1, ExpiresAt: time.Unix(2000, 0).UTC(), RunnerCapacity: 2})
 				return err
 			},
 		},
@@ -474,7 +494,7 @@ func faultOps() []opCase {
 			},
 		},
 		{
-			name: "InsertGeneratedJobsTx",
+			name: "InsertGeneratedFragmentTx",
 			setup: func(m *memStore) {
 				seedRunAndJob(m)
 			},
@@ -483,12 +503,46 @@ func faultOps() []opCase {
 				child.ID = "ffffffffffffffffffffffffffffffff"
 				child.Key = "generated"
 				child.DynamicDepth = 1
-				return s.(DynamicStoreTx).InsertGeneratedJobsTx(ctx(), testJob.ID, 1, map[string]model.Job{child.ID: child}, map[string][]string{child.ID: nil}, map[string]map[string]ArtifactContract{child.ID: {"dist": {Name: "dist"}}}, func(parent model.Job, count int) error {
+				_, _, err := s.(DynamicStoreTx).InsertGeneratedFragmentTx(ctx(), GeneratedFragmentRequest{
+					ParentJobID: testJob.ID, Depth: 1, FragmentID: "frag-fault",
+					Jobs: map[string]model.Job{child.ID: child}, Deps: map[string][]string{child.ID: nil},
+					Contracts: map[string]map[string]ArtifactContract{child.ID: {"dist": {Name: "dist"}}},
+					Children:  []GeneratedFragmentChild{{Key: child.Key, ID: child.ID}},
+				}, func(parent model.Job, count int) error {
 					if count != 1 {
 						return fmt.Errorf("unexpected run job count %d", count)
 					}
 					return nil
 				})
+				return err
+			},
+		},
+		{
+			name:  "InsertArtifactOnce",
+			setup: seedRunAndJob,
+			call: func(s Store) error {
+				_, _, err := s.(ArtifactIdempotentStore).InsertArtifactOnce(ctx(), model.ArtifactRecord{ID: "dddddddddddddddddddddddddddddddd", RunID: testRun.ID, JobID: testJob.ID, Name: "bin", SHA256: "e", CreatedAt: time.Unix(1002, 0).UTC()})
+				return err
+			},
+		},
+		{
+			name: "ClaimOutbox",
+			setup: func(m *memStore) {
+				_ = m.OutboxAppend(ctx(), OutboxItem{ID: "44444444444444444444444444444444", Kind: "github_check", Payload: []byte(`{"sha":"abc"}`), CreatedAt: time.Unix(1013, 0).UTC()})
+			},
+			call: func(s Store) error {
+				_, err := s.(OutboxStore).ClaimOutbox(ctx(), "flusher-a", 4)
+				return err
+			},
+		},
+		{
+			name: "ReleaseOutboxClaim",
+			setup: func(m *memStore) {
+				_ = m.OutboxAppend(ctx(), OutboxItem{ID: "44444444444444444444444444444444", Kind: "github_check", Payload: []byte(`{"sha":"abc"}`), CreatedAt: time.Unix(1013, 0).UTC()})
+				_, _ = m.ClaimOutbox(ctx(), "flusher-a", 1)
+			},
+			call: func(s Store) error {
+				return s.(OutboxStore).ReleaseOutboxClaim(ctx(), "44444444444444444444444444444444", "flusher-a")
 			},
 		},
 		{

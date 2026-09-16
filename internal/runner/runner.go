@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	v1 "github.com/Bel-Consulting-OU/kiwi-ci/internal/api/v1"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/artifact"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executor"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/logging"
@@ -135,10 +136,37 @@ type Runner struct {
 	// capabilities discovered on this host and the profile capabilities
 	// returned by the register response — it can only shrink the profile,
 	// never enlarge it. capEnforced reports whether the server declared a
-	// profile capability ceiling (legacy servers without profiles leave
-	// both empty).
+	// profile capability claim: a response carrying the capabilities key
+	// (even an explicit empty list or null) is authoritative, so an empty
+	// intersection denies every runtime instead of meaning "no
+	// restriction". Legacy servers without profiles omit the key entirely
+	// and leave capEnforced false.
 	effectiveCapabilities []string
 	capEnforced           bool
+}
+
+// registerResponse is the register reply. Capabilities is decoded as raw
+// JSON so the runner can distinguish an ABSENT key (legacy pre-profile
+// server: no claim) from a present-but-empty list or null (an explicit
+// profile claim that grants nothing, which is an authoritative deny-all
+// ceiling rather than a missing restriction).
+type registerResponse struct {
+	model.Runner
+	Capabilities json.RawMessage `json:"capabilities"`
+}
+
+// decodeProfileCapabilities interprets the register response's capabilities
+// field. claimed is true whenever the key is present at all: an explicit
+// empty list or null yields a nil/empty list with claimed=true, which the
+// runner turns into an enforced empty intersection.
+func decodeProfileCapabilities(raw json.RawMessage) (caps []string, claimed bool, err error) {
+	if raw == nil {
+		return nil, false, nil
+	}
+	if err := json.Unmarshal(raw, &caps); err != nil {
+		return nil, true, fmt.Errorf("capabilities claim: %w", err)
+	}
+	return caps, true, nil
 }
 
 func (r *Runner) Run(ctx context.Context) error {
@@ -293,7 +321,7 @@ func (r *Runner) register(ctx context.Context) error {
 		CertSerial:   r.clientCertSerial(),
 		Draining:     r.Cfg.Drain,
 	}
-	var out model.Runner
+	var out registerResponse
 	if err := r.post(ctx, "/api/v1/runners/register", in, &out); err != nil {
 		if isHTTPStatus(err, http.StatusForbidden) || isHTTPStatus(err, http.StatusUnauthorized) {
 			// 401/403 on registration means the runner was disabled or
@@ -309,11 +337,17 @@ func (r *Runner) register(ctx context.Context) error {
 	// Capability intersection: the profile capabilities in the response
 	// are the ceiling; the runner advertises (and enforces) only the
 	// intersection with what this host actually discovered, so a job
-	// requiring a runtime the host cannot provide never starts here.
-	if len(out.Capabilities) > 0 {
-		r.capEnforced = true
+	// requiring a runtime the host cannot provide never starts here. The
+	// claim is enforced whenever the server sent the capabilities key at
+	// all — an empty claim is an authoritative empty ceiling, not an
+	// absent one, so the intersection may legitimately be empty and then
+	// denies every runtime.
+	profileCaps, claimed, err := decodeProfileCapabilities(out.Capabilities)
+	if err != nil {
+		return fmt.Errorf("register: %w", err)
 	}
-	r.effectiveCapabilities = intersectStringLists(out.Capabilities, discovered)
+	r.capEnforced = claimed
+	r.effectiveCapabilities = intersectStringLists(profileCaps, discovered)
 	fmt.Printf("kiwi runner %s registered (%s/%s) labels=%s caps=%s\n", r.ID, runtime.GOOS, runtime.GOARCH, strings.Join(out.Labels, ","), strings.Join(r.effectiveCapabilities, ","))
 	return nil
 }
@@ -566,10 +600,14 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// the workspace. The executor reads it through the job's live backend
 	// session (no-follow on native, docker exec on container, ssh on tart)
 	// with a hard 256 KiB cap and hands it to this hook for upload under the
-	// active lease. A fragment that cannot be safely read fails the job in
-	// the executor; a non-2xx upload response (the control plane may reject
-	// per policy/caps/depth) does NOT change the job outcome — the failure
-	// is reported in logs and the completion proceeds.
+	// active lease with the deterministic fragment_id derived from the
+	// parsed fragment. A fragment that cannot be safely read fails the job
+	// in the executor; a non-2xx upload response (the control plane may
+	// reject per policy/caps/depth) fails the job too, unless the compiled
+	// job declared generate.optional=true, in which case the executor keeps
+	// the error as a warning and the completion proceeds. A replayed upload
+	// (same fragment_id under the same lease generation) is answered with
+	// the originally created children.
 	opts.GenerateUpload = func(jobID, path string, data []byte) error {
 		if err := r.uploadGeneratedFragmentData(parent, t, path, data); err != nil {
 			return err
@@ -613,13 +651,18 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 // missing the assignment is a configuration error, not something the runner
 // can reconstruct at runtime.
 // checkCapability enforces the runner-side capability intersection: when
-// the register response declared a profile capability ceiling, a job whose
+// the register response declared a profile capability claim, a job whose
 // runtime capability is not in the runner's effective (discovered ∩
-// profile) set is refused before execution. Without a ceiling (legacy
-// server) every runtime is accepted.
+// profile) set is refused before execution. An enforced but EMPTY
+// intersection denies every runtime — including the default native runtime
+// (empty runtime) — because an empty claim means "run nothing", never "no
+// restriction". Without a claim (legacy server) every runtime is accepted.
 func (r *Runner) checkCapability(runtime string) error {
-	if !r.capEnforced || runtime == "" {
+	if !r.capEnforced {
 		return nil
+	}
+	if runtime == "" {
+		runtime = "native"
 	}
 	if !containsString(r.effectiveCapabilities, runtime) {
 		return fmt.Errorf("runtime %q is outside this runner's profile capability intersection", runtime)
@@ -1071,21 +1114,21 @@ func snapshotRequested(s pipeline.SnapshotSpec, st model.Status) bool {
 }
 
 // generatedFragment is the POST /api/v1/jobs/{id}/generated body: the child
-// graph a generator produced. jobs maps the child key to its pipeline job
-// spec; deps carries fragment-internal dependency edges (the generating job
-// is the implicit dependency of every child on the control plane).
-type generatedFragment struct {
-	Jobs map[string]pipeline.Job `json:"jobs"`
-	Deps map[string][]string     `json:"deps"`
-}
+// graph a generator produced, shared with the control plane so the
+// deterministic fragment id is derived from the identical parsed shape on
+// both sides.
+type generatedFragment = v1.GeneratedFragment
 
 // uploadGeneratedFragmentData parses the generator's fragment (already read
 // through the job's live backend session by the executor, bounded and
 // no-follow) and POSTs it to /api/v1/jobs/{id}/generated under the active
-// lease. A non-2xx response is returned as an error: the caller reports it
-// as a non-fatal failure and the job completion proceeds — the server may
-// reject the fragment per policy, in which case the run's children never
-// exist.
+// lease. The body carries the deterministic fragment_id derived from the
+// parsed {jobs, deps} pair: the control plane recomputes it and rejects a
+// mismatch (400), and a replayed upload with the same (job, lease
+// generation, fragment_id) is answered idempotently with the originally
+// created child IDs, so a lost response never duplicates children. A non-2xx
+// response is returned as an error; the executor fails the job unless the
+// job declared generate.optional=true.
 func (r *Runner) uploadGeneratedFragmentData(ctx context.Context, t server.Task, path string, data []byte) error {
 	clean := filepath.Clean(path)
 	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) || filepath.IsAbs(clean) {
@@ -1095,6 +1138,11 @@ func (r *Runner) uploadGeneratedFragmentData(ctx context.Context, t server.Task,
 	if err := json.Unmarshal(data, &frag); err != nil {
 		return fmt.Errorf("parse generated fragment %q: %w", path, err)
 	}
+	fid, err := frag.Digest()
+	if err != nil {
+		return fmt.Errorf("fragment id for %q: %w", path, err)
+	}
+	frag.FragmentID = fid
 	body, err := json.Marshal(frag)
 	if err != nil {
 		return fmt.Errorf("encode generated fragment: %w", err)

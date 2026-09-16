@@ -24,6 +24,9 @@ type fakeStore struct {
 	artifacts []model.ArtifactRecord
 	reports   []model.TestReport
 
+	profiles     map[string]model.RunnerProfile
+	certProfiles map[string]string
+
 	leaderOK    bool
 	leaderErr   error
 	releaseKeys []string
@@ -76,14 +79,62 @@ type releaseRunnerCall struct {
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		runs:     map[string]model.Run{},
-		jobs:     map[string]model.Job{},
-		runners:  map[string]model.Runner{},
-		receipts: map[string]model.CompletionReceipt{},
+		runs:         map[string]model.Run{},
+		jobs:         map[string]model.Job{},
+		runners:      map[string]model.Runner{},
+		receipts:     map[string]model.CompletionReceipt{},
+		profiles:     map[string]model.RunnerProfile{},
+		certProfiles: map[string]string{},
 	}
 }
 
 var _ storage.Store = (*fakeStore)(nil)
+var _ storage.ProfileStore = (*fakeStore)(nil)
+
+func (f *fakeStore) UpsertProfile(ctx context.Context, p model.RunnerProfile) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.profiles[p.ID] = p
+	return nil
+}
+
+func (f *fakeStore) GetProfile(ctx context.Context, id string) (model.RunnerProfile, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p, ok := f.profiles[id]
+	if !ok {
+		return model.RunnerProfile{}, storage.ErrNotFound
+	}
+	return p, nil
+}
+
+func (f *fakeStore) ListProfiles(ctx context.Context) ([]model.RunnerProfile, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]model.RunnerProfile, 0, len(f.profiles))
+	for _, p := range f.profiles {
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+func (f *fakeStore) BindCertProfile(ctx context.Context, serial, profileID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.certProfiles[serial] = profileID
+	return nil
+}
+
+func (f *fakeStore) ProfileForSerial(ctx context.Context, serial string) (model.RunnerProfile, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	id, ok := f.certProfiles[serial]
+	if !ok {
+		return model.RunnerProfile{}, false, nil
+	}
+	p, ok := f.profiles[id]
+	return p, ok, nil
+}
 
 func (f *fakeStore) Close() error { return nil }
 
@@ -206,8 +257,12 @@ func (f *fakeStore) AcquireLease(ctx context.Context, jobID, runnerID string, to
 	if j.Status != model.StatusQueued {
 		return model.Job{}, storage.ErrLeaseConflict
 	}
+	now := time.Now().UTC()
 	j.Status = model.StatusRunning
 	j.Attempts++
+	if j.StartedAt == nil {
+		j.StartedAt = &now
+	}
 	j.LeaseRunnerID = runnerID
 	j.LeaseTokenHash = tokenHash
 	j.LeaseGeneration = generation

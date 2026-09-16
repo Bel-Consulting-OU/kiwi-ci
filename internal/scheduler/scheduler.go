@@ -19,10 +19,10 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
@@ -73,12 +73,38 @@ type DBScheduler struct {
 	// LeaderTTL is the soft renewal window for the leadership claim.
 	LeaderTTL time.Duration
 
+	// Quota limits (0 = unlimited) are enforced INSIDE the atomic lease's
+	// queued->running transition, so a lease can never push the running
+	// count past the configured concurrency. The server installs them
+	// through SetQuotaLimits after wiring the store (config is applied
+	// after SwitchToDB) and re-applies them on every lease.
+	quotaMu         sync.Mutex
+	repoConcurrency float64
+	teamConcurrency float64
+
 	// leader is true while this instance holds the leadership claim.
 	// Access is atomic: Lease and IsLeader can run concurrently from
 	// runner poll goroutines.
 	leader atomic.Bool
 	// initErr records a leadership acquisition failure at construction.
 	initErr error
+}
+
+// SetQuotaLimits installs the repo/team concurrency limits enforced by the
+// atomic lease's conditional queued->running transition (0 = unlimited).
+// Safe for concurrent use with Lease.
+func (s *DBScheduler) SetQuotaLimits(repo, team float64) {
+	s.quotaMu.Lock()
+	s.repoConcurrency = repo
+	s.teamConcurrency = team
+	s.quotaMu.Unlock()
+}
+
+// quotaLimits returns the current repo/team concurrency limits.
+func (s *DBScheduler) quotaLimits() (repo, team float64) {
+	s.quotaMu.Lock()
+	defer s.quotaMu.Unlock()
+	return s.repoConcurrency, s.teamConcurrency
 }
 
 // NewDB constructs a DBScheduler backed by store and attempts to acquire the
@@ -181,10 +207,16 @@ func (s *DBScheduler) Enqueue(ctx context.Context, run model.Run, jobs map[strin
 }
 
 // Lease claims the best available queued job for runnerID. It is leader-only.
-// Candidate selection mirrors the in-memory next(): dependency readiness and
-// conditions via DependencyOutcome/ConditionAllows, label matching,
-// environment concurrency, then priority (downstream depth) and age. The raw
-// lease token is returned exactly once; only its hash is persisted.
+// Candidate selection uses the ONE shared lease predicate
+// (storage.LeasePredicate): admission state, labels, canonical repository
+// ACL, runtime capability, the enforced-policy runtime grant, placement
+// regions and environment concurrency. Dependency readiness and queue
+// deadlines are evaluated on top, then priority (downstream depth) and age.
+// The raw lease token is returned exactly once; only its hash is persisted.
+//
+// Every scheduling attribute is resolved LIVE: when the runner has a linked
+// profile the profile's current labels/region/repo ACL/capabilities/capacity/
+// rates are used, not the registration snapshot.
 func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time) (*model.Job, string, time.Time, error) {
 	if !s.IsLeader(ctx) {
 		return nil, "", time.Time{}, ErrNotLeader
@@ -196,10 +228,11 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 	// Profile semantics: capacity 0 means the runner takes no work (a
 	// runner without a linked profile registers capacity 0). The legacy
 	// clamp to 1 is gone — zero is meaningful now.
-	if ri.Capacity <= 0 {
+	eff := s.effectiveRunner(ctx, ri)
+	if eff.Capacity <= 0 {
 		return nil, "", time.Time{}, ErrNoJobs
 	}
-	if len(ri.ActiveJobs) >= ri.Capacity {
+	if len(eff.ActiveJobs) >= eff.Capacity {
 		return nil, "", time.Time{}, ErrNoJobs
 	}
 	queued, err := s.Store.ListQueuedJobs(ctx)
@@ -212,38 +245,47 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 		}
 		return queued[i].CreatedAt.Before(queued[j].CreatedAt)
 	})
+	repoConcurrency, teamConcurrency := s.quotaLimits()
 	runJobs := map[string]map[string]model.Job{}
 	envJobs := map[string][]model.Job{}
 	for _, candidate := range queued {
-		if !satisfiesLabels(ri.Labels, candidate.RequiredLabels) {
-			continue
-		}
-		// Canonical repository authorization is part of the atomic claim
-		// predicate: a runner whose profile restricts repositories never
-		// sees candidates outside its canonical repo allowlist.
-		if !s.runnerAllowedRepo(ri, candidate) {
-			continue
-		}
-		// Capability compatibility is part of the claim predicate too: a
-		// job whose runtime demands a capability the runner does not
-		// declare is never leased to it. Empty declared capabilities keep
-		// the check vacuous (discovered-only intersection).
-		if !s.runnerHasCapability(ri, candidate) {
-			continue
-		}
 		// Queue-timeout expiry: a candidate whose queue deadline has passed
 		// is never leased; RecoverExpired cancels it. Both the atomic-lease
 		// and the plain-lease branches below share this gate.
 		if dl := queueDeadlineFor(candidate); dl != nil && !dl.After(now) {
 			continue
 		}
-		// Placement regions: a region-constrained job only leases to a
-		// runner whose region is in the set. A runner without a region can
-		// never satisfy the constraint (empty region fails matching).
-		if len(candidate.PlacementRegions) > 0 && ri.Region == "" {
-			continue
+		// The shared predicate is the same decision the SQL claim and the
+		// in-memory stores apply: admission state (disabled/draining,
+		// capacity), labels, canonical repo ACL, runtime capability,
+		// enforced-policy runtime grant, placement regions and environment
+		// concurrency.
+		envRunning := 0
+		if candidate.Environment != "" && candidate.EnvironmentConcurrency > 0 {
+			key := candidate.RepoURL + "\x00" + candidate.Environment
+			active, ok := envJobs[key]
+			if !ok {
+				all, err := s.Store.ListJobsByEnvironment(ctx, candidate.RepoURL, candidate.Environment)
+				if err != nil {
+					return nil, "", time.Time{}, err
+				}
+				envJobs[key] = all
+				active = all
+			}
+			for _, other := range active {
+				if other.ID != candidate.ID && other.Status == model.StatusRunning {
+					envRunning++
+				}
+			}
 		}
-		if len(candidate.PlacementRegions) > 0 && !containsStr(candidate.PlacementRegions, ri.Region) {
+		policyRuntimes, policyEnforced := storage.LeasePolicyRuntimes(candidate)
+		if !(storage.LeasePredicate{
+			Runner:         eff,
+			Job:            candidate,
+			EnvRunning:     envRunning,
+			PolicyEnforced: policyEnforced,
+			PolicyRuntimes: policyRuntimes,
+		}).Allows() {
 			continue
 		}
 		jobs, ok := runJobs[candidate.RunID]
@@ -258,25 +300,6 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 			}
 			runJobs[candidate.RunID] = jobs
 		}
-		if candidate.Environment != "" && candidate.EnvironmentConcurrency > 0 {
-			key := candidate.RepoURL + "\x00" + candidate.Environment
-			active, ok := envJobs[key]
-			if !ok {
-				all, err := s.Store.ListJobsByEnvironment(ctx, candidate.RepoURL, candidate.Environment)
-				if err != nil {
-					return nil, "", time.Time{}, err
-				}
-				envJobs[key] = all
-				active = all
-			}
-			byID := make(map[string]model.Job, len(active))
-			for _, j := range active {
-				byID[j.ID] = j
-			}
-			if EnvironmentAtCapacity(candidate, byID) {
-				continue
-			}
-		}
 		ready, outcome := DependencyOutcome(candidate.Needs, nil, func(id string) (model.Status, bool) {
 			d, ok := jobs[id]
 			return d.Status, ok
@@ -290,25 +313,48 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 		}
 		expires := LeaseExpiry(now, s.LeaseDuration)
 		generation := candidate.LeaseGeneration + 1
-		// Capacity-atomic lease: when the store supports it, the job claim
-		// and the runner's active-jobs append happen in ONE transaction, so
-		// two concurrent leases can never exceed the runner's capacity. The
-		// separate UpsertRunner afterwards is skipped because the store
+		claim := storage.LeaseClaim{
+			JobID:                  candidate.ID,
+			RunnerID:               runnerID,
+			TokenHash:              s.HashToken(raw),
+			Generation:             generation,
+			ExpiresAt:              expires,
+			RunnerCapacity:         eff.Capacity,
+			Runtime:                storage.JobRuntime(candidate),
+			CanonRepoID:            storage.CanonicalRepoID(storage.RepoHost(candidate.RepoURL), candidate.RepoFullName),
+			RepoFullName:           candidate.RepoFullName,
+			RequiredLabels:         candidate.RequiredLabels,
+			PlacementRegions:       candidate.PlacementRegions,
+			Environment:            candidate.Environment,
+			EnvironmentConcurrency: candidate.EnvironmentConcurrency,
+			RepoURL:                candidate.RepoURL,
+			RepoConcurrency:        repoConcurrency,
+			TeamConcurrency:        teamConcurrency,
+		}
+		// Capacity-atomic lease: the job claim, every predicate above and
+		// the runner's active-jobs append happen in ONE transaction, so two
+		// concurrent leases can never exceed the runner's capacity, bypass
+		// a concurrent disable/drain or overrun environment/quota limits.
+		// The separate UpsertRunner afterwards is skipped because the store
 		// already updated the runner row.
 		if as, ok := s.Store.(storage.AtomicLeaseStore); ok {
-			j, err := as.AcquireLeaseAtomic(ctx, candidate.ID, runnerID, s.HashToken(raw), generation, expires, ri.Capacity)
-			if errors.Is(err, storage.ErrLeaseConflict) {
+			j, err := as.AcquireLeaseAtomic(ctx, claim)
+			switch {
+			case err == nil:
+				j.NeedsOutputs = CollectNeedsOutputs(candidate, jobs)
+				return &j, raw, expires, nil
+			case errors.Is(err, storage.ErrLeaseConflict):
 				continue
-			}
-			if errors.Is(err, storage.ErrNoCapacity) {
-				// The runner filled up between the read and the claim.
-				return nil, "", time.Time{}, ErrNoJobs
-			}
-			if err != nil {
+			case errors.Is(err, storage.ErrNoCapacity),
+				errors.Is(err, storage.ErrEnvConcurrency),
+				errors.Is(err, storage.ErrQuotaExceeded):
+				// A predicate lost a race (filled capacity slot, taken
+				// environment slot, exhausted quota) or this candidate is
+				// not eligible for this runner: try the next candidate.
+				continue
+			default:
 				return nil, "", time.Time{}, err
 			}
-			j.NeedsOutputs = CollectNeedsOutputs(candidate, jobs)
-			return &j, raw, expires, nil
 		}
 		j, err := s.Store.AcquireLease(ctx, candidate.ID, runnerID, s.HashToken(raw), generation, expires)
 		if errors.Is(err, storage.ErrLeaseConflict) {
@@ -318,7 +364,19 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 		if err != nil {
 			return nil, "", time.Time{}, err
 		}
+		// The plain-lease fallback persists no rates (its signature has no
+		// rate source): freeze the live rates on the returned job and
+		// persist them so completion accounting stays identical to the
+		// atomic path.
+		j.CostRate = eff.CostPerHour
+		j.PowerWatts = eff.PowerWatts
+		if j.StartedAt == nil {
+			j.StartedAt = &now
+		}
 		j.NeedsOutputs = CollectNeedsOutputs(candidate, jobs)
+		if err := s.Store.UpdateJob(ctx, j); err != nil {
+			log.Printf("scheduler: persist frozen rates for %s: %v", j.ID, err)
+		}
 		ri.ActiveJobs = appendUnique(ri.ActiveJobs, j.ID)
 		ri.Busy = len(ri.ActiveJobs) >= ri.Capacity
 		ri.CurrentJob = ""
@@ -334,6 +392,25 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 		return &j, raw, expires, nil
 	}
 	return nil, "", time.Time{}, ErrNoJobs
+}
+
+// effectiveRunner resolves the runner's LIVE scheduling view at lease time:
+// when a profile is linked to the runner's certificate serial, the profile's
+// current labels/region/repo ACL/capabilities/capacity/rates replace the
+// registration snapshot, so a profile edit takes effect on the next lease.
+// Stores without a profile contract (or an unlinked runner) return the
+// snapshot unchanged; the atomic claim independently fails closed on a
+// linked-but-missing profile.
+func (s *DBScheduler) effectiveRunner(ctx context.Context, ri model.Runner) model.Runner {
+	ps, ok := s.Store.(storage.ProfileStore)
+	if !ok || strings.TrimSpace(ri.CertSerial) == "" {
+		return ri
+	}
+	p, found, err := ps.ProfileForSerial(ctx, ri.CertSerial)
+	if err != nil || !found {
+		return ri
+	}
+	return storage.ResolveRunnerProfile(ri, p, true)
 }
 
 // Heartbeat extends the job's lease and reports whether the job was
@@ -652,123 +729,15 @@ func (s *DBScheduler) appendAudit(ctx context.Context, action, actor, runID, job
 	}
 }
 
-// satisfiesLabels reports whether every required label is present.
-func satisfiesLabels(have, need []string) bool {
-	m := map[string]bool{}
-	for _, x := range have {
-		m[x] = true
-	}
-	for _, x := range need {
-		if !m[x] {
-			return false
-		}
-	}
-	return true
-}
-
-// runnerAllowedRepo reports whether a candidate job is inside the runner's
-// repository scope. A runner with an empty AllowedRepositories has no
-// restriction; otherwise the job's canonical repo ID ("<forgeHost>/<full
-// name>") — and its bare full name, for profiles that store either form —
-// must appear in the list.
-func (s *DBScheduler) runnerAllowedRepo(ri model.Runner, candidate model.Job) bool {
-	if len(ri.AllowedRepositories) == 0 {
-		return true
-	}
-	canon := auth.CanonicalRepoID(repoHostFromURL(candidate.RepoURL), candidate.RepoFullName)
-	for _, allowed := range ri.AllowedRepositories {
-		if allowed == canon || (candidate.RepoFullName != "" && allowed == candidate.RepoFullName) {
-			return true
-		}
-	}
-	return false
-}
-
-// runnerHasCapability reports whether the candidate's runtime capability is
-// declared by the runner. Empty declared capabilities make the check
-// vacuous (the profile has no capability list; the runner's discovered
-// capabilities are its own intersection). A job whose runtime cannot be
-// derived (no compiled payload, or an empty/unknown runtime) is not
-// constrained by this predicate.
-func (s *DBScheduler) runnerHasCapability(ri model.Runner, candidate model.Job) bool {
-	if len(ri.Capabilities) == 0 {
-		return true
-	}
-	runtime := jobRuntimeCapability(candidate)
-	if runtime == "" {
-		return true
-	}
-	return containsStr(ri.Capabilities, runtime)
-}
-
 // jobRuntimeCapability extracts the job's runtime capability
-// (container/tart/native) from the persisted compiled payload, mirroring
-// queueTimeoutFromPayload's payload-based derivation. Jobs without a
-// compiled payload (or with an unknown runtime) yield "".
+// (container/tart/native) from the persisted compiled payload.
 func jobRuntimeCapability(j model.Job) string {
-	if j.CompiledJobPayload == nil || j.CompiledJobPayload.EffectiveJob == nil {
-		return ""
-	}
-	var b []byte
-	switch v := j.CompiledJobPayload.EffectiveJob.(type) {
-	case json.RawMessage:
-		b = v
-	case []byte:
-		b = v
-	case string:
-		b = []byte(v)
-	default:
-		var err error
-		if b, err = json.Marshal(v); err != nil {
-			return ""
-		}
-	}
-	var cj pipeline.CompiledJob
-	if err := json.Unmarshal(b, &cj); err != nil {
-		return ""
-	}
-	switch cj.Job.Runtime {
-	case "container", "tart", "native":
-		return cj.Job.Runtime
-	default:
-		return ""
-	}
+	return storage.JobRuntime(j)
 }
 
-// repoHostFromURL extracts the forge host from a repo URL in the common
-// forms (https://host/owner/repo, ssh://git@host/owner/repo and the
-// scp-like git@host:owner/repo), mirroring the server's host derivation so
-// canonical repo IDs agree across packages.
+// repoHostFromURL extracts the forge host from a repo URL.
 func repoHostFromURL(repoURL string) string {
-	u := strings.TrimSpace(repoURL)
-	if i := strings.Index(u, "://"); i >= 0 {
-		u = u[i+3:]
-	}
-	if at := strings.Index(u, "@"); at >= 0 {
-		u = u[at+1:]
-	}
-	slash := strings.Index(u, "/")
-	colon := strings.Index(u, ":")
-	switch {
-	case slash < 0 && colon < 0:
-		return u
-	case slash < 0:
-		return u[:colon]
-	case colon >= 0 && colon < slash:
-		return u[:colon]
-	default:
-		return u[:slash]
-	}
-}
-
-// containsStr reports whether list contains v.
-func containsStr(list []string, v string) bool {
-	for _, x := range list {
-		if x == v {
-			return true
-		}
-	}
-	return false
+	return storage.RepoHost(repoURL)
 }
 
 func appendUnique(in []string, v string) []string {

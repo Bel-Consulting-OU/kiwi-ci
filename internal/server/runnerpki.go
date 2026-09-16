@@ -156,77 +156,127 @@ func (s *Server) peerRunnerID(r *http.Request) (string, error) {
 	return s.RunnerCA.VerifyPeer(r.TLS.PeerCertificates[0], roots)
 }
 
-// bindRunnerIdentity binds a runner request to its authenticated identity:
-// the per-runner bearer token's bound runner ID and/or the TLS peer
-// certificate identity. When both mechanisms carry an identity they must
-// agree; a claimed id must equal the authenticated one (an empty id skips
-// the comparison, letting register() adopt the identity). With neither
-// mechanism configured the legacy shared bearer token is the identity and
-// no additional binding check applies.
-func (s *Server) bindRunnerIdentity(r *http.Request, id string) error {
+// resolveRunnerIdentity is the SINGLE transport identity resolution shared
+// by bindRunnerIdentity (mutation-time binding) and verifyRunnerIdentity
+// (per-request verification), so both enforce IDENTICAL semantics:
+//
+//   - RequireRunnerClientCerts with a runner CA makes the TLS peer
+//     certificate mandatory and authoritative on every runner route: a
+//     request without a valid peer certificate is rejected, and a presented
+//     per-runner bearer token must agree with it;
+//   - without the requirement, a per-runner bearer token is acceptable on
+//     EVERY runner route even when a runner CA exists (no peer-cert
+//     requirement); a peer certificate that is presented must agree with
+//     the bearer identity;
+//   - with a CA and neither a bearer nor a peer certificate the request is
+//     rejected: one of the two mechanisms must carry the identity;
+//   - with neither mechanism configured the legacy shared bearer token is
+//     the identity and no binding check applies.
+//
+// Revoked peer certificates (CRL, see crl.go) are rejected by
+// verifyRunnerIdentity (the per-route gate): revocation is a control-plane
+// decision, distinct from the identity binding. resolved is the
+// authenticated runner ID; constrained reports whether an identity
+// comparison actually took place.
+func (s *Server) resolveRunnerIdentity(r *http.Request, claimedID string) (resolved string, constrained bool, err error) {
 	bearerID, hasBearer := s.runnerBearerID(r)
 	if s.RunnerCA != nil && s.RequireRunnerClientCerts {
 		peerID, err := s.peerRunnerID(r)
 		if err != nil {
-			return err
-		}
-		if id != "" && id != peerID {
-			return fmt.Errorf("certificate identity %q does not match runner id %q", peerID, id)
+			return "", true, err
 		}
 		if hasBearer && bearerID != peerID {
-			return fmt.Errorf("bearer identity %q does not match certificate identity %q", bearerID, peerID)
+			return "", true, fmt.Errorf("bearer identity %q does not match certificate identity %q", bearerID, peerID)
 		}
-		return nil
+		if claimedID != "" && claimedID != peerID {
+			return "", true, fmt.Errorf("certificate identity %q does not match runner id %q", peerID, claimedID)
+		}
+		return peerID, true, nil
+	}
+	if s.RunnerCA != nil {
+		peerID, peerErr := s.peerRunnerID(r)
+		havePeer := peerErr == nil
+		switch {
+		case hasBearer && havePeer:
+			if bearerID != peerID {
+				return "", true, fmt.Errorf("bearer identity %q does not match certificate identity %q", bearerID, peerID)
+			}
+			if claimedID != "" && claimedID != bearerID {
+				return "", true, fmt.Errorf("bearer identity %q does not match runner id %q", bearerID, claimedID)
+			}
+			return bearerID, true, nil
+		case hasBearer:
+			if claimedID != "" && claimedID != bearerID {
+				return "", true, fmt.Errorf("bearer identity %q does not match runner id %q", bearerID, claimedID)
+			}
+			return bearerID, true, nil
+		case havePeer:
+			if claimedID != "" && claimedID != peerID {
+				return "", true, fmt.Errorf("certificate identity %q does not match runner id %q", peerID, claimedID)
+			}
+			return peerID, true, nil
+		default:
+			return "", true, fmt.Errorf("runner certificate or per-runner bearer token required")
+		}
 	}
 	if hasBearer {
-		if id != "" && id != bearerID {
-			return fmt.Errorf("bearer identity %q does not match runner id %q", bearerID, id)
+		if claimedID != "" && claimedID != bearerID {
+			return "", true, fmt.Errorf("bearer identity %q does not match runner id %q", bearerID, claimedID)
 		}
+		return bearerID, true, nil
+	}
+	return "", false, nil
+}
+
+// checkPeerCertRevoked rejects a request whose presented TLS peer
+// certificate is on the revocation list. No peer certificate (or no CA) is
+// not an error here: the requirement decision belongs to
+// resolveRunnerIdentity.
+func (s *Server) checkPeerCertRevoked(r *http.Request) error {
+	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 || r.TLS.PeerCertificates[0] == nil {
 		return nil
 	}
-	if s.RunnerCA == nil {
-		return nil
-	}
-	peerID, err := s.peerRunnerID(r)
-	if err != nil {
-		return err
-	}
-	if id != "" && id != peerID {
-		return fmt.Errorf("certificate identity %q does not match runner id %q", peerID, id)
+	serial := r.TLS.PeerCertificates[0].SerialNumber.Text(16)
+	if s.certSerialRevoked(serial) {
+		return fmt.Errorf("runner certificate %s is revoked", serial)
 	}
 	return nil
 }
 
+// bindRunnerIdentity binds a runner request to its authenticated identity
+// (the shared resolveRunnerIdentity semantics): the per-runner bearer
+// token's bound runner ID and/or the TLS peer certificate identity. When
+// both mechanisms carry an identity they must agree; a claimed id must
+// equal the authenticated one (an empty id skips the comparison, letting
+// register() adopt the identity). With neither mechanism configured the
+// legacy shared bearer token is the identity and no additional binding
+// check applies.
+func (s *Server) bindRunnerIdentity(r *http.Request, id string) error {
+	_, _, err := s.resolveRunnerIdentity(r, id)
+	return err
+}
+
 // verifyRunnerIdentity reports whether the request's authenticated identity
-// matches the runner ID it acts for. Lease tokens remain the capability;
-// this pins the transport identity (per-runner bearer token and/or TLS
-// peer certificate) to the claimed runner. With neither configured (legacy
-// shared bearer mode) this accepts. Revoked certificates (CRL, see crl.go)
-// are rejected after the identity check: revocation is a control-plane
-// decision that must not be bypassed by reusing a still-valid certificate.
+// matches the runner ID it acts for, using the SAME semantics as
+// bindRunnerIdentity (see resolveRunnerIdentity). Lease tokens remain the
+// capability; this pins the transport identity (per-runner bearer token
+// and/or TLS peer certificate) to the claimed runner. With neither
+// configured (legacy shared bearer mode) this accepts. Revoked certificates
+// (CRL, see crl.go) are rejected after the identity check: revocation is a
+// control-plane decision that must not be bypassed by reusing a still-valid
+// certificate.
 func (s *Server) verifyRunnerIdentity(r *http.Request, payloadRunnerID string) bool {
-	bearerID, hasBearer := s.runnerBearerID(r)
-	if s.RunnerCA != nil {
-		peerID, err := s.peerRunnerID(r)
-		if err != nil {
-			return false
-		}
-		if peerID != payloadRunnerID {
-			return false
-		}
-		if hasBearer && bearerID != payloadRunnerID {
-			return false
-		}
-		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 && r.TLS.PeerCertificates[0] != nil {
-			serial := r.TLS.PeerCertificates[0].SerialNumber.Text(16)
-			if s.certSerialRevoked(serial) {
-				return false
-			}
-		}
-		return true
+	resolved, constrained, err := s.resolveRunnerIdentity(r, payloadRunnerID)
+	if err != nil {
+		return false
 	}
-	if hasBearer {
-		return bearerID == payloadRunnerID
+	if constrained && resolved != payloadRunnerID {
+		return false
+	}
+	if s.RunnerCA != nil {
+		if err := s.checkPeerCertRevoked(r); err != nil {
+			return false
+		}
 	}
 	return true
 }

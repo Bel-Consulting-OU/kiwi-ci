@@ -50,6 +50,23 @@ func (t *TokenStore) Authenticate(raw string) (Principal, bool) {
 	return p, ok
 }
 
+// PrincipalBySubject resolves the first principal whose Subject matches.
+// Used by revocable delegations (trusted schedules) that must re-check the
+// creator's CURRENT grants at execution time.
+func (t *TokenStore) PrincipalBySubject(subject string) (Principal, bool) {
+	if subject == "" {
+		return Principal{}, false
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	for _, p := range t.tokens {
+		if p.Subject == subject {
+			return p, true
+		}
+	}
+	return Principal{}, false
+}
+
 // Empty reports whether no tokens are configured.
 func (t *TokenStore) Empty() bool {
 	t.mu.RLock()

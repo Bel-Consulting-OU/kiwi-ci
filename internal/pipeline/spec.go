@@ -308,6 +308,12 @@ type GenerateSpec struct {
 	Path     string `yaml:"path,omitempty" json:"path,omitempty"`
 	MaxJobs  int    `yaml:"max_jobs,omitempty" json:"max_jobs,omitempty"`
 	MaxDepth int    `yaml:"max_depth,omitempty" json:"max_depth,omitempty"`
+	// Optional downgrades a rejected fragment upload (validation failure,
+	// policy rejection, non-2xx response, network failure) to a warning: the
+	// generating job still succeeds. When false (default) the rejected
+	// fragment fails the job so a run can never silently lose its generated
+	// children.
+	Optional bool `yaml:"optional,omitempty" json:"optional,omitempty"`
 }
 
 // DownstreamSpec triggers a pipeline in another repository.
