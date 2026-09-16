@@ -178,21 +178,60 @@ func TestValidateResourcesRanges(t *testing.T) {
 	if err := Validate(mk(Resources{PIDs: 1}, "tart")); err == nil || !strings.Contains(err.Error(), "tart backend does not honor pid limits") {
 		t.Errorf("tart pids error = %v, want tart pid rejection", err)
 	}
+	if err := Validate(mk(Resources{Disk: 1}, "tart")); err == nil || !strings.Contains(err.Error(), "tart backend does not honor disk limits") {
+		t.Errorf("tart disk error = %v, want tart disk rejection", err)
+	}
+	// Container disk is advisory but accepted (documented, not enforced).
+	if err := Validate(mk(Resources{Disk: 1}, "container")); err != nil {
+		t.Errorf("container advisory disk rejected: %v", err)
+	}
+	// The native backend cannot honor any resource request.
+	for _, r := range []Resources{
+		{CPU: 1},
+		{Memory: 1},
+		{Disk: 1},
+		{PIDs: 1},
+		{CPU: 1, Memory: 1, Disk: 1, PIDs: 1},
+	} {
+		if err := Validate(mk(r, "")); err == nil || !strings.Contains(err.Error(), "native backend does not enforce resource requests") {
+			t.Errorf("native resources %+v error = %v, want native resource rejection", r, err)
+		}
+	}
+	// A native job with no resource requests stays valid.
+	if err := Validate(mk(Resources{}, "")); err != nil {
+		t.Errorf("native job without resources rejected: %v", err)
+	}
 	// The compiled validator enforces the same admission.
 	cj := CompiledJob{ID: "x", BaseID: "x", Job: Job{Runtime: "tart", VM: "vm", Resources: Resources{PIDs: 2}, Steps: []Step{{Run: "true"}}}}
 	if err := ValidateCompiledJob(cj); err == nil || !strings.Contains(err.Error(), "tart backend does not honor pid limits") {
 		t.Errorf("compiled tart pids error = %v", err)
 	}
+	cj = CompiledJob{ID: "x", BaseID: "x", Job: Job{Runtime: "tart", VM: "vm", Resources: Resources{Disk: 2}, Steps: []Step{{Run: "true"}}}}
+	if err := ValidateCompiledJob(cj); err == nil || !strings.Contains(err.Error(), "tart backend does not honor disk limits") {
+		t.Errorf("compiled tart disk error = %v", err)
+	}
+	cj = CompiledJob{ID: "x", BaseID: "x", Job: Job{Resources: Resources{CPU: 1}, Steps: []Step{{Run: "true"}}}}
+	if err := ValidateCompiledJob(cj); err == nil || !strings.Contains(err.Error(), "native backend does not enforce resource requests") {
+		t.Errorf("compiled native resources error = %v", err)
+	}
 }
 
 func TestResourceCapabilitiesMap(t *testing.T) {
 	cpu, mem, disk, pids := ResourceCapabilities("container")
-	if !cpu || !mem || !disk || !pids {
-		t.Error("container must honor all resource limits")
+	if !cpu || !mem || disk || !pids {
+		t.Error("container must honor cpu/memory/pids and treat disk as advisory")
 	}
 	cpu, mem, disk, pids = ResourceCapabilities("tart")
-	if !cpu || !mem || !disk || pids {
-		t.Error("tart must honor cpu/memory/disk but not pids")
+	if !cpu || !mem || disk || pids {
+		t.Error("tart must honor cpu/memory only")
+	}
+	cpu, mem, disk, pids = ResourceCapabilities("")
+	if cpu || mem || disk || pids {
+		t.Error("native runtime must report no enforceable resource limits")
+	}
+	cpu, mem, disk, pids = ResourceCapabilities("bogus")
+	if cpu || mem || disk || pids {
+		t.Error("unknown runtime must report no enforceable resource limits")
 	}
 }
 

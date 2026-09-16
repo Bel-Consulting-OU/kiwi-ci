@@ -38,6 +38,15 @@ var (
 	// letter or underscore followed by up to 63 letters, digits,
 	// underscores or hyphens.
 	inputNameRegexp = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]{0,63}$`)
+	// secretNameRegexp pins the secret identifier grammar to the env-safe
+	// canonical form: a leading ASCII letter or underscore followed by up
+	// to 63 letters, digits or underscores — no hyphens, dots or other
+	// punctuation. The executor projects secret names into
+	// KIWI_SECRET_<NAME> environment variables by replacing punctuation
+	// with "_", so names like foo-bar and foo.bar would collide with
+	// foo_bar after projection. Rejecting punctuation at admission makes
+	// collisions impossible for accepted names.
+	secretNameRegexp = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
 
 	shellNames = map[string]bool{
 		"": true, "bash": true, "sh": true, "zsh": true, "pwsh": true,
@@ -100,6 +109,9 @@ func validateSpec(s *Spec, relaxComponentJobs bool) error {
 	for _, name := range s.Secrets {
 		if strings.TrimSpace(name) == "" {
 			return fmt.Errorf("secret name cannot be empty")
+		}
+		if !secretNameRegexp.MatchString(name) {
+			return fmt.Errorf("secret name %q is invalid (must match %s)", name, secretNameRegexp.String())
 		}
 	}
 	if err := validateInputs(s); err != nil {
@@ -193,26 +205,42 @@ func ValidateLimits(s *Spec) error {
 		if combos == 0 {
 			combos = 1
 		}
-		shardCount := 1
 		if j.Tests.Shards > maxShardsPerJob {
 			return fmt.Errorf("job %q tests.shards %d exceeds the limit of %d", id, j.Tests.Shards, maxShardsPerJob)
 		}
+		shardCount := 1
 		if j.Tests.Shards > 0 {
 			shardCount = j.Tests.Shards
 		}
-		totalExpanded += combos * shardCount
-	}
-	if totalExpanded > maxExpandedJobs {
-		return fmt.Errorf("pipeline expands to %d jobs, limit is %d", totalExpanded, maxExpandedJobs)
+		expanded := saturatingMul(combos, shardCount, maxExpandedJobs)
+		if totalExpanded > maxExpandedJobs-expanded {
+			return fmt.Errorf("pipeline expands to %d jobs, limit is %d", maxExpandedJobs+1, maxExpandedJobs)
+		}
+		totalExpanded += expanded
 	}
 	return nil
+}
+
+// saturatingMul multiplies n by factor without ever computing an unchecked
+// product: when n already exceeds limit or n*factor would exceed it, the
+// result saturates at limit+1 instead of wrapping, so callers can compare
+// against limit and never observe an overflowed value. A non-positive
+// operand yields 0 (the empty-product identity for the count callers).
+func saturatingMul(n, factor, limit int) int {
+	if n <= 0 || factor <= 0 {
+		return 0
+	}
+	if n > limit/factor {
+		return limit + 1
+	}
+	return n * factor
 }
 
 func matrixComboCount(m map[string][]any) int {
 	n := 1
 	for _, vals := range m {
 		if len(vals) > 0 {
-			n *= len(vals)
+			n = saturatingMul(n, len(vals), maxMatrixCombos)
 		}
 	}
 	return n
@@ -547,6 +575,9 @@ func validateStep(jobID string, idx int, st *Step, seenIDs map[string]bool) erro
 	for _, name := range st.Secrets {
 		if strings.TrimSpace(name) == "" {
 			return fmt.Errorf("%s has empty secret name", where)
+		}
+		if !secretNameRegexp.MatchString(name) {
+			return fmt.Errorf("%s has invalid secret name %q (must match %s)", where, name, secretNameRegexp.String())
 		}
 		if seenSecrets[name] {
 			return fmt.Errorf("%s lists secret %q more than once", where, name)

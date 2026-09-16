@@ -571,3 +571,109 @@ func TestValidateLimitsEnvVars(t *testing.T) {
 		t.Fatalf("want env vars limit error, got %v", err)
 	}
 }
+
+func TestSaturatingMulNoOverflow(t *testing.T) {
+	cases := []struct {
+		name      string
+		n, factor int
+		limit     int
+		want      int
+	}{
+		{"exact fit", 512, 1, maxMatrixCombos, 512},
+		{"over limit by one", 513, 1, maxMatrixCombos, maxMatrixCombos + 1},
+		{"int32 product overflow", 1 << 30, 1 << 30, maxMatrixCombos, maxMatrixCombos + 1},
+		{"int64 product overflow", 1 << 62, 8, maxMatrixCombos, maxMatrixCombos + 1},
+		{"factor alone over limit", 1, maxMatrixCombos + 1, maxMatrixCombos, maxMatrixCombos + 1},
+		{"zero factor", 5, 0, maxMatrixCombos, 0},
+		{"zero n", 0, 5, maxMatrixCombos, 0},
+		{"shard product saturates at expanded limit", maxMatrixCombos, maxShardsPerJob, maxExpandedJobs, maxExpandedJobs + 1},
+		{"shard product within limit", 4, maxShardsPerJob, maxExpandedJobs, maxExpandedJobs},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := saturatingMul(tc.n, tc.factor, tc.limit); got != tc.want {
+				t.Fatalf("saturatingMul(%d, %d, %d) = %d, want %d (no wrap)", tc.n, tc.factor, tc.limit, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMatrixComboCountNeverWraps(t *testing.T) {
+	// A product that would overflow int32 (100000*100000 = 10^10) must
+	// saturate at maxMatrixCombos+1 instead of wrapping to a small or
+	// negative number.
+	big := make([]any, 100000)
+	m := map[string][]any{
+		"a": big,
+		"b": big,
+	}
+	if got := matrixComboCount(m); got != maxMatrixCombos+1 {
+		t.Fatalf("matrixComboCount = %d, want saturated %d", got, maxMatrixCombos+1)
+	}
+	s := &Spec{Version: 1, Jobs: map[string]Job{
+		"x": {Matrix: m, Steps: []Step{{Run: "echo hi"}}},
+	}}
+	err := Validate(s)
+	if err == nil || !strings.Contains(err.Error(), "513 combinations") {
+		t.Fatalf("overflowed matrix must be rejected with the limit error, got %v", err)
+	}
+}
+
+func TestValidateLimitsExpansionMultiplicationNeverWraps(t *testing.T) {
+	// combos x shards and the running total must saturate, never wrap.
+	s := &Spec{Version: 1, Jobs: map[string]Job{}}
+	vals := make([]any, maxMatrixCombos)
+	for i := range vals {
+		vals[i] = fmt.Sprintf("v%d", i)
+	}
+	// 512 combos x 1024 shards per job overflows nothing but exceeds the
+	// expanded-jobs limit as a saturated count.
+	s.Jobs["x"] = Job{Matrix: map[string][]any{"dim": vals}, Tests: TestConfig{Shards: maxShardsPerJob}, Steps: []Step{{Run: "echo hi"}}}
+	err := Validate(s)
+	if err == nil || !strings.Contains(err.Error(), "expands to") {
+		t.Fatalf("combos x shards overflow must surface as the limit error, got %v", err)
+	}
+}
+
+func TestSecretNameGrammarRejectsPunctuation(t *testing.T) {
+	for _, name := range []string{"foo-bar", "foo.bar", "foo/bar", "foo bar", "9foo", "-foo", "a!b"} {
+		_, err := Parse([]byte("version: 1\nsecrets: [" + name + "]\njobs:\n  x:\n    steps:\n      - run: echo hi\n"))
+		if err == nil {
+			t.Fatalf("secret name %q accepted", name)
+		}
+		if !strings.Contains(err.Error(), "must match") || !strings.Contains(err.Error(), name) {
+			t.Fatalf("secret name %q error = %v, want grammar rejection naming the secret", name, err)
+		}
+	}
+	// Step-level declarations get the same treatment.
+	_, err := Parse([]byte("version: 1\njobs:\n  x:\n    steps:\n      - run: echo hi\n        secrets: [foo-bar]\n"))
+	if err == nil || !strings.Contains(err.Error(), `invalid secret name "foo-bar"`) {
+		t.Fatalf("step secret punctuation error = %v", err)
+	}
+}
+
+func TestSecretNameGrammarAcceptsEnvSafeNames(t *testing.T) {
+	s, err := Parse([]byte("version: 1\nsecrets: [foo_bar, Foo_1, _lead]\njobs:\n  x:\n    steps:\n      - run: echo hi\n        secrets: [foo_bar]\n"))
+	if err != nil {
+		t.Fatalf("env-safe secret names must be accepted: %v", err)
+	}
+	if len(s.Secrets) != 3 {
+		t.Fatalf("secrets = %v", s.Secrets)
+	}
+}
+
+func TestSecretNameCollisionsImpossible(t *testing.T) {
+	// foo_bar, foo-bar and foo.bar all project to KIWI_SECRET_FOO_BAR; only
+	// the canonical form is admitted, so accepted names can never collide.
+	accepted := []string{"foo_bar", "Foo_Bar", "FOO_BAR_1", "_x"}
+	for _, name := range accepted {
+		if _, err := Parse([]byte("version: 1\nsecrets: [" + name + "]\njobs:\n  x:\n    steps:\n      - run: echo hi\n")); err != nil {
+			t.Fatalf("canonical secret name %q rejected: %v", name, err)
+		}
+	}
+	for _, name := range []string{"foo-bar", "foo.bar", "foo bar"} {
+		if _, err := Parse([]byte("version: 1\nsecrets: [" + name + "]\njobs:\n  x:\n    steps:\n      - run: echo hi\n")); err == nil {
+			t.Fatalf("punctuated secret name %q accepted (would collide under env projection)", name)
+		}
+	}
+}

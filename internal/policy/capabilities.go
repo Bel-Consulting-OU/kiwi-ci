@@ -34,6 +34,16 @@ type Capabilities struct {
 	RunnerLabels       []string
 	GenerateChildGraph bool
 	CrossRepoTrigger   bool
+	// RequireRootless, RequireReadOnlyRootFS and RequireNonRoot are
+	// sandbox requirements the effective policy demands of every executed
+	// job, not grants: Intersect ORs them (any layer that demands one
+	// wins) and Effective preserves them. The JSON tags match the
+	// runner-side effectivePolicySandbox decode (internal/runner) so the
+	// compiled payload carries them as "rootless", "read_only_rootfs" and
+	// "non_root".
+	RequireRootless       bool `json:"rootless"`
+	RequireReadOnlyRootFS bool `json:"read_only_rootfs"`
+	RequireNonRoot        bool `json:"non_root"`
 }
 
 // DefaultTrustedCapabilities returns the capabilities granted to trusted
@@ -57,22 +67,29 @@ func DefaultTrustedCapabilities() Capabilities {
 }
 
 // DefaultUntrustedCapabilities returns the hard floor for untrusted
-// pipelines: no native execution, no egress, no secrets, no OIDC credentials,
-// and no deployments. Secrets and OIDC are non-nil empty allowlists so they
-// deny by default and cannot be lifted by Intersect. CacheRead/CacheWrite stay
-// true because the server scopes cache namespaces per trust domain.
+// pipelines: no native execution, no Tart execution (until Tart gains
+// isolated networking, a networked VM is not a sandbox boundary), no
+// egress, no secrets, no OIDC credentials, and no deployments. Every
+// executed job must additionally run rootless, with a read-only rootfs,
+// and as a non-root user (the untrusted sandbox floor). Secrets and OIDC
+// are non-nil empty allowlists so they deny by default and cannot be
+// lifted by Intersect. CacheRead/CacheWrite stay true because the server
+// scopes cache namespaces per trust domain.
 func DefaultUntrustedCapabilities() Capabilities {
 	return Capabilities{
-		NativeExecution: false,
-		Container:       true,
-		Tart:            true,
-		Network:         pipeline.NetworkPolicyNone,
-		Secrets:         map[string]bool{},
-		OIDC:            []string{},
-		Deployments:     false,
-		CacheRead:       true,
-		CacheWrite:      true,
-		RunnerLabels:    nil,
+		NativeExecution:       false,
+		Container:             true,
+		Tart:                  false,
+		Network:               pipeline.NetworkPolicyNone,
+		Secrets:               map[string]bool{},
+		OIDC:                  []string{},
+		Deployments:           false,
+		CacheRead:             true,
+		CacheWrite:            true,
+		RunnerLabels:          nil,
+		RequireRootless:       true,
+		RequireReadOnlyRootFS: true,
+		RequireNonRoot:        true,
 	}
 }
 
@@ -82,21 +99,27 @@ func DefaultUntrustedCapabilities() Capabilities {
 // intersected as sets, and runner labels are intersected as subsets. A nil
 // set acts as the universal set (no restriction from that side), so
 // Intersect(c, DefaultUntrustedCapabilities()) always lands on the untrusted
-// floor.
+// floor. Sandbox requirements (RequireRootless/RequireReadOnlyRootFS/
+// RequireNonRoot) are the one monotone exception: they are ORed, because a
+// requirement demanded by any layer must survive — a layer that does not
+// demand one is neutral, never a waiver.
 func Intersect(base, restriction Capabilities) Capabilities {
 	return Capabilities{
-		NativeExecution:    base.NativeExecution && restriction.NativeExecution,
-		Container:          base.Container && restriction.Container,
-		Tart:               base.Tart && restriction.Tart,
-		Network:            minNetwork(base.Network, restriction.Network),
-		Secrets:            intersectSecrets(base.Secrets, restriction.Secrets),
-		OIDC:               intersectStrings(base.OIDC, restriction.OIDC),
-		Deployments:        base.Deployments && restriction.Deployments,
-		CacheRead:          base.CacheRead && restriction.CacheRead,
-		CacheWrite:         base.CacheWrite && restriction.CacheWrite,
-		RunnerLabels:       intersectStrings(base.RunnerLabels, restriction.RunnerLabels),
-		GenerateChildGraph: base.GenerateChildGraph && restriction.GenerateChildGraph,
-		CrossRepoTrigger:   base.CrossRepoTrigger && restriction.CrossRepoTrigger,
+		NativeExecution:       base.NativeExecution && restriction.NativeExecution,
+		Container:             base.Container && restriction.Container,
+		Tart:                  base.Tart && restriction.Tart,
+		Network:               minNetwork(base.Network, restriction.Network),
+		Secrets:               intersectSecrets(base.Secrets, restriction.Secrets),
+		OIDC:                  intersectStrings(base.OIDC, restriction.OIDC),
+		Deployments:           base.Deployments && restriction.Deployments,
+		CacheRead:             base.CacheRead && restriction.CacheRead,
+		CacheWrite:            base.CacheWrite && restriction.CacheWrite,
+		RunnerLabels:          intersectStrings(base.RunnerLabels, restriction.RunnerLabels),
+		GenerateChildGraph:    base.GenerateChildGraph && restriction.GenerateChildGraph,
+		CrossRepoTrigger:      base.CrossRepoTrigger && restriction.CrossRepoTrigger,
+		RequireRootless:       base.RequireRootless || restriction.RequireRootless,
+		RequireReadOnlyRootFS: base.RequireReadOnlyRootFS || restriction.RequireReadOnlyRootFS,
+		RequireNonRoot:        base.RequireNonRoot || restriction.RequireNonRoot,
 	}
 }
 

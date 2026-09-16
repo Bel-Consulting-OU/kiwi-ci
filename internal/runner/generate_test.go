@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -144,6 +145,48 @@ func TestExecuteGeneratePathOnlyOnSuccess(t *testing.T) {
 	}
 	if c.Status != model.StatusFailure {
 		t.Fatalf("status = %s, want failure", c.Status)
+	}
+}
+
+// TestExecuteGeneratePathSymlinkFailsJob declares generate.path and plants a
+// symlink to a host file outside the workspace at that path. The fragment
+// is read through the native backend's no-follow read, so the read fails and
+// the JOB fails with a clear error — never a warning — and no fragment is
+// POSTed.
+func TestExecuteGeneratePathSymlinkFailsJob(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation needs privileges on windows")
+	}
+	fsrv := &fakeRunnerServer{}
+	ts := httptest.NewServer(fsrv.handler())
+	defer ts.Close()
+
+	base := "version: 1\njobs:\n  build:\n    generate:\n      path: generated.json\n    steps:\n      - run: echo hi\n"
+	task := basicTask(base)
+	task.Job.CompiledJobPayload = buildPayload(t, base, "build")
+
+	secret := filepath.Join(t.TempDir(), "host-secret.txt")
+	if err := os.WriteFile(secret, []byte(`{"jobs":{"evil":{"runtime":"native","steps":[{"run":"echo pwned"}]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := testRunnerFor(t, ts, Config{CaptureSnapshots: false})
+	r.Cfg.CheckoutFn = func(_ context.Context, _ model.Job, dir string) error {
+		return os.Symlink(secret, filepath.Join(dir, "generated.json"))
+	}
+	r.execute(context.Background(), task)
+
+	if h := fsrv.headerOf(http.MethodPost, "/api/v1/jobs/job-1/generated"); h != nil {
+		t.Fatal("fragment POSTed despite unreadable generate.path")
+	}
+	c, ok := fsrv.lastComplete()
+	if !ok {
+		t.Fatal("no completion recorded")
+	}
+	if c.Status != model.StatusFailure {
+		t.Fatalf("status = %s (%s), want failure for unreadable generate.path", c.Status, c.Error)
+	}
+	if !strings.Contains(c.Error, "generate.path") {
+		t.Fatalf("error = %q, want generate.path refusal", c.Error)
 	}
 }
 

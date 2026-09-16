@@ -46,30 +46,40 @@ type Manifest struct {
 
 // ManifestFor walks the workspace and builds its manifest: regular files
 // only, paths in sorted order, per-file SHA-256, and a root digest over the
-// canonical entry list.
+// canonical entry list. Every file is read through a held safefs
+// WorkspaceRoot (no-follow, anchored to the root handle), so a file swapped
+// for a symlink mid-walk fails the manifest instead of hashing content
+// outside the workspace.
 func ManifestFor(workspace string) (Manifest, error) {
-	entries, err := collectEntries(workspace)
+	root, err := safefs.OpenWorkspaceRoot(workspace)
+	if err != nil {
+		return Manifest{}, fmt.Errorf("snapshot: open workspace: %w", err)
+	}
+	defer root.Close()
+	return manifestForRoot(root)
+}
+
+// manifestForRoot builds the manifest for an already-opened workspace root.
+func manifestForRoot(root *safefs.WorkspaceRoot) (Manifest, error) {
+	entries, err := collectEntries(root)
 	if err != nil {
 		return Manifest{}, err
 	}
 	return Manifest{Version: ManifestVersion, RootSHA256: rootSHA256(entries), Entries: entries}, nil
 }
 
-// collectEntries walks the workspace and records every regular file with a
-// normalized mode (0o644, matching what WriteTarGz puts in the archive) so a
-// manifest computed from the filesystem and one computed from the archive
-// agree.
-func collectEntries(workspace string) ([]Entry, error) {
-	root, err := filepath.Abs(workspace)
-	if err != nil {
-		return nil, err
-	}
+// collectEntries walks the workspace beneath the held root and records every
+// regular file with a normalized mode (0o644, matching what
+// WriteTarGzFromRoot puts in the archive) so a manifest computed from the
+// filesystem and one computed from the archive agree. Each file is hashed
+// from the descriptor returned by root.OpenRel.
+func collectEntries(root *safefs.WorkspaceRoot) ([]Entry, error) {
 	var out []Entry
-	err = filepath.WalkDir(root, func(abs string, d os.DirEntry, err error) error {
+	err := filepath.WalkDir(root.Canonical, func(abs string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if abs == root {
+		if abs == root.Canonical {
 			return nil
 		}
 		if d.Type()&os.ModeSymlink != 0 {
@@ -88,15 +98,15 @@ func collectEntries(workspace string) ([]Entry, error) {
 		if !fi.Mode().IsRegular() {
 			return nil
 		}
-		rel, err := filepath.Rel(root, abs)
+		rel, err := filepath.Rel(root.Canonical, abs)
 		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			return fmt.Errorf("snapshot: path escapes workspace: %q", abs)
 		}
-		h := sha256.New()
-		f, err := os.Open(abs)
+		f, err := root.OpenRel(filepath.ToSlash(rel))
 		if err != nil {
 			return err
 		}
+		h := sha256.New()
 		size, cpErr := io.Copy(h, f)
 		f.Close()
 		if cpErr != nil {

@@ -331,7 +331,27 @@ func (c *countReader) Read(p []byte) (int, error) {
 // WriteTarGz writes a deterministic tar.gz of the given workspace-relative
 // paths. Symlinks and special files are never written. Paths that resolve
 // outside the workspace are an error.
+//
+// Deprecated: use OpenWorkspaceRoot plus WriteTarGzFromRoot so the archive
+// is built from descriptors opened relative to the held root handle, never
+// by path name. This shim keeps the historical path-based entry point for
+// legacy callers (followSymlinks=false routes through the root-based writer
+// anyway; followSymlinks=true retains the old path-following behavior).
 func WriteTarGz(w io.Writer, workspace string, paths []string, followSymlinks bool) error {
+	if !followSymlinks {
+		root, err := OpenWorkspaceRoot(workspace)
+		if err != nil {
+			return err
+		}
+		defer root.Close()
+		return WriteTarGzFromRoot(w, root, paths)
+	}
+	return writeTarGzFollowing(w, workspace, paths)
+}
+
+// writeTarGzFollowing is the legacy path-based archive writer, retained only
+// for the followSymlinks=true branch of the deprecated WriteTarGz shim.
+func writeTarGzFollowing(w io.Writer, workspace string, paths []string) error {
 	gz := gzip.NewWriter(w)
 	tw := tar.NewWriter(gz)
 	fail := func(e error) error {
@@ -339,7 +359,7 @@ func WriteTarGz(w io.Writer, workspace string, paths []string, followSymlinks bo
 		_ = gz.Close()
 		return e
 	}
-	entries, err := collect(workspace, paths, followSymlinks)
+	entries, err := collect(workspace, paths, true)
 	if err != nil {
 		return err
 	}
@@ -370,12 +390,150 @@ func WriteTarGz(w io.Writer, workspace string, paths []string, followSymlinks bo
 	return gz.Close()
 }
 
+// WriteTarGzFromRoot writes a deterministic tar.gz of the given
+// workspace-relative paths, reading every file through the held
+// WorkspaceRoot descriptor: each regular file is opened with OpenRel
+// (no-follow, anchored to the root handle) and its content is copied from
+// that descriptor only, never re-opened by name. A file swapped for a
+// symlink after validation either yields the originally opened bytes or
+// fails the archive — content from outside the workspace can never be
+// written. Symlinks and special files are never written.
+func WriteTarGzFromRoot(w io.Writer, root *WorkspaceRoot, paths []string) error {
+	if root == nil || root.F == nil {
+		return fmt.Errorf("safefs: nil workspace root")
+	}
+	entries, err := collectFromRoot(root, paths)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		for _, e := range entries {
+			if e.f != nil {
+				_ = e.f.Close()
+			}
+		}
+	}()
+	gz := gzip.NewWriter(w)
+	tw := tar.NewWriter(gz)
+	fail := func(e error) error {
+		_ = tw.Close()
+		_ = gz.Close()
+		return e
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].rel < entries[j].rel })
+	for _, e := range entries {
+		if e.rel == "" || e.rel == "." || e.rel == "./" {
+			continue
+		}
+		h := &tar.Header{Name: e.rel, Mode: e.mode, Size: e.size, ModTime: e.modTime, Typeflag: e.typeflag}
+		if err := tw.WriteHeader(h); err != nil {
+			return fail(err)
+		}
+		if e.typeflag == tar.TypeReg {
+			n, err := io.CopyN(tw, e.f, e.size)
+			if err != nil {
+				return fail(err)
+			}
+			if n != e.size {
+				return fail(fmt.Errorf("safefs: %q: short read: %d of %d bytes", e.rel, n, e.size))
+			}
+		}
+	}
+	if err := tw.Close(); err != nil {
+		return fail(err)
+	}
+	return gz.Close()
+}
+
+// collectFromRoot walks the requested paths beneath the workspace root and
+// records every regular file with its descriptor already opened via
+// OpenRel. Symlink components are never followed; a symlink capture root is
+// skipped (matching WriteTarGz's historical behavior) and nested symlinks
+// are never archived.
+func collectFromRoot(root *WorkspaceRoot, paths []string) ([]walkEntry, error) {
+	seen := map[string]bool{}
+	var out []walkEntry
+	for _, p := range paths {
+		rel := p
+		if rel == "" || rel == "." {
+			rel = ""
+		}
+		if rel != "" {
+			rel = filepath.ToSlash(rel)
+		}
+		abs := root.Canonical
+		if rel != "" {
+			abs = filepath.Join(root.Canonical, filepath.FromSlash(rel))
+		}
+		fi, err := os.Lstat(abs)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, err
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			// never follow or archive a symlinked capture root
+			continue
+		}
+		err = filepath.WalkDir(abs, func(p string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.Type()&os.ModeSymlink != 0 {
+				// never follow or archive symlinks
+				return nil
+			}
+			r, err := filepath.Rel(root.Canonical, p)
+			if err != nil || r == ".." || strings.HasPrefix(r, ".."+string(filepath.Separator)) {
+				return fmt.Errorf("safefs: path escapes workspace: %q", p)
+			}
+			r = filepath.ToSlash(r)
+			if seen[r] {
+				return fmt.Errorf("safefs: duplicate path %q", r)
+			}
+			seen[r] = true
+			if d.IsDir() {
+				info, err := d.Info()
+				if err != nil {
+					return err
+				}
+				out = append(out, walkEntry{abs: p, rel: r + "/", mode: 0o755, modTime: info.ModTime(), typeflag: tar.TypeDir})
+				return nil
+			}
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			if !info.Mode().IsRegular() {
+				return nil
+			}
+			f, err := root.OpenRel(r)
+			if err != nil {
+				return err
+			}
+			st, err := f.Stat()
+			if err != nil {
+				f.Close()
+				return err
+			}
+			out = append(out, walkEntry{abs: p, rel: r, size: st.Size(), mode: 0o644, modTime: st.ModTime(), typeflag: tar.TypeReg, f: f})
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
 type walkEntry struct {
 	abs, rel string
 	size     int64
 	mode     int64
 	modTime  time.Time
 	typeflag byte
+	f        *os.File // held descriptor for regular files
 }
 
 func collect(workspace string, paths []string, followSymlinks bool) ([]walkEntry, error) {

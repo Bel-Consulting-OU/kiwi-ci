@@ -133,8 +133,14 @@ jobs:
     steps:
       - run: echo hi
 `
-	if w := submitPipeline(t, s, "https://github.com/o/r.git", "o/r", unpinnedVM); w.Code != http.StatusForbidden {
-		t.Fatalf("unpinned vm = %d, want 403: %s", w.Code, w.Body.String())
+	// Untrusted submissions may not run Tart at all (no isolated Tart
+	// networking), so the digest-pin case is exercised through the internal
+	// trusted enqueue path: the trusted run's VM must still be digest-pinned.
+	if _, err := s.enqueue(SubmitRun{
+		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
+		Ref: "refs/heads/main", Pipeline: unpinnedVM, Trusted: true,
+	}); err == nil {
+		t.Fatal("trusted enqueue with unpinned vm must be rejected by require_digest_pins")
 	}
 	pinned := `version: 1
 jobs:

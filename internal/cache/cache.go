@@ -31,24 +31,38 @@ func Default() *Store {
 	return &Store{Root: filepath.Join(home, ".kiwi", "cache")}
 }
 
+// Key computes the cache key for base and the workspace's hashFiles. Every
+// file is read through a held safefs.WorkspaceRoot: matches are opened
+// relative to the root handle with a no-follow discipline, so a hash file
+// swapped for a symlink fails the key computation instead of hashing
+// content outside the workspace.
 func (s *Store) Key(base string, workspace string, hashFiles []string) (string, error) {
 	h := sha256.New()
 	io.WriteString(h, base)
 	io.WriteString(h, "\x00")
+	root, err := safefs.OpenWorkspaceRoot(workspace)
+	if err != nil {
+		return "", err
+	}
+	defer root.Close()
 	var files []string
 	for _, p := range hashFiles {
-		matches, _ := filepath.Glob(filepath.Join(workspace, p))
+		matches, _ := filepath.Glob(filepath.Join(root.Canonical, p))
 		files = append(files, matches...)
 	}
 	sort.Strings(files)
 	for _, f := range files {
-		b, err := os.ReadFile(f)
+		rel, _ := filepath.Rel(root.Canonical, f)
+		fh, err := root.OpenRel(filepath.ToSlash(rel))
 		if err != nil {
 			return "", err
 		}
-		rel, _ := filepath.Rel(workspace, f)
 		io.WriteString(h, rel)
-		h.Write(b)
+		_, cpErr := io.Copy(h, fh)
+		fh.Close()
+		if cpErr != nil {
+			return "", cpErr
+		}
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
@@ -104,6 +118,11 @@ func (s *Store) Save(key, workspace string, paths []string) error {
 	if err := safefs.FitsAvailable(s.Root, s.MaxCacheBytes); err != nil {
 		return err
 	}
+	root, err := safefs.OpenWorkspaceRoot(workspace)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
 	tmp := filepath.Join(s.Root, key+".tmp")
 	f, err := os.Create(tmp)
 	if err != nil {
@@ -113,7 +132,7 @@ func (s *Store) Save(key, workspace string, paths []string) error {
 	if s.MaxCacheBytes > 0 {
 		w = safefs.NewCappedWriter(f, s.MaxCacheBytes)
 	}
-	if err := safefs.WriteTarGz(w, workspace, paths, false); err != nil {
+	if err := safefs.WriteTarGzFromRoot(w, root, paths); err != nil {
 		f.Close()
 		_ = os.Remove(tmp)
 		return err

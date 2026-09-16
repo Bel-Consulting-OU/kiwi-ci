@@ -27,6 +27,9 @@ func TestDefaultTrustedCapabilities(t *testing.T) {
 	if !c.CacheRead || !c.CacheWrite {
 		t.Fatalf("trusted defaults must allow cache read/write: %+v", c)
 	}
+	if c.RequireRootless || c.RequireReadOnlyRootFS || c.RequireNonRoot {
+		t.Fatalf("trusted defaults must not demand sandbox requirements: %+v", c)
+	}
 }
 
 func TestDefaultUntrustedCapabilities(t *testing.T) {
@@ -34,8 +37,11 @@ func TestDefaultUntrustedCapabilities(t *testing.T) {
 	if c.NativeExecution {
 		t.Fatal("untrusted defaults must deny native execution")
 	}
-	if !c.Container || !c.Tart {
-		t.Fatal("untrusted defaults must allow container/tart execution")
+	if !c.Container {
+		t.Fatal("untrusted defaults must allow container execution")
+	}
+	if c.Tart {
+		t.Fatal("untrusted defaults must deny tart execution until tart has isolated networking")
 	}
 	if c.Network != pipeline.NetworkPolicyNone {
 		t.Fatalf("untrusted default network = %v, want none", c.Network)
@@ -51,6 +57,66 @@ func TestDefaultUntrustedCapabilities(t *testing.T) {
 	}
 	if !c.CacheRead || !c.CacheWrite {
 		t.Fatalf("untrusted defaults must allow cache read/write (server scopes namespace): %+v", c)
+	}
+	if !c.RequireRootless || !c.RequireReadOnlyRootFS || !c.RequireNonRoot {
+		t.Fatalf("untrusted defaults must demand rootless/read-only-rootfs/non-root: %+v", c)
+	}
+}
+
+func TestIntersectSandboxRequirementsAreMonotoneOR(t *testing.T) {
+	cases := []struct {
+		name                              string
+		base, restriction                 Capabilities
+		wantRootless, wantRO, wantNonRoot bool
+	}{
+		{
+			name:         "base demands all, restriction neutral",
+			base:         Capabilities{RequireRootless: true, RequireReadOnlyRootFS: true, RequireNonRoot: true},
+			restriction:  Capabilities{},
+			wantRootless: true, wantRO: true, wantNonRoot: true,
+		},
+		{
+			name:         "restriction demands all, base neutral",
+			base:         Capabilities{},
+			restriction:  Capabilities{RequireRootless: true, RequireReadOnlyRootFS: true, RequireNonRoot: true},
+			wantRootless: true, wantRO: true, wantNonRoot: true,
+		},
+		{
+			name:         "partial demands survive independently",
+			base:         Capabilities{RequireRootless: true, RequireNonRoot: true},
+			restriction:  Capabilities{RequireReadOnlyRootFS: true},
+			wantRootless: true, wantRO: true, wantNonRoot: true,
+		},
+		{
+			name:         "neither demands nothing",
+			base:         Capabilities{},
+			restriction:  Capabilities{},
+			wantRootless: false, wantRO: false, wantNonRoot: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Intersect(tc.base, tc.restriction)
+			if got.RequireRootless != tc.wantRootless || got.RequireReadOnlyRootFS != tc.wantRO || got.RequireNonRoot != tc.wantNonRoot {
+				t.Fatalf("Intersect(%+v, %+v) requirements = %t/%t/%t, want %t/%t/%t",
+					tc.base, tc.restriction, got.RequireRootless, got.RequireReadOnlyRootFS, got.RequireNonRoot,
+					tc.wantRootless, tc.wantRO, tc.wantNonRoot)
+			}
+		})
+	}
+}
+
+func TestEffectiveSandboxRequirements(t *testing.T) {
+	// The untrusted floor demands all three requirements even when every
+	// layer was neutral.
+	got := Capabilities{}.Effective(false)
+	if !got.RequireRootless || !got.RequireReadOnlyRootFS || !got.RequireNonRoot {
+		t.Fatalf("Effective(false) must demand rootless/read-only-rootfs/non-root: %+v", got)
+	}
+	// Trusted sets never gain requirements.
+	trusted := Capabilities{}.Effective(true)
+	if trusted.RequireRootless || trusted.RequireReadOnlyRootFS || trusted.RequireNonRoot {
+		t.Fatalf("Effective(true) must not demand sandbox requirements: %+v", trusted)
 	}
 }
 

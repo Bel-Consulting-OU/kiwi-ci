@@ -30,9 +30,9 @@ func stepSecretGraph(t *testing.T, yaml string) *pipeline.Graph {
 func TestStepSecretsDoNotReachOtherSteps(t *testing.T) {
 	ws := t.TempDir()
 	provider := secrets.MapProvider{
-		"global-secret": "globalvalue",
-		"step-a":        "avalue",
-		"step-b":        "bvalue",
+		"global_secret": "globalvalue",
+		"step_a":        "avalue",
+		"step_b":        "bvalue",
 	}
 	// Each step writes the secret env name into its file when the secret
 	// is visible to it. The syntax is per-host: POSIX test on Unix,
@@ -47,15 +47,15 @@ func TestStepSecretsDoNotReachOtherSteps(t *testing.T) {
 	stepOne := probe("STEP_A", "step1_a.txt") + probe("STEP_B", "step1_b.txt") + probe("GLOBAL_SECRET", "step1_g.txt")
 	stepTwo := probe("STEP_A", "step2_a.txt") + probe("STEP_B", "step2_b.txt") + probe("GLOBAL_SECRET", "step2_g.txt")
 	g := stepSecretGraph(t, `version: 1
-secrets: [global-secret]
+secrets: [global_secret]
 jobs:
   probe:
     steps:
       - id: one
-        secrets: [step-a]
+        secrets: [step_a]
         run: |
 `+stepOne+`      - id: two
-        secrets: [step-b]
+        secrets: [step_b]
         run: |
 `+stepTwo)
 	ex := Executor{Opt: Options{Workspace: ws, SecretProvider: provider}}
@@ -82,13 +82,13 @@ jobs:
 		t.Fatalf("step one missing its declared secret: %q", got)
 	}
 	if got := read("step1_b.txt"); got != "" {
-		t.Fatalf("step-b secret leaked into step one: %q", got)
+		t.Fatalf("step_b secret leaked into step one: %q", got)
 	}
 	if got := read("step2_b.txt"); !strings.Contains(got, "KIWI_SECRET_STEP_B") {
 		t.Fatalf("step two missing its declared secret: %q", got)
 	}
 	if got := read("step2_a.txt"); got != "" {
-		t.Fatalf("step-a secret leaked into step two: %q", got)
+		t.Fatalf("step_a secret leaked into step two: %q", got)
 	}
 	for _, f := range []string{"step1_g.txt", "step2_g.txt"} {
 		if got := read(f); !strings.Contains(got, "KIWI_SECRET_GLOBAL_SECRET") {
@@ -100,7 +100,7 @@ jobs:
 func TestStepSecretMaskedInLogs(t *testing.T) {
 	const value = "topsecret-token-9f8a"
 	ws := t.TempDir()
-	provider := secrets.MapProvider{"step-a": value}
+	provider := secrets.MapProvider{"step_a": value}
 	var mu sync.Mutex
 	var lines []string
 	sink := logging.Func(func(job, step, line string) {
@@ -118,7 +118,7 @@ func TestStepSecretMaskedInLogs(t *testing.T) {
 jobs:
   probe:
     steps:
-      - secrets: [step-a]
+      - secrets: [step_a]
         run: `+echoScript+`
 `)
 	ex := Executor{Opt: Options{Workspace: ws, SecretProvider: provider, Logs: sink}}

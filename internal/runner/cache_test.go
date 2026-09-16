@@ -82,7 +82,12 @@ func TestCacheRestoreFallsBackToJobScopedRoute(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := safefs.WriteTarGz(f, ws, []string{"cached.txt"}, false); err != nil {
+	wsRoot, err := safefs.OpenWorkspaceRoot(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wsRoot.Close()
+	if err := safefs.WriteTarGzFromRoot(f, wsRoot, []string{"cached.txt"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.Close(); err != nil {

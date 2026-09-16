@@ -79,38 +79,38 @@ func TestInheritEnvOptIn(t *testing.T) {
 
 func TestStepSecretScoping(t *testing.T) {
 	provider := secrets.MapProvider{
-		"job-secret": "jobs",
-		"step-one":   "one",
-		"step-two":   "two",
+		"job_secret": "jobs",
+		"step_one":   "one",
+		"step_two":   "two",
 	}
 	stepA := nativeScript(
 		`          [ "$KIWI_SECRET_JOB_SECRET" = "jobs" ] || { echo "job secret missing in step a"; exit 1; }
-          [ "$KIWI_SECRET_STEP_ONE" = "one" ] || { echo "step-one secret missing"; exit 1; }
-          [ -z "$KIWI_SECRET_STEP_TWO" ] || { echo "step-two secret leaked into step a"; exit 1; }
+          [ "$KIWI_SECRET_STEP_ONE" = "one" ] || { echo "step_one secret missing"; exit 1; }
+          [ -z "$KIWI_SECRET_STEP_TWO" ] || { echo "step_two secret leaked into step a"; exit 1; }
 `,
 		`          if ($env:KIWI_SECRET_JOB_SECRET -ne "jobs") { "job secret missing in step a"; exit 1 }
-          if ($env:KIWI_SECRET_STEP_ONE -ne "one") { "step-one secret missing"; exit 1 }
-          if ($env:KIWI_SECRET_STEP_TWO) { "step-two secret leaked into step a"; exit 1 }
+          if ($env:KIWI_SECRET_STEP_ONE -ne "one") { "step_one secret missing"; exit 1 }
+          if ($env:KIWI_SECRET_STEP_TWO) { "step_two secret leaked into step a"; exit 1 }
 `)
 	stepB := nativeScript(
 		`          [ "$KIWI_SECRET_JOB_SECRET" = "jobs" ] || { echo "job secret missing in step b"; exit 1; }
-          [ "$KIWI_SECRET_STEP_TWO" = "two" ] || { echo "step-two secret missing"; exit 1; }
-          [ -z "$KIWI_SECRET_STEP_ONE" ] || { echo "step-one secret leaked into step b"; exit 1; }
+          [ "$KIWI_SECRET_STEP_TWO" = "two" ] || { echo "step_two secret missing"; exit 1; }
+          [ -z "$KIWI_SECRET_STEP_ONE" ] || { echo "step_one secret leaked into step b"; exit 1; }
 `,
 		`          if ($env:KIWI_SECRET_JOB_SECRET -ne "jobs") { "job secret missing in step b"; exit 1 }
-          if ($env:KIWI_SECRET_STEP_TWO -ne "two") { "step-two secret missing"; exit 1 }
-          if ($env:KIWI_SECRET_STEP_ONE) { "step-one secret leaked into step b"; exit 1 }
+          if ($env:KIWI_SECRET_STEP_TWO -ne "two") { "step_two secret missing"; exit 1 }
+          if ($env:KIWI_SECRET_STEP_ONE) { "step_one secret leaked into step b"; exit 1 }
 `)
 	s, err := pipeline.Parse([]byte(`version: 1
-secrets: [job-secret]
+secrets: [job_secret]
 jobs:
   probe:
     steps:
       - id: a
-        secrets: [step-one]
+        secrets: [step_one]
         run: |
 ` + stepA + `      - id: b
-        secrets: [step-two]
+        secrets: [step_two]
         run: |
 ` + stepB))
 	if err != nil {

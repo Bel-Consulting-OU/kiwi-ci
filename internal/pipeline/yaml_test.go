@@ -213,6 +213,7 @@ components:
       version: "16"
 jobs:
   x:
+    runtime: container
     placement:
       regions: [eu-west-1]
       labels: [fast]
@@ -296,6 +297,7 @@ func TestByteSizeUnmarshal(t *testing.T) {
 	s, err := Parse([]byte(`version: 1
 jobs:
   x:
+    runtime: container
     resources:
       memory: "512Mi"
       disk: 2Gi

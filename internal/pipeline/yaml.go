@@ -204,7 +204,7 @@ var knownFieldTables = map[string]map[string]bool{
 		"services": true, "steps": true, "cache": true, "artifacts": true,
 		"downloads": true, "test_reports": true, "environment": true,
 		"infra_retries": true, "permissions": true, "outputs": true,
-		"placement": true, "sandbox": true, "resources": true, "workflow": true,
+		"placement": true, "sandbox": true, "resources": true,
 		"tests": true, "generate": true, "downstream": true, "deployment": true,
 		"snapshot": true, "component": true, "with": true, "queue_timeout": true,
 	},

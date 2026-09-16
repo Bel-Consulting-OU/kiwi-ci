@@ -143,12 +143,21 @@ const (
 //     "pull_request.opened") is action-scoped and takes precedence over the
 //     bare event key. For merge_request events, "pull_request" is used as a
 //     fallback key when no "merge_request" key exists.
-//   - Draft PRs never match (GitHub Actions parity: drafts only trigger on
-//     explicit review activity, which is not modeled here yet).
+//   - Actions: when the matched trigger declares `actions`, the event's
+//     action must appear in the list. Matching is canonicalized: exact
+//     after case normalization (the forge adapters already normalize
+//     forge-specific action names, e.g. GitLab "open" to "opened").
+//   - Draft: the matched trigger's `draft` declares the draft stance. nil
+//     (unset) admits both draft and non-draft events; false rejects draft
+//     events; true admits ONLY draft events. There is no blanket draft
+//     rejection.
 //   - Ref matching: tag refs (refs/tags/... or ec.Tag != "") are matched
 //     against tags/tags_ignore; branch refs against branches/branches_ignore.
 //     Patterns are path.Match globs, plus exact equality. A tag ref only
 //     matches a trigger with no ref filters or with tag filters configured.
+//     For pull_request/merge_request events the branch filters match
+//     ec.BaseRef — the TARGET branch the adapters supply — never the head
+//     branch; push events match ec.Ref.
 //   - Paths: pipeline.PathsMatch over ec.ChangedFiles. With no changed-file
 //     data, paths filters cannot be evaluated and are treated as matching
 //     (consistent with pipeline.PathsMatch's empty-list behavior).
@@ -179,7 +188,10 @@ func MatchesTrigger(triggers map[string]pipeline.Trigger, ec EventContext) (bool
 	} else {
 		return false, ""
 	}
-	if ec.Draft {
+	if len(trg.Actions) > 0 && !matchAction(trg.Actions, ec.Action) {
+		return false, ""
+	}
+	if trg.Draft != nil && *trg.Draft != ec.Draft {
 		return false, ""
 	}
 	tagRef := ec.Tag != "" || strings.HasPrefix(ec.Ref, "refs/tags/")
@@ -203,7 +215,12 @@ func MatchesTrigger(triggers map[string]pipeline.Trigger, ec EventContext) (bool
 			}
 		}
 	} else {
+		// Push branch filters match the pushed ref; PR/MR branch filters
+		// match the TARGET branch (ec.BaseRef) the adapters supply.
 		branch := strings.TrimPrefix(strings.TrimPrefix(ec.Ref, "refs/heads/"), "refs/")
+		if isPullRequestEvent(ec.Event) && ec.BaseRef != "" {
+			branch = strings.TrimPrefix(strings.TrimPrefix(ec.BaseRef, "refs/heads/"), "refs/")
+		}
 		if len(trg.Branches) > 0 && !matchRefPatterns(branch, trg.Branches) {
 			return false, ""
 		}
@@ -217,6 +234,26 @@ func MatchesTrigger(triggers map[string]pipeline.Trigger, ec EventContext) (bool
 		}
 	}
 	return true, matched
+}
+
+func isPullRequestEvent(event string) bool {
+	return event == "pull_request" || event == "merge_request"
+}
+
+// matchAction reports whether the event's action appears in the trigger's
+// action list. Matching is canonicalized: exact after case normalization and
+// trimming (the adapters already map forge-specific action names onto the
+// canonical GitHub-style set).
+func matchAction(actions []string, action string) bool {
+	if action == "" {
+		return false
+	}
+	for _, a := range actions {
+		if strings.EqualFold(strings.TrimSpace(a), action) {
+			return true
+		}
+	}
+	return false
 }
 
 func matchRefPatterns(name string, patterns []string) bool {

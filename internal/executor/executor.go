@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/artifact"
@@ -81,11 +82,77 @@ type Options struct {
 	// step's wall time (including retries and backoff). Steps that were
 	// skipped or never executed are not reported.
 	StepReporter func(jobID, stepID string, d time.Duration)
+	// GenerateUpload, when set, is called for a successful job that declares
+	// generate.path, with the fragment's contents read through the job's
+	// live backend session (ReadJobFile) while it is still running. An
+	// upload error is reported as a warning and never changes job status; a
+	// read error fails the job. The distributed runner wires its fragment
+	// POST here; local runs leave it nil and only validate the read.
+	GenerateUpload func(jobID, path string, data []byte) error
 }
 
 type Executor struct {
 	Opt    Options
 	Masker *secrets.Masker
+	// sessions tracks the live per-job backend sessions so generate reads
+	// (and other job-scoped file reads) resolve through the execution
+	// backend instead of host-side path opens. It must stay a pointer: runJob
+	// makes shallow copies of Executor for its log-quota scoping.
+	sessions *sessionRegistry
+}
+
+// sessionRegistry maps job IDs to their live backend sessions. A session is
+// registered once its backend is started and unregistered after the backend
+// is closed, so reads outside that window fail closed.
+type sessionRegistry struct {
+	mu sync.Mutex
+	m  map[string]Backend
+}
+
+func (r *sessionRegistry) put(jobID string, b Backend) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	if r.m == nil {
+		r.m = map[string]Backend{}
+	}
+	r.m[jobID] = b
+	r.mu.Unlock()
+}
+
+func (r *sessionRegistry) get(jobID string) (Backend, bool) {
+	if r == nil {
+		return nil, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b, ok := r.m[jobID]
+	return b, ok
+}
+
+func (r *sessionRegistry) delete(jobID string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	delete(r.m, jobID)
+	r.mu.Unlock()
+}
+
+// ReadJobFile reads a file from a running job's live backend session. The
+// job must currently be executing (its backend session registered): the
+// backend performs the read inside the execution boundary — native reads
+// are no-follow host reads, container reads run `docker exec cat`, tart
+// reads go over ssh — so a symlink planted in the workspace can only
+// resolve inside the sandbox, never to host content. maxBytes is a hard
+// cap.
+func (e *Executor) ReadJobFile(ctx context.Context, jobID, path string, maxBytes int64) ([]byte, error) {
+	b, ok := e.sessions.get(jobID)
+	if !ok {
+		return nil, fmt.Errorf("no live backend session for job %q", jobID)
+	}
+	return b.ReadFile(ctx, path, maxBytes)
 }
 
 func (e *Executor) prepare() {
@@ -103,6 +170,9 @@ func (e *Executor) prepare() {
 	}
 	if e.Masker == nil {
 		e.Masker = &secrets.Masker{}
+	}
+	if e.sessions == nil {
+		e.sessions = &sessionRegistry{}
 	}
 }
 
@@ -363,18 +433,27 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			e.log(cj.ID, "resources", line)
 		}
 	}
+	var closeJob func() error
 	if lifecycle, ok := backend.(JobLifecycle); ok {
 		if err := lifecycle.StartJob(ctx, workspace, func(line string) { e.log(cj.ID, "runtime", line) }); err != nil {
 			res.Status = model.StatusFailure
 			res.Error = err.Error()
 			return finish(res)
 		}
-		defer func() {
-			if err := lifecycle.CloseJob(); err != nil {
+		closeJob = lifecycle.CloseJob
+	}
+	// Register the live backend session so job-scoped reads (generate.path)
+	// resolve through the execution boundary. The session stays registered
+	// until the backend is closed.
+	e.sessions.put(cj.ID, backend)
+	defer func() {
+		if closeJob != nil {
+			if err := closeJob(); err != nil {
 				e.log(cj.ID, "runtime", "cleanup warning: "+err.Error())
 			}
-		}()
-	}
+		}
+		e.sessions.delete(cj.ID)
+	}()
 	stepOutputs := map[string]map[string]string{}
 	// currentStatus drives step condition evaluation. A hard step failure
 	// does NOT abort the job: later steps whose conditions explicitly allow
@@ -571,6 +650,32 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		res.Error = fmt.Sprintf("step %q not found in job", e.Opt.OnlyStep)
 		return finish(res)
 	}
+	// generate.path handling runs while the backend session is alive (the
+	// session is closed only by the deferred cleanup above). The fragment is
+	// read through the backend with a hard cap, never host-side by name: a
+	// fragment that cannot be safely read fails the job with a clear error.
+	if currentStatus == model.StatusSuccess && strings.TrimSpace(cj.Job.Generate.Path) != "" {
+		genPath := strings.TrimSpace(cj.Job.Generate.Path)
+		clean := filepath.Clean(genPath)
+		if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+			genErr := fmt.Errorf("generate.path %q escapes the workspace", genPath)
+			e.log(cj.ID, "generate", genErr.Error())
+			currentStatus = model.StatusFailure
+			res.Error = genErr.Error()
+		} else {
+			data, gerr := e.ReadJobFile(ctx, cj.ID, filepath.Join(workspace, clean), maxGeneratedFragmentBytes)
+			if gerr != nil {
+				genErr := fmt.Errorf("generate.path %q: %w", genPath, gerr)
+				e.log(cj.ID, "generate", genErr.Error())
+				currentStatus = model.StatusFailure
+				res.Error = genErr.Error()
+			} else if e.Opt.GenerateUpload != nil {
+				if uerr := e.Opt.GenerateUpload(cj.ID, genPath, data); uerr != nil {
+					e.log(cj.ID, "generate", "fragment upload failed: "+uerr.Error())
+				}
+			}
+		}
+	}
 	if currentStatus == model.StatusSuccess {
 		for _, c := range cj.Job.Cache {
 			key, er := e.Opt.Cache.Key(e.cacheBase(c.Key)+"|"+runtime.GOOS+"|"+runtime.GOARCH+"|"+cj.Job.Runtime, workspace, c.HashFiles)
@@ -644,6 +749,11 @@ func defaultCondition(cond string) string {
 // a fresh context with this budget because the job's own execution context
 // is already dead.
 const cleanupTimeout = 60 * time.Second
+
+// maxGeneratedFragmentBytes is the hard cap for one generated graph
+// fragment read through the execution backend (mirrors the control plane's
+// upload bound).
+const maxGeneratedFragmentBytes = 256 << 10
 
 func (e *Executor) saveArtifacts(_ *pipeline.Spec, cj pipeline.CompiledJob, workspace string, status model.Status) {
 	for _, a := range cj.Job.Artifacts {

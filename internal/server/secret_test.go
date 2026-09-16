@@ -256,13 +256,13 @@ func TestEnqueueDeclaredSecrets(t *testing.T) {
 	run, err := s.enqueue(SubmitRun{
 		RepoURL: "https://github.com/kiwi/repo.git", Ref: "main",
 		Pipeline: `version: 1
-secrets: [global-a, global-b, global-a]
+secrets: [global_a, global_b, global_a]
 jobs:
   build:
     steps:
-      - secrets: [step-x, global-a]
+      - secrets: [step_x, global_a]
         run: echo hi
-      - secrets: [step-y, step-x]
+      - secrets: [step_y, step_x]
         run: echo bye
 `,
 		Trusted: true,
@@ -278,7 +278,7 @@ jobs:
 			got = j.DeclaredSecrets
 		}
 	}
-	want := []string{"global-a", "global-b", "step-x", "step-y"}
+	want := []string{"global_a", "global_b", "step_x", "step_y"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("DeclaredSecrets = %v, want %v", got, want)
 	}

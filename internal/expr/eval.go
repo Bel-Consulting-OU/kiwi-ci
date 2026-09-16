@@ -4,12 +4,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/safefs"
 )
 
 // hashFiles hashing bounds: a total content budget (streamed, error on
@@ -213,15 +215,12 @@ func hashFilesFunc(c Context, args []Expr) (string, error) {
 	if strings.TrimSpace(c.Workspace) == "" {
 		return "", fmt.Errorf("hashFiles: workspace is not set")
 	}
-	workspace, err := filepath.Abs(c.Workspace)
+	root, err := safefs.OpenWorkspaceRoot(c.Workspace)
 	if err != nil {
 		return "", fmt.Errorf("hashFiles: workspace %q: %w", c.Workspace, err)
 	}
-	workspace, err = filepath.EvalSymlinks(workspace)
-	if err != nil {
-		return "", fmt.Errorf("hashFiles: workspace %q: %w", c.Workspace, err)
-	}
-	workspace = filepath.Clean(workspace)
+	defer root.Close()
+	workspace := root.Canonical
 	var globs []string
 	for _, a := range args {
 		v, err := a.Eval(c)
@@ -265,19 +264,18 @@ func hashFilesFunc(c Context, args []Expr) (string, error) {
 	h := sha256.New()
 	remaining := int64(hashFilesMaxBytes)
 	for _, f := range files {
-		resolved, err := filepath.EvalSymlinks(f)
-		if err != nil {
-			return "", fmt.Errorf("hashFiles: %w", err)
-		}
-		rel, err := filepath.Rel(workspace, resolved)
+		rel, err := filepath.Rel(workspace, f)
 		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			return "", fmt.Errorf("hashFiles: match %q escapes the workspace", f)
 		}
-		io.WriteString(h, rel)
-		fh, err := os.Open(f)
+		fh, err := root.OpenRel(filepath.ToSlash(rel))
 		if err != nil {
+			if errors.Is(err, safefs.ErrSymlinkParent) || errors.Is(err, safefs.ErrNotRegular) {
+				return "", fmt.Errorf("hashFiles: match %q escapes the workspace", f)
+			}
 			return "", fmt.Errorf("hashFiles: %w", err)
 		}
+		io.WriteString(h, rel)
 		n, err := io.Copy(h, io.LimitReader(fh, remaining+1))
 		fh.Close()
 		if err != nil {

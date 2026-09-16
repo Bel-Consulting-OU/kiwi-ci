@@ -37,19 +37,21 @@ var (
 )
 
 // ResourceCapabilities documents, per runtime, which resource requests the
-// backend can enforce. container enforces all four; tart enforces cpu,
-// memory and disk but not pid limits (admission rejects tart jobs that
-// declare pids); the native runtime (and any unknown runtime) accepts all
-// declarations as advisory — enforcement there is host-side, not
-// container-isolated.
+// backend can actually enforce. The container backend enforces cpu, memory
+// and pid limits (its disk request is advisory and produces no cgroup/docker
+// limit); the tart backend enforces cpu and memory (disk is advisory and
+// pid limits are unsupported); the native runtime (and any unknown runtime)
+// is not container-isolated at all, so every declaration there is advisory
+// and admission rejects it. validateResources uses this map to refuse
+// declarations a backend cannot honor instead of silently accepting no-ops.
 func ResourceCapabilities(runtime string) (cpu, memory, disk, pids bool) {
 	switch runtime {
 	case "container":
-		return true, true, true, true
+		return true, true, false, true
 	case "tart":
-		return true, true, true, false
+		return true, true, false, false
 	default:
-		return true, true, true, true
+		return false, false, false, false
 	}
 }
 
@@ -312,9 +314,12 @@ func validateCompiledStep(jobWhere, phase string, idx int, st *Step, seenIDs map
 
 // validateResources enforces the resource request ranges and the backend
 // capability admission for the given runtime: negative or NaN values are
-// rejected, requests beyond the hard ceilings are rejected, and a tart job
-// declaring pids is rejected because the tart backend does not honor pid
-// limits (documented by ResourceCapabilities).
+// rejected, requests beyond the hard ceilings are rejected, and
+// declarations a backend cannot honor are rejected outright — the native
+// runtime accepts no resource request at all (host-side, not
+// container-isolated), tart rejects disk and pid requests, and container
+// accepts all four (cpu/memory/pids enforced; its disk request stays
+// advisory, matching ResourceCapabilities).
 func validateResources(where, runtime string, r Resources) error {
 	if math.IsNaN(r.CPU) || math.IsInf(r.CPU, 0) {
 		return fmt.Errorf("%s resources.cpu must be a finite number", where)
@@ -343,8 +348,16 @@ func validateResources(where, runtime string, r Resources) error {
 	if r.PIDs > maxPIDsRequest {
 		return fmt.Errorf("%s resources.pids %d exceeds the limit of %d", where, r.PIDs, maxPIDsRequest)
 	}
-	if r.PIDs > 0 && runtime == "tart" {
-		if _, _, _, pidsOK := ResourceCapabilities(runtime); !pidsOK {
+	switch {
+	case runtime == "" || runtime == "native":
+		if r.CPU > 0 || r.Memory > 0 || r.Disk > 0 || r.PIDs > 0 {
+			return fmt.Errorf("%s: native backend does not enforce resource requests", where)
+		}
+	case runtime == "tart":
+		if r.Disk > 0 {
+			return fmt.Errorf("%s: tart backend does not honor disk limits", where)
+		}
+		if r.PIDs > 0 {
 			return fmt.Errorf("%s: tart backend does not honor pid limits", where)
 		}
 	}

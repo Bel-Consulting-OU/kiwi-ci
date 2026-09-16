@@ -19,12 +19,12 @@ func mustParse(t *testing.T, y string) *pipeline.Spec {
 
 func TestTrustedAdmissionAllowsNativeSecretsAndIDToken(t *testing.T) {
 	s := mustParse(t, `version: 1
-secrets: [deploy-key]
+secrets: [deploy_key]
 jobs:
   x:
     steps:
       - run: echo hi
-        secrets: [deploy-key]
+        secrets: [deploy_key]
   y:
     runtime: container
     image: alpine

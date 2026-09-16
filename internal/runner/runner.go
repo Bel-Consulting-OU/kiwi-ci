@@ -46,9 +46,6 @@ const (
 	gcInterval = time.Hour
 	// gcOlderThan is the executor.GC staleness window.
 	gcOlderThan = 24 * time.Hour
-	// maxGeneratedFragmentBytes mirrors the control plane's upload bound
-	// for one generated graph fragment (POST /api/v1/jobs/{id}/generated).
-	maxGeneratedFragmentBytes = 256 << 10
 )
 
 // ErrRunnerDisabledOrRevoked reports that the control plane has disabled
@@ -496,23 +493,24 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// Step durations come from the executor's wall-clock step measurements
 	// (StepReporter), never from sink-derived log timing.
 	applyStepReporter(&opts, r.Metrics)
-	ex := executor.Executor{Opt: opts, Masker: masker}
-	res := ex.RunCompiledJob(ctx, spec, cj)
 	// P2-30 generate wiring: a successful job whose effective compiled job
 	// declares generate.path produced a downstream child-graph fragment in
-	// the workspace. It is located, parsed ({jobs, deps}), and POSTed to
-	// /api/v1/jobs/{id}/generated under the active lease. A non-2xx
-	// response (the control plane may reject per policy/caps/depth) does
-	// NOT change the job outcome: the failure is reported in logs and the
-	// completion proceeds — the rejected children then never exist, which
-	// is the enforced semantics.
-	if res.Status == model.StatusSuccess && cj.Job.Generate.Path != "" {
-		if err := r.uploadGeneratedFragment(parent, t, tmp, cj.Job.Generate.Path); err != nil {
-			sink.WriteLine(cj.ID, "generate", "fragment upload failed: "+err.Error())
-		} else {
-			sink.WriteLine(cj.ID, "generate", "generated fragment uploaded from "+cj.Job.Generate.Path)
+	// the workspace. The executor reads it through the job's live backend
+	// session (no-follow on native, docker exec on container, ssh on tart)
+	// with a hard 256 KiB cap and hands it to this hook for upload under the
+	// active lease. A fragment that cannot be safely read fails the job in
+	// the executor; a non-2xx upload response (the control plane may reject
+	// per policy/caps/depth) does NOT change the job outcome — the failure
+	// is reported in logs and the completion proceeds.
+	opts.GenerateUpload = func(jobID, path string, data []byte) error {
+		if err := r.uploadGeneratedFragmentData(parent, t, path, data); err != nil {
+			return err
 		}
+		sink.WriteLine(jobID, "generate", "generated fragment uploaded from "+path)
+		return nil
 	}
+	ex := executor.Executor{Opt: opts, Masker: masker}
+	res := ex.RunCompiledJob(ctx, spec, cj)
 	if len(cj.Job.TestReports) > 0 {
 		report, er := testintel.Aggregate(tmp, cj.Job.TestReports)
 		if er != nil {
@@ -992,28 +990,17 @@ type generatedFragment struct {
 	Deps map[string][]string     `json:"deps"`
 }
 
-// uploadGeneratedFragment reads the generator's fragment file from the job
-// workspace (bounded read), parses {jobs, deps}, and POSTs it to
-// /api/v1/jobs/{id}/generated under the active lease. A non-2xx response is
-// returned as an error: the caller reports it as a non-fatal failure and
-// the job completion proceeds — the server may reject the fragment per
-// policy, in which case the run's children never exist.
-func (r *Runner) uploadGeneratedFragment(ctx context.Context, t server.Task, workspace, path string) error {
+// uploadGeneratedFragmentData parses the generator's fragment (already read
+// through the job's live backend session by the executor, bounded and
+// no-follow) and POSTs it to /api/v1/jobs/{id}/generated under the active
+// lease. A non-2xx response is returned as an error: the caller reports it
+// as a non-fatal failure and the job completion proceeds — the server may
+// reject the fragment per policy, in which case the run's children never
+// exist.
+func (r *Runner) uploadGeneratedFragmentData(ctx context.Context, t server.Task, path string, data []byte) error {
 	clean := filepath.Clean(path)
 	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) || filepath.IsAbs(clean) {
 		return fmt.Errorf("generate.path %q escapes the workspace", path)
-	}
-	f, err := os.Open(filepath.Join(workspace, clean))
-	if err != nil {
-		return fmt.Errorf("open generated fragment %q: %w", path, err)
-	}
-	data, err := io.ReadAll(io.LimitReader(f, maxGeneratedFragmentBytes+1))
-	_ = f.Close()
-	if err != nil {
-		return fmt.Errorf("read generated fragment %q: %w", path, err)
-	}
-	if len(data) > maxGeneratedFragmentBytes {
-		return fmt.Errorf("generated fragment %q exceeds %d bytes", path, maxGeneratedFragmentBytes)
 	}
 	var frag generatedFragment
 	if err := json.Unmarshal(data, &frag); err != nil {

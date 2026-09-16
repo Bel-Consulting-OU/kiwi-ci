@@ -30,12 +30,17 @@ func Default() *Store {
 // containing the archive digest and per-entry digests. Symlinks and special
 // files are never captured, capture roots that resolve outside the workspace
 // are rejected, and the archive output is hard-capped at MaxArtifactBytes.
+// Every workspace read goes through a held safefs.WorkspaceRoot: files are
+// opened relative to the root handle (no-follow) and hashed from the
+// returned descriptors, never re-opened by name, so a file swapped for a
+// symlink mid-capture can never exfiltrate host content.
 func (s *Store) Save(runID, jobID, name, workspace string, paths []string) (string, error) {
-	wsRoot, err := filepath.EvalSymlinks(workspace)
+	wsRoot, err := safefs.OpenWorkspaceRoot(workspace)
 	if err != nil {
-		return "", fmt.Errorf("artifact: resolve workspace: %w", err)
+		return "", fmt.Errorf("artifact: open workspace root: %w", err)
 	}
-	if err := verifyCaptureRoots(wsRoot, paths); err != nil {
+	defer wsRoot.Close()
+	if err := verifyCaptureRoots(wsRoot.Canonical, paths); err != nil {
 		return "", err
 	}
 	dir := filepath.Join(s.Root, encodeArtifactName(runID), encodeArtifactName(jobID))
@@ -60,7 +65,7 @@ func (s *Store) Save(runID, jobID, name, workspace string, paths []string) (stri
 	if s.MaxArtifactBytes > 0 {
 		w = safefs.NewCappedWriter(f, s.MaxArtifactBytes)
 	}
-	if err := safefs.WriteTarGz(w, wsRoot, paths, false); err != nil {
+	if err := safefs.WriteTarGzFromRoot(w, wsRoot, paths); err != nil {
 		f.Close()
 		_ = os.Remove(dst + ".tmp")
 		return "", err
@@ -145,16 +150,25 @@ func encodeArtifactName(s string) string {
 	return base64.RawURLEncoding.EncodeToString([]byte(s))
 }
 
-func collectEntries(workspace string, paths []string) ([]ArtifactEntry, error) {
-	root, err := filepath.Abs(workspace)
-	if err != nil {
-		return nil, err
-	}
+// collectEntries walks the requested capture paths beneath the held
+// workspace root and records every regular file, hashing each one from the
+// descriptor returned by OpenRel (no-follow, anchored to the root handle).
+// Symlinked capture roots and nested symlinks are never captured; a file
+// swapped for a symlink between enumeration and open fails the collection
+// instead of following the link.
+func collectEntries(root *safefs.WorkspaceRoot, paths []string) ([]ArtifactEntry, error) {
 	var out []ArtifactEntry
 	for _, p := range paths {
-		abs := root
-		if p != "" && p != "." {
-			abs = filepath.Join(root, p)
+		rel := p
+		if rel == "" || rel == "." {
+			rel = ""
+		}
+		if rel != "" {
+			rel = filepath.ToSlash(rel)
+		}
+		abs := root.Canonical
+		if rel != "" {
+			abs = filepath.Join(root.Canonical, filepath.FromSlash(rel))
 		}
 		fi, err := os.Lstat(abs)
 		if err != nil {
@@ -163,54 +177,50 @@ func collectEntries(workspace string, paths []string) ([]ArtifactEntry, error) {
 			}
 			return nil, err
 		}
-		err = walkEntries(root, abs, fi, &out)
+		if fi.Mode()&os.ModeSymlink != 0 {
+			// Symlinked capture roots are never followed or archived.
+			continue
+		}
+		err = filepath.WalkDir(abs, func(p string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.Type()&os.ModeSymlink != 0 {
+				return nil
+			}
+			if d.IsDir() {
+				return nil
+			}
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			if !info.Mode().IsRegular() {
+				return nil
+			}
+			r, err := filepath.Rel(root.Canonical, p)
+			if err != nil || r == ".." || strings.HasPrefix(r, ".."+string(filepath.Separator)) {
+				return fmt.Errorf("artifact: path escapes workspace: %q", p)
+			}
+			f, err := root.OpenRel(filepath.ToSlash(r))
+			if err != nil {
+				return err
+			}
+			h := sha256.New()
+			size, cpErr := io.Copy(h, f)
+			f.Close()
+			if cpErr != nil {
+				return cpErr
+			}
+			out = append(out, ArtifactEntry{Path: filepath.ToSlash(r), Mode: uint32(info.Mode().Perm()), Size: size, SHA256: hex.EncodeToString(h.Sum(nil))})
+			return nil
+		})
 		if err != nil {
 			return nil, err
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out, nil
-}
-
-func walkEntries(root, abs string, fi os.FileInfo, out *[]ArtifactEntry) error {
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return nil
-	}
-	if fi.Mode().IsRegular() {
-		rel, err := filepath.Rel(root, abs)
-		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("artifact: path escapes workspace: %q", abs)
-		}
-		h := sha256.New()
-		f, err := os.Open(abs)
-		if err != nil {
-			return err
-		}
-		size, cpErr := io.Copy(h, f)
-		f.Close()
-		if cpErr != nil {
-			return cpErr
-		}
-		*out = append(*out, ArtifactEntry{Path: filepath.ToSlash(rel), Mode: uint32(fi.Mode().Perm()), Size: size, SHA256: hex.EncodeToString(h.Sum(nil))})
-		return nil
-	}
-	if !fi.IsDir() {
-		return nil
-	}
-	ents, err := os.ReadDir(abs)
-	if err != nil {
-		return err
-	}
-	for _, e := range ents {
-		info, err := e.Info()
-		if err != nil {
-			return err
-		}
-		if err := walkEntries(root, filepath.Join(abs, e.Name()), info, out); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // Extract restores a tar.gz artifact under dest using the hardened safefs

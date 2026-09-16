@@ -8,6 +8,8 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
+func boolPtr(b bool) *bool { return &b }
+
 func push() forge.EventContext {
 	return forge.EventContext{
 		Forge: "github",
@@ -74,12 +76,36 @@ func TestMatchesEventAndActionKeys(t *testing.T) {
 }
 
 func TestMatchesDraft(t *testing.T) {
+	base := func() forge.EventContext {
+		ec := push()
+		ec.Event = "pull_request"
+		ec.BaseRef = "refs/heads/main"
+		return ec
+	}
+	// Draft nil: drafts are admitted for matched events.
 	triggers := map[string]pipeline.Trigger{"pull_request": {}}
-	ec := push()
-	ec.Event = "pull_request"
+	ec := base()
 	ec.Draft = true
-	if ok, _ := Matches(triggers, ec); ok {
-		t.Fatal("draft PR matched")
+	if ok, _ := Matches(triggers, ec); !ok {
+		t.Fatal("draft PR must match when Draft is unset")
+	}
+	// Draft false: drafts rejected.
+	noDrafts := map[string]pipeline.Trigger{"pull_request": {Draft: boolPtr(false)}}
+	if ok, _ := Matches(noDrafts, ec); ok {
+		t.Fatal("draft PR matched a Draft=false trigger")
+	}
+	ec.Draft = false
+	if ok, _ := Matches(noDrafts, ec); !ok {
+		t.Fatal("non-draft PR must match a Draft=false trigger")
+	}
+	// Draft true: only drafts.
+	onlyDrafts := map[string]pipeline.Trigger{"pull_request": {Draft: boolPtr(true)}}
+	if ok, _ := Matches(onlyDrafts, ec); ok {
+		t.Fatal("non-draft PR matched a Draft=true trigger")
+	}
+	ec.Draft = true
+	if ok, _ := Matches(onlyDrafts, ec); !ok {
+		t.Fatal("draft PR must match a Draft=true trigger")
 	}
 }
 

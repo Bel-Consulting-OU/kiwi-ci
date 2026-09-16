@@ -34,71 +34,14 @@ func (t TriggerSet) Matches(ec forge.EventContext) (bool, string) {
 // returns whether the event should enqueue a run and the trigger key that
 // matched ("" for the empty-section fallback). See the package comment for
 // the exact semantics.
+// Matches delegates to forge.MatchesTrigger: the forge package owns the
+// authoritative trigger semantics (PR/MR base-ref branch matching,
+// canonicalized action matching, draft true/false/nil handling, and path
+// filters), and this package must never re-implement them — earlier
+// duplication drifted and diverged. trigger imports forge for EventContext
+// and forge never imports trigger, so the dependency direction is clean.
 func Matches(triggers map[string]pipeline.Trigger, ec forge.EventContext) (bool, string) {
-	if len(triggers) == 0 {
-		return true, ""
-	}
-	key := ec.Event
-	if ec.Event == "merge_request" {
-		if _, ok := triggers["merge_request"]; !ok {
-			if _, ok := triggers["pull_request"]; ok {
-				key = "pull_request"
-			}
-		}
-	}
-	actionKey := ""
-	if ec.Action != "" {
-		actionKey = ec.Event + "." + ec.Action
-	}
-	matched := ""
-	var trg pipeline.Trigger
-	if _, ok := triggers[actionKey]; actionKey != "" && ok {
-		trg = triggers[actionKey]
-		matched = actionKey
-	} else if t, ok := triggers[key]; ok {
-		trg = t
-		matched = key
-	} else {
-		return false, ""
-	}
-	if ec.Draft {
-		return false, ""
-	}
-	tagRef := ec.Tag != "" || strings.HasPrefix(ec.Ref, "refs/tags/")
-	if tagRef {
-		name := ec.Tag
-		if name == "" {
-			name = strings.TrimPrefix(ec.Ref, "refs/tags/")
-		}
-		if len(trg.Tags) == 0 && len(trg.TagsIgnore) == 0 {
-			// No tag filters: tag refs only match triggers with no ref
-			// filters at all; branch filters never admit tags.
-			if len(trg.Branches) > 0 || len(trg.BranchesIgnore) > 0 {
-				return false, ""
-			}
-		} else {
-			if len(trg.Tags) > 0 && !matchRefPatterns(name, trg.Tags) {
-				return false, ""
-			}
-			if matchRefPatterns(name, trg.TagsIgnore) {
-				return false, ""
-			}
-		}
-	} else {
-		branch := strings.TrimPrefix(strings.TrimPrefix(ec.Ref, "refs/heads/"), "refs/")
-		if len(trg.Branches) > 0 && !matchRefPatterns(branch, trg.Branches) {
-			return false, ""
-		}
-		if matchRefPatterns(branch, trg.BranchesIgnore) {
-			return false, ""
-		}
-	}
-	if len(trg.Paths) > 0 || len(trg.PathsIgnore) > 0 {
-		if !pipeline.PathsMatch(ec.ChangedFiles, trg.Paths, trg.PathsIgnore) {
-			return false, ""
-		}
-	}
-	return true, matched
+	return forge.MatchesTrigger(triggers, ec)
 }
 
 func matchRefPatterns(name string, patterns []string) bool {

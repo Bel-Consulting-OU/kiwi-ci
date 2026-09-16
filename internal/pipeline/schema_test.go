@@ -3,6 +3,7 @@ package pipeline
 import (
 	"encoding/json"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -354,6 +355,84 @@ jobs:
 				t.Fatalf("parity disagreement: Go error = %v, schema errors = %v", goErr, schemaErrs)
 			}
 		})
+	}
+}
+
+// knownFieldStructs maps the structural known-field table entries to the
+// struct type whose yaml tags must cover them. Tables for free-form maps
+// (env, matrix, with, inputs of downstream) have no entry: their keys are
+// data, not fields.
+var knownFieldStructs = map[string]reflect.Type{
+	"":                                   reflect.TypeOf(Spec{}),
+	"defaults":                           reflect.TypeOf(Defaults{}),
+	"concurrency":                        reflect.TypeOf(Concurrency{}),
+	"permissions":                        reflect.TypeOf(Permissions{}),
+	"defaults.retry":                     reflect.TypeOf(Retry{}),
+	"on.*":                               reflect.TypeOf(Trigger{}),
+	"inputs.*":                           reflect.TypeOf(Input{}),
+	"packages.*":                         reflect.TypeOf(Package{}),
+	"components.*":                       reflect.TypeOf(ComponentUse{}),
+	"jobs.*":                             reflect.TypeOf(Job{}),
+	"jobs.*.retry":                       reflect.TypeOf(Retry{}),
+	"jobs.*.environment":                 reflect.TypeOf(Environment{}),
+	"jobs.*.sandbox":                     reflect.TypeOf(Sandbox{}),
+	"jobs.*.placement":                   reflect.TypeOf(Placement{}),
+	"jobs.*.resources":                   reflect.TypeOf(Resources{}),
+	"jobs.*.tests":                       reflect.TypeOf(TestConfig{}),
+	"jobs.*.generate":                    reflect.TypeOf(GenerateSpec{}),
+	"jobs.*.downstream":                  reflect.TypeOf(DownstreamSpec{}),
+	"jobs.*.snapshot":                    reflect.TypeOf(SnapshotSpec{}),
+	"jobs.*.deployment":                  reflect.TypeOf(DeploymentSpec{}),
+	"jobs.*.services.*":                  reflect.TypeOf(Service{}),
+	"jobs.*.steps.*":                     reflect.TypeOf(Step{}),
+	"jobs.*.steps.*.retry":               reflect.TypeOf(Retry{}),
+	"jobs.*.cache.*":                     reflect.TypeOf(Cache{}),
+	"jobs.*.artifacts.*":                 reflect.TypeOf(Artifact{}),
+	"jobs.*.artifacts.*.sigstore":        reflect.TypeOf(SigstoreConfig{}),
+	"jobs.*.downloads.*":                 reflect.TypeOf(ArtifactInput{}),
+	"jobs.*.deployment.canary.*":         reflect.TypeOf(Step{}),
+	"jobs.*.deployment.verify.*":         reflect.TypeOf(Step{}),
+	"jobs.*.deployment.rollback.*":       reflect.TypeOf(Step{}),
+	"jobs.*.deployment.canary.*.retry":   reflect.TypeOf(Retry{}),
+	"jobs.*.deployment.verify.*.retry":   reflect.TypeOf(Retry{}),
+	"jobs.*.deployment.rollback.*.retry": reflect.TypeOf(Retry{}),
+}
+
+func yamlFieldTags(t reflect.Type) map[string]bool {
+	tags := map[string]bool{}
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		tag, ok := f.Tag.Lookup("yaml")
+		if !ok {
+			continue
+		}
+		name := strings.Split(tag, ",")[0]
+		if name == "" || name == "-" {
+			continue
+		}
+		tags[name] = true
+	}
+	return tags
+}
+
+// TestKnownFieldTablesMatchStructTags asserts that every known-field key in
+// the structural tables maps to a real struct field (via its yaml tag), so a
+// field removed from pipeline.Job (or any section struct) fails CI instead
+// of silently drifting from the parser's admission table.
+func TestKnownFieldTablesMatchStructTags(t *testing.T) {
+	for path, table := range knownFieldTables {
+		typ, ok := knownFieldStructs[path]
+		if !ok {
+			// Free-form maps (env, matrix, with, downstream inputs) and
+			// cron entries are intentionally not field-checked.
+			continue
+		}
+		tags := yamlFieldTags(typ)
+		for key := range table {
+			if !tags[key] {
+				t.Errorf("known-field table %q lists %q, which is not a yaml field of %s", path, key, typ)
+			}
+		}
 	}
 }
 
