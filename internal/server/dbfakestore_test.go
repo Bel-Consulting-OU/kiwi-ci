@@ -1056,6 +1056,13 @@ func (f *dbFakeStore) SaveTestHistory(ctx context.Context, stats []byte) (int64,
 	return f.testHistoryVersion, nil
 }
 
+func (f *dbFakeStore) GetSchedule(ctx context.Context, id string) (storage.Schedule, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	sc, ok := f.schedules[id]
+	return sc, ok, nil
+}
+
 func (f *dbFakeStore) UpsertSchedule(ctx context.Context, sc storage.Schedule) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

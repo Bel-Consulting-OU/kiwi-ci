@@ -304,6 +304,12 @@ type Occurrence struct {
 type ScheduleStore interface {
 	UpsertSchedule(ctx context.Context, s Schedule) error
 	ListSchedules(ctx context.Context) ([]Schedule, error)
+	// GetSchedule re-reads the authoritative row. The scheduler calls it
+	// immediately before firing an occurrence, because a disablement,
+	// spec update, trust downgrade or identity change performed on another
+	// replica must take effect on the current leader without waiting for a
+	// full reload.
+	GetSchedule(ctx context.Context, id string) (Schedule, bool, error)
 	ClaimScheduleOccurrence(ctx context.Context, scheduleID string, nominal time.Time, runID string) (bool, error)
 	ListOccurrences(ctx context.Context, scheduleID string) ([]Occurrence, error)
 	// AdvanceScheduleLastRun moves the schedule's LastRun marker forward to

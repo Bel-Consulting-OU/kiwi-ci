@@ -4060,6 +4060,12 @@ func (s *Server) maintainDB(ctx context.Context, now time.Time) {
 		if err := s.Sched.RecoverExpired(ctx, now); err != nil {
 			s.logError("post-promotion recovery", "error", err.Error())
 		}
+		// The in-memory schedule mirror may be arbitrarily stale (writes
+		// landed on other replicas while this one was a standby): reload the
+		// authoritative rows before this leader can fire anything.
+		if err := s.reloadSchedulesFromStore(ctx); err != nil {
+			s.logError("post-promotion schedule reload", "error", err.Error())
+		}
 		return
 	}
 	if !s.Sched.IsLeader(ctx) {

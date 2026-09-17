@@ -227,3 +227,95 @@ func TestScheduleEndpoints(t *testing.T) {
 func timePtr(t time.Time) *time.Time { return &t }
 
 var _ = strings.TrimSpace
+
+// TestScheduleCrossReplicaDisableStopsLeader is the HA coherence regression:
+// replica A leads with a cached schedule, replica B disables it in the
+// durable store, and A's next tick must re-read the authoritative row and
+// skip the occurrence instead of firing its stale copy. Same for a spec
+// update: the leader must fire the UPDATED spec.
+func TestScheduleCrossReplicaDisableStopsLeader(t *testing.T) {
+	f := newDBFakeStore()
+	a := New("token")
+	if err := a.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	b := New("token")
+	if err := b.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	// Seed a schedule through replica B (durable store is shared).
+	sc := storage.Schedule{
+		ID: "s1", Repository: "acme/app", RepoID: "github.com/acme/app",
+		RepoURL: "https://github.com/acme/app.git", Forge: "github",
+		Enabled: true, Trusted: false,
+		Spec: "version: 1\non:\n  schedule:\n    cron: \"* * * * *\"\njobs:\n  j:\n    runtime: container\n    image: alpine\n    steps:\n      - run: echo hi\n",
+	}
+	if err := f.UpsertSchedule(context.Background(), sc); err != nil {
+		t.Fatal(err)
+	}
+	// Replica A's mirror knows the schedule (simulating an earlier tick).
+	a.mu.Lock()
+	a.schedules[sc.ID] = sc
+	a.mu.Unlock()
+
+	now := time.Now().UTC().Truncate(time.Minute).Add(30 * time.Second)
+	nominal := now
+
+	// B disables it durably. A still has the enabled copy cached.
+	sc.Enabled = false
+	if err := f.UpsertSchedule(context.Background(), sc); err != nil {
+		t.Fatal(err)
+	}
+	if _, fired, err := a.fireSchedule(context.Background(), a.schedules[sc.ID], nominal); err == nil || fired {
+		t.Fatalf("leader fired a disabled schedule: fired=%v err=%v", fired, err)
+	}
+	// The durable row is still disabled and no run was created.
+	if got := len(f.runs); got != 0 {
+		t.Fatalf("runs created = %d, want 0", got)
+	}
+}
+
+// TestSchedulePromotionReloadsAuthoritativeRows proves a freshly promoted
+// leader replaces its stale mirror with durable rows (and disables invalid
+// ones fail-closed) before it can fire anything.
+func TestSchedulePromotionReloadsAuthoritativeRows(t *testing.T) {
+	f := newDBFakeStore()
+	a := New("token")
+	if err := a.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	b := New("token")
+	if err := b.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	valid := storage.Schedule{
+		ID: "valid", Repository: "acme/app", RepoID: "github.com/acme/app",
+		RepoURL: "https://github.com/acme/app.git", Forge: "github", Enabled: true,
+		Spec: "version: 1\non:\n  schedule: \"* * * * *\"\njobs:\n  j:\n    runtime: container\n    image: alpine\n    steps:\n      - run: echo hi\n",
+	}
+	invalid := storage.Schedule{
+		ID: "invalid", Repository: "acme/other", RepoID: "github.com/acme/other",
+		RepoURL: "https://github.com/acme/app.git", Forge: "github", Enabled: true,
+		Spec: valid.Spec,
+	}
+	for _, sc := range []storage.Schedule{valid, invalid} {
+		if err := f.UpsertSchedule(context.Background(), sc); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Standby mirror is empty/stale; promotion reload must populate it and
+	// disable the inconsistent row.
+	if err := a.reloadSchedulesFromStore(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	a.mu.Lock()
+	_, hasValid := a.schedules["valid"]
+	inv, hasInvalid := a.schedules["invalid"]
+	a.mu.Unlock()
+	if !hasValid {
+		t.Fatal("reload did not pick up the authoritative schedule")
+	}
+	if hasInvalid && inv.Enabled {
+		t.Fatal("inconsistent schedule must be disabled at reload")
+	}
+}

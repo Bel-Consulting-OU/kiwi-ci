@@ -282,6 +282,36 @@ func sanitizeScheduleSpec(specText string) string {
 	return string(out)
 }
 
+// reloadSchedulesFromStore replaces the in-memory schedule mirror with the
+// authoritative durable rows, validating every one (invalid rows are
+// disabled fail-closed, never grandfathered). Called on leadership
+// promotion so a freshly promoted leader can never fire a stale copy.
+func (s *Server) reloadSchedulesFromStore(ctx context.Context) error {
+	ss, ok := s.scheduleStoreDB()
+	if !ok {
+		return nil
+	}
+	list, err := ss.ListSchedules(ctx)
+	if err != nil {
+		return err
+	}
+	kept, disabled := validateLoadedSchedules(list)
+	for _, d := range disabled {
+		s.auditLocked("schedule.invalid_disabled", "scheduler", "", "", "schedule disabled at reload: stored identity is inconsistent",
+			map[string]string{"schedule": d.Schedule.ID, "reason": d.Reason})
+		if err := ss.UpsertSchedule(ctx, d.Schedule); err != nil {
+			s.logError("schedule disable persist failed", "schedule", d.Schedule.ID, "error", err.Error())
+		}
+	}
+	s.mu.Lock()
+	s.schedules = map[string]storage.Schedule{}
+	for _, sc := range kept {
+		s.schedules[sc.ID] = sc
+	}
+	s.mu.Unlock()
+	return nil
+}
+
 // scheduleStore reports whether the server has a durable schedule store
 // (SQL in DB mode, the in-memory+file store otherwise).
 func (s *Server) scheduleStoreDB() (storage.ScheduleStore, bool) {
@@ -645,6 +675,15 @@ func (s *Server) fireDueSchedules(ctx context.Context, now time.Time) {
 	}
 	for _, d := range dues {
 		if _, fired, err := s.fireSchedule(ctx, d.sc, d.nominal); err != nil {
+			if errors.Is(err, errScheduleDisabled) || errors.Is(err, errScheduleGone) {
+				// The durable row changed on another replica: skip this
+				// occurrence (already audited) and advance durably so the
+				// leader does not spin on a schedule it should not run.
+				if aerr := s.advanceSchedulePast(ctx, d.sc, d.nominal); aerr != nil {
+					s.logError("schedule advance failed", "schedule", d.sc.ID, "error", aerr.Error())
+				}
+				continue
+			}
 			if errors.Is(err, errScheduleUnauthorized) {
 				// Trust revoked: skip this occurrence (already audited) and
 				// advance durably, so the schedule does not spin retrying
@@ -669,6 +708,15 @@ func (s *Server) fireDueSchedules(ctx context.Context, now time.Time) {
 		}
 	}
 }
+
+// errScheduleDisabled marks an occurrence whose schedule was disabled on
+// another replica and re-read as disabled by the leader: the caller advances
+// past the nominal without firing.
+var errScheduleDisabled = errors.New("schedule disabled")
+
+// errScheduleGone marks an occurrence whose schedule row was deleted on
+// another replica.
+var errScheduleGone = errors.New("schedule deleted")
 
 // errScheduleUnauthorized marks a trusted occurrence whose creator lost the
 // trusted_run grant: the caller advances the schedule past the nominal so it
@@ -811,6 +859,29 @@ func (s *Server) nextDueScheduleFrom(now time.Time, seen map[string]bool) (stora
 // schedule's STORED immutable identity (RepoID, RepoURL, Trusted) — never
 // the caller's request context.
 func (s *Server) fireSchedule(ctx context.Context, sc storage.Schedule, nominal time.Time) (model.Run, bool, error) {
+	// The leader re-reads the AUTHORITATIVE row immediately before firing:
+	// a disablement, spec update, trust downgrade or identity change
+	// performed on another replica must take effect here without waiting
+	// for a full reload. A row that disappeared or is disabled is skipped
+	// (the caller advances past the nominal); a read error fails the fire
+	// and leaves the occurrence for the next tick.
+	if ss, ok := s.scheduleStoreDB(); ok {
+		durable, found, err := ss.GetSchedule(ctx, sc.ID)
+		if err != nil {
+			return model.Run{}, false, fmt.Errorf("reload schedule %s before firing: %w", sc.ID, err)
+		}
+		if !found {
+			s.auditLocked("schedule.missing", "scheduler", "", "", "schedule was deleted on another replica; occurrence skipped",
+				map[string]string{"schedule": sc.ID})
+			return model.Run{}, false, errScheduleGone
+		}
+		if !durable.Enabled {
+			s.auditLocked("schedule.disabled", "scheduler", "", "", "schedule was disabled on another replica; occurrence skipped",
+				map[string]string{"schedule": sc.ID})
+			return model.Run{}, false, errScheduleDisabled
+		}
+		sc = durable
+	}
 	// Fail closed on an inconsistent stored identity, even when the row was
 	// injected directly instead of passing the load-time validation: a
 	// schedule whose Repository/RepoURL/RepoID disagree never fires. The

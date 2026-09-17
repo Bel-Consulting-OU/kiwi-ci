@@ -1558,6 +1558,21 @@ func (f *FaultyStore) AcquireDigestFence(ctx context.Context, digest string) (fu
 	return inner.AcquireDigestFence(ctx, digest)
 }
 
+func (f *FaultyStore) GetSchedule(ctx context.Context, id string) (Schedule, bool, error) {
+	inner, ok := f.Inner.(ScheduleStore)
+	if !ok {
+		return Schedule{}, false, fmt.Errorf("storage: inner store does not implement ScheduleStore")
+	}
+	return inner.GetSchedule(ctx, id)
+}
+
+func (m *memStore) GetSchedule(ctx context.Context, id string) (Schedule, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sc, ok := m.schedules[id]
+	return sc, ok, nil
+}
+
 func (m *memStore) AdvanceScheduleLastRun(ctx context.Context, id string, nominal time.Time) error {
 	if id == "" {
 		return fmt.Errorf("storage: empty schedule id")

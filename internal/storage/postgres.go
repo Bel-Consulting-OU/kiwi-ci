@@ -2731,6 +2731,20 @@ func (s *PostgresStore) UpsertSchedule(ctx context.Context, sc Schedule) error {
 	return err
 }
 
+// GetSchedule reads one authoritative schedule row by ID.
+func (s *PostgresStore) GetSchedule(ctx context.Context, id string) (Schedule, bool, error) {
+	var sc Schedule
+	err := s.pool.QueryRow(ctx, `SELECT id, repository, COALESCE(repo_id, ''), COALESCE(repo_url, ''), COALESCE(forge, ''), trusted, spec, enabled, last_run, created_at, COALESCE(created_by, '') FROM schedules WHERE id=$1`, id).
+		Scan(&sc.ID, &sc.Repository, &sc.RepoID, &sc.RepoURL, &sc.Forge, &sc.Trusted, &sc.Spec, &sc.Enabled, &sc.LastRun, &sc.CreatedAt, &sc.CreatedBy)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Schedule{}, false, nil
+		}
+		return Schedule{}, false, err
+	}
+	return sc, true, nil
+}
+
 func (s *PostgresStore) ListSchedules(ctx context.Context) ([]Schedule, error) {
 	rows, err := s.pool.Query(ctx, `SELECT id, repository, COALESCE(repo_id, ''), COALESCE(repo_url, ''), COALESCE(forge, ''), trusted, spec, enabled, last_run, created_at, COALESCE(created_by, '') FROM schedules ORDER BY created_at ASC, id ASC`)
 	if err != nil {
