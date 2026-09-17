@@ -12,14 +12,31 @@ type SubmitRun struct {
 	RepoFullName string `json:"repo_full_name,omitempty"`
 	// RepoID is the canonical repository identity. It is never accepted
 	// from client JSON: direct API submissions derive it at ingress from
-	// repo_url + repo_full_name, while internal ingresses (webhook
-	// handlers, schedules, downstream children, reruns) set the derived or
-	// persisted identity here.
-	RepoID   string `json:"-"`
-	Ref      string `json:"ref"`
-	SHA      string `json:"sha,omitempty"`
-	Event    string `json:"event,omitempty"`
-	Pipeline string `json:"pipeline"`
+	// repo_url (with repo_full_name REQUIRED to match that URL's repository
+	// path), while internal ingresses (webhook handlers, schedules,
+	// downstream children, reruns) set the derived or persisted identity
+	// here.
+	RepoID string `json:"-"`
+	// PolicyRepoID is the canonical identity every authorization decision
+	// uses: the BASE repository for a fork PR (RepoID is kept for
+	// compatibility). Internal ingresses set it; it is never accepted from
+	// client JSON.
+	PolicyRepoID string `json:"-"`
+	// CheckoutRepoURL is the clone URL the run's jobs check out (the fork
+	// head URL for cross-repo PRs). Internal ingresses set it; it is never
+	// accepted from client JSON.
+	CheckoutRepoURL string `json:"-"`
+	// identityBound marks a submission whose identity was resolved
+	// server-side at an internal ingress (webhook, schedule, downstream
+	// dispatch, rerun). Such submissions skip the direct-submission
+	// repo_url/repo_full_name binding check, because a fork PR's base full
+	// name legitimately differs from its head clone URL. It is never
+	// accepted from client JSON.
+	identityBound bool   `json:"-"`
+	Ref           string `json:"ref"`
+	SHA           string `json:"sha,omitempty"`
+	Event         string `json:"event,omitempty"`
+	Pipeline      string `json:"pipeline"`
 	// Trusted is deliberately never accepted from client JSON: direct API
 	// submissions are untrusted. Only forge webhook handlers and internal
 	// reruns (which copy the previous run's trust) set it in Go code.

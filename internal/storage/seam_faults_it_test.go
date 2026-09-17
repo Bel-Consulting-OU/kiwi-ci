@@ -130,7 +130,7 @@ func TestPostgresIntegrationStatementFaults(t *testing.T) {
 		pgITSeedRunner(t, st, runnerID, 1, 0, 0)
 		pgITDropExpressionIndexes(t, st, "jobs", "payload")
 		pgITBreakColumnToArray(t, st, "jobs", "payload")
-		if _, err := st.AcquireLeaseAtomic(ctx, LeaseClaim{JobID: jobID, RunnerID: runnerID, RepoURL: pgITRepo, Environment: "prod", EnvironmentConcurrency: 1}); err == nil {
+		if _, err := st.AcquireLeaseAtomic(ctx, LeaseClaim{JobID: jobID, RunnerID: runnerID, CanonRepoID: pgITRepoID, Environment: "prod", EnvironmentConcurrency: 1}); err == nil {
 			t.Fatal("env-count with a mistyped payload succeeded")
 		}
 	})

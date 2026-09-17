@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secrets"
 )
@@ -48,17 +47,12 @@ func secretDeliveryAAD(runnerID, jobID string, generation int64, name string) []
 	return []byte(remoteSecretAADPrefix + runnerID + "\x00" + jobID + "\x00" + strconv.FormatInt(generation, 10) + "\x00" + name)
 }
 
-// client returns a redirect-refusing copy of the configured HTTP client.
-// Credential-bearing secret traffic must never follow redirects to a
-// different origin; a redirect response is surfaced as an error instead.
+// client returns a hardened copy of the configured HTTP client: bounded
+// total timeout, hardened transport and redirect refusal. Credential-bearing
+// secret traffic must never follow redirects to a different origin; a
+// redirect response is surfaced as an error instead.
 func (p *RemoteProvider) client() *http.Client {
-	base := p.Client
-	if base == nil {
-		base = &http.Client{Timeout: 30 * time.Second}
-	}
-	c := *base
-	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	return &c
+	return providerClient(p.Client)
 }
 
 // Get implements secrets.Provider: it requests one declared secret under

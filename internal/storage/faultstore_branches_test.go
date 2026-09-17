@@ -128,15 +128,15 @@ func TestMemStoreEnqueueCancelAndFaultBranches(t *testing.T) {
 	if got.Status != model.StatusCancelled {
 		t.Fatalf("queued job not cancelled: %+v", got)
 	}
-	// The supersede resolver ignores an empty repo or group.
-	if ids := m.supersededJobIDsLocked(&SupersedePolicy{Repo: "", ConcurrencyGroup: "g"}, memRunID); ids != nil {
+	// The supersede resolver ignores an empty canonical repo id or group.
+	if ids := m.supersededJobIDsLocked(&SupersedePolicy{RepoID: "", ConcurrencyGroup: "g"}, memRunID); ids != nil {
 		t.Fatalf("empty repo supersede = %v", ids)
 	}
-	if ids := m.supersededJobIDsLocked(&SupersedePolicy{Repo: "r", ConcurrencyGroup: ""}, memRunID); ids != nil {
+	if ids := m.supersededJobIDsLocked(&SupersedePolicy{RepoID: "r", ConcurrencyGroup: ""}, memRunID); ids != nil {
 		t.Fatalf("empty group supersede = %v", ids)
 	}
 	// A supersede policy with no matching runs yields nothing.
-	if ids := m.supersededJobIDsLocked(&SupersedePolicy{Repo: "github.com/o/r", ConcurrencyGroup: "deploy"}, memRunID); len(ids) != 0 {
+	if ids := m.supersededJobIDsLocked(&SupersedePolicy{RepoID: "github.com/o/r", ConcurrencyGroup: "deploy"}, memRunID); len(ids) != 0 {
 		t.Fatalf("unmatched supersede = %v", ids)
 	}
 

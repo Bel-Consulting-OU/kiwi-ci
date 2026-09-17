@@ -218,7 +218,7 @@ func TestFlowSchedulesDBListOrdering(t *testing.T) {
 }
 
 func TestFlowSchedulesFirePersistFailures(t *testing.T) {
-	// DB upsert failure after a successful enqueue only logs.
+	// DB durable-advance failure after a successful enqueue only logs.
 	f := newDBFakeStore()
 	s := New("token")
 	if err := s.SwitchToDB(f); err != nil {
@@ -231,9 +231,11 @@ func TestFlowSchedulesFirePersistFailures(t *testing.T) {
 	if err := s.reloadSchedulesDB(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	s.DB = &fcStore{dbFakeStore: f, upsertScheduleErr: errors.New("upsert down")}
+	f.mu.Lock()
+	f.advanceScheduleErr = errors.New("advance down")
+	f.mu.Unlock()
 	if _, fired, err := s.fireSchedule(context.Background(), sc, time.Now().UTC().Truncate(time.Minute)); err != nil || !fired {
-		t.Fatalf("fire with upsert failure = fired=%v err=%v", fired, err)
+		t.Fatalf("fire with advance failure = fired=%v err=%v", fired, err)
 	}
 
 	// Memory persist failure after a successful enqueue only logs.

@@ -74,6 +74,12 @@ var (
 	// observe a report from the detached GC goroutine without racing the
 	// process-wide stdout.
 	reportf = fmt.Printf
+	// removeJobWorkspace deletes the per-job workspace root after the job.
+	// os.MkdirTemp creates the root 0700 and runner-owned; the container
+	// backend provisions and restores the tree for hardened rootful
+	// workloads. A seam so the docker integration test can observe the
+	// post-run host-side state instead of racing the cleanup.
+	removeJobWorkspace = os.RemoveAll
 )
 
 type Config struct {
@@ -482,7 +488,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		r.complete(parent, t, model.StatusFailure, err, nil)
 		return
 	}
-	defer os.RemoveAll(tmp)
+	defer func() { _ = removeJobWorkspace(tmp) }()
 	checkoutStart := time.Now()
 	if err = r.checkoutTask(ctx, t.Job, tmp); err != nil {
 		r.complete(parent, t, statusForErr(ctx, err), err, nil)

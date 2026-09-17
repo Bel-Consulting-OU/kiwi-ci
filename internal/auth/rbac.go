@@ -87,26 +87,34 @@ func Authorize(p Principal, action Action, repo string, trusted bool) bool {
 // may be keyed by the canonical repository ID (host/owner/name) or by the
 // bare full name (owner/name): a canonical lookup falls back to the bare
 // form and a bare lookup falls back to canonical keys with the same bare
-// part, so both keying conventions work. The bare→canonical fallback is
-// DETERMINISTIC and fails closed: when several canonical keys share the
-// bare part with DIFFERENT permission sets the lookup resolves to no entry
-// (role fallback applies) instead of depending on Go's randomized map
-// iteration order, which could otherwise flip an authorization decision
-// between calls.
+// part, so both keying conventions work. Stored keys and the lookup key are
+// canonicalized first (host case, one trailing dot, default ports), so
+// equivalent spellings of the same forge host address the same grant. The
+// bare→canonical fallback is DETERMINISTIC and fails closed: when several
+// canonical keys share the bare part with DIFFERENT permission sets the
+// lookup resolves to no entry (role fallback applies) instead of depending
+// on Go's randomized map iteration order, which could otherwise flip an
+// authorization decision between calls.
 func (p Principal) repoEntry(repo string) (RepositoryPermission, bool) {
-	if perm, ok := p.Repositories[repo]; ok {
+	repo = NormalizeRepoKey(repo)
+	if perm, ok := lookupRepoEntry(p.Repositories, repo); ok {
 		return perm, true
 	}
-	host, bare, hasHost := splitCanonicalRepo(repo)
+	_, bare, hasHost := splitCanonicalRepo(repo)
 	if hasHost {
-		perm, ok := p.Repositories[bare]
-		return perm, ok
+		return lookupRepoEntry(p.Repositories, bare)
 	}
 	// repo is a bare full name: match canonical keys whose bare part is repo.
 	var match RepositoryPermission
 	found, ambiguous := false, false
+	seen := map[string]bool{}
 	for key, perm := range p.Repositories {
-		if _, kb, kHost := splitCanonicalRepo(key); kHost && kb == bare {
+		nk := NormalizeRepoKey(key)
+		if seen[nk] {
+			continue
+		}
+		seen[nk] = true
+		if _, kb, kHost := splitCanonicalRepo(nk); kHost && kb == bare {
 			if !found {
 				match, found = perm, true
 			} else if perm != match {
@@ -114,7 +122,28 @@ func (p Principal) repoEntry(repo string) (RepositoryPermission, bool) {
 			}
 		}
 	}
-	_ = host
+	if found && !ambiguous {
+		return match, true
+	}
+	return RepositoryPermission{}, false
+}
+
+// lookupRepoEntry resolves the entry whose key canonicalizes to target.
+// Equivalent keys carrying DIFFERENT permission sets resolve to no entry
+// (fail closed) instead of depending on map iteration order.
+func lookupRepoEntry(m map[string]RepositoryPermission, target string) (RepositoryPermission, bool) {
+	var match RepositoryPermission
+	found, ambiguous := false, false
+	for key, perm := range m {
+		if NormalizeRepoKey(key) != target {
+			continue
+		}
+		if !found {
+			match, found = perm, true
+		} else if perm != match {
+			ambiguous = true
+		}
+	}
 	if found && !ambiguous {
 		return match, true
 	}
@@ -123,21 +152,36 @@ func (p Principal) repoEntry(repo string) (RepositoryPermission, bool) {
 
 // CanonicalRepoID renders the canonical repository identity "<host>/<fullName>"
 // (e.g. github.com/Bel-Consulting-OU/kiwi-ci). The forge host is
-// authoritative when known: a stored full name that does not already start
-// with exactly that host is prefixed with it. That keeps identities
-// host-scoped even when the first segment merely looks like a host (the
-// GitLab group "acme.co/service" previously collapsed to the bare
-// "acme.co/service", letting a github.com grant authorize a gitlab.example
-// run) and when the name embeds a different host. With no known forge host
-// the trimmed full name is returned unchanged; an empty full name stays
-// empty. The forge host is usually derived from the run's repo URL.
+// canonicalized first (lowercase, one trailing dot stripped, default port
+// dropped, userinfo stripped: see CanonicalHost), and a full name that
+// already starts with a canonically equivalent spelling of that host is
+// reduced to its owner/name remainder, so re-canonicalizing a stored
+// identity is idempotent. The forge host stays authoritative when the full
+// name embeds a DIFFERENT host: such a name is prefixed with the canonical
+// host, keeping identities host-scoped even when the first segment merely
+// looks like a host (the GitLab group "acme.co/service" previously collapsed
+// to the bare "acme.co/service", letting a github.com grant authorize a
+// gitlab.example run). With no known forge host the trimmed full name is
+// returned unchanged; an empty full name stays empty. The forge host is
+// usually derived from the run's repo URL.
 func CanonicalRepoID(forgeHost, fullName string) string {
 	fullName = strings.TrimSpace(fullName)
 	if fullName == "" {
 		return ""
 	}
-	host := strings.TrimSpace(forgeHost)
-	if host == "" || strings.HasPrefix(fullName, host+"/") {
+	host := CanonicalHost(forgeHost)
+	if first, rest, ok := splitHostLike(fullName); ok {
+		canonFirst := CanonicalHost(first)
+		if host == "" || canonFirst == host {
+			// The full name already carries this host: keep one canonical
+			// spelling and drop the duplicate prefix.
+			if host == "" {
+				host = canonFirst
+			}
+			fullName = rest
+		}
+	}
+	if host == "" {
 		return fullName
 	}
 	return host + "/" + fullName
@@ -151,9 +195,8 @@ func CanonicalRepoID(forgeHost, fullName string) string {
 // would be misread as host "acme.co" + bare "service", and an unrelated bare
 // alias "service" would match it.
 func splitCanonicalRepo(repo string) (host, bare string, hasHost bool) {
-	parts := strings.SplitN(repo, "/", 2)
-	if len(parts) == 2 && strings.Contains(parts[0], ".") && strings.Contains(parts[1], "/") {
-		return parts[0], parts[1], true
+	if first, rest, ok := splitHostLike(repo); ok {
+		return first, rest, true
 	}
 	return "", repo, false
 }

@@ -118,7 +118,13 @@ type Store interface {
 	ListJobsByRun(ctx context.Context, runID string) ([]model.Job, error)
 	// ListJobsByEnvironment returns all jobs holding the given
 	// repository-scoped environment, for environment concurrency accounting.
-	ListJobsByEnvironment(ctx context.Context, repoURL, environment string) ([]model.Job, error)
+	// repoID is the CANONICAL repository identity ("<host>/<owner>/<name>",
+	// see RepoIDForJob): the environment key is (RepoID, environment), so
+	// two spellings of one clone URL (HTTPS/ssh) share one key while the
+	// same environment name on two different repositories never does.
+	// Legacy rows without a stored repo_id derive the same canonical
+	// identity from their clone URL + full name.
+	ListJobsByEnvironment(ctx context.Context, repoID, environment string) ([]model.Job, error)
 	ListQueuedJobs(ctx context.Context) ([]model.Job, error)
 	UpdateJob(ctx context.Context, job model.Job) error
 
@@ -300,6 +306,15 @@ type ScheduleStore interface {
 	ListSchedules(ctx context.Context) ([]Schedule, error)
 	ClaimScheduleOccurrence(ctx context.Context, scheduleID string, nominal time.Time, runID string) (bool, error)
 	ListOccurrences(ctx context.Context, scheduleID string) ([]Occurrence, error)
+	// AdvanceScheduleLastRun moves the schedule's LastRun marker forward to
+	// nominal, durably and MONOTONICALLY: last_run is set to
+	// GREATEST(existing, nominal), so a stale replica (or a retried skip)
+	// can never move the marker backwards and make an already-settled
+	// occurrence due again. Implementations must persist before returning
+	// nil; an error means the marker was not advanced and the caller must
+	// retry the advance on its next tick instead of touching a local
+	// mirror.
+	AdvanceScheduleLastRun(ctx context.Context, id string, nominal time.Time) error
 }
 
 // DeploymentStore is the durable deployment record contract.
@@ -566,8 +581,16 @@ type DownstreamLaunchClaim struct {
 // (SQL: under a per-(repo, group) advisory lock) so concurrent superseding
 // enqueues of one group serialize and exactly one run survives
 // non-terminal; the loser's cancellation commits together with the winner.
+//
+// RepoID is the CANONICAL repository identity of the checkout repository
+// (model.Run.RepoID, see RepoIDForRun), never a clone URL: submitting the
+// same repository once via HTTPS and once via SSH must supersede, while two
+// repositories whose clone URLs only coincidentally match (mirrors, forks
+// with identical names on different forges) must not. Stores compare the
+// stored payload's repo_id and fall back to the legacy URL + full-name
+// derivation for rows persisted before RepoID existed.
 type SupersedePolicy struct {
-	Repo             string `json:"repo"`
+	RepoID           string `json:"repo_id"`
 	ConcurrencyGroup string `json:"concurrency_group"`
 }
 
@@ -642,7 +665,9 @@ type RunEnqueueStore interface {
 //     explicit bare alias.
 //   - Environment/EnvironmentConcurrency reserve an environment slot inside
 //     the transaction under a per-key advisory lock, so two concurrent
-//     claims can never both take the last slot.
+//     claims can never both take the last slot. The key is the CANONICAL
+//     repository identity plus the environment name (see EnvKey), never the
+//     clone URL: HTTPS and SSH submissions of one repository share the key.
 //   - RepoConcurrency/TeamConcurrency gate the queued->running quota
 //     transition: the quota_reservations row is updated conditionally and
 //     zero matched rows rolls the whole lease back with ErrQuotaExceeded.
@@ -663,21 +688,23 @@ type LeaseClaim struct {
 
 	Environment            string
 	EnvironmentConcurrency int
-	RepoURL                string
 	RepoConcurrency        float64
 	TeamConcurrency        float64
 }
 
-// EnvKey names the environment concurrency key: the repository URL plus the
-// environment name. An environment name is not a global lock across
-// repositories. The key is logical only and contains no NUL byte; SQL
-// advisory locks are derived from it with advisoryLockKey, so no scalar
-// containing raw separators is ever bound as a SQL text parameter.
+// EnvKey names the environment concurrency key: the CANONICAL repository
+// identity plus the environment name. An environment name is not a global
+// lock across repositories, and a clone URL is not an identity: the same
+// repository submitted once via HTTPS and once via SSH resolves to one
+// canonical RepoID and therefore one key. The key is logical only and
+// contains no NUL byte; SQL advisory locks are derived from it with
+// advisoryLockKey, so no scalar containing raw separators is ever bound as a
+// SQL text parameter.
 func (c LeaseClaim) EnvKey() string {
-	if c.RepoURL == "" || c.Environment == "" {
+	if c.CanonRepoID == "" || c.Environment == "" {
 		return ""
 	}
-	return c.RepoURL + "\x1f" + c.Environment
+	return c.CanonRepoID + "\x1f" + c.Environment
 }
 
 // AtomicLeaseStore acquires a job lease and reserves the runner capacity

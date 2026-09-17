@@ -82,6 +82,12 @@ func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	// The rename is only durable once the parent directory is fsynced.
+	if err := storage.SyncDir(dir); err != nil {
+		_ = os.Remove(dst)
+		http.Error(w, err.Error(), 500)
+		return
+	}
 	// Build the manifest by scanning the stored archive (no extraction, no
 	// trust in client-supplied metadata).
 	af, err := os.Open(dst)
@@ -97,8 +103,19 @@ func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid snapshot archive: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	mb, _ := json.MarshalIndent(m, "", "  ")
-	_ = os.WriteFile(dst+".manifest.json", mb, 0o600)
+	mb, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		_ = os.Remove(dst)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	// The manifest sidecar is part of the durable archive pair: write it
+	// through the checked atomic writer before the record is committed.
+	if err := storage.AtomicWriteFile(dst+".manifest.json", mb, 0o600); err != nil {
+		_ = os.Remove(dst)
+		http.Error(w, err.Error(), 500)
+		return
+	}
 	rec := model.SnapshotRecord{
 		ID:         id,
 		RunID:      j.RunID,
@@ -114,12 +131,93 @@ func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
 	for _, e := range m.Entries {
 		rec.Entries = append(rec.Entries, model.SnapshotEntry{Path: e.Path, Mode: e.Mode, Size: e.Size, SHA256: e.SHA256})
 	}
+	// Commit the authoritative record only after the archive and manifest
+	// are durably stored, and only acknowledge the upload once the record
+	// itself is durable in the state snapshot. A failed state write removes
+	// the in-memory record and the unreferenced files, so the runner can
+	// retry instead of losing the snapshot silently.
 	s.mu.Lock()
 	s.snapshots[id] = rec
+	persistErr := s.persistLocked()
+	if persistErr != nil {
+		delete(s.snapshots, id)
+	}
 	s.mu.Unlock()
+	if persistErr != nil {
+		_ = os.Remove(dst)
+		_ = os.Remove(dst + ".manifest.json")
+		http.Error(w, "snapshot record persistence failed", http.StatusServiceUnavailable)
+		return
+	}
 	// The audit trail records the digest, never the archive contents.
 	s.auditLocked("snapshot.uploaded", runnerID, j.RunID, j.ID, "workspace snapshot uploaded", map[string]string{"sha256": rec.SHA256})
 	writeJSON(w, http.StatusCreated, redactSnapshot(rec))
+}
+
+// snapshotRestoreDropped is a test seam over the log line emitted when a
+// durable snapshot record fails load validation. Production logs through the
+// server logger; tests capture the drop calls.
+var snapshotRestoreDropped = func(s *Server, id string, err error) {
+	s.logError("snapshot record dropped at load", "snapshot", id, "error", err.Error())
+}
+
+// restoreSnapshots installs the durable fs-mode snapshot records after
+// validating every referenced archive/manifest pair. A record whose files
+// are missing, truncated, altered, or inconsistent with its manifest is
+// dropped (and logged) instead of resurrecting a broken entry; the next
+// state write persists the pruned set.
+func (s *Server) restoreSnapshots(recs map[string]model.SnapshotRecord) {
+	out := make(map[string]model.SnapshotRecord, len(recs))
+	for id, rec := range recs {
+		if err := validateSnapshotFiles(rec); err != nil {
+			snapshotRestoreDropped(s, id, err)
+			continue
+		}
+		out[id] = rec
+	}
+	s.snapshots = out
+}
+
+// validateSnapshotFiles checks one fs-mode snapshot record against the
+// files it references: the archive must exist, have the recorded size and
+// SHA-256, and its manifest sidecar must exist and decode to the recorded
+// version and root digest.
+func validateSnapshotFiles(rec model.SnapshotRecord) error {
+	if rec.ID == "" {
+		return errors.New("empty snapshot id")
+	}
+	if rec.Path == "" {
+		return errors.New("empty snapshot archive path")
+	}
+	f, err := os.Open(rec.Path)
+	if err != nil {
+		return err
+	}
+	h := sha256.New()
+	n, copyErr := io.Copy(h, f)
+	closeErr := f.Close()
+	if err := firstErr(copyErr, closeErr); err != nil {
+		return err
+	}
+	if n != rec.Size {
+		return fmt.Errorf("archive size %d does not match record %d", n, rec.Size)
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != rec.SHA256 {
+		return fmt.Errorf("archive digest %s does not match record %s", got, rec.SHA256)
+	}
+	mb, err := os.ReadFile(rec.Path + ".manifest.json")
+	if err != nil {
+		return fmt.Errorf("manifest sidecar: %w", err)
+	}
+	var m snapshot.Manifest
+	if err := json.Unmarshal(mb, &m); err != nil {
+		return fmt.Errorf("manifest decode: %w", err)
+	}
+	if m.Version != rec.Version || m.RootSHA256 != rec.RootSHA256 {
+		return fmt.Errorf("manifest version=%d root=%s does not match record version=%d root=%s",
+			m.Version, m.RootSHA256, rec.Version, rec.RootSHA256)
+	}
+	return nil
 }
 
 // uploadSnapshotDB is the DB-mode upload: the archive bytes are stored in

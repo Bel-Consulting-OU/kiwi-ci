@@ -98,21 +98,25 @@ func (s *Server) deploymentForJob(ctx context.Context, j model.Job) (model.Deplo
 	return model.Deployment{}, false, nil
 }
 
+// persistDeploymentFinishState is a test seam over the fs-mode state write
+// used by the deployment-finish effect: production calls s.persistLocked,
+// tests inject a failure to prove the marker rolls back and the effect is
+// retried instead of reporting success without durable state.
+var persistDeploymentFinishState = func(s *Server) error { return s.persistLocked() }
+
 // effectDeploymentFinish marks the deployment record of a completed
-// environment job with its terminal status. Marker: a non-nil finished_at
-// (or a missing deployment record) means there is nothing left to finish.
+// environment job with its terminal status, creating the record when a
+// failed create left it absent. Marker: a non-nil finished_at (or a job
+// without an environment) means there is nothing left to finish.
+//
+// Persistence failures are returned, never swallowed: in DB mode the record
+// is inserted/updated durably before anything is mirrored or audited, so the
+// completion outbox keeps the effect pending and retries it; in fs/memory
+// mode a failed state write rolls the in-memory marker back, so the retry
+// re-attempts it instead of reporting a success that durable state does not
+// contain.
 func (s *Server) effectDeploymentFinish(ctx context.Context, j model.Job) error {
 	if j.Environment == "" {
-		return nil
-	}
-	d, found, err := s.deploymentForJob(ctx, j)
-	if err != nil {
-		return err
-	}
-	if !found || d.ID == "" {
-		return nil
-	}
-	if d.FinishedAt != nil {
 		return nil
 	}
 	finished := time.Now().UTC()
@@ -120,17 +124,33 @@ func (s *Server) effectDeploymentFinish(ctx context.Context, j model.Job) error 
 		finished = *j.FinishedAt
 	}
 	if s.DB != nil {
-		s.finishDeploymentDB(ctx, j, j.Status, finished)
+		return s.finishDeploymentDB(ctx, j, j.Status, finished)
+	}
+	d, found, err := s.deploymentForJob(ctx, j)
+	if err != nil {
+		return err
+	}
+	if !found || d.ID == "" || d.FinishedAt != nil {
 		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if cur, ok := s.deployments[j.ID]; ok {
-		cur.Status = j.Status
-		cur.FinishedAt = &finished
-		s.deployments[j.ID] = cur
+	cur, ok := s.deployments[j.ID]
+	if !ok || cur.FinishedAt != nil {
+		return nil
 	}
-	return s.persistLocked()
+	prev := cur
+	cur.Status = j.Status
+	cur.FinishedAt = &finished
+	s.deployments[j.ID] = cur
+	if err := persistDeploymentFinishState(s); err != nil {
+		// Durability first: the marker must not survive a failed write, or
+		// the retry would treat the effect as already done.
+		s.deployments[j.ID] = prev
+		return err
+	}
+	s.auditLocked("deployment.completed", "scheduler", j.RunID, j.ID, "deployment finished", map[string]string{"environment": j.Environment, "status": string(j.Status)})
+	return nil
 }
 
 // effectUsageAccount computes and persists the completed job's cost/energy

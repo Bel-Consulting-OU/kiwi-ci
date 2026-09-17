@@ -20,10 +20,7 @@ type OnePasswordClient struct {
 }
 
 func (c *OnePasswordClient) client() *http.Client {
-	if c.HTTPClient != nil {
-		return c.HTTPClient
-	}
-	return http.DefaultClient
+	return providerClient(c.HTTPClient)
 }
 
 type onePasswordItemResponse struct {
@@ -37,6 +34,9 @@ type onePasswordItemResponse struct {
 // Resolve fetches the item named "name" from the configured vault, filtered to
 // the password field, and returns its value.
 func (c *OnePasswordClient) Resolve(ctx context.Context, name string, _ SecretScope) (string, error) {
+	if err := validateProviderEndpoint(c.Host, true); err != nil {
+		return "", fmt.Errorf("onepassword: %w", err)
+	}
 	u := strings.TrimRight(c.Host, "/") + "/v1/vaults/" + url.PathEscape(c.VaultID) +
 		"/items/" + url.PathEscape(name) + "?fields=password"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)

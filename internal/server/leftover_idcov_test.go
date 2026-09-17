@@ -112,22 +112,55 @@ func (f deploymentStatusFaultStore) UpdateDeploymentStatus(ctx context.Context, 
 }
 
 // TestLeftoverDeploymentStatusUpdateFailure covers the finish path's
-// best-effort durable status update: a store failure is logged, the
-// completion itself is not failed.
+// durability contract: a failed durable status update is returned to the
+// caller (so the effect stays pending and is retried), and neither the
+// in-memory marker nor the completion audit is touched.
 func TestLeftoverDeploymentStatusUpdateFailure(t *testing.T) {
 	s, f, _, _ := cacheFixture(t)
 	fault := deploymentStatusFaultStore{dbFakeStore: f, updateErr: errors.New("deployment update down")}
 	s.DB = fault
 	j := model.Job{ID: "job-a", RunID: "run-c", Environment: "production"}
+	d0 := model.Deployment{ID: "dep-1", RunID: j.RunID, JobID: j.ID, Environment: j.Environment, Status: model.StatusRunning, CreatedAt: time.Now().UTC()}
 	s.mu.Lock()
-	s.deployments[j.ID] = model.Deployment{ID: "dep-1", RunID: j.RunID, JobID: j.ID, Environment: j.Environment, Status: model.StatusRunning, CreatedAt: time.Now().UTC()}
+	s.deployments[j.ID] = d0
 	s.mu.Unlock()
-	s.finishDeploymentDB(context.Background(), j, model.StatusFailure, time.Now().UTC())
+	if err := f.InsertDeployment(context.Background(), d0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.finishDeploymentDB(context.Background(), j, model.StatusFailure, time.Now().UTC()); err == nil {
+		t.Fatal("failed durable update must be returned, not swallowed")
+	}
 	s.mu.Lock()
 	d := s.deployments[j.ID]
 	s.mu.Unlock()
+	if d.Status != model.StatusRunning || d.FinishedAt != nil {
+		t.Fatalf("failed update advanced the in-memory marker: %+v", d)
+	}
+	f.mu.Lock()
+	stored := f.deployments[j.ID]
+	audited := false
+	for _, e := range f.audit {
+		if e.Action == "deployment.completed" {
+			audited = true
+		}
+	}
+	f.mu.Unlock()
+	if stored.FinishedAt != nil {
+		t.Fatalf("failed update reached the store: %+v", stored)
+	}
+	if audited {
+		t.Fatal("failed update emitted the completion audit")
+	}
+	// Once the store recovers the same call converges the record.
+	s.DB = f
+	if err := s.finishDeploymentDB(context.Background(), j, model.StatusFailure, time.Now().UTC()); err != nil {
+		t.Fatalf("recovered finish = %v", err)
+	}
+	s.mu.Lock()
+	d = s.deployments[j.ID]
+	s.mu.Unlock()
 	if d.Status != model.StatusFailure || d.FinishedAt == nil {
-		t.Fatalf("deployment not finished: %+v", d)
+		t.Fatalf("deployment not finished after recovery: %+v", d)
 	}
 }
 
@@ -204,7 +237,9 @@ func TestLeftoverScheduleDBUpsertEntropyFailure(t *testing.T) {
 
 // TestLeftoverSchedulePersistenceFailure covers fireSchedule's best-effort
 // persistence of the last-run marker: the occurrence claim write succeeds,
-// the marker write fails, and the run still fires.
+// the durable marker advance write fails, and the run still fires (the
+// persisted claim already prevents a refire; the next tick converges the
+// marker through the durable advance path).
 func TestLeftoverSchedulePersistenceFailure(t *testing.T) {
 	s, err := NewPersistent("secret", "secret", t.TempDir())
 	if err != nil {
@@ -223,6 +258,9 @@ func TestLeftoverSchedulePersistenceFailure(t *testing.T) {
 
 	sc := storage.Schedule{ID: "sc-1", Repository: "o/r", RepoID: "github.com/o/r", RepoURL: "https://github.com/o/r.git",
 		Spec: scheduleSpec, Enabled: true, CreatedAt: time.Now().UTC()}
+	s.mu.Lock()
+	s.schedules[sc.ID] = sc
+	s.mu.Unlock()
 	run, fired, err := s.fireSchedule(context.Background(), sc, time.Now().UTC())
 	if err != nil || !fired {
 		t.Fatalf("fireSchedule with failing marker write = %v, %v; want fired run", err, fired)

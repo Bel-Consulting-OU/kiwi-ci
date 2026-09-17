@@ -24,6 +24,13 @@ func serviceNetworkArgs(isolated bool) []string {
 	return args
 }
 
+// serviceWorkloadUser is the identity every service container runs as: the
+// unprivileged "nobody" user. Services never bind-mount the runner checkout,
+// so the rootless/rootful workspace mapping (planHardenedContainer) does not
+// apply to them; the read-only rootfs, capability drop, no-new-privileges and
+// tmpfs keep them restricted on either daemon kind.
+const serviceWorkloadUser = "65534:65534"
+
 // serviceContainerName derives the deterministic docker container name for
 // one declared service.
 func serviceContainerName(runID, jobID string, index int, svc pipeline.Service) string {
@@ -90,12 +97,14 @@ func startContainerServices(ctx context.Context, runID, jobID string, services [
 		name := serviceContainerName(runID, jobID, i, svc)
 		// Every service runs maximally hardened. The user is hard-coded to
 		// 65534:65534 (nobody) rather than omitted: images known to require
-		// root are not a reason to weaken isolation for the rest.
+		// root are not a reason to weaken isolation for the rest. Services
+		// and the job container share one network only; the workspace
+		// ownership mapping never applies here.
 		args := []string{"run", "-d", "--rm", "--network=" + network, "--name", name,
 			"--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
 			"--tmpfs", "/tmp:rw,nosuid,nodev",
 			"--pids-limit=256", "--memory=2g", "--cpus=2",
-			"--user=65534:65534",
+			"--user=" + serviceWorkloadUser,
 		}
 		args = append(args, containerLabels(runID, jobID)...)
 		for k, v := range svc.Env {

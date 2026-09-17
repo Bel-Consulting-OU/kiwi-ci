@@ -33,10 +33,7 @@ type GCPClient struct {
 }
 
 func (c *GCPClient) client() *http.Client {
-	if c.HTTPClient != nil {
-		return c.HTTPClient
-	}
-	return http.DefaultClient
+	return providerClient(c.HTTPClient)
 }
 
 func (c *GCPClient) tokenURL() string {
@@ -125,11 +122,15 @@ func (c *GCPClient) accessToken(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	tokenURL := c.tokenURL()
+	if err := validateProviderEndpoint(tokenURL, true); err != nil {
+		return "", fmt.Errorf("gcp: %w", err)
+	}
 	form := url.Values{
 		"grant_type": {"urn:ietf:params:oauth:grant-type:jwt-bearer"},
 		"assertion":  {jwt},
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.tokenURL(), strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return "", fmt.Errorf("gcp: token request: %w", err)
 	}
@@ -163,7 +164,11 @@ func (c *GCPClient) Resolve(ctx context.Context, name string, _ SecretScope) (st
 	if err != nil {
 		return "", err
 	}
-	u := c.secretManagerURL() + "/v1/projects/" + url.PathEscape(c.Project) +
+	secretManagerURL := c.secretManagerURL()
+	if err := validateProviderEndpoint(secretManagerURL, true); err != nil {
+		return "", fmt.Errorf("gcp: %w", err)
+	}
+	u := secretManagerURL + "/v1/projects/" + url.PathEscape(c.Project) +
 		"/secrets/" + url.PathEscape(name) + "/versions/latest:access"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {

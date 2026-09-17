@@ -171,14 +171,20 @@ func TestEffectiveNeedsAuthority(t *testing.T) {
 
 func TestLeaseClaimEnvKey(t *testing.T) {
 	if got := (LeaseClaim{Environment: "prod"}).EnvKey(); got != "" {
-		t.Fatalf("missing repo URL = %q, want empty", got)
+		t.Fatalf("missing canonical repo id = %q, want empty", got)
 	}
-	if got := (LeaseClaim{RepoURL: "https://github.com/acme/api"}).EnvKey(); got != "" {
+	if got := (LeaseClaim{CanonRepoID: "github.com/acme/api"}).EnvKey(); got != "" {
 		t.Fatalf("missing environment = %q, want empty", got)
 	}
-	c := LeaseClaim{RepoURL: "https://github.com/acme/api", Environment: "prod"}
-	if got, want := c.EnvKey(), "https://github.com/acme/api\x1fprod"; got != want {
+	c := LeaseClaim{CanonRepoID: "github.com/acme/api", Environment: "prod"}
+	if got, want := c.EnvKey(), "github.com/acme/api\x1fprod"; got != want {
 		t.Fatalf("EnvKey = %q, want %q", got, want)
+	}
+	// The key is the canonical identity, never a clone URL: HTTPS and SSH
+	// spellings of one repository must resolve to the same EnvKey.
+	ssh := LeaseClaim{CanonRepoID: RepoIDFor("", "git@github.com:acme/api.git", "acme/api"), Environment: "prod"}
+	if ssh.EnvKey() != c.EnvKey() {
+		t.Fatalf("SSH EnvKey = %q, want the canonical HTTPS key %q", ssh.EnvKey(), c.EnvKey())
 	}
 }
 

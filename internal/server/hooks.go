@@ -153,9 +153,12 @@ func (s *Server) gitlabWebhook(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	checkout := checkoutCloneURL(ec)
 	in := SubmitRun{
 		RepoID:            repoID,
-		RepoURL:           ec.HeadRepository.CloneURL,
+		PolicyRepoID:      repoID,
+		CheckoutRepoURL:   checkout,
+		RepoURL:           checkout,
 		RepoFullName:      ec.Repository.FullName,
 		Ref:               ec.Ref,
 		SHA:               ec.HeadSHA,
@@ -165,6 +168,7 @@ func (s *Server) gitlabWebhook(w http.ResponseWriter, r *http.Request) {
 		ChangedFiles:      files,
 		ChangedFilesKnown: filesKnown,
 		Metadata:          map[string]string{"gitlab_delivery": delivery},
+		identityBound:     true,
 	}
 	run, err := s.enqueue(in)
 	if err != nil {
@@ -256,9 +260,12 @@ func (s *Server) forgejoWebhook(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	checkout := checkoutCloneURL(ec)
 	in := SubmitRun{
 		RepoID:            repoID,
-		RepoURL:           ec.HeadRepository.CloneURL,
+		PolicyRepoID:      repoID,
+		CheckoutRepoURL:   checkout,
+		RepoURL:           checkout,
 		RepoFullName:      ec.Repository.FullName,
 		Ref:               ec.Ref,
 		SHA:               ec.HeadSHA,
@@ -268,6 +275,7 @@ func (s *Server) forgejoWebhook(w http.ResponseWriter, r *http.Request) {
 		ChangedFiles:      files,
 		ChangedFilesKnown: filesKnown,
 		Metadata:          map[string]string{"forgejo_delivery": delivery},
+		identityBound:     true,
 	}
 	run, err := s.enqueue(in)
 	if err != nil {

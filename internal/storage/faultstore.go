@@ -128,8 +128,8 @@ func (f *FaultyStore) ListQueuedJobs(ctx context.Context) ([]model.Job, error) {
 	return f.Inner.ListQueuedJobs(ctx)
 }
 
-func (f *FaultyStore) ListJobsByEnvironment(ctx context.Context, repoURL, environment string) ([]model.Job, error) {
-	return f.Inner.ListJobsByEnvironment(ctx, repoURL, environment)
+func (f *FaultyStore) ListJobsByEnvironment(ctx context.Context, repoID, environment string) ([]model.Job, error) {
+	return f.Inner.ListJobsByEnvironment(ctx, repoID, environment)
 }
 
 func (f *FaultyStore) ListJobsByRunner(ctx context.Context, runnerID string) ([]model.Job, error) {
@@ -399,6 +399,15 @@ func (f *FaultyStore) ClaimScheduleOccurrence(ctx context.Context, scheduleID st
 
 func (f *FaultyStore) ListOccurrences(ctx context.Context, scheduleID string) ([]Occurrence, error) {
 	return f.Inner.(ScheduleStore).ListOccurrences(ctx, scheduleID)
+}
+
+func (f *FaultyStore) AdvanceScheduleLastRun(ctx context.Context, id string, nominal time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(ScheduleStore).AdvanceScheduleLastRun(ctx, id, nominal)
 }
 
 func (f *FaultyStore) InsertDeployment(ctx context.Context, d model.Deployment) error {
@@ -989,12 +998,15 @@ func (m *memStore) ListQueuedJobs(ctx context.Context) ([]model.Job, error) {
 	return out, nil
 }
 
-func (m *memStore) ListJobsByEnvironment(ctx context.Context, repoURL, environment string) ([]model.Job, error) {
+// ListJobsByEnvironment mirrors the SQL store: jobs are matched on the
+// canonical repository identity (stored RepoID, legacy fallback derivation),
+// so HTTPS and SSH spellings of one repository share an environment key.
+func (m *memStore) ListJobsByEnvironment(ctx context.Context, repoID, environment string) ([]model.Job, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := []model.Job{}
 	for _, j := range m.jobs {
-		if j.Environment == environment && j.RepoURL == repoURL {
+		if j.Environment == environment && RepoIDForJob(j) == repoID {
 			out = append(out, j)
 		}
 	}
@@ -1484,6 +1496,28 @@ func (m *memStore) ListSchedules(ctx context.Context) ([]Schedule, error) {
 		out = append(out, sc)
 	}
 	return out, nil
+}
+
+// AdvanceScheduleLastRun advances the stored marker monotonically:
+// last_run = max(existing, nominal), mirroring the SQL GREATEST update. A
+// stale caller can never move the marker backwards. An unknown schedule is
+// ErrNotFound.
+func (m *memStore) AdvanceScheduleLastRun(ctx context.Context, id string, nominal time.Time) error {
+	if id == "" {
+		return fmt.Errorf("storage: empty schedule id")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sc, ok := m.schedules[id]
+	if !ok {
+		return ErrNotFound
+	}
+	nominal = nominal.UTC()
+	if sc.LastRun == nil || sc.LastRun.Before(nominal) {
+		sc.LastRun = &nominal
+		m.schedules[id] = sc
+	}
+	return nil
 }
 
 func (m *memStore) ClaimScheduleOccurrence(ctx context.Context, scheduleID string, nominal time.Time, runID string) (bool, error) {
@@ -2043,12 +2077,15 @@ func (m *memStore) InsertCompiledRun(ctx context.Context, req InsertCompiledRunR
 
 // supersededJobIDsLocked resolves a supersede policy against the currently
 // committed runs (caller holds m.mu): every other non-terminal run of the
-// same repository and concurrency group contributes its non-terminal job
-// IDs, in deterministic order.
+// same CANONICAL repository identity and concurrency group contributes its
+// non-terminal job IDs, in deterministic order. The identity is read through
+// RepoIDForRun (stored RepoID, legacy URL + full-name fallback), so the same
+// repository submitted once via HTTPS and once via SSH supersedes, exactly
+// like the SQL store's repo_id predicate.
 func (m *memStore) supersededJobIDsLocked(p *SupersedePolicy, newRunID string) []string {
-	repo := strings.TrimSpace(p.Repo)
+	repoID := strings.TrimSpace(p.RepoID)
 	group := strings.TrimSpace(p.ConcurrencyGroup)
-	if repo == "" || group == "" {
+	if repoID == "" || group == "" {
 		return nil
 	}
 	runIDs := []string{}
@@ -2056,7 +2093,7 @@ func (m *memStore) supersededJobIDsLocked(p *SupersedePolicy, newRunID string) [
 		if id == newRunID || r.Status.Terminal() {
 			continue
 		}
-		if r.Repo != repo || r.ConcurrencyGroup != group {
+		if RepoIDForRun(r) != repoID || r.ConcurrencyGroup != group {
 			continue
 		}
 		runIDs = append(runIDs, id)
@@ -2203,13 +2240,22 @@ func (m *memStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim) (mo
 	if linked && !found {
 		return model.Job{}, ErrNoCapacity
 	}
+	// The environment key is the CANONICAL repository identity of the claim
+	// (falling back to the job's own identity for callers that carry none)
+	// plus the environment name, exactly like the SQL count and
+	// LeaseClaim.EnvKey: HTTPS/SSH spellings of one repository share a slot
+	// pool. The claim's environment fields are authoritative, mirroring the
+	// SQL claim.
+	env := claim.Environment
+	envLimit := claim.EnvironmentConcurrency
+	claimRepoID := RepoIDFor(claim.CanonRepoID, j.RepoURL, j.RepoFullName)
 	envRunning := 0
-	if j.Environment != "" && j.EnvironmentConcurrency > 0 {
+	if env != "" && envLimit > 0 {
 		for id, other := range m.jobs {
 			if id == j.ID || other.Status != model.StatusRunning {
 				continue
 			}
-			if other.RepoURL == j.RepoURL && other.Environment == j.Environment {
+			if other.Environment == env && RepoIDForJob(other) == claimRepoID {
 				envRunning++
 			}
 		}

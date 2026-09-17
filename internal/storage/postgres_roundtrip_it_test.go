@@ -167,11 +167,11 @@ func TestPostgresIntegrationJobsRoundTrip(t *testing.T) {
 	if err := st.InsertJob(ctx, envJob); err != nil {
 		t.Fatalf("insert env job: %v", err)
 	}
-	byEnv, err := st.ListJobsByEnvironment(ctx, pgITRepo, "prod")
+	byEnv, err := st.ListJobsByEnvironment(ctx, pgITRepoID, "prod")
 	if err != nil || len(byEnv) != 1 || byEnv[0].ID != childID {
 		t.Fatalf("ListJobsByEnvironment = %v, %v", byEnv, err)
 	}
-	if byEnv, err = st.ListJobsByEnvironment(ctx, pgITRepo, "missing"); err != nil || len(byEnv) != 0 {
+	if byEnv, err = st.ListJobsByEnvironment(ctx, pgITRepoID, "missing"); err != nil || len(byEnv) != 0 {
 		t.Fatalf("ListJobsByEnvironment missing = %v, %v", byEnv, err)
 	}
 

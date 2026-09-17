@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"time"
 )
 
 var keyRE = regexp.MustCompile(`^[a-f0-9]{64}$`)
@@ -48,6 +49,14 @@ func (s *FS) Put(ctx context.Context, key string, r io.Reader, size int64) (Obje
 		if statErr != nil {
 			return Object{}, statErr
 		}
+		// A deduplicated re-put refreshes the object's mtime. The payload
+		// is immutable, but the age floor the CAS GC applies must reflect
+		// the last time an upload made the object reachable again: without
+		// the touch, a digest orphaned for longer than the floor and then
+		// re-put concurrently with a GC pass could be deleted out from
+		// under its new reference.
+		now := time.Now()
+		_ = os.Chtimes(dst, now, now)
 		return Object{Key: key, SHA256: key, Size: fi.Size()}, nil
 	}
 	tmp := filepath.Join(dir, "."+key+".tmp")
@@ -118,6 +127,56 @@ func (s *FS) Delete(ctx context.Context, key string) error {
 		return err
 	}
 	_ = os.Remove(filepath.Join(s.Root, "sha256", key[:2]))
+	return nil
+}
+
+// List walks the store's <root>/sha256/<xx>/<digest> layout and reports every
+// committed object. It implements Enumerator. Staging files (dot-prefixed
+// ".tmp" scratch files) and any name that is not a canonical 64-hex digest
+// are skipped, so the walk can never surface a partially written upload. A
+// missing shard directory is not an error; a failed stat or the callback's
+// error aborts the walk and is returned unchanged. ctx is checked between
+// shards so a cancelled GC pass stops promptly.
+func (s *FS) List(ctx context.Context, fn func(Object) error) error {
+	root := filepath.Join(s.Root, "sha256")
+	shards, err := os.ReadDir(root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	for _, shard := range shards {
+		if !shard.IsDir() {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		entries, err := os.ReadDir(filepath.Join(root, shard.Name()))
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return err
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			key := e.Name()
+			if !keyRE.MatchString(key) {
+				continue
+			}
+			info, err := e.Info()
+			if err != nil {
+				return err
+			}
+			if err := fn(Object{Key: key, SHA256: key, Size: info.Size(), ModTime: info.ModTime()}); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 

@@ -221,7 +221,7 @@ func TestPostgresIntegrationTxAbortedHelperSweep(t *testing.T) {
 			return st.claimDownstreamLaunchTx(ctx, tx, &DownstreamLaunchClaim{LinkKey: jobID + "\x00r\x00x", StableChildID: memDigest}, pgITNewID(t))
 		},
 		"supersededJobIDsTx": func(ctx context.Context, tx pgx.Tx) error {
-			_, err := st.supersededJobIDsTx(ctx, tx, &SupersedePolicy{Repo: "r", ConcurrencyGroup: "g"}, runID)
+			_, err := st.supersededJobIDsTx(ctx, tx, &SupersedePolicy{RepoID: "r", ConcurrencyGroup: "g"}, runID)
 			return err
 		},
 		"cancelSupersededTx": func(ctx context.Context, tx pgx.Tx) error {
@@ -318,7 +318,7 @@ func TestPostgresIntegrationCorruptStateErrorBranches(t *testing.T) {
 	// InsertCompiledRun: the supersede resolver fails on a NUL repository.
 	err = st.InsertCompiledRun(ctx, InsertCompiledRunRequest{
 		Run:       pgITRun(pgITNewID(t), model.StatusQueued),
-		Supersede: &SupersedePolicy{Repo: "r\x00x", ConcurrencyGroup: "g"},
+		Supersede: &SupersedePolicy{RepoID: "r\x00x", ConcurrencyGroup: "g"},
 	})
 	if err == nil {
 		t.Fatal("supersede with a NUL repository must fail")
@@ -677,7 +677,7 @@ func TestPostgresIntegrationAcquireLeaseAtomicExtraBranches(t *testing.T) {
 	if _, err := st.AcquireLeaseAtomic(ctx, LeaseClaim{JobID: holder, RunnerID: runnerID}); err != nil {
 		t.Fatalf("lease holder: %v", err)
 	}
-	envClaim := LeaseClaim{JobID: blocked, RunnerID: runnerID, Environment: "prod", EnvironmentConcurrency: 1, RepoURL: pgITRepo}
+	envClaim := LeaseClaim{JobID: blocked, RunnerID: runnerID, Environment: "prod", EnvironmentConcurrency: 1, CanonRepoID: pgITRepoID}
 	if _, err := st.AcquireLeaseAtomic(ctx, envClaim); !errors.Is(err, ErrEnvConcurrency) {
 		t.Fatalf("environment concurrency = %v, want ErrEnvConcurrency", err)
 	}

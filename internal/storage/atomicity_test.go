@@ -108,7 +108,7 @@ func TestMemStoreDuplicateDeliveryRollsBackSupersession(t *testing.T) {
 	baseline := m.snapshot()
 	dup := compiledRunRequest("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaae", repo)
 	dup.Run.ConcurrencyGroup = "grp"
-	dup.Supersede = &SupersedePolicy{Repo: repo, ConcurrencyGroup: "grp"}
+	dup.Supersede = &SupersedePolicy{RepoID: RepoIDFor("", repo, "o/r"), ConcurrencyGroup: "grp"}
 	dup.WebhookClaim = &WebhookClaim{Forge: "github", DeliveryID: "del-1", RunID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad"}
 	dup.Quota = &QuotaReservation{RepoKey: repo, JobCount: 1}
 	if err := m.InsertCompiledRun(ctx(), dup); !errors.Is(err, ErrDeliveryDuplicate) {
@@ -176,7 +176,7 @@ func TestMemStoreSupersedePolicyAtomic(t *testing.T) {
 	next := InsertCompiledRunRequest{
 		Run:          model.Run{ID: newRunID, Repo: repo, ConcurrencyGroup: "grp", Status: model.StatusQueued, CreatedAt: time.Unix(2000, 0).UTC()},
 		Jobs:         map[string]model.Job{newJobID: {ID: newJobID, RunID: newRunID, RepoURL: repo, Status: model.StatusQueued, CreatedAt: time.Unix(2001, 0).UTC()}},
-		Supersede:    &SupersedePolicy{Repo: repo, ConcurrencyGroup: "grp"},
+		Supersede:    &SupersedePolicy{RepoID: RepoIDFor("", repo, "o/r"), ConcurrencyGroup: "grp"},
 		WebhookClaim: &WebhookClaim{Forge: "github", DeliveryID: "del-sup", RunID: newRunID},
 		Quota:        &QuotaReservation{RepoKey: repoID, JobCount: 1},
 	}
@@ -294,7 +294,7 @@ func TestMemStoreConcurrentSupersedeSingleWinner(t *testing.T) {
 			errs <- m.InsertCompiledRun(ctx(), InsertCompiledRunRequest{
 				Run:       model.Run{ID: runID, Repo: repo, ConcurrencyGroup: "grp", Status: model.StatusQueued, CreatedAt: time.Unix(3000+int64(n), 0).UTC()},
 				Jobs:      map[string]model.Job{jobID: {ID: jobID, RunID: runID, RepoURL: repo, Status: model.StatusQueued, CreatedAt: time.Unix(3000+int64(n), 0).UTC()}},
-				Supersede: &SupersedePolicy{Repo: repo, ConcurrencyGroup: "grp"},
+				Supersede: &SupersedePolicy{RepoID: RepoIDFor("", repo, "o/r"), ConcurrencyGroup: "grp"},
 			})
 		}(i)
 	}

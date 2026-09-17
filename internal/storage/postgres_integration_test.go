@@ -315,7 +315,7 @@ func TestPostgresIntegrationInsertCompiledRun(t *testing.T) {
 		Jobs:      map[string]model.Job{newJob: pgITJob(newRun, newJob, repo)},
 		Deps:      map[string][]string{newJob: {}},
 		Contracts: map[string]map[string]ArtifactContract{newJob: contracts},
-		Supersede: &SupersedePolicy{Repo: repo, ConcurrencyGroup: "grp"},
+		Supersede: &SupersedePolicy{RepoID: pgITRepoID, ConcurrencyGroup: "grp"},
 		Quota:     &QuotaReservation{RepoKey: pgITRepoID, JobCount: 1},
 		WebhookClaim: &WebhookClaim{
 			Forge: "github", DeliveryID: "del-new", RunID: newRun,
@@ -608,7 +608,7 @@ func TestPostgresIntegrationAcquireLeaseAtomicPredicates(t *testing.T) {
 		wg.Add(1)
 		go func(jobID, runnerID string) {
 			defer wg.Done()
-			_, err := st.AcquireLeaseAtomic(ctx, LeaseClaim{JobID: jobID, RunnerID: runnerID, TokenHash: []byte("h"), Generation: 1, ExpiresAt: time.Now().UTC().Add(time.Hour), RunnerCapacity: 1, Environment: "prod", EnvironmentConcurrency: 1, RepoURL: pgITRepo})
+			_, err := st.AcquireLeaseAtomic(ctx, LeaseClaim{JobID: jobID, RunnerID: runnerID, TokenHash: []byte("h"), Generation: 1, ExpiresAt: time.Now().UTC().Add(time.Hour), RunnerCapacity: 1, Environment: "prod", EnvironmentConcurrency: 1, CanonRepoID: pgITRepoID})
 			envResults <- err
 		}(jobID, runnerID)
 	}
@@ -658,7 +658,7 @@ func TestPostgresIntegrationAcquireLeaseAtomicPredicates(t *testing.T) {
 	}
 	quotaRunner := pgITNewID(t)
 	pgITSeedRunner(t, st, quotaRunner, 2, 0, 0)
-	baseClaim := LeaseClaim{RunnerID: quotaRunner, TokenHash: []byte("h"), Generation: 1, ExpiresAt: time.Now().UTC().Add(time.Hour), RunnerCapacity: 2, RepoURL: pgITRepo, RepoConcurrency: 1}
+	baseClaim := LeaseClaim{RunnerID: quotaRunner, TokenHash: []byte("h"), Generation: 1, ExpiresAt: time.Now().UTC().Add(time.Hour), RunnerCapacity: 2, RepoConcurrency: 1}
 	firstClaim := baseClaim
 	firstClaim.JobID = quotaJobA
 	if _, err := st.AcquireLeaseAtomic(ctx, firstClaim); err != nil {
@@ -706,7 +706,7 @@ func TestPostgresIntegrationCompleteJob(t *testing.T) {
 		t.Fatal(err)
 	}
 	pgITSeedRunner(t, st, runnerID, 1, 0, 0)
-	if _, err := st.AcquireLeaseAtomic(ctx, LeaseClaim{JobID: jobID, RunnerID: runnerID, TokenHash: []byte("h"), Generation: 1, ExpiresAt: time.Now().UTC().Add(time.Hour), RunnerCapacity: 1, RepoURL: repo}); err != nil {
+	if _, err := st.AcquireLeaseAtomic(ctx, LeaseClaim{JobID: jobID, RunnerID: runnerID, TokenHash: []byte("h"), Generation: 1, ExpiresAt: time.Now().UTC().Add(time.Hour), RunnerCapacity: 1}); err != nil {
 		t.Fatal(err)
 	}
 	receipt := model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID, ResultHash: "hash-1"}
@@ -846,7 +846,7 @@ func TestPostgresIntegrationCancelRunJobs(t *testing.T) {
 		t.Fatalf("seed unrelated run: %v", err)
 	}
 	pgITSeedRunner(t, st, runnerID, 1, 0, 0)
-	if _, err := st.AcquireLeaseAtomic(ctx, LeaseClaim{JobID: jobRunning, RunnerID: runnerID, TokenHash: []byte("h"), Generation: 1, ExpiresAt: time.Now().UTC().Add(time.Hour), RunnerCapacity: 1, RepoURL: repo}); err != nil {
+	if _, err := st.AcquireLeaseAtomic(ctx, LeaseClaim{JobID: jobRunning, RunnerID: runnerID, TokenHash: []byte("h"), Generation: 1, ExpiresAt: time.Now().UTC().Add(time.Hour), RunnerCapacity: 1}); err != nil {
 		t.Fatal(err)
 	}
 

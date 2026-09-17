@@ -179,13 +179,16 @@ func TestContainerBackendStartJobFakeDocker(t *testing.T) {
 	if len(lines) != 1 || !strings.Contains(lines[0], "job container started") {
 		t.Fatalf("emit = %v", lines)
 	}
-	// Read-only + rootless + explicit network produce the hardened flags.
+	// Read-only + rootless + explicit network produce the hardened flags. A
+	// rootless daemon runs the workload as namespace root: container root maps
+	// to the host runner uid, so the bind mount stays accessible without any
+	// host-side chown (see TestContainerBackendStartJobHardenedRootful…).
 	b2 := &ContainerBackend{Image: "alpine:3.19", Network: "kiwi-net", Rootless: true, ReadOnlyRootFS: true, RunID: "r", JobID: "j"}
 	if err := b2.StartJob(context.Background(), ws, func(string) {}); err != nil {
 		t.Fatalf("hardened StartJob: %v", err)
 	}
 	log := readFakeLog(t, "FAKE_DOCKER_LOG")
-	if !strings.Contains(log, "--read-only") || !strings.Contains(log, "--user=65534:65534") || !strings.Contains(log, "--network=kiwi-net") {
+	if !strings.Contains(log, "--read-only") || !strings.Contains(log, "--user=0:0") || !strings.Contains(log, "--network=kiwi-net") {
 		t.Fatalf("hardened args missing: %s", log)
 	}
 }

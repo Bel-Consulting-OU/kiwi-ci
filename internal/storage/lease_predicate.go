@@ -3,6 +3,7 @@ package storage
 import (
 	"encoding/json"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
@@ -154,17 +155,23 @@ func RepoFullNameFromURL(repoURL string) string {
 	return ""
 }
 
-// RepoIDForJob resolves the canonical repository identity of a job:
-// the immutable stored RepoID when present, otherwise derived from
-// RepoURL + RepoFullName (legacy records).
+// RepoIDForJob resolves the canonical repository identity of a job: the
+// immutable PolicyRepoID when present (the BASE repository of a fork PR,
+// which every authorization/quota/cache decision uses), otherwise the stored
+// RepoID, otherwise derived from RepoURL + RepoFullName (legacy records).
 func RepoIDForJob(j model.Job) string {
+	if id := strings.TrimSpace(j.PolicyRepoID); id != "" {
+		return id
+	}
 	return RepoIDFor(j.RepoID, j.RepoURL, j.RepoFullName)
 }
 
-// RepoIDForRun resolves the canonical repository identity of a run:
-// the immutable stored RepoID when present, otherwise derived from
-// Repo + RepoFullName (legacy records).
+// RepoIDForRun resolves the canonical repository identity of a run with the
+// same PolicyRepoID-first fallback as RepoIDForJob.
 func RepoIDForRun(r model.Run) string {
+	if id := strings.TrimSpace(r.PolicyRepoID); id != "" {
+		return id
+	}
 	return RepoIDFor(r.RepoID, r.Repo, r.RepoFullName)
 }
 
@@ -272,50 +279,157 @@ func JobRuntime(j model.Job) string {
 	}
 }
 
-// RepoHost extracts the forge host from a repository URL in the common forms
-// (https://host/owner/repo, ssh://git@host/owner/repo and the scp-like
-// git@host:owner/repo), mirroring the server's host derivation so canonical
-// repo IDs agree across packages. Scheme URLs keep a non-default port
-// (host:port is part of the identity); scp-like forms never do.
+// RepoHost extracts and CANONICALIZES the forge host from a repository URL
+// in the common forms (https://host/owner/repo, ssh://git@host/owner/repo
+// and the scp-like git@host:owner/repo), mirroring the server's host
+// derivation so canonical repo IDs agree across packages. The host is
+// lowercased with ONE trailing dot stripped and the default port of the
+// scheme dropped (443 https, 80 http, 22 ssh); a non-default port stays part
+// of the identity, and scp-like forms never carry a port.
 func RepoHost(repoURL string) string {
-	u := strings.TrimSpace(repoURL)
-	if i := strings.Index(u, "://"); i >= 0 {
-		rest := u[i+3:]
+	return canonicalHost(repoURL)
+}
+
+// canonicalHost normalizes a forge host spelling onto ONE canonical form so
+// equivalent spellings of the same forge derive the same repository identity
+// and the same quota/ACL keys: lowercase, ONE trailing dot stripped,
+// userinfo stripped, and the scheme's default port dropped (443 https, 80
+// http, 22 ssh; with no scheme the well-known default ports 443/80/22 are
+// dropped). Non-default ports stay part of the identity. It mirrors
+// auth.CanonicalHost and the server's canonicalHost; the pinning tests keep
+// the three implementations identical.
+func canonicalHost(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	if i := strings.Index(s, "://"); i >= 0 {
+		scheme := strings.ToLower(strings.TrimSpace(s[:i]))
+		rest := s[i+3:]
+		if j := strings.IndexAny(rest, "/?#"); j >= 0 {
+			rest = rest[:j]
+		}
 		if at := strings.LastIndex(rest, "@"); at >= 0 {
 			rest = rest[at+1:]
 		}
-		if slash := strings.Index(rest, "/"); slash >= 0 {
-			return rest[:slash]
+		return canonicalHostPort(scheme, rest)
+	}
+	if at := strings.LastIndex(s, "@"); at >= 0 {
+		rest := s[at+1:]
+		if colon := strings.Index(rest, ":"); colon >= 0 {
+			tail := rest[colon+1:]
+			if tail == "" || strings.Contains(tail, "/") {
+				return canonicalHostPort("ssh", rest[:colon])
+			}
 		}
-		return rest
+		return canonicalHostPort("", rest)
 	}
-	if at := strings.LastIndex(u, "@"); at >= 0 {
-		u = u[at+1:]
+	if j := strings.IndexAny(s, "/?#"); j >= 0 {
+		s = s[:j]
 	}
-	if colon := strings.Index(u, ":"); colon >= 0 {
-		return u[:colon]
+	if colon := strings.Index(s, ":"); colon > 0 && !strings.Contains(s[:colon], ":") {
+		if _, err := strconv.Atoi(s[colon+1:]); err != nil {
+			// Legacy "host:path" spelling with no scp user and no numeric
+			// port: the colon separates the host from a path, not a port.
+			s = s[:colon]
+		}
 	}
-	if slash := strings.Index(u, "/"); slash >= 0 {
-		return u[:slash]
+	return canonicalHostPort("", s)
+}
+
+// canonicalHostPort lowercases hostPort and drops its default port for
+// scheme.
+func canonicalHostPort(scheme, hostPort string) string {
+	hostPort = strings.TrimSpace(hostPort)
+	if hostPort == "" {
+		return ""
 	}
-	return u
+	if at := strings.LastIndex(hostPort, "@"); at >= 0 {
+		hostPort = hostPort[at+1:]
+	}
+	host, port := splitCanonHostPort(hostPort)
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if host == "" {
+		return ""
+	}
+	if port != "" && isDefaultHostPort(scheme, port) {
+		port = ""
+	}
+	if port != "" {
+		return host + ":" + port
+	}
+	return host
+}
+
+func splitCanonHostPort(hostPort string) (host, port string) {
+	if strings.HasPrefix(hostPort, "[") {
+		if end := strings.Index(hostPort, "]"); end > 0 {
+			host = hostPort[1:end]
+			if rest := hostPort[end+1:]; strings.HasPrefix(rest, ":") {
+				port = rest[1:]
+			}
+			return host, port
+		}
+		return hostPort, ""
+	}
+	if colon := strings.LastIndex(hostPort, ":"); colon > 0 && !strings.Contains(hostPort[:colon], ":") {
+		if _, err := strconv.Atoi(hostPort[colon+1:]); err == nil {
+			return hostPort[:colon], hostPort[colon+1:]
+		}
+	}
+	return hostPort, ""
+}
+
+func isDefaultHostPort(scheme, port string) bool {
+	switch scheme {
+	case "https":
+		return port == "443"
+	case "http":
+		return port == "80"
+	case "ssh":
+		return port == "22"
+	default:
+		return port == "443" || port == "80" || port == "22"
+	}
+}
+
+// splitHostLike splits "host/rest" when the first segment is host-like
+// (contains a dot) and the remainder itself contains a slash, so a GitLab
+// group with a dot in its name ("acme.co/service") is never mistaken for a
+// host. It mirrors auth's splitHostLike.
+func splitHostLike(key string) (first, rest string, ok bool) {
+	parts := strings.SplitN(key, "/", 2)
+	if len(parts) != 2 || !strings.Contains(parts[0], ".") || !strings.Contains(parts[1], "/") {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
 }
 
 // CanonicalRepoID is the canonical "<host>/<owner>/<name>" identity used by
 // repository allowlists and quota counters. It mirrors auth.CanonicalRepoID
 // without importing the auth package, so storage stays independent of the
 // server identity layer; the two derivations MUST stay identical. The forge
-// host is authoritative: a full name that already starts with exactly that
-// host is returned unchanged (idempotent), so re-canonicalizing a stored
-// RepoID is a no-op. With no known host the trimmed full name is returned
-// unchanged; an empty full name stays empty.
+// host is canonicalized first (see canonicalHost) and a full name that
+// already carries a canonically equivalent spelling of that host is reduced
+// to its owner/name remainder (idempotent); a name embedding a DIFFERENT
+// host is re-prefixed with the authoritative host. With no known host the
+// trimmed full name is returned unchanged; an empty full name stays empty.
 func CanonicalRepoID(host, fullName string) string {
-	host = strings.TrimSpace(host)
 	fullName = strings.TrimSpace(fullName)
 	if fullName == "" {
 		return ""
 	}
-	if host == "" || strings.HasPrefix(fullName, host+"/") {
+	host = canonicalHost(host)
+	if first, rest, ok := splitHostLike(fullName); ok {
+		canonFirst := canonicalHost(first)
+		if host == "" || canonFirst == host {
+			if host == "" {
+				host = canonFirst
+			}
+			fullName = rest
+		}
+	}
+	if host == "" {
 		return fullName
 	}
 	return host + "/" + fullName

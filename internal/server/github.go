@@ -119,9 +119,12 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	checkout := checkoutCloneURL(ec)
 	in := SubmitRun{
 		RepoID:            repoID,
-		RepoURL:           ec.HeadRepository.CloneURL,
+		PolicyRepoID:      repoID,
+		CheckoutRepoURL:   checkout,
+		RepoURL:           checkout,
 		RepoFullName:      ec.Repository.FullName,
 		Ref:               ec.Ref,
 		SHA:               ec.HeadSHA,
@@ -131,6 +134,7 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 		ChangedFiles:      files,
 		ChangedFilesKnown: filesKnown,
 		Metadata:          map[string]string{"github_delivery": delivery},
+		identityBound:     true,
 	}
 	run, err := s.enqueue(in)
 	if err != nil {

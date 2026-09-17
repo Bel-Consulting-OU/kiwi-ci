@@ -3,6 +3,11 @@
 # push, pull request, manual and tag events; the nightly fuzz lane runs on the
 # `nightly` cron job.
 #
+# CI split: Woodpecker owns EVERY Linux lane. Native macOS/Windows checks run
+# in the single narrowly-scoped GitHub Actions workflow
+# (.github/workflows/native.yml), because Woodpecker cannot execute non-Linux
+# jobs; that workflow never duplicates a Linux lane.
+#
 # Schema notes (verified against the Woodpecker 3.18 pipeline JSON schema):
 #   - `services` uses the map syntax: the map key is the service hostname.
 #   - `matrix` is a TOP-LEVEL key; a platform matrix duplicates the whole
@@ -230,6 +235,10 @@ steps:
         platform: linux/amd64
     commands:
       - go test -coverprofile=coverage.out -covermode=atomic ./...
+      # Assert both lanes' profiles before merging: a missing, empty,
+      # header-less or truncated profile fails here with a clear message
+      # instead of a confusing merge-coverage error.
+      - ./scripts/ci-coverage-selftest.sh coverage.out integration-coverage.out
       # The integration lane wrote integration-coverage.out into the shared
       # workspace; merge so the real SQL paths count toward the total.
       - ./scripts/merge-coverage.sh merged-coverage.out coverage.out integration-coverage.out
@@ -276,7 +285,37 @@ steps:
         }
         EOF
         go run /tmp/wait-postgres.go
-      - go test -count=1 -timeout=20m -v -run Integration ./internal/storage ./internal/scheduler ./internal/server
+      # The coverage lane merges this profile with the unit profile, so it
+      # must be written here with the same atomic mode and land in the shared
+      # workspace as integration-coverage.out. -coverpkg=./... makes the
+      # cross-package paths the integration tests drive (storage -> blob,
+      # db, safefs, ...) count toward the merged total instead of only the
+      # three target packages.
+      - go test -count=1 -timeout=20m -v -run Integration -covermode=atomic -coverprofile=integration-coverage.out -coverpkg=./... ./internal/storage ./internal/scheduler ./internal/server
+
+  # Hardened-container workspace lane. The integration test self-skips
+  # unless KIWI_TEST_DOCKER=1; the preflight exports it only when this agent
+  # actually exposes a usable docker daemon (CLI + socket), so agents without
+  # one keep the pipeline green while still printing why the lane skipped.
+  # Enable it on an agent by baking the docker CLI into the pipeline image
+  # and mounting the daemon socket.
+  docker-workspace:
+    image: golang:1.27
+    depends_on: [unit]
+    environment:
+      GOTOOLCHAIN: local
+    when:
+      - event: [push, pull_request, manual, tag]
+        platform: linux/amd64
+    commands:
+      - |
+        if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+          export KIWI_TEST_DOCKER=1
+          echo "docker daemon available: running the rootless/hardened workspace integration test"
+        else
+          echo "no usable docker daemon on this agent (CLI or socket missing); the test will self-skip"
+        fi
+        go test -count=1 -v -timeout=20m -run RootlessHardenedContainerWorkspace ./internal/runner
 
   # Nightly fuzz lane. Woodpecker cron jobs are created in the repository
   # settings (name `nightly`, schedule `0 3 * * *`, branch main); this step

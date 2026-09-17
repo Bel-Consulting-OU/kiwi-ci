@@ -223,20 +223,20 @@ func (f *fcStore) ListQueuedJobs(ctx context.Context) ([]model.Job, error) {
 	return f.dbFakeStore.ListQueuedJobs(ctx)
 }
 
-func (f *fcStore) ListJobsByEnvironment(ctx context.Context, repoURL, environment string) ([]model.Job, error) {
+func (f *fcStore) ListJobsByEnvironment(ctx context.Context, repoID, environment string) ([]model.Job, error) {
 	if f.listJobsByEnvErr != nil {
 		return nil, f.listJobsByEnvErr
 	}
 	if f.queuedOverride != nil {
 		out := []model.Job{}
 		for _, j := range f.queuedOverride {
-			if j.RepoURL == repoURL && j.Environment == environment {
+			if storage.RepoIDForJob(j) == repoID && j.Environment == environment {
 				out = append(out, j)
 			}
 		}
 		return out, nil
 	}
-	return f.dbFakeStore.ListJobsByEnvironment(ctx, repoURL, environment)
+	return f.dbFakeStore.ListJobsByEnvironment(ctx, repoID, environment)
 }
 
 func (f *fcStore) SetQueueReasons(ctx context.Context, reasons map[string]string) error {

@@ -515,7 +515,7 @@ func faultOps() []opCase {
 				return s.(RunEnqueueStore).InsertCompiledRun(ctx(), InsertCompiledRunRequest{
 					Run:          model.Run{ID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad", Repo: "https://github.com/o/r.git", Status: model.StatusQueued, ConcurrencyGroup: "grp", CreatedAt: time.Unix(2000, 0).UTC()},
 					Jobs:         jobs,
-					Supersede:    &SupersedePolicy{Repo: "https://github.com/o/r.git", ConcurrencyGroup: "grp"},
+					Supersede:    &SupersedePolicy{RepoID: RepoIDFor("", "https://github.com/o/r.git", ""), ConcurrencyGroup: "grp"},
 					WebhookClaim: &WebhookClaim{Forge: "github", DeliveryID: "del-stage", RunID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad"},
 					Quota:        &QuotaReservation{RepoKey: "https://github.com/o/r.git", JobCount: 8},
 				})
@@ -836,7 +836,7 @@ func TestFaultInjectionAtomicEnqueueEveryStage(t *testing.T) {
 		return InsertCompiledRunRequest{
 			Run:          model.Run{ID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad", Repo: repo, Status: model.StatusQueued, ConcurrencyGroup: "grp", CreatedAt: time.Unix(2000, 0).UTC()},
 			Jobs:         jobs,
-			Supersede:    &SupersedePolicy{Repo: repo, ConcurrencyGroup: "grp"},
+			Supersede:    &SupersedePolicy{RepoID: RepoIDFor("", repo, ""), ConcurrencyGroup: "grp"},
 			WebhookClaim: &WebhookClaim{Forge: "github", DeliveryID: "del-stage", RunID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad"},
 			Quota:        &QuotaReservation{RepoKey: repo, JobCount: jobCount},
 		}

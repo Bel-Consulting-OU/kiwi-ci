@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
@@ -34,6 +33,13 @@ type Snapshot struct {
 	// equivalents). Additive; older snapshots load with nil maps.
 	Profiles         map[string]model.RunnerProfile `json:"profiles,omitempty"`
 	CertProfileLinks map[string]string              `json:"cert_profile_links,omitempty"`
+	// Snapshots persists the fs-mode uploaded workspace snapshot records
+	// (workspace_snapshots equivalents) so the archives written under the
+	// data dir stay addressable across restarts instead of becoming
+	// unreferenced orphans. Additive; older snapshots load with a nil map.
+	// The server validates every referenced archive/manifest pair at load
+	// and drops records whose files no longer match.
+	Snapshots map[string]model.SnapshotRecord `json:"snapshots,omitempty"`
 }
 
 type Repository struct {
@@ -85,6 +91,9 @@ func (r *Repository) loadLocked() (Snapshot, error) {
 	if s.CertProfileLinks == nil {
 		s.CertProfileLinks = map[string]string{}
 	}
+	if s.Snapshots == nil {
+		s.Snapshots = map[string]model.SnapshotRecord{}
+	}
 	return s, nil
 }
 
@@ -99,16 +108,11 @@ func (r *Repository) Save(s Snapshot) error {
 	if err != nil {
 		return err
 	}
-	tmp := filepath.Join(r.Root, fmt.Sprintf("state.%d.tmp", time.Now().UnixNano()))
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	f, err := os.OpenFile(tmp, os.O_RDWR, 0)
-	if err == nil {
-		_ = f.Sync()
-		_ = f.Close()
-	}
-	return os.Rename(tmp, filepath.Join(r.Root, "state.json"))
+	// AtomicWriteFile checks the temp file's Sync/Close errors and fsyncs
+	// the parent directory after the rename: a state snapshot is only
+	// reported written when it is durable, and a crash can never leave a
+	// truncated or half-renamed state.json.
+	return AtomicWriteFile(filepath.Join(r.Root, "state.json"), b, 0o600)
 }
 
 func (r *Repository) AppendLog(e model.LogEntry) error {

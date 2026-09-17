@@ -2,9 +2,10 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
-	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -44,13 +45,14 @@ type scheduleRequest struct {
 }
 
 // scheduleRepoID resolves the stored canonical repository identity of a
-// schedule: the RepoID field when present (authoritative), otherwise derived
-// from the stored identity fields at load. Legacy rows stored the clone URL
-// as both identity and clone URL, so a URL-shaped Repository is first
-// reduced to its forge-native owner/name before canonicalization.
+// schedule: the RepoID field when present (authoritative, canonicalized so
+// equivalent forge-host spellings agree), otherwise derived from the stored
+// identity fields at load. Legacy rows stored the clone URL as both identity
+// and clone URL, so a URL-shaped Repository is first reduced to its
+// forge-native owner/name before canonicalization.
 func scheduleRepoID(sc storage.Schedule) string {
 	if id := strings.TrimSpace(sc.RepoID); id != "" {
-		return id
+		return auth.NormalizeRepoKey(id)
 	}
 	fullName := strings.TrimSpace(sc.Repository)
 	repoURL := strings.TrimSpace(scheduleRepoURL(sc))
@@ -60,6 +62,156 @@ func scheduleRepoID(sc storage.Schedule) string {
 		fullName = repoFullNameFromCloneURL(fullName)
 	}
 	return auth.CanonicalRepoID(repoHost(repoURL), fullName)
+}
+
+// bindScheduleRepoIdentity is the STRICT create/update binding for a
+// schedule: repo_url is authoritative and the submitted Repository must
+// canonicalize to the SAME repository path (and, when Repository is itself
+// URL-shaped, the same host-scoped identity), case-insensitively with one
+// ".git" suffix stripped. It returns the canonical forge host, the canonical
+// RepoID, the clone URL to store and the normalized display name. The legacy
+// form that carried the clone URL in Repository is still accepted, but the
+// stored display name is normalized to the repository path.
+func bindScheduleRepoIdentity(repository, repoURL string) (host, identity, cloneURL, display string, err error) {
+	repo := strings.TrimSpace(repository)
+	url := strings.TrimSpace(repoURL)
+	if url == "" {
+		// Legacy form: Repository itself carried the clone URL.
+		url = repo
+	}
+	host, path, perr := parseCloneURL(url)
+	if perr != nil {
+		return "", "", "", "", fmt.Errorf("repo_url must be a clone URL naming a host and repository path: %w", perr)
+	}
+	identity = auth.CanonicalRepoID(host, path)
+	if repo == "" {
+		return "", "", "", "", errors.New("repository is required")
+	}
+	if dh, dp, derr := parseCloneURL(repo); derr == nil {
+		if !strings.EqualFold(auth.CanonicalRepoID(dh, dp), identity) {
+			return "", "", "", "", errors.New("repository URL does not match the host and repository path of repo_url")
+		}
+		display = dp
+	} else {
+		dp, ok := forgePathFromFullName(repo)
+		if !ok || !strings.EqualFold(dp, path) {
+			return "", "", "", "", fmt.Errorf("repository %q does not match the repository path %q of repo_url", repo, path)
+		}
+		display = dp
+	}
+	return host, identity, url, display, nil
+}
+
+// durableScheduleIdentity validates and normalizes one DURABLE schedule row
+// (loaded from the SQL store or schedules.json). It returns a copy with the
+// canonical RepoID/RepoURL/Forge populated, or an error describing why the
+// stored identity cannot be trusted:
+//
+//   - the clone URL (RepoURL, or the legacy Repository-as-URL) must parse
+//     through the strict parser;
+//   - the stored Repository must name the same repository path — and, when
+//     it is URL-shaped, the same host-scoped identity;
+//   - a stored RepoID, when present, must equal the URL-derived canonical
+//     identity (case-insensitively).
+//
+// A row with an EMPTY RepoID is the pre-RepoID legacy shape: it is accepted
+// only when Repository/RepoURL agree, and the derived identity is filled in,
+// so the row is migrated rather than grandfathered with an inconsistent one.
+func durableScheduleIdentity(sc storage.Schedule) (storage.Schedule, error) {
+	cloneURL := strings.TrimSpace(scheduleRepoURL(sc))
+	if cloneURL == "" {
+		return sc, errors.New("schedule has no clone URL")
+	}
+	host, path, err := parseCloneURL(cloneURL)
+	if err != nil {
+		return sc, fmt.Errorf("clone URL: %w", err)
+	}
+	identity := auth.CanonicalRepoID(host, path)
+	display := strings.TrimSpace(sc.Repository)
+	if display == "" {
+		return sc, errors.New("schedule has no repository name")
+	}
+	displayPath, ok := forgePathFromFullName(display)
+	if !ok || !strings.EqualFold(displayPath, path) {
+		return sc, fmt.Errorf("repository %q does not match clone URL repository path %q", display, path)
+	}
+	if dh, dp, derr := parseCloneURL(display); derr == nil {
+		if !strings.EqualFold(auth.CanonicalRepoID(dh, dp), identity) {
+			return sc, fmt.Errorf("repository URL %q does not match repo_url %q", display, cloneURL)
+		}
+	}
+	if stored := strings.TrimSpace(sc.RepoID); stored != "" {
+		if !strings.EqualFold(auth.NormalizeRepoKey(stored), identity) {
+			return sc, fmt.Errorf("stored repo_id %q does not match clone URL identity %q", stored, identity)
+		}
+	}
+	sc.RepoID = identity
+	if strings.TrimSpace(sc.RepoURL) == "" {
+		sc.RepoURL = cloneURL
+	}
+	if sc.Forge == "" {
+		sc.Forge = forgeKindForHost(host)
+	}
+	return sc, nil
+}
+
+// disabledSchedule is one durable schedule that failed load-time identity
+// validation and was disabled (fail closed) with its reason.
+type disabledSchedule struct {
+	Schedule storage.Schedule
+	Reason   string
+}
+
+// validateLoadedSchedules validates every durable schedule and DISABLES each
+// one whose stored identity is inconsistent. Disabling is the policy for
+// TRUSTED and UNTRUSTED rows alike (consistency; documented here): a durable
+// row whose identity cannot be proven must never fire, and a disabled row is
+// never silently re-enabled — fixing it requires an explicit API update,
+// which re-runs the same binding checks. Kept rows carry the canonical
+// identity fields.
+func validateLoadedSchedules(list []storage.Schedule) (kept []storage.Schedule, disabled []disabledSchedule) {
+	for _, sc := range list {
+		valid, err := durableScheduleIdentity(sc)
+		if err != nil {
+			sc.Enabled = false
+			kept = append(kept, sc)
+			disabled = append(disabled, disabledSchedule{Schedule: sc, Reason: err.Error()})
+			continue
+		}
+		kept = append(kept, valid)
+	}
+	return kept, disabled
+}
+
+// reportDisabledSchedules audits and logs every schedule disabled at load
+// and persists the disabled state through the durable store (best effort;
+// the in-memory row is already disabled, so the schedule never fires even if
+// the write fails). Migration note: no schema change is required for this
+// validation — it runs at load time, so a hand-crafted inconsistent row is
+// quarantined on the next start.
+func (s *Server) reportDisabledSchedules(ctx context.Context, disabled []disabledSchedule) {
+	for _, d := range disabled {
+		s.auditLocked("schedule.invalid_disabled", "scheduler", "", "", "durable schedule disabled at load: "+d.Reason,
+			map[string]string{"schedule": d.Schedule.ID, "repository": d.Schedule.Repository, "repo_url": d.Schedule.RepoURL, "reason": d.Reason})
+		s.logError("schedules: durable schedule disabled at load", "schedule", d.Schedule.ID, "repository", d.Schedule.Repository, "error", d.Reason)
+	}
+	if len(disabled) == 0 {
+		return
+	}
+	if ss, ok := s.scheduleStoreDB(); ok {
+		for _, d := range disabled {
+			if err := ss.UpsertSchedule(ctx, d.Schedule); err != nil {
+				s.logError("schedules: persist disabled schedule failed", "schedule", d.Schedule.ID, "error", err.Error())
+			}
+		}
+		return
+	}
+	s.mu.Lock()
+	err := s.persistSchedulesLocked()
+	s.mu.Unlock()
+	if err != nil {
+		s.logError("schedules: persist disabled schedules failed", "error", err.Error())
+	}
 }
 
 // scheduleRepoFullName resolves the human-readable repository name of a
@@ -140,7 +292,11 @@ func (s *Server) scheduleStoreDB() (storage.ScheduleStore, bool) {
 	return ss, ok
 }
 
-// loadSchedules restores fs-mode schedules from dataDir/schedules.json.
+// loadSchedules restores fs-mode schedules from dataDir/schedules.json. Every
+// durable row is validated at load: a schedule whose stored
+// Repository/RepoURL mismatch or whose stored RepoID disagrees with the URL
+// is DISABLED (fail closed), audited and logged, and the disabled state is
+// written back — it is never grandfathered into firing.
 func (s *Server) loadSchedules(dataDir string) error {
 	if dataDir == "" {
 		return nil
@@ -156,16 +312,23 @@ func (s *Server) loadSchedules(dataDir string) error {
 	if err := jsonUnmarshal(b, &f); err != nil {
 		return err
 	}
-	for _, sc := range f.Schedules {
+	kept, disabled := validateLoadedSchedules(f.Schedules)
+	s.mu.Lock()
+	for _, sc := range kept {
 		s.schedules[sc.ID] = sc
 	}
 	for id, occ := range f.Occurrences {
 		s.occurrences[id] = occ
 	}
+	s.mu.Unlock()
+	s.reportDisabledSchedules(context.Background(), disabled)
 	return nil
 }
 
-// reloadSchedulesDB loads schedules from the SQL store into memory.
+// reloadSchedulesDB loads schedules from the SQL store into memory, applying
+// the SAME load-time identity validation as fs mode: inconsistent rows are
+// disabled (fail closed) with an audit line, a load log and a persisted
+// disabled state.
 func (s *Server) reloadSchedulesDB(ctx context.Context) error {
 	ss, ok := s.scheduleStoreDB()
 	if !ok {
@@ -175,23 +338,49 @@ func (s *Server) reloadSchedulesDB(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	kept, disabled := validateLoadedSchedules(list)
 	s.mu.Lock()
-	for _, sc := range list {
+	for _, sc := range kept {
 		s.schedules[sc.ID] = sc
 	}
 	s.mu.Unlock()
+	s.reportDisabledSchedules(ctx, disabled)
 	return nil
 }
 
-// writeSchedulesFile is a test-only seam over the schedules-file writer
-// (marshalJSONFile): production always uses the real atomic write, tests
-// override it to fail a specific write and exercise the best-effort last_run
-// persistence branch.
-var writeSchedulesFile = marshalJSONFile
+// writeSchedulesFile is a test-only seam over the schedules-file writer:
+// production writes through storage.AtomicWriteFile (checked Sync/Close,
+// atomic rename, parent-directory fsync), tests override it to fail a
+// specific write and exercise the durable-first advancement and the
+// best-effort post-fire marker persistence branches.
+var writeSchedulesFile = writeSchedulesJSONFile
+
+// writeSchedulesJSONFile marshals the schedules state and durably replaces
+// the schedules file. The v parameter is any so the test seam keeps the
+// shared json-file signature.
+func writeSchedulesJSONFile(path string, v any) error {
+	f, ok := v.(schedulesFileJSON)
+	if !ok {
+		return fmt.Errorf("schedules: unexpected payload type %T", v)
+	}
+	b, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		return err
+	}
+	return storage.AtomicWriteFile(path, append(b, '\n'), 0o600)
+}
 
 // persistSchedulesLocked atomically writes fs-mode schedules. Callers hold
 // s.mu. DB mode schedules live in the SQL store; the fs file is untouched.
 func (s *Server) persistSchedulesLocked() error {
+	return s.persistSchedulesWithLocked(nil)
+}
+
+// persistSchedulesWithLocked serializes the fs-mode schedules file with the
+// given per-ID overrides applied WITHOUT mutating the in-memory maps: a
+// durable-first advance can stage a candidate LastRun, write it, and only
+// touch the mirror once the file write succeeded. Callers hold s.mu.
+func (s *Server) persistSchedulesWithLocked(overrides map[string]storage.Schedule) error {
 	if s.dataDir == "" || s.DB != nil {
 		return nil
 	}
@@ -199,7 +388,10 @@ func (s *Server) persistSchedulesLocked() error {
 		Schedules:   make([]storage.Schedule, 0, len(s.schedules)),
 		Occurrences: s.occurrences,
 	}
-	for _, sc := range s.schedules {
+	for id, sc := range s.schedules {
+		if o, ok := overrides[id]; ok {
+			sc = o
+		}
 		f.Schedules = append(f.Schedules, sc)
 	}
 	sort.Slice(f.Schedules, func(i, j int) bool { return f.Schedules[i].ID < f.Schedules[j].ID })
@@ -257,30 +449,19 @@ func (s *Server) upsertSchedule(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid schedule spec: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	// Identity derivation: Repository is the human-readable name, RepoURL
-	// the clone URL. The canonical RepoID and the Forge kind are derived
-	// once and stored, so automatic firing uses the immutable stored
-	// identity. A URL-shaped Repository (the legacy form that stored the
-	// clone URL as identity) is reduced to its forge-native owner/name; the
-	// canonical identity is REQUIRED: a repository without a forge host
-	// cannot be scheduled, because a bare name is shared across forges.
-	repoURL := strings.TrimSpace(in.RepoURL)
-	if repoURL == "" {
-		repoURL = in.Repository
-	}
-	repoID := auth.CanonicalRepoID(repoHost(repoURL), in.Repository)
-	if u, err := url.Parse(in.Repository); err == nil && u.Host != "" {
-		fullName := repoFullNameFromCloneURL(in.Repository)
-		if fullName == "" {
-			http.Error(w, "repository URL names no repository path", http.StatusBadRequest)
-			return
-		}
-		repoID = auth.CanonicalRepoID(repoHost(in.Repository), fullName)
-	}
-	if strings.Count(repoID, "/") < 2 {
-		http.Error(w, "repo_url is required to derive the canonical repository identity (host/owner/name)", http.StatusBadRequest)
+	// Identity derivation and BINDING: repo_url is authoritative and the
+	// submitted Repository must canonicalize to the SAME repository path
+	// (and host identity when Repository is itself URL-shaped). This runs
+	// BEFORE the trusted_run authorization below, so a mismatched request
+	// can never obtain trusted execution for a repository it does not name.
+	// The canonical RepoID, clone URL and Forge kind are stored, so
+	// automatic firing uses the immutable stored identity.
+	host, repoID, repoURL, display, bindErr := bindScheduleRepoIdentity(in.Repository, in.RepoURL)
+	if bindErr != nil {
+		http.Error(w, bindErr.Error(), http.StatusBadRequest)
 		return
 	}
+	in.Repository = display
 	if in.Trusted {
 		// A TRUSTED schedule fires with trusted capabilities: creating or
 		// updating one requires the repo-scoped trusted_run grant for the
@@ -326,7 +507,7 @@ func (s *Server) upsertSchedule(w http.ResponseWriter, r *http.Request) {
 		sc.Repository = in.Repository
 		sc.RepoID = repoID
 		sc.RepoURL = repoURL
-		sc.Forge = forgeKindForHost(repoHost(repoURL))
+		sc.Forge = forgeKindForHost(host)
 		sc.Trusted = in.Trusted
 		sc.Spec = in.Spec
 		sc.Enabled = enabled
@@ -360,7 +541,7 @@ func (s *Server) upsertSchedule(w http.ResponseWriter, r *http.Request) {
 		sc.Repository = in.Repository
 		sc.RepoID = repoID
 		sc.RepoURL = repoURL
-		sc.Forge = forgeKindForHost(repoHost(repoURL))
+		sc.Forge = forgeKindForHost(host)
 		sc.Trusted = in.Trusted
 		sc.Spec = in.Spec
 		sc.Enabled = enabled
@@ -466,8 +647,12 @@ func (s *Server) fireDueSchedules(ctx context.Context, now time.Time) {
 		if _, fired, err := s.fireSchedule(ctx, d.sc, d.nominal); err != nil {
 			if errors.Is(err, errScheduleUnauthorized) {
 				// Trust revoked: skip this occurrence (already audited) and
-				// advance, so the schedule does not spin retrying it.
-				s.advanceSchedulePast(ctx, d.sc, d.nominal)
+				// advance durably, so the schedule does not spin retrying
+				// it. A failed advance leaves the marker untouched and is
+				// retried on the next tick.
+				if aerr := s.advanceSchedulePast(ctx, d.sc, d.nominal); aerr != nil {
+					s.logError("schedule advance failed", "schedule", d.sc.ID, "error", aerr.Error())
+				}
 				continue
 			}
 			s.logError("schedule fire failed", "schedule", d.sc.ID, "error", err.Error())
@@ -475,8 +660,11 @@ func (s *Server) fireDueSchedules(ctx context.Context, now time.Time) {
 			// enqueue: leave LastRun so the next tick refires it.
 			continue
 		} else if !fired {
-			// Another instance claimed this nominal; skip ahead.
-			s.advanceSchedulePast(ctx, d.sc, d.nominal)
+			// Another instance claimed this nominal; skip ahead durably. A
+			// failed advance is retried on the next tick.
+			if aerr := s.advanceSchedulePast(ctx, d.sc, d.nominal); aerr != nil {
+				s.logError("schedule advance failed", "schedule", d.sc.ID, "error", aerr.Error())
+			}
 			continue
 		}
 	}
@@ -509,15 +697,60 @@ func (s *Server) scheduleTrustStillGranted(sc storage.Schedule) bool {
 	return auth.Authorize(p, auth.ActionTrustedRun, scheduleRepoID(sc), true)
 }
 
-// advanceSchedulePast moves the in-memory schedule's LastRun marker past a
+// advanceSchedulePast durably moves a schedule's LastRun marker past a
 // nominal that could not be (or was already) claimed, so the next tick
-// evaluates the following occurrence instead of spinning.
-func (s *Server) advanceSchedulePast(ctx context.Context, sc storage.Schedule, nominal time.Time) {
-	if sc.LastRun == nil || sc.LastRun.Before(nominal) {
-		sc.LastRun = &nominal
-		s.mu.Lock()
-		s.schedules[sc.ID] = sc
+// evaluates the following occurrence instead of spinning. The advance is
+// durable FIRST and MONOTONIC: the store applies max(last_run, nominal)
+// (SQL GREATEST), and the in-memory mirror is updated only after that write
+// succeeds. A returned error means the marker was not advanced anywhere;
+// the caller retries it on the next tick.
+func (s *Server) advanceSchedulePast(ctx context.Context, sc storage.Schedule, nominal time.Time) error {
+	nominal = nominal.UTC()
+	if ss, ok := s.scheduleStoreDB(); ok {
+		if err := ss.AdvanceScheduleLastRun(ctx, sc.ID, nominal); err != nil {
+			return err
+		}
+		s.setScheduleLastRunMirror(sc.ID, nominal)
+		return nil
+	}
+	// fs mode: schedules.json is the durable store. Stage the candidate
+	// marker and write it BEFORE touching the mirror, so a failed write
+	// leaves memory (and the next tick's due computation) exactly where it
+	// was.
+	s.mu.Lock()
+	cur, ok := s.schedules[sc.ID]
+	if !ok {
 		s.mu.Unlock()
+		return nil
+	}
+	if cur.LastRun != nil && !cur.LastRun.Before(nominal) {
+		s.mu.Unlock()
+		return nil
+	}
+	cand := cur
+	cand.LastRun = &nominal
+	persistErr := s.persistSchedulesWithLocked(map[string]storage.Schedule{sc.ID: cand})
+	s.mu.Unlock()
+	if persistErr != nil {
+		return persistErr
+	}
+	s.setScheduleLastRunMirror(sc.ID, nominal)
+	return nil
+}
+
+// setScheduleLastRunMirror applies a committed durable advance to the local
+// mirror. The mirror only ever moves forward, so a stale in-memory value
+// (or a concurrent advance) can never be dragged backwards.
+func (s *Server) setScheduleLastRunMirror(id string, nominal time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, ok := s.schedules[id]
+	if !ok {
+		return
+	}
+	if cur.LastRun == nil || cur.LastRun.Before(nominal) {
+		cur.LastRun = &nominal
+		s.schedules[id] = cur
 	}
 }
 
@@ -578,6 +811,17 @@ func (s *Server) nextDueScheduleFrom(now time.Time, seen map[string]bool) (stora
 // schedule's STORED immutable identity (RepoID, RepoURL, Trusted) — never
 // the caller's request context.
 func (s *Server) fireSchedule(ctx context.Context, sc storage.Schedule, nominal time.Time) (model.Run, bool, error) {
+	// Fail closed on an inconsistent stored identity, even when the row was
+	// injected directly instead of passing the load-time validation: a
+	// schedule whose Repository/RepoURL/RepoID disagree never fires. The
+	// validated copy supplies the canonical RepoID/RepoURL/Forge used below.
+	valid, idErr := durableScheduleIdentity(sc)
+	if idErr != nil {
+		s.auditLocked("schedule.invalid_disabled", "scheduler", "", "", "schedule occurrence refused: stored identity is inconsistent",
+			map[string]string{"schedule": sc.ID, "repository": sc.Repository, "repo_url": sc.RepoURL, "reason": idErr.Error()})
+		return model.Run{}, false, fmt.Errorf("schedule %s identity invalid: %w", sc.ID, idErr)
+	}
+	sc = valid
 	// Trusted schedules are a REVOCABLE delegation: automatic firing
 	// re-checks the creator principal's CURRENT grants (trusted_run for the
 	// schedule's stored repository) when a principal store is configured.
@@ -597,15 +841,22 @@ func (s *Server) fireSchedule(ctx context.Context, sc storage.Schedule, nominal 
 	if err != nil {
 		return model.Run{}, false, err
 	}
+	// The fired run carries the schedule's stored canonical identity: the
+	// policy identity is the schedule's RepoID and the checkout URL is its
+	// stored clone URL. The submission is server-derived, so it skips the
+	// direct-submission binding.
 	in := SubmitRun{
-		RepoID:       scheduleRepoID(sc),
-		RepoURL:      scheduleRepoURL(sc),
-		RepoFullName: scheduleRepoFullName(sc),
-		Ref:          ref,
-		Event:        "schedule",
-		Pipeline:     sanitizeScheduleSpec(sc.Spec),
-		Trusted:      sc.Trusted,
-		Metadata:     map[string]string{"schedule_id": sc.ID, "schedule_nominal": nominal.Format(time.RFC3339)},
+		RepoID:          scheduleRepoID(sc),
+		PolicyRepoID:    scheduleRepoID(sc),
+		CheckoutRepoURL: scheduleRepoURL(sc),
+		RepoURL:         scheduleRepoURL(sc),
+		RepoFullName:    scheduleRepoFullName(sc),
+		identityBound:   true,
+		Ref:             ref,
+		Event:           "schedule",
+		Pipeline:        sanitizeScheduleSpec(sc.Spec),
+		Trusted:         sc.Trusted,
+		Metadata:        map[string]string{"schedule_id": sc.ID, "schedule_nominal": nominal.Format(time.RFC3339)},
 		// The occurrence claim commits atomically with the run.
 		ScheduleClaim: &storage.ScheduleClaim{ScheduleID: sc.ID, Nominal: nominal},
 	}
@@ -618,19 +869,15 @@ func (s *Server) fireSchedule(ctx context.Context, sc storage.Schedule, nominal 
 		s.auditLocked("schedule.trigger_failed", "scheduler", "", "", "scheduled run rejected", map[string]string{"schedule": sc.ID, "error": err.Error()})
 		return model.Run{}, false, err
 	}
-	nominalCopy := nominal
-	sc.LastRun = &nominalCopy
-	if ss, ok := s.scheduleStoreDB(); ok {
-		if err := ss.UpsertSchedule(ctx, sc); err != nil {
-			s.logError("schedule last_run update failed", "schedule", sc.ID, "error", err.Error())
-		}
-	}
-	s.mu.Lock()
-	s.schedules[sc.ID] = sc
-	persistErr := s.persistSchedulesLocked()
-	s.mu.Unlock()
-	if persistErr != nil {
-		s.logError("schedule persistence failed", "schedule", sc.ID, "error", persistErr.Error())
+	// The occurrence claim is already durable (inside the enqueue
+	// transaction in DB mode, in the persisted schedules file in fs mode),
+	// so this nominal can never refire. last_run only drives the NEXT due
+	// computation: advance it through the same durable, monotonic contract
+	// the skip path uses, and log (never fail the fired run) when the
+	// durable write is unavailable — the next tick converges it through the
+	// claim check or the skip advance.
+	if err := s.advanceSchedulePast(ctx, sc, nominal); err != nil {
+		s.logError("schedule last_run advance failed", "schedule", sc.ID, "error", err.Error())
 	}
 	s.auditLocked("schedule.triggered", "scheduler", run.ID, "", "scheduled run enqueued", map[string]string{"schedule": sc.ID, "nominal": nominal.Format(time.RFC3339)})
 	return run, true, nil

@@ -128,8 +128,8 @@ func TestEnqueueDBSupersessionCancelsAtomically(t *testing.T) {
 		t.Fatalf("InsertCompiledRun calls = %d, want 2", len(f.compiledCalls))
 	}
 	req := f.compiledCalls[1]
-	if req.Supersede == nil || req.Supersede.Repo != "https://github.com/o/r.git" || req.Supersede.ConcurrencyGroup != "grp" {
-		t.Fatalf("second enqueue supersede policy = %+v", req.Supersede)
+	if req.Supersede == nil || req.Supersede.RepoID != "github.com/o/r" || req.Supersede.ConcurrencyGroup != "grp" {
+		t.Fatalf("second enqueue supersede policy = %+v, want the canonical repo id", req.Supersede)
 	}
 	if len(req.CancelPrevious) != 0 {
 		t.Fatalf("second enqueue precomputed cancel list = %v, want none", req.CancelPrevious)

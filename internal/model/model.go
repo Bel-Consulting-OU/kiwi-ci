@@ -36,9 +36,20 @@ type Run struct {
 	// may be a URL or a bare owner/name. Additive: records persisted before
 	// RepoID default to empty and consumers derive the identity from
 	// Repo + RepoFullName (see the repoIDFor helpers).
-	RepoID           string            `json:"repo_id,omitempty"`
-	Repo             string            `json:"repo,omitempty"`
-	RepoFullName     string            `json:"repo_full_name,omitempty"`
+	RepoID       string `json:"repo_id,omitempty"`
+	Repo         string `json:"repo,omitempty"`
+	RepoFullName string `json:"repo_full_name,omitempty"`
+	// PolicyRepoID is the canonical repository identity every AUTHORIZATION
+	// decision uses (policy lookup, RBAC, OIDC, quotas, cache namespace,
+	// downstream authorization, schedule ownership, runner ACLs, audit). For
+	// a PR from a fork it is the BASE repository's canonical ID, never the
+	// head's. It is additive: records persisted before it default to empty
+	// and consumers fall back to the derived RepoID (see repoIDForRun).
+	PolicyRepoID string `json:"policy_repo_id,omitempty"`
+	// CheckoutRepoURL is the clone URL the run's jobs check out: the fork
+	// HEAD repository's clone URL for cross-repo PRs. It is additive;
+	// legacy records default to empty and the runner falls back to Repo.
+	CheckoutRepoURL  string            `json:"checkout_repo_url,omitempty"`
 	Ref              string            `json:"ref,omitempty"`
 	SHA              string            `json:"sha,omitempty"`
 	Event            string            `json:"event,omitempty"`
@@ -70,9 +81,19 @@ type Job struct {
 	// scheduling decision uses; RepoURL/RepoFullName are display/clone
 	// fields only. Additive: empty on legacy records, where consumers derive
 	// the identity from RepoURL + RepoFullName.
-	RepoID           string   `json:"repo_id,omitempty"`
-	RepoURL          string   `json:"repo_url"`
-	RepoFullName     string   `json:"repo_full_name,omitempty"`
+	RepoID       string `json:"repo_id,omitempty"`
+	RepoURL      string `json:"repo_url"`
+	RepoFullName string `json:"repo_full_name,omitempty"`
+	// PolicyRepoID is the canonical repository identity every authorization,
+	// policy, quota, cache and scheduling decision uses; for fork PRs it is
+	// the BASE repository (copied from the run), never the head. Additive:
+	// empty on legacy records, where consumers derive the identity from
+	// RepoID/RepoURL + RepoFullName.
+	PolicyRepoID string `json:"policy_repo_id,omitempty"`
+	// CheckoutRepoURL is the clone URL the runner must check out (the fork
+	// head URL for cross-repo PRs). It is delivered on the task's RepoURL;
+	// additive, defaults to RepoURL.
+	CheckoutRepoURL  string   `json:"checkout_repo_url,omitempty"`
 	Ref              string   `json:"ref,omitempty"`
 	SHA              string   `json:"sha,omitempty"`
 	Event            string   `json:"event,omitempty"`

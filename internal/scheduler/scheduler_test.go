@@ -301,11 +301,11 @@ func TestEnqueueInsertsRunAndJobs(t *testing.T) {
 func TestEnqueueSupersedesConcurrencyGroup(t *testing.T) {
 	f := newFakeStore()
 	now := time.Now().UTC()
-	f.putRun(model.Run{ID: "old", Repo: "repo", ConcurrencyGroup: "grp", Status: model.StatusRunning, CreatedAt: now})
+	f.putRun(model.Run{ID: "old", Repo: "github.com/o/r", RepoFullName: "o/r", ConcurrencyGroup: "grp", Status: model.StatusRunning, CreatedAt: now})
 	f.putJob(model.Job{ID: "oldjob", RunID: "old", Status: model.StatusQueued})
-	f.putRun(model.Run{ID: "unrelated", Repo: "repo", ConcurrencyGroup: "other", Status: model.StatusRunning, CreatedAt: now})
+	f.putRun(model.Run{ID: "unrelated", Repo: "github.com/o/r", RepoFullName: "o/r", ConcurrencyGroup: "other", Status: model.StatusRunning, CreatedAt: now})
 	f.putJob(model.Job{ID: "otherjob", RunID: "unrelated", Status: model.StatusQueued})
-	run := model.Run{ID: "new", Repo: "repo", ConcurrencyGroup: "grp", Status: model.StatusQueued, CreatedAt: now}
+	run := model.Run{ID: "new", Repo: "github.com/o/r", RepoFullName: "o/r", ConcurrencyGroup: "grp", Status: model.StatusQueued, CreatedAt: now}
 	s := NewDB(f, time.Minute, nil, nil)
 	if err := s.Enqueue(context.Background(), run, map[string]model.Job{"newjob": {ID: "newjob", RunID: "new", Status: model.StatusQueued}}, nil, true); err != nil {
 		t.Fatalf("Enqueue: %v", err)
@@ -316,8 +316,8 @@ func TestEnqueueSupersedesConcurrencyGroup(t *testing.T) {
 		t.Fatalf("InsertCompiledRun calls = %d, want 1", len(f.compiledCalls))
 	}
 	req := f.compiledCalls[0]
-	if req.Supersede == nil || req.Supersede.Repo != "repo" || req.Supersede.ConcurrencyGroup != "grp" {
-		t.Fatalf("supersede policy = %+v, want repo/grp", req.Supersede)
+	if req.Supersede == nil || req.Supersede.RepoID != "github.com/o/r" || req.Supersede.ConcurrencyGroup != "grp" {
+		t.Fatalf("supersede policy = %+v, want canonical repo id/grp", req.Supersede)
 	}
 	if len(req.CancelPrevious) != 0 {
 		t.Fatalf("precomputed cancel list = %v, want empty (resolved in-transaction)", req.CancelPrevious)
@@ -343,12 +343,12 @@ func TestEnqueueSupersedesConcurrencyGroup(t *testing.T) {
 func TestEnqueueFaultDuringSupersessionLeavesOldRun(t *testing.T) {
 	f := newFakeStore()
 	now := time.Now().UTC()
-	f.putRun(model.Run{ID: "old", Repo: "repo", ConcurrencyGroup: "grp", Status: model.StatusRunning, CreatedAt: now})
+	f.putRun(model.Run{ID: "old", Repo: "github.com/o/r", RepoFullName: "o/r", ConcurrencyGroup: "grp", Status: model.StatusRunning, CreatedAt: now})
 	f.putJob(model.Job{ID: "oldjob1", RunID: "old", Status: model.StatusQueued})
 	f.putJob(model.Job{ID: "oldjob2", RunID: "old", Status: model.StatusRunning})
 	f.compiledFailAfterOps = 1
 	f.compiledFailErr = errCompiledBoom
-	run := model.Run{ID: "new", Repo: "repo", ConcurrencyGroup: "grp", Status: model.StatusQueued, CreatedAt: now}
+	run := model.Run{ID: "new", Repo: "github.com/o/r", RepoFullName: "o/r", ConcurrencyGroup: "grp", Status: model.StatusQueued, CreatedAt: now}
 	s := NewDB(f, time.Minute, nil, nil)
 	err := s.Enqueue(context.Background(), run, map[string]model.Job{"newjob": {ID: "newjob", RunID: "new", Status: model.StatusQueued}}, nil, true)
 	if !errors.Is(err, errCompiledBoom) {
@@ -385,7 +385,7 @@ func TestEnqueueFaultDuringSupersessionLeavesOldRun(t *testing.T) {
 func TestEnqueueConcurrentSupersedeExactlyOneWinner(t *testing.T) {
 	f := newFakeStore()
 	now := time.Now().UTC()
-	f.putRun(model.Run{ID: "old", Repo: "repo", ConcurrencyGroup: "grp", Status: model.StatusRunning, CreatedAt: now})
+	f.putRun(model.Run{ID: "old", Repo: "github.com/o/r", RepoFullName: "o/r", ConcurrencyGroup: "grp", Status: model.StatusRunning, CreatedAt: now})
 	f.putJob(model.Job{ID: "oldjob", RunID: "old", Status: model.StatusQueued})
 	s := NewDB(f, time.Minute, nil, nil)
 	const enqueues = 8
@@ -397,7 +397,7 @@ func TestEnqueueConcurrentSupersedeExactlyOneWinner(t *testing.T) {
 			defer wg.Done()
 			runID := fmt.Sprintf("new%02d", n)
 			jobID := fmt.Sprintf("job%02d", n)
-			run := model.Run{ID: runID, Repo: "repo", ConcurrencyGroup: "grp", Status: model.StatusQueued, CreatedAt: now}
+			run := model.Run{ID: runID, Repo: "github.com/o/r", RepoFullName: "o/r", ConcurrencyGroup: "grp", Status: model.StatusQueued, CreatedAt: now}
 			errs <- s.Enqueue(context.Background(), run, map[string]model.Job{jobID: {ID: jobID, RunID: runID, Status: model.StatusQueued}}, nil, true)
 		}(i)
 	}
@@ -412,7 +412,7 @@ func TestEnqueueConcurrentSupersedeExactlyOneWinner(t *testing.T) {
 	defer f.mu.Unlock()
 	active := 0
 	for _, r := range f.runs {
-		if r.Repo != "repo" || r.ConcurrencyGroup != "grp" {
+		if storage.RepoIDForRun(r) != "github.com/o/r" || r.ConcurrencyGroup != "grp" {
 			continue
 		}
 		if r.ID == "old" {

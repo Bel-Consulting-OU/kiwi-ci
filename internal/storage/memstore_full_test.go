@@ -79,15 +79,20 @@ func TestMemStoreRunAndJobReads(t *testing.T) {
 
 	envJob := memTestJob(memJobID2, memRunID, model.StatusRunning)
 	envJob.Environment = "prod"
-	envJob.RepoURL = "https://github.com/acme/api.git"
+	// Legacy row: no stored RepoID, SSH clone-URL spelling. The listed key
+	// is the canonical identity, so an HTTPS spelling reaches it too.
+	envJob.RepoID = ""
+	envJob.RepoURL = "git@github.com:acme/api.git"
 	if err := m.InsertJob(ctx, envJob); err != nil {
 		t.Fatalf("insert env job: %v", err)
 	}
-	byEnv, err := m.ListJobsByEnvironment(ctx, "https://github.com/acme/api.git", "prod")
+	// The listing is keyed by the CANONICAL repository identity: an HTTPS
+	// spelling of the same repository reaches the SSH-spelled legacy row.
+	byEnv, err := m.ListJobsByEnvironment(ctx, "github.com/acme/api", "prod")
 	if err != nil || len(byEnv) != 1 || byEnv[0].ID != memJobID2 {
 		t.Fatalf("ListJobsByEnvironment = %v, %v", byEnv, err)
 	}
-	byEnv, err = m.ListJobsByEnvironment(ctx, "https://github.com/other/api.git", "prod")
+	byEnv, err = m.ListJobsByEnvironment(ctx, "github.com/other/api", "prod")
 	if err != nil || len(byEnv) != 0 {
 		t.Fatalf("ListJobsByEnvironment other = %v, %v", byEnv, err)
 	}

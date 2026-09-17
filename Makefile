@@ -1,5 +1,5 @@
 .PHONY: build test test-unit test-race test-integration integration test-adversarial test-shuffle test-stress \
-	fuzz coverage coverage-floor staticcheck govulncheck cross schema-check docs-check license-check repro-build \
+	fuzz coverage coverage-ci coverage-floor staticcheck govulncheck cross schema-check docs-check license-check repro-build \
 	fmt lint run clean protect-branch
 
 VERSION ?= 0.1.0-dev
@@ -44,8 +44,20 @@ fuzz:
 	./scripts/fuzz-smoke.sh 10s
 
 coverage:
-	go test -coverprofile=coverage.out ./...
+	go test -coverprofile=coverage.out -covermode=atomic ./...
 	go tool cover -func=coverage.out | tail -1
+
+# CI-equivalent coverage chain, mirroring the Woodpecker `coverage` and
+# `integration-postgres` lanes exactly: unit profile, PostgreSQL integration
+# profile (requires KIWI_TEST_POSTGRES_URL), profile self-test, merge,
+# per-package report and the coverage floor.
+coverage-ci:
+	go test -coverprofile=coverage.out -covermode=atomic ./...
+	go test -count=1 -timeout=20m -run Integration -covermode=atomic -coverprofile=integration-coverage.out -coverpkg=./... ./internal/storage ./internal/scheduler ./internal/server
+	./scripts/ci-coverage-selftest.sh coverage.out integration-coverage.out
+	./scripts/merge-coverage.sh merged-coverage.out coverage.out integration-coverage.out
+	./scripts/coverage-report.sh merged-coverage.out
+	./scripts/coverage-floor.sh merged-coverage.out
 
 # Enforce the total-coverage floor on a profile produced by `make coverage`;
 # override the default floor with KC_MIN_COVERAGE=<percent>.

@@ -53,11 +53,11 @@ func (s *injectedStore) ListQueuedJobs(ctx context.Context) ([]model.Job, error)
 	return s.fakeStore.ListQueuedJobs(ctx)
 }
 
-func (s *injectedStore) ListJobsByEnvironment(ctx context.Context, repoURL, environment string) ([]model.Job, error) {
+func (s *injectedStore) ListJobsByEnvironment(ctx context.Context, repoID, environment string) ([]model.Job, error) {
 	if s.listByEnvErr != nil {
 		return nil, s.listByEnvErr
 	}
-	return s.fakeStore.ListJobsByEnvironment(ctx, repoURL, environment)
+	return s.fakeStore.ListJobsByEnvironment(ctx, repoID, environment)
 }
 
 func (s *injectedStore) ListJobsByRun(ctx context.Context, runID string) ([]model.Job, error) {

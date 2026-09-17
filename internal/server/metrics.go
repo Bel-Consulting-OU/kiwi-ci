@@ -87,6 +87,8 @@ func NewMetrics() *Metrics {
 	m.declare("kiwi_test_duration_seconds", "Test report test duration", "histogram", defaultHistogramBounds)
 	m.declare("kiwi_http_duration_seconds", "HTTP request handling latency", "histogram", defaultHistogramBounds)
 	m.declare("kiwi_cas_latency_seconds", "Content-addressed storage latency", "histogram", defaultHistogramBounds)
+	m.declare("kiwi_cas_gc_deleted_objects_total", "Unreferenced CAS objects removed by the garbage collector", "counter", nil)
+	m.declare("kiwi_cas_gc_deleted_bytes_total", "Unreferenced CAS bytes removed by the garbage collector", "counter", nil)
 	m.declare("kiwi_scheduler_loop_duration_seconds", "Scheduler housekeeping loop duration", "histogram", defaultHistogramBounds)
 	m.declare("kiwi_runner_saturation", "Fraction of runner capacity in use (busy slots / total slots)", "gauge", nil)
 	m.declare("kiwi_db_pool", "Database pool statistics by stat name", "gauge", nil)

@@ -45,7 +45,7 @@ func TestPostgresClosedPoolErrorPaths(t *testing.T) {
 		{"InsertJob", func() error { return st.InsertJob(ctx, job) }},
 		{"GetJob", func() error { _, err := st.GetJob(ctx, jobID); return err }},
 		{"ListJobsByRun", func() error { _, err := st.ListJobsByRun(ctx, runID); return err }},
-		{"ListJobsByEnvironment", func() error { _, err := st.ListJobsByEnvironment(ctx, pgITRepo, "prod"); return err }},
+		{"ListJobsByEnvironment", func() error { _, err := st.ListJobsByEnvironment(ctx, pgITRepoID, "prod"); return err }},
 		{"ListQueuedJobs", func() error { _, err := st.ListQueuedJobs(ctx); return err }},
 		{"ListJobsByRunner", func() error { _, err := st.ListJobsByRunner(ctx, runnerID); return err }},
 		{"UpdateJob", func() error { return st.UpdateJob(ctx, job) }},

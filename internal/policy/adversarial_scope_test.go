@@ -377,8 +377,18 @@ func TestPolicyAllowlistsAreExactMatchOnly(t *testing.T) {
 			t.Fatalf("runner label %q matched a confusable/case variant", label)
 		}
 	}
-	if cfg.CloneHostAllowed("org/app", "GitHub.com") || cfg.CloneHostAllowed("org/app", "github.com.") {
-		t.Fatal("clone host matching is not byte-exact")
+	// Clone HOSTS are canonicalized on both sides (case, one trailing dot,
+	// the scheme's default port): those spellings address the same forge and
+	// must match the configured entry. Unrelated hosts still fail closed.
+	for _, variant := range []string{"GitHub.com", "github.com.", "github.com:443", "HTTPS://GitHub.com"} {
+		if !cfg.CloneHostAllowed("org/app", variant) {
+			t.Fatalf("canonical host variant %q must be admitted", variant)
+		}
+	}
+	for _, other := range []string{"github.com.evil.example", "evil.example", "github.com:8443", ""} {
+		if cfg.CloneHostAllowed("org/app", other) {
+			t.Fatalf("host %q must not be admitted by the github.com entry", other)
+		}
 	}
 	if !cfg.CloneHostAllowed("org/app", "github.com") {
 		t.Fatal("exact clone host must be admitted")

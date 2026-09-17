@@ -61,7 +61,7 @@ func faultyWrapperCases() map[string]wrapperCase {
 			j.Environment = "prod"
 			_ = m.InsertJob(ctx(), j)
 		}, call: func(f *FaultyStore) error {
-			_, err := f.ListJobsByEnvironment(ctx(), testJob.RepoURL, "prod")
+			_, err := f.ListJobsByEnvironment(ctx(), RepoIDForJob(testJob), "prod")
 			return err
 		}},
 		"ListJobsByRunner": {seed: func(m *memStore) {

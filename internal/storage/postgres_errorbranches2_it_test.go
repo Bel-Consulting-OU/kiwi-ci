@@ -114,7 +114,7 @@ func TestPostgresIntegrationScannerCorruption(t *testing.T) {
 	if _, err := st.pool.Exec(ctx, `UPDATE jobs SET payload = jsonb_build_object('environment','prod','repo_url',$2::text,'status',123) WHERE id=$1`, jobID, pgITRepo); err != nil {
 		t.Fatalf("corrupt env job: %v", err)
 	}
-	_, err = st.ListJobsByEnvironment(ctx, pgITRepo, "prod")
+	_, err = st.ListJobsByEnvironment(ctx, pgITRepoID, "prod")
 	expectErr("ListJobsByEnvironment", err)
 	_, err = st.ListQueuedJobs(ctx)
 	expectErr("ListQueuedJobs", err)
@@ -340,7 +340,7 @@ func TestPostgresIntegrationSupersedeDeepErrors(t *testing.T) {
 		st := pgITStore(t)
 		if err := st.InsertCompiledRun(ctx, InsertCompiledRunRequest{
 			Run:       pgITRun(pgITNewID(t), model.StatusQueued),
-			Supersede: &SupersedePolicy{Repo: "", ConcurrencyGroup: ""},
+			Supersede: &SupersedePolicy{RepoID: "", ConcurrencyGroup: ""},
 		}); err != nil {
 			t.Fatalf("empty supersede: %v", err)
 		}

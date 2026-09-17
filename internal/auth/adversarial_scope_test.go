@@ -61,14 +61,16 @@ func TestAuthorizeAmbiguousBareLookupFailsClosed(t *testing.T) {
 }
 
 // TestAuthorizeRepoIdentityExact pins byte-exact repository identity
-// resolution: case differences, trailing whitespace, extra path segments
-// and unicode confusables never match a declared entry.
+// resolution: repository-path case differences, trailing whitespace, extra
+// path segments and unicode confusables never match a declared entry. HOST
+// spelling differences (case, one trailing dot, the scheme's default port)
+// are canonicalized onto the same identity by design (see CanonicalHost):
+// they address the same forge and therefore the same grant.
 func TestAuthorizeRepoIdentityExact(t *testing.T) {
 	p := Principal{Subject: "bot", Repositories: map[string]RepositoryPermission{
 		"github.com/o/r": {Read: true},
 	}}
 	denied := []string{
-		"GitHub.com/o/r",
 		"github.com/O/R",
 		"github.com/o/r ",
 		" github.com/o/r",
@@ -85,6 +87,12 @@ func TestAuthorizeRepoIdentityExact(t *testing.T) {
 	if !Authorize(p, ActionRead, "github.com/o/r", false) {
 		t.Fatal("exact repo must be authorized")
 	}
+	// Canonically equivalent HOST spellings address the same declared grant.
+	for _, repo := range []string{"GitHub.com/o/r", "github.com./o/r", "github.com:443/o/r"} {
+		if !Authorize(p, ActionRead, repo, false) {
+			t.Fatalf("canonical host variant %q must match the declared entry", repo)
+		}
+	}
 	// CanonicalID trims surrounding whitespace before deciding the shape.
 	if got := CanonicalRepoID("github.com", "  o/r  "); got != "github.com/o/r" {
 		t.Fatalf("CanonicalRepoID = %q", got)
@@ -92,9 +100,13 @@ func TestAuthorizeRepoIdentityExact(t *testing.T) {
 	if got := CanonicalRepoID("", "  "); got != "" {
 		t.Fatalf("blank full name must stay empty, got %q", got)
 	}
-	// A name that already starts with the SAME host is never re-prefixed.
+	// A name that already starts with the SAME host is never re-prefixed,
+	// including a canonically equivalent host spelling.
 	if got := CanonicalRepoID("github.com", "github.com/o/r"); got != "github.com/o/r" {
 		t.Fatalf("same-host full name rewritten: %q", got)
+	}
+	if got := CanonicalRepoID("GITHUB.COM:443", "GitHub.com./o/r"); got != "github.com/o/r" {
+		t.Fatalf("equivalent host spellings must collapse: %q", got)
 	}
 	// A name that embeds a DIFFERENT host is re-prefixed with the
 	// authoritative forge host: identities stay host-scoped instead of

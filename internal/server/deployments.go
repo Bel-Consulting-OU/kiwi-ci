@@ -26,19 +26,36 @@ func (s *Server) recordDeploymentLocked(j model.Job, startedAt time.Time) model.
 	return d
 }
 
-// recordDeploymentDB creates the deployment record in DB mode: the record
-// is persisted through DeploymentStore and mirrored in memory for the
-// completion path's ID lookup.
-func (s *Server) recordDeploymentDB(ctx context.Context, j model.Job, startedAt time.Time) model.Deployment {
+// recordDeploymentDB creates the deployment record in DB mode. The durable
+// insert commits FIRST: the in-memory mirror and the deployment.started
+// audit event are only written after DeploymentStore accepted the record, so
+// a persistence failure leaves no marker behind and the caller can retry
+// (or the completion deployment effect can rebuild the record). Idempotent
+// per job ID.
+func (s *Server) recordDeploymentDB(ctx context.Context, j model.Job, startedAt time.Time) (model.Deployment, error) {
 	s.mu.Lock()
-	d := s.recordDeploymentLocked(j, startedAt)
+	if d, ok := s.deployments[j.ID]; ok {
+		s.mu.Unlock()
+		return d, nil
+	}
 	s.mu.Unlock()
+	d := deploy.NewDeployment(j, j.ApprovedBy, nil, &startedAt)
 	if ds, ok := s.DB.(storage.DeploymentStore); ok {
 		if err := ds.InsertDeployment(ctx, d); err != nil {
-			s.logError("deployment record insert failed", "job", j.ID, "error", err.Error())
+			return model.Deployment{}, err
 		}
 	}
-	return d
+	s.mu.Lock()
+	if cur, ok := s.deployments[j.ID]; ok {
+		// A concurrent create won the race; the durable row is keyed by the
+		// deterministic per-job deployment ID, so it is the same record.
+		s.mu.Unlock()
+		return cur, nil
+	}
+	s.deployments[j.ID] = d
+	s.mu.Unlock()
+	s.auditLocked("deployment.started", "scheduler", j.RunID, j.ID, "deployment started", map[string]string{"environment": j.Environment})
+	return d, nil
 }
 
 // recordDeployment is POST /api/v1/jobs/{id}/deployments: it creates (or
@@ -62,7 +79,13 @@ func (s *Server) recordDeployment(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "job has no environment", http.StatusConflict)
 			return
 		}
-		d := s.recordDeploymentDB(r.Context(), j, time.Now().UTC())
+		d, err := s.recordDeploymentDB(r.Context(), j, time.Now().UTC())
+		if err != nil {
+			// Fail closed: a deployment record that is not durable must not
+			// be acknowledged (no in-memory marker, no audit).
+			http.Error(w, err.Error(), 500)
+			return
+		}
 		writeJSON(w, http.StatusCreated, d)
 		return
 	}
@@ -142,44 +165,54 @@ func (s *Server) listDeployments(w http.ResponseWriter, r *http.Request) {
 }
 
 // finishDeploymentDB marks the deployment for a completed environment job
-// with the job's terminal status. A deployment whose finished_at is already
-// set is the idempotency marker for the completion deployment_finish effect:
-// replays skip it instead of re-auditing or overwriting the record.
-func (s *Server) finishDeploymentDB(ctx context.Context, j model.Job, status model.Status, finishedAt time.Time) {
+// with the job's terminal status, creating the record when the create path
+// never managed to persist one (a lease-time insert failure that the
+// completion effect now converges after the store recovers). A deployment
+// whose finished_at is already set is the idempotency marker for the
+// completion deployment_finish effect: replays skip it instead of
+// re-auditing or overwriting the record.
+//
+// Durability contract: every DeploymentStore write happens BEFORE the
+// in-memory mirror and the deployment.completed audit event are touched. A
+// returned error leaves the marker unset and the completion outbox retries
+// the whole effect; the record is rebuilt from the job on the retry.
+func (s *Server) finishDeploymentDB(ctx context.Context, j model.Job, status model.Status, finishedAt time.Time) error {
 	if j.Environment == "" {
-		return
+		return nil
 	}
-	s.mu.Lock()
-	d, ok := s.deployments[j.ID]
-	s.mu.Unlock()
-	if !ok {
-		if ds, isDS := s.DB.(storage.DeploymentStore); isDS {
-			recs, err := ds.ListDeploymentsByRun(ctx, j.RunID)
-			if err == nil {
-				for _, rec := range recs {
-					if rec.JobID == j.ID {
-						d = rec
-						break
-					}
-				}
-			}
+	ds, hasStore := s.DB.(storage.DeploymentStore)
+	d, found, err := s.deploymentForJob(ctx, j)
+	if err != nil {
+		return err
+	}
+	if !found || d.ID == "" {
+		if !hasStore {
+			// No durable deployment store to converge: DB-less servers use
+			// the in-memory effect path.
+			return nil
+		}
+		started := finishedAt
+		if j.StartedAt != nil {
+			started = *j.StartedAt
+		}
+		d = deploy.NewDeployment(j, j.ApprovedBy, nil, &started)
+		if err := ds.InsertDeployment(ctx, d); err != nil {
+			return err
 		}
 	}
-	if d.ID == "" {
-		return
-	}
 	if d.FinishedAt != nil {
-		return
+		return nil
 	}
 	d.Status = status
 	d.FinishedAt = &finishedAt
+	if hasStore {
+		if err := ds.UpdateDeploymentStatus(ctx, d.ID, status, &finishedAt); err != nil {
+			return err
+		}
+	}
 	s.mu.Lock()
 	s.deployments[j.ID] = d
 	s.mu.Unlock()
-	if ds, ok := s.DB.(storage.DeploymentStore); ok {
-		if err := ds.UpdateDeploymentStatus(ctx, d.ID, status, &finishedAt); err != nil {
-			s.logError("deployment status update failed", "deployment", d.ID, "error", err.Error())
-		}
-	}
 	s.auditLocked("deployment.completed", "scheduler", j.RunID, j.ID, "deployment finished", map[string]string{"environment": j.Environment, "status": string(status)})
+	return nil
 }

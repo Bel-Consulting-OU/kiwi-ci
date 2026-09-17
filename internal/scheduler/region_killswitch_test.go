@@ -85,8 +85,10 @@ func TestCancelJobsByRunnerRequeuesWithinBudget(t *testing.T) {
 	if retry.Status != model.StatusQueued {
 		t.Fatalf("job-retry status = %q, want queued", retry.Status)
 	}
-	if retry.Attempts != 2 {
-		t.Fatalf("job-retry attempts = %d, want 2", retry.Attempts)
+	// Attempts were charged by the lease, not by the kill switch: the
+	// recovery path only reads the budget.
+	if retry.Attempts != 1 {
+		t.Fatalf("job-retry attempts = %d, want 1 (lease-time increment only)", retry.Attempts)
 	}
 	if retry.LeaseRunnerID != "" || retry.LeaseTokenHash != nil || retry.LeaseExpiresAt != nil {
 		t.Fatalf("job-retry lease not invalidated: %+v", retry)
@@ -94,8 +96,8 @@ func TestCancelJobsByRunnerRequeuesWithinBudget(t *testing.T) {
 	if doomed.Status != model.StatusCancelled {
 		t.Fatalf("job-doomed status = %q, want cancelled", doomed.Status)
 	}
-	if doomed.Attempts != 4 {
-		t.Fatalf("job-doomed attempts = %d, want 4", doomed.Attempts)
+	if doomed.Attempts != 3 {
+		t.Fatalf("job-doomed attempts = %d, want 3 (lease-time increments only)", doomed.Attempts)
 	}
 	if doomed.LeaseRunnerID != "" || doomed.LeaseTokenHash != nil || doomed.LeaseExpiresAt != nil {
 		t.Fatalf("job-doomed lease not invalidated: %+v", doomed)

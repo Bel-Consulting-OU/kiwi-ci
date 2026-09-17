@@ -196,18 +196,29 @@ func TestMemStoreEnvironmentConcurrencyRepoScoped(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := m.AcquireLeaseAtomic(ctx(), leaseClaimFor(leaseJobID, leaseRunner, 1)); err != nil {
+	repoClaim := func(jobID, runnerID string) LeaseClaim {
+		c := leaseClaimFor(jobID, runnerID, 1)
+		c.CanonRepoID = leaseRepoID
+		c.Environment = "prod"
+		c.EnvironmentConcurrency = 1
+		return c
+	}
+	if _, err := m.AcquireLeaseAtomic(ctx(), repoClaim(leaseJobID, leaseRunner)); err != nil {
 		t.Fatalf("first prod lease: %v", err)
 	}
 	// Same (repo, env) key on a DIFFERENT, free runner: blocked by the
 	// repo-scoped environment slot, not by runner capacity.
-	if _, err := m.AcquireLeaseAtomic(ctx(), leaseClaimFor(leaseJob2ID, secondRunner, 1)); !errors.Is(err, ErrEnvConcurrency) {
+	if _, err := m.AcquireLeaseAtomic(ctx(), repoClaim(leaseJob2ID, secondRunner)); !errors.Is(err, ErrEnvConcurrency) {
 		t.Fatalf("second same-repo prod lease = %v, want ErrEnvConcurrency", err)
 	}
 	// Same environment NAME in another repository: allowed.
 	third := model.Job{ID: "77777777777777777777777777777777", RunID: leaseRunID, Key: "deploy-c", Status: model.StatusQueued, RepoURL: otherRepo, Environment: "prod", EnvironmentConcurrency: 1, CreatedAt: time.Unix(1003, 0).UTC()}
 	_ = m.InsertJob(ctx(), third)
-	if _, err := m.AcquireLeaseAtomic(ctx(), leaseClaimFor(third.ID, secondRunner, 1)); err != nil {
+	otherClaim := leaseClaimFor(third.ID, secondRunner, 1)
+	otherClaim.CanonRepoID = RepoIDForJob(third)
+	otherClaim.Environment = "prod"
+	otherClaim.EnvironmentConcurrency = 1
+	if _, err := m.AcquireLeaseAtomic(ctx(), otherClaim); err != nil {
 		t.Fatalf("cross-repo prod lease: %v", err)
 	}
 }
@@ -243,7 +254,6 @@ func TestMemStoreQuotaQueuedRunningLifecycle(t *testing.T) {
 		t.Fatalf("after enqueues = %d/%d, want 0/%d", running, queued, queuedJobs)
 	}
 	claim := leaseClaimFor(ids[0], leaseRunner, 2)
-	claim.RepoURL = repo
 	claim.RepoConcurrency = 1
 	if _, err := m.AcquireLeaseAtomic(ctx(), claim); err != nil {
 		t.Fatalf("first quota lease: %v", err)
@@ -255,7 +265,6 @@ func TestMemStoreQuotaQueuedRunningLifecycle(t *testing.T) {
 	// The second claim must be rejected by the conditional transition and
 	// must not move any counter.
 	second := leaseClaimFor(ids[1], leaseRunner, 2)
-	second.RepoURL = repo
 	second.RepoConcurrency = 1
 	if _, err := m.AcquireLeaseAtomic(ctx(), second); !errors.Is(err, ErrQuotaExceeded) {
 		t.Fatalf("second quota lease = %v, want ErrQuotaExceeded", err)

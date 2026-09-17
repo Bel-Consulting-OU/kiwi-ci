@@ -332,7 +332,8 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 			needs = append(needs, depID)
 		}
 		j := model.Job{
-			ID: id, RunID: parent.RunID, Key: key, BaseKey: cj.BaseID, RepoID: parent.RepoID, RepoURL: parent.RepoURL, RepoFullName: parent.RepoFullName, Ref: parent.Ref, SHA: parent.SHA,
+			ID: id, RunID: parent.RunID, Key: key, BaseKey: cj.BaseID, RepoID: parent.RepoID, PolicyRepoID: parent.PolicyRepoID, CheckoutRepoURL: parent.CheckoutRepoURL,
+			RepoURL: parent.RepoURL, RepoFullName: parent.RepoFullName, Ref: parent.Ref, SHA: parent.SHA,
 			Event: parent.Event, Condition: cj.Job.If, DependencyStatus: model.StatusSuccess, Pipeline: string(canonical), Trusted: parent.Trusted, ChangedFiles: append([]string{}, parent.ChangedFiles...), ChangedFilesKnown: parent.ChangedFilesKnown, Needs: needs,
 			RequiredLabels: labelsForJob(cj.Job), Network: effectiveNetwork, Environment: env, ApprovalRequired: cj.Job.Environment.Approval, EnvironmentBranches: append([]string{}, cj.Job.Environment.Branches...), EnvironmentConcurrency: cj.Job.Environment.Concurrency, OIDCAllowed: cj.Job.Permissions.IDToken, OIDCAudiences: cloneStrings(oidcAudiences),
 			DeclaredSecrets: declaredSecrets(strictSpec, cj.Job),

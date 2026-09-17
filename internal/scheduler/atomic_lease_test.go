@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -67,9 +66,16 @@ func (a *atomicFakeStore) AcquireLeaseAtomic(ctx context.Context, claim storage.
 	if err != nil {
 		return model.Job{}, err
 	}
+	// The environment key is the CANONICAL repository identity, exactly like
+	// the SQL claim and LeaseClaim.EnvKey; the job's own identity is the
+	// fallback for a claim that carries none.
+	claimRepoID := claim.CanonRepoID
+	if claimRepoID == "" {
+		claimRepoID = storage.RepoIDForJob(j)
+	}
 	envRunning := 0
 	if claim.Environment != "" && claim.EnvironmentConcurrency > 0 {
-		all, _ := a.fakeStore.ListJobsByEnvironment(ctx, claim.RepoURL, claim.Environment)
+		all, _ := a.fakeStore.ListJobsByEnvironment(ctx, claimRepoID, claim.Environment)
 		for _, other := range all {
 			if other.ID != claim.JobID && other.Status == model.StatusRunning {
 				envRunning++
@@ -85,10 +91,10 @@ func (a *atomicFakeStore) AcquireLeaseAtomic(ctx context.Context, claim storage.
 		}
 		return model.Job{}, storage.ErrNoCapacity
 	}
-	if claim.RepoURL != "" {
+	if repoID := storage.RepoIDForJob(j); repoID != "" {
 		if m := a.fakeQuotas(); m != nil {
-			keys := []string{claim.RepoURL}
-			if team := repoTeamKey(claim.RepoURL); team != claim.RepoURL {
+			keys := []string{repoID}
+			if team := storage.RepoTeamKey(repoID); team != "" && team != repoID {
 				keys = append(keys, team)
 			}
 			for i, key := range keys {
@@ -139,30 +145,6 @@ func (a *atomicFakeStore) fakeQuotas() map[string]int {
 		a.quotas = map[string]int{}
 	}
 	return a.quotas
-}
-
-// repoTeamKey mirrors storage's team quota key derivation.
-func repoTeamKey(repoURL string) string {
-	u := repoURL
-	if i := strings.Index(u, "://"); i >= 0 {
-		u = u[i+3:]
-	}
-	if at := strings.Index(u, "@"); at >= 0 {
-		u = u[at+1:]
-	}
-	slash := strings.Index(u, "/")
-	if slash < 0 {
-		return repoURL
-	}
-	rest := u[slash+1:]
-	seg := rest
-	if i := strings.Index(rest, "/"); i >= 0 {
-		seg = rest[:i]
-	}
-	if seg == "" {
-		return repoURL
-	}
-	return u[:slash] + "/" + seg
 }
 
 func (a *atomicFakeStore) jobStatus(jobID string) (model.Status, string) {

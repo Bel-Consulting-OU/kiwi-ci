@@ -197,6 +197,19 @@ type Server struct {
 	BlobStore blob.Store
 	CAS       *cas.CAS
 
+	// CASGCInterval, CASGCMinAge and CASGCBatch tune the reference-aware
+	// CAS garbage collector Maintain runs (see cas_gc.go). Zero values use
+	// the defaults: one pass per hour, a 24h object age floor, and at most
+	// 1000 deletions per pass.
+	CASGCInterval time.Duration
+	CASGCMinAge   time.Duration
+	CASGCBatch    int
+	// casGCMu is the in-process collector lease used when no database is
+	// attached (DB mode uses the store's advisory lock instead), and
+	// casGCLast is the last pass time for Maintain's interval gating.
+	casGCMu   sync.Mutex
+	casGCLast time.Time
+
 	// DownstreamPipelineFetcher, when non-nil, overrides the forge-based
 	// pipeline fetch for downstream dispatch (tests inject a stub; the
 	// default resolves the target forge adapter from the parent run's
@@ -533,6 +546,11 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 	if s.certProfiles == nil {
 		s.certProfiles = map[string]string{}
 	}
+	// Snapshot records are only restored when their archive and manifest
+	// sidecar still exist and match the recorded digests; broken records are
+	// dropped (and logged) instead of resurfacing as undownloadable entries.
+	// The state write below persists the pruned set.
+	s.restoreSnapshots(snap.Snapshots)
 	s.rebuildArtifactContractsLocked()
 	// DB-mode artifact transport: payload bytes move through the shared
 	// CAS blob store (default: filesystem under dataDir/cas) so downloads
@@ -937,11 +955,23 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	// The canonical repository identity is derived at ingress from the
-	// clone URL host plus the submitted full name; a client-supplied
-	// repo_id is never decoded (json:"-"), so the identity can never be
-	// spoofed by a submission.
-	in.RepoID = repoIDForSubmit(in)
+	// The canonical repository identity is derived at ingress from repo_url
+	// through the STRICT clone-URL parser. A client-supplied repo_id is
+	// never decoded (json:"-"), and repo_full_name is not independently
+	// authoritative: when supplied it must be canonically equal to the
+	// repository path of repo_url. The binding runs BEFORE any RBAC,
+	// policy or quota work so a mismatched submission can never authorize
+	// as the name it claims.
+	if err := bindSubmissionRepoIdentity(&in); err != nil {
+		var adm *admissionError
+		if errors.As(err, &adm) {
+			writeJSON(w, adm.Status, map[string]string{"error": adm.Msg, "reason": adm.Reason})
+			return
+		}
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	in.identityBound = true
 	if !s.requireAction(w, r, auth.ActionRun, in.RepoID, false) {
 		return
 	}
@@ -983,13 +1013,28 @@ func (s *Server) enqueue(in SubmitRun) (model.Run, error) {
 func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 	ctx, span := s.startSpan(context.Background(), "server.enqueue")
 	defer span.End()
-	// The canonical repository identity is derived ONCE here when the
-	// ingress did not already resolve it (webhook handlers, schedules,
-	// downstream children and reruns set it; direct submissions derive it
-	// from repo_url). Every downstream decision uses in.RepoID.
-	if strings.TrimSpace(in.RepoID) == "" {
-		in.RepoID = repoIDForSubmit(in)
+	// Non-webhook ingresses (direct API submits and any caller that did not
+	// resolve the identity itself) go through the strict binding FIRST: the
+	// identity is derived from repo_url and a supplied repo_full_name must
+	// match the URL's repository path. Internal ingresses (webhook, schedule,
+	// downstream dispatch, rerun) set identityBound after deriving the
+	// identity server-side, so fork PRs — whose base full name deliberately
+	// differs from the head clone URL — are never rejected here.
+	if !in.identityBound {
+		if err := bindSubmissionRepoIdentity(&in); err != nil {
+			return model.Run{}, err
+		}
 	}
+	// The policy/authorization identity and the checkout clone URL are
+	// resolved ONCE and copied to the run and every job: for a fork PR the
+	// policy identity is the BASE repository while the checkout URL is the
+	// head clone URL.
+	in.RepoID = strings.TrimSpace(in.RepoID)
+	policyID := submittedPolicyRepoID(in)
+	if policyID == "" {
+		return model.Run{}, &admissionError{Status: 400, Reason: "repo_identity_required", Msg: "repository identity could not be resolved"}
+	}
+	checkoutURL := submittedCheckoutURL(in)
 	// Server-side pipeline resolution: components are resolved and merged,
 	// inputs validated and injected, and the canonical pipeline text
 	// replaces the submission so every persisted job carries a
@@ -1012,10 +1057,11 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 	}
 	// Repository/org policy file restrictions are intersected on top of the
 	// defaults, then the hard trust floor is applied. A policy file can only
-	// ever narrow capabilities.
+	// ever narrow capabilities. Every lookup uses the POLICY identity (the
+	// base repository for fork PRs).
 	if s.Policy != nil {
-		caps = policy.Intersect(caps, s.Policy.CapabilitiesFor(in.RepoID))
-		grants := s.Policy.GrantsFor(in.RepoID)
+		caps = policy.Intersect(caps, s.Policy.CapabilitiesFor(policyID))
+		grants := s.Policy.GrantsFor(policyID)
 		caps.Deployments = caps.Deployments || grants.Deployments
 		caps.GenerateChildGraph = caps.GenerateChildGraph || grants.GenerateChildGraph
 		caps.CrossRepoTrigger = caps.CrossRepoTrigger || grants.CrossRepoTrigger
@@ -1033,8 +1079,10 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 	// capability-scoped declaration invariants, and (when a policy file is
 	// loaded) the org-policy host/region/digest restrictions. Generated
 	// fragments, schedules and downstream children use the SAME path — no
-	// second-class admission.
-	if err = s.admitCompiledSpec(repoIdentity{RepoID: in.RepoID, RepoURL: in.RepoURL, RepoFullName: in.RepoFullName}, spec, caps); err != nil {
+	// second-class admission. The clone-host restriction evaluates the
+	// CHECKOUT URL (the head repository for fork PRs): that is what the
+	// runner will actually clone.
+	if err = s.admitCompiledSpec(repoIdentity{RepoID: policyID, RepoURL: in.RepoURL, RepoFullName: in.RepoFullName}, spec, caps); err != nil {
 		return model.Run{}, err
 	}
 	pipelineDigest, err := pipeline.PipelineDigest(spec)
@@ -1054,7 +1102,8 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 		}
 	}
 	group := expandConcurrency(spec.Concurrency.Group, in)
-	run := model.Run{ID: runID, RepoID: in.RepoID, Repo: in.RepoURL, RepoFullName: in.RepoFullName, Ref: in.Ref, SHA: in.SHA, Event: in.Event,
+	run := model.Run{ID: runID, RepoID: in.RepoID, PolicyRepoID: policyID, CheckoutRepoURL: checkoutURL,
+		Repo: in.RepoURL, RepoFullName: in.RepoFullName, Ref: in.Ref, SHA: in.SHA, Event: in.Event,
 		Status: model.StatusQueued, Trusted: in.Trusted, ConcurrencyGroup: group, CreatedAt: now, Metadata: cloneMap(in.Metadata)}
 
 	jobIDs := make(map[string]string, len(g.Jobs))
@@ -1099,7 +1148,8 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 		jobDigest := hex.EncodeToString(digestSum[:])
 		jobContracts[jobIDs[key]] = buildJobContracts(cj)
 		j := model.Job{
-			ID: jobIDs[key], RunID: runID, Key: key, BaseKey: cj.BaseID, RepoID: in.RepoID, RepoURL: in.RepoURL, RepoFullName: in.RepoFullName, Ref: in.Ref, SHA: in.SHA,
+			ID: jobIDs[key], RunID: runID, Key: key, BaseKey: cj.BaseID, RepoID: in.RepoID, PolicyRepoID: policyID, CheckoutRepoURL: checkoutURL,
+			RepoURL: in.RepoURL, RepoFullName: in.RepoFullName, Ref: in.Ref, SHA: in.SHA,
 			Event: in.Event, Condition: cj.Job.If, DependencyStatus: model.StatusSuccess, Pipeline: in.Pipeline, Trusted: in.Trusted, ChangedFiles: append([]string{}, in.ChangedFiles...), ChangedFilesKnown: in.ChangedFilesKnown, Needs: needs,
 			RequiredLabels: labelsForJob(cj.Job), Network: effectiveNetwork, Environment: env, ApprovalRequired: cj.Job.Environment.Approval, EnvironmentBranches: append([]string{}, cj.Job.Environment.Branches...), EnvironmentConcurrency: cj.Job.Environment.Concurrency, OIDCAllowed: cj.Job.Permissions.IDToken, OIDCAudiences: cloneStrings(oidcAudiences),
 			DeclaredSecrets: declaredSecrets(spec, cj.Job),
@@ -1170,15 +1220,24 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 	// between the handler fast path and concurrent deliveries.
 	if delivery, ok := webhookDelivery(in.Metadata); ok {
 		if existing, ok := s.deliveries[delivery]; ok {
-			if prior, ok := s.runs[existing]; ok && repoIDForRun(prior) == in.RepoID {
+			if prior, ok := s.runs[existing]; ok && repoIDForRun(prior) == policyID {
 				s.mu.Unlock()
 				return prior, nil
 			}
 		}
 	}
 	if group != "" && spec.Concurrency.CancelInProgress {
+		// Supersession keys on the SCHEDULING identity of the checkout
+		// repository (storage.RepoIDForRun: stored RepoID with the legacy
+		// URL + full-name fallback), exactly like the SQL store's
+		// in-transaction policy. The authorization-side PolicyRepoID is
+		// deliberately not consulted here: for a fork PR it is the BASE
+		// repository. The same repository submitted once via HTTPS and once
+		// via SSH supersedes; a same-named repository on another forge does
+		// not.
+		newRepoID := storage.RepoIDForRun(run)
 		for id, old := range s.runs {
-			if old.ID != runID && old.Repo == in.RepoURL && old.ConcurrencyGroup == group && !old.Status.Terminal() {
+			if old.ID != runID && old.ConcurrencyGroup == group && !old.Status.Terminal() && newRepoID != "" && storage.RepoIDForRun(old) == newRepoID {
 				s.cancelRunLocked(id, "superseded by run "+runID, "scheduler")
 			}
 		}
@@ -1270,11 +1329,18 @@ func (s *Server) enqueueDB(in SubmitRun, run model.Run, created map[string]model
 		Contracts: jobContracts,
 	}
 	// Concurrency supersession is resolved inside the enqueue transaction
-	// (under the store's per-(repo, group) lock) so the conflicting runs are
-	// cancelled in the same commit that publishes this run, and concurrent
-	// superseding enqueues of one group serialize on exactly one survivor.
+	// (under the store's per-(canonical repo, group) lock) so the conflicting
+	// runs are cancelled in the same commit that publishes this run, and
+	// concurrent superseding enqueues of one group serialize on exactly one
+	// survivor. The policy carries the SCHEDULING identity: the canonical
+	// RepoID of the run's checkout repository (storage.RepoIDForRun), never
+	// the clone URL and never the authorization-side PolicyRepoID (which is
+	// the BASE repository for a fork PR) — supersession folds HTTPS and SSH
+	// spellings of one checkout repository together.
 	if cancelInProgress && group != "" {
-		req.Supersede = &storage.SupersedePolicy{Repo: run.Repo, ConcurrencyGroup: group}
+		if repoID := storage.RepoIDForRun(run); repoID != "" {
+			req.Supersede = &storage.SupersedePolicy{RepoID: repoID, ConcurrencyGroup: group}
+		}
 	}
 	if in.DownstreamLaunch != nil {
 		req.DownstreamLaunch = in.DownstreamLaunch
@@ -1324,7 +1390,7 @@ func (s *Server) enqueueDB(in SubmitRun, run model.Run, created map[string]model
 		if existingID, found, ferr := s.DB.FindDelivery(ctx, req.WebhookClaim.Forge, req.WebhookClaim.DeliveryID); ferr != nil {
 			return model.Run{}, fmt.Errorf("lookup delivery: %w", ferr)
 		} else if found {
-			if prior, gerr := s.DB.GetRun(ctx, existingID); gerr == nil && repoIDForRun(prior) == in.RepoID {
+			if prior, gerr := s.DB.GetRun(ctx, existingID); gerr == nil && repoIDForRun(prior) == repoIDForRun(run) {
 				return prior, nil
 			}
 		}
@@ -2166,14 +2232,18 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 		// the in-memory stores apply (labels, canonical repo ACL, runtime
 		// capability, enforced-policy runtime grant, regions, environment
 		// concurrency); dependency readiness is the only memory-specific
-		// gate layered on top.
+		// gate layered on top. Environment concurrency keys on the
+		// SCHEDULING identity of the checkout repository
+		// (storage.RepoIDForJob, the same resolver scheduler.EnvironmentAtCapacity
+		// and the SQL claim use), not on the authorization-side PolicyRepoID.
 		envRunning := 0
 		if j.Environment != "" && j.EnvironmentConcurrency > 0 {
+			jobRepoID := storage.RepoIDForJob(j)
 			for _, other := range s.jobs {
 				if other.ID == j.ID || other.Status != model.StatusRunning {
 					continue
 				}
-				if other.Environment == j.Environment && repoIDForJob(other) == repoIDForJob(j) {
+				if other.Environment == j.Environment && storage.RepoIDForJob(other) == jobRepoID {
 					envRunning++
 				}
 			}
@@ -2256,6 +2326,11 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	// runner and is stripped from the task job.
 	taskJob := j
 	taskJob.LeaseTokenHash = nil
+	// The runner clones the task's RepoURL: deliver the CHECKOUT URL (the
+	// fork head for cross-repo PRs) and never the policy identity.
+	if checkout := strings.TrimSpace(j.CheckoutRepoURL); checkout != "" {
+		taskJob.RepoURL = checkout
+	}
 	task := Task{Job: taskJob, LeaseToken: rawToken, LeaseGeneration: j.LeaseGeneration, LeaseExpiresAt: exp}
 	leaseSpan.End()
 	writeJSON(w, http.StatusOK, task)
@@ -2326,9 +2401,20 @@ func (s *Server) nextDB(w http.ResponseWriter, r *http.Request, id string) {
 	// the same values, and no post-claim rewrite is needed.
 	taskJob := *j
 	taskJob.LeaseTokenHash = nil
+	// The runner clones the task's RepoURL: deliver the CHECKOUT URL (the
+	// fork head for cross-repo PRs) and never the policy identity.
+	if checkout := strings.TrimSpace(j.CheckoutRepoURL); checkout != "" {
+		taskJob.RepoURL = checkout
+	}
 	task := Task{Job: taskJob, LeaseToken: rawToken, LeaseGeneration: j.LeaseGeneration, LeaseExpiresAt: exp}
 	if j.Environment != "" {
-		s.recordDeploymentDB(ctx, *j, time.Now().UTC())
+		// The lease already committed; a failed deployment insert is
+		// surfaced (logged) here, never mirrored as a started deployment.
+		// The completion deployment effect rebuilds the record from the job
+		// once the store recovers.
+		if _, derr := s.recordDeploymentDB(ctx, *j, time.Now().UTC()); derr != nil {
+			s.logError("deployment record insert failed", "job", j.ID, "error", derr.Error())
+		}
 	}
 	s.metricObserve("kiwi_queue_latency_seconds", time.Since(j.CreatedAt).Seconds(), nil)
 	writeJSON(w, http.StatusOK, task)
@@ -2936,10 +3022,21 @@ func (s *Server) rerunRun(w http.ResponseWriter, r *http.Request) {
 		delete(meta, key)
 	}
 	meta["rerun_of"] = id
-	// A rerun COPIES the source run's immutable RepoID: the clone URL may
-	// have changed since the source run, and re-deriving from it could move
-	// the identity to a different repository.
-	run, err := s.enqueue(SubmitRun{RepoID: old.RepoID, RepoURL: old.Repo, RepoFullName: old.RepoFullName, Ref: old.Ref, SHA: old.SHA, Event: old.Event, Pipeline: pipelineText, Trusted: rerunTrusted(r, old), Metadata: meta})
+	// A rerun COPIES the source run's immutable identity (RepoID for
+	// compatibility, PolicyRepoID for authorization, CheckoutRepoURL for the
+	// clone) and never re-derives it: the clone URL may have changed since
+	// the source run, and re-deriving from it could move the identity to a
+	// different repository. identityBound marks the identity as
+	// server-derived so the direct-submission binding never rejects a fork
+	// PR rerun whose base full name differs from its head clone URL.
+	policyID := repoIDForRun(old)
+	repoID := strings.TrimSpace(old.RepoID)
+	if repoID == "" {
+		repoID = policyID
+	}
+	run, err := s.enqueue(SubmitRun{RepoID: repoID, PolicyRepoID: policyID, CheckoutRepoURL: checkoutURLForRun(old),
+		RepoURL: old.Repo, RepoFullName: old.RepoFullName, Ref: old.Ref, SHA: old.SHA, Event: old.Event, Pipeline: pipelineText,
+		Trusted: rerunTrusted(r, old), Metadata: meta, identityBound: true})
 	if err != nil {
 		http.Error(w, err.Error(), 400)
 		return
@@ -2987,10 +3084,18 @@ func (s *Server) rerunRunDB(w http.ResponseWriter, r *http.Request, id string) {
 		delete(meta, key)
 	}
 	meta["rerun_of"] = id
-	// A rerun COPIES the source run's immutable RepoID: the clone URL may
-	// have changed since the source run, and re-deriving from it could move
-	// the identity to a different repository.
-	run, err := s.enqueue(SubmitRun{RepoID: old.RepoID, RepoURL: old.Repo, RepoFullName: old.RepoFullName, Ref: old.Ref, SHA: old.SHA, Event: old.Event, Pipeline: pipelineText, Trusted: rerunTrusted(r, old), Metadata: meta})
+	// A rerun COPIES the source run's immutable identity (see rerunRun):
+	// RepoID, PolicyRepoID and CheckoutRepoURL travel together, and the
+	// direct-submission binding is skipped because the identity is already
+	// server-derived.
+	policyID := repoIDForRun(old)
+	repoID := strings.TrimSpace(old.RepoID)
+	if repoID == "" {
+		repoID = policyID
+	}
+	run, err := s.enqueue(SubmitRun{RepoID: repoID, PolicyRepoID: policyID, CheckoutRepoURL: checkoutURLForRun(old),
+		RepoURL: old.Repo, RepoFullName: old.RepoFullName, Ref: old.Ref, SHA: old.SHA, Event: old.Event, Pipeline: pipelineText,
+		Trusted: rerunTrusted(r, old), Metadata: meta, identityBound: true})
 	if err != nil {
 		http.Error(w, err.Error(), 400)
 		return
@@ -3438,7 +3543,7 @@ func (s *Server) persistLocked() error {
 		// snapshot must not be overwritten with stale memory maps.
 		return nil
 	}
-	return s.store.Save(storage.Snapshot{Version: 1, Runs: s.runs, Jobs: s.jobs, Runners: s.runners, Artifacts: s.artifacts, Reports: s.reports, DownstreamLinks: s.downstreamLinks, Profiles: s.profiles, CertProfileLinks: s.certProfiles})
+	return s.store.Save(storage.Snapshot{Version: 1, Runs: s.runs, Jobs: s.jobs, Runners: s.runners, Artifacts: s.artifacts, Reports: s.reports, DownstreamLinks: s.downstreamLinks, Profiles: s.profiles, CertProfileLinks: s.certProfiles, Snapshots: s.snapshots})
 }
 func (s *Server) leaseDuration() time.Duration {
 	if s.LeaseDuration <= 0 {
@@ -3518,28 +3623,14 @@ func regionSatisfied(region string, allowed []string) bool {
 }
 
 // environmentAtCapacityScoped is the scheduling-time environment concurrency
-// gate for in-memory mode. The concurrency key is repo+environment: an
-// environment name is not a global lock across repositories. The SQL lease
-// pass applies the identical repo-scoped rule via
-// Store.ListJobsByEnvironment inside scheduler.Lease.
+// gate for in-memory mode. The concurrency key is the CANONICAL repository
+// identity plus the environment name (repo A's production never blocks repo
+// B's production, and HTTPS/SSH spellings of one repository share one key).
+// It delegates to scheduler.EnvironmentAtCapacity, the single decision the
+// DB scheduler's pre-filter and the SQL claim mirror, so memory mode and
+// Postgres mode agree by construction.
 func environmentAtCapacityScoped(j model.Job, jobs map[string]model.Job) bool {
-	if j.Environment == "" || j.EnvironmentConcurrency <= 0 {
-		return false
-	}
-	active := 0
-	for _, other := range jobs {
-		if other.ID == j.ID || other.Status != model.StatusRunning {
-			continue
-		}
-		if other.Environment != j.Environment || repoIDForJob(other) != repoIDForJob(j) {
-			continue
-		}
-		active++
-		if active >= j.EnvironmentConcurrency {
-			return true
-		}
-	}
-	return false
+	return scheduler.EnvironmentAtCapacity(j, jobs)
 }
 func validJobOutputs(in map[string]string) bool {
 	if len(in) > 256 {
@@ -3905,6 +3996,7 @@ func (s *Server) Maintain(ctx context.Context) {
 				s.publishGitHubStatus(r)
 			}
 			s.GC(ctx, tick.UTC())
+			s.maybeRunCASGC(ctx, tick.UTC())
 			s.flushOutbox()
 			s.fireDueSchedules(ctx, tick.UTC())
 			s.metricObserve("kiwi_scheduler_loop_duration_seconds", time.Since(loopStart).Seconds(), nil)
@@ -3941,4 +4033,5 @@ func (s *Server) maintainDB(ctx context.Context, now time.Time) {
 	s.recoverDownstreamReservations(ctx, now)
 	s.flushOutbox()
 	s.GC(ctx, now)
+	s.maybeRunCASGC(ctx, now)
 }

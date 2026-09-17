@@ -43,13 +43,15 @@ func TestDBRunnerDisableRequeuesRunningJobs(t *testing.T) {
 	j := f.jobs["job-1"]
 	audit := append([]model.AuditEvent(nil), f.audit...)
 	f.mu.Unlock()
-	// Retry budget still available: requeued with attempts++ and the lease
-	// cleared.
+	// Retry budget still available: requeued with the lease cleared and the
+	// attempts count UNCHANGED (attempts are charged by the lease only; the
+	// kill switch consumes the lease-time increment, exactly like
+	// RecoverExpired).
 	if j.Status != model.StatusQueued {
 		t.Fatalf("job status = %q, want queued (retry budget available)", j.Status)
 	}
-	if j.Attempts != 2 {
-		t.Fatalf("attempts = %d, want 2", j.Attempts)
+	if j.Attempts != 1 {
+		t.Fatalf("attempts = %d, want 1 (the lease-time increment only)", j.Attempts)
 	}
 	if j.LeaseRunnerID != "" || j.LeaseTokenHash != nil || j.LeaseExpiresAt != nil {
 		t.Fatalf("lease not invalidated: %+v", j)
@@ -95,8 +97,10 @@ func TestDBRunnerDisableCancelsWhenBudgetExhausted(t *testing.T) {
 	if j.Status != model.StatusCancelled {
 		t.Fatalf("job status = %q, want cancelled (retry budget exhausted)", j.Status)
 	}
-	if j.Attempts != 4 {
-		t.Fatalf("attempts = %d, want 4", j.Attempts)
+	// The exhausted decision reads the lease-time attempts; the kill switch
+	// never manufactures an extra attempt.
+	if j.Attempts != 3 {
+		t.Fatalf("attempts = %d, want 3 (lease-time increments only)", j.Attempts)
 	}
 	if j.LeaseRunnerID != "" || j.LeaseTokenHash != nil || j.LeaseExpiresAt != nil {
 		t.Fatalf("lease not invalidated: %+v", j)

@@ -49,7 +49,7 @@ func TestPostgresIntegrationSupersedeJobErrorBranch(t *testing.T) {
 	}
 	err := st.InsertCompiledRun(ctx, InsertCompiledRunRequest{
 		Run:       pgITRun(pgITNewID(t), model.StatusQueued),
-		Supersede: &SupersedePolicy{Repo: pgITRepo, ConcurrencyGroup: "deploy"},
+		Supersede: &SupersedePolicy{RepoID: pgITRepoID, ConcurrencyGroup: "deploy"},
 	})
 	if err == nil {
 		t.Fatal("expected the supersede cancel to fail on a corrupt job payload")

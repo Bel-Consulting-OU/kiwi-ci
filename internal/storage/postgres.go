@@ -450,24 +450,61 @@ func advisoryLockKey(kind string, parts ...string) int64 {
 	return int64(binary.BigEndian.Uint64(sum[:8]))
 }
 
+// canonicalRepoIDSQLExpr renders the SQL expression that resolves the
+// canonical repository identity of a runs/jobs payload EXACTLY like
+// RepoIDFor / RepoIDForRun / RepoIDForJob: the stored repo_id is
+// authoritative; a legacy payload (no repo_id) derives "<host>/<full name>"
+// from its clone URL — runs persist the clone URL as "repo", jobs as
+// "repo_url" — plus repo_full_name, itself recovered from the URL path when
+// the record carries none. The host/path extraction mirrors
+// RepoHost/RepoFullNameFromURL for the scheme (https://host/o/r.git),
+// ssh://git@host/o/r and scp-like (git@host:o/r) forms, so a row written
+// before RepoID existed compares EQUAL to a modern row for the same
+// repository even when the two spell the clone URL differently, and two
+// repositories that merely share a name on different hosts or forges never
+// compare equal. Host and full name are trimmed; an empty repo_id and an
+// unparseable URL resolve to "".
+func canonicalRepoIDSQLExpr(urlKey string) string {
+	u := "COALESCE(payload->>'" + urlKey + "', '')"
+	f := "BTRIM(COALESCE(payload->>'repo_full_name', ''))"
+	scpLike := "STRPOS(" + u + ", ':') > 0 AND (STRPOS(" + u + ", '/') = 0 OR STRPOS(" + u + ", '/') > STRPOS(" + u + ", ':'))"
+	host := "CASE WHEN STRPOS(" + u + ", '://') > 0 " +
+		"THEN REGEXP_REPLACE(SPLIT_PART(SUBSTRING(" + u + " FROM STRPOS(" + u + ", '://') + 3), '/', 1), '^.*@', '') " +
+		"WHEN " + scpLike + " THEN REGEXP_REPLACE(SPLIT_PART(" + u + ", ':', 1), '^.*@', '') " +
+		"ELSE REGEXP_REPLACE(SPLIT_PART(" + u + ", '/', 1), '^.*@', '') END"
+	path := "BTRIM(REGEXP_REPLACE(CASE WHEN STRPOS(" + u + ", '://') > 0 " +
+		"THEN COALESCE(SUBSTRING(SUBSTRING(" + u + " FROM STRPOS(" + u + ", '://') + 3) FROM '/(.*)$'), '') " +
+		"WHEN " + scpLike + " THEN SUBSTRING(" + u + " FROM STRPOS(" + u + ", ':') + 1) " +
+		"ELSE " + u + " END, '\\.git$', ''), '/')"
+	full := "CASE WHEN " + f + " <> '' THEN " + f + " ELSE " + path + " END"
+	return "COALESCE(NULLIF(BTRIM(payload->>'repo_id'), ''), " +
+		"CASE WHEN " + full + " = '' THEN '' " +
+		"WHEN " + host + " = '' OR LEFT(" + full + ", LENGTH(" + host + ") + 1) = " + host + " || '/' THEN " + full + " " +
+		"ELSE " + host + " || '/' || " + full + " END)"
+}
+
 // supersededJobIDsTx resolves the supersede policy to the concrete
-// non-terminal job IDs of every conflicting run. The per-(repository,
-// concurrency group) advisory transaction lock is taken FIRST, so
-// concurrent superseding enqueues of one group serialize: a transaction
-// entering the section only sees runs whose insert already committed, and
-// its cancellation commits atomically with its own run. The new run is
+// non-terminal job IDs of every conflicting run. The per-(canonical
+// repository identity, concurrency group) advisory transaction lock is taken
+// FIRST, so concurrent superseding enqueues of one group serialize: a
+// transaction entering the section only sees runs whose insert already
+// committed, and its cancellation commits atomically with its own run. The
+// conflicting runs are selected by the CANONICAL repo_id of their payload
+// (legacy rows: derived from the clone URL + full name, see
+// canonicalRepoIDSQLExpr), so the same repository submitted via HTTPS and
+// via SSH supersedes — a clone-URL comparison would not. The new run is
 // excluded by ID (its jobs must never be cancelled by its own enqueue).
 func (s *PostgresStore) supersededJobIDsTx(ctx context.Context, tx pgx.Tx, p *SupersedePolicy, newRunID string) ([]string, error) {
-	repo := strings.TrimSpace(p.Repo)
+	repoID := strings.TrimSpace(p.RepoID)
 	group := strings.TrimSpace(p.ConcurrencyGroup)
-	if repo == "" || group == "" {
+	if repoID == "" || group == "" {
 		return nil, nil
 	}
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, advisoryLockKey("kiwi-supersede", repo, group)); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, advisoryLockKey("kiwi-supersede", repoID, group)); err != nil {
 		return nil, err
 	}
-	rows, err := tx.Query(ctx, `SELECT id FROM runs WHERE id<>$3 AND payload->>'repo'=$1 AND payload->>'concurrency_group'=$2 AND NOT (status IN ('success', 'failure', 'cancelled', 'skipped', 'blocked')) ORDER BY created_at ASC, id ASC`,
-		repo, group, newRunID)
+	rows, err := tx.Query(ctx, `SELECT id FROM runs WHERE id<>$3 AND `+canonicalRepoIDSQLExpr("repo")+`=$1 AND payload->>'concurrency_group'=$2 AND NOT (status IN ('success', 'failure', 'cancelled', 'skipped', 'blocked')) ORDER BY created_at ASC, id ASC`,
+		repoID, group, newRunID)
 	if err != nil {
 		return nil, err
 	}
@@ -962,8 +999,14 @@ func (s *PostgresStore) ListJobsByRun(ctx context.Context, runID string) ([]mode
 	return out, rows.Err()
 }
 
-func (s *PostgresStore) ListJobsByEnvironment(ctx context.Context, repoURL, environment string) ([]model.Job, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+jobCols+` FROM jobs WHERE payload->>'repo_url'=$1 AND payload->>'environment'=$2 ORDER BY created_at ASC, id ASC`, repoURL, environment)
+// ListJobsByEnvironment returns every job holding one (canonical repository
+// identity, environment) key. Jobs are matched on the canonical repo_id of
+// their payload; legacy rows without one derive the identity from their
+// clone URL + full name (see canonicalRepoIDSQLExpr), so HTTPS and SSH
+// spellings of one repository return the same set while same-named
+// repositories on different hosts do not.
+func (s *PostgresStore) ListJobsByEnvironment(ctx context.Context, repoID, environment string) ([]model.Job, error) {
+	rows, err := s.pool.Query(ctx, `SELECT `+jobCols+` FROM jobs WHERE `+canonicalRepoIDSQLExpr("repo_url")+`=$1 AND payload->>'environment'=$2 ORDER BY created_at ASC, id ASC`, repoID, environment)
 	if err != nil {
 		return nil, err
 	}
@@ -1236,15 +1279,18 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 
 	// Step 2: environment concurrency is reserved inside this transaction:
 	// the per-key advisory lock serializes concurrent claims of the same
-	// (repo, environment) key, and the running count is read after taking
-	// the lock, so two polls can never both win the last slot.
+	// (CANONICAL repository identity, environment) key, and the running count
+	// is read after taking the lock, so two polls can never both win the last
+	// slot. The count matches the canonical repo_id of each running job
+	// (legacy rows: derived from the clone URL + full name), so an HTTPS
+	// submission and an SSH submission of one repository share one slot pool.
 	if envKey := claim.EnvKey(); envKey != "" && claim.EnvironmentConcurrency > 0 {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, advisoryLockKey("kiwi-env", envKey)); err != nil {
 			return model.Job{}, err
 		}
 		var running int
-		if err := tx.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE status='running' AND payload->>'repo_url'=$1 AND payload->>'environment'=$2 AND id<>$3`,
-			claim.RepoURL, claim.Environment, claim.JobID).Scan(&running); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE status='running' AND `+canonicalRepoIDSQLExpr("repo_url")+`=$1 AND payload->>'environment'=$2 AND id<>$3`,
+			claim.CanonRepoID, claim.Environment, claim.JobID).Scan(&running); err != nil {
 			return model.Job{}, err
 		}
 		if running >= claim.EnvironmentConcurrency {

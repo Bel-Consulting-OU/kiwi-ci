@@ -105,7 +105,7 @@ func TestPostgresIntegrationReaderScanSweep(t *testing.T) {
 			t.Fatal(err)
 		}
 		pgITBreakColumnToArray(t, st, "jobs", "key")
-		if _, err := st.ListJobsByEnvironment(context.Background(), pgITRepo, "prod"); err == nil {
+		if _, err := st.ListJobsByEnvironment(context.Background(), pgITRepoID, "prod"); err == nil {
 			t.Fatal("ListJobsByEnvironment = nil error")
 		}
 	})
@@ -341,7 +341,7 @@ func TestPostgresIntegrationRecomputeHelperBreaks(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer func() { _ = tx.Rollback(context.Background()) }()
-		if _, err := st.supersededJobIDsTx(context.Background(), tx, &SupersedePolicy{Repo: pgITRepo, ConcurrencyGroup: "g"}, "new-run"); err == nil {
+		if _, err := st.supersededJobIDsTx(context.Background(), tx, &SupersedePolicy{RepoID: pgITRepoID, ConcurrencyGroup: "g"}, "new-run"); err == nil {
 			t.Fatal("supersededJobIDsTx runs query failure = nil error")
 		}
 	})
@@ -361,7 +361,7 @@ func TestPostgresIntegrationRecomputeHelperBreaks(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer func() { _ = tx.Rollback(context.Background()) }()
-		if _, err := st.supersededJobIDsTx(context.Background(), tx, &SupersedePolicy{Repo: pgITRepo, ConcurrencyGroup: "g"}, "new-run"); err == nil {
+		if _, err := st.supersededJobIDsTx(context.Background(), tx, &SupersedePolicy{RepoID: pgITRepoID, ConcurrencyGroup: "g"}, "new-run"); err == nil {
 			t.Fatal("supersededJobIDsTx jobs query failure = nil error")
 		}
 	})
@@ -805,7 +805,7 @@ func TestPostgresIntegrationCloseThenSweep(t *testing.T) {
 	if _, err := st.ListTestReports(ctx, runID); err == nil {
 		t.Fatal("ListTestReports on a closed pool = nil error")
 	}
-	if _, err := st.ListJobsByEnvironment(ctx, pgITRepo, "prod"); err == nil {
+	if _, err := st.ListJobsByEnvironment(ctx, pgITRepoID, "prod"); err == nil {
 		t.Fatal("ListJobsByEnvironment on a closed pool = nil error")
 	}
 	if _, err := st.ListJobsByRunner(ctx, runnerID); err == nil {

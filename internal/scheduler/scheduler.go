@@ -205,8 +205,15 @@ func (s *DBScheduler) Enqueue(ctx context.Context, run model.Run, jobs map[strin
 		Jobs: jobs,
 		Deps: deps,
 	}
-	if cancelInProgress && run.ConcurrencyGroup != "" && run.Repo != "" {
-		req.Supersede = &storage.SupersedePolicy{Repo: run.Repo, ConcurrencyGroup: run.ConcurrencyGroup}
+	// The supersede policy carries the CANONICAL repository identity of the
+	// run (stored RepoID, legacy URL + full-name fallback), not the clone
+	// URL: HTTPS and SSH submissions of one repository must supersede, and
+	// the SQL store's advisory lock and prior-run selection key on the same
+	// canonical value.
+	if cancelInProgress {
+		if repoID := storage.RepoIDForRun(run); repoID != "" && run.ConcurrencyGroup != "" {
+			req.Supersede = &storage.SupersedePolicy{RepoID: repoID, ConcurrencyGroup: run.ConcurrencyGroup}
+		}
 	}
 	return rs.InsertCompiledRun(ctx, req)
 }
@@ -267,10 +274,16 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 		// concurrency.
 		envRunning := 0
 		if candidate.Environment != "" && candidate.EnvironmentConcurrency > 0 {
-			key := candidate.RepoURL + "\x00" + candidate.Environment
+			// The environment concurrency key is the CANONICAL repository
+			// identity plus the environment name (LeaseClaim.EnvKey): the
+			// same repository submitted via HTTPS and via SSH shares one
+			// slot pool, and a same-named environment on another repository
+			// never shares it.
+			repoID := storage.RepoIDForJob(candidate)
+			key := repoID + "\x00" + candidate.Environment
 			active, ok := envJobs[key]
 			if !ok {
-				all, err := s.Store.ListJobsByEnvironment(ctx, candidate.RepoURL, candidate.Environment)
+				all, err := s.Store.ListJobsByEnvironment(ctx, repoID, candidate.Environment)
 				if err != nil {
 					return nil, "", time.Time{}, err
 				}
@@ -332,7 +345,6 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 			PlacementRegions:       candidate.PlacementRegions,
 			Environment:            candidate.Environment,
 			EnvironmentConcurrency: candidate.EnvironmentConcurrency,
-			RepoURL:                candidate.RepoURL,
 			RepoConcurrency:        repoConcurrency,
 			TeamConcurrency:        teamConcurrency,
 		}
@@ -466,11 +478,17 @@ func (s *DBScheduler) CancelRun(ctx context.Context, runID, reason string) error
 
 // CancelJobsByRunner is the runner disable kill switch: it invalidates every
 // active lease the runner holds in one pass. Each running job either
-// requeues (attempts++ and the infrastructure retry budget still available)
-// or cancels; lease fields are cleared so a stale lease token is dead, the
-// runner's counters are released, dependent jobs and run statuses are
-// recomputed, and audit events are emitted through the store. It returns
-// the number of invalidated leases.
+// requeues (the infrastructure retry budget still available) or cancels;
+// lease fields are cleared so a stale lease token is dead, the runner's
+// counters are released, dependent jobs and run statuses are recomputed, and
+// audit events are emitted through the store. It returns the number of
+// invalidated leases.
+//
+// The requeue/exhaustion decision consumes the SAME attempt count as
+// RecoverExpired: attempts increment exactly once per lease (see
+// storage.AcquireLeaseAtomic / AcquireLease), so a lease recovered here is
+// not charged a second attempt — the budget compares the job's attempt
+// count, it does not manufacture a new one.
 func (s *DBScheduler) CancelJobsByRunner(ctx context.Context, runnerID, reason string) (int, error) {
 	if runnerID == "" {
 		return 0, fmt.Errorf("scheduler: cancel jobs by runner: empty runner id")
@@ -491,7 +509,8 @@ func (s *DBScheduler) CancelJobsByRunner(ctx context.Context, runnerID, reason s
 		if j.Status != model.StatusRunning {
 			continue
 		}
-		j.Attempts++
+		// Same decision RecoverExpired makes from the lease-time increment:
+		// no extra attempts++ here, attempts stay equal to leases/executions.
 		if j.Attempts <= j.MaxInfraRetries {
 			j.Status = model.StatusQueued
 			j.Error = reason + "; retrying"

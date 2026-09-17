@@ -39,42 +39,52 @@ func canned(status int, body string) *http.Response {
 	return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Header: http.Header{}}
 }
 
-// TestProviderClientFactories proves each provider returns the configured
-// client and falls back to the default.
+// TestProviderClientFactories proves each provider adopts the hardened
+// client factory: a configured client's transport is preserved (on a copy),
+// while redirect refusal and a finite total timeout are always enforced; a
+// provider without a configured client never falls back to the unbounded
+// http.DefaultClient.
 func TestProviderClientFactories(t *testing.T) {
-	custom := &http.Client{Timeout: time.Second}
-	if (&SecretsManagerClient{HTTPClient: custom}).client() != custom {
-		t.Fatal("aws custom client ignored")
+	custom := &http.Client{Timeout: time.Second, Transport: &http.Transport{}}
+	checkConfigured := func(name string, got *http.Client) {
+		t.Helper()
+		if got == custom {
+			t.Fatalf("%s: configured client must be copied, not returned as-is", name)
+		}
+		if got.Transport != custom.Transport {
+			t.Fatalf("%s: configured transport ignored", name)
+		}
+		if got.Timeout != time.Second {
+			t.Fatalf("%s: configured timeout = %v", name, got.Timeout)
+		}
+		if got.CheckRedirect == nil || got.CheckRedirect(nil, nil) != http.ErrUseLastResponse {
+			t.Fatalf("%s: configured client must refuse redirects", name)
+		}
 	}
-	if (&SecretsManagerClient{}).client() != http.DefaultClient {
-		t.Fatal("aws default client wrong")
+	checkDefault := func(name string, got *http.Client) {
+		t.Helper()
+		if got == http.DefaultClient {
+			t.Fatalf("%s: default client must be the hardened one, not http.DefaultClient", name)
+		}
+		if got.Timeout != hardenedTotalTimeout {
+			t.Fatalf("%s: default timeout = %v, want %v", name, got.Timeout, hardenedTotalTimeout)
+		}
+		if got.CheckRedirect == nil || got.CheckRedirect(nil, nil) != http.ErrUseLastResponse {
+			t.Fatalf("%s: default client must refuse redirects", name)
+		}
 	}
-	if (&AzureClient{HTTPClient: custom}).client() != custom {
-		t.Fatal("azure custom client ignored")
-	}
-	if (&AzureClient{}).client() != http.DefaultClient {
-		t.Fatal("azure default client wrong")
-	}
-	if (&GCPClient{HTTPClient: custom}).client() != custom {
-		t.Fatal("gcp custom client ignored")
-	}
-	if (&GCPClient{}).client() != http.DefaultClient {
-		t.Fatal("gcp default client wrong")
-	}
-	if (&OnePasswordClient{HTTPClient: custom}).client() != custom {
-		t.Fatal("onepassword custom client ignored")
-	}
-	if (&OnePasswordClient{}).client() != http.DefaultClient {
-		t.Fatal("onepassword default client wrong")
-	}
-	if (&VaultClient{HTTPClient: custom}).client() != custom {
-		t.Fatal("vault custom client ignored")
-	}
-	vc := (&VaultClient{}).client()
-	req, _ := http.NewRequest(http.MethodGet, "https://vault.example", nil)
-	if vc.CheckRedirect == nil || vc.CheckRedirect(req, nil) != http.ErrUseLastResponse {
-		t.Fatal("vault default client must refuse redirects")
-	}
+	checkConfigured("aws", (&SecretsManagerClient{HTTPClient: custom}).client())
+	checkDefault("aws default", (&SecretsManagerClient{}).client())
+	checkConfigured("azure", (&AzureClient{HTTPClient: custom}).client())
+	checkDefault("azure default", (&AzureClient{}).client())
+	checkConfigured("gcp", (&GCPClient{HTTPClient: custom}).client())
+	checkDefault("gcp default", (&GCPClient{}).client())
+	checkConfigured("onepassword", (&OnePasswordClient{HTTPClient: custom}).client())
+	checkDefault("onepassword default", (&OnePasswordClient{}).client())
+	checkConfigured("vault", (&VaultClient{HTTPClient: custom}).client())
+	checkDefault("vault default", (&VaultClient{}).client())
+	checkConfigured("remote", (&RemoteProvider{Client: custom}).client())
+	checkDefault("remote default", (&RemoteProvider{}).client())
 }
 
 // TestAWSSecretsManagerErrorMatrix proves every failure branch of the

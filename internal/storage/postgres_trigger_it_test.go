@@ -655,7 +655,7 @@ func TestPostgresIntegrationDroppedTableReadErrors(t *testing.T) {
 			return err
 		}},
 		"ListJobsByEnv": {"jobs", func(t *testing.T, st *PostgresStore, ids *boomerIds) error {
-			_, err := st.ListJobsByEnvironment(ctx, pgITRepo, "prod")
+			_, err := st.ListJobsByEnvironment(ctx, pgITRepoID, "prod")
 			return err
 		}},
 		"ListJobsByRunner": {"jobs", func(t *testing.T, st *PostgresStore, ids *boomerIds) error {

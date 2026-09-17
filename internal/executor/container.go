@@ -40,6 +40,11 @@ type ContainerBackend struct {
 	// run flags by StartJob. Values are already admission-checked by
 	// pipeline validation; zero requests produce no flags.
 	Resources pipeline.Resources
+	// restoreWorkspace undoes the host-side workspace provisioning applied
+	// before a hardened rootful container started. It is set by StartJob and
+	// run exactly once by CloseJob (or by StartJob itself when the docker run
+	// fails after provisioning).
+	restoreWorkspace func() error
 }
 
 func (*ContainerBackend) Name() string { return "container" }
@@ -84,16 +89,28 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 	args = append(args, resourceArgsFor(b.Resources)...)
 	args = append(args, containerLabels(b.RunID, b.JobID)...)
 	if b.Rootless || b.ReadOnlyRootFS {
+		plan := planHardenedContainer(b.Rootless)
 		args = append(args,
 			"--read-only",
 			"--tmpfs", "/tmp:rw,nosuid,nodev",
 			"--tmpfs", "/run:rw,nosuid,nodev",
-			"--user=65534:65534",
+			"--user="+plan.User,
 		)
+		if plan.ProvisionWorkspace {
+			restore, perr := provisionWorkspace(abs, plan.UID, plan.GID, false)
+			if perr != nil {
+				return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("provision container workspace: %w", perr)}
+			}
+			b.restoreWorkspace = restore
+		}
 	}
 	args = append(args, b.Image, "sh", "-c", "while :; do sleep 3600; done")
 	out, err := exec.CommandContext(ctx, docker, args...).CombinedOutput()
 	if err != nil {
+		restoreErr := b.restoreProvisionedWorkspace()
+		if restoreErr != nil {
+			return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("start job container: %v: %s (workspace restore also failed: %v)", err, strings.TrimSpace(string(out)), restoreErr)}
+		}
 		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("start job container: %v: %s", err, strings.TrimSpace(string(out)))}
 	}
 	emit("job container started " + b.container)
@@ -124,6 +141,74 @@ func resourceArgsFor(r pipeline.Resources) []string {
 	}
 	return args
 }
+
+// containerWorkloadUID/GID is the unprivileged identity a hardened container
+// drops to on a rootful daemon ("nobody"). A rootful daemon has no user
+// namespace mapping, so this uid exists on the host and cannot traverse the
+// 0700 runner-owned checkout until the workspace is provisioned.
+const (
+	containerWorkloadUID = 65534
+	containerWorkloadGID = 65534
+)
+
+// workspaceTraverseMode is the mode applied to the workspace ROOT while a
+// hardened rootful workload owns it: execute-only for the runner and other
+// local users (traverse), while the workload, as owner, keeps rwx. Inner
+// checkout entries are chowned to the workload rather than opened up.
+const workspaceTraverseMode = os.FileMode(0o711)
+
+// hardenedContainerPlan is the pure decision for how a hardened container job
+// reaches the bind-mounted workspace:
+//
+//   - rootless daemon: the daemon is user-namespaced, so container root IS the
+//     host runner uid. The workload runs as 0:0 inside the namespace (never
+//     65534, which would map to a subordinate UID and lose access to the
+//     runner-owned mount). No host-side provisioning is needed: files the
+//     workload writes stay runner-owned on the host, and the user namespace is
+//     the isolation boundary.
+//   - rootful daemon: the workload drops to 65534:65534. The checkout is 0700
+//     and runner-owned, so the tree is chowned to the workload and the
+//     workspace root is made traverse-only (0711) before the container starts;
+//     the executor restores ownership and mode when the job ends.
+type hardenedContainerPlan struct {
+	User               string
+	ProvisionWorkspace bool
+	WorkspaceDirMode   os.FileMode
+	UID                int
+	GID                int
+}
+
+func planHardenedContainer(rootless bool) hardenedContainerPlan {
+	if rootless {
+		return hardenedContainerPlan{User: "0:0"}
+	}
+	return hardenedContainerPlan{
+		User:               "65534:65534",
+		ProvisionWorkspace: true,
+		WorkspaceDirMode:   workspaceTraverseMode,
+		UID:                containerWorkloadUID,
+		GID:                containerWorkloadGID,
+	}
+}
+
+// provisionContainerWorkspace prepares the runner-owned checkout for a
+// hardened container workload and returns the restore function that puts the
+// tree back under the runner's uid/gid. Rootless daemons need no ownership
+// change (see planHardenedContainer); rootful daemons chown the tree to the
+// workload uid/gid and leave the workspace root traverse-only (0711), so the
+// workload can enter and write the checkout without the checkout ever being
+// world-writable.
+func provisionContainerWorkspace(workspace string, uid, gid int, rootless bool) (func() error, error) {
+	if rootless {
+		return func() error { return nil }, nil
+	}
+	return provisionWorkspaceTree(workspace, uid, gid)
+}
+
+// provisionWorkspace is a seam over provisionContainerWorkspace so backend
+// tests can exercise a hardened rootful StartJob without a root runner: the
+// real chown to 65534 requires CAP_CHOWN.
+var provisionWorkspace = provisionContainerWorkspace
 
 // securityOptionsRootless reports whether a `docker info --format
 // {{.SecurityOptions}}` report claims a rootless daemon. The daemon emits
@@ -159,14 +244,29 @@ func (b *ContainerBackend) verifyRootlessDaemon(ctx context.Context, docker stri
 
 func (b *ContainerBackend) CloseJob() error {
 	if b.container == "" || b.docker == "" {
-		return nil
+		return b.restoreProvisionedWorkspace()
 	}
 	out, err := exec.Command(b.docker, "rm", "-f", b.container).CombinedOutput()
 	b.container = ""
 	if err != nil && !strings.Contains(string(out), "No such container") {
+		if rerr := b.restoreProvisionedWorkspace(); rerr != nil {
+			return fmt.Errorf("remove job container: %v: %s (workspace restore also failed: %v)", err, strings.TrimSpace(string(out)), rerr)
+		}
 		return fmt.Errorf("remove job container: %v: %s", err, strings.TrimSpace(string(out)))
 	}
-	return nil
+	return b.restoreProvisionedWorkspace()
+}
+
+// restoreProvisionedWorkspace runs the pending ownership restore exactly once.
+// Errors are returned, never swallowed: a failed restore leaves the checkout
+// under the workload uid and must surface as a cleanup warning.
+func (b *ContainerBackend) restoreProvisionedWorkspace() error {
+	restore := b.restoreWorkspace
+	b.restoreWorkspace = nil
+	if restore == nil {
+		return nil
+	}
+	return restore()
 }
 
 // ReadFile reads a workspace file from inside the job container via

@@ -429,9 +429,29 @@ func TestSqueezeRecordDeploymentDBPaths(t *testing.T) {
 	if err := f.InsertJob(context.Background(), model.Job{ID: "job-2", RunID: "run-1", Environment: "prod"}); err != nil {
 		t.Fatal(err)
 	}
+	// A failing durable insert fails the request and leaves neither the
+	// in-memory mirror nor an audit event behind.
 	f.deploymentInsertErr = errStaticKindMissing
-	if w := c.do(http.MethodPost, "/api/v1/jobs/job-2/deployments", nil, nil); w.Code != http.StatusCreated {
-		t.Fatalf("record with failing insert = %d, want 201", w.Code)
+	if w := c.do(http.MethodPost, "/api/v1/jobs/job-2/deployments", nil, nil); w.Code != http.StatusInternalServerError {
+		t.Fatalf("record with failing insert = %d, want 500", w.Code)
+	}
+	s.mu.Lock()
+	_, mirrored := s.deployments["job-2"]
+	s.mu.Unlock()
+	if mirrored {
+		t.Fatal("failed deployment insert left an in-memory marker")
+	}
+	f.mu.Lock()
+	_, stored := f.deployments["job-2"]
+	audited := false
+	for _, e := range f.audit {
+		if e.Action == "deployment.started" && e.JobID == "job-2" {
+			audited = true
+		}
+	}
+	f.mu.Unlock()
+	if stored || audited {
+		t.Fatalf("failed deployment insert reached the store=%v audit=%v", stored, audited)
 	}
 }
 

@@ -348,7 +348,11 @@ func TestMemStoreLeaseEnvironmentConcurrency(t *testing.T) {
 		go func(i int, jobID string) {
 			defer wg.Done()
 			runnerID := []string{leaseRunner, "66666666666666666666666666666666"}[i]
-			_, err := m.AcquireLeaseAtomic(ctx(), leaseClaimFor(jobID, runnerID, 1))
+			claim := leaseClaimFor(jobID, runnerID, 1)
+			claim.CanonRepoID = leaseRepoID
+			claim.Environment = "prod"
+			claim.EnvironmentConcurrency = 1
+			_, err := m.AcquireLeaseAtomic(ctx(), claim)
 			results <- result{jobID, err}
 		}(i, jobID)
 	}
@@ -381,13 +385,11 @@ func TestMemStoreLeaseQuotaConcurrency(t *testing.T) {
 		t.Fatal(err)
 	}
 	claim := leaseClaimFor(leaseJobID, leaseRunner, 2)
-	claim.RepoURL = leaseRepo
 	claim.RepoConcurrency = 1
 	if _, err := m.AcquireLeaseAtomic(ctx(), claim); err != nil {
 		t.Fatalf("first quota claim: %v", err)
 	}
 	second := leaseClaimFor(leaseJob2ID, leaseRunner, 2)
-	second.RepoURL = leaseRepo
 	second.RepoConcurrency = 1
 	_, err := m.AcquireLeaseAtomic(ctx(), second)
 	var qe *QuotaExceededError

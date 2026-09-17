@@ -133,9 +133,11 @@ func (s *Server) admitOrgPolicyRestrictions(id repoIdentity, spec *pipeline.Spec
 	// Allowed clone hosts: org-level allowlist intersected with the
 	// repo-level allowlist. Nil means the level imposes no restriction;
 	// a non-nil EMPTY result (disjoint restrictions) denies every host.
+	// Both sides are canonicalized (lowercase, one trailing dot, default
+	// port dropped) so equivalent forge-host spellings match.
 	if hosts := s.Policy.AllowedCloneHostsFor(repoID); hosts != nil {
 		host := repoHost(id.RepoURL)
-		if host == "" || !containsList(hosts, host) {
+		if !s.Policy.CloneHostAllowed(repoID, host) {
 			return policyDenied(fmt.Sprintf("repository host %q is not in the allowed clone hosts", host))
 		}
 	}

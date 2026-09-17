@@ -23,10 +23,7 @@ type AzureClient struct {
 }
 
 func (c *AzureClient) client() *http.Client {
-	if c.HTTPClient != nil {
-		return c.HTTPClient
-	}
-	return http.DefaultClient
+	return providerClient(c.HTTPClient)
 }
 
 func (c *AzureClient) tokenURL() string {
@@ -41,13 +38,17 @@ type azureTokenResponse struct {
 }
 
 func (c *AzureClient) accessToken(ctx context.Context) (string, error) {
+	tokenURL := c.tokenURL()
+	if err := validateProviderEndpoint(tokenURL, true); err != nil {
+		return "", fmt.Errorf("azure: %w", err)
+	}
 	form := url.Values{
 		"grant_type":    {"client_credentials"},
 		"client_id":     {c.ClientID},
 		"client_secret": {c.ClientSecret},
 		"scope":         {"https://vault.azure.net/.default"},
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.tokenURL(), strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return "", fmt.Errorf("azure: token request: %w", err)
 	}
@@ -84,6 +85,9 @@ func (c *AzureClient) Resolve(ctx context.Context, name string, _ SecretScope) (
 	token, err := c.accessToken(ctx)
 	if err != nil {
 		return "", err
+	}
+	if err := validateProviderEndpoint(c.VaultURL, true); err != nil {
+		return "", fmt.Errorf("azure: %w", err)
 	}
 	u := strings.TrimRight(c.VaultURL, "/") + "/secrets/" + url.PathEscape(name) + "?api-version=7.4"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)

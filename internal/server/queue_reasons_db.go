@@ -64,12 +64,16 @@ func (s *Server) depsReadyDB(ctx context.Context, j model.Job) bool {
 }
 
 // environmentAtCapacityDB mirrors environmentAtCapacityScoped against the
-// SQL store's per-environment job listing.
+// SQL store's per-environment job listing: the listing is keyed by the
+// SCHEDULING identity of the checkout repository (storage.RepoIDForJob:
+// stored RepoID with the legacy URL + full-name fallback), never the clone
+// URL and never the authorization-side PolicyRepoID. The DB and memory modes
+// therefore make the same repo-scoped decision for one candidate.
 func (s *Server) environmentAtCapacityDB(ctx context.Context, j model.Job) bool {
 	if j.Environment == "" || j.EnvironmentConcurrency <= 0 {
 		return false
 	}
-	others, err := s.DB.ListJobsByEnvironment(ctx, j.RepoURL, j.Environment)
+	others, err := s.DB.ListJobsByEnvironment(ctx, storage.RepoIDForJob(j), j.Environment)
 	if err != nil {
 		return false
 	}

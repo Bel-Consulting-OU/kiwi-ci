@@ -27,10 +27,7 @@ type SecretsManagerClient struct {
 }
 
 func (c *SecretsManagerClient) client() *http.Client {
-	if c.HTTPClient != nil {
-		return c.HTTPClient
-	}
-	return http.DefaultClient
+	return providerClient(c.HTTPClient)
 }
 
 func (c *SecretsManagerClient) endpoint() string {
@@ -52,6 +49,9 @@ func (c *SecretsManagerClient) Resolve(ctx context.Context, name string, _ Secre
 		return "", fmt.Errorf("secretsmanager: marshal request: %w", err)
 	}
 	endpoint := c.endpoint()
+	if err := validateProviderEndpoint(endpoint, true); err != nil {
+		return "", fmt.Errorf("secretsmanager: %w", err)
+	}
 	u, err := url.Parse(endpoint)
 	if err != nil {
 		return "", fmt.Errorf("secretsmanager: parse endpoint: %w", err)

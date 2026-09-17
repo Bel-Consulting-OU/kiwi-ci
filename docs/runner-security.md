@@ -23,8 +23,51 @@ Distributed runners must never enable environment inheritance.
   reflink copy, or plain copy), so parallel matrix jobs cannot observe
   or clobber each other (`internal/workspace`).
 - Remote runs get a fresh per-task clone on the runner.
+- The remote runner creates the per-job workspace root with `os.MkdirTemp`
+  (`kiwi-run-*`): mode `0700`, owned by the runner's uid/gid. Nothing is
+  world-readable or world-writable at rest.
 - Working directories are resolved through symlinks and rejected if
   they escape the workspace.
+
+### Container workspace ownership (hardened jobs)
+
+A hardened container job (`sandbox.rootless` or
+`sandbox.read_only_rootfs`) must be able to traverse and write the
+bind-mounted checkout without the checkout ever becoming world-writable.
+The executor decides this purely from the daemon kind
+(`planHardenedContainer`):
+
+| daemon   | workload identity | workspace root | ownership                 | host-side provisioning |
+|----------|-------------------|----------------|---------------------------|------------------------|
+| rootless | `0:0` in the user namespace | unchanged `0700` | stays runner-owned | none: container root already maps to the runner uid; the user namespace is the isolation boundary |
+| rootful  | `65534:65534` (`nobody`) | `0711` traverse-only | chowned to `65534:65534` for the container lifetime | `provisionContainerWorkspace` before `docker run` |
+
+Rules that keep this safe:
+
+- The rootful provisioning refuses to touch a tree the runner does not
+  own (validated entry by entry before any `chown`; symlinks are
+  `lchown`ed, never followed). A partial failure rolls the root mode
+  back; a non-root runner gets a clear provisioning error instead of a
+  container that cannot read its own workspace.
+- Restore runs when the job ends (including failed starts): every entry
+  is chowned back to the runner uid/gid and the original root mode
+  (`0700`) is reinstated, so artifact capture, snapshots, test reports
+  and `os.RemoveAll` all see runner-owned files again. Restore is
+  idempotent and its errors are surfaced as cleanup warnings.
+- The `0711` root only grants traversal: inner entries are chowned to
+  the workload instead of being opened up, and no job ever gets a
+  world-writable workspace.
+- Rootless daemons never force `--user=65534:65534`: on a user-namespaced
+  daemon that uid maps to a subordinate host uid which cannot access the
+  runner-owned mount. The workload runs as namespace root and files
+  created in the bind mount stay runner-owned on the host.
+
+`internal/runner/rootless_integration_test.go` (gated by
+`KIWI_TEST_DOCKER=1`) proves the contract end to end: the job writes a
+file through the mount, an artifact uploads from the host-side tree, the
+host sees runner ownership and the restored `0700` mode afterwards, and
+a rootless daemon reports container root while the host file stays
+runner-owned.
 
 ## Backend hardening
 
@@ -33,12 +76,17 @@ Distributed runners must never enable environment inheritance.
 Jobs run in a single long-lived container with:
 
 - `--cap-drop=ALL` and `--security-opt=no-new-privileges`;
-- `--init` and workspace bind mount;
+- `--init` and workspace bind mount (ownership prepared per the
+  decision table above);
 - network `bridge`, `host`, or `none` per job;
 - `sandbox.rootless` verifies the Docker daemon is actually rootless
-  (`docker info`) and refuses otherwise;
+  (`docker info`) and refuses otherwise; a verified rootless daemon then
+  runs the workload as namespace root (`0:0`) so the bind mount stays
+  runner-owned on the host;
 - `sandbox.read_only_rootfs` mounts the root filesystem read-only with
-  `nosuid,nodev` tmpfs for `/tmp` and `/run`;
+  `nosuid,nodev` tmpfs for `/tmp` and `/run`; on a rootful daemon the
+  workload drops to `65534:65534` and the workspace is provisioned as
+  described in "Container workspace ownership";
 - service containers join a dedicated network, which is created
   `--internal` when egress is `none` or `services-only`.
 

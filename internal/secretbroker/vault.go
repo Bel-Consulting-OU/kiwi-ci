@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -21,41 +20,24 @@ type VaultClient struct {
 }
 
 func (c *VaultClient) client() *http.Client {
-	if c.HTTPClient != nil {
-		return c.HTTPClient
-	}
-	return &http.Client{
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
+	return providerClient(c.HTTPClient)
 }
 
+// baseURL validates and parses the configured Vault address. Validation is
+// repeated on every resolve: an endpoint that fails it (http, userinfo, a
+// credential-bearing query) fails closed before any token is attached.
 func (c *VaultClient) baseURL() (*url.URL, error) {
+	if err := validateProviderEndpoint(c.Address, true); err != nil {
+		return nil, fmt.Errorf("vault: %w", err)
+	}
 	u, err := url.Parse(c.Address)
 	if err != nil {
 		return nil, fmt.Errorf("vault: parse address: %w", err)
-	}
-	if u.Scheme != "https" {
-		if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
-			return nil, fmt.Errorf("vault: insecure http address %q rejected (non-loopback)", c.Address)
-		}
-		if u.Scheme != "http" {
-			return nil, fmt.Errorf("vault: unsupported scheme %q", u.Scheme)
-		}
 	}
 	if u.Host == "" {
 		return nil, fmt.Errorf("vault: address has no host")
 	}
 	return u, nil
-}
-
-func isLoopbackHost(host string) bool {
-	if host == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
 }
 
 type vaultKV2Response struct {

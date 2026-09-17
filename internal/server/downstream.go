@@ -330,14 +330,20 @@ func (s *Server) dispatchDownstream(ctx context.Context, item forge.OutboxItem) 
 	// A replayed dispatch whose link is already launched with the same
 	// stable ID returns the existing child run.
 	child, err := s.enqueueID(SubmitRun{
-		RepoID:       targetRepoID,
-		RepoURL:      downstreamCloneURL(forgeKind, baseURL, p.TargetRepo),
-		RepoFullName: p.TargetRepo,
-		Ref:          p.TargetRef,
-		Event:        p.Event,
-		Pipeline:     content,
-		Trusted:      trusted,
-		Metadata:     meta,
+		RepoID:          targetRepoID,
+		PolicyRepoID:    targetRepoID,
+		CheckoutRepoURL: downstreamCloneURL(forgeKind, baseURL, p.TargetRepo),
+		RepoURL:         downstreamCloneURL(forgeKind, baseURL, p.TargetRepo),
+		RepoFullName:    p.TargetRepo,
+		Ref:             p.TargetRef,
+		Event:           p.Event,
+		Pipeline:        content,
+		Trusted:         trusted,
+		Metadata:        meta,
+		// The identity is derived server-side from the persisted link
+		// coordinates (never from a client-supplied name), so the
+		// direct-submission binding does not apply.
+		identityBound: true,
 		DownstreamLaunch: &storage.DownstreamLaunchClaim{
 			LinkKey:       downstreamLinkKey(p.ParentJobID, p.TargetRepo, p.TargetRef),
 			StableChildID: stableKey,

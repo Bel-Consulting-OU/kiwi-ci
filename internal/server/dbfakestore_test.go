@@ -86,6 +86,19 @@ type dbFakeStore struct {
 	// leave the durable pending rows in place).
 	artifactInsertErr error
 
+	// casRefErr, when non-nil, makes every CAS-reference read path fail
+	// (the CAS GC fail-closed tests).
+	casRefErr error
+	// casGCLeases records the held collector leases by key; casGCLeaseClaims
+	// records every acquisition attempt; casGCLeaseErr injects a hard lease
+	// failure.
+	casGCLeases      map[string]bool
+	casGCLeaseClaims []string
+	casGCLeaseErr    error
+	// leaderClaims records every advisory-lock key TryAcquireLeadership was
+	// asked for, so tests can pin the CAS GC HA lease.
+	leaderClaims []string
+
 	// listRunsErr/getRunErr/getJobErr make the corresponding read fail with a
 	// hard store error (not ErrNotFound), and the deployment knobs make the
 	// deployment store fail: they drive fail-closed/500 paths.
@@ -100,7 +113,11 @@ type dbFakeStore struct {
 	findDeliveryErr     error
 	outboxPendingErr    error
 	listSchedulesErr    error
-	cancelRunJobsErr    error
+	// advanceScheduleErr, when non-nil, makes AdvanceScheduleLastRun fail
+	// (durable-advance failure-injection tests: the in-memory mirror must
+	// stay untouched).
+	advanceScheduleErr error
+	cancelRunJobsErr   error
 	// enqueueErr, when non-nil, is returned by InsertCompiledRun in place of
 	// the in-memory enqueue.
 	enqueueErr error
@@ -203,6 +220,44 @@ var _ storage.EnrollGrantStore = (*dbFakeStore)(nil)
 var _ storage.TestHistoryStore = (*dbFakeStore)(nil)
 var _ storage.ArtifactIdempotentStore = (*dbFakeStore)(nil)
 var _ storage.GeneratedFragmentStore = (*dbFakeStore)(nil)
+var _ storage.CASReferenceStore = (*dbFakeStore)(nil)
+var _ storage.CASGCLeaseStore = (*dbFakeStore)(nil)
+
+// fakeCASGCLease is one held in-memory collector lease.
+type fakeCASGCLease struct {
+	store *dbFakeStore
+	key   string
+	once  sync.Once
+}
+
+func (l *fakeCASGCLease) Release(ctx context.Context) error {
+	l.once.Do(func() {
+		l.store.mu.Lock()
+		delete(l.store.casGCLeases, l.key)
+		l.store.mu.Unlock()
+	})
+	return nil
+}
+
+// TryAcquireCASGCLease implements storage.CASGCLeaseStore: the advisory
+// lock is modeled as a per-key held flag and every attempt is recorded so
+// tests can pin the HA lease. casGCLeaseErr injects a hard store failure.
+func (f *dbFakeStore) TryAcquireCASGCLease(ctx context.Context, key string) (storage.CASGCLease, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.casGCLeaseClaims = append(f.casGCLeaseClaims, key)
+	if f.casGCLeaseErr != nil {
+		return nil, false, f.casGCLeaseErr
+	}
+	if f.casGCLeases == nil {
+		f.casGCLeases = map[string]bool{}
+	}
+	if f.casGCLeases[key] {
+		return nil, false, nil
+	}
+	f.casGCLeases[key] = true
+	return &fakeCASGCLease{store: f, key: key}, true, nil
+}
 
 func newDBFakeStore() *dbFakeStore {
 	return &dbFakeStore{
@@ -322,12 +377,12 @@ func (f *dbFakeStore) ListJobsByRun(ctx context.Context, runID string) ([]model.
 	return out, nil
 }
 
-func (f *dbFakeStore) ListJobsByEnvironment(ctx context.Context, repoURL, environment string) ([]model.Job, error) {
+func (f *dbFakeStore) ListJobsByEnvironment(ctx context.Context, repoID, environment string) ([]model.Job, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := []model.Job{}
 	for _, j := range f.jobs {
-		if j.Environment == environment && j.RepoURL == repoURL {
+		if j.Environment == environment && storage.RepoIDForJob(j) == repoID {
 			out = append(out, j)
 		}
 	}
@@ -795,6 +850,7 @@ func (f *dbFakeStore) FindDelivery(ctx context.Context, forge, deliveryID string
 func (f *dbFakeStore) TryAcquireLeadership(ctx context.Context, key string, ttl time.Duration) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.leaderClaims = append(f.leaderClaims, key)
 	if f.leaderErr != nil {
 		return false, f.leaderErr
 	}
@@ -802,6 +858,58 @@ func (f *dbFakeStore) TryAcquireLeadership(ctx context.Context, key string, ttl 
 }
 
 func (f *dbFakeStore) ReleaseLeadership(ctx context.Context, key string) error { return nil }
+
+// ListAllArtifacts implements storage.CASReferenceStore: the full artifact
+// table, mirroring the real read path.
+func (f *dbFakeStore) ListAllArtifacts(ctx context.Context) ([]model.ArtifactRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.casRefErr != nil {
+		return nil, f.casRefErr
+	}
+	return append([]model.ArtifactRecord{}, f.artifacts...), nil
+}
+
+// ListAllSnapshots implements storage.CASReferenceStore: the full snapshot
+// table.
+func (f *dbFakeStore) ListAllSnapshots(ctx context.Context) ([]model.SnapshotRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.casRefErr != nil {
+		return nil, f.casRefErr
+	}
+	return append([]model.SnapshotRecord{}, f.snapshots...), nil
+}
+
+// ListAllCacheManifests implements storage.CASReferenceStore: every durable
+// cache-manifest row.
+func (f *dbFakeStore) ListAllCacheManifests(ctx context.Context) ([]storage.CacheManifestRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.casRefErr != nil {
+		return nil, f.casRefErr
+	}
+	out := []storage.CacheManifestRecord{}
+	for _, rec := range f.cacheMans {
+		out = append(out, rec)
+	}
+	return out, nil
+}
+
+// ListAllPendingSidecarDigests implements storage.CASReferenceStore: the
+// digest column of the durable pending-sidecar rows.
+func (f *dbFakeStore) ListAllPendingSidecarDigests(ctx context.Context) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.casRefErr != nil {
+		return nil, f.casRefErr
+	}
+	out := []string{}
+	for _, row := range f.pendingSidecars {
+		out = append(out, row.digest)
+	}
+	return out, nil
+}
 
 func (f *dbFakeStore) Migrate(ctx context.Context) error { return nil }
 
@@ -984,6 +1092,26 @@ func (f *dbFakeStore) ListOccurrences(ctx context.Context, scheduleID string) ([
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]storage.Occurrence(nil), f.occurrences[scheduleID]...), nil
+}
+
+// AdvanceScheduleLastRun mirrors the SQL GREATEST update: the stored marker
+// only ever moves forward, so a stale replica can never move it backwards.
+func (f *dbFakeStore) AdvanceScheduleLastRun(ctx context.Context, id string, nominal time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.advanceScheduleErr != nil {
+		return f.advanceScheduleErr
+	}
+	sc, ok := f.schedules[id]
+	if !ok {
+		return storage.ErrNotFound
+	}
+	nominal = nominal.UTC()
+	if sc.LastRun == nil || sc.LastRun.Before(nominal) {
+		sc.LastRun = &nominal
+		f.schedules[id] = sc
+	}
+	return nil
 }
 
 func (f *dbFakeStore) InsertDeployment(ctx context.Context, d model.Deployment) error {
@@ -1415,7 +1543,8 @@ func (f *dbFakeStore) InsertCompiledRun(ctx context.Context, req storage.InsertC
 // committed runs (caller holds f.mu), mirroring the SQL in-transaction
 // resolver.
 func (f *dbFakeStore) supersededJobIDsLocked(p *storage.SupersedePolicy, newRunID string) []string {
-	if strings.TrimSpace(p.Repo) == "" || strings.TrimSpace(p.ConcurrencyGroup) == "" {
+	repoID := strings.TrimSpace(p.RepoID)
+	if repoID == "" || strings.TrimSpace(p.ConcurrencyGroup) == "" {
 		return nil
 	}
 	out := []string{}
@@ -1423,7 +1552,7 @@ func (f *dbFakeStore) supersededJobIDsLocked(p *storage.SupersedePolicy, newRunI
 		if id == newRunID || r.Status.Terminal() {
 			continue
 		}
-		if r.Repo != p.Repo || r.ConcurrencyGroup != p.ConcurrencyGroup {
+		if storage.RepoIDForRun(r) != repoID || r.ConcurrencyGroup != p.ConcurrencyGroup {
 			continue
 		}
 		for jid, j := range f.jobs {

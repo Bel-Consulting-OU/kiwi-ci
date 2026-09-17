@@ -8,6 +8,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
@@ -230,6 +231,9 @@ func (c *Config) RepoPolicyFor(repoID string) (RepoPolicy, bool) {
 
 // repoPolicy resolves the policy entry for a repository identity:
 //
+//   - stored keys and the lookup key are canonicalized first
+//     (auth.NormalizeRepoKey): equivalent forge-host spellings —
+//     GITHUB.COM, github.com., github.com:443 — address the same entry;
 //   - an exact canonical ("<host>/<owner>/<name>") key wins;
 //   - an exact bare ("owner/name") key wins when the lookup key itself is
 //     bare;
@@ -245,24 +249,51 @@ func (c *Config) repoPolicy(repoID string) (RepoPolicy, bool) {
 	if c == nil {
 		return RepoPolicy{}, false
 	}
-	repoID = strings.TrimSpace(repoID)
-	if rp, ok := c.Repositories[repoID]; ok {
+	repoID = auth.NormalizeRepoKey(strings.TrimSpace(repoID))
+	if rp, ok := lookupRepoPolicy(c.Repositories, repoID); ok {
 		return rp, true
 	}
 	_, bare, hasHost := splitCanonicalRepoKey(repoID)
 	if hasHost {
-		rp, ok := c.Repositories[bare]
-		return rp, ok
+		return lookupRepoPolicy(c.Repositories, bare)
 	}
 	var match RepoPolicy
 	found, ambiguous := false, false
+	seen := map[string]bool{}
 	for key, rp := range c.Repositories {
-		if _, kb, kHost := splitCanonicalRepoKey(key); kHost && kb == repoID {
+		nk := auth.NormalizeRepoKey(key)
+		if seen[nk] {
+			continue
+		}
+		seen[nk] = true
+		if _, kb, kHost := splitCanonicalRepoKey(nk); kHost && kb == repoID {
 			if !found {
 				match, found = rp, true
 			} else if !reflect.DeepEqual(rp, match) {
 				ambiguous = true
 			}
+		}
+	}
+	if found && !ambiguous {
+		return match, true
+	}
+	return RepoPolicy{}, false
+}
+
+// lookupRepoPolicy resolves the entry whose key canonicalizes to target.
+// Equivalent keys carrying DIFFERENT policies resolve to no entry (fail
+// closed) instead of depending on map iteration order.
+func lookupRepoPolicy(m map[string]RepoPolicy, target string) (RepoPolicy, bool) {
+	var match RepoPolicy
+	found, ambiguous := false, false
+	for key, rp := range m {
+		if auth.NormalizeRepoKey(key) != target {
+			continue
+		}
+		if !found {
+			match, found = rp, true
+		} else if !reflect.DeepEqual(rp, match) {
+			ambiguous = true
 		}
 	}
 	if found && !ambiguous {
@@ -404,12 +435,29 @@ func (c *Config) CapabilitiesFor(repoID string) Capabilities {
 
 // AllowedCloneHostsFor returns the effective clone-host allowlist for a
 // canonical repository identity: the organization allowlist intersected
-// with the repository allowlist. nil means unrestricted, an empty non-nil
-// list denies every host (a disjoint org/repo intersection is deny-all,
-// never "no restriction"), and a non-empty list restricts to its entries.
+// with the repository allowlist, with every entry canonicalized
+// (auth.CanonicalHost) so "GITHUB.COM", "github.com." and "github.com:443"
+// all match the canonical host "github.com". nil means unrestricted, an
+// empty non-nil list denies every host (a disjoint org/repo intersection is
+// deny-all, never "no restriction"), and a non-empty list restricts to its
+// entries.
 func (c *Config) AllowedCloneHostsFor(repoID string) []string {
 	rp, _ := c.repoPolicy(repoID)
-	return intersectStrings(c.AllowedCloneHosts, rp.AllowedCloneHosts)
+	return canonicalHostList(intersectStrings(c.AllowedCloneHosts, rp.AllowedCloneHosts))
+}
+
+// canonicalHostList canonicalizes every entry of a host allowlist, keeping
+// nil as nil. An entry that canonicalizes to "" can never match a host, so
+// it stays as a deny entry (fail closed).
+func canonicalHostList(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	out := make([]string, len(in))
+	for i, h := range in {
+		out[i] = auth.CanonicalHost(h)
+	}
+	return out
 }
 
 // AllowedRegionsFor returns the effective placement-region allowlist for a
@@ -421,16 +469,27 @@ func (c *Config) AllowedRegionsFor(repoID string) []string {
 }
 
 // CloneHostAllowed reports whether host is admitted by the effective
-// clone-host allowlist for a canonical repository identity. A nil allowlist
-// is unrestricted; a non-nil allowlist admits only its entries, so an empty
-// allowlist denies every host — including an empty/unparseable host, which
-// fails closed.
+// clone-host allowlist for a canonical repository identity. Comparison is
+// canonical on BOTH sides: the queried host and every allowlist entry pass
+// through auth.CanonicalHost, so equivalent forge-host spellings match. A
+// nil allowlist is unrestricted; a non-nil allowlist admits only its
+// entries, so an empty allowlist denies every host — including an
+// empty/unparseable host, which fails closed.
 func (c *Config) CloneHostAllowed(repoID, host string) bool {
 	allowed := c.AllowedCloneHostsFor(repoID)
 	if allowed == nil {
 		return true
 	}
-	return host != "" && containsString(allowed, host)
+	h := auth.CanonicalHost(host)
+	if h == "" {
+		return false
+	}
+	for _, entry := range allowed {
+		if entry == h {
+			return true
+		}
+	}
+	return false
 }
 
 // RegionAllowed reports whether region is admitted by the effective

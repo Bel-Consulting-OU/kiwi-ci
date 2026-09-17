@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net"
@@ -14,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,7 +29,26 @@ const (
 	s3PutTimeout    = 30 * time.Minute
 	s3GetTimeout    = 2 * time.Minute
 	s3DeleteTimeout = 2 * time.Minute
+	s3ListTimeout   = 2 * time.Minute
 )
+
+// s3ListPageSize is the bounded ListObjectsV2 page size: the store never
+// asks the endpoint for more than this many keys per request, so a listing
+// of a huge bucket streams in bounded pages instead of one unbounded
+// response.
+const s3ListPageSize = 1000
+
+// s3ListObjectsResult is the subset of the ListObjectsV2 XML response the
+// enumerator needs.
+type s3ListObjectsResult struct {
+	IsTruncated           bool   `xml:"IsTruncated"`
+	NextContinuationToken string `xml:"NextContinuationToken"`
+	Contents              []struct {
+		Key          string    `xml:"Key"`
+		Size         int64     `xml:"Size"`
+		LastModified time.Time `xml:"LastModified"`
+	} `xml:"Contents"`
+}
 
 // withDeadline returns ctx unchanged when it already has a deadline,
 // otherwise a copy bounded by d. The returned cancel is a no-op in the
@@ -146,7 +167,7 @@ func canonicalRequest(req *http.Request, payloadHash string) (string, string) {
 	var qs []string
 	for k, vs := range query {
 		for _, v := range vs {
-			qs = append(qs, url.QueryEscape(k)+"="+url.QueryEscape(v))
+			qs = append(qs, awsURIEncode(k, true)+"="+awsURIEncode(v, true))
 		}
 	}
 	sort.Strings(qs)
@@ -173,6 +194,46 @@ func canonicalRequest(req *http.Request, payloadHash string) (string, string) {
 
 func compactSpaces(s string) string {
 	return strings.Join(strings.Fields(s), " ")
+}
+
+// awsURIEncode implements the SigV4 URI encoding: unreserved characters are
+// kept, everything else is percent-encoded, and "/" is only kept when
+// encodeSlash is false. Unlike url.QueryEscape it encodes a space as %20,
+// which is required for the canonical query string.
+func awsURIEncode(s string, encodeSlash bool) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+			c == '-' || c == '_' || c == '.' || c == '~':
+			b.WriteByte(c)
+		case c == '/' && !encodeSlash:
+			b.WriteByte(c)
+		default:
+			fmt.Fprintf(&b, "%%%02X", c)
+		}
+	}
+	return b.String()
+}
+
+// s3DigestFromKey extracts the content digest an S3 object key addresses.
+// The S3 store writes bare digest keys; the two-level sha256/<xx>/<digest>
+// layout the FS store uses is accepted too so a bucket migrated between
+// backends enumerates the same way.
+func s3DigestFromKey(key string) (string, bool) {
+	if keyRE.MatchString(key) {
+		return key, true
+	}
+	rest, ok := strings.CutPrefix(key, "sha256/")
+	if !ok {
+		return "", false
+	}
+	shard, digest, ok := strings.Cut(rest, "/")
+	if !ok || len(shard) != 2 || !keyRE.MatchString(digest) || shard != digest[:2] {
+		return "", false
+	}
+	return digest, true
 }
 
 func stringToSign(now time.Time, scope, canonical string) string {
@@ -314,4 +375,69 @@ func (s *S3) Delete(ctx context.Context, key string) error {
 		return fmt.Errorf("blob: s3 delete %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 	return nil
+}
+
+// listURL builds the bucket-level ListObjectsV2 URL for one page.
+func (s *S3) listURL(continuationToken string) string {
+	base := strings.TrimSuffix(s.objectURL(""), "/")
+	q := url.Values{}
+	q.Set("list-type", "2")
+	q.Set("max-keys", strconv.Itoa(s3ListPageSize))
+	if continuationToken != "" {
+		q.Set("continuation-token", continuationToken)
+	}
+	return base + "?" + q.Encode()
+}
+
+// List implements Enumerator with ListObjectsV2: it follows the
+// continuation-token pagination until the endpoint reports the listing is
+// complete, reporting each content-addressed object (bare digest keys and
+// the two-level sha256/<xx>/<digest> layout) with its size and LastModified
+// time. Non-digest keys, directory placeholders and bucket bookkeeping
+// objects are skipped, so the CAS GC can never mistake them for payloads.
+// The callback's error stops the walk and is returned unchanged; a truncated
+// page without a continuation token is an error rather than a silent stop.
+func (s *S3) List(ctx context.Context, fn func(Object) error) error {
+	ctx, cancel := withDeadline(ctx, s3ListTimeout)
+	defer cancel()
+	token := ""
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.listURL(token), nil)
+		if err != nil {
+			return err
+		}
+		s.sign(req, emptyPayloadHash, time.Now().UTC())
+		resp, err := s.client().Do(req)
+		if err != nil {
+			return err
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+		resp.Body.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("blob: s3 list %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		}
+		var page s3ListObjectsResult
+		if err := xml.Unmarshal(body, &page); err != nil {
+			return fmt.Errorf("blob: s3 list decode: %w", err)
+		}
+		for _, entry := range page.Contents {
+			digest, ok := s3DigestFromKey(entry.Key)
+			if !ok {
+				continue
+			}
+			if err := fn(Object{Key: digest, SHA256: digest, Size: entry.Size, ModTime: entry.LastModified}); err != nil {
+				return err
+			}
+		}
+		if !page.IsTruncated {
+			return nil
+		}
+		if page.NextContinuationToken == "" {
+			return fmt.Errorf("blob: s3 list truncated without a continuation token")
+		}
+		token = page.NextContinuationToken
+	}
 }

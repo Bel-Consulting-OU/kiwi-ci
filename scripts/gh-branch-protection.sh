@@ -14,9 +14,13 @@
 #
 # REQUIRED STATUS CONTEXTS — MUST MATCH THE WOODPECKER INSTANCE
 # ------------------------------------------------------------
-# CI runs on Woodpecker (.woodpecker.yml), not GitHub Actions. Woodpecker
-# reports one commit status PER WORKFLOW LEG, with the context rendered from
-# the server settings:
+# CI runs on Woodpecker (.woodpecker.yml) for every Linux lane. A single,
+# narrowly-scoped GitHub Actions workflow (.github/workflows/native.yml)
+# runs the native macOS/Windows checks because Woodpecker cannot execute
+# non-Linux jobs; Linux lanes are never duplicated there.
+#
+# Woodpecker reports one commit status PER WORKFLOW LEG, with the context
+# rendered from the server settings:
 #
 #   WOODPECKER_STATUS_CONTEXT         default: ci/woodpecker
 #   WOODPECKER_STATUS_CONTEXT_FORMAT  default:
@@ -30,25 +34,35 @@
 #   ci/woodpecker/pr/woodpecker/1     linux/amd64 leg on pull request
 #   ci/woodpecker/pr/woodpecker/2     linux/arm64 leg on pull request
 #
+# GitHub Actions reports a matrix job as `<job name> (<matrix value>)`, so
+# .github/workflows/native.yml (job name `native`, matrix key `os`) produces
+# these required contexts IN ADDITION to the Woodpecker ones:
+#
+#   native (macos-latest)
+#   native (windows-latest)
+#
 # If the Woodpecker instance customizes the status context or its format
 # (very common: a plain `woodpecker` context), these names will NOT match and
 # GitHub would wait forever for checks that never appear. Before applying,
 # confirm the actual context strings on a recent commit in the repository's
-# checks tab, then override:
+# checks tab, then override with NEWLINE-separated lists (contexts may contain
+# spaces, as `native (macos-latest)` does):
 #
-#   KIWI_WOODPECKER_CONTEXTS="<ctx> <ctx> ..."   # exact list
-#   KIWI_WOODPECKER_CONTEXT=<ctx>                # single-context shorthand
+#   KIWI_WOODPECKER_CONTEXTS="<ctx>\n<ctx>..."   # exact Woodpecker list
+#   KIWI_WOODPECKER_CONTEXT=<ctx>                # single Woodpecker context
+#   KIWI_NATIVE_CONTEXTS="<ctx>\n<ctx>..."       # exact native list ("" = none)
 #
 # Woodpecker does NOT report one context per step, so step names (`unit`,
 # `race`, ...) are never branch-protection contexts for a single-file
 # pipeline. Removing the arm64 matrix entry from .woodpecker.yml also removes
-# the `/2` contexts; drop them here at the same time.
+# the `/2` contexts; drop them here at the same time. Removing the native
+# workflow removes `native (...)`; clear KIWI_NATIVE_CONTEXTS then.
 #
 # Policy applied:
 #   - changes to main must arrive through a pull request
 #     (required_pull_request_reviews with zero approvals; CI does the
 #     gating, humans may self-merge when checks are green)
-#   - required status checks: the Woodpecker contexts above (strict)
+#   - required status checks: the Woodpecker + native contexts above (strict)
 #   - branches must be up-to-date with main before merging
 #   - enforce_admins: false (admins are not exempt from the rules)
 #   - conversation resolution: disabled
@@ -73,24 +87,49 @@ REPO="${KIWI_REPO:-$(gh repo view --json nameWithOwner -q .nameWithOwner)}"
 }
 
 if [ -n "${KIWI_WOODPECKER_CONTEXTS:-}" ]; then
-	CONTEXTS_LIST="$KIWI_WOODPECKER_CONTEXTS"
+	WOODPECKER_LIST="$KIWI_WOODPECKER_CONTEXTS"
 elif [ -n "${KIWI_WOODPECKER_CONTEXT:-}" ]; then
-	CONTEXTS_LIST="$KIWI_WOODPECKER_CONTEXT"
+	WOODPECKER_LIST="$KIWI_WOODPECKER_CONTEXT"
 else
-	CONTEXTS_LIST="ci/woodpecker/push/woodpecker/1 ci/woodpecker/push/woodpecker/2 ci/woodpecker/pr/woodpecker/1 ci/woodpecker/pr/woodpecker/2"
+	WOODPECKER_LIST="ci/woodpecker/push/woodpecker/1
+ci/woodpecker/push/woodpecker/2
+ci/woodpecker/pr/woodpecker/1
+ci/woodpecker/pr/woodpecker/2"
 fi
+
+if [ "${KIWI_NATIVE_CONTEXTS+set}" = "set" ]; then
+	NATIVE_LIST="$KIWI_NATIVE_CONTEXTS"
+else
+	NATIVE_LIST="native (macos-latest)
+native (windows-latest)"
+fi
+
+# Contexts are newline-separated on purpose: a native context contains a
+# space (`native (macos-latest)`), so word splitting would corrupt it.
+CONTEXTS_LIST="$WOODPECKER_LIST
+$NATIVE_LIST"
 
 # Build the JSON contexts array.
 CONTEXTS=""
+OLDIFS="$IFS"
+IFS='
+'
 for ctx in $CONTEXTS_LIST; do
+	[ -n "$ctx" ] || continue
 	if [ -z "$CONTEXTS" ]; then
 		CONTEXTS="\"$ctx\""
 	else
 		CONTEXTS="$CONTEXTS, \"$ctx\""
 	fi
 done
+IFS="$OLDIFS"
 
-echo "branch-protection: requiring Woodpecker contexts: $CONTEXTS_LIST"
+echo "branch-protection: requiring contexts:"
+printf '%s\n' "$WOODPECKER_LIST" "$NATIVE_LIST" | while IFS= read -r required; do
+	if [ -n "$required" ]; then
+		printf '  %s\n' "$required"
+	fi
+done
 echo "branch-protection: verify these against the instance's WOODPECKER_STATUS_CONTEXT(_FORMAT) and the checks tab"
 
 gh api -X PUT "repos/$REPO/branches/$BRANCH/protection" \
