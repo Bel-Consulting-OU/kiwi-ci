@@ -551,7 +551,9 @@ func TestScheduleFailingEnqueueRefiresNextTickDB(t *testing.T) {
 	if err := s.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
-	now := time.Now().UTC()
+	// Anchored inside a minute: the +5s retry tick must not cross a minute
+	// boundary and legitimately make the next nominal due.
+	now := time.Now().UTC().Truncate(time.Minute).Add(30 * time.Second)
 	sc := storage.Schedule{
 		ID:         "sched1",
 		Repository: "https://example.com/o/r.git",
@@ -604,7 +606,10 @@ func TestScheduleFailingEnqueueRefiresNextTickMemory(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &sc); err != nil {
 		t.Fatal(err)
 	}
-	now := time.Now().UTC()
+	// Anchor 30s into a minute so the +5s retry tick cannot cross a
+	// minute boundary and legitimately make the NEXT nominal due (a
+	// real-time flake seen on CI at HH:MM:58).
+	now := time.Now().UTC().Truncate(time.Minute).Add(30 * time.Second)
 	s.mu.Lock()
 	sc.LastRun = timePtr(now.Add(-1 * time.Minute))
 	s.schedules[sc.ID] = sc
