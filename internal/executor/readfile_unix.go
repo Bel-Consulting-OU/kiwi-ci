@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/safefs"
@@ -42,24 +41,12 @@ func readFileWithinRoot(root, path string, maxBytes int64) ([]byte, error) {
 		return nil, err
 	}
 	defer ws.Close()
-	rel, err := filepath.Rel(ws.Canonical, path)
-	if err != nil || escapesRoot(rel) {
-		// The caller may spell the path through platform-level symlinks
-		// (tmpdirs on macOS are /var/... while the canonical root is
-		// /private/var/...). Canonicalize the parent only to reconcile the
-		// spelling; the read itself is still anchored to the root handle.
-		parent, base := filepath.Split(path)
-		realParent, perr := filepath.EvalSymlinks(filepath.Clean(parent))
-		if perr != nil {
-			if os.IsNotExist(perr) {
-				return nil, os.ErrNotExist
-			}
-			return nil, perr
+	rel, ok := relWithinRoot(ws, root, path)
+	if !ok {
+		if _, serr := os.Stat(path); os.IsNotExist(serr) {
+			return nil, os.ErrNotExist
 		}
-		rel, err = filepath.Rel(ws.Canonical, filepath.Join(realParent, base))
-		if err != nil || escapesRoot(rel) {
-			return nil, fmt.Errorf("read path %q is outside the workspace", path)
-		}
+		return nil, fmt.Errorf("read path %q is outside the workspace", path)
 	}
 	f, err := ws.OpenRel(filepath.ToSlash(rel))
 	if err != nil {
@@ -67,8 +54,4 @@ func readFileWithinRoot(root, path string, maxBytes int64) ([]byte, error) {
 	}
 	defer f.Close()
 	return readCapped(f, maxBytes)
-}
-
-func escapesRoot(rel string) bool {
-	return rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }

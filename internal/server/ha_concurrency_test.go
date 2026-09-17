@@ -523,8 +523,16 @@ func TestHACompletionEffectsConvergeAcrossReplicas(t *testing.T) {
 	_, hasLink := c.f.downstreamLinks[task.Job.ID+"\x00acme/child\x00refs/heads/main"]
 	remaining := len(c.f.outboxItems)
 	c.f.mu.Unlock()
-	if !j.UsageRecorded || j.Cost <= 0 {
-		t.Fatalf("replica-1 flush did not account usage: %+v", j)
+	// EITHER replica may win the usage accounting (both are allowed to
+	// flush the same durable outbox); exactly-once accounting is the
+	// invariant, not which replica performs it. Cost itself depends on the
+	// completion's wall-clock duration (which can be ~0 in a fast test), so
+	// assert the durable markers and the frozen rates instead.
+	if !j.UsageRecorded {
+		t.Fatalf("usage not accounted after replica-1 flush: %+v", j)
+	}
+	if j.CostRate <= 0 || j.PowerWatts <= 0 {
+		t.Fatalf("lease-time usage rates not frozen on the job: cost_rate=%v power_watts=%v", j.CostRate, j.PowerWatts)
 	}
 	if !hasLink {
 		t.Fatal("replica-1 flush did not record the downstream link")

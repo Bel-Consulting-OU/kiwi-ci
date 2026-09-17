@@ -847,9 +847,11 @@ jobs:
 	}
 	// The SBOM bytes live in CAS under their digest.
 	sbomDigest := sha256Hex([]byte(sbom))
-	if _, _, err := s.CAS.Open(context.Background(), sbomDigest); err != nil {
+	rc, _, err := s.CAS.Open(context.Background(), sbomDigest)
+	if err != nil {
 		t.Fatalf("sbom bytes not in cas: %v", err)
 	}
+	rc.Close()
 	// The artifact upload passes the attestation gate from CAS and records
 	// cas: digest references; no node-local sidecar files are used.
 	w = doJSONHeaders(t, s, http.MethodPut, "/api/v1/jobs/"+task.Job.ID+"/artifacts/bin", "token", "payload", hdrs)

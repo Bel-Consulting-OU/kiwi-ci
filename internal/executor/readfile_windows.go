@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/safefs"
 )
@@ -48,8 +47,11 @@ func readFileWithinRoot(root, path string, maxBytes int64) ([]byte, error) {
 		return nil, err
 	}
 	defer ws.Close()
-	rel, err := filepath.Rel(ws.Canonical, path)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	rel, ok := relWithinRoot(ws, root, path)
+	if !ok {
+		if _, serr := os.Stat(path); os.IsNotExist(serr) {
+			return nil, os.ErrNotExist
+		}
 		return nil, fmt.Errorf("read path %q is outside the workspace", path)
 	}
 	f, err := ws.OpenRel(filepath.ToSlash(rel))
