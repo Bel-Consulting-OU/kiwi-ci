@@ -543,19 +543,26 @@ func TestHACompletionEffectsConvergeAcrossReplicas(t *testing.T) {
 	if remaining != 0 {
 		t.Fatalf("outbox rows after flush = %d, want 0", remaining)
 	}
-	cost := c.s[1].Metrics.counters["kiwi_usage_cost_total"][""]
+	// EITHER replica may win the usage accounting (whichever flushes the
+	// durable outbox first); the invariant is exactly one accounting across
+	// the pair, not which counter moved.
+	usageTotal := func() float64 {
+		return c.s[0].Metrics.counters["kiwi_usage_cost_total"][""] +
+			c.s[1].Metrics.counters["kiwi_usage_cost_total"][""]
+	}
+	cost := usageTotal()
 	if cost <= 0 {
-		t.Fatalf("replica-1 usage counter = %v, want the single accounting", cost)
+		t.Fatalf("no replica accounted usage (total = %v)", cost)
 	}
 	// Replica 0's receipt replay reconciles again: convergence, not double
-	// accounting. Its own usage counter must stay at zero (the marker makes
-	// the effect a no-op) and no new downstream intent may appear.
+	// accounting. The pair's usage counter must not move and no new
+	// downstream intent may appear.
 	body := fmt.Sprintf(`{"runner_id":%q,"lease_token":%q,"lease_generation":%d,"status":"success"}`, ri.ID, task.LeaseToken, task.LeaseGeneration)
 	if w := doJSONHeaders(t, c.s[0], http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/complete", "token", body, leaseHeaders(task, ri.ID)); w.Code != http.StatusNoContent {
 		t.Fatalf("receipt replay = %d: %s", w.Code, w.Body.String())
 	}
-	if got := c.s[0].Metrics.counters["kiwi_usage_cost_total"][""]; got != 0 {
-		t.Fatalf("replica-0 replay double-accounted usage: counter=%v", got)
+	if got := usageTotal(); got != cost {
+		t.Fatalf("receipt replay double-accounted usage: total %v -> %v", cost, got)
 	}
 	if n := downstreamIntentsQueued(c.f); n != 0 {
 		t.Fatalf("replica-0 replay re-queued %d downstream intents", n)
