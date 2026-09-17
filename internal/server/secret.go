@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
@@ -253,12 +255,17 @@ func (s *Server) issueSecret(w http.ResponseWriter, r *http.Request) {
 // deliverSecret resolves the broker, seals the value for the runner's
 // ephemeral key, and writes the response for an already-claimed delivery.
 // Any post-claim failure releases the claim (SQL row or memory receipt) so
-// a failed resolution never consumes the once-only delivery.
+// a failed resolution never consumes the once-only delivery. The release
+// is a compensation that must outlive the request: it runs on its own
+// short-lived context, because a client disconnect cancels r.Context() and
+// must never strand a consumed claim.
 func (s *Server) deliverSecret(w http.ResponseWriter, r *http.Request, j model.Job, in SecretRequest, jobID string, dbClaimed bool) {
 	release := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
 		if dbClaimed {
 			if rel, ok := s.DB.(storage.SecretClaimReleaser); ok {
-				if err := rel.ReleaseSecretDelivery(r.Context(), jobID, in.LeaseGeneration, in.Name); err != nil {
+				if err := rel.ReleaseSecretDelivery(ctx, jobID, in.LeaseGeneration, in.Name); err != nil {
 					s.logError("secret delivery: claim release failed", "error", err.Error())
 				}
 			}

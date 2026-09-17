@@ -2,7 +2,9 @@ package scheduler
 
 import (
 	"context"
+	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,6 +46,16 @@ type fakeStore struct {
 	// queue-timeout/lease paths that maintain reserved counters can be
 	// exercised in scheduler tests (clamped at zero, like every store).
 	quotaReservations map[string][2]int
+
+	// compiledCalls records every atomic enqueue request the scheduler
+	// issues, so tests can assert the run/jobs/deps/supersede payload.
+	compiledCalls []storage.InsertCompiledRunRequest
+	// compiledFailAfterOps, when > 0, makes the next InsertCompiledRun fail
+	// (one-shot) after staging that many operations (superseded
+	// cancellations first, then enqueued jobs): a mid-enqueue storage fault
+	// that must leave zero rows.
+	compiledFailAfterOps int
+	compiledFailErr      error
 }
 
 type acquireCall struct {
@@ -96,6 +108,204 @@ func newFakeStore() *fakeStore {
 var _ storage.Store = (*fakeStore)(nil)
 var _ storage.ProfileStore = (*fakeStore)(nil)
 var _ storage.QuotaCounterStore = (*fakeStore)(nil)
+var _ storage.RunEnqueueStore = (*fakeStore)(nil)
+
+// InsertCompiledRun applies the atomic enqueue in memory: the run, its jobs
+// (with the request's authoritative dependency edges), the supersede
+// cancellations and their dependent/run recomputation commit together under
+// f.mu, mirroring the SQL transaction. compiledFailAfterOps injects a
+// one-shot failure after that many staged writes, so tests can prove a
+// mid-enqueue fault leaves zero rows (run included).
+func (f *fakeStore) InsertCompiledRun(ctx context.Context, req storage.InsertCompiledRunRequest) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.compiledCalls = append(f.compiledCalls, req)
+	if _, dup := f.runs[req.Run.ID]; dup {
+		return fmt.Errorf("storage: run %s already exists", req.Run.ID)
+	}
+	now := time.Now().UTC()
+	staged := 0
+	bumpStaged := func() error {
+		if f.compiledFailAfterOps <= 0 {
+			return nil
+		}
+		staged++
+		if staged < f.compiledFailAfterOps {
+			return nil
+		}
+		err := f.compiledFailErr
+		f.compiledFailAfterOps = 0
+		f.compiledFailErr = nil
+		if err == nil {
+			err = fmt.Errorf("storage: injected enqueue failure")
+		}
+		return err
+	}
+	type cancelStage struct {
+		id         string
+		job        model.Job
+		wasRunning bool
+		runnerID   string
+	}
+	cancelIDs := append([]string(nil), req.CancelPrevious...)
+	if req.Supersede != nil {
+		cancelIDs = append(cancelIDs, f.supersededJobIDsLocked(req.Supersede, req.Run.ID)...)
+	}
+	cancelStages := make([]cancelStage, 0, len(cancelIDs))
+	seen := map[string]bool{}
+	for _, id := range cancelIDs {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		j, ok := f.jobs[id]
+		if !ok || j.Status.Terminal() {
+			continue
+		}
+		wasRunning := j.Status == model.StatusRunning
+		runnerID := j.LeaseRunnerID
+		j.Status = model.StatusCancelled
+		j.Error = "superseded by run " + req.Run.ID
+		j.FinishedAt = &now
+		j.LeaseRunnerID = ""
+		j.LeaseTokenHash = nil
+		j.LeaseExpiresAt = nil
+		cancelStages = append(cancelStages, cancelStage{id: id, job: j, wasRunning: wasRunning, runnerID: runnerID})
+		if err := bumpStaged(); err != nil {
+			return err
+		}
+	}
+	type jobStage struct {
+		id  string
+		job model.Job
+	}
+	jobStages := make([]jobStage, 0, len(req.Jobs))
+	for id, j := range req.Jobs {
+		if deps, ok := req.Deps[id]; ok {
+			j.Needs = append([]string(nil), deps...)
+		}
+		jobStages = append(jobStages, jobStage{id: id, job: j})
+		if err := bumpStaged(); err != nil {
+			return err
+		}
+	}
+	// Commit: the superseded cancellations land first, then their dependents
+	// are re-evaluated and their runs cancelled, and only then is the new
+	// run published — one indivisible step under f.mu.
+	cancelled := map[string]bool{}
+	cancelledRuns := map[string]bool{}
+	for _, st := range cancelStages {
+		f.jobs[st.id] = st.job
+		cancelled[st.id] = true
+		if st.job.RunID != "" {
+			cancelledRuns[st.job.RunID] = true
+		}
+		f.audit = append(f.audit, model.AuditEvent{ID: st.id + "|audit", Action: "job.superseded", Actor: "scheduler", RunID: st.job.RunID, JobID: st.id, Message: "cancelled", CreatedAt: now})
+		if st.wasRunning && st.runnerID != "" {
+			f.releaseRunnerSlotLocked(st.runnerID, st.id)
+		}
+	}
+	f.recomputeDependentsLocked(cancelled, now)
+	for rid := range cancelledRuns {
+		if r, ok := f.runs[rid]; ok && !r.Status.Terminal() {
+			r.Status = model.StatusCancelled
+			r.FinishedAt = &now
+			f.runs[rid] = r
+		}
+	}
+	f.insertRunCalls = append(f.insertRunCalls, req.Run)
+	f.runs[req.Run.ID] = req.Run
+	for _, st := range jobStages {
+		f.jobs[st.id] = st.job
+	}
+	return nil
+}
+
+// supersededJobIDsLocked resolves a supersede policy against the currently
+// committed runs (caller holds f.mu).
+func (f *fakeStore) supersededJobIDsLocked(p *storage.SupersedePolicy, newRunID string) []string {
+	if strings.TrimSpace(p.Repo) == "" || strings.TrimSpace(p.ConcurrencyGroup) == "" {
+		return nil
+	}
+	out := []string{}
+	for id, r := range f.runs {
+		if id == newRunID || r.Status.Terminal() {
+			continue
+		}
+		if r.Repo != p.Repo || r.ConcurrencyGroup != p.ConcurrencyGroup {
+			continue
+		}
+		for jid, j := range f.jobs {
+			if j.RunID != id || j.Status.Terminal() {
+				continue
+			}
+			out = append(out, jid)
+		}
+	}
+	return out
+}
+
+// recomputeDependentsLocked re-evaluates queued/waiting jobs that need a
+// cancelled job, blocking them when their condition does not allow the
+// outcome (caller holds f.mu).
+func (f *fakeStore) recomputeDependentsLocked(cancelled map[string]bool, now time.Time) {
+	if len(cancelled) == 0 {
+		return
+	}
+	for id, j := range f.jobs {
+		if j.Status != model.StatusQueued && j.Status != model.StatusWaitingApproval {
+			continue
+		}
+		needsCancelled := false
+		for _, dep := range j.Needs {
+			if cancelled[dep] {
+				needsCancelled = true
+				break
+			}
+		}
+		if !needsCancelled {
+			continue
+		}
+		ready, outcome := DependencyOutcome(j.Needs, nil, func(dep string) (model.Status, bool) {
+			d, ok := f.jobs[dep]
+			return d.Status, ok
+		})
+		if !ready {
+			continue
+		}
+		j.DependencyStatus = outcome
+		if outcome != model.StatusSuccess && !ConditionAllows(j.Condition, outcome) {
+			j.Status = model.StatusBlocked
+			j.Error = "dependency failed"
+			j.FinishedAt = &now
+		}
+		f.jobs[id] = j
+	}
+}
+
+// releaseRunnerSlotLocked splices one job ID out of a runner's active set and
+// recomputes busy/current_job (caller holds f.mu).
+func (f *fakeStore) releaseRunnerSlotLocked(runnerID, jobID string) {
+	r, ok := f.runners[runnerID]
+	if !ok {
+		return
+	}
+	active := r.ActiveJobs[:0]
+	for _, id := range r.ActiveJobs {
+		if id != jobID {
+			active = append(active, id)
+		}
+	}
+	r.ActiveJobs = active
+	if len(r.ActiveJobs) > 0 && r.CurrentJob == jobID {
+		r.CurrentJob = r.ActiveJobs[0]
+	}
+	if len(r.ActiveJobs) == 0 {
+		r.CurrentJob = ""
+	}
+	r.Busy = r.Capacity > 0 && len(r.ActiveJobs) >= r.Capacity
+	f.runners[runnerID] = r
+}
 
 // AdjustQuotaCounter shifts the reserved counters for the key pair,
 // clamping at zero exactly like the SQL/memStore counter updates.

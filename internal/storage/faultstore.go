@@ -613,6 +613,46 @@ func (f *FaultyStore) SetArtifactSidecars(ctx context.Context, id, sbomPath, sbo
 	return f.Inner.(ArtifactSidecarStore).SetArtifactSidecars(ctx, id, sbomPath, sbomSHA256, sigstorePath, sigstoreSHA256)
 }
 
+func (f *FaultyStore) RememberPendingSidecar(ctx context.Context, jobID, artifactName, kind, digest string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(ArtifactSidecarStore).RememberPendingSidecar(ctx, jobID, artifactName, kind, digest)
+}
+
+func (f *FaultyStore) PendingSidecar(ctx context.Context, jobID, artifactName, kind string) (string, bool, error) {
+	return f.Inner.(ArtifactSidecarStore).PendingSidecar(ctx, jobID, artifactName, kind)
+}
+
+func (f *FaultyStore) ConsumePendingSidecar(ctx context.Context, jobID, artifactName, kind, digest string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(ArtifactSidecarStore).ConsumePendingSidecar(ctx, jobID, artifactName, kind, digest)
+}
+
+func (f *FaultyStore) DeletePendingSidecars(ctx context.Context, jobID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return f.Inner.(ArtifactSidecarStore).DeletePendingSidecars(ctx, jobID)
+}
+
+func (f *FaultyStore) PrunePendingSidecars(ctx context.Context, olderThan time.Time) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return 0, err
+	}
+	return f.Inner.(ArtifactSidecarStore).PrunePendingSidecars(ctx, olderThan)
+}
+
 func (f *FaultyStore) ClaimSecretDelivery(ctx context.Context, jobID string, generation int64, secretName string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -754,6 +794,8 @@ type memStore struct {
 	quotas      map[string]quotaCounts
 	cacheMans   map[string]CacheManifestRecord
 	claims      map[string]time.Time
+	// pendingSidecars mirrors artifact_pending_sidecars (migration 0012).
+	pendingSidecars map[string]pendingSidecar
 
 	profiles     map[string]model.RunnerProfile
 	certProfiles map[string]string
@@ -763,12 +805,32 @@ type memStore struct {
 
 	testHistoryVersion int64
 	testHistoryStats   []byte
+
+	// enqueueFaultOps, when > 0, makes the next InsertCompiledRun fail after
+	// staging that many operations (superseded cancellations first, then
+	// enqueued jobs) with enqueueFaultErr: the in-memory analogue of a
+	// storage error on the Nth write INSIDE the enqueue transaction. It
+	// fires before anything is committed, so fault-injection tests can prove
+	// a mid-enqueue failure leaves zero rows (run included). One-shot.
+	enqueueFaultOps int
+	enqueueFaultErr error
 }
 
 // quotaCounts is the in-memory reserved counter pair for one quota key.
 type quotaCounts struct {
 	running int
 	queued  int
+}
+
+// pendingSidecar is one in-memory artifact_pending_sidecars row.
+type pendingSidecar struct {
+	digest    string
+	createdAt time.Time
+}
+
+// pendingSidecarKey is the in-memory artifact_pending_sidecars primary key.
+func pendingSidecarKey(jobID, artifactName, kind string) string {
+	return jobID + "\x00" + artifactName + "\x00" + kind
 }
 
 // outboxClaim is one in-memory outbox claim lease.
@@ -784,25 +846,26 @@ func fragmentKey(parentJobID string, generation int64, fragmentID string) string
 
 func newMemStore() *memStore {
 	return &memStore{
-		runs:         map[string]model.Run{},
-		jobs:         map[string]model.Job{},
-		runners:      map[string]model.Runner{},
-		receipts:     map[string]model.CompletionReceipt{},
-		deliveries:   map[string]string{},
-		outboxClaims: map[string]outboxClaim{},
-		fragments:    map[string]GeneratedFragmentReceipt{},
-		schedules:    map[string]Schedule{},
-		occurrences:  map[string]map[time.Time]string{},
-		contracts:    map[string]map[string]ArtifactContract{},
-		downstream:   map[string]DownstreamLink{},
-		quotas:       map[string]quotaCounts{},
-		cacheMans:    map[string]CacheManifestRecord{},
-		claims:       map[string]time.Time{},
-		profiles:     map[string]model.RunnerProfile{},
-		certProfiles: map[string]string{},
-		runnerTokens: map[string]string{},
-		revocations:  map[string]string{},
-		grants:       map[string]EnrollGrantRecord{},
+		runs:            map[string]model.Run{},
+		jobs:            map[string]model.Job{},
+		runners:         map[string]model.Runner{},
+		receipts:        map[string]model.CompletionReceipt{},
+		deliveries:      map[string]string{},
+		outboxClaims:    map[string]outboxClaim{},
+		fragments:       map[string]GeneratedFragmentReceipt{},
+		schedules:       map[string]Schedule{},
+		occurrences:     map[string]map[time.Time]string{},
+		contracts:       map[string]map[string]ArtifactContract{},
+		downstream:      map[string]DownstreamLink{},
+		quotas:          map[string]quotaCounts{},
+		cacheMans:       map[string]CacheManifestRecord{},
+		claims:          map[string]time.Time{},
+		pendingSidecars: map[string]pendingSidecar{},
+		profiles:        map[string]model.RunnerProfile{},
+		certProfiles:    map[string]string{},
+		runnerTokens:    map[string]string{},
+		revocations:     map[string]string{},
+		grants:          map[string]EnrollGrantRecord{},
 	}
 }
 
@@ -978,7 +1041,7 @@ func (m *memStore) AcquireLease(ctx context.Context, jobID, runnerID string, tok
 	j.LeaseGeneration = generation
 	j.LeaseExpiresAt = &expiresAt
 	m.jobs[jobID] = j
-	m.adjustQuotaLocked(j.RepoURL, 1, -1)
+	m.adjustQuotaLocked(RepoIDForJob(j), 1, -1)
 	return j, nil
 }
 
@@ -1042,7 +1105,7 @@ func (m *memStore) CompleteJob(ctx context.Context, jobID string, generation int
 	j.LeaseExpiresAt = nil
 	m.jobs[jobID] = j
 	m.receipts[key] = receipt
-	m.adjustQuotaLocked(j.RepoURL, -1, 0)
+	m.adjustQuotaLocked(RepoIDForJob(j), -1, 0)
 	// Release the completing runner's slot and bump its counters in the
 	// same critical section, mirroring the SQL completeRunnerTx: capacity 0
 	// survives (never clamped), busy recomputes from the remaining set.
@@ -1093,7 +1156,7 @@ func (m *memStore) CancelRunJobs(ctx context.Context, runID string, reason strin
 		j.LeaseExpiresAt = nil
 		m.jobs[id] = j
 		if wasRunning {
-			m.adjustQuotaLocked(j.RepoURL, -1, 0)
+			m.adjustQuotaLocked(RepoIDForJob(j), -1, 0)
 			// The cancelled running job releases its runner slot in the
 			// same critical section, so the runner is immediately
 			// schedulable again.
@@ -1101,7 +1164,7 @@ func (m *memStore) CancelRunJobs(ctx context.Context, runID string, reason strin
 				m.releaseRunnerSlotLocked(runnerID, id)
 			}
 		} else {
-			m.adjustQuotaLocked(j.RepoURL, 0, -1)
+			m.adjustQuotaLocked(RepoIDForJob(j), 0, -1)
 		}
 		ids = append(ids, id)
 	}
@@ -1185,7 +1248,7 @@ func (m *memStore) releaseJobQuotaLocked(jobID string) {
 	if j.Status == model.StatusQueued {
 		queuedDelta = 1
 	}
-	m.adjustQuotaLocked(j.RepoURL, -1, queuedDelta)
+	m.adjustQuotaLocked(RepoIDForJob(j), -1, queuedDelta)
 }
 
 func (m *memStore) InsertArtifact(ctx context.Context, a model.ArtifactRecord) error {
@@ -1715,15 +1778,16 @@ func (m *memStore) GetArtifact(ctx context.Context, id string) (model.ArtifactRe
 // atomicity/storage round extension methods (in-memory)
 // ---------------------------------------------------------------------------
 
-// memQuotaKeys mirrors the SQL quota key derivation for one repository URL.
-func memQuotaKeys(repoURL string) []string {
-	return QuotaKeys(repoURL)
+// memQuotaKeys mirrors the SQL quota key derivation for one canonical
+// repository identity.
+func memQuotaKeys(repoID string) []string {
+	return QuotaKeys(repoID)
 }
 
 // adjustQuotaLocked shifts counters for the repo/team keys (caller holds
 // m.mu). Missing rows are tolerated.
-func (m *memStore) adjustQuotaLocked(repoURL string, runningDelta, queuedDelta int) {
-	for _, key := range memQuotaKeys(repoURL) {
+func (m *memStore) adjustQuotaLocked(repoID string, runningDelta, queuedDelta int) {
+	for _, key := range memQuotaKeys(repoID) {
 		c := m.quotas[key]
 		c.running += runningDelta
 		if c.running < 0 {
@@ -1739,8 +1803,14 @@ func (m *memStore) adjustQuotaLocked(repoURL string, runningDelta, queuedDelta i
 
 // InsertCompiledRun applies the whole atomic-enqueue request under m.mu:
 // every write is staged and only committed when the whole request validates
-// (delivery dedupe, quota limits, schedule claim), so a rejected request
-// leaves zero partial state.
+// (delivery dedupe, duplicate rows, quota limits, schedule claim), so a
+// rejected request leaves zero partial state. Supersession — explicit
+// CancelPrevious IDs and the in-transaction Supersede policy resolved
+// against the currently committed runs — commits with the new run: the
+// superseded jobs are terminal-cancelled with their leases cleared, their
+// runner slots and quota released, their dependents re-evaluated, and the
+// superseded runs marked cancelled in the SAME critical section that
+// publishes the new run.
 func (m *memStore) InsertCompiledRun(ctx context.Context, req InsertCompiledRunRequest) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1748,16 +1818,12 @@ func (m *memStore) InsertCompiledRun(ctx context.Context, req InsertCompiledRunR
 	if runID == "" {
 		return fmt.Errorf("storage: empty run id")
 	}
-	if req.WebhookClaim != nil {
-		if _, exists := m.deliveries[req.WebhookClaim.Forge+"/"+req.WebhookClaim.DeliveryID]; exists {
-			return ErrDeliveryDuplicate
-		}
-	}
 	// Every reservation is STAGED first and committed only after the whole
-	// request validated: a rejection (quota limit, lost schedule claim) must
-	// leave zero partial state, exactly like the SQL transaction. Mutating
-	// m.downstream/m.quotas in place before a later validation fails would
-	// leak a consumed launch claim or an inflated counter.
+	// request validated: a rejection (duplicate delivery, quota limit, lost
+	// schedule claim) must leave zero partial state, exactly like the SQL
+	// transaction. Mutating m.downstream/m.quotas in place before a later
+	// validation fails would leak a consumed launch claim or an inflated
+	// counter.
 	type quotaStage struct {
 		key string
 		c   quotaCounts
@@ -1792,6 +1858,18 @@ func (m *memStore) InsertCompiledRun(ctx context.Context, req InsertCompiledRunR
 		l.ReservedAt = nil
 		downstreamLinkKey = key
 		stagedDownstream = &l
+	}
+	// Duplicate primary keys mirror the SQL INSERT failures (the downstream
+	// launch claim above is resolved first, exactly like the SQL order): a
+	// replayed run must fail the whole enqueue rather than overwrite the
+	// committed rows.
+	if _, exists := m.runs[runID]; exists {
+		return fmt.Errorf("storage: run %s already exists", runID)
+	}
+	for id := range req.Jobs {
+		if _, exists := m.jobs[id]; exists {
+			return fmt.Errorf("storage: job %s already exists", id)
+		}
 	}
 	// Quota reservation: re-enforce limits against the reserved counters.
 	if req.Quota != nil {
@@ -1829,23 +1907,44 @@ func (m *memStore) InsertCompiledRun(ctx context.Context, req InsertCompiledRunR
 			}
 		}
 	}
-	// Commit: from here on nothing can fail, so the staged reservations land
-	// together with the run.
-	if stagedDownstream != nil {
-		m.downstream[downstreamLinkKey] = *stagedDownstream
-	}
-	for _, st := range quotaStages {
-		m.quotas[st.key] = st.c
-	}
 	now := time.Now().UTC()
-	m.runs[runID] = req.Run
-	for id, j := range req.Jobs {
-		m.jobs[id] = j
-		if contracts, ok := req.Contracts[id]; ok {
-			m.contracts[id] = contracts
+	// The in-transaction supersede policy resolves against the currently
+	// committed runs (the new run is excluded by ID), exactly like the SQL
+	// resolver under its advisory lock.
+	stagedOps := 0
+	bumpStaged := func() error {
+		if m.enqueueFaultOps <= 0 {
+			return nil
 		}
+		stagedOps++
+		if stagedOps < m.enqueueFaultOps {
+			return nil
+		}
+		err := m.enqueueFaultErr
+		m.enqueueFaultOps = 0
+		m.enqueueFaultErr = nil
+		if err == nil {
+			err = fmt.Errorf("storage: injected enqueue failure")
+		}
+		return err
 	}
-	for _, id := range req.CancelPrevious {
+	type cancelStage struct {
+		id         string
+		job        model.Job
+		wasRunning bool
+		runnerID   string
+	}
+	cancelIDs := append([]string(nil), req.CancelPrevious...)
+	if req.Supersede != nil {
+		cancelIDs = append(cancelIDs, m.supersededJobIDsLocked(req.Supersede, runID)...)
+	}
+	cancelStages := make([]cancelStage, 0, len(cancelIDs))
+	seenCancel := map[string]bool{}
+	for _, id := range cancelIDs {
+		if seenCancel[id] {
+			continue
+		}
+		seenCancel[id] = true
 		j, ok := m.jobs[id]
 		if !ok || j.Status.Terminal() {
 			continue
@@ -1858,17 +1957,78 @@ func (m *memStore) InsertCompiledRun(ctx context.Context, req InsertCompiledRunR
 		j.LeaseRunnerID = ""
 		j.LeaseTokenHash = nil
 		j.LeaseExpiresAt = nil
-		m.jobs[id] = j
-		m.audit = append(m.audit, model.AuditEvent{ID: id + "|audit", Action: "job.superseded", Actor: "scheduler", RunID: j.RunID, JobID: id, Message: "cancelled", CreatedAt: now})
-		if wasRunning {
-			m.adjustQuotaLocked(j.RepoURL, -1, 0)
+		cancelStages = append(cancelStages, cancelStage{id: id, job: j, wasRunning: wasRunning, runnerID: runnerID})
+		if err := bumpStaged(); err != nil {
+			return err
+		}
+	}
+	type jobStage struct {
+		id  string
+		job model.Job
+	}
+	jobStages := make([]jobStage, 0, len(req.Jobs))
+	for id, j := range req.Jobs {
+		j.Needs = effectiveNeeds(id, j, req.Deps)
+		jobStages = append(jobStages, jobStage{id: id, job: j})
+		if err := bumpStaged(); err != nil {
+			return err
+		}
+	}
+	// The delivery-dedupe claim is validated against the staged request,
+	// mirroring the SQL transaction where the webhook claim insert runs
+	// after the run/jobs/supersession writes and its conflict rolls them all
+	// back: a replayed delivery must not cancel the superseded run either.
+	if req.WebhookClaim != nil {
+		if _, exists := m.deliveries[req.WebhookClaim.Forge+"/"+req.WebhookClaim.DeliveryID]; exists {
+			return ErrDeliveryDuplicate
+		}
+	}
+	// Commit: from here on nothing can fail, so the staged reservations, the
+	// superseded cancellations and the new run land together.
+	if stagedDownstream != nil {
+		m.downstream[downstreamLinkKey] = *stagedDownstream
+	}
+	for _, st := range quotaStages {
+		m.quotas[st.key] = st.c
+	}
+	cancelled := make(map[string]bool, len(cancelStages))
+	cancelledRuns := map[string]bool{}
+	for _, st := range cancelStages {
+		m.jobs[st.id] = st.job
+		cancelled[st.id] = true
+		if st.job.RunID != "" {
+			cancelledRuns[st.job.RunID] = true
+		}
+		m.audit = append(m.audit, model.AuditEvent{ID: st.id + "|audit", Action: "job.superseded", Actor: "scheduler", RunID: st.job.RunID, JobID: st.id, Message: "cancelled", CreatedAt: now})
+		if st.wasRunning {
+			m.adjustQuotaLocked(RepoIDForJob(st.job), -1, 0)
 			// A superseded running job releases its runner slot in the
 			// same transaction, exactly like the SQL cancel-superseded path.
-			if runnerID != "" {
-				m.releaseRunnerSlotLocked(runnerID, id)
+			if st.runnerID != "" {
+				m.releaseRunnerSlotLocked(st.runnerID, st.id)
 			}
 		} else {
-			m.adjustQuotaLocked(j.RepoURL, 0, -1)
+			m.adjustQuotaLocked(RepoIDForJob(st.job), 0, -1)
+		}
+	}
+	// Dependents recomputed per existing cancel semantics: a queued job
+	// needing a superseded job is re-evaluated against the fresh outcome and
+	// blocked when its condition does not allow it.
+	m.recomputeDependentsLocked(cancelled, now)
+	// The superseded runs are cancelled in the same step as the new run's
+	// publication, never leaving an active run with only cancelled jobs.
+	for rid := range cancelledRuns {
+		if r, ok := m.runs[rid]; ok && !r.Status.Terminal() {
+			r.Status = model.StatusCancelled
+			r.FinishedAt = &now
+			m.runs[rid] = r
+		}
+	}
+	m.runs[runID] = req.Run
+	for _, st := range jobStages {
+		m.jobs[st.id] = st.job
+		if contracts, ok := req.Contracts[st.id]; ok {
+			m.contracts[st.id] = contracts
 		}
 	}
 	if req.WebhookClaim != nil {
@@ -1883,6 +2043,82 @@ func (m *memStore) InsertCompiledRun(ctx context.Context, req InsertCompiledRunR
 		byNominal[req.ScheduleClaim.Nominal] = runID
 	}
 	return nil
+}
+
+// supersededJobIDsLocked resolves a supersede policy against the currently
+// committed runs (caller holds m.mu): every other non-terminal run of the
+// same repository and concurrency group contributes its non-terminal job
+// IDs, in deterministic order.
+func (m *memStore) supersededJobIDsLocked(p *SupersedePolicy, newRunID string) []string {
+	repo := strings.TrimSpace(p.Repo)
+	group := strings.TrimSpace(p.ConcurrencyGroup)
+	if repo == "" || group == "" {
+		return nil
+	}
+	runIDs := []string{}
+	for id, r := range m.runs {
+		if id == newRunID || r.Status.Terminal() {
+			continue
+		}
+		if r.Repo != repo || r.ConcurrencyGroup != group {
+			continue
+		}
+		runIDs = append(runIDs, id)
+	}
+	sort.Strings(runIDs)
+	out := []string{}
+	for _, rid := range runIDs {
+		for id, j := range m.jobs {
+			if j.RunID != rid || j.Status.Terminal() {
+				continue
+			}
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// recomputeDependentsLocked re-evaluates every queued/waiting job that needs
+// one of the cancelled jobs against the fresh dependency outcome (caller
+// holds m.mu), blocking it when its condition does not allow the outcome.
+// It mirrors recomputeDependentsTx from the SQL enqueue transaction.
+func (m *memStore) recomputeDependentsLocked(cancelled map[string]bool, now time.Time) {
+	if len(cancelled) == 0 {
+		return
+	}
+	for id, j := range m.jobs {
+		if j.Status != model.StatusQueued && j.Status != model.StatusWaitingApproval {
+			continue
+		}
+		needsCancelled := false
+		for _, dep := range j.Needs {
+			if cancelled[dep] {
+				needsCancelled = true
+				break
+			}
+		}
+		if !needsCancelled {
+			continue
+		}
+		statuses := map[string]model.Status{}
+		for _, dep := range j.Needs {
+			if d, ok := m.jobs[dep]; ok {
+				statuses[dep] = d.Status
+			}
+		}
+		ready, outcome := dependencyOutcome(statuses, j.Needs)
+		if !ready {
+			continue
+		}
+		j.DependencyStatus = outcome
+		if outcome != model.StatusSuccess && !dependencyConditionAllows(j.Condition, outcome) {
+			j.Status = model.StatusBlocked
+			j.Error = "dependency failed"
+			j.FinishedAt = &now
+		}
+		m.jobs[id] = j
+	}
 }
 
 // resolveProfileLocked resolves the LIVE profile bound to the runner's
@@ -1910,8 +2146,8 @@ func (m *memStore) resolveProfileLocked(r model.Runner) (effective model.Runner,
 // limit. Caller holds m.mu; the caller performs the counter move only after
 // every other claim predicate passed, so a rejected lease leaves the
 // counters untouched.
-func (m *memStore) claimQuotaLocked(repoURL string, repoLimit, teamLimit float64) error {
-	for i, key := range memQuotaKeys(repoURL) {
+func (m *memStore) claimQuotaLocked(repoID string, repoLimit, teamLimit float64) error {
+	for i, key := range memQuotaKeys(repoID) {
 		limit := repoLimit
 		reason, scope := "REPO_QUOTA", "repository"
 		if i > 0 {
@@ -1992,7 +2228,7 @@ func (m *memStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim) (mo
 		}
 		return model.Job{}, ErrNoCapacity
 	}
-	if err := m.claimQuotaLocked(j.RepoURL, claim.RepoConcurrency, claim.TeamConcurrency); err != nil {
+	if err := m.claimQuotaLocked(RepoIDForJob(j), claim.RepoConcurrency, claim.TeamConcurrency); err != nil {
 		return model.Job{}, err
 	}
 	now := time.Now().UTC()
@@ -2016,7 +2252,7 @@ func (m *memStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim) (mo
 		r.CurrentJob = r.ActiveJobs[0]
 	}
 	m.runners[claim.RunnerID] = r
-	m.adjustQuotaLocked(j.RepoURL, 1, -1)
+	m.adjustQuotaLocked(RepoIDForJob(j), 1, -1)
 	return j, nil
 }
 
@@ -2175,6 +2411,84 @@ func (m *memStore) SetArtifactSidecars(ctx context.Context, id, sbomPath, sbomSH
 		return nil
 	}
 	return ErrNotFound
+}
+
+// RememberPendingSidecar upserts the pending sidecar digest for
+// (job, artifact, kind), replacing the digest of a re-upload.
+func (m *memStore) RememberPendingSidecar(ctx context.Context, jobID, artifactName, kind, digest string) error {
+	if err := validatePendingSidecarKey(jobID, artifactName, kind); err != nil {
+		return err
+	}
+	if err := validatePendingSidecarDigest(digest); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pendingSidecars[pendingSidecarKey(jobID, artifactName, kind)] = pendingSidecar{digest: digest, createdAt: time.Now().UTC()}
+	return nil
+}
+
+// PendingSidecar resolves the pending sidecar digest, or ok=false when the
+// row is absent.
+func (m *memStore) PendingSidecar(ctx context.Context, jobID, artifactName, kind string) (string, bool, error) {
+	if err := validatePendingSidecarKey(jobID, artifactName, kind); err != nil {
+		return "", false, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	row, ok := m.pendingSidecars[pendingSidecarKey(jobID, artifactName, kind)]
+	if !ok {
+		return "", false, nil
+	}
+	return row.digest, true, nil
+}
+
+// ConsumePendingSidecar deletes the pending row only while it still carries
+// the consumed digest.
+func (m *memStore) ConsumePendingSidecar(ctx context.Context, jobID, artifactName, kind, digest string) error {
+	if err := validatePendingSidecarKey(jobID, artifactName, kind); err != nil {
+		return err
+	}
+	if err := validatePendingSidecarDigest(digest); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := pendingSidecarKey(jobID, artifactName, kind)
+	if row, ok := m.pendingSidecars[key]; ok && row.digest == digest {
+		delete(m.pendingSidecars, key)
+	}
+	return nil
+}
+
+// DeletePendingSidecars clears every leftover pending row for the job.
+func (m *memStore) DeletePendingSidecars(ctx context.Context, jobID string) error {
+	if err := ValidateJobID(jobID); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	prefix := jobID + "\x00"
+	for key := range m.pendingSidecars {
+		if strings.HasPrefix(key, prefix) {
+			delete(m.pendingSidecars, key)
+		}
+	}
+	return nil
+}
+
+// PrunePendingSidecars drops rows created before the cutoff.
+func (m *memStore) PrunePendingSidecars(ctx context.Context, olderThan time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for key, row := range m.pendingSidecars {
+		if row.createdAt.Before(olderThan) {
+			delete(m.pendingSidecars, key)
+			n++
+		}
+	}
+	return n, nil
 }
 
 // requiredArtifactMissingLocked returns the name of the first Required

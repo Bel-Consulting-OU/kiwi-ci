@@ -1,12 +1,12 @@
 -- 0001_init.sql — full control-plane schema.
--- Hot paths (statuses, leases, counters, ordering) get real columns; payload
+-- Hot paths (statuses, leases, counters, ordering) get real columns, payload
 -- fields (pipeline text, metadata, outputs, manifests) live in jsonb payload
 -- columns for flexibility. Reads merge the real columns over the payload.
 
 CREATE TABLE schema_migrations (
     version INT PRIMARY KEY,
     applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
-)
+);
 
 CREATE TABLE runs (
     id TEXT PRIMARY KEY,
@@ -15,11 +15,11 @@ CREATE TABLE runs (
     finished_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL,
     payload JSONB NOT NULL
-)
+);
 
-CREATE INDEX runs_status_idx ON runs (status)
+CREATE INDEX runs_status_idx ON runs (status);
 
-CREATE INDEX runs_created_at_idx ON runs (created_at DESC)
+CREATE INDEX runs_created_at_idx ON runs (created_at DESC);
 
 CREATE TABLE jobs (
     id TEXT PRIMARY KEY,
@@ -39,19 +39,19 @@ CREATE TABLE jobs (
     finished_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL,
     payload JSONB NOT NULL
-)
+);
 
-CREATE INDEX jobs_run_id_idx ON jobs (run_id)
+CREATE INDEX jobs_run_id_idx ON jobs (run_id);
 
-CREATE INDEX jobs_status_priority_idx ON jobs (status, priority DESC, created_at ASC)
+CREATE INDEX jobs_status_priority_idx ON jobs (status, priority DESC, created_at ASC);
 
 CREATE TABLE job_dependencies (
     job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     depends_on TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     PRIMARY KEY (job_id, depends_on)
-)
+);
 
-CREATE INDEX job_dependencies_depends_on_idx ON job_dependencies (depends_on)
+CREATE INDEX job_dependencies_depends_on_idx ON job_dependencies (depends_on);
 
 CREATE TABLE job_leases (
     job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
@@ -60,9 +60,9 @@ CREATE TABLE job_leases (
     generation BIGINT NOT NULL,
     expires_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-)
+);
 
-CREATE INDEX job_leases_expires_at_idx ON job_leases (expires_at)
+CREATE INDEX job_leases_expires_at_idx ON job_leases (expires_at);
 
 CREATE TABLE completion_receipts (
     job_id TEXT NOT NULL,
@@ -71,7 +71,7 @@ CREATE TABLE completion_receipts (
     result_hash TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (job_id, generation, runner_id)
-)
+);
 
 CREATE TABLE runners (
     id TEXT PRIMARY KEY,
@@ -84,7 +84,7 @@ CREATE TABLE runners (
     registered TIMESTAMPTZ,
     last_seen TIMESTAMPTZ,
     payload JSONB NOT NULL
-)
+);
 
 CREATE TABLE runner_certificates (
     serial TEXT PRIMARY KEY,
@@ -93,15 +93,15 @@ CREATE TABLE runner_certificates (
     not_after TIMESTAMPTZ,
     revoked_at TIMESTAMPTZ,
     payload JSONB NOT NULL
-)
+);
 
-CREATE INDEX runner_certificates_runner_id_idx ON runner_certificates (runner_id)
+CREATE INDEX runner_certificates_runner_id_idx ON runner_certificates (runner_id);
 
 CREATE TABLE runner_capabilities (
     runner_id TEXT NOT NULL REFERENCES runners(id) ON DELETE CASCADE,
     capability TEXT NOT NULL,
     PRIMARY KEY (runner_id, capability)
-)
+);
 
 CREATE TABLE artifacts (
     id TEXT PRIMARY KEY,
@@ -114,16 +114,16 @@ CREATE TABLE artifacts (
     created_at TIMESTAMPTZ NOT NULL,
     expires_at TIMESTAMPTZ,
     payload JSONB NOT NULL
-)
+);
 
-CREATE INDEX artifacts_run_id_idx ON artifacts (run_id)
+CREATE INDEX artifacts_run_id_idx ON artifacts (run_id);
 
 CREATE TABLE cache_manifests (
     cache_key TEXT PRIMARY KEY,
     entries JSONB NOT NULL DEFAULT '[]'::jsonb,
     created_at TIMESTAMPTZ NOT NULL,
     payload JSONB NOT NULL
-)
+);
 
 CREATE TABLE deployments (
     id TEXT PRIMARY KEY,
@@ -132,16 +132,16 @@ CREATE TABLE deployments (
     environment TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL,
     payload JSONB NOT NULL
-)
+);
 
-CREATE INDEX deployments_run_id_idx ON deployments (run_id)
+CREATE INDEX deployments_run_id_idx ON deployments (run_id);
 
 CREATE TABLE environments (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
     created_at TIMESTAMPTZ NOT NULL,
     payload JSONB NOT NULL
-)
+);
 
 CREATE TABLE approvals (
     id TEXT PRIMARY KEY,
@@ -151,9 +151,9 @@ CREATE TABLE approvals (
     approved_by TEXT,
     created_at TIMESTAMPTZ NOT NULL,
     payload JSONB NOT NULL
-)
+);
 
-CREATE INDEX approvals_job_id_idx ON approvals (job_id)
+CREATE INDEX approvals_job_id_idx ON approvals (job_id);
 
 CREATE TABLE schedules (
     id TEXT PRIMARY KEY,
@@ -161,7 +161,7 @@ CREATE TABLE schedules (
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL,
     payload JSONB NOT NULL
-)
+);
 
 CREATE TABLE test_cases (
     id TEXT PRIMARY KEY,
@@ -172,9 +172,9 @@ CREATE TABLE test_cases (
     passed BOOLEAN NOT NULL,
     message TEXT,
     payload JSONB NOT NULL
-)
+);
 
-CREATE INDEX test_cases_report_id_idx ON test_cases (report_id)
+CREATE INDEX test_cases_report_id_idx ON test_cases (report_id);
 
 CREATE TABLE test_results (
     id TEXT PRIMARY KEY,
@@ -187,9 +187,9 @@ CREATE TABLE test_results (
     duration DOUBLE PRECISION,
     created_at TIMESTAMPTZ NOT NULL,
     payload JSONB NOT NULL
-)
+);
 
-CREATE INDEX test_results_run_id_idx ON test_results (run_id)
+CREATE INDEX test_results_run_id_idx ON test_results (run_id);
 
 CREATE TABLE audit_events (
     id TEXT PRIMARY KEY,
@@ -200,9 +200,9 @@ CREATE TABLE audit_events (
     message TEXT,
     metadata JSONB,
     created_at TIMESTAMPTZ NOT NULL
-)
+);
 
-CREATE INDEX audit_events_created_at_idx ON audit_events (created_at DESC)
+CREATE INDEX audit_events_created_at_idx ON audit_events (created_at DESC);
 
 CREATE TABLE log_chunks (
     id TEXT PRIMARY KEY,
@@ -214,9 +214,9 @@ CREATE TABLE log_chunks (
     line TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL,
     UNIQUE (run_id, seq)
-)
+);
 
-CREATE INDEX log_chunks_run_id_seq_idx ON log_chunks (run_id, seq)
+CREATE INDEX log_chunks_run_id_seq_idx ON log_chunks (run_id, seq);
 
 CREATE TABLE usage_records (
     id TEXT PRIMARY KEY,
@@ -225,7 +225,7 @@ CREATE TABLE usage_records (
     unit TEXT,
     created_at TIMESTAMPTZ NOT NULL,
     payload JSONB NOT NULL
-)
+);
 
 CREATE TABLE webhook_deliveries (
     forge TEXT NOT NULL,
@@ -234,7 +234,7 @@ CREATE TABLE webhook_deliveries (
     payload_digest TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (forge, delivery_id)
-)
+);
 
 CREATE TABLE downstream_links (
     id TEXT PRIMARY KEY,
@@ -243,7 +243,7 @@ CREATE TABLE downstream_links (
     kind TEXT,
     created_at TIMESTAMPTZ NOT NULL,
     payload JSONB NOT NULL
-)
+);
 
 CREATE TABLE workspace_snapshots (
     id TEXT PRIMARY KEY,
@@ -251,4 +251,4 @@ CREATE TABLE workspace_snapshots (
     job_id TEXT,
     created_at TIMESTAMPTZ NOT NULL,
     payload JSONB NOT NULL
-)
+);

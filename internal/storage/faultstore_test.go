@@ -17,27 +17,28 @@ var errBoom = errors.New("injected storage failure")
 // memSnapshot is a comparable picture of every durable collection in a
 // memStore, used to prove a faulted operation left no partial write.
 type memSnapshot struct {
-	runs         map[string]model.Run
-	jobs         map[string]model.Job
-	runners      map[string]model.Runner
-	receipts     map[string]model.CompletionReceipt
-	auditLen     int
-	logsLen      int
-	artifacts    []model.ArtifactRecord
-	reportsLen   int
-	deliveries   map[string]string
-	outbox       []OutboxItem
-	schedules    map[string]Schedule
-	occurrences  map[string]map[time.Time]string
-	deployments  []model.Deployment
-	snapshots    []model.SnapshotRecord
-	jobContracts map[string]map[string]ArtifactContract
-	downstream   map[string]DownstreamLink
-	quotas       map[string]quotaCounts
-	cacheMans    map[string]CacheManifestRecord
-	claims       map[string]time.Time
-	outboxClaims map[string]outboxClaim
-	fragments    map[string]GeneratedFragmentReceipt
+	runs            map[string]model.Run
+	jobs            map[string]model.Job
+	runners         map[string]model.Runner
+	receipts        map[string]model.CompletionReceipt
+	auditLen        int
+	logsLen         int
+	artifacts       []model.ArtifactRecord
+	reportsLen      int
+	deliveries      map[string]string
+	outbox          []OutboxItem
+	schedules       map[string]Schedule
+	occurrences     map[string]map[time.Time]string
+	deployments     []model.Deployment
+	snapshots       []model.SnapshotRecord
+	jobContracts    map[string]map[string]ArtifactContract
+	downstream      map[string]DownstreamLink
+	quotas          map[string]quotaCounts
+	cacheMans       map[string]CacheManifestRecord
+	claims          map[string]time.Time
+	outboxClaims    map[string]outboxClaim
+	fragments       map[string]GeneratedFragmentReceipt
+	pendingSidecars map[string]pendingSidecar
 }
 
 func (m *memStore) snapshot() memSnapshot {
@@ -52,28 +53,37 @@ func (m *memStore) snapshot() memSnapshot {
 		cacheMans[k] = v
 	}
 	return memSnapshot{
-		runs:         cloneRuns(m.runs),
-		jobs:         cloneJobs(m.jobs),
-		runners:      cloneRunners(m.runners),
-		receipts:     cloneReceipts(m.receipts),
-		auditLen:     len(m.audit),
-		logsLen:      len(m.logs),
-		artifacts:    append([]model.ArtifactRecord(nil), m.artifacts...),
-		reportsLen:   len(m.reports),
-		deliveries:   cloneDeliveries(m.deliveries),
-		outbox:       append([]OutboxItem(nil), m.outbox...),
-		schedules:    cloneSchedules(m.schedules),
-		occurrences:  cloneOccurrences(m.occurrences),
-		deployments:  append([]model.Deployment(nil), m.deployments...),
-		snapshots:    append([]model.SnapshotRecord(nil), m.snapshots...),
-		jobContracts: cloneJobContracts(m.contracts),
-		downstream:   cloneDownstreamLinks(m.downstream),
-		quotas:       quotas,
-		cacheMans:    cacheMans,
-		claims:       cloneClaims(m.claims),
-		outboxClaims: cloneOutboxClaims(m.outboxClaims),
-		fragments:    cloneFragments(m.fragments),
+		runs:            cloneRuns(m.runs),
+		jobs:            cloneJobs(m.jobs),
+		runners:         cloneRunners(m.runners),
+		receipts:        cloneReceipts(m.receipts),
+		auditLen:        len(m.audit),
+		logsLen:         len(m.logs),
+		artifacts:       append([]model.ArtifactRecord(nil), m.artifacts...),
+		reportsLen:      len(m.reports),
+		deliveries:      cloneDeliveries(m.deliveries),
+		outbox:          append([]OutboxItem(nil), m.outbox...),
+		schedules:       cloneSchedules(m.schedules),
+		occurrences:     cloneOccurrences(m.occurrences),
+		deployments:     append([]model.Deployment(nil), m.deployments...),
+		snapshots:       append([]model.SnapshotRecord(nil), m.snapshots...),
+		jobContracts:    cloneJobContracts(m.contracts),
+		downstream:      cloneDownstreamLinks(m.downstream),
+		quotas:          quotas,
+		cacheMans:       cacheMans,
+		claims:          cloneClaims(m.claims),
+		outboxClaims:    cloneOutboxClaims(m.outboxClaims),
+		fragments:       cloneFragments(m.fragments),
+		pendingSidecars: clonePendingSidecars(m.pendingSidecars),
 	}
+}
+
+func clonePendingSidecars(in map[string]pendingSidecar) map[string]pendingSidecar {
+	out := make(map[string]pendingSidecar, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 func cloneOutboxClaims(in map[string]outboxClaim) map[string]outboxClaim {
@@ -224,10 +234,15 @@ func seedRunner(m *memStore) {
 // opCase describes one mutating store operation for fault-injection
 // coverage: a setup function seeds the minimum durable state the operation
 // needs, and call executes the operation against the store under test.
+// enqueueStageFault, when > 0, additionally arms the inner store's
+// mid-enqueue fault hook at failAfter=0 so the harness also covers a failure
+// INSIDE the atomic enqueue transaction (after that many staged writes)
+// rather than only before the call.
 type opCase struct {
-	name  string
-	setup func(*memStore)
-	call  func(Store) error
+	name              string
+	setup             func(*memStore)
+	call              func(Store) error
+	enqueueStageFault int
 }
 
 func faultOps() []opCase {
@@ -477,6 +492,36 @@ func faultOps() []opCase {
 			},
 		},
 		{
+			// The mid-enqueue stage fault: a failure on the 7th of 8 job
+			// writes (plus the supersede cancellation) must leave ZERO rows
+			// behind — no run, no jobs, no delivery claim, no quota
+			// reservation.
+			name: "InsertCompiledRunMidEnqueueFault",
+			setup: func(m *memStore) {
+				_ = m.InsertRun(ctx(), testRun)
+				old := testJob
+				old.ID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac"
+				old.Status = model.StatusQueued
+				old.RepoURL = "https://github.com/o/r.git"
+				_ = m.InsertJob(ctx(), old)
+			},
+			enqueueStageFault: 8,
+			call: func(s Store) error {
+				jobs := map[string]model.Job{}
+				for i := 0; i < 8; i++ {
+					id := fmt.Sprintf("%032d", i)
+					jobs[id] = model.Job{ID: id, RunID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad", Key: fmt.Sprintf("j%d", i), RepoURL: "https://github.com/o/r.git", Status: model.StatusQueued, CreatedAt: time.Unix(2000+int64(i), 0).UTC()}
+				}
+				return s.(RunEnqueueStore).InsertCompiledRun(ctx(), InsertCompiledRunRequest{
+					Run:          model.Run{ID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad", Repo: "https://github.com/o/r.git", Status: model.StatusQueued, ConcurrencyGroup: "grp", CreatedAt: time.Unix(2000, 0).UTC()},
+					Jobs:         jobs,
+					Supersede:    &SupersedePolicy{Repo: "https://github.com/o/r.git", ConcurrencyGroup: "grp"},
+					WebhookClaim: &WebhookClaim{Forge: "github", DeliveryID: "del-stage", RunID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad"},
+					Quota:        &QuotaReservation{RepoKey: "https://github.com/o/r.git", JobCount: 8},
+				})
+			},
+		},
+		{
 			name:  "AcquireLeaseAtomic",
 			setup: func(m *memStore) { seedRunAndJob(m); seedRunner(m) },
 			call: func(s Store) error {
@@ -590,6 +635,44 @@ func faultOps() []opCase {
 			},
 		},
 		{
+			name:  "RememberPendingSidecar",
+			setup: seedRunAndJob,
+			call: func(s Store) error {
+				return s.(ArtifactSidecarStore).RememberPendingSidecar(ctx(), testJob.ID, "bin", ArtifactSidecarKindSBOM, strings.Repeat("c", 64))
+			},
+		},
+		{
+			name: "ConsumePendingSidecar",
+			setup: func(m *memStore) {
+				seedRunAndJob(m)
+				_ = m.RememberPendingSidecar(ctx(), testJob.ID, "bin", ArtifactSidecarKindSBOM, strings.Repeat("c", 64))
+			},
+			call: func(s Store) error {
+				return s.(ArtifactSidecarStore).ConsumePendingSidecar(ctx(), testJob.ID, "bin", ArtifactSidecarKindSBOM, strings.Repeat("c", 64))
+			},
+		},
+		{
+			name: "DeletePendingSidecars",
+			setup: func(m *memStore) {
+				seedRunAndJob(m)
+				_ = m.RememberPendingSidecar(ctx(), testJob.ID, "bin", ArtifactSidecarKindSigstore, strings.Repeat("d", 64))
+			},
+			call: func(s Store) error {
+				return s.(ArtifactSidecarStore).DeletePendingSidecars(ctx(), testJob.ID)
+			},
+		},
+		{
+			name: "PrunePendingSidecars",
+			setup: func(m *memStore) {
+				seedRunAndJob(m)
+				_ = m.RememberPendingSidecar(ctx(), testJob.ID, "bin", ArtifactSidecarKindSBOM, strings.Repeat("c", 64))
+			},
+			call: func(s Store) error {
+				_, err := s.(ArtifactSidecarStore).PrunePendingSidecars(ctx(), time.Now().UTC().Add(time.Hour))
+				return err
+			},
+		},
+		{
 			name: "ReserveDownstreamLaunch",
 			setup: func(m *memStore) {
 				seedRunAndJob(m)
@@ -638,7 +721,9 @@ func faultOps() []opCase {
 // TestFaultInjectionEveryMutationEveryPoint injects a failure at every
 // failure point of every mutating store operation and asserts the failed
 // operation returned the injected error without leaving any partial write
-// behind in the underlying store.
+// behind in the underlying store. Operations carrying an enqueueStageFault
+// are additionally driven through the mid-enqueue hook at failAfter=0: a
+// failure INSIDE the atomic enqueue transaction must also leave zero rows.
 func TestFaultInjectionEveryMutationEveryPoint(t *testing.T) {
 	for _, op := range faultOps() {
 		for failAfter := 0; failAfter <= 3; failAfter++ {
@@ -646,14 +731,20 @@ func TestFaultInjectionEveryMutationEveryPoint(t *testing.T) {
 				inner := newMemStore()
 				op.setup(inner)
 				baseline := inner.snapshot()
+				if op.enqueueStageFault > 0 && failAfter == 0 {
+					inner.enqueueFaultOps = op.enqueueStageFault
+					inner.enqueueFaultErr = errBoom
+				}
 
 				fs := &FaultyStore{Inner: inner, FailAfter: failAfter, Err: errBoom}
 				err := op.call(fs)
 				after := inner.snapshot()
 
-				// Each operation is a single mutating call, so it faults
-				// exactly when FailAfter == 1.
-				if failAfter == 1 {
+				// Each operation faults either before the call (FailAfter
+				// == 1) or, for stage-fault ops, on the Nth write inside the
+				// transaction (failAfter == 0 with the hook armed).
+				expectFault := failAfter == 1 || (op.enqueueStageFault > 0 && failAfter == 0)
+				if expectFault {
 					if !errors.Is(err, errBoom) {
 						t.Fatalf("expected injected error, got %v", err)
 					}
@@ -673,60 +764,151 @@ func TestFaultInjectionEveryMutationEveryPoint(t *testing.T) {
 	}
 }
 
-// TestFaultInjectionSequenceNoPartialLeak replays the scheduler enqueue
-// shape (InsertRun + one InsertJob per job) through a faulted store and
-// checks that every failure point yields exactly the durable prefix of
-// successful calls — memory never diverges from what was committed.
-func TestFaultInjectionSequenceNoPartialLeak(t *testing.T) {
-	const jobCount = 3
-	jobs := make([]model.Job, jobCount)
-	for i := range jobs {
-		jobs[i] = model.Job{ID: fmt.Sprintf("j%d", i), RunID: testRun.ID, Key: fmt.Sprintf("job%d", i), Status: model.StatusQueued, CreatedAt: time.Unix(2000+int64(i), 0).UTC()}
+// TestFaultInjectionAtomicEnqueueNoPartialLeak drives the atomic enqueue
+// through a faulted store and proves the durable state is all-or-nothing: a
+// failure injected before the transaction leaves zero rows, a fully
+// successful enqueue commits the run, every job and the webhook claim
+// exactly once — never a partial prefix like the removed sequential
+// InsertRun/InsertJob shape.
+func TestFaultInjectionAtomicEnqueueNoPartialLeak(t *testing.T) {
+	const jobCount = 8
+	jobs := map[string]model.Job{}
+	deps := map[string][]string{}
+	for i := 0; i < jobCount; i++ {
+		id := fmt.Sprintf("%032d", i)
+		jobs[id] = model.Job{ID: id, RunID: testRun.ID, Key: fmt.Sprintf("job%d", i), Status: model.StatusQueued, CreatedAt: time.Unix(2000+int64(i), 0).UTC()}
 	}
-	enqueueShape := func(s Store) error {
-		if err := s.InsertRun(ctx(), testRun); err != nil {
-			return err
-		}
-		for _, j := range jobs {
-			if err := s.InsertJob(ctx(), j); err != nil {
-				return err
-			}
-		}
-		return nil
+	req := InsertCompiledRunRequest{
+		Run:          testRun,
+		Jobs:         jobs,
+		Deps:         deps,
+		WebhookClaim: &WebhookClaim{Forge: "github", DeliveryID: "del-atomic", RunID: testRun.ID},
+		Quota:        &QuotaReservation{RepoKey: "https://github.com/o/r.git", JobCount: jobCount},
 	}
-	for failAfter := 1; failAfter <= jobCount+2; failAfter++ {
+	for failAfter := 1; failAfter <= 3; failAfter++ {
 		t.Run(fmt.Sprintf("failAfter=%d", failAfter), func(t *testing.T) {
 			inner := newMemStore()
 			fs := &FaultyStore{Inner: inner, FailAfter: failAfter, Err: errBoom}
-			err := enqueueShape(fs)
-
-			// Replay the successful prefix on a pristine store: the
-			// faulted store's memory must match it exactly.
-			// Replay only the successful prefix (calls 1..failAfter-1).
-			control := newMemStore()
-			for i := 1; i < failAfter && i <= jobCount+1; i++ {
-				switch i {
-				case 1:
-					_ = control.InsertRun(ctx(), testRun)
-				default:
-					_ = control.InsertJob(ctx(), jobs[i-2])
-				}
-			}
-			got := inner.snapshot()
-			want := control.snapshot()
-			if !reflect.DeepEqual(got, want) {
-				t.Fatalf("faulted store memory diverges from the durable prefix:\n got:  %+v\n want: %+v", got, want)
-			}
-			if failAfter >= 1 && failAfter <= jobCount+1 {
+			err := fs.InsertCompiledRun(ctx(), req)
+			if failAfter == 1 {
 				if !errors.Is(err, errBoom) {
-					t.Fatalf("expected injected error at call %d, got %v", failAfter, err)
+					t.Fatalf("expected injected error, got %v", err)
 				}
-			} else {
-				if err != nil {
-					t.Fatalf("unexpected error: %v", err)
+				if len(inner.snapshot().runs) != 0 || len(inner.snapshot().jobs) != 0 {
+					t.Fatalf("faulted atomic enqueue leaked rows: %d runs, %d jobs", len(inner.runs), len(inner.jobs))
 				}
+				if _, ok := inner.deliveries["github/del-atomic"]; ok {
+					t.Fatal("faulted atomic enqueue leaked the delivery claim")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error at failAfter=%d: %v", failAfter, err)
+			}
+			if len(inner.runs) != 1 {
+				t.Fatalf("successful enqueue stored %d runs, want exactly 1", len(inner.runs))
+			}
+			if len(inner.jobs) != jobCount {
+				t.Fatalf("successful enqueue stored %d jobs, want exactly %d", len(inner.jobs), jobCount)
+			}
+			if _, ok := inner.deliveries["github/del-atomic"]; !ok {
+				t.Fatal("successful enqueue lost the delivery claim")
 			}
 		})
+	}
+}
+
+// TestFaultInjectionAtomicEnqueueEveryStage sweeps the mid-enqueue stage
+// hook across every write of a superseding atomic enqueue (the supersede
+// cancellation plus 8 job rows plus the reservations): a failure after ANY
+// staged write must leave the store byte-for-byte unchanged — the old run
+// untouched, the new run absent, no audit rows, no quota movement — and only
+// a fault beyond the last write lets the whole request commit.
+func TestFaultInjectionAtomicEnqueueEveryStage(t *testing.T) {
+	repo := "https://github.com/o/r.git"
+	const jobCount = 8
+	build := func() InsertCompiledRunRequest {
+		jobs := map[string]model.Job{}
+		for i := 0; i < jobCount; i++ {
+			id := fmt.Sprintf("%032d", i)
+			jobs[id] = model.Job{ID: id, RunID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad", Key: fmt.Sprintf("job%d", i), RepoURL: repo, Status: model.StatusQueued, CreatedAt: time.Unix(2000+int64(i), 0).UTC()}
+		}
+		return InsertCompiledRunRequest{
+			Run:          model.Run{ID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad", Repo: repo, Status: model.StatusQueued, ConcurrencyGroup: "grp", CreatedAt: time.Unix(2000, 0).UTC()},
+			Jobs:         jobs,
+			Supersede:    &SupersedePolicy{Repo: repo, ConcurrencyGroup: "grp"},
+			WebhookClaim: &WebhookClaim{Forge: "github", DeliveryID: "del-stage", RunID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad"},
+			Quota:        &QuotaReservation{RepoKey: repo, JobCount: jobCount},
+		}
+	}
+	seed := func(m *memStore) {
+		old := compiledRunRequest("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac", repo)
+		old.Quota = &QuotaReservation{RepoKey: repo, JobCount: 1}
+		if err := m.InsertCompiledRun(ctx(), old); err != nil {
+			t.Fatal(err)
+		}
+		m.runs["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"] = model.Run{ID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab", Repo: repo, ConcurrencyGroup: "grp", Status: model.StatusRunning, CreatedAt: time.Unix(1000, 0).UTC()}
+	}
+	// 1 supersede cancellation + 8 jobs = 9 staged writes.
+	for stage := 1; stage <= jobCount+1; stage++ {
+		t.Run(fmt.Sprintf("stage=%d", stage), func(t *testing.T) {
+			inner := newMemStore()
+			seed(inner)
+			baseline := inner.snapshot()
+			inner.enqueueFaultOps = stage
+			inner.enqueueFaultErr = errBoom
+			err := inner.InsertCompiledRun(ctx(), build())
+			if !errors.Is(err, errBoom) {
+				t.Fatalf("stage %d = %v, want injected error", stage, err)
+			}
+			if after := inner.snapshot(); !reflect.DeepEqual(after, baseline) {
+				t.Fatalf("stage %d left partial state:\n before: %+v\n after:  %+v", stage, baseline, after)
+			}
+		})
+	}
+	// Without supersession the staged writes are exactly the job rows: a
+	// failure on the 7th of 8 jobs must leave no run and no jobs — the
+	// literal mid-enqueue case.
+	t.Run("job7", func(t *testing.T) {
+		inner := newMemStore()
+		req := build()
+		req.Supersede = nil
+		inner.enqueueFaultOps = 7
+		inner.enqueueFaultErr = errBoom
+		if err := inner.InsertCompiledRun(ctx(), req); !errors.Is(err, errBoom) {
+			t.Fatalf("mid-enqueue failure = %v, want injected error", err)
+		}
+		if len(inner.runs) != 0 || len(inner.jobs) != 0 {
+			t.Fatalf("mid-enqueue failure leaked %d runs and %d jobs", len(inner.runs), len(inner.jobs))
+		}
+		if _, ok := inner.deliveries["github/del-stage"]; ok {
+			t.Fatal("mid-enqueue failure leaked the webhook delivery claim")
+		}
+		if running, queued, _ := inner.QuotaCounts(ctx(), repo, ""); running != 0 || queued != 0 {
+			t.Fatalf("mid-enqueue failure leaked quota counters %d/%d", running, queued)
+		}
+	})
+	// A fault armed beyond the last write never fires: the request commits
+	// completely and exactly once.
+	inner := newMemStore()
+	seed(inner)
+	inner.enqueueFaultOps = jobCount + 2
+	inner.enqueueFaultErr = errBoom
+	if err := inner.InsertCompiledRun(ctx(), build()); err != nil {
+		t.Fatalf("unfired stage fault failed the enqueue: %v", err)
+	}
+	if len(inner.jobs) != jobCount+1 {
+		t.Fatalf("committed jobs = %d, want %d (old + new)", len(inner.jobs), jobCount+1)
+	}
+	if newRun, ok := inner.runs["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad"]; !ok || newRun.Status != model.StatusQueued {
+		t.Fatalf("new run not committed: %+v ok=%v", newRun, ok)
+	}
+	old, _ := inner.GetJob(ctx(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac")
+	if old.Status != model.StatusCancelled {
+		t.Fatalf("superseded job status = %s, want cancelled", old.Status)
+	}
+	if prev, _ := inner.GetRun(ctx(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"); prev.Status != model.StatusCancelled {
+		t.Fatalf("superseded run status = %s, want cancelled", prev.Status)
 	}
 }
 
@@ -762,5 +944,8 @@ func TestFaultInjectionReadsUnaffected(t *testing.T) {
 	}
 	if _, err := fs.GetArtifact(ctx(), "dddddddddddddddddddddddddddddddd"); err == nil {
 		t.Fatal("GetArtifact on empty store must not succeed")
+	}
+	if digest, ok, err := fs.PendingSidecar(ctx(), testJob.ID, "bin", ArtifactSidecarKindSBOM); err != nil || ok || digest != "" {
+		t.Fatalf("PendingSidecar on empty store = %q ok=%v err=%v", digest, ok, err)
 	}
 }

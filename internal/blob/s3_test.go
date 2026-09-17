@@ -3,9 +3,12 @@ package blob
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -108,6 +111,179 @@ func TestS3PutOpenRoundTrip(t *testing.T) {
 	}
 	if obj.Size != int64(len(data)) {
 		t.Fatalf("open size = %d", obj.Size)
+	}
+}
+
+// recordingTripper captures the request it was asked to perform so tests can
+// observe the request context, and returns a canned response or error.
+type recordingTripper struct {
+	mu   sync.Mutex
+	req  *http.Request
+	resp *http.Response
+	err  error
+}
+
+func (rt *recordingTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	rt.mu.Lock()
+	rt.req = req
+	rt.mu.Unlock()
+	if rt.err != nil {
+		return nil, rt.err
+	}
+	return rt.resp, nil
+}
+
+func (rt *recordingTripper) requestContext(t *testing.T) context.Context {
+	t.Helper()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.req == nil {
+		t.Fatal("no request reached the transport")
+	}
+	return rt.req.Context()
+}
+
+// s3WithTripper returns a path-style test store whose HTTP client uses rt.
+func s3WithTripper(rt http.RoundTripper) *S3 {
+	return &S3{
+		Endpoint:        "http://s3.test",
+		Region:          "us-east-1",
+		Bucket:          "bucket",
+		AccessKeyID:     "key",
+		SecretAccessKey: "secret",
+		PathStyle:       true,
+		Client:          &http.Client{Transport: rt},
+	}
+}
+
+// TestS3OpenStreamsBodyAfterReturn pins the stream lifetime contract: Open
+// returns as soon as the response headers are available and the body keeps
+// streaming afterwards. A server that flushes the first chunk and only then
+// produces the rest must not block Open.
+func TestS3OpenStreamsBodyAfterReturn(t *testing.T) {
+	chunks := []string{"first-chunk|", "second-chunk|", "third-chunk"}
+	release := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	done := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(done)
+		fl, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("test server does not support flushing")
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, chunks[0])
+		fl.Flush()
+		// Fail-safe: a broken Open that waits for the full body must not
+		// hang the suite; it must fail on the assertion below instead.
+		time.AfterFunc(2*time.Second, unblock)
+		<-release
+		_, _ = io.WriteString(w, chunks[1])
+		fl.Flush()
+		time.Sleep(200 * time.Millisecond)
+		_, _ = io.WriteString(w, chunks[2])
+		fl.Flush()
+	}))
+	t.Cleanup(srv.Close)
+
+	key := strings.Repeat("c", 64)
+	s := s3WithTripper(http.DefaultTransport)
+	s.Endpoint = srv.URL
+	rc, _, err := s.Open(context.Background(), key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	select {
+	case <-done:
+		t.Fatal("Open returned only after the server had written the whole body")
+	default:
+	}
+	unblock()
+	body, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read after Open returned: %v", err)
+	}
+	if got, want := string(body), strings.Join(chunks, ""); got != want {
+		t.Fatalf("streamed body = %q, want %q", got, want)
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// TestS3OpenCloseCancelsRequestContext verifies the request context outlives
+// Open while the caller streams, is cancelled by Close, and that Close is
+// idempotent.
+func TestS3OpenCloseCancelsRequestContext(t *testing.T) {
+	payload := []byte("streamed payload")
+	rt := &recordingTripper{resp: &http.Response{
+		StatusCode:    http.StatusOK,
+		Body:          io.NopCloser(bytes.NewReader(payload)),
+		ContentLength: int64(len(payload)),
+	}}
+	s := s3WithTripper(rt)
+
+	key := strings.Repeat("d", 64)
+	rc, obj, err := s.Open(context.Background(), key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	ctx := rt.requestContext(t)
+	if ctx.Err() != nil {
+		t.Fatalf("request context cancelled while the caller is still streaming: %v", ctx.Err())
+	}
+	body, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(body, payload) {
+		t.Fatalf("body = %q, want %q", body, payload)
+	}
+	if obj.Size != int64(len(payload)) {
+		t.Fatalf("size = %d, want %d", obj.Size, len(payload))
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("EOF alone must not cancel the request context: %v", ctx.Err())
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("Close must cancel the request context, got %v", ctx.Err())
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
+// TestS3OpenFailureCancelsRequestContext verifies every failure path releases
+// the bounded request context instead of leaking it until its timeout.
+func TestS3OpenFailureCancelsRequestContext(t *testing.T) {
+	key := strings.Repeat("e", 64)
+	cases := map[string]*recordingTripper{
+		"status": {resp: &http.Response{
+			StatusCode: http.StatusInternalServerError,
+			Body:       io.NopCloser(strings.NewReader("boom")),
+		}},
+		"not-found": {resp: &http.Response{
+			StatusCode: http.StatusNotFound,
+			Body:       io.NopCloser(strings.NewReader("missing")),
+		}},
+		"transport": {err: errors.New("connection refused")},
+	}
+	for name, rt := range cases {
+		t.Run(name, func(t *testing.T) {
+			s := s3WithTripper(rt)
+			if _, _, err := s.Open(context.Background(), key); err == nil {
+				t.Fatal("Open must fail")
+			}
+			ctx := rt.requestContext(t)
+			if !errors.Is(ctx.Err(), context.Canceled) {
+				t.Fatalf("failed Open leaked its request context: %v", ctx.Err())
+			}
+		})
 	}
 }
 

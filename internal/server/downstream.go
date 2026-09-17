@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/forge"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
@@ -64,15 +65,20 @@ func (s *Server) recordDownstreamIntents(ctx context.Context, j model.Job, run m
 	if err != nil {
 		return err
 	}
-	forgeKind := forgeKindForHost(repoURLHost(run.Repo))
+	forgeKind := forgeKindForHost(repoHost(repoIDForRun(run)))
+	baseURL := s.forgeBaseURL(forgeKind)
 	link := storage.DownstreamLink{
-		ParentJobID:   j.ID,
-		TargetRepo:    targetRepo,
-		TargetRef:     targetRef,
-		LaunchToken:   token,
-		TargetForge:   forgeKind,
-		TargetBaseURL: s.forgeBaseURL(forgeKind),
-		TargetRepoID:  targetRepo,
+		ParentJobID: j.ID,
+		TargetRepo:  targetRepo,
+		TargetRef:   targetRef,
+		LaunchToken: token,
+		TargetForge: forgeKind,
+		// The persisted target RepoID is the canonical identity of the
+		// child repository under the target forge/host; dispatch uses it
+		// for authorization and for the child run's RepoID, never
+		// re-deriving from a bare name.
+		TargetBaseURL: baseURL,
+		TargetRepoID:  auth.CanonicalRepoID(downstreamForgeHost(forgeKind, baseURL), targetRepo),
 		// The stable launch key is derived at record time so every launch
 		// of this link reuses the SAME child run ID.
 		StableChildID: downstreamStableKey(j.ID, targetRepo, targetRef),
@@ -253,15 +259,6 @@ func (s *Server) dispatchDownstream(ctx context.Context, item forge.OutboxItem) 
 	// The stable launch key: deterministic across replays and restarts.
 	stableKey := downstreamStableKey(p.ParentJobID, p.TargetRepo, p.TargetRef)
 	stableChildID := downstreamStableChildRunID(stableKey)
-	// Bilateral authorization: the TARGET repository's policy must consent
-	// to the dispatch. Without an allowlist entry for the target (default
-	// deny) the intent is refused with an audit event and dropped (a nil
-	// error acks the outbox item, removing it from the queue).
-	if !s.downstreamAllowed(ctx, p) {
-		s.metricAdd("kiwi_downstream_skips_total", 1, nil)
-		s.auditLocked("downstream.refused", "scheduler", p.ParentRunID, p.ParentJobID, "downstream dispatch refused: target policy does not allow this source repository", map[string]string{"target_repo": p.TargetRepo, "target_ref": p.TargetRef})
-		return nil
-	}
 	// The persisted link carries the forge identity coordinates; a replay
 	// that dropped the in-memory copy falls back to the payload.
 	link, ok, err := s.getDownstreamLink(ctx, p.ParentJobID, p.TargetRepo, p.TargetRef)
@@ -279,6 +276,25 @@ func (s *Server) dispatchDownstream(ctx context.Context, item forge.OutboxItem) 
 			forgeKind = link.TargetForge
 		}
 		baseURL = link.TargetBaseURL
+	}
+	// The target's canonical identity: the persisted RepoID when the link
+	// recorded one, otherwise derived from the target forge host. Bare
+	// target names are only the human-readable coordinate.
+	var targetRepoID string
+	if id := strings.TrimSpace(link.TargetRepoID); id != "" && id != strings.TrimSpace(p.TargetRepo) {
+		targetRepoID = id
+	} else {
+		targetRepoID = auth.CanonicalRepoID(downstreamForgeHost(forgeKind, baseURL), p.TargetRepo)
+	}
+	// Bilateral authorization: the TARGET repository's policy must consent
+	// to the dispatch. Without an allowlist entry for the target's canonical
+	// identity (or, as an explicitly configured alias, its bare name —
+	// default deny) the intent is refused with an audit event and dropped (a
+	// nil error acks the outbox item, removing it from the queue).
+	if !s.downstreamAllowed(ctx, p, targetRepoID) {
+		s.metricAdd("kiwi_downstream_skips_total", 1, nil)
+		s.auditLocked("downstream.refused", "scheduler", p.ParentRunID, p.ParentJobID, "downstream dispatch refused: target policy does not allow this source repository", map[string]string{"target_repo": targetRepoID, "target_ref": p.TargetRef})
+		return nil
 	}
 	// Reserve FIRST: the reservation is the exactly-once claim. Exactly one
 	// concurrent flusher wins; the others skip.
@@ -308,12 +324,13 @@ func (s *Server) dispatchDownstream(ctx context.Context, item forge.OutboxItem) 
 	// Trust ingress: the child inherits the parent's trust only when the
 	// target repository's policy explicitly grants trusted ingress; every
 	// other target receives an untrusted child.
-	trusted := p.Trusted && s.DownstreamTrustedIngress[p.TargetRepo]
+	trusted := p.Trusted && s.downstreamTrustedIngress(targetRepoID, p.TargetRepo)
 	// The child enqueue carries the downstream launch claim: the child run
 	// (ID = the stable child ID) and the link update commit atomically.
 	// A replayed dispatch whose link is already launched with the same
 	// stable ID returns the existing child run.
 	child, err := s.enqueueID(SubmitRun{
+		RepoID:       targetRepoID,
 		RepoURL:      downstreamCloneURL(forgeKind, baseURL, p.TargetRepo),
 		RepoFullName: p.TargetRepo,
 		Ref:          p.TargetRef,
@@ -357,14 +374,30 @@ func downstreamStableChildRunID(stableKey string) string {
 	return stableKey[:32]
 }
 
+// downstreamTrustedIngress resolves the trusted-ingress switch for a target:
+// the canonical RepoID key wins; a bare name in the map is an EXPLICIT
+// legacy alias.
+func (s *Server) downstreamTrustedIngress(targetRepoID, bare string) bool {
+	if v, ok := s.DownstreamTrustedIngress[targetRepoID]; ok {
+		return v
+	}
+	return s.DownstreamTrustedIngress[bare]
+}
+
 // downstreamAllowed enforces the target repository's policy consent for one
-// dispatch intent. A target without a DownstreamAllowlist entry refuses
-// every source (default deny); an entry with an empty/nil source list
-// allows any source; otherwise only the listed source repositories are
-// allowed. A parent run that cannot be resolved refuses the dispatch
-// (fail closed).
-func (s *Server) downstreamAllowed(ctx context.Context, p downstreamPayload) bool {
-	sources, ok := s.DownstreamAllowlist[p.TargetRepo]
+// dispatch intent. Allowlist keys are canonical repository IDs
+// ("<host>/<owner>/<name>"); a bare "owner/name" key is an EXPLICIT legacy
+// alias applying to every forge presenting that name. A target without an
+// entry refuses every source (default deny); an entry with an empty/nil
+// source list allows any source; otherwise only the listed source
+// repositories are allowed — compared by canonical identity, with a bare
+// source entry an explicit alias. A parent run that cannot be resolved
+// refuses the dispatch (fail closed).
+func (s *Server) downstreamAllowed(ctx context.Context, p downstreamPayload, targetRepoID string) bool {
+	sources, ok := s.DownstreamAllowlist[targetRepoID]
+	if !ok {
+		sources, ok = s.DownstreamAllowlist[p.TargetRepo]
+	}
 	if !ok {
 		return false
 	}
@@ -387,11 +420,18 @@ func (s *Server) downstreamAllowed(ctx context.Context, p downstreamPayload) boo
 		}
 		run = r
 	}
-	source := run.RepoFullName
-	if strings.TrimSpace(source) == "" {
-		source = run.Repo
+	source := repoIDForRun(run)
+	if source == "" {
+		source = strings.TrimSpace(run.RepoFullName)
 	}
-	return stringSliceContains(sources, source)
+	for _, allowed := range sources {
+		// Canonical identity first; a bare full name in the allowlist is an
+		// explicitly configured alias.
+		if allowed == source || (run.RepoFullName != "" && allowed == run.RepoFullName) {
+			return true
+		}
+	}
+	return false
 }
 
 // reserveDownstreamLaunch claims the link reservation through the store
@@ -570,17 +610,18 @@ func forgeKindForHost(host string) string {
 // persisted forge coordinates: the base URL override (self-hosted) wins,
 // otherwise the forge's public host.
 func downstreamCloneURL(forgeKind, baseURL, repo string) string {
-	if baseURL != "" {
-		return strings.TrimRight(baseURL, "/") + "/" + repo
+	return "https://" + downstreamForgeHost(forgeKind, baseURL) + "/" + repo
+}
+
+// downstreamForgeHost resolves the target forge host of a downstream child
+// from the persisted coordinates: the configured/self-hosted base URL host
+// wins, otherwise the forge's public host. The child run's RepoID derives
+// its host from here, so it is stable across replays.
+func downstreamForgeHost(forgeKind, baseURL string) string {
+	if h := repoHost(baseURL); h != "" {
+		return h
 	}
-	host := "github.com"
-	switch forgeKind {
-	case "gitlab":
-		host = "gitlab.com"
-	case "forgejo":
-		host = "codeberg.org"
-	}
-	return "https://" + host + "/" + repo
+	return publicForgeHost(forgeKind)
 }
 
 // refreshDownstreamParentsLocked re-aggregates every parent run that waits

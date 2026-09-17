@@ -33,14 +33,38 @@ Go 1.23 or later is required.
    existing one.
 2. Create a branch from `main`.
 3. Make the change, including tests where practical.
-4. Run the full gate suite locally:
+4. Run the CI gates locally. The Makefile targets mirror the Woodpecker
+   lanes one-to-one:
 
    ```bash
-   gofmt -l .
-   go vet ./...
-   go test ./...
-   go build ./...
+   test -z "$(gofmt -l .)"   # format gate
+   make lint           # go vet ./...
+   make test-unit      # go test ./...
+   make test-race      # go test -race -shuffle=on ./...
+   make test-adversarial
+   make fuzz           # 10s per fuzz target
+   make schema-check   # pipeline schema + FILE_MAP.md freshness
+   make cross
+   make docs-check
+   make license-check
+   make repro-build
+   make staticcheck    # staticcheck v0.8.1
+   make govulncheck    # govulncheck v1.8.0, needs network
+   make coverage       # writes coverage.out and prints the total
+   make coverage-floor # fails under KC_MIN_COVERAGE (default 60)
    ```
+
+   The real-PostgreSQL lane is env-gated: point it at any throwaway
+   database (each test creates and drops its own `kiwi_it_<random>`
+   schema) and run
+
+   ```bash
+   make integration    # KIWI_TEST_POSTGRES_URL must be set
+   ```
+
+   Without `KIWI_TEST_POSTGRES_URL` (and in `-short` mode) the
+   integration tests skip, so `make test-unit` stays hermetic. The CI
+   lane name is `integration-postgres` in `.woodpecker.yml`.
 
 5. If you changed Go files, run `go run ./cmd/filemap` and commit the
    regenerated `FILE_MAP.md`.

@@ -87,32 +87,34 @@ redeploying the old binary plus its data directory files.
 ## Dependency upgrade policy
 
 - Dependabot opens weekly pull requests for Go modules (`gomod`,
-  commit prefix `deps`) and GitHub Actions (`github-actions`, commit
-  prefix `ci`), capped at 5 open PRs per ecosystem
-  (`.github/dependabot.yml`). A full CI matrix runs on every
-  dependency PR; merge only when it is green.
-- CI tooling versions are pinned, not floating:
-  - `staticcheck` `honnef.co/go/tools/cmd/staticcheck@v0.6.1`
-    (staticcheck 2025.1.1): the latest release compatible with the
-    repository's Go 1.23 toolchain. Newer releases require Go 1.25+;
-    when the module's `go` directive is bumped, move the pin forward
-    in `.github/workflows/ci.yml` and re-run the baseline.
-  - `govulncheck` `golang.org/x/vuln/cmd/govulncheck@v1.1.4`: the
-    latest release compatible with Go 1.23, used both in CI and as a
-    release gate.
-  - Workflow actions are pinned to full commit SHAs; a tag move
-    cannot change what CI runs. When upgrading an action, resolve the
-    new tag to its commit SHA (`gh api repos/<owner>/<repo>/commits/<tag>`)
-    and update the tag→SHA comment next to the step.
-- Upgrading the Go toolchain (the `go` directive in `go.mod` and the
-  `go-version` inputs in the workflows) must happen before bumping
-  the staticcheck/govulncheck pins, and is a separate PR from
-  dependency bumps so bisection stays clean.
+  commit prefix `deps`), capped at 5 open PRs (`.github/dependabot.yml`).
+  A full CI pipeline runs on every dependency PR; merge only when it is
+  green. GitHub Actions are no longer used (CI runs on Woodpecker), so
+  there is no `github-actions` ecosystem to upgrade.
+- CI tooling versions are pinned in `.woodpecker.yml`, not floating:
+  - `staticcheck` `honnef.co/go/tools/cmd/staticcheck@v0.8.1`: bump the
+    pin in the `staticcheck` step when the toolchain moves forward and
+    re-run the pipeline baseline.
+  - `govulncheck` `golang.org/x/vuln/cmd/govulncheck@v1.8.0`: the
+    release gate; it needs network access to the vulnerability
+    database.
+  - All steps run in `golang:1.27` images with `GOTOOLCHAIN: local`, so
+    the pipeline toolchain is the module's `go` directive, not a
+    floating latest.
+  - Woodpecker pipeline syntax changes (`when`, `matrix`, `services`,
+    `depends_on`) are checked against the Woodpecker instance version;
+    the schema assumptions are documented in the `.woodpecker.yml`
+    header. The upstream JSON schema is a good pre-flight check.
+- Upgrading the Go toolchain (the `go` directive in `go.mod`) must
+  happen before bumping the staticcheck/govulncheck pins, and is a
+  separate PR from dependency bumps so bisection stays clean.
+- The real-PostgreSQL integration lane runs on a `postgres:16-alpine`
+  service container; bump the service image deliberately together with
+  a green `integration-postgres` run.
 - Docker base images are digest-pinned in the `Dockerfile`; re-resolve
   digests (`docker buildx imagetools inspect <image>`) whenever the
   image tag is bumped.
 - Release signing is mandatory: `scripts/release.sh` fails closed
   without `KIWI_RELEASE_SIGNING_KEY`. Unsigned releases are only
-  possible through an explicit `allow_unsigned` workflow dispatch
-  (`KIWI_ALLOW_UNSIGNED_RELEASE=1`) and must be treated as a
-  disaster-recovery exception, never the norm.
+  possible through an explicit `KIWI_ALLOW_UNSIGNED_RELEASE=1` and must
+  be treated as a disaster-recovery exception, never the norm.

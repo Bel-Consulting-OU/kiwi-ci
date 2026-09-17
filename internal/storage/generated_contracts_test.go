@@ -169,7 +169,7 @@ func TestMigration0007ScheduleIdentity(t *testing.T) {
 		}
 	}
 	stmts := migrations.SplitStatements(sql)
-	if len(stmts) != 1 {
-		t.Fatalf("0007 has %d statements, want exactly 1 (one migration = one statement batch, matching the 0001-0006 convention)", len(stmts))
+	if len(stmts) != 7 {
+		t.Fatalf("0007 has %d statements, want 7 (one statement per semicolon-terminated DDL: 5 ALTER + 2 CREATE INDEX)", len(stmts))
 	}
 }

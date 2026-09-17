@@ -41,11 +41,19 @@ type OPAPolicy struct {
 // caller does not supply them; slices are never nil so `input.secrets[_]`
 // style iteration is always safe. Policies must only reference these keys:
 //
-//	repository (string), trusted (bool), branch (string), event (string),
-//	runtime (string), secrets ([]string), audiences ([]string),
-//	environment (string), runner_labels ([]string), network (string)
+//	repository (string), repo_full_name (string), trusted (bool),
+//	branch (string), event (string), runtime (string), secrets ([]string),
+//	audiences ([]string), environment (string), runner_labels ([]string),
+//	network (string)
+//
+// Repository is the canonical repository identity
+// ("<host>/<owner>/<name>") — the coordinate every authorization decision
+// uses, so github.com/acme/backend and gitlab.company.com/acme/backend are
+// distinct inputs. RepoFullName (additive) is the human-readable
+// owner/name and must not be used for identity decisions.
 type OPAInput struct {
 	Repository   string
+	RepoFullName string
 	Trusted      bool
 	Branch       string
 	Event        string
@@ -70,16 +78,17 @@ type OPADecision struct {
 // would silently never match (a fail-open hazard), so LoadOPAPolicy rejects
 // it at startup instead.
 var opaInputFields = map[string]bool{
-	"repository":    true,
-	"trusted":       true,
-	"branch":        true,
-	"event":         true,
-	"runtime":       true,
-	"secrets":       true,
-	"audiences":     true,
-	"environment":   true,
-	"runner_labels": true,
-	"network":       true,
+	"repository":     true,
+	"repo_full_name": true,
+	"trusted":        true,
+	"branch":         true,
+	"event":          true,
+	"runtime":        true,
+	"secrets":        true,
+	"audiences":      true,
+	"environment":    true,
+	"runner_labels":  true,
+	"network":        true,
 }
 
 // LoadOPAPolicy parses and compiles regoSrc into a prepared query and
@@ -228,16 +237,17 @@ func denyReason(entry any) string {
 // they are never nil and never null.
 func (in OPAInput) asMap() map[string]any {
 	return map[string]any{
-		"repository":    in.Repository,
-		"trusted":       in.Trusted,
-		"branch":        in.Branch,
-		"event":         in.Event,
-		"runtime":       in.Runtime,
-		"secrets":       anyStrings(in.Secrets),
-		"audiences":     anyStrings(in.Audiences),
-		"environment":   in.Environment,
-		"runner_labels": anyStrings(in.RunnerLabels),
-		"network":       in.Network,
+		"repository":     in.Repository,
+		"repo_full_name": in.RepoFullName,
+		"trusted":        in.Trusted,
+		"branch":         in.Branch,
+		"event":          in.Event,
+		"runtime":        in.Runtime,
+		"secrets":        anyStrings(in.Secrets),
+		"audiences":      anyStrings(in.Audiences),
+		"environment":    in.Environment,
+		"runner_labels":  anyStrings(in.RunnerLabels),
+		"network":        in.Network,
 	}
 }
 

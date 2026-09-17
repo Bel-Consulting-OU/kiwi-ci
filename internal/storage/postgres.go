@@ -3,6 +3,8 @@ package storage
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,7 +15,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
@@ -256,19 +257,19 @@ func (rs *runnerScanner) runner() (model.Runner, error) {
 // quota reservation counters
 // ---------------------------------------------------------------------------
 
-// quotaKeys derives the reservation counter keys for one repository URL: the
-// repository key is the URL itself and the team key is the host plus the
-// first path segment, mirroring the server's team derivation. Deduplicated
-// when both keys coincide.
-func quotaKeys(repoURL string) []string {
-	return QuotaKeys(repoURL)
+// quotaKeys derives the reservation counter keys for one canonical
+// repository identity (legacy URL inputs derive the same pair), mirroring
+// the server's team derivation. Deduplicated when both keys coincide.
+func quotaKeys(repoID string) []string {
+	return QuotaKeys(repoID)
 }
 
 // adjustQuotaTx shifts the reserved running/queued counters for one
-// repository URL inside a transaction. Counters clamp at zero; a missing
-// reservation row (job predates quota accounting) is tolerated.
-func (s *PostgresStore) adjustQuotaTx(ctx context.Context, tx pgx.Tx, repoURL string, runningDelta, queuedDelta int) error {
-	for _, key := range quotaKeys(repoURL) {
+// canonical repository identity inside a transaction. Counters clamp at
+// zero; a missing reservation row (job predates quota accounting) is
+// tolerated.
+func (s *PostgresStore) adjustQuotaTx(ctx context.Context, tx pgx.Tx, repoID string, runningDelta, queuedDelta int) error {
+	for _, key := range quotaKeys(repoID) {
 		if _, err := tx.Exec(ctx, `UPDATE quota_reservations SET running = GREATEST(running + $2, 0), queued = GREATEST(queued + $3, 0), updated_at = now() WHERE key = $1`, key, runningDelta, queuedDelta); err != nil {
 			return err
 		}
@@ -329,9 +330,15 @@ func (s *PostgresStore) reserveQuotaTx(ctx context.Context, tx pgx.Tx, q *QuotaR
 
 // InsertCompiledRun implements the atomic enqueue: one transaction inserts
 // the run, every job, the dependency edges, the artifact contracts, cancels
-// the superseded jobs with audit rows, and claims the delivery/quota/
-// schedule/downstream-launch reservations. Any failure rolls everything
-// back.
+// the superseded jobs and runs with audit rows and dependent recomputation,
+// and claims the delivery/quota/schedule/downstream-launch reservations. Any
+// failure rolls everything back.
+//
+// Concurrency-group supersession is resolved INSIDE the transaction: when
+// req.Supersede names a (repository, concurrency group) pair, the conflicting
+// non-terminal runs are selected under a per-key advisory lock, so
+// concurrent superseding enqueues serialize: the last committed run wins and
+// every earlier one is cancelled in the same commit that publishes it.
 func (s *PostgresStore) InsertCompiledRun(ctx context.Context, req InsertCompiledRunRequest) error {
 	if err := ValidateRunID(req.Run.ID); err != nil {
 		return err
@@ -362,11 +369,13 @@ func (s *PostgresStore) InsertCompiledRun(ctx context.Context, req InsertCompile
 		if err := ValidateRunID(j.RunID); err != nil {
 			return err
 		}
+		j.Needs = effectiveNeeds(id, j, req.Deps)
 		if err := s.insertJobRowTx(ctx, tx, j); err != nil {
 			return err
 		}
 	}
-	for _, j := range req.Jobs {
+	for id, j := range req.Jobs {
+		j.Needs = effectiveNeeds(id, j, req.Deps)
 		if err := s.replaceDependenciesTx(ctx, tx, j); err != nil {
 			return err
 		}
@@ -380,6 +389,15 @@ func (s *PostgresStore) InsertCompiledRun(ctx context.Context, req InsertCompile
 			return err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE jobs SET payload = jsonb_set(payload, '{artifact_contracts}', $2::jsonb, true) WHERE id=$1`, id, cp); err != nil {
+			return err
+		}
+	}
+	if req.Supersede != nil {
+		superseded, err := s.supersededJobIDsTx(ctx, tx, req.Supersede, req.Run.ID)
+		if err != nil {
+			return err
+		}
+		if err := s.cancelSupersededTx(ctx, tx, superseded, req.Run.ID); err != nil {
 			return err
 		}
 	}
@@ -402,6 +420,81 @@ func (s *PostgresStore) InsertCompiledRun(ctx context.Context, req InsertCompile
 	return tx.Commit(ctx)
 }
 
+// advisoryLockKey derives a stable 64-bit PostgreSQL advisory-lock key for a
+// logical resource: sha256 over the kind and the parts, each prefixed with a
+// NUL separator, truncated to the first 8 digest bytes in big-endian order.
+// The NULs only ever live inside the HASH INPUT, so the value bound to SQL is
+// a plain int64: records or group names containing arbitrary bytes (including
+// NUL, which the server rejects as text with SQLSTATE 22021) still serialize
+// on a well-defined key. Distinct (kind, parts) tuples collide only with
+// probability ~2^-64.
+func advisoryLockKey(kind string, parts ...string) int64 {
+	h := sha256.New()
+	h.Write([]byte(kind))
+	for _, p := range parts {
+		h.Write([]byte{0})
+		h.Write([]byte(p))
+	}
+	sum := h.Sum(nil)
+	return int64(binary.BigEndian.Uint64(sum[:8]))
+}
+
+// supersededJobIDsTx resolves the supersede policy to the concrete
+// non-terminal job IDs of every conflicting run. The per-(repository,
+// concurrency group) advisory transaction lock is taken FIRST, so
+// concurrent superseding enqueues of one group serialize: a transaction
+// entering the section only sees runs whose insert already committed, and
+// its cancellation commits atomically with its own run. The new run is
+// excluded by ID (its jobs must never be cancelled by its own enqueue).
+func (s *PostgresStore) supersededJobIDsTx(ctx context.Context, tx pgx.Tx, p *SupersedePolicy, newRunID string) ([]string, error) {
+	repo := strings.TrimSpace(p.Repo)
+	group := strings.TrimSpace(p.ConcurrencyGroup)
+	if repo == "" || group == "" {
+		return nil, nil
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, advisoryLockKey("kiwi-supersede", repo, group)); err != nil {
+		return nil, err
+	}
+	rows, err := tx.Query(ctx, `SELECT id FROM runs WHERE id<>$3 AND payload->>'repo'=$1 AND payload->>'concurrency_group'=$2 AND NOT (status IN ('success', 'failure', 'cancelled', 'skipped', 'blocked')) ORDER BY created_at ASC, id ASC`,
+		repo, group, newRunID)
+	if err != nil {
+		return nil, err
+	}
+	runIDs := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		runIDs = append(runIDs, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	jobIDs := []string{}
+	for _, runID := range runIDs {
+		jrows, err := tx.Query(ctx, `SELECT id FROM jobs WHERE run_id=$1 AND NOT (status IN ('success', 'failure', 'cancelled', 'skipped', 'blocked')) ORDER BY id ASC`, runID)
+		if err != nil {
+			return nil, err
+		}
+		for jrows.Next() {
+			var id string
+			if err := jrows.Scan(&id); err != nil {
+				jrows.Close()
+				return nil, err
+			}
+			jobIDs = append(jobIDs, id)
+		}
+		jrows.Close()
+		if err := jrows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return jobIDs, nil
+}
+
 // insertRunTx inserts the run row inside an open transaction.
 func (s *PostgresStore) insertRunTx(ctx context.Context, tx pgx.Tx, run model.Run) error {
 	payload, err := json.Marshal(run)
@@ -414,20 +507,28 @@ func (s *PostgresStore) insertRunTx(ctx context.Context, tx pgx.Tx, run model.Ru
 }
 
 // cancelSupersededTx cancels the superseded jobs (concurrency-group
-// cancel-in-progress) with audit rows, inside the enqueue transaction.
+// cancel-in-progress) with audit rows, inside the enqueue transaction. Every
+// cancelled job's dependents are re-evaluated in the same transaction
+// (blocked when their condition does not allow the cancelled outcome,
+// mirroring the in-memory cancel-then-schedule pass), and the superseded
+// runs themselves are marked cancelled in the same commit, so supersession
+// is never observable as "jobs cancelled but run still active".
 func (s *PostgresStore) cancelSupersededTx(ctx context.Context, tx pgx.Tx, jobIDs []string, newRunID string) error {
 	now := time.Now().UTC()
+	cancelledRuns := map[string]struct{}{}
+	cancelled := make([]string, 0, len(jobIDs))
 	for _, id := range jobIDs {
 		if err := ValidateJobID(id); err != nil {
 			return err
 		}
 		var (
-			payload []byte
-			status  string
-			runID   string
-			key     string
+			payload       []byte
+			status        string
+			runID         string
+			key           string
+			leaseRunnerID string
 		)
-		err := tx.QueryRow(ctx, `SELECT payload, status, run_id, key FROM jobs WHERE id=$1 FOR UPDATE`, id).Scan(&payload, &status, &runID, &key)
+		err := tx.QueryRow(ctx, `SELECT payload, status, run_id, key, COALESCE(lease_runner_id, '') FROM jobs WHERE id=$1 FOR UPDATE`, id).Scan(&payload, &status, &runID, &key, &leaseRunnerID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			continue
 		}
@@ -443,7 +544,15 @@ func (s *PostgresStore) cancelSupersededTx(ctx context.Context, tx pgx.Tx, jobID
 		}
 		reason := "superseded by run " + newRunID
 		wasRunning := model.Status(status) == model.StatusRunning
-		runnerID := j.LeaseRunnerID
+		// The lease_runner_id COLUMN is authoritative (the same source
+		// CompleteJob, CancelRunJobs and ListJobsByRunner read); the payload
+		// copy is only a legacy fallback for rows written before the column
+		// existed, since the lease paths update the column without rewriting
+		// the payload.
+		runnerID := leaseRunnerID
+		if runnerID == "" {
+			runnerID = j.LeaseRunnerID
+		}
 		j.Status = model.StatusCancelled
 		j.Error = reason
 		j.FinishedAt = &now
@@ -477,16 +586,68 @@ func (s *PostgresStore) cancelSupersededTx(ctx context.Context, tx pgx.Tx, jobID
 		}
 		// The cancelled job releases its quota slot (running or queued).
 		if wasRunning {
-			if err := s.adjustQuotaTx(ctx, tx, j.RepoURL, -1, 0); err != nil {
+			if err := s.adjustQuotaTx(ctx, tx, RepoIDForJob(j), -1, 0); err != nil {
 				return err
 			}
 		} else {
-			if err := s.adjustQuotaTx(ctx, tx, j.RepoURL, 0, -1); err != nil {
+			if err := s.adjustQuotaTx(ctx, tx, RepoIDForJob(j), 0, -1); err != nil {
 				return err
 			}
 		}
+		cancelled = append(cancelled, id)
+		if runID != "" {
+			cancelledRuns[runID] = struct{}{}
+		}
+	}
+	// Dependents recomputed per existing cancel semantics: a queued job
+	// needing a superseded job is re-evaluated against the fresh outcome
+	// and blocked when its condition does not allow it.
+	for _, id := range cancelled {
+		if err := s.recomputeDependentsTx(ctx, tx, id, now); err != nil {
+			return err
+		}
+	}
+	// The superseded run rows are cancelled in the same commit (mirroring
+	// CancelRunJobs), so a superseded run is never left non-terminal while
+	// all of its jobs are cancelled.
+	for runID := range cancelledRuns {
+		if err := s.cancelSupersededRunTx(ctx, tx, runID, now); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// cancelSupersededRunTx marks one superseded run cancelled inside the
+// caller's transaction, preserving its existing start time. A missing or
+// already-terminal run row is tolerated.
+func (s *PostgresStore) cancelSupersededRunTx(ctx context.Context, tx pgx.Tx, runID string, now time.Time) error {
+	var (
+		payload []byte
+		status  string
+	)
+	err := tx.QueryRow(ctx, `SELECT payload, status FROM runs WHERE id=$1 FOR UPDATE`, runID).Scan(&payload, &status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if model.Status(status).Terminal() {
+		return nil
+	}
+	var run model.Run
+	if err := json.Unmarshal(payload, &run); err != nil {
+		return err
+	}
+	run.Status = model.StatusCancelled
+	run.FinishedAt = &now
+	rp, err := json.Marshal(run)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `UPDATE runs SET status=$2, finished_at=$3, payload=$4 WHERE id=$1`, runID, string(model.StatusCancelled), now, rp)
+	return err
 }
 
 // insertWebhookClaimTx inserts the delivery-dedupe claim with ON CONFLICT
@@ -986,8 +1147,8 @@ func profileAllowsCandidate(p model.RunnerProfile, jobRuntime, canonRepoID, repo
 // row is below the configured concurrency limit (limit <= 0 means
 // unlimited), so a concurrent claim can never push running over the limit.
 // Zero matched rows rolls the caller's lease back with ErrQuotaExceeded.
-func (s *PostgresStore) claimQuotaTx(ctx context.Context, tx pgx.Tx, repoURL string, repoLimit, teamLimit float64) error {
-	keys := quotaKeys(repoURL)
+func (s *PostgresStore) claimQuotaTx(ctx context.Context, tx pgx.Tx, repoID string, repoLimit, teamLimit float64) error {
+	keys := quotaKeys(repoID)
 	for i, key := range keys {
 		limit := repoLimit
 		reason, scope := "REPO_QUOTA", "repository"
@@ -1067,7 +1228,7 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 	// (repo, environment) key, and the running count is read after taking
 	// the lock, so two polls can never both win the last slot.
 	if envKey := claim.EnvKey(); envKey != "" && claim.EnvironmentConcurrency > 0 {
-		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "kiwi-env\x00"+envKey); err != nil {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, advisoryLockKey("kiwi-env", envKey)); err != nil {
 			return model.Job{}, err
 		}
 		var running int
@@ -1147,7 +1308,7 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 	j.PowerWatts = powerWatts
 
 	// Step 6: conditional queued -> running quota transition.
-	if err := s.claimQuotaTx(ctx, tx, j.RepoURL, claim.RepoConcurrency, claim.TeamConcurrency); err != nil {
+	if err := s.claimQuotaTx(ctx, tx, RepoIDForJob(j), claim.RepoConcurrency, claim.TeamConcurrency); err != nil {
 		return model.Job{}, err
 	}
 
@@ -1324,7 +1485,7 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 		return err
 	}
 	// The completed job releases its reserved running slot.
-	if err := s.adjustQuotaTx(ctx, tx, j.RepoURL, -1, 0); err != nil {
+	if err := s.adjustQuotaTx(ctx, tx, RepoIDForJob(j), -1, 0); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO completion_receipts (job_id, generation, runner_id, result_hash) VALUES ($1, $2, $3, $4) ON CONFLICT (job_id, generation, runner_id) DO NOTHING`,
@@ -1793,7 +1954,7 @@ func (s *PostgresStore) CancelRunJobs(ctx context.Context, runID string, reason 
 		}
 		// The cancelled job releases its reserved slot (running or queued).
 		if t.wasRunning {
-			if err := s.adjustQuotaTx(ctx, tx, j.RepoURL, -1, 0); err != nil {
+			if err := s.adjustQuotaTx(ctx, tx, RepoIDForJob(j), -1, 0); err != nil {
 				return nil, err
 			}
 			// A running job also held a runner capacity slot: splice it out
@@ -1804,7 +1965,7 @@ func (s *PostgresStore) CancelRunJobs(ctx context.Context, runID string, reason 
 				}
 			}
 		} else {
-			if err := s.adjustQuotaTx(ctx, tx, j.RepoURL, 0, -1); err != nil {
+			if err := s.adjustQuotaTx(ctx, tx, RepoIDForJob(j), 0, -1); err != nil {
 				return nil, err
 			}
 		}
@@ -1993,10 +2154,12 @@ func (s *PostgresStore) ReleaseRunnerJob(ctx context.Context, runnerID, jobID st
 // when the job was requeued. A missing job row is tolerated.
 func (s *PostgresStore) releaseJobQuotaTx(ctx context.Context, tx pgx.Tx, jobID string) error {
 	var (
-		jobStatus string
-		jobRepo   string
+		jobStatus   string
+		jobRepoID   string
+		jobRepoURL  string
+		jobFullName string
 	)
-	if err := tx.QueryRow(ctx, `SELECT status, COALESCE(payload->>'repo_url', '') FROM jobs WHERE id=$1`, jobID).Scan(&jobStatus, &jobRepo); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT status, COALESCE(payload->>'repo_id', ''), COALESCE(payload->>'repo_url', ''), COALESCE(payload->>'repo_full_name', '') FROM jobs WHERE id=$1`, jobID).Scan(&jobStatus, &jobRepoID, &jobRepoURL, &jobFullName); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
@@ -2006,7 +2169,7 @@ func (s *PostgresStore) releaseJobQuotaTx(ctx context.Context, tx pgx.Tx, jobID 
 	if model.Status(jobStatus) == model.StatusQueued {
 		queuedDelta = 1
 	}
-	return s.adjustQuotaTx(ctx, tx, jobRepo, -1, queuedDelta)
+	return s.adjustQuotaTx(ctx, tx, RepoIDFor(jobRepoID, jobRepoURL, jobFullName), -1, queuedDelta)
 }
 
 // releaseRunnerSlotTx splices one job ID out of a runner's active_jobs set
@@ -3228,6 +3391,81 @@ func (s *PostgresStore) SetArtifactSidecars(ctx context.Context, id, sbomPath, s
 	return tx.Commit(ctx)
 }
 
+// ---------------------------------------------------------------------------
+// pending artifact sidecars (migration 0012)
+// ---------------------------------------------------------------------------
+
+// RememberPendingSidecar upserts the pending sidecar digest for
+// (job, artifact, kind): a re-upload of the same kind replaces the digest
+// and refreshes created_at, so the payload gate always resolves the latest
+// bytes. The row is durable and shared, so any replica can resolve it.
+func (s *PostgresStore) RememberPendingSidecar(ctx context.Context, jobID, artifactName, kind, digest string) error {
+	if err := validatePendingSidecarKey(jobID, artifactName, kind); err != nil {
+		return err
+	}
+	if err := validatePendingSidecarDigest(digest); err != nil {
+		return err
+	}
+	_, err := s.pool.Exec(ctx, `INSERT INTO artifact_pending_sidecars (job_id, artifact_name, kind, digest) VALUES ($1, $2, $3, $4)
+		ON CONFLICT (job_id, artifact_name, kind) DO UPDATE SET digest = EXCLUDED.digest, created_at = now()`,
+		jobID, artifactName, kind, digest)
+	return err
+}
+
+// PendingSidecar resolves the pending sidecar digest uploaded for the job's
+// artifact, or ok=false when no row exists (the gate then fails closed).
+func (s *PostgresStore) PendingSidecar(ctx context.Context, jobID, artifactName, kind string) (string, bool, error) {
+	if err := validatePendingSidecarKey(jobID, artifactName, kind); err != nil {
+		return "", false, err
+	}
+	var digest string
+	err := s.pool.QueryRow(ctx, `SELECT digest FROM artifact_pending_sidecars WHERE job_id=$1 AND artifact_name=$2 AND kind=$3`, jobID, artifactName, kind).Scan(&digest)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return digest, true, nil
+}
+
+// ConsumePendingSidecar deletes the pending row for (job, artifact, kind)
+// only while it still carries the consumed digest: a concurrent re-upload
+// with a newer digest survives the stale consumer.
+func (s *PostgresStore) ConsumePendingSidecar(ctx context.Context, jobID, artifactName, kind, digest string) error {
+	if err := validatePendingSidecarKey(jobID, artifactName, kind); err != nil {
+		return err
+	}
+	if err := validatePendingSidecarDigest(digest); err != nil {
+		return err
+	}
+	_, err := s.pool.Exec(ctx, `DELETE FROM artifact_pending_sidecars WHERE job_id=$1 AND artifact_name=$2 AND kind=$3 AND digest=$4`,
+		jobID, artifactName, kind, digest)
+	return err
+}
+
+// DeletePendingSidecars clears every leftover pending row for the job after
+// one of its artifact records committed: rows not consumed by the record
+// are expendable (the digests either ride the durable record or were never
+// attached).
+func (s *PostgresStore) DeletePendingSidecars(ctx context.Context, jobID string) error {
+	if err := ValidateJobID(jobID); err != nil {
+		return err
+	}
+	_, err := s.pool.Exec(ctx, `DELETE FROM artifact_pending_sidecars WHERE job_id=$1`, jobID)
+	return err
+}
+
+// PrunePendingSidecars deletes pending rows created before the cutoff and
+// reports how many were removed. It never touches CAS blobs.
+func (s *PostgresStore) PrunePendingSidecars(ctx context.Context, olderThan time.Time) (int, error) {
+	ct, err := s.pool.Exec(ctx, `DELETE FROM artifact_pending_sidecars WHERE created_at < $1`, olderThan)
+	if err != nil {
+		return 0, err
+	}
+	return int(ct.RowsAffected()), nil
+}
+
 // AppendDownstreamRun appends childRunID to the parent run's downstream_runs
 // payload key exactly once (idempotent): the row is locked FOR UPDATE and
 // the append is skipped when the ID is already present.
@@ -3408,11 +3646,18 @@ func (s *PostgresStore) applyMigration(ctx context.Context, m migrations.Migrati
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('kiwi_schema_migrations'))`); err != nil {
 		return err
 	}
+	// schema_migrations may not exist yet (fresh schema, migration 0001).
+	// Resolve the table with to_regclass BEFORE touching it: a plain EXISTS
+	// probe would raise undefined_table (42P01) inside this transaction,
+	// aborting it (25P02) and making Migrate unable to bootstrap a fresh
+	// database. to_regclass answers "present?" without an error.
+	var haveTable bool
+	if err := tx.QueryRow(ctx, `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&haveTable); err != nil {
+		return err
+	}
 	applied := false
-	err = tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version=$1)`, m.Version).Scan(&applied)
-	if err != nil {
-		// Before migration 1 the schema_migrations table does not exist yet.
-		if !isUndefinedTable(err) {
+	if haveTable {
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version=$1)`, m.Version).Scan(&applied); err != nil {
 			return err
 		}
 	}
@@ -3428,11 +3673,6 @@ func (s *PostgresStore) applyMigration(ctx context.Context, m migrations.Migrati
 		return err
 	}
 	return tx.Commit(ctx)
-}
-
-func isUndefinedTable(err error) bool {
-	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "42P01"
 }
 
 func (s *PostgresStore) SchemaVersion(ctx context.Context) (int, error) {

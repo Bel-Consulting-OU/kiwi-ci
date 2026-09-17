@@ -55,35 +55,46 @@ func satAddF(a, b float64) float64 {
 // self-contained.
 func (s *Server) admitQuotaLocked(run model.Run, jobCount int) error {
 	repoRunning, repoQueued, teamRunning, teamQueued := s.quotaCountsLocked(run)
+	repoID := repoIDForRun(run)
+	team := repoTeamKey(repoID)
 	newQueued := float64(jobCount)
 	l := s.QuotaLimits
 	switch {
 	case l.RepoConcurrency > 0 && float64(repoRunning) >= l.RepoConcurrency:
-		return quotaDenied("REPO_QUOTA", fmt.Sprintf("repository %s already has %d running job(s), concurrency limit %g", run.Repo, repoRunning, l.RepoConcurrency))
+		return quotaDenied("REPO_QUOTA", fmt.Sprintf("repository %s already has %d running job(s), concurrency limit %g", repoID, repoRunning, l.RepoConcurrency))
 	case l.TeamConcurrency > 0 && float64(teamRunning) >= l.TeamConcurrency:
-		return quotaDenied("TEAM_QUOTA", fmt.Sprintf("team %s already has %d running job(s), concurrency limit %g", repoURLTeam(run.Repo), teamRunning, l.TeamConcurrency))
+		return quotaDenied("TEAM_QUOTA", fmt.Sprintf("team %s already has %d running job(s), concurrency limit %g", team, teamRunning, l.TeamConcurrency))
 	case l.RepoQueueDepth > 0 && satAddF(float64(repoQueued), newQueued) > l.RepoQueueDepth:
-		return quotaDenied("REPO_QUOTA", fmt.Sprintf("repository %s queue depth would reach %d, limit %g", run.Repo, repoQueued+jobCount, l.RepoQueueDepth))
+		return quotaDenied("REPO_QUOTA", fmt.Sprintf("repository %s queue depth would reach %d, limit %g", repoID, repoQueued+jobCount, l.RepoQueueDepth))
 	case l.TeamQueueDepth > 0 && satAddF(float64(teamQueued), newQueued) > l.TeamQueueDepth:
-		return quotaDenied("TEAM_QUOTA", fmt.Sprintf("team %s queue depth would reach %d, limit %g", repoURLTeam(run.Repo), teamQueued+jobCount, l.TeamQueueDepth))
+		return quotaDenied("TEAM_QUOTA", fmt.Sprintf("team %s queue depth would reach %d, limit %g", team, teamQueued+jobCount, l.TeamQueueDepth))
 	}
 	return nil
 }
 
 // quotaCountsLocked computes the current repo/team running and queued job
-// counts for a run's repository URL. The memory-mode caller holds s.mu; the
-// DB-mode branch queries the SQL store.
+// counts for a run's canonical repository identity. Jobs are matched by
+// their own canonical RepoID (derived for legacy payloads), so
+// github.com/acme/backend and gitlab.company.com/acme/backend never share a
+// count. The memory-mode caller holds s.mu; the DB-mode branch queries the
+// SQL store.
 func (s *Server) quotaCountsLocked(run model.Run) (repoRunning, repoQueued, teamRunning, teamQueued int) {
-	team := repoURLTeam(run.Repo)
+	repoID := repoIDForRun(run)
+	team := repoTeamKey(repoID)
+	count := func(j model.Job) (repo, teamKey string) {
+		repo = repoIDForJob(j)
+		return repo, repoTeamKey(repo)
+	}
 	if s.DB != nil {
 		ctx := context.Background()
 		queued, err := s.DB.ListQueuedJobs(ctx)
 		if err == nil {
 			for _, j := range queued {
-				if j.RepoURL == run.Repo {
+				repo, teamKey := count(j)
+				if repo == repoID {
 					repoQueued++
 				}
-				if repoURLTeam(j.RepoURL) == team {
+				if teamKey == team {
 					teamQueued++
 				}
 			}
@@ -104,10 +115,11 @@ func (s *Server) quotaCountsLocked(run model.Run) (repoRunning, repoQueued, team
 				if j.Status != model.StatusRunning {
 					continue
 				}
-				if j.RepoURL == run.Repo {
+				repo, teamKey := count(j)
+				if repo == repoID {
 					repoRunning++
 				}
-				if repoURLTeam(j.RepoURL) == team {
+				if teamKey == team {
 					teamRunning++
 				}
 			}
@@ -117,17 +129,19 @@ func (s *Server) quotaCountsLocked(run model.Run) (repoRunning, repoQueued, team
 	for _, j := range s.jobs {
 		switch j.Status {
 		case model.StatusRunning:
-			if j.RepoURL == run.Repo {
+			repo, teamKey := count(j)
+			if repo == repoID {
 				repoRunning++
 			}
-			if repoURLTeam(j.RepoURL) == team {
+			if teamKey == team {
 				teamRunning++
 			}
 		case model.StatusQueued:
-			if j.RepoURL == run.Repo {
+			repo, teamKey := count(j)
+			if repo == repoID {
 				repoQueued++
 			}
-			if repoURLTeam(j.RepoURL) == team {
+			if teamKey == team {
 				teamQueued++
 			}
 		}

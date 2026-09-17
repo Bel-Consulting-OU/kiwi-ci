@@ -30,25 +30,25 @@ CREATE TABLE runner_profiles (
     cost_per_hour DOUBLE PRECISION NOT NULL DEFAULT 0,
     power_watts DOUBLE PRECISION NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-)
+);
 
 CREATE TABLE cert_profile_links (
     serial TEXT NOT NULL PRIMARY KEY,
     profile_id TEXT NOT NULL
-)
+);
 
 CREATE TABLE runner_bearer_tokens (
     runner_id TEXT NOT NULL PRIMARY KEY,
     token_digest TEXT NOT NULL UNIQUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-)
+);
 
 CREATE TABLE cert_revocations (
     serial TEXT NOT NULL PRIMARY KEY,
     revoked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     reason TEXT NOT NULL DEFAULT '',
     runner_id TEXT NOT NULL DEFAULT ''
-)
+);
 
 CREATE TABLE enrollment_grants (
     digest TEXT NOT NULL PRIMARY KEY,
@@ -56,4 +56,4 @@ CREATE TABLE enrollment_grants (
     bound_labels JSONB NOT NULL DEFAULT '[]',
     consumed_at TIMESTAMPTZ,
     consumed_by TEXT
-)
+);

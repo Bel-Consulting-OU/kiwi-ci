@@ -5,6 +5,16 @@
 // hashes while streaming and fails at EOF when the content does not match
 // the requested digest. cas is the digest-verified layer; the underlying
 // blob stores trust their object keys.
+//
+// Lifecycle: CAS writes are append/deduplicate only. Put never mutates,
+// overwrites or reuses an object: a digest names a fixed byte sequence, so
+// writing an object that already exists is an idempotent re-put of identical
+// content. A failed Put or a failed metadata/commit step therefore leaves at
+// most an unreferenced object, never a missing or corrupted one. Callers must
+// not delete as rollback after a metadata/persistence failure: the object may
+// be shared by other references and deleting it would corrupt them. Deletion
+// happens only through the reference-aware garbage collector of the storage
+// layer, which knows when the last reference is gone.
 package cas
 
 import (
@@ -112,6 +122,11 @@ func (c *CAS) Open(ctx context.Context, sha256hex string) (io.ReadCloser, blob.O
 	return &verifyingReader{r: rc, h: sha256.New(), want: sha256hex}, obj, nil
 }
 
+// Delete removes one object unconditionally. It is not part of the write
+// lifecycle: never call it to roll back a failed Put or a failed commit of
+// metadata that names the object, because the digest may be shared by other
+// references (see the package doc). Reclaiming unreferenced objects is the
+// reference-aware garbage collector's job.
 func (c *CAS) Delete(ctx context.Context, sha256hex string) error {
 	return c.Blobs.Delete(ctx, sha256hex)
 }

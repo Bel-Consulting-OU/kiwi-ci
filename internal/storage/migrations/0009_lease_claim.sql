@@ -9,7 +9,7 @@
 --
 -- The jobs environment index backs the in-transaction environment
 -- concurrency count (payload->>'repo_url' + payload->>'environment' for
--- running jobs); the cert_profile_links index backs the live profile
+-- running jobs), the cert_profile_links index backs the live profile
 -- resolution used by the claim predicates.
 
 ALTER TABLE runners ADD COLUMN IF NOT EXISTS disabled BOOLEAN NOT NULL DEFAULT FALSE;

@@ -108,7 +108,7 @@ func TestMemStoreConcurrentLeaseSingleJobEightPollers(t *testing.T) {
 	if err := m.UpsertRunner(ctx(), model.Runner{ID: leaseRunner, Capacity: 1, CostPerHour: 4.5, PowerWatts: 12}); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.AdjustQuotaCounter(ctx(), leaseRepo, "", 0, 1); err != nil {
+	if err := m.AdjustQuotaCounter(ctx(), leaseRepoID, "", 0, 1); err != nil {
 		t.Fatal(err)
 	}
 	const pollers = 8
@@ -170,7 +170,7 @@ func TestMemStoreConcurrentLeaseSingleJobEightPollers(t *testing.T) {
 	if len(ri.ActiveJobs) != 1 || ri.ActiveJobs[0] != leaseJobID || !ri.Busy {
 		t.Fatalf("runner after race = active=%v busy=%v", ri.ActiveJobs, ri.Busy)
 	}
-	running, queued, _ := m.QuotaCounts(ctx(), leaseRepo, "")
+	running, queued, _ := m.QuotaCounts(ctx(), leaseRepoID, "")
 	if running != 1 || queued != 0 {
 		t.Fatalf("quota after race = %d/%d, want 1/0", running, queued)
 	}
@@ -219,13 +219,14 @@ func TestMemStoreEnvironmentConcurrencyRepoScoped(t *testing.T) {
 func TestMemStoreQuotaQueuedRunningLifecycle(t *testing.T) {
 	m := newMemStore()
 	repo := "https://github.com/o/r.git"
+	repoID := RepoIDFor("", repo, "o/r")
 	team := "github.com/o"
 	const queuedJobs = 3
 	ids := []string{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaf", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"}
 	for i, id := range ids {
 		req := compiledRunRequest(id, id, repo)
 		req.Run.ID = id
-		req.Quota = &QuotaReservation{RepoKey: repo, TeamKey: team, JobCount: 1}
+		req.Quota = &QuotaReservation{RepoKey: repoID, TeamKey: team, JobCount: 1}
 		// One job per run so cancel targets exactly one job.
 		job := req.Jobs[id]
 		job.RunID = id
@@ -237,7 +238,7 @@ func TestMemStoreQuotaQueuedRunningLifecycle(t *testing.T) {
 	if err := m.UpsertRunner(ctx(), model.Runner{ID: leaseRunner, Capacity: 2}); err != nil {
 		t.Fatal(err)
 	}
-	running, queued, _ := m.QuotaCounts(ctx(), repo, "")
+	running, queued, _ := m.QuotaCounts(ctx(), repoID, "")
 	if running != 0 || queued != queuedJobs {
 		t.Fatalf("after enqueues = %d/%d, want 0/%d", running, queued, queuedJobs)
 	}
@@ -247,7 +248,7 @@ func TestMemStoreQuotaQueuedRunningLifecycle(t *testing.T) {
 	if _, err := m.AcquireLeaseAtomic(ctx(), claim); err != nil {
 		t.Fatalf("first quota lease: %v", err)
 	}
-	running, queued, _ = m.QuotaCounts(ctx(), repo, "")
+	running, queued, _ = m.QuotaCounts(ctx(), repoID, "")
 	if running != 1 || queued != queuedJobs-1 {
 		t.Fatalf("after lease = %d/%d, want 1/%d", running, queued, queuedJobs-1)
 	}
@@ -259,7 +260,7 @@ func TestMemStoreQuotaQueuedRunningLifecycle(t *testing.T) {
 	if _, err := m.AcquireLeaseAtomic(ctx(), second); !errors.Is(err, ErrQuotaExceeded) {
 		t.Fatalf("second quota lease = %v, want ErrQuotaExceeded", err)
 	}
-	running, queued, _ = m.QuotaCounts(ctx(), repo, "")
+	running, queued, _ = m.QuotaCounts(ctx(), repoID, "")
 	if running != 1 || queued != queuedJobs-1 {
 		t.Fatalf("after rejected lease = %d/%d, want 1/%d", running, queued, queuedJobs-1)
 	}
@@ -268,14 +269,14 @@ func TestMemStoreQuotaQueuedRunningLifecycle(t *testing.T) {
 	if _, err := m.CancelRunJobs(ctx(), ids[0], "test cancel"); err != nil {
 		t.Fatal(err)
 	}
-	running, queued, _ = m.QuotaCounts(ctx(), repo, "")
+	running, queued, _ = m.QuotaCounts(ctx(), repoID, "")
 	if running != 0 || queued != queuedJobs-1 {
 		t.Fatalf("after cancel = %d/%d, want 0/%d", running, queued, queuedJobs-1)
 	}
 	if _, err := m.AcquireLeaseAtomic(ctx(), second); err != nil {
 		t.Fatalf("lease after cancel: %v", err)
 	}
-	running, queued, _ = m.QuotaCounts(ctx(), repo, "")
+	running, queued, _ = m.QuotaCounts(ctx(), repoID, "")
 	if running != 1 || queued != queuedJobs-2 {
 		t.Fatalf("after second lease = %d/%d, want 1/%d", running, queued, queuedJobs-2)
 	}
@@ -284,7 +285,7 @@ func TestMemStoreQuotaQueuedRunningLifecycle(t *testing.T) {
 	if err := m.CompleteJob(ctx(), ids[1], 1, leaseRunner, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: ids[1], Generation: 1, RunnerID: leaseRunner}); err != nil {
 		t.Fatal(err)
 	}
-	running, queued, _ = m.QuotaCounts(ctx(), repo, "")
+	running, queued, _ = m.QuotaCounts(ctx(), repoID, "")
 	if running != 0 || queued != queuedJobs-2 {
 		t.Fatalf("after complete = %d/%d, want 0/%d", running, queued, queuedJobs-2)
 	}
@@ -292,7 +293,7 @@ func TestMemStoreQuotaQueuedRunningLifecycle(t *testing.T) {
 	if err := m.CompleteJob(ctx(), ids[1], 1, leaseRunner, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: ids[1], Generation: 1, RunnerID: leaseRunner}); err != nil {
 		t.Fatalf("replayed completion: %v", err)
 	}
-	running, queued, _ = m.QuotaCounts(ctx(), repo, "")
+	running, queued, _ = m.QuotaCounts(ctx(), repoID, "")
 	if running != 0 || queued != queuedJobs-2 {
 		t.Fatalf("after replay = %d/%d, want 0/%d", running, queued, queuedJobs-2)
 	}
@@ -480,7 +481,7 @@ func TestMemStoreSupersedeQuotaMatrix(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			m := newMemStore()
 			old := compiledRunRequest(leaseRunID, leaseJobID, repo)
-			old.Quota = &QuotaReservation{RepoKey: repo, JobCount: 1}
+			old.Quota = &QuotaReservation{RepoKey: RepoIDFor("", repo, "o/r"), JobCount: 1}
 			if err := m.InsertCompiledRun(ctx(), old); err != nil {
 				t.Fatal(err)
 			}
@@ -499,7 +500,7 @@ func TestMemStoreSupersedeQuotaMatrix(t *testing.T) {
 				}
 			}
 			next := compiledRunRequest(leaseJob2ID, "55555555555555555555555555555555", repo)
-			next.Quota = &QuotaReservation{RepoKey: repo, JobCount: 1}
+			next.Quota = &QuotaReservation{RepoKey: RepoIDFor("", repo, "o/r"), JobCount: 1}
 			next.CancelPrevious = []string{leaseJobID}
 			if err := m.InsertCompiledRun(ctx(), next); err != nil {
 				t.Fatal(err)
@@ -512,7 +513,7 @@ func TestMemStoreSupersedeQuotaMatrix(t *testing.T) {
 			// successor's queued reservation counted exactly once. A running
 			// predecessor is replaced by the successor's queued slot, and a
 			// queued/waiting predecessor keeps the queued count flat.
-			running, queued, _ := m.QuotaCounts(ctx(), repo, "")
+			running, queued, _ := m.QuotaCounts(ctx(), RepoIDFor("", repo, "o/r"), "")
 			fresh, _ := m.GetJob(ctx(), "55555555555555555555555555555555")
 			if fresh.Status != model.StatusQueued {
 				t.Fatalf("successor status = %s", fresh.Status)
@@ -602,8 +603,9 @@ func TestMemStoreReleaseRunnerJobMissingRunnerReleasesQuota(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			m := newMemStore()
+			repoID := RepoIDFor("", repo, "o/r")
 			req := compiledRunRequest(leaseRunID, leaseJobID, repo)
-			req.Quota = &QuotaReservation{RepoKey: repo, JobCount: 1}
+			req.Quota = &QuotaReservation{RepoKey: repoID, JobCount: 1}
 			if err := m.InsertCompiledRun(ctx(), req); err != nil {
 				t.Fatal(err)
 			}
@@ -613,7 +615,7 @@ func TestMemStoreReleaseRunnerJobMissingRunnerReleasesQuota(t *testing.T) {
 			if _, err := m.AcquireLeaseAtomic(ctx(), leaseClaimFor(leaseJobID, leaseRunner, 1)); err != nil {
 				t.Fatal(err)
 			}
-			running, queued, _ := m.QuotaCounts(ctx(), repo, "")
+			running, queued, _ := m.QuotaCounts(ctx(), repoID, "")
 			if running != 1 || queued != 0 {
 				t.Fatalf("pre-release counters = %d/%d, want 1/0", running, queued)
 			}
@@ -632,7 +634,7 @@ func TestMemStoreReleaseRunnerJobMissingRunnerReleasesQuota(t *testing.T) {
 			if err := m.ReleaseRunnerJob(ctx(), leaseRunner, leaseJobID, model.StatusFailure); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("release = %v, want ErrNotFound", err)
 			}
-			running, queued, _ = m.QuotaCounts(ctx(), repo, "")
+			running, queued, _ = m.QuotaCounts(ctx(), repoID, "")
 			wantQueued := 0
 			if requeued {
 				wantQueued = 1

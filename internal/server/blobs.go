@@ -218,12 +218,21 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 		expires := createdAt.Add(retention)
 		rec.ExpiresAt = &expires
 	}
-	s.attachSidecarsToRecord(r.Context(), &rec, j, name, dir)
+	if err := s.attachSidecarsToRecord(r.Context(), &rec, j, name, dir); err != nil {
+		// The sidecar references could not be resolved (store outage): the
+		// record must not silently lose its attestations, so the upload
+		// fails closed. A CAS blob already written above stays as an
+		// orphan for the reference-aware GC.
+		removeStagedArtifact(dst, casMode)
+		s.logError("artifact: sidecar reference lookup failed", "job", j.ID, "error", err.Error())
+		http.Error(w, "artifact sidecar reference lookup failed", http.StatusInternalServerError)
+		return
+	}
 	// Provenance signs with the dedicated provenance key — never the OIDC
 	// key — so the two trust roots stay independent.
 	finished := time.Now().UTC()
 	signer := s.ensureProvenanceKey()
-	st := provenance.ArtifactStatement(provenance.ArtifactInput{Name: name, SHA256: rec.SHA256, RunID: j.RunID, JobID: j.ID, JobKey: j.Key, Repository: run.RepoFullName, Ref: run.Ref, Commit: run.SHA, Runner: runnerID, Trusted: j.Trusted, Started: jobStart(j), Finished: finished})
+	st := provenance.ArtifactStatement(provenance.ArtifactInput{Name: name, SHA256: rec.SHA256, RunID: j.RunID, JobID: j.ID, JobKey: j.Key, Repository: repoIDForRun(run), Ref: run.Ref, Commit: run.SHA, Runner: runnerID, Trusted: j.Trusted, Started: jobStart(j), Finished: finished})
 	st.Builder = provenance.BuilderPlaceholder
 	if env, er := provenance.Sign(st, signer.KID, signer.Private); er == nil {
 		if ab, mer := json.MarshalIndent(env, "", "  "); mer == nil {
@@ -275,6 +284,13 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 			writeJSON(w, http.StatusOK, stored)
 			return
 		}
+		// The record is durable: consume the pending sidecar rows it now
+		// references (and clear the job's leftovers). A cleanup failure is
+		// logged, never fatal — the record already carries the digests and
+		// the maintenance tick prunes any leftover row.
+		if cerr := s.consumeArtifactPendingSidecars(ctx, j.ID, rec); cerr != nil {
+			s.logError("artifact: pending sidecar cleanup failed", "job", j.ID, "artifact", rec.ID, "error", cerr.Error())
+		}
 		s.metricAdd("kiwi_artifact_bytes_total", float64(n), nil)
 		s.metricObserve("kiwi_cas_latency_seconds", time.Since(start).Seconds(), nil)
 		s.auditLocked("artifact.uploaded", runnerID, j.RunID, j.ID, "artifact uploaded", map[string]string{"name": name, "sha256": rec.SHA256, "provenance_kid": signer.KID})
@@ -309,6 +325,10 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 	}
 	s.auditLocked("artifact.uploaded", runnerID, j.RunID, j.ID, "artifact uploaded", map[string]string{"name": name, "sha256": rec.SHA256, "provenance_kid": signer.KID})
 	_ = s.persistLocked()
+	// Dev-mode mirror: the record now carries its sidecar references, so
+	// the pending entries are consumed with it.
+	delete(s.pendingSidecars, sidecarPendingKey(j.ID, name, storage.ArtifactSidecarKindSBOM))
+	delete(s.pendingSidecars, sidecarPendingKey(j.ID, name, storage.ArtifactSidecarKindSigstore))
 	s.mu.Unlock()
 	s.metricAdd("kiwi_artifact_bytes_total", float64(n), nil)
 	s.metricObserve("kiwi_cas_latency_seconds", time.Since(start).Seconds(), nil)
@@ -481,14 +501,12 @@ func (s *Server) openArtifact(ctx context.Context, rec model.ArtifactRecord) (io
 }
 
 // cacheNamespace derives the cache namespace from the leased job: the
-// repository identity (preferring the full name, falling back to the repo
-// URL) and the trust domain. Clients can never influence the namespace:
-// the legacy X-Kiwi-Repository/X-Kiwi-Trust-Domain headers are rejected.
+// canonical repository identity (the stored RepoID, derived from the URL +
+// full name for legacy jobs) and the trust domain. Clients can never
+// influence the namespace: the legacy
+// X-Kiwi-Repository/X-Kiwi-Trust-Domain headers are rejected.
 func cacheNamespace(j model.Job) (repo, trust string) {
-	repo = j.RepoFullName
-	if repo == "" {
-		repo = j.RepoURL
-	}
+	repo = repoIDForJob(j)
 	repo = strings.TrimSpace(repo)
 	trust = "untrusted"
 	if j.Trusted {
@@ -535,9 +553,11 @@ func (s *Server) cacheLease(w http.ResponseWriter, r *http.Request) (model.Job, 
 // the cache_manifests table in DB mode, next to the dataDir in fs mode.
 // The namespace is derived from the leased job; the response carries the
 // content digest and the manifest digest. The manifest must commit
-// durably BEFORE the 201: a manifest failure removes the orphaned CAS blob
-// and fails the upload (5xx) so a cache entry can never exist without its
-// signed mapping.
+// durably BEFORE the 201: a manifest failure fails the upload (5xx) so a
+// cache entry can never exist without its signed mapping. The already
+// written CAS blob is left in place as an orphan for the reference-aware
+// blob GC — never deleted, because the digest may be referenced by
+// another entry.
 func (s *Server) uploadJobCache(w http.ResponseWriter, r *http.Request) {
 	if s.store == nil {
 		http.Error(w, "cache storage requires persistent server", http.StatusServiceUnavailable)
@@ -568,11 +588,11 @@ func (s *Server) uploadJobCache(w http.ResponseWriter, r *http.Request) {
 	envelope, err := s.writeCacheManifest(r.Context(), fileKey, key, repo, trust, sum, size, j)
 	if err != nil {
 		// The manifest is the durable mapping: without it the blob is an
-		// unreachable orphan, so it is removed and the upload fails closed.
-		if derr := s.CAS.Delete(r.Context(), sum); derr != nil {
-			s.logError("cache: orphan blob removal failed", "sha256", sum, "error", derr.Error())
-		}
-		s.logError("cache: manifest persist failed", "error", err.Error())
+		// unreachable ORPHAN, and the upload fails closed. It is never
+		// deleted here: CAS writes are append/deduplicate, so the digest
+		// may be referenced by another cache entry or record; the
+		// reference-aware blob GC owns orphan reclamation.
+		s.logError("cache: manifest persist failed; blob left for GC", "sha256", sum, "error", err.Error())
 		http.Error(w, "cache manifest persist failed", http.StatusInternalServerError)
 		return
 	}

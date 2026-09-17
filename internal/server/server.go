@@ -95,7 +95,7 @@ type Server struct {
 	RekorPublicKey      ed25519.PublicKey
 	RekorBaseURL        string
 	// EnrollGrants maps SHA-256 digests of single-use enrollment grants to
-	// their remaining state (expiry, label binding, used). Grants are
+	// their remaining state (expiry, allowed labels, used). Grants are
 	// persisted as enroll-grants.json under dataDir; raw grant values are
 	// never stored. Guarded by s.mu.
 	EnrollGrants map[string]EnrollGrant
@@ -926,7 +926,12 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	if !s.requireAction(w, r, auth.ActionRun, auth.CanonicalRepoID(repoHost(in.RepoURL), in.RepoFullName), false) {
+	// The canonical repository identity is derived at ingress from the
+	// clone URL host plus the submitted full name; a client-supplied
+	// repo_id is never decoded (json:"-"), so the identity can never be
+	// spoofed by a submission.
+	in.RepoID = repoIDForSubmit(in)
+	if !s.requireAction(w, r, auth.ActionRun, in.RepoID, false) {
 		return
 	}
 	// Direct API submissions are never trusted; only the forge webhook path
@@ -967,6 +972,13 @@ func (s *Server) enqueue(in SubmitRun) (model.Run, error) {
 func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 	ctx, span := s.startSpan(context.Background(), "server.enqueue")
 	defer span.End()
+	// The canonical repository identity is derived ONCE here when the
+	// ingress did not already resolve it (webhook handlers, schedules,
+	// downstream children and reruns set it; direct submissions derive it
+	// from repo_url). Every downstream decision uses in.RepoID.
+	if strings.TrimSpace(in.RepoID) == "" {
+		in.RepoID = repoIDForSubmit(in)
+	}
 	// Server-side pipeline resolution: components are resolved and merged,
 	// inputs validated and injected, and the canonical pipeline text
 	// replaces the submission so every persisted job carries a
@@ -991,8 +1003,8 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 	// defaults, then the hard trust floor is applied. A policy file can only
 	// ever narrow capabilities.
 	if s.Policy != nil {
-		caps = policy.Intersect(caps, s.Policy.CapabilitiesFor(in.RepoFullName))
-		grants := s.Policy.GrantsFor(in.RepoFullName)
+		caps = policy.Intersect(caps, s.Policy.CapabilitiesFor(in.RepoID))
+		grants := s.Policy.GrantsFor(in.RepoID)
 		caps.Deployments = caps.Deployments || grants.Deployments
 		caps.GenerateChildGraph = caps.GenerateChildGraph || grants.GenerateChildGraph
 		caps.CrossRepoTrigger = caps.CrossRepoTrigger || grants.CrossRepoTrigger
@@ -1011,7 +1023,7 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 	// loaded) the org-policy host/region/digest restrictions. Generated
 	// fragments, schedules and downstream children use the SAME path — no
 	// second-class admission.
-	if err = s.admitCompiledSpec(repoIdentity{RepoURL: in.RepoURL, RepoFullName: in.RepoFullName}, spec, caps); err != nil {
+	if err = s.admitCompiledSpec(repoIdentity{RepoID: in.RepoID, RepoURL: in.RepoURL, RepoFullName: in.RepoFullName}, spec, caps); err != nil {
 		return model.Run{}, err
 	}
 	pipelineDigest, err := pipeline.PipelineDigest(spec)
@@ -1031,7 +1043,7 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 		}
 	}
 	group := expandConcurrency(spec.Concurrency.Group, in)
-	run := model.Run{ID: runID, Repo: in.RepoURL, RepoFullName: in.RepoFullName, Ref: in.Ref, SHA: in.SHA, Event: in.Event,
+	run := model.Run{ID: runID, RepoID: in.RepoID, Repo: in.RepoURL, RepoFullName: in.RepoFullName, Ref: in.Ref, SHA: in.SHA, Event: in.Event,
 		Status: model.StatusQueued, Trusted: in.Trusted, ConcurrencyGroup: group, CreatedAt: now, Metadata: cloneMap(in.Metadata)}
 
 	jobIDs := make(map[string]string, len(g.Jobs))
@@ -1076,7 +1088,7 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 		jobDigest := hex.EncodeToString(digestSum[:])
 		jobContracts[jobIDs[key]] = buildJobContracts(cj)
 		j := model.Job{
-			ID: jobIDs[key], RunID: runID, Key: key, BaseKey: cj.BaseID, RepoURL: in.RepoURL, RepoFullName: in.RepoFullName, Ref: in.Ref, SHA: in.SHA,
+			ID: jobIDs[key], RunID: runID, Key: key, BaseKey: cj.BaseID, RepoID: in.RepoID, RepoURL: in.RepoURL, RepoFullName: in.RepoFullName, Ref: in.Ref, SHA: in.SHA,
 			Event: in.Event, Condition: cj.Job.If, DependencyStatus: model.StatusSuccess, Pipeline: in.Pipeline, Trusted: in.Trusted, ChangedFiles: append([]string{}, in.ChangedFiles...), ChangedFilesKnown: in.ChangedFilesKnown, Needs: needs,
 			RequiredLabels: labelsForJob(cj.Job), Network: effectiveNetwork, Environment: env, ApprovalRequired: cj.Job.Environment.Approval, EnvironmentBranches: append([]string{}, cj.Job.Environment.Branches...), EnvironmentConcurrency: cj.Job.Environment.Concurrency, OIDCAllowed: cj.Job.Permissions.IDToken, OIDCAudiences: cloneStrings(oidcAudiences),
 			DeclaredSecrets: declaredSecrets(spec, cj.Job),
@@ -1147,7 +1159,7 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 	// between the handler fast path and concurrent deliveries.
 	if delivery, ok := webhookDelivery(in.Metadata); ok {
 		if existing, ok := s.deliveries[delivery]; ok {
-			if prior, ok := s.runs[existing]; ok && prior.RepoFullName == in.RepoFullName {
+			if prior, ok := s.runs[existing]; ok && repoIDForRun(prior) == in.RepoID {
 				s.mu.Unlock()
 				return prior, nil
 			}
@@ -1208,13 +1220,13 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 
 // enqueueDB persists a compiled run through the storage.RunEnqueueStore:
 // ONE InsertCompiledRun transaction inserts the run, jobs, dependencies and
-// artifact contracts, cancels the superseded jobs with audit rows, and
+// artifact contracts, cancels the concurrency-group superseded runs and
+// their jobs with audit rows and dependent recomputation (resolved INSIDE
+// the transaction from the SupersedePolicy, not from a pre-read), and
 // claims the webhook delivery, quota reservation and (optionally) schedule
-// occurrence. It mirrors enqueue's dedupe and supersession semantics
-// against the durable delivery table and the SQL run list, decides
-// approval/environment gating up front (the SQL completion path does not
-// re-run the full schedule pass), and emits the run.queued audit event
-// through the DB audit funnel.
+// occurrence. It decides approval/environment gating up front (the SQL
+// completion path does not re-run the full schedule pass) and emits the
+// run.queued audit event through the DB audit funnel.
 func (s *Server) enqueueDB(in SubmitRun, run model.Run, created map[string]model.Job, jobContracts map[string]map[string]storage.ArtifactContract, group string, cancelInProgress bool, now time.Time) (model.Run, error) {
 	ctx := context.Background()
 	// Daily budget state: enqueues are refused while the usage store is
@@ -1240,36 +1252,18 @@ func (s *Server) enqueueDB(in SubmitRun, run model.Run, created map[string]model
 	for id, j := range created {
 		deps[id] = append([]string(nil), j.Needs...)
 	}
-	// Concurrency supersession: collect the non-terminal job IDs of the
-	// runs sharing this repository and concurrency group so the enqueue
-	// transaction cancels them atomically with the insert.
-	var cancelPrevious []string
-	if cancelInProgress && group != "" {
-		runs, err := s.DB.ListRuns(ctx, 10000)
-		if err != nil {
-			return model.Run{}, fmt.Errorf("list runs for supersession: %w", err)
-		}
-		for _, old := range runs {
-			if old.ID == run.ID || old.Repo != run.Repo || old.ConcurrencyGroup != group || old.Status.Terminal() {
-				continue
-			}
-			jobs, err := s.DB.ListJobsByRun(ctx, old.ID)
-			if err != nil {
-				return model.Run{}, fmt.Errorf("list jobs for supersession: %w", err)
-			}
-			for _, j := range jobs {
-				if !j.Status.Terminal() {
-					cancelPrevious = append(cancelPrevious, j.ID)
-				}
-			}
-		}
-	}
 	req := storage.InsertCompiledRunRequest{
-		Run:            run,
-		Jobs:           created,
-		Deps:           deps,
-		Contracts:      jobContracts,
-		CancelPrevious: cancelPrevious,
+		Run:       run,
+		Jobs:      created,
+		Deps:      deps,
+		Contracts: jobContracts,
+	}
+	// Concurrency supersession is resolved inside the enqueue transaction
+	// (under the store's per-(repo, group) lock) so the conflicting runs are
+	// cancelled in the same commit that publishes this run, and concurrent
+	// superseding enqueues of one group serialize on exactly one survivor.
+	if cancelInProgress && group != "" {
+		req.Supersede = &storage.SupersedePolicy{Repo: run.Repo, ConcurrencyGroup: group}
 	}
 	if in.DownstreamLaunch != nil {
 		req.DownstreamLaunch = in.DownstreamLaunch
@@ -1278,8 +1272,8 @@ func (s *Server) enqueueDB(in SubmitRun, run model.Run, created map[string]model
 		req.WebhookClaim = &storage.WebhookClaim{Forge: forge, DeliveryID: delivery, RunID: run.ID}
 	}
 	req.Quota = &storage.QuotaReservation{
-		RepoKey:         run.Repo,
-		TeamKey:         repoURLTeam(run.Repo),
+		RepoKey:         repoIDForRun(run),
+		TeamKey:         repoTeamKey(repoIDForRun(run)),
 		JobCount:        len(created),
 		RepoConcurrency: s.QuotaLimits.RepoConcurrency,
 		TeamConcurrency: s.QuotaLimits.TeamConcurrency,
@@ -1291,8 +1285,11 @@ func (s *Server) enqueueDB(in SubmitRun, run model.Run, created map[string]model
 	}
 	rs, ok := s.DB.(storage.RunEnqueueStore)
 	if !ok {
-		// Fallback for stores predating the atomic enqueue: the old
-		// scheduler sequence plus a best-effort delivery upsert.
+		// Fallback for stores predating the atomic enqueue on the DB handle:
+		// the scheduler's own store still performs the whole enqueue through
+		// its ONE transaction (including the in-transaction supersession),
+		// followed by a best-effort delivery upsert. A scheduler without the
+		// atomic contract fails closed instead of writing partial rows.
 		if err := s.Sched.Enqueue(ctx, run, created, deps, cancelInProgress && group != ""); err != nil {
 			return model.Run{}, err
 		}
@@ -1316,7 +1313,7 @@ func (s *Server) enqueueDB(in SubmitRun, run model.Run, created map[string]model
 		if existingID, found, ferr := s.DB.FindDelivery(ctx, req.WebhookClaim.Forge, req.WebhookClaim.DeliveryID); ferr != nil {
 			return model.Run{}, fmt.Errorf("lookup delivery: %w", ferr)
 		} else if found {
-			if prior, gerr := s.DB.GetRun(ctx, existingID); gerr == nil && prior.RepoFullName == in.RepoFullName {
+			if prior, gerr := s.DB.GetRun(ctx, existingID); gerr == nil && repoIDForRun(prior) == in.RepoID {
 				return prior, nil
 			}
 		}
@@ -1845,7 +1842,7 @@ func (s *Server) listServingRunners(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if repoFilter != "" {
-				canon := canonicalRepoForRun(run)
+				canon := repoIDForRun(run)
 				if repoFilter != run.RepoFullName && repoFilter != canon && repoFilter != auth.CanonicalRepoID("", run.RepoFullName) {
 					continue
 				}
@@ -1854,7 +1851,7 @@ func (s *Server) listServingRunners(w http.ResponseWriter, r *http.Request) {
 				visibleJobs = append(visibleJobs, jobID)
 				continue
 			}
-			canon := canonicalRepoForRun(run)
+			canon := repoIDForRun(run)
 			if allowed[canon] || allowed[run.RepoFullName] {
 				visibleJobs = append(visibleJobs, jobID)
 				continue
@@ -2142,8 +2139,9 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 		if other.Status != model.StatusRunning {
 			continue
 		}
-		repoRunning[other.RepoURL]++
-		teamRunning[repoURLTeam(other.RepoURL)]++
+		otherRepo := repoIDForJob(other)
+		repoRunning[otherRepo]++
+		teamRunning[repoTeamKey(otherRepo)]++
 	}
 	for _, j := range s.jobs {
 		if j.Status != model.StatusQueued || !depsReadyLocked(j, s.jobs) {
@@ -2155,10 +2153,11 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 		if dl := scheduler.QueueDeadlineFor(j); dl != nil && !dl.After(now) {
 			continue
 		}
-		if s.QuotaLimits.RepoConcurrency > 0 && float64(repoRunning[j.RepoURL]) >= s.QuotaLimits.RepoConcurrency {
+		jobRepo := repoIDForJob(j)
+		if s.QuotaLimits.RepoConcurrency > 0 && float64(repoRunning[jobRepo]) >= s.QuotaLimits.RepoConcurrency {
 			continue
 		}
-		if s.QuotaLimits.TeamConcurrency > 0 && float64(teamRunning[repoURLTeam(j.RepoURL)]) >= s.QuotaLimits.TeamConcurrency {
+		if s.QuotaLimits.TeamConcurrency > 0 && float64(teamRunning[repoTeamKey(jobRepo)]) >= s.QuotaLimits.TeamConcurrency {
 			continue
 		}
 		// The shared lease predicate is the SAME decision the SQL claim and
@@ -2172,7 +2171,7 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 				if other.ID == j.ID || other.Status != model.StatusRunning {
 					continue
 				}
-				if other.Environment == j.Environment && other.RepoURL == j.RepoURL {
+				if other.Environment == j.Environment && repoIDForJob(other) == repoIDForJob(j) {
 					envRunning++
 				}
 			}
@@ -2827,7 +2826,7 @@ func (s *Server) approveJob(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if !s.requireAction(w, r, auth.ActionApprove, canonicalRepoForJob(j), false) {
+	if !s.requireAction(w, r, auth.ActionApprove, repoIDForJob(j), false) {
 		return
 	}
 	s.mu.Lock()
@@ -2871,7 +2870,7 @@ func (s *Server) approveJobDB(w http.ResponseWriter, r *http.Request, jobID, act
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	if !s.requireAction(w, r, auth.ActionApprove, canonicalRepoForJob(j), false) {
+	if !s.requireAction(w, r, auth.ActionApprove, repoIDForJob(j), false) {
 		return
 	}
 	if !j.ApprovalRequired {
@@ -2929,7 +2928,7 @@ func (s *Server) rerunRun(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if !s.requireAction(w, r, auth.ActionRerun, canonicalRepoForRun(old), false) {
+	if !s.requireAction(w, r, auth.ActionRerun, repoIDForRun(old), false) {
 		return
 	}
 	meta := cloneMap(old.Metadata)
@@ -2942,7 +2941,10 @@ func (s *Server) rerunRun(w http.ResponseWriter, r *http.Request) {
 		delete(meta, key)
 	}
 	meta["rerun_of"] = id
-	run, err := s.enqueue(SubmitRun{RepoURL: old.Repo, RepoFullName: old.RepoFullName, Ref: old.Ref, SHA: old.SHA, Event: old.Event, Pipeline: pipelineText, Trusted: rerunTrusted(r, old), Metadata: meta})
+	// A rerun COPIES the source run's immutable RepoID: the clone URL may
+	// have changed since the source run, and re-deriving from it could move
+	// the identity to a different repository.
+	run, err := s.enqueue(SubmitRun{RepoID: old.RepoID, RepoURL: old.Repo, RepoFullName: old.RepoFullName, Ref: old.Ref, SHA: old.SHA, Event: old.Event, Pipeline: pipelineText, Trusted: rerunTrusted(r, old), Metadata: meta})
 	if err != nil {
 		http.Error(w, err.Error(), 400)
 		return
@@ -2979,7 +2981,7 @@ func (s *Server) rerunRunDB(w http.ResponseWriter, r *http.Request, id string) {
 		http.NotFound(w, r)
 		return
 	}
-	if !s.requireAction(w, r, auth.ActionRerun, canonicalRepoForRun(old), false) {
+	if !s.requireAction(w, r, auth.ActionRerun, repoIDForRun(old), false) {
 		return
 	}
 	meta := cloneMap(old.Metadata)
@@ -2990,7 +2992,10 @@ func (s *Server) rerunRunDB(w http.ResponseWriter, r *http.Request, id string) {
 		delete(meta, key)
 	}
 	meta["rerun_of"] = id
-	run, err := s.enqueue(SubmitRun{RepoURL: old.Repo, RepoFullName: old.RepoFullName, Ref: old.Ref, SHA: old.SHA, Event: old.Event, Pipeline: pipelineText, Trusted: rerunTrusted(r, old), Metadata: meta})
+	// A rerun COPIES the source run's immutable RepoID: the clone URL may
+	// have changed since the source run, and re-deriving from it could move
+	// the identity to a different repository.
+	run, err := s.enqueue(SubmitRun{RepoID: old.RepoID, RepoURL: old.Repo, RepoFullName: old.RepoFullName, Ref: old.Ref, SHA: old.SHA, Event: old.Event, Pipeline: pipelineText, Trusted: rerunTrusted(r, old), Metadata: meta})
 	if err != nil {
 		http.Error(w, err.Error(), 400)
 		return
@@ -3013,7 +3018,7 @@ func rerunTrusted(r *http.Request, old model.Run) bool {
 		// identity to authorize; keep the previous trust.
 		return true
 	}
-	return authorizeRepo(p, auth.ActionTrustedRun, canonicalRepoForRun(old), true)
+	return authorizeRepo(p, auth.ActionTrustedRun, repoIDForRun(old), true)
 }
 
 func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
@@ -3030,7 +3035,7 @@ func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if !s.requireAction(w, r, auth.ActionCancel, canonicalRepoForRun(run), false) {
+	if !s.requireAction(w, r, auth.ActionCancel, repoIDForRun(run), false) {
 		return
 	}
 	s.mu.Lock()
@@ -3060,7 +3065,7 @@ func (s *Server) cancelRunDB(w http.ResponseWriter, r *http.Request, id, actor s
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	if !s.requireAction(w, r, auth.ActionCancel, canonicalRepoForRun(run), false) {
+	if !s.requireAction(w, r, auth.ActionCancel, repoIDForRun(run), false) {
 		return
 	}
 	reason := "cancelled by " + actor
@@ -3531,7 +3536,7 @@ func environmentAtCapacityScoped(j model.Job, jobs map[string]model.Job) bool {
 		if other.ID == j.ID || other.Status != model.StatusRunning {
 			continue
 		}
-		if other.Environment != j.Environment || other.RepoURL != j.RepoURL {
+		if other.Environment != j.Environment || repoIDForJob(other) != repoIDForJob(j) {
 			continue
 		}
 		active++

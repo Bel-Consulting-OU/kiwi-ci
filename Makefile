@@ -1,5 +1,5 @@
-.PHONY: build test test-unit test-race test-integration test-adversarial test-shuffle test-stress \
-	fuzz coverage staticcheck govulncheck cross schema-check docs-check license-check repro-build \
+.PHONY: build test test-unit test-race test-integration integration test-adversarial test-shuffle test-stress \
+	fuzz coverage coverage-floor staticcheck govulncheck cross schema-check docs-check license-check repro-build \
 	fmt lint run clean protect-branch
 
 VERSION ?= 0.1.0-dev
@@ -22,8 +22,14 @@ test-unit:
 test-race:
 	go test -race -shuffle=on ./...
 
-test-integration:
-	go test -tags=integration ./...
+test-integration: integration
+
+# Real-PostgreSQL integration lane: env-gated by KIWI_TEST_POSTGRES_URL (the
+# tests skip when it is unset) and selected by -run Integration. Run it
+# against a throwaway database; every test creates and drops its own schema.
+integration:
+	@test -n "$$KIWI_TEST_POSTGRES_URL" || { echo "integration: set KIWI_TEST_POSTGRES_URL (e.g. postgres://postgres:pass@localhost:5432/kiwi?sslmode=disable)"; exit 1; }
+	go test -count=1 -timeout=20m -run Integration ./internal/storage ./internal/scheduler ./internal/server
 
 test-adversarial:
 	go test -run 'Adversarial|Security|Property|Fault|Symlink|Traversal|Tamper|Reject|Evil|Bomb' -shuffle=on ./...
@@ -40,6 +46,11 @@ fuzz:
 coverage:
 	go test -coverprofile=coverage.out ./...
 	go tool cover -func=coverage.out | tail -1
+
+# Enforce the total-coverage floor on a profile produced by `make coverage`;
+# override the default floor with KC_MIN_COVERAGE=<percent>.
+coverage-floor:
+	./scripts/coverage-floor.sh coverage.out
 
 staticcheck:
 	staticcheck ./...

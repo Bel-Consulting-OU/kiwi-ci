@@ -7,7 +7,7 @@
 -- energy are kept on the same row for the budget read path.
 --
 -- 0001_init.sql created a provisional cache_manifests table (cache_key /
--- entries shape) that nothing has written to yet; 0004 supersedes it with
+-- entries shape) that nothing has written to yet, 0004 supersedes it with
 -- the real contract: the (repo, trust_domain, logical_key) namespace maps to
 -- a content-addressed blob digest with producer provenance and the signed
 -- manifest envelope, mirroring how 0002/0003 superseded their provisional
@@ -25,11 +25,11 @@ CREATE TABLE quota_reservations (
     daily_cost DOUBLE PRECISION NOT NULL DEFAULT 0,
     daily_energy DOUBLE PRECISION NOT NULL DEFAULT 0,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-)
+);
 
-CREATE INDEX quota_reservations_updated_at_idx ON quota_reservations (updated_at)
+CREATE INDEX quota_reservations_updated_at_idx ON quota_reservations (updated_at);
 
-DROP TABLE IF EXISTS cache_manifests
+DROP TABLE IF EXISTS cache_manifests;
 
 CREATE TABLE cache_manifests (
     repo TEXT NOT NULL,
@@ -42,15 +42,15 @@ CREATE TABLE cache_manifests (
     created_at TIMESTAMPTZ NOT NULL,
     payload JSONB NOT NULL,
     PRIMARY KEY (repo, trust_domain, logical_key)
-)
+);
 
-CREATE INDEX cache_manifests_blob_sha256_idx ON cache_manifests (blob_sha256)
+CREATE INDEX cache_manifests_blob_sha256_idx ON cache_manifests (blob_sha256);
 
 ALTER TABLE downstream_links
     ADD COLUMN reserved BOOLEAN NOT NULL DEFAULT FALSE,
     ADD COLUMN reserved_at TIMESTAMPTZ,
     ADD COLUMN target_forge TEXT NOT NULL DEFAULT '',
     ADD COLUMN target_base_url TEXT NOT NULL DEFAULT '',
-    ADD COLUMN target_repo_id TEXT NOT NULL DEFAULT ''
+    ADD COLUMN target_repo_id TEXT NOT NULL DEFAULT '';
 
-CREATE INDEX downstream_links_reserved_idx ON downstream_links (reserved, reserved_at)
+CREATE INDEX downstream_links_reserved_idx ON downstream_links (reserved, reserved_at);

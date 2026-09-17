@@ -154,8 +154,8 @@ func TestRepoHostDerivation(t *testing.T) {
 		{"ssh://git@github.com/o/r.git", "github.com"},
 		{"git@github.com:o/r.git", "github.com"},
 	} {
-		if got := repoHostFromURL(tc.url); got != tc.want {
-			t.Errorf("repoHostFromURL(%q) = %q, want %q", tc.url, got, tc.want)
+		if got := storage.RepoHost(tc.url); got != tc.want {
+			t.Errorf("storage.RepoHost(%q) = %q, want %q", tc.url, got, tc.want)
 		}
 	}
 }

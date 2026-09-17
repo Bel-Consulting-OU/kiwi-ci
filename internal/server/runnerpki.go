@@ -98,10 +98,10 @@ func (s *Server) SetRunnerCA(certPath, keyPath string) error {
 // enroll signs a runner CSR after the enrollment token check already
 // performed by auth(). A request authenticated with a single-use grant
 // instead of the static enroll token has the grant consumed here (atomic
-// single-use, expiry and label binding) before any certificate is signed.
-// The issued certificate binds the runner to its authenticated ID; the CSR's
-// own identity fields are discarded (server-synthesized identity, see
-// runnerpki.SignRunnerCSR).
+// single-use, expiry and allowed-label validation) before any certificate
+// is signed. The issued certificate binds the runner to its authenticated
+// ID; the CSR's own identity fields are discarded (server-synthesized
+// identity, see runnerpki.SignRunnerCSR).
 func (s *Server) enroll(w http.ResponseWriter, r *http.Request) {
 	if s.RunnerCA == nil {
 		http.Error(w, "runner CA not configured", http.StatusServiceUnavailable)
@@ -128,8 +128,8 @@ func (s *Server) enroll(w http.ResponseWriter, r *http.Request) {
 	tok := enrollTokenFrom(r)
 	if s.RunnerEnrollToken == "" || !bearerOK(tok, s.RunnerEnrollToken) {
 		// Not the static enrollment token: the request must have been
-		// gated by a grant. Consume it (single-use + expiry + label
-		// binding) before signing.
+		// gated by a grant. Consume it (single-use + expiry + allowed
+		// labels) before signing.
 		if err := s.consumeEnrollGrant(tok, in.Labels); err != nil {
 			http.Error(w, err.Error(), http.StatusUnauthorized)
 			return

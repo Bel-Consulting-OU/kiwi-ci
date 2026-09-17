@@ -547,13 +547,16 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid job token", http.StatusUnauthorized)
 		return
 	}
-	sub := "repo:" + run.RepoFullName + ":ref:" + run.Ref + ":job:" + j.Key
+	// The subject and the repository_id claim use the canonical repository
+	// identity; the repository claim stays the human-readable full name.
+	repoID := repoIDForRun(run)
+	sub := "repo:" + repoID + ":ref:" + run.Ref + ":job:" + j.Key
 	jti, err := newID()
 	if err != nil {
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
-	claims := map[string]any{"iss": iss, "sub": sub, "aud": in.Audience, "iat": now.Unix(), "nbf": now.Add(-5 * time.Second).Unix(), "exp": now.Add(5 * time.Minute).Unix(), "jti": jti, "repository": run.RepoFullName, "ref": run.Ref, "sha": run.SHA, "event": run.Event, "run_id": run.ID, "job_id": j.ID, "job": j.Key, "environment": j.Environment, "trusted": j.Trusted}
+	claims := map[string]any{"iss": iss, "sub": sub, "aud": in.Audience, "iat": now.Unix(), "nbf": now.Add(-5 * time.Second).Unix(), "exp": now.Add(5 * time.Minute).Unix(), "jti": jti, "repository": run.RepoFullName, "repository_id": repoID, "ref": run.Ref, "sha": run.SHA, "event": run.Event, "run_id": run.ID, "job_id": j.ID, "job": j.Key, "environment": j.Environment, "trusted": j.Trusted}
 	jwt, err := s.signJWT(signer, claims)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

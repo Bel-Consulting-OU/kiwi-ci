@@ -240,16 +240,18 @@ func TestEnrollGrants(t *testing.T) {
 		return EnrollRequest{RunnerID: runnerID, CSR: base64.StdEncoding.EncodeToString(csrPEM), Labels: labels}
 	}
 
-	// Label binding: missing a bound label is rejected (and the grant is
-	// not consumed by a rejected attempt).
-	req := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/enroll", enrollBody("runner-1", []string{"os:macos"}), raw, nil)
+	// Allowed-label contract: the grant's bound labels are the complete
+	// allowed set, so a request carrying a label outside it is rejected
+	// (with a clear error) and the grant is not consumed by the rejected
+	// attempt.
+	req := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/enroll", enrollBody("runner-1", []string{"os:macos", "arm64", "extra"}), raw, nil)
 	if req.Code != http.StatusUnauthorized {
-		t.Fatalf("enroll without bound labels: got %d, want 401", req.Code)
+		t.Fatalf("enroll with an unpermitted label: got %d, want 401", req.Code)
 	}
-	// With all bound labels the grant works exactly once.
-	ok := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/enroll", enrollBody("runner-1", []string{"os:macos", "arm64", "extra"}), raw, nil)
+	// With only allowed labels the grant works exactly once.
+	ok := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/enroll", enrollBody("runner-1", []string{"os:macos", "arm64"}), raw, nil)
 	if ok.Code != http.StatusOK {
-		t.Fatalf("enroll with bound labels: got %d: %s", ok.Code, ok.Body.String())
+		t.Fatalf("enroll with allowed labels: got %d: %s", ok.Code, ok.Body.String())
 	}
 	var out EnrollResponse
 	if err := json.Unmarshal(ok.Body.Bytes(), &out); err != nil {

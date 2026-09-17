@@ -8,10 +8,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -148,17 +150,32 @@ func (s *Server) uploadSBOM(w http.ResponseWriter, r *http.Request, j model.Job,
 		return
 	}
 	sum := sha256Hex(body)
+	ctx := r.Context()
 	if s.DB != nil {
 		if s.CAS == nil {
 			http.Error(w, "sidecar storage requires a blob store", http.StatusServiceUnavailable)
 			return
 		}
-		if _, perr := s.CAS.Put(r.Context(), bytes.NewReader(body)); perr != nil {
+		if _, perr := s.CAS.Put(ctx, bytes.NewReader(body)); perr != nil {
 			http.Error(w, perr.Error(), 500)
 			return
 		}
-		s.rememberPendingSidecar(j, base, "sbom", sum)
-		s.attachSidecarToArtifact(r.Context(), j, base, "sbom", "cas:"+sum, sum)
+		// Durable pending state BEFORE the 201: a replica restart or a
+		// different replica must still resolve the sidecar for the payload
+		// gate. The CAS blob is content-addressed and is never deleted on a
+		// later failure (it may be referenced elsewhere).
+		if err := s.rememberPendingSidecar(ctx, j, base, storage.ArtifactSidecarKindSBOM, sum); err != nil {
+			s.logError("artifact: sbom pending state persist failed", "job", j.ID, "error", err.Error())
+			http.Error(w, "sbom pending state persist failed", http.StatusServiceUnavailable)
+			return
+		}
+		if err := s.attachSidecarToArtifact(ctx, j, base, storage.ArtifactSidecarKindSBOM, "cas:"+sum, sum); err != nil {
+			// Fail closed: a sidecar that cannot be attached to an existing
+			// artifact record must never be acknowledged as stored.
+			s.logError("artifact: sbom attach failed", "job", j.ID, "error", err.Error())
+			http.Error(w, "sbom attachment failed", http.StatusServiceUnavailable)
+			return
+		}
 		s.metricObserve("kiwi_cas_latency_seconds", time.Since(start).Seconds(), nil)
 		writeJSON(w, http.StatusCreated, map[string]any{"name": base + sbomSuffix, "sha256": sum, "format": string(format)})
 		return
@@ -173,7 +190,16 @@ func (s *Server) uploadSBOM(w http.ResponseWriter, r *http.Request, j model.Job,
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	s.attachSidecarToArtifact(r.Context(), j, base, "sbom", sidecar, sum)
+	// Dev-mode mirror of the durable pending row (fs mode has no shared
+	// store): the payload gate and the record attachment can resolve the
+	// digest when a CAS backend is attached, and fall back to the local
+	// sidecar file otherwise. The map write never fails.
+	_ = s.rememberPendingSidecar(ctx, j, base, storage.ArtifactSidecarKindSBOM, sum)
+	if err := s.attachSidecarToArtifact(ctx, j, base, storage.ArtifactSidecarKindSBOM, sidecar, sum); err != nil {
+		s.logError("artifact: sbom attach failed", "job", j.ID, "error", err.Error())
+		http.Error(w, "sbom attachment failed", http.StatusServiceUnavailable)
+		return
+	}
 	s.metricObserve("kiwi_cas_latency_seconds", time.Since(start).Seconds(), nil)
 	writeJSON(w, http.StatusCreated, map[string]any{"name": base + sbomSuffix, "sha256": sum, "format": string(format)})
 }
@@ -217,17 +243,26 @@ func (s *Server) uploadSigstore(w http.ResponseWriter, r *http.Request, j model.
 		}
 	}
 	sum := sha256Hex(body)
+	ctx := r.Context()
 	if s.DB != nil {
 		if s.CAS == nil {
 			http.Error(w, "sidecar storage requires a blob store", http.StatusServiceUnavailable)
 			return
 		}
-		if _, perr := s.CAS.Put(r.Context(), bytes.NewReader(body)); perr != nil {
+		if _, perr := s.CAS.Put(ctx, bytes.NewReader(body)); perr != nil {
 			http.Error(w, perr.Error(), 500)
 			return
 		}
-		s.rememberPendingSidecar(j, base, "sigstore", sum)
-		s.attachSidecarToArtifact(r.Context(), j, base, "sigstore", "cas:"+sum, sum)
+		if err := s.rememberPendingSidecar(ctx, j, base, storage.ArtifactSidecarKindSigstore, sum); err != nil {
+			s.logError("artifact: sigstore pending state persist failed", "job", j.ID, "error", err.Error())
+			http.Error(w, "sigstore pending state persist failed", http.StatusServiceUnavailable)
+			return
+		}
+		if err := s.attachSidecarToArtifact(ctx, j, base, storage.ArtifactSidecarKindSigstore, "cas:"+sum, sum); err != nil {
+			s.logError("artifact: sigstore attach failed", "job", j.ID, "error", err.Error())
+			http.Error(w, "sigstore attachment failed", http.StatusServiceUnavailable)
+			return
+		}
 		s.auditLocked("artifact.sigstore_stored", j.LeaseRunnerID, j.RunID, j.ID, "sigstore bundle stored", map[string]string{"name": base, "sha256": sum})
 		writeJSON(w, http.StatusCreated, map[string]any{"name": base + sigstoreSuffix, "sha256": sum})
 		return
@@ -242,60 +277,181 @@ func (s *Server) uploadSigstore(w http.ResponseWriter, r *http.Request, j model.
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	s.attachSidecarToArtifact(r.Context(), j, base, "sigstore", sidecar, sum)
+	// Dev-mode mirror of the durable pending row: see uploadSBOM.
+	_ = s.rememberPendingSidecar(ctx, j, base, storage.ArtifactSidecarKindSigstore, sum)
+	if err := s.attachSidecarToArtifact(ctx, j, base, storage.ArtifactSidecarKindSigstore, sidecar, sum); err != nil {
+		s.logError("artifact: sigstore attach failed", "job", j.ID, "error", err.Error())
+		http.Error(w, "sigstore attachment failed", http.StatusServiceUnavailable)
+		return
+	}
 	s.auditLocked("artifact.sigstore_stored", j.LeaseRunnerID, j.RunID, j.ID, "sigstore bundle stored", map[string]string{"name": base, "sha256": sum})
 	writeJSON(w, http.StatusCreated, map[string]any{"name": base + sigstoreSuffix, "sha256": sum})
 }
 
-// sidecarPendingKey names one pending sidecar in the upload-window map.
+// pendingSidecarMaxAge is the retention window of a pending sidecar:
+// sidecars uploaded for an artifact payload that never arrives are
+// unreachable long before this, so the maintenance tick (PrunePendingSidecars
+// in DB mode, the in-memory mirror otherwise) drops them.
+const pendingSidecarMaxAge = 7 * 24 * time.Hour
+
+// sidecarPendingKey names one pending sidecar in the dev-mode in-memory
+// mirror. DB mode keys the durable row by (job, artifact, kind) directly.
 func sidecarPendingKey(jobID, base, kind string) string {
 	return jobID + "\x00" + cleanBlobName(base) + "\x00" + kind
 }
 
-// rememberPendingSidecar records a DB-mode sidecar digest uploaded before
-// its artifact payload, so the payload upload gate can resolve the bytes
-// through CAS instead of node-local files.
-func (s *Server) rememberPendingSidecar(j model.Job, base, kind, digest string) {
-	s.mu.Lock()
-	s.pendingSidecars[sidecarPendingKey(j.ID, base, kind)] = digest
-	s.mu.Unlock()
+// encodePendingSidecar packs a dev-mode mirror entry: the CAS digest plus
+// its creation time, so the memory tick can age out stale entries without
+// widening the shared Server struct.
+func encodePendingSidecar(digest string, created time.Time) string {
+	return strconv.FormatInt(created.UTC().UnixNano(), 10) + "\x00" + digest
 }
 
-// pendingSidecarDigest returns the CAS digest of a DB-mode sidecar uploaded
-// for the job, or "" when unknown.
-func (s *Server) pendingSidecarDigest(jobID, base, kind string) string {
+// decodePendingSidecar unpacks a dev-mode mirror entry. Entries written in
+// the legacy bare-digest form decode as digest-only.
+func decodePendingSidecar(v string) (digest string, created time.Time, ok bool) {
+	idx := strings.IndexByte(v, 0)
+	if idx <= 0 {
+		if v == "" {
+			return "", time.Time{}, false
+		}
+		return v, time.Time{}, true
+	}
+	ns, err := strconv.ParseInt(v[:idx], 10, 64)
+	if err != nil {
+		return v, time.Time{}, true
+	}
+	return v[idx+1:], time.Unix(0, ns).UTC(), true
+}
+
+// sidecarStore resolves the durable pending-sidecar store in DB mode.
+func (s *Server) sidecarStore() (storage.ArtifactSidecarStore, bool) {
+	if s.DB == nil {
+		return nil, false
+	}
+	ss, ok := s.DB.(storage.ArtifactSidecarStore)
+	return ss, ok
+}
+
+// rememberPendingSidecar records a sidecar digest uploaded before its
+// artifact payload, so the payload upload gate can resolve the bytes
+// through CAS. DB mode writes the DURABLE artifact_pending_sidecars row
+// (visible to every replica, survives restarts); fs/memory mode keeps the
+// in-memory mirror, which is dev-mode state only. A DB-mode store failure
+// is returned so the caller fails closed — never a 201 without pending
+// state.
+func (s *Server) rememberPendingSidecar(ctx context.Context, j model.Job, base, kind, digest string) error {
+	if ss, ok := s.sidecarStore(); ok {
+		return ss.RememberPendingSidecar(ctx, j.ID, cleanBlobName(base), kind, digest)
+	}
+	if s.DB != nil {
+		return fmt.Errorf("artifact sidecar store unavailable")
+	}
+	s.mu.Lock()
+	s.pendingSidecars[sidecarPendingKey(j.ID, base, kind)] = encodePendingSidecar(digest, time.Now().UTC())
+	s.mu.Unlock()
+	return nil
+}
+
+// pendingSidecarDigest resolves the CAS digest of a pending sidecar: from
+// the durable store in DB mode, from the in-memory mirror otherwise.
+func (s *Server) pendingSidecarDigest(ctx context.Context, jobID, base, kind string) (string, bool, error) {
+	if ss, ok := s.sidecarStore(); ok {
+		return ss.PendingSidecar(ctx, jobID, cleanBlobName(base), kind)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.pendingSidecars[sidecarPendingKey(jobID, base, kind)]
+	v, ok := s.pendingSidecars[sidecarPendingKey(jobID, base, kind)]
+	if !ok {
+		return "", false, nil
+	}
+	digest, _, ok := decodePendingSidecar(v)
+	return digest, ok && digest != "", nil
 }
 
-// attachSidecarToArtifact links a verified sidecar (sbom/sigstore) to the
-// existing artifact record for base. Memory mode updates the in-memory
-// record; DB mode persists the digest references through the store
-// (ArtifactSidecarStore).
-func (s *Server) attachSidecarToArtifact(ctx context.Context, j model.Job, base, kind, path, sum string) {
-	recs, err := s.findArtifactByJobName(ctx, j.RunID, j.ID, base)
-	if err != nil || len(recs) == 0 {
-		return
+// consumeArtifactPendingSidecars deletes the pending rows whose digests
+// were copied into a durably committed artifact record, then clears the
+// job's leftover rows (DeletePendingSidecars): every remaining digest was
+// either attached to the record or is expendable. It MUST run only after
+// the record insert committed; a crash in between leaves the pending rows
+// in place for the retry. Failures are the caller's to log: the record is
+// already durable and the maintenance tick prunes leftovers.
+func (s *Server) consumeArtifactPendingSidecars(ctx context.Context, jobID string, rec model.ArtifactRecord) error {
+	ss, ok := s.sidecarStore()
+	if !ok {
+		return nil
 	}
-	rec := recs[len(recs)-1]
-	if s.DB != nil {
-		if ss, ok := s.DB.(storage.ArtifactSidecarStore); ok {
-			sbomPath, sbomSum, sigPath, sigSum := "", "", "", ""
-			if kind == "sbom" {
-				sbomPath, sbomSum = path, sum
-			} else {
-				sigPath, sigSum = path, sum
-			}
-			if err := ss.SetArtifactSidecars(ctx, rec.ID, sbomPath, sbomSum, sigPath, sigSum); err != nil {
-				s.logError("artifact: sidecar attach failed", "artifact", rec.ID, "error", err.Error())
-			}
+	name := cleanBlobName(rec.Name)
+	if rec.SBOMSHA256 != "" {
+		if err := ss.ConsumePendingSidecar(ctx, jobID, name, storage.ArtifactSidecarKindSBOM, rec.SBOMSHA256); err != nil {
+			return err
+		}
+	}
+	if rec.SigstoreSHA256 != "" {
+		if err := ss.ConsumePendingSidecar(ctx, jobID, name, storage.ArtifactSidecarKindSigstore, rec.SigstoreSHA256); err != nil {
+			return err
+		}
+	}
+	return ss.DeletePendingSidecars(ctx, jobID)
+}
+
+// pruneExpiredPendingSidecars drops pending sidecar rows older than
+// pendingSidecarMaxAge. The maintenance tick calls it in both modes: DB
+// mode prunes the shared table, memory mode ages out the mirror. It never
+// deletes a CAS blob (digests may be referenced elsewhere).
+func (s *Server) pruneExpiredPendingSidecars(ctx context.Context, now time.Time) {
+	cutoff := now.UTC().Add(-pendingSidecarMaxAge)
+	if ss, ok := s.sidecarStore(); ok {
+		pctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		if _, err := ss.PrunePendingSidecars(pctx, cutoff); err != nil {
+			s.logError("sidecars: pending prune failed", "error", err.Error())
 		}
 		return
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, v := range s.pendingSidecars {
+		_, created, ok := decodePendingSidecar(v)
+		if !ok || created.Before(cutoff) {
+			delete(s.pendingSidecars, key)
+		}
+	}
+}
+
+// attachSidecarToArtifact links a verified sidecar (sbom/sigstore) to the
+// existing artifact record for base and returns an error when the link
+// cannot be durably recorded: DB mode persists the digest references
+// through the store (ArtifactSidecarStore), and a persistence failure must
+// fail the request closed (503) instead of acknowledging a sidecar the
+// record does not carry. No record yet is not a failure: the pending row
+// is resolved when the artifact payload is recorded. Memory mode updates
+// the in-memory record.
+func (s *Server) attachSidecarToArtifact(ctx context.Context, j model.Job, base, kind, path, sum string) error {
+	recs, err := s.findArtifactByJobName(ctx, j.RunID, j.ID, base)
+	if err != nil {
+		return err
+	}
+	if len(recs) == 0 {
+		return nil
+	}
+	rec := recs[len(recs)-1]
+	if s.DB != nil {
+		ss, ok := s.sidecarStore()
+		if !ok {
+			return fmt.Errorf("artifact sidecar store unavailable")
+		}
+		sbomPath, sbomSum, sigPath, sigSum := "", "", "", ""
+		if kind == storage.ArtifactSidecarKindSBOM {
+			sbomPath, sbomSum = path, sum
+		} else {
+			sigPath, sigSum = path, sum
+		}
+		return ss.SetArtifactSidecars(ctx, rec.ID, sbomPath, sbomSum, sigPath, sigSum)
+	}
+	s.mu.Lock()
 	if cur, ok := s.artifacts[rec.ID]; ok {
-		if kind == "sbom" {
+		if kind == storage.ArtifactSidecarKindSBOM {
 			cur.SBOMPath = path
 			cur.SBOMSHA256 = sum
 		} else {
@@ -306,12 +462,14 @@ func (s *Server) attachSidecarToArtifact(ctx context.Context, j model.Job, base,
 		_ = s.persistLocked()
 	}
 	s.mu.Unlock()
+	return nil
 }
 
 // gateArtifactAttestations enforces the SBOM/sigstore requirements at
 // artifact-payload upload time. The frozen contract is authoritative; the
 // pipeline text is never re-parsed. DB mode resolves the sidecar bytes
-// through CAS via the pending-sidecar digests; fs mode reads the local
+// through CAS via the DURABLE pending rows (any replica, surviving
+// restarts); fs/memory mode resolves the pending mirror or the local
 // sidecar files. It returns an HTTP error string on failure.
 func (s *Server) gateArtifactAttestations(ctx context.Context, c storage.ArtifactContract, j model.Job, base string, digest string, dir string) (int, string) {
 	if strings.TrimSpace(c.SBOM) != "" {
@@ -347,12 +505,18 @@ func (s *Server) gateArtifactAttestations(ctx context.Context, c storage.Artifac
 	return 0, ""
 }
 
-// sidecarBytes resolves one sidecar's bytes for the upload gate: through
-// CAS in DB mode (pending sidecar digest), from the local sidecar file in
-// fs mode.
+// sidecarBytes resolves one sidecar's bytes for the upload gate: from the
+// durable pending row in DB mode (the digest points into the shared CAS),
+// from the pending map when present, from the local sidecar file in
+// fs/memory mode otherwise. An unresolvable sidecar is reported as an
+// error so the gate fails closed.
 func (s *Server) sidecarBytes(ctx context.Context, j model.Job, base, kind, dir string) ([]byte, error) {
 	if s.DB != nil {
-		if d := s.pendingSidecarDigest(j.ID, base, kind); d != "" && s.CAS != nil {
+		d, ok, err := s.pendingSidecarDigest(ctx, j.ID, base, kind)
+		if err != nil {
+			return nil, err
+		}
+		if ok && d != "" && s.CAS != nil {
 			rc, _, err := s.CAS.Open(ctx, d)
 			if err != nil {
 				return nil, err
@@ -362,33 +526,56 @@ func (s *Server) sidecarBytes(ctx context.Context, j model.Job, base, kind, dir 
 		}
 		return nil, os.ErrNotExist
 	}
+	if d, ok, err := s.pendingSidecarDigest(ctx, j.ID, base, kind); err == nil && ok && d != "" && s.CAS != nil {
+		if rc, _, oerr := s.CAS.Open(ctx, d); oerr == nil {
+			defer rc.Close()
+			return io.ReadAll(io.LimitReader(rc, maxSBOMBytes+1))
+		}
+	}
 	return os.ReadFile(artifactSidecarPath(dir, base, kind))
 }
 
 // attachSidecarsToRecord fills the sidecar fields of a freshly built
-// artifact record: from the local sidecar files in fs mode, from the CAS
-// digest references in DB mode (the bytes already live in the shared
-// store).
-func (s *Server) attachSidecarsToRecord(ctx context.Context, rec *model.ArtifactRecord, j model.Job, base, dir string) {
+// artifact record: from the DURABLE pending-sidecar rows in DB mode (their
+// CAS digest references), from the pending mirror / local sidecar files in
+// fs mode. A store lookup failure is returned so the caller fails the
+// upload instead of recording an artifact that silently lost its attested
+// sidecars.
+func (s *Server) attachSidecarsToRecord(ctx context.Context, rec *model.ArtifactRecord, j model.Job, base, dir string) error {
 	if s.DB != nil {
-		if d := s.pendingSidecarDigest(j.ID, base, "sbom"); d != "" {
+		ss, ok := s.sidecarStore()
+		if !ok {
+			return fmt.Errorf("artifact sidecar store unavailable")
+		}
+		if d, ok, err := ss.PendingSidecar(ctx, j.ID, cleanBlobName(base), storage.ArtifactSidecarKindSBOM); err != nil {
+			return err
+		} else if ok && d != "" {
 			rec.SBOMPath = "cas:" + d
 			rec.SBOMSHA256 = d
 		}
-		if d := s.pendingSidecarDigest(j.ID, base, "sigstore"); d != "" {
+		if d, ok, err := ss.PendingSidecar(ctx, j.ID, cleanBlobName(base), storage.ArtifactSidecarKindSigstore); err != nil {
+			return err
+		} else if ok && d != "" {
 			rec.SigstorePath = "cas:" + d
 			rec.SigstoreSHA256 = d
 		}
-		return
+		return nil
 	}
-	if b, err := os.ReadFile(artifactSidecarPath(dir, base, "sbom")); err == nil && json.Valid(b) {
+	if d, ok, _ := s.pendingSidecarDigest(ctx, j.ID, base, storage.ArtifactSidecarKindSBOM); ok && d != "" && s.CAS != nil {
+		rec.SBOMPath = "cas:" + d
+		rec.SBOMSHA256 = d
+	} else if b, err := os.ReadFile(artifactSidecarPath(dir, base, "sbom")); err == nil && json.Valid(b) {
 		rec.SBOMPath = artifactSidecarPath(dir, base, "sbom")
 		rec.SBOMSHA256 = sha256Hex(b)
 	}
-	if b, err := os.ReadFile(artifactSidecarPath(dir, base, "sigstore")); err == nil && json.Valid(b) {
+	if d, ok, _ := s.pendingSidecarDigest(ctx, j.ID, base, storage.ArtifactSidecarKindSigstore); ok && d != "" && s.CAS != nil {
+		rec.SigstorePath = "cas:" + d
+		rec.SigstoreSHA256 = d
+	} else if b, err := os.ReadFile(artifactSidecarPath(dir, base, "sigstore")); err == nil && json.Valid(b) {
 		rec.SigstorePath = artifactSidecarPath(dir, base, "sigstore")
 		rec.SigstoreSHA256 = sha256Hex(b)
 	}
+	return nil
 }
 
 func sha256Hex(b []byte) string {

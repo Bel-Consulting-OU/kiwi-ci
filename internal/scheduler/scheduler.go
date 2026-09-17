@@ -164,19 +164,32 @@ func (s *DBScheduler) IsLeader(ctx context.Context) bool {
 	return got
 }
 
-// Enqueue inserts a run and its compiled jobs, then applies concurrency-group
-// supersession when requested: non-terminal runs sharing the same repository
-// and concurrency group are cancelled the same way the in-memory scheduler's
-// cancelRunLocked does. deps carries the same dependency edges already
-// embedded in each job's Needs field.
+// Enqueue inserts a run, its compiled jobs and their dependency edges
+// through the store's ONE atomic enqueue transaction
+// (storage.InsertCompiledRun): the run row, every job row, the dependency
+// edges, the supersession cancellations and their dependent/run
+// recomputation commit together or not at all.
+//
+// Supersession is NOT applied as a follow-up pass: when cancelInProgress is
+// set the request carries an in-transaction storage.SupersedePolicy, so the
+// store resolves the conflicting non-terminal runs of the same repository
+// and concurrency group inside the transaction and cancels them — jobs
+// terminal-cancelled with leases cleared, runner slots and quota released,
+// dependents recomputed — in the same commit that publishes the new run.
+// Concurrent superseding enqueues therefore serialize on the store's
+// per-(repository, group) transaction lock: exactly one run survives
+// non-terminal and no partial state is ever observable. A store without the
+// atomic contract fails closed instead of falling back to the sequential
+// run/job inserts.
 //
 // Queue deadlines are materialized here: a job whose QueueDeadline is unset
 // but whose compiled payload declares a queue_timeout gets its deadline
 // (CreatedAt + timeout) persisted with the insert, so the deadline is set at
 // enqueue for every DB-mode job.
 func (s *DBScheduler) Enqueue(ctx context.Context, run model.Run, jobs map[string]model.Job, deps map[string][]string, cancelInProgress bool) error {
-	if err := s.Store.InsertRun(ctx, run); err != nil {
-		return fmt.Errorf("scheduler: insert run: %w", err)
+	rs, ok := s.Store.(storage.RunEnqueueStore)
+	if !ok {
+		return errors.New("scheduler: store does not support the atomic enqueue transaction")
 	}
 	for id, j := range jobs {
 		if j.QueueDeadline == nil {
@@ -185,25 +198,17 @@ func (s *DBScheduler) Enqueue(ctx context.Context, run model.Run, jobs map[strin
 				j.QueueDeadline = &dl
 			}
 		}
-		if err := s.Store.InsertJob(ctx, j); err != nil {
-			return fmt.Errorf("scheduler: insert job %s: %w", id, err)
-		}
+		jobs[id] = j
 	}
-	if cancelInProgress && run.ConcurrencyGroup != "" {
-		runs, err := s.Store.ListRuns(ctx, 10000)
-		if err != nil {
-			return fmt.Errorf("scheduler: list runs for supersession: %w", err)
-		}
-		for _, old := range runs {
-			if old.ID == run.ID || old.Repo != run.Repo || old.ConcurrencyGroup != run.ConcurrencyGroup || old.Status.Terminal() {
-				continue
-			}
-			if _, err := s.Store.CancelRunJobs(ctx, old.ID, "superseded by run "+run.ID); err != nil {
-				log.Printf("scheduler: supersede run %s: %v", old.ID, err)
-			}
-		}
+	req := storage.InsertCompiledRunRequest{
+		Run:  run,
+		Jobs: jobs,
+		Deps: deps,
 	}
-	return nil
+	if cancelInProgress && run.ConcurrencyGroup != "" && run.Repo != "" {
+		req.Supersede = &storage.SupersedePolicy{Repo: run.Repo, ConcurrencyGroup: run.ConcurrencyGroup}
+	}
+	return rs.InsertCompiledRun(ctx, req)
 }
 
 // Lease claims the best available queued job for runnerID. It is leader-only.
@@ -321,7 +326,7 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 			ExpiresAt:              expires,
 			RunnerCapacity:         eff.Capacity,
 			Runtime:                storage.JobRuntime(candidate),
-			CanonRepoID:            storage.CanonicalRepoID(storage.RepoHost(candidate.RepoURL), candidate.RepoFullName),
+			CanonRepoID:            storage.RepoIDForJob(candidate),
 			RepoFullName:           candidate.RepoFullName,
 			RequiredLabels:         candidate.RequiredLabels,
 			PlacementRegions:       candidate.PlacementRegions,
@@ -635,7 +640,8 @@ func (s *DBScheduler) releaseQueuedQuota(ctx context.Context, j model.Job) {
 	if !ok {
 		return
 	}
-	if err := qs.AdjustQuotaCounter(ctx, j.RepoURL, storage.RepoTeamKey(j.RepoURL), 0, -1); err != nil {
+	repoID := storage.RepoIDForJob(j)
+	if err := qs.AdjustQuotaCounter(ctx, repoID, storage.RepoTeamKey(repoID), 0, -1); err != nil {
 		log.Printf("scheduler: release queued quota for job %s: %v", j.ID, err)
 	}
 }
@@ -752,11 +758,6 @@ func (s *DBScheduler) appendAudit(ctx context.Context, action, actor, runID, job
 // (container/tart/native) from the persisted compiled payload.
 func jobRuntimeCapability(j model.Job) string {
 	return storage.JobRuntime(j)
-}
-
-// repoHostFromURL extracts the forge host from a repo URL.
-func repoHostFromURL(repoURL string) string {
-	return storage.RepoHost(repoURL)
 }
 
 func appendUnique(in []string, v string) []string {

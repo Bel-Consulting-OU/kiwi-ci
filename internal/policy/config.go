@@ -3,6 +3,8 @@ package policy
 import (
 	"fmt"
 	"os"
+	"reflect"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 
@@ -219,16 +221,79 @@ func (c *Config) CompileOPA() (*OPAPolicy, error) {
 	return LoadOPAPolicy(src)
 }
 
-// CapabilitiesFor derives the capability intersection for a repository from
-// org-level and repo-level policy. The result must always be further
-// intersected with the caller's base capabilities and the trust floor.
+// RepoPolicyFor returns the repository policy entry for a canonical
+// repository identity ("<host>/<owner>/<name>"). Lookup is canonical-first;
+// see repoPolicy for the exact alias semantics.
+func (c *Config) RepoPolicyFor(repoID string) (RepoPolicy, bool) {
+	return c.repoPolicy(repoID)
+}
+
+// repoPolicy resolves the policy entry for a repository identity:
+//
+//   - an exact canonical ("<host>/<owner>/<name>") key wins;
+//   - an exact bare ("owner/name") key wins when the lookup key itself is
+//     bare;
+//   - on a canonical lookup miss, a bare key equal to the identity's
+//     owner/name is honored as an EXPLICIT legacy alias applying to every
+//     forge presenting that name (aliases are never derived implicitly);
+//   - a bare lookup key (a submission with no forge host) matches canonical
+//     keys sharing its owner/name only when exactly one DISTINCT entry
+//     exists: several different entries make the lookup ambiguous and
+//     resolve to no entry (fail closed) instead of depending on map
+//     iteration order.
+func (c *Config) repoPolicy(repoID string) (RepoPolicy, bool) {
+	if c == nil {
+		return RepoPolicy{}, false
+	}
+	repoID = strings.TrimSpace(repoID)
+	if rp, ok := c.Repositories[repoID]; ok {
+		return rp, true
+	}
+	_, bare, hasHost := splitCanonicalRepoKey(repoID)
+	if hasHost {
+		rp, ok := c.Repositories[bare]
+		return rp, ok
+	}
+	var match RepoPolicy
+	found, ambiguous := false, false
+	for key, rp := range c.Repositories {
+		if _, kb, kHost := splitCanonicalRepoKey(key); kHost && kb == repoID {
+			if !found {
+				match, found = rp, true
+			} else if !reflect.DeepEqual(rp, match) {
+				ambiguous = true
+			}
+		}
+	}
+	if found && !ambiguous {
+		return match, true
+	}
+	return RepoPolicy{}, false
+}
+
+// splitCanonicalRepoKey splits a canonical "host/owner/name" identity into
+// host and bare "owner/name" parts, reporting whether the input carried a
+// host. A dotted first segment alone is not enough: a canonical identity
+// always carries owner/name after the host, so the remainder must itself
+// contain a slash. Without that rule a GitLab group with a dot in its name
+// ("acme.co/service") would be misread as host "acme.co" + bare "service".
+// It mirrors auth's canonical split so policy lookups and RBAC agree.
+func splitCanonicalRepoKey(repo string) (host, bare string, hasHost bool) {
+	parts := strings.SplitN(repo, "/", 2)
+	if len(parts) == 2 && strings.Contains(parts[0], ".") && strings.Contains(parts[1], "/") {
+		return parts[0], parts[1], true
+	}
+	return "", repo, false
+}
+
 // GrantsFor returns the boolean capabilities explicitly granted by the
-// policy file for a repository: Deployments, CrossRepoTrigger, and
-// GenerateChildGraph are denied by the trust-domain defaults and can only be
-// enabled by an explicit policy statement. Unspecified grants stay false.
-func (c *Config) GrantsFor(repoFullName string) Capabilities {
+// policy file for a canonical repository identity: Deployments,
+// CrossRepoTrigger, and GenerateChildGraph are denied by the trust-domain
+// defaults and can only be enabled by an explicit policy statement.
+// Unspecified grants stay false.
+func (c *Config) GrantsFor(repoID string) Capabilities {
 	var g Capabilities
-	rp, ok := c.Repositories[repoFullName]
+	rp, ok := c.repoPolicy(repoID)
 	if !ok {
 		return g
 	}
@@ -238,8 +303,9 @@ func (c *Config) GrantsFor(repoFullName string) Capabilities {
 	return g
 }
 
-// CapabilitiesFor derives the capability RESTRICTION for a repository from
-// org-level and repo-level policy. Unspecified fields pass through
+// CapabilitiesFor derives the capability RESTRICTION for a canonical
+// repository identity ("<host>/<owner>/<name>") from org-level and
+// repo-level policy. Unspecified fields pass through
 // unrestricted (booleans true, Network Internet, nil sets), because the
 // result is intersected with the caller's base capabilities: a zero-value
 // field here would silently deny everything.
@@ -249,7 +315,7 @@ func (c *Config) GrantsFor(repoFullName string) Capabilities {
 // EMPTY list is a deny-all allowlist. A disjoint org/repo intersection is
 // therefore a non-nil empty list that denies everything, never an
 // unrestricted pass. The returned set is authoritative (Enforced=true).
-func (c *Config) CapabilitiesFor(repoFullName string) Capabilities {
+func (c *Config) CapabilitiesFor(repoID string) Capabilities {
 	rest := Capabilities{
 		NativeExecution:    true,
 		Container:          true,
@@ -291,7 +357,7 @@ func (c *Config) CapabilitiesFor(repoFullName string) Capabilities {
 			rest.Network = pipeline.NetworkPolicyNone
 		}
 	}
-	if rp, ok := c.Repositories[repoFullName]; ok {
+	if rp, ok := c.repoPolicy(repoID); ok {
 		if rp.SecretAllowlist != nil {
 			m := map[string]bool{}
 			for _, s := range rp.SecretAllowlist {
@@ -337,26 +403,30 @@ func (c *Config) CapabilitiesFor(repoFullName string) Capabilities {
 }
 
 // AllowedCloneHostsFor returns the effective clone-host allowlist for a
-// repository: the organization allowlist intersected with the repository
-// allowlist. nil means unrestricted, an empty non-nil list denies every
-// host (a disjoint org/repo intersection is deny-all, never "no
-// restriction"), and a non-empty list restricts to its entries.
-func (c *Config) AllowedCloneHostsFor(repoFullName string) []string {
-	return intersectStrings(c.AllowedCloneHosts, c.Repositories[repoFullName].AllowedCloneHosts)
+// canonical repository identity: the organization allowlist intersected
+// with the repository allowlist. nil means unrestricted, an empty non-nil
+// list denies every host (a disjoint org/repo intersection is deny-all,
+// never "no restriction"), and a non-empty list restricts to its entries.
+func (c *Config) AllowedCloneHostsFor(repoID string) []string {
+	rp, _ := c.repoPolicy(repoID)
+	return intersectStrings(c.AllowedCloneHosts, rp.AllowedCloneHosts)
 }
 
 // AllowedRegionsFor returns the effective placement-region allowlist for a
-// repository with the same nil/empty rules as AllowedCloneHostsFor.
-func (c *Config) AllowedRegionsFor(repoFullName string) []string {
-	return intersectStrings(c.AllowedRegions, c.Repositories[repoFullName].AllowedRegions)
+// canonical repository identity with the same nil/empty rules as
+// AllowedCloneHostsFor.
+func (c *Config) AllowedRegionsFor(repoID string) []string {
+	rp, _ := c.repoPolicy(repoID)
+	return intersectStrings(c.AllowedRegions, rp.AllowedRegions)
 }
 
 // CloneHostAllowed reports whether host is admitted by the effective
-// clone-host allowlist for repoFullName. A nil allowlist is unrestricted; a
-// non-nil allowlist admits only its entries, so an empty allowlist denies
-// every host — including an empty/unparseable host, which fails closed.
-func (c *Config) CloneHostAllowed(repoFullName, host string) bool {
-	allowed := c.AllowedCloneHostsFor(repoFullName)
+// clone-host allowlist for a canonical repository identity. A nil allowlist
+// is unrestricted; a non-nil allowlist admits only its entries, so an empty
+// allowlist denies every host — including an empty/unparseable host, which
+// fails closed.
+func (c *Config) CloneHostAllowed(repoID, host string) bool {
+	allowed := c.AllowedCloneHostsFor(repoID)
 	if allowed == nil {
 		return true
 	}
@@ -364,10 +434,10 @@ func (c *Config) CloneHostAllowed(repoFullName, host string) bool {
 }
 
 // RegionAllowed reports whether region is admitted by the effective
-// placement-region allowlist for repoFullName, with the same nil/empty
-// rules as CloneHostAllowed.
-func (c *Config) RegionAllowed(repoFullName, region string) bool {
-	allowed := c.AllowedRegionsFor(repoFullName)
+// placement-region allowlist for a canonical repository identity, with the
+// same nil/empty rules as CloneHostAllowed.
+func (c *Config) RegionAllowed(repoID, region string) bool {
+	allowed := c.AllowedRegionsFor(repoID)
 	if allowed == nil {
 		return true
 	}

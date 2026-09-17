@@ -111,8 +111,9 @@ func TestEnqueueDBSupersessionCancelsAtomically(t *testing.T) {
 	if w := doJSON(t, s, http.MethodPost, "/api/v1/runs", "token", body); w.Code != http.StatusAccepted {
 		t.Fatalf("first submit = %d: %s", w.Code, w.Body.String())
 	}
-	// A second run in the same concurrency group cancels the first run's
-	// queued job inside the enqueue transaction.
+	// A second run in the same concurrency group cancels the first run and
+	// its queued job inside the enqueue transaction, resolved from the
+	// in-transaction policy (never a pre-read list).
 	var second model.Run
 	w := doJSON(t, s, http.MethodPost, "/api/v1/runs", "token", body)
 	if w.Code != http.StatusAccepted {
@@ -123,6 +124,16 @@ func TestEnqueueDBSupersessionCancelsAtomically(t *testing.T) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if len(f.compiledCalls) != 2 {
+		t.Fatalf("InsertCompiledRun calls = %d, want 2", len(f.compiledCalls))
+	}
+	req := f.compiledCalls[1]
+	if req.Supersede == nil || req.Supersede.Repo != "https://github.com/o/r.git" || req.Supersede.ConcurrencyGroup != "grp" {
+		t.Fatalf("second enqueue supersede policy = %+v", req.Supersede)
+	}
+	if len(req.CancelPrevious) != 0 {
+		t.Fatalf("second enqueue precomputed cancel list = %v, want none", req.CancelPrevious)
+	}
 	var cancelled model.Job
 	found := false
 	for _, j := range f.jobs {
@@ -136,6 +147,186 @@ func TestEnqueueDBSupersessionCancelsAtomically(t *testing.T) {
 	}
 	if cancelled.Error != "superseded by run "+second.ID {
 		t.Fatalf("superseded error = %q", cancelled.Error)
+	}
+	if prev, ok := f.runs[cancelled.RunID]; !ok || prev.Status != model.StatusCancelled {
+		t.Fatalf("superseded run = %+v, want cancelled in the same commit", prev)
+	}
+	supersededAudits := 0
+	for _, e := range f.audit {
+		if e.Action == "job.superseded" {
+			supersededAudits++
+		}
+	}
+	if supersededAudits != 1 {
+		t.Fatalf("job.superseded audit rows = %d, want 1", supersededAudits)
+	}
+}
+
+// TestEnqueueDBMidSupersessionFailureLeavesOldRun injects a storage failure
+// while the enqueue is cancelling the superseded run: the submit must fail
+// as a whole, the superseded run and its job must be unchanged, and no row
+// of the new run (or its audit trail) may exist.
+func TestEnqueueDBMidSupersessionFailureLeavesOldRun(t *testing.T) {
+	f := newDBFakeStore()
+	s := New("token")
+	if err := s.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"repo_url":"https://github.com/o/r.git","repo_full_name":"o/r","ref":"refs/heads/main","sha":"abc","pipeline":` + jsonString(concurrencyPipeline) + `}`
+	if w := doJSON(t, s, http.MethodPost, "/api/v1/runs", "token", body); w.Code != http.StatusAccepted {
+		t.Fatalf("first submit = %d: %s", w.Code, w.Body.String())
+	}
+	f.mu.Lock()
+	runsBefore := len(f.runs)
+	jobsBefore := len(f.jobs)
+	auditBefore := len(f.audit)
+	var oldRunID, oldJobID string
+	for id, r := range f.runs {
+		oldRunID = id
+		_ = r
+	}
+	for id, j := range f.jobs {
+		oldJobID = id
+		_ = j
+	}
+	f.mu.Unlock()
+	f.enqueueFailDuringSupersede = true
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runs", "token", body)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("failing supersession submit = %d, want 400: %s", w.Code, w.Body.String())
+	}
+	f.mu.Lock()
+	if len(f.runs) != runsBefore || len(f.jobs) != jobsBefore {
+		f.mu.Unlock()
+		t.Fatalf("failed supersession leaked rows: %d/%d runs, %d/%d jobs", len(f.runs), runsBefore, len(f.jobs), jobsBefore)
+	}
+	oldRun, ok := f.runs[oldRunID]
+	if !ok || oldRun.Status.Terminal() {
+		f.mu.Unlock()
+		t.Fatalf("superseded run mutated by the failed enqueue: %+v ok=%v", oldRun, ok)
+	}
+	oldJob, ok := f.jobs[oldJobID]
+	if !ok || oldJob.Status.Terminal() || oldJob.LeaseRunnerID != "" {
+		f.mu.Unlock()
+		t.Fatalf("superseded job mutated by the failed enqueue: %+v ok=%v", oldJob, ok)
+	}
+	auditAfter := len(f.audit)
+	f.mu.Unlock()
+	if auditAfter != auditBefore {
+		t.Fatalf("failed supersession wrote %d audit rows", auditAfter-auditBefore)
+	}
+	// The follow-up submission (no injected fault) still supersedes cleanly.
+	if w := doJSON(t, s, http.MethodPost, "/api/v1/runs", "token", body); w.Code != http.StatusAccepted {
+		t.Fatalf("recovery submit = %d: %s", w.Code, w.Body.String())
+	}
+	f.mu.Lock()
+	prev, ok := f.runs[oldRunID]
+	f.mu.Unlock()
+	if !ok || prev.Status != model.StatusCancelled {
+		t.Fatalf("recovery supersession left old run %+v ok=%v, want cancelled", prev, ok)
+	}
+}
+
+// TestEnqueueMemorySupersedeCancelsOldRun proves the dev-mode (in-memory)
+// enqueue applies supersession before publishing the new run under s.mu: the
+// prior run and its jobs are cancelled in the same critical section that
+// inserts the successor, so the pair is never observable half-applied.
+func TestEnqueueMemorySupersedeCancelsOldRun(t *testing.T) {
+	s := New("token")
+	body := `{"repo_url":"https://github.com/o/r.git","repo_full_name":"o/r","ref":"refs/heads/main","sha":"abc","pipeline":` + jsonString(concurrencyPipeline) + `}`
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runs", "token", body)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("first submit = %d: %s", w.Code, w.Body.String())
+	}
+	var first model.Run
+	if err := json.Unmarshal(w.Body.Bytes(), &first); err != nil {
+		t.Fatal(err)
+	}
+	w = doJSON(t, s, http.MethodPost, "/api/v1/runs", "token", body)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("second submit = %d: %s", w.Code, w.Body.String())
+	}
+	var second model.Run
+	if err := json.Unmarshal(w.Body.Bytes(), &second); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prev, ok := s.runs[first.ID]
+	if !ok || prev.Status != model.StatusCancelled || prev.FinishedAt == nil {
+		t.Fatalf("superseded memory run = %+v ok=%v, want cancelled with finished_at", prev, ok)
+	}
+	if next, ok := s.runs[second.ID]; !ok || next.Status.Terminal() {
+		t.Fatalf("successor memory run = %+v ok=%v, want non-terminal", next, ok)
+	}
+	oldJobs, newJobs := 0, 0
+	for _, j := range s.jobs {
+		switch j.RunID {
+		case first.ID:
+			oldJobs++
+			if j.Status != model.StatusCancelled {
+				t.Fatalf("superseded memory job = %s, want cancelled", j.Status)
+			}
+			if j.LeaseRunnerID != "" || j.LeaseTokenHash != nil || j.LeaseExpiresAt != nil {
+				t.Fatalf("superseded memory job kept lease state: %+v", j)
+			}
+		case second.ID:
+			newJobs++
+			if j.Status.Terminal() {
+				t.Fatalf("successor memory job = %s, want non-terminal", j.Status)
+			}
+		}
+	}
+	if oldJobs != 1 || newJobs != 1 {
+		t.Fatalf("memory jobs = %d old / %d new, want 1/1 (no partial state)", oldJobs, newJobs)
+	}
+}
+
+// TestEnqueueDBConcurrentSupersedeSingleWinner races HTTP submissions in one
+// concurrency group: the store serializes the in-transaction supersession,
+// so exactly one run stays non-terminal and every committed run carries its
+// complete job set.
+func TestEnqueueDBConcurrentSupersedeSingleWinner(t *testing.T) {
+	f := newDBFakeStore()
+	s := New("token")
+	if err := s.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"repo_url":"https://github.com/o/r.git","repo_full_name":"o/r","ref":"refs/heads/main","sha":"abc","pipeline":` + jsonString(concurrencyPipeline) + `}`
+	const submits = 6
+	var wg sync.WaitGroup
+	for i := 0; i < submits; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if w := doJSON(t, s, http.MethodPost, "/api/v1/runs", "token", body); w.Code != http.StatusAccepted {
+				t.Errorf("concurrent submit = %d: %s", w.Code, w.Body.String())
+			}
+		}()
+	}
+	wg.Wait()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	active := 0
+	for id, r := range f.runs {
+		if !r.Status.Terminal() {
+			active++
+		}
+		jobs := 0
+		for _, j := range f.jobs {
+			if j.RunID == id {
+				jobs++
+			}
+		}
+		if jobs != 1 {
+			t.Fatalf("run %s carries %d jobs, want exactly 1", id, jobs)
+		}
+	}
+	if active != 1 {
+		t.Fatalf("non-terminal runs = %d, want exactly one winner", active)
+	}
+	if len(f.runs) != submits {
+		t.Fatalf("runs = %d, want %d (every submission committed)", len(f.runs), submits)
 	}
 }
 
@@ -532,11 +723,12 @@ func TestDownstreamForgeIdentityPersisted(t *testing.T) {
 	if !ok {
 		t.Fatal("link missing")
 	}
-	if link.TargetForge != "forgejo" || link.TargetBaseURL != "https://forgejo.internal.example" || link.TargetRepoID != "acme/child" {
+	if link.TargetForge != "forgejo" || link.TargetBaseURL != "https://forgejo.internal.example" || link.TargetRepoID != "forgejo.internal.example/acme/child" {
 		t.Fatalf("forge identity = %+v", link)
 	}
-	// The derived clone URL uses the persisted base URL, not a public host.
-	if got := downstreamCloneURL(link.TargetForge, link.TargetBaseURL, link.TargetRepoID); got != "https://forgejo.internal.example/acme/child" {
+	// The derived clone URL uses the persisted base URL and the bare target
+	// repository name (the canonical RepoID is the identity, not a path).
+	if got := downstreamCloneURL(link.TargetForge, link.TargetBaseURL, link.TargetRepo); got != "https://forgejo.internal.example/acme/child" {
 		t.Fatalf("clone url = %q", got)
 	}
 }

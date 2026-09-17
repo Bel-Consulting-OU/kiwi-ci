@@ -10,10 +10,16 @@ import (
 type SubmitRun struct {
 	RepoURL      string `json:"repo_url"`
 	RepoFullName string `json:"repo_full_name,omitempty"`
-	Ref          string `json:"ref"`
-	SHA          string `json:"sha,omitempty"`
-	Event        string `json:"event,omitempty"`
-	Pipeline     string `json:"pipeline"`
+	// RepoID is the canonical repository identity. It is never accepted
+	// from client JSON: direct API submissions derive it at ingress from
+	// repo_url + repo_full_name, while internal ingresses (webhook
+	// handlers, schedules, downstream children, reruns) set the derived or
+	// persisted identity here.
+	RepoID   string `json:"-"`
+	Ref      string `json:"ref"`
+	SHA      string `json:"sha,omitempty"`
+	Event    string `json:"event,omitempty"`
+	Pipeline string `json:"pipeline"`
 	// Trusted is deliberately never accepted from client JSON: direct API
 	// submissions are untrusted. Only forge webhook handlers and internal
 	// reruns (which copy the previous run's trust) set it in Go code.
@@ -95,9 +101,11 @@ type Complete struct {
 // request. The caller authenticates with the enrollment token or a
 // single-use enrollment grant; CSR is the PEM certificate request base64
 // (standard) encoded. Labels are the enrollment's requested runner
-// metadata; a label-bound grant requires every bound label to be present.
-// The CSR's identity fields are ignored: the server synthesizes the
-// certificate identity from RunnerID.
+// metadata, advisory only: a grant with an allowed-label set permits the
+// request only when every requested label is in that set, and the labels
+// are discarded afterwards (scheduling labels come from the registration
+// profile, never from enrollment). The CSR's identity fields are ignored:
+// the server synthesizes the certificate identity from RunnerID.
 type EnrollRequest struct {
 	RunnerID string   `json:"runner_id"`
 	CSR      string   `json:"csr"`

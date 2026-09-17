@@ -23,6 +23,7 @@ type JobDTO struct {
 	RunID                  string                       `json:"run_id"`
 	Key                    string                       `json:"key"`
 	BaseKey                string                       `json:"base_key,omitempty"`
+	RepoID                 string                       `json:"repo_id,omitempty"`
 	RepoURL                string                       `json:"repo_url"`
 	Ref                    string                       `json:"ref,omitempty"`
 	SHA                    string                       `json:"sha,omitempty"`
@@ -64,9 +65,12 @@ type JobDTO struct {
 }
 
 // RunDTO is the run shape returned by list/status endpoints. It mirrors
-// model.Run exactly (runs are not redacted today).
+// model.Run exactly (runs are not redacted today). RepoID is the canonical
+// repository identity, exposed additively; Repo/RepoFullName stay the
+// display/clone fields.
 type RunDTO struct {
 	ID               string            `json:"id"`
+	RepoID           string            `json:"repo_id,omitempty"`
 	Repo             string            `json:"repo,omitempty"`
 	RepoFullName     string            `json:"repo_full_name,omitempty"`
 	Ref              string            `json:"ref,omitempty"`
@@ -159,7 +163,8 @@ type ArtifactDTO struct {
 // JobDTOFrom maps a model.Job into the redacted public DTO.
 func JobDTOFrom(j model.Job) JobDTO {
 	return JobDTO{
-		ID: j.ID, RunID: j.RunID, Key: j.Key, BaseKey: j.BaseKey, RepoURL: j.RepoURL,
+		ID: j.ID, RunID: j.RunID, Key: j.Key, BaseKey: j.BaseKey,
+		RepoID: j.RepoID, RepoURL: j.RepoURL,
 		Ref: j.Ref, SHA: j.SHA, Event: j.Event, Condition: j.Condition,
 		DependencyStatus: j.DependencyStatus, Pipeline: "",
 		Trusted: j.Trusted, ChangedFiles: j.ChangedFiles, Needs: j.Needs,
@@ -181,7 +186,7 @@ func JobDTOFrom(j model.Job) JobDTO {
 // RunDTOFrom maps a model.Run into the public DTO.
 func RunDTOFrom(r model.Run) RunDTO {
 	return RunDTO{
-		ID: r.ID, Repo: r.Repo, RepoFullName: r.RepoFullName, Ref: r.Ref, SHA: r.SHA,
+		ID: r.ID, RepoID: r.RepoID, Repo: r.Repo, RepoFullName: r.RepoFullName, Ref: r.Ref, SHA: r.SHA,
 		Event: r.Event, Status: r.Status, Trusted: r.Trusted,
 		ConcurrencyGroup: r.ConcurrencyGroup, CreatedAt: time.Time(r.CreatedAt),
 		StartedAt: jsonTimePtr(r.StartedAt), FinishedAt: jsonTimePtr(r.FinishedAt),

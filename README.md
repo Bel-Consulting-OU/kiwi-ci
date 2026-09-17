@@ -192,19 +192,50 @@ Build your own with `make release` (cross-compiled bundle) and
 
 ## CI status
 
-Every push to `main` and every pull request runs the full matrix in
-`.github/workflows/ci.yml`: `format`, `vet`, `unit` on Ubuntu, macOS
-and Windows, `race` on Ubuntu and macOS, a Windows concurrent stress
-lane (the race detector is unavailable on Windows), `adversarial`,
-`fuzz-smoke`, `schema`, `cross`, `staticcheck`, `govulncheck`,
-`license`, `docs`, and `repro`. A nightly fuzz run
-(`nightly-fuzz.yml`) keeps the fuzz corpus warm, and releases are
-gated on `govulncheck` plus mandatory provenance signing (see
-`.github/workflows/release.yml`).
+CI runs on [Woodpecker CI](https://woodpecker-ci.org) (`.woodpecker.yml`);
+the GitHub Actions workflows have been removed. Every push, pull request,
+manual run and tag executes one pipeline with these lanes:
 
-`main` is branch-protected: merges require a pull request, all
-required checks green, and the branch up-to-date with `main`; admins
-are not exempt. The protection rule is applied idempotently by
-`make protect-branch` (`scripts/gh-branch-protection.sh`, repo-admin
-token required). Dependabot keeps Go modules and GitHub Actions up to
-date with weekly PRs (`.github/dependabot.yml`).
+- `format`, `vet`: `gofmt -l` and `go vet ./...`.
+- `unit`, `race`: `go test -shuffle=on -timeout=15m ./...` and the race
+  detector build; both run on a `linux/amd64` and a `linux/arm64` matrix leg
+  (the arm64 entry needs an agent labelled `platform=linux/arm64`; remove the
+  matrix entry when the fleet has none).
+- `adversarial`, `fuzz-smoke`: the adversarial/security/property suites and
+  10-second fuzz smoke over every registered fuzz target.
+- `schema`: pipeline schema tests plus `go run ./cmd/filemap --check`.
+- `cross`, `docs`, `license`, `repro`: cross-compilation, documentation and
+  licence presence checks, and byte-identical reproducible builds.
+- `staticcheck` (`honnef.co/go/tools/cmd/staticcheck@v0.8.1`) and
+  `govulncheck` (`golang.org/x/vuln/cmd/govulncheck@v1.8.0`, needs network):
+  pinned tool versions, cached through the shared `/go` workspace volume.
+- `smoke`: builds the binary and validates `.kiwi/pipeline.yaml` and
+  `examples/kiwi.yaml` (container-free; `kiwi run` needs a container runtime
+  and is covered by the executor test suites).
+- `coverage`: `go test -coverprofile=coverage.out ./...` prints the total and
+  enforces the floor through `scripts/coverage-floor.sh` (default
+  `KC_MIN_COVERAGE=60`).
+- `integration-postgres`: a real PostgreSQL 16 service container, a
+  stdlib-only readiness probe, then
+  `KIWI_TEST_POSTGRES_URL=... go test -count=1 -timeout=20m -run Integration
+  ./internal/storage ./internal/scheduler ./internal/server`. The tests create
+  and drop their own `kiwi_it_<random>` schema per test, so the lane is
+  repeatable and never touches shared tables.
+
+A `nightly` cron job in the Woodpecker repository settings (schedule
+`0 3 * * *`, branch `main`) runs the `fuzz-nightly` step: every fuzz target
+for 30 seconds.
+
+Woodpecker reports one commit status per workflow leg. With the server
+defaults (`WOODPECKER_STATUS_CONTEXT=ci/woodpecker` and the default context
+format with a `/<axis_id>` suffix for matrix legs) this pipeline reports
+`ci/woodpecker/push/woodpecker/1` (amd64) and `.../2` (arm64) on pushes, and
+the matching `/pr/` contexts on pull requests. `main` is branch-protected:
+merges require a pull request, those Woodpecker contexts green, and the branch
+up-to-date with `main`; admins are not exempt. The protection rule is applied
+idempotently by `make protect-branch` (`scripts/gh-branch-protection.sh`,
+repo-admin token required); the required contexts are configurable
+(`KIWI_WOODPECKER_CONTEXTS`) and must match the Woodpecker instance
+configuration. Dependabot keeps Go modules up to date with weekly PRs
+(`.github/dependabot.yml`); CI tool versions are pinned in `.woodpecker.yml`
+and upgraded deliberately (see [docs/upgrades.md](docs/upgrades.md)).

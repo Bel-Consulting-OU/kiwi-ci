@@ -2,7 +2,10 @@ package storage
 
 import (
 	"errors"
+	"fmt"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -85,18 +88,264 @@ func TestMemStoreInsertCompiledRunSupersession(t *testing.T) {
 	}
 }
 
+// TestMemStoreDuplicateDeliveryRollsBackSupersession proves a replayed
+// webhook delivery rolls the WHOLE enqueue back — the staged supersede
+// cancellations included — exactly like the SQL transaction: the old run and
+// its jobs stay untouched and the new run never exists.
+func TestMemStoreDuplicateDeliveryRollsBackSupersession(t *testing.T) {
+	repo := "https://github.com/o/r.git"
+	m := newMemStore()
+	old := compiledRunRequest("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac", repo)
+	old.Run.ConcurrencyGroup = "grp"
+	old.Run.Status = model.StatusRunning
+	if err := m.InsertCompiledRun(ctx(), old); err != nil {
+		t.Fatal(err)
+	}
+	// A prior delivery of del-1 was already processed by another run.
+	if err := m.UpsertDelivery(ctx(), "github", "del-1", "cccccccccccccccccccccccccccccccc", "digest"); err != nil {
+		t.Fatal(err)
+	}
+	baseline := m.snapshot()
+	dup := compiledRunRequest("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaae", repo)
+	dup.Run.ConcurrencyGroup = "grp"
+	dup.Supersede = &SupersedePolicy{Repo: repo, ConcurrencyGroup: "grp"}
+	dup.WebhookClaim = &WebhookClaim{Forge: "github", DeliveryID: "del-1", RunID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad"}
+	dup.Quota = &QuotaReservation{RepoKey: repo, JobCount: 1}
+	if err := m.InsertCompiledRun(ctx(), dup); !errors.Is(err, ErrDeliveryDuplicate) {
+		t.Fatalf("duplicate delivery = %v, want ErrDeliveryDuplicate", err)
+	}
+	if after := m.snapshot(); !reflect.DeepEqual(after, baseline) {
+		t.Fatalf("replayed delivery left partial state (supersession not rolled back):\n before: %+v\n after:  %+v", baseline, after)
+	}
+}
+
+// TestMemStoreSupersedePolicyAtomic proves the in-transaction supersede
+// policy: conflicting non-terminal runs are cancelled in the SAME commit as
+// the new run — jobs terminal-cancelled with leases cleared, the running
+// job's runner slot and quota released, dependents re-evaluated, and the
+// superseded run marked cancelled — while runs of other groups stay
+// untouched and the whole request either commits or leaves no trace.
+func TestMemStoreSupersedePolicyAtomic(t *testing.T) {
+	repo := "https://github.com/o/r.git"
+	repoID := RepoIDFor("", repo, "o/r")
+	oldRunID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"
+	oldJobID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac"
+	runningJobID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaf"
+	otherRunID := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	otherJobID := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbc"
+	depRunID := "dddddddddddddddddddddddddddddddd"
+	depJobID := "dddddddddddddddddddddddddddddddc"
+	newRunID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad"
+	newJobID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaae"
+
+	m := newMemStore()
+	old := InsertCompiledRunRequest{
+		Run: model.Run{ID: oldRunID, Repo: repo, ConcurrencyGroup: "grp", Status: model.StatusRunning, CreatedAt: time.Unix(1000, 0).UTC()},
+		Jobs: map[string]model.Job{
+			oldJobID:     {ID: oldJobID, RunID: oldRunID, RepoURL: repo, Status: model.StatusQueued, CreatedAt: time.Unix(1001, 0).UTC()},
+			runningJobID: {ID: runningJobID, RunID: oldRunID, RepoURL: repo, Status: model.StatusQueued, CreatedAt: time.Unix(1002, 0).UTC()},
+		},
+		Quota: &QuotaReservation{RepoKey: repoID, JobCount: 2},
+	}
+	if err := m.InsertCompiledRun(ctx(), old); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.UpsertRunner(ctx(), model.Runner{ID: leaseRunner, Capacity: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.AcquireLeaseAtomic(ctx(), leaseClaimFor(runningJobID, leaseRunner, 1)); err != nil {
+		t.Fatal(err)
+	}
+	// An unrelated run of the same repository but another concurrency group.
+	other := compiledRunRequest(otherRunID, otherJobID, repo)
+	other.Run.ConcurrencyGroup = "other"
+	other.Run.Status = model.StatusRunning
+	other.Quota = &QuotaReservation{RepoKey: repoID, JobCount: 1}
+	if err := m.InsertCompiledRun(ctx(), other); err != nil {
+		t.Fatal(err)
+	}
+	// A dependent in another run, gated on the superseded job's success: the
+	// supersession must re-evaluate it and block it in the same commit.
+	if err := m.InsertRun(ctx(), model.Run{ID: depRunID, Repo: repo, Status: model.StatusQueued, CreatedAt: time.Unix(1100, 0).UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.InsertJob(ctx(), model.Job{ID: depJobID, RunID: depRunID, RepoURL: repo, Status: model.StatusQueued, Condition: "success()", Needs: []string{oldJobID}, CreatedAt: time.Unix(1101, 0).UTC()}); err != nil {
+		t.Fatal(err)
+	}
+
+	next := InsertCompiledRunRequest{
+		Run:          model.Run{ID: newRunID, Repo: repo, ConcurrencyGroup: "grp", Status: model.StatusQueued, CreatedAt: time.Unix(2000, 0).UTC()},
+		Jobs:         map[string]model.Job{newJobID: {ID: newJobID, RunID: newRunID, RepoURL: repo, Status: model.StatusQueued, CreatedAt: time.Unix(2001, 0).UTC()}},
+		Supersede:    &SupersedePolicy{Repo: repo, ConcurrencyGroup: "grp"},
+		WebhookClaim: &WebhookClaim{Forge: "github", DeliveryID: "del-sup", RunID: newRunID},
+		Quota:        &QuotaReservation{RepoKey: repoID, JobCount: 1},
+	}
+	if err := m.InsertCompiledRun(ctx(), next); err != nil {
+		t.Fatal(err)
+	}
+
+	// Superseded jobs: terminal-cancelled, leases cleared.
+	for _, id := range []string{oldJobID, runningJobID} {
+		j, err := m.GetJob(ctx(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if j.Status != model.StatusCancelled || j.Error != "superseded by run "+newRunID {
+			t.Fatalf("superseded job %s = %s/%q", id, j.Status, j.Error)
+		}
+		if j.LeaseRunnerID != "" || j.LeaseTokenHash != nil || j.LeaseExpiresAt != nil {
+			t.Fatalf("superseded job %s kept lease state: %+v", id, j)
+		}
+	}
+	// Superseded run cancelled in the same commit.
+	if prev, err := m.GetRun(ctx(), oldRunID); err != nil || prev.Status != model.StatusCancelled || prev.FinishedAt == nil {
+		t.Fatalf("superseded run = %+v err=%v, want cancelled with finished_at", prev, err)
+	}
+	// Runner slot released.
+	if ri, err := m.GetRunner(ctx(), leaseRunner); err != nil || len(ri.ActiveJobs) != 0 || ri.Busy {
+		t.Fatalf("runner after supersession = %+v err=%v, want released slot", ri, err)
+	}
+	// Quota: the running and queued predecessor slots released, the
+	// successor's single queued slot reserved.
+	running, queued, err := m.QuotaCounts(ctx(), RepoIDFor("", repo, "o/r"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if running != 0 || queued != 2 {
+		t.Fatalf("quota after supersession = %d/%d, want 0/2 (successor + unrelated)", running, queued)
+	}
+	// Unrelated run and group untouched.
+	otherJob, _ := m.GetJob(ctx(), otherJobID)
+	if otherJob.Status != model.StatusQueued {
+		t.Fatalf("unrelated job = %s, want queued", otherJob.Status)
+	}
+	if otherRun, _ := m.GetRun(ctx(), otherRunID); otherRun.Status != model.StatusRunning {
+		t.Fatalf("unrelated run = %s, want running", otherRun.Status)
+	}
+	// Dependent recomputed and blocked in the same commit.
+	dep, _ := m.GetJob(ctx(), depJobID)
+	if dep.Status != model.StatusBlocked || dep.DependencyStatus != model.StatusCancelled {
+		t.Fatalf("dependent = %s/%s, want blocked/cancelled", dep.Status, dep.DependencyStatus)
+	}
+	// The successor is committed with its job and delivery claim.
+	if nextRun, err := m.GetRun(ctx(), newRunID); err != nil || nextRun.Status != model.StatusQueued {
+		t.Fatalf("successor run = %+v err=%v", nextRun, err)
+	}
+	if got, err := m.GetJob(ctx(), newJobID); err != nil || got.Status != model.StatusQueued {
+		t.Fatalf("successor job = %+v err=%v", got, err)
+	}
+	if _, ok, _ := m.FindDelivery(ctx(), "github", "del-sup"); !ok {
+		t.Fatal("successful enqueue lost the delivery claim")
+	}
+}
+
+// TestMemStoreInsertCompiledRunDepsAuthoritative proves the request's Deps
+// map is the authoritative dependency-edge source: an entry (including an
+// explicitly empty list) replaces the job's Needs, and jobs without an entry
+// keep their own Needs.
+func TestMemStoreInsertCompiledRunDepsAuthoritative(t *testing.T) {
+	m := newMemStore()
+	repo := "https://github.com/o/r.git"
+	jobA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaae"
+	jobB := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaf"
+	req := InsertCompiledRunRequest{
+		Run: model.Run{ID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad", Repo: repo, Status: model.StatusQueued, CreatedAt: time.Unix(2000, 0).UTC()},
+		Jobs: map[string]model.Job{
+			jobA: {ID: jobA, RunID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad", RepoURL: repo, Status: model.StatusQueued, Needs: []string{"stale"}},
+			jobB: {ID: jobB, RunID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad", RepoURL: repo, Status: model.StatusQueued, Needs: []string{jobA}},
+		},
+		Deps: map[string][]string{jobA: {}},
+	}
+	if err := m.InsertCompiledRun(ctx(), req); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := m.GetJob(ctx(), jobA)
+	if len(a.Needs) != 0 {
+		t.Fatalf("job with explicit empty deps kept needs %v", a.Needs)
+	}
+	b, _ := m.GetJob(ctx(), jobB)
+	if len(b.Needs) != 1 || b.Needs[0] != jobA {
+		t.Fatalf("job without a deps entry needs = %v, want [%s]", b.Needs, jobA)
+	}
+}
+
+// TestMemStoreConcurrentSupersedeSingleWinner races superseding enqueues in
+// one concurrency group through the memory store: every request commits
+// completely or not at all (each run carries exactly its own job), the old
+// run is cancelled, and exactly one run stays non-terminal.
+func TestMemStoreConcurrentSupersedeSingleWinner(t *testing.T) {
+	repo := "https://github.com/o/r.git"
+	m := newMemStore()
+	old := compiledRunRequest("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac", repo)
+	old.Run.ConcurrencyGroup = "grp"
+	old.Run.Status = model.StatusRunning
+	if err := m.InsertCompiledRun(ctx(), old); err != nil {
+		t.Fatal(err)
+	}
+	const enqueues = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, enqueues)
+	for i := 0; i < enqueues; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			runID := fmt.Sprintf("eeeeeeeeeeeeeeeeeeeeeeeeeeee%04d", n)
+			jobID := fmt.Sprintf("ffffffffffffffffffffffffffff%04d", n)
+			errs <- m.InsertCompiledRun(ctx(), InsertCompiledRunRequest{
+				Run:       model.Run{ID: runID, Repo: repo, ConcurrencyGroup: "grp", Status: model.StatusQueued, CreatedAt: time.Unix(3000+int64(n), 0).UTC()},
+				Jobs:      map[string]model.Job{jobID: {ID: jobID, RunID: runID, RepoURL: repo, Status: model.StatusQueued, CreatedAt: time.Unix(3000+int64(n), 0).UTC()}},
+				Supersede: &SupersedePolicy{Repo: repo, ConcurrencyGroup: "grp"},
+			})
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent superseding enqueue: %v", err)
+		}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if prev := m.runs["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"]; prev.Status != model.StatusCancelled {
+		t.Fatalf("old run status = %s, want cancelled", prev.Status)
+	}
+	active := 0
+	for id, r := range m.runs {
+		if id == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab" || r.ConcurrencyGroup != "grp" {
+			continue
+		}
+		if !r.Status.Terminal() {
+			active++
+		}
+		jobs := 0
+		for _, j := range m.jobs {
+			if j.RunID == id {
+				jobs++
+			}
+		}
+		if jobs != 1 {
+			t.Fatalf("run %s carries %d jobs, want exactly 1 (no partial state)", id, jobs)
+		}
+	}
+	if active != 1 {
+		t.Fatalf("non-terminal runs in the group = %d, want exactly one winner", active)
+	}
+}
+
 // TestMemStoreQuotaReservationLifecycle proves the reserved counters are
 // decremented on cancel and complete.
 func TestMemStoreQuotaReservationLifecycle(t *testing.T) {
 	m := newMemStore()
 	seedRunner(m)
 	repo := "https://github.com/o/r.git"
+	repoID := RepoIDFor("", repo, "o/r")
 	req := compiledRunRequest("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaae", repo)
-	req.Quota = &QuotaReservation{RepoKey: repo, JobCount: 1}
+	req.Quota = &QuotaReservation{RepoKey: repoID, JobCount: 1}
 	if err := m.InsertCompiledRun(ctx(), req); err != nil {
 		t.Fatal(err)
 	}
-	running, queued, err := m.QuotaCounts(ctx(), repo, "")
+	running, queued, err := m.QuotaCounts(ctx(), repoID, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +356,7 @@ func TestMemStoreQuotaReservationLifecycle(t *testing.T) {
 	if _, err := m.AcquireLeaseAtomic(ctx(), LeaseClaim{JobID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaae", RunnerID: testRunner.ID, TokenHash: []byte("h"), Generation: 1, ExpiresAt: time.Unix(3000, 0).UTC(), RunnerCapacity: 2}); err != nil {
 		t.Fatal(err)
 	}
-	running, queued, _ = m.QuotaCounts(ctx(), repo, "")
+	running, queued, _ = m.QuotaCounts(ctx(), repoID, "")
 	if running != 1 || queued != 0 {
 		t.Fatalf("after lease = %d/%d, want 1/0", running, queued)
 	}
@@ -115,25 +364,25 @@ func TestMemStoreQuotaReservationLifecycle(t *testing.T) {
 	if err := m.CompleteJob(ctx(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaae", 1, testRunner.ID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaae", Generation: 1, RunnerID: testRunner.ID}); err != nil {
 		t.Fatal(err)
 	}
-	running, queued, _ = m.QuotaCounts(ctx(), repo, "")
+	running, queued, _ = m.QuotaCounts(ctx(), repoID, "")
 	if running != 0 || queued != 0 {
 		t.Fatalf("after complete = %d/%d, want 0/0", running, queued)
 	}
 
 	// Cancel path: a queued job's reservation is released on cancel.
 	req2 := compiledRunRequest("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaf", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab", repo)
-	req2.Quota = &QuotaReservation{RepoKey: repo, JobCount: 1}
+	req2.Quota = &QuotaReservation{RepoKey: repoID, JobCount: 1}
 	if err := m.InsertCompiledRun(ctx(), req2); err != nil {
 		t.Fatal(err)
 	}
-	_, queued, _ = m.QuotaCounts(ctx(), repo, "")
+	_, queued, _ = m.QuotaCounts(ctx(), repoID, "")
 	if queued != 1 {
 		t.Fatalf("after second enqueue queued = %d, want 1", queued)
 	}
 	if _, err := m.CancelRunJobs(ctx(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaf", "test"); err != nil {
 		t.Fatal(err)
 	}
-	_, queued, _ = m.QuotaCounts(ctx(), repo, "")
+	_, queued, _ = m.QuotaCounts(ctx(), repoID, "")
 	if queued != 0 {
 		t.Fatalf("after cancel queued = %d, want 0", queued)
 	}

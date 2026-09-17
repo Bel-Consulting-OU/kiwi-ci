@@ -131,8 +131,11 @@ func TestFireScheduleUsesStoredIdentity(t *testing.T) {
 	if !fired {
 		t.Fatal("fireSchedule reported not fired")
 	}
-	if run.RepoFullName != "gitlab.com/acme/service" {
-		t.Fatalf("fired run RepoFullName = %q, want stored RepoID", run.RepoFullName)
+	if run.RepoID != "gitlab.com/acme/service" {
+		t.Fatalf("fired run RepoID = %q, want stored canonical RepoID", run.RepoID)
+	}
+	if run.RepoFullName != "acme/service" {
+		t.Fatalf("fired run RepoFullName = %q, want the display full name", run.RepoFullName)
 	}
 	if run.Repo != "https://gitlab.com/acme/service.git" {
 		t.Fatalf("fired run Repo = %q, want stored RepoURL", run.Repo)

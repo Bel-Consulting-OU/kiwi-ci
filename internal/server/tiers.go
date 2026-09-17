@@ -90,38 +90,6 @@ func classifyRoute(r *http.Request) routeTier {
 	return tierAdmin
 }
 
-// canonicalRepoForRun resolves the run's canonical repository identity
-// ("<forgeHost>/<fullName>"). The forge host is derived from the run's repo
-// URL when the stored full name does not already carry one.
-func canonicalRepoForRun(run model.Run) string {
-	return auth.CanonicalRepoID(repoHost(run.Repo), run.RepoFullName)
-}
-
-// repoHost extracts the forge host from a repo URL in the common forms:
-// https://host/owner/repo(.git), ssh://git@host/owner/repo and the scp-like
-// git@host:owner/repo.
-func repoHost(repoURL string) string {
-	u := strings.TrimSpace(repoURL)
-	if i := strings.Index(u, "://"); i >= 0 {
-		u = u[i+3:]
-	}
-	if at := strings.Index(u, "@"); at >= 0 {
-		u = u[at+1:]
-	}
-	slash := strings.Index(u, "/")
-	colon := strings.Index(u, ":")
-	switch {
-	case slash < 0 && colon < 0:
-		return u
-	case slash < 0:
-		return u[:colon]
-	case colon >= 0 && colon < slash:
-		return u[:colon]
-	default:
-		return u[:slash]
-	}
-}
-
 // visibleRepos returns the set of repository identities a principal may
 // read. ok=false means the request has no principal-based restriction
 // (legacy mode, admin principal, or a principal without a repository map:
@@ -168,7 +136,7 @@ func (s *Server) repoVisible(r *http.Request, run model.Run) bool {
 	if !restricted {
 		return true
 	}
-	canon := canonicalRepoForRun(run)
+	canon := repoIDForRun(run)
 	if allowed[canon] || allowed[run.RepoFullName] {
 		return true
 	}
@@ -288,15 +256,10 @@ func (s *Server) runForAuth(ctx context.Context, id string) (model.Run, error) {
 	return run, nil
 }
 
-// canonicalRepoForJob resolves the canonical repository identity of a job.
-func canonicalRepoForJob(j model.Job) string {
-	return auth.CanonicalRepoID(repoHost(j.RepoURL), j.RepoFullName)
-}
-
 // requireRunRead enforces the read action plus repository-scope visibility
 // for a per-run read route.
 func (s *Server) requireRunRead(w http.ResponseWriter, r *http.Request, run model.Run) bool {
-	if !s.requireAction(w, r, auth.ActionRead, canonicalRepoForRun(run), false) {
+	if !s.requireAction(w, r, auth.ActionRead, repoIDForRun(run), false) {
 		return false
 	}
 	if !s.repoVisible(r, run) {
@@ -309,7 +272,7 @@ func (s *Server) requireRunRead(w http.ResponseWriter, r *http.Request, run mode
 // requireRunArtifactRead enforces the artifact-read action plus repository
 // visibility for a per-run artifact route.
 func (s *Server) requireRunArtifactRead(w http.ResponseWriter, r *http.Request, run model.Run) bool {
-	if !s.requireAction(w, r, auth.ActionArtifactRead, canonicalRepoForRun(run), false) {
+	if !s.requireAction(w, r, auth.ActionArtifactRead, repoIDForRun(run), false) {
 		return false
 	}
 	if !s.repoVisible(r, run) {

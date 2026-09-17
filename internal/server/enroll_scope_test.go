@@ -3,7 +3,10 @@ package server
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -46,10 +49,12 @@ func enrollBodyFor(t *testing.T, runnerID string, labels []string) []byte {
 }
 
 // TestEnrollGrantLabelMismatchDoesNotConsumeGrant pins single-use
-// consumption to SUCCESSFUL validation: a request missing a bound label is
-// refused without burning the grant, in memory and DB mode alike. Before
-// the fix the DB path consumed (conditional UPDATE) first and checked the
-// labels after, so one wrong-label attempt destroyed the grant.
+// consumption to SUCCESSFUL validation: a request carrying a label outside
+// the grant's complete allowed set is refused without burning the grant, in
+// memory and DB mode alike. A request whose labels are all allowed (a
+// subset of the allowed set) succeeds. Before the consume-before-check fix
+// the DB path consumed (conditional UPDATE) first and checked the labels
+// after, so one wrong-label attempt destroyed the grant.
 func TestEnrollGrantLabelMismatchDoesNotConsumeGrant(t *testing.T) {
 	t.Run("memory", func(t *testing.T) {
 		s := grantTestServer(t)
@@ -58,15 +63,19 @@ func TestEnrollGrantLabelMismatchDoesNotConsumeGrant(t *testing.T) {
 			t.Fatal(err)
 		}
 		h := s.Handler()
-		if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/enroll", enrollBodyFor(t, "r1", []string{"os:macos"}), raw, nil); w.Code != http.StatusUnauthorized {
-			t.Fatalf("missing one bound label = %d, want 401", w.Code)
+		if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/enroll", enrollBodyFor(t, "r1", []string{"os:macos", "trusted-production"}), raw, nil); w.Code != http.StatusUnauthorized {
+			t.Fatalf("extra label = %d, want 401", w.Code)
 		}
-		if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/enroll", enrollBodyFor(t, "r2", nil), raw, nil); w.Code != http.StatusUnauthorized {
-			t.Fatalf("missing all bound labels = %d, want 401", w.Code)
+		if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/enroll", enrollBodyFor(t, "r2", []string{"os:ubuntu"}), raw, nil); w.Code != http.StatusUnauthorized {
+			t.Fatalf("disallowed label = %d, want 401", w.Code)
 		}
-		// The grant is still usable with the full label set.
-		if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/enroll", enrollBodyFor(t, "r3", []string{"os:macos", "arm64"}), raw, nil); w.Code != http.StatusOK {
+		// The grant is still usable with an allowed label subset.
+		if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/enroll", enrollBodyFor(t, "r3", []string{"os:macos"}), raw, nil); w.Code != http.StatusOK {
 			t.Fatalf("grant burned by a rejected attempt: %d %s", w.Code, w.Body.String())
+		}
+		// And a replay is refused.
+		if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/enroll", enrollBodyFor(t, "r4", []string{"os:macos"}), raw, nil); w.Code != http.StatusUnauthorized {
+			t.Fatalf("consumed grant replay = %d, want 401", w.Code)
 		}
 	})
 	t.Run("db", func(t *testing.T) {
@@ -85,8 +94,8 @@ func TestEnrollGrantLabelMismatchDoesNotConsumeGrant(t *testing.T) {
 			t.Fatal(err)
 		}
 		h := s.Handler()
-		if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/enroll", enrollBodyFor(t, "r1", []string{"os:macos"}), raw, nil); w.Code != http.StatusUnauthorized {
-			t.Fatalf("missing one bound label = %d, want 401", w.Code)
+		if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/enroll", enrollBodyFor(t, "r1", []string{"os:macos", "arm64", "extra"}), raw, nil); w.Code != http.StatusUnauthorized {
+			t.Fatalf("extra label = %d, want 401", w.Code)
 		}
 		f.mu.Lock()
 		rec := f.grants[auth.TokenDigest(raw)]
@@ -94,14 +103,150 @@ func TestEnrollGrantLabelMismatchDoesNotConsumeGrant(t *testing.T) {
 		if rec.Consumed {
 			t.Fatal("rejected label binding consumed the durable grant")
 		}
-		if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/enroll", enrollBodyFor(t, "r2", []string{"os:macos", "arm64"}), raw, nil); w.Code != http.StatusOK {
+		// An allowed subset still works exactly once.
+		if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/enroll", enrollBodyFor(t, "r2", []string{"os:macos"}), raw, nil); w.Code != http.StatusOK {
 			t.Fatalf("durable grant burned by a rejected attempt: %d %s", w.Code, w.Body.String())
 		}
 		// And a replay now conflicts.
-		if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/enroll", enrollBodyFor(t, "r3", []string{"os:macos", "arm64"}), raw, nil); w.Code != http.StatusUnauthorized {
+		if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/enroll", enrollBodyFor(t, "r3", []string{"os:macos"}), raw, nil); w.Code != http.StatusUnauthorized {
 			t.Fatalf("consumed grant replay = %d, want 401", w.Code)
 		}
 	})
+}
+
+// TestEnrollGrantAllowedLabelsContract pins the allowed-label contract: the
+// grant's BoundLabels are the COMPLETE ALLOWED set (every requested label
+// must appear in it), an empty allowed set is the legacy no-constraint
+// grant, and comparison is exact — byte-for-byte, case-sensitive, no
+// trimming — matching the runner label grammar (runnerLabelRegexp). Every
+// rejection leaves the grant unconsumed and therefore still usable.
+func TestEnrollGrantAllowedLabelsContract(t *testing.T) {
+	cases := []struct {
+		name    string
+		allowed []string
+		request []string
+		permit  bool
+	}{
+		{"subset of allowed set", []string{"os:macos", "arm64"}, []string{"os:macos"}, true},
+		{"exact allowed set", []string{"os:macos", "arm64"}, []string{"os:macos", "arm64"}, true},
+		{"no allowed set accepts any", nil, []string{"anything", "else"}, true},
+		{"extra label rejected", []string{"os:macos"}, []string{"os:macos", "trusted-production"}, false},
+		{"label outside allowed set rejected", []string{"os:macos"}, []string{"os:linux"}, false},
+		{"trailing space is a different label", []string{"os:macos"}, []string{"os:macos "}, false},
+		{"leading space in allowed label is a different label", []string{" os:macos"}, []string{"os:macos"}, false},
+		{"case is significant", []string{"os:macos"}, []string{"OS:Macos"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := grantTestServer(t)
+			raw, err := s.CreateEnrollGrant(time.Hour, tc.allowed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = s.consumeEnrollGrant(raw, tc.request)
+			if tc.permit {
+				if err != nil {
+					t.Fatalf("allowed request rejected: %v", err)
+				}
+				if err := s.consumeEnrollGrant(raw, tc.request); err == nil {
+					t.Fatal("grant consumed twice")
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("disallowed request consumed the grant")
+			}
+			if !strings.Contains(err.Error(), "grant does not permit label") {
+				t.Fatalf("rejection error = %q, want the unpermitted-label message", err)
+			}
+			// The rejected attempt must leave the grant consumable.
+			if err := s.consumeEnrollGrant(raw, tc.allowed); err != nil {
+				t.Fatalf("rejection burned the grant: %v", err)
+			}
+		})
+	}
+}
+
+// TestEnrollGrantPersistFailureRollsBackConsumption pins the memory-mode
+// consume path to all-or-nothing: when persisting the consumed state fails,
+// the in-memory mutation is rolled back, no certificate is issued, and the
+// on-disk state stays unconsumed — so a restarted server still accepts the
+// original grant exactly once.
+func TestEnrollGrantPersistFailureRollsBackConsumption(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewPersistent("runner-tok", "admin-tok", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, err := runnerpki.NewCA("rollback ca", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.RunnerCA = ca
+	s.RunnerEnrollToken = ""
+	raw, err := s.CreateEnrollGrant(time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	origPersist := persistEnrollGrantsFunc
+	persistEnrollGrantsFunc = func(*Server) error { return errors.New("injected persist failure") }
+	t.Cleanup(func() { persistEnrollGrantsFunc = origPersist })
+
+	// A handler enrollment fails on the failed consume and must not issue a
+	// certificate.
+	w := pkiRequest(t, s.Handler(), http.MethodPost, "/api/v1/runners/enroll", enrollBodyFor(t, "runner-rb", nil), raw, nil)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("enroll with failing persist = %d, want 401: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "CERTIFICATE") {
+		t.Fatalf("certificate issued for a failed consume: %s", w.Body.String())
+	}
+
+	// The in-memory mutation was rolled back: the grant is still unused.
+	s.mu.Lock()
+	g, ok := s.EnrollGrants[auth.TokenDigest(raw)]
+	s.mu.Unlock()
+	if !ok {
+		t.Fatal("failed persist deleted the in-memory grant")
+	}
+	if g.Used {
+		t.Fatal("failed persist left the grant marked used in memory")
+	}
+	// The failed persist never rewrote the file: on disk the grant is unused.
+	onDisk, err := os.ReadFile(filepath.Join(dir, enrollGrantsFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted map[string]EnrollGrant
+	if err := json.Unmarshal(onDisk, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if rec, ok := persisted[auth.TokenDigest(raw)]; !ok || rec.Used {
+		t.Fatalf("on-disk grant after failed persist = %+v (present=%v)", rec, ok)
+	}
+
+	// Simulate a restart over the same data dir: persistence works again and
+	// the original token is accepted exactly once.
+	persistEnrollGrantsFunc = origPersist
+	s2, err := NewPersistent("runner-tok", "admin-tok", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2.RunnerCA = ca
+	s2.RunnerEnrollToken = ""
+	s2.mu.Lock()
+	loaded, ok := s2.EnrollGrants[auth.TokenDigest(raw)]
+	s2.mu.Unlock()
+	if !ok || loaded.Used {
+		t.Fatalf("restart loaded grant = %+v (present=%v), want unused", loaded, ok)
+	}
+	if err := s2.consumeEnrollGrant(raw, nil); err != nil {
+		t.Fatalf("consume after restart: %v", err)
+	}
+	if err := s2.consumeEnrollGrant(raw, nil); err == nil {
+		t.Fatal("grant consumed twice after restart")
+	}
 }
 
 // TestEnrollGrantConcurrentConsumptionMemory proves the memory-mode
@@ -227,13 +372,13 @@ func TestEnrollGrantDBModeRequiresDurableStore(t *testing.T) {
 	}
 }
 
-// TestEnrollGrantExtraLabelsCannotEscalate documents the (intentional)
-// label-binding direction: the request must CARRY every bound label, and
-// extra request labels are ignored because enrollment labels are never
-// persisted — scheduling attributes come exclusively from the registration
-// profile. This is why a superset request cannot escalate, and why it is
-// deliberately not rejected.
-func TestEnrollGrantExtraLabelsCannotEscalate(t *testing.T) {
+// TestEnrollGrantExtraLabelsRejected pins the escalation boundary of the
+// allowed-label contract: a request carrying a label the grant does not
+// permit is refused BEFORE consumption (with a clear error), so the grant
+// survives for a legitimate enrollment — and the enrolled runner still
+// registers with its PROFILE's labels, because enrollment labels are
+// advisory and never become scheduling attributes.
+func TestEnrollGrantExtraLabelsRejected(t *testing.T) {
 	s := grantTestServer(t)
 	s.RequireProfiles = true
 	createProfile(t, s, model.RunnerProfile{ID: "plain", Labels: []string{"os:linux"}, Capabilities: []string{"container"}, MaxCapacity: 1})
@@ -243,11 +388,20 @@ func TestEnrollGrantExtraLabelsCannotEscalate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Superset request: bound label present plus an extra privileged one.
+	// Superset request: the extra privileged label is not in the allowed
+	// set and must be rejected with the documented error.
 	w := pkiRequest(t, s.Handler(), http.MethodPost, "/api/v1/runners/enroll",
 		enrollBodyFor(t, "runner-extra", []string{"os:linux", "trusted-production"}), raw, nil)
-	if w.Code != http.StatusOK {
-		t.Fatalf("superset request with all bound labels = %d, want 200", w.Code)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("superset request = %d, want 401", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `grant does not permit label "trusted-production"`) {
+		t.Fatalf("rejection body = %q, want the unpermitted-label message", w.Body.String())
+	}
+	// The rejection did not consume the grant: an allowed request enrolls.
+	if w := pkiRequest(t, s.Handler(), http.MethodPost, "/api/v1/runners/enroll",
+		enrollBodyFor(t, "runner-extra", []string{"os:linux"}), raw, nil); w.Code != http.StatusOK {
+		t.Fatalf("allowed enrollment after rejection = %d: %s", w.Code, w.Body.String())
 	}
 	// The enrolled identity registers with the PROFILE's labels: the extra
 	// enrollment label never becomes a scheduling attribute.

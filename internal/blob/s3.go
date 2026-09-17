@@ -15,6 +15,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -36,6 +37,23 @@ func withDeadline(ctx context.Context, d time.Duration) (context.Context, contex
 		return ctx, func() {}
 	}
 	return context.WithTimeout(ctx, d)
+}
+
+// bodyWithCancel ties a response body to the request context that owns it.
+// The bounded context must outlive Open: the caller streams the body after
+// Open returns, so the context may only be released when the body is closed.
+// Close closes the underlying body first (releasing the connection) and then
+// cancels the request context exactly once, making repeated closes safe.
+type bodyWithCancel struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (b *bodyWithCancel) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(b.cancel)
+	return err
 }
 
 // s3Dialer is the dialer behind the default S3 transport: 10s connection
@@ -232,31 +250,39 @@ func (s *S3) Put(ctx context.Context, key string, r io.Reader, size int64) (Obje
 	return Object{Key: key, SHA256: digest, Size: n}, nil
 }
 
+// Open returns a stream for the object addressed by key. The returned reader
+// owns the request: the bounded request context stays alive while the caller
+// streams and is cancelled by the reader's Close, so Open must never cancel
+// on the success path. Every failure path cancels immediately, so a failed
+// Open never leaks a request context.
 func (s *S3) Open(ctx context.Context, key string) (io.ReadCloser, Object, error) {
 	if !keyRE.MatchString(key) {
 		return nil, Object{}, fmt.Errorf("blob: invalid key %q", key)
 	}
 	ctx, cancel := withDeadline(ctx, s3GetTimeout)
-	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.objectURL(key), nil)
 	if err != nil {
+		cancel()
 		return nil, Object{}, err
 	}
 	s.sign(req, emptyPayloadHash, time.Now().UTC())
 	resp, err := s.client().Do(req)
 	if err != nil {
+		cancel()
 		return nil, Object{}, err
 	}
 	if resp.StatusCode == http.StatusNotFound {
 		resp.Body.Close()
+		cancel()
 		return nil, Object{}, ErrNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
+		cancel()
 		return nil, Object{}, fmt.Errorf("blob: s3 get %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
-	return resp.Body, Object{Key: key, SHA256: key, Size: resp.ContentLength}, nil
+	return &bodyWithCancel{ReadCloser: resp.Body, cancel: cancel}, Object{Key: key, SHA256: key, Size: resp.ContentLength}, nil
 }
 
 func (s *S3) Delete(ctx context.Context, key string) error {

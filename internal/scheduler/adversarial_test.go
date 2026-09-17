@@ -35,7 +35,8 @@ func TestRecoverExpiredQueueTimeoutReleasesQueuedQuota(t *testing.T) {
 	job.QueueDeadline = &past
 	f.putJob(job)
 	ctx := context.Background()
-	if err := f.AdjustQuotaCounter(ctx, advRepo, team, 0, 1); err != nil {
+	repoID := storage.RepoIDForJob(job)
+	if err := f.AdjustQuotaCounter(ctx, repoID, team, 0, 1); err != nil {
 		t.Fatal(err)
 	}
 	s := NewDB(f, time.Minute, nil, nil)
@@ -46,7 +47,7 @@ func TestRecoverExpiredQueueTimeoutReleasesQueuedQuota(t *testing.T) {
 	if j.Status != model.StatusCancelled || j.Error != "queue timeout" {
 		t.Fatalf("job after queue timeout = %s/%q, want cancelled/queue timeout", j.Status, j.Error)
 	}
-	if rq := f.quotaQueued(advRepo); rq != 0 {
+	if rq := f.quotaQueued(repoID); rq != 0 {
 		t.Fatalf("repo queued counter = %d, want 0 after queue-timeout cancel", rq)
 	}
 	if tq := f.quotaQueued(team); tq != 0 {
@@ -60,13 +61,13 @@ func TestRecoverExpiredQueueTimeoutReleasesQueuedQuota(t *testing.T) {
 	second.RepoFullName = "o/r"
 	second.CreatedAt = now
 	f.putJob(second)
-	if err := f.AdjustQuotaCounter(ctx, advRepo, team, 0, 1); err != nil {
+	if err := f.AdjustQuotaCounter(ctx, repoID, team, 0, 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.RecoverExpired(ctx, now); err != nil {
 		t.Fatalf("replayed RecoverExpired: %v", err)
 	}
-	if got := f.quotaQueued(advRepo); got != 1 {
+	if got := f.quotaQueued(repoID); got != 1 {
 		t.Fatalf("repo queued counter after replay = %d, want 1 (the live job's reservation)", got)
 	}
 	if got := f.quotaQueued(team); got != 1 {
@@ -91,7 +92,8 @@ func TestRecoverExpiredWaitingApprovalQueueTimeout(t *testing.T) {
 	job.QueueDeadline = &past
 	f.putJob(job)
 	ctx := context.Background()
-	if err := f.AdjustQuotaCounter(ctx, advRepo, team, 0, 1); err != nil {
+	repoID := storage.RepoIDForJob(job)
+	if err := f.AdjustQuotaCounter(ctx, repoID, team, 0, 1); err != nil {
 		t.Fatal(err)
 	}
 	s := NewDB(f, time.Minute, nil, nil)
@@ -102,8 +104,8 @@ func TestRecoverExpiredWaitingApprovalQueueTimeout(t *testing.T) {
 	if j.Status != model.StatusCancelled {
 		t.Fatalf("waiting-approval job status = %s, want cancelled", j.Status)
 	}
-	if f.quotaQueued(advRepo) != 0 || f.quotaRunning(advRepo) != 0 {
-		t.Fatalf("counters = %d/%d, want 0/0", f.quotaRunning(advRepo), f.quotaQueued(advRepo))
+	if f.quotaQueued(repoID) != 0 || f.quotaRunning(repoID) != 0 {
+		t.Fatalf("counters = %d/%d, want 0/0", f.quotaRunning(repoID), f.quotaQueued(repoID))
 	}
 }
 

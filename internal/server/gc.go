@@ -33,10 +33,13 @@ func (s *Server) GC(ctx context.Context, now time.Time) GCStats {
 		s.pruneJobLocksLocked()
 	}
 	s.mu.Unlock()
+	// Pending SBOM/sigstore rows older than the retention window are
+	// pruned here: the durable table in DB mode, the dev-mode mirror
+	// otherwise. Pruning never deletes CAS blobs.
+	s.pruneExpiredPendingSidecars(ctx, now)
 	if s.store != nil {
 		stats.TempFilesRemoved = sweepTempFiles(s.store.Root, now)
 	}
-	_ = ctx
 	return stats
 }
 

@@ -152,7 +152,7 @@ func TestCacheManifestCarriesServerDerivedNamespace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify manifest: %v", err)
 	}
-	if m.Repository != "o/repo-a" || m.TrustDomain != "trusted" || m.LogicalKey != key {
+	if m.Repository != "github.com/o/repo-a" || m.TrustDomain != "trusted" || m.LogicalKey != key {
 		t.Fatalf("manifest namespace mismatch: repo=%q trust=%q key=%q", m.Repository, m.TrustDomain, m.LogicalKey)
 	}
 	if rec.BlobSHA256 != m.BlobSHA256 || rec.BlobSHA256 == "" {

@@ -1,72 +1,291 @@
-# Kiwi's own CI on Woodpecker CI. This pipeline is intentionally lean and
-# fully green on every push: only gates that are hermetic and deterministic
-# run here (the GitHub Actions matrix adds OS coverage and nightly fuzzing).
+# Kiwi's own CI on Woodpecker CI (v3 pipeline syntax). Woodpecker is the
+# primary and comprehensive CI for this repository: every lane below runs on
+# push, pull request, manual and tag events; the nightly fuzz lane runs on the
+# `nightly` cron job.
 #
-# Woodpecker executes each step in a fresh golang container; caching is
-# declared per step for the module cache.
+# Schema notes (verified against the Woodpecker 3.18 pipeline JSON schema):
+#   - `services` uses the map syntax: the map key is the service hostname.
+#   - `matrix` is a TOP-LEVEL key; a platform matrix duplicates the whole
+#     workflow per platform, so platform-independent lanes are pinned to
+#     linux/amd64 with `when.platform`. The unit and race lanes intentionally
+#     run on BOTH platforms.
+#   - The arm64 matrix entry requires an agent registered with the
+#     `platform=linux/arm64` label. Remove that entry when no arm64 agent
+#     exists, otherwise its workflow stays queued forever. The amd64 entry
+#     needs `platform=linux/amd64` (every Docker agent has it by default).
+#   - `when` is a list of alternative conditions; all fields inside one entry
+#     are ANDed. The top-level `when` admits cron pipelines as well: a
+#     top-level filter that excluded `cron` would drop the nightly workflow
+#     before its step could run.
+#   - Woodpecker has no artifact store without an upload plugin; the coverage
+#     step therefore prints the profile summary and enforces the floor, and
+#     leaves coverage.out in the shared workspace.
+#   - The `nightly` cron job (schedule `0 3 * * *`, branch main) is created in
+#     the Woodpecker repository settings; the YAML below only filters on it.
+#
+# Status reporting: a single-file configuration is one workflow named after
+# the file (`woodpecker`). Woodpecker reports one commit status per workflow
+# leg, and with the DEFAULT status context configuration
+# (WOODPECKER_STATUS_CONTEXT=ci/woodpecker,
+# WOODPECKER_STATUS_CONTEXT_FORMAT={{ .context }}/{{ .event }}/{{ .workflow }}
+# with a `/<axis_id>` suffix for matrix legs, axis ids starting at 1) this
+# file produces
+#   ci/woodpecker/push/woodpecker/1   (linux/amd64 leg)
+#   ci/woodpecker/push/woodpecker/2   (linux/arm64 leg)
+# on pushes and the corresponding /pr/ contexts on pull requests.
+# scripts/gh-branch-protection.sh requires that documented set by default;
+# instances that customize WOODPECKER_STATUS_CONTEXT(_FORMAT) must override
+# it there (KIWI_WOODPECKER_CONTEXTS).
+
+when:
+  - event: [push, pull_request, manual, tag]
+  - event: cron
+
+labels:
+  platform: ${platform}
+
+matrix:
+  platform:
+    - linux/amd64
+    - linux/arm64
+
+# A shared /go volume keeps the module cache (and go run tool builds) warm
+# across steps of one pipeline, which is what lets the pinned staticcheck and
+# govulncheck steps reuse modules instead of re-downloading them per step.
+workspace:
+  base: /go
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    when:
+      - event: [push, pull_request, manual, tag]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: pass
+      POSTGRES_DB: kiwi
 
 steps:
   format:
     image: golang:1.27
+    depends_on: []
+    when:
+      - event: [push, pull_request, manual, tag]
+        platform: linux/amd64
     commands:
       - test -z "$(gofmt -l .)"
-    when:
-      - event: [push, pull_request, manual]
 
   vet:
     image: golang:1.27
+    depends_on: [format]
+    when:
+      - event: [push, pull_request, manual, tag]
+        platform: linux/amd64
     commands:
       - go vet ./...
 
+  # unit and race run on every matrix platform: they are the portable core.
   unit:
     image: golang:1.27
+    depends_on: []
     environment:
       GOTOOLCHAIN: local
+    when:
+      - event: [push, pull_request, manual, tag]
     commands:
       - go test -shuffle=on -timeout=15m ./...
 
   race:
     image: golang:1.27
+    depends_on: []
+    environment:
+      GOTOOLCHAIN: local
+    when:
+      - event: [push, pull_request, manual, tag]
     commands:
       - go test -race -shuffle=on -timeout=15m ./...
 
   adversarial:
     image: golang:1.27
+    depends_on: [vet]
+    environment:
+      GOTOOLCHAIN: local
+    when:
+      - event: [push, pull_request, manual, tag]
+        platform: linux/amd64
     commands:
       - go test -run 'Adversarial|Security|Property|Fault|Symlink|Traversal|Tamper|Reject|Evil|Bomb' -shuffle=on ./...
 
+  fuzz-smoke:
+    image: golang:1.27
+    depends_on: [vet]
+    environment:
+      GOTOOLCHAIN: local
+    when:
+      - event: [push, pull_request, manual, tag]
+        platform: linux/amd64
+    commands:
+      - ./scripts/fuzz-smoke.sh 10s
+
   schema:
     image: golang:1.27
+    depends_on: [vet]
+    environment:
+      GOTOOLCHAIN: local
+    when:
+      - event: [push, pull_request, manual, tag]
+        platform: linux/amd64
     commands:
       - go test -run Schema ./internal/pipeline
       - go run ./cmd/filemap --check
 
   cross:
     image: golang:1.27
+    depends_on: [vet]
+    environment:
+      GOTOOLCHAIN: local
+    when:
+      - event: [push, pull_request, manual, tag]
+        platform: linux/amd64
     commands:
       - make cross
 
-  license:
-    image: golang:1.27
-    commands:
-      - make license-check
-
   docs:
     image: golang:1.27
+    depends_on: [vet]
+    when:
+      - event: [push, pull_request, manual, tag]
+        platform: linux/amd64
     commands:
       - make docs-check
 
+  license:
+    image: golang:1.27
+    depends_on: [vet]
+    when:
+      - event: [push, pull_request, manual, tag]
+        platform: linux/amd64
+    commands:
+      - make license-check
+
   repro:
     image: golang:1.27
+    depends_on: [vet]
+    environment:
+      GOTOOLCHAIN: local
+    when:
+      - event: [push, pull_request, manual, tag]
+        platform: linux/amd64
     commands:
       - ./scripts/repro-build.sh
 
-  govulncheck:
-    image: golang:1.27
-    commands:
-      - go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
-
   staticcheck:
     image: golang:1.27
+    depends_on: [vet]
+    environment:
+      GOTOOLCHAIN: local
+    when:
+      - event: [push, pull_request, manual, tag]
+        platform: linux/amd64
     commands:
+      # Pinned, never floating; the shared /go volume caches the tool build.
       - go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
+
+  govulncheck:
+    image: golang:1.27
+    depends_on: [vet]
+    environment:
+      GOTOOLCHAIN: local
+    when:
+      - event: [push, pull_request, manual, tag]
+        platform: linux/amd64
+    commands:
+      # Needs network access to the vulnerability database; keep it online.
+      - go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+
+  smoke:
+    image: golang:1.27
+    depends_on: [vet]
+    environment:
+      GOTOOLCHAIN: local
+    when:
+      - event: [push, pull_request, manual, tag]
+        platform: linux/amd64
+    commands:
+      # Container-free probe: build the real binary and validate both shipped
+      # pipelines. `kiwi run` needs a container runtime, so it is exercised by
+      # the executor test suites instead of here.
+      - go build -trimpath -o /tmp/kiwi ./cmd/kiwi
+      - /tmp/kiwi validate -f .kiwi/pipeline.yaml
+      - /tmp/kiwi validate -f examples/kiwi.yaml
+
+  coverage:
+    image: golang:1.27
+    depends_on: [unit]
+    environment:
+      GOTOOLCHAIN: local
+      KC_MIN_COVERAGE: "60"
+    when:
+      - event: [push, pull_request, manual, tag]
+        platform: linux/amd64
+    commands:
+      - go test -coverprofile=coverage.out ./...
+      - go tool cover -func=coverage.out | tail -1
+      - ./scripts/coverage-floor.sh coverage.out
+
+  integration-postgres:
+    image: golang:1.27
+    depends_on: [unit]
+    environment:
+      GOTOOLCHAIN: local
+      KIWI_TEST_POSTGRES_URL: postgres://postgres:pass@postgres:5432/kiwi?sslmode=disable
+    when:
+      - event: [push, pull_request, manual, tag]
+        platform: linux/amd64
+    commands:
+      # Wait for the postgres service without extra packages: a stdlib-only
+      # Go dialer retries until the service accepts connections.
+      - |
+        cat > /tmp/wait-postgres.go <<'EOF'
+        package main
+
+        import (
+        	"fmt"
+        	"net"
+        	"os"
+        	"time"
+        )
+
+        func main() {
+        	deadline := time.Now().Add(90 * time.Second)
+        	for {
+        		conn, err := net.DialTimeout("tcp", "postgres:5432", 2*time.Second)
+        		if err == nil {
+        			_ = conn.Close()
+        			return
+        		}
+        		if time.Now().After(deadline) {
+        			fmt.Fprintf(os.Stderr, "postgres not ready after 90s: %v\n", err)
+        			os.Exit(1)
+        		}
+        		time.Sleep(time.Second)
+        	}
+        }
+        EOF
+        go run /tmp/wait-postgres.go
+      - go test -count=1 -timeout=20m -v -run Integration ./internal/storage ./internal/scheduler ./internal/server
+
+  # Nightly fuzz lane. Woodpecker cron jobs are created in the repository
+  # settings (name `nightly`, schedule `0 3 * * *`, branch main); this step
+  # only runs for that cron event and is skipped by every other pipeline.
+  fuzz-nightly:
+    image: golang:1.27
+    depends_on: []
+    environment:
+      GOTOOLCHAIN: local
+    when:
+      - event: cron
+        cron: nightly
+        platform: linux/amd64
+    commands:
+      - ./scripts/fuzz-smoke.sh 30s

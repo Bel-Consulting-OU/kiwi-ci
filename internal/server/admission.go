@@ -2,7 +2,6 @@ package server
 
 import (
 	"fmt"
-	"net/url"
 	"regexp"
 	"strings"
 
@@ -38,9 +37,12 @@ func quotaDenied(reason, msg string) error {
 var downstreamRepoRE = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
 
 // repoIdentity is the repository coordinate set a submission is admitted
-// under: the clone URL (host checks derive from it) and the full name (the
-// policy lookup key).
+// under: the canonical RepoID (the policy lookup key), the clone URL the
+// host checks derive from, and the human-readable full name. RepoID is
+// derived once at ingress; the other fields are display/derivation inputs
+// only.
 type repoIdentity struct {
+	RepoID       string
 	RepoURL      string
 	RepoFullName string
 }
@@ -122,13 +124,17 @@ func (s *Server) admitOrgPolicyRestrictions(id repoIdentity, spec *pipeline.Spec
 	if s.Policy == nil {
 		return nil
 	}
-	repoPolicy, hasRepo := s.Policy.Repositories[id.RepoFullName]
+	repoID := id.RepoID
+	if repoID == "" {
+		repoID = repoIDFor(id.RepoID, id.RepoURL, id.RepoFullName)
+	}
+	repoPolicy, hasRepo := s.Policy.RepoPolicyFor(repoID)
 
 	// Allowed clone hosts: org-level allowlist intersected with the
 	// repo-level allowlist. Nil means the level imposes no restriction;
 	// a non-nil EMPTY result (disjoint restrictions) denies every host.
-	if hosts := s.Policy.AllowedCloneHostsFor(id.RepoFullName); hosts != nil {
-		host := repoURLHost(id.RepoURL)
+	if hosts := s.Policy.AllowedCloneHostsFor(repoID); hosts != nil {
+		host := repoHost(id.RepoURL)
 		if host == "" || !containsList(hosts, host) {
 			return policyDenied(fmt.Sprintf("repository host %q is not in the allowed clone hosts", host))
 		}
@@ -137,7 +143,7 @@ func (s *Server) admitOrgPolicyRestrictions(id repoIdentity, spec *pipeline.Spec
 	// Allowed regions: every placement.regions entry must be inside the
 	// effective allowlist. Same nil/empty semantics as clone hosts: a
 	// non-nil empty intersection denies every region.
-	if regions := s.Policy.AllowedRegionsFor(id.RepoFullName); regions != nil {
+	if regions := s.Policy.AllowedRegionsFor(repoID); regions != nil {
 		for id, j := range spec.Jobs {
 			for _, r := range j.Placement.Regions {
 				if !containsList(regions, r) {
@@ -194,35 +200,6 @@ func validateDownstreamSpec(jobID string, d pipeline.DownstreamSpec) error {
 		}
 	}
 	return nil
-}
-
-// repoURLHost extracts the host of a repository clone URL for the clone-host
-// allowlist check. Unparseable URLs return "" and are rejected by any
-// configured allowlist (fail closed).
-func repoURLHost(repoURL string) string {
-	u, err := url.Parse(strings.TrimSpace(repoURL))
-	if err != nil {
-		return ""
-	}
-	if u.Host == "" {
-		return ""
-	}
-	return u.Host
-}
-
-// repoURLTeam derives the quota team key from the repository URL: the
-// host plus the first path segment (the org), so teams never collide across
-// forges. Unparseable URLs fall back to the raw string.
-func repoURLTeam(repoURL string) string {
-	u, err := url.Parse(strings.TrimSpace(repoURL))
-	if err != nil || u.Host == "" {
-		return strings.TrimSpace(repoURL)
-	}
-	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-	if len(parts) == 0 || parts[0] == "" {
-		return u.Host
-	}
-	return u.Host + "/" + parts[0]
 }
 
 func containsList(list []string, v string) bool {

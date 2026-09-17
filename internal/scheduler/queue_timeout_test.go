@@ -177,9 +177,10 @@ func TestEnqueueMaterializesQueueDeadline(t *testing.T) {
 	if want := now.Add(10 * time.Minute); !stored.QueueDeadline.Equal(want) {
 		t.Errorf("QueueDeadline = %v, want %v", stored.QueueDeadline, want)
 	}
-	// A job without a queue timeout gets no deadline.
-	plain := model.Job{ID: "job2", RunID: "run", Key: "plain", Status: model.StatusQueued, CreatedAt: now}
-	if err := s.Enqueue(context.Background(), run, map[string]model.Job{"job2": plain}, nil, false); err != nil {
+	// A job without a queue timeout gets no deadline (a fresh run, since the
+	// atomic enqueue inserts one run per request and rejects duplicates).
+	plain := model.Job{ID: "job2", RunID: "run2", Key: "plain", Status: model.StatusQueued, CreatedAt: now}
+	if err := s.Enqueue(context.Background(), model.Run{ID: "run2", Status: model.StatusQueued, CreatedAt: now}, map[string]model.Job{"job2": plain}, nil, false); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if stored, _ := f.job("job2"); stored.QueueDeadline != nil {

@@ -26,7 +26,17 @@ func (s Status) Terminal() bool {
 }
 
 type Run struct {
-	ID               string            `json:"id"`
+	ID string `json:"id"`
+	// RepoID is the immutable canonical repository identity, derived ONCE at
+	// ingress from the forge host plus the forge-native repository identity
+	// (e.g. "github.com/owner/repo", "gitlab.company.com/group/sub/proj").
+	// Every identity decision (policy lookup, RBAC, OIDC, quotas, cache
+	// namespace, downstream authorization, schedule ownership, runner ACLs)
+	// uses RepoID. Repo and RepoFullName are display/clone fields only: they
+	// may be a URL or a bare owner/name. Additive: records persisted before
+	// RepoID default to empty and consumers derive the identity from
+	// Repo + RepoFullName (see the repoIDFor helpers).
+	RepoID           string            `json:"repo_id,omitempty"`
 	Repo             string            `json:"repo,omitempty"`
 	RepoFullName     string            `json:"repo_full_name,omitempty"`
 	Ref              string            `json:"ref,omitempty"`
@@ -50,10 +60,17 @@ type Run struct {
 // carries the pipeline text so a restarted control plane and its runners can
 // recompile deterministically without an external store.
 type Job struct {
-	ID               string   `json:"id"`
-	RunID            string   `json:"run_id"`
-	Key              string   `json:"key"`
-	BaseKey          string   `json:"base_key,omitempty"`
+	ID      string `json:"id"`
+	RunID   string `json:"run_id"`
+	Key     string `json:"key"`
+	BaseKey string `json:"base_key,omitempty"`
+	// RepoID is the immutable canonical repository identity, copied from the
+	// run at job creation (never re-derived from the possibly changed clone
+	// URL). It is the identity every authorization, policy, quota, cache and
+	// scheduling decision uses; RepoURL/RepoFullName are display/clone
+	// fields only. Additive: empty on legacy records, where consumers derive
+	// the identity from RepoURL + RepoFullName.
+	RepoID           string   `json:"repo_id,omitempty"`
 	RepoURL          string   `json:"repo_url"`
 	RepoFullName     string   `json:"repo_full_name,omitempty"`
 	Ref              string   `json:"ref,omitempty"`

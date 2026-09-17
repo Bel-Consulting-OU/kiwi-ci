@@ -13,16 +13,16 @@
 -- link reuses the SAME child run ID, so a crash between the reservation and
 -- the child launch can never produce a duplicate child.
 
-ALTER TABLE schedules ADD COLUMN repo_id TEXT NOT NULL DEFAULT ''
+ALTER TABLE schedules ADD COLUMN repo_id TEXT NOT NULL DEFAULT '';
 
-ALTER TABLE schedules ADD COLUMN repo_url TEXT NOT NULL DEFAULT ''
+ALTER TABLE schedules ADD COLUMN repo_url TEXT NOT NULL DEFAULT '';
 
-ALTER TABLE schedules ADD COLUMN forge TEXT NOT NULL DEFAULT ''
+ALTER TABLE schedules ADD COLUMN forge TEXT NOT NULL DEFAULT '';
 
-ALTER TABLE schedules ADD COLUMN trusted BOOLEAN NOT NULL DEFAULT FALSE
+ALTER TABLE schedules ADD COLUMN trusted BOOLEAN NOT NULL DEFAULT FALSE;
 
-ALTER TABLE downstream_links ADD COLUMN stable_child_id TEXT NOT NULL DEFAULT ''
+ALTER TABLE downstream_links ADD COLUMN stable_child_id TEXT NOT NULL DEFAULT '';
 
-CREATE INDEX schedules_repo_id_idx ON schedules (repo_id)
+CREATE INDEX schedules_repo_id_idx ON schedules (repo_id);
 
-CREATE INDEX downstream_links_stable_child_idx ON downstream_links (stable_child_id)
+CREATE INDEX downstream_links_stable_child_idx ON downstream_links (stable_child_id);

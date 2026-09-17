@@ -117,7 +117,7 @@ func (s *Server) rebuildTestHistoryDB(ctx context.Context) {
 		repo, cached := repoForRun[r.RunID]
 		if !cached {
 			if run, gerr := s.DB.GetRun(ctx, r.RunID); gerr == nil {
-				repo = run.RepoFullName
+				repo = repoIDForRun(run)
 			}
 			repoForRun[r.RunID] = repo
 		}
@@ -251,7 +251,9 @@ func (s *Server) testShards(w http.ResponseWriter, r *http.Request) {
 		run = s.runs[j.RunID]
 		s.mu.Unlock()
 	}
-	repo := run.RepoFullName
+	// The shard/history key is the run's canonical repository identity, so
+	// two forges presenting the same bare name never share test history.
+	repo := repoIDForRun(run)
 	suite := j.Key
 	shards := 1
 	if v, err := strconv.Atoi(r.URL.Query().Get("shards")); err == nil && v > 0 && v <= 256 {

@@ -75,7 +75,7 @@ func TestDBQuotaSlotReleasedOnComplete(t *testing.T) {
 	if code, _ := next(); code != http.StatusNoContent {
 		t.Fatalf("second lease while at quota = %d, want 204", code)
 	}
-	running, queued := quotaCountsOf(f, "https://github.com/o/r.git")
+	running, queued := quotaCountsOf(f, "github.com/o/r")
 	if running != 1 || queued != 1 {
 		t.Fatalf("counters after first lease = %d/%d, want 1/1", running, queued)
 	}
@@ -84,7 +84,7 @@ func TestDBQuotaSlotReleasedOnComplete(t *testing.T) {
 	if w := completeTask(t, s, task, ri.ID, "success"); w.Code != http.StatusNoContent {
 		t.Fatalf("complete = %d: %s", w.Code, w.Body.String())
 	}
-	running, queued = quotaCountsOf(f, "https://github.com/o/r.git")
+	running, queued = quotaCountsOf(f, "github.com/o/r")
 	if running != 0 || queued != 1 {
 		t.Fatalf("counters after complete = %d/%d, want 0/1", running, queued)
 	}
@@ -132,7 +132,7 @@ func TestDBQuotaSlotReleasedOnCancel(t *testing.T) {
 	if w := doJSON(t, s, http.MethodPost, "/api/v1/runs/"+run.ID+"/cancel", "token", ""); w.Code != http.StatusOK {
 		t.Fatalf("cancel = %d: %s", w.Code, w.Body.String())
 	}
-	running, queued := quotaCountsOf(f, "https://github.com/o/r.git")
+	running, queued := quotaCountsOf(f, "github.com/o/r")
 	if running != 0 || queued != 0 {
 		t.Fatalf("counters after cancelling the whole run = %d/%d, want 0/0", running, queued)
 	}
@@ -234,7 +234,7 @@ func TestMemoryEnvironmentConcurrencySameRepoSerializes(t *testing.T) {
 	}
 }
 
-// quotaCountsOf reads the reserved counters for one repository key.
+// quotaCountsOf reads the reserved counters for one canonical repository key.
 func quotaCountsOf(f *dbFakeStore, repoKey string) (int, int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

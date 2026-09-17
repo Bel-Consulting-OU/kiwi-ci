@@ -2,6 +2,7 @@ package storage
 
 import (
 	"encoding/json"
+	"net/url"
 	"strings"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
@@ -57,7 +58,7 @@ func (p LeasePredicate) Allows() bool {
 	if !labelsSatisfy(r.Labels, j.RequiredLabels) {
 		return false
 	}
-	if !RepoAllowed(r.AllowedRepositories, j.RepoURL, j.RepoFullName) {
+	if !RepoAllowed(r.AllowedRepositories, j) {
 		return false
 	}
 	runtime := JobRuntime(j)
@@ -94,19 +95,77 @@ func ResolveRunnerProfile(r model.Runner, profile model.RunnerProfile, linked bo
 	return r
 }
 
-// RepoAllowed reports whether the canonical repository (or its bare full
-// name) is inside the allowlist. An empty allowlist imposes no restriction.
-func RepoAllowed(allowed []string, repoURL, repoFullName string) bool {
+// RepoAllowed reports whether the job's canonical repository identity (or,
+// as an explicitly configured alias, its bare full name) is inside the
+// allowlist. An empty allowlist imposes no restriction. The canonical
+// identity is read from the job's immutable RepoID, falling back to the
+// RepoURL + RepoFullName derivation for legacy payloads.
+func RepoAllowed(allowed []string, j model.Job) bool {
 	if len(allowed) == 0 {
 		return true
 	}
-	canon := CanonicalRepoID(RepoHost(repoURL), repoFullName)
+	canon := RepoIDForJob(j)
 	for _, a := range allowed {
-		if a == canon || (repoFullName != "" && a == repoFullName) {
+		if a == canon || (j.RepoFullName != "" && a == j.RepoFullName) {
 			return true
 		}
 	}
 	return false
+}
+
+// RepoIDFor resolves the canonical repository identity from an optional
+// stored RepoID plus the clone URL and full name: the stored RepoID is
+// authoritative and returned verbatim when set; otherwise the identity is
+// derived from the forge host of the clone URL plus the full name (itself
+// recovered from the URL path when the record carries no full name, so
+// URL-only legacy submissions keep a host-scoped identity). It is the ONE
+// fallback derivation the scheduler, the stores and the server's repoIDFor
+// helper all agree on.
+func RepoIDFor(repoID, repoURL, repoFullName string) string {
+	if id := strings.TrimSpace(repoID); id != "" {
+		return id
+	}
+	fullName := strings.TrimSpace(repoFullName)
+	if fullName == "" {
+		fullName = RepoFullNameFromURL(repoURL)
+	}
+	return CanonicalRepoID(RepoHost(repoURL), fullName)
+}
+
+// RepoFullNameFromURL extracts the forge-native owner/name (or nested group
+// path) from a clone URL, dropping the scheme, host, credentials and the
+// ".git" suffix. It returns "" when the input names no repository path
+// (empty, bare owner/name, or unparseable).
+func RepoFullNameFromURL(repoURL string) string {
+	u := strings.TrimSpace(repoURL)
+	if i := strings.Index(u, "://"); i >= 0 {
+		parsed, err := url.Parse(u)
+		if err != nil || parsed.Host == "" {
+			return ""
+		}
+		return strings.Trim(strings.TrimSuffix(parsed.Path, ".git"), "/")
+	}
+	// scp-like git@host:owner/name
+	if at := strings.Index(u, "@"); at >= 0 {
+		if colon := strings.Index(u[at:], ":"); colon >= 0 {
+			return strings.Trim(strings.TrimSuffix(u[at+colon+1:], ".git"), "/")
+		}
+	}
+	return ""
+}
+
+// RepoIDForJob resolves the canonical repository identity of a job:
+// the immutable stored RepoID when present, otherwise derived from
+// RepoURL + RepoFullName (legacy records).
+func RepoIDForJob(j model.Job) string {
+	return RepoIDFor(j.RepoID, j.RepoURL, j.RepoFullName)
+}
+
+// RepoIDForRun resolves the canonical repository identity of a run:
+// the immutable stored RepoID when present, otherwise derived from
+// Repo + RepoFullName (legacy records).
+func RepoIDForRun(r model.Run) string {
+	return RepoIDFor(r.RepoID, r.Repo, r.RepoFullName)
 }
 
 // RuntimeAllowed reports whether the runtime is declared by the capability
@@ -216,40 +275,47 @@ func JobRuntime(j model.Job) string {
 // RepoHost extracts the forge host from a repository URL in the common forms
 // (https://host/owner/repo, ssh://git@host/owner/repo and the scp-like
 // git@host:owner/repo), mirroring the server's host derivation so canonical
-// repo IDs agree across packages.
+// repo IDs agree across packages. Scheme URLs keep a non-default port
+// (host:port is part of the identity); scp-like forms never do.
 func RepoHost(repoURL string) string {
 	u := strings.TrimSpace(repoURL)
 	if i := strings.Index(u, "://"); i >= 0 {
-		u = u[i+3:]
+		rest := u[i+3:]
+		if at := strings.LastIndex(rest, "@"); at >= 0 {
+			rest = rest[at+1:]
+		}
+		if slash := strings.Index(rest, "/"); slash >= 0 {
+			return rest[:slash]
+		}
+		return rest
 	}
-	if at := strings.Index(u, "@"); at >= 0 {
+	if at := strings.LastIndex(u, "@"); at >= 0 {
 		u = u[at+1:]
 	}
-	slash := strings.Index(u, "/")
-	colon := strings.Index(u, ":")
-	switch {
-	case slash < 0 && colon < 0:
-		return u
-	case slash < 0:
+	if colon := strings.Index(u, ":"); colon >= 0 {
 		return u[:colon]
-	case colon >= 0 && colon < slash:
-		return u[:colon]
-	default:
+	}
+	if slash := strings.Index(u, "/"); slash >= 0 {
 		return u[:slash]
 	}
+	return u
 }
 
 // CanonicalRepoID is the canonical "<host>/<owner>/<name>" identity used by
-// repository allowlists. It mirrors auth.CanonicalRepoID without importing
-// the auth package, so storage stays independent of the server identity
-// layer.
+// repository allowlists and quota counters. It mirrors auth.CanonicalRepoID
+// without importing the auth package, so storage stays independent of the
+// server identity layer; the two derivations MUST stay identical. The forge
+// host is authoritative: a full name that already starts with exactly that
+// host is returned unchanged (idempotent), so re-canonicalizing a stored
+// RepoID is a no-op. With no known host the trimmed full name is returned
+// unchanged; an empty full name stays empty.
 func CanonicalRepoID(host, fullName string) string {
 	host = strings.TrimSpace(host)
 	fullName = strings.TrimSpace(fullName)
 	if fullName == "" {
-		return host
+		return ""
 	}
-	if host == "" {
+	if host == "" || strings.HasPrefix(fullName, host+"/") {
 		return fullName
 	}
 	return host + "/" + fullName

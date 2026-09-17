@@ -550,7 +550,7 @@ func TestDottedOrgVisibilityStaysStrict(t *testing.T) {
 		t.Fatal("canonical dotted-org principal must see the run")
 	}
 	// authorizeRepo: the bare alias must not authorize the dotted run.
-	if authorizeRepo(aliasPrincipal, auth.ActionRead, canonicalRepoForRun(run), false) {
+	if authorizeRepo(aliasPrincipal, auth.ActionRead, repoIDForRun(run), false) {
 		t.Fatal("authorizeRepo honored a single-segment alias for a dotted org")
 	}
 }

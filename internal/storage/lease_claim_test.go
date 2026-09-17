@@ -17,6 +17,9 @@ const (
 	leaseJobID  = "22222222222222222222222222222222"
 	leaseJob2ID = "33333333333333333333333333333333"
 	leaseRepo   = "https://github.com/o/r.git"
+	// leaseRepoID is the canonical identity of leaseRepo: the key every
+	// quota counter mutation derives (see RepoIDForJob / QuotaKeys).
+	leaseRepoID = "github.com/o/r"
 	leaseRunner = "44444444444444444444444444444444"
 	leaseCert   = "cert-serial-1"
 	leaseProf   = "profile-1"

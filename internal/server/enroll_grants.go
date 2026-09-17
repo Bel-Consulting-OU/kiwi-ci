@@ -27,8 +27,16 @@ type EnrollGrant struct {
 	// ExpiresAt bounds the grant lifetime; expired grants are rejected
 	// and pruned.
 	ExpiresAt time.Time `json:"expires_at"`
-	// BoundLabels, when non-empty, restricts what the enrollment may
-	// request: the enroll request must carry every bound label.
+	// BoundLabels is the grant's COMPLETE ALLOWED label set (the field
+	// name is retained for wire/storage compatibility; the concept is
+	// AllowedLabels). A non-empty list permits exactly those enrollment
+	// labels: every label the enroll request carries must appear in this
+	// set. An empty/nil list is the legacy no-constraint grant and
+	// permits any requested labels. Comparison is exact — byte-for-byte,
+	// case-sensitive, no trimming — matching the runner label grammar
+	// enforced at registration (runnerLabelRegexp). Enrollment labels are
+	// advisory and never become scheduling attributes: those remain
+	// server/profile-owned.
 	BoundLabels []string `json:"bound_labels,omitempty"`
 	// Used marks the grant consumed. Consumption is atomic under s.mu so
 	// a racing replay cannot double-enroll.
@@ -46,10 +54,11 @@ func enrollTokenFrom(r *http.Request) string {
 
 // CreateEnrollGrant mints a single-use enrollment grant: 32 random bytes
 // returned raw (hex) to the operator/runner agent, stored server-side only
-// as its SHA-256 digest with the given lifetime and label binding. In DB
+// as its SHA-256 digest with the given lifetime and allowed-label set. An
+// empty allowedLabels list mints the legacy no-label-constraint grant. In DB
 // mode the grant row is written through the durable EnrollGrantStore so
 // every replica honors the same single-use claim.
-func (s *Server) CreateEnrollGrant(ttl time.Duration, boundLabels []string) (string, error) {
+func (s *Server) CreateEnrollGrant(ttl time.Duration, allowedLabels []string) (string, error) {
 	if ttl <= 0 {
 		return "", fmt.Errorf("enroll grant ttl must be positive")
 	}
@@ -67,7 +76,7 @@ func (s *Server) CreateEnrollGrant(ttl time.Duration, boundLabels []string) (str
 		if !ok {
 			return "", fmt.Errorf("store does not support enrollment grants")
 		}
-		if err := gs.PutEnrollGrant(context.Background(), auth.TokenDigest(token), expires, boundLabels); err != nil {
+		if err := gs.PutEnrollGrant(context.Background(), auth.TokenDigest(token), expires, allowedLabels); err != nil {
 			return "", err
 		}
 		return token, nil
@@ -80,7 +89,7 @@ func (s *Server) CreateEnrollGrant(ttl time.Duration, boundLabels []string) (str
 	s.pruneEnrollGrantsLocked(time.Now().UTC())
 	s.EnrollGrants[auth.TokenDigest(token)] = EnrollGrant{
 		ExpiresAt:   expires,
-		BoundLabels: append([]string(nil), boundLabels...),
+		BoundLabels: append([]string(nil), allowedLabels...),
 	}
 	if err := s.persistEnrollGrants(); err != nil {
 		delete(s.EnrollGrants, auth.TokenDigest(token))
@@ -118,30 +127,42 @@ func (s *Server) enrollGrantOK(tok string) bool {
 	return ok && !g.Used && time.Now().UTC().Before(g.ExpiresAt)
 }
 
-// checkGrantLabels enforces the grant's label binding: the enroll request
-// must carry every bound label. A grant without bound labels accepts any
-// request. The check is separate from consumption so a mismatched request
-// never burns the single-use grant (memory and DB mode share the contract).
-func checkGrantLabels(bound, request []string) error {
-	for _, want := range bound {
-		if !containsLabel(request, want) {
-			return fmt.Errorf("enrollment grant requires label %q", want)
+// checkGrantAllowedLabels enforces the grant's allowed-label contract:
+// BoundLabels is the COMPLETE ALLOWED set, so every label the enroll request
+// carries must appear in it. A grant with an empty allowed set (the legacy
+// no-constraint grant) accepts any requested labels. Comparison is exact:
+// labels are matched byte-for-byte (case-sensitive, no trimming), the same
+// semantics as the runner label grammar (runnerLabelRegexp). The check is
+// separate from consumption so a mismatched request never burns the
+// single-use grant (memory and DB mode share the contract). Enrollment
+// labels are advisory: they are validated here and then discarded, never
+// persisted as scheduling attributes (those are server/profile-owned).
+func checkGrantAllowedLabels(allowed, requested []string) error {
+	if len(allowed) == 0 {
+		// Legacy/unconstrained grant: no label contract to enforce.
+		return nil
+	}
+	for _, want := range requested {
+		if !containsLabel(allowed, want) {
+			return fmt.Errorf("grant does not permit label %q", want)
 		}
 	}
 	return nil
 }
 
 // consumeEnrollGrant atomically validates and consumes the grant presented
-// by an enroll request: known, unused, unexpired, and — when the grant is
-// label-bound — the request must carry every bound label. In DB mode the
-// consumption is the store's conditional UPDATE (consumed_at IS NULL AND
-// expires_at > now()), so concurrent enrollments of the same grant yield
-// exactly one winner; memory mode consumes under s.mu. Label binding is
-// validated BEFORE the consume in both modes: a request missing a bound
-// label must not consume (and thereby destroy) the grant it cannot use.
-// BoundLabels are immutable for a grant digest, so the pre-read cannot be
-// raced into disagreeing with the consumed record. On success the grant is
-// marked used and persisted before any certificate is signed.
+// by an enroll request: known, unused, unexpired, and — when the grant
+// carries an allowed-label set — every requested label must be in that set.
+// In DB mode the consumption is the store's conditional UPDATE (consumed_at
+// IS NULL AND expires_at > now()), so concurrent enrollments of the same
+// grant yield exactly one winner; memory mode consumes under s.mu. Label
+// validation happens BEFORE the consume in both modes: a request carrying an
+// unpermitted label must not consume (and thereby destroy) the grant it
+// cannot use. BoundLabels are immutable for a grant digest, so the pre-read
+// cannot be raced into disagreeing with the consumed record. On success the
+// grant is marked used and persisted before any certificate is signed; if
+// the memory-mode persist fails the in-memory mutation is rolled back, so a
+// consume that is not durable stays consumable and no certificate is issued.
 func (s *Server) consumeEnrollGrant(tok string, requestLabels []string) error {
 	if tok == "" {
 		return fmt.Errorf("enrollment grant required")
@@ -166,7 +187,7 @@ func (s *Server) consumeEnrollGrant(tok string, requestLabels []string) error {
 		if !time.Now().UTC().Before(rec.ExpiresAt) {
 			return fmt.Errorf("enrollment grant expired")
 		}
-		if err := checkGrantLabels(rec.BoundLabels, requestLabels); err != nil {
+		if err := checkGrantAllowedLabels(rec.BoundLabels, requestLabels); err != nil {
 			return err
 		}
 		if _, err := gs.ConsumeEnrollGrant(context.Background(), digest, ""); err != nil {
@@ -185,22 +206,33 @@ func (s *Server) consumeEnrollGrant(tok string, requestLabels []string) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	g, ok := s.EnrollGrants[digest]
-	if !ok {
+	prev, existed := s.EnrollGrants[digest]
+	if !existed {
 		return fmt.Errorf("unknown enrollment grant")
 	}
+	g := prev
 	if g.Used {
 		return fmt.Errorf("enrollment grant already used")
 	}
 	if time.Now().UTC().After(g.ExpiresAt) {
 		return fmt.Errorf("enrollment grant expired")
 	}
-	if err := checkGrantLabels(g.BoundLabels, requestLabels); err != nil {
+	if err := checkGrantAllowedLabels(g.BoundLabels, requestLabels); err != nil {
 		return err
 	}
 	g.Used = true
 	s.EnrollGrants[digest] = g
 	if err := s.persistEnrollGrants(); err != nil {
+		// The consume is not durable: restore the pre-consume entry so a
+		// restart (which reloads the on-disk, still-unused grant) and a
+		// retry do not see a phantom consumption. No certificate is
+		// signed for a consume that did not persist, because the caller
+		// returns on this error.
+		if existed {
+			s.EnrollGrants[digest] = prev
+		} else {
+			delete(s.EnrollGrants, digest)
+		}
 		return fmt.Errorf("persist enrollment grants: %w", err)
 	}
 	return nil
@@ -235,14 +267,22 @@ func (s *Server) loadEnrollGrants(dataDir string) error {
 	return nil
 }
 
-// persistEnrollGrants atomically writes the grant state to dataDir
-// (digest-keyed only). Memory servers without a data dir keep grants in
-// process memory.
-func (s *Server) persistEnrollGrants() error {
+// persistEnrollGrantsFunc is the persistence seam for grant state.
+// Production always uses the filesystem writer below; tests replace it to
+// inject persistence failures. It is invoked only while s.mu is held, and
+// tests restore it before any further grant state can be persisted.
+var persistEnrollGrantsFunc = func(s *Server) error {
 	if s.dataDir == "" {
 		return nil
 	}
 	return marshalJSONFile(filepath.Join(s.dataDir, enrollGrantsFile), s.EnrollGrants)
+}
+
+// persistEnrollGrants atomically writes the grant state to dataDir
+// (digest-keyed only). Memory servers without a data dir keep grants in
+// process memory.
+func (s *Server) persistEnrollGrants() error {
+	return persistEnrollGrantsFunc(s)
 }
 
 // pruneEnrollGrantsLocked drops expired grants. Callers hold s.mu.

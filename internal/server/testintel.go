@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
@@ -41,12 +42,12 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 	repo := ""
 	if s.DB != nil {
 		if run, gerr := s.DB.GetRun(r.Context(), j.RunID); gerr == nil {
-			repo = run.RepoFullName
+			repo = repoIDForRun(run)
 		}
 	} else {
 		s.mu.Lock()
 		if run, ok := s.runs[j.RunID]; ok {
-			repo = run.RepoFullName
+			repo = repoIDForRun(run)
 		}
 		s.mu.Unlock()
 	}
@@ -121,9 +122,12 @@ func (s *Server) listTestReports(w http.ResponseWriter, r *http.Request) {
 }
 
 // testIntelligence reports flaky-test history and report volume for one
-// repository. The repo query parameter is required: reports are keyed by
-// run, and the run's RepoFullName scopes the aggregation so a control plane
-// hosting many repositories never leaks cross-repo test history.
+// repository. The repo query parameter is required and accepts the
+// human-readable full name, the canonical RepoID or the legacy canonical
+// form: reports are keyed by run and matched through the run's canonical
+// repository identity, so a control plane hosting many repositories — or
+// two forges presenting the same bare name — never leaks cross-repo test
+// history.
 func (s *Server) testIntelligence(w http.ResponseWriter, r *http.Request) {
 	repo := r.URL.Query().Get("repo")
 	if repo == "" {
@@ -137,6 +141,7 @@ func (s *Server) testIntelligence(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
+	historyKeys := map[string]bool{repo: true}
 	if s.DB != nil {
 		s.syncTestHistoryDB(r.Context())
 		reports, err := s.DB.ListTestReportsAll(r.Context())
@@ -147,13 +152,14 @@ func (s *Server) testIntelligence(w http.ResponseWriter, r *http.Request) {
 		filtered := make([]model.TestReport, 0, len(reports))
 		for _, rep := range reports {
 			run, gerr := s.DB.GetRun(r.Context(), rep.RunID)
-			if gerr == nil && run.RepoFullName == repo {
+			if gerr == nil && runMatchesRepoQuery(run, repo) {
 				filtered = append(filtered, rep)
+				historyKeys[repoIDForRun(run)] = true
 			}
 		}
 		out := summarizeTestIntelligence(filtered)
 		out["repo"] = repo
-		s.mergeHistoryFlaky(repo, out)
+		s.mergeHistoryFlakyKeys(historyKeys, out)
 		writeJSON(w, http.StatusOK, out)
 		return
 	}
@@ -161,14 +167,29 @@ func (s *Server) testIntelligence(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.Unlock()
 	filtered := []model.TestReport{}
 	for _, rep := range s.reports {
-		if run, ok := s.runs[rep.RunID]; ok && run.RepoFullName == repo {
+		if run, ok := s.runs[rep.RunID]; ok && runMatchesRepoQuery(run, repo) {
 			filtered = append(filtered, rep)
+			historyKeys[repoIDForRun(run)] = true
 		}
 	}
 	out := summarizeTestIntelligence(filtered)
 	out["repo"] = repo
-	s.mergeHistoryFlaky(repo, out)
+	s.mergeHistoryFlakyKeys(historyKeys, out)
 	writeJSON(w, http.StatusOK, out)
+}
+
+// runMatchesRepoQuery reports whether a test-intelligence query addresses a
+// run's repository. The query may be the human-readable full name, the
+// canonical RepoID, or the legacy host-less canonical form.
+func runMatchesRepoQuery(run model.Run, query string) bool {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return false
+	}
+	if query == run.RepoFullName || query == repoIDForRun(run) {
+		return true
+	}
+	return query == auth.CanonicalRepoID("", run.RepoFullName)
 }
 
 // summarizeTestIntelligence computes the flaky-test summary from an explicit
@@ -211,7 +232,7 @@ func summarizeTestIntelligence(reports []model.TestReport) map[string]any {
 }
 
 // mergeHistoryFlaky unions the report-derived flaky set with the persisted
-// history's flaky set for a repository.
+// history's flaky set for one repository key.
 func (s *Server) mergeHistoryFlaky(repo string, out map[string]any) {
 	existing, _ := out["flaky_tests"].([]string)
 	seen := map[string]bool{}
@@ -226,4 +247,12 @@ func (s *Server) mergeHistoryFlaky(repo string, out map[string]any) {
 	}
 	sort.Strings(existing)
 	out["flaky_tests"] = existing
+}
+
+// mergeHistoryFlakyKeys unions the persisted flaky set over every canonical
+// history key a query matched.
+func (s *Server) mergeHistoryFlakyKeys(keys map[string]bool, out map[string]any) {
+	for key := range keys {
+		s.mergeHistoryFlaky(key, out)
+	}
 }

@@ -7,7 +7,7 @@
 -- sequences stay strictly increasing across replicas and restarts.
 --
 -- test_history caches the serialized per-test history aggregates with a
--- monotonically increasing version bumped on every upload; replicas reload
+-- monotonically increasing version bumped on every upload, replicas reload
 -- the cache when the version advances so sharding decisions converge.
 
 CREATE TABLE log_entries (
@@ -18,18 +18,18 @@ CREATE TABLE log_entries (
     step TEXT,
     line TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL
-)
+);
 
-CREATE INDEX log_entries_run_id_seq_idx ON log_entries (run_id, seq)
+CREATE INDEX log_entries_run_id_seq_idx ON log_entries (run_id, seq);
 
 INSERT INTO log_entries (run_id, job_id, job_key, step, line, created_at)
-    SELECT run_id, job_id, job_key, step, line, created_at FROM log_chunks ORDER BY seq
+    SELECT run_id, job_id, job_key, step, line, created_at FROM log_chunks ORDER BY seq;
 
 CREATE TABLE test_history (
     id INT PRIMARY KEY,
     version BIGINT NOT NULL DEFAULT 0,
     stats JSONB NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-)
+);
 
-INSERT INTO test_history (id, version, stats) VALUES (1, 0, '{}')
+INSERT INTO test_history (id, version, stats) VALUES (1, 0, '{}');

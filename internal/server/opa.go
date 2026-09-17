@@ -98,7 +98,8 @@ func (s *Server) opaAdmissionCheck(ctx context.Context, in SubmitRun, g *pipelin
 			network = "none"
 		}
 		decision, err := gate.Decide(ctx, policy.OPAInput{
-			Repository:   in.RepoFullName,
+			Repository:   repoIDForSubmit(in),
+			RepoFullName: in.RepoFullName,
 			Trusted:      in.Trusted,
 			Branch:       branch,
 			Event:        in.Event,

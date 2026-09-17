@@ -163,41 +163,69 @@ func TestSnapshotUploadDBModeCASAndRecord(t *testing.T) {
 	}
 }
 
-// TestSnapshotUploadDBModeRecordFailureFailsClosed proves an insertion
-// failure fails the upload (503) and removes the CAS blob again.
-func TestSnapshotUploadDBModeRecordFailureFailsClosed(t *testing.T) {
+// TestSnapshotUploadDBModeRecordFailureKeepsSharedCASBlob proves the
+// fail-closed record contract WITHOUT the blind CAS rollback: an insertion
+// failure fails the upload (503) and records nothing, but a digest another
+// durable record references is never deleted — the pre-existing snapshot
+// still downloads.
+func TestSnapshotUploadDBModeRecordFailureKeepsSharedCASBlob(t *testing.T) {
 	f := newDBFakeStore()
 	casDir := t.TempDir()
 	s, runnerID, jobID, task, c := snapshotCASServer(t, f, casDir)
+	runID := task.Job.RunID
 	body, _ := snapshotArchive(t)
 
+	// Seed one durable snapshot record referencing CAS digest X.
+	w := uploadSnapshotCAS(t, c, jobID, runnerID, task, body)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("seed upload = %d: %s", w.Code, w.Body.String())
+	}
+	var first struct {
+		ID     string `json:"id"`
+		SHA256 string `json:"sha256"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &first); err != nil {
+		t.Fatal(err)
+	}
+	if len(first.SHA256) != 64 {
+		t.Fatalf("seed digest = %q", first.SHA256)
+	}
+
+	// The record insert fails while the SAME archive dedupes to X.
 	f.mu.Lock()
 	f.snapshotErr = fmt.Errorf("snapshot: injected failure")
 	f.mu.Unlock()
-	w := uploadSnapshotCAS(t, c, jobID, runnerID, task, body)
+	w = uploadSnapshotCAS(t, c, jobID, runnerID, task, body)
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("upload with record failure = %d, want 503: %s", w.Code, w.Body.String())
 	}
 	f.mu.Lock()
 	records := len(f.snapshots)
 	f.mu.Unlock()
-	if records != 0 {
-		t.Fatalf("records persisted = %d, want 0", records)
+	if records != 1 {
+		t.Fatalf("records persisted = %d, want 1 (the failed upload must not record)", records)
 	}
-	// The orphaned CAS blob was removed again: no object files remain
-	// under the blob store (the sha256/ prefix layout keeps empty dirs).
-	var blobFiles []string
-	_ = filepath.Walk(filepath.Join(casDir, "sha256"), func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-		if !info.IsDir() {
-			blobFiles = append(blobFiles, path)
-		}
-		return nil
-	})
-	if len(blobFiles) != 0 {
-		t.Fatalf("CAS blobs left behind after failed record insert: %d files", len(blobFiles))
+
+	// The pre-existing digest survives and is still openable.
+	rc, _, err := s.CAS.Open(context.Background(), first.SHA256)
+	if err != nil {
+		t.Fatalf("pre-existing CAS digest deleted by failed upload: %v", err)
 	}
-	_ = s
+	got, err := io.ReadAll(rc)
+	rc.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("CAS bytes changed: got %d bytes, want %d", len(got), len(body))
+	}
+
+	// The record referencing X still downloads byte-identically.
+	w = c.do(http.MethodGet, "/api/v1/runs/"+runID+"/snapshots/"+first.ID, nil, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("pre-existing snapshot download = %d: %s", w.Code, w.Body.String())
+	}
+	if !bytes.Equal(w.Body.Bytes(), body) {
+		t.Fatalf("downloaded bytes differ after failed upload: got %d, want %d", w.Body.Len(), len(body))
+	}
 }

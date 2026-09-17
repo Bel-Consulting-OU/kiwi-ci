@@ -332,7 +332,7 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 			needs = append(needs, depID)
 		}
 		j := model.Job{
-			ID: id, RunID: parent.RunID, Key: key, BaseKey: cj.BaseID, RepoURL: parent.RepoURL, RepoFullName: parent.RepoFullName, Ref: parent.Ref, SHA: parent.SHA,
+			ID: id, RunID: parent.RunID, Key: key, BaseKey: cj.BaseID, RepoID: parent.RepoID, RepoURL: parent.RepoURL, RepoFullName: parent.RepoFullName, Ref: parent.Ref, SHA: parent.SHA,
 			Event: parent.Event, Condition: cj.Job.If, DependencyStatus: model.StatusSuccess, Pipeline: string(canonical), Trusted: parent.Trusted, ChangedFiles: append([]string{}, parent.ChangedFiles...), ChangedFilesKnown: parent.ChangedFilesKnown, Needs: needs,
 			RequiredLabels: labelsForJob(cj.Job), Network: effectiveNetwork, Environment: env, ApprovalRequired: cj.Job.Environment.Approval, EnvironmentBranches: append([]string{}, cj.Job.Environment.Branches...), EnvironmentConcurrency: cj.Job.Environment.Concurrency, OIDCAllowed: cj.Job.Permissions.IDToken, OIDCAudiences: cloneStrings(oidcAudiences),
 			DeclaredSecrets: declaredSecrets(strictSpec, cj.Job),
@@ -476,12 +476,12 @@ func (s *Server) memoryGeneratedFragment(parentJobID string, generation int64, f
 // generatedChildCapabilities derives the capability ceiling for generated
 // children: the parent's stored effective policy, narrowed by the current
 // policy file and the trust floor. A parent without a stored policy falls
-// back to the enqueue-time defaults for its trust level.
+// back to the enqueue-time defaults for its trust level. The policy lookup
+// uses the parent's canonical RepoID (derived for legacy payloads), so a
+// policy entry for github.com/acme/api never narrows a
+// gitlab.company.com/acme/api child.
 func (s *Server) generatedChildCapabilities(parent model.Job) policy.Capabilities {
-	repo := parent.RepoFullName
-	if repo == "" {
-		repo = repoFullNameOf(parent)
-	}
+	repo := repoIDForJob(parent)
 	caps := policy.DefaultUntrustedCapabilities()
 	if parent.Trusted {
 		caps = policy.DefaultTrustedCapabilities()
@@ -513,10 +513,11 @@ func repoFullNameOf(j model.Job) string {
 }
 
 // repoIdentityOfJob resolves the repository identity a job is admitted
-// under: its clone URL and full name (reconstructed from the URL when the
-// stored full name is empty).
+// under: the canonical RepoID (derived for legacy payloads), its clone URL
+// and its full name (reconstructed from the URL when the stored full name
+// is empty).
 func repoIdentityOfJob(j model.Job) repoIdentity {
-	id := repoIdentity{RepoURL: j.RepoURL, RepoFullName: j.RepoFullName}
+	id := repoIdentity{RepoID: repoIDForJob(j), RepoURL: j.RepoURL, RepoFullName: j.RepoFullName}
 	if id.RepoFullName == "" {
 		id.RepoFullName = repoFullNameOf(j)
 	}

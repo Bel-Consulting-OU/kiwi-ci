@@ -145,14 +145,16 @@ func (s *Server) gitlabWebhook(w http.ResponseWriter, r *http.Request) {
 
 	files := ec.ChangedFiles
 
+	repoID := s.forgeRepoID("gitlab", webhookRepoCoordinate(ec))
 	delivery := r.Header.Get("X-GitLab-Event-UUID")
 	if delivery != "" {
-		if run, ok := s.dedupeRun(delivery, ec.Repository.FullName); ok {
+		if run, ok := s.dedupeRun(delivery, repoID); ok {
 			writeJSON(w, http.StatusOK, run)
 			return
 		}
 	}
 	in := SubmitRun{
+		RepoID:            repoID,
 		RepoURL:           ec.HeadRepository.CloneURL,
 		RepoFullName:      ec.Repository.FullName,
 		Ref:               ec.Ref,
@@ -246,14 +248,16 @@ func (s *Server) forgejoWebhook(w http.ResponseWriter, r *http.Request) {
 
 	files := ec.ChangedFiles
 
+	repoID := s.forgeRepoID("forgejo", webhookRepoCoordinate(ec))
 	delivery := r.Header.Get("X-Forgejo-Delivery")
 	if delivery != "" {
-		if run, ok := s.dedupeRun(delivery, ec.Repository.FullName); ok {
+		if run, ok := s.dedupeRun(delivery, repoID); ok {
 			writeJSON(w, http.StatusOK, run)
 			return
 		}
 	}
 	in := SubmitRun{
+		RepoID:            repoID,
 		RepoURL:           ec.HeadRepository.CloneURL,
 		RepoFullName:      ec.Repository.FullName,
 		Ref:               ec.Ref,

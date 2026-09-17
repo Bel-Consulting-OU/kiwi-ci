@@ -11,7 +11,7 @@
 --
 -- outbox gains the cross-replica claim lease: a flusher atomically claims a
 -- batch (SELECT ... FOR UPDATE SKIP LOCKED) before dispatch and acknowledges
--- (DELETE) after it; a claimed_at older than the claim TTL (5 minutes) is
+-- (DELETE) after it, a claimed_at older than the claim TTL (5 minutes) is
 -- reclaimable by another replica after a crash.
 --
 -- artifacts gains the job_generation column and the (job_id, job_generation,

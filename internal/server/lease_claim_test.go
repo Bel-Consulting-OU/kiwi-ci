@@ -12,6 +12,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runnerpki"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 // ---------------------------------------------------------------------------
@@ -390,10 +391,11 @@ func paritySeedDB(f *dbFakeStore, runner model.Runner, jobs ...model.Job) {
 		// Mirror the durable quota counters for seeded running jobs, exactly
 		// as claims/completions would keep them.
 		if j.Status == model.StatusRunning && j.RepoURL != "" {
-			c := f.quotas[j.RepoURL]
+			repoID := storage.RepoIDForJob(j)
+			c := f.quotas[repoID]
 			c[0]++
-			f.quotas[j.RepoURL] = c
-			if team := repoURLTeam(j.RepoURL); team != j.RepoURL {
+			f.quotas[repoID] = c
+			if team := storage.RepoTeamKey(repoID); team != repoID && team != "" {
 				tc := f.quotas[team]
 				tc[0]++
 				f.quotas[team] = tc

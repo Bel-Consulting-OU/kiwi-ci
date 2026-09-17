@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"runtime"
 	"strings"
 	"testing"
@@ -36,6 +37,140 @@ func tarGzEntries(t *testing.T, entries []struct {
 		t.Fatal(err)
 	}
 	return buf.Bytes()
+}
+
+// tarGzHeaders builds a tar.gz from raw headers; regular entries carry a
+// one-byte body per declared size.
+func tarGzHeaders(t *testing.T, headers []tar.Header) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	for i := range headers {
+		h := headers[i]
+		if err := tw.WriteHeader(&h); err != nil {
+			t.Fatal(err)
+		}
+		if h.Typeflag == tar.TypeReg && h.Size > 0 {
+			if _, err := tw.Write(bytes.Repeat([]byte("x"), int(h.Size))); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// TestParseHeaderCountRejectsDirectoryFlood pins the total-header bound:
+// directory headers used to bypass MaxEntries entirely, so an archive of
+// nothing but directories could grow the seen map without bound.
+func TestParseHeaderCountRejectsDirectoryFlood(t *testing.T) {
+	headers := make([]tar.Header, 0, 10_000)
+	for i := 0; i < 10_000; i++ {
+		headers = append(headers, tar.Header{
+			Name:     fmt.Sprintf("dir%05d/", i),
+			Typeflag: tar.TypeDir,
+			Mode:     0o755,
+		})
+	}
+	limits := safefs.ExtractLimits{MaxEntries: 100}
+	if _, err := ParseWithLimits(bytes.NewReader(tarGzHeaders(t, headers)), limits); !errors.Is(err, safefs.ErrLimits) {
+		t.Fatalf("directory flood: want ErrLimits, got %v", err)
+	}
+}
+
+// TestParseHeaderCountRejectsSymlinkFlood is the symlink twin: non-regular
+// headers are processed and counted too.
+func TestParseHeaderCountRejectsSymlinkFlood(t *testing.T) {
+	headers := make([]tar.Header, 0, 10_000)
+	for i := 0; i < 10_000; i++ {
+		headers = append(headers, tar.Header{
+			Name:     fmt.Sprintf("link%05d", i),
+			Typeflag: tar.TypeSymlink,
+			Linkname: "target",
+		})
+	}
+	limits := safefs.ExtractLimits{MaxEntries: 100}
+	if _, err := ParseWithLimits(bytes.NewReader(tarGzHeaders(t, headers)), limits); !errors.Is(err, safefs.ErrLimits) {
+		t.Fatalf("symlink flood: want ErrLimits, got %v", err)
+	}
+}
+
+// TestParseHeaderCountRejectsPaxFlood floods the archive with PAX extended
+// headers: each entry is long enough that the writer emits an extended header
+// record, and the total-header cap must reject the resulting stream even
+// though Go's tar reader merges those records before returning them.
+func TestParseHeaderCountRejectsPaxFlood(t *testing.T) {
+	long := strings.Repeat("p", 120)
+	headers := make([]tar.Header, 0, 10_000)
+	for i := 0; i < 10_000; i++ {
+		headers = append(headers, tar.Header{
+			Name:     fmt.Sprintf("%s%05d", long, i),
+			Typeflag: tar.TypeSymlink,
+			Linkname: "target",
+			Format:   tar.FormatPAX,
+		})
+	}
+	limits := safefs.ExtractLimits{MaxEntries: 100}
+	if _, err := ParseWithLimits(bytes.NewReader(tarGzHeaders(t, headers)), limits); !errors.Is(err, safefs.ErrLimits) {
+		t.Fatalf("pax flood: want ErrLimits, got %v", err)
+	}
+}
+
+// TestParseHeaderCountBoundaryMixed pins the boundary: a mixed archive with
+// exactly MaxEntries headers of any type is accepted, one header more is
+// rejected, and the regular-entry set is unaffected.
+func TestParseHeaderCountBoundaryMixed(t *testing.T) {
+	mk := func(extra bool) []byte {
+		headers := make([]tar.Header, 0, 101)
+		for i := 0; i < 40; i++ {
+			headers = append(headers, tar.Header{
+				Name:     fmt.Sprintf("dir%02d/", i),
+				Typeflag: tar.TypeDir,
+				Mode:     0o755,
+			})
+		}
+		for i := 0; i < 30; i++ {
+			headers = append(headers, tar.Header{
+				Name:     fmt.Sprintf("link%02d", i),
+				Typeflag: tar.TypeSymlink,
+				Linkname: "dir00",
+			})
+		}
+		for i := 0; i < 30; i++ {
+			headers = append(headers, tar.Header{
+				Name:     fmt.Sprintf("file%02d", i),
+				Typeflag: tar.TypeReg,
+				Mode:     0o644,
+				Size:     1,
+			})
+		}
+		if extra {
+			headers = append(headers, tar.Header{
+				Name:     "one-more",
+				Typeflag: tar.TypeReg,
+				Mode:     0o644,
+				Size:     1,
+			})
+		}
+		return tarGzHeaders(t, headers)
+	}
+	limits := safefs.ExtractLimits{MaxEntries: 100}
+	m, err := ParseWithLimits(bytes.NewReader(mk(false)), limits)
+	if err != nil {
+		t.Fatalf("archive with exactly MaxEntries headers must parse: %v", err)
+	}
+	if len(m.Entries) != 30 {
+		t.Fatalf("regular entries = %d, want 30", len(m.Entries))
+	}
+	if _, err := ParseWithLimits(bytes.NewReader(mk(true)), limits); !errors.Is(err, safefs.ErrLimits) {
+		t.Fatalf("MaxEntries+1 headers: want ErrLimits, got %v", err)
+	}
 }
 
 // TestParseFileLimitBoundary pins the per-entry size boundary: an entry

@@ -111,14 +111,16 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 	// and include-path triggers fail closed when the list is unobtainable.
 	files := ec.ChangedFiles
 
+	repoID := s.forgeRepoID("github", webhookRepoCoordinate(ec))
 	delivery := r.Header.Get("X-GitHub-Delivery")
 	if delivery != "" {
-		if run, ok := s.dedupeRun(delivery, ec.Repository.FullName); ok {
+		if run, ok := s.dedupeRun(delivery, repoID); ok {
 			writeJSON(w, http.StatusOK, run)
 			return
 		}
 	}
 	in := SubmitRun{
+		RepoID:            repoID,
 		RepoURL:           ec.HeadRepository.CloneURL,
 		RepoFullName:      ec.Repository.FullName,
 		Ref:               ec.Ref,
@@ -149,8 +151,9 @@ func (s *Server) pipelinePath() string {
 // dedupeRun returns the run already created for a webhook delivery ID, so
 // forge retries (which reuse the delivery ID) acknowledge the original run
 // instead of enqueueing a duplicate. The stored run must belong to the same
-// canonical repository.
-func (s *Server) dedupeRun(delivery, repoFullName string) (model.Run, bool) {
+// canonical repository: a delivery ID collision across forges can never
+// return a same-named repository's run.
+func (s *Server) dedupeRun(delivery, repoID string) (model.Run, bool) {
 	if delivery == "" {
 		return model.Run{}, false
 	}
@@ -164,7 +167,7 @@ func (s *Server) dedupeRun(delivery, repoFullName string) (model.Run, bool) {
 	if !ok {
 		return model.Run{}, false
 	}
-	if repoFullName != "" && run.RepoFullName != repoFullName {
+	if repoID != "" && repoIDForRun(run) != repoID {
 		return model.Run{}, false
 	}
 	return run, true

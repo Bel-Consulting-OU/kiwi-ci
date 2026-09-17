@@ -5,11 +5,18 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
+
+// errCompiledBoom is the injected storage failure used by the atomic-enqueue
+// fault tests.
+var errCompiledBoom = errors.New("injected compiled-enqueue failure")
 
 func testHash(raw string) []byte {
 	sum := sha256.Sum256([]byte(raw))
@@ -265,11 +272,29 @@ func TestEnqueueInsertsRunAndJobs(t *testing.T) {
 	if err := s.Enqueue(context.Background(), run, jobs, deps, false); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
+	// ONE atomic request carries the run, its jobs and the authoritative
+	// dependency edges; there is no sequential InsertRun/InsertJob loop.
+	if len(f.compiledCalls) != 1 {
+		t.Fatalf("InsertCompiledRun calls = %d, want 1", len(f.compiledCalls))
+	}
+	req := f.compiledCalls[0]
+	if req.Run.ID != "run" || len(req.Jobs) != 2 {
+		t.Fatalf("compiled request = run %q with %d jobs", req.Run.ID, len(req.Jobs))
+	}
+	if got := req.Deps["job2"]; len(got) != 1 || got[0] != "job1" {
+		t.Fatalf("compiled deps = %v, want job2 -> [job1]", req.Deps)
+	}
 	if len(f.insertRunCalls) != 1 || f.insertRunCalls[0].ID != "run" {
 		t.Errorf("insert run calls = %+v", f.insertRunCalls)
 	}
-	if len(f.insertJobCalls) != 2 {
-		t.Errorf("insert job calls = %d, want 2", len(f.insertJobCalls))
+	if len(f.insertJobCalls) != 0 {
+		t.Errorf("sequential insert job calls = %d, want 0", len(f.insertJobCalls))
+	}
+	for _, id := range []string{"job1", "job2"} {
+		j, ok := f.job(id)
+		if !ok || j.RunID != "run" {
+			t.Fatalf("job %s not committed: %+v ok=%v", id, j, ok)
+		}
 	}
 }
 
@@ -285,14 +310,155 @@ func TestEnqueueSupersedesConcurrencyGroup(t *testing.T) {
 	if err := s.Enqueue(context.Background(), run, map[string]model.Job{"newjob": {ID: "newjob", RunID: "new", Status: model.StatusQueued}}, nil, true); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
-	if len(f.cancelRunCalls) != 1 || f.cancelRunCalls[0].RunID != "old" {
-		t.Errorf("cancel calls = %+v, want exactly [old]", f.cancelRunCalls)
+	// Supersession rides the atomic request as a policy, not as a follow-up
+	// CancelRunJobs delegation: no log-and-ignore cancellation call exists.
+	if len(f.compiledCalls) != 1 {
+		t.Fatalf("InsertCompiledRun calls = %d, want 1", len(f.compiledCalls))
+	}
+	req := f.compiledCalls[0]
+	if req.Supersede == nil || req.Supersede.Repo != "repo" || req.Supersede.ConcurrencyGroup != "grp" {
+		t.Fatalf("supersede policy = %+v, want repo/grp", req.Supersede)
+	}
+	if len(req.CancelPrevious) != 0 {
+		t.Fatalf("precomputed cancel list = %v, want empty (resolved in-transaction)", req.CancelPrevious)
+	}
+	if len(f.cancelRunCalls) != 0 {
+		t.Errorf("CancelRunJobs calls = %+v, want none (supersession is in the enqueue transaction)", f.cancelRunCalls)
 	}
 	if j, _ := f.job("oldjob"); j.Status != model.StatusCancelled {
 		t.Errorf("superseded job status = %q, want cancelled", j.Status)
 	}
+	if old, _ := f.GetRun(context.Background(), "old"); old.Status != model.StatusCancelled {
+		t.Errorf("superseded run status = %q, want cancelled", old.Status)
+	}
 	if j, _ := f.job("otherjob"); j.Status != model.StatusQueued {
 		t.Errorf("unrelated job status = %q, want queued", j.Status)
+	}
+}
+
+// TestEnqueueFaultDuringSupersessionLeavesOldRun injects a storage failure
+// while the supersede cancellations are being staged: the whole enqueue must
+// fail, the new run must not exist, and the old run and its jobs must be
+// byte-for-byte unchanged.
+func TestEnqueueFaultDuringSupersessionLeavesOldRun(t *testing.T) {
+	f := newFakeStore()
+	now := time.Now().UTC()
+	f.putRun(model.Run{ID: "old", Repo: "repo", ConcurrencyGroup: "grp", Status: model.StatusRunning, CreatedAt: now})
+	f.putJob(model.Job{ID: "oldjob1", RunID: "old", Status: model.StatusQueued})
+	f.putJob(model.Job{ID: "oldjob2", RunID: "old", Status: model.StatusRunning})
+	f.compiledFailAfterOps = 1
+	f.compiledFailErr = errCompiledBoom
+	run := model.Run{ID: "new", Repo: "repo", ConcurrencyGroup: "grp", Status: model.StatusQueued, CreatedAt: now}
+	s := NewDB(f, time.Minute, nil, nil)
+	err := s.Enqueue(context.Background(), run, map[string]model.Job{"newjob": {ID: "newjob", RunID: "new", Status: model.StatusQueued}}, nil, true)
+	if !errors.Is(err, errCompiledBoom) {
+		t.Fatalf("Enqueue with injected supersession fault = %v, want injected error", err)
+	}
+	if _, err := f.GetRun(context.Background(), "new"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("failed enqueue leaked the new run: %v", err)
+	}
+	if _, ok := f.job("newjob"); ok {
+		t.Fatal("failed enqueue leaked the new job")
+	}
+	for _, id := range []string{"oldjob1", "oldjob2"} {
+		j, ok := f.job(id)
+		if !ok {
+			t.Fatalf("old job %s vanished", id)
+		}
+		if j.Status.Terminal() || j.LeaseRunnerID != "" {
+			t.Fatalf("old job %s mutated by the failed supersession: %+v", id, j)
+		}
+	}
+	old, _ := f.GetRun(context.Background(), "old")
+	if old.Status != model.StatusRunning {
+		t.Fatalf("old run mutated by the failed supersession: %+v", old)
+	}
+	if audits := f.audits(); len(audits) != 0 {
+		t.Fatalf("failed supersession wrote audit rows: %+v", audits)
+	}
+}
+
+// TestEnqueueConcurrentSupersedeExactlyOneWinner races superseding enqueues
+// in one concurrency group through the atomic store: every enqueue either
+// commits completely (its run plus all jobs) or leaves nothing, and exactly
+// one run remains non-terminal at the end.
+func TestEnqueueConcurrentSupersedeExactlyOneWinner(t *testing.T) {
+	f := newFakeStore()
+	now := time.Now().UTC()
+	f.putRun(model.Run{ID: "old", Repo: "repo", ConcurrencyGroup: "grp", Status: model.StatusRunning, CreatedAt: now})
+	f.putJob(model.Job{ID: "oldjob", RunID: "old", Status: model.StatusQueued})
+	s := NewDB(f, time.Minute, nil, nil)
+	const enqueues = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, enqueues)
+	for i := 0; i < enqueues; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			runID := fmt.Sprintf("new%02d", n)
+			jobID := fmt.Sprintf("job%02d", n)
+			run := model.Run{ID: runID, Repo: "repo", ConcurrencyGroup: "grp", Status: model.StatusQueued, CreatedAt: now}
+			errs <- s.Enqueue(context.Background(), run, map[string]model.Job{jobID: {ID: jobID, RunID: runID, Status: model.StatusQueued}}, nil, true)
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent superseding enqueue: %v", err)
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	active := 0
+	for _, r := range f.runs {
+		if r.Repo != "repo" || r.ConcurrencyGroup != "grp" {
+			continue
+		}
+		if r.ID == "old" {
+			if r.Status != model.StatusCancelled {
+				t.Fatalf("old run status = %s, want cancelled", r.Status)
+			}
+			continue
+		}
+		if !r.Status.Terminal() {
+			active++
+		}
+		// Every committed run carries exactly its own job, terminal or not:
+		// no run is ever published with missing jobs.
+		jobs := 0
+		for _, j := range f.jobs {
+			if j.RunID == r.ID {
+				jobs++
+			}
+		}
+		if jobs != 1 {
+			t.Fatalf("run %s has %d jobs, want exactly 1 (no partial state)", r.ID, jobs)
+		}
+	}
+	if active != 1 {
+		t.Fatalf("non-terminal runs in the group = %d, want exactly one winner", active)
+	}
+}
+
+// TestEnqueueRequiresAtomicStore proves the DB scheduler fails closed when
+// its store cannot run the atomic enqueue transaction: no sequential
+// fallback may write partial run/job rows.
+func TestEnqueueRequiresAtomicStore(t *testing.T) {
+	inner := newFakeStore()
+	legacy := struct{ storage.Store }{Store: inner}
+	s := NewDB(legacy, time.Minute, nil, nil)
+	now := time.Now().UTC()
+	run := model.Run{ID: "run", Status: model.StatusQueued, CreatedAt: now}
+	err := s.Enqueue(context.Background(), run, map[string]model.Job{"job": {ID: "job", RunID: "run", Status: model.StatusQueued}}, nil, false)
+	if err == nil {
+		t.Fatal("Enqueue against a non-atomic store succeeded")
+	}
+	if len(inner.insertRunCalls) != 0 || len(inner.insertJobCalls) != 0 {
+		t.Fatalf("non-atomic store received sequential writes: %d runs, %d jobs", len(inner.insertRunCalls), len(inner.insertJobCalls))
+	}
+	if _, ok := inner.job("job"); ok {
+		t.Fatal("non-atomic store persisted a partial job")
 	}
 }
 

@@ -519,8 +519,10 @@ type WebhookClaim struct {
 // QuotaReservation carries the quota admission decision into the enqueue
 // transaction: the RepoKey/TeamKey counters are locked FOR UPDATE and
 // incremented by JobCount after the limits are re-checked against the
-// locked values, closing the check-then-reserve race. Zero/negative limits
-// are unlimited.
+// locked values, closing the check-then-reserve race. RepoKey is the run's
+// canonical RepoID and TeamKey its host/owner team key (see QuotaKeys), so
+// same-named repositories on different forges never share a counter.
+// Zero/negative limits are unlimited.
 type QuotaReservation struct {
 	RepoKey  string `json:"repo_key"`
 	TeamKey  string `json:"team_key"`
@@ -555,26 +557,63 @@ type DownstreamLaunchClaim struct {
 	StableChildID string `json:"stable_child_id"`
 }
 
+// SupersedePolicy folds concurrency-group cancel-in-progress supersession
+// into the enqueue transaction: every other non-terminal run of the same
+// repository and concurrency group is cancelled — jobs terminal-cancelled
+// with leases cleared, runner slots and quota released, dependents
+// re-evaluated — in the SAME commit as the new run, or the whole enqueue
+// rolls back. Stores resolve the conflicting runs INSIDE the transaction
+// (SQL: under a per-(repo, group) advisory lock) so concurrent superseding
+// enqueues of one group serialize and exactly one run survives
+// non-terminal; the loser's cancellation commits together with the winner.
+type SupersedePolicy struct {
+	Repo             string `json:"repo"`
+	ConcurrencyGroup string `json:"concurrency_group"`
+}
+
 // InsertCompiledRunRequest is the full atomic-enqueue payload: one run, its
 // compiled jobs, dependency edges, artifact contracts, superseded job IDs,
-// and the optional webhook-dedupe, quota-reservation, schedule-occurrence
-// and downstream-launch claims. Everything commits in a single transaction
-// or nothing does.
+// an optional concurrency-group supersede policy, and the optional
+// webhook-dedupe, quota-reservation, schedule-occurrence and
+// downstream-launch claims. Everything commits in a single transaction or
+// nothing does.
+//
+// The run's and jobs' canonical RepoID rides the run/job payload (jsonb), so
+// no dedicated column is required; RepoIDForJob/RepoIDForRun recover the
+// identity for records persisted before the field existed.
+//
+// Deps is the authoritative dependency-edge map for the enqueued jobs: when
+// it carries an entry for a job ID that entry (including an explicitly empty
+// list) replaces the job's Needs, so the persisted edges always match what
+// the caller compiled. Jobs without a Deps entry keep their Needs.
 type InsertCompiledRunRequest struct {
 	Run              model.Run
 	Jobs             map[string]model.Job
 	Deps             map[string][]string
 	Contracts        map[string]map[string]ArtifactContract
 	CancelPrevious   []string
+	Supersede        *SupersedePolicy
 	WebhookClaim     *WebhookClaim
 	Quota            *QuotaReservation
 	ScheduleClaim    *ScheduleClaim
 	DownstreamLaunch *DownstreamLaunchClaim
 }
 
+// effectiveNeeds resolves the dependency edges persisted for one enqueued
+// job: the request's Deps entry is authoritative when present, otherwise the
+// job's own Needs list is used. The result is always a fresh slice.
+func effectiveNeeds(id string, j model.Job, deps map[string][]string) []string {
+	needs, ok := deps[id]
+	if !ok {
+		return j.Needs
+	}
+	return append([]string(nil), needs...)
+}
+
 // RunEnqueueStore is the atomic enqueue contract: InsertCompiledRun persists
 // the run, its jobs, dependencies and artifact contracts, cancels superseded
-// jobs, and claims the delivery/quota/schedule reservations in ONE
+// jobs (explicit CancelPrevious IDs and/or the in-transaction Supersede
+// policy), and claims the delivery/quota/schedule reservations in ONE
 // transaction. On a webhook-dedupe conflict it returns ErrDeliveryDuplicate
 // (the caller re-reads the original run via FindDelivery); on a quota limit
 // it returns *QuotaExceededError; on a schedule-occurrence conflict it
@@ -597,6 +636,10 @@ type RunEnqueueStore interface {
 //     checked against the LIVE profile rows (cert_profile_links ->
 //     runner_profiles) when the runner is linked; an unlinked runner keeps
 //     the legacy behavior (predicates evaluated by the caller's snapshot).
+//     CanonRepoID is the job's immutable canonical RepoID
+//     ("<host>/<owner>/<name>"), so a profile grant for github.com/acme/api
+//     never authorizes gitlab.company.com/acme/api; RepoFullName is only the
+//     explicit bare alias.
 //   - Environment/EnvironmentConcurrency reserve an environment slot inside
 //     the transaction under a per-key advisory lock, so two concurrent
 //     claims can never both take the last slot.
@@ -627,12 +670,14 @@ type LeaseClaim struct {
 
 // EnvKey names the environment concurrency key: the repository URL plus the
 // environment name. An environment name is not a global lock across
-// repositories.
+// repositories. The key is logical only and contains no NUL byte; SQL
+// advisory locks are derived from it with advisoryLockKey, so no scalar
+// containing raw separators is ever bound as a SQL text parameter.
 func (c LeaseClaim) EnvKey() string {
 	if c.RepoURL == "" || c.Environment == "" {
 		return ""
 	}
-	return c.RepoURL + "\x00" + c.Environment
+	return c.RepoURL + "\x1f" + c.Environment
 }
 
 // AtomicLeaseStore acquires a job lease and reserves the runner capacity
@@ -663,38 +708,60 @@ type QuotaCounterStore interface {
 	QuotaCounts(ctx context.Context, repoKey, teamKey string) (running, queued int, err error)
 }
 
-// QuotaKeys derives the reservation counter keys for one repository URL: the
-// repository key is the URL itself and the team key is the forge host plus
-// the first path segment, mirroring the server's team derivation. The result
-// is deduplicated when both keys coincide and empty for an empty URL. Every
-// counter mutation (enqueue reservation, lease transition, completion,
-// cancellation, queue-timeout expiry) must use this SAME derivation or the
-// counters drift.
-func QuotaKeys(repoURL string) []string {
-	repo := strings.TrimSpace(repoURL)
+// QuotaKeys derives the reservation counter keys for one canonical
+// repository identity ("<host>/<owner>/<name>"; a legacy repo URL still
+// derives the same pair): the repository key is the identity itself and the
+// team key is the forge host plus the first path segment (the owner), so
+// teams never collide across forges and gitlab.company.com/acme/backend and
+// github.com/acme/backend never share a counter. The result is deduplicated
+// when both keys coincide and empty for an empty identity. Every counter
+// mutation (enqueue reservation, lease transition, completion, cancellation,
+// queue-timeout expiry) must use this SAME derivation — feeding it the
+// canonical RepoID — or the counters drift.
+func QuotaKeys(repoID string) []string {
+	repo := strings.TrimSpace(repoID)
 	if repo == "" {
 		return nil
 	}
-	team := repo
-	if u, err := url.Parse(repo); err == nil && u.Host != "" {
-		parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-		if len(parts) > 0 && parts[0] != "" {
-			team = u.Host + "/" + parts[0]
-		} else {
-			team = u.Host
-		}
-	}
+	team := repoTeamKey(repo)
 	if team == repo {
 		return []string{repo}
 	}
 	return []string{repo, team}
 }
 
-// RepoTeamKey returns the team counter key for a repository URL ("" when the
-// URL does not derive a distinct team key). It is the second element of
-// QuotaKeys, for callers that adjust a single repository/team pair.
-func RepoTeamKey(repoURL string) string {
-	keys := QuotaKeys(repoURL)
+// repoTeamKey derives the team counter key of a canonical repository
+// identity: the forge host plus the owner segment. Legacy URL inputs derive
+// the same pair (host + first path segment) so pre-canonical counters stay
+// addressable.
+func repoTeamKey(repo string) string {
+	if u, err := url.Parse(repo); err == nil && u.Host != "" {
+		parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+		if len(parts) > 0 && parts[0] != "" {
+			return u.Host + "/" + parts[0]
+		}
+		return u.Host
+	}
+	// Canonical "host/owner/name": the first two slash-separated segments.
+	// A bare "owner/name" (no forge host) has no distinct team key; a first
+	// segment containing a dot with a nested remainder also qualifies as a
+	// canonical host.
+	parts := strings.Split(repo, "/")
+	if len(parts) >= 3 && parts[0] != "" && parts[1] != "" {
+		return parts[0] + "/" + parts[1]
+	}
+	if len(parts) == 2 && strings.Contains(parts[0], ".") {
+		return parts[0] + "/" + parts[1]
+	}
+	return repo
+}
+
+// RepoTeamKey returns the team counter key for a canonical repository
+// identity ("" when the identity does not derive a distinct team key). It is
+// the second element of QuotaKeys, for callers that adjust a single
+// repository/team pair.
+func RepoTeamKey(repoID string) string {
+	keys := QuotaKeys(repoID)
 	if len(keys) > 1 {
 		return keys[1]
 	}
@@ -725,11 +792,75 @@ type CacheManifestStore interface {
 	GetCacheManifest(ctx context.Context, repo, trustDomain, logicalKey string) (CacheManifestRecord, bool, error)
 }
 
-// ArtifactSidecarStore updates one artifact record's sidecar references
-// (SBOM/sigstore digests) after the record was created. Only non-empty
-// values are written.
+// ArtifactSidecarStore is the durable artifact-sidecar contract:
+// SetArtifactSidecars updates one artifact record's sidecar references
+// (SBOM/sigstore digests) after the record was created (only non-empty
+// values are written), and the pending-sidecar methods persist the
+// upload window between a sidecar upload and its artifact payload
+// (migration 0012: artifact_pending_sidecars), keyed by
+// (job_id, artifact_name, kind):
+//
+//   - RememberPendingSidecar upserts the digest (a re-upload of the same
+//     kind replaces the digest).
+//   - PendingSidecar resolves it (ok=false when no row exists).
+//   - ConsumePendingSidecar deletes the row ONLY when the stored digest
+//     still equals the digested record's reference, so a newer re-upload
+//     is never dropped by a stale consumer.
+//   - DeletePendingSidecars clears the job's leftover rows once an
+//     artifact record commits.
+//   - PrunePendingSidecars drops rows older than the cutoff (the
+//     maintenance tick prunes rows past the 7-day retention window).
+//
+// The digests are content-addressed: no method ever deletes a CAS blob,
+// which may be referenced by other records.
 type ArtifactSidecarStore interface {
 	SetArtifactSidecars(ctx context.Context, id, sbomPath, sbomSHA256, sigstorePath, sigstoreSHA256 string) error
+	RememberPendingSidecar(ctx context.Context, jobID, artifactName, kind, digest string) error
+	PendingSidecar(ctx context.Context, jobID, artifactName, kind string) (digest string, ok bool, err error)
+	ConsumePendingSidecar(ctx context.Context, jobID, artifactName, kind, digest string) error
+	DeletePendingSidecars(ctx context.Context, jobID string) error
+	PrunePendingSidecars(ctx context.Context, olderThan time.Time) (int, error)
+}
+
+// ArtifactSidecarKindSBOM and ArtifactSidecarKindSigstore are the canonical
+// pending-sidecar kinds.
+const (
+	ArtifactSidecarKindSBOM     = "sbom"
+	ArtifactSidecarKindSigstore = "sigstore"
+)
+
+// validatePendingSidecarKey checks the artifact_pending_sidecars primary-key
+// components. The artifact name is the cleaned name the server addresses
+// records by; the kind is one of the canonical kinds.
+func validatePendingSidecarKey(jobID, artifactName, kind string) error {
+	if err := ValidateJobID(jobID); err != nil {
+		return err
+	}
+	if strings.TrimSpace(artifactName) == "" {
+		return fmt.Errorf("storage: empty pending sidecar artifact name")
+	}
+	switch kind {
+	case ArtifactSidecarKindSBOM, ArtifactSidecarKindSigstore:
+		return nil
+	default:
+		return fmt.Errorf("storage: invalid pending sidecar kind %q", kind)
+	}
+}
+
+// validatePendingSidecarDigest checks the content-addressed digest stored
+// for a pending sidecar: the canonical 64 lowercase hex sha256.
+func validatePendingSidecarDigest(digest string) error {
+	if len(digest) != 64 {
+		return fmt.Errorf("storage: invalid pending sidecar digest length %d", len(digest))
+	}
+	for i := 0; i < len(digest); i++ {
+		c := digest[i]
+		if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') {
+			continue
+		}
+		return fmt.Errorf("storage: invalid pending sidecar digest character %q at position %d", c, i)
+	}
+	return nil
 }
 
 // SecretClaimStore is the durable once-only secret delivery claim contract

@@ -121,9 +121,11 @@ func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
 
 // uploadSnapshotDB is the DB-mode upload: the archive bytes are stored in
 // CAS and the record is inserted through SnapshotStore in the same flow.
-// Insertion failure fails the upload (503) and removes the orphaned CAS
-// blob; a CAS failure fails the upload (503). The record's Path is the
-// cas:<digest> reference, so any replica resolves the archive by digest.
+// Insertion failure fails the upload (503); the already written CAS blob is
+// left as an orphan for the reference-aware blob GC — never deleted,
+// because a failed metadata persist must not remove a digest another
+// record may reference. The record's Path is the cas:<digest> reference,
+// so any replica resolves the archive by digest.
 func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j model.Job, runnerID string) {
 	ctx := r.Context()
 	tmp, err := os.CreateTemp("", "kiwi-snapshot-*")
@@ -180,17 +182,14 @@ func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j mode
 	}
 	ss, ok := s.DB.(storage.SnapshotStore)
 	if !ok {
-		_ = s.CAS.Delete(ctx, obj.SHA256)
 		http.Error(w, "snapshot record storage unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	if err := ss.InsertSnapshotRecord(ctx, rec); err != nil {
 		// Fail the upload instead of logging: a snapshot whose record is
-		// not durable must not be acknowledged. The orphaned CAS blob is
-		// removed again so retries re-put the same digest.
-		if derr := s.CAS.Delete(ctx, obj.SHA256); derr != nil {
-			s.logError("snapshot: CAS cleanup after record failure", "error", derr.Error())
-		}
+		// not durable must not be acknowledged. The CAS blob is left in
+		// place as an orphan (content-addressed, possibly referenced by
+		// another record); the reference-aware GC reclaims it.
 		http.Error(w, "snapshot record persistence failed", http.StatusServiceUnavailable)
 		return
 	}

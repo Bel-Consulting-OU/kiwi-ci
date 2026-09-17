@@ -26,12 +26,14 @@ type schedulesFileJSON struct {
 }
 
 // scheduleRequest is the PUT /api/v1/schedules body. Repository is the
-// repository full name (owner/name) — the identity, no longer the clone
-// URL; RepoURL is the clone URL; Trusted requests a trusted schedule
-// (requires the repo-scoped trusted_run grant on top of policy_manage).
-// The canonical RepoID and the Forge kind are derived server-side from
-// (RepoURL, Repository) and stored, so automatic firing uses the immutable
-// stored identity — never the request context.
+// human-readable repository name (owner/name); RepoURL is the clone URL the
+// canonical identity and the forge kind are derived from; Trusted requests
+// a trusted schedule (requires the repo-scoped trusted_run grant on top of
+// policy_manage). The canonical RepoID and the Forge kind are derived
+// server-side from (RepoURL, Repository) and REQUIRED on create, so
+// automatic firing uses the immutable stored identity — never the request
+// context. A bare repository name without a forge host is rejected: two
+// forges presenting the same bare name must never share a schedule identity.
 type scheduleRequest struct {
 	ID         string `json:"id,omitempty"`
 	Repository string `json:"repository"`
@@ -42,13 +44,28 @@ type scheduleRequest struct {
 }
 
 // scheduleRepoID resolves the stored canonical repository identity of a
-// schedule: the RepoID field when present, otherwise the legacy Repository
-// value (old rows stored the clone URL as both identity and clone URL).
+// schedule: the RepoID field when present (authoritative), otherwise derived
+// from the stored identity fields at load. Legacy rows stored the clone URL
+// as both identity and clone URL, so a URL-shaped Repository is first
+// reduced to its forge-native owner/name before canonicalization.
 func scheduleRepoID(sc storage.Schedule) string {
-	if sc.RepoID != "" {
-		return sc.RepoID
+	if id := strings.TrimSpace(sc.RepoID); id != "" {
+		return id
 	}
-	return sc.Repository
+	fullName := strings.TrimSpace(sc.Repository)
+	repoURL := strings.TrimSpace(scheduleRepoURL(sc))
+	if fullName == repoURL {
+		// Legacy row: repository carried its own identity, possibly the
+		// clone URL itself.
+		fullName = repoFullNameFromCloneURL(fullName)
+	}
+	return auth.CanonicalRepoID(repoHost(repoURL), fullName)
+}
+
+// scheduleRepoFullName resolves the human-readable repository name of a
+// schedule (display only; legacy rows may still carry the clone URL).
+func scheduleRepoFullName(sc storage.Schedule) string {
+	return strings.TrimSpace(sc.Repository)
 }
 
 // scheduleRepoURL resolves the stored clone URL of a schedule: the RepoURL
@@ -234,19 +251,29 @@ func (s *Server) upsertSchedule(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid schedule spec: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	// Identity derivation: Repository is the full name (identity), RepoURL
+	// Identity derivation: Repository is the human-readable name, RepoURL
 	// the clone URL. The canonical RepoID and the Forge kind are derived
 	// once and stored, so automatic firing uses the immutable stored
-	// identity. Legacy rows (created before repo_url existed) stored the
-	// clone URL in repository: a URL-shaped repository keeps working as its
-	// own identity and clone URL.
+	// identity. A URL-shaped Repository (the legacy form that stored the
+	// clone URL as identity) is reduced to its forge-native owner/name; the
+	// canonical identity is REQUIRED: a repository without a forge host
+	// cannot be scheduled, because a bare name is shared across forges.
 	repoURL := strings.TrimSpace(in.RepoURL)
 	if repoURL == "" {
 		repoURL = in.Repository
 	}
 	repoID := auth.CanonicalRepoID(repoHost(repoURL), in.Repository)
 	if u, err := url.Parse(in.Repository); err == nil && u.Host != "" {
-		repoID = in.Repository
+		fullName := repoFullNameFromCloneURL(in.Repository)
+		if fullName == "" {
+			http.Error(w, "repository URL names no repository path", http.StatusBadRequest)
+			return
+		}
+		repoID = auth.CanonicalRepoID(repoHost(in.Repository), fullName)
+	}
+	if strings.Count(repoID, "/") < 2 {
+		http.Error(w, "repo_url is required to derive the canonical repository identity (host/owner/name)", http.StatusBadRequest)
+		return
 	}
 	if in.Trusted {
 		// A TRUSTED schedule fires with trusted capabilities: creating or
@@ -565,8 +592,9 @@ func (s *Server) fireSchedule(ctx context.Context, sc storage.Schedule, nominal 
 		return model.Run{}, false, err
 	}
 	in := SubmitRun{
+		RepoID:       scheduleRepoID(sc),
 		RepoURL:      scheduleRepoURL(sc),
-		RepoFullName: scheduleRepoID(sc),
+		RepoFullName: scheduleRepoFullName(sc),
 		Ref:          ref,
 		Event:        "schedule",
 		Pipeline:     sanitizeScheduleSpec(sc.Spec),
