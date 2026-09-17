@@ -260,9 +260,16 @@ func TestFlowSchedulesFirePersistFailures(t *testing.T) {
 		t.Fatalf("fire with persist failure = fired=%v err=%v", fired, err)
 	}
 
-	// A spec that parses nowhere is rejected by a direct fire.
+	// A spec that parses nowhere is rejected by a direct fire. The durable
+	// row is authoritative now, so the bad spec must be persisted before the
+	// fire (the leader re-reads it immediately before evaluating).
 	bad := sc
 	bad.Spec = "jobs: [oops"
+	if ss, ok := s.scheduleStoreDB(); ok {
+		if err := ss.UpsertSchedule(context.Background(), bad); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if _, _, err := s.fireSchedule(context.Background(), bad, time.Now().UTC()); err == nil {
 		t.Fatal("bad spec fire must fail")
 	}
