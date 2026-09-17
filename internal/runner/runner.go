@@ -58,6 +58,24 @@ var ErrRunnerDisabledOrRevoked = errors.New("runner disabled or certificate revo
 // overridden at build time via -ldflags.
 var RunnerVersion = "dev"
 
+// Seams over the standard library used by the runner. Production behavior is
+// unchanged; they let checked failure branches be exercised deterministically:
+// closeRunnerTempFile covers os.File.Close failures (matching the
+// internal/cache closeCacheFile seam), randReader covers identifier-generation
+// failures (matching the internal/provenance randReader seam), and
+// enrollTLSConfig covers the enrollment TLS configuration so a hermetic test
+// can reach the server-CA fallback without a system-trusted listener
+// certificate.
+var (
+	closeRunnerTempFile           = (*os.File).Close
+	randReader          io.Reader = rand.Reader
+	enrollTLSConfig               = runnerpki.TLSClientConfig
+	// reportf writes runner maintenance reports. It is a seam so tests can
+	// observe a report from the detached GC goroutine without racing the
+	// process-wide stdout.
+	reportf = fmt.Printf
+)
+
 type Config struct {
 	Server, Token, Name string
 	Labels              []string
@@ -276,7 +294,7 @@ func (r *Runner) Run(ctx context.Context) error {
 				go func() {
 					rep := executor.GC(ctx, r.Cfg.WorkDir, gcOlderThan)
 					if rep.Containers > 0 || rep.Networks > 0 || rep.VMs > 0 {
-						fmt.Printf("kiwi runner %s: gc removed %d containers, %d networks, %d VMs\n", r.ID, rep.Containers, rep.Networks, rep.VMs)
+						reportf("kiwi runner %s: gc removed %d containers, %d networks, %d VMs\n", r.ID, rep.Containers, rep.Networks, rep.VMs)
 					}
 				}()
 			}
@@ -1019,7 +1037,7 @@ func (r *Runner) restoreDownloads(ctx context.Context, t server.Task, inputs []p
 		h := sha256.New()
 		_, cp := io.Copy(io.MultiWriter(tmp, h), resp.Body)
 		resp.Body.Close()
-		cl := tmp.Close()
+		cl := closeRunnerTempFile(tmp)
 		if cp != nil {
 			os.Remove(tmpPath)
 			return cp
@@ -1330,7 +1348,7 @@ func (r *Runner) enroll(ctx context.Context, caPEM, csrPEM []byte) (*server.Enro
 	if r.Cfg.EnrollToken == "" {
 		return nil, fmt.Errorf("runner enrollment token is empty")
 	}
-	tlsConf, err := runnerpki.TLSClientConfig(nil, nil, caPEM, r.serverName())
+	tlsConf, err := enrollTLSConfig(nil, nil, caPEM, r.serverName())
 	if err != nil {
 		return nil, err
 	}
@@ -1384,7 +1402,7 @@ func loadPEM(v string) ([]byte, error) {
 // runner generates its own stable-per-process identity for enrollment.
 func newRunnerID() (string, error) {
 	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
+	if _, err := io.ReadFull(randReader, b); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil

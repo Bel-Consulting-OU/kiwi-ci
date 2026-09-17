@@ -15,6 +15,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 )
 
@@ -39,9 +40,21 @@ type EncryptedDelivery struct {
 	LeaseGeneration int64
 }
 
+// randReader and generateX25519Key are test-only seams over crypto/rand
+// and ephemeral key generation. Production behavior is unchanged; they let
+// entropy failures in nonce and ephemeral-key generation be exercised.
+var (
+	randReader        io.Reader = rand.Reader
+	generateX25519Key           = func() (*ecdh.PrivateKey, error) { return ecdh.X25519().GenerateKey(rand.Reader) }
+)
+
 // ErrAlreadyDelivered is returned by OneTime after a secret has already been
 // delivered once for a given scope.
 var ErrAlreadyDelivered = errors.New("secretbroker: secret already delivered")
+
+// ErrNilInner is returned by OneTime.Resolve when the wrapper has no Inner
+// broker, so a misconfigured wrapper fails closed instead of panicking.
+var ErrNilInner = errors.New("secretbroker: broker not configured")
 
 // OneTime wraps a Broker and guarantees each (name, repository, environment)
 // combination is delivered at most once. A failed resolution does not consume
@@ -55,6 +68,9 @@ type OneTime struct {
 }
 
 func (o *OneTime) Resolve(ctx context.Context, name string, scope SecretScope) (string, error) {
+	if o.Inner == nil {
+		return "", fmt.Errorf("%w: OneTime wrapper has no Inner broker", ErrNilInner)
+	}
 	key := name + "\x00" + scope.Repository + "\x00" + scope.Environment
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -84,7 +100,7 @@ func SealEnvelope(plain []byte, peerPub [32]byte, aad []byte) (EncryptedDelivery
 	if err != nil {
 		return EncryptedDelivery{}, fmt.Errorf("seal: peer public key: %w", err)
 	}
-	eph, err := ecdh.X25519().GenerateKey(rand.Reader)
+	eph, err := generateX25519Key()
 	if err != nil {
 		return EncryptedDelivery{}, fmt.Errorf("seal: ephemeral key: %w", err)
 	}
@@ -102,7 +118,7 @@ func SealEnvelope(plain []byte, peerPub [32]byte, aad []byte) (EncryptedDelivery
 		return EncryptedDelivery{}, err
 	}
 	nonce := make([]byte, aead.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
+	if _, err := io.ReadFull(randReader, nonce); err != nil {
 		return EncryptedDelivery{}, fmt.Errorf("seal: nonce: %w", err)
 	}
 	return EncryptedDelivery{

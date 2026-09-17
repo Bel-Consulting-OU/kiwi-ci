@@ -25,7 +25,7 @@ func (r *Runner) uploadJobSnapshot(ctx context.Context, t server.Task, workspace
 		tmp.Close()
 		return fmt.Errorf("snapshot create: %w", err)
 	}
-	if err := tmp.Close(); err != nil {
+	if err := closeRunnerTempFile(tmp); err != nil {
 		return fmt.Errorf("snapshot close: %w", err)
 	}
 	f, err := os.Open(tmpPath)

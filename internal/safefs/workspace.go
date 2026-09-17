@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"path/filepath"
 	"strings"
 )
 
@@ -34,7 +33,7 @@ func OpenWorkspaceRoot(path string) (*WorkspaceRoot, error) {
 	if err != nil {
 		return nil, err
 	}
-	canonical, err := filepath.EvalSymlinks(path)
+	canonical, err := evalSymlinks(path)
 	if err != nil {
 		f.Close()
 		return nil, err

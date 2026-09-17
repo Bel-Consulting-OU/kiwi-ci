@@ -194,7 +194,7 @@ func VerifyArchive(archivePath string, m ArtifactManifest) error {
 			return fmt.Errorf("artifact: entry %q mode %o does not match manifest mode %o", clean, hdr.Mode, e.Mode)
 		}
 		digest := sha256.New()
-		got, err := io.Copy(digest, tr)
+		got, err := copyDigest(digest, tr)
 		if err != nil {
 			return fmt.Errorf("artifact: verify entry %q: %w", clean, err)
 		}

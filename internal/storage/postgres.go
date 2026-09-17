@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,6 +37,16 @@ type PostgresStore struct {
 }
 
 var _ Store = (*PostgresStore)(nil)
+
+// randReader and jsonMarshal are test-only seams over crypto/rand and
+// encoding/json. Production always uses the standard library defaults below
+// (the var values are never reassigned outside tests); tests override them to
+// exercise the fail-closed error branches, which cannot be reached when the
+// real randomness source and the real encoder always succeed.
+var (
+	randReader  io.Reader = rand.Reader
+	jsonMarshal           = json.Marshal
+)
 
 var (
 	_ OutboxStore           = (*PostgresStore)(nil)
@@ -384,7 +395,7 @@ func (s *PostgresStore) InsertCompiledRun(ctx context.Context, req InsertCompile
 		if err := ValidateJobID(id); err != nil {
 			return err
 		}
-		cp, err := json.Marshal(contracts)
+		cp, err := jsonMarshal(contracts)
 		if err != nil {
 			return err
 		}
@@ -497,7 +508,7 @@ func (s *PostgresStore) supersededJobIDsTx(ctx context.Context, tx pgx.Tx, p *Su
 
 // insertRunTx inserts the run row inside an open transaction.
 func (s *PostgresStore) insertRunTx(ctx context.Context, tx pgx.Tx, run model.Run) error {
-	payload, err := json.Marshal(run)
+	payload, err := jsonMarshal(run)
 	if err != nil {
 		return err
 	}
@@ -559,7 +570,7 @@ func (s *PostgresStore) cancelSupersededTx(ctx context.Context, tx pgx.Tx, jobID
 		j.LeaseRunnerID = ""
 		j.LeaseTokenHash = nil
 		j.LeaseExpiresAt = nil
-		jp, err := json.Marshal(j)
+		jp, err := jsonMarshal(j)
 		if err != nil {
 			return err
 		}
@@ -642,7 +653,7 @@ func (s *PostgresStore) cancelSupersededRunTx(ctx context.Context, tx pgx.Tx, ru
 	}
 	run.Status = model.StatusCancelled
 	run.FinishedAt = &now
-	rp, err := json.Marshal(run)
+	rp, err := jsonMarshal(run)
 	if err != nil {
 		return err
 	}
@@ -745,7 +756,7 @@ func (s *PostgresStore) InsertRun(ctx context.Context, run model.Run) error {
 	if err := ValidateRunID(run.ID); err != nil {
 		return err
 	}
-	payload, err := json.Marshal(run)
+	payload, err := jsonMarshal(run)
 	if err != nil {
 		return err
 	}
@@ -794,7 +805,7 @@ func (s *PostgresStore) UpdateRunStatus(ctx context.Context, id string, status m
 	if finishedAt != nil {
 		run.FinishedAt = finishedAt
 	}
-	rp, err := json.Marshal(run)
+	rp, err := jsonMarshal(run)
 	if err != nil {
 		return err
 	}
@@ -843,13 +854,13 @@ func (s *PostgresStore) ListRuns(ctx context.Context, limit int) ([]model.Run, e
 // jobWriteArgs marshals a job into the real-column + payload argument list
 // used by both INSERT and the upsert path of UpdateJob.
 func jobWriteArgs(j model.Job) ([]any, error) {
-	payload, err := json.Marshal(j)
+	payload, err := jsonMarshal(j)
 	if err != nil {
 		return nil, err
 	}
 	var outputsJSON []byte
 	if len(j.Outputs) > 0 {
-		if outputsJSON, err = json.Marshal(j.Outputs); err != nil {
+		if outputsJSON, err = jsonMarshal(j.Outputs); err != nil {
 			return nil, err
 		}
 	}
@@ -1331,16 +1342,16 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 			Repositories: append([]string{}, profile.Repositories...),
 			Capabilities: append([]string{}, profile.Capabilities...),
 		}
-		profileJSON, err = json.Marshal(view)
+		profileJSON, err = jsonMarshal(view)
 		if err != nil {
 			return model.Job{}, err
 		}
 	}
-	labelsJSON, err := json.Marshal(append([]string{}, claim.RequiredLabels...))
+	labelsJSON, err := jsonMarshal(append([]string{}, claim.RequiredLabels...))
 	if err != nil {
 		return model.Job{}, err
 	}
-	regionsJSON, err := json.Marshal(append([]string{}, claim.PlacementRegions...))
+	regionsJSON, err := jsonMarshal(append([]string{}, claim.PlacementRegions...))
 	if err != nil {
 		return model.Job{}, err
 	}
@@ -1472,11 +1483,11 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 	j.LeaseRunnerID = ""
 	j.LeaseTokenHash = nil
 	j.LeaseExpiresAt = nil
-	newPayload, err := json.Marshal(j)
+	newPayload, err := jsonMarshal(j)
 	if err != nil {
 		return err
 	}
-	outputsJSON, err := json.Marshal(outputs)
+	outputsJSON, err := jsonMarshal(outputs)
 	if err != nil {
 		return err
 	}
@@ -1526,7 +1537,7 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 // CompletionEffectID values so the completing server can queue and ack the
 // very rows this transaction created.
 func (s *PostgresStore) insertCompletionEffectsTx(ctx context.Context, tx pgx.Tx, jobID, runID string, generation int64, now time.Time) error {
-	payload, err := json.Marshal(CompletionEffectsPayload{JobID: jobID, RunID: runID})
+	payload, err := jsonMarshal(CompletionEffectsPayload{JobID: jobID, RunID: runID})
 	if err != nil {
 		return err
 	}
@@ -1612,11 +1623,11 @@ func (s *PostgresStore) completeRunnerTx(ctx context.Context, tx pgx.Tx, runnerI
 	r.Completed = completed
 	r.Failed = failed
 	r.LastSeen = now
-	rp, err := json.Marshal(r)
+	rp, err := jsonMarshal(r)
 	if err != nil {
 		return err
 	}
-	aj, err := json.Marshal(active)
+	aj, err := jsonMarshal(active)
 	if err != nil {
 		return err
 	}
@@ -1703,7 +1714,7 @@ func (s *PostgresStore) recomputeDependentTx(ctx context.Context, tx pgx.Tx, dep
 		d.Error = "dependency failed"
 		d.FinishedAt = &fin
 	}
-	dp, err := json.Marshal(d)
+	dp, err := jsonMarshal(d)
 	if err != nil {
 		return err
 	}
@@ -1768,7 +1779,7 @@ func (s *PostgresStore) recomputeRunTx(ctx context.Context, tx pgx.Tx, runID str
 	if !recomputeRunStatus(&run, states) {
 		return nil
 	}
-	rp, err := json.Marshal(run)
+	rp, err := jsonMarshal(run)
 	if err != nil {
 		return err
 	}
@@ -1944,7 +1955,7 @@ func (s *PostgresStore) CancelRunJobs(ctx context.Context, runID string, reason 
 		j.LeaseRunnerID = ""
 		j.LeaseTokenHash = nil
 		j.LeaseExpiresAt = nil
-		jp, err := json.Marshal(j)
+		jp, err := jsonMarshal(j)
 		if err != nil {
 			return nil, err
 		}
@@ -1985,7 +1996,7 @@ func (s *PostgresStore) CancelRunJobs(ctx context.Context, runID string, reason 
 		if !run.Status.Terminal() {
 			run.Status = model.StatusCancelled
 			run.FinishedAt = &now
-			rp, err := json.Marshal(run)
+			rp, err := jsonMarshal(run)
 			if err != nil {
 				return nil, err
 			}
@@ -2007,11 +2018,11 @@ func (s *PostgresStore) UpsertRunner(ctx context.Context, runner model.Runner) e
 	if err := ValidateRunnerID(runner.ID); err != nil {
 		return err
 	}
-	payload, err := json.Marshal(runner)
+	payload, err := jsonMarshal(runner)
 	if err != nil {
 		return err
 	}
-	activeJSON, err := json.Marshal(runner.ActiveJobs)
+	activeJSON, err := jsonMarshal(runner.ActiveJobs)
 	if err != nil {
 		return err
 	}
@@ -2129,11 +2140,11 @@ func (s *PostgresStore) ReleaseRunnerJob(ctx context.Context, runnerID, jobID st
 	r.Completed = completed
 	r.Failed = failed
 	r.LastSeen = time.Now().UTC()
-	rp, err := json.Marshal(r)
+	rp, err := jsonMarshal(r)
 	if err != nil {
 		return err
 	}
-	aj, err := json.Marshal(active)
+	aj, err := jsonMarshal(active)
 	if err != nil {
 		return err
 	}
@@ -2244,7 +2255,7 @@ func (s *PostgresStore) InsertArtifact(ctx context.Context, a model.ArtifactReco
 	if err := ValidateRunID(a.RunID); err != nil {
 		return err
 	}
-	payload, err := json.Marshal(a)
+	payload, err := jsonMarshal(a)
 	if err != nil {
 		return err
 	}
@@ -2266,7 +2277,7 @@ func (s *PostgresStore) InsertArtifactOnce(ctx context.Context, a model.Artifact
 	if err := ValidateRunID(a.RunID); err != nil {
 		return model.ArtifactRecord{}, false, err
 	}
-	payload, err := json.Marshal(a)
+	payload, err := jsonMarshal(a)
 	if err != nil {
 		return model.ArtifactRecord{}, false, err
 	}
@@ -2363,7 +2374,7 @@ func (s *PostgresStore) InsertTestReport(ctx context.Context, rep model.TestRepo
 	if err := ValidateRunID(rep.RunID); err != nil {
 		return err
 	}
-	payload, err := json.Marshal(rep)
+	payload, err := jsonMarshal(rep)
 	if err != nil {
 		return err
 	}
@@ -2381,7 +2392,7 @@ func (s *PostgresStore) InsertTestReport(ctx context.Context, rep model.TestRepo
 		if err != nil {
 			return err
 		}
-		cp, err := json.Marshal(c)
+		cp, err := jsonMarshal(c)
 		if err != nil {
 			return err
 		}
@@ -2471,7 +2482,7 @@ func (s *PostgresStore) AppendAudit(ctx context.Context, e model.AuditEvent) err
 	}
 	var meta []byte
 	if len(e.Metadata) > 0 {
-		m, err := json.Marshal(e.Metadata)
+		m, err := jsonMarshal(e.Metadata)
 		if err != nil {
 			return err
 		}
@@ -2749,7 +2760,7 @@ func (s *PostgresStore) InsertDeployment(ctx context.Context, d model.Deployment
 	if err := ValidateRunID(d.RunID); err != nil {
 		return err
 	}
-	payload, err := json.Marshal(d)
+	payload, err := jsonMarshal(d)
 	if err != nil {
 		return err
 	}
@@ -2812,7 +2823,7 @@ func (s *PostgresStore) UpdateDeploymentStatus(ctx context.Context, id string, s
 	if finishedAt != nil {
 		d.FinishedAt = finishedAt
 	}
-	dp, err := json.Marshal(d)
+	dp, err := jsonMarshal(d)
 	if err != nil {
 		return err
 	}
@@ -2833,7 +2844,7 @@ func (s *PostgresStore) InsertSnapshotRecord(ctx context.Context, rec model.Snap
 	if err := ValidateRunID(rec.RunID); err != nil {
 		return err
 	}
-	payload, err := json.Marshal(rec)
+	payload, err := jsonMarshal(rec)
 	if err != nil {
 		return err
 	}
@@ -2879,7 +2890,7 @@ func (s *PostgresStore) InsertJobContracts(ctx context.Context, jobID string, co
 	if err := ValidateJobID(jobID); err != nil {
 		return err
 	}
-	cp, err := json.Marshal(contracts)
+	cp, err := jsonMarshal(contracts)
 	if err != nil {
 		return err
 	}
@@ -3086,7 +3097,7 @@ func (s *PostgresStore) InsertGeneratedFragmentTx(ctx context.Context, req Gener
 		if err := ValidateJobID(id); err != nil {
 			return GeneratedFragmentReceipt{}, false, err
 		}
-		cp, err := json.Marshal(cs)
+		cp, err := jsonMarshal(cs)
 		if err != nil {
 			return GeneratedFragmentReceipt{}, false, err
 		}
@@ -3098,7 +3109,7 @@ func (s *PostgresStore) InsertGeneratedFragmentTx(ctx context.Context, req Gener
 	// Canonical order contract: the caller passes Children in sorted-key
 	// order (the same order its response reported).
 	children := append([]GeneratedFragmentChild(nil), req.Children...)
-	cb, err := json.Marshal(children)
+	cb, err := jsonMarshal(children)
 	if err != nil {
 		return GeneratedFragmentReceipt{}, false, err
 	}
@@ -3329,7 +3340,7 @@ func (s *PostgresStore) PutCacheManifest(ctx context.Context, rec CacheManifestR
 	if rec.CreatedAt.IsZero() {
 		rec.CreatedAt = time.Now().UTC()
 	}
-	payload, err := json.Marshal(rec)
+	payload, err := jsonMarshal(rec)
 	if err != nil {
 		return err
 	}
@@ -3499,7 +3510,7 @@ func (s *PostgresStore) AppendDownstreamRun(ctx context.Context, runID, childRun
 		}
 	}
 	run.DownstreamRuns = append(run.DownstreamRuns, childRunID)
-	rp, err := json.Marshal(run)
+	rp, err := jsonMarshal(run)
 	if err != nil {
 		return err
 	}
@@ -3550,8 +3561,8 @@ func (s *PostgresStore) SaveTestHistory(ctx context.Context, stats []byte) (int6
 		stats = []byte("{}")
 	}
 	var version int64
-	err := s.pool.QueryRow(ctx, `INSERT INTO test_history (id, version, stats) VALUES (1, 1, $2::jsonb) ON CONFLICT (id) DO UPDATE SET version = test_history.version + 1, stats = EXCLUDED.stats, updated_at = now() RETURNING version`,
-		version, string(stats)).Scan(&version)
+	err := s.pool.QueryRow(ctx, `INSERT INTO test_history (id, version, stats) VALUES (1, 1, $1::jsonb) ON CONFLICT (id) DO UPDATE SET version = test_history.version + 1, stats = EXCLUDED.stats, updated_at = now() RETURNING version`,
+		string(stats)).Scan(&version)
 	return version, err
 }
 
@@ -3745,21 +3756,21 @@ func (s *PostgresStore) UpsertProfile(ctx context.Context, p model.RunnerProfile
 	if p.ID == "" {
 		return fmt.Errorf("storage: profile id is required")
 	}
-	labels, err := json.Marshal(p.Labels)
+	labels, err := jsonMarshal(p.Labels)
 	if err != nil {
 		return err
 	}
 	if len(labels) == 0 || string(labels) == "null" {
 		labels = []byte("[]")
 	}
-	repos, err := json.Marshal(p.Repositories)
+	repos, err := jsonMarshal(p.Repositories)
 	if err != nil {
 		return err
 	}
 	if len(repos) == 0 || string(repos) == "null" {
 		repos = []byte("[]")
 	}
-	caps, err := json.Marshal(p.Capabilities)
+	caps, err := jsonMarshal(p.Capabilities)
 	if err != nil {
 		return err
 	}
@@ -3922,7 +3933,7 @@ func (s *PostgresStore) PutEnrollGrant(ctx context.Context, digest string, expir
 	if digest == "" {
 		return fmt.Errorf("storage: enroll grant digest is required")
 	}
-	labels, err := json.Marshal(boundLabels)
+	labels, err := jsonMarshal(boundLabels)
 	if err != nil {
 		return err
 	}
@@ -3996,7 +4007,7 @@ func (s *PostgresStore) ConsumeEnrollGrant(ctx context.Context, digest string, c
 
 func newID() (string, error) {
 	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
+	if _, err := io.ReadFull(randReader, b); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil

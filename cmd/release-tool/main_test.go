@@ -2,6 +2,8 @@ package main
 
 import (
 	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
@@ -10,6 +12,7 @@ import (
 	"encoding/pem"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/provenance"
@@ -224,5 +227,141 @@ func TestLoadSigningKeyRejectsInvalid(t *testing.T) {
 	missing := filepath.Join(dir, "missing.pem")
 	if _, _, err := loadSigningKey(missing); err == nil {
 		t.Fatal("missing key file must error")
+	}
+}
+
+func TestRunCLIExitCodes(t *testing.T) {
+	binary := writeTempBinary(t)
+
+	if code := runCLI([]string{"--no-such-flag"}); code != 2 {
+		t.Fatalf("bad flag exit = %d, want 2", code)
+	}
+	if code := runCLI(nil); code != 2 {
+		t.Fatalf("missing -binary exit = %d, want 2", code)
+	}
+	if code := runCLI([]string{"-binary", binary, "extra"}); code != 2 {
+		t.Fatalf("positional arg exit = %d, want 2", code)
+	}
+	if code := runCLI([]string{"-binary", binary, "-out", t.TempDir()}); code != 0 {
+		t.Fatalf("success exit = %d, want 0", code)
+	}
+	if code := runCLI([]string{"-binary", filepath.Join(t.TempDir(), "missing"), "-out", t.TempDir()}); code != 1 {
+		t.Fatalf("missing binary exit = %d, want 1", code)
+	}
+}
+
+func TestParseFlags(t *testing.T) {
+	in, err := parseFlags([]string{
+		"-binary", "/tmp/kiwi", "-name", "kiwi-darwin", "-version", "9.9.9",
+		"-commit", "cafe", "-repo", "https://example.test/repo", "-ref", "refs/tags/v9.9.9",
+		"-out", "/tmp/out", "-key", "/tmp/key.pem",
+	})
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	want := releaseInput{
+		Binary: "/tmp/kiwi", Name: "kiwi-darwin", Version: "9.9.9", Commit: "cafe",
+		Repo: "https://example.test/repo", Ref: "refs/tags/v9.9.9", OutDir: "/tmp/out", KeyFile: "/tmp/key.pem",
+	}
+	if in != want {
+		t.Fatalf("parseFlags = %+v, want %+v", in, want)
+	}
+
+	in, err = parseFlags([]string{"-binary", "/tmp/kiwi"})
+	if err != nil {
+		t.Fatalf("defaults: %v", err)
+	}
+	if in.Name != "kiwi" || in.OutDir != "." || in.KeyFile != "" {
+		t.Fatalf("defaults = %+v", in)
+	}
+
+	for _, args := range [][]string{
+		{"-no-such-flag"},
+		{"-binary", "/tmp/kiwi", "stray"},
+		{},
+	} {
+		if _, err := parseFlags(args); err == nil {
+			t.Fatalf("parseFlags(%v) = nil error, want failure", args)
+		}
+	}
+}
+
+func TestRunFailureBranches(t *testing.T) {
+	binary := writeTempBinary(t)
+
+	in := testInput(t, filepath.Join(t.TempDir(), "missing-binary"))
+	if err := run(in); err == nil {
+		t.Fatal("run with missing binary must fail")
+	}
+
+	in = testInput(t, binary)
+	in.OutDir = filepath.Join(t.TempDir(), "no-such-dir")
+	if err := run(in); err == nil {
+		t.Fatal("run with missing output directory must fail")
+	}
+
+	in = testInput(t, binary)
+	in.KeyFile = filepath.Join(t.TempDir(), "missing.key")
+	if err := run(in); err == nil {
+		t.Fatal("run with missing signing key must fail")
+	}
+
+	in = testInput(t, binary)
+	outAsFile := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(outAsFile, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	in.OutDir = outAsFile
+	if err := run(in); err == nil {
+		t.Fatal("run with a file as output directory must fail")
+	}
+}
+
+func TestRunProvenanceWriteFailure(t *testing.T) {
+	binary := writeTempBinary(t)
+	keyPath, _, _ := writeTempKey(t)
+	in := testInput(t, binary)
+	in.KeyFile = keyPath
+	base := filepath.Base(in.Binary)
+	if err := os.MkdirAll(filepath.Join(in.OutDir, base+".provenance.json"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := run(in)
+	if err == nil {
+		t.Fatal("run must fail when the provenance path is a directory")
+	}
+	if !strings.Contains(err.Error(), "provenance.json") {
+		t.Fatalf("error = %v, want provenance path failure", err)
+	}
+	if _, serr := os.Stat(filepath.Join(in.OutDir, base+".sbom.cdx.json")); serr != nil {
+		t.Fatalf("sbom should have been written before the provenance failure: %v", serr)
+	}
+}
+
+func TestLoadSigningKeyRejectsMalformedPKCS8(t *testing.T) {
+	dir := t.TempDir()
+
+	badDER := filepath.Join(dir, "bad-der.pem")
+	if err := os.WriteFile(badDER, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte("not der")}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := loadSigningKey(badDER); err == nil {
+		t.Fatal("malformed PKCS#8 body must error")
+	}
+
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rsaDER, err := x509.MarshalPKCS8PrivateKey(rsaKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongType := filepath.Join(dir, "rsa.pem")
+	if err := os.WriteFile(wrongType, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: rsaDER}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := loadSigningKey(wrongType); err == nil {
+		t.Fatal("a non-Ed25519 PKCS#8 key must error")
 	}
 }

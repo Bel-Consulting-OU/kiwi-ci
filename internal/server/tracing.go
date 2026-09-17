@@ -15,6 +15,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 const otelServiceName = "kiwi-server"
@@ -31,15 +32,10 @@ func (s *Server) ConfigureTracing(ctx context.Context, endpoint string) error {
 	if err != nil {
 		return fmt.Errorf("otel: create exporter: %w", err)
 	}
-	res, err := resource.Merge(resource.Default(),
-		resource.NewWithAttributes(semconv.SchemaURL, semconv.ServiceName(otelServiceName)))
-	if err != nil {
-		_ = exporter.Shutdown(ctx)
-		return fmt.Errorf("otel: build resource: %w", err)
-	}
+	attrs := append(resource.Default().Attributes(), semconv.ServiceName(otelServiceName))
 	provider := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exporter),
-		sdktrace.WithResource(res),
+		sdktrace.WithResource(resource.NewSchemaless(attrs...)),
 	)
 	otel.SetTracerProvider(provider)
 	s.otelShutdown = provider.Shutdown
@@ -65,7 +61,7 @@ func (s *Server) shutdownTracing(ctx context.Context) {
 		_ = s.otelShutdown(ctx)
 		s.otelShutdown = nil
 		s.otelEnabled = false
-		otel.SetTracerProvider(nil)
+		otel.SetTracerProvider(noop.NewTracerProvider())
 	}
 }
 

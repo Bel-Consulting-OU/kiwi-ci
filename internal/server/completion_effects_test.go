@@ -104,10 +104,7 @@ func deploymentOfJob(t *testing.T, f *dbFakeStore, jobID string) model.Deploymen
 // pass.
 func crashComplete(t *testing.T, s *Server, task Task, runnerID string) {
 	t.Helper()
-	hash, err := completionResultHash(model.StatusSuccess, "", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	hash := completionResultHash(model.StatusSuccess, "", nil)
 	if err := s.Sched.Complete(context.Background(), task.Job.ID, task.LeaseGeneration, runnerID, model.StatusSuccess, "", nil, hash); err != nil {
 		t.Fatalf("store completion: %v", err)
 	}

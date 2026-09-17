@@ -16,14 +16,14 @@ type EvalContext struct {
 
 func Eval(expr string, c EvalContext) (bool, error) {
 	expr = strings.TrimSpace(expr)
+	for hasOuterParens(expr) {
+		expr = strings.TrimSpace(expr[1 : len(expr)-1])
+	}
 	if expr == "" || expr == "true" {
 		return true, nil
 	}
 	if expr == "false" {
 		return false, nil
-	}
-	for hasOuterParens(expr) {
-		expr = strings.TrimSpace(expr[1 : len(expr)-1])
 	}
 	if parts := splitLogical(expr, "||"); len(parts) > 1 {
 		for _, p := range parts {

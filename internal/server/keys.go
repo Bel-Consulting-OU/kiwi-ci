@@ -2,13 +2,13 @@ package server
 
 import (
 	"crypto/ed25519"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -52,7 +52,7 @@ type provenanceSigner struct {
 }
 
 func newEphemeralEd25519() (ed25519.PublicKey, ed25519.PrivateKey) {
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	pub, priv, err := ed25519.GenerateKey(randReader)
 	if err != nil {
 		panic("kiwi server: failed to generate Ed25519 key: " + err.Error())
 	}
@@ -199,7 +199,7 @@ func (s *Server) loadWebSessionSecret(dataDir string) error {
 		}
 	}
 	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
+	if _, err := io.ReadFull(randReader, b); err != nil {
 		return err
 	}
 	s.WebSessionSecret = b

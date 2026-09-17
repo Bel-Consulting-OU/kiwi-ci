@@ -239,16 +239,35 @@ func convertStrategy(res *importer.Result, strat *yaml.Node, job string, j *pipe
 			continue
 		}
 		var out []any
+		scalarValues := true
 		for _, v := range vals.Content {
-			switch v.Kind {
-			case yaml.ScalarNode:
-				var decoded any
-				if err := v.Decode(&decoded); err == nil {
-					out = append(out, decoded)
-				}
-			default:
-				res.AddUnsupported("job %q: matrix dimension %q has a non-scalar value; dropped", job, dim)
+			if v.Kind != yaml.ScalarNode {
+				scalarValues = false
+				break
 			}
+			var decoded any
+			if err := v.Decode(&decoded); err != nil {
+				scalarValues = false
+				break
+			}
+			out = append(out, decoded)
+		}
+		if !scalarValues {
+			// A partly (or wholly) non-scalar dimension cannot be represented
+			// faithfully: keeping only its scalar values would silently
+			// change the matrix, so the dimension is dropped whole with an
+			// explicit diagnosis.
+			res.AddWarning("job %q: matrix dimension %q contains non-scalar values; the dimension is omitted", job, dim)
+			res.AddUnsupported("job %q: matrix dimension %q is not representable in Kiwi (scalar values only); the dimension was dropped", job, dim)
+			continue
+		}
+		if len(out) == 0 {
+			// An empty dimension would make the generated YAML rejected by
+			// pipeline.Parse ("matrix dimension has no values"), so it is
+			// never emitted.
+			res.AddWarning("job %q: matrix dimension %q is empty; the dimension is omitted", job, dim)
+			res.AddUnsupported("job %q: matrix dimension %q has no values and cannot be represented; the dimension was dropped", job, dim)
+			continue
 		}
 		j.Matrix[dim] = out
 	}

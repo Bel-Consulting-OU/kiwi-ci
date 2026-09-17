@@ -350,11 +350,114 @@ func runInteractive(ctx context.Context, lines *Ring[string], cfg *Config, out i
 	}
 }
 
-// readKeys reads single keystrokes (with escape sequences for arrows) and
-// sends normalized key names over ch until ctx ends.
+// maxSearchBytes bounds one accumulated / search line: a hostile or
+// runaway input source must not grow the reader's buffer without bound.
+const maxSearchBytes = 1024
+
+// Key-reader states: ground (ordinary keys), esc (a lone ESC was seen and
+// the next byte decides whether it opens a control sequence), csi (inside
+// ESC [ ... <final byte>), and search (accumulating a "/" search line).
+const (
+	keyGround = iota
+	keyEsc
+	keyCSI
+	keySearch
+)
+
+// readKeys reads keystrokes (with escape sequences for arrows) and sends
+// normalized key names over ch until ctx ends or in reaches EOF.
+//
+// The reader is a resumable state machine over a persistent buffer: bytes
+// are appended to the pending state and consumed only when a key or control
+// sequence is provably complete, so nothing is dropped at a read-chunk
+// boundary. An escape sequence is recognized only once its final byte
+// arrives (ESC in one read, "[A" in the next still yields "up"). A lone ESC
+// cannot be told apart from the start of a split sequence at the moment it
+// is read, so it is flushed as the "esc" key at the first boundary that
+// proves it was alone: end of input, or a following byte other than "["
+// (e.g. ESC q yields "esc" then "q"). A timer-based flush was rejected: it
+// would reintroduce timing-dependent key loss and make the reader
+// non-deterministic. A "/" search accumulates every byte, including action
+// keys such as y/j/f, until Enter (or CR) and is emitted as exactly one
+// "/<text>" key, echoing the submitted text.
 func readKeys(ctx context.Context, in io.Reader, ch chan<- string) {
-	buf := make([]byte, 8)
-	pending := []byte{}
+	buf := make([]byte, 256)
+	state := keyGround
+	var search []byte
+	var csiParams []byte
+
+	emit := func(k string) bool {
+		select {
+		case ch <- k:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+	var handle func(b byte) bool
+	handle = func(b byte) bool {
+		switch state {
+		case keySearch:
+			if b == '\n' || b == '\r' {
+				key := "/" + string(search)
+				search = search[:0]
+				state = keyGround
+				return emit(key)
+			}
+			if len(search) < maxSearchBytes {
+				search = append(search, b)
+			}
+			return true
+		case keyEsc:
+			if b == '[' {
+				state = keyCSI
+				csiParams = csiParams[:0]
+				return true
+			}
+			state = keyGround
+			if !emit("esc") {
+				return false
+			}
+			return handle(b)
+		case keyCSI:
+			if b >= 0x40 && b <= 0x7e {
+				state = keyGround
+				if k := csiKey(b, csiParams); k != "" {
+					return emit(k)
+				}
+				return true
+			}
+			// Parameter (0x30..0x3f) and intermediate bytes are collected
+			// until the final byte; the sequence is incomplete without it.
+			if b >= 0x30 && b <= 0x3f && len(csiParams) < 16 {
+				csiParams = append(csiParams, b)
+			}
+			return true
+		default:
+			switch b {
+			case 0x1b:
+				state = keyEsc
+			case '/':
+				state = keySearch
+				search = search[:0]
+			case 'q', 'Q':
+				return emit("q")
+			case '\t':
+				return emit("tab")
+			case 'j', 'J':
+				return emit("j")
+			case 'f', 'F':
+				return emit("f")
+			case 'y', 'Y':
+				return emit("y")
+			case 'n':
+				return emit("n")
+			case 'N':
+				return emit("N")
+			}
+			return true
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -362,70 +465,42 @@ func readKeys(ctx context.Context, in io.Reader, ch chan<- string) {
 		default:
 		}
 		n, err := in.Read(buf)
-		if err != nil {
-			return
-		}
-		pending = append(pending, buf[:n]...)
-		for len(pending) > 0 {
-			switch {
-			case len(pending) >= 3 && pending[0] == 0x1b && pending[1] == '[':
-				switch pending[2] {
-				case 'A':
-					ch <- "up"
-				case 'B':
-					ch <- "down"
-				case '5', '6':
-					if len(pending) >= 4 && pending[3] == '~' {
-						if pending[2] == '5' {
-							ch <- "pgup"
-						} else {
-							ch <- "pgdn"
-						}
-						pending = pending[4:]
-						continue
-					}
-				case 'H':
-					ch <- "home"
-				case 'F':
-					ch <- "end"
-				}
-				pending = pending[3:]
-				continue
-			case len(pending) >= 2 && pending[0] == 0x1b:
-				pending = pending[1:]
-				continue
-			default:
-				c := pending[0]
-				pending = pending[1:]
-				switch c {
-				case 'q', 'Q':
-					ch <- "q"
-				case '\t':
-					ch <- "tab"
-				case 'j', 'J':
-					ch <- "j"
-				case 'f', 'F':
-					ch <- "f"
-				case 'y', 'Y':
-					ch <- "y"
-				case 'n':
-					ch <- "n"
-				case 'N':
-					ch <- "N"
-				case '/':
-					line := []byte{'/'}
-					for len(pending) > 0 && pending[0] != '\n' && pending[0] != '\r' {
-						line = append(line, pending[0])
-						pending = pending[1:]
-					}
-					if len(pending) > 0 {
-						pending = pending[1:]
-					}
-					ch <- string(line)
-				case '\n', '\r':
-					// ignore
-				}
+		for _, b := range buf[:n] {
+			if !handle(b) {
+				return
 			}
 		}
+		if err != nil {
+			if state == keyEsc {
+				_ = emit("esc")
+			}
+			if state == keySearch {
+				_ = emit("/" + string(search))
+			}
+			return
+		}
 	}
+}
+
+// csiKey maps a completed CSI sequence (final byte plus collected parameter
+// bytes) onto a normalized key name; "" for sequences the TUI does not use.
+func csiKey(final byte, params []byte) string {
+	switch final {
+	case 'A':
+		return "up"
+	case 'B':
+		return "down"
+	case 'H':
+		return "home"
+	case 'F':
+		return "end"
+	case '~':
+		switch string(params) {
+		case "5":
+			return "pgup"
+		case "6":
+			return "pgdn"
+		}
+	}
+	return ""
 }

@@ -2,7 +2,6 @@ package server
 
 import (
 	"crypto/ed25519"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -10,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -90,14 +90,14 @@ type oidcPreviousKeyFile struct {
 
 func newOIDCKID() (string, error) {
 	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
+	if _, err := io.ReadFull(randReader, b); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
 }
 
 func newOIDCSigner() *oidcSigner {
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	pub, priv, err := ed25519.GenerateKey(randReader)
 	if err != nil {
 		panic("kiwi server: failed to generate OIDC signing key: " + err.Error())
 	}
@@ -193,7 +193,7 @@ func persistOIDCKeyRing(s *oidcSigner) error {
 			RetireAfter: p.RetireAfter.UTC().Format(time.RFC3339Nano),
 		})
 	}
-	b, err := json.MarshalIndent(rf, "", "  ")
+	b, err := jsonMarshalIndent(rf, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -443,7 +443,7 @@ func (s *Server) oidcJWKS(w http.ResponseWriter, r *http.Request) {
 			keys = append(keys, oidcJWK(p.KID, p.Public))
 		}
 	}
-	body, err := json.Marshal(map[string]any{"keys": keys})
+	body, err := jsonMarshal(map[string]any{"keys": keys})
 	if err != nil {
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
@@ -601,8 +601,8 @@ func (s *Server) signJWT(signer *oidcSigner, claims map[string]any) (string, err
 		return "", fmt.Errorf("OIDC signer unavailable")
 	}
 	header := map[string]any{"alg": "EdDSA", "typ": "JWT", "kid": signer.KID}
-	h, _ := json.Marshal(header)
-	c, err := json.Marshal(claims)
+	h, _ := jsonMarshal(header)
+	c, err := jsonMarshal(claims)
 	if err != nil {
 		return "", err
 	}

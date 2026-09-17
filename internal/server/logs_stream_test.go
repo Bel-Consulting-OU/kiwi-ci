@@ -8,10 +8,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 type sseFrame struct {
@@ -98,6 +100,56 @@ func TestStreamLogsRequiresAuth(t *testing.T) {
 	w := doJSON(t, s, http.MethodGet, "/api/v1/runs/r1/logs/stream", "", "")
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated stream = %d, want 401", w.Code)
+	}
+}
+
+// streamDeleteStore wraps a working store and starts reporting ErrNotFound
+// after failAfter reads, simulating a run deleted while its log stream is
+// open.
+type streamDeleteStore struct {
+	*fcStore
+	mu        sync.Mutex
+	reads     int
+	failAfter int
+}
+
+func (s *streamDeleteStore) ReadLogs(ctx context.Context, runID string, after int64, limit int) ([]model.LogEntry, error) {
+	s.mu.Lock()
+	s.reads++
+	fail := s.reads >= s.failAfter
+	s.mu.Unlock()
+	if fail {
+		return nil, storage.ErrNotFound
+	}
+	return s.fcStore.ReadLogs(ctx, runID, after, limit)
+}
+
+// TestStreamLogsRunDeletedMidStream proves a run that disappears after the
+// SSE headers are committed ends the stream with a done event instead of
+// trying to write a 404 body into an already-200 response.
+func TestStreamLogsRunDeletedMidStream(t *testing.T) {
+	s, f, _, _ := cacheFixture(t)
+	s.LogStreamIdleTimeout = time.Hour
+	if err := f.AppendLog(context.Background(), model.LogEntry{RunID: "run-c", JobID: "job-a", JobKey: "build", Step: "s", Line: "first", CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	s.DB = &streamDeleteStore{fcStore: &fcStore{dbFakeStore: f}, failAfter: 2}
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	frames := startStream(t, ctx, srv.URL+"/api/v1/runs/run-c/logs/stream", "admin-tok")
+	expectSeq(t, frames, 1, "first")
+	select {
+	case frame, ok := <-frames:
+		if !ok {
+			t.Fatal("stream closed without a done event")
+		}
+		if frame.event != "done" {
+			t.Fatalf("frame after disappearance = %+v, want done", frame)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream did not terminate after the run disappeared")
 	}
 }
 

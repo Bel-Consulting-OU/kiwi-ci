@@ -61,6 +61,10 @@ func ValidateManifest(m CacheManifest) error {
 // SignManifest returns a DSSE-like signed envelope over the canonical manifest
 // JSON.
 func SignManifest(m CacheManifest, keyID string, priv ed25519.PrivateKey) ([]byte, error) {
+	if len(priv) != ed25519.PrivateKeySize {
+		// ed25519.Sign panics on malformed keys; fail closed instead.
+		return nil, fmt.Errorf("cache: invalid signing key length %d", len(priv))
+	}
 	if err := ValidateManifest(m); err != nil {
 		return nil, err
 	}

@@ -7,12 +7,17 @@ import (
 	"syscall"
 )
 
+// statfsFn is a test-only seam over syscall.Statfs. Production behavior is
+// unchanged; it lets the checked low-free-space branch be exercised without a
+// nearly full filesystem.
+var statfsFn = syscall.Statfs
+
 // FitsAvailable reports whether the filesystem containing path has enough
 // free bytes. With maxBytes <= 0 it only enforces a 5% free-space safety
 // threshold.
 func FitsAvailable(path string, maxBytes int64) error {
 	var st syscall.Statfs_t
-	if err := syscall.Statfs(path, &st); err != nil {
+	if err := statfsFn(path, &st); err != nil {
 		return err
 	}
 	avail := int64(st.Bavail) * int64(st.Bsize)

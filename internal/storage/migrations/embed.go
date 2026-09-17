@@ -7,6 +7,7 @@ package migrations
 import (
 	"embed"
 	"fmt"
+	"io/fs"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,7 +27,13 @@ type Migration struct {
 
 // All returns the embedded migrations sorted by version.
 func All() ([]Migration, error) {
-	entries, err := FS.ReadDir(".")
+	return load(FS)
+}
+
+// load reads migrations from fsys. All uses the embedded FS; the indirection
+// keeps the error handling for malformed trees testable.
+func load(fsys fs.FS) ([]Migration, error) {
+	entries, err := fs.ReadDir(fsys, ".")
 	if err != nil {
 		return nil, fmt.Errorf("migrations: read dir: %w", err)
 	}
@@ -39,7 +46,7 @@ func All() ([]Migration, error) {
 		if err != nil {
 			return nil, err
 		}
-		raw, err := FS.ReadFile(e.Name())
+		raw, err := fs.ReadFile(fsys, e.Name())
 		if err != nil {
 			return nil, fmt.Errorf("migrations: read %s: %w", e.Name(), err)
 		}

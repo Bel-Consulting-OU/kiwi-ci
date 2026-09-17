@@ -161,10 +161,7 @@ func readJSONL[T any](path string, limit int, keep func(T) bool) ([]T, error) {
 	for {
 		var v T
 		if err := dec.Decode(&v); err != nil {
-			if errors.Is(err, os.ErrClosed) {
-				return out, nil
-			}
-			if errors.Is(err, io.EOF) {
+			if jsonlStreamFinished(err) {
 				return out, nil
 			}
 			return out, err
@@ -176,6 +173,13 @@ func readJSONL[T any](path string, limit int, keep func(T) bool) ([]T, error) {
 			}
 		}
 	}
+}
+
+// jsonlStreamFinished reports whether a JSON-lines decode error means the
+// stream ended cleanly (EOF or an already-closed file) rather than a
+// malformed record. Both cases are the normal end of a log file.
+func jsonlStreamFinished(err error) bool {
+	return errors.Is(err, os.ErrClosed) || errors.Is(err, io.EOF)
 }
 
 // MaxLogSeq returns the highest durable log sequence so a restarted control

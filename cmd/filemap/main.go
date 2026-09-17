@@ -9,6 +9,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -22,15 +23,26 @@ const (
 )
 
 func main() {
-	root := flag.String("root", ".", "repository root to walk")
-	out := flag.String("out", "", "output path (default: <root>/FILE_MAP.md)")
-	check := flag.Bool("check", false, "fail if FILE_MAP.md is stale instead of writing")
-	flag.Parse()
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+// run executes one filemap invocation, writing normal output to stdout and
+// diagnostics to stderr, and returns the process exit code. Flag parsing uses
+// the package-level flag.CommandLine so that, as before, an invalid flag
+// exits with status 2 (ExitOnError) in production.
+func run(args []string, stdout, stderr io.Writer) int {
+	flags := flag.CommandLine
+	root := flags.String("root", ".", "repository root to walk")
+	out := flags.String("out", "", "output path (default: <root>/FILE_MAP.md)")
+	check := flags.Bool("check", false, "fail if FILE_MAP.md is stale instead of writing")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
 
 	abs, err := filepath.Abs(*root)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "filemap:", err)
-		os.Exit(1)
+		fmt.Fprintln(stderr, "filemap:", err)
+		return 1
 	}
 	dest := *out
 	if dest == "" {
@@ -59,15 +71,15 @@ func main() {
 		if d.Name() == outputName && rel == outputName {
 			return nil
 		}
-		if skipFile(rel, d) {
+		if skipFile(abs, rel, d) {
 			return nil
 		}
 		paths = append(paths, rel)
 		return nil
 	})
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "filemap:", err)
-		os.Exit(1)
+		fmt.Fprintln(stderr, "filemap:", err)
+		return 1
 	}
 	sort.Strings(paths)
 
@@ -83,22 +95,24 @@ func main() {
 	if *check {
 		existing, rerr := os.ReadFile(dest)
 		if rerr == nil && string(existing) == generated {
-			fmt.Printf("filemap: %s is up to date (%d files)\n", dest, len(paths))
-			return
+			fmt.Fprintf(stdout, "filemap: %s is up to date (%d files)\n", dest, len(paths))
+			return 0
 		}
-		fmt.Fprintf(os.Stderr, "filemap: %s is stale; run `go run ./cmd/filemap` to regenerate\n", dest)
-		os.Exit(1)
+		fmt.Fprintf(stderr, "filemap: %s is stale; run `go run ./cmd/filemap` to regenerate\n", dest)
+		return 1
 	}
 	if err := os.WriteFile(dest, []byte(generated), 0o644); err != nil {
-		fmt.Fprintln(os.Stderr, "filemap:", err)
-		os.Exit(1)
+		fmt.Fprintln(stderr, "filemap:", err)
+		return 1
 	}
-	fmt.Printf("filemap: wrote %s (%d files)\n", dest, len(paths))
+	fmt.Fprintf(stdout, "filemap: wrote %s (%d files)\n", dest, len(paths))
+	return 0
 }
 
 // skipFile filters out generated metadata and non-source artifacts that must
-// not appear in the inventory.
-func skipFile(rel string, d fs.DirEntry) bool {
+// not appear in the inventory. The binary probe resolves rel beneath the walk
+// root, never against the process working directory.
+func skipFile(root, rel string, d fs.DirEntry) bool {
 	name := d.Name()
 	if name == ".DS_Store" || name == "Thumbs.db" || name == "desktop.ini" {
 		return true
@@ -110,7 +124,7 @@ func skipFile(rel string, d fs.DirEntry) bool {
 		return false
 	}
 	if info, err := d.Info(); err == nil && info.Mode().IsRegular() {
-		if b, rerr := os.ReadFile(filepath.Join(".", filepath.FromSlash(rel))); rerr == nil && !isText(b) {
+		if b, rerr := os.ReadFile(filepath.Join(root, filepath.FromSlash(rel))); rerr == nil && !isText(b) {
 			return true
 		}
 	}
@@ -267,11 +281,26 @@ func firstNonEmpty(s string) string {
 // no usable header line.
 func fallbackDescription(rel string) string {
 	dir := filepath.Dir(rel)
+	isCmd := dir == "cmd" || strings.HasPrefix(dir, "cmd"+string(filepath.Separator))
 	switch {
 	case strings.HasSuffix(rel, "_test.go"):
-		return "Regression tests for the " + filepath.Base(dir) + " package."
+		switch {
+		case dir == ".":
+			return "Regression tests for the repository root."
+		case isCmd:
+			return "Regression tests for the " + filepath.Base(dir) + " command."
+		default:
+			return "Regression tests for the " + filepath.Base(dir) + " package."
+		}
 	case strings.HasSuffix(rel, ".go"):
-		return "Go source in internal/" + filepath.Base(dir) + "."
+		switch {
+		case dir == ".":
+			return "Go source in the repository root."
+		case isCmd:
+			return "Go source for the " + filepath.Base(dir) + " command."
+		default:
+			return "Go source in internal/" + filepath.Base(dir) + "."
+		}
 	case strings.HasSuffix(rel, ".md"):
 		return "Documentation file."
 	case strings.HasSuffix(rel, ".yaml") || strings.HasSuffix(rel, ".yml"):

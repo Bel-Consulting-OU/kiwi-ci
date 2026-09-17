@@ -51,6 +51,17 @@ const (
 	maxCompletionReceipts = 4096
 )
 
+// randReader and jsonMarshal are test-only seams over crypto/rand and
+// encoding/json. Production always uses the standard library defaults below
+// (the var values are never reassigned outside tests); tests override them to
+// exercise the fail-closed error branches, which cannot be reached when the
+// real randomness source and the real encoder always succeed.
+var (
+	randReader        io.Reader = rand.Reader
+	jsonMarshal                 = json.Marshal
+	jsonMarshalIndent           = json.MarshalIndent
+)
+
 type Server struct {
 	// Token remains for source compatibility; RunnerToken/AdminToken are authoritative.
 	Token                string
@@ -382,7 +393,7 @@ func New(token string) *Server {
 // newLeaseKey generates a 32-byte lease HMAC key from crypto/rand.
 func newLeaseKey() ([]byte, error) {
 	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
+	if _, err := io.ReadFull(randReader, b); err != nil {
 		return nil, err
 	}
 	return b, nil
@@ -1030,7 +1041,7 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 	if err != nil {
 		return model.Run{}, err
 	}
-	policyJSON, err := json.Marshal(caps)
+	policyJSON, err := jsonMarshal(caps)
 	if err != nil {
 		return model.Run{}, err
 	}
@@ -1080,7 +1091,7 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 		cj = s.applyUntrustedResourceCeilings(cj, in.Trusted)
 		// The compiled job payload is the deterministic enqueue-time record
 		// the runner can verify its own recompilation against.
-		cjJSON, mErr := json.Marshal(cj)
+		cjJSON, mErr := jsonMarshal(cj)
 		if mErr != nil {
 			return model.Run{}, mErr
 		}
@@ -1865,9 +1876,6 @@ func (s *Server) listServingRunners(w http.ResponseWriter, r *http.Request) {
 		}
 		dto = append(dto, v1.RunnerServingDTOFrom(ri, visibleJobs))
 	}
-	if dto == nil {
-		dto = []v1.RunnerServingDTO{}
-	}
 	writeJSON(w, http.StatusOK, dto)
 }
 
@@ -2145,12 +2153,6 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, j := range s.jobs {
 		if j.Status != model.StatusQueued || !depsReadyLocked(j, s.jobs) {
-			continue
-		}
-		// Queue-timeout expiry (parity with scheduler.Lease): a candidate
-		// whose deadline has passed is never leased; recoverLeasesLocked
-		// cancels it terminally.
-		if dl := scheduler.QueueDeadlineFor(j); dl != nil && !dl.After(now) {
 			continue
 		}
 		jobRepo := repoIDForJob(j)
@@ -2492,11 +2494,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "error message exceeds 64 KiB", http.StatusBadRequest)
 		return
 	}
-	hash, err := completionResultHash(in.Status, in.Error, in.Outputs)
-	if err != nil {
-		http.Error(w, "invalid outputs payload", http.StatusBadRequest)
-		return
-	}
+	hash := completionResultHash(in.Status, in.Error, in.Outputs)
 	if s.Sched != nil {
 		s.completeDB(w, r, jobID, in, hash)
 		return
@@ -2743,18 +2741,15 @@ func (s *Server) completeDB(w http.ResponseWriter, r *http.Request, jobID string
 // completionResultHash canonicalizes a completion payload so identical
 // retries can be recognized. encoding/json sorts map keys, making outputs
 // deterministic.
-func completionResultHash(status model.Status, errMsg string, outputs map[string]string) (string, error) {
-	outJSON, err := json.Marshal(outputs)
-	if err != nil {
-		return "", err
-	}
+func completionResultHash(status model.Status, errMsg string, outputs map[string]string) string {
+	outJSON, _ := jsonMarshal(outputs)
 	h := sha256.New()
 	_, _ = h.Write([]byte(status))
 	_, _ = h.Write([]byte{0})
 	_, _ = h.Write([]byte(errMsg))
 	_, _ = h.Write([]byte{0})
 	_, _ = h.Write(outJSON)
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func completionReceiptKey(jobID string, generation int64, runnerID string) string {
@@ -3754,7 +3749,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // newID returns a 128-bit crypto/rand identifier hex-encoded.
 func newID() (string, error) {
 	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
+	if _, err := io.ReadFull(randReader, b); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil

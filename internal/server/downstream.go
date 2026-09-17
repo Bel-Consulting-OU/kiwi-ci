@@ -99,7 +99,7 @@ func (s *Server) recordDownstreamIntents(ctx context.Context, j model.Job, run m
 		Forge:       forgeKind,
 		Trusted:     downstreamChildTrusted(j),
 	}
-	raw, err := json.Marshal(payload)
+	raw, err := jsonMarshal(payload)
 	if err != nil {
 		return err
 	}
@@ -187,7 +187,7 @@ func effectiveCapsOf(j model.Job) (policy.Capabilities, bool) {
 	if j.CompiledJobPayload == nil || j.CompiledJobPayload.EffectivePolicy == nil {
 		return policy.Capabilities{}, false
 	}
-	b, err := json.Marshal(j.CompiledJobPayload.EffectivePolicy)
+	b, err := jsonMarshal(j.CompiledJobPayload.EffectivePolicy)
 	if err != nil {
 		return policy.Capabilities{}, false
 	}

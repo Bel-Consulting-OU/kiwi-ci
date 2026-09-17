@@ -3,8 +3,6 @@ package secretbroker
 import (
 	"bytes"
 	"context"
-	"crypto/ecdh"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -69,7 +67,7 @@ func (p *RemoteProvider) Get(ctx context.Context, name string) (string, error) {
 	if strings.TrimSpace(name) == "" {
 		return "", fmt.Errorf("remote secret: empty secret name")
 	}
-	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	priv, err := generateX25519Key()
 	if err != nil {
 		return "", fmt.Errorf("remote secret: generate ephemeral key: %w", err)
 	}

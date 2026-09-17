@@ -21,6 +21,13 @@ type Store struct {
 	MaxArtifactBytes int64
 }
 
+// Test-only seams for otherwise unreachable OS failure branches. Production
+// behavior is unchanged: the defaults are os.File.Close and io.Copy.
+var (
+	closeArtifactFile = (*os.File).Close
+	copyDigest        = io.Copy
+)
+
 func Default() *Store {
 	home, _ := os.UserHomeDir()
 	return &Store{Root: filepath.Join(home, ".kiwi", "artifacts")}
@@ -66,7 +73,7 @@ func (s *Store) Save(runID, jobID, name, workspace string, paths []string) (stri
 		_ = os.Remove(dst + ".tmp")
 		return "", err
 	}
-	if err := f.Close(); err != nil {
+	if err := closeArtifactFile(f); err != nil {
 		_ = os.Remove(dst + ".tmp")
 		return "", err
 	}
@@ -78,7 +85,7 @@ func (s *Store) Save(runID, jobID, name, workspace string, paths []string) (stri
 		return "", err
 	}
 	h := sha256.New()
-	size, cpErr := io.Copy(h, archive)
+	size, cpErr := copyDigest(h, archive)
 	archive.Close()
 	if cpErr != nil {
 		return "", cpErr

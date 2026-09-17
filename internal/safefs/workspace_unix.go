@@ -23,7 +23,7 @@ func (w *WorkspaceRoot) openRel(rel string) (*os.File, error) {
 		return nil, err
 	}
 	rootFd := int(w.F.Fd())
-	if fd, handled, err := openRelPlatform(rootFd, rel); handled {
+	if fd, handled, err := openRelPlatformHook(rootFd, rel); handled {
 		if err != nil {
 			return nil, mapSpecialFileError(err, rel)
 		}
@@ -37,6 +37,11 @@ func (w *WorkspaceRoot) openRel(rel string) (*os.File, error) {
 	}
 	return w.verifiedFile(fd, rel)
 }
+
+// openRelPlatformHook is a test-only seam over openRelPlatform, the
+// openat2-based fast path that only exists on Linux. Production behavior is
+// unchanged; it lets the platform path be exercised on hosts without openat2.
+var openRelPlatformHook = openRelPlatform
 
 // mapSpecialFileError reports the OS refusals that mean "this path is a
 // special file, not an openable regular file" (opening a unix socket yields

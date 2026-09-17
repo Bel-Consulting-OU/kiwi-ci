@@ -127,11 +127,7 @@ func (s *Server) bindCertProfile(ctx context.Context, serial, profileID string) 
 		return err
 	}
 	if s.DB != nil {
-		ps, ok := s.DB.(storage.ProfileStore)
-		if !ok {
-			return fmt.Errorf("store does not support runner profiles")
-		}
-		return ps.BindCertProfile(ctx, serial, profileID)
+		return s.DB.(storage.ProfileStore).BindCertProfile(ctx, serial, profileID)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

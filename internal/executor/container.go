@@ -66,7 +66,7 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 			return err
 		}
 	}
-	abs, err := filepath.Abs(workspace)
+	abs, err := absWorkspacePath(workspace)
 	if err != nil {
 		return &RunError{Kind: ErrorInfra, Err: err}
 	}

@@ -59,7 +59,7 @@ func (s *Server) persistDrainFlagLocked() {
 		return
 	}
 	s.drainMu.Lock()
-	b, err := json.Marshal(map[string]string{"reason": s.drainReason})
+	b, err := jsonMarshal(map[string]string{"reason": s.drainReason})
 	s.drainMu.Unlock()
 	if err != nil {
 		return

@@ -35,28 +35,52 @@ func stepName(line string) string {
 
 // renderFrame builds one visible screen of lines honoring collapse state,
 // search matches, and the cursor. h is the frame height; w the width.
+//
+// A collapsed step group renders exactly one marker line for all of its
+// members: every member line maps to that marker (lineToVisible), so a
+// search match inside a collapsed group still highlights its marker and the
+// cursor keeps pointing at a visible line. cursor and matches are indices
+// into lines; the returned frame uses visible-line coordinates.
 func renderFrame(lines []string, cursor int, collapsed map[string]bool, matches []int, h, w int) []string {
 	if h <= 0 {
 		return nil
 	}
 	visible := make([]string, 0, len(lines))
+	// lineToVisible maps every source line to the visible line representing
+	// it: its own position when the group is open, the collapsed marker
+	// when not.
+	lineToVisible := make([]int, len(lines))
 	group := ""
-	for _, l := range lines {
+	open := true
+	marker := -1
+	for i, l := range lines {
 		s := stepName(l)
 		if s != group {
 			group = s
-			if collapsed[group] {
+			open = !collapsed[group]
+			if !open {
+				marker = len(visible)
 				visible = append(visible, fmt.Sprintf("▶ %s (%d lines)", group, countGroup(lines, group)))
-				continue
 			}
 		}
-		visible = append(visible, l)
+		if open {
+			lineToVisible[i] = len(visible)
+			visible = append(visible, l)
+		} else {
+			lineToVisible[i] = marker
+		}
 	}
-	matchSet := map[int]bool{}
+	highlight := make([]bool, len(visible))
 	for _, m := range matches {
-		matchSet[m] = true
+		if m >= 0 && m < len(lineToVisible) {
+			highlight[lineToVisible[m]] = true
+		}
 	}
 	start := cursor - h + 1
+	// A cursor inside a collapsed group anchors the window at the marker.
+	if cursor >= 0 && cursor < len(lineToVisible) && lineToVisible[cursor] != cursor {
+		start = lineToVisible[cursor] - h + 1
+	}
 	if start < 0 {
 		start = 0
 	}
@@ -73,7 +97,7 @@ func renderFrame(lines []string, cursor int, collapsed map[string]bool, matches 
 	out := make([]string, 0, end-start)
 	for i := start; i < end; i++ {
 		prefix := "  "
-		if matchSet[i] {
+		if highlight[i] {
 			prefix = "» "
 		}
 		out = append(out, truncate(prefix+visible[i], w))

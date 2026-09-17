@@ -44,6 +44,17 @@ type TartBackend struct {
 
 func (*TartBackend) Name() string { return "tart" }
 
+// tartIPWait bounds how long StartJob waits for the booted VM to report an
+// IP. It is a seam: production uses the fixed 60s bound, tests shorten it to
+// exercise the never-got-an-IP failure without waiting a minute.
+var tartIPWait = 60 * time.Second
+
+// generateSSHKey is a test-only seam over generateEphemeralSSHKey. Production
+// behavior is unchanged; it lets the checked SSH key-generation failure branch
+// be exercised (key generation can genuinely fail: ssh-keygen errors and the
+// Go fallback cannot write).
+var generateSSHKey = generateEphemeralSSHKey
+
 // StartJob clones and boots one disposable Tart VM for the entire CI job.
 // The VM is deleted by CloseJob; steps share VM state and the mounted checkout.
 func (b *TartBackend) StartJob(ctx context.Context, workspace string, emit func(string)) error {
@@ -74,7 +85,7 @@ func (b *TartBackend) StartJob(ctx context.Context, workspace string, emit func(
 	if err != nil {
 		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("ssh not found: %w", err)}
 	}
-	abs, err := filepath.Abs(workspace)
+	abs, err := absWorkspacePath(workspace)
 	if err != nil {
 		return &RunError{Kind: ErrorInfra, Err: err}
 	}
@@ -105,7 +116,7 @@ func (b *TartBackend) StartJob(ctx context.Context, workspace string, emit func(
 		_ = b.CloseJob()
 		return &RunError{Kind: ErrorInfra, Err: err}
 	}
-	deadline := time.Now().Add(60 * time.Second)
+	deadline := time.Now().Add(tartIPWait)
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			_ = b.CloseJob()
@@ -300,7 +311,7 @@ func (b *TartBackend) setupSSHDir() error {
 		return err
 	}
 	b.sshDir = dir
-	if err := generateEphemeralSSHKey(filepath.Join(dir, "id_ed25519")); err != nil {
+	if err := generateSSHKey(filepath.Join(dir, "id_ed25519")); err != nil {
 		_ = os.RemoveAll(dir)
 		b.sshDir = ""
 		return fmt.Errorf("generate ephemeral SSH key: %w", err)

@@ -1089,9 +1089,7 @@ func (m *memStore) CompleteJob(ctx context.Context, jobID string, generation int
 	// A missing artifact fails closed (the job stays running) with
 	// ErrRequiredArtifactMissing; a contract-store failure does the same.
 	if status == model.StatusSuccess {
-		if missing, err := m.requiredArtifactMissingLocked(jobID); err != nil {
-			return err
-		} else if missing != "" {
+		if missing := m.requiredArtifactMissingLocked(jobID); missing != "" {
 			return fmt.Errorf("%w: %s", ErrRequiredArtifactMissing, missing)
 		}
 	}
@@ -1127,10 +1125,8 @@ func (m *memStore) CompleteJob(ctx context.Context, jobID string, generation int
 	// Post-transaction completion effects mirror the SQL contract: one
 	// outbox intent per effect kind, committed with the completion under
 	// the deterministic effect IDs the completing server queues locally.
-	payload, merr := json.Marshal(CompletionEffectsPayload{JobID: jobID, RunID: j.RunID})
-	if merr != nil {
-		return merr
-	}
+	// The payload carries two strings, so marshaling cannot fail.
+	payload, _ := json.Marshal(CompletionEffectsPayload{JobID: jobID, RunID: j.RunID})
 	for _, kind := range CompletionEffectKinds() {
 		m.outbox = append(m.outbox, OutboxItem{ID: CompletionEffectID(jobID, generation, kind), Kind: kind, Payload: payload, CreatedAt: now})
 	}
@@ -2494,10 +2490,10 @@ func (m *memStore) PrunePendingSidecars(ctx context.Context, olderThan time.Time
 // requiredArtifactMissingLocked returns the name of the first Required
 // contract entry with no artifact record for (job, name), or "" when every
 // required artifact is present. The caller holds m.mu.
-func (m *memStore) requiredArtifactMissingLocked(jobID string) (string, error) {
+func (m *memStore) requiredArtifactMissingLocked(jobID string) string {
 	contracts, ok := m.contracts[jobID]
 	if !ok || len(contracts) == 0 {
-		return "", nil
+		return ""
 	}
 	for name, c := range contracts {
 		if !c.Required {
@@ -2511,10 +2507,10 @@ func (m *memStore) requiredArtifactMissingLocked(jobID string) (string, error) {
 			}
 		}
 		if !found {
-			return name, nil
+			return name
 		}
 	}
-	return "", nil
+	return ""
 }
 
 // ClaimSecretDelivery reserves the once-only (job, generation, secret name)

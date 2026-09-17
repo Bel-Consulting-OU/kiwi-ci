@@ -32,6 +32,43 @@ func TestSanitizeID(t *testing.T) {
 	}
 }
 
+func TestSanitizeIDBoundaryLengths(t *testing.T) {
+	for _, tc := range []struct {
+		n       int
+		wantLen int
+	}{
+		{0, 3}, {127, 127}, {128, 128}, {129, 128}, {200, 128},
+	} {
+		got := SanitizeID(strings.Repeat("a", tc.n), map[string]bool{})
+		if len(got) != tc.wantLen {
+			t.Fatalf("SanitizeID(%d chars) len = %d, want %d (%q)", tc.n, len(got), tc.wantLen, got)
+		}
+		if !idRegexp.MatchString(got) {
+			t.Fatalf("SanitizeID(%d chars) = %q does not match the id grammar", tc.n, got)
+		}
+	}
+	// Collisions at and beyond the truncation boundary keep the final id
+	// inside the grammar: the suffix is carved out of the base, never
+	// appended past 128 characters.
+	for _, n := range []int{124, 126, 127, 128, 129, 200} {
+		taken := map[string]bool{}
+		ids := make([]string, 0, 3)
+		for _, tail := range []string{"-x", "-y", "-z"} {
+			ids = append(ids, SanitizeID(strings.Repeat("b", n)+tail, taken))
+		}
+		for i, id := range ids {
+			if len(id) > 128 || !idRegexp.MatchString(id) {
+				t.Fatalf("n=%d id[%d] = %q (len %d) violates the grammar", n, i, id, len(id))
+			}
+			for j := 0; j < i; j++ {
+				if id == ids[j] {
+					t.Fatalf("n=%d duplicate id %q", n, id)
+				}
+			}
+		}
+	}
+}
+
 func TestConfidenceScoring(t *testing.T) {
 	if c := Confidence(10, 0, 0); c != 1 {
 		t.Fatalf("clean import confidence = %v, want 1", c)

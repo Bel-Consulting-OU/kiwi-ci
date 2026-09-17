@@ -63,6 +63,13 @@ var s3Dialer = &net.Dialer{
 	KeepAlive: 30 * time.Second,
 }
 
+// Test-only seams over the temp-file seek and reopen used by Put. Production
+// behavior is unchanged: the defaults are (*os.File).Seek and os.Open.
+var (
+	seekTemp        = (*os.File).Seek
+	openTempForRead = func(name string) (io.ReadCloser, error) { return os.Open(name) }
+)
+
 // s3Transport builds the default S3 HTTP transport with explicit
 // connection timeouts and idle limits: 10s dial, 90s idle connection
 // lifetime, 10s TLS handshake, 30s response header, and bounded idle
@@ -108,7 +115,8 @@ func (s *S3) objectURL(key string) string {
 	if s.PathStyle {
 		return strings.TrimRight(s.Endpoint, "/") + "/" + s.Bucket + "/" + strings.TrimPrefix(key, "/")
 	}
-	return "https://" + s.Bucket + "." + strings.TrimLeft(strings.TrimPrefix(s.Endpoint, "https://"), "/") + "/" + strings.TrimPrefix(key, "/")
+	host := strings.Trim(strings.TrimPrefix(s.Endpoint, "https://"), "/")
+	return "https://" + s.Bucket + "." + host + "/" + strings.TrimPrefix(key, "/")
 }
 
 func (s *S3) sign(req *http.Request, payloadHash string, now time.Time) {
@@ -214,13 +222,13 @@ func (s *S3) Put(ctx context.Context, key string, r io.Reader, size int64) (Obje
 	if n != size {
 		return Object{}, fmt.Errorf("blob: s3 put size mismatch: wrote %d bytes, expected %d", n, size)
 	}
-	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+	if _, err := seekTemp(tmp, 0, io.SeekStart); err != nil {
 		return Object{}, err
 	}
 	digest := hex.EncodeToString(h.Sum(nil))
 	// Re-read the temp file to compute the exact request body hash for SigV4.
 	h2 := sha256.New()
-	tmp2, err := os.Open(tmp.Name())
+	tmp2, err := openTempForRead(tmp.Name())
 	if err != nil {
 		return Object{}, err
 	}

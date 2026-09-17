@@ -3,7 +3,6 @@ package server
 import (
 	"bytes"
 	"crypto/ed25519"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -11,6 +10,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -116,14 +116,14 @@ func createClusterKey(kind string) ([]byte, error) {
 		}
 		return json.MarshalIndent(rf, "", "  ")
 	case clusterKindProvenance, clusterKindCacheSigning:
-		_, priv, err := ed25519.GenerateKey(rand.Reader)
+		_, priv, err := ed25519.GenerateKey(randReader)
 		if err != nil {
 			return nil, err
 		}
 		return encodeEd25519PrivatePEM(priv)
 	case clusterKindWebSession:
 		b := make([]byte, 32)
-		if _, err := rand.Read(b); err != nil {
+		if _, err := io.ReadFull(randReader, b); err != nil {
 			return nil, err
 		}
 		return b, nil
@@ -159,7 +159,7 @@ func createWebSessionKey() ([]byte, error) {
 		}
 	}
 	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
+	if _, err := io.ReadFull(randReader, b); err != nil {
 		return nil, err
 	}
 	return b, nil

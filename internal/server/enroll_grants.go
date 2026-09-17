@@ -2,11 +2,11 @@ package server
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -63,7 +63,7 @@ func (s *Server) CreateEnrollGrant(ttl time.Duration, allowedLabels []string) (s
 		return "", fmt.Errorf("enroll grant ttl must be positive")
 	}
 	raw := make([]byte, 32)
-	if _, err := rand.Read(raw); err != nil {
+	if _, err := io.ReadFull(randReader, raw); err != nil {
 		return "", fmt.Errorf("generate enroll grant: %w", err)
 	}
 	token := hex.EncodeToString(raw)
@@ -228,11 +228,7 @@ func (s *Server) consumeEnrollGrant(tok string, requestLabels []string) error {
 		// retry do not see a phantom consumption. No certificate is
 		// signed for a consume that did not persist, because the caller
 		// returns on this error.
-		if existed {
-			s.EnrollGrants[digest] = prev
-		} else {
-			delete(s.EnrollGrants, digest)
-		}
+		s.EnrollGrants[digest] = prev
 		return fmt.Errorf("persist enrollment grants: %w", err)
 	}
 	return nil

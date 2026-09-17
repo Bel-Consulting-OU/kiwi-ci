@@ -69,7 +69,7 @@ func (s *Store) Key(base string, workspace string, hashFiles []string) (string, 
 			return "", err
 		}
 		io.WriteString(h, rel)
-		_, cpErr := io.Copy(h, fh)
+		_, cpErr := copyCacheDigest(h, fh)
 		fh.Close()
 		if cpErr != nil {
 			return "", cpErr
@@ -99,6 +99,14 @@ func (s *Store) Restore(key, workspace string, paths []string) (bool, error) {
 }
 
 var errRemoteNotFound = fmt.Errorf("cache entry not found on remote")
+
+// closeCacheFile and copyCacheDigest are test-only seams over os.File.Close
+// and io.Copy. Production behavior is unchanged; they let the checked
+// close-failure and copy-failure branches be exercised.
+var (
+	closeCacheFile  = (*os.File).Close
+	copyCacheDigest = io.Copy
+)
 
 func (s *Store) restoreLocal(key, workspace string, paths []string) (bool, error) {
 	f, err := os.Open(filepath.Join(s.Root, key+".tar.gz"))
@@ -154,7 +162,7 @@ func (s *Store) Save(key, workspace string, paths []string) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	if err := f.Close(); err != nil {
+	if err := closeCacheFile(f); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
@@ -208,7 +216,7 @@ func (s *Store) fetchRemote(key string) error {
 		return err
 	}
 	_, cp := io.Copy(f, resp.Body)
-	cl := f.Close()
+	cl := closeCacheFile(f)
 	if cp != nil {
 		_ = os.Remove(tmp)
 		return cp

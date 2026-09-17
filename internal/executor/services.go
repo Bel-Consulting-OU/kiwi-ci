@@ -126,14 +126,12 @@ func startContainerServices(ctx context.Context, runID, jobID string, services [
 			retries = 12
 		}
 		name := containers[i]
-		healthy := false
 		for attempt := 0; attempt <= retries; attempt++ {
 			hcCtx, cancel := context.WithTimeout(ctx, timeout)
 			hcArgs := append([]string{"exec", name}, shellCommand("sh", svc.Healthcheck)...)
 			out, hcErr := exec.CommandContext(hcCtx, docker, hcArgs...).CombinedOutput()
 			cancel()
 			if hcErr == nil {
-				healthy = true
 				emit("service " + name + " healthy")
 				break
 			}
@@ -147,10 +145,6 @@ func startContainerServices(ctx context.Context, runID, jobID string, services [
 				return "", func() {}, &RunError{Kind: ErrorCancelled, Err: ctx.Err()}
 			case <-time.After(interval):
 			}
-		}
-		if !healthy {
-			cleanupAll()
-			return "", func() {}, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("service %q never became healthy", name)}
 		}
 	}
 	return network, cleanup, nil

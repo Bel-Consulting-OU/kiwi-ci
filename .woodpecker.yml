@@ -221,17 +221,20 @@ steps:
 
   coverage:
     image: golang:1.27
-    depends_on: [unit]
+    depends_on: [unit, integration-postgres]
     environment:
       GOTOOLCHAIN: local
-      KC_MIN_COVERAGE: "60"
+      KC_MIN_COVERAGE: "95"
     when:
       - event: [push, pull_request, manual, tag]
         platform: linux/amd64
     commands:
-      - go test -coverprofile=coverage.out ./...
-      - go tool cover -func=coverage.out | tail -1
-      - ./scripts/coverage-floor.sh coverage.out
+      - go test -coverprofile=coverage.out -covermode=atomic ./...
+      # The integration lane wrote integration-coverage.out into the shared
+      # workspace; merge so the real SQL paths count toward the total.
+      - ./scripts/merge-coverage.sh merged-coverage.out coverage.out integration-coverage.out
+      - ./scripts/coverage-report.sh merged-coverage.out
+      - ./scripts/coverage-floor.sh merged-coverage.out
 
   integration-postgres:
     image: golang:1.27

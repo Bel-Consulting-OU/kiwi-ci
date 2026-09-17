@@ -14,6 +14,14 @@ import (
 
 var keyRE = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
+// fsStat and fsRename are test-only seams over os.Stat and os.Rename.
+// Production behavior is unchanged; they let the stat/rename race branches
+// be exercised deterministically.
+var (
+	fsStat   = os.Stat
+	fsRename = os.Rename
+)
+
 // FS is a filesystem-backed Store. Objects are immutable files laid out as
 // <root>/sha256/<first-2>/<full-digest>. Puts are staged and atomically
 // renamed; concurrent identical puts are idempotent.
@@ -35,8 +43,8 @@ func (s *FS) Put(ctx context.Context, key string, r io.Reader, size int64) (Obje
 		return Object{}, err
 	}
 	dst := filepath.Join(dir, key)
-	if _, err := os.Stat(dst); err == nil {
-		fi, statErr := os.Stat(dst)
+	if _, err := fsStat(dst); err == nil {
+		fi, statErr := fsStat(dst)
 		if statErr != nil {
 			return Object{}, statErr
 		}
@@ -65,9 +73,9 @@ func (s *FS) Put(ctx context.Context, key string, r io.Reader, size int64) (Obje
 		_ = os.Remove(tmp)
 		return Object{}, fmt.Errorf("blob: content digest does not match key %s", key)
 	}
-	if err := os.Rename(tmp, dst); err != nil {
+	if err := fsRename(tmp, dst); err != nil {
 		// A concurrent writer won the race: the existing object is identical.
-		if _, statErr := os.Stat(dst); statErr == nil {
+		if _, statErr := fsStat(dst); statErr == nil {
 			return Object{Key: key, SHA256: key, Size: n}, nil
 		}
 		_ = os.Remove(tmp)

@@ -78,6 +78,11 @@ func (r *Root) Close() error {
 	return r.F.Close()
 }
 
+// evalSymlinks is a test-only seam over filepath.EvalSymlinks. Production
+// behavior is unchanged; it lets the post-open canonicalization failure be
+// exercised deterministically.
+var evalSymlinks = filepath.EvalSymlinks
+
 // OpenRootNoFollow opens an existing directory as an extraction root. The
 // directory must already exist and must not be a symlink; its canonical path
 // (all symlink components resolved) is recorded once. Every later operation
@@ -88,7 +93,7 @@ func OpenRootNoFollow(path string) (*Root, error) {
 	if err != nil {
 		return nil, err
 	}
-	canonical, err := filepath.EvalSymlinks(path)
+	canonical, err := evalSymlinks(path)
 	if err != nil {
 		f.Close()
 		return nil, err
@@ -485,13 +490,26 @@ func WriteTarGzFromRoot(w io.Writer, root *WorkspaceRoot, paths []string) error 
 	return err
 }
 
+// closeEntryFile, copyEntryBytes, statArchiveEntry and walkDirFn are
+// test-only seams over os.File.Close, io.CopyN, os.File.Stat and
+// filepath.WalkDir. Production behavior is unchanged; they let the post-copy
+// close failure, a short entry read, the writer's own post-open
+// stat/regularity re-check and the root-anchored walk's entry-info race guard
+// be exercised deterministically.
+var (
+	closeEntryFile   = (*os.File).Close
+	copyEntryBytes   = io.CopyN
+	statArchiveEntry = (*os.File).Stat
+	walkDirFn        = filepath.WalkDir
+)
+
 // WriteTarGzFromRootEntries is WriteTarGzFromRoot and additionally returns
 // the regular files whose bytes were written to the stream, in write order,
 // with the digest of exactly those bytes. A manifest built from the result
 // can never disagree with the archive, even if the workspace is mutated
 // mid-capture.
 func WriteTarGzFromRootEntries(w io.Writer, root *WorkspaceRoot, paths []string) ([]ArchiveFile, error) {
-	if root == nil || root.F == nil {
+	if root == nil || root.Root == nil || root.Root.F == nil {
 		return nil, fmt.Errorf("safefs: nil workspace root")
 	}
 	entries, err := collectFromRoot(root, paths)
@@ -518,7 +536,7 @@ func WriteTarGzFromRootEntries(w io.Writer, root *WorkspaceRoot, paths []string)
 			if err != nil {
 				return fail(fmt.Errorf("safefs: open %q: %w", e.rel, err))
 			}
-			st, statErr := f.Stat()
+			st, statErr := statArchiveEntry(f)
 			if statErr != nil {
 				f.Close()
 				return fail(statErr)
@@ -540,8 +558,8 @@ func WriteTarGzFromRootEntries(w io.Writer, root *WorkspaceRoot, paths []string)
 			continue
 		}
 		hasher := sha256.New()
-		n, copyErr := io.CopyN(io.MultiWriter(tw, hasher), f, h.Size)
-		closeErr := f.Close()
+		n, copyErr := copyEntryBytes(io.MultiWriter(tw, hasher), f, h.Size)
+		closeErr := closeEntryFile(f)
 		if copyErr != nil {
 			return fail(copyErr)
 		}
@@ -602,7 +620,7 @@ func collectFromRoot(root *WorkspaceRoot, paths []string) ([]walkEntry, error) {
 			// never follow or archive a symlinked capture root
 			continue
 		}
-		err = filepath.WalkDir(abs, func(p string, d os.DirEntry, err error) error {
+		err = walkDirFn(abs, func(p string, d os.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}

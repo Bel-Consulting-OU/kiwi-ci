@@ -1,10 +1,12 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -14,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cas"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/snapshot"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
@@ -165,6 +168,22 @@ func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j mode
 		http.Error(w, "snapshot storage failed", http.StatusServiceUnavailable)
 		return
 	}
+	// Read-back verification: the bytes must be complete and content-
+	// addressed exactly as streamed. A store that truncated or altered the
+	// archive (obj digest/size disagreeing with the request hash, or the
+	// stored object failing the CAS digest check on re-read) fails the
+	// upload instead of being acknowledged; the unreferenced blob is left
+	// for the reference-aware GC.
+	wantSHA := hex.EncodeToString(h.Sum(nil))
+	if obj.SHA256 != wantSHA || obj.Size != n {
+		http.Error(w, "snapshot storage verification failed", http.StatusServiceUnavailable)
+		return
+	}
+	if err := verifyStoredSnapshot(ctx, s.CAS, wantSHA, n); err != nil {
+		s.logf("snapshot upload: stored archive verification failed: %v", err)
+		http.Error(w, "snapshot storage verification failed", http.StatusServiceUnavailable)
+		return
+	}
 	rec := model.SnapshotRecord{
 		ID:         id,
 		RunID:      j.RunID,
@@ -195,6 +214,31 @@ func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j mode
 	}
 	s.auditLocked("snapshot.uploaded", runnerID, j.RunID, j.ID, "workspace snapshot uploaded", map[string]string{"sha256": rec.SHA256})
 	writeJSON(w, http.StatusCreated, redactSnapshot(rec))
+}
+
+// verifyStoredSnapshot opens a just-written CAS object and re-hashes it,
+// guaranteeing the stored archive matches the size and digest computed while
+// the request body was streamed. CAS.Open already verifies the digest while
+// streaming; this read-back additionally proves the object is readable and
+// its size is what the record will advertise.
+func verifyStoredSnapshot(ctx context.Context, c *cas.CAS, digest string, wantSize int64) error {
+	rc, obj, err := c.Open(ctx, digest)
+	if err != nil {
+		return err
+	}
+	h := sha256.New()
+	n, copyErr := io.Copy(h, rc)
+	closeErr := rc.Close()
+	if err := firstErr(copyErr, closeErr); err != nil {
+		return err
+	}
+	if n != wantSize || obj.Size != wantSize {
+		return fmt.Errorf("stored snapshot size %d (object %d), want %d", n, obj.Size, wantSize)
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != digest {
+		return fmt.Errorf("stored snapshot digest %s, want %s", got, digest)
+	}
+	return nil
 }
 
 // listSnapshots is GET /api/v1/runs/{id}/snapshots: the manifests of every

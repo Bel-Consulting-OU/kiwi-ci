@@ -14,8 +14,14 @@ import (
 // write happens. On case-sensitive filesystems the name is returned
 // unchanged.
 func foldPath(name string) string {
-	if !caseInsensitiveFS {
+	if !foldCaseInsensitive {
 		return name
 	}
 	return norm.NFC.String(strings.ToLower(name))
 }
+
+// foldCaseInsensitive is a test-only seam over the platform
+// caseInsensitiveFS constant. Production behavior is unchanged; it lets the
+// case-sensitive branch (live on case-sensitive filesystems) be exercised on
+// a case-insensitive host.
+var foldCaseInsensitive = caseInsensitiveFS

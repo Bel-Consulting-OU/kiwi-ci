@@ -72,7 +72,7 @@ func (s *Server) checkIntent(run model.Run, name, status, conclusion, summary st
 	if s.ExternalURL != "" {
 		detailsURL = s.ExternalURL + "/?run=" + run.ID
 	}
-	payload, err := json.Marshal(forge.CheckPayload{
+	payload, err := jsonMarshal(forge.CheckPayload{
 		RepoFullName: run.RepoFullName,
 		SHA:          run.SHA,
 		Name:         name,
@@ -116,7 +116,7 @@ func (s *Server) publishGitHubStatusFromPayload(ctx context.Context, p forge.Sta
 	if p.RepoFullName == "" || p.SHA == "" {
 		return nil
 	}
-	body, err := json.Marshal(map[string]any{
+	body, err := jsonMarshal(map[string]any{
 		"state":       p.State,
 		"description": p.Description,
 		"context":     p.Context,

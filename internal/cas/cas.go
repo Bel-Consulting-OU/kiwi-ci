@@ -87,6 +87,11 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// fileSeek is a test-only seam for os.File.Seek. It exists so the error
+// branch after rewriting the temp file can be exercised; production behavior
+// is unchanged (os.File.Seek).
+var fileSeek = (*os.File).Seek
+
 func (c *CAS) Put(ctx context.Context, r io.Reader) (blob.Object, error) {
 	tmp, err := os.CreateTemp("", "kiwi-cas-*")
 	if err != nil {
@@ -100,7 +105,7 @@ func (c *CAS) Put(ctx context.Context, r io.Reader) (blob.Object, error) {
 		return blob.Object{}, err
 	}
 	key := hex.EncodeToString(h.Sum(nil))
-	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+	if _, err := fileSeek(tmp, 0, io.SeekStart); err != nil {
 		return blob.Object{}, err
 	}
 	obj, err := c.Blobs.Put(ctx, key, tmp, n)

@@ -115,7 +115,7 @@ func (n *not) Eval(c Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return boolString(v), nil
+	return boolString(!v), nil
 }
 
 func (n *not) EvalBool(c Context) (bool, error) {

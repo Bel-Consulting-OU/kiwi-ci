@@ -8,6 +8,11 @@ import (
 	"os"
 )
 
+// keyFileCreate is a test-only seam over os.OpenFile. Production behavior is
+// unchanged; it lets the checked chmod/write/exhaustion failure branches of
+// WriteOwnerOnly be exercised.
+var keyFileCreate = os.OpenFile
+
 // WriteOwnerOnly writes data to path with mode 0600. On Unix the file mode is
 // the access-control mechanism: 0600 grants read/write to the owner only, so
 // the file is owner-only by construction and no separate ACL handling exists.
@@ -18,7 +23,7 @@ import (
 func WriteOwnerOnly(path string, data []byte) error {
 	const attempts = 3
 	for i := 0; i < attempts; i++ {
-		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		f, err := keyFileCreate(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if err == nil {
 			if cerr := f.Chmod(0o600); cerr != nil {
 				f.Close()

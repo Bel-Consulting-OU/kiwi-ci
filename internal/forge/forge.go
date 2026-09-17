@@ -154,7 +154,10 @@ const (
 //   - Ref matching: tag refs (refs/tags/... or ec.Tag != "") are matched
 //     against tags/tags_ignore; branch refs against branches/branches_ignore.
 //     Patterns are path.Match globs, plus exact equality. A tag ref only
-//     matches a trigger with no ref filters or with tag filters configured.
+//     matches a trigger with no ref filters or with tag filters configured,
+//     and symmetrically a branch ref only matches a trigger with no ref
+//     filters or with branch filters configured: a tags-only trigger never
+//     admits a branch push, a branches-only trigger never admits a tag push.
 //     For pull_request/merge_request events the branch filters match
 //     ec.BaseRef — the TARGET branch the adapters supply — never the head
 //     branch; push events match ec.Ref.
@@ -220,6 +223,12 @@ func MatchesTrigger(triggers map[string]pipeline.Trigger, ec EventContext) (bool
 		branch := strings.TrimPrefix(strings.TrimPrefix(ec.Ref, "refs/heads/"), "refs/")
 		if isPullRequestEvent(ec.Event) && ec.BaseRef != "" {
 			branch = strings.TrimPrefix(strings.TrimPrefix(ec.BaseRef, "refs/heads/"), "refs/")
+		}
+		// A trigger that declares only tag filters is tag-scoped: a branch
+		// ref must not match it, symmetric with the branch-only rejection
+		// of tag refs above.
+		if len(trg.Branches) == 0 && len(trg.BranchesIgnore) == 0 && (len(trg.Tags) > 0 || len(trg.TagsIgnore) > 0) {
+			return false, ""
 		}
 		if len(trg.Branches) > 0 && !matchRefPatterns(branch, trg.Branches) {
 			return false, ""

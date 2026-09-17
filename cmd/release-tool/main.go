@@ -38,15 +38,22 @@ type releaseInput struct {
 }
 
 func main() {
-	in, err := parseFlags(os.Args[1:])
+	os.Exit(runCLI(os.Args[1:]))
+}
+
+// runCLI parses args, runs the release pipeline and returns the process exit
+// code: 2 for flag errors, 1 for failures, 0 on success.
+func runCLI(args []string) int {
+	in, err := parseFlags(args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "release-tool: %v\n", err)
-		os.Exit(2)
+		return 2
 	}
 	if err := run(in); err != nil {
 		fmt.Fprintf(os.Stderr, "release-tool: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 func parseFlags(args []string) (releaseInput, error) {

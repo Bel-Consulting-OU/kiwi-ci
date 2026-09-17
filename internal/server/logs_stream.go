@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -86,7 +85,8 @@ func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if errors.Is(err, storage.ErrNotFound) {
-				http.Error(w, "run not found", http.StatusNotFound)
+				fmt.Fprint(w, "event: done\ndata: run not found\n\n")
+				fl.Flush()
 				return
 			}
 			fmt.Fprintf(w, "event: error\ndata: %s\n\n", jsonQuote(err.Error()))
@@ -95,7 +95,7 @@ func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(entries) > 0 {
 			for _, e := range entries {
-				b, merr := json.Marshal(e)
+				b, merr := jsonMarshal(e)
 				if merr != nil {
 					continue
 				}
@@ -122,6 +122,6 @@ func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request) {
 
 // jsonQuote returns the JSON-encoded form of s.
 func jsonQuote(s string) string {
-	b, _ := json.Marshal(s)
+	b, _ := jsonMarshal(s)
 	return string(b)
 }

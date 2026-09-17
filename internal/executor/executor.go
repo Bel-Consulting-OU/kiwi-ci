@@ -480,10 +480,6 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			continue
 		}
 		matchedStep = true
-		if e.Opt.OnlyStep != "" && st.ID != e.Opt.OnlyStep && name != e.Opt.OnlyStep {
-			e.log(cj.ID, "replay", "skipped "+name+" (replaying only "+e.Opt.OnlyStep+")")
-			continue
-		}
 		ok, er := pipeline.Eval(defaultCondition(st.If), pipeline.EvalContext{Status: currentStatus, Env: cj.Job.Env, Event: e.Opt.Event, Branch: e.Opt.Branch})
 		if er != nil {
 			e.log(cj.ID, name, "condition error: "+er.Error())
@@ -747,6 +743,18 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	return finish(res)
 }
 
+// absWorkspacePath is a test-only seam over filepath.Abs. Production behavior
+// is unchanged; it lets the checked workspace-canonicalization failure
+// branches be exercised. The underlying failure is real when the process
+// working directory has been removed (getcwd ENOENT on Linux) but cannot be
+// reproduced on darwin, where getcwd keeps resolving an unlinked directory.
+var absWorkspacePath = filepath.Abs
+
+// closeSnapshotFile is a test-only seam over os.File.Close. Production
+// behavior is unchanged; it lets the checked snapshot-close failure branch be
+// exercised (matching the runner's closeRunnerTempFile seam).
+var closeSnapshotFile = (*os.File).Close
+
 // captureSnapshot archives the job workspace after its steps ran. It writes
 // under the host temp dir (filepath.Join(os.TempDir(), "kiwi-snapshots",
 // runID, jobID+".tar.gz")) using the snapshot package's own workspace scan.
@@ -768,7 +776,7 @@ func (e *Executor) captureSnapshot(jobID, workspace string) {
 		e.log(jobID, "snapshot", "warning: "+err.Error())
 		return
 	}
-	if err := f.Close(); err != nil {
+	if err := closeSnapshotFile(f); err != nil {
 		e.log(jobID, "snapshot", "warning: "+err.Error())
 		return
 	}
@@ -848,8 +856,22 @@ func depsOutcome(needs []string, statuses map[string]model.Status) (bool, model.
 func dependencyConditionAllows(expr string, status model.Status) bool {
 	return pipeline.ConditionAllows(expr, status)
 }
+
+// secureWorkingDir resolves a step's working_directory against the workspace
+// root and enforces containment on symlink-resolved (canonical) paths, so a
+// symlinked component inside the workspace cannot redirect the step outside
+// of it.
+//
+// The returned path is re-spelled under the caller's workspace root rather
+// than under the canonical root: ContainerBackend and TartBackend compare
+// the step directory against filepath.Abs(workspace) lexically (filepath.Rel)
+// to derive the in-sandbox path, and when the workspace root itself lives
+// under a symlink (macOS /var and /tmp, or a symlinked data dir) the
+// canonical path would look like it escapes the mount. The relative path was
+// verified against the canonical root, so joining it back to the original
+// root keeps containment and never widens the workspace.
 func secureWorkingDir(workspace, rel string) (string, error) {
-	root, err := filepath.Abs(workspace)
+	root, err := absWorkspacePath(workspace)
 	if err != nil {
 		return "", err
 	}
@@ -876,7 +898,7 @@ func secureWorkingDir(workspace, rel string) (string, error) {
 	if err != nil || relToRoot == ".." || strings.HasPrefix(relToRoot, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("working_directory resolves outside workspace: %q", rel)
 	}
-	return realCandidate, nil
+	return filepath.Join(root, relToRoot), nil
 }
 
 func collectNeedsOutputs(needs []string, jobs map[string]pipeline.CompiledJob, results map[string]model.JobResult) map[string]map[string]string {

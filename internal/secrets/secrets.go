@@ -48,8 +48,12 @@ func (p EnvProvider) Get(_ context.Context, name string) (string, error) {
 
 type MacKeychainProvider struct{ Service string }
 
+// goos is a test-only seam over runtime.GOOS. Production behavior is
+// unchanged; it lets the darwin guard be exercised from a darwin test run.
+var goos = runtime.GOOS
+
 func (p MacKeychainProvider) Get(ctx context.Context, name string) (string, error) {
-	if runtime.GOOS != "darwin" {
+	if goos != "darwin" {
 		return "", fmt.Errorf("macOS keychain unavailable")
 	}
 	service := p.Service

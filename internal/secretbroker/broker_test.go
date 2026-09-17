@@ -166,6 +166,19 @@ func TestOneTimeOnceOnly(t *testing.T) {
 	}
 }
 
+func TestOneTimeNilInnerFailsClosed(t *testing.T) {
+	ot := &OneTime{}
+	_, err := ot.Resolve(context.Background(), "token", SecretScope{Repository: "r", Environment: "prod"})
+	if !errors.Is(err, ErrNilInner) {
+		t.Fatalf("nil Inner resolve = %v, want ErrNilInner", err)
+	}
+	chain := ChainBroker{ot, StaticBroker{"token": "abc123"}}
+	v, err := chain.Resolve(context.Background(), "token", SecretScope{})
+	if err != nil || v != "abc123" {
+		t.Fatalf("chain with nil-Inner wrapper = (%q, %v)", v, err)
+	}
+}
+
 func TestOneTimeScopeIsolation(t *testing.T) {
 	inner := StaticBroker{"token": "abc123"}
 	ot := &OneTime{Inner: inner}

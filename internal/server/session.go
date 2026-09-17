@@ -2,10 +2,10 @@ package server
 
 import (
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"io"
 	"net/http"
 	"os"
 	"strconv"
@@ -50,7 +50,7 @@ func webSessionSecret() []byte {
 		}
 	}
 	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
+	if _, err := io.ReadFull(randReader, b); err != nil {
 		panic("kiwi server: failed to generate web session secret: " + err.Error())
 	}
 	return b
@@ -78,7 +78,7 @@ func webMAC(secret []byte, tag, payload string) string {
 // source fails.
 func newWebToken(secret []byte, tag string) (value string, expiry int64, err error) {
 	nonce := make([]byte, webSessionNonceSz)
-	if _, err = rand.Read(nonce); err != nil {
+	if _, err = io.ReadFull(randReader, nonce); err != nil {
 		return "", 0, err
 	}
 	nonceHex := hex.EncodeToString(nonce)

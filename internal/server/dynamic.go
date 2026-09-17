@@ -267,7 +267,7 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 	if err != nil {
 		return nil, err
 	}
-	policyJSON, err := json.Marshal(childCaps)
+	policyJSON, err := jsonMarshal(childCaps)
 	if err != nil {
 		return nil, err
 	}
@@ -318,7 +318,7 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 		// Untrusted children get the server-side resource ceilings just
 		// like initial enqueues, BEFORE the compiled payload is marshaled.
 		cj = s.applyUntrustedResourceCeilings(cj, parent.Trusted)
-		cjJSON, mErr := json.Marshal(cj)
+		cjJSON, mErr := jsonMarshal(cj)
 		if mErr != nil {
 			return nil, mErr
 		}

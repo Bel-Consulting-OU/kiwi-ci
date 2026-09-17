@@ -148,6 +148,23 @@ func prewarmRemovals(prev prewarmState, refs []string) (remove, keep []prewarmIt
 	return remove, keep
 }
 
+// dedupePrewarmItems removes duplicate (Ref, Kind) entries while preserving
+// the first occurrence order. A ref that was kept from the previous state is
+// pulled again on every pass, so without dedupe it would be tracked twice
+// and consume two of the maxTracked budget slots.
+func dedupePrewarmItems(items []prewarmItem) []prewarmItem {
+	out := make([]prewarmItem, 0, len(items))
+	seen := map[prewarmItem]bool{}
+	for _, item := range items {
+		if seen[item] {
+			continue
+		}
+		seen[item] = true
+		out = append(out, item)
+	}
+	return out
+}
+
 // capPrewarmItems deterministically bounds the tracked set.
 func capPrewarmItems(items []prewarmItem, max int) []prewarmItem {
 	if len(items) <= max {
@@ -321,7 +338,7 @@ func (p *prewarmer) run(ctx context.Context) error {
 		}(pr, bin)
 	}
 	wg.Wait()
-	next = capPrewarmItems(next, p.maxTracked)
+	next = capPrewarmItems(dedupePrewarmItems(next), p.maxTracked)
 	return p.saveState(prewarmState{Version: 1, Items: next})
 }
 

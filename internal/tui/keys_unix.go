@@ -41,11 +41,6 @@ func (t *termState) Restore() {
 	t.ok = false
 }
 
-const (
-	ioctlReadTermios  = 0x40487413
-	ioctlWriteTermios = 0x80487413
-)
-
 // isTerminal reports whether fd is a character device terminal.
 func isTerminal(fd uintptr) bool {
 	var term syscall.Termios

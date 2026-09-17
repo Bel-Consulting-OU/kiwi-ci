@@ -183,6 +183,12 @@ func (s *Server) reloadSchedulesDB(ctx context.Context) error {
 	return nil
 }
 
+// writeSchedulesFile is a test-only seam over the schedules-file writer
+// (marshalJSONFile): production always uses the real atomic write, tests
+// override it to fail a specific write and exercise the best-effort last_run
+// persistence branch.
+var writeSchedulesFile = marshalJSONFile
+
 // persistSchedulesLocked atomically writes fs-mode schedules. Callers hold
 // s.mu. DB mode schedules live in the SQL store; the fs file is untouched.
 func (s *Server) persistSchedulesLocked() error {
@@ -197,7 +203,7 @@ func (s *Server) persistSchedulesLocked() error {
 		f.Schedules = append(f.Schedules, sc)
 	}
 	sort.Slice(f.Schedules, func(i, j int) bool { return f.Schedules[i].ID < f.Schedules[j].ID })
-	return marshalJSONFile(joinDataDir(s.dataDir, schedulesFile), f)
+	return writeSchedulesFile(joinDataDir(s.dataDir, schedulesFile), f)
 }
 
 // listSchedules implements GET /api/v1/schedules. Authorization requires

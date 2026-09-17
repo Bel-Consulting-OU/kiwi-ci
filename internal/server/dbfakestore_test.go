@@ -86,6 +86,25 @@ type dbFakeStore struct {
 	// leave the durable pending rows in place).
 	artifactInsertErr error
 
+	// listRunsErr/getRunErr/getJobErr make the corresponding read fail with a
+	// hard store error (not ErrNotFound), and the deployment knobs make the
+	// deployment store fail: they drive fail-closed/500 paths.
+	listRunsErr         error
+	getRunErr           error
+	getJobErr           error
+	listJobsByRunErr    error
+	deploymentInsertErr error
+	listDeploymentsErr  error
+	updateDeploymentErr error
+	upsertDeliveryErr   error
+	findDeliveryErr     error
+	outboxPendingErr    error
+	listSchedulesErr    error
+	cancelRunJobsErr    error
+	// enqueueErr, when non-nil, is returned by InsertCompiledRun in place of
+	// the in-memory enqueue.
+	enqueueErr error
+
 	leaderOK  bool
 	leaderErr error
 	schemaErr error
@@ -226,6 +245,9 @@ func (f *dbFakeStore) InsertRun(ctx context.Context, run model.Run) error {
 func (f *dbFakeStore) GetRun(ctx context.Context, id string) (model.Run, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.getRunErr != nil {
+		return model.Run{}, f.getRunErr
+	}
 	r, ok := f.runs[id]
 	if !ok {
 		return model.Run{}, storage.ErrNotFound
@@ -254,6 +276,9 @@ func (f *dbFakeStore) UpdateRunStatus(ctx context.Context, id string, status mod
 func (f *dbFakeStore) ListRuns(ctx context.Context, limit int) ([]model.Run, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.listRunsErr != nil {
+		return nil, f.listRunsErr
+	}
 	out := make([]model.Run, 0, len(f.runs))
 	for _, r := range f.runs {
 		out = append(out, r)
@@ -272,6 +297,9 @@ func (f *dbFakeStore) InsertJob(ctx context.Context, job model.Job) error {
 func (f *dbFakeStore) GetJob(ctx context.Context, id string) (model.Job, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.getJobErr != nil {
+		return model.Job{}, f.getJobErr
+	}
 	j, ok := f.jobs[id]
 	if !ok {
 		return model.Job{}, storage.ErrNotFound
@@ -282,6 +310,9 @@ func (f *dbFakeStore) GetJob(ctx context.Context, id string) (model.Job, error) 
 func (f *dbFakeStore) ListJobsByRun(ctx context.Context, runID string) ([]model.Job, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.listJobsByRunErr != nil {
+		return nil, f.listJobsByRunErr
+	}
 	out := []model.Job{}
 	for _, j := range f.jobs {
 		if j.RunID == runID {
@@ -464,6 +495,9 @@ func (f *dbFakeStore) CompleteJob(ctx context.Context, jobID string, generation 
 }
 
 func (f *dbFakeStore) CancelRunJobs(ctx context.Context, runID string, reason string) ([]string, error) {
+	if f.cancelRunJobsErr != nil {
+		return nil, f.cancelRunJobsErr
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.cancelRunCalls = append(f.cancelRunCalls, cancelRunArgs{runID, reason})
@@ -739,6 +773,9 @@ func (f *dbFakeStore) HasCompletionReceipt(ctx context.Context, jobID string, ge
 }
 
 func (f *dbFakeStore) UpsertDelivery(ctx context.Context, forge, deliveryID string, runID string, payloadDigest string) error {
+	if f.upsertDeliveryErr != nil {
+		return f.upsertDeliveryErr
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deliveries[forge+"/"+deliveryID] = runID
@@ -746,6 +783,9 @@ func (f *dbFakeStore) UpsertDelivery(ctx context.Context, forge, deliveryID stri
 }
 
 func (f *dbFakeStore) FindDelivery(ctx context.Context, forge, deliveryID string) (string, bool, error) {
+	if f.findDeliveryErr != nil {
+		return "", false, f.findDeliveryErr
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	v, ok := f.deliveries[forge+"/"+deliveryID]
@@ -844,6 +884,9 @@ func (f *dbFakeStore) OutboxAck(ctx context.Context, id string) error {
 func (f *dbFakeStore) OutboxPending(ctx context.Context) ([]storage.OutboxItem, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.outboxPendingErr != nil {
+		return nil, f.outboxPendingErr
+	}
 	return append([]storage.OutboxItem(nil), f.outboxItems...), nil
 }
 
@@ -913,6 +956,9 @@ func (f *dbFakeStore) UpsertSchedule(ctx context.Context, sc storage.Schedule) e
 }
 
 func (f *dbFakeStore) ListSchedules(ctx context.Context) ([]storage.Schedule, error) {
+	if f.listSchedulesErr != nil {
+		return nil, f.listSchedulesErr
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make([]storage.Schedule, 0, len(f.schedules))
@@ -943,6 +989,9 @@ func (f *dbFakeStore) ListOccurrences(ctx context.Context, scheduleID string) ([
 func (f *dbFakeStore) InsertDeployment(ctx context.Context, d model.Deployment) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.deploymentInsertErr != nil {
+		return f.deploymentInsertErr
+	}
 	f.deployments[d.ID] = d
 	return nil
 }
@@ -950,6 +999,9 @@ func (f *dbFakeStore) InsertDeployment(ctx context.Context, d model.Deployment) 
 func (f *dbFakeStore) ListDeploymentsByRun(ctx context.Context, runID string) ([]model.Deployment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.listDeploymentsErr != nil {
+		return nil, f.listDeploymentsErr
+	}
 	out := []model.Deployment{}
 	for _, d := range f.deployments {
 		if d.RunID == runID {
@@ -962,6 +1014,9 @@ func (f *dbFakeStore) ListDeploymentsByRun(ctx context.Context, runID string) ([
 func (f *dbFakeStore) UpdateDeploymentStatus(ctx context.Context, id string, status model.Status, finishedAt *time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.updateDeploymentErr != nil {
+		return f.updateDeploymentErr
+	}
 	d, ok := f.deployments[id]
 	if !ok {
 		return storage.ErrNotFound
@@ -1159,6 +1214,9 @@ func (f *dbFakeStore) InsertCompiledRun(ctx context.Context, req storage.InsertC
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.compiledCalls = append(f.compiledCalls, req)
+	if f.enqueueErr != nil {
+		return f.enqueueErr
+	}
 	if f.enqueueFailOnce {
 		f.enqueueFailOnce = false
 		return fmt.Errorf("enqueue: injected failure")

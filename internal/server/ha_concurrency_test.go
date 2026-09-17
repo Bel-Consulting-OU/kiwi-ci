@@ -491,10 +491,7 @@ func TestHACompletionEffectsConvergeAcrossReplicas(t *testing.T) {
 	// Replica 0's completion transaction commits; the effect pass is "lost"
 	// (the replica crashes before running it). The store-level completion is
 	// exactly what CompleteJob did before the HTTP handler would reconcile.
-	hash, err := completionResultHash(model.StatusSuccess, "", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	hash := completionResultHash(model.StatusSuccess, "", nil)
 	if err := c.s[0].Sched.Complete(context.Background(), task.Job.ID, task.LeaseGeneration, ri.ID, model.StatusSuccess, "", nil, hash); err != nil {
 		t.Fatalf("store completion: %v", err)
 	}

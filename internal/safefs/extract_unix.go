@@ -28,6 +28,10 @@ func openRootHandle(path string) (*os.File, error) {
 	return os.NewFile(uintptr(fd), path), nil
 }
 
+// dupRootFD is a test-only seam over unix.Dup. Production behavior is
+// unchanged; it lets the descriptor-duplication failure be exercised.
+var dupRootFD = unix.Dup
+
 // openParentChain walks the parent components of name beneath the held root
 // descriptor one component at a time: each existing component is opened with
 // O_NOFOLLOW|O_DIRECTORY, and each missing component is created with a
@@ -36,7 +40,7 @@ func openRootHandle(path string) (*os.File, error) {
 // renames or symlink swaps above or inside the root cannot redirect the
 // write. The caller owns the returned descriptor of the deepest parent.
 func openParentChain(root *Root, name string) (int, error) {
-	fd, err := unix.Dup(int(root.F.Fd()))
+	fd, err := dupRootFD(int(root.F.Fd()))
 	if err != nil {
 		return -1, err
 	}
@@ -45,7 +49,7 @@ func openParentChain(root *Root, name string) (int, error) {
 		if p == "" {
 			continue
 		}
-		child, err := unix.Openat(fd, p, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		child, err := openatFn(fd, p, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 		if err == nil {
 			unix.Close(fd)
 			fd = child
@@ -62,7 +66,7 @@ func openParentChain(root *Root, name string) (int, error) {
 			unix.Close(fd)
 			return -1, e
 		}
-		child, err = unix.Openat(fd, p, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		child, err = openatFn(fd, p, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 		unix.Close(fd)
 		if err != nil {
 			if errors.Is(err, unix.ELOOP) {
@@ -74,6 +78,12 @@ func openParentChain(root *Root, name string) (int, error) {
 	}
 	return fd, nil
 }
+
+// openatFn is a test-only seam over unix.Openat. Production behavior is
+// unchanged; it lets the re-open failure branches after a missing-component
+// mkdirat (a TOCTOU with a concurrently appearing component) be exercised
+// deterministically.
+var openatFn = unix.Openat
 
 // mkdirNoFollow creates the directory entry name (and parents) under the
 // root handle, requiring every component to be a real directory.
@@ -88,7 +98,7 @@ func mkdirNoFollow(root *Root, name string) error {
 	if err := unix.Mkdirat(parentFd, base, 0o755); err != nil && !errors.Is(err, unix.EEXIST) {
 		return err
 	}
-	fd, err := unix.Openat(parentFd, base, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	fd, err := openatFn(parentFd, base, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		if errors.Is(err, unix.ELOOP) {
 			return ErrSymlinkParent

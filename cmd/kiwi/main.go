@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"runtime"
@@ -14,70 +16,95 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 2 {
+	os.Exit(runProgram(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+// errUnknownCommand marks a usage error; the caller must exit with status 2
+// and must not prefix the message with "kiwi:" (usage() already printed the
+// command list).
+var errUnknownCommand = errors.New("unknown command")
+
+// runProgram dispatches one kiwi invocation and returns the process exit
+// code: 0 on success, 1 when the command failed, 2 for usage errors.
+func runProgram(args []string, stdout, stderr io.Writer) int {
+	if len(args) < 1 {
 		usage()
-		os.Exit(2)
+		return 2
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	var err error
-	switch os.Args[1] {
-	case "run":
-		err = app.RunLocal(ctx, os.Args[2:])
-	case "validate":
-		err = app.Validate(os.Args[2:])
-	case "explain":
-		err = app.Explain(os.Args[2:])
-	case "doctor":
-		err = app.Doctor(os.Args[2:])
-	case "server":
-		err = app.Server(ctx, os.Args[2:])
-	case "runner":
-		err = app.Runner(ctx, os.Args[2:])
-	case "dispatch":
-		err = app.Dispatch(ctx, os.Args[2:])
-	case "import":
-		err = app.Import(os.Args[2:])
-	case "replay":
-		err = app.Replay(ctx, os.Args[2:])
-	case "init":
-		err = app.Init(os.Args[2:])
-	case "runs", "jobs", "logs", "cancel", "approve", "rerun", "artifacts", "schedules", "policy":
-		err = app.Ops(ctx, os.Args[1], os.Args[2:])
-	case "tui":
-		err = app.TUI(ctx, os.Args[2:])
-	case "database":
-		err = databaseCommand(ctx, os.Args[2:])
-	case "config":
-		err = configCommand(ctx, os.Args[2:])
-	case "version", "--version", "-v":
-		fmt.Printf("kiwi %s (%s/%s)\n", version.String(), runtime.GOOS, runtime.GOARCH)
-		if v := version.Full(); v["commit"] != "" || v["build_date"] != "" {
-			extra := ""
-			if v["commit"] != "" {
-				extra = "commit " + v["commit"]
-			}
-			if v["build_date"] != "" {
-				if extra != "" {
-					extra += " "
-				}
-				extra += "built " + v["build_date"]
-			}
-			fmt.Printf("  %s\n", extra)
-		}
-		return
-	case "help", "--help", "-h":
-		usage()
-		return
-	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
-		usage()
-		os.Exit(2)
+	err := dispatch(ctx, args, stdout, stderr)
+	if errors.Is(err, errUnknownCommand) {
+		return 2
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "kiwi:", err)
-		os.Exit(1)
+		fmt.Fprintln(stderr, "kiwi:", err)
+		return 1
+	}
+	return 0
+}
+
+// dispatch runs the subcommand named by args[0]. Unknown commands print the
+// usage text and return a nil error after reporting why on stderr.
+func dispatch(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	switch args[0] {
+	case "run":
+		return app.RunLocal(ctx, args[1:])
+	case "validate":
+		return app.Validate(args[1:])
+	case "explain":
+		return app.Explain(args[1:])
+	case "doctor":
+		return app.Doctor(args[1:])
+	case "server":
+		return app.Server(ctx, args[1:])
+	case "runner":
+		return app.Runner(ctx, args[1:])
+	case "dispatch":
+		return app.Dispatch(ctx, args[1:])
+	case "import":
+		return app.Import(args[1:])
+	case "replay":
+		return app.Replay(ctx, args[1:])
+	case "init":
+		return app.Init(args[1:])
+	case "runs", "jobs", "logs", "cancel", "approve", "rerun", "artifacts", "schedules", "policy":
+		return app.Ops(ctx, args[0], args[1:])
+	case "tui":
+		return app.TUI(ctx, args[1:])
+	case "database":
+		return databaseCommand(ctx, args[1:])
+	case "config":
+		return configCommand(ctx, args[1:])
+	case "version", "--version", "-v":
+		printVersion(stdout)
+		return nil
+	case "help", "--help", "-h":
+		usage()
+		return nil
+	default:
+		fmt.Fprintf(stderr, "unknown command %q\n\n", args[0])
+		usage()
+		return errUnknownCommand
+	}
+}
+
+// printVersion renders the build identity on stdout.
+func printVersion(stdout io.Writer) {
+	fmt.Fprintf(stdout, "kiwi %s (%s/%s)\n", version.String(), runtime.GOOS, runtime.GOARCH)
+	if v := version.Full(); v["commit"] != "" || v["build_date"] != "" {
+		extra := ""
+		if v["commit"] != "" {
+			extra = "commit " + v["commit"]
+		}
+		if v["build_date"] != "" {
+			if extra != "" {
+				extra += " "
+			}
+			extra += "built " + v["build_date"]
+		}
+		fmt.Fprintf(stdout, "  %s\n", extra)
 	}
 }
 

@@ -161,15 +161,20 @@ func (b *boundedReadCloser) Read(p []byte) (int, error) {
 }
 
 // verifyingReadCloser hashes the stream while it is read and rejects a
-// digest mismatch when the stream ends.
+// digest mismatch when the stream ends. A mismatch is latched: every later
+// Read and Close reports it instead of falling back to io.EOF or nil.
 type verifyingReadCloser struct {
 	r    io.ReadCloser
 	want string
 	h    hash.Hash
 	done bool
+	err  error
 }
 
 func (v *verifyingReadCloser) Read(p []byte) (int, error) {
+	if v.err != nil {
+		return 0, v.err
+	}
 	n, err := v.r.Read(p)
 	if n > 0 {
 		v.h.Write(p[:n])
@@ -177,10 +182,17 @@ func (v *verifyingReadCloser) Read(p []byte) (int, error) {
 	if err == io.EOF && !v.done {
 		v.done = true
 		if got := hex.EncodeToString(v.h.Sum(nil)); got != v.want {
-			return n, fmt.Errorf("cache restore digest mismatch: got %s, want %s", got, v.want)
+			v.err = fmt.Errorf("cache restore digest mismatch: got %s, want %s", got, v.want)
+			return n, v.err
 		}
 	}
 	return n, err
 }
 
-func (v *verifyingReadCloser) Close() error { return v.r.Close() }
+func (v *verifyingReadCloser) Close() error {
+	closeErr := v.r.Close()
+	if v.err != nil {
+		return v.err
+	}
+	return closeErr
+}

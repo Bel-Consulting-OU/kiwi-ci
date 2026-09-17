@@ -170,7 +170,16 @@ func SanitizeID(name string, taken map[string]bool) string {
 	}
 	base := id
 	for i := 2; taken[id]; i++ {
-		id = fmt.Sprintf("%s-%d", base, i)
+		suffix := fmt.Sprintf("-%d", i)
+		// The collision suffix must fit inside the 128-character id bound:
+		// re-truncate the base so base+suffix is never longer than 128.
+		// len(suffix) is tiny (i is bounded by the number of tracked jobs),
+		// so the keep prefix is always non-empty.
+		keep := base
+		if max := 128 - len(suffix); len(keep) > max {
+			keep = keep[:max]
+		}
+		id = keep + suffix
 	}
 	taken[id] = true
 	return id

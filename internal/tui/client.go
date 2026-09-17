@@ -186,10 +186,14 @@ func readSSE(ctx context.Context, r io.Reader, onData func(string) error) error 
 }
 
 // chunkReader adapts an arbitrary reader into line reads without bufio's
-// per-line allocation limits.
+// per-line allocation limits. It serves exactly one line per readLine call:
+// buffered bytes are drained first, and a terminal short read (data plus a
+// read error, including io.EOF) still yields every complete line before the
+// error surfaces.
 type chunkReader struct {
 	r   io.Reader
 	buf []byte
+	err error // sticky read error; reported once buf is drained
 }
 
 func newChunkReader(r io.Reader) *chunkReader { return &chunkReader{r: r} }
@@ -201,16 +205,22 @@ func (c *chunkReader) readLine() (string, error) {
 			c.buf = c.buf[i+1:]
 			return line, nil
 		}
-		p := make([]byte, 4096)
-		n, err := c.r.Read(p)
-		c.buf = append(c.buf, p[:n]...)
-		if err != nil {
+		if c.err != nil {
 			if len(c.buf) > 0 {
+				// Final line without a trailing newline.
 				line := strings.TrimRight(string(c.buf), "\r")
 				c.buf = nil
 				return line, nil
 			}
-			return "", err
+			return "", c.err
+		}
+		p := make([]byte, 4096)
+		n, err := c.r.Read(p)
+		if n > 0 {
+			c.buf = append(c.buf, p[:n]...)
+		}
+		if err != nil {
+			c.err = err
 		}
 	}
 }

@@ -73,9 +73,14 @@ func manifestForRoot(root *safefs.WorkspaceRoot) (Manifest, error) {
 // WriteTarGzFromRoot puts in the archive) so a manifest computed from the
 // filesystem and one computed from the archive agree. Each file is hashed
 // from the descriptor returned by root.OpenRel.
+// walkDir is a test-only seam over filepath.WalkDir. Production behavior is
+// unchanged; it lets the per-entry error handling be exercised with synthetic
+// entry shapes (symlinked directories, unreadable entries, escaping paths).
+var walkDir = filepath.WalkDir
+
 func collectEntries(root *safefs.WorkspaceRoot) ([]Entry, error) {
 	var out []Entry
-	err := filepath.WalkDir(root.Canonical, func(abs string, d os.DirEntry, err error) error {
+	err := walkDir(root.Canonical, func(abs string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}

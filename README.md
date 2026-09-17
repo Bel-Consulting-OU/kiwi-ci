@@ -213,8 +213,11 @@ manual run and tag executes one pipeline with these lanes:
   `examples/kiwi.yaml` (container-free; `kiwi run` needs a container runtime
   and is covered by the executor test suites).
 - `coverage`: `go test -coverprofile=coverage.out ./...` prints the total and
-  enforces the floor through `scripts/coverage-floor.sh` (default
-  `KC_MIN_COVERAGE=60`).
+  merges the unit and PostgreSQL integration profiles with
+  `scripts/merge-coverage.sh` (per-package summary via
+  `scripts/coverage-report.sh`) and enforces the floor through
+  `scripts/coverage-floor.sh` (default
+  `KC_MIN_COVERAGE=95`).
 - `integration-postgres`: a real PostgreSQL 16 service container, a
   stdlib-only readiness probe, then
   `KIWI_TEST_POSTGRES_URL=... go test -count=1 -timeout=20m -run Integration

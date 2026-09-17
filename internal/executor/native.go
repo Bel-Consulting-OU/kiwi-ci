@@ -9,6 +9,13 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
+// attachChildSupervision is a test-only seam over superviseChildNow, the
+// portable wrapper around the per-platform child supervision. Production
+// behavior is unchanged; it lets the post-Start supervision failure branch
+// (real on Windows where the Job Object assign can fail) be exercised on
+// hosts without the Windows Job Object API.
+var attachChildSupervision = superviseChildNow
+
 type NativeBackend struct{}
 
 func (*NativeBackend) Name() string { return "native" }
@@ -71,7 +78,7 @@ func (*NativeBackend) Run(ctx context.Context, c Command, emit func(string)) err
 	// materialized cmd.Process and before any supervision goroutine reads it.
 	// On Windows it creates the Job Object and assigns the just-started child
 	// before returning, so no goroutine can observe an unassigned process.
-	cleanup, err := superviseChildNow(cmd, nil)
+	cleanup, err := attachChildSupervision(cmd, nil)
 	if err != nil {
 		_ = stdout.Close()
 		_ = stderr.Close()

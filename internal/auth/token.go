@@ -30,6 +30,9 @@ func TokenDigest(raw string) string {
 
 // AddToken registers raw with principal, keyed by the token digest.
 func (t *TokenStore) AddToken(raw string, p Principal) error {
+	if t == nil {
+		return fmt.Errorf("auth: nil token store")
+	}
 	if raw == "" {
 		return fmt.Errorf("auth: token must not be empty")
 	}
@@ -44,6 +47,9 @@ func (t *TokenStore) AddToken(raw string, p Principal) error {
 
 // Authenticate resolves raw to its principal.
 func (t *TokenStore) Authenticate(raw string) (Principal, bool) {
+	if t == nil {
+		return Principal{}, false
+	}
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	p, ok := t.tokens[TokenDigest(raw)]
@@ -54,7 +60,7 @@ func (t *TokenStore) Authenticate(raw string) (Principal, bool) {
 // Used by revocable delegations (trusted schedules) that must re-check the
 // creator's CURRENT grants at execution time.
 func (t *TokenStore) PrincipalBySubject(subject string) (Principal, bool) {
-	if subject == "" {
+	if t == nil || subject == "" {
 		return Principal{}, false
 	}
 	t.mu.RLock()
@@ -69,6 +75,9 @@ func (t *TokenStore) PrincipalBySubject(subject string) (Principal, bool) {
 
 // Empty reports whether no tokens are configured.
 func (t *TokenStore) Empty() bool {
+	if t == nil {
+		return true
+	}
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return len(t.tokens) == 0
@@ -77,6 +86,9 @@ func (t *TokenStore) Empty() bool {
 // Load replaces the store contents with the JSON token file at path
 // (map of token digest to principal).
 func (t *TokenStore) Load(path string) error {
+	if t == nil {
+		return fmt.Errorf("auth: nil token store")
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -94,6 +106,9 @@ func (t *TokenStore) Load(path string) error {
 // Save atomically writes the store as a 0600 JSON file of token digests to
 // principals, creating the parent directory (0700) if needed.
 func (t *TokenStore) Save(path string) error {
+	if t == nil {
+		return fmt.Errorf("auth: nil token store")
+	}
 	t.mu.RLock()
 	m := make(map[string]Principal, len(t.tokens))
 	for k, v := range t.tokens {

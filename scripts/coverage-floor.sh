@@ -5,7 +5,7 @@
 #   coverage-floor.sh [profile]        (default: coverage.out)
 #
 # Environment:
-#   KC_MIN_COVERAGE   minimum total percentage (default: 60)
+#   KC_MIN_COVERAGE   minimum total percentage (default: 95)
 #
 # The profile is produced by the coverage lane:
 #   go test -coverprofile=coverage.out ./...
@@ -15,7 +15,7 @@
 set -eu
 
 PROFILE="${1:-coverage.out}"
-FLOOR="${KC_MIN_COVERAGE:-60}"
+FLOOR="${KC_MIN_COVERAGE:-95}"
 
 if [ ! -f "$PROFILE" ]; then
 	echo "coverage-floor: profile $PROFILE not found; run go test -coverprofile=$PROFILE ./..." >&2

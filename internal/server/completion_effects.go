@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"strings"
 	"time"
@@ -219,7 +218,7 @@ func (s *Server) runForJob(ctx context.Context, runID string) (model.Run, error)
 // queued intents become no-ops via their markers unless a crash lost the
 // inline pass, in which case the flush performs them.
 func (s *Server) enqueueCompletionEffects(j model.Job, run model.Run) error {
-	payload, err := json.Marshal(storage.CompletionEffectsPayload{JobID: j.ID, RunID: run.ID})
+	payload, err := jsonMarshal(storage.CompletionEffectsPayload{JobID: j.ID, RunID: run.ID})
 	if err != nil {
 		return err
 	}
@@ -237,7 +236,7 @@ func (s *Server) enqueueCompletionEffects(j model.Job, run model.Run) error {
 // inside the completion transaction under the deterministic effect IDs; the
 // local copies let this instance's flush loop dispatch and ack them.
 func (s *Server) enqueueCompletionEffectsLocal(jobID, runID string, generation int64) {
-	payload, err := json.Marshal(storage.CompletionEffectsPayload{JobID: jobID, RunID: runID})
+	payload, err := jsonMarshal(storage.CompletionEffectsPayload{JobID: jobID, RunID: runID})
 	if err != nil {
 		return
 	}

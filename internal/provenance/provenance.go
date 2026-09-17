@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -246,9 +247,13 @@ func VerifyWith(envelope []byte, jwksOrKey func(kid string) (ed25519.PublicKey, 
 	return st, nil
 }
 
+// randReader is a test-only seam over crypto/rand.Reader. Production
+// behavior is unchanged; it lets key-generation failures be exercised.
+var randReader io.Reader = rand.Reader
+
 // NewProvenanceKey generates a fresh Ed25519 provenance signing key pair.
 func NewProvenanceKey() (ed25519.PublicKey, ed25519.PrivateKey, error) {
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	pub, priv, err := ed25519.GenerateKey(randReader)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -344,7 +349,7 @@ func SignFile(runID, repo, commit, path string) (*Envelope, error) {
 		return nil, err
 	}
 	sum := sha256.Sum256(b)
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	pub, priv, err := ed25519.GenerateKey(randReader)
 	if err != nil {
 		return nil, err
 	}
