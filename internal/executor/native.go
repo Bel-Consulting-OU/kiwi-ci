@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"time"
 
@@ -69,36 +70,57 @@ func (*NativeBackend) Run(ctx context.Context, c Command, emit func(string)) err
 	cmd.Dir = c.Dir
 	cmd.Env = c.Env
 	configureProcess(cmd)
-	stdout, _ := cmd.StdoutPipe()
-	stderr, _ := cmd.StderrPipe()
-	if err := cmd.Start(); err != nil {
+	// Parent-owned pipes: cmd.StdoutPipe would make Wait responsible for
+	// closing the read ends, and Wait closes them as soon as it observes the
+	// child exit — which can discard buffered output when Wait wins the race
+	// against the drain goroutines (load-dependent; single-P runs reproduce
+	// it). With os.Pipe, Wait only reaps; the parent closes its write-end
+	// copies right after Start so the drains see EOF when the child exits.
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
 		return &RunError{Kind: ErrorInfra, Err: err}
 	}
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		stdoutR.Close()
+		stdoutW.Close()
+		return &RunError{Kind: ErrorInfra, Err: err}
+	}
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderrW
+	if err := cmd.Start(); err != nil {
+		stdoutR.Close()
+		stdoutW.Close()
+		stderrR.Close()
+		stderrW.Close()
+		return &RunError{Kind: ErrorInfra, Err: err}
+	}
+	stdoutW.Close()
+	stderrW.Close()
 	// superviseChildNow must run synchronously here: after cmd.Start() has
 	// materialized cmd.Process and before any supervision goroutine reads it.
 	// On Windows it creates the Job Object and assigns the just-started child
 	// before returning, so no goroutine can observe an unassigned process.
 	cleanup, err := attachChildSupervision(cmd, nil)
 	if err != nil {
-		_ = stdout.Close()
-		_ = stderr.Close()
+		_ = stdoutR.Close()
+		_ = stderrR.Close()
 		_ = terminateProcess(cmd)
 		_ = cmd.Wait()
 		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("attach child process supervision: %w", err)}
 	}
 	done := make(chan struct{}, 2)
-	go func() { defer func() { done <- struct{}{} }(); streamLines(stdout, defaultMaxLine, emit) }()
-	go func() { defer func() { done <- struct{}{} }(); streamLines(stderr, defaultMaxLine, emit) }()
+	go func() { defer func() { done <- struct{}{} }(); streamLines(stdoutR, defaultMaxLine, emit) }()
+	go func() { defer func() { done <- struct{}{} }(); streamLines(stderrR, defaultMaxLine, emit) }()
 	wait := make(chan error, 1)
 	go func() {
 		err := cmd.Wait()
 		cleanup()
+		joinDrains(done, 2*time.Second, stdoutR, stderrR)
 		wait <- err
 	}()
 	select {
 	case err := <-wait:
-		<-done
-		<-done
 		if err != nil {
 			return &RunError{Kind: ErrorFailure, Err: err}
 		}
@@ -111,8 +133,6 @@ func (*NativeBackend) Run(ctx context.Context, c Command, emit func(string)) err
 			_ = killProcess(cmd)
 			<-wait
 		}
-		<-done
-		<-done
 		kind := ErrorCancelled
 		if ctx.Err() == context.DeadlineExceeded {
 			kind = ErrorTimeout

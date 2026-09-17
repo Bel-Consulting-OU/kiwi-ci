@@ -103,7 +103,7 @@ func (c *Client) Restore(ctx context.Context, jobID string, leaseHeaders map[str
 		resp.Body.Close()
 		return nil, fmt.Errorf("cache restore %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
-	var body io.ReadCloser = resp.Body
+	body := resp.Body
 	digest := strings.TrimSpace(resp.Header.Get(HeaderCacheSHA256))
 	if digest == "" {
 		if c.Logf != nil {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -77,6 +78,31 @@ func streamLines(r io.Reader, maxLine int, emit func(string)) {
 		default:
 			// Read error: flush whatever was accumulated and stop.
 			emitLine()
+			return
+		}
+	}
+}
+
+// joinDrains waits for the two pipe drains to finish after the child has
+// been reaped, with a bounded grace: output written up to the child's exit is
+// delivered normally, while a lingering descendant that inherited a pipe can
+// never stall the job. After the grace the read ends are closed (the drains
+// flush whatever they already buffered and return).
+func joinDrains(done <-chan struct{}, grace time.Duration, readEnds ...io.Closer) {
+	drained := 0
+	deadline := time.After(grace)
+	for drained < 2 {
+		select {
+		case <-done:
+			drained++
+		case <-deadline:
+			for _, c := range readEnds {
+				_ = c.Close()
+			}
+			for drained < 2 {
+				<-done
+				drained++
+			}
 			return
 		}
 	}

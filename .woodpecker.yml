@@ -98,7 +98,10 @@ steps:
     when:
       - event: [push, pull_request, manual, tag]
     commands:
-      - go test -shuffle=on -timeout=15m ./...
+      # -vet=all runs every vet analyzer over the test sources too; the
+      # shuffle flag rotates test order per run so order-dependent state
+      # leaks surface instead of hiding behind a stable sequence.
+      - go test -vet=all -shuffle=on -timeout=15m ./...
 
   race:
     image: golang:1.27
@@ -109,6 +112,62 @@ steps:
       - event: [push, pull_request, manual, tag]
     commands:
       - go test -race -shuffle=on -timeout=15m ./...
+
+  race-double:
+    image: golang:1.27
+    depends_on: [race]
+    environment:
+      GOTOOLCHAIN: local
+    when:
+      - event: [push, pull_request, manual, tag]
+        platform: linux/amd64
+    commands:
+      # Repeat the race detector on the concurrency-critical packages: a
+      # single pass misses schedules where a race only loses under a
+      # different interleaving.
+      - go test -race -count=2 -shuffle=on -timeout=25m ./internal/server ./internal/storage ./internal/scheduler ./internal/executor ./internal/runner ./internal/secretbroker ./internal/blob ./internal/safefs
+
+  single-p:
+    image: golang:1.27
+    depends_on: [unit]
+    environment:
+      GOTOOLCHAIN: local
+      GOMAXPROCS: "1"
+    when:
+      - event: [push, pull_request, manual, tag]
+        platform: linux/amd64
+    commands:
+      # One OS thread: goroutine interleavings collapse, which is exactly
+      # how the process-output loss race (Wait closing pipes before the
+      # drains read them) was found. Never remove this lane.
+      - go test -count=1 -timeout=30m ./...
+
+  checkptr:
+    image: golang:1.27
+    depends_on: [unit]
+    environment:
+      GOTOOLCHAIN: local
+    when:
+      - event: [push, pull_request, manual, tag]
+        platform: linux/amd64
+    commands:
+      # checkptr=2 is maximally strict about unsafe pointer arithmetic and
+      # requires -race; it covers the syscall/unsafe paths (tui termios,
+      # safefs openat handling) that plain vet cannot see.
+      - go test -gcflags=all=-d=checkptr=2 -race -count=1 -timeout=40m ./...
+
+  stress:
+    image: golang:1.27
+    depends_on: [unit]
+    environment:
+      GOTOOLCHAIN: local
+    when:
+      - event: [push, pull_request, manual, tag]
+        platform: linux/amd64
+    commands:
+      # High-count concurrency/adversarial repetitions: races and
+      # lost-update bugs need many interleavings, not one.
+      - go test -run 'Concurrent|Property|Fault|HA|Parity|Adversarial' -count=10 -shuffle=on -timeout=30m ./internal/server ./internal/storage ./internal/scheduler ./internal/executor ./internal/runner
 
   adversarial:
     image: golang:1.27
@@ -130,7 +189,7 @@ steps:
       - event: [push, pull_request, manual, tag]
         platform: linux/amd64
     commands:
-      - ./scripts/fuzz-smoke.sh 10s
+      - ./scripts/fuzz-smoke.sh 30s
 
   schema:
     image: golang:1.27
@@ -194,7 +253,10 @@ steps:
         platform: linux/amd64
     commands:
       # Pinned, never floating; the shared /go volume caches the tool build.
-      - go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
+      # -checks=all with a curated exclusion list: ST1000/ST1020/ST1021
+      # (package/type comment style) and ST1003 (initialism style) are
+      # stylistic, everything else must be clean.
+      - go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 -checks=all,-ST1000,-ST1020,-ST1021,-ST1003 ./...
 
   govulncheck:
     image: golang:1.27
@@ -206,7 +268,9 @@ steps:
         platform: linux/amd64
     commands:
       # Needs network access to the vulnerability database; keep it online.
-      - go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+      # -test scans test dependencies as well: a vulnerable test-only path
+      # is still a supply-chain finding.
+      - go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 -test ./...
 
   smoke:
     image: golang:1.27

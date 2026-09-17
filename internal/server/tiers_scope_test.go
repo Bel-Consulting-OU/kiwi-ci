@@ -528,8 +528,9 @@ func TestDottedOrgVisibilityStaysStrict(t *testing.T) {
 	if s.repoVisible(req, run) {
 		t.Fatal("single-segment alias made a dotted-org run visible")
 	}
-	if !s.repoVisibleByName(req, "acme.co/service") {
-		// repoVisibleByName has no alias entry for the literal name either.
+	// repoVisibleByName has no alias entry for the literal name either.
+	if s.repoVisibleByName(req, "acme.co/service") {
+		t.Fatal("single-segment alias resolved by name")
 	}
 	// The literal full-name alias does see it.
 	literal := auth.Principal{Subject: "literal", Repositories: map[string]auth.RepositoryPermission{

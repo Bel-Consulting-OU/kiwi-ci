@@ -353,27 +353,41 @@ func shellCommand(shell, script string) []string {
 }
 
 func streamCommand(ctx context.Context, cmd *exec.Cmd, emit func(string)) error {
-	stdout, err := cmd.StdoutPipe()
+	// Parent-owned pipes: cmd.StdoutPipe hands pipe closure to Wait, which
+	// closes the read ends the moment it sees the child exit and can discard
+	// buffered output (race reproduced under single-P load). os.Pipe keeps
+	// ownership with us: Wait only reaps; we close the write ends after
+	// Start so the drains see EOF when the child exits, then join them.
+	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
 		return &RunError{Kind: ErrorInfra, Err: err}
 	}
-	stderr, err := cmd.StderrPipe()
+	stderrR, stderrW, err := os.Pipe()
 	if err != nil {
+		stdoutR.Close()
+		stdoutW.Close()
 		return &RunError{Kind: ErrorInfra, Err: err}
 	}
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderrW
 	if err := cmd.Start(); err != nil {
+		stdoutR.Close()
+		stdoutW.Close()
+		stderrR.Close()
+		stderrW.Close()
 		return &RunError{Kind: ErrorInfra, Err: err}
 	}
+	stdoutW.Close()
+	stderrW.Close()
 	done := make(chan struct{}, 2)
-	for _, r := range []io.Reader{stdout, stderr} {
+	for _, r := range []io.Reader{stdoutR, stderrR} {
 		go func(rd io.Reader) {
 			defer func() { done <- struct{}{} }()
 			streamLines(rd, defaultMaxLine, emit)
 		}(r)
 	}
 	err = cmd.Wait()
-	<-done
-	<-done
+	joinDrains(done, 2*time.Second, stdoutR, stderrR)
 	if err != nil {
 		kind := ErrorFailure
 		if ctx.Err() == context.DeadlineExceeded {

@@ -38,7 +38,22 @@ test-shuffle:
 	go test -shuffle=on -count=2 ./...
 
 test-stress:
-	go test -count=20 -run 'Property|Fault|Concurrent' ./internal/scheduler ./internal/storage ./internal/server
+	go test -run 'Concurrent|Property|Fault|HA|Parity|Adversarial' -count=10 -shuffle=on -timeout=30m ./internal/server ./internal/storage ./internal/scheduler ./internal/executor ./internal/runner
+
+# single-P collapses goroutine interleavings; it found the process-output
+# loss race (Wait closing pipes before the drains read them) and stays in CI.
+test-single-p:
+	GOMAXPROCS=1 go test -count=1 -timeout=30m ./...
+
+# checkptr=2 is maximally strict about unsafe pointer arithmetic (needs -race).
+test-checkptr:
+	go test -gcflags=all=-d=checkptr=2 -race -count=1 -timeout=40m ./...
+
+# The antagonistic battery run before every release.
+test-antagonistic: test-unit test-race test-adversarial test-stress test-single-p test-checkptr
+
+staticcheck-all:
+	go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 -checks=all,-ST1000,-ST1020,-ST1021,-ST1003 ./...
 
 fuzz:
 	./scripts/fuzz-smoke.sh 10s
@@ -46,6 +61,9 @@ fuzz:
 coverage:
 	go test -coverprofile=coverage.out -covermode=atomic ./...
 	go tool cover -func=coverage.out | tail -1
+
+coverage-report:
+	./scripts/coverage-report.sh coverage.out
 
 # CI-equivalent coverage chain, mirroring the Woodpecker `coverage` and
 # `integration-postgres` lanes exactly: unit profile, PostgreSQL integration

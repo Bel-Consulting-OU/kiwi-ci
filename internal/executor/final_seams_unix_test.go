@@ -59,17 +59,22 @@ func TestFinalStreamCommandPipeAndStartErrors(t *testing.T) {
 	ctx := context.Background()
 	emit := func(string) {}
 
+	// streamCommand owns stdout/stderr through parent-owned os.Pipes: a
+	// preset writer is deliberately overridden so output is always captured
+	// (StdoutPipe-era behavior rejected presets, but that also meant Wait
+	// owned the read ends and could discard buffered output).
 	var buf bytes.Buffer
-	cmd := exec.Command("true")
+	cmd := exec.Command("echo", "preset-overridden")
 	cmd.Stdout = &buf
-	if err := streamCommand(ctx, cmd, emit); err == nil {
-		t.Fatal("preset stdout accepted")
+	var got []string
+	if err := streamCommand(ctx, cmd, func(l string) { got = append(got, l) }); err != nil {
+		t.Fatalf("preset stdout: %v", err)
 	}
-
-	cmd = exec.Command("true")
-	cmd.Stderr = &buf
-	if err := streamCommand(ctx, cmd, emit); err == nil {
-		t.Fatal("preset stderr accepted")
+	if len(got) != 1 || got[0] != "preset-overridden" {
+		t.Fatalf("captured lines = %v, want the pipe output", got)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("preset writer received output: %q", buf.String())
 	}
 
 	cmd = exec.Command(filepath.Join(t.TempDir(), "missing-binary"))

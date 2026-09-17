@@ -400,17 +400,30 @@ func (b *TartBackend) hardenedSSHArgs(host, command string) []string {
 func (b *TartBackend) sshRunOnce(ctx context.Context, args []string, stdin io.Reader, consumeOut, consumeErr func(io.Reader) error) (int, error) {
 	cmd := exec.CommandContext(ctx, b.ssh, args...)
 	cmd.Stdin = stdin
-	stdout, err := cmd.StdoutPipe()
+	// Parent-owned pipes (see streamCommand): with StdoutPipe/StderrPipe,
+	// Wait closes the read ends as soon as the child exits and can discard
+	// buffered output; os.Pipe keeps closure with us.
+	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
 		return -1, &RunError{Kind: ErrorInfra, Err: err}
 	}
-	stderr, err := cmd.StderrPipe()
+	stderrR, stderrW, err := os.Pipe()
 	if err != nil {
+		stdoutR.Close()
+		stdoutW.Close()
 		return -1, &RunError{Kind: ErrorInfra, Err: err}
 	}
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderrW
 	if err := cmd.Start(); err != nil {
+		stdoutR.Close()
+		stdoutW.Close()
+		stderrR.Close()
+		stderrW.Close()
 		return -1, &RunError{Kind: ErrorInfra, Err: err}
 	}
+	stdoutW.Close()
+	stderrW.Close()
 	var mu sync.Mutex
 	var consumeFailure error
 	done := make(chan struct{}, 2)
@@ -424,11 +437,10 @@ func (b *TartBackend) sshRunOnce(ctx context.Context, args []string, stdin io.Re
 			mu.Unlock()
 		}
 	}
-	go drain(stdout, consumeOut)
-	go drain(stderr, consumeErr)
+	go drain(stdoutR, consumeOut)
+	go drain(stderrR, consumeErr)
 	waitErr := cmd.Wait()
-	<-done
-	<-done
+	joinDrains(done, 2*time.Second, stdoutR, stderrR)
 	exitCode := 0
 	if waitErr != nil {
 		var ee *exec.ExitError
