@@ -28,8 +28,11 @@ func (w *WorkspaceRoot) openRel(rel string) (*os.File, error) {
 		if err != nil {
 			return nil, err
 		}
-		if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+		if fi.Mode()&os.ModeSymlink != 0 {
 			return nil, ErrSymlinkParent
+		}
+		if !fi.IsDir() {
+			return nil, fmt.Errorf("%w: %q", ErrNotRegular, p)
 		}
 	}
 	target := filepath.Join(w.Canonical, filepath.FromSlash(rel))
@@ -37,8 +40,11 @@ func (w *WorkspaceRoot) openRel(rel string) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	if fi.Mode()&os.ModeSymlink != 0 || !fi.Mode().IsRegular() {
+	if fi.Mode()&os.ModeSymlink != 0 {
 		return nil, ErrSymlinkParent
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%w: %q", ErrNotRegular, rel)
 	}
 	f, err := os.Open(target)
 	if err != nil {

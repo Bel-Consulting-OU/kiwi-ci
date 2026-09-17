@@ -185,7 +185,7 @@ func TestDBModeSmoke(t *testing.T) {
 	for _, c := range f.completeCalls {
 		receipt = c.Receipt
 	}
-	job, _ := f.jobs[task.Job.ID]
+	job := f.jobs[task.Job.ID]
 	f.mu.Unlock()
 	if completions != 1 {
 		t.Fatalf("CompleteJob calls = %d, want 1 (the replay is acknowledged from the durable receipt without re-delegating)", completions)

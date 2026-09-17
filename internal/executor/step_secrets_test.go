@@ -119,7 +119,7 @@ jobs:
   probe:
     steps:
       - secrets: [step_a]
-        run: `+echoScript+`
+        run: `+yamlRun(echoScript)+`
 `)
 	ex := Executor{Opt: Options{Workspace: ws, SecretProvider: provider, Logs: sink}}
 	res, err := ex.Run(context.Background(), g)

@@ -58,7 +58,7 @@ func (s *Server) uploadArtifact(w http.ResponseWriter, r *http.Request) {
 		s.writeLeaseAuthError(w, r, authErr)
 		return
 	}
-	run := model.Run{}
+	var run model.Run
 	if s.DB != nil {
 		run, _ = s.DB.GetRun(r.Context(), j.RunID)
 	} else {

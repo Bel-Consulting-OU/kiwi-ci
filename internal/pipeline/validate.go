@@ -690,13 +690,39 @@ func validateRetry(r Retry, where string) error {
 	return nil
 }
 
-// checkRelPath rejects absolute paths and any ".." component.
+// IsPortableAbsPath reports whether p is absolute on ANY supported platform
+// (POSIX root, Windows drive designator, or UNC/backslash root), so callers
+// reject platform-dependent absolute paths regardless of the host OS.
+func IsPortableAbsPath(p string) bool { return portableAbsPath(p) }
+
+// portableAbsPath reports whether p is absolute on ANY supported platform:
+// a POSIX root, a Windows drive designator (C:...), or a UNC/backslash
+// root. Pipelines are portable artifacts, so a path that is absolute on a
+// Windows runner must be rejected even while validating on unix.
+func portableAbsPath(p string) bool {
+	if filepath.IsAbs(p) {
+		return true
+	}
+	if strings.HasPrefix(p, "/") || strings.HasPrefix(p, "\\") {
+		return true
+	}
+	if len(p) >= 2 && p[1] == ':' {
+		c := p[0]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			return true
+		}
+	}
+	return false
+}
+
+// checkRelPath rejects absolute paths (on every platform) and any ".."
+// component.
 func checkRelPath(where string, paths ...string) error {
 	for _, p := range paths {
 		if strings.TrimSpace(p) == "" {
 			continue
 		}
-		if filepath.IsAbs(p) || strings.HasPrefix(p, "/") || strings.HasPrefix(p, "\\") {
+		if portableAbsPath(p) {
 			return fmt.Errorf("%s: absolute path %q is not allowed", where, p)
 		}
 		for _, part := range strings.FieldsFunc(p, func(r rune) bool { return r == '/' || r == '\\' }) {

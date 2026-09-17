@@ -451,7 +451,9 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	s.mu.Lock()
 	s.reloadOIDCRingLocked()
-	if s.oidc == nil || now.Sub(s.oidc.NotBefore) > oidcActiveKeyMaxAge {
+	// >= (not >): coarse-clock platforms can report an exactly-zero age for
+	// a freshly created key, and a max age of 0 must mean "rotate now".
+	if s.oidc == nil || now.Sub(s.oidc.NotBefore) >= oidcActiveKeyMaxAge {
 		s.rotateOIDCKeyLocked(now)
 	}
 	signer := s.oidc

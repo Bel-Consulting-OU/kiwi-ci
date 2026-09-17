@@ -34,7 +34,7 @@ jobs:
       token: ${{ steps.out.outputs.TOKEN }}
     steps:
       - id: out
-        run: ` + script + `
+        run: ` + yamlRun(script) + `
 `))
 	if err != nil {
 		t.Fatal(err)

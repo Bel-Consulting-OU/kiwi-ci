@@ -3,6 +3,7 @@ package runner
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -54,11 +55,19 @@ func TestEffectiveChangedFilesKnownEmptyNoGitFallback(t *testing.T) {
 func withFakeGit(t *testing.T, marker string, fn func()) {
 	t.Helper()
 	bin := t.TempDir()
-	script := "#!/bin/sh\ntouch '" + marker + "'\nexit 0\n"
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+	var name, script string
+	if runtime.GOOS == "windows" {
+		// .bat is resolved through PATHEXT; cmd.exe writes the marker.
+		name = "git.bat"
+		script = "@echo off\r\necho invoked> \"" + marker + "\"\r\nexit /b 0\r\n"
+	} else {
+		name = "git"
+		script = "#!/bin/sh\ntouch '" + marker + "'\nexit 0\n"
+	}
+	if err := os.WriteFile(filepath.Join(bin, name), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	old := os.Getenv("PATH")
-	t.Setenv("PATH", bin+":"+old)
+	t.Setenv("PATH", bin+string(filepath.ListSeparator)+old)
 	fn()
 }

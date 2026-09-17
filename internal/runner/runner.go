@@ -1049,7 +1049,7 @@ func safeDownloadDest(workspace, inPath string) (string, error) {
 	dest := workspace
 	if inPath != "" {
 		clean := filepath.Clean(inPath)
-		if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		if pipeline.IsPortableAbsPath(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 			return "", fmt.Errorf("unsafe download path %q", inPath)
 		}
 		dest = filepath.Join(workspace, clean)

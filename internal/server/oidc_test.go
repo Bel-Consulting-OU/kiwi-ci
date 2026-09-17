@@ -600,10 +600,16 @@ func TestOIDCRotationPersistBeforeActivateFileMode(t *testing.T) {
 	s.mu.Lock()
 	oldKID := s.oidc.KID
 	s.mu.Unlock()
-	if err := os.Chmod(dir, 0o500); err != nil {
+	// Force the ring write to fail portably: replace the ring FILE with a
+	// DIRECTORY of the same name so the atomic write's rename step fails on
+	// every OS (chmod-based injection is a no-op under Windows ACLs).
+	ring := filepath.Join(dir, "oidc-keyring.json")
+	if err := os.Remove(ring); err != nil {
 		t.Fatal(err)
 	}
-	defer os.Chmod(dir, 0o700)
+	if err := os.Mkdir(ring, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	s.mu.Lock()
 	s.rotateOIDCKeyLocked(time.Now().UTC())
 	active := s.oidc.KID

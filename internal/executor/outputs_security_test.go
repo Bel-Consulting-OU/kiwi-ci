@@ -85,7 +85,7 @@ jobs:
   big:
     steps:
       - id: out
-        run: ` + big + `
+        run: ` + yamlRun(big) + `
 `))
 	if err != nil {
 		t.Fatal(err)

@@ -2,6 +2,7 @@ package app
 
 import (
 	"crypto/tls"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -257,8 +258,9 @@ func TestBuildBlobStoreFSFromDataDir(t *testing.T) {
 	if !ok {
 		t.Fatalf("fs backend produced %T, want *blob.FS", store)
 	}
-	if fs.Root != "/var/lib/kiwi/blobs" {
-		t.Fatalf("fs root = %q, want /var/lib/kiwi/blobs", fs.Root)
+	want := filepath.FromSlash("/var/lib/kiwi/blobs")
+	if fs.Root != want {
+		t.Fatalf("fs root = %q, want %q", fs.Root, want)
 	}
 }
 

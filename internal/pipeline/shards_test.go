@@ -248,7 +248,7 @@ func TestValidateManifestPathConfinement(t *testing.T) {
 		{"absolute", "/etc/tests.txt", "absolute path"},
 		{"parent traversal", "../tests.txt", ".. component"},
 		{"nested traversal", "a/../../tests.txt", ".. component"},
-		{"windows abs", "C:\\tests.txt", ""},
+		{"windows abs", "C:\\tests.txt", "absolute path"},
 		{"relative ok", "testdata/manifest.txt", ""},
 		{"dot ok", "./manifest.txt", ""},
 		{"empty ok", "", ""},
