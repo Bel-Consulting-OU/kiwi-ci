@@ -23,7 +23,7 @@ type memSnapshot struct {
 	receipts     map[string]model.CompletionReceipt
 	auditLen     int
 	logsLen      int
-	artifactsLen int
+	artifacts    []model.ArtifactRecord
 	reportsLen   int
 	deliveries   map[string]string
 	outbox       []OutboxItem
@@ -58,7 +58,7 @@ func (m *memStore) snapshot() memSnapshot {
 		receipts:     cloneReceipts(m.receipts),
 		auditLen:     len(m.audit),
 		logsLen:      len(m.logs),
-		artifactsLen: len(m.artifacts),
+		artifacts:    append([]model.ArtifactRecord(nil), m.artifacts...),
 		reportsLen:   len(m.reports),
 		deliveries:   cloneDeliveries(m.deliveries),
 		outbox:       append([]OutboxItem(nil), m.outbox...),
@@ -543,6 +543,50 @@ func faultOps() []opCase {
 			},
 			call: func(s Store) error {
 				return s.(OutboxStore).ReleaseOutboxClaim(ctx(), "44444444444444444444444444444444", "flusher-a")
+			},
+		},
+		{
+			name:  "UpdateRunStatus",
+			setup: seedRunAndJob,
+			call: func(s Store) error {
+				fin := time.Unix(25000, 0).UTC()
+				return s.UpdateRunStatus(ctx(), testRun.ID, model.StatusSuccess, nil, &fin)
+			},
+		},
+		{
+			name:  "UpdateJob",
+			setup: seedRunAndJob,
+			call: func(s Store) error {
+				j, err := s.GetJob(ctx(), testJob.ID)
+				if err != nil {
+					return err
+				}
+				j.QueueReason = "NO_COMPATIBLE_RUNNER"
+				return s.UpdateJob(ctx(), j)
+			},
+		},
+		{
+			name:  "ReleaseRunnerJob",
+			setup: func(m *memStore) { seedRunningJob(m); seedRunner(m) },
+			call: func(s Store) error {
+				return s.ReleaseRunnerJob(ctx(), testRunner.ID, testJob.ID, model.StatusFailure)
+			},
+		},
+		{
+			name:  "UpsertDelivery",
+			setup: seedRunAndJob,
+			call: func(s Store) error {
+				return s.UpsertDelivery(ctx(), "github", "del-1", testRun.ID, "digest-1")
+			},
+		},
+		{
+			name: "SetArtifactSidecars",
+			setup: func(m *memStore) {
+				seedRunAndJob(m)
+				_, _, _ = m.InsertArtifactOnce(ctx(), model.ArtifactRecord{ID: "dddddddddddddddddddddddddddddddd", RunID: testRun.ID, JobID: testJob.ID, Name: "bin", SHA256: "e", CreatedAt: time.Unix(1002, 0).UTC()})
+			},
+			call: func(s Store) error {
+				return s.(ArtifactSidecarStore).SetArtifactSidecars(ctx(), "dddddddddddddddddddddddddddddddd", "sbom.json", "sbom-hash", "sig.json", "sig-hash")
 			},
 		},
 		{

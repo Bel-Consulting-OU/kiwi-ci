@@ -10,3 +10,6 @@
 *.toml text eol=lf
 Makefile text eol=lf
 Dockerfile text eol=lf
+# Committed Mach-O build artifact: never run it through text conversion so
+# Windows checkouts cannot mangle it.
+filemap binary

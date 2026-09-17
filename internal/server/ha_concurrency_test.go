@@ -456,6 +456,104 @@ jobs:
 	}
 }
 
+// TestHACompletionEffectsConvergeAcrossReplicas: the completion commits on
+// replica 0 (durable receipt + in-transaction effect intents) but the process
+// dies before any effect runs. Replica 1 then replays the outbox and applies
+// every effect; replica 0's later receipt replay must not double-account. The
+// downstream link, deployment finish and usage marker converge to exactly one
+// application each.
+func TestHACompletionEffectsConvergeAcrossReplicas(t *testing.T) {
+	c := newHACluster(t)
+	for i := 0; i < 2; i++ {
+		grantEffectsCapabilities(c.s[i])
+		c.s[i].DownstreamAllowlist = map[string][]string{"acme/child": {"o/r"}}
+		c.s[i].DownstreamPipelineFetcher = func(ctx context.Context, repo, ref string) (string, error) {
+			return childPipeline, nil
+		}
+	}
+	ri := haRegisterRunner(t, c.s[0], 1)
+	// Give the runner a usage rate so the usage effect is observable.
+	c.f.mu.Lock()
+	r := c.f.runners[ri.ID]
+	r.CostPerHour = 10
+	r.PowerWatts = 25
+	c.f.runners[ri.ID] = r
+	c.f.mu.Unlock()
+	submitHAPipeline(t, c.s[0], effectsPipeline)
+	w := doJSON(t, c.s[0], http.MethodPost, "/api/v1/runners/"+ri.ID+"/next", "token", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("next: %d %s", w.Code, w.Body.String())
+	}
+	var task Task
+	if err := json.Unmarshal(w.Body.Bytes(), &task); err != nil {
+		t.Fatal(err)
+	}
+	// Replica 0's completion transaction commits; the effect pass is "lost"
+	// (the replica crashes before running it). The store-level completion is
+	// exactly what CompleteJob did before the HTTP handler would reconcile.
+	hash, err := completionResultHash(model.StatusSuccess, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.s[0].Sched.Complete(context.Background(), task.Job.ID, task.LeaseGeneration, ri.ID, model.StatusSuccess, "", nil, hash); err != nil {
+		t.Fatalf("store completion: %v", err)
+	}
+	c.f.mu.Lock()
+	j := c.f.jobs[task.Job.ID]
+	effectsQueued := 0
+	for _, it := range c.f.outboxItems {
+		if isCompletionEffectKind(it.Kind) {
+			effectsQueued++
+		}
+	}
+	c.f.mu.Unlock()
+	if j.UsageRecorded {
+		t.Fatal("usage recorded before any effect pass ran")
+	}
+	if effectsQueued != len(storage.CompletionEffectKinds()) {
+		t.Fatalf("effect intents = %d, want %d committed with the completion", effectsQueued, len(storage.CompletionEffectKinds()))
+	}
+	// Replica 1 restart-replays the durable outbox and runs the effects.
+	if err := c.s[1].outbox.ReplayDB(context.Background()); err != nil {
+		t.Fatalf("replay db: %v", err)
+	}
+	c.s[1].flushOutbox()
+	c.f.mu.Lock()
+	j = c.f.jobs[task.Job.ID]
+	_, hasLink := c.f.downstreamLinks[task.Job.ID+"\x00acme/child\x00refs/heads/main"]
+	remaining := len(c.f.outboxItems)
+	c.f.mu.Unlock()
+	if !j.UsageRecorded || j.Cost <= 0 {
+		t.Fatalf("replica-1 flush did not account usage: %+v", j)
+	}
+	if !hasLink {
+		t.Fatal("replica-1 flush did not record the downstream link")
+	}
+	if d := deploymentOfJob(t, c.f, task.Job.ID); d.FinishedAt == nil {
+		t.Fatal("replica-1 flush did not finish the deployment")
+	}
+	if remaining != 0 {
+		t.Fatalf("outbox rows after flush = %d, want 0", remaining)
+	}
+	cost := c.s[1].Metrics.counters["kiwi_usage_cost_total"][""]
+	if cost <= 0 {
+		t.Fatalf("replica-1 usage counter = %v, want the single accounting", cost)
+	}
+	// Replica 0's receipt replay reconciles again: convergence, not double
+	// accounting. Its own usage counter must stay at zero (the marker makes
+	// the effect a no-op) and no new downstream intent may appear.
+	body := fmt.Sprintf(`{"runner_id":%q,"lease_token":%q,"lease_generation":%d,"status":"success"}`, ri.ID, task.LeaseToken, task.LeaseGeneration)
+	if w := doJSONHeaders(t, c.s[0], http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/complete", "token", body, leaseHeaders(task, ri.ID)); w.Code != http.StatusNoContent {
+		t.Fatalf("receipt replay = %d: %s", w.Code, w.Body.String())
+	}
+	if got := c.s[0].Metrics.counters["kiwi_usage_cost_total"][""]; got != 0 {
+		t.Fatalf("replica-0 replay double-accounted usage: counter=%v", got)
+	}
+	if n := downstreamIntentsQueued(c.f); n != 0 {
+		t.Fatalf("replica-0 replay re-queued %d downstream intents", n)
+	}
+}
+
 // runningJobsInRun returns the run's running jobs (the "at most one running
 // lease per job" invariant checker).
 func runningJobsInRun(t *testing.T, f *dbFakeStore, runID string) []model.Job {

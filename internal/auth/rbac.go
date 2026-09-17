@@ -87,7 +87,12 @@ func Authorize(p Principal, action Action, repo string, trusted bool) bool {
 // may be keyed by the canonical repository ID (host/owner/name) or by the
 // bare full name (owner/name): a canonical lookup falls back to the bare
 // form and a bare lookup falls back to canonical keys with the same bare
-// part, so both keying conventions work.
+// part, so both keying conventions work. The bare→canonical fallback is
+// DETERMINISTIC and fails closed: when several canonical keys share the
+// bare part with DIFFERENT permission sets the lookup resolves to no entry
+// (role fallback applies) instead of depending on Go's randomized map
+// iteration order, which could otherwise flip an authorization decision
+// between calls.
 func (p Principal) repoEntry(repo string) (RepositoryPermission, bool) {
 	if perm, ok := p.Repositories[repo]; ok {
 		return perm, true
@@ -98,40 +103,56 @@ func (p Principal) repoEntry(repo string) (RepositoryPermission, bool) {
 		return perm, ok
 	}
 	// repo is a bare full name: match canonical keys whose bare part is repo.
+	var match RepositoryPermission
+	found, ambiguous := false, false
 	for key, perm := range p.Repositories {
 		if _, kb, kHost := splitCanonicalRepo(key); kHost && kb == bare {
-			return perm, true
+			if !found {
+				match, found = perm, true
+			} else if perm != match {
+				ambiguous = true
+			}
 		}
 	}
 	_ = host
+	if found && !ambiguous {
+		return match, true
+	}
 	return RepositoryPermission{}, false
 }
 
 // CanonicalRepoID renders the canonical repository identity "<host>/<fullName>"
-// (e.g. github.com/Bel-Consulting-OU/kiwi-ci). A fullName that already
-// carries a forge host is returned unchanged; an empty fullName stays empty.
-// The forge host is usually derived from the run's repo URL when the stored
-// full name lacks one.
+// (e.g. github.com/Bel-Consulting-OU/kiwi-ci). The forge host is
+// authoritative when known: a stored full name that does not already start
+// with exactly that host is prefixed with it. That keeps identities
+// host-scoped even when the first segment merely looks like a host (the
+// GitLab group "acme.co/service" previously collapsed to the bare
+// "acme.co/service", letting a github.com grant authorize a gitlab.example
+// run) and when the name embeds a different host. With no known forge host
+// the trimmed full name is returned unchanged; an empty full name stays
+// empty. The forge host is usually derived from the run's repo URL.
 func CanonicalRepoID(forgeHost, fullName string) string {
 	fullName = strings.TrimSpace(fullName)
 	if fullName == "" {
 		return ""
 	}
-	if parts := strings.SplitN(fullName, "/", 2); len(parts) == 2 && strings.Contains(parts[0], ".") {
-		return fullName
-	}
 	host := strings.TrimSpace(forgeHost)
-	if host == "" {
+	if host == "" || strings.HasPrefix(fullName, host+"/") {
 		return fullName
 	}
 	return host + "/" + fullName
 }
 
 // splitCanonicalRepo splits a canonical "host/owner/name" ID into host and
-// bare "owner/name" parts, reporting whether the input carried a host.
+// bare "owner/name" parts, reporting whether the input carried a host. A
+// dotted first segment alone is not enough: a canonical ID always carries
+// owner/name after the host, so the remainder must itself contain a slash.
+// Without that rule a GitLab group with a dot in its name ("acme.co/service")
+// would be misread as host "acme.co" + bare "service", and an unrelated bare
+// alias "service" would match it.
 func splitCanonicalRepo(repo string) (host, bare string, hasHost bool) {
 	parts := strings.SplitN(repo, "/", 2)
-	if len(parts) == 2 && strings.Contains(parts[0], ".") {
+	if len(parts) == 2 && strings.Contains(parts[0], ".") && strings.Contains(parts[1], "/") {
 		return parts[0], parts[1], true
 	}
 	return "", repo, false

@@ -50,7 +50,7 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
           go-version-file: go.mod
-      - run: go test -shuffle=on ./...
+      - run: go test -shuffle=on -timeout=15m ./...
 
   race:
     strategy:
@@ -65,7 +65,7 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
           go-version-file: go.mod
-      - run: go test -race -shuffle=on ./...
+      - run: go test -race -shuffle=on -timeout=15m ./...
 
   # Windows has no race detector, so the concurrent-heavy packages get a
   # high-count stress lane instead to shake out flaky parallel tests.
@@ -128,8 +128,9 @@ jobs:
 
   # Installs staticcheck with the repo Go toolchain (setup-go above) rather
   # than the staticcheck-action's separate Go install, so analysis uses the
-  # same compiler the repo builds with. honnef.co/go/tools v0.6.1 is
-  # staticcheck 2025.1.1, the latest release compatible with Go 1.23.
+  # same compiler the repo builds with. honnef.co/go/tools v0.8.1
+  # (staticcheck 2026.2.1) understands the Go 1.27 export data; v0.6.1
+  # cannot decode it and fails every package with import errors.
   staticcheck:
     runs-on: ubuntu-latest
     steps:
@@ -147,17 +148,17 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/go/bin
-          key: ${{ runner.os }}-staticcheck-v0.6.1-${{ hashFiles('go.sum') }}
+          key: ${{ runner.os }}-staticcheck-v0.8.1-${{ hashFiles('go.sum') }}
           restore-keys: |
-            ${{ runner.os }}-staticcheck-v0.6.1-
+            ${{ runner.os }}-staticcheck-v0.8.1-
       - name: Install staticcheck
-        run: go install honnef.co/go/tools/cmd/staticcheck@v0.6.1
+        run: go install honnef.co/go/tools/cmd/staticcheck@v0.8.1
       - name: staticcheck
         run: staticcheck ./...
 
   # govulncheck runs directly under the repo Go toolchain (go run with a
   # pinned module version) for toolchain consistency. golang.org/x/vuln
-  # v1.1.4 is the latest release compatible with Go 1.23.
+  # v1.8.0 is the current release line for Go 1.27.
   govulncheck:
     runs-on: ubuntu-latest
     steps:
@@ -171,11 +172,11 @@ jobs:
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: ~/go/pkg/mod
-          key: ${{ runner.os }}-govulncheck-v1.1.4-${{ hashFiles('go.sum') }}
+          key: ${{ runner.os }}-govulncheck-v1.8.0-${{ hashFiles('go.sum') }}
           restore-keys: |
-            ${{ runner.os }}-govulncheck-v1.1.4-
+            ${{ runner.os }}-govulncheck-v1.8.0-
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
 
   license:
     runs-on: ubuntu-latest

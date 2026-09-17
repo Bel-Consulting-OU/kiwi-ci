@@ -157,6 +157,10 @@ type VerifyOptions struct {
 	Job        string
 	Builder    string
 	Issuer     string
+	// Digest, when non-empty, must equal the sha256 digest of the first
+	// subject. Callers that consumed artifact bytes should always set it so
+	// the signature is bound to exactly those bytes.
+	Digest     string
 	TrustedKey ed25519.PublicKey
 }
 
@@ -211,6 +215,17 @@ func VerifyWith(envelope []byte, jwksOrKey func(kid string) (ed25519.PublicKey, 
 	if st.Type != StatementType {
 		return Statement{}, fmt.Errorf("provenance: unexpected statement type %q", st.Type)
 	}
+	// A provenance statement without a subject (or with a subject that carries
+	// no digest) binds nothing: reject it rather than return a statement that
+	// a caller could mistake for a verified artifact binding.
+	if len(st.Subject) == 0 {
+		return Statement{}, fmt.Errorf("provenance: statement has no subject")
+	}
+	for _, s := range st.Subject {
+		if s.Digest["sha256"] == "" {
+			return Statement{}, fmt.Errorf("provenance: subject %q has no sha256 digest", s.Name)
+		}
+	}
 	ep := st.Predicate.BuildDefinition.ExternalParameters
 	for _, c := range []struct {
 		want, got string
@@ -222,6 +237,7 @@ func VerifyWith(envelope []byte, jwksOrKey func(kid string) (ed25519.PublicKey, 
 		{opts.Job, fmt.Sprint(ep["job"]), "job"},
 		{opts.Builder, st.Predicate.RunDetails.Builder.ID, "builder"},
 		{opts.Issuer, st.Issuer, "issuer"},
+		{opts.Digest, st.Subject[0].Digest["sha256"], "subject digest"},
 	} {
 		if c.want != "" && c.got != c.want {
 			return Statement{}, fmt.Errorf("provenance: %s mismatch: want %q, got %q", c.label, c.want, c.got)

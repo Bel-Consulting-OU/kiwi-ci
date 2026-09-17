@@ -25,7 +25,7 @@ func (w *WorkspaceRoot) openRel(rel string) (*os.File, error) {
 	rootFd := int(w.F.Fd())
 	if fd, handled, err := openRelPlatform(rootFd, rel); handled {
 		if err != nil {
-			return nil, err
+			return nil, mapSpecialFileError(err, rel)
 		}
 		return w.verifiedFile(fd, rel)
 	} else if err != nil {
@@ -33,21 +33,37 @@ func (w *WorkspaceRoot) openRel(rel string) (*os.File, error) {
 	}
 	fd, err := openRelWalk(rootFd, rel)
 	if err != nil {
-		return nil, err
+		return nil, mapSpecialFileError(err, rel)
 	}
 	return w.verifiedFile(fd, rel)
+}
+
+// mapSpecialFileError reports the OS refusals that mean "this path is a
+// special file, not an openable regular file" (opening a unix socket yields
+// ENXIO/ENODEV on some systems, ENOTSUP on others) as ErrNotRegular so the
+// no-follow read contract has one failure shape for FIFOs, sockets and
+// devices alike.
+func mapSpecialFileError(err error, rel string) error {
+	if errors.Is(err, unix.ENXIO) || errors.Is(err, unix.ENODEV) || errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP) {
+		return fmt.Errorf("%w: %q", ErrNotRegular, rel)
+	}
+	return err
 }
 
 // openRelWalk opens rel beneath the held root descriptor one component at a
 // time. Every intermediate component is opened with O_NOFOLLOW|O_DIRECTORY
 // and the final component with O_NOFOLLOW, so no symlink anywhere in the
-// chain can redirect the open. The caller owns the returned descriptor.
+// chain can redirect the open. O_NONBLOCK is included so opening a FIFO in
+// the workspace returns immediately instead of blocking until a writer
+// appears; regular files are unaffected by O_NONBLOCK and the final
+// descriptor is fstat-verified to be a regular file. The caller owns the
+// returned descriptor.
 func openRelWalk(rootFd int, rel string) (int, error) {
 	fd := rootFd
 	opened := false
 	parts := strings.Split(rel, "/")
 	for i, p := range parts {
-		flags := unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_CLOEXEC
+		flags := unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_CLOEXEC | unix.O_NONBLOCK
 		if i < len(parts)-1 {
 			flags |= unix.O_DIRECTORY
 		}

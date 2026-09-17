@@ -10,7 +10,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -371,15 +373,44 @@ func (s *Server) reloadOIDCRingLocked() {
 	s.oidc = signer
 }
 
+// oidcIssuer validates and returns the OIDC issuer identifier. The value
+// must be an absolute HTTPS URL; plaintext HTTP is tolerated only for a
+// genuine loopback host (local development), never for a lookalike
+// hostname like "localhost.evil.example" or "127.0.0.1.attacker.test".
+// Userinfo, queries and fragments are rejected because an OIDC issuer
+// identifier must be a bare origin(+path) URL.
 func (s *Server) oidcIssuer() (string, error) {
 	v := strings.TrimRight(s.ExternalURL, "/")
 	if v == "" {
 		return "", fmt.Errorf("KIWI_EXTERNAL_URL/--external-url is required for OIDC")
 	}
-	if !strings.HasPrefix(v, "https://") && !strings.HasPrefix(v, "http://127.0.0.1") && !strings.HasPrefix(v, "http://localhost") {
-		return "", fmt.Errorf("OIDC issuer must use HTTPS")
+	u, err := url.Parse(v)
+	if err != nil || u.Host == "" || u.Opaque != "" {
+		return "", fmt.Errorf("OIDC issuer must be an absolute URL")
 	}
-	return v, nil
+	if u.User != nil {
+		return "", fmt.Errorf("OIDC issuer must not carry userinfo")
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("OIDC issuer must not carry a query or fragment")
+	}
+	if u.Scheme == "https" {
+		return v, nil
+	}
+	if u.Scheme == "http" && isLoopbackHost(u.Hostname()) {
+		return v, nil
+	}
+	return "", fmt.Errorf("OIDC issuer must use HTTPS")
+}
+
+// isLoopbackHost reports whether host is a genuine loopback name or
+// address ("localhost", 127.0.0.0/8, ::1) — never a prefix lookalike.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (s *Server) oidcConfiguration(w http.ResponseWriter, r *http.Request) {

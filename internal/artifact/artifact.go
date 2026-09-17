@@ -31,9 +31,10 @@ func Default() *Store {
 // files are never captured, capture roots that resolve outside the workspace
 // are rejected, and the archive output is hard-capped at MaxArtifactBytes.
 // Every workspace read goes through a held safefs.WorkspaceRoot: files are
-// opened relative to the root handle (no-follow) and hashed from the
-// returned descriptors, never re-opened by name, so a file swapped for a
-// symlink mid-capture can never exfiltrate host content.
+// opened relative to the root handle (no-follow) and the manifest is built
+// from the exact bytes written into the archive, so the manifest can never
+// describe different content than the archive even when the workspace is
+// mutated mid-capture.
 func (s *Store) Save(runID, jobID, name, workspace string, paths []string) (string, error) {
 	wsRoot, err := safefs.OpenWorkspaceRoot(workspace)
 	if err != nil {
@@ -55,17 +56,12 @@ func (s *Store) Save(runID, jobID, name, workspace string, paths []string) (stri
 	if err != nil {
 		return "", err
 	}
-	entries, err := collectEntries(wsRoot, paths)
-	if err != nil {
-		f.Close()
-		_ = os.Remove(dst + ".tmp")
-		return "", err
-	}
 	var w io.Writer = f
 	if s.MaxArtifactBytes > 0 {
 		w = safefs.NewCappedWriter(f, s.MaxArtifactBytes)
 	}
-	if err := safefs.WriteTarGzFromRoot(w, wsRoot, paths); err != nil {
+	archived, err := safefs.WriteTarGzFromRootEntries(w, wsRoot, paths)
+	if err != nil {
 		f.Close()
 		_ = os.Remove(dst + ".tmp")
 		return "", err
@@ -87,6 +83,11 @@ func (s *Store) Save(runID, jobID, name, workspace string, paths []string) (stri
 	if cpErr != nil {
 		return "", cpErr
 	}
+	entries := make([]ArtifactEntry, 0, len(archived))
+	for _, e := range archived {
+		entries = append(entries, ArtifactEntry{Path: e.Path, Mode: uint32(e.Mode), Size: e.Size, SHA256: e.SHA256})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
 	m := ArtifactManifest{
 		Version:   1,
 		Name:      name,
@@ -148,79 +149,6 @@ func encodeArtifactName(s string) string {
 		return s
 	}
 	return base64.RawURLEncoding.EncodeToString([]byte(s))
-}
-
-// collectEntries walks the requested capture paths beneath the held
-// workspace root and records every regular file, hashing each one from the
-// descriptor returned by OpenRel (no-follow, anchored to the root handle).
-// Symlinked capture roots and nested symlinks are never captured; a file
-// swapped for a symlink between enumeration and open fails the collection
-// instead of following the link.
-func collectEntries(root *safefs.WorkspaceRoot, paths []string) ([]ArtifactEntry, error) {
-	var out []ArtifactEntry
-	for _, p := range paths {
-		rel := p
-		if rel == "" || rel == "." {
-			rel = ""
-		}
-		if rel != "" {
-			rel = filepath.ToSlash(rel)
-		}
-		abs := root.Canonical
-		if rel != "" {
-			abs = filepath.Join(root.Canonical, filepath.FromSlash(rel))
-		}
-		fi, err := os.Lstat(abs)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return nil, err
-		}
-		if fi.Mode()&os.ModeSymlink != 0 {
-			// Symlinked capture roots are never followed or archived.
-			continue
-		}
-		err = filepath.WalkDir(abs, func(p string, d os.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			if d.Type()&os.ModeSymlink != 0 {
-				return nil
-			}
-			if d.IsDir() {
-				return nil
-			}
-			info, err := d.Info()
-			if err != nil {
-				return err
-			}
-			if !info.Mode().IsRegular() {
-				return nil
-			}
-			r, err := filepath.Rel(root.Canonical, p)
-			if err != nil || r == ".." || strings.HasPrefix(r, ".."+string(filepath.Separator)) {
-				return fmt.Errorf("artifact: path escapes workspace: %q", p)
-			}
-			f, err := root.OpenRel(filepath.ToSlash(r))
-			if err != nil {
-				return err
-			}
-			h := sha256.New()
-			size, cpErr := io.Copy(h, f)
-			f.Close()
-			if cpErr != nil {
-				return cpErr
-			}
-			out = append(out, ArtifactEntry{Path: filepath.ToSlash(r), Mode: uint32(info.Mode().Perm()), Size: size, SHA256: hex.EncodeToString(h.Sum(nil))})
-			return nil
-		})
-		if err != nil {
-			return nil, err
-		}
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
-	return out, nil
 }
 
 // Extract restores a tar.gz artifact under dest using the hardened safefs

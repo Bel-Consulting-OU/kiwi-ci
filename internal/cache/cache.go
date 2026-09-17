@@ -8,11 +8,22 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/safefs"
 )
+
+// cacheKeyRE is the accepted archive key shape: an alphanumeric first
+// character followed by up to 127 [A-Za-z0-9._-] characters. Keys produced
+// by Key are hex SHA-256 digests (a strict subset); the wider shape keeps
+// caller-supplied keys usable while rejecting path separators, "..",
+// absolute paths and URL-hostile characters, so no store operation (local
+// path or remote URL) can address anything outside the cache root.
+var cacheKeyRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+
+func validKey(key string) bool { return cacheKeyRE.MatchString(key) }
 
 // Store is a content-addressed cache archive store. Extraction goes through
 // safefs (no symlink following, hard resource limits). When RemoteURL is set
@@ -68,6 +79,9 @@ func (s *Store) Key(base string, workspace string, hashFiles []string) (string, 
 }
 
 func (s *Store) Restore(key, workspace string, paths []string) (bool, error) {
+	if !validKey(key) {
+		return false, fmt.Errorf("cache: invalid cache key")
+	}
 	hit, err := s.restoreLocal(key, workspace, paths)
 	if err != nil || hit {
 		return hit, err
@@ -112,6 +126,9 @@ func (s *Store) restoreLocal(key, workspace string, paths []string) (bool, error
 }
 
 func (s *Store) Save(key, workspace string, paths []string) error {
+	if !validKey(key) {
+		return fmt.Errorf("cache: invalid cache key")
+	}
 	if err := os.MkdirAll(s.Root, 0o755); err != nil {
 		return err
 	}
@@ -162,6 +179,9 @@ func (s *Store) client() *http.Client {
 }
 
 func (s *Store) fetchRemote(key string) error {
+	if !validKey(key) {
+		return fmt.Errorf("cache: invalid cache key")
+	}
 	req, err := http.NewRequest(http.MethodGet, s.RemoteURL+"/api/v1/cache/"+key, nil)
 	if err != nil {
 		return err
@@ -201,6 +221,9 @@ func (s *Store) fetchRemote(key string) error {
 }
 
 func (s *Store) pushRemote(key string) error {
+	if !validKey(key) {
+		return fmt.Errorf("cache: invalid cache key")
+	}
 	path := filepath.Join(s.Root, key+".tar.gz")
 	f, err := os.Open(path)
 	if err != nil {

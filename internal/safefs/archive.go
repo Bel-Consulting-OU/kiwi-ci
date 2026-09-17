@@ -7,6 +7,8 @@ package safefs
 import (
 	"archive/tar"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -282,8 +284,8 @@ func cleanEntryName(name string) (string, error) {
 	if strings.HasPrefix(name, "/") {
 		return "", fmt.Errorf("absolute path %q", name)
 	}
-	if strings.ContainsRune(name, 0x7f) {
-		return "", fmt.Errorf("control byte in name")
+	if err := checkNameRunes(name); err != nil {
+		return "", err
 	}
 	clean := path.Clean(name)
 	if clean == "." || clean == "" {
@@ -293,8 +295,73 @@ func cleanEntryName(name string) (string, error) {
 		if comp == ".." {
 			return "", fmt.Errorf("parent traversal in %q", name)
 		}
+		if err := checkNameComponent(comp); err != nil {
+			return "", err
+		}
 	}
 	return clean, nil
+}
+
+// ValidateEntryName exposes the archive entry-name discipline to packages
+// that build manifests from untrusted tar streams (for example snapshot
+// parsing) so what they accept can never diverge from what Extract will
+// accept. It returns the cleaned relative path.
+func ValidateEntryName(name string) (string, error) { return cleanEntryName(name) }
+
+// FoldPath returns the duplicate-detection fold for an entry name: on
+// case-insensitive filesystems it lowercases and Unicode-normalizes (NFC)
+// so case-only and NFC/NFD-only collisions, which a case-insensitive
+// filesystem would silently merge, are rejected before any write. On
+// case-sensitive filesystems the name is returned unchanged.
+func FoldPath(name string) string { return foldPath(name) }
+
+// checkNameRunes rejects characters that would let an entry name spoof,
+// inject into, or confuse terminal/log output: C0 controls, DEL, and the
+// Unicode bidirectional formatting controls with no legitimate use in a
+// file name.
+func checkNameRunes(name string) error {
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("control character %#U in name %q", r, name)
+		}
+		if (r >= 0x202A && r <= 0x202E) || (r >= 0x2066 && r <= 0x2069) || r == 0x200E || r == 0x200F {
+			return fmt.Errorf("unicode formatting control %#U in name %q", r, name)
+		}
+	}
+	return nil
+}
+
+// checkNameComponent rejects path components that are not portable across
+// the supported platforms: Windows reserved device names (CON, NUL,
+// COM1..9, LPT1..9, CONIN$/CONOUT$), names with a trailing dot or space
+// (Win32 silently strips them, so two distinct entries would merge), and
+// colons (which address NTFS alternate data streams instead of a file).
+// Rejecting them everywhere keeps extraction fail-closed and portable.
+func checkNameComponent(comp string) error {
+	if comp == "" {
+		return fmt.Errorf("empty path component")
+	}
+	if strings.HasSuffix(comp, ".") || strings.HasSuffix(comp, " ") {
+		return fmt.Errorf("component %q ends with a dot or space", comp)
+	}
+	if strings.ContainsRune(comp, ':') {
+		return fmt.Errorf("component %q contains a colon", comp)
+	}
+	base := comp
+	if i := strings.IndexByte(base, '.'); i >= 0 {
+		base = base[:i]
+	}
+	switch strings.ToUpper(base) {
+	case "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$":
+		return fmt.Errorf("component %q is a reserved device name", comp)
+	}
+	if len(base) == 4 {
+		u := strings.ToUpper(base)
+		if (strings.HasPrefix(u, "COM") || strings.HasPrefix(u, "LPT")) && u[3] >= '1' && u[3] <= '9' {
+			return fmt.Errorf("component %q is a reserved device name", comp)
+		}
+	}
+	return nil
 }
 
 func pathDepth(name string) int {
@@ -390,66 +457,125 @@ func writeTarGzFollowing(w io.Writer, workspace string, paths []string) error {
 	return gz.Close()
 }
 
+// ArchiveFile describes one regular file that was written into an archive,
+// with the digest of the exact bytes that reached the tar stream. Callers use
+// it to build a manifest that is consistent with the archive by
+// construction: there is no second walk of the filesystem that a concurrent
+// writer could race against.
+type ArchiveFile struct {
+	Path    string
+	Mode    int64
+	Size    int64
+	SHA256  string
+	ModTime time.Time
+}
+
 // WriteTarGzFromRoot writes a deterministic tar.gz of the given
 // workspace-relative paths, reading every file through the held
 // WorkspaceRoot descriptor: each regular file is opened with OpenRel
-// (no-follow, anchored to the root handle) and its content is copied from
-// that descriptor only, never re-opened by name. A file swapped for a
-// symlink after validation either yields the originally opened bytes or
-// fails the archive — content from outside the workspace can never be
-// written. Symlinks and special files are never written.
+// (no-follow, anchored to the root handle) at write time and its content is
+// copied from that descriptor only, never re-opened by name, and only one
+// descriptor is held at a time so a large workspace cannot exhaust file
+// descriptors. A file swapped for a symlink before it is opened fails the
+// archive; a file deleted after its descriptor was opened is still archived
+// from that descriptor (on POSIX). Symlinks and special files are never
+// written.
 func WriteTarGzFromRoot(w io.Writer, root *WorkspaceRoot, paths []string) error {
+	_, err := WriteTarGzFromRootEntries(w, root, paths)
+	return err
+}
+
+// WriteTarGzFromRootEntries is WriteTarGzFromRoot and additionally returns
+// the regular files whose bytes were written to the stream, in write order,
+// with the digest of exactly those bytes. A manifest built from the result
+// can never disagree with the archive, even if the workspace is mutated
+// mid-capture.
+func WriteTarGzFromRootEntries(w io.Writer, root *WorkspaceRoot, paths []string) ([]ArchiveFile, error) {
 	if root == nil || root.F == nil {
-		return fmt.Errorf("safefs: nil workspace root")
+		return nil, fmt.Errorf("safefs: nil workspace root")
 	}
 	entries, err := collectFromRoot(root, paths)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer func() {
-		for _, e := range entries {
-			if e.f != nil {
-				_ = e.f.Close()
-			}
-		}
-	}()
 	gz := gzip.NewWriter(w)
 	tw := tar.NewWriter(gz)
-	fail := func(e error) error {
+	fail := func(e error) ([]ArchiveFile, error) {
 		_ = tw.Close()
 		_ = gz.Close()
-		return e
+		return nil, e
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].rel < entries[j].rel })
+	var files []ArchiveFile
 	for _, e := range entries {
 		if e.rel == "" || e.rel == "." || e.rel == "./" {
 			continue
 		}
 		h := &tar.Header{Name: e.rel, Mode: e.mode, Size: e.size, ModTime: e.modTime, Typeflag: e.typeflag}
+		var f *os.File
+		if e.typeflag == tar.TypeReg {
+			f, err = root.OpenRel(e.rel)
+			if err != nil {
+				return fail(fmt.Errorf("safefs: open %q: %w", e.rel, err))
+			}
+			st, statErr := f.Stat()
+			if statErr != nil {
+				f.Close()
+				return fail(statErr)
+			}
+			if !st.Mode().IsRegular() {
+				f.Close()
+				return fail(fmt.Errorf("%w: %q", ErrNotRegular, e.rel))
+			}
+			h.Size = st.Size()
+			h.ModTime = st.ModTime()
+		}
 		if err := tw.WriteHeader(h); err != nil {
+			if f != nil {
+				f.Close()
+			}
 			return fail(err)
 		}
-		if e.typeflag == tar.TypeReg {
-			n, err := io.CopyN(tw, e.f, e.size)
-			if err != nil {
-				return fail(err)
-			}
-			if n != e.size {
-				return fail(fmt.Errorf("safefs: %q: short read: %d of %d bytes", e.rel, n, e.size))
-			}
+		if f == nil {
+			continue
 		}
+		hasher := sha256.New()
+		n, copyErr := io.CopyN(io.MultiWriter(tw, hasher), f, h.Size)
+		closeErr := f.Close()
+		if copyErr != nil {
+			return fail(copyErr)
+		}
+		if closeErr != nil {
+			return fail(closeErr)
+		}
+		if n != h.Size {
+			return fail(fmt.Errorf("safefs: %q: short read: %d of %d bytes", e.rel, n, h.Size))
+		}
+		files = append(files, ArchiveFile{
+			Path:    e.rel,
+			Mode:    e.mode,
+			Size:    n,
+			SHA256:  hex.EncodeToString(hasher.Sum(nil)),
+			ModTime: h.ModTime,
+		})
 	}
 	if err := tw.Close(); err != nil {
-		return fail(err)
+		_ = gz.Close()
+		return nil, err
 	}
-	return gz.Close()
+	if err := gz.Close(); err != nil {
+		return nil, err
+	}
+	return files, nil
 }
 
 // collectFromRoot walks the requested paths beneath the workspace root and
-// records every regular file with its descriptor already opened via
-// OpenRel. Symlink components are never followed; a symlink capture root is
-// skipped (matching WriteTarGz's historical behavior) and nested symlinks
-// are never archived.
+// records every regular file and directory. No descriptor is held here:
+// regular files are opened by the writer immediately before their bytes are
+// read, so a capture never keeps one descriptor per workspace file open.
+// Symlink components are never followed; a symlink capture root is skipped
+// (matching WriteTarGz's historical behavior) and nested symlinks are never
+// archived.
 func collectFromRoot(root *WorkspaceRoot, paths []string) ([]walkEntry, error) {
 	seen := map[string]bool{}
 	var out []walkEntry
@@ -493,31 +619,18 @@ func collectFromRoot(root *WorkspaceRoot, paths []string) ([]walkEntry, error) {
 				return fmt.Errorf("safefs: duplicate path %q", r)
 			}
 			seen[r] = true
-			if d.IsDir() {
-				info, err := d.Info()
-				if err != nil {
-					return err
-				}
-				out = append(out, walkEntry{abs: p, rel: r + "/", mode: 0o755, modTime: info.ModTime(), typeflag: tar.TypeDir})
-				return nil
-			}
 			info, err := d.Info()
 			if err != nil {
 				return err
 			}
+			if d.IsDir() {
+				out = append(out, walkEntry{rel: r + "/", mode: 0o755, modTime: info.ModTime(), typeflag: tar.TypeDir})
+				return nil
+			}
 			if !info.Mode().IsRegular() {
 				return nil
 			}
-			f, err := root.OpenRel(r)
-			if err != nil {
-				return err
-			}
-			st, err := f.Stat()
-			if err != nil {
-				f.Close()
-				return err
-			}
-			out = append(out, walkEntry{abs: p, rel: r, size: st.Size(), mode: 0o644, modTime: st.ModTime(), typeflag: tar.TypeReg, f: f})
+			out = append(out, walkEntry{rel: r, size: info.Size(), mode: 0o644, modTime: info.ModTime(), typeflag: tar.TypeReg})
 			return nil
 		})
 		if err != nil {
@@ -528,12 +641,15 @@ func collectFromRoot(root *WorkspaceRoot, paths []string) ([]walkEntry, error) {
 }
 
 type walkEntry struct {
-	abs, rel string
+	// abs is only populated by the legacy path-based collect (the
+	// followSymlinks=true shim); root-anchored capture opens descriptors
+	// through OpenRel and never needs a path.
+	abs      string
+	rel      string
 	size     int64
 	mode     int64
 	modTime  time.Time
 	typeflag byte
-	f        *os.File // held descriptor for regular files
 }
 
 func collect(workspace string, paths []string, followSymlinks bool) ([]walkEntry, error) {

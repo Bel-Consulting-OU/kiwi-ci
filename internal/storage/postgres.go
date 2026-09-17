@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -262,23 +261,7 @@ func (rs *runnerScanner) runner() (model.Runner, error) {
 // first path segment, mirroring the server's team derivation. Deduplicated
 // when both keys coincide.
 func quotaKeys(repoURL string) []string {
-	repo := strings.TrimSpace(repoURL)
-	if repo == "" {
-		return nil
-	}
-	team := repo
-	if u, err := url.Parse(repo); err == nil && u.Host != "" {
-		parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-		if len(parts) > 0 && parts[0] != "" {
-			team = u.Host + "/" + parts[0]
-		} else {
-			team = u.Host
-		}
-	}
-	if team == repo {
-		return []string{repo}
-	}
-	return []string{repo, team}
+	return QuotaKeys(repoURL)
 }
 
 // adjustQuotaTx shifts the reserved running/queued counters for one
@@ -1254,6 +1237,12 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 	if generation < 0 {
 		return fmt.Errorf("storage: invalid lease generation %d", generation)
 	}
+	// The receipt identity must match the completion identity: the receipt
+	// row key is what makes a replay idempotent, so a mismatched receipt
+	// would break replay detection instead of failing closed.
+	if receipt.JobID != jobID || receipt.Generation != generation || receipt.RunnerID != runnerID {
+		return fmt.Errorf("storage: completion receipt identity mismatch")
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -1939,6 +1928,15 @@ func (s *PostgresStore) ReleaseRunnerJob(ctx context.Context, runnerID, jobID st
 	err = tx.QueryRow(ctx, `SELECT payload, COALESCE(active_jobs, '[]'::jsonb), capacity, completed, failed FROM runners WHERE id=$1 FOR UPDATE`, runnerID).
 		Scan(&payload, &activeJSON, &capacity, &completed, &failed)
 	if errors.Is(err, pgx.ErrNoRows) {
+		// The runner row is gone (deregistered): the reserved quota slot is
+		// repository-scoped, so it is released regardless of the missing
+		// runner row. The release still reports the missing runner.
+		if qerr := s.releaseJobQuotaTx(ctx, tx, jobID); qerr != nil {
+			return qerr
+		}
+		if cerr := tx.Commit(ctx); cerr != nil {
+			return cerr
+		}
 		return ErrNotFound
 	}
 	if err != nil {
@@ -1984,22 +1982,31 @@ func (s *PostgresStore) ReleaseRunnerJob(ctx context.Context, runnerID, jobID st
 	}
 	// The released job was running: release the running slot and, when the
 	// job was requeued (recovery/kill switch), re-reserve the queued slot.
+	if err := s.releaseJobQuotaTx(ctx, tx, jobID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// releaseJobQuotaTx releases one job's reserved quota slot inside the
+// caller's transaction: the running slot always, plus a fresh queued slot
+// when the job was requeued. A missing job row is tolerated.
+func (s *PostgresStore) releaseJobQuotaTx(ctx context.Context, tx pgx.Tx, jobID string) error {
 	var (
 		jobStatus string
 		jobRepo   string
 	)
-	if err := tx.QueryRow(ctx, `SELECT status, COALESCE(payload->>'repo_url', '') FROM jobs WHERE id=$1`, jobID).Scan(&jobStatus, &jobRepo); err == nil {
-		queuedDelta := 0
-		if model.Status(jobStatus) == model.StatusQueued {
-			queuedDelta = 1
+	if err := tx.QueryRow(ctx, `SELECT status, COALESCE(payload->>'repo_url', '') FROM jobs WHERE id=$1`, jobID).Scan(&jobStatus, &jobRepo); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
 		}
-		if err := s.adjustQuotaTx(ctx, tx, jobRepo, -1, queuedDelta); err != nil {
-			return err
-		}
-	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return err
 	}
-	return tx.Commit(ctx)
+	queuedDelta := 0
+	if model.Status(jobStatus) == model.StatusQueued {
+		queuedDelta = 1
+	}
+	return s.adjustQuotaTx(ctx, tx, jobRepo, -1, queuedDelta)
 }
 
 // releaseRunnerSlotTx splices one job ID out of a runner's active_jobs set

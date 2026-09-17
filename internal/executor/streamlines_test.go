@@ -2,6 +2,7 @@ package executor
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -86,4 +87,72 @@ func TestStreamLinesMultipleLines(t *testing.T) {
 			t.Fatalf("line %d = %q, want %q", i, got[i], want[i])
 		}
 	}
+}
+
+// TestStreamLinesCapBoundary pins the truncation boundary: a line exactly at
+// maxLine is emitted whole, and a line one byte longer is truncated with the
+// exact skipped-byte count.
+func TestStreamLinesCapBoundary(t *testing.T) {
+	const maxLine = 8
+	exact := strings.Repeat("a", maxLine) + "\n"
+	var got []string
+	streamLines(strings.NewReader(exact), maxLine, func(line string) { got = append(got, line) })
+	if len(got) != 1 || got[0] != strings.Repeat("a", maxLine) {
+		t.Fatalf("line at cap: got %q", got)
+	}
+	if strings.Contains(got[0], "truncated") {
+		t.Fatalf("line at cap must not be marked truncated: %q", got[0])
+	}
+
+	got = nil
+	over := strings.Repeat("b", maxLine+1) + "\n"
+	streamLines(strings.NewReader(over), maxLine, func(line string) { got = append(got, line) })
+	if len(got) != 1 {
+		t.Fatalf("got %d lines, want 1", len(got))
+	}
+	if !strings.HasPrefix(got[0], strings.Repeat("b", maxLine)) || !strings.HasSuffix(got[0], "[line truncated: 1 bytes]") {
+		t.Fatalf("line one over cap = %q", got[0])
+	}
+
+	// A trailing line without a newline is still emitted. The CR of a CRLF
+	// pair is a raw line byte and counts against the byte cap: a CRLF line
+	// whose visible text is exactly maxLine bytes drops the CR and reports
+	// it in the marker (the emitted text is still the visible maxLine
+	// characters, so nothing visible is lost).
+	got = nil
+	streamLines(strings.NewReader(strings.Repeat("c", maxLine)+"\r\nno-newline"), maxLine, func(line string) { got = append(got, line) })
+	if len(got) != 2 {
+		t.Fatalf("CRLF/EOF lines = %q", got)
+	}
+	if got[0] != strings.Repeat("c", maxLine)+"[line truncated: 1 bytes]" {
+		t.Fatalf("CRLF at cap = %q", got[0])
+	}
+	if got[1] != "no-newli[line truncated: 2 bytes]" {
+		t.Fatalf("EOF line over cap = %q", got[1])
+	}
+}
+
+// TestStreamLinesDrainsOnReadError verifies a failing reader flushes the
+// accumulated line and returns instead of losing it.
+func TestStreamLinesDrainsOnReadError(t *testing.T) {
+	var got []string
+	streamLines(&failingReader{data: []byte("partial"), err: errors.New("boom")}, 1<<20, func(line string) { got = append(got, line) })
+	if len(got) != 1 || got[0] != "partial" {
+		t.Fatalf("read-error flush = %q", got)
+	}
+}
+
+type failingReader struct {
+	data []byte
+	err  error
+	done bool
+}
+
+func (f *failingReader) Read(p []byte) (int, error) {
+	if f.done {
+		return 0, f.err
+	}
+	f.done = true
+	n := copy(p, f.data)
+	return n, f.err
 }

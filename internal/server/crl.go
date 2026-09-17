@@ -71,6 +71,17 @@ func (s *Server) revokeRunnerCert(ri model.Runner, actor string) {
 	s.crl[ri.CertSerial] = ri.ID
 	persistErr := s.persistCRL()
 	s.mu.Unlock()
+	// The local decision is authoritative immediately: seed the DB-mode
+	// decision cache with revoked=true so a certificate revoked HERE is
+	// rejected on this replica at once (the cross-replica TTL only bounds
+	// revocations written by other replicas).
+	now := time.Now()
+	s.crlMu.Lock()
+	if s.crlCache == nil {
+		s.crlCache = map[string]crlCacheEntry{}
+	}
+	s.crlCache[ri.CertSerial] = crlCacheEntry{revoked: true, at: now}
+	s.crlMu.Unlock()
 	if s.DB != nil {
 		if rev, ok := s.DB.(storage.CertRevocationStore); ok {
 			if err := rev.RevokeCert(context.Background(), ri.CertSerial, ri.ID, "runner revoked"); err != nil {
@@ -85,13 +96,22 @@ func (s *Server) revokeRunnerCert(ri model.Runner, actor string) {
 }
 
 // certSerialRevoked reports whether a peer certificate serial is on the
-// CRL. Memory mode consults the in-process map; DB mode consults a
-// short-TTL cache backed by the durable cert_revocations row, so a
-// revocation written by any replica rejects the certificate on every other
-// replica within crlCacheTTL.
+// CRL. A locally observed revocation (the persisted in-process mirror,
+// written by revokeRunnerCert) is authoritative and never expires locally:
+// it stays effective even if the durable revocation row could not be
+// written, so a disable on this replica can never be undone by the cache
+// TTL. DB mode additionally consults a short-TTL cache backed by the
+// durable cert_revocations row, so a revocation written by any replica
+// rejects the certificate on every other replica within crlCacheTTL.
 func (s *Server) certSerialRevoked(serial string) bool {
 	if serial == "" {
 		return false
+	}
+	s.mu.Lock()
+	_, locallyRevoked := s.crl[serial]
+	s.mu.Unlock()
+	if locallyRevoked {
+		return true
 	}
 	if s.DB != nil {
 		if rev, ok := s.DB.(storage.CertRevocationStore); ok {
@@ -105,11 +125,11 @@ func (s *Server) certSerialRevoked(serial string) bool {
 			revoked, err := rev.CertRevoked(context.Background(), serial)
 			if err != nil {
 				s.logError("crl: cache fill failed", "serial", serial, "error", err.Error())
-				// Fail closed on an unavailable revocation store.
-				s.mu.Lock()
-				_, known := s.crl[serial]
-				s.mu.Unlock()
-				return known
+				// Fail closed on an unavailable revocation store: an
+				// unreachable revocation source must never resurrect a
+				// certificate it might have revoked. The local dev mirror
+				// can only make the decision MORE strict, never less.
+				return true
 			}
 			s.crlMu.Lock()
 			if s.crlCache == nil {
@@ -120,8 +140,5 @@ func (s *Server) certSerialRevoked(serial string) bool {
 			return revoked
 		}
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, ok := s.crl[serial]
-	return ok
+	return false
 }

@@ -169,6 +169,12 @@ func hmacSHA256(key []byte, data string) []byte {
 }
 
 func (s *S3) Put(ctx context.Context, key string, r io.Reader, size int64) (Object, error) {
+	if !keyRE.MatchString(key) {
+		return Object{}, fmt.Errorf("blob: invalid key %q", key)
+	}
+	if size < 0 {
+		return Object{}, fmt.Errorf("blob: negative size")
+	}
 	ctx, cancel := withDeadline(ctx, s3PutTimeout)
 	defer cancel()
 	// Buffer to compute MD5 and SHA256 before sending; S3 PutObject requires
@@ -227,6 +233,9 @@ func (s *S3) Put(ctx context.Context, key string, r io.Reader, size int64) (Obje
 }
 
 func (s *S3) Open(ctx context.Context, key string) (io.ReadCloser, Object, error) {
+	if !keyRE.MatchString(key) {
+		return nil, Object{}, fmt.Errorf("blob: invalid key %q", key)
+	}
 	ctx, cancel := withDeadline(ctx, s3GetTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.objectURL(key), nil)
@@ -251,6 +260,9 @@ func (s *S3) Open(ctx context.Context, key string) (io.ReadCloser, Object, error
 }
 
 func (s *S3) Delete(ctx context.Context, key string) error {
+	if !keyRE.MatchString(key) {
+		return fmt.Errorf("blob: invalid key %q", key)
+	}
 	ctx, cancel := withDeadline(ctx, s3DeleteTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, s.objectURL(key), nil)

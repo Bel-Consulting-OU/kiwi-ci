@@ -23,6 +23,11 @@ const (
 
 	maxEnvelopeBytes = 8 << 20
 	maxLogEntries    = 4
+	// maxIntegratedTimeSkew bounds how far in the future a log entry's
+	// integratedTime may be relative to the verifier's clock. Past times are
+	// legitimate (artifacts are verified long after they were built); an
+	// absurd future timestamp indicates a broken or hostile log.
+	maxIntegratedTimeSkew = 24 * time.Hour
 )
 
 // Attestation pairs a DSSE envelope with the claims it was produced under.
@@ -355,6 +360,9 @@ func VerifySigstoreBundle(bundle []byte, artifactDigest string, verifyCfg Sigsto
 			}
 			if le.IntegratedTime <= 0 {
 				return fmt.Errorf("supplychain: log entry missing integratedTime")
+			}
+			if maxFuture := time.Now().Add(maxIntegratedTimeSkew).Unix(); le.IntegratedTime > maxFuture {
+				return fmt.Errorf("supplychain: log entry integratedTime %d is implausibly in the future", le.IntegratedTime)
 			}
 			if le.BodyHash == "" {
 				return fmt.Errorf("supplychain: log entry missing body hash")

@@ -42,15 +42,15 @@ jobs:
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: ~/go/pkg/mod
-          key: ${{ runner.os }}-release-govulncheck-v1.1.4-${{ hashFiles('go.sum') }}
+          key: ${{ runner.os }}-release-govulncheck-v1.8.0-${{ hashFiles('go.sum') }}
           restore-keys: |
-            ${{ runner.os }}-release-govulncheck-v1.1.4-
+            ${{ runner.os }}-release-govulncheck-v1.8.0-
 
       # govulncheck is a release gate: a release with known vulnerabilities
-      # is never built or published. golang.org/x/vuln v1.1.4 is the latest
-      # release compatible with Go 1.23.
+      # is never built or published. golang.org/x/vuln v1.8.0 is the current
+      # release line for Go 1.27.
       - name: govulncheck release gate
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
 
       # Signing is NOT optional. A signed release requires
       # KIWI_RELEASE_SIGNING_KEY (an Ed25519 PKCS#8 private key PEM as a

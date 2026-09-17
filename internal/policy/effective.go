@@ -118,6 +118,12 @@ func validateJob(id string, job pipeline.Job, caps Capabilities) error {
 		if !caps.Tart {
 			return &Violation{Kind: ViolationKindTart, Detail: fmt.Sprintf("job %q requests runtime tart", id)}
 		}
+	default:
+		// Defense in depth: the strict pipeline parser rejects unknown
+		// runtimes, but admission must never wave through a runtime the
+		// capability set cannot classify. An unrecognized backend could
+		// otherwise bypass every runtime grant above.
+		return &Violation{Kind: ViolationKindRuntime, Detail: fmt.Sprintf("job %q requests unsupported runtime %q", id, job.Runtime)}
 	}
 	requested := requestedNetwork(job)
 	if requested != pipeline.NetworkPolicyDefault && networkStrength(requested) > networkStrength(caps.Network) {

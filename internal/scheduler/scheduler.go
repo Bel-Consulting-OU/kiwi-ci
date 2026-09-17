@@ -252,7 +252,7 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 		// Queue-timeout expiry: a candidate whose queue deadline has passed
 		// is never leased; RecoverExpired cancels it. Both the atomic-lease
 		// and the plain-lease branches below share this gate.
-		if dl := queueDeadlineFor(candidate); dl != nil && !dl.After(now) {
+		if dl := QueueDeadlineFor(candidate); dl != nil && !dl.After(now) {
 			continue
 		}
 		// The shared predicate is the same decision the SQL claim and the
@@ -560,9 +560,12 @@ func (s *DBScheduler) RecoverExpired(ctx context.Context, now time.Time) error {
 		for _, j := range all {
 			// Queue-timeout expiry: a queued (or approval-waiting) job past
 			// its queue deadline is cancelled terminally, independent of its
-			// attempt count, and dependents are recomputed below.
+			// attempt count, and dependents are recomputed below. The job's
+			// reserved queued quota slot is released in the same pass: a
+			// timed-out job never runs, so leaving the reservation behind
+			// would permanently shrink the repository/team queue depth.
 			if j.Status == model.StatusQueued || j.Status == model.StatusWaitingApproval {
-				dl := queueDeadlineFor(j)
+				dl := QueueDeadlineFor(j)
 				if dl == nil || dl.After(now) {
 					continue
 				}
@@ -578,6 +581,7 @@ func (s *DBScheduler) RecoverExpired(ctx context.Context, now time.Time) error {
 					log.Printf("scheduler: expire queue deadline for job %s: %v", j.ID, err)
 					continue
 				}
+				s.releaseQueuedQuota(ctx, j)
 				jobs[j.ID] = j
 				changed = true
 				continue
@@ -619,6 +623,21 @@ func (s *DBScheduler) RecoverExpired(ctx context.Context, now time.Time) error {
 		}
 	}
 	return nil
+}
+
+// releaseQueuedQuota returns a queue-timeout-cancelled job's reserved queued
+// slot to the repository/team quota counters, using the SAME key derivation
+// the enqueue reservation used. Stores without the counter contract (legacy
+// fakes) are tolerated. Failures are logged: the job is already cancelled and
+// the next counter adjustment path cannot repair it, so this is best effort.
+func (s *DBScheduler) releaseQueuedQuota(ctx context.Context, j model.Job) {
+	qs, ok := s.Store.(storage.QuotaCounterStore)
+	if !ok {
+		return
+	}
+	if err := qs.AdjustQuotaCounter(ctx, j.RepoURL, storage.RepoTeamKey(j.RepoURL), 0, -1); err != nil {
+		log.Printf("scheduler: release queued quota for job %s: %v", j.ID, err)
+	}
 }
 
 // recomputeDependents re-evaluates dependency outcomes for non-terminal jobs
@@ -758,12 +777,14 @@ func defaultToken() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// queueDeadlineFor returns the job's queue deadline: the persisted
+// QueueDeadlineFor returns the job's queue deadline: the persisted
 // QueueDeadline field when present, otherwise the deadline derived from the
 // compiled payload's queue_timeout (CreatedAt + timeout). Jobs without
 // either have no deadline and never expire. The payload fallback keeps
 // rows persisted before the QueueDeadline field existed expiring correctly.
-func queueDeadlineFor(j model.Job) *time.Time {
+// It is exported so every lease/recovery path (including the server's
+// in-memory mode) applies one queue-timeout rule.
+func QueueDeadlineFor(j model.Job) *time.Time {
 	if j.QueueDeadline != nil {
 		return j.QueueDeadline
 	}

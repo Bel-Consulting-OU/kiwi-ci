@@ -389,7 +389,9 @@ func TestRevocationSharedAcrossReplicas(t *testing.T) {
 	}
 	// The second instance rejects the revoked certificate on runner-tier
 	// routes (identity verification consults the shared revocation row).
-	if w := pkiRequest(t, s2.Handler(), http.MethodPost, "/api/v1/runners/runner-a/next", map[string]any{}, "runner-tok", cert); w.Code != http.StatusForbidden {
+	// The rejection now happens in the shared identity resolver, so the
+	// tier gate answers 401 before the handler (403) can.
+	if w := pkiRequest(t, s2.Handler(), http.MethodPost, "/api/v1/runners/runner-a/next", map[string]any{}, "runner-tok", cert); w.Code != http.StatusUnauthorized && w.Code != http.StatusForbidden {
 		t.Fatalf("second instance accepted revoked cert: %d %s", w.Code, w.Body.String())
 	}
 	// The durable row is present.

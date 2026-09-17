@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -1001,6 +1000,16 @@ func (m *memStore) HeartbeatLease(ctx context.Context, jobID string, runnerID st
 func (m *memStore) CompleteJob(ctx context.Context, jobID string, generation int64, runnerID string, status model.Status, errMsg string, outputs map[string]string, receipt model.CompletionReceipt) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if generation < 0 {
+		return fmt.Errorf("storage: invalid lease generation %d", generation)
+	}
+	// The receipt identity must match the completion identity: the receipt
+	// key is what makes a replay idempotent, so a mismatched receipt would
+	// silently poison the dedupe table (SQL rejects generation < 0 and keys
+	// the receipt by the completion row for the same reason).
+	if receipt.JobID != jobID || receipt.Generation != generation || receipt.RunnerID != runnerID {
+		return fmt.Errorf("storage: completion receipt identity mismatch")
+	}
 	j, ok := m.jobs[jobID]
 	if !ok {
 		return ErrNotFound
@@ -1136,6 +1145,10 @@ func (m *memStore) ReleaseRunnerJob(ctx context.Context, runnerID, jobID string,
 	defer m.mu.Unlock()
 	r, ok := m.runners[runnerID]
 	if !ok {
+		// The runner row is gone (deregistered): the job's reserved quota
+		// slot is repository-scoped, so it is released regardless of the
+		// missing runner row.
+		m.releaseJobQuotaLocked(jobID)
 		return ErrNotFound
 	}
 	r.ActiveJobs = removeString(r.ActiveJobs, jobID)
@@ -1145,17 +1158,34 @@ func (m *memStore) ReleaseRunnerJob(ctx context.Context, runnerID, jobID string,
 	if len(r.ActiveJobs) == 0 {
 		r.CurrentJob = ""
 	}
-	// Capacity 0 survives release; busy mirrors the SQL recompute.
+	// Capacity 0 survives release; busy mirrors the SQL recompute, and the
+	// completion/failure counters and last_seen move exactly like the SQL
+	// ReleaseRunnerJob so lost-runner accounting is identical in every mode.
 	r.Busy = r.Capacity > 0 && len(r.ActiveJobs) >= r.Capacity
-	m.runners[runnerID] = r
-	if j, jok := m.jobs[jobID]; jok {
-		queuedDelta := 0
-		if j.Status == model.StatusQueued {
-			queuedDelta = 1
-		}
-		m.adjustQuotaLocked(j.RepoURL, -1, queuedDelta)
+	if status == model.StatusSuccess {
+		r.Completed++
+	} else if status == model.StatusFailure {
+		r.Failed++
 	}
+	r.LastSeen = time.Now().UTC()
+	m.runners[runnerID] = r
+	m.releaseJobQuotaLocked(jobID)
 	return nil
+}
+
+// releaseJobQuotaLocked returns a released job's reserved quota slot: the
+// running slot for any released job, plus a fresh queued slot when the job
+// was requeued. The caller holds m.mu.
+func (m *memStore) releaseJobQuotaLocked(jobID string) {
+	j, jok := m.jobs[jobID]
+	if !jok {
+		return
+	}
+	queuedDelta := 0
+	if j.Status == model.StatusQueued {
+		queuedDelta = 1
+	}
+	m.adjustQuotaLocked(j.RepoURL, -1, queuedDelta)
 }
 
 func (m *memStore) InsertArtifact(ctx context.Context, a model.ArtifactRecord) error {
@@ -1305,6 +1335,14 @@ func (m *memStore) receiptKey(jobID string, generation int64, runnerID string) s
 func (m *memStore) OutboxAppend(ctx context.Context, e OutboxItem) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Outbox IDs are the durable primary key (SQL: id TEXT PRIMARY KEY): a
+	// duplicate append fails so a retried intent can never create a second
+	// row that would be dispatched twice under the same stable ID.
+	for _, it := range m.outbox {
+		if it.ID == e.ID {
+			return fmt.Errorf("storage: duplicate outbox id %q", e.ID)
+		}
+	}
 	m.outbox = append(m.outbox, e)
 	return nil
 }
@@ -1345,7 +1383,9 @@ func (m *memStore) ClaimOutbox(ctx context.Context, claimer string, limit int) (
 		if len(out) >= limit {
 			break
 		}
-		if c, ok := m.outboxClaims[it.ID]; ok && c.at.After(cutoff) {
+		// Boundary parity with the SQL claim (claimed_at < cutoff): a
+		// claim exactly at the cutoff is still honored.
+		if c, ok := m.outboxClaims[it.ID]; ok && !c.at.Before(cutoff) {
 			continue
 		}
 		m.outboxClaims[it.ID] = outboxClaim{claimer: claimer, at: time.Now().UTC()}
@@ -1677,23 +1717,7 @@ func (m *memStore) GetArtifact(ctx context.Context, id string) (model.ArtifactRe
 
 // memQuotaKeys mirrors the SQL quota key derivation for one repository URL.
 func memQuotaKeys(repoURL string) []string {
-	repo := strings.TrimSpace(repoURL)
-	if repo == "" {
-		return nil
-	}
-	team := repo
-	if u, err := url.Parse(repo); err == nil && u.Host != "" {
-		parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-		if len(parts) > 0 && parts[0] != "" {
-			team = u.Host + "/" + parts[0]
-		} else {
-			team = u.Host
-		}
-	}
-	if team == repo {
-		return []string{repo}
-	}
-	return []string{repo, team}
+	return QuotaKeys(repoURL)
 }
 
 // adjustQuotaLocked shifts counters for the repo/team keys (caller holds
@@ -1729,6 +1753,20 @@ func (m *memStore) InsertCompiledRun(ctx context.Context, req InsertCompiledRunR
 			return ErrDeliveryDuplicate
 		}
 	}
+	// Every reservation is STAGED first and committed only after the whole
+	// request validated: a rejection (quota limit, lost schedule claim) must
+	// leave zero partial state, exactly like the SQL transaction. Mutating
+	// m.downstream/m.quotas in place before a later validation fails would
+	// leak a consumed launch claim or an inflated counter.
+	type quotaStage struct {
+		key string
+		c   quotaCounts
+	}
+	var (
+		quotaStages       []quotaStage
+		stagedDownstream  *DownstreamLink
+		downstreamLinkKey string
+	)
 	if req.DownstreamLaunch != nil {
 		parts := strings.Split(req.DownstreamLaunch.LinkKey, "\x00")
 		if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
@@ -1752,7 +1790,8 @@ func (m *memStore) InsertCompiledRun(ctx context.Context, req InsertCompiledRunR
 		l.StableChildID = req.DownstreamLaunch.StableChildID
 		l.Reserved = false
 		l.ReservedAt = nil
-		m.downstream[key] = l
+		downstreamLinkKey = key
+		stagedDownstream = &l
 	}
 	// Quota reservation: re-enforce limits against the reserved counters.
 	if req.Quota != nil {
@@ -1780,18 +1819,23 @@ func (m *memStore) InsertCompiledRun(ctx context.Context, req InsertCompiledRunR
 			if queueLimit > 0 && float64(c.queued) > queueLimit {
 				return &QuotaExceededError{Reason: reason, Msg: fmt.Sprintf("%s queue depth would reach %d, limit %g", scope, c.queued, queueLimit)}
 			}
-			m.quotas[key] = c
+			quotaStages = append(quotaStages, quotaStage{key: key, c: c})
 		}
 	}
 	if req.ScheduleClaim != nil {
-		byNominal, ok := m.occurrences[req.ScheduleClaim.ScheduleID]
-		if !ok {
-			byNominal = map[time.Time]string{}
-			m.occurrences[req.ScheduleClaim.ScheduleID] = byNominal
+		if byNominal, ok := m.occurrences[req.ScheduleClaim.ScheduleID]; ok {
+			if existing, exists := byNominal[req.ScheduleClaim.Nominal]; exists && existing != runID {
+				return ErrScheduleClaimLost
+			}
 		}
-		if existing, exists := byNominal[req.ScheduleClaim.Nominal]; exists && existing != runID {
-			return ErrScheduleClaimLost
-		}
+	}
+	// Commit: from here on nothing can fail, so the staged reservations land
+	// together with the run.
+	if stagedDownstream != nil {
+		m.downstream[downstreamLinkKey] = *stagedDownstream
+	}
+	for _, st := range quotaStages {
+		m.quotas[st.key] = st.c
 	}
 	now := time.Now().UTC()
 	m.runs[runID] = req.Run
@@ -1831,7 +1875,12 @@ func (m *memStore) InsertCompiledRun(ctx context.Context, req InsertCompiledRunR
 		m.deliveries[req.WebhookClaim.Forge+"/"+req.WebhookClaim.DeliveryID] = runID + "/" + req.WebhookClaim.PayloadDigest
 	}
 	if req.ScheduleClaim != nil {
-		m.occurrences[req.ScheduleClaim.ScheduleID][req.ScheduleClaim.Nominal] = runID
+		byNominal, ok := m.occurrences[req.ScheduleClaim.ScheduleID]
+		if !ok {
+			byNominal = map[time.Time]string{}
+			m.occurrences[req.ScheduleClaim.ScheduleID] = byNominal
+		}
+		byNominal[req.ScheduleClaim.Nominal] = runID
 	}
 	return nil
 }
@@ -2045,14 +2094,23 @@ func (m *memStore) InsertGeneratedFragmentTx(ctx context.Context, req GeneratedF
 	// Stage the whole fragment first (mirroring the SQL transaction: any
 	// validation failure — including a malformed contract job ID — rolls
 	// the ENTIRE fragment back, leaving no partial jobs or contracts).
-	for id := range req.Jobs {
+	// A map key that disagrees with the job's own ID would make this store
+	// insert the job under a different primary key than SQL (which inserts
+	// under j.ID), so it fails closed.
+	for id, j := range req.Jobs {
 		if err := ValidateJobID(id); err != nil {
 			return GeneratedFragmentReceipt{}, false, err
+		}
+		if j.ID != id {
+			return GeneratedFragmentReceipt{}, false, fmt.Errorf("storage: fragment job key %s carries id %s", id, j.ID)
 		}
 	}
 	for id := range req.Contracts {
 		if err := ValidateJobID(id); err != nil {
 			return GeneratedFragmentReceipt{}, false, err
+		}
+		if _, ok := req.Jobs[id]; !ok {
+			return GeneratedFragmentReceipt{}, false, fmt.Errorf("storage: fragment contracts reference unknown job %s", id)
 		}
 	}
 	for id, j := range req.Jobs {

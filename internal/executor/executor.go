@@ -600,7 +600,19 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			}
 		}
 		if st.ID != "" {
-			data, outErr := backend.ReadFile(stepCtx, outputFile, 1<<20)
+			var (
+				data   []byte
+				outErr error
+			)
+			if _, isNative := backend.(*NativeBackend); isNative {
+				// Native reads go through the workspace root descriptor so a
+				// symlinked intermediate directory cannot redirect the read
+				// outside the workspace; container/Tart resolve the path
+				// inside their own sandbox.
+				data, outErr = readFileWithinRoot(workspace, outputFile, 1<<20)
+			} else {
+				data, outErr = backend.ReadFile(stepCtx, outputFile, 1<<20)
+			}
 			switch {
 			case errors.Is(outErr, os.ErrNotExist):
 				// Step wrote no outputs; treat as empty.
@@ -669,7 +681,18 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			currentStatus = model.StatusFailure
 			res.Error = genErr.Error()
 		} else {
-			data, gerr := e.ReadJobFile(ctx, cj.ID, filepath.Join(workspace, clean), maxGeneratedFragmentBytes)
+			var (
+				data []byte
+				gerr error
+			)
+			if _, isNative := backend.(*NativeBackend); isNative {
+				// Root-anchored read: the fragment path is workspace-relative
+				// (already cleaned above), so no symlinked component below the
+				// workspace can redirect it to host content.
+				data, gerr = readFileWithinRoot(workspace, filepath.Join(workspace, clean), maxGeneratedFragmentBytes)
+			} else {
+				data, gerr = e.ReadJobFile(ctx, cj.ID, filepath.Join(workspace, clean), maxGeneratedFragmentBytes)
+			}
 			if gerr != nil {
 				genErr := fmt.Errorf("generate.path %q: %w", genPath, gerr)
 				e.log(cj.ID, "generate", genErr.Error())

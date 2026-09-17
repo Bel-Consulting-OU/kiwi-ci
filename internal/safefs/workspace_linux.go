@@ -8,12 +8,14 @@ import (
 
 // openRelPlatform opens rel beneath rootFd with openat2, which resolves the
 // whole path atomically in the kernel: RESOLVE_BENEATH forbids escaping the
-// root and RESOLVE_NO_SYMLINKS forbids every symlink component. On kernels
+// root and RESOLVE_NO_SYMLINKS forbids every symlink component. O_NONBLOCK
+// makes opening a FIFO return immediately instead of blocking (regular files
+// are unaffected) so a planted FIFO cannot stall a read forever. On kernels
 // without openat2 (or without the resolve flags) it reports handled=false so
 // the caller falls back to the component-wise openat walk.
 func openRelPlatform(rootFd int, rel string) (int, bool, error) {
 	fd, err := unix.Openat2(rootFd, rel, &unix.OpenHow{
-		Flags:   unix.O_RDONLY | unix.O_CLOEXEC,
+		Flags:   unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NONBLOCK,
 		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS,
 	})
 	if err == nil {

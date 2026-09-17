@@ -160,8 +160,11 @@ func TestPrepareGitWorktree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("workspace is not a git worktree: %v", err)
 	}
-	if !strings.HasSuffix(strings.TrimSpace(string(gitDir)), ".git/worktrees/"+filepath.Base(dir)) {
-		t.Fatalf("workspace git-dir = %q, want a worktree dir", strings.TrimSpace(string(gitDir)))
+	// git prints --git-dir with forward slashes on every platform (including
+	// Windows), so compare after normalizing separators.
+	gitDirPath := filepath.ToSlash(strings.TrimSpace(string(gitDir)))
+	if !strings.HasSuffix(gitDirPath, ".git/worktrees/"+filepath.Base(dir)) {
+		t.Fatalf("workspace git-dir = %q, want a worktree dir", gitDirPath)
 	}
 
 	// Writes in the worktree never appear in the source.

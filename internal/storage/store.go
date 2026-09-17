@@ -11,7 +11,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
@@ -659,6 +661,44 @@ type AtomicLeaseStore interface {
 type QuotaCounterStore interface {
 	AdjustQuotaCounter(ctx context.Context, repoKey, teamKey string, runningDelta, queuedDelta int) error
 	QuotaCounts(ctx context.Context, repoKey, teamKey string) (running, queued int, err error)
+}
+
+// QuotaKeys derives the reservation counter keys for one repository URL: the
+// repository key is the URL itself and the team key is the forge host plus
+// the first path segment, mirroring the server's team derivation. The result
+// is deduplicated when both keys coincide and empty for an empty URL. Every
+// counter mutation (enqueue reservation, lease transition, completion,
+// cancellation, queue-timeout expiry) must use this SAME derivation or the
+// counters drift.
+func QuotaKeys(repoURL string) []string {
+	repo := strings.TrimSpace(repoURL)
+	if repo == "" {
+		return nil
+	}
+	team := repo
+	if u, err := url.Parse(repo); err == nil && u.Host != "" {
+		parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+		if len(parts) > 0 && parts[0] != "" {
+			team = u.Host + "/" + parts[0]
+		} else {
+			team = u.Host
+		}
+	}
+	if team == repo {
+		return []string{repo}
+	}
+	return []string{repo, team}
+}
+
+// RepoTeamKey returns the team counter key for a repository URL ("" when the
+// URL does not derive a distinct team key). It is the second element of
+// QuotaKeys, for callers that adjust a single repository/team pair.
+func RepoTeamKey(repoURL string) string {
+	keys := QuotaKeys(repoURL)
+	if len(keys) > 1 {
+		return keys[1]
+	}
+	return ""
 }
 
 // CacheManifestRecord is one signed shared-cache manifest row: the

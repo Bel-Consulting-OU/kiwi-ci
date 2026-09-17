@@ -39,6 +39,11 @@ type fakeStore struct {
 	cancelRunCalls     []cancelRunCall
 	updateJobCalls     []model.Job
 	releaseRunnerCalls []releaseRunnerCall
+
+	// quotaReservations backs the storage.QuotaCounterStore contract so the
+	// queue-timeout/lease paths that maintain reserved counters can be
+	// exercised in scheduler tests (clamped at zero, like every store).
+	quotaReservations map[string][2]int
 }
 
 type acquireCall struct {
@@ -90,6 +95,63 @@ func newFakeStore() *fakeStore {
 
 var _ storage.Store = (*fakeStore)(nil)
 var _ storage.ProfileStore = (*fakeStore)(nil)
+var _ storage.QuotaCounterStore = (*fakeStore)(nil)
+
+// AdjustQuotaCounter shifts the reserved counters for the key pair,
+// clamping at zero exactly like the SQL/memStore counter updates.
+func (f *fakeStore) AdjustQuotaCounter(ctx context.Context, repoKey, teamKey string, runningDelta, queuedDelta int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.quotaReservations == nil {
+		f.quotaReservations = map[string][2]int{}
+	}
+	for _, key := range []string{repoKey, teamKey} {
+		if key == "" {
+			continue
+		}
+		c := f.quotaReservations[key]
+		c[0] += runningDelta
+		if c[0] < 0 {
+			c[0] = 0
+		}
+		c[1] += queuedDelta
+		if c[1] < 0 {
+			c[1] = 0
+		}
+		f.quotaReservations[key] = c
+	}
+	return nil
+}
+
+// QuotaCounts reads the summed reserved counters for the key pair.
+func (f *fakeStore) QuotaCounts(ctx context.Context, repoKey, teamKey string) (int, int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var running, queued int
+	for _, key := range []string{repoKey, teamKey} {
+		if key == "" {
+			continue
+		}
+		c := f.quotaReservations[key]
+		running += c[0]
+		queued += c[1]
+	}
+	return running, queued, nil
+}
+
+// quotaQueued reports one key's reserved queued counter.
+func (f *fakeStore) quotaQueued(key string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.quotaReservations[key][1]
+}
+
+// quotaRunning reports one key's reserved running counter.
+func (f *fakeStore) quotaRunning(key string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.quotaReservations[key][0]
+}
 
 func (f *fakeStore) UpsertProfile(ctx context.Context, p model.RunnerProfile) error {
 	f.mu.Lock()

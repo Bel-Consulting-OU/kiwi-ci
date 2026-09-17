@@ -120,10 +120,3 @@ func writeFileNoFollow(root *Root, name string, r io.Reader, size int64, limits 
 	}
 	return nil
 }
-
-func foldPath(name string) string {
-	if caseInsensitiveFS {
-		return strings.ToLower(name)
-	}
-	return name
-}

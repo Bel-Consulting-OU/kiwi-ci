@@ -35,7 +35,10 @@ func TestHashFilesRejectsSymlinkEscapingWorkspace(t *testing.T) {
 	outside := t.TempDir()
 	writeHashFile(t, outside, "secret.txt", "secret\n")
 	if err := os.Symlink(outside, filepath.Join(ws, "escape")); err != nil {
-		t.Fatal(err)
+		// Symlink creation needs a privilege that Windows hosts may lack
+		// (Developer Mode or an elevated token); the containment check is
+		// still exercised on hosts that can create symlinks.
+		t.Skipf("symlinks unavailable: %v", err)
 	}
 	if _, err := EvalString(`${{ hashFiles('*') }}`, Context{Workspace: ws}); err == nil || !strings.Contains(err.Error(), "escapes the workspace") {
 		t.Errorf("symlink match error = %v, want workspace-confinement rejection", err)
@@ -43,7 +46,7 @@ func TestHashFilesRejectsSymlinkEscapingWorkspace(t *testing.T) {
 	// A symlink to a file inside the workspace is fine.
 	writeHashFile(t, ws, "real.txt", "data\n")
 	if err := os.Symlink(filepath.Join(ws, "real.txt"), filepath.Join(ws, "link.txt")); err != nil {
-		t.Fatal(err)
+		t.Skipf("symlinks unavailable: %v", err)
 	}
 	if _, err := EvalString(`${{ hashFiles('real.txt') }}`, Context{Workspace: ws}); err != nil {
 		t.Errorf("internal symlink rejected: %v", err)

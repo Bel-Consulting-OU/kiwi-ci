@@ -58,10 +58,18 @@ func TestIdentityStoreRoundTrip(t *testing.T) {
 		// directory ACL is the owner-only boundary there.
 		return
 	}
-	if fi, err := os.Stat(filepath.Join(dir, identityKeyFile)); err != nil || fi.Mode().Perm() != 0o600 {
+	fi, err := os.Stat(filepath.Join(dir, identityKeyFile))
+	if err != nil {
+		t.Fatalf("stat key.pem: %v", err)
+	}
+	if fi.Mode().Perm() != 0o600 {
 		t.Fatalf("key.pem mode = %v, want 0600", fi.Mode().Perm())
 	}
-	if fi, err := os.Stat(dir); err != nil || fi.Mode().Perm() != 0o700 {
+	fi, err = os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat store dir: %v", err)
+	}
+	if fi.Mode().Perm() != 0o700 {
 		t.Fatalf("store dir mode = %v, want 0700", fi.Mode().Perm())
 	}
 }

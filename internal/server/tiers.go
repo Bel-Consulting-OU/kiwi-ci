@@ -143,9 +143,14 @@ func (s *Server) visibleRepos(r *http.Request) (map[string]bool, bool) {
 }
 
 // splitCanonicalKey splits "host/owner/name" into host and bare "owner/name".
+// The remainder after the dotted host must itself contain a slash: a
+// canonical identity always carries owner/name, so a two-segment
+// "acme.co/service" (a GitLab group containing a dot) must NOT be read as
+// host "acme.co" + bare "service" — that would let an unrelated bare alias
+// "service" match it.
 func splitCanonicalKey(key string) (host, bare string, hasHost bool) {
 	parts := strings.SplitN(key, "/", 2)
-	if len(parts) == 2 && strings.Contains(parts[0], ".") {
+	if len(parts) == 2 && strings.Contains(parts[0], ".") && strings.Contains(parts[1], "/") {
 		return parts[0], parts[1], true
 	}
 	return "", key, false

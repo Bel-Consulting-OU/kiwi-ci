@@ -149,9 +149,13 @@ func Parse(r io.Reader) (Manifest, error) {
 }
 
 // parseLimits are the hard bounds Parse enforces on untrusted snapshot
-// archives: at most 16 GiB of expanded data, 1_000_000 entries, 1 GiB per
-// entry, path length 2048 and depth 64.
+// archives: at most 4 GiB of compressed input, 16 GiB of expanded data,
+// 1_000_000 entries, 1 GiB per entry, path length 2048, depth 64 and a
+// compression ratio of 1000 (the same envelope safefs extraction applies).
 func parseLimits(l safefs.ExtractLimits) safefs.ExtractLimits {
+	if l.MaxArchiveBytes <= 0 {
+		l.MaxArchiveBytes = 4 << 30
+	}
 	if l.MaxExpandedBytes <= 0 {
 		l.MaxExpandedBytes = 16 << 30
 	}
@@ -166,6 +170,9 @@ func parseLimits(l safefs.ExtractLimits) safefs.ExtractLimits {
 	}
 	if l.MaxDepth <= 0 {
 		l.MaxDepth = 64
+	}
+	if l.MaxCompressionRatio <= 0 {
+		l.MaxCompressionRatio = 1000
 	}
 	return l
 }
@@ -184,7 +191,12 @@ func (c *countReader) Read(p []byte) (int, error) {
 }
 
 // ParseWithLimits is Parse with caller-supplied resource bounds; zero fields
-// fall back to the hard defaults of parseLimits.
+// fall back to the hard defaults of parseLimits. Entry names are validated
+// with the same discipline as safefs extraction (relative, clean, portable,
+// no control characters) and duplicates — including case-fold and
+// normalization collisions on case-insensitive filesystems — are rejected,
+// so a manifest produced by Parse can only describe an archive that
+// extraction would accept.
 func ParseWithLimits(r io.Reader, limits safefs.ExtractLimits) (Manifest, error) {
 	limits = parseLimits(limits)
 	compressed := &countReader{r: r}
@@ -195,6 +207,7 @@ func ParseWithLimits(r io.Reader, limits safefs.ExtractLimits) (Manifest, error)
 	defer gz.Close()
 	tr := tar.NewReader(gz)
 	var entries []Entry
+	seen := map[string]bool{}
 	var expanded int64
 	for {
 		h, err := tr.Next()
@@ -207,6 +220,15 @@ func ParseWithLimits(r io.Reader, limits safefs.ExtractLimits) (Manifest, error)
 		if limits.MaxArchiveBytes > 0 && compressed.n > limits.MaxArchiveBytes {
 			return Manifest{}, fmt.Errorf("snapshot: %w", safefs.ErrLimits)
 		}
+		name, nerr := safefs.ValidateEntryName(h.Name)
+		if nerr != nil {
+			return Manifest{}, fmt.Errorf("snapshot: %w: %v", safefs.ErrUnsafeEntry, nerr)
+		}
+		key := safefs.FoldPath(name)
+		if seen[key] {
+			return Manifest{}, fmt.Errorf("snapshot: %w: %q", safefs.ErrDuplicateEntry, name)
+		}
+		seen[key] = true
 		if h.Typeflag != tar.TypeReg {
 			continue
 		}
@@ -216,22 +238,25 @@ func ParseWithLimits(r io.Reader, limits safefs.ExtractLimits) (Manifest, error)
 		if expanded+h.Size > limits.MaxExpandedBytes {
 			return Manifest{}, fmt.Errorf("snapshot: %w", safefs.ErrLimits)
 		}
+		if compressed.n > 0 && expanded+h.Size > int64(limits.MaxCompressionRatio)*compressed.n {
+			return Manifest{}, fmt.Errorf("snapshot: %w", safefs.ErrCompression)
+		}
 		expanded += h.Size
 		if int64(len(entries)) >= limits.MaxEntries {
 			return Manifest{}, fmt.Errorf("snapshot: %w", safefs.ErrLimits)
 		}
-		if len(h.Name) > limits.MaxPathLength {
+		if len(name) > limits.MaxPathLength {
 			return Manifest{}, fmt.Errorf("snapshot: %w", safefs.ErrLimits)
 		}
-		if strings.Count(h.Name, "/")+1 > limits.MaxDepth {
+		if strings.Count(name, "/")+1 > limits.MaxDepth {
 			return Manifest{}, fmt.Errorf("snapshot: %w", safefs.ErrLimits)
 		}
 		hasher := sha256.New()
 		if _, err := io.Copy(hasher, tr); err != nil {
-			return Manifest{}, fmt.Errorf("snapshot: hash entry %q: %w", h.Name, err)
+			return Manifest{}, fmt.Errorf("snapshot: hash entry %q: %w", name, err)
 		}
 		entries = append(entries, Entry{
-			Path:   h.Name,
+			Path:   name,
 			Mode:   uint32(h.Mode),
 			Size:   h.Size,
 			SHA256: hex.EncodeToString(hasher.Sum(nil)),

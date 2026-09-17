@@ -69,6 +69,10 @@ type dbFakeStore struct {
 	// auditErr, when non-nil, makes AppendAudit fail (OIDC issuance
 	// fail-closed tests).
 	auditErr error
+	// updateJobErr, when non-nil, makes UpdateJob fail. It models a store
+	// failure while the completion-effect pass persists the usage marker, so
+	// tests can exercise a crash window that lands BETWEEN effects.
+	updateJobErr error
 
 	leaderOK  bool
 	leaderErr error
@@ -308,6 +312,9 @@ func (f *dbFakeStore) ListJobsByRunner(ctx context.Context, runnerID string) ([]
 func (f *dbFakeStore) UpdateJob(ctx context.Context, job model.Job) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.updateJobErr != nil {
+		return f.updateJobErr
+	}
 	f.updateJobCalls = append(f.updateJobCalls, job)
 	f.jobs[job.ID] = job
 	return nil
@@ -354,6 +361,12 @@ func (f *dbFakeStore) CompleteJob(ctx context.Context, jobID string, generation 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.completeCalls = append(f.completeCalls, completeArgs{jobID, generation, runnerID, status, receipt})
+	if generation < 0 {
+		return fmt.Errorf("storage: invalid lease generation %d", generation)
+	}
+	if receipt.JobID != jobID || receipt.Generation != generation || receipt.RunnerID != runnerID {
+		return fmt.Errorf("storage: completion receipt identity mismatch")
+	}
 	j, ok := f.jobs[jobID]
 	if !ok {
 		return storage.ErrNotFound
@@ -399,6 +412,9 @@ func (f *dbFakeStore) CompleteJob(ctx context.Context, jobID string, generation 
 	j.LeaseExpiresAt = nil
 	f.jobs[jobID] = j
 	f.receipts[key] = receipt
+	// The completed job releases its reserved running quota slot in the same
+	// critical section, mirroring completeRunnerTx/adjustQuotaTx.
+	f.adjustQuotaLocked(j.RepoURL, -1, 0)
 	// Release the completing runner's slot and counters in the same critical
 	// section, mirroring the SQL completeRunnerTx (capacity 0 survives).
 	if r, rok := f.runners[runnerID]; rok {
@@ -448,10 +464,16 @@ func (f *dbFakeStore) CancelRunJobs(ctx context.Context, runID string, reason st
 		j.LeaseTokenHash = nil
 		j.LeaseExpiresAt = nil
 		f.jobs[id] = j
-		// A cancelled running job releases its runner slot immediately,
-		// mirroring the SQL transaction.
-		if wasRunning && runnerID != "" {
-			f.releaseRunnerSlotLocked(runnerID, id)
+		// The cancelled job releases its reserved slot (running or queued),
+		// mirroring the SQL CancelRunJobs transaction.
+		if wasRunning {
+			f.adjustQuotaLocked(j.RepoURL, -1, 0)
+			// A cancelled running job releases its runner slot immediately.
+			if runnerID != "" {
+				f.releaseRunnerSlotLocked(runnerID, id)
+			}
+		} else {
+			f.adjustQuotaLocked(j.RepoURL, 0, -1)
 		}
 		ids = append(ids, id)
 	}
@@ -461,6 +483,24 @@ func (f *dbFakeStore) CancelRunJobs(ctx context.Context, runID string, reason st
 		f.runs[runID] = r
 	}
 	return ids, nil
+}
+
+// adjustQuotaLocked shifts the reserved counters for the repository/team
+// keys derived from repoURL (clamped at zero, missing rows tolerated),
+// mirroring the SQL adjustQuotaTx key derivation. The caller holds f.mu.
+func (f *dbFakeStore) adjustQuotaLocked(repoURL string, runningDelta, queuedDelta int) {
+	for _, key := range storage.QuotaKeys(repoURL) {
+		c := f.quotas[key]
+		c[0] += runningDelta
+		if c[0] < 0 {
+			c[0] = 0
+		}
+		c[1] += queuedDelta
+		if c[1] < 0 {
+			c[1] = 0
+		}
+		f.quotas[key] = c
+	}
 }
 
 // releaseRunnerSlotLocked splices a job out of a runner's active set and
@@ -521,6 +561,9 @@ func (f *dbFakeStore) ReleaseRunnerJob(ctx context.Context, runnerID, jobID stri
 	defer f.mu.Unlock()
 	r, ok := f.runners[runnerID]
 	if !ok {
+		// The runner row is gone: the job's reserved quota slot is
+		// repository-scoped and is released regardless.
+		f.releaseJobQuotaLocked(jobID)
 		return storage.ErrNotFound
 	}
 	if status == model.StatusSuccess {
@@ -531,7 +574,23 @@ func (f *dbFakeStore) ReleaseRunnerJob(ctx context.Context, runnerID, jobID stri
 	r.LastSeen = time.Now().UTC()
 	f.runners[runnerID] = r
 	f.releaseRunnerSlotLocked(runnerID, jobID)
+	f.releaseJobQuotaLocked(jobID)
 	return nil
+}
+
+// releaseJobQuotaLocked returns a released job's reserved quota slot: the
+// running slot always, plus a fresh queued slot when it was requeued. The
+// caller holds f.mu.
+func (f *dbFakeStore) releaseJobQuotaLocked(jobID string) {
+	j, jok := f.jobs[jobID]
+	if !jok {
+		return
+	}
+	queuedDelta := 0
+	if j.Status == model.StatusQueued {
+		queuedDelta = 1
+	}
+	f.adjustQuotaLocked(j.RepoURL, -1, queuedDelta)
 }
 
 func (f *dbFakeStore) InsertArtifact(ctx context.Context, a model.ArtifactRecord) error {
@@ -731,6 +790,13 @@ func (f *dbFakeStore) OutboxAppend(ctx context.Context, e storage.OutboxItem) er
 	if f.outboxAppendErr != nil {
 		return f.outboxAppendErr
 	}
+	// Outbox IDs are the durable primary key: a duplicate append fails like
+	// the SQL unique constraint instead of stacking a second row.
+	for _, it := range f.outboxItems {
+		if it.ID == e.ID {
+			return fmt.Errorf("storage: duplicate outbox id %q", e.ID)
+		}
+	}
 	f.outboxItems = append(f.outboxItems, e)
 	return nil
 }
@@ -780,7 +846,8 @@ func (f *dbFakeStore) ClaimOutbox(ctx context.Context, claimer string, limit int
 		if len(out) >= limit {
 			break
 		}
-		if c, ok := f.outboxClaims[it.ID]; ok && c.at.After(cutoff) {
+		// Boundary parity with the SQL claim (claimed_at < cutoff).
+		if c, ok := f.outboxClaims[it.ID]; ok && !c.at.Before(cutoff) {
 			continue
 		}
 		f.outboxClaims[it.ID] = fakeOutboxClaim{claimer: claimer, at: time.Now().UTC()}
@@ -1079,6 +1146,18 @@ func (f *dbFakeStore) InsertCompiledRun(ctx context.Context, req storage.InsertC
 			return storage.ErrDeliveryDuplicate
 		}
 	}
+	// Reservations are staged first and committed only after the whole
+	// request validated, so a rejection leaves zero partial state (the SQL
+	// enqueue is a single transaction with the same property).
+	type quotaStage struct {
+		key string
+		c   [2]int
+	}
+	var (
+		quotaStages       []quotaStage
+		stagedDownstream  *storage.DownstreamLink
+		downstreamLinkKey string
+	)
 	if req.DownstreamLaunch != nil {
 		parts := strings.Split(req.DownstreamLaunch.LinkKey, "\x00")
 		if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
@@ -1101,7 +1180,8 @@ func (f *dbFakeStore) InsertCompiledRun(ctx context.Context, req storage.InsertC
 		l.StableChildID = req.DownstreamLaunch.StableChildID
 		l.Reserved = false
 		l.ReservedAt = nil
-		f.downstreamLinks[req.DownstreamLaunch.LinkKey] = l
+		downstreamLinkKey = req.DownstreamLaunch.LinkKey
+		stagedDownstream = &l
 	}
 	if req.ScheduleClaim != nil {
 		for _, o := range f.occurrences[req.ScheduleClaim.ScheduleID] {
@@ -1137,8 +1217,16 @@ func (f *dbFakeStore) InsertCompiledRun(ctx context.Context, req storage.InsertC
 			if queueLimit > 0 && float64(c[1]) > queueLimit {
 				return &storage.QuotaExceededError{Reason: reason, Msg: fmt.Sprintf("queue depth limit %g", queueLimit)}
 			}
-			f.quotas[key] = c
+			quotaStages = append(quotaStages, quotaStage{key: key, c: c})
 		}
+	}
+	// Commit: nothing below can fail, so every staged reservation lands with
+	// the run.
+	if stagedDownstream != nil {
+		f.downstreamLinks[downstreamLinkKey] = *stagedDownstream
+	}
+	for _, st := range quotaStages {
+		f.quotas[st.key] = st.c
 	}
 	now := time.Now().UTC()
 	f.insertRunCalls = append(f.insertRunCalls, req.Run)

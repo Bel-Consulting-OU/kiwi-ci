@@ -284,6 +284,11 @@ func (c *Config) CapabilitiesFor(repoFullName string) Capabilities {
 	if c.Network != "" {
 		if n, err := parseNetworkPolicy(c.Network); err == nil {
 			rest.Network = n
+		} else {
+			// Config.Validate rejects unparseable network values in files,
+			// but a programmatically constructed Config must never fail
+			// open: an unknown network string compiles to no egress.
+			rest.Network = pipeline.NetworkPolicyNone
 		}
 	}
 	if rp, ok := c.Repositories[repoFullName]; ok {
@@ -321,6 +326,10 @@ func (c *Config) CapabilitiesFor(repoFullName string) Capabilities {
 		if rp.Network != "" {
 			if n, err := parseNetworkPolicy(rp.Network); err == nil {
 				rest.Network = minNetwork(rest.Network, n)
+			} else {
+				// An unparseable repo-level network value compiles to no
+				// egress (fail closed), never to the org ceiling.
+				rest.Network = pipeline.NetworkPolicyNone
 			}
 		}
 	}

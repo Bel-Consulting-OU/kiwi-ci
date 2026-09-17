@@ -2149,6 +2149,12 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 		if j.Status != model.StatusQueued || !depsReadyLocked(j, s.jobs) {
 			continue
 		}
+		// Queue-timeout expiry (parity with scheduler.Lease): a candidate
+		// whose deadline has passed is never leased; recoverLeasesLocked
+		// cancels it terminally.
+		if dl := scheduler.QueueDeadlineFor(j); dl != nil && !dl.After(now) {
+			continue
+		}
 		if s.QuotaLimits.RepoConcurrency > 0 && float64(repoRunning[j.RepoURL]) >= s.QuotaLimits.RepoConcurrency {
 			continue
 		}
@@ -3300,7 +3306,28 @@ func (s *Server) recoverLeasesLocked(now time.Time, startup bool) {
 	_ = startup // Signature kept for call-site stability; startup no longer forces expiry: unexpired leases survive restart.
 	expirations := 0
 	lost := 0
+	timedOut := 0
 	for id, j := range s.jobs {
+		// Queue-timeout expiry, mirroring the scheduler's RecoverExpired: a
+		// queued (or approval-waiting) job past its queue deadline is
+		// cancelled terminally and never leased, independent of attempts.
+		if j.Status == model.StatusQueued || j.Status == model.StatusWaitingApproval {
+			dl := scheduler.QueueDeadlineFor(j)
+			if dl == nil || dl.After(now) {
+				continue
+			}
+			fin := now
+			j.Status = model.StatusCancelled
+			j.Error = "queue timeout"
+			j.FinishedAt = &fin
+			j.LeaseRunnerID = ""
+			j.LeaseTokenHash = nil
+			j.LeaseExpiresAt = nil
+			s.jobs[id] = j
+			s.auditLocked("job.queue_timeout", "scheduler", j.RunID, j.ID, "job cancelled after queue deadline", map[string]string{"job": j.Key})
+			timedOut++
+			continue
+		}
 		if j.Status != model.StatusRunning {
 			continue
 		}
@@ -3332,6 +3359,9 @@ func (s *Server) recoverLeasesLocked(now time.Time, startup bool) {
 	}
 	s.metricAdd("kiwi_lease_expirations_total", float64(expirations), nil)
 	s.metricAdd("kiwi_lost_runners_total", float64(lost), nil)
+	if timedOut > 0 {
+		s.metricAdd("kiwi_queue_timeouts_total", float64(timedOut), nil)
+	}
 	s.scheduleStateLocked()
 }
 

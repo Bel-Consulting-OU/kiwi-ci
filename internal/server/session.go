@@ -97,10 +97,11 @@ func parseWebToken(v string) (nonce, mac, expStr string, ok bool) {
 }
 
 // webTokenOK validates a signed token: a valid MAC (constant time) over a
-// non-expired nonce+expiry pair.
+// non-expired nonce+expiry pair. Structurally empty parts are rejected
+// outright — a well-formed token always carries all three components.
 func webTokenOK(secret []byte, tag, v string) bool {
 	nonce, mac, expStr, ok := parseWebToken(v)
-	if !ok {
+	if !ok || nonce == "" || mac == "" || expStr == "" {
 		return false
 	}
 	expiry, err := strconv.ParseInt(expStr, 10, 64)

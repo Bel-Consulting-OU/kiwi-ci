@@ -68,6 +68,7 @@ func NewMetrics() *Metrics {
 	}
 	m.declare("kiwi_lease_expirations_total", "Job leases expired and recovered", "counter", nil)
 	m.declare("kiwi_lost_runners_total", "Jobs failed after exhausting infra retries on lost runners", "counter", nil)
+	m.declare("kiwi_queue_timeouts_total", "Queued jobs cancelled after their queue deadline", "counter", nil)
 	m.declare("kiwi_runner_killswitch_jobs_total", "Active job leases invalidated by the runner disable kill switch", "counter", nil)
 	m.declare("kiwi_cache_hits_total", "Cache download hits", "counter", nil)
 	m.declare("kiwi_cache_misses_total", "Cache download misses", "counter", nil)

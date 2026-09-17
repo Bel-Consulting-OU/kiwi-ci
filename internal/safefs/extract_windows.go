@@ -90,7 +90,3 @@ func writeFileNoFollow(root *Root, name string, r io.Reader, size int64, limits 
 	}
 	return nil
 }
-
-func foldPath(name string) string {
-	return strings.ToLower(name)
-}
