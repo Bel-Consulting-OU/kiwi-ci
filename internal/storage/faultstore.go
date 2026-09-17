@@ -781,6 +781,7 @@ type memStore struct {
 	mu         sync.Mutex
 	fenceMu    sync.Mutex
 	fences     map[string]*sync.Mutex
+	checkRuns  checkRunMem
 	runs       map[string]model.Run
 	jobs       map[string]model.Job
 	runners    map[string]model.Runner
@@ -1564,6 +1565,39 @@ func (f *FaultyStore) GetSchedule(ctx context.Context, id string) (Schedule, boo
 		return Schedule{}, false, fmt.Errorf("storage: inner store does not implement ScheduleStore")
 	}
 	return inner.GetSchedule(ctx, id)
+}
+
+func (m *memStore) PutCheckRun(ctx context.Context, key, checkRunID string) error {
+	return m.checkRuns.put(key, checkRunID)
+}
+
+func (m *memStore) GetCheckRun(ctx context.Context, key string) (string, bool, error) {
+	id, ok := m.checkRuns.get(key)
+	return id, ok, nil
+}
+
+func (f *FaultyStore) PutCheckRun(ctx context.Context, key, checkRunID string) error {
+	op := f.fail()
+	if op != nil {
+		return op
+	}
+	inner, ok := f.Inner.(CheckRunStore)
+	if !ok {
+		return fmt.Errorf("storage: inner store does not implement CheckRunStore")
+	}
+	return inner.PutCheckRun(ctx, key, checkRunID)
+}
+
+func (f *FaultyStore) GetCheckRun(ctx context.Context, key string) (string, bool, error) {
+	op := f.fail()
+	if op != nil {
+		return "", false, op
+	}
+	inner, ok := f.Inner.(CheckRunStore)
+	if !ok {
+		return "", false, fmt.Errorf("storage: inner store does not implement CheckRunStore")
+	}
+	return inner.GetCheckRun(ctx, key)
 }
 
 func (m *memStore) GetSchedule(ctx context.Context, id string) (Schedule, bool, error) {

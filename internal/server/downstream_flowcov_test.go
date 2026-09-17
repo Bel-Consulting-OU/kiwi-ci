@@ -40,12 +40,14 @@ func TestFlowDownstreamRecordIntents(t *testing.T) {
 	if len(s.outbox.Pending()) != 1 {
 		t.Fatalf("outbox pending = %d, want 1", len(s.outbox.Pending()))
 	}
-	// Duplicate recording is a no-op through the link claim.
+	// Duplicate recording converges: the stored link's token is reused and
+	// the deterministic intent ID dedupes, so replay never spawns a second
+	// launch (nor a second intent).
 	if err := s.recordDownstreamIntents(ctx, fcRecordJob("j"), run); err != nil {
 		t.Fatalf("duplicate record = %v", err)
 	}
-	if got := len(s.outbox.Pending()); got != 2 {
-		t.Fatalf("outbox after duplicate record = %d, want 2 (intent re-enqueued)", got)
+	if got := len(s.outbox.Pending()); got != 1 {
+		t.Fatalf("outbox after duplicate record = %d, want 1 (deterministic intent deduped)", got)
 	}
 }
 
@@ -72,8 +74,15 @@ func TestFlowDownstreamRecordIntentsStoreErrors(t *testing.T) {
 	job2 := job
 	job2.ID = "job-b"
 	s.DB = &fcStore{dbFakeStore: f}
-	if err := s.recordDownstreamIntents(context.Background(), job2, run); err == nil {
-		t.Fatal("outbox enqueue failure must propagate")
+	if err := s.recordDownstreamIntents(context.Background(), job2, run); err != nil {
+		// The durable append failed but the intent stays queued in memory
+		// (localOnly) and will still dispatch: that is the outbox's stated
+		// contract, so recording is NOT an error as long as the intent is
+		// queued. Assert precisely that.
+		t.Fatalf("record with durable-append failure must keep the intent queued, got %v", err)
+	}
+	if !s.outbox.HasIntent(downstreamStableKey("job-b", "o/target", "refs/heads/main")) {
+		t.Fatal("intent missing after durable-append failure")
 	}
 	f.mu.Lock()
 	f.outboxAppendErr = nil

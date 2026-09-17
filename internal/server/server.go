@@ -164,6 +164,10 @@ type Server struct {
 	// such as deployments directly.
 	AdmissionCapabilities *policy.Capabilities
 
+	// checkRuns persists logical-check → forge check-run IDs so retried
+	// publications update instead of duplicating (see checkruns.go).
+	checkRuns *checkRunIDs
+
 	// digestFence serializes CAS publication against garbage collection for
 	// memory/fs deployments; DB mode prefers the store-backed fence so the
 	// serialization spans replicas (see withDigestFence).
@@ -1035,6 +1039,18 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 	// policy identity is the BASE repository while the checkout URL is the
 	// head clone URL.
 	in.RepoID = strings.TrimSpace(in.RepoID)
+	// The forge identity is resolved ONCE here for every ingress (webhook
+	// handlers, schedules, downstream, rerun and direct submissions): the
+	// canonical RepoID already carries the instance host, and classification
+	// against the configured/public forge hosts yields the kind. An
+	// unclassifiable host stays empty so check publication is skipped rather
+	// than sent to a guessed forge.
+	if in.ForgeKind == "" && in.RepoID != "" {
+		in.ForgeKind = s.forgeKindForRepoID(in.RepoID)
+		if i := strings.Index(in.RepoID, "/"); i > 0 {
+			in.ForgeHost = in.RepoID[:i]
+		}
+	}
 	policyID := submittedPolicyRepoID(in)
 	if policyID == "" {
 		return model.Run{}, &admissionError{Status: 400, Reason: "repo_identity_required", Msg: "repository identity could not be resolved"}
@@ -1108,7 +1124,8 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 	}
 	group := expandConcurrency(spec.Concurrency.Group, in)
 	run := model.Run{ID: runID, RepoID: in.RepoID, PolicyRepoID: policyID, CheckoutRepoURL: checkoutURL,
-		Repo: in.RepoURL, RepoFullName: in.RepoFullName, Ref: in.Ref, SHA: in.SHA, Event: in.Event,
+		Repo: in.RepoURL, RepoFullName: in.RepoFullName, ForgeKind: in.ForgeKind, ForgeHost: in.ForgeHost,
+		Ref: in.Ref, SHA: in.SHA, Event: in.Event,
 		Status: model.StatusQueued, Trusted: in.Trusted, ConcurrencyGroup: group, CreatedAt: now, Metadata: cloneMap(in.Metadata)}
 
 	jobIDs := make(map[string]string, len(g.Jobs))
@@ -1153,7 +1170,7 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 		jobDigest := hex.EncodeToString(digestSum[:])
 		jobContracts[jobIDs[key]] = buildJobContracts(cj)
 		j := model.Job{
-			ID: jobIDs[key], RunID: runID, Key: key, BaseKey: cj.BaseID, RepoID: in.RepoID, PolicyRepoID: policyID, CheckoutRepoURL: checkoutURL,
+			ID: jobIDs[key], RunID: runID, Key: key, BaseKey: cj.BaseID, RepoID: in.RepoID, PolicyRepoID: policyID, CheckoutRepoURL: checkoutURL, ForgeKind: in.ForgeKind, ForgeHost: in.ForgeHost,
 			RepoURL: in.RepoURL, RepoFullName: in.RepoFullName, Ref: in.Ref, SHA: in.SHA,
 			Event: in.Event, Condition: cj.Job.If, DependencyStatus: model.StatusSuccess, Pipeline: in.Pipeline, Trusted: in.Trusted, ChangedFiles: append([]string{}, in.ChangedFiles...), ChangedFilesKnown: in.ChangedFilesKnown, Needs: needs,
 			RequiredLabels: labelsForJob(cj.Job), Network: effectiveNetwork, Environment: env, ApprovalRequired: cj.Job.Environment.Approval, EnvironmentBranches: append([]string{}, cj.Job.Environment.Branches...), EnvironmentConcurrency: cj.Job.Environment.Concurrency, OIDCAllowed: cj.Job.Permissions.IDToken, OIDCAudiences: cloneStrings(oidcAudiences),

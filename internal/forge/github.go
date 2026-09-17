@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -290,9 +291,26 @@ func (g *GitHub) changedFilesPage(ctx context.Context, repoFullName, u string) (
 // external_id is derived deterministically from the sha and name so that
 // re-publishing the same run (or re-running the same commit) updates the
 // existing check run instead of duplicating it.
+// CheckRunPublisher is the idempotency-aware publication path: with an
+// existing check-run ID the update is a PATCH of that run (GitHub's POST
+// always creates a NEW check run, so a retry after a lost ACK would
+// otherwise duplicate the check); without one the run is created and its ID
+// returned for the caller to persist. The stable external_id keys the run to
+// the logical Kiwi check (run + name), never just the SHA.
+type CheckRunPublisher interface {
+	PublishCheckRun(ctx context.Context, repoFullName, sha, name, status, conclusion, detailsURL, summary string, annotations []CheckAnnotation, existingID string) (string, error)
+}
+
 func (g *GitHub) PublishCheck(ctx context.Context, repoFullName, sha, name, status, conclusion, detailsURL, summary string, annotations []CheckAnnotation) error {
+	_, err := g.PublishCheckRun(ctx, repoFullName, sha, name, status, conclusion, detailsURL, summary, annotations, "")
+	return err
+}
+
+// PublishCheckRun creates or PATCHes one logical check run and returns its
+// GitHub check-run ID.
+func (g *GitHub) PublishCheckRun(ctx context.Context, repoFullName, sha, name, status, conclusion, detailsURL, summary string, annotations []CheckAnnotation, existingID string) (string, error) {
 	if repoFullName == "" || sha == "" {
-		return fmt.Errorf("missing repo or sha for check publish")
+		return "", fmt.Errorf("missing repo or sha for check publish")
 	}
 	externalID := "kiwi-" + shortSHA(sha) + "-" + slug(name)
 	output := map[string]any{"title": "Kiwi / " + name, "summary": summary}
@@ -316,30 +334,52 @@ func (g *GitHub) PublishCheck(ctx context.Context, repoFullName, sha, name, stat
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
-		return err
+		return "", err
 	}
+	method := http.MethodPost
 	u := g.apiBase() + "/repos/" + repoFullName + "/check-runs"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(payload))
+	if existingID != "" {
+		// The check already exists: PATCH it. POST here would create a
+		// duplicate, which is exactly what a lost outbox ACK + retry does.
+		method = http.MethodPatch
+		u += "/" + existingID
+		// PATCH does not accept head_sha; it is immutable after creation.
+		delete(body, "head_sha")
+		payload, err = json.Marshal(body)
+		if err != nil {
+			return "", err
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, method, u, bytes.NewReader(payload))
 	if err != nil {
-		return err
+		return "", err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("Content-Type", "application/json")
 	if tok, err := g.authToken(ctx, repoFullName); err != nil {
-		return err
+		return "", err
 	} else if tok != "" {
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 	resp, err := g.httpClient().Do(req)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("GitHub check-runs API %s: %s", resp.Status, strings.TrimSpace(string(b)))
+		return "", fmt.Errorf("GitHub check-runs API %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
-	return nil
+	if existingID != "" {
+		return existingID, nil
+	}
+	var created struct {
+		ID int64 `json:"id"`
+	}
+	if derr := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&created); derr != nil || created.ID == 0 {
+		return "", fmt.Errorf("GitHub check-runs create: no check-run id in response")
+	}
+	return strconv.FormatInt(created.ID, 10), nil
 }
 
 func (g *GitHub) CloneCredentialFor(_ string) (string, bool) {

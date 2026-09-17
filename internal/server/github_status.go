@@ -28,6 +28,11 @@ func (s *Server) publishGitHubStatus(run model.Run) {
 	if run.RepoFullName == "" || run.SHA == "" {
 		return
 	}
+	if run.ForgeKind != "" && run.ForgeKind != "github" {
+		// Never route another forge's run to the GitHub API, even when a
+		// GitHub credential happens to be configured on this control plane.
+		return
+	}
 	if s.GitHubToken == "" && s.GitHubAppID == 0 && s.gitHubAPIBase == "" {
 		// No publishing credential or endpoint configured: nothing can be
 		// published, so the intent would never dispatch. Skip enqueueing.
@@ -61,6 +66,12 @@ func (s *Server) publishGitHubStatus(run model.Run) {
 	})
 	items = append(items, jobIntents...)
 	for _, it := range items {
+		if it.Kind == "" {
+			// The run's forge could not be classified: publishing to a
+			// guessed forge is worse than not publishing.
+			log.Printf("outbox: skipping check intent for run %s without a forge identity", run.ID)
+			continue
+		}
 		if err := s.outbox.Enqueue(it); err != nil {
 			log.Printf("outbox: enqueue %s: %v", it.Kind, err)
 		}
@@ -73,6 +84,9 @@ func (s *Server) checkIntent(run model.Run, name, status, conclusion, summary st
 		detailsURL = s.ExternalURL + "/?run=" + run.ID
 	}
 	payload, err := jsonMarshal(forge.CheckPayload{
+		RunID:        run.ID,
+		ForgeKind:    run.ForgeKind,
+		ForgeHost:    run.ForgeHost,
 		RepoFullName: run.RepoFullName,
 		SHA:          run.SHA,
 		Name:         name,
@@ -85,7 +99,16 @@ func (s *Server) checkIntent(run model.Run, name, status, conclusion, summary st
 	if err != nil {
 		payload = []byte("{}")
 	}
-	return forge.OutboxItem{Kind: forge.OutboxKindGitHubCheck, Payload: payload}
+	kind := ""
+	switch run.ForgeKind {
+	case "github":
+		kind = forge.OutboxKindGitHubCheck
+	case "gitlab":
+		kind = forge.OutboxKindGitLabCheck
+	case "forgejo":
+		kind = forge.OutboxKindForgejoCheck
+	}
+	return forge.OutboxItem{Kind: kind, Payload: payload}
 }
 
 // checkStateForRun maps Kiwi run/job statuses onto GitHub check-run

@@ -223,6 +223,7 @@ func TestGitHubPublishCheckEdges(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id": 1}`))
 	}))
 	defer ts.Close()
 	err := (&GitHub{BaseURL: ts.URL}).PublishCheck(context.Background(), "o/r", strings.Repeat("a", 40), "build/test",

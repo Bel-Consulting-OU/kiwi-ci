@@ -2,8 +2,12 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -326,4 +330,61 @@ func TestOutboxDBReplayPrunesAckedByOtherReplica(t *testing.T) {
 	if d.total() != 0 {
 		t.Fatalf("acked intent redispatched: %v", d.seen)
 	}
+}
+
+// TestGitHubCheckRetryPatchesInsteadOfDuplicating is the lost-ACK regression:
+// the first publish POSTs and the returned check-run ID is persisted; when the
+// outbox retries the same logical check (remote success, local ACK failure),
+// dispatch must PATCH that ID — a second POST would duplicate the check.
+func TestGitHubCheckRetryPatchesInsteadOfDuplicating(t *testing.T) {
+	var posts, patches int
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			posts++
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id": 4242}`))
+		case http.MethodPatch:
+			patches++
+			if !strings.HasSuffix(r.URL.Path, "/check-runs/4242") {
+				t.Errorf("PATCH path = %s, want /check-runs/4242", r.URL.Path)
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id": 4242}`))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer api.Close()
+
+	s := New("secret")
+	s.GitHubToken = "tok"
+	s.gitHubAPIBase = api.URL
+	item := forge.OutboxItem{Kind: forge.OutboxKindGitHubCheck, Payload: mustJSON(t, forge.CheckPayload{
+		RunID: "run-1", ForgeKind: "github", ForgeHost: "github.com",
+		RepoFullName: "acme/backend", SHA: "abc", Name: "Pipeline",
+		Status: "completed", Conclusion: "success", Summary: "ok",
+	})}
+	if err := s.dispatchOutbox(context.Background(), item); err != nil {
+		t.Fatalf("first dispatch: %v", err)
+	}
+	// Retry the SAME intent (ACK failure replays it).
+	if err := s.dispatchOutbox(context.Background(), item); err != nil {
+		t.Fatalf("retry dispatch: %v", err)
+	}
+	if posts != 1 {
+		t.Fatalf("POSTs = %d, want exactly 1 (retry must not create a duplicate check)", posts)
+	}
+	if patches != 1 {
+		t.Fatalf("PATCHes = %d, want 1", patches)
+	}
+}
+
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }

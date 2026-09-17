@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"encoding/json"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"net/http"
 	"sync"
 	"testing"
@@ -209,5 +211,57 @@ func TestDownstreamStableIDDBModeCrashRecovery(t *testing.T) {
 	f.mu.Unlock()
 	if childCount != 1 {
 		t.Fatalf("child runs after replay = %d, want 1", childCount)
+	}
+}
+
+// TestDownstreamCrashBetweenLinkAndIntentRecovers proves the recovery window
+// is closed: a link committed with no outbox intent (crash between the two
+// writes) is replayed with the SAME launch token and a deterministic intent
+// ID, so exactly one child launch is recorded — never zero, never two.
+func TestDownstreamCrashBetweenLinkAndIntentRecovers(t *testing.T) {
+	s, err := NewPersistent("token", "token", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := model.Run{ID: "run-1", RepoID: "github.com/acme/app", PolicyRepoID: "github.com/acme/app",
+		RepoFullName: "acme/app", ForgeKind: "github", ForgeHost: "github.com", Ref: "refs/heads/main"}
+	job := model.Job{ID: "job-1", RunID: run.ID, Key: "build", RepoID: run.RepoID,
+		PolicyRepoID: run.PolicyRepoID, ForgeKind: "github", Status: model.StatusSuccess, Trusted: true,
+		Pipeline: "version: 1\njobs:\n  build:\n    runtime: container\n    image: alpine\n    steps:\n      - run: echo hi\n    downstream:\n      repository: acme/e2e\n      ref: main\n      wait: true\n"}
+	// Simulate the crash window: the link exists, the intent does not.
+	link := storage.DownstreamLink{
+		ParentJobID: job.ID, TargetRepo: "acme/e2e", TargetRef: "main",
+		LaunchToken: "stored-token", TargetForge: "github", TargetRepoID: "github.com/acme/e2e",
+		StableChildID: downstreamStableKey(job.ID, "acme/e2e", "main"),
+		CreatedAt:     time.Now().UTC(),
+	}
+	if err := s.insertDownstreamLink(context.Background(), link); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.recordDownstreamIntents(context.Background(), job, run); err != nil {
+		t.Fatalf("recovery replay: %v", err)
+	}
+	items := s.outbox.Pending()
+	if len(items) != 1 {
+		t.Fatalf("intents = %d, want exactly 1", len(items))
+	}
+	if items[0].ID != link.StableChildID {
+		t.Fatalf("intent id = %q, want the deterministic link key %q", items[0].ID, link.StableChildID)
+	}
+	var payload struct {
+		LaunchToken string `json:"launch_token"`
+	}
+	if err := json.Unmarshal(items[0].Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.LaunchToken != "stored-token" {
+		t.Fatalf("replay minted token %q, want the stored token (a new token would look like a second launch)", payload.LaunchToken)
+	}
+	// A second replay (another crash/retry) must not duplicate the intent.
+	if err := s.recordDownstreamIntents(context.Background(), job, run); err != nil {
+		t.Fatalf("second replay: %v", err)
+	}
+	if got := len(s.outbox.Pending()); got != 1 {
+		t.Fatalf("intents after second replay = %d, want 1", got)
 	}
 }

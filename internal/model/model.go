@@ -49,7 +49,13 @@ type Run struct {
 	// CheckoutRepoURL is the clone URL the run's jobs check out: the fork
 	// HEAD repository's clone URL for cross-repo PRs. It is additive;
 	// legacy records default to empty and the runner falls back to Repo.
-	CheckoutRepoURL  string            `json:"checkout_repo_url,omitempty"`
+	CheckoutRepoURL string `json:"checkout_repo_url,omitempty"`
+	// ForgeKind/ForgeHost are the explicit forge identity resolved once at
+	// ingress (github | gitlab | forgejo plus the instance host). Check
+	// publication routes by these fields; a run with no forge identity is
+	// never published anywhere.
+	ForgeKind        string            `json:"forge_kind,omitempty"`
+	ForgeHost        string            `json:"forge_host,omitempty"`
 	Ref              string            `json:"ref,omitempty"`
 	SHA              string            `json:"sha,omitempty"`
 	Event            string            `json:"event,omitempty"`
@@ -139,6 +145,10 @@ type Job struct {
 	LeaseGeneration int64      `json:"lease_generation,omitempty"`
 	LeaseExpiresAt  *time.Time `json:"lease_expires_at,omitempty"`
 	ApprovedBy      string     `json:"approved_by,omitempty"`
+	// ForgeKind/ForgeHost carry the run's forge identity (copied at job
+	// creation) so job-level publication and audit can never guess a forge.
+	ForgeKind string `json:"forge_kind,omitempty"`
+	ForgeHost string `json:"forge_host,omitempty"`
 	// QueueReason records why a queued job has not been leased yet. It is
 	// a queue.QueueReason code (e.g. WAITING_DEPENDENCY, NO_COMPATIBLE_RUNNER)
 	// set by the control plane's scheduling pass; empty means no reason.

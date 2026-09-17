@@ -1,10 +1,8 @@
 package server
 
 import (
-	"errors"
 	"fmt"
-	"net/url"
-	"strconv"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/giturl"
 	"strings"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
@@ -30,119 +28,8 @@ import (
 // rejected: a clone URL that cannot be parsed must never silently become a
 // different repository identity.
 func parseCloneURL(raw string) (host, forgePath string, err error) {
-	s := strings.TrimSpace(raw)
-	if s == "" {
-		return "", "", errors.New("clone URL is empty")
-	}
-	if i := strings.Index(s, "://"); i >= 0 {
-		scheme := strings.ToLower(strings.TrimSpace(s[:i]))
-		switch scheme {
-		case "https", "ssh", "http":
-		default:
-			return "", "", fmt.Errorf("unsupported clone URL scheme %q", scheme)
-		}
-		u, uerr := url.Parse(s)
-		if uerr != nil {
-			return "", "", fmt.Errorf("malformed clone URL: %w", uerr)
-		}
-		if u.Host == "" {
-			return "", "", errors.New("clone URL names no host")
-		}
-		if u.RawQuery != "" || u.Fragment != "" {
-			return "", "", errors.New("clone URL must not carry a query or fragment")
-		}
-		if u.User != nil {
-			username := u.User.Username()
-			_, hasPassword := u.User.Password()
-			if scheme != "ssh" || username != "git" || hasPassword {
-				return "", "", errors.New("clone URL must not carry credentials (userinfo)")
-			}
-		}
-		if scheme == "http" && !loopbackCloneHost(u.Hostname()) {
-			return "", "", errors.New("http clone URLs are only allowed for loopback hosts")
-		}
-		path, perr := cleanClonePath(u.Path)
-		if perr != nil {
-			return "", "", perr
-		}
-		h := canonicalHost(u.Host)
-		if h == "" {
-			return "", "", errors.New("clone URL names no host")
-		}
-		return h, path, nil
-	}
-	// scp-like git@host:path
-	at := strings.LastIndex(s, "@")
-	if at < 0 {
-		return "", "", errors.New("clone URL must be an absolute URL or an scp-style git@host:path")
-	}
-	if user := s[:at]; user != "git" {
-		return "", "", errors.New("scp-style clone URL must use the git user")
-	}
-	rest := s[at+1:]
-	colon := strings.Index(rest, ":")
-	if colon <= 0 {
-		return "", "", errors.New("malformed scp-style clone URL")
-	}
-	hostRaw, pathRaw := rest[:colon], rest[colon+1:]
-	if strings.ContainsAny(hostRaw, "/?#") {
-		return "", "", errors.New("malformed scp-style clone URL host")
-	}
-	if strings.ContainsAny(pathRaw, "?#") {
-		return "", "", errors.New("clone URL must not carry a query or fragment")
-	}
-	path, perr := cleanClonePath(pathRaw)
-	if perr != nil {
-		return "", "", perr
-	}
-	h := canonicalHost(hostRaw)
-	if h == "" {
-		return "", "", errors.New("clone URL names no host")
-	}
-	return h, path, nil
-}
-
-// cleanClonePath normalizes a clone URL's repository path: at most one
-// leading slash and one trailing slash are stripped, plus ONE trailing
-// ".git" suffix. The path must name at least one non-empty segment with no
-// "."/".." traversal and no empty (double-slash) segments: empty, slash-only
-// and ambiguous paths are rejected.
-func cleanClonePath(p string) (string, error) {
-	p = strings.TrimSpace(p)
-	if strings.HasPrefix(p, "//") {
-		return "", fmt.Errorf("clone URL repository path %q is malformed", p)
-	}
-	p = strings.TrimPrefix(p, "/")
-	p = strings.TrimSuffix(p, "/")
-	if p == "" {
-		return "", errors.New("clone URL names no repository path")
-	}
-	if len(p) > 4 && strings.EqualFold(p[len(p)-4:], ".git") {
-		p = p[:len(p)-4]
-		p = strings.TrimSuffix(p, "/")
-	}
-	if p == "" {
-		return "", errors.New("clone URL names no repository path")
-	}
-	segs := strings.Split(p, "/")
-	for _, seg := range segs {
-		if seg == "" || seg == "." || seg == ".." {
-			return "", fmt.Errorf("clone URL repository path %q is malformed", p)
-		}
-	}
-	return strings.Join(segs, "/"), nil
-}
-
-// loopbackCloneHost reports whether host is a loopback name/address. Plain
-// http is only admitted for loopback so a credential-less plaintext clone
-// can never be steered at an arbitrary network host through the parser.
-func loopbackCloneHost(host string) bool {
-	h := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
-	switch h {
-	case "localhost", "127.0.0.1", "::1":
-		return true
-	}
-	return strings.HasPrefix(h, "127.")
+	h, p, _, err := giturl.ParseCloneURL(raw)
+	return h, p, err
 }
 
 // canonicalHost normalizes a forge host spelling onto one canonical form,
@@ -154,99 +41,7 @@ func loopbackCloneHost(host string) bool {
 // (github.com:8443 is distinct). It agrees with auth.CanonicalHost, which
 // the RBAC/policy layers canonicalize with; the pinning test asserts it.
 func canonicalHost(raw string) string {
-	s := strings.TrimSpace(raw)
-	if s == "" {
-		return ""
-	}
-	if i := strings.Index(s, "://"); i >= 0 {
-		scheme := strings.ToLower(strings.TrimSpace(s[:i]))
-		if u, err := url.Parse(s); err == nil && u.Host != "" {
-			return canonHostPort(scheme, u.Host)
-		}
-		rest := s[i+3:]
-		if j := strings.IndexAny(rest, "/?#"); j >= 0 {
-			rest = rest[:j]
-		}
-		if at := strings.LastIndex(rest, "@"); at >= 0 {
-			rest = rest[at+1:]
-		}
-		return canonHostPort(scheme, rest)
-	}
-	if at := strings.LastIndex(s, "@"); at >= 0 {
-		rest := s[at+1:]
-		if colon := strings.Index(rest, ":"); colon >= 0 {
-			tail := rest[colon+1:]
-			if tail == "" || strings.Contains(tail, "/") {
-				return canonHostPort("ssh", rest[:colon])
-			}
-		}
-		return canonHostPort("", rest)
-	}
-	if j := strings.IndexAny(s, "/?#"); j >= 0 {
-		s = s[:j]
-	}
-	if colon := strings.Index(s, ":"); colon > 0 && !strings.Contains(s[:colon], ":") {
-		if _, err := strconv.Atoi(s[colon+1:]); err != nil {
-			// Legacy "host:path" spelling with no scp user and no numeric
-			// port: the colon separates the host from a path, not a port.
-			s = s[:colon]
-		}
-	}
-	return canonHostPort("", s)
-}
-
-func canonHostPort(scheme, hostPort string) string {
-	hostPort = strings.TrimSpace(hostPort)
-	if hostPort == "" {
-		return ""
-	}
-	if at := strings.LastIndex(hostPort, "@"); at >= 0 {
-		hostPort = hostPort[at+1:]
-	}
-	host, port := splitCanonHostPort(hostPort)
-	host = strings.ToLower(strings.TrimSuffix(host, "."))
-	if host == "" {
-		return ""
-	}
-	if port != "" && isDefaultHostPort(scheme, port) {
-		port = ""
-	}
-	if port != "" {
-		return host + ":" + port
-	}
-	return host
-}
-
-func splitCanonHostPort(hostPort string) (host, port string) {
-	if strings.HasPrefix(hostPort, "[") {
-		if end := strings.Index(hostPort, "]"); end > 0 {
-			host = hostPort[1:end]
-			if rest := hostPort[end+1:]; strings.HasPrefix(rest, ":") {
-				port = rest[1:]
-			}
-			return host, port
-		}
-		return hostPort, ""
-	}
-	if colon := strings.LastIndex(hostPort, ":"); colon > 0 && !strings.Contains(hostPort[:colon], ":") {
-		if _, err := strconv.Atoi(hostPort[colon+1:]); err == nil {
-			return hostPort[:colon], hostPort[colon+1:]
-		}
-	}
-	return hostPort, ""
-}
-
-func isDefaultHostPort(scheme, port string) bool {
-	switch scheme {
-	case "https":
-		return port == "443"
-	case "http":
-		return port == "80"
-	case "ssh":
-		return port == "22"
-	default:
-		return port == "443" || port == "80" || port == "22"
-	}
+	return giturl.CanonicalHost(raw)
 }
 
 // forgePathFromFullName normalizes a submitted repo_full_name / schedule
@@ -254,23 +49,8 @@ func isDefaultHostPort(scheme, port string) bool {
 // URL-shaped input is reduced through the strict clone-URL parser; a bare
 // owner/name is trimmed, ".git"-stripped and validated. It reports ok=false
 // for anything that cannot name a repository path.
-func forgePathFromFullName(raw string) (string, bool) {
-	s := strings.TrimSpace(raw)
-	if s == "" {
-		return "", false
-	}
-	if strings.Contains(s, "://") || strings.Contains(s, "@") {
-		_, p, err := parseCloneURL(s)
-		if err != nil {
-			return "", false
-		}
-		return p, true
-	}
-	p, err := cleanClonePath(s)
-	if err != nil {
-		return "", false
-	}
-	return p, true
+func forgePathFromFullName(full string) (string, bool) {
+	return giturl.ForgePathFromFullName(full)
 }
 
 // bindSubmissionRepoIdentity resolves and validates the repository identity
@@ -489,6 +269,34 @@ func publicForgeHost(forgeKind string) string {
 	default:
 		return "github.com"
 	}
+}
+
+// forgeKindForRepoID classifies a canonical repository identity to a forge
+// kind using the configured instance hosts first, then the public hosts. An
+// unclassifiable host yields "" so nothing is ever published to a guessed
+// forge.
+func (s *Server) forgeKindForRepoID(repoID string) string {
+	host := repoID
+	if i := strings.Index(host, "/"); i > 0 {
+		host = host[:i]
+	}
+	if host == "" {
+		return ""
+	}
+	for _, kind := range []string{"github", "gitlab", "forgejo"} {
+		if h := s.configuredForgeHost(kind); h != "" && h == host {
+			return kind
+		}
+	}
+	switch host {
+	case "github.com", "www.github.com":
+		return "github"
+	case "gitlab.com":
+		return "gitlab"
+	case "codeberg.org":
+		return "forgejo"
+	}
+	return ""
 }
 
 // forgeRepoID derives the canonical repository identity of one webhook

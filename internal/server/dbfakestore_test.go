@@ -21,6 +21,7 @@ import (
 // QueueReasonStore) so DB-mode server tests exercise the durable paths.
 type dbFakeStore struct {
 	mu        sync.Mutex
+	checkRuns map[string]string
 	runs      map[string]model.Run
 	jobs      map[string]model.Job
 	runners   map[string]model.Runner
@@ -1054,6 +1055,23 @@ func (f *dbFakeStore) SaveTestHistory(ctx context.Context, stats []byte) (int64,
 	f.testHistoryVersion++
 	f.testHistoryStats = append([]byte(nil), stats...)
 	return f.testHistoryVersion, nil
+}
+
+func (f *dbFakeStore) PutCheckRun(ctx context.Context, key, checkRunID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.checkRuns == nil {
+		f.checkRuns = map[string]string{}
+	}
+	f.checkRuns[key] = checkRunID
+	return nil
+}
+
+func (f *dbFakeStore) GetCheckRun(ctx context.Context, key string) (string, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	id, ok := f.checkRuns[key]
+	return id, ok, nil
 }
 
 func (f *dbFakeStore) GetSchedule(ctx context.Context, id string) (storage.Schedule, bool, error) {

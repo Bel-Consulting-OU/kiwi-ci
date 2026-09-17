@@ -9,6 +9,8 @@ import (
 // reserved for later phases.
 const (
 	OutboxKindGitHubCheck  = "github_check"
+	OutboxKindGitLabCheck  = "gitlab_check"
+	OutboxKindForgejoCheck = "forgejo_check"
 	OutboxKindGitHubStatus = "github_status"
 	OutboxKindDownstream   = "downstream"
 	OutboxKindWebhookCall  = "webhook_callback"
@@ -23,8 +25,13 @@ type OutboxItem struct {
 	CreatedAt time.Time       `json:"created_at"`
 }
 
-// CheckPayload carries the arguments for a github_check intent.
+// CheckPayload carries the arguments for a forge check intent. ForgeKind
+// records which forge the run belongs to so dispatch can never route one
+// forge's run to another's API.
 type CheckPayload struct {
+	RunID        string            `json:"run_id,omitempty"`
+	ForgeKind    string            `json:"forge_kind,omitempty"`
+	ForgeHost    string            `json:"forge_host,omitempty"`
 	RepoFullName string            `json:"repo_full_name"`
 	SHA          string            `json:"sha"`
 	Name         string            `json:"name"`

@@ -50,10 +50,10 @@ func TestSqueezePublishGitHubStatus(t *testing.T) {
 	s.gitHubAPIBase = "https://api.github.example"
 	s.ExternalURL = "https://kiwi.example"
 	// Missing coordinate: nothing to publish.
-	s.publishGitHubStatus(model.Run{ID: "r1"})
+	s.publishGitHubStatus(model.Run{ID: "r1", ForgeKind: "github", ForgeHost: "github.com"})
 
 	s.mu.Lock()
-	s.runs["r1"] = model.Run{ID: "r1", RepoFullName: "acme/backend", SHA: "sha", Status: model.StatusFailure}
+	s.runs["r1"] = model.Run{ID: "r1", RepoFullName: "acme/backend", SHA: "sha", ForgeKind: "github", ForgeHost: "github.com", Status: model.StatusFailure}
 	s.jobs["j1"] = model.Job{ID: "j1", RunID: "r1", Key: "build", Status: model.StatusFailure, Error: "compiler exploded"}
 	s.jobs["j2"] = model.Job{ID: "j2", RunID: "r1", Key: "test", Status: model.StatusSkipped}
 	s.jobs["j3"] = model.Job{ID: "j3", RunID: "r1", Key: "deploy", Status: model.StatusRunning}

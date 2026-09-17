@@ -8,6 +8,11 @@ import (
 )
 
 type SubmitRun struct {
+	// ForgeKind/ForgeHost are resolved SERVER-side at ingress (webhook
+	// handlers know the delivering forge; direct submissions derive it from
+	// the clone URL host). They are never accepted from public JSON.
+	ForgeKind    string `json:"-"`
+	ForgeHost    string `json:"-"`
 	RepoURL      string `json:"repo_url"`
 	RepoFullName string `json:"repo_full_name,omitempty"`
 	// RepoID is the canonical repository identity. It is never accepted

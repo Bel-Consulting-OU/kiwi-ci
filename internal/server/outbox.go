@@ -175,6 +175,14 @@ func (o *Outbox) Enqueue(item forge.OutboxItem) error {
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	// Idempotent by ID: deterministic intents (downstream launches keyed by
+	// the link's stable key) are replayed after lost ACKs and must converge
+	// on ONE durable intent.
+	for _, it := range o.items {
+		if it.ID == item.ID {
+			return nil
+		}
+	}
 	o.items = append(o.items, item)
 	if o.db != nil {
 		if err := o.db.OutboxAppend(context.Background(), storage.OutboxItem{
@@ -199,6 +207,23 @@ func (o *Outbox) Enqueue(item forge.OutboxItem) error {
 // inside another transaction (completion effect intents written by
 // storage.CompleteJob): the local copy lets this instance dispatch and ack
 // the pre-existing rows under the same IDs.
+// HasIntent reports whether an intent with this ID is already queued,
+// durably appended or currently in flight. Recovery paths use it to treat a
+// duplicate enqueue as success.
+func (o *Outbox) HasIntent(id string) bool {
+	if id == "" {
+		return false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for _, it := range o.items {
+		if it.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 func (o *Outbox) EnqueueLocal(item forge.OutboxItem) {
 	if item.CreatedAt.IsZero() {
 		item.CreatedAt = time.Now().UTC()
@@ -465,7 +490,46 @@ func (s *Server) dispatchOutbox(ctx context.Context, item forge.OutboxItem) erro
 		if err := json.Unmarshal(item.Payload, &p); err != nil {
 			return err
 		}
-		return s.gitHubForge().PublishCheck(ctx, p.RepoFullName, p.SHA, p.Name, p.Status, p.Conclusion, p.DetailsURL, p.Summary, p.Annotations)
+		// Defense in depth: a github_check intent whose payload names a
+		// different forge is dropped, never sent to the GitHub API.
+		if p.ForgeKind != "" && p.ForgeKind != "github" {
+			log.Printf("outbox: dropping github_check for %s run %s", p.ForgeKind, p.RepoFullName)
+			return nil
+		}
+		publisher := s.gitHubForge()
+		if idp, ok := interface{}(publisher).(forge.CheckRunPublisher); ok && p.RunID != "" {
+			key := s.checkRunKey(p.RunID, p.Name)
+			existing := s.getCheckRunID(ctx, key)
+			id, err := idp.PublishCheckRun(ctx, p.RepoFullName, p.SHA, p.Name, p.Status, p.Conclusion, p.DetailsURL, p.Summary, p.Annotations, existing)
+			if err != nil {
+				return err
+			}
+			if id != "" && id != existing {
+				s.putCheckRunID(ctx, key, id)
+			}
+			return nil
+		}
+		return publisher.PublishCheck(ctx, p.RepoFullName, p.SHA, p.Name, p.Status, p.Conclusion, p.DetailsURL, p.Summary, p.Annotations)
+	case forge.OutboxKindGitLabCheck:
+		var p forge.CheckPayload
+		if err := json.Unmarshal(item.Payload, &p); err != nil {
+			return err
+		}
+		if p.ForgeKind != "gitlab" {
+			log.Printf("outbox: dropping gitlab_check with forge kind %q", p.ForgeKind)
+			return nil
+		}
+		return s.gitLabForge().PublishCheck(ctx, p.RepoFullName, p.SHA, p.Name, p.Status, p.Conclusion, p.DetailsURL, p.Summary, p.Annotations)
+	case forge.OutboxKindForgejoCheck:
+		var p forge.CheckPayload
+		if err := json.Unmarshal(item.Payload, &p); err != nil {
+			return err
+		}
+		if p.ForgeKind != "forgejo" {
+			log.Printf("outbox: dropping forgejo_check with forge kind %q", p.ForgeKind)
+			return nil
+		}
+		return s.forgejoForge().PublishCheck(ctx, p.RepoFullName, p.SHA, p.Name, p.Status, p.Conclusion, p.DetailsURL, p.Summary, p.Annotations)
 	case forge.OutboxKindGitHubStatus:
 		var p forge.StatusPayload
 		if err := json.Unmarshal(item.Payload, &p); err != nil {

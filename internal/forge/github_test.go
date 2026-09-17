@@ -352,6 +352,7 @@ func TestGitHubPublishCheck(t *testing.T) {
 		}
 		_ = json.NewDecoder(r.Body).Decode(&lastBody)
 		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id": 1}`))
 	}))
 	defer ts.Close()
 	g := &GitHub{BaseURL: ts.URL, Token: "tok"}

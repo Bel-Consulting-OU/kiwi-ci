@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/giturl"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 	"io"
 	"net/http"
@@ -582,10 +583,23 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		r.complete(parent, t, model.StatusFailure, err, nil)
 		return
 	}
-	sink := logging.Func(func(job, step, line string) {
-		msg := masker.Mask(line)
-		fmt.Printf("[%s/%s] %s\n", job, step, msg)
-		_ = r.post(parent, "/api/v1/jobs/"+t.Job.ID+"/log", server.LogLine{RunnerID: r.ID, LeaseToken: t.LeaseToken, LeaseGeneration: t.LeaseGeneration, JobKey: job, Step: step, Line: msg}, nil)
+	// The sink spools lines in memory and a dedicated sender drains them:
+	// pipe readers must never block on control-plane delivery, so a slow log
+	// endpoint cannot stall the drain and silently drop the tail. Overflow
+	// and send failures are surfaced on completion (never a clean green job
+	// with lost logs).
+	consoleSink := logging.Func(func(job, step, line string) {
+		fmt.Printf("[%s/%s] %s\n", job, step, masker.Mask(line))
+	})
+	sink := newAsyncLogSink(consoleSink, func(lines []logLine) error {
+		var firstErr error
+		for _, l := range lines {
+			msg := masker.Mask(l.Line)
+			if err := r.post(parent, "/api/v1/jobs/"+t.Job.ID+"/log", server.LogLine{RunnerID: r.ID, LeaseToken: t.LeaseToken, LeaseGeneration: t.LeaseGeneration, JobKey: l.Job, Step: l.Step, Line: msg}, nil); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		return firstErr
 	})
 	// Distributed runs resolve secrets exclusively through the control
 	// plane's lease-bound delivery endpoint. Host env/Keychain providers
@@ -664,11 +678,44 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 			r.Metrics.Observe("kiwi_runner_snapshot_duration_seconds", time.Since(snapStart).Seconds())
 		}
 	}
+	// Flush the log spool before reporting the result; unsent or dropped
+	// lines make the job fail explicitly rather than completing clean.
+	remaining := sink.Flush(10 * time.Second)
+	dropped := sink.Dropped()
+	sendErr := sink.SendError()
+	sink.Close(2 * time.Second)
 	var runErr error
 	if res.Error != "" {
 		runErr = fmt.Errorf("%s", res.Error)
 	}
-	r.complete(parent, t, res.Status, runErr, res.Outputs)
+	status := res.Status
+	if dropped > 0 || remaining > 0 || sendErr != nil {
+		detail := ""
+		if dropped > 0 {
+			detail += fmt.Sprintf("%d log lines dropped (control plane too slow)", dropped)
+		}
+		if remaining > 0 {
+			if detail != "" {
+				detail += "; "
+			}
+			detail += fmt.Sprintf("%d log lines unsent at completion", remaining)
+		}
+		if sendErr != nil {
+			if detail != "" {
+				detail += "; "
+			}
+			detail += "log delivery error: " + sendErr.Error()
+		}
+		if runErr != nil {
+			runErr = fmt.Errorf("%w; %s", runErr, detail)
+		} else {
+			runErr = fmt.Errorf("%s", detail)
+		}
+		if status == model.StatusSuccess {
+			status = model.StatusFailure
+		}
+	}
+	r.complete(parent, t, status, runErr, res.Outputs)
 }
 
 // checkShardAssignment verifies the compile-time shard contract: the// control plane compiles tests.shards = N (N > 1) into N jobs whose env
@@ -920,23 +967,14 @@ func gitEnvForRepo(repoURL string, osEnv []string) ([]string, error) {
 	if strings.HasPrefix(repoURL, "-") {
 		return nil, fmt.Errorf("refusing git repo URL that looks like an option: %q", repoURL)
 	}
-	u, err := url.Parse(repoURL)
+	// Shared strict parser: the runner accepts exactly the forms the control
+	// plane admits (including scp-style git@host:owner/repo), so a URL Kiwi
+	// authorized can always be cloned.
+	host, _, scheme, err := giturl.ParseCloneURL(repoURL)
 	if err != nil {
-		return nil, fmt.Errorf("invalid repo URL: %w", err)
+		return nil, fmt.Errorf("refusing repo URL: %w", err)
 	}
-	// Embedded credentials are never accepted, except the conventional
-	// username-only ssh form (git@host): a password in a URL always leaks.
-	if u.User != nil {
-		_, hasPass := u.User.Password()
-		if u.Scheme != "ssh" || hasPass {
-			return nil, fmt.Errorf("refusing repo URL with embedded credentials")
-		}
-	}
-	if u.RawQuery != "" || u.Fragment != "" {
-		return nil, fmt.Errorf("refusing repo URL with query or fragment")
-	}
-	host := u.Hostname()
-	switch u.Scheme {
+	switch scheme {
 	case "https":
 		allowed := append([]string{"github.com"}, splitCSV(os.Getenv(envAllowedHTTPSHosts))...)
 		if !containsHost(allowed, host) {
@@ -951,10 +989,8 @@ func gitEnvForRepo(repoURL string, osEnv []string) ([]string, error) {
 		if !isLoopbackHost(host) || os.Getenv(envAllowInsecureClone) != "1" {
 			return nil, fmt.Errorf("refusing insecure http clone from %q (loopback + %s=1 required)", host, envAllowInsecureClone)
 		}
-	case "file", "git":
-		return nil, fmt.Errorf("refusing %s clone URL", u.Scheme)
 	default:
-		return nil, fmt.Errorf("unsupported or missing clone URL scheme %q", u.Scheme)
+		return nil, fmt.Errorf("unsupported clone URL scheme %q", scheme)
 	}
 
 	// Copy the environment, stripping every KIWI_GIT_TOKEN_* value so deploy
@@ -966,7 +1002,7 @@ func gitEnvForRepo(repoURL string, osEnv []string) ([]string, error) {
 		}
 		out = append(out, kv)
 	}
-	if u.Scheme == "https" {
+	if scheme == "https" {
 		// Exact-host token match: KIWI_GIT_TOKEN_<HOST with . and - mapped
 		// to _>. The git config is scoped to this host only.
 		tokenVar := "KIWI_GIT_TOKEN_" + strings.ToUpper(strings.NewReplacer(".", "_", "-", "_").Replace(host))

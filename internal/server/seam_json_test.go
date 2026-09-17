@@ -124,7 +124,7 @@ func TestSeamJSONDownstreamIntentsFailClosed(t *testing.T) {
 
 func TestSeamJSONCheckIntentFallsBack(t *testing.T) {
 	s := New("secret")
-	run := model.Run{ID: "run-1", RepoFullName: "o/r", SHA: "abc"}
+	run := model.Run{ID: "run-1", RepoFullName: "o/r", SHA: "abc", ForgeKind: "github", ForgeHost: "github.com"}
 	restore := seamJSON(t)
 	defer restore()
 	item := s.checkIntent(run, "kiwi", "completed", "success", "summary", nil)

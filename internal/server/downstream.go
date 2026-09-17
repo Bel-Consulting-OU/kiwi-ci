@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"strings"
 	"time"
 
@@ -61,6 +62,16 @@ func (s *Server) recordDownstreamIntents(ctx context.Context, j model.Job, run m
 	if event == "" {
 		event = "upstream"
 	}
+	// Idempotent recording: a link already stored for (parent, target, ref)
+	// carries the ONLY launch token this link may ever use, so a recovery
+	// replay must reuse it verbatim instead of minting a new one (a new token
+	// would make the same link look like a different launch and could spawn a
+	// second child). The deterministic outbox ID below dedupes the intent.
+	if existing, found, lerr := s.getDownstreamLink(ctx, j.ID, targetRepo, targetRef); lerr == nil && found {
+		return s.enqueueDownstreamIntent(ctx, j, run, d, existing)
+	} else if lerr != nil {
+		return fmt.Errorf("downstream: link read failed: %w", lerr)
+	}
 	token, err := newID()
 	if err != nil {
 		return err
@@ -87,24 +98,49 @@ func (s *Server) recordDownstreamIntents(ctx context.Context, j model.Job, run m
 	if err := s.insertDownstreamLink(ctx, link); err != nil {
 		return fmt.Errorf("downstream: link insert failed: %w", err)
 	}
+	return s.enqueueDownstreamIntent(ctx, j, run, d, link)
+}
+
+// enqueueDownstreamIntent writes the launch intent for a stored link with a
+// DETERMINISTIC outbox ID: a replay after a lost ACK or a crash between the
+// link commit and the intent append converges on the same intent, using the
+// link's stored launch token, and can never orphan the link.
+func (s *Server) enqueueDownstreamIntent(ctx context.Context, j model.Job, run model.Run, d pipeline.DownstreamSpec, link storage.DownstreamLink) error {
+	targetRepo := link.TargetRepo
+	targetRef := link.TargetRef
+	event := strings.TrimSpace(d.Event)
+	if event == "" {
+		event = "upstream"
+	}
 	payload := downstreamPayload{
 		ParentJobID: j.ID,
 		ParentRunID: run.ID,
 		TargetRepo:  targetRepo,
 		TargetRef:   targetRef,
-		LaunchToken: token,
+		LaunchToken: link.LaunchToken,
 		Event:       event,
 		Wait:        d.Wait,
 		Inputs:      cloneMap(d.Inputs),
-		Forge:       forgeKind,
+		Forge:       link.TargetForge,
 		Trusted:     downstreamChildTrusted(j),
 	}
 	raw, err := jsonMarshal(payload)
 	if err != nil {
 		return err
 	}
-	item := forge.OutboxItem{Kind: forge.OutboxKindDownstream, Payload: raw, CreatedAt: time.Now().UTC()}
+	item := forge.OutboxItem{
+		// Deterministic per link: replays collapse into one durable intent.
+		ID:        downstreamStableKey(j.ID, targetRepo, targetRef),
+		Kind:      forge.OutboxKindDownstream,
+		Payload:   raw,
+		CreatedAt: time.Now().UTC(),
+	}
 	if err := s.outbox.Enqueue(item); err != nil {
+		if s.outbox.HasIntent(item.ID) {
+			// Already recorded (a crash between link commit and ACK, or a
+			// concurrent replay): the intent exists, the link is satisfied.
+			return nil
+		}
 		return fmt.Errorf("downstream: outbox enqueue failed: %w", err)
 	}
 	return nil
