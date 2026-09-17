@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,7 @@ import (
 )
 
 func TestDispatchFlagAndTransportErrors(t *testing.T) {
+	testutil.UnixChmod(t)
 	dir := t.TempDir()
 	pipe := writePipeline(t, dir, "version: 1\njobs: {}\n")
 	// Flag parse error.

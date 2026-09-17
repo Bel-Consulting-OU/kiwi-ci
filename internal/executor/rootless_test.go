@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -32,6 +33,7 @@ func TestSecurityOptionsRootless(t *testing.T) {
 // requireRootlessDaemon function through a fake docker binary: a non-rootless
 // security-options report must refuse, a rootless one must pass.
 func TestRequireRootlessDaemonRunsTheCheckWithAFakeDocker(t *testing.T) {
+	testutil.UnixShell(t)
 	if runtime.GOOS == "windows" {
 		t.Skip("fake docker script is a POSIX shell script")
 	}

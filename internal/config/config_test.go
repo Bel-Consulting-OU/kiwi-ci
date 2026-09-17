@@ -411,3 +411,37 @@ func TestApplyEnvStrictNumeric(t *testing.T) {
 		t.Fatalf("canonical KIWI_QUOTA_REPO_CONCURRENCY must win over legacy, got %v", cfg.Quota.RepoConcurrency)
 	}
 }
+
+// TestForgeBaseURLTransportContract pins the forge-instance transport rules:
+// credentials on a forge root must never travel in plaintext, except to a
+// loopback development instance, and URLs never carry userinfo/query/fragment.
+func TestForgeBaseURLTransportContract(t *testing.T) {
+	cases := []struct {
+		name    string
+		mode    string
+		url     string
+		wantErr bool
+	}{
+		{"https production", "production", "https://gitlab.example.com", false},
+		{"http production", "production", "http://gitlab.example.com", true},
+		{"http loopback dev", "dev", "http://localhost:8080", false},
+		{"http loopback 127 dev", "dev", "http://127.0.0.1:8080", false},
+		{"http remote dev", "dev", "http://gitlab.internal", true},
+		{"userinfo", "production", "https://user:pass@gitlab.example.com", true},
+		{"query", "production", "https://gitlab.example.com?token=x", true},
+		{"fragment", "production", "https://gitlab.example.com#frag", true},
+		{"bad scheme", "production", "ftp://gitlab.example.com", true},
+	}
+	for _, tc := range cases {
+		cfg := &Config{Server: ServerConfig{Mode: tc.mode, ExternalURL: "https://ci.example.com"}}
+		cfg.GitLab.BaseURL = tc.url
+		cfg.Forgejo.BaseURL = "https://forgejo.example.com"
+		err := cfg.Validate()
+		if tc.wantErr && err == nil {
+			t.Errorf("%s: validation accepted %q", tc.name, tc.url)
+		}
+		if !tc.wantErr && err != nil {
+			t.Errorf("%s: validation rejected %q: %v", tc.name, tc.url, err)
+		}
+	}
+}

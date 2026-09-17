@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 	"io"
 	"net/http"
 	"net/url"
@@ -845,7 +846,13 @@ func cacheNamespace(j model.Job) string {
 	if j.Trusted {
 		trust = "trusted"
 	}
-	sum := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(j.RepoURL))))
+	// The namespace identity is the CANONICAL repository (PolicyRepoID when
+	// set, otherwise the RepoID derivation from the checkout URL): the clone
+	// URL is transport only, so HTTPS/SSH/default-port spellings of one
+	// repository share a namespace, and fork PRs use the base policy
+	// identity the server already wraps around this key.
+	id := storage.RepoIDForJob(j)
+	sum := sha256.Sum256([]byte(id))
 	return "repo:" + hex.EncodeToString(sum[:12]) + ":" + trust
 }
 

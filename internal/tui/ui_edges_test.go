@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"io"
 	"os"
 	"path/filepath"
@@ -140,6 +141,7 @@ func TestFindMatchesMultipleAndNone(t *testing.T) {
 }
 
 func TestExecToolSuccessAndFailure(t *testing.T) {
+	testutil.UnixShell(t)
 	dir := t.TempDir()
 	ok := filepath.Join(dir, "ok-tool")
 	if err := os.WriteFile(ok, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
@@ -163,6 +165,7 @@ func TestExecToolSuccessAndFailure(t *testing.T) {
 }
 
 func TestCopyPermalinkFallbacks(t *testing.T) {
+	testutil.UnixShell(t)
 	dir := t.TempDir()
 	t.Setenv("PATH", dir)
 	if copyPermalink("text") {

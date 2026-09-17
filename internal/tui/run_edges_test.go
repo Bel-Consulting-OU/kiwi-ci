@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -310,6 +311,7 @@ func TestRunInteractiveRefetchFailure(t *testing.T) {
 }
 
 func TestRunInteractivePermalinkCopied(t *testing.T) {
+	testutil.UnixShell(t)
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "pbcopy"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)

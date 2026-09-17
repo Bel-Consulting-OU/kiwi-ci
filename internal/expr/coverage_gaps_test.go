@@ -2,6 +2,7 @@ package expr
 
 import (
 	"errors"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -371,6 +372,7 @@ func TestParserErrorBranches(t *testing.T) {
 }
 
 func TestHashFilesErrorAndLimitBranches(t *testing.T) {
+	testutil.UnixChmod(t)
 	if _, err := EvalString("${{ hashFiles('*') }}", Context{Workspace: filepath.Join(t.TempDir(), "missing")}); err == nil {
 		t.Error("hashFiles with a non-directory workspace must fail")
 	}

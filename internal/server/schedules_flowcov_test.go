@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -152,6 +153,7 @@ func TestFlowSchedulesSanitizeSpec(t *testing.T) {
 }
 
 func TestFlowSchedulesLoadUnreadable(t *testing.T) {
+	testutil.UnixChmod(t)
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores file modes")
 	}

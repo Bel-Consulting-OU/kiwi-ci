@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -131,6 +132,7 @@ func TestFinalPrepareClientEnrollRejection(t *testing.T) {
 }
 
 func TestFinalRunGCReportsRemovedResources(t *testing.T) {
+	testutil.UnixShell(t)
 	// A fake docker that reports one stale labeled container exactly once:
 	// the marker directory makes the GC report happen on a single pass so no
 	// other goroutine reads the report seam afterwards.

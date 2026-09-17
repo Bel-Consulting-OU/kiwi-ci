@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -284,6 +285,7 @@ func TestConfigCheckFlagAndEnvErrors(t *testing.T) {
 }
 
 func TestDoctorCoversFoundAndMissingLookups(t *testing.T) {
+	testutil.UnixShell(t)
 	if err := Doctor([]string{"--bogus"}); err == nil {
 		t.Fatal("unknown flag accepted")
 	}

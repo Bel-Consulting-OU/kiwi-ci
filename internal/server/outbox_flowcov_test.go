@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"os"
 	"path/filepath"
 	"sync"
@@ -94,6 +95,7 @@ func TestFlowOutboxReplayDBBranches(t *testing.T) {
 }
 
 func TestFlowOutboxReadItemsErrors(t *testing.T) {
+	testutil.UnixChmod(t)
 	// A directory where the JSONL file belongs: decode failure.
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, outboxFile), 0o700); err != nil {
@@ -135,6 +137,7 @@ func TestFlowOutboxEnqueueLocalBranches(t *testing.T) {
 }
 
 func TestFlowOutboxAppendJSONLBranches(t *testing.T) {
+	testutil.UnixChmod(t)
 	o := NewOutbox(nil)
 	if err := o.appendJSONLLocked("x.jsonl", map[string]string{"a": "b"}); err != nil {
 		t.Fatalf("nil store append = %v", err)

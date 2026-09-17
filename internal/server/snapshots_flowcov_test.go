@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"errors"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -85,6 +86,7 @@ func TestFlowSnapshotMemoryMkdirFailure(t *testing.T) {
 }
 
 func TestFlowSnapshotMemoryStagingOpenFailure(t *testing.T) {
+	testutil.UnixChmod(t)
 	s, hdrs := fcMemoryBlobServer(t)
 	dir := filepath.Join(s.store.Root, "snapshots", "run-c", "job-a")
 	if err := os.MkdirAll(dir, 0o700); err != nil {

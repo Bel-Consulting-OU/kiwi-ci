@@ -441,3 +441,31 @@ func (s *S3) List(ctx context.Context, fn func(Object) error) error {
 		token = page.NextContinuationToken
 	}
 }
+
+// Stat issues a HeadObject request and reports size and Last-Modified.
+func (s *S3) Stat(ctx context.Context, key string) (Object, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, s.objectURL(key), nil)
+	if err != nil {
+		return Object{}, err
+	}
+	s.sign(req, emptyPayloadHash, time.Now().UTC())
+	resp, err := s.client().Do(req)
+	if err != nil {
+		return Object{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return Object{}, ErrNotFound
+	}
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return Object{}, fmt.Errorf("blob: s3 stat %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	obj := Object{Key: key, SHA256: key, Size: resp.ContentLength}
+	if lm := resp.Header.Get("Last-Modified"); lm != "" {
+		if t, terr := http.ParseTime(lm); terr == nil {
+			obj.ModTime = t
+		}
+	}
+	return obj, nil
+}

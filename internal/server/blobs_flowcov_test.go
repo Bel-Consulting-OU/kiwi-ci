@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -505,6 +506,7 @@ func TestFlowBlobUploadArtifactMkdirFailure(t *testing.T) {
 }
 
 func TestFlowBlobUploadArtifactStagingOpenFailure(t *testing.T) {
+	testutil.UnixChmod(t)
 	s, hdrs := fcMemoryBlobServer(t)
 	fcSeedContract(s, "job-a", fcBinContract())
 	dir := filepath.Join(s.store.Root, "artifacts", "run-c", "job-a")
@@ -996,6 +998,7 @@ func TestFlowBlobUploadJobCacheManifestStoreUnavailable(t *testing.T) {
 }
 
 func TestFlowBlobUploadJobCacheFSPersistFailures(t *testing.T) {
+	testutil.UnixChmod(t)
 	s, hdrs := fcMemoryBlobServer(t)
 	key := strings.Repeat("a", 64)
 	// A regular file where the cache directory belongs: MkdirAll fails.

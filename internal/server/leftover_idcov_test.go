@@ -17,6 +17,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"io"
 	"math/big"
 	"net/http"
@@ -346,6 +347,7 @@ func TestLeftoverLeaseKeyLoadErrors(t *testing.T) {
 // read-only parent makes MkdirAll fail, and a read-only existing directory
 // makes the key write fail. Both fail closed.
 func TestLeftoverLeaseKeyPersistFailure(t *testing.T) {
+	testutil.UnixChmod(t)
 	parent := t.TempDir()
 	if err := os.Chmod(parent, 0o500); err != nil {
 		t.Fatal(err)

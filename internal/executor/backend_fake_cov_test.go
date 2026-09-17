@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"io"
 	"net"
 	"net/http"
@@ -600,6 +601,7 @@ func TestTartBackendStartJobViaFakes(t *testing.T) {
 }
 
 func TestTartBackendStartJobErrorBranches(t *testing.T) {
+	testutil.UnixShell(t)
 	ctx := context.Background()
 	ws := t.TempDir()
 	// Clone failure.

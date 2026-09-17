@@ -2,6 +2,7 @@ package logging
 
 import (
 	"bytes"
+	"encoding/json"
 	"math"
 	"strings"
 	"testing"
@@ -92,14 +93,27 @@ func TestStructuredEdgeBranches(t *testing.T) {
 	buf.Reset()
 	s.Level = "info"
 	s.Info("msg", 42, "key", "value")
-	out := buf.String()
-	if strings.Contains(out, "42") || !strings.Contains(out, `"key":"value"`) {
-		t.Fatalf("non-string key handling = %q", out)
+	// Structural assertion: a substring search for "42" over the whole
+	// record is flaky because the timestamp can contain it (observed on
+	// macOS CI). Decode and inspect the fields instead.
+	var rec map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &rec); err != nil {
+		t.Fatalf("record is not valid JSON: %v (%q)", err, buf.String())
+	}
+	if rec["key"] != "value" {
+		t.Fatalf("kv pair missing: %v", rec)
+	}
+	if _, ok := rec["42"]; ok {
+		t.Fatalf("numeric key became a field: %v", rec)
 	}
 
 	buf.Reset()
 	s.Info("msg", "bad", math.Inf(1))
-	if !strings.Contains(buf.String(), `"bad":null`) {
-		t.Fatalf("unmarshalable value must render null: %q", buf.String())
+	var rec2 map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &rec2); err != nil {
+		t.Fatalf("record is not valid JSON: %v (%q)", err, buf.String())
+	}
+	if v, ok := rec2["bad"]; !ok || v != nil {
+		t.Fatalf("unmarshalable value must render null: %v", rec2)
 	}
 }

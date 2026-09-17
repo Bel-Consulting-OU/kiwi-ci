@@ -42,3 +42,11 @@ type Store interface {
 type Enumerator interface {
 	List(ctx context.Context, fn func(Object) error) error
 }
+
+// Statter is the optional age/metadata capability used by the reference-aware
+// CAS collector: a fresh stat under the digest fence re-checks that the
+// object is still old before deletion (the fence, not the stat, is what makes
+// the delete safe against concurrent re-publication).
+type Statter interface {
+	Stat(ctx context.Context, key string) (Object, error)
+}

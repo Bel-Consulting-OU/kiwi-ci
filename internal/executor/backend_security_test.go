@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"io"
 	"os"
 	"path/filepath"
@@ -137,6 +138,7 @@ func TestTartSSHArgsAreHardened(t *testing.T) {
 // invocation, no retry, and no insecure options in the args the fake ssh
 // received.
 func TestTartSSHAuthFailureIsHardError(t *testing.T) {
+	testutil.UnixShell(t)
 	if runtime.GOOS == "windows" {
 		t.Skip("fake ssh script is a POSIX shell script")
 	}

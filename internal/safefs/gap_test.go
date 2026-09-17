@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"errors"
 	"fmt"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"io"
 	"math"
 	"os"
@@ -376,6 +377,7 @@ func TestLegacyCollectSymlinkModes(t *testing.T) {
 // TestLegacyCollectReadDirError proves an unreadable directory surfaces from
 // the legacy walker.
 func TestLegacyCollectReadDirError(t *testing.T) {
+	testutil.UnixChmod(t)
 	requireNonRootSafefs(t)
 	ws := t.TempDir()
 	locked := filepath.Join(ws, "sub", "locked")
@@ -394,6 +396,7 @@ func TestLegacyCollectReadDirError(t *testing.T) {
 // TestWriteTarGzFollowingOpenError proves an unreadable regular file fails
 // the legacy writer (non-root).
 func TestWriteTarGzFollowingOpenError(t *testing.T) {
+	testutil.UnixChmod(t)
 	requireNonRootSafefs(t)
 	ws := t.TempDir()
 	locked := filepath.Join(ws, "locked.txt")
@@ -541,6 +544,7 @@ func TestWriteTarGzFromRootCollectErrors(t *testing.T) {
 // TestWriteTarGzFromRootCollectWalkError proves an unreadable directory
 // surfaces from the root-anchored collector (non-root).
 func TestWriteTarGzFromRootCollectWalkError(t *testing.T) {
+	testutil.UnixChmod(t)
 	requireNonRootSafefs(t)
 	ws := t.TempDir()
 	locked := filepath.Join(ws, "locked")
@@ -724,6 +728,7 @@ func TestExtractExistingEntryConflicts(t *testing.T) {
 // TestExtractFileOpenPermissionError proves a non-O_EXCL OS failure surfaces
 // from the file creation (non-root).
 func TestExtractFileOpenPermissionError(t *testing.T) {
+	testutil.UnixChmod(t)
 	requireNonRootSafefs(t)
 	dest := t.TempDir()
 	if err := os.Chmod(dest, 0o500); err != nil {
@@ -750,6 +755,7 @@ func TestExtractMkdirParentConflict(t *testing.T) {
 // TestExtractMkdirPermissionError proves a mkdirat failure other than EEXIST
 // surfaces (non-root, read-only destination).
 func TestExtractMkdirPermissionError(t *testing.T) {
+	testutil.UnixChmod(t)
 	requireNonRootSafefs(t)
 	dest := t.TempDir()
 	if err := os.Chmod(dest, 0o500); err != nil {

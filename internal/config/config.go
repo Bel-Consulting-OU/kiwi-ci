@@ -216,6 +216,41 @@ func Default() *Config {
 
 // Validate enforces the cross-field invariants: mode, production external
 // URL scheme, database URL format and blob backend enum.
+// validateForgeBaseURL enforces the forge-instance transport contract:
+// https in every mode except an explicitly allowed loopback http instance in
+// development; no userinfo, query or fragment (credential material belongs
+// in headers, never in the URL).
+func validateForgeBaseURL(field, raw, mode string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%s is not a valid URL: %w", field, err)
+	}
+	if u.Scheme != "https" && u.Scheme != "http" {
+		return fmt.Errorf("%s must use http:// or https://, got %q", field, u.Scheme)
+	}
+	if u.User != nil {
+		return fmt.Errorf("%s must not carry userinfo (credentials go in headers)", field)
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("%s must not carry a query or fragment", field)
+	}
+	if u.Scheme == "http" {
+		host := u.Hostname()
+		loopback := host == "localhost" || host == "127.0.0.1" || host == "::1"
+		if mode == "production" {
+			return fmt.Errorf("%s must use https:// in production (got plaintext http for a credential-bearing instance root)", field)
+		}
+		if !loopback {
+			return fmt.Errorf("%s may use plaintext http only for a loopback development instance, got %q", field, u.Host)
+		}
+	}
+	return nil
+}
+
 func (c *Config) Validate() error {
 	mode := c.Server.Mode
 	if mode == "" {
@@ -248,6 +283,15 @@ func (c *Config) Validate() error {
 		if c.Blob.S3Endpoint == "" || c.Blob.S3Bucket == "" || c.Blob.S3Region == "" {
 			return fmt.Errorf("blob.backend \"s3\" requires blob.s3_endpoint, blob.s3_bucket and blob.s3_region")
 		}
+	}
+	// Forge instance roots carry credentials (PRIVATE-TOKEN / token), so
+	// they must not travel over plaintext except to a genuine loopback
+	// development instance. Redirect refusal does not protect the transport.
+	if err := validateForgeBaseURL("gitlab.base_url", c.GitLab.BaseURL, mode); err != nil {
+		return err
+	}
+	if err := validateForgeBaseURL("forgejo.base_url", c.Forgejo.BaseURL, mode); err != nil {
+		return err
 	}
 	// GitHub App credentials are a pair: an app ID without a private key
 	// (or a key without an ID) can never authenticate.

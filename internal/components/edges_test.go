@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -50,6 +51,7 @@ func TestRemoteRegistryDefaultClient(t *testing.T) {
 }
 
 func TestRemoteRegistryResolveValidationAndTransport(t *testing.T) {
+	testutil.UnixChmod(t)
 	reg, err := NewRemoteRegistry("https://registry.example.com", "")
 	if err != nil {
 		t.Fatal(err)

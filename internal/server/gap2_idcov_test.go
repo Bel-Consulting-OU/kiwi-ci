@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -153,6 +154,7 @@ func TestIDCovTiersPureHelpers(t *testing.T) {
 // TestIDCovSessionHandlerGaps covers the login decode guard and the
 // malformed-token helpers.
 func TestIDCovSessionHandlerGaps(t *testing.T) {
+	testutil.UnixChmod(t)
 	s := testWebServer(t, "admin")
 	if w := doJSON(t, s, http.MethodPost, "/api/v1/login", "", `{`); w.Code != http.StatusBadRequest {
 		t.Fatalf("malformed login body = %d, want 400", w.Code)

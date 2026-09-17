@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"encoding/json"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -47,6 +48,7 @@ func TestDedupePrewarmItemsStableOrder(t *testing.T) {
 // duplicate entries and evicted new refs. After the fix the persisted state
 // holds each distinct (ref, kind) exactly once.
 func TestPrewarmRunDeduplicatesKeptRefs(t *testing.T) {
+	testutil.UnixShell(t)
 	bin := t.TempDir()
 	docker := filepath.Join(bin, "docker")
 	if err := os.WriteFile(docker, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -36,6 +37,7 @@ func TestFinalVerifyCompiledPayloadNilAndPipelineDigestError(t *testing.T) {
 }
 
 func TestFinalVerifyCompiledPayloadEncodeDecodeErrors(t *testing.T) {
+	testutil.UnixChmod(t)
 	spec, err := pipeline.Parse([]byte(payloadPipeline))
 	if err != nil {
 		t.Fatal(err)

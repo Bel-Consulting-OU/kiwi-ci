@@ -156,6 +156,12 @@ func (s *Server) uploadSBOM(w http.ResponseWriter, r *http.Request, j model.Job,
 			http.Error(w, "sidecar storage requires a blob store", http.StatusServiceUnavailable)
 			return
 		}
+		releaseGate, ferr := s.acquireDigestFence(ctx, sum)
+		if ferr != nil {
+			http.Error(w, ferr.Error(), 500)
+			return
+		}
+		defer releaseGate()
 		if _, perr := s.CAS.Put(ctx, bytes.NewReader(body)); perr != nil {
 			http.Error(w, perr.Error(), 500)
 			return
@@ -249,6 +255,12 @@ func (s *Server) uploadSigstore(w http.ResponseWriter, r *http.Request, j model.
 			http.Error(w, "sidecar storage requires a blob store", http.StatusServiceUnavailable)
 			return
 		}
+		releaseGate, ferr := s.acquireDigestFence(ctx, sum)
+		if ferr != nil {
+			http.Error(w, ferr.Error(), 500)
+			return
+		}
+		defer releaseGate()
 		if _, perr := s.CAS.Put(ctx, bytes.NewReader(body)); perr != nil {
 			http.Error(w, perr.Error(), 500)
 			return

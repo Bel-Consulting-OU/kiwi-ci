@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"io"
 	"math"
 	"os"
@@ -27,7 +28,7 @@ func requireNonRoot(t *testing.T) {
 // TestDefaultStoreRoot proves Default anchors the store under the user's home.
 func TestDefaultStoreRoot(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testutil.SetHome(t, home)
 	s := Default()
 	want := filepath.Join(home, ".kiwi", "artifacts")
 	if s.Root != want {

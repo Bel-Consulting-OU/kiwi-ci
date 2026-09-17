@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -89,6 +90,7 @@ func TestFinalRegisterServerErrorsAndCapabilityClaim(t *testing.T) {
 }
 
 func TestFinalDiscoveredCapabilities(t *testing.T) {
+	testutil.UnixShell(t)
 	t.Setenv("PATH", t.TempDir())
 	if got := discoveredCapabilities(); len(got) != 1 || got[0] != "native" {
 		t.Fatalf("bare host caps = %v", got)

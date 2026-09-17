@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -64,7 +65,7 @@ func okResp(status int, body io.ReadCloser) *http.Response {
 // TestDefaultStoreRoot proves Default anchors the store under the user's home.
 func TestDefaultStoreRoot(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testutil.SetHome(t, home)
 	s := Default()
 	if want := filepath.Join(home, ".kiwi", "cache"); s.Root != want {
 		t.Fatalf("Default().Root = %q, want %q", s.Root, want)
@@ -73,6 +74,7 @@ func TestDefaultStoreRoot(t *testing.T) {
 
 // TestKeyErrors proves workspace-open and file-read failures are surfaced.
 func TestKeyErrors(t *testing.T) {
+	testutil.UnixChmod(t)
 	s := &Store{Root: t.TempDir()}
 	if _, err := s.Key("base", filepath.Join(t.TempDir(), "missing"), nil); err == nil {
 		t.Fatal("missing workspace must fail")
@@ -108,6 +110,7 @@ func TestKeyErrors(t *testing.T) {
 // TestRestoreLocalFileErrors proves missing, unreadable, and unopenable
 // destinations are handled.
 func TestRestoreLocalFileErrors(t *testing.T) {
+	testutil.UnixChmod(t)
 	// Missing archive: a clean miss.
 	s := &Store{Root: t.TempDir()}
 	hit, err := s.Restore(gapCacheKey, t.TempDir(), nil)

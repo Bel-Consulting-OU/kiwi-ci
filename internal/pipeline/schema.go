@@ -551,6 +551,9 @@ const schemaSource = `{
         },
         "required": {
           "type": "boolean"
+        },
+        "max_size": {
+          "type": "string"
         }
       },
       "additionalProperties": false

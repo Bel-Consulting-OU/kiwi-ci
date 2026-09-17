@@ -1,11 +1,11 @@
 package runner
 
 import (
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"net"
 	"net/http"
 	"net/http/httptest"

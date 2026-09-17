@@ -60,6 +60,11 @@ import (
 // reference created by a NEW upload names a fresh object and is fully
 // protected by the age floor.
 
+// casGCAfterEnumeration is a test seam invoked between reference
+// collection and the delete sweep, so tests can publish a digest in exactly
+// the window the fence must protect. Production leaves it nil.
+var casGCAfterEnumeration func()
+
 const (
 	// defaultCASGCInterval is how often Maintain runs a CAS GC pass.
 	defaultCASGCInterval = time.Hour
@@ -173,6 +178,9 @@ func (s *Server) runCASGC(ctx context.Context, opts casGCOptions) (casGCStats, e
 	}
 	stats.Referenced = len(refs)
 	cutoff := opts.Now.Add(-opts.MinAge)
+	if casGCAfterEnumeration != nil {
+		casGCAfterEnumeration()
+	}
 
 	enumErr := enum.List(ctx, func(obj blob.Object) error {
 		stats.Enumerated++
@@ -194,15 +202,44 @@ func (s *Server) runCASGC(ctx context.Context, opts casGCOptions) (casGCStats, e
 		if !obj.ModTime.Before(cutoff) {
 			return nil
 		}
-		if err := store.Delete(ctx, obj.Key); err != nil {
-			if errors.Is(err, blob.ErrNotFound) {
+		// Fence the delete against publication for this digest: a writer
+		// holds the same fence across "publish + commit reference", so
+		// re-reading the durable references UNDER the fence makes a
+		// concurrent re-publication either visible (skip) or blocked until
+		// this delete completes (its own put then recreates the object and
+		// records the reference, which is safe).
+		return s.withDigestFence(ctx, digest, func() error {
+			fresh, ferr := s.collectCASReferences(ctx)
+			if ferr != nil {
+				return ferr
+			}
+			if _, live := fresh[digest]; live {
 				return nil
 			}
-			return err
-		}
-		stats.Deleted++
-		stats.Bytes += obj.Size
-		return nil
+			freshStat := obj
+			if st, ok := store.(blob.Statter); ok {
+				got, statErr := st.Stat(ctx, obj.Key)
+				if statErr != nil {
+					if errors.Is(statErr, blob.ErrNotFound) {
+						return nil
+					}
+					return statErr
+				}
+				freshStat = got
+			}
+			if freshStat.ModTime.IsZero() || !freshStat.ModTime.Before(cutoff) {
+				return nil
+			}
+			if err := store.Delete(ctx, obj.Key); err != nil {
+				if errors.Is(err, blob.ErrNotFound) {
+					return nil
+				}
+				return err
+			}
+			stats.Deleted++
+			stats.Bytes += freshStat.Size
+			return nil
+		})
 	})
 	if enumErr != nil && !errors.Is(enumErr, errCASGCBatchDone) {
 		return stats, fmt.Errorf("cas gc: enumerate: %w", enumErr)

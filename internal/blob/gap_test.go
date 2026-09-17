@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"io"
 	"net/http"
 	"net/url"
@@ -145,6 +146,7 @@ func TestFSPutRenameRaceBranches(t *testing.T) {
 
 // TestFSPutCreateTempError proves an unwritable shard directory fails.
 func TestFSPutCreateTempError(t *testing.T) {
+	testutil.UnixChmod(t)
 	requireNonRootBlob(t)
 	root := t.TempDir()
 	shard := filepath.Join(root, "sha256", gapKey[:2])
@@ -200,6 +202,7 @@ func TestFSFirstErr(t *testing.T) {
 // TestFSOpenStatAndOpenErrors proves non-notfound stat errors and open
 // errors are surfaced.
 func TestFSOpenStatAndOpenErrors(t *testing.T) {
+	testutil.UnixChmod(t)
 	requireNonRootBlob(t)
 	root := t.TempDir()
 	// Unreadable shard directory: Stat fails with EACCES.

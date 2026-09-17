@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 // TestSqueezeNewPersistentLoaderErrors drives every data-dir loader failure
 // return inside NewPersistentWithCluster with a corrupt fixture file.
 func TestSqueezeNewPersistentLoaderErrors(t *testing.T) {
+	testutil.UnixChmod(t)
 	cases := []struct {
 		name  string
 		write func(t *testing.T, dir string)

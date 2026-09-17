@@ -572,6 +572,15 @@ type DownstreamLaunchClaim struct {
 	StableChildID string `json:"stable_child_id"`
 }
 
+// DigestFencer serializes CAS publication and collection per digest. A
+// writer holds the fence across "publish object + commit durable reference";
+// the collector holds the same fence across "re-read references + delete".
+// DB implementations use a session advisory lock so the fence spans HA
+// replicas; memory implementations use a per-digest mutex.
+type DigestFencer interface {
+	WithDigestFence(ctx context.Context, digest string, fn func() error) error
+}
+
 // SupersedePolicy folds concurrency-group cancel-in-progress supersession
 // into the enqueue transaction: every other non-terminal run of the same
 // repository and concurrency group is cancelled — jobs terminal-cancelled

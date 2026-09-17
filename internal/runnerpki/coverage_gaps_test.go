@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"math/big"
 	"net/url"
 	"os"
@@ -114,6 +115,7 @@ func TestLoadCARejectsMalformedMaterial(t *testing.T) {
 }
 
 func TestLoadOrCreateCAErrorBranches(t *testing.T) {
+	testutil.UnixChmod(t)
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, caCertFile), []byte("junk"), 0o600); err != nil {
 		t.Fatal(err)

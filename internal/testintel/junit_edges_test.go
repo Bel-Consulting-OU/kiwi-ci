@@ -4,6 +4,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"math"
 	"os"
 	"path/filepath"
@@ -35,6 +36,7 @@ func writeReport(t *testing.T, name, content string) string {
 }
 
 func TestParseIOErrors(t *testing.T) {
+	testutil.UnixChmod(t)
 	if _, err := Parse(filepath.Join(t.TempDir(), "missing.xml")); err == nil {
 		t.Fatal("missing report must fail")
 	}

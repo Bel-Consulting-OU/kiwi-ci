@@ -779,6 +779,8 @@ func (f *FaultyStore) SaveTestHistory(ctx context.Context, stats []byte) (int64,
 // baseline underneath FaultyStore in fault-injection tests.
 type memStore struct {
 	mu         sync.Mutex
+	fenceMu    sync.Mutex
+	fences     map[string]*sync.Mutex
 	runs       map[string]model.Run
 	jobs       map[string]model.Job
 	runners    map[string]model.Runner
@@ -1502,6 +1504,60 @@ func (m *memStore) ListSchedules(ctx context.Context) ([]Schedule, error) {
 // last_run = max(existing, nominal), mirroring the SQL GREATEST update. A
 // stale caller can never move the marker backwards. An unknown schedule is
 // ErrNotFound.
+func (m *memStore) AcquireDigestFence(ctx context.Context, digest string) (func(), error) {
+	m.fenceMu.Lock()
+	mu, ok := m.fences[digest]
+	if !ok {
+		mu = &sync.Mutex{}
+		if m.fences == nil {
+			m.fences = map[string]*sync.Mutex{}
+		}
+		m.fences[digest] = mu
+	}
+	m.fenceMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	mu.Lock()
+	var once sync.Once
+	return func() { once.Do(mu.Unlock) }, nil
+}
+
+func (m *memStore) WithDigestFence(ctx context.Context, digest string, fn func() error) error {
+	m.fenceMu.Lock()
+	mu, ok := m.fences[digest]
+	if !ok {
+		mu = &sync.Mutex{}
+		if m.fences == nil {
+			m.fences = map[string]*sync.Mutex{}
+		}
+		m.fences[digest] = mu
+	}
+	m.fenceMu.Unlock()
+	mu.Lock()
+	defer mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return fn()
+}
+
+func (f *FaultyStore) WithDigestFence(ctx context.Context, digest string, fn func() error) error {
+	inner, ok := f.Inner.(DigestFenceStore)
+	if !ok {
+		return fmt.Errorf("storage: inner store does not implement DigestFenceStore")
+	}
+	return inner.WithDigestFence(ctx, digest, fn)
+}
+
+func (f *FaultyStore) AcquireDigestFence(ctx context.Context, digest string) (func(), error) {
+	inner, ok := f.Inner.(DigestFenceStore)
+	if !ok {
+		return nil, fmt.Errorf("storage: inner store does not implement DigestFenceStore")
+	}
+	return inner.AcquireDigestFence(ctx, digest)
+}
+
 func (m *memStore) AdvanceScheduleLastRun(ctx context.Context, id string, nominal time.Time) error {
 	if id == "" {
 		return fmt.Errorf("storage: empty schedule id")

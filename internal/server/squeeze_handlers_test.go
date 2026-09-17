@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -144,6 +145,7 @@ func TestSqueezeEnvironmentCapacity(t *testing.T) {
 // TestSqueezeRerunMemoryEdges covers the memory rerun 404 and enqueue-error
 // branches.
 func TestSqueezeRerunMemoryEdges(t *testing.T) {
+	testutil.UnixChmod(t)
 	s := New("secret")
 	c := newTestClient(t, s.Handler(), "secret")
 	if w := c.do(http.MethodPost, "/api/v1/runs/missing/rerun", nil, nil); w.Code != http.StatusNotFound {

@@ -16,3 +16,10 @@
 
 # Fuzz corpus/crash artifacts
 testdata/fuzz/
+
+# Generated coverage profiles and local tool binaries
+/coverage.out
+/integration-coverage.out
+/merged-coverage.out
+/filemap
+/dist/

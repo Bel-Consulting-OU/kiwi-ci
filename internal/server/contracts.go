@@ -38,7 +38,7 @@ func buildJobContracts(cj pipeline.CompiledJob) map[string]storage.ArtifactContr
 			Name:     name,
 			Paths:    append([]string(nil), a.Paths...),
 			Required: a.Required,
-			MaxSize:  0,
+			MaxSize:  int64(a.MaxSize),
 			SBOM:     strings.TrimSpace(a.SBOM),
 		}
 		if a.Sigstore != nil {

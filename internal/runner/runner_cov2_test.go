@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -171,6 +172,7 @@ func TestCacheTransportUploadAndRestoreFailures(t *testing.T) {
 }
 
 func TestCheckoutViaFakeGit(t *testing.T) {
+	testutil.UnixShell(t)
 	bin := t.TempDir()
 	script := `#!/bin/sh
 echo "$@" >> "${FAKE_GIT_LOG:-/dev/null}"

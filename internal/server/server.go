@@ -164,6 +164,11 @@ type Server struct {
 	// such as deployments directly.
 	AdmissionCapabilities *policy.Capabilities
 
+	// digestFence serializes CAS publication against garbage collection for
+	// memory/fs deployments; DB mode prefers the store-backed fence so the
+	// serialization spans replicas (see withDigestFence).
+	digestFence cas.Fencer
+
 	// Policy is the loaded organization policy file; its repository
 	// restrictions are intersected into every admission decision and can
 	// only narrow the effective capabilities.
@@ -962,7 +967,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	// repository path of repo_url. The binding runs BEFORE any RBAC,
 	// policy or quota work so a mismatched submission can never authorize
 	// as the name it claims.
-	if err := bindSubmissionRepoIdentity(&in); err != nil {
+	if err := bindPublicSubmissionRepoIdentity(&in); err != nil {
 		var adm *admissionError
 		if errors.As(err, &adm) {
 			writeJSON(w, adm.Status, map[string]string{"error": adm.Msg, "reason": adm.Reason})
@@ -1660,6 +1665,41 @@ func (s *Server) getLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	// In-memory servers keep no historical log buffer by design; tests/dev can still stream stdout.
 	writeJSON(w, http.StatusOK, []model.LogEntry{})
+}
+
+// defaultDigestFence backs servers that were constructed without New (tests
+// build zero-value Servers) so publication and collection still serialize.
+var defaultDigestFence cas.Fencer = cas.NewMemFencer()
+
+// withDigestFence serializes "publish object + commit durable reference"
+// (writers) against "re-read references + delete" (the CAS collector) for one
+// digest. DB mode uses the store-backed advisory lock so the fence spans HA
+// replicas; memory/fs mode uses the in-process fencer.
+func (s *Server) withDigestFence(ctx context.Context, digest string, fn func() error) error {
+	if s.DB != nil {
+		if fencer, ok := s.DB.(storage.DigestFenceStore); ok {
+			return fencer.WithDigestFence(ctx, digest, fn)
+		}
+	}
+	if s.digestFence == nil {
+		return defaultDigestFence.WithFence(ctx, digest, fn)
+	}
+	return s.digestFence.WithFence(ctx, digest, fn)
+}
+
+// acquireDigestFence takes the digest fence for a handler whose critical
+// section spans more than one call; the returned release is idempotent.
+func (s *Server) acquireDigestFence(ctx context.Context, digest string) (func(), error) {
+	if s.DB != nil {
+		if fencer, ok := s.DB.(storage.DigestFenceStore); ok {
+			return fencer.AcquireDigestFence(ctx, digest)
+		}
+	}
+	f := s.digestFence
+	if f == nil {
+		f = defaultDigestFence
+	}
+	return f.Acquire(ctx, digest)
 }
 
 // registerResponse always carries the capability claim, even when it is an

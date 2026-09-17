@@ -471,3 +471,66 @@ func TestMaybeRunCASGCIntervalGating(t *testing.T) {
 		t.Fatal("a tick past the interval must collect")
 	}
 }
+
+// TestCASGCEnumerationPauseRepublishKeepsBlob is the deterministic fence
+// regression: the collector enumerates an old unreferenced digest, the test
+// pauses it at exactly that point, a writer republishes the SAME digest and
+// commits a durable reference (through the fence), the collector resumes,
+// and the blob must survive. Without the fence + under-fence reference
+// re-read the resumed pass would delete the now-live object, leaving durable
+// metadata pointing at a missing blob.
+func TestCASGCEnumerationPauseRepublishKeepsBlob(t *testing.T) {
+	s, _ := casGCTestServer(t)
+	orphan := putCASBlob(t, s, "resurrected payload")
+	ageCASBlob(t, s, orphan.SHA256, 48*time.Hour)
+
+	paused := make(chan struct{})
+	resumed := make(chan struct{})
+	oldHook := casGCAfterEnumeration
+	casGCAfterEnumeration = func() {
+		close(paused)
+		<-resumed
+	}
+	t.Cleanup(func() { casGCAfterEnumeration = oldHook })
+
+	type gcResult struct {
+		stats casGCStats
+		err   error
+	}
+	done := make(chan gcResult, 1)
+	go func() {
+		stats, err := s.runCASGC(context.Background(), casGCOptions{MinAge: 24 * time.Hour, Batch: 100})
+		done <- gcResult{stats, err}
+	}()
+
+	<-paused
+	// The dangerous real-world case is a DEDUPLICATED reference: a new
+	// record pointing at the existing old blob WITHOUT rewriting its bytes,
+	// so the object's mtime stays old and only the under-fence reference
+	// re-read can save it. (A byte-level re-put would refresh the mtime and
+	// the fresh-stat guard would mask the re-read path this test must
+	// exercise.)
+	if err := s.withDigestFence(context.Background(), orphan.SHA256, func() error {
+		s.mu.Lock()
+		s.artifacts["resurrected"] = model.ArtifactRecord{ID: "resurrected", SHA256: orphan.SHA256}
+		s.mu.Unlock()
+		return nil
+	}); err != nil {
+		t.Fatalf("reference the deduplicated digest under fence: %v", err)
+	}
+	// Prove the object is still old: the age guard alone must NOT be what
+	// saves it.
+	ageCASBlob(t, s, orphan.SHA256, 48*time.Hour)
+	close(resumed)
+
+	res := <-done
+	if res.err != nil {
+		t.Fatalf("runCASGC: %v", res.err)
+	}
+	if res.stats.Deleted != 0 {
+		t.Fatalf("deleted = %d, want 0 (a concurrently referenced digest must survive)", res.stats.Deleted)
+	}
+	if !casBlobExists(t, s, orphan.SHA256) {
+		t.Fatal("the re-referenced digest was deleted: durable metadata now points at a missing blob")
+	}
+}

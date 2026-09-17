@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -42,6 +43,7 @@ import (
 // with the explicit provisioning refusal instead of starting a broken
 // container.
 func TestRootlessHardenedContainerWorkspaceIntegration(t *testing.T) {
+	testutil.UnixChmod(t)
 	if os.Getenv("KIWI_TEST_DOCKER") != "1" {
 		t.Skip("set KIWI_TEST_DOCKER=1 on a host with a Docker daemon to run the workspace integration test")
 	}

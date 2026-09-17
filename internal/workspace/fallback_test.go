@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"context"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -88,6 +89,7 @@ func TestSnapshotCopyFallback(t *testing.T) {
 // add` fails while the context is still live: the target is removed and the
 // snapshot falls through to the copy strategies.
 func TestSnapshotWorktreeAddFailure(t *testing.T) {
+	testutil.UnixChmod(t)
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
@@ -151,6 +153,7 @@ func TestSnapshotCancelDuringReflink(t *testing.T) {
 // TestSnapshotCancelDuringWorktree cancels the context while `git worktree
 // add` is running: the worktree strategy must report the context error.
 func TestSnapshotCancelDuringWorktree(t *testing.T) {
+	testutil.UnixShell(t)
 	realGit, err := exec.LookPath("git")
 	if err != nil {
 		t.Skip("git not available")

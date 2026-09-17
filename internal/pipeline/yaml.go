@@ -222,7 +222,7 @@ var knownFieldTables = map[string]map[string]bool{
 	"jobs.*.steps.*":                     {"id": true, "name": true, "run": true, "if": true, "shell": true, "working_directory": true, "env": true, "secrets": true, "timeout": true, "retry": true, "continue_on_error": true},
 	"jobs.*.steps.*.retry":               {"max": true, "backoff": true, "on": true},
 	"jobs.*.cache.*":                     {"name": true, "paths": true, "key": true, "hash_files": true, "restore_keys": true},
-	"jobs.*.artifacts.*":                 {"name": true, "paths": true, "if": true, "retention": true, "sbom": true, "sigstore": true, "required": true},
+	"jobs.*.artifacts.*":                 {"name": true, "paths": true, "if": true, "retention": true, "sbom": true, "sigstore": true, "required": true, "max_size": true},
 	"jobs.*.artifacts.*.sigstore":        {"required": true, "issuer": true, "identity": true},
 	"jobs.*.downloads.*":                 {"from": true, "name": true, "path": true},
 	"jobs.*.deployment.canary.*":         {"id": true, "name": true, "run": true, "if": true, "shell": true, "working_directory": true, "env": true, "secrets": true, "timeout": true, "retry": true, "continue_on_error": true},

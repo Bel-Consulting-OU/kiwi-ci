@@ -188,3 +188,19 @@ func firstErr(errs ...error) error {
 	}
 	return nil
 }
+
+// Stat returns the object's current size and mtime without opening it.
+func (s *FS) Stat(ctx context.Context, key string) (Object, error) {
+	if !keyRE.MatchString(key) {
+		return Object{}, fmt.Errorf("blob: invalid key %q", key)
+	}
+	dst := filepath.Join(s.Root, "sha256", key[:2], key)
+	fi, err := os.Stat(dst)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return Object{}, ErrNotFound
+		}
+		return Object{}, err
+	}
+	return Object{Key: key, SHA256: key, Size: fi.Size(), ModTime: fi.ModTime()}, nil
+}

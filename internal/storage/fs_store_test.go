@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"io"
 	"math"
 	"os"
@@ -129,6 +130,7 @@ func TestFSLoadNilPayloadMapsAreFilled(t *testing.T) {
 }
 
 func TestFSLoadCorruptStateFails(t *testing.T) {
+	testutil.UnixChmod(t)
 	dir := t.TempDir()
 	repo := New(dir)
 	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte("{not json"), 0o600); err != nil {

@@ -328,6 +328,18 @@ func bindSubmissionRepoIdentity(in *SubmitRun) error {
 	return nil
 }
 
+// bindPublicSubmissionRepoIdentity is the PUBLIC API contract: POST
+// /api/v1/runs must carry repo_url, because a URL-less submission has no
+// checkout repository and can only fail later on the runner. Internal
+// ingresses that legitimately know a bare identity (legacy state, tests)
+// keep using bindSubmissionRepoIdentity directly.
+func bindPublicSubmissionRepoIdentity(in *SubmitRun) error {
+	if strings.TrimSpace(in.RepoURL) == "" {
+		return &admissionError{Status: 400, Reason: "repo_url_required", Msg: "repo_url is required for API submissions"}
+	}
+	return bindSubmissionRepoIdentity(in)
+}
+
 // submittedPolicyRepoID resolves the policy/authorization identity of a
 // submission: the explicit PolicyRepoID when set, otherwise the immutable
 // RepoID. Internal ingresses set both; legacy payloads carry only RepoID.

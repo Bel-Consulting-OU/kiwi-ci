@@ -369,7 +369,7 @@ func TestFlowDownstreamReserveMemoryBranches(t *testing.T) {
 	// existing-link path.
 	s.store = storage.New(t.TempDir())
 	block := t.TempDir()
-	if err := writeFileSync(block+"/x", []byte("x"), 0o600); err != nil {
+	if err := storage.AtomicWriteFile(block+"/x", []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	s.store.Root = block + "/x"

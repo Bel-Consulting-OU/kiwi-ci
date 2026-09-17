@@ -365,6 +365,37 @@ steps:
   # and mounting the daemon socket.
   docker-workspace:
     image: golang:1.27
+    # REQUIRED lane on a Docker-capable agent: the rootless/hardened
+    # workspace invariant had a production bug, so "Docker unavailable" is a
+    # FAILURE here, not a skip. Agents without the label never run the step;
+    # an agent with the label but no usable daemon fails it. Use the
+    # self-skipping smoke variant below for best-effort environments.
+    labels: [docker]
+    depends_on: [unit]
+    environment:
+      GOTOOLCHAIN: local
+      KIWI_TEST_DOCKER: "1"
+    when:
+      - event: [push, pull_request, manual, tag]
+        platform: linux/amd64
+    commands:
+      - |
+        if ! command -v docker >/dev/null 2>&1; then
+          echo "required docker lane: docker CLI is not installed on this labeled agent" >&2
+          exit 1
+        fi
+        if ! docker info >/dev/null 2>&1; then
+          echo "required docker lane: no usable docker daemon (socket missing or permission denied)" >&2
+          docker info >&2 || true
+          exit 1
+        fi
+        go test -count=1 -v -timeout=20m -run RootlessHardenedContainerWorkspace ./internal/runner
+
+  docker-workspace-smoke:
+    image: golang:1.27
+    # Best-effort companion lane: runs wherever a daemon happens to exist and
+    # skips cleanly otherwise, so the invariant still gets exercised outside
+    # the labeled production agent without making every agent a hard failure.
     depends_on: [unit]
     environment:
       GOTOOLCHAIN: local
@@ -375,9 +406,9 @@ steps:
       - |
         if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
           export KIWI_TEST_DOCKER=1
-          echo "docker daemon available: running the rootless/hardened workspace integration test"
+          echo "docker daemon available: running the rootless/hardened workspace integration test (smoke)"
         else
-          echo "no usable docker daemon on this agent (CLI or socket missing); the test will self-skip"
+          echo "smoke lane: no usable docker daemon on this agent; skipping"
         fi
         go test -count=1 -v -timeout=20m -run RootlessHardenedContainerWorkspace ./internal/runner
 

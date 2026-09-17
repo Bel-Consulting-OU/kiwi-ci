@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"errors"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -40,6 +41,7 @@ func TestManifestForOpenWorkspaceErrors(t *testing.T) {
 // TestManifestForUnreadableDir proves a walk error surfaces (and that the
 // walk error path is reported once).
 func TestManifestForUnreadableDir(t *testing.T) {
+	testutil.UnixChmod(t)
 	requireNonRootSnapshot(t)
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "locked"), 0o755); err != nil {
@@ -58,6 +60,7 @@ func TestManifestForUnreadableDir(t *testing.T) {
 // TestManifestForUnreadableFile proves an unopenable regular file surfaces
 // from the no-follow open.
 func TestManifestForUnreadableFile(t *testing.T) {
+	testutil.UnixChmod(t)
 	requireNonRootSnapshot(t)
 	root := t.TempDir()
 	locked := filepath.Join(root, "locked.txt")

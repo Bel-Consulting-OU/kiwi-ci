@@ -261,6 +261,21 @@ func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j mode
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
+	// Publish + record commit under the digest fence (the collector re-reads
+	// references under the same fence). The digest is only known after Put,
+	// so the staging temp file is hashed here first; a matching CAS.Put is
+	// idempotent.
+	stagedSum, sumErr := fileSHA256(tmp.Name())
+	if sumErr != nil {
+		http.Error(w, sumErr.Error(), 500)
+		return
+	}
+	releaseSnap, fenceErr := s.acquireDigestFence(ctx, stagedSum)
+	if fenceErr != nil {
+		http.Error(w, fenceErr.Error(), 500)
+		return
+	}
+	defer releaseSnap()
 	obj, err := s.CAS.Put(ctx, tmp)
 	if err != nil {
 		http.Error(w, "snapshot storage failed", http.StatusServiceUnavailable)
@@ -518,4 +533,19 @@ func (s *Server) downloadSnapshotDB(w http.ResponseWriter, r *http.Request) {
 func redactSnapshot(rec model.SnapshotRecord) model.SnapshotRecord {
 	rec.Path = ""
 	return rec
+}
+
+// fileSHA256 hashes a staged file so the digest fence can be taken before
+// the object is published to CAS.
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }

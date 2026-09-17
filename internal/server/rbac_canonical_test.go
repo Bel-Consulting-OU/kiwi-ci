@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
@@ -41,10 +42,12 @@ func TestCanonicalReposNeverShareAuthorization(t *testing.T) {
 		t.Fatalf("gitlab submit via github principal = %d, want 403: %s", w.Code, w.Body.String())
 	}
 	// A BARE identity (no repo URL at all) must not match the canonical
-	// key either — the old bare-to-canonical fallback is gone.
+	// key either — and the PUBLIC API now requires repo_url outright
+	// (a URL-less submission has no checkout repository), so the bare form
+	// is rejected before RBAC ever runs.
 	w = c.do(http.MethodPost, "/api/v1/runs", SubmitRun{RepoFullName: "acme/service", Ref: "main", Pipeline: simpleContainerPipeline}, nil)
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("bare submit via canonical principal = %d, want 403: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "repo_url_required") {
+		t.Fatalf("bare public submit = %d, want 400 repo_url_required: %s", w.Code, w.Body.String())
 	}
 }
 

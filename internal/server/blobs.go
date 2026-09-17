@@ -106,6 +106,20 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 	lock.Lock()
 	defer lock.Unlock()
 
+	// Effective limit is the smaller of the global safety ceiling and the
+	// frozen artifact contract: a 10 MiB contract must reject a multi-GB
+	// body BEFORE it is staged, hashed or written anywhere. An excessive
+	// Content-Length is rejected outright; the stream itself is bounded at
+	// effectiveLimit+1 so an unknown-length body cannot run past it either.
+	effectiveLimit := maxBlobBytes
+	if contract.MaxSize > 0 && contract.MaxSize < effectiveLimit {
+		effectiveLimit = contract.MaxSize
+	}
+	if cl := r.ContentLength; cl > effectiveLimit {
+		s.auditLocked("artifact.contract_violation", runnerID, j.RunID, j.ID, "artifact Content-Length exceeds declared max size", map[string]string{"name": name, "size": strconv.FormatInt(cl, 10), "max": strconv.FormatInt(effectiveLimit, 10)})
+		http.Error(w, "artifact exceeds the declared maximum size", http.StatusRequestEntityTooLarge)
+		return
+	}
 	id, err := newID()
 	if err != nil {
 		http.Error(w, "internal server error", http.StatusInternalServerError)
@@ -119,11 +133,17 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 	}
 	start := time.Now()
 	h := sha256.New()
-	n, copyErr := io.Copy(io.MultiWriter(f, h), http.MaxBytesReader(w, r.Body, maxBlobBytes))
+	n, copyErr := io.Copy(io.MultiWriter(f, h), http.MaxBytesReader(w, r.Body, effectiveLimit+1))
 	syncErr := f.Sync()
 	closeErr := f.Close()
 	if err := firstErr(copyErr, syncErr, closeErr); err != nil {
 		_ = os.Remove(tmp)
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			s.auditLocked("artifact.contract_violation", runnerID, j.RunID, j.ID, "artifact exceeds declared max size", map[string]string{"name": name, "max": strconv.FormatInt(effectiveLimit, 10)})
+			http.Error(w, "artifact exceeds the declared maximum size", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, err.Error(), 500)
 		return
 	}
@@ -167,6 +187,19 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 	// the shared store. Legacy local files remain the fallback.
 	casMode := s.DB != nil && s.CAS != nil
 	if casMode {
+		// Hold the digest fence across "publish object + commit durable
+		// reference": the CAS collector re-reads references under the same
+		// fence, so a concurrent pass can never delete an object whose
+		// reference this handler is about to commit (and a pass that
+		// already decided to delete blocks this publish until it finishes,
+		// after which the put recreates the object).
+		release, ferr := s.acquireDigestFence(ctx, digest)
+		if ferr != nil {
+			_ = os.Remove(tmp)
+			http.Error(w, ferr.Error(), 500)
+			return
+		}
+		defer release()
 		tf, oerr := os.Open(tmp)
 		if oerr != nil {
 			_ = os.Remove(tmp)
@@ -578,13 +611,45 @@ func (s *Server) uploadJobCache(w http.ResponseWriter, r *http.Request) {
 	}
 	repo, trust := cacheNamespace(j)
 	fileKey := cacheFileKey(repo, trust, key)
-	obj, err := s.CAS.Put(r.Context(), http.MaxBytesReader(w, r.Body, maxBlobBytes))
+	// Stage and hash first so the digest whose fence we take is the digest
+	// being published, then hold the fence across Put + manifest commit.
+	staged, err := os.CreateTemp("", "kiwi-cache-put-*")
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	sum := obj.SHA256
+	stagedPath := staged.Name()
+	defer func() { _ = os.Remove(stagedPath) }()
+	hasher := sha256.New()
+	n, copyErr := io.Copy(io.MultiWriter(staged, hasher), http.MaxBytesReader(w, r.Body, maxBlobBytes))
+	if copyErr != nil {
+		staged.Close()
+		http.Error(w, copyErr.Error(), 500)
+		return
+	}
+	if _, err := staged.Seek(0, io.SeekStart); err != nil {
+		staged.Close()
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	sum := hex.EncodeToString(hasher.Sum(nil))
+	release, ferr := s.acquireDigestFence(r.Context(), sum)
+	if ferr != nil {
+		staged.Close()
+		http.Error(w, ferr.Error(), 500)
+		return
+	}
+	defer release()
+	obj, err := s.CAS.Put(r.Context(), staged)
+	staged.Close()
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
 	size := obj.Size
+	if size != n {
+		size = n
+	}
 	envelope, err := s.writeCacheManifest(r.Context(), fileKey, key, repo, trust, sum, size, j)
 	if err != nil {
 		// The manifest is the durable mapping: without it the blob is an
@@ -650,7 +715,7 @@ func (s *Server) writeCacheManifest(ctx context.Context, fileKey, logicalKey, re
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
-	if err := writeFileSync(path, b, 0o600); err != nil {
+	if err := storage.AtomicWriteFile(path, b, 0o600); err != nil {
 		return nil, err
 	}
 	return b, nil
@@ -659,24 +724,6 @@ func (s *Server) writeCacheManifest(ctx context.Context, fileKey, logicalKey, re
 // writeFileSync writes data atomically via a temp file + rename and fsyncs
 // the file before the rename so a durable manifest write cannot be lost by
 // a crash.
-func writeFileSync(path string, data []byte, mode os.FileMode) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, mode); err != nil {
-		return err
-	}
-	f, err := os.OpenFile(tmp, os.O_RDWR, 0)
-	if err != nil {
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
-}
 
 // downloadJobCache implements GET /api/v1/jobs/{id}/cache/{key}. The
 // namespace is resolved from the leased job, the manifest row (DB mode) or

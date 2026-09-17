@@ -428,6 +428,11 @@ type Artifact struct {
 	SBOM      string          `yaml:"sbom,omitempty" json:"sbom,omitempty"`
 	Sigstore  *SigstoreConfig `yaml:"sigstore,omitempty" json:"sigstore,omitempty"`
 	Required  bool            `yaml:"required,omitempty" json:"required,omitempty"`
+	// MaxSize caps the artifact payload in bytes ("10MiB" and plain byte
+	// counts both decode through ByteSize). The server enforces it at the
+	// upload reader, before any staging or hashing, and rejects oversize
+	// bodies with 413. Zero means the global ceiling only.
+	MaxSize ByteSize `yaml:"max_size,omitempty" json:"max_size,omitempty"`
 }
 
 // SigstoreConfig declares Sigstore attestation requirements for an artifact.
