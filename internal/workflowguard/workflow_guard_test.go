@@ -897,3 +897,23 @@ func TestWorkflowGuardDoctoredRequiredContextFails(t *testing.T) {
 		t.Fatalf("adding pull_request must clear the context finding, got:\n%s", FormatFindings(findings))
 	}
 }
+
+// TestWorkflowGuardConfigDirContainsOnlyFiles pins the Woodpecker config-dir
+// contract: every entry in .woodpecker/ must be a regular .yml/.yaml file. A
+// subdirectory there breaks config discovery on the server ("is a folder not
+// a file use Dir(..)"), so the docker-workspace CI image must live outside it.
+func TestWorkflowGuardConfigDirContainsOnlyFiles(t *testing.T) {
+	dir := filepath.Join(repoRoot(t), ".woodpecker")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if !e.Type().IsRegular() {
+			t.Fatalf(".woodpecker/%s is not a regular file; Woodpecker config discovery fails on non-file entries", e.Name())
+		}
+		if ext := filepath.Ext(e.Name()); ext != ".yml" && ext != ".yaml" {
+			t.Fatalf(".woodpecker/%s has unexpected extension %q; only workflow YAML belongs in the config directory", e.Name(), ext)
+		}
+	}
+}

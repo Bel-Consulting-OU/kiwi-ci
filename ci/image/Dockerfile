@@ -8,7 +8,7 @@
 # image published to a registry. The workflow's first step therefore builds
 # this file on the agent's Docker daemon:
 #
-#   docker build -f .woodpecker/ci/Dockerfile -t kiwi-ci-test:go1.27 .
+#   docker build -f ci/image/Dockerfile -t kiwi-ci-test:go1.27 .
 #
 # and the test step runs in that local image (pull: false).
 #

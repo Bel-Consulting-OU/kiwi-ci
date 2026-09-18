@@ -209,7 +209,7 @@ claims themselves.
   low-privilege user with no persistent credentials and Go 1.27.x on
   `PATH` (`GOTOOLCHAIN=local` prevents Go from downloading a toolchain
   and masking a stale worker). The required Docker lane builds its
-  digest-pinned test image locally from `.woodpecker/ci/Dockerfile`
+  digest-pinned test image locally from `ci/image/Dockerfile`
   (Go + git + Docker CLI + certs + make/gcc) instead of pulling one
   from a registry; see
   [production-deployment.md](production-deployment.md#native-and-local-ci-agents).

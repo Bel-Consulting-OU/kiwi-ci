@@ -212,7 +212,7 @@ trusted build boundary; provision them on that basis:
 
 The required `docker-workspace` lane needs a Docker CLI and must not
 depend on a registry image. Its first step builds
-`.woodpecker/ci/Dockerfile` locally on the agent's daemon as
+`ci/image/Dockerfile` locally on the agent's daemon as
 `kiwi-ci-test:go1.27`; the test step uses `pull: false`, so it runs those
 local layers. The image is based on the same digest-pinned Go 1.27 and
 Docker CLI images as the other workflows and adds git, CA certificates,

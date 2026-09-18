@@ -25,7 +25,7 @@
 # lane instead of being an undocumented agent setting.
 #
 # Self-contained image: golang:1.27 does not guarantee a Docker CLI, so the
-# lane builds its own test image from .woodpecker/ci/Dockerfile on the
+# lane builds its own test image from ci/image/Dockerfile on the
 # agent's daemon and runs the next step in it. Nothing has to be published to
 # or pulled from a registry for kiwi-ci-test.
 #
@@ -47,7 +47,7 @@ steps:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     commands:
-      - docker build -f .woodpecker/ci/Dockerfile -t kiwi-ci-test:go1.27 .
+      - docker build -f ci/image/Dockerfile -t kiwi-ci-test:go1.27 .
 
   docker-workspace:
     image: kiwi-ci-test:go1.27
