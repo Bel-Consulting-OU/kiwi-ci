@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	v1 "github.com/Bel-Consulting-OU/kiwi-ci/internal/api/v1"
@@ -48,7 +49,7 @@ import (
 
 const (
 	defaultLeaseDuration  = 45 * time.Second
-	maxCompletionReceipts = 4096
+	maxCompletionReceipts = storage.MaxCompletionReceipts
 )
 
 // randReader and jsonMarshal are test-only seams over crypto/rand and
@@ -126,6 +127,26 @@ type Server struct {
 	reports     map[string]model.TestReport
 	deliveries  map[string]string
 	completions map[string]model.CompletionReceipt
+	// completionReceiptAt records when each in-memory receipt was recorded
+	// so the persisted receipt set can be aged out and capped on restart.
+	// Guarded by s.mu, like completions.
+	completionReceiptAt map[string]time.Time
+	// completionReceiptsVer bumps on every mutation of the receipt table
+	// (record, eviction, rollback restore, snapshot restore, TTL pruning) so
+	// completionReceiptRecordsLocked can reuse its rendered, sorted slice
+	// instead of re-allocating and re-sorting up to maxCompletionReceipts
+	// records on every snapshot write (heartbeats persist too).
+	// completionReceiptsCache holds the rendered slice for
+	// completionReceiptsCacheVer; completionReceiptsCacheOK marks it valid,
+	// and completionReceiptsCacheExpiry is the earliest live entry expiry, so
+	// the cache is re-rendered (and expired entries pruned) once wall-clock
+	// time reaches it even when the table itself is unchanged. All guarded
+	// by s.mu, like the table.
+	completionReceiptsVer         uint64
+	completionReceiptsCache       []storage.CompletionReceiptRecord
+	completionReceiptsCacheVer    uint64
+	completionReceiptsCacheOK     bool
+	completionReceiptsCacheExpiry time.Time
 	// generatedFragments is the in-memory generated-fragment idempotency
 	// receipt table (migration 0010's generated_fragments in DB mode). It is
 	// NOT part of the fs snapshot: a dev-mode restart re-admits a replayed
@@ -136,6 +157,18 @@ type Server struct {
 	store              *storage.Repository
 	oidc               *oidcSigner
 	outbox             *Outbox
+
+	// stateDegraded is armed when a filesystem snapshot persist fails and
+	// cleared by the next successful persist. /readiness reports 503 while
+	// armed, so a mutation that could not be made durable is never silently
+	// acknowledged as healthy. lastPersistErr keeps the diagnostic message.
+	stateDegraded atomic.Bool
+	persistErrMu  sync.Mutex
+	// lastPersistErr is guarded by persistErrMu.
+	lastPersistErr string
+	// persistFailForTest, when non-nil, makes persistLocked report this
+	// error without touching disk. Test-only seam; production leaves it nil.
+	persistFailForTest error
 
 	// DB mode: when Sched is non-nil the PostgreSQL store is the source of
 	// truth and scheduler operations delegate to it. The in-memory maps
@@ -393,7 +426,7 @@ func New(token string) *Server {
 		UntrustedCPUCeiling:    2.0,
 		UntrustedMemoryCeiling: 4 << 30,
 		UntrustedPIDCeiling:    256,
-		runs:                   map[string]model.Run{}, jobs: map[string]model.Job{}, runners: map[string]model.Runner{}, artifacts: map[string]model.ArtifactRecord{}, reports: map[string]model.TestReport{}, deliveries: map[string]string{}, completions: map[string]model.CompletionReceipt{}, generatedFragments: map[string]storage.GeneratedFragmentReceipt{}, leaseKey: key, oidc: newOIDCSigner(),
+		runs:                   map[string]model.Run{}, jobs: map[string]model.Job{}, runners: map[string]model.Runner{}, artifacts: map[string]model.ArtifactRecord{}, reports: map[string]model.TestReport{}, deliveries: map[string]string{}, completions: map[string]model.CompletionReceipt{}, completionReceiptAt: map[string]time.Time{}, generatedFragments: map[string]storage.GeneratedFragmentReceipt{}, leaseKey: key, oidc: newOIDCSigner(),
 		outbox:          NewOutbox(nil),
 		AuthStore:       auth.NewTokenStore(),
 		deployments:     map[string]model.Deployment{},
@@ -575,6 +608,12 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 	// The state write below persists the pruned set.
 	s.restoreSnapshots(snap.Snapshots)
 	s.rebuildArtifactContractsLocked()
+	// Completion receipts are restored before any request can be served so a
+	// replayed completion after a restart is answered from the durable
+	// receipt instead of re-applying its effects.
+	s.mu.Lock()
+	s.restoreCompletionReceiptsLocked(snap.CompletionReceipts)
+	s.mu.Unlock()
 	// DB-mode artifact transport: payload bytes move through the shared
 	// CAS blob store (default: filesystem under dataDir/cas) so downloads
 	// resolve on any replica. The app agent overrides the backend via
@@ -665,6 +704,11 @@ func (s *Server) SwitchToDB(db storage.Store) error {
 	sched.SetQuotaLimits(s.QuotaLimits.RepoConcurrency, s.QuotaLimits.TeamConcurrency)
 	s.Sched = sched
 	s.DB = db
+	// The SQL store is now the source of truth and persistLocked returns
+	// early in DB mode, so a degraded flag armed by an fs-mode snapshot
+	// failure would pin /readiness at 503 forever. Clear it on the
+	// transition: the fs snapshot is abandoned, not repaired.
+	s.notePersistResult(nil)
 	s.LeaderKey = sched.LeaderKey
 	s.leader = sched.IsLeader(context.Background())
 	// DB mode: the durable outbox, schedules and artifact contracts move
@@ -1302,7 +1346,7 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 	}
 	s.auditLocked("run.queued", "scheduler", runID, "", "run queued", map[string]string{"event": in.Event})
 	s.scheduleStateLocked()
-	if err := s.persistLocked(); err != nil {
+	if err := s.persistCheckedErrLocked("run.enqueue"); err != nil {
 		s.mu.Unlock()
 		return model.Run{}, err
 	}
@@ -1918,7 +1962,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	}
 	s.runners[in.ID] = in
 	s.auditLocked("runner.register", in.Name, "", "", "runner registered", nil)
-	_ = s.persistLocked()
+	s.persistCheckedLocked("runner.register")
 	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, newRegisterResponse(in, s.RequireProfiles || hasProfile))
 }
@@ -2060,7 +2104,7 @@ func (s *Server) runnerDrain(w http.ResponseWriter, r *http.Request) {
 	ri.Draining = true
 	s.runners[id] = ri
 	s.auditLocked("runner.drain", actorFrom(r), "", "", "runner draining", map[string]string{"runner": id})
-	_ = s.persistLocked()
+	s.persistCheckedLocked("runner.drain")
 	writeJSON(w, http.StatusOK, ri)
 }
 
@@ -2153,7 +2197,7 @@ func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
 		s.refreshRunLocked(runID)
 	}
 	s.auditLocked("runner.disable", actor, "", "", "runner disabled", map[string]string{"runner": id})
-	_ = s.persistLocked()
+	s.persistCheckedLocked("runner.disable")
 	s.mu.Unlock()
 	s.revokeRunnerCert(ri, actor)
 	writeJSON(w, http.StatusOK, ri)
@@ -2197,7 +2241,7 @@ func (s *Server) runnerEnable(w http.ResponseWriter, r *http.Request) {
 	ri.Draining = false
 	s.runners[id] = ri
 	s.auditLocked("runner.enable", actorFrom(r), "", "", "runner enabled", map[string]string{"runner": id})
-	_ = s.persistLocked()
+	s.persistCheckedLocked("runner.enable")
 	writeJSON(w, http.StatusOK, ri)
 }
 
@@ -2248,7 +2292,7 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 			// nothing. The legacy clamp below applies only to the
 			// self-reported dev-mode registration.
 			s.runners[id] = ri
-			_ = s.persistLocked()
+			s.persistCheckedLocked("runner.lease_skip")
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -2259,7 +2303,7 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	if ri.Disabled {
 		w.Header().Set("X-Kiwi-Disabled", "true")
 		s.runners[id] = ri
-		_ = s.persistLocked()
+		s.persistCheckedLocked("runner.lease_skip")
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -2269,14 +2313,14 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	if ri.Draining {
 		w.Header().Set("X-Kiwi-Draining", "true")
 		s.runners[id] = ri
-		_ = s.persistLocked()
+		s.persistCheckedLocked("runner.lease_skip")
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	if len(ri.ActiveJobs) >= ri.Capacity {
 		ri.Busy = true
 		s.runners[id] = ri
-		_ = s.persistLocked()
+		s.persistCheckedLocked("runner.lease_skip")
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -2344,7 +2388,7 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 		// the same rules through applyQueueReasonsDB.
 		s.applyQueueReasonsLocked(ri)
 		s.runners[id] = ri
-		_ = s.persistLocked()
+		s.persistCheckedLocked("runner.queue_reasons")
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -2399,7 +2443,7 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	}
 	s.auditLocked("job.leased", ri.Name, j.RunID, j.ID, "job leased", map[string]string{"job": j.Key, "generation": strconv.FormatInt(j.LeaseGeneration, 10)})
 	s.metricObserve("kiwi_queue_latency_seconds", now.Sub(j.CreatedAt).Seconds(), nil)
-	_ = s.persistLocked()
+	s.persistCheckedLocked("job.lease")
 	// The raw token travels on the wire once; the hash is not needed by the
 	// runner and is stripped from the task job.
 	taskJob := j
@@ -2544,7 +2588,7 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		ri.LastSeen = now
 		s.runners[in.RunnerID] = ri
 	}
-	_ = s.persistLocked()
+	s.persistCheckedLocked("job.heartbeat")
 	writeJSON(w, http.StatusOK, HeartbeatResponse{LeaseExpiresAt: exp})
 }
 
@@ -2787,11 +2831,19 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 			// its lease; a duplicate delivery of the same result is
 			// acknowledged from the receipt instead of being rejected, and
 			// re-runs the post-completion effects that may have failed after
-			// the durable completion committed.
+			// the durable completion committed. The replay is durable-first
+			// too: the in-memory terminal state and receipt are written to
+			// the snapshot BEFORE any effect can run, and an unwritable
+			// snapshot answers 503 so effects never dispatch off state the
+			// disk does not contain.
 			s.mu.Lock()
-			rec, has := s.completions[completionReceiptKey(jobID, in.LeaseGeneration, in.RunnerID)]
+			matched, perr := s.completionReplayReadyLocked(jobID, in.LeaseGeneration, in.RunnerID, hash)
 			s.mu.Unlock()
-			if has && rec.ResultHash == hash {
+			if matched {
+				if perr != nil {
+					http.Error(w, "completion state not durable: "+perr.Error(), http.StatusServiceUnavailable)
+					return
+				}
 				if derr := s.reconcileCompletionEffects(context.Background(), jobID); derr != nil {
 					http.Error(w, derr.Error(), http.StatusInternalServerError)
 					return
@@ -2813,8 +2865,13 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.validActiveLease(cur, in.RunnerID, in.LeaseToken, in.LeaseGeneration, now) {
-		if rec, has := s.completions[completionReceiptKey(jobID, in.LeaseGeneration, in.RunnerID)]; has && rec.ResultHash == hash {
-			s.mu.Unlock()
+		matched, perr := s.completionReplayReadyLocked(jobID, in.LeaseGeneration, in.RunnerID, hash)
+		s.mu.Unlock()
+		if matched {
+			if perr != nil {
+				http.Error(w, "completion state not durable: "+perr.Error(), http.StatusServiceUnavailable)
+				return
+			}
 			if derr := s.reconcileCompletionEffects(context.Background(), jobID); derr != nil {
 				http.Error(w, derr.Error(), http.StatusInternalServerError)
 				return
@@ -2822,7 +2879,6 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		s.mu.Unlock()
 		http.Error(w, "stale or invalid lease", http.StatusConflict)
 		return
 	}
@@ -2859,22 +2915,33 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		}
 		j.FinishedAt = &now
 	}
-	if j.StartedAt != nil && j.FinishedAt != nil {
-		s.metricObserve("kiwi_job_duration_seconds", j.FinishedAt.Sub(*j.StartedAt).Seconds(), nil)
-	}
 	// Usage accounting: cost/energy from the frozen lease-time rates and
-	// the wall-clock duration, aggregated into the usage metrics and the
-	// trailing-24h budget window. The usage_recorded marker makes the
-	// outbox-carried usage_account effect a no-op on replay.
-	s.recordJobUsage(&j, now)
+	// the wall-clock duration. The amounts ride the snapshot write below;
+	// the process metrics move only AFTER that write succeeds, so a failed
+	// persist can never leave a metric claiming usage the snapshot cannot
+	// reconstruct. The usage_recorded marker makes the outbox-carried
+	// usage_account effect a no-op on replay.
+	usageCost, usageEnergy, usageOK := computeJobUsage(&j, now)
 	j.UsageRecorded = true
 	// The lease is spent: clear all lease state so nothing can reuse it,
 	// then dedupe future retries of this exact completion via the receipt.
 	j.LeaseRunnerID = ""
 	j.LeaseTokenHash = nil
 	j.LeaseExpiresAt = nil
-	s.recordCompletionReceiptLocked(jobID, in.LeaseGeneration, in.RunnerID, hash)
 	runID := j.RunID
+	// Ordering: capture -> mutate -> persist -> roll back on failure ->
+	// effects and metrics only after success. The captured snapshot (the
+	// whole jobs and runs maps plus the receipt table, deployment mirror and
+	// runner slot) restores EVERY in-memory mutation below when the snapshot
+	// write fails, including scheduleStateLocked's dependency-blocked
+	// dependents and its re-aggregation of every run. The runner's retry then
+	// re-enters this path from the leased running job, with all derived state
+	// re-derived from the retried result, instead of matching a receipt whose
+	// terminal state and usage marker were never durable. The receipt is part
+	// of the captured state (and rides the same persist), so a receipt can
+	// only survive together with the state it dedupes.
+	rollback := s.captureCompletionRollbackLocked(jobID, in.LeaseGeneration, in.RunnerID)
+	s.recordCompletionReceiptLocked(jobID, in.LeaseGeneration, in.RunnerID, hash)
 	s.jobs[jobID] = j
 	if d, ok := s.deployments[jobID]; ok {
 		d.Status = j.Status
@@ -2882,14 +2949,33 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		s.deployments[jobID] = d
 	}
 	s.releaseRunnerLocked(in.RunnerID, j.ID, j.Status)
-	s.auditLocked("job.completed", in.RunnerID, runID, j.ID, string(j.Status), map[string]string{"job": j.Key})
 	s.scheduleStateLocked()
 	s.refreshRunLocked(runID)
 	// The completed job's run may itself be a wait=true downstream child of
 	// another run: re-aggregate the parents.
 	s.refreshDownstreamParentsLocked(runID)
 	run := s.runs[runID]
-	_ = s.persistLocked()
+	// DURABLE-FIRST: the terminal job state, the run aggregation and the
+	// completion receipt must be on disk before any completion effect
+	// (outbox intent, downstream launch, forge publication) becomes
+	// dispatchable. A failed write rolls the in-memory state back and
+	// answers 503, enqueues nothing and moves no metric; the retry re-runs
+	// the whole path, so usage accounting can neither be skipped (a marker
+	// surviving without its metrics) nor applied twice (terminal state and
+	// receipt only survive a successful persist).
+	if perr := s.persistCheckedErrLocked("job.complete"); perr != nil {
+		s.rollbackCompletionLocked(rollback)
+		s.mu.Unlock()
+		http.Error(w, "completion state not durable: "+perr.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	s.auditLocked("job.completed", in.RunnerID, runID, j.ID, string(j.Status), map[string]string{"job": j.Key})
+	if j.StartedAt != nil && j.FinishedAt != nil {
+		s.metricObserve("kiwi_job_duration_seconds", j.FinishedAt.Sub(*j.StartedAt).Seconds(), nil)
+	}
+	if usageOK {
+		s.accountJobUsageMetrics(usageCost, usageEnergy, now)
+	}
 	s.mu.Unlock()
 	// The completion effects are recorded durably into the outbox (they run
 	// again — as marker-guarded no-ops — when the flush dispatches them, and
@@ -3037,18 +3123,227 @@ func completionReceiptKey(jobID string, generation int64, runnerID string) strin
 	return jobID + "|" + strconv.FormatInt(generation, 10) + "|" + runnerID
 }
 
-// recordCompletionReceiptLocked keeps a bounded in-memory dedupe record.
-// Receipts are intentionally not persisted in the filesystem snapshot; the
-// PostgreSQL phase will store them durably. The bound keeps memory flat and
-// evicts an arbitrary oldest entry when full.
+// recordCompletionReceiptLocked keeps a bounded in-memory dedupe record. The
+// receipt is persisted in the filesystem snapshot (CompletionReceipts) so an
+// fs-mode restart still answers a replayed completion idempotently; the bound
+// keeps memory flat and evicts the oldest receipt when full.
 func (s *Server) recordCompletionReceiptLocked(jobID string, generation int64, runnerID, resultHash string) {
 	if len(s.completions) >= maxCompletionReceipts {
-		for k := range s.completions {
-			delete(s.completions, k)
-			break
+		oldestKey, _ := s.oldestCompletionReceiptLocked()
+		delete(s.completions, oldestKey)
+		delete(s.completionReceiptAt, oldestKey)
+	}
+	key := completionReceiptKey(jobID, generation, runnerID)
+	s.completions[key] = model.CompletionReceipt{JobID: jobID, Generation: generation, RunnerID: runnerID, ResultHash: resultHash}
+	s.completionReceiptAt[key] = time.Now().UTC()
+	s.markCompletionReceiptsChangedLocked()
+}
+
+// markCompletionReceiptsChangedLocked invalidates the rendered receipt
+// snapshot cache after any mutation of the receipt table. The caller holds
+// s.mu.
+func (s *Server) markCompletionReceiptsChangedLocked() {
+	s.completionReceiptsVer++
+	s.completionReceiptsCacheOK = false
+}
+
+// oldestCompletionReceiptLocked returns the key and recorded time of the
+// receipt recordCompletionReceiptLocked evicts next (the oldest by recorded
+// time). Ties break on the receipt key, deterministically: the eviction and
+// the rollback capture both run this on identical state and must agree on
+// the victim even when timestamps are equal (zero-time legacy records,
+// coarse clock resolution). Map iteration order is randomized, so a
+// time-only comparison could evict one receipt and later roll back another,
+// permanently deleting an unrelated entry. The caller holds s.mu.
+func (s *Server) oldestCompletionReceiptLocked() (string, time.Time) {
+	oldestKey, oldestAt := "", time.Time{}
+	for k := range s.completions {
+		at := s.completionReceiptAt[k]
+		if oldestKey == "" || at.Before(oldestAt) || (at.Equal(oldestAt) && k < oldestKey) {
+			oldestKey, oldestAt = k, at
 		}
 	}
-	s.completions[completionReceiptKey(jobID, generation, runnerID)] = model.CompletionReceipt{JobID: jobID, Generation: generation, RunnerID: runnerID, ResultHash: resultHash}
+	return oldestKey, oldestAt
+}
+
+// completionRollback is the exact pre-completion in-memory state the inline
+// completion path overwrites. The rollback restores EVERY in-memory mutation
+// the failed-persist completion performed, not just the job it completed:
+//
+//   - jobs/runs are wholesale snapshots of the in-memory maps. The completion
+//     path does not only rewrite the completed job: scheduleStateLocked
+//     blocks dependency-blocked dependents and re-aggregates EVERY run (plus
+//     every wait=true parent run), so a per-job capture would leave those
+//     mutations behind and a retried completion could never un-block the
+//     dependent. Copying both maps closes every such derived mutation with
+//     one mechanism. The cost is one map copy of the exact state the very
+//     next step serializes to JSON.
+//
+//   - The copies are shallow (map + struct values): every mutation on the
+//     completion path assigns a modified struct value back into the map.
+//     Reference fields are replaced, never mutated in place (removeString
+//     allocates; Outputs is replaced with a fresh clone), so the captured
+//     struct values are exact. Any helper that ever mutates a stored
+//     slice/map in place must deep-copy the captured value first.
+//
+//   - The receipt table is captured exactly around the single record insert,
+//     including the bounded-table eviction the insert performs, plus the
+//     deployment mirror and the runner slot state.
+type completionRollback struct {
+	jobs  map[string]model.Job
+	runs  map[string]model.Run
+	jobID string
+
+	receiptKey string
+	receipt    model.CompletionReceipt
+	receiptAt  time.Time
+	hadReceipt bool
+
+	// evictedKey/evicted capture the entry recordCompletionReceiptLocked
+	// drops when the bounded receipt table is at capacity, so the rollback
+	// restores the table exactly rather than just this job's key.
+	evictedKey string
+	evicted    model.CompletionReceipt
+	evictedAt  time.Time
+
+	deployment    model.Deployment
+	hadDeployment bool
+
+	runnerID  string
+	runner    model.Runner
+	hadRunner bool
+}
+
+// captureCompletionRollbackLocked snapshots the state the inline completion
+// path mutates. It MUST run under s.mu and BEFORE the first mutation of the
+// path (recordCompletionReceiptLocked and the job-map write at the call
+// site); everything from there to the rollback or the successful return runs
+// in the same critical section, so the wholesale job/run restore can never
+// revert a concurrent request's work. The caller holds s.mu.
+// rollbackCompletionLocked restores the snapshot when the persist that would
+// make the completion durable fails.
+func (s *Server) captureCompletionRollbackLocked(jobID string, generation int64, runnerID string) completionRollback {
+	rb := completionRollback{
+		jobs:       make(map[string]model.Job, len(s.jobs)),
+		runs:       make(map[string]model.Run, len(s.runs)),
+		jobID:      jobID,
+		receiptKey: completionReceiptKey(jobID, generation, runnerID),
+		runnerID:   runnerID,
+	}
+	for id, j := range s.jobs {
+		rb.jobs[id] = j
+	}
+	for id, run := range s.runs {
+		rb.runs[id] = run
+	}
+	rb.receipt, rb.hadReceipt = s.completions[rb.receiptKey]
+	rb.receiptAt = s.completionReceiptAt[rb.receiptKey]
+	if len(s.completions) >= maxCompletionReceipts {
+		rb.evictedKey, rb.evictedAt = s.oldestCompletionReceiptLocked()
+		rb.evicted = s.completions[rb.evictedKey]
+	}
+	rb.deployment, rb.hadDeployment = s.deployments[jobID]
+	rb.runner, rb.hadRunner = s.runners[runnerID]
+	// The runner's ActiveJobs is the one slice the completion path used to
+	// compact in place; clone it so the captured value can never alias the
+	// live backing array even if a future helper reintroduces in-place
+	// compaction.
+	rb.runner.ActiveJobs = cloneStrings(rb.runner.ActiveJobs)
+	return rb
+}
+
+// rollbackCompletionLocked restores the snapshot captured before the inline
+// completion path mutated the in-memory state: every job and run row the
+// completion rewrote (the completed job, its dependency-blocked dependents,
+// the re-aggregated runs and parent runs), the receipt table exactly as it
+// was (including an undone eviction), the deployment mirror and the runner
+// slot state. The caller holds s.mu and invokes this only after the durability
+// write failed, immediately before the 503: keeping the terminal job, receipt
+// and usage marker behind would let the runner's retry short-circuit through
+// the receipt and skip usage accounting while the process metrics were never
+// moved, and keeping a blocked dependent behind would terminally wedge it
+// against a completion that never became durable.
+func (s *Server) rollbackCompletionLocked(rb completionRollback) {
+	restoreMap(s.jobs, rb.jobs)
+	restoreMap(s.runs, rb.runs)
+	if rb.hadReceipt {
+		s.completions[rb.receiptKey] = rb.receipt
+		s.completionReceiptAt[rb.receiptKey] = rb.receiptAt
+	} else {
+		delete(s.completions, rb.receiptKey)
+		delete(s.completionReceiptAt, rb.receiptKey)
+	}
+	if rb.evictedKey != "" {
+		s.completions[rb.evictedKey] = rb.evicted
+		s.completionReceiptAt[rb.evictedKey] = rb.evictedAt
+	}
+	s.markCompletionReceiptsChangedLocked()
+	if rb.hadDeployment {
+		s.deployments[rb.jobID] = rb.deployment
+	} else {
+		delete(s.deployments, rb.jobID)
+	}
+	if rb.hadRunner {
+		s.runners[rb.runnerID] = rb.runner
+	} else {
+		delete(s.runners, rb.runnerID)
+	}
+}
+
+// completionReplayReadyLocked recognizes an idempotent completion replay from
+// the in-memory receipt and, when it matches, makes the replayed state
+// durable BEFORE the caller runs any completion effect. The caller holds
+// s.mu. matched=false means there is no receipt for this (job, generation,
+// runner) triple; a non-nil error means the receipt matched but the snapshot
+// write failed, so the replay must be refused with 503 instead of acking
+// effects against state the disk does not contain.
+func (s *Server) completionReplayReadyLocked(jobID string, generation int64, runnerID, hash string) (matched bool, perr error) {
+	rec, has := s.completions[completionReceiptKey(jobID, generation, runnerID)]
+	if !has || rec.ResultHash != hash {
+		return false, nil
+	}
+	return true, s.persistCheckedErrLocked("job.complete.replay")
+}
+
+// computeJobUsage derives a job's completion cost/energy from the frozen
+// lease-time rates and stores them on the job. It is the metric-free half of
+// recordJobUsage, so callers can persist the amounts BEFORE moving process
+// metrics. ok=false when the job never started (or the rates are invalid).
+func computeJobUsage(j *model.Job, finished time.Time) (cost, energy float64, ok bool) {
+	if j.StartedAt == nil {
+		return 0, 0, false
+	}
+	dur := finished.Sub(*j.StartedAt)
+	cost, energy, err := quotas.ComputeUsage(dur, 1, quotas.Rates{CostPerMachineHour: j.CostRate, PowerWatts: j.PowerWatts})
+	if err != nil {
+		return 0, 0, false
+	}
+	j.Cost = cost
+	j.EnergyWh = energy
+	return cost, energy, true
+}
+
+// accountJobUsageMetrics moves the process-local usage metrics and the
+// trailing-24h in-memory budget window for a completion that is already
+// durable. It must only be called after the snapshot write succeeded: a
+// metric must never claim usage state the snapshot cannot reconstruct.
+func (s *Server) accountJobUsageMetrics(cost, energy float64, finished time.Time) {
+	s.metricAdd("kiwi_usage_cost_total", cost, nil)
+	s.metricAdd("kiwi_usage_energy_total", energy, nil)
+	if s.DB != nil {
+		return
+	}
+	s.usageMu.Lock()
+	defer s.usageMu.Unlock()
+	s.usage = append(s.usage, usageEntry{FinishedAt: finished, Cost: cost, EnergyWh: energy})
+	cutoff := finished.Add(-24 * time.Hour)
+	kept := s.usage[:0]
+	for _, e := range s.usage {
+		if e.FinishedAt.After(cutoff) {
+			kept = append(kept, e)
+		}
+	}
+	s.usage = kept
 }
 
 // hashLeaseToken computes the HMAC-SHA256 of a raw lease token under the
@@ -3129,7 +3424,7 @@ func (s *Server) approveJob(w http.ResponseWriter, r *http.Request) {
 	s.auditLocked("job.approved", actor, j.RunID, j.ID, "environment approved", map[string]string{"environment": j.Environment})
 	s.scheduleStateLocked()
 	s.refreshRunLocked(j.RunID)
-	_ = s.persistLocked()
+	s.persistCheckedLocked("job.approve")
 	writeJSON(w, http.StatusOK, redactJob(j))
 }
 
@@ -3341,7 +3636,7 @@ func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 	}
 	s.cancelRunLocked(id, "cancelled by "+actor, actor)
 	run = s.runs[id]
-	_ = s.persistLocked()
+	s.persistCheckedLocked("job.cancel")
 	s.mu.Unlock()
 	if perr := s.publishForgeStatus(r.Context(), run); perr != nil {
 		s.logError("forge status enqueue failed", "run", run.ID, "error", perr.Error())
@@ -3742,7 +4037,177 @@ func (s *Server) persistLocked() error {
 		// snapshot must not be overwritten with stale memory maps.
 		return nil
 	}
-	return s.store.Save(storage.Snapshot{Version: 1, Runs: s.runs, Jobs: s.jobs, Runners: s.runners, Artifacts: s.artifacts, Reports: s.reports, DownstreamLinks: s.downstreamLinks, Profiles: s.profiles, CertProfileLinks: s.certProfiles, Snapshots: s.snapshots})
+	if s.persistFailForTest != nil {
+		s.notePersistResult(s.persistFailForTest)
+		return s.persistFailForTest
+	}
+	err := s.store.Save(storage.Snapshot{Version: 1, Runs: s.runs, Jobs: s.jobs, Runners: s.runners, Artifacts: s.artifacts, Reports: s.reports, DownstreamLinks: s.downstreamLinks, Profiles: s.profiles, CertProfileLinks: s.certProfiles, Snapshots: s.snapshots, CompletionReceipts: s.completionReceiptRecordsLocked()})
+	s.notePersistResult(err)
+	return err
+}
+
+// persistCheckedErrLocked persists the in-memory state under the caller's
+// lock and returns the persistence error after logging it against the named
+// mutation. persistLocked already arms the server-wide degraded state on any
+// failure, so every call site (checked or not) fails closed at /readiness.
+func (s *Server) persistCheckedErrLocked(what string) error {
+	err := s.persistLocked()
+	if err != nil {
+		s.logError("state persist failed", "mutation", what, "error", err.Error())
+	}
+	return err
+}
+
+// persistCheckedLocked is persistCheckedErrLocked for call sites that only
+// need to know whether the state became durable.
+func (s *Server) persistCheckedLocked(what string) bool {
+	return s.persistCheckedErrLocked(what) == nil
+}
+
+// notePersistResult folds one snapshot write outcome into the degraded-state
+// signal: a failed write arms it, a successful write heals it.
+func (s *Server) notePersistResult(err error) {
+	if err != nil {
+		s.stateDegraded.Store(true)
+		s.persistErrMu.Lock()
+		s.lastPersistErr = err.Error()
+		s.persistErrMu.Unlock()
+		return
+	}
+	s.stateDegraded.Store(false)
+	s.persistErrMu.Lock()
+	s.lastPersistErr = ""
+	s.persistErrMu.Unlock()
+}
+
+// persistDegraded reports the last persistence failure, or "" when the
+// snapshot store is healthy.
+func (s *Server) persistDegraded() string {
+	s.persistErrMu.Lock()
+	defer s.persistErrMu.Unlock()
+	return s.lastPersistErr
+}
+
+// completionReceiptRecordsLocked renders the in-memory completion receipts as
+// the durable snapshot slice, ordered deterministically by receipt key. A
+// receipt recorded before timestamps were tracked falls back to the job's
+// finished_at so the restored set can still be aged out. Entries past
+// CompletionReceiptTTL are pruned here, not only at restore, so a long-running
+// fs-mode server stops emitting receipts it would only discard on the next
+// restart.
+//
+// The rendered, sorted slice is cached and reused while the receipt table's
+// mutation version is unchanged (persistLocked runs on every mutation and
+// heartbeats, so re-allocating and re-sorting up to 10 000 records each time
+// dominated the write). The returned slice IS the cache: storage.Repository.Save
+// marshals it synchronously and does not retain or mutate it, so the single
+// caller may keep it for the duration of the write, but must never modify it.
+// If a future store retains the slice, copy before handing it over.
+func (s *Server) completionReceiptRecordsLocked() []storage.CompletionReceiptRecord {
+	if len(s.completions) == 0 {
+		return nil
+	}
+	if s.completionReceiptsCacheOK && s.completionReceiptsCacheVer == s.completionReceiptsVer {
+		// The version is unchanged, but an entry may still have aged past
+		// CompletionReceiptTTL since the render: only reuse the cache while
+		// wall-clock time has not reached the earliest live expiry.
+		if s.completionReceiptsCacheExpiry.IsZero() || time.Now().UTC().Before(s.completionReceiptsCacheExpiry) {
+			return s.completionReceiptsCache
+		}
+	}
+	cutoff := time.Now().UTC().Add(-storage.CompletionReceiptTTL)
+	records := make([]storage.CompletionReceiptRecord, 0, len(s.completions))
+	var expired []string
+	var nextExpiry time.Time
+	for key, rec := range s.completions {
+		at := s.completionReceiptAt[key]
+		if at.IsZero() {
+			if j, ok := s.jobs[rec.JobID]; ok && j.FinishedAt != nil {
+				at = *j.FinishedAt
+			}
+		}
+		if !at.IsZero() && !at.After(cutoff) {
+			expired = append(expired, key)
+			continue
+		}
+		if !at.IsZero() {
+			if exp := at.Add(storage.CompletionReceiptTTL); nextExpiry.IsZero() || exp.Before(nextExpiry) {
+				nextExpiry = exp
+			}
+		}
+		records = append(records, storage.CompletionReceiptRecord{Receipt: rec, CreatedAt: at})
+	}
+	if len(expired) > 0 {
+		for _, key := range expired {
+			delete(s.completions, key)
+			delete(s.completionReceiptAt, key)
+		}
+		s.markCompletionReceiptsChangedLocked()
+	}
+	sort.Slice(records, func(i, j int) bool {
+		a, b := records[i].Receipt, records[j].Receipt
+		if a.JobID != b.JobID {
+			return a.JobID < b.JobID
+		}
+		if a.Generation != b.Generation {
+			return a.Generation < b.Generation
+		}
+		return a.RunnerID < b.RunnerID
+	})
+	s.completionReceiptsCache = records
+	s.completionReceiptsCacheVer = s.completionReceiptsVer
+	s.completionReceiptsCacheOK = true
+	s.completionReceiptsCacheExpiry = nextExpiry
+	return records
+}
+
+// restoreCompletionReceiptsLocked rebuilds the in-memory receipt table from
+// the persisted snapshot, pruning entries past CompletionReceiptTTL and
+// keeping only the newest maxCompletionReceipts. A record without a
+// timestamp (written before receipts carried one) is kept but ordered behind
+// timestamped entries, so it is never preferred over a newer receipt and
+// ages out at the next persist.
+func (s *Server) restoreCompletionReceiptsLocked(records []storage.CompletionReceiptRecord) {
+	if len(records) == 0 {
+		return
+	}
+	cutoff := time.Now().UTC().Add(-storage.CompletionReceiptTTL)
+	kept := make([]storage.CompletionReceiptRecord, 0, len(records))
+	for _, rec := range records {
+		if rec.Receipt.JobID == "" {
+			continue
+		}
+		if !rec.CreatedAt.IsZero() && !rec.CreatedAt.After(cutoff) {
+			continue
+		}
+		kept = append(kept, rec)
+	}
+	sort.Slice(kept, func(i, j int) bool {
+		ai, aj := kept[i].CreatedAt, kept[j].CreatedAt
+		if ai.IsZero() != aj.IsZero() {
+			return !ai.IsZero()
+		}
+		if !ai.Equal(aj) {
+			return ai.After(aj)
+		}
+		a, b := kept[i].Receipt, kept[j].Receipt
+		if a.JobID != b.JobID {
+			return a.JobID < b.JobID
+		}
+		if a.Generation != b.Generation {
+			return a.Generation < b.Generation
+		}
+		return a.RunnerID < b.RunnerID
+	})
+	if len(kept) > maxCompletionReceipts {
+		kept = kept[:maxCompletionReceipts]
+	}
+	for _, rec := range kept {
+		key := completionReceiptKey(rec.Receipt.JobID, rec.Receipt.Generation, rec.Receipt.RunnerID)
+		s.completions[key] = rec.Receipt
+		s.completionReceiptAt[key] = rec.CreatedAt
+	}
+	s.markCompletionReceiptsChangedLocked()
 }
 func (s *Server) leaseDuration() time.Duration {
 	if s.LeaseDuration <= 0 {
@@ -3848,23 +4313,49 @@ func validJobOutputs(in map[string]string) bool {
 	return true
 }
 
+// appendUnique returns in with v appended when absent. It never grows in
+// place: a slice stored on a runner can alias a completion rollback snapshot
+// (or a concurrent reader's view), so the append allocates.
 func appendUnique(in []string, v string) []string {
 	for _, x := range in {
 		if x == v {
 			return in
 		}
 	}
-	return append(in, v)
+	out := make([]string, len(in), len(in)+1)
+	copy(out, in)
+	return append(out, v)
 }
 
+// removeString returns every element of in except v. It always allocates a
+// fresh slice instead of compacting in place (out := in[:0]): the input is
+// usually a slice stored on a captured structure — releaseRunnerLocked
+// compacts runner.ActiveJobs while a completion rollback holds the
+// pre-completion value — and an in-place compaction would overwrite the
+// captured backing array, so a rolled-back runner would lose the restored
+// job and duplicate the surviving one.
 func removeString(in []string, v string) []string {
-	out := in[:0]
+	if in == nil {
+		return nil
+	}
+	out := make([]string, 0, len(in))
 	for _, x := range in {
 		if x != v {
 			out = append(out, x)
 		}
 	}
 	return out
+}
+
+// restoreMap replaces dst's contents with src's entries under the caller's
+// lock. Both maps are live server state; the destination is cleared in place
+// (never swapped) so no reader can hold a stale map reference across the
+// restore.
+func restoreMap[V any](dst, src map[string]V) {
+	clear(dst)
+	for k, v := range src {
+		dst[k] = v
+	}
 }
 
 func cloneMap(in map[string]string) map[string]string {
@@ -4183,7 +4674,7 @@ func (s *Server) Maintain(ctx context.Context) {
 				before[id] = r.Status
 			}
 			s.recoverLeasesLocked(tick.UTC(), false)
-			_ = s.persistLocked()
+			s.persistCheckedLocked("maintain.lease_recovery")
 			var changed []model.Run
 			for id, r := range s.runs {
 				if before[id] != r.Status {

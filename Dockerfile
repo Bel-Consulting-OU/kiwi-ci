@@ -13,6 +13,17 @@ ARG TARGETOS=linux
 ARG TARGETARCH=amd64
 ARG VERSION=dev
 ARG COMMIT=unknown
+# BUILD_DATE is the RFC3339 timestamp recorded as version.BuildDate. The
+# Makefile's docker-build computes it on the host from SOURCE_DATE_EPOCH, so
+# the build-stage userland never has to convert an epoch.
+ARG BUILD_DATE
+# SOURCE_DATE_EPOCH pins the recorded BuildDate so the artifact bytes are
+# reproducible, and is the fallback when BUILD_DATE is not supplied. The
+# epoch is converted with the Go toolchain already in this stage because
+# BusyBox date(1) need not support GNU `-d @epoch` or BSD `-r`. Provenance and
+# SBOM timestamps are unaffected and stay truthful. When neither is set, the
+# build timestamp is "now".
+ARG SOURCE_DATE_EPOCH
 
 WORKDIR /src
 
@@ -22,12 +33,21 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+RUN set -eux; \
+    if [ -z "${BUILD_DATE}" ] && [ -n "${SOURCE_DATE_EPOCH}" ]; then \
+      printf 'package main\nimport ("fmt"; "os"; "strconv"; "time")\nfunc main() { n, err := strconv.ParseInt(os.Args[1], 10, 64); if err != nil { os.Exit(1) }; fmt.Print(time.Unix(n, 0).UTC().Format(time.RFC3339)) }\n' >/tmp/epochdate.go; \
+      BUILD_DATE="$(go run /tmp/epochdate.go "${SOURCE_DATE_EPOCH}")"; \
+      rm -f /tmp/epochdate.go; \
+    fi; \
+    if [ -z "${BUILD_DATE}" ]; then \
+      BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
+    fi; \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -buildvcs=false \
     -ldflags "-s -w \
       -X github.com/Bel-Consulting-OU/kiwi-ci/internal/version.Version=${VERSION} \
       -X github.com/Bel-Consulting-OU/kiwi-ci/internal/version.Commit=${COMMIT} \
-      -X github.com/Bel-Consulting-OU/kiwi-ci/internal/version.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+      -X github.com/Bel-Consulting-OU/kiwi-ci/internal/version.BuildDate=${BUILD_DATE} \
       -X github.com/Bel-Consulting-OU/kiwi-ci/internal/version.Dirty=false" \
     -o /out/kiwi ./cmd/kiwi
 

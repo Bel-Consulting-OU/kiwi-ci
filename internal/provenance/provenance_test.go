@@ -118,6 +118,49 @@ func TestSignWithBuilderOption(t *testing.T) {
 	}
 }
 
+// TestArtifactStatementBuilderOverride proves the additive ArtifactInput
+// Builder option populates the standard SLSA predicate builder identity,
+// while an empty option keeps the runner-derived default.
+func TestArtifactStatementBuilderOverride(t *testing.T) {
+	const want = "https://kiwi-ci.dev/builders/release-tool@1.2.3"
+	st := ArtifactStatement(ArtifactInput{Name: "app", SHA256: strings.Repeat("c", 64), Builder: want})
+	if got := st.Predicate.RunDetails.Builder.ID; got != want {
+		t.Fatalf("predicate builder = %q, want %q", got, want)
+	}
+	if st.Builder != "" {
+		t.Fatalf("builder override must not set the top-level extension: %q", st.Builder)
+	}
+	def := ArtifactStatement(ArtifactInput{Name: "app", SHA256: strings.Repeat("c", 64), Runner: "runner-7"})
+	if got := def.Predicate.RunDetails.Builder.ID; got != "https://kiwi-ci.dev/runner/runner-7" {
+		t.Fatalf("default predicate builder = %q", got)
+	}
+}
+
+// TestVerifyWithConstrainedBuilder proves a caller-supplied builder
+// expectation accepts the recorded builder and rejects any other.
+func TestVerifyWithConstrainedBuilder(t *testing.T) {
+	pub, priv := provKey(t)
+	const builder = "https://kiwi-ci.dev/builders/release-tool@1.2.3"
+	env, err := Sign(ArtifactStatement(ArtifactInput{
+		Name: "app", SHA256: strings.Repeat("c", 64),
+		Repository: "example/repo", Ref: "refs/tags/v1.2.3", Commit: strings.Repeat("a", 40),
+		JobKey: "release", Builder: builder,
+	}), "kidA", priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := VerifyWith(raw, nil, VerifyOptions{TrustedKey: pub, Repository: "example/repo", Builder: builder}); err != nil {
+		t.Fatalf("matching builder constraint must verify: %v", err)
+	}
+	if _, err := VerifyWith(raw, nil, VerifyOptions{TrustedKey: pub, Builder: "https://kiwi-ci.dev/builders/release-tool@9.9.9"}); err == nil {
+		t.Fatal("wrong expected builder must fail verification")
+	}
+}
+
 func TestLoadOrCreateProvenanceKeyReusesKey(t *testing.T) {
 	dir := t.TempDir()
 	pub1, priv1, err := LoadOrCreateProvenanceKey(dir)

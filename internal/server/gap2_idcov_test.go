@@ -879,20 +879,37 @@ func TestIDCovMaintainLifecycle(t *testing.T) {
 	}
 }
 
-// TestIDCovReceiptEviction covers the bounded completion receipt cache.
+// TestIDCovReceiptEviction covers the bounded completion receipt cache: with
+// the table full, the receipt carrying the oldest recorded timestamp is
+// evicted and every newer receipt survives. Each seeded receipt carries a
+// distinct, strictly increasing timestamp so the assertion does not depend on
+// map iteration order.
 func TestIDCovReceiptEviction(t *testing.T) {
 	s := New("t")
+	base := time.Now().UTC().Add(-time.Hour)
 	s.mu.Lock()
+	keys := make([]string, 0, maxCompletionReceipts)
 	for i := 0; i < maxCompletionReceipts; i++ {
-		s.completions[completionReceiptKey("job-"+strings.Repeat("x", i%3)+strconv.Itoa(i), 1, "r")] = model.CompletionReceipt{}
+		id := "job-" + strconv.Itoa(i)
+		key := completionReceiptKey(id, 1, "r")
+		keys = append(keys, key)
+		s.completions[key] = model.CompletionReceipt{JobID: id, Generation: 1, RunnerID: "r", ResultHash: "hash"}
+		s.completionReceiptAt[key] = base.Add(time.Duration(i) * time.Second)
 	}
-	s.mu.Unlock()
 	s.recordCompletionReceiptLocked("new-job", 1, "r", "hash")
-	s.mu.Lock()
 	n := len(s.completions)
-	_, has := s.completions[completionReceiptKey("new-job", 1, "r")]
+	_, hasNew := s.completions[completionReceiptKey("new-job", 1, "r")]
+	_, hasOldest := s.completions[keys[0]]
+	_, hasSecondOldest := s.completions[keys[1]]
+	_, hasNewest := s.completions[keys[len(keys)-1]]
 	s.mu.Unlock()
-	if !has || n != maxCompletionReceipts {
-		t.Fatalf("eviction: n=%d has=%v", n, has)
+	if !hasNew || n != maxCompletionReceipts {
+		t.Fatalf("eviction: n=%d has=%v", n, hasNew)
+	}
+	if hasOldest {
+		t.Fatalf("timestamp-oldest receipt %q survived eviction", keys[0])
+	}
+	if !hasSecondOldest || !hasNewest {
+		t.Fatalf("eviction removed newer receipts: second-oldest=%v newest=%v", hasSecondOldest, hasNewest)
 	}
 }

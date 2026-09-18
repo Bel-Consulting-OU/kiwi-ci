@@ -91,10 +91,11 @@ func (s *Server) deploymentForJob(ctx context.Context, j model.Job) (model.Deplo
 }
 
 // persistDeploymentFinishState is a test seam over the fs-mode state write
-// used by the deployment-finish effect: production calls s.persistLocked,
-// tests inject a failure to prove the marker rolls back and the effect is
-// retried instead of reporting success without durable state.
-var persistDeploymentFinishState = func(s *Server) error { return s.persistLocked() }
+// used by the deployment-finish effect: production calls
+// s.persistCheckedErrLocked, tests inject a failure to prove the marker rolls
+// back and the effect is retried instead of reporting success without
+// durable state.
+var persistDeploymentFinishState = func(s *Server) error { return s.persistCheckedErrLocked("job.deployment_finish") }
 
 // effectDeploymentFinish marks the deployment record of a completed
 // environment job with its terminal status, creating the record when a
@@ -149,29 +150,89 @@ func (s *Server) effectDeploymentFinish(ctx context.Context, j model.Job) error 
 // usage. Marker: the job's usage_recorded flag — once set (with cost/energy
 // persisted on the job row), replays skip the computation so metrics and
 // budgets are never double-accounted.
+//
+// DB mode arbitrates through UsageOnceStore.RecordUsageOnce FIRST and moves
+// process metrics only when this call won the exactly-once transition: a
+// retry (or a second replica) that loses the race increments nothing. Stores
+// without the contract keep the previous read-modify-write fallback.
 func (s *Server) effectUsageAccount(ctx context.Context, j model.Job) error {
 	if j.UsageRecorded {
 		return nil
 	}
-	if j.StartedAt != nil {
-		finished := time.Now().UTC()
-		if j.FinishedAt != nil {
-			finished = *j.FinishedAt
-		}
-		s.recordJobUsage(&j, finished)
-		s.metricObserve("kiwi_job_duration_seconds", finished.Sub(*j.StartedAt).Seconds(), nil)
+	finished := time.Now().UTC()
+	if j.FinishedAt != nil {
+		finished = *j.FinishedAt
 	}
-	j.UsageRecorded = true
+	cost, energy, computed := computeJobUsage(&j, finished)
 	if s.DB != nil {
+		if us, ok := s.DB.(storage.UsageOnceStore); ok {
+			won, err := us.RecordUsageOnce(ctx, j.ID, cost, energy)
+			if err != nil {
+				// Nothing was recorded; the marker and the metrics stay
+				// untouched so the retry converges on exactly one winner.
+				return err
+			}
+			if !won {
+				// Another attempt (or replica) already recorded this job's
+				// usage: never move process metrics for a lost race.
+				return nil
+			}
+			if computed {
+				s.metricAdd("kiwi_usage_cost_total", cost, nil)
+				s.metricAdd("kiwi_usage_energy_total", energy, nil)
+				s.metricObserve("kiwi_job_duration_seconds", finished.Sub(*j.StartedAt).Seconds(), nil)
+			}
+			return nil
+		}
+		// Legacy store without the exactly-once contract: the previous
+		// read-modify-write path (last writer wins).
+		if computed {
+			s.recordJobUsage(&j, finished)
+			s.metricObserve("kiwi_job_duration_seconds", finished.Sub(*j.StartedAt).Seconds(), nil)
+		}
+		j.UsageRecorded = true
 		return s.DB.UpdateJob(ctx, j)
 	}
+	// The marker check above ran without s.mu; re-check it against the live
+	// job inside the same critical section that records. The outbox
+	// serializer is not the arbiter of the record — a direct reconcile can
+	// race a flush — so a second caller that slipped past the unlocked check
+	// must lose here instead of re-adding the metrics and the trailing
+	// window entry.
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.jobs[j.ID]; !ok {
+	live, ok := s.jobs[j.ID]
+	if !ok {
 		return nil
 	}
-	s.jobs[j.ID] = j
-	return s.persistLocked()
+	if live.UsageRecorded {
+		return nil
+	}
+	// Persist the live row (the effect's copy may predate unrelated state
+	// changes made while this effect computed) carrying the usage amounts
+	// this effect computed. Durability first, exactly like
+	// effectDeploymentFinish: a failed snapshot write must roll the marker
+	// and the amounts back, or the retry would short-circuit on the leaked
+	// marker and the usage would never reach disk (the effect would be
+	// ACKed from a state the snapshot does not contain).
+	prev := live
+	live.UsageRecorded = true
+	if computed {
+		live.Cost = cost
+		live.EnergyWh = energy
+	}
+	s.jobs[j.ID] = live
+	if err := s.persistCheckedErrLocked("job.usage_account"); err != nil {
+		s.jobs[j.ID] = prev
+		return err
+	}
+	if computed {
+		// Metrics and the trailing window move only after the amounts are
+		// durable: a failed attempt must not claim usage the snapshot
+		// cannot reconstruct.
+		s.accountJobUsageMetrics(cost, energy, finished)
+	}
+	return nil
 }
 
 // effectRunAggregate re-aggregates the completed job's run and every parent
@@ -191,7 +252,7 @@ func (s *Server) effectRunAggregate(ctx context.Context, j model.Job) error {
 	}
 	s.refreshRunLocked(j.RunID)
 	s.refreshDownstreamParentsLocked(j.RunID)
-	return s.persistLocked()
+	return s.persistCheckedErrLocked("job.run_aggregate")
 }
 
 // effectForgeStatus mirrors the run's terminal state to the forge. The

@@ -2,7 +2,6 @@ package runnerpki
 
 import (
 	"crypto/ed25519"
-	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -17,7 +16,7 @@ func GenerateKeyAndCSR(runnerID string) (privPEM, csrPEM []byte, err error) {
 	if runnerID == "" {
 		return nil, nil, fmt.Errorf("runner id is required")
 	}
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	_, priv, err := ed25519.GenerateKey(randomReader())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -26,7 +25,7 @@ func GenerateKeyAndCSR(runnerID string) (privPEM, csrPEM []byte, err error) {
 		Subject: pkix.Name{CommonName: runnerID},
 		URIs:    []*url.URL{uri},
 	}
-	der, err := x509.CreateCertificateRequest(rand.Reader, tmpl, priv)
+	der, err := x509.CreateCertificateRequest(randomReader(), tmpl, priv)
 	if err != nil {
 		return nil, nil, err
 	}

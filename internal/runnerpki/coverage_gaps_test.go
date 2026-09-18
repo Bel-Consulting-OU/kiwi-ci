@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"errors"
 	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
+	"io"
 	"math/big"
 	"net/url"
 	"os"
@@ -39,9 +40,13 @@ func (r *failingReader) Read(p []byte) (int, error) {
 
 func withFailingRand(t *testing.T, budget int) {
 	t.Helper()
-	old := rand.Reader
-	rand.Reader = &failingReader{budget: budget}
-	t.Cleanup(func() { rand.Reader = old })
+	old := randomReader()
+	injected := io.Reader(&failingReader{budget: budget})
+	randReader.Store(&injected)
+	t.Cleanup(func() {
+		restore := old
+		randReader.Store(&restore)
+	})
 }
 
 func rsaCA(t *testing.T) (*rsa.PrivateKey, []byte) {

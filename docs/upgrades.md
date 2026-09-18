@@ -91,7 +91,8 @@ redeploying the old binary plus its data directory files.
   A full CI pipeline runs on every dependency PR; merge only when it is
   green. CI runs exclusively on Woodpecker (`.woodpecker/`), so
   there is no `github-actions` ecosystem to upgrade.
-- CI tooling versions are pinned in `.woodpecker.yml`, not floating:
+- CI tooling versions are pinned in `.woodpecker/linux-amd64.yml`, not
+  floating:
   - `staticcheck` `honnef.co/go/tools/cmd/staticcheck@v0.8.1`: bump the
     pin in the `staticcheck` step when the toolchain moves forward and
     re-run the pipeline baseline.
@@ -103,8 +104,9 @@ redeploying the old binary plus its data directory files.
     floating latest.
   - Woodpecker pipeline syntax changes (`when`, `matrix`, `services`,
     `depends_on`) are checked against the Woodpecker instance version;
-    the schema assumptions are documented in the `.woodpecker.yml`
-    header. The upstream JSON schema is a good pre-flight check.
+    the schema assumptions are documented in the `.woodpecker/`
+    workflow headers. The upstream JSON schema is a good pre-flight
+    check.
 - Upgrading the Go toolchain (the `go` directive in `go.mod`) must
   happen before bumping the staticcheck/govulncheck pins, and is a
   separate PR from dependency bumps so bisection stays clean.

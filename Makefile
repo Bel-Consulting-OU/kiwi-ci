@@ -1,5 +1,5 @@
 .PHONY: build test test-unit test-race test-integration integration test-adversarial test-shuffle test-stress \
-	fuzz coverage coverage-ci coverage-floor staticcheck govulncheck cross schema-check docs-check license-check repro-build \
+	fuzz coverage coverage-ci coverage-floor staticcheck govulncheck cross schema-check docs-check license-check license-notice repro-build \
 	fmt lint run clean protect-branch
 
 VERSION ?= 0.1.0-dev
@@ -108,14 +108,30 @@ docs-check:
 	@# No stale references to abandoned CI systems.
 	@! grep -rn "github/workflows/native" README.md docs/ CONTRIBUTING.md .woodpecker/ 2>/dev/null
 	@! grep -rn "placeholder address" SECURITY.md 2>/dev/null
+	@# Relative Markdown links must resolve.
+	./scripts/docs-links-check.sh
+	@# The retired single-file Woodpecker layout must not reappear in docs.
+	@! grep -rn "\.woodpecker\.yml" README.md docs/ CONTRIBUTING.md .woodpecker/ .github/ 2>/dev/null
 	@# The documented example pipelines and config must actually validate.
 	go run ./cmd/kiwi validate -f .kiwi/pipeline.yaml
 	go run ./cmd/kiwi validate -f examples/kiwi.yaml
 	go run ./cmd/kiwi config check --config kiwi.example.toml
 
 license-check:
+	@# Classifier fixtures first: the gate itself is testable offline.
+	./scripts/license-check.sh --selftest
+	@# The scan covers the full build list, so the zips must be present.
+	go mod download all
+	./scripts/license-check.sh
 	grep -q 'Apache License' LICENSE
 	grep -q 'http://www.apache.org/licenses/LICENSE-2.0' LICENSE
+
+# Regenerates NOTICE from the dependency scan. Run after any dependency
+# change and commit the result; the license CI step fails on NOTICE drift.
+license-notice:
+	@# The scan covers the full build list, so the zips must be present.
+	go mod download all
+	./scripts/license-check.sh --notice
 
 repro-build:
 	./scripts/repro-build.sh
@@ -138,11 +154,36 @@ clean:
 protect-branch:
 	./scripts/gh-branch-protection.sh
 
-.PHONY: release docker-build
+# Reproducible release/snapshot builds: an explicit SOURCE_DATE_EPOCH pins the
+# recorded BuildDate (artifacts) while provenance/SBOM timestamps stay
+# truthful. In release mode scripts/release.sh derives it from the tagged
+# commit when unset. See docs/releases.md.
+SOURCE_DATE_EPOCH ?= $(shell git log -1 --format=%ct HEAD 2>/dev/null)
+
+# RFC3339 BuildDate passed to docker-build: derived here, on the host, from
+# SOURCE_DATE_EPOCH (default: HEAD commit date) with a BSD-then-GNU date
+# fallback, because the build-stage userland (BusyBox) need not support
+# `date -d @epoch`. Override DOCKER_BUILD_DATE for an explicit timestamp;
+# SOURCE_DATE_EPOCH still pins the recorded BuildDate (see docs/releases.md).
+DOCKER_BUILD_DATE ?= $(shell if [ -n "$(SOURCE_DATE_EPOCH)" ]; then date -u -r "$(SOURCE_DATE_EPOCH)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$(SOURCE_DATE_EPOCH)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null; fi)
+
+.PHONY: release release-snapshot release-formula-test docker-build
 
 release:
 	./scripts/release.sh $(TAG)
 
+# Branch/dirty development build: records the short SHA with a -snapshot
+# version suffix, requires no signing key, and never touches Formula/kiwi.rb.
+release-snapshot:
+	./scripts/release.sh --snapshot
+
+# Proves Formula/kiwi.rb renders correctly from Formula/kiwi.rb.tmpl across
+# two sequential releases (v1 then v2), with no pre-existing placeholders.
+release-formula-test:
+	./scripts/release-formula-test.sh
+
 docker-build:
-	docker build --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) \
+	docker build --build-arg BUILD_DATE=$(DOCKER_BUILD_DATE) \
+		--build-arg SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) \
+		--build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) \
 		-t ghcr.io/bel-consulting-ou/kiwi-ci:$(VERSION) .

@@ -39,7 +39,7 @@ func NewCA(commonName string, ttl time.Duration) (*CA, error) {
 	if ttl <= 0 {
 		ttl = 24 * 365 * time.Hour
 	}
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	_, priv, err := ed25519.GenerateKey(randomReader())
 	if err != nil {
 		return nil, err
 	}
@@ -58,7 +58,7 @@ func NewCA(commonName string, ttl time.Duration) (*CA, error) {
 		IsCA:                  true,
 		MaxPathLenZero:        true,
 	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, priv.Public(), priv)
+	der, err := x509.CreateCertificate(randomReader(), tmpl, tmpl, priv.Public(), priv)
 	if err != nil {
 		return nil, err
 	}
@@ -207,7 +207,7 @@ func (c *CA) SignRunnerCSR(csrPEM []byte, runnerID string, ttl time.Duration, ex
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 		URIs:         uris,
 	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, c.Cert, csr.PublicKey, c.Key)
+	der, err := x509.CreateCertificate(randomReader(), tmpl, c.Cert, csr.PublicKey, c.Key)
 	if err != nil {
 		return nil, fmt.Errorf("sign CSR: %w", err)
 	}
@@ -264,7 +264,7 @@ func hasEKU(list []x509.ExtKeyUsage, want x509.ExtKeyUsage) bool {
 }
 
 func randInt() (*big.Int, error) {
-	n, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	n, err := rand.Int(randomReader(), new(big.Int).Lsh(big.NewInt(1), 128))
 	if err != nil {
 		return nil, err
 	}

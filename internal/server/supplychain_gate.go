@@ -471,7 +471,7 @@ func (s *Server) attachSidecarToArtifact(ctx context.Context, j model.Job, base,
 			cur.SigstoreSHA256 = sum
 		}
 		s.artifacts[rec.ID] = cur
-		_ = s.persistLocked()
+		s.persistCheckedLocked("artifact.sidecar")
 	}
 	s.mu.Unlock()
 	return nil

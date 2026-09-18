@@ -101,7 +101,7 @@ func (s *Server) recordDeployment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	d := s.recordDeploymentLocked(j, time.Now().UTC())
-	_ = s.persistLocked()
+	s.persistCheckedLocked("deployment.record")
 	writeJSON(w, http.StatusCreated, d)
 }
 

@@ -283,7 +283,7 @@ func (s *Server) insertDownstreamLink(ctx context.Context, l storage.DownstreamL
 		return nil
 	}
 	s.downstreamLinks[key] = l
-	return s.persistLocked()
+	return s.persistCheckedErrLocked("downstream.link_insert")
 }
 
 // getDownstreamLink reads the launch claim.
@@ -520,7 +520,7 @@ func (s *Server) reserveDownstreamLaunch(ctx context.Context, parentJobID, targe
 	if !exists {
 		now := time.Now().UTC()
 		s.downstreamLinks[key] = storage.DownstreamLink{ParentJobID: parentJobID, TargetRepo: targetRepo, TargetRef: targetRef, LaunchToken: launchToken, Reserved: true, ReservedAt: &now, CreatedAt: now}
-		return true, s.persistLocked()
+		return true, s.persistCheckedErrLocked("downstream.reserve")
 	}
 	if l.ChildRunID != "" || l.Reserved {
 		return false, nil
@@ -532,7 +532,7 @@ func (s *Server) reserveDownstreamLaunch(ctx context.Context, parentJobID, targe
 		l.LaunchToken = launchToken
 	}
 	s.downstreamLinks[key] = l
-	if err := s.persistLocked(); err != nil {
+	if err := s.persistCheckedErrLocked("downstream.reserve"); err != nil {
 		l.Reserved = false
 		l.ReservedAt = nil
 		s.downstreamLinks[key] = l
@@ -559,7 +559,7 @@ func (s *Server) releaseDownstreamReservation(ctx context.Context, parentJobID, 
 	l.Reserved = false
 	l.ReservedAt = nil
 	s.downstreamLinks[key] = l
-	_ = s.persistLocked()
+	s.persistCheckedLocked("downstream.release_reservation")
 }
 
 // recoverDownstreamReservations expires reservations older than one hour
@@ -589,7 +589,7 @@ func (s *Server) recoverDownstreamReservations(ctx context.Context, now time.Tim
 		}
 	}
 	if changed {
-		_ = s.persistLocked()
+		s.persistCheckedLocked("downstream.expire_reservations")
 	}
 }
 
@@ -619,7 +619,7 @@ func (s *Server) appendDownstreamRun(ctx context.Context, parentRunID, childRunI
 		s.runs[parentRunID] = run
 	}
 	s.refreshRunLocked(parentRunID)
-	perr := s.persistLocked()
+	perr := s.persistCheckedErrLocked("downstream.append_child_run")
 	s.mu.Unlock()
 	if perr != nil {
 		return fmt.Errorf("downstream: persist parent linkage: %w", perr)

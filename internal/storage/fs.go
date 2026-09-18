@@ -8,8 +8,28 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+)
+
+// CompletionReceiptRecord pairs a completion receipt with the time it was
+// recorded. The timestamp lets a restarted control plane prune receipts past
+// the retention window and bound the restored set to the newest entries; a
+// receipt itself carries no wall-clock field (the key is the idempotency
+// identity: job + lease generation + runner).
+type CompletionReceiptRecord struct {
+	Receipt   model.CompletionReceipt `json:"receipt"`
+	CreatedAt time.Time               `json:"created_at"`
+}
+
+// Completion receipt retention: a persisted receipt is honored for
+// CompletionReceiptTTL after it was recorded, and a restart restores at most
+// MaxCompletionReceipts entries (the newest by CreatedAt). Both keep the
+// durable receipt set bounded without changing the idempotency identity.
+const (
+	CompletionReceiptTTL  = 7 * 24 * time.Hour
+	MaxCompletionReceipts = 10_000
 )
 
 // Snapshot is the durable control-plane state. The filesystem implementation is
@@ -40,6 +60,13 @@ type Snapshot struct {
 	// The server validates every referenced archive/manifest pair at load
 	// and drops records whose files no longer match.
 	Snapshots map[string]model.SnapshotRecord `json:"snapshots,omitempty"`
+	// CompletionReceipts persists the fs-mode completion idempotency
+	// receipts (the completion_receipts equivalents) so a restarted control
+	// plane answers a replayed completion from the durable receipt instead
+	// of re-applying effects. Additive; older snapshots load with a nil
+	// slice. The server prunes entries past CompletionReceiptTTL and caps
+	// the restored set at MaxCompletionReceipts newest.
+	CompletionReceipts []CompletionReceiptRecord `json:"completion_receipts,omitempty"`
 }
 
 type Repository struct {

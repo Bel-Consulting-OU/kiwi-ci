@@ -1,10 +1,13 @@
 // release-tool is a small release helper invoked by scripts/release.sh. It
 // reads one built kiwi binary and emits, next to it:
 //
-//   - <binary>.sbom.cdx.json     a CycloneDX 1.5 SBOM for the binary
+//   - <binary>.sbom.cdx.json     a CycloneDX 1.5 dependency SBOM whose root
+//     component is the main module and whose components/graph cover every
+//     direct and transitive module embedded in the binary
 //   - <binary>.provenance.json   a DSSE envelope over an in-toto statement
 //     (SLSA provenance v1 predicate) signed with a caller-supplied Ed25519
-//     key in PKCS#8 PEM form
+//     key in PKCS#8 PEM form; the standard predicate builder identity is
+//     https://kiwi-ci.dev/builders/release-tool@<version>
 //
 // The provenance file is skipped when no signing key is provided.
 package main
@@ -16,6 +19,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -23,8 +27,10 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/provenance"
-	"github.com/Bel-Consulting-OU/kiwi-ci/internal/supplychain"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/version"
 )
+
+const releaseToolBuilderPrefix = "https://kiwi-ci.dev/builders/release-tool@"
 
 type releaseInput struct {
 	Binary  string
@@ -35,6 +41,17 @@ type releaseInput struct {
 	Ref     string
 	OutDir  string
 	KeyFile string
+	Builder string
+}
+
+// builderID resolves the SLSA builder identity recorded in the provenance
+// predicate: an explicit -builder override, or the release-tool identity for
+// the version baked into this binary.
+func (in releaseInput) builderID() string {
+	if in.Builder != "" {
+		return in.Builder
+	}
+	return releaseToolBuilderPrefix + version.Version
 }
 
 func main() {
@@ -46,6 +63,9 @@ func main() {
 func runCLI(args []string) int {
 	in, err := parseFlags(args)
 	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		fmt.Fprintf(os.Stderr, "release-tool: %v\n", err)
 		return 2
 	}
@@ -61,13 +81,14 @@ func parseFlags(args []string) (releaseInput, error) {
 	fs.SetOutput(os.Stderr)
 	in := releaseInput{}
 	fs.StringVar(&in.Binary, "binary", "", "path to the built kiwi binary")
-	fs.StringVar(&in.Name, "name", "kiwi", "artifact name used in the SBOM")
+	fs.StringVar(&in.Name, "name", "", "name recorded for the SBOM root component (default: main module path)")
 	fs.StringVar(&in.Version, "version", "", "release version")
 	fs.StringVar(&in.Commit, "commit", "", "git commit of the build")
 	fs.StringVar(&in.Repo, "repo", "", "repository URL of the build")
 	fs.StringVar(&in.Ref, "ref", "", "git ref/tag of the build")
 	fs.StringVar(&in.OutDir, "out", ".", "directory to write SBOM/provenance into")
 	fs.StringVar(&in.KeyFile, "key", "", "path to an Ed25519 PKCS#8 PEM signing key (optional)")
+	fs.StringVar(&in.Builder, "builder", "", "SLSA builder ID recorded in the provenance predicate (default: "+releaseToolBuilderPrefix+"<tool version>)")
 	if err := fs.Parse(args); err != nil {
 		return in, err
 	}
@@ -81,13 +102,17 @@ func parseFlags(args []string) (releaseInput, error) {
 }
 
 func run(in releaseInput) error {
-	sum, size, err := sha256File(in.Binary)
+	sum, err := sha256File(in.Binary)
 	if err != nil {
 		return err
 	}
 	base := filepath.Base(in.Binary)
+	graph, err := readModuleGraph(in.Binary)
+	if err != nil {
+		return err
+	}
 
-	sbom, err := emitSBOM(in, base, sum, size)
+	sbom, err := emitSBOM(in, base, sum, graph)
 	if err != nil {
 		return err
 	}
@@ -117,29 +142,38 @@ func run(in releaseInput) error {
 	return nil
 }
 
-func sha256File(path string) ([32]byte, int64, error) {
+func sha256File(path string) ([32]byte, error) {
 	var sum [32]byte
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return sum, 0, err
+		return sum, err
 	}
-	return sha256.Sum256(b), int64(len(b)), nil
+	return sha256.Sum256(b), nil
 }
 
-// emitSBOM renders the CycloneDX 1.5 SBOM for one release binary.
-func emitSBOM(in releaseInput, base string, sum [32]byte, size int64) ([]byte, error) {
-	entries := []supplychain.ArtifactEntry{{
-		Path:   base,
-		SHA256: hex.EncodeToString(sum[:]),
-		Size:   size,
-	}}
-	return supplychain.GenerateCycloneDXJSON(in.Name, in.Version, in.Repo, in.Commit, entries)
+// emitSBOM renders the CycloneDX 1.5 SBOM for one release binary. The root
+// component is the main module, every direct and transitive module in the
+// binary's embedded build graph is a library component, and the dependency
+// graph records the root depending on all of them. An explicit -name
+// overrides only the root component's display name; its purl/bom-ref stay
+// derived from the main module so the graph remains resolvable.
+func emitSBOM(in releaseInput, base string, sum [32]byte, graph moduleGraph) ([]byte, error) {
+	doc := cdxDocumentForGraph(
+		graph, in.Version, base, hex.EncodeToString(sum[:]), version.Version, time.Now().UTC(),
+	)
+	if in.Name != "" && doc.Metadata.Component != nil {
+		doc.Metadata.Component.Name = in.Name
+	}
+	return marshalCycloneDX(doc)
 }
 
 // emitProvenance builds an in-toto statement (SLSA provenance v1 predicate)
 // binding the binary digest to the repository/ref/commit and signs it into a
-// DSSE envelope with the release Ed25519 key.
+// DSSE envelope with the release Ed25519 key. The standard predicate builder
+// identity records the release-tool (https://kiwi-ci.dev/builders/release-tool@<version>)
+// rather than a control-plane runner URL.
 func emitProvenance(in releaseInput, base string, sum [32]byte, priv ed25519.PrivateKey, keyID string) ([]byte, error) {
+	builder := in.builderID()
 	st := provenance.ArtifactStatement(provenance.ArtifactInput{
 		Name:       base,
 		SHA256:     hex.EncodeToString(sum[:]),
@@ -150,12 +184,13 @@ func emitProvenance(in releaseInput, base string, sum [32]byte, priv ed25519.Pri
 		Ref:        in.Ref,
 		Commit:     in.Commit,
 		Runner:     "release-tool",
+		Builder:    builder,
 		Trusted:    true,
 		Started:    time.Now().UTC(),
 		Finished:   time.Now().UTC(),
 	})
 	env, err := provenance.SignWith(st, keyID, priv, provenance.SignOptions{
-		Builder: "kiwi-ci@" + in.Version,
+		Builder: builder,
 	})
 	if err != nil {
 		return nil, err

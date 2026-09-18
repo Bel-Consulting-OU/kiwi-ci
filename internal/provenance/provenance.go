@@ -102,12 +102,22 @@ type Envelope struct {
 
 type ArtifactInput struct {
 	Name, SHA256, RunID, JobID, JobKey, Repository, Ref, Commit, Runner string
-	Trusted                                                             bool
-	Started, Finished                                                   time.Time
+	// Builder, when non-empty, overrides the default runner-derived
+	// RunDetails.Builder.ID in the SLSA predicate. Release tooling uses it to
+	// record a stable builder identity such as
+	// "https://kiwi-ci.dev/builders/release-tool@1.2.3" instead of a runner
+	// URL that only exists inside the control plane.
+	Builder           string
+	Trusted           bool
+	Started, Finished time.Time
 }
 
 func ArtifactStatement(in ArtifactInput) Statement {
-	return Statement{Type: StatementType, Subject: []Subject{{Name: in.Name, Digest: map[string]string{"sha256": in.SHA256}}}, PredicateType: PredicateType, Predicate: Predicate{BuildDefinition: BuildDefinition{BuildType: "https://kiwi-ci.dev/build/v1", ExternalParameters: map[string]any{"repository": in.Repository, "ref": in.Ref, "commit": in.Commit, "job": in.JobKey, "trusted": in.Trusted}}, RunDetails: RunDetails{Builder: Builder{ID: "https://kiwi-ci.dev/runner/" + in.Runner}, Metadata: Metadata{InvocationID: in.RunID + "/" + in.JobID, StartedOn: in.Started, FinishedOn: in.Finished}}}}
+	builderID := in.Builder
+	if builderID == "" {
+		builderID = "https://kiwi-ci.dev/runner/" + in.Runner
+	}
+	return Statement{Type: StatementType, Subject: []Subject{{Name: in.Name, Digest: map[string]string{"sha256": in.SHA256}}}, PredicateType: PredicateType, Predicate: Predicate{BuildDefinition: BuildDefinition{BuildType: "https://kiwi-ci.dev/build/v1", ExternalParameters: map[string]any{"repository": in.Repository, "ref": in.Ref, "commit": in.Commit, "job": in.JobKey, "trusted": in.Trusted}}, RunDetails: RunDetails{Builder: Builder{ID: builderID}, Metadata: Metadata{InvocationID: in.RunID + "/" + in.JobID, StartedOn: in.Started, FinishedOn: in.Finished}}}}
 }
 func Sign(st Statement, keyID string, priv ed25519.PrivateKey) (Envelope, error) {
 	return SignWith(st, keyID, priv, SignOptions{})

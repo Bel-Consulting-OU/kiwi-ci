@@ -13,6 +13,13 @@ documentation and the pipeline language.
 - No new third-party dependencies without a written justification. The
   runtime dependency set is currently `pgx/v5` (PostgreSQL) and
   `yaml.v3` (pipeline parsing).
+- Every dependency in the Go build list must carry an allowlisted
+  license: Apache-2.0, MIT, BSD-2-Clause, BSD-3-Clause, ISC, MPL-2.0,
+  PostgreSQL, Unlicense, or 0BSD. `make license-check` scans
+  `go list -m all` (including transitive modules and replaced modules)
+  and fails on a missing or non-allowlisted license. After any
+  dependency change run `make license-notice` and commit the regenerated
+  `NOTICE`; CI fails on NOTICE drift.
 - Documentation claims must match the code. When you change behavior,
   update the relevant file under `docs/` and regenerate `FILE_MAP.md`.
 
@@ -64,7 +71,8 @@ Go 1.23 or later is required.
 
    Without `KIWI_TEST_POSTGRES_URL` (and in `-short` mode) the
    integration tests skip, so `make test-unit` stays hermetic. The CI
-   lane name is `integration-postgres` in `.woodpecker.yml`.
+   lane name is `integration-postgres` in
+   `.woodpecker/integration-coverage.yml`.
 
 5. If you changed Go files, run `go run ./cmd/filemap` and commit the
    regenerated `FILE_MAP.md`.

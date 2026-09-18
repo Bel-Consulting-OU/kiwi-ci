@@ -201,7 +201,10 @@ func (idcovDownstreamErrStore) InsertDownstreamLink(context.Context, storage.Dow
 }
 
 // TestIDCovCompleteMemoryReceiptReconcileFailure covers the replayed
-// completion whose reconciliation fails.
+// completion whose reconciliation cannot become durable. The durable-first
+// replay gate refuses the ACK with 503 (and arms the degraded readiness
+// signal) instead of reporting 500 from a reconcile that already ran against
+// state the snapshot does not contain.
 func TestIDCovCompleteMemoryReceiptReconcileFailure(t *testing.T) {
 	dir := t.TempDir()
 	s, err := NewPersistent("token", "token", dir)
@@ -218,14 +221,18 @@ func TestIDCovCompleteMemoryReceiptReconcileFailure(t *testing.T) {
 	hash := completionResultHash(model.StatusFailure, "", nil)
 	s.completions[completionReceiptKey("job-rc", 1, "runner-a")] = model.CompletionReceipt{JobID: "job-rc", Generation: 1, RunnerID: "runner-a", ResultHash: hash}
 	s.mu.Unlock()
-	// Break the store so the reconciliation's run aggregate fails.
+	// Break the store so the replay's durability gate fails before any
+	// reconciliation can run.
 	blocker := filepath.Join(dir, "blocker")
 	writeTestFile(t, blocker, []byte("x"))
 	s.store.Root = blocker
 	body := `{"runner_id":"runner-a","lease_token":"good-token","lease_generation":1,"status":"failure"}`
 	w := pkiRequest(t, s.Handler(), http.MethodPost, "/api/v1/jobs/job-rc/complete", []byte(body), "token", nil)
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("reconcile failure = %d, want 500: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("non-durable replay = %d, want 503: %s", w.Code, w.Body.String())
+	}
+	if !s.stateDegraded.Load() {
+		t.Fatal("failed replay persist did not arm the degraded state")
 	}
 }
 

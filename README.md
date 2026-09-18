@@ -188,7 +188,9 @@ docker run --rm -p 8080:8080 ghcr.io/bel-consulting-ou/kiwi-ci:v0.1.0
 ```
 
 Build your own with `make release` (cross-compiled bundle) and
-`make docker-build`.
+`make docker-build`. See [docs/releases.md](docs/releases.md) for the
+release/snapshot gates, artifact verification, signing-key lifecycle, and
+reproducible builds.
 
 ## CI status
 

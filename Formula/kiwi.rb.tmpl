@@ -11,15 +11,15 @@ class Kiwi < Formula
   desc "Single-binary CI/CD engine: CLI, control plane, and runner"
   homepage "https://github.com/Bel-Consulting-OU/kiwi-ci"
   license "Apache-2.0"
-  version "0.1.0"
+  version "__VERSION__"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/Bel-Consulting-OU/kiwi-ci/releases/download/v0.1.0/kiwi-darwin-arm64"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      url "https://github.com/Bel-Consulting-OU/kiwi-ci/releases/download/v__VERSION__/kiwi-darwin-arm64"
+      sha256 "__SHA_DARWIN_ARM64__"
     else
-      url "https://github.com/Bel-Consulting-OU/kiwi-ci/releases/download/v0.1.0/kiwi-darwin-amd64"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      url "https://github.com/Bel-Consulting-OU/kiwi-ci/releases/download/v__VERSION__/kiwi-darwin-amd64"
+      sha256 "__SHA_DARWIN_AMD64__"
     end
   end
 

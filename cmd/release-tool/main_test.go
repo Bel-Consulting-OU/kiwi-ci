@@ -16,9 +16,19 @@ import (
 	"testing"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/provenance"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/version"
 )
 
 const testContent = "kiwi release test binary"
+
+// stubModuleGraph makes run()/runCLI() hermetic: the fake test binary carries
+// no embedded build info, so the module graph is supplied as fixture data.
+func stubModuleGraph(t *testing.T) {
+	t.Helper()
+	orig := readModuleGraph
+	readModuleGraph = func(string) (moduleGraph, error) { return fixtureGraph(), nil }
+	t.Cleanup(func() { readModuleGraph = orig })
+}
 
 func writeTempBinary(t *testing.T) string {
 	t.Helper()
@@ -61,7 +71,7 @@ func testInput(t *testing.T, binary string) releaseInput {
 func TestEmitSBOM(t *testing.T) {
 	binary := writeTempBinary(t)
 	sum := sha256.Sum256([]byte(testContent))
-	b, err := emitSBOM(testInput(t, binary), "kiwi-test-binary", sum, int64(len(testContent)))
+	b, err := emitSBOM(testInput(t, binary), "kiwi-test-binary", sum, fixtureGraph())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,21 +82,85 @@ func TestEmitSBOM(t *testing.T) {
 	if doc["bomFormat"] != "CycloneDX" || doc["specVersion"] != "1.5" {
 		t.Fatalf("unexpected bom format/version: %v %v", doc["bomFormat"], doc["specVersion"])
 	}
+	metadata, ok := doc["metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected metadata %v", doc["metadata"])
+	}
+	root, ok := metadata["component"].(map[string]any)
+	if !ok || root["name"] != "kiwi" || root["version"] != "1.2.3" {
+		t.Fatalf("unexpected root component %v", metadata["component"])
+	}
 	components, ok := doc["components"].([]any)
-	if !ok || len(components) != 1 {
+	if !ok || len(components) != 4 {
 		t.Fatalf("unexpected components %v", doc["components"])
 	}
-	c := components[0].(map[string]any)
-	if c["type"] != "file" || c["name"] != "kiwi-test-binary" {
-		t.Fatalf("unexpected component %v", c)
+	names := map[string]bool{}
+	var fileComponent map[string]any
+	for _, c := range components {
+		component := c.(map[string]any)
+		names[component["name"].(string)] = true
+		if component["name"] == "kiwi-test-binary" {
+			fileComponent = component
+		}
 	}
-	hashes, ok := c["hashes"].([]any)
+	for _, want := range []string{"github.com/jackc/pgx/v5", "github.com/jackc/pgpassfile", "github.com/example/new", "kiwi-test-binary"} {
+		if !names[want] {
+			t.Fatalf("component %q missing from %v", want, names)
+		}
+	}
+	if fileComponent["type"] != "file" {
+		t.Fatalf("artifact component = %v", fileComponent)
+	}
+	hashes, ok := fileComponent["hashes"].([]any)
 	if !ok || len(hashes) != 1 {
-		t.Fatalf("unexpected hashes %v", c["hashes"])
+		t.Fatalf("artifact hashes = %v", fileComponent["hashes"])
 	}
-	h := hashes[0].(map[string]any)
-	if h["alg"] != "SHA-256" || h["content"] != hex.EncodeToString(sum[:]) {
-		t.Fatalf("unexpected hash %v", h)
+	if h := hashes[0].(map[string]any); h["alg"] != "SHA-256" || h["content"] != hex.EncodeToString(sum[:]) {
+		t.Fatalf("artifact hash = %v, want %s", h, hex.EncodeToString(sum[:]))
+	}
+	deps, ok := doc["dependencies"].([]any)
+	if !ok || len(deps) != 1 {
+		t.Fatalf("unexpected dependencies %v", doc["dependencies"])
+	}
+	rootDep := deps[0].(map[string]any)
+	if rootDep["ref"] != root["bom-ref"] {
+		t.Fatalf("dependency root ref = %v, want %v", rootDep["ref"], root["bom-ref"])
+	}
+	if dependsOn, ok := rootDep["dependsOn"].([]any); !ok || len(dependsOn) != 3 {
+		t.Fatalf("root dependsOn = %v, want all 3 modules", rootDep["dependsOn"])
+	}
+}
+
+func TestEmitSBOMRootName(t *testing.T) {
+	binary := writeTempBinary(t)
+	sum := sha256.Sum256([]byte(testContent))
+	const wantBOMRef = "pkg:golang/github.com/Bel-Consulting-OU/kiwi-ci@1.2.3"
+	for _, tt := range []struct {
+		label string
+		name  string
+		want  string
+	}{
+		{"default", "", "github.com/Bel-Consulting-OU/kiwi-ci"},
+		{"override", "kiwi-darwin-arm64", "kiwi-darwin-arm64"},
+	} {
+		t.Run(tt.label, func(t *testing.T) {
+			in := testInput(t, binary)
+			in.Name = tt.name
+			b, err := emitSBOM(in, "kiwi-test-binary", sum, fixtureGraph())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var doc cdxDocument
+			if err := json.Unmarshal(b, &doc); err != nil {
+				t.Fatal(err)
+			}
+			if doc.Metadata.Component == nil || doc.Metadata.Component.Name != tt.want {
+				t.Fatalf("-name %q: root component = %+v, want name %q", tt.name, doc.Metadata.Component, tt.want)
+			}
+			if doc.Metadata.Component.BOMRef != wantBOMRef {
+				t.Fatalf("-name %q: root bom-ref = %q, want %q", tt.name, doc.Metadata.Component.BOMRef, wantBOMRef)
+			}
+		})
 	}
 }
 
@@ -139,11 +213,24 @@ func TestEmitProvenanceVerifies(t *testing.T) {
 		ep["ref"] != "refs/tags/v1.2.3" || ep["commit"] != "deadbeef" {
 		t.Fatalf("unexpected external parameters %v", ep)
 	}
-	if st.Builder != "kiwi-ci@1.2.3" {
-		t.Fatalf("builder = %q, want %q", st.Builder, "kiwi-ci@1.2.3")
+	if st.Builder != releaseToolBuilderPrefix+version.Version {
+		t.Fatalf("builder extension = %q, want %q", st.Builder, releaseToolBuilderPrefix+version.Version)
+	}
+	if got := st.Predicate.RunDetails.Builder.ID; got != releaseToolBuilderPrefix+version.Version {
+		t.Fatalf("predicate builder = %q, want %q", got, releaseToolBuilderPrefix+version.Version)
 	}
 	if env.Signatures[0].KeyID != keyID {
 		t.Fatalf("signature keyid = %q, want %q", env.Signatures[0].KeyID, keyID)
+	}
+	if _, err := provenance.VerifyWith(envBytes, nil, provenance.VerifyOptions{
+		TrustedKey: pub, Builder: releaseToolBuilderPrefix + version.Version,
+	}); err != nil {
+		t.Fatalf("constrained builder verification failed: %v", err)
+	}
+	if _, err := provenance.VerifyWith(envBytes, nil, provenance.VerifyOptions{
+		TrustedKey: pub, Builder: releaseToolBuilderPrefix + "9.9.9",
+	}); err == nil {
+		t.Fatal("wrong expected builder must fail verification")
 	}
 
 	otherPub, _, err := provenance.NewProvenanceKey()
@@ -156,6 +243,7 @@ func TestEmitProvenanceVerifies(t *testing.T) {
 }
 
 func TestRunWritesSBOMAndProvenance(t *testing.T) {
+	stubModuleGraph(t)
 	binary := writeTempBinary(t)
 	keyPath, _, pub := writeTempKey(t)
 	in := testInput(t, binary)
@@ -184,6 +272,7 @@ func TestRunWritesSBOMAndProvenance(t *testing.T) {
 }
 
 func TestRunWithoutKeySkipsProvenance(t *testing.T) {
+	stubModuleGraph(t)
 	binary := writeTempBinary(t)
 	in := testInput(t, binary)
 	if err := run(in); err != nil {
@@ -231,10 +320,14 @@ func TestLoadSigningKeyRejectsInvalid(t *testing.T) {
 }
 
 func TestRunCLIExitCodes(t *testing.T) {
+	stubModuleGraph(t)
 	binary := writeTempBinary(t)
 
 	if code := runCLI([]string{"--no-such-flag"}); code != 2 {
 		t.Fatalf("bad flag exit = %d, want 2", code)
+	}
+	if code := runCLI([]string{"--help"}); code != 0 {
+		t.Fatalf("help exit = %d, want 0", code)
 	}
 	if code := runCLI(nil); code != 2 {
 		t.Fatalf("missing -binary exit = %d, want 2", code)
@@ -254,7 +347,7 @@ func TestParseFlags(t *testing.T) {
 	in, err := parseFlags([]string{
 		"-binary", "/tmp/kiwi", "-name", "kiwi-darwin", "-version", "9.9.9",
 		"-commit", "cafe", "-repo", "https://example.test/repo", "-ref", "refs/tags/v9.9.9",
-		"-out", "/tmp/out", "-key", "/tmp/key.pem",
+		"-out", "/tmp/out", "-key", "/tmp/key.pem", "-builder", "https://kiwi-ci.dev/builders/release-tool@9.9.9",
 	})
 	if err != nil {
 		t.Fatalf("parseFlags: %v", err)
@@ -262,17 +355,24 @@ func TestParseFlags(t *testing.T) {
 	want := releaseInput{
 		Binary: "/tmp/kiwi", Name: "kiwi-darwin", Version: "9.9.9", Commit: "cafe",
 		Repo: "https://example.test/repo", Ref: "refs/tags/v9.9.9", OutDir: "/tmp/out", KeyFile: "/tmp/key.pem",
+		Builder: "https://kiwi-ci.dev/builders/release-tool@9.9.9",
 	}
 	if in != want {
 		t.Fatalf("parseFlags = %+v, want %+v", in, want)
+	}
+	if got := in.builderID(); got != want.Builder {
+		t.Fatalf("builderID override = %q, want %q", got, want.Builder)
 	}
 
 	in, err = parseFlags([]string{"-binary", "/tmp/kiwi"})
 	if err != nil {
 		t.Fatalf("defaults: %v", err)
 	}
-	if in.Name != "kiwi" || in.OutDir != "." || in.KeyFile != "" {
+	if in.Name != "" || in.OutDir != "." || in.KeyFile != "" {
 		t.Fatalf("defaults = %+v", in)
+	}
+	if got, want := in.builderID(), releaseToolBuilderPrefix+version.Version; got != want {
+		t.Fatalf("default builderID = %q, want %q", got, want)
 	}
 
 	for _, args := range [][]string{
@@ -287,6 +387,7 @@ func TestParseFlags(t *testing.T) {
 }
 
 func TestRunFailureBranches(t *testing.T) {
+	stubModuleGraph(t)
 	binary := writeTempBinary(t)
 
 	in := testInput(t, filepath.Join(t.TempDir(), "missing-binary"))
@@ -318,6 +419,7 @@ func TestRunFailureBranches(t *testing.T) {
 }
 
 func TestRunProvenanceWriteFailure(t *testing.T) {
+	stubModuleGraph(t)
 	binary := writeTempBinary(t)
 	keyPath, _, _ := writeTempKey(t)
 	in := testInput(t, binary)

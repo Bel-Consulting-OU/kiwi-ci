@@ -61,6 +61,7 @@ var (
 	_ DynamicStoreTx          = (*FaultyStore)(nil)
 	_ DownstreamStore         = (*FaultyStore)(nil)
 	_ UsageStore              = (*FaultyStore)(nil)
+	_ UsageOnceStore          = (*FaultyStore)(nil)
 	_ RunDownstreamStore      = (*FaultyStore)(nil)
 	_ ArtifactLookupStore     = (*FaultyStore)(nil)
 	_ RunnerJobStore          = (*FaultyStore)(nil)
@@ -503,6 +504,15 @@ func (f *FaultyStore) RecentUsage(ctx context.Context, since time.Time) (float64
 	return f.Inner.(UsageStore).RecentUsage(ctx, since)
 }
 
+func (f *FaultyStore) RecordUsageOnce(ctx context.Context, jobID string, cost, energyWh float64) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return false, err
+	}
+	return f.Inner.(UsageOnceStore).RecordUsageOnce(ctx, jobID, cost, energyWh)
+}
+
 func (f *FaultyStore) AppendDownstreamRun(ctx context.Context, runID, childRunID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -896,6 +906,7 @@ var (
 	_ DynamicStoreTx          = (*memStore)(nil)
 	_ DownstreamStore         = (*memStore)(nil)
 	_ UsageStore              = (*memStore)(nil)
+	_ UsageOnceStore          = (*memStore)(nil)
 	_ RunDownstreamStore      = (*memStore)(nil)
 	_ ArtifactLookupStore     = (*memStore)(nil)
 	_ RunnerJobStore          = (*memStore)(nil)
@@ -1939,6 +1950,23 @@ func (m *memStore) RecentUsage(ctx context.Context, since time.Time) (float64, f
 		energy += j.EnergyWh
 	}
 	return cost, energy, nil
+}
+
+// RecordUsageOnce mirrors the SQL conditional update: only the first caller
+// for a job wins; the marker and the cost/energy amounts are written in one
+// critical section so they can never diverge.
+func (m *memStore) RecordUsageOnce(ctx context.Context, jobID string, cost, energyWh float64) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	j, ok := m.jobs[jobID]
+	if !ok || j.UsageRecorded {
+		return false, nil
+	}
+	j.UsageRecorded = true
+	j.Cost = cost
+	j.EnergyWh = energyWh
+	m.jobs[jobID] = j
+	return true, nil
 }
 
 func (m *memStore) AppendDownstreamRun(ctx context.Context, runID, childRunID string) error {

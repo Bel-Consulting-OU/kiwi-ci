@@ -205,6 +205,7 @@ var _ storage.DynamicStore = (*dbFakeStore)(nil)
 var _ storage.DynamicStoreTx = (*dbFakeStore)(nil)
 var _ storage.DownstreamStore = (*dbFakeStore)(nil)
 var _ storage.UsageStore = (*dbFakeStore)(nil)
+var _ storage.UsageOnceStore = (*dbFakeStore)(nil)
 var _ storage.RunDownstreamStore = (*dbFakeStore)(nil)
 var _ storage.ArtifactLookupStore = (*dbFakeStore)(nil)
 var _ storage.RunnerJobStore = (*dbFakeStore)(nil)
@@ -424,6 +425,28 @@ func (f *dbFakeStore) UpdateJob(ctx context.Context, job model.Job) error {
 	f.updateJobCalls = append(f.updateJobCalls, job)
 	f.jobs[job.ID] = job
 	return nil
+}
+
+// RecordUsageOnce mirrors storage.UsageOnceStore: only the first caller per
+// job wins, and the marker plus cost/energy commit together. It honors
+// updateJobErr so the existing "job row write down" fault injection keeps
+// covering the usage effect.
+func (f *dbFakeStore) RecordUsageOnce(ctx context.Context, jobID string, cost, energyWh float64) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.updateJobErr != nil {
+		return false, f.updateJobErr
+	}
+	j, ok := f.jobs[jobID]
+	if !ok || j.UsageRecorded {
+		return false, nil
+	}
+	j.UsageRecorded = true
+	j.Cost = cost
+	j.EnergyWh = energyWh
+	f.jobs[jobID] = j
+	f.updateJobCalls = append(f.updateJobCalls, j)
+	return true, nil
 }
 
 func (f *dbFakeStore) AcquireLease(ctx context.Context, jobID, runnerID string, tokenHash []byte, generation int64, expiresAt time.Time) (model.Job, error) {

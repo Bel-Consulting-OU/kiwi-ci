@@ -368,7 +368,7 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 		return
 	}
 	s.auditLocked("artifact.uploaded", runnerID, j.RunID, j.ID, "artifact uploaded", map[string]string{"name": name, "sha256": rec.SHA256, "provenance_kid": signer.KID})
-	_ = s.persistLocked()
+	s.persistCheckedLocked("artifact.upload")
 	// Dev-mode mirror: the record now carries its sidecar references, so
 	// the pending entries are consumed with it.
 	delete(s.pendingSidecars, sidecarPendingKey(j.ID, name, storage.ArtifactSidecarKindSBOM))
