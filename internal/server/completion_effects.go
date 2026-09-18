@@ -53,23 +53,15 @@ func (s *Server) effectDownstreamCheck(ctx context.Context, j model.Job) error {
 	if !ok {
 		return nil
 	}
-	targetRepo := strings.TrimSpace(cj.Job.Downstream.Repository)
-	if targetRepo == "" {
+	if strings.TrimSpace(cj.Job.Downstream.Repository) == "" {
 		return nil
 	}
-	targetRef := strings.TrimSpace(cj.Job.Downstream.Ref)
-	if targetRef == "" {
-		run, err := s.runForJob(ctx, j.RunID)
-		if err != nil {
-			return err
-		}
-		targetRef = run.Ref
-	}
-	if link, ok, err := s.getDownstreamLink(ctx, j.ID, targetRepo, targetRef); err != nil {
-		return err
-	} else if ok && link.ParentJobID != "" {
-		return nil
-	}
+	// NO "link exists => success" shortcut: the crash window is exactly
+	// "link committed, durable intent missing", and recordDownstreamIntents
+	// is written as the IDEMPOTENT repair path (it reuses the link's stored
+	// token, checks the DETERMINISTIC durable outbox ID, and re-appends
+	// only when that row is absent). Returning early here would ACK the
+	// effect and permanently suppress the launch.
 	return s.recordDownstreamIntentsForCompleted(ctx, j.ID)
 }
 
@@ -187,9 +179,10 @@ func (s *Server) effectUsageAccount(ctx context.Context, j model.Job) error {
 // a pure function of durable state, so it is idempotent by construction.
 func (s *Server) effectRunAggregate(ctx context.Context, j model.Job) error {
 	if s.DB != nil {
-		s.adjustRunForChildrenDB(ctx, j.RunID)
-		s.refreshDownstreamParentsDB(ctx, j.RunID)
-		return nil
+		if err := s.adjustRunForChildrenDB(ctx, j.RunID); err != nil {
+			return err
+		}
+		return s.refreshDownstreamParentsDB(ctx, j.RunID)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -213,7 +206,7 @@ func (s *Server) effectForgeStatus(ctx context.Context, j model.Job) error {
 		return err
 	}
 	if run.Status.Terminal() {
-		s.publishForgeStatus(run)
+		return s.publishForgeStatus(ctx, run)
 	}
 	return nil
 }
@@ -243,12 +236,7 @@ func (s *Server) enqueueCompletionEffects(j model.Job, run model.Run) error {
 		return err
 	}
 	now := time.Now().UTC()
-	for _, kind := range storage.CompletionEffectKinds() {
-		if err := s.outbox.Enqueue(forge.OutboxItem{Kind: kind, Payload: payload, CreatedAt: now}); err != nil {
-			return err
-		}
-	}
-	return nil
+	return s.outbox.Enqueue(forge.OutboxItem{Kind: storage.OutboxKindCompletionReconcile, Payload: payload, CreatedAt: now})
 }
 
 // enqueueCompletionEffectsLocal queues in-memory-only copies of the effect
@@ -261,12 +249,10 @@ func (s *Server) enqueueCompletionEffectsLocal(jobID, runID string, generation i
 		return
 	}
 	now := time.Now().UTC()
-	for _, kind := range storage.CompletionEffectKinds() {
-		s.outbox.EnqueueLocal(forge.OutboxItem{
-			ID:        storage.CompletionEffectID(jobID, generation, kind),
-			Kind:      kind,
-			Payload:   payload,
-			CreatedAt: now,
-		})
-	}
+	s.outbox.EnqueueLocal(forge.OutboxItem{
+		ID:        storage.CompletionEffectID(jobID, generation, storage.OutboxKindCompletionReconcile),
+		Kind:      storage.OutboxKindCompletionReconcile,
+		Payload:   payload,
+		CreatedAt: now,
+	})
 }

@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -10,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -1632,22 +1634,21 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 	return tx.Commit(ctx)
 }
 
-// insertCompletionEffectsTx inserts one durable outbox intent per completion
-// effect kind inside the caller's transaction. IDs are the deterministic
-// CompletionEffectID values so the completing server can queue and ack the
-// very rows this transaction created.
+// insertCompletionEffectsTx inserts ONE deterministic reconcile intent
+// inside the caller's transaction: dispatching it runs the whole effect
+// chain once. (The previous per-kind fan-out amplified one completion into
+// five rows × five effect chains.)
 func (s *PostgresStore) insertCompletionEffectsTx(ctx context.Context, tx pgx.Tx, jobID, runID string, generation int64, now time.Time) error {
 	payload, err := jsonMarshal(CompletionEffectsPayload{JobID: jobID, RunID: runID})
 	if err != nil {
 		return err
 	}
-	for _, kind := range CompletionEffectKinds() {
-		if _, err := tx.Exec(ctx, `INSERT INTO outbox (id, kind, payload, created_at) VALUES ($1, $2, $3, $4)`,
-			CompletionEffectID(jobID, generation, kind), kind, payload, now); err != nil {
-			return err
-		}
-	}
-	return nil
+	// Strict insert: the receipt check inside this transaction already
+	// rejects replays, so an occupied reconcile ID means foreign state under
+	// a deterministic key — a hard invariant failure that rolls back.
+	_, err = tx.Exec(ctx, `INSERT INTO outbox (id, kind, payload, created_at) VALUES ($1, $2, $3, $4)`,
+		CompletionEffectID(jobID, generation, OutboxKindCompletionReconcile), OutboxKindCompletionReconcile, payload, now)
+	return err
 }
 
 // requiredArtifactMissingTx checks the completing job's artifact contracts
@@ -2692,9 +2693,55 @@ func (s *PostgresStore) OutboxAppend(ctx context.Context, e OutboxItem) error {
 	if len(payload) == 0 {
 		payload = []byte("{}")
 	}
-	_, err := s.pool.Exec(ctx, `INSERT INTO outbox (id, kind, payload, created_at) VALUES ($1, $2, $3, $4)`,
+	// Deterministic IDs make appends idempotent: a replay after a lost ACK
+	// must converge on ONE row. An ID reused with DIFFERENT content is an
+	// invariant failure (the deterministic key would map two distinct
+	// operations onto one durable intent), so it is rejected loudly.
+	var existingKind string
+	var existingPayload []byte
+	err := s.pool.QueryRow(ctx, `SELECT kind, payload FROM outbox WHERE id=$1`, e.ID).Scan(&existingKind, &existingPayload)
+	switch {
+	case err == nil:
+		if existingKind != e.Kind || !jsonPayloadEqual(existingPayload, payload) {
+			return fmt.Errorf("storage: outbox id %s reused with different content", e.ID)
+		}
+		return nil
+	case errors.Is(err, pgx.ErrNoRows):
+	default:
+		return err
+	}
+	_, err = s.pool.Exec(ctx, `INSERT INTO outbox (id, kind, payload, created_at) VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO NOTHING`,
 		e.ID, e.Kind, payload, e.CreatedAt)
-	return err
+	if err != nil {
+		return err
+	}
+	// Re-verify after the race-safe insert.
+	err = s.pool.QueryRow(ctx, `SELECT kind, payload FROM outbox WHERE id=$1`, e.ID).Scan(&existingKind, &existingPayload)
+	if err != nil {
+		return err
+	}
+	if existingKind != e.Kind || !jsonPayloadEqual(existingPayload, payload) {
+		return fmt.Errorf("storage: outbox id %s reused with different content", e.ID)
+	}
+	return nil
+}
+
+// jsonPayloadEqual compares two payloads SEMANTICALLY: the outbox column is
+// jsonb, which normalizes key order and whitespace on read, so a
+// byte-for-byte comparison would reject every legitimate replay. Falls back
+// to bytes.Equal when either side is not JSON.
+func jsonPayloadEqual(a, b []byte) bool {
+	if bytes.Equal(a, b) {
+		return true
+	}
+	var x, y any
+	if err := json.Unmarshal(a, &x); err != nil {
+		return false
+	}
+	if err := json.Unmarshal(b, &y); err != nil {
+		return false
+	}
+	return reflect.DeepEqual(x, y)
 }
 
 func (s *PostgresStore) OutboxAck(ctx context.Context, id string) error {

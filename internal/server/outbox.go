@@ -158,10 +158,12 @@ func (o *Outbox) readItems() ([]forge.OutboxItem, error) {
 	return out, nil
 }
 
-// Enqueue appends one intent to the queue and, when persistent, to the
-// durable store (SQL in DB mode, outbox.jsonl in fs mode). It returns an
-// error only when persistence fails; the item is still queued in memory in
-// that case.
+// Enqueue appends one intent DURABLY FIRST and only then makes it
+// dispatchable. In DB mode a failed OutboxAppend returns the error and the
+// item is NOT queued: an external side effect must never be dispatchable
+// from RAM alone, because a crash would erase the record of work that
+// already happened. Callers retry the whole operation; deterministic IDs
+// make the retry converge on one row.
 func (o *Outbox) Enqueue(item forge.OutboxItem) error {
 	if item.ID == "" {
 		id, err := newID()
@@ -183,23 +185,39 @@ func (o *Outbox) Enqueue(item forge.OutboxItem) error {
 			return nil
 		}
 	}
-	o.items = append(o.items, item)
 	if o.db != nil {
 		if err := o.db.OutboxAppend(context.Background(), storage.OutboxItem{
 			ID: item.ID, Kind: item.Kind, Payload: item.Payload, CreatedAt: item.CreatedAt,
 		}); err != nil {
-			// The durable append failed, but the caller was promised the
-			// intent stays queued in memory: mark it local-only so the
-			// claim-gated flush still dispatches it.
-			o.localOnly[item.ID] = true
 			return err
 		}
+		o.items = append(o.items, item)
 		return nil
 	}
 	if o.store == nil {
+		o.items = append(o.items, item)
 		return nil
 	}
-	return o.appendJSONLLocked(outboxFile, item)
+	if err := o.appendJSONLLocked(outboxFile, item); err != nil {
+		return err
+	}
+	o.items = append(o.items, item)
+	return nil
+}
+
+// QueueKnownDurable registers an intent whose durable row was ALREADY
+// appended (the downstream path writes the row inside its own critical
+// section). It never re-appends and never marks anything process-local, so
+// misuse cannot double-insert an ID or dispatch outside the DB claim.
+func (o *Outbox) QueueKnownDurable(item forge.OutboxItem) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for _, it := range o.items {
+		if it.ID == item.ID {
+			return
+		}
+	}
+	o.items = append(o.items, item)
 }
 
 // EnqueueLocal queues one intent in memory only, without touching the
@@ -553,14 +571,26 @@ func (s *Server) dispatchOutbox(ctx context.Context, item forge.OutboxItem) erro
 		return s.publishGitHubStatusFromPayload(ctx, p)
 	case forge.OutboxKindDownstream:
 		return s.dispatchDownstream(ctx, item)
-	case storage.OutboxKindDownstreamCheck, storage.OutboxKindDeploymentFinish,
-		storage.OutboxKindUsageAccount, storage.OutboxKindRunAggregate, storage.OutboxKindForgeStatus:
+	case storage.OutboxKindCompletionReconcile:
 		var p storage.CompletionEffectsPayload
 		if err := json.Unmarshal(item.Payload, &p); err != nil {
 			return err
 		}
 		if p.JobID == "" {
-			log.Printf("outbox: dropping completion effect %s with empty job id", item.Kind)
+			log.Printf("outbox: dropping completion reconcile with empty job id")
+			return nil
+		}
+		return s.reconcileCompletionEffects(ctx, p.JobID)
+	case storage.OutboxKindDownstreamCheck, storage.OutboxKindDeploymentFinish,
+		storage.OutboxKindUsageAccount, storage.OutboxKindRunAggregate, storage.OutboxKindForgeStatus:
+		// Legacy rows persisted before the single-row design: run the same
+		// idempotent chain (markers make the extra kinds no-ops).
+		var p storage.CompletionEffectsPayload
+		if err := json.Unmarshal(item.Payload, &p); err != nil {
+			return err
+		}
+		if p.JobID == "" {
+			log.Printf("outbox: dropping legacy completion effect %s with empty job id", item.Kind)
 			return nil
 		}
 		return s.reconcileCompletionEffects(ctx, p.JobID)

@@ -445,7 +445,7 @@ func TestPostgresIntegrationCompleteJobErrorBranches(t *testing.T) {
 	// A pre-existing outbox row under the deterministic effect ID fails the
 	// effects insert and rolls the completion back.
 	lease(t)
-	if _, err := st.pool.Exec(ctx, `INSERT INTO outbox (id, kind, payload, created_at) VALUES ($1, 'occupied', '{}'::jsonb, now())`, CompletionEffectID(jobID, 1, CompletionEffectKinds()[0])); err != nil {
+	if _, err := st.pool.Exec(ctx, `INSERT INTO outbox (id, kind, payload, created_at) VALUES ($1, 'occupied', '{}'::jsonb, now())`, CompletionEffectID(jobID, 1, OutboxKindCompletionReconcile)); err != nil {
 		t.Fatalf("occupy effect id: %v", err)
 	}
 	good := model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID}
@@ -456,7 +456,7 @@ func TestPostgresIntegrationCompleteJobErrorBranches(t *testing.T) {
 	if stillRunning.Status != model.StatusRunning {
 		t.Fatalf("rolled-back completion must leave the job running: %+v", stillRunning)
 	}
-	if _, err := st.pool.Exec(ctx, `DELETE FROM outbox WHERE id=$1`, CompletionEffectID(jobID, 1, CompletionEffectKinds()[0])); err != nil {
+	if _, err := st.pool.Exec(ctx, `DELETE FROM outbox WHERE id=$1`, CompletionEffectID(jobID, 1, OutboxKindCompletionReconcile)); err != nil {
 		t.Fatalf("clear effect id: %v", err)
 	}
 

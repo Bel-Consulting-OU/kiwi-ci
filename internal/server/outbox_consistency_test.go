@@ -282,7 +282,12 @@ func TestOutboxDBStaleClaimReclaimed(t *testing.T) {
 
 // TestOutboxDBLocalOnlyItemStillDispatched: an Enqueue whose durable append
 // failed stays queued in memory and is still dispatched (no row to claim).
-func TestOutboxDBLocalOnlyItemStillDispatched(t *testing.T) {
+// TestOutboxDBAppendFailureNeverDispatches is the durable-first contract:
+// when the DB append fails the intent must NOT be dispatchable from RAM — an
+// external side effect that was never durably recorded can be lost forever
+// on a crash. (This replaces the old local-only-dispatch expectation, which
+// violated the durable-outbox model.)
+func TestOutboxDBAppendFailureNeverDispatches(t *testing.T) {
 	f := newDBFakeStore()
 	o := NewOutbox(nil)
 	o.AttachDB(f)
@@ -292,15 +297,26 @@ func TestOutboxDBLocalOnlyItemStillDispatched(t *testing.T) {
 	if err := o.Enqueue(forge.OutboxItem{ID: "orphan", Kind: forge.OutboxKindGitHubCheck, Payload: []byte("{}")}); err == nil {
 		t.Fatal("Enqueue must report the durable append failure")
 	}
-	if got := len(o.Pending()); got != 1 {
-		t.Fatalf("pending after failed append = %d, want the local item", got)
+	if got := len(o.Pending()); got != 0 {
+		t.Fatalf("pending after failed append = %d, want 0 (never dispatch from RAM)", got)
 	}
 	d := newOutboxDispatcher()
-	if n, err := o.Flush(context.Background(), d.dispatch); err != nil || n != 1 {
-		t.Fatalf("local-only flush = n=%d err=%v", n, err)
+	if n, err := o.Flush(context.Background(), d.dispatch); err != nil || n != 0 {
+		t.Fatalf("flush after failed append = n=%d err=%v, want nothing dispatched", n, err)
 	}
-	if d.count("orphan") != 1 {
-		t.Fatalf("local-only intent dispatched %d times", d.count("orphan"))
+	if d.count("orphan") != 0 {
+		t.Fatalf("undurable intent dispatched %d times", d.count("orphan"))
+	}
+	// With the store healthy the SAME deterministic ID now records and
+	// dispatches exactly once.
+	f.mu.Lock()
+	f.outboxAppendErr = nil
+	f.mu.Unlock()
+	if err := o.Enqueue(forge.OutboxItem{ID: "orphan", Kind: forge.OutboxKindGitHubCheck, Payload: []byte("{}")}); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := o.Flush(context.Background(), d.dispatch); err != nil || n != 1 {
+		t.Fatalf("recovery flush = n=%d err=%v", n, err)
 	}
 }
 

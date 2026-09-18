@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 
@@ -561,8 +562,22 @@ func TestHACompletionEffectsConvergeAcrossReplicas(t *testing.T) {
 	if got := usageTotal(); got != cost {
 		t.Fatalf("receipt replay double-accounted usage: total %v -> %v", cost, got)
 	}
-	if n := downstreamIntentsQueued(c.f); n != 0 {
-		t.Fatalf("replica-0 replay re-queued %d downstream intents", n)
+	// The replay REPAIRS the downstream intent if its durable row is absent
+	// (the crash window this effect exists for) and is a no-op when the row
+	// is present. The invariant is exactly one durable row, not zero.
+	if n := downstreamIntentsQueued(c.f); n > 1 {
+		t.Fatalf("replica-0 replay created %d downstream intents, want ≤1", n)
+	}
+	if n := downstreamIntentsQueued(c.f); n == 1 {
+		// A repair must have used the stored link's token and stable ID.
+		f := c.f
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		for _, it := range f.outboxItems {
+			if it.Kind == forge.OutboxKindDownstream && !strings.Contains(string(it.Payload), `"launch_token"`) {
+				t.Fatal("repaired downstream intent lacks its launch token")
+			}
+		}
 	}
 }
 

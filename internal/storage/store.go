@@ -193,12 +193,17 @@ type OutboxItem struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// Completion post-transaction effect outbox kinds. CompleteJob inserts one
-// intent per kind INSIDE the completion transaction, so a crash after the
-// durable completion commits can never lose the effects: the outbox flush
-// (and the defensive receipt-replay reconciliation) re-runs them, and each
-// effect checks its own durable marker before acting.
+// Completion post-transaction effect outbox kinds. CompleteJob inserts ONE
+// deterministic `completion_reconcile` row per (job, lease generation)
+// INSIDE the completion transaction. Dispatching that single row runs the
+// whole effect chain (each effect still checks its own durable marker before
+// acting), which avoids the previous amplification where five durable rows
+// each re-ran all five logical effects.
 const (
+	OutboxKindCompletionReconcile = "completion_reconcile"
+
+	// Legacy per-kind rows remain recognized by the dispatcher for outbox
+	// rows persisted before the single-row design.
 	OutboxKindDownstreamCheck  = "downstream_check"
 	OutboxKindDeploymentFinish = "deployment_finish"
 	OutboxKindUsageAccount     = "usage_account"
@@ -213,8 +218,8 @@ type CompletionEffectsPayload struct {
 	RunID string `json:"run_id"`
 }
 
-// CompletionEffectKinds lists the effect kinds inserted by a completion, in
-// dispatch order.
+// CompletionEffectKinds lists the legacy effect kinds (kept for dispatch
+// compatibility with pre-existing rows).
 func CompletionEffectKinds() []string {
 	return []string{
 		OutboxKindDownstreamCheck,

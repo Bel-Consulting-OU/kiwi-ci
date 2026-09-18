@@ -72,7 +72,7 @@ func TestForgeCheckRoutingNeverCrossesForges(t *testing.T) {
 	s.runs[run.ID] = run
 	s.jobs["j-gl1"] = model.Job{ID: "j-gl1", RunID: run.ID, Key: "build", Status: model.StatusSuccess}
 	s.mu.Unlock()
-	s.publishForgeStatus(run)
+	s.publishForgeStatus(context.Background(), run)
 	pending := s.outbox.Pending()
 	if len(pending) == 0 {
 		t.Fatal("neutral publication produced no intents for a gitlab run")

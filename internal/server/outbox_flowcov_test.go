@@ -168,12 +168,14 @@ func TestFlowOutboxAppendJSONLBranches(t *testing.T) {
 	if err := o3.appendJSONLLocked("x.jsonl", map[string]string{"a": "b"}); err == nil {
 		t.Fatal("read-only root must fail the append")
 	}
-	// Enqueue surfaces the persistence error while keeping the item queued.
+	// Durable-first: Enqueue surfaces the persistence error and the item is
+	// NOT queued — the side effect must never be dispatchable before the
+	// record of it exists.
 	if err := o3.Enqueue(forge.OutboxItem{Kind: forge.OutboxKindWebhookCall}); err == nil {
 		t.Fatal("Enqueue must surface the fs persistence error")
 	}
-	if len(o3.Pending()) != 1 {
-		t.Fatal("failed persistence must keep the in-memory item")
+	if len(o3.Pending()) != 0 {
+		t.Fatal("failed persistence must not queue the item")
 	}
 }
 

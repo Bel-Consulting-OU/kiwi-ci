@@ -99,16 +99,18 @@ func TestFlowDownstreamRecordIntentsStoreErrors(t *testing.T) {
 
 func TestFlowDownstreamRecordForCompletedBranches(t *testing.T) {
 	ctx := context.Background()
-	// Memory mode: missing job, missing run, non-success, success.
+	// Memory mode: missing job and missing run are invariant failures (the
+	// repair path must fail closed so the completion effect retries instead
+	// of ACKing a launch it could not record).
 	s := fcEffectsServerWithRun(t)
-	if err := s.recordDownstreamIntentsForCompleted(ctx, "ghost"); err != nil {
-		t.Fatalf("missing job = %v", err)
+	if err := s.recordDownstreamIntentsForCompleted(ctx, "ghost"); err == nil {
+		t.Fatal("missing job must fail the repair")
 	}
 	s.mu.Lock()
 	s.jobs["j"] = model.Job{ID: "j", RunID: "ghost-run", Key: "build", Status: model.StatusSuccess, Pipeline: fcDownstreamNoRefPipeline, RepoURL: "https://github.com/o/repo-a.git", RepoFullName: "o/repo-a"}
 	s.mu.Unlock()
-	if err := s.recordDownstreamIntentsForCompleted(ctx, "j"); err != nil {
-		t.Fatalf("missing run = %v", err)
+	if err := s.recordDownstreamIntentsForCompleted(ctx, "j"); err == nil {
+		t.Fatal("missing run must fail the repair")
 	}
 	s.mu.Lock()
 	j := s.jobs["j"]

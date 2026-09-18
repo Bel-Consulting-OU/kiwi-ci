@@ -148,8 +148,11 @@ func (s *Server) enqueueDownstreamIntent(ctx context.Context, j model.Job, run m
 					return fmt.Errorf("downstream: durable intent append failed: %w", aerr)
 				}
 			}
-			// Keep the in-process queue in sync (idempotent by ID).
-			_ = s.outbox.Enqueue(item)
+			// The durable row exists: register it for dispatch WITHOUT a
+			// second append (Enqueue would double-insert the same ID and
+			// could mark the item process-local, dispatching it outside the
+			// DB claim while another replica owns the durable row).
+			s.outbox.QueueKnownDurable(item)
 			return nil
 		}
 	}
@@ -187,8 +190,14 @@ func (s *Server) recordDownstreamIntentsForCompleted(ctx context.Context, jobID 
 	j, ok := s.jobs[jobID]
 	run, runOK := s.runs[j.RunID]
 	s.mu.Unlock()
-	if !ok || !runOK || j.Status != model.StatusSuccess {
+	if !ok {
+		return fmt.Errorf("downstream: job %s not found for effect repair", jobID)
+	}
+	if j.Status != model.StatusSuccess {
 		return nil
+	}
+	if !runOK {
+		return fmt.Errorf("downstream: run %s not found for effect repair", j.RunID)
 	}
 	return s.recordDownstreamIntents(ctx, j, run)
 }
@@ -408,7 +417,11 @@ func (s *Server) dispatchDownstream(ctx context.Context, item forge.OutboxItem) 
 		return fmt.Errorf("downstream: enqueue child run: %w", err)
 	}
 	if p.Wait {
-		s.appendDownstreamRun(ctx, p.ParentRunID, child.ID)
+		// The parent-child edge must be durable before the downstream
+		// intent can be ACKed; deterministic child IDs make the retry safe.
+		if err := s.appendDownstreamRun(ctx, p.ParentRunID, child.ID); err != nil {
+			return err
+		}
 	}
 	s.metricAdd("kiwi_downstream_launches_total", 1, nil)
 	s.auditLocked("downstream.launched", "scheduler", p.ParentRunID, p.ParentJobID, "downstream run launched", map[string]string{"target_repo": p.TargetRepo, "target_ref": p.TargetRef, "child_run": child.ID})
@@ -582,29 +595,36 @@ func (s *Server) recoverDownstreamReservations(ctx context.Context, now time.Tim
 
 // appendDownstreamRun records the child run on the parent run for wait=true
 // aggregation and refreshes the parent's status.
-func (s *Server) appendDownstreamRun(ctx context.Context, parentRunID, childRunID string) {
+// appendDownstreamRun records the parent→child edge. The error is returned
+// (never swallowed): the downstream outbox row must not be ACKed while the
+// parent lacks the child linkage, or the parent can terminate prematurely.
+// Child IDs are deterministic, so a retry is safe.
+func (s *Server) appendDownstreamRun(ctx context.Context, parentRunID, childRunID string) error {
 	if s.DB != nil {
 		if rs, ok := s.DB.(storage.RunDownstreamStore); ok {
 			if err := rs.AppendDownstreamRun(ctx, parentRunID, childRunID); err != nil {
-				s.logError("downstream: append child run failed", "run", parentRunID, "error", err.Error())
+				return fmt.Errorf("downstream: append child run: %w", err)
 			}
 		}
-		s.adjustRunForChildrenDB(ctx, parentRunID)
-		return
+		return s.adjustRunForChildrenDB(ctx, parentRunID)
 	}
 	s.mu.Lock()
 	run, ok := s.runs[parentRunID]
 	if !ok {
 		s.mu.Unlock()
-		return
+		return nil
 	}
 	if !stringSliceContains(run.DownstreamRuns, childRunID) {
 		run.DownstreamRuns = append(run.DownstreamRuns, childRunID)
 		s.runs[parentRunID] = run
 	}
 	s.refreshRunLocked(parentRunID)
-	_ = s.persistLocked()
+	perr := s.persistLocked()
 	s.mu.Unlock()
+	if perr != nil {
+		return fmt.Errorf("downstream: persist parent linkage: %w", perr)
+	}
+	return nil
 }
 
 // fetchDownstreamPipeline resolves the target pipeline text: the injected
@@ -696,36 +716,42 @@ func (s *Server) refreshDownstreamParentsLocked(childRunID string) {
 
 // refreshDownstreamParentsDB re-aggregates every parent run that waits on
 // childRunID (DB mode).
-func (s *Server) refreshDownstreamParentsDB(ctx context.Context, childRunID string) {
+func (s *Server) refreshDownstreamParentsDB(ctx context.Context, childRunID string) error {
 	runs, err := s.DB.ListRuns(ctx, 10000)
 	if err != nil {
-		return
+		return fmt.Errorf("downstream: list runs: %w", err)
 	}
 	for _, run := range runs {
 		if stringSliceContains(run.DownstreamRuns, childRunID) {
-			s.adjustRunForChildrenDB(ctx, run.ID)
+			if aerr := s.adjustRunForChildrenDB(ctx, run.ID); aerr != nil {
+				return aerr
+			}
 		}
 	}
+	return nil
 }
 
 // adjustRunForChildrenDB applies the wait=true aggregation over one run's
 // downstream children in DB mode. It is called when a child is appended and
 // when a child run completes; the run row is reopened while any child is
 // still in flight and finalized from the child outcomes when they finish.
-func (s *Server) adjustRunForChildrenDB(ctx context.Context, runID string) {
+func (s *Server) adjustRunForChildrenDB(ctx context.Context, runID string) error {
 	run, err := s.DB.GetRun(ctx, runID)
-	if errors.Is(err, storage.ErrNotFound) || err != nil {
-		return
+	if err == nil && len(run.DownstreamRuns) == 0 {
+		return nil
 	}
-	if len(run.DownstreamRuns) == 0 {
-		return
+	if errors.Is(err, storage.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("downstream: read parent run: %w", err)
 	}
 	if run.Status.Terminal() && run.Status != model.StatusSuccess {
-		return
+		return nil
 	}
 	jobs, err := s.DB.ListJobsByRun(ctx, runID)
 	if err != nil {
-		return
+		return fmt.Errorf("downstream: list parent jobs: %w", err)
 	}
 	ownAllTerminal := true
 	ownFailure := false
@@ -742,7 +768,7 @@ func (s *Server) adjustRunForChildrenDB(ctx context.Context, runID string) {
 		}
 	}
 	if !ownAllTerminal {
-		return
+		return nil
 	}
 	allTerminal := true
 	anyFailure := false
@@ -753,7 +779,7 @@ func (s *Server) adjustRunForChildrenDB(ctx context.Context, runID string) {
 			continue
 		}
 		if cerr != nil {
-			continue
+			return fmt.Errorf("downstream: read child run %s: %w", childID, cerr)
 		}
 		if !child.Status.Terminal() {
 			allTerminal = false
@@ -766,28 +792,29 @@ func (s *Server) adjustRunForChildrenDB(ctx context.Context, runID string) {
 		}
 	}
 	switch {
-	case ownFailure:
-		return
-	case ownCancelled:
-		return
+	case ownFailure, ownCancelled:
+		return nil
 	case !allTerminal:
 		if run.Status != model.StatusRunning {
 			if rs, ok := s.DB.(storage.RunDownstreamStore); ok {
-				_ = rs.ReopenRunForChildren(ctx, runID)
+				if rerr := rs.ReopenRunForChildren(ctx, runID); rerr != nil {
+					return fmt.Errorf("downstream: reopen parent run: %w", rerr)
+				}
 			}
 		}
-		return
+		return nil
 	case anyFailure:
 		fin := time.Now().UTC()
 		if err := s.DB.UpdateRunStatus(ctx, runID, model.StatusFailure, nil, &fin); err != nil {
-			s.logError("downstream: finalize parent failure failed", "run", runID, "error", err.Error())
+			return fmt.Errorf("downstream: finalize parent failure: %w", err)
 		}
 	case anyCancelled:
 		fin := time.Now().UTC()
 		if err := s.DB.UpdateRunStatus(ctx, runID, model.StatusCancelled, nil, &fin); err != nil {
-			s.logError("downstream: finalize parent cancelled failed", "run", runID, "error", err.Error())
+			return fmt.Errorf("downstream: finalize parent cancelled: %w", err)
 		}
 	}
+	return nil
 }
 
 func stringSliceContains(list []string, v string) bool {

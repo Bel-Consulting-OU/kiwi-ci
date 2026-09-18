@@ -1316,7 +1316,9 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 		}
 	}
 	s.mu.Unlock()
-	s.publishGitHubStatus(run)
+	if err := s.publishForgeStatus(context.Background(), run); err != nil {
+		s.logError("forge status enqueue failed", "run", run.ID, "error", err.Error())
+	}
 	return run, nil
 }
 
@@ -1408,7 +1410,9 @@ func (s *Server) enqueueDB(in SubmitRun, run model.Run, created map[string]model
 			}
 		}
 		s.auditLocked("run.queued", "scheduler", run.ID, "", "run queued", map[string]string{"event": in.Event})
-		s.publishGitHubStatus(run)
+		if err := s.publishForgeStatus(ctx, run); err != nil {
+			s.logError("forge status enqueue failed", "run", run.ID, "error", err.Error())
+		}
 		return run, nil
 	}
 	err := rs.InsertCompiledRun(ctx, req)
@@ -1447,7 +1451,9 @@ func (s *Server) enqueueDB(in SubmitRun, run model.Run, created map[string]model
 		}
 	}
 	s.auditLocked("run.queued", "scheduler", run.ID, "", "run queued", map[string]string{"event": in.Event})
-	s.publishGitHubStatus(run)
+	if err := s.publishForgeStatus(context.Background(), run); err != nil {
+		s.logError("forge status enqueue failed", "run", run.ID, "error", err.Error())
+	}
 	return run, nil
 }
 
@@ -2865,7 +2871,9 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if run.Status.Terminal() {
-		s.publishGitHubStatus(run)
+		if err := s.publishForgeStatus(r.Context(), run); err != nil {
+			s.logError("forge status enqueue failed", "run", run.ID, "error", err.Error())
+		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -3296,7 +3304,9 @@ func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 	run = s.runs[id]
 	_ = s.persistLocked()
 	s.mu.Unlock()
-	s.publishGitHubStatus(run)
+	if perr := s.publishForgeStatus(r.Context(), run); perr != nil {
+		s.logError("forge status enqueue failed", "run", run.ID, "error", perr.Error())
+	}
 	writeJSON(w, http.StatusOK, run)
 }
 
@@ -3325,7 +3335,9 @@ func (s *Server) cancelRunDB(w http.ResponseWriter, r *http.Request, id, actor s
 	if cur, gerr := s.DB.GetRun(ctx, id); gerr == nil {
 		run = cur
 	}
-	s.publishGitHubStatus(run)
+	if perr := s.publishForgeStatus(ctx, run); perr != nil {
+		s.logError("forge status enqueue failed", "run", run.ID, "error", perr.Error())
+	}
 	writeJSON(w, http.StatusOK, run)
 }
 
@@ -4141,7 +4153,9 @@ func (s *Server) Maintain(ctx context.Context) {
 			}
 			s.mu.Unlock()
 			for _, r := range changed {
-				s.publishGitHubStatus(r)
+				if perr := s.publishForgeStatus(ctx, r); perr != nil {
+					s.logError("forge status enqueue failed", "run", r.ID, "error", perr.Error())
+				}
 			}
 			s.GC(ctx, tick.UTC())
 			s.maybeRunCASGC(ctx, tick.UTC())

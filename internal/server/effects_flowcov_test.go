@@ -114,8 +114,13 @@ func TestFlowEffectsDownstreamCheckBranches(t *testing.T) {
 	if err := s.effectDownstreamCheck(ctx, job); err == nil {
 		t.Fatal("missing run must fail the ref fallback")
 	}
-	// Ref fallback succeeds through the run.
+	// Ref fallback succeeds through the run. The repair path re-reads the
+	// job from the authoritative mirror, so seed it (real completions always
+	// have their job row present).
 	job.RunID = "run-1"
+	s.mu.Lock()
+	s.jobs[job.ID] = job
+	s.mu.Unlock()
 	if err := s.effectDownstreamCheck(ctx, job); err != nil {
 		t.Fatalf("ref fallback downstream check = %v", err)
 	}
@@ -294,8 +299,14 @@ func TestFlowEffectsEnqueueCompletionEffects(t *testing.T) {
 	if err := s.enqueueCompletionEffects(model.Job{ID: "j"}, model.Run{ID: "r"}); err != nil {
 		t.Fatalf("memory effect enqueue = %v", err)
 	}
-	if got := len(s.outbox.Pending()); got != len(storage.CompletionEffectKinds()) {
-		t.Fatalf("queued effects = %d", got)
+	// Single-row design: ONE deterministic reconcile intent per completion
+	// runs the whole effect chain (the per-kind fan-out amplified one
+	// completion into five rows × five chains).
+	if got := len(s.outbox.Pending()); got != 1 {
+		t.Fatalf("queued effects = %d, want 1 reconcile intent", got)
+	}
+	if s.outbox.Pending()[0].Kind != storage.OutboxKindCompletionReconcile {
+		t.Fatalf("queued kind = %q", s.outbox.Pending()[0].Kind)
 	}
 	// DB append failure surfaces.
 	s2, f, _, _ := cacheFixture(t)

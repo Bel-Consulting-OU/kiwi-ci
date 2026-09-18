@@ -3,10 +3,11 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -27,64 +28,108 @@ import (
 // persisted forge identity, so GitLab and Forgejo runs publish through their
 // own adapters instead of being silently dropped (and never routed to
 // GitHub). A run without a forge identity publishes nowhere.
-func (s *Server) publishForgeStatus(run model.Run) {
+func (s *Server) publishForgeStatus(ctx context.Context, run model.Run) error {
 	if run.ForgeKind != "github" && run.ForgeKind != "gitlab" && run.ForgeKind != "forgejo" {
-		return
+		return nil
 	}
-	if run.ForgeKind == "github" {
-		s.publishGitHubStatus(run)
-		return
-	}
-	// Non-GitHub forges: check intents only (no GitHub commit-status legacy
-	// API), enqueued with their forge-specific kind.
 	if run.RepoFullName == "" || run.SHA == "" {
-		return
+		return nil
+	}
+	// No publishing credential or endpoint for this forge: nothing can be
+	// published, so enqueueing would create rows that 401 forever. This is
+	// the explicit "publish_status disabled" state (a read-only
+	// integration); production startup validation warns when it is implicit.
+	if !s.forgePublishingConfigured(run.ForgeKind) {
+		return nil
 	}
 	status, conclusion := checkStateForRun(run.Status)
 	summary := "pipeline " + string(run.Status)
 	items := []forge.OutboxItem{s.checkIntent(run, "Pipeline", status, conclusion, summary, nil)}
-	s.mu.Lock()
-	for _, j := range s.jobs {
-		if j.RunID != run.ID || !j.Status.Terminal() {
-			continue
+	// Job enumeration must be AUTHORITATIVE in DB mode: the in-memory map
+	// is not the source of truth and another replica may run this effect.
+	if s.DB != nil {
+		jobs, err := s.DB.ListJobsByRun(ctx, run.ID)
+		if err != nil {
+			return fmt.Errorf("forge status: list jobs: %w", err)
 		}
-		jstatus, jconclusion := checkStateForRun(j.Status)
-		jsummary := "job " + j.Key + " " + string(j.Status)
-		if j.Error != "" {
-			jsummary += ": " + j.Error
+		for _, j := range jobs {
+			if !j.Status.Terminal() {
+				continue
+			}
+			jstatus, jconclusion := checkStateForRun(j.Status)
+			jsummary := "job " + j.Key + " " + string(j.Status)
+			if j.Error != "" {
+				jsummary += ": " + j.Error
+			}
+			items = append(items, s.checkIntent(run, j.Key, jstatus, jconclusion, jsummary, nil))
 		}
-		items = append(items, s.checkIntent(run, j.Key, jstatus, jconclusion, jsummary, nil))
+	} else {
+		s.mu.Lock()
+		for _, j := range s.jobs {
+			if j.RunID != run.ID || !j.Status.Terminal() {
+				continue
+			}
+			jstatus, jconclusion := checkStateForRun(j.Status)
+			jsummary := "job " + j.Key + " " + string(j.Status)
+			if j.Error != "" {
+				jsummary += ": " + j.Error
+			}
+			items = append(items, s.checkIntent(run, j.Key, jstatus, jconclusion, jsummary, nil))
+		}
+		s.mu.Unlock()
 	}
-	s.mu.Unlock()
+	// Deterministic order: pipeline first, then jobs by name.
+	sort.Slice(items[1:], func(i, j int) bool {
+		var a, b forge.CheckPayload
+		_ = json.Unmarshal(items[i+1].Payload, &a)
+		_ = json.Unmarshal(items[j+1].Payload, &b)
+		return a.Name < b.Name
+	})
+	// Durable-first: every intended row must be recorded before the effect
+	// reports success, otherwise the completion effect would be ACKed with
+	// forge statuses missing.
 	for _, it := range items {
 		if it.Kind == "" {
 			continue
 		}
 		if err := s.outbox.Enqueue(it); err != nil {
-			// Durable append failures keep the in-process queue in sync and
-			// are retried by the flush claim loop.
-			log.Printf("outbox: enqueue %s: %v", it.Kind, err)
+			return fmt.Errorf("forge status: enqueue %s: %w", it.Kind, err)
 		}
 	}
+	return nil
+}
+
+// forgePublishingConfigured reports whether the control plane holds any
+// credential or endpoint for the forge kind.
+func (s *Server) forgePublishingConfigured(kind string) bool {
+	switch kind {
+	case "github":
+		return s.GitHubToken != "" || s.GitHubAppID != 0 || s.gitHubAPIBase != ""
+	case "gitlab":
+		return s.GitLabToken != "" || s.gitLabAPIBase != ""
+	case "forgejo":
+		return s.ForgejoToken != "" || s.forgejoAPIBase != ""
+	}
+	return false
 }
 
 // publishGitHubStatus is the GitHub-only publication path (kept for callers
 // that explicitly target GitHub). Non-GitHub runs return immediately.
-func (s *Server) publishGitHubStatus(run model.Run) {
+func (s *Server) publishGitHubStatus(run model.Run) error {
 	_, span := s.startSpan(context.Background(), "forge.status.publish")
 	defer span.End()
 	if run.RepoFullName == "" || run.SHA == "" {
-		return
+		return nil
 	}
 	if run.ForgeKind != "" && run.ForgeKind != "github" {
 		// Never route another forge's run to the GitHub API, even when a
 		// GitHub credential happens to be configured on this control plane.
-		return
+		return nil
 	}
 	if s.GitHubToken == "" && s.GitHubAppID == 0 && s.gitHubAPIBase == "" {
 		// No publishing credential or endpoint configured: nothing can be
 		// published, so the intent would never dispatch. Skip enqueueing.
-		return
+		return nil
 	}
 	status, conclusion := checkStateForRun(run.Status)
 	summary := "pipeline " + string(run.Status)
@@ -117,13 +162,13 @@ func (s *Server) publishGitHubStatus(run model.Run) {
 		if it.Kind == "" {
 			// The run's forge could not be classified: publishing to a
 			// guessed forge is worse than not publishing.
-			log.Printf("outbox: skipping check intent for run %s without a forge identity", run.ID)
 			continue
 		}
 		if err := s.outbox.Enqueue(it); err != nil {
-			log.Printf("outbox: enqueue %s: %v", it.Kind, err)
+			return fmt.Errorf("forge status: enqueue %s: %w", it.Kind, err)
 		}
 	}
+	return nil
 }
 
 func (s *Server) checkIntent(run model.Run, name, status, conclusion, summary string, annotations []forge.CheckAnnotation) forge.OutboxItem {
@@ -156,7 +201,12 @@ func (s *Server) checkIntent(run model.Run, name, status, conclusion, summary st
 	case "forgejo":
 		kind = forge.OutboxKindForgejoCheck
 	}
-	return forge.OutboxItem{Kind: kind, Payload: payload}
+	// Deterministic ID over the LOGICAL operation: a replay (lost ACK,
+	// crash between enqueue and dispatch) converges on one durable row per
+	// (forge host, run, check name), and OutboxAppend verifies content on
+	// ID reuse.
+	sum := sha256.Sum256([]byte("forge-check\x00" + run.ForgeHost + "\x00" + run.ID + "\x00" + name))
+	return forge.OutboxItem{ID: hex.EncodeToString(sum[:16]), Kind: kind, Payload: payload}
 }
 
 // checkStateForRun maps Kiwi run/job statuses onto GitHub check-run

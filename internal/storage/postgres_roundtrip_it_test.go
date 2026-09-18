@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -502,18 +503,26 @@ func TestPostgresIntegrationOutboxRoundTrip(t *testing.T) {
 	st := pgITStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
-	first := OutboxItem{ID: "o1", Kind: "k1", Payload: []byte(`{"a":1}`), CreatedAt: now}
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
+	id1, id2 := "o1-"+suffix, "o2-"+suffix
+	first := OutboxItem{ID: id1, Kind: "k1", Payload: []byte(`{"a":1}`), CreatedAt: now}
 	if err := st.OutboxAppend(ctx, first); err != nil {
 		t.Fatalf("OutboxAppend: %v", err)
 	}
-	if err := st.OutboxAppend(ctx, first); err == nil {
-		t.Fatal("duplicate outbox id must fail")
+	// Idempotent by ID: a replay with IDENTICAL content (lost ACK) succeeds
+	// without creating a second row; the same ID with DIFFERENT content is
+	// an invariant failure.
+	if err := st.OutboxAppend(ctx, first); err != nil {
+		t.Fatalf("identical replay must succeed: %v", err)
 	}
-	if err := st.OutboxAppend(ctx, OutboxItem{ID: "o2", Kind: "k2", CreatedAt: now}); err != nil {
+	if err := st.OutboxAppend(ctx, OutboxItem{ID: id1, Kind: "k1", Payload: []byte(`{"a":2}`), CreatedAt: now}); err == nil {
+		t.Fatal("same id with different content must fail")
+	}
+	if err := st.OutboxAppend(ctx, OutboxItem{ID: id2, Kind: "k2", CreatedAt: now}); err != nil {
 		t.Fatalf("OutboxAppend second: %v", err)
 	}
 	pending, err := st.OutboxPending(ctx)
-	if err != nil || len(pending) != 2 || pending[0].ID != "o1" {
+	if err != nil || len(pending) != 2 || pending[0].ID != id1 {
 		t.Fatalf("OutboxPending = %+v, %v", pending, err)
 	}
 
@@ -524,31 +533,31 @@ func TestPostgresIntegrationOutboxRoundTrip(t *testing.T) {
 		t.Fatalf("zero limit = %v, %v", claimed, err)
 	}
 	claimed, err := st.ClaimOutbox(ctx, "flusher", 1)
-	if err != nil || len(claimed) != 1 || claimed[0].ID != "o1" {
+	if err != nil || len(claimed) != 1 || claimed[0].ID != id1 {
 		t.Fatalf("ClaimOutbox = %+v, %v", claimed, err)
 	}
 	// A fresh claim is invisible to another flusher.
 	again, err := st.ClaimOutbox(ctx, "other", 5)
-	if err != nil || len(again) != 1 || again[0].ID != "o2" {
+	if err != nil || len(again) != 1 || again[0].ID != id2 {
 		t.Fatalf("second flusher = %+v, %v", again, err)
 	}
 	// Releasing the claim makes the row claimable again immediately.
-	if err := st.ReleaseOutboxClaim(ctx, "o1", "flusher"); err != nil {
+	if err := st.ReleaseOutboxClaim(ctx, id1, "flusher"); err != nil {
 		t.Fatalf("ReleaseOutboxClaim: %v", err)
 	}
 	reclaimed, err := st.ClaimOutbox(ctx, "other", 1)
-	if err != nil || len(reclaimed) != 1 || reclaimed[0].ID != "o1" {
+	if err != nil || len(reclaimed) != 1 || reclaimed[0].ID != id1 {
 		t.Fatalf("reclaim after release = %+v, %v", reclaimed, err)
 	}
 	// Releasing a wrong claimer is a no-op.
-	if err := st.ReleaseOutboxClaim(ctx, "o2", "wrong"); err != nil {
+	if err := st.ReleaseOutboxClaim(ctx, id2, "wrong"); err != nil {
 		t.Fatalf("ReleaseOutboxClaim wrong: %v", err)
 	}
-	if err := st.OutboxAck(ctx, "o1"); err != nil {
+	if err := st.OutboxAck(ctx, id1); err != nil {
 		t.Fatalf("OutboxAck: %v", err)
 	}
 	pending, _ = st.OutboxPending(ctx)
-	if len(pending) != 1 || pending[0].ID != "o2" {
+	if len(pending) != 1 || pending[0].ID != id2 {
 		t.Fatalf("after ack = %+v", pending)
 	}
 }
