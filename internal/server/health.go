@@ -6,6 +6,13 @@ import (
 	"time"
 )
 
+// statePersistenceDegradedBody is the fixed /readiness body for a control
+// plane whose snapshot write failed. /readiness is unauthenticated, so the
+// raw persist error must NOT be echoed here: it would leak filesystem paths
+// and store internals. The diagnostic stays in the structured logs emitted
+// by persistCheckedErrLocked for the failing mutation.
+const statePersistenceDegradedBody = "state persistence degraded"
+
 // liveness reports that the process is up. It never checks dependencies:
 // a live control plane that cannot reach its store must still report
 // liveness so an orchestrator does not kill it while it retries.
@@ -29,10 +36,9 @@ func (s *Server) readiness(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.stateDegraded.Load() {
 		w.Header().Set("X-Kiwi-State", "degraded")
-		// Surface the diagnostic from the failed snapshot write so an
-		// operator can act on the outage instead of only seeing the
-		// degraded state.
-		http.Error(w, "state persistence degraded: "+s.persistDegraded(), http.StatusServiceUnavailable)
+		// Fixed body: the underlying persist error is in the logs, not on an
+		// unauthenticated probe (X1A).
+		http.Error(w, statePersistenceDegradedBody, http.StatusServiceUnavailable)
 		return
 	}
 	if s.DB == nil {

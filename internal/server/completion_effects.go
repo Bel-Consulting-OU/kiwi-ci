@@ -153,8 +153,9 @@ func (s *Server) effectDeploymentFinish(ctx context.Context, j model.Job) error 
 //
 // DB mode arbitrates through UsageOnceStore.RecordUsageOnce FIRST and moves
 // process metrics only when this call won the exactly-once transition: a
-// retry (or a second replica) that loses the race increments nothing. Stores
-// without the contract keep the previous read-modify-write fallback.
+// retry (or a second replica) that loses the race increments nothing. A store
+// without the contract fails closed rather than falling back to a
+// read-modify-write with last-writer-wins semantics.
 func (s *Server) effectUsageAccount(ctx context.Context, j model.Job) error {
 	if j.UsageRecorded {
 		return nil
@@ -165,33 +166,31 @@ func (s *Server) effectUsageAccount(ctx context.Context, j model.Job) error {
 	}
 	cost, energy, computed := computeJobUsage(&j, finished)
 	if s.DB != nil {
-		if us, ok := s.DB.(storage.UsageOnceStore); ok {
-			won, err := us.RecordUsageOnce(ctx, j.ID, cost, energy)
-			if err != nil {
-				// Nothing was recorded; the marker and the metrics stay
-				// untouched so the retry converges on exactly one winner.
-				return err
-			}
-			if !won {
-				// Another attempt (or replica) already recorded this job's
-				// usage: never move process metrics for a lost race.
-				return nil
-			}
-			if computed {
-				s.metricAdd("kiwi_usage_cost_total", cost, nil)
-				s.metricAdd("kiwi_usage_energy_total", energy, nil)
-				s.metricObserve("kiwi_job_duration_seconds", finished.Sub(*j.StartedAt).Seconds(), nil)
-			}
+		us, ok := s.DB.(storage.UsageOnceStore)
+		if !ok {
+			// Fail closed: without the exactly-once transition a retry or a
+			// second replica could double-account. Every shipped store
+			// implements the contract (PostgresStore, memStore, FaultyStore),
+			// so this is a programming-error guard, not a supported mode.
+			return errors.New("server: usage store lacks the exactly-once usage contract")
+		}
+		won, err := us.RecordUsageOnce(ctx, j.ID, cost, energy)
+		if err != nil {
+			// Nothing was recorded; the marker and the metrics stay
+			// untouched so the retry converges on exactly one winner.
+			return err
+		}
+		if !won {
+			// Another attempt (or replica) already recorded this job's
+			// usage: never move process metrics for a lost race.
 			return nil
 		}
-		// Legacy store without the exactly-once contract: the previous
-		// read-modify-write path (last writer wins).
 		if computed {
-			s.recordJobUsage(&j, finished)
+			s.metricAdd("kiwi_usage_cost_total", cost, nil)
+			s.metricAdd("kiwi_usage_energy_total", energy, nil)
 			s.metricObserve("kiwi_job_duration_seconds", finished.Sub(*j.StartedAt).Seconds(), nil)
 		}
-		j.UsageRecorded = true
-		return s.DB.UpdateJob(ctx, j)
+		return nil
 	}
 	// The marker check above ran without s.mu; re-check it against the live
 	// job inside the same critical section that records. The outbox

@@ -22,7 +22,7 @@ script exits non-zero with a precise message and publishes nothing.
 | Tag points at `HEAD`, recorded commit = tagged commit | required | n/a |
 | Recorded commit is the full 40-char lowercase SHA | required | short SHA (or explicit override) |
 | Clean git tree | required | allowed; `.dirty` is appended to the version |
-| Ed25519 signing key (`KIWI_RELEASE_SIGNING_KEY`) | required unless `--allow-unsigned` or `KIWI_ALLOW_UNSIGNED_RELEASE=1`; an explicit `--require-signing` overrides the env var | optional; unsigned snapshots are normal |
+| Ed25519 signing key (`KIWI_RELEASE_SIGNING_KEY`) | required unless `--allow-unsigned` or `KIWI_ALLOW_UNSIGNED_RELEASE=1`; an explicit `--require-signing` overrides the env var | optional; unsigned snapshots are normal. `--require-signing` is rejected (release-only flag); `--allow-unsigned` is accepted and ignored |
 | `Formula/kiwi.rb` re-rendered from `Formula/kiwi.rb.tmpl` | every release, unconditionally | never; snapshot builds skip formula rendering rather than refusing |
 | Bundle location | `dist/release/` | `dist/snapshot/`, with a `SNAPSHOT` marker file |
 | `SOURCE_DATE_EPOCH` default | committer date of the tagged commit | current time unless set |
@@ -44,7 +44,11 @@ tag. Formula rendering has no flag: release mode always re-renders
 Signing policy precedence: an explicit `--require-signing` on the command line
 wins over `KIWI_ALLOW_UNSIGNED_RELEASE=1`, which is only the default policy and
 cannot neutralize the flag; `--allow-unsigned` is the explicit opt-out. When
-both flags are given, the last one wins.
+both flags are given, the last one wins. `--require-signing` applies to release
+builds only: snapshots are never signed, so `--snapshot --require-signing` is
+rejected during argument validation with a usage error before any git or build
+work, and the caller must drop the flag. `--allow-unsigned` is accepted and
+ignored for snapshots (it changes nothing, since snapshots are never signed).
 
 Invocation:
 
@@ -67,7 +71,9 @@ scripts/release.sh v1.2.3 --allow-unsigned
 Snapshot versions look like `0.1.0-dev-snapshot+1a2b3c4` (or
 `...+1a2b3c4.dirty`) and the bundle contains a `SNAPSHOT` marker file that
 states the build is not a release. Snapshots are for testing; they are never
-published as releases and never update the Homebrew formula.
+published as releases, never update the Homebrew formula, and are never
+signed: `--snapshot --require-signing` is rejected as a usage error, while
+`--snapshot --allow-unsigned` is accepted and ignored.
 
 ## 2. Homebrew formula rendering
 
@@ -145,7 +151,11 @@ the recorded `BuildDate` is pinned from `SOURCE_DATE_EPOCH`.
 
 Flow in `scripts/release.sh` release mode:
 
-1. If `BUILD_DATE` is set explicitly, it wins.
+1. If `BUILD_DATE` is set explicitly, it wins. It must be exactly
+   `YYYY-MM-DDTHH:MM:SSZ` (RFC3339 UTC): any other value, including one
+   carrying whitespace or extra `-X` linker flags, is rejected with a fatal
+   error before the build, in both release and snapshot mode, so a caller
+   cannot override the validated version through `-ldflags`.
 2. Else if `SOURCE_DATE_EPOCH` is set, it is converted to RFC3339 UTC.
 3. Else `SOURCE_DATE_EPOCH` is derived from the tagged commit:
    `git log -1 --format=%ct <tag>`, then converted to RFC3339 UTC.
@@ -158,7 +168,9 @@ the `HEAD` commit date) to an RFC3339 `BUILD_DATE` on the host with a
 BSD-then-GNU `date` fallback and passes it as a build arg, so the Dockerfile
 never depends on the build-stage userland (BusyBox) understanding epoch
 syntax. A direct `docker build` may pass `--build-arg BUILD_DATE=<RFC3339>`
-itself; when only `SOURCE_DATE_EPOCH` is given, the Dockerfile converts it
+itself; that build arg is validated against the same exact RFC3339 UTC shape
+in the build stage before it reaches `-ldflags` (a rejected value fails the
+build). When only `SOURCE_DATE_EPOCH` is given, the Dockerfile converts it
 with the Go toolchain in the image. `make` users can override the timestamp
 with `DOCKER_BUILD_DATE`.
 

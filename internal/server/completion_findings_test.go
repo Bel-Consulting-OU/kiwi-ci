@@ -366,7 +366,7 @@ func TestCompletionReceiptRecordsPrunesExpired(t *testing.T) {
 // TestReadinessHealsAcrossSwitchToDB is the F2-5 regression: a server armed
 // stateDegraded by an fs-mode snapshot failure that then switches to DB mode
 // returned early from persistLocked forever, pinning /readiness at 503. The
-// transition clears the flag and the diagnostic.
+// transition clears the flag.
 func TestReadinessHealsAcrossSwitchToDB(t *testing.T) {
 	s, err := NewPersistent("token", "token", t.TempDir())
 	if err != nil {
@@ -387,9 +387,6 @@ func TestReadinessHealsAcrossSwitchToDB(t *testing.T) {
 	}
 	if s.stateDegraded.Load() {
 		t.Fatal("degraded flag survived the transition to DB mode")
-	}
-	if got := s.persistDegraded(); got != "" {
-		t.Fatalf("last persist error after switch = %q, want empty", got)
 	}
 	if w := doJSON(t, s, http.MethodGet, "/readiness", "", ""); w.Code != http.StatusOK {
 		t.Fatalf("readiness after switch = %d, want 200: %s", w.Code, w.Body.String())

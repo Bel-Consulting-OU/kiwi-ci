@@ -25,13 +25,16 @@
 #
 # Usage:
 #   scripts/release.sh [vX.Y.Z] [--allow-unsigned] [--require-signing]
-#   scripts/release.sh --snapshot
+#   scripts/release.sh --snapshot [--allow-unsigned]
 #   scripts/release.sh --render-formula VERSION SHA_DARWIN_ARM64 SHA_DARWIN_AMD64 [OUT]
 #
 # Signing policy: releases are signed by default. --allow-unsigned is the
 # explicit opt-out; KIWI_ALLOW_UNSIGNED_RELEASE=1 is only the default policy.
 # An explicit --require-signing wins over both and cannot be neutralized by
 # the environment variable. When both flags are given, the last one wins.
+# --require-signing applies to release builds only: snapshots are never signed,
+# so it is rejected with a usage error for --snapshot. --allow-unsigned is
+# accepted and ignored for snapshots.
 #
 # Inputs (env):
 #   VERSION                       release version override; in release mode it
@@ -52,7 +55,9 @@
 #                                 time. It only pins the recorded BuildDate
 #                                 (artifact bytes); provenance and SBOM
 #                                 timestamps stay truthful.
-#   BUILD_DATE                    explicit RFC3339 BuildDate override.
+#   BUILD_DATE                    explicit RFC3339 UTC BuildDate override
+#                                 (YYYY-MM-DDTHH:MM:SSZ). Any other value is
+#                                 rejected before the build.
 #   COMMIT / REF                  build identity overrides. In release mode
 #                                 COMMIT must be the full 40-char SHA of the
 #                                 tagged commit.
@@ -82,6 +87,24 @@ require_sha256() {
 	esac
 	if [ "${#value}" -ne 64 ]; then
 		die "$label is not a 64-char SHA256: '$value'"
+	fi
+}
+
+# require_rfc3339 verifies that a caller-supplied timestamp is exactly the
+# RFC3339 UTC form emitted by epoch_to_rfc3339 (YYYY-MM-DDTHH:MM:SSZ). The
+# case guard rejects characters outside the allowed set first -- including
+# whitespace and newlines -- so a multi-line value cannot pass on a matching
+# first line and then be whitespace-split by cmd/go into extra linker flags.
+require_rfc3339() {
+	value="$1"
+	label="$2"
+	case "$value" in
+	*[!0-9TZ:.-]*)
+		die "$label must be an RFC3339 UTC timestamp (YYYY-MM-DDTHH:MM:SSZ), got '$value'"
+		;;
+	esac
+	if ! printf '%s\n' "$value" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'; then
+		die "$label must be an RFC3339 UTC timestamp (YYYY-MM-DDTHH:MM:SSZ), got '$value'"
 	fi
 }
 
@@ -166,6 +189,13 @@ if [ "$SNAPSHOT" = "1" ] && [ -n "$TAG_ARG" ]; then
 	usage "--snapshot cannot be combined with a release tag ('$TAG_ARG')"
 fi
 
+# Snapshots are never signed (no key is ever used for them), so an explicit
+# --require-signing has no meaning and must not appear to be honored. Fail
+# closed here, at argument parsing, before any git or build work happens.
+if [ "$SNAPSHOT" = "1" ] && [ "$SIGNING_POLICY" = "require" ]; then
+	usage "--require-signing applies to release builds only; snapshots are never signed, so drop --require-signing"
+fi
+
 REPO="${REPO:-$(git remote get-url origin 2>/dev/null | sed 's/\.git$//' || true)}"
 [ -n "$REPO" ] || REPO="https://github.com/Bel-Consulting-OU/kiwi-ci"
 
@@ -193,6 +223,7 @@ if [ "$SNAPSHOT" = "1" ]; then
 		BUILD_DATE="$(epoch_to_rfc3339 "$SOURCE_DATE_EPOCH")"
 	else
 		BUILD_DATE="${BUILD_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+		require_rfc3339 "$BUILD_DATE" "BUILD_DATE"
 	fi
 	echo "release: SNAPSHOT build (NOT a release): version=$VERSION commit=$COMMIT ref=$REF dirty=$DIRTY"
 else
@@ -232,7 +263,7 @@ else
 	COMMIT="$HEAD_SHA"
 	DIRTY=false
 	if [ -n "${BUILD_DATE:-}" ]; then
-		BUILD_DATE="$BUILD_DATE"
+		require_rfc3339 "$BUILD_DATE" "BUILD_DATE"
 	elif [ -n "${SOURCE_DATE_EPOCH:-}" ]; then
 		BUILD_DATE="$(epoch_to_rfc3339 "$SOURCE_DATE_EPOCH")"
 	else

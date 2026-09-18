@@ -20,12 +20,24 @@
 # Makefile target does) to populate the cache.
 #
 # License files are matched by name (LICENSE*, COPYING*, UNLICENSE*) and
-# classified by scanning for the canonical markers in classify below. Each
-# file is classified on its own and must classify to an allowlisted id: an
-# allowlisted file never masks a disallowed or unrecognized one, and an
-# unrecognized license file is a failure, not a skip. Documentation-only
-# license files (for example LICENSE.docs) are ignored: they cover the
-# module's prose, not the code that ships.
+# classified by scanning for the canonical core phrases in classify below.
+# Every allowlisted permissive family (MIT, BSD-2/3, Apache-2.0, ISC, 0BSD,
+# MPL-2.0, PostgreSQL, Unlicense) must match its grant, conditions and
+# disclaimer together, so a bare fragment plus unrecognized terms is
+# unknown, not that license. A residual-restriction list (for example
+# "non-commercial", "evaluation only", "proprietary") fails a file even
+# when an allowlisted marker also matched in it. Each file is classified on
+# its own and must classify to an allowlisted id: an allowlisted file never
+# masks a disallowed or unrecognized one, and an unrecognized license file
+# is a failure, not a skip. Documentation-only license files (for example
+# LICENSE.docs) are ignored: they cover the module's prose, not the code
+# that ships.
+#
+# Classification is a heuristic, not legal advice: a crafted file that
+# embeds the complete canonical text of an allowed license alongside extra
+# restrictive terms can still classify as that license. NOTICE review and
+# human review of dependency licenses remain part of the process; this
+# check only catches marker-level mismatches.
 set -eu
 
 # Every id in this list is accepted; a detected id outside it fails the gate.
@@ -54,32 +66,95 @@ esac
 # PostgreSQL, Unlicense, then the copyleft/source-available ids:
 # AGPL-3.0, LGPL-2.1, LGPL-2.0, LGPL-3.0, GPL-2.0, GPL-3.0, AGPL, LGPL,
 # GPL, SSPL-1.0, SSPL, BUSL-1.1, BUSL, the CC-BY-NC family and
-# Commons-Clause.
+# Commons-Clause. The failing id "Restricted" is reported when a file
+# carries residual restriction language next to an allowlisted marker.
 classify() {
 	awk '
 	function add(id) {
 		if (have[id]++) return
 		out = (out == "") ? id : out "/" id
 	}
+	# permissive_only reports whether every detected id belongs to an
+	# allowlisted permissive family; a nonfree id (GPL, SSPL, ...) already
+	# fails the gate on its own.
+	function permissive_only(   n, parts, i) {
+		if (out == "") return 0
+		n = split(out, parts, "/")
+		for (i = 1; i <= n; i++) {
+			if (parts[i] != "Apache-2.0" && parts[i] != "BSD-3-Clause" &&
+			    parts[i] != "BSD-2-Clause" && parts[i] != "ISC" &&
+			    parts[i] != "0BSD" && parts[i] != "MIT" &&
+			    parts[i] != "MPL-2.0" && parts[i] != "PostgreSQL" &&
+			    parts[i] != "Unlicense")
+				return 0
+		}
+		return 1
+	}
 	{ text = text " " $0 }
 	END {
 		gsub(/[[:space:]]+/, " ", text)
 		low = tolower(text)
-		if (text ~ /Apache License/ && text ~ /Version 2\.0/) add("Apache-2.0")
-		if (text ~ /Redistribution and use in source and binary forms/) {
+
+		# Allowlisted permissive families are matched by their canonical
+		# core phrases only: a grant fragment alone is not a license. The
+		# shared disclaimer shape below covers the "THE SOFTWARE IS
+		# PROVIDED "AS IS"" wording of MIT/BSD/ISC/0BSD/Unlicense and
+		# the PostgreSQL "SOFTWARE PROVIDED HEREUNDER IS ON AN "AS IS"
+		# BASIS" wording.
+		as_is = ((low ~ /software is provided/ ||
+		          low ~ /software provided hereunder/ ||
+		          low ~ /as is. basis/) && low ~ /as is/)
+
+		# Apache-2.0: full text needs the terms header plus a license URL
+		# (the https:// spelling and the LICENSE-2.0-less appendix URL are
+		# both shipped in the wild); the appendix-only notice is complete
+		# only with the versioned LICENSE-2.0 URL and an AS IS basis.
+		if (text ~ /Apache License/ && text ~ /Version 2\.0/ &&
+		    ((text ~ /TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION/ &&
+		      text ~ /https?:\/\/www\.apache\.org\/licenses\//) ||
+		     (text ~ /You may obtain a copy of the License at/ &&
+		      text ~ /https?:\/\/www\.apache\.org\/licenses\/LICENSE-2\.0/ && as_is)))
+			add("Apache-2.0")
+
+		# BSD-2/3-Clause: header, both redistribution conditions and the
+		# disclaimer; BSD-3 additionally carries the name/endorsement
+		# clause.
+		if (text ~ /Redistribution and use in source and binary forms/ &&
+		    text ~ /Redistributions of source code must retain/ &&
+		    text ~ /Redistributions in binary form must reproduce/ && as_is) {
 			if (text ~ /Neither the name/ || text ~ /endorse or promote/) add("BSD-3-Clause")
 			else add("BSD-2-Clause")
 		}
-		if (text ~ /Permission to use, copy, modify, and\/or distribute this software for any purpose/ ||
-		    text ~ /Permission to use, copy, modify, and distribute this software for any purpose/) {
+
+		# ISC and 0BSD share the grant and disclaimer; ISC alone carries
+		# the copyright-notice condition.
+		if ((text ~ /Permission to use, copy, modify, and\/or distribute this software for any purpose/ ||
+		     text ~ /Permission to use, copy, modify, and distribute this software for any purpose/) &&
+		    text ~ /with or without fee is hereby granted/ && as_is) {
 			if (text ~ /provided that the (above )?copyright notice/) add("ISC")
 			else add("0BSD")
 		}
-		if (text ~ /to deal in the Software without restriction/) add("MIT")
-		if (text ~ /Mozilla Public License/ && low ~ /version 2\.0/) add("MPL-2.0")
-		if (text ~ /Permission to use, copy, modify, and distribute this software and its documentation for any purpose/ ||
-		    text ~ /PostgreSQL License[[:space:]]/) add("PostgreSQL")
-		if (text ~ /free and unencumbered software released into the public domain/) add("Unlicense")
+
+		# MIT: the grant, the notice condition and the disclaimer together.
+		# MIT No Attribution is the variant whose complete canonical text
+		# omits the condition and names itself in the title.
+		if (text ~ /Permission is hereby granted, free of charge/ && as_is &&
+		    (text ~ /copyright notice and this permission notice/ ||
+		     text ~ /MIT No Attribution/))
+			add("MIT")
+
+		if (text ~ /Mozilla Public License/ && low ~ /version 2\.0/ &&
+		    (text ~ /Covered Software/ || text ~ /Exhibit A/ || text ~ /1\. Definitions/))
+			add("MPL-2.0")
+
+		if ((text ~ /Permission to use, copy, modify, and distribute this software and its documentation for any purpose/ ||
+		     text ~ /PostgreSQL License[[:space:]]/) &&
+		    text ~ /paragraph and the following two paragraphs appear in all copies/ && as_is)
+			add("PostgreSQL")
+
+		if (text ~ /free and unencumbered software released into the public domain/ &&
+		    text ~ /Anyone is free to copy, modify, publish, use, compile, sell, or distribute/ && as_is)
+			add("Unlicense")
 		# Copyleft and source-available licenses. Full texts are matched by
 		# their canonical header date; the MPL-2.0 secondary-license list,
 		# which names GPL, LGPL and AGPL in title case without dates, must not
@@ -125,6 +200,26 @@ classify() {
 			add(cc)
 		}
 		if (low ~ /commons clause/) add("Commons-Clause")
+
+		# Residual restriction language is a denial independent of the
+		# matched id: a file cannot launder "evaluation only" or
+		# "proprietary" terms with an allowlisted marker elsewhere in the
+		# same file. The non-commercial phrases exclude the Unlicense
+		# grant wording ("commercial or non-commercial"), which is
+		# permissive. Files whose only ids are permissive families are
+		# reported as "Restricted", which is not in the allowlist and
+		# therefore fails the gate; files that also matched a nonfree id
+		# keep that id, which fails on its own.
+		noncomm = ((low ~ /non-commercial/ || low ~ /noncommercial/) &&
+		           low !~ /commercial or non-commercial/ &&
+		           low !~ /commercial and non-commercial/)
+		restricted = (noncomm || low ~ /not for commercial/ ||
+		              low ~ /evaluation only/ || low ~ /research only/ ||
+		              low ~ /no derivative/ || low ~ /noderivatives/ ||
+		              low ~ /proprietary/ || low ~ /internal use only/ ||
+		              low ~ /redistribution is prohibited/ ||
+		              low ~ /may not be redistributed/)
+		if (restricted && permissive_only()) out = "Restricted"
 		print out
 	}
 	' "$@"
@@ -378,13 +473,40 @@ run_selftest() {
 		fi
 	}
 
-	cat > "$_dir/apache" <<'EOF'
-Apache License
-Version 2.0, January 2004
-http://www.apache.org/licenses/
-EOF
+	# mit_text prints the canonical MIT text; the classifier requires the
+	# grant, the notice condition and the disclaimer together. apache_text
+	# prints a canonical Apache-2.0 text (header, terms, disclaimer,
+	# appendix). mit_fragment_text is the bare grant sentence that must NOT
+	# classify as MIT, and proprietary_text is unrecognized restriction
+	# wording. Fixtures compose these so the same-file masking cases use
+	# exactly the reviewer's material.
+	mit_text() {
+		cat <<'EOF'
+MIT License
 
-	cat > "$_dir/mit" <<'EOF'
+Copyright (c) 2024 Example Authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+EOF
+	}
+	mit_fragment_text() {
+		cat <<'EOF'
 MIT License
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -392,38 +514,168 @@ in the Software without restriction, including without limitation the rights
 to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 copies of the Software.
 EOF
+	}
+	proprietary_text() {
+		cat <<'EOF'
+Proprietary License
+Copyright (c) 2024 Example Corp. All rights reserved. Redistribution is
+prohibited without prior written permission.
+EOF
+	}
+	apache_text() {
+		cat <<'EOF'
+                                 Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+
+   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+   1. Definitions.
+
+      "License" shall mean the terms and conditions for use, reproduction,
+      and distribution as defined by Sections 1 through 9 of this document.
+
+      "Contributor" shall mean Licensor and any individual or Legal Entity
+      on behalf of whom a Contribution has been received by Licensor and
+      subsequently incorporated within the Work.
+
+   2. Grant of Copyright License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      copyright license to reproduce, prepare Derivative Works of,
+      publicly display, publicly perform, sublicense, and distribute the
+      Work and such Derivative Works in Source or Object form.
+
+   7. Disclaimer of Warranty. Unless required by applicable law or
+      agreed to in writing, Licensor provides the Work (and each
+      Contributor provides its Contributions) on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+      implied, including, without limitation, any warranties or conditions
+      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+      PARTICULAR PURPOSE.
+
+   9. Accepting Warranty or Additional Liability. While redistributing
+      the Work or Derivative Works thereof, You may choose to offer,
+      and charge a fee for, acceptance of support, warranty, indemnity,
+      or other liability obligations and/or rights consistent with this
+      License.
+
+   END OF TERMS AND CONDITIONS
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+EOF
+	}
+
+	apache_text > "$_dir/apache"
+	mit_fragment_text > "$_dir/mit-partial"
+	mit_text > "$_dir/mit-full"
+	{ mit_fragment_text; proprietary_text; } > "$_dir/mit-proprietary"
+	{
+		mit_text
+		printf '\nThis software is made available for non-commercial evaluation only.\n'
+	} > "$_dir/mit-restricted"
+	mit_text > "$_dir/mit"
 
 	cat > "$_dir/bsd2" <<'EOF'
+Copyright (c) 2024 Example Authors
+All rights reserved.
+
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
-1. Redistributions of source code must retain the above copyright notice.
-2. Redistributions in binary form must reproduce the above copyright notice.
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
 EOF
 
 	cat > "$_dir/bsd3" <<'EOF'
+Copyright (c) 2024 Example Authors
+All rights reserved.
+
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
-1. Redistributions of source code must retain the above copyright notice.
-2. Redistributions in binary form must reproduce the above copyright notice.
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
 3. Neither the name of the copyright holder nor the names of its contributors
-may be used to endorse or promote products derived from this software
-without specific prior written permission.
+   may be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES ARE DISCLAIMED. IN NO EVENT SHALL THE
+COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES ARISING IN ANY WAY
+OUT OF THE USE OF THIS SOFTWARE.
 EOF
 
 	cat > "$_dir/bsd3-variant" <<'EOF'
+Copyright (c) 2024 Example Authors
+All rights reserved.
+
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
-1. Redistributions of source code must retain the above copyright notice.
-2. Redistributions in binary form must reproduce the above copyright notice.
+
+1. Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
 The names of its contributors may not be used to endorse or promote products
 derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES ARE DISCLAIMED. IN NO EVENT SHALL THE
+COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES ARISING IN ANY WAY
+OUT OF THE USE OF THIS SOFTWARE.
 EOF
 
 	cat > "$_dir/isc" <<'EOF'
 ISC License
+
+Copyright (c) 2024 Example Authors
+
 Permission to use, copy, modify, and/or distribute this software for any
 purpose with or without fee is hereby granted, provided that the above
 copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
+OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+PERFORMANCE OF THIS SOFTWARE.
 EOF
 
 	cat > "$_dir/0bsd" <<'EOF'
@@ -442,28 +694,48 @@ EOF
 
 	cat > "$_dir/postgresql" <<'EOF'
 PostgreSQL License
+
+Copyright (c) 2024, Example Authors
+
 Permission to use, copy, modify, and distribute this software and its
 documentation for any purpose, without fee, and without a written agreement
 is hereby granted, provided that the above copyright notice and this
 paragraph and the following two paragraphs appear in all copies.
+
+IN NO EVENT SHALL THE AUTHORS BE LIABLE TO ANY PARTY FOR DIRECT, INDIRECT,
+SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, INCLUDING LOST PROFITS,
+ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS DOCUMENTATION.
+
+THE SOFTWARE PROVIDED HEREUNDER IS ON AN "AS IS" BASIS, AND THE AUTHORS HAVE
+NO OBLIGATIONS TO PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR
+MODIFICATIONS.
 EOF
 
 	cat > "$_dir/unlicense" <<'EOF'
 This is free and unencumbered software released into the public domain.
+
 Anyone is free to copy, modify, publish, use, compile, sell, or distribute
-this software, either in source code form or as a compiled binary.
+this software, either in source code form or as a compiled binary, for any
+purpose, commercial or non-commercial, and by any means.
+
+In jurisdictions that recognize copyright laws, the author or authors of
+this software dedicate any and all copyright interest in the software to
+the public domain. We make this dedication for the benefit of the public
+at large and to the detriment of our heirs and successors. We intend this
+dedication to be an overt act of relinquishment in perpetuity of all
+present and future rights to this software under copyright law.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+For more information, please refer to <https://unlicense.org>
 EOF
 
-	cat > "$_dir/apache-mit" <<'EOF'
-This project is covered by two different licenses: MIT and Apache.
-Apache License
-Version 2.0, January 2004
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software.
-EOF
+	{ apache_text; printf '\n'; mit_text; } > "$_dir/apache-mit"
 
 	cat > "$_dir/unknown" <<'EOF'
 Proprietary License
@@ -508,6 +780,9 @@ EOF
 
 	cat > "$_dir/mpl-secondary" <<'EOF'
 Mozilla Public License Version 2.0
+1. Definitions
+1.1. "Contributor" means each individual or legal entity that creates,
+contributes to the creation of, or owns Covered Software.
 "Secondary License" means either the GNU General Public License, Version 2.0,
 the GNU Lesser General Public License, Version 2.1, the GNU Affero General
 Public License, Version 3.0, or any later versions of those licenses.
@@ -541,14 +816,7 @@ below, subject to the following condition.
 EOF
 
 	mkdir -p "$_dir/dual-nonfree"
-	cat > "$_dir/dual-nonfree/LICENSE" <<'EOF'
-MIT License
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software.
-EOF
+	mit_text > "$_dir/dual-nonfree/LICENSE"
 	cat > "$_dir/dual-nonfree/COPYING" <<'EOF'
                     GNU GENERAL PUBLIC LICENSE
                        Version 3, 29 June 2007
@@ -557,34 +825,12 @@ EOF
 EOF
 
 	mkdir -p "$_dir/masked-unknown"
-	cat > "$_dir/masked-unknown/LICENSE" <<'EOF'
-MIT License
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software.
-EOF
-	cat > "$_dir/masked-unknown/LICENSE-PROPRIETARY" <<'EOF'
-Proprietary License
-Copyright (c) 2024 Example Corp. All rights reserved. Redistribution is
-prohibited without prior written permission.
-EOF
+	mit_text > "$_dir/masked-unknown/LICENSE"
+	proprietary_text > "$_dir/masked-unknown/LICENSE-PROPRIETARY"
 
 	mkdir -p "$_dir/dual-free"
-	cat > "$_dir/dual-free/LICENSE" <<'EOF'
-Apache License
-Version 2.0, January 2004
-http://www.apache.org/licenses/
-EOF
-	cat > "$_dir/dual-free/LICENSE-MIT" <<'EOF'
-MIT License
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software.
-EOF
+	apache_text > "$_dir/dual-free/LICENSE"
+	mit_text > "$_dir/dual-free/LICENSE-MIT"
 
 	mkdir -p "$_dir/copyleft-only"
 	cat > "$_dir/copyleft-only/COPYING" <<'EOF'
@@ -595,14 +841,7 @@ EOF
 EOF
 
 	mkdir -p "$_dir/stray-readme"
-	cat > "$_dir/stray-readme/LICENSE" <<'EOF'
-MIT License
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software.
-EOF
+	mit_text > "$_dir/stray-readme/LICENSE"
 	cat > "$_dir/stray-readme/README.md" <<'EOF'
                     GNU GENERAL PUBLIC LICENSE
                        Version 3, 29 June 2007
@@ -616,8 +855,27 @@ EOF
  Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
 EOF
 
+	mkdir -p "$_dir/partial-mit"
+	mit_fragment_text > "$_dir/partial-mit/LICENSE"
+
+	mkdir -p "$_dir/full-mit"
+	mit_text > "$_dir/full-mit/LICENSE"
+
+	mkdir -p "$_dir/same-file-masking"
+	{ mit_fragment_text; proprietary_text; } > "$_dir/same-file-masking/LICENSE"
+
+	mkdir -p "$_dir/restricted-mit"
+	{
+		mit_text
+		printf '\nThis software is made available for non-commercial evaluation only.\n'
+	} > "$_dir/restricted-mit/LICENSE"
+
 	check_fixture apache "Apache-2.0"
 	check_fixture mit "MIT"
+	check_fixture mit-full "MIT"
+	check_fixture mit-partial ""
+	check_fixture mit-proprietary ""
+	check_fixture mit-restricted "Restricted"
 	check_fixture bsd2 "BSD-2-Clause"
 	check_fixture bsd3 "BSD-3-Clause"
 	check_fixture bsd3-variant "BSD-3-Clause"
@@ -644,6 +902,10 @@ EOF
 	check_dir_fixture dual-free "PASS Apache-2.0/MIT"
 	check_dir_fixture copyleft-only "FAIL GPL-3.0"
 	check_dir_fixture stray-readme "PASS MIT"
+	check_dir_fixture partial-mit "FAIL UNRECOGNIZED"
+	check_dir_fixture full-mit "PASS MIT"
+	check_dir_fixture same-file-masking "FAIL UNRECOGNIZED"
+	check_dir_fixture restricted-mit "FAIL Restricted"
 
 	if [ "$_failures" -ne 0 ]; then
 		echo "license-check: selftest FAILED ($_failures fixture(s))" >&2

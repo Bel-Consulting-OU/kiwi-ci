@@ -122,17 +122,36 @@ func TestFlowQuotaCountsDB(t *testing.T) {
 	_ = ctx
 }
 
-func TestFlowQuotaRecordUsageErrors(t *testing.T) {
+// TestFlowQuotaEffectUsageNegativeDuration exercises the live usage effect on
+// a completion whose clock ran backwards: computeJobUsage refuses the
+// negative duration, so nothing is accounted (no amounts on the job, no
+// metrics, no trailing-window entry) while the usage marker still converges
+// so the effect is not retried forever.
+func TestFlowQuotaEffectUsageNegativeDuration(t *testing.T) {
 	s := New("tok")
 	started := time.Now().UTC()
 	finished := started.Add(-time.Minute)
-	j := model.Job{ID: "j", StartedAt: &started}
-	s.recordJobUsage(&j, finished)
-	if j.UsageRecorded {
-		t.Fatal("negative-duration usage must be refused")
+	j := model.Job{ID: "j", RunID: "run-j", Status: model.StatusRunning, StartedAt: &started, FinishedAt: &finished}
+	s.mu.Lock()
+	s.jobs[j.ID] = j
+	s.mu.Unlock()
+	if err := s.effectUsageAccount(context.Background(), j); err != nil {
+		t.Fatalf("effect usage = %v", err)
 	}
-	if len(s.usage) != 0 {
-		t.Fatal("failed usage must not enter the window")
+	s.mu.Lock()
+	live := s.jobs[j.ID]
+	s.mu.Unlock()
+	if live.Cost != 0 || live.EnergyWh != 0 {
+		t.Fatalf("negative-duration completion accounted usage: %+v", live)
+	}
+	if !live.UsageRecorded {
+		t.Fatal("negative-duration completion did not converge the usage marker")
+	}
+	s.usageMu.Lock()
+	entries := len(s.usage)
+	s.usageMu.Unlock()
+	if entries != 0 {
+		t.Fatalf("negative-duration completion appended %d usage window entries", entries)
 	}
 }
 

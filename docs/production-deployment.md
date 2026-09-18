@@ -130,7 +130,16 @@ enrollment traffic stays reachable on the same listener.
 
 ## Health and metrics
 
-- `GET /readiness` — ready to serve traffic (DB mode checks the store).
+- `GET /readiness` — ready to serve traffic. DB mode checks the store. In
+  fs mode (data-dir snapshot store) a failed snapshot write degrades the
+  control plane: `/readiness` answers 503 with `X-Kiwi-State: degraded` and a
+  fixed body (the raw error stays in the server logs), and new runner leases
+  are refused with 503 so no capability is issued for state the snapshot does
+  not contain. The state self-heals on the next successful persist and is
+  cleared when the server switches to DB mode (the abandoned snapshot is no
+  longer authoritative). Configure probes and load balancers to stop routing
+  traffic to an instance while `/readiness` answers 503, and alert on the
+  degraded state so a persistent snapshot-write failure is not masked.
 - `GET /liveness` — process is up.
 - `GET /metrics` — Prometheus-style metrics, optionally on a separate
   `observability.metrics_listen` address.

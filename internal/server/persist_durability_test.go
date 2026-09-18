@@ -48,10 +48,12 @@ func registerUsageRunner(t *testing.T, s *Server) (string, Task) {
 // TestReadinessDegradedOnPersistFailureAndHeals pins the degraded-state
 // contract end to end through the persistFailForTest seam: a mutation whose
 // snapshot write fails arms the degraded readiness signal (503 +
-// X-Kiwi-State: degraded + the underlying error text), and the next
-// successful persist heals it.
+// X-Kiwi-State: degraded + a FIXED body), and the next successful persist
+// heals it. The body must never echo the raw persist error or a path:
+// /readiness is unauthenticated (X1A).
 func TestReadinessDegradedOnPersistFailureAndHeals(t *testing.T) {
-	s, err := NewPersistent("token", "token", t.TempDir())
+	dir := t.TempDir()
+	s, err := NewPersistent("token", "token", dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,11 +77,15 @@ func TestReadinessDegradedOnPersistFailureAndHeals(t *testing.T) {
 		if got := w.Header().Get("X-Kiwi-State"); got != "degraded" {
 			t.Fatalf("X-Kiwi-State = %q, want degraded", got)
 		}
-		if !strings.Contains(w.Body.String(), seamErr.Error()) {
-			t.Fatalf("readiness body %q does not surface the persist error %q", w.Body.String(), seamErr)
+		body := w.Body.String()
+		if body != statePersistenceDegradedBody+"\n" {
+			t.Fatalf("readiness body = %q, want the fixed %q", body, statePersistenceDegradedBody)
 		}
-		if got := s.persistDegraded(); got != seamErr.Error() {
-			t.Fatalf("persistDegraded() = %q, want %q", got, seamErr)
+		if strings.Contains(body, seamErr.Error()) {
+			t.Fatalf("readiness body leaked the persist error: %q", body)
+		}
+		if strings.Contains(body, dir) {
+			t.Fatalf("readiness body leaked the data directory path: %q", body)
 		}
 	})
 
@@ -96,9 +102,6 @@ func TestReadinessDegradedOnPersistFailureAndHeals(t *testing.T) {
 		}
 		if got := w.Header().Get("X-Kiwi-State"); got != "" {
 			t.Fatalf("X-Kiwi-State after heal = %q, want empty", got)
-		}
-		if got := s.persistDegraded(); got != "" {
-			t.Fatalf("persistDegraded() after heal = %q, want empty", got)
 		}
 	})
 
@@ -128,6 +131,188 @@ func TestReadinessDegradedOnPersistFailureAndHeals(t *testing.T) {
 			t.Fatalf("readiness after healed completion = %d, want 200", w.Code)
 		}
 	})
+}
+
+// queuedJobForRun returns the (single-job) run's job under s.mu.
+func queuedJobForRun(t *testing.T, s *Server, run model.Run) model.Job {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, j := range s.jobs {
+		if j.RunID == run.ID {
+			return j
+		}
+	}
+	t.Fatalf("no job for run %s", run.ID)
+	return model.Job{}
+}
+
+// TestLeaseRefusedWhileDegradedAndHeals is the X1B regression for the
+// security-relevant lease path: a lease token is a capability for a running
+// job that the snapshot must contain, so while a failed snapshot write has
+// armed stateDegraded a lease request is refused with 503 and never receives
+// a token; once a later persist heals the state the same queued job leases
+// normally.
+func TestLeaseRefusedWhileDegradedAndHeals(t *testing.T) {
+	s, err := NewPersistent("token", "token", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := s.enqueue(SubmitRun{
+		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
+		Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Register the runner while the store is healthy; the refusal below can
+	// then only come from the degraded gate, not from a missing runner.
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
+		`{"name":"r1","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("register: %d %s", w.Code, w.Body.String())
+	}
+	var ri model.Runner
+	if err := json.Unmarshal(w.Body.Bytes(), &ri); err != nil {
+		t.Fatal(err)
+	}
+	seamErr := errors.New("synthetic snapshot write failure")
+	s.persistFailForTest = seamErr
+	// Arm the degraded state with another persisting mutation; registration
+	// answers 200 and /readiness is the fail-closed signal.
+	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
+		`{"name":"r2","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`); w.Code != http.StatusOK {
+		t.Fatalf("degrading register: %d %s", w.Code, w.Body.String())
+	}
+	if !s.stateDegraded.Load() {
+		t.Fatal("failed persist did not arm stateDegraded")
+	}
+
+	w = doJSON(t, s, http.MethodPost, "/api/v1/runners/"+ri.ID+"/next", "token", "")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("lease while degraded = %d, want 503: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if body != statePersistenceDegradedBody+"\n" {
+		t.Fatalf("refused lease body = %q, want the fixed %q", body, statePersistenceDegradedBody)
+	}
+	if strings.Contains(body, "token") || strings.Contains(body, seamErr.Error()) {
+		t.Fatalf("refused lease body leaked a token or the persist error: %q", body)
+	}
+	if j := queuedJobForRun(t, s, run); j.Status != model.StatusQueued {
+		t.Fatalf("refused lease changed the job status to %q, want queued", j.Status)
+	}
+
+	// Clearing the fault lets the next persist heal the state; the same job
+	// then leases normally and hands the runner a token.
+	s.persistFailForTest = nil
+	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
+		`{"name":"r3","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`); w.Code != http.StatusOK {
+		t.Fatalf("healing register: %d %s", w.Code, w.Body.String())
+	}
+	if s.stateDegraded.Load() {
+		t.Fatal("successful persist did not heal stateDegraded")
+	}
+	w = doJSON(t, s, http.MethodPost, "/api/v1/runners/"+ri.ID+"/next", "token", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("lease after heal = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	var task Task
+	if err := json.Unmarshal(w.Body.Bytes(), &task); err != nil {
+		t.Fatal(err)
+	}
+	if task.LeaseToken == "" || task.Job.ID == "" {
+		t.Fatalf("healed lease = %+v, want a token for the queued job", task)
+	}
+}
+
+// TestLeasePersistFailureWithholdsTokenAndRecovers pins the post-claim half
+// of X1B: the claim's own snapshot write fails after the in-memory claim was
+// installed, so the handler answers 503 without a token instead of ACKing a
+// lease the snapshot does not contain. The in-memory lease is then reclaimed
+// by expired-lease recovery (recoverLeasesLocked), which requeues the job
+// because the runner never received the token, and the job leases again once
+// the store heals.
+func TestLeasePersistFailureWithholdsTokenAndRecovers(t *testing.T) {
+	s, err := NewPersistent("token", "token", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := s.enqueue(SubmitRun{
+		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
+		Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
+		`{"name":"r1","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("register: %d %s", w.Code, w.Body.String())
+	}
+	var ri model.Runner
+	if err := json.Unmarshal(w.Body.Bytes(), &ri); err != nil {
+		t.Fatal(err)
+	}
+	seamErr := errors.New("synthetic snapshot write failure")
+	// The server is healthy at entry, so the claim runs and it is the
+	// claim's own persist that fails and arms the degraded state.
+	s.persistFailForTest = seamErr
+	w = doJSON(t, s, http.MethodPost, "/api/v1/runners/"+ri.ID+"/next", "token", "")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("lease whose claim write fails = %d, want 503: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if body != statePersistenceDegradedBody+"\n" {
+		t.Fatalf("refused lease body = %q, want the fixed %q", body, statePersistenceDegradedBody)
+	}
+	if strings.Contains(body, "token") {
+		t.Fatalf("refused lease body leaked a token: %q", body)
+	}
+	if !s.stateDegraded.Load() {
+		t.Fatal("failed claim persist did not arm stateDegraded")
+	}
+	j := queuedJobForRun(t, s, run)
+	if j.Status != model.StatusRunning || j.LeaseTokenHash == nil {
+		t.Fatalf("failed-ACK claim not left for recovery: %+v", j)
+	}
+
+	// The runner never received the token, so the lease expires un-renewed
+	// and expired-lease recovery requeues the job and frees the runner.
+	s.mu.Lock()
+	s.recoverLeasesLocked(time.Now().UTC().Add(s.leaseDuration()), false)
+	s.mu.Unlock()
+	j = queuedJobForRun(t, s, run)
+	if j.Status != model.StatusQueued || j.LeaseTokenHash != nil {
+		t.Fatalf("recovery did not reclaim the un-ACKed lease: %+v", j)
+	}
+	s.mu.Lock()
+	active := len(s.runners[ri.ID].ActiveJobs)
+	s.mu.Unlock()
+	if active != 0 {
+		t.Fatalf("recovery left %d active job(s) on the runner", active)
+	}
+
+	// Healing the store lets the same job lease normally.
+	s.persistFailForTest = nil
+	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
+		`{"name":"r1b","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`); w.Code != http.StatusOK {
+		t.Fatalf("healing register: %d %s", w.Code, w.Body.String())
+	}
+	if s.stateDegraded.Load() {
+		t.Fatal("successful persist did not heal stateDegraded")
+	}
+	w = doJSON(t, s, http.MethodPost, "/api/v1/runners/"+ri.ID+"/next", "token", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("lease after heal = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	var task Task
+	if err := json.Unmarshal(w.Body.Bytes(), &task); err != nil {
+		t.Fatal(err)
+	}
+	if task.LeaseToken == "" {
+		t.Fatalf("healed lease returned no token: %+v", task)
+	}
 }
 
 // TestCompletePersistFailureRetryAccountsUsageOnce is the A1 regression: the
@@ -370,6 +555,24 @@ func TestEffectUsageAccountDBRecordUsageOnceBranches(t *testing.T) {
 		f.mu.Unlock()
 		if !stored.UsageRecorded || stored.Cost <= 0 {
 			t.Fatalf("stored usage after winner = %+v", stored)
+		}
+	})
+
+	t.Run("store without the exactly-once contract fails closed", func(t *testing.T) {
+		// fcPlainStore hides every extension interface, so the effect cannot
+		// arbitrate the transition; it must refuse instead of falling back to
+		// a last-writer-wins read-modify-write.
+		plain := New("token")
+		plain.DB = fcPlainStore{newDBFakeStore()}
+		err := plain.effectUsageAccount(ctx, job)
+		if err == nil {
+			t.Fatal("store without UsageOnceStore = nil error, want fail-closed refusal")
+		}
+		if !strings.Contains(err.Error(), "exactly-once") {
+			t.Fatalf("fail-closed error = %v, want the contract diagnostic", err)
+		}
+		if cost, energy := usageMetricsSnapshot(plain); cost != 0 || energy != 0 {
+			t.Fatalf("fail-closed refusal moved metrics: cost=%v energy=%v", cost, energy)
 		}
 	})
 }

@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
-	"github.com/Bel-Consulting-OU/kiwi-ci/internal/quotas"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
@@ -147,39 +146,6 @@ func (s *Server) quotaCountsLocked(run model.Run) (repoRunning, repoQueued, team
 		}
 	}
 	return
-}
-
-// recordJobUsage computes the completed job's cost and energy from its
-// frozen lease-time rates and wall-clock duration, persists them on the
-// job, and aggregates them into the server usage metrics and the trailing
-// in-memory window (memory mode; DB mode reads UsageStore.RecentUsage).
-func (s *Server) recordJobUsage(j *model.Job, finished time.Time) {
-	if j.StartedAt == nil {
-		return
-	}
-	dur := finished.Sub(*j.StartedAt)
-	cost, energy, err := quotas.ComputeUsage(dur, 1, quotas.Rates{CostPerMachineHour: j.CostRate, PowerWatts: j.PowerWatts})
-	if err != nil {
-		return
-	}
-	j.Cost = cost
-	j.EnergyWh = energy
-	s.metricAdd("kiwi_usage_cost_total", cost, nil)
-	s.metricAdd("kiwi_usage_energy_total", energy, nil)
-	if s.DB != nil {
-		return
-	}
-	s.usageMu.Lock()
-	s.usage = append(s.usage, usageEntry{FinishedAt: finished, Cost: cost, EnergyWh: energy})
-	cutoff := finished.Add(-24 * time.Hour)
-	kept := s.usage[:0]
-	for _, e := range s.usage {
-		if e.FinishedAt.After(cutoff) {
-			kept = append(kept, e)
-		}
-	}
-	s.usage = kept
-	s.usageMu.Unlock()
 }
 
 // dailyBudgetExceeded reports whether the trailing-24h cost or energy

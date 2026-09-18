@@ -159,13 +159,12 @@ type Server struct {
 	outbox             *Outbox
 
 	// stateDegraded is armed when a filesystem snapshot persist fails and
-	// cleared by the next successful persist. /readiness reports 503 while
-	// armed, so a mutation that could not be made durable is never silently
-	// acknowledged as healthy. lastPersistErr keeps the diagnostic message.
+	// cleared by the next successful persist. /readiness reports 503 with a
+	// fixed body while armed, and next() refuses to issue new lease tokens,
+	// so a mutation that could not be made durable is never silently
+	// acknowledged as healthy. The diagnostic itself is logged by
+	// persistCheckedErrLocked.
 	stateDegraded atomic.Bool
-	persistErrMu  sync.Mutex
-	// lastPersistErr is guarded by persistErrMu.
-	lastPersistErr string
 	// persistFailForTest, when non-nil, makes persistLocked report this
 	// error without touching disk. Test-only seam; production leaves it nil.
 	persistFailForTest error
@@ -1962,6 +1961,9 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	}
 	s.runners[in.ID] = in
 	s.auditLocked("runner.register", in.Name, "", "", "runner registered", nil)
+	// Persist failure keeps the in-memory registration and answers 200;
+	// /readiness 503 + degraded is the compensating control, and the runner
+	// re-registers once the store heals.
 	s.persistCheckedLocked("runner.register")
 	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, newRegisterResponse(in, s.RequireProfiles || hasProfile))
@@ -2104,6 +2106,9 @@ func (s *Server) runnerDrain(w http.ResponseWriter, r *http.Request) {
 	ri.Draining = true
 	s.runners[id] = ri
 	s.auditLocked("runner.drain", actorFrom(r), "", "", "runner draining", map[string]string{"runner": id})
+	// A failed snapshot write leaves the in-memory drain flag in force; the
+	// next successful persist makes it durable, and /readiness 503 is the
+	// compensating control meanwhile.
 	s.persistCheckedLocked("runner.drain")
 	writeJSON(w, http.StatusOK, ri)
 }
@@ -2197,6 +2202,10 @@ func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
 		s.refreshRunLocked(runID)
 	}
 	s.auditLocked("runner.disable", actor, "", "", "runner disabled", map[string]string{"runner": id})
+	// The kill switch is already in force in memory (flag plus cancelled
+	// leases); a failed snapshot write is compensated by /readiness 503,
+	// which blocks every new lease until the next successful persist makes
+	// the flag and cancellations durable.
 	s.persistCheckedLocked("runner.disable")
 	s.mu.Unlock()
 	s.revokeRunnerCert(ri, actor)
@@ -2241,6 +2250,9 @@ func (s *Server) runnerEnable(w http.ResponseWriter, r *http.Request) {
 	ri.Draining = false
 	s.runners[id] = ri
 	s.auditLocked("runner.enable", actorFrom(r), "", "", "runner enabled", map[string]string{"runner": id})
+	// A failed snapshot write leaves the in-memory enable in force for this
+	// process; /readiness 503 is the compensating control until the next
+	// successful persist makes it durable.
 	s.persistCheckedLocked("runner.enable")
 	writeJSON(w, http.StatusOK, ri)
 }
@@ -2256,6 +2268,15 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	if s.isDraining() {
 		w.Header().Set("X-Kiwi-Draining", "true")
 		http.Error(w, "control plane draining", http.StatusServiceUnavailable)
+		return
+	}
+	// Durability gate: a lease token is a capability for a running job the
+	// snapshot must contain. While a previous snapshot write failed, refuse
+	// to issue any NEW lease (503, no token); in-flight leases keep
+	// heartbeating so they can finish, and /readiness routes traffic away.
+	if s.stateDegraded.Load() {
+		w.Header().Set("X-Kiwi-State", "degraded")
+		http.Error(w, statePersistenceDegradedBody, http.StatusServiceUnavailable)
 		return
 	}
 	if s.Sched != nil {
@@ -2443,7 +2464,22 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	}
 	s.auditLocked("job.leased", ri.Name, j.RunID, j.ID, "job leased", map[string]string{"job": j.Key, "generation": strconv.FormatInt(j.LeaseGeneration, 10)})
 	s.metricObserve("kiwi_queue_latency_seconds", now.Sub(j.CreatedAt).Seconds(), nil)
-	s.persistCheckedLocked("job.lease")
+	if !s.persistCheckedLocked("job.lease") {
+		// The claim is in memory only: the snapshot does not contain the
+		// running job or its token hash, so answering 200 would hand the
+		// runner a lease that a restart could re-issue to another runner
+		// (double execution). Withhold the token and fail the request
+		// instead. Recovery contract: the in-memory lease stays exactly as
+		// it is and is reclaimed by expired-lease recovery
+		// (recoverLeasesLocked, run from Maintain and at lease-time), which
+		// requeues the job once LeaseExpiresAt passes because the runner
+		// never received the token and cannot heartbeat or complete it.
+		// Until a later snapshot write succeeds, /readiness is 503 and the
+		// pre-check above refuses every new lease.
+		w.Header().Set("X-Kiwi-State", "degraded")
+		http.Error(w, statePersistenceDegradedBody, http.StatusServiceUnavailable)
+		return
+	}
 	// The raw token travels on the wire once; the hash is not needed by the
 	// runner and is stripped from the task job.
 	taskJob := j
@@ -2588,6 +2624,9 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		ri.LastSeen = now
 		s.runners[in.RunnerID] = ri
 	}
+	// A failed snapshot write keeps the extended expiry in memory only for
+	// this process; /readiness 503 plus the lease-expiry recovery contract
+	// is the compensating control.
 	s.persistCheckedLocked("job.heartbeat")
 	writeJSON(w, http.StatusOK, HeartbeatResponse{LeaseExpiresAt: exp})
 }
@@ -3307,7 +3346,7 @@ func (s *Server) completionReplayReadyLocked(jobID string, generation int64, run
 
 // computeJobUsage derives a job's completion cost/energy from the frozen
 // lease-time rates and stores them on the job. It is the metric-free half of
-// recordJobUsage, so callers can persist the amounts BEFORE moving process
+// usage accounting, so callers can persist the amounts BEFORE moving process
 // metrics. ok=false when the job never started (or the rates are invalid).
 func computeJobUsage(j *model.Job, finished time.Time) (cost, energy float64, ok bool) {
 	if j.StartedAt == nil {
@@ -4065,27 +4104,15 @@ func (s *Server) persistCheckedLocked(what string) bool {
 }
 
 // notePersistResult folds one snapshot write outcome into the degraded-state
-// signal: a failed write arms it, a successful write heals it.
+// signal: a failed write arms it, a successful write heals it. The detailed
+// error is logged by persistCheckedErrLocked and never retained in memory:
+// /readiness is unauthenticated and must not leak it.
 func (s *Server) notePersistResult(err error) {
 	if err != nil {
 		s.stateDegraded.Store(true)
-		s.persistErrMu.Lock()
-		s.lastPersistErr = err.Error()
-		s.persistErrMu.Unlock()
 		return
 	}
 	s.stateDegraded.Store(false)
-	s.persistErrMu.Lock()
-	s.lastPersistErr = ""
-	s.persistErrMu.Unlock()
-}
-
-// persistDegraded reports the last persistence failure, or "" when the
-// snapshot store is healthy.
-func (s *Server) persistDegraded() string {
-	s.persistErrMu.Lock()
-	defer s.persistErrMu.Unlock()
-	return s.lastPersistErr
 }
 
 // completionReceiptRecordsLocked renders the in-memory completion receipts as

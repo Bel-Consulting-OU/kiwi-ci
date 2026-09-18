@@ -1517,6 +1517,56 @@ func (s *PostgresStore) HeartbeatLease(ctx context.Context, jobID string, runner
 	return ErrLeaseConflict
 }
 
+// completionReceiptPruneBatch bounds how many receipt rows one prune deletes,
+// so the retention cleanup attached to a completion or receipt insert is a
+// bounded operation instead of an unbounded table sweep.
+const completionReceiptPruneBatch = 1000
+
+// completionReceiptTTLSeconds is CompletionReceiptTTL expressed the way
+// make_interval(secs => ...) expects it. Derived from the shared constant so
+// there is a single retention source of truth.
+var completionReceiptTTLSeconds = CompletionReceiptTTL.Seconds()
+
+// Completion receipt retention is shared with the fs store (see
+// CompletionReceiptTTL and MaxCompletionReceipts in fs.go): a receipt is
+// honored for replay detection only while it is younger than the TTL, and the
+// durable set is bounded to the newest MaxCompletionReceipts entries. Reads
+// filter on created_at (using the database clock, the same clock that stamped
+// the row) so an aged-out receipt is indistinguishable from a missing one: a
+// replayed completion is rejected as a stale lease instead of being
+// acknowledged and reconciled, matching fs mode. Writes reclaim expired rows
+// opportunistically through the completion_receipts_created_at_idx index.
+//
+// pruneCompletionReceiptsTx is idempotent and safe under concurrency and
+// multi-replica operation: both sweeps are bounded by completionReceiptPruneBatch
+// and take FOR UPDATE SKIP LOCKED, so a peer replica deleting the same stale
+// rows never blocks this transaction. The TTL sweep runs on every completion
+// and receipt insert; the cap sweep runs only when the planner's live-row
+// estimate exceeds MaxCompletionReceipts, so the common case pays a cheap
+// catalog estimate instead of an OFFSET walk. reltuples is maintained by
+// autovacuum ANALYZE, so the cap is enforced within a vacuum cycle rather than
+// instantly, and the TTL (the behavior-affecting bound) is enforced exactly.
+func pruneCompletionReceiptsTx(ctx context.Context, tx pgx.Tx) error {
+	if _, err := tx.Exec(ctx, `DELETE FROM completion_receipts WHERE ctid IN (
+		SELECT ctid FROM completion_receipts WHERE created_at < now() - make_interval(secs => $1) ORDER BY created_at LIMIT $2 FOR UPDATE SKIP LOCKED
+	)`, completionReceiptTTLSeconds, completionReceiptPruneBatch); err != nil {
+		return fmt.Errorf("storage: prune completion receipts: %w", err)
+	}
+	var estimate int64
+	if err := tx.QueryRow(ctx, `SELECT COALESCE((SELECT reltuples::bigint FROM pg_class WHERE oid = to_regclass('completion_receipts')), 0)`).Scan(&estimate); err != nil {
+		return fmt.Errorf("storage: completion receipt row estimate: %w", err)
+	}
+	if estimate <= MaxCompletionReceipts {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM completion_receipts WHERE ctid IN (
+		SELECT ctid FROM completion_receipts ORDER BY created_at DESC OFFSET $1 LIMIT $2 FOR UPDATE SKIP LOCKED
+	)`, MaxCompletionReceipts, completionReceiptPruneBatch); err != nil {
+		return fmt.Errorf("storage: cap completion receipts: %w", err)
+	}
+	return nil
+}
+
 // CompleteJob implements the audit item 5 transaction: lock the job FOR
 // UPDATE, verify generation+runner+status running, insert the receipt ON
 // CONFLICT DO NOTHING, update the job, update runner counters, recompute
@@ -1558,10 +1608,13 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 	}
 
 	// Idempotent replay: the exact completion (job, generation, runner) was
-	// already applied and its receipt persisted; acknowledge it again.
+	// already applied and its receipt persisted and still within the shared
+	// retention TTL; acknowledge it again. An aged-out receipt is treated as
+	// absent (recExists false) and falls through to the stale-lease errors,
+	// matching fs mode.
 	if curGen != generation || curRunner != runnerID || curStatus != string(model.StatusRunning) {
 		var recExists bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM completion_receipts WHERE job_id=$1 AND generation=$2 AND runner_id=$3)`, jobID, generation, runnerID).Scan(&recExists); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM completion_receipts WHERE job_id=$1 AND generation=$2 AND runner_id=$3 AND created_at >= now() - make_interval(secs => $4))`, jobID, generation, runnerID, completionReceiptTTLSeconds).Scan(&recExists); err != nil {
 			return err
 		}
 		if recExists {
@@ -1620,6 +1673,11 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO completion_receipts (job_id, generation, runner_id, result_hash) VALUES ($1, $2, $3, $4) ON CONFLICT (job_id, generation, runner_id) DO NOTHING`,
 		receipt.JobID, receipt.Generation, receipt.RunnerID, receipt.ResultHash); err != nil {
+		return err
+	}
+	// Reclaim receipts past the shared retention TTL (and, eventually, past
+	// the cap) in the same transaction that adds this one.
+	if err := pruneCompletionReceiptsTx(ctx, tx); err != nil {
 		return err
 	}
 	if err := s.completeRunnerTx(ctx, tx, runnerID, jobID, st, now); err != nil {
@@ -2639,15 +2697,34 @@ func (s *PostgresStore) ReadAudit(ctx context.Context, limit int) ([]model.Audit
 	return out, rows.Err()
 }
 
+// InsertCompletionReceipt persists one completion idempotency receipt and
+// then applies the shared retention prune in the same transaction, so the
+// receipt set stays bounded by the fs-mode contract. The insert is idempotent
+// (ON CONFLICT DO NOTHING) and a prune failure rolls the whole transaction
+// back, leaving the receipt absent; a retry re-applies both.
 func (s *PostgresStore) InsertCompletionReceipt(ctx context.Context, r model.CompletionReceipt) error {
 	if err := ValidateJobID(r.JobID); err != nil {
 		return err
 	}
-	_, err := s.pool.Exec(ctx, `INSERT INTO completion_receipts (job_id, generation, runner_id, result_hash) VALUES ($1, $2, $3, $4) ON CONFLICT (job_id, generation, runner_id) DO NOTHING`,
-		r.JobID, r.Generation, r.RunnerID, r.ResultHash)
-	return err
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `INSERT INTO completion_receipts (job_id, generation, runner_id, result_hash) VALUES ($1, $2, $3, $4) ON CONFLICT (job_id, generation, runner_id) DO NOTHING`,
+		r.JobID, r.Generation, r.RunnerID, r.ResultHash); err != nil {
+		return err
+	}
+	if err := pruneCompletionReceiptsTx(ctx, tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
+// HasCompletionReceipt reports the exact receipt only while it is within the
+// shared CompletionReceiptTTL; an aged-out row reads as absent even before a
+// write-path prune reclaims it, so replay behavior does not depend on when the
+// last completion happened to run.
 func (s *PostgresStore) HasCompletionReceipt(ctx context.Context, jobID string, generation int64, runnerID string) (model.CompletionReceipt, bool, error) {
 	if err := ValidateJobID(jobID); err != nil {
 		return model.CompletionReceipt{}, false, err
@@ -2656,7 +2733,7 @@ func (s *PostgresStore) HasCompletionReceipt(ctx context.Context, jobID string, 
 		rec  model.CompletionReceipt
 		hash string
 	)
-	err := s.pool.QueryRow(ctx, `SELECT result_hash FROM completion_receipts WHERE job_id=$1 AND generation=$2 AND runner_id=$3`, jobID, generation, runnerID).Scan(&hash)
+	err := s.pool.QueryRow(ctx, `SELECT result_hash FROM completion_receipts WHERE job_id=$1 AND generation=$2 AND runner_id=$3 AND created_at >= now() - make_interval(secs => $4)`, jobID, generation, runnerID, completionReceiptTTLSeconds).Scan(&hash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return model.CompletionReceipt{}, false, nil
 	}

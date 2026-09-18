@@ -83,6 +83,13 @@ redeploying the old binary plus its data directory files.
   tokens) are stable across restarts within protocol v3.
 - Deployment and snapshot records are memory-backed; treat them as
   ephemeral across upgrades until their persistence lands.
+- fs-mode `/readiness` is now durability-aware: when a data-dir snapshot
+  write fails, it answers 503 with `X-Kiwi-State: degraded` and a fixed body
+  (the raw error is only logged), new leases are refused until a later
+  persist succeeds, and switching the server to DB mode clears the state.
+  Operators upgrading an fs-mode deployment must make probes and load
+  balancers stop routing to a degraded instance; a healthy `/liveness` does
+  not mean the instance can accept new work.
 
 ## Dependency upgrade policy
 

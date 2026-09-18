@@ -13,9 +13,13 @@ ARG TARGETOS=linux
 ARG TARGETARCH=amd64
 ARG VERSION=dev
 ARG COMMIT=unknown
-# BUILD_DATE is the RFC3339 timestamp recorded as version.BuildDate. The
-# Makefile's docker-build computes it on the host from SOURCE_DATE_EPOCH, so
-# the build-stage userland never has to convert an epoch.
+# BUILD_DATE is the RFC3339 UTC timestamp (YYYY-MM-DDTHH:MM:SSZ) recorded as
+# version.BuildDate. The Makefile's docker-build computes it on the host from
+# SOURCE_DATE_EPOCH, so the build-stage userland never has to convert an
+# epoch. A caller-supplied value is validated below before it reaches
+# -ldflags: anything outside the exact RFC3339 UTC shape (whitespace, extra
+# linker flags, other characters) fails the build instead of being
+# whitespace-split by cmd/go.
 ARG BUILD_DATE
 # SOURCE_DATE_EPOCH pins the recorded BuildDate so the artifact bytes are
 # reproducible, and is the fallback when BUILD_DATE is not supplied. The
@@ -34,6 +38,15 @@ RUN go mod download
 COPY . .
 
 RUN set -eux; \
+    if [ -n "${BUILD_DATE}" ]; then \
+      case "${BUILD_DATE}" in \
+        *[!0-9TZ:.-]*) printf 'error: BUILD_DATE must be an RFC3339 UTC timestamp (YYYY-MM-DDTHH:MM:SSZ), got %s\n' "${BUILD_DATE}" >&2; exit 1 ;; \
+      esac; \
+      if ! printf '%s' "${BUILD_DATE}" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'; then \
+        printf 'error: BUILD_DATE must be an RFC3339 UTC timestamp (YYYY-MM-DDTHH:MM:SSZ), got %s\n' "${BUILD_DATE}" >&2; \
+        exit 1; \
+      fi; \
+    fi; \
     if [ -z "${BUILD_DATE}" ] && [ -n "${SOURCE_DATE_EPOCH}" ]; then \
       printf 'package main\nimport ("fmt"; "os"; "strconv"; "time")\nfunc main() { n, err := strconv.ParseInt(os.Args[1], 10, 64); if err != nil { os.Exit(1) }; fmt.Print(time.Unix(n, 0).UTC().Format(time.RFC3339)) }\n' >/tmp/epochdate.go; \
       BUILD_DATE="$(go run /tmp/epochdate.go "${SOURCE_DATE_EPOCH}")"; \
