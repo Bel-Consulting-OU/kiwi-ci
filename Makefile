@@ -104,6 +104,14 @@ docs-check:
 	test -f ADVERSARIAL_TEST_MATRIX.md
 	test -f SECURITY.md
 	test -f CONTRIBUTING.md
+	test -f docs/production-deployment.md
+	@# No stale references to abandoned CI systems.
+	@! grep -rn "github/workflows/native" README.md docs/ CONTRIBUTING.md .woodpecker/ 2>/dev/null
+	@! grep -rn "placeholder address" SECURITY.md 2>/dev/null
+	@# The documented example pipelines and config must actually validate.
+	go run ./cmd/kiwi validate -f .kiwi/pipeline.yaml
+	go run ./cmd/kiwi validate -f examples/kiwi.yaml
+	go run ./cmd/kiwi config check --config kiwi.example.toml
 
 license-check:
 	grep -q 'Apache License' LICENSE

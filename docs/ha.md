@@ -73,5 +73,12 @@ recovery does not create duplicate concurrent executions.
 ## Current limitations
 
 The dev-mode in-memory scheduler is single-instance by design; HA
-requires the PostgreSQL store. Deployment and snapshot records remain
-memory-backed even in DB mode.
+requires the PostgreSQL store. In DB mode, deployments persist through
+`DeploymentStore`, snapshots through `SnapshotStore` (bytes stored
+through the shared CAS), check-run mappings through `check_runs`,
+schedule occurrences through `schedule_occurrences`, and completion
+receipts/idempotent effect intents through the outbox — replicas
+converge from PostgreSQL rather than sharing process memory. Advisory
+locks (scheduler leadership, CAS digest fences, check publication,
+collector lease) live on a dedicated lock pool so they never consume
+the operational connections.

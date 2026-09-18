@@ -25,9 +25,10 @@ Private channels, in order of preference:
 1. **GitHub private security advisory**: open a private advisory against
    https://github.com/Bel-Consulting-OU/kiwi-ci (visible only to
    maintainers).
-2. **Email**: security@kiwi-ci.dev (placeholder address; verify it is
-   operational before relying on it — if it bounces, use the private
-   advisory).
+2. **Email**: security@bel-consulting.eu — monitored by the
+   maintainers. If it bounces, use the private advisory path above;
+   the advisory is the authoritative channel for coordinated
+   disclosure and CVE assignment.
 
 Include in your report:
 
