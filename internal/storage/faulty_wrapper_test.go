@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -448,5 +449,412 @@ func TestFaultyStoreCloseAndFaultState(t *testing.T) {
 	}
 	if third.Mutations() != 4 {
 		t.Fatalf("Mutations() = %d, want 4", third.Mutations())
+	}
+}
+
+// storeOnlyInner implements exactly Store and none of the optional extension
+// interfaces: it is the minimal inner store a FaultyStore can legally wrap.
+// Every method is an inert stub because the missing-interface test must never
+// let a call reach it.
+type storeOnlyInner struct{}
+
+var _ Store = storeOnlyInner{}
+
+func (storeOnlyInner) Close() error { return nil }
+
+func (storeOnlyInner) InsertRun(context.Context, model.Run) error { return nil }
+
+func (storeOnlyInner) GetRun(context.Context, string) (model.Run, error) {
+	return model.Run{}, nil
+}
+
+func (storeOnlyInner) UpdateRunStatus(context.Context, string, model.Status, *time.Time, *time.Time) error {
+	return nil
+}
+
+func (storeOnlyInner) ListRuns(context.Context, int) ([]model.Run, error) { return nil, nil }
+
+func (storeOnlyInner) InsertJob(context.Context, model.Job) error { return nil }
+
+func (storeOnlyInner) GetJob(context.Context, string) (model.Job, error) {
+	return model.Job{}, nil
+}
+
+func (storeOnlyInner) ListJobsByRun(context.Context, string) ([]model.Job, error) {
+	return nil, nil
+}
+
+func (storeOnlyInner) ListJobsByEnvironment(context.Context, string, string) ([]model.Job, error) {
+	return nil, nil
+}
+
+func (storeOnlyInner) ListQueuedJobs(context.Context) ([]model.Job, error) { return nil, nil }
+
+func (storeOnlyInner) UpdateJob(context.Context, model.Job) error { return nil }
+
+func (storeOnlyInner) AcquireLease(context.Context, string, string, []byte, int64, time.Time) (model.Job, error) {
+	return model.Job{}, nil
+}
+
+func (storeOnlyInner) HeartbeatLease(context.Context, string, string, int64, time.Time) error {
+	return nil
+}
+
+func (storeOnlyInner) CompleteJob(context.Context, string, int64, string, model.Status, string, map[string]string, model.CompletionReceipt) error {
+	return nil
+}
+
+func (storeOnlyInner) CancelRunJobs(context.Context, string, string) ([]string, error) {
+	return nil, nil
+}
+
+func (storeOnlyInner) UpsertRunner(context.Context, model.Runner) error { return nil }
+
+func (storeOnlyInner) GetRunner(context.Context, string) (model.Runner, error) {
+	return model.Runner{}, nil
+}
+
+func (storeOnlyInner) ListRunners(context.Context) ([]model.Runner, error) { return nil, nil }
+
+func (storeOnlyInner) ReleaseRunnerJob(context.Context, string, string, model.Status) error {
+	return nil
+}
+
+func (storeOnlyInner) InsertArtifact(context.Context, model.ArtifactRecord) error { return nil }
+
+func (storeOnlyInner) ListArtifacts(context.Context, string) ([]model.ArtifactRecord, error) {
+	return nil, nil
+}
+
+func (storeOnlyInner) InsertTestReport(context.Context, model.TestReport) error { return nil }
+
+func (storeOnlyInner) ListTestReports(context.Context, string) ([]model.TestReport, error) {
+	return nil, nil
+}
+
+func (storeOnlyInner) ListTestReportsAll(context.Context) ([]model.TestReport, error) {
+	return nil, nil
+}
+
+func (storeOnlyInner) AppendLog(context.Context, model.LogEntry) error { return nil }
+
+func (storeOnlyInner) ReadLogs(context.Context, string, int64, int) ([]model.LogEntry, error) {
+	return nil, nil
+}
+
+func (storeOnlyInner) AppendAudit(context.Context, model.AuditEvent) error { return nil }
+
+func (storeOnlyInner) ReadAudit(context.Context, int) ([]model.AuditEvent, error) {
+	return nil, nil
+}
+
+func (storeOnlyInner) InsertCompletionReceipt(context.Context, model.CompletionReceipt) error {
+	return nil
+}
+
+func (storeOnlyInner) HasCompletionReceipt(context.Context, string, int64, string) (model.CompletionReceipt, bool, error) {
+	return model.CompletionReceipt{}, false, nil
+}
+
+func (storeOnlyInner) UpsertDelivery(context.Context, string, string, string, string) error {
+	return nil
+}
+
+func (storeOnlyInner) FindDelivery(context.Context, string, string) (string, bool, error) {
+	return "", false, nil
+}
+
+func (storeOnlyInner) TryAcquireLeadership(context.Context, string, time.Duration) (bool, error) {
+	return false, nil
+}
+
+func (storeOnlyInner) ReleaseLeadership(context.Context, string) error { return nil }
+
+func (storeOnlyInner) Migrate(context.Context) error { return nil }
+
+func (storeOnlyInner) SchemaVersion(context.Context) (int, error) { return 0, nil }
+
+// missingIfaceCase drives one FaultyStore wrapper method against an inner
+// store that lacks the optional interface the method needs: iface is the
+// contract the fail-closed error must name, mutates marks methods that also
+// perform fault injection so the test can prove a missing interface is
+// detected without firing or consuming a fault.
+type missingIfaceCase struct {
+	mutates bool
+	iface   string
+	call    func(*FaultyStore) error
+}
+
+// missingOptionalInterfaceCases enumerates every optional-interface wrapper
+// method hardened to fail closed when the inner store is a plain Store.
+func missingOptionalInterfaceCases() map[string]missingIfaceCase {
+	return map[string]missingIfaceCase{
+		"ListJobsByRunner": {iface: "RunnerJobStore", call: func(f *FaultyStore) error {
+			_, err := f.ListJobsByRunner(ctx(), "")
+			return err
+		}},
+		"InsertArtifactOnce": {mutates: true, iface: "ArtifactIdempotentStore", call: func(f *FaultyStore) error {
+			_, _, err := f.InsertArtifactOnce(ctx(), model.ArtifactRecord{})
+			return err
+		}},
+		"OutboxAppend": {mutates: true, iface: "OutboxStore", call: func(f *FaultyStore) error {
+			return f.OutboxAppend(ctx(), OutboxItem{})
+		}},
+		"OutboxAck": {mutates: true, iface: "OutboxStore", call: func(f *FaultyStore) error {
+			return f.OutboxAck(ctx(), "")
+		}},
+		"OutboxPending": {iface: "OutboxStore", call: func(f *FaultyStore) error {
+			_, err := f.OutboxPending(ctx())
+			return err
+		}},
+		"ClaimOutbox": {mutates: true, iface: "OutboxStore", call: func(f *FaultyStore) error {
+			_, err := f.ClaimOutbox(ctx(), "", 0)
+			return err
+		}},
+		"ReleaseOutboxClaim": {mutates: true, iface: "OutboxStore", call: func(f *FaultyStore) error {
+			return f.ReleaseOutboxClaim(ctx(), "", "")
+		}},
+		"UpsertSchedule": {mutates: true, iface: "ScheduleStore", call: func(f *FaultyStore) error {
+			return f.UpsertSchedule(ctx(), Schedule{})
+		}},
+		"ListSchedules": {iface: "ScheduleStore", call: func(f *FaultyStore) error {
+			_, err := f.ListSchedules(ctx())
+			return err
+		}},
+		"ClaimScheduleOccurrence": {mutates: true, iface: "ScheduleStore", call: func(f *FaultyStore) error {
+			_, err := f.ClaimScheduleOccurrence(ctx(), "", time.Time{}, "")
+			return err
+		}},
+		"ListOccurrences": {iface: "ScheduleStore", call: func(f *FaultyStore) error {
+			_, err := f.ListOccurrences(ctx(), "")
+			return err
+		}},
+		"AdvanceScheduleLastRun": {mutates: true, iface: "ScheduleStore", call: func(f *FaultyStore) error {
+			return f.AdvanceScheduleLastRun(ctx(), "", time.Time{})
+		}},
+		"InsertDeployment": {mutates: true, iface: "DeploymentStore", call: func(f *FaultyStore) error {
+			return f.InsertDeployment(ctx(), model.Deployment{})
+		}},
+		"ListDeploymentsByRun": {iface: "DeploymentStore", call: func(f *FaultyStore) error {
+			_, err := f.ListDeploymentsByRun(ctx(), "")
+			return err
+		}},
+		"UpdateDeploymentStatus": {mutates: true, iface: "DeploymentStore", call: func(f *FaultyStore) error {
+			return f.UpdateDeploymentStatus(ctx(), "", model.StatusQueued, nil)
+		}},
+		"InsertSnapshotRecord": {mutates: true, iface: "SnapshotStore", call: func(f *FaultyStore) error {
+			return f.InsertSnapshotRecord(ctx(), model.SnapshotRecord{})
+		}},
+		"ListSnapshotsByRun": {iface: "SnapshotStore", call: func(f *FaultyStore) error {
+			_, err := f.ListSnapshotsByRun(ctx(), "")
+			return err
+		}},
+		"InsertJobContracts": {mutates: true, iface: "ArtifactContractStore", call: func(f *FaultyStore) error {
+			return f.InsertJobContracts(ctx(), "", nil)
+		}},
+		"GetJobContracts": {iface: "ArtifactContractStore", call: func(f *FaultyStore) error {
+			_, _, err := f.GetJobContracts(ctx(), "")
+			return err
+		}},
+		"SetQueueReasons": {mutates: true, iface: "QueueReasonStore", call: func(f *FaultyStore) error {
+			return f.SetQueueReasons(ctx(), nil)
+		}},
+		"InsertGeneratedJobs": {mutates: true, iface: "DynamicStore", call: func(f *FaultyStore) error {
+			return f.InsertGeneratedJobs(ctx(), "", 0, nil, nil)
+		}},
+		"InsertDownstreamLink": {mutates: true, iface: "DownstreamStore", call: func(f *FaultyStore) error {
+			return f.InsertDownstreamLink(ctx(), DownstreamLink{})
+		}},
+		"GetDownstreamLink": {iface: "DownstreamStore", call: func(f *FaultyStore) error {
+			_, _, err := f.GetDownstreamLink(ctx(), "", "", "")
+			return err
+		}},
+		"MarkDownstreamLaunched": {mutates: true, iface: "DownstreamStore", call: func(f *FaultyStore) error {
+			return f.MarkDownstreamLaunched(ctx(), "", "", "", "")
+		}},
+		"RecentUsage": {iface: "UsageStore", call: func(f *FaultyStore) error {
+			_, _, err := f.RecentUsage(ctx(), time.Time{})
+			return err
+		}},
+		"RecordUsageOnce": {mutates: true, iface: "UsageOnceStore", call: func(f *FaultyStore) error {
+			_, err := f.RecordUsageOnce(ctx(), "", 0, 0)
+			return err
+		}},
+		"AppendDownstreamRun": {mutates: true, iface: "RunDownstreamStore", call: func(f *FaultyStore) error {
+			return f.AppendDownstreamRun(ctx(), "", "")
+		}},
+		"ReopenRunForChildren": {mutates: true, iface: "RunDownstreamStore", call: func(f *FaultyStore) error {
+			return f.ReopenRunForChildren(ctx(), "")
+		}},
+		"GetArtifact": {iface: "ArtifactLookupStore", call: func(f *FaultyStore) error {
+			_, err := f.GetArtifact(ctx(), "")
+			return err
+		}},
+		"InsertCompiledRun": {mutates: true, iface: "RunEnqueueStore", call: func(f *FaultyStore) error {
+			return f.InsertCompiledRun(ctx(), InsertCompiledRunRequest{})
+		}},
+		"AcquireLeaseAtomic": {mutates: true, iface: "AtomicLeaseStore", call: func(f *FaultyStore) error {
+			_, err := f.AcquireLeaseAtomic(ctx(), LeaseClaim{})
+			return err
+		}},
+		"AdjustQuotaCounter": {mutates: true, iface: "QuotaCounterStore", call: func(f *FaultyStore) error {
+			return f.AdjustQuotaCounter(ctx(), "", "", 0, 0)
+		}},
+		"QuotaCounts": {iface: "QuotaCounterStore", call: func(f *FaultyStore) error {
+			_, _, err := f.QuotaCounts(ctx(), "", "")
+			return err
+		}},
+		"ReserveDownstreamLaunch": {mutates: true, iface: "DownstreamStore", call: func(f *FaultyStore) error {
+			_, err := f.ReserveDownstreamLaunch(ctx(), "", "", "", "")
+			return err
+		}},
+		"ReleaseDownstreamReservation": {mutates: true, iface: "DownstreamStore", call: func(f *FaultyStore) error {
+			return f.ReleaseDownstreamReservation(ctx(), "", "", "")
+		}},
+		"ExpireDownstreamReservations": {mutates: true, iface: "DownstreamStore", call: func(f *FaultyStore) error {
+			_, err := f.ExpireDownstreamReservations(ctx(), time.Time{})
+			return err
+		}},
+		"InsertGeneratedFragmentTx": {mutates: true, iface: "DynamicStoreTx", call: func(f *FaultyStore) error {
+			_, _, err := f.InsertGeneratedFragmentTx(ctx(), GeneratedFragmentRequest{}, nil)
+			return err
+		}},
+		"GetGeneratedFragment": {iface: "GeneratedFragmentStore", call: func(f *FaultyStore) error {
+			_, _, err := f.GetGeneratedFragment(ctx(), "", 0, "")
+			return err
+		}},
+		"PutCacheManifest": {mutates: true, iface: "CacheManifestStore", call: func(f *FaultyStore) error {
+			return f.PutCacheManifest(ctx(), CacheManifestRecord{})
+		}},
+		"GetCacheManifest": {iface: "CacheManifestStore", call: func(f *FaultyStore) error {
+			_, _, err := f.GetCacheManifest(ctx(), "", "", "")
+			return err
+		}},
+		"SetArtifactSidecars": {mutates: true, iface: "ArtifactSidecarStore", call: func(f *FaultyStore) error {
+			return f.SetArtifactSidecars(ctx(), "", "", "", "", "")
+		}},
+		"RememberPendingSidecar": {mutates: true, iface: "ArtifactSidecarStore", call: func(f *FaultyStore) error {
+			return f.RememberPendingSidecar(ctx(), "", "", "", "")
+		}},
+		"PendingSidecar": {iface: "ArtifactSidecarStore", call: func(f *FaultyStore) error {
+			_, _, err := f.PendingSidecar(ctx(), "", "", "")
+			return err
+		}},
+		"ConsumePendingSidecar": {mutates: true, iface: "ArtifactSidecarStore", call: func(f *FaultyStore) error {
+			return f.ConsumePendingSidecar(ctx(), "", "", "", "")
+		}},
+		"DeletePendingSidecars": {mutates: true, iface: "ArtifactSidecarStore", call: func(f *FaultyStore) error {
+			return f.DeletePendingSidecars(ctx(), "")
+		}},
+		"PrunePendingSidecars": {mutates: true, iface: "ArtifactSidecarStore", call: func(f *FaultyStore) error {
+			_, err := f.PrunePendingSidecars(ctx(), time.Time{})
+			return err
+		}},
+		"ClaimSecretDelivery": {mutates: true, iface: "SecretClaimStore", call: func(f *FaultyStore) error {
+			_, err := f.ClaimSecretDelivery(ctx(), "", 0, "")
+			return err
+		}},
+		"ReleaseSecretDelivery": {mutates: true, iface: "SecretClaimReleaser", call: func(f *FaultyStore) error {
+			return f.ReleaseSecretDelivery(ctx(), "", 0, "")
+		}},
+		"UpsertProfile": {mutates: true, iface: "ProfileStore", call: func(f *FaultyStore) error {
+			return f.UpsertProfile(ctx(), model.RunnerProfile{})
+		}},
+		"GetProfile": {iface: "ProfileStore", call: func(f *FaultyStore) error {
+			_, err := f.GetProfile(ctx(), "")
+			return err
+		}},
+		"ListProfiles": {iface: "ProfileStore", call: func(f *FaultyStore) error {
+			_, err := f.ListProfiles(ctx())
+			return err
+		}},
+		"BindCertProfile": {mutates: true, iface: "ProfileStore", call: func(f *FaultyStore) error {
+			return f.BindCertProfile(ctx(), "", "")
+		}},
+		"ProfileForSerial": {iface: "ProfileStore", call: func(f *FaultyStore) error {
+			_, _, err := f.ProfileForSerial(ctx(), "")
+			return err
+		}},
+		"UpsertRunnerToken": {mutates: true, iface: "RunnerTokenStore", call: func(f *FaultyStore) error {
+			return f.UpsertRunnerToken(ctx(), "", "")
+		}},
+		"RunnerIDForToken": {iface: "RunnerTokenStore", call: func(f *FaultyStore) error {
+			_, _, err := f.RunnerIDForToken(ctx(), "")
+			return err
+		}},
+		"HasRunnerTokens": {iface: "RunnerTokenStore", call: func(f *FaultyStore) error {
+			_, err := f.HasRunnerTokens(ctx())
+			return err
+		}},
+		"RevokeCert": {mutates: true, iface: "CertRevocationStore", call: func(f *FaultyStore) error {
+			return f.RevokeCert(ctx(), "", "", "")
+		}},
+		"CertRevoked": {iface: "CertRevocationStore", call: func(f *FaultyStore) error {
+			_, err := f.CertRevoked(ctx(), "")
+			return err
+		}},
+		"PutEnrollGrant": {mutates: true, iface: "EnrollGrantStore", call: func(f *FaultyStore) error {
+			return f.PutEnrollGrant(ctx(), "", time.Time{}, nil)
+		}},
+		"GetEnrollGrant": {iface: "EnrollGrantStore", call: func(f *FaultyStore) error {
+			_, _, err := f.GetEnrollGrant(ctx(), "")
+			return err
+		}},
+		"ConsumeEnrollGrant": {mutates: true, iface: "EnrollGrantStore", call: func(f *FaultyStore) error {
+			_, err := f.ConsumeEnrollGrant(ctx(), "", "")
+			return err
+		}},
+		"LoadTestHistory": {iface: "TestHistoryStore", call: func(f *FaultyStore) error {
+			_, _, err := f.LoadTestHistory(ctx())
+			return err
+		}},
+		"SaveTestHistory": {mutates: true, iface: "TestHistoryStore", call: func(f *FaultyStore) error {
+			_, err := f.SaveTestHistory(ctx(), nil)
+			return err
+		}},
+	}
+}
+
+// TestFaultyStoreMissingOptionalInterfacesFailClosed wraps a minimal Store
+// that implements none of the optional extension interfaces and calls every
+// hardened wrapper method: each call must return the typed missing-interface
+// error instead of panicking on a bare type assertion, and for mutating
+// methods an armed fault must stay untouched (the capability check runs first,
+// so a wiring error neither fires nor consumes a fault).
+func TestFaultyStoreMissingOptionalInterfacesFailClosed(t *testing.T) {
+	for name, tc := range missingOptionalInterfaceCases() {
+		t.Run(name, func(t *testing.T) {
+			fs := &FaultyStore{Inner: storeOnlyInner{}}
+			assertMissingInterface(t, tc.call(fs), tc.iface)
+			if fs.Mutations() != 0 {
+				t.Fatalf("missing-interface call counted %d mutations", fs.Mutations())
+			}
+			if !tc.mutates {
+				return
+			}
+			armed := &FaultyStore{Inner: storeOnlyInner{}, FailAfter: 1, Err: errBoom}
+			err := tc.call(armed)
+			assertMissingInterface(t, err, tc.iface)
+			if errors.Is(err, errBoom) {
+				t.Fatalf("missing interface fired the armed fault instead of failing closed")
+			}
+			if armed.Mutations() != 0 {
+				t.Fatalf("missing-interface call consumed a fault: Mutations() = %d", armed.Mutations())
+			}
+		})
+	}
+}
+
+func assertMissingInterface(t *testing.T, err error, iface string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("want missing-interface error naming %s, got nil", iface)
+	}
+	var miss *missingInnerInterfaceError
+	if !errors.As(err, &miss) {
+		t.Fatalf("want *missingInnerInterfaceError naming %s, got %T: %v", iface, err, err)
+	}
+	if miss.iface != iface {
+		t.Fatalf("missing interface = %q, want %q", miss.iface, iface)
 	}
 }

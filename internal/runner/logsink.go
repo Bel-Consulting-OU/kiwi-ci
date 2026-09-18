@@ -35,9 +35,22 @@ type asyncLogSink struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	// journal is the durable per-(job, generation) batch journal. When set,
+	// every batch is journaled before its first POST attempt, acked only
+	// after a confirmed delivery, and unconsumed records are replayed with
+	// their original identities before any new batch is formed. nil means
+	// no durable state directory is configured.
+	journal *logJournal
+	// pending holds the unconsumed journal records the sender must replay
+	// first, in sequence order. Guarded by the sender goroutine: only
+	// newLogSink and run touch it.
+	pending []logBatch
+
 	// batchSeq assigns every batch its immutable sequence when the sink
 	// forms the batch — once, before the first send — so retries of that
-	// batch reuse the same sequence and identity.
+	// batch reuse the same sequence and identity. A journaled sink starts
+	// it after the persisted maximum so a restart never regresses the
+	// sequence.
 	batchSeq atomic.Int64
 
 	mu         sync.Mutex
@@ -131,9 +144,28 @@ const (
 )
 
 func newAsyncLogSink(inner logging.Sink, post func(context.Context, logBatch) error) *asyncLogSink {
+	return newLogSink(inner, post, nil)
+}
+
+// newJournaledAsyncLogSink builds a sink whose batches are durable before
+// they are sent. The journal's unconsumed records are loaded at construction
+// and replayed, with their original batch ids and sequences, before the sink
+// forms any new batch.
+func newJournaledAsyncLogSink(inner logging.Sink, post func(context.Context, logBatch) error, journal *logJournal) *asyncLogSink {
+	return newLogSink(inner, post, journal)
+}
+
+func newLogSink(inner logging.Sink, post func(context.Context, logBatch) error, journal *logJournal) *asyncLogSink {
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &asyncLogSink{inner: inner, post: post, ctx: ctx, cancel: cancel, done: make(chan struct{})}
+	s := &asyncLogSink{inner: inner, post: post, journal: journal, ctx: ctx, cancel: cancel, done: make(chan struct{})}
 	s.cond = sync.NewCond(&s.mu)
+	if journal != nil {
+		s.pending = journal.pendingBatches()
+		s.batchSeq.Store(journal.maxSequence())
+		// Replay counts as work in flight so Flush/Finish never report a
+		// clean stop while unconsumed records are still being delivered.
+		s.inFlight = len(s.pending)
+	}
 	go s.run()
 	return s
 }
@@ -178,15 +210,48 @@ func (s *asyncLogSink) WriteLine(job, step, line string) {
 	s.mu.Unlock()
 }
 
-// run drains the spool into batched posts until Close.
+// run replays any unconsumed journal records first, then drains the spool
+// into batched posts until Close. Every new batch is journaled before its
+// first POST attempt and acked after a confirmed delivery; a journal failure
+// leaves the batch in the spool and stops the sender (fail closed).
 func (s *asyncLogSink) run() {
 	defer close(s.done)
+	// Recovery: the records were journaled by an earlier process and carry
+	// original (job, generation, batch_id) identities, so replaying them is
+	// idempotent server-side and reproduces the persisted batch boundaries
+	// byte-for-byte. This runs before any new batch is formed and before any
+	// newly spooled line can be sent, so ordering across the restart holds.
+	for _, batch := range s.pending {
+		err := s.postWithRetries(batch)
+		if err == nil && s.journal != nil {
+			// Deliver ack only after the server confirmed the delivery.
+			err = s.journal.ack(batch.Sequence, batch.ID)
+		}
+		if err != nil {
+			// Stop with the record still on disk: it stays available for
+			// the next same-(job, generation) resume.
+			s.recordSendErr(err)
+			return
+		}
+		s.mu.Lock()
+		s.inFlight--
+		s.cond.Broadcast()
+		s.mu.Unlock()
+	}
+	s.pending = nil
+
 	for {
 		s.mu.Lock()
 		for len(s.spool) == 0 && !s.closed {
 			s.cond.Wait()
 		}
 		if len(s.spool) == 0 && s.closed {
+			s.mu.Unlock()
+			return
+		}
+		if s.ctx.Err() != nil {
+			// Cancelled (Finish deadline or job cancellation): form no new
+			// batches; whatever is still spooled stays for the job outcome.
 			s.mu.Unlock()
 			return
 		}
@@ -218,41 +283,28 @@ func (s *asyncLogSink) run() {
 		s.inFlight++
 		s.mu.Unlock()
 
-		err := s.post(s.ctx, batch)
-		if err != nil {
-			// Retain the batch and retry retryable failures with bounded
-			// exponential backoff + jitter; a permanent (4xx-class) failure
-			// fails immediately. Re-sending a batch is SAFE: the server's
-			// batch receipts dedupe by (job, generation, batch_id).
-			var perm *permanentDeliveryError
-			if !errors.As(err, &perm) {
-				backoff := 100 * time.Millisecond
-				for attempt := 0; attempt < 6 && s.ctx.Err() == nil; attempt++ {
-					jitter := time.Duration(time.Now().UnixNano() % int64(backoff/2+1))
-					select {
-					case <-time.After(backoff + jitter):
-					case <-s.ctx.Done():
-					}
-					if s.ctx.Err() != nil {
-						break
-					}
-					if rerr := s.post(s.ctx, batch); rerr == nil {
-						err = nil
-						break
-					} else if errors.As(rerr, &perm) {
-						err = rerr
-						break
-					} else {
-						err = rerr
-					}
-					backoff *= 2
-					if backoff > 2*time.Second {
-						backoff = 2 * time.Second
-					}
-				}
+		if s.journal != nil {
+			if jerr := s.journal.append(batch); jerr != nil {
+				// No POST may leave the process for a batch that is not
+				// durably journaled. Restore the exact per-line costs, stop
+				// the sender, and surface the failure on the job outcome.
+				s.mu.Lock()
+				s.spool = append(append([]logLine(nil), batch.Lines...), s.spool...)
+				s.spoolBytes += removed
+				s.inFlight--
+				s.mu.Unlock()
+				s.recordSendErr(jerr)
+				return
 			}
 		}
 
+		err := s.postWithRetries(batch)
+		if err == nil && s.journal != nil {
+			// The record is deleted only after the ack was received. A
+			// failed delete leaves the record for an idempotent replay and
+			// is surfaced as a delivery failure.
+			err = s.journal.ack(batch.Sequence, batch.ID)
+		}
 		s.mu.Lock()
 		s.inFlight--
 		if err != nil && s.sendErr == nil {
@@ -260,12 +312,66 @@ func (s *asyncLogSink) run() {
 		}
 		s.cond.Broadcast()
 		s.mu.Unlock()
+		if s.ctx.Err() != nil {
+			return
+		}
 	}
+}
+
+// postWithRetries sends one batch. Retryable failures are retried with
+// bounded exponential backoff + jitter while the sink's context is alive; a
+// permanent (4xx-class) failure fails immediately. Re-sending a batch is
+// SAFE: the server's batch receipts dedupe by (job, generation, batch_id)
+// and the batch identity is immutable.
+func (s *asyncLogSink) postWithRetries(batch logBatch) error {
+	err := s.post(s.ctx, batch)
+	if err == nil {
+		return nil
+	}
+	var perm *permanentDeliveryError
+	if errors.As(err, &perm) {
+		return err
+	}
+	backoff := 100 * time.Millisecond
+	for attempt := 0; attempt < 6 && s.ctx.Err() == nil; attempt++ {
+		jitter := time.Duration(time.Now().UnixNano() % int64(backoff/2+1))
+		select {
+		case <-time.After(backoff + jitter):
+		case <-s.ctx.Done():
+		}
+		if s.ctx.Err() != nil {
+			break
+		}
+		if rerr := s.post(s.ctx, batch); rerr == nil {
+			return nil
+		} else if errors.As(rerr, &perm) {
+			return rerr
+		} else {
+			err = rerr
+		}
+		backoff *= 2
+		if backoff > 2*time.Second {
+			backoff = 2 * time.Second
+		}
+	}
+	return err
+}
+
+// recordSendErr stores the FIRST sender error and wakes Flush waiters.
+func (s *asyncLogSink) recordSendErr(err error) {
+	s.mu.Lock()
+	if err != nil && s.sendErr == nil {
+		s.sendErr = err
+	}
+	s.cond.Broadcast()
+	s.mu.Unlock()
 }
 
 // Flush waits until the spool is empty AND no batch is in flight (or the
 // deadline passes). Waiting only for an empty spool would return success
-// while the final POST is still running, hiding its failure.
+// while the final POST is still running, hiding its failure. A sender that
+// has already stopped (journal failure, or a clean closed drain) cannot make
+// further progress, so the wait ends immediately with the remaining count.
 func (s *asyncLogSink) Flush(deadline time.Duration) int {
 	end := time.Now().Add(deadline)
 	for {
@@ -274,6 +380,11 @@ func (s *asyncLogSink) Flush(deadline time.Duration) int {
 		s.mu.Unlock()
 		if pending == 0 || time.Now().After(end) {
 			return pending
+		}
+		select {
+		case <-s.done:
+			return pending
+		default:
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

@@ -1,5 +1,5 @@
 .PHONY: build test test-unit test-race test-integration integration test-adversarial test-shuffle test-stress \
-	fuzz coverage coverage-ci coverage-floor staticcheck govulncheck cross schema-check docs-check license-check license-notice repro-build \
+	fuzz coverage coverage-ci coverage-floor staticcheck govulncheck cross schema-check dockerfile-buildargs-check docs-check license-check license-notice repro-build \
 	fmt lint run clean protect-branch
 
 VERSION ?= 0.1.0-dev
@@ -95,9 +95,17 @@ cross:
 	GOOS=darwin GOARCH=amd64 go build -trimpath -o /dev/null ./cmd/kiwi
 	GOOS=windows GOARCH=amd64 go build -trimpath -o /dev/null ./cmd/kiwi
 
+# Extracts the VERSION/COMMIT validation RUN block from the Dockerfile
+# (between its BEGIN/END markers) and executes it natively under sh with
+# accept/reject inputs: build-arg validation is testable without a Docker
+# daemon. Also wired into schema-check below and the Woodpecker schema step.
+dockerfile-buildargs-check:
+	./scripts/dockerfile-buildargs-check.sh
+
 schema-check:
 	go test -run Schema ./internal/pipeline
 	go run ./cmd/filemap --check
+	./scripts/dockerfile-buildargs-check.sh
 
 docs-check:
 	test -f docs/threat-model.md

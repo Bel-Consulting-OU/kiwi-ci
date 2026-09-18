@@ -137,6 +137,14 @@ type Config struct {
 	// CacheRoot is the root for the runner's local cache and artifact
 	// stores (default: ~/.kiwi).
 	CacheRoot string
+	// StateDir is the runner's durable state directory; the per-job log
+	// batch journal lives under it (keyed by job and lease generation) so a
+	// restarted runner replays unconsumed batches under their original
+	// identities instead of re-batching (and duplicating) them. Defaults
+	// (resolved by Run, not needed by tests that call execute directly):
+	// CacheRoot when set, otherwise the identity directory, otherwise
+	// ~/.kiwi.
+	StateDir string
 	// SigstoreKeyPath is a PKCS8 PEM Ed25519 private key used to sign
 	// Sigstore attestations for artifacts whose contract declares a
 	// sigstore gate.
@@ -235,6 +243,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		r.ID = id
 	}
 	r.resolveIdentityDir()
+	r.resolveStateDir()
 	if err := r.prepareClient(ctx); err != nil {
 		return err
 	}
@@ -591,7 +600,29 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	consoleSink := logging.Func(func(job, step, line string) {
 		fmt.Printf("[%s/%s] %s\n", job, step, masker.Mask(line))
 	})
-	sink := newAsyncLogSink(consoleSink, r.logBatchPost(t, masker))
+	// Durable batch journal: every batch is journaled (masked) and fsynced
+	// before its first POST, unconditionally acked after the control plane
+	// confirms it, and unconsumed records from a crashed earlier process for
+	// this same lease generation are replayed with their original identities
+	// before new lines are sent. Opening fails closed: a corrupt/unreadable
+	// journal fails the job instead of silently dropping durable state.
+	journal, jerr := r.openJobLogJournal(t.Job.ID, t.LeaseGeneration, masker.Mask)
+	if jerr != nil {
+		r.complete(parent, t, model.StatusFailure, fmt.Errorf("log journal: %w", jerr), nil)
+		return
+	}
+	if journal != nil {
+		// Terminal completion ends the lease generation: nothing can resume
+		// this journal afterwards, so it is removed on every exit path. A
+		// cleanup failure is reported but never fails the job (the records
+		// are pruned when a later generation of the job opens its journal).
+		defer func() {
+			if rerr := journal.remove(); rerr != nil {
+				fmt.Fprintf(os.Stderr, "kiwi runner %s: remove log journal for %s: %v\n", r.ID, t.Job.ID, rerr)
+			}
+		}()
+	}
+	sink := newJournaledAsyncLogSink(consoleSink, r.logBatchPost(t, masker), journal)
 	// Distributed runs resolve secrets exclusively through the control
 	// plane's lease-bound delivery endpoint. Host env/Keychain providers
 	// are local-CLI-only (app.RunLocal keeps that chain); the runner never
@@ -1434,6 +1465,39 @@ func (r *Runner) resolveIdentityDir() {
 	if r.Cfg.IdentityDir != "" {
 		r.store = IdentityStore{Dir: r.Cfg.IdentityDir}
 	}
+}
+
+// resolveStateDir defaults the runner's durable state directory (home of the
+// log batch journal). Precedence: an explicit StateDir, then the cache root
+// (tests and deployments that already provision it), then the identity
+// directory, and finally ~/.kiwi. It is resolved by Run so callers that
+// invoke execute directly (tests) keep the journal off unless they opt in.
+func (r *Runner) resolveStateDir() {
+	if r.Cfg.StateDir != "" {
+		return
+	}
+	if r.Cfg.CacheRoot != "" {
+		r.Cfg.StateDir = r.Cfg.CacheRoot
+		return
+	}
+	if r.Cfg.IdentityDir != "" {
+		r.Cfg.StateDir = r.Cfg.IdentityDir
+		return
+	}
+	home, _ := os.UserHomeDir()
+	if home == "" {
+		return
+	}
+	r.Cfg.StateDir = filepath.Join(home, ".kiwi")
+}
+
+// openJobLogJournal opens the durable batch journal for one job lease
+// generation. A nil journal (no state directory) disables journaling.
+func (r *Runner) openJobLogJournal(jobID string, generation int64, mask func(string) string) (*logJournal, error) {
+	if r.Cfg.StateDir == "" {
+		return nil, nil
+	}
+	return openLogJournal(filepath.Join(r.Cfg.StateDir, "log-journal"), jobID, generation, mask)
 }
 
 // prepareClient builds the mTLS HTTP client when certificate material or an

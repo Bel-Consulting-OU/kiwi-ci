@@ -48,6 +48,26 @@ func (f *FaultyStore) Mutations() int {
 	return f.mutCalls
 }
 
+// missingInnerInterfaceError reports that a FaultyStore extension method was
+// called on an Inner Store that does not implement the optional interface the
+// method delegates to. Wrapper methods return it instead of panicking on a
+// bare type assertion, so wrapping a minimal Store fails closed with a
+// diagnosable error. The capability check runs before fault injection: a
+// missing interface is a wiring error, not a simulated storage failure, and
+// must not consume or fire a fault.
+type missingInnerInterfaceError struct {
+	iface string
+}
+
+func (e *missingInnerInterfaceError) Error() string {
+	return "storage: inner store does not implement " + e.iface
+}
+
+// errMissingInnerInterface builds the fail-closed error for an absent iface.
+func errMissingInnerInterface(iface string) error {
+	return &missingInnerInterfaceError{iface: iface}
+}
+
 var _ Store = (*FaultyStore)(nil)
 
 var (
@@ -137,7 +157,11 @@ func (f *FaultyStore) ListJobsByEnvironment(ctx context.Context, repoID, environ
 }
 
 func (f *FaultyStore) ListJobsByRunner(ctx context.Context, runnerID string) ([]model.Job, error) {
-	return f.Inner.(RunnerJobStore).ListJobsByRunner(ctx, runnerID)
+	inner, ok := f.Inner.(RunnerJobStore)
+	if !ok {
+		return nil, errMissingInnerInterface("RunnerJobStore")
+	}
+	return inner.ListJobsByRunner(ctx, runnerID)
 }
 
 func (f *FaultyStore) UpdateJob(ctx context.Context, job model.Job) error {
@@ -225,12 +249,16 @@ func (f *FaultyStore) ListArtifacts(ctx context.Context, runID string) ([]model.
 }
 
 func (f *FaultyStore) InsertArtifactOnce(ctx context.Context, a model.ArtifactRecord) (model.ArtifactRecord, bool, error) {
+	inner, ok := f.Inner.(ArtifactIdempotentStore)
+	if !ok {
+		return model.ArtifactRecord{}, false, errMissingInnerInterface("ArtifactIdempotentStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return model.ArtifactRecord{}, false, err
 	}
-	return f.Inner.(ArtifactIdempotentStore).InsertArtifactOnce(ctx, a)
+	return inner.InsertArtifactOnce(ctx, a)
 }
 
 func (f *FaultyStore) InsertTestReport(ctx context.Context, rep model.TestReport) error {
@@ -335,26 +363,36 @@ func (f *FaultyStore) SchemaVersion(ctx context.Context) (int, error) {
 
 // ---------------------------------------------------------------------------
 // DB-mode extension stores. The Inner Store must also implement these
-// interfaces (the fault-injection memStore does); the assertions panic
-// loudly if a non-extended inner is ever used with the extension methods.
+// interfaces (the fault-injection memStore does). A wrapper around a Store
+// that lacks one returns a typed missing-interface error (fail closed)
+// instead of panicking on a bare type assertion; the capability check runs
+// before fault injection so a wiring error never fires or consumes a fault.
 // ---------------------------------------------------------------------------
 
 func (f *FaultyStore) OutboxAppend(ctx context.Context, e OutboxItem) error {
+	inner, ok := f.Inner.(OutboxStore)
+	if !ok {
+		return errMissingInnerInterface("OutboxStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(OutboxStore).OutboxAppend(ctx, e)
+	return inner.OutboxAppend(ctx, e)
 }
 
 func (f *FaultyStore) OutboxAck(ctx context.Context, id string) error {
+	inner, ok := f.Inner.(OutboxStore)
+	if !ok {
+		return errMissingInnerInterface("OutboxStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(OutboxStore).OutboxAck(ctx, id)
+	return inner.OutboxAck(ctx, id)
 }
 
 // OutboxEnqueueVersioned delegates the versioned enqueue to the inner store
@@ -368,7 +406,7 @@ func (f *FaultyStore) OutboxEnqueueVersioned(ctx context.Context, e OutboxItem) 
 	}
 	inner, ok := f.Inner.(ForgeCheckStateStore)
 	if !ok {
-		return VersionedEnqueued, fmt.Errorf("storage: inner store does not implement ForgeCheckStateStore")
+		return VersionedEnqueued, errMissingInnerInterface("ForgeCheckStateStore")
 	}
 	return inner.OutboxEnqueueVersioned(ctx, e)
 }
@@ -378,31 +416,43 @@ func (f *FaultyStore) OutboxEnqueueVersioned(ctx context.Context, e OutboxItem) 
 func (f *FaultyStore) OutboxVersionGuard(ctx context.Context, id, logicalKey string, version int64) (bool, error) {
 	inner, ok := f.Inner.(ForgeCheckStateStore)
 	if !ok {
-		return false, fmt.Errorf("storage: inner store does not implement ForgeCheckStateStore")
+		return false, errMissingInnerInterface("ForgeCheckStateStore")
 	}
 	return inner.OutboxVersionGuard(ctx, id, logicalKey, version)
 }
 
 func (f *FaultyStore) OutboxPending(ctx context.Context) ([]OutboxItem, error) {
-	return f.Inner.(OutboxStore).OutboxPending(ctx)
+	inner, ok := f.Inner.(OutboxStore)
+	if !ok {
+		return nil, errMissingInnerInterface("OutboxStore")
+	}
+	return inner.OutboxPending(ctx)
 }
 
 func (f *FaultyStore) ClaimOutbox(ctx context.Context, claimer string, limit int) ([]OutboxItem, error) {
+	inner, ok := f.Inner.(OutboxStore)
+	if !ok {
+		return nil, errMissingInnerInterface("OutboxStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return nil, err
 	}
-	return f.Inner.(OutboxStore).ClaimOutbox(ctx, claimer, limit)
+	return inner.ClaimOutbox(ctx, claimer, limit)
 }
 
 func (f *FaultyStore) ReleaseOutboxClaim(ctx context.Context, id, claimer string) error {
+	inner, ok := f.Inner.(OutboxStore)
+	if !ok {
+		return errMissingInnerInterface("OutboxStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(OutboxStore).ReleaseOutboxClaim(ctx, id, claimer)
+	return inner.ReleaseOutboxClaim(ctx, id, claimer)
 }
 
 // OutboxRetry delegates the retry/dead-letter transition to the inner store
@@ -417,7 +467,7 @@ func (f *FaultyStore) OutboxRetry(ctx context.Context, id string, dispatchErr er
 		OutboxRetry(context.Context, string, error, int) error
 	})
 	if !ok {
-		return fmt.Errorf("storage: inner store does not implement OutboxRetry")
+		return errMissingInnerInterface("OutboxRetry")
 	}
 	return inner.OutboxRetry(ctx, id, dispatchErr, maxAttempts)
 }
@@ -425,7 +475,7 @@ func (f *FaultyStore) OutboxRetry(ctx context.Context, id string, dispatchErr er
 func (f *FaultyStore) OutboxDeadLetters(ctx context.Context) ([]OutboxDeadLetter, error) {
 	inner, ok := f.Inner.(OutboxDeadLetterStore)
 	if !ok {
-		return nil, fmt.Errorf("storage: inner store does not implement OutboxDeadLetterStore")
+		return nil, errMissingInnerInterface("OutboxDeadLetterStore")
 	}
 	return inner.OutboxDeadLetters(ctx)
 }
@@ -438,7 +488,7 @@ func (f *FaultyStore) OutboxRequeue(ctx context.Context, id string) error {
 	}
 	inner, ok := f.Inner.(OutboxDeadLetterStore)
 	if !ok {
-		return fmt.Errorf("storage: inner store does not implement OutboxDeadLetterStore")
+		return errMissingInnerInterface("OutboxDeadLetterStore")
 	}
 	return inner.OutboxRequeue(ctx, id)
 }
@@ -451,418 +501,643 @@ func (f *FaultyStore) OutboxDelete(ctx context.Context, id string) error {
 	}
 	inner, ok := f.Inner.(OutboxDeadLetterStore)
 	if !ok {
-		return fmt.Errorf("storage: inner store does not implement OutboxDeadLetterStore")
+		return errMissingInnerInterface("OutboxDeadLetterStore")
 	}
 	return inner.OutboxDelete(ctx, id)
 }
 
 func (f *FaultyStore) UpsertSchedule(ctx context.Context, sc Schedule) error {
+	inner, ok := f.Inner.(ScheduleStore)
+	if !ok {
+		return errMissingInnerInterface("ScheduleStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(ScheduleStore).UpsertSchedule(ctx, sc)
+	return inner.UpsertSchedule(ctx, sc)
 }
 
 func (f *FaultyStore) ListSchedules(ctx context.Context) ([]Schedule, error) {
-	return f.Inner.(ScheduleStore).ListSchedules(ctx)
+	inner, ok := f.Inner.(ScheduleStore)
+	if !ok {
+		return nil, errMissingInnerInterface("ScheduleStore")
+	}
+	return inner.ListSchedules(ctx)
 }
 
 func (f *FaultyStore) ClaimScheduleOccurrence(ctx context.Context, scheduleID string, nominal time.Time, runID string) (bool, error) {
+	inner, ok := f.Inner.(ScheduleStore)
+	if !ok {
+		return false, errMissingInnerInterface("ScheduleStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return false, err
 	}
-	return f.Inner.(ScheduleStore).ClaimScheduleOccurrence(ctx, scheduleID, nominal, runID)
+	return inner.ClaimScheduleOccurrence(ctx, scheduleID, nominal, runID)
 }
 
 func (f *FaultyStore) ListOccurrences(ctx context.Context, scheduleID string) ([]Occurrence, error) {
-	return f.Inner.(ScheduleStore).ListOccurrences(ctx, scheduleID)
+	inner, ok := f.Inner.(ScheduleStore)
+	if !ok {
+		return nil, errMissingInnerInterface("ScheduleStore")
+	}
+	return inner.ListOccurrences(ctx, scheduleID)
 }
 
 func (f *FaultyStore) AdvanceScheduleLastRun(ctx context.Context, id string, nominal time.Time) error {
+	inner, ok := f.Inner.(ScheduleStore)
+	if !ok {
+		return errMissingInnerInterface("ScheduleStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(ScheduleStore).AdvanceScheduleLastRun(ctx, id, nominal)
+	return inner.AdvanceScheduleLastRun(ctx, id, nominal)
 }
 
 func (f *FaultyStore) InsertDeployment(ctx context.Context, d model.Deployment) error {
+	inner, ok := f.Inner.(DeploymentStore)
+	if !ok {
+		return errMissingInnerInterface("DeploymentStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(DeploymentStore).InsertDeployment(ctx, d)
+	return inner.InsertDeployment(ctx, d)
 }
 
 func (f *FaultyStore) ListDeploymentsByRun(ctx context.Context, runID string) ([]model.Deployment, error) {
-	return f.Inner.(DeploymentStore).ListDeploymentsByRun(ctx, runID)
+	inner, ok := f.Inner.(DeploymentStore)
+	if !ok {
+		return nil, errMissingInnerInterface("DeploymentStore")
+	}
+	return inner.ListDeploymentsByRun(ctx, runID)
 }
 
 func (f *FaultyStore) UpdateDeploymentStatus(ctx context.Context, id string, status model.Status, finishedAt *time.Time) error {
+	inner, ok := f.Inner.(DeploymentStore)
+	if !ok {
+		return errMissingInnerInterface("DeploymentStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(DeploymentStore).UpdateDeploymentStatus(ctx, id, status, finishedAt)
+	return inner.UpdateDeploymentStatus(ctx, id, status, finishedAt)
 }
 
 func (f *FaultyStore) InsertSnapshotRecord(ctx context.Context, rec model.SnapshotRecord) error {
+	inner, ok := f.Inner.(SnapshotStore)
+	if !ok {
+		return errMissingInnerInterface("SnapshotStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(SnapshotStore).InsertSnapshotRecord(ctx, rec)
+	return inner.InsertSnapshotRecord(ctx, rec)
 }
 
 func (f *FaultyStore) ListSnapshotsByRun(ctx context.Context, runID string) ([]model.SnapshotRecord, error) {
-	return f.Inner.(SnapshotStore).ListSnapshotsByRun(ctx, runID)
+	inner, ok := f.Inner.(SnapshotStore)
+	if !ok {
+		return nil, errMissingInnerInterface("SnapshotStore")
+	}
+	return inner.ListSnapshotsByRun(ctx, runID)
 }
 
 func (f *FaultyStore) InsertJobContracts(ctx context.Context, jobID string, contracts map[string]ArtifactContract) error {
+	inner, ok := f.Inner.(ArtifactContractStore)
+	if !ok {
+		return errMissingInnerInterface("ArtifactContractStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(ArtifactContractStore).InsertJobContracts(ctx, jobID, contracts)
+	return inner.InsertJobContracts(ctx, jobID, contracts)
 }
 
 func (f *FaultyStore) GetJobContracts(ctx context.Context, jobID string) (map[string]ArtifactContract, bool, error) {
-	return f.Inner.(ArtifactContractStore).GetJobContracts(ctx, jobID)
+	inner, ok := f.Inner.(ArtifactContractStore)
+	if !ok {
+		return nil, false, errMissingInnerInterface("ArtifactContractStore")
+	}
+	return inner.GetJobContracts(ctx, jobID)
 }
 
 func (f *FaultyStore) SetQueueReasons(ctx context.Context, reasons map[string]string) error {
+	inner, ok := f.Inner.(QueueReasonStore)
+	if !ok {
+		return errMissingInnerInterface("QueueReasonStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(QueueReasonStore).SetQueueReasons(ctx, reasons)
+	return inner.SetQueueReasons(ctx, reasons)
 }
 
 func (f *FaultyStore) InsertGeneratedJobs(ctx context.Context, parentJobID string, depth int, jobs map[string]model.Job, deps map[string][]string) error {
+	inner, ok := f.Inner.(DynamicStore)
+	if !ok {
+		return errMissingInnerInterface("DynamicStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(DynamicStore).InsertGeneratedJobs(ctx, parentJobID, depth, jobs, deps)
+	return inner.InsertGeneratedJobs(ctx, parentJobID, depth, jobs, deps)
 }
 
 func (f *FaultyStore) InsertDownstreamLink(ctx context.Context, l DownstreamLink) error {
+	inner, ok := f.Inner.(DownstreamStore)
+	if !ok {
+		return errMissingInnerInterface("DownstreamStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(DownstreamStore).InsertDownstreamLink(ctx, l)
+	return inner.InsertDownstreamLink(ctx, l)
 }
 
 func (f *FaultyStore) GetDownstreamLink(ctx context.Context, parentJobID, targetRepo, targetRef string) (DownstreamLink, bool, error) {
-	return f.Inner.(DownstreamStore).GetDownstreamLink(ctx, parentJobID, targetRepo, targetRef)
+	inner, ok := f.Inner.(DownstreamStore)
+	if !ok {
+		return DownstreamLink{}, false, errMissingInnerInterface("DownstreamStore")
+	}
+	return inner.GetDownstreamLink(ctx, parentJobID, targetRepo, targetRef)
 }
 
 func (f *FaultyStore) MarkDownstreamLaunched(ctx context.Context, parentJobID, targetRepo, targetRef, childRunID string) error {
+	inner, ok := f.Inner.(DownstreamStore)
+	if !ok {
+		return errMissingInnerInterface("DownstreamStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(DownstreamStore).MarkDownstreamLaunched(ctx, parentJobID, targetRepo, targetRef, childRunID)
+	return inner.MarkDownstreamLaunched(ctx, parentJobID, targetRepo, targetRef, childRunID)
 }
 
 func (f *FaultyStore) RecentUsage(ctx context.Context, since time.Time) (float64, float64, error) {
-	return f.Inner.(UsageStore).RecentUsage(ctx, since)
+	inner, ok := f.Inner.(UsageStore)
+	if !ok {
+		return 0, 0, errMissingInnerInterface("UsageStore")
+	}
+	return inner.RecentUsage(ctx, since)
 }
 
 func (f *FaultyStore) RecordUsageOnce(ctx context.Context, jobID string, cost, energyWh float64) (bool, error) {
+	inner, ok := f.Inner.(UsageOnceStore)
+	if !ok {
+		return false, errMissingInnerInterface("UsageOnceStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return false, err
 	}
-	return f.Inner.(UsageOnceStore).RecordUsageOnce(ctx, jobID, cost, energyWh)
+	return inner.RecordUsageOnce(ctx, jobID, cost, energyWh)
 }
 
 func (f *FaultyStore) AppendDownstreamRun(ctx context.Context, runID, childRunID string) error {
+	inner, ok := f.Inner.(RunDownstreamStore)
+	if !ok {
+		return errMissingInnerInterface("RunDownstreamStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(RunDownstreamStore).AppendDownstreamRun(ctx, runID, childRunID)
+	return inner.AppendDownstreamRun(ctx, runID, childRunID)
 }
 
 func (f *FaultyStore) ReopenRunForChildren(ctx context.Context, runID string) error {
+	inner, ok := f.Inner.(RunDownstreamStore)
+	if !ok {
+		return errMissingInnerInterface("RunDownstreamStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(RunDownstreamStore).ReopenRunForChildren(ctx, runID)
+	return inner.ReopenRunForChildren(ctx, runID)
 }
 
 func (f *FaultyStore) GetArtifact(ctx context.Context, id string) (model.ArtifactRecord, error) {
-	return f.Inner.(ArtifactLookupStore).GetArtifact(ctx, id)
+	inner, ok := f.Inner.(ArtifactLookupStore)
+	if !ok {
+		return model.ArtifactRecord{}, errMissingInnerInterface("ArtifactLookupStore")
+	}
+	return inner.GetArtifact(ctx, id)
 }
 
 // ---------------------------------------------------------------------------
 // atomicity/storage round extension methods. The Inner Store must also
-// implement these interfaces (the fault-injection memStore does).
+// implement these interfaces (the fault-injection memStore does). Wrappers
+// fail closed with a typed missing-interface error when it does not.
 // ---------------------------------------------------------------------------
 
 func (f *FaultyStore) InsertCompiledRun(ctx context.Context, req InsertCompiledRunRequest) error {
+	inner, ok := f.Inner.(RunEnqueueStore)
+	if !ok {
+		return errMissingInnerInterface("RunEnqueueStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(RunEnqueueStore).InsertCompiledRun(ctx, req)
+	return inner.InsertCompiledRun(ctx, req)
 }
 
 func (f *FaultyStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim) (model.Job, error) {
+	inner, ok := f.Inner.(AtomicLeaseStore)
+	if !ok {
+		return model.Job{}, errMissingInnerInterface("AtomicLeaseStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return model.Job{}, err
 	}
-	return f.Inner.(AtomicLeaseStore).AcquireLeaseAtomic(ctx, claim)
+	return inner.AcquireLeaseAtomic(ctx, claim)
 }
 
 func (f *FaultyStore) AdjustQuotaCounter(ctx context.Context, repoKey, teamKey string, runningDelta, queuedDelta int) error {
+	inner, ok := f.Inner.(QuotaCounterStore)
+	if !ok {
+		return errMissingInnerInterface("QuotaCounterStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(QuotaCounterStore).AdjustQuotaCounter(ctx, repoKey, teamKey, runningDelta, queuedDelta)
+	return inner.AdjustQuotaCounter(ctx, repoKey, teamKey, runningDelta, queuedDelta)
 }
 
 func (f *FaultyStore) QuotaCounts(ctx context.Context, repoKey, teamKey string) (int, int, error) {
-	return f.Inner.(QuotaCounterStore).QuotaCounts(ctx, repoKey, teamKey)
+	inner, ok := f.Inner.(QuotaCounterStore)
+	if !ok {
+		return 0, 0, errMissingInnerInterface("QuotaCounterStore")
+	}
+	return inner.QuotaCounts(ctx, repoKey, teamKey)
 }
 
 func (f *FaultyStore) ReserveDownstreamLaunch(ctx context.Context, parentJobID, targetRepo, targetRef, launchToken string) (bool, error) {
+	inner, ok := f.Inner.(DownstreamStore)
+	if !ok {
+		return false, errMissingInnerInterface("DownstreamStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return false, err
 	}
-	return f.Inner.(DownstreamStore).ReserveDownstreamLaunch(ctx, parentJobID, targetRepo, targetRef, launchToken)
+	return inner.ReserveDownstreamLaunch(ctx, parentJobID, targetRepo, targetRef, launchToken)
 }
 
 func (f *FaultyStore) ReleaseDownstreamReservation(ctx context.Context, parentJobID, targetRepo, targetRef string) error {
+	inner, ok := f.Inner.(DownstreamStore)
+	if !ok {
+		return errMissingInnerInterface("DownstreamStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(DownstreamStore).ReleaseDownstreamReservation(ctx, parentJobID, targetRepo, targetRef)
+	return inner.ReleaseDownstreamReservation(ctx, parentJobID, targetRepo, targetRef)
 }
 
 func (f *FaultyStore) ExpireDownstreamReservations(ctx context.Context, olderThan time.Time) (int, error) {
+	inner, ok := f.Inner.(DownstreamStore)
+	if !ok {
+		return 0, errMissingInnerInterface("DownstreamStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return 0, err
 	}
-	return f.Inner.(DownstreamStore).ExpireDownstreamReservations(ctx, olderThan)
+	return inner.ExpireDownstreamReservations(ctx, olderThan)
 }
 
 func (f *FaultyStore) InsertGeneratedFragmentTx(ctx context.Context, req GeneratedFragmentRequest, verify GeneratedJobVerifier) (GeneratedFragmentReceipt, bool, error) {
+	inner, ok := f.Inner.(DynamicStoreTx)
+	if !ok {
+		return GeneratedFragmentReceipt{}, false, errMissingInnerInterface("DynamicStoreTx")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return GeneratedFragmentReceipt{}, false, err
 	}
-	return f.Inner.(DynamicStoreTx).InsertGeneratedFragmentTx(ctx, req, verify)
+	return inner.InsertGeneratedFragmentTx(ctx, req, verify)
 }
 
 func (f *FaultyStore) GetGeneratedFragment(ctx context.Context, parentJobID string, generation int64, fragmentID string) (GeneratedFragmentReceipt, bool, error) {
-	return f.Inner.(GeneratedFragmentStore).GetGeneratedFragment(ctx, parentJobID, generation, fragmentID)
+	inner, ok := f.Inner.(GeneratedFragmentStore)
+	if !ok {
+		return GeneratedFragmentReceipt{}, false, errMissingInnerInterface("GeneratedFragmentStore")
+	}
+	return inner.GetGeneratedFragment(ctx, parentJobID, generation, fragmentID)
 }
 
 func (f *FaultyStore) PutCacheManifest(ctx context.Context, rec CacheManifestRecord) error {
+	inner, ok := f.Inner.(CacheManifestStore)
+	if !ok {
+		return errMissingInnerInterface("CacheManifestStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(CacheManifestStore).PutCacheManifest(ctx, rec)
+	return inner.PutCacheManifest(ctx, rec)
 }
 
 func (f *FaultyStore) GetCacheManifest(ctx context.Context, repo, trustDomain, logicalKey string) (CacheManifestRecord, bool, error) {
-	return f.Inner.(CacheManifestStore).GetCacheManifest(ctx, repo, trustDomain, logicalKey)
+	inner, ok := f.Inner.(CacheManifestStore)
+	if !ok {
+		return CacheManifestRecord{}, false, errMissingInnerInterface("CacheManifestStore")
+	}
+	return inner.GetCacheManifest(ctx, repo, trustDomain, logicalKey)
 }
 
 func (f *FaultyStore) SetArtifactSidecars(ctx context.Context, id, sbomPath, sbomSHA256, sigstorePath, sigstoreSHA256 string) error {
+	inner, ok := f.Inner.(ArtifactSidecarStore)
+	if !ok {
+		return errMissingInnerInterface("ArtifactSidecarStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(ArtifactSidecarStore).SetArtifactSidecars(ctx, id, sbomPath, sbomSHA256, sigstorePath, sigstoreSHA256)
+	return inner.SetArtifactSidecars(ctx, id, sbomPath, sbomSHA256, sigstorePath, sigstoreSHA256)
 }
 
 func (f *FaultyStore) RememberPendingSidecar(ctx context.Context, jobID, artifactName, kind, digest string) error {
+	inner, ok := f.Inner.(ArtifactSidecarStore)
+	if !ok {
+		return errMissingInnerInterface("ArtifactSidecarStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(ArtifactSidecarStore).RememberPendingSidecar(ctx, jobID, artifactName, kind, digest)
+	return inner.RememberPendingSidecar(ctx, jobID, artifactName, kind, digest)
 }
 
 func (f *FaultyStore) PendingSidecar(ctx context.Context, jobID, artifactName, kind string) (string, bool, error) {
-	return f.Inner.(ArtifactSidecarStore).PendingSidecar(ctx, jobID, artifactName, kind)
+	inner, ok := f.Inner.(ArtifactSidecarStore)
+	if !ok {
+		return "", false, errMissingInnerInterface("ArtifactSidecarStore")
+	}
+	return inner.PendingSidecar(ctx, jobID, artifactName, kind)
 }
 
 func (f *FaultyStore) ConsumePendingSidecar(ctx context.Context, jobID, artifactName, kind, digest string) error {
+	inner, ok := f.Inner.(ArtifactSidecarStore)
+	if !ok {
+		return errMissingInnerInterface("ArtifactSidecarStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(ArtifactSidecarStore).ConsumePendingSidecar(ctx, jobID, artifactName, kind, digest)
+	return inner.ConsumePendingSidecar(ctx, jobID, artifactName, kind, digest)
 }
 
 func (f *FaultyStore) DeletePendingSidecars(ctx context.Context, jobID string) error {
+	inner, ok := f.Inner.(ArtifactSidecarStore)
+	if !ok {
+		return errMissingInnerInterface("ArtifactSidecarStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(ArtifactSidecarStore).DeletePendingSidecars(ctx, jobID)
+	return inner.DeletePendingSidecars(ctx, jobID)
 }
 
 func (f *FaultyStore) PrunePendingSidecars(ctx context.Context, olderThan time.Time) (int, error) {
+	inner, ok := f.Inner.(ArtifactSidecarStore)
+	if !ok {
+		return 0, errMissingInnerInterface("ArtifactSidecarStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return 0, err
 	}
-	return f.Inner.(ArtifactSidecarStore).PrunePendingSidecars(ctx, olderThan)
+	return inner.PrunePendingSidecars(ctx, olderThan)
 }
 
 func (f *FaultyStore) ClaimSecretDelivery(ctx context.Context, jobID string, generation int64, secretName string) (bool, error) {
+	inner, ok := f.Inner.(SecretClaimStore)
+	if !ok {
+		return false, errMissingInnerInterface("SecretClaimStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return false, err
 	}
-	return f.Inner.(SecretClaimStore).ClaimSecretDelivery(ctx, jobID, generation, secretName)
+	return inner.ClaimSecretDelivery(ctx, jobID, generation, secretName)
 }
 
 func (f *FaultyStore) ReleaseSecretDelivery(ctx context.Context, jobID string, generation int64, secretName string) error {
+	inner, ok := f.Inner.(SecretClaimReleaser)
+	if !ok {
+		return errMissingInnerInterface("SecretClaimReleaser")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(SecretClaimReleaser).ReleaseSecretDelivery(ctx, jobID, generation, secretName)
+	return inner.ReleaseSecretDelivery(ctx, jobID, generation, secretName)
 }
 
 func (f *FaultyStore) UpsertProfile(ctx context.Context, p model.RunnerProfile) error {
+	inner, ok := f.Inner.(ProfileStore)
+	if !ok {
+		return errMissingInnerInterface("ProfileStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(ProfileStore).UpsertProfile(ctx, p)
+	return inner.UpsertProfile(ctx, p)
 }
 
 func (f *FaultyStore) GetProfile(ctx context.Context, id string) (model.RunnerProfile, error) {
-	return f.Inner.(ProfileStore).GetProfile(ctx, id)
+	inner, ok := f.Inner.(ProfileStore)
+	if !ok {
+		return model.RunnerProfile{}, errMissingInnerInterface("ProfileStore")
+	}
+	return inner.GetProfile(ctx, id)
 }
 
 func (f *FaultyStore) ListProfiles(ctx context.Context) ([]model.RunnerProfile, error) {
-	return f.Inner.(ProfileStore).ListProfiles(ctx)
+	inner, ok := f.Inner.(ProfileStore)
+	if !ok {
+		return nil, errMissingInnerInterface("ProfileStore")
+	}
+	return inner.ListProfiles(ctx)
 }
 
 func (f *FaultyStore) BindCertProfile(ctx context.Context, serial, profileID string) error {
+	inner, ok := f.Inner.(ProfileStore)
+	if !ok {
+		return errMissingInnerInterface("ProfileStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(ProfileStore).BindCertProfile(ctx, serial, profileID)
+	return inner.BindCertProfile(ctx, serial, profileID)
 }
 
 func (f *FaultyStore) ProfileForSerial(ctx context.Context, serial string) (model.RunnerProfile, bool, error) {
-	return f.Inner.(ProfileStore).ProfileForSerial(ctx, serial)
+	inner, ok := f.Inner.(ProfileStore)
+	if !ok {
+		return model.RunnerProfile{}, false, errMissingInnerInterface("ProfileStore")
+	}
+	return inner.ProfileForSerial(ctx, serial)
 }
 
 func (f *FaultyStore) UpsertRunnerToken(ctx context.Context, runnerID, tokenDigest string) error {
+	inner, ok := f.Inner.(RunnerTokenStore)
+	if !ok {
+		return errMissingInnerInterface("RunnerTokenStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(RunnerTokenStore).UpsertRunnerToken(ctx, runnerID, tokenDigest)
+	return inner.UpsertRunnerToken(ctx, runnerID, tokenDigest)
 }
 
 func (f *FaultyStore) RunnerIDForToken(ctx context.Context, tokenDigest string) (string, bool, error) {
-	return f.Inner.(RunnerTokenStore).RunnerIDForToken(ctx, tokenDigest)
+	inner, ok := f.Inner.(RunnerTokenStore)
+	if !ok {
+		return "", false, errMissingInnerInterface("RunnerTokenStore")
+	}
+	return inner.RunnerIDForToken(ctx, tokenDigest)
 }
 
 func (f *FaultyStore) HasRunnerTokens(ctx context.Context) (bool, error) {
-	return f.Inner.(RunnerTokenStore).HasRunnerTokens(ctx)
+	inner, ok := f.Inner.(RunnerTokenStore)
+	if !ok {
+		return false, errMissingInnerInterface("RunnerTokenStore")
+	}
+	return inner.HasRunnerTokens(ctx)
 }
 
 func (f *FaultyStore) RevokeCert(ctx context.Context, serial, runnerID, reason string) error {
+	inner, ok := f.Inner.(CertRevocationStore)
+	if !ok {
+		return errMissingInnerInterface("CertRevocationStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(CertRevocationStore).RevokeCert(ctx, serial, runnerID, reason)
+	return inner.RevokeCert(ctx, serial, runnerID, reason)
 }
 
 func (f *FaultyStore) CertRevoked(ctx context.Context, serial string) (bool, error) {
-	return f.Inner.(CertRevocationStore).CertRevoked(ctx, serial)
+	inner, ok := f.Inner.(CertRevocationStore)
+	if !ok {
+		return false, errMissingInnerInterface("CertRevocationStore")
+	}
+	return inner.CertRevoked(ctx, serial)
 }
 
 func (f *FaultyStore) PutEnrollGrant(ctx context.Context, digest string, expiresAt time.Time, boundLabels []string) error {
+	inner, ok := f.Inner.(EnrollGrantStore)
+	if !ok {
+		return errMissingInnerInterface("EnrollGrantStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.(EnrollGrantStore).PutEnrollGrant(ctx, digest, expiresAt, boundLabels)
+	return inner.PutEnrollGrant(ctx, digest, expiresAt, boundLabels)
 }
 
 func (f *FaultyStore) GetEnrollGrant(ctx context.Context, digest string) (EnrollGrantRecord, bool, error) {
-	return f.Inner.(EnrollGrantStore).GetEnrollGrant(ctx, digest)
+	inner, ok := f.Inner.(EnrollGrantStore)
+	if !ok {
+		return EnrollGrantRecord{}, false, errMissingInnerInterface("EnrollGrantStore")
+	}
+	return inner.GetEnrollGrant(ctx, digest)
 }
 
 func (f *FaultyStore) ConsumeEnrollGrant(ctx context.Context, digest string, consumedBy string) (EnrollGrantRecord, error) {
+	inner, ok := f.Inner.(EnrollGrantStore)
+	if !ok {
+		return EnrollGrantRecord{}, errMissingInnerInterface("EnrollGrantStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return EnrollGrantRecord{}, err
 	}
-	return f.Inner.(EnrollGrantStore).ConsumeEnrollGrant(ctx, digest, consumedBy)
+	return inner.ConsumeEnrollGrant(ctx, digest, consumedBy)
 }
 
 func (f *FaultyStore) LoadTestHistory(ctx context.Context) (int64, []byte, error) {
-	return f.Inner.(TestHistoryStore).LoadTestHistory(ctx)
+	inner, ok := f.Inner.(TestHistoryStore)
+	if !ok {
+		return 0, nil, errMissingInnerInterface("TestHistoryStore")
+	}
+	return inner.LoadTestHistory(ctx)
 }
 
 func (f *FaultyStore) SaveTestHistory(ctx context.Context, stats []byte) (int64, error) {
+	inner, ok := f.Inner.(TestHistoryStore)
+	if !ok {
+		return 0, errMissingInnerInterface("TestHistoryStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return 0, err
 	}
-	return f.Inner.(TestHistoryStore).SaveTestHistory(ctx, stats)
+	return inner.SaveTestHistory(ctx, stats)
 }
 
 // memStore is a fully functional in-memory Store used as the fault-free
@@ -1906,7 +2181,7 @@ func (m *memStore) WithDigestFence(ctx context.Context, digest string, fn func()
 func (f *FaultyStore) WithDigestFence(ctx context.Context, digest string, fn func() error) error {
 	inner, ok := f.Inner.(DigestFenceStore)
 	if !ok {
-		return fmt.Errorf("storage: inner store does not implement DigestFenceStore")
+		return errMissingInnerInterface("DigestFenceStore")
 	}
 	return inner.WithDigestFence(ctx, digest, fn)
 }
@@ -1914,7 +2189,7 @@ func (f *FaultyStore) WithDigestFence(ctx context.Context, digest string, fn fun
 func (f *FaultyStore) AcquireNamedFence(ctx context.Context, namespace, key string) (func(), error) {
 	inner, ok := f.Inner.(DigestFenceStore)
 	if !ok {
-		return nil, fmt.Errorf("storage: inner store does not implement DigestFenceStore")
+		return nil, errMissingInnerInterface("DigestFenceStore")
 	}
 	return inner.AcquireNamedFence(ctx, namespace, key)
 }
@@ -1922,7 +2197,7 @@ func (f *FaultyStore) AcquireNamedFence(ctx context.Context, namespace, key stri
 func (f *FaultyStore) AcquireDigestFence(ctx context.Context, digest string) (func(), error) {
 	inner, ok := f.Inner.(DigestFenceStore)
 	if !ok {
-		return nil, fmt.Errorf("storage: inner store does not implement DigestFenceStore")
+		return nil, errMissingInnerInterface("DigestFenceStore")
 	}
 	return inner.AcquireDigestFence(ctx, digest)
 }
@@ -1930,7 +2205,7 @@ func (f *FaultyStore) AcquireDigestFence(ctx context.Context, digest string) (fu
 func (f *FaultyStore) GetSchedule(ctx context.Context, id string) (Schedule, bool, error) {
 	inner, ok := f.Inner.(ScheduleStore)
 	if !ok {
-		return Schedule{}, false, fmt.Errorf("storage: inner store does not implement ScheduleStore")
+		return Schedule{}, false, errMissingInnerInterface("ScheduleStore")
 	}
 	return inner.GetSchedule(ctx, id)
 }
@@ -1965,7 +2240,7 @@ func (f *FaultyStore) AppendLogBatch(ctx context.Context, entries []model.LogEnt
 	}
 	inner, ok := f.Inner.(LogBatchStore)
 	if !ok {
-		return false, fmt.Errorf("storage: inner store does not implement LogBatchStore")
+		return false, errMissingInnerInterface("LogBatchStore")
 	}
 	return inner.AppendLogBatch(ctx, entries, r)
 }
@@ -1986,7 +2261,7 @@ func (f *FaultyStore) PutCheckRun(ctx context.Context, key, checkRunID string) e
 	}
 	inner, ok := f.Inner.(CheckRunStore)
 	if !ok {
-		return fmt.Errorf("storage: inner store does not implement CheckRunStore")
+		return errMissingInnerInterface("CheckRunStore")
 	}
 	return inner.PutCheckRun(ctx, key, checkRunID)
 }
@@ -1998,7 +2273,7 @@ func (f *FaultyStore) GetCheckRun(ctx context.Context, key string) (string, bool
 	}
 	inner, ok := f.Inner.(CheckRunStore)
 	if !ok {
-		return "", false, fmt.Errorf("storage: inner store does not implement CheckRunStore")
+		return "", false, errMissingInnerInterface("CheckRunStore")
 	}
 	return inner.GetCheckRun(ctx, key)
 }
@@ -2010,7 +2285,7 @@ func (f *FaultyStore) OutboxHas(ctx context.Context, id string) (bool, error) {
 	}
 	inner, ok := f.Inner.(OutboxStore)
 	if !ok {
-		return false, fmt.Errorf("storage: inner store does not implement OutboxStore")
+		return false, errMissingInnerInterface("OutboxStore")
 	}
 	return inner.OutboxHas(ctx, id)
 }

@@ -54,6 +54,11 @@ COPY . .
 # The hex set is spelled out instead of [a-f] because under a UTF-8 collation
 # bash's range matching also accepts uppercase A-F. Keep these rules in sync
 # with docs/releases.md.
+#
+# scripts/dockerfile-buildargs-check.sh extracts the block between the BEGIN
+# and END markers below and executes it natively (no Docker daemon) under sh
+# with accept/reject inputs; keep it a single RUN instruction whose
+# continuation lines end in a backslash so extraction stays mechanical.
 # BEGIN version-commit validation
 RUN set -eux; \
     case "${VERSION}" in \

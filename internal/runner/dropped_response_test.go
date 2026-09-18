@@ -824,13 +824,16 @@ func (s *restartLogControlPlane) snapshot() ([]batchDeliveryAttempt, map[string]
 }
 
 // TestRestartMidBatchIdenticalReplayDedupes simulates a runner restart in
-// the middle of a log batch: the first sink commits batch 1 (the response is
-// dropped, its retry is parked) and dies with lines 2 spooled but never
-// delivered. A fresh sink with the same runner identity and the same lease
-// starts its sequence counter at 1 again and replays the identical batches;
-// the (job, generation, batch_id) receipt dedupes the replay instead of
-// duplicating the committed line. The unsent spool is process-local and is
-// only recovered because the restarted run re-emits it from the start.
+// the middle of a log batch WITHOUT a durable journal: the first sink
+// commits batch 1 (the response is dropped, its retry is parked) and dies
+// with lines 2 spooled but never delivered. A fresh sink with the same
+// runner identity and the same lease starts its sequence counter at 1 again
+// and replays the identical batches; the (job, generation, batch_id) receipt
+// dedupes the replay instead of duplicating the committed line. This pins
+// the identity-based dedupe contract in isolation; the durable journal
+// (logjournal_test.go) persists and replays the unsent spool so a restart
+// no longer has to re-emit it, and the process-local spool remains only as
+// the documented loss boundary.
 func TestRestartMidBatchIdenticalReplayDedupes(t *testing.T) {
 	cp := newRestartLogControlPlane()
 	cp.dropFirst = true
@@ -857,7 +860,6 @@ func TestRestartMidBatchIdenticalReplayDedupes(t *testing.T) {
 	if outA.Err == nil && outA.Remaining == 0 && outA.Stopped {
 		t.Fatalf("parked sink reported a clean stop: %+v", outA)
 	}
-	t.Logf("GAP: sink A died with Err=%v Remaining=%d Stopped=%v; the spool and the batch sequence are process-local, so lines spooled after the last acked batch are lost unless the restarted run re-emits them", outA.Err, outA.Remaining, outA.Stopped)
 	cp.startRestartPhase()
 
 	// Restart: a fresh process (new sink, sequence restarting at 1) replays
@@ -885,59 +887,6 @@ func TestRestartMidBatchIdenticalReplayDedupes(t *testing.T) {
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("receipt store lines = %v, want exactly %v (the replayed batch must be deduped)", got, want)
 	}
-}
-
-// TestRestartMidBatchDifferentBoundariesDuplicateGap documents the restart
-// gap that remains: batch identity is a function of (sequence, payload), so
-// the SAME lines replayed under the SAME lease generation but with different
-// batch boundaries (the drain boundary is timing-dependent) are a different
-// batch_id and are committed a second time. Server-side dedupe is per batch,
-// never per line. If sequence/spool persistence is added to the runner, this
-// test must be replaced by one asserting zero duplicates.
-func TestRestartMidBatchDifferentBoundariesDuplicateGap(t *testing.T) {
-	cp := newRestartLogControlPlane()
-	ts := httptest.NewServer(cp)
-	defer ts.Close()
-
-	task := basicTask(payloadPipeline)
-	post := testRunnerFor(t, ts, Config{}).logBatchPost(task, &secrets.Masker{})
-
-	// Original process: one drain formed batch 1 carrying both lines.
-	original := logBatch{
-		Sequence: 1,
-		Lines: []logLine{
-			{Job: "build", Step: "step", Line: "line-1"},
-			{Job: "build", Step: "step", Line: "line-2"},
-		},
-	}
-	original.ID = logBatchID(original.Sequence, original.Lines)
-	if err := post(context.Background(), original); err != nil {
-		t.Fatalf("original batch delivery: %v", err)
-	}
-
-	// Restarted process, same lease generation, fresh sequence counter, and
-	// a different drain boundary: the same lines are now two batches.
-	for i, line := range []string{"line-1", "line-2"} {
-		batch := logBatch{Sequence: int64(i + 1), Lines: []logLine{{Job: "build", Step: "step", Line: line}}}
-		batch.ID = logBatchID(batch.Sequence, batch.Lines)
-		if err := post(context.Background(), batch); err != nil {
-			t.Fatalf("restarted batch %d delivery: %v", i+1, err)
-		}
-	}
-
-	_, store := cp.snapshot()
-	if got := countCommittedBatches(store); got != 3 {
-		t.Fatalf("committed batches = %d, want 3 (the original plus the two re-batched deliveries)", got)
-	}
-	lines := flattenCommittedLines(store)
-	counts := map[string]int{}
-	for _, l := range lines {
-		counts[l]++
-	}
-	if counts["step: line-1"] != 2 || counts["step: line-2"] != 2 {
-		t.Fatalf("line counts = %v, want each line twice under the current per-batch contract", counts)
-	}
-	t.Logf("GAP: a restarted runner with the same lease but different drain boundaries duplicates lines (%v); batch identity includes the boundary, so only identical replays dedupe", counts)
 }
 
 // TestRestartLeaseAcquireToCompletionAccountsUsageOnce simulates a runner
