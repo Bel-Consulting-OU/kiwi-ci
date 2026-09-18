@@ -1,7 +1,6 @@
 package runner
 
 import (
-	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,15 +23,34 @@ type asyncLogSink struct {
 	inner logging.Sink
 	post  func(lines []logLine) error
 
-	mu     sync.Mutex
-	spool  []logLine
-	cond   *sync.Cond
-	closed bool
+	mu         sync.Mutex
+	spool      []logLine
+	spoolBytes int64
+	inFlight   int
+	closed     bool
+	cond       *sync.Cond
 
 	dropped atomic.Int64
-	sendErr atomic.Value // error
+
+	// First delivery error, guarded by mu. A plain error field (not
+	// atomic.Value) is deliberate: storing heterogeneous error types in an
+	// atomic.Value panics, which would take down the runner from its own
+	// logging goroutine.
+	sendErr       error
+	senderStopped bool
 
 	done chan struct{}
+}
+
+// logOutcome is the sender's final state at job end.
+type logOutcome struct {
+	Dropped   int64
+	Remaining int
+	Err       error
+	// Stopped is false when the bounded close deadline expired with the
+	// sender still running (a slow in-flight request); the job still fails
+	// explicitly via Remaining/Err.
+	Stopped bool
 }
 
 type logLine struct {
@@ -44,12 +62,20 @@ type logLine struct {
 // asyncSpoolLimit bounds the in-memory spool; at 64 bytes per line average
 // this is a few MiB, far below the memory a stalled sender could otherwise
 // accumulate over a long step.
-// asyncSpoolLimit is the spool bound; a package variable so tests can
-// shrink it instead of enqueueing a hundred thousand lines.
-var asyncSpoolLimit = 100_000
+// The spool is bounded in BOTH lines and bytes: a line can be up to ~1 MiB,
+// so a line-only cap would allow ~100 GiB of retained payload. The byte
+// budget is the binding constraint in practice.
+var (
+	asyncSpoolLimit = 100_000
+	asyncSpoolBytes = int64(32 << 20)
+)
 
-// asyncPostBatch is how many lines one POST carries.
-const asyncPostBatch = 200
+// asyncPostBytes bounds one batched request; asyncPostBatch bounds its line
+// count. Both feed the server's /log/batch limits (1 MiB, 2000 lines).
+const (
+	asyncPostBytes = 256 << 10
+	asyncPostBatch = 200
+)
 
 func newAsyncLogSink(inner logging.Sink, post func([]logLine) error) *asyncLogSink {
 	s := &asyncLogSink{inner: inner, post: post, done: make(chan struct{})}
@@ -59,14 +85,15 @@ func newAsyncLogSink(inner logging.Sink, post func([]logLine) error) *asyncLogSi
 }
 
 // WriteLine implements logging.Sink. It never blocks on the network: when
-// the spool is full the line is dropped (counted, surfaced later) instead of
-// stalling the drain that feeds it.
+// the spool is full in lines OR bytes the line is dropped (counted, surfaced
+// later) instead of stalling the drain that feeds it.
 func (s *asyncLogSink) WriteLine(job, step, line string) {
 	if s.inner != nil {
 		s.inner.WriteLine(job, step, line)
 	}
+	added := int64(len(job) + len(step) + len(line))
 	s.mu.Lock()
-	if s.closed || len(s.spool) >= asyncSpoolLimit {
+	if s.closed || len(s.spool) >= asyncSpoolLimit || s.spoolBytes+added > asyncSpoolBytes {
 		s.mu.Unlock()
 		if !s.closed {
 			s.dropped.Add(1)
@@ -74,6 +101,7 @@ func (s *asyncLogSink) WriteLine(job, step, line string) {
 		return
 	}
 	s.spool = append(s.spool, logLine{Job: job, Step: step, Line: line})
+	s.spoolBytes += added
 	s.cond.Signal()
 	s.mu.Unlock()
 }
@@ -90,63 +118,74 @@ func (s *asyncLogSink) run() {
 			s.mu.Unlock()
 			return
 		}
-		batch := s.spool
-		if len(batch) > asyncPostBatch {
-			batch = batch[:asyncPostBatch]
+		// Fill one BATCH up to both the line and byte budget.
+		n := 0
+		var bytes int64
+		for n < len(s.spool) && n < asyncPostBatch {
+			add := int64(len(s.spool[n].Job) + len(s.spool[n].Step) + len(s.spool[n].Line))
+			if n > 0 && bytes+add > asyncPostBytes {
+				break
+			}
+			bytes += add
+			n++
 		}
-		remaining := append([]logLine(nil), s.spool[len(batch):]...)
-		s.spool = remaining
+		batch := append([]logLine(nil), s.spool[:n]...)
+		s.spool = append([]logLine(nil), s.spool[n:]...)
+		s.spoolBytes -= bytes
+		if s.spoolBytes < 0 {
+			s.spoolBytes = 0
+		}
+		s.inFlight++
 		s.mu.Unlock()
 
-		if err := s.post(batch); err != nil {
-			s.sendErr.Store(err)
+		err := s.post(batch)
+
+		s.mu.Lock()
+		s.inFlight--
+		if err != nil && s.sendErr == nil {
+			s.sendErr = err
 		}
+		s.cond.Broadcast()
+		s.mu.Unlock()
 	}
 }
 
-// Flush waits until the spool is empty (or the deadline passes) so a job's
-// tail logs reach the control plane before completion is reported. It
-// returns the remaining unsent count.
+// Flush waits until the spool is empty AND no batch is in flight (or the
+// deadline passes). Waiting only for an empty spool would return success
+// while the final POST is still running, hiding its failure.
 func (s *asyncLogSink) Flush(deadline time.Duration) int {
 	end := time.Now().Add(deadline)
 	for {
 		s.mu.Lock()
-		n := len(s.spool)
+		pending := len(s.spool) + s.inFlight
 		s.mu.Unlock()
-		if n == 0 || time.Now().After(end) {
-			return n
+		if pending == 0 || time.Now().After(end) {
+			return pending
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 }
 
-// Close stops the sender after flushing what it can within the deadline.
-func (s *asyncLogSink) Close(deadline time.Duration) {
+// Finish stops the sender with a deadline and reports the final state. The
+// in-flight request is given up to deadline to complete; if the deadline
+// expires the outcome reports Stopped=false and the remaining work, and the
+// job must fail explicitly rather than claim a clean completion.
+func (s *asyncLogSink) Finish(deadline time.Duration) logOutcome {
 	s.Flush(deadline)
 	s.mu.Lock()
 	s.closed = true
 	s.cond.Broadcast()
 	s.mu.Unlock()
-	<-s.done
-}
-
-// Dropped reports how many lines overflowed the spool, and SendError the
-// first background post failure. Both are surfaced in the job's completion
-// so a lost-log job never looks clean.
-func (s *asyncLogSink) Dropped() int64 { return s.dropped.Load() }
-
-func (s *asyncLogSink) SendError() error {
-	if v := s.sendErr.Load(); v != nil {
-		if err, ok := v.(error); ok {
-			return err
-		}
+	stopped := true
+	select {
+	case <-s.done:
+	case <-time.After(deadline):
+		stopped = false
 	}
-	return nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.senderStopped = stopped
+	return logOutcome{Dropped: s.dropped.Load(), Remaining: len(s.spool) + s.inFlight, Err: s.sendErr, Stopped: stopped}
 }
 
 var _ logging.Sink = (*asyncLogSink)(nil)
-
-// unusedContext keeps the context import meaningful if callers later thread
-// one through the sink; the sender intentionally survives request-scoped
-// contexts (job-level lifetime).
-var _ = context.Background

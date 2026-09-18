@@ -592,14 +592,23 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		fmt.Printf("[%s/%s] %s\n", job, step, masker.Mask(line))
 	})
 	sink := newAsyncLogSink(consoleSink, func(lines []logLine) error {
-		var firstErr error
+		// ONE batched request per drain: per-line posts cannot keep up and
+		// force the spool to overflow on chatty builds.
+		out := make([]server.LogLine, 0, len(lines))
 		for _, l := range lines {
-			msg := masker.Mask(l.Line)
-			if err := r.post(parent, "/api/v1/jobs/"+t.Job.ID+"/log", server.LogLine{RunnerID: r.ID, LeaseToken: t.LeaseToken, LeaseGeneration: t.LeaseGeneration, JobKey: l.Job, Step: l.Step, Line: msg}, nil); err != nil && firstErr == nil {
-				firstErr = err
-			}
+			out = append(out, server.LogLine{RunnerID: r.ID, LeaseToken: t.LeaseToken, LeaseGeneration: t.LeaseGeneration, JobKey: l.Job, Step: l.Step, Line: masker.Mask(l.Line)})
 		}
-		return firstErr
+		var body struct {
+			RunnerID        string           `json:"runner_id"`
+			LeaseToken      string           `json:"lease_token"`
+			LeaseGeneration int64            `json:"lease_generation"`
+			Lines           []server.LogLine `json:"lines"`
+		}
+		body.RunnerID = r.ID
+		body.LeaseToken = t.LeaseToken
+		body.LeaseGeneration = t.LeaseGeneration
+		body.Lines = out
+		return r.post(parent, "/api/v1/jobs/"+t.Job.ID+"/log/batch", body, nil)
 	})
 	// Distributed runs resolve secrets exclusively through the control
 	// plane's lease-bound delivery endpoint. Host env/Keychain providers
@@ -678,33 +687,38 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 			r.Metrics.Observe("kiwi_runner_snapshot_duration_seconds", time.Since(snapStart).Seconds())
 		}
 	}
-	// Flush the log spool before reporting the result; unsent or dropped
-	// lines make the job fail explicitly rather than completing clean.
-	remaining := sink.Flush(10 * time.Second)
-	dropped := sink.Dropped()
-	sendErr := sink.SendError()
-	sink.Close(2 * time.Second)
+	// Finish the log sender before reporting the result: unsent, dropped or
+	// failed lines make the job fail explicitly rather than completing clean,
+	// and the final sender state is inspected only AFTER it has stopped (a
+	// late in-flight failure must still count).
+	outcome := sink.Finish(10 * time.Second)
 	var runErr error
 	if res.Error != "" {
 		runErr = fmt.Errorf("%s", res.Error)
 	}
 	status := res.Status
-	if dropped > 0 || remaining > 0 || sendErr != nil {
+	if outcome.Dropped > 0 || outcome.Remaining > 0 || outcome.Err != nil || !outcome.Stopped {
 		detail := ""
-		if dropped > 0 {
-			detail += fmt.Sprintf("%d log lines dropped (control plane too slow)", dropped)
+		if outcome.Dropped > 0 {
+			detail += fmt.Sprintf("%d log lines dropped (control plane too slow)", outcome.Dropped)
 		}
-		if remaining > 0 {
+		if outcome.Remaining > 0 {
 			if detail != "" {
 				detail += "; "
 			}
-			detail += fmt.Sprintf("%d log lines unsent at completion", remaining)
+			detail += fmt.Sprintf("%d log lines unsent at completion", outcome.Remaining)
 		}
-		if sendErr != nil {
+		if !outcome.Stopped {
 			if detail != "" {
 				detail += "; "
 			}
-			detail += "log delivery error: " + sendErr.Error()
+			detail += "log sender did not stop within the completion deadline"
+		}
+		if outcome.Err != nil {
+			if detail != "" {
+				detail += "; "
+			}
+			detail += "log delivery error: " + outcome.Err.Error()
 		}
 		if runErr != nil {
 			runErr = fmt.Errorf("%w; %s", runErr, detail)

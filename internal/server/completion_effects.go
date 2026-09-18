@@ -213,7 +213,7 @@ func (s *Server) effectForgeStatus(ctx context.Context, j model.Job) error {
 		return err
 	}
 	if run.Status.Terminal() {
-		s.publishGitHubStatus(run)
+		s.publishForgeStatus(run)
 	}
 	return nil
 }

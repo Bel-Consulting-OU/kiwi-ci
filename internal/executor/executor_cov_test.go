@@ -547,7 +547,7 @@ func TestNativeBackendReadFileErrors(t *testing.T) {
 
 func TestWriteOwnerOnly(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "key")
-	if err := WriteOwnerOnly(path, []byte("data")); err != nil {
+	if _, err := WriteOwnerOnly(path, []byte("data")); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(path)
@@ -558,7 +558,7 @@ func TestWriteOwnerOnly(t *testing.T) {
 	if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := WriteOwnerOnly(path, []byte("new")); err != nil {
+	if _, err := WriteOwnerOnly(path, []byte("new")); err != nil {
 		t.Fatal(err)
 	}
 	// A non-empty directory cannot be removed: the replace fails.
@@ -569,11 +569,11 @@ func TestWriteOwnerOnly(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(blocked, "child"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := WriteOwnerOnly(blocked, []byte("x")); err == nil {
+	if _, err := WriteOwnerOnly(blocked, []byte("x")); err == nil {
 		t.Fatal("non-empty directory accepted")
 	}
 	// A missing parent directory is a hard error.
-	if err := WriteOwnerOnly(filepath.Join(t.TempDir(), "missing", "key"), []byte("x")); err == nil {
+	if _, err := WriteOwnerOnly(filepath.Join(t.TempDir(), "missing", "key"), []byte("x")); err == nil {
 		t.Fatal("missing parent accepted")
 	}
 }

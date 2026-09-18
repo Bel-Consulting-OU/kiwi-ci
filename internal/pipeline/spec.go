@@ -88,6 +88,9 @@ func (b *ByteSize) UnmarshalYAML(value *yaml.Node) error {
 		return nil
 	}
 	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		if n < 0 {
+			return fmt.Errorf("byte size must not be negative, got %d", n)
+		}
 		*b = ByteSize(n)
 		return nil
 	}
@@ -98,6 +101,9 @@ func (b *ByteSize) UnmarshalYAML(value *yaml.Node) error {
 	f, err := strconv.ParseFloat(m[1], 64)
 	if err != nil {
 		return fmt.Errorf("invalid byte size %q: %w", s, err)
+	}
+	if f < 0 {
+		return fmt.Errorf("byte size must not be negative, got %q", s)
 	}
 	multipliers := map[string]float64{
 		"": 1, "b": 1,

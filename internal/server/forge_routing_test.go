@@ -66,4 +66,20 @@ func TestForgeCheckRoutingNeverCrossesForges(t *testing.T) {
 	if got := len(s.outbox.Pending()); got != 0 {
 		t.Fatalf("gitlab run queued %d github intents, want 0", got)
 	}
+	// The NEUTRAL completion path, however, must publish a GitLab run
+	// through the GitLab adapter: gitlab_check intents (+ the terminal job).
+	s.mu.Lock()
+	s.runs[run.ID] = run
+	s.jobs["j-gl1"] = model.Job{ID: "j-gl1", RunID: run.ID, Key: "build", Status: model.StatusSuccess}
+	s.mu.Unlock()
+	s.publishForgeStatus(run)
+	pending := s.outbox.Pending()
+	if len(pending) == 0 {
+		t.Fatal("neutral publication produced no intents for a gitlab run")
+	}
+	for _, it := range pending {
+		if it.Kind != forge.OutboxKindGitLabCheck {
+			t.Fatalf("neutral publication emitted %q for a gitlab run, want gitlab_check", it.Kind)
+		}
+	}
 }

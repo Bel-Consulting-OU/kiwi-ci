@@ -319,3 +319,48 @@ func TestSchedulePromotionReloadsAuthoritativeRows(t *testing.T) {
 		t.Fatal("inconsistent schedule must be disabled at reload")
 	}
 }
+
+// TestScheduleStableLeaderSeesNewScheduleFromReplica is the discovery
+// regression: a brand-new schedule created on replica B while replica A
+// stays leader must be visible to A's due calculation (it refreshes the
+// authoritative rows first), not just to a pre-known schedule's edits.
+func TestScheduleStableLeaderSeesNewScheduleFromReplica(t *testing.T) {
+	f := newDBFakeStore()
+	a := New("token")
+	if err := a.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	b := New("token")
+	if err := b.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	// A's mirror is empty (nothing known locally); B creates the schedule
+	// durably.
+	sc := storage.Schedule{
+		ID: "fresh", Repository: "acme/app", RepoID: "github.com/acme/app",
+		RepoURL: "https://github.com/acme/app.git", Forge: "github", Enabled: true,
+		Spec: "version: 1\non:\n  schedule:\n    cron: \"* * * * *\"\njobs:\n  j:\n    runtime: container\n    image: alpine\n    steps:\n      - run: echo hi\n",
+	}
+	if err := f.UpsertSchedule(context.Background(), sc); err != nil {
+		t.Fatal(err)
+	}
+	// The leader's tick must discover it even though its mirror never saw it.
+	now := time.Now().UTC().Truncate(time.Minute).Add(30 * time.Second)
+	a.mu.Lock()
+	a.schedules = map[string]storage.Schedule{} // mirror deliberately stale
+	a.mu.Unlock()
+	a.fireDueSchedules(context.Background(), now)
+	a.mu.Lock()
+	_, known := a.schedules["fresh"]
+	a.mu.Unlock()
+	if !known {
+		t.Fatal("stable leader never discovered the new schedule")
+	}
+	occ, err := f.ListOccurrences(context.Background(), sc.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(occ) == 0 {
+		t.Fatal("discovered schedule did not fire its due occurrence")
+	}
+}

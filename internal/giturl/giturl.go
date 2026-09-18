@@ -82,6 +82,9 @@ func ParseCloneURL(raw string) (host, forgePath, scheme string, err error) {
 		return "", "", "", errors.New("scp-style clone URL must be git@host:path")
 	}
 	hostPart := rest[:colon]
+	if strings.ContainsAny(hostPart, "/?#") || strings.TrimSpace(hostPart) != hostPart || strings.ContainsAny(hostPart, " \t") {
+		return "", "", "", errors.New("scp-style clone URL host component is malformed")
+	}
 	p, perr := cleanPath(rest[colon+1:])
 	if perr != nil {
 		return "", "", "", perr

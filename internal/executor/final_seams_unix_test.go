@@ -220,7 +220,7 @@ func TestFinalSeamKeyFileCreateBranches(t *testing.T) {
 		_ = f.Close()
 		return f, nil
 	}
-	if err := WriteOwnerOnly(path, []byte("secret")); err == nil {
+	if _, err := WriteOwnerOnly(path, []byte("secret")); err == nil {
 		t.Fatal("closed descriptor accepted")
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
@@ -237,7 +237,7 @@ func TestFinalSeamKeyFileCreateBranches(t *testing.T) {
 		_ = f.Close()
 		return os.Open(p)
 	}
-	if err := WriteOwnerOnly(path, []byte("secret")); err == nil {
+	if _, err := WriteOwnerOnly(path, []byte("secret")); err == nil {
 		t.Fatal("read-only descriptor accepted")
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
@@ -250,7 +250,7 @@ func TestFinalSeamKeyFileCreateBranches(t *testing.T) {
 		_ = os.WriteFile(p, []byte("x"), 0o600)
 		return nil, &os.PathError{Op: "open", Path: p, Err: syscall.EEXIST}
 	}
-	err := WriteOwnerOnly(path, []byte("secret"))
+	_, err := WriteOwnerOnly(path, []byte("secret"))
 	if err == nil || !strings.Contains(err.Error(), "could not be created exclusively") {
 		t.Fatalf("exhaustion = %v", err)
 	}

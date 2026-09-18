@@ -107,6 +107,7 @@ func TestTartImmutableRefRejected(t *testing.T) {
 // options (StrictHostKeyChecking=no, UserKnownHostsFile=/dev/null) appear
 // anywhere in the constructed args.
 func TestTartSSHArgsAreHardened(t *testing.T) {
+	testutil.UnixShell(t)
 	b := &TartBackend{sshDir: "/tmp/kiwi-ssh-42", ip: "192.0.2.1"}
 	args := b.hardenedSSHArgs("admin@"+b.ip, "true")
 	if !contains(args, "StrictHostKeyChecking=accept-new") {
@@ -184,6 +185,7 @@ func TestTartSSHAuthFailureIsHardError(t *testing.T) {
 // OpenSSH-compatible key file and public key without any external binary
 // (crypto/ed25519 fallback path).
 func TestTartKeyGeneration(t *testing.T) {
+	testutil.UnixShell(t)
 	dir := t.TempDir()
 	keyPath := dir + "/id_ed25519"
 	if err := writeGoGeneratedKey(keyPath); err != nil {

@@ -1600,6 +1600,29 @@ func (f *FaultyStore) GetCheckRun(ctx context.Context, key string) (string, bool
 	return inner.GetCheckRun(ctx, key)
 }
 
+func (f *FaultyStore) OutboxHas(ctx context.Context, id string) (bool, error) {
+	op := f.fail()
+	if op != nil {
+		return false, op
+	}
+	inner, ok := f.Inner.(OutboxStore)
+	if !ok {
+		return false, fmt.Errorf("storage: inner store does not implement OutboxStore")
+	}
+	return inner.OutboxHas(ctx, id)
+}
+
+func (m *memStore) OutboxHas(ctx context.Context, id string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, it := range m.outbox {
+		if it.ID == id {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (m *memStore) GetSchedule(ctx context.Context, id string) (Schedule, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

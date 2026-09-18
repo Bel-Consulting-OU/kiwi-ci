@@ -13,7 +13,7 @@ import (
 // mechanism on Unix — and that the content round-trips.
 func TestWriteOwnerOnlyUnixMode(t *testing.T) {
 	path := t.TempDir() + "/id_ed25519"
-	if err := WriteOwnerOnly(path, []byte("secret")); err != nil {
+	if _, err := WriteOwnerOnly(path, []byte("secret")); err != nil {
 		t.Fatal(err)
 	}
 	fi, err := os.Stat(path)
@@ -40,7 +40,7 @@ func TestWriteOwnerOnlyReplacesPreexistingLooseMode(t *testing.T) {
 	if err := os.WriteFile(path, []byte("stale"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := WriteOwnerOnly(path, []byte("secret")); err != nil {
+	if _, err := WriteOwnerOnly(path, []byte("secret")); err != nil {
 		t.Fatal(err)
 	}
 	fi, err := os.Stat(path)
@@ -72,7 +72,7 @@ func TestWriteOwnerOnlyReplacesSymlink(t *testing.T) {
 	if err := os.Symlink(victim, path); err != nil {
 		t.Fatal(err)
 	}
-	if err := WriteOwnerOnly(path, []byte("secret")); err != nil {
+	if _, err := WriteOwnerOnly(path, []byte("secret")); err != nil {
 		t.Fatal(err)
 	}
 	fi, err := os.Lstat(path)

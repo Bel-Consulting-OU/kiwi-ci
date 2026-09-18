@@ -257,6 +257,11 @@ const OutboxClaimBatch = 64
 // for the TTL.
 type OutboxStore interface {
 	OutboxAppend(ctx context.Context, e OutboxItem) error
+	// OutboxHas reports whether the DURABLE store already holds this intent
+	// ID. Recovery paths must distinguish "queued in this process" from
+	// "durably recorded": a memory-only copy dies with the process and the
+	// protected effect would be lost forever.
+	OutboxHas(ctx context.Context, id string) (bool, error)
 	OutboxAck(ctx context.Context, id string) error
 	OutboxPending(ctx context.Context) ([]OutboxItem, error)
 	ClaimOutbox(ctx context.Context, claimer string, limit int) ([]OutboxItem, error)

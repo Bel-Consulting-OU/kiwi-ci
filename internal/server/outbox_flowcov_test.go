@@ -27,6 +27,15 @@ type fcOutboxStore struct {
 	acked      []string
 }
 
+func (f *fcOutboxStore) OutboxHas(ctx context.Context, id string) (bool, error) {
+	for _, it := range f.pending {
+		if it.ID == id {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (f *fcOutboxStore) OutboxAppend(ctx context.Context, e storage.OutboxItem) error { return nil }
 
 func (f *fcOutboxStore) OutboxAck(ctx context.Context, id string) error {

@@ -29,6 +29,9 @@ func TestParseCloneURLFormTable(t *testing.T) {
 		{"-oProxyCommand=evil", "", "", "", false},
 		{"https://github.com/a//b", "", "", "", false},
 		{"https://github.com/../etc", "", "", "", false},
+		{"git@github.com/evil:acme/repo", "", "", "", false},
+		{"git@github.com?x:acme/repo", "", "", "", false},
+		{"git@github.com#f:acme/repo", "", "", "", false},
 	}
 	for _, tc := range cases {
 		host, path, scheme, err := ParseCloneURL(tc.raw)

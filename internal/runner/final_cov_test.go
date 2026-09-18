@@ -480,6 +480,14 @@ func (s *reportServer) handler() http.Handler {
 			var c server.Complete
 			_ = json.NewDecoder(r.Body).Decode(&c)
 			s.complete = append(s.complete, c)
+		case strings.HasSuffix(r.URL.Path, "/log/batch"):
+			var b struct {
+				Lines []server.LogLine `json:"lines"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&b)
+			for _, l := range b.Lines {
+				s.logs = append(s.logs, l.Step+": "+l.Line)
+			}
 		case strings.HasSuffix(r.URL.Path, "/log"):
 			var l server.LogLine
 			_ = json.NewDecoder(r.Body).Decode(&l)

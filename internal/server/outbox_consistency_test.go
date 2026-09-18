@@ -388,3 +388,59 @@ func mustJSON(t *testing.T, v any) []byte {
 	}
 	return b
 }
+
+// TestGitHubCheckRunMappingPersistedReadPropagated covers the two state
+// failures the sequential retry test cannot see: a mapping READ error must
+// fail the dispatch (never POST a duplicate), and a mapping WRITE error must
+// fail the dispatch (never ACK away the remote ID).
+func TestGitHubCheckRunMappingPersistErrorsFailDispatch(t *testing.T) {
+	var posts int
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			posts++
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id": 77}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer api.Close()
+
+	item := forge.OutboxItem{Kind: forge.OutboxKindGitHubCheck, Payload: mustJSON(t, forge.CheckPayload{
+		RunID: "run-x", ForgeKind: "github", RepoFullName: "acme/backend", SHA: "abc",
+		Name: "Pipeline", Status: "completed", Conclusion: "success",
+	})}
+
+	// Write failure: dispatch must fail (no ACK) and retry later.
+	fs := &fcStoreWriteFail{dbFakeStore: newDBFakeStore()}
+	s := New("secret")
+	s.GitHubToken = "tok"
+	s.gitHubAPIBase = api.URL
+	if err := s.SwitchToDB(fs); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.dispatchOutbox(context.Background(), item); err == nil {
+		t.Fatal("mapping write failure must fail the dispatch (the remote ID would be lost)")
+	}
+	// Read failure: dispatch must fail instead of POSTing again.
+	fs.failGet = true
+	if err := s.dispatchOutbox(context.Background(), item); err == nil {
+		t.Fatal("mapping read failure must fail the dispatch")
+	}
+}
+
+type fcStoreWriteFail struct {
+	*dbFakeStore
+	failGet bool
+}
+
+func (f *fcStoreWriteFail) PutCheckRun(ctx context.Context, key, id string) error {
+	return errors.New("mapping store down")
+}
+
+func (f *fcStoreWriteFail) GetCheckRun(ctx context.Context, key string) (string, bool, error) {
+	if f.failGet {
+		return "", false, errors.New("mapping read down")
+	}
+	return f.dbFakeStore.GetCheckRun(ctx, key)
+}

@@ -656,6 +656,18 @@ func (s *Server) scheduleByID(ctx context.Context, id string) (storage.Schedule,
 // next tick refires it; only successful enqueues (or occurrences claimed
 // by another instance) advance LastRun.
 func (s *Server) fireDueSchedules(ctx context.Context, now time.Time) {
+	// Due discovery runs on the AUTHORITATIVE rows in DB mode: a schedule
+	// created or re-cadenced on another replica while this leader stays
+	// stable would otherwise be invisible to its process-local mirror
+	// indefinitely (fireSchedule's pre-fire re-read only helps for
+	// schedules this mirror already knows). A durable read failure SKIPS
+	// the tick rather than scheduling from stale state.
+	if _, ok := s.scheduleStoreDB(); ok {
+		if err := s.reloadSchedulesFromStore(ctx); err != nil {
+			s.logError("schedule discovery refresh failed; skipping this tick", "error", err.Error())
+			return
+		}
+	}
 	// Collect the due occurrences first (without advancing) so a failing
 	// schedule cannot spin the tick loop or starve other schedules.
 	type dueFire struct {

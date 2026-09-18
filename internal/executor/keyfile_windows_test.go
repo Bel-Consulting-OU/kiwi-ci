@@ -16,8 +16,22 @@ import (
 // file modes do not encode access control).
 func TestWriteOwnerOnlyWindowsScope(t *testing.T) {
 	name := "kiwi-keyfile-test-key"
-	if err := WriteOwnerOnly(filepath.Join(t.TempDir(), name), []byte("secret")); err != nil {
+	requested := filepath.Join(t.TempDir(), name)
+	written, err := WriteOwnerOnly(requested, []byte("secret"))
+	if err != nil {
 		t.Fatal(err)
+	}
+	// The contract is the RETURNED path: Windows deliberately writes into a
+	// user-scoped directory instead of the requested location, and callers
+	// must use what the function reports.
+	if written == "" || written == requested {
+		t.Fatalf("WriteOwnerOnly returned %q; want the actual user-scoped path", written)
+	}
+	if b, rerr := os.ReadFile(written); rerr != nil || string(b) != "secret" {
+		t.Fatalf("returned path unreadable: %v", rerr)
+	}
+	if _, statErr := os.Stat(requested); statErr == nil {
+		t.Fatal("requested path must not exist (the function writes elsewhere on Windows)")
 	}
 	local, err := os.UserCacheDir()
 	if err != nil {

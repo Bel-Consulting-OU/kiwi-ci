@@ -23,3 +23,7 @@ testdata/fuzz/
 /merged-coverage.out
 /filemap
 /dist/
+
+# Editor/backup copies
+*.go.[0-9]*
+*.orig

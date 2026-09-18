@@ -553,7 +553,15 @@ const schemaSource = `{
           "type": "boolean"
         },
         "max_size": {
-          "type": "string"
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "integer",
+              "minimum": 0
+            }
+          ]
         }
       },
       "additionalProperties": false

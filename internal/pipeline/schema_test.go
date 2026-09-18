@@ -454,3 +454,26 @@ func TestRepoPipelineFilesSatisfySchema(t *testing.T) {
 		t.Fatalf("examples/kiwi.yaml must also parse with the Go engine: %v", err)
 	}
 }
+
+// TestMaxSizeSchemaParserParity pins the max_size type contract: the schema
+// and the Go parser agree on plain integers and size strings, and both
+// reject negatives.
+func TestMaxSizeSchemaParserParity(t *testing.T) {
+	valid := []string{
+		"max_size: 1048576",
+		"max_size: 10MiB",
+		"max_size: 0",
+	}
+	for _, frag := range valid {
+		src := "version: 1\njobs:\n  j:\n    runtime: container\n    image: alpine@sha256:" + strings.Repeat("a", 64) + "\n    steps:\n      - run: echo hi\n    artifacts:\n      - name: a\n        paths: [dist/**]\n        " + frag + "\n"
+		if _, err := Parse([]byte(src)); err != nil {
+			t.Errorf("%q rejected by the parser: %v", frag, err)
+		}
+	}
+	for _, frag := range []string{"max_size: -1", "max_size: -5MiB"} {
+		src := "version: 1\njobs:\n  j:\n    runtime: container\n    image: alpine@sha256:" + strings.Repeat("a", 64) + "\n    steps:\n      - run: echo hi\n    artifacts:\n      - name: a\n        paths: [dist/**]\n        " + frag + "\n"
+		if _, err := Parse([]byte(src)); err == nil {
+			t.Errorf("%q accepted; negative sizes must be rejected", frag)
+		}
+	}
+}

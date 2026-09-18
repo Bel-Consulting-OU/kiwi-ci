@@ -20,7 +20,9 @@ var keyFileCreate = os.OpenFile
 // The file is created with O_EXCL so an existing path (possibly world
 // readable, or a pre-planted symlink) is never written through: it is
 // removed and recreated at 0600 instead of inheriting its previous mode.
-func WriteOwnerOnly(path string, data []byte) error {
+// WriteOwnerOnly writes data at path with 0600 permissions (owner-only on
+// POSIX) and returns the path written (always the requested one here).
+func WriteOwnerOnly(path string, data []byte) (string, error) {
 	const attempts = 3
 	for i := 0; i < attempts; i++ {
 		f, err := keyFileCreate(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
@@ -28,22 +30,25 @@ func WriteOwnerOnly(path string, data []byte) error {
 			if cerr := f.Chmod(0o600); cerr != nil {
 				f.Close()
 				_ = os.Remove(path)
-				return cerr
+				return "", cerr
 			}
 			_, werr := f.Write(data)
 			cerr := f.Close()
 			if werr != nil {
 				_ = os.Remove(path)
-				return werr
+				return "", werr
 			}
-			return cerr
+			if cerr != nil {
+				return "", cerr
+			}
+			return path, nil
 		}
 		if !errors.Is(err, os.ErrExist) {
-			return err
+			return "", err
 		}
 		if rerr := os.Remove(path); rerr != nil {
-			return fmt.Errorf("executor: replace existing key file: %w", rerr)
+			return "", fmt.Errorf("executor: replace existing key file: %w", rerr)
 		}
 	}
-	return fmt.Errorf("executor: key file %s could not be created exclusively", path)
+	return "", fmt.Errorf("executor: key file %s could not be created exclusively", path)
 }

@@ -148,7 +148,18 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 		return
 	}
 	digest := hex.EncodeToString(h.Sum(nil))
-	// Contract size limit.
+	// Payload size limit: the stream is bounded at effectiveLimit+1, so any
+	// body that reached the bound (global OR contract) is rejected
+	// unconditionally — an absent/greater contract must not let a
+	// chunked-encoding body sneak one byte past the global ceiling.
+	if n > effectiveLimit {
+		_ = os.Remove(tmp)
+		s.auditLocked("artifact.contract_violation", runnerID, j.RunID, j.ID, "artifact exceeds the effective size limit", map[string]string{"name": name, "size": strconv.FormatInt(n, 10), "max": strconv.FormatInt(effectiveLimit, 10)})
+		http.Error(w, "artifact exceeds the declared maximum size", http.StatusRequestEntityTooLarge)
+		return
+	}
+	// Contract size limit (legacy path retained for contracts smaller than
+	// the global ceiling; effectiveLimit already covers it).
 	if contract.MaxSize > 0 && n > contract.MaxSize {
 		_ = os.Remove(tmp)
 		s.auditLocked("artifact.contract_violation", runnerID, j.RunID, j.ID, "artifact exceeds declared max size", map[string]string{"name": name, "size": strconv.FormatInt(n, 10), "max": strconv.FormatInt(contract.MaxSize, 10)})

@@ -135,10 +135,28 @@ func (s *Server) enqueueDownstreamIntent(ctx context.Context, j model.Job, run m
 		Payload:   raw,
 		CreatedAt: time.Now().UTC(),
 	}
+	if s.DB != nil {
+		if store, ok := s.DB.(storage.OutboxStore); ok {
+			// Durability first: a memory-only intent dies with the process
+			// while the link survives, permanently suppressing the launch.
+			has, herr := store.OutboxHas(ctx, item.ID)
+			if herr != nil {
+				return fmt.Errorf("downstream: durable intent check failed: %w", herr)
+			}
+			if !has {
+				if aerr := store.OutboxAppend(ctx, storage.OutboxItem{ID: item.ID, Kind: item.Kind, Payload: item.Payload, CreatedAt: item.CreatedAt}); aerr != nil {
+					return fmt.Errorf("downstream: durable intent append failed: %w", aerr)
+				}
+			}
+			// Keep the in-process queue in sync (idempotent by ID).
+			_ = s.outbox.Enqueue(item)
+			return nil
+		}
+	}
 	if err := s.outbox.Enqueue(item); err != nil {
 		if s.outbox.HasIntent(item.ID) {
-			// Already recorded (a crash between link commit and ACK, or a
-			// concurrent replay): the intent exists, the link is satisfied.
+			// Already queued in this process (concurrent replay): the
+			// deterministic ID means the durable copy is the same intent.
 			return nil
 		}
 		return fmt.Errorf("downstream: outbox enqueue failed: %w", err)

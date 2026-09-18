@@ -167,6 +167,12 @@ type Server struct {
 	// checkRuns persists logical-check → forge check-run IDs so retried
 	// publications update instead of duplicating (see checkruns.go).
 	checkRuns *checkRunIDs
+	// checkRunLocks serializes publication per logical check within this
+	// process (the DB mapping row is the cross-replica arbiter).
+	checkRunLocks struct {
+		mu sync.Mutex
+		m  map[string]*sync.Mutex
+	}
 
 	// digestFence serializes CAS publication against garbage collection for
 	// memory/fs deployments; DB mode prefers the store-backed fence so the
@@ -476,6 +482,9 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 	s.ClusterKeys = cluster
 	s.store = storage.New(dataDir)
 	s.outbox = NewOutbox(s.store)
+	// Restore the logical-check → remote check-run ID mapping so a restart
+	// UPDATES existing checks instead of creating duplicates.
+	s.checkRuns = &checkRunIDs{m: loadCheckRunIDs(dataDir)}
 	if cluster != nil {
 		if signer, err := s.loadOIDCSignerCluster(cluster); err != nil {
 			return nil, err
@@ -713,6 +722,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/jobs/{id}/approve", s.approveJob)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/heartbeat", s.heartbeat)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/log", s.log)
+	mux.HandleFunc("POST /api/v1/jobs/{id}/log/batch", s.logBatch)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/complete", s.complete)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/generated", s.generateJobs)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/snapshots", s.uploadSnapshot)
@@ -2563,6 +2573,82 @@ func (s *Server) heartbeatDB(w http.ResponseWriter, r *http.Request, jobID strin
 	writeJSON(w, http.StatusOK, HeartbeatResponse{Cancel: cancelled, LeaseExpiresAt: exp})
 }
 
+// logBatch accepts up to maxLogBatchLines lines in ONE request (bounded at
+// maxLogBatchBytes) for the same lease. This is the transport the runner's
+// async sender uses: per-line requests cannot keep up with a chatty build,
+// and the spool then overflows. Validation mirrors the single-line handler
+// per line; the whole request fails closed on the first invalid line.
+func (s *Server) logBatch(w http.ResponseWriter, r *http.Request) {
+	const maxLogBatchBytes = 1 << 20
+	const maxLogBatchLines = 2000
+	jobID := r.PathValue("id")
+	var in struct {
+		RunnerID        string    `json:"runner_id"`
+		LeaseToken      string    `json:"lease_token"`
+		LeaseGeneration int64     `json:"lease_generation"`
+		Lines           []LogLine `json:"lines"`
+	}
+	if !decodeLimit(w, r, &in, maxLogBatchBytes) {
+		return
+	}
+	if len(in.Lines) == 0 || len(in.Lines) > maxLogBatchLines {
+		http.Error(w, "log batch size out of range", http.StatusBadRequest)
+		return
+	}
+	for _, l := range in.Lines {
+		if len(l.Step) > 128 || len(l.Line) > 1<<20 || len(l.JobKey) > 512 {
+			http.Error(w, "log line exceeds size limits", http.StatusBadRequest)
+			return
+		}
+	}
+	j, authErr := s.authorizeRunnerLease(r, in.RunnerID, in.LeaseToken, in.LeaseGeneration)
+	if authErr != nil {
+		s.writeLeaseAuthError(w, r, authErr)
+		return
+	}
+	now := time.Now().UTC()
+	if s.DB != nil {
+		// DB mode: append each line through the identity-sequenced path so
+		// cursors stay monotonic; the batch is bounded, so the per-line cost
+		// is bounded too.
+		for _, l := range in.Lines {
+			if !s.logDBWrite(r.Context(), j, l, now) {
+				http.Error(w, "log append failed", 500)
+				return
+			}
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	s.mu.Lock()
+	cur, ok := s.jobs[jobID]
+	if !ok {
+		s.mu.Unlock()
+		http.NotFound(w, r)
+		return
+	}
+	if !s.validActiveLease(cur, in.RunnerID, in.LeaseToken, in.LeaseGeneration, now) {
+		s.mu.Unlock()
+		http.Error(w, "stale or invalid lease", http.StatusConflict)
+		return
+	}
+	entries := make([]model.LogEntry, 0, len(in.Lines))
+	for _, l := range in.Lines {
+		s.logSeq++
+		entries = append(entries, model.LogEntry{Seq: s.logSeq, RunID: cur.RunID, JobID: cur.ID, JobKey: cur.Key, Step: l.Step, Line: l.Line, CreatedAt: time.Now().UTC()})
+	}
+	s.mu.Unlock()
+	if s.store != nil {
+		for _, e := range entries {
+			if err := s.store.AppendLog(e); err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) log(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("id")
 	var in LogLine
@@ -2616,13 +2702,18 @@ func (s *Server) log(w http.ResponseWriter, r *http.Request) {
 // seq), so appends stay strictly increasing regardless of clock ordering
 // across replicas.
 func (s *Server) logDB(w http.ResponseWriter, r *http.Request, jobID string, in LogLine, j model.Job, now time.Time) {
-	ctx := r.Context()
-	e := model.LogEntry{RunID: j.RunID, JobID: j.ID, JobKey: j.Key, Step: in.Step, Line: in.Line, CreatedAt: now}
-	if err := s.DB.AppendLog(ctx, e); err != nil {
-		http.Error(w, err.Error(), 500)
+	if !s.logDBWrite(r.Context(), j, in, now) {
+		http.Error(w, "log append failed", 500)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// logDBWrite appends one line through the identity-sequenced DB path. The
+// job row is authoritative for run/job coordinates.
+func (s *Server) logDBWrite(ctx context.Context, j model.Job, in LogLine, now time.Time) bool {
+	e := model.LogEntry{RunID: j.RunID, JobID: j.ID, JobKey: j.Key, Step: in.Step, Line: in.Line, CreatedAt: now}
+	return s.DB.AppendLog(ctx, e) == nil
 }
 
 func (s *Server) complete(w http.ResponseWriter, r *http.Request) {

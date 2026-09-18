@@ -74,15 +74,23 @@ func TestFlowDownstreamRecordIntentsStoreErrors(t *testing.T) {
 	job2 := job
 	job2.ID = "job-b"
 	s.DB = &fcStore{dbFakeStore: f}
+	if err := s.recordDownstreamIntents(context.Background(), job2, run); err == nil {
+		// Durability-first: a failed durable append is a hard error so the
+		// completion effect keeps retrying. The link (committed before the
+		// intent) survives, and the replay reuses its stored token with the
+		// same deterministic intent ID, so nothing is lost or duplicated.
+		t.Fatal("durable append failure must propagate (the recovery replay repairs it)")
+	}
+	// Repair path: with the store healthy again the same recording converges
+	// on exactly one durable intent using the stored link's token.
+	f.mu.Lock()
+	f.outboxAppendErr = nil
+	f.mu.Unlock()
 	if err := s.recordDownstreamIntents(context.Background(), job2, run); err != nil {
-		// The durable append failed but the intent stays queued in memory
-		// (localOnly) and will still dispatch: that is the outbox's stated
-		// contract, so recording is NOT an error as long as the intent is
-		// queued. Assert precisely that.
-		t.Fatalf("record with durable-append failure must keep the intent queued, got %v", err)
+		t.Fatalf("repair replay: %v", err)
 	}
 	if !s.outbox.HasIntent(downstreamStableKey("job-b", "o/target", "refs/heads/main")) {
-		t.Fatal("intent missing after durable-append failure")
+		t.Fatal("intent missing after the repair replay")
 	}
 	f.mu.Lock()
 	f.outboxAppendErr = nil

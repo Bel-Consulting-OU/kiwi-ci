@@ -499,13 +499,28 @@ func (s *Server) dispatchOutbox(ctx context.Context, item forge.OutboxItem) erro
 		publisher := s.gitHubForge()
 		if idp, ok := interface{}(publisher).(forge.CheckRunPublisher); ok && p.RunID != "" {
 			key := s.checkRunKey(p.RunID, p.Name)
-			existing := s.getCheckRunID(ctx, key)
+			// One publication at a time per logical check: two dispatchers
+			// seeing "no mapping" would otherwise both POST before either
+			// mapping is installed.
+			unlock := s.lockCheckRunKey(key)
+			defer unlock()
+			existing, err := s.getCheckRunID(ctx, key)
+			if err != nil {
+				// Fail the dispatch (no ACK): retrying with a read error must
+				// not POST a duplicate.
+				return err
+			}
 			id, err := idp.PublishCheckRun(ctx, p.RepoFullName, p.SHA, p.Name, p.Status, p.Conclusion, p.DetailsURL, p.Summary, p.Annotations, existing)
 			if err != nil {
 				return err
 			}
 			if id != "" && id != existing {
-				s.putCheckRunID(ctx, key, id)
+				// Durably record BEFORE the intent can be ACKed; a failure
+				// here fails the dispatch so the retry reconciles instead of
+				// losing the remote ID.
+				if err := s.putCheckRunID(ctx, key, id); err != nil {
+					return err
+				}
 			}
 			return nil
 		}

@@ -526,6 +526,7 @@ func TestGCFakeBinaries(t *testing.T) {
 }
 
 func TestTartBackendPureStartErrors(t *testing.T) {
+	testutil.UnixShell(t)
 	ctx := context.Background()
 	ws := t.TempDir()
 	// Missing VM.
@@ -564,6 +565,7 @@ func TestTartBackendPureStartErrors(t *testing.T) {
 }
 
 func TestTartBackendStartJobViaFakes(t *testing.T) {
+	testutil.UnixShell(t)
 	installFakeBins(t)
 	ws := t.TempDir()
 	// A local kiwi-agent on the fixed bootstrap port accepts the key.

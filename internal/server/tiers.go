@@ -60,6 +60,9 @@ func runnerPath(method, path string) bool {
 		if len(segs) == 5 && segs[4] == "test-shards" && method == http.MethodGet {
 			return true
 		}
+		if len(segs) == 6 && segs[4] == "log" && segs[5] == "batch" && method == http.MethodPost {
+			return true
+		}
 		if len(segs) == 6 && segs[4] == "artifacts" && method == http.MethodPut {
 			return true
 		}

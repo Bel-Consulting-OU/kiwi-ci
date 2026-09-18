@@ -30,6 +30,17 @@ import (
 type PostgresStore struct {
 	pool *pgxpool.Pool
 
+	// fencePool is a SEPARATE connection pool used exclusively for
+	// advisory locks (CAS digest fences and the collector lease). Holding a
+	// lock on the operational pool would deadlock fenced operations that
+	// then need the same pool for their own reads/writes: at
+	// max_connections=1 the writer would hold its lock connection and block
+	// forever committing its reference, and the collector needs a lock
+	// connection plus a references connection plus its fence connection.
+	// Sized independently and small; created from the same DSN.
+	fencePoolOnce sync.Once
+	fencePool     *pgxpool.Pool
+
 	leaderMu        sync.Mutex
 	leaderConn      *pgx.Conn
 	leaderKey       string
@@ -110,12 +121,55 @@ func NewPostgresOpt(ctx context.Context, dsn string, opts ...PostgresOption) (*P
 	return &PostgresStore{pool: pool}, nil
 }
 
-// NewPostgresFromPool adopts an existing pool (tests, wiring).
+// NewPostgresFromPool adopts an existing pool (tests, wiring). The fence
+// pool is derived from the pool's DSN on first use.
 func NewPostgresFromPool(pool *pgxpool.Pool) *PostgresStore {
 	return &PostgresStore{pool: pool}
 }
 
+// advisoryPool returns the dedicated advisory-lock pool, creating it from
+// the operational pool's DSN on first use. A dedicated pool can never be
+// exhausted by ordinary operations.
+func (s *PostgresStore) advisoryPool() (*pgxpool.Pool, error) {
+	var perr error
+	s.fencePoolOnce.Do(func() {
+		dsn := ""
+		if s.pool != nil && s.pool.Config() != nil {
+			dsn = s.pool.Config().ConnString()
+		}
+		if dsn == "" {
+			perr = fmt.Errorf("storage: cannot derive a DSN for the advisory-lock pool")
+			return
+		}
+		cfg, err := pgxpool.ParseConfig(dsn)
+		if err != nil {
+			perr = fmt.Errorf("storage: parse dsn for advisory pool: %w", err)
+			return
+		}
+		// Advisory locks are held for the duration of a fenced operation, so
+		// the pool only needs a handful of connections regardless of the
+		// operational pool size.
+		if cfg.MaxConns < 4 {
+			cfg.MaxConns = 4
+		}
+		pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+		if err != nil {
+			perr = fmt.Errorf("storage: open advisory pool: %w", err)
+			return
+		}
+		s.fencePool = pool
+	})
+	if perr != nil {
+		return nil, perr
+	}
+	return s.fencePool, nil
+}
+
 func (s *PostgresStore) Close() error {
+	if s.fencePool != nil {
+		s.fencePool.Close()
+		s.fencePool = nil
+	}
 	s.leaderMu.Lock()
 	if s.leaderConn != nil {
 		_ = s.leaderConn.Close(context.Background())
@@ -2651,6 +2705,21 @@ func (s *PostgresStore) OutboxAck(ctx context.Context, id string) error {
 	// but crash-stranded row can only be reclaimed for OutboxClaimTTL.
 	_, err := s.pool.Exec(ctx, `DELETE FROM outbox WHERE id=$1`, id)
 	return err
+}
+
+func (s *PostgresStore) OutboxHas(ctx context.Context, id string) (bool, error) {
+	if id == "" {
+		return false, fmt.Errorf("storage: empty outbox id")
+	}
+	var one int
+	err := s.pool.QueryRow(ctx, `SELECT 1 FROM outbox WHERE id=$1`, id).Scan(&one)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *PostgresStore) OutboxPending(ctx context.Context) ([]OutboxItem, error) {

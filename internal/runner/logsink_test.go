@@ -37,12 +37,12 @@ func TestAsyncLogSinkNeverBlocksProducerAndFlushesAll(t *testing.T) {
 	if remaining := sink.Flush(30 * time.Second); remaining != 0 {
 		t.Fatalf("flush left %d unsent lines", remaining)
 	}
-	sink.Close(time.Second)
+	sink.Finish(time.Second)
 	if delivered.Load() != total {
 		t.Fatalf("delivered = %d, want %d", delivered.Load(), total)
 	}
-	if sink.Dropped() != 0 {
-		t.Fatalf("dropped = %d, want 0", sink.Dropped())
+	if sink.dropped.Load() != 0 {
+		t.Fatalf("dropped = %d, want 0", sink.dropped.Load())
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -71,11 +71,11 @@ func TestAsyncLogSinkOverflowIsCounted(t *testing.T) {
 		sink.WriteLine("job", "step", fmt.Sprintf("line-%d", i))
 	}
 	// The producer must not have blocked; overflow is counted, not queued.
-	if got := sink.Dropped(); got == 0 {
+	if got := sink.dropped.Load(); got == 0 {
 		t.Fatal("overflow was not counted")
 	}
 	close(release)
-	sink.Close(2 * time.Second)
+	sink.Finish(2 * time.Second)
 }
 
 // TestAsyncLogSinkSendErrorReported proves a background delivery failure is
@@ -83,11 +83,71 @@ func TestAsyncLogSinkOverflowIsCounted(t *testing.T) {
 func TestAsyncLogSinkSendErrorReported(t *testing.T) {
 	sink := newAsyncLogSink(nil, func([]logLine) error { return fmt.Errorf("control plane down") })
 	sink.WriteLine("job", "step", "x")
-	if remaining := sink.Flush(2 * time.Second); remaining != 0 {
-		t.Fatalf("remaining = %d", remaining)
-	}
-	sink.Close(time.Second)
-	if sink.SendError() == nil {
+	out := sink.Finish(2 * time.Second)
+	if out.Err == nil {
 		t.Fatal("send error not reported")
+	}
+	if out.Remaining != 0 {
+		t.Fatalf("remaining = %d, want 0", out.Remaining)
+	}
+	if !out.Stopped {
+		t.Fatal("sender did not stop within the deadline")
+	}
+}
+
+// TestAsyncLogSinkByteBudgetBoundsMemory proves the spool is bounded in
+// BYTES, not just line count: with a tiny byte budget a handful of large
+// lines must overflow and be counted instead of retaining ~100 GiB.
+func TestAsyncLogSinkByteBudgetBoundsMemory(t *testing.T) {
+	oldBytes, oldLines := asyncSpoolBytes, asyncSpoolLimit
+	asyncSpoolBytes, asyncSpoolLimit = 4<<10, 1_000_000
+	t.Cleanup(func() { asyncSpoolBytes, asyncSpoolLimit = oldBytes, oldLines })
+
+	release := make(chan struct{})
+	sink := newAsyncLogSink(nil, func([]logLine) error {
+		<-release
+		return nil
+	})
+	big := string(make([]byte, 1024)) // 1 KiB line
+	for i := 0; i < 50; i++ {
+		sink.WriteLine("job", "step", big)
+	}
+	if got := sink.dropped.Load(); got == 0 {
+		t.Fatal("byte budget did not bound the spool")
+	}
+	close(release)
+	out := sink.Finish(3 * time.Second)
+	if out.Err != nil {
+		t.Fatalf("unexpected sender error: %v", out.Err)
+	}
+}
+
+// TestAsyncLogSinkInFlightCountsTowardFlush proves Flush does not report
+// success while the final batch is still in flight and failing.
+func TestAsyncLogSinkInFlightCountsTowardFlush(t *testing.T) {
+	proceed := make(chan struct{})
+	var calls atomic.Int64
+	sink := newAsyncLogSink(nil, func([]logLine) error {
+		calls.Add(1)
+		<-proceed // hold the batch in flight
+		return fmt.Errorf("delivery down")
+	})
+	sink.WriteLine("job", "step", "line-1")
+	// Wait until the sender has taken the batch (in flight).
+	deadline := time.Now().Add(2 * time.Second)
+	for calls.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if calls.Load() == 0 {
+		t.Fatal("sender never picked up the batch")
+	}
+	// Flush with a short deadline must NOT claim success while in flight.
+	if pending := sink.Flush(20 * time.Millisecond); pending == 0 {
+		t.Fatal("flush reported success while a batch was still in flight")
+	}
+	close(proceed)
+	out := sink.Finish(3 * time.Second)
+	if out.Err == nil {
+		t.Fatal("in-flight failure was not surfaced after the sender stopped")
 	}
 }

@@ -990,6 +990,17 @@ func (f *dbFakeStore) OutboxAck(ctx context.Context, id string) error {
 	return nil
 }
 
+func (f *dbFakeStore) OutboxHas(ctx context.Context, id string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, it := range f.outboxItems {
+		if it.ID == id {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (f *dbFakeStore) OutboxPending(ctx context.Context) ([]storage.OutboxItem, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

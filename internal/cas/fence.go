@@ -26,62 +26,81 @@ type Fencer interface {
 // MemFencer is the in-process Fencer used by memory/fs deployments and by
 // tests. DB-backed deployments use a Postgres advisory-lock fencer so the
 // fence spans replicas.
+//
+// Entries are REFERENCE COUNTED: an entry is created on first use and
+// removed only when no holder and no waiter remains. The table is never
+// wholesale-reset — clearing it while a digest's mutex is held (or has
+// waiters) would let a new operation for the same digest create a second
+// mutex and enter concurrently, reopening the writer-versus-collector race
+// the fence exists to eliminate. A long-running installation reaching any
+// number of unique digests therefore cannot break mutual exclusion.
 type MemFencer struct {
 	mu   sync.Mutex
-	keys map[string]*sync.Mutex
+	keys map[string]*fenceEntry
+	// maxKeys retains zero-refcount entries up to this many keys before
+	// evicting idle ones (never held/waiting ones); tests shrink it.
+	maxKeys int
+}
+
+type fenceEntry struct {
+	mu      sync.Mutex
+	refs    int // holders + waiters registered against this entry
+	removed bool
 }
 
 func NewMemFencer() *MemFencer {
-	return &MemFencer{keys: map[string]*sync.Mutex{}}
+	return &MemFencer{keys: map[string]*fenceEntry{}, maxKeys: 4096}
 }
 
-func (f *MemFencer) Acquire(ctx context.Context, digest string) (func(), error) {
-	f.mu.Lock()
-	m, ok := f.keys[digest]
-	if !ok {
-		m = &sync.Mutex{}
-		f.keys[digest] = m
-	}
-	f.mu.Unlock()
+// acquire locks the entry for digest and returns an idempotent release.
+func (f *MemFencer) acquire(ctx context.Context, digest string) (*fenceEntry, func(), error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	m.Lock()
+	f.mu.Lock()
+	e, ok := f.keys[digest]
+	if !ok {
+		e = &fenceEntry{}
+		f.keys[digest] = e
+	}
+	e.refs++
+	f.mu.Unlock()
+
+	e.mu.Lock()
+
 	var once sync.Once
-	return func() {
+	release := func() {
 		once.Do(func() {
-			m.Unlock()
+			e.mu.Unlock()
 			f.mu.Lock()
-			if len(f.keys) > 4096 {
-				f.keys = map[string]*sync.Mutex{}
+			e.refs--
+			if e.refs == 0 && len(f.keys) > f.maxKeys {
+				// Evict only genuinely idle entries, and only entries whose
+				// mutex is not held: refs == 0 means no holder and no
+				// waiter can be waiting on this entry, so deleting it
+				// cannot race a future acquirer (which would take f.mu and
+				// create a fresh entry while this one is unreferenced).
+				if !e.removed {
+					e.removed = true
+					delete(f.keys, digest)
+				}
 			}
 			f.mu.Unlock()
 		})
-	}, nil
+	}
+	return e, release, nil
+}
+
+func (f *MemFencer) Acquire(ctx context.Context, digest string) (func(), error) {
+	_, release, err := f.acquire(ctx, digest)
+	return release, err
 }
 
 func (f *MemFencer) WithFence(ctx context.Context, digest string, fn func() error) error {
-	f.mu.Lock()
-	m, ok := f.keys[digest]
-	if !ok {
-		m = &sync.Mutex{}
-		f.keys[digest] = m
-	}
-	f.mu.Unlock()
-
-	m.Lock()
-	defer func() {
-		m.Unlock()
-		// Drop the entry once nobody else can hold it, so the map does not
-		// grow without bound across a long-lived process.
-		f.mu.Lock()
-		if len(f.keys) > 4096 {
-			f.keys = map[string]*sync.Mutex{}
-		}
-		f.mu.Unlock()
-	}()
-	if err := ctx.Err(); err != nil {
+	_, release, err := f.acquire(ctx, digest)
+	if err != nil {
 		return err
 	}
+	defer release()
 	return fn()
 }

@@ -29,26 +29,15 @@ var _ DigestFenceStore = (*PostgresStore)(nil)
 // lock when the transaction commits or rolls back. fn errors are returned
 // as-is (the lock is still released).
 func (s *PostgresStore) WithDigestFence(ctx context.Context, digest string, fn func() error) error {
-	if !digestFenceRE.MatchString(digest) {
-		return fmt.Errorf("storage: digest fence requires a lowercase-hex sha256 digest")
-	}
 	if fn == nil {
 		return fmt.Errorf("storage: digest fence requires a function")
 	}
-	tx, err := s.pool.Begin(ctx)
+	release, err := s.AcquireDigestFence(ctx, digest)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = tx.Rollback(context.Background()) }()
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, advisoryLockKey("kiwi-cas-digest", digest)); err != nil {
-		return err
-	}
-	if err := fn(); err != nil {
-		return err
-	}
-	// Commit to release the transaction-scoped lock deterministically before
-	// the deferred rollback would.
-	return tx.Commit(ctx)
+	defer release()
+	return fn()
 }
 
 // AcquireDigestFence opens a transaction, takes the digest's advisory lock,
@@ -60,16 +49,32 @@ func (s *PostgresStore) AcquireDigestFence(ctx context.Context, digest string) (
 	if !digestFenceRE.MatchString(digest) {
 		return nil, fmt.Errorf("storage: digest fence requires a lowercase-hex sha256 digest")
 	}
-	tx, err := s.pool.Begin(ctx)
+	// The lock lives on the DEDICATED advisory pool: the fenced operation
+	// itself performs ordinary reads/writes through the operational pool,
+	// and holding the lock on that pool would deadlock as soon as it is
+	// exhausted (max_connections=1 stalls immediately).
+	pool, err := s.advisoryPool()
 	if err != nil {
 		return nil, err
 	}
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, advisoryLockKey("kiwi-cas-digest", digest)); err != nil {
-		_ = tx.Rollback(context.Background())
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	key := advisoryLockKey("kiwi-cas-digest", digest)
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, key); err != nil {
+		conn.Release()
 		return nil, err
 	}
 	var once sync.Once
 	return func() {
-		once.Do(func() { _ = tx.Commit(context.Background()) })
+		once.Do(func() {
+			// Unlock on the same session, then return the connection; a
+			// failed unlock drops the session (and with it the lock).
+			if _, err := conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, key); err != nil {
+				_ = conn.Conn().Close(context.Background())
+			}
+			conn.Release()
+		})
 	}, nil
 }

@@ -74,6 +74,15 @@ func (f *fakeRunnerServer) handler() http.Handler {
 			_ = json.NewDecoder(r.Body).Decode(&c)
 			f.complete = append(f.complete, c)
 		}
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/log/batch") {
+			var b struct {
+				Lines []server.LogLine `json:"lines"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&b)
+			for _, l := range b.Lines {
+				f.logLines = append(f.logLines, l.Step+": "+l.Line)
+			}
+		}
 		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/log") {
 			var l server.LogLine
 			_ = json.NewDecoder(r.Body).Decode(&l)

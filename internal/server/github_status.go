@@ -22,6 +22,54 @@ import (
 // finished job. It only queues intents and returns immediately, so it is
 // safe to call while holding the server lock. Dispatch happens in
 // Maintain's flushOutbox tick and is best-effort by design.
+// publishForgeStatus is the forge-NEUTRAL completion publication: it fans
+// out per-job and pipeline check intents whose kind is chosen from the run's
+// persisted forge identity, so GitLab and Forgejo runs publish through their
+// own adapters instead of being silently dropped (and never routed to
+// GitHub). A run without a forge identity publishes nowhere.
+func (s *Server) publishForgeStatus(run model.Run) {
+	if run.ForgeKind != "github" && run.ForgeKind != "gitlab" && run.ForgeKind != "forgejo" {
+		return
+	}
+	if run.ForgeKind == "github" {
+		s.publishGitHubStatus(run)
+		return
+	}
+	// Non-GitHub forges: check intents only (no GitHub commit-status legacy
+	// API), enqueued with their forge-specific kind.
+	if run.RepoFullName == "" || run.SHA == "" {
+		return
+	}
+	status, conclusion := checkStateForRun(run.Status)
+	summary := "pipeline " + string(run.Status)
+	items := []forge.OutboxItem{s.checkIntent(run, "Pipeline", status, conclusion, summary, nil)}
+	s.mu.Lock()
+	for _, j := range s.jobs {
+		if j.RunID != run.ID || !j.Status.Terminal() {
+			continue
+		}
+		jstatus, jconclusion := checkStateForRun(j.Status)
+		jsummary := "job " + j.Key + " " + string(j.Status)
+		if j.Error != "" {
+			jsummary += ": " + j.Error
+		}
+		items = append(items, s.checkIntent(run, j.Key, jstatus, jconclusion, jsummary, nil))
+	}
+	s.mu.Unlock()
+	for _, it := range items {
+		if it.Kind == "" {
+			continue
+		}
+		if err := s.outbox.Enqueue(it); err != nil {
+			// Durable append failures keep the in-process queue in sync and
+			// are retried by the flush claim loop.
+			log.Printf("outbox: enqueue %s: %v", it.Kind, err)
+		}
+	}
+}
+
+// publishGitHubStatus is the GitHub-only publication path (kept for callers
+// that explicitly target GitHub). Non-GitHub runs return immediately.
 func (s *Server) publishGitHubStatus(run model.Run) {
 	_, span := s.startSpan(context.Background(), "forge.status.publish")
 	defer span.End()
