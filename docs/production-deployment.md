@@ -151,3 +151,21 @@ session cookies and CSRF protection.
   enqueue, lease, and completion spans.
 - Deployment and snapshot records persist durably (PostgreSQL or
   data-dir state file); scheduling semantics are enforced either way.
+
+
+## CI (Woodpecker) server requirements
+
+Kiwi's CI runs entirely on Woodpecker (`.woodpecker/` multi-workflow layout).
+The Woodpecker instance hosting it must be configured so CI reflects reality:
+
+- `WOODPECKER_FORCE_IGNORE_SERVICE_FAILURE=false` — otherwise a dead
+  PostgreSQL service is ignored and the `integration-coverage` workflow
+  passes without exercising the real database.
+- Stable, event-independent commit-status contexts, so branch protection can
+  require names like `ci/woodpecker/linux-amd64` instead of event-scoped
+  variants.
+- Agents labelled `platform=linux-amd64`, `platform=linux-arm64`,
+  `capability=docker`, `platform=windows-amd64` and `platform=darwin-arm64`
+  matching the workflow label sets; the Docker lane is REQUIRED and fails
+  (never skips) when its daemon is unavailable.
+- The clone plugin and every workflow image are pinned by OCI digest.

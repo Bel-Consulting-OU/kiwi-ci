@@ -1,0 +1,30 @@
+# REQUIRED Docker lane: the rootless/hardened workspace invariant had a
+# production bug, so a missing/unusable Docker daemon is a FAILURE here, not
+# a skip. This workflow selects a Docker-capable agent by label; agents
+# without the label never run it. The best-effort smoke variant lives in
+# linux-amd64.yml and skips cleanly when no daemon exists.
+labels:
+  platform: linux-amd64
+  capability: docker
+
+when:
+  - event: [push, pull_request, manual, tag]
+
+steps:
+  docker-workspace:
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    environment:
+      GOTOOLCHAIN: local
+      KIWI_TEST_DOCKER: "1"
+    commands:
+      - |
+        if ! command -v docker >/dev/null 2>&1; then
+          echo "required docker lane: docker CLI is not installed on this labeled agent" >&2
+          exit 1
+        fi
+        if ! docker info >/dev/null 2>&1; then
+          echo "required docker lane: no usable docker daemon (socket missing or permission denied)" >&2
+          docker info >&2 || true
+          exit 1
+        fi
+        go test -count=1 -v -timeout=20m -run RootlessHardenedContainerWorkspace ./internal/runner

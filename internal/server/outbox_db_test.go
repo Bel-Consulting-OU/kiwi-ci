@@ -62,8 +62,18 @@ func TestOutboxDBRoundTrip(t *testing.T) {
 	if err == nil {
 		t.Fatal("flush must propagate dispatch errors")
 	}
-	if got := len(s.outbox.Pending()); got != 1 {
-		t.Fatalf("pending after failed dispatch = %d, want 1", got)
+	// Durable-first retry contract: the local queue is a wake-up cache; the
+	// FAILED intent stays as a durable row (with attempts/backoff recorded)
+	// and is re-claimed when next_attempt_at is due. The error is returned
+	// AFTER the batch so unrelated rows still processed.
+	if got := len(s.outbox.Pending()); got != 0 {
+		t.Fatalf("local pending after failed dispatch = %d, want 0 (durable row owns the retry)", got)
+	}
+	f.mu.Lock()
+	remaining = len(f.outboxItems)
+	f.mu.Unlock()
+	if remaining != 1 {
+		t.Fatalf("durable rows after failed dispatch = %d, want 1", remaining)
 	}
 }
 

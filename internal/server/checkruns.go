@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,6 +18,11 @@ import (
 type checkRunIDs struct {
 	m map[string]string
 }
+
+// checkRunPersistMu serializes mutation + snapshot + write + rollback of the
+// whole-map mirror file: two different keys snapshotting independently and
+// writing in reverse order could otherwise erase the newer key.
+var checkRunPersistMu sync.Mutex
 
 func (s *Server) checkRunKey(runID, name string) string { return runID + "|" + name }
 
@@ -57,6 +63,8 @@ func (s *Server) putCheckRunID(ctx context.Context, key, id string) error {
 			return store.PutCheckRun(ctx, key, id)
 		}
 	}
+	checkRunPersistMu.Lock()
+	defer checkRunPersistMu.Unlock()
 	s.mu.Lock()
 	if s.checkRuns == nil {
 		s.checkRuns = &checkRunIDs{m: map[string]string{}}
@@ -103,39 +111,38 @@ func (s *Server) putCheckRunID(ctx context.Context, key, id string) error {
 }
 
 // lockCheckRunKey serializes publication for one logical check (run+name)
-// across dispatchers in this process; the DB mapping row is the cross-replica
-// arbiter, and the deterministic mapping key makes a rare cross-replica
-// double-create converge on the last write (with a reconciling GET on the
-// retry path).
-func (s *Server) lockCheckRunKey(key string) func() {
-	s.checkRunLocks.mu.Lock()
-	if s.checkRunLocks.m == nil {
-		s.checkRunLocks.m = map[string]*sync.Mutex{}
+// ACROSS REPLICAS: in DB mode the dedicated advisory-lock pool holds a
+// namespace/key fence (kiwi-check-run/<mappingKey>) so two replicas cannot
+// both read "no mapping" and POST duplicate checks. Memory/fs mode uses a
+// refcounted in-process fencer (cancellable, bounded). The returned release
+// is idempotent.
+func (s *Server) lockCheckRunKey(ctx context.Context, key string) (func(), error) {
+	if s.DB != nil {
+		if fencer, ok := s.DB.(storage.DigestFenceStore); ok {
+			return fencer.AcquireNamedFence(ctx, "check-run", key)
+		}
 	}
-	mu, ok := s.checkRunLocks.m[key]
-	if !ok {
-		mu = &sync.Mutex{}
-		s.checkRunLocks.m[key] = mu
-	}
-	s.checkRunLocks.mu.Unlock()
-	mu.Lock()
-	return mu.Unlock
+	return s.checkRunFence.Acquire(ctx, key)
 }
 
-// loadCheckRunIDs restores the fs-mode mirror at startup; without it a
-// restart forgets every remote ID and re-creates checks instead of PATCHing
-// them.
-func loadCheckRunIDs(dataDir string) map[string]string {
+// loadCheckRunIDs restores the fs-mode mirror at startup. Only a MISSING
+// file means "empty": a corrupt or unreadable mirror FAILS startup, because
+// silently resetting check identity would re-create every check instead of
+// PATCHing it.
+func loadCheckRunIDs(dataDir string) (map[string]string, error) {
 	if dataDir == "" {
-		return map[string]string{}
+		return map[string]string{}, nil
 	}
 	b, err := os.ReadFile(filepath.Join(dataDir, "check-runs.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return map[string]string{}, nil
+	}
 	if err != nil {
-		return map[string]string{}
+		return nil, fmt.Errorf("check-run mirror unreadable: %w", err)
 	}
 	var m map[string]string
 	if err := json.Unmarshal(b, &m); err != nil {
-		return map[string]string{}
+		return nil, fmt.Errorf("check-run mirror corrupt: %w", err)
 	}
-	return m
+	return m, nil
 }

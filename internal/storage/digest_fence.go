@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strings"
 	"sync"
 )
 
@@ -19,6 +20,10 @@ type DigestFenceStore interface {
 	WithDigestFence(ctx context.Context, digest string, fn func() error) error
 	// AcquireDigestFence takes the lock and returns an idempotent release.
 	AcquireDigestFence(ctx context.Context, digest string) (release func(), err error)
+	// AcquireNamedFence is the general form for other distributed
+	// uniqueness scopes (e.g. per-logical-check GitHub publication):
+	// namespace + key, same dedicated advisory pool.
+	AcquireNamedFence(ctx context.Context, namespace, key string) (release func(), err error)
 }
 
 var digestFenceRE = regexp.MustCompile(`^[a-f0-9]{64}$`)
@@ -38,6 +43,40 @@ func (s *PostgresStore) WithDigestFence(ctx context.Context, digest string, fn f
 	}
 	defer release()
 	return fn()
+}
+
+// AcquireNamedFence takes a session advisory lock for an arbitrary
+// namespace/key pair on the dedicated lock pool (never the operational
+// pool). The release is idempotent and drops the session if the unlock
+// fails, so a crashed holder can never wedge the fence.
+func (s *PostgresStore) AcquireNamedFence(ctx context.Context, namespace, key string) (func(), error) {
+	namespace = strings.TrimSpace(namespace)
+	key = strings.TrimSpace(key)
+	if namespace == "" || key == "" || len(namespace)+len(key) > 512 {
+		return nil, fmt.Errorf("storage: named fence requires a namespace and key")
+	}
+	pool, err := s.advisoryPool()
+	if err != nil {
+		return nil, err
+	}
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	lockKey := advisoryLockKey("kiwi-fence-"+namespace, key)
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, lockKey); err != nil {
+		conn.Release()
+		return nil, err
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if _, err := conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, lockKey); err != nil {
+				_ = conn.Conn().Close(context.Background())
+			}
+			conn.Release()
+		})
+	}, nil
 }
 
 // AcquireDigestFence opens a transaction, takes the digest's advisory lock,

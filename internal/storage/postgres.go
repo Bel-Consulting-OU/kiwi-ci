@@ -42,6 +42,11 @@ type PostgresStore struct {
 	// Sized independently and small; created from the same DSN.
 	fencePoolOnce sync.Once
 	fencePool     *pgxpool.Pool
+	// fencePoolErr records the FIRST advisory-pool initialization failure.
+	// A sync.Once body is skipped on later calls, so an error held only in a
+	// closure-local variable would vanish and callers would observe a nil
+	// pool with no error.
+	fencePoolErr error
 
 	leaderMu        sync.Mutex
 	leaderConn      *pgx.Conn
@@ -120,7 +125,14 @@ func NewPostgresOpt(ctx context.Context, dsn string, opts ...PostgresOption) (*P
 		pool.Close()
 		return nil, fmt.Errorf("storage: ping: %w", err)
 	}
-	return &PostgresStore{pool: pool}, nil
+	st := &PostgresStore{pool: pool}
+	// Eager advisory-pool initialization: a startup failure surfaces here
+	// instead of during the first fenced operation.
+	if _, err := st.advisoryPool(); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return st, nil
 }
 
 // NewPostgresFromPool adopts an existing pool (tests, wiring). The fence
@@ -133,36 +145,41 @@ func NewPostgresFromPool(pool *pgxpool.Pool) *PostgresStore {
 // the operational pool's DSN on first use. A dedicated pool can never be
 // exhausted by ordinary operations.
 func (s *PostgresStore) advisoryPool() (*pgxpool.Pool, error) {
-	var perr error
 	s.fencePoolOnce.Do(func() {
 		dsn := ""
 		if s.pool != nil && s.pool.Config() != nil {
 			dsn = s.pool.Config().ConnString()
 		}
 		if dsn == "" {
-			perr = fmt.Errorf("storage: cannot derive a DSN for the advisory-lock pool")
+			s.fencePoolErr = fmt.Errorf("storage: cannot derive a DSN for the advisory-lock pool")
 			return
 		}
 		cfg, err := pgxpool.ParseConfig(dsn)
 		if err != nil {
-			perr = fmt.Errorf("storage: parse dsn for advisory pool: %w", err)
+			s.fencePoolErr = fmt.Errorf("storage: parse dsn for advisory pool: %w", err)
 			return
 		}
-		// Advisory locks are held for the duration of a fenced operation, so
-		// the pool only needs a handful of connections regardless of the
-		// operational pool size.
-		if cfg.MaxConns < 4 {
-			cfg.MaxConns = 4
-		}
+		// Explicit cap: the lock pool exists to be INDEPENDENT of the
+		// operational pool, not to mirror its size.
+		cfg.MaxConns = 4
+		cfg.MinConns = 1
 		pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
 		if err != nil {
-			perr = fmt.Errorf("storage: open advisory pool: %w", err)
+			s.fencePoolErr = fmt.Errorf("storage: open advisory pool: %w", err)
+			return
+		}
+		if err := pool.Ping(context.Background()); err != nil {
+			pool.Close()
+			s.fencePoolErr = fmt.Errorf("storage: ping advisory pool: %w", err)
 			return
 		}
 		s.fencePool = pool
 	})
-	if perr != nil {
-		return nil, perr
+	if s.fencePoolErr != nil {
+		return nil, s.fencePoolErr
+	}
+	if s.fencePool == nil {
+		return nil, fmt.Errorf("storage: advisory pool unavailable")
 	}
 	return s.fencePool, nil
 }
@@ -2801,8 +2818,10 @@ func (s *PostgresStore) ClaimOutbox(ctx context.Context, claimer string, limit i
 	rows, err := s.pool.Query(ctx, `UPDATE outbox o SET claimed_at = now(), claimed_by = $1
 		FROM (
 			SELECT id FROM outbox
-			WHERE claimed_at IS NULL OR claimed_at < $3
-			ORDER BY created_at ASC, id ASC
+			WHERE dead_lettered_at IS NULL
+			  AND next_attempt_at <= now()
+			  AND (claimed_at IS NULL OR claimed_at < $3)
+			ORDER BY next_attempt_at ASC, created_at ASC, id ASC
 			LIMIT $2
 			FOR UPDATE SKIP LOCKED
 		) c
@@ -4220,4 +4239,56 @@ func containsString(in []string, v string) bool {
 		}
 	}
 	return false
+}
+
+// OutboxRetry records a failed dispatch attempt: the attempt counter grows,
+// the error is retained for operators, and the next attempt is scheduled
+// with bounded exponential backoff + jitter. After maxAttempts the row is
+// DEAD-LETTERED, so a permanently broken integration (revoked credentials,
+// invalid payload) cannot hot-loop forever.
+func (s *PostgresStore) OutboxRetry(ctx context.Context, id string, dispatchErr error, maxAttempts int) error {
+	if id == "" {
+		return fmt.Errorf("storage: empty outbox id")
+	}
+	msg := ""
+	if dispatchErr != nil {
+		msg = dispatchErr.Error()
+	}
+	backoff := time.Second
+	var attempts int
+	if err := s.pool.QueryRow(ctx, `SELECT attempts FROM outbox WHERE id=$1`, id).Scan(&attempts); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	for i := 0; i < attempts && backoff < time.Minute; i++ {
+		backoff *= 2
+	}
+	jitter := time.Duration(time.Now().UnixNano() % int64(backoff/4+1))
+	if maxAttempts > 0 && attempts+1 >= maxAttempts {
+		_, err := s.pool.Exec(ctx, `UPDATE outbox SET attempts=attempts+1, last_error=$2, claimed_at=NULL, claimed_by=NULL, dead_lettered_at=now() WHERE id=$1`, id, msg)
+		return err
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE outbox SET attempts=attempts+1, last_error=$2, claimed_at=NULL, claimed_by=NULL, next_attempt_at=now()+$3 WHERE id=$1`, id, msg, backoff+jitter)
+	return err
+}
+
+// OutboxPendingItems returns rows that are pending, not dead-lettered and
+// due, for startup replay.
+func (s *PostgresStore) OutboxDue(ctx context.Context) ([]OutboxItem, error) {
+	rows, err := s.pool.Query(ctx, `SELECT id, kind, payload, created_at FROM outbox WHERE dead_lettered_at IS NULL AND next_attempt_at <= now() ORDER BY created_at ASC, id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []OutboxItem{}
+	for rows.Next() {
+		var it OutboxItem
+		if err := rows.Scan(&it.ID, &it.Kind, &it.Payload, &it.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
 }

@@ -1,0 +1,140 @@
+# Linux amd64: the primary hermetic lane set. All images are pinned by OCI
+# digest (supply-chain requirement); agent selection is by workflow label.
+labels:
+  platform: linux-amd64
+
+when:
+  - event: [push, pull_request, manual, tag]
+
+steps:
+  format:
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    commands:
+      - test -z "$(gofmt -l .)"
+
+  vet:
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    environment:
+      GOTOOLCHAIN: local
+    commands:
+      - go vet ./...
+
+  unit:
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    depends_on: [vet]
+    environment:
+      GOTOOLCHAIN: local
+    commands:
+      # -vet=all runs every vet analyzer over the test sources too;
+      # shuffle rotates test order so order-dependent state leaks surface.
+      - go test -vet=all -shuffle=on -timeout=15m ./...
+
+  race:
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    depends_on: [unit]
+    environment:
+      GOTOOLCHAIN: local
+    commands:
+      - go test -race -shuffle=on -timeout=25m ./...
+
+  race-double:
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    depends_on: [race]
+    environment:
+      GOTOOLCHAIN: local
+    commands:
+      - go test -race -count=2 -shuffle=on -timeout=25m ./internal/server ./internal/storage ./internal/scheduler ./internal/executor ./internal/runner ./internal/secretbroker ./internal/blob ./internal/safefs ./internal/cas
+
+  single-p:
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    depends_on: [unit]
+    environment:
+      GOTOOLCHAIN: local
+      GOMAXPROCS: "1"
+    commands:
+      # One OS thread: goroutine interleavings collapse. This found the
+      # process-output loss race (Wait closing pipes before the drains read).
+      - go test -count=1 -timeout=30m ./...
+
+  checkptr:
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    depends_on: [unit]
+    environment:
+      GOTOOLCHAIN: local
+    commands:
+      - go test -gcflags=all=-d=checkptr=2 -race -count=1 -timeout=40m ./...
+
+  stress:
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    depends_on: [unit]
+    environment:
+      GOTOOLCHAIN: local
+    commands:
+      - go test -run 'Concurrent|Property|Fault|HA|Parity|Adversarial' -count=10 -shuffle=on -timeout=30m ./internal/server ./internal/storage ./internal/scheduler ./internal/executor ./internal/runner
+
+  adversarial:
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    depends_on: [vet]
+    environment:
+      GOTOOLCHAIN: local
+    commands:
+      - go test -run 'Adversarial|Security|Property|Fault|Symlink|Traversal|Tamper|Reject|Evil|Bomb' -shuffle=on ./...
+
+  schema:
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    depends_on: [vet]
+    environment:
+      GOTOOLCHAIN: local
+    commands:
+      - go test -run Schema ./internal/pipeline
+      - go run ./cmd/filemap --check
+
+  cross:
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    depends_on: [vet]
+    environment:
+      GOTOOLCHAIN: local
+    commands:
+      - make cross
+
+  license:
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    commands:
+      - make license-check
+
+  docs:
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    commands:
+      - make docs-check
+
+  repro:
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    environment:
+      GOTOOLCHAIN: local
+    commands:
+      - ./scripts/repro-build.sh
+
+  staticcheck:
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    environment:
+      GOTOOLCHAIN: local
+    commands:
+      # -checks=all with only the stylistic comment/initialism checks
+      # excluded; everything else must be clean.
+      - go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 -checks=all,-ST1000,-ST1020,-ST1021,-ST1003 ./...
+
+  govulncheck:
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    environment:
+      GOTOOLCHAIN: local
+    commands:
+      # -test scans test dependencies too.
+      - go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 -test ./...
+
+  fuzz-smoke:
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    depends_on: [unit]
+    environment:
+      GOTOOLCHAIN: local
+    commands:
+      - ./scripts/fuzz-smoke.sh 30s

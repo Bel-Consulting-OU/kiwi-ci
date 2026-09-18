@@ -1,0 +1,23 @@
+# Nightly: long-budget fuzzing plus the stress battery. Cron events are
+# configured on the Woodpecker repository (schedule trigger).
+labels:
+  platform: linux-amd64
+
+when:
+  - event: [cron, manual]
+
+steps:
+  fuzz:
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    environment:
+      GOTOOLCHAIN: local
+    commands:
+      - ./scripts/fuzz-smoke.sh 5m
+
+  stress:
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    depends_on: [fuzz]
+    environment:
+      GOTOOLCHAIN: local
+    commands:
+      - go test -run 'Concurrent|Property|Fault|HA|Parity' -count=50 -shuffle=on -timeout=60m ./internal/server ./internal/storage ./internal/scheduler

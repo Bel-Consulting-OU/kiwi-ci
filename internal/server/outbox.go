@@ -401,6 +401,30 @@ func (o *Outbox) flushDBBatch(ctx context.Context, dispatch func(context.Context
 	o.mu.Unlock()
 
 	dispatched := 0
+	var failed []string
+	defer func() {
+		// ALWAYS release the claims of rows this batch never dispatched:
+		// otherwise up to OutboxClaimBatch-1 unrelated rows stay claimed
+		// until the TTL expires.
+		for _, it := range claimed {
+			dispatchedOrFailed := false
+			for _, f := range failed {
+				if f == it.ID {
+					dispatchedOrFailed = true
+				}
+			}
+			o.mu.Lock()
+			for _, q := range o.items {
+				if q.ID == it.ID {
+					dispatchedOrFailed = true
+				}
+			}
+			o.mu.Unlock()
+			if !dispatchedOrFailed {
+				_ = o.db.ReleaseOutboxClaim(ctx, it.ID, claimer)
+			}
+		}
+	}()
 	for {
 		o.mu.Lock()
 		idx := -1
@@ -417,11 +441,24 @@ func (o *Outbox) flushDBBatch(ctx context.Context, dispatch func(context.Context
 		it := o.items[idx]
 		o.mu.Unlock()
 
-		if err := dispatch(ctx, it); err != nil {
+		if derr := dispatch(ctx, it); derr != nil {
+			// Record the attempt with bounded backoff (dead-letter after
+			// maxOutboxAttempts) instead of hot-looping, then CONTINUE with
+			// the other independent rows in this batch.
 			if owned[it.ID] {
+				if rerr := o.retryOutboxRow(ctx, it.ID, derr); rerr != nil {
+					log.Printf("outbox: retry record %s: %v", it.ID, rerr)
+				}
 				_ = o.db.ReleaseOutboxClaim(ctx, it.ID, claimer)
 			}
-			return dispatched, len(claimed), err
+			// Drop the FAILED attempt from the local queue: the durable row
+			// (with next_attempt_at) is the retry vehicle, and leaving it
+			// queued would make this loop re-pick it forever.
+			o.mu.Lock()
+			o.removeLocked(it.ID)
+			o.mu.Unlock()
+			failed = append(failed, it.ID)
+			continue
 		}
 		// Durable ACK BEFORE the local removal (and before the claim is
 		// considered satisfied): an ack failure keeps the item queued and
@@ -440,7 +477,30 @@ func (o *Outbox) flushDBBatch(ctx context.Context, dispatch func(context.Context
 		o.mu.Unlock()
 	}
 	o.pruneDB(ctx)
+	if len(failed) > 0 {
+		// Per-row failures are durably recorded with backoff (or
+		// dead-lettered); the error is still returned AFTER the batch so the
+		// caller can log/alert without stopping unrelated rows.
+		return dispatched, len(claimed), fmt.Errorf("outbox: %d intent(s) failed dispatch and were recorded for retry: %v", len(failed), failed)
+	}
 	return dispatched, len(claimed), nil
+}
+
+// maxOutboxAttempts is the dead-letter threshold: a dispatch that keeps
+// failing (permanent auth misconfiguration, invalid payload) is parked with
+// its error instead of retried forever.
+const maxOutboxAttempts = 8
+
+// retryOutboxRow records a failed attempt through the store when it supports
+// retry metadata; older stores simply keep the row claimed/released as
+// before.
+func (o *Outbox) retryOutboxRow(ctx context.Context, id string, dispatchErr error) error {
+	if rs, ok := o.db.(interface {
+		OutboxRetry(context.Context, string, error, int) error
+	}); ok {
+		return rs.OutboxRetry(ctx, id, dispatchErr, maxOutboxAttempts)
+	}
+	return nil
 }
 
 // removeLocked drops one item from the local queue. The caller holds o.mu.
@@ -520,7 +580,10 @@ func (s *Server) dispatchOutbox(ctx context.Context, item forge.OutboxItem) erro
 			// One publication at a time per logical check: two dispatchers
 			// seeing "no mapping" would otherwise both POST before either
 			// mapping is installed.
-			unlock := s.lockCheckRunKey(key)
+			unlock, lerr := s.lockCheckRunKey(ctx, key)
+			if lerr != nil {
+				return lerr
+			}
 			defer unlock()
 			existing, err := s.getCheckRunID(ctx, key)
 			if err != nil {
@@ -528,7 +591,8 @@ func (s *Server) dispatchOutbox(ctx context.Context, item forge.OutboxItem) erro
 				// not POST a duplicate.
 				return err
 			}
-			id, err := idp.PublishCheckRun(ctx, p.RepoFullName, p.SHA, p.Name, p.Status, p.Conclusion, p.DetailsURL, p.Summary, p.Annotations, existing)
+			logicalID := p.RunID + "\x00" + p.Name
+			id, err := idp.PublishCheckRun(ctx, logicalID, p.RepoFullName, p.SHA, p.Name, p.Status, p.Conclusion, p.DetailsURL, p.Summary, p.Annotations, existing)
 			if err != nil {
 				return err
 			}

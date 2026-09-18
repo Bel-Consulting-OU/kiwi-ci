@@ -20,16 +20,17 @@ import (
 // ScheduleStore, DeploymentStore, SnapshotStore, ArtifactContractStore,
 // QueueReasonStore) so DB-mode server tests exercise the durable paths.
 type dbFakeStore struct {
-	mu        sync.Mutex
-	checkRuns map[string]string
-	runs      map[string]model.Run
-	jobs      map[string]model.Job
-	runners   map[string]model.Runner
-	receipts  map[string]model.CompletionReceipt
-	audit     []model.AuditEvent
-	logs      []model.LogEntry
-	artifacts []model.ArtifactRecord
-	reports   []model.TestReport
+	mu         sync.Mutex
+	checkRuns  map[string]string
+	logBatches map[string]bool
+	runs       map[string]model.Run
+	jobs       map[string]model.Job
+	runners    map[string]model.Runner
+	receipts   map[string]model.CompletionReceipt
+	audit      []model.AuditEvent
+	logs       []model.LogEntry
+	artifacts  []model.ArtifactRecord
+	reports    []model.TestReport
 
 	outboxItems  []storage.OutboxItem
 	outboxAcked  []string
@@ -988,6 +989,21 @@ func (f *dbFakeStore) OutboxAck(ctx context.Context, id string) error {
 	f.outboxItems = kept
 	delete(f.outboxClaims, id)
 	return nil
+}
+
+func (f *dbFakeStore) AppendLogBatch(ctx context.Context, entries []model.LogEntry, r storage.LogBatchReceipt) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.logBatches == nil {
+		f.logBatches = map[string]bool{}
+	}
+	key := r.JobID + "\x00" + strconv.FormatInt(r.Generation, 10) + "\x00" + r.BatchID
+	if f.logBatches[key] {
+		return false, nil
+	}
+	f.logBatches[key] = true
+	f.logs = append(f.logs, entries...)
+	return true, nil
 }
 
 func (f *dbFakeStore) OutboxHas(ctx context.Context, id string) (bool, error) {

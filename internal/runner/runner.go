@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	v1 "github.com/Bel-Consulting-OU/kiwi-ci/internal/api/v1"
@@ -591,7 +592,8 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	consoleSink := logging.Func(func(job, step, line string) {
 		fmt.Printf("[%s/%s] %s\n", job, step, masker.Mask(line))
 	})
-	sink := newAsyncLogSink(consoleSink, func(lines []logLine) error {
+	var logBatchSeq atomic.Int64
+	sink := newAsyncLogSink(consoleSink, func(ctx context.Context, lines []logLine) error {
 		// ONE batched request per drain: per-line posts cannot keep up and
 		// force the spool to overflow on chatty builds.
 		out := make([]server.LogLine, 0, len(lines))
@@ -602,13 +604,31 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 			RunnerID        string           `json:"runner_id"`
 			LeaseToken      string           `json:"lease_token"`
 			LeaseGeneration int64            `json:"lease_generation"`
+			BatchID         string           `json:"batch_id"`
+			BatchSequence   int64            `json:"batch_sequence"`
 			Lines           []server.LogLine `json:"lines"`
 		}
 		body.RunnerID = r.ID
 		body.LeaseToken = t.LeaseToken
 		body.LeaseGeneration = t.LeaseGeneration
+		body.BatchSequence = logBatchSeq.Add(1)
+		// Deterministic batch identity: a safely retried batch is recognized
+		// by the server's receipt and never duplicates lines.
+		batchSum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%d", t.Job.ID, t.LeaseGeneration, body.BatchSequence)))
+		body.BatchID = hex.EncodeToString(batchSum[:16])
 		body.Lines = out
-		return r.post(parent, "/api/v1/jobs/"+t.Job.ID+"/log/batch", body, nil)
+		// 4xx-class failures are permanent (retrying cannot help) and fail
+		// the batch immediately; 5xx/network errors stay retryable.
+		err := r.post(parent, "/api/v1/jobs/"+t.Job.ID+"/log/batch", body, nil)
+		if err != nil {
+			msg := err.Error()
+			for _, code := range []string{" 400 ", " 401 ", " 403 ", " 404 ", " 409 ", " 413 ", " 422 "} {
+				if strings.Contains(msg, code) {
+					return PermanentDeliveryError(err)
+				}
+			}
+		}
+		return err
 	})
 	// Distributed runs resolve secrets exclusively through the control
 	// plane's lease-bound delivery endpoint. Host env/Keychain providers

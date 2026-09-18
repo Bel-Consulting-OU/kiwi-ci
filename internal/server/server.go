@@ -167,12 +167,9 @@ type Server struct {
 	// checkRuns persists logical-check → forge check-run IDs so retried
 	// publications update instead of duplicating (see checkruns.go).
 	checkRuns *checkRunIDs
-	// checkRunLocks serializes publication per logical check within this
-	// process (the DB mapping row is the cross-replica arbiter).
-	checkRunLocks struct {
-		mu sync.Mutex
-		m  map[string]*sync.Mutex
-	}
+	// checkRunFence serializes check publication in memory/fs mode (DB mode
+	// uses the dedicated advisory-lock pool instead).
+	checkRunFence *cas.MemFencer
 
 	// digestFence serializes CAS publication against garbage collection for
 	// memory/fs deployments; DB mode prefers the store-backed fence so the
@@ -404,6 +401,7 @@ func New(token string) *Server {
 		contracts:       map[string]map[string]storage.ArtifactContract{},
 		pendingSidecars: map[string]string{},
 		jobLocks:        map[string]*sync.Mutex{},
+		checkRunFence:   cas.NewMemFencer(),
 		crl:             map[string]string{},
 		EnrollGrants:    map[string]EnrollGrant{},
 		history:         newTestintelHistory(""),
@@ -483,8 +481,15 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 	s.store = storage.New(dataDir)
 	s.outbox = NewOutbox(s.store)
 	// Restore the logical-check → remote check-run ID mapping so a restart
-	// UPDATES existing checks instead of creating duplicates.
-	s.checkRuns = &checkRunIDs{m: loadCheckRunIDs(dataDir)}
+	// UPDATES existing checks instead of creating duplicates. A corrupt
+	// mirror fails startup (fail closed) rather than silently resetting
+	// check identity.
+	checkRunMap, crErr := loadCheckRunIDs(dataDir)
+	if crErr != nil {
+		return nil, crErr
+	}
+	s.checkRuns = &checkRunIDs{m: checkRunMap}
+	s.checkRunFence = cas.NewMemFencer()
 	if cluster != nil {
 		if signer, err := s.loadOIDCSignerCluster(cluster); err != nil {
 			return nil, err
@@ -2585,16 +2590,20 @@ func (s *Server) heartbeatDB(w http.ResponseWriter, r *http.Request, jobID strin
 // and the spool then overflows. Validation mirrors the single-line handler
 // per line; the whole request fails closed on the first invalid line.
 func (s *Server) logBatch(w http.ResponseWriter, r *http.Request) {
-	const maxLogBatchBytes = 1 << 20
 	const maxLogBatchLines = 2000
 	jobID := r.PathValue("id")
 	var in struct {
 		RunnerID        string    `json:"runner_id"`
 		LeaseToken      string    `json:"lease_token"`
 		LeaseGeneration int64     `json:"lease_generation"`
+		BatchID         string    `json:"batch_id"`
+		BatchSequence   int64     `json:"batch_sequence"`
 		Lines           []LogLine `json:"lines"`
 	}
-	if !decodeLimit(w, r, &in, maxLogBatchBytes) {
+	// The encoded envelope must fit its OWN allowance: a legal ~1 MiB line
+	// plus JSON escaping can exceed a 1 MiB body cap, so the batch body is
+	// bounded at 4 MiB while each logical line stays capped at 1 MiB.
+	if !decodeLimit(w, r, &in, 4<<20) {
 		return
 	}
 	if len(in.Lines) == 0 || len(in.Lines) > maxLogBatchLines {
@@ -2607,16 +2616,46 @@ func (s *Server) logBatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if len(in.BatchID) > 128 {
+		http.Error(w, "batch id exceeds 128 bytes", http.StatusBadRequest)
+		return
+	}
 	j, authErr := s.authorizeRunnerLease(r, in.RunnerID, in.LeaseToken, in.LeaseGeneration)
 	if authErr != nil {
 		s.writeLeaseAuthError(w, r, authErr)
 		return
 	}
 	now := time.Now().UTC()
+	if in.BatchID == "" {
+		// Deterministic fallback identity for clients that do not send one:
+		// a retried delivery of the same content under the same lease still
+		// dedupes.
+		sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%d", in.RunnerID, in.LeaseGeneration, in.BatchSequence)))
+		for _, l := range in.Lines {
+			sum = sha256.Sum256(append(sum[:], []byte(l.Step+"\x00"+l.Line)...))
+		}
+		in.BatchID = hex.EncodeToString(sum[:16])
+	}
 	if s.DB != nil {
-		// DB mode: append each line through the identity-sequenced path so
-		// cursors stay monotonic; the batch is bounded, so the per-line cost
-		// is bounded too.
+		if lbs, ok := s.DB.(storage.LogBatchStore); ok {
+			entries := make([]model.LogEntry, 0, len(in.Lines))
+			for _, l := range in.Lines {
+				entries = append(entries, model.LogEntry{RunID: j.RunID, JobID: j.ID, JobKey: j.Key, Step: l.Step, Line: l.Line, CreatedAt: now})
+			}
+			inserted, err := lbs.AppendLogBatch(r.Context(), entries, storage.LogBatchReceipt{JobID: j.ID, Generation: in.LeaseGeneration, BatchID: in.BatchID})
+			if err != nil {
+				http.Error(w, "log batch append failed", 500)
+				return
+			}
+			if !inserted {
+				// Duplicate delivery of an already-persisted batch: answer
+				// 204 without re-inserting.
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		for _, l := range in.Lines {
 			if !s.logDBWrite(r.Context(), j, l, now) {
 				http.Error(w, "log append failed", 500)

@@ -1,0 +1,32 @@
+# Native macOS arm64: unit + race + the termios/Tart-sensitive packages.
+# macOS agents use Woodpecker's local backend, which executes directly on the
+# host and therefore MUST run only trusted events.
+labels:
+  platform: darwin-arm64
+
+when:
+  - event: [push, manual, tag]
+
+steps:
+  unit:
+    image: golang:1.27
+    environment:
+      GOTOOLCHAIN: local
+    commands:
+      - go test -shuffle=on -timeout=20m ./...
+
+  race:
+    image: golang:1.27
+    depends_on: [unit]
+    environment:
+      GOTOOLCHAIN: local
+    commands:
+      - go test -race -shuffle=on -timeout=30m ./internal/tui ./internal/executor ./internal/safefs ./internal/server ./internal/storage
+
+  platform-packages:
+    image: golang:1.27
+    depends_on: [unit]
+    environment:
+      GOTOOLCHAIN: local
+    commands:
+      - go test -count=1 -v -timeout=30m ./internal/tui ./internal/safefs ./internal/workspace ./internal/executor

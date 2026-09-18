@@ -1,0 +1,44 @@
+# PostgreSQL integration + coverage in ONE workflow: the unit profile and the
+# integration profile must share a workspace for the merge, and files are
+# shared within a workflow, not between workflows.
+#
+# Server requirement (documented, must be configured on the Woodpecker
+# instance): WOODPECKER_FORCE_IGNORE_SERVICE_FAILURE=false, so a dead
+# PostgreSQL service FAILS the pipeline instead of being ignored.
+labels:
+  platform: linux-amd64
+
+when:
+  - event: [push, pull_request, manual, tag]
+
+services:
+  postgres:
+    image: postgres:16-alpine@sha256:3c5c8892d184f738f4fe282d14ddaa613a38f00f4189d2d94725ebe6f2909ddb
+    environment:
+      POSTGRES_PASSWORD: pass
+
+steps:
+  integration-postgres:
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    environment:
+      GOTOOLCHAIN: local
+    commands:
+      - |
+        for i in $(seq 1 30); do
+          if go run ./scripts/wait-for-tcp.go postgres 5432 2>/dev/null; then break; fi
+          sleep 2
+        done
+      - KIWI_TEST_POSTGRES_URL=postgres://postgres:pass@postgres:5432/postgres?sslmode=disable go test -count=1 -timeout=20m -v -run Integration -coverprofile=integration-coverage.out -covermode=atomic ./internal/storage ./internal/scheduler ./internal/server ./internal/app
+
+  coverage:
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    depends_on: [integration-postgres]
+    environment:
+      GOTOOLCHAIN: local
+      KC_MIN_COVERAGE: "95"
+    commands:
+      - go test -coverprofile=coverage.out -covermode=atomic ./...
+      - ./scripts/ci-coverage-selftest.sh coverage.out integration-coverage.out
+      - ./scripts/merge-coverage.sh merged-coverage.out coverage.out integration-coverage.out
+      - ./scripts/coverage-report.sh merged-coverage.out
+      - ./scripts/coverage-floor.sh merged-coverage.out

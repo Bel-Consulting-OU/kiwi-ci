@@ -89,7 +89,7 @@ redeploying the old binary plus its data directory files.
 - Dependabot opens weekly pull requests for Go modules (`gomod`,
   commit prefix `deps`), capped at 5 open PRs (`.github/dependabot.yml`).
   A full CI pipeline runs on every dependency PR; merge only when it is
-  green. GitHub Actions are no longer used (CI runs on Woodpecker), so
+  green. CI runs exclusively on Woodpecker (`.woodpecker/`), so
   there is no `github-actions` ecosystem to upgrade.
 - CI tooling versions are pinned in `.woodpecker.yml`, not floating:
   - `staticcheck` `honnef.co/go/tools/cmd/staticcheck@v0.8.1`: bump the

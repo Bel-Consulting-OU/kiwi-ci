@@ -3,7 +3,9 @@ package forge
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -298,21 +300,48 @@ func (g *GitHub) changedFilesPage(ctx context.Context, repoFullName, u string) (
 // returned for the caller to persist. The stable external_id keys the run to
 // the logical Kiwi check (run + name), never just the SHA.
 type CheckRunPublisher interface {
-	PublishCheckRun(ctx context.Context, repoFullName, sha, name, status, conclusion, detailsURL, summary string, annotations []CheckAnnotation, existingID string) (string, error)
+	// PublishCheckRun creates, reconciles or PATCHes one logical check and
+	// returns its GitHub check-run ID. logicalID is the durable Kiwi identity
+	// of the check (run + name), used for the external_id so reruns of the
+	// same SHA never share a check identity.
+	PublishCheckRun(ctx context.Context, logicalID, repoFullName, sha, name, status, conclusion, detailsURL, summary string, annotations []CheckAnnotation, existingID string) (string, error)
+	// FindCheckRun reconciles remote state: it looks for an existing check
+	// run whose external_id matches the logical check (the window where a
+	// POST succeeded but persisting its ID failed).
+	FindCheckRun(ctx context.Context, repoFullName, sha, externalID string) (string, error)
 }
 
 func (g *GitHub) PublishCheck(ctx context.Context, repoFullName, sha, name, status, conclusion, detailsURL, summary string, annotations []CheckAnnotation) error {
-	_, err := g.PublishCheckRun(ctx, repoFullName, sha, name, status, conclusion, detailsURL, summary, annotations, "")
+	_, err := g.PublishCheckRun(ctx, "kiwi-"+shortSHA(sha)+"-"+slug(name), repoFullName, sha, name, status, conclusion, detailsURL, summary, annotations, "")
 	return err
 }
 
-// PublishCheckRun creates or PATCHes one logical check run and returns its
-// GitHub check-run ID.
-func (g *GitHub) PublishCheckRun(ctx context.Context, repoFullName, sha, name, status, conclusion, detailsURL, summary string, annotations []CheckAnnotation, existingID string) (string, error) {
+// checkExternalID derives the durable external_id of a logical check:
+// hash(logicalID) so a rerun or manual run of the same SHA and check name
+// gets its OWN check identity.
+func checkExternalID(logicalID string) string {
+	sum := sha256.Sum256([]byte("kiwi-logical-check\x00" + logicalID))
+	return "kiwi-" + hex.EncodeToString(sum[:12])
+}
+
+// PublishCheckRun creates, reconciles or PATCHes one logical check run and
+// returns its GitHub check-run ID. When no mapping is supplied it first
+// reconciles against GitHub by external_id (covering the remote-success and
+// local-write-failure window), and only POSTs when nothing exists.
+func (g *GitHub) PublishCheckRun(ctx context.Context, logicalID, repoFullName, sha, name, status, conclusion, detailsURL, summary string, annotations []CheckAnnotation, existingID string) (string, error) {
 	if repoFullName == "" || sha == "" {
 		return "", fmt.Errorf("missing repo or sha for check publish")
 	}
-	externalID := "kiwi-" + shortSHA(sha) + "-" + slug(name)
+	externalID := checkExternalID(logicalID)
+	if existingID == "" {
+		found, ferr := g.FindCheckRun(ctx, repoFullName, sha, externalID)
+		if ferr != nil {
+			// Reconciliation failure must not cause a duplicate POST: the
+			// retry path reconciles again.
+			return "", fmt.Errorf("reconcile check run: %w", ferr)
+		}
+		existingID = found
+	}
 	output := map[string]any{"title": "Kiwi / " + name, "summary": summary}
 	if len(annotations) > 0 {
 		output["annotations"] = annotations
@@ -430,4 +459,48 @@ func slug(name string) string {
 		return "pipeline"
 	}
 	return s
+}
+
+// FindCheckRun lists the check runs for the commit and returns the ID of the
+// one whose external_id matches, or "" when none exists. Bounded response,
+// no redirects, context-propagating.
+func (g *GitHub) FindCheckRun(ctx context.Context, repoFullName, sha, externalID string) (string, error) {
+	if repoFullName == "" || sha == "" || externalID == "" {
+		return "", nil
+	}
+	u := g.apiBase() + "/repos/" + repoFullName + "/commits/" + sha + "/check-runs?per_page=100"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	if tok, err := g.authToken(ctx, repoFullName); err != nil {
+		return "", err
+	} else if tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	resp, err := g.httpClient().Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", fmt.Errorf("GitHub check-runs list %s: %s", resp.Status, strings.TrimSpace(string(b)))
+	}
+	var out struct {
+		CheckRuns []struct {
+			ID         int64  `json:"id"`
+			ExternalID string `json:"external_id"`
+		} `json:"check_runs"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&out); err != nil {
+		return "", err
+	}
+	for _, cr := range out.CheckRuns {
+		if cr.ExternalID == externalID {
+			return strconv.FormatInt(cr.ID, 10), nil
+		}
+	}
+	return "", nil
 }

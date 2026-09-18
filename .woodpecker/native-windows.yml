@@ -1,0 +1,28 @@
+# Native Windows amd64: real platform execution (cross-compilation is not
+# platform testing). Runs on a trusted/labeled Windows agent; untrusted fork
+# PR code must never execute on a local backend, so this workflow runs only
+# for trusted events (the org enables it for protected branches).
+labels:
+  platform: windows-amd64
+
+when:
+  - event: [push, manual, tag]
+
+steps:
+  unit:
+    image: golang:1.27
+    environment:
+      GOTOOLCHAIN: local
+    commands:
+      - go vet ./...
+      - go test -shuffle=on -timeout=20m ./...
+
+  platform-packages:
+    image: golang:1.27
+    depends_on: [unit]
+    environment:
+      GOTOOLCHAIN: local
+    commands:
+      # The packages whose behavior differs most on Windows: filesystem,
+      # terminal, path handling, process supervision and secrets key files.
+      - go test -count=1 -v -timeout=30m ./internal/safefs ./internal/tui ./internal/executor ./internal/runner ./internal/storage ./internal/workspace ./internal/config

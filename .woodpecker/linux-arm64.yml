@@ -1,0 +1,23 @@
+# Linux arm64: unit + race + the concurrency-critical packages, native
+# execution (no emulation) on an arm64-labelled agent.
+labels:
+  platform: linux-arm64
+
+when:
+  - event: [push, pull_request, manual, tag]
+
+steps:
+  unit:
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    environment:
+      GOTOOLCHAIN: local
+    commands:
+      - go test -vet=all -shuffle=on -timeout=15m ./...
+
+  race:
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    depends_on: [unit]
+    environment:
+      GOTOOLCHAIN: local
+    commands:
+      - go test -race -shuffle=on -timeout=25m ./...

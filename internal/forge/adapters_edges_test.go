@@ -221,6 +221,11 @@ func TestGitHubPublishCheckEdges(t *testing.T) {
 
 	var body map[string]any
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			// Reconcile probe: nothing exists remotely yet.
+			_, _ = w.Write([]byte(`{"check_runs":[]}`))
+			return
+		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte(`{"id": 1}`))
@@ -235,7 +240,7 @@ func TestGitHubPublishCheckEdges(t *testing.T) {
 	if body["conclusion"] != "success" || body["details_url"] != "https://ci.example/run/1" || body["completed_at"] == nil {
 		t.Fatalf("body = %v", body)
 	}
-	if body["external_id"] != "kiwi-"+strings.Repeat("a", 12)+"-build-test" {
+	if ext, _ := body["external_id"].(string); !strings.HasPrefix(ext, "kiwi-") || len(ext) != len("kiwi-")+24 {
 		t.Fatalf("external_id = %v", body["external_id"])
 	}
 	output, ok := body["output"].(map[string]any)

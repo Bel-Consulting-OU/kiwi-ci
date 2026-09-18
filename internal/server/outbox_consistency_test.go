@@ -356,6 +356,9 @@ func TestGitHubCheckRetryPatchesInsteadOfDuplicating(t *testing.T) {
 	var posts, patches int
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
+		case http.MethodGet:
+			_, _ = w.Write([]byte(`{"check_runs":[]}`))
+			return
 		case http.MethodPost:
 			posts++
 			w.WriteHeader(http.StatusCreated)

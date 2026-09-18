@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -782,6 +783,7 @@ type memStore struct {
 	fenceMu    sync.Mutex
 	fences     map[string]*sync.Mutex
 	checkRuns  checkRunMem
+	logBatches logBatchMem
 	runs       map[string]model.Run
 	jobs       map[string]model.Job
 	runners    map[string]model.Runner
@@ -1505,6 +1507,26 @@ func (m *memStore) ListSchedules(ctx context.Context) ([]Schedule, error) {
 // last_run = max(existing, nominal), mirroring the SQL GREATEST update. A
 // stale caller can never move the marker backwards. An unknown schedule is
 // ErrNotFound.
+func (m *memStore) AcquireNamedFence(ctx context.Context, namespace, key string) (func(), error) {
+	return m.acquireMemFence(namespace + "\x00" + key)
+}
+
+func (m *memStore) acquireMemFence(k string) (func(), error) {
+	m.fenceMu.Lock()
+	mu, ok := m.fences[k]
+	if !ok {
+		mu = &sync.Mutex{}
+		if m.fences == nil {
+			m.fences = map[string]*sync.Mutex{}
+		}
+		m.fences[k] = mu
+	}
+	m.fenceMu.Unlock()
+	mu.Lock()
+	var once sync.Once
+	return func() { once.Do(mu.Unlock) }, nil
+}
+
 func (m *memStore) AcquireDigestFence(ctx context.Context, digest string) (func(), error) {
 	m.fenceMu.Lock()
 	mu, ok := m.fences[digest]
@@ -1551,6 +1573,14 @@ func (f *FaultyStore) WithDigestFence(ctx context.Context, digest string, fn fun
 	return inner.WithDigestFence(ctx, digest, fn)
 }
 
+func (f *FaultyStore) AcquireNamedFence(ctx context.Context, namespace, key string) (func(), error) {
+	inner, ok := f.Inner.(DigestFenceStore)
+	if !ok {
+		return nil, fmt.Errorf("storage: inner store does not implement DigestFenceStore")
+	}
+	return inner.AcquireNamedFence(ctx, namespace, key)
+}
+
 func (f *FaultyStore) AcquireDigestFence(ctx context.Context, digest string) (func(), error) {
 	inner, ok := f.Inner.(DigestFenceStore)
 	if !ok {
@@ -1565,6 +1595,29 @@ func (f *FaultyStore) GetSchedule(ctx context.Context, id string) (Schedule, boo
 		return Schedule{}, false, fmt.Errorf("storage: inner store does not implement ScheduleStore")
 	}
 	return inner.GetSchedule(ctx, id)
+}
+
+func (m *memStore) AppendLogBatch(ctx context.Context, entries []model.LogEntry, r LogBatchReceipt) (bool, error) {
+	key := r.JobID + "\x00" + strconv.FormatInt(r.Generation, 10) + "\x00" + r.BatchID
+	if !m.logBatches.claim(key) {
+		return false, nil
+	}
+	m.mu.Lock()
+	m.logs = append(m.logs, entries...)
+	m.mu.Unlock()
+	return true, nil
+}
+
+func (f *FaultyStore) AppendLogBatch(ctx context.Context, entries []model.LogEntry, r LogBatchReceipt) (bool, error) {
+	op := f.fail()
+	if op != nil {
+		return false, op
+	}
+	inner, ok := f.Inner.(LogBatchStore)
+	if !ok {
+		return false, fmt.Errorf("storage: inner store does not implement LogBatchStore")
+	}
+	return inner.AppendLogBatch(ctx, entries, r)
 }
 
 func (m *memStore) PutCheckRun(ctx context.Context, key, checkRunID string) error {

@@ -346,6 +346,10 @@ func TestGitHubFetchFileOversizeRejected(t *testing.T) {
 func TestGitHubPublishCheck(t *testing.T) {
 	var lastBody map[string]any
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/check-runs") {
+			_, _ = w.Write([]byte(`{"check_runs":[]}`))
+			return
+		}
 		if r.URL.Path != "/repos/octocat/hello-world/check-runs" || r.Method != http.MethodPost {
 			http.NotFound(w, r)
 			return
@@ -366,9 +370,15 @@ func TestGitHubPublishCheck(t *testing.T) {
 	if lastBody["name"] != "Kiwi / Pipeline" || lastBody["status"] != "completed" || lastBody["conclusion"] != "failure" {
 		t.Fatalf("bad body: %v", lastBody)
 	}
+	// The external_id is now the HASH of the logical check identity
+	// (run + name), not a short-SHA/name pair: reruns of the same SHA get
+	// distinct check identities.
 	ext, ok := lastBody["external_id"].(string)
-	if !ok || !strings.HasPrefix(ext, "kiwi-9049f1265b7d") || !strings.HasSuffix(ext, "-Pipeline") {
+	if !ok || !strings.HasPrefix(ext, "kiwi-") || len(ext) != len("kiwi-")+24 {
 		t.Fatalf("bad external_id: %v", lastBody["external_id"])
+	}
+	if body, _ := json.Marshal(lastBody); strings.Contains(string(body), "9049f1265b7d-Pipeline") {
+		t.Fatal("external_id must not be derived from the short SHA + name")
 	}
 	output := lastBody["output"].(map[string]any)
 	if output["summary"] != "pipeline failed" {

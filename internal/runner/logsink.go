@@ -1,6 +1,9 @@
 package runner
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,7 +24,12 @@ import (
 // be reported green while its logs were lost.
 type asyncLogSink struct {
 	inner logging.Sink
-	post  func(lines []logLine) error
+	post  func(ctx context.Context, lines []logLine) error
+
+	// ctx is cancelled by Finish at its deadline, aborting any in-flight
+	// delivery instead of letting it run on the job's parent context.
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	mu         sync.Mutex
 	spool      []logLine
@@ -77,11 +85,28 @@ const (
 	asyncPostBatch = 200
 )
 
-func newAsyncLogSink(inner logging.Sink, post func([]logLine) error) *asyncLogSink {
-	s := &asyncLogSink{inner: inner, post: post, done: make(chan struct{})}
+func newAsyncLogSink(inner logging.Sink, post func(context.Context, []logLine) error) *asyncLogSink {
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &asyncLogSink{inner: inner, post: post, ctx: ctx, cancel: cancel, done: make(chan struct{})}
 	s.cond = sync.NewCond(&s.mu)
 	go s.run()
 	return s
+}
+
+// permanentDeliveryError marks a 4xx-class failure: retrying cannot help, so
+// the batch fails immediately and the job reports the loss explicitly.
+type permanentDeliveryError struct{ err error }
+
+func (e *permanentDeliveryError) Error() string { return e.err.Error() }
+func (e *permanentDeliveryError) Unwrap() error { return e.err }
+
+// PermanentDeliveryError wraps err so the sink classifies it as
+// non-retryable (used by the runner's post callback for HTTP 4xx).
+func PermanentDeliveryError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &permanentDeliveryError{err: err}
 }
 
 // WriteLine implements logging.Sink. It never blocks on the network: when
@@ -118,11 +143,13 @@ func (s *asyncLogSink) run() {
 			s.mu.Unlock()
 			return
 		}
-		// Fill one BATCH up to both the line and byte budget.
+		// Fill one BATCH up to both the line and byte budget, measuring the
+		// MARSHALED JSON size (escaping can multiply a line's encoded size).
 		n := 0
 		var bytes int64
 		for n < len(s.spool) && n < asyncPostBatch {
-			add := int64(len(s.spool[n].Job) + len(s.spool[n].Step) + len(s.spool[n].Line))
+			encoded, _ := json.Marshal(s.spool[n])
+			add := int64(len(encoded))
 			if n > 0 && bytes+add > asyncPostBytes {
 				break
 			}
@@ -138,7 +165,40 @@ func (s *asyncLogSink) run() {
 		s.inFlight++
 		s.mu.Unlock()
 
-		err := s.post(batch)
+		err := s.post(s.ctx, batch)
+		if err != nil {
+			// Retain the batch and retry retryable failures with bounded
+			// exponential backoff + jitter; a permanent (4xx-class) failure
+			// fails immediately. Re-sending a batch is SAFE: the server's
+			// batch receipts dedupe by (job, generation, batch_id).
+			var perm *permanentDeliveryError
+			if !errors.As(err, &perm) {
+				backoff := 100 * time.Millisecond
+				for attempt := 0; attempt < 6 && s.ctx.Err() == nil; attempt++ {
+					jitter := time.Duration(time.Now().UnixNano() % int64(backoff/2+1))
+					select {
+					case <-time.After(backoff + jitter):
+					case <-s.ctx.Done():
+					}
+					if s.ctx.Err() != nil {
+						break
+					}
+					if rerr := s.post(s.ctx, batch); rerr == nil {
+						err = nil
+						break
+					} else if errors.As(rerr, &perm) {
+						err = rerr
+						break
+					} else {
+						err = rerr
+					}
+					backoff *= 2
+					if backoff > 2*time.Second {
+						backoff = 2 * time.Second
+					}
+				}
+			}
+		}
 
 		s.mu.Lock()
 		s.inFlight--
@@ -180,7 +240,14 @@ func (s *asyncLogSink) Finish(deadline time.Duration) logOutcome {
 	select {
 	case <-s.done:
 	case <-time.After(deadline):
+		// Deadline reached: CANCEL the in-flight delivery so it does not
+		// outlive the job, then give the sender a moment to unwind.
 		stopped = false
+		s.cancel()
+		select {
+		case <-s.done:
+		case <-time.After(2 * time.Second):
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -192,82 +192,36 @@ Build your own with `make release` (cross-compiled bundle) and
 
 ## CI status
 
-CI is split by what each system can execute:
+CI is **Woodpecker-only** (`.woodpecker/` multi-workflow layout; agent
+selection is by workflow-level labels). There is no GitHub Actions workflow
+and no other CI system in this repository.
 
-- **Woodpecker CI owns every Linux lane** (`.woodpecker.yml`): every push,
-  pull request, manual run and tag executes one pipeline with the lanes
-  below.
-- **One narrowly-scoped GitHub Actions workflow**
-  (`.github/workflows/native.yml`) runs the native macOS/Windows checks,
-  because Woodpecker cannot execute non-Linux jobs. It never duplicates a
-  Linux lane: `go vet ./...` and `go test -shuffle=on ./...` on
-  `macos-latest` and `windows-latest`, plus `go test -race ./...` on macOS.
-  Its actions are pinned to full commit SHAs and `setup-go` reads
-  `go-version-file: go.mod`.
+| Workflow | Agent label | What it runs |
+|---|---|---|
+| `linux-amd64` | `platform=linux-amd64` | format, vet, unit (`-vet=all -shuffle`), race, race-double, single-P (`GOMAXPROCS=1`), checkptr (`-d=checkptr=2 -race`), stress (`-count=10` adversarial patterns), adversarial, schema (+FILE_MAP), cross, license, docs, repro, staticcheck (`-checks=all` minus stylistic), govulncheck (`-test`), fuzz smoke (30s/target) |
+| `linux-arm64` | `platform=linux-arm64` | unit + race natively |
+| `docker-workspace` | `platform=linux-amd64`, `capability=docker` | REQUIRED rootless/hardened container workspace integration; a missing/unusable Docker daemon FAILS this lane |
+| `integration-coverage` | `platform=linux-amd64` | PostgreSQL service + integration tests + merged coverage with the 95% floor |
+| `native-windows` | `platform=windows-amd64` | native Windows `go vet` + full unit suite + the platform-sensitive packages (safefs, tui, executor, runner, storage, workspace, config). Trusted events only |
+| `native-macos` | `platform=darwin-arm64` | native macOS unit + race + termios/Tart-sensitive packages. Trusted events only (local backend executes on the host) |
+| `nightly` | `platform=linux-amd64` | cron: every fuzz target for 5 minutes plus the 50x stress battery |
 
-Woodpecker lanes:
+Operational requirements for the Woodpecker instance:
 
-- `format`, `vet`: `gofmt -l` and `go vet ./...`.
-- `unit`, `race`: `go test -shuffle=on -timeout=15m ./...` and the race
-  detector build; both run on a `linux/amd64` and a `linux/arm64` matrix leg
-  (the arm64 entry needs an agent labelled `platform=linux/arm64`; remove the
-  matrix entry when the fleet has none).
-- `adversarial`, `fuzz-smoke`: the adversarial/security/property suites and
-  10-second fuzz smoke over every registered fuzz target.
-- `schema`: pipeline schema tests plus `go run ./cmd/filemap --check`.
-- `cross`, `docs`, `license`, `repro`: cross-compilation, documentation and
-  licence presence checks, and byte-identical reproducible builds.
-- `staticcheck` (`honnef.co/go/tools/cmd/staticcheck@v0.8.1`) and
-  `govulncheck` (`golang.org/x/vuln/cmd/govulncheck@v1.8.0`, needs network):
-  pinned tool versions, cached through the shared `/go` workspace volume.
-- `smoke`: builds the binary and validates `.kiwi/pipeline.yaml` and
-  `examples/kiwi.yaml` (container-free; `kiwi run` needs a container runtime
-  and is covered by the executor test suites).
-- `coverage`: `go test -coverprofile=coverage.out -covermode=atomic ./...`,
-  then `scripts/ci-coverage-selftest.sh` asserts both the unit and the
-  integration profile exist, are non-empty, carry a `mode:` header and record
-  at least `KC_MIN_COVERAGE_BLOCKS` (default 1000) blocks. Only then are they
-  merged with `scripts/merge-coverage.sh` (per-package summary via
-  `scripts/coverage-report.sh`) and checked by
-  `scripts/coverage-floor.sh` (default `KC_MIN_COVERAGE=95`).
-- `integration-postgres`: a real PostgreSQL 16 service container, a
-  stdlib-only readiness probe, then
-  `KIWI_TEST_POSTGRES_URL=... go test -count=1 -timeout=20m -run Integration
-  -covermode=atomic -coverprofile=integration-coverage.out -coverpkg=./...
-  ./internal/storage ./internal/scheduler ./internal/server`. The profile is
-  what the coverage lane merges, and `-coverpkg=./...` makes the
-  cross-package paths (storage → blob/db/safefs, ...) count toward the total.
-  The tests create and drop their own `kiwi_it_<random>` schema per test, so
-  the lane is repeatable and never touches shared tables.
-- `docker-workspace`: runs
-  `go test -run RootlessHardenedContainerWorkspace ./internal/runner` on
-  linux/amd64. The preflight exports `KIWI_TEST_DOCKER=1` only when the agent
-  exposes a usable docker daemon (CLI + socket); otherwise the test skips and
-  the lane stays green with a printed reason. With a daemon it proves the
-  hardened-container workspace contract end to end (see
-  [docs/runner-security.md](docs/runner-security.md)).
+- Every execution and service image is **pinned by OCI digest** in the
+  workflow files.
+- `WOODPECKER_FORCE_IGNORE_SERVICE_FAILURE=false` on the server, so the
+  PostgreSQL service being down fails `integration-coverage` instead of
+  being ignored (see [docs/production-deployment.md](docs/production-deployment.md)).
+- Status contexts should use an event-independent format (see the
+  Woodpecker docs), so branch protection can require stable names like
+  `ci/woodpecker/linux-amd64`.
 
-`make coverage-ci` mirrors the coverage chain locally (it needs
-`KIWI_TEST_POSTGRES_URL`).
-
-A `nightly` cron job in the Woodpecker repository settings (schedule
-`0 3 * * *`, branch `main`) runs the `fuzz-nightly` step: every fuzz target
-for 30 seconds.
-
-Woodpecker reports one commit status per workflow leg. With the server
-defaults (`WOODPECKER_STATUS_CONTEXT=ci/woodpecker` and the default context
-format with a `/<axis_id>` suffix for matrix legs) this pipeline reports
-`ci/woodpecker/push/woodpecker/1` (amd64) and `.../2` (arm64) on pushes, and
-the matching `/pr/` contexts on pull requests. GitHub Actions reports each
-matrix job as `<job name> (<matrix value>)`, so the native workflow adds
-`native (macos-latest)` and `native (windows-latest)`. `main` is
-branch-protected: merges require a pull request, all of those contexts green,
-and the branch up-to-date with `main`; admins are not exempt. The protection
-rule is applied idempotently by `make protect-branch`
-(`scripts/gh-branch-protection.sh`, repo-admin token required); the required
-contexts are configurable (`KIWI_WOODPECKER_CONTEXTS`,
-`KIWI_NATIVE_CONTEXTS`) and must match the actual checks. Dependabot keeps Go
-modules and pinned actions up to date with weekly PRs
-(`.github/dependabot.yml`); CI tool versions are pinned in `.woodpecker.yml`
-and `.github/workflows/native.yml` and upgraded deliberately (see
+`main` is branch-protected: merges require a pull request, the workflow
+contexts above green, and the branch up to date. Protection is applied by
+`make protect-branch` (`scripts/gh-branch-protection.sh`), which REFUSES to
+install any context it has not observed on a recent commit. Dependabot keeps
+Go modules current with weekly PRs (`.github/dependabot.yml`); tool versions
+are pinned in the workflow files and upgraded deliberately (see
 [docs/upgrades.md](docs/upgrades.md)).
+

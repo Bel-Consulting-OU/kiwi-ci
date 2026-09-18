@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -15,7 +16,7 @@ func TestAsyncLogSinkNeverBlocksProducerAndFlushesAll(t *testing.T) {
 	var delivered atomic.Int64
 	var mu sync.Mutex
 	seen := map[string]bool{}
-	sink := newAsyncLogSink(nil, func(lines []logLine) error {
+	sink := newAsyncLogSink(nil, func(_ context.Context, lines []logLine) error {
 		time.Sleep(5 * time.Millisecond) // slow endpoint
 		mu.Lock()
 		for _, l := range lines {
@@ -63,7 +64,7 @@ func TestAsyncLogSinkOverflowIsCounted(t *testing.T) {
 	t.Cleanup(func() { asyncSpoolLimit = oldLimit })
 
 	release := make(chan struct{})
-	sink := newAsyncLogSink(nil, func([]logLine) error {
+	sink := newAsyncLogSink(nil, func(context.Context, []logLine) error {
 		<-release // stall delivery entirely
 		return nil
 	})
@@ -81,7 +82,11 @@ func TestAsyncLogSinkOverflowIsCounted(t *testing.T) {
 // TestAsyncLogSinkSendErrorReported proves a background delivery failure is
 // surfaced (the caller fails the job) rather than swallowed.
 func TestAsyncLogSinkSendErrorReported(t *testing.T) {
-	sink := newAsyncLogSink(nil, func([]logLine) error { return fmt.Errorf("control plane down") })
+	// A PERMANENT (4xx-class) failure is surfaced immediately; transient
+	// failures retry with backoff first.
+	sink := newAsyncLogSink(nil, func(context.Context, []logLine) error {
+		return PermanentDeliveryError(fmt.Errorf("control plane down"))
+	})
 	sink.WriteLine("job", "step", "x")
 	out := sink.Finish(2 * time.Second)
 	if out.Err == nil {
@@ -104,7 +109,7 @@ func TestAsyncLogSinkByteBudgetBoundsMemory(t *testing.T) {
 	t.Cleanup(func() { asyncSpoolBytes, asyncSpoolLimit = oldBytes, oldLines })
 
 	release := make(chan struct{})
-	sink := newAsyncLogSink(nil, func([]logLine) error {
+	sink := newAsyncLogSink(nil, func(context.Context, []logLine) error {
 		<-release
 		return nil
 	})
@@ -127,7 +132,7 @@ func TestAsyncLogSinkByteBudgetBoundsMemory(t *testing.T) {
 func TestAsyncLogSinkInFlightCountsTowardFlush(t *testing.T) {
 	proceed := make(chan struct{})
 	var calls atomic.Int64
-	sink := newAsyncLogSink(nil, func([]logLine) error {
+	sink := newAsyncLogSink(nil, func(context.Context, []logLine) error {
 		calls.Add(1)
 		<-proceed // hold the batch in flight
 		return fmt.Errorf("delivery down")
@@ -149,5 +154,37 @@ func TestAsyncLogSinkInFlightCountsTowardFlush(t *testing.T) {
 	out := sink.Finish(3 * time.Second)
 	if out.Err == nil {
 		t.Fatal("in-flight failure was not surfaced after the sender stopped")
+	}
+}
+
+// TestAsyncLogSinkRetriesTransientFailures proves a retryable delivery
+// failure is retried (with the batch retained) and a later success clears
+// the error — the batch is not discarded on the first failure.
+func TestAsyncLogSinkRetriesTransientFailures(t *testing.T) {
+	var attempts atomic.Int64
+	delivered := make(chan int, 4)
+	sink := newAsyncLogSink(nil, func(_ context.Context, lines []logLine) error {
+		n := attempts.Add(1)
+		if n < 3 {
+			return fmt.Errorf("transient 503")
+		}
+		delivered <- len(lines)
+		return nil
+	})
+	sink.WriteLine("job", "step", "line-1")
+	out := sink.Finish(15 * time.Second)
+	select {
+	case n := <-delivered:
+		if n != 1 {
+			t.Fatalf("delivered %d lines, want 1", n)
+		}
+	default:
+		t.Fatal("batch was never delivered after retries")
+	}
+	if attempts.Load() < 3 {
+		t.Fatalf("attempts = %d, want retries before success", attempts.Load())
+	}
+	if out.Err != nil {
+		t.Fatalf("retry success must clear the error: %v", out.Err)
 	}
 }

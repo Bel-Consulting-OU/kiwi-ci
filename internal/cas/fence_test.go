@@ -90,3 +90,37 @@ func TestMemFencerWithinSameDigestSerializes(t *testing.T) {
 		t.Fatalf("max concurrent holders = %d, want 1", maxInside.Load())
 	}
 }
+
+// TestMemFencerWaiterCancellationIsClean proves a cancelled waiter removes
+// its reference and a later acquirer still gets the fence (no pinned entry,
+// no lost wakeup).
+func TestMemFencerWaiterCancellationIsClean(t *testing.T) {
+	f := NewMemFencer()
+	release, err := f.Acquire(context.Background(), "d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	waiting := make(chan error, 1)
+	go func() {
+		_, werr := f.Acquire(ctx, "d")
+		waiting <- werr
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	select {
+	case werr := <-waiting:
+		if werr == nil {
+			t.Fatal("cancelled waiter must not acquire")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled waiter never returned (non-cancellable wait)")
+	}
+	release()
+	// The entry must still be usable and acquirable after the cancellation.
+	r2, err := f.Acquire(context.Background(), "d")
+	if err != nil {
+		t.Fatalf("post-cancel acquire: %v", err)
+	}
+	r2()
+}
