@@ -399,14 +399,14 @@ func (f *FaultyStore) OutboxAck(ctx context.Context, id string) error {
 // (the fault-injection memStore implements the same supersede/watermark
 // semantics as the SQL store).
 func (f *FaultyStore) OutboxEnqueueVersioned(ctx context.Context, e OutboxItem) (VersionedEnqueueOutcome, error) {
+	inner, ok := f.Inner.(ForgeCheckStateStore)
+	if !ok {
+		return VersionedEnqueued, errMissingInnerInterface("ForgeCheckStateStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return VersionedEnqueued, err
-	}
-	inner, ok := f.Inner.(ForgeCheckStateStore)
-	if !ok {
-		return VersionedEnqueued, errMissingInnerInterface("ForgeCheckStateStore")
 	}
 	return inner.OutboxEnqueueVersioned(ctx, e)
 }
@@ -419,6 +419,21 @@ func (f *FaultyStore) OutboxVersionGuard(ctx context.Context, id, logicalKey str
 		return false, errMissingInnerInterface("ForgeCheckStateStore")
 	}
 	return inner.OutboxVersionGuard(ctx, id, logicalKey, version)
+}
+
+// OutboxMarkDelivered delegates the post-publication watermark stamp to the
+// inner store (legacy unversioned forge rows).
+func (f *FaultyStore) OutboxMarkDelivered(ctx context.Context, logicalKey string, version int64) error {
+	inner, ok := f.Inner.(ForgeCheckStateStore)
+	if !ok {
+		return errMissingInnerInterface("ForgeCheckStateStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return inner.OutboxMarkDelivered(ctx, logicalKey, version)
 }
 
 func (f *FaultyStore) OutboxPending(ctx context.Context) ([]OutboxItem, error) {
@@ -458,16 +473,16 @@ func (f *FaultyStore) ReleaseOutboxClaim(ctx context.Context, id, claimer string
 // OutboxRetry delegates the retry/dead-letter transition to the inner store
 // (the fault-injection memStore implements the same policy as the SQL store).
 func (f *FaultyStore) OutboxRetry(ctx context.Context, id string, dispatchErr error, maxAttempts int) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if err := f.fail(); err != nil {
-		return err
-	}
 	inner, ok := f.Inner.(interface {
 		OutboxRetry(context.Context, string, error, int) error
 	})
 	if !ok {
 		return errMissingInnerInterface("OutboxRetry")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
 	}
 	return inner.OutboxRetry(ctx, id, dispatchErr, maxAttempts)
 }
@@ -481,27 +496,27 @@ func (f *FaultyStore) OutboxDeadLetters(ctx context.Context) ([]OutboxDeadLetter
 }
 
 func (f *FaultyStore) OutboxRequeue(ctx context.Context, id string) error {
+	inner, ok := f.Inner.(OutboxDeadLetterStore)
+	if !ok {
+		return errMissingInnerInterface("OutboxDeadLetterStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
-	}
-	inner, ok := f.Inner.(OutboxDeadLetterStore)
-	if !ok {
-		return errMissingInnerInterface("OutboxDeadLetterStore")
 	}
 	return inner.OutboxRequeue(ctx, id)
 }
 
 func (f *FaultyStore) OutboxDelete(ctx context.Context, id string) error {
+	inner, ok := f.Inner.(OutboxDeadLetterStore)
+	if !ok {
+		return errMissingInnerInterface("OutboxDeadLetterStore")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
-	}
-	inner, ok := f.Inner.(OutboxDeadLetterStore)
-	if !ok {
-		return errMissingInnerInterface("OutboxDeadLetterStore")
 	}
 	return inner.OutboxDelete(ctx, id)
 }
@@ -1543,9 +1558,15 @@ func (m *memStore) CompleteJob(ctx context.Context, jobID string, generation int
 	// effect IDs the completing server queues locally — completion_reconcile
 	// (internal consistency, unbounded retries) and forge_delivery (external
 	// publication, bounded retries + dead-letter). The payload carries two
-	// strings, so marshaling cannot fail.
+	// strings, so marshaling cannot fail. The kind table is shared with the
+	// SQL completion transaction and its size is pinned by
+	// CompletionEffectIntentCount.
 	payload, _ := json.Marshal(CompletionEffectsPayload{JobID: jobID, RunID: j.RunID})
-	for _, kind := range []string{OutboxKindCompletionReconcile, OutboxKindForgeDelivery} {
+	kinds := NewCompletionEffectKinds()
+	if len(kinds) != CompletionEffectIntentCount {
+		return fmt.Errorf("storage: completion effect kind table has %d entries, want CompletionEffectIntentCount=%d", len(kinds), CompletionEffectIntentCount)
+	}
+	for _, kind := range kinds {
 		m.outbox = append(m.outbox, OutboxItem{ID: CompletionEffectID(jobID, generation, kind), Kind: kind, Payload: payload, CreatedAt: now})
 	}
 	return nil
@@ -1921,6 +1942,25 @@ func (m *memStore) OutboxVersionGuard(ctx context.Context, id, logicalKey string
 		newerPending = true
 	}
 	return alive && m.forgeState[logicalKey] < version && !newerPending, nil
+}
+
+// OutboxMarkDelivered is the in-memory mirror of the SQL watermark stamp for
+// legacy (unversioned) forge rows: the dispatcher derives the identity from
+// the payload and advances the delivered watermark after the forge accepted
+// the state.
+func (m *memStore) OutboxMarkDelivered(ctx context.Context, logicalKey string, version int64) error {
+	if logicalKey == "" || version <= 0 {
+		return fmt.Errorf("storage: mark delivered requires a logical key and a positive version")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.forgeState == nil {
+		m.forgeState = map[string]int64{}
+	}
+	if version > m.forgeState[logicalKey] {
+		m.forgeState[logicalKey] = version
+	}
+	return nil
 }
 
 // OutboxRetry mirrors the SQL retry policy: the attempt counter grows, the

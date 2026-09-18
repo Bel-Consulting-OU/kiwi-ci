@@ -251,8 +251,12 @@ func TestFlowOutboxDispatchKinds(t *testing.T) {
 	if err := s.dispatchOutbox(ctx, forge.OutboxItem{ID: "w", Kind: forge.OutboxKindWebhookCall, Payload: []byte(`{}`)}); err != nil {
 		t.Fatalf("webhook call must be dropped: %v", err)
 	}
-	if err := s.dispatchOutbox(ctx, forge.OutboxItem{ID: "u", Kind: "unknown-kind", Payload: []byte(`{}`)}); err != nil {
-		t.Fatalf("unknown kind must be dropped: %v", err)
+	// An unknown kind must NOT be dropped (that would ACK it away) or
+	// dead-lettered: the typed error keeps the row durable for a newer
+	// replica during a rolling upgrade.
+	unknown := s.dispatchOutbox(ctx, forge.OutboxItem{ID: "u", Kind: "unknown-kind", Payload: []byte(`{}`)})
+	if !errors.Is(unknown, errUnknownOutboxKind) {
+		t.Fatalf("unknown kind = %v, want errUnknownOutboxKind", unknown)
 	}
 	// Well-formed check/status payloads reach the forge adapter; without a
 	// configured forge they resolve to an error or a no-op, never a panic.

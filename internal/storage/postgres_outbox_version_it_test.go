@@ -246,3 +246,69 @@ func TestPostgresIntegrationOutboxVersionedConcurrentReplicas(t *testing.T) {
 		t.Fatalf("rows after concurrent acks = %d, %v; want 0", rows, err)
 	}
 }
+
+// TestPostgresIntegrationOutboxMarkDeliveredLegacyRow covers the LEGACY
+// pre-0018 row path against real PostgreSQL: OutboxAppend stores NULL
+// logical_key/state_version, the dispatcher-derived OutboxMarkDelivered
+// stamps the durable watermark for the derived identity, older derived
+// versions are then rejected by the guard, the stamp is monotonic, and the
+// legacy row's ack (NULL columns) removes it without touching the watermark.
+func TestPostgresIntegrationOutboxMarkDeliveredLegacyRow(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	key := "pg-legacy-key-" + pgITNewID(t)
+	legacyID := "legacy-row-" + pgITNewID(t)
+	if err := st.OutboxAppend(ctx, OutboxItem{
+		ID: legacyID, Kind: "github_check", Payload: []byte(`{"name":"Pipeline","status":"in_progress"}`),
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("append legacy row: %v", err)
+	}
+	// The row's columns are NULL/0, exactly like a pre-0018 pending row.
+	var nullKey *string
+	var storedVersion int64
+	if err := st.pool.QueryRow(ctx, `SELECT logical_key, state_version FROM outbox WHERE id=$1`, legacyID).Scan(&nullKey, &storedVersion); err != nil {
+		t.Fatal(err)
+	}
+	if nullKey != nil || storedVersion != 0 {
+		t.Fatalf("legacy row identity = key=%v version=%d, want NULL/0", nullKey, storedVersion)
+	}
+	// Before the publication no derived watermark exists: the derived v2
+	// identity is publishable.
+	if publish, err := st.OutboxVersionGuard(ctx, legacyID, key, 2); err != nil || !publish {
+		t.Fatalf("guard before stamp = %v, %v; want publish", publish, err)
+	}
+	// A successful publication stamps the watermark.
+	if err := st.OutboxMarkDelivered(ctx, key, 3); err != nil {
+		t.Fatalf("mark delivered: %v", err)
+	}
+	if publish, err := st.OutboxVersionGuard(ctx, legacyID, key, 2); err != nil || publish {
+		t.Fatalf("guard after stamp = %v, %v; want skip (derived older state)", publish, err)
+	}
+	// Monotonic: a lower stamp changes nothing, and a newer version passes.
+	if err := st.OutboxMarkDelivered(ctx, key, 1); err != nil {
+		t.Fatal(err)
+	}
+	var delivered int64
+	if err := st.pool.QueryRow(ctx, `SELECT delivered_version FROM forge_check_state WHERE logical_key=$1`, key).Scan(&delivered); err != nil || delivered != 3 {
+		t.Fatalf("watermark after lower stamp = %d, %v; want 3", delivered, err)
+	}
+	if publish, err := st.OutboxVersionGuard(ctx, legacyID, key, 4); err != nil || !publish {
+		t.Fatalf("guard for newer version = %v, %v; want publish", publish, err)
+	}
+	if err := st.OutboxMarkDelivered(ctx, "", 1); err == nil {
+		t.Fatal("empty logical key must be refused")
+	}
+	if err := st.OutboxMarkDelivered(ctx, key, 0); err == nil {
+		t.Fatal("non-positive version must be refused")
+	}
+	// Acking the legacy row removes it and leaves the watermark intact: its
+	// ack carries no identity, which is exactly why the explicit stamp
+	// exists.
+	if err := st.OutboxAck(ctx, legacyID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.pool.QueryRow(ctx, `SELECT delivered_version FROM forge_check_state WHERE logical_key=$1`, key).Scan(&delivered); err != nil || delivered != 3 {
+		t.Fatalf("watermark after legacy ack = %d, %v; want 3", delivered, err)
+	}
+}

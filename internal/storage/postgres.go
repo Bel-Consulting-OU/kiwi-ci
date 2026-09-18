@@ -1787,10 +1787,18 @@ func (s *PostgresStore) insertCompletionEffectsTx(ctx context.Context, tx pgx.Tx
 	if err != nil {
 		return err
 	}
+	kinds := NewCompletionEffectKinds()
+	if len(kinds) != CompletionEffectIntentCount {
+		// Fail closed instead of silently persisting a different intent set
+		// than the contract (and the server's deterministic local copies)
+		// promises: the completion transaction is the durability boundary for
+		// exactly these rows.
+		return fmt.Errorf("storage: completion effect kind table has %d entries, want CompletionEffectIntentCount=%d", len(kinds), CompletionEffectIntentCount)
+	}
 	// Strict insert: the receipt check inside this transaction already
 	// rejects replays, so an occupied reconcile ID means foreign state under
 	// a deterministic key — a hard invariant failure that rolls back.
-	for _, kind := range []string{OutboxKindCompletionReconcile, OutboxKindForgeDelivery} {
+	for _, kind := range kinds {
 		if _, err := tx.Exec(ctx, `INSERT INTO outbox (id, kind, payload, created_at) VALUES ($1, $2, $3, $4)`,
 			CompletionEffectID(jobID, generation, kind), kind, payload, now); err != nil {
 			return err
@@ -2949,6 +2957,24 @@ func (s *PostgresStore) OutboxAck(ctx context.Context, id string) error {
 		return err
 	}
 	return nil
+}
+
+// OutboxMarkDelivered advances the durable delivered watermark for one
+// logical key after a successful publication. Legacy pre-0018 rows carry no
+// logical_key/state_version columns, so their OutboxAck cannot advance the
+// watermark; the dispatcher derives the identity from the payload and calls
+// this after the forge accepted the state. GREATEST keeps it monotonic under
+// concurrent publications of different versions.
+func (s *PostgresStore) OutboxMarkDelivered(ctx context.Context, logicalKey string, version int64) error {
+	if logicalKey == "" || version <= 0 {
+		return fmt.Errorf("storage: mark delivered requires a logical key and a positive version")
+	}
+	_, err := s.pool.Exec(ctx, `INSERT INTO forge_check_state (logical_key, delivered_version, updated_at)
+		VALUES ($1, $2, now())
+		ON CONFLICT (logical_key) DO UPDATE
+			SET delivered_version = GREATEST(forge_check_state.delivered_version, EXCLUDED.delivered_version),
+			    updated_at = now()`, logicalKey, version)
+	return err
 }
 
 // OutboxEnqueueVersioned durably inserts one versioned forge-delivery intent

@@ -421,6 +421,17 @@ func TestSqueezeEnqueueDBFallback(t *testing.T) {
 	}
 	if _, err := s.enqueue(in); err == nil || !strings.Contains(err.Error(), "atomic") {
 		t.Fatalf("enqueue without the atomic contract = %v, want a fail-closed error", err)
+	} else {
+		var nd *stateNotDurableError
+		if !errors.As(err, &nd) {
+			t.Fatalf("enqueue error = %T, want *stateNotDurableError so submit/webhook answer 503 (FA-6)", err)
+		}
+	}
+	// The HTTP enqueue path maps the missing contract to 503, matching
+	// docs/upgrades.md; it must not look like an invalid client request.
+	body := `{"repo_url":"https://github.com/acme/backend.git","repo_full_name":"acme/backend","ref":"refs/heads/main","sha":"sha","pipeline":` + jsonString(smokePipeline) + `}`
+	if w := doJSON(t, s, http.MethodPost, "/api/v1/runs", "secret", body); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("submit without the atomic contract = %d, want 503: %s", w.Code, w.Body.String())
 	}
 	// Fail closed means NOTHING is written: no run, no jobs, no delivery.
 	f.mu.Lock()

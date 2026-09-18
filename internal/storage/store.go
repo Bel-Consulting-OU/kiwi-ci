@@ -239,12 +239,23 @@ const (
 //     or when the row itself no longer exists (a concurrent enqueue
 //     superseded it). The check is durable, so two replicas cannot publish
 //     an older state after a newer one once the newer one is visible.
+//     A LEGACY pre-0018 row has NULL logical_key/state_version columns: the
+//     dispatcher derives that identity from the payload and passes it here,
+//     so those rows obey the same watermark invariant.
+//   - OutboxMarkDelivered advances the durable delivered watermark for one
+//     logical key after a successful publication. It exists for legacy rows
+//     whose own ack cannot advance the watermark (their columns carry no
+//     identity); versioned rows still advance it atomically inside
+//     OutboxAck. GREATEST/max semantics keep the watermark monotonic.
 //
 // OutboxAck updates the delivered watermark in the same statement that
-// deletes the versioned row, so no separate method is needed for it.
+// deletes a VERSIONED row, so no separate method is needed for those; the
+// explicit OutboxMarkDelivered exists only for legacy rows whose columns
+// carry no identity.
 type ForgeCheckStateStore interface {
 	OutboxEnqueueVersioned(ctx context.Context, e OutboxItem) (VersionedEnqueueOutcome, error)
 	OutboxVersionGuard(ctx context.Context, id, logicalKey string, version int64) (publish bool, err error)
+	OutboxMarkDelivered(ctx context.Context, logicalKey string, version int64) error
 }
 
 // OutboxVersionLockNamespace is the advisory-lock key namespace that
@@ -302,6 +313,19 @@ func CompletionEffectKinds() []string {
 // per-kind intents listed by CompletionEffectKinds.
 const CompletionEffectIntentCount = 2
 
+// NewCompletionEffectKinds is the ordered set of intents a NEW completion
+// persists: ONE completion_reconcile row (internal consistency, unbounded
+// retries) and ONE forge_delivery row (external publication, bounded retries
+// + dead-letter). It is the single source of truth for the SQL completion
+// transaction, the memStore mirror and the server's fs/memory enqueue path,
+// and its size is pinned by CompletionEffectIntentCount.
+func NewCompletionEffectKinds() []string {
+	return []string{
+		OutboxKindCompletionReconcile,
+		OutboxKindForgeDelivery,
+	}
+}
+
 // IsCompletionEffectKind reports whether kind is a completion effect intent:
 // the split reconcile/forge_delivery rows or a legacy per-kind row.
 func IsCompletionEffectKind(kind string) bool {
@@ -314,6 +338,24 @@ func IsCompletionEffectKind(kind string) bool {
 		}
 	}
 	return false
+}
+
+// InternalCompletionEffectKind reports whether kind is an INTERNAL completion
+// effect: a completion effect whose dispatch runs the idempotent
+// marker-guarded reconciliation chain, so it converges forever and is never
+// dead-lettered. The external forge kinds (forge_delivery and the legacy
+// forge_status) are carved out of the completion-effect family: they own the
+// bounded retry/dead-letter policy, so a persistently failing forge can never
+// retire the internal consistency rows.
+func InternalCompletionEffectKind(kind string) bool {
+	if !IsCompletionEffectKind(kind) {
+		return false
+	}
+	switch kind {
+	case OutboxKindForgeDelivery, OutboxKindForgeStatus:
+		return false
+	}
+	return true
 }
 
 // CompletionEffectID derives the deterministic outbox item ID for one

@@ -5,12 +5,14 @@
 //
 // The guard encodes three CI invariants:
 //
-//  1. A workflow that runs on Woodpecker's local backend (a shell-image step
-//     such as bash/pwsh/powershell, or workflow labels selecting
-//     backend: local) executes directly on the worker host with no container
-//     boundary. It must not reference secrets, must not touch credential
-//     files, and must not run privileged/unsafe commands (docker socket
-//     mounts, writes into $HOME configuration, curl|sh).
+//  1. A workflow that runs on Woodpecker's local backend (a step whose image
+//     names a local-shell executable -- bash/sh/dash/zsh/ksh/busybox,
+//     pwsh/powershell, cmd, and their .exe forms, with any registry path,
+//     tag or digest stripped -- or workflow labels selecting backend: local)
+//     executes directly on the worker host with no container boundary. It
+//     must not reference secrets, must not touch credential files, and must
+//     not run privileged/unsafe commands (docker socket mounts, writes into
+//     $HOME configuration, curl|sh).
 //  2. Native/local workflows must stay on trusted push/manual/tag events and
 //     must advertise backend: local in their workflow-level labels.
 //  3. No branch-protection required context may name a workflow that never
@@ -247,13 +249,41 @@ func LoadDir(dir string) ([]Workflow, error) {
 	return out, nil
 }
 
-// localShellImages are the `image` values that mean "the local backend runs
-// this command directly on the worker host" (Woodpecker local backend:
-// image is the shell/executable).
-var localShellImages = map[string]bool{
+// localShellExecutables are the normalized `image` values that mean "the local
+// backend runs this command directly on the worker host" (Woodpecker local
+// backend: image is the shell/executable, not a container image).
+var localShellExecutables = map[string]bool{
 	"bash":       true,
+	"sh":         true,
+	"dash":       true,
+	"zsh":        true,
+	"ksh":        true,
+	"busybox":    true,
 	"pwsh":       true,
 	"powershell": true,
+	"cmd":        true,
+	"cmd.exe":    true,
+	"bash.exe":   true,
+	"sh.exe":     true,
+}
+
+// normalizeImageExecutable reduces an image value to the executable the local
+// backend would run: the basename of the registry path, with a trailing
+// `:tag` or `@digest` stripped. That makes execution-equivalent spellings
+// (`/bin/sh`, `bash:5`, `bash@sha256:...`, `docker.io/library/bash`) classify
+// the same as the bare shell name.
+func normalizeImageExecutable(image string) string {
+	s := strings.ToLower(strings.TrimSpace(image))
+	if i := strings.LastIndexAny(s, `/\`); i >= 0 {
+		s = s[i+1:]
+	}
+	if i := strings.IndexByte(s, '@'); i >= 0 {
+		s = s[:i]
+	}
+	if i := strings.LastIndexByte(s, ':'); i >= 0 {
+		s = s[:i]
+	}
+	return s
 }
 
 // restrictedLocalEvents is the only event set a local workflow may select:
@@ -298,14 +328,16 @@ func writesHomeConfig(cmd string) bool {
 }
 
 // IsLocal reports whether the workflow executes on the local backend: any
-// step whose image is a local shell, or workflow-level labels selecting
-// backend: local.
+// step whose normalized image names a local-shell executable, or
+// workflow-level labels selecting backend: local. The label check is
+// conservative: a workflow that advertises backend: local stays local
+// regardless of its image values.
 func IsLocal(w Workflow) bool {
 	if strings.EqualFold(strings.TrimSpace(w.Labels["backend"]), "local") {
 		return true
 	}
 	for _, s := range w.Steps {
-		if localShellImages[strings.ToLower(strings.TrimSpace(s.Image))] {
+		if localShellExecutables[normalizeImageExecutable(s.Image)] {
 			return true
 		}
 	}
@@ -345,9 +377,8 @@ func CheckWorkflow(w Workflow) []Finding {
 		}
 	}
 	for _, s := range w.Steps {
-		image := strings.ToLower(strings.TrimSpace(s.Image))
-		if !localShellImages[image] {
-			add(s.Name, "local-image", fmt.Sprintf("image %q is not a local shell (bash/pwsh/powershell)", s.Image))
+		if !localShellExecutables[normalizeImageExecutable(s.Image)] {
+			add(s.Name, "local-image", fmt.Sprintf("image %q is not a local shell (bash/sh/dash/zsh/ksh/busybox/pwsh/powershell/cmd)", s.Image))
 		}
 		prefix := "steps." + s.Name + "."
 		for _, p := range w.SecretPaths {
@@ -639,6 +670,188 @@ func TestWorkflowGuardDoctoredLocalFailures(t *testing.T) {
 	if got := mustRead(t, realPath); !bytes.Equal(got, real) {
 		t.Fatal("guard test modified the real .woodpecker/native-macos.yml")
 	}
+}
+
+// TestWorkflowGuardNormalizesImageExecutables pins the image normalization
+// rule: basename of the registry path, then `@digest` and `:tag` stripped,
+// lowercased and trimmed. Execution-equivalent spellings must collapse to the
+// bare shell name, and ordinary container images must not.
+func TestWorkflowGuardNormalizesImageExecutables(t *testing.T) {
+	cases := map[string]string{
+		"bash":                           "bash",
+		" BASH ":                         "bash",
+		"/bin/sh":                        "sh",
+		"/bin/bash":                      "bash",
+		"bash:5":                         "bash",
+		"bash@sha256:deadbeef":           "bash",
+		"docker.io/library/bash:5":       "bash",
+		"ghcr.io/org/sh@sha256:cafebabe": "sh",
+		"busybox:1.36":                   "busybox",
+		`C:\Windows\System32\cmd.exe`:    "cmd.exe",
+		"cmd.exe":                        "cmd.exe",
+		"golang:1.27":                    "golang",
+		"postgres:16-alpine":             "postgres",
+		"docker:cli":                     "docker",
+		"bashful:latest":                 "bashful",
+		"":                               "",
+	}
+	for in, want := range cases {
+		if got := normalizeImageExecutable(in); got != want {
+			t.Errorf("normalizeImageExecutable(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestWorkflowGuardEquivalentLocalImagesFail proves execution-equivalent
+// local-backend spellings are classified local and therefore caught by every
+// guard rule. The doctored copies come from real container lanes
+// (.woodpecker/linux-amd64.yml) whose labels do NOT select the local backend,
+// so only the image detector can make them local. The real YAMLs are never
+// modified (byte-compared afterwards).
+func TestWorkflowGuardEquivalentLocalImagesFail(t *testing.T) {
+	const goImage = "golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea"
+	realPath := filepath.Join(repoRoot(t), ".woodpecker", "linux-amd64.yml")
+	real := mustRead(t, realPath)
+
+	cases := []struct {
+		name    string
+		old     string
+		new     string
+		kind    string
+		step    string
+		wantMsg string
+	}{
+		{
+			name: "sh image with a secret", kind: "local-secret", step: "format", wantMsg: "RELEASE_TOKEN",
+			old: "  format:\n    image: " + goImage + "\n    commands:\n",
+			new: "  format:\n    image: sh\n    environment:\n      RELEASE_TOKEN:\n        from_secret: release-token\n    commands:\n",
+		},
+		{
+			name: "digest-pinned bash with a secret", kind: "local-secret", step: "format", wantMsg: "RELEASE_TOKEN",
+			old: "  format:\n    image: " + goImage + "\n    commands:\n",
+			new: "  format:\n    image: bash@sha256:deadbeef\n    environment:\n      RELEASE_TOKEN:\n        from_secret: release-token\n    commands:\n",
+		},
+		{
+			name: "/bin/sh image on a pull_request workflow", kind: "local-events", step: "", wantMsg: "pull_request",
+			old: "  format:\n    image: " + goImage + "\n",
+			new: "  format:\n    image: /bin/sh\n",
+		},
+		{
+			name: "bash:5 image with a docker socket mount", kind: "local-unsafe", step: "format", wantMsg: "docker-socket-mount",
+			old: "  format:\n    image: " + goImage + "\n    commands:\n",
+			new: "  format:\n    image: bash:5\n    commands:\n      - docker run -v /var/run/docker.sock:/var/run/docker.sock docker:cli info\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doctored := strings.Replace(string(real), tc.old, tc.new, 1)
+			if doctored == string(real) {
+				t.Fatalf("doctoring %q did not apply", tc.old)
+			}
+			path := filepath.Join(t.TempDir(), "linux-amd64.yml")
+			mustWrite(t, path, []byte(doctored))
+			w, err := LoadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !IsLocal(w) {
+				t.Fatalf("workflow with a local-shell image was not classified local")
+			}
+			findings := CheckWorkflow(w)
+			var match *Finding
+			for i := range findings {
+				f := findings[i]
+				if f.Kind == tc.kind && f.Step == tc.step && strings.Contains(f.Message, tc.wantMsg) {
+					match = &findings[i]
+					break
+				}
+			}
+			if match == nil {
+				t.Fatalf("guard missed the doctored %s; findings:\n%s", tc.name, FormatFindings(findings))
+			}
+			if match.File != "linux-amd64.yml" {
+				t.Fatalf("finding file = %q, want linux-amd64.yml (%s)", match.File, match.String())
+			}
+			t.Logf("guard finding: %s", match.String())
+		})
+	}
+	if got := mustRead(t, realPath); !bytes.Equal(got, real) {
+		t.Fatal("guard test modified the real .woodpecker/linux-amd64.yml")
+	}
+}
+
+// TestWorkflowGuardImageClassificationEdges covers the conservative label
+// rule, the Windows local shell, and the false-positive side: a normal
+// container image with a secret and a pull_request event must not be
+// classified local, while backend: local labels keep a workflow local
+// regardless of its image.
+func TestWorkflowGuardImageClassificationEdges(t *testing.T) {
+	load := func(t *testing.T, name, body string) Workflow {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), name)
+		mustWrite(t, path, []byte(body))
+		w, err := LoadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return w
+	}
+
+	t.Run("cmd on windows is local", func(t *testing.T) {
+		w := load(t, "native-windows.yml", "labels:\n  platform: windows/amd64\nwhen:\n  - event: [push]\nsteps:\n  build:\n    image: cmd\n    commands:\n      - go version\n")
+		if !IsLocal(w) {
+			t.Fatal("image cmd on a windows workflow was not classified local")
+		}
+		findings := CheckWorkflow(w)
+		var match *Finding
+		for i := range findings {
+			if findings[i].Kind == "local-labels" {
+				match = &findings[i]
+			}
+		}
+		if match == nil {
+			t.Fatalf("local cmd step must require backend: local labels; findings:\n%s", FormatFindings(findings))
+		}
+		t.Logf("guard finding: %s", match.String())
+	})
+
+	t.Run("backend local label stays local regardless of image", func(t *testing.T) {
+		w := load(t, "labelled.yml", "labels:\n  backend: local\nwhen:\n  - event: [push]\nsteps:\n  build:\n    image: golang:1.27\n    commands:\n      - go version\n")
+		if !IsLocal(w) {
+			t.Fatal("backend: local labels were not honored")
+		}
+		findings := CheckWorkflow(w)
+		var match *Finding
+		for i := range findings {
+			if findings[i].Kind == "local-image" && findings[i].Step == "build" {
+				match = &findings[i]
+			}
+		}
+		if match == nil {
+			t.Fatalf("a labelled local workflow with a container image must be flagged; findings:\n%s", FormatFindings(findings))
+		}
+		t.Logf("guard finding: %s", match.String())
+	})
+
+	t.Run("container image is not misclassified", func(t *testing.T) {
+		w := load(t, "linux-amd64.yml", "when:\n  - event: [push, pull_request]\nsteps:\n  unit:\n    image: golang:1.27\n    environment:\n      RELEASE_TOKEN:\n        from_secret: release-token\n    commands:\n      - go test ./...\n")
+		if IsLocal(w) {
+			t.Fatal("container image golang:1.27 was misclassified as local")
+		}
+		if findings := CheckWorkflow(w); len(findings) != 0 {
+			t.Fatalf("non-local workflow produced findings:\n%s", FormatFindings(findings))
+		}
+	})
+
+	t.Run("real container lane is not local", func(t *testing.T) {
+		w, err := LoadFile(filepath.Join(repoRoot(t), ".woodpecker", "linux-amd64.yml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if IsLocal(w) {
+			t.Fatal("real .woodpecker/linux-amd64.yml was misclassified as local")
+		}
+	})
 }
 
 // TestWorkflowGuardDoctoredRequiredContextFails proves the context

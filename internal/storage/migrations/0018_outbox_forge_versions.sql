@@ -1,4 +1,4 @@
--- 0018_outbox_forge_versions.sql — versioned forge-delivery identity.
+-- 0018_outbox_forge_versions.sql — versioned forge-delivery identity (columns).
 --
 -- A forge check is a LOGICAL remote object (run + check name) whose state
 -- advances monotonically queued -> in_progress -> completed. The outbox row
@@ -18,18 +18,20 @@
 -- SAME statement as the outbox row deletion (OutboxAck) so the watermark can
 -- never lag an acknowledged delivery, and it outlives the deleted outbox row
 -- (a max() over the outbox itself would lose the watermark on every ACK).
+--
+-- DEPLOY-SAFETY SPLIT (see 0019/0020): this file deliberately holds only
+-- fast, non-rewriting DDL. Both ALTERs are metadata-only ADD COLUMN (the
+-- NOT NULL DEFAULT 0 is stored in the catalog, not rewritten, on PostgreSQL
+-- 11+) and forge_check_state is brand new, so the ACCESS EXCLUSIVE lock this
+-- transaction takes on outbox is held for the duration of these statements
+-- only. The two indexes over the new columns live in their own files because
+-- PostgresStore.Migrate runs every file in one transaction: keeping them here
+-- would hold that ACCESS EXCLUSIVE lock across both index builds and block
+-- every outbox INSERT (webhooks, completions) for the whole build.
 
 ALTER TABLE outbox ADD COLUMN IF NOT EXISTS logical_key TEXT;
 
 ALTER TABLE outbox ADD COLUMN IF NOT EXISTS state_version BIGINT NOT NULL DEFAULT 0;
-
-CREATE UNIQUE INDEX IF NOT EXISTS outbox_logical_version_idx
-    ON outbox (logical_key, state_version)
-    WHERE logical_key IS NOT NULL;
-
-CREATE INDEX IF NOT EXISTS outbox_logical_pending_idx
-    ON outbox (logical_key, state_version)
-    WHERE logical_key IS NOT NULL AND dead_lettered_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS forge_check_state (
     logical_key       TEXT PRIMARY KEY,

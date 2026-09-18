@@ -2,11 +2,13 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
@@ -282,3 +284,68 @@ func jsonStr(v string) string {
 }
 
 var _ = storage.ErrNotFound
+
+// TestDBFakeLogBatchConflictMatchesDurableStores is FA-5: the DB-mode test
+// fake must compare payload digests exactly like Postgres, the memStore and
+// the fs journal, or DB-mode server tests cannot catch a handler that ACKs a
+// conflicting batch reuse as a replay.
+func TestDBFakeLogBatchConflictMatchesDurableStores(t *testing.T) {
+	ctx := context.Background()
+	f := newDBFakeStore()
+	r := storage.LogBatchReceipt{JobID: "j1", Generation: 1, BatchID: "b1"}
+	entries := []model.LogEntry{{RunID: "r1", JobID: "j1", JobKey: "build", Step: "run", Line: "one", CreatedAt: time.Now().UTC()}}
+	inserted, err := f.AppendLogBatch(ctx, entries, r)
+	if err != nil || !inserted {
+		t.Fatalf("first batch = inserted %v err %v, want true/nil", inserted, err)
+	}
+	// An identical ordered payload with fresh per-delivery metadata (Seq,
+	// CreatedAt) is the idempotent duplicate, not a conflict.
+	replay := []model.LogEntry{{RunID: "r1", JobID: "j1", JobKey: "build", Step: "run", Line: "one", CreatedAt: time.Now().UTC(), Seq: 99}}
+	if inserted, err = f.AppendLogBatch(ctx, replay, r); err != nil || inserted {
+		t.Fatalf("identical replay = inserted %v err %v, want false/nil", inserted, err)
+	}
+	// A reused identity with different lines is the same conflict the
+	// durable stores report.
+	conflict := []model.LogEntry{{RunID: "r1", JobID: "j1", JobKey: "build", Step: "run", Line: "changed"}}
+	if _, err = f.AppendLogBatch(ctx, conflict, r); !errors.Is(err, storage.ErrLogBatchConflict) {
+		t.Fatalf("conflicting batch = %v, want storage.ErrLogBatchConflict", err)
+	}
+	f.mu.Lock()
+	stored := len(f.logs)
+	f.mu.Unlock()
+	if stored != 1 {
+		t.Fatalf("stored lines = %d, want exactly the first batch's 1", stored)
+	}
+}
+
+// TestDBLogBatchHandlerConflictNotAcked is the handler-level half of FA-5:
+// a conflicting reuse of a batch identity must get the fixed failure
+// response, never the 204 replay ack a digest-blind fake used to produce.
+func TestDBLogBatchHandlerConflictNotAcked(t *testing.T) {
+	f := newDBFakeStore()
+	s, runnerID, task := effectsFixture(t, f)
+	path := "/api/v1/jobs/" + task.Job.ID + "/log/batch"
+
+	body := fsLogBatchBody(t, runnerID, task, "conflict-batch", 1, fsLogBatchLine(task.Job.Key, "run", "one"))
+	if w := doJSON(t, s, http.MethodPost, path, "token", body); w.Code != http.StatusNoContent {
+		t.Fatalf("first batch = %d, want 204: %s", w.Code, w.Body.String())
+	}
+	conflict := fsLogBatchBody(t, runnerID, task, "conflict-batch", 1, fsLogBatchLine(task.Job.Key, "run", "changed"))
+	w := doJSON(t, s, http.MethodPost, path, "token", conflict)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("conflicting batch = %d, want 500 (conflict must not be ACKed as a replay): %s", w.Code, w.Body.String())
+	}
+	if got := w.Body.String(); got != "log batch append failed\n" {
+		t.Fatalf("conflicting batch body = %q", got)
+	}
+	// The original payload is still the idempotent 204 replay.
+	if w := doJSON(t, s, http.MethodPost, path, "token", body); w.Code != http.StatusNoContent {
+		t.Fatalf("duplicate delivery = %d, want 204: %s", w.Code, w.Body.String())
+	}
+	f.mu.Lock()
+	stored := len(f.logs)
+	f.mu.Unlock()
+	if stored != 1 {
+		t.Fatalf("stored lines = %d, want exactly 1", stored)
+	}
+}

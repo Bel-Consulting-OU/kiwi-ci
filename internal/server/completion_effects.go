@@ -302,24 +302,65 @@ func (s *Server) runForJob(ctx context.Context, runID string) (model.Run, error)
 }
 
 // enqueueCompletionEffects durably queues the completion effect intents
-// (memory/fs mode: random IDs, persisted to outbox.jsonl when a store is
-// attached). The inline completion pass already applied the effects; the
-// queued intents become no-ops via their markers unless a crash lost the
-// inline pass, in which case the flush performs them. TWO intents are
-// queued: completion_reconcile (internal consistency, unbounded retries) and
+// (memory/fs mode: persisted to outbox.jsonl when a store is attached). The
+// inline completion pass already applied the effects; the queued intents
+// become no-ops via their markers unless a crash lost the inline pass, in
+// which case the flush performs them. TWO intents are queued:
+// completion_reconcile (internal consistency, unbounded retries) and
 // forge_delivery (external publication, bounded retries + dead-letter).
+//
+// IDs are DETERMINISTIC (storage.CompletionEffectID over job + lease
+// generation + kind), exactly like the DB-mode rows the completion
+// transaction commits: a replayed completion (receipt match) re-runs this
+// idempotently and converges on the same two intents instead of duplicating
+// them, which is what makes the fs replay path able to repair a crash between
+// the durable completion and the outbox append (FA-1).
 func (s *Server) enqueueCompletionEffects(j model.Job, run model.Run) error {
-	payload, err := jsonMarshal(storage.CompletionEffectsPayload{JobID: j.ID, RunID: run.ID})
+	return s.enqueueCompletionEffectIntents(j.ID, run.ID, j.LeaseGeneration)
+}
+
+// enqueueCompletionEffectIntents queues the two deterministic completion
+// effect intents for one (job, lease generation). The caller supplies the
+// generation explicitly so a receipt-replayed completion converges on the
+// ORIGINAL generation's intent IDs even when the live job has since been
+// re-leased under a newer one.
+func (s *Server) enqueueCompletionEffectIntents(jobID, runID string, generation int64) error {
+	payload, err := jsonMarshal(storage.CompletionEffectsPayload{JobID: jobID, RunID: runID})
 	if err != nil {
 		return err
 	}
 	now := time.Now().UTC()
-	for _, kind := range []string{storage.OutboxKindCompletionReconcile, storage.OutboxKindForgeDelivery} {
-		if err := s.outbox.Enqueue(forge.OutboxItem{Kind: kind, Payload: payload, CreatedAt: now}); err != nil {
+	for _, kind := range storage.NewCompletionEffectKinds() {
+		if err := s.outbox.Enqueue(forge.OutboxItem{
+			ID:        storage.CompletionEffectID(jobID, generation, kind),
+			Kind:      kind,
+			Payload:   payload,
+			CreatedAt: now,
+		}); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// repairCompletionIntents re-ensures the deterministic completion effect
+// intents exist in the outbox for a receipt-replayed completion in
+// fs/memory mode. The fs outbox is a SEPARATE journal from the snapshot: a
+// crash (or a failed append) between the durable completion and
+// enqueueCompletionEffects leaves the terminal forge_delivery intent
+// unrecorded, and the replay path would otherwise only reconcile internal
+// effects, losing the terminal forge publication forever. Enqueue is
+// idempotent by deterministic ID and skips already-delivered IDs, so a
+// replay after a successful completion is a no-op. A job that no longer
+// exists is treated as already reconciled.
+func (s *Server) repairCompletionIntents(jobID string, generation int64) error {
+	s.mu.Lock()
+	j, ok := s.jobs[jobID]
+	s.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	return s.enqueueCompletionEffectIntents(jobID, j.RunID, generation)
 }
 
 // enqueueCompletionEffectsLocal queues in-memory-only copies of the effect
@@ -332,7 +373,7 @@ func (s *Server) enqueueCompletionEffectsLocal(jobID, runID string, generation i
 		return
 	}
 	now := time.Now().UTC()
-	for _, kind := range []string{storage.OutboxKindCompletionReconcile, storage.OutboxKindForgeDelivery} {
+	for _, kind := range storage.NewCompletionEffectKinds() {
 		s.outbox.EnqueueLocal(forge.OutboxItem{
 			ID:        storage.CompletionEffectID(jobID, generation, kind),
 			Kind:      kind,

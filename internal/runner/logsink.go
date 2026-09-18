@@ -45,6 +45,11 @@ type asyncLogSink struct {
 	// first, in sequence order. Guarded by the sender goroutine: only
 	// newLogSink and run touch it.
 	pending []logBatch
+	// mem is the shared in-memory byte budget. A journaled sink adopts the
+	// journal's budget so the spool AND the journal-resident pending records
+	// are charged against the documented asyncSpoolBytes bound; a
+	// journal-less sink gets its own.
+	mem *logMemBudget
 
 	// batchSeq assigns every batch its immutable sequence when the sink
 	// forms the batch — once, before the first send — so retries of that
@@ -143,10 +148,6 @@ const (
 	asyncPostBatch = 200
 )
 
-func newAsyncLogSink(inner logging.Sink, post func(context.Context, logBatch) error) *asyncLogSink {
-	return newLogSink(inner, post, nil)
-}
-
 // newJournaledAsyncLogSink builds a sink whose batches are durable before
 // they are sent. The journal's unconsumed records are loaded at construction
 // and replayed, with their original batch ids and sequences, before the sink
@@ -160,11 +161,17 @@ func newLogSink(inner logging.Sink, post func(context.Context, logBatch) error, 
 	s := &asyncLogSink{inner: inner, post: post, journal: journal, ctx: ctx, cancel: cancel, done: make(chan struct{})}
 	s.cond = sync.NewCond(&s.mu)
 	if journal != nil {
-		s.pending = journal.pendingBatches()
+		// The journal owns the shared memory budget; moving the loaded
+		// records out of the journal keeps exactly one in-memory copy, still
+		// charged until each batch is acked.
+		s.mem = journal.mem
+		s.pending = journal.takePendingBatches()
 		s.batchSeq.Store(journal.maxSequence())
 		// Replay counts as work in flight so Flush/Finish never report a
 		// clean stop while unconsumed records are still being delivered.
 		s.inFlight = len(s.pending)
+	} else {
+		s.mem = &logMemBudget{}
 	}
 	go s.run()
 	return s
@@ -187,8 +194,9 @@ func PermanentDeliveryError(err error) error {
 }
 
 // WriteLine implements logging.Sink. It never blocks on the network: when
-// the spool is full in lines OR bytes the line is dropped (counted, surfaced
-// later) instead of stalling the drain that feeds it.
+// the spool is full in lines OR the shared memory budget (spool +
+// journal-resident records) cannot fit the line, the line is dropped
+// (counted, surfaced later) instead of stalling the drain that feeds it.
 func (s *asyncLogSink) WriteLine(job, step, line string) {
 	if s.inner != nil {
 		s.inner.WriteLine(job, step, line)
@@ -197,11 +205,16 @@ func (s *asyncLogSink) WriteLine(job, step, line string) {
 	// drain decrements by exactly this value.
 	l := logLine{Job: job, Step: step, Line: line, spoolCost: int64(len(job) + len(step) + len(line))}
 	s.mu.Lock()
-	if s.closed || len(s.spool) >= asyncSpoolLimit || s.spoolBytes+l.spoolCost > asyncSpoolBytes {
+	if s.closed || len(s.spool) >= asyncSpoolLimit {
 		s.mu.Unlock()
 		if !s.closed {
 			s.dropped.Add(1)
 		}
+		return
+	}
+	if !s.mem.reserve(l.spoolCost) {
+		s.mu.Unlock()
+		s.dropped.Add(1)
 		return
 	}
 	s.spool = append(s.spool, l)
@@ -214,6 +227,12 @@ func (s *asyncLogSink) WriteLine(job, step, line string) {
 // into batched posts until Close. Every new batch is journaled before its
 // first POST attempt and acked after a confirmed delivery; a journal failure
 // leaves the batch in the spool and stops the sender (fail closed).
+//
+// Delivery failures stop the sender (fail closed) as well: continuing could
+// ack a LATER batch and advance the single ack watermark past a sequence the
+// control plane never received, which a restart would then treat as consumed
+// and silently discard. Stopping keeps the watermark the highest CONTIGUOUS
+// acked sequence, so the failed journaled batch always replays.
 func (s *asyncLogSink) run() {
 	defer close(s.done)
 	// Recovery: the records were journaled by an earlier process and carry
@@ -221,7 +240,8 @@ func (s *asyncLogSink) run() {
 	// idempotent server-side and reproduces the persisted batch boundaries
 	// byte-for-byte. This runs before any new batch is formed and before any
 	// newly spooled line can be sent, so ordering across the restart holds.
-	for _, batch := range s.pending {
+	for i := range s.pending {
+		batch := s.pending[i]
 		err := s.postWithRetries(batch)
 		if err == nil && s.journal != nil {
 			// Deliver ack only after the server confirmed the delivery.
@@ -233,6 +253,9 @@ func (s *asyncLogSink) run() {
 			s.recordSendErr(err)
 			return
 		}
+		// Release the replay buffer slot after the ack so the shared memory
+		// budget drops with the record.
+		s.pending[i] = logBatch{}
 		s.mu.Lock()
 		s.inFlight--
 		s.cond.Broadcast()
@@ -281,16 +304,27 @@ func (s *asyncLogSink) run() {
 		s.spool = append([]logLine(nil), s.spool[n:]...)
 		s.spoolBytes -= removed
 		s.inFlight++
+		s.mem.release(removed)
 		s.mu.Unlock()
 
 		if s.journal != nil {
 			if jerr := s.journal.append(batch); jerr != nil {
 				// No POST may leave the process for a batch that is not
-				// durably journaled. Restore the exact per-line costs, stop
-				// the sender, and surface the failure on the job outcome.
+				// durably journaled. Restore the exact per-line costs (under
+				// the same shared budget: a line that no longer fits is
+				// counted, never silently dropped), stop the sender, and
+				// surface the failure on the job outcome.
 				s.mu.Lock()
-				s.spool = append(append([]logLine(nil), batch.Lines...), s.spool...)
-				s.spoolBytes += removed
+				var restored []logLine
+				for _, l := range batch.Lines {
+					if s.mem.reserve(l.spoolCost) {
+						restored = append(restored, l)
+						s.spoolBytes += l.spoolCost
+					} else {
+						s.dropped.Add(1)
+					}
+				}
+				s.spool = append(restored, s.spool...)
 				s.inFlight--
 				s.mu.Unlock()
 				s.recordSendErr(jerr)
@@ -312,6 +346,12 @@ func (s *asyncLogSink) run() {
 		}
 		s.cond.Broadcast()
 		s.mu.Unlock()
+		if err != nil {
+			// Fail closed: stop before any later batch can be acked past
+			// the failed sequence (see the run doc comment). Lines still
+			// spooled stay pending and are reported as Remaining.
+			return
+		}
 		if s.ctx.Err() != nil {
 			return
 		}
@@ -393,7 +433,9 @@ func (s *asyncLogSink) Flush(deadline time.Duration) int {
 // Finish stops the sender with a deadline and reports the final state. The
 // in-flight request is given up to deadline to complete; if the deadline
 // expires the outcome reports Stopped=false and the remaining work, and the
-// job must fail explicitly rather than claim a clean completion.
+// job must fail explicitly rather than claim a clean completion. Before the
+// outcome is reported, any batched acks are flushed durably so a clean stop
+// leaves the watermark covering every confirmed delivery.
 func (s *asyncLogSink) Finish(deadline time.Duration) logOutcome {
 	s.Flush(deadline)
 	s.mu.Lock()
@@ -411,6 +453,13 @@ func (s *asyncLogSink) Finish(deadline time.Duration) logOutcome {
 		select {
 		case <-s.done:
 		case <-time.After(2 * time.Second):
+		}
+	}
+	if s.journal != nil {
+		// Surface a failed ack flush explicitly instead of reporting a
+		// clean stop while confirmed acks are not yet durable.
+		if err := s.journal.flushAcks(); err != nil {
+			s.recordSendErr(err)
 		}
 	}
 	s.mu.Lock()

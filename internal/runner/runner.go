@@ -141,9 +141,10 @@ type Config struct {
 	// batch journal lives under it (keyed by job and lease generation) so a
 	// restarted runner replays unconsumed batches under their original
 	// identities instead of re-batching (and duplicating) them. Defaults
-	// (resolved by Run, not needed by tests that call execute directly):
+	// (resolved by Run, which fails closed when none can be resolved):
 	// CacheRoot when set, otherwise the identity directory, otherwise
-	// ~/.kiwi.
+	// ~/.kiwi. Direct execute test callers opt out of the journal explicitly
+	// through the Runner's journalOptOut seam.
 	StateDir string
 	// SigstoreKeyPath is a PKCS8 PEM Ed25519 private key used to sign
 	// Sigstore attestations for artifacts whose contract declares a
@@ -177,6 +178,12 @@ type Runner struct {
 	// and leave capEnforced false.
 	effectiveCapabilities []string
 	capEnforced           bool
+	// journalOptOut is the explicit seam that lets a caller of execute run
+	// WITHOUT the durable log journal: only direct test callers that do not
+	// resolve a state directory set it (testRunnerFor does). Run never sets
+	// it, so the production path always fails closed when no state
+	// directory can be resolved.
+	journalOptOut bool
 }
 
 // registerResponse is the register reply. Capabilities is decoded as raw
@@ -243,7 +250,9 @@ func (r *Runner) Run(ctx context.Context) error {
 		r.ID = id
 	}
 	r.resolveIdentityDir()
-	r.resolveStateDir()
+	if err := r.resolveStateDir(); err != nil {
+		return err
+	}
 	if err := r.prepareClient(ctx); err != nil {
 		return err
 	}
@@ -1467,34 +1476,45 @@ func (r *Runner) resolveIdentityDir() {
 	}
 }
 
-// resolveStateDir defaults the runner's durable state directory (home of the
+// resolveStateDir resolves the runner's durable state directory (home of the
 // log batch journal). Precedence: an explicit StateDir, then the cache root
 // (tests and deployments that already provision it), then the identity
-// directory, and finally ~/.kiwi. It is resolved by Run so callers that
-// invoke execute directly (tests) keep the journal off unless they opt in.
-func (r *Runner) resolveStateDir() {
+// directory, and finally ~/.kiwi. It returns an explicit error when no
+// durable directory can be determined: the production entry path (Run) must
+// fail closed rather than silently running without the journal. Callers that
+// invoke execute directly (tests) opt out explicitly via journalOptOut.
+func (r *Runner) resolveStateDir() error {
 	if r.Cfg.StateDir != "" {
-		return
+		return nil
 	}
 	if r.Cfg.CacheRoot != "" {
 		r.Cfg.StateDir = r.Cfg.CacheRoot
-		return
+		return nil
 	}
 	if r.Cfg.IdentityDir != "" {
 		r.Cfg.StateDir = r.Cfg.IdentityDir
-		return
+		return nil
 	}
-	home, _ := os.UserHomeDir()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("runner state directory: %w", err)
+	}
 	if home == "" {
-		return
+		return errors.New("runner state directory: no StateDir, CacheRoot, IdentityDir or HOME is configured; refusing to run without the durable log journal")
 	}
 	r.Cfg.StateDir = filepath.Join(home, ".kiwi")
+	return nil
 }
 
 // openJobLogJournal opens the durable batch journal for one job lease
-// generation. A nil journal (no state directory) disables journaling.
+// generation. A missing state directory is an explicit error on the
+// production path; the journalOptOut seam is the only way execute can run
+// journal-less, and tests that call execute directly set it deliberately.
 func (r *Runner) openJobLogJournal(jobID string, generation int64, mask func(string) string) (*logJournal, error) {
 	if r.Cfg.StateDir == "" {
+		if !r.journalOptOut {
+			return nil, errors.New("runner state directory is not resolved: refusing to run without the durable log journal")
+		}
 		return nil, nil
 	}
 	return openLogJournal(filepath.Join(r.Cfg.StateDir, "log-journal"), jobID, generation, mask)

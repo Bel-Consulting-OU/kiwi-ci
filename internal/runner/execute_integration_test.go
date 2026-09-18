@@ -141,7 +141,11 @@ func testRunnerFor(t *testing.T, ts *httptest.Server, cfg Config) *Runner {
 	if cfg.CacheRoot == "" {
 		cfg.CacheRoot = t.TempDir()
 	}
-	return &Runner{Cfg: cfg, ID: "runner-1", Client: &http.Client{Timeout: 30 * time.Second}, Metrics: NewMetrics()}
+	// Direct execute callers deliberately opt out of the durable log
+	// journal: without a resolved StateDir the production Run path fails
+	// closed, and this seam keeps execute usable journal-less in tests that
+	// do not exercise the journal (tests that set Cfg.StateDir still get it).
+	return &Runner{Cfg: cfg, ID: "runner-1", Client: &http.Client{Timeout: 30 * time.Second}, Metrics: NewMetrics(), journalOptOut: true}
 }
 
 func basicTask(pipelineText string) server.Task {

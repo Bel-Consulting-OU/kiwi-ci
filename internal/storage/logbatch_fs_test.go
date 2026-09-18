@@ -118,17 +118,23 @@ func TestFSAppendLogBatchJournalWriteFailureRetrySingleCopy(t *testing.T) {
 // TestFSAppendLogBatchPublishFsyncFailureRetrySingleCopy injects a directory
 // fsync failure on the PUBLICATION step: the rename has already happened, so
 // the batch is durable, and the retry must recognize it instead of writing a
-// second copy.
+// second copy. The injected failure targets the committed run directory's
+// sync by path (the per-run layout plus the max-seq index write add other
+// directory fsyncs).
 func TestFSAppendLogBatchPublishFsyncFailureRetrySingleCopy(t *testing.T) {
 	repo := New(t.TempDir())
 	id := LogBatchIdentity{JobID: "job-1", Generation: 1, BatchID: "batch-1"}
 	entries := wave1BatchEntries("run-1", "job-1")
 
+	// Layout adaptation: the max-seq index write adds directory fsyncs of its
+	// own, so the injected failure is targeted at the committed RUN
+	// directory's sync (the publication step, after the rename) instead of
+	// relying on the ordinal call count.
 	oldDir := atomicDirSync
-	calls := 0
+	failed := 0
 	atomicDirSync = func(dir string) error {
-		calls++
-		if calls == 2 {
+		if filepath.Base(filepath.Dir(dir)) == filepath.Base(repo.logBatchCommittedDir()) {
+			failed++
 			return errors.New("injected publication dir fsync failure")
 		}
 		return oldDir(dir)
@@ -139,8 +145,8 @@ func TestFSAppendLogBatchPublishFsyncFailureRetrySingleCopy(t *testing.T) {
 	if err == nil {
 		t.Fatal("append must surface the publication fsync failure")
 	}
-	if calls < 2 {
-		t.Fatalf("publication dir fsync did not run: calls=%d", calls)
+	if failed == 0 {
+		t.Fatal("publication dir fsync did not run")
 	}
 	got, rerr := repo.ReadLogs("run-1", 0, 100)
 	if rerr != nil || len(got) != 3 {
@@ -161,6 +167,11 @@ func TestFSAppendLogBatchPublishFsyncFailureRetrySingleCopy(t *testing.T) {
 // TestFSAppendLogBatchRecoveryReconcilesJournal proves that Load reconciles
 // an interrupted batch: a complete pending journal is published exactly once,
 // and a journal whose batch already committed is dropped.
+//
+// Layout adaptation: committed records now live in
+// logbatches/committed/<runID>/<key>.json (per-run scoping), so the
+// committed-path assertions below name the run directory; the pending journal
+// path is unchanged and the recovery semantics are identical.
 func TestFSAppendLogBatchRecoveryReconcilesJournal(t *testing.T) {
 	repo := New(t.TempDir())
 	id := LogBatchIdentity{JobID: "job-1", Generation: 1, BatchID: "batch-1"}
@@ -171,10 +182,11 @@ func TestFSAppendLogBatchRecoveryReconcilesJournal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	committedPath := filepath.Join(repo.logBatchCommittedDir(), "run-1", name)
 	if err := AtomicWriteFile(filepath.Join(repo.logBatchPendingDir(), name), rec, 0o600); err != nil {
 		t.Fatalf("stage interrupted journal: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(repo.logBatchCommittedDir(), name)); !os.IsNotExist(err) {
+	if _, err := os.Stat(committedPath); !os.IsNotExist(err) {
 		t.Fatalf("batch committed before recovery: %v", err)
 	}
 	if _, err := repo.Load(); err != nil {
@@ -182,6 +194,9 @@ func TestFSAppendLogBatchRecoveryReconcilesJournal(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(repo.logBatchPendingDir(), name)); !os.IsNotExist(err) {
 		t.Fatalf("pending journal survived recovery: %v", err)
+	}
+	if _, err := os.Stat(committedPath); err != nil {
+		t.Fatalf("recovery did not publish into the run directory: %v", err)
 	}
 	got, err := repo.ReadLogs("run-1", 0, 100)
 	if err != nil || len(got) != 3 {

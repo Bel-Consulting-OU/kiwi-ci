@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/forge"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
@@ -379,11 +380,9 @@ func TestGitHubCheckRetryPatchesInsteadOfDuplicating(t *testing.T) {
 	s := New("secret")
 	s.GitHubToken = "tok"
 	s.gitHubAPIBase = api.URL
-	item := forge.OutboxItem{Kind: forge.OutboxKindGitHubCheck, Payload: mustJSON(t, forge.CheckPayload{
-		RunID: "run-1", ForgeKind: "github", ForgeHost: "github.com",
-		RepoFullName: "acme/backend", SHA: "abc", Name: "Pipeline",
-		Status: "completed", Conclusion: "success", Summary: "ok",
-	})}
+	run := model.Run{ID: "run-1", ForgeKind: "github", ForgeHost: "github.com",
+		RepoFullName: "acme/backend", SHA: "abc", Status: model.StatusSuccess}
+	item := s.checkIntent(run, "Pipeline", "completed", "success", "ok", nil)
 	if err := s.dispatchOutbox(context.Background(), item); err != nil {
 		t.Fatalf("first dispatch: %v", err)
 	}
@@ -425,13 +424,32 @@ func TestGitHubCheckRunMappingPersistErrorsFailDispatch(t *testing.T) {
 	}))
 	defer api.Close()
 
-	item := forge.OutboxItem{Kind: forge.OutboxKindGitHubCheck, Payload: mustJSON(t, forge.CheckPayload{
+	item := forge.OutboxItem{ID: "legacy-mapping-1", Kind: forge.OutboxKindGitHubCheck, Payload: mustJSON(t, forge.CheckPayload{
 		RunID: "run-x", ForgeKind: "github", RepoFullName: "acme/backend", SHA: "abc",
 		Name: "Pipeline", Status: "completed", Conclusion: "success",
 	})}
 
 	// Write failure: dispatch must fail (no ACK) and retry later.
 	fs := &fcStoreWriteFail{dbFakeStore: newDBFakeStore()}
+	// The row is claimed from the durable store in production; its existence
+	// is part of the version-guard contract (a legacy row is guarded exactly
+	// like a versioned one).
+	{
+		var p forge.CheckPayload
+		if err := json.Unmarshal(item.Payload, &p); err != nil {
+			t.Fatal(err)
+		}
+		key, version, _, ok := forgeCheckIdentity(item, p)
+		if !ok {
+			t.Fatal("legacy payload must yield a derivable identity")
+		}
+		if err := fs.OutboxAppend(context.Background(), storage.OutboxItem{
+			ID: item.ID, Kind: item.Kind, Payload: item.Payload,
+			CreatedAt: time.Now().UTC(), LogicalKey: key, StateVersion: version,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	s := New("secret")
 	s.GitHubToken = "tok"
 	s.gitHubAPIBase = api.URL
@@ -462,4 +480,98 @@ func (f *fcStoreWriteFail) GetCheckRun(ctx context.Context, key string) (string,
 		return "", false, errors.New("mapping read down")
 	}
 	return f.dbFakeStore.GetCheckRun(ctx, key)
+}
+
+// TestUnknownOutboxKindSurvivesRollingUpgrade is FA-2: an old replica claims
+// a row of a kind it does not know (a newer binary's intent during a rolling
+// upgrade). It must NOT ACK the row and must NOT consume its dead-letter
+// budget; the row has to stay durable with bounded backoff until a replica
+// that understands the kind processes it.
+func TestUnknownOutboxKindSurvivesRollingUpgrade(t *testing.T) {
+	ctx := context.Background()
+	f := newDBFakeStore()
+	s := New("token")
+	if err := s.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	const futureKind = "future_v2_intent"
+	item := storage.OutboxItem{
+		ID: "future-1", Kind: futureKind, Payload: []byte(`{"job_id":"j"}`),
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := f.OutboxAppend(ctx, item); err != nil {
+		t.Fatal(err)
+	}
+
+	// The old replica flushes many times (> the dead-letter threshold):
+	// every attempt must fail the row WITHOUT acking or dead-lettering it.
+	for i := 0; i < maxOutboxAttempts+4; i++ {
+		_, _ = s.outbox.Flush(ctx, s.dispatchOutbox)
+		f.ForceAllOutboxDue()
+	}
+	if dead, err := f.OutboxDeadLetters(ctx); err != nil || len(dead) != 0 {
+		t.Fatalf("unknown kind was dead-lettered by the old replica: %+v, %v", dead, err)
+	}
+	f.mu.Lock()
+	alive := false
+	var attempts int
+	for _, it := range f.outboxItems {
+		if it.ID == item.ID {
+			alive = true
+			attempts = f.outboxMeta[it.ID].attempts
+		}
+	}
+	_, claimed := f.outboxClaims[item.ID]
+	f.mu.Unlock()
+	if !alive {
+		t.Fatal("unknown-kind row was ACKed away by the old replica")
+	}
+	if attempts == 0 {
+		t.Fatal("unknown-kind row was never retried (no backoff attempts recorded)")
+	}
+	if claimed {
+		t.Fatal("unknown-kind row stayed claimed after a failed dispatch")
+	}
+
+	// The rolling upgrade completes: a replica that understands the kind
+	// dispatches it and the row is acked exactly once.
+	handled := 0
+	dispatch := func(_ context.Context, it forge.OutboxItem) error {
+		if it.ID != item.ID || it.Kind != futureKind {
+			t.Fatalf("unexpected dispatch %s/%s", it.ID, it.Kind)
+		}
+		handled++
+		return nil
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := s.outbox.Flush(ctx, dispatch); err != nil {
+			t.Fatalf("flush after upgrade: %v", err)
+		}
+		f.ForceAllOutboxDue()
+	}
+	if handled != 1 {
+		t.Fatalf("upgraded replica handled the row %d times, want exactly 1", handled)
+	}
+	if pending, _ := f.OutboxPending(ctx); len(pending) != 0 {
+		t.Fatalf("row still pending after the upgraded replica acked it: %+v", pending)
+	}
+}
+
+// TestUnknownOutboxKindFSPending covers the fs queue: an erroring dispatch
+// (the unknown-kind error included) leaves the item queued instead of
+// removing it, so a downgraded/upgraded binary cannot lose the intent.
+func TestUnknownOutboxKindFSPending(t *testing.T) {
+	o := NewOutbox(nil)
+	item := testOutboxItem(t, "future_v2_intent", `{"job_id":"j"}`)
+	if err := o.Enqueue(item); err != nil {
+		t.Fatal(err)
+	}
+	boom := &unknownOutboxKindError{kind: item.Kind}
+	if _, err := o.Flush(context.Background(), func(context.Context, forge.OutboxItem) error { return boom }); err == nil {
+		t.Fatal("unknown-kind dispatch error must stop the flush")
+	}
+	pending := o.Pending()
+	if len(pending) != 1 || pending[0].ID != item.ID {
+		t.Fatalf("unknown-kind intent lost from the fs queue: %+v", pending)
+	}
 }

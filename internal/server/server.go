@@ -1511,8 +1511,11 @@ func (s *Server) enqueueDB(in SubmitRun, run model.Run, created map[string]model
 		// transaction, which reintroduces the atomic webhook-claim race for
 		// custom stores (a delivery could be claimed TWICE, or a run could
 		// exist without its jobs). Every shipped store implements the
-		// contract; this is an unsupported-store guard, not a mode.
-		return model.Run{}, fmt.Errorf("storage: attached store lacks the atomic compiled-run enqueue contract; refusing a non-atomic enqueue")
+		// contract; this is an unsupported-store guard, not a mode. The
+		// error is typed as a durability failure so submit and the webhook
+		// handlers answer 503 (startup already refuses such a store), never
+		// 400 as if the request were invalid.
+		return model.Run{}, notDurable(fmt.Errorf("storage: attached store lacks the atomic compiled-run enqueue contract; refusing a non-atomic enqueue"))
 	}
 	err := rs.InsertCompiledRun(ctx, req)
 	switch {
@@ -3003,6 +3006,15 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 					http.Error(w, "completion state not durable: "+perr.Error(), http.StatusServiceUnavailable)
 					return
 				}
+				// The durable completion lost its outbox intents (crash or
+				// failed append between the snapshot write and the enqueue):
+				// re-ensure the deterministic intents BEFORE acking, so the
+				// terminal forge publication is never stranded. Enqueue is
+				// idempotent by ID.
+				if rerr := s.repairCompletionIntents(jobID, in.LeaseGeneration); rerr != nil {
+					http.Error(w, "completion effects not durable: "+rerr.Error(), http.StatusServiceUnavailable)
+					return
+				}
 				if derr := s.reconcileCompletionEffects(context.Background(), jobID); derr != nil {
 					http.Error(w, derr.Error(), http.StatusInternalServerError)
 					return
@@ -3029,6 +3041,10 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		if matched {
 			if perr != nil {
 				http.Error(w, "completion state not durable: "+perr.Error(), http.StatusServiceUnavailable)
+				return
+			}
+			if rerr := s.repairCompletionIntents(jobID, in.LeaseGeneration); rerr != nil {
+				http.Error(w, "completion effects not durable: "+rerr.Error(), http.StatusServiceUnavailable)
 				return
 			}
 			if derr := s.reconcileCompletionEffects(context.Background(), jobID); derr != nil {
@@ -5031,6 +5047,54 @@ func recovererWith(next http.Handler, onPanic func(id, method, path string, x an
 	})
 }
 
+// logBatchPruner is the optional filesystem log reclamation contract. It is
+// asserted on s.store rather than added to storage.Store/Repository's shared
+// surface; a store that does not implement it (DB mode's SQL store keeps log
+// rows under its own retention) is skipped. Absence of the contract only
+// skips a reclamation, never a correctness path.
+type logBatchPruner interface {
+	PruneLogBatches(runID string) error
+}
+
+// logBatchRetention bounds how long committed fs log batches are kept after a
+// run reached a terminal state; it mirrors the default artifact retention
+// (contracts.go defaultRetention) so logs age out on the same horizon as the
+// run's artifacts. A run's logs are only reclaimed by pruneDeadRunLogBatches
+// once its FinishedAt is older than this, so logs of active or recently
+// finished runs (including anything a client can still stream) are untouched.
+const logBatchRetention = defaultRetention
+
+// pruneDeadRunLogBatches is the reclamation lifecycle hook, run by Maintain's
+// fs-mode tick after GC. A run is dead - and its committed batches prunable -
+// only when it is TERMINAL and its FinishedAt is older than
+// logBatchRetention; queued/running runs and re-run source runs are never
+// touched. It is a no-op for memory servers (no batch store) and DB-mode
+// servers (the SQL store owns its log retention).
+func (s *Server) pruneDeadRunLogBatches(now time.Time) {
+	if s.store == nil || s.DB != nil {
+		return
+	}
+	pruner, ok := any(s.store).(logBatchPruner)
+	if !ok {
+		return
+	}
+	cutoff := now.UTC().Add(-logBatchRetention)
+	s.mu.Lock()
+	var dead []string
+	for id, run := range s.runs {
+		if !run.Status.Terminal() || run.FinishedAt == nil || !run.FinishedAt.Before(cutoff) {
+			continue
+		}
+		dead = append(dead, id)
+	}
+	s.mu.Unlock()
+	for _, id := range dead {
+		if err := pruner.PruneLogBatches(id); err != nil {
+			s.logError("log batches: prune failed", "run", id, "error", err.Error())
+		}
+	}
+}
+
 // Maintain performs control-plane housekeeping independent of runner polling.
 // It recovers expired leases, advances dependency/approval state, persists the
 // result, and publishes forge status changes caused by lost runners.
@@ -5054,6 +5118,7 @@ func (s *Server) Maintain(ctx context.Context) {
 			s.maintainMemoryTick(ctx, tick.UTC())
 			s.GC(ctx, tick.UTC())
 			s.maybeRunCASGC(ctx, tick.UTC())
+			s.pruneDeadRunLogBatches(tick.UTC())
 			s.flushOutbox()
 			s.fireDueSchedules(ctx, tick.UTC())
 			s.metricObserve("kiwi_scheduler_loop_duration_seconds", time.Since(loopStart).Seconds(), nil)

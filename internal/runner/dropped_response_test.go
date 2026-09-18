@@ -169,7 +169,7 @@ func TestLogBatchDroppedConnectionCommitsExactlyOnce(t *testing.T) {
 
 	r := testRunnerFor(t, ts, Config{})
 	task := basicTask(payloadPipeline)
-	sink := newAsyncLogSink(nil, r.logBatchPost(task, &secrets.Masker{}))
+	sink := newLogSink(nil, r.logBatchPost(task, &secrets.Masker{}), nil)
 
 	sink.WriteLine("build", "step", "line-1")
 	waitUntil(t, 15*time.Second, "the dropped first delivery and its retry", func() bool {
@@ -844,7 +844,7 @@ func TestRestartMidBatchIdenticalReplayDedupes(t *testing.T) {
 
 	task := basicTask(payloadPipeline)
 	r := testRunnerFor(t, ts, Config{})
-	sinkA := newAsyncLogSink(nil, r.logBatchPost(task, &secrets.Masker{}))
+	sinkA := newLogSink(nil, r.logBatchPost(task, &secrets.Masker{}), nil)
 	sinkA.WriteLine("build", "step", "line-1")
 	waitUntil(t, 10*time.Second, "batch 1 to be committed with its response dropped", func() bool {
 		_, store := cp.snapshot()
@@ -865,7 +865,7 @@ func TestRestartMidBatchIdenticalReplayDedupes(t *testing.T) {
 	// Restart: a fresh process (new sink, sequence restarting at 1) replays
 	// the identical line sequence with identical batch boundaries.
 	r2 := testRunnerFor(t, ts, Config{})
-	sinkB := newAsyncLogSink(nil, r2.logBatchPost(task, &secrets.Masker{}))
+	sinkB := newLogSink(nil, r2.logBatchPost(task, &secrets.Masker{}), nil)
 	sinkB.WriteLine("build", "step", "line-1")
 	waitUntil(t, 10*time.Second, "the replayed batch 1 to be deduped", func() bool {
 		attempts, store := cp.snapshot()

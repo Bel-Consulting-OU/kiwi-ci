@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -351,11 +354,12 @@ func TestLogSpoolNoSequenceRegressionAfterCleanAck(t *testing.T) {
 }
 
 // T4: the old restart gap scenario — a restart with different drain
-// boundaries. The journaled lines now replay as the ORIGINAL persisted
-// batches (identity and boundary copied verbatim), so re-batching the same
-// lines under a different boundary is impossible and each line is committed
-// exactly once. Lines that were never journaled may be re-emitted by the new
-// process (the accepted boundary) and form new batches.
+// boundaries. The journaled lines replay as the ORIGINAL persisted batches
+// (identity and boundary copied verbatim), so re-batching the same lines
+// under a different boundary is impossible and each line is committed
+// exactly once. Lines that were never journaled (spooled only after the
+// sender stopped on the failed batch) are the documented loss boundary; the
+// recovery path re-executes them under a new lease, not the log sink.
 func TestLogSpoolRestartDifferentDrainBoundariesNoDuplication(t *testing.T) {
 	stateDir := t.TempDir()
 	cp := newRestartLogControlPlane()
@@ -365,33 +369,37 @@ func TestLogSpoolRestartDifferentDrainBoundariesNoDuplication(t *testing.T) {
 	r := testRunnerFor(t, ts, Config{})
 	task := basicTask(payloadPipeline)
 
-	// Original process: line-1/line-2 are journaled but the delivery never
-	// confirms; the process dies.
+	// Original process: line-1 is journaled, but the delivery fails
+	// permanently and the sender stops (fail closed). line-2 is spooled only
+	// after that failure and is therefore never journaled.
 	jA := openTestJournal(t, stateDir, "job-1", 3)
 	sinkA := newJournaledAsyncLogSink(nil, func(context.Context, logBatch) error {
 		return PermanentDeliveryError(errors.New("control plane unreachable"))
 	}, jA)
 	sinkA.WriteLine("build", "step", "line-1")
+	waitUntil(t, 10*time.Second, "line-1 to be journaled", func() bool {
+		return len(jA.pendingBatches()) == 1
+	})
 	sinkA.WriteLine("build", "step", "line-2")
-	if pending := sinkA.Flush(5 * time.Second); pending != 0 {
-		t.Fatalf("original spool did not drain: %d pending", pending)
+	outA := sinkA.Finish(2 * time.Second)
+	if outA.Err == nil {
+		t.Fatalf("original process reported a clean outcome despite the failed delivery: %+v", outA)
 	}
-	sinkA.Finish(2 * time.Second)
 	persisted := jA.pendingBatches()
-	if len(persisted) == 0 {
-		t.Fatal("nothing was journaled by the original process")
+	if len(persisted) != 1 {
+		t.Fatalf("persisted batches = %+v, want only the failed journaled batch", persisted)
 	}
-	if got := strings.Join(flattenPersistedLines(persisted), "|"); got != "step: line-1|step: line-2" {
-		t.Fatalf("persisted lines = %q, want line-1 and line-2", got)
+	if got := strings.Join(flattenPersistedLines(persisted), "|"); got != "step: line-1" {
+		t.Fatalf("persisted lines = %q, want line-1", got)
 	}
 
 	// Restart: the journal is replayed with the persisted boundaries; only
 	// genuinely new lines form new batches.
 	jB := openTestJournal(t, stateDir, "job-1", 3)
 	sinkB := newJournaledAsyncLogSink(nil, r.logBatchPost(task, &secrets.Masker{}), jB)
-	waitUntil(t, 10*time.Second, "the persisted batches to be replayed", func() bool {
+	waitUntil(t, 10*time.Second, "the persisted batch to be replayed", func() bool {
 		_, store := cp.snapshot()
-		return countCommittedBatches(store) == len(persisted)
+		return countCommittedBatches(store) == 1
 	})
 	sinkB.WriteLine("build", "step", "line-3")
 	sinkB.WriteLine("build", "step", "line-4")
@@ -402,9 +410,9 @@ func TestLogSpoolRestartDifferentDrainBoundariesNoDuplication(t *testing.T) {
 
 	_, store := cp.snapshot()
 	got := flattenCommittedLines(store)
-	want := []string{"step: line-1", "step: line-2", "step: line-3", "step: line-4"}
+	want := []string{"step: line-1", "step: line-3", "step: line-4"}
 	if strings.Join(got, "|") != strings.Join(want, "|") {
-		t.Fatalf("committed lines = %v, want exactly %v (no boundary-based duplicates)", got, want)
+		t.Fatalf("committed lines = %v, want exactly %v (no boundary-based duplicates; line-2 was never journaled)", got, want)
 	}
 	// Every persisted batch was replayed with its exact identity AND its
 	// exact ordered lines: the boundary cannot change across the restart.
@@ -466,7 +474,10 @@ func TestLogSpoolJournalCleanupOnCompletion(t *testing.T) {
 }
 
 // T6: new lines after replay get strictly increasing sequences and distinct
-// ids, and ordering across the restart is preserved.
+// ids, and ordering across the restart is preserved. The original process
+// delivered its batches but died BEFORE the batched ack watermark could be
+// flushed, so the restart replays the persisted identities idempotently
+// (server dedupe) and continues the sequence after the persisted maximum.
 func TestLogSpoolSequenceContinuesAfterRestart(t *testing.T) {
 	stateDir := t.TempDir()
 	cp := newRestartLogControlPlane()
@@ -475,27 +486,20 @@ func TestLogSpoolSequenceContinuesAfterRestart(t *testing.T) {
 
 	r := testRunnerFor(t, ts, Config{})
 	task := basicTask(payloadPipeline)
+	post := r.logBatchPost(task, &secrets.Masker{})
 
-	// Original process: one journaled batch per drained line, none
-	// delivered.
-	sent := make(chan struct{}, 8)
+	// Original process: one journaled+committed batch per drained line. The
+	// process crashes without Finish, so no ack flush ever runs.
 	jA := openTestJournal(t, stateDir, "job-1", 3)
-	sinkA := newJournaledAsyncLogSink(nil, func(_ context.Context, _ logBatch) error {
-		sent <- struct{}{}
-		return PermanentDeliveryError(errors.New("control plane unreachable"))
-	}, jA)
-	for _, line := range []string{"line-1", "line-2"} {
+	sinkA := newJournaledAsyncLogSink(nil, post, jA)
+	for i, line := range []string{"line-1", "line-2"} {
 		sinkA.WriteLine("build", "step", line)
-		select {
-		case <-sent:
-		case <-time.After(5 * time.Second):
-			t.Fatalf("batch for %s was not journaled and attempted", line)
-		}
+		want := i + 1
+		waitUntil(t, 10*time.Second, "line to be journaled", func() bool {
+			return len(jA.pendingBatches()) == want
+		})
 	}
-	if pending := sinkA.Flush(5 * time.Second); pending != 0 {
-		t.Fatalf("original spool did not drain: %d pending", pending)
-	}
-	sinkA.Finish(2 * time.Second)
+	crashLogSink(sinkA)
 	persisted := jA.pendingBatches()
 	if len(persisted) != 2 {
 		t.Fatalf("journaled batches = %d, want 2", len(persisted))
@@ -503,7 +507,7 @@ func TestLogSpoolSequenceContinuesAfterRestart(t *testing.T) {
 
 	// Restart: replay both records, then two new lines.
 	jB := openTestJournal(t, stateDir, "job-1", 3)
-	sinkB := newJournaledAsyncLogSink(nil, r.logBatchPost(task, &secrets.Masker{}), jB)
+	sinkB := newJournaledAsyncLogSink(nil, post, jB)
 	waitUntil(t, 10*time.Second, "both persisted batches to be replayed", func() bool {
 		_, store := cp.snapshot()
 		return countCommittedBatches(store) == 2
@@ -634,5 +638,500 @@ func TestLogSpoolJournalDiskBudgetOverflowFailsJob(t *testing.T) {
 	}
 	if recs := jA.pendingBatches(); len(recs) != 0 {
 		t.Fatalf("overflow left records on disk: %+v", recs)
+	}
+}
+
+// --- FB-1: watermark vs sequence gap --------------------------------------
+
+// crashLogSink stops a sink the way a process crash does: without the
+// Finish-time ack flush. It wakes the waiting sender so the goroutine exits.
+func crashLogSink(s *asyncLogSink) {
+	s.cancel()
+	s.WriteLine("crash", "wake", "wake")
+	<-s.done
+}
+
+// waitSinkDrained waits until the spool is empty AND every formed batch has
+// finished its ack (inFlight is decremented only after ack returns).
+func waitSinkDrained(t *testing.T, s *asyncLogSink) {
+	t.Helper()
+	waitUntil(t, 10*time.Second, "the sink to drain fully", func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return len(s.spool) == 0 && s.inFlight == 0
+	})
+}
+
+// durableWatermarkSequence reads the persisted ack watermark (0 when absent).
+func durableWatermarkSequence(t *testing.T, dir string) int64 {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(dir, "ack-watermark"))
+	if errors.Is(err, os.ErrNotExist) {
+		return 0
+	}
+	if err != nil {
+		t.Fatalf("read ack watermark: %v", err)
+	}
+	var wm logJournalWatermark
+	if err := json.Unmarshal(b, &wm); err != nil {
+		t.Fatalf("decode ack watermark %s: %v", b, err)
+	}
+	return wm.Sequence
+}
+
+// oneLineBatch builds an identified single-line batch for the given sequence.
+func oneLineBatch(sequence int64, line string) logBatch {
+	b := logBatch{Sequence: sequence, Lines: []logLine{{Job: "build", Step: "step", Line: line}}}
+	b.ID = logBatchID(b.Sequence, b.Lines)
+	return b
+}
+
+// FB-1 regression: the pre-amortization sender could advance the watermark
+// past a batch whose delivery failed permanently (it kept sending later
+// batches, acked one of them, and the single watermark covered the failed
+// sequence). On restart that record must be REPLAYED, never reclaimed as
+// consumed; the later committed batch must not be re-sent (its record was
+// unlinked and the server dedupes anyway); and the sequence must continue
+// after the persisted maximum.
+//
+// This test FAILS before the fix: load reclaimed record 1 because its
+// sequence was <= the format-1 watermark 2.
+func TestLogJournalLegacyWatermarkGapReplaysFailedBatch(t *testing.T) {
+	stateDir := t.TempDir()
+	cp := newRestartLogControlPlane()
+	ts := httptest.NewServer(cp)
+	defer ts.Close()
+
+	r := testRunnerFor(t, ts, Config{})
+	task := basicTask(payloadPipeline)
+	post := r.logBatchPost(task, &secrets.Masker{})
+
+	// Phase A (legacy process): batch 1 failed permanently and was never
+	// committed; batch 2 was delivered and committed. The legacy sender
+	// still acked batch 2, writing watermark=2 (format 1: no format field)
+	// and unlinking record 2 while record 1 stayed on disk.
+	jA := openTestJournal(t, stateDir, "job-1", 3)
+	b1 := oneLineBatch(1, "line-1")
+	b2 := oneLineBatch(2, "line-2")
+	if err := jA.append(b1); err != nil {
+		t.Fatalf("journal batch 1: %v", err)
+	}
+	if err := jA.append(b2); err != nil {
+		t.Fatalf("journal batch 2: %v", err)
+	}
+	if err := post(context.Background(), b2); err != nil {
+		t.Fatalf("commit batch 2: %v", err)
+	}
+	legacyWM := []byte(`{"job_id":"job-1","generation":3,"sequence":2}`)
+	if err := os.WriteFile(filepath.Join(jA.dir, "ack-watermark"), legacyWM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(jA.dir, journalRecordName(2, b2.ID))); err != nil {
+		t.Fatalf("legacy ack did not unlink record 2: %v", err)
+	}
+	// jA is abandoned: this is the crash.
+
+	// Phase B (fixed process): the format-1 watermark must NOT cause record 1
+	// to be reclaimed; it has to replay.
+	jB := openTestJournal(t, stateDir, "job-1", 3)
+	pending := jB.pendingBatches()
+	if len(pending) != 1 || pending[0].Sequence != 1 || pending[0].ID != b1.ID {
+		t.Fatalf("after the legacy-watermark restart pending = %+v, want the failed batch (seq 1, id %s)", pending, b1.ID)
+	}
+
+	sinkB := newJournaledAsyncLogSink(nil, post, jB)
+	sinkB.WriteLine("build", "step", "line-3")
+	outB := sinkB.Finish(10 * time.Second)
+	if outB.Err != nil || outB.Dropped != 0 || outB.Remaining != 0 || !outB.Stopped {
+		t.Fatalf("restart outcome = %+v, want a clean stop", outB)
+	}
+
+	attempts, store := cp.snapshot()
+	if countCommittedBatches(store) != 3 {
+		t.Fatalf("committed batches = %d, want 3 (batch 1 replayed once, batch 2 deduped, line-3 new)", countCommittedBatches(store))
+	}
+	got := flattenCommittedLines(store)
+	want := []string{"step: line-1", "step: line-2", "step: line-3"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("committed lines = %v, want exactly %v (one copy each)", got, want)
+	}
+	if n := countAttemptsFor(attempts, b2.ID); n != 1 {
+		t.Fatalf("committed batch 2 was sent %d time(s), want exactly 1 (deduped, not replayed)", n)
+	}
+	if n := countAttemptsFor(attempts, b1.ID); n != 1 {
+		t.Fatalf("failed batch 1 replay attempts = %d, want exactly 1", n)
+	}
+	// No sequence regression: the new line gets sequence 3 (> persisted max 2).
+	var newSeq int64
+	for _, a := range attempts {
+		if len(a.Lines) == 1 && a.Lines[0] == "step: line-3" {
+			newSeq = a.Sequence
+		}
+	}
+	if newSeq != 3 {
+		t.Fatalf("new batch sequence = %d, want 3 (no regression past the persisted maximum)", newSeq)
+	}
+}
+
+// FB-1 sender-side regression: a permanent delivery failure stops the
+// sender. No later batch may be formed or acked, so the durable watermark
+// can never advance past the failed sequence; Finish surfaces the failure
+// and the restart replays the failed batch under its original identity while
+// the sequence continues after the persisted maximum.
+func TestLogSinkStopsOnSendFailureBeforeAckingPast(t *testing.T) {
+	stateDir := t.TempDir()
+	var mu sync.Mutex
+	var failFirst atomic.Bool
+	failFirst.Store(true)
+	attempts := map[int64]int{}
+	committed := map[string][]string{}
+	post := func(_ context.Context, batch logBatch) error {
+		mu.Lock()
+		attempts[batch.Sequence]++
+		mu.Unlock()
+		if failFirst.Load() && batch.Sequence == 1 {
+			return PermanentDeliveryError(errors.New("rejected permanently"))
+		}
+		mu.Lock()
+		if _, ok := committed[batch.ID]; !ok {
+			committed[batch.ID] = batchLineStrings(batch)
+		}
+		mu.Unlock()
+		return nil
+	}
+
+	jA := openTestJournal(t, stateDir, "job-1", 3)
+	sinkA := newJournaledAsyncLogSink(nil, post, jA)
+	sinkA.WriteLine("build", "step", "line-1")
+	waitUntil(t, 10*time.Second, "the permanent failure of batch 1", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return attempts[1] > 0
+	})
+	// Only now is line-2 spooled: after the failure the sender must not form
+	// or post another batch.
+	sinkA.WriteLine("build", "step", "line-2")
+	outA := sinkA.Finish(10 * time.Second)
+	if outA.Err == nil {
+		t.Fatalf("the failed delivery was not surfaced: %+v", outA)
+	}
+	mu.Lock()
+	for seq := range attempts {
+		if seq != 1 {
+			mu.Unlock()
+			t.Fatalf("batch %d was attempted after the permanent failure", seq)
+		}
+	}
+	for id := range committed {
+		mu.Unlock()
+		t.Fatalf("batch %s was committed after the permanent failure", id)
+	}
+	mu.Unlock()
+	if outA.Dropped != 0 {
+		t.Fatalf("dropped = %d, want 0 (the spooled line is retained and reported)", outA.Dropped)
+	}
+	if outA.Remaining != 1 {
+		t.Fatalf("remaining = %d, want the spooled line-2 reported", outA.Remaining)
+	}
+	if got := jA.maxSequence(); got != 1 {
+		t.Fatalf("maxSequence = %d, want 1 (no later batch was formed)", got)
+	}
+	if recs := jA.pendingBatches(); len(recs) != 1 || recs[0].Sequence != 1 {
+		t.Fatalf("journal records = %+v, want only the failed batch 1", recs)
+	}
+
+	// Restart: batch 1 replays exactly once; the sequence continues after the
+	// persisted maximum. The endpoint recovers, so the replay succeeds.
+	failFirst.Store(false)
+	jB := openTestJournal(t, stateDir, "job-1", 3)
+	recs := jB.pendingBatches()
+	if len(recs) != 1 || recs[0].Sequence != 1 {
+		t.Fatalf("after restart pending = %+v, want the failed batch 1 replayed (not discarded)", recs)
+	}
+	sinkB := newJournaledAsyncLogSink(nil, post, jB)
+	sinkB.WriteLine("build", "step", "line-3")
+	outB := sinkB.Finish(10 * time.Second)
+	if outB.Err != nil || outB.Dropped != 0 || outB.Remaining != 0 || !outB.Stopped {
+		t.Fatalf("restart outcome = %+v, want a clean stop", outB)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(committed) != 2 {
+		t.Fatalf("committed batches = %d, want 2 (replayed batch 1 and the new batch)", len(committed))
+	}
+	if got := attempts[1]; got != 2 {
+		t.Fatalf("batch 1 attempts = %d, want 2 (permanent failure + replay)", got)
+	}
+	if got := attempts[2]; got != 1 {
+		t.Fatalf("new batch attempts = %d, want 1", got)
+	}
+	var lines []string
+	for _, l := range committed {
+		lines = append(lines, l...)
+	}
+	sort.Strings(lines)
+	if strings.Join(lines, "|") != "step: line-1|step: line-3" {
+		t.Fatalf("committed lines = %v, want line-1 and line-3 exactly once", lines)
+	}
+}
+
+// --- FB-2: amortized ack watermark -----------------------------------------
+
+// FB-2 regression: a burst of K acked batches performs FEWER than K durable
+// watermark writes (counted through the seam, never timing), and a crash at
+// any flush point leaves every un-acked record replayable and every acked
+// record either reclaimed or idempotently replayed, with exactly one
+// committed copy of every line and no sequence regression.
+func TestLogJournalAmortizedAckFlushBurst(t *testing.T) {
+	oldEvery := journalAckFlushEvery
+	journalAckFlushEvery = 4
+	t.Cleanup(func() { journalAckFlushEvery = oldEvery })
+
+	for _, k := range []int{1, 3, 4, 8, 11} {
+		t.Run(fmt.Sprintf("crash_after_%d_batches", k), func(t *testing.T) {
+			stateDir := t.TempDir()
+			oldWrites := journalWatermarkWrites.Swap(0)
+			t.Cleanup(func() { journalWatermarkWrites.Store(oldWrites) })
+
+			// In-process delivery stub: commit once per batch identity.
+			var mu sync.Mutex
+			committed := map[string][]string{}
+			attempts := map[int64]int{}
+			post := func(_ context.Context, batch logBatch) error {
+				mu.Lock()
+				attempts[batch.Sequence]++
+				if _, ok := committed[batch.ID]; !ok {
+					committed[batch.ID] = batchLineStrings(batch)
+				}
+				mu.Unlock()
+				return nil
+			}
+
+			jA := openTestJournal(t, stateDir, "job-1", 3)
+			sinkA := newJournaledAsyncLogSink(nil, post, jA)
+			for i := 0; i < k; i++ {
+				sinkA.WriteLine("build", "step", fmt.Sprintf("line-%d", i))
+				want := i + 1
+				waitUntil(t, 10*time.Second, fmt.Sprintf("%d committed batches", want), func() bool {
+					mu.Lock()
+					defer mu.Unlock()
+					return len(committed) == want
+				})
+			}
+			waitSinkDrained(t, sinkA)
+			writes := journalWatermarkWrites.Load()
+			if writes == 0 && k >= journalAckFlushEvery {
+				t.Fatalf("no ack watermark reached disk across %d acks (flush boundary %d)", k, journalAckFlushEvery)
+			}
+			if writes >= int64(k) {
+				t.Fatalf("watermark writes = %d for %d acked batches; the ack side was not amortized", writes, k)
+			}
+			// Crash WITHOUT Finish: no final flush runs.
+			crashLogSink(sinkA)
+
+			durableWM := durableWatermarkSequence(t, jA.dir)
+			if durableWM < 0 || durableWM > int64(k) {
+				t.Fatalf("durable watermark = %d for %d batches", durableWM, k)
+			}
+			if k >= journalAckFlushEvery && durableWM == 0 {
+				t.Fatal("no ack flush reached disk within the burst")
+			}
+
+			// Restart: exactly the records above the durable watermark are
+			// pending; nothing at or below it is replayed (acked batches stay
+			// deduped) and nothing above it is skipped.
+			jB := openTestJournal(t, stateDir, "job-1", 3)
+			pending := jB.pendingBatches()
+			if want := int64(k) - durableWM; int64(len(pending)) != want {
+				t.Fatalf("pending records after restart = %d, want %d (durable watermark %d)", len(pending), want, durableWM)
+			}
+			for i, b := range pending {
+				if wantSeq := durableWM + 1 + int64(i); b.Sequence != wantSeq {
+					t.Fatalf("pending[%d].Sequence = %d, want %d", i, b.Sequence, wantSeq)
+				}
+			}
+			if got := jB.maxSequence(); got != int64(k) {
+				t.Fatalf("maxSequence after restart = %d, want %d (no sequence regression)", got, k)
+			}
+
+			sinkB := newJournaledAsyncLogSink(nil, post, jB)
+			sinkB.WriteLine("build", "step", "line-new")
+			outB := sinkB.Finish(10 * time.Second)
+			if outB.Err != nil || outB.Dropped != 0 || outB.Remaining != 0 || !outB.Stopped {
+				t.Fatalf("restart outcome = %+v, want a clean stop", outB)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(committed) != k+1 {
+				t.Fatalf("committed batches = %d, want %d", len(committed), k+1)
+			}
+			var lines []string
+			for _, l := range committed {
+				lines = append(lines, l...)
+			}
+			sort.Strings(lines)
+			want := make([]string, 0, k+1)
+			for i := 0; i < k; i++ {
+				want = append(want, fmt.Sprintf("step: line-%d", i))
+			}
+			want = append(want, "step: line-new")
+			sort.Strings(want)
+			if strings.Join(lines, "|") != strings.Join(want, "|") {
+				t.Fatalf("committed lines = %v, want exactly one copy of each of %v", lines, want)
+			}
+			if got := attempts[int64(k)+1]; got != 1 {
+				t.Fatalf("new batch attempts = %d, want 1 (sequence %d is new)", got, k+1)
+			}
+			for _, b := range pending {
+				if got := attempts[b.Sequence]; got != 2 {
+					t.Fatalf("replayed batch %d attempts = %d, want 2 (crash + idempotent replay)", b.Sequence, got)
+				}
+			}
+		})
+	}
+}
+
+// --- FB-3: unified memory accounting ---------------------------------------
+
+// FB-3 regression: loading a journal backlog whose resident bytes exceed the
+// shared in-memory budget fails explicitly and leaves every durable record
+// in place (never a silent truncation/drop). Before the fix the backlog was
+// retained in memory up to the 128 MiB DISK budget, unbudgeted.
+func TestLogJournalMemoryBudgetRejectsOverBudgetBacklog(t *testing.T) {
+	stateDir := t.TempDir()
+	jA := openTestJournal(t, stateDir, "job-1", 3)
+	line := strings.Repeat("x", 1024)
+	for seq := int64(1); seq <= 8; seq++ {
+		if err := jA.append(oneLineBatch(seq, line)); err != nil {
+			t.Fatalf("append batch %d: %v", seq, err)
+		}
+	}
+	records, err := filepath.Glob(filepath.Join(jA.dir, "*.json"))
+	if err != nil || len(records) != 8 {
+		t.Fatalf("journaled records = %v (%v), want 8", records, err)
+	}
+
+	oldBytes := asyncSpoolBytes
+	asyncSpoolBytes = 2048
+	t.Cleanup(func() { asyncSpoolBytes = oldBytes })
+
+	jB, err := openLogJournal(stateDir, "job-1", 3, nil)
+	if err == nil {
+		t.Fatal("loading an over-budget backlog succeeded; resident memory is not bounded by the documented budget")
+	}
+	if !strings.Contains(err.Error(), "memory budget") {
+		t.Fatalf("load error = %v, want an explicit memory budget error", err)
+	}
+	if jB != nil {
+		t.Fatalf("failed load returned a journal: %+v", jB)
+	}
+	// No silent drop: the failed open left every record durably in place.
+	records, err = filepath.Glob(filepath.Join(jA.dir, "*.json"))
+	if err != nil || len(records) != 8 {
+		t.Fatalf("records after the failed load = %v (%v), want 8 preserved", records, err)
+	}
+}
+
+// FB-3: journal-resident bytes are charged against the shared budget with an
+// explicit rejection at the boundary and released by the ack flush; the
+// charge never exceeds the documented bound.
+func TestLogJournalMemoryBudgetAccountingBound(t *testing.T) {
+	stateDir := t.TempDir()
+	oldBytes := asyncSpoolBytes
+	asyncSpoolBytes = 8192
+	t.Cleanup(func() { asyncSpoolBytes = oldBytes })
+
+	j := openTestJournal(t, stateDir, "job-1", 3)
+	line := strings.Repeat("x", 1024)
+	var accepted []logBatch
+	for seq := int64(1); seq <= 100; seq++ {
+		b := oneLineBatch(seq, line)
+		if err := j.append(b); err != nil {
+			if !errors.Is(err, errLogJournalMemoryOverflow) {
+				t.Fatalf("append %d error = %v, want errLogJournalMemoryOverflow", seq, err)
+			}
+			break
+		}
+		accepted = append(accepted, b)
+		if got := j.residentBytes(); got > asyncSpoolBytes {
+			t.Fatalf("resident bytes = %d exceed the %d byte budget", got, asyncSpoolBytes)
+		}
+		if got := j.residentBytes(); got <= 0 {
+			t.Fatalf("accepted record %d is not charged to the shared budget", seq)
+		}
+	}
+	if len(accepted) == 0 || len(accepted) >= 100 {
+		t.Fatalf("accepted = %d batches, want an explicit mid-burst rejection", len(accepted))
+	}
+	if got := len(j.pendingBatches()); got != len(accepted) {
+		t.Fatalf("pending = %d, want the %d accepted records", got, len(accepted))
+	}
+	if _, ok := j.paths[int64(len(accepted)+1)]; ok {
+		t.Fatal("the rejected sequence left a path entry behind")
+	}
+	// The ack flush releases the reclaimed records' charge.
+	before := j.residentBytes()
+	if err := j.ack(accepted[0].Sequence, accepted[0].ID); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	if err := j.flushAcks(); err != nil {
+		t.Fatalf("flushAcks: %v", err)
+	}
+	if after := j.residentBytes(); after >= before {
+		t.Fatalf("ack+flush released no resident bytes: %d -> %d", before, after)
+	}
+	if got := j.residentBytes(); got > asyncSpoolBytes {
+		t.Fatalf("resident bytes = %d exceed the %d byte budget after the flush", got, asyncSpoolBytes)
+	}
+}
+
+// --- FB-4: explicit state-dir failures -------------------------------------
+
+// FB-4: the production entry path fails closed when no durable state
+// directory can be resolved instead of silently running journal-less.
+func TestRunFailsWhenStateDirCannotBeResolved(t *testing.T) {
+	t.Setenv("HOME", "")
+	r := &Runner{Cfg: Config{Server: "http://127.0.0.1:1"}}
+	err := r.Run(context.Background())
+	if err == nil {
+		t.Fatal("Run silently accepted an unresolvable state directory")
+	}
+	if !strings.Contains(err.Error(), "state directory") {
+		t.Fatalf("Run error = %v, want a state-directory error", err)
+	}
+}
+
+// FB-4: direct execute callers may run journal-less ONLY through the
+// explicit opt-out seam; without it openJobLogJournal fails closed, and a
+// configured but unusable state directory is always an error.
+func TestOpenJobLogJournalRequiresExplicitOptOut(t *testing.T) {
+	r := &Runner{}
+	if j, err := r.openJobLogJournal("job-1", 1, nil); err == nil || j != nil {
+		t.Fatalf("openJobLogJournal without a state dir = (%v, %v), want an explicit error", j, err)
+	}
+	// The seam is the only journal-less path.
+	rOptOut := &Runner{journalOptOut: true}
+	if j, err := rOptOut.openJobLogJournal("job-1", 1, nil); j != nil || err != nil {
+		t.Fatalf("openJobLogJournal with journalOptOut = (%v, %v), want (nil, nil)", j, err)
+	}
+	// A resolved state directory always opens the journal.
+	r.Cfg.StateDir = t.TempDir()
+	j, err := r.openJobLogJournal("job-1", 1, nil)
+	if err != nil || j == nil {
+		t.Fatalf("openJobLogJournal with a state dir = (%v, %v), want a journal", j, err)
+	}
+}
+
+// FB-4: an unusable (read-only) state directory is fail-closed: the journal
+// cannot be created and the error is surfaced rather than silently ignored.
+func TestOpenJobLogJournalReadOnlyStateDirFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	r := &Runner{Cfg: Config{StateDir: dir}}
+	if j, err := r.openJobLogJournal("job-1", 1, nil); err == nil || j != nil {
+		t.Fatalf("openJobLogJournal on a read-only state dir = (%v, %v), want an explicit error", j, err)
 	}
 }

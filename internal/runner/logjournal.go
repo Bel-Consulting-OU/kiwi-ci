@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // Durable per-job log batch journal.
@@ -36,24 +37,42 @@ import (
 // Crash safety: a record is created with a durable atomic replace (temp file
 // + fsync + rename + parent fsync), so it is either fully present or absent,
 // and it exists on disk before the first POST can leave the process.
-// Acknowledgement is a durable ack watermark (the highest acked sequence,
-// written atomically and fsynced) followed by a best-effort delete of the
-// record:
+// Acknowledgement is a durable ack watermark (the highest CONTIGUOUS acked
+// sequence) followed by reclamation of the records it covers:
 //
-//   - a crash before the watermark write leaves the record unconsumed, and
+//   - a crash before the watermark write leaves every record unconsumed, and
 //     the replay carries the identical (job, generation, batch_id) identity,
 //     so the server's receipt answers 204 without duplicating lines;
-//   - a crash after the watermark write but before the delete leaves a
+//   - a crash after the watermark write but before the unlink leaves a
 //     record the watermark already covers: the next open recognizes it as
 //     consumed, never replays it, and reclaims the file;
-//   - a record is never deleted before the ack is received (the watermark
-//     write itself is the durable ack point and precedes the unlink).
+//   - a record is never deleted before the ack is durably covered (the
+//     watermark write itself is the durable ack point and precedes the
+//     unlink).
 //
 // The watermark also preserves the persisted maximum across ack+cleanup, so
 // a fresh same-generation sink never regresses the sequence and can never
 // false-dedupe genuinely new lines against an already-acked batch id. A
 // persisted watermark is required because deleting every record would
 // otherwise erase the only local record of how far the sequence got.
+//
+// Contiguous-ack invariant: the watermark equals the highest sequence whose
+// delivery was confirmed, and no lower sequence may be left unconsumed. The
+// sink enforces it by stopping at the first send/ack failure, and ack
+// refuses to advance across an unconsumed record (fail closed). A format-1
+// watermark (the field absent: the pre-amortization sender) did NOT preserve
+// this invariant, so a record at or below a format-1 watermark is not proof
+// of delivery and is replayed rather than reclaimed; only a record whose
+// sequence EQUALS the watermark is unambiguously consumed.
+//
+// Ack amortization: the watermark write and the record unlinks are batched
+// (every journalAckFlushEvery acks, and on Finish). A crash after an ack but
+// before the flush replays already-delivered batches, which the server
+// dedupes by batch id; a crash before the flush can never skip an un-acked
+// batch because acks are recorded only after a confirmed delivery and the
+// flush only covers confirmed sequences. The trade-off is idempotent replay
+// work in a crash window in exchange for ~2 fsyncs per batch instead of ~4
+// on the sender critical path.
 //
 // Records persist the MASKED lines — exactly the bytes the delivery posts —
 // so secret material never lands in the journal, and a replay re-masks the
@@ -72,23 +91,54 @@ type logJournal struct {
 	generation    int64
 	mask          func(string) string
 
-	mu        sync.Mutex
-	records   []logBatch
-	paths     map[int64]string
-	sizes     map[int64]int64
-	maxSeq    int64
-	watermark int64
-	bytes     int64
-	removed   bool
+	// mem is the ONE in-memory byte budget shared with the sink's spool:
+	// every journal-resident record is charged against asyncSpoolBytes, so
+	// the documented bound covers the spool AND the journal backlog instead
+	// of the journal adding a second, unbudgeted 128 MiB in memory.
+	mem *logMemBudget
+
+	mu            sync.Mutex
+	records       []logBatch
+	paths         map[int64]string
+	sizes         map[int64]int64
+	resident      int64
+	maxSeq        int64
+	watermark     int64
+	ackedSeq      int64
+	unflushedAcks int
+	// trustWatermark is true for format-2+ watermarks, whose contiguous-ack
+	// invariant means every record at or below it is consumed.
+	trustWatermark bool
+	bytes          int64
+	removed        bool
 }
+
+// logJournalFormat is the durable journal format version written into the ack
+// watermark. Format 1 (the field absent) is the pre-amortization sender,
+// whose watermark could leapfrog a failed, never-delivered batch; format 2
+// (current) preserves watermark == highest contiguous acked sequence.
+const logJournalFormat = 2
+
+// journalAckFlushEvery amortizes the ack-side durable work: a watermark
+// write (temp+fsync+rename+dir-fsync) and the covered record unlinks are
+// batched per this many confirmed batches. It is a var so tests can drive
+// the flush boundary deterministically.
+var journalAckFlushEvery = 16
+
+// journalWatermarkWrites counts durable ack-watermark writes. Test seam: the
+// amortization test asserts a burst of K batches performs fewer than K
+// writes without relying on timing.
+var journalWatermarkWrites atomic.Int64
 
 // logJournalWatermark is the durable ack point: every sequence up to (and
 // including) it is delivered and must never be replayed, and new batches
-// continue after it.
+// continue after it. Format is the journal format that wrote it (0/absent
+// for the pre-amortization sender).
 type logJournalWatermark struct {
 	JobID      string `json:"job_id"`
 	Generation int64  `json:"generation"`
 	Sequence   int64  `json:"sequence"`
+	Format     int    `json:"format"`
 }
 
 // logJournalRecord is one durable batch record. The identity fields make the
@@ -114,7 +164,9 @@ type logJournalLine struct {
 // the journal retains every line until its batch is acked, so a stalled
 // control plane can grow it well past the memory spool, but never without a
 // bound. Overflow fails the job explicitly through the existing log failure
-// reporting; lines are NEVER silently dropped by the journal.
+// reporting; lines are NEVER silently dropped by the journal. The MEMORY
+// retained for pending records is bounded separately (and jointly with the
+// spool) by asyncSpoolBytes through logMemBudget.
 var asyncJournalBytes = int64(4) * int64(32<<20)
 
 // errLogJournalOverflow reports that journaling a batch would exceed the
@@ -123,6 +175,55 @@ var asyncJournalBytes = int64(4) * int64(32<<20)
 // the job fails explicitly (never an ack for an unjournaled batch, never a
 // silent drop).
 var errLogJournalOverflow = errors.New("log journal disk budget exceeded")
+
+// errLogJournalMemoryOverflow reports that journal-resident pending records
+// would exceed the shared in-memory budget (asyncSpoolBytes). Fail closed
+// with the same explicit semantics as the disk budget: no POST for a batch
+// that cannot be journaled, no silent drop, and on load no durable record is
+// ever discarded.
+var errLogJournalMemoryOverflow = errors.New("log journal memory budget exceeded")
+
+// logMemBudget is the single in-memory byte budget shared by the sink's
+// async spool and the journal's resident pending records. Both charge the
+// same counter, so the documented asyncSpoolBytes bound covers their sum
+// (previously the journal retained up to the 128 MiB DISK budget in memory
+// on top of the spool). Reservations are all-or-nothing; callers surface an
+// overflow explicitly (the spool counts a dropped line, the journal fails
+// the batch) and never silently discard.
+type logMemBudget struct{ used atomic.Int64 }
+
+func (b *logMemBudget) reserve(n int64) bool {
+	if n <= 0 {
+		return true
+	}
+	for {
+		cur := b.used.Load()
+		if cur+n > asyncSpoolBytes {
+			return false
+		}
+		if b.used.CompareAndSwap(cur, cur+n) {
+			return true
+		}
+	}
+}
+
+func (b *logMemBudget) release(n int64) {
+	if n <= 0 {
+		return
+	}
+	for {
+		cur := b.used.Load()
+		next := cur - n
+		if next < 0 {
+			next = 0
+		}
+		if b.used.CompareAndSwap(cur, next) {
+			return
+		}
+	}
+}
+
+func (b *logMemBudget) load() int64 { return b.used.Load() }
 
 // Durable-write seams. journalFileSync/journalFileClose are the checked
 // file Sync/Close steps, journalDirSync is the parent directory fsync after
@@ -171,6 +272,7 @@ func openLogJournal(root, jobID string, generation int64, mask func(string) stri
 		jobID:         jobID,
 		generation:    generation,
 		mask:          mask,
+		mem:           &logMemBudget{},
 		paths:         map[int64]string{},
 		sizes:         map[int64]int64{},
 	}
@@ -181,41 +283,51 @@ func openLogJournal(root, jobID string, generation int64, mask func(string) stri
 	return j, nil
 }
 
-// readLogJournalWatermark reads the durable ack point. A missing watermark
-// means nothing was acked yet; a corrupt or foreign one is a hard error.
-func readLogJournalWatermark(path, jobID string, generation int64) (int64, error) {
+// readLogJournalWatermark reads the durable ack point and its format. A
+// missing watermark means nothing was acked yet; a corrupt, foreign or
+// future-format one is a hard error.
+func readLogJournalWatermark(path, jobID string, generation int64) (int64, int, error) {
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return 0, nil
+		return 0, logJournalFormat, nil
 	}
 	if err != nil {
-		return 0, fmt.Errorf("log journal: read watermark %s: %w", path, err)
+		return 0, 0, fmt.Errorf("log journal: read watermark %s: %w", path, err)
 	}
 	var wm logJournalWatermark
 	if err := json.Unmarshal(b, &wm); err != nil {
-		return 0, fmt.Errorf("log journal: decode watermark %s: %w", path, err)
+		return 0, 0, fmt.Errorf("log journal: decode watermark %s: %w", path, err)
 	}
 	if wm.JobID != jobID || wm.Generation != generation {
-		return 0, fmt.Errorf("log journal: watermark %s belongs to (%q, %d), not (%q, %d)", path, wm.JobID, wm.Generation, jobID, generation)
+		return 0, 0, fmt.Errorf("log journal: watermark %s belongs to (%q, %d), not (%q, %d)", path, wm.JobID, wm.Generation, jobID, generation)
 	}
 	if wm.Sequence < 0 {
-		return 0, fmt.Errorf("log journal: watermark %s has a negative sequence", path)
+		return 0, 0, fmt.Errorf("log journal: watermark %s has a negative sequence", path)
 	}
-	return wm.Sequence, nil
+	if wm.Format > logJournalFormat {
+		return 0, 0, fmt.Errorf("log journal: watermark %s uses unsupported format %d", path, wm.Format)
+	}
+	return wm.Sequence, wm.Format, nil
 }
 
 // load reads the durable ack watermark and the unconsumed records, in
-// durable order. Records the watermark already covers are consumed state
-// left by a skipped cleanup: they are never replayed and are reclaimed as
-// the journal opens. A decode or identity failure is a hard error (fail
-// closed: durable state must not be silently ignored).
+// durable order. A format-2+ watermark covers every record at or below it
+// (contiguous ack) and those are never replayed; a format-1 watermark is
+// untrusted, so only a record EQUAL to it is treated as consumed and a lower
+// record (a failed batch the old sender's watermark leapfrogged) is
+// replayed. Reclaimed/loaded records are charged against the shared memory
+// budget; exceeding it is an explicit load failure, never a silent drop. A
+// decode or identity failure is a hard error (fail closed: durable state
+// must not be silently ignored).
 func (j *logJournal) load() error {
-	wm, err := readLogJournalWatermark(j.watermarkPath, j.jobID, j.generation)
+	wm, format, err := readLogJournalWatermark(j.watermarkPath, j.jobID, j.generation)
 	if err != nil {
 		return err
 	}
 	j.watermark = wm
+	j.ackedSeq = wm
 	j.maxSeq = wm
+	j.trustWatermark = format >= logJournalFormat
 	ents, err := os.ReadDir(j.dir)
 	if err != nil {
 		return fmt.Errorf("log journal: read %s: %w", j.dir, err)
@@ -241,10 +353,12 @@ func (j *logJournal) load() error {
 		if rec.Sequence <= 0 || rec.BatchID == "" || len(rec.Lines) == 0 {
 			return fmt.Errorf("log journal: record %s is incomplete", path)
 		}
-		if rec.Sequence <= j.watermark {
-			// Acked, cleanup skipped/delayed: consumed, never replayed.
-			// Reclaiming the file is best effort; a failure only delays
-			// space reclamation and never re-sends the batch.
+		if rec.Sequence <= j.watermark && (j.trustWatermark || rec.Sequence == j.watermark) {
+			// Consumed: either the format-2 contiguous watermark covers it
+			// or the format-1 legacy watermark equals it (the ack that wrote
+			// it unlinked this exact record). Reclaiming the file is best
+			// effort; a failure only delays space reclamation and never
+			// re-sends the batch.
 			_ = journalRemove(path)
 			continue
 		}
@@ -252,6 +366,11 @@ func (j *logJournal) load() error {
 			return fmt.Errorf("log journal: duplicate sequence %d under %s", rec.Sequence, j.dir)
 		}
 		seen[rec.Sequence] = true
+		if !j.mem.reserve(int64(len(b))) {
+			return fmt.Errorf("%w: loading %s (%d bytes) on top of %d resident bytes exceeds the %d byte memory budget for job %s generation %d",
+				errLogJournalMemoryOverflow, path, len(b), j.mem.load(), asyncSpoolBytes, j.jobID, j.generation)
+		}
+		j.resident += int64(len(b))
 		batch := logBatch{Sequence: rec.Sequence, ID: rec.BatchID, Lines: make([]logLine, 0, len(rec.Lines))}
 		for _, l := range rec.Lines {
 			batch.Lines = append(batch.Lines, logLine{
@@ -295,9 +414,11 @@ func (j *logJournal) pruneOlderGenerations(jobDir string) {
 	}
 }
 
-// pendingBatches returns the unconsumed records in sequence order. The lines
-// are the already-masked journaled payload; the batch identity is the
-// ORIGINAL one, never recomputed.
+// pendingBatches returns a copy of the unconsumed records in sequence order.
+// The lines are the already-masked journaled payload; the batch identity is
+// the ORIGINAL one, never recomputed. Tests use this to inspect durable
+// state; the sink moves the records out with takePendingBatches so the
+// replay payload is not duplicated in memory.
 func (j *logJournal) pendingBatches() []logBatch {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -306,6 +427,26 @@ func (j *logJournal) pendingBatches() []logBatch {
 		out = append(out, logBatch{Sequence: b.Sequence, ID: b.ID, Lines: append([]logLine(nil), b.Lines...)})
 	}
 	return out
+}
+
+// takePendingBatches moves the loaded unconsumed records to the caller. The
+// journal drops its own reference so the sink's replay buffer is the single
+// in-memory copy; the records stay charged against the shared memory budget
+// until their batches are acked.
+func (j *logJournal) takePendingBatches() []logBatch {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	out := j.records
+	j.records = nil
+	return out
+}
+
+// residentBytes is the memory charged for journal-resident pending records
+// (loaded plus appended, minus acked and removed). Test/accounting seam.
+func (j *logJournal) residentBytes() int64 {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.resident
 }
 
 // maxSequence is the highest persisted sequence: new batches continue after
@@ -317,8 +458,8 @@ func (j *logJournal) maxSequence() int64 {
 }
 
 // append durably journals one batch before its first POST attempt. It fails
-// (and writes nothing) when the batch would exceed the disk budget; the
-// caller must then not post the batch.
+// (and writes nothing) when the batch would exceed the disk budget OR the
+// shared in-memory budget; the caller must then not post the batch.
 func (j *logJournal) append(batch logBatch) error {
 	if batch.Sequence <= 0 || batch.ID == "" || len(batch.Lines) == 0 {
 		return fmt.Errorf("log journal: refusing to journal a batch without an identity")
@@ -340,8 +481,8 @@ func (j *logJournal) append(batch logBatch) error {
 	if j.removed {
 		return fmt.Errorf("log journal: journal for (%q, %d) is closed", j.jobID, j.generation)
 	}
-	if batch.Sequence <= j.watermark {
-		return fmt.Errorf("log journal: sequence %d is already durably acked (watermark %d)", batch.Sequence, j.watermark)
+	if batch.Sequence <= j.ackedSeq {
+		return fmt.Errorf("log journal: sequence %d is already acked (durable watermark %d)", batch.Sequence, j.watermark)
 	}
 	if _, ok := j.paths[batch.Sequence]; ok {
 		return fmt.Errorf("log journal: sequence %d already journaled", batch.Sequence)
@@ -350,10 +491,16 @@ func (j *logJournal) append(batch logBatch) error {
 		return fmt.Errorf("%w: %d pending bytes + %d byte batch exceeds the %d byte budget for job %s generation %d",
 			errLogJournalOverflow, j.bytes, len(b), asyncJournalBytes, j.jobID, j.generation)
 	}
+	if !j.mem.reserve(int64(len(b))) {
+		return fmt.Errorf("%w: %d resident bytes + %d byte record exceeds the %d byte memory budget for job %s generation %d",
+			errLogJournalMemoryOverflow, j.mem.load(), len(b), asyncSpoolBytes, j.jobID, j.generation)
+	}
 	path := filepath.Join(j.dir, journalRecordName(batch.Sequence, batch.ID))
 	if err := durableWriteJournalRecord(path, b); err != nil {
+		j.mem.release(int64(len(b)))
 		return err
 	}
+	j.resident += int64(len(b))
 	j.paths[batch.Sequence] = path
 	j.sizes[batch.Sequence] = int64(len(b))
 	j.bytes += int64(len(b))
@@ -364,13 +511,35 @@ func (j *logJournal) append(batch logBatch) error {
 	return nil
 }
 
-// ack durably marks the batch consumed after the control plane confirmed its
-// delivery. The durable ack point is the watermark write; the record unlink
-// afterwards is only space reclamation, so a failing unlink (or a crash right
-// after the watermark) can never resurrect a replay: the next open sees the
-// watermark and reclaims the record without sending it. The watermark is
-// written BEFORE the unlink, so a record is never deleted before the ack.
-// It is a no-op for a sequence already acked (or never journaled).
+// minUnackedSequenceLocked returns the lowest record sequence that is not
+// yet confirmed: records at or below ackedSeq are acked (their payload and
+// unlink are pending the next flush) and never count as a gap.
+func (j *logJournal) minUnackedSequenceLocked() (int64, bool) {
+	min := int64(0)
+	found := false
+	for seq := range j.paths {
+		if seq <= j.ackedSeq {
+			continue
+		}
+		if !found || seq < min {
+			min = seq
+			found = true
+		}
+	}
+	return min, found
+}
+
+// ack records a confirmed delivery. The durable watermark and the record
+// unlink are amortized (journalAckFlushEvery acks, or an explicit flushAcks
+// from the sink's Finish), but the ordering guarantee is unchanged: the
+// watermark write precedes every unlink it covers, so a crash can only
+// replay idempotently, never lose a delivered batch and never skip an
+// un-acked one.
+//
+// ack refuses to advance past an unconsumed lower sequence (fail closed):
+// the watermark must stay the highest CONTIGUOUS acked sequence, otherwise
+// load would have to guess whether a leapfrogged record was delivered.
+// It is a no-op for a sequence already acked or never journaled.
 func (j *logJournal) ack(sequence int64, batchID string) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -384,38 +553,116 @@ func (j *logJournal) ack(sequence int64, batchID string) error {
 	if filepath.Base(path) != journalRecordName(sequence, batchID) {
 		return fmt.Errorf("log journal: ack sequence %d does not match the journaled batch %s", sequence, batchID)
 	}
-	if sequence > j.watermark {
-		wm, err := json.Marshal(logJournalWatermark{JobID: j.jobID, Generation: j.generation, Sequence: sequence})
+	if min, ok := j.minUnackedSequenceLocked(); ok && min < sequence {
+		return fmt.Errorf("log journal: refusing to ack sequence %d past unconsumed sequence %d", sequence, min)
+	}
+	if sequence <= j.watermark {
+		// Already durably acked (a replayed legacy record, or a replay whose
+		// original ack landed): reclaim without moving the watermark.
+		_, err := j.reclaimCoveredLocked(sequence)
+		return err
+	}
+	if sequence <= j.ackedSeq {
+		// Acked in memory earlier; the pending flush will cover and reclaim
+		// it. Never unlink before the watermark is durable.
+		return nil
+	}
+	j.ackedSeq = sequence
+	j.unflushedAcks++
+	if j.unflushedAcks >= journalAckFlushEvery {
+		return j.flushAcksLocked()
+	}
+	return nil
+}
+
+// flushAcks makes every in-memory ack durable and reclaims the records it
+// covers. Ordering is the invariant: the watermark write precedes the
+// unlinks, so a record is never deleted before its delivery is durable. A
+// failure from the watermark write leaves every record unconsumed and is
+// surfaced as a delivery failure; a failing unlink is only cleanup lag and
+// never fails the job (the watermark already covers the record).
+func (j *logJournal) flushAcks() error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.flushAcksLocked()
+}
+
+func (j *logJournal) flushAcksLocked() error {
+	if j.removed {
+		return nil
+	}
+	if j.ackedSeq > j.watermark {
+		wm, err := json.Marshal(logJournalWatermark{JobID: j.jobID, Generation: j.generation, Sequence: j.ackedSeq, Format: logJournalFormat})
 		if err != nil {
-			return fmt.Errorf("log journal: encode ack watermark %d: %w", sequence, err)
+			return fmt.Errorf("log journal: encode ack watermark %d: %w", j.ackedSeq, err)
 		}
+		journalWatermarkWrites.Add(1)
 		if err := durableWriteJournalRecord(j.watermarkPath, wm); err != nil {
-			// The record stays unconsumed: a restart replays it and the
+			// The records stay unconsumed: a restart replays them and the
 			// server dedupes. This failure is surfaced to fail the job.
-			return fmt.Errorf("log journal: ack watermark %d: %w", sequence, err)
+			return fmt.Errorf("log journal: ack watermark %d: %w", j.ackedSeq, err)
 		}
-		j.watermark = sequence
+		j.watermark = j.ackedSeq
+	}
+	j.unflushedAcks = 0
+	// Reclaim every record the durable watermark now covers, in sequence
+	// order so a crash mid-cleanup leaves a suffix, never a hole.
+	seqs := make([]int64, 0, len(j.paths))
+	for seq := range j.paths {
+		if seq <= j.watermark {
+			seqs = append(seqs, seq)
+		}
+	}
+	sort.Slice(seqs, func(a, b int) bool { return seqs[a] < seqs[b] })
+	dirDirty := false
+	for _, seq := range seqs {
+		dirty, err := j.reclaimCoveredLocked(seq)
+		if err != nil {
+			return err
+		}
+		dirDirty = dirDirty || dirty
+	}
+	if dirDirty {
+		if err := journalDirSync(j.dir); err != nil {
+			return fmt.Errorf("log journal: ack cleanup: %w", err)
+		}
+	}
+	return nil
+}
+
+// reclaimCoveredLocked removes one durably acked record. It refuses to touch
+// a sequence the durable watermark does not cover (that record must stay for
+// replay), releases the record's share of the shared memory budget, and
+// treats a failed unlink as cleanup lag: the watermark already covers the
+// record, so a later open or the terminal remove reclaims it, and the disk
+// bytes stay accounted so the bound remains enforced. It reports whether a
+// directory entry changed (a caller batches one directory fsync).
+func (j *logJournal) reclaimCoveredLocked(sequence int64) (bool, error) {
+	path, ok := j.paths[sequence]
+	if !ok {
+		return false, nil
+	}
+	if sequence > j.watermark {
+		return false, fmt.Errorf("log journal: refusing to reclaim unacked sequence %d (watermark %d)", sequence, j.watermark)
 	}
 	size := j.sizes[sequence]
 	delete(j.paths, sequence)
 	delete(j.sizes, sequence)
 	for i, b := range j.records {
 		if b.Sequence == sequence {
-			j.records = append(j.records[:i], j.records[i+1:]...)
+			copy(j.records[i:], j.records[i+1:])
+			j.records[len(j.records)-1] = logBatch{}
+			j.records = j.records[:len(j.records)-1]
 			break
 		}
 	}
+	j.mem.release(size)
+	j.resident -= size
 	if err := journalRemove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		// The watermark already covers the record; keep its bytes accounted
-		// so a persistently failing cleanup keeps the disk bound enforced,
-		// and let a later open or the terminal remove reclaim it.
-		return nil
+		return false, nil
 	}
 	j.bytes -= size
-	if err := journalDirSync(j.dir); err != nil {
-		return fmt.Errorf("log journal: ack batch %d: %w", sequence, err)
-	}
-	return nil
+	return true, nil
 }
 
 // remove deletes the whole journal for this (job, generation). It is called
@@ -429,6 +676,10 @@ func (j *logJournal) remove() error {
 		return nil
 	}
 	j.removed = true
+	// The in-memory payload is gone with the journal: release its share of
+	// the shared budget even if the disk removal below fails.
+	j.mem.release(j.resident)
+	j.resident = 0
 	if err := os.RemoveAll(j.dir); err != nil {
 		return fmt.Errorf("log journal: remove %s: %w", j.dir, err)
 	}

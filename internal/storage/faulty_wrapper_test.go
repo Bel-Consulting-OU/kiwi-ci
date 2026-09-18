@@ -614,6 +614,22 @@ func missingOptionalInterfaceCases() map[string]missingIfaceCase {
 		"ReleaseOutboxClaim": {mutates: true, iface: "OutboxStore", call: func(f *FaultyStore) error {
 			return f.ReleaseOutboxClaim(ctx(), "", "")
 		}},
+		"OutboxEnqueueVersioned": {mutates: true, iface: "ForgeCheckStateStore", call: func(f *FaultyStore) error {
+			_, err := f.OutboxEnqueueVersioned(ctx(), OutboxItem{})
+			return err
+		}},
+		"OutboxRetry": {mutates: true, iface: "OutboxRetry", call: func(f *FaultyStore) error {
+			return f.OutboxRetry(ctx(), "", nil, 1)
+		}},
+		"OutboxRequeue": {mutates: true, iface: "OutboxDeadLetterStore", call: func(f *FaultyStore) error {
+			return f.OutboxRequeue(ctx(), "")
+		}},
+		"OutboxDelete": {mutates: true, iface: "OutboxDeadLetterStore", call: func(f *FaultyStore) error {
+			return f.OutboxDelete(ctx(), "")
+		}},
+		"OutboxMarkDelivered": {mutates: true, iface: "ForgeCheckStateStore", call: func(f *FaultyStore) error {
+			return f.OutboxMarkDelivered(ctx(), "", 0)
+		}},
 		"UpsertSchedule": {mutates: true, iface: "ScheduleStore", call: func(f *FaultyStore) error {
 			return f.UpsertSchedule(ctx(), Schedule{})
 		}},

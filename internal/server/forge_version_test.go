@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/forge"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
@@ -641,5 +642,184 @@ func TestCompletionReconcileNeverDeadLettersOnForgeFailure(t *testing.T) {
 		if status != "completed" {
 			t.Fatalf("forge publication emitted non-terminal state %q", status)
 		}
+	}
+}
+
+// legacyForgeCheckPayload builds a pre-0018 forge-check payload: it carries
+// the stable coordinates (host + run + check name) and the logical state, but
+// no logical_key/state_version fields, exactly like rows persisted before
+// migration 0018.
+func legacyForgeCheckPayload(t *testing.T, run model.Run, name, status, conclusion, summary string) []byte {
+	t.Helper()
+	payload, err := jsonMarshal(forge.CheckPayload{
+		RunID: run.ID, ForgeKind: run.ForgeKind, ForgeHost: run.ForgeHost,
+		RepoFullName: run.RepoFullName, SHA: run.SHA, Name: name,
+		Status: status, Conclusion: conclusion, Summary: summary,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
+}
+
+// appendLegacyForgeRow inserts one unversioned pre-0018 row directly into the
+// durable fake outbox (NULL logical_key/state_version columns).
+func appendLegacyForgeRow(t *testing.T, f *dbFakeStore, run model.Run, name, status, conclusion string) string {
+	t.Helper()
+	id := forgeCheckLogicalKey(run.ForgeHost, run.ID, name)
+	payload := legacyForgeCheckPayload(t, run, name, status, conclusion, name+" "+status)
+	f.mu.Lock()
+	f.outboxItems = append(f.outboxItems, storage.OutboxItem{
+		ID: id, Kind: forge.OutboxKindGitHubCheck, Payload: payload, CreatedAt: time.Now().UTC(),
+	})
+	f.mu.Unlock()
+	return id
+}
+
+// TestLegacyForgeCheckRowsObeyVersionWatermark is FA-3: pre-0018 pending rows
+// have NULL logical_key/state_version, so the supersede/guard machinery used
+// to skip them entirely and a stale legacy state could publish after a newer
+// version was delivered. The dispatcher now derives the identity from the
+// payload (host + run + name; rank from status) and applies the SAME durable
+// watermark guard, stamping the watermark after a successful publication.
+func TestLegacyForgeCheckRowsObeyVersionWatermark(t *testing.T) {
+	api, srv := newForgeVersionAPI(t)
+	defer srv.Close()
+	ctx := context.Background()
+
+	f := newDBFakeStore()
+	s := New("token")
+	s.GitHubToken = "tok"
+	s.gitHubAPIBase = srv.URL
+	if err := s.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	delivered := model.Run{ID: "legacy-delivered", ForgeKind: "github", ForgeHost: "github.com",
+		RepoFullName: "acme/backend", SHA: "sha-delivered", Status: model.StatusSuccess}
+	key := forgeCheckLogicalKey(delivered.ForgeHost, delivered.ID, "Pipeline")
+
+	// Deliver the terminal (v3) versioned state first: the durable watermark
+	// is now 3.
+	if err := s.publishForgeStatus(ctx, delivered); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.outbox.Flush(ctx, s.dispatchOutbox); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.forgeState[key]; got != 3 {
+		t.Fatalf("watermark after versioned delivery = %d, want 3", got)
+	}
+	postsBefore, _, publishedBefore := api.snapshot()
+	if len(publishedBefore) != 1 || publishedBefore[0] != "completed" {
+		t.Fatalf("published before legacy probe = %v, want [completed]", publishedBefore)
+	}
+
+	// A stale pre-0018 row (in_progress, rank 2) is claimed and dispatched:
+	// the derived guard must skip it (watermark 3 >= 2) without publishing.
+	appendLegacyForgeRow(t, f, delivered, "Pipeline", "in_progress", "")
+	if _, err := s.outbox.Flush(ctx, s.dispatchOutbox); err != nil {
+		t.Fatalf("flush stale legacy row: %v", err)
+	}
+	if posts, _, published := api.snapshot(); posts != postsBefore || len(published) != len(publishedBefore) {
+		t.Fatalf("stale legacy row published after a newer delivered state: posts %d->%d published %v->%v",
+			postsBefore, posts, publishedBefore, published)
+	}
+	if dead, _ := f.OutboxDeadLetters(ctx); len(dead) != 0 {
+		t.Fatalf("stale legacy row was dead-lettered instead of retired: %+v", dead)
+	}
+	if pending, _ := f.OutboxPending(ctx); len(pending) != 0 {
+		t.Fatalf("stale legacy row still pending: %+v", pending)
+	}
+	if got := f.forgeState[key]; got != 3 {
+		t.Fatalf("watermark regressed to %d", got)
+	}
+
+	// A legacy row with NO watermark for its own logical key publishes
+	// exactly once and stamps the watermark to its status rank.
+	fresh := model.Run{ID: "legacy-fresh", ForgeKind: "github", ForgeHost: "github.com",
+		RepoFullName: "acme/backend", SHA: "sha-fresh", Status: model.StatusSuccess}
+	freshKey := forgeCheckLogicalKey(fresh.ForgeHost, fresh.ID, "Pipeline")
+	appendLegacyForgeRow(t, f, fresh, "Pipeline", "completed", "success")
+	if _, err := s.outbox.Flush(ctx, s.dispatchOutbox); err != nil {
+		t.Fatalf("flush fresh legacy row: %v", err)
+	}
+	posts, _, published := api.snapshot()
+	if posts != postsBefore+1 {
+		t.Fatalf("legacy publication POSTs = %d, want %d (exactly once)", posts-postsBefore, 1)
+	}
+	if len(published) != len(publishedBefore)+1 || published[len(published)-1] != "completed" {
+		t.Fatalf("legacy publication states = %v, want one appended completed", published)
+	}
+	if got := f.forgeState[freshKey]; got != 3 {
+		t.Fatalf("legacy publication did not stamp the watermark: %d, want 3", got)
+	}
+
+	// Any later legacy state at or below the stamped watermark is skipped:
+	// the legacy rows now obey the same invariant as versioned ones.
+	appendLegacyForgeRow(t, f, fresh, "Pipeline", "in_progress", "")
+	if _, err := s.outbox.Flush(ctx, s.dispatchOutbox); err != nil {
+		t.Fatalf("flush stale legacy row after stamp: %v", err)
+	}
+	if postsNow, _, publishedNow := api.snapshot(); postsNow != posts || len(publishedNow) != len(published) {
+		t.Fatalf("legacy row published over its own stamped watermark: posts %d->%d published %v->%v",
+			posts, postsNow, published, publishedNow)
+	}
+}
+
+// TestLegacyForgeCheckFSWatermarkGuard covers the fs queue: a legacy row is
+// guarded by the in-process delivered watermark, and a successful legacy
+// publication stamps it DURABLY (the done journal marker), so a restart still
+// blocks a stale state and a stale versioned re-enqueue after it.
+func TestLegacyForgeCheckFSWatermarkGuard(t *testing.T) {
+	api, srv := newForgeVersionAPI(t)
+	defer srv.Close()
+	ctx := context.Background()
+	dir := t.TempDir()
+	s, err := NewPersistent("token", "token", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.GitHubToken = "tok"
+	s.gitHubAPIBase = srv.URL
+	run := model.Run{ID: "legacy-fs", ForgeKind: "github", ForgeHost: "github.com",
+		RepoFullName: "acme/backend", SHA: "sha-legacy-fs", Status: model.StatusSuccess}
+	key := forgeCheckLogicalKey(run.ForgeHost, run.ID, "Pipeline")
+	item := forge.OutboxItem{
+		ID: key, Kind: forge.OutboxKindGitHubCheck,
+		Payload: legacyForgeCheckPayload(t, run, "Pipeline", "completed", "success", "pipeline success"),
+	}
+	if err := s.dispatchOutbox(ctx, item); err != nil {
+		t.Fatalf("legacy fs dispatch: %v", err)
+	}
+	if posts, _, published := api.snapshot(); posts != 1 || len(published) != 1 || published[0] != "completed" {
+		t.Fatalf("legacy fs publication = posts=%d %v, want one completed", posts, published)
+	}
+
+	// A restart rebuilds the watermark from the durable done-journal marker.
+	s2, err := NewPersistent("token", "token", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2.GitHubToken = "tok"
+	s2.gitHubAPIBase = srv.URL
+	stale := forge.OutboxItem{
+		ID: key, Kind: forge.OutboxKindGitHubCheck,
+		Payload: legacyForgeCheckPayload(t, run, "Pipeline", "queued", "", "pipeline queued"),
+	}
+	if err := s2.dispatchOutbox(ctx, stale); err != nil {
+		t.Fatalf("stale legacy fs dispatch: %v", err)
+	}
+	if posts, _, published := api.snapshot(); posts != 1 || len(published) != 1 {
+		t.Fatalf("stale legacy fs state published after restart: posts=%d %v", posts, published)
+	}
+
+	// A stale VERSIONED re-enqueue (v2) after the legacy v3 publication is
+	// dropped by the restored watermark instead of being published late.
+	staleVersioned := s2.checkIntent(run, "Pipeline", "in_progress", "", "running", nil)
+	if err := s2.outbox.Enqueue(staleVersioned); err != nil {
+		t.Fatal(err)
+	}
+	if pending := s2.outbox.Pending(); len(pending) != 0 {
+		t.Fatalf("stale versioned state enqueued after a newer legacy delivery: %+v", pending)
 	}
 }

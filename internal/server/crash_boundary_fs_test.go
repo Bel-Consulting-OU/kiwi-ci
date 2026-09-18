@@ -618,3 +618,159 @@ func crashRunsForNominal(t *testing.T, s *Server, scheduleID string, nominal tim
 	}
 	return n
 }
+
+// crashStripPostPersistCompletionIntents rewrites outbox.jsonl to the exact
+// disk state at "completion snapshot persisted, no post-persist append ran":
+// every completion effect intent, forge check intent and downstream intent
+// the handler appends after the snapshot write is removed. (The forge check
+// intents come from publishForgeStatus, which the completion path calls
+// after enqueueCompletionEffects.)
+func crashStripPostPersistCompletionIntents(t *testing.T, dir string) {
+	t.Helper()
+	path := filepath.Join(dir, outboxFile)
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kept [][]byte
+	for _, line := range bytes.Split(b, []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var it forge.OutboxItem
+		if err := json.Unmarshal(line, &it); err == nil {
+			switch it.Kind {
+			case storage.OutboxKindCompletionReconcile, storage.OutboxKindForgeDelivery,
+				forge.OutboxKindGitHubCheck, forge.OutboxKindGitLabCheck, forge.OutboxKindForgejoCheck,
+				forge.OutboxKindGitHubStatus, forge.OutboxKindDownstream:
+				continue
+			}
+		}
+		kept = append(kept, line)
+	}
+	if err := os.WriteFile(path, bytes.Join(kept, []byte("\n")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestCrashCompletionBeforeIntentEnqueueReplayRepairsForgeDeliveryFS is FA-1:
+// the fs completion snapshot (terminal job, receipt, usage) is durable but the
+// process died BEFORE enqueueCompletionEffects appended the completion
+// intents. The runner's replayed completion hits the receipt-replay branch,
+// which used to reconcile internal effects only, permanently stranding the
+// terminal forge publication. The replay must re-ensure BOTH deterministic
+// intents (idempotently) before acking, and the scripted forge must see each
+// terminal check exactly once across replays.
+func TestCrashCompletionBeforeIntentEnqueueReplayRepairsForgeDeliveryFS(t *testing.T) {
+	api, srv := newForgeVersionAPI(t)
+	defer srv.Close()
+	dir := t.TempDir()
+	newServer := func() *Server {
+		t.Helper()
+		s, err := NewPersistent("token", "token", dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.GitHubToken = "tok"
+		s.gitHubAPIBase = srv.URL
+		return s
+	}
+
+	s1 := newServer()
+	if _, err := s1.enqueue(SubmitRun{
+		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
+		Ref: "refs/heads/main", SHA: "abc", Event: "push",
+		Pipeline: smokePipeline, Trusted: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Drain the queued-state publication first: the crash window below is
+	// "completion persisted, no post-persist intent appended".
+	s1.flushOutbox()
+	runnerID, task := registerUsageRunner(t, s1)
+	time.Sleep(20 * time.Millisecond)
+	if w := completeTask(t, s1, task, runnerID, "success"); w.Code != http.StatusNoContent {
+		t.Fatalf("complete = %d, want 204: %s", w.Code, w.Body.String())
+	}
+	s1.mu.Lock()
+	first := s1.jobs[task.Job.ID]
+	s1.mu.Unlock()
+
+	// Reconstruct the crash disk exactly: state.json keeps the terminal job,
+	// usage and receipt; outbox.jsonl loses every post-persist append.
+	crashStripPostPersistCompletionIntents(t, dir)
+
+	// Restart: the receipt (and terminal state) survived, the intents did not.
+	s2 := newServer()
+	key := completionReceiptKey(task.Job.ID, task.LeaseGeneration, runnerID)
+	s2.mu.Lock()
+	_, hasReceipt := s2.completions[key]
+	restored := s2.jobs[task.Job.ID]
+	s2.mu.Unlock()
+	if !hasReceipt {
+		t.Fatalf("completion receipt %q did not survive the crash", key)
+	}
+	if restored.Status != model.StatusSuccess || !restored.UsageRecorded || restored.Cost <= 0 {
+		t.Fatalf("restored terminal job = %+v", restored)
+	}
+	for _, kind := range []string{storage.OutboxKindCompletionReconcile, storage.OutboxKindForgeDelivery, forge.OutboxKindGitHubCheck} {
+		if n := crashPendingKindCount(s2, kind); n != 0 {
+			t.Fatalf("kind %q pending = %d after crash, want 0", kind, n)
+		}
+	}
+
+	// The runner replay republishes BOTH deterministic intents before acking.
+	if w := completeTask(t, s2, task, runnerID, "success"); w.Code != http.StatusNoContent {
+		t.Fatalf("receipt replay = %d, want 204: %s", w.Code, w.Body.String())
+	}
+	if n := crashPendingKindCount(s2, storage.OutboxKindForgeDelivery); n != 1 {
+		t.Fatalf("repaired forge_delivery intents = %d, want exactly 1 (terminal publication must not be lost)", n)
+	}
+	if n := crashPendingKindCount(s2, storage.OutboxKindCompletionReconcile); n != 1 {
+		t.Fatalf("repaired completion_reconcile intents = %d, want exactly 1", n)
+	}
+
+	// Dispatching the repaired intents publishes the terminal checks exactly
+	// once each (pipeline + the one job), all in the terminal completed state.
+	// The pipeline check was already mapped by the queued-state publication,
+	// so its terminal update is a PATCH; the job check is a fresh POST.
+	postsBefore, patchesBefore, publishedBefore := api.snapshot()
+	s2.flushOutbox()
+	posts, patches, published := api.snapshot()
+	if (posts-postsBefore)+(patches-patchesBefore) != 2 {
+		t.Fatalf("terminal forge publications = %d, want 2 (pipeline + job)", (posts-postsBefore)+(patches-patchesBefore))
+	}
+	if len(published)-len(publishedBefore) != 2 {
+		t.Fatalf("published states = %v, want 2 new terminal states", published[len(publishedBefore):])
+	}
+	for _, status := range published[len(publishedBefore):] {
+		if status != "completed" {
+			t.Fatalf("forge publication emitted non-terminal state %q", status)
+		}
+	}
+	if pending := len(s2.outbox.Pending()); pending != 0 {
+		t.Fatalf("outbox pending after convergence = %d, want 0", pending)
+	}
+
+	// A second replay is a no-op: the deterministic intents are already
+	// delivered, the internal effects stay idempotent (usage exactly once)
+	// and nothing republishes.
+	if w := completeTask(t, s2, task, runnerID, "success"); w.Code != http.StatusNoContent {
+		t.Fatalf("second replay = %d, want 204: %s", w.Code, w.Body.String())
+	}
+	s2.flushOutbox()
+	postsAgain, patchesAgain, publishedAgain := api.snapshot()
+	if postsAgain != posts || patchesAgain != patches || len(publishedAgain) != len(published) {
+		t.Fatalf("second replay republished: posts %d->%d patches %d->%d published %v->%v", posts, postsAgain, patches, patchesAgain, published, publishedAgain)
+	}
+	s2.mu.Lock()
+	replayed := s2.jobs[task.Job.ID]
+	s2.mu.Unlock()
+	if !replayed.UsageRecorded || replayed.Cost != first.Cost {
+		t.Fatalf("replay moved the durable completion: %+v (first cost %v)", replayed, first.Cost)
+	}
+	crashAssertUsageWindowExactlyOne(t, s2, first.Cost)
+}

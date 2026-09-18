@@ -24,6 +24,19 @@ const (
 	outboxDoneFile = "outbox.done.jsonl"
 )
 
+// outboxDoneRecord is one line of the fs done journal. ID is the acked
+// intent. LogicalKey/StateVersion form an optional DELIVERED WATERMARK marker:
+// legacy (pre-0018) forge-check rows carry no versioned identity on their own
+// ack, so the dispatcher stamps the derived identity here after a successful
+// publication; a restart rebuilds the fs-mode watermark from these records
+// (versioned rows also rebuild it from their versioned IDs, keeping older
+// journals readable).
+type outboxDoneRecord struct {
+	ID           string `json:"id,omitempty"`
+	LogicalKey   string `json:"logical_key,omitempty"`
+	StateVersion int64  `json:"state_version,omitempty"`
+}
+
 // Outbox is a durable FIFO of forge-publish intents. Items are held in
 // memory and, when a storage.Repository is attached, persisted as JSONL
 // lines so a restarted control plane replays unflushed intents. Processed
@@ -114,15 +127,20 @@ func (o *Outbox) ReplayDB(ctx context.Context) error {
 
 func (o *Outbox) loadLocked() error {
 	done := map[string]bool{}
+	delivered := map[string]int64{}
 	f, err := os.Open(filepath.Join(o.store.Root, outboxDoneFile))
 	if err == nil {
 		sc := bufio.NewScanner(f)
 		for sc.Scan() {
-			var rec struct {
-				ID string `json:"id"`
+			var rec outboxDoneRecord
+			if json.Unmarshal(sc.Bytes(), &rec) != nil {
+				continue
 			}
-			if json.Unmarshal(sc.Bytes(), &rec) == nil && rec.ID != "" {
+			if rec.ID != "" {
 				done[rec.ID] = true
+			}
+			if rec.LogicalKey != "" && rec.StateVersion > 0 && rec.StateVersion > delivered[rec.LogicalKey] {
+				delivered[rec.LogicalKey] = rec.StateVersion
 			}
 		}
 		_ = f.Close()
@@ -130,14 +148,17 @@ func (o *Outbox) loadLocked() error {
 		return err
 	}
 	o.done = done
-	// Rebuild the fs-mode delivered watermark from the done IDs: versioned
+	// Rebuild the fs-mode delivered watermark from the done IDs too: versioned
 	// IDs carry their logical key and version, so a stale state re-enqueued
 	// after a restart is still recognized as older than what was delivered.
+	// This keeps journals written before the explicit watermark records above
+	// readable.
 	for id := range done {
-		if key, version, ok := parseVersionedRowID(id); ok && version > o.delivered[key] {
-			o.delivered[key] = version
+		if key, version, ok := parseVersionedRowID(id); ok && version > delivered[key] {
+			delivered[key] = version
 		}
 	}
+	o.delivered = delivered
 
 	items, err := o.readItems()
 	if err != nil {
@@ -228,8 +249,13 @@ func (o *Outbox) Enqueue(item forge.OutboxItem) error {
 		return o.enqueueVersionedLocked(item)
 	}
 	// Idempotent by ID: deterministic intents (downstream launches keyed by
-	// the link's stable key) are replayed after lost ACKs and must converge
-	// on ONE durable intent.
+	// the link's stable key, completion effects keyed by job/generation/kind)
+	// are replayed after lost ACKs and must converge on ONE durable intent. An
+	// ID already in the done set was DELIVERED and retired: re-enqueueing it
+	// would dispatch the same effect a second time.
+	if o.done[item.ID] {
+		return nil
+	}
 	for _, it := range o.items {
 		if it.ID == item.ID {
 			return nil
@@ -301,9 +327,7 @@ func (o *Outbox) enqueueVersionedLocked(item forge.OutboxItem) error {
 			return err
 		}
 		for _, id := range superseded {
-			if err := o.appendJSONLLocked(outboxDoneFile, struct {
-				ID string `json:"id"`
-			}{ID: id}); err != nil {
+			if err := o.appendJSONLLocked(outboxDoneFile, outboxDoneRecord{ID: id}); err != nil {
 				return err
 			}
 		}
@@ -372,6 +396,59 @@ func (o *Outbox) recordDeliveredLocked(it forge.OutboxItem) {
 	if it.StateVersion > o.delivered[it.LogicalKey] {
 		o.delivered[it.LogicalKey] = it.StateVersion
 	}
+}
+
+// Superseded reports whether a forge-check state must not be published in
+// fs/memory mode: a version at or below the delivered watermark, or a
+// strictly newer version still queued. It is the fs-mode version guard for
+// LEGACY (unversioned) rows, whose payload carries no identity of its own, so
+// the dispatcher derives the identity and asks here before publishing.
+func (o *Outbox) Superseded(logicalKey string, version int64) bool {
+	if logicalKey == "" || version <= 0 {
+		return false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.delivered[logicalKey] >= version {
+		return true
+	}
+	for _, it := range o.items {
+		if it.LogicalKey == logicalKey && it.StateVersion > version {
+			return true
+		}
+	}
+	return false
+}
+
+// MarkDelivered durably advances the fs-mode delivered watermark for one
+// logical key after a successful publication. It is used for LEGACY
+// (unversioned) forge-check rows: their own ack carries no identity, so
+// without this stamp a stale state re-enqueued after the restart could
+// publish over a newer delivered one. Versioned items keep advancing the
+// watermark through their ack (recordDeliveredLocked); this method is
+// idempotent and never lowers it.
+func (o *Outbox) MarkDelivered(logicalKey string, version int64) error {
+	if logicalKey == "" || version <= 0 {
+		return nil
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.delivered[logicalKey] >= version {
+		return nil
+	}
+	// Durability first: a watermark the journal does not hold must not be
+	// reported as delivered, or a restart would allow the stale publication
+	// this guard exists to prevent.
+	if o.store != nil {
+		if err := o.appendJSONLLocked(outboxDoneFile, outboxDoneRecord{LogicalKey: logicalKey, StateVersion: version}); err != nil {
+			return err
+		}
+	}
+	if o.delivered == nil {
+		o.delivered = map[string]int64{}
+	}
+	o.delivered[logicalKey] = version
+	return nil
 }
 
 // QueueKnownDurable registers an intent whose durable row was ALREADY
@@ -524,9 +601,14 @@ func (o *Outbox) flushLocal(ctx context.Context, dispatch func(context.Context, 
 		// Durable ack BEFORE the local removal: a failed ack leaves the
 		// intent queued and it is retried (idempotently) next tick.
 		if o.store != nil {
-			if err := o.appendJSONLLocked(outboxDoneFile, struct {
-				ID string `json:"id"`
-			}{ID: it.ID}); err != nil {
+			rec := outboxDoneRecord{ID: it.ID}
+			if it.LogicalKey != "" && it.StateVersion > 0 {
+				// Persist the versioned identity explicitly so the watermark
+				// rebuild does not depend on parsing the row ID alone.
+				rec.LogicalKey = it.LogicalKey
+				rec.StateVersion = it.StateVersion
+			}
+			if err := o.appendJSONLLocked(outboxDoneFile, rec); err != nil {
 				return dispatched, err
 			}
 		}
@@ -693,18 +775,38 @@ func (o *Outbox) flushDBBatch(ctx context.Context, dispatch func(context.Context
 // its error instead of retried forever.
 const maxOutboxAttempts = 8
 
+// errUnknownOutboxKind marks a durable intent whose kind this binary does not
+// know (a NEWER replica's row during a rolling upgrade, or a downgrade). It
+// must never be dropped (ACK) or dead-lettered by an older replica: the row
+// has to survive until a replica that understands it claims it.
+var errUnknownOutboxKind = errors.New("outbox: unknown intent kind")
+
+// unknownOutboxKindError names the kind that could not be dispatched.
+type unknownOutboxKindError struct{ kind string }
+
+func (e *unknownOutboxKindError) Error() string {
+	return fmt.Sprintf("outbox: unknown intent kind %q left pending for a newer replica", e.kind)
+}
+
+func (e *unknownOutboxKindError) Unwrap() error { return errUnknownOutboxKind }
+
 // retryOutboxRow records a failed attempt through the store when it supports
 // retry metadata; older stores simply keep the row claimed/released as
-// before. Internal consistency rows (completion_reconcile) retry with NO
-// dead-letter cap: a persistently failing dependency must not retire the row
-// that converges internal markers/effects; the row keeps backing off and
-// stays visible as pending with its last error.
+// before. Two classes never consume the dead-letter budget:
+//
+//   - internal consistency rows (completion effects whose dispatch runs the
+//     marker-guarded reconciliation chain): a persistently failing dependency
+//     must not retire the row that converges internal markers/effects; it
+//     keeps backing off and stays visible as pending with its last error.
+//   - UNKNOWN kinds: an old replica must neither ACK nor dead-letter a row
+//     only a newer replica can process, so the row survives the rolling
+//     upgrade with bounded backoff instead of hot-looping.
 func (o *Outbox) retryOutboxRow(ctx context.Context, it forge.OutboxItem, dispatchErr error) error {
 	if rs, ok := o.db.(interface {
 		OutboxRetry(context.Context, string, error, int) error
 	}); ok {
 		maxAttempts := maxOutboxAttempts
-		if it.Kind == storage.OutboxKindCompletionReconcile {
+		if errors.Is(dispatchErr, errUnknownOutboxKind) || storage.InternalCompletionEffectKind(it.Kind) {
 			maxAttempts = 0
 		}
 		return rs.OutboxRetry(ctx, it.ID, dispatchErr, maxAttempts)
@@ -827,10 +929,13 @@ func (s *Server) dispatchOutbox(ctx context.Context, item forge.OutboxItem) erro
 						return err
 					}
 				}
-				return nil
+				return s.markForgeCheckDelivered(ctx, item, p)
 			}
 		}
-		return publisher.PublishCheck(ctx, p.RepoFullName, p.SHA, p.Name, p.Status, p.Conclusion, p.DetailsURL, p.Summary, p.Annotations)
+		if err := publisher.PublishCheck(ctx, p.RepoFullName, p.SHA, p.Name, p.Status, p.Conclusion, p.DetailsURL, p.Summary, p.Annotations); err != nil {
+			return err
+		}
+		return s.markForgeCheckDelivered(ctx, item, p)
 	case forge.OutboxKindGitLabCheck:
 		var p forge.CheckPayload
 		if err := json.Unmarshal(item.Payload, &p); err != nil {
@@ -855,7 +960,10 @@ func (s *Server) dispatchOutbox(ctx context.Context, item forge.OutboxItem) erro
 			log.Printf("outbox: skipping superseded forge check %s", item.ID)
 			return nil
 		}
-		return s.gitLabForge().PublishCheck(ctx, p.RepoFullName, p.SHA, p.Name, p.Status, p.Conclusion, p.DetailsURL, p.Summary, p.Annotations)
+		if err := s.gitLabForge().PublishCheck(ctx, p.RepoFullName, p.SHA, p.Name, p.Status, p.Conclusion, p.DetailsURL, p.Summary, p.Annotations); err != nil {
+			return err
+		}
+		return s.markForgeCheckDelivered(ctx, item, p)
 	case forge.OutboxKindForgejoCheck:
 		var p forge.CheckPayload
 		if err := json.Unmarshal(item.Payload, &p); err != nil {
@@ -880,7 +988,10 @@ func (s *Server) dispatchOutbox(ctx context.Context, item forge.OutboxItem) erro
 			log.Printf("outbox: skipping superseded forge check %s", item.ID)
 			return nil
 		}
-		return s.forgejoForge().PublishCheck(ctx, p.RepoFullName, p.SHA, p.Name, p.Status, p.Conclusion, p.DetailsURL, p.Summary, p.Annotations)
+		if err := s.forgejoForge().PublishCheck(ctx, p.RepoFullName, p.SHA, p.Name, p.Status, p.Conclusion, p.DetailsURL, p.Summary, p.Annotations); err != nil {
+			return err
+		}
+		return s.markForgeCheckDelivered(ctx, item, p)
 	case forge.OutboxKindGitHubStatus:
 		var p forge.StatusPayload
 		if err := json.Unmarshal(item.Payload, &p); err != nil {
@@ -941,8 +1052,11 @@ func (s *Server) dispatchOutbox(ctx context.Context, item forge.OutboxItem) erro
 		log.Printf("outbox: dropping reserved intent %s (kind %s)", item.ID, item.Kind)
 		return nil
 	default:
-		log.Printf("outbox: dropping unknown intent %s (kind %s)", item.ID, item.Kind)
-		return nil
+		// An unknown kind (a newer binary's row during a rolling upgrade) is
+		// never dropped or dead-lettered by this replica: return the typed
+		// error so the flush releases the claim and the row survives with
+		// backoff until a replica that understands it processes it.
+		return &unknownOutboxKindError{kind: item.Kind}
 	}
 }
 
@@ -972,20 +1086,68 @@ func (s *Server) fenceVersionedCheck(ctx context.Context, item forge.OutboxItem,
 	return true, unlock, nil
 }
 
-// forgeCheckDispatchable applies the durable version guard to a versioned
-// forge-check intent. In DB mode the guard is authoritative across replicas:
-// a row that no longer exists (superseded), a delivered version at or above
-// this one, or a newer pending version all mean this publication must be
-// skipped. A guard failure fails the dispatch (never publish without the
-// guard). In fs/memory mode the in-process queue already superseded older
-// pending versions at enqueue time and dispatches FIFO, so the local state is
-// the guard.
+// forgeCheckIdentity resolves the versioned delivery identity of a
+// forge-check intent. Versioned rows carry it in the durable columns and/or
+// the payload. LEGACY pre-0018 rows carry neither: their identity is DERIVED
+// from the payload's stable coordinates (forge host + run + check name) and
+// the status rank, so the same durable watermark guard (and the same
+// post-publication stamp) applies to them. ok=false means the payload does
+// not even carry the coordinates to derive from; legacy=true marks a derived
+// identity whose publication must stamp the watermark explicitly.
+func forgeCheckIdentity(item forge.OutboxItem, p forge.CheckPayload) (logicalKey string, version int64, legacy bool, ok bool) {
+	if item.LogicalKey != "" && item.StateVersion > 0 {
+		return item.LogicalKey, item.StateVersion, false, true
+	}
+	if p.LogicalKey != "" && p.StateVersion > 0 {
+		return p.LogicalKey, p.StateVersion, false, true
+	}
+	if p.RunID == "" || p.Name == "" {
+		return "", 0, false, false
+	}
+	return forgeCheckLogicalKey(p.ForgeHost, p.RunID, p.Name), checkStateVersion(p.Status), true, true
+}
+
+// markForgeCheckDelivered stamps the durable delivered watermark after a
+// successful forge publication of a LEGACY (pre-0018) forge-check row: its
+// own ack carries no logical_key/state_version columns, so without this stamp
+// a stale legacy state re-enqueued later (or a versioned state enqueued after
+// it) could regress a newer delivered state. Versioned rows return
+// immediately: OutboxAck advances their watermark atomically. A stamp failure
+// fails the dispatch (no ACK) so the retry repeats the idempotent publication
+// and the stamp together.
+func (s *Server) markForgeCheckDelivered(ctx context.Context, item forge.OutboxItem, p forge.CheckPayload) error {
+	logicalKey, version, legacy, ok := forgeCheckIdentity(item, p)
+	if !ok || !legacy {
+		return nil
+	}
+	if s.DB == nil {
+		return s.outbox.MarkDelivered(logicalKey, version)
+	}
+	vgs, ok := s.DB.(storage.ForgeCheckStateStore)
+	if !ok {
+		return fmt.Errorf("outbox: store lacks the versioned forge-check guard contract")
+	}
+	return vgs.OutboxMarkDelivered(ctx, logicalKey, version)
+}
+
+// forgeCheckDispatchable applies the durable version guard to a forge-check
+// intent, deriving the delivery identity for legacy unversioned rows. In DB
+// mode the guard is authoritative across replicas: a row that no longer
+// exists (superseded), a delivered version at or above this one, or a newer
+// pending version all mean this publication must be skipped. A guard failure
+// fails the dispatch (never publish without the guard). In fs/memory mode the
+// in-process queue already superseded older pending versions at enqueue time
+// and dispatches FIFO; its delivered watermark (rebuilt from the done
+// journal) is consulted here so a legacy row cannot regress it either.
 func (s *Server) forgeCheckDispatchable(ctx context.Context, item forge.OutboxItem, p forge.CheckPayload) (bool, error) {
-	if p.LogicalKey == "" || p.StateVersion <= 0 {
+	logicalKey, version, _, ok := forgeCheckIdentity(item, p)
+	if !ok {
+		// No identity to guard on (malformed legacy payload): preserve the
+		// historical behavior instead of blocking the row forever.
 		return true, nil
 	}
 	if s.DB == nil {
-		return true, nil
+		return !s.outbox.Superseded(logicalKey, version), nil
 	}
 	vgs, ok := s.DB.(storage.ForgeCheckStateStore)
 	if !ok {
@@ -994,7 +1156,7 @@ func (s *Server) forgeCheckDispatchable(ctx context.Context, item forge.OutboxIt
 		// it; this is a programming-error guard, not a supported mode.
 		return false, fmt.Errorf("outbox: store lacks the versioned forge-check guard contract")
 	}
-	publish, err := vgs.OutboxVersionGuard(ctx, item.ID, p.LogicalKey, p.StateVersion)
+	publish, err := vgs.OutboxVersionGuard(ctx, item.ID, logicalKey, version)
 	if err != nil {
 		return false, err
 	}

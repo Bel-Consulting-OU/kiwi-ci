@@ -22,7 +22,7 @@ import (
 type dbFakeStore struct {
 	mu         sync.Mutex
 	checkRuns  map[string]string
-	logBatches map[string]bool
+	logBatches map[string]string
 	runs       map[string]model.Run
 	jobs       map[string]model.Job
 	runners    map[string]model.Runner
@@ -1117,13 +1117,19 @@ func (f *dbFakeStore) AppendLogBatch(ctx context.Context, entries []model.LogEnt
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.logBatches == nil {
-		f.logBatches = map[string]bool{}
+		f.logBatches = map[string]string{}
 	}
 	key := r.JobID + "\x00" + strconv.FormatInt(r.Generation, 10) + "\x00" + r.BatchID
-	if f.logBatches[key] {
+	digest := storage.LogBatchPayloadDigest(r, entries)
+	if stored, ok := f.logBatches[key]; ok {
+		// Same payload under the same identity is an idempotent duplicate;
+		// a different payload is the conflict the SQL/fs stores report.
+		if stored != digest {
+			return false, storage.ErrLogBatchConflict
+		}
 		return false, nil
 	}
-	f.logBatches[key] = true
+	f.logBatches[key] = digest
 	f.logs = append(f.logs, entries...)
 	return true, nil
 }
@@ -1258,17 +1264,21 @@ func (f *dbFakeStore) OutboxDelete(ctx context.Context, id string) error {
 	return nil
 }
 
-// ForceOutboxDue clears the retry deferral for one row so tests can drive
-// the next attempt without waiting out the backoff.
-func (f *dbFakeStore) ForceOutboxDue(id string) {
+// OutboxMarkDelivered mirrors the SQL watermark stamp used for LEGACY
+// pre-0018 forge rows whose own ack cannot advance the watermark.
+func (f *dbFakeStore) OutboxMarkDelivered(ctx context.Context, logicalKey string, version int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	meta, ok := f.outboxMeta[id]
-	if !ok {
-		return
+	if logicalKey == "" || version <= 0 {
+		return fmt.Errorf("storage: mark delivered requires a logical key and a positive version")
 	}
-	meta.nextAt = time.Time{}
-	f.outboxMeta[id] = meta
+	if f.forgeState == nil {
+		f.forgeState = map[string]int64{}
+	}
+	if version > f.forgeState[logicalKey] {
+		f.forgeState[logicalKey] = version
+	}
+	return nil
 }
 
 // ForceAllOutboxDue clears every retry deferral (the test analogue of a

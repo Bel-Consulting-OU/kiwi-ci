@@ -54,6 +54,26 @@ Rules:
 - A schema bump in a migration implies the server release needs it;
   check `database status` after every upgrade.
 
+### Migration locks
+
+The automatic startup migration applies DDL in version order, one file per
+transaction, so each file is its own lock window:
+
+- The `outbox` metadata change in migration 0018 (`ALTER TABLE ... ADD COLUMN`
+  with a constant default, plus the new empty `forge_check_state` table) is
+  fast: the `ACCESS EXCLUSIVE` lock on `outbox` lives only for that file's
+  catalog-only statements and is not held across any index build.
+- The two `outbox` index builds (migrations 0019/0020, matching the unique
+  `(logical_key, state_version)` identity and its pending variant) are
+  non-concurrent and each hold a write-blocking `SHARE` lock on `outbox` for
+  the duration of that single build. Reads are unaffected; `INSERT`s from
+  completions and webhooks queue until the build finishes. This is brief for
+  typical outbox sizes; on a deployment carrying a very large dead-letter
+  backlog (for example after a long forge outage), plan a maintenance window
+  so enqueues are not delayed.
+- No manual step is required: the server migrates at startup, the split keeps
+  each lock window independent, and re-running is idempotent (`IF NOT EXISTS`).
+
 ## Upgrade procedure
 
 1. Back up PostgreSQL, the data directory key files (lease, OIDC, CA),
@@ -72,6 +92,27 @@ Rolling back the server binary is safe as long as the database schema
 is compatible: new columns are additive. If a release contained a
 breaking migration, roll back by restoring the database snapshot and
 redeploying the old binary plus its data directory files.
+
+fs mode has one silent data-loss boundary in that procedure. A binary
+that predates the durable deployment records does not know the
+`deployments` field of the data-dir snapshot
+(`storage.Snapshot.Deployments`). It decodes `state.json` without those
+records, and its first persist -- the server persists at startup and
+after every mutation -- rewrites the whole snapshot from its own struct
+and permanently drops every deployment record created after the
+upgrade. Before downgrading across that boundary, export/back up the
+deployment records (or do not downgrade); do not assume restoring the
+data directory files alone preserves them. The PostgreSQL store is
+unaffected: its deployment rows live in their own table.
+
+The same silent-drop class does not apply to fs schedule occurrence
+claims: they ride the separate `schedules.json` (`occurrences` field),
+which pre-deployments binaries already read and rewrite. What older
+snapshots lack is the run metadata (`schedule_id`/`schedule_nominal`)
+this version uses to adopt a committed run after a crash between the
+two fs writes; a downgrade loses that crash-window exactly-once
+compensation (a crash in the window can refire a nominal) but not the
+claims themselves.
 
 ## Behavioral compatibility notes
 
@@ -134,7 +175,14 @@ redeploying the old binary plus its data directory files.
   `completion_reconcile` (internal effects) and `forge_delivery` are
   separate intents: internal reconciliation is retried until it
   converges and is never dead-lettered, while forge delivery follows
-  the bounded retry/dead-letter policy. Operators inspect and recover
+  the bounded retry/dead-letter policy. Legacy pre-0018 rows without
+  version fields are normalized at dispatch (the logical key is derived
+  from host + run + check name, the version from the status rank), so
+  they obey the same watermark. A store that does not implement the
+  `storage.ForgeCheckStateStore` contract (including
+  `OutboxMarkDelivered`, which stamps the watermark for those legacy
+  rows) is refused fail-closed by dispatch and versioned enqueue: no
+  publication happens without the guard. Operators inspect and recover
   dead letters with:
   ```bash
   kiwi outbox dead-letters list [--database-url "$DATABASE_URL"]
@@ -144,8 +192,10 @@ redeploying the old binary plus its data directory files.
 - Enqueue is fail-closed for custom stores: server enqueue requires
   the `storage.RunEnqueueStore` atomic contract
   (`InsertCompiledRun`). A store that does not implement it (for
-  example an embedder's `storage.Store` wrapper) is refused with 503
-  instead of falling back to a non-atomic scheduler enqueue plus a
+  example an embedder's `storage.Store` wrapper) is refused at startup,
+  and any HTTP enqueue that still reaches it (`POST /api/v1/runs`,
+  `/hooks/github`, `/hooks/gitlab`, `/hooks/forgejo`) is refused with
+  503 instead of falling back to a non-atomic scheduler enqueue plus a
   best-effort delivery upsert. The built-in memory, fs, and PostgreSQL
   stores implement the contract; no action is needed unless you
   wrapped the store.

@@ -26,7 +26,7 @@ func TestAsyncLogSinkNeverBlocksProducerAndFlushesAll(t *testing.T) {
 	var delivered atomic.Int64
 	var mu sync.Mutex
 	seen := map[string]bool{}
-	sink := newAsyncLogSink(nil, func(_ context.Context, batch logBatch) error {
+	sink := newLogSink(nil, func(_ context.Context, batch logBatch) error {
 		time.Sleep(5 * time.Millisecond) // slow endpoint
 		mu.Lock()
 		for _, l := range batch.Lines {
@@ -35,7 +35,7 @@ func TestAsyncLogSinkNeverBlocksProducerAndFlushesAll(t *testing.T) {
 		mu.Unlock()
 		delivered.Add(int64(len(batch.Lines)))
 		return nil
-	})
+	}, nil)
 	const total = 4000
 	start := time.Now()
 	for i := 0; i < total; i++ {
@@ -74,10 +74,10 @@ func TestAsyncLogSinkOverflowIsCounted(t *testing.T) {
 	t.Cleanup(func() { asyncSpoolLimit = oldLimit })
 
 	release := make(chan struct{})
-	sink := newAsyncLogSink(nil, func(context.Context, logBatch) error {
+	sink := newLogSink(nil, func(context.Context, logBatch) error {
 		<-release // stall delivery entirely
 		return nil
-	})
+	}, nil)
 	for i := 0; i < 100; i++ {
 		sink.WriteLine("job", "step", fmt.Sprintf("line-%d", i))
 	}
@@ -94,9 +94,9 @@ func TestAsyncLogSinkOverflowIsCounted(t *testing.T) {
 func TestAsyncLogSinkSendErrorReported(t *testing.T) {
 	// A PERMANENT (4xx-class) failure is surfaced immediately; transient
 	// failures retry with backoff first.
-	sink := newAsyncLogSink(nil, func(context.Context, logBatch) error {
+	sink := newLogSink(nil, func(context.Context, logBatch) error {
 		return PermanentDeliveryError(fmt.Errorf("control plane down"))
-	})
+	}, nil)
 	sink.WriteLine("job", "step", "x")
 	out := sink.Finish(2 * time.Second)
 	if out.Err == nil {
@@ -119,10 +119,10 @@ func TestAsyncLogSinkByteBudgetBoundsMemory(t *testing.T) {
 	t.Cleanup(func() { asyncSpoolBytes, asyncSpoolLimit = oldBytes, oldLines })
 
 	release := make(chan struct{})
-	sink := newAsyncLogSink(nil, func(context.Context, logBatch) error {
+	sink := newLogSink(nil, func(context.Context, logBatch) error {
 		<-release
 		return nil
-	})
+	}, nil)
 	big := string(make([]byte, 1024)) // 1 KiB line
 	for i := 0; i < 50; i++ {
 		sink.WriteLine("job", "step", big)
@@ -142,11 +142,11 @@ func TestAsyncLogSinkByteBudgetBoundsMemory(t *testing.T) {
 func TestAsyncLogSinkInFlightCountsTowardFlush(t *testing.T) {
 	proceed := make(chan struct{})
 	var calls atomic.Int64
-	sink := newAsyncLogSink(nil, func(context.Context, logBatch) error {
+	sink := newLogSink(nil, func(context.Context, logBatch) error {
 		calls.Add(1)
 		<-proceed // hold the batch in flight
 		return fmt.Errorf("delivery down")
-	})
+	}, nil)
 	sink.WriteLine("job", "step", "line-1")
 	// Wait until the sender has taken the batch (in flight).
 	deadline := time.Now().Add(2 * time.Second)
@@ -173,14 +173,14 @@ func TestAsyncLogSinkInFlightCountsTowardFlush(t *testing.T) {
 func TestAsyncLogSinkRetriesTransientFailures(t *testing.T) {
 	var attempts atomic.Int64
 	delivered := make(chan int, 4)
-	sink := newAsyncLogSink(nil, func(_ context.Context, batch logBatch) error {
+	sink := newLogSink(nil, func(_ context.Context, batch logBatch) error {
 		n := attempts.Add(1)
 		if n < 3 {
 			return fmt.Errorf("transient 503")
 		}
 		delivered <- len(batch.Lines)
 		return nil
-	})
+	}, nil)
 	sink.WriteLine("job", "step", "line-1")
 	out := sink.Finish(15 * time.Second)
 	select {
@@ -279,7 +279,7 @@ func TestLogBatchRetryReusesImmutableIdentity(t *testing.T) {
 	defer ts.Close()
 
 	r := testRunnerFor(t, ts, Config{})
-	sink := newAsyncLogSink(nil, r.logBatchPost(basicTask(payloadPipeline), &secrets.Masker{}))
+	sink := newLogSink(nil, r.logBatchPost(basicTask(payloadPipeline), &secrets.Masker{}), nil)
 
 	sink.WriteLine("build", "step", "line-1")
 	waitUntil(t, 10*time.Second, "the first batch retry", func() bool {
@@ -354,7 +354,7 @@ func TestLogBatchPostAbortsInflightOnFinish(t *testing.T) {
 	defer ts.Close()
 
 	r := testRunnerFor(t, ts, Config{})
-	sink := newAsyncLogSink(nil, r.logBatchPost(basicTask(payloadPipeline), &secrets.Masker{}))
+	sink := newLogSink(nil, r.logBatchPost(basicTask(payloadPipeline), &secrets.Masker{}), nil)
 	sink.WriteLine("build", "step", "line-1")
 
 	select {
@@ -394,11 +394,11 @@ func TestLogSpoolAccountingMatchesStoredCosts(t *testing.T) {
 	// state is frozen and observable (no timing race).
 	started := make(chan struct{}, 16)
 	release := make(chan struct{}, 16)
-	sink := newAsyncLogSink(nil, func(context.Context, logBatch) error {
+	sink := newLogSink(nil, func(context.Context, logBatch) error {
 		started <- struct{}{}
 		<-release
 		return nil
-	})
+	}, nil)
 
 	// Escape-heavy line: every raw byte expands under JSON encoding (quotes,
 	// backslashes, newlines, tabs, CR, and <&> become \uXXXX), so the
@@ -513,7 +513,7 @@ func TestLogDeliveryHTTPStatusClassification(t *testing.T) {
 			}))
 			defer ts.Close()
 			r := testRunnerFor(t, ts, Config{})
-			sink := newAsyncLogSink(nil, r.logBatchPost(basicTask(payloadPipeline), &secrets.Masker{}))
+			sink := newLogSink(nil, r.logBatchPost(basicTask(payloadPipeline), &secrets.Masker{}), nil)
 			sink.WriteLine("build", "step", "line-1")
 			out := sink.Finish(10 * time.Second)
 			if tc.permanent {
@@ -559,5 +559,106 @@ func TestPostReturnsTypedHTTPStatusError(t *testing.T) {
 	}
 	if !permanentHTTPStatus(httpErr.StatusCode) {
 		t.Fatal("409 must classify as permanent")
+	}
+}
+
+// --- FB-3: unified in-memory budget ----------------------------------------
+
+// TestLogSinkSharedMemoryBudgetSpansSpoolAndJournal proves the spool AND the
+// journal-resident backlog are charged against the SAME documented bound: a
+// blocked delivery journals its batch (resident bytes), and the spool only
+// accepts what remains of the budget. Excess is counted as dropped and
+// surfaced, never silently lost, and the charged sum never exceeds the bound.
+func TestLogSinkSharedMemoryBudgetSpansSpoolAndJournal(t *testing.T) {
+	oldBytes := asyncSpoolBytes
+	asyncSpoolBytes = 4096
+	t.Cleanup(func() { asyncSpoolBytes = oldBytes })
+
+	j := openTestJournal(t, t.TempDir(), "job-1", 3)
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var delivered atomic.Int64
+	sink := newJournaledAsyncLogSink(nil, func(_ context.Context, batch logBatch) error {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+		delivered.Add(int64(len(batch.Lines)))
+		return nil
+	}, j)
+
+	line := strings.Repeat("y", 1024)
+	sink.WriteLine("build", "step", line+"0")
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first batch never reached the post callback")
+	}
+	if resident := j.residentBytes(); resident <= 0 {
+		t.Fatalf("journal-resident bytes = %d, want the blocked batch charged", resident)
+	}
+	const total = 50
+	for i := 1; i < total; i++ {
+		sink.WriteLine("build", "step", line+strconv.Itoa(i))
+	}
+	if sink.dropped.Load() == 0 {
+		t.Fatal("the shared budget was not enforced: the journal backlog did not shrink the spool capacity")
+	}
+	sink.mu.Lock()
+	spooled := sink.spoolBytes
+	sink.mu.Unlock()
+	if resident := j.residentBytes(); spooled+resident > asyncSpoolBytes {
+		t.Fatalf("resident bytes = %d spool + %d journal, over the %d byte bound", spooled, resident, asyncSpoolBytes)
+	}
+	close(release)
+	out := sink.Finish(10 * time.Second)
+	if out.Err != nil {
+		t.Fatalf("delivery error after release: %v", out.Err)
+	}
+	if out.Remaining != 0 {
+		t.Fatalf("remaining = %d after release, want 0", out.Remaining)
+	}
+	if got := delivered.Load() + out.Dropped; got != total {
+		t.Fatalf("delivered(%d) + dropped(%d) = %d, want %d (no silent loss)", delivered.Load(), out.Dropped, got, total)
+	}
+}
+
+// TestLogSinkJournalMemoryOverflowFailsExplicitly proves a batch whose
+// durable record cannot fit the shared memory budget is never posted and
+// never silently dropped: the job fails explicitly and the line stays in the
+// spool (Remaining), with no record left behind.
+func TestLogSinkJournalMemoryOverflowFailsExplicitly(t *testing.T) {
+	line := strings.Repeat("z", 1024)
+	// Room for the line's spool cost but not for its serialized record
+	// (identity fields + escaping overhead), so the spool accepts the line
+	// and the journal append fails explicitly.
+	oldBytes := asyncSpoolBytes
+	asyncSpoolBytes = int64(len("build")+len("step")+len(line)) + 1
+	t.Cleanup(func() { asyncSpoolBytes = oldBytes })
+
+	j := openTestJournal(t, t.TempDir(), "job-1", 3)
+	var attempts atomic.Int64
+	sink := newJournaledAsyncLogSink(nil, func(context.Context, logBatch) error {
+		attempts.Add(1)
+		return nil
+	}, j)
+	sink.WriteLine("build", "step", line)
+	out := sink.Finish(5 * time.Second)
+	if out.Err == nil || !strings.Contains(out.Err.Error(), "memory budget") {
+		t.Fatalf("outcome error = %v, want an explicit journal memory budget error", out.Err)
+	}
+	if attempts.Load() != 0 {
+		t.Fatalf("an unjournaled batch was posted %d time(s)", attempts.Load())
+	}
+	if out.Dropped != 0 {
+		t.Fatalf("journal memory overflow dropped lines: %+v", out)
+	}
+	if out.Remaining == 0 {
+		t.Fatalf("the line was neither delivered nor retained: %+v", out)
+	}
+	if got := j.pendingBatches(); len(got) != 0 {
+		t.Fatalf("the failed append left a durable record: %+v", got)
 	}
 }
