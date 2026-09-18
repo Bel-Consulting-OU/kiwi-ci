@@ -87,6 +87,8 @@ var (
 	_ ArtifactSidecarStore  = (*PostgresStore)(nil)
 	_ SecretClaimStore      = (*PostgresStore)(nil)
 	_ SecretClaimReleaser   = (*PostgresStore)(nil)
+	_ OutboxDeadLetterStore = (*PostgresStore)(nil)
+	_ ForgeCheckStateStore  = (*PostgresStore)(nil)
 )
 
 // NewPostgres opens a pool and verifies connectivity.
@@ -1567,6 +1569,25 @@ func pruneCompletionReceiptsTx(ctx context.Context, tx pgx.Tx) error {
 	return nil
 }
 
+// completionReceiptHashTx reads the stored result_hash of the live receipt
+// for (jobID, generation, runnerID). The TTL predicate is the same shared
+// retention filter HasCompletionReceipt applies: an aged-out receipt reads as
+// absent. It returns ("", false, nil) when no live receipt exists. The
+// caller must be inside the completion transaction so the read observes the
+// same snapshot as the insert/update it guards.
+func completionReceiptHashTx(ctx context.Context, tx pgx.Tx, jobID string, generation int64, runnerID string) (string, bool, error) {
+	var hash string
+	err := tx.QueryRow(ctx, `SELECT result_hash FROM completion_receipts WHERE job_id=$1 AND generation=$2 AND runner_id=$3 AND created_at >= now() - make_interval(secs => $4)`,
+		jobID, generation, runnerID, completionReceiptTTLSeconds).Scan(&hash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return hash, true, nil
+}
+
 // CompleteJob implements the audit item 5 transaction: lock the job FOR
 // UPDATE, verify generation+runner+status running, insert the receipt ON
 // CONFLICT DO NOTHING, update the job, update runner counters, recompute
@@ -1608,17 +1629,24 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 	}
 
 	// Idempotent replay: the exact completion (job, generation, runner) was
-	// already applied and its receipt persisted and still within the shared
-	// retention TTL; acknowledge it again. An aged-out receipt is treated as
-	// absent (recExists false) and falls through to the stale-lease errors,
-	// matching fs mode.
+	// already applied and its receipt persisted with the SAME result_hash and
+	// still within the shared retention TTL; acknowledge it again. An
+	// existing receipt with a DIFFERENT result_hash is a conflicting
+	// completion of the same lease (two racers, one success and one failure)
+	// and fails closed with ErrCompletionConflict instead of letting the
+	// loser be acked as a replay. An aged-out receipt is treated as absent
+	// (live false) and falls through to the stale-lease errors, matching fs
+	// mode.
 	if curGen != generation || curRunner != runnerID || curStatus != string(model.StatusRunning) {
-		var recExists bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM completion_receipts WHERE job_id=$1 AND generation=$2 AND runner_id=$3 AND created_at >= now() - make_interval(secs => $4))`, jobID, generation, runnerID, completionReceiptTTLSeconds).Scan(&recExists); err != nil {
+		storedHash, live, err := completionReceiptHashTx(ctx, tx, jobID, generation, runnerID)
+		if err != nil {
 			return err
 		}
-		if recExists {
-			return tx.Commit(ctx)
+		if live {
+			if storedHash == receipt.ResultHash {
+				return tx.Commit(ctx)
+			}
+			return ErrCompletionConflict
 		}
 		if curGen != generation || curRunner != runnerID {
 			return ErrGenerationMismatch
@@ -1671,9 +1699,48 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 	if err := s.adjustQuotaTx(ctx, tx, RepoIDForJob(j), -1, 0); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO completion_receipts (job_id, generation, runner_id, result_hash) VALUES ($1, $2, $3, $4) ON CONFLICT (job_id, generation, runner_id) DO NOTHING`,
-		receipt.JobID, receipt.Generation, receipt.RunnerID, receipt.ResultHash); err != nil {
+	tag, err := tx.Exec(ctx, `INSERT INTO completion_receipts (job_id, generation, runner_id, result_hash) VALUES ($1, $2, $3, $4) ON CONFLICT (job_id, generation, runner_id) DO NOTHING`,
+		receipt.JobID, receipt.Generation, receipt.RunnerID, receipt.ResultHash)
+	if err != nil {
 		return err
+	}
+	if tag.RowsAffected() == 0 {
+		// The receipt identity already exists. Losing the ON CONFLICT race is
+		// only an idempotent success when the STORED result_hash equals the
+		// incoming one; a different hash means two completions of the same
+		// lease disagree, so the whole transaction rolls back with
+		// ErrCompletionConflict instead of acking a conflicting result.
+		storedHash, live, err := completionReceiptHashTx(ctx, tx, receipt.JobID, receipt.Generation, receipt.RunnerID)
+		if err != nil {
+			return err
+		}
+		if live {
+			if storedHash == receipt.ResultHash {
+				// Exact replay: the previous completion (and all its effects)
+				// already committed; discard this transaction's partial
+				// updates and acknowledge.
+				return nil
+			}
+			return ErrCompletionConflict
+		}
+		// The conflicting row has aged out of the retention TTL and would
+		// have been reclaimed by pruneCompletionReceiptsTx below: treat it as
+		// absent, reclaim it, and retry the insert once.
+		if _, err := tx.Exec(ctx, `DELETE FROM completion_receipts WHERE job_id=$1 AND generation=$2 AND runner_id=$3 AND created_at < now() - make_interval(secs => $4)`,
+			receipt.JobID, receipt.Generation, receipt.RunnerID, completionReceiptTTLSeconds); err != nil {
+			return err
+		}
+		tag, err = tx.Exec(ctx, `INSERT INTO completion_receipts (job_id, generation, runner_id, result_hash) VALUES ($1, $2, $3, $4) ON CONFLICT (job_id, generation, runner_id) DO NOTHING`,
+			receipt.JobID, receipt.Generation, receipt.RunnerID, receipt.ResultHash)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			// A concurrent writer re-occupied the key inside this
+			// transaction (impossible while the job row is locked): fail
+			// closed rather than ack an unverified result.
+			return ErrCompletionConflict
+		}
 	}
 	// Reclaim receipts past the shared retention TTL (and, eventually, past
 	// the cap) in the same transaction that adds this one.
@@ -1709,10 +1776,12 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 	return tx.Commit(ctx)
 }
 
-// insertCompletionEffectsTx inserts ONE deterministic reconcile intent
-// inside the caller's transaction: dispatching it runs the whole effect
-// chain once. (The previous per-kind fan-out amplified one completion into
-// five rows × five effect chains.)
+// insertCompletionEffectsTx inserts the completion's durable effect intents
+// inside the caller's transaction: ONE completion_reconcile row (internal
+// consistency: markers/effects, retried without dead-lettering until they
+// converge) and ONE forge_delivery row (external forge publication, with its
+// own backoff/dead-letter policy). Splitting them keeps a persistently
+// failing forge from retiring the internal consistency row.
 func (s *PostgresStore) insertCompletionEffectsTx(ctx context.Context, tx pgx.Tx, jobID, runID string, generation int64, now time.Time) error {
 	payload, err := jsonMarshal(CompletionEffectsPayload{JobID: jobID, RunID: runID})
 	if err != nil {
@@ -1721,9 +1790,13 @@ func (s *PostgresStore) insertCompletionEffectsTx(ctx context.Context, tx pgx.Tx
 	// Strict insert: the receipt check inside this transaction already
 	// rejects replays, so an occupied reconcile ID means foreign state under
 	// a deterministic key — a hard invariant failure that rolls back.
-	_, err = tx.Exec(ctx, `INSERT INTO outbox (id, kind, payload, created_at) VALUES ($1, $2, $3, $4)`,
-		CompletionEffectID(jobID, generation, OutboxKindCompletionReconcile), OutboxKindCompletionReconcile, payload, now)
-	return err
+	for _, kind := range []string{OutboxKindCompletionReconcile, OutboxKindForgeDelivery} {
+		if _, err := tx.Exec(ctx, `INSERT INTO outbox (id, kind, payload, created_at) VALUES ($1, $2, $3, $4)`,
+			CompletionEffectID(jobID, generation, kind), kind, payload, now); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // requiredArtifactMissingTx checks the completing job's artifact contracts
@@ -2793,10 +2866,14 @@ func (s *PostgresStore) OutboxAppend(ctx context.Context, e OutboxItem) error {
 	// operations onto one durable intent), so it is rejected loudly.
 	var existingKind string
 	var existingPayload []byte
-	err := s.pool.QueryRow(ctx, `SELECT kind, payload FROM outbox WHERE id=$1`, e.ID).Scan(&existingKind, &existingPayload)
+	var existingKey *string
+	var existingVersion int64
+	err := s.pool.QueryRow(ctx, `SELECT kind, payload, logical_key, state_version FROM outbox WHERE id=$1`, e.ID).
+		Scan(&existingKind, &existingPayload, &existingKey, &existingVersion)
 	switch {
 	case err == nil:
-		if existingKind != e.Kind || !jsonPayloadEqual(existingPayload, payload) {
+		if existingKind != e.Kind || !jsonPayloadEqual(existingPayload, payload) ||
+			nullableText(existingKey) != e.LogicalKey || existingVersion != e.StateVersion {
 			return fmt.Errorf("storage: outbox id %s reused with different content", e.ID)
 		}
 		return nil
@@ -2804,20 +2881,30 @@ func (s *PostgresStore) OutboxAppend(ctx context.Context, e OutboxItem) error {
 	default:
 		return err
 	}
-	_, err = s.pool.Exec(ctx, `INSERT INTO outbox (id, kind, payload, created_at) VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO NOTHING`,
-		e.ID, e.Kind, payload, e.CreatedAt)
+	_, err = s.pool.Exec(ctx, `INSERT INTO outbox (id, kind, payload, created_at, logical_key, state_version) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING`,
+		e.ID, e.Kind, payload, e.CreatedAt, nullText(e.LogicalKey), e.StateVersion)
 	if err != nil {
 		return err
 	}
 	// Re-verify after the race-safe insert.
-	err = s.pool.QueryRow(ctx, `SELECT kind, payload FROM outbox WHERE id=$1`, e.ID).Scan(&existingKind, &existingPayload)
+	err = s.pool.QueryRow(ctx, `SELECT kind, payload, logical_key, state_version FROM outbox WHERE id=$1`, e.ID).
+		Scan(&existingKind, &existingPayload, &existingKey, &existingVersion)
 	if err != nil {
 		return err
 	}
-	if existingKind != e.Kind || !jsonPayloadEqual(existingPayload, payload) {
+	if existingKind != e.Kind || !jsonPayloadEqual(existingPayload, payload) ||
+		nullableText(existingKey) != e.LogicalKey || existingVersion != e.StateVersion {
 		return fmt.Errorf("storage: outbox id %s reused with different content", e.ID)
 	}
 	return nil
+}
+
+// nullableText dereferences an optional text column.
+func nullableText(v *string) string {
+	if v == nil {
+		return ""
+	}
+	return *v
 }
 
 // jsonPayloadEqual compares two payloads SEMANTICALLY: the outbox column is
@@ -2844,8 +2931,122 @@ func (s *PostgresStore) OutboxAck(ctx context.Context, id string) error {
 	}
 	// Deleting the row clears its claim atomically with the ack: a claimed
 	// but crash-stranded row can only be reclaimed for OutboxClaimTTL.
-	_, err := s.pool.Exec(ctx, `DELETE FROM outbox WHERE id=$1`, id)
-	return err
+	//
+	// For a versioned row the delivered watermark advances in the SAME
+	// statement (a single CTE, so it is atomic under concurrent acks): the
+	// watermark can never lag an acknowledged delivery, and it outlives the
+	// row deletion. GREATEST keeps the watermark monotonic when two replicas
+	// ack different versions of one logical key concurrently.
+	if _, err := s.pool.Exec(ctx, `WITH deleted AS (
+			DELETE FROM outbox WHERE id=$1
+			RETURNING logical_key, state_version
+		)
+		INSERT INTO forge_check_state (logical_key, delivered_version, updated_at)
+		SELECT logical_key, state_version, now() FROM deleted WHERE logical_key IS NOT NULL
+		ON CONFLICT (logical_key) DO UPDATE
+			SET delivered_version = GREATEST(forge_check_state.delivered_version, EXCLUDED.delivered_version),
+			    updated_at = now()`, id); err != nil {
+		return err
+	}
+	return nil
+}
+
+// OutboxEnqueueVersioned durably inserts one versioned forge-delivery intent
+// and supersedes every older pending version of the same logical key in ONE
+// transaction:
+//
+//  1. A per-logical-key transaction advisory lock serializes concurrent
+//     enqueues of the same logical key across replicas.
+//  2. The forge_check_state row is locked (upsert with a no-op update) and
+//     its delivered_version is read. A version at or below the watermark is
+//     already delivered: nothing is inserted and VersionedSuperseded is
+//     returned, so a stale state can never regress a delivered one.
+//  3. Every older PENDING row of the logical key is deleted (dead letters are
+//     terminal and operator-visible, so they are left for the operator path;
+//     they can no longer block a newer version because IDs are versioned).
+//  4. The new row is inserted under ID logical_key || '#' || version. A
+//     conflict can only be an equal-version dead letter, which is reported as
+//     superseded (the operator requeue path re-arms it, and the dispatcher
+//     guard retires it if a newer version wins first).
+func (s *PostgresStore) OutboxEnqueueVersioned(ctx context.Context, e OutboxItem) (VersionedEnqueueOutcome, error) {
+	if e.LogicalKey == "" || e.StateVersion <= 0 {
+		return VersionedEnqueued, fmt.Errorf("storage: versioned outbox enqueue requires a logical key and a positive version")
+	}
+	if e.CreatedAt.IsZero() {
+		e.CreatedAt = time.Now().UTC()
+	}
+	payload := e.Payload
+	if len(payload) == 0 {
+		payload = []byte("{}")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return VersionedEnqueued, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, advisoryLockKey(OutboxVersionLockNamespace, e.LogicalKey)); err != nil {
+		return VersionedEnqueued, err
+	}
+	var delivered int64
+	if err := tx.QueryRow(ctx, `INSERT INTO forge_check_state (logical_key) VALUES ($1)
+		ON CONFLICT (logical_key) DO UPDATE SET logical_key = EXCLUDED.logical_key
+		RETURNING delivered_version`, e.LogicalKey).Scan(&delivered); err != nil {
+		return VersionedEnqueued, err
+	}
+	if e.StateVersion <= delivered {
+		return VersionedSuperseded, tx.Commit(ctx)
+	}
+	// A NEWER pending version wins even when this enqueue arrives after it
+	// (out-of-order replicas): the newer state will publish the newest
+	// remote result, so inserting this older state would only add work the
+	// dispatcher guard then retires. Equal versions fall through: the
+	// payload is refreshed in place (supersede-range delete + insert).
+	var maxPending int64
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(state_version),0) FROM outbox WHERE logical_key=$1 AND dead_lettered_at IS NULL`, e.LogicalKey).Scan(&maxPending); err != nil {
+		return VersionedEnqueued, err
+	}
+	if e.StateVersion < maxPending {
+		return VersionedSuperseded, tx.Commit(ctx)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM outbox WHERE logical_key=$1 AND state_version <= $2 AND dead_lettered_at IS NULL`,
+		e.LogicalKey, e.StateVersion); err != nil {
+		return VersionedEnqueued, err
+	}
+	tag, err := tx.Exec(ctx, `INSERT INTO outbox (id, kind, payload, created_at, logical_key, state_version) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING`,
+		e.ID, e.Kind, payload, e.CreatedAt, e.LogicalKey, e.StateVersion)
+	if err != nil {
+		return VersionedEnqueued, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return VersionedEnqueued, err
+	}
+	if tag.RowsAffected() == 0 {
+		return VersionedSuperseded, nil
+	}
+	return VersionedEnqueued, nil
+}
+
+// OutboxVersionGuard is the dispatcher's durable publish gate for one
+// versioned row: publish only while the row still exists, no higher version
+// has been delivered, and no higher version is pending (a pending newer
+// version will publish the newer state, so publishing this one is redundant
+// and could arrive late). A read failure is returned so dispatch fails
+// closed instead of publishing without the guard.
+func (s *PostgresStore) OutboxVersionGuard(ctx context.Context, id, logicalKey string, version int64) (bool, error) {
+	if logicalKey == "" || version <= 0 {
+		return true, nil
+	}
+	var alive, newerPending bool
+	var delivered int64
+	err := s.pool.QueryRow(ctx, `SELECT
+			EXISTS (SELECT 1 FROM outbox WHERE id=$1),
+			COALESCE((SELECT delivered_version FROM forge_check_state WHERE logical_key=$2), 0),
+			EXISTS (SELECT 1 FROM outbox WHERE logical_key=$2 AND state_version > $3 AND dead_lettered_at IS NULL)`,
+		id, logicalKey, version).Scan(&alive, &delivered, &newerPending)
+	if err != nil {
+		return false, err
+	}
+	return alive && delivered < version && !newerPending, nil
 }
 
 func (s *PostgresStore) OutboxHas(ctx context.Context, id string) (bool, error) {
@@ -2863,8 +3064,11 @@ func (s *PostgresStore) OutboxHas(ctx context.Context, id string) (bool, error) 
 	return true, nil
 }
 
+// OutboxPending returns the active (not dead-lettered) outbox rows in FIFO
+// order for startup replay. Dead-lettered rows are operator-visible through
+// OutboxDeadLetters and must never be replayed or treated as pending work.
 func (s *PostgresStore) OutboxPending(ctx context.Context) ([]OutboxItem, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id, kind, payload, created_at FROM outbox ORDER BY created_at ASC, id ASC`)
+	rows, err := s.pool.Query(ctx, `SELECT id, kind, payload, created_at, logical_key, state_version FROM outbox WHERE dead_lettered_at IS NULL ORDER BY created_at ASC, id ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -2872,12 +3076,71 @@ func (s *PostgresStore) OutboxPending(ctx context.Context) ([]OutboxItem, error)
 	out := []OutboxItem{}
 	for rows.Next() {
 		var it OutboxItem
-		if err := rows.Scan(&it.ID, &it.Kind, &it.Payload, &it.CreatedAt); err != nil {
+		var key *string
+		if err := rows.Scan(&it.ID, &it.Kind, &it.Payload, &it.CreatedAt, &key, &it.StateVersion); err != nil {
 			return nil, err
 		}
+		it.LogicalKey = nullableText(key)
 		out = append(out, it)
 	}
 	return out, rows.Err()
+}
+
+// OutboxDeadLetters lists the retired (dead-lettered) outbox rows in FIFO
+// order with the operator context (attempts, last error, retirement time) and
+// the versioned delivery identity for triage.
+func (s *PostgresStore) OutboxDeadLetters(ctx context.Context) ([]OutboxDeadLetter, error) {
+	rows, err := s.pool.Query(ctx, `SELECT id, kind, payload, created_at, attempts, last_error, dead_lettered_at, logical_key, state_version FROM outbox WHERE dead_lettered_at IS NOT NULL ORDER BY dead_lettered_at ASC, created_at ASC, id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []OutboxDeadLetter{}
+	for rows.Next() {
+		var it OutboxDeadLetter
+		var key *string
+		if err := rows.Scan(&it.ID, &it.Kind, &it.Payload, &it.CreatedAt, &it.Attempts, &it.LastError, &it.DeadLetteredAt, &key, &it.StateVersion); err != nil {
+			return nil, err
+		}
+		it.LogicalKey = nullableText(key)
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+// OutboxRequeue resets one dead-lettered row to a fresh retry budget and an
+// immediately due schedule, so the next claim picks it up. The WHERE guard
+// keeps the operator action scoped to dead letters: a live row is never
+// disturbed by a requeue.
+func (s *PostgresStore) OutboxRequeue(ctx context.Context, id string) error {
+	if id == "" {
+		return fmt.Errorf("storage: empty outbox id")
+	}
+	tag, err := s.pool.Exec(ctx, `UPDATE outbox SET attempts=0, last_error='', next_attempt_at=now(), claimed_at=NULL, claimed_by=NULL, dead_lettered_at=NULL WHERE id=$1 AND dead_lettered_at IS NOT NULL`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// OutboxDelete removes one dead-lettered row. Like OutboxRequeue it is scoped
+// to dead letters, so a live intent can never be discarded through the
+// operator API.
+func (s *PostgresStore) OutboxDelete(ctx context.Context, id string) error {
+	if id == "" {
+		return fmt.Errorf("storage: empty outbox id")
+	}
+	tag, err := s.pool.Exec(ctx, `DELETE FROM outbox WHERE id=$1 AND dead_lettered_at IS NOT NULL`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // ClaimOutbox atomically claims up to limit dispatchable rows for claimer:
@@ -2903,7 +3166,7 @@ func (s *PostgresStore) ClaimOutbox(ctx context.Context, claimer string, limit i
 			FOR UPDATE SKIP LOCKED
 		) c
 		WHERE o.id = c.id
-		RETURNING o.id, o.kind, o.payload, o.created_at`, claimer, limit, cutoff)
+		RETURNING o.id, o.kind, o.payload, o.created_at, o.logical_key, o.state_version`, claimer, limit, cutoff)
 	if err != nil {
 		return nil, err
 	}
@@ -2911,9 +3174,11 @@ func (s *PostgresStore) ClaimOutbox(ctx context.Context, claimer string, limit i
 	out := []OutboxItem{}
 	for rows.Next() {
 		var it OutboxItem
-		if err := rows.Scan(&it.ID, &it.Kind, &it.Payload, &it.CreatedAt); err != nil {
+		var key *string
+		if err := rows.Scan(&it.ID, &it.Kind, &it.Payload, &it.CreatedAt, &key, &it.StateVersion); err != nil {
 			return nil, err
 		}
+		it.LogicalKey = nullableText(key)
 		out = append(out, it)
 	}
 	return out, rows.Err()
@@ -4354,7 +4619,7 @@ func (s *PostgresStore) OutboxRetry(ctx context.Context, id string, dispatchErr 
 // OutboxPendingItems returns rows that are pending, not dead-lettered and
 // due, for startup replay.
 func (s *PostgresStore) OutboxDue(ctx context.Context) ([]OutboxItem, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id, kind, payload, created_at FROM outbox WHERE dead_lettered_at IS NULL AND next_attempt_at <= now() ORDER BY created_at ASC, id ASC`)
+	rows, err := s.pool.Query(ctx, `SELECT id, kind, payload, created_at, logical_key, state_version FROM outbox WHERE dead_lettered_at IS NULL AND next_attempt_at <= now() ORDER BY created_at ASC, id ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -4362,9 +4627,11 @@ func (s *PostgresStore) OutboxDue(ctx context.Context) ([]OutboxItem, error) {
 	out := []OutboxItem{}
 	for rows.Next() {
 		var it OutboxItem
-		if err := rows.Scan(&it.ID, &it.Kind, &it.Payload, &it.CreatedAt); err != nil {
+		var key *string
+		if err := rows.Scan(&it.ID, &it.Kind, &it.Payload, &it.CreatedAt, &key, &it.StateVersion); err != nil {
 			return nil, err
 		}
+		it.LogicalKey = nullableText(key)
 		out = append(out, it)
 	}
 	return out, rows.Err()

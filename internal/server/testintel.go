@@ -68,12 +68,17 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	s.reports[rep.ID] = rep
-	perr := s.persistLocked()
-	s.mu.Unlock()
+	perr := s.persistCheckedErrLocked("test.report")
 	if perr != nil {
+		// The report never became durable: remove the in-memory ghost so a
+		// later successful persist cannot commit a report the runner was
+		// told failed, and the retry stores exactly one.
+		delete(s.reports, rep.ID)
+		s.mu.Unlock()
 		http.Error(w, perr.Error(), 500)
 		return
 	}
+	s.mu.Unlock()
 	s.recordTestReportHistory(repo, rep)
 	s.auditLocked("tests.uploaded", in.RunnerID, j.RunID, j.ID, "test report uploaded", map[string]string{"job": j.Key, "tests": strconv.Itoa(rep.Tests), "failures": strconv.Itoa(rep.Failures)})
 	writeJSON(w, http.StatusCreated, rep)

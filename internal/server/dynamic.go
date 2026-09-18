@@ -95,6 +95,13 @@ func (s *Server) generateJobs(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, adm.Error(), adm.Status)
 			return
 		}
+		// A failed snapshot write is a server-side durability failure, not a
+		// client error.
+		var nd *stateNotDurableError
+		if errors.As(aerr, &nd) {
+			http.Error(w, nd.Error(), http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, aerr.Error(), http.StatusBadRequest)
 		return
 	}
@@ -422,22 +429,33 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 		s.mu.Unlock()
 		return replayGeneratedResponse(parent, childDepth, rec), nil
 	}
+	rb := s.captureStateRollbackLocked()
 	for id, j := range created {
 		s.jobs[id] = j
 		if contracts, ok := jobContracts[id]; ok {
 			s.contracts[id] = contracts
 		}
 	}
+	if perr := s.persistCheckedErrLocked("generated.fragment"); perr != nil {
+		// The children never became durable: restore every map this path
+		// touched and fail closed with a 5xx. The idempotency receipt is
+		// recorded only AFTER the snapshot write, so a retry can never
+		// replay an admission the disk does not contain.
+		s.rollbackStateLocked(rb)
+		s.mu.Unlock()
+		return nil, notDurable(perr)
+	}
+	// The children are durable: record the in-memory idempotency receipt so
+	// a retry returns the SAME children instead of re-admitting. The
+	// receipt table is process-local fs state (a restart re-admits, the
+	// documented pre-receipt behavior); it is only ever populated for an
+	// admission whose children are already on disk.
 	s.generatedFragments[generatedFragmentKey(parent.ID, parent.LeaseGeneration, fragmentID)] = storage.GeneratedFragmentReceipt{
 		ParentJobID:     parent.ID,
 		LeaseGeneration: parent.LeaseGeneration,
 		FragmentID:      fragmentID,
 		Children:        children,
 		CreatedAt:       time.Now().UTC(),
-	}
-	if err := s.persistLocked(); err != nil {
-		s.mu.Unlock()
-		return nil, err
 	}
 	s.mu.Unlock()
 	return &generatedResponse{ParentJobID: parent.ID, RunID: parent.RunID, Depth: childDepth, JobIDs: ids, Keys: keys}, nil

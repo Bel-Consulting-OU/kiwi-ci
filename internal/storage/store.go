@@ -71,6 +71,18 @@ var (
 	// SHA256: the upload must be answered 409 and the stored record is never
 	// overwritten.
 	ErrArtifactDigestConflict = errors.New("storage: artifact digest conflict")
+	// ErrCompletionConflict means a completion receipt already exists for the
+	// same (job_id, generation, runner_id) identity but records a DIFFERENT
+	// result_hash: two concurrent completions of one lease disagree, and the
+	// losing result must fail closed (HTTP 409) instead of being acked as an
+	// idempotent replay. An equal result_hash is still an idempotent success.
+	ErrCompletionConflict = errors.New("storage: completion result conflict")
+	// ErrLogBatchConflict means a log batch receipt already exists for the
+	// same (job_id, generation, batch_id) identity but records a DIFFERENT
+	// canonical payload digest: the runner reused a batch identity for
+	// different lines, and the append fails closed (nothing is inserted)
+	// instead of silently accepting the second payload or dropping it.
+	ErrLogBatchConflict = errors.New("storage: log batch payload conflict")
 )
 
 // QuotaExceededError is returned by quota admission inside InsertCompiledRun
@@ -186,12 +198,58 @@ type Store interface {
 // unchanged because the Store interface itself is untouched.
 
 // OutboxItem is one durable publish intent queued for dispatch.
+//
+// LogicalKey/StateVersion are set for VERSIONED forge-delivery intents
+// (migration 0018): LogicalKey is the stable logical identity of the remote
+// object (for a forge check: the 128-bit sha256 of forge host + run + check
+// name) and StateVersion is the monotonic rank of the logical state it
+// carries. Versioned row IDs are LogicalKey || '#' || StateVersion, so a
+// newer state can never collide with, or be suppressed by, an older one.
 type OutboxItem struct {
-	ID        string    `json:"id"`
-	Kind      string    `json:"kind"`
-	Payload   []byte    `json:"payload"`
-	CreatedAt time.Time `json:"created_at"`
+	ID           string    `json:"id"`
+	Kind         string    `json:"kind"`
+	Payload      []byte    `json:"payload"`
+	CreatedAt    time.Time `json:"created_at"`
+	LogicalKey   string    `json:"logical_key,omitempty"`
+	StateVersion int64     `json:"state_version,omitempty"`
 }
+
+// VersionedEnqueueOutcome reports what OutboxEnqueueVersioned did with the
+// intent.
+type VersionedEnqueueOutcome int
+
+const (
+	// VersionedEnqueued: the intent was durably inserted (superseding older
+	// pending versions of the same logical key).
+	VersionedEnqueued VersionedEnqueueOutcome = iota
+	// VersionedSuperseded: an equal-or-newer version is already delivered or
+	// retired, so nothing was inserted and nothing must be dispatched.
+	VersionedSuperseded
+)
+
+// ForgeCheckStateStore is the versioned forge-delivery contract:
+//
+//   - OutboxEnqueueVersioned atomically inserts a versioned intent and
+//     supersedes every older pending version of the same logical key in ONE
+//     operation, after checking the durable delivered watermark. It returns
+//     VersionedSuperseded without inserting when the version is not newer
+//     than what is already delivered.
+//   - OutboxVersionGuard reports whether a claimed versioned row may be
+//     published: false when a newer version is already delivered or pending,
+//     or when the row itself no longer exists (a concurrent enqueue
+//     superseded it). The check is durable, so two replicas cannot publish
+//     an older state after a newer one once the newer one is visible.
+//
+// OutboxAck updates the delivered watermark in the same statement that
+// deletes the versioned row, so no separate method is needed for it.
+type ForgeCheckStateStore interface {
+	OutboxEnqueueVersioned(ctx context.Context, e OutboxItem) (VersionedEnqueueOutcome, error)
+	OutboxVersionGuard(ctx context.Context, id, logicalKey string, version int64) (publish bool, err error)
+}
+
+// OutboxVersionLockNamespace is the advisory-lock key namespace that
+// serializes versioned enqueues per logical key across replicas.
+const OutboxVersionLockNamespace = "forge-check-state"
 
 // Completion post-transaction effect outbox kinds. CompleteJob inserts ONE
 // deterministic `completion_reconcile` row per (job, lease generation)
@@ -201,6 +259,12 @@ type OutboxItem struct {
 // each re-ran all five logical effects.
 const (
 	OutboxKindCompletionReconcile = "completion_reconcile"
+
+	// OutboxKindForgeDelivery is the EXTERNAL forge-publication intent. It is
+	// split from completion_reconcile so a persistently failing forge can
+	// back off and dead-letter without ever retiring the INTERNAL consistency
+	// row (markers/effects keep retrying until internal invariants converge).
+	OutboxKindForgeDelivery = "forge_delivery"
 
 	// Legacy per-kind rows remain recognized by the dispatcher for outbox
 	// rows persisted before the single-row design.
@@ -219,7 +283,10 @@ type CompletionEffectsPayload struct {
 }
 
 // CompletionEffectKinds lists the legacy effect kinds (kept for dispatch
-// compatibility with pre-existing rows).
+// compatibility with pre-existing rows). New completions persist exactly two
+// intents: OutboxKindCompletionReconcile (internal consistency, unbounded
+// retries) and OutboxKindForgeDelivery (external publication, bounded
+// retries + dead-letter).
 func CompletionEffectKinds() []string {
 	return []string{
 		OutboxKindDownstreamCheck,
@@ -228,6 +295,25 @@ func CompletionEffectKinds() []string {
 		OutboxKindRunAggregate,
 		OutboxKindForgeStatus,
 	}
+}
+
+// CompletionEffectIntentCount is how many intents a NEW completion persists
+// (completion_reconcile + forge_delivery). Legacy rows persist the five
+// per-kind intents listed by CompletionEffectKinds.
+const CompletionEffectIntentCount = 2
+
+// IsCompletionEffectKind reports whether kind is a completion effect intent:
+// the split reconcile/forge_delivery rows or a legacy per-kind row.
+func IsCompletionEffectKind(kind string) bool {
+	if kind == OutboxKindCompletionReconcile || kind == OutboxKindForgeDelivery {
+		return true
+	}
+	for _, k := range CompletionEffectKinds() {
+		if k == kind {
+			return true
+		}
+	}
+	return false
 }
 
 // CompletionEffectID derives the deterministic outbox item ID for one
@@ -254,12 +340,12 @@ const OutboxClaimBatch = 64
 
 // OutboxStore is the durable outbox contract. OutboxAppend enqueues an item,
 // OutboxAck removes a successfully dispatched item (clearing any claim),
-// OutboxPending returns the unacked items in FIFO order for startup replay,
-// and ClaimOutbox atomically claims a batch of dispatchable rows for one
-// flusher so two replicas never dispatch the same intent: rows already
-// claimed within OutboxClaimTTL are skipped and stale claims are reclaimable.
-// ReleaseOutboxClaim returns an un-dispatched claim so a retry does not wait
-// for the TTL.
+// OutboxPending returns the unacked ACTIVE items (dead-lettered rows are
+// excluded) in FIFO order for startup replay, and ClaimOutbox atomically
+// claims a batch of dispatchable rows for one flusher so two replicas never
+// dispatch the same intent: rows already claimed within OutboxClaimTTL are
+// skipped and stale claims are reclaimable. ReleaseOutboxClaim returns an
+// un-dispatched claim so a retry does not wait for the TTL.
 type OutboxStore interface {
 	OutboxAppend(ctx context.Context, e OutboxItem) error
 	// OutboxHas reports whether the DURABLE store already holds this intent
@@ -271,6 +357,40 @@ type OutboxStore interface {
 	OutboxPending(ctx context.Context) ([]OutboxItem, error)
 	ClaimOutbox(ctx context.Context, claimer string, limit int) ([]OutboxItem, error)
 	ReleaseOutboxClaim(ctx context.Context, id, claimer string) error
+}
+
+// OutboxDeadLetter is one dead-lettered outbox row for operator inspection:
+// the original intent plus why (and after how many attempts) it was retired.
+type OutboxDeadLetter struct {
+	ID             string    `json:"id"`
+	Kind           string    `json:"kind"`
+	Payload        []byte    `json:"payload"`
+	CreatedAt      time.Time `json:"created_at"`
+	Attempts       int       `json:"attempts"`
+	LastError      string    `json:"last_error"`
+	DeadLetteredAt time.Time `json:"dead_lettered_at"`
+	LogicalKey     string    `json:"logical_key,omitempty"`
+	StateVersion   int64     `json:"state_version,omitempty"`
+}
+
+// OutboxDeadLetterStore is the operator-facing dead-letter contract for the
+// durable outbox: list retired intents, requeue one for a fresh retry budget,
+// or delete one. It deliberately extends the outbox area instead of widening
+// OutboxStore, so existing Store implementations and test fakes compile
+// unchanged.
+type OutboxDeadLetterStore interface {
+	// OutboxDeadLetters lists dead-lettered rows in FIFO order.
+	OutboxDeadLetters(ctx context.Context) ([]OutboxDeadLetter, error)
+	// OutboxRequeue resets one dead-lettered row to a fresh, immediately
+	// dispatchable state: dead_lettered_at/attempts/last_error are cleared and
+	// next_attempt_at is now(), so the row is claimable again. Only
+	// dead-lettered rows can be requeued; an absent (or live) row returns
+	// ErrNotFound.
+	OutboxRequeue(ctx context.Context, id string) error
+	// OutboxDelete removes one dead-lettered row. Only dead-lettered rows can
+	// be deleted, so the operator API can never discard a live intent; an
+	// absent (or live) row returns ErrNotFound.
+	OutboxDelete(ctx context.Context, id string) error
 }
 
 // Schedule is one cron-triggered pipeline schedule. Repository is the

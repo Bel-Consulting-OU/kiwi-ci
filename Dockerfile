@@ -20,6 +20,13 @@ ARG COMMIT=unknown
 # -ldflags: anything outside the exact RFC3339 UTC shape (whitespace, extra
 # linker flags, other characters) fails the build instead of being
 # whitespace-split by cmd/go.
+# The shape check below is deliberately stricter than RFC3339 -- exactly one
+# canonical spelling -- but it cannot tell whether the value is a real
+# calendar instant (2006-13-45T99:99:99Z still matches it). The real-calendar
+# check lives in scripts/release.sh and runs scripts/rfc3339check; that helper
+# cannot run in this stage because .dockerignore keeps scripts/ out of the
+# build context, so the shape regex is kept here. Keep both definitions in
+# sync (see docs/releases.md).
 ARG BUILD_DATE
 # SOURCE_DATE_EPOCH pins the recorded BuildDate so the artifact bytes are
 # reproducible, and is the fallback when BUILD_DATE is not supplied. The
@@ -36,6 +43,32 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
+
+# VERSION and COMMIT are interpolated into -ldflags below. Validate them in
+# this stage before that interpolation: a value carrying whitespace, quotes,
+# or an extra `-X ...` pair would otherwise be whitespace-split by cmd/go into
+# a caller-controlled linker argument. Allowed: VERSION in [A-Za-z0-9._+-]
+# (the ARG default covers the unset case; an explicit empty value cannot
+# inject anything), COMMIT as the literal "unknown" or 7-40 lowercase hex
+# characters (the Makefile passes a short SHA, a release a full 40-char SHA).
+# The hex set is spelled out instead of [a-f] because under a UTF-8 collation
+# bash's range matching also accepts uppercase A-F. Keep these rules in sync
+# with docs/releases.md.
+# BEGIN version-commit validation
+RUN set -eux; \
+    case "${VERSION}" in \
+      *[!A-Za-z0-9._+-]*) printf "error: VERSION must match [A-Za-z0-9._+-] (no whitespace or quotes), got '%s'\n" "${VERSION}" >&2; exit 1 ;; \
+    esac; \
+    case "${COMMIT}" in \
+      unknown) ;; \
+      *[!0123456789abcdef]*) printf "error: COMMIT must be 'unknown' or 7-40 lowercase hex characters, got '%s'\n" "${COMMIT}" >&2; exit 1 ;; \
+      *) \
+        if [ "${#COMMIT}" -lt 7 ] || [ "${#COMMIT}" -gt 40 ]; then \
+          printf "error: COMMIT must be 'unknown' or 7-40 lowercase hex characters, got '%s'\n" "${COMMIT}" >&2; \
+          exit 1; \
+        fi ;; \
+    esac
+# END version-commit validation
 
 RUN set -eux; \
     if [ -n "${BUILD_DATE}" ]; then \

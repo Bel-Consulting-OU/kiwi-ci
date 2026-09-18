@@ -1,0 +1,17 @@
+-- 0017_log_batch_payload.sql — bind each log_batches receipt to the payload it
+-- receipted.
+--
+-- 0014 keyed log batches by (job_id, generation, batch_id) only, so a reused
+-- batch_id with different lines was silently accepted as a duplicate delivery.
+-- payload_sha256 stores the canonical digest of the ORDERED batch payload
+-- (see storage.LogBatchPayloadDigest) so AppendLogBatch can distinguish an
+-- idempotent replay (same digest → no-op) from a conflicting reuse of the
+-- identity (different digest → ErrLogBatchConflict).
+--
+-- DEFAULT '' keeps the ALTER safe on a non-empty table. log_batches is empty
+-- in practice: the pre-0017 AppendLogBatch inserted the receipt and then
+-- failed on a missing log target, rolling the whole transaction back, so no
+-- receipt row ever committed. A legacy row that does exist reads as the empty
+-- digest, and because every real payload digest is non-empty a reused
+-- identity fails closed with ErrLogBatchConflict rather than being acked.
+ALTER TABLE log_batches ADD COLUMN IF NOT EXISTS payload_sha256 TEXT NOT NULL DEFAULT '';

@@ -157,10 +157,13 @@ func TestCompletionEffectsReceiptReplayExactlyOnce(t *testing.T) {
 		t.Fatal("downstream link recorded before any effect ran")
 	}
 	kinds := effectKindsQueued(f)
-	for _, k := range storage.CompletionEffectKinds() {
+	for _, k := range []string{storage.OutboxKindCompletionReconcile, storage.OutboxKindForgeDelivery} {
 		if kinds[k] != 1 {
 			t.Fatalf("effect kind %q queued %d times, want 1 (in-transaction intents)", k, kinds[k])
 		}
+	}
+	if len(kinds) != storage.CompletionEffectIntentCount {
+		t.Fatalf("completion persisted %d intents, want %d", len(kinds), storage.CompletionEffectIntentCount)
 	}
 	if downstreamIntentsQueued(f) != 0 {
 		t.Fatal("downstream dispatch intent must not exist before reconciliation")

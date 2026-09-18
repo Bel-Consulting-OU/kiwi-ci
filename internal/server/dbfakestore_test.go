@@ -35,10 +35,22 @@ type dbFakeStore struct {
 	outboxItems  []storage.OutboxItem
 	outboxAcked  []string
 	outboxClaims map[string]fakeOutboxClaim
-	fragments    map[string]storage.GeneratedFragmentReceipt
+	// outboxMeta mirrors migration 0015's attempts/last_error/next_attempt_at/
+	// dead_lettered_at retry state.
+	outboxMeta map[string]fakeOutboxMeta
+	// forgeState mirrors migration 0018's forge_check_state delivered
+	// watermark per logical key.
+	forgeState map[string]int64
+	fragments  map[string]storage.GeneratedFragmentReceipt
 	// outboxAppendErr/outboxAckErr inject durable-append/ack failures.
-	outboxAppendErr  error
-	outboxAckErr     error
+	outboxAppendErr error
+	outboxAckErr    error
+	// outboxVersionErr, when non-nil, makes OutboxEnqueueVersioned fail
+	// (persistent forge-publication failure tests).
+	outboxVersionErr error
+	// outboxGuardErr, when non-nil, makes OutboxVersionGuard fail
+	// (fail-closed dispatcher guard tests).
+	outboxGuardErr   error
 	schedules        map[string]storage.Schedule
 	occurrences      map[string][]storage.Occurrence
 	deployments      map[string]model.Deployment
@@ -196,6 +208,7 @@ type cancelRunArgs struct {
 
 var _ storage.Store = (*dbFakeStore)(nil)
 var _ storage.OutboxStore = (*dbFakeStore)(nil)
+var _ storage.ForgeCheckStateStore = (*dbFakeStore)(nil)
 var _ storage.ScheduleStore = (*dbFakeStore)(nil)
 var _ storage.DeploymentStore = (*dbFakeStore)(nil)
 var _ storage.SnapshotStore = (*dbFakeStore)(nil)
@@ -280,6 +293,8 @@ func newDBFakeStore() *dbFakeStore {
 		secretClaims:    map[string]bool{},
 		pendingSidecars: map[string]fakePendingSidecar{},
 		outboxClaims:    map[string]fakeOutboxClaim{},
+		outboxMeta:      map[string]fakeOutboxMeta{},
+		forgeState:      map[string]int64{},
 		fragments:       map[string]storage.GeneratedFragmentReceipt{},
 		profiles:        map[string]model.RunnerProfile{},
 		certProfiles:    map[string]string{},
@@ -557,13 +572,14 @@ func (f *dbFakeStore) CompleteJob(ctx context.Context, jobID string, generation 
 		f.releaseRunnerSlotLocked(runnerID, jobID)
 	}
 	// Completion effect intents ride the completion, mirroring the SQL
-	// contract: one durable outbox item per effect kind under the
-	// deterministic effect IDs.
+	// contract: completion_reconcile (internal consistency, unbounded
+	// retries) plus forge_delivery (external publication, bounded retries)
+	// under their deterministic effect IDs.
 	payload, perr := json.Marshal(storage.CompletionEffectsPayload{JobID: jobID, RunID: j.RunID})
 	if perr != nil {
 		return perr
 	}
-	for _, kind := range storage.CompletionEffectKinds() {
+	for _, kind := range []string{storage.OutboxKindCompletionReconcile, storage.OutboxKindForgeDelivery} {
 		f.outboxItems = append(f.outboxItems, storage.OutboxItem{
 			ID:        storage.CompletionEffectID(jobID, generation, kind),
 			Kind:      kind,
@@ -1007,11 +1023,94 @@ func (f *dbFakeStore) OutboxAck(ctx context.Context, id string) error {
 	for _, it := range f.outboxItems {
 		if it.ID != id {
 			kept = append(kept, it)
+			continue
+		}
+		// Versioned ack advances the delivered watermark atomically with
+		// the removal, mirroring the SQL CTE.
+		if it.LogicalKey != "" && it.StateVersion > f.forgeState[it.LogicalKey] {
+			f.forgeState[it.LogicalKey] = it.StateVersion
 		}
 	}
 	f.outboxItems = kept
 	delete(f.outboxClaims, id)
+	delete(f.outboxMeta, id)
 	return nil
+}
+
+// OutboxEnqueueVersioned mirrors the SQL versioned enqueue: check the
+// delivered watermark, delete older pending versions, insert the new row.
+func (f *dbFakeStore) OutboxEnqueueVersioned(ctx context.Context, e storage.OutboxItem) (storage.VersionedEnqueueOutcome, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.outboxVersionErr != nil {
+		return storage.VersionedEnqueued, f.outboxVersionErr
+	}
+	if e.LogicalKey == "" || e.StateVersion <= 0 {
+		return storage.VersionedEnqueued, fmt.Errorf("storage: versioned outbox enqueue requires a logical key and a positive version")
+	}
+	if e.StateVersion <= f.forgeState[e.LogicalKey] {
+		return storage.VersionedSuperseded, nil
+	}
+	// A newer pending version wins even when this enqueue arrives after it.
+	for _, it := range f.outboxItems {
+		if it.LogicalKey != e.LogicalKey || it.StateVersion <= e.StateVersion {
+			continue
+		}
+		if meta, ok := f.outboxMeta[it.ID]; ok && !meta.deadAt.IsZero() {
+			continue
+		}
+		return storage.VersionedSuperseded, nil
+	}
+	kept := f.outboxItems[:0]
+	for _, it := range f.outboxItems {
+		if it.LogicalKey == e.LogicalKey && it.StateVersion <= e.StateVersion {
+			if meta, ok := f.outboxMeta[it.ID]; ok && !meta.deadAt.IsZero() {
+				// Dead letters are terminal and operator-visible: never
+				// silently deleted by a supersede.
+				kept = append(kept, it)
+				continue
+			}
+			delete(f.outboxClaims, it.ID)
+			delete(f.outboxMeta, it.ID)
+			continue
+		}
+		kept = append(kept, it)
+	}
+	f.outboxItems = kept
+	for _, it := range f.outboxItems {
+		if it.ID == e.ID {
+			return storage.VersionedSuperseded, nil
+		}
+	}
+	f.outboxItems = append(f.outboxItems, e)
+	return storage.VersionedEnqueued, nil
+}
+
+// OutboxVersionGuard mirrors the SQL durable guard.
+func (f *dbFakeStore) OutboxVersionGuard(ctx context.Context, id, logicalKey string, version int64) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.outboxGuardErr != nil {
+		return false, f.outboxGuardErr
+	}
+	if logicalKey == "" || version <= 0 {
+		return true, nil
+	}
+	alive := false
+	newerPending := false
+	for _, it := range f.outboxItems {
+		if it.ID == id {
+			alive = true
+		}
+		if it.LogicalKey != logicalKey || it.StateVersion <= version {
+			continue
+		}
+		if meta, ok := f.outboxMeta[it.ID]; ok && !meta.deadAt.IsZero() {
+			continue
+		}
+		newerPending = true
+	}
+	return alive && f.forgeState[logicalKey] < version && !newerPending, nil
 }
 
 func (f *dbFakeStore) AppendLogBatch(ctx context.Context, entries []model.LogEntry, r storage.LogBatchReceipt) (bool, error) {
@@ -1046,7 +1145,141 @@ func (f *dbFakeStore) OutboxPending(ctx context.Context) ([]storage.OutboxItem, 
 	if f.outboxPendingErr != nil {
 		return nil, f.outboxPendingErr
 	}
-	return append([]storage.OutboxItem(nil), f.outboxItems...), nil
+	out := make([]storage.OutboxItem, 0, len(f.outboxItems))
+	for _, it := range f.outboxItems {
+		if meta, ok := f.outboxMeta[it.ID]; ok && !meta.deadAt.IsZero() {
+			continue
+		}
+		out = append(out, it)
+	}
+	return out, nil
+}
+
+// OutboxRetry mirrors the SQL retry/dead-letter transition: attempts grow,
+// the error is retained, the claim is dropped, and the next attempt is
+// deferred with bounded backoff. maxAttempts == 0 means NEVER dead-letter
+// (completion_reconcile's unbounded convergence policy).
+func (f *dbFakeStore) OutboxRetry(ctx context.Context, id string, dispatchErr error, maxAttempts int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	found := false
+	for _, it := range f.outboxItems {
+		if it.ID == id {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil
+	}
+	msg := ""
+	if dispatchErr != nil {
+		msg = dispatchErr.Error()
+	}
+	meta := f.outboxMeta[id]
+	backoff := time.Second
+	for i := 0; i < meta.attempts && backoff < time.Minute; i++ {
+		backoff *= 2
+	}
+	jitter := time.Duration(time.Now().UnixNano() % int64(backoff/4+1))
+	meta.attempts++
+	meta.lastError = msg
+	delete(f.outboxClaims, id)
+	if maxAttempts > 0 && meta.attempts >= maxAttempts {
+		meta.deadAt = time.Now().UTC()
+		meta.nextAt = time.Time{}
+	} else {
+		meta.nextAt = time.Now().UTC().Add(backoff + jitter)
+	}
+	f.outboxMeta[id] = meta
+	return nil
+}
+
+// OutboxDeadLetters lists retired rows with their failure context.
+func (f *dbFakeStore) OutboxDeadLetters(ctx context.Context) ([]storage.OutboxDeadLetter, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []storage.OutboxDeadLetter{}
+	for _, it := range f.outboxItems {
+		meta, ok := f.outboxMeta[it.ID]
+		if !ok || meta.deadAt.IsZero() {
+			continue
+		}
+		out = append(out, storage.OutboxDeadLetter{
+			ID: it.ID, Kind: it.Kind, Payload: it.Payload, CreatedAt: it.CreatedAt,
+			Attempts: meta.attempts, LastError: meta.lastError, DeadLetteredAt: meta.deadAt,
+			LogicalKey: it.LogicalKey, StateVersion: it.StateVersion,
+		})
+	}
+	return out, nil
+}
+
+// OutboxRequeue re-arms one dead letter with a fresh retry budget.
+func (f *dbFakeStore) OutboxRequeue(ctx context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	meta, ok := f.outboxMeta[id]
+	if !ok || meta.deadAt.IsZero() {
+		return storage.ErrNotFound
+	}
+	for _, it := range f.outboxItems {
+		if it.ID == id {
+			delete(f.outboxMeta, id)
+			delete(f.outboxClaims, id)
+			return nil
+		}
+	}
+	return storage.ErrNotFound
+}
+
+// OutboxDelete removes one dead letter; live rows are never deleted.
+func (f *dbFakeStore) OutboxDelete(ctx context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	meta, ok := f.outboxMeta[id]
+	if !ok || meta.deadAt.IsZero() {
+		return storage.ErrNotFound
+	}
+	kept := f.outboxItems[:0]
+	removed := false
+	for _, it := range f.outboxItems {
+		if it.ID == id {
+			removed = true
+			continue
+		}
+		kept = append(kept, it)
+	}
+	if !removed {
+		return storage.ErrNotFound
+	}
+	f.outboxItems = kept
+	delete(f.outboxMeta, id)
+	delete(f.outboxClaims, id)
+	return nil
+}
+
+// ForceOutboxDue clears the retry deferral for one row so tests can drive
+// the next attempt without waiting out the backoff.
+func (f *dbFakeStore) ForceOutboxDue(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	meta, ok := f.outboxMeta[id]
+	if !ok {
+		return
+	}
+	meta.nextAt = time.Time{}
+	f.outboxMeta[id] = meta
+}
+
+// ForceAllOutboxDue clears every retry deferral (the test analogue of a
+// backoff window elapsing) while preserving attempts/dead-letter state.
+func (f *dbFakeStore) ForceAllOutboxDue() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for id, meta := range f.outboxMeta {
+		meta.nextAt = time.Time{}
+		f.outboxMeta[id] = meta
+	}
 }
 
 // fakeOutboxClaim mirrors the outbox claimed_at/claimed_by columns.
@@ -1055,26 +1288,45 @@ type fakeOutboxClaim struct {
 	at      time.Time
 }
 
+// fakeOutboxMeta mirrors the outbox attempts/last_error/next_attempt_at/
+// dead_lettered_at columns (migration 0015).
+type fakeOutboxMeta struct {
+	attempts  int
+	lastError string
+	nextAt    time.Time
+	deadAt    time.Time
+}
+
 // ClaimOutbox atomically claims up to limit dispatchable rows for claimer:
 // unclaimed rows plus rows whose claim is older than storage.OutboxClaimTTL,
-// in FIFO order. Two concurrent flushers can never claim the same row.
+// in FIFO order. Two concurrent flushers can never claim the same row. Dead
+// letters and rows deferred by retry backoff are never claimed.
 func (f *dbFakeStore) ClaimOutbox(ctx context.Context, claimer string, limit int) ([]storage.OutboxItem, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if claimer == "" || limit <= 0 {
 		return nil, nil
 	}
-	cutoff := time.Now().UTC().Add(-storage.OutboxClaimTTL)
+	now := time.Now().UTC()
+	cutoff := now.Add(-storage.OutboxClaimTTL)
 	out := []storage.OutboxItem{}
 	for _, it := range f.outboxItems {
 		if len(out) >= limit {
 			break
 		}
+		if meta, ok := f.outboxMeta[it.ID]; ok {
+			if !meta.deadAt.IsZero() {
+				continue
+			}
+			if !meta.nextAt.IsZero() && meta.nextAt.After(now) {
+				continue
+			}
+		}
 		// Boundary parity with the SQL claim (claimed_at < cutoff).
 		if c, ok := f.outboxClaims[it.ID]; ok && !c.at.Before(cutoff) {
 			continue
 		}
-		f.outboxClaims[it.ID] = fakeOutboxClaim{claimer: claimer, at: time.Now().UTC()}
+		f.outboxClaims[it.ID] = fakeOutboxClaim{claimer: claimer, at: now}
 		out = append(out, it)
 	}
 	return out, nil

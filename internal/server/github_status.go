@@ -10,12 +10,12 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/forge"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
-	"go.opentelemetry.io/otel/attribute"
 )
 
 // publishGitHubStatus mirrors run state to the forge via the durable
@@ -113,69 +113,19 @@ func (s *Server) forgePublishingConfigured(kind string) bool {
 	return false
 }
 
-// publishGitHubStatus is the GitHub-only publication path (kept for callers
-// that explicitly target GitHub). Non-GitHub runs return immediately.
-func (s *Server) publishGitHubStatus(run model.Run) error {
-	_, span := s.startSpan(context.Background(), "forge.status.publish")
-	defer span.End()
-	if run.RepoFullName == "" || run.SHA == "" {
-		return nil
-	}
-	if run.ForgeKind != "" && run.ForgeKind != "github" {
-		// Never route another forge's run to the GitHub API, even when a
-		// GitHub credential happens to be configured on this control plane.
-		return nil
-	}
-	if s.GitHubToken == "" && s.GitHubAppID == 0 && s.gitHubAPIBase == "" {
-		// No publishing credential or endpoint configured: nothing can be
-		// published, so the intent would never dispatch. Skip enqueueing.
-		return nil
-	}
-	status, conclusion := checkStateForRun(run.Status)
-	summary := "pipeline " + string(run.Status)
-	items := []forge.OutboxItem{s.checkIntent(run, "Pipeline", status, conclusion, summary, nil)}
-	span.SetAttributes(attribute.String("kiwi.run_status", string(run.Status)))
-
-	s.mu.Lock()
-	var jobIntents []forge.OutboxItem
-	for _, j := range s.jobs {
-		if j.RunID != run.ID || !j.Status.Terminal() {
-			continue
-		}
-		jstatus, jconclusion := checkStateForRun(j.Status)
-		jsummary := "job " + j.Key + " " + string(j.Status)
-		if j.Error != "" {
-			jsummary += ": " + j.Error
-		}
-		jobIntents = append(jobIntents, s.checkIntent(run, j.Key, jstatus, jconclusion, jsummary, nil))
-	}
-	s.mu.Unlock()
-	// Deterministic order: pipeline first, then jobs sorted by key.
-	sort.Slice(jobIntents, func(i, j int) bool {
-		var a, b forge.CheckPayload
-		_ = json.Unmarshal(jobIntents[i].Payload, &a)
-		_ = json.Unmarshal(jobIntents[j].Payload, &b)
-		return a.Name < b.Name
-	})
-	items = append(items, jobIntents...)
-	for _, it := range items {
-		if it.Kind == "" {
-			// The run's forge could not be classified: publishing to a
-			// guessed forge is worse than not publishing.
-			continue
-		}
-		if err := s.outbox.Enqueue(it); err != nil {
-			return fmt.Errorf("forge status: enqueue %s: %w", it.Kind, err)
-		}
-	}
-	return nil
-}
-
 func (s *Server) checkIntent(run model.Run, name, status, conclusion, summary string, annotations []forge.CheckAnnotation) forge.OutboxItem {
 	detailsURL := ""
 	if s.ExternalURL != "" {
 		detailsURL = s.ExternalURL + "/?run=" + run.ID
 	}
+	// The LOGICAL key is the stable identity of one remote check
+	// (forge host + run + check name); the state version is the rank of the
+	// logical state this intent carries. Row identity is key#version, so a
+	// newer state never collides with an older one (P1 fix): queued -> running
+	// -> completed are DISTINCT outbox rows, each superseding the older
+	// pending one.
+	logicalKey := forgeCheckLogicalKey(run.ForgeHost, run.ID, name)
+	version := checkStateVersion(status)
 	payload, err := jsonMarshal(forge.CheckPayload{
 		RunID:        run.ID,
 		ForgeKind:    run.ForgeKind,
@@ -188,6 +138,8 @@ func (s *Server) checkIntent(run model.Run, name, status, conclusion, summary st
 		DetailsURL:   detailsURL,
 		Summary:      summary,
 		Annotations:  annotations,
+		LogicalKey:   logicalKey,
+		StateVersion: version,
 	})
 	if err != nil {
 		payload = []byte("{}")
@@ -201,12 +153,46 @@ func (s *Server) checkIntent(run model.Run, name, status, conclusion, summary st
 	case "forgejo":
 		kind = forge.OutboxKindForgejoCheck
 	}
-	// Deterministic ID over the LOGICAL operation: a replay (lost ACK,
-	// crash between enqueue and dispatch) converges on one durable row per
-	// (forge host, run, check name), and OutboxAppend verifies content on
-	// ID reuse.
-	sum := sha256.Sum256([]byte("forge-check\x00" + run.ForgeHost + "\x00" + run.ID + "\x00" + name))
-	return forge.OutboxItem{ID: hex.EncodeToString(sum[:16]), Kind: kind, Payload: payload}
+	return forge.OutboxItem{
+		ID:           forgeCheckRowID(logicalKey, version),
+		Kind:         kind,
+		Payload:      payload,
+		LogicalKey:   logicalKey,
+		StateVersion: version,
+	}
+}
+
+// forgeCheckLogicalKey derives the STABLE logical identity of one remote
+// check: sha256("forge-check\x00host\x00run\x00name") truncated to the
+// canonical 128-bit hex ID. It is the pre-existing deterministic intent
+// identity, now used as the logical key that survives across state versions
+// (the check-run mapping is still keyed by runID|name, matching this key
+// one-to-one for a given run/name pair).
+func forgeCheckLogicalKey(forgeHost, runID, name string) string {
+	sum := sha256.Sum256([]byte("forge-check\x00" + forgeHost + "\x00" + runID + "\x00" + name))
+	return hex.EncodeToString(sum[:16])
+}
+
+// forgeCheckRowID is the versioned durable outbox row identity:
+// logicalKey + "#" + stateVersion.
+func forgeCheckRowID(logicalKey string, version int64) string {
+	return logicalKey + "#" + strconv.FormatInt(version, 10)
+}
+
+// checkStateVersion ranks the mapped remote check state monotonically:
+// queued=1, in_progress=2, completed=3. The rank is derived from the LOGICAL
+// state, not from an enqueue counter, so a stale caller re-publishing an
+// older state can never supersede a newer delivered one; an unknown state is
+// treated as in_progress to match checkStateForRun's default.
+func checkStateVersion(checkStatus string) int64 {
+	switch checkStatus {
+	case "queued":
+		return 1
+	case "completed":
+		return 3
+	default:
+		return 2
+	}
 }
 
 // checkStateForRun maps Kiwi run/job statuses onto GitHub check-run

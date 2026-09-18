@@ -152,10 +152,13 @@ the recorded `BuildDate` is pinned from `SOURCE_DATE_EPOCH`.
 Flow in `scripts/release.sh` release mode:
 
 1. If `BUILD_DATE` is set explicitly, it wins. It must be exactly
-   `YYYY-MM-DDTHH:MM:SSZ` (RFC3339 UTC): any other value, including one
-   carrying whitespace or extra `-X` linker flags, is rejected with a fatal
-   error before the build, in both release and snapshot mode, so a caller
-   cannot override the validated version through `-ldflags`.
+   `YYYY-MM-DDTHH:MM:SSZ` (RFC3339 UTC) *and* name a real UTC calendar
+   instant: any other value, including one carrying whitespace or extra `-X`
+   linker flags, and including a shape-valid impossible date such as
+   `2006-13-45T99:99:99Z`, is rejected with a fatal error before the build,
+   in both release and snapshot mode, so a caller cannot override the
+   validated version through `-ldflags`. The calendar check is performed by
+   `scripts/rfc3339check` (see 5.1).
 2. Else if `SOURCE_DATE_EPOCH` is set, it is converted to RFC3339 UTC.
 3. Else `SOURCE_DATE_EPOCH` is derived from the tagged commit:
    `git log -1 --format=%ct <tag>`, then converted to RFC3339 UTC.
@@ -188,6 +191,41 @@ The distinction is deliberate:
 
 Local check: `make repro-build` builds twice with fixed ldflags and compares
 the binaries byte-for-byte.
+
+### 5.1 Build-argument validation
+
+Every identity value that reaches `-ldflags` is validated before it is
+interpolated, so a build argument cannot smuggle extra linker flags into the
+build:
+
+| Input | Accepted values |
+| --- | --- |
+| `VERSION` | characters `[A-Za-z0-9._+-]` only: ASCII letters, digits, `.`, `_`, `+`, `-`. No whitespace, quotes, or any other punctuation. (In the Docker build an omitted `VERSION` uses the `dev` default; an explicit empty value cannot inject anything.) |
+| `COMMIT` | the literal `unknown`, or 7-40 lowercase hex characters: the Makefile's short SHA, the `--snapshot` short SHA, or the full 40-char release SHA |
+| `BUILD_DATE` | exactly the canonical RFC3339 UTC form `YYYY-MM-DDTHH:MM:SSZ`, naming a real UTC calendar instant |
+
+`BUILD_DATE` is validated in two layers. The character set (`0-9 T Z : . -`)
+and the canonical shape are checked first; then, for every caller-supplied
+`BUILD_DATE` in both release and snapshot mode, `scripts/release.sh` runs
+`scripts/rfc3339check`, which parses the value with
+`time.Parse(time.RFC3339, ...)` and requires the parsed time to re-format to
+exactly the canonical UTC `Z` spelling. Shape alone would accept impossible
+dates such as `2006-13-45T99:99:99Z`; the helper rejects those, along with
+non-UTC numeric offsets (`+02:00`, `-00:00`), fractional seconds, and any
+other non-canonical spelling. Internally generated timestamps (the
+`SOURCE_DATE_EPOCH` conversion and `date -u`) are checked against the
+canonical shape.
+
+The Docker build stage applies the identical `VERSION` and `COMMIT` character
+rules and the identical canonical `BUILD_DATE` shape check to its build args
+before composing `-ldflags`; a mismatch fails the build with the offending
+value quoted. The real-calendar half of the `BUILD_DATE` check is the one in
+`scripts/release.sh`: `.dockerignore` keeps `scripts/` out of the Docker build
+context, so the helper cannot run in the build stage. `make docker-build`
+remains the supported Docker path -- it computes `BUILD_DATE` from
+`SOURCE_DATE_EPOCH` on the host and passes it through the same shape gate --
+and a direct `docker build --build-arg BUILD_DATE=...` accepts only the
+canonical shape.
 
 ## 6. Release signing key lifecycle
 

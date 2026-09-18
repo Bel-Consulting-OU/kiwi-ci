@@ -148,9 +148,15 @@ kiwi dispatch | kiwi runs | kiwi jobs | kiwi logs [--follow]
 kiwi cancel | kiwi approve | kiwi rerun | kiwi artifacts
 kiwi replay RUN JOB [STEP]   (restores the exact workspace snapshot)
 kiwi schedules list|trigger
+kiwi outbox dead-letters list|requeue|delete
 kiwi policy check [-f FILE] [--trusted]
 kiwi version
 ```
+
+`kiwi outbox dead-letters` lists forge-delivery intents that exhausted
+their retries and can requeue or delete one by ID (DB mode takes
+`--database-url`). See [docs/upgrades.md](docs/upgrades.md#behavioral-compatibility-notes)
+for the outbox versioning and dead-letter semantics.
 
 ## Repository layout
 

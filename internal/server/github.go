@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -138,6 +139,13 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	run, err := s.enqueue(in)
 	if err != nil {
+		// A durability failure is not a client error: answer 503 so the
+		// forge retries the delivery instead of treating it as rejected.
+		var nd *stateNotDurableError
+		if errors.As(err, &nd) {
+			http.Error(w, nd.Error(), http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}

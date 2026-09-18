@@ -133,13 +133,16 @@ enrollment traffic stays reachable on the same listener.
 - `GET /readiness` — ready to serve traffic. DB mode checks the store. In
   fs mode (data-dir snapshot store) a failed snapshot write degrades the
   control plane: `/readiness` answers 503 with `X-Kiwi-State: degraded` and a
-  fixed body (the raw error stays in the server logs), and new runner leases
-  are refused with 503 so no capability is issued for state the snapshot does
-  not contain. The state self-heals on the next successful persist and is
-  cleared when the server switches to DB mode (the abandoned snapshot is no
-  longer authoritative). Configure probes and load balancers to stop routing
-  traffic to an instance while `/readiness` answers 503, and alert on the
-  degraded state so a persistent snapshot-write failure is not masked.
+  fixed body (the raw error stays in the server logs), new runner leases are
+  refused with 503 so no capability is issued for state the snapshot does not
+  contain, and heartbeats answer 503 without extending the stored lease
+  expiry, so a runner self-cancels at its last acknowledged deadline instead
+  of running on an unrecorded extension. The state self-heals on the next
+  successful persist and is cleared when the server switches to DB mode (the
+  abandoned snapshot is no longer authoritative). Configure probes and load
+  balancers to stop routing traffic to an instance while `/readiness` answers
+  503, and alert on the degraded state so a persistent snapshot-write failure
+  is not masked.
 - `GET /liveness` — process is up.
 - `GET /metrics` — Prometheus-style metrics, optionally on a separate
   `observability.metrics_listen` address.
@@ -178,3 +181,41 @@ The Woodpecker instance hosting it must be configured so CI reflects reality:
   matching the workflow label sets; the Docker lane is REQUIRED and fails
   (never skips) when its daemon is unavailable.
 - The clone plugin and every workflow image are pinned by OCI digest.
+
+## Native and local CI agents
+
+The native macOS and Windows workflows run on Woodpecker's local backend,
+which executes the workflow commands directly on the worker host as the
+agent user, with no container boundary. These hosts are part of the
+trusted build boundary; provision them on that basis:
+
+- **One-shot, ephemeral workers.** Destroy or reimage the host after every
+  run. Never point the native labels at a long-lived interactive machine.
+- **Dedicated low-privilege user.** Run the Woodpecker agent as a
+  dedicated user (never root/administrator) whose only durable state is
+  the Go toolchain and the per-run checkout.
+- **No persistent credentials.** Keep release signing keys, forge tokens,
+  and cloud/SSH keys off the host. The only secret that may exist is the
+  Woodpecker agent secret, scoped to that agent and rotated.
+- **Never run fork code.** The native workflows accept trusted events only
+  (`push`, `manual`, `tag`). Fork pull requests run in the
+  Docker-backend lanes; do not add `pull_request`/`pull_request_*` events
+  to a local-backend workflow.
+- **Agent selection and shell.** Select `platform=darwin/arm64` +
+  `backend=local` for macOS and `platform=windows/amd64` + `backend=local`
+  for Windows. On the local backend `image` names the shell (`bash`,
+  `pwsh`) rather than a container image, so the shell must exist on the
+  worker's `PATH`, as must Go 1.27.x (`GOTOOLCHAIN=local` prevents Go from
+  downloading a toolchain and masking a stale worker).
+
+## CI test image
+
+The required `docker-workspace` lane needs a Docker CLI and must not
+depend on a registry image. Its first step builds
+`.woodpecker/ci/Dockerfile` locally on the agent's daemon as
+`kiwi-ci-test:go1.27`; the test step uses `pull: false`, so it runs those
+local layers. The image is based on the same digest-pinned Go 1.27 and
+Docker CLI images as the other workflows and adds git, CA certificates,
+make, gcc, and libc6-dev, each probed at build time. Bump the base
+digests deliberately (re-resolve with `docker buildx imagetools inspect`)
+and re-run the lane to validate the result.

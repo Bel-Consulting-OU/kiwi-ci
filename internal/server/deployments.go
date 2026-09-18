@@ -100,8 +100,21 @@ func (s *Server) recordDeployment(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "job has no environment", http.StatusConflict)
 		return
 	}
+	prev, had := s.deployments[jobID]
 	d := s.recordDeploymentLocked(j, time.Now().UTC())
-	s.persistCheckedLocked("deployment.record")
+	if perr := s.persistCheckedErrLocked("deployment.record"); perr != nil {
+		// The record never became durable: restore the pre-mutation mirror
+		// (or remove the fresh entry) and fail closed, exactly like the DB
+		// path. A later successful persist must not commit a 201 the
+		// client was told failed.
+		if had {
+			s.deployments[jobID] = prev
+		} else {
+			delete(s.deployments, jobID)
+		}
+		http.Error(w, "deployment record not durable", http.StatusServiceUnavailable)
+		return
+	}
 	writeJSON(w, http.StatusCreated, d)
 }
 

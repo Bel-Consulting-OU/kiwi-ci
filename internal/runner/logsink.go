@@ -2,8 +2,11 @@ package runner
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,12 +27,18 @@ import (
 // be reported green while its logs were lost.
 type asyncLogSink struct {
 	inner logging.Sink
-	post  func(ctx context.Context, lines []logLine) error
+	post  func(ctx context.Context, batch logBatch) error
 
 	// ctx is cancelled by Finish at its deadline, aborting any in-flight
-	// delivery instead of letting it run on the job's parent context.
+	// delivery instead of letting it run on the job's parent context. The
+	// post callback receives exactly this ctx.
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	// batchSeq assigns every batch its immutable sequence when the sink
+	// forms the batch — once, before the first send — so retries of that
+	// batch reuse the same sequence and identity.
+	batchSeq atomic.Int64
 
 	mu         sync.Mutex
 	spool      []logLine
@@ -65,6 +74,42 @@ type logLine struct {
 	Job  string
 	Step string
 	Line string
+	// spoolCost is this line's accounting cost, computed exactly ONCE at
+	// enqueue. The spool budget check and the drain decrement both use this
+	// stored value, so the tracked byte count can never drift from the
+	// buffered payload. The JSON-ENCODED size is a different quantity,
+	// computed separately and used solely for HTTP batch packing (escaping
+	// can multiply it).
+	spoolCost int64
+}
+
+// logBatch is an immutable unit of delivery. Its identity (Sequence and ID)
+// is assigned exactly once when the sink forms the batch and every retry
+// re-sends the identical values, so the control plane's (job, generation,
+// batch_id) receipt can dedupe a retried delivery.
+type logBatch struct {
+	Sequence int64
+	ID       string
+	Lines    []logLine
+}
+
+// logBatchID derives a batch's deterministic identity from the sequence
+// assigned by the sink and the batch payload: the sequence distinguishes
+// identical payloads in different batches, the payload binds the identity to
+// the bytes.
+func logBatchID(sequence int64, lines []logLine) string {
+	h := sha256.New()
+	h.Write([]byte(strconv.FormatInt(sequence, 10)))
+	h.Write([]byte{0})
+	for _, l := range lines {
+		h.Write([]byte(l.Job))
+		h.Write([]byte{0})
+		h.Write([]byte(l.Step))
+		h.Write([]byte{0})
+		h.Write([]byte(l.Line))
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil)[:16])
 }
 
 // asyncSpoolLimit bounds the in-memory spool; at 64 bytes per line average
@@ -85,7 +130,7 @@ const (
 	asyncPostBatch = 200
 )
 
-func newAsyncLogSink(inner logging.Sink, post func(context.Context, []logLine) error) *asyncLogSink {
+func newAsyncLogSink(inner logging.Sink, post func(context.Context, logBatch) error) *asyncLogSink {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &asyncLogSink{inner: inner, post: post, ctx: ctx, cancel: cancel, done: make(chan struct{})}
 	s.cond = sync.NewCond(&s.mu)
@@ -116,17 +161,19 @@ func (s *asyncLogSink) WriteLine(job, step, line string) {
 	if s.inner != nil {
 		s.inner.WriteLine(job, step, line)
 	}
-	added := int64(len(job) + len(step) + len(line))
+	// The spool cost is computed once here and stored with the line; the
+	// drain decrements by exactly this value.
+	l := logLine{Job: job, Step: step, Line: line, spoolCost: int64(len(job) + len(step) + len(line))}
 	s.mu.Lock()
-	if s.closed || len(s.spool) >= asyncSpoolLimit || s.spoolBytes+added > asyncSpoolBytes {
+	if s.closed || len(s.spool) >= asyncSpoolLimit || s.spoolBytes+l.spoolCost > asyncSpoolBytes {
 		s.mu.Unlock()
 		if !s.closed {
 			s.dropped.Add(1)
 		}
 		return
 	}
-	s.spool = append(s.spool, logLine{Job: job, Step: step, Line: line})
-	s.spoolBytes += added
+	s.spool = append(s.spool, l)
+	s.spoolBytes += l.spoolCost
 	s.cond.Signal()
 	s.mu.Unlock()
 }
@@ -145,23 +192,29 @@ func (s *asyncLogSink) run() {
 		}
 		// Fill one BATCH up to both the line and byte budget, measuring the
 		// MARSHALED JSON size (escaping can multiply a line's encoded size).
+		// This encoded size bounds the HTTP request only; spool accounting
+		// uses the per-line costs stored at enqueue.
 		n := 0
-		var bytes int64
+		var encodedBytes int64
 		for n < len(s.spool) && n < asyncPostBatch {
 			encoded, _ := json.Marshal(s.spool[n])
 			add := int64(len(encoded))
-			if n > 0 && bytes+add > asyncPostBytes {
+			if n > 0 && encodedBytes+add > asyncPostBytes {
 				break
 			}
-			bytes += add
+			encodedBytes += add
 			n++
 		}
-		batch := append([]logLine(nil), s.spool[:n]...)
-		s.spool = append([]logLine(nil), s.spool[n:]...)
-		s.spoolBytes -= bytes
-		if s.spoolBytes < 0 {
-			s.spoolBytes = 0
+		// Identity is assigned exactly ONCE, when the batch is formed and
+		// before the first send; every retry below reuses this same batch.
+		batch := logBatch{Sequence: s.batchSeq.Add(1), Lines: append([]logLine(nil), s.spool[:n]...)}
+		batch.ID = logBatchID(batch.Sequence, batch.Lines)
+		var removed int64
+		for _, l := range batch.Lines {
+			removed += l.spoolCost
 		}
+		s.spool = append([]logLine(nil), s.spool[n:]...)
+		s.spoolBytes -= removed
 		s.inFlight++
 		s.mu.Unlock()
 

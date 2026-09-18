@@ -5,13 +5,31 @@
 # here with a message naming the file, instead of surfacing later as a
 # confusing merge-coverage error or silently understated coverage.
 #
+# Cross-package assertion: the integration lane runs with `-coverpkg=./...`,
+# so its profile must record coverage blocks for production packages the
+# integration tests reach indirectly through the tested packages (for example
+# internal/pipeline, internal/safefs and internal/forge). Dropping or
+# narrowing -coverpkg silently shrinks the profile to the directly tested
+# packages while a plain block-count check still passes, so the profile whose
+# basename matches KC_INTEGRATION_PROFILE is additionally required to contain
+# at least one block for every fragment in KC_CROSSPKG_PATHS. Those paths are
+# absent from the profile when the integration lane loses -coverpkg=./...
+#
 # Usage: ci-coverage-selftest.sh PROFILE...
 #
 # Environment:
-#   KC_MIN_COVERAGE_BLOCKS   minimum coverage blocks per profile (default: 1000)
+#   KC_MIN_COVERAGE_BLOCKS  minimum coverage blocks per profile (default: 1000)
+#   KC_INTEGRATION_PROFILE  basename of the integration profile checked for
+#                           cross-package instrumentation
+#                           (default: integration-coverage.out)
+#   KC_CROSSPKG_PATHS       space-separated path fragments that must appear in
+#                           that profile; set it empty to disable the check
+#                           (default: internal/pipeline internal/safefs internal/forge)
 set -eu
 
 MIN_BLOCKS="${KC_MIN_COVERAGE_BLOCKS:-1000}"
+INTEGRATION_PROFILE="${KC_INTEGRATION_PROFILE:-integration-coverage.out}"
+CROSSPKG_PATHS="${KC_CROSSPKG_PATHS-internal/pipeline internal/safefs internal/forge}"
 [ "$#" -ge 1 ] || {
 	echo "ci-coverage-selftest: usage: ci-coverage-selftest.sh PROFILE..." >&2
 	exit 1
@@ -55,6 +73,19 @@ for profile in "$@"; do
 	blocks="$(awk 'NR > 1 && NF == 3 && $3 ~ /^[0-9]+$/ { n++ } END { print n + 0 }' "$profile")"
 	if [ "$blocks" -lt "$MIN_BLOCKS" ]; then
 		echo "ci-coverage-selftest: $profile records $blocks coverage blocks, below the required $MIN_BLOCKS (truncated or semantically empty profile)" >&2
+		status=1
+		continue
+	fi
+	ok=1
+	if [ "${profile##*/}" = "$INTEGRATION_PROFILE" ]; then
+		for fragment in $CROSSPKG_PATHS; do
+			if ! grep -Fq "/$fragment/" "$profile"; then
+				echo "ci-coverage-selftest: $profile records no coverage blocks for $fragment: the integration lane must run with -coverpkg=./... so cross-package production paths are instrumented" >&2
+				ok=0
+			fi
+		done
+	fi
+	if [ "$ok" -eq 0 ]; then
 		status=1
 		continue
 	fi

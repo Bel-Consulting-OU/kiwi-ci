@@ -77,8 +77,20 @@ func (s *Server) upsertProfile(ctx context.Context, p model.RunnerProfile) error
 	if s.profiles == nil {
 		s.profiles = map[string]model.RunnerProfile{}
 	}
+	prev, had := s.profiles[p.ID]
 	s.profiles[p.ID] = p
-	return s.persistLocked()
+	if perr := s.persistCheckedErrLocked("runner_profile.upsert"); perr != nil {
+		// Durability first: restore the previous profile (or remove the
+		// fresh entry) so the next successful persist cannot commit a
+		// profile the admin was told failed.
+		if had {
+			s.profiles[p.ID] = prev
+		} else {
+			delete(s.profiles, p.ID)
+		}
+		return perr
+	}
+	return nil
 }
 
 // getProfile resolves one profile.
@@ -134,8 +146,20 @@ func (s *Server) bindCertProfile(ctx context.Context, serial, profileID string) 
 	if s.certProfiles == nil {
 		s.certProfiles = map[string]string{}
 	}
+	prev, had := s.certProfiles[serial]
 	s.certProfiles[serial] = profileID
-	return s.persistLocked()
+	if perr := s.persistCheckedErrLocked("runner_profile.bind"); perr != nil {
+		// Durability first: a binding the snapshot does not contain must not
+		// survive in memory, and a failed persist is a server-side failure
+		// (503), never a 400.
+		if had {
+			s.certProfiles[serial] = prev
+		} else {
+			delete(s.certProfiles, serial)
+		}
+		return notDurable(perr)
+	}
+	return nil
 }
 
 // profileForSerial resolves the profile bound to a certificate serial
@@ -298,6 +322,13 @@ func (s *Server) bindRunnerProfileCert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.bindCertProfile(r.Context(), serial, profileID); err != nil {
+		// A durability failure is not a client error: fail closed with 503
+		// so the caller retries instead of treating the binding as rejected.
+		var nd *stateNotDurableError
+		if errors.As(err, &nd) {
+			http.Error(w, nd.Error(), http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}

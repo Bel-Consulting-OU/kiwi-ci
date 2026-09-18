@@ -50,7 +50,7 @@ func TestSqueezePublishGitHubStatus(t *testing.T) {
 	s.gitHubAPIBase = "https://api.github.example"
 	s.ExternalURL = "https://kiwi.example"
 	// Missing coordinate: nothing to publish.
-	s.publishGitHubStatus(model.Run{ID: "r1", ForgeKind: "github", ForgeHost: "github.com"})
+	_ = s.publishForgeStatus(context.Background(), model.Run{ID: "r1", ForgeKind: "github", ForgeHost: "github.com"})
 
 	s.mu.Lock()
 	s.runs["r1"] = model.Run{ID: "r1", RepoFullName: "acme/backend", SHA: "sha", ForgeKind: "github", ForgeHost: "github.com", Status: model.StatusFailure}
@@ -58,7 +58,7 @@ func TestSqueezePublishGitHubStatus(t *testing.T) {
 	s.jobs["j2"] = model.Job{ID: "j2", RunID: "r1", Key: "test", Status: model.StatusSkipped}
 	s.jobs["j3"] = model.Job{ID: "j3", RunID: "r1", Key: "deploy", Status: model.StatusRunning}
 	s.mu.Unlock()
-	s.publishGitHubStatus(s.runs["r1"])
+	_ = s.publishForgeStatus(context.Background(), s.runs["r1"])
 
 	items := s.outbox.Pending()
 	if len(items) != 3 {
@@ -95,7 +95,7 @@ func TestSqueezePublishGitHubStatus(t *testing.T) {
 	s2.mu.Lock()
 	s2.jobs["j1"] = model.Job{ID: "j1", RunID: "r1", Key: "build", Status: model.StatusSuccess}
 	s2.mu.Unlock()
-	s2.publishGitHubStatus(model.Run{ID: "r1", RepoFullName: "acme/backend", SHA: "sha", Status: model.StatusSuccess})
+	_ = s2.publishForgeStatus(context.Background(), model.Run{ID: "r1", ForgeKind: "github", ForgeHost: "github.com", RepoFullName: "acme/backend", SHA: "sha", Status: model.StatusSuccess})
 }
 
 // TestSqueezePublishStatusFromPayload covers the legacy commit-status

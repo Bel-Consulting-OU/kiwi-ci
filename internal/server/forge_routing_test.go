@@ -61,10 +61,12 @@ func TestForgeCheckRoutingNeverCrossesForges(t *testing.T) {
 	if err := s.dispatchOutbox(context.Background(), misrouted); err != nil {
 		t.Fatalf("misrouted dispatch must be a silent drop, got %v", err)
 	}
-	// And publishing a gitlab run through the GitHub path is a no-op.
-	s.publishGitHubStatus(run)
-	if got := len(s.outbox.Pending()); got != 0 {
-		t.Fatalf("gitlab run queued %d github intents, want 0", got)
+	// And publishing a gitlab run must never yield GitHub check intents.
+	_ = s.publishForgeStatus(context.Background(), run)
+	for _, it := range s.outbox.Pending() {
+		if it.Kind == forge.OutboxKindGitHubCheck {
+			t.Fatalf("gitlab run queued a github check intent")
+		}
 	}
 	// The NEUTRAL completion path, however, must publish a GitLab run
 	// through the GitLab adapter: gitlab_check intents (+ the terminal job).

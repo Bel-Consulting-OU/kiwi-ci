@@ -368,7 +368,19 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 		return
 	}
 	s.auditLocked("artifact.uploaded", runnerID, j.RunID, j.ID, "artifact uploaded", map[string]string{"name": name, "sha256": rec.SHA256, "provenance_kid": signer.KID})
-	s.persistCheckedLocked("artifact.upload")
+	if perr := s.persistCheckedErrLocked("artifact.upload"); perr != nil {
+		// The record never became durable: roll back the in-memory record,
+		// leave the pending-sidecar bookkeeping untouched, drop the staged
+		// payload and fail closed. A 201 here would acknowledge an artifact
+		// the snapshot does not contain, and the retry would replay from the
+		// ghost without ever writing it.
+		delete(s.artifacts, rec.ID)
+		s.mu.Unlock()
+		_ = os.Remove(dst)
+		_ = os.Remove(dst + ".intoto.json")
+		http.Error(w, "artifact upload not durable", http.StatusServiceUnavailable)
+		return
+	}
 	// Dev-mode mirror: the record now carries its sidecar references, so
 	// the pending entries are consumed with it.
 	delete(s.pendingSidecars, sidecarPendingKey(j.ID, name, storage.ArtifactSidecarKindSBOM))

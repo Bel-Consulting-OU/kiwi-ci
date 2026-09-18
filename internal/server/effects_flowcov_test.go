@@ -299,14 +299,19 @@ func TestFlowEffectsEnqueueCompletionEffects(t *testing.T) {
 	if err := s.enqueueCompletionEffects(model.Job{ID: "j"}, model.Run{ID: "r"}); err != nil {
 		t.Fatalf("memory effect enqueue = %v", err)
 	}
-	// Single-row design: ONE deterministic reconcile intent per completion
-	// runs the whole effect chain (the per-kind fan-out amplified one
-	// completion into five rows × five chains).
-	if got := len(s.outbox.Pending()); got != 1 {
-		t.Fatalf("queued effects = %d, want 1 reconcile intent", got)
+	// Split design: TWO deterministic intents per completion — the internal
+	// completion_reconcile row (unbounded retries) and the external
+	// forge_delivery row (bounded retries + dead-letter).
+	pending := s.outbox.Pending()
+	if len(pending) != 2 {
+		t.Fatalf("queued effects = %d, want reconcile + forge_delivery", len(pending))
 	}
-	if s.outbox.Pending()[0].Kind != storage.OutboxKindCompletionReconcile {
-		t.Fatalf("queued kind = %q", s.outbox.Pending()[0].Kind)
+	kinds := map[string]bool{}
+	for _, it := range pending {
+		kinds[it.Kind] = true
+	}
+	if !kinds[storage.OutboxKindCompletionReconcile] || !kinds[storage.OutboxKindForgeDelivery] {
+		t.Fatalf("queued kinds = %v", kinds)
 	}
 	// DB append failure surfaces.
 	s2, f, _, _ := cacheFixture(t)

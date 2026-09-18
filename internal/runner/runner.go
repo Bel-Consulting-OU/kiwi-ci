@@ -20,7 +20,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	v1 "github.com/Bel-Consulting-OU/kiwi-ci/internal/api/v1"
@@ -592,44 +591,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	consoleSink := logging.Func(func(job, step, line string) {
 		fmt.Printf("[%s/%s] %s\n", job, step, masker.Mask(line))
 	})
-	var logBatchSeq atomic.Int64
-	sink := newAsyncLogSink(consoleSink, func(ctx context.Context, lines []logLine) error {
-		// ONE batched request per drain: per-line posts cannot keep up and
-		// force the spool to overflow on chatty builds.
-		out := make([]server.LogLine, 0, len(lines))
-		for _, l := range lines {
-			out = append(out, server.LogLine{RunnerID: r.ID, LeaseToken: t.LeaseToken, LeaseGeneration: t.LeaseGeneration, JobKey: l.Job, Step: l.Step, Line: masker.Mask(l.Line)})
-		}
-		var body struct {
-			RunnerID        string           `json:"runner_id"`
-			LeaseToken      string           `json:"lease_token"`
-			LeaseGeneration int64            `json:"lease_generation"`
-			BatchID         string           `json:"batch_id"`
-			BatchSequence   int64            `json:"batch_sequence"`
-			Lines           []server.LogLine `json:"lines"`
-		}
-		body.RunnerID = r.ID
-		body.LeaseToken = t.LeaseToken
-		body.LeaseGeneration = t.LeaseGeneration
-		body.BatchSequence = logBatchSeq.Add(1)
-		// Deterministic batch identity: a safely retried batch is recognized
-		// by the server's receipt and never duplicates lines.
-		batchSum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%d", t.Job.ID, t.LeaseGeneration, body.BatchSequence)))
-		body.BatchID = hex.EncodeToString(batchSum[:16])
-		body.Lines = out
-		// 4xx-class failures are permanent (retrying cannot help) and fail
-		// the batch immediately; 5xx/network errors stay retryable.
-		err := r.post(parent, "/api/v1/jobs/"+t.Job.ID+"/log/batch", body, nil)
-		if err != nil {
-			msg := err.Error()
-			for _, code := range []string{" 400 ", " 401 ", " 403 ", " 404 ", " 409 ", " 413 ", " 422 "} {
-				if strings.Contains(msg, code) {
-					return PermanentDeliveryError(err)
-				}
-			}
-		}
-		return err
-	})
+	sink := newAsyncLogSink(consoleSink, r.logBatchPost(t, masker))
 	// Distributed runs resolve secrets exclusively through the control
 	// plane's lease-bound delivery endpoint. Host env/Keychain providers
 	// are local-CLI-only (app.RunLocal keeps that chain); the runner never
@@ -750,6 +712,44 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		}
 	}
 	r.complete(parent, t, status, runErr, res.Outputs)
+}
+
+// logBatchPost is the async sink's delivery callback for one immutable
+// batch. ONE batched request per drain: per-line posts cannot keep up and
+// force the spool to overflow on chatty builds. The callback posts on the
+// ctx it receives from the sink (never the job's parent context), so
+// Finish's cancellation aborts an in-flight HTTP request. HTTP failures are
+// classified by type: 4xx-class responses are permanent and fail the batch
+// immediately, 5xx and transport errors stay retryable. Because the batch
+// identity was assigned once by the sink, every retry carries the identical
+// BatchID and BatchSequence and the server's receipt can dedupe it.
+func (r *Runner) logBatchPost(t server.Task, masker *secrets.Masker) func(context.Context, logBatch) error {
+	return func(ctx context.Context, batch logBatch) error {
+		out := make([]server.LogLine, 0, len(batch.Lines))
+		for _, l := range batch.Lines {
+			out = append(out, server.LogLine{RunnerID: r.ID, LeaseToken: t.LeaseToken, LeaseGeneration: t.LeaseGeneration, JobKey: l.Job, Step: l.Step, Line: masker.Mask(l.Line)})
+		}
+		var body struct {
+			RunnerID        string           `json:"runner_id"`
+			LeaseToken      string           `json:"lease_token"`
+			LeaseGeneration int64            `json:"lease_generation"`
+			BatchID         string           `json:"batch_id"`
+			BatchSequence   int64            `json:"batch_sequence"`
+			Lines           []server.LogLine `json:"lines"`
+		}
+		body.RunnerID = r.ID
+		body.LeaseToken = t.LeaseToken
+		body.LeaseGeneration = t.LeaseGeneration
+		body.BatchSequence = batch.Sequence
+		body.BatchID = batch.ID
+		body.Lines = out
+		err := r.post(ctx, "/api/v1/jobs/"+t.Job.ID+"/log/batch", body, nil)
+		var httpErr *HTTPStatusError
+		if errors.As(err, &httpErr) && permanentHTTPStatus(httpErr.StatusCode) {
+			return PermanentDeliveryError(err)
+		}
+		return err
+	}
 }
 
 // checkShardAssignment verifies the compile-time shard contract: the// control plane compiles tests.shards = N (N > 1) into N jobs whose env
@@ -901,7 +901,10 @@ func (r *Runner) heartbeatLoop(ctx context.Context, cancel context.CancelFunc, t
 // heartbeatTick decides the next lease deadline and whether the job must be
 // cancelled now. When the control plane is unreachable the deadline is not
 // extended, so a job self-cancels before its lease expires and the control
-// plane can safely requeue it.
+// plane can safely requeue it. A confirmed response may only EXTEND the
+// deadline: a stale, zero or regressed LeaseExpiresAt must never shorten it,
+// or the runner would self-cancel a job whose lease the control plane still
+// considers valid, and the requeue would execute it a second time.
 func heartbeatTick(now, deadline time.Time, resp *server.HeartbeatResponse, err error) (time.Time, bool) {
 	if now.Add(2 * time.Second).After(deadline) {
 		return deadline, true
@@ -909,10 +912,13 @@ func heartbeatTick(now, deadline time.Time, resp *server.HeartbeatResponse, err 
 	if err != nil {
 		return deadline, false
 	}
-	if resp.Cancel {
+	if resp != nil && resp.Cancel {
 		return deadline, true
 	}
-	return resp.LeaseExpiresAt, false
+	if resp != nil && resp.LeaseExpiresAt.After(deadline) {
+		return resp.LeaseExpiresAt, false
+	}
+	return deadline, false
 }
 
 func statusForErr(ctx context.Context, err error) model.Status {
@@ -1158,15 +1164,26 @@ func safeDownloadDest(workspace, inPath string) (string, error) {
 	return dest, nil
 }
 
+// uploadArtifact delivers one captured artifact archive with bounded
+// redelivery. The control plane identifies an upload by (job, lease
+// generation, name) and answers a same-digest replay from its existing
+// record, so retrying a dropped response can neither duplicate nor corrupt
+// the artifact.
 func (r *Runner) uploadArtifact(ctx context.Context, t server.Task, name, path string) error {
+	if st, serr := os.Stat(path); serr == nil {
+		r.Metrics.Counter("kiwi_runner_artifact_bytes", float64(st.Size()))
+	}
+	return retryDelivery(ctx, func() error { return r.putArtifact(ctx, t, name, path) })
+}
+
+// putArtifact performs one artifact PUT attempt. The archive is reopened on
+// every attempt because the request body is the file itself.
+func (r *Runner) putArtifact(ctx context.Context, t server.Task, name, path string) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	if st, serr := f.Stat(); serr == nil {
-		r.Metrics.Counter("kiwi_runner_artifact_bytes", float64(st.Size()))
-	}
 	url := r.Cfg.Server + "/api/v1/jobs/" + t.Job.ID + "/artifacts/" + name
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, f)
 	if err != nil {
@@ -1184,17 +1201,77 @@ func (r *Runner) uploadArtifact(ctx context.Context, t server.Task, name, path s
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("artifact upload %s: %s", resp.Status, strings.TrimSpace(string(b)))
+		return fmt.Errorf("artifact upload %s: %w", resp.Status, &HTTPStatusError{StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(b))})
 	}
 	return nil
 }
 
+// complete delivers the terminal result with bounded redelivery. Completion
+// is idempotent on the control plane: the receipt is keyed by (job, lease
+// generation, runner) and the result hash, so a replay of the same result is
+// acknowledged without re-accounting usage. A dropped response (the server
+// committed but the runner never saw the 204) must therefore be retried:
+// without the retry the job stays leased until expiry and is re-queued and
+// re-executed even though it already finished.
 func (r *Runner) complete(ctx context.Context, t server.Task, st model.Status, err error, outputs map[string]string) {
 	msg := ""
 	if err != nil {
 		msg = err.Error()
 	}
-	_ = r.post(ctx, "/api/v1/jobs/"+t.Job.ID+"/complete", server.Complete{RunnerID: r.ID, LeaseToken: t.LeaseToken, LeaseGeneration: t.LeaseGeneration, Status: st, Error: msg, Outputs: outputs}, nil)
+	body := server.Complete{RunnerID: r.ID, LeaseToken: t.LeaseToken, LeaseGeneration: t.LeaseGeneration, Status: st, Error: msg, Outputs: outputs}
+	_ = retryDelivery(ctx, func() error {
+		return r.post(ctx, "/api/v1/jobs/"+t.Job.ID+"/complete", body, nil)
+	})
+}
+
+// deliveryAttempts bounds the redelivery of an idempotent lease-bound
+// request (job completion, artifact upload) whose commit may have succeeded
+// even though its acknowledgement was lost. The request identity is
+// deterministic (completion receipt; artifact name under the lease
+// generation), so a replay is deduplicated server-side.
+const deliveryAttempts = 5
+
+// retryableDeliveryError reports whether an idempotent delivery failure may
+// be retried: transport errors (the commit may have landed even though the
+// response did not) and transient HTTP responses (5xx, 408, 429). Permanent
+// 4xx responses and request-construction failures cannot be fixed by a
+// replay and are returned immediately.
+func retryableDeliveryError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var httpErr *HTTPStatusError
+	if errors.As(err, &httpErr) {
+		return !permanentHTTPStatus(httpErr.StatusCode)
+	}
+	var urlErr *url.Error
+	return errors.As(err, &urlErr)
+}
+
+// retryDelivery runs deliver with bounded exponential backoff + jitter until
+// it succeeds, fails permanently, the attempts are exhausted, or ctx is
+// cancelled. It returns the last delivery error.
+func retryDelivery(ctx context.Context, deliver func() error) error {
+	backoff := 100 * time.Millisecond
+	var err error
+	for attempt := 0; attempt < deliveryAttempts; attempt++ {
+		if attempt > 0 {
+			jitter := time.Duration(time.Now().UnixNano() % int64(backoff/2+1))
+			select {
+			case <-time.After(backoff + jitter):
+			case <-ctx.Done():
+				return err
+			}
+			backoff *= 2
+			if backoff > 2*time.Second {
+				backoff = 2 * time.Second
+			}
+		}
+		if err = deliver(); err == nil || !retryableDeliveryError(err) || ctx.Err() != nil {
+			return err
+		}
+	}
+	return err
 }
 
 // snapshotRequested reports whether the job's snapshot declaration captures
@@ -1283,12 +1360,32 @@ func (r *Runner) post(ctx context.Context, path string, in, out any) error {
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		bb, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("%s: %s", resp.Status, bb)
+		return &HTTPStatusError{StatusCode: resp.StatusCode, Body: string(bb)}
 	}
 	if out != nil {
 		return json.NewDecoder(resp.Body).Decode(out)
 	}
 	return nil
+}
+
+// HTTPStatusError is returned by r.post for a non-2xx control-plane
+// response. The typed status lets callers classify failures (permanent vs
+// retryable, disabled/revoked) instead of parsing the error string.
+type HTTPStatusError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("%d %s: %s", e.StatusCode, http.StatusText(e.StatusCode), e.Body)
+}
+
+// permanentHTTPStatus classifies an HTTP status for delivery: 4xx-class
+// failures are permanent (retrying cannot help) except 408 Request Timeout
+// and 429 Too Many Requests, which are transient. 5xx and everything else
+// stay retryable.
+func permanentHTTPStatus(code int) bool {
+	return code >= 400 && code < 500 && code != http.StatusRequestTimeout && code != http.StatusTooManyRequests
 }
 func unique(in []string) []string {
 	m := map[string]bool{}
@@ -1312,11 +1409,12 @@ func containsString(list []string, v string) bool {
 	return false
 }
 
-// isHTTPStatus reports whether err was produced by r.post or a runner HTTP
-// call failing with the given status (the error strings embed "STATUS
-// TEXT").
+// isHTTPStatus reports whether err was produced by r.post failing with the
+// given status; classification is typed (HTTPStatusError), never string
+// parsing.
 func isHTTPStatus(err error, status int) bool {
-	return err != nil && strings.HasPrefix(err.Error(), fmt.Sprintf("%d ", status))
+	var httpErr *HTTPStatusError
+	return errors.As(err, &httpErr) && httpErr.StatusCode == status
 }
 func (r *Runner) auth(req *http.Request) {
 	if r.Cfg.Token != "" {

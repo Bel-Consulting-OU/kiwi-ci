@@ -81,8 +81,88 @@ redeploying the old binary plus its data directory files.
   large fleets.
 - Lease and completion semantics (generation-bound receipts, HMAC-only
   tokens) are stable across restarts within protocol v3.
-- Deployment and snapshot records are memory-backed; treat them as
-  ephemeral across upgrades until their persistence lands.
+- Deployment records now persist durably: PostgreSQL through
+  `DeploymentStore`, fs mode through the data-dir state snapshot
+  (alongside `SnapshotStore` records, which were already persisted).
+  Existing deployments are NOT backfilled: a snapshot written by an
+  older version contains no deployment records, so deployments created
+  before the upgrade are absent from listings after it. There is no
+  migration for them; treat pre-upgrade deployment history as lost.
+- fs-mode mutations are fail-closed when the snapshot write fails: the
+  mutation is refused instead of acknowledged, the in-memory state
+  rolls back to its pre-mutation value, and `/readiness` answers 503
+  (`X-Kiwi-State: degraded`) until a later persist succeeds. The write
+  paths whose state rides the snapshot are:
+  - `POST /api/v1/runs` (503; enqueue persist failures used to map to
+    400 and never acknowledge a run body) and the webhook enqueues
+    `POST /hooks/github`, `/hooks/gitlab`, `/hooks/forgejo` (503).
+  - `POST /api/v1/runners/{id}/next` (503 fixed body, the lease token
+    is withheld, and the in-memory claim is reclaimed by the documented
+    recovery contract).
+  - `POST /api/v1/jobs/{id}/heartbeat` (503, see below).
+  - `POST /api/v1/jobs/{id}/complete` including receipt replays,
+    `.../approve`, `.../cancel` (503, no state change).
+  - `POST /api/v1/jobs/{id}/snapshots`,
+    `PUT /api/v1/jobs/{id}/artifacts/{name}`, sidecar attachment,
+    `POST /api/v1/jobs/{id}/deployments`, runner
+    `drain`/`disable`/`enable`, and generated fragments
+    (`POST /api/v1/jobs/{id}/generated`) (503, with the record or
+    artifact rolled back).
+  - Runner-profile writes and cert-profile binds (`POST`/`PUT
+    /api/v1/runner-profiles`, `PUT /api/v1/runner-profiles/{id}/cert/{serial}`),
+    test reports (`POST /api/v1/jobs/{id}/tests`) and schedule creation
+    (`PUT /api/v1/schedules`) answer 500 or 503 after rolling back the
+    partial record.
+  - Maintenance lease recovery has no HTTP surface but runs the same
+    rollback and degrades readiness.
+  A 503 from these paths means the mutation did NOT partially apply;
+  it also means it was not queued. The client must resubmit it once the
+  instance (or the data directory) is writable again.
+- Heartbeat is fail-closed: a heartbeat that cannot be persisted
+  answers 503 and does not extend the stored lease expiry. The runner
+  only moves its local deadline forward from confirmed responses, so a
+  control plane that stays degraded until the acknowledged deadline
+  makes the runner self-cancel instead of running on an extension the
+  control plane never recorded.
+- The forge outbox carries a versioned delivery identity. Each logical
+  check is keyed by `(run, check)`; publications are ranked
+  `queued=1 < running=2 < completed=3`; a newer version supersedes an
+  older pending delivery; and the delivered-version watermark advances
+  in the same statement as the ACK. A dispatcher guard refuses to
+  publish a version at or below the delivered watermark, so a stale
+  replay after a restart can never regress the remote check.
+  `completion_reconcile` (internal effects) and `forge_delivery` are
+  separate intents: internal reconciliation is retried until it
+  converges and is never dead-lettered, while forge delivery follows
+  the bounded retry/dead-letter policy. Operators inspect and recover
+  dead letters with:
+  ```bash
+  kiwi outbox dead-letters list [--database-url "$DATABASE_URL"]
+  kiwi outbox dead-letters requeue <id> [--database-url "$DATABASE_URL"]
+  kiwi outbox dead-letters delete <id> [--database-url "$DATABASE_URL"]
+  ```
+- Enqueue is fail-closed for custom stores: server enqueue requires
+  the `storage.RunEnqueueStore` atomic contract
+  (`InsertCompiledRun`). A store that does not implement it (for
+  example an embedder's `storage.Store` wrapper) is refused with 503
+  instead of falling back to a non-atomic scheduler enqueue plus a
+  best-effort delivery upsert. The built-in memory, fs, and PostgreSQL
+  stores implement the contract; no action is needed unless you
+  wrapped the store.
+- The native macOS/Windows workflows are Woodpecker local-backend
+  jobs: they select dedicated agents by label
+  (`platform=darwin/arm64` + `backend=local`,
+  `platform=windows/amd64` + `backend=local`), run in `bash`/`pwsh`
+  directly on the worker host, and are restricted to trusted events
+  (`push`, `manual`, `tag`; never fork pull requests). Provision the
+  workers as one-shot ephemeral hosts running the agent as a dedicated
+  low-privilege user with no persistent credentials and Go 1.27.x on
+  `PATH` (`GOTOOLCHAIN=local` prevents Go from downloading a toolchain
+  and masking a stale worker). The required Docker lane builds its
+  digest-pinned test image locally from `.woodpecker/ci/Dockerfile`
+  (Go + git + Docker CLI + certs + make/gcc) instead of pulling one
+  from a registry; see
+  [production-deployment.md](production-deployment.md#native-and-local-ci-agents).
 - fs-mode `/readiness` is now durability-aware: when a data-dir snapshot
   write fails, it answers 503 with `X-Kiwi-State: degraded` and a fixed body
   (the raw error is only logged), new leases are refused until a later

@@ -463,6 +463,7 @@ func (s *Server) attachSidecarToArtifact(ctx context.Context, j model.Job, base,
 	}
 	s.mu.Lock()
 	if cur, ok := s.artifacts[rec.ID]; ok {
+		prev := cur
 		if kind == storage.ArtifactSidecarKindSBOM {
 			cur.SBOMPath = path
 			cur.SBOMSHA256 = sum
@@ -471,7 +472,14 @@ func (s *Server) attachSidecarToArtifact(ctx context.Context, j model.Job, base,
 			cur.SigstoreSHA256 = sum
 		}
 		s.artifacts[rec.ID] = cur
-		s.persistCheckedLocked("artifact.sidecar")
+		if perr := s.persistCheckedErrLocked("artifact.sidecar"); perr != nil {
+			// Durability first: an attachment the snapshot does not contain
+			// must not survive in memory, or the next unrelated persist
+			// commits a sidecar the uploader was told failed.
+			s.artifacts[rec.ID] = prev
+			s.mu.Unlock()
+			return perr
+		}
 	}
 	s.mu.Unlock()
 	return nil

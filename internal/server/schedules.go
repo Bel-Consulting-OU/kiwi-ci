@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -576,13 +577,24 @@ func (s *Server) upsertSchedule(w http.ResponseWriter, r *http.Request) {
 		sc.Spec = in.Spec
 		sc.Enabled = enabled
 		sc.CreatedBy = actorFrom(r)
+		prev, had := s.schedules[sc.ID]
 		s.schedules[sc.ID] = sc
 		persistErr := s.persistSchedulesLocked()
-		s.mu.Unlock()
 		if persistErr != nil {
+			// The schedule never became durable: restore the previous row
+			// (or remove the fresh entry) before answering 5xx, so the next
+			// successful schedules write cannot commit a schedule the client
+			// was told failed.
+			if had {
+				s.schedules[sc.ID] = prev
+			} else {
+				delete(s.schedules, sc.ID)
+			}
+			s.mu.Unlock()
 			http.Error(w, persistErr.Error(), 500)
 			return
 		}
+		s.mu.Unlock()
 	}
 	s.auditLocked(action, actor, "", "", action, map[string]string{"schedule": sc.ID, "repository": sc.Repository})
 	writeJSON(w, http.StatusOK, sc)
@@ -667,6 +679,12 @@ func (s *Server) fireDueSchedules(ctx context.Context, now time.Time) {
 			s.logError("schedule discovery refresh failed; skipping this tick", "error", err.Error())
 			return
 		}
+	} else {
+		// fs/memory mode: tie the run snapshot (state.json) and the
+		// schedules journal (schedules.json) together BEFORE evaluating due
+		// occurrences, so a committed run whose occurrence claim never
+		// reached the journal is adopted at its nominal and never refired.
+		s.reconcileScheduleOccurrences()
 	}
 	// Collect the due occurrences first (without advancing) so a failing
 	// schedule cannot spin the tick loop or starve other schedules.
@@ -916,6 +934,20 @@ func (s *Server) fireSchedule(ctx context.Context, sc storage.Schedule, nominal 
 			map[string]string{"schedule": sc.ID, "creator": sc.CreatedBy, "repository": scheduleRepoID(sc)})
 		return model.Run{}, false, errScheduleUnauthorized
 	}
+	// Exactly-once across the two fs durable stores: the run snapshot
+	// (state.json) commits BEFORE the schedules journal (schedules.json).
+	// The run carries schedule_id + schedule_nominal, so its metadata IS the
+	// durable pending-occurrence marker for that nominal. Before enqueueing,
+	// adopt a claim recorded in memory or reconstruct it from a committed
+	// run: the nominal is already fired, so report fired=false instead of
+	// creating a second run.
+	if s.DB == nil {
+		if runID, claimed := s.adoptCommittedScheduleOccurrence(sc.ID, nominal); claimed {
+			s.auditLocked("schedule.occurrence_adopted", "scheduler", runID, "", "occurrence claim adopted from the committed run",
+				map[string]string{"schedule": sc.ID, "nominal": nominal.UTC().Format(time.RFC3339)})
+			return model.Run{}, false, nil
+		}
+	}
 	preID, err := newID()
 	if err != nil {
 		return model.Run{}, false, err
@@ -981,4 +1013,133 @@ func (s *Server) claimScheduleOccurrenceLocked(scheduleID string, nominal time.T
 	}
 	occ[key] = runID
 	return true
+}
+
+// adoptCommittedScheduleOccurrence reports whether the (schedule, nominal)
+// pair is already fired and, when the claim is not already in memory,
+// reconstructs it from the committed run whose metadata carries
+// schedule_id + schedule_nominal (the durable pending-occurrence marker that
+// rides the run snapshot). The adopted claim is persisted through the
+// schedules journal when possible; a failed write leaves the in-memory claim
+// in place, so this process still cannot refire the nominal and the next
+// tick (or restart) re-runs the same adoption. The caller holds no lock.
+func (s *Server) adoptCommittedScheduleOccurrence(scheduleID string, nominal time.Time) (string, bool) {
+	nominal = nominal.UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	runID, claimed := s.scheduleOccurrenceRunLocked(scheduleID, nominal)
+	if !claimed {
+		return "", false
+	}
+	if err := s.persistSchedulesLocked(); err != nil {
+		// Best effort: the claim is already authoritative in memory (and
+		// recoverable from the committed run on restart), so a failed
+		// journal write must not turn the adoption into a second run.
+		s.logError("schedule occurrence claim persist failed", "schedule", scheduleID, "error", err.Error())
+	}
+	return runID, true
+}
+
+// scheduleOccurrenceRunLocked resolves the run that already fired a nominal:
+// the in-memory claim first, then a committed run carrying the
+// schedule_id + schedule_nominal metadata (adopted into the claim map). The
+// caller holds s.mu. claimed=true means the nominal must not fire again,
+// even when the claimed run is no longer present (the orphan reconcile
+// records that; firing a second run could duplicate an execution).
+func (s *Server) scheduleOccurrenceRunLocked(scheduleID string, nominal time.Time) (string, bool) {
+	key := nominal.UTC().Unix()
+	if occ := s.occurrences[scheduleID]; occ != nil {
+		if runID, ok := occ[key]; ok {
+			return runID, true
+		}
+	}
+	want := nominal.UTC().Format(time.RFC3339)
+	for id, run := range s.runs {
+		if run.Metadata["schedule_id"] != scheduleID || run.Metadata["schedule_nominal"] != want {
+			continue
+		}
+		occ := s.occurrences[scheduleID]
+		if occ == nil {
+			occ = map[int64]string{}
+			s.occurrences[scheduleID] = occ
+		}
+		occ[key] = id
+		return id, true
+	}
+	return "", false
+}
+
+// reconcileScheduleOccurrences ties the two fs-mode durable stores together
+// before due evaluation:
+//
+//  1. Adopt: a committed run carrying schedule_id + schedule_nominal is the
+//     durable pending-occurrence marker for a nominal whose claim never
+//     reached the schedules journal (a crash or failed journal write in the
+//     window between the two writes). The claim and LastRun are restored
+//     from it, so a committed run with an unclaimed nominal is adopted and
+//     never refired.
+//  2. Record: a claim whose run is not present would otherwise silently
+//     consume the occurrence. It is audited and logged once per claim; the
+//     claim is deliberately kept (never refire a nominal that may have
+//     produced a run).
+func (s *Server) reconcileScheduleOccurrences() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	adopted := false
+	for id, run := range s.runs {
+		scheduleID := strings.TrimSpace(run.Metadata["schedule_id"])
+		nominalText := strings.TrimSpace(run.Metadata["schedule_nominal"])
+		if scheduleID == "" || nominalText == "" {
+			continue
+		}
+		sc, ok := s.schedules[scheduleID]
+		if !ok {
+			continue
+		}
+		nominal, err := time.Parse(time.RFC3339, nominalText)
+		if err != nil {
+			continue
+		}
+		nominal = nominal.UTC()
+		if occ := s.occurrences[scheduleID]; occ != nil {
+			if _, claimed := occ[nominal.Unix()]; claimed {
+				continue
+			}
+		}
+		if s.occurrences[scheduleID] == nil {
+			s.occurrences[scheduleID] = map[int64]string{}
+		}
+		s.occurrences[scheduleID][nominal.Unix()] = id
+		if sc.LastRun == nil || sc.LastRun.Before(nominal) {
+			sc.LastRun = &nominal
+			s.schedules[scheduleID] = sc
+		}
+		adopted = true
+	}
+	if adopted {
+		if err := s.persistSchedulesLocked(); err != nil {
+			// The in-memory adoption still prevents a refire this process;
+			// the next tick re-runs the adoption.
+			s.logError("schedule occurrence reconcile persist failed", "error", err.Error())
+		}
+	}
+	for scheduleID, occ := range s.occurrences {
+		for unix, runID := range occ {
+			if _, ok := s.runs[runID]; ok {
+				continue
+			}
+			key := scheduleID + "\x00" + strconv.FormatInt(unix, 10) + "\x00" + runID
+			if s.orphanOccurrences[key] {
+				continue
+			}
+			if s.orphanOccurrences == nil {
+				s.orphanOccurrences = map[string]bool{}
+			}
+			s.orphanOccurrences[key] = true
+			nominal := time.Unix(unix, 0).UTC().Format(time.RFC3339)
+			s.auditLocked("schedule.occurrence_orphaned", "scheduler", "", "", "claimed occurrence has no committed run",
+				map[string]string{"schedule": scheduleID, "nominal": nominal, "run": runID})
+			s.logError("schedule: claimed occurrence has no committed run", "schedule", scheduleID, "nominal", nominal, "run", runID)
+		}
+	}
 }

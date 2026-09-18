@@ -380,9 +380,12 @@ type Server struct {
 	historyDBVersion int64
 
 	// schedules/occurrences are the memory-mode schedule store; DB mode
-	// uses storage.ScheduleStore (schedules.go).
-	schedules   map[string]storage.Schedule
-	occurrences map[string]map[int64]string
+	// uses storage.ScheduleStore (schedules.go). orphanOccurrences remembers
+	// which claimed occurrences were already reported as having no committed
+	// run, so the fs reconcile audits each one once instead of every tick.
+	schedules         map[string]storage.Schedule
+	occurrences       map[string]map[int64]string
+	orphanOccurrences map[string]bool
 
 	// opaPolicy is the compiled OPA deny gate (nil when no rules are
 	// configured); opaBroken is set when a configured gate failed to
@@ -426,25 +429,26 @@ func New(token string) *Server {
 		UntrustedMemoryCeiling: 4 << 30,
 		UntrustedPIDCeiling:    256,
 		runs:                   map[string]model.Run{}, jobs: map[string]model.Job{}, runners: map[string]model.Runner{}, artifacts: map[string]model.ArtifactRecord{}, reports: map[string]model.TestReport{}, deliveries: map[string]string{}, completions: map[string]model.CompletionReceipt{}, completionReceiptAt: map[string]time.Time{}, generatedFragments: map[string]storage.GeneratedFragmentReceipt{}, leaseKey: key, oidc: newOIDCSigner(),
-		outbox:          NewOutbox(nil),
-		AuthStore:       auth.NewTokenStore(),
-		deployments:     map[string]model.Deployment{},
-		snapshots:       map[string]model.SnapshotRecord{},
-		contracts:       map[string]map[string]storage.ArtifactContract{},
-		pendingSidecars: map[string]string{},
-		jobLocks:        map[string]*sync.Mutex{},
-		checkRunFence:   cas.NewMemFencer(),
-		crl:             map[string]string{},
-		EnrollGrants:    map[string]EnrollGrant{},
-		history:         newTestintelHistory(""),
-		schedules:       map[string]storage.Schedule{},
-		occurrences:     map[string]map[int64]string{},
-		downstreamLinks: map[string]storage.DownstreamLink{},
-		profiles:        map[string]model.RunnerProfile{},
-		certProfiles:    map[string]string{},
-		runnerTokens:    map[string]string{},
-		Logger:          logging.NewStructured(os.Stderr),
-		Metrics:         NewMetrics(),
+		outbox:            NewOutbox(nil),
+		AuthStore:         auth.NewTokenStore(),
+		deployments:       map[string]model.Deployment{},
+		snapshots:         map[string]model.SnapshotRecord{},
+		contracts:         map[string]map[string]storage.ArtifactContract{},
+		pendingSidecars:   map[string]string{},
+		jobLocks:          map[string]*sync.Mutex{},
+		checkRunFence:     cas.NewMemFencer(),
+		crl:               map[string]string{},
+		EnrollGrants:      map[string]EnrollGrant{},
+		history:           newTestintelHistory(""),
+		schedules:         map[string]storage.Schedule{},
+		occurrences:       map[string]map[int64]string{},
+		orphanOccurrences: map[string]bool{},
+		downstreamLinks:   map[string]storage.DownstreamLink{},
+		profiles:          map[string]model.RunnerProfile{},
+		certProfiles:      map[string]string{},
+		runnerTokens:      map[string]string{},
+		Logger:            logging.NewStructured(os.Stderr),
+		Metrics:           NewMetrics(),
 	}
 }
 
@@ -601,6 +605,13 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 	if s.certProfiles == nil {
 		s.certProfiles = map[string]string{}
 	}
+	// Deployment records ride the snapshot so an acknowledged environment
+	// lifecycle survives a restart (docs/environments.md:67). Older
+	// snapshots have no deployments field and load as an empty map.
+	s.deployments = snap.Deployments
+	if s.deployments == nil {
+		s.deployments = map[string]model.Deployment{}
+	}
 	// Snapshot records are only restored when their archive and manifest
 	// sidecar still exist and match the recorded digests; broken records are
 	// dropped (and logged) instead of resurfacing as undownloadable entries.
@@ -613,6 +624,11 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 	s.mu.Lock()
 	s.restoreCompletionReceiptsLocked(snap.CompletionReceipts)
 	s.mu.Unlock()
+	// The trailing-24h cost/energy budget window is rebuilt from the restored
+	// jobs: only live completions append to s.usage, so without this an fs
+	// restart would reset every daily quota to zero even though the recorded
+	// usage (UsageRecorded) is durable on the jobs.
+	s.rebuildUsageWindow(snap.Jobs)
 	// DB-mode artifact transport: payload bytes move through the shared
 	// CAS blob store (default: filesystem under dataDir/cas) so downloads
 	// resolve on any replica. The app agent overrides the backend via
@@ -667,12 +683,13 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 		s.runners[id] = r
 	}
 	s.mu.Lock()
-	s.recoverLeasesLocked(now, true)
+	expirations, lostRunners, timedOut := s.recoverLeasesLocked(now, true)
 	err = s.persistLocked()
 	s.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
+	s.recordRecoveryMetrics(expirations, lostRunners, timedOut)
 	if err := s.ConfigureOPA(); err != nil {
 		return nil, err
 	}
@@ -687,6 +704,14 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 // leadership claim to another live instance is not an error — the server
 // starts as a standby (leader=false) and Maintain polls for promotion.
 func (s *Server) SwitchToDB(db storage.Store) error {
+	if _, ok := db.(storage.RunEnqueueStore); !ok {
+		// Startup-time fail-closed: every DB-mode submission goes through
+		// the atomic compiled-run enqueue (run + jobs + deps + contracts +
+		// webhook/quota/schedule claims in ONE transaction). A store without
+		// the contract cannot serve submissions safely, so the control plane
+		// refuses to start instead of discovering it on the first webhook.
+		return fmt.Errorf("server: switch to db: store lacks the atomic compiled-run enqueue contract")
+	}
 	// Tokens are HMACed with the server lease key before persistence so the
 	// durable row validates under validActiveLease on every instance that
 	// shares the key (persisted via data-dir in production).
@@ -1064,6 +1089,14 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": budget.Error(), "reason": budget.Reason})
 			return
 		}
+		// A failed snapshot write is a server-side durability failure, not a
+		// client error: answer 503 so the caller retries instead of treating
+		// the submission as invalid.
+		var nd *stateNotDurableError
+		if errors.As(err, &nd) {
+			http.Error(w, nd.Error(), http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -1306,6 +1339,13 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 			}
 		}
 	}
+	// Capture every map this enqueue can mutate BEFORE the first mutation:
+	// the supersession cancels below, the run/jobs/contracts insertion, the
+	// occurrence claim, the downstream link and scheduleStateLocked's derived
+	// job/run rewrites. A failed snapshot write restores the whole
+	// pre-enqueue state, so no ghost run a later successful persist could
+	// durably commit and no duplicate a client retry could create.
+	rb := s.captureStateRollbackLocked()
 	if group != "" && spec.Concurrency.CancelInProgress {
 		// Supersession keys on the SCHEDULING identity of the checkout
 		// repository (storage.RepoIDForRun: stored RepoID with the legacy
@@ -1318,7 +1358,12 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 		newRepoID := storage.RepoIDForRun(run)
 		for id, old := range s.runs {
 			if old.ID != runID && old.ConcurrencyGroup == group && !old.Status.Terminal() && newRepoID != "" && storage.RepoIDForRun(old) == newRepoID {
-				s.cancelRunLocked(id, "superseded by run "+runID, "scheduler")
+				reason := "superseded by run " + runID
+				s.cancelRunLocked(id, reason)
+				// The scheduler path keeps the historical best-effort audit:
+				// the supersession transition is not an admin mutation, and
+				// the enclosing enqueue's own audit row covers the change.
+				s.auditLocked("run.cancelled", "scheduler", id, "", reason, nil)
 			}
 		}
 	}
@@ -1346,13 +1391,30 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 	s.auditLocked("run.queued", "scheduler", runID, "", "run queued", map[string]string{"event": in.Event})
 	s.scheduleStateLocked()
 	if err := s.persistCheckedErrLocked("run.enqueue"); err != nil {
+		// The enqueue never became durable: restore the exact pre-enqueue
+		// state (superseded runs revived, ghost run/jobs/contracts removed,
+		// occurrence claim and downstream link reverted) before returning the
+		// error. The webhook deliveries map is untouched on this path, so a
+		// retry cannot be mistaken for a replay of the ghost run. The typed
+		// error lets submit and the webhook answer 503 instead of 400.
+		s.rollbackStateLocked(rb)
 		s.mu.Unlock()
-		return model.Run{}, err
+		return model.Run{}, notDurable(err)
 	}
 	if in.ScheduleClaim != nil {
 		if err := s.persistSchedulesLocked(); err != nil {
+			// The run snapshot committed BEFORE this schedules-journal write,
+			// so the run is durable and its schedule_id/schedule_nominal
+			// metadata is the durable pending-occurrence marker for the
+			// nominal. The in-memory claim is kept and reconciled from that
+			// marker on the next tick / restart (adoptCommittedScheduleOccurrence,
+			// reconcileScheduleOccurrences), so the occurrence is never
+			// refired; the error is still returned because the claim itself
+			// was not journaled. Rolling the committed run back is not an
+			// option: it is already durable and would require a second
+			// state.json write that can itself fail.
 			s.mu.Unlock()
-			return model.Run{}, err
+			return model.Run{}, notDurable(err)
 		}
 	}
 	run = s.runs[runID]
@@ -1444,24 +1506,13 @@ func (s *Server) enqueueDB(in SubmitRun, run model.Run, created map[string]model
 	}
 	rs, ok := s.DB.(storage.RunEnqueueStore)
 	if !ok {
-		// Fallback for stores predating the atomic enqueue on the DB handle:
-		// the scheduler's own store still performs the whole enqueue through
-		// its ONE transaction (including the in-transaction supersession),
-		// followed by a best-effort delivery upsert. A scheduler without the
-		// atomic contract fails closed instead of writing partial rows.
-		if err := s.Sched.Enqueue(ctx, run, created, deps, cancelInProgress && group != ""); err != nil {
-			return model.Run{}, err
-		}
-		if req.WebhookClaim != nil {
-			if err := s.DB.UpsertDelivery(ctx, req.WebhookClaim.Forge, req.WebhookClaim.DeliveryID, run.ID, ""); err != nil {
-				s.logError("delivery upsert failed", "error", err.Error())
-			}
-		}
-		s.auditLocked("run.queued", "scheduler", run.ID, "", "run queued", map[string]string{"event": in.Event})
-		if err := s.publishForgeStatus(ctx, run); err != nil {
-			s.logError("forge status enqueue failed", "run", run.ID, "error", err.Error())
-		}
-		return run, nil
+		// Fail closed: without the atomic compiled-run enqueue the run/jobs
+		// and the webhook-delivery claim cannot be committed in one
+		// transaction, which reintroduces the atomic webhook-claim race for
+		// custom stores (a delivery could be claimed TWICE, or a run could
+		// exist without its jobs). Every shipped store implements the
+		// contract; this is an unsupported-store guard, not a mode.
+		return model.Run{}, fmt.Errorf("storage: attached store lacks the atomic compiled-run enqueue contract; refusing a non-atomic enqueue")
 	}
 	err := rs.InsertCompiledRun(ctx, req)
 	switch {
@@ -2087,12 +2138,16 @@ func (s *Server) runnerDrain(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
+		// Audit-first: a drain that cannot leave evidence is refused.
+		if aerr := s.auditFirstLocked("runner.drain", actorFrom(r), "", "", "runner draining", map[string]string{"runner": id}); aerr != nil {
+			http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		ri.Draining = true
 		if err := s.DB.UpsertRunner(r.Context(), ri); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		s.auditLocked("runner.drain", actorFrom(r), "", "", "runner draining", map[string]string{"runner": id})
 		writeJSON(w, http.StatusOK, ri)
 		return
 	}
@@ -2103,13 +2158,20 @@ func (s *Server) runnerDrain(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if aerr := s.auditFirstLocked("runner.drain", actorFrom(r), "", "", "runner draining", map[string]string{"runner": id}); aerr != nil {
+		http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	prev := ri
 	ri.Draining = true
 	s.runners[id] = ri
-	s.auditLocked("runner.drain", actorFrom(r), "", "", "runner draining", map[string]string{"runner": id})
-	// A failed snapshot write leaves the in-memory drain flag in force; the
-	// next successful persist makes it durable, and /readiness 503 is the
-	// compensating control meanwhile.
-	s.persistCheckedLocked("runner.drain")
+	if perr := s.persistCheckedErrLocked("runner.drain"); perr != nil {
+		// The drain never became durable: restore the runner exactly and
+		// answer 503 instead of ACKing a flag the snapshot does not contain.
+		s.runners[id] = prev
+		http.Error(w, "runner drain not durable", http.StatusServiceUnavailable)
+		return
+	}
 	writeJSON(w, http.StatusOK, ri)
 }
 
@@ -2146,6 +2208,14 @@ func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
+		// Audit-first: the disable's evidence lands before the runner row is
+		// updated. The DB audit table is a separate transaction (the store
+		// API cannot join it), so a row may exist for a disable the store
+		// update then rejected.
+		if aerr := s.auditFirstLocked("runner.disable", actor, "", "", "runner disabled", map[string]string{"runner": id}); aerr != nil {
+			http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		ri.Disabled = true
 		if ri.CertSerial != "" && ri.RevokedAt == nil {
 			now := time.Now().UTC()
@@ -2165,7 +2235,6 @@ func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
 		}
 		s.metricAdd("kiwi_runner_killswitch_jobs_total", float64(revoked), nil)
 		s.revokeRunnerCert(ri, actor)
-		s.auditLocked("runner.disable", actor, "", "", "runner disabled", map[string]string{"runner": id})
 		writeJSON(w, http.StatusOK, ri)
 		return
 	}
@@ -2176,6 +2245,14 @@ func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// Audit-first: an unwritable audit row blocks the whole kill switch
+	// (flag plus lease cancellations) with 503.
+	if aerr := s.auditFirstLocked("runner.disable", actor, "", "", "runner disabled", map[string]string{"runner": id}); aerr != nil {
+		s.mu.Unlock()
+		http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	rb := s.captureStateRollbackLocked()
 	ri.Disabled = true
 	if ri.CertSerial != "" && ri.RevokedAt == nil {
 		now := time.Now().UTC()
@@ -2201,12 +2278,16 @@ func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
 	for runID := range s.runs {
 		s.refreshRunLocked(runID)
 	}
-	s.auditLocked("runner.disable", actor, "", "", "runner disabled", map[string]string{"runner": id})
-	// The kill switch is already in force in memory (flag plus cancelled
-	// leases); a failed snapshot write is compensated by /readiness 503,
-	// which blocks every new lease until the next successful persist makes
-	// the flag and cancellations durable.
-	s.persistCheckedLocked("runner.disable")
+	if perr := s.persistCheckedErrLocked("runner.disable"); perr != nil {
+		// The kill switch never became durable: revive every cancelled job,
+		// restore the runner (flag, revocation marker, slots) and the
+		// re-aggregated runs, and answer 503. The certificate revocation
+		// below runs only after the durable write.
+		s.rollbackStateLocked(rb)
+		s.mu.Unlock()
+		http.Error(w, "runner disable not durable", http.StatusServiceUnavailable)
+		return
+	}
 	s.mu.Unlock()
 	s.revokeRunnerCert(ri, actor)
 	writeJSON(w, http.StatusOK, ri)
@@ -2229,13 +2310,16 @@ func (s *Server) runnerEnable(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
+		if aerr := s.auditFirstLocked("runner.enable", actorFrom(r), "", "", "runner enabled", map[string]string{"runner": id}); aerr != nil {
+			http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		ri.Disabled = false
 		ri.Draining = false
 		if err := s.DB.UpsertRunner(r.Context(), ri); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		s.auditLocked("runner.enable", actorFrom(r), "", "", "runner enabled", map[string]string{"runner": id})
 		writeJSON(w, http.StatusOK, ri)
 		return
 	}
@@ -2246,14 +2330,21 @@ func (s *Server) runnerEnable(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if aerr := s.auditFirstLocked("runner.enable", actorFrom(r), "", "", "runner enabled", map[string]string{"runner": id}); aerr != nil {
+		http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	prev := ri
 	ri.Disabled = false
 	ri.Draining = false
 	s.runners[id] = ri
-	s.auditLocked("runner.enable", actorFrom(r), "", "", "runner enabled", map[string]string{"runner": id})
-	// A failed snapshot write leaves the in-memory enable in force for this
-	// process; /readiness 503 is the compensating control until the next
-	// successful persist makes it durable.
-	s.persistCheckedLocked("runner.enable")
+	if perr := s.persistCheckedErrLocked("runner.enable"); perr != nil {
+		// The enable never became durable: restore the flags and answer 503
+		// instead of ACKing service a restart would revoke.
+		s.runners[id] = prev
+		http.Error(w, "runner enable not durable", http.StatusServiceUnavailable)
+		return
+	}
 	writeJSON(w, http.StatusOK, ri)
 }
 
@@ -2294,7 +2385,8 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.recoverLeasesLocked(now, false)
+	expirations, lostRunners, timedOut := s.recoverLeasesLocked(now, false)
+	s.recordRecoveryMetrics(expirations, lostRunners, timedOut)
 	s.scheduleStateLocked()
 	ri, ok := s.runners[id]
 	if !ok {
@@ -2617,6 +2709,14 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "stale or invalid lease", http.StatusConflict)
 		return
 	}
+	// Capture every field this handler touches BEFORE mutating: the job's
+	// lease expiry and the runner's LastSeen. A failed snapshot write must
+	// leave both exactly as they were, or the extended deadline would exist
+	// only in memory while the runner adopts it from the 200 response — a
+	// crash then re-issues the lease the disk still shows as expired, opening
+	// a duplicate-execution window.
+	prevJob := cur
+	prevRunner, hadRunner := s.runners[in.RunnerID]
 	exp := now.Add(s.leaseDuration())
 	cur.LeaseExpiresAt = &exp
 	s.jobs[jobID] = cur
@@ -2624,10 +2724,19 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		ri.LastSeen = now
 		s.runners[in.RunnerID] = ri
 	}
-	// A failed snapshot write keeps the extended expiry in memory only for
-	// this process; /readiness 503 plus the lease-expiry recovery contract
-	// is the compensating control.
-	s.persistCheckedLocked("job.heartbeat")
+	if perr := s.persistCheckedErrLocked("job.heartbeat"); perr != nil {
+		// Roll the extension back and refuse the heartbeat with a fixed body:
+		// the runner keeps its OLD deadline and retries, so the only durable
+		// expiry is one the snapshot actually recorded.
+		s.jobs[jobID] = prevJob
+		if hadRunner {
+			s.runners[in.RunnerID] = prevRunner
+		} else {
+			delete(s.runners, in.RunnerID)
+		}
+		http.Error(w, "heartbeat not durable", http.StatusServiceUnavailable)
+		return
+	}
 	writeJSON(w, http.StatusOK, HeartbeatResponse{LeaseExpiresAt: exp})
 }
 
@@ -2760,18 +2869,29 @@ func (s *Server) logBatch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "stale or invalid lease", http.StatusConflict)
 		return
 	}
+	// CreatedAt and Seq are per-delivery metadata that storage.
+	// LogBatchPayloadDigest deliberately excludes, so a retried delivery may
+	// mint a fresh arrival time and re-allocate Seq values: Repository.
+	// AppendLogBatch recognizes the identical ordered lines under the same
+	// (job, generation, batch_id) identity as an idempotent duplicate (204)
+	// instead of a payload conflict. No first-delivery state has to be
+	// remembered for that, so the retry also works across a restart.
 	entries := make([]model.LogEntry, 0, len(in.Lines))
 	for _, l := range in.Lines {
 		s.logSeq++
-		entries = append(entries, model.LogEntry{Seq: s.logSeq, RunID: cur.RunID, JobID: cur.ID, JobKey: cur.Key, Step: l.Step, Line: l.Line, CreatedAt: time.Now().UTC()})
+		entries = append(entries, model.LogEntry{Seq: s.logSeq, RunID: cur.RunID, JobID: cur.ID, JobKey: cur.Key, Step: l.Step, Line: l.Line, CreatedAt: now})
 	}
 	s.mu.Unlock()
 	if s.store != nil {
-		for _, e := range entries {
-			if err := s.store.AppendLog(e); err != nil {
-				http.Error(w, err.Error(), 500)
-				return
-			}
+		err := s.store.AppendLogBatch(storage.LogBatchIdentity{JobID: cur.ID, Generation: in.LeaseGeneration, BatchID: in.BatchID}, entries)
+		if err != nil {
+			// Every append failure answers exactly like the DB-mode batch
+			// path: a fixed 500 body, including storage.ErrLogBatchConflict
+			// (a reused identity with different lines). Nothing partial is
+			// exposed: the fs store publishes the batch atomically, so the
+			// retry of a failed write starts from the same clean state.
+			http.Error(w, "log batch append failed", 500)
+			return
 		}
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -3117,6 +3237,14 @@ func (s *Server) completeDB(w http.ResponseWriter, r *http.Request, jobID string
 			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
 			return
 		}
+		// A completion whose result hash disagrees with the durable receipt
+		// for the same (job, generation, runner) lost a race against a
+		// different result: fail closed with 409 instead of acking the
+		// conflicting completion as an idempotent replay.
+		if errors.Is(err, storage.ErrCompletionConflict) {
+			http.Error(w, "completion result conflicts with stored receipt", http.StatusConflict)
+			return
+		}
 		if rec, has, herr := s.DB.HasCompletionReceipt(ctx, jobID, in.LeaseGeneration, in.RunnerID); herr == nil && has && rec.ResultHash == hash {
 			// Idempotent replay: re-apply post-completion effects that may
 			// have failed after the durable completion committed.
@@ -3329,6 +3457,94 @@ func (s *Server) rollbackCompletionLocked(rb completionRollback) {
 	}
 }
 
+// stateRollback captures the in-memory maps an authoritative fs-mode mutation
+// can touch, so a failed snapshot write restores the exact pre-mutation state
+// instead of leaving a change behind that a later successful persist could
+// durably commit or that a client retry could duplicate. It is the general
+// form of completionRollback's whole-map technique: the captured maps hold
+// struct values, and every helper on these paths replaces values/slices
+// (never mutates a stored slice in place), so shallow copies are exact except
+// for the two nested containers, which are copied explicitly (runner
+// ActiveJobs slices and the per-schedule occurrence maps).
+//
+// The capture must run under s.mu and BEFORE the first mutation; the entire
+// capture -> mutate -> persist -> rollback sequence runs in the same critical
+// section, so a rollback can never revert a concurrent request's work.
+type stateRollback struct {
+	runs            map[string]model.Run
+	jobs            map[string]model.Job
+	runners         map[string]model.Runner
+	contracts       map[string]map[string]storage.ArtifactContract
+	deliveries      map[string]string
+	downstreamLinks map[string]storage.DownstreamLink
+	occurrences     map[string]map[int64]string
+	deployments     map[string]model.Deployment
+}
+
+// captureStateRollbackLocked snapshots every map the fs-mode authoritative
+// handlers in this file mutate. The caller holds s.mu.
+func (s *Server) captureStateRollbackLocked() stateRollback {
+	rb := stateRollback{
+		runs:            make(map[string]model.Run, len(s.runs)),
+		jobs:            make(map[string]model.Job, len(s.jobs)),
+		runners:         make(map[string]model.Runner, len(s.runners)),
+		contracts:       make(map[string]map[string]storage.ArtifactContract, len(s.contracts)),
+		deliveries:      make(map[string]string, len(s.deliveries)),
+		downstreamLinks: make(map[string]storage.DownstreamLink, len(s.downstreamLinks)),
+		occurrences:     make(map[string]map[int64]string, len(s.occurrences)),
+		deployments:     make(map[string]model.Deployment, len(s.deployments)),
+	}
+	for id, v := range s.runs {
+		rb.runs[id] = v
+	}
+	for id, v := range s.jobs {
+		rb.jobs[id] = v
+	}
+	for id, v := range s.runners {
+		// The runner's ActiveJobs slice is the one stored slice a mutation
+		// path could compact in place; clone it so the captured value can
+		// never alias the live backing array (same guard as
+		// captureCompletionRollbackLocked).
+		v.ActiveJobs = cloneStrings(v.ActiveJobs)
+		rb.runners[id] = v
+	}
+	for id, v := range s.contracts {
+		rb.contracts[id] = v
+	}
+	for k, v := range s.deliveries {
+		rb.deliveries[k] = v
+	}
+	for k, v := range s.downstreamLinks {
+		rb.downstreamLinks[k] = v
+	}
+	for id, occ := range s.occurrences {
+		cp := make(map[int64]string, len(occ))
+		for k, v := range occ {
+			cp[k] = v
+		}
+		rb.occurrences[id] = cp
+	}
+	for id, v := range s.deployments {
+		rb.deployments[id] = v
+	}
+	return rb
+}
+
+// rollbackStateLocked restores a captureStateRollbackLocked snapshot. The
+// caller holds s.mu and invokes it only after the durability write failed,
+// immediately before the fail-closed response. The maps are restored in
+// place (never swapped) so no reader can hold a stale map reference.
+func (s *Server) rollbackStateLocked(rb stateRollback) {
+	restoreMap(s.runs, rb.runs)
+	restoreMap(s.jobs, rb.jobs)
+	restoreMap(s.runners, rb.runners)
+	restoreMap(s.contracts, rb.contracts)
+	restoreMap(s.deliveries, rb.deliveries)
+	restoreMap(s.downstreamLinks, rb.downstreamLinks)
+	restoreMap(s.occurrences, rb.occurrences)
+	restoreMap(s.deployments, rb.deployments)
+}
+
 // completionReplayReadyLocked recognizes an idempotent completion replay from
 // the in-memory receipt and, when it matches, makes the replayed state
 // durable BEFORE the caller runs any completion effect. The caller holds
@@ -3383,6 +3599,48 @@ func (s *Server) accountJobUsageMetrics(cost, energy float64, finished time.Time
 		}
 	}
 	s.usage = kept
+}
+
+// rebuildUsageWindow reconstructs the trailing-24h budget window at fs-mode
+// startup from the restored jobs. It uses the SAME usageEntry structure and
+// usageMu lock as the live accounting path (accountJobUsageMetrics), so the
+// daily cost/energy gates (dailyBudgetStateDB) see the durable totals after a
+// restart instead of an empty window. Only jobs whose usage was already
+// accounted durably (UsageRecorded, with the amounts persisted on the job)
+// and whose FinishedAt is inside the trailing 24h contribute. Entries are
+// ordered deterministically by FinishedAt, ties by job ID: the totals are
+// additive, and a stable order keeps restarts reproducible.
+func (s *Server) rebuildUsageWindow(jobs map[string]model.Job) {
+	cutoff := time.Now().UTC().Add(-24 * time.Hour)
+	type rankedUsage struct {
+		jobID string
+		entry usageEntry
+	}
+	ranked := make([]rankedUsage, 0)
+	s.mu.Lock()
+	for id, j := range jobs {
+		if !j.UsageRecorded || j.FinishedAt == nil || !j.FinishedAt.After(cutoff) {
+			continue
+		}
+		ranked = append(ranked, rankedUsage{jobID: id, entry: usageEntry{FinishedAt: *j.FinishedAt, Cost: j.Cost, EnergyWh: j.EnergyWh}})
+	}
+	s.mu.Unlock()
+	if len(ranked) == 0 {
+		return
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		if !ranked[i].entry.FinishedAt.Equal(ranked[j].entry.FinishedAt) {
+			return ranked[i].entry.FinishedAt.Before(ranked[j].entry.FinishedAt)
+		}
+		return ranked[i].jobID < ranked[j].jobID
+	})
+	entries := make([]usageEntry, 0, len(ranked))
+	for _, r := range ranked {
+		entries = append(entries, r.entry)
+	}
+	s.usageMu.Lock()
+	s.usage = entries
+	s.usageMu.Unlock()
 }
 
 // hashLeaseToken computes the HMAC-SHA256 of a raw lease token under the
@@ -3454,16 +3712,34 @@ func (s *Server) approveJob(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "job is already terminal", http.StatusConflict)
 		return
 	}
+	// Audit-first: an unwritable audit row blocks the approval with 503
+	// before any state changes, so a durable approval can never lack its
+	// evidence.
+	if aerr := s.auditFirstLocked("job.approved", actor, j.RunID, j.ID, "environment approved", map[string]string{"environment": j.Environment}); aerr != nil {
+		http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	rb := s.captureStateRollbackLocked()
 	j.ApprovedBy = actor
 	if j.Status == model.StatusWaitingApproval {
 		j.Status = model.StatusQueued
 	}
-	s.observeApprovalWait(&j)
+	// The wait marker is cleared as part of the transition, but the metrics
+	// move only AFTER the snapshot write: a failed persist must not claim an
+	// approval that was rolled back.
+	waitSeconds, waited := approvalWaitSeconds(&j)
 	s.jobs[jobID] = j
-	s.auditLocked("job.approved", actor, j.RunID, j.ID, "environment approved", map[string]string{"environment": j.Environment})
 	s.scheduleStateLocked()
 	s.refreshRunLocked(j.RunID)
-	s.persistCheckedLocked("job.approve")
+	if perr := s.persistCheckedErrLocked("job.approve"); perr != nil {
+		s.rollbackStateLocked(rb)
+		http.Error(w, "approval not durable", http.StatusServiceUnavailable)
+		return
+	}
+	if waited {
+		s.metricObserve("kiwi_approval_wait_seconds", waitSeconds, nil)
+		s.metricObserve("kiwi_environment_wait_seconds", waitSeconds, nil)
+	}
 	writeJSON(w, http.StatusOK, redactJob(j))
 }
 
@@ -3495,25 +3771,38 @@ func (s *Server) approveJobDB(w http.ResponseWriter, r *http.Request, jobID, act
 	if j.Status == model.StatusWaitingApproval {
 		j.Status = model.StatusQueued
 	}
-	s.observeApprovalWait(&j)
+	waitSeconds, waited := approvalWaitSeconds(&j)
+	// Audit-first: the DB audit table is a separate transaction from the job
+	// update (the store API cannot join them), so the row lands before the
+	// transition and a failed append refuses the approval. A row may exist
+	// for an update the store then rejected.
+	if aerr := s.auditFirstLocked("job.approved", actor, j.RunID, j.ID, "environment approved", map[string]string{"environment": j.Environment}); aerr != nil {
+		http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	if err := s.DB.UpdateJob(ctx, j); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	s.auditLocked("job.approved", actor, j.RunID, j.ID, "environment approved", map[string]string{"environment": j.Environment})
+	if waited {
+		s.metricObserve("kiwi_approval_wait_seconds", waitSeconds, nil)
+		s.metricObserve("kiwi_environment_wait_seconds", waitSeconds, nil)
+	}
 	writeJSON(w, http.StatusOK, redactJob(j))
 }
 
-// observeApprovalWait records how long an approval-gated job waited from
-// entering the waiting state to approval and clears the marker.
-func (s *Server) observeApprovalWait(j *model.Job) {
+// approvalWaitSeconds derives how long an approval-gated job waited from
+// entering the waiting state and clears the marker on the job. It is the
+// metric-free half of approval accounting: both approve paths call it BEFORE
+// their durable write and move the wait metrics only after the write
+// succeeded, so a failed approval cannot claim a wait it did not record.
+func approvalWaitSeconds(j *model.Job) (float64, bool) {
 	if j.WaitingSince == nil {
-		return
+		return 0, false
 	}
 	wait := time.Since(*j.WaitingSince).Seconds()
-	s.metricObserve("kiwi_approval_wait_seconds", wait, nil)
-	s.metricObserve("kiwi_environment_wait_seconds", wait, nil)
 	j.WaitingSince = nil
+	return wait, true
 }
 
 func (s *Server) rerunRun(w http.ResponseWriter, r *http.Request) {
@@ -3673,9 +3962,28 @@ func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	s.cancelRunLocked(id, "cancelled by "+actor, actor)
+	// Audit-first: the cancellation's evidence is written before the state
+	// transition, and an unwritable audit blocks the transition (503). The
+	// row may therefore exist for an attempt whose persist then failed and
+	// was rolled back — evidence-first is the chosen failure mode.
+	reason := "cancelled by " + actor
+	if aerr := s.auditFirstLocked("run.cancelled", actor, id, "", reason, nil); aerr != nil {
+		s.mu.Unlock()
+		http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	rb := s.captureStateRollbackLocked()
+	s.cancelRunLocked(id, reason)
 	run = s.runs[id]
-	s.persistCheckedLocked("job.cancel")
+	if perr := s.persistCheckedErrLocked("job.cancel"); perr != nil {
+		// The cancellation never became durable: restore every job, run and
+		// runner slot the cancel path touched, answer 503, and publish NO
+		// forge status (the outbox intent is only enqueued after durability).
+		s.rollbackStateLocked(rb)
+		s.mu.Unlock()
+		http.Error(w, "cancel state not durable", http.StatusServiceUnavailable)
+		return
+	}
 	s.mu.Unlock()
 	if perr := s.publishForgeStatus(r.Context(), run); perr != nil {
 		s.logError("forge status enqueue failed", "run", run.ID, "error", perr.Error())
@@ -3700,11 +4008,19 @@ func (s *Server) cancelRunDB(w http.ResponseWriter, r *http.Request, id, actor s
 		return
 	}
 	reason := "cancelled by " + actor
+	// Audit-first, mirroring the memory path: the DB audit table is a
+	// separate transaction from the scheduler's cancel (the store API cannot
+	// join them), so the row lands before the transition and a failed append
+	// refuses the cancel. A row may exist for a cancel the scheduler then
+	// rejected; that is the documented evidence-first trade-off.
+	if aerr := s.auditFirstLocked("run.cancelled", actor, id, "", reason, nil); aerr != nil {
+		http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	if err := s.Sched.CancelRun(ctx, id, reason); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	s.auditLocked("run.cancelled", actor, id, "", reason, nil)
 	if cur, gerr := s.DB.GetRun(ctx, id); gerr == nil {
 		run = cur
 	}
@@ -3714,7 +4030,12 @@ func (s *Server) cancelRunDB(w http.ResponseWriter, r *http.Request, id, actor s
 	writeJSON(w, http.StatusOK, run)
 }
 
-func (s *Server) cancelRunLocked(runID, reason, actor string) {
+// cancelRunLocked applies the in-memory cancellation of a run and all its
+// non-terminal jobs, releasing the runner slots of cancelled RUNNING jobs.
+// It does NOT audit: the admin cancel path audits first (auditFirstLocked)
+// and the scheduler supersession path audits at its call site, so this helper
+// performs exactly the state mutation the caller can capture for rollback.
+func (s *Server) cancelRunLocked(runID, reason string) {
 	now := time.Now().UTC()
 	for id, j := range s.jobs {
 		if j.RunID != runID || j.Status.Terminal() {
@@ -3747,7 +4068,6 @@ func (s *Server) cancelRunLocked(runID, reason, actor string) {
 	// A cancelled run may be a wait=true downstream child of another run:
 	// re-aggregate the parents.
 	s.refreshDownstreamParentsLocked(runID)
-	s.auditLocked("run.cancelled", actor, runID, "", reason, nil)
 }
 
 func (s *Server) scheduleStateLocked() {
@@ -3935,16 +4255,13 @@ func (s *Server) refreshRunLocked(runID string) {
 	s.runs[runID] = run
 }
 
-func (s *Server) recoverLeasesLocked(now time.Time, startup bool) {
+func (s *Server) recoverLeasesLocked(now time.Time, startup bool) (expirations, lost, timedOut int) {
 	if s.Sched != nil {
 		// DB mode: expired-lease recovery is the leader's job and runs
 		// through Sched.RecoverExpired in Maintain.
-		return
+		return 0, 0, 0
 	}
 	_ = startup // Signature kept for call-site stability; startup no longer forces expiry: unexpired leases survive restart.
-	expirations := 0
-	lost := 0
-	timedOut := 0
 	for id, j := range s.jobs {
 		// Queue-timeout expiry, mirroring the scheduler's RecoverExpired: a
 		// queued (or approval-waiting) job past its queue deadline is
@@ -3995,12 +4312,20 @@ func (s *Server) recoverLeasesLocked(now time.Time, startup bool) {
 		s.jobs[id] = j
 		s.releaseRunnerLocked(runnerID, j.ID, model.StatusFailure)
 	}
+	s.scheduleStateLocked()
+	return expirations, lost, timedOut
+}
+
+// recordRecoveryMetrics moves the expired-lease counters for a recovery pass.
+// Callers run it only after the pass's snapshot write succeeded (or on the
+// startup path where the write is about to be validated), so a rolled-back
+// recovery cannot leave counters claiming expirations the disk never saw.
+func (s *Server) recordRecoveryMetrics(expirations, lost, timedOut int) {
 	s.metricAdd("kiwi_lease_expirations_total", float64(expirations), nil)
 	s.metricAdd("kiwi_lost_runners_total", float64(lost), nil)
 	if timedOut > 0 {
 		s.metricAdd("kiwi_queue_timeouts_total", float64(timedOut), nil)
 	}
-	s.scheduleStateLocked()
 }
 
 func (s *Server) releaseRunnerLocked(runnerID, jobID string, status model.Status) {
@@ -4025,26 +4350,40 @@ func (s *Server) releaseRunnerLocked(runnerID, jobID string, status model.Status
 	s.runners[runnerID] = ri
 }
 
-// auditLocked is the single audit funnel. In DB mode events go through the
-// store (AppendAudit); failures are logged, never silently dropped. In dev
-// mode events are appended to the filesystem repository when one is attached.
-func (s *Server) auditLocked(action, actor, runID, jobID, msg string, meta map[string]string) {
+// auditFirstLocked appends one audit event and RETURNS the append failure,
+// unlike auditLocked which logs and continues. Admin mutations (runner
+// disable/enable/drain, approval, run cancel) call it BEFORE the state
+// transition and fail closed (rollback + 503) when the evidence cannot be
+// written: a successful disable/approve/cancel must never be able to lack its
+// audit row. The ordering is audit -> mutate -> persist, so an audit row MAY
+// exist for an attempt whose transition then failed (a failed state persist
+// rolls the transition back): the contract fails closed on EVIDENCE, not on
+// the transition. In DB mode the audit goes to the store's audit table, which
+// is a separate transaction from the state update (the store API cannot join
+// the two), so the same documented ordering applies.
+func (s *Server) auditFirstLocked(action, actor, runID, jobID, msg string, meta map[string]string) error {
 	if s.store == nil && s.DB == nil {
-		return
+		return nil
 	}
 	id, err := newID()
 	if err != nil {
-		s.logError("audit: dropping event", "action", action, "error", err.Error())
-		return
+		return err
 	}
 	e := model.AuditEvent{ID: id, Action: action, Actor: actor, RunID: runID, JobID: jobID, Message: msg, Metadata: meta, CreatedAt: time.Now().UTC()}
 	if s.DB != nil {
-		if err := s.DB.AppendAudit(context.Background(), e); err != nil {
-			s.logError("audit: append failed", "action", action, "error", err.Error())
-		}
-		return
+		return s.DB.AppendAudit(context.Background(), e)
 	}
-	_ = s.store.AppendAudit(e)
+	return s.store.AppendAudit(e)
+}
+
+// auditLocked is the best-effort audit funnel used by non-admin and
+// non-transitional events: failures are logged, never silently dropped.
+// Admin transitions use auditFirstLocked so a missing audit row blocks the
+// mutation instead of being logged after the fact.
+func (s *Server) auditLocked(action, actor, runID, jobID, msg string, meta map[string]string) {
+	if err := s.auditFirstLocked(action, actor, runID, jobID, msg, meta); err != nil {
+		s.logError("audit: append failed", "action", action, "error", err.Error())
+	}
 }
 func (s *Server) listAudit(w http.ResponseWriter, r *http.Request) {
 	if s.DB != nil {
@@ -4080,7 +4419,7 @@ func (s *Server) persistLocked() error {
 		s.notePersistResult(s.persistFailForTest)
 		return s.persistFailForTest
 	}
-	err := s.store.Save(storage.Snapshot{Version: 1, Runs: s.runs, Jobs: s.jobs, Runners: s.runners, Artifacts: s.artifacts, Reports: s.reports, DownstreamLinks: s.downstreamLinks, Profiles: s.profiles, CertProfileLinks: s.certProfiles, Snapshots: s.snapshots, CompletionReceipts: s.completionReceiptRecordsLocked()})
+	err := s.store.Save(storage.Snapshot{Version: 1, Runs: s.runs, Jobs: s.jobs, Runners: s.runners, Artifacts: s.artifacts, Reports: s.reports, DownstreamLinks: s.downstreamLinks, Profiles: s.profiles, CertProfileLinks: s.certProfiles, Snapshots: s.snapshots, CompletionReceipts: s.completionReceiptRecordsLocked(), Deployments: s.deployments})
 	s.notePersistResult(err)
 	return err
 }
@@ -4101,6 +4440,23 @@ func (s *Server) persistCheckedErrLocked(what string) error {
 // need to know whether the state became durable.
 func (s *Server) persistCheckedLocked(what string) bool {
 	return s.persistCheckedErrLocked(what) == nil
+}
+
+// stateNotDurableError marks a mutation error that is a durability failure
+// (the snapshot or schedules journal could not be written), not a client
+// error. HTTP handlers map it to 503 so a failed write is never handed to
+// the client as 400.
+type stateNotDurableError struct{ err error }
+
+func (e *stateNotDurableError) Error() string { return "state not durable: " + e.err.Error() }
+func (e *stateNotDurableError) Unwrap() error { return e.err }
+
+// notDurable wraps err as a stateNotDurableError; nil stays nil.
+func notDurable(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &stateNotDurableError{err: err}
 }
 
 // notePersistResult folds one snapshot write outcome into the degraded-state
@@ -4695,30 +5051,55 @@ func (s *Server) Maintain(ctx context.Context) {
 				s.metricObserve("kiwi_scheduler_loop_duration_seconds", time.Since(loopStart).Seconds(), nil)
 				continue
 			}
-			s.mu.Lock()
-			before := map[string]model.Status{}
-			for id, r := range s.runs {
-				before[id] = r.Status
-			}
-			s.recoverLeasesLocked(tick.UTC(), false)
-			s.persistCheckedLocked("maintain.lease_recovery")
-			var changed []model.Run
-			for id, r := range s.runs {
-				if before[id] != r.Status {
-					changed = append(changed, r)
-				}
-			}
-			s.mu.Unlock()
-			for _, r := range changed {
-				if perr := s.publishForgeStatus(ctx, r); perr != nil {
-					s.logError("forge status enqueue failed", "run", r.ID, "error", perr.Error())
-				}
-			}
+			s.maintainMemoryTick(ctx, tick.UTC())
 			s.GC(ctx, tick.UTC())
 			s.maybeRunCASGC(ctx, tick.UTC())
 			s.flushOutbox()
 			s.fireDueSchedules(ctx, tick.UTC())
 			s.metricObserve("kiwi_scheduler_loop_duration_seconds", time.Since(loopStart).Seconds(), nil)
+		}
+	}
+}
+
+// maintainMemoryTick is the fs/memory-mode housekeeping tick: it recovers
+// expired leases and publishes the forge statuses caused by lost runners.
+// Recovery and its snapshot write are ONE critical section so a failed
+// persist rolls the whole pass back — the in-memory state must match the
+// disk, or a crash would "lose" a recovery the process already reported while
+// the next tick double-requeues it. No HTTP status exists here; the degraded
+// flag armed by the persist helper plus the rollback log carry the failure.
+// Exposed as a method so tests can drive one tick deterministically.
+func (s *Server) maintainMemoryTick(ctx context.Context, now time.Time) {
+	s.mu.Lock()
+	before := map[string]model.Status{}
+	for id, r := range s.runs {
+		before[id] = r.Status
+	}
+	rb := s.captureStateRollbackLocked()
+	expirations, lostRunners, timedOut := s.recoverLeasesLocked(now, false)
+	recoveryDurable := true
+	if perr := s.persistCheckedErrLocked("maintain.lease_recovery"); perr != nil {
+		s.rollbackStateLocked(rb)
+		recoveryDurable = false
+	}
+	var changed []model.Run
+	if recoveryDurable {
+		s.recordRecoveryMetrics(expirations, lostRunners, timedOut)
+		for id, r := range s.runs {
+			if before[id] != r.Status {
+				changed = append(changed, r)
+			}
+		}
+	}
+	s.mu.Unlock()
+	if !recoveryDurable {
+		// Do NOT publish forge statuses off a rolled-back recovery: the runs
+		// are back to their pre-recovery state.
+		s.logError("maintenance: lease recovery rolled back; in-memory state matches disk")
+	}
+	for _, r := range changed {
+		if perr := s.publishForgeStatus(ctx, r); perr != nil {
+			s.logError("forge status enqueue failed", "run", r.ID, "error", perr.Error())
 		}
 	}
 }

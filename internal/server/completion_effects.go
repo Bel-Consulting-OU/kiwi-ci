@@ -11,13 +11,17 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
-// reconcileCompletionEffects runs every post-completion effect for jobID.
-// It is the idempotent reconciliation behind the completion outbox flush and
-// the defensive receipt replay: each effect checks its own durable marker
+// reconcileCompletionEffects runs every INTERNAL post-completion effect for
+// jobID: downstream launch recording, deployment finishing, usage
+// accounting and run aggregation. Each effect checks its own durable marker
 // (downstream link row, deployment finished_at, job usage_recorded flag,
-// recomputed run aggregation, terminal run forge publish) before acting, so
-// at-least-once dispatch can never double-account. A job that no longer
-// exists is treated as already reconciled.
+// recomputed run aggregation) before acting, so at-least-once dispatch can
+// never double-account. A job that no longer exists is treated as already
+// reconciled.
+//
+// Forge publication is deliberately NOT part of this chain: it lives in the
+// separate OutboxKindForgeDelivery intent, which may back off and dead-letter
+// per its own policy without ever retiring this internal consistency row.
 func (s *Server) reconcileCompletionEffects(ctx context.Context, jobID string) error {
 	j, err := s.jobForLease(ctx, jobID)
 	if errors.Is(err, storage.ErrNotFound) {
@@ -35,7 +39,19 @@ func (s *Server) reconcileCompletionEffects(ctx context.Context, jobID string) e
 	if err := s.effectUsageAccount(ctx, j); err != nil {
 		return err
 	}
-	if err := s.effectRunAggregate(ctx, j); err != nil {
+	return s.effectRunAggregate(ctx, j)
+}
+
+// dispatchForgeDelivery runs the external publication for one completed job
+// (the forge_delivery intent): resolve the job's run and mirror its terminal
+// state to the forge. Retries/dead-letters are the outbox's per-intent
+// policy, independent of the internal completion_reconcile row.
+func (s *Server) dispatchForgeDelivery(ctx context.Context, jobID string) error {
+	j, err := s.jobForLease(ctx, jobID)
+	if errors.Is(err, storage.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
 		return err
 	}
 	return s.effectForgeStatus(ctx, j)
@@ -289,14 +305,21 @@ func (s *Server) runForJob(ctx context.Context, runID string) (model.Run, error)
 // (memory/fs mode: random IDs, persisted to outbox.jsonl when a store is
 // attached). The inline completion pass already applied the effects; the
 // queued intents become no-ops via their markers unless a crash lost the
-// inline pass, in which case the flush performs them.
+// inline pass, in which case the flush performs them. TWO intents are
+// queued: completion_reconcile (internal consistency, unbounded retries) and
+// forge_delivery (external publication, bounded retries + dead-letter).
 func (s *Server) enqueueCompletionEffects(j model.Job, run model.Run) error {
 	payload, err := jsonMarshal(storage.CompletionEffectsPayload{JobID: j.ID, RunID: run.ID})
 	if err != nil {
 		return err
 	}
 	now := time.Now().UTC()
-	return s.outbox.Enqueue(forge.OutboxItem{Kind: storage.OutboxKindCompletionReconcile, Payload: payload, CreatedAt: now})
+	for _, kind := range []string{storage.OutboxKindCompletionReconcile, storage.OutboxKindForgeDelivery} {
+		if err := s.outbox.Enqueue(forge.OutboxItem{Kind: kind, Payload: payload, CreatedAt: now}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // enqueueCompletionEffectsLocal queues in-memory-only copies of the effect
@@ -309,10 +332,12 @@ func (s *Server) enqueueCompletionEffectsLocal(jobID, runID string, generation i
 		return
 	}
 	now := time.Now().UTC()
-	s.outbox.EnqueueLocal(forge.OutboxItem{
-		ID:        storage.CompletionEffectID(jobID, generation, storage.OutboxKindCompletionReconcile),
-		Kind:      storage.OutboxKindCompletionReconcile,
-		Payload:   payload,
-		CreatedAt: now,
-	})
+	for _, kind := range []string{storage.OutboxKindCompletionReconcile, storage.OutboxKindForgeDelivery} {
+		s.outbox.EnqueueLocal(forge.OutboxItem{
+			ID:        storage.CompletionEffectID(jobID, generation, kind),
+			Kind:      kind,
+			Payload:   payload,
+			CreatedAt: now,
+		})
+	}
 }

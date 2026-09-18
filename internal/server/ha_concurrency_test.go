@@ -380,8 +380,8 @@ func TestHACancelVersusCompleteNoDoubleEffects(t *testing.T) {
 				if r.Completed != 1 {
 					t.Fatalf("runner completed = %d, want exactly 1", r.Completed)
 				}
-				if effects != 0 && effects != len(storage.CompletionEffectKinds()) {
-					t.Fatalf("completion effect intents = %d, want 0 or %d (all-or-nothing)", effects, len(storage.CompletionEffectKinds()))
+				if effects != 0 && effects != storage.CompletionEffectIntentCount {
+					t.Fatalf("completion effect intents = %d, want 0 or %d (all-or-nothing)", effects, storage.CompletionEffectIntentCount)
 				}
 			} else {
 				if r.Completed != 0 {
@@ -399,12 +399,7 @@ func TestHACancelVersusCompleteNoDoubleEffects(t *testing.T) {
 }
 
 func isCompletionEffectKind(kind string) bool {
-	for _, k := range storage.CompletionEffectKinds() {
-		if k == kind {
-			return true
-		}
-	}
-	return false
+	return storage.IsCompletionEffectKind(kind)
 }
 
 // TestHAEnvironmentConcurrencyOneWinner: two queued jobs share a
@@ -508,8 +503,8 @@ func TestHACompletionEffectsConvergeAcrossReplicas(t *testing.T) {
 	if j.UsageRecorded {
 		t.Fatal("usage recorded before any effect pass ran")
 	}
-	if effectsQueued != len(storage.CompletionEffectKinds()) {
-		t.Fatalf("effect intents = %d, want %d committed with the completion", effectsQueued, len(storage.CompletionEffectKinds()))
+	if effectsQueued != storage.CompletionEffectIntentCount {
+		t.Fatalf("effect intents = %d, want %d committed with the completion", effectsQueued, storage.CompletionEffectIntentCount)
 	}
 	// Replica 1 restart-replays the durable outbox and runs the effects.
 	if err := c.s[1].outbox.ReplayDB(context.Background()); err != nil {

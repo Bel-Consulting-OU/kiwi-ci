@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/app"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/version"
 )
 
@@ -150,6 +151,8 @@ func TestDispatchRoutesEveryCommand(t *testing.T) {
 		{"tui", []string{"tui", "--no-such-flag"}},
 		{"database-empty", []string{"database"}},
 		{"database", []string{"database", "--no-such-flag"}},
+		{"outbox-empty", []string{"outbox"}},
+		{"outbox", []string{"outbox", "--no-such-flag"}},
 		{"config-empty", []string{"config"}},
 		{"config", []string{"config", "--no-such-flag"}},
 	}
@@ -251,12 +254,40 @@ func TestConfigCommand(t *testing.T) {
 	}
 }
 
+// TestOutboxCommand mirrors TestDatabaseCommand for the operator
+// dead-letter command group: missing/unknown subcommands are usage errors and
+// known subcommands fail on flags (never on "subcommand").
+func TestOutboxCommand(t *testing.T) {
+	ctx := context.Background()
+	if err := app.Outbox(ctx, nil); err == nil || !strings.Contains(err.Error(), "requires a subcommand") {
+		t.Fatalf("Outbox(nil) = %v", err)
+	}
+	if err := app.Outbox(ctx, []string{"drop"}); err == nil || !strings.Contains(err.Error(), "unknown outbox subcommand") {
+		t.Fatalf("Outbox(drop) = %v", err)
+	}
+	if err := app.Outbox(ctx, []string{"dead-letters"}); err == nil || !strings.Contains(err.Error(), "requires a subcommand") {
+		t.Fatalf("Outbox(dead-letters) = %v", err)
+	}
+	if err := app.Outbox(ctx, []string{"dead-letters", "drop"}); err == nil || !strings.Contains(err.Error(), "unknown outbox dead-letters subcommand") {
+		t.Fatalf("Outbox(dead-letters drop) = %v", err)
+	}
+	for _, sub := range []string{"list", "requeue", "delete"} {
+		err := app.Outbox(ctx, []string{"dead-letters", sub, "--no-such-flag"})
+		if err == nil {
+			t.Fatalf("Outbox(dead-letters %s bad flag) = nil, want flag error", sub)
+		}
+		if strings.Contains(err.Error(), "subcommand") {
+			t.Fatalf("Outbox(dead-letters %s) rejected a known subcommand: %v", sub, err)
+		}
+	}
+}
+
 func TestUsageListsCommands(t *testing.T) {
 	text := captureUsage(t, usage)
 	for _, want := range []string{
 		"kiwi run", "kiwi validate", "kiwi explain", "kiwi doctor",
 		"kiwi server", "kiwi runner", "kiwi dispatch", "kiwi init",
-		"kiwi tui", "kiwi config check",
+		"kiwi tui", "kiwi config check", "kiwi outbox dead-letters",
 		"kiwi version", "identical local and remote DAG execution",
 	} {
 		if !strings.Contains(text, want) {

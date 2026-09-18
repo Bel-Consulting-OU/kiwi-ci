@@ -1,22 +1,68 @@
 # Native macOS arm64: unit + race + the termios/Tart-sensitive packages.
-# macOS agents use Woodpecker's local backend, which executes directly on the
-# host and therefore MUST run only trusted events.
+#
+# ===========================================================================
+# SECURITY - LOCAL BACKEND, NO ISOLATION
+# This workflow runs on Woodpecker's local backend, which executes the
+# commands below directly on the worker host, as the same user as the agent,
+# with no container boundary. Treat the worker as fully exposed to whatever
+# the checkout contains:
+#   - run it only on one-shot/ephemeral, disposable hosts that are destroyed
+#     or reimaged after every run; never reuse a long-lived interactive host;
+#   - run the agent as a dedicated low-privilege user (never root) whose only
+#     durable state is the Go toolchain and the per-run checkout;
+#   - keep no persistent credentials on the host: no release signing keys, no
+#     forge tokens, no cloud/SSH keys. The only secret that may exist is the
+#     Woodpecker agent secret, and it is scoped to this agent and rotated;
+#   - NEVER run untrusted code here. `when` is restricted to push/manual/tag,
+#     which are trusted events for this repository: only users with write
+#     access can push, create tags, or trigger a manual run, and a fork pull
+#     request never produces events in this repository. Do not add
+#     pull_request/pull_request_* events to this file; fork heads would then
+#     execute on the host. PR coverage belongs to the Docker-backend lanes.
+# ===========================================================================
+#
+# Agent selection and shell:
+#   - Woodpecker's local backend advertises the default labels
+#     platform=<GOOS>/<GOARCH> and backend=local; selecting both pins this
+#     workflow to the dedicated macOS host (docs: workflow syntax -> labels;
+#     agent configuration -> AGENT_LABELS).
+#   - On the local backend `image` is the shell/executable, not a container
+#     image (docs: backends -> local -> "Shell"), so it is `bash` here.
+#   - The worker must provide Go 1.27.x: the toolchain step asserts
+#     `go version`, and GOTOOLCHAIN=local stops Go from downloading another
+#     toolchain to mask a stale worker.
 labels:
-  platform: darwin-arm64
+  platform: darwin/arm64
+  backend: local
 
 when:
   - event: [push, manual, tag]
 
 steps:
+  toolchain:
+    image: bash
+    environment:
+      GOTOOLCHAIN: local
+    commands:
+      - |
+        command -v go >/dev/null 2>&1 || { echo "native-macos: go is not on PATH on this worker" >&2; exit 1; }
+        gv="$(go version)"
+        printf '%s\n' "$gv"
+        printf '%s\n' "$gv" | grep -Eq '^go version go1\.27([.][0-9]+)? ' || {
+          echo "native-macos requires Go 1.27.x on the worker, got: $gv" >&2
+          exit 1
+        }
+
   unit:
-    image: golang:1.27
+    image: bash
+    depends_on: [toolchain]
     environment:
       GOTOOLCHAIN: local
     commands:
       - go test -shuffle=on -timeout=20m ./...
 
   race:
-    image: golang:1.27
+    image: bash
     depends_on: [unit]
     environment:
       GOTOOLCHAIN: local
@@ -24,7 +70,7 @@ steps:
       - go test -race -shuffle=on -timeout=30m ./internal/tui ./internal/executor ./internal/safefs ./internal/server ./internal/storage
 
   platform-packages:
-    image: golang:1.27
+    image: bash
     depends_on: [unit]
     environment:
       GOTOOLCHAIN: local

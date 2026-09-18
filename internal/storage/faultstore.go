@@ -52,6 +52,8 @@ var _ Store = (*FaultyStore)(nil)
 
 var (
 	_ OutboxStore             = (*FaultyStore)(nil)
+	_ OutboxDeadLetterStore   = (*FaultyStore)(nil)
+	_ ForgeCheckStateStore    = (*FaultyStore)(nil)
 	_ ScheduleStore           = (*FaultyStore)(nil)
 	_ DeploymentStore         = (*FaultyStore)(nil)
 	_ SnapshotStore           = (*FaultyStore)(nil)
@@ -355,6 +357,32 @@ func (f *FaultyStore) OutboxAck(ctx context.Context, id string) error {
 	return f.Inner.(OutboxStore).OutboxAck(ctx, id)
 }
 
+// OutboxEnqueueVersioned delegates the versioned enqueue to the inner store
+// (the fault-injection memStore implements the same supersede/watermark
+// semantics as the SQL store).
+func (f *FaultyStore) OutboxEnqueueVersioned(ctx context.Context, e OutboxItem) (VersionedEnqueueOutcome, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return VersionedEnqueued, err
+	}
+	inner, ok := f.Inner.(ForgeCheckStateStore)
+	if !ok {
+		return VersionedEnqueued, fmt.Errorf("storage: inner store does not implement ForgeCheckStateStore")
+	}
+	return inner.OutboxEnqueueVersioned(ctx, e)
+}
+
+// OutboxVersionGuard is a read-only guard: a guard failure must never be
+// converted into "publish anyway" by fault injection.
+func (f *FaultyStore) OutboxVersionGuard(ctx context.Context, id, logicalKey string, version int64) (bool, error) {
+	inner, ok := f.Inner.(ForgeCheckStateStore)
+	if !ok {
+		return false, fmt.Errorf("storage: inner store does not implement ForgeCheckStateStore")
+	}
+	return inner.OutboxVersionGuard(ctx, id, logicalKey, version)
+}
+
 func (f *FaultyStore) OutboxPending(ctx context.Context) ([]OutboxItem, error) {
 	return f.Inner.(OutboxStore).OutboxPending(ctx)
 }
@@ -375,6 +403,57 @@ func (f *FaultyStore) ReleaseOutboxClaim(ctx context.Context, id, claimer string
 		return err
 	}
 	return f.Inner.(OutboxStore).ReleaseOutboxClaim(ctx, id, claimer)
+}
+
+// OutboxRetry delegates the retry/dead-letter transition to the inner store
+// (the fault-injection memStore implements the same policy as the SQL store).
+func (f *FaultyStore) OutboxRetry(ctx context.Context, id string, dispatchErr error, maxAttempts int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	inner, ok := f.Inner.(interface {
+		OutboxRetry(context.Context, string, error, int) error
+	})
+	if !ok {
+		return fmt.Errorf("storage: inner store does not implement OutboxRetry")
+	}
+	return inner.OutboxRetry(ctx, id, dispatchErr, maxAttempts)
+}
+
+func (f *FaultyStore) OutboxDeadLetters(ctx context.Context) ([]OutboxDeadLetter, error) {
+	inner, ok := f.Inner.(OutboxDeadLetterStore)
+	if !ok {
+		return nil, fmt.Errorf("storage: inner store does not implement OutboxDeadLetterStore")
+	}
+	return inner.OutboxDeadLetters(ctx)
+}
+
+func (f *FaultyStore) OutboxRequeue(ctx context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	inner, ok := f.Inner.(OutboxDeadLetterStore)
+	if !ok {
+		return fmt.Errorf("storage: inner store does not implement OutboxDeadLetterStore")
+	}
+	return inner.OutboxRequeue(ctx, id)
+}
+
+func (f *FaultyStore) OutboxDelete(ctx context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	inner, ok := f.Inner.(OutboxDeadLetterStore)
+	if !ok {
+		return fmt.Errorf("storage: inner store does not implement OutboxDeadLetterStore")
+	}
+	return inner.OutboxDelete(ctx, id)
 }
 
 func (f *FaultyStore) UpsertSchedule(ctx context.Context, sc Schedule) error {
@@ -807,6 +886,13 @@ type memStore struct {
 	// outboxClaims tracks the cross-replica flush claims (claimed_at is
 	// compared against OutboxClaimTTL on every claim attempt).
 	outboxClaims map[string]outboxClaim
+	// outboxMeta tracks the retry/dead-letter state of each durable outbox
+	// row, mirroring migration 0015's attempts/last_error/next_attempt_at/
+	// dead_lettered_at columns.
+	outboxMeta map[string]outboxMeta
+	// forgeState tracks the delivered state watermark per logical forge-check
+	// key, mirroring migration 0018's forge_check_state table.
+	forgeState map[string]int64
 	// fragments is the generated-fragment idempotency receipt table.
 	fragments   map[string]GeneratedFragmentReceipt
 	schedules   map[string]Schedule
@@ -863,6 +949,14 @@ type outboxClaim struct {
 	at      time.Time
 }
 
+// outboxMeta is the in-memory outbox retry/dead-letter row state.
+type outboxMeta struct {
+	attempts  int
+	lastError string
+	nextAt    time.Time
+	deadAt    time.Time
+}
+
 // fragmentKey is the in-memory generated-fragments primary key.
 func fragmentKey(parentJobID string, generation int64, fragmentID string) string {
 	return fmt.Sprintf("%s|%d|%s", parentJobID, generation, fragmentID)
@@ -876,6 +970,8 @@ func newMemStore() *memStore {
 		receipts:        map[string]model.CompletionReceipt{},
 		deliveries:      map[string]string{},
 		outboxClaims:    map[string]outboxClaim{},
+		outboxMeta:      map[string]outboxMeta{},
+		forgeState:      map[string]int64{},
 		fragments:       map[string]GeneratedFragmentReceipt{},
 		schedules:       map[string]Schedule{},
 		occurrences:     map[string]map[time.Time]string{},
@@ -897,6 +993,8 @@ var _ Store = (*memStore)(nil)
 
 var (
 	_ OutboxStore             = (*memStore)(nil)
+	_ OutboxDeadLetterStore   = (*memStore)(nil)
+	_ ForgeCheckStateStore    = (*memStore)(nil)
 	_ ScheduleStore           = (*memStore)(nil)
 	_ DeploymentStore         = (*memStore)(nil)
 	_ SnapshotStore           = (*memStore)(nil)
@@ -1107,10 +1205,25 @@ func (m *memStore) CompleteJob(ctx context.Context, jobID string, generation int
 	}
 	key := m.receiptKey(jobID, generation, runnerID)
 	if j.Status != model.StatusRunning || j.LeaseRunnerID != runnerID || j.LeaseGeneration != generation {
-		if _, dup := m.receipts[key]; dup {
-			return nil
+		// Idempotent replay only for the IDENTICAL result: a stored receipt
+		// with a different ResultHash is a conflicting completion of the
+		// same lease and fails closed, mirroring the SQL path.
+		if rec, dup := m.receipts[key]; dup {
+			if rec.ResultHash == receipt.ResultHash {
+				return nil
+			}
+			return ErrCompletionConflict
 		}
 		return ErrGenerationMismatch
+	}
+	// The job is still running under the matching lease but a receipt key
+	// already exists: validate payload identity instead of overwriting a
+	// different result (the SQL ON CONFLICT DO NOTHING path).
+	if rec, dup := m.receipts[key]; dup {
+		if rec.ResultHash != receipt.ResultHash {
+			return ErrCompletionConflict
+		}
+		return nil
 	}
 	// Required-artifact verification inside the completion: a successful
 	// completion must have an artifact row for every Required contract.
@@ -1150,12 +1263,14 @@ func (m *memStore) CompleteJob(ctx context.Context, jobID string, generation int
 		r.LastSeen = now
 		m.runners[runnerID] = r
 	}
-	// Post-transaction completion effects mirror the SQL contract: one
-	// outbox intent per effect kind, committed with the completion under
-	// the deterministic effect IDs the completing server queues locally.
-	// The payload carries two strings, so marshaling cannot fail.
+	// Post-transaction completion effects mirror the SQL contract: TWO
+	// durable intents committed with the completion under the deterministic
+	// effect IDs the completing server queues locally — completion_reconcile
+	// (internal consistency, unbounded retries) and forge_delivery (external
+	// publication, bounded retries + dead-letter). The payload carries two
+	// strings, so marshaling cannot fail.
 	payload, _ := json.Marshal(CompletionEffectsPayload{JobID: jobID, RunID: j.RunID})
-	for _, kind := range CompletionEffectKinds() {
+	for _, kind := range []string{OutboxKindCompletionReconcile, OutboxKindForgeDelivery} {
 		m.outbox = append(m.outbox, OutboxItem{ID: CompletionEffectID(jobID, generation, kind), Kind: kind, Payload: payload, CreatedAt: now})
 	}
 	return nil
@@ -1441,17 +1556,218 @@ func (m *memStore) OutboxAck(ctx context.Context, id string) error {
 	for _, it := range m.outbox {
 		if it.ID != id {
 			out = append(out, it)
+			continue
+		}
+		// Versioned ack advances the delivered watermark atomically with the
+		// removal, mirroring the SQL CTE.
+		if it.LogicalKey != "" && it.StateVersion > 0 {
+			if it.StateVersion > m.forgeState[it.LogicalKey] {
+				m.forgeState[it.LogicalKey] = it.StateVersion
+			}
 		}
 	}
 	m.outbox = out
 	delete(m.outboxClaims, id)
+	delete(m.outboxMeta, id)
 	return nil
 }
 
+// OutboxEnqueueVersioned is the in-memory mirror of the SQL versioned
+// enqueue: under one lock it checks the delivered watermark, deletes every
+// older pending row of the logical key, and inserts the new row. Because the
+// memory store has no replicas, m.mu is the serialization the SQL advisory
+// lock provides there.
+func (m *memStore) OutboxEnqueueVersioned(ctx context.Context, e OutboxItem) (VersionedEnqueueOutcome, error) {
+	if e.LogicalKey == "" || e.StateVersion <= 0 {
+		return VersionedEnqueued, fmt.Errorf("storage: versioned outbox enqueue requires a logical key and a positive version")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if e.StateVersion <= m.forgeState[e.LogicalKey] {
+		return VersionedSuperseded, nil
+	}
+	// A newer pending version wins even when this enqueue arrives after it.
+	for _, it := range m.outbox {
+		if it.LogicalKey != e.LogicalKey || it.StateVersion <= e.StateVersion {
+			continue
+		}
+		if meta, ok := m.outboxMeta[it.ID]; ok && !meta.deadAt.IsZero() {
+			continue
+		}
+		return VersionedSuperseded, nil
+	}
+	kept := m.outbox[:0]
+	for _, it := range m.outbox {
+		if it.LogicalKey == e.LogicalKey && it.StateVersion <= e.StateVersion {
+			meta := m.outboxMeta[it.ID]
+			if !meta.deadAt.IsZero() {
+				// Dead letters are terminal and operator-visible: never
+				// silently deleted by a supersede.
+				kept = append(kept, it)
+				continue
+			}
+			delete(m.outboxClaims, it.ID)
+			delete(m.outboxMeta, it.ID)
+			continue
+		}
+		kept = append(kept, it)
+	}
+	m.outbox = kept
+	for _, it := range m.outbox {
+		if it.ID == e.ID {
+			// Equal-version dead letter (pending rows were removed above):
+			// report superseded, mirroring the SQL ON CONFLICT DO NOTHING.
+			return VersionedSuperseded, nil
+		}
+	}
+	m.outbox = append(m.outbox, e)
+	return VersionedEnqueued, nil
+}
+
+// OutboxVersionGuard is the in-memory mirror of the SQL durable guard.
+func (m *memStore) OutboxVersionGuard(ctx context.Context, id, logicalKey string, version int64) (bool, error) {
+	if logicalKey == "" || version <= 0 {
+		return true, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	alive := false
+	newerPending := false
+	for _, it := range m.outbox {
+		if it.ID == id {
+			alive = true
+		}
+		if it.LogicalKey != logicalKey || it.StateVersion <= version {
+			continue
+		}
+		if meta, ok := m.outboxMeta[it.ID]; ok && !meta.deadAt.IsZero() {
+			continue
+		}
+		newerPending = true
+	}
+	return alive && m.forgeState[logicalKey] < version && !newerPending, nil
+}
+
+// OutboxRetry mirrors the SQL retry policy: the attempt counter grows, the
+// dispatch error is retained, the claim is dropped, and the next attempt is
+// scheduled with bounded exponential backoff. After maxAttempts the row is
+// dead-lettered instead of hot-looping. An unknown id is a no-op (the row was
+// already acked).
+func (m *memStore) OutboxRetry(ctx context.Context, id string, dispatchErr error, maxAttempts int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.hasOutboxLocked(id) {
+		return nil
+	}
+	msg := ""
+	if dispatchErr != nil {
+		msg = dispatchErr.Error()
+	}
+	meta := m.outboxMeta[id]
+	backoff := time.Second
+	for i := 0; i < meta.attempts && backoff < time.Minute; i++ {
+		backoff *= 2
+	}
+	jitter := time.Duration(time.Now().UnixNano() % int64(backoff/4+1))
+	meta.attempts++
+	meta.lastError = msg
+	delete(m.outboxClaims, id)
+	if maxAttempts > 0 && meta.attempts >= maxAttempts {
+		meta.deadAt = time.Now().UTC()
+		meta.nextAt = time.Time{}
+	} else {
+		meta.nextAt = time.Now().UTC().Add(backoff + jitter)
+	}
+	m.outboxMeta[id] = meta
+	return nil
+}
+
+// OutboxPending returns the active (not dead-lettered) rows in FIFO order,
+// mirroring the SQL `WHERE dead_lettered_at IS NULL` filter: startup replay
+// must never re-dispatch a retired intent.
 func (m *memStore) OutboxPending(ctx context.Context) ([]OutboxItem, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return append([]OutboxItem(nil), m.outbox...), nil
+	out := make([]OutboxItem, 0, len(m.outbox))
+	for _, it := range m.outbox {
+		if meta, ok := m.outboxMeta[it.ID]; ok && !meta.deadAt.IsZero() {
+			continue
+		}
+		out = append(out, it)
+	}
+	return out, nil
+}
+
+// OutboxDeadLetters lists the dead-lettered rows in FIFO order with the
+// operator context (attempts, last error, retirement time).
+func (m *memStore) OutboxDeadLetters(ctx context.Context) ([]OutboxDeadLetter, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []OutboxDeadLetter{}
+	for _, it := range m.outbox {
+		meta, ok := m.outboxMeta[it.ID]
+		if !ok || meta.deadAt.IsZero() {
+			continue
+		}
+		out = append(out, OutboxDeadLetter{
+			ID:             it.ID,
+			Kind:           it.Kind,
+			Payload:        it.Payload,
+			CreatedAt:      it.CreatedAt,
+			Attempts:       meta.attempts,
+			LastError:      meta.lastError,
+			DeadLetteredAt: meta.deadAt,
+			LogicalKey:     it.LogicalKey,
+			StateVersion:   it.StateVersion,
+		})
+	}
+	return out, nil
+}
+
+// OutboxRequeue resets one dead-lettered row to a fresh, immediately
+// dispatchable state. Only dead letters can be requeued; an absent or live
+// row is ErrNotFound, mirroring the SQL WHERE guard.
+func (m *memStore) OutboxRequeue(ctx context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	meta, ok := m.outboxMeta[id]
+	if !ok || meta.deadAt.IsZero() || !m.hasOutboxLocked(id) {
+		return ErrNotFound
+	}
+	delete(m.outboxMeta, id)
+	delete(m.outboxClaims, id)
+	return nil
+}
+
+// OutboxDelete removes one dead-lettered row. Only dead letters can be
+// deleted; an absent or live row is ErrNotFound.
+func (m *memStore) OutboxDelete(ctx context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	meta, ok := m.outboxMeta[id]
+	if !ok || meta.deadAt.IsZero() || !m.hasOutboxLocked(id) {
+		return ErrNotFound
+	}
+	out := m.outbox[:0]
+	for _, it := range m.outbox {
+		if it.ID != id {
+			out = append(out, it)
+		}
+	}
+	m.outbox = out
+	delete(m.outboxMeta, id)
+	delete(m.outboxClaims, id)
+	return nil
+}
+
+// hasOutboxLocked reports whether the durable outbox (still) holds id.
+func (m *memStore) hasOutboxLocked(id string) bool {
+	for _, it := range m.outbox {
+		if it.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // ClaimOutbox claims up to limit dispatchable rows for claimer: unclaimed or
@@ -1464,18 +1780,29 @@ func (m *memStore) ClaimOutbox(ctx context.Context, claimer string, limit int) (
 	if claimer == "" || limit <= 0 {
 		return nil, nil
 	}
-	cutoff := time.Now().UTC().Add(-OutboxClaimTTL)
+	now := time.Now().UTC()
+	cutoff := now.Add(-OutboxClaimTTL)
 	out := []OutboxItem{}
 	for _, it := range m.outbox {
 		if len(out) >= limit {
 			break
+		}
+		// Dead letters are terminal: never claimable again until requeued.
+		if meta, ok := m.outboxMeta[it.ID]; ok {
+			if !meta.deadAt.IsZero() {
+				continue
+			}
+			// Boundary parity with the SQL `next_attempt_at <= now()`.
+			if !meta.nextAt.IsZero() && meta.nextAt.After(now) {
+				continue
+			}
 		}
 		// Boundary parity with the SQL claim (claimed_at < cutoff): a
 		// claim exactly at the cutoff is still honored.
 		if c, ok := m.outboxClaims[it.ID]; ok && !c.at.Before(cutoff) {
 			continue
 		}
-		m.outboxClaims[it.ID] = outboxClaim{claimer: claimer, at: time.Now().UTC()}
+		m.outboxClaims[it.ID] = outboxClaim{claimer: claimer, at: now}
 		out = append(out, it)
 	}
 	return out, nil
@@ -1608,9 +1935,19 @@ func (f *FaultyStore) GetSchedule(ctx context.Context, id string) (Schedule, boo
 	return inner.GetSchedule(ctx, id)
 }
 
-func (m *memStore) AppendLogBatch(ctx context.Context, entries []model.LogEntry, r LogBatchReceipt) (bool, error) {
+func (m *memStore) AppendLogBatch(ctx context.Context, entries []model.LogEntry, r LogBatchIdentity) (bool, error) {
+	if r.JobID == "" || r.BatchID == "" {
+		return false, fmt.Errorf("storage: log batch requires job id and batch id")
+	}
+	if len(entries) == 0 {
+		return false, fmt.Errorf("storage: empty log batch")
+	}
 	key := r.JobID + "\x00" + strconv.FormatInt(r.Generation, 10) + "\x00" + r.BatchID
-	if !m.logBatches.claim(key) {
+	claimed, conflict := m.logBatches.claim(key, LogBatchPayloadDigest(r, entries))
+	if conflict {
+		return false, ErrLogBatchConflict
+	}
+	if !claimed {
 		return false, nil
 	}
 	m.mu.Lock()
@@ -1619,7 +1956,9 @@ func (m *memStore) AppendLogBatch(ctx context.Context, entries []model.LogEntry,
 	return true, nil
 }
 
-func (f *FaultyStore) AppendLogBatch(ctx context.Context, entries []model.LogEntry, r LogBatchReceipt) (bool, error) {
+// AppendLogBatch passes the inner store's result (including
+// ErrLogBatchConflict) through untouched; only injected faults replace it.
+func (f *FaultyStore) AppendLogBatch(ctx context.Context, entries []model.LogEntry, r LogBatchIdentity) (bool, error) {
 	op := f.fail()
 	if op != nil {
 		return false, op

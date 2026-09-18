@@ -75,8 +75,9 @@ func TestCompletionReceiptsSurviveRestartReplay(t *testing.T) {
 	}
 
 	// The identical replay is idempotent: 204 from the restored receipt. The
-	// restarted process starts with zero usage metrics and an empty usage
-	// window, so any second accounting would be visible here.
+	// restarted process rebuilt its trailing-24h window from the durable job
+	// (exactly one entry); a replay must not append a second accounting, and
+	// the process-local metrics stay reset.
 	if w := completeTask(t, s2, task, runnerID, "success"); w.Code != http.StatusNoContent {
 		t.Fatalf("replayed complete = %d, want 204: %s", w.Code, w.Body.String())
 	}
@@ -86,9 +87,16 @@ func TestCompletionReceiptsSurviveRestartReplay(t *testing.T) {
 	}
 	s2.usageMu.Lock()
 	usageLen := len(s2.usage)
+	var windowEntry usageEntry
+	if usageLen > 0 {
+		windowEntry = s2.usage[0]
+	}
 	s2.usageMu.Unlock()
-	if usageLen != 0 {
-		t.Fatalf("replayed completion appended %d usage window entries", usageLen)
+	if usageLen != 1 {
+		t.Fatalf("replayed completion left %d usage window entries, want exactly the 1 rebuilt from disk", usageLen)
+	}
+	if windowEntry.Cost != first.Cost || windowEntry.EnergyWh != first.EnergyWh {
+		t.Fatalf("restarted usage window %+v does not match durable usage cost=%v energy=%v", windowEntry, first.Cost, first.EnergyWh)
 	}
 	s2.mu.Lock()
 	replayed := s2.jobs[task.Job.ID]

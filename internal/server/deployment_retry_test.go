@@ -62,11 +62,14 @@ func TestDeploymentFinishEffectRetriesAfterUpdateFailure(t *testing.T) {
 
 	// Store recovers. The failed flush left its claims on the rows it never
 	// reached; simulate the claim TTL passing (a crashed flusher's claims
-	// expire after storage.OutboxClaimTTL) so the restart claims them again.
+	// expire after storage.OutboxClaimTTL) AND the retry backoff elapsing
+	// (the durable row carries next_attempt_at), so the restart claims them
+	// again.
 	f.mu.Lock()
 	f.updateDeploymentErr = nil
 	f.outboxClaims = map[string]fakeOutboxClaim{}
 	f.mu.Unlock()
+	f.ForceAllOutboxDue()
 	s2 := New("token")
 	if err := s2.SwitchToDB(f); err != nil {
 		t.Fatal(err)
@@ -128,6 +131,7 @@ func TestDeploymentFinishEffectCreatesRecordAfterInsertRecovery(t *testing.T) {
 	f.mu.Lock()
 	f.deploymentInsertErr = nil
 	f.mu.Unlock()
+	f.ForceAllOutboxDue()
 	s2 := New("token")
 	if err := s2.SwitchToDB(f); err != nil {
 		t.Fatal(err)

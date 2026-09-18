@@ -28,7 +28,12 @@ steps:
           if go run ./scripts/wait-for-tcp.go postgres 5432 2>/dev/null; then break; fi
           sleep 2
         done
-      - KIWI_TEST_POSTGRES_URL=postgres://postgres:pass@postgres:5432/postgres?sslmode=disable go test -count=1 -timeout=20m -v -run Integration -coverprofile=integration-coverage.out -covermode=atomic ./internal/storage ./internal/scheduler ./internal/server ./internal/app
+      # -coverpkg=./... instruments cross-package production paths (e.g.
+      # internal/pipeline, internal/safefs, internal/forge) that the
+      # integration tests reach through the tested packages; dropping it
+      # silently narrows the profile and the merged floor measures less than
+      # it claims. scripts/ci-coverage-selftest.sh enforces its presence.
+      - KIWI_TEST_POSTGRES_URL=postgres://postgres:pass@postgres:5432/postgres?sslmode=disable go test -count=1 -timeout=20m -v -run Integration -coverprofile=integration-coverage.out -covermode=atomic -coverpkg=./... ./internal/storage ./internal/scheduler ./internal/server ./internal/app
 
   coverage:
     image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea

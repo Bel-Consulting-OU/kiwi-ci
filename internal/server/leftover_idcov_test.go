@@ -499,28 +499,21 @@ func TestLeftoverCancelScopedRunnerDenied(t *testing.T) {
 	}
 }
 
-// TestLeftoverInternalSchedulingError covers the in-memory scheduler's
-// Enqueue error path when the attached DB store cannot serve the atomic
-// compiled-run insert: the submission surfaces the store error.
-// baseOnlyStore exposes exactly the base storage.Store surface, hiding the
-// optional atomic-enqueue extension the scheduler needs.
+// TestLeftoverInternalSchedulingError covers the DB STARTUP path when the
+// store hides InsertCompiledRun: SwitchToDB must fail closed (the control
+// plane never starts in a mode that would enqueue non-atomically).
 type baseOnlyStore struct {
 	storage.Store
 }
 
-// TestLeftoverInternalSchedulingError covers the DB enqueue path when the
-// store attached to the SCHEDULER hides InsertCompiledRun: the scheduler's
-// Enqueue reports the missing atomic interface and the submission is refused
-// instead of being persisted non-atomically.
+// TestLeftoverInternalSchedulingError covers the fail-closed contract for a
+// store that hides InsertCompiledRun: DB startup is refused instead of
+// silently degrading the enqueue to a non-atomic scheduler path.
 func TestLeftoverInternalSchedulingError(t *testing.T) {
 	s := New("secret")
-	if err := s.SwitchToDB(baseOnlyStore{newDBFakeStore()}); err != nil {
-		t.Fatal(err)
-	}
-	c := newTestClient(t, s.Handler(), "secret")
-	w := c.do(http.MethodPost, "/api/v1/runs", SubmitRun{RepoURL: "https://github.com/o/r.git", Ref: "main", Pipeline: testPipeline}, nil)
-	if w.Code == http.StatusAccepted || !strings.Contains(w.Body.String(), "atomic enqueue") {
-		t.Fatalf("enqueue without the atomic store = %d: %s; want refusal", w.Code, w.Body.String())
+	err := s.SwitchToDB(baseOnlyStore{newDBFakeStore()})
+	if err == nil || !strings.Contains(err.Error(), "atomic") {
+		t.Fatalf("SwitchToDB without the atomic store = %v; want fail-closed startup", err)
 	}
 }
 

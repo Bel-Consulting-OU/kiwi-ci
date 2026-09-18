@@ -235,8 +235,17 @@ func TestMemStoreCompleteJobBranches(t *testing.T) {
 		t.Fatalf("completed job = %+v", got)
 	}
 	pending, err := m.OutboxPending(ctx)
-	if err != nil || len(pending) != len(CompletionEffectKinds()) {
+	// Split design: exactly two intents per completion — the internal
+	// completion_reconcile row and the external forge_delivery row.
+	if err != nil || len(pending) != 2 {
 		t.Fatalf("completion outbox = %v, %v", pending, err)
+	}
+	kinds := map[string]bool{}
+	for _, it := range pending {
+		kinds[it.Kind] = true
+	}
+	if !kinds[OutboxKindCompletionReconcile] || !kinds[OutboxKindForgeDelivery] {
+		t.Fatalf("completion outbox kinds = %v", kinds)
 	}
 
 	// Runner slot bookkeeping: capacity survivors, busy recompute, counters.

@@ -57,7 +57,9 @@
 #                                 timestamps stay truthful.
 #   BUILD_DATE                    explicit RFC3339 UTC BuildDate override
 #                                 (YYYY-MM-DDTHH:MM:SSZ). Any other value is
-#                                 rejected before the build.
+#                                 rejected before the build. Shape alone is not
+#                                 enough: the date must be a real UTC calendar
+#                                 time, which scripts/rfc3339check decides.
 #   COMMIT / REF                  build identity overrides. In release mode
 #                                 COMMIT must be the full 40-char SHA of the
 #                                 tagged commit.
@@ -90,21 +92,46 @@ require_sha256() {
 	fi
 }
 
-# require_rfc3339 verifies that a caller-supplied timestamp is exactly the
-# RFC3339 UTC form emitted by epoch_to_rfc3339 (YYYY-MM-DDTHH:MM:SSZ). The
-# case guard rejects characters outside the allowed set first -- including
-# whitespace and newlines -- so a multi-line value cannot pass on a matching
-# first line and then be whitespace-split by cmd/go into extra linker flags.
-require_rfc3339() {
+# require_rfc3339_shape verifies that an internally generated timestamp is
+# exactly the RFC3339 UTC form emitted by epoch_to_rfc3339
+# (YYYY-MM-DDTHH:MM:SSZ). The case guard rejects characters outside the
+# allowed set first -- including whitespace and newlines -- so a multi-line
+# value cannot pass on a matching first line and then be whitespace-split by
+# cmd/go into extra linker flags. This is the cheap check for values this
+# script produced itself; caller-supplied values go through require_rfc3339,
+# which additionally proves the date is a real calendar time.
+require_rfc3339_shape() {
 	value="$1"
 	label="$2"
 	case "$value" in
-	*[!0-9TZ:.-]*)
+	"" | *[!0-9TZ:.-]*)
 		die "$label must be an RFC3339 UTC timestamp (YYYY-MM-DDTHH:MM:SSZ), got '$value'"
 		;;
 	esac
 	if ! printf '%s\n' "$value" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'; then
 		die "$label must be an RFC3339 UTC timestamp (YYYY-MM-DDTHH:MM:SSZ), got '$value'"
+	fi
+}
+
+# require_rfc3339 verifies a caller-supplied timestamp. The case guard is the
+# same cheap charset defense-in-depth as above; the calendar truth (month,
+# day, and time ranges, no numeric offsets, canonical UTC "Z" spelling) is
+# decided by the scripts/rfc3339check Go helper, because a shape regex alone
+# accepts impossible dates such as 2006-13-45T99:99:99Z. Go is already
+# required to build, so the helper adds no new dependency. The helper runs
+# only on this caller-supplied path; internally generated timestamps are
+# shape-checked with require_rfc3339_shape.
+require_rfc3339() {
+	value="$1"
+	label="$2"
+	case "$value" in
+	"" | *[!0-9TZ:.-]*)
+		die "$label must be an RFC3339 UTC timestamp (YYYY-MM-DDTHH:MM:SSZ), got '$value'"
+		;;
+	esac
+	if ! err="$(go run ./scripts/rfc3339check "$value" 2>&1 >/dev/null)"; then
+		err="$(printf '%s\n' "$err" | head -n 1)"
+		die "$label must be a real UTC calendar timestamp in RFC3339 form (YYYY-MM-DDTHH:MM:SSZ), got '$value': $err"
 	fi
 }
 
@@ -221,9 +248,12 @@ if [ "$SNAPSHOT" = "1" ]; then
 	OUT="dist/snapshot"
 	if [ -n "${SOURCE_DATE_EPOCH:-}" ]; then
 		BUILD_DATE="$(epoch_to_rfc3339 "$SOURCE_DATE_EPOCH")"
-	else
-		BUILD_DATE="${BUILD_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+		require_rfc3339_shape "$BUILD_DATE" "BUILD_DATE"
+	elif [ -n "${BUILD_DATE:-}" ]; then
 		require_rfc3339 "$BUILD_DATE" "BUILD_DATE"
+	else
+		BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+		require_rfc3339_shape "$BUILD_DATE" "BUILD_DATE"
 	fi
 	echo "release: SNAPSHOT build (NOT a release): version=$VERSION commit=$COMMIT ref=$REF dirty=$DIRTY"
 else
@@ -266,9 +296,11 @@ else
 		require_rfc3339 "$BUILD_DATE" "BUILD_DATE"
 	elif [ -n "${SOURCE_DATE_EPOCH:-}" ]; then
 		BUILD_DATE="$(epoch_to_rfc3339 "$SOURCE_DATE_EPOCH")"
+		require_rfc3339_shape "$BUILD_DATE" "BUILD_DATE"
 	else
 		SOURCE_DATE_EPOCH="$(git log -1 --format=%ct "$TAG")"
 		BUILD_DATE="$(epoch_to_rfc3339 "$SOURCE_DATE_EPOCH")"
+		require_rfc3339_shape "$BUILD_DATE" "BUILD_DATE"
 	fi
 	echo "release: RELEASE build: version=$VERSION tag=$TAG commit=$COMMIT source_date_epoch=${SOURCE_DATE_EPOCH:-unset}"
 

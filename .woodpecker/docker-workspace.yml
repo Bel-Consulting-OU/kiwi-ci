@@ -3,6 +3,16 @@
 # a skip. This workflow selects a Docker-capable agent by label; agents
 # without the label never run it. The best-effort smoke variant lives in
 # linux-amd64.yml and skips cleanly when no daemon exists.
+#
+# Self-contained image: golang:1.27 does not guarantee a Docker CLI, so the
+# lane builds its own test image from .woodpecker/ci/Dockerfile on the
+# agent's daemon and runs the next step in it. Nothing has to be published to
+# or pulled from a registry for kiwi-ci-test.
+#
+# `pull` is a boolean step option in the Woodpecker schema (no "never" value);
+# `pull: false` is the documented "do not force a pull" setting. The image is
+# already present on the daemon after the build step, so the test step runs
+# the locally built layers.
 labels:
   platform: linux-amd64
   capability: docker
@@ -11,15 +21,23 @@ when:
   - event: [push, pull_request, manual, tag]
 
 steps:
+  build-ci-image:
+    image: docker:cli@sha256:018edbc908e08fcc9dbf029c812c34251e9b4719e6f71ca0e5eae2a987d014ca
+    pull: false
+    commands:
+      - docker build -f .woodpecker/ci/Dockerfile -t kiwi-ci-test:go1.27 .
+
   docker-workspace:
-    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    image: kiwi-ci-test:go1.27
+    pull: false
+    depends_on: [build-ci-image]
     environment:
       GOTOOLCHAIN: local
       KIWI_TEST_DOCKER: "1"
     commands:
       - |
         if ! command -v docker >/dev/null 2>&1; then
-          echo "required docker lane: docker CLI is not installed on this labeled agent" >&2
+          echo "required docker lane: docker CLI is missing from the kiwi-ci-test image" >&2
           exit 1
         fi
         if ! docker info >/dev/null 2>&1; then

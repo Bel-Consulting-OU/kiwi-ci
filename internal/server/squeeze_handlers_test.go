@@ -399,12 +399,13 @@ func TestSqueezeEnqueueMemoryPersistFailure(t *testing.T) {
 }
 
 // noAtomicEnqueueStore hides InsertCompiledRun (a RunEnqueueStore-only
-// method) behind the base storage.Store interface so the server takes the
-// scheduler fallback path.
+// method) behind the base storage.Store interface.
 type noAtomicEnqueueStore struct{ storage.Store }
 
-// TestSqueezeEnqueueDBFallback covers the non-RunEnqueueStore fallback and
-// its delivery-upsert failure log.
+// TestSqueezeEnqueueDBFallback is the fail-closed regression (P2 defect 3):
+// a store without the atomic compiled-run enqueue contract must REFUSE the
+// submission instead of falling back to a non-atomic scheduler enqueue plus a
+// best-effort delivery upsert (which reintroduced the webhook-claim race).
 func TestSqueezeEnqueueDBFallback(t *testing.T) {
 	s, err := NewPersistent("secret", "secret", t.TempDir())
 	if err != nil {
@@ -418,18 +419,16 @@ func TestSqueezeEnqueueDBFallback(t *testing.T) {
 		Ref: "refs/heads/main", SHA: "sha", Event: "push", Pipeline: untrustedPipeline,
 		Metadata: map[string]string{"github_delivery": "fallback-1"},
 	}
-	run, err := s.enqueue(in)
-	if err != nil {
-		t.Fatalf("fallback enqueue: %v", err)
+	if _, err := s.enqueue(in); err == nil || !strings.Contains(err.Error(), "atomic") {
+		t.Fatalf("enqueue without the atomic contract = %v, want a fail-closed error", err)
 	}
-	if run.ID == "" {
-		t.Fatal("empty run")
-	}
-
-	f.upsertDeliveryErr = errStaticKindMissing
-	in.Metadata["github_delivery"] = "fallback-2"
-	if _, err := s.enqueue(in); err != nil {
-		t.Fatalf("fallback enqueue with failing delivery upsert: %v", err)
+	// Fail closed means NOTHING is written: no run, no jobs, no delivery.
+	f.mu.Lock()
+	runs := len(f.runs)
+	deliveries := len(f.deliveries)
+	f.mu.Unlock()
+	if runs != 0 || deliveries != 0 {
+		t.Fatalf("failed-closed enqueue wrote runs=%d deliveries=%d, want 0/0", runs, deliveries)
 	}
 }
 

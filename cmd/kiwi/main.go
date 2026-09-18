@@ -75,6 +75,8 @@ func dispatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return app.TUI(ctx, args[1:])
 	case "database":
 		return databaseCommand(ctx, args[1:])
+	case "outbox":
+		return app.Outbox(ctx, args[1:])
 	case "config":
 		return configCommand(ctx, args[1:])
 	case "version", "--version", "-v":
@@ -148,6 +150,7 @@ Usage:
                 [--config kiwi.toml]
   kiwi config check --config kiwi.toml
   kiwi database migrate|status --database-url URL
+  kiwi outbox dead-letters list|requeue|delete [--database-url URL] [ID]
   kiwi runner   --server http://127.0.0.1:8080 --token TOKEN [--drain]
   kiwi runner list|drain|disable|enable --server URL --token ADMIN_TOKEN [RUNNER_ID]
   kiwi dispatch --repo owner/name --ref main --input k=v --pipeline FILE
