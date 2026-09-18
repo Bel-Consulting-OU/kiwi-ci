@@ -19,7 +19,9 @@
 #   --snapshot         branch/dirty development build. Records the short SHA
 #                      and a "-snapshot+<shortsha>" version suffix, labels the
 #                      bundle with a SNAPSHOT marker, never touches
-#                      Formula/kiwi.rb, and does not require a signing key.
+#                      Formula/kiwi.rb, and is never signed: it ignores
+#                      KIWI_RELEASE_SIGNING_KEY entirely (neither reads nor
+#                      materializes it, and never passes -key to release-tool).
 #   --render-formula   internal helper used by scripts/release-formula-test.sh:
 #                      renders Formula/kiwi.rb.tmpl deterministically.
 #
@@ -42,8 +44,10 @@
 #   KIWI_RELEASE_SIGNING_KEY      Ed25519 PKCS#8 private key PEM, or a path
 #                                 to a PEM file. Required in release mode
 #                                 unless --allow-unsigned /
-#                                 KIWI_ALLOW_UNSIGNED_RELEASE=1. Optional in
-#                                 snapshot mode.
+#                                 KIWI_ALLOW_UNSIGNED_RELEASE=1. Ignored in
+#                                 snapshot mode: snapshots are never signed,
+#                                 so the variable is neither read nor
+#                                 materialized and -key is never passed.
 #   KIWI_ALLOW_UNSIGNED_RELEASE   set to 1 to permit an unsigned release
 #                                 (disaster recovery only) unless an explicit
 #                                 --require-signing was given, which always
@@ -362,7 +366,17 @@ go build -trimpath -buildvcs=false \
 -X github.com/Bel-Consulting-OU/kiwi-ci/internal/version.Commit=$COMMIT" \
 	-o "$TMP_DIR/release-tool" ./cmd/release-tool
 
-if [ -n "${KIWI_RELEASE_SIGNING_KEY:-}" ]; then
+# Signing key resolution. Snapshots are never signed, so snapshot mode is
+# handled first and unconditionally: KEY_FILE stays empty and
+# KIWI_RELEASE_SIGNING_KEY is never read or materialized, no matter what the
+# environment happens to contain. Release mode keeps the fail-closed policy
+# validated above: an existing path is used in place, inline PEM contents are
+# written to a mode-600 temp file, and an empty key stays on the already
+# permitted unsigned disaster-release path.
+if [ "$SNAPSHOT" = "1" ]; then
+	KEY_FILE=""
+	echo "release: snapshot build WITHOUT provenance signing (snapshots are never signed)" >&2
+elif [ -n "${KIWI_RELEASE_SIGNING_KEY:-}" ]; then
 	if [ -f "$KIWI_RELEASE_SIGNING_KEY" ]; then
 		KEY_FILE="$KIWI_RELEASE_SIGNING_KEY"
 	else
@@ -373,11 +387,7 @@ if [ -n "${KIWI_RELEASE_SIGNING_KEY:-}" ]; then
 	fi
 else
 	KEY_FILE=""
-	if [ "$SNAPSHOT" = "1" ]; then
-		echo "release: snapshot build WITHOUT provenance signing (no KIWI_RELEASE_SIGNING_KEY)" >&2
-	else
-		echo "release: proceeding WITHOUT provenance signing (unsigned disaster release)" >&2
-	fi
+	echo "release: proceeding WITHOUT provenance signing (unsigned disaster release)" >&2
 fi
 
 for name in kiwi-darwin-arm64 kiwi-darwin-amd64 kiwi-linux-arm64 kiwi-linux-amd64 kiwi-windows-amd64.exe; do

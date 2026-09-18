@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,6 +42,16 @@ type fakeStore struct {
 	cancelRunCalls     []cancelRunCall
 	updateJobCalls     []model.Job
 	releaseRunnerCalls []releaseRunnerCall
+
+	// Transactional recovery/revocation calls: the scheduler must issue
+	// exactly ONE of these per transition (never the retired multi-step
+	// UpdateJob+ReleaseRunnerJob sequence).
+	revokeCalls  []revokeCall
+	recoverCalls []recoverCall
+	expireCalls  []expireCall
+	revokeErr    error
+	recoverErr   error
+	expireErr    error
 
 	// quotaReservations backs the storage.QuotaCounterStore contract so the
 	// queue-timeout/lease paths that maintain reserved counters can be
@@ -94,6 +105,21 @@ type releaseRunnerCall struct {
 	Status   model.Status
 }
 
+type revokeCall struct {
+	RunnerID string
+	Reason   string
+}
+
+type recoverCall struct {
+	JobID      string
+	Generation int64
+}
+
+type expireCall struct {
+	JobID    string
+	Deadline time.Time
+}
+
 func newFakeStore() *fakeStore {
 	return &fakeStore{
 		runs:         map[string]model.Run{},
@@ -109,6 +135,7 @@ var _ storage.Store = (*fakeStore)(nil)
 var _ storage.ProfileStore = (*fakeStore)(nil)
 var _ storage.QuotaCounterStore = (*fakeStore)(nil)
 var _ storage.RunEnqueueStore = (*fakeStore)(nil)
+var _ storage.RecoveryStore = (*fakeStore)(nil)
 
 // InsertCompiledRun applies the atomic enqueue in memory: the run, its jobs
 // (with the request's authoritative dependency edges), the supersede
@@ -307,6 +334,255 @@ func (f *fakeStore) releaseRunnerSlotLocked(runnerID, jobID string) {
 	}
 	r.Busy = r.Capacity > 0 && len(r.ActiveJobs) >= r.Capacity
 	f.runners[runnerID] = r
+}
+
+// fakeAdjustQuotaLocked shifts the fake's reserved counters (caller holds
+// f.mu), mirroring the storage counter updates (clamped at zero).
+func (f *fakeStore) fakeAdjustQuotaLocked(repoID string, runningDelta, queuedDelta int) {
+	if f.quotaReservations == nil {
+		f.quotaReservations = map[string][2]int{}
+	}
+	for _, key := range storage.QuotaKeys(repoID) {
+		if key == "" {
+			continue
+		}
+		c := f.quotaReservations[key]
+		c[0] += runningDelta
+		if c[0] < 0 {
+			c[0] = 0
+		}
+		c[1] += queuedDelta
+		if c[1] < 0 {
+			c[1] = 0
+		}
+		f.quotaReservations[key] = c
+	}
+}
+
+// recomputeRunLocked mirrors storage's run aggregation from the fake's job
+// states (caller holds f.mu).
+func (f *fakeStore) recomputeRunLocked(runID string, now time.Time) {
+	r, ok := f.runs[runID]
+	if !ok || r.Status == model.StatusCancelled {
+		return
+	}
+	var total, terminal int
+	var anyRunning, anyFailure, anyCancelled, anyWaiting bool
+	var firstStart, lastFinish *time.Time
+	for _, j := range f.jobs {
+		if j.RunID != runID {
+			continue
+		}
+		total++
+		if j.StartedAt != nil && (firstStart == nil || j.StartedAt.Before(*firstStart)) {
+			t := *j.StartedAt
+			firstStart = &t
+		}
+		if j.Status.Terminal() {
+			terminal++
+			if j.FinishedAt != nil && (lastFinish == nil || j.FinishedAt.After(*lastFinish)) {
+				t := *j.FinishedAt
+				lastFinish = &t
+			}
+		}
+		switch j.Status {
+		case model.StatusRunning:
+			anyRunning = true
+		case model.StatusFailure, model.StatusBlocked:
+			anyFailure = true
+		case model.StatusCancelled:
+			anyCancelled = true
+		case model.StatusWaitingApproval:
+			anyWaiting = true
+		}
+	}
+	if total == 0 {
+		return
+	}
+	switch {
+	case terminal == total:
+		switch {
+		case anyFailure:
+			r.Status = model.StatusFailure
+		case anyCancelled:
+			r.Status = model.StatusCancelled
+		default:
+			r.Status = model.StatusSuccess
+		}
+		r.FinishedAt = lastFinish
+		if r.FinishedAt == nil {
+			n := now.UTC()
+			r.FinishedAt = &n
+		}
+	case anyRunning:
+		r.Status = model.StatusRunning
+	case anyWaiting:
+		r.Status = model.StatusWaitingApproval
+	default:
+		r.Status = model.StatusQueued
+	}
+	if r.StartedAt == nil && firstStart != nil {
+		r.StartedAt = firstStart
+	}
+	f.runs[runID] = r
+}
+
+// RevokeRunnerLeases is the transactional kill switch on the fake store: the
+// whole runner-scoped transition commits under f.mu, mirroring the real
+// RecoveryStore contract.
+func (f *fakeStore) RevokeRunnerLeases(ctx context.Context, runnerID, reason string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.revokeCalls = append(f.revokeCalls, revokeCall{RunnerID: runnerID, Reason: reason})
+	if f.revokeErr != nil {
+		return nil, f.revokeErr
+	}
+	now := time.Now().UTC()
+	ids := []string{}
+	for id, j := range f.jobs {
+		if j.Status == model.StatusRunning && j.LeaseRunnerID == runnerID {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	changed := map[string]bool{}
+	runIDs := map[string]bool{}
+	for _, id := range ids {
+		j := f.jobs[id]
+		requeue := j.Attempts <= j.MaxInfraRetries
+		if requeue {
+			j.Status = model.StatusQueued
+			j.Error = reason + "; retrying"
+		} else {
+			j.Status = model.StatusCancelled
+			j.Error = reason
+			j.FinishedAt = &now
+		}
+		j.LeaseRunnerID = ""
+		j.LeaseTokenHash = nil
+		j.LeaseExpiresAt = nil
+		f.jobs[id] = j
+		if requeue {
+			f.fakeAdjustQuotaLocked(storage.RepoIDForJob(j), -1, 1)
+		} else {
+			f.fakeAdjustQuotaLocked(storage.RepoIDForJob(j), -1, 0)
+		}
+		action := "job.runner_disabled_cancelled"
+		if requeue {
+			action = "job.runner_disabled_requeued"
+		}
+		f.audit = append(f.audit, model.AuditEvent{ID: id + "|" + action, Action: action, Actor: "admin", RunID: j.RunID, JobID: j.ID, Message: reason, CreatedAt: now})
+		changed[id] = true
+		if j.RunID != "" {
+			runIDs[j.RunID] = true
+		}
+	}
+	for _, id := range ids {
+		f.releaseRunnerSlotLocked(runnerID, id)
+		if r, ok := f.runners[runnerID]; ok {
+			r.Failed++
+			r.LastSeen = now
+			f.runners[runnerID] = r
+		}
+	}
+	f.recomputeDependentsLocked(changed, now)
+	for runID := range runIDs {
+		f.recomputeRunLocked(runID, now)
+	}
+	return ids, nil
+}
+
+// RecoverExpiredLease is the single expired-lease transition on the fake
+// store, mirroring the real RecoveryStore contract.
+func (f *fakeStore) RecoverExpiredLease(ctx context.Context, jobID string, expectedGeneration int64, now time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.recoverCalls = append(f.recoverCalls, recoverCall{JobID: jobID, Generation: expectedGeneration})
+	if f.recoverErr != nil {
+		return f.recoverErr
+	}
+	j, ok := f.jobs[jobID]
+	if !ok {
+		return storage.ErrNotFound
+	}
+	if j.Status != model.StatusRunning || j.LeaseGeneration != expectedGeneration {
+		return nil
+	}
+	if j.LeaseExpiresAt != nil && j.LeaseExpiresAt.After(now) {
+		return nil
+	}
+	requeue := j.Attempts <= j.MaxInfraRetries
+	if requeue {
+		j.Status = model.StatusQueued
+		j.Error = "runner lease expired; retrying"
+	} else {
+		j.Status = model.StatusFailure
+		j.Error = "runner lease expired and infrastructure retry budget exhausted"
+		j.FinishedAt = &now
+	}
+	runnerID := j.LeaseRunnerID
+	j.LeaseRunnerID = ""
+	j.LeaseTokenHash = nil
+	j.LeaseExpiresAt = nil
+	f.jobs[jobID] = j
+	if requeue {
+		f.fakeAdjustQuotaLocked(storage.RepoIDForJob(j), -1, 1)
+	} else {
+		f.fakeAdjustQuotaLocked(storage.RepoIDForJob(j), -1, 0)
+	}
+	if runnerID != "" {
+		f.releaseRunnerSlotLocked(runnerID, jobID)
+		if r, ok := f.runners[runnerID]; ok {
+			r.Failed++
+			r.LastSeen = now
+			f.runners[runnerID] = r
+		}
+	}
+	action := "job.lease_expired"
+	msg := "job requeued after lost runner"
+	if !requeue {
+		action = "job.lost_runner"
+		msg = j.Error
+	}
+	f.audit = append(f.audit, model.AuditEvent{ID: jobID + "|" + action, Action: action, Actor: "scheduler", RunID: j.RunID, JobID: j.ID, Message: msg, CreatedAt: now})
+	f.recomputeDependentsLocked(map[string]bool{jobID: true}, now)
+	f.recomputeRunLocked(j.RunID, now)
+	return nil
+}
+
+// ExpireQueuedJob is the single queue-timeout transition on the fake store,
+// mirroring the real RecoveryStore contract.
+func (f *fakeStore) ExpireQueuedJob(ctx context.Context, jobID string, deadline time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.expireCalls = append(f.expireCalls, expireCall{JobID: jobID, Deadline: deadline})
+	if f.expireErr != nil {
+		return f.expireErr
+	}
+	j, ok := f.jobs[jobID]
+	if !ok {
+		return storage.ErrNotFound
+	}
+	if j.Status != model.StatusQueued && j.Status != model.StatusWaitingApproval {
+		return nil
+	}
+	now := time.Now().UTC()
+	eff := storage.QueueDeadlineFor(j)
+	if eff == nil || eff.After(deadline) || deadline.After(now) {
+		return nil
+	}
+	j.Status = model.StatusCancelled
+	j.Error = "queue timeout"
+	j.FinishedAt = &now
+	j.LeaseRunnerID = ""
+	j.LeaseTokenHash = nil
+	j.LeaseExpiresAt = nil
+	f.jobs[jobID] = j
+	f.fakeAdjustQuotaLocked(storage.RepoIDForJob(j), 0, -1)
+	f.audit = append(f.audit, model.AuditEvent{ID: jobID + "|job.queue_timeout", Action: "job.queue_timeout", Actor: "scheduler", RunID: j.RunID, JobID: j.ID, Message: "job cancelled after queue deadline", CreatedAt: now})
+	f.recomputeDependentsLocked(map[string]bool{jobID: true}, now)
+	f.recomputeRunLocked(j.RunID, now)
+	return nil
 }
 
 // AdjustQuotaCounter shifts the reserved counters for the key pair,

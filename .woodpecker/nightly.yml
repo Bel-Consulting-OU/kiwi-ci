@@ -1,7 +1,7 @@
 # Nightly: long-budget fuzzing plus the stress battery. Cron events are
 # configured on the Woodpecker repository (schedule trigger).
 labels:
-  platform: linux-amd64
+  platform: linux/amd64
 
 when:
   - event: [cron, manual]
@@ -12,6 +12,9 @@ steps:
     environment:
       GOTOOLCHAIN: local
     commands:
+      # First command of the first step: exact toolchain assertion (go.mod
+      # vs README.md vs the running `go`) before the long fuzz budget starts.
+      - ./scripts/toolchain-check.sh
       - ./scripts/fuzz-smoke.sh 5m
 
   stress:

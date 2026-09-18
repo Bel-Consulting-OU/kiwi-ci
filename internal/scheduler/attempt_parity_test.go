@@ -8,31 +8,14 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
-// attemptParityStore combines the capacity-atomic lease fake (which applies
-// the real lease-time attempts++ exactly once) with the runner-job listing
-// the disable kill switch consumes.
-type attemptParityStore struct {
-	*atomicFakeStore
-}
-
-func (a *attemptParityStore) ListJobsByRunner(ctx context.Context, runnerID string) ([]model.Job, error) {
-	a.fakeStore.mu.Lock()
-	defer a.fakeStore.mu.Unlock()
-	out := []model.Job{}
-	for _, j := range a.fakeStore.jobs {
-		if j.Status == model.StatusRunning && j.LeaseRunnerID == runnerID {
-			out = append(out, j)
-		}
-	}
-	return out, nil
-}
-
 // leasedParityJob returns a store whose single leader-scheduler job holds a
 // REAL lease (attempts incremented once by the claim), then expires the
-// lease so both recovery paths see the identical expired-lease state.
-func leasedParityJob(t *testing.T, maxInfraRetries int) (*attemptParityStore, *DBScheduler) {
+// lease so both recovery paths see the identical expired-lease state. The
+// atomicFakeStore's embedded fakeStore implements the transactional
+// RecoveryStore the kill switch and lease recovery now consume.
+func leasedParityJob(t *testing.T, maxInfraRetries int) (*atomicFakeStore, *DBScheduler) {
 	t.Helper()
-	st := &attemptParityStore{atomicFakeStore: newAtomicFakeStore()}
+	st := newAtomicFakeStore()
 	st.setLeader(true, nil)
 	now := time.Now().UTC()
 	st.putRun(model.Run{ID: "run", Repo: "https://github.com/o/r.git", RepoFullName: "o/r", Status: model.StatusRunning, CreatedAt: now})
@@ -56,8 +39,10 @@ func leasedParityJob(t *testing.T, maxInfraRetries int) (*attemptParityStore, *D
 
 // releaseAttemptParityRunnerSlot clears the atomic fake's active set after a
 // recovery pass, mirroring what the real store's release does, so the job can
-// be re-leased by the parity assertion.
-func releaseAttemptParityRunnerSlot(st *attemptParityStore) {
+// be re-leased by the parity assertion. The embedded fakeStore recovery
+// updates the runner row; the atomic fake's separate capacity map is cleared
+// here, exactly as before.
+func releaseAttemptParityRunnerSlot(st *atomicFakeStore) {
 	st.mu.Lock()
 	delete(st.active, "runner")
 	st.mu.Unlock()

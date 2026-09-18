@@ -22,7 +22,7 @@ script exits non-zero with a precise message and publishes nothing.
 | Tag points at `HEAD`, recorded commit = tagged commit | required | n/a |
 | Recorded commit is the full 40-char lowercase SHA | required | short SHA (or explicit override) |
 | Clean git tree | required | allowed; `.dirty` is appended to the version |
-| Ed25519 signing key (`KIWI_RELEASE_SIGNING_KEY`) | required unless `--allow-unsigned` or `KIWI_ALLOW_UNSIGNED_RELEASE=1`; an explicit `--require-signing` overrides the env var | optional; unsigned snapshots are normal. `--require-signing` is rejected (release-only flag); `--allow-unsigned` is accepted and ignored |
+| Ed25519 signing key (`KIWI_RELEASE_SIGNING_KEY`) | required unless `--allow-unsigned` or `KIWI_ALLOW_UNSIGNED_RELEASE=1`; an explicit `--require-signing` overrides the env var | ignored entirely, even when set: snapshots are never signed, so the variable is never read or materialized and `release-tool` is never invoked with `-key`. `--require-signing` is rejected (release-only flag); `--allow-unsigned` is accepted and ignored |
 | `Formula/kiwi.rb` re-rendered from `Formula/kiwi.rb.tmpl` | every release, unconditionally | never; snapshot builds skip formula rendering rather than refusing |
 | Bundle location | `dist/release/` | `dist/snapshot/`, with a `SNAPSHOT` marker file |
 | `SOURCE_DATE_EPOCH` default | committer date of the tagged commit | current time unless set |
@@ -49,6 +49,10 @@ builds only: snapshots are never signed, so `--snapshot --require-signing` is
 rejected during argument validation with a usage error before any git or build
 work, and the caller must drop the flag. `--allow-unsigned` is accepted and
 ignored for snapshots (it changes nothing, since snapshots are never signed).
+Snapshot signing does not depend on the environment: in snapshot mode
+`KIWI_RELEASE_SIGNING_KEY` is never read or materialized and `release-tool` is
+never invoked with `-key`, so a signing key that happens to be exported in the
+environment cannot silently sign a snapshot.
 
 Invocation:
 
@@ -73,7 +77,11 @@ Snapshot versions look like `0.1.0-dev-snapshot+1a2b3c4` (or
 states the build is not a release. Snapshots are for testing; they are never
 published as releases, never update the Homebrew formula, and are never
 signed: `--snapshot --require-signing` is rejected as a usage error, while
-`--snapshot --allow-unsigned` is accepted and ignored.
+`--snapshot --allow-unsigned` is accepted and ignored. The signing key is
+ignored in snapshot mode even when `KIWI_RELEASE_SIGNING_KEY` is set in the
+environment (PEM or path): the variable is neither read nor materialized, no
+key temp file is created, and `release-tool` receives no `-key` argument, so
+snapshot behavior does not depend on the caller's environment.
 
 ## 2. Homebrew formula rendering
 
@@ -234,8 +242,9 @@ canonical shape.
 - Algorithm: Ed25519.
 - Private key: PKCS#8 PEM, supplied to `scripts/release.sh` through
   `KIWI_RELEASE_SIGNING_KEY` (either the PEM contents or a path to a file).
-  It must never be committed; keep it in the release CI secret store, ideally
-  backed by an HSM or a hardware token used by an offline signer.
+  Release mode only: the variable is ignored for snapshots, which are never
+  signed. It must never be committed; keep it in the release CI secret store,
+  ideally backed by an HSM or a hardware token used by an offline signer.
 - Public key: PKIX `PUBLIC KEY` PEM, published for verifiers and accepted by
   `kiwi verify --trusted-key`.
 - The private key is **distinct** from the control plane's provenance key

@@ -148,3 +148,43 @@ func TestOutboxInMemoryPersistenceOptional(t *testing.T) {
 		t.Fatal("item not queued")
 	}
 }
+
+// TestOutboxEnqueueSameIDConflictFS pins J2-4 for the fs/memory queue: an ID
+// that already exists locally is an idempotent success only when the content
+// matches (semantic JSON compare, empty payload == "{}"); the same ID with a
+// different payload or kind is a typed invariant conflict that must not
+// silently succeed or mutate the queued intent.
+func TestOutboxEnqueueSameIDConflictFS(t *testing.T) {
+	o := NewOutbox(nil)
+	first := forge.OutboxItem{ID: "fixed-intent", Kind: forge.OutboxKindGitHubStatus, Payload: []byte(`{"a":1}`)}
+	if err := o.Enqueue(first); err != nil {
+		t.Fatalf("first enqueue: %v", err)
+	}
+	if err := o.Enqueue(first); err != nil {
+		t.Fatalf("same-payload replay must be a success: %v", err)
+	}
+	if err := o.Enqueue(forge.OutboxItem{ID: "fixed-intent", Kind: forge.OutboxKindGitHubStatus, Payload: []byte(`{ "a" : 1 }`)}); err != nil {
+		t.Fatalf("semantically-equal payload replay must be a success: %v", err)
+	}
+	if got := len(o.Pending()); got != 1 {
+		t.Fatalf("replay duplicated the queued intent: %d", got)
+	}
+	if err := o.Enqueue(forge.OutboxItem{ID: "fixed-intent", Kind: forge.OutboxKindGitHubStatus, Payload: []byte(`{"a":2}`)}); !errors.Is(err, ErrOutboxIDConflict) {
+		t.Fatalf("different payload error = %v, want ErrOutboxIDConflict", err)
+	}
+	if err := o.Enqueue(forge.OutboxItem{ID: "fixed-intent", Kind: forge.OutboxKindGitHubCheck, Payload: []byte(`{"a":1}`)}); !errors.Is(err, ErrOutboxIDConflict) {
+		t.Fatalf("different kind error = %v, want ErrOutboxIDConflict", err)
+	}
+	got := o.Pending()
+	if len(got) != 1 || got[0].Kind != forge.OutboxKindGitHubStatus || string(got[0].Payload) != `{"a":1}` {
+		t.Fatalf("conflict mutated the queue: %+v", got)
+	}
+	// An empty payload is the same intent as "{}", mirroring OutboxAppend.
+	o2 := NewOutbox(nil)
+	if err := o2.Enqueue(forge.OutboxItem{ID: "empty-payload", Kind: "k", Payload: nil}); err != nil {
+		t.Fatal(err)
+	}
+	if err := o2.Enqueue(forge.OutboxItem{ID: "empty-payload", Kind: "k", Payload: []byte("{}")}); err != nil {
+		t.Fatalf("empty payload replay must be a success: %v", err)
+	}
+}

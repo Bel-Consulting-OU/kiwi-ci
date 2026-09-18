@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -101,6 +102,7 @@ var (
 	_ TestHistoryStore        = (*FaultyStore)(nil)
 	_ ArtifactIdempotentStore = (*FaultyStore)(nil)
 	_ GeneratedFragmentStore  = (*FaultyStore)(nil)
+	_ RecoveryStore           = (*FaultyStore)(nil)
 )
 
 func (f *FaultyStore) Close() error { return f.Inner.Close() }
@@ -233,6 +235,45 @@ func (f *FaultyStore) ReleaseRunnerJob(ctx context.Context, runnerID, jobID stri
 		return err
 	}
 	return f.Inner.ReleaseRunnerJob(ctx, runnerID, jobID, status)
+}
+
+func (f *FaultyStore) RevokeRunnerLeases(ctx context.Context, runnerID, reason string) ([]string, error) {
+	inner, ok := f.Inner.(RecoveryStore)
+	if !ok {
+		return nil, errMissingInnerInterface("RecoveryStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return nil, err
+	}
+	return inner.RevokeRunnerLeases(ctx, runnerID, reason)
+}
+
+func (f *FaultyStore) RecoverExpiredLease(ctx context.Context, jobID string, expectedGeneration int64, now time.Time) error {
+	inner, ok := f.Inner.(RecoveryStore)
+	if !ok {
+		return errMissingInnerInterface("RecoveryStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return inner.RecoverExpiredLease(ctx, jobID, expectedGeneration, now)
+}
+
+func (f *FaultyStore) ExpireQueuedJob(ctx context.Context, jobID string, deadline time.Time) error {
+	inner, ok := f.Inner.(RecoveryStore)
+	if !ok {
+		return errMissingInnerInterface("RecoveryStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return inner.ExpireQueuedJob(ctx, jobID, deadline)
 }
 
 func (f *FaultyStore) InsertArtifact(ctx context.Context, a model.ArtifactRecord) error {
@@ -1214,6 +1255,16 @@ type memStore struct {
 	// a mid-enqueue failure leaves zero rows (run included). One-shot.
 	enqueueFaultOps int
 	enqueueFaultErr error
+
+	// recoveryFaultOps, when > 0, makes the next RecoveryStore transaction
+	// fail after staging that many operations with recoveryFaultErr: the
+	// in-memory analogue of a statement failure at the Nth write INSIDE a
+	// recovery transaction. The staged writes are discarded on failure, so
+	// tests can prove the whole transition (job, runner slot, quota, run
+	// aggregation, audit) rolls back and no partial state is observable.
+	// One-shot.
+	recoveryFaultOps int
+	recoveryFaultErr error
 }
 
 // quotaCounts is the in-memory reserved counter pair for one quota key.
@@ -1312,6 +1363,7 @@ var (
 	_ CertRevocationStore     = (*memStore)(nil)
 	_ EnrollGrantStore        = (*memStore)(nil)
 	_ TestHistoryStore        = (*memStore)(nil)
+	_ RecoveryStore           = (*memStore)(nil)
 )
 
 func (m *memStore) Close() error { return nil }
@@ -1684,6 +1736,410 @@ func (m *memStore) releaseJobQuotaLocked(jobID string) {
 		queuedDelta = 1
 	}
 	m.adjustQuotaLocked(RepoIDForJob(j), -1, queuedDelta)
+}
+
+// ---------------------------------------------------------------------------
+// transactional lease recovery / revocation (in-memory mirrors)
+// ---------------------------------------------------------------------------
+//
+// The three methods below apply the whole transition to OVERLAY copies of the
+// affected collections and swap them in only when every staged write
+// succeeded. A failure injected through recoveryFaultOps therefore leaves the
+// committed state exactly as it was — the in-memory equivalent of a rolled
+// back SQL transaction.
+
+// recoveryBump advances the staged-write counter of the current recovery
+// transaction and returns the injected failure when the configured op is
+// reached. It is one-shot, mirroring enqueueFaultOps.
+func recoveryBump(ops *int, errp *error, staged *int) error {
+	if *ops <= 0 {
+		return nil
+	}
+	*staged++
+	if *staged < *ops {
+		return nil
+	}
+	err := *errp
+	*ops = 0
+	*errp = nil
+	if err == nil {
+		err = errors.New("storage: injected recovery failure")
+	}
+	return err
+}
+
+// recoveryBumpFor is the bound form used by the memStore methods.
+func (m *memStore) recoveryBumpFor(staged *int) error {
+	return recoveryBump(&m.recoveryFaultOps, &m.recoveryFaultErr, staged)
+}
+
+func cloneRecoveryJobs(in map[string]model.Job) map[string]model.Job {
+	out := make(map[string]model.Job, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneRecoveryRunners(in map[string]model.Runner) map[string]model.Runner {
+	out := make(map[string]model.Runner, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneRecoveryRuns(in map[string]model.Run) map[string]model.Run {
+	out := make(map[string]model.Run, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneRecoveryQuotas(in map[string]quotaCounts) map[string]quotaCounts {
+	out := make(map[string]quotaCounts, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+// adjustQuotaMap shifts counters on an overlay quota map, clamping at zero
+// exactly like adjustQuotaLocked.
+func adjustQuotaMap(quotas map[string]quotaCounts, repoID string, runningDelta, queuedDelta int) {
+	for _, key := range QuotaKeys(repoID) {
+		c := quotas[key]
+		c.running += runningDelta
+		if c.running < 0 {
+			c.running = 0
+		}
+		c.queued += queuedDelta
+		if c.queued < 0 {
+			c.queued = 0
+		}
+		quotas[key] = c
+	}
+}
+
+// releaseRunnerSlotMap removes one job from an overlay runner's active set
+// and recomputes busy/current_job, mirroring releaseRunnerSlotLocked.
+func releaseRunnerSlotMap(runners map[string]model.Runner, runnerID, jobID string) {
+	r, ok := runners[runnerID]
+	if !ok {
+		return
+	}
+	r.ActiveJobs = removeString(r.ActiveJobs, jobID)
+	if len(r.ActiveJobs) > 0 && r.CurrentJob == jobID {
+		r.CurrentJob = r.ActiveJobs[0]
+	}
+	if len(r.ActiveJobs) == 0 {
+		r.CurrentJob = ""
+	}
+	r.Busy = r.Capacity > 0 && len(r.ActiveJobs) >= r.Capacity
+	runners[runnerID] = r
+}
+
+// recomputeDependentsMap re-evaluates queued/waiting jobs that need one of
+// the changed jobs against the overlay job map, blocking them when their
+// condition does not allow the fresh outcome. It mirrors the SQL
+// recomputeDependentsTx pass.
+func recomputeDependentsMap(jobs map[string]model.Job, changed map[string]bool, now time.Time) {
+	for id, j := range jobs {
+		if j.Status != model.StatusQueued && j.Status != model.StatusWaitingApproval {
+			continue
+		}
+		needsChanged := false
+		for _, dep := range j.Needs {
+			if changed[dep] {
+				needsChanged = true
+				break
+			}
+		}
+		if !needsChanged {
+			continue
+		}
+		statuses := map[string]model.Status{}
+		for _, dep := range j.Needs {
+			if d, ok := jobs[dep]; ok {
+				statuses[dep] = d.Status
+			}
+		}
+		ready, outcome := dependencyOutcome(statuses, j.Needs)
+		if !ready {
+			continue
+		}
+		j.DependencyStatus = outcome
+		if outcome != model.StatusSuccess && !dependencyConditionAllows(j.Condition, outcome) {
+			j.Status = model.StatusBlocked
+			j.Error = "dependency failed"
+			j.FinishedAt = &now
+		}
+		jobs[id] = j
+	}
+}
+
+// recomputeRunMap recomputes one run's aggregation from the overlay job map,
+// mirroring the SQL recomputeRunTx.
+func recomputeRunMap(runs map[string]model.Run, jobs map[string]model.Job, runID string) {
+	run, ok := runs[runID]
+	if !ok {
+		return
+	}
+	states := []jobState{}
+	for _, j := range jobs {
+		if j.RunID == runID {
+			states = append(states, jobState{status: j.Status, startedAt: j.StartedAt, finishedAt: j.FinishedAt})
+		}
+	}
+	if recomputeRunStatus(&run, states) {
+		runs[runID] = run
+	}
+}
+
+// recoveryAudit builds one audit event for a transactional recovery.
+func recoveryAudit(j model.Job, action, actor, msg string, meta map[string]string, now time.Time) model.AuditEvent {
+	return model.AuditEvent{ID: j.ID + "|" + action, Action: action, Actor: actor, RunID: j.RunID, JobID: j.ID, Message: msg, Metadata: meta, CreatedAt: now}
+}
+
+// RevokeRunnerLeases mirrors the SQL transaction: every running lease of the
+// runner is requeued or cancelled, the lease cleared, the runner slot, quota
+// counters, dependents, run aggregation and audit all move together.
+func (m *memStore) RevokeRunnerLeases(ctx context.Context, runnerID, reason string) ([]string, error) {
+	if err := ValidateRunnerID(runnerID); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now().UTC()
+	ids := []string{}
+	for id, j := range m.jobs {
+		if j.Status == model.StatusRunning && j.LeaseRunnerID == runnerID {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return []string{}, nil
+	}
+	sort.Strings(ids)
+	jobs := cloneRecoveryJobs(m.jobs)
+	runners := cloneRecoveryRunners(m.runners)
+	runs := cloneRecoveryRuns(m.runs)
+	quotas := cloneRecoveryQuotas(m.quotas)
+	audit := append([]model.AuditEvent(nil), m.audit...)
+	staged := 0
+	changed := map[string]bool{}
+	runIDs := map[string]bool{}
+	for _, id := range ids {
+		j := jobs[id]
+		requeue := j.Attempts <= j.MaxInfraRetries
+		if requeue {
+			j.Status = model.StatusQueued
+			j.Error = reason + "; retrying"
+		} else {
+			j.Status = model.StatusCancelled
+			j.Error = reason
+			j.FinishedAt = &now
+		}
+		j.LeaseRunnerID = ""
+		j.LeaseTokenHash = nil
+		j.LeaseExpiresAt = nil
+		jobs[id] = j
+		if err := m.recoveryBumpFor(&staged); err != nil {
+			return nil, err
+		}
+		if requeue {
+			adjustQuotaMap(quotas, RepoIDForJob(j), -1, 1)
+		} else {
+			adjustQuotaMap(quotas, RepoIDForJob(j), -1, 0)
+		}
+		if err := m.recoveryBumpFor(&staged); err != nil {
+			return nil, err
+		}
+		action := "job.runner_disabled_cancelled"
+		if requeue {
+			action = "job.runner_disabled_requeued"
+		}
+		audit = append(audit, recoveryAudit(j, action, "admin", reason, map[string]string{"job": j.Key, "runner": runnerID}, now))
+		if err := m.recoveryBumpFor(&staged); err != nil {
+			return nil, err
+		}
+		changed[id] = true
+		if j.RunID != "" {
+			runIDs[j.RunID] = true
+		}
+	}
+	for _, id := range ids {
+		releaseRunnerSlotMap(runners, runnerID, id)
+		if r, ok := runners[runnerID]; ok {
+			r.Failed++
+			r.LastSeen = now
+			runners[runnerID] = r
+		}
+		if err := m.recoveryBumpFor(&staged); err != nil {
+			return nil, err
+		}
+	}
+	recomputeDependentsMap(jobs, changed, now)
+	if err := m.recoveryBumpFor(&staged); err != nil {
+		return nil, err
+	}
+	for runID := range runIDs {
+		recomputeRunMap(runs, jobs, runID)
+	}
+	if err := m.recoveryBumpFor(&staged); err != nil {
+		return nil, err
+	}
+	m.jobs = jobs
+	m.runners = runners
+	m.runs = runs
+	m.quotas = quotas
+	m.audit = audit
+	return ids, nil
+}
+
+// RecoverExpiredLease mirrors the SQL transaction for one expired running
+// lease. A job that is not running with the expected generation, or whose
+// lease is still live, is a no-op.
+func (m *memStore) RecoverExpiredLease(ctx context.Context, jobID string, expectedGeneration int64, now time.Time) error {
+	if err := ValidateJobID(jobID); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	j, ok := m.jobs[jobID]
+	if !ok {
+		return ErrNotFound
+	}
+	if j.Status != model.StatusRunning || j.LeaseGeneration != expectedGeneration {
+		return nil
+	}
+	if j.LeaseExpiresAt != nil && j.LeaseExpiresAt.After(now) {
+		return nil
+	}
+	jobs := cloneRecoveryJobs(m.jobs)
+	runners := cloneRecoveryRunners(m.runners)
+	runs := cloneRecoveryRuns(m.runs)
+	quotas := cloneRecoveryQuotas(m.quotas)
+	audit := append([]model.AuditEvent(nil), m.audit...)
+	staged := 0
+	requeue := j.Attempts <= j.MaxInfraRetries
+	if requeue {
+		j.Status = model.StatusQueued
+		j.Error = "runner lease expired; retrying"
+	} else {
+		j.Status = model.StatusFailure
+		j.Error = "runner lease expired and infrastructure retry budget exhausted"
+		j.FinishedAt = &now
+	}
+	leaseRunnerID := j.LeaseRunnerID
+	j.LeaseRunnerID = ""
+	j.LeaseTokenHash = nil
+	j.LeaseExpiresAt = nil
+	jobs[jobID] = j
+	if err := m.recoveryBumpFor(&staged); err != nil {
+		return err
+	}
+	if requeue {
+		adjustQuotaMap(quotas, RepoIDForJob(j), -1, 1)
+	} else {
+		adjustQuotaMap(quotas, RepoIDForJob(j), -1, 0)
+	}
+	if err := m.recoveryBumpFor(&staged); err != nil {
+		return err
+	}
+	if leaseRunnerID != "" {
+		releaseRunnerSlotMap(runners, leaseRunnerID, jobID)
+		if r, ok := runners[leaseRunnerID]; ok {
+			r.Failed++
+			r.LastSeen = now
+			runners[leaseRunnerID] = r
+		}
+		if err := m.recoveryBumpFor(&staged); err != nil {
+			return err
+		}
+	}
+	action := "job.lease_expired"
+	msg := "job requeued after lost runner"
+	if !requeue {
+		action = "job.lost_runner"
+		msg = j.Error
+	}
+	audit = append(audit, recoveryAudit(j, action, "scheduler", msg, map[string]string{"job": j.Key}, now))
+	if err := m.recoveryBumpFor(&staged); err != nil {
+		return err
+	}
+	recomputeDependentsMap(jobs, map[string]bool{jobID: true}, now)
+	if err := m.recoveryBumpFor(&staged); err != nil {
+		return err
+	}
+	recomputeRunMap(runs, jobs, j.RunID)
+	if err := m.recoveryBumpFor(&staged); err != nil {
+		return err
+	}
+	m.jobs = jobs
+	m.runners = runners
+	m.runs = runs
+	m.quotas = quotas
+	m.audit = audit
+	return nil
+}
+
+// ExpireQueuedJob mirrors the SQL transaction for one queue-timeout job.
+func (m *memStore) ExpireQueuedJob(ctx context.Context, jobID string, deadline time.Time) error {
+	if err := ValidateJobID(jobID); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	j, ok := m.jobs[jobID]
+	if !ok {
+		return ErrNotFound
+	}
+	if j.Status != model.StatusQueued && j.Status != model.StatusWaitingApproval {
+		return nil
+	}
+	now := time.Now().UTC()
+	eff := QueueDeadlineFor(j)
+	if eff == nil || eff.After(deadline) || deadline.After(now) {
+		return nil
+	}
+	jobs := cloneRecoveryJobs(m.jobs)
+	runs := cloneRecoveryRuns(m.runs)
+	quotas := cloneRecoveryQuotas(m.quotas)
+	audit := append([]model.AuditEvent(nil), m.audit...)
+	staged := 0
+	j.Status = model.StatusCancelled
+	j.Error = "queue timeout"
+	j.FinishedAt = &now
+	j.LeaseRunnerID = ""
+	j.LeaseTokenHash = nil
+	j.LeaseExpiresAt = nil
+	jobs[jobID] = j
+	if err := m.recoveryBumpFor(&staged); err != nil {
+		return err
+	}
+	adjustQuotaMap(quotas, RepoIDForJob(j), 0, -1)
+	if err := m.recoveryBumpFor(&staged); err != nil {
+		return err
+	}
+	audit = append(audit, recoveryAudit(j, "job.queue_timeout", "scheduler", "job cancelled after queue deadline", map[string]string{"job": j.Key}, now))
+	if err := m.recoveryBumpFor(&staged); err != nil {
+		return err
+	}
+	recomputeDependentsMap(jobs, map[string]bool{jobID: true}, now)
+	if err := m.recoveryBumpFor(&staged); err != nil {
+		return err
+	}
+	recomputeRunMap(runs, jobs, j.RunID)
+	if err := m.recoveryBumpFor(&staged); err != nil {
+		return err
+	}
+	m.jobs = jobs
+	m.runs = runs
+	m.quotas = quotas
+	m.audit = audit
+	return nil
 }
 
 func (m *memStore) InsertArtifact(ctx context.Context, a model.ArtifactRecord) error {

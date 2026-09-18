@@ -32,7 +32,7 @@ go build ./cmd/kiwi
 ./kiwi doctor
 ```
 
-Go 1.23 or later is required.
+Go 1.27.1 or later is required.
 
 ## Workflow
 

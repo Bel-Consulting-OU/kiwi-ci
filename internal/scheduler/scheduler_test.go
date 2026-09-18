@@ -468,7 +468,7 @@ func TestRecoverExpiredRequeuesWithinBudget(t *testing.T) {
 	now := time.Now().UTC()
 	exp := now.Add(-time.Minute)
 	f.putRun(model.Run{ID: "run", Status: model.StatusRunning, CreatedAt: now})
-	f.putJob(model.Job{ID: "job", RunID: "run", Key: "build", Status: model.StatusRunning, Attempts: 1, MaxInfraRetries: 2, LeaseRunnerID: "runner", LeaseGeneration: 1, LeaseExpiresAt: &exp})
+	f.putJob(model.Job{ID: "job", RunID: "run", Key: "build", Status: model.StatusRunning, RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r", Attempts: 1, MaxInfraRetries: 2, LeaseRunnerID: "runner", LeaseGeneration: 1, LeaseExpiresAt: &exp})
 	f.putRunner(model.Runner{ID: "runner", Name: "runner", Capacity: 1, ActiveJobs: []string{"job"}})
 	s := NewDB(f, time.Minute, nil, nil)
 	if !s.IsLeader(context.Background()) {
@@ -484,8 +484,21 @@ func TestRecoverExpiredRequeuesWithinBudget(t *testing.T) {
 	if j.LeaseRunnerID != "" || j.LeaseExpiresAt != nil || j.LeaseTokenHash != nil {
 		t.Errorf("lease not cleared: %+v", j)
 	}
-	if len(f.releaseRunnerCalls) != 1 || f.releaseRunnerCalls[0].RunnerID != "runner" {
-		t.Errorf("release calls = %+v", f.releaseRunnerCalls)
+	// Adaptation note: the old recovery used UpdateJob + ReleaseRunnerJob;
+	// the transactional contract must issue exactly one store operation and
+	// no legacy multi-step write.
+	if len(f.releaseRunnerCalls) != 0 || len(f.updateJobCalls) != 0 {
+		t.Errorf("legacy multi-step recovery writes used: release=%d update=%d", len(f.releaseRunnerCalls), len(f.updateJobCalls))
+	}
+	if len(f.recoverCalls) != 1 || f.recoverCalls[0].JobID != "job" || f.recoverCalls[0].Generation != 1 {
+		t.Errorf("recover calls = %+v, want one for job generation 1", f.recoverCalls)
+	}
+	ri, _ := f.GetRunner(context.Background(), "runner")
+	if len(ri.ActiveJobs) != 0 {
+		t.Errorf("runner active jobs after recovery = %v, want empty", ri.ActiveJobs)
+	}
+	if running, queued, _ := f.QuotaCounts(context.Background(), storage.RepoIDForJob(j), ""); running != 0 || queued != 1 {
+		t.Errorf("quota after recovery = %d/%d, want 0/1", running, queued)
 	}
 	audits := f.audits()
 	if len(audits) != 1 || audits[0].Action != "job.lease_expired" {

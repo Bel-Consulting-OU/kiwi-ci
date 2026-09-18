@@ -6,7 +6,7 @@
 # instance): WOODPECKER_FORCE_IGNORE_SERVICE_FAILURE=false, so a dead
 # PostgreSQL service FAILS the pipeline instead of being ignored.
 labels:
-  platform: linux-amd64
+  platform: linux/amd64
 
 when:
   - event: [push, pull_request, manual, tag]
@@ -23,6 +23,9 @@ steps:
     environment:
       GOTOOLCHAIN: local
     commands:
+      # First command of the first step: exact toolchain assertion (go.mod
+      # vs README.md vs the running `go`) before the service wait or any test.
+      - ./scripts/toolchain-check.sh
       - |
         for i in $(seq 1 30); do
           if go run ./scripts/wait-for-tcp.go postgres 5432 2>/dev/null; then break; fi

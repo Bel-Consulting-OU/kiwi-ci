@@ -1,6 +1,6 @@
 .PHONY: build test test-unit test-race test-integration integration test-adversarial test-shuffle test-stress \
 	fuzz coverage coverage-ci coverage-floor staticcheck govulncheck cross schema-check dockerfile-buildargs-check docs-check license-check license-notice repro-build \
-	fmt lint run clean protect-branch
+	toolchain-check fmt lint run clean protect-branch
 
 VERSION ?= 0.1.0-dev
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -102,7 +102,15 @@ cross:
 dockerfile-buildargs-check:
 	./scripts/dockerfile-buildargs-check.sh
 
-schema-check:
+# Toolchain contract: README.md must document exactly the `go` version from
+# go.mod, and the running `go` must satisfy it. The selftest proves the failure
+# paths on doctored temp copies before the live check runs; every Woodpecker
+# workflow invokes the script in its first step as well.
+toolchain-check:
+	./scripts/toolchain-check.sh --selftest
+	./scripts/toolchain-check.sh
+
+schema-check: toolchain-check
 	go test -run Schema ./internal/pipeline
 	go run ./cmd/filemap --check
 	./scripts/dockerfile-buildargs-check.sh
@@ -175,7 +183,7 @@ SOURCE_DATE_EPOCH ?= $(shell git log -1 --format=%ct HEAD 2>/dev/null)
 # SOURCE_DATE_EPOCH still pins the recorded BuildDate (see docs/releases.md).
 DOCKER_BUILD_DATE ?= $(shell if [ -n "$(SOURCE_DATE_EPOCH)" ]; then date -u -r "$(SOURCE_DATE_EPOCH)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$(SOURCE_DATE_EPOCH)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null; fi)
 
-.PHONY: release release-snapshot release-formula-test docker-build
+.PHONY: release release-snapshot release-formula-test release-snapshot-signing-test docker-build
 
 release:
 	./scripts/release.sh $(TAG)
@@ -189,6 +197,13 @@ release-snapshot:
 # two sequential releases (v1 then v2), with no pre-existing placeholders.
 release-formula-test:
 	./scripts/release-formula-test.sh
+
+# Proves snapshot builds are never signed even when KIWI_RELEASE_SIGNING_KEY
+# is exported: release-tool must receive no -key and no key temp file may be
+# materialized, while a release-mode control with the same environment must
+# pass -key pointing at a mode-600 temp file.
+release-snapshot-signing-test:
+	./scripts/release-snapshot-signing-test.sh
 
 docker-build:
 	docker build --build-arg BUILD_DATE=$(DOCKER_BUILD_DATE) \

@@ -24,16 +24,37 @@
 #
 # Agent selection and shell:
 #   - Woodpecker's local backend advertises the default labels
-#     platform=<GOOS>/<GOARCH> and backend=local; selecting both pins this
-#     workflow to the dedicated Windows host (docs: workflow syntax ->
-#     labels; agent configuration -> AGENT_LABELS).
+#     platform=<GOOS>/<GOARCH> (canonical slash form) and backend=local;
+#     selecting both pins this workflow to the dedicated Windows host (docs:
+#     workflow syntax -> labels; agent configuration -> AGENT_LABELS).
 #   - On the local backend `image` is the shell/executable, not a container
 #     image (docs: backends -> local -> "Shell"). Upstream supports both
 #     `pwsh` and `powershell` (pipeline/backend/local/command.go); `pwsh`
 #     (PowerShell 7+) is used here and must be on the worker's PATH.
-#   - The worker must provide Go 1.27.x: the toolchain step asserts
-#     `go version`, and GOTOOLCHAIN=local stops Go from downloading another
-#     toolchain to mask a stale worker.
+#
+# Clone path (local backend): the automatic clone step is the plugin-git
+# binary, and the docs state it "must be in your $PATH for the default clone
+# step to work. If this is not the case, you can still write a manual clone
+# step." (docs: workflow syntax -> `clone`). This worker does not guarantee
+# plugin-git, so the documented fallback is used: `skip_clone: true` (docs:
+# workflow syntax -> `skip_clone`) disables the plugin clone, and the
+# `checkout` step below clones and checks out the Woodpecker-provided revision
+# itself. The local backend already creates the workspace (`CI_WORKSPACE`)
+# before the first step and runs every command with it as the working
+# directory (docs: usage -> environment -> `CI_WORKSPACE`; local backend docs:
+# "The local backend will use a random directory in $TMPDIR to store the
+# cloned code"). The commands use the built-in commit variables
+# CI_REPO_CLONE_URL, CI_COMMIT_REF and CI_COMMIT_SHA, so push, manual and tag
+# events all check out the exact commit, and the result is verified before any
+# other step runs.
+#
+# Toolchain: the `toolchain` step runs the shared POSIX-sh drift checker
+# (scripts/toolchain-check.sh), which reads the exact `go <version>` directive
+# from the checked-out go.mod and compares it against README.md and the
+# worker's `go version`. This replaces the old loose `1.27.x` regex.
+# `sh` must be on the worker PATH; Git for Windows ships one and `git` itself
+# is already required by the checkout step. GOTOOLCHAIN=local stops Go from
+# downloading a different toolchain to mask a stale worker.
 labels:
   platform: windows/amd64
   backend: local
@@ -41,13 +62,30 @@ labels:
 when:
   - event: [push, manual, tag]
 
+skip_clone: true
+
 steps:
-  toolchain:
+  checkout:
     image: pwsh
     environment:
       GOTOOLCHAIN: local
     commands:
-      - '$gv = (go version); if ($gv -notmatch ''go1\.27(\.\d+)?'') { Write-Error "native-windows requires Go 1.27.x on the worker, got: $gv"; exit 1 }; Write-Host "go toolchain: $gv"'
+      - |
+        git -C $env:CI_WORKSPACE init -q
+        git -C $env:CI_WORKSPACE remote add origin $env:CI_REPO_CLONE_URL
+        git -C $env:CI_WORKSPACE fetch -q --force origin $env:CI_COMMIT_REF
+        git -C $env:CI_WORKSPACE checkout -q --detach $env:CI_COMMIT_SHA
+        $head = (git -C $env:CI_WORKSPACE rev-parse HEAD).Trim()
+        if ($head -ne $env:CI_COMMIT_SHA) { Write-Error "checkout: HEAD $head does not match CI_COMMIT_SHA $env:CI_COMMIT_SHA"; exit 1 }
+
+  toolchain:
+    image: pwsh
+    depends_on: [checkout]
+    environment:
+      GOTOOLCHAIN: local
+    commands:
+      # Exact toolchain assertion (go.mod vs README.md vs running `go`).
+      - sh ./scripts/toolchain-check.sh
 
   unit:
     image: pwsh

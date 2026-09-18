@@ -16,6 +16,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -405,5 +406,74 @@ func TestPostgresIntegrationServerCrossInstance(t *testing.T) {
 	}
 	if job, err := storeB.GetJob(context.Background(), task.Job.ID); err != nil || job.Status != model.StatusSuccess {
 		t.Fatalf("durable cross-instance job = %+v err=%v", job, err)
+	}
+}
+
+// TestPostgresIntegrationServerOutboxDueOnlyMirror pins J2-3 against real
+// PostgreSQL: the due-only read (OutboxDue) is what ReplayDB and pruneDB
+// mirror, so a backoff-delayed row is not resident, a dead letter is never
+// resident and stays operator-visible only through the dead-letter API, and
+// the delayed row becomes claimable once its backoff elapses.
+func TestPostgresIntegrationServerOutboxDueOnlyMirror(t *testing.T) {
+	env := pgITServerSetup(t)
+	st := env.open(t)
+	ctx := context.Background()
+	created := time.Now().UTC()
+	for _, id := range []string{"pg-due", "pg-delayed", "pg-dead"} {
+		if err := st.OutboxAppend(ctx, storage.OutboxItem{
+			ID: id, Kind: "due_probe", Payload: []byte(`{}`), CreatedAt: created,
+		}); err != nil {
+			t.Fatalf("append %s: %v", id, err)
+		}
+	}
+	// Defer pg-delayed with an unbounded retry budget (next_attempt_at in the
+	// future) and dead-letter pg-dead (maxAttempts=1).
+	if err := st.OutboxRetry(ctx, "pg-delayed", errors.New("transient"), 0); err != nil {
+		t.Fatalf("delay retry: %v", err)
+	}
+	if err := st.OutboxRetry(ctx, "pg-dead", errors.New("terminal"), 1); err != nil {
+		t.Fatalf("dead-letter retry: %v", err)
+	}
+
+	s, err := NewPersistent("token", "token", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SwitchToDB(st); err != nil {
+		t.Fatalf("SwitchToDB: %v", err)
+	}
+	ids := outboxPendingIDSet(s.outbox)
+	if !ids["pg-due"] || ids["pg-delayed"] || ids["pg-dead"] {
+		t.Fatalf("resident after ReplayDB = %v, want only pg-due", ids)
+	}
+	dead, err := st.OutboxDeadLetters(ctx)
+	if err != nil || len(dead) != 1 || dead[0].ID != "pg-dead" {
+		t.Fatalf("dead letters = %+v, %v; want only pg-dead", dead, err)
+	}
+
+	// Once the backoff elapses the delayed row is claimable (the claim path
+	// mirrors it for dispatch).
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		claimed, cerr := st.ClaimOutbox(ctx, "due-probe", 10)
+		if cerr != nil {
+			t.Fatalf("claim: %v", cerr)
+		}
+		found := false
+		for _, it := range claimed {
+			if it.ID == "pg-delayed" {
+				found = true
+			}
+			if it.ID == "pg-dead" {
+				t.Fatalf("dead letter was claimable: %+v", it)
+			}
+		}
+		if found {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("delayed row never became claimable after its backoff elapsed")
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }

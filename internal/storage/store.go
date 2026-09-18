@@ -691,11 +691,54 @@ type ArtifactIdempotentStore interface {
 	InsertArtifactOnce(ctx context.Context, a model.ArtifactRecord) (model.ArtifactRecord, bool, error)
 }
 
-// RunnerJobStore lists the currently running jobs leased by one runner. It
-// backs the runner disable kill switch: the control plane invalidates every
-// active lease the runner holds in one atomic pass.
+// RunnerJobStore lists the currently running jobs leased by one runner. The
+// runner disable kill switch itself goes through RecoveryStore
+// (RevokeRunnerLeases); this read contract remains for inspection and for
+// callers that need the lease set before deciding what to do with it.
 type RunnerJobStore interface {
 	ListJobsByRunner(ctx context.Context, runnerID string) ([]model.Job, error)
+}
+
+// RecoveryStore is the transaction-per-transition contract for lease
+// recovery and revocation. Every method applies the complete transition —
+// job row and payload, lease clearing, runner active-set/counters, quota
+// counters, dependent jobs, run aggregation and the audit event — in the
+// SAME durable transaction, so a crash between "job terminal/requeued" and
+// "runner slot/quota released" is impossible. The methods are idempotent:
+// a second caller (another replica racing the same recovery) observes the
+// already-transitioned state and changes nothing.
+//
+// This replaces the previous scheduler-side multi-step sequencing
+// (UpdateJob + ReleaseRunnerJob + quota release + Go-level recompute), which
+// a crash could split and strand a runner slot or a quota reservation
+// forever.
+type RecoveryStore interface {
+	// RevokeRunnerLeases invalidates every running lease held by runnerID
+	// (the runner-disable kill switch). Each running job either requeues
+	// (infrastructure retry budget still available) or is terminal-cancelled
+	// with the given reason; lease fields are cleared, the runner's
+	// active_jobs entry is removed, the running quota slot is released (and
+	// the queued slot re-reserved for a requeued job), dependent jobs and the
+	// affected runs are recomputed, and one audit event per job is written.
+	// It returns the IDs of the revoked jobs.
+	RevokeRunnerLeases(ctx context.Context, runnerID, reason string) ([]string, error)
+	// RecoverExpiredLease transitions ONE running job whose lease expired
+	// (LeaseExpiresAt <= now): requeue while the infrastructure retry budget
+	// is available, otherwise terminal failure. The expectedGeneration
+	// guards against recovering a lease that was replaced concurrently: a
+	// job whose current lease generation differs, or that is no longer
+	// running, is left untouched (nil error, no-op). The transition clears
+	// the lease, releases the runner slot, moves the quota counter, and
+	// recomputes dependents and the run in the same transaction.
+	RecoverExpiredLease(ctx context.Context, jobID string, expectedGeneration int64, now time.Time) error
+	// ExpireQueuedJob terminal-cancels ONE queued (or approval-waiting) job
+	// whose queue deadline has passed, releases its reserved queued quota
+	// slot, and recomputes dependents and the run in the same transaction.
+	// deadline is the deadline the caller observed: the job is expired only
+	// while its current effective deadline is not after it and the deadline
+	// itself is not in the future. A job that is no longer queued, or whose
+	// deadline moved past the observed one, is left untouched (no-op).
+	ExpireQueuedJob(ctx context.Context, jobID string, deadline time.Time) error
 }
 
 // WebhookClaim is the delivery-dedupe claim persisted inside the enqueue

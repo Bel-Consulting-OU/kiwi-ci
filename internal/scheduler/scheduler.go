@@ -13,7 +13,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -24,7 +23,6 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
-	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
@@ -193,9 +191,10 @@ func (s *DBScheduler) Enqueue(ctx context.Context, run model.Run, jobs map[strin
 	}
 	for id, j := range jobs {
 		if j.QueueDeadline == nil {
-			if to := queueTimeoutFromPayload(j); to > 0 {
-				dl := j.CreatedAt.Add(to)
-				j.QueueDeadline = &dl
+			// The canonical helper derives CreatedAt + queue_timeout from the
+			// compiled payload when the deadline field is unset.
+			if dl := storage.QueueDeadlineFor(j); dl != nil {
+				j.QueueDeadline = dl
 			}
 		}
 		jobs[id] = j
@@ -477,94 +476,51 @@ func (s *DBScheduler) CancelRun(ctx context.Context, runID, reason string) error
 }
 
 // CancelJobsByRunner is the runner disable kill switch: it invalidates every
-// active lease the runner holds in one pass. Each running job either
+// active lease the runner holds through ONE transactional store operation
+// (storage.RecoveryStore.RevokeRunnerLeases). Each running job either
 // requeues (the infrastructure retry budget still available) or cancels;
 // lease fields are cleared so a stale lease token is dead, the runner's
-// counters are released, dependent jobs and run statuses are recomputed, and
-// audit events are emitted through the store. It returns the number of
-// invalidated leases.
+// active set and counters are released, the quota counters move, dependent
+// jobs and run statuses are recomputed, and the audit events are written —
+// all in the same durable commit, so a crash can never strand a runner slot
+// or a quota reservation. It returns the number of invalidated leases.
 //
 // The requeue/exhaustion decision consumes the SAME attempt count as
 // RecoverExpired: attempts increment exactly once per lease (see
 // storage.AcquireLeaseAtomic / AcquireLease), so a lease recovered here is
 // not charged a second attempt — the budget compares the job's attempt
 // count, it does not manufacture a new one.
+//
+// A store without the transactional contract fails closed instead of falling
+// back to the retired multi-step sequence.
 func (s *DBScheduler) CancelJobsByRunner(ctx context.Context, runnerID, reason string) (int, error) {
 	if runnerID == "" {
 		return 0, fmt.Errorf("scheduler: cancel jobs by runner: empty runner id")
 	}
-	rj, ok := s.Store.(storage.RunnerJobStore)
+	rs, ok := s.Store.(storage.RecoveryStore)
 	if !ok {
-		return 0, fmt.Errorf("scheduler: store does not support listing jobs by runner")
+		return 0, fmt.Errorf("scheduler: store does not support transactional runner lease revocation")
 	}
-	jobs, err := rj.ListJobsByRunner(ctx, runnerID)
+	revoked, err := rs.RevokeRunnerLeases(ctx, runnerID, reason)
 	if err != nil {
 		return 0, err
 	}
-	now := time.Now().UTC()
-	affected := map[string]map[string]model.Job{}
-	count := 0
-	var firstErr error
-	for _, j := range jobs {
-		if j.Status != model.StatusRunning {
-			continue
-		}
-		// Same decision RecoverExpired makes from the lease-time increment:
-		// no extra attempts++ here, attempts stay equal to leases/executions.
-		if j.Attempts <= j.MaxInfraRetries {
-			j.Status = model.StatusQueued
-			j.Error = reason + "; retrying"
-			s.appendAudit(ctx, "job.runner_disabled_requeued", "admin", j.RunID, j.ID, reason, map[string]string{"job": j.Key, "runner": runnerID})
-		} else {
-			fin := now
-			j.Status = model.StatusCancelled
-			j.Error = reason
-			j.FinishedAt = &fin
-			s.appendAudit(ctx, "job.runner_disabled_cancelled", "admin", j.RunID, j.ID, reason, map[string]string{"job": j.Key, "runner": runnerID})
-		}
-		j.LeaseRunnerID = ""
-		j.LeaseTokenHash = nil
-		j.LeaseExpiresAt = nil
-		if err := s.Store.UpdateJob(ctx, j); err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			log.Printf("scheduler: kill switch: update job %s: %v", j.ID, err)
-			continue
-		}
-		if err := s.Store.ReleaseRunnerJob(ctx, runnerID, j.ID, model.StatusFailure); err != nil && !errors.Is(err, storage.ErrNotFound) {
-			log.Printf("scheduler: kill switch: release runner %s job %s: %v", runnerID, j.ID, err)
-		}
-		count++
-		if affected[j.RunID] == nil {
-			affected[j.RunID] = map[string]model.Job{}
-		}
-		affected[j.RunID][j.ID] = j
-	}
-	for runID := range affected {
-		all, err := s.Store.ListJobsByRun(ctx, runID)
-		if err != nil {
-			log.Printf("scheduler: kill switch: list run %s jobs: %v", runID, err)
-			continue
-		}
-		jobs := make(map[string]model.Job, len(all))
-		for _, j := range all {
-			jobs[j.ID] = j
-		}
-		s.recomputeDependents(ctx, jobs)
-		if run, err := s.Store.GetRun(ctx, runID); err == nil {
-			s.recomputeRun(ctx, run, jobs)
-		}
-	}
-	return count, firstErr
+	return len(revoked), nil
 }
 
-// RecoverExpired requeues or fails jobs whose leases expired, mirrors the
-// in-memory recoverLeasesLocked (infrastructure retry budget respected),
-// re-evaluates dependents, and recomputes run statuses. Leader-only.
+// RecoverExpired requeues or fails jobs whose leases expired and cancels
+// queued jobs past their queue deadline, mirroring the in-memory
+// recoverLeasesLocked (infrastructure retry budget respected). Every job
+// transition is ONE transactional store operation that also releases the
+// runner slot / quota reservation and recomputes dependents and the run, so
+// no later best-effort pass can be lost to a crash. Leader-only.
 func (s *DBScheduler) RecoverExpired(ctx context.Context, now time.Time) error {
 	if !s.IsLeader(ctx) {
 		return ErrNotLeader
+	}
+	rs, ok := s.Store.(storage.RecoveryStore)
+	if !ok {
+		return fmt.Errorf("scheduler: store does not support transactional lease recovery")
 	}
 	runs, err := s.Store.ListRuns(ctx, 10000)
 	if err != nil {
@@ -576,201 +532,36 @@ func (s *DBScheduler) RecoverExpired(ctx context.Context, now time.Time) error {
 			log.Printf("scheduler: recover run %s: %v", run.ID, err)
 			continue
 		}
-		jobs := make(map[string]model.Job, len(all))
 		for _, j := range all {
-			jobs[j.ID] = j
-		}
-		changed := false
-		for _, j := range all {
-			// Queue-timeout expiry: a queued (or approval-waiting) job past
-			// its queue deadline is cancelled terminally, independent of its
-			// attempt count, and dependents are recomputed below. The job's
-			// reserved queued quota slot is released in the same pass: a
-			// timed-out job never runs, so leaving the reservation behind
-			// would permanently shrink the repository/team queue depth.
-			if j.Status == model.StatusQueued || j.Status == model.StatusWaitingApproval {
+			switch j.Status {
+			case model.StatusQueued, model.StatusWaitingApproval:
+				// Queue-timeout expiry: a queued (or approval-waiting) job
+				// past its queue deadline is cancelled terminally,
+				// independent of its attempt count, and its reserved queued
+				// quota slot is released in the SAME transaction. The
+				// expected deadline guards against expiring a job whose
+				// deadline moved after this snapshot.
 				dl := QueueDeadlineFor(j)
 				if dl == nil || dl.After(now) {
 					continue
 				}
-				fin := now
-				j.Status = model.StatusCancelled
-				j.Error = "queue timeout"
-				j.FinishedAt = &fin
-				j.LeaseRunnerID = ""
-				j.LeaseTokenHash = nil
-				j.LeaseExpiresAt = nil
-				s.appendAudit(ctx, "job.queue_timeout", "scheduler", j.RunID, j.ID, "job cancelled after queue deadline", map[string]string{"job": j.Key})
-				if err := s.Store.UpdateJob(ctx, j); err != nil {
+				if err := rs.ExpireQueuedJob(ctx, j.ID, *dl); err != nil {
 					log.Printf("scheduler: expire queue deadline for job %s: %v", j.ID, err)
+				}
+			case model.StatusRunning:
+				if j.LeaseExpiresAt != nil && j.LeaseExpiresAt.After(now) {
 					continue
 				}
-				s.releaseQueuedQuota(ctx, j)
-				jobs[j.ID] = j
-				changed = true
-				continue
+				// The expected generation makes the recovery idempotent and
+				// race-safe: a lease replaced by a concurrent re-lease is
+				// left untouched.
+				if err := rs.RecoverExpiredLease(ctx, j.ID, j.LeaseGeneration, now); err != nil {
+					log.Printf("scheduler: recover job %s: %v", j.ID, err)
+				}
 			}
-			if j.Status != model.StatusRunning {
-				continue
-			}
-			if j.LeaseExpiresAt != nil && j.LeaseExpiresAt.After(now) {
-				continue
-			}
-			runnerID := j.LeaseRunnerID
-			if j.Attempts <= j.MaxInfraRetries {
-				j.Status = model.StatusQueued
-				j.Error = "runner lease expired; retrying"
-				s.appendAudit(ctx, "job.lease_expired", "scheduler", j.RunID, j.ID, "job requeued after lost runner", map[string]string{"job": j.Key})
-			} else {
-				fin := now
-				j.Status = model.StatusFailure
-				j.Error = "runner lease expired and infrastructure retry budget exhausted"
-				j.FinishedAt = &fin
-				s.appendAudit(ctx, "job.lost_runner", "scheduler", j.RunID, j.ID, j.Error, map[string]string{"job": j.Key})
-			}
-			j.LeaseRunnerID = ""
-			j.LeaseTokenHash = nil
-			j.LeaseExpiresAt = nil
-			if err := s.Store.UpdateJob(ctx, j); err != nil {
-				log.Printf("scheduler: recover job %s: %v", j.ID, err)
-				continue
-			}
-			if err := s.Store.ReleaseRunnerJob(ctx, runnerID, j.ID, model.StatusFailure); err != nil && !errors.Is(err, storage.ErrNotFound) {
-				log.Printf("scheduler: release runner %s after recovery: %v", runnerID, err)
-			}
-			jobs[j.ID] = j
-			changed = true
-		}
-		if changed {
-			s.recomputeDependents(ctx, jobs)
-			s.recomputeRun(ctx, run, jobs)
 		}
 	}
 	return nil
-}
-
-// releaseQueuedQuota returns a queue-timeout-cancelled job's reserved queued
-// slot to the repository/team quota counters, using the SAME key derivation
-// the enqueue reservation used. Stores without the counter contract (legacy
-// fakes) are tolerated. Failures are logged: the job is already cancelled and
-// the next counter adjustment path cannot repair it, so this is best effort.
-func (s *DBScheduler) releaseQueuedQuota(ctx context.Context, j model.Job) {
-	qs, ok := s.Store.(storage.QuotaCounterStore)
-	if !ok {
-		return
-	}
-	repoID := storage.RepoIDForJob(j)
-	if err := qs.AdjustQuotaCounter(ctx, repoID, storage.RepoTeamKey(repoID), 0, -1); err != nil {
-		log.Printf("scheduler: release queued quota for job %s: %v", j.ID, err)
-	}
-}
-
-// recomputeDependents re-evaluates dependency outcomes for non-terminal jobs
-// after a recovery changed an upstream state, mirroring scheduleStateLocked's
-// dependency and blocking pass.
-func (s *DBScheduler) recomputeDependents(ctx context.Context, jobs map[string]model.Job) {
-	for _, j := range jobs {
-		if j.Status != model.StatusQueued && j.Status != model.StatusWaitingApproval {
-			continue
-		}
-		ready, outcome := DependencyOutcome(j.Needs, nil, func(id string) (model.Status, bool) {
-			d, ok := jobs[id]
-			return d.Status, ok
-		})
-		if !ready || j.DependencyStatus == outcome {
-			continue
-		}
-		j.DependencyStatus = outcome
-		if outcome != model.StatusSuccess && !ConditionAllows(j.Condition, outcome) {
-			fin := time.Now().UTC()
-			j.Status = model.StatusBlocked
-			j.Error = "dependency failed"
-			j.FinishedAt = &fin
-			s.appendAudit(ctx, "job.blocked", "scheduler", j.RunID, j.ID, "dependency failed", map[string]string{"job": j.Key})
-		}
-		if err := s.Store.UpdateJob(ctx, j); err != nil {
-			log.Printf("scheduler: recompute dependent %s: %v", j.ID, err)
-		}
-	}
-}
-
-// recomputeRun mirrors refreshRunLocked from the job states of one run.
-func (s *DBScheduler) recomputeRun(ctx context.Context, run model.Run, jobs map[string]model.Job) {
-	if run.Status == model.StatusCancelled {
-		return
-	}
-	var total, terminal int
-	var anyRunning, anyFailure, anyCancelled, anyWaiting bool
-	var firstStart, lastFinish *time.Time
-	for _, j := range jobs {
-		total++
-		if j.StartedAt != nil && (firstStart == nil || j.StartedAt.Before(*firstStart)) {
-			t := *j.StartedAt
-			firstStart = &t
-		}
-		if j.Status.Terminal() {
-			terminal++
-			if j.FinishedAt != nil && (lastFinish == nil || j.FinishedAt.After(*lastFinish)) {
-				t := *j.FinishedAt
-				lastFinish = &t
-			}
-		}
-		switch j.Status {
-		case model.StatusRunning:
-			anyRunning = true
-		case model.StatusFailure, model.StatusBlocked:
-			anyFailure = true
-		case model.StatusCancelled:
-			anyCancelled = true
-		case model.StatusWaitingApproval:
-			anyWaiting = true
-		}
-	}
-	if total == 0 {
-		return
-	}
-	switch {
-	case terminal == total:
-		switch {
-		case anyFailure:
-			run.Status = model.StatusFailure
-		case anyCancelled:
-			run.Status = model.StatusCancelled
-		default:
-			run.Status = model.StatusSuccess
-		}
-		run.FinishedAt = lastFinish
-		if run.FinishedAt == nil {
-			n := time.Now().UTC()
-			run.FinishedAt = &n
-		}
-	case anyRunning:
-		run.Status = model.StatusRunning
-	case anyWaiting:
-		run.Status = model.StatusWaitingApproval
-	default:
-		run.Status = model.StatusQueued
-	}
-	if run.StartedAt == nil && firstStart != nil {
-		run.StartedAt = firstStart
-	}
-	if err := s.Store.UpdateRunStatus(ctx, run.ID, run.Status, run.StartedAt, run.FinishedAt); err != nil {
-		log.Printf("scheduler: recompute run %s: %v", run.ID, err)
-	}
-}
-
-// appendAudit writes one audit event through the store. Failures are logged,
-// never silently dropped, per the DB-mode audit policy.
-func (s *DBScheduler) appendAudit(ctx context.Context, action, actor, runID, jobID, msg string, meta map[string]string) {
-	id, err := newID()
-	if err != nil {
-		log.Printf("scheduler: dropping %q audit event: %v", action, err)
-		return
-	}
-	e := model.AuditEvent{ID: id, Action: action, Actor: actor, RunID: runID, JobID: jobID, Message: msg, Metadata: meta, CreatedAt: time.Now().UTC()}
-	if err := s.Store.AppendAudit(ctx, e); err != nil {
-		log.Printf("scheduler: audit %q failed: %v", action, err)
-	}
 }
 
 // jobRuntimeCapability extracts the job's runtime capability
@@ -797,62 +588,10 @@ func defaultToken() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// QueueDeadlineFor returns the job's queue deadline: the persisted
-// QueueDeadline field when present, otherwise the deadline derived from the
-// compiled payload's queue_timeout (CreatedAt + timeout). Jobs without
-// either have no deadline and never expire. The payload fallback keeps
-// rows persisted before the QueueDeadline field existed expiring correctly.
-// It is exported so every lease/recovery path (including the server's
-// in-memory mode) applies one queue-timeout rule.
+// QueueDeadlineFor returns the job's queue deadline. It delegates to the
+// canonical storage helper so the scheduler's lease gate, the recovery
+// transaction and the server's in-memory mode all apply one queue-timeout
+// rule (persisted QueueDeadline first, compiled-payload queue_timeout second).
 func QueueDeadlineFor(j model.Job) *time.Time {
-	if j.QueueDeadline != nil {
-		return j.QueueDeadline
-	}
-	to := queueTimeoutFromPayload(j)
-	if to <= 0 {
-		return nil
-	}
-	dl := j.CreatedAt.Add(to)
-	return &dl
-}
-
-// queueTimeoutFromPayload extracts the compiled job's queue_timeout from
-// the stored compiled payload (CompiledJobPayload.EffectiveJob), so queue
-// deadlines are payload-based and need no dedicated storage column.
-func queueTimeoutFromPayload(j model.Job) time.Duration {
-	if j.CompiledJobPayload == nil || j.CompiledJobPayload.EffectiveJob == nil {
-		return 0
-	}
-	var b []byte
-	switch v := j.CompiledJobPayload.EffectiveJob.(type) {
-	case json.RawMessage:
-		b = v
-	case []byte:
-		b = v
-	case string:
-		b = []byte(v)
-	default:
-		var err error
-		if b, err = json.Marshal(v); err != nil {
-			return 0
-		}
-	}
-	var cj pipeline.CompiledJob
-	if err := json.Unmarshal(b, &cj); err != nil {
-		return 0
-	}
-	if cj.Job.QueueTimeout.Duration <= 0 {
-		return 0
-	}
-	return cj.Job.QueueTimeout.Duration
-}
-
-// newID returns a 128-bit crypto/rand identifier hex-encoded, matching the
-// canonical control-plane identifier format.
-func newID() (string, error) {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b), nil
+	return storage.QueueDeadlineFor(j)
 }

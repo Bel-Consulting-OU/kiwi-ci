@@ -4,6 +4,26 @@
 # without the label never run it. The best-effort smoke variant lives in
 # linux-amd64.yml and skips cleanly when no daemon exists.
 #
+# Agent labels: `platform: linux/amd64` is the canonical GOOS/GOARCH form of
+# the built-in `platform=<GOOS>/<GOARCH>` agent label (docs: workflow syntax
+# -> labels). `capability: docker` only SELECTS an agent; it injects nothing,
+# so the daemon socket is mounted explicitly below.
+#
+# Docker access and trust: both steps below mount the agent host's socket
+# (`volumes: - /var/run/docker.sock:/var/run/docker.sock`, the exact mount
+# shown in docs: usage -> volumes). Host-path volumes are only accepted when
+# the repository is marked TRUSTED in Woodpecker (project settings -> trusted;
+# docs: usage -> volumes: "Volumes are only available to trusted repositories
+# and for security reasons should only be used in private environments").
+# TRUST REQUIREMENT: this lane therefore requires a trusted repository, and
+# it runs on a dedicated agent whose daemon is the one the lane may touch.
+# Alternative for a dedicated agent that mounts the socket everywhere:
+#   WOODPECKER_BACKEND_DOCKER_VOLUMES=/var/run/docker.sock:/var/run/docker.sock
+# (docs: docker backend -> BACKEND_DOCKER_VOLUMES, "List of default volumes
+# separated by comma to be mounted to all pipeline containers"). The
+# per-workflow mount is preferred: the requirement stays visible with the
+# lane instead of being an undocumented agent setting.
+#
 # Self-contained image: golang:1.27 does not guarantee a Docker CLI, so the
 # lane builds its own test image from .woodpecker/ci/Dockerfile on the
 # agent's daemon and runs the next step in it. Nothing has to be published to
@@ -14,7 +34,7 @@
 # already present on the daemon after the build step, so the test step runs
 # the locally built layers.
 labels:
-  platform: linux-amd64
+  platform: linux/amd64
   capability: docker
 
 when:
@@ -24,6 +44,8 @@ steps:
   build-ci-image:
     image: docker:cli@sha256:018edbc908e08fcc9dbf029c812c34251e9b4719e6f71ca0e5eae2a987d014ca
     pull: false
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     commands:
       - docker build -f .woodpecker/ci/Dockerfile -t kiwi-ci-test:go1.27 .
 
@@ -31,10 +53,17 @@ steps:
     image: kiwi-ci-test:go1.27
     pull: false
     depends_on: [build-ci-image]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       GOTOOLCHAIN: local
       KIWI_TEST_DOCKER: "1"
     commands:
+      # This is the first Go-capable step: build-ci-image runs in docker:cli,
+      # which carries no Go toolchain. The drift check (go.mod vs README vs
+      # running toolchain) therefore asserts the exact toolchain here, before
+      # any test executes.
+      - ./scripts/toolchain-check.sh
       - |
         if ! command -v docker >/dev/null 2>&1; then
           echo "required docker lane: docker CLI is missing from the kiwi-ci-test image" >&2

@@ -99,6 +99,22 @@ func faultyWrapperCases() map[string]wrapperCase {
 		"ReleaseRunnerJob": {mutates: true, seed: func(m *memStore) { seedRunningJob(m); seedRunner(m) }, call: func(f *FaultyStore) error {
 			return f.ReleaseRunnerJob(ctx(), testRunner.ID, testJob.ID, model.StatusSuccess)
 		}},
+		"RevokeRunnerLeases": {mutates: true, seed: func(m *memStore) { seedRunningJob(m); seedRunner(m) }, call: func(f *FaultyStore) error {
+			_, err := f.RevokeRunnerLeases(ctx(), testRunner.ID, "runner disabled")
+			return err
+		}},
+		"RecoverExpiredLease": {mutates: true, seed: func(m *memStore) { seedRunningJob(m); seedRunner(m) }, call: func(f *FaultyStore) error {
+			return f.RecoverExpiredLease(ctx(), testJob.ID, 1, time.Unix(3000, 0).UTC())
+		}},
+		"ExpireQueuedJob": {mutates: true, seed: func(m *memStore) {
+			dl := time.Unix(1500, 0).UTC()
+			j := testJob
+			j.QueueDeadline = &dl
+			_ = m.InsertRun(ctx(), testRun)
+			_ = m.InsertJob(ctx(), j)
+		}, call: func(f *FaultyStore) error {
+			return f.ExpireQueuedJob(ctx(), testJob.ID, time.Unix(1500, 0).UTC())
+		}},
 		"InsertArtifact": {mutates: true, call: func(f *FaultyStore) error { return f.InsertArtifact(ctx(), artifact) }},
 		"ListArtifacts": {seed: func(m *memStore) { _ = m.InsertArtifact(ctx(), artifact) }, call: func(f *FaultyStore) error {
 			_, err := f.ListArtifacts(ctx(), testRun.ID)
@@ -772,6 +788,16 @@ func missingOptionalInterfaceCases() map[string]missingIfaceCase {
 		}},
 		"ReleaseSecretDelivery": {mutates: true, iface: "SecretClaimReleaser", call: func(f *FaultyStore) error {
 			return f.ReleaseSecretDelivery(ctx(), "", 0, "")
+		}},
+		"RevokeRunnerLeases": {mutates: true, iface: "RecoveryStore", call: func(f *FaultyStore) error {
+			_, err := f.RevokeRunnerLeases(ctx(), "", "")
+			return err
+		}},
+		"RecoverExpiredLease": {mutates: true, iface: "RecoveryStore", call: func(f *FaultyStore) error {
+			return f.RecoverExpiredLease(ctx(), "", 0, time.Time{})
+		}},
+		"ExpireQueuedJob": {mutates: true, iface: "RecoveryStore", call: func(f *FaultyStore) error {
+			return f.ExpireQueuedJob(ctx(), "", time.Time{})
 		}},
 		"UpsertProfile": {mutates: true, iface: "ProfileStore", call: func(f *FaultyStore) error {
 			return f.UpsertProfile(ctx(), model.RunnerProfile{})

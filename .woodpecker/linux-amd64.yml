@@ -1,7 +1,13 @@
 # Linux amd64: the primary hermetic lane set. All images are pinned by OCI
 # digest (supply-chain requirement); agent selection is by workflow label.
+#
+# Label form: Woodpecker agents advertise the built-in default label
+# `platform=<GOOS>/<GOARCH>` (docs: workflow syntax -> labels: "platform=agent-os/agent-arch",
+# and filter-by-platform: "The syntax of the platform is GOOS/GOARCH like
+# linux/arm64"). The slash form is the canonical one; the hyphenated spelling
+# only works when every agent overrides the built-in label.
 labels:
-  platform: linux-amd64
+  platform: linux/amd64
 
 when:
   - event: [push, pull_request, manual, tag]
@@ -10,6 +16,9 @@ steps:
   format:
     image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
     commands:
+      # First command of the first step: assert the exact toolchain from
+      # go.mod against README.md and the running `go` before anything else.
+      - ./scripts/toolchain-check.sh
       - test -z "$(gofmt -l .)"
 
   vet:
@@ -86,9 +95,9 @@ steps:
     environment:
       GOTOOLCHAIN: local
     commands:
-      - go test -run Schema ./internal/pipeline
-      - go run ./cmd/filemap --check
-      - ./scripts/dockerfile-buildargs-check.sh
+      # make schema-check is the single wiring point: pipeline schema tests,
+      # FILE_MAP, the Dockerfile build-arg check and toolchain-drift check.
+      - make schema-check
 
   cross:
     image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
@@ -120,6 +129,7 @@ steps:
     commands:
       - ./scripts/repro-build.sh
       - make release-formula-test
+      - make release-snapshot-signing-test
 
   staticcheck:
     image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea

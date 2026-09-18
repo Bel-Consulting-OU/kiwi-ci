@@ -2,7 +2,6 @@ package scheduler
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"math"
 	"strings"
@@ -18,21 +17,19 @@ import (
 // scheduler error branch can be driven deterministically.
 type injectedStore struct {
 	*fakeStore
-	getRunnerErr       error
-	listQueuedErr      error
-	listByEnvErr       error
-	listByRunErr       error
-	updateJobErr       error
-	upsertRunnerErr    error
-	heartbeatErr       error
-	heartbeatHook      func()
-	cancelRunErr       error
-	listRunsErr        error
-	updateRunStatusErr error
-	appendAuditErr     error
-	profileErr         error
-	acquireLeaseHook   func(jobID string) error
-	clearStartedAt     bool
+	getRunnerErr     error
+	listQueuedErr    error
+	listByEnvErr     error
+	listByRunErr     error
+	updateJobErr     error
+	upsertRunnerErr  error
+	heartbeatErr     error
+	heartbeatHook    func()
+	cancelRunErr     error
+	listRunsErr      error
+	profileErr       error
+	acquireLeaseHook func(jobID string) error
+	clearStartedAt   bool
 }
 
 func newInjectedStore() *injectedStore {
@@ -103,20 +100,6 @@ func (s *injectedStore) ListRuns(ctx context.Context, limit int) ([]model.Run, e
 		return nil, s.listRunsErr
 	}
 	return s.fakeStore.ListRuns(ctx, limit)
-}
-
-func (s *injectedStore) UpdateRunStatus(ctx context.Context, id string, status model.Status, startedAt, finishedAt *time.Time) error {
-	if s.updateRunStatusErr != nil {
-		return s.updateRunStatusErr
-	}
-	return s.fakeStore.UpdateRunStatus(ctx, id, status, startedAt, finishedAt)
-}
-
-func (s *injectedStore) AppendAudit(ctx context.Context, e model.AuditEvent) error {
-	if s.appendAuditErr != nil {
-		return s.appendAuditErr
-	}
-	return s.fakeStore.AppendAudit(ctx, e)
 }
 
 func (s *injectedStore) ProfileForSerial(ctx context.Context, serial string) (model.RunnerProfile, bool, error) {
@@ -485,17 +468,26 @@ func TestCancelJobsByRunnerEdges(t *testing.T) {
 		}
 	})
 
-	t.Run("listing failure", func(t *testing.T) {
-		st := &killErrStore{killStore: &killStore{fakeStore: newFakeStore()}}
-		st.listErr = errors.New("listing failed")
+	t.Run("transaction failure is returned with zero partial state", func(t *testing.T) {
+		st := newFakeStore()
+		st.putJob(model.Job{ID: "job-run", RunID: "run-1", Key: "r", Status: model.StatusRunning, LeaseRunnerID: "runner-1", Attempts: 5, MaxInfraRetries: 1, LeaseExpiresAt: &now})
+		st.putRunner(model.Runner{ID: "runner-1", Name: "r", Capacity: 1, ActiveJobs: []string{"job-run"}})
+		st.revokeErr = errors.New("revoke transaction failed")
 		s := NewDB(st, time.Second, nil, nil)
-		if _, err := s.CancelJobsByRunner(ctx, "runner-1", "disable"); err == nil {
-			t.Fatal("listing failure must surface")
+		count, err := s.CancelJobsByRunner(ctx, "runner-1", "disable")
+		if count != 0 || err == nil {
+			t.Fatalf("count/err = %d/%v, want the transaction failure returned", count, err)
+		}
+		// Adaptation note: the old multi-step sequence returned a count for
+		// jobs already updated before a later step failed. The transactional
+		// contract is all-or-nothing, so the job must be untouched.
+		if j, _ := st.job("job-run"); j.Status != model.StatusRunning || j.LeaseRunnerID != "runner-1" {
+			t.Fatalf("failed revocation left partial state: %+v", j)
 		}
 	})
 
 	t.Run("non-running jobs are skipped", func(t *testing.T) {
-		st := &killAllStore{fakeStore: newFakeStore()}
+		st := newFakeStore()
 		st.putJob(model.Job{ID: "job-queued", RunID: "run-1", Key: "q", Status: model.StatusQueued, LeaseRunnerID: "runner-1"})
 		st.putJob(model.Job{ID: "job-run", RunID: "run-1", Key: "r", Status: model.StatusRunning, LeaseRunnerID: "runner-1", Attempts: 5, MaxInfraRetries: 1, LeaseExpiresAt: &now})
 		s := NewDB(st, time.Second, nil, nil)
@@ -508,80 +500,29 @@ func TestCancelJobsByRunnerEdges(t *testing.T) {
 		}
 	})
 
-	t.Run("update failure is recorded and skips the job", func(t *testing.T) {
-		st := &killAllStore{fakeStore: newFakeStore()}
+	t.Run("one transactional call and an idempotent replay", func(t *testing.T) {
+		st := newFakeStore()
 		st.putJob(model.Job{ID: "job-run", RunID: "run-1", Key: "r", Status: model.StatusRunning, LeaseRunnerID: "runner-1", Attempts: 5, MaxInfraRetries: 1, LeaseExpiresAt: &now})
-		st.updateErr = errors.New("update failed")
-		s := NewDB(st, time.Second, nil, nil)
-		count, err := s.CancelJobsByRunner(ctx, "runner-1", "disable")
-		if count != 0 || err == nil {
-			t.Fatalf("count/err = %d/%v, want the update failure recorded", count, err)
-		}
-	})
-
-	t.Run("runner release and recompute failures are logged", func(t *testing.T) {
-		st := &killAllStore{fakeStore: newFakeStore()}
-		st.putJob(model.Job{ID: "job-run", RunID: "run-1", Key: "r", Status: model.StatusRunning, LeaseRunnerID: "runner-1", Attempts: 5, MaxInfraRetries: 1, LeaseExpiresAt: &now})
-		st.putRun(model.Run{ID: "run-1", Status: model.StatusRunning, CreatedAt: now})
-		st.releaseErr = errors.New("release failed")
-		st.listByRunErr = errors.New("list by run failed")
+		st.putRunner(model.Runner{ID: "runner-1", Name: "r", Capacity: 1, ActiveJobs: []string{"job-run"}})
 		s := NewDB(st, time.Second, nil, nil)
 		count, err := s.CancelJobsByRunner(ctx, "runner-1", "disable")
 		if err != nil || count != 1 {
 			t.Fatalf("count/err = %d/%v", count, err)
 		}
-
-		st.listByRunErr = nil
-		st.releaseErr = nil
+		// Adaptation note: the old scheduler drove UpdateJob + ReleaseRunnerJob
+		// per job; the transactional contract must be the ONLY write path.
+		if len(st.releaseRunnerCalls) != 0 || len(st.updateJobCalls) != 0 {
+			t.Fatalf("multi-step recovery writes were used: release=%d update=%d", len(st.releaseRunnerCalls), len(st.updateJobCalls))
+		}
+		if len(st.revokeCalls) != 1 {
+			t.Fatalf("revoke calls = %d, want exactly 1", len(st.revokeCalls))
+		}
+		// A second replica racing the same revocation observes an empty set.
 		count, err = s.CancelJobsByRunner(ctx, "runner-1", "disable")
 		if err != nil || count != 0 {
-			t.Fatalf("second call count/err = %d/%v (job must now be terminal)", count, err)
+			t.Fatalf("replayed count/err = %d/%v, want 0/nil", count, err)
 		}
 	})
-}
-
-type killErrStore struct {
-	*killStore
-	listErr        error
-	updateErr      error
-	releaseErr     error
-	listByRunErr   error
-	appendAuditErr error
-}
-
-func (k *killErrStore) ListJobsByRunner(ctx context.Context, runnerID string) ([]model.Job, error) {
-	if k.listErr != nil {
-		return nil, k.listErr
-	}
-	return k.killStore.ListJobsByRunner(ctx, runnerID)
-}
-
-func (k *killErrStore) UpdateJob(ctx context.Context, j model.Job) error {
-	if k.updateErr != nil {
-		return k.updateErr
-	}
-	return k.killStore.UpdateJob(ctx, j)
-}
-
-func (k *killErrStore) ReleaseRunnerJob(ctx context.Context, runnerID, jobID string, status model.Status) error {
-	if k.releaseErr != nil {
-		return k.releaseErr
-	}
-	return k.killStore.ReleaseRunnerJob(ctx, runnerID, jobID, status)
-}
-
-func (k *killErrStore) ListJobsByRun(ctx context.Context, runID string) ([]model.Job, error) {
-	if k.listByRunErr != nil {
-		return nil, k.listByRunErr
-	}
-	return k.killStore.ListJobsByRun(ctx, runID)
-}
-
-func (k *killErrStore) AppendAudit(ctx context.Context, e model.AuditEvent) error {
-	if k.appendAuditErr != nil {
-		return k.appendAuditErr
-	}
-	return k.killStore.AppendAudit(ctx, e)
 }
 
 func TestRecoverExpiredErrorPaths(t *testing.T) {
@@ -611,20 +552,26 @@ func TestRecoverExpiredErrorPaths(t *testing.T) {
 		}
 	})
 
-	t.Run("queue timeout write and quota release failures", func(t *testing.T) {
-		st := &quotaErrStore{fakeStore: newFakeStore()}
+	t.Run("queue timeout transaction failure leaves the job queued", func(t *testing.T) {
+		st := newFakeStore()
 		deadline := now.Add(-time.Minute)
 		st.putJob(model.Job{ID: "job-1", RunID: "run-1", Key: "k", Status: model.StatusQueued, QueueDeadline: &deadline, RepoURL: "https://github.com/o/r.git"})
 		st.putRun(model.Run{ID: "run-1", Status: model.StatusQueued, CreatedAt: now})
 		st.leaderOK = true
-		st.updateJobErr = errors.New("update failed")
+		st.expireErr = errors.New("expire transaction failed")
 		s := NewDB(st, time.Second, nil, nil)
 		if err := s.RecoverExpired(ctx, now); err != nil {
 			t.Fatalf("RecoverExpired: %v", err)
 		}
+		// Adaptation note: the old scheduler applied the job write first and
+		// released the queued quota best-effort afterwards; a failure left a
+		// cancelled job with a leaked reservation. The transaction must roll
+		// back completely.
+		if j, _ := st.job("job-1"); j.Status != model.StatusQueued {
+			t.Fatalf("failed expire left partial state: %+v", j)
+		}
 
-		st.updateJobErr = nil
-		st.adjustQuotaErr = errors.New("quota counter write failed")
+		st.expireErr = nil
 		if err := s.RecoverExpired(ctx, now); err != nil {
 			t.Fatalf("RecoverExpired: %v", err)
 		}
@@ -632,27 +579,25 @@ func TestRecoverExpiredErrorPaths(t *testing.T) {
 		if !ok || j.Status != model.StatusCancelled {
 			t.Fatalf("job after queue timeout = %+v", j)
 		}
+		if len(st.expireCalls) != 2 {
+			t.Fatalf("expire calls = %d, want 2 (one failed, one committed)", len(st.expireCalls))
+		}
 	})
 
-	t.Run("lease expiry write and runner release failures", func(t *testing.T) {
-		st := &quotaErrStore{fakeStore: newFakeStore()}
+	t.Run("lease recovery transaction failure leaves every job untouched", func(t *testing.T) {
+		st := newFakeStore()
 		expired := now.Add(-time.Minute)
-		st.putJob(model.Job{ID: "job-1", RunID: "run-1", Key: "k", Status: model.StatusRunning, LeaseRunnerID: "runner-1", LeaseExpiresAt: &expired, Attempts: 5, MaxInfraRetries: 0})
-		st.putJob(model.Job{ID: "job-2", RunID: "run-1", Key: "k2", Status: model.StatusRunning, LeaseRunnerID: "runner-1", LeaseExpiresAt: &expired, Attempts: 0, MaxInfraRetries: 2})
+		st.putJob(model.Job{ID: "job-1", RunID: "run-1", Key: "k", Status: model.StatusRunning, LeaseRunnerID: "runner-1", LeaseGeneration: 1, LeaseExpiresAt: &expired, Attempts: 5, MaxInfraRetries: 0})
+		st.putJob(model.Job{ID: "job-2", RunID: "run-1", Key: "k2", Status: model.StatusRunning, LeaseRunnerID: "runner-1", LeaseGeneration: 1, LeaseExpiresAt: &expired, Attempts: 0, MaxInfraRetries: 2})
 		st.putRun(model.Run{ID: "run-1", Status: model.StatusRunning, CreatedAt: now})
 		st.leaderOK = true
-		st.updateJobErr = errors.New("update failed")
-		st.releaseErr = errors.New("release failed")
+		st.recoverErr = errors.New("recover transaction failed")
 		s := NewDB(st, time.Second, nil, nil)
 		if err := s.RecoverExpired(ctx, now); err != nil {
 			t.Fatalf("RecoverExpired: %v", err)
 		}
 
-		st.updateJobErr = nil
-		if err := s.RecoverExpired(ctx, now); err != nil {
-			t.Fatalf("RecoverExpired: %v", err)
-		}
-		st.releaseErr = nil
+		st.recoverErr = nil
 		if err := s.RecoverExpired(ctx, now); err != nil {
 			t.Fatalf("RecoverExpired: %v", err)
 		}
@@ -662,118 +607,10 @@ func TestRecoverExpiredErrorPaths(t *testing.T) {
 		if j, _ := st.job("job-2"); j.Status != model.StatusQueued {
 			t.Fatalf("retryable job = %+v", j)
 		}
-	})
-}
-
-// killAllStore lists every job of the runner regardless of status, so the
-// kill switch's non-running skip and per-stage failures are reachable.
-type killAllStore struct {
-	*fakeStore
-	updateErr    error
-	releaseErr   error
-	listByRunErr error
-}
-
-func (k *killAllStore) ListJobsByRunner(ctx context.Context, runnerID string) ([]model.Job, error) {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	out := []model.Job{}
-	for _, j := range k.jobs {
-		if j.LeaseRunnerID == runnerID {
-			out = append(out, j)
+		if len(st.recoverCalls) != 4 {
+			t.Fatalf("recover calls = %d, want 2 per pass x 2 passes", len(st.recoverCalls))
 		}
-	}
-	return out, nil
-}
-
-func (k *killAllStore) UpdateJob(ctx context.Context, j model.Job) error {
-	if k.updateErr != nil {
-		return k.updateErr
-	}
-	return k.fakeStore.UpdateJob(ctx, j)
-}
-
-func (k *killAllStore) ReleaseRunnerJob(ctx context.Context, runnerID, jobID string, status model.Status) error {
-	if k.releaseErr != nil {
-		return k.releaseErr
-	}
-	return k.fakeStore.ReleaseRunnerJob(ctx, runnerID, jobID, status)
-}
-
-func (k *killAllStore) ListJobsByRun(ctx context.Context, runID string) ([]model.Job, error) {
-	if k.listByRunErr != nil {
-		return nil, k.listByRunErr
-	}
-	return k.fakeStore.ListJobsByRun(ctx, runID)
-}
-
-// quotaErrStore injects queue-counter and job-write failures.
-type quotaErrStore struct {
-	*fakeStore
-	updateJobErr    error
-	releaseErr      error
-	adjustQuotaErr  error
-	appendAuditErr  error
-	updateRunErr    error
-	listJobsByRunEr error
-}
-
-func (q *quotaErrStore) UpdateJob(ctx context.Context, j model.Job) error {
-	if q.updateJobErr != nil {
-		return q.updateJobErr
-	}
-	return q.fakeStore.UpdateJob(ctx, j)
-}
-
-func (q *quotaErrStore) ReleaseRunnerJob(ctx context.Context, runnerID, jobID string, status model.Status) error {
-	if q.releaseErr != nil {
-		return q.releaseErr
-	}
-	return q.fakeStore.ReleaseRunnerJob(ctx, runnerID, jobID, status)
-}
-
-func (q *quotaErrStore) AdjustQuotaCounter(ctx context.Context, repoKey, teamKey string, runningDelta, queuedDelta int) error {
-	if q.adjustQuotaErr != nil {
-		return q.adjustQuotaErr
-	}
-	return q.fakeStore.AdjustQuotaCounter(ctx, repoKey, teamKey, runningDelta, queuedDelta)
-}
-
-func (q *quotaErrStore) AppendAudit(ctx context.Context, e model.AuditEvent) error {
-	if q.appendAuditErr != nil {
-		return q.appendAuditErr
-	}
-	return q.fakeStore.AppendAudit(ctx, e)
-}
-
-func (q *quotaErrStore) UpdateRunStatus(ctx context.Context, id string, status model.Status, startedAt, finishedAt *time.Time) error {
-	if q.updateRunErr != nil {
-		return q.updateRunErr
-	}
-	return q.fakeStore.UpdateRunStatus(ctx, id, status, startedAt, finishedAt)
-}
-
-func (q *quotaErrStore) ListJobsByRun(ctx context.Context, runID string) ([]model.Job, error) {
-	if q.listJobsByRunEr != nil {
-		return nil, q.listJobsByRunEr
-	}
-	return q.fakeStore.ListJobsByRun(ctx, runID)
-}
-
-func TestRecoverExpiredAuditFailureIsLogged(t *testing.T) {
-	st := &quotaErrStore{fakeStore: newFakeStore()}
-	deadline := time.Now().UTC().Add(-time.Minute)
-	st.putJob(model.Job{ID: "job-1", RunID: "run-1", Key: "k", Status: model.StatusQueued, QueueDeadline: &deadline})
-	st.putRun(model.Run{ID: "run-1", Status: model.StatusQueued})
-	st.leaderOK = true
-	st.appendAuditErr = errors.New("audit sink down")
-	s := NewDB(st, time.Second, nil, nil)
-	if err := s.RecoverExpired(context.Background(), time.Now().UTC()); err != nil {
-		t.Fatalf("RecoverExpired: %v", err)
-	}
-	if j, _ := st.job("job-1"); j.Status != model.StatusCancelled {
-		t.Fatalf("job = %+v, want the queue timeout applied", j)
-	}
+	})
 }
 
 func TestAppendUniqueAndCloneMap(t *testing.T) {
@@ -792,260 +629,6 @@ func TestAppendUniqueAndCloneMap(t *testing.T) {
 	cloned["k"] = "changed"
 	if src["k"] != "v" {
 		t.Fatal("cloneMap must copy the map")
-	}
-}
-
-func TestReleaseQueuedQuotaLegacyStore(t *testing.T) {
-	// A store without the counter contract is tolerated: the release is a
-	// no-op instead of an error.
-	st := &legacyQuotaStore{Store: newFakeStore()}
-	s := &DBScheduler{Store: st, LeaderKey: "k", LeaderTTL: time.Second}
-	s.releaseQueuedQuota(context.Background(), model.Job{ID: "j", RepoURL: "https://github.com/o/r.git"})
-}
-
-// legacyQuotaStore hides the QuotaCounterStore methods by embedding only the
-// storage.Store interface.
-type legacyQuotaStore struct {
-	storage.Store
-}
-
-func TestRecomputeRunStatuses(t *testing.T) {
-	ctx := context.Background()
-	now := time.Now().UTC()
-	started := now.Add(-time.Minute)
-	finished := now.Add(-time.Second)
-
-	cases := []struct {
-		name   string
-		run    model.Run
-		jobs   map[string]model.Job
-		want   model.Status
-		wantNo bool
-	}{
-		{
-			name: "all terminal with failure",
-			run:  model.Run{ID: "run", Status: model.StatusRunning},
-			jobs: map[string]model.Job{
-				"a": {ID: "a", Status: model.StatusSuccess, StartedAt: &started, FinishedAt: &finished},
-				"b": {ID: "b", Status: model.StatusBlocked},
-			},
-			want: model.StatusFailure,
-		},
-		{
-			name: "all terminal cancelled",
-			run:  model.Run{ID: "run", Status: model.StatusRunning},
-			jobs: map[string]model.Job{
-				"a": {ID: "a", Status: model.StatusSuccess},
-				"b": {ID: "b", Status: model.StatusCancelled},
-			},
-			want: model.StatusCancelled,
-		},
-		{
-			name: "all terminal success without finish times",
-			run:  model.Run{ID: "run", Status: model.StatusRunning},
-			jobs: map[string]model.Job{
-				"a": {ID: "a", Status: model.StatusSuccess},
-			},
-			want: model.StatusSuccess,
-		},
-		{
-			name: "running wins",
-			run:  model.Run{ID: "run", Status: model.StatusQueued},
-			jobs: map[string]model.Job{
-				"a": {ID: "a", Status: model.StatusRunning},
-				"b": {ID: "b", Status: model.StatusQueued},
-			},
-			want: model.StatusRunning,
-		},
-		{
-			name: "waiting approval",
-			run:  model.Run{ID: "run", Status: model.StatusQueued},
-			jobs: map[string]model.Job{
-				"a": {ID: "a", Status: model.StatusWaitingApproval},
-			},
-			want: model.StatusWaitingApproval,
-		},
-		{
-			name: "otherwise queued",
-			run:  model.Run{ID: "run", Status: model.StatusRunning},
-			jobs: map[string]model.Job{
-				"a": {ID: "a", Status: model.StatusQueued},
-			},
-			want: model.StatusQueued,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			st := newFakeStore()
-			st.putRun(tc.run)
-			for id, j := range tc.jobs {
-				j.RunID = tc.run.ID
-				st.putJob(j)
-				_ = id
-			}
-			s := &DBScheduler{Store: st, LeaderKey: "k", LeaderTTL: time.Second}
-			s.recomputeRun(ctx, tc.run, tc.jobs)
-			run, err := st.GetRun(ctx, tc.run.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if run.Status != tc.want {
-				t.Fatalf("status = %v, want %v", run.Status, tc.want)
-			}
-			if tc.want == model.StatusSuccess && run.FinishedAt == nil {
-				t.Fatal("terminal runs must get a finish time")
-			}
-		})
-	}
-
-	t.Run("cancelled run is untouched", func(t *testing.T) {
-		st := newFakeStore()
-		run := model.Run{ID: "run", Status: model.StatusCancelled}
-		st.putRun(run)
-		s := &DBScheduler{Store: st, LeaderKey: "k", LeaderTTL: time.Second}
-		s.recomputeRun(ctx, run, map[string]model.Job{"a": {ID: "a", Status: model.StatusRunning}})
-		got, _ := st.GetRun(ctx, "run")
-		if got.Status != model.StatusCancelled {
-			t.Fatalf("status = %v", got.Status)
-		}
-	})
-
-	t.Run("empty job set is untouched", func(t *testing.T) {
-		st := newFakeStore()
-		run := model.Run{ID: "run", Status: model.StatusQueued}
-		st.putRun(run)
-		s := &DBScheduler{Store: st, LeaderKey: "k", LeaderTTL: time.Second}
-		s.recomputeRun(ctx, run, nil)
-		got, _ := st.GetRun(ctx, "run")
-		if got.Status != model.StatusQueued {
-			t.Fatalf("status = %v", got.Status)
-		}
-	})
-
-	t.Run("update failure is logged", func(t *testing.T) {
-		st := &quotaErrStore{fakeStore: newFakeStore()}
-		st.updateRunErr = errors.New("run write failed")
-		run := model.Run{ID: "run", Status: model.StatusQueued}
-		st.putRun(run)
-		s := &DBScheduler{Store: st, LeaderKey: "k", LeaderTTL: time.Second}
-		s.recomputeRun(ctx, run, map[string]model.Job{"a": {ID: "a", Status: model.StatusRunning}})
-	})
-}
-
-func TestRecomputeDependents(t *testing.T) {
-	ctx := context.Background()
-
-	t.Run("success dependency promotes waiting job", func(t *testing.T) {
-		st := newFakeStore()
-		jobs := map[string]model.Job{
-			"up":   {ID: "up", Status: model.StatusSuccess},
-			"down": {ID: "down", RunID: "run", Key: "down", Status: model.StatusQueued, Needs: []string{"up"}},
-		}
-		for _, j := range jobs {
-			st.putJob(j)
-		}
-		s := &DBScheduler{Store: st, LeaderKey: "k", LeaderTTL: time.Second}
-		s.recomputeDependents(ctx, jobs)
-		j, _ := st.job("down")
-		if j.DependencyStatus != model.StatusSuccess {
-			t.Fatalf("dependency status = %v", j.DependencyStatus)
-		}
-	})
-
-	t.Run("failed dependency blocks the job", func(t *testing.T) {
-		st := newFakeStore()
-		jobs := map[string]model.Job{
-			"up":   {ID: "up", Status: model.StatusFailure},
-			"down": {ID: "down", RunID: "run", Key: "down", Status: model.StatusQueued, Needs: []string{"up"}},
-		}
-		for _, j := range jobs {
-			st.putJob(j)
-		}
-		s := &DBScheduler{Store: st, LeaderKey: "k", LeaderTTL: time.Second}
-		s.recomputeDependents(ctx, jobs)
-		j, _ := st.job("down")
-		if j.Status != model.StatusBlocked || j.FinishedAt == nil {
-			t.Fatalf("blocked job = %+v", j)
-		}
-	})
-
-	t.Run("condition always admits a failed dependency", func(t *testing.T) {
-		st := newFakeStore()
-		jobs := map[string]model.Job{
-			"up":   {ID: "up", Status: model.StatusFailure},
-			"down": {ID: "down", RunID: "run", Key: "down", Status: model.StatusQueued, Needs: []string{"up"}, Condition: "always()"},
-		}
-		for _, j := range jobs {
-			st.putJob(j)
-		}
-		s := &DBScheduler{Store: st, LeaderKey: "k", LeaderTTL: time.Second}
-		s.recomputeDependents(ctx, jobs)
-		j, _ := st.job("down")
-		if j.Status != model.StatusQueued || j.DependencyStatus != model.StatusFailure {
-			t.Fatalf("always job = %+v", j)
-		}
-	})
-
-	t.Run("unchanged outcome is skipped", func(t *testing.T) {
-		st := newFakeStore()
-		jobs := map[string]model.Job{
-			"up":   {ID: "up", Status: model.StatusSuccess},
-			"down": {ID: "down", RunID: "run", Status: model.StatusQueued, Needs: []string{"up"}, DependencyStatus: model.StatusSuccess},
-		}
-		for _, j := range jobs {
-			st.putJob(j)
-		}
-		s := &DBScheduler{Store: st, LeaderKey: "k", LeaderTTL: time.Second}
-		s.recomputeDependents(ctx, jobs)
-	})
-
-	t.Run("update failure is logged", func(t *testing.T) {
-		st := &quotaErrStore{fakeStore: newFakeStore()}
-		st.updateJobErr = errors.New("update failed")
-		jobs := map[string]model.Job{
-			"up":   {ID: "up", Status: model.StatusSuccess},
-			"down": {ID: "down", RunID: "run", Status: model.StatusQueued, Needs: []string{"up"}},
-		}
-		for _, j := range jobs {
-			st.putJob(j)
-		}
-		s := &DBScheduler{Store: st, LeaderKey: "k", LeaderTTL: time.Second}
-		s.recomputeDependents(ctx, jobs)
-	})
-}
-
-func TestQueueTimeoutFromPayloadVariants(t *testing.T) {
-	withTimeout := func(t *testing.T) []byte {
-		t.Helper()
-		cj := pipeline.CompiledJob{Job: pipeline.Job{QueueTimeout: pipeline.Duration{Duration: 30 * time.Second, Set: true}}}
-		b, err := json.Marshal(cj)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return b
-	}
-	raw := withTimeout(t)
-
-	cases := []struct {
-		name string
-		job  model.Job
-		want time.Duration
-	}{
-		{"nil payload", model.Job{}, 0},
-		{"nil effective job", model.Job{CompiledJobPayload: &model.CompiledJobPayload{}}, 0},
-		{"raw message", model.Job{CompiledJobPayload: &model.CompiledJobPayload{EffectiveJob: json.RawMessage(raw)}}, 30 * time.Second},
-		{"byte slice", model.Job{CompiledJobPayload: &model.CompiledJobPayload{EffectiveJob: raw}}, 30 * time.Second},
-		{"string", model.Job{CompiledJobPayload: &model.CompiledJobPayload{EffectiveJob: string(raw)}}, 30 * time.Second},
-		{"struct value", model.Job{CompiledJobPayload: &model.CompiledJobPayload{EffectiveJob: pipeline.CompiledJob{Job: pipeline.Job{QueueTimeout: pipeline.Duration{Duration: 5 * time.Second, Set: true}}}}}, 5 * time.Second},
-		{"invalid json", model.Job{CompiledJobPayload: &model.CompiledJobPayload{EffectiveJob: []byte("{nope")}}, 0},
-		{"no timeout", model.Job{CompiledJobPayload: &model.CompiledJobPayload{EffectiveJob: []byte("{}")}}, 0},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := queueTimeoutFromPayload(tc.job); got != tc.want {
-				t.Fatalf("queueTimeoutFromPayload = %v, want %v", got, tc.want)
-			}
-		})
 	}
 }
 

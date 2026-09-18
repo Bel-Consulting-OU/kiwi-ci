@@ -33,7 +33,7 @@ var regionParityTable = []struct {
 // region-constrained job (parity with memory mode).
 func TestRegionParityTableDBMode(t *testing.T) {
 	for _, tc := range regionParityTable {
-		st := &killStore{fakeStore: newFakeStore()}
+		st := newFakeStore()
 		st.leaderOK = true
 		s := NewDB(st, DefaultLeaseDuration, nil, nil)
 		ctx := context.Background()

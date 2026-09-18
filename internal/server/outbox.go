@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -98,12 +100,42 @@ func (o *Outbox) AttachDB(db storage.Store) {
 	}
 }
 
+// outboxDueStore is the optional due-filtered active read: rows that are not
+// dead-lettered AND dispatchable now (next_attempt_at <= now()). PostgresStore
+// implements it; stores that cannot express the due filter fall back to
+// OutboxPending in dbMirrorItems.
+type outboxDueStore interface {
+	OutboxDue(ctx context.Context) ([]storage.OutboxItem, error)
+}
+
+// dbMirrorItems returns the durable rows ReplayDB and pruneDB may mirror in
+// memory. INVARIANT: o.items holds only currently-due, non-dead intents.
+// Dead letters are operator-visible only through the dead-letter API, and a
+// delayed row (retry backoff in the future) must not stay resident: it is not
+// dispatchable yet, so it is not mirrored. Dispatchability itself is always
+// decided by ClaimOutbox; a delayed row becomes claimable on the flush tick
+// whose due time has arrived, and that claim appends it to o.items then.
+//
+// A store without OutboxDue (legacy/test stores) can only expose its active
+// set: dead letters are still excluded, but rows whose backoff has not
+// elapsed cannot be told apart there, so those stay claim-gated like every
+// other durable row.
+func (o *Outbox) dbMirrorItems(ctx context.Context) ([]storage.OutboxItem, error) {
+	if due, ok := o.db.(outboxDueStore); ok {
+		return due.OutboxDue(ctx)
+	}
+	return o.db.OutboxPending(ctx)
+}
+
 // ReplayDB loads unacked intents from the SQL store into memory (FIFO).
+// Only intents dispatchable now are mirrored (see dbMirrorItems): a delayed
+// row is left to the durable claim that fires once its backoff elapses, and
+// a dead letter is never resident.
 func (o *Outbox) ReplayDB(ctx context.Context) error {
 	if o.db == nil {
 		return nil
 	}
-	items, err := o.db.OutboxPending(ctx)
+	items, err := o.dbMirrorItems(ctx)
 	if err != nil {
 		return err
 	}
@@ -219,6 +251,52 @@ func (o *Outbox) readItems() ([]forge.OutboxItem, error) {
 	return out, nil
 }
 
+// ErrOutboxIDConflict marks an invariant violation: an intent ID that is
+// already queued was enqueued again with DIFFERENT content. Deterministic IDs
+// make replays idempotent (same ID + same content is success), but reusing an
+// ID for a different operation would map two distinct effects onto one durable
+// intent, so it must fail loudly instead of silently succeeding.
+var ErrOutboxIDConflict = errors.New("outbox: intent ID reused with different content")
+
+// outboxIDConflictError names the conflicting intent ID; it unwraps to
+// ErrOutboxIDConflict so callers can match with errors.Is.
+type outboxIDConflictError struct{ id string }
+
+func (e *outboxIDConflictError) Error() string {
+	return fmt.Sprintf("outbox: intent %s already exists with different content", e.id)
+}
+
+func (e *outboxIDConflictError) Unwrap() error { return ErrOutboxIDConflict }
+
+// sameOutboxContent mirrors the durable OutboxAppend idempotency rule: the
+// same ID with the same kind, payload and versioned identity is a replay;
+// anything else is an invariant conflict. Payloads compare semantically
+// because durable JSON columns normalize whitespace/key order on read, and an
+// empty payload is normalized to "{}" exactly like OutboxAppend does.
+func sameOutboxContent(existing, incoming forge.OutboxItem) bool {
+	if existing.Kind != incoming.Kind {
+		return false
+	}
+	if existing.LogicalKey != incoming.LogicalKey || existing.StateVersion != incoming.StateVersion {
+		return false
+	}
+	a, b := existing.Payload, incoming.Payload
+	if len(a) == 0 {
+		a = []byte("{}")
+	}
+	if len(b) == 0 {
+		b = []byte("{}")
+	}
+	if bytes.Equal(a, b) {
+		return true
+	}
+	var x, y any
+	if json.Unmarshal(a, &x) != nil || json.Unmarshal(b, &y) != nil {
+		return false
+	}
+	return reflect.DeepEqual(x, y)
+}
+
 // Enqueue appends one intent DURABLY FIRST and only then makes it
 // dispatchable. In DB mode a failed durable write returns the error and the
 // item is NOT queued: an external side effect must never be dispatchable
@@ -258,6 +336,13 @@ func (o *Outbox) Enqueue(item forge.OutboxItem) error {
 	}
 	for _, it := range o.items {
 		if it.ID == item.ID {
+			// An ID already queued is a replay only when the content matches.
+			// A reused ID with a different payload/kind is an invariant
+			// conflict (two operations mapped onto one durable intent) and
+			// must never be silently acknowledged as success.
+			if !sameOutboxContent(it, item) {
+				return &outboxIDConflictError{id: item.ID}
+			}
 			return nil
 		}
 	}
@@ -682,27 +767,21 @@ func (o *Outbox) flushDBBatch(ctx context.Context, dispatch func(context.Context
 
 	dispatched := 0
 	var failed []string
+	// acked records the claimed rows this call ACKed durably. The deferred
+	// release then covers EVERY OTHER claimed row, so the batch invariant is
+	// simply "every claimed row ends this call ACKed or released". Deciding
+	// "handled" from local-queue membership was wrong: after an early ACK
+	// error every not-yet-dispatched claimed row is still queued locally and
+	// its claim was left held until OutboxClaimTTL expired. Releasing an
+	// already-ACKed row or a claim this call already released is a no-op in
+	// every store (they clear only the caller's own claim).
+	acked := make(map[string]bool, len(claimed))
 	defer func() {
-		// ALWAYS release the claims of rows this batch never dispatched:
-		// otherwise up to OutboxClaimBatch-1 unrelated rows stay claimed
-		// until the TTL expires.
 		for _, it := range claimed {
-			dispatchedOrFailed := false
-			for _, f := range failed {
-				if f == it.ID {
-					dispatchedOrFailed = true
-				}
+			if acked[it.ID] {
+				continue
 			}
-			o.mu.Lock()
-			for _, q := range o.items {
-				if q.ID == it.ID {
-					dispatchedOrFailed = true
-				}
-			}
-			o.mu.Unlock()
-			if !dispatchedOrFailed {
-				_ = o.db.ReleaseOutboxClaim(ctx, it.ID, claimer)
-			}
+			_ = o.db.ReleaseOutboxClaim(ctx, it.ID, claimer)
 		}
 	}()
 	for {
@@ -752,6 +831,9 @@ func (o *Outbox) flushDBBatch(ctx context.Context, dispatch func(context.Context
 			}
 			return dispatched, len(claimed), err
 		}
+		// Durable ACK succeeded: this claim is satisfied and must not be
+		// released by the deferred cleanup.
+		acked[it.ID] = true
 		o.mu.Lock()
 		o.removeLocked(it.ID)
 		o.done[it.ID] = true
@@ -826,9 +908,11 @@ func (o *Outbox) removeLocked(id string) {
 
 // pruneDB drops local copies of rows another replica has acknowledged, so
 // the in-memory queue does not grow without bound in HA. Local-only items
-// (no durable row) are never pruned.
+// (no durable row) are never pruned. The live set is the SAME due-only set
+// ReplayDB mirrors (dbMirrorItems), so a row that stopped being dispatchable
+// (retry backoff) is not kept resident, and a dead letter is dropped.
 func (o *Outbox) pruneDB(ctx context.Context) {
-	pending, err := o.db.OutboxPending(ctx)
+	pending, err := o.dbMirrorItems(ctx)
 	if err != nil {
 		return
 	}

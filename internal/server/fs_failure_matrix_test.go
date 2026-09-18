@@ -25,7 +25,7 @@ package server
 //	runner.enable          server.go:2311   503
 //	runner.lease_skip      server.go:2378/2389/2399/2406 204 annotations, not driven (see report)
 //	runner.queue_reasons   server.go:2474   204 annotations, not driven (see report)
-//	job.lease              server.go:2529   503 fixed body, token withheld; in-memory claim retained by documented recovery contract (server.go:2530-2543)
+//	job.lease              server.go:2633   503 fixed body, token withheld, claim rolled back (job queued, attempt unconsumed, runner slot free; rollback at server.go:2402)
 //	job.heartbeat          server.go:2697   503 "heartbeat not durable"
 //	job.complete           server.go:3095   503
 //	job.complete.replay    server.go:3530   503
@@ -350,10 +350,11 @@ func fsCaseRunEnqueueWebhook() fsMutationCase {
 	}
 }
 
-// fsCaseJobLease drives POST /api/v1/runners/{id}/next. The documented
-// recovery contract (server.go:2530-2543) intentionally retains the
-// in-memory claim while withholding the token so expired-lease recovery
-// requeues it.
+// fsCaseJobLease drives POST /api/v1/runners/{id}/next. The claim's snapshot
+// write fails after the in-memory claim was installed: the handler rolls the
+// claim back wholesale (job stays queued, attempt unconsumed, runner slot
+// free), withholds the token and answers 503. Healing lets the SAME job lease
+// exactly once and the durable snapshot then contains that one claim.
 func fsCaseJobLease() fsMutationCase {
 	return fsMutationCase{
 		name: "job.lease",
@@ -367,6 +368,9 @@ func fsCaseJobLease() fsMutationCase {
 			}
 			job := queuedJobForRun(t, s, run)
 			runnerID := registerRollbackRunner(t, s, 1)
+			s.mu.Lock()
+			preActive := len(s.runners[runnerID].ActiveJobs)
+			s.mu.Unlock()
 			return &fsMutationDrive{
 				invoke: func(t *testing.T, s *Server) {
 					w := doJSON(t, s, http.MethodPost, "/api/v1/runners/"+runnerID+"/next", "token", "")
@@ -376,31 +380,27 @@ func fsCaseJobLease() fsMutationCase {
 						t.Fatalf("refused lease X-Kiwi-State = %q, want degraded", got)
 					}
 					fsMatrixAssertNoLeaseLeak(t, w)
-				},
-				rolledBack: false,
-				drift: func(t *testing.T, s *Server, pre stateRollback) {
-					if pre.jobs[job.ID].Status != model.StatusQueued {
-						t.Fatalf("fixture: job %s pre-status = %s", job.ID, pre.jobs[job.ID].Status)
-					}
 					s.mu.Lock()
 					got := s.jobs[job.ID]
 					active := len(s.runners[runnerID].ActiveJobs)
 					s.mu.Unlock()
-					if got.Status != model.StatusRunning || len(got.LeaseTokenHash) == 0 {
-						t.Fatalf("documented recovery claim missing: %+v", got)
+					if got.Status != model.StatusQueued || got.Attempts != job.Attempts || got.LeaseTokenHash != nil || got.LeaseRunnerID != "" {
+						t.Fatalf("failed-persist claim not rolled back: %+v", got)
 					}
-					if active != 1 {
-						t.Fatalf("documented recovery claim did not hold the runner slot: active=%d", active)
+					if active != preActive {
+						t.Fatalf("failed-persist claim changed the runner slots: %d -> %d", preActive, active)
 					}
 				},
+				rolledBack: true,
 				heal: func(t *testing.T, s *Server) {
-					// The runner never received the token, so the only way
-					// forward is expiry recovery. The maintain tick both
-					// requeues the expired in-memory claim and performs the
-					// persist that clears the degraded flag (server.go:5017-5057);
-					// with the flag cleared the same /next request then leases
-					// the requeued job normally.
-					s.maintainMemoryTick(context.Background(), time.Now().UTC().Add(2*s.leaseDuration()))
+					// The job is still queued, so healing the store lets the
+					// same job lease normally; the failed write armed the
+					// degraded gate, so a succeeding persist (a healing
+					// registration) must clear it before /next is accepted.
+					if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
+						`{"name":"lease-heal","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`); w.Code != http.StatusOK {
+						t.Fatalf("healing register: %d %s", w.Code, w.Body.String())
+					}
 					w := doJSON(t, s, http.MethodPost, "/api/v1/runners/"+runnerID+"/next", "token", "")
 					fsMatrixAssertStatus(t, w, http.StatusOK)
 					var task Task
@@ -410,6 +410,9 @@ func fsCaseJobLease() fsMutationCase {
 					if task.LeaseToken == "" || task.Job.ID != job.ID {
 						t.Fatalf("healed lease = %+v, want a token for %s", task, job.ID)
 					}
+					if task.Job.Attempts != job.Attempts+1 {
+						t.Fatalf("healed lease attempts = %d, want exactly %d (the failed claim must not consume one)", task.Job.Attempts, job.Attempts+1)
+					}
 				},
 				durable: func(t *testing.T, dir string, s *Server) {
 					s2 := fsMatrixReload(t, dir)
@@ -418,6 +421,9 @@ func fsCaseJobLease() fsMutationCase {
 					s2.mu.Unlock()
 					if got.Status != model.StatusRunning || got.LeaseRunnerID != runnerID || len(got.LeaseTokenHash) == 0 {
 						t.Fatalf("healed lease not durable: %+v", got)
+					}
+					if got.Attempts != job.Attempts+1 {
+						t.Fatalf("durable lease attempts = %d, want exactly %d", got.Attempts, job.Attempts+1)
 					}
 				},
 			}

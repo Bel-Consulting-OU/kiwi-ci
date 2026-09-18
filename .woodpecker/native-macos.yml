@@ -23,14 +23,33 @@
 #
 # Agent selection and shell:
 #   - Woodpecker's local backend advertises the default labels
-#     platform=<GOOS>/<GOARCH> and backend=local; selecting both pins this
-#     workflow to the dedicated macOS host (docs: workflow syntax -> labels;
-#     agent configuration -> AGENT_LABELS).
+#     platform=<GOOS>/<GOARCH> (canonical slash form) and backend=local;
+#     selecting both pins this workflow to the dedicated macOS host (docs:
+#     workflow syntax -> labels; agent configuration -> AGENT_LABELS).
 #   - On the local backend `image` is the shell/executable, not a container
 #     image (docs: backends -> local -> "Shell"), so it is `bash` here.
-#   - The worker must provide Go 1.27.x: the toolchain step asserts
-#     `go version`, and GOTOOLCHAIN=local stops Go from downloading another
-#     toolchain to mask a stale worker.
+#
+# Clone path (local backend): the automatic clone step is the plugin-git
+# binary, and the docs state it "must be in your $PATH for the default clone
+# step to work. If this is not the case, you can still write a manual clone
+# step." (docs: workflow syntax -> `clone`). This worker does not guarantee
+# plugin-git, so the documented fallback is used: `skip_clone: true` (docs:
+# workflow syntax -> `skip_clone`) disables the plugin clone, and the
+# `checkout` step below clones and checks out the Woodpecker-provided revision
+# itself. The local backend already creates the workspace (`CI_WORKSPACE`)
+# before the first step and runs every command with it as the working
+# directory (docs: usage -> environment -> `CI_WORKSPACE`; local backend docs:
+# "The local backend will use a random directory in $TMPDIR to store the
+# cloned code"). The commands use the built-in commit variables
+# CI_REPO_CLONE_URL, CI_COMMIT_REF and CI_COMMIT_SHA, so push, manual and tag
+# events all check out the exact commit, and the result is verified before any
+# other step runs.
+#
+# Toolchain: the `toolchain` step reads the exact `go <version>` directive
+# from the checked-out go.mod and compares it against README.md and the
+# worker's `go version` via scripts/toolchain-check.sh. This replaces the old
+# loose `1.27.x` regex. GOTOOLCHAIN=local stops Go from downloading a
+# different toolchain to mask a stale worker.
 labels:
   platform: darwin/arm64
   backend: local
@@ -38,20 +57,30 @@ labels:
 when:
   - event: [push, manual, tag]
 
+skip_clone: true
+
 steps:
-  toolchain:
+  checkout:
     image: bash
     environment:
       GOTOOLCHAIN: local
     commands:
       - |
-        command -v go >/dev/null 2>&1 || { echo "native-macos: go is not on PATH on this worker" >&2; exit 1; }
-        gv="$(go version)"
-        printf '%s\n' "$gv"
-        printf '%s\n' "$gv" | grep -Eq '^go version go1\.27([.][0-9]+)? ' || {
-          echo "native-macos requires Go 1.27.x on the worker, got: $gv" >&2
-          exit 1
-        }
+        set -eu
+        git -C "$CI_WORKSPACE" init -q
+        git -C "$CI_WORKSPACE" remote add origin "$CI_REPO_CLONE_URL"
+        git -C "$CI_WORKSPACE" fetch -q --force origin "$CI_COMMIT_REF"
+        git -C "$CI_WORKSPACE" checkout -q --detach "$CI_COMMIT_SHA"
+        test "$(git -C "$CI_WORKSPACE" rev-parse HEAD)" = "$CI_COMMIT_SHA"
+
+  toolchain:
+    image: bash
+    depends_on: [checkout]
+    environment:
+      GOTOOLCHAIN: local
+    commands:
+      # Exact toolchain assertion (go.mod vs README.md vs running `go`).
+      - ./scripts/toolchain-check.sh
 
   unit:
     image: bash

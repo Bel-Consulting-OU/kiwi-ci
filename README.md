@@ -34,7 +34,7 @@ untrusted code.
 
 ## Requirements
 
-- Go 1.23 or later.
+- Go 1.27.1 or later.
 - `git` on the PATH.
 - Docker (for `runtime: container`) and Tart (for `runtime: tart`)
   only where those runtimes are used.
@@ -206,13 +206,13 @@ and no other CI system in this repository.
 
 | Workflow | Agent label | What it runs |
 |---|---|---|
-| `linux-amd64` | `platform=linux-amd64` | format, vet, unit (`-vet=all -shuffle`), race, race-double, single-P (`GOMAXPROCS=1`), checkptr (`-d=checkptr=2 -race`), stress (`-count=10` adversarial patterns), adversarial, schema (+FILE_MAP), cross, license, docs, repro, staticcheck (`-checks=all` minus stylistic), govulncheck (`-test`), fuzz smoke (30s/target) |
-| `linux-arm64` | `platform=linux-arm64` | unit + race natively |
-| `docker-workspace` | `platform=linux-amd64`, `capability=docker` | REQUIRED rootless/hardened container workspace integration; a missing/unusable Docker daemon FAILS this lane |
-| `integration-coverage` | `platform=linux-amd64` | PostgreSQL service + integration tests + merged coverage with the 95% floor |
-| `native-windows` | `platform=windows-amd64` | native Windows `go vet` + full unit suite + the platform-sensitive packages (safefs, tui, executor, runner, storage, workspace, config). Trusted events only |
-| `native-macos` | `platform=darwin-arm64` | native macOS unit + race + termios/Tart-sensitive packages. Trusted events only (local backend executes on the host) |
-| `nightly` | `platform=linux-amd64` | cron: every fuzz target for 5 minutes plus the 50x stress battery |
+| `linux-amd64` | `platform=linux/amd64` | format, vet, unit (`-vet=all -shuffle`), race, race-double, single-P (`GOMAXPROCS=1`), checkptr (`-d=checkptr=2 -race`), stress (`-count=10` adversarial patterns), adversarial, schema (+FILE_MAP), cross, license, docs, repro, staticcheck (`-checks=all` minus stylistic), govulncheck (`-test`), fuzz smoke (30s/target) |
+| `linux-arm64` | `platform=linux/arm64` | unit + race natively |
+| `docker-workspace` | `platform=linux/amd64`, `capability=docker` | REQUIRED rootless/hardened container workspace integration; a missing/unusable Docker daemon FAILS this lane |
+| `integration-coverage` | `platform=linux/amd64` | PostgreSQL service + integration tests + merged coverage with the 95% floor |
+| `native-windows` | `platform=windows/amd64` | native Windows `go vet` + full unit suite + the platform-sensitive packages (safefs, tui, executor, runner, storage, workspace, config). Trusted events only |
+| `native-macos` | `platform=darwin/arm64` | native macOS unit + race + termios/Tart-sensitive packages. Trusted events only (local backend executes on the host) |
+| `nightly` | `platform=linux/amd64` | cron: every fuzz target for 5 minutes plus the 50x stress battery |
 
 Operational requirements for the Woodpecker instance:
 
@@ -221,14 +221,31 @@ Operational requirements for the Woodpecker instance:
 - `WOODPECKER_FORCE_IGNORE_SERVICE_FAILURE=false` on the server, so the
   PostgreSQL service being down fails `integration-coverage` instead of
   being ignored (see [docs/production-deployment.md](docs/production-deployment.md)).
+- `docker-workspace` mounts the agent host's Docker socket into its steps
+  (`volumes: - /var/run/docker.sock:/var/run/docker.sock`), so the repository
+  must be marked **trusted** in Woodpecker; `capability=docker` only selects
+  an agent and injects nothing. A dedicated agent that mounts the socket into
+  every pipeline container instead can set
+  `WOODPECKER_BACKEND_DOCKER_VOLUMES=/var/run/docker.sock:/var/run/docker.sock`.
 - Status contexts should use an event-independent format (see the
   Woodpecker docs), so branch protection can require stable names like
-  `ci/woodpecker/linux-amd64`.
+  `ci/woodpecker/linux-amd64`. Platform labels themselves use the canonical
+  `GOOS/GOARCH` slash form (`platform=linux/amd64`), matching the built-in
+  agent label.
 
 `main` is branch-protected: merges require a pull request, the workflow
 contexts above green, and the branch up to date. Protection is applied by
 `make protect-branch` (`scripts/gh-branch-protection.sh`), which REFUSES to
-install any context it has not observed on a recent commit. Dependabot keeps
+install any context it has not observed on a recent commit. By default the
+script emits the legacy `contexts` array; set
+`KIWI_WOODPECKER_APP_ID=<app-id>` to emit app-bound required checks
+(`checks: [{"context": "...", "app_id": <id>}, ...]`), which pins each
+context to the Woodpecker GitHub App instead of accepting a same-named status
+from any publisher. App-bound checks are sent with
+`X-GitHub-Api-Version: 2022-11-28` (override `KIWI_GH_API_VERSION`) and
+`Accept: application/vnd.github+json` (`KIWI_GH_ACCEPT`; GitHub Enterprise
+Server older than 3.9 needs the legacy
+`application/vnd.github.luke-cage-preview+json` media type). Dependabot keeps
 Go modules current with weekly PRs (`.github/dependabot.yml`); tool versions
 are pinned in the workflow files and upgraded deliberately (see
 [docs/upgrades.md](docs/upgrades.md)).

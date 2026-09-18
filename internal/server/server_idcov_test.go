@@ -20,19 +20,19 @@ import (
 // lifecycle endpoints use while delegating everything else to the fake.
 type idcovFaultStore struct {
 	*dbFakeStore
-	getRunErr       error
-	listRunsErr     error
-	listJobsErr     error
-	readLogsErr     error
-	appendLogErr    error
-	getJobErr       error
-	getRunnerErr    error
-	upsertRunErr    error
-	updateJobErr    error
-	listRunnerErr   error
-	hasReceiptErr   error
-	listByRunnerErr error
-	listAuditErr    error
+	getRunErr     error
+	listRunsErr   error
+	listJobsErr   error
+	readLogsErr   error
+	appendLogErr  error
+	getJobErr     error
+	getRunnerErr  error
+	upsertRunErr  error
+	updateJobErr  error
+	listRunnerErr error
+	hasReceiptErr error
+	revokeErr     error
+	listAuditErr  error
 }
 
 func (f *idcovFaultStore) GetRun(ctx context.Context, id string) (model.Run, error) {
@@ -105,11 +105,14 @@ func (f *idcovFaultStore) ReadAudit(ctx context.Context, limit int) ([]model.Aud
 	return f.dbFakeStore.ReadAudit(ctx, limit)
 }
 
-func (f *idcovFaultStore) ListJobsByRunner(ctx context.Context, runnerID string) ([]model.Job, error) {
-	if f.listByRunnerErr != nil {
-		return nil, f.listByRunnerErr
+// RevokeRunnerLeases injects a transactional kill-switch failure: the
+// scheduler consumes storage.RecoveryStore directly and never falls back to
+// ListJobsByRunner.
+func (f *idcovFaultStore) RevokeRunnerLeases(ctx context.Context, runnerID, reason string) ([]string, error) {
+	if f.revokeErr != nil {
+		return nil, f.revokeErr
 	}
-	return f.dbFakeStore.ListJobsByRunner(ctx, runnerID)
+	return f.dbFakeStore.RevokeRunnerLeases(ctx, runnerID, reason)
 }
 
 func (f *idcovFaultStore) ListRunners(ctx context.Context) ([]model.Runner, error) {

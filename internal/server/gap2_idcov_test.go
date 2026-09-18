@@ -771,9 +771,9 @@ func TestIDCovRunnerDisableDBErrors(t *testing.T) {
 		t.Fatalf("disable write failure = %d, want 500", w.Code)
 	}
 	fault.upsertRunErr = nil
-	// The kill switch itself fails when the store cannot list the runner's
-	// jobs.
-	fault.listByRunnerErr = errors.New("list by runner failed")
+	// The kill switch itself fails when the store cannot revoke the runner's
+	// leases transactionally.
+	fault.revokeErr = errors.New("revoke leases failed")
 	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/r1/disable", "admin", ""); w.Code != http.StatusInternalServerError {
 		t.Fatalf("disable kill-switch failure = %d, want 500", w.Code)
 	}

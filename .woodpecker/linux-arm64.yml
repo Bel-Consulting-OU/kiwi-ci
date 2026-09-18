@@ -1,7 +1,7 @@
 # Linux arm64: unit + race + the concurrency-critical packages, native
 # execution (no emulation) on an arm64-labelled agent.
 labels:
-  platform: linux-arm64
+  platform: linux/arm64
 
 when:
   - event: [push, pull_request, manual, tag]
@@ -12,6 +12,9 @@ steps:
     environment:
       GOTOOLCHAIN: local
     commands:
+      # First command of the first step: exact toolchain assertion (go.mod
+      # vs README.md vs the running `go`) before any build or test.
+      - ./scripts/toolchain-check.sh
       - go test -vet=all -shuffle=on -timeout=15m ./...
 
   race:

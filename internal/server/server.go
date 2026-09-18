@@ -2351,6 +2351,73 @@ func (s *Server) runnerEnable(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, ri)
 }
 
+// leaseRollback is the exact pre-claim in-memory state the fs/memory lease
+// path overwrites. A claim mutates the job (running status, consumed attempt,
+// token hash, lease generation/expiry, frozen rates, started_at), the runner
+// (active slot, busy/current_job, last_seen), the run aggregate refreshed
+// from the job map and — for environment jobs — the deployment mirror. On a
+// failed snapshot write the claim must be undone wholesale: the job stays
+// queued (attempt not consumed, runner slot free) and no in-memory token
+// exists for a lease no runner ever received.
+type leaseRollback struct {
+	jobID string
+	job   model.Job
+
+	runID  string
+	run    model.Run
+	hadRun bool
+
+	runnerID  string
+	runner    model.Runner
+	hadRunner bool
+
+	deployment    model.Deployment
+	hadDeployment bool
+}
+
+// captureLeaseRollbackLocked snapshots the state the fs/memory lease claim
+// mutates. It MUST run under s.mu and BEFORE the first claim mutation; the
+// capture -> mutate -> persist -> rollback sequence runs in one critical
+// section, so a rollback can never revert a concurrent request's work. The
+// caller holds s.mu.
+func (s *Server) captureLeaseRollbackLocked(j model.Job, runnerID string) leaseRollback {
+	rb := leaseRollback{jobID: j.ID, job: j, runID: j.RunID, runnerID: runnerID}
+	rb.run, rb.hadRun = s.runs[j.RunID]
+	rb.runner, rb.hadRunner = s.runners[runnerID]
+	// The runner's ActiveJobs slice is cloned so the captured value can never
+	// alias a live backing array (the same guard as captureStateRollbackLocked).
+	rb.runner.ActiveJobs = cloneStrings(rb.runner.ActiveJobs)
+	rb.deployment, rb.hadDeployment = s.deployments[j.ID]
+	return rb
+}
+
+// rollbackLeaseLocked restores a captureLeaseRollbackLocked snapshot after the
+// claim's snapshot write failed, immediately before the fail-closed 503. The
+// job.leased audit and the queue-latency observation run only after the
+// durability check, so a rolled-back claim leaves no evidence claiming a lease
+// the disk never saw; a deployment.started row may remain, which is the
+// documented audit-first contract (evidence may exist for an attempt whose
+// transition then failed). The maps are restored in place (never swapped) so
+// no reader can hold a stale map reference.
+func (s *Server) rollbackLeaseLocked(rb leaseRollback) {
+	s.jobs[rb.jobID] = rb.job
+	if rb.hadRun {
+		s.runs[rb.runID] = rb.run
+	} else {
+		delete(s.runs, rb.runID)
+	}
+	if rb.hadRunner {
+		s.runners[rb.runnerID] = rb.runner
+	} else {
+		delete(s.runners, rb.runnerID)
+	}
+	if rb.hadDeployment {
+		s.deployments[rb.jobID] = rb.deployment
+	} else {
+		delete(s.deployments, rb.jobID)
+	}
+}
+
 func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !s.verifyRunnerIdentity(r, id) {
@@ -2515,6 +2582,12 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 		return candidates[i].CreatedAt.Before(candidates[j].CreatedAt)
 	})
 	j := candidates[0]
+	// Capture the pre-claim state before the first mutation: a failed
+	// snapshot write below rolls the whole claim back (job queued, attempt
+	// unconsumed, runner slot free) instead of leaving a phantom lease no
+	// runner can ever use. The capture and the rollback run under the same
+	// s.mu critical section, so it can never revert concurrent work.
+	rb := s.captureLeaseRollbackLocked(s.jobs[j.ID], id)
 	j.QueueReason = ""
 	s.jobs[j.ID] = j
 	j.NeedsOutputs = scheduler.CollectNeedsOutputs(j, s.jobs)
@@ -2557,24 +2630,27 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	if j.Environment != "" {
 		s.recordDeploymentLocked(j, now)
 	}
-	s.auditLocked("job.leased", ri.Name, j.RunID, j.ID, "job leased", map[string]string{"job": j.Key, "generation": strconv.FormatInt(j.LeaseGeneration, 10)})
-	s.metricObserve("kiwi_queue_latency_seconds", now.Sub(j.CreatedAt).Seconds(), nil)
 	if !s.persistCheckedLocked("job.lease") {
 		// The claim is in memory only: the snapshot does not contain the
 		// running job or its token hash, so answering 200 would hand the
 		// runner a lease that a restart could re-issue to another runner
-		// (double execution). Withhold the token and fail the request
-		// instead. Recovery contract: the in-memory lease stays exactly as
-		// it is and is reclaimed by expired-lease recovery
-		// (recoverLeasesLocked, run from Maintain and at lease-time), which
-		// requeues the job once LeaseExpiresAt passes because the runner
-		// never received the token and cannot heartbeat or complete it.
-		// Until a later snapshot write succeeds, /readiness is 503 and the
-		// pre-check above refuses every new lease.
+		// (double execution). Withhold the token, restore the pre-claim
+		// state (job queued again, attempt unconsumed, runner slot free,
+		// run aggregate and deployment mirror reverted) and fail the request.
+		// Nothing in memory now refers to a lease no runner received: a later
+		// successful unrelated persist must not be able to make the phantom
+		// durable, and no attempt or runner slot is burned. The failed write
+		// arms the degraded readiness signal and the pre-check above refuses
+		// every new lease until a later snapshot write heals the state.
+		s.rollbackLeaseLocked(rb)
 		w.Header().Set("X-Kiwi-State", "degraded")
 		http.Error(w, statePersistenceDegradedBody, http.StatusServiceUnavailable)
 		return
 	}
+	// The lease is durable: only now record the evidence and the latency
+	// observation, so neither can claim a lease the disk never saw.
+	s.auditLocked("job.leased", ri.Name, j.RunID, j.ID, "job leased", map[string]string{"job": j.Key, "generation": strconv.FormatInt(j.LeaseGeneration, 10)})
+	s.metricObserve("kiwi_queue_latency_seconds", now.Sub(j.CreatedAt).Seconds(), nil)
 	// The raw token travels on the wire once; the hash is not needed by the
 	// runner and is stripped from the task job.
 	taskJob := j

@@ -228,11 +228,12 @@ func TestLeaseRefusedWhileDegradedAndHeals(t *testing.T) {
 
 // TestLeasePersistFailureWithholdsTokenAndRecovers pins the post-claim half
 // of X1B: the claim's own snapshot write fails after the in-memory claim was
-// installed, so the handler answers 503 without a token instead of ACKing a
-// lease the snapshot does not contain. The in-memory lease is then reclaimed
-// by expired-lease recovery (recoverLeasesLocked), which requeues the job
-// because the runner never received the token, and the job leases again once
-// the store heals.
+// installed, so the handler answers 503 without a token AND rolls the claim
+// back wholesale — the job stays queued (attempt not consumed, token hash
+// cleared) and the runner slot is free — instead of retaining a phantom lease
+// only expired-lease recovery could ever reclaim. Healing the store lets the
+// SAME job lease exactly once, and the durable snapshot contains that one
+// claim.
 func TestLeasePersistFailureWithholdsTokenAndRecovers(t *testing.T) {
 	s, err := NewPersistent("token", "token", t.TempDir())
 	if err != nil {
@@ -254,6 +255,10 @@ func TestLeasePersistFailureWithholdsTokenAndRecovers(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &ri); err != nil {
 		t.Fatal(err)
 	}
+	pre := queuedJobForRun(t, s, run)
+	s.mu.Lock()
+	preActive := len(s.runners[ri.ID].ActiveJobs)
+	s.mu.Unlock()
 	seamErr := errors.New("synthetic snapshot write failure")
 	// The server is healthy at entry, so the claim runs and it is the
 	// claim's own persist that fails and arms the degraded state.
@@ -272,31 +277,26 @@ func TestLeasePersistFailureWithholdsTokenAndRecovers(t *testing.T) {
 	if !s.stateDegraded.Load() {
 		t.Fatal("failed claim persist did not arm stateDegraded")
 	}
+	// The claim is rolled back wholesale: queued, attempt unconsumed, no
+	// token hash in memory, no runner slot held.
 	j := queuedJobForRun(t, s, run)
-	if j.Status != model.StatusRunning || j.LeaseTokenHash == nil {
-		t.Fatalf("failed-ACK claim not left for recovery: %+v", j)
-	}
-
-	// The runner never received the token, so the lease expires un-renewed
-	// and expired-lease recovery requeues the job and frees the runner.
-	s.mu.Lock()
-	s.recoverLeasesLocked(time.Now().UTC().Add(s.leaseDuration()), false)
-	s.mu.Unlock()
-	j = queuedJobForRun(t, s, run)
-	if j.Status != model.StatusQueued || j.LeaseTokenHash != nil {
-		t.Fatalf("recovery did not reclaim the un-ACKed lease: %+v", j)
+	if j.Status != model.StatusQueued || j.Attempts != pre.Attempts || j.LeaseTokenHash != nil || j.LeaseRunnerID != "" {
+		t.Fatalf("failed-persist claim not rolled back: %+v", j)
 	}
 	s.mu.Lock()
 	active := len(s.runners[ri.ID].ActiveJobs)
 	s.mu.Unlock()
-	if active != 0 {
-		t.Fatalf("recovery left %d active job(s) on the runner", active)
+	if active != preActive {
+		t.Fatalf("failed-persist claim changed the runner slots: %d -> %d", preActive, active)
 	}
 
-	// Healing the store lets the same job lease normally.
+	// Healing the store lets the same queued job lease exactly once: one
+	// attempt consumed, one runner slot held, one durable claim. The failed
+	// write armed the degraded gate, so heal it with a succeeding persist
+	// first (the gate refuses new leases until then, by design).
 	s.persistFailForTest = nil
 	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
-		`{"name":"r1b","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`); w.Code != http.StatusOK {
+		`{"name":"r1-heal","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`); w.Code != http.StatusOK {
 		t.Fatalf("healing register: %d %s", w.Code, w.Body.String())
 	}
 	if s.stateDegraded.Load() {
@@ -310,8 +310,19 @@ func TestLeasePersistFailureWithholdsTokenAndRecovers(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &task); err != nil {
 		t.Fatal(err)
 	}
-	if task.LeaseToken == "" {
-		t.Fatalf("healed lease returned no token: %+v", task)
+	if task.LeaseToken == "" || task.Job.ID != pre.ID {
+		t.Fatalf("healed lease = %+v, want a token for %s", task, pre.ID)
+	}
+	if task.Job.Attempts != pre.Attempts+1 {
+		t.Fatalf("healed lease attempts = %d, want exactly %d (failed claim must not consume one)", task.Job.Attempts, pre.Attempts+1)
+	}
+	snap, err := s.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	disk := snap.Jobs[pre.ID]
+	if disk.Status != model.StatusRunning || disk.LeaseRunnerID != ri.ID || len(disk.LeaseTokenHash) == 0 || disk.Attempts != pre.Attempts+1 {
+		t.Fatalf("healed lease not durable exactly once: %+v", disk)
 	}
 }
 

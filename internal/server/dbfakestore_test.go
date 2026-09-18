@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/forge"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
@@ -222,6 +223,7 @@ var _ storage.UsageOnceStore = (*dbFakeStore)(nil)
 var _ storage.RunDownstreamStore = (*dbFakeStore)(nil)
 var _ storage.ArtifactLookupStore = (*dbFakeStore)(nil)
 var _ storage.RunnerJobStore = (*dbFakeStore)(nil)
+var _ storage.RecoveryStore = (*dbFakeStore)(nil)
 var _ storage.RunEnqueueStore = (*dbFakeStore)(nil)
 var _ storage.AtomicLeaseStore = (*dbFakeStore)(nil)
 var _ storage.QuotaCounterStore = (*dbFakeStore)(nil)
@@ -638,8 +640,231 @@ func (f *dbFakeStore) CancelRunJobs(ctx context.Context, runID string, reason st
 // tolerated), mirroring the SQL adjustQuotaTx key derivation. The caller
 // holds f.mu.
 func (f *dbFakeStore) adjustQuotaLocked(repoID string, runningDelta, queuedDelta int) {
+	adjustQuotaMap(f.quotas, repoID, runningDelta, queuedDelta)
+}
+
+// ---------------------------------------------------------------------------
+// storage.RecoveryStore: transactional lease recovery and revocation
+// ---------------------------------------------------------------------------
+
+// The three recovery transactions stage every effect — job rows and lease
+// fields, runner active sets and counters, quota counters, dependent jobs,
+// run aggregation and audit rows — on copies of the fake's maps, swapping
+// them in only after the whole pass succeeded, mirroring the single durable
+// transaction in memStore/PostgresStore.
+
+// RevokeRunnerLeases mirrors memStore.RevokeRunnerLeases: every running lease
+// held by runnerID is requeued (infrastructure retry budget still available)
+// or terminal-cancelled with the reason, the lease is cleared, the runner
+// slot and quota counters move, dependents and affected runs are recomputed,
+// and one audit row per job is written. It returns the revoked job IDs.
+func (f *dbFakeStore) RevokeRunnerLeases(ctx context.Context, runnerID, reason string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	now := time.Now().UTC()
+	ids := []string{}
+	for id, j := range f.jobs {
+		if j.Status == model.StatusRunning && j.LeaseRunnerID == runnerID {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return []string{}, nil
+	}
+	sort.Strings(ids)
+	jobs := cloneJobMap(f.jobs)
+	runners := cloneRunnerMap(f.runners)
+	runs := cloneRunMap(f.runs)
+	quotas := cloneQuotaMap(f.quotas)
+	audit := append([]model.AuditEvent(nil), f.audit...)
+	changed := map[string]bool{}
+	runIDs := map[string]bool{}
+	for _, id := range ids {
+		j := jobs[id]
+		requeue := j.Attempts <= j.MaxInfraRetries
+		if requeue {
+			j.Status = model.StatusQueued
+			j.Error = reason + "; retrying"
+		} else {
+			j.Status = model.StatusCancelled
+			j.Error = reason
+			j.FinishedAt = &now
+		}
+		j.LeaseRunnerID = ""
+		j.LeaseTokenHash = nil
+		j.LeaseExpiresAt = nil
+		jobs[id] = j
+		if requeue {
+			adjustQuotaMap(quotas, storage.RepoIDForJob(j), -1, 1)
+		} else {
+			adjustQuotaMap(quotas, storage.RepoIDForJob(j), -1, 0)
+		}
+		action := "job.runner_disabled_cancelled"
+		if requeue {
+			action = "job.runner_disabled_requeued"
+		}
+		audit = append(audit, recoveryAudit(j, action, "admin", reason, map[string]string{"job": j.Key, "runner": runnerID}, now))
+		changed[id] = true
+		if j.RunID != "" {
+			runIDs[j.RunID] = true
+		}
+	}
+	for _, id := range ids {
+		releaseRunnerSlotMap(runners, runnerID, id)
+		if r, ok := runners[runnerID]; ok {
+			r.Failed++
+			r.LastSeen = now
+			runners[runnerID] = r
+		}
+	}
+	recomputeDependentsMap(jobs, changed, now)
+	for runID := range runIDs {
+		recomputeRunMap(runs, jobs, runID)
+	}
+	f.jobs, f.runners, f.runs, f.quotas, f.audit = jobs, runners, runs, quotas, audit
+	return ids, nil
+}
+
+// RecoverExpiredLease mirrors memStore.RecoverExpiredLease: an expired
+// running lease with the expected generation is requeued or terminally
+// failed (budget exhausted); a mismatched generation, a non-running job or a
+// still-live lease is a no-op.
+func (f *dbFakeStore) RecoverExpiredLease(ctx context.Context, jobID string, expectedGeneration int64, now time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	j, ok := f.jobs[jobID]
+	if !ok {
+		return storage.ErrNotFound
+	}
+	if j.Status != model.StatusRunning || j.LeaseGeneration != expectedGeneration {
+		return nil
+	}
+	if j.LeaseExpiresAt != nil && j.LeaseExpiresAt.After(now) {
+		return nil
+	}
+	jobs := cloneJobMap(f.jobs)
+	runners := cloneRunnerMap(f.runners)
+	runs := cloneRunMap(f.runs)
+	quotas := cloneQuotaMap(f.quotas)
+	audit := append([]model.AuditEvent(nil), f.audit...)
+	requeue := j.Attempts <= j.MaxInfraRetries
+	if requeue {
+		j.Status = model.StatusQueued
+		j.Error = "runner lease expired; retrying"
+	} else {
+		j.Status = model.StatusFailure
+		j.Error = "runner lease expired and infrastructure retry budget exhausted"
+		j.FinishedAt = &now
+	}
+	leaseRunnerID := j.LeaseRunnerID
+	j.LeaseRunnerID = ""
+	j.LeaseTokenHash = nil
+	j.LeaseExpiresAt = nil
+	jobs[jobID] = j
+	if requeue {
+		adjustQuotaMap(quotas, storage.RepoIDForJob(j), -1, 1)
+	} else {
+		adjustQuotaMap(quotas, storage.RepoIDForJob(j), -1, 0)
+	}
+	if leaseRunnerID != "" {
+		releaseRunnerSlotMap(runners, leaseRunnerID, jobID)
+		if r, ok := runners[leaseRunnerID]; ok {
+			r.Failed++
+			r.LastSeen = now
+			runners[leaseRunnerID] = r
+		}
+	}
+	action := "job.lease_expired"
+	msg := "job requeued after lost runner"
+	if !requeue {
+		action = "job.lost_runner"
+		msg = j.Error
+	}
+	audit = append(audit, recoveryAudit(j, action, "scheduler", msg, map[string]string{"job": j.Key}, now))
+	recomputeDependentsMap(jobs, map[string]bool{jobID: true}, now)
+	recomputeRunMap(runs, jobs, j.RunID)
+	f.jobs, f.runners, f.runs, f.quotas, f.audit = jobs, runners, runs, quotas, audit
+	return nil
+}
+
+// ExpireQueuedJob mirrors memStore.ExpireQueuedJob: a queued (or
+// approval-waiting) job whose effective queue deadline is not after the
+// observed deadline and whose observed deadline is not in the future is
+// terminal-cancelled, its queued quota slot released, dependents and the run
+// recomputed. Everything else is a no-op.
+func (f *dbFakeStore) ExpireQueuedJob(ctx context.Context, jobID string, deadline time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	j, ok := f.jobs[jobID]
+	if !ok {
+		return storage.ErrNotFound
+	}
+	if j.Status != model.StatusQueued && j.Status != model.StatusWaitingApproval {
+		return nil
+	}
+	now := time.Now().UTC()
+	eff := storage.QueueDeadlineFor(j)
+	if eff == nil || eff.After(deadline) || deadline.After(now) {
+		return nil
+	}
+	jobs := cloneJobMap(f.jobs)
+	runs := cloneRunMap(f.runs)
+	quotas := cloneQuotaMap(f.quotas)
+	audit := append([]model.AuditEvent(nil), f.audit...)
+	j.Status = model.StatusCancelled
+	j.Error = "queue timeout"
+	j.FinishedAt = &now
+	j.LeaseRunnerID = ""
+	j.LeaseTokenHash = nil
+	j.LeaseExpiresAt = nil
+	jobs[jobID] = j
+	adjustQuotaMap(quotas, storage.RepoIDForJob(j), 0, -1)
+	audit = append(audit, recoveryAudit(j, "job.queue_timeout", "scheduler", "job cancelled after queue deadline", map[string]string{"job": j.Key}, now))
+	recomputeDependentsMap(jobs, map[string]bool{jobID: true}, now)
+	recomputeRunMap(runs, jobs, j.RunID)
+	f.jobs, f.runs, f.quotas, f.audit = jobs, runs, quotas, audit
+	return nil
+}
+
+// cloneJobMap/cloneRunnerMap/cloneRunMap/cloneQuotaMap copy the fake's state
+// for a staged recovery transaction (the memStore overlay clones).
+func cloneJobMap(in map[string]model.Job) map[string]model.Job {
+	out := make(map[string]model.Job, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneRunnerMap(in map[string]model.Runner) map[string]model.Runner {
+	out := make(map[string]model.Runner, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneRunMap(in map[string]model.Run) map[string]model.Run {
+	out := make(map[string]model.Run, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneQuotaMap(in map[string][2]int) map[string][2]int {
+	out := make(map[string][2]int, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+// adjustQuotaMap shifts counters on an overlay quota map, clamping at zero
+// exactly like the SQL/memStore counter updates.
+func adjustQuotaMap(quotas map[string][2]int, repoID string, runningDelta, queuedDelta int) {
 	for _, key := range storage.QuotaKeys(repoID) {
-		c := f.quotas[key]
+		c := quotas[key]
 		c[0] += runningDelta
 		if c[0] < 0 {
 			c[0] = 0
@@ -648,8 +873,106 @@ func (f *dbFakeStore) adjustQuotaLocked(repoID string, runningDelta, queuedDelta
 		if c[1] < 0 {
 			c[1] = 0
 		}
-		f.quotas[key] = c
+		quotas[key] = c
 	}
+}
+
+// releaseRunnerSlotMap removes one job from an overlay runner's active set
+// and recomputes busy/current_job, mirroring memStore.releaseRunnerSlotMap.
+func releaseRunnerSlotMap(runners map[string]model.Runner, runnerID, jobID string) {
+	r, ok := runners[runnerID]
+	if !ok {
+		return
+	}
+	active := make([]string, 0, len(r.ActiveJobs))
+	for _, id := range r.ActiveJobs {
+		if id != jobID {
+			active = append(active, id)
+		}
+	}
+	r.ActiveJobs = active
+	if len(active) > 0 && r.CurrentJob == jobID {
+		r.CurrentJob = active[0]
+	}
+	if len(active) == 0 {
+		r.CurrentJob = ""
+	}
+	r.Busy = r.Capacity > 0 && len(active) >= r.Capacity
+	runners[runnerID] = r
+}
+
+// recoveryAudit builds one audit event for a staged recovery transaction,
+// mirroring storage.recoveryAudit.
+func recoveryAudit(j model.Job, action, actor, msg string, meta map[string]string, now time.Time) model.AuditEvent {
+	return model.AuditEvent{ID: j.ID + "|" + action, Action: action, Actor: actor, RunID: j.RunID, JobID: j.ID, Message: msg, Metadata: meta, CreatedAt: now}
+}
+
+// recomputeRunMap recomputes one run's aggregation from the overlay job map,
+// mirroring memStore.recomputeRunMap/recomputeRunStatus.
+func recomputeRunMap(runs map[string]model.Run, jobs map[string]model.Job, runID string) {
+	run, ok := runs[runID]
+	if !ok || run.Status == model.StatusCancelled {
+		return
+	}
+	var total, terminal int
+	var anyRunning, anyFailure, anyCancelled, anyWaiting bool
+	var firstStart, lastFinish *time.Time
+	for _, j := range jobs {
+		if j.RunID != runID {
+			continue
+		}
+		total++
+		if j.StartedAt != nil && (firstStart == nil || j.StartedAt.Before(*firstStart)) {
+			t := *j.StartedAt
+			firstStart = &t
+		}
+		if j.Status.Terminal() {
+			terminal++
+			if j.FinishedAt != nil && (lastFinish == nil || j.FinishedAt.After(*lastFinish)) {
+				t := *j.FinishedAt
+				lastFinish = &t
+			}
+		}
+		switch j.Status {
+		case model.StatusRunning:
+			anyRunning = true
+		case model.StatusFailure, model.StatusBlocked:
+			anyFailure = true
+		case model.StatusCancelled:
+			anyCancelled = true
+		case model.StatusWaitingApproval:
+			anyWaiting = true
+		}
+	}
+	if total == 0 {
+		return
+	}
+	switch {
+	case terminal == total:
+		switch {
+		case anyFailure:
+			run.Status = model.StatusFailure
+		case anyCancelled:
+			run.Status = model.StatusCancelled
+		default:
+			run.Status = model.StatusSuccess
+		}
+		run.FinishedAt = lastFinish
+		if run.FinishedAt == nil {
+			n := time.Now().UTC()
+			run.FinishedAt = &n
+		}
+	case anyRunning:
+		run.Status = model.StatusRunning
+	case anyWaiting:
+		run.Status = model.StatusWaitingApproval
+	default:
+		run.Status = model.StatusQueued
+	}
+	if run.StartedAt == nil && firstStart != nil {
+		run.StartedAt = firstStart
+	}
+	runs[runID] = run
 }
 
 // releaseRunnerSlotLocked splices a job out of a runner's active set and
@@ -1001,15 +1324,31 @@ func (f *dbFakeStore) OutboxAppend(ctx context.Context, e storage.OutboxItem) er
 	if f.outboxAppendErr != nil {
 		return f.outboxAppendErr
 	}
-	// Outbox IDs are the durable primary key: a duplicate append fails like
-	// the SQL unique constraint instead of stacking a second row.
+	// Outbox IDs are the durable primary key: a REPLAY with identical content
+	// converges on the existing row (nil), while a reused ID with different
+	// kind/payload/identity is the same invariant conflict the SQL store
+	// reports via its post-conflict re-read validation.
 	for _, it := range f.outboxItems {
-		if it.ID == e.ID {
-			return fmt.Errorf("storage: duplicate outbox id %q", e.ID)
+		if it.ID != e.ID {
+			continue
 		}
+		if !fakeOutboxContentSame(it, e) {
+			return fmt.Errorf("storage: outbox id %s reused with different content", e.ID)
+		}
+		return nil
 	}
 	f.outboxItems = append(f.outboxItems, e)
 	return nil
+}
+
+// fakeOutboxContentSame mirrors the SQL OutboxAppend comparison (empty payload
+// normalized to "{}", JSON compared semantically) through the shared server
+// helper so the fake cannot drift from Enqueue's rule.
+func fakeOutboxContentSame(a, b storage.OutboxItem) bool {
+	return sameOutboxContent(
+		forge.OutboxItem{Kind: a.Kind, Payload: a.Payload, LogicalKey: a.LogicalKey, StateVersion: a.StateVersion},
+		forge.OutboxItem{Kind: b.Kind, Payload: b.Payload, LogicalKey: b.LogicalKey, StateVersion: b.StateVersion},
+	)
 }
 
 func (f *dbFakeStore) OutboxAck(ctx context.Context, id string) error {
@@ -1155,6 +1494,31 @@ func (f *dbFakeStore) OutboxPending(ctx context.Context) ([]storage.OutboxItem, 
 	for _, it := range f.outboxItems {
 		if meta, ok := f.outboxMeta[it.ID]; ok && !meta.deadAt.IsZero() {
 			continue
+		}
+		out = append(out, it)
+	}
+	return out, nil
+}
+
+// OutboxDue mirrors the SQL due-filtered active read: not dead-lettered AND
+// next_attempt_at <= now(). ReplayDB and pruneDB mirror only these rows, so a
+// backoff-delayed row is not resident and a dead letter is never replayed.
+func (f *dbFakeStore) OutboxDue(ctx context.Context) ([]storage.OutboxItem, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.outboxPendingErr != nil {
+		return nil, f.outboxPendingErr
+	}
+	now := time.Now().UTC()
+	out := make([]storage.OutboxItem, 0, len(f.outboxItems))
+	for _, it := range f.outboxItems {
+		if meta, ok := f.outboxMeta[it.ID]; ok {
+			if !meta.deadAt.IsZero() {
+				continue
+			}
+			if !meta.nextAt.IsZero() && meta.nextAt.After(now) {
+				continue
+			}
 		}
 		out = append(out, it)
 	}
@@ -1907,34 +2271,39 @@ func (f *dbFakeStore) supersededJobIDsLocked(p *storage.SupersedePolicy, newRunI
 // cancelled job, blocking them when their condition does not allow the
 // outcome (caller holds f.mu). It mirrors the SQL recomputeDependentsTx.
 func (f *dbFakeStore) recomputeDependentsLocked(cancelled map[string]bool, now time.Time) {
-	if len(cancelled) == 0 {
-		return
-	}
-	for id, j := range f.jobs {
+	recomputeDependentsMap(f.jobs, cancelled, now)
+}
+
+// recomputeDependentsMap re-evaluates queued/waiting jobs that need one of
+// the changed jobs against the overlay job map, blocking them when their
+// condition does not allow the fresh outcome, mirroring
+// memStore.recomputeDependentsMap.
+func recomputeDependentsMap(jobs map[string]model.Job, changed map[string]bool, now time.Time) {
+	for id, j := range jobs {
 		if j.Status != model.StatusQueued && j.Status != model.StatusWaitingApproval {
 			continue
 		}
-		needsCancelled := false
+		needsChanged := false
 		for _, dep := range j.Needs {
-			if cancelled[dep] {
-				needsCancelled = true
+			if changed[dep] {
+				needsChanged = true
 				break
 			}
 		}
-		if !needsCancelled {
+		if !needsChanged {
 			continue
 		}
-		ready, outcome := dependencyOutcomeLocked(j, f.jobs)
+		ready, outcome := dependencyOutcomeLocked(j, jobs)
 		if !ready {
 			continue
 		}
 		j.DependencyStatus = outcome
-		if !depsReadyLocked(j, f.jobs) {
+		if !depsReadyLocked(j, jobs) {
 			j.Status = model.StatusBlocked
 			j.Error = "dependency failed"
 			j.FinishedAt = &now
 		}
-		f.jobs[id] = j
+		jobs[id] = j
 	}
 }
 
