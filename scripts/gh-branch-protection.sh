@@ -48,15 +48,31 @@ set -eu
 REPO="${KIWI_REPO:-Bel-Consulting-OU/kiwi-ci}"
 BRANCH="${KIWI_BRANCH:-main}"
 # Required for PRs: only workflows whose `when` contains `pull_request`.
-CONTEXTS="${KIWI_CONTEXTS:-ci/woodpecker/linux-amd64 ci/woodpecker/linux-arm64 ci/woodpecker/docker-workspace ci/woodpecker/integration-coverage}"
+# Woodpecker's context format is `{{context}}/{{event}}/{{workflow}}` with the
+# pull_request event mapped to the literal `pr` (verified against
+# server/forge/common/status.go in v3.18.1 and against observed statuses).
+# Matrix axes append `/<axis_id>`; none of these workflows use a matrix.
+CONTEXTS="${KIWI_CONTEXTS:-ci/woodpecker/pr/linux-amd64 ci/woodpecker/pr/linux-arm64 ci/woodpecker/pr/docker-workspace ci/woodpecker/pr/integration-coverage}"
+# Push variants are posted for every push; they are listed so operators can
+# require them for direct pushes instead (a direct push to a protected branch
+# can never satisfy only-pr contexts, and pr-only contexts block direct pushes
+# when enforce_admins is true).
+PUSH_CONTEXTS="${KIWI_PUSH_CONTEXTS:-ci/woodpecker/push/linux-amd64 ci/woodpecker/push/linux-arm64 ci/woodpecker/push/docker-workspace ci/woodpecker/push/integration-coverage}"
 # Never added to required PR contexts: push/manual/tag-only gates (see the
 # invariant above). Listed for observability warnings only.
-NATIVE_CONTEXTS="${KIWI_NATIVE_CONTEXTS:-ci/woodpecker/native-windows ci/woodpecker/native-macos}"
+NATIVE_CONTEXTS="${KIWI_NATIVE_CONTEXTS:-ci/woodpecker/push/native-windows ci/woodpecker/push/native-macos}"
 # Optional: numeric GitHub App ID that must publish each required context.
 APP_ID="${KIWI_WOODPECKER_APP_ID:-}"
 GH_API_VERSION="${KIWI_GH_API_VERSION:-2022-11-28}"
 GH_ACCEPT="${KIWI_GH_ACCEPT:-application/vnd.github+json}"
+# enforce_admins applies required checks to administrators too. Default true is
+# the documented policy, but it also blocks direct pushes to the protected
+# branch (a fresh commit has no statuses yet); set KIWI_ENFORCE_ADMINS=false
+# when the repository workflow is direct pushes rather than pull requests.
+ENFORCE_ADMINS="${KIWI_ENFORCE_ADMINS:-true}"
+case "$ENFORCE_ADMINS" in true|false) ;; *) echo "KIWI_ENFORCE_ADMINS must be true or false, got: $ENFORCE_ADMINS" >&2; exit 2 ;; esac
 
+echo "== push contexts (require these instead when direct pushes must be gated): $PUSH_CONTEXTS"
 echo "== recent commit statuses observed on $REPO"
 OBSERVED=$(gh api "repos/$REPO/commits?sha=$BRANCH&per_page=5" -q '.[].sha' 2>/dev/null | while read -r sha; do
 	gh api "repos/$REPO/commits/$sha/statuses" -q '.[].context' 2>/dev/null || true
@@ -112,7 +128,7 @@ fi
 gh api -X PUT "repos/$REPO/branches/$BRANCH/protection" "$@" --input - <<EOF
 {
   "required_status_checks": $REQUIRED_STATUS_CHECKS,
-  "enforce_admins": true,
+  "enforce_admins": $ENFORCE_ADMINS,
   "required_pull_request_reviews": {"required_approving_review_count": 1},
   "restrictions": null,
   "allow_force_pushes": false,

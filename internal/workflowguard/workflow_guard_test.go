@@ -448,9 +448,31 @@ func runsOnPullRequest(events []string) bool {
 	return false
 }
 
-// CheckRequiredContexts fails when a required PR context names a workflow
-// that never runs on pull_request (or does not exist): such a context is
-// never produced and every PR would wait forever for it.
+// requiredContextEvent maps a Woodpecker status-context event segment to the
+// workflow `when` event it is produced for. Woodpecker maps pull_request to
+// the literal `pr` in status contexts (server/forge/common/status.go).
+var requiredContextEvent = map[string]string{
+	"push":   "push",
+	"pr":     "pull_request",
+	"tag":    "tag",
+	"manual": "manual",
+	"cron":   "cron",
+}
+
+func runsOnEvent(events []string, want string) bool {
+	for _, ev := range events {
+		if ev == want || strings.HasPrefix(ev, want+"_") {
+			return true
+		}
+	}
+	return false
+}
+
+// CheckRequiredContexts fails when a required context cannot ever be produced:
+// the format must be ci/woodpecker/<event>/<workflow>[/<axis>], the workflow
+// must exist, and its `when` events must include the event that the context
+// claims. This is the invariant that a context naming a workflow absent from
+// the required event would otherwise wait forever.
 func CheckRequiredContexts(workflows []Workflow, script string) []Finding {
 	byName := map[string]Workflow{}
 	for _, w := range workflows {
@@ -461,7 +483,23 @@ func CheckRequiredContexts(workflows []Workflow, script string) []Finding {
 		if !strings.HasPrefix(ctx, "ci/woodpecker/") {
 			continue
 		}
-		name := strings.TrimPrefix(ctx, "ci/woodpecker/")
+		parts := strings.Split(strings.TrimPrefix(ctx, "ci/woodpecker/"), "/")
+		if len(parts) < 2 {
+			findings = append(findings, Finding{
+				File: "scripts/gh-branch-protection.sh", Kind: "required-context",
+				Message: fmt.Sprintf("required context %q is malformed: want ci/woodpecker/<event>/<workflow>[/<axis>]", ctx),
+			})
+			continue
+		}
+		event, name := parts[0], parts[1]
+		want, eventKnown := requiredContextEvent[event]
+		if !eventKnown {
+			findings = append(findings, Finding{
+				File: "scripts/gh-branch-protection.sh", Kind: "required-context",
+				Message: fmt.Sprintf("required context %q uses unknown event segment %q", ctx, event),
+			})
+			continue
+		}
 		w, ok := byName[name]
 		if !ok {
 			findings = append(findings, Finding{
@@ -470,10 +508,10 @@ func CheckRequiredContexts(workflows []Workflow, script string) []Finding {
 			})
 			continue
 		}
-		if !runsOnPullRequest(w.Events) {
+		if !runsOnEvent(w.Events, want) {
 			findings = append(findings, Finding{
 				File: w.File, Kind: "required-context",
-				Message: fmt.Sprintf("workflow %q is required as PR context %q but never runs on pull_request (events: %s)", name, ctx, strings.Join(w.Events, ", ")),
+				Message: fmt.Sprintf("workflow %q is required as context %q but never runs on %s (events: %s)", name, ctx, want, strings.Join(w.Events, ", ")),
 			})
 		}
 	}
@@ -585,10 +623,10 @@ func TestWorkflowGuardParsesRequiredContexts(t *testing.T) {
 	script := string(mustRead(t, filepath.Join(root, "scripts", "gh-branch-protection.sh")))
 	got := ParseRequiredContexts(script)
 	want := []string{
-		"ci/woodpecker/linux-amd64",
-		"ci/woodpecker/linux-arm64",
-		"ci/woodpecker/docker-workspace",
-		"ci/woodpecker/integration-coverage",
+		"ci/woodpecker/pr/linux-amd64",
+		"ci/woodpecker/pr/linux-arm64",
+		"ci/woodpecker/pr/docker-workspace",
+		"ci/woodpecker/pr/integration-coverage",
 	}
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Fatalf("ParseRequiredContexts = %v, want %v", got, want)
@@ -865,7 +903,7 @@ func TestWorkflowGuardDoctoredRequiredContextFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	script := "CONTEXTS=\"${KIWI_CONTEXTS:-ci/woodpecker/linux-amd64 ci/woodpecker/ghost}\"\n"
+	script := "CONTEXTS=\"${KIWI_CONTEXTS:-ci/woodpecker/pr/linux-amd64 ci/woodpecker/pr/ghost}\"\n"
 	findings := CheckRequiredContexts(workflows, script)
 	if len(findings) != 2 {
 		t.Fatalf("findings = %d, want 2:\n%s", len(findings), FormatFindings(findings))
@@ -895,6 +933,35 @@ func TestWorkflowGuardDoctoredRequiredContextFails(t *testing.T) {
 	findings = CheckRequiredContexts(workflows, script)
 	if len(findings) != 1 || !strings.Contains(findings[0].Message, "ghost") {
 		t.Fatalf("adding pull_request must clear the context finding, got:\n%s", FormatFindings(findings))
+	}
+}
+
+// TestWorkflowGuardRejectsContextShapeDrift pins the two shape failures that
+// previously slipped through: the pre-event flat form and an unknown event
+// segment are both rejected before any workflow lookup.
+func TestWorkflowGuardRejectsContextShapeDrift(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "linux-amd64.yml"), []byte("when:\n  - event: [push, pull_request]\nsteps:\n  unit:\n    image: golang:1.27\n    commands: [go test ./...]\n"))
+	workflows, err := LoadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := "CONTEXTS=\"${KIWI_CONTEXTS:-ci/woodpecker/linux-amd64 ci/woodpecker/release/linux-amd64}\"\n"
+	findings := CheckRequiredContexts(workflows, script)
+	if len(findings) != 2 {
+		t.Fatalf("findings = %d, want 2:\n%s", len(findings), FormatFindings(findings))
+	}
+	var sawMalformed, sawUnknownEvent bool
+	for _, f := range findings {
+		if strings.Contains(f.Message, "is malformed") {
+			sawMalformed = true
+		}
+		if strings.Contains(f.Message, "unknown event segment") {
+			sawUnknownEvent = true
+		}
+	}
+	if !sawMalformed || !sawUnknownEvent {
+		t.Fatalf("expected malformed + unknown-event findings, got:\n%s", FormatFindings(findings))
 	}
 }
 
