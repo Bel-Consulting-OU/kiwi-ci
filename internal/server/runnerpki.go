@@ -130,7 +130,7 @@ func (s *Server) enroll(w http.ResponseWriter, r *http.Request) {
 		// Not the static enrollment token: the request must have been
 		// gated by a grant. Consume it (single-use + expiry + allowed
 		// labels) before signing.
-		if err := s.consumeEnrollGrant(tok, in.Labels); err != nil {
+		if err := s.consumeEnrollGrant(r.Context(), tok, in.Labels); err != nil {
 			http.Error(w, err.Error(), http.StatusUnauthorized)
 			return
 		}

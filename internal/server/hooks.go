@@ -125,7 +125,7 @@ func (s *Server) gitlabWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	content, err := fg.FetchFile(r.Context(), ec.Repository.FullName, s.pipelinePath(), pipelineSHA)
 	if err != nil {
-		http.Error(w, "fetch pipeline: "+err.Error(), http.StatusBadGateway)
+		s.serverError(w, r, http.StatusBadGateway, err, "bad gateway")
 		return
 	}
 	spec, err := pipeline.Parse([]byte(content))
@@ -135,7 +135,7 @@ func (s *Server) gitlabWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	ok, matched, filesKnown, terr := s.evalTriggerMatches(r.Context(), fg, spec, &ec)
 	if terr != nil {
-		http.Error(w, terr.Error(), http.StatusBadGateway)
+		s.serverError(w, r, http.StatusBadGateway, terr, "bad gateway")
 		return
 	}
 	if !ok {
@@ -177,7 +177,7 @@ func (s *Server) gitlabWebhook(w http.ResponseWriter, r *http.Request) {
 		// forge retries the delivery instead of treating it as rejected.
 		var nd *stateNotDurableError
 		if errors.As(err, &nd) {
-			http.Error(w, nd.Error(), http.StatusServiceUnavailable)
+			s.serverError(w, r, http.StatusServiceUnavailable, nd, "state not durable")
 			return
 		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -239,7 +239,7 @@ func (s *Server) forgejoWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	content, err := fg.FetchFile(r.Context(), ec.Repository.FullName, s.pipelinePath(), pipelineSHA)
 	if err != nil {
-		http.Error(w, "fetch pipeline: "+err.Error(), http.StatusBadGateway)
+		s.serverError(w, r, http.StatusBadGateway, err, "bad gateway")
 		return
 	}
 	spec, err := pipeline.Parse([]byte(content))
@@ -249,7 +249,7 @@ func (s *Server) forgejoWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	ok, matched, filesKnown, terr := s.evalTriggerMatches(r.Context(), fg, spec, &ec)
 	if terr != nil {
-		http.Error(w, terr.Error(), http.StatusBadGateway)
+		s.serverError(w, r, http.StatusBadGateway, terr, "bad gateway")
 		return
 	}
 	if !ok {
@@ -289,7 +289,7 @@ func (s *Server) forgejoWebhook(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var nd *stateNotDurableError
 		if errors.As(err, &nd) {
-			http.Error(w, nd.Error(), http.StatusServiceUnavailable)
+			s.serverError(w, r, http.StatusServiceUnavailable, nd, "state not durable")
 			return
 		}
 		http.Error(w, err.Error(), http.StatusBadRequest)

@@ -183,7 +183,7 @@ func TestSqueezeOutboxClaimerID(t *testing.T) {
 	fs.outboxAppendErr = errors.New("append down")
 	ob := NewOutbox(nil)
 	ob.AttachDB(fs)
-	if err := ob.Enqueue(forge.OutboxItem{}); err == nil {
+	if err := ob.Enqueue(context.Background(), forge.OutboxItem{}); err == nil {
 		t.Fatal("durable append failure = nil error")
 	}
 	_ = time.Now

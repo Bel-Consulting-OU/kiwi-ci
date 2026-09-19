@@ -232,7 +232,7 @@ func (s *Server) createRunnerProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.upsertProfile(r.Context(), in); err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	s.auditLocked("runner_profile.upsert", actorFrom(r), "", "", "runner profile created", map[string]string{"profile": in.ID})
@@ -249,7 +249,7 @@ func (s *Server) getRunnerProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	writeJSON(w, http.StatusOK, p)
@@ -261,7 +261,7 @@ func (s *Server) listRunnerProfiles(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := s.listProfiles(r.Context())
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	if out == nil {
@@ -290,7 +290,7 @@ func (s *Server) updateRunnerProfile(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	if in.CreatedAt.IsZero() {
@@ -301,7 +301,7 @@ func (s *Server) updateRunnerProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.upsertProfile(r.Context(), in); err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	s.auditLocked("runner_profile.upsert", actorFrom(r), "", "", "runner profile updated", map[string]string{"profile": in.ID})
@@ -326,7 +326,7 @@ func (s *Server) bindRunnerProfileCert(w http.ResponseWriter, r *http.Request) {
 		// so the caller retries instead of treating the binding as rejected.
 		var nd *stateNotDurableError
 		if errors.As(err, &nd) {
-			http.Error(w, nd.Error(), http.StatusServiceUnavailable)
+			s.serverError(w, r, http.StatusServiceUnavailable, nd, "state not durable")
 			return
 		}
 		http.Error(w, err.Error(), http.StatusBadRequest)

@@ -500,6 +500,8 @@ func (storeOnlyInner) ListJobsByRun(context.Context, string) ([]model.Job, error
 	return nil, nil
 }
 
+func (storeOnlyInner) CountRunningJobs(context.Context) (int, error) { return 0, nil }
+
 func (storeOnlyInner) ListJobsByEnvironment(context.Context, string, string) ([]model.Job, error) {
 	return nil, nil
 }

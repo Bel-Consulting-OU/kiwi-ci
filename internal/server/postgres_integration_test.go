@@ -28,6 +28,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/forge"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
@@ -475,5 +476,69 @@ func TestPostgresIntegrationServerOutboxDueOnlyMirror(t *testing.T) {
 			t.Fatal("delayed row never became claimable after its backoff elapsed")
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// TestPostgresIntegrationServerOutboxCancelledFlushReleasesClaims is the
+// real-PostgreSQL regression for the claim-cleanup context defect: the flush
+// context is cancelled while a dispatch is in flight (the Maintain 2-minute
+// bound expiring mid-batch), the ACK fails on the dead context, and the
+// remaining claimed rows must still be released, so a SECOND pool (another
+// replica) can claim them immediately. Before the fix the release UPDATE ran
+// on the cancelled context, pgx refused it before it reached PostgreSQL, the
+// error was discarded, and the rows stayed invisible to the other replica
+// until OutboxClaimTTL (5 minutes).
+func TestPostgresIntegrationServerOutboxCancelledFlushReleasesClaims(t *testing.T) {
+	env := pgITServerSetup(t)
+	stA := env.open(t)
+	stB := env.open(t)
+	ctx := context.Background()
+	base := time.Now().UTC().Add(-time.Minute)
+	for i, id := range []string{"pg-ctx-a", "pg-ctx-b", "pg-ctx-c", "pg-ctx-d"} {
+		if err := stA.OutboxAppend(ctx, storage.OutboxItem{
+			ID: id, Kind: storage.OutboxKindUsageAccount, Payload: []byte(`{"job_id":"gone"}`),
+			CreatedAt: base.Add(time.Duration(i) * time.Second),
+		}); err != nil {
+			t.Fatalf("append %s: %v", id, err)
+		}
+	}
+
+	o := NewOutbox(nil)
+	o.AttachDB(stA)
+	flushCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var dispatched []string
+	n, err := o.Flush(flushCtx, func(_ context.Context, it forge.OutboxItem) error {
+		dispatched = append(dispatched, it.ID)
+		if it.ID == "pg-ctx-b" {
+			// The flush bound expires while this dispatch is in flight: the
+			// forge call completed, but the ACK and any cleanup statement on
+			// this context are refused by pgx.
+			cancel()
+		}
+		return nil
+	})
+	if err == nil {
+		t.Fatal("ACK on the cancelled context must fail the flush")
+	}
+	if n != 1 || len(dispatched) != 2 {
+		t.Fatalf("flush = n=%d dispatched=%v, want pg-ctx-a ACKed and pg-ctx-b dispatched but unACKed", n, dispatched)
+	}
+
+	// A second replica (separate pool) must claim the remaining rows right
+	// now: the claim cleanup is not allowed to ride the dispatch context.
+	reclaimed, cerr := stB.ClaimOutbox(ctx, "replica-2", 10)
+	if cerr != nil {
+		t.Fatalf("second-pool claim: %v", cerr)
+	}
+	ids := map[string]bool{}
+	for _, it := range reclaimed {
+		ids[it.ID] = true
+	}
+	if !ids["pg-ctx-b"] || !ids["pg-ctx-c"] || !ids["pg-ctx-d"] {
+		t.Fatalf("immediately reclaimable rows = %v, want pg-ctx-b/c/d (claims stranded until OutboxClaimTTL)", ids)
+	}
+	if ids["pg-ctx-a"] {
+		t.Fatalf("ACKed row was claimable by the second pool: %v", ids)
 	}
 }

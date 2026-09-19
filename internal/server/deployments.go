@@ -72,7 +72,7 @@ func (s *Server) recordDeployment(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		if j.Environment == "" {
@@ -83,7 +83,7 @@ func (s *Server) recordDeployment(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			// Fail closed: a deployment record that is not durable must not
 			// be acknowledged (no in-memory marker, no audit).
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		writeJSON(w, http.StatusCreated, d)
@@ -127,7 +127,7 @@ func (s *Server) listDeployments(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		} else if err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		if !s.requireRunRead(w, r, run) {
@@ -137,7 +137,7 @@ func (s *Server) listDeployments(w http.ResponseWriter, r *http.Request) {
 		if ds, ok := s.DB.(storage.DeploymentStore); ok {
 			recs, err := ds.ListDeploymentsByRun(r.Context(), runID)
 			if err != nil {
-				http.Error(w, err.Error(), 500)
+				s.internalError(w, r, err, "")
 				return
 			}
 			out = append(out, recs...)

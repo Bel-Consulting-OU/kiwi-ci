@@ -304,13 +304,26 @@ func sameOutboxContent(existing, incoming forge.OutboxItem) bool {
 // already happened. Callers retry the whole operation; deterministic IDs
 // make the retry converge on one row.
 //
+// ctx is the caller's REQUEST or RECONCILIATION context and is threaded into
+// the durable store call: a canceled request aborts the enqueue before
+// anything becomes durable or dispatchable (the caller's retry re-runs the
+// whole operation; deterministic IDs converge on one row). The fs path is
+// synchronous and not interruptible, so cancellation is honored at the
+// operation boundary — before any mutation — and never leaves a partial
+// JSONL line behind. A caller that intentionally wants the intent recorded
+// even though its own request is gone must pass a bounded detach
+// (boundedDetach), never a bare Background.
+//
 // VERSIONED intents (LogicalKey + StateVersion, forge checks) additionally
 // SUPERSEDE older pending versions of the same logical key durably in the
 // same operation as the insert. A version that is not newer than the
 // delivered watermark is dropped (the newer state is already published or
 // pending), and a newer version is never blocked by an older dead-lettered
 // row because the row ID is versioned.
-func (o *Outbox) Enqueue(item forge.OutboxItem) error {
+func (o *Outbox) Enqueue(ctx context.Context, item forge.OutboxItem) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if item.ID == "" {
 		id, err := newID()
 		if err != nil {
@@ -324,7 +337,7 @@ func (o *Outbox) Enqueue(item forge.OutboxItem) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if item.LogicalKey != "" && item.StateVersion > 0 {
-		return o.enqueueVersionedLocked(item)
+		return o.enqueueVersionedLocked(ctx, item)
 	}
 	// Idempotent by ID: deterministic intents (downstream launches keyed by
 	// the link's stable key, completion effects keyed by job/generation/kind)
@@ -347,7 +360,7 @@ func (o *Outbox) Enqueue(item forge.OutboxItem) error {
 		}
 	}
 	if o.db != nil {
-		if err := o.db.OutboxAppend(context.Background(), storage.OutboxItem{
+		if err := o.db.OutboxAppend(ctx, storage.OutboxItem{
 			ID: item.ID, Kind: item.Kind, Payload: item.Payload, CreatedAt: item.CreatedAt,
 		}); err != nil {
 			return err
@@ -367,8 +380,15 @@ func (o *Outbox) Enqueue(item forge.OutboxItem) error {
 }
 
 // enqueueVersionedLocked applies the versioned durable-first contract. The
-// caller holds o.mu.
-func (o *Outbox) enqueueVersionedLocked(item forge.OutboxItem) error {
+// caller holds o.mu. ctx is the caller's request/reconciliation context and
+// reaches the durable versioned enqueue, which is where the supersede and the
+// watermark guard run; a canceled context aborts before that statement so no
+// row is inserted or superseded. The fs path checks ctx at the boundary only
+// (see Enqueue).
+func (o *Outbox) enqueueVersionedLocked(ctx context.Context, item forge.OutboxItem) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if o.db != nil {
 		vgs, ok := o.db.(storage.ForgeCheckStateStore)
 		if !ok {
@@ -379,7 +399,7 @@ func (o *Outbox) enqueueVersionedLocked(item forge.OutboxItem) error {
 			// supported mode.
 			return fmt.Errorf("outbox: store lacks the versioned forge-check enqueue contract for logical key %q", item.LogicalKey)
 		}
-		outcome, err := vgs.OutboxEnqueueVersioned(context.Background(), storage.OutboxItem{
+		outcome, err := vgs.OutboxEnqueueVersioned(ctx, storage.OutboxItem{
 			ID: item.ID, Kind: item.Kind, Payload: item.Payload, CreatedAt: item.CreatedAt,
 			LogicalKey: item.LogicalKey, StateVersion: item.StateVersion,
 		})
@@ -717,6 +737,54 @@ func (o *Outbox) flushLocal(ctx context.Context, dispatch func(context.Context, 
 // next tick).
 const outboxFlushMaxBatches = 64
 
+// outboxClaimReleaseTimeout bounds one claim-cleanup statement issued after
+// dispatch (see releaseOutboxClaimCleanup).
+const outboxClaimReleaseTimeout = 5 * time.Second
+
+// outboxFlushTimeout bounds one outbox flush cycle (see flushOutbox).
+const outboxFlushTimeout = 2 * time.Minute
+
+// outboxDetachTimeout bounds an enqueue that intentionally outlives the
+// request that triggered it (boundedDetach call sites).
+const outboxDetachTimeout = 5 * time.Second
+
+// boundedDetach derives the context for a durable operation that deliberately
+// OUTLIVES its origin: the request may be gone (client hung up) while the
+// intent must still be recorded, so cancellation is dropped. The detach is
+// never unbounded — a stalled store must not pin the goroutine forever — so a
+// fresh timeout is imposed around the derived context. Values (tracing,
+// request IDs) are preserved when an origin exists. origin may be nil for
+// call paths that have no caller context to thread (the shared run-enqueue
+// plumbing); the detach is still bounded. This is the ONLY sanctioned way to
+// detach in this package: a bare Background at a request-coupled call site is
+// the defect this helper exists to prevent.
+func boundedDetach(origin context.Context, bound time.Duration) (context.Context, context.CancelFunc) {
+	if origin == nil {
+		origin = context.Background() // allow-background: detach root for context-free call paths
+	}
+	return context.WithTimeout(context.WithoutCancel(origin), bound)
+}
+
+// releaseOutboxClaimCleanup releases one claimed-but-unhandled outbox row
+// with a context that OUTLIVES the dispatch context. flushOutbox bounds the
+// dispatch to two minutes and the caller may cancel it sooner; a release on
+// that context reaches PostgreSQL already cancelled, so pgx refuses it and
+// (if the error were discarded) up to OutboxClaimBatch claimed rows would stay
+// invisible to every other replica until OutboxClaimTTL. context.WithoutCancel
+// keeps the context values but drops cancellation and the deadline; a FRESH
+// timeout per release (rather than one per flush) gives each release a full
+// window, because the deferred cleanup runs after the batch dispatch, when a
+// context created at claim time could already be expired. Failures are logged
+// with the row ID instead of discarded: the row stays durable and is reclaimed
+// after the TTL, but the operator must see why the retry is delayed.
+func (o *Outbox) releaseOutboxClaimCleanup(ctx context.Context, id, claimer string) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), outboxClaimReleaseTimeout)
+	defer cancel()
+	if err := o.db.ReleaseOutboxClaim(cleanupCtx, id, claimer); err != nil {
+		log.Printf("outbox: release claim for %s: %v (row stays claimed until OutboxClaimTTL)", id, err)
+	}
+}
+
 // flushDB claims and dispatches batches of durable rows until no more rows
 // are claimable, dispatching exactly the items this flusher owns: its fresh
 // claims plus local-only items. Claiming before each batch is what keeps
@@ -772,16 +840,21 @@ func (o *Outbox) flushDBBatch(ctx context.Context, dispatch func(context.Context
 	// simply "every claimed row ends this call ACKed or released". Deciding
 	// "handled" from local-queue membership was wrong: after an early ACK
 	// error every not-yet-dispatched claimed row is still queued locally and
-	// its claim was left held until OutboxClaimTTL expired. Releasing an
-	// already-ACKed row or a claim this call already released is a no-op in
-	// every store (they clear only the caller's own claim).
+	// its claim was left held until OutboxClaimTTL expired. Every release (the
+	// explicit ones above/below and this deferred sweep) runs through
+	// releaseOutboxClaimCleanup, whose context survives the dispatch context:
+	// this cleanup runs exactly when that context may already be cancelled or
+	// expired, and a claim stranded there hides the row from every other
+	// replica for the whole TTL. Releasing an already-ACKed row or a claim
+	// this call already released is a no-op in every store (they clear only
+	// the caller's own claim).
 	acked := make(map[string]bool, len(claimed))
 	defer func() {
 		for _, it := range claimed {
 			if acked[it.ID] {
 				continue
 			}
-			_ = o.db.ReleaseOutboxClaim(ctx, it.ID, claimer)
+			o.releaseOutboxClaimCleanup(ctx, it.ID, claimer)
 		}
 	}()
 	for {
@@ -811,7 +884,7 @@ func (o *Outbox) flushDBBatch(ctx context.Context, dispatch func(context.Context
 				if rerr := o.retryOutboxRow(ctx, it, derr); rerr != nil {
 					log.Printf("outbox: retry record %s: %v", it.ID, rerr)
 				}
-				_ = o.db.ReleaseOutboxClaim(ctx, it.ID, claimer)
+				o.releaseOutboxClaimCleanup(ctx, it.ID, claimer)
 			}
 			// Drop the FAILED attempt from the local queue: the durable row
 			// (with next_attempt_at) is the retry vehicle, and leaving it
@@ -827,7 +900,7 @@ func (o *Outbox) flushDBBatch(ctx context.Context, dispatch func(context.Context
 		// releases the claim so the retry does not wait out the TTL.
 		if err := o.db.OutboxAck(ctx, it.ID); err != nil {
 			if owned[it.ID] {
-				_ = o.db.ReleaseOutboxClaim(ctx, it.ID, claimer)
+				o.releaseOutboxClaimCleanup(ctx, it.ID, claimer)
 			}
 			return dispatched, len(claimed), err
 		}
@@ -945,13 +1018,18 @@ func (o *Outbox) claimerID() string {
 	return o.claimer
 }
 
-// flushOutbox drains the server's outbox through the forge dispatch path.
-// It is called from the Maintain loop; unhandled intents are dropped with a
-// log line rather than blocking the queue forever.
-func (s *Server) flushOutbox() {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+// flushOutbox drains the server's outbox through the forge dispatch path. It
+// is called from the Maintain loop with the loop's lifecycle context; a
+// canceled/expired tick context therefore does not abort a cycle that already
+// started (a claim released mid-cycle, or an ACK skipped after a successful
+// forge POST, forces a full retry and hides the row from other replicas until
+// the claim TTL). The detach is BOUNDED: a stalled store or forge cannot pin
+// the maintain loop forever. Unhandled intents are dropped with a log line
+// rather than blocking the queue forever.
+func (s *Server) flushOutbox(ctx context.Context) {
+	flushCtx, cancel := boundedDetach(ctx, outboxFlushTimeout)
 	defer cancel()
-	if _, err := s.outbox.Flush(ctx, s.dispatchOutbox); err != nil {
+	if _, err := s.outbox.Flush(flushCtx, s.dispatchOutbox); err != nil {
 		log.Printf("outbox: flush stopped: %v", err)
 	}
 }

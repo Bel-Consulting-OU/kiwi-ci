@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -413,7 +414,7 @@ func TestConcurrentGrantConsumptionOneWinnerDB(t *testing.T) {
 	if err := s.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := s.CreateEnrollGrant(time.Hour, nil)
+	raw, err := s.CreateEnrollGrant(context.Background(), time.Hour, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -461,7 +462,7 @@ func TestEnrollGrantPersistsInDB(t *testing.T) {
 	if err := s.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := s.CreateEnrollGrant(time.Hour, []string{"os:macos"})
+	raw, err := s.CreateEnrollGrant(context.Background(), time.Hour, []string{"os:macos"})
 	if err != nil {
 		t.Fatal(err)
 	}

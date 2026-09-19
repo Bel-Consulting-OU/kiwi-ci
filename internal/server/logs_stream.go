@@ -42,7 +42,7 @@ func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	if !s.requireRunRead(w, r, run) {

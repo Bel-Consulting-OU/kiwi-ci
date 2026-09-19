@@ -78,7 +78,7 @@ func TestDownstreamCrashRecoveryReusesStableChildID(t *testing.T) {
 	// Recovery: the maintain pass expires the stale reservation.
 	s.recoverDownstreamReservations(context.Background(), time.Now().UTC().Add(2*time.Hour))
 	// Redispatch uses the SAME stable child ID.
-	s.flushOutbox()
+	s.flushOutbox(context.Background())
 	children := childRunsOf(s)
 	if len(children) != 1 {
 		t.Fatalf("child runs = %d, want 1", len(children))
@@ -96,7 +96,7 @@ func TestDownstreamCrashRecoveryReusesStableChildID(t *testing.T) {
 	}
 	// A second flush (replayed outbox ack lost) must not create a second
 	// child.
-	s.flushOutbox()
+	s.flushOutbox(context.Background())
 	if got := childRunsOf(s); len(got) != 1 {
 		t.Fatalf("child runs after replay = %d, want 1", len(got))
 	}
@@ -180,7 +180,7 @@ func TestDownstreamStableIDDBModeCrashRecovery(t *testing.T) {
 	s.DownstreamPipelineFetcher = func(ctx context.Context, repo, ref string) (string, error) {
 		return childPipeline, nil
 	}
-	s.flushOutbox()
+	s.flushOutbox(context.Background())
 	f.mu.Lock()
 	childCount := 0
 	for _, r := range f.runs {
@@ -200,7 +200,7 @@ func TestDownstreamStableIDDBModeCrashRecovery(t *testing.T) {
 		t.Fatalf("link = %+v, want launched with stable id %q", link, wantChildID)
 	}
 	// Replayed dispatch (ack lost after commit) must not duplicate.
-	s.flushOutbox()
+	s.flushOutbox(context.Background())
 	f.mu.Lock()
 	childCount = 0
 	for _, r := range f.runs {

@@ -58,7 +58,7 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 	// the same flow so a failed history write can never lose the report.
 	if s.DB != nil {
 		if err := s.DB.InsertTestReport(r.Context(), rep); err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		s.recordTestReportHistory(repo, rep)
@@ -75,7 +75,7 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 		// told failed, and the retry stores exactly one.
 		delete(s.reports, rep.ID)
 		s.mu.Unlock()
-		http.Error(w, perr.Error(), 500)
+		s.internalError(w, r, perr, "")
 		return
 	}
 	s.mu.Unlock()
@@ -92,7 +92,7 @@ func (s *Server) listTestReports(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		} else if err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		if !s.requireRunRead(w, r, run) {
@@ -100,7 +100,7 @@ func (s *Server) listTestReports(w http.ResponseWriter, r *http.Request) {
 		}
 		out, err := s.DB.ListTestReports(r.Context(), runID)
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		writeJSON(w, http.StatusOK, out)
@@ -151,7 +151,7 @@ func (s *Server) testIntelligence(w http.ResponseWriter, r *http.Request) {
 		s.syncTestHistoryDB(r.Context())
 		reports, err := s.DB.ListTestReportsAll(r.Context())
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		filtered := make([]model.TestReport, 0, len(reports))

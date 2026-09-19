@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -62,6 +63,94 @@ type productionConfig struct {
 // no additional requirements.
 // drainTimeout bounds the graceful drain wait on signal.
 const drainTimeout = 30 * time.Second
+
+// listenControlPlane binds the control-plane listener. It is net.Listen in
+// production; socket-level tests replace it to bind 127.0.0.1:0 and learn the
+// ephemeral address without the close/reopen race of a reserved-port probe.
+// controlPlaneBuilt, when non-nil, is invoked with the assembled *http.Server
+// and the resolved listen address immediately before serving begins, letting
+// the socket tests inspect the timeout/TLS configuration actually in force
+// (and shrink the header bound for the stalled-header test). Production
+// leaves both untouched.
+var (
+	listenControlPlane = net.Listen
+	controlPlaneBuilt  func(h *http.Server, addr string)
+)
+
+// apiReadDeadline/apiWriteDeadline bound ordinary (non-streaming) API
+// requests: the body read and the response write respectively. They are
+// variables only so the socket-level tests can shrink the bound; production
+// uses these values.
+var (
+	apiReadDeadline  = 30 * time.Second
+	apiWriteDeadline = 60 * time.Second
+)
+
+// withAPIDeadlines re-applies the former global ReadTimeout/WriteTimeout
+// contract to the ordinary API routes, while leaving bulk streaming routes
+// unbounded. The http.Server itself runs with ReadTimeout/WriteTimeout 0:
+// artifact/cache/snapshot traffic streams up to 8 GiB (maxBlobBytes in
+// internal/server/blobs.go) and the log stream is long-lived, so any fixed
+// global deadline cuts transfers Kiwi's own size limits allow (the P2
+// defect). Deadlines here are absolute per request, covering the body read
+// and the response write.
+//
+// TRADE-OFF: routes listed in streamingRoute carry NO server-side transfer
+// deadline at all. Their transfer size stays bounded by Kiwi's own limits
+// (http.MaxBytesReader / artifact contracts) and a stalled peer is reaped by
+// IdleTimeout between requests; only operators can bound transfer time
+// externally. Keep the exemption list tight and in sync with the route table
+// in internal/server/server.go; any new long-lived/bulk route MUST be added
+// there instead of dropping the deadline globally again.
+func withAPIDeadlines(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if streamingRoute(r.Method, r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// ResponseController reaches the underlying net.Conn; on writers that
+		// do not support deadlines (httptest recorders) the error is
+		// deliberately ignored: deadlines are a production hardening, not an
+		// authorization decision.
+		rc := http.NewResponseController(w)
+		now := time.Now()
+		_ = rc.SetReadDeadline(now.Add(apiReadDeadline))
+		_ = rc.SetWriteDeadline(now.Add(apiWriteDeadline))
+		next.ServeHTTP(w, r)
+	})
+}
+
+// streamingRoute reports whether the route legitimately streams bulk or
+// long-lived traffic and therefore must not carry the ordinary API
+// deadlines. The set mirrors the route table in internal/server/server.go:
+//
+//	PUT  /api/v1/jobs/{id}/artifacts/{name}      upload up to 8 GiB
+//	PUT  /api/v1/jobs/{id}/cache/{key}           upload up to 8 GiB
+//	POST /api/v1/jobs/{id}/snapshots             upload up to 8 GiB
+//	GET  /api/v1/jobs/{id}/cache/{key}           download (streamed)
+//	GET  /api/v1/jobs/{id}/dependencies/...      download (streamed)
+//	GET  /api/v1/artifacts/{id}[/provenance]     download (streamed)
+//	GET  /api/v1/runs/{id}/snapshots/{sid}       download (streamed)
+//	GET  /api/v1/runs/{id}/logs/stream           SSE, long-lived
+func streamingRoute(method, path string) bool {
+	switch {
+	case method == http.MethodPut && strings.HasPrefix(path, "/api/v1/jobs/") &&
+		(strings.Contains(path, "/artifacts/") || strings.Contains(path, "/cache/")):
+		return true
+	case method == http.MethodPost && strings.HasPrefix(path, "/api/v1/jobs/") &&
+		strings.HasSuffix(path, "/snapshots"):
+		return true
+	case method == http.MethodGet && strings.HasPrefix(path, "/api/v1/jobs/") &&
+		(strings.Contains(path, "/cache/") || strings.Contains(path, "/dependencies/")):
+		return true
+	case method == http.MethodGet && strings.HasPrefix(path, "/api/v1/artifacts/"):
+		return true
+	case method == http.MethodGet && strings.HasPrefix(path, "/api/v1/runs/") &&
+		(strings.Contains(path, "/snapshots/") || strings.HasSuffix(path, "/logs/stream")):
+		return true
+	}
+	return false
+}
 
 // drainableServer is the compile-checkable adoption seam for the server
 // agent's graceful-drain methods: BeginDrain marks the control plane
@@ -538,12 +627,18 @@ func Server(ctx context.Context, args []string) error {
 	}
 	h := &http.Server{
 		Addr:              listenV,
-		Handler:           srv.Handler(),
+		Handler:           withAPIDeadlines(srv.Handler()),
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       90 * time.Second,
-		MaxHeaderBytes:    1 << 20,
+		// ReadTimeout/WriteTimeout are deliberately 0 (disabled): artifact,
+		// cache and snapshot endpoints stream up to 8 GiB and log streaming
+		// is long-lived, so a global 30s/60s body/write deadline aborts
+		// legitimate transfers regardless of Kiwi's own size limits.
+		// withAPIDeadlines reapplies the bounded contract to the ordinary
+		// JSON API, and streamingRoute exempts the bulk/long-lived routes.
+		ReadTimeout:    0,
+		WriteTimeout:   0,
+		IdleTimeout:    90 * time.Second,
+		MaxHeaderBytes: 1 << 20,
 	}
 	// The TLS identity comes from the server's own certificate pair plus the
 	// runner client CA trust settings (Server.TLSConfig), so the listener
@@ -579,12 +674,35 @@ func Server(ctx context.Context, args []string) error {
 		defer cancel()
 		_ = h.Shutdown(c)
 	}()
+	// Bind explicitly so the socket-level tests can observe the address and
+	// server actually in force; Serve/ServeTLS have the same semantics as
+	// ListenAndServe/ListenAndServeTLS (listener tracking for Shutdown,
+	// HTTP/2 setup, ErrServerClosed).
+	ln, lerr := listenControlPlane("tcp", listenV)
+	if lerr != nil {
+		return lerr
+	}
+	if controlPlaneBuilt != nil {
+		controlPlaneBuilt(h, ln.Addr().String())
+	}
+	// Truthful startup logging: scheme follows the serving branch below, and
+	// the printed address is the address actually bound.
 	scheme := "http"
 	if tlsCertV != "" {
 		scheme = "https"
 	}
-	fmt.Printf("Kiwi server listening on %s://%s\n", scheme, listenV)
-	serveErr := h.ListenAndServe()
+	fmt.Printf("Kiwi server listening on %s://%s\n", scheme, ln.Addr())
+	var serveErr error
+	if tlsCertV != "" {
+		// The TLS serving point. The certificate comes from Server.TLSConfig
+		// (h.TLSConfig.Certificates is populated), so the empty filenames are
+		// intentional and correct. Calling ListenAndServe() here would open a
+		// PLAINTEXT listener and never exercise the constructed TLS
+		// 1.2+/client-CA configuration (the P0 defect).
+		serveErr = h.ServeTLS(ln, "", "")
+	} else {
+		serveErr = h.Serve(ln)
+	}
 	if serveErr == http.ErrServerClosed {
 		return nil
 	}

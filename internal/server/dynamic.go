@@ -99,7 +99,7 @@ func (s *Server) generateJobs(w http.ResponseWriter, r *http.Request) {
 		// client error.
 		var nd *stateNotDurableError
 		if errors.As(aerr, &nd) {
-			http.Error(w, nd.Error(), http.StatusServiceUnavailable)
+			s.serverError(w, r, http.StatusServiceUnavailable, nd, "state not durable")
 			return
 		}
 		http.Error(w, aerr.Error(), http.StatusBadRequest)

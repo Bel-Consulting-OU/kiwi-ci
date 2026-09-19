@@ -1,8 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,7 +20,7 @@ func TestOutboxDBRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	item := forge.OutboxItem{Kind: forge.OutboxKindGitHubCheck, Payload: []byte(`{"name":"Pipeline"}`)}
-	if err := s.outbox.Enqueue(item); err != nil {
+	if err := s.outbox.Enqueue(context.Background(), item); err != nil {
 		t.Fatal(err)
 	}
 	queued := s.outbox.Pending()
@@ -55,7 +58,7 @@ func TestOutboxDBRoundTrip(t *testing.T) {
 	}
 
 	// A failed dispatch keeps the item queued and unacked.
-	if err := s.outbox.Enqueue(forge.OutboxItem{Kind: forge.OutboxKindGitHubStatus, Payload: []byte("{}")}); err != nil {
+	if err := s.outbox.Enqueue(context.Background(), forge.OutboxItem{Kind: forge.OutboxKindGitHubStatus, Payload: []byte("{}")}); err != nil {
 		t.Fatal(err)
 	}
 	_, err = s.outbox.Flush(context.Background(), func(ctx context.Context, it forge.OutboxItem) error {
@@ -175,6 +178,179 @@ func TestOutboxFlushDBReleasesUndispatchedClaimsOnAckError(t *testing.T) {
 	}
 }
 
+// outboxCancelCtxStore mirrors PostgresStore's context coupling for the
+// statements a flush performs AFTER a successful dispatch: pgx refuses an
+// already-cancelled context before the statement reaches PostgreSQL, so the
+// ACK and the claim-release UPDATE fail once the flush context dies. The
+// context-blind dbFakeStore shortcut cannot reproduce the stranding defect;
+// this wrapper can.
+type outboxCancelCtxStore struct{ *dbFakeStore }
+
+func (s *outboxCancelCtxStore) OutboxAck(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.dbFakeStore.OutboxAck(ctx, id)
+}
+
+func (s *outboxCancelCtxStore) ReleaseOutboxClaim(ctx context.Context, id, claimer string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.dbFakeStore.ReleaseOutboxClaim(ctx, id, claimer)
+}
+
+// TestOutboxFlushDBCancelledContextReleasesClaims pins the P2 outbox-claim
+// stranding defect: claim cleanup must NOT ride the dispatch context. The
+// flush context is cancelled while the dispatch of "b" is in flight (the
+// Maintain 2-minute bound expiring mid-batch); the ACK of "b" then fails on
+// the dead context and the flush returns early, leaving "c" and "d" claimed
+// but never dispatched. With cleanup on the dispatch context the release
+// UPDATEs are refused too (and the errors discarded), so b/c/d stay invisible
+// to every other replica until OutboxClaimTTL (5 minutes). With a cleanup
+// context derived via context.WithoutCancel they are claimable immediately.
+func TestOutboxFlushDBCancelledContextReleasesClaims(t *testing.T) {
+	f := &outboxCancelCtxStore{dbFakeStore: newDBFakeStore()}
+	s := New("token")
+	if err := s.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	base := time.Now().UTC().Add(-time.Minute)
+	for i, id := range []string{"a", "b", "c", "d"} {
+		if err := f.OutboxAppend(ctx, storage.OutboxItem{
+			ID: id, Kind: storage.OutboxKindUsageAccount, Payload: []byte(`{"job_id":"gone"}`),
+			CreatedAt: base.Add(time.Duration(i) * time.Second),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	flushCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var dispatched []string
+	n, err := s.outbox.Flush(flushCtx, func(_ context.Context, it forge.OutboxItem) error {
+		dispatched = append(dispatched, it.ID)
+		if it.ID == "b" {
+			// The flush bound expires while this dispatch is in flight: the
+			// forge call completed, but every later store statement would run
+			// on a dead context.
+			cancel()
+		}
+		return nil
+	})
+	if err == nil {
+		t.Fatal("the ACK of b on the cancelled context must fail the flush")
+	}
+	if n != 1 || len(dispatched) != 2 || dispatched[0] != "a" || dispatched[1] != "b" {
+		t.Fatalf("flush = n=%d dispatched=%v, want a ACKed and b dispatched but unACKed", n, dispatched)
+	}
+
+	// The failed ACK released b with a cleanup context of its own, and the
+	// deferred cleanup released the never-dispatched c and d.
+	f.mu.Lock()
+	_, aClaimed := f.outboxClaims["a"]
+	_, bClaimed := f.outboxClaims["b"]
+	_, cClaimed := f.outboxClaims["c"]
+	_, dClaimed := f.outboxClaims["d"]
+	f.mu.Unlock()
+	if aClaimed || bClaimed || cClaimed || dClaimed {
+		t.Fatalf("claims after flush: a=%v b=%v c=%v d=%v, want every claim released", aClaimed, bClaimed, cClaimed, dClaimed)
+	}
+
+	// A second replica must be able to claim the remaining rows RIGHT NOW,
+	// not after OutboxClaimTTL.
+	reclaimed, cerr := f.ClaimOutbox(ctx, "replica-2", 10)
+	if cerr != nil {
+		t.Fatal(cerr)
+	}
+	ids := map[string]bool{}
+	for _, it := range reclaimed {
+		ids[it.ID] = true
+	}
+	if !ids["b"] || !ids["c"] || !ids["d"] {
+		t.Fatalf("immediately reclaimable rows = %v, want b, c and d (claims stranded until OutboxClaimTTL)", ids)
+	}
+	if ids["a"] {
+		t.Fatalf("ACKed row was claimable again: %v", ids)
+	}
+}
+
+// outboxReleaseFailStore fails every ReleaseOutboxClaim while recording the
+// attempted IDs: claim cleanup errors must be logged (row ID + error) and
+// must never abort or panic the flush.
+type outboxReleaseFailStore struct {
+	*dbFakeStore
+	releaseErr error
+	released   []string
+}
+
+func (s *outboxReleaseFailStore) ReleaseOutboxClaim(ctx context.Context, id, claimer string) error {
+	s.released = append(s.released, id)
+	if s.releaseErr != nil {
+		return s.releaseErr
+	}
+	return s.dbFakeStore.ReleaseOutboxClaim(ctx, id, claimer)
+}
+
+// TestOutboxFlushDBReleaseFailureLoggedAndFlushContinues pins the cleanup
+// error contract: a failing ReleaseOutboxClaim is logged with the item ID and
+// the error (never silently discarded) and the batch keeps dispatching and
+// ACKing its remaining rows.
+func TestOutboxFlushDBReleaseFailureLoggedAndFlushContinues(t *testing.T) {
+	f := &outboxReleaseFailStore{dbFakeStore: newDBFakeStore(), releaseErr: errors.New("release update down")}
+	s := New("token")
+	if err := s.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	base := time.Now().UTC().Add(-time.Minute)
+	for i, id := range []string{"a", "b", "c"} {
+		if err := f.OutboxAppend(ctx, storage.OutboxItem{
+			ID: id, Kind: storage.OutboxKindUsageAccount, Payload: []byte(`{"job_id":"gone"}`),
+			CreatedAt: base.Add(time.Duration(i) * time.Second),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var buf bytes.Buffer
+	prevLog := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(prevLog)
+
+	var dispatched []string
+	n, err := s.outbox.Flush(ctx, func(_ context.Context, it forge.OutboxItem) error {
+		dispatched = append(dispatched, it.ID)
+		if it.ID == "a" {
+			return errors.New("dispatch down")
+		}
+		return nil
+	})
+	if err == nil {
+		t.Fatal("the per-row dispatch failure must still be returned after the batch")
+	}
+	if n != 2 || strings.Join(dispatched, ",") != "a,b,c" {
+		t.Fatalf("flush n=%d dispatched=%v, want [a b c] with 2 ACKs (the release failure must not stop the batch)", n, dispatched)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "release claim for a") || !strings.Contains(logged, "release update down") {
+		t.Fatalf("release failure not logged with item ID and error: %q", logged)
+	}
+	if len(f.released) == 0 {
+		t.Fatal("release was never attempted")
+	}
+	f.mu.Lock()
+	var remaining []string
+	for _, it := range f.outboxItems {
+		remaining = append(remaining, it.ID)
+	}
+	f.mu.Unlock()
+	if strings.Join(remaining, ",") != "a" {
+		t.Fatalf("durable rows = %v, want only the failed-dispatch row a (b and c ACKed)", remaining)
+	}
+}
+
 // TestOutboxReplayDBMirrorsOnlyDueRows pins J2-3: o.items holds only
 // currently-due, non-dead intents. A delayed row (future next_attempt_at) is
 // NOT resident after ReplayDB and becomes claimable when due; a dead letter
@@ -275,13 +451,13 @@ func TestOutboxEnqueueSameIDConflictDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	first := forge.OutboxItem{ID: "db-fixed-intent", Kind: forge.OutboxKindGitHubStatus, Payload: []byte(`{"a":1}`)}
-	if err := s.outbox.Enqueue(first); err != nil {
+	if err := s.outbox.Enqueue(context.Background(), first); err != nil {
 		t.Fatalf("first enqueue: %v", err)
 	}
-	if err := s.outbox.Enqueue(first); err != nil {
+	if err := s.outbox.Enqueue(context.Background(), first); err != nil {
 		t.Fatalf("same-payload replay must be a success: %v", err)
 	}
-	if err := s.outbox.Enqueue(forge.OutboxItem{ID: "db-fixed-intent", Kind: forge.OutboxKindGitHubStatus, Payload: []byte(`{"a":2}`)}); !errors.Is(err, ErrOutboxIDConflict) {
+	if err := s.outbox.Enqueue(context.Background(), forge.OutboxItem{ID: "db-fixed-intent", Kind: forge.OutboxKindGitHubStatus, Payload: []byte(`{"a":2}`)}); !errors.Is(err, ErrOutboxIDConflict) {
 		t.Fatalf("different payload error = %v, want ErrOutboxIDConflict", err)
 	}
 	f.mu.Lock()
@@ -296,14 +472,14 @@ func TestOutboxEnqueueSameIDConflictDB(t *testing.T) {
 	s.outbox.mu.Lock()
 	s.outbox.removeLocked(first.ID)
 	s.outbox.mu.Unlock()
-	if err := s.outbox.Enqueue(first); err != nil {
+	if err := s.outbox.Enqueue(context.Background(), first); err != nil {
 		t.Fatalf("same-content durable replay must be a success: %v", err)
 	}
 	// ...while different content under the same durable ID is rejected.
 	s.outbox.mu.Lock()
 	s.outbox.removeLocked(first.ID)
 	s.outbox.mu.Unlock()
-	if err := s.outbox.Enqueue(forge.OutboxItem{ID: "db-fixed-intent", Kind: forge.OutboxKindGitHubStatus, Payload: []byte(`{"a":3}`)}); err == nil {
+	if err := s.outbox.Enqueue(context.Background(), forge.OutboxItem{ID: "db-fixed-intent", Kind: forge.OutboxKindGitHubStatus, Payload: []byte(`{"a":3}`)}); err == nil {
 		t.Fatal("durable same-ID/different-content enqueue must fail")
 	}
 }

@@ -861,7 +861,7 @@ func (s *Server) auth(next http.Handler) http.Handler {
 			tok := enrollTokenFrom(r)
 			switch {
 			case s.RunnerEnrollToken != "" && bearerOK(tok, s.RunnerEnrollToken):
-			case s.enrollGrantOK(tok):
+			case s.enrollGrantOK(r.Context(), tok):
 			default:
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
@@ -1042,6 +1042,32 @@ func (s *Server) logError(msg string, kv ...any) {
 	s.Logger.Error(msg, kv...)
 }
 
+// serverError answers a failed request with an opaque body while keeping the
+// detailed error server-side. Handlers must never echo raw 5xx errors: store
+// and provider errors carry filesystem paths, SQL details and internals. The
+// error is logged at error level with the same fields as the recoverer
+// (request_id from the requestID middleware, method, path) plus the status,
+// so the diagnostic survives. clientMsg is the fixed, caller-supplied body
+// (e.g. statePersistenceDegradedBody or "state not durable"); empty defaults
+// to "internal server error".
+func (s *Server) serverError(w http.ResponseWriter, r *http.Request, status int, err error, clientMsg string) {
+	if clientMsg == "" {
+		clientMsg = "internal server error"
+	}
+	detail := ""
+	if err != nil {
+		detail = err.Error()
+	}
+	s.logError("server error", "request_id", requestIDFrom(r), "method", r.Method, "path", r.URL.Path, "status", status, "error", detail)
+	http.Error(w, clientMsg, status)
+}
+
+// internalError is the 500 shorthand for serverError: the detail is logged
+// with the request ID and the client only ever sees an opaque body.
+func (s *Server) internalError(w http.ResponseWriter, r *http.Request, err error, clientMsg string) {
+	s.serverError(w, r, http.StatusInternalServerError, err, clientMsg)
+}
+
 func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	var in SubmitRun
 	if !decode(w, r, &in) {
@@ -1094,7 +1120,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		// the submission as invalid.
 		var nd *stateNotDurableError
 		if errors.As(err, &nd) {
-			http.Error(w, nd.Error(), http.StatusServiceUnavailable)
+			s.serverError(w, r, http.StatusServiceUnavailable, nd, "state not durable")
 			return
 		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -1426,7 +1452,17 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 		}
 	}
 	s.mu.Unlock()
-	if err := s.publishForgeStatus(context.Background(), run); err != nil {
+	// The run itself is already durable; the initial queued check is
+	// best-effort and must still be recorded if the submitting client hangs
+	// up, so it goes through an explicitly BOUNDED detach (never a bare
+	// Background): a stalled DB cannot pin the submission goroutine, and a
+	// failure is logged rather than returned because the run's own durability
+	// is what the response ACKs. enqueue() has no caller context to thread
+	// (the same plumbing serves HTTP handlers and the scheduler).
+	//lint:ignore SA1012 detach root: boundedDetach substitutes context.Background() when origin is nil (context-free call path).
+	pubCtx, pubCancel := boundedDetach(nil, outboxDetachTimeout)
+	defer pubCancel()
+	if err := s.publishForgeStatus(pubCtx, run); err != nil {
 		s.logError("forge status enqueue failed", "run", run.ID, "error", err.Error())
 	}
 	return run, nil
@@ -1553,7 +1589,16 @@ func (s *Server) enqueueDB(in SubmitRun, run model.Run, created map[string]model
 		}
 	}
 	s.auditLocked("run.queued", "scheduler", run.ID, "", "run queued", map[string]string{"event": in.Event})
-	if err := s.publishForgeStatus(context.Background(), run); err != nil {
+	// Same bounded detach as the fs enqueue path: the run (and its jobs,
+	// claims and quota reservation) is already committed in one transaction,
+	// so the queued check publication is best-effort and must still be
+	// recorded if the submitting client hangs up; the bound keeps a stalled
+	// DB from pinning the submission goroutine, and a failure is logged, not
+	// returned, because the transaction is what the response ACKs.
+	//lint:ignore SA1012 detach root: boundedDetach substitutes context.Background() when origin is nil (context-free call path).
+	pubCtx, pubCancel := boundedDetach(nil, outboxDetachTimeout)
+	defer pubCancel()
+	if err := s.publishForgeStatus(pubCtx, run); err != nil {
 		s.logError("forge status enqueue failed", "run", run.ID, "error", err.Error())
 	}
 	return run, nil
@@ -1653,7 +1698,7 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 	if s.DB != nil {
 		out, err := s.DB.ListRuns(r.Context(), 1000)
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		dto := make([]v1.RunDTO, 0, len(out))
@@ -1691,7 +1736,7 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		if !s.requireRunRead(w, r, v) {
@@ -1720,7 +1765,7 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		} else if err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		if !s.requireRunRead(w, r, run) {
@@ -1728,7 +1773,7 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 		}
 		jobs, err := s.DB.ListJobsByRun(r.Context(), runID)
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		out := make([]v1.JobDTO, 0, len(jobs))
@@ -1772,7 +1817,7 @@ func (s *Server) getLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	if !s.requireRunRead(w, r, run) {
@@ -1783,7 +1828,7 @@ func (s *Server) getLogs(w http.ResponseWriter, r *http.Request) {
 	if s.DB != nil {
 		v, err := s.DB.ReadLogs(r.Context(), id, after, limit)
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		writeJSON(w, http.StatusOK, v)
@@ -1792,7 +1837,7 @@ func (s *Server) getLogs(w http.ResponseWriter, r *http.Request) {
 	if s.store != nil {
 		v, err := s.store.ReadLogs(id, after, limit)
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		writeJSON(w, http.StatusOK, v)
@@ -1950,7 +1995,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	if s.DB != nil {
 		old, gerr := s.DB.GetRunner(r.Context(), in.ID)
 		if gerr != nil && !errors.Is(gerr, storage.ErrNotFound) {
-			http.Error(w, gerr.Error(), 500)
+			s.internalError(w, r, gerr, "")
 			return
 		}
 		// Re-registration must not clear admin state: a disabled runner
@@ -1978,7 +2023,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 			in.CurrentJob = in.ActiveJobs[0]
 		}
 		if err := s.DB.UpsertRunner(r.Context(), in); err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		s.auditLocked("runner.register", in.Name, "", "", "runner registered", nil)
@@ -2033,7 +2078,7 @@ func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
 	if s.DB != nil {
 		out, err := s.DB.ListRunners(r.Context())
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		dto := make([]v1.RunnerDTO, 0, len(out))
@@ -2071,7 +2116,7 @@ func (s *Server) listServingRunners(w http.ResponseWriter, r *http.Request) {
 	if s.DB != nil {
 		out, err := s.DB.ListRunners(r.Context())
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		all = out
@@ -2138,7 +2183,7 @@ func (s *Server) runnerDrain(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		// Audit-first: a drain that cannot leave evidence is refused.
@@ -2148,7 +2193,7 @@ func (s *Server) runnerDrain(w http.ResponseWriter, r *http.Request) {
 		}
 		ri.Draining = true
 		if err := s.DB.UpsertRunner(r.Context(), ri); err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		writeJSON(w, http.StatusOK, ri)
@@ -2208,7 +2253,7 @@ func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		// Audit-first: the disable's evidence lands before the runner row is
@@ -2225,7 +2270,7 @@ func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
 			ri.RevokedAt = &now
 		}
 		if err := s.DB.UpsertRunner(r.Context(), ri); err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		// The disable flag alone does not stop a job already in flight: the
@@ -2233,7 +2278,7 @@ func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
 		// runner so no further work can run.
 		revoked, err := s.revokeRunnerDB(r.Context(), id, "runner disabled")
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		s.metricAdd("kiwi_runner_killswitch_jobs_total", float64(revoked), nil)
@@ -2310,7 +2355,7 @@ func (s *Server) runnerEnable(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		if aerr := s.auditFirstLocked("runner.enable", actorFrom(r), "", "", "runner enabled", map[string]string{"runner": id}); aerr != nil {
@@ -2320,7 +2365,7 @@ func (s *Server) runnerEnable(w http.ResponseWriter, r *http.Request) {
 		ri.Disabled = false
 		ri.Draining = false
 		if err := s.DB.UpsertRunner(r.Context(), ri); err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		writeJSON(w, http.StatusOK, ri)
@@ -2692,7 +2737,7 @@ func (s *Server) nextDB(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, "runner not registered", http.StatusNotFound)
 		return
 	} else if err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	if ri.Disabled {
@@ -2722,7 +2767,7 @@ func (s *Server) nextDB(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, "runner not registered", http.StatusNotFound)
 		return
 	case err != nil:
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	// The claim transaction froze the runner's live usage rates (and
@@ -2831,7 +2876,7 @@ func (s *Server) heartbeatDB(w http.ResponseWriter, r *http.Request, jobID strin
 		return
 	}
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	if j.Status == model.StatusCancelled {
@@ -2849,7 +2894,7 @@ func (s *Server) heartbeatDB(w http.ResponseWriter, r *http.Request, jobID strin
 		return
 	}
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	writeJSON(w, http.StatusOK, HeartbeatResponse{Cancel: cancelled, LeaseExpiresAt: exp})
@@ -3016,7 +3061,7 @@ func (s *Server) log(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	if s.store != nil {
 		if err := s.store.AppendLog(e); err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 	}
@@ -3079,7 +3124,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 			s.mu.Unlock()
 			if matched {
 				if perr != nil {
-					http.Error(w, "completion state not durable: "+perr.Error(), http.StatusServiceUnavailable)
+					s.serverError(w, r, http.StatusServiceUnavailable, perr, "completion state not durable")
 					return
 				}
 				// The durable completion lost its outbox intents (crash or
@@ -3087,12 +3132,12 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 				// re-ensure the deterministic intents BEFORE acking, so the
 				// terminal forge publication is never stranded. Enqueue is
 				// idempotent by ID.
-				if rerr := s.repairCompletionIntents(jobID, in.LeaseGeneration); rerr != nil {
-					http.Error(w, "completion effects not durable: "+rerr.Error(), http.StatusServiceUnavailable)
+				if rerr := s.repairCompletionIntents(r.Context(), jobID, in.LeaseGeneration); rerr != nil {
+					s.serverError(w, r, http.StatusServiceUnavailable, rerr, "completion effects not durable")
 					return
 				}
-				if derr := s.reconcileCompletionEffects(context.Background(), jobID); derr != nil {
-					http.Error(w, derr.Error(), http.StatusInternalServerError)
+				if derr := s.reconcileCompletionEffects(r.Context(), jobID); derr != nil {
+					s.internalError(w, r, derr, "")
 					return
 				}
 				w.WriteHeader(http.StatusNoContent)
@@ -3116,15 +3161,15 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 		if matched {
 			if perr != nil {
-				http.Error(w, "completion state not durable: "+perr.Error(), http.StatusServiceUnavailable)
+				s.serverError(w, r, http.StatusServiceUnavailable, perr, "completion state not durable")
 				return
 			}
-			if rerr := s.repairCompletionIntents(jobID, in.LeaseGeneration); rerr != nil {
-				http.Error(w, "completion effects not durable: "+rerr.Error(), http.StatusServiceUnavailable)
+			if rerr := s.repairCompletionIntents(r.Context(), jobID, in.LeaseGeneration); rerr != nil {
+				s.serverError(w, r, http.StatusServiceUnavailable, rerr, "completion effects not durable")
 				return
 			}
-			if derr := s.reconcileCompletionEffects(context.Background(), jobID); derr != nil {
-				http.Error(w, derr.Error(), http.StatusInternalServerError)
+			if derr := s.reconcileCompletionEffects(r.Context(), jobID); derr != nil {
+				s.internalError(w, r, derr, "")
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
@@ -3217,7 +3262,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	if perr := s.persistCheckedErrLocked("job.complete"); perr != nil {
 		s.rollbackCompletionLocked(rollback)
 		s.mu.Unlock()
-		http.Error(w, "completion state not durable: "+perr.Error(), http.StatusServiceUnavailable)
+		s.serverError(w, r, http.StatusServiceUnavailable, perr, "completion state not durable")
 		return
 	}
 	s.auditLocked("job.completed", in.RunnerID, runID, j.ID, string(j.Status), map[string]string{"job": j.Key})
@@ -3231,8 +3276,8 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	// The completion effects are recorded durably into the outbox (they run
 	// again — as marker-guarded no-ops — when the flush dispatches them, and
 	// for real when a crash lost the inline pass above).
-	if err := s.enqueueCompletionEffects(j, run); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if err := s.enqueueCompletionEffects(r.Context(), j, run); err != nil {
+		s.internalError(w, r, err, "")
 		return
 	}
 	// A successful job with a downstream declaration records the launch
@@ -3241,8 +3286,8 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	// completion stands, and the idempotent replay re-attempts the
 	// recording.
 	if j.Status == model.StatusSuccess {
-		if err := s.recordDownstreamIntents(context.Background(), j, run); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		if err := s.recordDownstreamIntents(r.Context(), j, run); err != nil {
+			s.internalError(w, r, err, "")
 			return
 		}
 	}
@@ -3274,11 +3319,11 @@ func (s *Server) completeDB(w http.ResponseWriter, r *http.Request, jobID string
 	// applied and its receipt persisted; acknowledge it and defensively
 	// reconcile the post-completion effects before acknowledging.
 	if rec, has, err := s.DB.HasCompletionReceipt(ctx, jobID, in.LeaseGeneration, in.RunnerID); err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	} else if has && rec.ResultHash == hash {
 		if derr := s.reconcileCompletionEffects(ctx, jobID); derr != nil {
-			http.Error(w, derr.Error(), http.StatusInternalServerError)
+			s.internalError(w, r, derr, "")
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -3291,7 +3336,7 @@ func (s *Server) completeDB(w http.ResponseWriter, r *http.Request, jobID string
 			// receipt wins, and its effects are reconciled before ack.
 			if rec, has, herr := s.DB.HasCompletionReceipt(ctx, jobID, in.LeaseGeneration, in.RunnerID); herr == nil && has && rec.ResultHash == hash {
 				if derr := s.reconcileCompletionEffects(ctx, jobID); derr != nil {
-					http.Error(w, derr.Error(), http.StatusInternalServerError)
+					s.internalError(w, r, derr, "")
 					return
 				}
 				w.WriteHeader(http.StatusNoContent)
@@ -3341,7 +3386,7 @@ func (s *Server) completeDB(w http.ResponseWriter, r *http.Request, jobID string
 			// Idempotent replay: re-apply post-completion effects that may
 			// have failed after the durable completion committed.
 			if derr := s.reconcileCompletionEffects(ctx, jobID); derr != nil {
-				http.Error(w, derr.Error(), http.StatusInternalServerError)
+				s.internalError(w, r, derr, "")
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
@@ -3358,7 +3403,7 @@ func (s *Server) completeDB(w http.ResponseWriter, r *http.Request, jobID string
 	// completion response (500) and the idempotent receipt replay
 	// re-attempts the reconciliation.
 	if derr := s.reconcileCompletionEffects(ctx, jobID); derr != nil {
-		http.Error(w, derr.Error(), http.StatusInternalServerError)
+		s.internalError(w, r, derr, "")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -3845,7 +3890,7 @@ func (s *Server) approveJobDB(w http.ResponseWriter, r *http.Request, jobID, act
 		return
 	}
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	if !s.requireAction(w, r, auth.ActionApprove, repoIDForJob(j), false) {
@@ -3873,7 +3918,7 @@ func (s *Server) approveJobDB(w http.ResponseWriter, r *http.Request, jobID, act
 		return
 	}
 	if err := s.DB.UpdateJob(ctx, j); err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	if waited {
@@ -3964,12 +4009,12 @@ func (s *Server) rerunRunDB(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	jobs, err := s.DB.ListJobsByRun(ctx, id)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	var pipelineText string
@@ -4093,7 +4138,7 @@ func (s *Server) cancelRunDB(w http.ResponseWriter, r *http.Request, id, actor s
 		return
 	}
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	if !s.requireAction(w, r, auth.ActionCancel, repoIDForRun(run), false) {
@@ -4110,7 +4155,7 @@ func (s *Server) cancelRunDB(w http.ResponseWriter, r *http.Request, id, actor s
 		return
 	}
 	if err := s.Sched.CancelRun(ctx, id, reason); err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	if cur, gerr := s.DB.GetRun(ctx, id); gerr == nil {
@@ -4482,7 +4527,7 @@ func (s *Server) listAudit(w http.ResponseWriter, r *http.Request) {
 		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 		v, err := s.DB.ReadAudit(r.Context(), limit)
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		writeJSON(w, 200, v)
@@ -4495,7 +4540,7 @@ func (s *Server) listAudit(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	v, err := s.store.ReadAudit(limit)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	writeJSON(w, 200, v)
@@ -4927,7 +4972,7 @@ func (s *Server) metricsMemory(w http.ResponseWriter, r *http.Request) {
 func (s *Server) metricsDB(w http.ResponseWriter, r *http.Request) {
 	runs, err := s.DB.ListRuns(r.Context(), 100)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	counts := map[model.Status]int{}
@@ -5195,7 +5240,7 @@ func (s *Server) Maintain(ctx context.Context) {
 			s.GC(ctx, tick.UTC())
 			s.maybeRunCASGC(ctx, tick.UTC())
 			s.pruneDeadRunLogBatches(tick.UTC())
-			s.flushOutbox()
+			s.flushOutbox(ctx)
 			s.fireDueSchedules(ctx, tick.UTC())
 			s.metricObserve("kiwi_scheduler_loop_duration_seconds", time.Since(loopStart).Seconds(), nil)
 		}
@@ -5278,7 +5323,7 @@ func (s *Server) maintainDB(ctx context.Context, now time.Time) {
 		s.logError("lease recovery", "error", err.Error())
 	}
 	s.recoverDownstreamReservations(ctx, now)
-	s.flushOutbox()
+	s.flushOutbox(ctx)
 	s.GC(ctx, now)
 	s.maybeRunCASGC(ctx, now)
 }

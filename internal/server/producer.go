@@ -89,7 +89,7 @@ func (s *Server) downloadDependency(w http.ResponseWriter, r *http.Request) {
 		}
 		recs, lerr := s.findArtifactByJobName(r.Context(), pj.RunID, pj.ID, artifact)
 		if lerr != nil {
-			http.Error(w, lerr.Error(), 500)
+			s.internalError(w, r, lerr, "")
 			return
 		}
 		matches = append(matches, recs...)

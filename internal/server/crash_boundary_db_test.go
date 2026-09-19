@@ -46,7 +46,7 @@ func TestCrashOutboxDispatchRestartExactlyOnceDB(t *testing.T) {
 
 	s1 := crashDBOutboxServer(t, f, srv.URL)
 	inflight := s1.checkIntent(run, "Pipeline", "queued", "", "queued", nil)
-	if err := s1.outbox.Enqueue(inflight); err != nil {
+	if err := s1.outbox.Enqueue(context.Background(), inflight); err != nil {
 		t.Fatal(err)
 	}
 	// Mid-flight crash: another replica claimed the row and died before
@@ -59,7 +59,7 @@ func TestCrashOutboxDispatchRestartExactlyOnceDB(t *testing.T) {
 	if err := s2.outbox.ReplayDB(ctx); err != nil {
 		t.Fatal(err)
 	}
-	s2.flushOutbox()
+	s2.flushOutbox(context.Background())
 	if posts, patches, _ := api.snapshot(); posts != 0 || patches != 0 {
 		t.Fatalf("restart republished a row another replica still claims: posts=%d patches=%d", posts, patches)
 	}
@@ -73,7 +73,7 @@ func TestCrashOutboxDispatchRestartExactlyOnceDB(t *testing.T) {
 	f.outboxClaims[inflight.ID] = fakeOutboxClaim{claimer: "crashed-replica", at: time.Now().UTC().Add(-2 * storage.OutboxClaimTTL)}
 	f.mu.Unlock()
 	f.ForceAllOutboxDue()
-	s2.flushOutbox()
+	s2.flushOutbox(context.Background())
 	if posts, patches, published := api.snapshot(); posts != 1 || patches != 0 || len(published) != 1 {
 		t.Fatalf("reclaimed dispatch = posts=%d patches=%d published=%v, want one publication", posts, patches, published)
 	}
@@ -84,7 +84,7 @@ func TestCrashOutboxDispatchRestartExactlyOnceDB(t *testing.T) {
 	// Remote publication succeeded, crash before the durable ACK: the
 	// restarted flusher must PATCH the persisted remote ID, not POST again.
 	survivor := s2.checkIntent(run, "build", "completed", "success", "done", nil)
-	if err := s2.outbox.Enqueue(survivor); err != nil {
+	if err := s2.outbox.Enqueue(context.Background(), survivor); err != nil {
 		t.Fatal(err)
 	}
 	if err := s2.dispatchOutbox(ctx, survivor); err != nil {
@@ -98,7 +98,7 @@ func TestCrashOutboxDispatchRestartExactlyOnceDB(t *testing.T) {
 	if err := s3.outbox.ReplayDB(ctx); err != nil {
 		t.Fatal(err)
 	}
-	s3.flushOutbox()
+	s3.flushOutbox(context.Background())
 	posts, patches, published := api.snapshot()
 	if posts != 2 || patches != 1 {
 		t.Fatalf("post-restart re-dispatch = posts=%d patches=%d, want 2/1 (no duplicate remote check)", posts, patches)
@@ -127,7 +127,7 @@ func TestCrashOutboxDeadLetterRestartDB(t *testing.T) {
 
 	s1 := crashDBOutboxServer(t, f, srv.URL)
 	item := s1.checkIntent(run, "Pipeline", "completed", "success", "done", nil)
-	if err := s1.outbox.Enqueue(item); err != nil {
+	if err := s1.outbox.Enqueue(context.Background(), item); err != nil {
 		t.Fatal(err)
 	}
 	driveOutboxAttempts(s1, f, maxOutboxAttempts)
@@ -148,7 +148,7 @@ func TestCrashOutboxDeadLetterRestartDB(t *testing.T) {
 	if got := len(s2.outbox.Pending()); got != 0 {
 		t.Fatalf("dead letter replayed as pending after restart: %d", got)
 	}
-	s2.flushOutbox()
+	s2.flushOutbox(context.Background())
 	if posts, patches, _ := api.snapshot(); posts != 0 || patches != 0 {
 		t.Fatalf("restart published a dead letter: posts=%d patches=%d", posts, patches)
 	}
@@ -167,7 +167,7 @@ func TestCrashOutboxDeadLetterRestartDB(t *testing.T) {
 		t.Fatalf("dead letters after requeue = %+v", dead)
 	}
 	f.ForceAllOutboxDue()
-	s2.flushOutbox()
+	s2.flushOutbox(context.Background())
 	if posts, patches, published := api.snapshot(); posts != 1 || patches != 0 || len(published) != 1 || published[0] != "completed" {
 		t.Fatalf("requeued delivery = posts=%d patches=%d published=%v, want one completed publication", posts, patches, published)
 	}

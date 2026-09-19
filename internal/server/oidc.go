@@ -416,7 +416,7 @@ func isLoopbackHost(host string) bool {
 func (s *Server) oidcConfiguration(w http.ResponseWriter, r *http.Request) {
 	iss, err := s.oidcIssuer()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		s.serverError(w, r, http.StatusServiceUnavailable, err, "OIDC unavailable")
 		return
 	}
 	w.Header().Set("Cache-Control", "public, max-age=300")
@@ -464,7 +464,7 @@ func (s *Server) oidcJWKS(w http.ResponseWriter, r *http.Request) {
 func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 	iss, err := s.oidcIssuer()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		s.serverError(w, r, http.StatusServiceUnavailable, err, "OIDC unavailable")
 		return
 	}
 	jobID := r.PathValue("id")
@@ -501,7 +501,7 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		run, err = s.DB.GetRun(r.Context(), j.RunID)
@@ -510,7 +510,7 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 	} else {
@@ -559,7 +559,7 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 	claims := map[string]any{"iss": iss, "sub": sub, "aud": in.Audience, "iat": now.Unix(), "nbf": now.Add(-5 * time.Second).Unix(), "exp": now.Add(5 * time.Minute).Unix(), "jti": jti, "repository": run.RepoFullName, "repository_id": repoID, "ref": run.Ref, "sha": run.SHA, "event": run.Event, "run_id": run.ID, "job_id": j.ID, "job": j.Key, "environment": j.Environment, "trusted": j.Trusted}
 	jwt, err := s.signJWT(signer, claims)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		s.internalError(w, r, err, "")
 		return
 	}
 	// The audit trail records the issuance before the token is returned; a

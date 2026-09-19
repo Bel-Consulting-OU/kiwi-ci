@@ -695,18 +695,27 @@ func (f listJobsFaultStore) ListJobsByRun(ctx context.Context, runID string) ([]
 	return f.dbFakeStore.ListJobsByRun(ctx, runID)
 }
 
-// TestLeftoverActiveJobsListFailure covers the drain accounting's per-run
-// read failure: an unreadable run contributes zero in-flight jobs instead of
-// failing the whole count.
+// TestLeftoverActiveJobsListFailure covers the drain accounting's new shape:
+// the aggregate running count is authoritative and independent of per-run job
+// reads, so an unreadable ListJobsByRun can no longer hide a running job; a
+// failed aggregate count is UNKNOWN and reported fail-closed (never zero).
 func TestLeftoverActiveJobsListFailure(t *testing.T) {
 	s := New("secret")
 	f := newDBFakeStore()
 	f.mu.Lock()
 	f.runs["run-x"] = model.Run{ID: "run-x", Status: model.StatusRunning}
+	f.jobs["job-x"] = model.Job{ID: "job-x", RunID: "run-x", Status: model.StatusRunning}
 	f.mu.Unlock()
 	s.DB = listJobsFaultStore{dbFakeStore: f, listErr: errors.New("jobs read down")}
-	if n := s.ActiveJobs(); n != 0 {
-		t.Fatalf("ActiveJobs with unreadable jobs = %d; want 0", n)
+	if n := s.ActiveJobs(); n != 1 {
+		t.Fatalf("ActiveJobs with unreadable per-run jobs = %d; want 1 (aggregate is authoritative)", n)
+	}
+	f.countRunningErr = errors.New("count read down")
+	if n := s.ActiveJobs(); n != unknownActiveJobs {
+		t.Fatalf("ActiveJobs with unreadable count = %d; want fail-closed %d", n, unknownActiveJobs)
+	}
+	if n, known := s.activeJobCount(); n != 0 || known {
+		t.Fatalf("activeJobCount with unreadable count = %d,%v; want 0,false", n, known)
 	}
 }
 

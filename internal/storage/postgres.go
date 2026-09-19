@@ -192,10 +192,9 @@ func (s *PostgresStore) Close() error {
 		s.fencePool = nil
 	}
 	s.leaderMu.Lock()
-	if s.leaderConn != nil {
-		_ = s.leaderConn.Close(context.Background())
-		s.leaderConn = nil
-	}
+	// Closing the session releases its advisory lock; clear the whole cache
+	// so a (mis)use after Close cannot observe a stale held-leadership view.
+	s.dropLeaderSessionLocked()
 	s.leaderMu.Unlock()
 	s.pool.Close()
 	return nil
@@ -1072,6 +1071,18 @@ func (s *PostgresStore) ListJobsByRun(ctx context.Context, runID string) ([]mode
 		out = append(out, j)
 	}
 	return out, rows.Err()
+}
+
+// CountRunningJobs returns the number of jobs holding a running lease. One
+// aggregate query: the drain count never depends on ListRuns pagination or on
+// per-run scans that could be skipped on error, so a DB-mode drain cannot
+// conclude "zero active jobs" from an incomplete view.
+func (s *PostgresStore) CountRunningJobs(ctx context.Context) (int, error) {
+	var n int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE status='running'`).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // ListJobsByEnvironment returns every job holding one (canonical repository
@@ -4129,6 +4140,25 @@ func (s *PostgresStore) SaveTestHistory(ctx context.Context, stats []byte) (int6
 	return version, err
 }
 
+// leaderProbeTimeout bounds the liveness round-trip that proves a cached
+// leader session still exists, and the best-effort unlock/close of a session
+// this store is dropping. It must stay short: the probe runs under leaderMu.
+const leaderProbeTimeout = 2 * time.Second
+
+// Leadership invariant (S1A): leaderConn is the ONLY proof of leadership
+// this store exposes. Its session-level advisory lock lives exactly as long
+// as that PostgreSQL session, so the cached leaderKey/leaderHeldUntil pair
+// is never trusted on its own: every cached-success path first executes a
+// round-trip on the SAME connection (pgx.Conn.Ping opens no new connection),
+// and any failure clears the cache and falls through to a real acquisition
+// attempt instead of returning true. A stale true could otherwise survive
+// until the local TTL while ANOTHER replica legitimately holds the lock —
+// split-brain leadership. The same rule drives the lifecycle: a session is
+// only closed through dropLeaderSessionLocked, which clears every cached
+// field first, and ReleaseLeadership clears the cache even when the unlock
+// round-trip fails (a failed unlock on a live session leaves the lock held,
+// so the session is closed to release it deterministically).
+//
 // TryAcquireLeadership takes a session-level Postgres advisory lock on a
 // dedicated connection held outside the pool. Advisory locks die with the
 // connection, so a crashed leader's lease is released automatically.
@@ -4142,15 +4172,26 @@ func (s *PostgresStore) TryAcquireLeadership(ctx context.Context, key string, tt
 	s.leaderMu.Lock()
 	defer s.leaderMu.Unlock()
 	if s.leaderConn != nil && s.leaderKey == key && time.Now().Before(s.leaderHeldUntil) {
-		s.leaderHeldUntil = time.Now().Add(ttl)
-		return true, nil
+		// Cached success: verify the session that took the lock is still
+		// alive before renewing. Derive the probe from the caller's context
+		// without its cancellation so a canceled caller cannot tear down a
+		// live leader session, while a dead session is detected regardless.
+		probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), leaderProbeTimeout)
+		err := s.leaderConn.Ping(probeCtx)
+		cancel()
+		if err == nil {
+			s.leaderHeldUntil = time.Now().Add(ttl)
+			return true, nil
+		}
+		// The session (and with it the advisory lock) is gone: another
+		// replica may already hold the key. Drop the stale cache and run
+		// the normal acquisition path; never report the cached true.
+		s.dropLeaderSessionLocked()
 	}
 	if s.leaderConn != nil {
-		_, _ = s.leaderConn.Exec(ctx, `SELECT pg_advisory_unlock(hashtext($1))`, s.leaderKey)
-		_ = s.leaderConn.Close(ctx)
-		s.leaderConn = nil
-		s.leaderKey = ""
-		s.leaderHeldUntil = time.Time{}
+		// Key change or local TTL elapsed: the old session must not stay
+		// cached as proof for a key it does not hold.
+		s.dropLeaderSessionLocked()
 	}
 	cc := s.pool.Config().ConnConfig
 	if cc == nil {
@@ -4162,11 +4203,11 @@ func (s *PostgresStore) TryAcquireLeadership(ctx context.Context, key string, tt
 	}
 	var got bool
 	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtext($1))`, key).Scan(&got); err != nil {
-		_ = conn.Close(ctx)
+		s.closeLeaderCandidateLocked(conn)
 		return false, err
 	}
 	if !got {
-		_ = conn.Close(ctx)
+		s.closeLeaderCandidateLocked(conn)
 		return false, nil
 	}
 	s.leaderConn = conn
@@ -4175,19 +4216,57 @@ func (s *PostgresStore) TryAcquireLeadership(ctx context.Context, key string, tt
 	return true, nil
 }
 
+// dropLeaderSessionLocked releases and closes the cached leader session,
+// clearing every cached field BEFORE the network round-trips so a concurrent
+// reader can never observe a closed connection as a held leadership proof.
+// The explicit unlock is best-effort: closing the session releases every
+// session-level advisory lock even when the unlock round-trip fails. Caller
+// holds leaderMu.
+func (s *PostgresStore) dropLeaderSessionLocked() {
+	conn, key := s.leaderConn, s.leaderKey
+	s.leaderConn = nil
+	s.leaderKey = ""
+	s.leaderHeldUntil = time.Time{}
+	if conn == nil {
+		return
+	}
+	if key != "" {
+		uctx, cancel := context.WithTimeout(context.Background(), leaderProbeTimeout)
+		_, _ = conn.Exec(uctx, `SELECT pg_advisory_unlock(hashtext($1))`, key)
+		cancel()
+	}
+	s.closeLeaderCandidateLocked(conn)
+}
+
+// closeLeaderCandidateLocked closes a leader-candidate connection that was
+// never cached (a failed acquisition attempt) with a bounded context, so a
+// wedged socket cannot pin leaderMu and no failed attempt leaks a session.
+// The caller must not be holding a cache entry for conn.
+func (s *PostgresStore) closeLeaderCandidateLocked(conn *pgx.Conn) {
+	if conn == nil {
+		return
+	}
+	cctx, cancel := context.WithTimeout(context.Background(), leaderProbeTimeout)
+	defer cancel()
+	_ = conn.Close(cctx)
+}
+
 func (s *PostgresStore) ReleaseLeadership(ctx context.Context, key string) error {
 	s.leaderMu.Lock()
 	defer s.leaderMu.Unlock()
 	if s.leaderConn == nil || s.leaderKey != key {
 		return nil
 	}
-	if _, err := s.leaderConn.Exec(ctx, `SELECT pg_advisory_unlock(hashtext($1))`, key); err != nil {
-		return err
-	}
-	err := s.leaderConn.Close(ctx)
+	conn := s.leaderConn
+	_, err := conn.Exec(ctx, `SELECT pg_advisory_unlock(hashtext($1))`, key)
+	// Clear the cache unconditionally, then close the session. When the
+	// unlock round-trip failed on a live connection the lock is still
+	// held, and the close is what releases it; when it failed because the
+	// session was already dead, the cached entry was stale anyway.
 	s.leaderConn = nil
 	s.leaderKey = ""
 	s.leaderHeldUntil = time.Time{}
+	s.closeLeaderCandidateLocked(conn)
 	return err
 }
 

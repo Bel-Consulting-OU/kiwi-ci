@@ -230,7 +230,7 @@ func TestCompletionEffectsFlushAfterRestart(t *testing.T) {
 	s2.DownstreamPipelineFetcher = func(ctx context.Context, repo, ref string) (string, error) {
 		return childPipeline, nil
 	}
-	s2.flushOutbox()
+	s2.flushOutbox(context.Background())
 
 	f.mu.Lock()
 	j := f.jobs[task.Job.ID]
@@ -290,7 +290,7 @@ func TestCompletionEffectsMemoryMarkersPreventDoubleAccounting(t *testing.T) {
 	s.DownstreamPipelineFetcher = func(ctx context.Context, repo, ref string) (string, error) {
 		return childPipeline, nil
 	}
-	s.flushOutbox()
+	s.flushOutbox(context.Background())
 	s.mu.Lock()
 	afterFlush := len(s.usage)
 	s.mu.Unlock()

@@ -53,7 +53,7 @@ func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 	dir := filepath.Join(s.store.Root, "snapshots", j.RunID, j.ID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	id, err := newID()
@@ -65,7 +65,7 @@ func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
 	dst := filepath.Join(dir, id+".tar.gz")
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	h := sha256.New()
@@ -74,18 +74,18 @@ func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
 	closeErr := f.Close()
 	if err := firstErr(copyErr, syncErr, closeErr); err != nil {
 		_ = os.Remove(tmp)
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	if err := os.Rename(tmp, dst); err != nil {
 		_ = os.Remove(tmp)
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	// The rename is only durable once the parent directory is fsynced.
 	if err := storage.SyncDir(dir); err != nil {
 		_ = os.Remove(dst)
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	// Build the manifest by scanning the stored archive (no extraction, no
@@ -93,7 +93,7 @@ func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
 	af, err := os.Open(dst)
 	if err != nil {
 		_ = os.Remove(dst)
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	m, err := snapshot.Parse(af)
@@ -113,7 +113,7 @@ func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
 	// through the checked atomic writer before the record is committed.
 	if err := storage.AtomicWriteFile(dst+".manifest.json", mb, 0o600); err != nil {
 		_ = os.Remove(dst)
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	rec := model.SnapshotRecord{
@@ -231,7 +231,7 @@ func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j mode
 	ctx := r.Context()
 	tmp, err := os.CreateTemp("", "kiwi-snapshot-*")
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	tmpName := tmp.Name()
@@ -240,11 +240,11 @@ func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j mode
 	h := sha256.New()
 	n, copyErr := io.Copy(io.MultiWriter(tmp, h), http.MaxBytesReader(w, r.Body, maxBlobBytes))
 	if err := firstErr(copyErr); err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	m, err := snapshot.Parse(tmp)
@@ -253,7 +253,7 @@ func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j mode
 		return
 	}
 	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	id, err := newID()
@@ -267,12 +267,12 @@ func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j mode
 	// idempotent.
 	stagedSum, sumErr := fileSHA256(tmp.Name())
 	if sumErr != nil {
-		http.Error(w, sumErr.Error(), 500)
+		s.internalError(w, r, sumErr, "")
 		return
 	}
 	releaseSnap, fenceErr := s.acquireDigestFence(ctx, stagedSum)
 	if fenceErr != nil {
-		http.Error(w, fenceErr.Error(), 500)
+		s.internalError(w, r, fenceErr, "")
 		return
 	}
 	defer releaseSnap()
@@ -368,7 +368,7 @@ func (s *Server) listSnapshots(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		} else if err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		if !s.requireRunRead(w, r, run) {
@@ -378,7 +378,7 @@ func (s *Server) listSnapshots(w http.ResponseWriter, r *http.Request) {
 		if ss, ok := s.DB.(storage.SnapshotStore); ok {
 			recs, err := ss.ListSnapshotsByRun(r.Context(), runID)
 			if err != nil {
-				http.Error(w, err.Error(), 500)
+				s.internalError(w, r, err, "")
 				return
 			}
 			for _, rec := range recs {
@@ -465,7 +465,7 @@ func (s *Server) downloadSnapshotDB(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	if !s.requireRunRead(w, r, run) {
@@ -478,7 +478,7 @@ func (s *Server) downloadSnapshotDB(w http.ResponseWriter, r *http.Request) {
 	}
 	recs, err := ss.ListSnapshotsByRun(ctx, runID)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	var rec model.SnapshotRecord

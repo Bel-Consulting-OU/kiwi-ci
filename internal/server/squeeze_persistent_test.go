@@ -284,7 +284,8 @@ func TestSqueezeLoadDrainFlagEdges(t *testing.T) {
 }
 
 // TestSqueezeDrainActiveJobsDB covers the DB-mode drain accounting with a
-// fake store, including the fallback when listing runs fails.
+// fake store: the aggregate running count is authoritative, and a failing
+// count is UNKNOWN (fail-closed non-zero), never a memory fallback.
 func TestSqueezeDrainActiveJobsDB(t *testing.T) {
 	s, err := NewPersistent("token", "token", t.TempDir())
 	if err != nil {
@@ -310,16 +311,25 @@ func TestSqueezeDrainActiveJobsDB(t *testing.T) {
 	if err := f.InsertJob(ctx, model.Job{ID: "job-3", RunID: "run-2", Status: model.StatusRunning}); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.ActiveJobs(); got != 1 {
-		t.Fatalf("ActiveJobs = %d, want 1 (only non-terminal runs count)", got)
+	// The aggregate counts every running job, independent of run status and
+	// pagination: job-1 and job-3 both hold a running lease.
+	if got := s.ActiveJobs(); got != 2 {
+		t.Fatalf("ActiveJobs = %d, want 2 (aggregate running count)", got)
 	}
-	// A failing store falls back to the in-memory count.
-	f.listRunsErr = errStaticKindMissing
+	// A failing store yields an UNKNOWN count, never a memory fallback and
+	// never zero: the drain seam keeps waiting.
+	f.countRunningErr = errStaticKindMissing
+	if got := s.ActiveJobs(); got != unknownActiveJobs {
+		t.Fatalf("ActiveJobs with failing count = %d, want fail-closed %d", got, unknownActiveJobs)
+	}
+	if n, known := s.activeJobCount(); known || n != 0 {
+		t.Fatalf("activeJobCount with failing store = %d,%v; want 0,false", n, known)
+	}
 	s.mu.Lock()
 	s.jobs["mem-1"] = model.Job{ID: "mem-1", Status: model.StatusRunning}
 	s.mu.Unlock()
-	if got := s.ActiveJobs(); got != 1 {
-		t.Fatalf("ActiveJobs fallback = %d, want 1", got)
+	if got := s.ActiveJobs(); got != unknownActiveJobs {
+		t.Fatalf("ActiveJobs must not fall back to memory in DB mode: %d", got)
 	}
 }
 

@@ -439,15 +439,6 @@ func workflowName(w Workflow) string {
 	return strings.TrimSuffix(w.File, filepath.Ext(w.File))
 }
 
-func runsOnPullRequest(events []string) bool {
-	for _, ev := range events {
-		if ev == "pull_request" || strings.HasPrefix(ev, "pull_request") {
-			return true
-		}
-	}
-	return false
-}
-
 // requiredContextEvent maps a Woodpecker status-context event segment to the
 // workflow `when` event it is produced for. Woodpecker maps pull_request to
 // the literal `pr` in status contexts (server/forge/common/status.go).

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -58,7 +59,7 @@ func enrollBodyFor(t *testing.T, runnerID string, labels []string) []byte {
 func TestEnrollGrantLabelMismatchDoesNotConsumeGrant(t *testing.T) {
 	t.Run("memory", func(t *testing.T) {
 		s := grantTestServer(t)
-		raw, err := s.CreateEnrollGrant(time.Hour, []string{"os:macos", "arm64"})
+		raw, err := s.CreateEnrollGrant(context.Background(), time.Hour, []string{"os:macos", "arm64"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -89,7 +90,7 @@ func TestEnrollGrantLabelMismatchDoesNotConsumeGrant(t *testing.T) {
 		if err := s.SwitchToDB(f); err != nil {
 			t.Fatal(err)
 		}
-		raw, err := s.CreateEnrollGrant(time.Hour, []string{"os:macos", "arm64"})
+		raw, err := s.CreateEnrollGrant(context.Background(), time.Hour, []string{"os:macos", "arm64"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -139,16 +140,16 @@ func TestEnrollGrantAllowedLabelsContract(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			s := grantTestServer(t)
-			raw, err := s.CreateEnrollGrant(time.Hour, tc.allowed)
+			raw, err := s.CreateEnrollGrant(context.Background(), time.Hour, tc.allowed)
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = s.consumeEnrollGrant(raw, tc.request)
+			err = s.consumeEnrollGrant(context.Background(), raw, tc.request)
 			if tc.permit {
 				if err != nil {
 					t.Fatalf("allowed request rejected: %v", err)
 				}
-				if err := s.consumeEnrollGrant(raw, tc.request); err == nil {
+				if err := s.consumeEnrollGrant(context.Background(), raw, tc.request); err == nil {
 					t.Fatal("grant consumed twice")
 				}
 				return
@@ -160,7 +161,7 @@ func TestEnrollGrantAllowedLabelsContract(t *testing.T) {
 				t.Fatalf("rejection error = %q, want the unpermitted-label message", err)
 			}
 			// The rejected attempt must leave the grant consumable.
-			if err := s.consumeEnrollGrant(raw, tc.allowed); err != nil {
+			if err := s.consumeEnrollGrant(context.Background(), raw, tc.allowed); err != nil {
 				t.Fatalf("rejection burned the grant: %v", err)
 			}
 		})
@@ -184,7 +185,7 @@ func TestEnrollGrantPersistFailureRollsBackConsumption(t *testing.T) {
 	}
 	s.RunnerCA = ca
 	s.RunnerEnrollToken = ""
-	raw, err := s.CreateEnrollGrant(time.Hour, nil)
+	raw, err := s.CreateEnrollGrant(context.Background(), time.Hour, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,10 +242,10 @@ func TestEnrollGrantPersistFailureRollsBackConsumption(t *testing.T) {
 	if !ok || loaded.Used {
 		t.Fatalf("restart loaded grant = %+v (present=%v), want unused", loaded, ok)
 	}
-	if err := s2.consumeEnrollGrant(raw, nil); err != nil {
+	if err := s2.consumeEnrollGrant(context.Background(), raw, nil); err != nil {
 		t.Fatalf("consume after restart: %v", err)
 	}
-	if err := s2.consumeEnrollGrant(raw, nil); err == nil {
+	if err := s2.consumeEnrollGrant(context.Background(), raw, nil); err == nil {
 		t.Fatal("grant consumed twice after restart")
 	}
 }
@@ -253,7 +254,7 @@ func TestEnrollGrantPersistFailureRollsBackConsumption(t *testing.T) {
 // single-use arbitration under concurrency: exactly one enrollment wins.
 func TestEnrollGrantConcurrentConsumptionMemory(t *testing.T) {
 	s := grantTestServer(t)
-	raw, err := s.CreateEnrollGrant(time.Hour, nil)
+	raw, err := s.CreateEnrollGrant(context.Background(), time.Hour, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +310,7 @@ func TestEnrollGrantGarbageAndExpiredTokens(t *testing.T) {
 		}
 	}
 	// Expired (memory): forcing the stored expiry into the past refuses.
-	raw, err := s.CreateEnrollGrant(time.Hour, nil)
+	raw, err := s.CreateEnrollGrant(context.Background(), time.Hour, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,7 +333,7 @@ func TestEnrollGrantGarbageAndExpiredTokens(t *testing.T) {
 	if err := dbs.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
-	dbRaw, err := dbs.CreateEnrollGrant(time.Hour, nil)
+	dbRaw, err := dbs.CreateEnrollGrant(context.Background(), time.Hour, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -357,13 +358,13 @@ func TestEnrollGrantDBModeRequiresDurableStore(t *testing.T) {
 	f := newDBFakeStore()
 	s := New("runner-tok")
 	s.DB = grantlessStore{Store: f}
-	if _, err := s.CreateEnrollGrant(time.Hour, nil); err == nil {
+	if _, err := s.CreateEnrollGrant(context.Background(), time.Hour, nil); err == nil {
 		t.Fatal("DB mode without a durable grant store minted a memory grant")
 	}
-	if s.enrollGrantOK(strings.Repeat("a", 64)) {
+	if s.enrollGrantOK(context.Background(), strings.Repeat("a", 64)) {
 		t.Fatal("DB mode without a durable grant store validated a grant")
 	}
-	if err := s.consumeEnrollGrant(strings.Repeat("a", 64), nil); err == nil {
+	if err := s.consumeEnrollGrant(context.Background(), strings.Repeat("a", 64), nil); err == nil {
 		t.Fatal("DB mode without a durable grant store consumed a grant")
 	}
 	// The grantless base store itself still works for the base contract.
@@ -384,7 +385,7 @@ func TestEnrollGrantExtraLabelsRejected(t *testing.T) {
 	createProfile(t, s, model.RunnerProfile{ID: "plain", Labels: []string{"os:linux"}, Capabilities: []string{"container"}, MaxCapacity: 1})
 	_, cert := pkiSignRunner(t, s.RunnerCA, "runner-extra")
 	bindSerial(t, s, "plain", cert.SerialNumber.Text(16))
-	raw, err := s.CreateEnrollGrant(time.Hour, []string{"os:linux"})
+	raw, err := s.CreateEnrollGrant(context.Background(), time.Hour, []string{"os:linux"})
 	if err != nil {
 		t.Fatal(err)
 	}

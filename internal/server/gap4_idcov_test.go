@@ -185,8 +185,14 @@ func TestIDCovCompleteEnqueueEffectFailures(t *testing.T) {
 		base.mu.Unlock()
 		s.DB = &idcovDownstreamErrStore{dbFakeStore: base}
 		w := completeTask(t, s, task, runnerID, "success")
-		if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "downstream") {
+		if w.Code != http.StatusInternalServerError {
 			t.Fatalf("complete with a failing downstream insert = %d: %s", w.Code, w.Body.String())
+		}
+		// Adapted for the 5xx hardening: the store error text used to be the
+		// response body ("downstream link insert failed"). The body must now
+		// be opaque; the detail is logged with the request ID.
+		if strings.Contains(w.Body.String(), "downstream") {
+			t.Fatalf("internal store error leaked to the client: %s", w.Body.String())
 		}
 	})
 }

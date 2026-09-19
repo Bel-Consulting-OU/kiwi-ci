@@ -21,6 +21,10 @@ type drainStatus struct {
 	Draining   bool   `json:"draining"`
 	Reason     string `json:"reason,omitempty"`
 	ActiveJobs int    `json:"active_jobs"`
+	// ActiveJobsKnown is false when the store could not produce the
+	// in-flight count. ActiveJobs is then the fail-closed reporting value
+	// (never zero) and must not be read as "drained".
+	ActiveJobsKnown bool `json:"active_jobs_known"`
 }
 
 // isDraining reports the drain state under the drain mutex.
@@ -44,27 +48,54 @@ func (s *Server) drainReasonOf() string {
 // The app agent calls this from its --drain-on-sigterm handler and then
 // polls ActiveJobs() until the in-flight count reaches zero (or the 30s
 // budget expires) before exiting.
+//
+// It is the no-error signal-path entry point required by the drainableServer
+// seam in internal/app: a persistence failure is logged prominently by
+// beginDrain and the in-memory state stays set (fail closed to draining),
+// but the process must NOT describe itself as durably drained — a restart
+// could resume taking leases. The HTTP handler uses beginDrain directly to
+// answer 503 on that failure.
 func (s *Server) BeginDrain(reason string) {
+	_ = s.beginDrain(reason)
+}
+
+// beginDrain sets the in-memory drain state, persists drain.flag and reports
+// the persistence outcome. The in-memory state is set FIRST and cleared by
+// nothing here: a drain request must fail closed to draining (refusing new
+// leases) even when the flag cannot be written, because resuming service
+// after an operator/signal drain would be worse. On error a prominent log
+// states that the node is draining in memory only.
+func (s *Server) beginDrain(reason string) error {
 	s.drainMu.Lock()
 	s.draining = true
 	s.drainReason = reason
 	s.drainMu.Unlock()
-	s.persistDrainFlagLocked()
-	s.auditLocked("server.drain", "admin", "", "", "control plane draining", map[string]string{"reason": reason})
+	err := s.persistDrainFlagLocked()
+	meta := map[string]string{"reason": reason}
+	if err != nil {
+		meta["durable"] = "false"
+		s.logError("drain: drain.flag was NOT persisted; the node is draining in memory only and a restart may resume taking leases", "reason", reason, "error", err.Error())
+	}
+	s.auditLocked("server.drain", "admin", "", "", "control plane draining", meta)
+	return err
 }
 
-// persistDrainFlagLocked writes the drain state into dataDir/drain.flag.
-func (s *Server) persistDrainFlagLocked() {
+// persistDrainFlagLocked writes the drain state into dataDir/drain.flag and
+// reports whether the flag became durable. A no-op (nil) when no data dir is
+// configured: there is no file to become durable and a restarted process
+// starts clean. Callers must not acknowledge a durable drain when this
+// returns an error.
+func (s *Server) persistDrainFlagLocked() error {
 	if s.dataDir == "" {
-		return
+		return nil
 	}
 	s.drainMu.Lock()
 	b, err := jsonMarshal(map[string]string{"reason": s.drainReason})
 	s.drainMu.Unlock()
 	if err != nil {
-		return
+		return err
 	}
-	_ = writeFileAtomic(joinDataDir(s.dataDir, drainFlagFile), b, 0o600)
+	return writeFileAtomic(joinDataDir(s.dataDir, drainFlagFile), b, 0o600)
 }
 
 // loadDrainFlag restores a persisted drain state at startup.
@@ -92,35 +123,42 @@ func (s *Server) loadDrainFlag(dataDir string) error {
 	return nil
 }
 
-// ActiveJobs counts jobs currently holding a running lease (the in-flight
-// work a drain must wait for). Memory mode reads the in-memory maps; DB
-// mode counts running jobs across non-terminal runs through the store.
-func (s *Server) ActiveJobs() int {
+// unknownActiveJobs is the fail-closed value reported when the store cannot
+// prove the in-flight count. The drain seam in internal/app polls
+// ActiveJobs() and only stops at exactly zero, so an UNKNOWN count must
+// never render as zero: it keeps the drain waiting (bounded by the explicit
+// shutdown timeout) instead of falsely declaring the node drained.
+const unknownActiveJobs = 1
+
+// activeJobCount returns the in-flight job count and whether it is known.
+// Memory mode is authoritative over the in-memory maps. DB mode asks the
+// store for one aggregate running count: an error means UNKNOWN, never zero.
+// The previous implementation listed runs (capped at 10000) and silently
+// continued past per-run errors, so a transient failure or the ceiling could
+// report zero and let a shutdown proceed while jobs were still running.
+func (s *Server) activeJobCount() (int, bool) {
 	if s.DB != nil {
 		ctx, cancel := contextTimeout(5 * time.Second)
 		defer cancel()
-		runs, err := s.DB.ListRuns(ctx, 10000)
+		n, err := s.DB.CountRunningJobs(ctx)
 		if err != nil {
-			return s.activeJobsMemory()
+			s.logError("drain: running-job count unavailable; treating drain as not proven", "error", err.Error())
+			return 0, false
 		}
-		total := 0
-		for _, run := range runs {
-			if run.Status.Terminal() {
-				continue
-			}
-			jobs, err := s.DB.ListJobsByRun(ctx, run.ID)
-			if err != nil {
-				continue
-			}
-			for _, j := range jobs {
-				if j.Status == model.StatusRunning {
-					total++
-				}
-			}
-		}
-		return total
+		return n, true
 	}
-	return s.activeJobsMemory()
+	return s.activeJobsMemory(), true
+}
+
+// ActiveJobs reports the in-flight job count for the drain seam and the
+// drain status endpoint. An unknown store count is reported as
+// unknownActiveJobs so a drain can never observe zero from a failure.
+func (s *Server) ActiveJobs() int {
+	n, known := s.activeJobCount()
+	if !known {
+		return unknownActiveJobs
+	}
+	return n
 }
 
 func (s *Server) activeJobsMemory() int {
@@ -145,7 +183,15 @@ func (s *Server) drainServer(w http.ResponseWriter, r *http.Request) {
 	if reason == "" {
 		reason = "administrative drain"
 	}
-	s.BeginDrain(reason)
+	if err := s.beginDrain(reason); err != nil {
+		// Fail closed: the node is draining in memory (no new leases) but
+		// drain.flag could not be written, so a restart would resume taking
+		// leases. Answer the readiness degraded pattern instead of
+		// acknowledging a durable drain. A retry persists and acks.
+		w.Header().Set("X-Kiwi-State", "degraded")
+		http.Error(w, statePersistenceDegradedBody, http.StatusServiceUnavailable)
+		return
+	}
 	writeJSON(w, http.StatusOK, s.drainStatusSnapshot())
 }
 
@@ -155,10 +201,15 @@ func (s *Server) drainStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) drainStatusSnapshot() drainStatus {
+	n, known := s.activeJobCount()
+	if !known {
+		n = unknownActiveJobs
+	}
 	return drainStatus{
-		Draining:   s.isDraining(),
-		Reason:     s.drainReasonOf(),
-		ActiveJobs: s.ActiveJobs(),
+		Draining:        s.isDraining(),
+		Reason:          s.drainReasonOf(),
+		ActiveJobs:      n,
+		ActiveJobsKnown: known,
 	}
 }
 

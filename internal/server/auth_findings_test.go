@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -204,7 +205,7 @@ func TestEnrollGrants(t *testing.T) {
 	}
 	s.RunnerCA = ca
 
-	raw, err := s.CreateEnrollGrant(time.Hour, []string{"os:macos", "arm64"})
+	raw, err := s.CreateEnrollGrant(context.Background(), time.Hour, []string{"os:macos", "arm64"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,10 +267,10 @@ func TestEnrollGrants(t *testing.T) {
 	}
 
 	// Expired grants are rejected by the tier gate.
-	if _, err := s.CreateEnrollGrant(-0, nil); err == nil {
+	if _, err := s.CreateEnrollGrant(context.Background(), -0, nil); err == nil {
 		t.Fatal("zero ttl must be rejected")
 	}
-	expired, err := s.CreateEnrollGrant(time.Nanosecond, nil)
+	expired, err := s.CreateEnrollGrant(context.Background(), time.Nanosecond, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,7 +297,7 @@ func TestEnrollGrants(t *testing.T) {
 // (expiry and bound labels).
 func TestCreateEnrollGrantState(t *testing.T) {
 	s := New("t")
-	raw, err := s.CreateEnrollGrant(time.Minute, []string{"a", "b"})
+	raw, err := s.CreateEnrollGrant(context.Background(), time.Minute, []string{"a", "b"})
 	if err != nil {
 		t.Fatal(err)
 	}

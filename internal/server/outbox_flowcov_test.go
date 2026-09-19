@@ -171,7 +171,7 @@ func TestFlowOutboxAppendJSONLBranches(t *testing.T) {
 	// Durable-first: Enqueue surfaces the persistence error and the item is
 	// NOT queued — the side effect must never be dispatchable before the
 	// record of it exists.
-	if err := o3.Enqueue(forge.OutboxItem{Kind: forge.OutboxKindWebhookCall}); err == nil {
+	if err := o3.Enqueue(context.Background(), forge.OutboxItem{Kind: forge.OutboxKindWebhookCall}); err == nil {
 		t.Fatal("Enqueue must surface the fs persistence error")
 	}
 	if len(o3.Pending()) != 0 {

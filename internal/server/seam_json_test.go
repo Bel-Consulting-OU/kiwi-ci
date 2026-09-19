@@ -89,7 +89,7 @@ func TestSeamJSONCompletionEffects(t *testing.T) {
 	run := model.Run{ID: "run-1"}
 	restore := seamJSON(t)
 	defer restore()
-	if err := s.enqueueCompletionEffects(j, run); !errors.Is(err, errSeamJSON) {
+	if err := s.enqueueCompletionEffects(context.Background(), j, run); !errors.Is(err, errSeamJSON) {
 		t.Fatalf("enqueueCompletionEffects = %v; want encoder error", err)
 	}
 	// The local variant has no error return: it must drop the intents
@@ -206,7 +206,9 @@ func TestSeamJSONDrainFlagPersistDropsFlag(t *testing.T) {
 	s.drainReason = "maintenance"
 	restore := seamJSON(t)
 	defer restore()
-	s.persistDrainFlagLocked()
+	if err := s.persistDrainFlagLocked(); err == nil {
+		t.Fatal("persistDrainFlagLocked with failing encoder = nil error; want the encoder failure")
+	}
 	// The flag file must not exist: a partially encoded flag is never
 	// persisted.
 	if b, err := readFileIfExists(s.dataDir, drainFlagFile); err == nil && len(b) > 0 {

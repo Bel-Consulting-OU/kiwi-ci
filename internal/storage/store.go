@@ -128,6 +128,14 @@ type Store interface {
 	InsertJob(ctx context.Context, job model.Job) error
 	GetJob(ctx context.Context, id string) (model.Job, error)
 	ListJobsByRun(ctx context.Context, runID string) ([]model.Job, error)
+	// CountRunningJobs returns the number of jobs currently holding a
+	// running lease (status='running') across every run, including
+	// non-terminal runs. It is the authoritative in-flight count for a
+	// graceful drain in DB mode: one aggregate query that never depends on
+	// run pagination or per-run scans, so a drain can never conclude
+	// "zero active jobs" from an incomplete or errored walk. An error means
+	// the count is UNKNOWN, never zero.
+	CountRunningJobs(ctx context.Context) (int, error)
 	// ListJobsByEnvironment returns all jobs holding the given
 	// repository-scoped environment, for environment concurrency accounting.
 	// repoID is the CANONICAL repository identity ("<host>/<owner>/<name>",

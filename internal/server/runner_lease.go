@@ -53,6 +53,6 @@ func (s *Server) writeLeaseAuthError(w http.ResponseWriter, r *http.Request, err
 	case errors.Is(err, storage.ErrNotFound):
 		http.NotFound(w, r)
 	default:
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		s.internalError(w, r, err, "")
 	}
 }

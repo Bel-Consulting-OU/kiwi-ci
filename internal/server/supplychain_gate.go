@@ -158,12 +158,12 @@ func (s *Server) uploadSBOM(w http.ResponseWriter, r *http.Request, j model.Job,
 		}
 		releaseGate, ferr := s.acquireDigestFence(ctx, sum)
 		if ferr != nil {
-			http.Error(w, ferr.Error(), 500)
+			s.internalError(w, r, ferr, "")
 			return
 		}
 		defer releaseGate()
 		if _, perr := s.CAS.Put(ctx, bytes.NewReader(body)); perr != nil {
-			http.Error(w, perr.Error(), 500)
+			s.internalError(w, r, perr, "")
 			return
 		}
 		// Durable pending state BEFORE the 201: a replica restart or a
@@ -188,12 +188,12 @@ func (s *Server) uploadSBOM(w http.ResponseWriter, r *http.Request, j model.Job,
 	}
 	dir := filepath.Join(s.store.Root, "artifacts", j.RunID, j.ID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	sidecar := artifactSidecarPath(dir, base, "sbom")
 	if err := writeFileAtomic(sidecar, body, 0o600); err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	// Dev-mode mirror of the durable pending row (fs mode has no shared
@@ -257,12 +257,12 @@ func (s *Server) uploadSigstore(w http.ResponseWriter, r *http.Request, j model.
 		}
 		releaseGate, ferr := s.acquireDigestFence(ctx, sum)
 		if ferr != nil {
-			http.Error(w, ferr.Error(), 500)
+			s.internalError(w, r, ferr, "")
 			return
 		}
 		defer releaseGate()
 		if _, perr := s.CAS.Put(ctx, bytes.NewReader(body)); perr != nil {
-			http.Error(w, perr.Error(), 500)
+			s.internalError(w, r, perr, "")
 			return
 		}
 		if err := s.rememberPendingSidecar(ctx, j, base, storage.ArtifactSidecarKindSigstore, sum); err != nil {
@@ -281,12 +281,12 @@ func (s *Server) uploadSigstore(w http.ResponseWriter, r *http.Request, j model.
 	}
 	dir := filepath.Join(s.store.Root, "artifacts", j.RunID, j.ID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	sidecar := artifactSidecarPath(dir, base, "sigstore")
 	if err := writeFileAtomic(sidecar, body, 0o600); err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	// Dev-mode mirror of the durable pending row: see uploadSBOM.

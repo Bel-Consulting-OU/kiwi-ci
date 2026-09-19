@@ -275,7 +275,7 @@ func TestHAConcurrentOutboxFlushDisjoint(t *testing.T) {
 	ids := make([]string, 0, items)
 	for i := 0; i < items; i++ {
 		it := forge.OutboxItem{Kind: forge.OutboxKindGitHubCheck, Payload: []byte(`{}`)}
-		if err := c.s[0].outbox.Enqueue(it); err != nil {
+		if err := c.s[0].outbox.Enqueue(context.Background(), it); err != nil {
 			t.Fatal(err)
 		}
 		ids = append(ids, c.s[0].outbox.Pending()[i].ID)
@@ -510,7 +510,7 @@ func TestHACompletionEffectsConvergeAcrossReplicas(t *testing.T) {
 	if err := c.s[1].outbox.ReplayDB(context.Background()); err != nil {
 		t.Fatalf("replay db: %v", err)
 	}
-	c.s[1].flushOutbox()
+	c.s[1].flushOutbox(context.Background())
 	c.f.mu.Lock()
 	j = c.f.jobs[task.Job.ID]
 	_, hasLink := c.f.downstreamLinks[task.Job.ID+"\x00acme/child\x00refs/heads/main"]

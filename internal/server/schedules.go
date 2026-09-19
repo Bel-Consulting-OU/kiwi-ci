@@ -438,7 +438,7 @@ func (s *Server) listSchedules(w http.ResponseWriter, r *http.Request) {
 	if ss, ok := s.scheduleStoreDB(); ok {
 		out, err := ss.ListSchedules(r.Context())
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
@@ -512,7 +512,7 @@ func (s *Server) upsertSchedule(w http.ResponseWriter, r *http.Request) {
 		if in.ID != "" {
 			existing, err := ss.ListSchedules(r.Context())
 			if err != nil {
-				http.Error(w, err.Error(), 500)
+				s.internalError(w, r, err, "")
 				return
 			}
 			for _, e := range existing {
@@ -544,7 +544,7 @@ func (s *Server) upsertSchedule(w http.ResponseWriter, r *http.Request) {
 		sc.Enabled = enabled
 		sc.CreatedBy = actorFrom(r)
 		if err := ss.UpsertSchedule(r.Context(), sc); err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		s.mu.Lock()
@@ -591,7 +591,7 @@ func (s *Server) upsertSchedule(w http.ResponseWriter, r *http.Request) {
 				delete(s.schedules, sc.ID)
 			}
 			s.mu.Unlock()
-			http.Error(w, persistErr.Error(), 500)
+			s.internalError(w, r, persistErr, "")
 			return
 		}
 		s.mu.Unlock()
@@ -615,7 +615,7 @@ func (s *Server) triggerSchedule(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	// Manual trigger re-checks the trusted_run grant for TRUSTED schedules:
@@ -628,7 +628,7 @@ func (s *Server) triggerSchedule(w http.ResponseWriter, r *http.Request) {
 	nominal := time.Now().UTC().Truncate(time.Minute)
 	run, fired, err := s.fireSchedule(r.Context(), sc, nominal)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		s.internalError(w, r, err, "")
 		return
 	}
 	if !fired {

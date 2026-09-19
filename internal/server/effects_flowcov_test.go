@@ -296,7 +296,7 @@ func TestFlowEffectsForgeStatusRunError(t *testing.T) {
 
 func TestFlowEffectsEnqueueCompletionEffects(t *testing.T) {
 	s := New("tok")
-	if err := s.enqueueCompletionEffects(model.Job{ID: "j"}, model.Run{ID: "r"}); err != nil {
+	if err := s.enqueueCompletionEffects(context.Background(), model.Job{ID: "j"}, model.Run{ID: "r"}); err != nil {
 		t.Fatalf("memory effect enqueue = %v", err)
 	}
 	// Split design: TWO deterministic intents per completion — the internal
@@ -318,7 +318,7 @@ func TestFlowEffectsEnqueueCompletionEffects(t *testing.T) {
 	f.mu.Lock()
 	f.outboxAppendErr = errors.New("outbox append down")
 	f.mu.Unlock()
-	if err := s2.enqueueCompletionEffects(model.Job{ID: "j"}, model.Run{ID: "r"}); err == nil {
+	if err := s2.enqueueCompletionEffects(context.Background(), model.Job{ID: "j"}, model.Run{ID: "r"}); err == nil {
 		t.Fatal("outbox append failure must propagate")
 	}
 	f.mu.Lock()

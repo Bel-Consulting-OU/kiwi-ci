@@ -764,6 +764,18 @@ func (f *fakeStore) ListJobsByRun(ctx context.Context, runID string) ([]model.Jo
 	return out, nil
 }
 
+func (f *fakeStore) CountRunningJobs(ctx context.Context) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, j := range f.jobs {
+		if j.Status == model.StatusRunning {
+			n++
+		}
+	}
+	return n, nil
+}
+
 func (f *fakeStore) ListQueuedJobs(ctx context.Context) ([]model.Job, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

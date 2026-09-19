@@ -214,7 +214,7 @@ func TestDownstreamLaunchExactlyOnceAcrossRestart(t *testing.T) {
 	if downstreamPendingItem(t, s2).Kind != forge.OutboxKindDownstream {
 		t.Fatalf("replayed intents missing the downstream intent: %d items", len(replayed))
 	}
-	s2.flushOutbox()
+	s2.flushOutbox(context.Background())
 	if got := childRunsOf(s2); len(got) != 1 {
 		t.Fatalf("child runs after replay = %d, want exactly 1 (no duplicate launch)", len(got))
 	}
@@ -233,7 +233,7 @@ func TestDownstreamWaitAggregation(t *testing.T) {
 	s.DownstreamPipelineFetcher = func(ctx context.Context, repo, ref string) (string, error) {
 		return childPipeline, nil
 	}
-	s.flushOutbox()
+	s.flushOutbox(context.Background())
 	children := childRunsOf(s)
 	if len(children) != 1 {
 		t.Fatalf("child runs = %d, want 1", len(children))
@@ -277,7 +277,7 @@ func TestDownstreamWaitChildFailure(t *testing.T) {
 	s.DownstreamPipelineFetcher = func(ctx context.Context, repo, ref string) (string, error) {
 		return childPipeline, nil
 	}
-	s.flushOutbox()
+	s.flushOutbox(context.Background())
 	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/"+runnerID+"/next", "token", "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("lease child job = %d: %s", w.Code, w.Body.String())
@@ -342,7 +342,7 @@ func TestDownstreamDBModeExactlyOnce(t *testing.T) {
 	if err := s2.dispatchOutbox(context.Background(), item); err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
-	s2.flushOutbox()
+	s2.flushOutbox(context.Background())
 	f.mu.Lock()
 	childCount := 0
 	for _, r := range f.runs {
@@ -386,7 +386,7 @@ func TestDownstreamRefusedWithoutTargetConsent(t *testing.T) {
 		fetched = true
 		return childPipeline, nil
 	}
-	s.flushOutbox()
+	s.flushOutbox(context.Background())
 	if fetched {
 		t.Fatal("pipeline fetched despite missing target consent")
 	}
@@ -425,7 +425,7 @@ func TestDownstreamAllowlistedSourceUntrustedChild(t *testing.T) {
 	s.DownstreamPipelineFetcher = func(ctx context.Context, repo, ref string) (string, error) {
 		return childPipeline, nil
 	}
-	s.flushOutbox()
+	s.flushOutbox(context.Background())
 	children := childRunsOf(s)
 	if len(children) != 1 {
 		t.Fatalf("child runs = %d, want 1", len(children))
@@ -447,7 +447,7 @@ func TestDownstreamTrustedIngressPreservesTrust(t *testing.T) {
 	s.DownstreamPipelineFetcher = func(ctx context.Context, repo, ref string) (string, error) {
 		return childPipeline, nil
 	}
-	s.flushOutbox()
+	s.flushOutbox(context.Background())
 	children := childRunsOf(s)
 	if len(children) != 1 {
 		t.Fatalf("child runs = %d, want 1", len(children))
@@ -481,7 +481,7 @@ func TestDownstreamRefusedDBMode(t *testing.T) {
 	if w := completeTask(t, s, task, runnerID, "success"); w.Code != http.StatusNoContent {
 		t.Fatalf("complete = %d: %s", w.Code, w.Body.String())
 	}
-	s.flushOutbox()
+	s.flushOutbox(context.Background())
 	f.mu.Lock()
 	childCount := 0
 	refused := false

@@ -156,7 +156,7 @@ func (s *Server) enqueueDownstreamIntent(ctx context.Context, j model.Job, run m
 			return nil
 		}
 	}
-	if err := s.outbox.Enqueue(item); err != nil {
+	if err := s.outbox.Enqueue(ctx, item); err != nil {
 		if s.outbox.HasIntent(item.ID) {
 			// Already queued in this process (concurrent replay): the
 			// deterministic ID means the durable copy is the same intent.

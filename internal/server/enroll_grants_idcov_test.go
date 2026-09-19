@@ -64,14 +64,14 @@ func grantServer(t *testing.T) *Server {
 // persistence, DB minting and every failure branch.
 func TestIDCovCreateEnrollGrantPaths(t *testing.T) {
 	s := grantServer(t)
-	if _, err := s.CreateEnrollGrant(0, nil); err == nil {
+	if _, err := s.CreateEnrollGrant(context.Background(), 0, nil); err == nil {
 		t.Fatal("non-positive ttl = nil error")
 	}
-	if _, err := s.CreateEnrollGrant(-time.Minute, nil); err == nil {
+	if _, err := s.CreateEnrollGrant(context.Background(), -time.Minute, nil); err == nil {
 		t.Fatal("negative ttl = nil error")
 	}
 	s.EnrollGrants = nil
-	tok, err := s.CreateEnrollGrant(time.Hour, []string{"container"})
+	tok, err := s.CreateEnrollGrant(context.Background(), time.Hour, []string{"container"})
 	if err != nil || tok == "" {
 		t.Fatalf("memory grant = %q, %v", tok, err)
 	}
@@ -92,7 +92,7 @@ func TestIDCovCreateEnrollGrantPaths(t *testing.T) {
 	}
 	// Expired grants are pruned on mint.
 	s.EnrollGrants[auth.TokenDigest("stale")] = EnrollGrant{ExpiresAt: time.Now().Add(-time.Minute)}
-	if _, err := s.CreateEnrollGrant(time.Hour, nil); err != nil {
+	if _, err := s.CreateEnrollGrant(context.Background(), time.Hour, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := s.EnrollGrants[auth.TokenDigest("stale")]; ok {
@@ -101,7 +101,7 @@ func TestIDCovCreateEnrollGrantPaths(t *testing.T) {
 	// A persistence failure rolls the in-memory grant back.
 	orig := persistEnrollGrantsFunc
 	persistEnrollGrantsFunc = func(*Server) error { return errors.New("disk full") }
-	if _, err := s.CreateEnrollGrant(time.Hour, nil); err == nil {
+	if _, err := s.CreateEnrollGrant(context.Background(), time.Hour, nil); err == nil {
 		t.Fatal("persist failure = nil error")
 	}
 	persistEnrollGrantsFunc = orig
@@ -109,19 +109,19 @@ func TestIDCovCreateEnrollGrantPaths(t *testing.T) {
 	// DB mode requires the durable grant store.
 	s3 := New("t")
 	s3.DB = idcovGrantStoreOnly{Store: newDBFakeStore()}
-	if _, err := s3.CreateEnrollGrant(time.Hour, nil); err == nil || !strings.Contains(err.Error(), "does not support enrollment grants") {
+	if _, err := s3.CreateEnrollGrant(context.Background(), time.Hour, nil); err == nil || !strings.Contains(err.Error(), "does not support enrollment grants") {
 		t.Fatalf("DB without grant store = %v", err)
 	}
 	// A store write failure propagates.
 	fault := &enrollFaultStore{dbFakeStore: newDBFakeStore(), putErr: errors.New("write failed")}
 	s4 := New("t")
 	s4.DB = fault
-	if _, err := s4.CreateEnrollGrant(time.Hour, nil); err == nil {
+	if _, err := s4.CreateEnrollGrant(context.Background(), time.Hour, nil); err == nil {
 		t.Fatal("DB put failure = nil error")
 	}
 	// Success stores the digest durably.
 	s4.DB = fault.dbFakeStore
-	tok4, err := s4.CreateEnrollGrant(time.Hour, []string{"a"})
+	tok4, err := s4.CreateEnrollGrant(context.Background(), time.Hour, []string{"a"})
 	if err != nil || tok4 == "" {
 		t.Fatalf("DB grant = %q, %v", tok4, err)
 	}
@@ -133,20 +133,20 @@ func TestIDCovCreateEnrollGrantPaths(t *testing.T) {
 // TestIDCovEnrollGrantOKPaths covers the tier gate validation in both modes.
 func TestIDCovEnrollGrantOKPaths(t *testing.T) {
 	s := grantServer(t)
-	if s.enrollGrantOK("") {
+	if s.enrollGrantOK(context.Background(), "") {
 		t.Fatal("empty token accepted")
 	}
-	if s.enrollGrantOK("unknown") {
+	if s.enrollGrantOK(context.Background(), "unknown") {
 		t.Fatal("unknown token accepted")
 	}
-	live, err := s.CreateEnrollGrant(time.Hour, nil)
+	live, err := s.CreateEnrollGrant(context.Background(), time.Hour, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !s.enrollGrantOK(live) {
+	if !s.enrollGrantOK(context.Background(), live) {
 		t.Fatal("live grant rejected")
 	}
-	used, err := s.CreateEnrollGrant(time.Hour, nil)
+	used, err := s.CreateEnrollGrant(context.Background(), time.Hour, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,10 +155,10 @@ func TestIDCovEnrollGrantOKPaths(t *testing.T) {
 	g.Used = true
 	s.EnrollGrants[auth.TokenDigest(used)] = g
 	s.mu.Unlock()
-	if s.enrollGrantOK(used) {
+	if s.enrollGrantOK(context.Background(), used) {
 		t.Fatal("used grant accepted")
 	}
-	expired, err := s.CreateEnrollGrant(time.Hour, nil)
+	expired, err := s.CreateEnrollGrant(context.Background(), time.Hour, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,32 +167,32 @@ func TestIDCovEnrollGrantOKPaths(t *testing.T) {
 	g.ExpiresAt = time.Now().Add(-time.Second)
 	s.EnrollGrants[auth.TokenDigest(expired)] = g
 	s.mu.Unlock()
-	if s.enrollGrantOK(expired) {
+	if s.enrollGrantOK(context.Background(), expired) {
 		t.Fatal("expired grant accepted")
 	}
 
 	// DB mode.
 	s2 := New("t")
 	s2.DB = idcovGrantStoreOnly{Store: newDBFakeStore()}
-	if s2.enrollGrantOK("anything") {
+	if s2.enrollGrantOK(context.Background(), "anything") {
 		t.Fatal("DB without grant store accepted a token")
 	}
 	fault := &enrollFaultStore{dbFakeStore: newDBFakeStore()}
 	s3 := New("t")
 	s3.DB = fault
 	fault.getErr = errors.New("down")
-	if s3.enrollGrantOK("x") {
+	if s3.enrollGrantOK(context.Background(), "x") {
 		t.Fatal("DB read error accepted a token")
 	}
 	fault.getErr = nil
-	if s3.enrollGrantOK("x") {
+	if s3.enrollGrantOK(context.Background(), "x") {
 		t.Fatal("unknown DB token accepted")
 	}
-	dbTok, err := s3.CreateEnrollGrant(time.Hour, nil)
+	dbTok, err := s3.CreateEnrollGrant(context.Background(), time.Hour, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !s3.enrollGrantOK(dbTok) {
+	if !s3.enrollGrantOK(context.Background(), dbTok) {
 		t.Fatal("live DB grant rejected")
 	}
 	// Consumed and expired durable records are rejected.
@@ -202,7 +202,7 @@ func TestIDCovEnrollGrantOKPaths(t *testing.T) {
 	fault.dbFakeStore.mu.Lock()
 	fault.dbFakeStore.grants[digest] = rec
 	fault.dbFakeStore.mu.Unlock()
-	if s3.enrollGrantOK(dbTok) {
+	if s3.enrollGrantOK(context.Background(), dbTok) {
 		t.Fatal("consumed DB grant accepted")
 	}
 	rec.Consumed = false
@@ -210,7 +210,7 @@ func TestIDCovEnrollGrantOKPaths(t *testing.T) {
 	fault.dbFakeStore.mu.Lock()
 	fault.dbFakeStore.grants[digest] = rec
 	fault.dbFakeStore.mu.Unlock()
-	if s3.enrollGrantOK(dbTok) {
+	if s3.enrollGrantOK(context.Background(), dbTok) {
 		t.Fatal("expired DB grant accepted")
 	}
 }
@@ -220,29 +220,29 @@ func TestIDCovEnrollGrantOKPaths(t *testing.T) {
 // rollback.
 func TestIDCovConsumeEnrollGrantMemoryPaths(t *testing.T) {
 	s := grantServer(t)
-	if err := s.consumeEnrollGrant("", nil); err == nil {
+	if err := s.consumeEnrollGrant(context.Background(), "", nil); err == nil {
 		t.Fatal("empty token consumed")
 	}
-	if err := s.consumeEnrollGrant("unknown", nil); err == nil || !strings.Contains(err.Error(), "unknown") {
+	if err := s.consumeEnrollGrant(context.Background(), "unknown", nil); err == nil || !strings.Contains(err.Error(), "unknown") {
 		t.Fatalf("unknown grant = %v", err)
 	}
-	tok, err := s.CreateEnrollGrant(time.Hour, []string{"container"})
+	tok, err := s.CreateEnrollGrant(context.Background(), time.Hour, []string{"container"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.consumeEnrollGrant(tok, []string{"container", "extra"}); err == nil || !strings.Contains(err.Error(), "does not permit label") {
+	if err := s.consumeEnrollGrant(context.Background(), tok, []string{"container", "extra"}); err == nil || !strings.Contains(err.Error(), "does not permit label") {
 		t.Fatalf("label mismatch = %v", err)
 	}
-	if !s.enrollGrantOK(tok) {
+	if !s.enrollGrantOK(context.Background(), tok) {
 		t.Fatal("label mismatch burned the grant")
 	}
-	if err := s.consumeEnrollGrant(tok, []string{"container"}); err != nil {
+	if err := s.consumeEnrollGrant(context.Background(), tok, []string{"container"}); err != nil {
 		t.Fatalf("consume = %v", err)
 	}
-	if err := s.consumeEnrollGrant(tok, nil); err == nil || !strings.Contains(err.Error(), "already used") {
+	if err := s.consumeEnrollGrant(context.Background(), tok, nil); err == nil || !strings.Contains(err.Error(), "already used") {
 		t.Fatalf("double consume = %v", err)
 	}
-	expired, err := s.CreateEnrollGrant(time.Hour, nil)
+	expired, err := s.CreateEnrollGrant(context.Background(), time.Hour, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,21 +251,21 @@ func TestIDCovConsumeEnrollGrantMemoryPaths(t *testing.T) {
 	g.ExpiresAt = time.Now().Add(-time.Second)
 	s.EnrollGrants[auth.TokenDigest(expired)] = g
 	s.mu.Unlock()
-	if err := s.consumeEnrollGrant(expired, nil); err == nil || !strings.Contains(err.Error(), "expired") {
+	if err := s.consumeEnrollGrant(context.Background(), expired, nil); err == nil || !strings.Contains(err.Error(), "expired") {
 		t.Fatalf("expired consume = %v", err)
 	}
 	// A persistence failure restores the pre-consume entry.
-	rollback, err := s.CreateEnrollGrant(time.Hour, nil)
+	rollback, err := s.CreateEnrollGrant(context.Background(), time.Hour, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	orig := persistEnrollGrantsFunc
 	persistEnrollGrantsFunc = func(*Server) error { return errors.New("disk full") }
-	if err := s.consumeEnrollGrant(rollback, nil); err == nil {
+	if err := s.consumeEnrollGrant(context.Background(), rollback, nil); err == nil {
 		t.Fatal("persist failure = nil error")
 	}
 	persistEnrollGrantsFunc = orig
-	if !s.enrollGrantOK(rollback) {
+	if !s.enrollGrantOK(context.Background(), rollback) {
 		t.Fatal("failed consume did not restore the grant")
 	}
 }
@@ -275,34 +275,34 @@ func TestIDCovConsumeEnrollGrantMemoryPaths(t *testing.T) {
 func TestIDCovConsumeEnrollGrantDBPaths(t *testing.T) {
 	s := New("t")
 	s.DB = idcovGrantStoreOnly{Store: newDBFakeStore()}
-	if err := s.consumeEnrollGrant("x", nil); err == nil || !strings.Contains(err.Error(), "does not support") {
+	if err := s.consumeEnrollGrant(context.Background(), "x", nil); err == nil || !strings.Contains(err.Error(), "does not support") {
 		t.Fatalf("DB without grant store = %v", err)
 	}
 	fault := &enrollFaultStore{dbFakeStore: newDBFakeStore()}
 	s2 := New("t")
 	s2.DB = fault
 	fault.getErr = errors.New("read failed")
-	if err := s2.consumeEnrollGrant("x", nil); err == nil || !strings.Contains(err.Error(), "read enrollment grant") {
+	if err := s2.consumeEnrollGrant(context.Background(), "x", nil); err == nil || !strings.Contains(err.Error(), "read enrollment grant") {
 		t.Fatalf("DB read error = %v", err)
 	}
 	fault.getErr = nil
-	if err := s2.consumeEnrollGrant("missing", nil); err == nil || !strings.Contains(err.Error(), "unknown") {
+	if err := s2.consumeEnrollGrant(context.Background(), "missing", nil); err == nil || !strings.Contains(err.Error(), "unknown") {
 		t.Fatalf("DB missing = %v", err)
 	}
-	tok, err := s2.CreateEnrollGrant(time.Hour, []string{"container"})
+	tok, err := s2.CreateEnrollGrant(context.Background(), time.Hour, []string{"container"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s2.consumeEnrollGrant(tok, []string{"other"}); err == nil || !strings.Contains(err.Error(), "does not permit label") {
+	if err := s2.consumeEnrollGrant(context.Background(), tok, []string{"other"}); err == nil || !strings.Contains(err.Error(), "does not permit label") {
 		t.Fatalf("DB label mismatch = %v", err)
 	}
-	if !s2.enrollGrantOK(tok) {
+	if !s2.enrollGrantOK(context.Background(), tok) {
 		t.Fatal("DB label mismatch burned the grant")
 	}
-	if err := s2.consumeEnrollGrant(tok, []string{"container"}); err != nil {
+	if err := s2.consumeEnrollGrant(context.Background(), tok, []string{"container"}); err != nil {
 		t.Fatalf("DB consume = %v", err)
 	}
-	if err := s2.consumeEnrollGrant(tok, nil); err == nil || !strings.Contains(err.Error(), "already used") {
+	if err := s2.consumeEnrollGrant(context.Background(), tok, nil); err == nil || !strings.Contains(err.Error(), "already used") {
 		t.Fatalf("DB double consume = %v", err)
 	}
 
@@ -323,11 +323,11 @@ func TestIDCovConsumeEnrollGrantDBPaths(t *testing.T) {
 			f := &enrollFaultStore{dbFakeStore: newDBFakeStore(), consumeErr: tc.err}
 			ss := New("t")
 			ss.DB = f
-			tok, err := ss.CreateEnrollGrant(time.Hour, nil)
+			tok, err := ss.CreateEnrollGrant(context.Background(), time.Hour, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = ss.consumeEnrollGrant(tok, nil)
+			err = ss.consumeEnrollGrant(context.Background(), tok, nil)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("consume error = %v, want %q", err, tc.want)
 			}
@@ -343,7 +343,7 @@ func TestIDCovConsumeEnrollGrantDBPaths(t *testing.T) {
 	f2.dbFakeStore.mu.Unlock()
 	s3 := New("t")
 	s3.DB = f2
-	if err := s3.consumeEnrollGrant("expired-db", nil); err == nil || !strings.Contains(err.Error(), "expired") {
+	if err := s3.consumeEnrollGrant(context.Background(), "expired-db", nil); err == nil || !strings.Contains(err.Error(), "expired") {
 		t.Fatalf("expired durable grant = %v", err)
 	}
 }
@@ -429,7 +429,7 @@ func TestIDCovEnrollGrantHTTPEndToEnd(t *testing.T) {
 	}
 	s := grantServer(t)
 	s.RunnerCA = ca
-	tok, err := s.CreateEnrollGrant(time.Hour, []string{"container"})
+	tok, err := s.CreateEnrollGrant(context.Background(), time.Hour, []string{"container"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -446,7 +446,7 @@ func TestIDCovEnrollGrantHTTPEndToEnd(t *testing.T) {
 	if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/enroll", []byte(bad), tok, nil); w.Code != http.StatusUnauthorized {
 		t.Fatalf("unpermitted label = %d: %s", w.Code, w.Body.String())
 	}
-	if !s.enrollGrantOK(tok) {
+	if !s.enrollGrantOK(context.Background(), tok) {
 		t.Fatal("unpermitted label consumed the grant")
 	}
 	good := `{"runner_id":"runner-g","csr":"` + csr + `","labels":["container"]}`

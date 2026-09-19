@@ -61,7 +61,7 @@ func TestOutboxDBAckFailureKeepsPendingAndRetries(t *testing.T) {
 	o := NewOutbox(nil)
 	o.AttachDB(f)
 	item := forge.OutboxItem{Kind: forge.OutboxKindGitHubCheck, Payload: []byte(`{}`)}
-	if err := o.Enqueue(item); err != nil {
+	if err := o.Enqueue(context.Background(), item); err != nil {
 		t.Fatal(err)
 	}
 	id := o.Pending()[0].ID
@@ -120,7 +120,7 @@ func TestOutboxFSAckFailureKeepsPendingAndRetries(t *testing.T) {
 	dir := t.TempDir()
 	o := NewOutbox(storage.New(dir))
 	item := testOutboxItem(t, forge.OutboxKindGitHubCheck, `{}`)
-	if err := o.Enqueue(item); err != nil {
+	if err := o.Enqueue(context.Background(), item); err != nil {
 		t.Fatal(err)
 	}
 	// Break the store directory so the durable done-file append fails while
@@ -202,7 +202,7 @@ func TestOutboxDBConcurrentFlushNoDoubleDispatch(t *testing.T) {
 	ids := make([]string, 0, items)
 	for i := 0; i < items; i++ {
 		it := forge.OutboxItem{Kind: forge.OutboxKindGitHubCheck, Payload: []byte(`{}`)}
-		if err := o1.Enqueue(it); err != nil {
+		if err := o1.Enqueue(context.Background(), it); err != nil {
 			t.Fatal(err)
 		}
 		ids = append(ids, o1.Pending()[i].ID)
@@ -295,7 +295,7 @@ func TestOutboxDBAppendFailureNeverDispatches(t *testing.T) {
 	f.mu.Lock()
 	f.outboxAppendErr = errors.New("db down")
 	f.mu.Unlock()
-	if err := o.Enqueue(forge.OutboxItem{ID: "orphan", Kind: forge.OutboxKindGitHubCheck, Payload: []byte("{}")}); err == nil {
+	if err := o.Enqueue(context.Background(), forge.OutboxItem{ID: "orphan", Kind: forge.OutboxKindGitHubCheck, Payload: []byte("{}")}); err == nil {
 		t.Fatal("Enqueue must report the durable append failure")
 	}
 	if got := len(o.Pending()); got != 0 {
@@ -313,7 +313,7 @@ func TestOutboxDBAppendFailureNeverDispatches(t *testing.T) {
 	f.mu.Lock()
 	f.outboxAppendErr = nil
 	f.mu.Unlock()
-	if err := o.Enqueue(forge.OutboxItem{ID: "orphan", Kind: forge.OutboxKindGitHubCheck, Payload: []byte("{}")}); err != nil {
+	if err := o.Enqueue(context.Background(), forge.OutboxItem{ID: "orphan", Kind: forge.OutboxKindGitHubCheck, Payload: []byte("{}")}); err != nil {
 		t.Fatal(err)
 	}
 	if n, err := o.Flush(context.Background(), d.dispatch); err != nil || n != 1 {
@@ -329,7 +329,7 @@ func TestOutboxDBReplayPrunesAckedByOtherReplica(t *testing.T) {
 	o := NewOutbox(nil)
 	o.AttachDB(f)
 	it := forge.OutboxItem{ID: "shared", Kind: forge.OutboxKindGitHubCheck, Payload: []byte("{}")}
-	if err := o.Enqueue(it); err != nil {
+	if err := o.Enqueue(context.Background(), it); err != nil {
 		t.Fatal(err)
 	}
 	// Another replica wins the claim and acks before our flush starts.
@@ -563,7 +563,7 @@ func TestUnknownOutboxKindSurvivesRollingUpgrade(t *testing.T) {
 func TestUnknownOutboxKindFSPending(t *testing.T) {
 	o := NewOutbox(nil)
 	item := testOutboxItem(t, "future_v2_intent", `{"job_id":"j"}`)
-	if err := o.Enqueue(item); err != nil {
+	if err := o.Enqueue(context.Background(), item); err != nil {
 		t.Fatal(err)
 	}
 	boom := &unknownOutboxKindError{kind: item.Kind}

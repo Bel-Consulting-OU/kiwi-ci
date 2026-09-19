@@ -232,7 +232,7 @@ jobs:
 	s.DownstreamPipelineFetcher = func(ctx context.Context, repo, ref string) (string, error) {
 		return unpinnedChild, nil
 	}
-	s.flushOutbox()
+	s.flushOutbox(context.Background())
 	if got := childRunsOf(s); len(got) != 0 {
 		t.Fatalf("child runs = %d, want 0 (child rejected by admission)", len(got))
 	}

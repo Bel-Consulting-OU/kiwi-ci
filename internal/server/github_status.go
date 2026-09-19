@@ -88,9 +88,12 @@ func (s *Server) publishForgeStatus(ctx context.Context, run model.Run) error {
 	// Durable-first: every intended row must be recorded before the effect
 	// reports success, otherwise the completion effect would be ACKed with
 	// forge statuses missing. Every item carries a concrete kind: the
-	// forge-kind gate above makes checkIntent's kind selection total.
+	// forge-kind gate above makes checkIntent's kind selection total. ctx is
+	// the publishing effect's context, threaded into the durable enqueue: a
+	// canceled request aborts before persisting and the caller retries the
+	// idempotent effect instead of acknowledging half the intent set.
 	for _, it := range items {
-		if err := s.outbox.Enqueue(it); err != nil {
+		if err := s.outbox.Enqueue(ctx, it); err != nil {
 			return fmt.Errorf("forge status: enqueue %s: %w", it.Kind, err)
 		}
 	}

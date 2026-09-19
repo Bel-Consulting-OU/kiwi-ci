@@ -241,7 +241,7 @@ func TestPostgresIntegrationServerReplicaForgeCheckConvergence(t *testing.T) {
 		go func(s *Server, it forge.OutboxItem) {
 			defer wg.Done()
 			<-start
-			errs <- s.outbox.Enqueue(it)
+			errs <- s.outbox.Enqueue(context.Background(), it)
 		}(pair.s, pair.it)
 	}
 	close(start)
@@ -296,10 +296,10 @@ func TestPostgresIntegrationServerReplicaForgeCheckConvergence(t *testing.T) {
 
 	// A stale equal-version re-enqueue after delivery is refused by the
 	// durable watermark: no second publication.
-	if err := sA.outbox.Enqueue(itemA); err != nil {
+	if err := sA.outbox.Enqueue(context.Background(), itemA); err != nil {
 		t.Fatalf("stale re-enqueue: %v", err)
 	}
-	sA.flushOutbox()
+	sA.flushOutbox(context.Background())
 	if posts, patches, _ := api.snapshot(); posts != 1 || patches != 0 {
 		t.Fatalf("stale re-enqueue republished: posts=%d patches=%d", posts, patches)
 	}

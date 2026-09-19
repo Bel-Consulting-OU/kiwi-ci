@@ -220,7 +220,7 @@ func TestCrashCompletionDurableBeforeEffectsRestartFS(t *testing.T) {
 		crashAssertUsageWindowExactlyOne(t, s2, first.Cost)
 
 		// The repaired intent dispatches to exactly one child run.
-		s2.flushOutbox()
+		s2.flushOutbox(context.Background())
 		if children := childRunsOf(s2); len(children) != 1 {
 			t.Fatalf("downstream children = %d, want exactly 1", len(children))
 		}
@@ -259,7 +259,7 @@ func TestCrashCompletionDurableBeforeEffectsRestartFS(t *testing.T) {
 			t.Fatalf("replayed downstream intents = %d, want 1", n)
 		}
 
-		s2.flushOutbox()
+		s2.flushOutbox(context.Background())
 		s2.mu.Lock()
 		job := s2.jobs[task.Job.ID]
 		s2.mu.Unlock()
@@ -289,7 +289,7 @@ func TestCrashOutboxDurableBeforeDispatchRestartFS(t *testing.T) {
 	a := testOutboxItem(t, forge.OutboxKindGitHubCheck, `{"repo_full_name":"r","sha":"s"}`)
 	b := testOutboxItem(t, forge.OutboxKindGitHubStatus, `{"repo_full_name":"r","sha":"s"}`)
 	for _, it := range []forge.OutboxItem{a, b} {
-		if err := o1.Enqueue(it); err != nil {
+		if err := o1.Enqueue(context.Background(), it); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -337,7 +337,7 @@ func TestCrashOutboxRemotePublishedBeforeAckRestartFS(t *testing.T) {
 	}
 	configure(s1)
 	item := s1.checkIntent(run, "Pipeline", "in_progress", "", "running", nil)
-	if err := s1.outbox.Enqueue(item); err != nil {
+	if err := s1.outbox.Enqueue(context.Background(), item); err != nil {
 		t.Fatal(err)
 	}
 	// Remote publication succeeds and the mapping is persisted; the process
@@ -357,7 +357,7 @@ func TestCrashOutboxRemotePublishedBeforeAckRestartFS(t *testing.T) {
 	if n := len(s2.outbox.Pending()); n != 1 {
 		t.Fatalf("unacked intent after restart = %d, want 1", n)
 	}
-	s2.flushOutbox()
+	s2.flushOutbox(context.Background())
 	posts, patches, published := api.snapshot()
 	if posts != 1 || patches != 1 {
 		t.Fatalf("restart re-dispatch = posts=%d patches=%d, want 1/1 (PATCH, never a duplicate POST)", posts, patches)
@@ -689,7 +689,7 @@ func TestCrashCompletionBeforeIntentEnqueueReplayRepairsForgeDeliveryFS(t *testi
 	}
 	// Drain the queued-state publication first: the crash window below is
 	// "completion persisted, no post-persist intent appended".
-	s1.flushOutbox()
+	s1.flushOutbox(context.Background())
 	runnerID, task := registerUsageRunner(t, s1)
 	time.Sleep(20 * time.Millisecond)
 	if w := completeTask(t, s1, task, runnerID, "success"); w.Code != http.StatusNoContent {
@@ -738,7 +738,7 @@ func TestCrashCompletionBeforeIntentEnqueueReplayRepairsForgeDeliveryFS(t *testi
 	// The pipeline check was already mapped by the queued-state publication,
 	// so its terminal update is a PATCH; the job check is a fresh POST.
 	postsBefore, patchesBefore, publishedBefore := api.snapshot()
-	s2.flushOutbox()
+	s2.flushOutbox(context.Background())
 	posts, patches, published := api.snapshot()
 	if (posts-postsBefore)+(patches-patchesBefore) != 2 {
 		t.Fatalf("terminal forge publications = %d, want 2 (pipeline + job)", (posts-postsBefore)+(patches-patchesBefore))
@@ -761,7 +761,7 @@ func TestCrashCompletionBeforeIntentEnqueueReplayRepairsForgeDeliveryFS(t *testi
 	if w := completeTask(t, s2, task, runnerID, "success"); w.Code != http.StatusNoContent {
 		t.Fatalf("second replay = %d, want 204: %s", w.Code, w.Body.String())
 	}
-	s2.flushOutbox()
+	s2.flushOutbox(context.Background())
 	postsAgain, patchesAgain, publishedAgain := api.snapshot()
 	if postsAgain != posts || patchesAgain != patches || len(publishedAgain) != len(published) {
 		t.Fatalf("second replay republished: posts %d->%d patches %d->%d published %v->%v", posts, postsAgain, patches, patchesAgain, published, publishedAgain)

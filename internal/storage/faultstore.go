@@ -26,6 +26,13 @@ type FaultyStore struct {
 	mutCalls  int
 	FailAfter int
 	Err       error
+
+	// countRunningJobsErr, when non-nil, is returned by CountRunningJobs
+	// instead of delegating to Inner. The general FailAfter counter is
+	// write-only by design, but the drain path must also be provable against
+	// a failing in-flight READ: an errored count is UNKNOWN and must never
+	// be treated as "zero active jobs, drained".
+	countRunningJobsErr error
 }
 
 // fail returns the injected error on the FailAfter-th mutating call and nil
@@ -148,6 +155,27 @@ func (f *FaultyStore) GetJob(ctx context.Context, id string) (model.Job, error) 
 
 func (f *FaultyStore) ListJobsByRun(ctx context.Context, runID string) ([]model.Job, error) {
 	return f.Inner.ListJobsByRun(ctx, runID)
+}
+
+// CountRunningJobs passes through to Inner, reads never consume the
+// write-fault counter, so a drain count can only fail when the configured
+// CountRunningJobs fault is armed.
+func (f *FaultyStore) CountRunningJobs(ctx context.Context) (int, error) {
+	f.mu.Lock()
+	err := f.countRunningJobsErr
+	f.mu.Unlock()
+	if err != nil {
+		return 0, err
+	}
+	return f.Inner.CountRunningJobs(ctx)
+}
+
+// SetCountRunningJobsError installs (or clears, with nil) the injected
+// CountRunningJobs failure. It is safe to call while a drain poll is running.
+func (f *FaultyStore) SetCountRunningJobsError(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.countRunningJobsErr = err
 }
 
 func (f *FaultyStore) ListQueuedJobs(ctx context.Context) ([]model.Job, error) {
@@ -1440,6 +1468,22 @@ func (m *memStore) ListJobsByRun(ctx context.Context, runID string) ([]model.Job
 		}
 	}
 	return out, nil
+}
+
+// CountRunningJobs mirrors the SQL aggregate over the in-memory job map: the
+// authoritative in-flight count for a drain, independent of run scans. The
+// memory store's map under one mutex is always a complete view, so a returned
+// count is known, never partial.
+func (m *memStore) CountRunningJobs(ctx context.Context) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, j := range m.jobs {
+		if j.Status == model.StatusRunning {
+			n++
+		}
+	}
+	return n, nil
 }
 
 func (m *memStore) ListQueuedJobs(ctx context.Context) ([]model.Job, error) {

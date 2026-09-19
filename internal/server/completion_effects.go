@@ -309,29 +309,32 @@ func (s *Server) runForJob(ctx context.Context, runID string) (model.Run, error)
 // completion_reconcile (internal consistency, unbounded retries) and
 // forge_delivery (external publication, bounded retries + dead-letter).
 //
-// IDs are DETERMINISTIC (storage.CompletionEffectID over job + lease
-// generation + kind), exactly like the DB-mode rows the completion
+// ctx is the completion request/reconciliation context and reaches the
+// durable enqueue: a canceled request leaves no half-persisted intent, and
+// the caller's idempotent replay (repairCompletionIntents) re-runs the whole
+// recording. IDs are DETERMINISTIC (storage.CompletionEffectID over job +
+// lease generation + kind), exactly like the DB-mode rows the completion
 // transaction commits: a replayed completion (receipt match) re-runs this
 // idempotently and converges on the same two intents instead of duplicating
 // them, which is what makes the fs replay path able to repair a crash between
 // the durable completion and the outbox append (FA-1).
-func (s *Server) enqueueCompletionEffects(j model.Job, run model.Run) error {
-	return s.enqueueCompletionEffectIntents(j.ID, run.ID, j.LeaseGeneration)
+func (s *Server) enqueueCompletionEffects(ctx context.Context, j model.Job, run model.Run) error {
+	return s.enqueueCompletionEffectIntents(ctx, j.ID, run.ID, j.LeaseGeneration)
 }
 
 // enqueueCompletionEffectIntents queues the two deterministic completion
 // effect intents for one (job, lease generation). The caller supplies the
 // generation explicitly so a receipt-replayed completion converges on the
 // ORIGINAL generation's intent IDs even when the live job has since been
-// re-leased under a newer one.
-func (s *Server) enqueueCompletionEffectIntents(jobID, runID string, generation int64) error {
+// re-leased under a newer one. ctx reaches the durable enqueue per intent.
+func (s *Server) enqueueCompletionEffectIntents(ctx context.Context, jobID, runID string, generation int64) error {
 	payload, err := jsonMarshal(storage.CompletionEffectsPayload{JobID: jobID, RunID: runID})
 	if err != nil {
 		return err
 	}
 	now := time.Now().UTC()
 	for _, kind := range storage.NewCompletionEffectKinds() {
-		if err := s.outbox.Enqueue(forge.OutboxItem{
+		if err := s.outbox.Enqueue(ctx, forge.OutboxItem{
 			ID:        storage.CompletionEffectID(jobID, generation, kind),
 			Kind:      kind,
 			Payload:   payload,
@@ -353,14 +356,19 @@ func (s *Server) enqueueCompletionEffectIntents(jobID, runID string, generation 
 // idempotent by deterministic ID and skips already-delivered IDs, so a
 // replay after a successful completion is a no-op. A job that no longer
 // exists is treated as already reconciled.
-func (s *Server) repairCompletionIntents(jobID string, generation int64) error {
+//
+// ctx is the replay request's context: it reaches the durable enqueue, so a
+// canceled replay aborts before persisting and the caller answers 503
+// WITHOUT acknowledging the completion; the runner's retry re-runs the
+// repair.
+func (s *Server) repairCompletionIntents(ctx context.Context, jobID string, generation int64) error {
 	s.mu.Lock()
 	j, ok := s.jobs[jobID]
 	s.mu.Unlock()
 	if !ok {
 		return nil
 	}
-	return s.enqueueCompletionEffectIntents(jobID, j.RunID, generation)
+	return s.enqueueCompletionEffectIntents(ctx, jobID, j.RunID, generation)
 }
 
 // enqueueCompletionEffectsLocal queues in-memory-only copies of the effect

@@ -577,7 +577,11 @@ func fsCaseJobComplete() fsMutationCase {
 				invoke: func(t *testing.T, s *Server) {
 					w := completeTask(t, s, task, runnerID, "success")
 					fsMatrixAssertStatus(t, w, http.StatusServiceUnavailable)
-					if !strings.HasPrefix(w.Body.String(), "completion state not durable:") {
+					// Hardened 5xx body: the persist error used to be appended
+					// to the fixed prefix, leaking fs paths to the runner. The
+					// detail now stays in the server log (see serverError) and
+					// the caller gets exactly the fixed message.
+					if w.Body.String() != "completion state not durable\n" {
 						t.Fatalf("refused completion body = %q", w.Body.String())
 					}
 					// The completion rollback captures maps the generic
@@ -640,7 +644,9 @@ func fsCaseJobCompleteReplay() fsMutationCase {
 				invoke: func(t *testing.T, s *Server) {
 					w := completeTask(t, s, task, runnerID, "success")
 					fsMatrixAssertStatus(t, w, http.StatusServiceUnavailable)
-					if !strings.HasPrefix(w.Body.String(), "completion state not durable:") {
+					// Hardened 5xx body: see fsCaseJobComplete — fixed opaque
+					// message, detail only in the server log.
+					if w.Body.String() != "completion state not durable\n" {
 						t.Fatalf("refused replay body = %q", w.Body.String())
 					}
 				},

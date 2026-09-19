@@ -255,8 +255,8 @@ func TestForgeCheckSupersedeRaceNewestSurvives(t *testing.T) {
 	o2.AttachDB(f)
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); _ = o1.Enqueue(itemV2) }()
-	go func() { defer wg.Done(); _ = o2.Enqueue(itemV3) }()
+	go func() { defer wg.Done(); _ = o1.Enqueue(context.Background(), itemV2) }()
+	go func() { defer wg.Done(); _ = o2.Enqueue(context.Background(), itemV3) }()
 	wg.Wait()
 
 	pending, err := f.OutboxPending(context.Background())
@@ -315,7 +315,7 @@ func TestForgeCheckVersionGuardFailsClosed(t *testing.T) {
 	item := s.checkIntent(run, "Pipeline", "completed", "success", "ok", nil)
 	// The row must exist durably: the guard skips a row a concurrent
 	// supersede deleted.
-	if err := s.outbox.Enqueue(item); err != nil {
+	if err := s.outbox.Enqueue(context.Background(), item); err != nil {
 		t.Fatalf("enqueue versioned intent: %v", err)
 	}
 	f.mu.Lock()
@@ -420,7 +420,7 @@ func TestOutboxDeadLetterLifecycleEndToEnd(t *testing.T) {
 	run := model.Run{ID: "run-3", ForgeKind: "github", ForgeHost: "github.com",
 		RepoFullName: "acme/backend", SHA: "sha-3", Status: model.StatusQueued}
 	item := s.checkIntent(run, "Pipeline", "in_progress", "", "running", nil)
-	if err := s.outbox.Enqueue(item); err != nil {
+	if err := s.outbox.Enqueue(context.Background(), item); err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
 
@@ -467,7 +467,7 @@ func TestOutboxDeadLetterLifecycleEndToEnd(t *testing.T) {
 	// A second retired intent (fresh logical key: the delivered watermark of
 	// the first key would supersede an equal/older state) deletes cleanly.
 	second := s.checkIntent(run, "build", "queued", "", "queued", nil)
-	if err := s.outbox.Enqueue(second); err != nil {
+	if err := s.outbox.Enqueue(context.Background(), second); err != nil {
 		t.Fatal(err)
 	}
 	api.setFail(true)
@@ -499,10 +499,10 @@ func TestOutboxFSVersionedSupersedeSurvivesRestart(t *testing.T) {
 		Payload: []byte(`{"state_version":2}`), LogicalKey: key, StateVersion: 2}
 
 	o1 := NewOutbox(store)
-	if err := o1.Enqueue(v1); err != nil {
+	if err := o1.Enqueue(context.Background(), v1); err != nil {
 		t.Fatal(err)
 	}
-	if err := o1.Enqueue(v2); err != nil {
+	if err := o1.Enqueue(context.Background(), v2); err != nil {
 		t.Fatal(err)
 	}
 	pending := o1.Pending()
@@ -521,7 +521,7 @@ func TestOutboxFSVersionedSupersedeSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	o3 := NewOutbox(store)
-	if err := o3.Enqueue(v1); err != nil {
+	if err := o3.Enqueue(context.Background(), v1); err != nil {
 		t.Fatal(err)
 	}
 	if pending := o3.Pending(); len(pending) != 0 {
@@ -530,7 +530,7 @@ func TestOutboxFSVersionedSupersedeSurvivesRestart(t *testing.T) {
 	// v3 is newer and is accepted.
 	v3 := forge.OutboxItem{ID: forgeCheckRowID(key, 3), Kind: forge.OutboxKindGitHubCheck,
 		Payload: []byte(`{"state_version":3}`), LogicalKey: key, StateVersion: 3}
-	if err := o3.Enqueue(v3); err != nil {
+	if err := o3.Enqueue(context.Background(), v3); err != nil {
 		t.Fatal(err)
 	}
 	if pending := o3.Pending(); len(pending) != 1 || pending[0].StateVersion != 3 {
@@ -816,7 +816,7 @@ func TestLegacyForgeCheckFSWatermarkGuard(t *testing.T) {
 	// A stale VERSIONED re-enqueue (v2) after the legacy v3 publication is
 	// dropped by the restored watermark instead of being published late.
 	staleVersioned := s2.checkIntent(run, "Pipeline", "in_progress", "", "running", nil)
-	if err := s2.outbox.Enqueue(staleVersioned); err != nil {
+	if err := s2.outbox.Enqueue(context.Background(), staleVersioned); err != nil {
 		t.Fatal(err)
 	}
 	if pending := s2.outbox.Pending(); len(pending) != 0 {

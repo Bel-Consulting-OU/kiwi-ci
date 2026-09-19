@@ -38,7 +38,7 @@ func TestDeploymentFinishEffectRetriesAfterUpdateFailure(t *testing.T) {
 	f.mu.Lock()
 	f.updateDeploymentErr = errors.New("deployment update down")
 	f.mu.Unlock()
-	s.flushOutbox()
+	s.flushOutbox(context.Background())
 
 	f.mu.Lock()
 	d := f.deployments[task.Job.ID]
@@ -76,7 +76,7 @@ func TestDeploymentFinishEffectRetriesAfterUpdateFailure(t *testing.T) {
 	}
 	s2.DownstreamAllowlist = map[string][]string{"acme/child": {"o/r"}}
 	s2.DownstreamPipelineFetcher = func(context.Context, string, string) (string, error) { return childPipeline, nil }
-	s2.flushOutbox()
+	s2.flushOutbox(context.Background())
 
 	d = deploymentOfJob(t, f, task.Job.ID)
 	if d.FinishedAt == nil || d.Status != model.StatusSuccess {
@@ -112,7 +112,7 @@ func TestDeploymentFinishEffectCreatesRecordAfterInsertRecovery(t *testing.T) {
 	f.mu.Lock()
 	f.deploymentInsertErr = errors.New("deployment insert down")
 	f.mu.Unlock()
-	s.flushOutbox()
+	s.flushOutbox(context.Background())
 
 	f.mu.Lock()
 	_, created := f.deployments[task.Job.ID]
@@ -138,7 +138,7 @@ func TestDeploymentFinishEffectCreatesRecordAfterInsertRecovery(t *testing.T) {
 	}
 	s2.DownstreamAllowlist = map[string][]string{"acme/child": {"o/r"}}
 	s2.DownstreamPipelineFetcher = func(context.Context, string, string) (string, error) { return childPipeline, nil }
-	s2.flushOutbox()
+	s2.flushOutbox(context.Background())
 
 	d := deploymentOfJob(t, f, task.Job.ID)
 	if d.Status != model.StatusSuccess || d.FinishedAt == nil {
@@ -169,13 +169,13 @@ func TestDeploymentFinishEffectFSPersistFailureRollsBack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.outbox.Enqueue(forge.OutboxItem{Kind: storage.OutboxKindDeploymentFinish, Payload: payload, CreatedAt: now}); err != nil {
+	if err := s.outbox.Enqueue(context.Background(), forge.OutboxItem{Kind: storage.OutboxKindDeploymentFinish, Payload: payload, CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 
 	old := persistDeploymentFinishState
 	persistDeploymentFinishState = func(*Server) error { return errors.New("state write down") }
-	s.flushOutbox()
+	s.flushOutbox(context.Background())
 	persistDeploymentFinishState = old
 
 	s.mu.Lock()
@@ -199,7 +199,7 @@ func TestDeploymentFinishEffectFSPersistFailureRollsBack(t *testing.T) {
 
 	// Retry after the state write recovers: the marker commits and the
 	// audit follows.
-	s.flushOutbox()
+	s.flushOutbox(context.Background())
 	s.mu.Lock()
 	d = s.deployments[j.ID]
 	s.mu.Unlock()

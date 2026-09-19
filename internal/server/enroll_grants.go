@@ -58,9 +58,17 @@ func enrollTokenFrom(r *http.Request) string {
 // empty allowedLabels list mints the legacy no-label-constraint grant. In DB
 // mode the grant row is written through the durable EnrollGrantStore so
 // every replica honors the same single-use claim.
-func (s *Server) CreateEnrollGrant(ttl time.Duration, allowedLabels []string) (string, error) {
+//
+// ctx is the caller's request context and reaches the durable PutEnrollGrant;
+// a canceled context mints nothing (no token is returned, no row written).
+// The fs/memory path persists synchronously and is not interruptible, so
+// cancellation is honored at the operation boundary, before the map mutation.
+func (s *Server) CreateEnrollGrant(ctx context.Context, ttl time.Duration, allowedLabels []string) (string, error) {
 	if ttl <= 0 {
 		return "", fmt.Errorf("enroll grant ttl must be positive")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 	raw := make([]byte, 32)
 	if _, err := io.ReadFull(randReader, raw); err != nil {
@@ -76,7 +84,7 @@ func (s *Server) CreateEnrollGrant(ttl time.Duration, allowedLabels []string) (s
 		if !ok {
 			return "", fmt.Errorf("store does not support enrollment grants")
 		}
-		if err := gs.PutEnrollGrant(context.Background(), auth.TokenDigest(token), expires, allowedLabels); err != nil {
+		if err := gs.PutEnrollGrant(ctx, auth.TokenDigest(token), expires, allowedLabels); err != nil {
 			return "", err
 		}
 		return token, nil
@@ -101,9 +109,14 @@ func (s *Server) CreateEnrollGrant(ttl time.Duration, allowedLabels []string) (s
 // enrollGrantOK reports whether tok corresponds to a grant that is still
 // valid: known, unused and unexpired. It is the auth() tier gate; the
 // enroll handler re-checks atomically under consumeEnrollGrant to close the
-// replay race.
-func (s *Server) enrollGrantOK(tok string) bool {
+// replay race. ctx is the request context: a canceled request reaches no
+// store and is never validated (the store read would honor the cancellation
+// anyway; the early check also keeps the fs/memory path consistent).
+func (s *Server) enrollGrantOK(ctx context.Context, tok string) bool {
 	if tok == "" {
+		return false
+	}
+	if ctx.Err() != nil {
 		return false
 	}
 	digest := auth.TokenDigest(tok)
@@ -115,7 +128,7 @@ func (s *Server) enrollGrantOK(tok string) bool {
 			// replica-local map.
 			return false
 		}
-		rec, found, err := gs.GetEnrollGrant(context.Background(), digest)
+		rec, found, err := gs.GetEnrollGrant(ctx, digest)
 		if err != nil || !found {
 			return false
 		}
@@ -163,9 +176,18 @@ func checkGrantAllowedLabels(allowed, requested []string) error {
 // grant is marked used and persisted before any certificate is signed; if
 // the memory-mode persist fails the in-memory mutation is rolled back, so a
 // consume that is not durable stays consumable and no certificate is issued.
-func (s *Server) consumeEnrollGrant(tok string, requestLabels []string) error {
+//
+// ctx is the enroll REQUEST context and threads into both durable store
+// calls. A canceled request aborts the consumption before the conditional
+// UPDATE (or before the fs/memory mutation): the grant stays consumable and
+// the handler returns without signing any certificate, so no ACK ever
+// outlives a persistence that did not happen.
+func (s *Server) consumeEnrollGrant(ctx context.Context, tok string, requestLabels []string) error {
 	if tok == "" {
 		return fmt.Errorf("enrollment grant required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	digest := auth.TokenDigest(tok)
 	if s.DB != nil {
@@ -174,7 +196,7 @@ func (s *Server) consumeEnrollGrant(tok string, requestLabels []string) error {
 			// DB mode without a durable grant store has no grants at all.
 			return fmt.Errorf("store does not support enrollment grants")
 		}
-		rec, found, gerr := gs.GetEnrollGrant(context.Background(), digest)
+		rec, found, gerr := gs.GetEnrollGrant(ctx, digest)
 		if gerr != nil {
 			return fmt.Errorf("read enrollment grant: %w", gerr)
 		}
@@ -190,7 +212,7 @@ func (s *Server) consumeEnrollGrant(tok string, requestLabels []string) error {
 		if err := checkGrantAllowedLabels(rec.BoundLabels, requestLabels); err != nil {
 			return err
 		}
-		if _, err := gs.ConsumeEnrollGrant(context.Background(), digest, ""); err != nil {
+		if _, err := gs.ConsumeEnrollGrant(ctx, digest, ""); err != nil {
 			switch {
 			case errors.Is(err, storage.ErrNotFound):
 				return fmt.Errorf("unknown enrollment grant")

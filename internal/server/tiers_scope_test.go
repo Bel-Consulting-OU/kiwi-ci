@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 
@@ -396,7 +397,7 @@ func TestEnrollTierAcceptsOnlyEnrollCredentials(t *testing.T) {
 	g.RunnerCA = ca
 	g.RunnerEnrollToken = ""
 	g.RunnerToken = "runner-tok"
-	raw, err := g.CreateEnrollGrant(time.Hour, nil)
+	raw, err := g.CreateEnrollGrant(context.Background(), time.Hour, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

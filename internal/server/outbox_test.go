@@ -23,10 +23,10 @@ func TestOutboxFlushDispatchesAndEmpties(t *testing.T) {
 	o := NewOutbox(nil)
 	a := testOutboxItem(t, forge.OutboxKindGitHubCheck, `{"repo_full_name":"octocat/hello-world","sha":"s"}`)
 	b := testOutboxItem(t, forge.OutboxKindGitHubStatus, `{"repo_full_name":"octocat/hello-world","sha":"s"}`)
-	if err := o.Enqueue(a); err != nil {
+	if err := o.Enqueue(context.Background(), a); err != nil {
 		t.Fatal(err)
 	}
-	if err := o.Enqueue(b); err != nil {
+	if err := o.Enqueue(context.Background(), b); err != nil {
 		t.Fatal(err)
 	}
 	var order []string
@@ -49,8 +49,8 @@ func TestOutboxFlushStopsOnFailure(t *testing.T) {
 	o := NewOutbox(nil)
 	a := testOutboxItem(t, forge.OutboxKindGitHubCheck, `{}`)
 	b := testOutboxItem(t, forge.OutboxKindGitHubCheck, `{}`)
-	_ = o.Enqueue(a)
-	_ = o.Enqueue(b)
+	_ = o.Enqueue(context.Background(), a)
+	_ = o.Enqueue(context.Background(), b)
 	boom := errors.New("api down")
 	var calls int
 	n, err := o.Flush(context.Background(), func(_ context.Context, it forge.OutboxItem) error {
@@ -86,10 +86,10 @@ func TestOutboxRestartReplay(t *testing.T) {
 	a := testOutboxItem(t, forge.OutboxKindGitHubCheck, `{"repo_full_name":"r"}`)
 	b := testOutboxItem(t, forge.OutboxKindGitHubCheck, `{"repo_full_name":"r"}`)
 	c := testOutboxItem(t, forge.OutboxKindGitHubCheck, `{"repo_full_name":"r"}`)
-	if err := o1.Enqueue(a); err != nil {
+	if err := o1.Enqueue(context.Background(), a); err != nil {
 		t.Fatal(err)
 	}
-	if err := o1.Enqueue(b); err != nil {
+	if err := o1.Enqueue(context.Background(), b); err != nil {
 		t.Fatal(err)
 	}
 	// Flush a only; b stays queued (simulates crash after a dispatch).
@@ -101,7 +101,7 @@ func TestOutboxRestartReplay(t *testing.T) {
 	}); err == nil {
 		t.Fatal("expected error")
 	}
-	if err := o1.Enqueue(c); err != nil {
+	if err := o1.Enqueue(context.Background(), c); err != nil {
 		t.Fatal(err)
 	}
 
@@ -141,7 +141,7 @@ func TestOutboxRestartReplay(t *testing.T) {
 func TestOutboxInMemoryPersistenceOptional(t *testing.T) {
 	o := NewOutbox(nil)
 	it := testOutboxItem(t, forge.OutboxKindGitHubCheck, `{}`)
-	if err := o.Enqueue(it); err != nil {
+	if err := o.Enqueue(context.Background(), it); err != nil {
 		t.Fatalf("in-memory enqueue must not fail: %v", err)
 	}
 	if len(o.Pending()) != 1 {
@@ -157,22 +157,22 @@ func TestOutboxInMemoryPersistenceOptional(t *testing.T) {
 func TestOutboxEnqueueSameIDConflictFS(t *testing.T) {
 	o := NewOutbox(nil)
 	first := forge.OutboxItem{ID: "fixed-intent", Kind: forge.OutboxKindGitHubStatus, Payload: []byte(`{"a":1}`)}
-	if err := o.Enqueue(first); err != nil {
+	if err := o.Enqueue(context.Background(), first); err != nil {
 		t.Fatalf("first enqueue: %v", err)
 	}
-	if err := o.Enqueue(first); err != nil {
+	if err := o.Enqueue(context.Background(), first); err != nil {
 		t.Fatalf("same-payload replay must be a success: %v", err)
 	}
-	if err := o.Enqueue(forge.OutboxItem{ID: "fixed-intent", Kind: forge.OutboxKindGitHubStatus, Payload: []byte(`{ "a" : 1 }`)}); err != nil {
+	if err := o.Enqueue(context.Background(), forge.OutboxItem{ID: "fixed-intent", Kind: forge.OutboxKindGitHubStatus, Payload: []byte(`{ "a" : 1 }`)}); err != nil {
 		t.Fatalf("semantically-equal payload replay must be a success: %v", err)
 	}
 	if got := len(o.Pending()); got != 1 {
 		t.Fatalf("replay duplicated the queued intent: %d", got)
 	}
-	if err := o.Enqueue(forge.OutboxItem{ID: "fixed-intent", Kind: forge.OutboxKindGitHubStatus, Payload: []byte(`{"a":2}`)}); !errors.Is(err, ErrOutboxIDConflict) {
+	if err := o.Enqueue(context.Background(), forge.OutboxItem{ID: "fixed-intent", Kind: forge.OutboxKindGitHubStatus, Payload: []byte(`{"a":2}`)}); !errors.Is(err, ErrOutboxIDConflict) {
 		t.Fatalf("different payload error = %v, want ErrOutboxIDConflict", err)
 	}
-	if err := o.Enqueue(forge.OutboxItem{ID: "fixed-intent", Kind: forge.OutboxKindGitHubCheck, Payload: []byte(`{"a":1}`)}); !errors.Is(err, ErrOutboxIDConflict) {
+	if err := o.Enqueue(context.Background(), forge.OutboxItem{ID: "fixed-intent", Kind: forge.OutboxKindGitHubCheck, Payload: []byte(`{"a":1}`)}); !errors.Is(err, ErrOutboxIDConflict) {
 		t.Fatalf("different kind error = %v, want ErrOutboxIDConflict", err)
 	}
 	got := o.Pending()
@@ -181,10 +181,10 @@ func TestOutboxEnqueueSameIDConflictFS(t *testing.T) {
 	}
 	// An empty payload is the same intent as "{}", mirroring OutboxAppend.
 	o2 := NewOutbox(nil)
-	if err := o2.Enqueue(forge.OutboxItem{ID: "empty-payload", Kind: "k", Payload: nil}); err != nil {
+	if err := o2.Enqueue(context.Background(), forge.OutboxItem{ID: "empty-payload", Kind: "k", Payload: nil}); err != nil {
 		t.Fatal(err)
 	}
-	if err := o2.Enqueue(forge.OutboxItem{ID: "empty-payload", Kind: "k", Payload: []byte("{}")}); err != nil {
+	if err := o2.Enqueue(context.Background(), forge.OutboxItem{ID: "empty-payload", Kind: "k", Payload: []byte("{}")}); err != nil {
 		t.Fatalf("empty payload replay must be a success: %v", err)
 	}
 }

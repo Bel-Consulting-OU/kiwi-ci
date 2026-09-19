@@ -58,19 +58,35 @@ func (s *Server) uploadArtifact(w http.ResponseWriter, r *http.Request) {
 		s.writeLeaseAuthError(w, r, authErr)
 		return
 	}
+	// The run record carries the signed provenance identity
+	// (repository/ref/commit), so loading it is never best-effort: an
+	// unavailable or missing run fails the upload closed BEFORE any bytes
+	// are staged, rather than minting a statement with an empty identity.
 	var run model.Run
 	if s.DB != nil {
-		run, _ = s.DB.GetRun(r.Context(), j.RunID)
+		loaded, err := s.DB.GetRun(r.Context(), j.RunID)
+		if err != nil {
+			s.logError("artifact: authoritative run lookup failed", "job", j.ID, "run", j.RunID, "error", err.Error())
+			http.Error(w, "artifact provenance identity unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		run = loaded
 	} else {
 		s.mu.Lock()
-		run = s.runs[j.RunID]
+		loaded, ok := s.runs[j.RunID]
 		s.mu.Unlock()
+		if !ok {
+			s.logError("artifact: authoritative run lookup failed", "job", j.ID, "run", j.RunID, "error", "run not found")
+			http.Error(w, "artifact provenance identity unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		run = loaded
 	}
 	// Contract resolution: every upload name must trace to a declared
 	// artifact (or its .sbom/.sigstore attestation sibling).
 	contracts, err := s.contractsForJob(r.Context(), j)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	contract, kind, ok := contractForUploadName(contracts, name)
@@ -96,7 +112,7 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 	ctx := r.Context()
 	dir := filepath.Join(s.store.Root, "artifacts", j.RunID, j.ID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	// The critical section: idempotency check, staging, gate and record
@@ -128,7 +144,7 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 	tmp := filepath.Join(dir, "."+id+".tmp")
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	start := time.Now()
@@ -144,7 +160,7 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 			http.Error(w, "artifact exceeds the declared maximum size", http.StatusRequestEntityTooLarge)
 			return
 		}
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	digest := hex.EncodeToString(h.Sum(nil))
@@ -180,7 +196,7 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 			return
 		}
 	} else {
-		http.Error(w, lerr.Error(), 500)
+		s.internalError(w, r, lerr, "")
 		return
 	}
 	// SBOM/sigstore attestation gate: required attestations must be
@@ -207,20 +223,20 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 		release, ferr := s.acquireDigestFence(ctx, digest)
 		if ferr != nil {
 			_ = os.Remove(tmp)
-			http.Error(w, ferr.Error(), 500)
+			s.internalError(w, r, ferr, "")
 			return
 		}
 		defer release()
 		tf, oerr := os.Open(tmp)
 		if oerr != nil {
 			_ = os.Remove(tmp)
-			http.Error(w, oerr.Error(), 500)
+			s.internalError(w, r, oerr, "")
 			return
 		}
 		if _, perr := s.CAS.Put(ctx, tf); perr != nil {
 			_ = tf.Close()
 			_ = os.Remove(tmp)
-			http.Error(w, perr.Error(), 500)
+			s.internalError(w, r, perr, "")
 			return
 		}
 		_ = tf.Close()
@@ -228,7 +244,7 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 	} else {
 		if err := os.Rename(tmp, dst); err != nil {
 			_ = os.Remove(tmp)
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 	}
@@ -319,7 +335,7 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 		}
 		if ierr != nil {
 			removeStagedArtifact(dst, casMode)
-			http.Error(w, ierr.Error(), 500)
+			s.internalError(w, r, ierr, "")
 			return
 		}
 		if !created {
@@ -357,7 +373,7 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 	case merr != nil:
 		s.mu.Unlock()
 		_ = os.Remove(dst)
-		http.Error(w, merr.Error(), 500)
+		s.internalError(w, r, merr, "")
 		return
 	case !created:
 		s.mu.Unlock()
@@ -448,12 +464,16 @@ func jobStart(j model.Job) time.Time {
 func (s *Server) listArtifacts(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
 	if s.DB != nil {
+		// Unlike the upload path, this run load only scopes the read; it
+		// signs no provenance. It is already fail-closed: a missing record
+		// answers 404 and a store failure aborts before any authorization,
+		// so a zero-valued run can never widen the list.
 		run, err := s.DB.GetRun(r.Context(), runID)
 		if errors.Is(err, storage.ErrNotFound) {
 			http.NotFound(w, r)
 			return
 		} else if err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		if !s.requireRunArtifactRead(w, r, run) {
@@ -461,7 +481,7 @@ func (s *Server) listArtifacts(w http.ResponseWriter, r *http.Request) {
 		}
 		out, err := s.DB.ListArtifacts(r.Context(), runID)
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			s.internalError(w, r, err, "")
 			return
 		}
 		dto := make([]v1.ArtifactDTO, 0, len(out))
@@ -638,7 +658,7 @@ func (s *Server) uploadJobCache(w http.ResponseWriter, r *http.Request) {
 	// being published, then hold the fence across Put + manifest commit.
 	staged, err := os.CreateTemp("", "kiwi-cache-put-*")
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	stagedPath := staged.Name()
@@ -647,26 +667,26 @@ func (s *Server) uploadJobCache(w http.ResponseWriter, r *http.Request) {
 	n, copyErr := io.Copy(io.MultiWriter(staged, hasher), http.MaxBytesReader(w, r.Body, maxBlobBytes))
 	if copyErr != nil {
 		staged.Close()
-		http.Error(w, copyErr.Error(), 500)
+		s.internalError(w, r, copyErr, "")
 		return
 	}
 	if _, err := staged.Seek(0, io.SeekStart); err != nil {
 		staged.Close()
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	sum := hex.EncodeToString(hasher.Sum(nil))
 	release, ferr := s.acquireDigestFence(r.Context(), sum)
 	if ferr != nil {
 		staged.Close()
-		http.Error(w, ferr.Error(), 500)
+		s.internalError(w, r, ferr, "")
 		return
 	}
 	defer release()
 	obj, err := s.CAS.Put(r.Context(), staged)
 	staged.Close()
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	size := obj.Size
@@ -783,7 +803,7 @@ func (s *Server) downloadJobCache(w http.ResponseWriter, r *http.Request) {
 		if cs, ok := s.DB.(storage.CacheManifestStore); ok {
 			rec, found, err := cs.GetCacheManifest(r.Context(), repo, trust, key)
 			if err != nil {
-				http.Error(w, err.Error(), 500)
+				s.internalError(w, r, err, "")
 				return
 			}
 			if !found || rec.BlobSHA256 == "" {
@@ -832,7 +852,7 @@ func (s *Server) downloadJobCache(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		http.Error(w, err.Error(), 500)
+		s.internalError(w, r, err, "")
 		return
 	}
 	defer rc.Close()

@@ -117,10 +117,13 @@ type dbFakeStore struct {
 	// listRunsErr/getRunErr/getJobErr make the corresponding read fail with a
 	// hard store error (not ErrNotFound), and the deployment knobs make the
 	// deployment store fail: they drive fail-closed/500 paths.
-	listRunsErr         error
-	getRunErr           error
-	getJobErr           error
-	listJobsByRunErr    error
+	listRunsErr      error
+	getRunErr        error
+	getJobErr        error
+	listJobsByRunErr error
+	// countRunningErr, when non-nil, makes CountRunningJobs fail: the drain
+	// count is then UNKNOWN and must never be read as zero/drained.
+	countRunningErr     error
 	deploymentInsertErr error
 	listDeploymentsErr  error
 	updateDeploymentErr error
@@ -395,6 +398,24 @@ func (f *dbFakeStore) ListJobsByRun(ctx context.Context, runID string) ([]model.
 		}
 	}
 	return out, nil
+}
+
+// CountRunningJobs mirrors memStore.CountRunningJobs: the in-flight count is
+// the number of jobs holding a running lease, read atomically from the
+// complete in-memory job map. countRunningErr injects the drain-count failure.
+func (f *dbFakeStore) CountRunningJobs(ctx context.Context) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.countRunningErr != nil {
+		return 0, f.countRunningErr
+	}
+	n := 0
+	for _, j := range f.jobs {
+		if j.Status == model.StatusRunning {
+			n++
+		}
+	}
+	return n, nil
 }
 
 func (f *dbFakeStore) ListJobsByEnvironment(ctx context.Context, repoID, environment string) ([]model.Job, error) {

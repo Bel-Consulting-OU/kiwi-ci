@@ -91,7 +91,7 @@ func TestSeamRandIdentifierHelpersFailClosed(t *testing.T) {
 	if b, err := createClusterKey(clusterKindWebSession); err == nil || b != nil {
 		t.Fatalf("createClusterKey(web-session) with failing entropy = %v, %v; want nil, error", b, err)
 	}
-	if _, err := s.CreateEnrollGrant(time.Minute, nil); err == nil || !strings.Contains(err.Error(), "generate enroll grant") {
+	if _, err := s.CreateEnrollGrant(context.Background(), time.Minute, nil); err == nil || !strings.Contains(err.Error(), "generate enroll grant") {
 		t.Fatalf("CreateEnrollGrant with failing entropy = %v; want generate error", err)
 	}
 }
@@ -149,7 +149,7 @@ func TestSeamRandOutboxFailures(t *testing.T) {
 	restore := seamRand(t, seamErrReader{})
 	defer restore()
 	o := &Outbox{}
-	if err := o.Enqueue(forge.OutboxItem{}); err == nil {
+	if err := o.Enqueue(context.Background(), forge.OutboxItem{}); err == nil {
 		t.Fatal("Outbox.Enqueue with failing entropy must fail")
 	}
 	if id := o.claimerID(); !strings.HasPrefix(id, "outbox-") || id == "outbox-" {
