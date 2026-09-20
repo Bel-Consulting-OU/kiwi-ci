@@ -12,6 +12,7 @@ import (
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/forge"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
@@ -757,5 +758,47 @@ func TestFlowDownstreamApplyChildrenLocked(t *testing.T) {
 	s.mu.Unlock()
 	if run.Status != model.StatusFailure {
 		t.Fatalf("failed child run = %+v", run)
+	}
+}
+
+// TestFlowDownstreamIntentIDConflictNotSwallowed is the F3-3 regression: the
+// deterministic downstream intent ID is derived from (parent job, target
+// repo, target ref), so a second recording for the same link with DIFFERENT
+// content is ErrOutboxIDConflict. The previous HasIntent short-circuit
+// acknowledged that conflict as success, which could silently drop the
+// conflicting spec's event/inputs while the link looked dispatched. The
+// original intent must stay queued unchanged.
+func TestFlowDownstreamIntentIDConflictNotSwallowed(t *testing.T) {
+	ctx := context.Background()
+	s := fcEffectsServerWithRun(t)
+	j := model.Job{ID: "job-conflict", RunID: "run-1", Key: "build", Status: model.StatusSuccess}
+	run := model.Run{ID: "run-1"}
+	linkA := storage.DownstreamLink{ParentJobID: j.ID, TargetRepo: "o/target", TargetRef: "refs/heads/main", LaunchToken: "token-A"}
+	specA := pipeline.DownstreamSpec{Repository: "o/target", Ref: "refs/heads/main", Inputs: map[string]string{"variant": "A"}}
+	if err := s.enqueueDownstreamIntent(ctx, j, run, specA, linkA); err != nil {
+		t.Fatalf("first intent enqueue = %v", err)
+	}
+
+	// Same deterministic ID, different payload: the conflict must fail the
+	// recording instead of being acknowledged.
+	linkB := linkA
+	linkB.LaunchToken = "token-B"
+	specB := specA
+	specB.Inputs = map[string]string{"variant": "B"}
+	err := s.enqueueDownstreamIntent(ctx, j, run, specB, linkB)
+	if !errors.Is(err, ErrOutboxIDConflict) {
+		t.Fatalf("conflicting intent with a reused ID = %v; want ErrOutboxIDConflict (must not be acknowledged)", err)
+	}
+
+	pending := s.outbox.Pending()
+	if len(pending) != 1 {
+		t.Fatalf("pending intents after the conflict = %d, want the single original intent", len(pending))
+	}
+	var got downstreamPayload
+	if err := json.Unmarshal(pending[0].Payload, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.LaunchToken != "token-A" || got.Inputs["variant"] != "A" {
+		t.Fatalf("recorded intent after the conflict = %+v; want the original A content", got)
 	}
 }

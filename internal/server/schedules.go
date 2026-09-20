@@ -628,6 +628,13 @@ func (s *Server) triggerSchedule(w http.ResponseWriter, r *http.Request) {
 	nominal := time.Now().UTC().Truncate(time.Minute)
 	run, fired, err := s.fireSchedule(r.Context(), sc, nominal)
 	if err != nil {
+		// A non-durable enqueue is the same server-side condition as on every
+		// other ingress: 503 + the fixed opaque "state not durable" body.
+		// Any other fire error (invalid stored identity, ID generation, a
+		// failed durable re-read) stays the generic 500.
+		if s.respondEnqueueError(w, r, err) {
+			return
+		}
 		s.internalError(w, r, err, "")
 		return
 	}

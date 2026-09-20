@@ -63,6 +63,17 @@ var (
 	jsonMarshalIndent           = json.MarshalIndent
 )
 
+// prePersistHook, when non-nil, runs inside the persistent constructor after
+// every data-dir loader has succeeded and immediately before the trailing
+// persistLocked. It is a test-only seam (production leaves it nil): that
+// trailing persist cannot be failed through the filesystem while all loaders
+// keep working, because uid 0 bypasses permission bits and every structural
+// block on the state write (a directory at state.json, a dangling data dir)
+// breaks an earlier loader or the log-seq checkpoint first. Tests arm it to
+// assert the constructor's persist-failure return through the existing
+// persistFailForTest switch.
+var prePersistHook func(*Server)
+
 type Server struct {
 	// Token remains for source compatibility; RunnerToken/AdminToken are authoritative.
 	Token                string
@@ -684,6 +695,9 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 	}
 	s.mu.Lock()
 	expirations, lostRunners, timedOut := s.recoverLeasesLocked(now, true)
+	if prePersistHook != nil {
+		prePersistHook(s)
+	}
 	err = s.persistLocked()
 	s.mu.Unlock()
 	if err != nil {
@@ -1066,6 +1080,25 @@ func (s *Server) serverError(w http.ResponseWriter, r *http.Request, status int,
 // with the request ID and the client only ever sees an opaque body.
 func (s *Server) internalError(w http.ResponseWriter, r *http.Request, err error, clientMsg string) {
 	s.serverError(w, r, http.StatusInternalServerError, err, clientMsg)
+}
+
+// respondEnqueueError is the ONE mapping from a run-enqueue error
+// (s.enqueue / s.enqueueID / s.enqueueDB) to its HTTP response. A durability
+// failure (stateNotDurableError) is a server-side condition, not a client
+// error: it answers 503 with the fixed opaque "state not durable" body and
+// keeps the store/path detail server-side (serverError logs it with the
+// request identity), so every ingress — submit, webhooks, dynamic fragments,
+// rerun and schedule trigger — reports persistence failures identically and
+// never echoes raw store text. It reports whether it wrote the response; a
+// false return leaves the error to the caller's ingress-specific mapping
+// (admission, OPA denial, quota, or a genuine 4xx validation message).
+func (s *Server) respondEnqueueError(w http.ResponseWriter, r *http.Request, err error) bool {
+	var nd *stateNotDurableError
+	if errors.As(err, &nd) {
+		s.serverError(w, r, http.StatusServiceUnavailable, nd, "state not durable")
+		return true
+	}
+	return false
 }
 
 func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
@@ -4030,6 +4063,11 @@ func (s *Server) rerunRun(w http.ResponseWriter, r *http.Request) {
 		RepoURL: old.Repo, RepoFullName: old.RepoFullName, Ref: old.Ref, SHA: old.SHA, Event: old.Event, Pipeline: pipelineText,
 		Trusted: rerunTrusted(r, old), Metadata: meta, identityBound: true})
 	if err != nil {
+		// A non-durable enqueue is answered like every other ingress (503 +
+		// opaque body); only a genuine validation error keeps its message.
+		if s.respondEnqueueError(w, r, err) {
+			return
+		}
 		http.Error(w, err.Error(), 400)
 		return
 	}
@@ -4089,6 +4127,11 @@ func (s *Server) rerunRunDB(w http.ResponseWriter, r *http.Request, id string) {
 		RepoURL: old.Repo, RepoFullName: old.RepoFullName, Ref: old.Ref, SHA: old.SHA, Event: old.Event, Pipeline: pipelineText,
 		Trusted: rerunTrusted(r, old), Metadata: meta, identityBound: true})
 	if err != nil {
+		// Same durability mapping as rerunRun: persistence failures answer
+		// 503 with the fixed opaque body, validation errors keep their 400.
+		if s.respondEnqueueError(w, r, err) {
+			return
+		}
 		http.Error(w, err.Error(), 400)
 		return
 	}

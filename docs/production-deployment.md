@@ -64,7 +64,10 @@ for lease/OIDC key material (or a process for provisioning the keys).
 Set `--tls-cert`/`--tls-key` (or `server.tls_cert`/`server.tls_key` in
 the config file) to serve HTTPS. `--external-url` must match the public
 base URL: it is advertised as the OIDC issuer and used for forge
-statuses. In production, external URL must be `https://`.
+statuses. In production, external URL must be `https://`. The listener
+serves TLS only: clients, probes, load balancers, and backend services
+must use `https://` (or terminate TLS in front of the instance), because
+a plaintext request to a TLS listener fails.
 
 ## Configuration file
 
@@ -142,7 +145,10 @@ enrollment traffic stays reachable on the same listener.
   abandoned snapshot is no longer authoritative). Configure probes and load
   balancers to stop routing traffic to an instance while `/readiness` answers
   503, and alert on the degraded state so a persistent snapshot-write failure
-  is not masked.
+  is not masked. Probe over HTTPS when the server runs with
+  `--tls-cert`/`--tls-key`, e.g.
+  `curl -fsS https://ci.example.com/readiness` (a plaintext probe against a
+  TLS listener fails).
 - `GET /liveness` — process is up.
 - `GET /metrics` — Prometheus-style metrics, optionally on a separate
   `observability.metrics_listen` address.
@@ -173,13 +179,23 @@ The Woodpecker instance hosting it must be configured so CI reflects reality:
 - `WOODPECKER_FORCE_IGNORE_SERVICE_FAILURE=false` — otherwise a dead
   PostgreSQL service is ignored and the `integration-coverage` workflow
   passes without exercising the real database.
-- Stable, event-independent commit-status contexts, so branch protection can
-  require names like `ci/woodpecker/linux-amd64` instead of event-scoped
-  variants.
-- Agents labelled `platform=linux-amd64`, `platform=linux-arm64`,
-  `capability=docker`, `platform=windows-amd64` and `platform=darwin-arm64`
+- Commit-status contexts use Woodpecker's canonical
+  `ci/woodpecker/<event>/<workflow>[/<axis>]` form, with the `pull_request`
+  event mapped to the literal `pr`, so branch protection requires names like
+  `ci/woodpecker/pr/linux-amd64` (the flat pre-event form can never be
+  satisfied). The native macOS/Windows workflows run on trusted events only,
+  so their `push/` contexts are not required for pull requests.
+- Agents labelled `platform=linux/amd64`, `platform=linux/arm64`,
+  `capability=docker`, `platform=windows/amd64` and `platform=darwin/arm64`
   matching the workflow label sets; the Docker lane is REQUIRED and fails
   (never skips) when its daemon is unavailable.
+- `docker-workspace` is a trusted, push/manual/tag-only lane: it mounts the
+  agent host's Docker daemon socket in its steps. Woodpecker gates host
+  volumes on the repository-level Trusted flag alone -- there is no per-event
+  or fork gating -- so a `pull_request` run would execute PR-authored code
+  with host-daemon control (host-root equivalent). It is therefore recorded
+  as `ci/woodpecker/push/docker-workspace`, not as a required PR context;
+  re-gating pull requests needs a socket-less variant of the lane.
 - The clone plugin and every workflow image are pinned by OCI digest.
 
 ## Native and local CI agents
@@ -198,9 +214,12 @@ trusted build boundary; provision them on that basis:
   and cloud/SSH keys off the host. The only secret that may exist is the
   Woodpecker agent secret, scoped to that agent and rotated.
 - **Never run fork code.** The native workflows accept trusted events only
-  (`push`, `manual`, `tag`). Fork pull requests run in the
-  Docker-backend lanes; do not add `pull_request`/`pull_request_*` events
-  to a local-backend workflow.
+  (`push`, `manual`, `tag`). Fork pull requests run in the Docker-backend
+  lanes; the socket-mounting `docker-workspace` lane is push-only (see above),
+  so only the container-isolated Docker lanes run on PRs. Do not add
+  `pull_request`/`pull_request_*` events to a local-backend workflow or a
+  host-volume workflow; `internal/workflowguard` fails the build if either
+  reappears.
 - **Agent selection and shell.** Select `platform=darwin/arm64` +
   `backend=local` for macOS and `platform=windows/amd64` + `backend=local`
   for Windows. On the local backend `image` names the shell (`bash`,

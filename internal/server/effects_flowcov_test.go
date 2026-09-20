@@ -128,12 +128,26 @@ func TestFlowEffectsDownstreamCheckBranches(t *testing.T) {
 	if err := s.effectDownstreamCheck(ctx, job); err != nil {
 		t.Fatalf("declared-ref downstream check = %v", err)
 	}
-	// An existing link is the marker: the recording is skipped.
+	// An existing link is replayed idempotently: recordDownstreamIntents
+	// re-reads the stored link (same token, same deterministic intent ID and
+	// content), so the recording converges without a second intent.
+	s.mu.Lock()
+	existing, exists := s.downstreamLinks[downstreamLinkKey("j", "o/target", "refs/heads/main")]
+	s.mu.Unlock()
+	if !exists || existing.LaunchToken == "" {
+		t.Fatalf("recorded link = %+v exists=%v; want a stored launch token", existing, exists)
+	}
+	if err := s.effectDownstreamCheck(ctx, job); err != nil {
+		t.Fatalf("existing-link downstream check = %v", err)
+	}
+	// A link whose content changed under the same deterministic intent ID is
+	// an invariant conflict (F3-3): the recording must error instead of
+	// ACKing an intent that belongs to the old link.
 	s.mu.Lock()
 	s.downstreamLinks[downstreamLinkKey("j", "o/target", "refs/heads/main")] = storage.DownstreamLink{ParentJobID: "j", TargetRepo: "o/target", TargetRef: "refs/heads/main"}
 	s.mu.Unlock()
-	if err := s.effectDownstreamCheck(ctx, job); err != nil {
-		t.Fatalf("existing-link downstream check = %v", err)
+	if err := s.effectDownstreamCheck(ctx, job); !errors.Is(err, ErrOutboxIDConflict) {
+		t.Fatalf("conflicting-link downstream check = %v; want ErrOutboxIDConflict", err)
 	}
 }
 

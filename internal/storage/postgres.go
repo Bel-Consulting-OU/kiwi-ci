@@ -48,10 +48,27 @@ type PostgresStore struct {
 	// pool with no error.
 	fencePoolErr error
 
+	// leaderMu guards the cached leader-session fields only. It is never held
+	// across a network round-trip: the liveness probe, the candidate
+	// connect/try-lock and the close of a dropped session all run outside it
+	// (see TryAcquireLeadership), so one black-holed connection cannot
+	// serialize every leadership caller behind a single mutex.
 	leaderMu        sync.Mutex
 	leaderConn      *pgx.Conn
 	leaderKey       string
 	leaderHeldUntil time.Time
+	// leaderProbedAt is the time of the last successful proof that the cached
+	// session is alive: the acquisition round-trip that took the advisory
+	// lock, or a later liveness probe.
+	leaderProbedAt time.Time
+	// leaderProbeWait is non-nil while a liveness probe for the cached session
+	// runs outside leaderMu; concurrent callers wait on it (and re-evaluate
+	// the cache) instead of stacking duplicate probes.
+	leaderProbeWait chan struct{}
+	// leaderAcquireMu serializes candidate-session acquisition (connect plus
+	// advisory try-lock). The cached hot path never takes it, so a slow or
+	// black-holed acquisition cannot block cached leadership calls.
+	leaderAcquireMu sync.Mutex
 }
 
 var _ Store = (*PostgresStore)(nil)
@@ -193,9 +210,11 @@ func (s *PostgresStore) Close() error {
 	}
 	s.leaderMu.Lock()
 	// Closing the session releases its advisory lock; clear the whole cache
-	// so a (mis)use after Close cannot observe a stale held-leadership view.
-	s.dropLeaderSessionLocked()
+	// first so a (mis)use after Close cannot observe a stale held-leadership
+	// view. The close itself runs outside leaderMu under its own bound.
+	conn := s.detachLeaderSessionLocked()
 	s.leaderMu.Unlock()
+	s.closeLeaderConn(conn)
 	s.pool.Close()
 	return nil
 }
@@ -4140,24 +4159,59 @@ func (s *PostgresStore) SaveTestHistory(ctx context.Context, stats []byte) (int6
 	return version, err
 }
 
-// leaderProbeTimeout bounds the liveness round-trip that proves a cached
-// leader session still exists, and the best-effort unlock/close of a session
-// this store is dropping. It must stay short: the probe runs under leaderMu.
+// leaderProbeTimeout bounds the cached-session liveness probe (which runs
+// outside leaderMu), ReleaseLeadership's unlock round-trip, and the close of a
+// session or rejected candidate this store is dropping.
 const leaderProbeTimeout = 2 * time.Second
+
+// leaderAcquireTimeout bounds the connect plus advisory try-lock round-trips
+// of a fresh candidate session; the caller's context still applies when
+// shorter. It is a var only so tests can shrink the bound — production never
+// reassigns it (same seam convention as randReader/jsonMarshal above).
+var leaderAcquireTimeout = 2 * time.Second
+
+// leaderProbeInterval returns how long a successful liveness proof is trusted
+// before a cached call has to re-prove the session: min(1s, ttl/5), so the
+// window in which a dead session could still be reported true stays at most
+// one second and never exceeds a fifth of the claim's own renewal window.
+func leaderProbeInterval(ttl time.Duration) time.Duration {
+	if d := ttl / 5; d > 0 && d <= time.Second {
+		return d
+	}
+	return time.Second
+}
+
+// leaderProbeFn performs the liveness round-trip that proves a cached leader
+// session still exists. Production pings the cached connection itself (Ping
+// opens no new connection); tests override it to inject a slow or failing
+// probe. Like randReader/jsonMarshal above it is only reassigned by tests.
+var leaderProbeFn = func(ctx context.Context, conn *pgx.Conn) error {
+	return conn.Ping(ctx)
+}
 
 // Leadership invariant (S1A): leaderConn is the ONLY proof of leadership
 // this store exposes. Its session-level advisory lock lives exactly as long
-// as that PostgreSQL session, so the cached leaderKey/leaderHeldUntil pair
-// is never trusted on its own: every cached-success path first executes a
-// round-trip on the SAME connection (pgx.Conn.Ping opens no new connection),
-// and any failure clears the cache and falls through to a real acquisition
-// attempt instead of returning true. A stale true could otherwise survive
-// until the local TTL while ANOTHER replica legitimately holds the lock —
-// split-brain leadership. The same rule drives the lifecycle: a session is
-// only closed through dropLeaderSessionLocked, which clears every cached
-// field first, and ReleaseLeadership clears the cache even when the unlock
-// round-trip fails (a failed unlock on a live session leaves the lock held,
-// so the session is closed to release it deterministically).
+// as that PostgreSQL session, so the cached leaderKey/leaderHeldUntil pair is
+// never trusted on its own. A cached success is renewed only while the last
+// successful proof (the acquisition round-trip that took the lock, or a later
+// liveness probe on the SAME connection) is younger than leaderProbeInterval;
+// beyond that a probe must succeed first. Any failed proof — or a locally
+// closed session, detected without I/O — clears the cache and falls through
+// to a real acquisition attempt instead of returning true. A stale true could
+// otherwise survive until the local TTL while ANOTHER replica legitimately
+// holds the lock: split-brain leadership.
+//
+// Locking: leaderMu guards the cached fields only and is never held across a
+// round-trip. Fresh cached calls do no I/O at all; the probe runs OUTSIDE the
+// lock, single-flight (leaderProbeWait), so one slow or dead connection
+// cannot pin the mutex or the cached hot path; the candidate connect plus
+// try-lock runs outside the lock under leaderAcquireTimeout, serialized on
+// leaderAcquireMu (which the cached hot path never takes). The same rule
+// drives the lifecycle: a session is only closed after
+// detachLeaderSessionLocked cleared every cached field BEFORE any I/O, and
+// ReleaseLeadership clears the cache even when the unlock round-trip fails (a
+// failed unlock on a live session leaves the lock held, so the session is
+// closed to release it deterministically).
 //
 // TryAcquireLeadership takes a session-level Postgres advisory lock on a
 // dedicated connection held outside the pool. Advisory locks die with the
@@ -4169,80 +4223,189 @@ func (s *PostgresStore) TryAcquireLeadership(ctx context.Context, key string, tt
 	if ttl <= 0 {
 		return false, fmt.Errorf("storage: non-positive leadership ttl")
 	}
-	s.leaderMu.Lock()
-	defer s.leaderMu.Unlock()
-	if s.leaderConn != nil && s.leaderKey == key && time.Now().Before(s.leaderHeldUntil) {
-		// Cached success: verify the session that took the lock is still
-		// alive before renewing. Derive the probe from the caller's context
-		// without its cancellation so a canceled caller cannot tear down a
-		// live leader session, while a dead session is detected regardless.
-		probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), leaderProbeTimeout)
-		err := s.leaderConn.Ping(probeCtx)
-		cancel()
-		if err == nil {
-			s.leaderHeldUntil = time.Now().Add(ttl)
-			return true, nil
+	interval := leaderProbeInterval(ttl)
+	for {
+		s.leaderMu.Lock()
+		if s.leaderConn != nil && s.leaderKey == key && time.Now().Before(s.leaderHeldUntil) {
+			conn := s.leaderConn
+			if !conn.IsClosed() {
+				if time.Since(s.leaderProbedAt) < interval {
+					// The last successful proof is still fresh: renew the
+					// soft window and return without any round-trip. This is
+					// the scheduler hot path (every runner poll, twice per
+					// Maintain tick).
+					s.leaderHeldUntil = time.Now().Add(ttl)
+					s.leaderMu.Unlock()
+					return true, nil
+				}
+				if waiter := s.leaderProbeWait; waiter != nil {
+					// A probe for this session is already in flight: wait for
+					// its bounded result (or this caller's cancellation) and
+					// re-evaluate the cache instead of stacking duplicate
+					// probes.
+					s.leaderMu.Unlock()
+					select {
+					case <-waiter:
+					case <-ctx.Done():
+						return false, ctx.Err()
+					}
+					continue
+				}
+				// Proof is stale: probe OUTSIDE leaderMu, single-flight, so a
+				// slow or dead connection cannot pin the mutex or the cached
+				// hot path.
+				waiter := make(chan struct{})
+				s.leaderProbeWait = waiter
+				s.leaderMu.Unlock()
+
+				probeErr := s.probeLeaderConn(ctx, conn)
+
+				s.leaderMu.Lock()
+				close(waiter)
+				s.leaderProbeWait = nil
+				stillCached := s.leaderConn == conn && s.leaderKey == key && time.Now().Before(s.leaderHeldUntil)
+				if stillCached && probeErr == nil {
+					now := time.Now()
+					s.leaderProbedAt = now
+					s.leaderHeldUntil = now.Add(ttl)
+					s.leaderMu.Unlock()
+					return true, nil
+				}
+				if stillCached {
+					// The session (and with it the advisory lock) is gone:
+					// another replica may already hold the key. Drop the
+					// stale cache and run the normal acquisition path; never
+					// report the cached true.
+					deadConn := s.detachLeaderSessionLocked()
+					s.leaderMu.Unlock()
+					s.closeLeaderConn(deadConn)
+					continue
+				}
+				s.leaderMu.Unlock()
+				continue
+			}
+			// Locally closed session: the advisory lock died with it. Drop
+			// without a round-trip and re-enter the loop for acquisition.
+			deadConn := s.detachLeaderSessionLocked()
+			s.leaderMu.Unlock()
+			s.closeLeaderConn(deadConn)
+			continue
 		}
-		// The session (and with it the advisory lock) is gone: another
-		// replica may already hold the key. Drop the stale cache and run
-		// the normal acquisition path; never report the cached true.
-		s.dropLeaderSessionLocked()
+		if s.leaderConn != nil {
+			// Key change or elapsed local TTL: the old session must not stay
+			// cached as proof for a key it does not hold.
+			deadConn := s.detachLeaderSessionLocked()
+			s.leaderMu.Unlock()
+			s.closeLeaderConn(deadConn)
+			continue
+		}
+		s.leaderMu.Unlock()
+
+		// No cached leadership: acquire a candidate session. Acquisition is
+		// serialized on leaderAcquireMu and its round-trips run outside
+		// leaderMu under a bounded context.
+		got, done, err := s.acquireLeaderSession(ctx, key, ttl, interval)
+		if done {
+			return got, err
+		}
+		// A concurrent caller cached a live session while this one waited to
+		// acquire; re-evaluate it through the cached path above.
 	}
-	if s.leaderConn != nil {
-		// Key change or local TTL elapsed: the old session must not stay
-		// cached as proof for a key it does not hold.
-		s.dropLeaderSessionLocked()
+}
+
+// probeLeaderConn runs the cached-session liveness round-trip OUTSIDE
+// leaderMu, bounded by leaderProbeTimeout and detached from the caller's
+// cancellation: a canceled caller must not tear down a live leader session,
+// while a dead session is detected and dropped regardless.
+func (s *PostgresStore) probeLeaderConn(ctx context.Context, conn *pgx.Conn) error {
+	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), leaderProbeTimeout)
+	defer cancel()
+	return leaderProbeFn(probeCtx, conn)
+}
+
+// acquireLeaderSession opens a fresh dedicated session and attempts the
+// advisory lock for key, returning done=false when a concurrent caller cached
+// a live session while this one waited on leaderAcquireMu, so the caller
+// re-evaluates the cache instead of opening a duplicate session. Everything
+// runs outside leaderMu; the caller's context (capped at
+// leaderAcquireTimeout) bounds the connect and try-lock so a black-holed
+// database cannot block for the driver's multi-minute default connect
+// timeout.
+func (s *PostgresStore) acquireLeaderSession(ctx context.Context, key string, ttl, interval time.Duration) (got, done bool, err error) {
+	s.leaderAcquireMu.Lock()
+	defer s.leaderAcquireMu.Unlock()
+
+	// Re-check the cache: a concurrent acquisition may have cached the key
+	// while this call waited. A fresh proof is reused; a stale one is left to
+	// the caller's cached path so the throttle and probe rules still apply.
+	s.leaderMu.Lock()
+	if s.leaderConn != nil && s.leaderKey == key && time.Now().Before(s.leaderHeldUntil) && !s.leaderConn.IsClosed() {
+		if time.Since(s.leaderProbedAt) < interval {
+			s.leaderHeldUntil = time.Now().Add(ttl)
+			s.leaderMu.Unlock()
+			return true, true, nil
+		}
+		s.leaderMu.Unlock()
+		return false, false, nil
+	}
+	// A session for another key (or a locally closed one) must not outlive
+	// this acquisition: the store keeps at most one cached leader session.
+	oldConn := s.detachLeaderSessionLocked()
+	s.leaderMu.Unlock()
+	s.closeLeaderConn(oldConn)
+
+	if s.pool == nil {
+		return false, true, fmt.Errorf("storage: pool unavailable")
 	}
 	cc := s.pool.Config().ConnConfig
 	if cc == nil {
-		return false, fmt.Errorf("storage: pool has no conn config")
+		return false, true, fmt.Errorf("storage: pool has no conn config")
 	}
-	conn, err := pgx.ConnectConfig(ctx, cc)
+	actx, cancel := context.WithTimeout(ctx, leaderAcquireTimeout)
+	defer cancel()
+	conn, err := pgx.ConnectConfig(actx, cc)
 	if err != nil {
-		return false, err
+		return false, true, err
 	}
-	var got bool
-	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtext($1))`, key).Scan(&got); err != nil {
-		s.closeLeaderCandidateLocked(conn)
-		return false, err
+	var acquired bool
+	if err := conn.QueryRow(actx, `SELECT pg_try_advisory_lock(hashtext($1))`, key).Scan(&acquired); err != nil {
+		s.closeLeaderConn(conn)
+		return false, true, err
 	}
-	if !got {
-		s.closeLeaderCandidateLocked(conn)
-		return false, nil
+	if !acquired {
+		s.closeLeaderConn(conn)
+		return false, true, nil
 	}
+	now := time.Now()
+	s.leaderMu.Lock()
 	s.leaderConn = conn
 	s.leaderKey = key
-	s.leaderHeldUntil = time.Now().Add(ttl)
-	return true, nil
+	s.leaderProbedAt = now
+	s.leaderHeldUntil = now.Add(ttl)
+	s.leaderMu.Unlock()
+	return true, true, nil
 }
 
-// dropLeaderSessionLocked releases and closes the cached leader session,
-// clearing every cached field BEFORE the network round-trips so a concurrent
-// reader can never observe a closed connection as a held leadership proof.
-// The explicit unlock is best-effort: closing the session releases every
-// session-level advisory lock even when the unlock round-trip fails. Caller
-// holds leaderMu.
-func (s *PostgresStore) dropLeaderSessionLocked() {
-	conn, key := s.leaderConn, s.leaderKey
+// detachLeaderSessionLocked removes the cached leader session and returns its
+// connection, clearing every cached field BEFORE any I/O so no concurrent
+// reader can observe a released session as a held-leadership proof. The
+// caller holds leaderMu and must close the returned connection outside the
+// lock (closeLeaderConn). Returns nil when nothing was cached.
+func (s *PostgresStore) detachLeaderSessionLocked() *pgx.Conn {
+	conn := s.leaderConn
 	s.leaderConn = nil
 	s.leaderKey = ""
 	s.leaderHeldUntil = time.Time{}
-	if conn == nil {
-		return
-	}
-	if key != "" {
-		uctx, cancel := context.WithTimeout(context.Background(), leaderProbeTimeout)
-		_, _ = conn.Exec(uctx, `SELECT pg_advisory_unlock(hashtext($1))`, key)
-		cancel()
-	}
-	s.closeLeaderCandidateLocked(conn)
+	s.leaderProbedAt = time.Time{}
+	return conn
 }
 
-// closeLeaderCandidateLocked closes a leader-candidate connection that was
-// never cached (a failed acquisition attempt) with a bounded context, so a
-// wedged socket cannot pin leaderMu and no failed attempt leaks a session.
-// The caller must not be holding a cache entry for conn.
-func (s *PostgresStore) closeLeaderCandidateLocked(conn *pgx.Conn) {
+// closeLeaderConn closes a session connection that was already detached from
+// the cache (a dropped leader session or a rejected acquisition candidate).
+// Closing the PostgreSQL session releases every session-level advisory lock it
+// holds, so no separate unlock round-trip is needed on the drop path. The
+// close is bounded and best-effort, and runs outside leaderMu.
+func (s *PostgresStore) closeLeaderConn(conn *pgx.Conn) {
 	if conn == nil {
 		return
 	}
@@ -4253,20 +4416,21 @@ func (s *PostgresStore) closeLeaderCandidateLocked(conn *pgx.Conn) {
 
 func (s *PostgresStore) ReleaseLeadership(ctx context.Context, key string) error {
 	s.leaderMu.Lock()
-	defer s.leaderMu.Unlock()
 	if s.leaderConn == nil || s.leaderKey != key {
+		s.leaderMu.Unlock()
 		return nil
 	}
-	conn := s.leaderConn
-	_, err := conn.Exec(ctx, `SELECT pg_advisory_unlock(hashtext($1))`, key)
-	// Clear the cache unconditionally, then close the session. When the
-	// unlock round-trip failed on a live connection the lock is still
-	// held, and the close is what releases it; when it failed because the
-	// session was already dead, the cached entry was stale anyway.
-	s.leaderConn = nil
-	s.leaderKey = ""
-	s.leaderHeldUntil = time.Time{}
-	s.closeLeaderCandidateLocked(conn)
+	conn := s.detachLeaderSessionLocked()
+	s.leaderMu.Unlock()
+	// The unlock round-trip runs outside leaderMu, bounded by the caller's
+	// context capped at leaderProbeTimeout, and its error is returned: a
+	// failed unlock on a live session leaves the lock held and the close
+	// below releases it deterministically; on an already-dead session the
+	// failed round-trip is the contract this method reports.
+	uctx, cancel := context.WithTimeout(ctx, leaderProbeTimeout)
+	defer cancel()
+	_, err := conn.Exec(uctx, `SELECT pg_advisory_unlock(hashtext($1))`, key)
+	s.closeLeaderConn(conn)
 	return err
 }
 

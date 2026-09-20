@@ -270,6 +270,59 @@ func TestDrainDBAggregateCountIndependentOfRunScans(t *testing.T) {
 	}
 }
 
+// TestDrainStatusReportsActiveJobsKnown pins the ActiveJobsKnown field of the
+// drain-status response for BOTH values: false while the store cannot produce
+// the in-flight count (ActiveJobs is then the fail-closed unknownActiveJobs
+// value, never zero, so the drain keeps waiting), and true with the
+// authoritative count once the store recovers.
+func TestDrainStatusReportsActiveJobsKnown(t *testing.T) {
+	s := New("secret")
+	f := newDBFakeStore()
+	if err := s.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := f.InsertRun(ctx, model.Run{ID: "run-1", Status: model.StatusRunning}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.InsertJob(ctx, model.Job{ID: "job-1", RunID: "run-1", Status: model.StatusRunning}); err != nil {
+		t.Fatal(err)
+	}
+	s.BeginDrain("db drain")
+	f.countRunningErr = errors.New("count unavailable")
+
+	w := doJSON(t, s, http.MethodGet, "/api/v1/drain", "secret", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("drain status with an unavailable count = %d: %s", w.Code, w.Body.String())
+	}
+	var st drainStatus
+	if err := json.Unmarshal(w.Body.Bytes(), &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.ActiveJobsKnown {
+		t.Fatalf("ActiveJobsKnown with an unavailable store count = true; status = %+v", st)
+	}
+	if st.ActiveJobs != unknownActiveJobs || st.ActiveJobs == 0 {
+		t.Fatalf("ActiveJobs with an unavailable count = %d; want the fail-closed %d", st.ActiveJobs, unknownActiveJobs)
+	}
+	if !st.Draining {
+		t.Fatalf("drain status while the count is unavailable must report draining: %+v", st)
+	}
+
+	// Recovery: an authoritative aggregate count is reported with known=true.
+	f.countRunningErr = nil
+	w = doJSON(t, s, http.MethodGet, "/api/v1/drain", "secret", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("drain status after recovery = %d: %s", w.Code, w.Body.String())
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &st); err != nil {
+		t.Fatal(err)
+	}
+	if !st.ActiveJobsKnown || st.ActiveJobs != 1 {
+		t.Fatalf("ActiveJobsKnown/ActiveJobs after recovery = %v/%d; want true/1", st.ActiveJobsKnown, st.ActiveJobs)
+	}
+}
+
 // TestDrainMemoryModeCountKnown pins the memory-mode behavior: the
 // in-memory maps are authoritative, so the count is always known and never
 // consults the store.

@@ -576,9 +576,13 @@ func (o *Outbox) QueueKnownDurable(item forge.OutboxItem) {
 // inside another transaction (completion effect intents written by
 // storage.CompleteJob): the local copy lets this instance dispatch and ack
 // the pre-existing rows under the same IDs.
-// HasIntent reports whether an intent with this ID is already queued,
-// durably appended or currently in flight. Recovery paths use it to treat a
-// duplicate enqueue as success.
+//
+// HasIntent reports whether an intent with this ID is currently queued in
+// this process (a durable local mirror, a local-only item or a pre-existing
+// row registered through QueueKnownDurable). It compares IDs only, never
+// content, so it must NOT be used to treat a duplicate enqueue as success:
+// Outbox.Enqueue already returns nil for an identical-content replay and
+// ErrOutboxIDConflict when the ID carries different content.
 func (o *Outbox) HasIntent(id string) bool {
 	if id == "" {
 		return false
@@ -770,15 +774,16 @@ func boundedDetach(origin context.Context, bound time.Duration) (context.Context
 // dispatch to two minutes and the caller may cancel it sooner; a release on
 // that context reaches PostgreSQL already cancelled, so pgx refuses it and
 // (if the error were discarded) up to OutboxClaimBatch claimed rows would stay
-// invisible to every other replica until OutboxClaimTTL. context.WithoutCancel
-// keeps the context values but drops cancellation and the deadline; a FRESH
-// timeout per release (rather than one per flush) gives each release a full
-// window, because the deferred cleanup runs after the batch dispatch, when a
-// context created at claim time could already be expired. Failures are logged
-// with the row ID instead of discarded: the row stays durable and is reclaimed
-// after the TTL, but the operator must see why the retry is delayed.
+// invisible to every other replica until OutboxClaimTTL. The boundedDetach
+// helper is the ONLY sanctioned detach in this package: it drops cancellation
+// while preserving values and imposes a FRESH timeout per release (rather than
+// one per flush), so each release gets a full window even though the deferred
+// cleanup runs after the batch dispatch, when a context created at claim time
+// could already be expired. Failures are logged with the row ID instead of
+// discarded: the row stays durable and is reclaimed after the TTL, but the
+// operator must see why the retry is delayed.
 func (o *Outbox) releaseOutboxClaimCleanup(ctx context.Context, id, claimer string) {
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), outboxClaimReleaseTimeout)
+	cleanupCtx, cancel := boundedDetach(ctx, outboxClaimReleaseTimeout)
 	defer cancel()
 	if err := o.db.ReleaseOutboxClaim(cleanupCtx, id, claimer); err != nil {
 		log.Printf("outbox: release claim for %s: %v (row stays claimed until OutboxClaimTTL)", id, err)

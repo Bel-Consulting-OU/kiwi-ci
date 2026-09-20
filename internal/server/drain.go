@@ -16,7 +16,10 @@ type drainRequest struct {
 	Reason string `json:"reason,omitempty"`
 }
 
-// drainStatus is the GET /api/v1/drain response.
+// drainStatus is the GET /api/v1/drain (and POST /api/v1/drain success)
+// response. ActiveJobsKnown distinguishes an authoritative in-flight count
+// (true) from the fail-closed reporting value (false); a caller must never
+// read ActiveJobs as "drained" while ActiveJobsKnown is false.
 type drainStatus struct {
 	Draining   bool   `json:"draining"`
 	Reason     string `json:"reason,omitempty"`
@@ -195,11 +198,18 @@ func (s *Server) drainServer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.drainStatusSnapshot())
 }
 
-// drainStatus implements GET /api/v1/drain (admin tier).
+// drainStatus implements GET /api/v1/drain (admin tier). The response's
+// ActiveJobsKnown reports whether ActiveJobs is the store's authoritative
+// in-flight count: false means the count was unavailable and a drain must
+// keep waiting (ActiveJobs is then the fail-closed unknownActiveJobs value).
 func (s *Server) drainStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.drainStatusSnapshot())
 }
 
+// drainStatusSnapshot builds the drain-status body, folding an unavailable
+// store count into ActiveJobsKnown=false with ActiveJobs set to the
+// fail-closed unknownActiveJobs value so the JSON itself can never read as
+// drained.
 func (s *Server) drainStatusSnapshot() drainStatus {
 	n, known := s.activeJobCount()
 	if !known {

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"net/http"
 	"os"
@@ -118,27 +119,20 @@ func TestSqueezeNewPersistentSymlinkedDataDir(t *testing.T) {
 	}
 }
 
-// TestSqueezeNewPersistentPersistFailure makes the final snapshot write fail
-// after every loader succeeded. The injection is a read-only data directory,
-// which the OS only enforces for a non-root euid: root bypasses the write bit
-// (CAP_DAC_OVERRIDE), so there is no root-proof way to fail the trailing
-// constructor persist while keeping the loaders working (a directory at
-// state.json would fail the loader first).
+// TestSqueezeNewPersistentPersistFailure makes the constructor's trailing
+// state persist fail after every loader has succeeded. The pre-persist seam
+// arms the existing persistFailForTest switch, so the assertion is
+// deterministic and active as root: no filesystem injection can fail the
+// trailing write while all loaders still work (root bypasses permission
+// bits, and a directory at state.json or a dangling data dir fails a loader
+// or the log-seq checkpoint first).
 func TestSqueezeNewPersistentPersistFailure(t *testing.T) {
-	testutil.UnixChmod(t)
-	testutil.RequireNonRoot(t)
-	dir := t.TempDir()
-	if _, err := NewPersistentWithCluster("t", "t", dir, nil); err != nil {
-		t.Fatal(err)
-	}
-	// Verify the persisted snapshot is rewritten on the next start; make the
-	// directory unwritable so that write fails.
-	if err := os.Chmod(dir, 0o500); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
-	if _, err := NewPersistentWithCluster("t", "t", dir, nil); err == nil {
-		t.Fatal("read-only data dir = nil error, want persist failure")
+	persistErr := errors.New("state snapshot unwritable")
+	old := prePersistHook
+	prePersistHook = func(s *Server) { s.persistFailForTest = persistErr }
+	t.Cleanup(func() { prePersistHook = old })
+	if _, err := NewPersistentWithCluster("t", "t", t.TempDir(), nil); !errors.Is(err, persistErr) {
+		t.Fatalf("constructor with failing trailing persist = %v; want %v", err, persistErr)
 	}
 }
 

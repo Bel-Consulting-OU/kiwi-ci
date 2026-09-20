@@ -157,11 +157,13 @@ func (s *Server) enqueueDownstreamIntent(ctx context.Context, j model.Job, run m
 		}
 	}
 	if err := s.outbox.Enqueue(ctx, item); err != nil {
-		if s.outbox.HasIntent(item.ID) {
-			// Already queued in this process (concurrent replay): the
-			// deterministic ID means the durable copy is the same intent.
-			return nil
-		}
+		// A deterministic ID already queued with DIFFERENT content is
+		// ErrOutboxIDConflict: the existing intent belongs to another
+		// operation, and acknowledging this enqueue would silently drop the
+		// conflicting spec's event/inputs while the link looked dispatched.
+		// An identical-content replay needs no fallback here — Enqueue itself
+		// returns nil for it — so no HasIntent short-circuit may mask the
+		// conflict.
 		return fmt.Errorf("downstream: outbox enqueue failed: %w", err)
 	}
 	return nil

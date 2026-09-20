@@ -3,7 +3,7 @@
 // tests below against the real .woodpecker/*.yml tree and against doctored
 // copies in temporary directories.
 //
-// The guard encodes three CI invariants:
+// The guard encodes four CI invariants:
 //
 //  1. A workflow that runs on Woodpecker's local backend (a step whose image
 //     names a local-shell executable -- bash/sh/dash/zsh/ksh/busybox,
@@ -15,9 +15,16 @@
 //     $HOME configuration, curl|sh).
 //  2. Native/local workflows must stay on trusted push/manual/tag events and
 //     must advertise backend: local in their workflow-level labels.
-//  3. No branch-protection required context may name a workflow that never
-//     runs on pull_request, or every PR waits for a check that is never
-//     scheduled.
+//  3. No branch-protection context (the required PR list, the push list, or
+//     the native observability list) may name a workflow that does not exist
+//     or that never runs on the event the context claims.
+//  4. A workflow or step that declares a host volume -- the Docker daemon
+//     socket above all -- must not run on pull_request. Woodpecker gates
+//     volumes on the repository-level Trusted flag only, with no per-event or
+//     fork gating, so a PR-triggered host-volume mount executes PR-authored
+//     code with agent-host privilege (the socket is host-root equivalent).
+//     This rule applies to container workflows too, where the local-agent
+//     assertions above do not.
 package workflowguard
 
 import (
@@ -56,6 +63,26 @@ type Step struct {
 	Image       string
 	Commands    []string
 	Environment map[string]string
+	// Volumes are the step's `volumes` entries, e.g.
+	// "/var/run/docker.sock:/var/run/docker.sock" or "gopath:/go".
+	Volumes []string
+}
+
+// Volume is one workflow-level volume definition. Path is the volume source:
+// a host path for host volumes, otherwise a name the container runtime or the
+// workflow resolves.
+type Volume struct {
+	Name string
+	Path string
+}
+
+// VolumeMount is one host volume the workflow declares. Step is the step
+// declaring it (empty for a workflow-level definition), Source is the
+// host-side path and Spec the raw entry the operator wrote.
+type VolumeMount struct {
+	Step   string
+	Source string
+	Spec   string
 }
 
 // Workflow is the subset of a Woodpecker workflow the guard inspects.
@@ -67,6 +94,8 @@ type Workflow struct {
 	// Events are the `when` event names (event may be a scalar or a list).
 	Events []string
 	Steps  []Step
+	// Volumes are the workflow-level volume definitions.
+	Volumes []Volume
 	// SecretPaths are YAML paths under which a secret is referenced through
 	// `secrets:` or `from_secret`.
 	SecretPaths []string
@@ -160,6 +189,142 @@ func parseEvents(when *yaml.Node) []string {
 	return out
 }
 
+// windowsDrivePattern matches the start of a Windows host path (C:\... or
+// C:/...), which must not be mistaken for a source:target separator.
+var windowsDrivePattern = regexp.MustCompile(`^[A-Za-z]:[\\/]`)
+
+// parseWorkflowVolumes reads the workflow-level `volumes` definitions. The
+// documented form is a sequence of {name, path} mappings; scalar entries and a
+// name->path mapping are accepted too, so a reformat cannot hide a host path
+// from the guard.
+func parseWorkflowVolumes(vols *yaml.Node) []Volume {
+	if vols == nil {
+		return nil
+	}
+	fromScalar := func(v *yaml.Node) Volume {
+		spec := strings.TrimSpace(v.Value)
+		if i := strings.IndexByte(spec, ':'); i >= 0 && !windowsDrivePattern.MatchString(spec) {
+			return Volume{Name: strings.TrimSpace(spec[:i]), Path: strings.TrimSpace(spec[i+1:])}
+		}
+		return Volume{Path: spec}
+	}
+	var out []Volume
+	switch vols.Kind {
+	case yaml.SequenceNode:
+		for _, entry := range vols.Content {
+			switch entry.Kind {
+			case yaml.ScalarNode:
+				out = append(out, fromScalar(entry))
+			case yaml.MappingNode:
+				v := Volume{}
+				if name := mappingValue(entry, "name"); name != nil && name.Kind == yaml.ScalarNode {
+					v.Name = name.Value
+				}
+				if path := mappingValue(entry, "path"); path != nil && path.Kind == yaml.ScalarNode {
+					v.Path = path.Value
+				}
+				out = append(out, v)
+			}
+		}
+	case yaml.MappingNode:
+		for i := 0; i+1 < len(vols.Content); i += 2 {
+			if val := vols.Content[i+1]; val.Kind == yaml.ScalarNode {
+				out = append(out, Volume{Name: vols.Content[i].Value, Path: val.Value})
+			}
+		}
+	}
+	return out
+}
+
+// volumeSource returns the source side of a `source:target` volume entry,
+// tolerating Windows drive letters. A bare path (no separator) is returned
+// unchanged.
+func volumeSource(spec string) string {
+	s := strings.TrimSpace(spec)
+	if windowsDrivePattern.MatchString(s) {
+		if i := strings.IndexByte(s[2:], ':'); i >= 0 {
+			return strings.TrimSpace(s[:2+i])
+		}
+		return s
+	}
+	if i := strings.IndexByte(s, ':'); i >= 0 {
+		return strings.TrimSpace(s[:i])
+	}
+	return s
+}
+
+// hostVolumeSource reports whether a volume source names a path on the agent
+// host (absolute POSIX path, home-relative path, relative dot path, or a
+// Windows drive path, and the Docker socket specifically) rather than a
+// container-runtime named volume.
+func hostVolumeSource(source string) bool {
+	s := strings.TrimSpace(source)
+	if s == "" {
+		return false
+	}
+	if strings.Contains(strings.ToLower(s), "docker.sock") {
+		return true
+	}
+	if strings.HasPrefix(s, "/") || strings.HasPrefix(s, "~") ||
+		strings.HasPrefix(s, "./") || strings.HasPrefix(s, "../") {
+		return true
+	}
+	return windowsDrivePattern.MatchString(s)
+}
+
+// HostVolumeMounts returns every host volume the workflow declares: step
+// `volumes` entries whose source is a host path (or the Docker socket by
+// name), plus workflow-level volumes defined with a host path, including named
+// host volumes mounted by a step. Entries are deduplicated per step and spec.
+func (w Workflow) HostVolumeMounts() []VolumeMount {
+	hostNames := map[string]string{}
+	var out []VolumeMount
+	seen := map[string]bool{}
+	add := func(m VolumeMount) {
+		key := m.Step + "\x00" + m.Spec
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, m)
+	}
+	for _, v := range w.Volumes {
+		if !hostVolumeSource(v.Path) {
+			continue
+		}
+		spec := v.Path
+		if v.Name != "" {
+			spec = v.Name + ":" + v.Path
+			hostNames[v.Name] = v.Path
+		}
+		add(VolumeMount{Source: v.Path, Spec: spec})
+	}
+	for _, s := range w.Steps {
+		for _, spec := range s.Volumes {
+			source := volumeSource(spec)
+			if !hostVolumeSource(source) {
+				if path, ok := hostNames[source]; ok {
+					add(VolumeMount{Step: s.Name, Source: path, Spec: spec})
+				}
+				continue
+			}
+			add(VolumeMount{Step: s.Name, Source: source, Spec: spec})
+		}
+	}
+	return out
+}
+
+// pullRequestEvents returns the workflow's pull_request-family events.
+func pullRequestEvents(events []string) []string {
+	var out []string
+	for _, ev := range events {
+		if ev == "pull_request" || strings.HasPrefix(ev, "pull_request_") {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
 // LoadFile parses one workflow file into the guard's view.
 func LoadFile(path string) (Workflow, error) {
 	b, err := os.ReadFile(path)
@@ -186,6 +351,7 @@ func LoadFile(path string) (Workflow, error) {
 	if when := mappingValue(doc, "when"); when != nil {
 		w.Events = parseEvents(when)
 	}
+	w.Volumes = parseWorkflowVolumes(mappingValue(doc, "volumes"))
 	if steps := mappingValue(doc, "steps"); steps != nil && steps.Kind == yaml.MappingNode {
 		for i := 0; i+1 < len(steps.Content); i += 2 {
 			step := Step{Name: steps.Content[i].Value, Environment: map[string]string{}}
@@ -207,6 +373,13 @@ func LoadFile(path string) (Workflow, error) {
 						step.Environment[key] = val.Value
 					} else if mappingValue(val, "from_secret") != nil {
 						step.Environment[key] = "from_secret"
+					}
+				}
+			}
+			if vols := mappingValue(node, "volumes"); vols != nil && vols.Kind == yaml.SequenceNode {
+				for _, v := range vols.Content {
+					if v.Kind == yaml.ScalarNode {
+						step.Volumes = append(step.Volumes, v.Value)
 					}
 				}
 			}
@@ -344,16 +517,22 @@ func IsLocal(w Workflow) bool {
 	return false
 }
 
-// CheckWorkflow applies the local-agent boundary rules. Non-local workflows
-// are out of scope for these assertions (container isolation is the
-// boundary there).
+// CheckWorkflow applies the boundary rules. The host-volume/trust rule
+// applies to every workflow -- a container does not protect the agent host
+// from a mounted daemon socket -- while the local-agent assertions apply only
+// to local workflows, where container isolation is not the boundary.
 func CheckWorkflow(w Workflow) []Finding {
-	if !IsLocal(w) {
-		return nil
-	}
 	var findings []Finding
 	add := func(step, kind, msg string) {
 		findings = append(findings, Finding{File: w.File, Step: step, Kind: kind, Message: msg})
+	}
+	if pr := pullRequestEvents(w.Events); len(pr) > 0 {
+		for _, m := range w.HostVolumeMounts() {
+			add(m.Step, "host-volume-pr", fmt.Sprintf("declares host volume %q but lists %s; host volumes run with agent-host privilege (the Docker socket is host-root equivalent) and Woodpecker gates them only on the repository Trusted flag, never on PR/fork origin, so they must stay on trusted push/manual/tag events", m.Spec, strings.Join(pr, ", ")))
+		}
+	}
+	if !IsLocal(w) {
+		return findings
 	}
 	if !strings.EqualFold(strings.TrimSpace(w.Labels["backend"]), "local") {
 		add("", "local-labels", "runs local-shell steps but the workflow labels do not advertise backend: local")
@@ -400,17 +579,17 @@ func CheckWorkflow(w Workflow) []Finding {
 	return findings
 }
 
-// ParseRequiredContexts extracts the required PR status contexts from the
-// branch-protection script's CONTEXTS line textually (the script is shell,
-// not YAML).
-func ParseRequiredContexts(script string) []string {
+// ParseContexts extracts the default value of the named context-list variable
+// from the branch-protection script textually (the script is shell, not YAML).
+func ParseContexts(script, variable string) []string {
 	var out []string
+	prefix := variable + "="
 	for _, line := range strings.Split(script, "\n") {
 		trimmed := strings.TrimSpace(line)
-		if !strings.HasPrefix(trimmed, "CONTEXTS=") {
+		if !strings.HasPrefix(trimmed, prefix) {
 			continue
 		}
-		value := strings.TrimSpace(strings.TrimPrefix(trimmed, "CONTEXTS="))
+		value := strings.TrimSpace(strings.TrimPrefix(trimmed, prefix))
 		if strings.HasPrefix(value, `"`) {
 			value = strings.TrimPrefix(value, `"`)
 			if i := strings.Index(value, `"`); i >= 0 {
@@ -428,6 +607,12 @@ func ParseRequiredContexts(script string) []string {
 		out = append(out, strings.Fields(value)...)
 	}
 	return out
+}
+
+// ParseRequiredContexts extracts the required PR status contexts from the
+// branch-protection script's CONTEXTS line.
+func ParseRequiredContexts(script string) []string {
+	return ParseContexts(script, "CONTEXTS")
 }
 
 // workflowName is the Woodpecker workflow identity used in status contexts:
@@ -459,18 +644,41 @@ func runsOnEvent(events []string, want string) bool {
 	return false
 }
 
-// CheckRequiredContexts fails when a required context cannot ever be produced:
-// the format must be ci/woodpecker/<event>/<workflow>[/<axis>], the workflow
-// must exist, and its `when` events must include the event that the context
-// claims. This is the invariant that a context naming a workflow absent from
-// the required event would otherwise wait forever.
+// contextListVars are the branch-protection script variables whose default
+// context lists the guard validates: CONTEXTS is the required-for-PR list,
+// PUSH_CONTEXTS gates direct pushes, and NATIVE_CONTEXTS is the native-gate
+// observability list. A stale name in any of them is a protection bug, so all
+// three are cross-checked against the workflow tree.
+var contextListVars = []string{"CONTEXTS", "PUSH_CONTEXTS", "NATIVE_CONTEXTS"}
+
+// CheckContextLists validates every context list the branch-protection script
+// defaults to.
+func CheckContextLists(workflows []Workflow, script string) []Finding {
+	var findings []Finding
+	for _, variable := range contextListVars {
+		findings = append(findings, CheckContextList(workflows, script, variable)...)
+	}
+	return findings
+}
+
+// CheckRequiredContexts validates the required-for-PR CONTEXTS list.
 func CheckRequiredContexts(workflows []Workflow, script string) []Finding {
+	return CheckContextList(workflows, script, "CONTEXTS")
+}
+
+// CheckContextList fails when a context in the named script variable cannot
+// ever be produced: the format must be
+// ci/woodpecker/<event>/<workflow>[/<axis>], the workflow must exist, and its
+// `when` events must include the event that the context claims. This is the
+// invariant that a context naming a workflow absent from the claimed event
+// would otherwise wait forever.
+func CheckContextList(workflows []Workflow, script, variable string) []Finding {
 	byName := map[string]Workflow{}
 	for _, w := range workflows {
 		byName[workflowName(w)] = w
 	}
 	var findings []Finding
-	for _, ctx := range ParseRequiredContexts(script) {
+	for _, ctx := range ParseContexts(script, variable) {
 		if !strings.HasPrefix(ctx, "ci/woodpecker/") {
 			continue
 		}
@@ -478,7 +686,7 @@ func CheckRequiredContexts(workflows []Workflow, script string) []Finding {
 		if len(parts) < 2 {
 			findings = append(findings, Finding{
 				File: "scripts/gh-branch-protection.sh", Kind: "required-context",
-				Message: fmt.Sprintf("required context %q is malformed: want ci/woodpecker/<event>/<workflow>[/<axis>]", ctx),
+				Message: fmt.Sprintf("context %q in %s is malformed: want ci/woodpecker/<event>/<workflow>[/<axis>]", ctx, variable),
 			})
 			continue
 		}
@@ -487,7 +695,7 @@ func CheckRequiredContexts(workflows []Workflow, script string) []Finding {
 		if !eventKnown {
 			findings = append(findings, Finding{
 				File: "scripts/gh-branch-protection.sh", Kind: "required-context",
-				Message: fmt.Sprintf("required context %q uses unknown event segment %q", ctx, event),
+				Message: fmt.Sprintf("context %q in %s uses unknown event segment %q", ctx, variable, event),
 			})
 			continue
 		}
@@ -495,14 +703,14 @@ func CheckRequiredContexts(workflows []Workflow, script string) []Finding {
 		if !ok {
 			findings = append(findings, Finding{
 				File: "scripts/gh-branch-protection.sh", Kind: "required-context",
-				Message: fmt.Sprintf("required context %q names workflow %q with no matching .woodpecker workflow", ctx, name),
+				Message: fmt.Sprintf("context %q in %s names workflow %q with no matching .woodpecker workflow", ctx, variable, name),
 			})
 			continue
 		}
 		if !runsOnEvent(w.Events, want) {
 			findings = append(findings, Finding{
 				File: w.File, Kind: "required-context",
-				Message: fmt.Sprintf("workflow %q is required as context %q but never runs on %s (events: %s)", name, ctx, want, strings.Join(w.Events, ", ")),
+				Message: fmt.Sprintf("workflow %q is listed as context %q in %s but never runs on %s (events: %s)", name, ctx, variable, want, strings.Join(w.Events, ", ")),
 			})
 		}
 	}
@@ -552,7 +760,7 @@ func allFindings(t *testing.T, workflows []Workflow, script string) []Finding {
 	for _, w := range workflows {
 		out = append(out, CheckWorkflow(w)...)
 	}
-	return append(out, CheckRequiredContexts(workflows, script)...)
+	return append(out, CheckContextLists(workflows, script)...)
 }
 
 // TestWorkflowGuardCleanRepoPasses runs the guard against the real tree: it
@@ -593,7 +801,7 @@ func TestWorkflowGuardCleanRepoPasses(t *testing.T) {
 	if locals < 2 {
 		t.Fatalf("guard classified only %d local workflows, want at least native-macos and native-windows", locals)
 	}
-	for _, want := range []string{"native-macos.yml", "native-windows.yml", "linux-amd64.yml"} {
+	for _, want := range []string{"native-macos.yml", "native-windows.yml", "linux-amd64.yml", "docker-workspace.yml"} {
 		found := false
 		for _, w := range workflows {
 			if w.File == want {
@@ -604,23 +812,231 @@ func TestWorkflowGuardCleanRepoPasses(t *testing.T) {
 			t.Fatalf("workflow %s was not parsed", want)
 		}
 	}
+	// The host-volume rule must have real coverage: docker-workspace declares
+	// the socket and must not list any pull_request-family event, and the
+	// container (non-local) workflows must not hide host volumes either.
+	for _, w := range workflows {
+		if len(w.HostVolumeMounts()) > 0 && len(pullRequestEvents(w.Events)) > 0 {
+			t.Fatalf("%s: host volumes on %v", w.File, pullRequestEvents(w.Events))
+		}
+	}
 }
 
 // TestWorkflowGuardParsesRequiredContexts pins the textual parse of the
 // branch-protection script so a reformat cannot silently empty the required
-// context list the guard cross-checks.
+// context list the guard cross-checks. All three lists are pinned, including
+// the docker-workspace push-only decision (no `pr/` entry) and the native
+// push contexts.
 func TestWorkflowGuardParsesRequiredContexts(t *testing.T) {
 	root := repoRoot(t)
 	script := string(mustRead(t, filepath.Join(root, "scripts", "gh-branch-protection.sh")))
+
 	got := ParseRequiredContexts(script)
 	want := []string{
 		"ci/woodpecker/pr/linux-amd64",
 		"ci/woodpecker/pr/linux-arm64",
-		"ci/woodpecker/pr/docker-workspace",
 		"ci/woodpecker/pr/integration-coverage",
 	}
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Fatalf("ParseRequiredContexts = %v, want %v", got, want)
+	}
+	for _, forbidden := range []string{"docker-workspace"} {
+		for _, ctx := range got {
+			if strings.Contains(ctx, forbidden) {
+				t.Fatalf("required PR context %q names %s, which mounts the host Docker socket and must stay push-only", ctx, forbidden)
+			}
+		}
+	}
+
+	got = ParseContexts(script, "PUSH_CONTEXTS")
+	want = []string{
+		"ci/woodpecker/push/linux-amd64",
+		"ci/woodpecker/push/linux-arm64",
+		"ci/woodpecker/push/docker-workspace",
+		"ci/woodpecker/push/integration-coverage",
+	}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("ParseContexts(PUSH_CONTEXTS) = %v, want %v", got, want)
+	}
+
+	got = ParseContexts(script, "NATIVE_CONTEXTS")
+	want = []string{
+		"ci/woodpecker/push/native-windows",
+		"ci/woodpecker/push/native-macos",
+	}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("ParseContexts(NATIVE_CONTEXTS) = %v, want %v", got, want)
+	}
+
+	// The generic parse must not let one list's line satisfy another's.
+	only := "PUSH_CONTEXTS=\"${KIWI_PUSH_CONTEXTS:-ci/woodpecker/push/ghost}\"\n"
+	if got := ParseRequiredContexts(only); len(got) != 0 {
+		t.Fatalf("ParseRequiredContexts on a PUSH_CONTEXTS-only script = %v, want none", got)
+	}
+}
+
+// TestWorkflowGuardCoversRealDockerSocketLane proves the host-volume rule is
+// not vacuous on the real tree: it must see both docker-workspace socket
+// mounts, and the real workflow (trusted events only) must produce no finding.
+func TestWorkflowGuardCoversRealDockerSocketLane(t *testing.T) {
+	w, err := LoadFile(filepath.Join(repoRoot(t), ".woodpecker", "docker-workspace.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mounts := w.HostVolumeMounts()
+	if len(mounts) != 2 {
+		t.Fatalf("HostVolumeMounts = %d (%v), want the 2 docker.sock mounts", len(mounts), mounts)
+	}
+	steps := map[string]bool{}
+	for _, m := range mounts {
+		if !strings.Contains(m.Spec, "docker.sock") {
+			t.Fatalf("mount %+v does not name docker.sock", m)
+		}
+		steps[m.Step] = true
+	}
+	for _, want := range []string{"build-ci-image", "docker-workspace"} {
+		if !steps[want] {
+			t.Fatalf("socket mount in step %q not detected; mounts: %v", want, mounts)
+		}
+	}
+	if pr := pullRequestEvents(w.Events); len(pr) != 0 {
+		t.Fatalf("docker-workspace events include %v; the socket lane must stay on trusted events", pr)
+	}
+	if findings := CheckWorkflow(w); len(findings) != 0 {
+		t.Fatalf("real docker-workspace produced findings:\n%s", FormatFindings(findings))
+	}
+}
+
+// TestWorkflowGuardDoctoredHostVolumePRFails re-adds pull_request to the real
+// docker-workspace workflow (in a temp copy) and proves the guard fails with
+// file/step/message for each socket-mounting step. The real YAML is never
+// modified (byte-compared afterwards).
+func TestWorkflowGuardDoctoredHostVolumePRFails(t *testing.T) {
+	realPath := filepath.Join(repoRoot(t), ".woodpecker", "docker-workspace.yml")
+	real := mustRead(t, realPath)
+	const old = "  - event: [push, manual, tag]"
+	const new = "  - event: [push, pull_request, manual, tag]"
+	doctored := strings.Replace(string(real), old, new, 1)
+	if doctored == string(real) {
+		t.Fatalf("doctoring %q did not apply", old)
+	}
+	path := filepath.Join(t.TempDir(), "docker-workspace.yml")
+	mustWrite(t, path, []byte(doctored))
+	w, err := LoadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	findings := CheckWorkflow(w)
+	got := map[string]bool{}
+	for _, f := range findings {
+		if f.Kind != "host-volume-pr" {
+			continue
+		}
+		if f.File != "docker-workspace.yml" {
+			t.Fatalf("finding file = %q, want docker-workspace.yml (%s)", f.File, f.String())
+		}
+		if !strings.Contains(f.Message, "docker.sock") || !strings.Contains(f.Message, "pull_request") {
+			t.Fatalf("finding must name the socket and the event: %s", f.String())
+		}
+		got[f.Step] = true
+		t.Logf("guard finding: %s", f.String())
+	}
+	for _, step := range []string{"build-ci-image", "docker-workspace"} {
+		if !got[step] {
+			t.Fatalf("guard missed the socket mount in step %q; findings:\n%s", step, FormatFindings(findings))
+		}
+	}
+	if after := mustRead(t, realPath); !bytes.Equal(after, real) {
+		t.Fatal("guard test modified the real .woodpecker/docker-workspace.yml")
+	}
+}
+
+// TestWorkflowGuardDoctoredWorkflowLevelHostVolumeFails covers the other
+// declaration site: a workflow-level host-path volume (including a named host
+// volume mounted by a step) on a pull_request workflow, and the trusted-event
+// counterpart that must pass.
+func TestWorkflowGuardDoctoredWorkflowLevelHostVolumeFails(t *testing.T) {
+	const body = "when:\n  - event: [push, pull_request]\nvolumes:\n  - name: sock\n    path: /var/run/docker.sock\nsteps:\n  build:\n    image: golang:1.27\n    volumes:\n      - sock:/var/run/docker.sock\n    commands: [true]\n"
+	path := filepath.Join(t.TempDir(), "container-lane.yml")
+	mustWrite(t, path, []byte(body))
+	w, err := LoadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if IsLocal(w) {
+		t.Fatal("container workflow with a socket was misclassified as local")
+	}
+	findings := CheckWorkflow(w)
+	var sawWorkflow, sawStep bool
+	for _, f := range findings {
+		if f.Kind != "host-volume-pr" {
+			continue
+		}
+		if f.Step == "" && f.File == "container-lane.yml" {
+			sawWorkflow = true
+		}
+		if f.Step == "build" {
+			sawStep = true
+		}
+		t.Logf("guard finding: %s", f.String())
+	}
+	if !sawWorkflow || !sawStep {
+		t.Fatalf("workflow-level=%v step-level=%v, want both findings:\n%s", sawWorkflow, sawStep, FormatFindings(findings))
+	}
+
+	trusted := strings.Replace(body, "event: [push, pull_request]", "event: [push]", 1)
+	mustWrite(t, path, []byte(trusted))
+	w, err = LoadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if findings := CheckWorkflow(w); len(findings) != 0 {
+		t.Fatalf("trusted-event host volume produced findings:\n%s", FormatFindings(findings))
+	}
+}
+
+// TestWorkflowGuardDoctoredPushAndNativeContextsFail proves the guard
+// validates PUSH_CONTEXTS and NATIVE_CONTEXTS too: a missing workflow and a
+// workflow that never runs on the claimed event both fail, and a corrected
+// script passes.
+func TestWorkflowGuardDoctoredPushAndNativeContextsFail(t *testing.T) {
+	dir := t.TempDir()
+	pushAndPR := "when:\n  - event: [push, pull_request]\nsteps:\n  unit:\n    image: golang:1.27\n    commands: [go test ./...]\n"
+	mustWrite(t, filepath.Join(dir, "linux-amd64.yml"), []byte(pushAndPR))
+	manualOnly := "when:\n  - event: [manual]\nsteps:\n  unit:\n    image: golang:1.27\n    commands: [go test ./...]\n"
+	mustWrite(t, filepath.Join(dir, "native-windows.yml"), []byte(manualOnly))
+	workflows, err := LoadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := "CONTEXTS=\"${KIWI_CONTEXTS:-ci/woodpecker/pr/linux-amd64}\"\n" +
+		"PUSH_CONTEXTS=\"${KIWI_PUSH_CONTEXTS:-ci/woodpecker/push/linux-amd64 ci/woodpecker/push/ghost ci/woodpecker/push/native-windows}\"\n" +
+		"NATIVE_CONTEXTS=\"${KIWI_NATIVE_CONTEXTS:-ci/woodpecker/push/native-macos}\"\n"
+	findings := CheckContextLists(workflows, script)
+	var sawGhostPush, sawNeverPush, sawMissingNative bool
+	for _, f := range findings {
+		if f.Kind != "required-context" {
+			t.Fatalf("unexpected finding kind: %s", f.String())
+		}
+		switch {
+		case strings.Contains(f.Message, "PUSH_CONTEXTS") && strings.Contains(f.Message, `"ghost"`):
+			sawGhostPush = true
+		case strings.Contains(f.Message, "PUSH_CONTEXTS") && strings.Contains(f.Message, "never runs on push") && f.File == "native-windows.yml":
+			sawNeverPush = true
+		case strings.Contains(f.Message, "NATIVE_CONTEXTS") && strings.Contains(f.Message, "native-macos"):
+			sawMissingNative = true
+		}
+		t.Logf("guard finding: %s", f.String())
+	}
+	if !sawGhostPush || !sawNeverPush || !sawMissingNative {
+		t.Fatalf("ghost-push=%v never-push=%v missing-native=%v; findings:\n%s", sawGhostPush, sawNeverPush, sawMissingNative, FormatFindings(findings))
+	}
+
+	fixed := "CONTEXTS=\"${KIWI_CONTEXTS:-ci/woodpecker/pr/linux-amd64}\"\n" +
+		"PUSH_CONTEXTS=\"${KIWI_PUSH_CONTEXTS:-ci/woodpecker/push/linux-amd64}\"\n" +
+		"NATIVE_CONTEXTS=\"${KIWI_NATIVE_CONTEXTS:-ci/woodpecker/push/linux-amd64}\"\n"
+	if findings := CheckContextLists(workflows, fixed); len(findings) != 0 {
+		t.Fatalf("corrected context lists produced findings:\n%s", FormatFindings(findings))
 	}
 }
 

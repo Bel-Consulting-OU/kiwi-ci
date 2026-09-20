@@ -175,7 +175,14 @@ claims themselves.
   `completion_reconcile` (internal effects) and `forge_delivery` are
   separate intents: internal reconciliation is retried until it
   converges and is never dead-lettered, while forge delivery follows
-  the bounded retry/dead-letter policy. Legacy pre-0018 rows without
+  the bounded retry/dead-letter policy. Unknown intent kinds are a
+  second never-dead-lettered class that matters during rolling
+  upgrades: a row written by a newer binary is neither dropped (ACKed
+  away) nor dead-lettered by an older replica -- dispatch returns a
+  typed error, the claim is released, and the row survives with bounded
+  backoff until a replica that understands it processes it. A store or
+  replica that cannot dispatch a kind must therefore leave it queued,
+  not consume it. Legacy pre-0018 rows without
   version fields are normalized at dispatch (the logical key is derived
   from host + run + check name, the version from the status rank), so
   they obey the same watermark. A store that does not implement the
@@ -220,6 +227,20 @@ claims themselves.
   Operators upgrading an fs-mode deployment must make probes and load
   balancers stop routing to a degraded instance; a healthy `/liveness` does
   not mean the instance can accept new work.
+- Servers started with `--tls-cert`/`--tls-key` now actually serve TLS.
+  Previously the flags were accepted but the listener stayed plaintext, so
+  probe, load-balancer, and backend configurations pointed at such a server
+  must move to `https://` (or terminate TLS in front of the instance) as
+  part of the upgrade; a plaintext request to the TLS listener fails. See
+  the probe guidance in
+  [production-deployment.md](production-deployment.md#health-and-metrics).
+- Runners fail closed at startup when no durable state directory can be
+  resolved: the per-job log journal needs an explicit state/cache root, the
+  enrollment identity directory (`--identity-dir`), or `HOME`, and the
+  runner now refuses to start instead of silently running journal-less. A
+  service unit that does not set `HOME` (common under systemd) must set
+  `HOME` for the runner user or pass `--identity-dir <dir>`; the identity
+  directory doubles as the state directory.
 
 ## Dependency upgrade policy
 

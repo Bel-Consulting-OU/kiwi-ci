@@ -902,8 +902,10 @@ func fsCaseMaintainLeaseRecovery() fsMutationCase {
 }
 
 // fsCaseScheduleFire drives POST /api/v1/schedules/{id}/trigger, whose
-// occurrence claim rides the enqueue snapshot write (schedules.go:946 ->
-// server.go:1374) and therefore rolls back with it.
+// occurrence claim rides the enqueue snapshot write (fireSchedule ->
+// enqueueID -> persistCheckedErrLocked) and therefore rolls back with it. The
+// non-durable enqueue goes through the shared enqueue-error mapping: 503 with
+// the fixed opaque body, never a raw store error and never a run body.
 func fsCaseScheduleFire() fsMutationCase {
 	return fsMutationCase{
 		name: "schedule.fire",
@@ -921,7 +923,13 @@ func fsCaseScheduleFire() fsMutationCase {
 			return &fsMutationDrive{
 				invoke: func(t *testing.T, s *Server) {
 					w := doJSON(t, s, http.MethodPost, "/api/v1/schedules/"+sc.ID+"/trigger", "token", "")
-					fsMatrixAssertStatus(t, w, http.StatusInternalServerError)
+					fsMatrixAssertStatus(t, w, http.StatusServiceUnavailable)
+					if got := w.Body.String(); got != "state not durable\n" {
+						t.Fatalf("refused trigger body = %q, want the fixed %q", got, "state not durable\n")
+					}
+					if strings.Contains(w.Body.String(), errFSMatrixSeam.Error()) {
+						t.Fatalf("refused trigger leaked the persist error: %q", w.Body.String())
+					}
 					if strings.Contains(w.Body.String(), `"id"`) {
 						t.Fatalf("refused trigger leaked a run body: %q", w.Body.String())
 					}

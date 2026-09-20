@@ -342,25 +342,34 @@ func TestLeftoverLeaseKeyLoadErrors(t *testing.T) {
 	}
 }
 
-// TestLeftoverLeaseKeyPersistFailure covers the persist failure branches: a
-// parent that is not a directory makes MkdirAll fail, and a directory at the
-// temp-key path makes the key write fail. Both fail closed, and both
-// injections are rejected by the OS for any euid (no chmod assumption).
+// TestLeftoverLeaseKeyPersistFailure covers loadLeaseKey's persist failure
+// branches. A dangling symlink as the parent keeps the read looking like a
+// missing file (ENOENT, so the load step falls through to key generation)
+// while MkdirAll cannot materialize the directory through the dangling link:
+// path resolution, not permission bits, refuses it, so the injection works
+// for root too. The second case puts a directory at the temp-key path so the
+// key write (open) fails. Both assert the failing op, proving the read step
+// succeeded and the persist step failed; the ENOTDIR read case stays in
+// TestLeftoverLeaseKeyLoadErrors.
 func TestLeftoverLeaseKeyPersistFailure(t *testing.T) {
-	blocker := filepath.Join(t.TempDir(), "blocker")
-	if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
-		t.Fatal(err)
+	root := t.TempDir()
+	dangling := filepath.Join(root, "dangling")
+	if err := os.Symlink(filepath.Join(root, "missing-target"), dangling); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
 	}
-	if _, err := loadLeaseKey(filepath.Join(blocker, "child")); err == nil {
-		t.Fatal("lease key dir creation under a non-directory parent must fail")
+	_, err := loadLeaseKey(filepath.Join(dangling, "child"))
+	var pathErr *os.PathError
+	if !errors.As(err, &pathErr) || pathErr.Op != "mkdir" {
+		t.Fatalf("dangling-parent load = %v; want the MkdirAll (mkdir) failure after the read resolved to not-exist", err)
 	}
 
-	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, "lease.key.tmp"), 0o700); err != nil {
+	root2 := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root2, "lease.key.tmp"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := loadLeaseKey(root); err == nil {
-		t.Fatal("lease key write with a directory at the temp path must fail")
+	_, err = loadLeaseKey(root2)
+	if !errors.As(err, &pathErr) || pathErr.Op != "open" {
+		t.Fatalf("temp-key-path-directory load = %v; want the key write (open) failure", err)
 	}
 }
 

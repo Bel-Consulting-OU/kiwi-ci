@@ -3,7 +3,6 @@ package server
 import (
 	"bytes"
 	"errors"
-	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -85,20 +84,23 @@ func TestFlowSnapshotMemoryMkdirFailure(t *testing.T) {
 	}
 }
 
+// TestFlowSnapshotMemoryStagingOpenFailure covers the staging open failing
+// after the snapshot directory has been created: the fixed entropy pins the
+// staging filename and a directory placed there refuses the O_CREATE|O_EXCL
+// open with EEXIST for any euid (path existence, not permission bits), so
+// the assertion stays active as root.
 func TestFlowSnapshotMemoryStagingOpenFailure(t *testing.T) {
-	testutil.UnixChmod(t)
-	// The staging open only fails under a non-root euid: root bypasses the
-	// directory's write bit, so the OS would create the staging file anyway.
-	testutil.RequireNonRoot(t)
 	s, hdrs := fcMemoryBlobServer(t)
+	restore := seamRand(t, seamFixedReader{})
+	defer restore()
+	id, err := newID()
+	if err != nil {
+		t.Fatal(err)
+	}
 	dir := filepath.Join(s.store.Root, "snapshots", "run-c", "job-a")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Join(dir, "."+id+".tmp"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(dir, 0o500); err != nil {
-		t.Fatal(err)
-	}
-	defer os.Chmod(dir, 0o700)
 	w := fcUploadSnapshot(t, s, hdrs, fcSnapshotArchive(t))
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("snapshot staging failure = %d, want 500: %s", w.Code, w.Body.String())

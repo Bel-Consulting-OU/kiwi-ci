@@ -2,28 +2,40 @@
 # gh-branch-protection.sh configures main-branch protection for Kiwi CI.
 #
 # INVARIANT: a required status context must come from a workflow that actually
-# runs on the event being gated. Required PR contexts are therefore only the
-# EVENT-INDEPENDENT Woodpecker workflow contexts whose `when` includes
+# runs on the event being gated. Woodpecker's status format is
+# `ci/woodpecker/<event>/<workflow>[/<axis>]`, with `pull_request` mapped to
+# the literal `pr` (verified against server/forge/common/status.go in
+# v3.18.1 and against observed statuses). Required PR contexts are therefore
+# only the `pr/` contexts of the workflows whose `when` includes
 # `pull_request`:
 #
-#   ci/woodpecker/linux-amd64
-#   ci/woodpecker/linux-arm64
-#   ci/woodpecker/docker-workspace
-#   ci/woodpecker/integration-coverage
+#   ci/woodpecker/pr/linux-amd64
+#   ci/woodpecker/pr/linux-arm64
+#   ci/woodpecker/pr/integration-coverage
 #
-# The native workflows (ci/woodpecker/native-windows, ci/woodpecker/native-macos)
-# are deliberately NOT required for pull requests. Their workflows run only on
-# push/manual/tag because the local backend executes directly on dedicated
-# hosts and must never run untrusted fork code; a fork PR head produces no such
-# context, so requiring them would leave every fork PR waiting forever for a
-# check that is intentionally never scheduled. They remain post-merge (push)
-# and tag gates per the workflow `when`, and their absence on a PR is expected,
-# not a failure.
+# docker-workspace is deliberately NOT a required PR context: it mounts the
+# agent host's Docker daemon socket with host volumes, and Woodpecker gates
+# volumes on the repository-level Trusted flag alone (no PR/fork gating), so a
+# pull_request run would execute PR-authored code with host-daemon control.
+# Its workflow `when` is push/manual/tag only and it stays a post-merge gate as
+# `ci/woodpecker/push/docker-workspace` (see PUSH_CONTEXTS).
+#
+# The native workflows (ci/woodpecker/push/native-windows,
+# ci/woodpecker/push/native-macos) are deliberately NOT required for pull
+# requests. They run only on push/manual/tag because the local backend
+# executes directly on dedicated hosts and must never run untrusted fork code;
+# a fork PR head produces no such context, so requiring them would leave every
+# fork PR waiting forever for a check that is intentionally never scheduled.
+# They remain post-merge (push) and tag gates per the workflow `when`, and
+# their absence on a PR is expected, not a failure.
 #
 # For the required contexts to be stable, the Woodpecker instance must use the
-# documented status format, e.g.:
+# canonical status format, i.e. at least:
 #
-#   {{ .context }}/{{ .workflow }}{{if not (eq .axis_id 0)}}/{{.axis_id}}{{end}}
+#   {{context}}/{{event}}/{{workflow}}
+#
+# Matrix workflows append `/<axis_id>`; none of the workflows here use a
+# matrix, so the plain three-segment form is what the lists below name.
 #
 # The script refuses to install a context it has NEVER observed on a recent
 # commit, so abandoned or mistyped context names cannot silently weaken (or
@@ -52,7 +64,9 @@ BRANCH="${KIWI_BRANCH:-main}"
 # pull_request event mapped to the literal `pr` (verified against
 # server/forge/common/status.go in v3.18.1 and against observed statuses).
 # Matrix axes append `/<axis_id>`; none of these workflows use a matrix.
-CONTEXTS="${KIWI_CONTEXTS:-ci/woodpecker/pr/linux-amd64 ci/woodpecker/pr/linux-arm64 ci/woodpecker/pr/docker-workspace ci/woodpecker/pr/integration-coverage}"
+# docker-workspace is absent on purpose: it mounts the host Docker socket and is
+# push/manual/tag only (see the invariant above).
+CONTEXTS="${KIWI_CONTEXTS:-ci/woodpecker/pr/linux-amd64 ci/woodpecker/pr/linux-arm64 ci/woodpecker/pr/integration-coverage}"
 # Push variants are posted for every push; they are listed so operators can
 # require them for direct pushes instead (a direct push to a protected branch
 # can never satisfy only-pr contexts, and pr-only contexts block direct pushes

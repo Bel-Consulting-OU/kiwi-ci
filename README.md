@@ -208,7 +208,7 @@ and no other CI system in this repository.
 |---|---|---|
 | `linux-amd64` | `platform=linux/amd64` | format, vet, unit (`-vet=all -shuffle`), race, race-double, single-P (`GOMAXPROCS=1`), checkptr (`-d=checkptr=2 -race`), stress (`-count=10` adversarial patterns), adversarial, schema (+FILE_MAP), cross, license, docs, repro, staticcheck (`-checks=all` minus stylistic), govulncheck (`-test`), fuzz smoke (30s/target) |
 | `linux-arm64` | `platform=linux/arm64` | unit + race natively |
-| `docker-workspace` | `platform=linux/amd64`, `capability=docker` | REQUIRED rootless/hardened container workspace integration; a missing/unusable Docker daemon FAILS this lane |
+| `docker-workspace` | `platform=linux/amd64`, `capability=docker` | REQUIRED rootless/hardened container workspace integration; a missing/unusable Docker daemon FAILS this lane. Mounts the host Docker socket, so it is trusted push/manual/tag-only (never `pull_request`) |
 | `integration-coverage` | `platform=linux/amd64` | PostgreSQL service + integration tests + merged coverage with the 95% floor |
 | `native-windows` | `platform=windows/amd64` | native Windows `go vet` + full unit suite + the platform-sensitive packages (safefs, tui, executor, runner, storage, workspace, config). Trusted events only |
 | `native-macos` | `platform=darwin/arm64` | native macOS unit + race + termios/Tart-sensitive packages. Trusted events only (local backend executes on the host) |
@@ -224,14 +224,21 @@ Operational requirements for the Woodpecker instance:
 - `docker-workspace` mounts the agent host's Docker socket into its steps
   (`volumes: - /var/run/docker.sock:/var/run/docker.sock`), so the repository
   must be marked **trusted** in Woodpecker; `capability=docker` only selects
-  an agent and injects nothing. A dedicated agent that mounts the socket into
-  every pipeline container instead can set
+  an agent and injects nothing. Woodpecker gates volumes on the
+  repository-level Trusted flag alone (no per-event or fork gating), so the
+  lane runs on trusted events only (`push`/`manual`/`tag`) and never on
+  `pull_request`; running it on PRs again needs a socket-less variant. A
+  dedicated agent that mounts the socket into every pipeline container
+  instead can set
   `WOODPECKER_BACKEND_DOCKER_VOLUMES=/var/run/docker.sock:/var/run/docker.sock`.
-- Status contexts should use an event-independent format (see the
-  Woodpecker docs), so branch protection can require stable names like
-  `ci/woodpecker/linux-amd64`. Platform labels themselves use the canonical
-  `GOOS/GOARCH` slash form (`platform=linux/amd64`), matching the built-in
-  agent label.
+- Commit-status contexts use Woodpecker's canonical
+  `ci/woodpecker/<event>/<workflow>` form, with the pull_request event mapped
+  to the literal `pr`, so branch protection requires names like
+  `ci/woodpecker/pr/linux-amd64` (not the flat pre-event form). The native
+  macOS/Windows workflows run on trusted events only, so their `push/`
+  contexts are not required for, and cannot be produced by, pull requests.
+  Platform labels use the canonical `GOOS/GOARCH` slash form
+  (`platform=linux/amd64`), matching the built-in agent label.
 
 `main` is branch-protected: merges require a pull request, the workflow
 contexts above green, and the branch up to date. Protection is applied by

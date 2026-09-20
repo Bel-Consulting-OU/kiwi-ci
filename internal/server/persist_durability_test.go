@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 // usageMetricsSnapshot reads the process-local usage counters under the
@@ -586,4 +588,123 @@ func TestEffectUsageAccountDBRecordUsageOnceBranches(t *testing.T) {
 			t.Fatalf("fail-closed refusal moved metrics: cost=%v energy=%v", cost, energy)
 		}
 	})
+}
+
+// assertNotDurableEnqueueResponse pins the shared F3-1 response contract for
+// every ingress that enqueues a run: a non-durable enqueue answers 503 with
+// the fixed opaque "state not durable" body, and none of the given raw
+// store/path fragments may appear in it.
+func assertNotDurableEnqueueResponse(t *testing.T, what string, w *httptest.ResponseRecorder, leaked ...string) {
+	t.Helper()
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("%s = %d, want 503: %s", what, w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if body != "state not durable\n" {
+		t.Fatalf("%s body = %q, want the fixed %q", what, body, "state not durable\n")
+	}
+	for _, raw := range leaked {
+		if raw != "" && strings.Contains(body, raw) {
+			t.Fatalf("%s body leaked raw store/path text %q: %q", what, raw, body)
+		}
+	}
+	if strings.Contains(body, "state not durable: ") {
+		t.Fatalf("%s body carries the wrapped store detail: %q", what, body)
+	}
+}
+
+// TestRerunNotDurableAnswers503 pins F3-1 for the memory rerun ingress: a
+// snapshot-write failure during the rerun's enqueue is a server-side
+// durability condition, so the client gets 503 with the fixed opaque "state
+// not durable" body — never the raw store error as the previous 400.
+func TestRerunNotDurableAnswers503(t *testing.T) {
+	s, err := NewPersistent("token", "token", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := s.enqueue(context.Background(), SubmitRun{
+		RepoURL: "https://github.com/kiwi/repo.git", RepoFullName: "kiwi/repo",
+		Ref: "main", SHA: "abc", Event: "push", Pipeline: testPipeline,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seamErr := errors.New("synthetic snapshot write failure")
+	s.persistFailForTest = seamErr
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runs/"+run.ID+"/rerun", "token", "")
+	assertNotDurableEnqueueResponse(t, "non-durable rerun", w, seamErr.Error(), "snapshot")
+	// The failed rerun must leave no ghost run behind.
+	s.mu.Lock()
+	n := len(s.runs)
+	s.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("runs after the refused rerun = %d, want the original run only", n)
+	}
+}
+
+// TestRerunDBNotDurableAnswers503 pins F3-1 for the DB rerun ingress through
+// the missing-atomic-contract seam: the durable enqueue cannot commit, so it
+// is reported as a durability failure (503 + opaque body) instead of a raw
+// 400 that echoed the storage contract text.
+func TestRerunDBNotDurableAnswers503(t *testing.T) {
+	s, err := NewPersistent("token", "token", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newDBFakeStore()
+	if err := s.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	run, err := s.enqueue(context.Background(), SubmitRun{
+		RepoURL: "https://github.com/kiwi/repo.git", RepoFullName: "kiwi/repo",
+		Ref: "main", SHA: "abc", Event: "push", Pipeline: testPipeline,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// baseOnlyStore hides the RunEnqueueStore contract while the reads the
+	// rerun handler performs still flow through the embedded store: the
+	// enqueue now fails closed as non-durable.
+	s.DB = baseOnlyStore{f}
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runs/"+run.ID+"/rerun", "token", "")
+	assertNotDurableEnqueueResponse(t, "non-durable DB rerun", w, "lacks the atomic", "compiled-run enqueue")
+}
+
+// TestScheduleTriggerNotDurableAnswers503 pins F3-1 for the manual schedule
+// trigger: a non-durable enqueue is answered 503 + the fixed opaque body
+// instead of the generic 500 (and never a raw 4xx).
+func TestScheduleTriggerNotDurableAnswers503(t *testing.T) {
+	s, err := NewPersistent("token", "token", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"repository":"https://github.com/o/r.git","spec":` + jsonString(scheduleSpec) + `}`
+	if w := doJSON(t, s, http.MethodPut, "/api/v1/schedules", "token", body); w.Code != http.StatusOK {
+		t.Fatalf("create schedule = %d: %s", w.Code, w.Body.String())
+	}
+	var sc storage.Schedule
+	s.mu.Lock()
+	for _, v := range s.schedules {
+		sc = v
+	}
+	s.mu.Unlock()
+	if sc.ID == "" {
+		t.Fatal("schedule was not created")
+	}
+	seamErr := errors.New("synthetic snapshot write failure")
+	s.persistFailForTest = seamErr
+	w := doJSON(t, s, http.MethodPost, "/api/v1/schedules/"+sc.ID+"/trigger", "token", "")
+	assertNotDurableEnqueueResponse(t, "non-durable schedule trigger", w, seamErr.Error(), "snapshot")
+	// The failed trigger must not leave a claimed occurrence or a ghost run:
+	// the nominal is still unfired and a retry is a first fire.
+	s.mu.Lock()
+	_, claimed := s.occurrences[sc.ID][time.Now().UTC().Truncate(time.Minute).Unix()]
+	runs := len(s.runs)
+	s.mu.Unlock()
+	if claimed {
+		t.Fatal("failed schedule trigger left the nominal claimed")
+	}
+	if runs != 0 {
+		t.Fatalf("failed schedule trigger left %d ghost run(s)", runs)
+	}
 }

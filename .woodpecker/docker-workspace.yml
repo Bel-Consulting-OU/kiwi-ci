@@ -17,6 +17,18 @@
 # and for security reasons should only be used in private environments").
 # TRUST REQUIREMENT: this lane therefore requires a trusted repository, and
 # it runs on a dedicated agent whose daemon is the one the lane may touch.
+#
+# TRUSTED EVENTS ONLY: Woodpecker gates host volumes on the repository-level
+# Trusted flag alone -- there is no per-event or fork gating -- so a
+# `pull_request` run of this workflow would execute PR-authored
+# Dockerfile/Go code with control of the agent host's Docker daemon, which
+# is equivalent to host root. The `when` below therefore excludes
+# `pull_request` (and every `pull_request_*` variant): this lane runs on
+# push/manual/tag only. Re-gating pull requests requires a socket-less
+# variant of this lane; `capability: docker` only selects an agent and
+# injects nothing. internal/workflowguard fails any workflow that declares a
+# host volume and still lists `pull_request`.
+#
 # Alternative for a dedicated agent that mounts the socket everywhere:
 #   WOODPECKER_BACKEND_DOCKER_VOLUMES=/var/run/docker.sock:/var/run/docker.sock
 # (docs: docker backend -> BACKEND_DOCKER_VOLUMES, "List of default volumes
@@ -38,7 +50,10 @@ labels:
   capability: docker
 
 when:
-  - event: [push, pull_request, manual, tag]
+  # Trusted events only: the steps below mount /var/run/docker.sock (see the
+  # trust rationale in the header), so a pull_request run would hand
+  # PR-authored code control of the host daemon.
+  - event: [push, manual, tag]
 
 steps:
   build-ci-image:

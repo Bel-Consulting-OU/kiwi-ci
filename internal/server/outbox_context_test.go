@@ -635,6 +635,22 @@ func TestOwnedFilesPinContextCoupling(t *testing.T) {
 	if !strings.Contains(detach, "if origin == nil {") || !strings.Contains(detach, "origin = context.Background() // allow-background:") {
 		t.Fatalf("outbox.go: boundedDetach is not nil-safe with a marked root:\n%s", detach)
 	}
+
+	// releaseOutboxClaimCleanup must detach through that single sanctioned
+	// helper: its former inline WithTimeout(WithoutCancel(...)) was a second,
+	// undocumented detach implementation that could drift from the invariant.
+	cleanup, ok := functionBody(string(ob), "func (o *Outbox) releaseOutboxClaimCleanup(")
+	if !ok {
+		t.Fatal("outbox.go: releaseOutboxClaimCleanup not found")
+	}
+	if !strings.Contains(cleanup, "boundedDetach(ctx, outboxClaimReleaseTimeout)") {
+		t.Fatalf("outbox.go: releaseOutboxClaimCleanup does not use the sanctioned boundedDetach:\n%s", cleanup)
+	}
+	for _, raw := range []string{"context.WithoutCancel", "context.WithTimeout", "context.Background()"} {
+		if strings.Contains(cleanup, raw) {
+			t.Fatalf("outbox.go: releaseOutboxClaimCleanup re-implements the detach with %s:\n%s", raw, cleanup)
+		}
+	}
 }
 
 // functionBody returns the source of the function whose definition line starts
