@@ -48,7 +48,7 @@ func effectsFixture(t *testing.T, f *dbFakeStore) (*Server, string, Task) {
 		t.Fatal(err)
 	}
 	grantEffectsCapabilities(s)
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: effectsPipeline, Trusted: true,
@@ -263,7 +263,7 @@ func TestCompletionEffectsMemoryMarkersPreventDoubleAccounting(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Policy = &policy.Config{Repositories: map[string]policy.RepoPolicy{"o/r": {CrossRepoTrigger: boolPtr(true)}}}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: downstreamPipeline, Trusted: true,

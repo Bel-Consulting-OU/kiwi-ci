@@ -17,7 +17,6 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"io"
 	"math/big"
 	"net/http"
@@ -344,26 +343,24 @@ func TestLeftoverLeaseKeyLoadErrors(t *testing.T) {
 }
 
 // TestLeftoverLeaseKeyPersistFailure covers the persist failure branches: a
-// read-only parent makes MkdirAll fail, and a read-only existing directory
-// makes the key write fail. Both fail closed.
+// parent that is not a directory makes MkdirAll fail, and a directory at the
+// temp-key path makes the key write fail. Both fail closed, and both
+// injections are rejected by the OS for any euid (no chmod assumption).
 func TestLeftoverLeaseKeyPersistFailure(t *testing.T) {
-	testutil.UnixChmod(t)
-	parent := t.TempDir()
-	if err := os.Chmod(parent, 0o500); err != nil {
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(parent, 0o700) })
-	if _, err := loadLeaseKey(filepath.Join(parent, "child")); err == nil {
-		t.Fatal("lease key dir creation under a read-only parent must fail")
+	if _, err := loadLeaseKey(filepath.Join(blocker, "child")); err == nil {
+		t.Fatal("lease key dir creation under a non-directory parent must fail")
 	}
 
 	root := t.TempDir()
-	if err := os.Chmod(root, 0o500); err != nil {
+	if err := os.MkdirAll(filepath.Join(root, "lease.key.tmp"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(root, 0o700) })
 	if _, err := loadLeaseKey(root); err == nil {
-		t.Fatal("lease key write into a read-only directory must fail")
+		t.Fatal("lease key write with a directory at the temp path must fail")
 	}
 }
 

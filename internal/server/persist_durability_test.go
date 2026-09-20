@@ -106,7 +106,7 @@ func TestReadinessDegradedOnPersistFailureAndHeals(t *testing.T) {
 	})
 
 	t.Run("completion failure answers 503", func(t *testing.T) {
-		if _, err := s.enqueue(SubmitRun{
+		if _, err := s.enqueue(context.Background(), SubmitRun{
 			RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 			Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 		}); err != nil {
@@ -158,7 +158,7 @@ func TestLeaseRefusedWhileDegradedAndHeals(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := s.enqueue(SubmitRun{
+	run, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 	})
@@ -239,7 +239,7 @@ func TestLeasePersistFailureWithholdsTokenAndRecovers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := s.enqueue(SubmitRun{
+	run, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 	})
@@ -337,7 +337,7 @@ func TestCompletePersistFailureRetryAccountsUsageOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 	}); err != nil {

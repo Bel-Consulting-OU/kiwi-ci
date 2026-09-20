@@ -71,7 +71,7 @@ func haRegisterRunner(t *testing.T, s *Server, capacity int) model.Runner {
 // trusted flag from clients).
 func submitHAPipeline(t *testing.T, s *Server, pipelineText string) model.Run {
 	t.Helper()
-	run, err := s.enqueue(SubmitRun{
+	run, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: pipelineText, Trusted: true,

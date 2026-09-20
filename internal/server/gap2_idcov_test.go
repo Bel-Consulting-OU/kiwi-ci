@@ -273,6 +273,14 @@ func TestIDCovReloadOIDCRingFileModeSuccess(t *testing.T) {
 	if err := persistOIDCKeyRing(other); err != nil {
 		t.Fatal(err)
 	}
+	// Back-to-back writes of equal length can land on the same mtime tick on
+	// a coarse filesystem, which would hide the rotation from the
+	// mtime/size change detector. The external writer is modeled as strictly
+	// later so the reload assertion is deterministic.
+	later := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(path, later, later); err != nil {
+		t.Fatal(err)
+	}
 	s.reloadOIDCRingLocked()
 	gotKID := s.oidc.KID
 	gotPath := s.oidc.ringPath

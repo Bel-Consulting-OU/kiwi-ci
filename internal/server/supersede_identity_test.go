@@ -7,6 +7,7 @@ package server
 // the same group is never cancelled.
 
 import (
+	"context"
 	"testing"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
@@ -21,7 +22,7 @@ func TestMemorySupersessionCanonicalRepoIDSpellingPair(t *testing.T) {
 	}
 	submit := func(repoURL, fullName string) model.Run {
 		t.Helper()
-		run, err := s.enqueue(SubmitRun{RepoURL: repoURL, RepoFullName: fullName, Ref: "refs/heads/main", SHA: "abc", Event: "push", Pipeline: concurrencyPipeline})
+		run, err := s.enqueue(context.Background(), SubmitRun{RepoURL: repoURL, RepoFullName: fullName, Ref: "refs/heads/main", SHA: "abc", Event: "push", Pipeline: concurrencyPipeline})
 		if err != nil {
 			t.Fatalf("enqueue %s: %v", repoURL, err)
 		}

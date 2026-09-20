@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"net/http"
 	"testing"
 	"time"
@@ -20,7 +21,7 @@ func TestCompletionReceiptsSurviveRestartReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s1.enqueue(SubmitRun{
+	if _, err := s1.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 	}); err != nil {

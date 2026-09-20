@@ -507,6 +507,9 @@ func TestFlowBlobUploadArtifactMkdirFailure(t *testing.T) {
 
 func TestFlowBlobUploadArtifactStagingOpenFailure(t *testing.T) {
 	testutil.UnixChmod(t)
+	// The staging open only fails under a non-root euid: root bypasses the
+	// directory's write bit, so the OS would create the staging file anyway.
+	testutil.RequireNonRoot(t)
 	s, hdrs := fcMemoryBlobServer(t)
 	fcSeedContract(s, "job-a", fcBinContract())
 	dir := filepath.Join(s.store.Root, "artifacts", "run-c", "job-a")
@@ -998,31 +1001,57 @@ func TestFlowBlobUploadJobCacheManifestStoreUnavailable(t *testing.T) {
 }
 
 func TestFlowBlobUploadJobCacheFSPersistFailures(t *testing.T) {
-	testutil.UnixChmod(t)
-	s, hdrs := fcMemoryBlobServer(t)
 	key := strings.Repeat("a", 64)
+
 	// A regular file where the cache directory belongs: MkdirAll fails.
-	if err := os.WriteFile(filepath.Join(s.store.Root, "cache"), []byte("block"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if w := doJSONHeaders(t, s, http.MethodPut, "/api/v1/jobs/job-a/cache/"+key, "runner-tok", "x", hdrs); w.Code != http.StatusInternalServerError {
-		t.Fatalf("cache mkdir failure = %d, want 500: %s", w.Code, w.Body.String())
-	}
-	if err := os.Remove(filepath.Join(s.store.Root, "cache")); err != nil {
-		t.Fatal(err)
-	}
-	// A read-only cache directory: the atomic manifest write fails.
-	dir := filepath.Join(s.store.Root, "cache")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(dir, 0o500); err != nil {
-		t.Fatal(err)
-	}
-	defer os.Chmod(dir, 0o700)
-	if w := doJSONHeaders(t, s, http.MethodPut, "/api/v1/jobs/job-a/cache/"+key, "runner-tok", "x", hdrs); w.Code != http.StatusInternalServerError {
-		t.Fatalf("cache write failure = %d, want 500: %s", w.Code, w.Body.String())
-	}
+	t.Run("cache path is a file", func(t *testing.T) {
+		s, hdrs := fcMemoryBlobServer(t)
+		if err := os.WriteFile(filepath.Join(s.store.Root, "cache"), []byte("block"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if w := doJSONHeaders(t, s, http.MethodPut, "/api/v1/jobs/job-a/cache/"+key, "runner-tok", "x", hdrs); w.Code != http.StatusInternalServerError {
+			t.Fatalf("cache mkdir failure = %d, want 500: %s", w.Code, w.Body.String())
+		}
+	})
+
+	// A directory where the manifest file belongs: the atomic write's rename
+	// is rejected by the OS for every euid, so the manifest-persist failure
+	// branch is still asserted when the suite runs as root.
+	t.Run("manifest path is a directory", func(t *testing.T) {
+		s, hdrs := fcMemoryBlobServer(t)
+		dir := filepath.Join(s.store.Root, "cache")
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		s.mu.Lock()
+		j := s.jobs["job-a"]
+		s.mu.Unlock()
+		repo, trust := cacheNamespace(j)
+		if err := os.Mkdir(filepath.Join(dir, cacheFileKey(repo, trust, key)+".manifest.json"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if w := doJSONHeaders(t, s, http.MethodPut, "/api/v1/jobs/job-a/cache/"+key, "runner-tok", "x", hdrs); w.Code != http.StatusInternalServerError {
+			t.Fatalf("cache write failure = %d, want 500: %s", w.Code, w.Body.String())
+		}
+	})
+
+	// A read-only cache directory: the atomic manifest write fails. Only a
+	// non-root euid can assert this, since root bypasses the mode bits.
+	t.Run("read-only cache directory", func(t *testing.T) {
+		testutil.RequireNonRoot(t)
+		s, hdrs := fcMemoryBlobServer(t)
+		dir := filepath.Join(s.store.Root, "cache")
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dir, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+		if w := doJSONHeaders(t, s, http.MethodPut, "/api/v1/jobs/job-a/cache/"+key, "runner-tok", "x", hdrs); w.Code != http.StatusInternalServerError {
+			t.Fatalf("cache write failure = %d, want 500: %s", w.Code, w.Body.String())
+		}
+	})
 }
 
 func TestFlowBlobDownloadJobCachePreconditions(t *testing.T) {

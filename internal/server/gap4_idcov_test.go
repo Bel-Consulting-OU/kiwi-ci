@@ -142,7 +142,7 @@ func TestIDCovCompleteEnqueueEffectFailures(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := s.enqueue(SubmitRun{
+		if _, err := s.enqueue(context.Background(), SubmitRun{
 			RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 			Ref: "refs/heads/main", SHA: "abc", Event: "push",
 			Pipeline: "version: 1\njobs:\n  build:\n    runtime: container\n    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n    steps:\n      - run: echo hi\n",
@@ -166,7 +166,7 @@ func TestIDCovCompleteEnqueueEffectFailures(t *testing.T) {
 			t.Fatal(err)
 		}
 		s.Policy = &policy.Config{Repositories: map[string]policy.RepoPolicy{"o/r": {CrossRepoTrigger: boolPtr(true)}}}
-		if _, err := s.enqueue(SubmitRun{
+		if _, err := s.enqueue(context.Background(), SubmitRun{
 			RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 			Ref: "refs/heads/main", SHA: "abc", Event: "push",
 			Pipeline: downstreamPipeline, Trusted: true,

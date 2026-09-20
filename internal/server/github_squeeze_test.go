@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -355,7 +356,7 @@ func TestDedupeRunEdges(t *testing.T) {
 		t.Fatal("delivery pointing at a missing run must not dedupe")
 	}
 
-	run, err := s.enqueue(SubmitRun{
+	run, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/acme/backend.git", RepoFullName: "acme/backend",
 		Ref: "refs/heads/main", SHA: "sha", Event: "push", Pipeline: untrustedPipeline,
 	})

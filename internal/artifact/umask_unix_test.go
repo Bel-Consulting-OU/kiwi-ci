@@ -7,12 +7,16 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 )
 
 // TestSaveUnreadableArchiveFailsDigestOpen pins the digest pass failing when
 // the freshly created archive cannot be opened (umask 0o777). Unix-only:
-// Windows has no umask semantics.
+// Windows has no umask semantics. The mode bits are only enforced for a
+// non-root euid, so root skips instead of passing tautologically.
 func TestSaveUnreadableArchiveFailsDigestOpen(t *testing.T) {
+	testutil.RequireNonRoot(t)
 	ws := t.TempDir()
 	if err := os.WriteFile(filepath.Join(ws, "f"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)

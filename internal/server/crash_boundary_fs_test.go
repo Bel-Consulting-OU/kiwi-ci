@@ -140,7 +140,7 @@ func TestCrashCompletionDurableBeforeEffectsRestartFS(t *testing.T) {
 	t.Run("crash-before-effect-intents-and-link", func(t *testing.T) {
 		dir := t.TempDir()
 		s1 := crashEffectsServer(t, dir)
-		if _, err := s1.enqueue(SubmitRun{
+		if _, err := s1.enqueue(context.Background(), SubmitRun{
 			RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 			Ref: "refs/heads/main", SHA: "abc", Event: "push",
 			Pipeline: downstreamPipeline, Trusted: true,
@@ -232,7 +232,7 @@ func TestCrashCompletionDurableBeforeEffectsRestartFS(t *testing.T) {
 	t.Run("crash-before-dispatch", func(t *testing.T) {
 		dir := t.TempDir()
 		s1 := crashEffectsServer(t, dir)
-		if _, err := s1.enqueue(SubmitRun{
+		if _, err := s1.enqueue(context.Background(), SubmitRun{
 			RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 			Ref: "refs/heads/main", SHA: "abc", Event: "push",
 			Pipeline: downstreamPipeline, Trusted: true,
@@ -456,7 +456,7 @@ func TestCrashLogBatchJournalCommittedBeforeResponseFS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s1.enqueue(SubmitRun{
+	if _, err := s1.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 	}); err != nil {
@@ -680,7 +680,7 @@ func TestCrashCompletionBeforeIntentEnqueueReplayRepairsForgeDeliveryFS(t *testi
 	}
 
 	s1 := newServer()
-	if _, err := s1.enqueue(SubmitRun{
+	if _, err := s1.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: smokePipeline, Trusted: true,

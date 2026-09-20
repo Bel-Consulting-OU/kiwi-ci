@@ -482,7 +482,10 @@ const backgroundAllowMarker = "allow-background:"
 // TestOwnedFilesPinContextCoupling is (c): the encoded classification. Every
 // context.Background()/context.TODO() in the owned files must be annotated as
 // a sanctioned detach root, and the server.go call sites this fix touched
-// must keep threading a real caller context or the bounded detach.
+// must keep threading a real caller context or the bounded detach. The
+// enqueue plumbing and the audit-first path are additionally scanned per
+// function body: neither may contain a bare Background/TODO at all, so the
+// only detach root on those paths is boundedDetach's own (annotated) one.
 //
 // Documented checklist for the reviewer (the same list is asserted below):
 //
@@ -494,12 +497,21 @@ const backgroundAllowMarker = "allow-background:"
 //	  server.go   s.recordDownstreamIntents(r.Context(), j, run)
 //	  runnerpki.go s.consumeEnrollGrant(r.Context(), tok, in.Labels)
 //	  github_status.go / completion_effects.go / downstream.go: Enqueue(ctx, ...)
+//	  server.go   s.startSpan(ctx, "server.enqueue")
+//	  server.go   s.enqueue(r.Context(), in)                [submit/rerun]
+//	  server.go   s.enqueueID(ctx, in, "")                  [enqueue wrapper]
+//	  server.go   s.enqueueDB(ctx, in, run, ...)            [DB run creation]
+//	  server.go   s.auditFirstLocked(r.Context(), ...)      [admin mutations]
+//	  github.go / hooks.go: s.enqueue(r.Context(), in)      [webhooks]
+//	  schedules.go: s.enqueueID(ctx, in, preID)             [schedule firing]
+//	  downstream.go: s.enqueueID(ctx, SubmitRun{...})       [outbox re-enqueue]
 //	bounded detach (intentionally outlives the request, bounded by timeout):
 //	  server.go   s.publishForgeStatus(pubCtx, run)   [run already durable]
+//	  server.go   auditLocked -> boundedDetach(nil, auditDetachTimeout)
 //	  outbox.go   flushOutbox(ctx) -> boundedDetach(ctx, outboxFlushTimeout)
 //	  outbox.go   releaseOutboxClaimCleanup (claim cleanup)
 func TestOwnedFilesPinContextCoupling(t *testing.T) {
-	owned := []string{"outbox.go", "enroll_grants.go", "completion_effects.go", "github_status.go"}
+	owned := []string{"outbox.go", "enroll_grants.go", "completion_effects.go", "github_status.go", "server.go"}
 	for _, name := range owned {
 		src, err := os.ReadFile(name)
 		if err != nil {
@@ -528,6 +540,19 @@ func TestOwnedFilesPinContextCoupling(t *testing.T) {
 		"s.recordDownstreamIntents(r.Context(), j, run)",
 		"s.publishForgeStatus(pubCtx, run)",
 		"s.flushOutbox(ctx)",
+		"s.startSpan(ctx, \"server.enqueue\")",
+		"s.enqueue(r.Context(), in)",
+		"s.enqueue(r.Context(), SubmitRun{",
+		"s.enqueueID(ctx, in, \"\")",
+		"s.enqueueDB(ctx, in, run, created, jobContracts, group,",
+		"s.auditFirstLocked(r.Context(), \"runner.drain\",",
+		"s.auditFirstLocked(r.Context(), \"runner.disable\",",
+		"s.auditFirstLocked(r.Context(), \"runner.enable\",",
+		"s.auditFirstLocked(r.Context(), \"job.approved\",",
+		"s.auditFirstLocked(r.Context(), \"run.cancelled\",",
+		"s.auditFirstLocked(ctx, \"job.approved\",",
+		"s.auditFirstLocked(ctx, \"run.cancelled\",",
+		"boundedDetach(ctx, outboxDetachTimeout)",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("server.go: missing context-threaded call site %q", want)
@@ -541,9 +566,87 @@ func TestOwnedFilesPinContextCoupling(t *testing.T) {
 		"s.consumeEnrollGrant(context.Background()",
 		"s.publishForgeStatus(context.Background()",
 		"s.flushOutbox()",
+		"startSpan(context.Background(), \"server.enqueue\")",
+		"s.enqueue(in)",
+		"s.enqueueID(in,",
+		"s.enqueueDB(in,",
+		"s.auditFirstLocked(\"",
+		"s.DB.AppendAudit(context.Background(",
 	} {
 		if strings.Contains(body, banned) {
 			t.Errorf("server.go: request-coupled call site regressed to a bare context: %q", banned)
 		}
 	}
+
+	// The out-of-server.go production callers thread their own request or
+	// maintenance context; pin the exact call shape (and the unthreaded
+	// regression) in each file.
+	for _, tc := range []struct{ file, want, banned string }{
+		{"github.go", "s.enqueue(r.Context(), in)", "s.enqueue(in)"},
+		{"hooks.go", "s.enqueue(r.Context(), in)", "s.enqueue(in)"},
+		{"schedules.go", "s.enqueueID(ctx, in, preID)", "s.enqueueID(in,"},
+		{"downstream.go", "s.enqueueID(ctx, SubmitRun{", "s.enqueueID(in,"},
+	} {
+		bs, err := os.ReadFile(tc.file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(bs), tc.want) {
+			t.Errorf("%s: missing context-threaded call site %q", tc.file, tc.want)
+		}
+		if strings.Contains(string(bs), tc.banned) {
+			t.Errorf("%s: enqueue call site regressed to a bare context: %q", tc.file, tc.banned)
+		}
+	}
+
+	// The enqueue plumbing and the audit-first path are the defect surface of
+	// this fix: pin their function bodies to hold NO context root at all. The
+	// only sanctioned root reachable from them is boundedDetach's own.
+	for _, sig := range []string{
+		"func (s *Server) enqueue(ctx context.Context,",
+		"func (s *Server) enqueueID(ctx context.Context,",
+		"func (s *Server) enqueueDB(ctx context.Context,",
+		"func (s *Server) auditFirstLocked(ctx context.Context,",
+		"func (s *Server) auditLocked(",
+	} {
+		fn, ok := functionBody(body, sig)
+		if !ok {
+			t.Errorf("server.go: missing threaded signature %q", sig)
+			continue
+		}
+		for _, root := range []string{"context.Background()", "context.TODO()"} {
+			if strings.Contains(fn, root) {
+				t.Errorf("server.go: %s contains a bare %s; enqueue/audit must thread ctx or use boundedDetach", sig, root)
+			}
+		}
+	}
+
+	// boundedDetach (outbox.go) is the single sanctioned root: it must stay
+	// nil-safe and carry the allow-marker so the server.go call paths above
+	// can detach without an origin.
+	ob, err := os.ReadFile("outbox.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	detach, ok := functionBody(string(ob), "func boundedDetach(")
+	if !ok {
+		t.Fatal("outbox.go: boundedDetach not found")
+	}
+	if !strings.Contains(detach, "if origin == nil {") || !strings.Contains(detach, "origin = context.Background() // allow-background:") {
+		t.Fatalf("outbox.go: boundedDetach is not nil-safe with a marked root:\n%s", detach)
+	}
+}
+
+// functionBody returns the source of the function whose definition line starts
+// with sig, up to the next top-level func definition (or EOF).
+func functionBody(src, sig string) (string, bool) {
+	start := strings.Index(src, sig)
+	if start < 0 {
+		return "", false
+	}
+	rest := src[start:]
+	if end := strings.Index(rest[1:], "\nfunc "); end >= 0 {
+		return rest[:end+1], true
+	}
+	return rest, true
 }

@@ -20,7 +20,7 @@ func TestUsageWindowRebuiltFromFSJobsAfterRestart(t *testing.T) {
 	// Any positive cost exhausts the budget, so the assertion is about the
 	// window surviving restart, not about a specific amount.
 	s.DailyCostLimit = 1e-9
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 	}); err != nil {

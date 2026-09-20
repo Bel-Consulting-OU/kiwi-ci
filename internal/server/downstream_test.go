@@ -77,7 +77,7 @@ func downstreamServer(t *testing.T, pipelineText string) (*Server, model.Run) {
 			"o/r": {CrossRepoTrigger: boolPtr(true)},
 		},
 	}
-	run, err := s.enqueue(SubmitRun{
+	run, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: pipelineText, Trusted: true,
@@ -129,7 +129,7 @@ func TestDownstreamCapabilityRejectionAtEnqueue(t *testing.T) {
 	}
 	// The same pipeline is admitted when the grant exists.
 	s.Policy = &policy.Config{Repositories: map[string]policy.RepoPolicy{"o/r": {CrossRepoTrigger: boolPtr(true)}}}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: downstreamPipeline, Trusted: true,
@@ -154,7 +154,7 @@ jobs:
     steps:
       - run: echo hi
 `
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: bad, Trusted: true,
@@ -308,7 +308,7 @@ func TestDownstreamDBModeExactlyOnce(t *testing.T) {
 	}
 	s.DownstreamAllowlist = map[string][]string{"acme/child": {"o/r"}}
 	s.Policy = &policy.Config{Repositories: map[string]policy.RepoPolicy{"o/r": {CrossRepoTrigger: boolPtr(true)}}}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: downstreamPipeline, Trusted: true,
@@ -370,7 +370,7 @@ func TestDownstreamRefusedWithoutTargetConsent(t *testing.T) {
 	}
 	s.Policy = &policy.Config{Repositories: map[string]policy.RepoPolicy{"o/r": {CrossRepoTrigger: boolPtr(true)}}}
 	// No DownstreamAllowlist at all: default deny.
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: downstreamPipeline, Trusted: true,
@@ -470,7 +470,7 @@ func TestDownstreamRefusedDBMode(t *testing.T) {
 	}
 	// No allowlist: default deny.
 	s.Policy = &policy.Config{Repositories: map[string]policy.RepoPolicy{"o/r": {CrossRepoTrigger: boolPtr(true)}}}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: downstreamPipeline, Trusted: true,

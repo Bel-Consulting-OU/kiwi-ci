@@ -359,7 +359,7 @@ func fsCaseJobLease() fsMutationCase {
 	return fsMutationCase{
 		name: "job.lease",
 		drive: func(t *testing.T, s *Server) *fsMutationDrive {
-			run, err := s.enqueue(SubmitRun{
+			run, err := s.enqueue(context.Background(), SubmitRun{
 				RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 				Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 			})
@@ -436,7 +436,7 @@ func fsCaseJobHeartbeat() fsMutationCase {
 	return fsMutationCase{
 		name: "job.heartbeat",
 		drive: func(t *testing.T, s *Server) *fsMutationDrive {
-			if _, err := s.enqueue(SubmitRun{
+			if _, err := s.enqueue(context.Background(), SubmitRun{
 				RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 				Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 			}); err != nil {
@@ -481,7 +481,7 @@ func fsCaseJobApprove() fsMutationCase {
 	return fsMutationCase{
 		name: "job.approve",
 		drive: func(t *testing.T, s *Server) *fsMutationDrive {
-			if _, err := s.enqueue(SubmitRun{
+			if _, err := s.enqueue(context.Background(), SubmitRun{
 				RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 				Ref: "refs/heads/main", Event: "push", Pipeline: approvalPipeline,
 			}); err != nil {
@@ -528,7 +528,7 @@ func fsCaseJobCancel() fsMutationCase {
 	return fsMutationCase{
 		name: "job.cancel",
 		drive: func(t *testing.T, s *Server) *fsMutationDrive {
-			run, err := s.enqueue(SubmitRun{
+			run, err := s.enqueue(context.Background(), SubmitRun{
 				RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 				Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 			})
@@ -566,7 +566,7 @@ func fsCaseJobComplete() fsMutationCase {
 	return fsMutationCase{
 		name: "job.complete",
 		drive: func(t *testing.T, s *Server) *fsMutationDrive {
-			if _, err := s.enqueue(SubmitRun{
+			if _, err := s.enqueue(context.Background(), SubmitRun{
 				RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 				Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 			}); err != nil {
@@ -630,7 +630,7 @@ func fsCaseJobCompleteReplay() fsMutationCase {
 	return fsMutationCase{
 		name: "job.complete_replay",
 		drive: func(t *testing.T, s *Server) *fsMutationDrive {
-			if _, err := s.enqueue(SubmitRun{
+			if _, err := s.enqueue(context.Background(), SubmitRun{
 				RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 				Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 			}); err != nil {
@@ -764,7 +764,7 @@ func fsCaseRunnerDisable() fsMutationCase {
 	return fsMutationCase{
 		name: "runner.disable",
 		drive: func(t *testing.T, s *Server) *fsMutationDrive {
-			if _, err := s.enqueue(SubmitRun{
+			if _, err := s.enqueue(context.Background(), SubmitRun{
 				RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 				Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 			}); err != nil {
@@ -840,7 +840,7 @@ func fsCaseMaintainLeaseRecovery() fsMutationCase {
 	return fsMutationCase{
 		name: "maintain.lease_recovery",
 		drive: func(t *testing.T, s *Server) *fsMutationDrive {
-			if _, err := s.enqueue(SubmitRun{
+			if _, err := s.enqueue(context.Background(), SubmitRun{
 				RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 				Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 			}); err != nil {
@@ -969,7 +969,7 @@ func fsCaseSnapshotUpload() fsMutationCase {
 	return fsMutationCase{
 		name: "snapshot.upload",
 		drive: func(t *testing.T, s *Server) *fsMutationDrive {
-			if _, err := s.enqueue(SubmitRun{
+			if _, err := s.enqueue(context.Background(), SubmitRun{
 				RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 				Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 			}); err != nil {
@@ -1040,7 +1040,7 @@ func TestFSFailureMatrixNoDegradedLeakAcrossMutations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := s.enqueue(SubmitRun{
+	run, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 	})
@@ -1242,7 +1242,7 @@ func TestFSFindingsDeploymentRecordAcknowledgesOnPersistFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	grantDeployments(s)
-	run, err := s.enqueue(SubmitRun{
+	run, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/kiwi/repo.git", Ref: "main",
 		Pipeline: deploymentPipeline, Trusted: true,
 	})
@@ -1269,7 +1269,7 @@ func TestFSFindingsDeploymentRecordAcknowledgesOnPersistFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	grantDeployments(s3)
-	run3, err := s3.enqueue(SubmitRun{
+	run3, err := s3.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/kiwi/repo.git", Ref: "main",
 		Pipeline: deploymentPipeline, Trusted: true,
 	})
@@ -1304,7 +1304,7 @@ func TestFSFindingsTestReportLeavesGhostOnPersistFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 	}); err != nil {

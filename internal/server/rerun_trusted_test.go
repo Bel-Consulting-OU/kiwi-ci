@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"testing"
@@ -18,7 +19,7 @@ func rerunServer(t *testing.T) (*Server, model.Run) {
 		"rerun-token":   {Subject: "rerun-bot", Roles: []auth.Role{auth.RoleRerun}},
 		"trusted-token": {Subject: "trusted-bot", Roles: []auth.Role{auth.RoleRerun, auth.RoleTrustedRun}},
 	})
-	run, err := s.enqueue(SubmitRun{
+	run, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/kiwi/repo.git", RepoFullName: "kiwi/repo",
 		Ref: "main", SHA: "abc", Event: "push",
 		Pipeline: testPipeline, Trusted: true,
@@ -73,7 +74,7 @@ func TestRerunUntrustedRunStaysUntrusted(t *testing.T) {
 	s := storeServer(t, "", map[string]auth.Principal{
 		"trusted-token": {Subject: "trusted-bot", Roles: []auth.Role{auth.RoleRerun, auth.RoleTrustedRun}},
 	})
-	run, err := s.enqueue(SubmitRun{
+	run, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/kiwi/repo.git", RepoFullName: "kiwi/repo",
 		Ref: "main", SHA: "abc", Event: "push",
 		Pipeline: testPipeline, Trusted: false,
@@ -98,7 +99,7 @@ func TestRerunDBModeTrustDowngrade(t *testing.T) {
 	if err := s.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
-	run, err := s.enqueue(SubmitRun{
+	run, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/kiwi/repo.git", RepoFullName: "kiwi/repo",
 		Ref: "main", SHA: "abc", Event: "push",
 		Pipeline: testPipeline, Trusted: true,

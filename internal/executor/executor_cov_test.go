@@ -55,12 +55,15 @@ func TestBackendForVariants(t *testing.T) {
 		t.Fatal("container image not carried")
 	}
 	tb, err := BackendFor("tart", "", "vm1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tartb := tb.(*TartBackend)
-	if tartb.VM != "vm1" {
-		t.Fatal("tart VM not carried")
+	if runtime.GOOS == "darwin" {
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tb.(*TartBackend).VM != "vm1" {
+			t.Fatal("tart VM not carried")
+		}
+	} else if err == nil || !strings.Contains(err.Error(), "requires macOS") {
+		t.Fatalf("BackendFor(tart) on %s = (%T, %v), want a requires-macOS error", runtime.GOOS, tb, err)
 	}
 	if _, err := BackendFor("bogus", "", ""); err == nil {
 		t.Fatal("unknown backend accepted")
@@ -76,11 +79,15 @@ func TestBackendForNetworkCarriesNetwork(t *testing.T) {
 		t.Fatal("container network not carried")
 	}
 	tb, err := BackendForNetwork("tart", "", "vm", "none")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tb.(*TartBackend).Network != "none" {
-		t.Fatal("tart network not carried")
+	if runtime.GOOS == "darwin" {
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tb.(*TartBackend).Network != "none" {
+			t.Fatal("tart network not carried")
+		}
+	} else if err == nil || !strings.Contains(err.Error(), "requires macOS") {
+		t.Fatalf("BackendForNetwork(tart) on %s = (%T, %v), want a requires-macOS error", runtime.GOOS, tb, err)
 	}
 	if _, err := BackendForNetwork("bogus", "", "", ""); err == nil {
 		t.Fatal("unknown backend accepted")

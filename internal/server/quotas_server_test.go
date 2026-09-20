@@ -37,7 +37,7 @@ func TestQuotaRepoConcurrencyRejection(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.QuotaLimits = quotas.Limits{RepoConcurrency: 1}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 	}); err != nil {
@@ -74,7 +74,7 @@ func TestQuotaTeamConcurrencyRejection(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.QuotaLimits = quotas.Limits{TeamConcurrency: 1}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r1.git", RepoFullName: "o/r1",
 		Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 	}); err != nil {
@@ -141,7 +141,7 @@ func TestQuotaZeroLimitsUnlimited(t *testing.T) {
 	if err := s.QuotaLimits.Validate(); err != nil {
 		t.Fatalf("zero limits must be valid: %v", err)
 	}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Event: "push", Pipeline: threeJobPipeline,
 	}); err != nil {
@@ -158,7 +158,7 @@ func TestLeaseFreezesRates(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d", w.Code)
 	}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 	}); err != nil {
@@ -200,7 +200,7 @@ func TestCompletionAggregatesUsage(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &ri); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 	}); err != nil {
@@ -256,7 +256,7 @@ func TestDailyBudgetBlocksLeasesMemory(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &ri); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 	}); err != nil {
@@ -342,7 +342,7 @@ func TestCompletionAggregatesUsageDB(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &ri); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 	}); err != nil {

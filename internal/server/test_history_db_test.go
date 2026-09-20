@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -32,7 +33,7 @@ func TestTestHistoryDBReplicasShareShardDecisions(t *testing.T) {
 	if err := s1.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s1.enqueue(SubmitRun{
+	if _, err := s1.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: smokePipeline, Trusted: true,
@@ -118,7 +119,7 @@ func TestTestHistoryUpdateFailureKeepsReport(t *testing.T) {
 	if err := s.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: smokePipeline, Trusted: true,

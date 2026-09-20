@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -30,7 +31,7 @@ func TestUntrustedResourceCeilingsAppliedAtEnqueue(t *testing.T) {
 	if s.UntrustedCPUCeiling != 2.0 || s.UntrustedMemoryCeiling != 4<<30 || s.UntrustedPIDCeiling != 256 {
 		t.Fatalf("default ceilings = %v/%d/%d, want 2.0/4GiB/256", s.UntrustedCPUCeiling, s.UntrustedMemoryCeiling, s.UntrustedPIDCeiling)
 	}
-	run, err := s.enqueue(SubmitRun{
+	run, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "main", Pipeline: bareContainerPipeline,
 	})
@@ -77,7 +78,7 @@ func TestTrustedJobWithoutResourcesGetsNoCeilings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := s.enqueue(SubmitRun{
+	run, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "main", Pipeline: bareContainerPipeline, Trusted: true,
 	})
@@ -116,7 +117,7 @@ jobs:
     steps:
       - run: echo hi
 `
-	run, err := s.enqueue(SubmitRun{
+	run, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "main", Pipeline: declared,
 	})
@@ -146,7 +147,7 @@ func TestCustomUntrustedCeilings(t *testing.T) {
 	s.UntrustedCPUCeiling = 1.5
 	s.UntrustedMemoryCeiling = 1 << 30
 	s.UntrustedPIDCeiling = 64
-	run, err := s.enqueue(SubmitRun{
+	run, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "main", Pipeline: bareContainerPipeline,
 	})

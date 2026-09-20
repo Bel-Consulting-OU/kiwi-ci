@@ -392,7 +392,7 @@ func (s *Server) dispatchDownstream(ctx context.Context, item forge.OutboxItem) 
 	// (ID = the stable child ID) and the link update commit atomically.
 	// A replayed dispatch whose link is already launched with the same
 	// stable ID returns the existing child run.
-	child, err := s.enqueueID(SubmitRun{
+	child, err := s.enqueueID(ctx, SubmitRun{
 		RepoID:          targetRepoID,
 		PolicyRepoID:    targetRepoID,
 		CheckoutRepoURL: downstreamCloneURL(forgeKind, baseURL, p.TargetRepo),

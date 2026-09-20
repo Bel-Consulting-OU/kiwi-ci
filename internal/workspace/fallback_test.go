@@ -87,9 +87,11 @@ func TestSnapshotCopyFallback(t *testing.T) {
 
 // TestSnapshotWorktreeAddFailure exercises the branch where `git worktree
 // add` fails while the context is still live: the target is removed and the
-// snapshot falls through to the copy strategies.
+// snapshot falls through to the copy strategies. The run root is replaced by
+// a regular file, so the target cannot be materialized under it for any euid
+// (chmod 0500 would be bypassed by a root container and the branch would not
+// run at all).
 func TestSnapshotWorktreeAddFailure(t *testing.T) {
-	testutil.UnixChmod(t)
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
@@ -106,13 +108,15 @@ func TestSnapshotWorktreeAddFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	if err := os.Chmod(m.Root, 0o500); err != nil {
+	if err := os.Remove(m.Root); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(m.Root, 0o755) })
+	if err := os.WriteFile(m.Root, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
-	if _, _, err := m.Prepare(context.Background(), "readonly-root"); err == nil {
-		t.Fatal("prepare must fail when the run root is not writable")
+	if _, _, err := m.Prepare(context.Background(), "unusable-root"); err == nil {
+		t.Fatal("prepare must fail when the run root cannot hold a workspace")
 	}
 }
 

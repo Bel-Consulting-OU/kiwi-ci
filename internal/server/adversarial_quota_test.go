@@ -41,7 +41,7 @@ func TestDBQuotaSlotReleasedOnComplete(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.QuotaLimits.RepoConcurrency = 1
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: twoJobPipeline,
@@ -110,7 +110,7 @@ func TestDBQuotaSlotReleasedOnCancel(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.QuotaLimits.RepoConcurrency = 1
-	run, err := s.enqueue(SubmitRun{
+	run, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: twoJobPipeline,
@@ -166,7 +166,7 @@ func TestMemoryEnvironmentConcurrencyRepoScoped(t *testing.T) {
 	for _, repo := range []string{"https://example.com/o/r.git", "https://example.com/other/s.git"} {
 		full := repo[len("https://example.com/"):]
 		full = full[:len(full)-len(".git")]
-		if _, err := s.enqueue(SubmitRun{RepoURL: repo, RepoFullName: full, Ref: "refs/heads/main", SHA: "abc", Event: "push", Pipeline: envPipeline, Trusted: true}); err != nil {
+		if _, err := s.enqueue(context.Background(), SubmitRun{RepoURL: repo, RepoFullName: full, Ref: "refs/heads/main", SHA: "abc", Event: "push", Pipeline: envPipeline, Trusted: true}); err != nil {
 			t.Fatalf("enqueue %s: %v", repo, err)
 		}
 	}
@@ -214,7 +214,7 @@ func TestMemoryEnvironmentConcurrencySameRepoSerializes(t *testing.T) {
 	s.AdmissionCapabilities = &caps
 	// Two runs of the same repository and environment.
 	for i := 0; i < 2; i++ {
-		if _, err := s.enqueue(SubmitRun{RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r", Ref: "refs/heads/main", SHA: "abc", Event: "push", Pipeline: envPipeline, Trusted: true}); err != nil {
+		if _, err := s.enqueue(context.Background(), SubmitRun{RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r", Ref: "refs/heads/main", SHA: "abc", Event: "push", Pipeline: envPipeline, Trusted: true}); err != nil {
 			t.Fatalf("enqueue %d: %v", i, err)
 		}
 	}

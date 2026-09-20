@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -19,7 +20,7 @@ func TestChangedFilesKnownPersistedAtEnqueue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := s.enqueue(SubmitRun{
+	run, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "main", Pipeline: bareContainerPipeline,
 		ChangedFiles: nil, ChangedFilesKnown: true,
@@ -44,7 +45,7 @@ func TestChangedFilesKnownPersistedAtEnqueue(t *testing.T) {
 	}
 	// Unknown completeness: the flag stays false so the runner keeps the
 	// git fallback.
-	run2, err := s.enqueue(SubmitRun{
+	run2, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "main", Pipeline: bareContainerPipeline,
 	})

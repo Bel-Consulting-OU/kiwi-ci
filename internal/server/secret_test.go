@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/base64"
@@ -253,7 +254,7 @@ func TestIssueSecretReceiptSurvivesRestart(t *testing.T) {
 
 func TestEnqueueDeclaredSecrets(t *testing.T) {
 	s := New("secret")
-	run, err := s.enqueue(SubmitRun{
+	run, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/kiwi/repo.git", Ref: "main",
 		Pipeline: `version: 1
 secrets: [global_a, global_b, global_a]

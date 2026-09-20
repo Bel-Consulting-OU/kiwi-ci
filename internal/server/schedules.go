@@ -975,7 +975,7 @@ func (s *Server) fireSchedule(ctx context.Context, sc storage.Schedule, nominal 
 		// The occurrence claim commits atomically with the run.
 		ScheduleClaim: &storage.ScheduleClaim{ScheduleID: sc.ID, Nominal: nominal},
 	}
-	run, err := s.enqueueID(in, preID)
+	run, err := s.enqueueID(ctx, in, preID)
 	if err != nil {
 		if errors.Is(err, storage.ErrScheduleClaimLost) {
 			// Another instance claimed this nominal with a different run.

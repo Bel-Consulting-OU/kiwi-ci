@@ -47,17 +47,22 @@ func TestParseIOErrors(t *testing.T) {
 		t.Fatalf("directory = %v", err)
 	}
 
-	// An unreadable file fails at open.
-	locked := filepath.Join(dir, "locked.xml")
-	if err := os.WriteFile(locked, []byte("<testsuite/>"), 0o000); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Parse(locked); err == nil {
-		t.Fatal("unreadable report must fail")
-	}
-	if err := os.Chmod(locked, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	// An unreadable file fails at open. The denial only exists for a
+	// non-root euid, so this one assertion is its own subtest: root skips it
+	// while the remaining Parse error branches below still run.
+	t.Run("unreadable file", func(t *testing.T) {
+		testutil.RequireNonRoot(t)
+		locked := filepath.Join(dir, "locked.xml")
+		if err := os.WriteFile(locked, []byte("<testsuite/>"), 0o000); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Parse(locked); err == nil {
+			t.Fatal("unreadable report must fail")
+		}
+		if err := os.Chmod(locked, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	})
 
 	if _, err := Parse(writeReport(t, "empty.xml", "")); err == nil || !strings.Contains(err.Error(), "not a JUnit report") {
 		t.Fatalf("empty report = %v", err)

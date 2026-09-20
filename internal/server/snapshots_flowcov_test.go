@@ -87,6 +87,9 @@ func TestFlowSnapshotMemoryMkdirFailure(t *testing.T) {
 
 func TestFlowSnapshotMemoryStagingOpenFailure(t *testing.T) {
 	testutil.UnixChmod(t)
+	// The staging open only fails under a non-root euid: root bypasses the
+	// directory's write bit, so the OS would create the staging file anyway.
+	testutil.RequireNonRoot(t)
 	s, hdrs := fcMemoryBlobServer(t)
 	dir := filepath.Join(s.store.Root, "snapshots", "run-c", "job-a")
 	if err := os.MkdirAll(dir, 0o700); err != nil {

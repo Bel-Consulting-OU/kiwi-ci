@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -96,13 +97,13 @@ func TestRunListVisibilityStrictlyCanonical(t *testing.T) {
 		},
 	})
 	// Seed one run per forge directly (enqueue bypasses HTTP auth).
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/acme/service.git", RepoFullName: "acme/service",
 		Ref: "main", Pipeline: simpleContainerPipeline,
 	}); err != nil {
 		t.Fatalf("seed github run: %v", err)
 	}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://gitlab.example/acme/service.git", RepoFullName: "acme/service",
 		Ref: "main", Pipeline: simpleContainerPipeline,
 	}); err != nil {

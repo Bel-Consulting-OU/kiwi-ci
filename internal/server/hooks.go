@@ -171,7 +171,7 @@ func (s *Server) gitlabWebhook(w http.ResponseWriter, r *http.Request) {
 		Metadata:          map[string]string{"gitlab_delivery": delivery},
 		identityBound:     true,
 	}
-	run, err := s.enqueue(in)
+	run, err := s.enqueue(r.Context(), in)
 	if err != nil {
 		// A durability failure is not a client error: answer 503 so the
 		// forge retries the delivery instead of treating it as rejected.
@@ -285,7 +285,7 @@ func (s *Server) forgejoWebhook(w http.ResponseWriter, r *http.Request) {
 		Metadata:          map[string]string{"forgejo_delivery": delivery},
 		identityBound:     true,
 	}
-	run, err := s.enqueue(in)
+	run, err := s.enqueue(r.Context(), in)
 	if err != nil {
 		var nd *stateNotDurableError
 		if errors.As(err, &nd) {

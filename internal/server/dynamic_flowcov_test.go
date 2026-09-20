@@ -258,7 +258,7 @@ func fcDynamicDBFixture(t *testing.T) (*Server, *dbFakeStore, Task) {
 			"o/r": {GenerateChildGraph: boolPtr(true), CrossRepoTrigger: boolPtr(true)},
 		},
 	}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: generatePipeline, Trusted: true,

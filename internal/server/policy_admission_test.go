@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -138,7 +139,7 @@ jobs:
 	// Untrusted submissions may not run Tart at all (no isolated Tart
 	// networking), so the digest-pin case is exercised through the internal
 	// trusted enqueue path: the trusted run's VM must still be digest-pinned.
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Pipeline: unpinnedVM, Trusted: true,
 	}); err == nil {

@@ -29,7 +29,7 @@ func snapshotCASServer(t *testing.T, f *dbFakeStore, casDir string) (*Server, st
 		t.Fatal(err)
 	}
 	s.SetBlobStore(blob.NewFS(casDir))
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/kiwi/repo.git", RepoFullName: "kiwi/repo",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: testPipeline, Trusted: true,

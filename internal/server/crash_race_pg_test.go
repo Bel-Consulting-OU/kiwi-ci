@@ -176,7 +176,7 @@ func TestPostgresIntegrationServerWebhookEnqueueRace(t *testing.T) {
 		go func(s *Server) {
 			defer wg.Done()
 			<-start
-			r, err := s.enqueue(in)
+			r, err := s.enqueue(context.Background(), in)
 			results <- enqueueResult{run: r, err: err}
 		}(s)
 	}

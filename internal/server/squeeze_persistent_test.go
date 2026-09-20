@@ -119,8 +119,14 @@ func TestSqueezeNewPersistentSymlinkedDataDir(t *testing.T) {
 }
 
 // TestSqueezeNewPersistentPersistFailure makes the final snapshot write fail
-// after every loader succeeded.
+// after every loader succeeded. The injection is a read-only data directory,
+// which the OS only enforces for a non-root euid: root bypasses the write bit
+// (CAP_DAC_OVERRIDE), so there is no root-proof way to fail the trailing
+// constructor persist while keeping the loaders working (a directory at
+// state.json would fail the loader first).
 func TestSqueezeNewPersistentPersistFailure(t *testing.T) {
+	testutil.UnixChmod(t)
+	testutil.RequireNonRoot(t)
 	dir := t.TempDir()
 	if _, err := NewPersistentWithCluster("t", "t", dir, nil); err != nil {
 		t.Fatal(err)

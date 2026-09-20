@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -90,7 +91,7 @@ func TestCompletionRollbackRestoresRunnerActiveJobsExactly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Event: "push", Pipeline: rollbackFanoutPipeline,
 	}); err != nil {
@@ -197,7 +198,7 @@ func TestCompletionRollbackRestoresDependentJobAndRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := s.enqueue(SubmitRun{
+	run, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Event: "push", Pipeline: rollbackDependencyPipeline,
 	})
@@ -323,7 +324,7 @@ func TestCompletionRollbackRestoresSingleActiveJobRunner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 	}); err != nil {

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -39,7 +40,7 @@ func trustedGenerateServer(t *testing.T) (*Server, model.Run) {
 			"o/r": {GenerateChildGraph: boolPtr(true), CrossRepoTrigger: boolPtr(true)},
 		},
 	}
-	run, err := s.enqueue(SubmitRun{
+	run, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: generatePipeline, Trusted: true,
@@ -201,7 +202,7 @@ func TestDynamicGenerateTrustReduction(t *testing.T) {
 	s.runs = map[string]model.Run{}
 	s.jobs = map[string]model.Job{}
 	s.mu.Unlock()
-	run, err := s.enqueue(SubmitRun{
+	run, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: generatePipeline, Trusted: true,
@@ -247,7 +248,7 @@ func TestDynamicGenerateDBMode(t *testing.T) {
 			"o/r": {GenerateChildGraph: boolPtr(true)},
 		},
 	}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: generatePipeline, Trusted: true,

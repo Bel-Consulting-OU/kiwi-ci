@@ -240,14 +240,14 @@ func TestDirectSubmitBindingAcceptsEquivalentForms(t *testing.T) {
 // repo_full_name past the binding.
 func TestEnqueueBindsNonWebhookIngress(t *testing.T) {
 	s := New("token")
-	_, err := s.enqueue(SubmitRun{
+	_, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/acme/other.git", RepoFullName: "acme/allowed",
 		Ref: "refs/heads/main", Pipeline: simpleContainerPipeline,
 	})
 	if err == nil {
 		t.Fatal("enqueue accepted a mismatched repo_url/repo_full_name pair")
 	}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/acme/other.git", RepoFullName: "acme/other",
 		Ref: "refs/heads/main", Pipeline: simpleContainerPipeline,
 	}); err != nil {

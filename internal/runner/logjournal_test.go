@@ -1122,16 +1122,17 @@ func TestOpenJobLogJournalRequiresExplicitOptOut(t *testing.T) {
 	}
 }
 
-// FB-4: an unusable (read-only) state directory is fail-closed: the journal
-// cannot be created and the error is surfaced rather than silently ignored.
+// FB-4: an unusable state directory is fail-closed: the journal cannot be
+// created and the error is surfaced rather than silently ignored. The state
+// dir sits under a regular file so MkdirAll fails for every euid (a chmod
+// 0500 state dir is bypassed by root, which would let the journal open).
 func TestOpenJobLogJournalReadOnlyStateDirFailsClosed(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0o500); err != nil {
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
-	r := &Runner{Cfg: Config{StateDir: dir}}
+	r := &Runner{Cfg: Config{StateDir: filepath.Join(blocker, "state")}}
 	if j, err := r.openJobLogJournal("job-1", 1, nil); err == nil || j != nil {
-		t.Fatalf("openJobLogJournal on a read-only state dir = (%v, %v), want an explicit error", j, err)
+		t.Fatalf("openJobLogJournal on an unusable state dir = (%v, %v), want an explicit error", j, err)
 	}
 }

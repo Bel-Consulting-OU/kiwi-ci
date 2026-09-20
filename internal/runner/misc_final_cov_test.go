@@ -163,13 +163,15 @@ func TestFinalNewJobCacheLogfAndRestore(t *testing.T) {
 func TestFinalIdentityStoreWriteFailures(t *testing.T) {
 	full := Identity{ID: "runner-1", KeyPEM: []byte("key"), CertPEM: []byte("cert"), CACertPEM: []byte("ca")}
 
-	readOnly := t.TempDir()
-	if err := os.Chmod(readOnly, 0o500); err != nil {
+	// The first write (runner id) fails: a directory is in the way, which the
+	// OS rejects for every euid (a chmod 0500 dir is bypassed by root). The
+	// error is the same first-write return the read-only case exercises.
+	idBlocked := t.TempDir()
+	if err := os.Mkdir(filepath.Join(idBlocked, identityIDFile), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(readOnly, 0o700) })
-	if err := (IdentityStore{Dir: readOnly}).Save(full); err == nil {
-		t.Fatal("write into a read-only identity dir succeeded")
+	if err := (IdentityStore{Dir: idBlocked}).Save(full); err == nil {
+		t.Fatal("write onto an identity-id directory succeeded")
 	}
 
 	certBlocked := t.TempDir()

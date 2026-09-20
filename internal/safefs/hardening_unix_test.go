@@ -70,6 +70,14 @@ func TestOpenRelDeviceFileRejected(t *testing.T) {
 	if err := syscall.Mknod(dev, syscall.S_IFCHR|0o666, int(unixMkdev(1, 3))); err != nil {
 		t.Skip("device nodes need privileges")
 	}
+	// A node created as root inside a container can still be denied at open
+	// time (device cgroup/seccomp), so ErrNotRegular is unobservable there;
+	// TestOpenRelFIFODoesNotBlock covers the same not-regular code path.
+	if f, err := os.Open(dev); err != nil {
+		t.Skipf("device node is not openable in this sandbox: %v", err)
+	} else {
+		_ = f.Close()
+	}
 	root, err := OpenWorkspaceRoot(ws)
 	if err != nil {
 		t.Fatal(err)

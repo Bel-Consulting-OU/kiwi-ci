@@ -326,7 +326,7 @@ func TestSqueezeEnqueueMemoryDownstreamClaims(t *testing.T) {
 		}
 	}
 	// First launch records the link.
-	run, err := s.enqueueID(claim("o/r|refs/heads/main|child", "stable-1"), "child-run-1")
+	run, err := s.enqueueID(context.Background(), claim("o/r|refs/heads/main|child", "stable-1"), "child-run-1")
 	if err != nil {
 		t.Fatalf("first launch: %v", err)
 	}
@@ -337,7 +337,7 @@ func TestSqueezeEnqueueMemoryDownstreamClaims(t *testing.T) {
 		t.Fatalf("link = %+v", link)
 	}
 	// A replay of the same stable child returns the existing run.
-	prior, err := s.enqueueID(claim("o/r|refs/heads/main|child", "stable-1"), "child-run-1")
+	prior, err := s.enqueueID(context.Background(), claim("o/r|refs/heads/main|child", "stable-1"), "child-run-1")
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
@@ -345,7 +345,7 @@ func TestSqueezeEnqueueMemoryDownstreamClaims(t *testing.T) {
 		t.Fatalf("replay returned %s want %s", prior.ID, run.ID)
 	}
 	// A conflicting claim for the same link fails closed.
-	if _, err := s.enqueueID(claim("o/r|refs/heads/main|child", "stable-2"), "child-run-2"); err == nil {
+	if _, err := s.enqueueID(context.Background(), claim("o/r|refs/heads/main|child", "stable-2"), "child-run-2"); err == nil {
 		t.Fatal("conflicting downstream claim = nil error")
 	}
 }
@@ -358,11 +358,11 @@ func TestSqueezeEnqueueMemoryDeliveryDedupe(t *testing.T) {
 		Ref: "refs/heads/main", SHA: "sha", Event: "push", Pipeline: untrustedPipeline,
 		Metadata: map[string]string{"github_delivery": "dup-1"},
 	}
-	first, err := s.enqueue(in)
+	first, err := s.enqueue(context.Background(), in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := s.enqueue(in)
+	second, err := s.enqueue(context.Background(), in)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -373,28 +373,27 @@ func TestSqueezeEnqueueMemoryDeliveryDedupe(t *testing.T) {
 	in2 := in
 	in2.RepoURL = "https://github.com/other/backend.git"
 	in2.RepoFullName = "other/backend"
-	if run, err := s.enqueue(in2); err != nil || run.ID == first.ID {
+	if run, err := s.enqueue(context.Background(), in2); err != nil || run.ID == first.ID {
 		t.Fatalf("cross-repo delivery dedupe = %+v, %v", run, err)
 	}
 }
 
 // TestSqueezeEnqueueMemoryPersistFailure covers the enqueue persist error.
 func TestSqueezeEnqueueMemoryPersistFailure(t *testing.T) {
-	dir := t.TempDir()
-	s, err := NewPersistent("secret", "secret", dir)
+	s, err := NewPersistent("secret", "secret", t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(dir, 0o500); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
-	_, err = s.enqueue(SubmitRun{
+	// Inject the snapshot-write fault through the server seam instead of a
+	// read-only data dir: root bypasses the mode bits, so the chmod version
+	// of this test could not fail under a privileged CI runner.
+	s.persistFailForTest = errors.New("injected enqueue persist failure")
+	_, err = s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/acme/backend.git", RepoFullName: "acme/backend",
 		Ref: "refs/heads/main", SHA: "sha", Event: "push", Pipeline: untrustedPipeline,
 	})
 	if err == nil {
-		t.Fatal("enqueue with unwritable data dir = nil error")
+		t.Fatal("enqueue with a failing state persist = nil error")
 	}
 }
 
@@ -419,7 +418,7 @@ func TestSqueezeEnqueueDBFallback(t *testing.T) {
 		Ref: "refs/heads/main", SHA: "sha", Event: "push", Pipeline: untrustedPipeline,
 		Metadata: map[string]string{"github_delivery": "fallback-1"},
 	}
-	if _, err := s.enqueue(in); err == nil || !strings.Contains(err.Error(), "atomic") {
+	if _, err := s.enqueue(context.Background(), in); err == nil || !strings.Contains(err.Error(), "atomic") {
 		t.Fatalf("enqueue without the atomic contract = %v, want a fail-closed error", err)
 	} else {
 		var nd *stateNotDurableError
@@ -465,7 +464,7 @@ func TestSqueezeEnqueueDBErrorBranches(t *testing.T) {
 	t.Run("duplicate without claim", func(t *testing.T) {
 		s, f := newServer(t)
 		f.enqueueErr = storage.ErrDeliveryDuplicate
-		if _, err := s.enqueue(base); !errors.Is(err, storage.ErrDeliveryDuplicate) {
+		if _, err := s.enqueue(context.Background(), base); !errors.Is(err, storage.ErrDeliveryDuplicate) {
 			t.Fatalf("err = %v", err)
 		}
 	})
@@ -475,7 +474,7 @@ func TestSqueezeEnqueueDBErrorBranches(t *testing.T) {
 		f.findDeliveryErr = errStaticKindMissing
 		in := base
 		in.Metadata = map[string]string{"github_delivery": "d1"}
-		if _, err := s.enqueue(in); err == nil || !strings.Contains(err.Error(), "lookup delivery") {
+		if _, err := s.enqueue(context.Background(), in); err == nil || !strings.Contains(err.Error(), "lookup delivery") {
 			t.Fatalf("err = %v, want lookup failure", err)
 		}
 	})
@@ -484,7 +483,7 @@ func TestSqueezeEnqueueDBErrorBranches(t *testing.T) {
 		f.enqueueErr = storage.ErrDeliveryDuplicate
 		in := base
 		in.Metadata = map[string]string{"github_delivery": "d1"}
-		if _, err := s.enqueue(in); !errors.Is(err, storage.ErrDeliveryDuplicate) {
+		if _, err := s.enqueue(context.Background(), in); !errors.Is(err, storage.ErrDeliveryDuplicate) {
 			t.Fatalf("err = %v", err)
 		}
 	})
@@ -493,7 +492,7 @@ func TestSqueezeEnqueueDBErrorBranches(t *testing.T) {
 		f.enqueueErr = storage.ErrScheduleClaimLost
 		in := base
 		in.ScheduleClaim = &storage.ScheduleClaim{ScheduleID: "s1", Nominal: time.Now().UTC()}
-		if _, err := s.enqueue(in); !errors.Is(err, storage.ErrScheduleClaimLost) {
+		if _, err := s.enqueue(context.Background(), in); !errors.Is(err, storage.ErrScheduleClaimLost) {
 			t.Fatalf("err = %v", err)
 		}
 	})
@@ -505,7 +504,7 @@ func TestSqueezeEnqueueDBErrorBranches(t *testing.T) {
 		f.enqueueErr = storage.ErrDownstreamLaunched
 		in := base
 		in.DownstreamLaunch = &storage.DownstreamLaunchClaim{LinkKey: "k", StableChildID: "stable"}
-		run, err := s.enqueueID(in, "child-run")
+		run, err := s.enqueueID(context.Background(), in, "child-run")
 		if err != nil {
 			t.Fatalf("replay: %v", err)
 		}
@@ -518,7 +517,7 @@ func TestSqueezeEnqueueDBErrorBranches(t *testing.T) {
 		f.enqueueErr = storage.ErrDownstreamLaunched
 		in := base
 		in.DownstreamLaunch = &storage.DownstreamLaunchClaim{LinkKey: "k", StableChildID: "stable"}
-		if _, err := s.enqueueID(in, "child-run"); !errors.Is(err, storage.ErrDownstreamLaunched) {
+		if _, err := s.enqueueID(context.Background(), in, "child-run"); !errors.Is(err, storage.ErrDownstreamLaunched) {
 			t.Fatalf("err = %v", err)
 		}
 	})
@@ -553,7 +552,7 @@ jobs:
     steps:
       - run: echo hi
 `
-	run, err := s.enqueue(SubmitRun{
+	run, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/acme/backend.git", RepoFullName: "acme/backend",
 		Ref: "refs/heads/main", SHA: "sha", Event: "push", Pipeline: gated, Trusted: true,
 	})

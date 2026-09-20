@@ -493,7 +493,7 @@ func TestCompleteDBRequiresDeclaredArtifacts(t *testing.T) {
 	if err := s.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: requiredArtifactPipeline, Trusted: true,
@@ -580,7 +580,7 @@ func TestDownstreamConcurrentFlushOneChild(t *testing.T) {
 	}
 	s.DownstreamAllowlist = map[string][]string{"acme/child": {"o/r"}}
 	s.Policy = &policy.Config{Repositories: map[string]policy.RepoPolicy{"o/r": {CrossRepoTrigger: boolPtr(true)}}}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: downstreamPipeline, Trusted: true,
@@ -641,7 +641,7 @@ func TestDownstreamReservedLinkRecoveredByMaintain(t *testing.T) {
 	}
 	s.DownstreamAllowlist = map[string][]string{"acme/child": {"o/r"}}
 	s.Policy = &policy.Config{Repositories: map[string]policy.RepoPolicy{"o/r": {CrossRepoTrigger: boolPtr(true)}}}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: downstreamPipeline, Trusted: true,
@@ -706,7 +706,7 @@ func TestDownstreamForgeIdentityPersisted(t *testing.T) {
 	s.SetForgeBaseURL("forgejo", "https://forgejo.internal.example")
 	s.Policy = &policy.Config{Repositories: map[string]policy.RepoPolicy{"o/r": {CrossRepoTrigger: boolPtr(true)}}}
 	// The parent repository lives on a self-hosted Forgejo host.
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://forgejo.internal.example/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: downstreamPipeline, Trusted: true,
@@ -876,7 +876,7 @@ func TestDynamicFragmentBeyondCapRejectedInTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Policy = &policy.Config{Repositories: map[string]policy.RepoPolicy{"o/r": {GenerateChildGraph: boolPtr(true)}}}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: generatePipeline, Trusted: true,
@@ -1023,7 +1023,7 @@ jobs:
     steps:
       - run: echo hi
 `
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: sbomPipeline, Trusted: true,

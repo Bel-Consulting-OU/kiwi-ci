@@ -186,7 +186,10 @@ exit 0
 		if !strings.Contains(got, "gc removed 1 containers, 0 networks, 0 VMs") {
 			t.Fatalf("GC report = %q", got)
 		}
-	case <-time.After(30 * time.Second):
+	// Generous bound: under CI the agent may be CPU-starved by emulated-arch
+	// steps, which delays the poll/GC goroutine well past the usual
+	// millisecond latency; a quiet machine reports almost immediately.
+	case <-time.After(2 * time.Minute):
 		t.Fatal("GC report was not printed")
 	}
 	cancel()

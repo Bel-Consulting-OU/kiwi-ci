@@ -98,13 +98,13 @@ jobs:
     steps:
       - run: echo hi
 `
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Pipeline: ok, Trusted: true,
 	}); err != nil {
 		t.Fatalf("granted+allowlisted: %v", err)
 	}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://evil.example/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Pipeline: ok, Trusted: true,
 	}); err == nil {
@@ -112,7 +112,7 @@ jobs:
 	}
 	// Grant removed: the declaration is rejected again.
 	s.Policy = &policy.Config{AllowedCloneHosts: []string{"github.com"}}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Pipeline: ok, Trusted: true,
 	}); err == nil {
@@ -289,7 +289,7 @@ jobs:
     steps:
       - run: echo hi
 `
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Pipeline: native, Trusted: true,
 	}); err != nil {

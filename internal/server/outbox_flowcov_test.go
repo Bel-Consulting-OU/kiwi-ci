@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"os"
 	"path/filepath"
 	"sync"
@@ -104,7 +103,6 @@ func TestFlowOutboxReplayDBBranches(t *testing.T) {
 }
 
 func TestFlowOutboxReadItemsErrors(t *testing.T) {
-	testutil.UnixChmod(t)
 	// A directory where the JSONL file belongs: decode failure.
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, outboxFile), 0o700); err != nil {
@@ -117,14 +115,14 @@ func TestFlowOutboxReadItemsErrors(t *testing.T) {
 	if _, err := o.readItems(); err == nil {
 		t.Fatal("directory decode must be an error")
 	}
-	// An unreadable root: open failure.
-	blocked := t.TempDir()
-	if err := os.Chmod(blocked, 0o000); err != nil {
+	// An open failure that is not ENOENT: every path under a regular file
+	// resolves to ENOTDIR, which the OS reports for any euid.
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	defer os.Chmod(blocked, 0o700)
 	o2 := NewOutbox(nil)
-	o2.store = storage.New(blocked)
+	o2.store = storage.New(filepath.Join(blocker, "data"))
 	if _, err := o2.readItems(); err == nil {
 		t.Fatal("unreadable root must be an error")
 	}
@@ -146,7 +144,6 @@ func TestFlowOutboxEnqueueLocalBranches(t *testing.T) {
 }
 
 func TestFlowOutboxAppendJSONLBranches(t *testing.T) {
-	testutil.UnixChmod(t)
 	o := NewOutbox(nil)
 	if err := o.appendJSONLLocked("x.jsonl", map[string]string{"a": "b"}); err != nil {
 		t.Fatalf("nil store append = %v", err)
@@ -157,24 +154,31 @@ func TestFlowOutboxAppendJSONLBranches(t *testing.T) {
 	if err := o2.appendJSONLLocked("x.jsonl", make(chan int)); err == nil {
 		t.Fatal("unencodable value must fail")
 	}
-	// Open failure: read-only root.
+	// Open failure: a directory at the append path is rejected by the OS for
+	// every euid.
 	blocked := t.TempDir()
-	if err := os.Chmod(blocked, 0o500); err != nil {
+	if err := os.Mkdir(filepath.Join(blocked, "x.jsonl"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	defer os.Chmod(blocked, 0o700)
 	o3 := NewOutbox(nil)
 	o3.store = storage.New(blocked)
 	if err := o3.appendJSONLLocked("x.jsonl", map[string]string{"a": "b"}); err == nil {
-		t.Fatal("read-only root must fail the append")
+		t.Fatal("directory at the append path must fail the append")
 	}
 	// Durable-first: Enqueue surfaces the persistence error and the item is
 	// NOT queued — the side effect must never be dispatchable before the
-	// record of it exists.
-	if err := o3.Enqueue(context.Background(), forge.OutboxItem{Kind: forge.OutboxKindWebhookCall}); err == nil {
+	// record of it exists. A store root under a regular file fails MkdirAll
+	// for every euid, so this holds under root too.
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	o4 := NewOutbox(nil)
+	o4.store = storage.New(filepath.Join(blocker, "data"))
+	if err := o4.Enqueue(context.Background(), forge.OutboxItem{Kind: forge.OutboxKindWebhookCall}); err == nil {
 		t.Fatal("Enqueue must surface the fs persistence error")
 	}
-	if len(o3.Pending()) != 0 {
+	if len(o4.Pending()) != 0 {
 		t.Fatal("failed persistence must not queue the item")
 	}
 }

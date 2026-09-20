@@ -137,7 +137,7 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 		Metadata:          map[string]string{"github_delivery": delivery},
 		identityBound:     true,
 	}
-	run, err := s.enqueue(in)
+	run, err := s.enqueue(r.Context(), in)
 	if err != nil {
 		// A durability failure is not a client error: answer 503 so the
 		// forge retries the delivery instead of treating it as rejected.

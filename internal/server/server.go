@@ -734,14 +734,14 @@ func (s *Server) SwitchToDB(db storage.Store) error {
 	// transition: the fs snapshot is abandoned, not repaired.
 	s.notePersistResult(nil)
 	s.LeaderKey = sched.LeaderKey
-	s.leader = sched.IsLeader(context.Background())
+	s.leader = sched.IsLeader(context.Background()) // allow-background: startup leader probe runs before any request exists
 	// DB mode: the durable outbox, schedules and artifact contracts move
 	// into the SQL store.
 	s.outbox.AttachDB(db)
-	if err := s.outbox.ReplayDB(context.Background()); err != nil {
+	if err := s.outbox.ReplayDB(context.Background()); err != nil { // allow-background: startup outbox replay, no request origin exists
 		s.logError("outbox: db replay failed", "error", err.Error())
 	}
-	if err := s.reloadSchedulesDB(context.Background()); err != nil {
+	if err := s.reloadSchedulesDB(context.Background()); err != nil { // allow-background: startup schedule load, no request origin exists
 		s.logError("schedules: db load failed", "error", err.Error())
 	}
 	if err := s.ConfigureOPA(); err != nil {
@@ -1097,7 +1097,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	// (and internal reruns of previously trusted runs) set Trusted. The
 	// `trusted` field is not accepted from client JSON (json:"-").
 	in.Trusted = false
-	run, err := s.enqueue(in)
+	run, err := s.enqueue(r.Context(), in)
 	if err != nil {
 		var adm *admissionError
 		if errors.As(err, &adm) {
@@ -1129,16 +1129,30 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, run)
 }
 
-func (s *Server) enqueue(in SubmitRun) (model.Run, error) {
-	return s.enqueueID(in, "")
+// enqueue submits a run on the caller's context: the request context for
+// every HTTP ingress (submit, webhooks, rerun) and the maintenance-tick
+// context for schedule firing and outbox-driven downstream dispatch. A
+// canceled origin aborts the enqueue at the operation boundary BEFORE
+// anything is persisted or mutated in memory, so a client that hung up can
+// never leave a ghost run behind. Only an operation that must outlive its
+// origin may detach, and only through boundedDetach (see the queued-status
+// publication below).
+func (s *Server) enqueue(ctx context.Context, in SubmitRun) (model.Run, error) {
+	return s.enqueueID(ctx, in, "")
 }
 
 // enqueueID is enqueue with an optional pre-generated run ID (schedules
 // claim their occurrence before enqueueing and therefore need the ID up
 // front).
-func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
-	ctx, span := s.startSpan(context.Background(), "server.enqueue")
+func (s *Server) enqueueID(ctx context.Context, in SubmitRun, preRunID string) (model.Run, error) {
+	ctx, span := s.startSpan(ctx, "server.enqueue")
 	defer span.End()
+	if err := ctx.Err(); err != nil {
+		// Fail closed before ANY work: a canceled request must not resolve a
+		// pipeline, admit quota or generate IDs for a run that cannot be
+		// completed.
+		return model.Run{}, err
+	}
 	// Non-webhook ingresses (direct API submits and any caller that did not
 	// resolve the identity itself) go through the strict binding FIRST: the
 	// identity is derived from repo_url and a supplied repo_full_name must
@@ -1312,10 +1326,16 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 	// persisted before the run and its jobs exist.
 
 	if s.Sched != nil {
-		return s.enqueueDB(in, run, created, jobContracts, group, spec.Concurrency.CancelInProgress, now)
+		return s.enqueueDB(ctx, in, run, created, jobContracts, group, spec.Concurrency.CancelInProgress, now)
 	}
 
 	s.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		// The request may have been canceled while this enqueue waited for
+		// the state lock; abort before the first mutation.
+		s.mu.Unlock()
+		return model.Run{}, err
+	}
 	// Schedule occurrence atomicity (memory mode): a conflicting claim for
 	// the same nominal aborts before anything is inserted, and the claim
 	// itself lands only after the run and its jobs are committed to the
@@ -1416,6 +1436,15 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 	}
 	s.auditLocked("run.queued", "scheduler", runID, "", "run queued", map[string]string{"event": in.Event})
 	s.scheduleStateLocked()
+	if err := ctx.Err(); err != nil {
+		// Canceled before the snapshot write: roll the in-memory mutation
+		// back so the aborted enqueue leaves no ghost run. The fs snapshot is
+		// synchronous and not interruptible, so cancellation is honored at
+		// the operation boundary, exactly like the outbox fs append.
+		s.rollbackStateLocked(rb)
+		s.mu.Unlock()
+		return model.Run{}, err
+	}
 	if err := s.persistCheckedErrLocked("run.enqueue"); err != nil {
 		// The enqueue never became durable: restore the exact pre-enqueue
 		// state (superseded runs revived, ghost run/jobs/contracts removed,
@@ -1457,10 +1486,9 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 	// up, so it goes through an explicitly BOUNDED detach (never a bare
 	// Background): a stalled DB cannot pin the submission goroutine, and a
 	// failure is logged rather than returned because the run's own durability
-	// is what the response ACKs. enqueue() has no caller context to thread
-	// (the same plumbing serves HTTP handlers and the scheduler).
-	//lint:ignore SA1012 detach root: boundedDetach substitutes context.Background() when origin is nil (context-free call path).
-	pubCtx, pubCancel := boundedDetach(nil, outboxDetachTimeout)
+	// is what the response ACKs. ctx is passed as the detach ORIGIN so the
+	// values survive while its cancellation does not.
+	pubCtx, pubCancel := boundedDetach(ctx, outboxDetachTimeout)
 	defer pubCancel()
 	if err := s.publishForgeStatus(pubCtx, run); err != nil {
 		s.logError("forge status enqueue failed", "run", run.ID, "error", err.Error())
@@ -1476,9 +1504,13 @@ func (s *Server) enqueueID(in SubmitRun, preRunID string) (model.Run, error) {
 // claims the webhook delivery, quota reservation and (optionally) schedule
 // occurrence. It decides approval/environment gating up front (the SQL
 // completion path does not re-run the full schedule pass) and emits the
-// run.queued audit event through the DB audit funnel.
-func (s *Server) enqueueDB(in SubmitRun, run model.Run, created map[string]model.Job, jobContracts map[string]map[string]storage.ArtifactContract, group string, cancelInProgress bool, now time.Time) (model.Run, error) {
-	ctx := context.Background()
+// run.queued audit event through the DB audit funnel. ctx is the caller's
+// request or maintenance context and reaches every store call; a canceled
+// origin aborts before the transaction is issued.
+func (s *Server) enqueueDB(ctx context.Context, in SubmitRun, run model.Run, created map[string]model.Job, jobContracts map[string]map[string]storage.ArtifactContract, group string, cancelInProgress bool, now time.Time) (model.Run, error) {
+	if err := ctx.Err(); err != nil {
+		return model.Run{}, err
+	}
 	// Daily budget state: enqueues are refused while the usage store is
 	// unavailable unless the operator explicitly fails open.
 	if _, _, err := s.dailyBudgetStateDB(ctx); err != nil && !s.QuotaFailOpen {
@@ -1553,6 +1585,11 @@ func (s *Server) enqueueDB(in SubmitRun, run model.Run, created map[string]model
 		// 400 as if the request were invalid.
 		return model.Run{}, notDurable(fmt.Errorf("storage: attached store lacks the atomic compiled-run enqueue contract; refusing a non-atomic enqueue"))
 	}
+	if err := ctx.Err(); err != nil {
+		// The request may have been canceled while the run was compiled and
+		// gated; do not issue the durable transaction at all.
+		return model.Run{}, err
+	}
 	err := rs.InsertCompiledRun(ctx, req)
 	switch {
 	case errors.Is(err, storage.ErrDeliveryDuplicate):
@@ -1594,9 +1631,9 @@ func (s *Server) enqueueDB(in SubmitRun, run model.Run, created map[string]model
 	// so the queued check publication is best-effort and must still be
 	// recorded if the submitting client hangs up; the bound keeps a stalled
 	// DB from pinning the submission goroutine, and a failure is logged, not
-	// returned, because the transaction is what the response ACKs.
-	//lint:ignore SA1012 detach root: boundedDetach substitutes context.Background() when origin is nil (context-free call path).
-	pubCtx, pubCancel := boundedDetach(nil, outboxDetachTimeout)
+	// returned, because the transaction is what the response ACKs. ctx is the
+	// detach ORIGIN: values survive, cancellation does not.
+	pubCtx, pubCancel := boundedDetach(ctx, outboxDetachTimeout)
 	defer pubCancel()
 	if err := s.publishForgeStatus(pubCtx, run); err != nil {
 		s.logError("forge status enqueue failed", "run", run.ID, "error", err.Error())
@@ -2187,7 +2224,7 @@ func (s *Server) runnerDrain(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Audit-first: a drain that cannot leave evidence is refused.
-		if aerr := s.auditFirstLocked("runner.drain", actorFrom(r), "", "", "runner draining", map[string]string{"runner": id}); aerr != nil {
+		if aerr := s.auditFirstLocked(r.Context(), "runner.drain", actorFrom(r), "", "", "runner draining", map[string]string{"runner": id}); aerr != nil {
 			http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
 			return
 		}
@@ -2206,7 +2243,7 @@ func (s *Server) runnerDrain(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if aerr := s.auditFirstLocked("runner.drain", actorFrom(r), "", "", "runner draining", map[string]string{"runner": id}); aerr != nil {
+	if aerr := s.auditFirstLocked(r.Context(), "runner.drain", actorFrom(r), "", "", "runner draining", map[string]string{"runner": id}); aerr != nil {
 		http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -2260,7 +2297,7 @@ func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
 		// updated. The DB audit table is a separate transaction (the store
 		// API cannot join it), so a row may exist for a disable the store
 		// update then rejected.
-		if aerr := s.auditFirstLocked("runner.disable", actor, "", "", "runner disabled", map[string]string{"runner": id}); aerr != nil {
+		if aerr := s.auditFirstLocked(r.Context(), "runner.disable", actor, "", "", "runner disabled", map[string]string{"runner": id}); aerr != nil {
 			http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
 			return
 		}
@@ -2295,7 +2332,7 @@ func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
 	}
 	// Audit-first: an unwritable audit row blocks the whole kill switch
 	// (flag plus lease cancellations) with 503.
-	if aerr := s.auditFirstLocked("runner.disable", actor, "", "", "runner disabled", map[string]string{"runner": id}); aerr != nil {
+	if aerr := s.auditFirstLocked(r.Context(), "runner.disable", actor, "", "", "runner disabled", map[string]string{"runner": id}); aerr != nil {
 		s.mu.Unlock()
 		http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
 		return
@@ -2358,7 +2395,7 @@ func (s *Server) runnerEnable(w http.ResponseWriter, r *http.Request) {
 			s.internalError(w, r, err, "")
 			return
 		}
-		if aerr := s.auditFirstLocked("runner.enable", actorFrom(r), "", "", "runner enabled", map[string]string{"runner": id}); aerr != nil {
+		if aerr := s.auditFirstLocked(r.Context(), "runner.enable", actorFrom(r), "", "", "runner enabled", map[string]string{"runner": id}); aerr != nil {
 			http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
 			return
 		}
@@ -2378,7 +2415,7 @@ func (s *Server) runnerEnable(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if aerr := s.auditFirstLocked("runner.enable", actorFrom(r), "", "", "runner enabled", map[string]string{"runner": id}); aerr != nil {
+	if aerr := s.auditFirstLocked(r.Context(), "runner.enable", actorFrom(r), "", "", "runner enabled", map[string]string{"runner": id}); aerr != nil {
 		http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -3852,7 +3889,7 @@ func (s *Server) approveJob(w http.ResponseWriter, r *http.Request) {
 	// Audit-first: an unwritable audit row blocks the approval with 503
 	// before any state changes, so a durable approval can never lack its
 	// evidence.
-	if aerr := s.auditFirstLocked("job.approved", actor, j.RunID, j.ID, "environment approved", map[string]string{"environment": j.Environment}); aerr != nil {
+	if aerr := s.auditFirstLocked(r.Context(), "job.approved", actor, j.RunID, j.ID, "environment approved", map[string]string{"environment": j.Environment}); aerr != nil {
 		http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -3913,7 +3950,7 @@ func (s *Server) approveJobDB(w http.ResponseWriter, r *http.Request, jobID, act
 	// update (the store API cannot join them), so the row lands before the
 	// transition and a failed append refuses the approval. A row may exist
 	// for an update the store then rejected.
-	if aerr := s.auditFirstLocked("job.approved", actor, j.RunID, j.ID, "environment approved", map[string]string{"environment": j.Environment}); aerr != nil {
+	if aerr := s.auditFirstLocked(ctx, "job.approved", actor, j.RunID, j.ID, "environment approved", map[string]string{"environment": j.Environment}); aerr != nil {
 		http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -3989,7 +4026,7 @@ func (s *Server) rerunRun(w http.ResponseWriter, r *http.Request) {
 	if repoID == "" {
 		repoID = policyID
 	}
-	run, err := s.enqueue(SubmitRun{RepoID: repoID, PolicyRepoID: policyID, CheckoutRepoURL: checkoutURLForRun(old),
+	run, err := s.enqueue(r.Context(), SubmitRun{RepoID: repoID, PolicyRepoID: policyID, CheckoutRepoURL: checkoutURLForRun(old),
 		RepoURL: old.Repo, RepoFullName: old.RepoFullName, Ref: old.Ref, SHA: old.SHA, Event: old.Event, Pipeline: pipelineText,
 		Trusted: rerunTrusted(r, old), Metadata: meta, identityBound: true})
 	if err != nil {
@@ -4048,7 +4085,7 @@ func (s *Server) rerunRunDB(w http.ResponseWriter, r *http.Request, id string) {
 	if repoID == "" {
 		repoID = policyID
 	}
-	run, err := s.enqueue(SubmitRun{RepoID: repoID, PolicyRepoID: policyID, CheckoutRepoURL: checkoutURLForRun(old),
+	run, err := s.enqueue(r.Context(), SubmitRun{RepoID: repoID, PolicyRepoID: policyID, CheckoutRepoURL: checkoutURLForRun(old),
 		RepoURL: old.Repo, RepoFullName: old.RepoFullName, Ref: old.Ref, SHA: old.SHA, Event: old.Event, Pipeline: pipelineText,
 		Trusted: rerunTrusted(r, old), Metadata: meta, identityBound: true})
 	if err != nil {
@@ -4104,7 +4141,7 @@ func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 	// row may therefore exist for an attempt whose persist then failed and
 	// was rolled back — evidence-first is the chosen failure mode.
 	reason := "cancelled by " + actor
-	if aerr := s.auditFirstLocked("run.cancelled", actor, id, "", reason, nil); aerr != nil {
+	if aerr := s.auditFirstLocked(r.Context(), "run.cancelled", actor, id, "", reason, nil); aerr != nil {
 		s.mu.Unlock()
 		http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
 		return
@@ -4150,7 +4187,7 @@ func (s *Server) cancelRunDB(w http.ResponseWriter, r *http.Request, id, actor s
 	// join them), so the row lands before the transition and a failed append
 	// refuses the cancel. A row may exist for a cancel the scheduler then
 	// rejected; that is the documented evidence-first trade-off.
-	if aerr := s.auditFirstLocked("run.cancelled", actor, id, "", reason, nil); aerr != nil {
+	if aerr := s.auditFirstLocked(ctx, "run.cancelled", actor, id, "", reason, nil); aerr != nil {
 		http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -4498,7 +4535,22 @@ func (s *Server) releaseRunnerLocked(runnerID, jobID string, status model.Status
 // the transition. In DB mode the audit goes to the store's audit table, which
 // is a separate transaction from the state update (the store API cannot join
 // the two), so the same documented ordering applies.
-func (s *Server) auditFirstLocked(action, actor, runID, jobID, msg string, meta map[string]string) error {
+//
+// ctx is the caller's REQUEST context for every admin mutation: a canceled
+// request fails the append (and therefore the mutation) before any change is
+// made, so a mutation can never proceed without evidence. The fs audit append
+// is synchronous and takes no context, so cancellation is honored here at the
+// operation boundary: the ctx check below rejects a canceled request before
+// the append, and an in-flight append is allowed to finish (it is a single
+// durable line; failing after it lands would leave evidence for a mutation
+// that did not happen, which the audit-first ordering already permits).
+func (s *Server) auditFirstLocked(ctx context.Context, action, actor, runID, jobID, msg string, meta map[string]string) error {
+	if err := ctx.Err(); err != nil {
+		// Fail closed even for stores that ignore contexts (fs appends, test
+		// doubles): a canceled request must never record an audit row whose
+		// corresponding mutation then gets to proceed.
+		return err
+	}
 	if s.store == nil && s.DB == nil {
 		return nil
 	}
@@ -4508,17 +4560,31 @@ func (s *Server) auditFirstLocked(action, actor, runID, jobID, msg string, meta 
 	}
 	e := model.AuditEvent{ID: id, Action: action, Actor: actor, RunID: runID, JobID: jobID, Message: msg, Metadata: meta, CreatedAt: time.Now().UTC()}
 	if s.DB != nil {
-		return s.DB.AppendAudit(context.Background(), e)
+		return s.DB.AppendAudit(ctx, e)
 	}
 	return s.store.AppendAudit(e)
 }
+
+// auditDetachTimeout bounds one best-effort audit append issued from a call
+// path with no caller context (scheduler transitions, artifact/test events).
+const auditDetachTimeout = 5 * time.Second
 
 // auditLocked is the best-effort audit funnel used by non-admin and
 // non-transitional events: failures are logged, never silently dropped.
 // Admin transitions use auditFirstLocked so a missing audit row blocks the
 // mutation instead of being logged after the fact.
+//
+// These events describe state that has ALREADY been mutated (a completed job,
+// an uploaded artifact, a scheduler requeue), so the row must survive a
+// canceled maintain tick or a disconnected runner: the funnel uses the
+// sanctioned bounded detach rather than the (nonexistent) caller context. nil
+// is deliberate — this helper has no origin to inherit; boundedDetach
+// substitutes a root and imposes the bound.
 func (s *Server) auditLocked(action, actor, runID, jobID, msg string, meta map[string]string) {
-	if err := s.auditFirstLocked(action, actor, runID, jobID, msg, meta); err != nil {
+	//lint:ignore SA1012 sanctioned nil-origin boundedDetach root for the context-free best-effort audit path
+	ctx, cancel := boundedDetach(nil, auditDetachTimeout)
+	defer cancel()
+	if err := s.auditFirstLocked(ctx, action, actor, runID, jobID, msg, meta); err != nil {
 		s.logError("audit: append failed", "action", action, "error", err.Error())
 	}
 }

@@ -139,17 +139,24 @@ func TestNewLocalRegistryFromDirErrors(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	// Unreadable spec file: the walk reports the read error.
-	unreadable := filepath.Join(dir, "locked.yaml")
-	if err := os.WriteFile(unreadable, []byte("name: locked\n"), 0o000); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := NewLocalRegistryFromDir(dir); err == nil {
-		t.Fatalf("unreadable spec must fail the load")
-	}
-	if err := os.Chmod(unreadable, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	// Unreadable spec file: the walk reports the read error. The denial only
+	// exists for a non-root euid, so this assertion is its own subtest and
+	// the malformed-spec assertions below still run as root.
+	t.Run("unreadable spec", func(t *testing.T) {
+		testutil.UnixChmod(t)
+		testutil.RequireNonRoot(t)
+		lockedDir := t.TempDir()
+		unreadable := filepath.Join(lockedDir, "locked.yaml")
+		if err := os.WriteFile(unreadable, []byte("name: locked\n"), 0o000); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := NewLocalRegistryFromDir(lockedDir); err == nil {
+			t.Fatalf("unreadable spec must fail the load")
+		}
+		if err := os.Chmod(unreadable, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	})
 
 	// Malformed spec file.
 	if err := os.WriteFile(filepath.Join(dir, "broken.yaml"), []byte("name: [\n"), 0o600); err != nil {

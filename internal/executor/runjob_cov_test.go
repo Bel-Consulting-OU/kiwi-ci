@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -118,6 +119,11 @@ func TestRunJobUnknownRuntimeAndNetworkNone(t *testing.T) {
 }
 
 func TestRunJobTartFullPath(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		// The tart backend is refused on every other platform before a VM
+		// can be started, so the end-to-end path is darwin-only.
+		t.Skip("tart backend is darwin-only")
+	}
 	installFakeBins(t)
 	ws := canonicalTempDir(t)
 	t.Setenv("FAKE_WS", ws)

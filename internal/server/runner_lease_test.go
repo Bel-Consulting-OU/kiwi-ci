@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -56,7 +57,7 @@ func runnerLeaseTableServer(t *testing.T) (*Server, http.Handler, Task, *x509.Ce
 	if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register", reg, "runner-tok", certA); w.Code != http.StatusOK {
 		t.Fatalf("register runner-a: %d %s", w.Code, w.Body.String())
 	}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: smokePipeline, Trusted: true,

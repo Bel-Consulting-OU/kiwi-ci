@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"testing"
@@ -40,7 +41,7 @@ func grantDeployments(s *Server) {
 // job.
 func leaseDeploymentJob(t *testing.T, s *Server, c *testClient) (runID, jobID, runnerID, token string, generation int64) {
 	t.Helper()
-	run, err := s.enqueue(SubmitRun{RepoURL: "https://github.com/kiwi/repo.git", Ref: "main", Pipeline: deploymentPipeline, Trusted: true})
+	run, err := s.enqueue(context.Background(), SubmitRun{RepoURL: "https://github.com/kiwi/repo.git", Ref: "main", Pipeline: deploymentPipeline, Trusted: true})
 	if err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
@@ -167,7 +168,7 @@ func TestEnvironmentConcurrencyScopedToRepo(t *testing.T) {
 	grantDeployments(s)
 	c := newTestClient(t, s.Handler(), "secret")
 	for _, repo := range []string{"https://github.com/acme/one.git", "https://github.com/acme/two.git"} {
-		if _, err := s.enqueue(SubmitRun{RepoURL: repo, Ref: "main", Pipeline: sharedEnvPipeline, Trusted: true}); err != nil {
+		if _, err := s.enqueue(context.Background(), SubmitRun{RepoURL: repo, Ref: "main", Pipeline: sharedEnvPipeline, Trusted: true}); err != nil {
 			t.Fatalf("enqueue %s: %v", repo, err)
 		}
 	}
@@ -182,7 +183,7 @@ func TestEnvironmentConcurrencyScopedToRepo(t *testing.T) {
 	}
 	// A second job in repo one must wait: same repo+environment is at
 	// capacity.
-	if _, err := s.enqueue(SubmitRun{RepoURL: "https://github.com/acme/one.git", Ref: "main", Pipeline: sharedEnvPipeline, Trusted: true}); err != nil {
+	if _, err := s.enqueue(context.Background(), SubmitRun{RepoURL: "https://github.com/acme/one.git", Ref: "main", Pipeline: sharedEnvPipeline, Trusted: true}); err != nil {
 		t.Fatal(err)
 	}
 	r3 := registerRunner(t, c, "r3", nil)

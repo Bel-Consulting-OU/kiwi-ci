@@ -156,7 +156,7 @@ func TestDownstreamStableIDDBModeCrashRecovery(t *testing.T) {
 	}
 	s.DownstreamAllowlist = map[string][]string{"acme/child": {"o/r"}}
 	s.Policy = &policy.Config{Repositories: map[string]policy.RepoPolicy{"o/r": {CrossRepoTrigger: boolPtr(true)}}}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push",
 		Pipeline: downstreamPipeline, Trusted: true,

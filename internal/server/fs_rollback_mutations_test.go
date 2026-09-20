@@ -36,7 +36,7 @@ func TestHeartbeatPersistFailureRollsBackExpiryAndRefuses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 	}); err != nil {
@@ -120,7 +120,7 @@ func TestCancelPersistFailureRollsBackAndPublishesNothing(t *testing.T) {
 	// Configure GitHub publishing so a real publication intent would be
 	// observable in the outbox.
 	s.GitHubToken = "publish-token"
-	run, err := s.enqueue(SubmitRun{
+	run, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", SHA: "abc", Event: "push", Pipeline: smokePipeline,
 	})
@@ -222,7 +222,7 @@ func TestEnqueuePersistFailureLeavesNoGhostRunOrClaim(t *testing.T) {
 	pre := captureStateForTest(t, s)
 
 	s.persistFailForTest = errors.New("synthetic snapshot write failure")
-	run, err := s.enqueueID(in, "run-fixed-1")
+	run, err := s.enqueueID(context.Background(), in, "run-fixed-1")
 	if err == nil {
 		t.Fatalf("enqueue with a broken snapshot store = nil error, run %+v", run)
 	}
@@ -253,7 +253,7 @@ func TestEnqueuePersistFailureLeavesNoGhostRunOrClaim(t *testing.T) {
 
 	// Heal: the same submission creates exactly one run and its claims.
 	s.persistFailForTest = nil
-	run2, err := s.enqueueID(in, "run-fixed-1")
+	run2, err := s.enqueueID(context.Background(), in, "run-fixed-1")
 	if err != nil {
 		t.Fatalf("healed enqueue: %v", err)
 	}
@@ -281,7 +281,7 @@ func TestEnqueuePersistFailureLeavesNoGhostRunOrClaim(t *testing.T) {
 	replay := in
 	replay.ScheduleClaim = nil
 	replay.DownstreamLaunch = nil
-	run3, err := s.enqueueID(replay, "run-fixed-2")
+	run3, err := s.enqueueID(context.Background(), replay, "run-fixed-2")
 	if err != nil {
 		t.Fatalf("webhook replay: %v", err)
 	}
@@ -305,7 +305,7 @@ func TestEnqueuePersistFailureRevivesSupersededRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	incumbent, err := s.enqueue(SubmitRun{
+	incumbent, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Event: "push", Pipeline: concurrencyPipeline,
 	})
@@ -331,7 +331,7 @@ func TestEnqueuePersistFailureRevivesSupersededRun(t *testing.T) {
 	}
 	pre := captureStateForTest(t, s)
 	s.persistFailForTest = errors.New("synthetic snapshot write failure")
-	if _, err := s.enqueueID(submit, "superseder-1"); err == nil {
+	if _, err := s.enqueueID(context.Background(), submit, "superseder-1"); err == nil {
 		t.Fatal("superseding enqueue with a broken snapshot store returned nil error")
 	}
 	post := captureStateForTest(t, s)
@@ -358,7 +358,7 @@ func TestEnqueuePersistFailureRevivesSupersededRun(t *testing.T) {
 	// Heal: the superseding enqueue lands and terminally cancels the
 	// incumbent exactly as the durable path requires.
 	s.persistFailForTest = nil
-	superseder, err := s.enqueueID(submit, "superseder-1")
+	superseder, err := s.enqueueID(context.Background(), submit, "superseder-1")
 	if err != nil {
 		t.Fatalf("healed superseding enqueue: %v", err)
 	}
@@ -483,7 +483,7 @@ func TestRunnerDisablePersistFailureRollsBack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := s.enqueue(SubmitRun{
+	run, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 	})
@@ -555,7 +555,7 @@ func TestApprovePersistFailureRollsBack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Event: "push", Pipeline: approvalPipeline,
 	}); err != nil {
@@ -627,7 +627,7 @@ func TestMaintainLeaseRecoveryPersistFailureRollsBack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := s.enqueue(SubmitRun{
+	run, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 	})
@@ -716,13 +716,13 @@ func TestFSAdminAuditFailureBlocksMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	runnerID := registerRollbackRunner(t, s, 1)
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Event: "push", Pipeline: smokePipeline,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.enqueue(SubmitRun{
+	if _, err := s.enqueue(context.Background(), SubmitRun{
 		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
 		Ref: "refs/heads/main", Event: "push", Pipeline: approvalPipeline,
 	}); err != nil {
