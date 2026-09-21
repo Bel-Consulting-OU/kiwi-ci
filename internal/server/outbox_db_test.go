@@ -416,7 +416,9 @@ func TestOutboxReplayDBMirrorsOnlyDueRows(t *testing.T) {
 	}
 
 	// prune uses the same due-only set: a local copy of a row whose retry is
-	// deferred (or that was dead-lettered) is dropped, local-only items stay.
+	// deferred (or that was dead-lettered) is dropped, and so is a resident
+	// item with no durable row — Enqueue is durable-first, so no live path
+	// can create one.
 	f.mu.Lock()
 	f.outboxMeta["delayed"] = fakeOutboxMeta{attempts: 2, lastError: "boom", nextAt: time.Now().UTC().Add(time.Hour)}
 	f.mu.Unlock()
@@ -424,19 +426,15 @@ func TestOutboxReplayDBMirrorsOnlyDueRows(t *testing.T) {
 	s.outbox.items = append(s.outbox.items,
 		forge.OutboxItem{ID: "delayed", Kind: forge.OutboxKindGitHubCheck},
 		forge.OutboxItem{ID: "delayed-2", Kind: forge.OutboxKindGitHubCheck},
-		forge.OutboxItem{ID: "local-only", Kind: "local_kind"})
-	s.outbox.localOnly["local-only"] = true
+		forge.OutboxItem{ID: "no-durable-row", Kind: "local_kind"})
 	s.outbox.mu.Unlock()
 	f.mu.Lock()
 	f.outboxMeta["delayed-2"] = fakeOutboxMeta{attempts: maxOutboxAttempts, lastError: "retired", deadAt: time.Now().UTC()}
 	f.mu.Unlock()
 	s.outbox.pruneDB(ctx)
 	ids = outboxPendingIDSet(s.outbox)
-	if ids["delayed"] || ids["delayed-2"] {
-		t.Fatalf("prune kept non-due/dead local copies resident: %v", ids)
-	}
-	if !ids["local-only"] {
-		t.Fatalf("prune dropped a local-only item: %v", ids)
+	if ids["delayed"] || ids["delayed-2"] || ids["no-durable-row"] {
+		t.Fatalf("prune kept non-due/dead/unbacked local copies resident: %v", ids)
 	}
 }
 

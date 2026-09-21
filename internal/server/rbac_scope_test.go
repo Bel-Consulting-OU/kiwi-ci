@@ -11,7 +11,10 @@ import (
 )
 
 // scopedStoreServer builds a server with an admin token and two store
-// principals: an admin and a repo-scoped reader.
+// principals: an admin and a repo-only reader. The readers hold NO global
+// read role on purpose — their repository map is the only read capability,
+// which must still open the collections (requireReadAny) while every run of
+// another repository stays excluded.
 func scopedStoreServer(t *testing.T) *Server {
 	t.Helper()
 	s, err := NewPersistent("runner-tok", "admin-tok", t.TempDir())
@@ -21,14 +24,12 @@ func scopedStoreServer(t *testing.T) *Server {
 	for raw, p := range map[string]auth.Principal{
 		"reader": {
 			Subject: "repo-reader",
-			Roles:   []auth.Role{auth.RoleRead},
 			Repositories: map[string]auth.RepositoryPermission{
 				"o/repo-a": {Read: true},
 			},
 		},
 		"artifact-reader": {
 			Subject: "artifact-reader",
-			Roles:   []auth.Role{auth.RoleRead, auth.RoleArtifactRead},
 			Repositories: map[string]auth.RepositoryPermission{
 				"o/repo-a": {Read: true, ArtifactRead: true},
 			},
@@ -112,8 +113,8 @@ func TestScopedRunReadDeniesForeignRepo(t *testing.T) {
 			t.Fatalf("reader on %s: want 403 got %d: %s", path, w.Code, w.Body.String())
 		}
 	}
-	// A read role without artifact_read cannot list artifacts even on the
-	// allowed repo.
+	// A repository read grant without artifact_read cannot list artifacts
+	// even on the allowed repo (the repo entry is authoritative).
 	if w := doJSON(t, s, http.MethodGet, "/api/v1/runs/run-a/artifacts", "reader", ""); w.Code != http.StatusForbidden {
 		t.Fatalf("reader without artifact_read: want 403 got %d", w.Code)
 	}

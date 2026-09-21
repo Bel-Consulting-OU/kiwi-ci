@@ -83,6 +83,41 @@ func Authorize(p Principal, action Action, repo string, trusted bool) bool {
 	return false
 }
 
+// CanReadRepo reports whether the principal may read repository repo. It is
+// THE repository-visibility decision shared by the per-run read routes and
+// the scoped collection projections (run lists and serving runners), so
+// NormalizeRepoKey, default-port/host-case canonicalization, bare aliases and
+// the ambiguity fail-closed rule resolve identically everywhere. repo accepts
+// a canonical repository ID ("forge-host/owner/name") or a bare full name;
+// the call is equivalent to Authorize(p, ActionRead, repo, false) and shares
+// the full repository-entry semantics (an entry present for the repository is
+// authoritative; global roles cover the repositories the map does not
+// mention).
+func CanReadRepo(p Principal, repo string) bool {
+	return Authorize(p, ActionRead, repo, false)
+}
+
+// CanReadAnyRepo reports whether the principal may read at least one
+// repository: the admin role, the global read role, or any repository entry
+// with Read enabled. Repository-spanning collection endpoints use it as their
+// coarse capability gate BEFORE resolving each candidate individually through
+// CanReadRepo. It is deliberately NOT a per-repository decision: an entry
+// whose equivalent duplicate key conflicts still counts here, because the
+// per-repository resolution fails closed later; a principal with no read
+// capability at all is refused outright instead of receiving an empty
+// collection.
+func CanReadAnyRepo(p Principal) bool {
+	if p.Has(RoleAdmin) || p.Has(RoleRead) {
+		return true
+	}
+	for _, perm := range p.Repositories {
+		if perm.Read {
+			return true
+		}
+	}
+	return false
+}
+
 // repoEntry resolves the repo-specific permission entry for repo. The map
 // may be keyed by the canonical repository ID (host/owner/name) or by the
 // bare full name (owner/name): a canonical lookup falls back to the bare

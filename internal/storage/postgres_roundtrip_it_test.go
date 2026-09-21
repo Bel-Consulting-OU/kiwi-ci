@@ -800,60 +800,60 @@ func TestPostgresIntegrationSidecarsAndDownstreamRuns(t *testing.T) {
 	jobID := pgITNewID(t)
 	childID := pgITNewID(t)
 
-	if err := st.RememberPendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSBOM, memDigest); err != nil {
+	if err := st.RememberPendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM, memDigest); err != nil {
 		t.Fatalf("RememberPendingSidecar: %v", err)
 	}
 	// A re-upload replaces the digest.
-	if err := st.RememberPendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSBOM, memDigest2); err != nil {
+	if err := st.RememberPendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM, memDigest2); err != nil {
 		t.Fatalf("RememberPendingSidecar replace: %v", err)
 	}
-	digest, ok, err := st.PendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSBOM)
+	digest, ok, err := st.PendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM)
 	if err != nil || !ok || digest != memDigest2 {
 		t.Fatalf("PendingSidecar = %q, %v, %v", digest, ok, err)
 	}
-	if _, ok, err := st.PendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSigstore); err != nil || ok {
+	if _, ok, err := st.PendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSigstore); err != nil || ok {
 		t.Fatalf("missing pending sidecar = %v, %v", ok, err)
 	}
-	if err := st.RememberPendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSBOM, "short"); err == nil {
+	if err := st.RememberPendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM, "short"); err == nil {
 		t.Fatal("invalid digest must fail")
 	}
-	if err := st.RememberPendingSidecar(ctx, jobID, "bin", "pbom", memDigest); err == nil {
+	if err := st.RememberPendingSidecar(ctx, jobID, 1, "bin", "pbom", memDigest); err == nil {
 		t.Fatal("invalid kind must fail")
 	}
 	// A stale consumer must not delete a newer digest.
-	if err := st.ConsumePendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSBOM, memDigest); err != nil {
+	if err := st.ConsumePendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM, memDigest); err != nil {
 		t.Fatalf("stale consume: %v", err)
 	}
-	if _, ok, _ := st.PendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSBOM); !ok {
+	if _, ok, _ := st.PendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM); !ok {
 		t.Fatal("stale consume dropped the row")
 	}
-	if err := st.ConsumePendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSBOM, memDigest2); err != nil {
+	if err := st.ConsumePendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM, memDigest2); err != nil {
 		t.Fatalf("ConsumePendingSidecar: %v", err)
 	}
-	if _, ok, _ := st.PendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSBOM); ok {
+	if _, ok, _ := st.PendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM); ok {
 		t.Fatal("consume did not delete the row")
 	}
-	if err := st.ConsumePendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSBOM, memDigest2); err != nil {
+	if err := st.ConsumePendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM, memDigest2); err != nil {
 		t.Fatalf("consume missing: %v", err)
 	}
-	if err := st.ConsumePendingSidecar(ctx, jobID, "bin", "pbom", memDigest); err == nil {
+	if err := st.ConsumePendingSidecar(ctx, jobID, 1, "bin", "pbom", memDigest); err == nil {
 		t.Fatal("invalid kind must fail")
 	}
-	if err := st.DeletePendingSidecars(ctx, "bad"); err == nil {
+	if _, _, err := st.PendingSidecar(ctx, "bad", 1, "bin", ArtifactSidecarKindSBOM); err == nil {
 		t.Fatal("invalid job id must fail")
 	}
 
-	if err := st.RememberPendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSBOM, memDigest); err != nil {
+	if err := st.RememberPendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM, memDigest); err != nil {
 		t.Fatalf("remember: %v", err)
 	}
-	if err := st.DeletePendingSidecars(ctx, jobID); err != nil {
-		t.Fatalf("DeletePendingSidecars: %v", err)
+	if err := st.ConsumePendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM, memDigest); err != nil {
+		t.Fatalf("consume: %v", err)
 	}
 	pruned, err := st.PrunePendingSidecars(ctx, time.Now().UTC().Add(time.Hour))
 	if err != nil || pruned != 0 {
 		t.Fatalf("prune after delete = %d, %v", pruned, err)
 	}
-	if err := st.RememberPendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSBOM, memDigest); err != nil {
+	if err := st.RememberPendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM, memDigest); err != nil {
 		t.Fatalf("remember: %v", err)
 	}
 	pruned, err = st.PrunePendingSidecars(ctx, time.Now().UTC().Add(time.Hour))

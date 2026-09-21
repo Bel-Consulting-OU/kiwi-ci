@@ -66,7 +66,9 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 				s.internalError(w, r, err, "")
 				return
 			}
-			s.mirrorTestReportHistoryDB(repo, rep)
+			// Mark the cached snapshot stale; the next read reloads the
+			// repository's freshly committed durable aggregates.
+			s.mirrorTestReportHistoryDB(repo)
 		} else {
 			if err := s.DB.InsertTestReport(r.Context(), rep); err != nil {
 				s.internalError(w, r, err, "")
@@ -268,10 +270,22 @@ func runMatchesRepoQuery(run model.Run, query string) bool {
 
 // summarizeTestIntelligence computes the flaky-test summary from an explicit
 // report list (both the DB and the in-memory path feed pre-filtered lists).
+// Each test's outcomes are folded in deterministic report order (created_at,
+// then id) into the SAME bounded 16-outcome window the persisted history and
+// the SQL aggregates use, so the report-derived set cannot keep a test that
+// dropped out of its window — the shard, API and aggregate flaky semantics
+// stay aligned.
 func summarizeTestIntelligence(reports []model.TestReport) map[string]any {
+	ordered := append([]model.TestReport(nil), reports...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		if !ordered[i].CreatedAt.Equal(ordered[j].CreatedAt) {
+			return ordered[i].CreatedAt.Before(ordered[j].CreatedAt)
+		}
+		return ordered[i].ID < ordered[j].ID
+	})
 	history := map[string][]bool{}
 	var tests, failures int
-	for _, rep := range reports {
+	for _, rep := range ordered {
 		tests += rep.Tests
 		failures += rep.Failures
 		for _, c := range rep.Cases {
@@ -279,20 +293,16 @@ func summarizeTestIntelligence(reports []model.TestReport) map[string]any {
 			if c.Class != "" {
 				key = c.Class + "." + c.Name
 			}
-			history[key] = append(history[key], c.Passed)
+			window := append(history[key], c.Passed)
+			if len(window) > testintel.OutcomeWindow {
+				window = window[len(window)-testintel.OutcomeWindow:]
+			}
+			history[key] = window
 		}
 	}
 	flaky := []string{}
 	for name, results := range history {
-		var pass, fail bool
-		for _, ok := range results {
-			if ok {
-				pass = true
-			} else {
-				fail = true
-			}
-		}
-		if pass && fail {
+		if testintel.FlakeProbability(results) > 0 {
 			flaky = append(flaky, name)
 		}
 	}

@@ -273,6 +273,7 @@ func buildBlobStore(cfg config.BlobConfig, dataDir string) blob.Store {
 			Bucket:          cfg.S3Bucket,
 			AccessKeyID:     cfg.S3AccessKey,
 			SecretAccessKey: cfg.S3SecretKey,
+			PathStyle:       cfg.S3PathStyle,
 		}
 	default:
 		root := cfg.Path

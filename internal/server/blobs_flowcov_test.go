@@ -65,6 +65,7 @@ type fcStore struct {
 	reopenRunErr            error
 	updateRunStatusErr      error
 	expireReservationsErr   error
+	parentRunIDsErr         error
 	listQueuedErr           error
 	listJobsByEnvErr        error
 	setQueueReasonsErr      error
@@ -278,6 +279,13 @@ func (f *fcStore) ReopenRunForChildren(ctx context.Context, runID string) error 
 	return f.dbFakeStore.ReopenRunForChildren(ctx, runID)
 }
 
+func (f *fcStore) ParentRunIDsForChild(ctx context.Context, childRunID string) ([]string, error) {
+	if f.parentRunIDsErr != nil {
+		return nil, f.parentRunIDsErr
+	}
+	return f.dbFakeStore.ParentRunIDsForChild(ctx, childRunID)
+}
+
 func (f *fcStore) UpdateRunStatus(ctx context.Context, id string, status model.Status, startedAt, finishedAt *time.Time) error {
 	if f.updateRunStatusErr != nil {
 		return f.updateRunStatusErr
@@ -318,11 +326,11 @@ func (f *fcStore) SetQueueReasons(ctx context.Context, reasons map[string]string
 	return f.dbFakeStore.SetQueueReasons(ctx, reasons)
 }
 
-func (f *fcStore) PendingSidecar(ctx context.Context, jobID, artifactName, kind string) (string, bool, error) {
+func (f *fcStore) PendingSidecar(ctx context.Context, jobID string, generation int64, artifactName, kind string) (string, bool, error) {
 	if f.pendingSidecarReadErr != nil {
 		return "", false, f.pendingSidecarReadErr
 	}
-	return f.dbFakeStore.PendingSidecar(ctx, jobID, artifactName, kind)
+	return f.dbFakeStore.PendingSidecar(ctx, jobID, generation, artifactName, kind)
 }
 
 func (f *fcStore) GetGeneratedFragment(ctx context.Context, parentJobID string, generation int64, fragmentID string) (storage.GeneratedFragmentReceipt, bool, error) {
@@ -380,18 +388,11 @@ func (f *fcStore) GetRun(ctx context.Context, id string) (model.Run, error) {
 	return f.dbFakeStore.GetRun(ctx, id)
 }
 
-func (f *fcStore) ConsumePendingSidecar(ctx context.Context, jobID, artifactName, kind, digest string) error {
+func (f *fcStore) ConsumePendingSidecar(ctx context.Context, jobID string, generation int64, artifactName, kind, digest string) error {
 	if f.consumeSidecarErr != nil {
 		return f.consumeSidecarErr
 	}
-	return f.dbFakeStore.ConsumePendingSidecar(ctx, jobID, artifactName, kind, digest)
-}
-
-func (f *fcStore) DeletePendingSidecars(ctx context.Context, jobID string) error {
-	if f.consumeSidecarErr != nil {
-		return f.consumeSidecarErr
-	}
-	return f.dbFakeStore.DeletePendingSidecars(ctx, jobID)
+	return f.dbFakeStore.ConsumePendingSidecar(ctx, jobID, generation, artifactName, kind, digest)
 }
 
 func (f *fcStore) GetCacheManifest(ctx context.Context, repo, trustDomain, logicalKey string) (storage.CacheManifestRecord, bool, error) {
@@ -782,11 +783,11 @@ func fcScopedAuthServer(t *testing.T, s *Server) {
 	}
 }
 
-// fcOutsiderPrincipal may read repo-b only.
+// fcOutsiderPrincipal may read repo-b only (no global read role: the repo
+// grant is its only read capability and must not leak to other repositories).
 func fcOutsiderPrincipal() auth.Principal {
 	return auth.Principal{
 		Subject: "outsider",
-		Roles:   []auth.Role{auth.RoleRead},
 		Repositories: map[string]auth.RepositoryPermission{
 			"github.com/o/repo-b": {Read: true},
 		},

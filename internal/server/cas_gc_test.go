@@ -410,7 +410,7 @@ func TestCollectCASReferencesGathersEverySource(t *testing.T) {
 	f.mu.Lock()
 	f.artifacts = append(f.artifacts, model.ArtifactRecord{ID: "db-a1", SHA256: dbArtifact})
 	f.cacheMans["k1"] = storage.CacheManifestRecord{Repo: "r", TrustDomain: "t", LogicalKey: "k", BlobSHA256: cacheManifest}
-	f.pendingSidecars[fakePendingKey("job", "art", storage.ArtifactSidecarKindSBOM)] = fakePendingSidecar{digest: dbPending}
+	f.pendingSidecars[fakePendingKey("job", 1, "art", storage.ArtifactSidecarKindSBOM)] = fakePendingSidecar{digest: dbPending}
 	f.mu.Unlock()
 
 	refs, err := s.collectCASReferences(context.Background())

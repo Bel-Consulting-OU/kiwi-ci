@@ -38,7 +38,7 @@ func TestLeaderFenceMemStoreFailsClosed(t *testing.T) {
 		QueueDeadline: &deadline, CreatedAt: now,
 	}
 	m.outbox = append(m.outbox, OutboxItem{ID: "o1", Kind: "test"})
-	m.pendingSidecars[pendingSidecarKey(sidecarJob, "bin", ArtifactSidecarKindSBOM)] = pendingSidecar{
+	m.pendingSidecars[pendingSidecarKey(sidecarJob, 3, "bin", ArtifactSidecarKindSBOM)] = pendingSidecar{
 		digest: strings.Repeat("a", 64), createdAt: now.Add(-2 * time.Hour),
 	}
 	m.downstream[sidecarJob+"\x00link"] = DownstreamLink{

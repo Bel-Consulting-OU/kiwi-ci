@@ -1,9 +1,12 @@
 package testintel
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"math"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -15,11 +18,17 @@ const (
 	// outcomeWindow is how many most-recent outcomes each TestStat keeps.
 	// Flake probability and the Flaky list are derived from this window.
 	outcomeWindow = 16
+	// historyKeyV2Prefix marks the structured, unambiguous history key
+	// encoding: "v2:" + base64.RawURLEncoding(json([4]string{repo, suite,
+	// class, name})). Every part is length-delimited by the JSON array, so a
+	// part containing "|" (or any other byte) round-trips exactly. Empty and
+	// whitespace-only parts are values like any other.
+	historyKeyV2Prefix = "v2:"
 )
 
-// History accumulates per-test statistics keyed by repo|suite|class|name.
-// It is safe for concurrent use and can be serialized for server-side
-// persistence.
+// History accumulates per-test statistics keyed by the canonical, versioned
+// history key (see encodeHistoryKey). It is safe for concurrent use and can
+// be serialized for server-side persistence.
 type History struct {
 	mu    sync.Mutex
 	stats map[string]*TestStat
@@ -40,8 +49,103 @@ func NewHistory() *History {
 	return &History{stats: map[string]*TestStat{}}
 }
 
+// encodeHistoryKey renders the canonical history key of one test identity:
+// "v2:" followed by the raw-URL base64 of the JSON array [repo, suite, class,
+// name]. The structured form is unambiguous for EVERY part (a name, class,
+// suite or repository containing "|", unicode, empty or whitespace-only
+// strings all round-trip), unlike the legacy repo|suite|class|name join. It
+// is the ONLY encoding new writes use; decodeHistoryKey still reads legacy
+// keys (additive read-compat).
+func encodeHistoryKey(repo, suite, class, name string) string {
+	// json.Marshal cannot fail for [4]string.
+	raw, _ := json.Marshal([4]string{repo, suite, class, name})
+	return historyKeyV2Prefix + base64.RawURLEncoding.EncodeToString(raw)
+}
+
+// EncodeHistoryKey is encodeHistoryKey for callers outside this package (the
+// SQL aggregate encoder), so the incremental store and the in-memory history
+// serialize to the SAME key shape.
+func EncodeHistoryKey(repo, suite, class, name string) string {
+	return encodeHistoryKey(repo, suite, class, name)
+}
+
+// historyKeyParts is one decoded history key.
+type historyKeyParts struct {
+	repo  string
+	suite string
+	class string
+	name  string
+}
+
+// decodeHistoryKey parses one history key. ok reports whether the key is a
+// fully attributed identity: either a decodable v2 key or a legacy key with
+// exactly four "|"-separated fields. Ambiguous legacy keys (a pre-v2 part
+// containing "|", hence a different field count) return ok=false with the
+// leading repository and suite fields still filled in — exactly the leniency
+// the old repoPart/suitePart helpers had — while displayName renders them as
+// their raw key (also the old behavior). A corrupt v2 key can never be
+// attributed: it falls through to the legacy split, where it can only ever
+// match its own literal text as a repository.
+func decodeHistoryKey(key string) (historyKeyParts, bool) {
+	if rest, found := strings.CutPrefix(key, historyKeyV2Prefix); found {
+		if raw, err := base64.RawURLEncoding.DecodeString(rest); err == nil {
+			var fields [4]string
+			if err := json.Unmarshal(raw, &fields); err == nil {
+				return historyKeyParts{repo: fields[0], suite: fields[1], class: fields[2], name: fields[3]}, true
+			}
+		}
+	}
+	fields := strings.Split(key, "|")
+	if len(fields) == 4 {
+		return historyKeyParts{repo: fields[0], suite: fields[1], class: fields[2], name: fields[3]}, true
+	}
+	// Ambiguous legacy key. Its leading repository and suite fields still
+	// resolve exactly as the old repoPart/suitePart helpers resolved them;
+	// class and name are not attributable.
+	parts := historyKeyParts{}
+	if len(fields) > 0 {
+		parts.repo = fields[0]
+	}
+	if len(fields) >= 3 {
+		// The legacy suite field lived between the first and second
+		// separator: a shorter key has no suite field at all.
+		parts.suite = fields[1]
+	}
+	return parts, false
+}
+
+// testKey is the canonical history key of one test identity.
 func testKey(repo, suite, class, name string) string {
-	return repo + "|" + suite + "|" + class + "|" + name
+	return encodeHistoryKey(repo, suite, class, name)
+}
+
+// Clone returns a deep copy of the history: the stats map and every TestStat
+// are new, including the mutable Outcomes slice and the LastFailure pointer.
+// Concurrent writers (Record) of the receiver can never change the returned
+// snapshot and mutating the clone can never change the receiver, which is the
+// copy-on-write primitive the server relies on to publish a new generation
+// without touching snapshots already handed to readers. A nil receiver clones
+// to an empty history so callers need no nil guard.
+func (h *History) Clone() *History {
+	if h == nil {
+		return NewHistory()
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := &History{stats: make(map[string]*TestStat, len(h.stats))}
+	for key, st := range h.stats {
+		if st == nil {
+			continue
+		}
+		cp := *st
+		if st.LastFailure != nil {
+			when := *st.LastFailure
+			cp.LastFailure = &when
+		}
+		cp.Outcomes = append([]bool(nil), st.Outcomes...)
+		out.stats[key] = &cp
+	}
+	return out
 }
 
 // Record folds one test outcome into the history: run/pass/fail counters,
@@ -98,10 +202,24 @@ func flakeProbability(outcomes []bool) float64 {
 	return float64(minority) / float64(len(outcomes))
 }
 
-// Flaky returns the sorted names of tests in repo that have both passed and
-// failed inside their outcome window (class-qualified when a class exists
-// in at least one observation... names are rendered as "name" or
-// "class.name" exactly as recorded via a stable rendering helper).
+// OutcomeWindow is how many most-recent outcomes each TestStat keeps. It is
+// exported so callers that fold their own outcome history (the report-derived
+// test-intelligence summary) apply the SAME window as History.Record.
+const OutcomeWindow = outcomeWindow
+
+// FlakeProbability is the window-flakiness predicate of flakeProbability,
+// exported for callers that derive flakiness from their own bounded outcome
+// windows. A positive result means the window holds both outcomes; a
+// single-outcome or empty window is never flaky.
+func FlakeProbability(outcomes []bool) float64 {
+	return flakeProbability(outcomes)
+}
+
+// Flaky returns the sorted names of tests in repo that were flaky inside
+// their 16-outcome window: the window-derived flake probability is positive
+// (both outcomes present in the window), NOT the lifetime counters a test
+// that failed long ago and then passed its whole window would otherwise keep.
+// Names are rendered as "name" or "class.name" exactly as recorded.
 func (h *History) Flaky(repo string) []string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -110,7 +228,7 @@ func (h *History) Flaky(repo string) []string {
 		if !repoMatches(key, repo) {
 			continue
 		}
-		if st.Passes > 0 && st.Fails > 0 {
+		if st.FlakeProb > 0 {
 			out = append(out, displayName(key))
 		}
 	}
@@ -135,10 +253,31 @@ func (h *History) Manifest(repo, suite string) []string {
 	return out
 }
 
+// defaultShardDuration is the nominal duration LPT schedules for a test
+// without a usable EWMA measurement: TestStat.Runs == 0 (a stat loaded from a
+// journal that predates duration recording, or one that has never run) or a
+// non-finite EWMA (a corrupt journal). A nominal unit rather than 0 keeps
+// unmeasured tests spread across shards; treating them all as zero-load would
+// pile every one of them into the first shard.
+const defaultShardDuration = 1.0
+
 // Shard deterministically splits the known tests of repo/suite into the
-// given number of shards, largest-duration-first round-robin so shards end
-// up duration-balanced. Ties break on name for reproducibility. A
-// non-positive shard count yields one shard with every test.
+// given number of shards with longest-processing-time (LPT) list scheduling:
+// tests are sorted by descending scheduling duration (ties by display name),
+// then each test is assigned to the shard with the smallest accumulated
+// duration, ties going to the lowest shard index. LPT is what actually
+// balances shard duration; the previous largest-first round-robin is provably
+// imbalanced for skewed workloads (one 10s test plus five 1s tests across two
+// shards: round-robin yields 12s vs 3s, LPT yields 10s vs 5s, which is
+// optimal).
+//
+// The scheduling duration is TestStat.EWMA; a test without a usable EWMA
+// schedules with the documented defaultShardDuration. Each shard's list keeps
+// the global scheduling order (descending duration, ties by name), so a shard
+// is a stable, deterministic subsequence of that order. The partition is
+// exact: every known test appears in exactly one shard. Empty shards are
+// materialised as empty (non-nil) slices. A non-positive shard count yields
+// one shard with every test.
 func (h *History) Shard(repo, suite string, shards int) [][]string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -151,7 +290,11 @@ func (h *History) Shard(repo, suite string, shards int) [][]string {
 		if !repoMatches(key, repo) || !suiteMatches(key, suite) {
 			continue
 		}
-		entries = append(entries, entry{name: displayName(key), ewma: st.EWMA})
+		dur := st.EWMA
+		if st.Runs == 0 || math.IsNaN(dur) {
+			dur = defaultShardDuration
+		}
+		entries = append(entries, entry{name: displayName(key), ewma: dur})
 	}
 	sort.Slice(entries, func(i, j int) bool {
 		if entries[i].ewma != entries[j].ewma {
@@ -163,9 +306,16 @@ func (h *History) Shard(repo, suite string, shards int) [][]string {
 		shards = 1
 	}
 	out := make([][]string, shards)
-	for i, e := range entries {
-		shard := i % shards
-		out[shard] = append(out[shard], e.name)
+	load := make([]float64, shards)
+	for _, e := range entries {
+		target := 0
+		for i := 1; i < shards; i++ {
+			if load[i] < load[target] {
+				target = i
+			}
+		}
+		out[target] = append(out[target], e.name)
+		load[target] += e.ewma
 	}
 	for i := range out {
 		if out[i] == nil {
@@ -206,61 +356,26 @@ func LoadHistory(path string) (*History, error) {
 }
 
 func repoMatches(key, repo string) bool {
-	return repoPart(key) == repo
-}
-
-func repoPart(key string) string {
-	for i := 0; i < len(key); i++ {
-		if key[i] == '|' {
-			return key[:i]
-		}
-	}
-	return key
-}
-
-func suitePart(key string) string {
-	first := -1
-	second := -1
-	for i := 0; i < len(key); i++ {
-		if key[i] == '|' {
-			if first < 0 {
-				first = i
-			} else if second < 0 {
-				second = i
-				break
-			}
-		}
-	}
-	if second < 0 {
-		return ""
-	}
-	return key[first+1 : second]
+	parts, _ := decodeHistoryKey(key)
+	return parts.repo == repo
 }
 
 func suiteMatches(key, suite string) bool {
-	return suitePart(key) == suite
+	parts, _ := decodeHistoryKey(key)
+	return parts.suite == suite
 }
 
 // displayName renders a history key as "name" (empty class) or "class.name".
+// A key that is not fully attributed (an ambiguous legacy key, or one that
+// never was a history key) renders as itself, exactly as the pre-v2 helper
+// did.
 func displayName(key string) string {
-	parts := splitKey(key)
-	if len(parts) != 4 {
+	parts, ok := decodeHistoryKey(key)
+	if !ok {
 		return key
 	}
-	if parts[2] == "" {
-		return parts[3]
+	if parts.class == "" {
+		return parts.name
 	}
-	return parts[2] + "." + parts[3]
-}
-
-func splitKey(key string) []string {
-	out := []string{}
-	start := 0
-	for i := 0; i <= len(key); i++ {
-		if i == len(key) || key[i] == '|' {
-			out = append(out, key[start:i])
-			start = i + 1
-		}
-	}
-	return out
+	return parts.class + "." + parts.name
 }

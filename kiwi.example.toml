@@ -46,6 +46,18 @@
 # s3_access_key = ""
 # s3_secret_key = ""
 
+# Path-style addressing (bucket in the URL path) instead of the default
+# virtual-hosted style (bucket as the first host label). Required for IP
+# endpoints, endpoints with a path prefix and buckets that are not
+# DNS-compatible host labels.
+# s3_path_style = false
+
+# Explicit override allowing an http:// endpoint in production mode. S3
+# requests carry SigV4 credentials, so production refuses plaintext
+# transport unless this acknowledges a trusted network. Dev mode allows
+# http:// for local gateways (MinIO and friends) without the override.
+# s3_allow_plaintext = false
+
 [github]
 # GitHub App ID and private key for the API client.
 # app_id = 0

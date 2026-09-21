@@ -142,16 +142,15 @@ func TestPostgresClosedPoolErrorPaths(t *testing.T) {
 		{"GetCacheManifest", func() error { _, _, err := st.GetCacheManifest(ctx, "r", "t", "l"); return err }},
 		{"SetArtifactSidecars", func() error { return st.SetArtifactSidecars(ctx, memArtifactID, "p", "", "", "") }},
 		{"RememberPendingSidecar", func() error {
-			return st.RememberPendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSBOM, memDigest)
+			return st.RememberPendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM, memDigest)
 		}},
 		{"PendingSidecar", func() error {
-			_, _, err := st.PendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSBOM)
+			_, _, err := st.PendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM)
 			return err
 		}},
 		{"ConsumePendingSidecar", func() error {
-			return st.ConsumePendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSBOM, memDigest)
+			return st.ConsumePendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM, memDigest)
 		}},
-		{"DeletePendingSidecars", func() error { return st.DeletePendingSidecars(ctx, jobID) }},
 		{"PrunePendingSidecars", func() error { _, err := st.PrunePendingSidecars(ctx, now); return err }},
 		{"AppendDownstreamRun", func() error { return st.AppendDownstreamRun(ctx, runID, runID) }},
 		{"ReopenRunForChildren", func() error { return st.ReopenRunForChildren(ctx, runID) }},

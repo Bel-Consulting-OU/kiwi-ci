@@ -171,7 +171,7 @@ func TestSqueezeSBOMUploadBodyAndStorageEdges(t *testing.T) {
 	t.Run("attachment failure", func(t *testing.T) {
 		s, f, _, hdrs := cacheFixture(t)
 		scPutContract(t, s, f, "job-a", storage.ArtifactContract{Name: "bin", Paths: []string{"out/"}, SBOM: "spdx-json"})
-		if err := f.InsertArtifact(context.Background(), model.ArtifactRecord{ID: "art-1", RunID: "run-c", JobID: "job-a", Name: "bin", SHA256: strings.Repeat("a", 64)}); err != nil {
+		if err := f.InsertArtifact(context.Background(), model.ArtifactRecord{ID: "art-1", RunID: "run-c", JobID: "job-a", Name: "bin", SHA256: strings.Repeat("a", 64), LeaseGeneration: 5}); err != nil {
 			t.Fatal(err)
 		}
 		f.sidecarAttachErr = errStaticKindMissing
@@ -319,13 +319,13 @@ func TestSqueezeSidecarStoreAbsent(t *testing.T) {
 	if err := s.rememberPendingSidecar(context.Background(), model.Job{ID: "j"}, "bin", storage.ArtifactSidecarKindSBOM, "d"); err == nil {
 		t.Fatal("remember without sidecar store = nil error")
 	}
-	if err := s.consumeArtifactPendingSidecars(context.Background(), "j", model.ArtifactRecord{}); err != nil {
+	if err := s.consumeArtifactPendingSidecars(context.Background(), model.ArtifactRecord{}); err != nil {
 		t.Fatalf("consume without sidecar store = %v", err)
 	}
-	if err := f.InsertArtifact(context.Background(), model.ArtifactRecord{ID: "art-1", RunID: "run-c", JobID: "job-a", Name: "bin"}); err != nil {
+	if err := f.InsertArtifact(context.Background(), model.ArtifactRecord{ID: "art-1", RunID: "run-c", JobID: "job-a", Name: "bin", LeaseGeneration: 5}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.attachSidecarToArtifact(context.Background(), model.Job{ID: "job-a", RunID: "run-c"}, "bin", storage.ArtifactSidecarKindSBOM, "p", "d"); err == nil {
+	if err := s.attachSidecarToArtifact(context.Background(), model.Job{ID: "job-a", RunID: "run-c", LeaseGeneration: 5}, "bin", storage.ArtifactSidecarKindSBOM, "p", "d"); err == nil {
 		t.Fatal("attach without sidecar store = nil error")
 	}
 	rec := model.ArtifactRecord{}
@@ -338,13 +338,13 @@ func TestSqueezeSidecarStoreAbsent(t *testing.T) {
 func TestSqueezeConsumePendingSidecarErrors(t *testing.T) {
 	s, f, _, _ := cacheFixture(t)
 	f.pendingErr = errStaticKindMissing
-	rec := model.ArtifactRecord{Name: "bin", SBOMSHA256: "d1", SigstoreSHA256: "d2"}
-	if err := s.consumeArtifactPendingSidecars(context.Background(), "job-a", rec); err == nil {
+	rec := model.ArtifactRecord{JobID: "job-a", Name: "bin", LeaseGeneration: 5, SBOMSHA256: "d1", SigstoreSHA256: "d2"}
+	if err := s.consumeArtifactPendingSidecars(context.Background(), rec); err == nil {
 		t.Fatal("sbom consume failure = nil error")
 	}
 	// A record with only a sigstore digest reaches the second consume call.
-	rec = model.ArtifactRecord{Name: "bin", SigstoreSHA256: "d2"}
-	if err := s.consumeArtifactPendingSidecars(context.Background(), "job-a", rec); err == nil {
+	rec = model.ArtifactRecord{JobID: "job-a", Name: "bin", LeaseGeneration: 5, SigstoreSHA256: "d2"}
+	if err := s.consumeArtifactPendingSidecars(context.Background(), rec); err == nil {
 		t.Fatal("sigstore consume failure = nil error")
 	}
 }
@@ -354,7 +354,7 @@ func TestSqueezeConsumePendingSidecarErrors(t *testing.T) {
 func TestSqueezeAttachSidecarLookupError(t *testing.T) {
 	s, f, _, _ := cacheFixture(t)
 	s.DB = &fcStore{dbFakeStore: f, listArtifactsErr: errors.New("artifact table down")}
-	if err := s.attachSidecarToArtifact(context.Background(), model.Job{ID: "job-a"}, "bin", storage.ArtifactSidecarKindSBOM, "p", "d"); err == nil {
+	if err := s.attachSidecarToArtifact(context.Background(), model.Job{ID: "job-a", LeaseGeneration: 5}, "bin", storage.ArtifactSidecarKindSBOM, "p", "d"); err == nil {
 		t.Fatal("lookup failure = nil error")
 	}
 }
@@ -363,13 +363,13 @@ func TestSqueezeAttachSidecarLookupError(t *testing.T) {
 // fs-mode branches.
 func TestSqueezeAttachSidecarKinds(t *testing.T) {
 	s, f, _, _ := cacheFixture(t)
-	if err := f.InsertArtifact(context.Background(), model.ArtifactRecord{ID: "art-1", RunID: "run-c", JobID: "job-a", Name: "bin", SHA256: strings.Repeat("a", 64)}); err != nil {
+	if err := f.InsertArtifact(context.Background(), model.ArtifactRecord{ID: "art-1", RunID: "run-c", JobID: "job-a", Name: "bin", SHA256: strings.Repeat("a", 64), LeaseGeneration: 5}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.attachSidecarToArtifact(context.Background(), model.Job{ID: "job-a", RunID: "run-c"}, "bin", storage.ArtifactSidecarKindSBOM, "cas:sum", "sum"); err != nil {
+	if err := s.attachSidecarToArtifact(context.Background(), model.Job{ID: "job-a", RunID: "run-c", LeaseGeneration: 5}, "bin", storage.ArtifactSidecarKindSBOM, "cas:sum", "sum"); err != nil {
 		t.Fatalf("db sbom attach: %v", err)
 	}
-	if err := s.attachSidecarToArtifact(context.Background(), model.Job{ID: "job-a", RunID: "run-c"}, "bin", storage.ArtifactSidecarKindSigstore, "cas:sig", "sig"); err != nil {
+	if err := s.attachSidecarToArtifact(context.Background(), model.Job{ID: "job-a", RunID: "run-c", LeaseGeneration: 5}, "bin", storage.ArtifactSidecarKindSigstore, "cas:sig", "sig"); err != nil {
 		t.Fatalf("db sigstore attach: %v", err)
 	}
 	rec, err := f.GetArtifact(context.Background(), "art-1")
@@ -386,10 +386,10 @@ func TestSqueezeAttachSidecarKinds(t *testing.T) {
 	if w := doJSONHeaders(t, fs, http.MethodPut, "/api/v1/jobs/job-a/artifacts/bin", "runner-tok", "payload", hdrs); w.Code != http.StatusCreated {
 		t.Fatalf("artifact upload = %d: %s", w.Code, w.Body.String())
 	}
-	if err := fs.attachSidecarToArtifact(context.Background(), model.Job{ID: "job-a", RunID: "run-c"}, "bin", storage.ArtifactSidecarKindSBOM, "p", "sum"); err != nil {
+	if err := fs.attachSidecarToArtifact(context.Background(), model.Job{ID: "job-a", RunID: "run-c", LeaseGeneration: 5}, "bin", storage.ArtifactSidecarKindSBOM, "p", "sum"); err != nil {
 		t.Fatalf("fs sbom attach: %v", err)
 	}
-	if err := fs.attachSidecarToArtifact(context.Background(), model.Job{ID: "job-a", RunID: "run-c"}, "bin", storage.ArtifactSidecarKindSigstore, "p", "sig"); err != nil {
+	if err := fs.attachSidecarToArtifact(context.Background(), model.Job{ID: "job-a", RunID: "run-c", LeaseGeneration: 5}, "bin", storage.ArtifactSidecarKindSigstore, "p", "sig"); err != nil {
 		t.Fatalf("fs sigstore attach: %v", err)
 	}
 	fs.mu.Lock()
@@ -433,16 +433,16 @@ func TestSqueezeSidecarBytesEdges(t *testing.T) {
 	t.Run("db pending lookup error", func(t *testing.T) {
 		s, f, _, _ := cacheFixture(t)
 		f.pendingErr = errStaticKindMissing
-		if _, err := s.sidecarBytes(context.Background(), model.Job{ID: "job-a"}, "bin", "sbom", t.TempDir()); err == nil {
+		if _, err := s.sidecarBytes(context.Background(), model.Job{ID: "job-a", LeaseGeneration: 5}, "bin", "sbom", t.TempDir()); err == nil {
 			t.Fatal("pending lookup error = nil")
 		}
 	})
 	t.Run("db cas open error", func(t *testing.T) {
 		s, f, _, _ := cacheFixture(t)
-		if err := f.RememberPendingSidecar(context.Background(), "job-a", "bin", storage.ArtifactSidecarKindSBOM, "missing-digest"); err != nil {
+		if err := f.RememberPendingSidecar(context.Background(), "job-a", 5, "bin", storage.ArtifactSidecarKindSBOM, "missing-digest"); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := s.sidecarBytes(context.Background(), model.Job{ID: "job-a"}, "bin", "sbom", t.TempDir()); err == nil {
+		if _, err := s.sidecarBytes(context.Background(), model.Job{ID: "job-a", LeaseGeneration: 5}, "bin", "sbom", t.TempDir()); err == nil {
 			t.Fatal("missing CAS blob = nil error")
 		}
 	})
@@ -451,12 +451,12 @@ func TestSqueezeSidecarBytesEdges(t *testing.T) {
 		_ = hdrs
 		dir := t.TempDir()
 		s.mu.Lock()
-		s.pendingSidecars[sidecarPendingKey("job-a", "bin", "sbom")] = encodePendingSidecar("missing-digest", time.Now().UTC())
+		s.pendingSidecars[sidecarPendingKey("job-a", 5, "bin", "sbom")] = encodePendingSidecar("missing-digest", time.Now().UTC())
 		s.mu.Unlock()
 		if err := writeFileAtomic(artifactSidecarPath(dir, "bin", "sbom"), []byte(validSPDX), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		b, err := s.sidecarBytes(context.Background(), model.Job{ID: "job-a"}, "bin", "sbom", dir)
+		b, err := s.sidecarBytes(context.Background(), model.Job{ID: "job-a", LeaseGeneration: 5}, "bin", "sbom", dir)
 		if err != nil || string(b) != validSPDX {
 			t.Fatalf("fs fallback = %q, %v", b, err)
 		}
@@ -484,11 +484,11 @@ func TestSqueezeAttachSidecarsToRecordFS(t *testing.T) {
 	}
 	// Pending digests with a CAS resolve to cas: references.
 	s.mu.Lock()
-	s.pendingSidecars[sidecarPendingKey("job-b", "bin", "sbom")] = encodePendingSidecar("sum", time.Now().UTC())
-	s.pendingSidecars[sidecarPendingKey("job-b", "bin", "sigstore")] = encodePendingSidecar("sig", time.Now().UTC())
+	s.pendingSidecars[sidecarPendingKey("job-b", 1, "bin", "sbom")] = encodePendingSidecar("sum", time.Now().UTC())
+	s.pendingSidecars[sidecarPendingKey("job-b", 1, "bin", "sigstore")] = encodePendingSidecar("sig", time.Now().UTC())
 	s.mu.Unlock()
 	rec2 := model.ArtifactRecord{}
-	if err := s.attachSidecarsToRecord(context.Background(), &rec2, model.Job{ID: "job-b"}, "bin", t.TempDir()); err != nil {
+	if err := s.attachSidecarsToRecord(context.Background(), &rec2, model.Job{ID: "job-b", LeaseGeneration: 1}, "bin", t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	if rec2.SBOMPath != "cas:sum" || rec2.SigstorePath != "cas:sig" {
@@ -529,7 +529,7 @@ func TestSqueezeUploadSigstoreRecorded(t *testing.T) {
 	if w.Code != http.StatusCreated {
 		t.Fatalf("sigstore upload = %d: %s", w.Code, w.Body.String())
 	}
-	if _, ok, err := f.PendingSidecar(context.Background(), "job-a", "bin", storage.ArtifactSidecarKindSigstore); err != nil || !ok {
+	if _, ok, err := f.PendingSidecar(context.Background(), "job-a", 5, "bin", storage.ArtifactSidecarKindSigstore); err != nil || !ok {
 		t.Fatalf("pending sigstore not recorded: ok=%v err=%v", ok, err)
 	}
 }
@@ -546,7 +546,7 @@ func TestSqueezeSigstoreUploadRecordedDigestBranch(t *testing.T) {
 		SigstoreIssuer:   "https://token.actions.githubusercontent.com",
 		SigstoreIdentity: "my-identity",
 	})
-	if err := f.InsertArtifact(context.Background(), model.ArtifactRecord{ID: "art-1", RunID: "run-c", JobID: "job-a", Name: "bin", SHA256: digest}); err != nil {
+	if err := f.InsertArtifact(context.Background(), model.ArtifactRecord{ID: "art-1", RunID: "run-c", JobID: "job-a", Name: "bin", SHA256: digest, LeaseGeneration: 5}); err != nil {
 		t.Fatal(err)
 	}
 	w := doJSONHeaders(t, s, http.MethodPut, "/api/v1/jobs/job-a/artifacts/bin.sigstore", "runner-tok", string(bundle), hdrs)
@@ -568,7 +568,7 @@ func TestSqueezeAttachSidecarsToRecordDBErrors(t *testing.T) {
 	s2, f2, _, _ := cacheFixture(t)
 	s2.DB = &fcStore{dbFakeStore: f2, pendingSidecarReadErr: errors.New("pending table down")}
 	rec := model.ArtifactRecord{}
-	if err := s2.attachSidecarsToRecord(context.Background(), &rec, model.Job{ID: "job-a"}, "bin", t.TempDir()); err == nil {
+	if err := s2.attachSidecarsToRecord(context.Background(), &rec, model.Job{ID: "job-a", LeaseGeneration: 5}, "bin", t.TempDir()); err == nil {
 		t.Fatal("db pending lookup error = nil")
 	}
 }
@@ -576,18 +576,21 @@ func TestSqueezeAttachSidecarsToRecordDBErrors(t *testing.T) {
 // TestSqueezeRememberPendingSidecarDB covers the durable remember path.
 func TestSqueezeRememberPendingSidecarDB(t *testing.T) {
 	s, f, _, _ := cacheFixture(t)
-	if err := s.rememberPendingSidecar(context.Background(), model.Job{ID: "job-a"}, "bin", storage.ArtifactSidecarKindSBOM, "digest"); err != nil {
+	if err := s.rememberPendingSidecar(context.Background(), model.Job{ID: "job-a", LeaseGeneration: 5}, "bin", storage.ArtifactSidecarKindSBOM, "digest"); err != nil {
 		t.Fatal(err)
 	}
-	if d, ok, err := f.PendingSidecar(context.Background(), "job-a", "bin", storage.ArtifactSidecarKindSBOM); err != nil || !ok || d != "digest" {
+	if d, ok, err := f.PendingSidecar(context.Background(), "job-a", 5, "bin", storage.ArtifactSidecarKindSBOM); err != nil || !ok || d != "digest" {
 		t.Fatalf("pending = %q ok=%v err=%v", d, ok, err)
 	}
 }
 
 // TestSqueezeSidecarPendingKeyAndFormat covers helpers directly.
 func TestSqueezeSidecarPendingKeyAndFormat(t *testing.T) {
-	if got := sidecarPendingKey("j", "bin", "sbom"); !strings.Contains(got, "j\x00bin\x00sbom") {
+	if got := sidecarPendingKey("j", 3, "bin", "sbom"); !strings.Contains(got, "j\x003\x00bin\x00sbom") {
 		t.Fatalf("pending key = %q", got)
+	}
+	if sidecarPendingKey("j", 3, "bin", "sbom") == sidecarPendingKey("j", 4, "bin", "sbom") {
+		t.Fatal("pending key must include the lease generation")
 	}
 	if got := artifactSidecarPath("/d", "bin", "sbom"); got != filepath.Join("/d", "bin.sbom.json") {
 		t.Fatalf("sidecar path = %q", got)
@@ -600,11 +603,11 @@ func TestSqueezeSidecarPendingKeyAndFormat(t *testing.T) {
 // sigstorePendingErrStore fails only the sigstore pending lookup.
 type sigstorePendingErrStore struct{ *dbFakeStore }
 
-func (s sigstorePendingErrStore) PendingSidecar(ctx context.Context, jobID, artifactName, kind string) (string, bool, error) {
+func (s sigstorePendingErrStore) PendingSidecar(ctx context.Context, jobID string, generation int64, artifactName, kind string) (string, bool, error) {
 	if kind == storage.ArtifactSidecarKindSigstore {
 		return "", false, errors.New("sigstore pending table down")
 	}
-	return s.dbFakeStore.PendingSidecar(ctx, jobID, artifactName, kind)
+	return s.dbFakeStore.PendingSidecar(ctx, jobID, generation, artifactName, kind)
 }
 
 // TestSqueezeCycloneDXFormatField covers the bomFormat refusal.
@@ -639,9 +642,9 @@ func TestSqueezeSidecarBytesFromCAS(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.mu.Lock()
-	s.pendingSidecars[sidecarPendingKey("job-a", "bin", "sbom")] = encodePendingSidecar(obj.SHA256, time.Now().UTC())
+	s.pendingSidecars[sidecarPendingKey("job-a", 5, "bin", "sbom")] = encodePendingSidecar(obj.SHA256, time.Now().UTC())
 	s.mu.Unlock()
-	b, err := s.sidecarBytes(context.Background(), model.Job{ID: "job-a"}, "bin", "sbom", t.TempDir())
+	b, err := s.sidecarBytes(context.Background(), model.Job{ID: "job-a", LeaseGeneration: 5}, "bin", "sbom", t.TempDir())
 	if err != nil || string(b) != validSPDX {
 		t.Fatalf("cas sidecar bytes = %q, %v", b, err)
 	}
@@ -653,7 +656,7 @@ func TestSqueezeAttachSidecarsToRecordSigstoreLookupError(t *testing.T) {
 	s, f, _, _ := cacheFixture(t)
 	s.DB = sigstorePendingErrStore{dbFakeStore: f}
 	rec := model.ArtifactRecord{}
-	if err := s.attachSidecarsToRecord(context.Background(), &rec, model.Job{ID: "job-a"}, "bin", t.TempDir()); err == nil {
+	if err := s.attachSidecarsToRecord(context.Background(), &rec, model.Job{ID: "job-a", LeaseGeneration: 5}, "bin", t.TempDir()); err == nil {
 		t.Fatal("sigstore pending lookup error = nil")
 	}
 }

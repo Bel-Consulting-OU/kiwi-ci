@@ -121,6 +121,17 @@ type dbFakeStore struct {
 	getRunErr        error
 	getJobErr        error
 	listJobsByRunErr error
+	// metricRunStatusErr/metricJobStatusErr/metricQueueReasonErr/
+	// metricRunnerSlotsErr make one DB-mode state aggregate fail, so the
+	// per-family skip behavior of the metrics handler is testable.
+	metricRunStatusErr   error
+	metricJobStatusErr   error
+	metricQueueReasonErr error
+	metricRunnerSlotsErr error
+	// parentRunIDsErr, when non-nil, makes ParentRunIDsForChild fail: the
+	// downstream reverse-index read is a hard dependency, so the parent
+	// refresh must fail closed on it rather than fall back to a run scan.
+	parentRunIDsErr error
 	// countRunningErr, when non-nil, makes CountRunningJobs fail: the drain
 	// count is then UNKNOWN and must never be read as zero/drained.
 	countRunningErr     error
@@ -233,6 +244,7 @@ var _ storage.DownstreamLeaderStore = (*dbFakeStore)(nil)
 var _ storage.UsageStore = (*dbFakeStore)(nil)
 var _ storage.UsageOnceStore = (*dbFakeStore)(nil)
 var _ storage.RunDownstreamStore = (*dbFakeStore)(nil)
+var _ storage.DownstreamParentRunStore = (*dbFakeStore)(nil)
 var _ storage.ArtifactLookupStore = (*dbFakeStore)(nil)
 var _ storage.RunnerJobStore = (*dbFakeStore)(nil)
 var _ storage.RecoveryStore = (*dbFakeStore)(nil)
@@ -254,6 +266,7 @@ var _ storage.ArtifactIdempotentStore = (*dbFakeStore)(nil)
 var _ storage.GeneratedFragmentStore = (*dbFakeStore)(nil)
 var _ storage.CASReferenceStore = (*dbFakeStore)(nil)
 var _ storage.CASGCLeaseStore = (*dbFakeStore)(nil)
+var _ storage.MetricsAggregateStore = (*dbFakeStore)(nil)
 
 // fakeCASGCLease is one held in-memory collector lease.
 type fakeCASGCLease struct {
@@ -409,6 +422,83 @@ func (f *dbFakeStore) ListJobsByRun(ctx context.Context, runID string) ([]model.
 		if j.RunID == runID {
 			out = append(out, j)
 		}
+	}
+	return out, nil
+}
+
+// MetricsAggregateStore: the DB-mode state gauges read these aggregates, so
+// the fake mirrors the SQL and memStore semantics exactly — every run, every
+// job (terminal runs included), queued/approval-waiting jobs with a non-empty
+// reason, and runner slots with capacity clamped at one — and honors the
+// per-family error knobs so the handler's skip-on-error behavior is testable.
+func (f *dbFakeStore) RunStatusCounts(ctx context.Context) (map[model.Status]int, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.metricRunStatusErr != nil {
+		return nil, f.metricRunStatusErr
+	}
+	out := map[model.Status]int{}
+	for _, r := range f.runs {
+		out[r.Status]++
+	}
+	return out, nil
+}
+
+func (f *dbFakeStore) JobStatusCounts(ctx context.Context) (map[model.Status]int, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.metricJobStatusErr != nil {
+		return nil, f.metricJobStatusErr
+	}
+	out := map[model.Status]int{}
+	for _, j := range f.jobs {
+		out[j.Status]++
+	}
+	return out, nil
+}
+
+func (f *dbFakeStore) QueuedJobQueueReasonCounts(ctx context.Context) (map[string]int, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.metricQueueReasonErr != nil {
+		return nil, f.metricQueueReasonErr
+	}
+	out := map[string]int{}
+	for _, j := range f.jobs {
+		if j.QueueReason != "" && (j.Status == model.StatusQueued || j.Status == model.StatusWaitingApproval) {
+			out[j.QueueReason]++
+		}
+	}
+	return out, nil
+}
+
+func (f *dbFakeStore) RunnerSlotTotals(ctx context.Context) (storage.RunnerSlotTotals, error) {
+	if err := ctx.Err(); err != nil {
+		return storage.RunnerSlotTotals{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.metricRunnerSlotsErr != nil {
+		return storage.RunnerSlotTotals{}, f.metricRunnerSlotsErr
+	}
+	var out storage.RunnerSlotTotals
+	for _, r := range f.runners {
+		out.Runners++
+		c := r.Capacity
+		if c < 1 {
+			c = 1
+		}
+		out.Capacity += c
+		out.Busy += len(r.ActiveJobs)
 	}
 	return out, nil
 }
@@ -1989,7 +2079,8 @@ func (f *dbFakeStore) FlakyTestNames(ctx context.Context, repoIDs []string, limi
 	out := []string{}
 	for _, id := range repoIDs {
 		for _, row := range f.historyAggregates[id] {
-			if row.Passes == 0 || row.Fails == 0 {
+			// Same window-derived predicate as SQL flake_prob > 0.
+			if row.FlakeProb <= 0 {
 				continue
 			}
 			display := row.Name
@@ -2041,12 +2132,12 @@ func (f *dbFakeStore) RebuildRepoTestHistory(ctx context.Context, repoID string)
 	return f.historyVersions[repoID], nil
 }
 
+// ListTestHistoryRepoIDs mirrors the SQL contract: limit is the keyset page
+// size there, while this in-memory fake returns the complete ascending
+// enumeration directly (it already holds every repository).
 func (f *dbFakeStore) ListTestHistoryRepoIDs(ctx context.Context, limit int) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if limit <= 0 {
-		limit = 1000
-	}
 	seen := map[string]bool{}
 	for _, rep := range f.reports {
 		if run, ok := f.runs[rep.RunID]; ok {
@@ -2060,9 +2151,6 @@ func (f *dbFakeStore) ListTestHistoryRepoIDs(ctx context.Context, limit int) ([]
 		out = append(out, id)
 	}
 	sort.Strings(out)
-	if len(out) > limit {
-		out = out[:limit]
-	}
 	return out, nil
 }
 
@@ -2368,6 +2456,31 @@ func (f *dbFakeStore) ReopenRunForChildren(ctx context.Context, runID string) er
 	r.FinishedAt = nil
 	f.runs[runID] = r
 	return nil
+}
+
+// ParentRunIDsForChild mirrors the SQL/memStore reverse-index lookup over the
+// fake's downstream links and jobs: distinct parent run IDs, ordered.
+func (f *dbFakeStore) ParentRunIDsForChild(ctx context.Context, childRunID string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.parentRunIDsErr != nil {
+		return nil, f.parentRunIDsErr
+	}
+	seen := map[string]bool{}
+	out := []string{}
+	for _, l := range f.downstreamLinks {
+		if l.ChildRunID != childRunID {
+			continue
+		}
+		j, ok := f.jobs[l.ParentJobID]
+		if !ok || j.RunID == "" || seen[j.RunID] {
+			continue
+		}
+		seen[j.RunID] = true
+		out = append(out, j.RunID)
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 func (f *dbFakeStore) GetArtifact(ctx context.Context, id string) (model.ArtifactRecord, error) {
@@ -2960,58 +3073,44 @@ type fakePendingSidecar struct {
 	createdAt time.Time
 }
 
-// fakePendingKey mirrors the artifact_pending_sidecars primary key.
-func fakePendingKey(jobID, artifactName, kind string) string {
-	return jobID + "\x00" + artifactName + "\x00" + kind
+// fakePendingKey mirrors the artifact_pending_sidecars primary key: the full
+// artifact identity (job, lease generation, artifact name, kind).
+func fakePendingKey(jobID string, generation int64, artifactName, kind string) string {
+	return jobID + "\x00" + itoa(generation) + "\x00" + artifactName + "\x00" + kind
 }
 
-func (f *dbFakeStore) RememberPendingSidecar(ctx context.Context, jobID, artifactName, kind, digest string) error {
+func (f *dbFakeStore) RememberPendingSidecar(ctx context.Context, jobID string, generation int64, artifactName, kind, digest string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.pendingErr != nil {
 		return f.pendingErr
 	}
-	f.pendingSidecars[fakePendingKey(jobID, artifactName, kind)] = fakePendingSidecar{digest: digest, createdAt: time.Now().UTC()}
+	f.pendingSidecars[fakePendingKey(jobID, generation, artifactName, kind)] = fakePendingSidecar{digest: digest, createdAt: time.Now().UTC()}
 	return nil
 }
 
-func (f *dbFakeStore) PendingSidecar(ctx context.Context, jobID, artifactName, kind string) (string, bool, error) {
+func (f *dbFakeStore) PendingSidecar(ctx context.Context, jobID string, generation int64, artifactName, kind string) (string, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.pendingErr != nil {
 		return "", false, f.pendingErr
 	}
-	row, ok := f.pendingSidecars[fakePendingKey(jobID, artifactName, kind)]
+	row, ok := f.pendingSidecars[fakePendingKey(jobID, generation, artifactName, kind)]
 	if !ok {
 		return "", false, nil
 	}
 	return row.digest, true, nil
 }
 
-func (f *dbFakeStore) ConsumePendingSidecar(ctx context.Context, jobID, artifactName, kind, digest string) error {
+func (f *dbFakeStore) ConsumePendingSidecar(ctx context.Context, jobID string, generation int64, artifactName, kind, digest string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.pendingErr != nil {
 		return f.pendingErr
 	}
-	key := fakePendingKey(jobID, artifactName, kind)
+	key := fakePendingKey(jobID, generation, artifactName, kind)
 	if row, ok := f.pendingSidecars[key]; ok && row.digest == digest {
 		delete(f.pendingSidecars, key)
-	}
-	return nil
-}
-
-func (f *dbFakeStore) DeletePendingSidecars(ctx context.Context, jobID string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.pendingErr != nil {
-		return f.pendingErr
-	}
-	prefix := jobID + "\x00"
-	for key := range f.pendingSidecars {
-		if strings.HasPrefix(key, prefix) {
-			delete(f.pendingSidecars, key)
-		}
 	}
 	return nil
 }

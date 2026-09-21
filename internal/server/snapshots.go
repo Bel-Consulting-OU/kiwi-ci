@@ -354,14 +354,22 @@ func verifyStoredSnapshot(ctx context.Context, c *cas.CAS, digest string, wantSi
 	return nil
 }
 
+// snapshotListMemoryLock is a test seam invoked immediately before
+// listSnapshots takes s.mu to copy the memory-mode records. DB-mode tests
+// assert the hook is never reached, pinning the contract that the DB branch
+// does not touch the global server mutex. Production leaves it a no-op.
+var snapshotListMemoryLock = func() {}
+
 // listSnapshots is GET /api/v1/runs/{id}/snapshots: the manifests of every
 // snapshot uploaded by the run's jobs. DB mode reads the SQL records
 // (SnapshotStore) as the single source of truth; memory mode reads the
-// in-memory map.
+// in-memory map. Neither mode holds s.mu across a store call, response
+// serialization or a client write: the DB branch touches no in-memory state,
+// and the memory branch copies the run and its matching records under the
+// lock, releases it, and only then sorts and serializes — a slow PostgreSQL
+// or a slow client can never stall unrelated control-plane operations.
 func (s *Server) listSnapshots(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.DB != nil {
 		run, err := s.DB.GetRun(r.Context(), runID)
 		if errors.Is(err, storage.ErrNotFound) {
@@ -389,7 +397,16 @@ func (s *Server) listSnapshots(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, out)
 		return
 	}
+	// Memory mode: resolve the run and copy only its records under the lock,
+	// then redact, sort and serialize outside it.
+	snapshotListMemoryLock()
+	s.mu.Lock()
 	run, ok := s.runs[runID]
+	var out []model.SnapshotRecord
+	if ok {
+		out = s.snapshotRecordsForRunLocked(runID)
+	}
+	s.mu.Unlock()
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -397,14 +414,25 @@ func (s *Server) listSnapshots(w http.ResponseWriter, r *http.Request) {
 	if !s.requireRunRead(w, r, run) {
 		return
 	}
-	out := []model.SnapshotRecord{}
+	redacted := make([]model.SnapshotRecord, 0, len(out))
+	for _, rec := range out {
+		redacted = append(redacted, redactSnapshot(rec))
+	}
+	sort.Slice(redacted, func(i, j int) bool { return redacted[i].CreatedAt.Before(redacted[j].CreatedAt) })
+	writeJSON(w, http.StatusOK, redacted)
+}
+
+// snapshotRecordsForRunLocked copies the in-memory snapshot records of one
+// run into a fresh non-nil slice. s.mu must be held; the caller is
+// responsible for releasing it before sorting or serializing.
+func (s *Server) snapshotRecordsForRunLocked(runID string) []model.SnapshotRecord {
+	out := make([]model.SnapshotRecord, 0, len(s.snapshots))
 	for _, rec := range s.snapshots {
 		if rec.RunID == runID {
-			out = append(out, redactSnapshot(rec))
+			out = append(out, rec)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
-	writeJSON(w, http.StatusOK, out)
+	return out
 }
 
 // downloadSnapshot is GET /api/v1/runs/{id}/snapshots/{sid}: streams one

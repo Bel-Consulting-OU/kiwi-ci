@@ -1259,76 +1259,13 @@ type CacheManifestStore interface {
 	GetCacheManifest(ctx context.Context, repo, trustDomain, logicalKey string) (CacheManifestRecord, bool, error)
 }
 
-// ArtifactSidecarStore is the durable artifact-sidecar contract:
-// SetArtifactSidecars updates one artifact record's sidecar references
-// (SBOM/sigstore digests) after the record was created (only non-empty
-// values are written), and the pending-sidecar methods persist the
-// upload window between a sidecar upload and its artifact payload
-// (migration 0012: artifact_pending_sidecars), keyed by
-// (job_id, artifact_name, kind):
-//
-//   - RememberPendingSidecar upserts the digest (a re-upload of the same
-//     kind replaces the digest).
-//   - PendingSidecar resolves it (ok=false when no row exists).
-//   - ConsumePendingSidecar deletes the row ONLY when the stored digest
-//     still equals the digested record's reference, so a newer re-upload
-//     is never dropped by a stale consumer.
-//   - DeletePendingSidecars clears the job's leftover rows once an
-//     artifact record commits.
-//   - PrunePendingSidecars drops rows older than the cutoff (the
-//     maintenance tick prunes rows past the 7-day retention window).
-//
-// The digests are content-addressed: no method ever deletes a CAS blob,
-// which may be referenced by other records.
-type ArtifactSidecarStore interface {
-	SetArtifactSidecars(ctx context.Context, id, sbomPath, sbomSHA256, sigstorePath, sigstoreSHA256 string) error
-	RememberPendingSidecar(ctx context.Context, jobID, artifactName, kind, digest string) error
-	PendingSidecar(ctx context.Context, jobID, artifactName, kind string) (digest string, ok bool, err error)
-	ConsumePendingSidecar(ctx context.Context, jobID, artifactName, kind, digest string) error
-	DeletePendingSidecars(ctx context.Context, jobID string) error
-	PrunePendingSidecars(ctx context.Context, olderThan time.Time) (int, error)
-}
-
 // ArtifactSidecarKindSBOM and ArtifactSidecarKindSigstore are the canonical
-// pending-sidecar kinds.
+// pending-sidecar kinds. The generation-qualified ArtifactSidecarStore
+// contract lives in postgres_sidecars.go.
 const (
 	ArtifactSidecarKindSBOM     = "sbom"
 	ArtifactSidecarKindSigstore = "sigstore"
 )
-
-// validatePendingSidecarKey checks the artifact_pending_sidecars primary-key
-// components. The artifact name is the cleaned name the server addresses
-// records by; the kind is one of the canonical kinds.
-func validatePendingSidecarKey(jobID, artifactName, kind string) error {
-	if err := ValidateJobID(jobID); err != nil {
-		return err
-	}
-	if strings.TrimSpace(artifactName) == "" {
-		return fmt.Errorf("storage: empty pending sidecar artifact name")
-	}
-	switch kind {
-	case ArtifactSidecarKindSBOM, ArtifactSidecarKindSigstore:
-		return nil
-	default:
-		return fmt.Errorf("storage: invalid pending sidecar kind %q", kind)
-	}
-}
-
-// validatePendingSidecarDigest checks the content-addressed digest stored
-// for a pending sidecar: the canonical 64 lowercase hex sha256.
-func validatePendingSidecarDigest(digest string) error {
-	if len(digest) != 64 {
-		return fmt.Errorf("storage: invalid pending sidecar digest length %d", len(digest))
-	}
-	for i := 0; i < len(digest); i++ {
-		c := digest[i]
-		if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') {
-			continue
-		}
-		return fmt.Errorf("storage: invalid pending sidecar digest character %q at position %d", c, i)
-	}
-	return nil
-}
 
 // SecretClaimStore is the durable once-only secret delivery claim contract
 // (SQL mode). ClaimSecretDelivery reserves the (job, lease generation,

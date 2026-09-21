@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -1010,15 +1011,18 @@ func (s *Server) adminOK(r *http.Request) bool {
 // store principals. Requests without a principal are legacy mode: no admin
 // token and no store tokens are configured, so auth() gates nothing and
 // there is no identity to authorize against. Repository-scoped decisions
-// resolve STRICTLY to the canonical forge-host/owner/name identity (see
-// authorizeRepo): bare aliases are honored only when the principal map
-// explicitly declares them.
+// resolve in auth.Authorize — the SINGLE repository-grant resolution entry
+// point, so canonicalization, default ports, host case, bare aliases and the
+// ambiguity fail-closed rule are identical to every other endpoint. Callers
+// pass the repository identity they already resolved (empty only when the
+// route genuinely addresses no repository, e.g. runner_manage or
+// policy_manage surfaces).
 func (s *Server) requireAction(w http.ResponseWriter, r *http.Request, action auth.Action, repo string, trusted bool) bool {
 	p, ok := auth.PrincipalFrom(r)
 	if !ok {
 		return true
 	}
-	if authorizeRepo(p, action, repo, trusted) {
+	if auth.Authorize(p, action, repo, trusted) {
 		return true
 	}
 	http.Error(w, "forbidden", http.StatusForbidden)
@@ -1774,43 +1778,145 @@ func branchFromRef(ref string) string {
 }
 
 func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAction(w, r, auth.ActionRead, "", false) {
+	// Coarse read gate: the collection spans repositories, so it is satisfied
+	// by global read/admin or any repository read grant (auth.CanReadAnyRepo,
+	// documented in requireReadAny). It is not the authorization decision for
+	// any run: every candidate is filtered individually below through
+	// canReadRepo, the single repository-grant resolution (auth.CanReadRepo),
+	// so an explicit repository deny wins and a repository-only read grant
+	// still reaches its repository.
+	if !s.requireReadAny(w, r) {
 		return
 	}
-	// Scoped list: non-admin principals see only the repositories their
-	// grants cover.
-	visible := func(run model.Run) bool { return s.repoVisible(r, run) }
+	cursor, ok := decodeRunsCursor(r.URL.Query().Get("cursor"))
+	if !ok {
+		// Opaque: the malformed value and the decoder's reason are never
+		// echoed back.
+		http.Error(w, "invalid cursor", http.StatusBadRequest)
+		return
+	}
+	limit := storage.NormalizeRunsPageLimit(runsPageLimitParam(r))
+	visible := func(run model.Run) bool { return s.canReadRepo(r, repoIDForRun(run)) }
+	var page storage.RunPage
 	if s.DB != nil {
-		out, err := s.DB.ListRuns(r.Context(), 1000)
+		var err error
+		page, err = listRunsPageFromStore(r.Context(), s.DB, cursor, limit)
 		if err != nil {
 			s.internalError(w, r, err, "")
 			return
 		}
-		dto := make([]v1.RunDTO, 0, len(out))
-		for _, v := range out {
-			if !visible(v) {
-				continue
-			}
-			dto = append(dto, v1.RunDTOFrom(v))
+	} else {
+		s.mu.Lock()
+		snapshot := make([]model.Run, 0, len(s.runs))
+		for _, v := range s.runs {
+			snapshot = append(snapshot, v)
 		}
-		writeJSON(w, http.StatusOK, dto)
-		return
+		s.mu.Unlock()
+		page = storage.PageRuns(snapshot, cursor.createdAt, cursor.id, limit)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]model.Run, 0, len(s.runs))
-	for _, v := range s.runs {
+	// RBAC filtering runs AFTER paging: the store page is cut on the
+	// underlying (created_at, id) keyset and the next cursor comes from the
+	// page boundary the store reported, never from how many runs survived the
+	// filter. A page may therefore return fewer — even zero — runs while a
+	// next cursor still leads to the remaining visible runs, and the walk
+	// terminates on the first page for which the store reported no further
+	// rows. Deciding "more data" from the visible count instead would stop
+	// early (false last page) whenever the newest rows of a page are
+	// invisible, silently hiding every older visible run.
+	dto := make([]v1.RunDTO, 0, len(page.Runs))
+	for _, v := range page.Runs {
 		if !visible(v) {
 			continue
 		}
-		out = append(out, v)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
-	dto := make([]v1.RunDTO, 0, len(out))
-	for _, v := range out {
 		dto = append(dto, v1.RunDTOFrom(v))
 	}
+	w.Header().Set("X-Kiwi-Runs-Limit-Cap", strconv.Itoa(storage.MaxRunsPageLimit))
+	if page.HasMore && page.NextID != "" {
+		w.Header().Set("X-Kiwi-Next-Cursor", encodeRunsCursor(page.NextCreatedAt, page.NextID))
+	}
 	writeJSON(w, http.StatusOK, dto)
+}
+
+// runsCursorPrefix versions the opaque runs-collection cursor. The cursor
+// follows the repository's structured-key style (testintel's history keys):
+// a version prefix plus base64.RawURLEncoding of a JSON array, here
+// [created_at in RFC3339Nano UTC, run id], so every id byte round-trips
+// exactly (including separators, unicode and whitespace).
+const runsCursorPrefix = "rk1:"
+
+// runsCursor is the decoded position of the previous page: the (created_at,
+// id) of its last run. The zero value is the first-page position.
+type runsCursor struct {
+	createdAt time.Time
+	id        string
+}
+
+// encodeRunsCursor renders the opaque cursor for the run that ended a page.
+func encodeRunsCursor(createdAt time.Time, id string) string {
+	raw, _ := json.Marshal([2]string{createdAt.UTC().Format(time.RFC3339Nano), id})
+	return runsCursorPrefix + base64.RawURLEncoding.EncodeToString(raw)
+}
+
+// decodeRunsCursor parses the opaque cursor query parameter. An empty value
+// is the first-page position. Anything else must be exactly the encoding
+// encodeRunsCursor produces; malformed input reports ok=false so the handler
+// answers an opaque 400 instead of guessing at a position.
+func decodeRunsCursor(raw string) (runsCursor, bool) {
+	if raw == "" {
+		return runsCursor{}, true
+	}
+	rest, found := strings.CutPrefix(raw, runsCursorPrefix)
+	if !found {
+		return runsCursor{}, false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(rest)
+	if err != nil {
+		return runsCursor{}, false
+	}
+	var fields []string
+	if err := json.Unmarshal(decoded, &fields); err != nil || len(fields) != 2 {
+		return runsCursor{}, false
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, fields[0])
+	if err != nil || fields[1] == "" {
+		return runsCursor{}, false
+	}
+	return runsCursor{createdAt: createdAt, id: fields[1]}, true
+}
+
+// runsPageLimitParam parses the bounded page-size query parameter. Absent,
+// unparsable and non-positive values select the default; values above the
+// cap are clamped (the cap is advertised in X-Kiwi-Runs-Limit-Cap and the
+// API docs).
+func runsPageLimitParam(r *http.Request) int {
+	limit, err := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("limit")))
+	if err != nil {
+		return storage.DefaultRunsPageLimit
+	}
+	return storage.NormalizeRunsPageLimit(limit)
+}
+
+// listRunsPageFromStore reads one keyset page from a store. Stores that
+// implement RunPageStore do the keyset read natively; a store that predates
+// the capability (minimal test doubles, custom Stores) is served a bounded
+// ListRuns snapshot through the same in-memory PageRuns contract, so callers
+// see identical page semantics either way. The fallback asks for one extra
+// row to detect HasMore exactly, except at the cap where the extra row would
+// exceed the bound (and every ListRuns implementation caps at
+// MaxRunsPageLimit anyway).
+func listRunsPageFromStore(ctx context.Context, store storage.Store, cursor runsCursor, limit int) (storage.RunPage, error) {
+	if paged, ok := store.(storage.RunPageStore); ok {
+		return paged.ListRunsPage(ctx, cursor.createdAt, cursor.id, limit)
+	}
+	fetch := limit
+	if fetch < storage.MaxRunsPageLimit {
+		fetch++
+	}
+	runs, err := store.ListRuns(ctx, fetch)
+	if err != nil {
+		return storage.RunPage{}, err
+	}
+	return storage.PageRuns(runs, cursor.createdAt, cursor.id, limit), nil
 }
 func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
@@ -2194,7 +2300,12 @@ func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
 // the DTO exposes just {ID, Name, Busy, LastSeen, ActiveJobs (filtered to
 // visible repositories)} — no labels, no metadata, no region.
 func (s *Server) listServingRunners(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAction(w, r, auth.ActionRead, "", false) {
+	// Coarse read gate shared with listRuns: global read/admin or any
+	// repository read grant (auth.CanReadAnyRepo via requireReadAny). Each
+	// active job below is authorized individually through canReadRepo, so a
+	// repository-only reader is not blanket-denied and an explicitly denied
+	// repository is never revealed.
+	if !s.requireReadAny(w, r) {
 		return
 	}
 	var all []model.Runner
@@ -2212,7 +2323,6 @@ func (s *Server) listServingRunners(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.Unlock()
 	}
-	allowed, restricted := s.visibleRepos(r)
 	repoFilter := strings.TrimSpace(r.URL.Query().Get("repo"))
 	dto := make([]v1.RunnerServingDTO, 0)
 	for _, ri := range all {
@@ -2232,18 +2342,13 @@ func (s *Server) listServingRunners(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 			}
-			if !restricted {
-				visibleJobs = append(visibleJobs, jobID)
+			// Per-candidate repository decision: a non-readable repository is
+			// omitted entirely, so neither the job nor its repository
+			// identity can leak through the runner projection.
+			if !s.canReadRepo(r, repoIDForRun(run)) {
 				continue
 			}
-			canon := repoIDForRun(run)
-			if allowed[canon] || allowed[run.RepoFullName] {
-				visibleJobs = append(visibleJobs, jobID)
-				continue
-			}
-			if _, bare, hasHost := splitCanonicalKey(canon); hasHost && allowed[bare] {
-				visibleJobs = append(visibleJobs, jobID)
-			}
+			visibleJobs = append(visibleJobs, jobID)
 		}
 		if len(visibleJobs) == 0 {
 			continue
@@ -4214,7 +4319,7 @@ func rerunTrusted(r *http.Request, old model.Run) bool {
 		// identity to authorize; keep the previous trust.
 		return true
 	}
-	return authorizeRepo(p, auth.ActionTrustedRun, repoIDForRun(old), true)
+	return auth.Authorize(p, auth.ActionTrustedRun, repoIDForRun(old), true)
 }
 
 func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
@@ -5086,108 +5191,6 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 // route.
 func (s *Server) MetricsHandler() http.Handler {
 	return http.HandlerFunc(s.metrics)
-}
-
-// metricsMemory renders the state gauges from the in-memory maps.
-func (s *Server) metricsMemory(w http.ResponseWriter, r *http.Request) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	counts := map[model.Status]int{}
-	for _, r := range s.runs {
-		counts[r.Status]++
-	}
-	jobs := map[model.Status]int{}
-	for _, j := range s.jobs {
-		jobs[j.Status]++
-	}
-	busy := 0
-	capacity := 0
-	for _, r := range s.runners {
-		busy += len(r.ActiveJobs)
-		c := r.Capacity
-		if c < 1 {
-			c = 1
-		}
-		capacity += c
-	}
-	queueReasons := map[string]int{}
-	for _, j := range s.jobs {
-		if j.QueueReason != "" && (j.Status == model.StatusQueued || j.Status == model.StatusWaitingApproval) {
-			queueReasons[j.QueueReason]++
-		}
-	}
-	fmt.Fprintln(w, "# HELP kiwi_runs Number of CI runs by status")
-	fmt.Fprintln(w, "# TYPE kiwi_runs gauge")
-	for st, n := range counts {
-		fmt.Fprintf(w, "kiwi_runs{status=%q} %d\n", st, n)
-	}
-	fmt.Fprintln(w, "# HELP kiwi_jobs Number of CI jobs by status")
-	fmt.Fprintln(w, "# TYPE kiwi_jobs gauge")
-	for st, n := range jobs {
-		fmt.Fprintf(w, "kiwi_jobs{status=%q} %d\n", st, n)
-	}
-	fmt.Fprintln(w, "# HELP kiwi_jobs_queue_reason Number of queued jobs by queue reason")
-	fmt.Fprintln(w, "# TYPE kiwi_jobs_queue_reason gauge")
-	for reason, n := range queueReasons {
-		fmt.Fprintf(w, "kiwi_jobs_queue_reason{reason=%q} %d\n", reason, n)
-	}
-	fmt.Fprintf(w, "kiwi_runners %d\nkiwi_runner_slots %d\nkiwi_runner_slots_busy %d\n", len(s.runners), capacity, busy)
-	if capacity > 0 {
-		s.metricSet("kiwi_runner_saturation", float64(busy)/float64(capacity), nil)
-	}
-}
-
-// metricsDB serves the same gauges from the SQL store, bounded to the most
-// recent runs so a scrape cannot degenerate into a full-table scan.
-func (s *Server) metricsDB(w http.ResponseWriter, r *http.Request) {
-	runs, err := s.DB.ListRuns(r.Context(), 100)
-	if err != nil {
-		s.internalError(w, r, err, "")
-		return
-	}
-	counts := map[model.Status]int{}
-	jobs := map[model.Status]int{}
-	for _, run := range runs {
-		counts[run.Status]++
-		if run.Status.Terminal() {
-			continue
-		}
-		runJobs, err := s.DB.ListJobsByRun(r.Context(), run.ID)
-		if err != nil {
-			continue
-		}
-		for _, j := range runJobs {
-			jobs[j.Status]++
-		}
-	}
-	busy := 0
-	capacity := 0
-	allRunners, err := s.DB.ListRunners(r.Context())
-	if err != nil {
-		allRunners = nil
-	}
-	for _, ri := range allRunners {
-		busy += len(ri.ActiveJobs)
-		c := ri.Capacity
-		if c < 1 {
-			c = 1
-		}
-		capacity += c
-	}
-	fmt.Fprintln(w, "# HELP kiwi_runs Number of CI runs by status")
-	fmt.Fprintln(w, "# TYPE kiwi_runs gauge")
-	for st, n := range counts {
-		fmt.Fprintf(w, "kiwi_runs{status=%q} %d\n", st, n)
-	}
-	fmt.Fprintln(w, "# HELP kiwi_jobs Number of CI jobs by status")
-	fmt.Fprintln(w, "# TYPE kiwi_jobs gauge")
-	for st, n := range jobs {
-		fmt.Fprintf(w, "kiwi_jobs{status=%q} %d\n", st, n)
-	}
-	fmt.Fprintf(w, "kiwi_runners %d\nkiwi_runner_slots %d\nkiwi_runner_slots_busy %d\n", len(allRunners), capacity, busy)
-	if capacity > 0 {
-		s.metricSet("kiwi_runner_saturation", float64(busy)/float64(capacity), nil)
-	}
 }
 
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {

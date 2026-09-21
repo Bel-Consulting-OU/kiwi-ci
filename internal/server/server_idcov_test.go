@@ -275,9 +275,9 @@ func TestIDCovGetLogsEndpoints(t *testing.T) {
 		t.Fatalf("failing db logs = %d, want 500", w.Code)
 	}
 
-	// A read principal restricted to another repository is refused.
+	// A repo-only read principal restricted to another repository is refused.
 	restricted := storeServer(t, "", map[string]auth.Principal{
-		"read-token": {Subject: "reader", Roles: []auth.Role{auth.RoleRead}, Repositories: map[string]auth.RepositoryPermission{"github.com/other/repo": {Read: true}}},
+		"read-token": {Subject: "reader", Repositories: map[string]auth.RepositoryPermission{"github.com/other/repo": {Read: true}}},
 	})
 	restricted.mu.Lock()
 	restricted.runs["run-4"] = model.Run{ID: "run-4", RepoID: "github.com/kiwi/repo", Repo: "https://github.com/kiwi/repo.git", RepoFullName: "kiwi/repo", Status: model.StatusRunning}
@@ -341,7 +341,7 @@ func TestIDCovListRunsScopedAndDBError(t *testing.T) {
 	f.mu.Unlock()
 
 	s := storeServer(t, "", map[string]auth.Principal{
-		"read-token": {Subject: "reader", Roles: []auth.Role{auth.RoleRead}, Repositories: map[string]auth.RepositoryPermission{"github.com/kiwi/repo": {Read: true}}},
+		"read-token": {Subject: "reader", Repositories: map[string]auth.RepositoryPermission{"github.com/kiwi/repo": {Read: true}}},
 	})
 	if err := s.SwitchToDB(f); err != nil {
 		t.Fatal(err)

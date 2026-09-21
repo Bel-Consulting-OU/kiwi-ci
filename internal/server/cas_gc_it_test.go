@@ -33,7 +33,7 @@ func TestCASGCIntegrationDBMode(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("insert artifact: %v", err)
 	}
-	if err := st.RememberPendingSidecar(ctx, runID, "bin", storage.ArtifactSidecarKindSBOM, pending.SHA256); err != nil {
+	if err := st.RememberPendingSidecar(ctx, runID, 1, "bin", storage.ArtifactSidecarKindSBOM, pending.SHA256); err != nil {
 		t.Fatalf("remember pending sidecar: %v", err)
 	}
 

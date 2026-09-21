@@ -150,6 +150,7 @@ var (
 	_ UsageStore                = (*FaultyStore)(nil)
 	_ UsageOnceStore            = (*FaultyStore)(nil)
 	_ RunDownstreamStore        = (*FaultyStore)(nil)
+	_ DownstreamParentRunStore  = (*FaultyStore)(nil)
 	_ ArtifactLookupStore       = (*FaultyStore)(nil)
 	_ RunnerJobStore            = (*FaultyStore)(nil)
 	_ RunEnqueueStore           = (*FaultyStore)(nil)
@@ -172,6 +173,7 @@ var (
 	_ RecoveryScanStore         = (*FaultyStore)(nil)
 	_ OutboxClaimBatchStore     = (*FaultyStore)(nil)
 	_ LeaderFenceStore          = (*FaultyStore)(nil)
+	_ RunPageStore              = (*FaultyStore)(nil)
 )
 
 func (f *FaultyStore) Close() error { return f.Inner.Close() }
@@ -202,6 +204,18 @@ func (f *FaultyStore) ListRuns(ctx context.Context, limit int) ([]model.Run, err
 	return f.Inner.ListRuns(ctx, limit)
 }
 
+// ListRunsPage delegates the keyset-paged run read to Inner when it
+// implements RunPageStore, and fails closed with a diagnosable capability
+// error otherwise. It is a READ: the FailAfter mutation counter is never
+// consumed, exactly like ListRuns.
+func (f *FaultyStore) ListRunsPage(ctx context.Context, afterCreatedAt time.Time, afterID string, limit int) (RunPage, error) {
+	inner, ok := f.Inner.(RunPageStore)
+	if !ok {
+		return RunPage{}, errMissingInnerInterface("RunPageStore")
+	}
+	return inner.ListRunsPage(ctx, afterCreatedAt, afterID, limit)
+}
+
 func (f *FaultyStore) InsertJob(ctx context.Context, job model.Job) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -217,6 +231,43 @@ func (f *FaultyStore) GetJob(ctx context.Context, id string) (model.Job, error) 
 
 func (f *FaultyStore) ListJobsByRun(ctx context.Context, runID string) ([]model.Job, error) {
 	return f.Inner.ListJobsByRun(ctx, runID)
+}
+
+// MetricsAggregateStore delegation: the DB-mode state gauges read through the
+// wrapper exactly like the raw store. The methods are plain reads (they never
+// consume the write-fault counter); a wrapper over an Inner that does not
+// implement the contract fails closed with a diagnosable capability error
+// instead of falling back to run sampling.
+func (f *FaultyStore) RunStatusCounts(ctx context.Context) (map[model.Status]int, error) {
+	inner, ok := f.Inner.(MetricsAggregateStore)
+	if !ok {
+		return nil, errMissingInnerInterface("MetricsAggregateStore")
+	}
+	return inner.RunStatusCounts(ctx)
+}
+
+func (f *FaultyStore) JobStatusCounts(ctx context.Context) (map[model.Status]int, error) {
+	inner, ok := f.Inner.(MetricsAggregateStore)
+	if !ok {
+		return nil, errMissingInnerInterface("MetricsAggregateStore")
+	}
+	return inner.JobStatusCounts(ctx)
+}
+
+func (f *FaultyStore) QueuedJobQueueReasonCounts(ctx context.Context) (map[string]int, error) {
+	inner, ok := f.Inner.(MetricsAggregateStore)
+	if !ok {
+		return nil, errMissingInnerInterface("MetricsAggregateStore")
+	}
+	return inner.QueuedJobQueueReasonCounts(ctx)
+}
+
+func (f *FaultyStore) RunnerSlotTotals(ctx context.Context) (RunnerSlotTotals, error) {
+	inner, ok := f.Inner.(MetricsAggregateStore)
+	if !ok {
+		return RunnerSlotTotals{}, errMissingInnerInterface("MetricsAggregateStore")
+	}
+	return inner.RunnerSlotTotals(ctx)
 }
 
 // CountRunningJobs passes through to Inner, reads never consume the
@@ -969,6 +1020,16 @@ func (f *FaultyStore) ReopenRunForChildren(ctx context.Context, runID string) er
 	return inner.ReopenRunForChildren(ctx, runID)
 }
 
+// ParentRunIDsForChild is a READ of the downstream reverse index, so it
+// passes through to Inner unchanged (FaultyStore injects write faults only).
+func (f *FaultyStore) ParentRunIDsForChild(ctx context.Context, childRunID string) ([]string, error) {
+	inner, ok := f.Inner.(DownstreamParentRunStore)
+	if !ok {
+		return nil, errMissingInnerInterface("DownstreamParentRunStore")
+	}
+	return inner.ParentRunIDsForChild(ctx, childRunID)
+}
+
 func (f *FaultyStore) GetArtifact(ctx context.Context, id string) (model.ArtifactRecord, error) {
 	inner, ok := f.Inner.(ArtifactLookupStore)
 	if !ok {
@@ -1122,7 +1183,7 @@ func (f *FaultyStore) GetCacheManifest(ctx context.Context, repo, trustDomain, l
 	return inner.GetCacheManifest(ctx, repo, trustDomain, logicalKey)
 }
 
-func (f *FaultyStore) SetArtifactSidecars(ctx context.Context, id, sbomPath, sbomSHA256, sigstorePath, sigstoreSHA256 string) error {
+func (f *FaultyStore) SetArtifactSidecars(ctx context.Context, artifactID, sbomPath, sbomSHA256, sigstorePath, sigstoreSHA256 string) error {
 	inner, ok := f.Inner.(ArtifactSidecarStore)
 	if !ok {
 		return errMissingInnerInterface("ArtifactSidecarStore")
@@ -1132,10 +1193,10 @@ func (f *FaultyStore) SetArtifactSidecars(ctx context.Context, id, sbomPath, sbo
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return inner.SetArtifactSidecars(ctx, id, sbomPath, sbomSHA256, sigstorePath, sigstoreSHA256)
+	return inner.SetArtifactSidecars(ctx, artifactID, sbomPath, sbomSHA256, sigstorePath, sigstoreSHA256)
 }
 
-func (f *FaultyStore) RememberPendingSidecar(ctx context.Context, jobID, artifactName, kind, digest string) error {
+func (f *FaultyStore) RememberPendingSidecar(ctx context.Context, jobID string, generation int64, artifactName, kind, digest string) error {
 	inner, ok := f.Inner.(ArtifactSidecarStore)
 	if !ok {
 		return errMissingInnerInterface("ArtifactSidecarStore")
@@ -1145,18 +1206,18 @@ func (f *FaultyStore) RememberPendingSidecar(ctx context.Context, jobID, artifac
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return inner.RememberPendingSidecar(ctx, jobID, artifactName, kind, digest)
+	return inner.RememberPendingSidecar(ctx, jobID, generation, artifactName, kind, digest)
 }
 
-func (f *FaultyStore) PendingSidecar(ctx context.Context, jobID, artifactName, kind string) (string, bool, error) {
+func (f *FaultyStore) PendingSidecar(ctx context.Context, jobID string, generation int64, artifactName, kind string) (string, bool, error) {
 	inner, ok := f.Inner.(ArtifactSidecarStore)
 	if !ok {
 		return "", false, errMissingInnerInterface("ArtifactSidecarStore")
 	}
-	return inner.PendingSidecar(ctx, jobID, artifactName, kind)
+	return inner.PendingSidecar(ctx, jobID, generation, artifactName, kind)
 }
 
-func (f *FaultyStore) ConsumePendingSidecar(ctx context.Context, jobID, artifactName, kind, digest string) error {
+func (f *FaultyStore) ConsumePendingSidecar(ctx context.Context, jobID string, generation int64, artifactName, kind, digest string) error {
 	inner, ok := f.Inner.(ArtifactSidecarStore)
 	if !ok {
 		return errMissingInnerInterface("ArtifactSidecarStore")
@@ -1166,20 +1227,7 @@ func (f *FaultyStore) ConsumePendingSidecar(ctx context.Context, jobID, artifact
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return inner.ConsumePendingSidecar(ctx, jobID, artifactName, kind, digest)
-}
-
-func (f *FaultyStore) DeletePendingSidecars(ctx context.Context, jobID string) error {
-	inner, ok := f.Inner.(ArtifactSidecarStore)
-	if !ok {
-		return errMissingInnerInterface("ArtifactSidecarStore")
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if err := f.fail(); err != nil {
-		return err
-	}
-	return inner.DeletePendingSidecars(ctx, jobID)
+	return inner.ConsumePendingSidecar(ctx, jobID, generation, artifactName, kind, digest)
 }
 
 func (f *FaultyStore) PrunePendingSidecars(ctx context.Context, olderThan time.Time) (int, error) {
@@ -1547,9 +1595,11 @@ type pendingSidecar struct {
 	createdAt time.Time
 }
 
-// pendingSidecarKey is the in-memory artifact_pending_sidecars primary key.
-func pendingSidecarKey(jobID, artifactName, kind string) string {
-	return jobID + "\x00" + artifactName + "\x00" + kind
+// pendingSidecarKey is the in-memory artifact_pending_sidecars primary key:
+// the full artifact identity (job, lease generation, artifact name, kind),
+// mirroring migration 0028.
+func pendingSidecarKey(jobID string, generation int64, artifactName, kind string) string {
+	return jobID + "\x00" + strconv.FormatInt(generation, 10) + "\x00" + artifactName + "\x00" + kind
 }
 
 // outboxClaim is one in-memory outbox claim lease.
@@ -1623,6 +1673,7 @@ var (
 	_ UsageStore                = (*memStore)(nil)
 	_ UsageOnceStore            = (*memStore)(nil)
 	_ RunDownstreamStore        = (*memStore)(nil)
+	_ DownstreamParentRunStore  = (*memStore)(nil)
 	_ ArtifactLookupStore       = (*memStore)(nil)
 	_ RunnerJobStore            = (*memStore)(nil)
 	_ RunEnqueueStore           = (*memStore)(nil)
@@ -1645,6 +1696,7 @@ var (
 	_ RecoveryStore             = (*memStore)(nil)
 	_ RecoveryScanStore         = (*memStore)(nil)
 	_ OutboxClaimBatchStore     = (*memStore)(nil)
+	_ RunPageStore              = (*memStore)(nil)
 )
 
 func (m *memStore) Close() error { return nil }
@@ -1694,6 +1746,21 @@ func (m *memStore) ListRuns(ctx context.Context, limit int) ([]model.Run, error)
 	return out, nil
 }
 
+// ListRunsPage mirrors the SQL keyset page (see RunPageStore): the same
+// (created_at DESC, id DESC) order, the same (created_at, id) < cursor
+// predicate and the same bounded limit, computed by the shared PageRuns
+// helper so the memory and SQL pages cannot drift. The run map under m.mu is
+// a complete view, so paging is deterministic.
+func (m *memStore) ListRunsPage(ctx context.Context, afterCreatedAt time.Time, afterID string, limit int) (RunPage, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	runs := make([]model.Run, 0, len(m.runs))
+	for _, r := range m.runs {
+		runs = append(runs, r)
+	}
+	return PageRuns(runs, afterCreatedAt, afterID, limit), nil
+}
+
 func (m *memStore) InsertJob(ctx context.Context, job model.Job) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1719,6 +1786,71 @@ func (m *memStore) ListJobsByRun(ctx context.Context, runID string) ([]model.Job
 		if j.RunID == runID {
 			out = append(out, j)
 		}
+	}
+	return out, nil
+}
+
+// MetricsAggregateStore: the in-memory mirror of the SQL aggregates. The
+// maps under one mutex are always a complete view, so these counts are the
+// reference values the DB-mode gauges must agree with. A canceled context is
+// reported as an error (never as an empty/zero map), so the metrics path
+// skips the family instead of rendering wrong zeros.
+func (m *memStore) RunStatusCounts(ctx context.Context) (map[model.Status]int, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[model.Status]int, len(m.runs))
+	for _, r := range m.runs {
+		out[r.Status]++
+	}
+	return out, nil
+}
+
+func (m *memStore) JobStatusCounts(ctx context.Context) (map[model.Status]int, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[model.Status]int, len(m.jobs))
+	for _, j := range m.jobs {
+		out[j.Status]++
+	}
+	return out, nil
+}
+
+func (m *memStore) QueuedJobQueueReasonCounts(ctx context.Context) (map[string]int, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := map[string]int{}
+	for _, j := range m.jobs {
+		if j.QueueReason != "" && (j.Status == model.StatusQueued || j.Status == model.StatusWaitingApproval) {
+			out[j.QueueReason]++
+		}
+	}
+	return out, nil
+}
+
+func (m *memStore) RunnerSlotTotals(ctx context.Context) (RunnerSlotTotals, error) {
+	if err := ctx.Err(); err != nil {
+		return RunnerSlotTotals{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out RunnerSlotTotals
+	for _, r := range m.runners {
+		out.Runners++
+		c := r.Capacity
+		if c < 1 {
+			c = 1
+		}
+		out.Capacity += c
+		out.Busy += len(r.ActiveJobs)
 	}
 	return out, nil
 }
@@ -3603,6 +3735,34 @@ func (m *memStore) ReopenRunForChildren(ctx context.Context, runID string) error
 	return nil
 }
 
+// ParentRunIDsForChild is the in-memory equivalent of the SQL reverse-index
+// lookup: every downstream link launched as childRunID maps through its
+// parent job to that job's run. Missing parent jobs are skipped (the SQL JOIN
+// drops them), duplicates are folded and the result is ordered by run ID,
+// exactly like PostgresStore.ParentRunIDsForChild.
+func (m *memStore) ParentRunIDsForChild(ctx context.Context, childRunID string) ([]string, error) {
+	if childRunID == "" {
+		return nil, fmt.Errorf("storage: empty child run id")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	seen := map[string]bool{}
+	out := []string{}
+	for _, l := range m.downstream {
+		if l.ChildRunID != childRunID {
+			continue
+		}
+		j, ok := m.jobs[l.ParentJobID]
+		if !ok || j.RunID == "" || seen[j.RunID] {
+			continue
+		}
+		seen[j.RunID] = true
+		out = append(out, j.RunID)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 func (m *memStore) GetArtifact(ctx context.Context, id string) (model.ArtifactRecord, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -4248,11 +4408,11 @@ func (m *memStore) GetCacheManifest(ctx context.Context, repo, trustDomain, logi
 }
 
 // SetArtifactSidecars updates one artifact record's sidecar references.
-func (m *memStore) SetArtifactSidecars(ctx context.Context, id, sbomPath, sbomSHA256, sigstorePath, sigstoreSHA256 string) error {
+func (m *memStore) SetArtifactSidecars(ctx context.Context, artifactID, sbomPath, sbomSHA256, sigstorePath, sigstoreSHA256 string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for i, a := range m.artifacts {
-		if a.ID != id {
+		if a.ID != artifactID {
 			continue
 		}
 		if sbomPath != "" {
@@ -4273,10 +4433,11 @@ func (m *memStore) SetArtifactSidecars(ctx context.Context, id, sbomPath, sbomSH
 	return ErrNotFound
 }
 
-// RememberPendingSidecar upserts the pending sidecar digest for
-// (job, artifact, kind), replacing the digest of a re-upload.
-func (m *memStore) RememberPendingSidecar(ctx context.Context, jobID, artifactName, kind, digest string) error {
-	if err := validatePendingSidecarKey(jobID, artifactName, kind); err != nil {
+// RememberPendingSidecar upserts the pending sidecar digest for one
+// (job, generation, artifact, kind) identity, replacing the digest of a
+// re-upload. Another generation's row is a different key.
+func (m *memStore) RememberPendingSidecar(ctx context.Context, jobID string, generation int64, artifactName, kind, digest string) error {
+	if err := validatePendingSidecarKey(jobID, generation, artifactName, kind); err != nil {
 		return err
 	}
 	if err := validatePendingSidecarDigest(digest); err != nil {
@@ -4284,19 +4445,20 @@ func (m *memStore) RememberPendingSidecar(ctx context.Context, jobID, artifactNa
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.pendingSidecars[pendingSidecarKey(jobID, artifactName, kind)] = pendingSidecar{digest: digest, createdAt: time.Now().UTC()}
+	m.pendingSidecars[pendingSidecarKey(jobID, generation, artifactName, kind)] = pendingSidecar{digest: digest, createdAt: time.Now().UTC()}
 	return nil
 }
 
-// PendingSidecar resolves the pending sidecar digest, or ok=false when the
-// row is absent.
-func (m *memStore) PendingSidecar(ctx context.Context, jobID, artifactName, kind string) (string, bool, error) {
-	if err := validatePendingSidecarKey(jobID, artifactName, kind); err != nil {
+// PendingSidecar resolves the pending sidecar digest for the exact
+// (job, generation, artifact, kind) identity, or ok=false when the row is
+// absent. It never falls back to another generation.
+func (m *memStore) PendingSidecar(ctx context.Context, jobID string, generation int64, artifactName, kind string) (string, bool, error) {
+	if err := validatePendingSidecarKey(jobID, generation, artifactName, kind); err != nil {
 		return "", false, err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	row, ok := m.pendingSidecars[pendingSidecarKey(jobID, artifactName, kind)]
+	row, ok := m.pendingSidecars[pendingSidecarKey(jobID, generation, artifactName, kind)]
 	if !ok {
 		return "", false, nil
 	}
@@ -4304,9 +4466,9 @@ func (m *memStore) PendingSidecar(ctx context.Context, jobID, artifactName, kind
 }
 
 // ConsumePendingSidecar deletes the pending row only while it still carries
-// the consumed digest.
-func (m *memStore) ConsumePendingSidecar(ctx context.Context, jobID, artifactName, kind, digest string) error {
-	if err := validatePendingSidecarKey(jobID, artifactName, kind); err != nil {
+// the consumed digest, and only for the exact generation.
+func (m *memStore) ConsumePendingSidecar(ctx context.Context, jobID string, generation int64, artifactName, kind, digest string) error {
+	if err := validatePendingSidecarKey(jobID, generation, artifactName, kind); err != nil {
 		return err
 	}
 	if err := validatePendingSidecarDigest(digest); err != nil {
@@ -4314,25 +4476,9 @@ func (m *memStore) ConsumePendingSidecar(ctx context.Context, jobID, artifactNam
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	key := pendingSidecarKey(jobID, artifactName, kind)
+	key := pendingSidecarKey(jobID, generation, artifactName, kind)
 	if row, ok := m.pendingSidecars[key]; ok && row.digest == digest {
 		delete(m.pendingSidecars, key)
-	}
-	return nil
-}
-
-// DeletePendingSidecars clears every leftover pending row for the job.
-func (m *memStore) DeletePendingSidecars(ctx context.Context, jobID string) error {
-	if err := ValidateJobID(jobID); err != nil {
-		return err
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	prefix := jobID + "\x00"
-	for key := range m.pendingSidecars {
-		if strings.HasPrefix(key, prefix) {
-			delete(m.pendingSidecars, key)
-		}
 	}
 	return nil
 }
@@ -4673,7 +4819,9 @@ func (m *memStore) FlakyTestNames(ctx context.Context, repoIDs []string, limit i
 	out := []string{}
 	for _, id := range repoIDs {
 		for _, row := range m.historyAggregates[id] {
-			if row.Passes == 0 || row.Fails == 0 {
+			// Window-derived predicate: identical to the SQL flake_prob > 0
+			// and to testintel.History.Flaky.
+			if row.FlakeProb <= 0 {
 				continue
 			}
 			display := row.Name
@@ -4694,10 +4842,12 @@ func (m *memStore) FlakyTestNames(ctx context.Context, repoIDs []string, limit i
 	return out, nil
 }
 
+// ListTestHistoryRepoIDs returns every canonical repository ID with durable
+// reports, in ascending order. The SQL store enumerates these with keyset
+// pages of `limit` (TestHistoryRepoPageSize when non-positive); the
+// in-memory store already holds the full set, so it returns the same complete
+// enumeration without a page loop — the contract result is identical.
 func (m *memStore) ListTestHistoryRepoIDs(ctx context.Context, limit int) ([]string, error) {
-	if limit <= 0 {
-		limit = 1000
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	seen := map[string]bool{}
@@ -4713,9 +4863,6 @@ func (m *memStore) ListTestHistoryRepoIDs(ctx context.Context, limit int) ([]str
 		out = append(out, id)
 	}
 	sort.Strings(out)
-	if len(out) > limit {
-		out = out[:limit]
-	}
 	return out, nil
 }
 

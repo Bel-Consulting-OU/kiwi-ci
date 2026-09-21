@@ -337,19 +337,19 @@ func TestMemStoreCacheManifestAndConsumeValidation(t *testing.T) {
 	}
 
 	// Consume validates its key before touching state.
-	if err := m.ConsumePendingSidecar(ctx(), "bad", "bin", ArtifactSidecarKindSBOM, memDigest); err == nil {
+	if err := m.ConsumePendingSidecar(ctx(), "bad", 1, "bin", ArtifactSidecarKindSBOM, memDigest); err == nil {
 		t.Fatal("invalid job id must fail")
 	}
-	if err := m.ConsumePendingSidecar(ctx(), memJobID, "bin", "pbom", memDigest); err == nil {
+	if err := m.ConsumePendingSidecar(ctx(), memJobID, 1, "bin", "pbom", memDigest); err == nil {
 		t.Fatal("invalid kind must fail")
 	}
-	if err := m.ConsumePendingSidecar(ctx(), memJobID, "bin", ArtifactSidecarKindSBOM, "short"); err == nil {
+	if err := m.ConsumePendingSidecar(ctx(), memJobID, 1, "bin", ArtifactSidecarKindSBOM, "short"); err == nil {
 		t.Fatal("invalid digest must fail")
 	}
-	if _, _, err := m.PendingSidecar(ctx(), "bad", "bin", ArtifactSidecarKindSBOM); err == nil {
+	if _, _, err := m.PendingSidecar(ctx(), "bad", 1, "bin", ArtifactSidecarKindSBOM); err == nil {
 		t.Fatal("PendingSidecar must validate its key")
 	}
-	if err := m.RememberPendingSidecar(ctx(), memJobID, "bin", "pbom", memDigest); err == nil {
+	if err := m.RememberPendingSidecar(ctx(), memJobID, 1, "bin", "pbom", memDigest); err == nil {
 		t.Fatal("RememberPendingSidecar must validate its kind")
 	}
 }

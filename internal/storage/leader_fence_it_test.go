@@ -97,7 +97,7 @@ func TestPostgresIntegrationLeaderFenceStaleLeaderMutatesNothing(t *testing.T) {
 	}
 
 	pendingJob := pgITNewID(t)
-	if err := a.RememberPendingSidecar(ctx, pendingJob, "bin", ArtifactSidecarKindSBOM, strings.Repeat("e", 64)); err != nil {
+	if err := a.RememberPendingSidecar(ctx, pendingJob, 4, "bin", ArtifactSidecarKindSBOM, strings.Repeat("e", 64)); err != nil {
 		t.Fatalf("remember pending sidecar: %v", err)
 	}
 	if _, err := a.pool.Exec(ctx, `UPDATE artifact_pending_sidecars SET created_at = now() - interval '2 hours' WHERE job_id=$1`, pendingJob); err != nil {

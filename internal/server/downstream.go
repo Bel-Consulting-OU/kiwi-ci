@@ -771,17 +771,24 @@ func (s *Server) refreshDownstreamParentsLocked(childRunID string) {
 }
 
 // refreshDownstreamParentsDB re-aggregates every parent run that waits on
-// childRunID (DB mode).
+// childRunID (DB mode). The parents are resolved through the store's
+// downstream reverse index (ParentRunIDsForChild): the previous
+// ListRuns(10000) enumeration could never see a parent older than the 10,000
+// newest runs, so on a busy installation the parent stayed permanently stale
+// when its child finished. A store without the reverse-index contract fails
+// closed — there is deliberately NO bounded-scan fallback.
 func (s *Server) refreshDownstreamParentsDB(ctx context.Context, childRunID string) error {
-	runs, err := s.DB.ListRuns(ctx, 10000)
-	if err != nil {
-		return fmt.Errorf("downstream: list runs: %w", err)
+	store, ok := s.DB.(storage.DownstreamParentRunStore)
+	if !ok {
+		return fmt.Errorf("downstream: store %T lacks the reverse-index contract (storage.DownstreamParentRunStore); refusing the bounded run scan for child %s", s.DB, childRunID)
 	}
-	for _, run := range runs {
-		if stringSliceContains(run.DownstreamRuns, childRunID) {
-			if aerr := s.adjustRunForChildrenDB(ctx, run.ID); aerr != nil {
-				return aerr
-			}
+	parentRunIDs, err := store.ParentRunIDsForChild(ctx, childRunID)
+	if err != nil {
+		return fmt.Errorf("downstream: parent runs for child %s: %w", childRunID, err)
+	}
+	for _, parentRunID := range parentRunIDs {
+		if aerr := s.adjustRunForChildrenDB(ctx, parentRunID); aerr != nil {
+			return aerr
 		}
 	}
 	return nil

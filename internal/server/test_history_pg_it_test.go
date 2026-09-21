@@ -339,3 +339,97 @@ func TestPostgresIntegrationServerDisableRunnerAtomicCert(t *testing.T) {
 		t.Fatalf("certificate revocation after replay = %v err=%v", revoked, err)
 	}
 }
+
+// pgITServerCount runs one scalar count query through a raw connection bound
+// to the test schema.
+func pgITServerCount(t *testing.T, env *pgITServerEnv, sql string, args ...any) int {
+	t.Helper()
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, env.base)
+	if err != nil {
+		t.Fatalf("raw connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if _, err := conn.Exec(ctx, "SET search_path TO "+pgx.Identifier{env.schema}.Sanitize()); err != nil {
+		t.Fatalf("raw search_path: %v", err)
+	}
+	var n int
+	if err := conn.QueryRow(ctx, sql, args...).Scan(&n); err != nil {
+		t.Fatalf("raw count: %v", err)
+	}
+	return n
+}
+
+// pgITServerSeedHistoryRepoPage plants n repositories with one durable report
+// each by bulk SQL, so the repository-enumeration pagination can be exercised
+// past the old 1000-repository cap without 1000+ API round trips.
+func pgITServerSeedHistoryRepoPage(t *testing.T, env *pgITServerEnv, n int) {
+	t.Helper()
+	pgITServerExec(t, env, `INSERT INTO runs (id, status, created_at, payload)
+		SELECT 'run-' || lpad(i::text, 28, '0'), 'success', now(),
+			jsonb_build_object('id', 'run-' || lpad(i::text, 28, '0'),
+				'repo_id', 'github.com/kiwi-it/page-' || lpad(i::text, 4, '0'),
+				'repo_full_name', 'kiwi-it/page-' || lpad(i::text, 4, '0'),
+				'repo', 'https://github.com/kiwi-it/page-' || lpad(i::text, 4, '0') || '.git')
+		FROM generate_series(1, $1) AS i`, n)
+	pgITServerExec(t, env, `INSERT INTO test_results (id, run_id, job_key, tests, failures, created_at, payload)
+		SELECT 'rep-' || lpad(i::text, 28, '0'), 'run-' || lpad(i::text, 28, '0'), 'build', 1, 0, now(), '{}'::jsonb
+		FROM generate_series(1, $1) AS i`, n)
+}
+
+// repairCountingStore wraps the live PostgreSQL store: it forces a small
+// keyset page size and counts the per-repository repairs the server's
+// maintenance enumeration drives, so the test proves EVERY repository
+// participates across many pages (not only the first 1000).
+type repairCountingStore struct {
+	*storage.PostgresStore
+	page    int
+	mu      sync.Mutex
+	rebuilt map[string]int
+}
+
+func (c *repairCountingStore) ListTestHistoryRepoIDs(ctx context.Context, limit int) ([]string, error) {
+	if c.page > 0 {
+		limit = c.page
+	}
+	return c.PostgresStore.ListTestHistoryRepoIDs(ctx, limit)
+}
+
+func (c *repairCountingStore) RebuildRepoTestHistory(ctx context.Context, repoID string) (int64, error) {
+	c.mu.Lock()
+	c.rebuilt[repoID]++
+	c.mu.Unlock()
+	return c.PostgresStore.RebuildRepoTestHistory(ctx, repoID)
+}
+
+// TestPostgresIntegrationServerTestHistoryRepairAllReposAcrossPages is defect
+// 4's end-to-end real-PostgreSQL proof: the maintenance repair enumerates
+// MORE than 1000 repositories through keyset pages (the wrapper forces pages
+// of 97) and rebuilds every one of them. Pre-fix the enumeration stopped at
+// the 1000-repository cap and the remaining repositories were never repaired.
+func TestPostgresIntegrationServerTestHistoryRepairAllReposAcrossPages(t *testing.T) {
+	env := pgITServerSetup(t)
+	s, st := pgITServerWithEnv(t, env, t.TempDir())
+	pgITServerAwaitLeadership(t, s)
+	const repos = 1005
+	pgITServerSeedHistoryRepoPage(t, env, repos)
+
+	counting := &repairCountingStore{PostgresStore: st, page: 97, rebuilt: map[string]int{}}
+	s.DB = counting
+	s.rebuildTestHistoryDB(context.Background())
+
+	counting.mu.Lock()
+	rebuilt := len(counting.rebuilt)
+	counting.mu.Unlock()
+	if rebuilt != repos {
+		t.Fatalf("maintenance repair rebuilt %d repositories, want all %d across keyset pages", rebuilt, repos)
+	}
+	// The durable effect: every repository got its version row.
+	if n := pgITServerCount(t, env, `SELECT COUNT(*) FROM test_history_repos`); n != repos {
+		t.Fatalf("test_history_repos rows = %d, want %d", n, repos)
+	}
+	// Spot check through the store API: a repaired repository loads.
+	if v, _, err := st.LoadRepoTestHistory(context.Background(), "github.com/kiwi-it/page-1005"); err != nil || v == 0 {
+		t.Fatalf("spot-check repaired history = version %d err %v, want a repaired version", v, err)
+	}
+}

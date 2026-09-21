@@ -22,7 +22,7 @@ type wrapperCase struct {
 func faultyWrapperCases() map[string]wrapperCase {
 	artifact := model.ArtifactRecord{ID: "dddddddddddddddddddddddddddddddd", RunID: testRun.ID, JobID: testJob.ID, Name: "bin", SHA256: "e", CreatedAt: time.Unix(1002, 0).UTC()}
 	pending := func(m *memStore) {
-		_ = m.RememberPendingSidecar(ctx(), testJob.ID, "bin", ArtifactSidecarKindSBOM, memDigest)
+		_ = m.RememberPendingSidecar(ctx(), testJob.ID, 1, "bin", ArtifactSidecarKindSBOM, memDigest)
 	}
 	fragment := func(m *memStore) {
 		seedRunningJob(m)
@@ -115,6 +115,22 @@ func faultyWrapperCases() map[string]wrapperCase {
 		"UpsertRunner": {mutates: true, seed: seedRunner, call: func(f *FaultyStore) error { return f.UpsertRunner(ctx(), testRunner) }},
 		"GetRunner":    {seed: seedRunner, call: func(f *FaultyStore) error { _, err := f.GetRunner(ctx(), testRunner.ID); return err }},
 		"ListRunners":  {seed: seedRunner, call: func(f *FaultyStore) error { _, err := f.ListRunners(ctx()); return err }},
+		"RunStatusCounts": {seed: seedRunAndJob, call: func(f *FaultyStore) error {
+			_, err := f.RunStatusCounts(ctx())
+			return err
+		}},
+		"JobStatusCounts": {seed: seedRunAndJob, call: func(f *FaultyStore) error {
+			_, err := f.JobStatusCounts(ctx())
+			return err
+		}},
+		"QueuedJobQueueReasonCounts": {seed: seedRunAndJob, call: func(f *FaultyStore) error {
+			_, err := f.QueuedJobQueueReasonCounts(ctx())
+			return err
+		}},
+		"RunnerSlotTotals": {seed: seedRunner, call: func(f *FaultyStore) error {
+			_, err := f.RunnerSlotTotals(ctx())
+			return err
+		}},
 		"ReleaseRunnerJob": {mutates: true, seed: func(m *memStore) { seedRunningJob(m); seedRunner(m) }, call: func(f *FaultyStore) error {
 			return f.ReleaseRunnerJob(ctx(), testRunner.ID, testJob.ID, model.StatusSuccess)
 		}},
@@ -327,17 +343,14 @@ func faultyWrapperCases() map[string]wrapperCase {
 			return f.SetArtifactSidecars(ctx(), artifact.ID, "sbom", "s1", "sig", "s2")
 		}},
 		"RememberPendingSidecar": {mutates: true, call: func(f *FaultyStore) error {
-			return f.RememberPendingSidecar(ctx(), testJob.ID, "bin", ArtifactSidecarKindSBOM, memDigest)
+			return f.RememberPendingSidecar(ctx(), testJob.ID, 1, "bin", ArtifactSidecarKindSBOM, memDigest)
 		}},
 		"PendingSidecar": {seed: pending, call: func(f *FaultyStore) error {
-			_, _, err := f.PendingSidecar(ctx(), testJob.ID, "bin", ArtifactSidecarKindSBOM)
+			_, _, err := f.PendingSidecar(ctx(), testJob.ID, 1, "bin", ArtifactSidecarKindSBOM)
 			return err
 		}},
 		"ConsumePendingSidecar": {mutates: true, seed: pending, call: func(f *FaultyStore) error {
-			return f.ConsumePendingSidecar(ctx(), testJob.ID, "bin", ArtifactSidecarKindSBOM, memDigest)
-		}},
-		"DeletePendingSidecars": {mutates: true, seed: pending, call: func(f *FaultyStore) error {
-			return f.DeletePendingSidecars(ctx(), testJob.ID)
+			return f.ConsumePendingSidecar(ctx(), testJob.ID, 1, "bin", ArtifactSidecarKindSBOM, memDigest)
 		}},
 		"PrunePendingSidecars": {mutates: true, seed: pending, call: func(f *FaultyStore) error {
 			_, err := f.PrunePendingSidecars(ctx(), time.Unix(6000, 0).UTC())
@@ -864,17 +877,14 @@ func missingOptionalInterfaceCases() map[string]missingIfaceCase {
 			return f.SetArtifactSidecars(ctx(), "", "", "", "", "")
 		}},
 		"RememberPendingSidecar": {mutates: true, iface: "ArtifactSidecarStore", call: func(f *FaultyStore) error {
-			return f.RememberPendingSidecar(ctx(), "", "", "", "")
+			return f.RememberPendingSidecar(ctx(), "", 0, "", "", "")
 		}},
 		"PendingSidecar": {iface: "ArtifactSidecarStore", call: func(f *FaultyStore) error {
-			_, _, err := f.PendingSidecar(ctx(), "", "", "")
+			_, _, err := f.PendingSidecar(ctx(), "", 0, "", "")
 			return err
 		}},
 		"ConsumePendingSidecar": {mutates: true, iface: "ArtifactSidecarStore", call: func(f *FaultyStore) error {
-			return f.ConsumePendingSidecar(ctx(), "", "", "", "")
-		}},
-		"DeletePendingSidecars": {mutates: true, iface: "ArtifactSidecarStore", call: func(f *FaultyStore) error {
-			return f.DeletePendingSidecars(ctx(), "")
+			return f.ConsumePendingSidecar(ctx(), "", 0, "", "", "")
 		}},
 		"PrunePendingSidecars": {mutates: true, iface: "ArtifactSidecarStore", call: func(f *FaultyStore) error {
 			_, err := f.PrunePendingSidecars(ctx(), time.Time{})
@@ -990,6 +1000,22 @@ func missingOptionalInterfaceCases() map[string]missingIfaceCase {
 		}},
 		"DisableRunnerAndRevokeCert": {mutates: true, iface: "RunnerDisableStore", call: func(f *FaultyStore) error {
 			_, err := f.DisableRunnerAndRevokeCert(ctx(), "", "", "")
+			return err
+		}},
+		"RunStatusCounts": {iface: "MetricsAggregateStore", call: func(f *FaultyStore) error {
+			_, err := f.RunStatusCounts(ctx())
+			return err
+		}},
+		"JobStatusCounts": {iface: "MetricsAggregateStore", call: func(f *FaultyStore) error {
+			_, err := f.JobStatusCounts(ctx())
+			return err
+		}},
+		"QueuedJobQueueReasonCounts": {iface: "MetricsAggregateStore", call: func(f *FaultyStore) error {
+			_, err := f.QueuedJobQueueReasonCounts(ctx())
+			return err
+		}},
+		"RunnerSlotTotals": {iface: "MetricsAggregateStore", call: func(f *FaultyStore) error {
+			_, err := f.RunnerSlotTotals(ctx())
 			return err
 		}},
 	}

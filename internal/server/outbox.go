@@ -61,10 +61,6 @@ type Outbox struct {
 	store *storage.Repository
 	db    storage.OutboxStore
 	done  map[string]bool
-	// localOnly marks DB-mode items whose durable append failed: they have
-	// no row to claim, so they are dispatched directly (at-least-once),
-	// preserving Enqueue's "persistence failed but still queued" contract.
-	localOnly map[string]bool
 	// delivered is the highest state_version acknowledged per logical key.
 	// It mirrors forge_check_state in DB mode (where the durable guard is
 	// authoritative) and is the fs-mode supersede watermark: it is rebuilt
@@ -75,14 +71,14 @@ type Outbox struct {
 	// lease. Lazily initialized.
 	claimer string
 	// flushMu serializes flushes on one instance so two concurrent Flush
-	// calls cannot dispatch the same claimed/local-only item twice.
+	// calls cannot dispatch the same claimed item twice.
 	flushMu sync.Mutex
 }
 
 // NewOutbox creates an outbox. When store is non-nil, unflushed intents
 // from a previous process are replayed into the queue.
 func NewOutbox(store *storage.Repository) *Outbox {
-	o := &Outbox{store: store, done: map[string]bool{}, localOnly: map[string]bool{}, delivered: map[string]int64{}}
+	o := &Outbox{store: store, done: map[string]bool{}, delivered: map[string]int64{}}
 	if store == nil {
 		return o
 	}
@@ -483,7 +479,6 @@ func (o *Outbox) retireSupersededLocked(ids []string) {
 	for _, id := range ids {
 		o.removeLocked(id)
 		o.done[id] = true
-		delete(o.localOnly, id)
 	}
 }
 
@@ -493,7 +488,6 @@ func (o *Outbox) supersedeLocked(logicalKey string, version int64) {
 	kept := o.items[:0]
 	for _, it := range o.items {
 		if it.LogicalKey == logicalKey && it.StateVersion <= version {
-			delete(o.localOnly, it.ID)
 			continue
 		}
 		kept = append(kept, it)
@@ -590,11 +584,11 @@ func (o *Outbox) QueueKnownDurable(item forge.OutboxItem) {
 // the pre-existing rows under the same IDs.
 //
 // HasIntent reports whether an intent with this ID is currently queued in
-// this process (a durable local mirror, a local-only item or a pre-existing
-// row registered through QueueKnownDurable). It compares IDs only, never
-// content, so it must NOT be used to treat a duplicate enqueue as success:
-// Outbox.Enqueue already returns nil for an identical-content replay and
-// ErrOutboxIDConflict when the ID carries different content.
+// this process (a durable local mirror, or a pre-existing row registered
+// through QueueKnownDurable). It compares IDs only, never content, so it must
+// NOT be used to treat a duplicate enqueue as success: Outbox.Enqueue already
+// returns nil for an identical-content replay and ErrOutboxIDConflict when the
+// ID carries different content.
 func (o *Outbox) HasIntent(id string) bool {
 	if id == "" {
 		return false
@@ -667,9 +661,7 @@ func (o *Outbox) Pending() []forge.OutboxItem {
 // (storage.ClaimOutbox): rows claimed by another replica within
 // storage.OutboxClaimTTL are skipped, so two control planes flush disjoint
 // batches and never double-dispatch. A claim is released on dispatch or ack
-// failure so the retry does not wait out the TTL. Local-only items (durable
-// append failed at enqueue time) are dispatched directly, since there is no
-// row to claim.
+// failure so the retry does not wait out the TTL.
 //
 // The dispatch runs WITHOUT the outbox lock so dispatched intents may
 // enqueue follow-up intents (e.g. a completion effect recording downstream
@@ -848,10 +840,10 @@ func (o *Outbox) releaseOutboxClaimCleanup(ctx context.Context, id, claimer stri
 }
 
 // flushDB claims and dispatches batches of durable rows until no more rows
-// are claimable, dispatching exactly the items this flusher owns: its fresh
-// claims plus local-only items. Claiming before each batch is what keeps
-// concurrent replicas on disjoint work while still draining follow-up
-// intents queued during dispatch.
+// are claimable, dispatching exactly the items this flusher's fresh claim
+// covers. Claiming before each batch is what keeps concurrent replicas on
+// disjoint work while still draining follow-up intents queued during
+// dispatch.
 func (o *Outbox) flushDB(ctx context.Context, dispatch func(context.Context, forge.OutboxItem) error) (int, error) {
 	total := 0
 	for batch := 0; batch < outboxFlushMaxBatches; batch++ {
@@ -876,8 +868,9 @@ func (o *Outbox) flushDBBatch(ctx context.Context, dispatch func(context.Context
 	if err != nil {
 		return 0, 0, err
 	}
-	// Even with an empty claim, local-only items (durable append failed at
-	// enqueue time) are dispatched below: they have no row to claim.
+	// owned holds exactly the rows this flush claimed: a resident item that
+	// is not in it (mirrored by ReplayDB, or held by another replica's
+	// claim) must not be dispatched by this flusher.
 	owned := make(map[string]bool, len(claimed))
 	o.mu.Lock()
 	known := make(map[string]bool, len(o.items))
@@ -929,7 +922,7 @@ func (o *Outbox) flushDBBatch(ctx context.Context, dispatch func(context.Context
 		o.mu.Lock()
 		idx := -1
 		for i, it := range o.items {
-			if owned[it.ID] || o.localOnly[it.ID] {
+			if owned[it.ID] {
 				idx = i
 				break
 			}
@@ -983,7 +976,6 @@ func (o *Outbox) flushDBBatch(ctx context.Context, dispatch func(context.Context
 		o.removeLocked(it.ID)
 		o.done[it.ID] = true
 		o.recordDeliveredLocked(it)
-		delete(o.localOnly, it.ID)
 		dispatched++
 		o.mu.Unlock()
 	}
@@ -1052,10 +1044,12 @@ func (o *Outbox) removeLocked(id string) {
 }
 
 // pruneDB drops local copies of rows another replica has acknowledged, so
-// the in-memory queue does not grow without bound in HA. Local-only items
-// (no durable row) are never pruned. The live set is the SAME due-only set
-// ReplayDB mirrors (dbMirrorItems), so a row that stopped being dispatchable
-// (retry backoff) is not kept resident, and a dead letter is dropped.
+// the in-memory queue does not grow without bound in HA. The live set is the
+// SAME due-only set ReplayDB mirrors (dbMirrorItems), so a row that stopped
+// being dispatchable (retry backoff) is not kept resident, and a dead letter
+// is dropped. Every resident DB-mode item corresponds to a durable row (a
+// durable append failure never queues anything), so an item with no live row
+// is stale by definition and is pruned too.
 func (o *Outbox) pruneDB(ctx context.Context) {
 	pending, err := o.dbMirrorItems(ctx)
 	if err != nil {
@@ -1069,7 +1063,7 @@ func (o *Outbox) pruneDB(ctx context.Context) {
 	defer o.mu.Unlock()
 	kept := o.items[:0]
 	for _, it := range o.items {
-		if live[it.ID] || o.localOnly[it.ID] {
+		if live[it.ID] {
 			kept = append(kept, it)
 		}
 	}

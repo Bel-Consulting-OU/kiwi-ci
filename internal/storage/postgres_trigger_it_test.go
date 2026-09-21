@@ -128,7 +128,7 @@ func linkSeed(t *testing.T, st *PostgresStore, ids *boomerIds) {
 
 func sidecarSeed(t *testing.T, st *PostgresStore, ids *boomerIds) {
 	t.Helper()
-	if err := st.RememberPendingSidecar(context.Background(), ids.job, "bin", ArtifactSidecarKindSBOM, memDigest); err != nil {
+	if err := st.RememberPendingSidecar(context.Background(), ids.job, 1, "bin", ArtifactSidecarKindSBOM, memDigest); err != nil {
 		t.Fatalf("pending sidecar: %v", err)
 	}
 }
@@ -429,18 +429,13 @@ func TestPostgresIntegrationTriggeredSQLErrors(t *testing.T) {
 			}
 		}},
 		"artifact_pending_sidecars/Remember": {"artifact_pending_sidecars", func(t *testing.T, st *PostgresStore, ids *boomerIds) {
-			if err := st.RememberPendingSidecar(ctx, ids.job, "bin", ArtifactSidecarKindSBOM, memDigest); err == nil {
+			if err := st.RememberPendingSidecar(ctx, ids.job, 1, "bin", ArtifactSidecarKindSBOM, memDigest); err == nil {
 				t.Fatal("expected the pending sidecar upsert to fail")
 			}
 		}},
 		"artifact_pending_sidecars/Consume": {"artifact_pending_sidecars", func(t *testing.T, st *PostgresStore, ids *boomerIds) {
-			if err := st.ConsumePendingSidecar(ctx, ids.job, "bin", ArtifactSidecarKindSBOM, memDigest); err == nil {
+			if err := st.ConsumePendingSidecar(ctx, ids.job, 1, "bin", ArtifactSidecarKindSBOM, memDigest); err == nil {
 				t.Fatal("expected the pending sidecar delete to fail")
-			}
-		}},
-		"artifact_pending_sidecars/Delete": {"artifact_pending_sidecars", func(t *testing.T, st *PostgresStore, ids *boomerIds) {
-			if err := st.DeletePendingSidecars(ctx, ids.job); err == nil {
-				t.Fatal("expected the pending sidecar sweep to fail")
 			}
 		}},
 		"artifact_pending_sidecars/Prune": {"artifact_pending_sidecars", func(t *testing.T, st *PostgresStore, ids *boomerIds) {
@@ -570,7 +565,7 @@ func TestPostgresIntegrationDroppedTableReadErrors(t *testing.T) {
 			return err
 		}},
 		"PendingSidecar": {"artifact_pending_sidecars", func(t *testing.T, st *PostgresStore, ids *boomerIds) error {
-			_, _, err := st.PendingSidecar(ctx, ids.job, "bin", ArtifactSidecarKindSBOM)
+			_, _, err := st.PendingSidecar(ctx, ids.job, 1, "bin", ArtifactSidecarKindSBOM)
 			return err
 		}},
 		"LoadTestHistory": {"test_history", func(t *testing.T, st *PostgresStore, ids *boomerIds) error {

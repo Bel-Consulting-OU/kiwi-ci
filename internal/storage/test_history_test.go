@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -176,5 +177,138 @@ func TestMemStoreIncrementalHistoryScoped(t *testing.T) {
 	// trigger).
 	if v, stats, err := m.LoadRepoTestHistory(ctx, "github.com/o/missing"); err != nil || v != 0 || stats != nil {
 		t.Fatalf("missing repo history = %d/%v/%v; want 0/nil/nil", v, stats, err)
+	}
+}
+
+// TestEncodeTestHistoryStatsV2KeysUnambiguous is the aggregate-side key
+// round-trip: every part may contain "|", unicode, be empty or whitespace-only
+// without another identity's key colliding, because the encoder writes the
+// structured v2 key. The encoded stats must load through the legacy history
+// reader (testintel.LoadHistory) and answer Manifest/Flaky correctly.
+func TestEncodeTestHistoryStatsV2KeysUnambiguous(t *testing.T) {
+	rows := []TestHistoryAggregate{
+		{RepoID: "github.com/o/r|x", Suite: "suite|part", Class: "cl|ass", Name: "na|me",
+			Runs: 2, Passes: 1, Fails: 1, EWMA: 1, FlakeProb: 0.5, Outcomes: []bool{false, true}},
+		{RepoID: "github.com/o/r", Suite: "suite", Class: "cl", Name: "ass|na|me",
+			Runs: 2, Passes: 2, EWMA: 2, FlakeProb: 0},
+		{RepoID: "github.com/o/r", Suite: "suite", Class: "", Name: " ",
+			Runs: 1, Passes: 1, EWMA: 3, FlakeProb: 0},
+		{RepoID: "github.com/уни/код", Suite: "тест", Class: "класс", Name: "имя🚀",
+			Runs: 1, Passes: 0, Fails: 1, EWMA: 4, FlakeProb: 0},
+	}
+	stats, err := EncodeTestHistoryStats(rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]testintel.TestStat
+	if err := json.Unmarshal(stats, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded) != len(rows) {
+		t.Fatalf("encoded %d keys from %d rows (collision): %s", len(decoded), len(rows), stats)
+	}
+	for key := range decoded {
+		if !strings.HasPrefix(key, "v2:") {
+			t.Fatalf("aggregate key %q is not the v2 encoding", key)
+		}
+	}
+	// The structured key survives the history-file reader: load the encoded
+	// stats as a file and read the exact identities back.
+	path := filepath.Join(t.TempDir(), "history.json")
+	if err := os.WriteFile(path, stats, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h, err := testintel.LoadHistory(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := h.Manifest("github.com/o/r|x", "suite|part"); !reflect.DeepEqual(got, []string{"cl|ass.na|me"}) {
+		t.Fatalf("manifest through the aggregate encoder = %v", got)
+	}
+	if got := h.Manifest("github.com/o/r", "suite"); !reflect.DeepEqual(got, []string{" ", "cl.ass|na|me"}) {
+		t.Fatalf("second repo manifest = %v", got)
+	}
+	if got := h.Flaky("github.com/o/r|x"); !reflect.DeepEqual(got, []string{"cl|ass.na|me"}) {
+		t.Fatalf("flaky through the aggregate encoder = %v", got)
+	}
+	if got := h.Flaky("github.com/o/r"); len(got) != 0 {
+		t.Fatalf("unrelated repo flaky = %v", got)
+	}
+	// The pre-v2 join would have collided these two identities; assert they
+	// are distinct keys now.
+	if testintel.EncodeHistoryKey("a|b", "s", "c", "n") == testintel.EncodeHistoryKey("a", "b|s", "c", "n") {
+		t.Fatal("structured keys collided across part boundaries")
+	}
+}
+
+// TestTestHistoryAggregateKeyStructured pins the rebuild map key against
+// in-band-separator collisions.
+func TestTestHistoryAggregateKeyStructured(t *testing.T) {
+	if testHistoryAggregateKey("a|b", "c", "d") == testHistoryAggregateKey("a", "b|c", "d") {
+		t.Fatal("rebuild map key collided across part boundaries")
+	}
+	if !strings.HasPrefix(testHistoryAggregateKey("s", "c", "n"), "v2:") {
+		t.Fatal("rebuild map key is not structured")
+	}
+}
+
+// TestMemStoreFlakyWindowAndRepoPaging mirrors the SQL defects in memory: the
+// flaky predicate is the window-derived flake probability (not lifetime
+// counters), and ListTestHistoryRepoIDs returns the complete enumeration for
+// any page size (the SQL store loops its keyset pages to the same result).
+func TestMemStoreFlakyWindowAndRepoPaging(t *testing.T) {
+	ctx := context.Background()
+	m := newMemStore()
+	base := time.Now().UTC()
+	repo := "github.com/o/a"
+	m.runs["run-a"] = model.Run{ID: "run-a", RepoID: repo, RepoFullName: "o/a"}
+	// One failure, then a clean 16-outcome window.
+	if _, err := m.InsertTestReportWithHistory(ctx, model.TestReport{ID: "r0", RunID: "run-a", JobKey: "build",
+		CreatedAt: base, Cases: []model.TestResult{{Name: "t", Passed: false}}}, repo); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < testintel.OutcomeWindow; i++ {
+		if _, err := m.InsertTestReportWithHistory(ctx, model.TestReport{ID: "rp" + itoa64(int64(i)), RunID: "run-a", JobKey: "build",
+			CreatedAt: base.Add(time.Duration(i+1) * time.Second), Cases: []model.TestResult{{Name: "t", Passed: true}}}, repo); err != nil {
+			t.Fatal(err)
+		}
+	}
+	flaky, err := m.FlakyTestNames(ctx, []string{repo}, 100)
+	if err != nil || len(flaky) != 0 {
+		t.Fatalf("memStore flaky after clean window = %v, %v; want none", flaky, err)
+	}
+	// A fresh failure restores it.
+	if _, err := m.InsertTestReportWithHistory(ctx, model.TestReport{ID: "rf", RunID: "run-a", JobKey: "build",
+		CreatedAt: base.Add(time.Minute), Cases: []model.TestResult{{Name: "t", Passed: false}}}, repo); err != nil {
+		t.Fatal(err)
+	}
+	flaky, err = m.FlakyTestNames(ctx, []string{repo}, 100)
+	if err != nil || !reflect.DeepEqual(flaky, []string{"t"}) {
+		t.Fatalf("memStore flaky after fresh failure = %v, %v; want [t]", flaky, err)
+	}
+
+	// Pagination contract: every repository is enumerated regardless of the
+	// page size (the SQL store pages internally; the result is identical).
+	for i := 0; i < 5; i++ {
+		id := "github.com/o/p" + itoa64(int64(i))
+		runID := "run-p" + itoa64(int64(i))
+		m.runs[runID] = model.Run{ID: runID, RepoID: id, RepoFullName: "o/p" + itoa64(int64(i))}
+		if _, err := m.InsertTestReportWithHistory(ctx, model.TestReport{ID: "rep-" + runID, RunID: runID, JobKey: "build",
+			CreatedAt: base, Cases: []model.TestResult{{Name: "x", Passed: true}}}, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	full, err := m.ListTestHistoryRepoIDs(ctx, 0)
+	if err != nil || len(full) != 6 {
+		t.Fatalf("full enumeration = %v, %v; want 6 repositories", full, err)
+	}
+	small, err := m.ListTestHistoryRepoIDs(ctx, 2)
+	if err != nil || !reflect.DeepEqual(small, full) {
+		t.Fatalf("small-page enumeration = %v, %v; want the identical complete list %v", small, err, full)
+	}
+	sorted := append([]string(nil), full...)
+	sort.Strings(sorted)
+	if !reflect.DeepEqual(full, sorted) {
+		t.Fatalf("enumeration is not ascending: %v", full)
 	}
 }

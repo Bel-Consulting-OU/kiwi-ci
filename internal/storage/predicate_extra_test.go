@@ -218,20 +218,23 @@ func TestCompletionEffectIDsAreDeterministic(t *testing.T) {
 func TestPendingSidecarValidationHelpers(t *testing.T) {
 	jobID := "0123456789abcdef0123456789abcdef"
 	digest := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-	if err := validatePendingSidecarKey(jobID, "bin", ArtifactSidecarKindSBOM); err != nil {
+	if err := validatePendingSidecarKey(jobID, 1, "bin", ArtifactSidecarKindSBOM); err != nil {
 		t.Fatalf("valid sbom key: %v", err)
 	}
-	if err := validatePendingSidecarKey(jobID, "bin", ArtifactSidecarKindSigstore); err != nil {
+	if err := validatePendingSidecarKey(jobID, 1, "bin", ArtifactSidecarKindSigstore); err != nil {
 		t.Fatalf("valid sigstore key: %v", err)
 	}
-	if err := validatePendingSidecarKey("bad", "bin", ArtifactSidecarKindSBOM); err == nil {
+	if err := validatePendingSidecarKey("bad", 1, "bin", ArtifactSidecarKindSBOM); err == nil {
 		t.Fatal("invalid job id must fail")
 	}
-	if err := validatePendingSidecarKey(jobID, "  ", ArtifactSidecarKindSBOM); err == nil {
+	if err := validatePendingSidecarKey(jobID, 1, "  ", ArtifactSidecarKindSBOM); err == nil {
 		t.Fatal("empty artifact name must fail")
 	}
-	if err := validatePendingSidecarKey(jobID, "bin", "pbom"); err == nil {
+	if err := validatePendingSidecarKey(jobID, 1, "bin", "pbom"); err == nil {
 		t.Fatal("invalid kind must fail")
+	}
+	if err := validatePendingSidecarKey(jobID, -1, "bin", ArtifactSidecarKindSBOM); err == nil {
+		t.Fatal("negative generation must fail")
 	}
 	if err := validatePendingSidecarDigest(digest); err != nil {
 		t.Fatalf("valid digest: %v", err)

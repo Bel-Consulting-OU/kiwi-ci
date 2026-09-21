@@ -514,7 +514,9 @@ func TestRouteWalkCatchesUnclassifiedRoute(t *testing.T) {
 // TestDottedOrgVisibilityStaysStrict pins the server-side counterpart of
 // the canonical-shape rule: a run on a dotted-org repository
 // (gitlab.example/acme.co/service) is invisible to a principal whose map
-// only declares a single-segment alias "service".
+// only declares a single-segment alias "service". canReadRepo and
+// repoVisibleByName (the auth.CanReadRepo wrappers) must agree with the
+// canonical auth resolution.
 func TestDottedOrgVisibilityStaysStrict(t *testing.T) {
 	aliasPrincipal := auth.Principal{Subject: "alias", Repositories: map[string]auth.RepositoryPermission{
 		"service": {Read: true},
@@ -527,8 +529,8 @@ func TestDottedOrgVisibilityStaysStrict(t *testing.T) {
 	s := &Server{}
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/runs", nil)
 	req = req.WithContext(auth.WithPrincipal(req.Context(), aliasPrincipal))
-	if s.repoVisible(req, run) {
-		t.Fatal("single-segment alias made a dotted-org run visible")
+	if s.canReadRepo(req, repoIDForRun(run)) {
+		t.Fatal("single-segment alias made a dotted-org run readable")
 	}
 	// repoVisibleByName has no alias entry for the literal name either.
 	if s.repoVisibleByName(req, "acme.co/service") {
@@ -540,7 +542,7 @@ func TestDottedOrgVisibilityStaysStrict(t *testing.T) {
 	}}
 	req2 := httptest.NewRequest(http.MethodGet, "/api/v1/runs", nil)
 	req2 = req2.WithContext(auth.WithPrincipal(req2.Context(), literal))
-	if !s.repoVisible(req2, run) {
+	if !s.canReadRepo(req2, repoIDForRun(run)) {
 		t.Fatal("literal dotted-org alias must see its run")
 	}
 	// A canonical principal for the exact identity also sees it.
@@ -549,11 +551,12 @@ func TestDottedOrgVisibilityStaysStrict(t *testing.T) {
 	}}
 	req3 := httptest.NewRequest(http.MethodGet, "/api/v1/runs", nil)
 	req3 = req3.WithContext(auth.WithPrincipal(req3.Context(), canon))
-	if !s.repoVisible(req3, run) {
+	if !s.canReadRepo(req3, repoIDForRun(run)) {
 		t.Fatal("canonical dotted-org principal must see the run")
 	}
-	// authorizeRepo: the bare alias must not authorize the dotted run.
-	if authorizeRepo(aliasPrincipal, auth.ActionRead, repoIDForRun(run), false) {
-		t.Fatal("authorizeRepo honored a single-segment alias for a dotted org")
+	// The shared auth resolution: the bare alias must not authorize the
+	// dotted run.
+	if auth.CanReadRepo(aliasPrincipal, repoIDForRun(run)) {
+		t.Fatal("auth.CanReadRepo honored a single-segment alias for a dotted org")
 	}
 }

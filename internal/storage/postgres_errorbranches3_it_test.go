@@ -371,7 +371,7 @@ func TestPostgresIntegrationMiscValidationBranches(t *testing.T) {
 		t.Fatal("invalid generated job id must fail")
 	}
 	// ConsumePendingSidecar validates the digest.
-	if err := st.ConsumePendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSBOM, "short"); err == nil {
+	if err := st.ConsumePendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM, "short"); err == nil {
 		t.Fatal("invalid digest must fail")
 	}
 	// nullBytes distinguishes empty from non-empty input.

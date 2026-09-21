@@ -14,20 +14,42 @@ import (
 
 // RemoteRegistry resolves digest-pinned component refs from a remote
 // component registry HTTP API. Transport security is strict: the base URL
-// must be https:// and the client never follows redirects, so bearer
-// credentials cannot leak to another origin. Registry responses are
-// bounded at 1 MiB.
+// must be a canonical https:// URL with no userinfo, query or fragment, and
+// the client never follows redirects, so bearer credentials cannot leak to
+// another origin. Each registry response is read to at most 1 MiB and must
+// be a single complete JSON value: oversize responses and trailing material
+// after that value are rejected before the spec is decoded.
 type RemoteRegistry struct {
 	BaseURL string
 	Token   string
 	Client  *http.Client
 }
 
-// maxRegistryResponseBytes bounds one registry spec response.
+// maxRegistryResponseBytes bounds one registry spec response: the total
+// bytes read from the response body, not just the prefix a decoder happens
+// to consume.
 const maxRegistryResponseBytes = 1 << 20
 
+// defaultRegistryTimeout bounds every registry request when the caller did
+// not configure a timeout on their own client.
+const defaultRegistryTimeout = 20 * time.Second
+
 // NewRemoteRegistry validates the base URL and returns a registry client.
-// http:// base URLs are rejected outright (strict HTTPS).
+// http:// base URLs are rejected outright (strict HTTPS), and so are
+// userinfo, query and fragment components: credentials belong in the
+// Authorization header (never in a URL that gets logged), and a query or
+// fragment would silently survive into every derived request URL. The
+// scheme must be spelled in canonical lowercase.
+//
+// Case and percent-encoding cannot bypass these rules. net/url lowercases
+// the scheme before it is compared, so an upper-case "HTTPS://" still
+// requires TLS; the explicit prefix check additionally rejects the
+// non-canonical spelling because BaseURL is concatenated and logged
+// verbatim. Percent-encoded delimiters cannot fabricate components either:
+// only literal '?', '#', '@' and ':' delimit a URL's query, fragment,
+// userinfo and scheme, so encoded forms (for example "%3F" inside a path)
+// remain path data that is sent verbatim, while a malformed escape makes
+// url.Parse fail closed.
 func NewRemoteRegistry(baseURL, token string) (*RemoteRegistry, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
@@ -39,19 +61,42 @@ func NewRemoteRegistry(baseURL, token string) (*RemoteRegistry, error) {
 	if u.Host == "" {
 		return nil, fmt.Errorf("components: remote registry URL has no host: %q", baseURL)
 	}
+	if u.User != nil {
+		return nil, fmt.Errorf("components: remote registry URL must not carry userinfo: %q", baseURL)
+	}
+	if u.RawQuery != "" || u.ForceQuery {
+		return nil, fmt.Errorf("components: remote registry URL must not carry a query: %q", baseURL)
+	}
+	if u.Fragment != "" {
+		return nil, fmt.Errorf("components: remote registry URL must not carry a fragment: %q", baseURL)
+	}
+	if !strings.HasPrefix(baseURL, "https://") {
+		return nil, fmt.Errorf("components: remote registry URL must be spelled with a lowercase https:// scheme: %q", baseURL)
+	}
 	return &RemoteRegistry{BaseURL: strings.TrimRight(baseURL, "/"), Token: token}, nil
 }
 
+// client returns the HTTP client used for registry requests. It always
+// returns a hardened copy of the configured client (which may be nil):
+// caller-supplied transport, TLS configuration, proxy, cookie jar and
+// headers are preserved because they carry no transport *policy*, but the
+// policy fields are enforced unconditionally. A Timeout that is unset
+// (zero or negative, i.e. no deadline) becomes defaultRegistryTimeout, and
+// CheckRedirect always refuses redirects with http.ErrUseLastResponse so a
+// 3xx cannot carry the bearer token to another origin. The caller's
+// *http.Client is copied, never mutated.
 func (r *RemoteRegistry) client() *http.Client {
+	var c http.Client
 	if r.Client != nil {
-		return r.Client
+		c = *r.Client
 	}
-	return &http.Client{
-		Timeout: 20 * time.Second,
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
+	if c.Timeout <= 0 {
+		c.Timeout = defaultRegistryTimeout
 	}
+	c.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &c
 }
 
 // Resolve fetches the component named by a validated digest-pinned ref and
@@ -83,8 +128,21 @@ func (r *RemoteRegistry) Resolve(ctx context.Context, ref string) (Spec, string,
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return Spec{}, "", fmt.Errorf("components: registry %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
+	// Read one byte past the bound so an exactly-at-limit body is accepted
+	// while anything larger is rejected: a streaming decoder would instead
+	// stop at the limit and silently ignore trailing material, so the limit
+	// would bound only the consumed prefix, not the response.
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxRegistryResponseBytes+1))
+	if err != nil {
+		return Spec{}, "", fmt.Errorf("components: read %s: %w", name, err)
+	}
+	if len(raw) > maxRegistryResponseBytes {
+		return Spec{}, "", fmt.Errorf("components: decode %s: response exceeds the %d-byte limit", name, maxRegistryResponseBytes)
+	}
+	// json.Unmarshal, unlike a streaming Decoder, rejects any non-whitespace
+	// material after the top-level JSON value.
 	var spec Spec
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxRegistryResponseBytes)).Decode(&spec); err != nil {
+	if err := json.Unmarshal(raw, &spec); err != nil {
 		return Spec{}, "", fmt.Errorf("components: decode %s: %w", name, err)
 	}
 	digest, err := Digest(spec)

@@ -244,78 +244,101 @@ func (s *Server) commitTestintelHistory() error {
 	return os.Rename(s.historyFile+".tmp", s.historyFile)
 }
 
-// mirrorTestReportHistoryDB folds one ALREADY DURABLY COMMITTED report into
-// THIS repository's cached snapshot. In the aggregate-store path the durable
-// aggregate was updated in the same transaction as the report (see
-// storage.TestHistoryAggregateStore.InsertTestReportWithHistory), so this is
-// a local mirror only: it makes the new data visible immediately without any
-// database work, and it deliberately marks the entry stale so the next read
-// reloads the repository's durable aggregates. The fold is the one mutation
-// a cached snapshot can see; it only ever adds THIS repository's observations
-// under the cache mutex (testintel.History is itself safe for concurrent
-// use), so it can never introduce another repository's data into a response.
-// An empty repository key is never mirrored: it would merge unrelated
-// repositories' history.
-func (s *Server) mirrorTestReportHistoryDB(repo string, rep model.TestReport) {
+// mirrorTestReportHistoryDB marks THIS repository's cached snapshot stale
+// after an upload whose report and history aggregates ALREADY committed in
+// one durable transaction (see
+// storage.TestHistoryAggregateStore.InsertTestReportWithHistory). The cached
+// snapshot is IMMUTABLE for readers, so the mirror never folds into it: a
+// request that took the pointer keeps answering Shard, Manifest and Flaky
+// from its own generation for the whole response, even while a same-or
+// other-repository upload commits. The stale marker makes the next
+// historyForRepo reload the repository's durable aggregates and atomically
+// swap in a freshly decoded pointer; if the store is temporarily down the old
+// immutable snapshot keeps serving. An empty repository key is never mirrored:
+// it would mask unrelated repositories' history.
+func (s *Server) mirrorTestReportHistoryDB(repo string) {
 	if repo == "" {
 		return
 	}
 	s.historyCache.update(repo, func(e *repoHistoryCacheEntry) {
 		e.version = historyStaleVersion
-		for _, c := range rep.Cases {
-			e.history.Record(repo, rep.JobKey, c.Class, c.Name, c.Duration, c.Passed, rep.CreatedAt)
-		}
 	})
 }
 
+// foldReportCases records every case of rep under repo into h. h must be
+// privately owned by the caller (a clone): the fold is the mutation that must
+// never reach a published snapshot.
+func foldReportCases(h *testintel.History, repo string, rep model.TestReport) {
+	for _, c := range rep.Cases {
+		h.Record(repo, rep.JobKey, c.Class, c.Name, c.Duration, c.Passed, rep.CreatedAt)
+	}
+}
+
 // recordTestReportHistory is the LEGACY-store and memory-mode history write.
+// Both branches publish a NEW snapshot (copy-on-write): the report's cases
+// are folded into a deep clone of the current snapshot, never into the
+// snapshot itself, so a concurrent test-intelligence reader that already took
+// the previous pointer can neither observe the fold nor have its generation
+// change under it.
+//
 // In memory mode the history file under dataDir is the durable store: the
-// fold and its staged-then-renamed file commit run in one critical section
-// (s.mu, as before, so concurrent test-intelligence readers holding s.mu
-// cannot observe a report without its history), with the cache mutex taken
-// inside s.mu. A DB store without the incremental aggregate contract falls
-// back to the explicit full rebuild (the documented maintenance path); the
-// production PostgresStore implements the aggregate contract, so an upload
-// never rebuilds the whole history. ctx is the request context: a canceled
-// request performs no durable write (the legacy rebuild logs and aborts).
+// clone's staged-then-renamed file commit runs in one critical section (s.mu,
+// as before, so concurrent test-intelligence readers holding s.mu cannot
+// observe a report without its history), with the cache mutex taken inside
+// s.mu, and the clone is published ONLY after the commit SUCCEEDED. On a
+// failed save or commit the old snapshot keeps serving and the failure is
+// logged: mutation is never visible without durability.
+//
+// A DB store without the incremental aggregate contract falls back to the
+// explicit full rebuild (the documented maintenance path); the production
+// PostgresStore implements the aggregate contract, so an upload never
+// rebuilds the whole history. ctx is the request context: a canceled request
+// performs no durable write (the legacy rebuild logs and aborts).
 func (s *Server) recordTestReportHistory(ctx context.Context, repo string, rep model.TestReport) {
 	if s.DB != nil {
-		// Legacy store: fold locally so this instance serves the new data,
-		// then repair the shared cache from the committed reports.
+		// Legacy store: the report is already durable, so folding a clone
+		// locally makes this instance serve the new data immediately, then
+		// the shared cache is repaired from the committed reports.
 		s.historyCache.update(historyWholeCacheKey, func(e *repoHistoryCacheEntry) {
-			for _, c := range rep.Cases {
-				e.history.Record(repo, rep.JobKey, c.Class, c.Name, c.Duration, c.Passed, rep.CreatedAt)
-			}
+			next := e.history.Clone()
+			foldReportCases(next, repo, rep)
+			e.history = next
 		})
 		s.rebuildTestHistoryDB(ctx)
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.historyCache.update(historyWholeCacheKey, func(e *repoHistoryCacheEntry) {
-		for _, c := range rep.Cases {
-			e.history.Record(repo, rep.JobKey, c.Class, c.Name, c.Duration, c.Passed, rep.CreatedAt)
-		}
-		if err := s.saveTestintelHistory(e.history); err != nil {
-			s.logError("test history: save failed", "error", err.Error())
-		} else if err := s.commitTestintelHistory(); err != nil {
-			s.logError("test history: commit failed", "error", err.Error())
-		}
-	})
+	entry := repoHistoryCacheEntry{}
+	if cached, hit := s.historyCache.lookup(historyWholeCacheKey); hit {
+		entry = cached
+	}
+	next := entry.historyOrNew().Clone()
+	foldReportCases(next, repo, rep)
+	if err := s.saveTestintelHistory(next); err != nil {
+		s.logError("test history: save failed", "error", err.Error())
+		return
+	}
+	if err := s.commitTestintelHistory(); err != nil {
+		s.logError("test history: commit failed", "error", err.Error())
+		return
+	}
+	entry.history = next
+	s.historyCache.store(historyWholeCacheKey, entry)
 }
 
-// maintenanceRepoLimit bounds the explicit repair/rebuild enumeration.
-const maintenanceRepoLimit = 1000
-
 // rebuildTestHistoryDB is the EXPLICIT maintenance/repair operation (never
-// called per upload). With an incremental aggregate store it rebuilds every
-// repository's aggregates through the bounded per-repository repair; with a
-// legacy TestHistoryStore it recomputes the serialized cache from all
-// durable reports exactly as the pre-0026 code did. A failure only logs: the
-// durable reports are untouched and the cached snapshots keep serving.
+// called per upload). With an incremental aggregate store it enumerates and
+// rebuilds EVERY repository through the bounded per-repository repair: the
+// store's keyset pagination returns every repository across as many bounded
+// pages as it takes (the page size is a bound on one query, never a cap on
+// the enumeration). With a legacy TestHistoryStore it recomputes the
+// serialized cache from all durable reports exactly as the pre-0026 code
+// did. A failure only logs: the durable reports are untouched and the cached
+// snapshots keep serving.
 func (s *Server) rebuildTestHistoryDB(ctx context.Context) {
 	if agg, ok := s.DB.(storage.TestHistoryAggregateStore); ok {
-		repos, err := agg.ListTestHistoryRepoIDs(ctx, maintenanceRepoLimit)
+		repos, err := agg.ListTestHistoryRepoIDs(ctx, storage.TestHistoryRepoPageSize)
 		if err != nil {
 			s.logError("test history: list repositories failed", "error", err.Error())
 			return

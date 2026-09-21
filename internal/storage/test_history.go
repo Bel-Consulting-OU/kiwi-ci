@@ -38,22 +38,28 @@ import (
 var _ TestHistoryAggregateStore = (*PostgresStore)(nil)
 
 // testHistoryAggregateKey is the deterministic in-memory key for one
-// aggregate row while rebuilding.
+// aggregate row while rebuilding. It uses the same structured encoding as the
+// persisted stats (see testintel.EncodeHistoryKey) with an empty repository,
+// so the rebuild map can never merge two distinct test identities whose
+// fields contain the old in-band separator.
 func testHistoryAggregateKey(suite, class, name string) string {
-	return suite + "\x00" + class + "\x00" + name
+	return testintel.EncodeHistoryKey("", suite, class, name)
 }
 
-// EncodeTestHistoryStats renders aggregate rows as the legacy stats JSON: a
-// map keyed "repo|suite|class|name" whose values carry the same JSON tags as
+// EncodeTestHistoryStats renders aggregate rows as the stats JSON: a map
+// keyed by the canonical v2 history key (testintel.EncodeHistoryKey, the
+// unambiguous structured form) whose values carry the same JSON tags as
 // testintel.TestStat. It is the single encoder shared by the SQL load path
-// and the in-memory stores, so every reader sees one shape.
+// and the in-memory stores, so every reader sees one shape and a part
+// containing "|" can never be mis-split. Legacy keys are still READ
+// (testintel.LoadHistory decodes both forms); new writes are v2 only.
 func EncodeTestHistoryStats(rows []TestHistoryAggregate) ([]byte, error) {
 	if len(rows) == 0 {
 		return nil, nil
 	}
 	stats := make(map[string]testintel.TestStat, len(rows))
 	for _, r := range rows {
-		stats[r.RepoID+"|"+r.Suite+"|"+r.Class+"|"+r.Name] = testintel.TestStat{
+		stats[testintel.EncodeHistoryKey(r.RepoID, r.Suite, r.Class, r.Name)] = testintel.TestStat{
 			Runs:        int(r.Runs),
 			Passes:      int(r.Passes),
 			Fails:       int(r.Fails),
@@ -348,9 +354,12 @@ func (s *PostgresStore) TestReportTotals(ctx context.Context, repoIDs []string, 
 }
 
 // FlakyTestNames returns the sorted, deduplicated class-qualified test names
-// that both passed and failed among the resolved repositories, bounded by
-// limit. Ordering is deterministic (rendered name, then suite) before the
-// bound is applied.
+// that are flaky inside their 16-outcome window among the resolved
+// repositories, bounded by limit. The predicate is the window-derived
+// flake_prob > 0 — the SAME rule as testintel.History.Flaky — not the
+// lifetime passes/fails counters, so a test that failed long ago and passed
+// its whole window drops out. Ordering is deterministic (rendered name, then
+// suite) before the bound is applied.
 func (s *PostgresStore) FlakyTestNames(ctx context.Context, repoIDs []string, limit int) ([]string, error) {
 	if len(repoIDs) == 0 {
 		return []string{}, nil
@@ -359,7 +368,7 @@ func (s *PostgresStore) FlakyTestNames(ctx context.Context, repoIDs []string, li
 		limit = 1000
 	}
 	rows, err := s.pool.Query(ctx, `SELECT suite, test_class, test_name FROM test_history_aggregates
-		WHERE repo_id = ANY($1::text[]) AND passes > 0 AND fails > 0
+		WHERE repo_id = ANY($1::text[]) AND flake_prob > 0
 		ORDER BY (CASE WHEN test_class = '' THEN test_name ELSE test_class || '.' || test_name END), suite, test_name
 		LIMIT $2`, repoIDs, limit)
 	if err != nil {
@@ -515,32 +524,60 @@ func rebuildRepoTestHistoryTx(ctx context.Context, tx pgx.Tx, repoID string) err
 	return nil
 }
 
-// ListTestHistoryRepoIDs returns the canonical repository IDs that have
-// durable reports, in id order and bounded by limit. It lets the explicit
-// maintenance rebuild enumerate the repositories it should repair. Legacy
-// runs (no repo_id/policy_repo_id) resolve through the same canonical
-// policy-first expression the scoped reads and the rebuild use, so their
-// repositories are listed too (a purely stored-identity enumeration would
-// omit every pre-RepoID repository and never repair it).
+// TestHistoryRepoPageSize is the default keyset page size of the repository
+// enumeration (ListTestHistoryRepoIDs). A page bounds ONE query; it is not a
+// cap on the enumeration: the method keeps requesting pages with a strict
+// keyset cursor until a short page proves the end, so a maintenance rebuild
+// repairs every repository that has durable reports.
+const TestHistoryRepoPageSize = 500
+
+// ListTestHistoryRepoIDs returns EVERY canonical repository ID that has
+// durable reports, in ascending id order. limit is the keyset page size (a
+// non-positive value selects TestHistoryRepoPageSize): each query is
+// `WHERE <canonical repo> > $after ORDER BY 1 LIMIT $page` and the loop
+// continues until a page shorter than the bound, so no repository is ever
+// left out by a magic enumeration cap. Legacy runs (no
+// repo_id/policy_repo_id) resolve through the same canonical policy-first
+// expression the scoped reads and the rebuild use, so their repositories are
+// listed too (a purely stored-identity enumeration would omit every
+// pre-RepoID repository and never repair it).
 func (s *PostgresStore) ListTestHistoryRepoIDs(ctx context.Context, limit int) ([]string, error) {
-	if limit <= 0 || limit > 10000 {
-		limit = 1000
+	page := limit
+	if page <= 0 {
+		page = TestHistoryRepoPageSize
 	}
-	rows, err := s.pool.Query(ctx, `SELECT DISTINCT `+canonicalPolicyRepoIDSQLExprOn("r.payload", "repo")+`
-		FROM test_results tr JOIN runs r ON r.id = tr.run_id
-		WHERE `+canonicalPolicyRepoIDSQLExprOn("r.payload", "repo")+` <> ''
-		ORDER BY 1 LIMIT $1`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+	repoExpr := canonicalPolicyRepoIDSQLExprOn("r.payload", "repo")
 	out := []string{}
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+	after := ""
+	for {
+		rows, err := s.pool.Query(ctx, `SELECT DISTINCT `+repoExpr+`
+			FROM test_results tr JOIN runs r ON r.id = tr.run_id
+			WHERE `+repoExpr+` <> '' AND `+repoExpr+` > $1
+			ORDER BY 1 LIMIT $2`, after, page)
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, id)
+		n := 0
+		last := ""
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out = append(out, id)
+			last = id
+			n++
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		if n < page {
+			return out, nil
+		}
+		// Strict keyset advance: the next page starts after the last id of
+		// this page, so pages can never overlap or skip ids.
+		after = last
 	}
-	return out, rows.Err()
 }

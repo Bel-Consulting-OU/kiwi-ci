@@ -236,9 +236,10 @@ func TestWaitForDrainTimesOut(t *testing.T) {
 func TestBuildBlobStoreS3(t *testing.T) {
 	cfg := config.BlobConfig{
 		Backend:     "s3",
-		S3Endpoint:  "http://s3.local",
+		S3Endpoint:  "http://127.0.0.1:9000",
 		S3Bucket:    "kiwi-artifacts",
 		S3Region:    "us-east-1",
+		S3PathStyle: true,
 		S3AccessKey: "ak",
 		S3SecretKey: "sk",
 	}
@@ -247,8 +248,11 @@ func TestBuildBlobStoreS3(t *testing.T) {
 	if !ok {
 		t.Fatalf("s3 backend produced %T, want *blob.S3", store)
 	}
-	if s3.Bucket != "kiwi-artifacts" || s3.Region != "us-east-1" || s3.Endpoint != "http://s3.local" {
+	if s3.Bucket != "kiwi-artifacts" || s3.Region != "us-east-1" || s3.Endpoint != "http://127.0.0.1:9000" || !s3.PathStyle {
 		t.Fatalf("s3 config not carried: %+v", s3)
+	}
+	if err := s3.Validate(); err != nil {
+		t.Fatalf("wired s3 store invalid: %v", err)
 	}
 }
 

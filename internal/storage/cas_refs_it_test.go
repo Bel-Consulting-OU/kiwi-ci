@@ -51,7 +51,7 @@ func TestPostgresIntegrationCASReferenceReads(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("put cache manifest: %v", err)
 	}
-	if err := st.RememberPendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSBOM, pendingDigest); err != nil {
+	if err := st.RememberPendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM, pendingDigest); err != nil {
 		t.Fatalf("remember pending sidecar: %v", err)
 	}
 

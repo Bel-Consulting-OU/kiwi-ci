@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -548,23 +549,111 @@ func TestFlowDownstreamFetchPipelineBranches(t *testing.T) {
 
 func TestFlowDownstreamRefreshParentsDB(t *testing.T) {
 	ctx := context.Background()
-	s, f, _, _ := cacheFixture(t)
-	s.DB = &fcStore{dbFakeStore: f, listRunsErr: errors.New("run list down")}
-	s.refreshDownstreamParentsDB(ctx, "child")
 
-	s2, f2, _, _ := cacheFixture(t)
-	f2.mu.Lock()
-	f2.runs["parent"] = model.Run{ID: "parent", Status: model.StatusSuccess, DownstreamRuns: []string{"child"}, CreatedAt: time.Now().UTC()}
-	f2.jobs["p1"] = model.Job{ID: "p1", RunID: "parent", Status: model.StatusSuccess}
-	f2.runs["child"] = model.Run{ID: "child", Status: model.StatusSuccess}
-	f2.mu.Unlock()
-	s2.refreshDownstreamParentsDB(ctx, "child")
-	f2.mu.Lock()
-	parent := f2.runs["parent"]
-	f2.mu.Unlock()
-	if parent.Status != model.StatusSuccess {
-		t.Fatalf("parent after refresh = %s", parent.Status)
+	// The reverse-index read failing is a hard error: the refresh must fail
+	// closed instead of falling back to a bounded run scan.
+	s, f, _, _ := cacheFixture(t)
+	s.DB = &fcStore{dbFakeStore: f, parentRunIDsErr: errors.New("parent lookup down")}
+	if err := s.refreshDownstreamParentsDB(ctx, "child"); err == nil || !strings.Contains(err.Error(), "parent runs for child") {
+		t.Fatalf("refresh with a failing reverse-index read = %v; want a wrapped hard error", err)
 	}
+
+	// A store without the reverse-index contract is refused with a clear
+	// error (never the 10k run scan).
+	s2, f2, _, _ := cacheFixture(t)
+	s2.DB = &storeWithoutReverseIndex{Store: f2}
+	if err := s2.refreshDownstreamParentsDB(ctx, "child"); err == nil || !strings.Contains(err.Error(), "DownstreamParentRunStore") {
+		t.Fatalf("refresh without the reverse-index contract = %v; want a fail-closed error", err)
+	}
+
+	// A launched link resolves the parent run and re-aggregation finalizes
+	// it from the child's outcome.
+	s3, f3, _, _ := cacheFixture(t)
+	f3.mu.Lock()
+	f3.runs["parent"] = model.Run{ID: "parent", Status: model.StatusRunning, DownstreamRuns: []string{"child"}, CreatedAt: time.Now().UTC()}
+	f3.jobs["p1"] = model.Job{ID: "p1", RunID: "parent", Status: model.StatusSuccess}
+	f3.runs["child"] = model.Run{ID: "child", Status: model.StatusFailure}
+	f3.downstreamLinks["p1\x00acme/child\x00refs/heads/main"] = storage.DownstreamLink{ParentJobID: "p1", TargetRepo: "acme/child", TargetRef: "refs/heads/main", ChildRunID: "child"}
+	f3.mu.Unlock()
+	if err := s3.refreshDownstreamParentsDB(ctx, "child"); err != nil {
+		t.Fatalf("refresh = %v", err)
+	}
+	f3.mu.Lock()
+	parent := f3.runs["parent"]
+	f3.mu.Unlock()
+	if parent.Status != model.StatusFailure || parent.FinishedAt == nil {
+		t.Fatalf("parent after refresh = %+v, want finalized failure", parent)
+	}
+
+	// Multiple parents waiting on one child are all resolved and adjusted;
+	// the terminal child (running) reopens a finished parent.
+	s4, f4, _, _ := cacheFixture(t)
+	f4.mu.Lock()
+	f4.runs["parent-a"] = model.Run{ID: "parent-a", Status: model.StatusSuccess, DownstreamRuns: []string{"child"}, FinishedAt: timePtr(time.Now().UTC())}
+	f4.jobs["pa"] = model.Job{ID: "pa", RunID: "parent-a", Status: model.StatusSuccess}
+	f4.runs["parent-b"] = model.Run{ID: "parent-b", Status: model.StatusSuccess, DownstreamRuns: []string{"child"}, FinishedAt: timePtr(time.Now().UTC())}
+	f4.jobs["pb"] = model.Job{ID: "pb", RunID: "parent-b", Status: model.StatusSuccess}
+	f4.runs["child"] = model.Run{ID: "child", Status: model.StatusRunning}
+	f4.downstreamLinks["pa\x00a/x\x00refs/heads/main"] = storage.DownstreamLink{ParentJobID: "pa", ChildRunID: "child"}
+	f4.downstreamLinks["pb\x00b/x\x00refs/heads/main"] = storage.DownstreamLink{ParentJobID: "pb", ChildRunID: "child"}
+	f4.mu.Unlock()
+	if err := s4.refreshDownstreamParentsDB(ctx, "child"); err != nil {
+		t.Fatalf("refresh multiple parents = %v", err)
+	}
+	f4.mu.Lock()
+	pa, pb := f4.runs["parent-a"], f4.runs["parent-b"]
+	f4.mu.Unlock()
+	if pa.Status != model.StatusRunning || pa.FinishedAt != nil || pb.Status != model.StatusRunning || pb.FinishedAt != nil {
+		t.Fatalf("parents after in-flight child refresh = %s/%v, %s/%v; want both reopened running", pa.Status, pa.FinishedAt, pb.Status, pb.FinishedAt)
+	}
+
+	// A parent with several children stays open until every child is
+	// terminal; the last child's completion finalizes it.
+	s5, f5, _, _ := cacheFixture(t)
+	f5.mu.Lock()
+	f5.runs["parent"] = model.Run{ID: "parent", Status: model.StatusRunning, DownstreamRuns: []string{"child-1", "child-2"}}
+	f5.jobs["p1"] = model.Job{ID: "p1", RunID: "parent", Status: model.StatusSuccess}
+	f5.runs["child-1"] = model.Run{ID: "child-1", Status: model.StatusFailure}
+	f5.runs["child-2"] = model.Run{ID: "child-2", Status: model.StatusRunning}
+	f5.downstreamLinks["p1\x00a/x\x00refs/heads/main"] = storage.DownstreamLink{ParentJobID: "p1", ChildRunID: "child-1"}
+	f5.downstreamLinks["p1\x00a/x2\x00refs/heads/main"] = storage.DownstreamLink{ParentJobID: "p1", ChildRunID: "child-2"}
+	f5.mu.Unlock()
+	if err := s5.refreshDownstreamParentsDB(ctx, "child-1"); err != nil {
+		t.Fatalf("refresh first child = %v", err)
+	}
+	f5.mu.Lock()
+	parent = f5.runs["parent"]
+	f5.mu.Unlock()
+	if parent.Status != model.StatusRunning {
+		t.Fatalf("parent after first child = %s, want still running", parent.Status)
+	}
+	f5.mu.Lock()
+	child2 := f5.runs["child-2"]
+	child2.Status = model.StatusFailure
+	f5.runs["child-2"] = child2
+	f5.mu.Unlock()
+	if err := s5.refreshDownstreamParentsDB(ctx, "child-2"); err != nil {
+		t.Fatalf("refresh last child = %v", err)
+	}
+	f5.mu.Lock()
+	parent = f5.runs["parent"]
+	f5.mu.Unlock()
+	if parent.Status != model.StatusFailure || parent.FinishedAt == nil {
+		t.Fatalf("parent after all children = %+v, want finalized failure", parent)
+	}
+
+	// An unknown child resolves no parents and is a no-op.
+	s6, _, _, _ := cacheFixture(t)
+	if err := s6.refreshDownstreamParentsDB(ctx, "ghost"); err != nil {
+		t.Fatalf("refresh unknown child = %v", err)
+	}
+}
+
+// storeWithoutReverseIndex exposes only the base Store contract, hiding the
+// reverse-index methods a real store provides: the DB-mode parent refresh
+// must refuse it instead of falling back to a bounded run scan.
+type storeWithoutReverseIndex struct {
+	storage.Store
 }
 
 func TestFlowDownstreamAdjustRunForChildren(t *testing.T) {

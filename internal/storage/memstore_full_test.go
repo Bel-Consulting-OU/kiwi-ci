@@ -834,64 +834,76 @@ func TestMemStoreQuotaCounters(t *testing.T) {
 func TestMemStorePendingSidecarBranches(t *testing.T) {
 	ctx := memTestCtx()
 	m := newMemStore()
-	if err := m.RememberPendingSidecar(ctx, memJobID, "bin", ArtifactSidecarKindSBOM, memDigest); err != nil {
+	if err := m.RememberPendingSidecar(ctx, memJobID, 1, "bin", ArtifactSidecarKindSBOM, memDigest); err != nil {
 		t.Fatalf("RememberPendingSidecar: %v", err)
 	}
-	// A re-upload replaces the digest.
-	if err := m.RememberPendingSidecar(ctx, memJobID, "bin", ArtifactSidecarKindSBOM, memDigest2); err != nil {
+	// A re-upload of the SAME generation replaces the digest.
+	if err := m.RememberPendingSidecar(ctx, memJobID, 1, "bin", ArtifactSidecarKindSBOM, memDigest2); err != nil {
 		t.Fatalf("RememberPendingSidecar replace: %v", err)
 	}
-	got, ok, err := m.PendingSidecar(ctx, memJobID, "bin", ArtifactSidecarKindSBOM)
+	got, ok, err := m.PendingSidecar(ctx, memJobID, 1, "bin", ArtifactSidecarKindSBOM)
 	if err != nil || !ok || got != memDigest2 {
 		t.Fatalf("PendingSidecar = %q, %v, %v", got, ok, err)
 	}
-	if _, ok, err := m.PendingSidecar(ctx, memJobID, "bin", ArtifactSidecarKindSigstore); err != nil || ok {
+	if _, ok, err := m.PendingSidecar(ctx, memJobID, 1, "bin", ArtifactSidecarKindSigstore); err != nil || ok {
 		t.Fatalf("missing sidecar = %v, %v", ok, err)
 	}
+	// A DIFFERENT generation is a different row: a retry generation never
+	// resolves the previous generation's pending sidecar.
+	if _, ok, _ := m.PendingSidecar(ctx, memJobID, 2, "bin", ArtifactSidecarKindSBOM); ok {
+		t.Fatal("pending row leaked across lease generations")
+	}
+	if err := m.RememberPendingSidecar(ctx, memJobID, 2, "bin", ArtifactSidecarKindSBOM, memDigest); err != nil {
+		t.Fatalf("remember generation 2: %v", err)
+	}
+	if d, ok, _ := m.PendingSidecar(ctx, memJobID, 1, "bin", ArtifactSidecarKindSBOM); !ok || d != memDigest2 {
+		t.Fatalf("generation 1 row mutated by generation 2: %q ok=%v", d, ok)
+	}
 	// A stale consumer must not delete a newer digest.
-	if err := m.ConsumePendingSidecar(ctx, memJobID, "bin", ArtifactSidecarKindSBOM, memDigest); err != nil {
+	if err := m.ConsumePendingSidecar(ctx, memJobID, 1, "bin", ArtifactSidecarKindSBOM, memDigest); err != nil {
 		t.Fatalf("stale consume: %v", err)
 	}
-	if _, ok, _ := m.PendingSidecar(ctx, memJobID, "bin", ArtifactSidecarKindSBOM); !ok {
+	if _, ok, _ := m.PendingSidecar(ctx, memJobID, 1, "bin", ArtifactSidecarKindSBOM); !ok {
 		t.Fatal("stale consume dropped a newer digest")
 	}
-	if err := m.ConsumePendingSidecar(ctx, memJobID, "bin", ArtifactSidecarKindSBOM, memDigest2); err != nil {
+	// Consuming an older generation never touches the other generation.
+	if err := m.ConsumePendingSidecar(ctx, memJobID, 1, "bin", ArtifactSidecarKindSBOM, memDigest2); err != nil {
 		t.Fatalf("ConsumePendingSidecar: %v", err)
 	}
-	if _, ok, _ := m.PendingSidecar(ctx, memJobID, "bin", ArtifactSidecarKindSBOM); ok {
+	if _, ok, _ := m.PendingSidecar(ctx, memJobID, 1, "bin", ArtifactSidecarKindSBOM); ok {
 		t.Fatal("consume did not delete the row")
 	}
+	if _, ok, _ := m.PendingSidecar(ctx, memJobID, 2, "bin", ArtifactSidecarKindSBOM); !ok {
+		t.Fatal("consume of generation 1 deleted generation 2's row")
+	}
 	// Consuming a missing row is a no-op.
-	if err := m.ConsumePendingSidecar(ctx, memJobID, "bin", ArtifactSidecarKindSBOM, memDigest2); err != nil {
+	if err := m.ConsumePendingSidecar(ctx, memJobID, 1, "bin", ArtifactSidecarKindSBOM, memDigest2); err != nil {
 		t.Fatalf("consume missing: %v", err)
 	}
 
-	if err := m.RememberPendingSidecar(ctx, memJobID, "bin", ArtifactSidecarKindSBOM, memDigest); err != nil {
+	// Artifact scoping: another artifact name in the same generation keeps
+	// its own row.
+	if err := m.RememberPendingSidecar(ctx, memJobID, 1, "bin", ArtifactSidecarKindSBOM, memDigest); err != nil {
 		t.Fatalf("remember: %v", err)
 	}
-	if err := m.RememberPendingSidecar(ctx, memJobID, "lib", ArtifactSidecarKindSigstore, memDigest); err != nil {
+	if err := m.RememberPendingSidecar(ctx, memJobID, 1, "lib", ArtifactSidecarKindSigstore, memDigest); err != nil {
 		t.Fatalf("remember other: %v", err)
 	}
-	if err := m.RememberPendingSidecar(ctx, memJobID2, "bin", ArtifactSidecarKindSBOM, memDigest); err != nil {
-		t.Fatalf("remember other job: %v", err)
+	if err := m.ConsumePendingSidecar(ctx, memJobID, 1, "bin", ArtifactSidecarKindSBOM, memDigest); err != nil {
+		t.Fatalf("consume bin: %v", err)
 	}
-	if err := m.DeletePendingSidecars(ctx, memJobID); err != nil {
-		t.Fatalf("DeletePendingSidecars: %v", err)
-	}
-	if _, ok, _ := m.PendingSidecar(ctx, memJobID2, "bin", ArtifactSidecarKindSBOM); !ok {
-		t.Fatal("delete crossed job boundaries")
-	}
-	if err := m.DeletePendingSidecars(ctx, "bad"); err == nil {
-		t.Fatal("delete with invalid job id must fail")
+	if d, ok, _ := m.PendingSidecar(ctx, memJobID, 1, "lib", ArtifactSidecarKindSigstore); !ok || d != memDigest {
+		t.Fatal("consume of bin dropped lib's pending row")
 	}
 
-	// Prune drops only rows older than the cutoff.
+	// Prune drops only rows older than the cutoff; fresh rows (whatever the
+	// generation) survive.
 	pruned, err := m.PrunePendingSidecars(ctx, time.Now().UTC().Add(-time.Hour))
 	if err != nil || pruned != 0 {
 		t.Fatalf("prune fresh = %d, %v", pruned, err)
 	}
 	pruned, err = m.PrunePendingSidecars(ctx, time.Now().UTC().Add(time.Hour))
-	if err != nil || pruned != 1 {
+	if err != nil || pruned != 2 {
 		t.Fatalf("prune stale = %d, %v", pruned, err)
 	}
 }
@@ -1048,8 +1060,11 @@ func TestMemStoreTestHistory(t *testing.T) {
 }
 
 func TestMemStoreFragmentHelpers(t *testing.T) {
-	if got := pendingSidecarKey("j", "a", "k"); got != "j\x00a\x00k" {
+	if got := pendingSidecarKey("j", 3, "a", "k"); got != "j\x003\x00a\x00k" {
 		t.Fatalf("pendingSidecarKey = %q", got)
+	}
+	if pendingSidecarKey("j", 3, "a", "k") == pendingSidecarKey("j", 4, "a", "k") {
+		t.Fatal("pendingSidecarKey must include the lease generation")
 	}
 	if got := fragmentKey("j", 3, "f"); got != "j|3|f" {
 		t.Fatalf("fragmentKey = %q", got)

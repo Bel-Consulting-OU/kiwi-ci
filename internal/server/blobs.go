@@ -344,11 +344,13 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 			writeJSON(w, http.StatusOK, stored)
 			return
 		}
-		// The record is durable: consume the pending sidecar rows it now
-		// references (and clear the job's leftovers). A cleanup failure is
-		// logged, never fatal — the record already carries the digests and
-		// the maintenance tick prunes any leftover row.
-		if cerr := s.consumeArtifactPendingSidecars(ctx, j.ID, rec); cerr != nil {
+		// The record is durable: consume ONLY the pending sidecar rows this
+		// exact record references (job, generation, name, kind). Every other
+		// artifact's (or generation's) pending sidecar survives until its own
+		// commit or the 7-day prune. A cleanup failure is logged, never fatal
+		// — the record already carries the digests and the maintenance tick
+		// prunes any leftover row.
+		if cerr := s.consumeArtifactPendingSidecars(ctx, rec); cerr != nil {
 			s.logError("artifact: pending sidecar cleanup failed", "job", j.ID, "artifact", rec.ID, "error", cerr.Error())
 		}
 		s.metricAdd("kiwi_artifact_bytes_total", float64(n), nil)
@@ -398,9 +400,9 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 		return
 	}
 	// Dev-mode mirror: the record now carries its sidecar references, so
-	// the pending entries are consumed with it.
-	delete(s.pendingSidecars, sidecarPendingKey(j.ID, name, storage.ArtifactSidecarKindSBOM))
-	delete(s.pendingSidecars, sidecarPendingKey(j.ID, name, storage.ArtifactSidecarKindSigstore))
+	// only ITS OWN (job, generation, name) pending entries are consumed.
+	delete(s.pendingSidecars, sidecarPendingKey(j.ID, rec.LeaseGeneration, name, storage.ArtifactSidecarKindSBOM))
+	delete(s.pendingSidecars, sidecarPendingKey(j.ID, rec.LeaseGeneration, name, storage.ArtifactSidecarKindSigstore))
 	s.mu.Unlock()
 	s.metricAdd("kiwi_artifact_bytes_total", float64(n), nil)
 	s.metricObserve("kiwi_cas_latency_seconds", time.Since(start).Seconds(), nil)

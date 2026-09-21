@@ -1055,8 +1055,9 @@ func TestPostgresIntegrationArtifactInsertOnce(t *testing.T) {
 	}
 }
 
-// TestPostgresIntegrationPendingSidecars proves the pending-sidecar table
-// round trip, digest-conditioned consumption and pruning.
+// TestPostgresIntegrationPendingSidecars proves the generation-qualified
+// pending-sidecar table round trip, digest-conditioned consumption and
+// pruning.
 func TestPostgresIntegrationPendingSidecars(t *testing.T) {
 	st := pgITStore(t)
 	ctx := context.Background()
@@ -1064,59 +1065,182 @@ func TestPostgresIntegrationPendingSidecars(t *testing.T) {
 	digest1 := strings.Repeat("1", 64)
 	digest2 := strings.Repeat("2", 64)
 
-	if err := st.RememberPendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSBOM, digest1); err != nil {
+	if err := st.RememberPendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM, digest1); err != nil {
 		t.Fatalf("remember: %v", err)
 	}
-	got, ok, err := st.PendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSBOM)
+	got, ok, err := st.PendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM)
 	if err != nil || !ok || got != digest1 {
 		t.Fatalf("pending = %q ok=%v err=%v, want %s", got, ok, err, digest1)
 	}
-	// A re-upload replaces the digest; consuming the stale digest must not
-	// remove the newer row.
-	if err := st.RememberPendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSBOM, digest2); err != nil {
+	// A re-upload of the same generation replaces the digest; consuming the
+	// stale digest must not remove the newer row.
+	if err := st.RememberPendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM, digest2); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.ConsumePendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSBOM, digest1); err != nil {
+	if err := st.ConsumePendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM, digest1); err != nil {
 		t.Fatal(err)
 	}
-	if got, ok, _ := st.PendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSBOM); !ok || got != digest2 {
+	if got, ok, _ := st.PendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM); !ok || got != digest2 {
 		t.Fatalf("stale consume removed the newest digest: %q ok=%v", got, ok)
 	}
-	if err := st.ConsumePendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSBOM, digest2); err != nil {
+	if err := st.ConsumePendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM, digest2); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, _ := st.PendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSBOM); ok {
+	if _, ok, _ := st.PendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM); ok {
 		t.Fatal("consumed sidecar still present")
 	}
-	// Kind-scoped rows and job cleanup.
-	if err := st.RememberPendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSigstore, digest1); err != nil {
+	// Kind-scoped rows: consuming one kind never removes the other.
+	if err := st.RememberPendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSigstore, digest1); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.RememberPendingSidecar(ctx, jobID, "other", ArtifactSidecarKindSBOM, digest2); err != nil {
+	if err := st.RememberPendingSidecar(ctx, jobID, 1, "other", ArtifactSidecarKindSBOM, digest2); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.DeletePendingSidecars(ctx, jobID); err != nil {
+	if err := st.ConsumePendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSigstore, digest1); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, _ := st.PendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSigstore); ok {
-		t.Fatal("DeletePendingSidecars left a row behind")
+	if _, ok, _ := st.PendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSigstore); ok {
+		t.Fatal("consumed sigstore row still present")
+	}
+	if _, ok, _ := st.PendingSidecar(ctx, jobID, 1, "other", ArtifactSidecarKindSBOM); !ok {
+		t.Fatal("consuming bin dropped other's pending row")
 	}
 	// Pruning by age removes only older rows.
-	if err := st.RememberPendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSBOM, digest1); err != nil {
+	if err := st.RememberPendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM, digest1); err != nil {
 		t.Fatal(err)
 	}
 	if n, err := st.PrunePendingSidecars(ctx, time.Now().UTC().Add(-time.Hour)); err != nil || n != 0 {
 		t.Fatalf("past cutoff pruned %d err=%v, want 0", n, err)
 	}
-	if n, err := st.PrunePendingSidecars(ctx, time.Now().UTC().Add(time.Hour)); err != nil || n != 1 {
-		t.Fatalf("future cutoff pruned %d err=%v, want 1", n, err)
+	if n, err := st.PrunePendingSidecars(ctx, time.Now().UTC().Add(time.Hour)); err != nil || n != 2 {
+		t.Fatalf("future cutoff pruned %d err=%v, want 2", n, err)
 	}
 	// Validation fails closed on malformed keys and digests.
-	if err := st.RememberPendingSidecar(ctx, jobID, "bin", "not-a-kind", digest1); err == nil {
+	if err := st.RememberPendingSidecar(ctx, jobID, 1, "bin", "not-a-kind", digest1); err == nil {
 		t.Fatal("invalid sidecar kind accepted")
 	}
-	if err := st.RememberPendingSidecar(ctx, jobID, "bin", ArtifactSidecarKindSBOM, "short"); err == nil {
+	if err := st.RememberPendingSidecar(ctx, jobID, -1, "bin", ArtifactSidecarKindSBOM, digest1); err == nil {
+		t.Fatal("negative lease generation accepted")
+	}
+	if err := st.RememberPendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM, "short"); err == nil {
 		t.Fatal("invalid sidecar digest accepted")
+	}
+}
+
+// TestIntegrationPendingSidecarGenerationScoped proves the generation-scoped
+// pending contract on real PostgreSQL: two generations of the SAME artifact
+// name hold independent rows across two store instances (the two-replica
+// race), a lookup for a generation that never wrote a row resolves nothing,
+// a consume for one generation never deletes the other's row, and the prune
+// keeps fresh rows.
+func TestIntegrationPendingSidecarGenerationScoped(t *testing.T) {
+	env := pgITSetup(t)
+	a := env.open(t)
+	env.migrate(t, a)
+	pgITArmFence(t, a)
+	b := env.open(t)
+	pgITArmFence(t, b)
+	ctx := context.Background()
+	jobID := pgITNewID(t)
+	gen1 := strings.Repeat("a", 64)
+	gen2 := strings.Repeat("b", 64)
+
+	// Two replicas race the same artifact name under different generations.
+	if err := a.RememberPendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM, gen1); err != nil {
+		t.Fatalf("replica A remember gen1: %v", err)
+	}
+	if err := b.RememberPendingSidecar(ctx, jobID, 2, "bin", ArtifactSidecarKindSBOM, gen2); err != nil {
+		t.Fatalf("replica B remember gen2: %v", err)
+	}
+	if d, ok, err := b.PendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM); err != nil || !ok || d != gen1 {
+		t.Fatalf("cross-replica gen1 pending = %q ok=%v err=%v", d, ok, err)
+	}
+	if d, ok, err := a.PendingSidecar(ctx, jobID, 2, "bin", ArtifactSidecarKindSBOM); err != nil || !ok || d != gen2 {
+		t.Fatalf("cross-replica gen2 pending = %q ok=%v err=%v", d, ok, err)
+	}
+	if _, ok, _ := a.PendingSidecar(ctx, jobID, 3, "bin", ArtifactSidecarKindSBOM); ok {
+		t.Fatal("generation 3 resolved another generation's row")
+	}
+	// Consuming generation 1 leaves generation 2 in place (exact identity).
+	if err := a.ConsumePendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM, gen1); err != nil {
+		t.Fatalf("consume gen1: %v", err)
+	}
+	if _, ok, _ := a.PendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM); ok {
+		t.Fatal("gen1 row survived its consume")
+	}
+	if d, ok, _ := a.PendingSidecar(ctx, jobID, 2, "bin", ArtifactSidecarKindSBOM); !ok || d != gen2 {
+		t.Fatalf("gen1 consume dropped gen2: %q ok=%v", d, ok)
+	}
+	// Prune keeps the fresh gen2 row.
+	if n, err := a.PrunePendingSidecars(ctx, time.Now().UTC().Add(-time.Hour)); err != nil || n != 0 {
+		t.Fatalf("prune fresh = %d, %v; want 0", n, err)
+	}
+	if _, ok, _ := b.PendingSidecar(ctx, jobID, 2, "bin", ArtifactSidecarKindSBOM); !ok {
+		t.Fatal("fresh gen2 row pruned")
+	}
+}
+
+// TestIntegrationPendingSidecarMigrationDrainsRows proves the 0028 upgrade
+// transition on a real database: a schema holding the PRE-0028 0012 shape
+// with generation-less rows is drained and recreated with the generation in
+// the primary key, so old rows can never resolve for any generation.
+func TestIntegrationPendingSidecarMigrationDrainsRows(t *testing.T) {
+	env := pgITSetup(t)
+	st := env.open(t)
+	ctx := context.Background()
+	// Bring the schema to the pre-0028 state: apply every migration before
+	// 0028, including the shipped 0012 shape.
+	all, err := migrations.All()
+	if err != nil {
+		t.Fatalf("migrations.All: %v", err)
+	}
+	for _, m := range all {
+		if m.Version > 27 {
+			continue
+		}
+		if err := st.applyMigration(ctx, m); err != nil {
+			t.Fatalf("apply %s: %v", m.Name, err)
+		}
+	}
+	// Seed a legacy generation-less row through the old column list.
+	jobID := pgITNewID(t)
+	legacyDigest := strings.Repeat("c", 64)
+	if _, err := st.pool.Exec(ctx, `INSERT INTO artifact_pending_sidecars (job_id, artifact_name, kind, digest) VALUES ($1, 'bin', 'sbom', $2)`, jobID, legacyDigest); err != nil {
+		t.Fatalf("seed legacy row: %v", err)
+	}
+	// Apply 0028: the drain + recreate.
+	var target migrations.Migration
+	for _, m := range all {
+		if m.Version == 28 {
+			target = m
+		}
+	}
+	if target.Version == 0 {
+		t.Fatal("0028 not embedded")
+	}
+	if err := st.applyMigration(ctx, target); err != nil {
+		t.Fatalf("apply 0028: %v", err)
+	}
+	// The legacy rows are gone for every generation, and the new shape
+	// accepts generation-qualified rows.
+	if _, ok, err := st.PendingSidecar(ctx, jobID, 0, "bin", ArtifactSidecarKindSBOM); err != nil || ok {
+		t.Fatalf("drained legacy row still resolves: ok=%v err=%v", ok, err)
+	}
+	if _, ok, _ := st.PendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM); ok {
+		t.Fatal("drained legacy row resolved for generation 1")
+	}
+	var count int
+	if err := st.pool.QueryRow(ctx, `SELECT COUNT(*) FROM artifact_pending_sidecars`).Scan(&count); err != nil {
+		t.Fatalf("count drained rows: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("drained table has %d rows, want 0", count)
+	}
+	if err := st.RememberPendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM, legacyDigest); err != nil {
+		t.Fatalf("remember after 0028: %v", err)
+	}
+	if d, ok, _ := st.PendingSidecar(ctx, jobID, 1, "bin", ArtifactSidecarKindSBOM); !ok || d != legacyDigest {
+		t.Fatalf("post-0028 pending = %q ok=%v", d, ok)
 	}
 }
 

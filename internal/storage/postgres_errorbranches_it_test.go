@@ -90,7 +90,7 @@ func TestPostgresIntegrationValidationSweep(t *testing.T) {
 	bad("PutCacheManifest/bad-digest", st.PutCacheManifest(ctx, CacheManifestRecord{Repo: "r", TrustDomain: "t", LogicalKey: "l", BlobSHA256: "short"}), true)
 	bad("SetArtifactSidecars/bad-id", st.SetArtifactSidecars(ctx, "bad", "p", "", "", ""), true)
 	bad("PendingSidecar/bad-key", func() error {
-		_, _, err := st.PendingSidecar(ctx, "bad", "bin", ArtifactSidecarKindSBOM)
+		_, _, err := st.PendingSidecar(ctx, "bad", 1, "bin", ArtifactSidecarKindSBOM)
 		return err
 	}(), true)
 	bad("AppendDownstreamRun/bad-run", st.AppendDownstreamRun(ctx, "bad", runID), true)

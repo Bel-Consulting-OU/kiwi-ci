@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -529,22 +531,266 @@ func TestTestHistoryCacheVersionAndEviction(t *testing.T) {
 		t.Fatalf("taken snapshot changed under a newer generation: %v", got)
 	}
 
-	// The local mirror marks the entry stale (local, same-repository fold)
-	// and the next read supersedes it with the durable generation.
-	s.mirrorTestReportHistoryDB(a, model.TestReport{JobKey: "build", CreatedAt: time.Now().UTC(),
-		Cases: []model.TestResult{{Class: "C", Name: "mirrored", Passed: true}}})
+	// A same-repository upload mirror marks the entry stale but NEVER mutates
+	// the cached snapshot: the stale entry still holds hNew, the exact
+	// immutable generation already taken above. The next read atomically
+	// swaps in a freshly decoded pointer.
+	s.mirrorTestReportHistoryDB(a)
 	e, ok := s.historyCache.lookup(a)
 	if !ok || e.version != historyStaleVersion {
 		t.Fatalf("mirrored entry version = %d ok=%v, want stale (%d)", e.version, ok, historyStaleVersion)
 	}
-	if got := e.history.Manifest(a, "build"); !reflect.DeepEqual(got, []string{"C.a-1", "C.a-new", "C.mirrored"}) {
-		t.Fatalf("mirrored snapshot = %v, want the local fold with C.mirrored", got)
+	if e.history != hNew {
+		t.Fatal("the mirror replaced or mutated the cached snapshot instead of only marking it stale")
+	}
+	if got := hNew.Manifest(a, "build"); !reflect.DeepEqual(got, []string{"C.a-1", "C.a-new"}) {
+		t.Fatalf("held snapshot changed under the mirror: %v", got)
 	}
 	hDurable, err := s.historyForRepo(ctx, a)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if hDurable == hNew {
+		t.Fatal("the stale entry must be reloaded into a fresh pointer")
+	}
 	if got := hDurable.Manifest(a, "build"); !reflect.DeepEqual(got, []string{"C.a-1", "C.a-new"}) {
 		t.Fatalf("mirror was not superseded by the durable generation: %v", got)
+	}
+}
+
+// TestTestHistorySnapshotStableAcrossSameRepoUpload is the reviewer's
+// deterministic immutability regression: ONE snapshot taken for a response
+// must keep answering Shard, Manifest and Flaky from its own generation while
+// a same-repository upload commits and mirrors. Pre-fix the mirror called
+// Record on the cached snapshot in place, so the held pointer observed the
+// later generation (counters, manifest, flaky) mid-response.
+func TestTestHistorySnapshotStableAcrossSameRepoUpload(t *testing.T) {
+	ctx := context.Background()
+	f := newDBFakeStore()
+	s := New("tok")
+	if err := s.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	repo := "github.com/o/a"
+	seedTestHistoryRepo(t, ctx, f, repo, "run-a", "build", []string{"a-slow", "a-quick"}, "a-slow")
+	h, err := s.historyForRepo(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeManifest := h.Manifest(repo, "build")
+	beforeFlaky := h.Flaky(repo)
+	beforeAssignment := h.Shard(repo, "build", 2)
+
+	// The same repository's next upload commits its durable aggregate (a new
+	// test plus fresh outcomes) and mirrors the cache entry stale.
+	if _, err := f.InsertTestReportWithHistory(ctx, model.TestReport{
+		ID: "rep-late", RunID: "run-a", JobKey: "build", CreatedAt: time.Now().UTC(),
+		Cases: []model.TestResult{{Class: "C", Name: "a-late", Passed: true}, {Class: "C", Name: "a-slow", Passed: false}},
+	}, repo); err != nil {
+		t.Fatal(err)
+	}
+	s.mirrorTestReportHistoryDB(repo)
+
+	// The held pointer answers its own generation consistently: the exact
+	// Manifest/Shard/Flaky trio of the response cannot change mid-flight.
+	if got := h.Manifest(repo, "build"); !reflect.DeepEqual(got, beforeManifest) {
+		t.Fatalf("held manifest changed under a same-repo upload: %v -> %v", beforeManifest, got)
+	}
+	if got := h.Shard(repo, "build", 2); !reflect.DeepEqual(got, beforeAssignment) {
+		t.Fatalf("held assignment changed under a same-repo upload: %v -> %v", beforeAssignment, got)
+	}
+	if got := h.Flaky(repo); !reflect.DeepEqual(got, beforeFlaky) {
+		t.Fatalf("held flaky set changed under a same-repo upload: %v -> %v", beforeFlaky, got)
+	}
+	if strings.Contains(strings.Join(h.Manifest(repo, "build"), ","), "a-late") {
+		t.Fatal("held snapshot observed a later generation")
+	}
+
+	// The next read swaps in the durable generation as a NEW pointer; the
+	// held one stays frozen.
+	next, err := s.historyForRepo(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next == h {
+		t.Fatal("the same-repo mirror did not force a fresh decode")
+	}
+	if got := next.Manifest(repo, "build"); !reflect.DeepEqual(got, []string{"C.a-late", "C.a-quick", "C.a-slow"}) {
+		t.Fatalf("fresh generation manifest = %v", got)
+	}
+	if got := h.Manifest(repo, "build"); !reflect.DeepEqual(got, beforeManifest) {
+		t.Fatalf("held snapshot changed after the reload: %v", got)
+	}
+}
+
+// TestTestHistoryMemorySnapshotStableAcrossUpdate is the memory/fs half of
+// the same-repo immutability regression: recordTestReportHistory publishes a
+// deep clone, so the whole-history snapshot a reader holds is never mutated.
+func TestTestHistoryMemorySnapshotStableAcrossUpdate(t *testing.T) {
+	ctx := context.Background()
+	s, err := NewPersistent("token", "token", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := "github.com/o/a"
+	s.recordTestReportHistory(ctx, repo, model.TestReport{JobKey: "build", CreatedAt: time.Now().UTC(),
+		Cases: []model.TestResult{{Class: "C", Name: "a-slow", Passed: false}, {Class: "C", Name: "a-slow", Passed: true}}})
+	held := s.cachedHistory(repo)
+	if held == nil {
+		t.Fatal("memory snapshot missing")
+	}
+	beforeManifest := held.Manifest(repo, "build")
+	beforeFlaky := held.Flaky(repo)
+
+	s.recordTestReportHistory(ctx, repo, model.TestReport{JobKey: "build", CreatedAt: time.Now().UTC(),
+		Cases: []model.TestResult{{Class: "C", Name: "a-late", Passed: true}, {Class: "C", Name: "a-slow", Passed: false}}})
+
+	if got := held.Manifest(repo, "build"); !reflect.DeepEqual(got, beforeManifest) {
+		t.Fatalf("memory snapshot mutated in place: %v -> %v", beforeManifest, got)
+	}
+	if got := held.Flaky(repo); !reflect.DeepEqual(got, beforeFlaky) {
+		t.Fatalf("memory snapshot flaky set mutated in place: %v -> %v", beforeFlaky, got)
+	}
+	next := s.cachedHistory(repo)
+	if next == held {
+		t.Fatal("memory update must publish a NEW snapshot (copy-on-write)")
+	}
+	if got := next.Manifest(repo, "build"); !reflect.DeepEqual(got, []string{"C.a-late", "C.a-slow"}) {
+		t.Fatalf("new memory generation manifest = %v", got)
+	}
+}
+
+// TestTestHistoryMemoryWriteFailureKeepsSnapshot proves the durability rule of
+// the memory/fs copy-on-write: when the history file write (save or commit)
+// fails, the old snapshot keeps serving and the failed fold is NEVER visible.
+func TestTestHistoryMemoryWriteFailureKeepsSnapshot(t *testing.T) {
+	ctx := context.Background()
+	repo := "github.com/o/a"
+	s, err := NewPersistent("token", "token", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.recordTestReportHistory(ctx, repo, model.TestReport{JobKey: "build", CreatedAt: time.Now().UTC(),
+		Cases: []model.TestResult{{Class: "C", Name: "a-slow", Passed: false}, {Class: "C", Name: "a-slow", Passed: true}}})
+	held := s.cachedHistory(repo)
+	before := held.Manifest(repo, "build")
+
+	// Save failure: the history path's parent is a regular file.
+	block := filepath.Join(t.TempDir(), "block")
+	if err := os.WriteFile(block, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.historyFile = block + "/sub/history.json"
+	s.recordTestReportHistory(ctx, repo, model.TestReport{JobKey: "build", CreatedAt: time.Now().UTC(),
+		Cases: []model.TestResult{{Class: "C", Name: "a-late", Passed: true}}})
+	if s.cachedHistory(repo) != held {
+		t.Fatal("a failed save published a mutated snapshot")
+	}
+	if got := held.Manifest(repo, "build"); !reflect.DeepEqual(got, before) {
+		t.Fatalf("a failed save mutated the held snapshot: %v", got)
+	}
+
+	// Commit failure: the staged file writes next to a DIRECTORY, so the
+	// rename onto the history path fails after a successful stage.
+	s.historyFile = t.TempDir()
+	s.recordTestReportHistory(ctx, repo, model.TestReport{JobKey: "build", CreatedAt: time.Now().UTC(),
+		Cases: []model.TestResult{{Class: "C", Name: "a-later", Passed: true}}})
+	if s.cachedHistory(repo) != held {
+		t.Fatal("a failed commit published a mutated snapshot")
+	}
+	if got := strings.Join(held.Manifest(repo, "build"), ","); got != strings.Join(before, ",") {
+		t.Fatalf("a failed commit mutated the held snapshot: %v", got)
+	}
+}
+
+// TestTestHistoryFlakyDropsOutAfterCleanWindow pins the window-derived flaky
+// predicate across the aggregate mirror and the server snapshot: a test with
+// a lifetime failure that then passes its last 16 observations is no longer
+// flaky, and a fresh failure restores it.
+func TestTestHistoryFlakyDropsOutAfterCleanWindow(t *testing.T) {
+	ctx := context.Background()
+	f := newDBFakeStore()
+	s := New("tok")
+	if err := s.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	repo := "github.com/o/a"
+	now := time.Now().UTC()
+	if _, err := f.InsertTestReportWithHistory(ctx, model.TestReport{
+		ID: "rep-fail", RunID: "run-a", JobKey: "build", CreatedAt: now,
+		Cases: []model.TestResult{{Class: "C", Name: "t", Passed: false}},
+	}, repo); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < testintel.OutcomeWindow; i++ {
+		if _, err := f.InsertTestReportWithHistory(ctx, model.TestReport{
+			ID: fmt.Sprintf("rep-pass-%02d", i), RunID: "run-a", JobKey: "build", CreatedAt: now.Add(time.Duration(i+1) * time.Second),
+			Cases: []model.TestResult{{Class: "C", Name: "t", Passed: true}},
+		}, repo); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if flaky, err := f.FlakyTestNames(ctx, []string{repo}, 100); err != nil || len(flaky) != 0 {
+		t.Fatalf("aggregate flaky after clean window = %v, %v; want none", flaky, err)
+	}
+	h, err := s.historyForRepo(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := h.Flaky(repo); len(got) != 0 {
+		t.Fatalf("snapshot flaky after clean window = %v, want none", got)
+	}
+	// A fresh failure inside the window puts the test back on both paths.
+	if _, err := f.InsertTestReportWithHistory(ctx, model.TestReport{
+		ID: "rep-fail-again", RunID: "run-a", JobKey: "build", CreatedAt: now.Add(time.Minute),
+		Cases: []model.TestResult{{Class: "C", Name: "t", Passed: false}},
+	}, repo); err != nil {
+		t.Fatal(err)
+	}
+	if flaky, err := f.FlakyTestNames(ctx, []string{repo}, 100); err != nil || !reflect.DeepEqual(flaky, []string{"C.t"}) {
+		t.Fatalf("aggregate flaky after fresh failure = %v, %v; want [C.t]", flaky, err)
+	}
+	h2, err := s.historyForRepo(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := h2.Flaky(repo); !reflect.DeepEqual(got, []string{"C.t"}) {
+		t.Fatalf("snapshot flaky after fresh failure = %v, want [C.t]", got)
+	}
+}
+
+// TestSummarizeTestIntelligenceWindowAligned proves the report-derived
+// summary uses the same bounded window as the persisted history and the SQL
+// aggregates: a test that failed long ago and passed its whole window is not
+// reported flaky, and the fold order is deterministic (created_at, then id).
+func TestSummarizeTestIntelligenceWindowAligned(t *testing.T) {
+	base := time.Now().UTC()
+	reports := []model.TestReport{{ID: "old", CreatedAt: base,
+		Cases: []model.TestResult{{Class: "C", Name: "t", Passed: false}}}}
+	for i := 0; i < testintel.OutcomeWindow; i++ {
+		reports = append(reports, model.TestReport{ID: fmt.Sprintf("p%02d", i), CreatedAt: base.Add(time.Duration(i+1) * time.Second),
+			Cases: []model.TestResult{{Class: "C", Name: "t", Passed: true}}})
+	}
+	out := summarizeTestIntelligence(reports)
+	if got, _ := out["flaky_tests"].([]string); len(got) != 0 {
+		t.Fatalf("report-derived flaky after a clean window = %v, want none", got)
+	}
+	// The same reports in any input order yield the same answer (the fold
+	// order is created_at/id, not slice order).
+	shuffled := append([]model.TestReport(nil), reports...)
+	for i, j := 0, len(shuffled)-1; i < j; i, j = i+1, j-1 {
+		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+	}
+	out2 := summarizeTestIntelligence(shuffled)
+	if fmt.Sprint(out2["flaky_tests"]) != fmt.Sprint(out["flaky_tests"]) {
+		t.Fatalf("summary is order-dependent: %v vs %v", out2["flaky_tests"], out["flaky_tests"])
+	}
+	// A fresh failure inside the window restores flakiness.
+	fresh := append([]model.TestReport(nil), reports...)
+	fresh = append(fresh, model.TestReport{ID: "new", CreatedAt: base.Add(time.Minute),
+		Cases: []model.TestResult{{Class: "C", Name: "t", Passed: false}}})
+	out3 := summarizeTestIntelligence(fresh)
+	if got, _ := out3["flaky_tests"].([]string); len(got) != 1 || got[0] != "C.t" {
+		t.Fatalf("report-derived flaky after a fresh failure = %v, want [C.t]", got)
 	}
 }

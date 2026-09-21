@@ -101,17 +101,33 @@ func TestIDCovMetricsHandlerAndDBRendering(t *testing.T) {
 	if !strings.Contains(body, `kiwi_runs{status="running"} 1`) || !strings.Contains(body, "kiwi_runner_saturation") {
 		t.Fatalf("db metrics body incomplete: %s", body)
 	}
-	// A failing job listing is skipped, a failing run listing is a 500 and a
-	// failing runner listing degrades to zero runners.
-	fault := &idcovFaultStore{dbFakeStore: f, listJobsErr: errors.New("jobs down"), listRunnerErr: errors.New("runners down")}
+	// The DB state gauges read the store aggregates: a failing aggregate is
+	// logged and skips ONLY its family (the healthy families and the process
+	// registry keep rendering) — never a wrong zero.
+	fault := &idcovFaultStore{dbFakeStore: f}
+	f.metricJobStatusErr = errors.New("jobs down")
+	f.metricRunnerSlotsErr = errors.New("runners down")
 	sd.DB = fault
 	w = doJSON(t, sd, http.MethodGet, "/metrics", "admin", "")
-	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "kiwi_runners 0") {
-		t.Fatalf("degraded db metrics = %d: %s", w.Code, w.Body.String())
+	body = w.Body.String()
+	if w.Code != http.StatusOK || !strings.Contains(body, `kiwi_runs{status="running"} 1`) {
+		t.Fatalf("degraded db metrics = %d: %s", w.Code, body)
 	}
-	fault.listRunsErr = errors.New("runs down")
-	if w := doJSON(t, sd, http.MethodGet, "/metrics", "admin", ""); w.Code != http.StatusInternalServerError {
-		t.Fatalf("failing db metrics = %d, want 500", w.Code)
+	if strings.Contains(body, "# HELP kiwi_jobs Number") || strings.Contains(body, `kiwi_jobs{status=`) || strings.Contains(body, "kiwi_runners ") {
+		t.Fatalf("failed db metric families rendered: %s", body)
+	}
+	// A failing run aggregate skips the runs family too; the runner family
+	// (healthy again) still renders its real values, not zeros.
+	f.metricJobStatusErr = nil
+	f.metricRunnerSlotsErr = nil
+	f.metricRunStatusErr = errors.New("runs down")
+	w = doJSON(t, sd, http.MethodGet, "/metrics", "admin", "")
+	body = w.Body.String()
+	if w.Code != http.StatusOK || strings.Contains(body, "# HELP kiwi_runs Number") || strings.Contains(body, `kiwi_runs{status=`) {
+		t.Fatalf("failed run family rendered = %d: %s", w.Code, body)
+	}
+	if !strings.Contains(body, "kiwi_runners 1") || !strings.Contains(body, `kiwi_jobs{status="running"} 1`) {
+		t.Fatalf("healthy db families missing after a run aggregate failure: %s", body)
 	}
 }
 

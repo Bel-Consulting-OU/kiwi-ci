@@ -173,8 +173,14 @@ func TestTestHistoryUpdateFailureFailsUploadClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The failed upload left no phantom history: only the acknowledged
-	// report's case is present.
-	if strings.Contains(string(stats), "solo") || !strings.Contains(string(stats), "second") {
-		t.Fatalf("history after healed retry = %s", stats)
+	// report's case is present. The stats keys are the structured v2 keys, so
+	// the assertion decodes them through the same reader the server uses
+	// instead of substring-matching the serialized names.
+	h, err := historyFromStats(stats)
+	if err != nil {
+		t.Fatalf("decode history stats: %v", err)
+	}
+	if got := h.Manifest("github.com/o/r", "build"); len(got) != 1 || got[0] != "second" {
+		t.Fatalf("history after healed retry = %v (stats %s)", got, stats)
 	}
 }

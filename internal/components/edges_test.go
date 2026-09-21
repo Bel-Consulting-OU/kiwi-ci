@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
@@ -43,10 +44,28 @@ func TestRemoteRegistryDefaultClient(t *testing.T) {
 	if err := cl.CheckRedirect(nil, nil); !errors.Is(err, http.ErrUseLastResponse) {
 		t.Fatalf("CheckRedirect = %v, want ErrUseLastResponse", err)
 	}
+	// A caller-supplied client is copied and hardened, never used as-is and
+	// never mutated: the copy gets the policy fields, the original keeps its
+	// own (zero) timeout and redirect handler.
 	custom := &http.Client{}
 	reg.Client = custom
-	if reg.client() != custom {
-		t.Fatal("an injected client must be used as-is")
+	got := reg.client()
+	if got == custom {
+		t.Fatal("client() must return a hardened copy, not the injected client")
+	}
+	if got.Timeout != defaultRegistryTimeout {
+		t.Fatalf("hardened Timeout = %v, want %v", got.Timeout, defaultRegistryTimeout)
+	}
+	if err := got.CheckRedirect(nil, nil); !errors.Is(err, http.ErrUseLastResponse) {
+		t.Fatalf("hardened CheckRedirect = %v, want ErrUseLastResponse", err)
+	}
+	if custom.Timeout != 0 || custom.CheckRedirect != nil {
+		t.Fatalf("hardening mutated the caller's client: %+v", custom)
+	}
+	// An explicit caller timeout below the class default is preserved.
+	reg.Client = &http.Client{Timeout: time.Second}
+	if got := reg.client().Timeout; got != time.Second {
+		t.Fatalf("caller Timeout = %v, want 1s", got)
 	}
 }
 

@@ -456,7 +456,7 @@ func TestFlowTestintelListReports(t *testing.T) {
 		t.Fatalf("memory report list = %d %s", w.Code, w.Body.String())
 	}
 	// Scoped denial.
-	if err := s.AuthStore.AddToken("outsider", auth.Principal{Subject: "outsider", Roles: []auth.Role{auth.RoleRead},
+	if err := s.AuthStore.AddToken("outsider", auth.Principal{Subject: "outsider",
 		Repositories: map[string]auth.RepositoryPermission{"github.com/o/repo-b": {Read: true}}}); err != nil {
 		t.Fatal(err)
 	}
@@ -466,7 +466,7 @@ func TestFlowTestintelListReports(t *testing.T) {
 
 	// DB: scoped denial, missing run, read failure, list failure, success.
 	s2, f, _, _ := cacheFixture(t)
-	if err := s2.AuthStore.AddToken("outsider", auth.Principal{Subject: "outsider", Roles: []auth.Role{auth.RoleRead},
+	if err := s2.AuthStore.AddToken("outsider", auth.Principal{Subject: "outsider",
 		Repositories: map[string]auth.RepositoryPermission{"github.com/o/repo-b": {Read: true}}}); err != nil {
 		t.Fatal(err)
 	}
@@ -507,7 +507,7 @@ func TestFlowTestintelIntelligence(t *testing.T) {
 		t.Fatalf("rbac intelligence = %d, want 403", w.Code)
 	}
 	// Scoped denial through repo visibility.
-	if err := s.AuthStore.AddToken("outsider", auth.Principal{Subject: "outsider", Roles: []auth.Role{auth.RoleRead},
+	if err := s.AuthStore.AddToken("outsider", auth.Principal{Subject: "outsider",
 		Repositories: map[string]auth.RepositoryPermission{"github.com/o/repo-b": {Read: true}}}); err != nil {
 		t.Fatal(err)
 	}

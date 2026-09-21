@@ -251,7 +251,6 @@ func TestFlowSnapshotMemoryDownloadScopedDenial(t *testing.T) {
 	s.mu.Unlock()
 	if err := s.AuthStore.AddToken("outsider", auth.Principal{
 		Subject: "outsider",
-		Roles:   []auth.Role{auth.RoleRead},
 		Repositories: map[string]auth.RepositoryPermission{
 			"github.com/o/repo-b": {Read: true},
 		},
@@ -348,7 +347,6 @@ func TestFlowSnapshotDBListScopedDenial(t *testing.T) {
 	s, _, _, _ := cacheFixture(t)
 	if err := s.AuthStore.AddToken("outsider", auth.Principal{
 		Subject: "outsider",
-		Roles:   []auth.Role{auth.RoleRead},
 		Repositories: map[string]auth.RepositoryPermission{
 			"github.com/o/repo-b": {Read: true},
 		},
@@ -468,7 +466,6 @@ func TestFlowSnapshotDBDownloadScopedDenial(t *testing.T) {
 	f.mu.Unlock()
 	if err := s.AuthStore.AddToken("outsider", auth.Principal{
 		Subject: "outsider",
-		Roles:   []auth.Role{auth.RoleRead},
 		Repositories: map[string]auth.RepositoryPermission{
 			"github.com/o/repo-b": {Read: true},
 		},

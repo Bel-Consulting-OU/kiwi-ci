@@ -53,24 +53,29 @@ func idcovPrincipal(t *testing.T, p auth.Principal) *http.Request {
 func TestIDCovTiersPureHelpers(t *testing.T) {
 	s := New("t")
 
-	// repoVisible: a canonical run identity matches a bare alias. The full
+	// canReadRepo: a canonical run identity matches a bare alias. The full
 	// name deliberately differs from the alias so the canonical bare-part
 	// resolution is the branch under test.
 	run := model.Run{ID: "r1", RepoID: "github.com/acme/service", RepoFullName: "acme/service-full"}
 	alias := auth.Principal{Subject: "u", Repositories: map[string]auth.RepositoryPermission{"acme/service": {Read: true}}}
-	if !s.repoVisible(idcovPrincipal(t, alias), run) {
+	if !s.canReadRepo(idcovPrincipal(t, alias), repoIDForRun(run)) {
 		t.Fatal("bare alias did not match the canonical run identity")
 	}
 	canonOnly := auth.Principal{Subject: "u", Repositories: map[string]auth.RepositoryPermission{"github.com/acme/service": {Read: true}}}
-	if !s.repoVisible(idcovPrincipal(t, canonOnly), run) {
+	if !s.canReadRepo(idcovPrincipal(t, canonOnly), repoIDForRun(run)) {
 		t.Fatal("canonical key did not match")
 	}
-	if !s.repoVisible(idcovPrincipal(t, alias), model.Run{ID: "r2", RepoID: "github.com/acme/service", RepoFullName: "acme/service-full"}) {
+	if !s.canReadRepo(idcovPrincipal(t, alias), repoIDForRun(model.Run{ID: "r2", RepoID: "github.com/acme/service", RepoFullName: "acme/service-full"})) {
 		t.Fatal("bare alias did not match the canonical bare part")
 	}
 	other := auth.Principal{Subject: "u", Repositories: map[string]auth.RepositoryPermission{"github.com/other/repo": {Read: true}}}
-	if s.repoVisible(idcovPrincipal(t, other), run) {
-		t.Fatal("unrelated repository was visible")
+	if s.canReadRepo(idcovPrincipal(t, other), repoIDForRun(run)) {
+		t.Fatal("unrelated repository was readable")
+	}
+	// The no-principal path (legacy/web session) is decided by the outer
+	// tier and must stay open.
+	if !s.canReadRepo(httptest.NewRequest(http.MethodGet, "/", nil), repoIDForRun(run)) {
+		t.Fatal("no-principal request must pass the repository check")
 	}
 
 	// repoVisibleByName: canonical input matches a bare alias, and the
@@ -85,13 +90,13 @@ func TestIDCovTiersPureHelpers(t *testing.T) {
 		t.Fatal("unrelated name was visible")
 	}
 
-	// authorizeRepo: trusted run resolution, unknown actions and the
-	// per-repository permission table.
+	// auth.Authorize: trusted run resolution, unknown actions and the
+	// per-repository permission table (resolved only in internal/auth).
 	trustedPrincipal := auth.Principal{Subject: "u", Roles: []auth.Role{auth.RoleTrustedRun}}
-	if !authorizeRepo(trustedPrincipal, auth.ActionRun, "", true) {
+	if !auth.Authorize(trustedPrincipal, auth.ActionRun, "", true) {
 		t.Fatal("trusted run role rejected for a trusted action")
 	}
-	if authorizeRepo(trustedPrincipal, auth.Action("unknown_action"), "", false) {
+	if auth.Authorize(trustedPrincipal, auth.Action("unknown_action"), "", false) {
 		t.Fatal("unknown action authorized")
 	}
 	perm := auth.Principal{Subject: "u", Repositories: map[string]auth.RepositoryPermission{
@@ -99,20 +104,20 @@ func TestIDCovTiersPureHelpers(t *testing.T) {
 	}}
 	for _, action := range []auth.Action{auth.ActionRun, auth.ActionTrustedRun, auth.ActionApprove, auth.ActionCancel, auth.ActionRerun, auth.ActionArtifactRead, auth.ActionRead} {
 		want := action != auth.ActionRead
-		if got := authorizeRepo(perm, action, "github.com/acme/service", action == auth.ActionRun); got != want {
-			t.Fatalf("authorizeRepo(%s) = %v, want %v", action, got, want)
+		if got := auth.Authorize(perm, action, "github.com/acme/service", action == auth.ActionRun); got != want {
+			t.Fatalf("Authorize(%s) = %v, want %v", action, got, want)
 		}
 	}
-	if authorizeRepo(perm, auth.ActionRun, "github.com/acme/service", false) != true {
+	if !auth.Authorize(perm, auth.ActionRun, "github.com/acme/service", false) {
 		t.Fatal("untrusted run permission rejected")
 	}
-	if authorizeRepo(perm, auth.Action("unknown"), "github.com/acme/service", false) {
+	if auth.Authorize(perm, auth.Action("unknown"), "github.com/acme/service", false) {
 		t.Fatal("unknown action authorized through the repo table")
 	}
 
-	// requireRunRead / requireRunArtifactRead: a read principal scoped away
-	// from the run is refused.
-	scoped := auth.Principal{Subject: "u", Roles: []auth.Role{auth.RoleRead, auth.RoleArtifactRead}, Repositories: map[string]auth.RepositoryPermission{"github.com/other/repo": {Read: true, ArtifactRead: true}}}
+	// requireRunRead / requireRunArtifactRead: a repo-only read principal
+	// scoped away from the run is refused.
+	scoped := auth.Principal{Subject: "u", Repositories: map[string]auth.RepositoryPermission{"github.com/other/repo": {Read: true, ArtifactRead: true}}}
 	w := httptest.NewRecorder()
 	if s.requireRunRead(w, idcovPrincipal(t, scoped), run) || w.Code != http.StatusForbidden {
 		t.Fatalf("requireRunRead scoped out = %v/%d", false, w.Code)
@@ -554,9 +559,10 @@ func TestIDCovGetRunAndListJobsDBBranches(t *testing.T) {
 	f.mu.Lock()
 	f.runs["r1"] = model.Run{ID: "r1", RepoID: "github.com/kiwi/repo", RepoFullName: "kiwi/repo", Status: model.StatusRunning}
 	f.mu.Unlock()
-	// A read-restricted principal is refused on both endpoints.
+	// A repo-only read principal restricted to another repository is refused
+	// on both endpoints.
 	scoped := storeServer(t, "", map[string]auth.Principal{
-		"read-token": {Subject: "reader", Roles: []auth.Role{auth.RoleRead}, Repositories: map[string]auth.RepositoryPermission{"github.com/other/repo": {Read: true}}},
+		"read-token": {Subject: "reader", Repositories: map[string]auth.RepositoryPermission{"github.com/other/repo": {Read: true}}},
 	})
 	if err := scoped.SwitchToDB(f); err != nil {
 		t.Fatal(err)

@@ -21,7 +21,8 @@ untrusted code.
   enforcement), and disposable Tart VMs on Apple Silicon.
 - **Control plane**: PostgreSQL-backed scheduler with per-job leases,
   HA leader election, REST API, web dashboard, audit log, and
-  Prometheus metrics.
+  Prometheus metrics. The runs collection is keyset-paginated so older
+  runs stay reachable; see [docs/runs-api.md](docs/runs-api.md).
 - **Security**: capability-based admission policy with a deny-by-default
   untrusted floor, mTLS runner enrollment, HMAC-only lease tokens,
   sealed secret delivery, OIDC token issuance, and hardened archive

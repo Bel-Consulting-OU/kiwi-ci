@@ -281,13 +281,10 @@ func TestOutboxDBStaleClaimReclaimed(t *testing.T) {
 	}
 }
 
-// TestOutboxDBLocalOnlyItemStillDispatched: an Enqueue whose durable append
-// failed stays queued in memory and is still dispatched (no row to claim).
 // TestOutboxDBAppendFailureNeverDispatches is the durable-first contract:
 // when the DB append fails the intent must NOT be dispatchable from RAM — an
 // external side effect that was never durably recorded can be lost forever
-// on a crash. (This replaces the old local-only-dispatch expectation, which
-// violated the durable-outbox model.)
+// on a crash.
 func TestOutboxDBAppendFailureNeverDispatches(t *testing.T) {
 	f := newDBFakeStore()
 	o := NewOutbox(nil)

@@ -240,12 +240,20 @@ func (s *Server) uploadSigstore(w http.ResponseWriter, r *http.Request, j model.
 		return
 	}
 	cfg := s.sigstoreVerifyConfig(c)
-	if recs, lerr := s.findArtifactByJobName(r.Context(), j.RunID, j.ID, base); lerr == nil && len(recs) > 0 {
-		latest := recs[len(recs)-1]
-		if err := supplychain.VerifySigstoreBundle(body, latest.SHA256, cfg); err != nil {
-			s.auditLocked("artifact.sigstore_rejected", j.LeaseRunnerID, j.RunID, j.ID, "sigstore bundle verification failed", map[string]string{"name": base, "error": err.Error()})
-			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
-			return
+	// Immediate verification is generation-qualified: the bundle can only be
+	// verified against the artifact uploaded under THIS lease generation. A
+	// previous generation's record (same artifact name) is never inspected —
+	// a retry generation must not be able to pass its bundle on the prior
+	// payload's digest. When no record exists for this generation yet (the
+	// documented bundle-before-payload order) verification is deferred to the
+	// artifact upload gate, which resolves the exact generation's digest.
+	if recs, lerr := s.findArtifactByJobName(r.Context(), j.RunID, j.ID, base); lerr == nil {
+		if current, found := existingArtifactForGeneration(recs, j.LeaseGeneration); found {
+			if err := supplychain.VerifySigstoreBundle(body, current.SHA256, cfg); err != nil {
+				s.auditLocked("artifact.sigstore_rejected", j.LeaseRunnerID, j.RunID, j.ID, "sigstore bundle verification failed", map[string]string{"name": base, "error": err.Error()})
+				http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+				return
+			}
 		}
 	}
 	sum := sha256Hex(body)
@@ -307,9 +315,12 @@ func (s *Server) uploadSigstore(w http.ResponseWriter, r *http.Request, j model.
 const pendingSidecarMaxAge = 7 * 24 * time.Hour
 
 // sidecarPendingKey names one pending sidecar in the dev-mode in-memory
-// mirror. DB mode keys the durable row by (job, artifact, kind) directly.
-func sidecarPendingKey(jobID, base, kind string) string {
-	return jobID + "\x00" + cleanBlobName(base) + "\x00" + kind
+// mirror. DB mode keys the durable row by the same full artifact identity
+// (job, lease generation, artifact, kind) — migration 0028 — directly: a
+// retry generation must never collide with (or resolve) a previous
+// generation's pending sidecar.
+func sidecarPendingKey(jobID string, generation int64, base, kind string) string {
+	return jobID + "\x00" + strconv.FormatInt(generation, 10) + "\x00" + cleanBlobName(base) + "\x00" + kind
 }
 
 // encodePendingSidecar packs a dev-mode mirror entry: the CAS digest plus
@@ -347,33 +358,38 @@ func (s *Server) sidecarStore() (storage.ArtifactSidecarStore, bool) {
 
 // rememberPendingSidecar records a sidecar digest uploaded before its
 // artifact payload, so the payload upload gate can resolve the bytes
-// through CAS. DB mode writes the DURABLE artifact_pending_sidecars row
-// (visible to every replica, survives restarts); fs/memory mode keeps the
-// in-memory mirror, which is dev-mode state only. A DB-mode store failure
-// is returned so the caller fails closed — never a 201 without pending
-// state.
+// through CAS. The row is keyed by the FULL artifact identity
+// (job, lease generation, artifact, kind): a retry generation's sidecar can
+// never overwrite or masquerade as another generation's pending state. DB
+// mode writes the DURABLE artifact_pending_sidecars row (visible to every
+// replica, survives restarts); fs/memory mode keeps the in-memory mirror,
+// which is dev-mode state only. A DB-mode store failure is returned so the
+// caller fails closed — never a 201 without pending state.
 func (s *Server) rememberPendingSidecar(ctx context.Context, j model.Job, base, kind, digest string) error {
 	if ss, ok := s.sidecarStore(); ok {
-		return ss.RememberPendingSidecar(ctx, j.ID, cleanBlobName(base), kind, digest)
+		return ss.RememberPendingSidecar(ctx, j.ID, j.LeaseGeneration, cleanBlobName(base), kind, digest)
 	}
 	if s.DB != nil {
 		return fmt.Errorf("artifact sidecar store unavailable")
 	}
 	s.mu.Lock()
-	s.pendingSidecars[sidecarPendingKey(j.ID, base, kind)] = encodePendingSidecar(digest, time.Now().UTC())
+	s.pendingSidecars[sidecarPendingKey(j.ID, j.LeaseGeneration, base, kind)] = encodePendingSidecar(digest, time.Now().UTC())
 	s.mu.Unlock()
 	return nil
 }
 
-// pendingSidecarDigest resolves the CAS digest of a pending sidecar: from
-// the durable store in DB mode, from the in-memory mirror otherwise.
-func (s *Server) pendingSidecarDigest(ctx context.Context, jobID, base, kind string) (string, bool, error) {
+// pendingSidecarDigest resolves the CAS digest of a pending sidecar for the
+// EXACT (job, lease generation, artifact, kind) identity: from the durable
+// store in DB mode, from the in-memory mirror otherwise. A row for another
+// generation is never a fallback — the caller fails closed when this
+// generation has no pending sidecar.
+func (s *Server) pendingSidecarDigest(ctx context.Context, jobID string, generation int64, base, kind string) (string, bool, error) {
 	if ss, ok := s.sidecarStore(); ok {
-		return ss.PendingSidecar(ctx, jobID, cleanBlobName(base), kind)
+		return ss.PendingSidecar(ctx, jobID, generation, cleanBlobName(base), kind)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	v, ok := s.pendingSidecars[sidecarPendingKey(jobID, base, kind)]
+	v, ok := s.pendingSidecars[sidecarPendingKey(jobID, generation, base, kind)]
 	if !ok {
 		return "", false, nil
 	}
@@ -381,30 +397,32 @@ func (s *Server) pendingSidecarDigest(ctx context.Context, jobID, base, kind str
 	return digest, ok && digest != "", nil
 }
 
-// consumeArtifactPendingSidecars deletes the pending rows whose digests
-// were copied into a durably committed artifact record, then clears the
-// job's leftover rows (DeletePendingSidecars): every remaining digest was
-// either attached to the record or is expendable. It MUST run only after
-// the record insert committed; a crash in between leaves the pending rows
-// in place for the retry. Failures are the caller's to log: the record is
-// already durable and the maintenance tick prunes leftovers.
-func (s *Server) consumeArtifactPendingSidecars(ctx context.Context, jobID string, rec model.ArtifactRecord) error {
+// consumeArtifactPendingSidecars deletes ONLY the pending rows whose digests
+// were copied into a durably committed artifact record: the exact
+// (job, lease generation, artifact, kind) rows the record references. There
+// is deliberately no job-wide delete — another artifact's (or another
+// generation's) pending sidecar survives its own commit or the 7-day prune.
+// It MUST run only after the record insert committed; a crash in between
+// leaves the pending rows in place for the retry. Failures are the caller's
+// to log: the record is already durable and the maintenance tick prunes
+// leftovers.
+func (s *Server) consumeArtifactPendingSidecars(ctx context.Context, rec model.ArtifactRecord) error {
 	ss, ok := s.sidecarStore()
 	if !ok {
 		return nil
 	}
 	name := cleanBlobName(rec.Name)
 	if rec.SBOMSHA256 != "" {
-		if err := ss.ConsumePendingSidecar(ctx, jobID, name, storage.ArtifactSidecarKindSBOM, rec.SBOMSHA256); err != nil {
+		if err := ss.ConsumePendingSidecar(ctx, rec.JobID, rec.LeaseGeneration, name, storage.ArtifactSidecarKindSBOM, rec.SBOMSHA256); err != nil {
 			return err
 		}
 	}
 	if rec.SigstoreSHA256 != "" {
-		if err := ss.ConsumePendingSidecar(ctx, jobID, name, storage.ArtifactSidecarKindSigstore, rec.SigstoreSHA256); err != nil {
+		if err := ss.ConsumePendingSidecar(ctx, rec.JobID, rec.LeaseGeneration, name, storage.ArtifactSidecarKindSigstore, rec.SigstoreSHA256); err != nil {
 			return err
 		}
 	}
-	return ss.DeletePendingSidecars(ctx, jobID)
+	return nil
 }
 
 // pruneExpiredPendingSidecars drops pending sidecar rows older than
@@ -432,22 +450,25 @@ func (s *Server) pruneExpiredPendingSidecars(ctx context.Context, now time.Time)
 }
 
 // attachSidecarToArtifact links a verified sidecar (sbom/sigstore) to the
-// existing artifact record for base and returns an error when the link
-// cannot be durably recorded: DB mode persists the digest references
-// through the store (ArtifactSidecarStore), and a persistence failure must
-// fail the request closed (503) instead of acknowledging a sidecar the
-// record does not carry. No record yet is not a failure: the pending row
-// is resolved when the artifact payload is recorded. Memory mode updates
-// the in-memory record.
+// artifact record of the CURRENT lease generation and returns an error when
+// the link cannot be durably recorded: DB mode persists the digest
+// references through the store (ArtifactSidecarStore), and a persistence
+// failure must fail the request closed (503) instead of acknowledging a
+// sidecar the record does not carry. Selection is generation-qualified: a
+// record uploaded under another lease generation is NEVER a candidate (that
+// would attach this generation's attestation to the previous generation's
+// payload). No record yet for this generation is not a failure: the sidecar
+// stays pending and is resolved when the payload is recorded. Memory mode
+// updates the in-memory record.
 func (s *Server) attachSidecarToArtifact(ctx context.Context, j model.Job, base, kind, path, sum string) error {
 	recs, err := s.findArtifactByJobName(ctx, j.RunID, j.ID, base)
 	if err != nil {
 		return err
 	}
-	if len(recs) == 0 {
+	rec, found := existingArtifactForGeneration(recs, j.LeaseGeneration)
+	if !found {
 		return nil
 	}
-	rec := recs[len(recs)-1]
 	if s.DB != nil {
 		ss, ok := s.sidecarStore()
 		if !ok {
@@ -526,13 +547,14 @@ func (s *Server) gateArtifactAttestations(ctx context.Context, c storage.Artifac
 }
 
 // sidecarBytes resolves one sidecar's bytes for the upload gate: from the
-// durable pending row in DB mode (the digest points into the shared CAS),
-// from the pending map when present, from the local sidecar file in
-// fs/memory mode otherwise. An unresolvable sidecar is reported as an
-// error so the gate fails closed.
+// durable pending row of the EXACT (job, lease generation, artifact, kind)
+// identity in DB mode (the digest points into the shared CAS), from the
+// pending map when present, from the local sidecar file in fs/memory mode
+// otherwise. Another generation's pending row is never used. An
+// unresolvable sidecar is reported as an error so the gate fails closed.
 func (s *Server) sidecarBytes(ctx context.Context, j model.Job, base, kind, dir string) ([]byte, error) {
 	if s.DB != nil {
-		d, ok, err := s.pendingSidecarDigest(ctx, j.ID, base, kind)
+		d, ok, err := s.pendingSidecarDigest(ctx, j.ID, j.LeaseGeneration, base, kind)
 		if err != nil {
 			return nil, err
 		}
@@ -546,7 +568,7 @@ func (s *Server) sidecarBytes(ctx context.Context, j model.Job, base, kind, dir 
 		}
 		return nil, os.ErrNotExist
 	}
-	if d, ok, err := s.pendingSidecarDigest(ctx, j.ID, base, kind); err == nil && ok && d != "" && s.CAS != nil {
+	if d, ok, err := s.pendingSidecarDigest(ctx, j.ID, j.LeaseGeneration, base, kind); err == nil && ok && d != "" && s.CAS != nil {
 		if rc, _, oerr := s.CAS.Open(ctx, d); oerr == nil {
 			defer rc.Close()
 			return io.ReadAll(io.LimitReader(rc, maxSBOMBytes+1))
@@ -556,24 +578,26 @@ func (s *Server) sidecarBytes(ctx context.Context, j model.Job, base, kind, dir 
 }
 
 // attachSidecarsToRecord fills the sidecar fields of a freshly built
-// artifact record: from the DURABLE pending-sidecar rows in DB mode (their
+// artifact record: from the DURABLE pending-sidecar rows of the record's
+// exact (job, lease generation, artifact, kind) identity in DB mode (their
 // CAS digest references), from the pending mirror / local sidecar files in
-// fs mode. A store lookup failure is returned so the caller fails the
-// upload instead of recording an artifact that silently lost its attested
-// sidecars.
+// fs mode. The generation is part of the lookup, so a retry generation never
+// picks up the previous generation's pending sidecar. A store lookup failure
+// is returned so the caller fails the upload instead of recording an
+// artifact that silently lost its attested sidecars.
 func (s *Server) attachSidecarsToRecord(ctx context.Context, rec *model.ArtifactRecord, j model.Job, base, dir string) error {
 	if s.DB != nil {
 		ss, ok := s.sidecarStore()
 		if !ok {
 			return fmt.Errorf("artifact sidecar store unavailable")
 		}
-		if d, ok, err := ss.PendingSidecar(ctx, j.ID, cleanBlobName(base), storage.ArtifactSidecarKindSBOM); err != nil {
+		if d, ok, err := ss.PendingSidecar(ctx, j.ID, j.LeaseGeneration, cleanBlobName(base), storage.ArtifactSidecarKindSBOM); err != nil {
 			return err
 		} else if ok && d != "" {
 			rec.SBOMPath = "cas:" + d
 			rec.SBOMSHA256 = d
 		}
-		if d, ok, err := ss.PendingSidecar(ctx, j.ID, cleanBlobName(base), storage.ArtifactSidecarKindSigstore); err != nil {
+		if d, ok, err := ss.PendingSidecar(ctx, j.ID, j.LeaseGeneration, cleanBlobName(base), storage.ArtifactSidecarKindSigstore); err != nil {
 			return err
 		} else if ok && d != "" {
 			rec.SigstorePath = "cas:" + d
@@ -581,14 +605,14 @@ func (s *Server) attachSidecarsToRecord(ctx context.Context, rec *model.Artifact
 		}
 		return nil
 	}
-	if d, ok, _ := s.pendingSidecarDigest(ctx, j.ID, base, storage.ArtifactSidecarKindSBOM); ok && d != "" && s.CAS != nil {
+	if d, ok, _ := s.pendingSidecarDigest(ctx, j.ID, j.LeaseGeneration, base, storage.ArtifactSidecarKindSBOM); ok && d != "" && s.CAS != nil {
 		rec.SBOMPath = "cas:" + d
 		rec.SBOMSHA256 = d
 	} else if b, err := os.ReadFile(artifactSidecarPath(dir, base, "sbom")); err == nil && json.Valid(b) {
 		rec.SBOMPath = artifactSidecarPath(dir, base, "sbom")
 		rec.SBOMSHA256 = sha256Hex(b)
 	}
-	if d, ok, _ := s.pendingSidecarDigest(ctx, j.ID, base, storage.ArtifactSidecarKindSigstore); ok && d != "" && s.CAS != nil {
+	if d, ok, _ := s.pendingSidecarDigest(ctx, j.ID, j.LeaseGeneration, base, storage.ArtifactSidecarKindSigstore); ok && d != "" && s.CAS != nil {
 		rec.SigstorePath = "cas:" + d
 		rec.SigstoreSHA256 = d
 	} else if b, err := os.ReadFile(artifactSidecarPath(dir, base, "sigstore")); err == nil && json.Valid(b) {

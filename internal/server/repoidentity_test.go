@@ -162,10 +162,10 @@ func TestRBACUsesStoredRepoID(t *testing.T) {
 	}
 	githubRun := model.Run{RepoID: "github.com/acme/backend", Repo: "https://github.com/acme/backend.git", RepoFullName: "acme/backend"}
 	gitlabRun := model.Run{RepoID: "gitlab.company.com/acme/backend", Repo: "https://gitlab.company.com/acme/backend.git", RepoFullName: "acme/backend"}
-	if !authorizeRepo(principal, auth.ActionRead, repoIDForRun(githubRun), false) {
+	if !auth.Authorize(principal, auth.ActionRead, repoIDForRun(githubRun), false) {
 		t.Fatal("declared canonical repo must authorize")
 	}
-	if authorizeRepo(principal, auth.ActionRead, repoIDForRun(gitlabRun), false) {
+	if auth.Authorize(principal, auth.ActionRead, repoIDForRun(gitlabRun), false) {
 		t.Fatal("same-name repository on another forge must not be authorized")
 	}
 }

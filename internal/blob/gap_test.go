@@ -267,24 +267,121 @@ func TestS3ClientRedirectPolicy(t *testing.T) {
 	}
 }
 
-// TestS3ObjectURLStyles proves both addressing styles build the expected URL
-// and that trailing endpoint slashes never leak a double slash into the path.
+// TestS3ObjectURLStyles proves both addressing styles build the expected URL:
+// ports are preserved in both styles, a path-style endpoint keeps its gateway
+// path prefix, trailing endpoint slashes never leak a double slash into the
+// path, and a scheme-less endpoint is rejected (it is not an absolute URL).
 func TestS3ObjectURLStyles(t *testing.T) {
 	for _, endpoint := range []string{"http://localhost:9000/", "http://localhost:9000//"} {
 		path := &S3{Endpoint: endpoint, Bucket: "bucket", PathStyle: true}
-		if got := path.objectURL("/key"); got != "http://localhost:9000/bucket/key" {
+		got, err := path.objectURL("/key")
+		if err != nil {
+			t.Fatalf("path-style URL for %q: %v", endpoint, err)
+		}
+		if got != "http://localhost:9000/bucket/key" {
 			t.Fatalf("path-style URL for %q = %q", endpoint, got)
 		}
 	}
-	for _, endpoint := range []string{"https://s3.example.com/", "https://s3.example.com//", "https:///s3.example.com/"} {
-		virtual := &S3{Endpoint: endpoint, Bucket: "bucket"}
-		if got := virtual.objectURL("key"); got != "https://bucket.s3.example.com/key" {
-			t.Fatalf("virtual-hosted URL for %q = %q", endpoint, got)
+	// Ports and a gateway path prefix survive path-style addressing.
+	prefix := &S3{Endpoint: "https://gw.example:9443/s3/", Bucket: "bucket", PathStyle: true}
+	if got, err := prefix.objectURL("key"); err != nil || got != "https://gw.example:9443/s3/bucket/key" {
+		t.Fatalf("path-style prefixed URL = %q, err=%v", got, err)
+	}
+	// Virtual-hosted style puts the bucket before the endpoint host, keeps
+	// the port, and ignores trailing slashes.
+	for _, tc := range []struct{ endpoint, want string }{
+		{"https://s3.example.com/", "https://bucket.s3.example.com/key"},
+		{"https://s3.example.com//", "https://bucket.s3.example.com/key"},
+		{"https://s3.example.com:8443", "https://bucket.s3.example.com:8443/key"},
+	} {
+		virtual := &S3{Endpoint: tc.endpoint, Bucket: "bucket"}
+		got, err := virtual.objectURL("key")
+		if err != nil {
+			t.Fatalf("virtual-hosted URL for %q: %v", tc.endpoint, err)
+		}
+		if got != tc.want {
+			t.Fatalf("virtual-hosted URL for %q = %q, want %q", tc.endpoint, got, tc.want)
 		}
 	}
 	bare := &S3{Endpoint: "s3.example.com", Bucket: "bucket"}
-	if got := bare.objectURL("key"); got != "https://bucket.s3.example.com/key" {
-		t.Fatalf("bare endpoint URL = %q", got)
+	if _, err := bare.objectURL("key"); err == nil {
+		t.Fatal("scheme-less endpoint accepted")
+	}
+}
+
+// TestS3ValidateS3Config pins the endpoint/bucket coherence rules shared by
+// config validation (blob.ValidateS3Config) and the transport: invalid
+// endpoints, unusable bucket names, IP endpoints in virtual-hosted style and
+// path prefixes in virtual-hosted style are refused (pointing the operator at
+// s3_path_style), while the path-style variants are accepted.
+func TestS3ValidateS3Config(t *testing.T) {
+	cases := []struct {
+		name     string
+		endpoint string
+		bucket   string
+		path     bool
+		wantErr  bool
+		wantHint bool
+	}{
+		{"https dns virtual", "https://s3.example.com", "bucket", false, false, false},
+		{"http dns path", "http://localhost:9000", "bucket", true, false, false},
+		{"ip path-style", "http://127.0.0.1:9000", "bucket", true, false, false},
+		{"ip virtual rejected", "http://127.0.0.1:9000", "bucket", false, true, true},
+		{"ipv6 path-style", "http://[::1]:9000", "bucket", true, false, false},
+		{"ipv6 virtual rejected", "http://[::1]:9000", "bucket", false, true, true},
+		{"path prefix path-style", "https://gw.example/s3", "bucket", true, false, false},
+		{"path prefix virtual rejected", "https://gw.example/s3", "bucket", false, true, true},
+		{"dotted bucket virtual", "https://s3.example.com", "my.bucket", false, false, false},
+		{"dotted bucket path-style", "https://s3.example.com", "my.bucket", true, false, false},
+		{"double-dot virtual rejected", "https://s3.example.com", "my..bucket", false, true, false},
+		{"double-dot path rejected", "https://s3.example.com", "my..bucket", true, true, false},
+		{"empty bucket rejected", "https://s3.example.com", "", false, true, false},
+		{"slash bucket rejected", "https://s3.example.com", "a/b", true, true, false},
+		{"space bucket rejected", "https://s3.example.com", "a b", true, true, false},
+		{"leading-dash label virtual rejected", "https://s3.example.com", "b-.x", false, true, true},
+		{"empty label virtual rejected", "https://s3.example.com", "b..x", false, true, false},
+		{"missing scheme", "s3.example.com", "bucket", true, true, false},
+		{"empty endpoint", "", "bucket", true, true, false},
+		{"non-http scheme", "ftp://s3.example.com", "bucket", true, true, false},
+		{"https without host", "https://", "bucket", true, true, false},
+		{"userinfo", "https://u:p@s3.example.com", "bucket", true, true, false},
+		{"query", "https://s3.example.com?x=1", "bucket", true, true, false},
+		{"fragment", "https://s3.example.com#f", "bucket", true, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateS3Config(tc.endpoint, tc.bucket, tc.path)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("ValidateS3Config(%q, %q, path=%v) = %v, wantErr=%v", tc.endpoint, tc.bucket, tc.path, err, tc.wantErr)
+			}
+			if err != nil && tc.wantHint && !strings.Contains(err.Error(), "s3_path_style") {
+				t.Fatalf("error %q does not point at s3_path_style", err)
+			}
+		})
+	}
+}
+
+// TestS3ValidateAndParseOnce proves the store's own Validate reports the same
+// coherence error objectURL reports and that the endpoint is resolved exactly
+// once per store instance: a later Endpoint mutation cannot silently redirect
+// an already-validated store.
+func TestS3ValidateAndParseOnce(t *testing.T) {
+	bad := &S3{Endpoint: "http://127.0.0.1:9000", Bucket: "bucket"}
+	err := bad.Validate()
+	if err == nil || !strings.Contains(err.Error(), "s3_path_style") {
+		t.Fatalf("virtual-hosted IP endpoint Validate = %v", err)
+	}
+	if _, uerr := bad.objectURL("key"); uerr == nil {
+		t.Fatal("objectURL accepted the same unusable combination")
+	}
+
+	s := &S3{Endpoint: "https://s3.example.com", Bucket: "bucket"}
+	if err := s.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	s.Endpoint = "http://[::1"
+	if got, err := s.objectURL("key"); err != nil || got != "https://bucket.s3.example.com/key" {
+		t.Fatalf("cached endpoint URL = %q, err=%v", got, err)
 	}
 }
 

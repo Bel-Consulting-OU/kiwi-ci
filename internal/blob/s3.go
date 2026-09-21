@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -109,6 +110,10 @@ func s3Transport() *http.Transport {
 
 // S3 is an S3-compatible Store using AWS Signature Version 4 implemented with
 // the standard library only.
+//
+// Endpoint and Bucket are parsed and validated exactly once per store
+// instance (see Validate), so an unusable endpoint/bucket/style combination
+// fails the first request instead of building a broken URL.
 type S3 struct {
 	Endpoint        string
 	Region          string
@@ -118,6 +123,12 @@ type S3 struct {
 	Token           string
 	PathStyle       bool
 	Client          *http.Client
+
+	// endpointOnce caches the endpoint resolution: endpointURL is the parsed
+	// endpoint and endpointErr is the sticky validation error.
+	endpointOnce sync.Once
+	endpointURL  *url.URL
+	endpointErr  error
 }
 
 func (s *S3) client() *http.Client {
@@ -132,12 +143,142 @@ func (s *S3) client() *http.Client {
 	return c
 }
 
-func (s *S3) objectURL(key string) string {
-	if s.PathStyle {
-		return strings.TrimRight(s.Endpoint, "/") + "/" + s.Bucket + "/" + strings.TrimPrefix(key, "/")
+// s3BucketRE matches the URL-safe bucket characters an S3-compatible
+// endpoint accepts. The full AWS naming rules (3-63 lowercase characters)
+// are deliberately not enforced: local gateways commonly use short or
+// mixed-case names, and the coherence rules in resolveS3Target are what keep
+// the address resolvable.
+var s3BucketRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+// parseS3Endpoint parses and structurally validates one S3 endpoint. The
+// endpoint must be an absolute http(s) URL with a host and, like every
+// credential-bearing URL, must not carry userinfo, a query or a fragment.
+// This parse is the single source of truth for both addressing styles.
+func parseS3Endpoint(raw string) (*url.URL, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, fmt.Errorf("blob: s3 endpoint is required")
 	}
-	host := strings.Trim(strings.TrimPrefix(s.Endpoint, "https://"), "/")
-	return "https://" + s.Bucket + "." + host + "/" + strings.TrimPrefix(key, "/")
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return nil, fmt.Errorf("blob: s3 endpoint is not a valid URL: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("blob: s3 endpoint must use http:// or https://, got %q", raw)
+	}
+	if u.Host == "" || u.Hostname() == "" {
+		return nil, fmt.Errorf("blob: s3 endpoint has no host: %q", raw)
+	}
+	if u.User != nil {
+		return nil, fmt.Errorf("blob: s3 endpoint must not carry userinfo (credentials go in the access key fields)")
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("blob: s3 endpoint must not carry a query or fragment")
+	}
+	return u, nil
+}
+
+// validateS3Bucket checks that bucket can be placed in a URL path
+// (path-style) or as the first host label (virtual-hosted style).
+func validateS3Bucket(bucket string, pathStyle bool) error {
+	if bucket == "" {
+		return fmt.Errorf("blob: s3 bucket is required")
+	}
+	if !s3BucketRE.MatchString(bucket) || strings.Contains(bucket, "..") {
+		return fmt.Errorf("blob: s3 bucket %q contains characters that cannot appear in an S3 URL", bucket)
+	}
+	if pathStyle {
+		return nil
+	}
+	for _, label := range strings.Split(bucket, ".") {
+		if label == "" || len(label) > 63 || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return fmt.Errorf("blob: s3 bucket %q is not a DNS-compatible host label; use path-style addressing (blob.s3_path_style)", bucket)
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+				return fmt.Errorf("blob: s3 bucket %q is not a DNS-compatible host label; use path-style addressing (blob.s3_path_style)", bucket)
+			}
+		}
+	}
+	return nil
+}
+
+// resolveS3Target parses the endpoint and validates the endpoint/bucket
+// combination for the chosen addressing style:
+//
+//   - path-style: the endpoint may be an IP literal and may carry a path
+//     prefix (a gateway base path); the bucket is appended to that path and
+//     the endpoint port is preserved.
+//   - virtual-hosted style: the bucket becomes the first host label, so the
+//     endpoint host must be a DNS name (an IP literal cannot carry a bucket
+//     subdomain), must not carry a path prefix (which cannot be combined
+//     with a bucket host), and the bucket must be a DNS-compatible label
+//     sequence. Use path-style addressing for any of those cases.
+func resolveS3Target(endpoint, bucket string, pathStyle bool) (*url.URL, error) {
+	u, err := parseS3Endpoint(endpoint)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateS3Bucket(bucket, pathStyle); err != nil {
+		return nil, err
+	}
+	if pathStyle {
+		return u, nil
+	}
+	if net.ParseIP(u.Hostname()) != nil {
+		return nil, fmt.Errorf("blob: s3 endpoint %q is an IP address, which cannot carry the virtual-hosted bucket subdomain; use path-style addressing (blob.s3_path_style)", u.Host)
+	}
+	if strings.Trim(u.Path, "/") != "" {
+		return nil, fmt.Errorf("blob: s3 endpoint %q has a path prefix, which virtual-hosted addressing cannot combine with a bucket host; use path-style addressing (blob.s3_path_style)", u.Path)
+	}
+	return u, nil
+}
+
+// ValidateS3Config validates one endpoint/bucket pair for the given
+// addressing style exactly as the S3 transport resolves it, so config
+// validation can fail an unusable combination at startup instead of at the
+// first artifact transfer.
+func ValidateS3Config(endpoint, bucket string, pathStyle bool) error {
+	_, err := resolveS3Target(endpoint, bucket, pathStyle)
+	return err
+}
+
+// Validate reports whether the store's endpoint/bucket/style combination is
+// usable, parsing the endpoint exactly once. objectURL performs the same
+// check, so direct constructors can fail fast at startup with the same error
+// the first request would report.
+func (s *S3) Validate() error {
+	return s.resolveEndpoint()
+}
+
+// resolveEndpoint parses and validates the endpoint exactly once per store
+// instance and reports the sticky error on every later call.
+func (s *S3) resolveEndpoint() error {
+	s.endpointOnce.Do(func() {
+		s.endpointURL, s.endpointErr = resolveS3Target(s.Endpoint, s.Bucket, s.PathStyle)
+	})
+	return s.endpointErr
+}
+
+// objectURL builds the request URL for one object key in the store's
+// addressing style, preserving the endpoint port in both styles. Path-style
+// keeps any endpoint path prefix and appends the bucket to it; virtual-hosted
+// style prefixes the bucket to the endpoint host and requires the
+// endpoint/bucket combination validated by resolveS3Target.
+func (s *S3) objectURL(key string) (string, error) {
+	if err := s.resolveEndpoint(); err != nil {
+		return "", err
+	}
+	key = strings.TrimPrefix(key, "/")
+	if s.PathStyle {
+		return strings.TrimRight(s.endpointURL.String(), "/") + "/" + s.Bucket + "/" + key, nil
+	}
+	host := s.Bucket + "." + s.endpointURL.Hostname()
+	if port := s.endpointURL.Port(); port != "" {
+		host = net.JoinHostPort(host, port)
+	}
+	return s.endpointURL.Scheme + "://" + host + "/" + key, nil
 }
 
 func (s *S3) sign(req *http.Request, payloadHash string, now time.Time) {
@@ -300,7 +441,11 @@ func (s *S3) Put(ctx context.Context, key string, r io.Reader, size int64) (Obje
 	tmp2.Close()
 	bodyHash := hex.EncodeToString(h2.Sum(nil))
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, s.objectURL(key), tmp)
+	rawURL, err := s.objectURL(key)
+	if err != nil {
+		return Object{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, rawURL, tmp)
 	if err != nil {
 		return Object{}, err
 	}
@@ -329,7 +474,12 @@ func (s *S3) Open(ctx context.Context, key string) (io.ReadCloser, Object, error
 		return nil, Object{}, fmt.Errorf("blob: invalid key %q", key)
 	}
 	ctx, cancel := withDeadline(ctx, s3GetTimeout)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.objectURL(key), nil)
+	rawURL, err := s.objectURL(key)
+	if err != nil {
+		cancel()
+		return nil, Object{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		cancel()
 		return nil, Object{}, err
@@ -360,7 +510,11 @@ func (s *S3) Delete(ctx context.Context, key string) error {
 	}
 	ctx, cancel := withDeadline(ctx, s3DeleteTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, s.objectURL(key), nil)
+	rawURL, err := s.objectURL(key)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, rawURL, nil)
 	if err != nil {
 		return err
 	}
@@ -378,15 +532,19 @@ func (s *S3) Delete(ctx context.Context, key string) error {
 }
 
 // listURL builds the bucket-level ListObjectsV2 URL for one page.
-func (s *S3) listURL(continuationToken string) string {
-	base := strings.TrimSuffix(s.objectURL(""), "/")
+func (s *S3) listURL(continuationToken string) (string, error) {
+	base, err := s.objectURL("")
+	if err != nil {
+		return "", err
+	}
+	base = strings.TrimSuffix(base, "/")
 	q := url.Values{}
 	q.Set("list-type", "2")
 	q.Set("max-keys", strconv.Itoa(s3ListPageSize))
 	if continuationToken != "" {
 		q.Set("continuation-token", continuationToken)
 	}
-	return base + "?" + q.Encode()
+	return base + "?" + q.Encode(), nil
 }
 
 // List implements Enumerator with ListObjectsV2: it follows the
@@ -402,7 +560,11 @@ func (s *S3) List(ctx context.Context, fn func(Object) error) error {
 	defer cancel()
 	token := ""
 	for {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.listURL(token), nil)
+		rawURL, err := s.listURL(token)
+		if err != nil {
+			return err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 		if err != nil {
 			return err
 		}
@@ -444,7 +606,11 @@ func (s *S3) List(ctx context.Context, fn func(Object) error) error {
 
 // Stat issues a HeadObject request and reports size and Last-Modified.
 func (s *S3) Stat(ctx context.Context, key string) (Object, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, s.objectURL(key), nil)
+	rawURL, err := s.objectURL(key)
+	if err != nil {
+		return Object{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, rawURL, nil)
 	if err != nil {
 		return Object{}, err
 	}

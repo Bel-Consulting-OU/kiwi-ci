@@ -83,7 +83,14 @@ kiwi.toml` validates a file. Sections: `server`, `database`,
 Artifact bytes live in the `blob` backend: `fs` (local data directory,
 default) or `s3` (endpoint, bucket, region, access key, secret key).
 S3 requires all three coordinates. The content-addressed CAS layer
-verifies digests on write and read regardless of backend.
+verifies digests on write and read regardless of backend. The endpoint
+is parsed and the endpoint/bucket combination validated at startup:
+virtual-hosted addressing (the default) needs a DNS endpoint host with
+no path prefix, while IP endpoints, gateway path prefixes and non-DNS
+bucket names require `s3_path_style = true`. Production refuses an
+`http://` endpoint (SigV4 credentials must not travel in plaintext)
+unless `s3_allow_plaintext = true` explicitly acknowledges a trusted
+network.
 
 ## Runners and enrollment
 

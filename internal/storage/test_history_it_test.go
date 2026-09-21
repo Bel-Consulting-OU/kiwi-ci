@@ -7,6 +7,7 @@ package storage
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -792,4 +793,116 @@ func itoa64(v int64) string {
 		b[i] = '-'
 	}
 	return string(b[i:])
+}
+
+// pgITSeedHistoryRepoPage plants n repositories with one durable report each
+// by bulk SQL, so repository-enumeration pagination can be exercised at a
+// scale where per-insert APIs would dominate the test runtime. Each run
+// payload carries the canonical repo_id every scoped read resolves.
+func pgITSeedHistoryRepoPage(t *testing.T, st *PostgresStore, n int) []string {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := st.pool.Exec(ctx, `INSERT INTO runs (id, status, created_at, payload)
+		SELECT 'run-' || lpad(i::text, 28, '0'), 'success', now(),
+			jsonb_build_object('id', 'run-' || lpad(i::text, 28, '0'),
+				'repo_id', 'github.com/kiwi-it/page-' || lpad(i::text, 4, '0'),
+				'repo_full_name', 'kiwi-it/page-' || lpad(i::text, 4, '0'),
+				'repo', 'https://github.com/kiwi-it/page-' || lpad(i::text, 4, '0') || '.git')
+		FROM generate_series(1, $1) AS i`, n); err != nil {
+		t.Fatalf("seed pagination runs: %v", err)
+	}
+	if _, err := st.pool.Exec(ctx, `INSERT INTO test_results (id, run_id, job_key, tests, failures, created_at, payload)
+		SELECT 'rep-' || lpad(i::text, 28, '0'), 'run-' || lpad(i::text, 28, '0'), 'build', 1, 0, now(), '{}'::jsonb
+		FROM generate_series(1, $1) AS i`, n); err != nil {
+		t.Fatalf("seed pagination reports: %v", err)
+	}
+	ids := make([]string, 0, n)
+	for i := 1; i <= n; i++ {
+		ids = append(ids, "github.com/kiwi-it/page-"+fmt.Sprintf("%04d", i))
+	}
+	return ids
+}
+
+// TestPostgresIntegrationTestHistoryRepairRepoPagination is defect 4's
+// real-PostgreSQL proof: more than the old 1000-repository enumeration cap is
+// returned COMPLETE (every repository present, ascending, unique) by the
+// keyset loop, with the default page size and with a deliberately small page
+// size that forces many pages.
+func TestPostgresIntegrationTestHistoryRepairRepoPagination(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	const repos = 1005
+	want := pgITSeedHistoryRepoPage(t, st, repos)
+
+	full, err := st.ListTestHistoryRepoIDs(ctx, 0)
+	if err != nil {
+		t.Fatalf("default enumeration: %v", err)
+	}
+	if len(full) != repos {
+		t.Fatalf("default enumeration = %d repositories, want %d (the pre-fix cap returned 1000)", len(full), repos)
+	}
+	if !reflect.DeepEqual(full, want) {
+		t.Fatalf("default enumeration is not the complete ascending set:\ngot  %d ids\nwant %d ids", len(full), len(want))
+	}
+	// Small page size: the loop must fetch the identical complete set across
+	// many keyset pages.
+	small, err := st.ListTestHistoryRepoIDs(ctx, 7)
+	if err != nil {
+		t.Fatalf("small-page enumeration: %v", err)
+	}
+	if !reflect.DeepEqual(small, full) {
+		t.Fatalf("small-page enumeration diverged: %d ids vs %d", len(small), len(full))
+	}
+	// A page bound larger than the set terminates after one short page.
+	one, err := st.ListTestHistoryRepoIDs(ctx, repos+10)
+	if err != nil || !reflect.DeepEqual(one, full) {
+		t.Fatalf("single-page enumeration diverged: %d ids err=%v", len(one), err)
+	}
+}
+
+// TestPostgresIntegrationTestHistoryFlakyWindowDropsOut is defect 2's
+// real-PostgreSQL proof: FlakyTestNames filters on the window-derived
+// flake_prob (NOT the lifetime passes/fails counters), so a test that failed
+// once and then passed its whole 16-outcome window drops out while its
+// lifetime counters still show the failure.
+func TestPostgresIntegrationTestHistoryFlakyWindowDropsOut(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	repo, full := "github.com/kiwi-it/window", "kiwi-it/window"
+	base := time.Now().UTC().Truncate(time.Second)
+	runID, jobID := pgITNewID(t), pgITNewID(t)
+	pgITHistoryRun(t, st, runID, jobID, repo, full, base)
+
+	upload := func(at time.Time, passed bool) {
+		t.Helper()
+		rep := pgITHistoryReport(runID, pgITNewID(t), at, model.TestResult{Name: "t", Duration: 1, Passed: passed})
+		if _, err := st.InsertTestReportWithHistory(ctx, rep, repo); err != nil {
+			t.Fatalf("upload: %v", err)
+		}
+	}
+	upload(base, false)
+	for i := 0; i < 16; i++ {
+		upload(base.Add(time.Duration(i+1)*time.Second), true)
+	}
+	flaky, err := st.FlakyTestNames(ctx, []string{repo}, 100)
+	if err != nil || len(flaky) != 0 {
+		t.Fatalf("flaky after a clean 16-outcome window = %v, %v; want none", flaky, err)
+	}
+	// The lifetime counters still carry the old failure: the predicate must be
+	// flake_prob, not passes > 0 AND fails > 0.
+	var passes, fails int64
+	var flakeProb float64
+	if err := st.pool.QueryRow(ctx, `SELECT passes, fails, flake_prob FROM test_history_aggregates
+		WHERE repo_id=$1 AND suite='build' AND test_class='' AND test_name='t'`, repo).Scan(&passes, &fails, &flakeProb); err != nil {
+		t.Fatalf("read aggregate: %v", err)
+	}
+	if passes != 16 || fails != 1 || flakeProb != 0 {
+		t.Fatalf("aggregate = passes %d fails %d flake_prob %v; want 16/1/0", passes, fails, flakeProb)
+	}
+	// A fresh failure inside the window restores the flaky classification.
+	upload(base.Add(time.Minute), false)
+	flaky, err = st.FlakyTestNames(ctx, []string{repo}, 100)
+	if err != nil || !reflect.DeepEqual(flaky, []string{"t"}) {
+		t.Fatalf("flaky after a fresh failure = %v, %v; want [t]", flaky, err)
+	}
 }

@@ -148,11 +148,11 @@ func TestFlowGCPendingSidecarPruning(t *testing.T) {
 	s2.GC(context.Background(), time.Now().UTC())
 	f.mu.Lock()
 	f.pendingErr = nil
-	f.pendingSidecars["job-a\x00bin\x00sbom"] = fakePendingSidecar{digest: "d", createdAt: time.Now().UTC().Add(-8 * 24 * time.Hour)}
+	f.pendingSidecars[fakePendingKey("job-a", 5, "bin", "sbom")] = fakePendingSidecar{digest: "d", createdAt: time.Now().UTC().Add(-8 * 24 * time.Hour)}
 	f.mu.Unlock()
 	s2.GC(context.Background(), time.Now().UTC())
 	f.mu.Lock()
-	_, survived := f.pendingSidecars["job-a\x00bin\x00sbom"]
+	_, survived := f.pendingSidecars[fakePendingKey("job-a", 5, "bin", "sbom")]
 	f.mu.Unlock()
 	if survived {
 		t.Fatal("db stale pending sidecar survived GC")

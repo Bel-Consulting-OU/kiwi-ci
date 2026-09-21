@@ -84,13 +84,13 @@ func TestExplicitBareAliasOnlyWhenConfigured(t *testing.T) {
 
 // TestRunListVisibilityStrictlyCanonical (P1-21): the scoped list endpoints
 // resolve visibility strictly to the canonical identity — runs for
-// gitlab.example/acme/service are invisible to a principal keyed only for
-// github.com/acme/service (the implicit bare-alias derivation is gone).
+// gitlab.example/acme/service are invisible to a repo-only principal granted
+// github.com/acme/service (the implicit bare-alias derivation is gone, and
+// without a global read role the role fallback cannot mask the difference).
 func TestRunListVisibilityStrictlyCanonical(t *testing.T) {
 	s := storeServer(t, "", map[string]auth.Principal{
 		"github-token": {
 			Subject: "github-bot",
-			Roles:   []auth.Role{auth.RoleRead},
 			Repositories: map[string]auth.RepositoryPermission{
 				"github.com/acme/service": {Run: true, Read: true},
 			},

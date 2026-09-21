@@ -641,34 +641,24 @@ func faultOps() []opCase {
 			name:  "RememberPendingSidecar",
 			setup: seedRunAndJob,
 			call: func(s Store) error {
-				return s.(ArtifactSidecarStore).RememberPendingSidecar(ctx(), testJob.ID, "bin", ArtifactSidecarKindSBOM, strings.Repeat("c", 64))
+				return s.(ArtifactSidecarStore).RememberPendingSidecar(ctx(), testJob.ID, 1, "bin", ArtifactSidecarKindSBOM, strings.Repeat("c", 64))
 			},
 		},
 		{
 			name: "ConsumePendingSidecar",
 			setup: func(m *memStore) {
 				seedRunAndJob(m)
-				_ = m.RememberPendingSidecar(ctx(), testJob.ID, "bin", ArtifactSidecarKindSBOM, strings.Repeat("c", 64))
+				_ = m.RememberPendingSidecar(ctx(), testJob.ID, 1, "bin", ArtifactSidecarKindSBOM, strings.Repeat("c", 64))
 			},
 			call: func(s Store) error {
-				return s.(ArtifactSidecarStore).ConsumePendingSidecar(ctx(), testJob.ID, "bin", ArtifactSidecarKindSBOM, strings.Repeat("c", 64))
-			},
-		},
-		{
-			name: "DeletePendingSidecars",
-			setup: func(m *memStore) {
-				seedRunAndJob(m)
-				_ = m.RememberPendingSidecar(ctx(), testJob.ID, "bin", ArtifactSidecarKindSigstore, strings.Repeat("d", 64))
-			},
-			call: func(s Store) error {
-				return s.(ArtifactSidecarStore).DeletePendingSidecars(ctx(), testJob.ID)
+				return s.(ArtifactSidecarStore).ConsumePendingSidecar(ctx(), testJob.ID, 1, "bin", ArtifactSidecarKindSBOM, strings.Repeat("c", 64))
 			},
 		},
 		{
 			name: "PrunePendingSidecars",
 			setup: func(m *memStore) {
 				seedRunAndJob(m)
-				_ = m.RememberPendingSidecar(ctx(), testJob.ID, "bin", ArtifactSidecarKindSBOM, strings.Repeat("c", 64))
+				_ = m.RememberPendingSidecar(ctx(), testJob.ID, 1, "bin", ArtifactSidecarKindSBOM, strings.Repeat("c", 64))
 			},
 			call: func(s Store) error {
 				_, err := s.(ArtifactSidecarStore).PrunePendingSidecars(ctx(), time.Now().UTC().Add(time.Hour))
@@ -948,7 +938,7 @@ func TestFaultInjectionReadsUnaffected(t *testing.T) {
 	if _, err := fs.GetArtifact(ctx(), "dddddddddddddddddddddddddddddddd"); err == nil {
 		t.Fatal("GetArtifact on empty store must not succeed")
 	}
-	if digest, ok, err := fs.PendingSidecar(ctx(), testJob.ID, "bin", ArtifactSidecarKindSBOM); err != nil || ok || digest != "" {
+	if digest, ok, err := fs.PendingSidecar(ctx(), testJob.ID, 1, "bin", ArtifactSidecarKindSBOM); err != nil || ok || digest != "" {
 		t.Fatalf("PendingSidecar on empty store = %q ok=%v err=%v", digest, ok, err)
 	}
 }

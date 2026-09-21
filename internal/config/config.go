@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/blob"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/quotas"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/ratelimit"
 )
@@ -50,13 +51,23 @@ type RunnerPKIConfig struct {
 
 type BlobConfig struct {
 	// Backend selects artifact/blob storage: "fs" (default) or "s3".
-	Backend     string `toml:"backend"`
-	Path        string `toml:"path"`
-	S3Endpoint  string `toml:"s3_endpoint"`
-	S3Bucket    string `toml:"s3_bucket"`
-	S3Region    string `toml:"s3_region"`
-	S3AccessKey string `toml:"s3_access_key"`
-	S3SecretKey string `toml:"s3_secret_key"`
+	Backend    string `toml:"backend"`
+	Path       string `toml:"path"`
+	S3Endpoint string `toml:"s3_endpoint"`
+	S3Bucket   string `toml:"s3_bucket"`
+	S3Region   string `toml:"s3_region"`
+	// S3PathStyle selects path-style addressing (bucket in the URL path)
+	// over virtual-hosted style (bucket as the first host label). Required
+	// for IP endpoints, endpoints with a path prefix and buckets that are
+	// not DNS-compatible host labels; optional for plain DNS endpoints.
+	S3PathStyle bool `toml:"s3_path_style"`
+	// S3AllowPlaintext explicitly acknowledges an http:// S3 endpoint in
+	// production mode. SigV4 credentials travel in the request, so
+	// production refuses plaintext transport unless this override is set
+	// (dev mode allows it for local gateways such as MinIO).
+	S3AllowPlaintext bool   `toml:"s3_allow_plaintext"`
+	S3AccessKey      string `toml:"s3_access_key"`
+	S3SecretKey      string `toml:"s3_secret_key"`
 }
 
 type GitHubConfig struct {
@@ -263,8 +274,15 @@ func (c *Config) Validate() error {
 		if c.Server.ExternalURL == "" {
 			return fmt.Errorf("server.external_url is required in production mode (the OIDC issuer always serves in production)")
 		}
-		if !strings.HasPrefix(c.Server.ExternalURL, "https://") {
-			return fmt.Errorf("server.external_url must start with https:// in production mode, got %q", c.Server.ExternalURL)
+	}
+	if c.Server.ExternalURL != "" {
+		// The SAME parsed-URL validator the OIDC startup path uses (see
+		// ValidateExternalURL): a malformed value is refused at startup
+		// instead of surfacing as a 503 on the discovery endpoint. An empty
+		// external_url stays legal outside production (OIDC is simply
+		// unavailable until it is configured).
+		if _, err := ValidateExternalURL(c.Server.ExternalURL, mode); err != nil {
+			return fmt.Errorf("server.external_url: %w", err)
 		}
 	}
 	if c.Database.URL != "" {
@@ -282,6 +300,20 @@ func (c *Config) Validate() error {
 	if backend == "s3" {
 		if c.Blob.S3Endpoint == "" || c.Blob.S3Bucket == "" || c.Blob.S3Region == "" {
 			return fmt.Errorf("blob.backend \"s3\" requires blob.s3_endpoint, blob.s3_bucket and blob.s3_region")
+		}
+		// Parse the endpoint and validate the endpoint/bucket combination
+		// exactly as the transport resolves it: IP endpoints, path prefixes
+		// and non-DNS buckets are fine with path-style addressing and are
+		// refused (with the s3_path_style hint) under virtual-hosted style.
+		if err := blob.ValidateS3Config(c.Blob.S3Endpoint, c.Blob.S3Bucket, c.Blob.S3PathStyle); err != nil {
+			return fmt.Errorf("blob: %w", err)
+		}
+		// SigV4 credentials must not cross the network in plaintext: an
+		// http:// endpoint is refused in production unless the operator
+		// explicitly acknowledges the trusted network with
+		// blob.s3_allow_plaintext = true.
+		if u, err := url.Parse(strings.TrimSpace(c.Blob.S3Endpoint)); err == nil && u.Scheme == "http" && mode == "production" && !c.Blob.S3AllowPlaintext {
+			return fmt.Errorf("blob.s3_endpoint must use https:// in production (an http:// endpoint sends S3 credentials in plaintext); set blob.s3_allow_plaintext = true only for a trusted network")
 		}
 	}
 	// Forge instance roots carry credentials (PRIVATE-TOKEN / token), so
