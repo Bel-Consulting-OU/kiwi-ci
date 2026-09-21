@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
@@ -57,6 +58,22 @@ type ClusterKeyWriter interface {
 // not materializing a CA unless one is configured.
 type ClusterKeyLookup interface {
 	Lookup(kind string) ([]byte, bool, error)
+}
+
+// ClusterKeyRotationFencer optionally provides the cross-replica fence that
+// serializes key-material rotation. It is what makes rotation safe in HA: a
+// local mutex only serializes goroutines inside one replica, while two
+// replicas can both observe an expired active key, generate different
+// replacements, and both issue tokens under a ring the other then overwrites.
+// A fenced rotation reloads the shared ring AFTER taking the fence and
+// re-checks whether rotation is still due, so the loser of a concurrent
+// rotation observes the winner's published key instead of rotating again.
+//
+// The DB-backed store implements this with a PostgreSQL advisory lock; the
+// fence is held only across reload/re-check/rotate/persist and is
+// hard-bounded on release.
+type ClusterKeyRotationFencer interface {
+	WithClusterKeyRotationFence(ctx context.Context, kind string, fn func() error) error
 }
 
 // FSClusterKeyStore persists one file per kind under Dir with mode 0600.
@@ -783,6 +800,36 @@ func (s *Server) setRunnerCAFromBlob(b []byte) error {
 	return nil
 }
 
+// UseClusterKeyStore replaces the server's cluster key store and loads every
+// signing material through it. The app wiring calls it for the DB-backed
+// store after the SQL store is connected; construction-time callers go
+// through NewPersistentWithCluster instead. Like that constructor, an absent
+// runner CA stays absent (it is never materialized by the loader).
+func (s *Server) UseClusterKeyStore(store ClusterKeyStore) error {
+	if store == nil {
+		return errors.New("cluster keys: nil store")
+	}
+	s.ClusterKeys = store
+	if signer, err := s.loadOIDCSignerCluster(store); err != nil {
+		return err
+	} else {
+		s.oidc = signer
+	}
+	if err := s.loadLeaseKeyCluster(store); err != nil {
+		return err
+	}
+	if err := s.loadRunnerCACluster(store); err != nil {
+		return err
+	}
+	if err := s.loadProvenanceCluster(store); err != nil {
+		return err
+	}
+	if err := s.loadCacheSignerCluster(store); err != nil {
+		return err
+	}
+	return s.loadWebSessionCluster(store)
+}
+
 // parseRunnerCABlob parses a runner CA cluster object (cert PEM + NUL + key
 // PEM, or the legacy concatenated PEMs) into a CA.
 func (s *Server) parseRunnerCABlob(b []byte) (*runnerpki.CA, error) {
@@ -830,14 +877,24 @@ func (s *Server) KeyFingerprints() map[string]string {
 // ValidateHAReady reports whether the control plane may serve as part of an
 // HA deployment. A server with a database but no cluster key store would
 // generate per-replica signing material, so replicas could not verify each
-// other's lease tokens, OIDC tokens, provenance or cache signatures. When
-// runner CA material is loaded, it must additionally resolve identically
-// through the cluster store: the shared object must parse to a CA whose
-// certificate fingerprint equals the loaded CA's, so a replica cannot hold
-// a divergent runner CA.
+// other's lease tokens, OIDC tokens, provenance or cache signatures. The
+// implicit NewPersistent store rooted at the node-local data dir is NOT
+// proof of a shared key store: separate replicas with separate data dirs
+// would each pass while holding different keys, so HA/DB mode requires a
+// deliberately configured shared provider (the DB-backed cluster key store,
+// or an explicit --cluster-key-dir on shared storage that is not the data
+// dir itself). When runner CA material is loaded, it must additionally
+// resolve identically through the cluster store: the shared object must
+// parse to a CA whose certificate fingerprint equals the loaded CA's, so a
+// replica cannot hold a divergent runner CA.
 func (s *Server) ValidateHAReady() error {
 	if s.DB != nil && s.ClusterKeys == nil {
 		return errors.New("HA deployments require a cluster key store")
+	}
+	if s.DB != nil {
+		if fs, ok := s.ClusterKeys.(*FSClusterKeyStore); ok && clusterKeyDirIsNodeLocal(fs.Dir, s.dataDir) {
+			return fmt.Errorf("HA deployments require a shared cluster key store: the cluster key directory %q is the node-local data dir, so replicas would hold different keys; configure --cluster-key-dir on shared storage or use the database-backed cluster key store", fs.Dir)
+		}
 	}
 	if s.RunnerCA != nil && s.ClusterKeys != nil {
 		var shared []byte
@@ -862,4 +919,19 @@ func (s *Server) ValidateHAReady() error {
 		}
 	}
 	return nil
+}
+
+// clusterKeyDirIsNodeLocal reports whether dir is the server's own data
+// directory (or a filesystem alias of it): that store is node-local by
+// construction, not a deliberately configured shared provider.
+func clusterKeyDirIsNodeLocal(dir, dataDir string) bool {
+	if dir == "" || dataDir == "" {
+		return dir == dataDir
+	}
+	if filepath.Clean(dir) == filepath.Clean(dataDir) {
+		return true
+	}
+	di, derr := os.Stat(dir)
+	dd, dderr := os.Stat(dataDir)
+	return derr == nil && dderr == nil && os.SameFile(di, dd)
 }

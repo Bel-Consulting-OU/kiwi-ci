@@ -1,6 +1,10 @@
 package server
 
 import (
+	"fmt"
+	"math"
+	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
@@ -17,18 +21,43 @@ func jobResourceRequests(cj pipeline.CompiledJob) (cpu float64, memory, disk int
 	return r.CPU, int64(r.Memory), int64(r.Disk), r.PIDs
 }
 
-// applyUntrustedResourceCeilings sets the server-side resource ceilings on
-// the compiled job of an UNTRUSTED run whenever the job declares no request
-// of its own: the executor then always applies CPU/memory/PID limits to
-// untrusted work, even for pipelines that never mention resources. Only
-// fields the job's runtime backend can actually enforce are filled (see
-// pipeline.ResourceCapabilities); trusted jobs and jobs with explicit
-// requests are untouched.
-func (s *Server) applyUntrustedResourceCeilings(cj pipeline.CompiledJob, trusted bool) pipeline.CompiledJob {
+// applyUntrustedResourceCeilings applies the server-side resource CEILINGS
+// to the compiled job of an UNTRUSTED run: an explicit request in any
+// dimension above the configured ceiling is REJECTED (never clamped — a
+// silently reduced request would still be executable but misrepresented),
+// and a dimension the job leaves unset is filled with the ceiling value so
+// the executor always applies limits to untrusted work, even for pipelines
+// that never mention resources. The offending field, the requested value and
+// the ceiling travel in the returned admission error so the API can answer
+// an opaque 4xx naming the field and both values.
+//
+// Only fields the job's runtime backend can actually enforce are filled (see
+// pipeline.ResourceCapabilities), with one documented exception: the disk
+// ceiling is filled for container jobs, whose backend enforces
+// resources.disk as a hard workspace-content bound (tart/native disk and pid
+// declarations are rejected by pipeline validation, so they are never
+// filled). A ceiling of 0 disables that dimension entirely (no rejection, no
+// fill).
+//
+// Trusted jobs are UNCONSTRAINED by these ceilings: they keep their declared
+// resources exactly, including requests above every untrusted ceiling.
+func (s *Server) applyUntrustedResourceCeilings(cj pipeline.CompiledJob, trusted bool) (pipeline.CompiledJob, error) {
 	if trusted {
-		return cj
+		return cj, nil
 	}
 	cpu, mem, _, pids := pipeline.ResourceCapabilities(cj.Job.Runtime)
+	if err := s.checkUntrustedCeiling("cpu", cj.Job.Resources.CPU, s.UntrustedCPUCeiling); err != nil {
+		return cj, err
+	}
+	if err := s.checkUntrustedCeiling("memory", float64(cj.Job.Resources.Memory), float64(s.UntrustedMemoryCeiling)); err != nil {
+		return cj, err
+	}
+	if err := s.checkUntrustedCeiling("disk", float64(cj.Job.Resources.Disk), float64(s.UntrustedDiskCeiling)); err != nil {
+		return cj, err
+	}
+	if err := s.checkUntrustedCeiling("pids", float64(cj.Job.Resources.PIDs), float64(s.UntrustedPIDCeiling)); err != nil {
+		return cj, err
+	}
 	if cpu && cj.Job.Resources.CPU == 0 && s.UntrustedCPUCeiling > 0 {
 		cj.Job.Resources.CPU = s.UntrustedCPUCeiling
 	}
@@ -38,7 +67,47 @@ func (s *Server) applyUntrustedResourceCeilings(cj pipeline.CompiledJob, trusted
 	if pids && cj.Job.Resources.PIDs == 0 && s.UntrustedPIDCeiling > 0 {
 		cj.Job.Resources.PIDs = s.UntrustedPIDCeiling
 	}
-	return cj
+	if untrustedDiskBound(cj.Job.Runtime) && cj.Job.Resources.Disk == 0 && s.UntrustedDiskCeiling > 0 {
+		cj.Job.Resources.Disk = pipeline.ByteSize(s.UntrustedDiskCeiling)
+	}
+	return cj, nil
+}
+
+// untrustedDiskBound reports whether the runtime's backend enforces
+// resources.disk as a hard workspace bound. Only the container backend does
+// (see internal/executor: workspaceMaxBytes/enforceWorkspaceBound); tart and
+// native disk declarations are rejected by pipeline validation, so the
+// untrusted disk ceiling is never stamped on them.
+func untrustedDiskBound(runtime string) bool {
+	return runtime == "container"
+}
+
+// checkUntrustedCeiling rejects one explicit untrusted resource request that
+// exceeds its configured ceiling. A zero ceiling disables the dimension; a
+// non-positive request is not an explicit request. field is the pipeline
+// spelling (cpu/memory/disk/pids) and both values are reported so the client
+// can correct the declaration.
+func (s *Server) checkUntrustedCeiling(field string, requested, ceiling float64) error {
+	if ceiling <= 0 || requested <= 0 || requested <= ceiling {
+		return nil
+	}
+	return &admissionError{
+		Status: http.StatusBadRequest,
+		Reason: "untrusted_resource_ceiling_exceeded",
+		Msg:    fmt.Sprintf("untrusted job resources.%s %s exceeds the ceiling %s", field, formatResourceValue(requested), formatResourceValue(ceiling)),
+	}
+}
+
+// formatResourceValue renders a resource quantity without a trailing ".0" so
+// the rejection message reads "4" instead of "4.000000" for whole numbers.
+// The int64 conversion is guarded (integers beyond 2^53 are not exactly
+// representable and fall back to the float rendering), so no value can
+// overflow the conversion.
+func formatResourceValue(v float64) string {
+	if v == math.Trunc(v) && math.Abs(v) < 1<<53 {
+		return strconv.FormatInt(int64(v), 10)
+	}
+	return strconv.FormatFloat(v, 'g', -1, 64)
 }
 
 // jobQueueDeadline computes the queue deadline for a compiled job whose

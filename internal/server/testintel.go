@@ -77,6 +77,15 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 	rep.JobID = j.ID
 	rep.JobKey = j.Key
 	rep.CreatedAt = time.Now().UTC()
+	// The AUTHORITATIVE suite identity (the job key) is what the aggregate
+	// upsert indexes; a pipeline declaration over the shared suite budget
+	// would otherwise bypass the payload validator (which ran before this
+	// override) and fail the SQL primary key later. It is refused here,
+	// before any store call, with the same budget as the submitted report.
+	if len(rep.JobKey) > testintel.MaxTestSuiteBytes {
+		http.Error(w, "job key is over the "+strconv.Itoa(testintel.MaxTestSuiteBytes)+"-byte suite budget", http.StatusBadRequest)
+		return
+	}
 	// The delivery key is scoped to the AUTHORITATIVE job/lease generation
 	// from the verified lease, never to client-supplied values, so a replay
 	// can never be re-attributed to another job or generation.

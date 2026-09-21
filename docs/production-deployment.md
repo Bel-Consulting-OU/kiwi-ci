@@ -14,6 +14,17 @@ local testing and is not covered here beyond the basics.
   - `--database-url` (PostgreSQL) is required;
   - distinct `--admin-token` and `--runner-token` are required unless
     `--allow-shared-token` acknowledges a shared credential;
+    `--allow-shared-token` only acknowledges reusing one value for both
+    tokens — it does not re-enable the shared token on the runner tier;
+  - runner traffic must have an actual per-runner mechanism: enforced
+    runner mTLS (`--runner-ca-cert`/`--runner-ca-key` with
+    `--runner-require-client-certs`) or provisioned per-runner bearer
+    credentials (`--runner-tokens-file`, or rows already present in
+    `runner_bearer_tokens`). This half of the contract is checked AFTER
+    the database opens, because the credentials may already be
+    provisioned there. The shared `--runner-token` is dev/bootstrap
+    compatibility only: the server clears it at startup and production
+    refuses runner traffic authenticated with it;
   - `--external-url` starting with `https://` is required (the OIDC
     issuer always serves in production);
   - `--tls-cert`/`--tls-key` are required.
@@ -25,11 +36,17 @@ kiwi server \
   --external-url https://ci.example.com \
   --database-url "postgres://kiwi:pass@db:5432/kiwi" \
   --admin-token "$ADMIN_TOKEN" \
-  --runner-token "$RUNNER_TOKEN" \
+  --runner-tokens-file /etc/kiwi/runner-tokens.json \
   --tls-cert /etc/kiwi/server.crt \
   --tls-key /etc/kiwi/server.key \
   --data-dir /var/lib/kiwi
 ```
+
+`/etc/kiwi/runner-tokens.json` maps runner IDs to SHA-256 token digests
+(`{"<runner-id>": "<sha256-hex>"}`); the server provisions them into
+`runner_bearer_tokens` at startup. The mTLS alternative replaces
+`--runner-tokens-file` with `--runner-ca-cert`/`--runner-ca-key` (plus
+enrollment) and keeps `--runner-require-client-certs` at its default.
 
 ## PostgreSQL
 
@@ -56,8 +73,25 @@ and polls for promotion (`Server.Maintain`). See [ha.md](ha.md) for the
 full leader-duty list.
 
 Run at least two instances behind a load balancer. Each instance needs
-the same database URL, tokens, external URL, and a shared `--data-dir`
-for lease/OIDC key material (or a process for provisioning the keys).
+the same database URL, tokens, and external URL. Signing material must
+be SHARED, not node-local: in DB mode the server uses the database-backed
+cluster key store (`cluster_keys`, created on first start), so replicas
+share the lease HMAC key, OIDC ring, provenance key, cache signing key,
+web session secret and runner CA through PostgreSQL. An explicit
+`--cluster-key-dir` on shared storage is the alternative; a store rooted
+at the per-node `--data-dir` is refused in production/DB mode, because
+two replicas with separate data dirs would each pass a naive readiness
+check while holding different keys. When a data dir exists, its existing
+key files are migrated into the shared store on first use, so upgrading a
+single-node deployment keeps its OIDC/provenance/runner-CA trust roots.
+
+OIDC key rotation is fenced across replicas: a due rotation takes a
+PostgreSQL advisory lock, reloads the shared ring, re-checks that rotation
+is still due, rotates once and persists, then releases. A replica that
+cannot take the fence within its bound keeps serving the current
+published key instead of activating a key no peer can verify. The JWKS
+endpoint reloads the shared ring before serving, so a non-issuing replica
+always advertises a peer's freshly rotated key.
 
 ## TLS
 
@@ -103,10 +137,20 @@ kiwi runner --server https://ci.example.com \
 
 The runner bearer token is a SHARED credential: every runner presents the
 same token, so it authenticates "some registered runner" but is not a
-per-runner identity and cannot distinguish runners. Production strongly
-prefers persistent per-runner mTLS identities. The control plane fails
-closed: in production, an admin token without either a runner token or
-enforced runner mTLS is a startup error.
+per-runner identity and cannot distinguish runners. It is dev/bootstrap
+compatibility only. Production disables it and refuses to start unless at
+least one actual per-runner mechanism exists:
+
+- **per-runner bearer credentials** — `--runner-tokens-file` maps each
+  runner ID to the SHA-256 digest of its own token (provisioned into
+  `runner_bearer_tokens`), or the rows are provisioned out of band; the
+  server rejects the shared token as soon as per-runner credentials exist;
+- **enforced runner mTLS** — `--runner-ca-cert`/`--runner-ca-key` plus
+  runner certificates (see below), with `--runner-require-client-certs`
+  at its default.
+
+If the per-runner credential store is unavailable at request time, the
+runner tier answers 503 and never falls back to the shared token.
 
 For mTLS identity binding, create a runner CA once:
 

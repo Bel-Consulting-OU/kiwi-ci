@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -34,6 +35,13 @@ var oidcActiveKeyMaxAge = 30 * 24 * time.Hour
 // oidcPreviousKeyRetireAfter is how long a rotated-out signing key remains
 // advertised in the JWKS so tokens it signed stay verifiable.
 var oidcPreviousKeyRetireAfter = 72 * time.Hour
+
+// clusterKeyRotationFenceTimeout bounds how long a due rotation waits for the
+// cross-replica fence. Contention beyond this keeps the CURRENT published key
+// active instead of rotating without the fence: a token signed under an
+// unpublished key is unverifiable, which is strictly worse than a slightly
+// stale signing key. It is a var only so tests can shrink the bound.
+var clusterKeyRotationFenceTimeout = 10 * time.Second
 
 // oidcPreviousKey is a rotated-out signing key kept in the JWKS until
 // RetireAfter. Only the public half is retained.
@@ -310,6 +318,75 @@ func (s *Server) rotateOIDCKeyLocked(now time.Time) {
 	s.oidc = next
 }
 
+// clusterKeyRotationFencer returns the cross-replica rotation fence for the
+// OIDC ring, or nil when none is available (dev/in-memory mode). The cluster
+// store is preferred because it owns the ring; the DB store is the fallback
+// so a shared --cluster-key-dir deployment still fences through PostgreSQL.
+func (s *Server) clusterKeyRotationFencer() ClusterKeyRotationFencer {
+	if f, ok := s.ClusterKeys.(ClusterKeyRotationFencer); ok {
+		return f
+	}
+	if s.DB != nil {
+		if f, ok := s.DB.(ClusterKeyRotationFencer); ok {
+			return f
+		}
+	}
+	return nil
+}
+
+// ensureOIDCSigner returns the signer issueOIDC must sign under, rotating the
+// active key first when it is due. The shared ring is reloaded before the
+// check so a rotation published by another replica is adopted immediately.
+//
+// When a cross-replica fence is available the due-rotation path is: acquire
+// the fence, reload the shared ring AGAIN, re-check whether rotation is still
+// due, then rotate and persist exactly once while still holding the fence.
+// The loser of a concurrent rotation therefore observes the winner's
+// published key and does not overwrite it, and no replica ever activates a
+// replacement before it is published. When the fence cannot be acquired
+// within clusterKeyRotationFenceTimeout the current (published) key stays
+// active: issuing under an unpublished key would produce tokens no peer can
+// verify. Without any fence (dev mode) the reload + local mutex path is the
+// best available guarantee.
+func (s *Server) ensureOIDCSigner(ctx context.Context, now time.Time) *oidcSigner {
+	// >= (not >): coarse-clock platforms can report an exactly-zero age for
+	// a freshly created key, and a max age of 0 must mean "rotate now".
+	s.mu.Lock()
+	s.reloadOIDCRingLocked()
+	due := s.oidc == nil || now.Sub(s.oidc.NotBefore) >= oidcActiveKeyMaxAge
+	signer := s.oidc
+	s.mu.Unlock()
+	if !due {
+		return signer
+	}
+	if fencer := s.clusterKeyRotationFencer(); fencer != nil {
+		fctx, cancel := context.WithTimeout(ctx, clusterKeyRotationFenceTimeout)
+		err := fencer.WithClusterKeyRotationFence(fctx, clusterKindOIDC, func() error {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			s.reloadOIDCRingLocked()
+			if s.oidc == nil || now.Sub(s.oidc.NotBefore) >= oidcActiveKeyMaxAge {
+				s.rotateOIDCKeyLocked(now)
+			}
+			return nil
+		})
+		cancel()
+		if err != nil {
+			s.logError("oidc: rotation fence unavailable; keeping current published key", "error", err.Error())
+		}
+	} else {
+		s.mu.Lock()
+		s.reloadOIDCRingLocked()
+		if s.oidc == nil || now.Sub(s.oidc.NotBefore) >= oidcActiveKeyMaxAge {
+			s.rotateOIDCKeyLocked(now)
+		}
+		s.mu.Unlock()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.oidc
+}
+
 // reloadOIDCRingLocked replaces the in-memory signer when the persisted
 // ring changed since it was loaded — another replica rotated it. The caller
 // must hold s.mu. File mode compares the ring file's mtime/size; cluster
@@ -410,7 +487,12 @@ func oidcJWK(kid string, pub ed25519.PublicKey) map[string]any {
 }
 
 func (s *Server) oidcJWKS(w http.ResponseWriter, r *http.Request) {
+	// Reload the shared ring BEFORE serving: a replica that has not issued a
+	// token since a peer rotated would otherwise keep publishing a JWKS
+	// without the peer's active key, and tokens signed under that key would
+	// fail verification at every consumer of this endpoint.
 	s.mu.Lock()
+	s.reloadOIDCRingLocked()
 	signer := s.oidc
 	s.mu.Unlock()
 	if signer == nil {
@@ -462,15 +544,11 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 	}
 	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	now := time.Now().UTC()
-	s.mu.Lock()
-	s.reloadOIDCRingLocked()
-	// >= (not >): coarse-clock platforms can report an exactly-zero age for
-	// a freshly created key, and a max age of 0 must mean "rotate now".
-	if s.oidc == nil || now.Sub(s.oidc.NotBefore) >= oidcActiveKeyMaxAge {
-		s.rotateOIDCKeyLocked(now)
+	signer := s.ensureOIDCSigner(r.Context(), now)
+	if signer == nil {
+		s.serverError(w, r, http.StatusServiceUnavailable, fmt.Errorf("OIDC signer unavailable"), "OIDC unavailable")
+		return
 	}
-	signer := s.oidc
-	s.mu.Unlock()
 	// DB mode: the store is the source of truth for the lease/audience
 	// checks; the in-memory maps are only the dev-mode mirror.
 	var j model.Job

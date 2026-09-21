@@ -134,6 +134,12 @@ func (s *PostgresStore) revokeRunnerLeasesTx(ctx context.Context, tx pgx.Tx, run
 			j.ID, string(j.Status), nullText(j.Error), j.FinishedAt, jp); err != nil {
 			return nil, nil, err
 		}
+		// The invalidated lease releases its resource reservation in the
+		// same transaction (a requeued job holds none until it is leased
+		// again, and both branches release idempotently).
+		if err := releaseResourcesTx(ctx, tx, j.ID); err != nil {
+			return nil, nil, err
+		}
 		// The invalidated lease releases its running reservation; a requeued
 		// job re-reserves a queued slot in the same statement pair.
 		if requeue {
@@ -299,6 +305,11 @@ func (s *PostgresStore) RecoverExpiredLease(ctx context.Context, jobID string, e
 		jobID, string(j.Status), nullText(j.Error), j.FinishedAt, jp); err != nil {
 		return err
 	}
+	// The expired lease releases its resource reservation in the same
+	// transaction, whether the job requeues or terminally fails.
+	if err := releaseResourcesTx(ctx, tx, jobID); err != nil {
+		return err
+	}
 	if requeue {
 		if err := s.adjustQuotaTx(ctx, tx, RepoIDForJob(j), -1, 1); err != nil {
 			return err
@@ -353,6 +364,12 @@ func (s *PostgresStore) recoverCorruptLeaseTx(ctx context.Context, tx pgx.Tx, jo
 	}
 	if _, err := tx.Exec(ctx, `UPDATE jobs SET status=$2, error=$3, finished_at=$4, lease_runner_id=NULL, lease_token_hash=NULL, lease_expires_at=NULL WHERE id=$1`,
 		jobID, string(model.StatusFailure), CorruptLeaseRecoveryReason, now); err != nil {
+		return err
+	}
+	// The forced recovery releases the job's resource reservation by its
+	// PRIMARY KEY, so an undecodable payload cannot strand one: the ledger
+	// row needs no decoded request to be deleted.
+	if err := releaseResourcesTx(ctx, tx, jobID); err != nil {
 		return err
 	}
 	// Retry policy (MaxInfraRetries) lives in the payload and cannot be
@@ -492,7 +509,11 @@ func (s *PostgresStore) ExpireQueuedJob(ctx context.Context, jobID string, deadl
 	}
 	// A timed-out job never runs: return its reserved queued slot. The quota
 	// scope comes from the job payload normally, and from the run's canonical
-	// identity when the job payload is corrupt.
+	// identity when the job payload is corrupt. The resource reservation
+	// release is the documented idempotent no-op (queued jobs hold none).
+	if err := releaseResourcesTx(ctx, tx, jobID); err != nil {
+		return err
+	}
 	repoID := RepoIDForJob(j)
 	if corrupt {
 		if repoID, err = s.repoIDForRecoveryTx(ctx, tx, runID); err != nil {

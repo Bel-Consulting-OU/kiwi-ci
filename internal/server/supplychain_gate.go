@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -79,24 +78,42 @@ func writeArtifactSidecar(dir string, generation int64, base, kind, digest strin
 	return path, nil
 }
 
+// errAmbiguousArtifactSidecar reports that more than one digest-qualified
+// sidecar file exists for one (generation, base, kind) identity and no
+// durable pending pointer names the accepted digest. The immutable files are
+// digest-qualified but their names carry no "latest" relationship, so
+// picking the lexicographically first one after a restart could attach an
+// older re-upload's attestation to the artifact. Resolution fails closed.
+var errAmbiguousArtifactSidecar = errors.New("artifact sidecar is ambiguous: multiple candidates and no durable pending pointer")
+
 // findArtifactSidecar resolves the readable sidecar file of one
-// (generation, base, kind) identity: the exact digest-qualified path when
-// digest is non-empty and present, else the lexicographically first
-// matching file in the generation directory. Several files can exist only
-// after an in-generation re-upload; whichever candidate is read is still
-// validated by the caller (SBOM document validation / sigstore bundle
-// verification), and the GENERATION boundary is never crossed.
-func findArtifactSidecar(dir string, generation int64, base, kind, digest string) (string, bool) {
+// (generation, base, kind) identity:
+//
+//   - digest non-empty: the EXACT digest-qualified path must exist. There is
+//     no fallback scan: a durable pointer that names a missing file is a
+//     broken pointer, and substituting another digest's bytes would attach
+//     an attestation the control plane never accepted;
+//   - digest empty (legacy/unindexed state): exactly ONE candidate file in
+//     the generation directory is the unambiguous legacy layout and is
+//     returned; ZERO returns os.ErrNotExist; TWO OR MORE are ambiguous and
+//     FAIL CLOSED with errAmbiguousArtifactSidecar instead of arbitrarily
+//     selecting one.
+//
+// The GENERATION boundary is never crossed either way. Whichever file is
+// returned is still validated by the caller (SBOM document validation /
+// sigstore bundle verification).
+func findArtifactSidecar(dir string, generation int64, base, kind, digest string) (string, error) {
 	if digest != "" {
 		path := artifactSidecarPath(dir, generation, base, kind, digest)
 		if fi, err := os.Stat(path); err == nil && !fi.IsDir() {
-			return path, true
+			return path, nil
 		}
+		return "", os.ErrNotExist
 	}
 	genDir := artifactSidecarDir(dir, generation)
 	entries, err := os.ReadDir(genDir)
 	if err != nil {
-		return "", false
+		return "", os.ErrNotExist
 	}
 	prefix := cleanBlobName(base) + "." + kind + "."
 	candidates := []string{}
@@ -107,11 +124,14 @@ func findArtifactSidecar(dir string, generation int64, base, kind, digest string
 		}
 		candidates = append(candidates, name)
 	}
-	if len(candidates) == 0 {
-		return "", false
+	switch len(candidates) {
+	case 0:
+		return "", os.ErrNotExist
+	case 1:
+		return filepath.Join(genDir, candidates[0]), nil
+	default:
+		return "", fmt.Errorf("%w: %d candidates for %s.%s in generation %d", errAmbiguousArtifactSidecar, len(candidates), cleanBlobName(base), kind, generation)
 	}
-	sort.Strings(candidates)
-	return filepath.Join(genDir, candidates[0]), true
 }
 
 // SetSigstoreTrustRoot pins the Sigstore verification trust root: the
@@ -270,8 +290,15 @@ func (s *Server) uploadSBOM(w http.ResponseWriter, r *http.Request, j model.Job,
 	// Dev-mode mirror of the durable pending row (fs mode has no shared
 	// store): the payload gate and the record attachment can resolve the
 	// digest when a CAS backend is attached, and fall back to the local
-	// sidecar file otherwise. The map write never fails.
-	_ = s.rememberPendingSidecar(ctx, j, base, storage.ArtifactSidecarKindSBOM, sum)
+	// sidecar file otherwise. The mirror entry rides the same atomic state
+	// snapshot as everything else, so a persist failure fails the upload
+	// closed (503) — a 201 without durable pending state would let a restart
+	// guess between candidate files.
+	if err := s.rememberPendingSidecar(ctx, j, base, storage.ArtifactSidecarKindSBOM, sum); err != nil {
+		s.logError("artifact: sbom pending state persist failed", "job", j.ID, "error", err.Error())
+		http.Error(w, "sbom pending state persist failed", http.StatusServiceUnavailable)
+		return
+	}
 	if err := s.attachSidecarToArtifact(ctx, j, base, storage.ArtifactSidecarKindSBOM, sidecar, sum); err != nil {
 		s.logError("artifact: sbom attach failed", "job", j.ID, "error", err.Error())
 		http.Error(w, "sbom attachment failed", http.StatusServiceUnavailable)
@@ -365,7 +392,11 @@ func (s *Server) uploadSigstore(w http.ResponseWriter, r *http.Request, j model.
 		return
 	}
 	// Dev-mode mirror of the durable pending row: see uploadSBOM.
-	_ = s.rememberPendingSidecar(ctx, j, base, storage.ArtifactSidecarKindSigstore, sum)
+	if err := s.rememberPendingSidecar(ctx, j, base, storage.ArtifactSidecarKindSigstore, sum); err != nil {
+		s.logError("artifact: sigstore pending state persist failed", "job", j.ID, "error", err.Error())
+		http.Error(w, "sigstore pending state persist failed", http.StatusServiceUnavailable)
+		return
+	}
 	if err := s.attachSidecarToArtifact(ctx, j, base, storage.ArtifactSidecarKindSigstore, sidecar, sum); err != nil {
 		s.logError("artifact: sigstore attach failed", "job", j.ID, "error", err.Error())
 		http.Error(w, "sigstore attachment failed", http.StatusServiceUnavailable)
@@ -385,33 +416,50 @@ const pendingSidecarMaxAge = 7 * 24 * time.Hour
 // mirror. DB mode keys the durable row by the same full artifact identity
 // (job, lease generation, artifact, kind) — migration 0028 — directly: a
 // retry generation must never collide with (or resolve) a previous
-// generation's pending sidecar.
+// generation's pending sidecar. The canonical encoding lives in
+// storage.PendingSidecarKey so the fs snapshot's durable pointers and the
+// in-memory mirror can never drift.
 func sidecarPendingKey(jobID string, generation int64, base, kind string) string {
-	return jobID + "\x00" + strconv.FormatInt(generation, 10) + "\x00" + cleanBlobName(base) + "\x00" + kind
+	return storage.PendingSidecarKey(jobID, generation, cleanBlobName(base), kind)
 }
 
-// encodePendingSidecar packs a dev-mode mirror entry: the CAS digest plus
-// its creation time, so the memory tick can age out stale entries without
-// widening the shared Server struct.
+// encodePendingSidecar packs a dev-mode mirror entry: the digest plus its
+// creation time, so the memory tick can age out stale entries. The encoding
+// is storage.EncodePendingSidecarValue, which is also what the durable fs
+// snapshot pointers decode/encode through.
 func encodePendingSidecar(digest string, created time.Time) string {
-	return strconv.FormatInt(created.UTC().UnixNano(), 10) + "\x00" + digest
+	return storage.EncodePendingSidecarValue(digest, created)
 }
 
 // decodePendingSidecar unpacks a dev-mode mirror entry. Entries written in
 // the legacy bare-digest form decode as digest-only.
 func decodePendingSidecar(v string) (digest string, created time.Time, ok bool) {
-	idx := strings.IndexByte(v, 0)
-	if idx <= 0 {
-		if v == "" {
-			return "", time.Time{}, false
-		}
-		return v, time.Time{}, true
+	return storage.DecodePendingSidecarValue(v)
+}
+
+// pendingSidecarSnapshotLocked renders the in-memory mirror as the durable,
+// deterministically ordered pointer slice the fs snapshot persists. The
+// caller holds s.mu (persistLocked callers do); the returned slice is a
+// fresh allocation, never aliasing the map.
+func (s *Server) pendingSidecarSnapshotLocked() []storage.PendingSidecarPointer {
+	return storage.SnapshotPendingSidecarPointers(s.pendingSidecars)
+}
+
+// restorePendingSidecarPointers installs the durable fs-mode pointers after a
+// restart. The durable snapshot is the restart-authoritative source: every
+// pointer it carries is installed, and a key it does not carry is left
+// untouched (a union with any legacy in-memory state, which today is empty
+// at load). The legacy on-disk case — exactly one sidecar file per identity
+// with no pointer — stays resolvable through findArtifactSidecar's
+// unambiguous-candidate path; several candidates without a pointer fail
+// closed there.
+func (s *Server) restorePendingSidecarPointers(snap storage.Snapshot) {
+	state := snap.PendingSidecarState()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, val := range state {
+		s.pendingSidecars[key] = val
 	}
-	ns, err := strconv.ParseInt(v[:idx], 10, 64)
-	if err != nil {
-		return v, time.Time{}, true
-	}
-	return v[idx+1:], time.Unix(0, ns).UTC(), true
 }
 
 // sidecarStore resolves the durable pending-sidecar store in DB mode.
@@ -429,9 +477,12 @@ func (s *Server) sidecarStore() (storage.ArtifactSidecarStore, bool) {
 // (job, lease generation, artifact, kind): a retry generation's sidecar can
 // never overwrite or masquerade as another generation's pending state. DB
 // mode writes the DURABLE artifact_pending_sidecars row (visible to every
-// replica, survives restarts); fs/memory mode keeps the in-memory mirror,
-// which is dev-mode state only. A DB-mode store failure is returned so the
-// caller fails closed — never a 201 without pending state.
+// replica, survives restarts); fs mode persists the mirror entry in the SAME
+// atomic state snapshot as the rest of the control-plane state (so a restart
+// restores the exact accepted digest instead of guessing between candidate
+// files); a pure-memory server keeps the in-memory mirror only. A store or
+// state-persist failure is returned so the caller fails closed — never a
+// 201 without pending state.
 func (s *Server) rememberPendingSidecar(ctx context.Context, j model.Job, base, kind, digest string) error {
 	if ss, ok := s.sidecarStore(); ok {
 		return ss.RememberPendingSidecar(ctx, j.ID, j.LeaseGeneration, cleanBlobName(base), kind, digest)
@@ -439,8 +490,24 @@ func (s *Server) rememberPendingSidecar(ctx context.Context, j model.Job, base, 
 	if s.DB != nil {
 		return fmt.Errorf("artifact sidecar store unavailable")
 	}
+	key := sidecarPendingKey(j.ID, j.LeaseGeneration, base, kind)
+	value := encodePendingSidecar(digest, time.Now().UTC())
 	s.mu.Lock()
-	s.pendingSidecars[sidecarPendingKey(j.ID, j.LeaseGeneration, base, kind)] = encodePendingSidecar(digest, time.Now().UTC())
+	prev, hadPrev := s.pendingSidecars[key]
+	s.pendingSidecars[key] = value
+	perr := s.persistCheckedErrLocked("artifact.sidecar_pending")
+	if perr != nil {
+		// Durability first: a pointer the snapshot does not contain must not
+		// survive in memory, or the next unrelated persist commits pending
+		// state the uploader was told failed.
+		if hadPrev {
+			s.pendingSidecars[key] = prev
+		} else {
+			delete(s.pendingSidecars, key)
+		}
+		s.mu.Unlock()
+		return perr
+	}
 	s.mu.Unlock()
 	return nil
 }
@@ -474,22 +541,50 @@ func (s *Server) pendingSidecarDigest(ctx context.Context, jobID string, generat
 // to log: the record is already durable and the maintenance tick prunes
 // leftovers.
 func (s *Server) consumeArtifactPendingSidecars(ctx context.Context, rec model.ArtifactRecord) error {
-	ss, ok := s.sidecarStore()
-	if !ok {
+	if ss, ok := s.sidecarStore(); ok {
+		name := cleanBlobName(rec.Name)
+		if rec.SBOMSHA256 != "" {
+			if err := ss.ConsumePendingSidecar(ctx, rec.JobID, rec.LeaseGeneration, name, storage.ArtifactSidecarKindSBOM, rec.SBOMSHA256); err != nil {
+				return err
+			}
+		}
+		if rec.SigstoreSHA256 != "" {
+			if err := ss.ConsumePendingSidecar(ctx, rec.JobID, rec.LeaseGeneration, name, storage.ArtifactSidecarKindSigstore, rec.SigstoreSHA256); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
+	if s.DB != nil {
+		// DB mode without the sidecar store extension has no durable rows to
+		// consume; the fs mirror is not the source of truth here.
+		return nil
+	}
+	// fs/memory mode: drop the committed record's OWN mirror entries and
+	// persist the drop so a restart does not resurrect a consumed pointer.
+	// The record is already durable and carries the digests, so a persist
+	// failure is returned for the caller to log (never silently ignored).
 	name := cleanBlobName(rec.Name)
+	var keys []string
 	if rec.SBOMSHA256 != "" {
-		if err := ss.ConsumePendingSidecar(ctx, rec.JobID, rec.LeaseGeneration, name, storage.ArtifactSidecarKindSBOM, rec.SBOMSHA256); err != nil {
-			return err
-		}
+		keys = append(keys, sidecarPendingKey(rec.JobID, rec.LeaseGeneration, name, storage.ArtifactSidecarKindSBOM))
 	}
 	if rec.SigstoreSHA256 != "" {
-		if err := ss.ConsumePendingSidecar(ctx, rec.JobID, rec.LeaseGeneration, name, storage.ArtifactSidecarKindSigstore, rec.SigstoreSHA256); err != nil {
-			return err
+		keys = append(keys, sidecarPendingKey(rec.JobID, rec.LeaseGeneration, name, storage.ArtifactSidecarKindSigstore))
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed := false
+	for _, key := range keys {
+		if _, ok := s.pendingSidecars[key]; ok {
+			delete(s.pendingSidecars, key)
+			changed = true
 		}
 	}
-	return nil
+	if !changed {
+		return nil
+	}
+	return s.persistCheckedErrLocked("artifact.sidecar_consume")
 }
 
 // pruneExpiredPendingSidecars drops pending sidecar rows older than
@@ -508,11 +603,20 @@ func (s *Server) pruneExpiredPendingSidecars(ctx context.Context, now time.Time)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	changed := false
 	for key, v := range s.pendingSidecars {
 		_, created, ok := decodePendingSidecar(v)
 		if !ok || created.Before(cutoff) {
 			delete(s.pendingSidecars, key)
+			changed = true
 		}
+	}
+	if changed {
+		// Persist the pruned mirror so a restart cannot resurrect entries
+		// the maintenance tick already dropped. Failures are logged by
+		// persistCheckedErrLocked and arm the degraded state; they never
+		// re-add the pruned entries.
+		_ = s.persistCheckedErrLocked("artifact.sidecar_prune")
 	}
 }
 
@@ -587,6 +691,10 @@ func (s *Server) gateArtifactAttestations(ctx context.Context, c storage.Artifac
 		}
 		b, rerr := s.sidecarBytes(ctx, j, base, "sbom", dir)
 		if rerr != nil {
+			if errors.Is(rerr, errAmbiguousArtifactSidecar) {
+				s.auditLocked("artifact.sbom_rejected", j.LeaseRunnerID, j.RunID, j.ID, "required sbom ambiguous at artifact upload", map[string]string{"name": base, "error": rerr.Error()})
+				return http.StatusUnprocessableEntity, "required sbom is ambiguous: " + rerr.Error()
+			}
 			s.auditLocked("artifact.sbom_missing", j.LeaseRunnerID, j.RunID, j.ID, "required sbom missing at artifact upload", map[string]string{"name": base})
 			return http.StatusUnprocessableEntity, "required sbom missing: upload <name>.sbom before the artifact"
 		}
@@ -602,6 +710,10 @@ func (s *Server) gateArtifactAttestations(ctx context.Context, c storage.Artifac
 		}
 		b, rerr := s.sidecarBytes(ctx, j, base, "sigstore", dir)
 		if rerr != nil {
+			if errors.Is(rerr, errAmbiguousArtifactSidecar) {
+				s.auditLocked("artifact.sigstore_rejected", j.LeaseRunnerID, j.RunID, j.ID, "required sigstore ambiguous at artifact upload", map[string]string{"name": base, "error": rerr.Error()})
+				return http.StatusUnprocessableEntity, "required sigstore bundle is ambiguous: " + rerr.Error()
+			}
 			s.auditLocked("artifact.sigstore_missing", j.LeaseRunnerID, j.RunID, j.ID, "required sigstore missing at artifact upload", map[string]string{"name": base})
 			return http.StatusUnprocessableEntity, "required sigstore bundle missing: upload <name>.sigstore before the artifact"
 		}
@@ -643,10 +755,12 @@ func (s *Server) sidecarBytes(ctx context.Context, j model.Job, base, kind, dir 
 		}
 	}
 	// fs/dev fallback: the exact digest-qualified file when the pending
-	// mirror knows the digest, else this generation's unique candidate.
-	path, found := findArtifactSidecar(dir, j.LeaseGeneration, base, kind, d)
-	if !found {
-		return nil, os.ErrNotExist
+	// mirror knows the digest, else this generation's unique candidate. Two
+	// or more candidates without a durable pointer are ambiguous and fail
+	// closed (errAmbiguousArtifactSidecar), never an arbitrary pick.
+	path, ferr := findArtifactSidecar(dir, j.LeaseGeneration, base, kind, d)
+	if ferr != nil {
+		return nil, ferr
 	}
 	return os.ReadFile(path)
 }
@@ -679,24 +793,45 @@ func (s *Server) attachSidecarsToRecord(ctx context.Context, rec *model.Artifact
 		}
 		return nil
 	}
+	// The fs resolution is sourced EXACTLY like the gate's: the durable
+	// pending digest when present (exact file only), else the single
+	// unambiguous legacy candidate. An ambiguous identity (several files,
+	// no pointer) is returned as an error so the caller fails the upload
+	// instead of recording one of the candidates arbitrarily.
 	sbomPending, sbomOK, _ := s.pendingSidecarDigest(ctx, j.ID, j.LeaseGeneration, base, storage.ArtifactSidecarKindSBOM)
 	if sbomOK && sbomPending != "" && s.CAS != nil {
 		rec.SBOMPath = "cas:" + sbomPending
 		rec.SBOMSHA256 = sbomPending
-	} else if path, found := findArtifactSidecar(dir, j.LeaseGeneration, base, "sbom", sbomPending); found {
-		if b, err := os.ReadFile(path); err == nil && json.Valid(b) {
-			rec.SBOMPath = path
-			rec.SBOMSHA256 = sha256Hex(b)
+	} else {
+		path, ferr := findArtifactSidecar(dir, j.LeaseGeneration, base, "sbom", sbomPending)
+		switch {
+		case ferr == nil:
+			if b, err := os.ReadFile(path); err == nil && json.Valid(b) {
+				rec.SBOMPath = path
+				rec.SBOMSHA256 = sha256Hex(b)
+			}
+		case errors.Is(ferr, os.ErrNotExist):
+			// No sidecar for this identity: a non-required gate stays empty.
+		default:
+			return ferr
 		}
 	}
 	sigPending, sigOK, _ := s.pendingSidecarDigest(ctx, j.ID, j.LeaseGeneration, base, storage.ArtifactSidecarKindSigstore)
 	if sigOK && sigPending != "" && s.CAS != nil {
 		rec.SigstorePath = "cas:" + sigPending
 		rec.SigstoreSHA256 = sigPending
-	} else if path, found := findArtifactSidecar(dir, j.LeaseGeneration, base, "sigstore", sigPending); found {
-		if b, err := os.ReadFile(path); err == nil && json.Valid(b) {
-			rec.SigstorePath = path
-			rec.SigstoreSHA256 = sha256Hex(b)
+	} else {
+		path, ferr := findArtifactSidecar(dir, j.LeaseGeneration, base, "sigstore", sigPending)
+		switch {
+		case ferr == nil:
+			if b, err := os.ReadFile(path); err == nil && json.Valid(b) {
+				rec.SigstorePath = path
+				rec.SigstoreSHA256 = sha256Hex(b)
+			}
+		case errors.Is(ferr, os.ErrNotExist):
+			// No sidecar for this identity: a non-required gate stays empty.
+		default:
+			return ferr
 		}
 	}
 	return nil

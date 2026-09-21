@@ -43,6 +43,21 @@ func validateRunnerProfile(p *model.RunnerProfile) error {
 	if p.MaxCapacity < 0 || p.MaxCapacity > maxRunnerCapacity {
 		return fmt.Errorf("max_capacity must be in 0..%d, got %d", maxRunnerCapacity, p.MaxCapacity)
 	}
+	// Resource capacities (migration 0030): 0 means unconstrained, so only
+	// negative values are invalid. The dimensions are independent; a profile
+	// may constrain any subset.
+	if p.MaxCPU < 0 {
+		return fmt.Errorf("max_cpu must not be negative, got %v", p.MaxCPU)
+	}
+	if p.MaxMemory < 0 {
+		return fmt.Errorf("max_memory must not be negative, got %d", p.MaxMemory)
+	}
+	if p.MaxDisk < 0 {
+		return fmt.Errorf("max_disk must not be negative, got %d", p.MaxDisk)
+	}
+	if p.MaxPIDs < 0 {
+		return fmt.Errorf("max_pids must not be negative, got %d", p.MaxPIDs)
+	}
 	for _, c := range p.Capabilities {
 		if !profileCapabilities[c] {
 			return fmt.Errorf("invalid runner capability %q (want native, container or tart)", c)

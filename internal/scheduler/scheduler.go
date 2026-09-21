@@ -238,6 +238,17 @@ func (s *DBScheduler) Enqueue(ctx context.Context, run model.Run, jobs map[strin
 // deadlines are evaluated on top, then priority (downstream depth) and age.
 // The raw lease token is returned exactly once; only its hash is persisted.
 //
+// RESOURCE ADMISSION: a candidate whose requested CPU/memory/disk/PIDs do
+// not fit the runner's REMAINING resource capacity is skipped, so it waits
+// (or is leased to another runner with room) instead of oversubscribing this
+// one. The check here is a pre-filter over the live reservation sum; the
+// authoritative check-and-reserve happens inside the claim transaction
+// (storage.AcquireLeaseAtomic), which fails with storage.ErrResourceCapacity
+// when a concurrent lease won the remaining capacity first — that error is
+// treated exactly like a lost capacity race (try the next candidate). A
+// runner without configured capacities (all dimensions zero, the documented
+// default) admits every candidate: only the job-count capacity applies.
+//
 // Deliberately NOT epoch-fenced, unlike the leader-only housekeeping
 // mutations: the lease claim is itself a single atomic conditional
 // transaction (AcquireLeaseAtomic / AcquireLease) whose mutual exclusion comes
@@ -268,6 +279,12 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 	if len(eff.ActiveJobs) >= eff.Capacity {
 		return nil, "", time.Time{}, ErrNoJobs
 	}
+	// The runner's live resource reservations, read ONCE per lease attempt
+	// (the pre-filter below evaluates every candidate against the same
+	// snapshot; the claim transaction re-reads them under the runner row
+	// lock). A store without the reservation contract reports zero, which
+	// makes the pre-filter vacuous.
+	reserved := s.reservedResources(ctx, runnerID)
 	queued, err := s.Store.ListQueuedJobs(ctx)
 	if err != nil {
 		return nil, "", time.Time{}, err
@@ -286,6 +303,17 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 		// is never leased; RecoverExpired cancels it. Both the atomic-lease
 		// and the plain-lease branches below share this gate.
 		if dl := QueueDeadlineFor(candidate); dl != nil && !dl.After(now) {
+			continue
+		}
+		// Resource admission pre-filter: a candidate that cannot fit the
+		// runner's remaining resource capacity waits for room on this
+		// runner (or a lease on another one) instead of being claimed and
+		// rolling back.
+		if !(storage.ResourceAdmission{
+			Capacity:  eff.ResourceCapacity,
+			Reserved:  reserved,
+			Requested: candidate.ResourceRequest(),
+		}).Allows() {
 			continue
 		}
 		// The shared predicate is the same decision the SQL claim and the
@@ -359,6 +387,7 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 			Generation:             generation,
 			ExpiresAt:              expires,
 			RunnerCapacity:         eff.Capacity,
+			ResourceCapacity:       eff.ResourceCapacity,
 			Runtime:                storage.JobRuntime(candidate),
 			CanonRepoID:            storage.RepoIDForJob(candidate),
 			RepoFullName:           candidate.RepoFullName,
@@ -368,11 +397,16 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 			EnvironmentConcurrency: candidate.EnvironmentConcurrency,
 			RepoConcurrency:        repoConcurrency,
 			TeamConcurrency:        teamConcurrency,
+			CPURequest:             candidate.CPURequest,
+			MemoryRequest:          candidate.MemoryRequest,
+			DiskRequest:            candidate.DiskRequest,
+			PIDsRequest:            candidate.PIDsRequest,
 		}
-		// Capacity-atomic lease: the job claim, every predicate above and
-		// the runner's active-jobs append happen in ONE transaction, so two
-		// concurrent leases can never exceed the runner's capacity, bypass
-		// a concurrent disable/drain or overrun environment/quota limits.
+		// Capacity-atomic lease: the job claim, every predicate above, the
+		// resource reservation and the runner's active-jobs append happen in
+		// ONE transaction, so two concurrent leases can never exceed the
+		// runner's capacity — count or resources — bypass a concurrent
+		// disable/drain or overrun environment/quota limits.
 		// The separate UpsertRunner afterwards is skipped because the store
 		// already updated the runner row.
 		if as, ok := s.Store.(storage.AtomicLeaseStore); ok {
@@ -385,10 +419,12 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 				continue
 			case errors.Is(err, storage.ErrNoCapacity),
 				errors.Is(err, storage.ErrEnvConcurrency),
+				errors.Is(err, storage.ErrResourceCapacity),
 				errors.Is(err, storage.ErrQuotaExceeded):
 				// A predicate lost a race (filled capacity slot, taken
-				// environment slot, exhausted quota) or this candidate is
-				// not eligible for this runner: try the next candidate.
+				// environment slot, exhausted resource capacity or quota) or
+				// this candidate is not eligible for this runner: try the
+				// next candidate.
 				continue
 			default:
 				return nil, "", time.Time{}, err
@@ -449,6 +485,38 @@ func (s *DBScheduler) effectiveRunner(ctx context.Context, ri model.Runner) mode
 		return ri
 	}
 	return storage.ResolveRunnerProfile(ri, p, true)
+}
+
+// EffectiveRunner exposes the LIVE scheduling view of one runner (profile
+// overlay included) to the server's queue-reason explainer, so the reasons it
+// reports use the same effective capacity the lease decision uses. Stores
+// without a profile contract return the runner unchanged.
+func (s *DBScheduler) EffectiveRunner(ctx context.Context, ri model.Runner) model.Runner {
+	return s.effectiveRunner(ctx, ri)
+}
+
+// ReservedResources exposes the runner's live resource reservation sum to the
+// queue-reason explainer. A store without the ledger contract reports zero,
+// which makes the resource reasons vacuous.
+func (s *DBScheduler) ReservedResources(ctx context.Context, runnerID string) model.ResourceCapacity {
+	return s.reservedResources(ctx, runnerID)
+}
+
+// reservedResources reads the runner's live resource reservations when the
+// store keeps the ledger. A store without the contract reports zero, which
+// makes the resource pre-filter vacuous (the claim's own transaction still
+// decides).
+func (s *DBScheduler) reservedResources(ctx context.Context, runnerID string) model.ResourceCapacity {
+	rs, ok := s.Store.(storage.ResourceReservationStore)
+	if !ok {
+		return model.ResourceCapacity{}
+	}
+	reserved, err := rs.RunnerReservedResources(ctx, runnerID)
+	if err != nil {
+		log.Printf("scheduler: read reserved resources for runner %s: %v", runnerID, err)
+		return model.ResourceCapacity{}
+	}
+	return reserved
 }
 
 // Heartbeat extends the job's lease and reports whether the job was

@@ -17,6 +17,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/safefs"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/snapshot"
 )
 
 // incompressible returns n bytes of random data: snapshot archives are
@@ -110,22 +111,41 @@ func TestWorkspaceMaxBytesForResourcesUnits(t *testing.T) {
 	}
 }
 
-// TestSnapshotArchiveMaxBytesDerivation pins the archive cap derivation: a
-// declared bound scales by the documented framing factor and an undeclared
-// bound falls back to the runner default, which unifies with the control
-// plane's hard upload ceiling.
+// TestSnapshotArchiveMaxBytesDerivation pins the archive cap derivation
+// against the ONE shared snapshot budget: a declared bound scales by the
+// documented framing factor, an undeclared bound falls back to
+// DefaultSnapshotArchiveMaxBytes, and a bound whose 2x product would exceed
+// the budget is CLAMPED to it, so the runner can never assemble an archive
+// the receiver's body cap and snapshot.Parse would reject.
 func TestSnapshotArchiveMaxBytesDerivation(t *testing.T) {
-	if DefaultSnapshotArchiveMaxBytes != 8<<30 {
-		t.Fatalf("default snapshot archive cap = %d, want 8 GiB", DefaultSnapshotArchiveMaxBytes)
+	// The runner default IS the shared budget (one exported symbol used by
+	// the parser default, the runner cap and the HTTP body cap).
+	if DefaultSnapshotArchiveMaxBytes != snapshot.MaxArchiveBytes {
+		t.Fatalf("runner default = %d, want the shared snapshot.MaxArchiveBytes %d", DefaultSnapshotArchiveMaxBytes, snapshot.MaxArchiveBytes)
 	}
-	if got := snapshotArchiveMaxBytes(0); got != DefaultSnapshotArchiveMaxBytes {
-		t.Fatalf("undeclared bound cap = %d, want %d", got, DefaultSnapshotArchiveMaxBytes)
+	if snapshot.MaxArchiveBytes != 4<<30 {
+		t.Fatalf("shared snapshot budget = %d, want 4 GiB", snapshot.MaxArchiveBytes)
+	}
+	if got := snapshotArchiveMaxBytes(0); got != snapshot.MaxArchiveBytes {
+		t.Fatalf("undeclared bound cap = %d, want %d", got, snapshot.MaxArchiveBytes)
 	}
 	if got := snapshotArchiveMaxBytes(64 << 10); got != 128<<10 {
 		t.Fatalf("declared bound cap = %d, want %d", got, 128<<10)
 	}
-	if got := snapshotArchiveMaxBytes(1 << 50); got != 2<<50 {
-		t.Fatalf("1 PiB bound cap = %d, want %d", got, 2<<50)
+	// Exactly at half the budget the 2x product still fits.
+	if got := snapshotArchiveMaxBytes(snapshot.MaxArchiveBytes / 2); got != snapshot.MaxArchiveBytes {
+		t.Fatalf("half-budget bound cap = %d, want the shared ceiling %d", got, snapshot.MaxArchiveBytes)
+	}
+	// One byte above half the budget the 2x product would exceed it: the
+	// cap is clamped, never 2x the declared bound.
+	if got := snapshotArchiveMaxBytes(snapshot.MaxArchiveBytes/2 + 1); got != snapshot.MaxArchiveBytes {
+		t.Fatalf("above-half bound cap = %d, want the shared ceiling %d", got, snapshot.MaxArchiveBytes)
+	}
+	if got := snapshotArchiveMaxBytes(snapshot.MaxArchiveBytes); got != snapshot.MaxArchiveBytes {
+		t.Fatalf("at-budget bound cap = %d, want the shared ceiling %d", got, snapshot.MaxArchiveBytes)
+	}
+	if got := snapshotArchiveMaxBytes(1 << 50); got != snapshot.MaxArchiveBytes {
+		t.Fatalf("1 PiB bound cap = %d, want the shared ceiling %d", got, snapshot.MaxArchiveBytes)
 	}
 }
 

@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -44,11 +45,33 @@ type ContainerBackend struct {
 	// quota): it is enforced as the workspace content bound instead, see
 	// workspaceMaxBytes/enforceWorkspaceBound.
 	Resources pipeline.Resources
+	// Untrusted marks the job as untrusted. Untrusted jobs always get a
+	// workspace disk budget: the declared resources.disk when set, otherwise
+	// UntrustedDiskMaxBytes (or DefaultUntrustedWorkspaceMaxBytes). Trusted
+	// jobs without a disk declaration keep the historical unbounded
+	// behavior.
+	Untrusted bool
+	// UntrustedDiskMaxBytes overrides DefaultUntrustedWorkspaceMaxBytes for
+	// untrusted jobs without a resources.disk declaration. Zero selects the
+	// package default; negative is treated as zero.
+	UntrustedDiskMaxBytes int64
+	// RequireDiskQuota fails StartJob closed when the job is untrusted and no
+	// OS-level hard bound (project quota) can be established for the
+	// workspace. Production runners set this for untrusted jobs; the
+	// step-boundary resources.disk check alone is not a security boundary,
+	// so advertising it as enforced without this gate would be dishonest. The
+	// operator escape hatch for trusted-only/self-hosted runners lives in
+	// Options/KIWI_ALLOW_UNQUOTAED_UNTRUSTED_DISK.
+	RequireDiskQuota bool
 	// restoreWorkspace undoes the host-side workspace provisioning applied
 	// before a hardened rootful container started. It is set by StartJob and
 	// run exactly once by CloseJob (or by StartJob itself when the docker run
 	// fails after provisioning).
 	restoreWorkspace func() error
+	// quotaCleanup removes the OS-level workspace project quota applied by
+	// the capability probe. Set by StartJob and run exactly once by CloseJob
+	// (or by StartJob itself on a failure after the probe succeeded).
+	quotaCleanup func() error
 }
 
 func (*ContainerBackend) Name() string { return "container" }
@@ -75,16 +98,31 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 	// checkout that already exceeds it is refused before any container is
 	// created, so an over-quota workspace can never half-run. The check is
 	// host-side and does not depend on the daemon, so it deliberately runs
-	// before the docker lookup.
+	// before the docker lookup. Untrusted jobs without a declaration measure
+	// against the mandatory default budget (workspaceMaxBytes).
 	if err := b.enforceWorkspaceBound(); err != nil {
 		return err
 	}
+	// Untrusted jobs must not advertise a disk bound that exists only at step
+	// boundaries. When the caller demands a hard bound, the capability probe
+	// must actually establish one (XFS project quota); otherwise the job
+	// fails closed before docker is even looked up, with a message that names
+	// the escape hatch instead of silently running unbounded.
+	if b.Untrusted && b.RequireDiskQuota {
+		status, cleanup := workspaceDiskQuotaSetup(abs, b.workspaceMaxBytes())
+		if !status.Hard {
+			return &RunError{Kind: ErrorConfig, Err: fmt.Errorf("untrusted job requires a hard workspace disk quota, but none could be established: %s (the step-boundary resources.disk check is not a hard bound; set %s=1 only on trusted-only self-hosted runners to accept that residual, or run the runner on an XFS workspace with prjquota and root)", status.Detail, AllowUnquotaedUntrustedDiskEnv)}
+		}
+		b.quotaCleanup = cleanup
+	}
 	docker, err := exec.LookPath("docker")
 	if err != nil {
+		_ = b.cleanupWorkspaceQuota()
 		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("docker not found: %w", err)}
 	}
 	if b.Rootless {
 		if err := b.verifyRootlessDaemon(ctx, docker); err != nil {
+			_ = b.cleanupWorkspaceQuota()
 			return err
 		}
 	}
@@ -112,6 +150,7 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 		if plan.ProvisionWorkspace {
 			restore, perr := provisionWorkspace(abs, plan.UID, plan.GID, false)
 			if perr != nil {
+				_ = b.cleanupWorkspaceQuota()
 				return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("provision container workspace: %w", perr)}
 			}
 			b.restoreWorkspace = restore
@@ -120,7 +159,7 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 	args = append(args, b.Image, "sh", "-c", "while :; do sleep 3600; done")
 	out, err := exec.CommandContext(ctx, docker, args...).CombinedOutput()
 	if err != nil {
-		restoreErr := b.restoreProvisionedWorkspace()
+		restoreErr := errors.Join(b.restoreProvisionedWorkspace(), b.cleanupWorkspaceQuota())
 		if restoreErr != nil {
 			return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("start job container: %v: %s (workspace restore also failed: %v)", err, strings.TrimSpace(string(out)), restoreErr)}
 		}
@@ -141,30 +180,49 @@ func containerResourceArgs(j pipeline.Job) []string {
 	return resourceArgsFor(j.Resources)
 }
 
-// workspaceMaxBytes is the workspace content bound for one container job: the
-// declared resources.disk request. pipeline.ByteSize is already the canonical
-// byte count the pipeline decoder produced (binary suffixes: "2Gi" = 2<<30;
-// plain integers are bytes), and the same value the distributed runner copies
-// into executor.Options.WorkspaceMaxBytes, so no re-parsing is involved.
+// workspaceMaxBytes is the workspace content bound for one container job.
+// pipeline.ByteSize is already the canonical byte count the pipeline decoder
+// produced (binary suffixes: "2Gi" = 2<<30; plain integers are bytes), so no
+// re-parsing is involved.
 //
-// An undeclared disk (zero) leaves the workspace unbounded. That is the
-// documented default: pipelines that never declared a disk request keep their
-// previous behavior exactly, and the bound only applies to jobs that opted
-// into a disk declaration.
+// Precedence:
+//  1. a declared resources.disk request (any job), then
+//  2. for an untrusted job, UntrustedDiskMaxBytes when set, otherwise the
+//     mandatory DefaultUntrustedWorkspaceMaxBytes, then
+//  3. trusted jobs without a declaration: zero (unbounded), the documented
+//     historical default.
+//
+// The untrusted default is the fix for the unbounded-workspace defect: an
+// undeclared disk no longer means "unbounded" for jobs the runner does not
+// trust. The bound is still measured at step boundaries (a bind mount has no
+// per-mount quota); the hard OS-level bound for untrusted jobs comes from the
+// RequireDiskQuota capability gate, which fails closed when no project quota
+// can be established.
 func (b *ContainerBackend) workspaceMaxBytes() int64 {
-	return int64(b.Resources.Disk)
+	if disk := int64(b.Resources.Disk); disk > 0 {
+		return disk
+	}
+	if b.Untrusted {
+		if b.UntrustedDiskMaxBytes > 0 {
+			return b.UntrustedDiskMaxBytes
+		}
+		return DefaultUntrustedWorkspaceMaxBytes
+	}
+	return 0
 }
 
 // enforceWorkspaceBound fails with a clear error when the host-side workspace
-// already holds more than the declared resources.disk bound. A bind mount has
-// no per-mount quota, so the bound is measured at step boundaries (before a
-// step starts and again after it succeeded) and the offending step fails
-// instead of the workspace silently growing past its declaration. Nothing is
-// ever truncated: an over-bound workspace is reported, never silently trimmed.
+// already holds more than the job's workspace bound. A bind mount has no
+// per-mount quota, so the bound is measured at step boundaries (before a step
+// starts and again after it succeeded) and the offending step fails instead
+// of the workspace silently growing past its declaration. Nothing is ever
+// truncated: an over-bound workspace is reported, never silently trimmed.
 //
 // The measurement is a stat-only walk (see workspaceUsageBytes); it is not
 // part of the security boundary (the daemon has no quota to set), so it is
-// deliberately best-effort about concurrent workspace mutations.
+// deliberately best-effort about concurrent workspace mutations. Untrusted
+// jobs get a hard bound from the project-quota capability gate when the
+// caller requires one.
 func (b *ContainerBackend) enforceWorkspaceBound() error {
 	limit := b.workspaceMaxBytes()
 	if limit <= 0 {
@@ -335,17 +393,38 @@ func (b *ContainerBackend) verifyRootlessDaemon(ctx context.Context, docker stri
 
 func (b *ContainerBackend) CloseJob() error {
 	if b.container == "" || b.docker == "" {
-		return b.restoreProvisionedWorkspace()
+		return b.finishJobWorkspace()
 	}
 	out, err := exec.Command(b.docker, "rm", "-f", b.container).CombinedOutput()
 	b.container = ""
 	if err != nil && !strings.Contains(string(out), "No such container") {
-		if rerr := b.restoreProvisionedWorkspace(); rerr != nil {
+		if rerr := b.finishJobWorkspace(); rerr != nil {
 			return fmt.Errorf("remove job container: %v: %s (workspace restore also failed: %v)", err, strings.TrimSpace(string(out)), rerr)
 		}
 		return fmt.Errorf("remove job container: %v: %s", err, strings.TrimSpace(string(out)))
 	}
-	return b.restoreProvisionedWorkspace()
+	return b.finishJobWorkspace()
+}
+
+// finishJobWorkspace runs the pending workspace teardown (ownership restore
+// and project-quota removal), joining both errors. Each step is idempotent
+// (the function values are cleared before use), so CloseJob and the StartJob
+// failure paths can call it unconditionally.
+func (b *ContainerBackend) finishJobWorkspace() error {
+	return errors.Join(b.restoreProvisionedWorkspace(), b.cleanupWorkspaceQuota())
+}
+
+// cleanupWorkspaceQuota removes the OS-level workspace project quota applied
+// by the capability probe, exactly once. Errors are returned, never
+// swallowed: a failed removal leaves quota state behind and must surface as a
+// cleanup warning.
+func (b *ContainerBackend) cleanupWorkspaceQuota() error {
+	cleanup := b.quotaCleanup
+	b.quotaCleanup = nil
+	if cleanup == nil {
+		return nil
+	}
+	return cleanup()
 }
 
 // restoreProvisionedWorkspace runs the pending ownership restore exactly once.

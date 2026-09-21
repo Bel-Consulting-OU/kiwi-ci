@@ -81,7 +81,7 @@ Production mode (PostgreSQL, TLS, distinct admin/runner credentials):
   --external-url https://ci.example.com \
   --database-url "postgres://kiwi:pass@db:5432/kiwi" \
   --admin-token "$ADMIN_TOKEN" \
-  --runner-token "$RUNNER_TOKEN" \
+  --runner-tokens-file /etc/kiwi/runner-tokens.json \
   --tls-cert /etc/kiwi/server.crt \
   --tls-key /etc/kiwi/server.key \
   --data-dir /var/lib/kiwi
@@ -89,11 +89,23 @@ Production mode (PostgreSQL, TLS, distinct admin/runner credentials):
 
 Production mode enforces its contract at startup: database URL,
 distinct tokens (or `--allow-shared-token`), an `https://` external URL
-(the OIDC issuer), and TLS. The `--runner-token` is a SHARED credential
-across all runners — not a per-runner identity — so production strongly
-prefers persistent per-runner mTLS identities (`--runner-ca-cert`/
-`--runner-ca-key` plus enrollment); without a runner token, enforced
-runner mTLS is required. See
+(the OIDC issuer), and TLS. The runner-auth half is enforced once the
+database is open, because per-runner bearer credentials may already be
+provisioned in `runner_bearer_tokens`: production requires at least one
+actual per-runner mechanism — enforced runner mTLS
+(`--runner-ca-cert`/`--runner-ca-key` with `--runner-require-client-certs`)
+or per-runner bearer credentials (`--runner-tokens-file`, a JSON map of
+runner ID to SHA-256 token digest, or rows already provisioned in
+`runner_bearer_tokens`).
+
+The shared `--runner-token` is **dev/bootstrap compatibility only**: a
+production server clears it at startup, so it can never authenticate
+runner traffic there, and a production server with only `--runner-token`
+and no per-runner credentials refuses to start. HA replicas share every
+signing material through the database-backed cluster key store by
+default; an explicit `--cluster-key-dir` on shared storage is the
+alternative, while a per-node `--data-dir` key store is refused in
+HA/production mode. See
 [docs/production-deployment.md](docs/production-deployment.md).
 
 Configuration can also come from a `kiwi.toml` file

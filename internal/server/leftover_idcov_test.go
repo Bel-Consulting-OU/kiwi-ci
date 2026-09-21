@@ -185,8 +185,8 @@ func TestLeftoverRunnerTokensZeroValue(t *testing.T) {
 		t.Fatal("LoadRunnerTokens did not initialize the token map")
 	}
 	s.LoadRunnerTokens(nil)
-	if _, ok := s.runnerBearerID(httptest.NewRequest(http.MethodGet, "/", nil)); ok {
-		t.Fatal("empty token map must not resolve a bearer")
+	if _, ok, err := s.runnerBearerID(httptest.NewRequest(http.MethodGet, "/", nil)); ok || err != nil {
+		t.Fatalf("empty token map must not resolve a bearer: ok=%v err=%v", ok, err)
 	}
 }
 

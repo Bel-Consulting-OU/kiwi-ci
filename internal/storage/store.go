@@ -1111,6 +1111,16 @@ type RunEnqueueStore interface {
 //   - RepoConcurrency/TeamConcurrency gate the queued->running quota
 //     transition: the quota_reservations row is updated conditionally and
 //     zero matched rows rolls the whole lease back with ErrQuotaExceeded.
+//   - CPURequest/MemoryRequest/DiskRequest/PIDsRequest are the candidate
+//     job's requested resources (model.Job.ResourceRequest). The claim
+//     reserves them against the runner's remaining resource capacity in the
+//     same transaction (see postgres_resource_reservation.go); a rejected
+//     admission rolls the lease back with ErrResourceCapacity.
+//   - ResourceCapacity is the caller's registration-snapshot resource
+//     capacity. The SQL claim reads the runner row's live resource capacity
+//     (and, when linked, the profile's max_* columns) instead; memory stores
+//     that keep no live row read this field. Zero dimensions are
+//     unconstrained (the documented default).
 type LeaseClaim struct {
 	JobID      string
 	RunnerID   string
@@ -1118,7 +1128,8 @@ type LeaseClaim struct {
 	Generation int64
 	ExpiresAt  time.Time
 
-	RunnerCapacity int
+	RunnerCapacity   int
+	ResourceCapacity model.ResourceCapacity
 
 	Runtime          string
 	CanonRepoID      string
@@ -1130,6 +1141,16 @@ type LeaseClaim struct {
 	EnvironmentConcurrency int
 	RepoConcurrency        float64
 	TeamConcurrency        float64
+
+	CPURequest    float64
+	MemoryRequest int64
+	DiskRequest   int64
+	PIDsRequest   int
+}
+
+// RequestedResources returns the claim's requested resources.
+func (c LeaseClaim) RequestedResources() model.ResourceCapacity {
+	return model.ResourceCapacity{CPU: c.CPURequest, Memory: c.MemoryRequest, Disk: c.DiskRequest, PIDs: c.PIDsRequest}
 }
 
 // EnvKey names the environment concurrency key: the CANONICAL repository

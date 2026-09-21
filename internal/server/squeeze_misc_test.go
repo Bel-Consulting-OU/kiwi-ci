@@ -156,8 +156,8 @@ func TestSqueezeRunnerTokenBranches(t *testing.T) {
 		t.Fatal(err)
 	}
 	ps.DB = errTokenStore{dbFakeStore: f, lookupErr: errors.New("token table down")}
-	if _, ok := ps.runnerBearerID(runnerTokenRequest("tok")); ok {
-		t.Fatal("failing token lookup returned an identity")
+	if _, ok, lerr := ps.runnerBearerID(runnerTokenRequest("tok")); ok || lerr == nil {
+		t.Fatalf("failing token lookup = ok=%v err=%v, want no identity and a hard error", ok, lerr)
 	}
 
 	ps2, err := NewPersistent("secret", "secret", t.TempDir())
@@ -168,13 +168,15 @@ func TestSqueezeRunnerTokenBranches(t *testing.T) {
 	if err := ps2.SwitchToDB(f2); err != nil {
 		t.Fatal(err)
 	}
-	if ps2.runnerTokensConfigured(runnerTokenRequest("tok")) {
-		t.Fatal("no tokens configured must report empty")
+	configured, cerr := ps2.runnerTokensConfigured(runnerTokenRequest("tok"))
+	if cerr != nil || configured {
+		t.Fatalf("no tokens configured = %v, %v", configured, cerr)
 	}
 	ps2.DB = errTokenStore{dbFakeStore: f2, hasErr: errors.New("token table down")}
 	ps2.runnerTokensDBAt = time.Time{}
-	if ps2.runnerTokensConfigured(runnerTokenRequest("tok")) {
-		t.Fatal("failing existence check must report no tokens")
+	configured, cerr = ps2.runnerTokensConfigured(runnerTokenRequest("tok"))
+	if cerr == nil || configured {
+		t.Fatalf("failing existence check = %v, %v; want a hard error that is never cached as not configured", configured, cerr)
 	}
 
 	ps3, err := NewPersistent("secret", "secret", t.TempDir())

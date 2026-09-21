@@ -31,7 +31,10 @@ import (
 // productionConfig is the pure input to validateProductionConfig, extracted
 // so production-mode requirements are unit-testable without a network.
 // Server() fills it from the merged configuration (CLI > environment >
-// config file > defaults).
+// config file > defaults). Per-runner credential requirements are NOT part of
+// this static input: they can only be decided after the SQL store is open
+// (see validateProductionRunnerCredentials), so the static validator never
+// rejects a production config for `--runner-token` alone.
 type productionConfig struct {
 	Mode             string
 	DatabaseURL      string
@@ -41,26 +44,17 @@ type productionConfig struct {
 	TLSCert          string
 	TLSKey           string
 	AllowSharedToken bool
-	// RunnerMTLSEnforced reports whether runner client certificates are
-	// mandatory (runner CA configured and --runner-require-client-certs
-	// not disabled). When enforced, the runner bearer token becomes
-	// optional in production.
-	RunnerMTLSEnforced bool
-	// RunnerTokensConfigured reports whether per-runner bearer credentials
-	// are provisioned (auth.runner_tokens_file, or rows already in the
-	// runner_bearer_tokens table checked after the DB connects). With
-	// per-runner credentials the shared runner token is dev-only.
-	RunnerTokensConfigured bool
 }
 
-// validateProductionConfig enforces the production-mode startup contract:
-// a database URL, distinct admin/runner credentials (or an explicit
-// --allow-shared-token), an external URL (the OIDC issuer always serves in
-// production), TLS, and per-runner runner credentials. The shared runner
-// bearer token is a SHARED credential, not a per-runner identity, and is
-// dev/bootstrap-only: production requires runner mTLS or per-runner bearer
-// tokens (auth.runner_tokens_file / DB runner_bearer_tokens). Dev mode has
-// no additional requirements.
+// validateProductionConfig enforces the STATIC half of the production-mode
+// startup contract: a database URL, distinct admin/runner credentials (or an
+// explicit --allow-shared-token), an external URL (the OIDC issuer always
+// serves in production), and TLS. The runner-auth half is post-DB: at least
+// one actual per-runner mechanism (enforced mTLS or provisioned per-runner
+// bearer credentials) must exist, checked by
+// validateProductionRunnerCredentials once the store is open, because
+// per-runner credentials may already be provisioned in
+// runner_bearer_tokens. Dev mode has no additional requirements.
 // drainTimeout bounds the graceful drain wait on signal.
 const drainTimeout = 30 * time.Second
 
@@ -309,19 +303,31 @@ func validateProductionConfig(cfg productionConfig) error {
 	if cfg.TLSCert == "" || cfg.TLSKey == "" {
 		return fmt.Errorf("production mode requires --tls-cert and --tls-key")
 	}
-	// Fail closed: an admin token without any runner credential would serve
-	// 503s on every runner route (the server's own fail-closed tier), so
-	// refuse it at startup unless runner mTLS is enforced or per-runner
-	// tokens are provisioned.
-	if cfg.AdminToken != "" && cfg.RunnerToken == "" && !cfg.RunnerMTLSEnforced && !cfg.RunnerTokensConfigured {
-		return fmt.Errorf("production mode with an admin token requires --runner-token, enforced runner mTLS (--runner-ca-cert/--runner-ca-key with --runner-require-client-certs) or per-runner credentials (--runner-tokens-file)")
+	// Runner credentials are a POST-DB decision (per-runner tokens may
+	// already live in the runner_bearer_tokens table), so the static
+	// validator deliberately says nothing about --runner-token here.
+	return nil
+}
+
+// validateProductionRunnerCredentials is the post-DB half of the production
+// runner-auth contract: at least one actual per-runner mechanism must exist —
+// enforced runner mTLS, per-runner bearer credentials supplied through
+// --runner-tokens-file (provisioned into runner_bearer_tokens next), or rows
+// already provisioned in runner_bearer_tokens. The shared runner token is
+// dev/bootstrap compatibility only: production accepts it at neither this
+// check nor the request path (Server() clears Server.RunnerToken once this
+// function passes), so a production server holding only --runner-token
+// refuses to start.
+func validateProductionRunnerCredentials(ctx context.Context, db storage.Store, mtlsEnforced bool, fileTokens map[string]string) error {
+	if mtlsEnforced || len(fileTokens) > 0 {
+		return nil
 	}
-	// The shared runner token is a shared credential: production must not
-	// rely on it. Runner traffic needs per-runner identity (mTLS) or
-	// per-runner bearer tokens; a global runner token alone refuses to
-	// start.
-	if cfg.RunnerToken != "" && !cfg.RunnerMTLSEnforced && !cfg.RunnerTokensConfigured {
-		return fmt.Errorf("production requires runner mTLS or per-runner credentials; the shared runner token is dev-only")
+	has, err := hasProvisionedRunnerTokens(ctx, db)
+	if err != nil {
+		return fmt.Errorf("check per-runner credentials: %w", err)
+	}
+	if !has {
+		return fmt.Errorf("production requires runner mTLS or per-runner credentials; the shared runner token is dev/bootstrap-only and is disabled in production")
 	}
 	return nil
 }
@@ -333,10 +339,12 @@ func Server(ctx context.Context, args []string) error {
 	// explicitly set flags override the config.
 	listen := fs.String("listen", "", "listen address (default: \":8080\")")
 	// The runner bearer token is a SHARED credential across all runners,
-	// not a per-runner identity. Production strongly prefers persistent
-	// per-runner mTLS identities (--runner-ca-cert/--runner-ca-key +
-	// enrollment); the control plane fails closed when neither is present.
-	token := fs.String("runner-token", "", "runner bearer token shared by all runners (prefer per-runner mTLS certificates in production)")
+	// not a per-runner identity. It is dev/bootstrap compatibility only:
+	// production clears it at startup and requires per-runner mTLS
+	// identities (--runner-ca-cert/--runner-ca-key + enrollment) or
+	// per-runner bearer credentials (--runner-tokens-file /
+	// runner_bearer_tokens).
+	token := fs.String("runner-token", "", "runner bearer token shared by all runners (dev/bootstrap only; production requires per-runner mTLS or --runner-tokens-file)")
 	adminToken := fs.String("admin-token", "", "admin bearer token (defaults to runner token)")
 	webhookSecret := fs.String("github-webhook-secret", "", "GitHub webhook HMAC secret")
 	githubToken := fs.String("github-token", "", "GitHub token for private pipeline fetches")
@@ -353,7 +361,7 @@ func Server(ctx context.Context, args []string) error {
 	// HTTP authorization layer, keeping admin/forge/enrollment traffic on
 	// the same listener.
 	runnerRequireClientCerts := fs.Bool("runner-require-client-certs", true, "require runner client certificates on runner-tier routes when a runner CA is configured (default true)")
-	clusterKeyDir := fs.String("cluster-key-dir", "", "shared cluster key store directory (HA replicas share signing material); requires --data-dir")
+	clusterKeyDir := fs.String("cluster-key-dir", "", "shared cluster key store directory (HA replicas share signing material); requires --data-dir; DB mode defaults to the database-backed store")
 	databaseURL := fs.String("database-url", "", "PostgreSQL connection URL (wires the durable SQL control plane)")
 	mode := fs.String("mode", "", "server mode: dev (in-memory, default) or production")
 	allowSharedToken := fs.Bool("allow-shared-token", false, "production: allow --admin-token to equal --runner-token")
@@ -476,16 +484,14 @@ func Server(ctx context.Context, args []string) error {
 		return err
 	}
 	if err := validateProductionConfig(productionConfig{
-		Mode:                   modeV,
-		DatabaseURL:            databaseURLV,
-		RunnerToken:            tokenV,
-		AdminToken:             adminTokenV,
-		ExternalURL:            externalURLV,
-		TLSCert:                tlsCertV,
-		TLSKey:                 tlsKeyV,
-		AllowSharedToken:       *allowSharedToken,
-		RunnerMTLSEnforced:     runnerCACertV != "" && runnerCAKeyV != "" && *runnerRequireClientCerts,
-		RunnerTokensConfigured: len(runnerTokens) > 0,
+		Mode:             modeV,
+		DatabaseURL:      databaseURLV,
+		RunnerToken:      tokenV,
+		AdminToken:       adminTokenV,
+		ExternalURL:      externalURLV,
+		TLSCert:          tlsCertV,
+		TLSKey:           tlsKeyV,
+		AllowSharedToken: *allowSharedToken,
 	}); err != nil {
 		return err
 	}
@@ -499,7 +505,8 @@ func Server(ctx context.Context, args []string) error {
 	}
 	if databaseURLV != "" {
 		// DB mode: the SQL store is the source of truth. A data-dir is still
-		// used when set (lease key, OIDC signer, artifact bytes); without it
+		// used when set (artifact bytes, and the seed for migrating legacy
+		// node-local key material into the shared store); without it
 		// artifact storage is unavailable.
 		var pgOpts []storage.PostgresOption
 		if cfg.Database.MaxConnections > 0 {
@@ -526,27 +533,53 @@ func Server(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
+		// Shared cluster keys: an explicit --cluster-key-dir wins; otherwise
+		// the DB-backed store is preferred so HA replicas share every signing
+		// material through PostgreSQL instead of relying on per-node data
+		// dirs. The node-local store (when a data dir exists) is only the
+		// migration seed, keeping an upgrading deployment's existing OIDC /
+		// provenance / runner-CA trust roots.
+		if clusterStore == nil {
+			blobs, ok := any(db).(storage.ClusterKeyBlobStore)
+			if !ok {
+				if modeV == "production" {
+					return fmt.Errorf("production DB mode requires a shared cluster key store: configure --cluster-key-dir on shared storage (the SQL store does not support the database-backed key store)")
+				}
+			} else {
+				if err := blobs.EnsureClusterKeySchema(ctx); err != nil {
+					return fmt.Errorf("cluster key store: %w", err)
+				}
+				var seed server.ClusterKeyStore
+				if *dataDir != "" {
+					seed = srv.ClusterKeys
+				}
+				if err := srv.UseClusterKeyStore(&server.DBClusterKeyStore{Blobs: blobs, Seed: seed}); err != nil {
+					return err
+				}
+			}
+		}
 		if err := srv.SwitchToDB(db); err != nil {
 			return err
 		}
-		// A production DB control plane without a cluster key store would
-		// mint per-replica signing material: replicas could not verify each
-		// other's tokens. Surface that at startup.
+		// A production DB control plane without a shared cluster key store
+		// would mint per-replica signing material: replicas could not verify
+		// each other's tokens. Surface that at startup. Runner credentials
+		// are then validated post-DB (per-runner tokens may already be
+		// provisioned in runner_bearer_tokens).
 		if modeV == "production" {
 			if err := srv.ValidateHAReady(); err != nil {
 				return err
 			}
-			// Runner credentials: per-runner tokens may also live in the
-			// runner_bearer_tokens table (provisioned out of band). A
-			// production runner-tier without mTLS and without any token
-			// rows refuses to start.
-			if !(runnerCACertV != "" && runnerCAKeyV != "" && *runnerRequireClientCerts) && len(runnerTokens) == 0 {
-				if has, herr := hasProvisionedRunnerTokens(ctx, db); herr != nil {
-					return fmt.Errorf("check per-runner credentials: %w", herr)
-				} else if !has {
-					return fmt.Errorf("production requires runner mTLS or per-runner credentials; the shared runner token is dev-only")
-				}
+			if err := validateProductionRunnerCredentials(ctx, db,
+				runnerCACertV != "" && runnerCAKeyV != "" && *runnerRequireClientCerts, runnerTokens); err != nil {
+				return err
 			}
+			// The shared runner token is dev/bootstrap compatibility only.
+			// The production per-runner contract above now holds, so disable
+			// the shared credential PERMANENTLY (static startup decision, not
+			// per-request DB contents): production runner traffic is
+			// authenticated only by per-runner bearer tokens or mTLS.
+			srv.RunnerToken = ""
 		}
 		if len(runnerTokens) > 0 {
 			if err := srv.ProvisionRunnerTokensDB(ctx, runnerTokens); err != nil {

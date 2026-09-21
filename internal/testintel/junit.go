@@ -232,6 +232,14 @@ func readSuiteElement(dec *xml.Decoder, se xml.StartElement, mask func(string) s
 	}
 	var s Suite
 	s.Name = attrValue(se, "name")
+	// The suite name is an indexed identity component in the persisted
+	// aggregates (migration 0026 keys on (repo_id, suite, test_class,
+	// test_name)), so it obeys the same shared byte budget as the case
+	// identities. The file-path-derived suite names of case-level reports
+	// are not affected: only a producer-declared testsuite name is checked.
+	if len(s.Name) > MaxTestSuiteBytes {
+		return nil, fmt.Errorf("%w: testsuite name is %d bytes, over the %d-byte suite budget", ErrLimitExceeded, len(s.Name), MaxTestSuiteBytes)
+	}
 	s.Tests, _ = attrInt(se, "tests")
 	s.Failures, _ = attrInt(se, "failures")
 	s.Errors, _ = attrInt(se, "errors")
@@ -297,6 +305,18 @@ func readCase(dec *xml.Decoder, se xml.StartElement, mask func(string) string, c
 	if err := dec.DecodeElement(&cx, &se); err != nil {
 		return Case{}, err
 	}
+	// Identity strings are indexed (migration 0026's
+	// (repo_id, suite, test_class, test_name) primary key), so they are
+	// bounded, not truncated: a truncated identity would silently merge two
+	// distinct tests into one aggregate row, which is worse than rejecting
+	// the report. The validator enforces the same bounds on the model, so a
+	// parser-accepted report always passes validation.
+	if len(cx.Name) > MaxTestNameBytes {
+		return Case{}, fmt.Errorf("%w: testcase name is %d bytes, over the %d-byte name budget", ErrLimitExceeded, len(cx.Name), MaxTestNameBytes)
+	}
+	if len(cx.Class) > MaxTestClassBytes {
+		return Case{}, fmt.Errorf("%w: testcase class is %d bytes, over the %d-byte class budget", ErrLimitExceeded, len(cx.Class), MaxTestClassBytes)
+	}
 	c := Case{
 		Name:      cx.Name,
 		Class:     cx.Class,
@@ -334,9 +354,27 @@ func appendSuite(out *Report, s Suite) {
 }
 
 // finalizeSuite derives counters from case outcomes when the producer's
-// attributes are missing or smaller than the case-derived counts.
+// attributes are missing or smaller than the case-derived counts. A negative
+// producer counter is producer garbage and is dropped to zero exactly like
+// an invalid duration, so the parser never emits a negative count; an
+// impossible counter RELATION (failures+errors or skipped above tests after
+// derivation) is rejected by the shared ValidateReportPayload the aggregate
+// path calls, so producer attributes can never fabricate a report the
+// validator would refuse.
 func finalizeSuite(s *Suite) {
 	var fail, errs, skip int
+	if s.Tests < 0 {
+		s.Tests = 0
+	}
+	if s.Failures < 0 {
+		s.Failures = 0
+	}
+	if s.Errors < 0 {
+		s.Errors = 0
+	}
+	if s.Skipped < 0 {
+		s.Skipped = 0
+	}
 	for _, c := range s.Cases {
 		switch {
 		case c.Failure != nil:
@@ -478,7 +516,11 @@ func Aggregate(workspace string, patterns []string) (model.TestReport, error) {
 // AggregateMasked is Aggregate with a secret-masking hook applied to
 // failure/error messages and system-err excerpts. The mask must be safe for
 // concurrent use when the caller shares it with other goroutines; the runner
-// passes secrets.Masker.Mask, which takes a read lock.
+// passes secrets.Masker.Mask, which takes a read lock. A file matched by
+// several patterns is parsed exactly once: the candidate set is deduplicated
+// by workspace-relative path before the file cap, byte accounting and case
+// accounting run, so overlapping globs can neither double-count nor double-
+// parse a report.
 func AggregateMasked(workspace string, patterns []string, mask func(string) string) (model.TestReport, error) {
 	root, err := safefs.OpenWorkspaceRoot(workspace)
 	if err != nil {
@@ -486,12 +528,25 @@ func AggregateMasked(workspace string, patterns []string, mask func(string) stri
 	}
 	defer root.Close()
 	var files []string
+	// Overlapping patterns are deduplicated by workspace-relative path
+	// before the file is materialized: "reports/*.xml" and
+	// "reports/unit.xml" would otherwise parse unit.xml twice, doubling its
+	// counters, cases and byte accounting. The candidate paths are already
+	// root-relative and cleaned (reportCandidates), so the path is the
+	// identity.
+	seen := make(map[string]bool)
 	for _, p := range patterns {
 		matches, err := reportCandidates(root, p)
 		if err != nil {
 			return model.TestReport{}, err
 		}
-		files = append(files, matches...)
+		for _, m := range matches {
+			if seen[m] {
+				continue
+			}
+			seen[m] = true
+			files = append(files, m)
+		}
 	}
 	sort.Strings(files)
 	if len(files) > MaxReportFiles {

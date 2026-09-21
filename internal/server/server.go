@@ -232,13 +232,17 @@ type Server struct {
 	// energy budget; exceeding them refuses new leases (0 = unlimited).
 	DailyCostLimit   float64
 	DailyEnergyLimit float64
-	// UntrustedCPUCeiling/UntrustedMemoryCeiling/UntrustedPIDCeiling are
-	// the server-side resource ceilings applied at enqueue to UNTRUSTED
-	// jobs that declare no CPU/memory/PID requests of their own: the
-	// executor then always applies limits to untrusted work. Defaults:
-	// 2.0 CPU, 4 GiB memory, 256 PIDs.
+	// UntrustedCPUCeiling/UntrustedMemoryCeiling/UntrustedDiskCeiling/
+	// UntrustedPIDCeiling are the server-side resource ceilings enforced at
+	// enqueue on UNTRUSTED jobs: an explicit request above a ceiling is
+	// REJECTED (opaque 400, see applyUntrustedResourceCeilings), and a
+	// dimension the job leaves unset is filled with the ceiling value so the
+	// executor always applies limits to untrusted work. A zero ceiling
+	// disables that dimension. Trusted jobs are unconstrained by these.
+	// Defaults: 2.0 CPU, 4 GiB memory, 10 GiB disk, 256 PIDs.
 	UntrustedCPUCeiling    float64
 	UntrustedMemoryCeiling int64
+	UntrustedDiskCeiling   int64
 	UntrustedPIDCeiling    int
 	// QuotaFailOpen, when true, lets enqueues and leases proceed when the
 	// usage store is unavailable instead of refusing them with
@@ -445,6 +449,7 @@ func New(token string) *Server {
 		LeaseDuration:          defaultLeaseDuration,
 		UntrustedCPUCeiling:    2.0,
 		UntrustedMemoryCeiling: 4 << 30,
+		UntrustedDiskCeiling:   10 << 30,
 		UntrustedPIDCeiling:    256,
 		runs:                   map[string]model.Run{}, jobs: map[string]model.Job{}, runners: map[string]model.Runner{}, artifacts: map[string]model.ArtifactRecord{}, reports: map[string]model.TestReport{}, deliveries: map[string]string{}, completions: map[string]model.CompletionReceipt{}, completionReceiptAt: map[string]time.Time{}, generatedFragments: map[string]storage.GeneratedFragmentReceipt{}, leaseKey: key, oidc: newOIDCSigner(),
 		outbox:            NewOutbox(nil),
@@ -644,6 +649,12 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 	// dropped (and logged) instead of resurfacing as undownloadable entries.
 	// The state write below persists the pruned set.
 	s.restoreSnapshots(snap.Snapshots)
+	// FS pending SBOM/Sigstore pointers ride the snapshot so a restart
+	// resolves the exact digest that was accepted before the restart;
+	// without them a generation directory with several candidate files
+	// would be resolved arbitrarily (now: refuse). Older snapshots carry no
+	// pointers and the union leaves the (empty) mirror untouched.
+	s.restorePendingSidecarPointers(snap)
 	s.rebuildArtifactContractsLocked()
 	// Completion receipts are restored before any request can be served so a
 	// replayed completion after a restart is answered from the durable
@@ -899,31 +910,42 @@ func (s *Server) auth(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		case tierRunner:
-			// Fail closed: a runner-tier route must have a working runner
-			// credential. Either a non-empty runner bearer token, enforced
-			// runner mTLS, or provisioned per-runner bearer tokens are
-			// required; a server with none must refuse instead of silently
-			// accepting unauthenticated runner traffic.
-			if s.RunnerToken == "" && !(s.RunnerCA != nil && s.RequireRunnerClientCerts) && !s.runnerTokensConfigured(r) {
-				http.Error(w, "runner authentication is not configured", http.StatusServiceUnavailable)
+			// Runner-tier authentication is fail closed. The per-runner
+			// credential state is resolved FIRST: a hard auth-store error
+			// answers 503 and can never fall through to the weaker shared
+			// runner token (which production disables outright). Either
+			// per-runner bearer credentials, enforced runner mTLS, or — in
+			// dev/bootstrap mode only — the shared runner token authenticate;
+			// a server with none must refuse instead of silently accepting
+			// unauthenticated runner traffic.
+			perRunnerConfigured, cerr := s.runnerTokensConfigured(r)
+			if cerr != nil {
+				s.serverError(w, r, http.StatusServiceUnavailable, cerr, "runner authentication store unavailable")
 				return
 			}
-			// Runner-tier routes authenticate with per-runner bearer
-			// tokens, enforced runner mTLS, or — in dev/legacy mode only —
-			// the shared runner token. Once per-runner credentials exist
-			// the shared token is rejected here (it is dev-only and can
-			// never impersonate a specific runner ID).
-			if s.runnerTokensConfigured(r) {
-				if _, ok := s.runnerBearerID(r); !ok {
-					if s.RunnerCA != nil && s.RequireRunnerClientCerts {
-						// mTLS-only runner: no bearer required.
-					} else {
-						http.Error(w, "unauthorized", http.StatusUnauthorized)
-						return
-					}
+			mtls := s.RunnerCA != nil && s.RequireRunnerClientCerts
+			switch {
+			case perRunnerConfigured:
+				// Per-runner credentials exist: the shared token is rejected
+				// here (it can never impersonate a specific runner ID).
+				if _, ok, berr := s.runnerBearerID(r); berr != nil {
+					s.serverError(w, r, http.StatusServiceUnavailable, berr, "runner authentication store unavailable")
+					return
+				} else if !ok && !mtls {
+					http.Error(w, "unauthorized", http.StatusUnauthorized)
+					return
 				}
-			} else if s.RunnerToken != "" && !bearerOK(r.Header.Get("Authorization"), s.RunnerToken) {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
+			case s.RunnerToken != "":
+				// Dev/bootstrap compatibility path. Production wiring clears
+				// RunnerToken once the per-runner contract is validated at
+				// startup, so the shared credential cannot authenticate
+				// there even if it is still supplied.
+				if !bearerOK(r.Header.Get("Authorization"), s.RunnerToken) {
+					http.Error(w, "unauthorized", http.StatusUnauthorized)
+					return
+				}
+			case !mtls:
+				http.Error(w, "runner authentication is not configured", http.StatusServiceUnavailable)
 				return
 			}
 			// The shared TLS listener verifies client certificates only
@@ -931,7 +953,7 @@ func (s *Server) auth(next http.Handler) http.Handler {
 			// here. The peer identity must bind (a valid runner certificate
 			// chaining to the runner CA); per-route identity checks still
 			// run inside the handlers.
-			if s.RunnerCA != nil && s.RequireRunnerClientCerts {
+			if mtls {
 				if err := s.bindRunnerIdentity(r, ""); err != nil {
 					http.Error(w, "runner client certificate required", http.StatusUnauthorized)
 					return
@@ -1341,8 +1363,13 @@ func (s *Server) enqueueID(ctx context.Context, in SubmitRun, preRunID string) (
 		// Untrusted jobs without declared resources get the server-side
 		// ceilings BEFORE the compiled payload is marshaled, so both the
 		// effective-job record and the persisted request fields carry them
-		// and the executor always applies limits to untrusted work.
-		cj = s.applyUntrustedResourceCeilings(cj, in.Trusted)
+		// and the executor always applies limits to untrusted work. An
+		// explicit request above a ceiling is rejected here, before the job
+		// digest is signed and anything is persisted.
+		cj, err = s.applyUntrustedResourceCeilings(cj, in.Trusted)
+		if err != nil {
+			return model.Run{}, err
+		}
 		// The compiled job payload is the deterministic enqueue-time record
 		// the runner can verify its own recompilation against.
 		cjJSON, mErr := jsonMarshal(cj)
@@ -2136,7 +2163,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if in.ID == "" {
-		if rid, ok := s.runnerBearerID(r); ok {
+		if rid, ok, err := s.runnerBearerID(r); err == nil && ok {
 			in.ID = rid
 		}
 	}
@@ -4830,7 +4857,7 @@ func (s *Server) persistLocked() error {
 		s.notePersistResult(s.persistFailForTest)
 		return s.persistFailForTest
 	}
-	err := s.store.Save(storage.Snapshot{Version: 1, Runs: s.runs, Jobs: s.jobs, Runners: s.runners, Artifacts: s.artifacts, Reports: s.reports, DownstreamLinks: s.downstreamLinks, Profiles: s.profiles, CertProfileLinks: s.certProfiles, Snapshots: s.snapshots, CompletionReceipts: s.completionReceiptRecordsLocked(), Deployments: s.deployments, CRL: s.crl})
+	err := s.store.Save(storage.Snapshot{Version: 1, Runs: s.runs, Jobs: s.jobs, Runners: s.runners, Artifacts: s.artifacts, Reports: s.reports, DownstreamLinks: s.downstreamLinks, Profiles: s.profiles, CertProfileLinks: s.certProfiles, Snapshots: s.snapshots, CompletionReceipts: s.completionReceiptRecordsLocked(), Deployments: s.deployments, CRL: s.crl, PendingSidecars: s.pendingSidecarSnapshotLocked()})
 	s.notePersistResult(err)
 	return err
 }

@@ -129,12 +129,13 @@ type AuthConfig struct {
 	AdminToken string `toml:"admin_token"`
 	// RunnerToken is the bearer token shared by ALL runners. It is a
 	// shared credential, not a per-runner identity: it cannot distinguish
-	// runners. Production strongly prefers persistent per-runner mTLS
-	// identities (runner_pki); the control plane refuses to serve runner
-	// traffic with neither a runner token nor enforced runner mTLS. In
-	// production the shared token is dev/bootstrap-only: runner
-	// authentication must be per-runner mTLS or per-runner bearer tokens
-	// (runner_tokens_file).
+	// runners, and it is dev/bootstrap compatibility only. Production
+	// authenticates runner traffic exclusively with per-runner bearer
+	// credentials (runner_tokens_file, provisioned into
+	// runner_bearer_tokens) or enforced runner mTLS (runner_pki); the
+	// server clears this token at production startup, and a production
+	// server with neither per-runner mechanism refuses to start after the
+	// database opens.
 	RunnerToken string `toml:"runner_token"`
 	// TokensFile is the JSON token-store path for fine-grained principals.
 	TokensFile string `toml:"tokens_file"`

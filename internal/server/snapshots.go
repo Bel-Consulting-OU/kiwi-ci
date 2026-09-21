@@ -23,6 +23,28 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
+// snapshotUploadMaxBytes is the receiver's HTTP body cap for snapshot
+// uploads: the ONE shared compressed snapshot archive budget
+// (snapshot.MaxArchiveBytes) the runner's capture cap is clamped to and
+// snapshot.Parse enforces. It is a variable so tests can exercise the
+// boundary with small bodies instead of generating GiBs; production leaves
+// it at the shared constant.
+var snapshotUploadMaxBytes = snapshot.MaxArchiveBytes
+
+// isSnapshotBodyTooLarge reports whether a body copy failed because the
+// request exceeded snapshotUploadMaxBytes (http.MaxBytesReader), so the
+// handler can answer 413 with a clear snapshot-archive reason instead of an
+// opaque 500.
+func isSnapshotBodyTooLarge(err error) bool {
+	var mbe *http.MaxBytesError
+	return errors.As(err, &mbe)
+}
+
+// snapshotTooLargeError renders the shared body-cap rejection.
+func snapshotTooLargeError() string {
+	return fmt.Sprintf("snapshot archive exceeds the %d-byte upload limit", snapshotUploadMaxBytes)
+}
+
 // uploadSnapshot is POST /api/v1/jobs/{id}/snapshots: the runner uploads a
 // workspace snapshot tar.gz under its active lease. In memory mode the
 // archive is stored under the server data dir (snapshots/<runID>/<jobID>)
@@ -70,11 +92,15 @@ func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h := sha256.New()
-	n, copyErr := io.Copy(io.MultiWriter(f, h), http.MaxBytesReader(w, r.Body, maxBlobBytes))
+	n, copyErr := io.Copy(io.MultiWriter(f, h), http.MaxBytesReader(w, r.Body, snapshotUploadMaxBytes))
 	syncErr := f.Sync()
 	closeErr := f.Close()
 	if err := firstErr(copyErr, syncErr, closeErr); err != nil {
 		_ = os.Remove(tmp)
+		if isSnapshotBodyTooLarge(err) {
+			http.Error(w, snapshotTooLargeError(), http.StatusRequestEntityTooLarge)
+			return
+		}
 		s.internalError(w, r, err, "")
 		return
 	}
@@ -239,8 +265,12 @@ func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j mode
 	defer os.Remove(tmpName)
 	defer tmp.Close()
 	h := sha256.New()
-	n, copyErr := io.Copy(io.MultiWriter(tmp, h), http.MaxBytesReader(w, r.Body, maxBlobBytes))
+	n, copyErr := io.Copy(io.MultiWriter(tmp, h), http.MaxBytesReader(w, r.Body, snapshotUploadMaxBytes))
 	if err := firstErr(copyErr); err != nil {
+		if isSnapshotBodyTooLarge(copyErr) {
+			http.Error(w, snapshotTooLargeError(), http.StatusRequestEntityTooLarge)
+			return
+		}
 		s.internalError(w, r, err, "")
 		return
 	}

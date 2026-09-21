@@ -48,7 +48,10 @@ func TestCompiledJobPayloadInTask(t *testing.T) {
 	// The enqueue applies the untrusted resource ceilings to the compiled
 	// job BEFORE marshaling the payload, so the recomputation must mirror
 	// that step to derive the same digest.
-	cj = s.applyUntrustedResourceCeilings(cj, task.Job.Trusted)
+	cj, err = s.applyUntrustedResourceCeilings(cj, task.Job.Trusted)
+	if err != nil {
+		t.Fatal(err)
+	}
 	cjJSON, err := json.Marshal(cj)
 	if err != nil {
 		t.Fatal(err)

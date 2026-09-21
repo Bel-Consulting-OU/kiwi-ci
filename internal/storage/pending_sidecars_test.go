@@ -81,13 +81,18 @@ func TestMigration0028GenerationScopedPendingSidecars(t *testing.T) {
 		t.Fatalf("0028 statement 3 = %q, want the CREATE TABLE", stmts[2])
 	}
 	// The migration set is ordered: 0028 runs exactly once, after everything
-	// that existed before it.
+	// that existed before it, and later migrations append after it.
 	all, err := migrations.All()
 	if err != nil {
 		t.Fatalf("All: %v", err)
 	}
-	if got := all[len(all)-1].Version; got != 29 {
-		t.Fatalf("newest migration version = %d, want 29 (0029 adds the report-delivery receipts)", got)
+	if got := all[len(all)-1].Version; got < 29 {
+		t.Fatalf("newest migration version = %d, want >= 29 (0029 adds the report-delivery receipts)", got)
+	}
+	for i := 1; i < len(all); i++ {
+		if all[i-1].Version >= all[i].Version {
+			t.Fatalf("migrations not strictly ordered at %d/%d", all[i-1].Version, all[i].Version)
+		}
 	}
 }
 

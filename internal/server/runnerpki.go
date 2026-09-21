@@ -212,7 +212,10 @@ func (s *Server) peerRunnerID(r *http.Request) (string, error) {
 // revoked certificate. resolved is the authenticated runner ID; constrained
 // reports whether an identity comparison actually took place.
 func (s *Server) resolveRunnerIdentity(r *http.Request, claimedID string) (resolved string, constrained bool, err error) {
-	bearerID, hasBearer := s.runnerBearerID(r)
+	bearerID, hasBearer, bErr := s.runnerBearerID(r)
+	if bErr != nil {
+		return "", true, bErr
+	}
 	if s.RunnerCA != nil && s.RequireRunnerClientCerts {
 		peerID, err := s.peerRunnerID(r)
 		if err != nil {
@@ -346,7 +349,7 @@ func (s *Server) requestCertSerial(r *http.Request, payloadSerial string) string
 	if serial == "" {
 		return ""
 	}
-	if bearerID, ok := s.runnerBearerID(r); ok {
+	if bearerID, ok, err := s.runnerBearerID(r); err == nil && ok {
 		stolen, err := s.serialClaimedByOther(r.Context(), serial, bearerID)
 		if err != nil || stolen {
 			return ""

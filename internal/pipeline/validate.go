@@ -17,6 +17,14 @@ const (
 	maxMatrixCombos   = 512
 	maxStepsPerJob    = 512
 	maxServicesPerJob = 32
+	// MaxUntrustedServicesPerJob is the per-job service-count ceiling for
+	// untrusted jobs. It is deliberately far below maxServicesPerJob: every
+	// service is a separately scheduled container whose limits (even after
+	// the executor's aggregate envelope) add kernel-level attack surface and
+	// startup cost the runner does not trust. Trusted jobs keep the
+	// historical 32-service allowance; trust-aware callers enforce this
+	// ceiling with ValidateServiceQuota.
+	MaxUntrustedServicesPerJob = 8
 	// maxSecretsPerJob is the per-job declared-secret-name cap. It is the
 	// shared capacity agreement with the execution masker: a job that
 	// passes admission can never silently lose secrets to masking because
@@ -143,6 +151,49 @@ func validateSpec(s *Spec, relaxComponentJobs bool) error {
 	}
 	if cyc := findCycle(s.Jobs); len(cyc) > 0 {
 		return fmt.Errorf("dependency cycle: %s", strings.Join(cyc, " -> "))
+	}
+	return nil
+}
+
+// ValidateServiceCount enforces the trust-dependent service-count ceiling for
+// one job. It is the per-job form of ValidateServiceQuota, used by the
+// executor immediately before any service container is started so an
+// untrusted job can never fan out more sidecars than the untrusted ceiling
+// allows, even when it reached execution through a path that skipped the
+// spec-level check.
+func ValidateServiceCount(jobID string, services []Service, untrusted bool) error {
+	limit := maxServicesPerJob
+	trust := "trusted"
+	if untrusted {
+		limit = MaxUntrustedServicesPerJob
+		trust = "untrusted"
+	}
+	if len(services) > limit {
+		return fmt.Errorf("job %q declares %d services, limit is %d for %s jobs", jobID, len(services), limit, trust)
+	}
+	return nil
+}
+
+// ValidateServiceQuota enforces the trust-dependent per-job service-count
+// ceiling on an already-parsed spec: maxServicesPerJob for trusted pipelines
+// and MaxUntrustedServicesPerJob for untrusted ones. Validate/ValidateLimits
+// keep enforcing the absolute ceiling for every pipeline; this is the
+// additional trust-aware ceiling for callers that know the trust domain
+// (runner admission and the executor before any service container starts).
+// Jobs are checked in sorted order so the error is deterministic.
+func ValidateServiceQuota(s *Spec, untrusted bool) error {
+	if s == nil {
+		return nil
+	}
+	ids := make([]string, 0, len(s.Jobs))
+	for id := range s.Jobs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		if err := ValidateServiceCount(id, s.Jobs[id].Services, untrusted); err != nil {
+			return err
+		}
 	}
 	return nil
 }

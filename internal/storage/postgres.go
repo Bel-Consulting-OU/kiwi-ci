@@ -816,7 +816,11 @@ func (s *PostgresStore) cancelSupersededTx(ctx context.Context, tx pgx.Tx, jobID
 		}
 		// The cancelled job releases its runner slot in the SAME
 		// transaction: a superseded running job must never leave its
-		// runner's active_jobs entry behind.
+		// runner's active_jobs entry behind. Its resource reservation is
+		// released in the same step (idempotent no-op for queued jobs).
+		if err := releaseResourcesTx(ctx, tx, id); err != nil {
+			return err
+		}
 		if wasRunning && runnerID != "" {
 			if err := s.releaseRunnerSlotTx(ctx, tx, runnerID, id); err != nil {
 				return err
@@ -1315,6 +1319,12 @@ func (s *PostgresStore) UpdateJob(ctx context.Context, job model.Job) error {
 // leases
 // ---------------------------------------------------------------------------
 
+// AcquireLease is the non-atomic claim used only by callers whose store has
+// no AtomicLeaseStore contract: it flips the job row without touching the
+// runner, so it reserves NO resource capacity (there is no runner row lock
+// to make a check-and-reserve atomic). Every bundled store implements
+// AtomicLeaseStore; the scheduler therefore always claims through
+// AcquireLeaseAtomic, where the reservation protocol lives.
 func (s *PostgresStore) AcquireLease(ctx context.Context, jobID, runnerID string, tokenHash []byte, generation int64, expiresAt time.Time) (model.Job, error) {
 	if err := ValidateJobID(jobID); err != nil {
 		return model.Job{}, err
@@ -1458,13 +1468,17 @@ func (s *PostgresStore) claimQuotaTx(ctx context.Context, tx pgx.Tx, repoID stri
 //     edit takes effect on the next lease) and its capacity/repo ACL/
 //     capabilities/labels/region/rates replace the registration snapshot;
 //  5. the frozen usage rates are written into the job payload;
-//  6. the quota queued->running transition is conditional;
-//  7. the runner slot update enforces disabled/draining, capacity > 0, the
+//  6. the job's requested resources are CHECKED AND RESERVED against the
+//     runner's remaining resource capacity (live profile max_* first, the
+//     registration snapshot second; a zero dimension is unconstrained) and
+//     the reservation row is inserted in the same transaction;
+//  7. the quota queued->running transition is conditional;
+//  8. the runner slot update enforces disabled/draining, capacity > 0, the
 //     capacity bound and the live profile predicates in SQL.
 //
 // Any failed predicate rolls every step back and returns the matching
 // sentinel error (ErrNoCapacity, ErrEnvConcurrency, ErrQuotaExceeded,
-// ErrLeaseConflict).
+// ErrResourceCapacity, ErrLeaseConflict).
 func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim) (model.Job, error) {
 	if err := ValidateJobID(claim.JobID); err != nil {
 		return model.Job{}, err
@@ -1521,9 +1535,13 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 		runnerDisabled   bool
 		runnerDraining   bool
 		runnerCertSerial string
+		runnerResCPU     float64
+		runnerResMemory  int64
+		runnerResDisk    int64
+		runnerResPIDs    int
 	)
-	err = tx.QueryRow(ctx, `SELECT capacity, COALESCE((payload->>'cost_per_hour')::double precision, 0), COALESCE((payload->>'power_watts')::double precision, 0), disabled, draining, COALESCE(payload->>'cert_serial', '') FROM runners WHERE id=$1 FOR UPDATE`, claim.RunnerID).
-		Scan(&runnerCapacity, &runnerCost, &runnerWatts, &runnerDisabled, &runnerDraining, &runnerCertSerial)
+	err = tx.QueryRow(ctx, `SELECT capacity, COALESCE((payload->>'cost_per_hour')::double precision, 0), COALESCE((payload->>'power_watts')::double precision, 0), disabled, draining, COALESCE(payload->>'cert_serial', ''), COALESCE((payload->'resource_capacity'->>'cpu')::double precision, 0), COALESCE((payload->'resource_capacity'->>'memory')::bigint, 0), COALESCE((payload->'resource_capacity'->>'disk')::bigint, 0), COALESCE((payload->'resource_capacity'->>'pids')::int, 0) FROM runners WHERE id=$1 FOR UPDATE`, claim.RunnerID).
+		Scan(&runnerCapacity, &runnerCost, &runnerWatts, &runnerDisabled, &runnerDraining, &runnerCertSerial, &runnerResCPU, &runnerResMemory, &runnerResDisk, &runnerResPIDs)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return model.Job{}, ErrNoCapacity
 	}
@@ -1545,8 +1563,15 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 		return model.Job{}, ErrNoCapacity
 	}
 	capacity := runnerCapacity
+	// The runner's effective resource capacity: the LIVE profile's max_*
+	// columns when linked, the runner row's registration snapshot
+	// (payload.resource_capacity) otherwise. Zero dimensions are
+	// unconstrained (documented default), so a runner with no configured
+	// capacities admits every job exactly as before.
+	resourceCapacity := model.ResourceCapacity{CPU: runnerResCPU, Memory: runnerResMemory, Disk: runnerResDisk, PIDs: runnerResPIDs}
 	if linked {
 		capacity = profile.MaxCapacity
+		resourceCapacity = model.ResourceCapacityFromProfile(profile)
 		if !profileAllowsCandidate(profile, claim.Runtime, claim.CanonRepoID, claim.RepoFullName, claim.RequiredLabels, claim.PlacementRegions) {
 			return model.Job{}, ErrNoCapacity
 		}
@@ -1579,12 +1604,20 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 	j.CostRate = costRate
 	j.PowerWatts = powerWatts
 
-	// Step 6: conditional queued -> running quota transition.
+	// Step 6: check-and-reserve the job's requested resources against the
+	// runner's remaining capacity. The runner row is locked above, so the
+	// reservation SUM cannot move under a concurrent claim for this runner;
+	// a failure rolls the whole lease back with ErrResourceCapacity.
+	if err := reserveResourcesTx(ctx, tx, claim, resourceCapacity); err != nil {
+		return model.Job{}, err
+	}
+
+	// Step 7: conditional queued -> running quota transition.
 	if err := s.claimQuotaTx(ctx, tx, RepoIDForJob(j), claim.RepoConcurrency, claim.TeamConcurrency); err != nil {
 		return model.Job{}, err
 	}
 
-	// Step 7: reserve the runner slot. The predicates are evaluated in SQL
+	// Step 8: reserve the runner slot. The predicates are evaluated in SQL
 	// against the live row + resolved profile values: disabled/draining,
 	// capacity > 0, capacity bound, runtime capability, repo allowlist,
 	// required labels and placement regions. profileJSON carries every
@@ -1835,8 +1868,12 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 		jobID, string(st), nullText(errMsg), outputsJSON, now, newPayload); err != nil {
 		return err
 	}
-	// The completed job releases its reserved running slot.
+	// The completed job releases its reserved running slot and its resource
+	// reservation (idempotent; a replayed completion never re-inserted one).
 	if err := s.adjustQuotaTx(ctx, tx, RepoIDForJob(j), -1, 0); err != nil {
+		return err
+	}
+	if err := releaseResourcesTx(ctx, tx, jobID); err != nil {
 		return err
 	}
 	tag, err := tx.Exec(ctx, `INSERT INTO completion_receipts (job_id, generation, runner_id, result_hash) VALUES ($1, $2, $3, $4) ON CONFLICT (job_id, generation, runner_id) DO NOTHING`,
@@ -2360,7 +2397,12 @@ func (s *PostgresStore) CancelRunJobs(ctx context.Context, runID string, reason 
 			t.id, reason, now, jp); err != nil {
 			return nil, err
 		}
-		// The cancelled job releases its reserved slot (running or queued).
+		// The cancelled job releases its reserved slot (running or queued)
+		// and its resource reservation (no-op for a queued job, which never
+		// acquired one).
+		if err := releaseResourcesTx(ctx, tx, t.id); err != nil {
+			return nil, err
+		}
 		if t.wasRunning {
 			if err := s.adjustQuotaTx(ctx, tx, RepoIDForJob(j), -1, 0); err != nil {
 				return nil, err
@@ -2499,9 +2541,13 @@ func (s *PostgresStore) ReleaseRunnerJob(ctx context.Context, runnerID, jobID st
 	if errors.Is(err, pgx.ErrNoRows) {
 		// The runner row is gone (deregistered): the reserved quota slot is
 		// repository-scoped, so it is released regardless of the missing
-		// runner row. The release still reports the missing runner.
+		// runner row. The release still reports the missing runner. The
+		// resource reservation is keyed by job, so it is released too.
 		if qerr := s.releaseJobQuotaTx(ctx, tx, jobID); qerr != nil {
 			return qerr
+		}
+		if rerr := releaseResourcesTx(ctx, tx, jobID); rerr != nil {
+			return rerr
 		}
 		if cerr := tx.Commit(ctx); cerr != nil {
 			return cerr
@@ -2552,6 +2598,10 @@ func (s *PostgresStore) ReleaseRunnerJob(ctx context.Context, runnerID, jobID st
 	// The released job was running: release the running slot and, when the
 	// job was requeued (recovery/kill switch), re-reserve the queued slot.
 	if err := s.releaseJobQuotaTx(ctx, tx, jobID); err != nil {
+		return err
+	}
+	// Release the job's resource reservation in the same transaction.
+	if err := releaseResourcesTx(ctx, tx, jobID); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -4750,6 +4800,8 @@ var (
 )
 
 // scanProfile reads one runner_profiles row into a model.RunnerProfile.
+// The resource capacity columns (migration 0030) default to 0 = unconstrained
+// for every pre-0030 row and for profiles created without them.
 func scanProfile(row pgx.Row) (model.RunnerProfile, error) {
 	var (
 		p           model.RunnerProfile
@@ -4758,10 +4810,14 @@ func scanProfile(row pgx.Row) (model.RunnerProfile, error) {
 		repos       []byte
 		caps        []byte
 		maxCapacity int
+		maxCPU      float64
+		maxMemory   int64
+		maxDisk     int64
+		maxPIDs     int
 		cost        float64
 		watts       float64
 	)
-	err := row.Scan(&p.ID, &labels, &region, &repos, &caps, &maxCapacity, &cost, &watts, &p.CreatedAt)
+	err := row.Scan(&p.ID, &labels, &region, &repos, &caps, &maxCapacity, &maxCPU, &maxMemory, &maxDisk, &maxPIDs, &cost, &watts, &p.CreatedAt)
 	if err != nil {
 		return p, err
 	}
@@ -4776,12 +4832,20 @@ func scanProfile(row pgx.Row) (model.RunnerProfile, error) {
 	}
 	p.Region = region
 	p.MaxCapacity = maxCapacity
+	p.MaxCPU = maxCPU
+	p.MaxMemory = maxMemory
+	p.MaxDisk = maxDisk
+	p.MaxPIDs = maxPIDs
 	p.CostPerHour = cost
 	p.PowerWatts = watts
 	return p, nil
 }
 
-const profileCols = "id, labels, region, repositories, capabilities, max_capacity, cost_per_hour, power_watts, created_at"
+const profileCols = "id, labels, region, repositories, capabilities, max_capacity, max_cpu, max_memory, max_disk, max_pids, cost_per_hour, power_watts, created_at"
+
+// profileColsAliased is profileCols qualified with a table alias for the
+// cert_profile_links join; the two lists MUST stay in the same order.
+const profileColsAliased = "rp.id, rp.labels, rp.region, rp.repositories, rp.capabilities, rp.max_capacity, rp.max_cpu, rp.max_memory, rp.max_disk, rp.max_pids, rp.cost_per_hour, rp.power_watts, rp.created_at"
 
 func (s *PostgresStore) UpsertProfile(ctx context.Context, p model.RunnerProfile) error {
 	if p.ID == "" {
@@ -4812,8 +4876,8 @@ func (s *PostgresStore) UpsertProfile(ctx context.Context, p model.RunnerProfile
 	if created.IsZero() {
 		created = time.Now().UTC()
 	}
-	_, err = s.pool.Exec(ctx, `INSERT INTO runner_profiles (id, labels, region, repositories, capabilities, max_capacity, cost_per_hour, power_watts, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (id) DO UPDATE SET labels=EXCLUDED.labels, region=EXCLUDED.region, repositories=EXCLUDED.repositories, capabilities=EXCLUDED.capabilities, max_capacity=EXCLUDED.max_capacity, cost_per_hour=EXCLUDED.cost_per_hour, power_watts=EXCLUDED.power_watts`,
-		p.ID, labels, p.Region, repos, caps, p.MaxCapacity, p.CostPerHour, p.PowerWatts, created)
+	_, err = s.pool.Exec(ctx, `INSERT INTO runner_profiles (id, labels, region, repositories, capabilities, max_capacity, max_cpu, max_memory, max_disk, max_pids, cost_per_hour, power_watts, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (id) DO UPDATE SET labels=EXCLUDED.labels, region=EXCLUDED.region, repositories=EXCLUDED.repositories, capabilities=EXCLUDED.capabilities, max_capacity=EXCLUDED.max_capacity, max_cpu=EXCLUDED.max_cpu, max_memory=EXCLUDED.max_memory, max_disk=EXCLUDED.max_disk, max_pids=EXCLUDED.max_pids, cost_per_hour=EXCLUDED.cost_per_hour, power_watts=EXCLUDED.power_watts`,
+		p.ID, labels, p.Region, repos, caps, p.MaxCapacity, p.MaxCPU, p.MaxMemory, p.MaxDisk, p.MaxPIDs, p.CostPerHour, p.PowerWatts, created)
 	return err
 }
 
@@ -4859,37 +4923,13 @@ func (s *PostgresStore) ProfileForSerial(ctx context.Context, serial string) (mo
 	if serial == "" {
 		return model.RunnerProfile{}, false, nil
 	}
-	var (
-		p           model.RunnerProfile
-		labels      []byte
-		region      string
-		repos       []byte
-		caps        []byte
-		maxCapacity int
-		cost        float64
-		watts       float64
-	)
-	err := s.pool.QueryRow(ctx, `SELECT rp.id, rp.labels, rp.region, rp.repositories, rp.capabilities, rp.max_capacity, rp.cost_per_hour, rp.power_watts, rp.created_at FROM cert_profile_links cl JOIN runner_profiles rp ON rp.id = cl.profile_id WHERE cl.serial=$1`, serial).
-		Scan(&p.ID, &labels, &region, &repos, &caps, &maxCapacity, &cost, &watts, &p.CreatedAt)
+	p, err := scanProfile(s.pool.QueryRow(ctx, `SELECT `+profileColsAliased+` FROM cert_profile_links cl JOIN runner_profiles rp ON rp.id = cl.profile_id WHERE cl.serial=$1`, serial))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return model.RunnerProfile{}, false, nil
 	}
 	if err != nil {
 		return model.RunnerProfile{}, false, err
 	}
-	if err := json.Unmarshal(labels, &p.Labels); err != nil {
-		return model.RunnerProfile{}, false, fmt.Errorf("storage: decode profile labels: %w", err)
-	}
-	if err := json.Unmarshal(repos, &p.Repositories); err != nil {
-		return model.RunnerProfile{}, false, fmt.Errorf("storage: decode profile repositories: %w", err)
-	}
-	if err := json.Unmarshal(caps, &p.Capabilities); err != nil {
-		return model.RunnerProfile{}, false, fmt.Errorf("storage: decode profile capabilities: %w", err)
-	}
-	p.Region = region
-	p.MaxCapacity = maxCapacity
-	p.CostPerHour = cost
-	p.PowerWatts = watts
 	return p, true, nil
 }
 

@@ -26,23 +26,25 @@ import (
 //     exactly its declared bound can exceed the bound without anything
 //     misbehaving.
 //   - a job without a disk declaration falls back to
-//     DefaultSnapshotArchiveMaxBytes, the same 8 GiB hard ceiling the
-//     control plane enforces on every blob/snapshot upload
-//     (internal/server/blobs.go maxBlobBytes), which is also the 8 GiB
-//     object class the runner's own streaming client policy is documented
-//     against (see streamIdleTimeout in runner.go). Unifying with that
-//     ceiling keeps runner-side behavior consistent with the receiver: the
-//     runner never assembles an archive larger than the control plane's hard
-//     limit, and the fallback is bounded rather than workspace-sized.
+//     DefaultSnapshotArchiveMaxBytes, which IS the shared
+//     snapshot.MaxArchiveBytes budget every layer uses.
+//
+// The derived cap is min(2 x declared bound, DefaultSnapshotArchiveMaxBytes):
+// the same budget the receiver's HTTP body limit and snapshot.Parse enforce,
+// so the runner can never assemble an archive the control plane necessarily
+// rejects. (Before this source existed the fallback and the 2x product were
+// unclamped 8 GiB against a 4 GiB parser default.)
 //
 // The cap is enforced while streaming (safefs.CappedWriter), so an oversized
 // workspace aborts the capture without buffering it in memory, and the
 // partial temporary file is removed before the error is returned.
 const (
 	// DefaultSnapshotArchiveMaxBytes is the runner-side snapshot archive cap
-	// used when the job declares no resources.disk: 8 GiB, matching the
-	// control plane's hard upload ceiling.
-	DefaultSnapshotArchiveMaxBytes int64 = 8 << 30
+	// used when the job declares no resources.disk, and the hard ceiling of
+	// the derived 2x cap: the shared snapshot.MaxArchiveBytes budget
+	// (4 GiB), which is exactly what the control plane's snapshot upload
+	// endpoints and snapshot.Parse accept.
+	DefaultSnapshotArchiveMaxBytes int64 = snapshot.MaxArchiveBytes
 	// snapshotArchiveFactor scales a declared workspace bound into the
 	// archive bound (see above). Maximum declared disk is 1 PiB
 	// (pipeline.maxDiskRequest), so the product stays far below int64.
@@ -50,12 +52,14 @@ const (
 )
 
 // snapshotArchiveMaxBytes derives the local cap for one snapshot archive from
-// the job's workspace bound (executor.Options.WorkspaceMaxBytes). A zero
-// bound means the job declared no resources.disk and the documented fallback
-// applies.
+// the job's workspace bound (executor.Options.WorkspaceMaxBytes): the
+// documented 2x framing factor, clamped to the shared
+// DefaultSnapshotArchiveMaxBytes ceiling either way. A zero bound means the
+// job declared no resources.disk and the documented fallback applies.
 func snapshotArchiveMaxBytes(workspaceMaxBytes int64) int64 {
-	if workspaceMaxBytes <= 0 {
-		return DefaultSnapshotArchiveMaxBytes
+	limit := DefaultSnapshotArchiveMaxBytes
+	if workspaceMaxBytes <= 0 || workspaceMaxBytes > limit/snapshotArchiveFactor {
+		return limit
 	}
 	return workspaceMaxBytes * snapshotArchiveFactor
 }

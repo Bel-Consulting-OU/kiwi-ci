@@ -323,8 +323,12 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 			effectiveNetwork = "none"
 		}
 		// Untrusted children get the server-side resource ceilings just
-		// like initial enqueues, BEFORE the compiled payload is marshaled.
-		cj = s.applyUntrustedResourceCeilings(cj, parent.Trusted)
+		// like initial enqueues, BEFORE the compiled payload is marshaled:
+		// an explicit request above a ceiling rejects the whole fragment.
+		cj, err = s.applyUntrustedResourceCeilings(cj, parent.Trusted)
+		if err != nil {
+			return nil, err
+		}
 		cjJSON, mErr := jsonMarshal(cj)
 		if mErr != nil {
 			return nil, mErr

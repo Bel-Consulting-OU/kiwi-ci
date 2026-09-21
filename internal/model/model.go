@@ -189,8 +189,8 @@ type Job struct {
 	UsageRecorded bool `json:"usage_recorded,omitempty"`
 	// CPURequest/MemoryRequest/DiskRequest/PIDsRequest carry the job's
 	// declared resource requirements (pipeline Job.Resources), persisted in
-	// the job payload so scheduling and future runner/backend enforcement
-	// can read them without recompiling. Additive.
+	// the job payload so scheduling and backend enforcement can read them
+	// without recompiling. Additive.
 	CPURequest    float64 `json:"cpu_request,omitempty"`
 	MemoryRequest int64   `json:"memory_request,omitempty"`
 	DiskRequest   int64   `json:"disk_request,omitempty"`
@@ -217,6 +217,16 @@ type Runner struct {
 	CurrentJob string            `json:"current_job,omitempty"`
 	Busy       bool              `json:"busy"`
 
+	// ResourceCapacity is the runner's effective resource capacity (CPU,
+	// memory, disk, PIDs). It is overlaid from the runner's linked profile
+	// at registration and at lease time (ResolveRunnerProfile); a runner
+	// without a linked profile uses its registration snapshot, and a zero
+	// dimension is UNCONSTRAINED. Additive: deployments that predate it
+	// keep the count-only behavior. The effective values are persisted with
+	// the registration payload and re-resolved live from the profile on
+	// every lease.
+	ResourceCapacity ResourceCapacity `json:"resource_capacity,omitempty"`
+
 	// Admission control.
 	Disabled bool `json:"disabled,omitempty"`
 	Draining bool `json:"draining,omitempty"`
@@ -240,11 +250,16 @@ type Runner struct {
 
 // RunnerProfile is the server-owned runner identity profile. Every
 // scheduling-relevant runner attribute (labels, region, repository scope,
-// capabilities, capacity, cost/energy rates) is server-owned: runners may
-// not self-report any of it at registration — the profile supplies it, and
-// a runner without a linked profile registers empty (capacity 0, no
-// labels/region, no rates). Repositories holds canonical repo IDs
-// ("<forgeHost>/<owner>/<name>"); empty means any repository.
+// capabilities, capacity, resource capacities, cost/energy rates) is
+// server-owned: runners may not self-report any of it at registration — the
+// profile supplies it, and a runner without a linked profile registers empty
+// (capacity 0, no labels/region, no rates). Repositories holds canonical
+// repo IDs ("<forgeHost>/<owner>/<name>"); empty means any repository.
+//
+// MaxCPU/MaxMemory/MaxDisk/MaxPIDs are the profile's resource capacities:
+// the ceiling against which the LIVE sum of the runner's reserved running
+// jobs is checked at lease time. A zero dimension is UNCONSTRAINED (the
+// documented default; pre-0030 behavior is the count-only max_capacity).
 type RunnerProfile struct {
 	ID           string    `json:"id"`
 	Labels       []string  `json:"labels,omitempty"`
@@ -252,9 +267,36 @@ type RunnerProfile struct {
 	Repositories []string  `json:"repositories,omitempty"`
 	Capabilities []string  `json:"capabilities,omitempty"`
 	MaxCapacity  int       `json:"max_capacity,omitempty"`
+	MaxCPU       float64   `json:"max_cpu,omitempty"`
+	MaxMemory    int64     `json:"max_memory,omitempty"`
+	MaxDisk      int64     `json:"max_disk,omitempty"`
+	MaxPIDs      int       `json:"max_pids,omitempty"`
 	CostPerHour  float64   `json:"cost_per_hour,omitempty"`
 	PowerWatts   float64   `json:"power_watts,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
+}
+
+// ResourceCapacity is one entity's resource quantities: a runner's
+// remaining/effective capacity or a set of resource requests, in the same
+// additive order as the job request fields. A zero dimension means
+// "unconstrained" when read as a CAPACITY and "no request" when read as a
+// request; ResourceAdmission decides which dimensions bind.
+type ResourceCapacity struct {
+	CPU    float64 `json:"cpu,omitempty"`
+	Memory int64   `json:"memory,omitempty"`
+	Disk   int64   `json:"disk,omitempty"`
+	PIDs   int     `json:"pids,omitempty"`
+}
+
+// ResourceCapacityFromProfile returns the profile's resource capacities.
+func ResourceCapacityFromProfile(p RunnerProfile) ResourceCapacity {
+	return ResourceCapacity{CPU: p.MaxCPU, Memory: p.MaxMemory, Disk: p.MaxDisk, PIDs: p.MaxPIDs}
+}
+
+// ResourceRequest returns the job's declared resource requests as a
+// ResourceCapacity.
+func (j Job) ResourceRequest() ResourceCapacity {
+	return ResourceCapacity{CPU: j.CPURequest, Memory: j.MemoryRequest, Disk: j.DiskRequest, PIDs: j.PIDsRequest}
 }
 
 // CompiledJobPayload is the enqueue-time compilation record persisted on a

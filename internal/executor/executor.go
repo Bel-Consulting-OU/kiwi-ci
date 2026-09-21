@@ -66,6 +66,25 @@ type Options struct {
 	// that are not pinned by an @sha256: digest. The server enables this for
 	// untrusted jobs.
 	RequireImmutableImages bool
+	// Untrusted marks the job as untrusted. Untrusted container jobs always
+	// receive a workspace disk budget: the declared resources.disk when set,
+	// otherwise UntrustedWorkspaceMaxBytes (or the documented
+	// DefaultUntrustedWorkspaceMaxBytes). Trusted jobs without a declaration
+	// keep the historical unbounded behavior. Untrusted jobs are also held to
+	// the smaller pipeline.MaxUntrustedServicesPerJob service-count ceiling.
+	Untrusted bool
+	// UntrustedWorkspaceMaxBytes overrides DefaultUntrustedWorkspaceMaxBytes
+	// for untrusted jobs whose pipeline does not declare resources.disk. Zero
+	// selects the package default; this is the configuration seam for runners
+	// that need a different budget.
+	UntrustedWorkspaceMaxBytes int64
+	// RequireUntrustedDiskQuota fails an untrusted container job closed when
+	// no OS-level hard workspace bound (XFS project quota) can be established
+	// for its workspace. The step-boundary resources.disk measurement is not a
+	// security boundary, so production runners set this and let the operator
+	// escape hatch (KIWI_ALLOW_UNQUOTAED_UNTRUSTED_DISK) cover trusted-only
+	// self-hosted setups.
+	RequireUntrustedDiskQuota bool
 	// CaptureSnapshot archives the job workspace after its steps ran (for
 	// any status other than skipped/blocked) under the host temp dir.
 	// Snapshot failures are logged as warnings and never change job status.
@@ -397,10 +416,20 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			return finish(res)
 		}
 	}
+	// The trust-aware service-count ceiling is enforced before any service
+	// container starts: untrusted jobs may declare at most
+	// pipeline.MaxUntrustedServicesPerJob services, trusted jobs the
+	// historical 32. A pipeline that slipped past spec admission can never
+	// fan out more sidecars than the trust domain allows.
+	if err := pipeline.ValidateServiceCount(cj.ID, cj.Job.Services, e.Opt.Untrusted); err != nil {
+		res.Status = model.StatusFailure
+		res.Error = err.Error()
+		return finish(res)
+	}
 	if cj.Job.Runtime == "container" && len(cj.Job.Services) > 0 {
 		isolated := networkPolicy == pipeline.NetworkPolicyNone || networkPolicy == pipeline.NetworkPolicyServicesOnly
 		var er error
-		network, cleanupServices, er = startContainerServices(ctx, e.Opt.RunID, cj.ID, cj.Job.Services, isolated, e.Opt.RequireImmutableImages, func(line string) { e.log(cj.ID, "service", line) })
+		network, cleanupServices, er = startContainerServices(ctx, e.Opt.RunID, cj.ID, cj.Job.Services, cj.Job.Resources, isolated, e.Opt.RequireImmutableImages, func(line string) { e.log(cj.ID, "service", line) })
 		if er != nil {
 			res.Status = model.StatusFailure
 			res.Error = er.Error()
@@ -426,6 +455,9 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		b.RunID = e.Opt.RunID
 		b.JobID = cj.ID
 		b.Resources = cj.Job.Resources
+		b.Untrusted = e.Opt.Untrusted
+		b.UntrustedDiskMaxBytes = e.Opt.UntrustedWorkspaceMaxBytes
+		b.RequireDiskQuota = e.Opt.RequireUntrustedDiskQuota
 	case *TartBackend:
 		b.RequireImmutableImages = e.Opt.RequireImmutableImages
 		b.Resources = cj.Job.Resources

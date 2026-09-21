@@ -116,17 +116,83 @@ func TestServerDBModeWithoutDataDir(t *testing.T) {
 	}
 }
 
-func TestServerDBModeProductionRequiresHAStore(t *testing.T) {
-	// Production DB mode without a cluster key store fails ValidateHAReady.
+func TestServerDBModeProductionUsesDBClusterKeyStore(t *testing.T) {
+	// D3-C: production DB mode no longer accepts a node-local data-dir key
+	// store, and no longer needs --cluster-key-dir either: the DB-backed
+	// cluster key store is the preferred shared provider, so replicas share
+	// every signing material through PostgreSQL. Startup must succeed and
+	// the shared table must hold the material.
 	dsn := scratchPostgresDSN(t)
 	addr := freeTCPAddr(t)
 	certFile, keyFile := writeSelfSignedTLS(t)
-	err := Server(context.Background(), []string{"--listen", addr, "--database-url", dsn,
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := startServer(t, ctx, "--listen", addr, "--database-url", dsn,
 		"--mode", "production", "--external-url", "https://ci.example.com",
 		"--tls-cert", certFile, "--tls-key", keyFile, "--admin-token", "admin",
-		"--runner-tokens-file", writeRunnerTokensFile(t)})
-	if err == nil {
-		t.Fatal("production DB mode without a cluster key store succeeded")
+		"--data-dir", t.TempDir(),
+		"--runner-tokens-file", writeRunnerTokensFile(t))
+	waitTCPUp(t, addr, errCh, 15*time.Second)
+	if err := stopServer(t, cancel, errCh); err != nil {
+		t.Fatalf("production DB-mode Server without --cluster-key-dir returned %v", err)
+	}
+	db, err := openDBForTest(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	blobs, ok := any(db).(storage.ClusterKeyBlobStore)
+	if !ok {
+		t.Fatal("SQL store does not implement ClusterKeyBlobStore")
+	}
+	for _, kind := range []string{"oidc", "lease", "provenance", "cache-signing", "web-session"} {
+		b, found, gerr := blobs.GetClusterKey(context.Background(), kind)
+		if gerr != nil || !found || len(b) == 0 {
+			t.Fatalf("shared cluster key %q: found=%v len=%d err=%v", kind, found, len(b), gerr)
+		}
+	}
+}
+
+func TestServerDBModeProductionRunnerTokenOnlyWithProvisionedTokens(t *testing.T) {
+	dsn := scratchPostgresDSN(t)
+	// Seed per-runner credentials into runner_bearer_tokens through a dev
+	// server (the provisioning path).
+	seedAddr := freeTCPAddr(t)
+	seedCtx, seedCancel := context.WithCancel(context.Background())
+	seedCh := startServer(t, seedCtx, "--listen", seedAddr, "--database-url", dsn,
+		"--data-dir", t.TempDir(), "--runner-tokens-file", writeRunnerTokensFile(t))
+	waitTCPUp(t, seedAddr, seedCh, 15*time.Second)
+	if err := stopServer(t, seedCancel, seedCh); err != nil {
+		t.Fatalf("seeding server returned %v", err)
+	}
+
+	// D3-D: production with ONLY --runner-token (no mTLS, no tokens file)
+	// starts because the durable store already holds per-runner credentials;
+	// static validation must not reject it prematurely.
+	certFile, keyFile := writeSelfSignedTLS(t)
+	addr := freeTCPAddr(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := startServer(t, ctx, "--listen", addr, "--database-url", dsn,
+		"--mode", "production", "--external-url", "https://ci.example.com",
+		"--tls-cert", certFile, "--tls-key", keyFile,
+		"--admin-token", "admin", "--runner-token", "shared-runner-token")
+	waitTCPUp(t, addr, errCh, 15*time.Second)
+	if err := stopServer(t, cancel, errCh); err != nil {
+		t.Fatalf("production with --runner-token and provisioned bearer tokens returned %v", err)
+	}
+}
+
+func TestServerDBModeProductionNoRunnerMechanismFailsPostDB(t *testing.T) {
+	// D3-D: production with a shared token but no per-runner mechanism at
+	// all fails the POST-DB credential check (not the static one) with a
+	// clear message.
+	dsn := scratchPostgresDSN(t)
+	certFile, keyFile := writeSelfSignedTLS(t)
+	err := Server(context.Background(), []string{"--listen", freeTCPAddr(t), "--database-url", dsn,
+		"--mode", "production", "--external-url", "https://ci.example.com",
+		"--tls-cert", certFile, "--tls-key", keyFile,
+		"--admin-token", "admin", "--runner-token", "shared-runner-token"})
+	if err == nil || !strings.Contains(err.Error(), "production requires runner mTLS or per-runner credentials") {
+		t.Fatalf("production without runner credentials = %v", err)
 	}
 }
 

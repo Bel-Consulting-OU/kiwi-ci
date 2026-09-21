@@ -28,6 +28,25 @@ import (
 // ManifestVersion is the current snapshot manifest format version.
 const ManifestVersion = 1
 
+// MaxArchiveBytes is the ONE compressed snapshot-archive budget shared by
+// every layer of the snapshot path:
+//
+//   - the runner refuses to assemble a larger archive: its derived capture
+//     cap is min(2 x declared workspace bound, MaxArchiveBytes)
+//     (internal/runner/snapshots.go);
+//   - the control plane's snapshot upload endpoints refuse a larger request
+//     body (internal/server/snapshots.go);
+//   - Parse/ParseWithLimits reject a larger compressed archive with
+//     safefs.ErrLimits (parseLimits defaults MaxArchiveBytes to this value).
+//
+// Before this source existed the runner's fallback/2x cap was 8 GiB while
+// the parser defaulted to 4 GiB, so the runner could assemble an archive the
+// receiver necessarily rejected. 4 GiB is the practical compressed ceiling:
+// it is far above a real workspace snapshot and keeps the receiver's
+// worst-case gzip work bounded (MaxExpandedBytes is 16 GiB, a 1000x
+// compression-ratio guard and a 1 GiB per-entry cap still apply on top).
+const MaxArchiveBytes int64 = 4 << 30
+
 // Entry is one regular file in a snapshot.
 type Entry struct {
 	Path   string `json:"path"`
@@ -154,13 +173,16 @@ func Parse(r io.Reader) (Manifest, error) {
 }
 
 // parseLimits are the hard bounds Parse enforces on untrusted snapshot
-// archives: at most 4 GiB of compressed input, 16 GiB of expanded data,
-// 1_000_000 tar headers (MaxEntries, counted per header regardless of
+// archives: at most MaxArchiveBytes of compressed input, 16 GiB of expanded
+// data, 1_000_000 tar headers (MaxEntries, counted per header regardless of
 // type), 1 GiB per entry, path length 2048, depth 64 and a compression
-// ratio of 1000 (the same envelope safefs extraction applies).
+// ratio of 1000 (the same envelope safefs extraction applies). A
+// caller-supplied positive MaxArchiveBytes overrides the shared default (the
+// server parses with the default, so the upload body cap and the parser
+// agree).
 func parseLimits(l safefs.ExtractLimits) safefs.ExtractLimits {
 	if l.MaxArchiveBytes <= 0 {
-		l.MaxArchiveBytes = 4 << 30
+		l.MaxArchiveBytes = MaxArchiveBytes
 	}
 	if l.MaxExpandedBytes <= 0 {
 		l.MaxExpandedBytes = 16 << 30
@@ -221,6 +243,14 @@ func ParseWithLimits(r io.Reader, limits safefs.ExtractLimits) (Manifest, error)
 	var headers int64
 	for {
 		h, err := tr.Next()
+		// The archive budget is checked on every Next call, INCLUDING the
+		// call that reports EOF: an archive whose last entry pushes it over
+		// the limit (or one whose overage only becomes visible while the
+		// reader drains the tail) is rejected instead of being accepted
+		// because the loop broke before examining the counter.
+		if limits.MaxArchiveBytes > 0 && compressed.n > limits.MaxArchiveBytes {
+			return Manifest{}, fmt.Errorf("snapshot: archive exceeds the %d-byte compressed limit: %w", limits.MaxArchiveBytes, safefs.ErrLimits)
+		}
 		if err == io.EOF {
 			break
 		}
@@ -229,9 +259,6 @@ func ParseWithLimits(r io.Reader, limits safefs.ExtractLimits) (Manifest, error)
 		}
 		headers++
 		if headers > limits.MaxEntries {
-			return Manifest{}, fmt.Errorf("snapshot: %w", safefs.ErrLimits)
-		}
-		if limits.MaxArchiveBytes > 0 && compressed.n > limits.MaxArchiveBytes {
 			return Manifest{}, fmt.Errorf("snapshot: %w", safefs.ErrLimits)
 		}
 		name, nerr := safefs.ValidateEntryName(h.Name)

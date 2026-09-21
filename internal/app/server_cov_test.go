@@ -297,7 +297,14 @@ func TestServerRejectsBadInputs(t *testing.T) {
 	}
 }
 
-func TestServerProductionRefusesSharedRunnerToken(t *testing.T) {
+func TestServerProductionRunnerTokenDecisionIsPostDB(t *testing.T) {
+	// D3-D: --runner-token alone is no longer rejected by STATIC validation.
+	// The per-runner decision needs the database (rows may already be
+	// provisioned in runner_bearer_tokens), so an unreachable database must
+	// surface the connection error first, not a runner-token refusal. The
+	// DB-backed pass/fail paths are covered by the PostgreSQL tests
+	// (TestServerDBModeProductionRunnerTokenOnlyWithProvisionedTokens and
+	// TestServerDBModeProductionNoRunnerMechanismFailsPostDB).
 	err := Server(context.Background(), []string{
 		"--mode", "production",
 		"--database-url", "postgres://postgres@127.0.0.1:1/postgres?sslmode=disable",
@@ -305,8 +312,14 @@ func TestServerProductionRefusesSharedRunnerToken(t *testing.T) {
 		"--tls-cert", "c.pem", "--tls-key", "k.pem",
 		"--admin-token", "admin", "--runner-token", "runner",
 	})
-	if err == nil || !strings.Contains(err.Error(), "shared runner token is dev-only") {
-		t.Fatalf("production Server = %v, want shared-runner-token refusal", err)
+	if err == nil {
+		t.Fatal("production Server with an unreachable database succeeded")
+	}
+	if !strings.Contains(err.Error(), "storage:") {
+		t.Fatalf("production Server = %v, want the database connection error", err)
+	}
+	if strings.Contains(err.Error(), "runner token") {
+		t.Fatalf("runner-token decision happened before the database was reachable: %v", err)
 	}
 }
 

@@ -379,7 +379,7 @@ func TestStartContainerServicesFakeDocker(t *testing.T) {
 	installFakeBins(t)
 	ctx := context.Background()
 	services := []pipeline.Service{{Name: "db", Image: "postgres:16", Env: map[string]string{"POSTGRES_PASSWORD": "x"}}}
-	network, cleanup, err := startContainerServices(ctx, "run1", "job1", services, true, false, func(string) {})
+	network, cleanup, err := startContainerServices(ctx, "run1", "job1", services, pipeline.Resources{}, true, false, func(string) {})
 	if err != nil {
 		t.Fatalf("startContainerServices: %v", err)
 	}
@@ -393,7 +393,7 @@ func TestStartContainerServicesFakeDocker(t *testing.T) {
 	}
 	// A long name is truncated to 60 characters.
 	long := strings.Repeat("a", 80)
-	network, cleanup, err = startContainerServices(ctx, long, long, services, false, false, func(string) {})
+	network, cleanup, err = startContainerServices(ctx, long, long, services, pipeline.Resources{}, false, false, func(string) {})
 	if err != nil {
 		t.Fatalf("long-name services: %v", err)
 	}
@@ -404,13 +404,13 @@ func TestStartContainerServicesFakeDocker(t *testing.T) {
 	// Healthcheck success path (immediate, with the default interval and
 	// retry budget).
 	hc := []pipeline.Service{{Name: "db", Image: "postgres:16", Healthcheck: "true"}}
-	if _, cleanup, err = startContainerServices(ctx, "r", "j", hc, false, false, func(string) {}); err != nil {
+	if _, cleanup, err = startContainerServices(ctx, "r", "j", hc, pipeline.Resources{}, false, false, func(string) {}); err != nil {
 		t.Fatalf("healthcheck success: %v", err)
 	}
 	cleanup()
 	// Healthcheck success after one retry uses an explicit interval.
 	hc = []pipeline.Service{{Name: "db", Image: "postgres:16", Healthcheck: "true", Retries: 2, Interval: pipeline.Duration{Duration: 10 * time.Millisecond}}}
-	if _, cleanup, err = startContainerServices(ctx, "r", "j", hc, false, false, func(string) {}); err != nil {
+	if _, cleanup, err = startContainerServices(ctx, "r", "j", hc, pipeline.Resources{}, false, false, func(string) {}); err != nil {
 		t.Fatalf("healthcheck retry: %v", err)
 	}
 	cleanup()
@@ -419,29 +419,29 @@ func TestStartContainerServicesFakeDocker(t *testing.T) {
 func TestStartContainerServicesErrors(t *testing.T) {
 	ctx := context.Background()
 	// Missing image.
-	if _, _, err := startContainerServices(ctx, "r", "j", []pipeline.Service{{}}, false, false, func(string) {}); err == nil {
+	if _, _, err := startContainerServices(ctx, "r", "j", []pipeline.Service{{}}, pipeline.Resources{}, false, false, func(string) {}); err == nil {
 		t.Fatal("missing service image accepted")
 	}
 	// Unpinned image under the immutability requirement.
-	if _, _, err := startContainerServices(ctx, "r", "j", []pipeline.Service{{Image: "postgres:16"}}, false, true, func(string) {}); err == nil {
+	if _, _, err := startContainerServices(ctx, "r", "j", []pipeline.Service{{Image: "postgres:16"}}, pipeline.Resources{}, false, true, func(string) {}); err == nil {
 		t.Fatal("unpinned service image accepted")
 	}
 	// Docker missing.
 	t.Setenv("PATH", t.TempDir())
-	if _, _, err := startContainerServices(ctx, "r", "j", []pipeline.Service{{Image: "postgres:16"}}, false, false, func(string) {}); err == nil {
+	if _, _, err := startContainerServices(ctx, "r", "j", []pipeline.Service{{Image: "postgres:16"}}, pipeline.Resources{}, false, false, func(string) {}); err == nil {
 		t.Fatal("docker-less services succeeded")
 	}
 	installFakeBins(t)
 	svc := []pipeline.Service{{Image: "postgres:16"}}
 	// Network creation fails.
 	t.Setenv("FAKE_DOCKER_NET_FAIL", "1")
-	if _, _, err := startContainerServices(ctx, "r", "j", svc, false, false, func(string) {}); err == nil {
+	if _, _, err := startContainerServices(ctx, "r", "j", svc, pipeline.Resources{}, false, false, func(string) {}); err == nil {
 		t.Fatal("network failure accepted")
 	}
 	// Service start fails (cleanup runs).
 	t.Setenv("FAKE_DOCKER_NET_FAIL", "")
 	t.Setenv("FAKE_DOCKER_RUN_FAIL", "1")
-	if _, _, err := startContainerServices(ctx, "r", "j", svc, false, false, func(string) {}); err == nil {
+	if _, _, err := startContainerServices(ctx, "r", "j", svc, pipeline.Resources{}, false, false, func(string) {}); err == nil {
 		t.Fatal("service start failure accepted")
 	}
 	// Healthcheck exhausts its retries and fails (cleanup runs).
@@ -449,7 +449,7 @@ func TestStartContainerServicesErrors(t *testing.T) {
 	t.Setenv("FAKE_DOCKER_RUN_FAIL", "")
 	t.Setenv("FAKE_DOCKER_EXEC_FAIL", "1")
 	hc := []pipeline.Service{{Name: "db", Image: "postgres:16", Healthcheck: "false", Retries: 1, Interval: pipeline.Duration{Duration: time.Millisecond}}}
-	if _, _, err := startContainerServices(ctx, "r", "j", hc, false, false, func(string) {}); err == nil {
+	if _, _, err := startContainerServices(ctx, "r", "j", hc, pipeline.Resources{}, false, false, func(string) {}); err == nil {
 		t.Fatal("unhealthy service accepted")
 	}
 	// A context cancelled during the healthcheck wait aborts it: a long
@@ -462,7 +462,7 @@ func TestStartContainerServicesErrors(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 		cancel()
 	}()
-	if _, _, err := startContainerServices(cctx, "r", "j", slowHC, false, false, func(string) {}); err == nil {
+	if _, _, err := startContainerServices(cctx, "r", "j", slowHC, pipeline.Resources{}, false, false, func(string) {}); err == nil {
 		t.Fatal("cancelled service wait accepted")
 	}
 	// A pre-cancelled context aborts immediately.
@@ -470,7 +470,7 @@ func TestStartContainerServicesErrors(t *testing.T) {
 	t.Setenv("FAKE_DOCKER_EXEC_FAIL", "1")
 	cctx2, cancel2 := context.WithCancel(ctx)
 	cancel2()
-	if _, _, err := startContainerServices(cctx2, "r", "j", hc, false, false, func(string) {}); err == nil {
+	if _, _, err := startContainerServices(cctx2, "r", "j", hc, pipeline.Resources{}, false, false, func(string) {}); err == nil {
 		t.Fatal("pre-cancelled service wait accepted")
 	}
 }
@@ -482,15 +482,28 @@ func TestServiceNetworkAndNameHelpers(t *testing.T) {
 	if got := serviceNetworkArgs(true); got[len(got)-1] != "--internal" {
 		t.Fatalf("isolated args = %v", got)
 	}
-	if got := serviceContainerName("r", "j", 0, pipeline.Service{}); !strings.HasPrefix(got, "kiwi-svc-r-j-1") {
+	// The physical name is ALWAYS the unique kiwi-svc-<run>-<job>-<index>
+	// form, even when the service declares an alias: aliases are attached as
+	// network aliases, never as docker container names.
+	got := serviceContainerName("r", "j", 0)
+	if got != "kiwi-svc-r-j-1" {
 		t.Fatalf("default name = %q", got)
 	}
-	got := serviceContainerName("r", "j", 0, pipeline.Service{Name: "My DB!"})
-	if got != "my-db-" {
-		t.Fatalf("custom name = %q", got)
+	if got := serviceContainerName("r", "j", 0); strings.Contains(got, "db") {
+		t.Fatalf("alias leaked into the physical name: %q", got)
 	}
-	if got := serviceContainerName("r", "j", 0, pipeline.Service{Name: "!!!"}); got != "---" {
-		t.Fatalf("sanitized name = %q", got)
+	// Alias sanitization is preserved for the network alias.
+	if alias := serviceAlias(pipeline.Service{Name: "My DB!"}); alias != "my-db-" {
+		t.Fatalf("custom alias = %q", alias)
+	}
+	if alias := serviceAlias(pipeline.Service{Name: "!!!"}); alias != "---" {
+		t.Fatalf("sanitized alias = %q", alias)
+	}
+	if alias := serviceAlias(pipeline.Service{}); alias != "" {
+		t.Fatalf("nameless alias = %q", alias)
+	}
+	if alias := serviceAlias(pipeline.Service{Name: "Postgres"}); alias != "postgres" {
+		t.Fatalf("lowercased alias = %q", alias)
 	}
 }
 

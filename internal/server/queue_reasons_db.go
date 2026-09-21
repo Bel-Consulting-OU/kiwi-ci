@@ -13,6 +13,14 @@ import (
 // candidate and persists them through QueueReasonStore. It runs on a DB
 // lease miss so the SQL store's queue_reason column stays populated without
 // rewriting whole job payloads.
+//
+// Resource admission participates in the explanation: a candidate whose
+// request exceeds the runner's configured capacity for good is reported as
+// NO_COMPATIBLE_RUNNER (the existing "no runner can take this" semantics, so
+// an unsatisfiable job does not look like an infinite capacity wait), and a
+// candidate that merely does not fit the runner's REMAINING capacity now is
+// reported as RUNNER_CAPACITY (it will be leased when one of the runner's
+// jobs finishes, or by another runner with room).
 func (s *Server) applyQueueReasonsDB(ctx context.Context, ri model.Runner) {
 	qs, ok := s.DB.(storage.QueueReasonStore)
 	if !ok {
@@ -21,6 +29,16 @@ func (s *Server) applyQueueReasonsDB(ctx context.Context, ri model.Runner) {
 	jobs, err := s.DB.ListQueuedJobs(ctx)
 	if err != nil {
 		return
+	}
+	// The runner's LIVE effective capacity and current reservations are
+	// resolved once per pass (mirroring the lease path's live resolution).
+	eff := ri
+	if s.Sched != nil {
+		eff = s.Sched.EffectiveRunner(ctx, ri)
+	}
+	var reserved model.ResourceCapacity
+	if s.Sched != nil {
+		reserved = s.Sched.ReservedResources(ctx, eff.ID)
 	}
 	reasons := map[string]string{}
 	for _, j := range jobs {
@@ -31,12 +49,20 @@ func (s *Server) applyQueueReasonsDB(ctx context.Context, ri model.Runner) {
 		switch {
 		case !s.depsReadyDB(ctx, j):
 			reason = queue.WaitingDependency
-		case !labelsSatisfied(ri.Labels, j.RequiredLabels):
+		case !labelsSatisfied(eff.Labels, j.RequiredLabels):
 			reason = queue.NoCompatibleRunner
-		case !regionSatisfied(ri.Region, j.PlacementRegions):
+		case !regionSatisfied(eff.Region, j.PlacementRegions):
 			reason = queue.RegionUnavailable
 		case s.environmentAtCapacityDB(ctx, j):
 			reason = queue.EnvironmentLocked
+		case !(storage.ResourceAdmission{Capacity: eff.ResourceCapacity, Reserved: reserved, Requested: j.ResourceRequest()}).EverSatisfiable():
+			// No amount of waiting frees this runner for the job: the job
+			// is incompatible with its configured capacity.
+			reason = queue.NoCompatibleRunner
+		case !(storage.ResourceAdmission{Capacity: eff.ResourceCapacity, Reserved: reserved, Requested: j.ResourceRequest()}).Allows():
+			// The job fits the runner in principle but not in what is left
+			// right now.
+			reason = queue.RunnerCapacity
 		}
 		if j.QueueReason != string(reason) {
 			reasons[j.ID] = string(reason)

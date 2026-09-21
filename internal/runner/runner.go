@@ -718,11 +718,23 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// The declared resources.disk is the job's workspace bound: it feeds the
 	// executor's pre-execution free-space check and the container backend's
 	// step-boundary workspace check, and it is what the snapshot capture
-	// derives its local archive cap from (see uploadJobSnapshot). An
-	// undeclared disk leaves the bound at zero, the documented default that
-	// preserves the behavior of pipelines without a disk declaration.
+	// derives its local archive cap from (see uploadJobSnapshot). Untrusted
+	// jobs without a declaration get the mandatory executor default budget
+	// instead of zero, so an undeclared disk can never mean "unbounded" for a
+	// job the runner does not trust. Trusted jobs without a declaration keep
+	// the documented zero (unbounded) behavior.
+	untrusted := !t.Job.Trusted
 	workspaceMaxBytes := workspaceMaxBytesForResources(cj.Job.Resources)
+	if workspaceMaxBytes == 0 && untrusted {
+		workspaceMaxBytes = executor.DefaultUntrustedWorkspaceMaxBytes
+	}
 	opts.WorkspaceMaxBytes = workspaceMaxBytes
+	opts.Untrusted = untrusted
+	// Production untrusted policy: the step-boundary resources.disk check is
+	// not a security boundary, so an untrusted job whose workspace cannot get
+	// a hard OS-level bound (project quota) fails closed. The escape hatch is
+	// the documented operator switch for trusted-only/self-hosted runners.
+	opts.RequireUntrustedDiskQuota = untrusted && !executor.AllowUnquotaedUntrustedDisk()
 	// Step durations come from the executor's wall-clock step measurements
 	// (StepReporter), never from sink-derived log timing.
 	applyStepReporter(&opts, r.Metrics)

@@ -99,6 +99,89 @@ func TestParseTruncatesMessagesAtSharedLimit(t *testing.T) {
 	}
 }
 
+// TestIdentityLimitsRejectedIdenticallyByParserAndValidator pins the D4-B
+// contract: the testcase identity strings (and a producer-declared testsuite
+// name) that PostgreSQL indexes are bounded by the shared limits at the
+// parser AND at ValidateReportPayload, with the same ErrLimitExceeded reason.
+// Exactly-at-the-boundary values are accepted by both.
+func TestIdentityLimitsRejectedIdenticallyByParserAndValidator(t *testing.T) {
+	over := strings.Repeat("n", MaxTestNameBytes+1)
+	at := strings.Repeat("n", MaxTestNameBytes)
+
+	ws := t.TempDir()
+	writeFixture(t, ws, "over.xml", `<testsuite name="s"><testcase name="`+over+`"/></testsuite>`)
+	writeFixture(t, ws, "at.xml", `<testsuite name="s"><testcase name="`+at+`"/></testsuite>`)
+
+	_, perr := Aggregate(ws, []string{"over.xml"})
+	if !errors.Is(perr, ErrLimitExceeded) || !strings.Contains(perr.Error(), "name budget") {
+		t.Fatalf("parser oversized name = %v, want ErrLimitExceeded name-budget reason", perr)
+	}
+	verr := ValidateReportPayload(model.TestReport{Tests: 1, Cases: []model.TestResult{{Name: over, Passed: true}}})
+	if !errors.Is(verr, ErrLimitExceeded) || !strings.Contains(verr.Error(), "name budget") {
+		t.Fatalf("validator oversized name = %v, want ErrLimitExceeded name-budget reason", verr)
+	}
+	if _, err := Aggregate(ws, []string{"at.xml"}); err != nil {
+		t.Fatalf("parser rejected the boundary name: %v", err)
+	}
+	if err := ValidateReportPayload(model.TestReport{Tests: 1, Cases: []model.TestResult{{Name: at, Passed: true}}}); err != nil {
+		t.Fatalf("validator rejected the boundary name: %v", err)
+	}
+
+	// Class.
+	overClass := strings.Repeat("c", MaxTestClassBytes+1)
+	atClass := strings.Repeat("c", MaxTestClassBytes)
+	writeFixture(t, ws, "overclass.xml", `<testsuite name="s"><testcase name="t" classname="`+overClass+`"/></testsuite>`)
+	writeFixture(t, ws, "atclass.xml", `<testsuite name="s"><testcase name="t" classname="`+atClass+`"/></testsuite>`)
+	if _, err := Aggregate(ws, []string{"overclass.xml"}); !errors.Is(err, ErrLimitExceeded) || !strings.Contains(err.Error(), "class budget") {
+		t.Fatalf("parser oversized class = %v, want ErrLimitExceeded class-budget reason", err)
+	}
+	if err := ValidateReportPayload(model.TestReport{Tests: 1, Cases: []model.TestResult{{Name: "t", Class: overClass, Passed: true}}}); !errors.Is(err, ErrLimitExceeded) || !strings.Contains(err.Error(), "class budget") {
+		t.Fatalf("validator oversized class = %v, want ErrLimitExceeded class-budget reason", err)
+	}
+	if _, err := Aggregate(ws, []string{"atclass.xml"}); err != nil {
+		t.Fatalf("parser rejected the boundary class: %v", err)
+	}
+	if err := ValidateReportPayload(model.TestReport{Tests: 1, Cases: []model.TestResult{{Name: "t", Class: atClass, Passed: true}}}); err != nil {
+		t.Fatalf("validator rejected the boundary class: %v", err)
+	}
+
+	// Suite: the parser checks a producer-declared testsuite name, the
+	// validator checks the report's suite identity (JobKey), which is what
+	// the aggregate table stores.
+	overSuite := strings.Repeat("s", MaxTestSuiteBytes+1)
+	atSuite := strings.Repeat("s", MaxTestSuiteBytes)
+	writeFixture(t, ws, "oversuite.xml", `<testsuite name="`+overSuite+`"><testcase name="t"/></testsuite>`)
+	writeFixture(t, ws, "atsuite.xml", `<testsuite name="`+atSuite+`"><testcase name="t"/></testsuite>`)
+	if _, err := Aggregate(ws, []string{"oversuite.xml"}); !errors.Is(err, ErrLimitExceeded) || !strings.Contains(err.Error(), "suite budget") {
+		t.Fatalf("parser oversized suite = %v, want ErrLimitExceeded suite-budget reason", err)
+	}
+	if _, err := Aggregate(ws, []string{"atsuite.xml"}); err != nil {
+		t.Fatalf("parser rejected the boundary suite name: %v", err)
+	}
+	if err := ValidateReportPayload(model.TestReport{Tests: 1, JobKey: overSuite, Cases: []model.TestResult{{Name: "t", Passed: true}}}); !errors.Is(err, ErrLimitExceeded) || !strings.Contains(err.Error(), "suite budget") {
+		t.Fatalf("validator oversized suite identity = %v, want ErrLimitExceeded suite-budget reason", err)
+	}
+	if err := ValidateReportPayload(model.TestReport{Tests: 1, JobKey: atSuite, Cases: []model.TestResult{{Name: "t", Passed: true}}}); err != nil {
+		t.Fatalf("validator rejected the boundary suite identity: %v", err)
+	}
+}
+
+// TestOversizedIdentityFailsBeforeSQL pins the ingestion order: a direct
+// /tests payload carrying a runaway testcase name is refused by the shared
+// validator with a clear 4xx BEFORE any store call. The validator error is
+// asserted directly here; the endpoint's ordering is covered by the
+// delivery tests (the handler calls ValidateReportPayload before authorizing
+// and inserting).
+func TestOversizedIdentityFailsBeforeSQL(t *testing.T) {
+	err := ValidateReportPayload(model.TestReport{
+		Tests: 1,
+		Cases: []model.TestResult{{Name: strings.Repeat("x", MaxTestNameBytes+1), Passed: true}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "name budget") {
+		t.Fatalf("err = %v, want a clear name-budget rejection", err)
+	}
+}
+
 // TestValidateReportPayloadRejectsCaseOverBudget is the shared case-count
 // boundary: a report one case over MaxJobCases is refused with
 // ErrLimitExceeded by the same validator the runner and the endpoint call.

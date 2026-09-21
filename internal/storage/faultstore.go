@@ -168,6 +168,7 @@ var (
 	_ TestHistoryAggregateStore = (*FaultyStore)(nil)
 	_ TestReportDeliveryStore   = (*FaultyStore)(nil)
 	_ RunnerDisableStore        = (*FaultyStore)(nil)
+	_ ResourceReservationStore  = (*FaultyStore)(nil)
 	_ ArtifactIdempotentStore   = (*FaultyStore)(nil)
 	_ GeneratedFragmentStore    = (*FaultyStore)(nil)
 	_ RecoveryStore             = (*FaultyStore)(nil)
@@ -1323,6 +1324,26 @@ func (f *FaultyStore) ProfileForSerial(ctx context.Context, serial string) (mode
 	return inner.ProfileForSerial(ctx, serial)
 }
 
+// RunnerReservedResources / ListResourceReservations delegate the
+// reservation-ledger reads to the wrapped store (the lease claim itself is
+// delegated through AcquireLeaseAtomic, fault-injectable like every other
+// mutation).
+func (f *FaultyStore) RunnerReservedResources(ctx context.Context, runnerID string) (model.ResourceCapacity, error) {
+	inner, ok := f.Inner.(ResourceReservationStore)
+	if !ok {
+		return model.ResourceCapacity{}, errMissingInnerInterface("ResourceReservationStore")
+	}
+	return inner.RunnerReservedResources(ctx, runnerID)
+}
+
+func (f *FaultyStore) ListResourceReservations(ctx context.Context, runnerID string) ([]ResourceReservation, error) {
+	inner, ok := f.Inner.(ResourceReservationStore)
+	if !ok {
+		return nil, errMissingInnerInterface("ResourceReservationStore")
+	}
+	return inner.ListResourceReservations(ctx, runnerID)
+}
+
 func (f *FaultyStore) UpsertRunnerToken(ctx context.Context, runnerID, tokenDigest string) error {
 	inner, ok := f.Inner.(RunnerTokenStore)
 	if !ok {
@@ -1564,6 +1585,13 @@ type memStore struct {
 	revocations  map[string]string
 	grants       map[string]EnrollGrantRecord
 
+	// reservations mirrors migration 0030's job_resource_reservations rows:
+	// the per-lease resource reservations of RUNNING jobs, keyed by job ID.
+	// The in-memory lease claim checks and inserts here under m.mu (the
+	// single-process capacity guarantee), and every release path deletes the
+	// job's row with it.
+	reservations map[string]ResourceReservation
+
 	testHistoryVersion int64
 	testHistoryStats   []byte
 	// historyAggregates / historyVersions mirror migration 0026's
@@ -1666,6 +1694,7 @@ func newMemStore() *memStore {
 		certProfiles:      map[string]string{},
 		runnerTokens:      map[string]string{},
 		revocations:       map[string]string{},
+		reservations:      map[string]ResourceReservation{},
 		grants:            map[string]EnrollGrantRecord{},
 		historyAggregates: map[string]map[string]TestHistoryAggregate{},
 		historyVersions:   map[string]int64{},
@@ -1941,6 +1970,9 @@ func (m *memStore) UpdateJob(ctx context.Context, job model.Job) error {
 	return nil
 }
 
+// AcquireLease is the non-atomic in-memory claim (see the SQL counterpart):
+// it claims the job without a runner-slot predicate and reserves no resource
+// capacity. Bundle users claim through AcquireLeaseAtomic.
 func (m *memStore) AcquireLease(ctx context.Context, jobID, runnerID string, tokenHash []byte, generation int64, expiresAt time.Time) (model.Job, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2040,6 +2072,9 @@ func (m *memStore) CompleteJob(ctx context.Context, jobID string, generation int
 	m.jobs[jobID] = j
 	m.receipts[key] = receipt
 	m.adjustQuotaLocked(RepoIDForJob(j), -1, 0)
+	// The completion releases the job's resource reservation in the same
+	// critical section (idempotent; a replay never re-inserted one).
+	m.releaseReservationLocked(jobID)
 	// Release the completing runner's slot and bump its counters in the
 	// same critical section, mirroring the SQL completeRunnerTx: capacity 0
 	// survives (never clamped), busy recomputes from the remaining set.
@@ -2095,6 +2130,9 @@ func (m *memStore) CancelRunJobs(ctx context.Context, runID string, reason strin
 		j.LeaseTokenHash = nil
 		j.LeaseExpiresAt = nil
 		m.jobs[id] = j
+		// The cancelled job releases its resource reservation (a no-op for
+		// queued jobs, which never acquired one).
+		m.releaseReservationLocked(id)
 		if wasRunning {
 			m.adjustQuotaLocked(RepoIDForJob(j), -1, 0)
 			// The cancelled running job releases its runner slot in the
@@ -2150,8 +2188,9 @@ func (m *memStore) ReleaseRunnerJob(ctx context.Context, runnerID, jobID string,
 	if !ok {
 		// The runner row is gone (deregistered): the job's reserved quota
 		// slot is repository-scoped, so it is released regardless of the
-		// missing runner row.
+		// missing runner row, and the resource reservation is keyed by job.
 		m.releaseJobQuotaLocked(jobID)
+		m.releaseReservationLocked(jobID)
 		return ErrNotFound
 	}
 	r.ActiveJobs = removeString(r.ActiveJobs, jobID)
@@ -2173,6 +2212,7 @@ func (m *memStore) ReleaseRunnerJob(ctx context.Context, runnerID, jobID string,
 	r.LastSeen = time.Now().UTC()
 	m.runners[runnerID] = r
 	m.releaseJobQuotaLocked(jobID)
+	m.releaseReservationLocked(jobID)
 	return nil
 }
 
@@ -2379,6 +2419,7 @@ func (m *memStore) RevokeRunnerLeases(ctx context.Context, runnerID, reason stri
 	runners := cloneRecoveryRunners(m.runners)
 	runs := cloneRecoveryRuns(m.runs)
 	quotas := cloneRecoveryQuotas(m.quotas)
+	reservations := cloneRecoveryReservations(m.reservations)
 	audit := append([]model.AuditEvent(nil), m.audit...)
 	staged := 0
 	changed := map[string]bool{}
@@ -2398,6 +2439,9 @@ func (m *memStore) RevokeRunnerLeases(ctx context.Context, runnerID, reason stri
 		j.LeaseTokenHash = nil
 		j.LeaseExpiresAt = nil
 		jobs[id] = j
+		// The invalidated lease releases its reservation in the same
+		// transaction (a requeued job holds none until re-leased).
+		releaseReservationMap(reservations, id)
 		if err := m.recoveryBumpFor(&staged); err != nil {
 			return nil, err
 		}
@@ -2447,6 +2491,7 @@ func (m *memStore) RevokeRunnerLeases(ctx context.Context, runnerID, reason stri
 	m.runners = runners
 	m.runs = runs
 	m.quotas = quotas
+	m.reservations = reservations
 	m.audit = audit
 	return ids, nil
 }
@@ -2480,6 +2525,7 @@ func (m *memStore) RecoverExpiredLease(ctx context.Context, jobID string, expect
 	runners := cloneRecoveryRunners(m.runners)
 	runs := cloneRecoveryRuns(m.runs)
 	quotas := cloneRecoveryQuotas(m.quotas)
+	reservations := cloneRecoveryReservations(m.reservations)
 	audit := append([]model.AuditEvent(nil), m.audit...)
 	staged := 0
 	corrupt := m.undecodableJobs[jobID]
@@ -2504,6 +2550,11 @@ func (m *memStore) RecoverExpiredLease(ctx context.Context, jobID string, expect
 	j.LeaseTokenHash = nil
 	j.LeaseExpiresAt = nil
 	jobs[jobID] = j
+	// The expired lease releases its resource reservation in the same
+	// transaction, whether the job requeues or terminally fails (the
+	// corrupt-payload path releases it too: the row is keyed by job ID and
+	// needs no decoded request).
+	releaseReservationMap(reservations, jobID)
 	if err := m.recoveryBumpFor(&staged); err != nil {
 		return err
 	}
@@ -2552,6 +2603,7 @@ func (m *memStore) RecoverExpiredLease(ctx context.Context, jobID string, expect
 	m.runners = runners
 	m.runs = runs
 	m.quotas = quotas
+	m.reservations = reservations
 	m.audit = audit
 	return nil
 }
@@ -2666,6 +2718,7 @@ func (m *memStore) ExpireQueuedJob(ctx context.Context, jobID string, deadline t
 	jobs := cloneRecoveryJobs(m.jobs)
 	runs := cloneRecoveryRuns(m.runs)
 	quotas := cloneRecoveryQuotas(m.quotas)
+	reservations := cloneRecoveryReservations(m.reservations)
 	audit := append([]model.AuditEvent(nil), m.audit...)
 	staged := 0
 	reason := "queue timeout"
@@ -2683,6 +2736,10 @@ func (m *memStore) ExpireQueuedJob(ctx context.Context, jobID string, deadline t
 	j.LeaseTokenHash = nil
 	j.LeaseExpiresAt = nil
 	jobs[jobID] = j
+	// A queued job never acquired a resource reservation; the release is the
+	// documented idempotent no-op that keeps every terminal transition on
+	// one path.
+	releaseReservationMap(reservations, jobID)
 	if err := m.recoveryBumpFor(&staged); err != nil {
 		return err
 	}
@@ -2705,6 +2762,7 @@ func (m *memStore) ExpireQueuedJob(ctx context.Context, jobID string, deadline t
 	m.jobs = jobs
 	m.runs = runs
 	m.quotas = quotas
+	m.reservations = reservations
 	m.audit = audit
 	return nil
 }
@@ -4032,6 +4090,9 @@ func (m *memStore) InsertCompiledRun(ctx context.Context, req InsertCompiledRunR
 			cancelledRuns[st.job.RunID] = true
 		}
 		m.audit = append(m.audit, model.AuditEvent{ID: st.id + "|audit", Action: "job.superseded", Actor: "scheduler", RunID: st.job.RunID, JobID: st.id, Message: "cancelled", CreatedAt: now})
+		// The superseded job releases its resource reservation in the same
+		// step (idempotent no-op for queued jobs).
+		m.releaseReservationLocked(st.id)
 		if st.wasRunning {
 			m.adjustQuotaLocked(RepoIDForJob(st.job), -1, 0)
 			// A superseded running job releases its runner slot in the
@@ -4199,6 +4260,98 @@ func (m *memStore) claimQuotaLocked(repoID string, repoLimit, teamLimit float64)
 	return nil
 }
 
+// reservedResourcesLocked sums the live reservations of one runner (caller
+// holds m.mu). No reservation means zero on every dimension.
+func (m *memStore) reservedResourcesLocked(runnerID string) model.ResourceCapacity {
+	var out model.ResourceCapacity
+	for _, r := range m.reservations {
+		if r.RunnerID != runnerID {
+			continue
+		}
+		out.CPU += r.CPU
+		out.Memory += r.Memory
+		out.Disk += r.Disk
+		out.PIDs += r.PIDs
+	}
+	return out
+}
+
+// reserveResourcesLocked is the in-memory mirror of reserveResourcesTx: the
+// shared ResourceAdmission predicate over the runner's remaining capacity,
+// then the ledger row. It reports ErrResourceCapacity (wrapped with the
+// requested/reserved/capacity values) when the request does not fit. The
+// caller holds m.mu and has already passed every other claim predicate, so a
+// rejection leaves the job queued and the runner untouched.
+func (m *memStore) reserveResourcesLocked(claim LeaseClaim, capacity model.ResourceCapacity) error {
+	reserved := m.reservedResourcesLocked(claim.RunnerID)
+	admission := ResourceAdmission{Capacity: capacity, Reserved: reserved, Requested: claim.RequestedResources()}
+	if !admission.Allows() {
+		return fmt.Errorf("%w: runner %s requested cpu=%v memory=%d disk=%d pids=%d, reserved cpu=%v memory=%d disk=%d pids=%d, capacity cpu=%v memory=%d disk=%d pids=%d",
+			ErrResourceCapacity, claim.RunnerID,
+			claim.CPURequest, claim.MemoryRequest, claim.DiskRequest, claim.PIDsRequest,
+			reserved.CPU, reserved.Memory, reserved.Disk, reserved.PIDs,
+			capacity.CPU, capacity.Memory, capacity.Disk, capacity.PIDs)
+	}
+	// job_id is the primary key: replacing a stale row keeps at most one
+	// live reservation per job exactly like the SQL DELETE + INSERT.
+	m.reservations[claim.JobID] = ResourceReservation{
+		JobID: claim.JobID, RunnerID: claim.RunnerID, Generation: claim.Generation,
+		CPU: claim.CPURequest, Memory: claim.MemoryRequest, Disk: claim.DiskRequest, PIDs: claim.PIDsRequest,
+		CreatedAt: time.Now().UTC(),
+	}
+	return nil
+}
+
+// releaseReservationLocked deletes one job's reservation row (caller holds
+// m.mu). It is idempotent: a missing row is a no-op, and a job can hold at
+// most one row, so no path can double-release or leak.
+func (m *memStore) releaseReservationLocked(jobID string) {
+	delete(m.reservations, jobID)
+}
+
+// releaseReservationMap deletes one job's reservation from an overlay map,
+// mirroring releaseReservationLocked for the transactional recovery
+// methods.
+func releaseReservationMap(reservations map[string]ResourceReservation, jobID string) {
+	delete(reservations, jobID)
+}
+
+// cloneRecoveryReservations copies the reservation map for a transactional
+// recovery overlay.
+func cloneRecoveryReservations(in map[string]ResourceReservation) map[string]ResourceReservation {
+	out := make(map[string]ResourceReservation, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+// RunnerReservedResources implements ResourceReservationStore.
+func (m *memStore) RunnerReservedResources(ctx context.Context, runnerID string) (model.ResourceCapacity, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.reservedResourcesLocked(runnerID), nil
+}
+
+// ListResourceReservations implements ResourceReservationStore.
+func (m *memStore) ListResourceReservations(ctx context.Context, runnerID string) ([]ResourceReservation, error) {
+	if err := ValidateRunnerID(runnerID); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []ResourceReservation{}
+	for _, r := range m.reservations {
+		if r.RunnerID == runnerID {
+			out = append(out, r)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].JobID < out[j].JobID })
+	return out, nil
+}
+
+var _ ResourceReservationStore = (*memStore)(nil)
+
 // releaseRunnerSlotLocked splices one job ID out of a runner's active set
 // and recomputes busy/current_job (caller holds m.mu). Capacity 0 survives:
 // a zero-capacity runner is never busy.
@@ -4222,8 +4375,13 @@ func (m *memStore) releaseRunnerSlotLocked(runnerID, jobID string) {
 // incremented once, started_at stamped on the first lease only, live usage
 // rates frozen), the full claim predicate (disabled/draining, capacity > 0,
 // live profile repo ACL/capabilities/labels/region), the environment
-// concurrency reservation and the conditional queued->running quota
-// transition all commit or fail together under m.mu.
+// concurrency reservation, the resource check-and-reserve against the
+// runner's remaining capacity and the conditional queued->running quota
+// transition all commit or fail together under m.mu. Memory mode is
+// single-process: the reservation guarantees capacity within this process,
+// which is exactly the documented memory-mode semantics; HA deployments run
+// the SQL store, where the runner row lock makes the same check atomic
+// across replicas.
 func (m *memStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim) (model.Job, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -4273,6 +4431,13 @@ func (m *memStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim) (mo
 		return model.Job{}, ErrNoCapacity
 	}
 	if err := m.claimQuotaLocked(RepoIDForJob(j), claim.RepoConcurrency, claim.TeamConcurrency); err != nil {
+		return model.Job{}, err
+	}
+	// Resource check-and-reserve: the effective runner carries the LIVE
+	// profile's capacities when linked (ResolveRunnerProfile overlays them),
+	// the registration snapshot otherwise. Zero dimensions are
+	// unconstrained, so capacity-less runners keep the count-only behavior.
+	if err := m.reserveResourcesLocked(claim, effective.ResourceCapacity); err != nil {
 		return model.Job{}, err
 	}
 	now := time.Now().UTC()
@@ -5014,6 +5179,7 @@ func (m *memStore) DisableRunnerAndRevokeCert(ctx context.Context, runnerID, cer
 	runners := cloneRecoveryRunners(m.runners)
 	runs := cloneRecoveryRuns(m.runs)
 	quotas := cloneRecoveryQuotas(m.quotas)
+	reservations := cloneRecoveryReservations(m.reservations)
 	audit := append([]model.AuditEvent(nil), m.audit...)
 	revocations := map[string]string{}
 	for k, v := range m.revocations {
@@ -5038,6 +5204,9 @@ func (m *memStore) DisableRunnerAndRevokeCert(ctx context.Context, runnerID, cer
 		j.LeaseTokenHash = nil
 		j.LeaseExpiresAt = nil
 		jobs[id] = j
+		// The invalidated lease releases its resource reservation in the
+		// same transaction (a requeued job holds none until re-leased).
+		releaseReservationMap(reservations, id)
 		if err := m.recoveryBumpFor(&staged); err != nil {
 			return 0, err
 		}
@@ -5101,6 +5270,7 @@ func (m *memStore) DisableRunnerAndRevokeCert(ctx context.Context, runnerID, cer
 		return 0, err
 	}
 	m.jobs, m.runners, m.runs, m.quotas = jobs, runners, runs, quotas
+	m.reservations = reservations
 	m.audit, m.revocations = audit, revocations
 	return len(ids), nil
 }

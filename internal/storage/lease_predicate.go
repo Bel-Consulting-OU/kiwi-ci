@@ -81,7 +81,9 @@ func (p LeasePredicate) Allows() bool {
 // ResolveRunnerProfile overlays a linked profile's live scheduling
 // attributes onto the runner's registration snapshot. linked=false (or a
 // zero profile) returns the runner unchanged, so unlinked runners keep their
-// registration attributes.
+// registration attributes. The profile's resource capacities (migration
+// 0030) replace the snapshot's the same way; a zero profile dimension is
+// unconstrained.
 func ResolveRunnerProfile(r model.Runner, profile model.RunnerProfile, linked bool) model.Runner {
 	if !linked {
 		return r
@@ -91,6 +93,7 @@ func ResolveRunnerProfile(r model.Runner, profile model.RunnerProfile, linked bo
 	r.AllowedRepositories = append([]string(nil), profile.Repositories...)
 	r.Capabilities = append([]string(nil), profile.Capabilities...)
 	r.Capacity = profile.MaxCapacity
+	r.ResourceCapacity = model.ResourceCapacityFromProfile(profile)
 	r.CostPerHour = profile.CostPerHour
 	r.PowerWatts = profile.PowerWatts
 	return r

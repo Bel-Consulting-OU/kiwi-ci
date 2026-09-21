@@ -83,6 +83,15 @@ type Snapshot struct {
 	// certificate. Additive; older snapshots load with a nil map and the
 	// legacy runner-crl.json file is merged in by the server.
 	CRL map[string]string `json:"crl,omitempty"`
+	// PendingSidecars persists the fs-mode pending SBOM/Sigstore pointers
+	// (the artifact_pending_sidecars equivalents) so a restarted control
+	// plane resolves the exact digest that was accepted before the restart
+	// instead of guessing between the generation directory's candidate
+	// files. Additive; older snapshots load with a nil slice, and exactly
+	// one unambiguous on-disk file per identity remains resolvable as
+	// legacy state (multiple candidates with no pointer fail closed).
+	// See pending_sidecar_snapshot.go.
+	PendingSidecars []PendingSidecarPointer `json:"pending_sidecars,omitempty"`
 }
 
 type Repository struct {
