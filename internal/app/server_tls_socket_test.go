@@ -20,13 +20,16 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -505,6 +508,44 @@ func (r *trickleReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// leaseArtifactJob registers a runner, submits a run whose pipeline declares
+// the "bin" artifact, leases the job, and returns the runner plus the lease
+// contract required for artifact uploads on the real listener.
+func leaseArtifactJob(t *testing.T, client *http.Client, base, token string) (model.Runner, string, string, int64) {
+	t.Helper()
+	resp, body := doSocketJSON(t, client, http.MethodPost, base+"/api/v1/runners/register", token,
+		`{"name":"slow-runner","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("register = %d %s, want 200", resp.StatusCode, body)
+	}
+	var runner model.Runner
+	if err := json.Unmarshal(body, &runner); err != nil {
+		t.Fatal(err)
+	}
+	submit := `{"repo_url":"https://example.com/o/r.git","repo_full_name":"o/r","ref":"refs/heads/main","sha":"abc","event":"push","pipeline":` +
+		jsonString(t, socketArtifactPipeline) + `}`
+	resp, body = doSocketJSON(t, client, http.MethodPost, base+"/api/v1/runs", token, submit)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("submit = %d %s, want 202", resp.StatusCode, body)
+	}
+	resp, body = doSocketJSON(t, client, http.MethodPost, base+"/api/v1/runners/"+runner.ID+"/next", token, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("lease = %d %s, want 200", resp.StatusCode, body)
+	}
+	var task struct {
+		Job             model.Job `json:"job"`
+		LeaseToken      string    `json:"lease_token"`
+		LeaseGeneration int64     `json:"lease_generation"`
+	}
+	if err := json.Unmarshal(body, &task); err != nil {
+		t.Fatal(err)
+	}
+	if task.Job.ID == "" {
+		t.Fatalf("lease returned no job: %s", body)
+	}
+	return runner, task.Job.ID, task.LeaseToken, task.LeaseGeneration
+}
+
 // TestSlowUploadStreamingDeadlinePolicy proves the P2 fix on the real server:
 // a multi-second chunked artifact upload (the up-to-8-GiB streaming class,
 // internal/server/blobs.go maxBlobBytes) succeeds while a JSON API body
@@ -531,51 +572,20 @@ func TestSlowUploadStreamingDeadlinePolicy(t *testing.T) {
 
 	base := "http://" + addr
 	client := &http.Client{Timeout: 30 * time.Second}
-
-	// Register a runner and lease a job whose pipeline declares the artifact.
-	resp, body := doSocketJSON(t, client, http.MethodPost, base+"/api/v1/runners/register", "tok",
-		`{"name":"slow-runner","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("register = %d %s, want 200", resp.StatusCode, body)
-	}
-	var runner model.Runner
-	if err := json.Unmarshal(body, &runner); err != nil {
-		t.Fatal(err)
-	}
-	submit := `{"repo_url":"https://example.com/o/r.git","repo_full_name":"o/r","ref":"refs/heads/main","sha":"abc","event":"push","pipeline":` +
-		jsonString(t, socketArtifactPipeline) + `}`
-	resp, body = doSocketJSON(t, client, http.MethodPost, base+"/api/v1/runs", "tok", submit)
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("submit = %d %s, want 202", resp.StatusCode, body)
-	}
-	resp, body = doSocketJSON(t, client, http.MethodPost, base+"/api/v1/runners/"+runner.ID+"/next", "tok", "")
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("lease = %d %s, want 200", resp.StatusCode, body)
-	}
-	var task struct {
-		Job             model.Job `json:"job"`
-		LeaseToken      string    `json:"lease_token"`
-		LeaseGeneration int64     `json:"lease_generation"`
-	}
-	if err := json.Unmarshal(body, &task); err != nil {
-		t.Fatal(err)
-	}
-	if task.Job.ID == "" {
-		t.Fatalf("lease returned no job: %s", body)
-	}
+	runner, jobID, leaseToken, leaseGeneration := leaseArtifactJob(t, client, base, "tok")
 
 	// The streaming-exempt artifact upload: ~1s of trickled chunks, twice the
 	// shrunk 500ms bound.
 	uploadStart := time.Now()
-	upReq, err := http.NewRequest(http.MethodPut, base+"/api/v1/jobs/"+task.Job.ID+"/artifacts/bin",
+	upReq, err := http.NewRequest(http.MethodPut, base+"/api/v1/jobs/"+jobID+"/artifacts/bin",
 		newTrickleReader(8, 6, 200*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)
 	}
 	upReq.Header.Set("Authorization", "Bearer tok")
 	upReq.Header.Set("X-Kiwi-Runner-ID", runner.ID)
-	upReq.Header.Set("X-Kiwi-Lease-Token", task.LeaseToken)
-	upReq.Header.Set("X-Kiwi-Lease-Generation", strconv.FormatInt(task.LeaseGeneration, 10))
+	upReq.Header.Set("X-Kiwi-Lease-Token", leaseToken)
+	upReq.Header.Set("X-Kiwi-Lease-Generation", strconv.FormatInt(leaseGeneration, 10))
 	upResp, err := client.Do(upReq)
 	if err != nil {
 		t.Fatalf("slow artifact upload failed at the transport: %v", err)
@@ -649,6 +659,281 @@ func TestStreamingDeadlineStalledHeaderDropped(t *testing.T) {
 		t.Fatalf("stalled header connection was served: %d", resp.StatusCode)
 	}
 	t.Logf("header stall answered with %d, not served", resp.StatusCode)
+}
+
+// TestKeepAliveStreamClearsInheritedDeadlines is the HTTP/1.1 keep-alive
+// regression for the connection-deadline leak: the first (ordinary) request
+// on a connection leaves absolute read/write deadlines on it, and the SAME
+// connection then runs a deliberately slow streaming upload that outlives
+// those deadlines. It must complete 201 because the streaming branch clears
+// both deadlines before dispatch. No client pooling is involved: raw net.Dial
+// plus manual chunked framing.
+func TestKeepAliveStreamClearsInheritedDeadlines(t *testing.T) {
+	prevRead, prevWrite := apiReadDeadline, apiWriteDeadline
+	apiReadDeadline, apiWriteDeadline = 400*time.Millisecond, 400*time.Millisecond
+	t.Cleanup(func() { apiReadDeadline, apiWriteDeadline = prevRead, prevWrite })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	addr, errCh := startServerEphemeral(t, ctx, "--runner-token", "tok", "--data-dir", t.TempDir())
+	defer func() {
+		if err := stopServer(t, cancel, errCh); err != nil {
+			t.Fatalf("Server returned %v", err)
+		}
+	}()
+
+	base := "http://" + addr
+	client := &http.Client{Timeout: 15 * time.Second}
+	runner, jobID, leaseToken, leaseGeneration := leaseArtifactJob(t, client, base, "tok")
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	br := bufio.NewReader(conn)
+
+	// Request 1: an ordinary API route. Its response completes, but the
+	// middleware's absolute deadlines stay on the connection.
+	if _, err := fmt.Fprintf(conn, "GET /readiness HTTP/1.1\r\nHost: kiwi\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("readiness on raw connection: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("readiness = %d, want 200", resp.StatusCode)
+	}
+
+	// Let the first request's absolute deadlines expire before the stream.
+	time.Sleep(700 * time.Millisecond)
+
+	// Request 2: a slow streaming PUT on the SAME connection, ~1.5s > the
+	// 400ms ordinary deadlines.
+	head := fmt.Sprintf("PUT /api/v1/jobs/%s/artifacts/bin HTTP/1.1\r\nHost: kiwi\r\n"+
+		"Authorization: Bearer tok\r\n"+
+		"X-Kiwi-Runner-ID: %s\r\n"+
+		"X-Kiwi-Lease-Token: %s\r\n"+
+		"X-Kiwi-Lease-Generation: %d\r\n"+
+		"Content-Type: application/gzip\r\n"+
+		"Transfer-Encoding: chunked\r\n\r\n",
+		jobID, runner.ID, leaseToken, leaseGeneration)
+	if _, err := io.WriteString(conn, head); err != nil {
+		t.Fatal(err)
+	}
+	streamUntil := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(streamUntil) {
+		if _, err := io.WriteString(conn, "4\r\nkiwi\r\n"); err != nil {
+			t.Fatalf("slow stream on the reused keep-alive connection was cut (inherited deadlines leaked?): %v", err)
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	if _, err := io.WriteString(conn, "0\r\n\r\n"); err != nil {
+		t.Fatalf("final chunk on the reused connection: %v", err)
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	streamResp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("streaming response on the reused connection failed (inherited deadlines leaked?): %v", err)
+	}
+	streamBody, _ := io.ReadAll(io.LimitReader(streamResp.Body, 1<<20))
+	streamResp.Body.Close()
+	if streamResp.StatusCode != http.StatusCreated {
+		t.Fatalf("slow stream on the reused connection = %d %s, want 201", streamResp.StatusCode, streamBody)
+	}
+}
+
+// stallAfterFirstRead sends one small chunk and then stalls long past any
+// (test-shrunk) idle bound before completing, forcing the server-side sliding
+// read deadline to fire.
+type stallAfterFirstRead struct {
+	sent bool
+}
+
+func (b *stallAfterFirstRead) Read(p []byte) (int, error) {
+	if !b.sent {
+		b.sent = true
+		return copy(p, "kiwi"), nil
+	}
+	time.Sleep(2 * time.Second)
+	return 0, io.EOF
+}
+
+// TestStreamingStalledUploadDroppedByIdleBound proves the sliding bound is a
+// real bound: an upload that sends some bytes and then stops is terminated
+// (never accepted with 201) well before its stall ends.
+func TestStreamingStalledUploadDroppedByIdleBound(t *testing.T) {
+	prevIdle := streamIdleTimeout
+	streamIdleTimeout = 250 * time.Millisecond
+	t.Cleanup(func() { streamIdleTimeout = prevIdle })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	addr, errCh := startServerEphemeral(t, ctx, "--runner-token", "tok", "--data-dir", t.TempDir())
+	defer func() {
+		if err := stopServer(t, cancel, errCh); err != nil {
+			t.Fatalf("Server returned %v", err)
+		}
+	}()
+
+	base := "http://" + addr
+	client := &http.Client{Timeout: 15 * time.Second}
+	runner, jobID, leaseToken, leaseGeneration := leaseArtifactJob(t, client, base, "tok")
+
+	req, err := http.NewRequest(http.MethodPut, base+"/api/v1/jobs/"+jobID+"/artifacts/bin", io.NopCloser(&stallAfterFirstRead{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.ContentLength = -1
+	req.Header.Set("Authorization", "Bearer tok")
+	req.Header.Set("X-Kiwi-Runner-ID", runner.ID)
+	req.Header.Set("X-Kiwi-Lease-Token", leaseToken)
+	req.Header.Set("X-Kiwi-Lease-Generation", strconv.FormatInt(leaseGeneration, 10))
+	req.Header.Set("Content-Type", "application/gzip")
+
+	start := time.Now()
+	resp, err := client.Do(req)
+	elapsed := time.Since(start)
+	if err == nil {
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		if resp.StatusCode == http.StatusCreated {
+			t.Fatalf("stalled upload was accepted: %d", resp.StatusCode)
+		}
+	}
+	if elapsed > 1500*time.Millisecond {
+		t.Fatalf("stalled upload survived the idle bound: %v elapsed", elapsed)
+	}
+}
+
+// TestStreamingContinuousUploadOutlivesIdleWindows proves the bound is
+// sliding, not absolute: a trickle whose every gap is below the idle bound
+// keeps resetting it, so the transfer completes even though its total
+// duration exceeds both the ordinary API deadlines and several idle windows.
+func TestStreamingContinuousUploadOutlivesIdleWindows(t *testing.T) {
+	prevRead, prevWrite, prevIdle := apiReadDeadline, apiWriteDeadline, streamIdleTimeout
+	apiReadDeadline, apiWriteDeadline, streamIdleTimeout = 300*time.Millisecond, 300*time.Millisecond, 400*time.Millisecond
+	t.Cleanup(func() { apiReadDeadline, apiWriteDeadline, streamIdleTimeout = prevRead, prevWrite, prevIdle })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	addr, errCh := startServerEphemeral(t, ctx, "--runner-token", "tok", "--data-dir", t.TempDir())
+	defer func() {
+		if err := stopServer(t, cancel, errCh); err != nil {
+			t.Fatalf("Server returned %v", err)
+		}
+	}()
+
+	base := "http://" + addr
+	client := &http.Client{Timeout: 15 * time.Second}
+	runner, jobID, leaseToken, leaseGeneration := leaseArtifactJob(t, client, base, "tok")
+
+	// 12 chunks, one every 120ms: ~1.44s total, three-plus idle windows,
+	// with every individual gap well inside one window.
+	req, err := http.NewRequest(http.MethodPut, base+"/api/v1/jobs/"+jobID+"/artifacts/bin",
+		newTrickleReader(8, 12, 120*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer tok")
+	req.Header.Set("X-Kiwi-Runner-ID", runner.ID)
+	req.Header.Set("X-Kiwi-Lease-Token", leaseToken)
+	req.Header.Set("X-Kiwi-Lease-Generation", strconv.FormatInt(leaseGeneration, 10))
+	req.Header.Set("Content-Type", "application/gzip")
+
+	start := time.Now()
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("continuous slow upload failed at the transport: %v", err)
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	resp.Body.Close()
+	if elapsed := time.Since(start); elapsed < 800*time.Millisecond {
+		t.Fatalf("upload finished in %v; it never streamed past the idle window", elapsed)
+	}
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("continuous slow upload = %d %s, want 201", resp.StatusCode, body)
+	}
+}
+
+// deadlineRecordingWriter observes the deadline operations the middleware
+// performs on its ResponseWriter. ResponseController discovers the
+// Set{Read,Write}Deadline methods directly, so this is the exact seam the
+// production net.Conn exposes.
+type deadlineRecordingWriter struct {
+	http.ResponseWriter
+	readClears  int
+	writeClears int
+	readArms    int
+	writeArms   int
+	lastRead    time.Time
+	lastWrite   time.Time
+}
+
+func (d *deadlineRecordingWriter) SetReadDeadline(t time.Time) error {
+	if t.IsZero() {
+		d.readClears++
+	} else {
+		d.readArms++
+		d.lastRead = t
+	}
+	return nil
+}
+
+func (d *deadlineRecordingWriter) SetWriteDeadline(t time.Time) error {
+	if t.IsZero() {
+		d.writeClears++
+	} else {
+		d.writeArms++
+		d.lastWrite = t
+	}
+	return nil
+}
+
+func (d *deadlineRecordingWriter) Flush() {}
+
+// TestStreamingBranchClearsInheritedDeadlines pins the exact S1-B fix at the
+// middleware seam: on a streaming route both connection deadlines must be
+// cleared before dispatch (a reused connection must never run the stream
+// under the previous request's deadlines), and the sliding idle bound must
+// re-arm the write deadline after a Write and the read deadline after a body
+// Read. This fails against the pre-fix middleware, which dispatched the
+// stream without touching either deadline.
+func TestStreamingBranchClearsInheritedDeadlines(t *testing.T) {
+	prevRead, prevWrite, prevIdle := apiReadDeadline, apiWriteDeadline, streamIdleTimeout
+	apiReadDeadline, apiWriteDeadline = 5*time.Minute, 5*time.Minute
+	streamIdleTimeout = 3 * time.Second
+	t.Cleanup(func() { apiReadDeadline, apiWriteDeadline, streamIdleTimeout = prevRead, prevWrite, prevIdle })
+
+	h := withAPIDeadlines(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := w.Write([]byte("answer")); err != nil {
+			t.Errorf("stream write: %v", err)
+		}
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			t.Errorf("stream body read: %v", err)
+		}
+	}))
+	rec := &deadlineRecordingWriter{ResponseWriter: httptest.NewRecorder()}
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/jobs/job-1/artifacts/bin", strings.NewReader("chunk"))
+	h.ServeHTTP(rec, req)
+
+	if rec.readClears == 0 {
+		t.Fatal("streaming branch did not clear the inherited read deadline")
+	}
+	if rec.writeClears == 0 {
+		t.Fatal("streaming branch did not clear the inherited write deadline")
+	}
+	if rec.readArms == 0 || rec.writeArms == 0 {
+		t.Fatalf("streaming branch did not arm the sliding deadlines: read arms=%d write arms=%d", rec.readArms, rec.writeArms)
+	}
+	if until := time.Until(rec.lastWrite); until <= time.Second || until > 4*time.Second {
+		t.Fatalf("write deadline re-armed at %v from now, want ~%v", until, streamIdleTimeout)
+	}
+	if until := time.Until(rec.lastRead); until <= time.Second || until > 4*time.Second {
+		t.Fatalf("read deadline re-armed at %v from now, want ~%v", until, streamIdleTimeout)
+	}
 }
 
 // jsonString marshals a string as a JSON literal for embedding in a request

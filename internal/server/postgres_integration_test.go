@@ -176,6 +176,22 @@ func pgITServerAwaitLeadership(t *testing.T, s *Server) {
 	}
 }
 
+// pgITSrvArmFence makes st present the durable current leadership epoch, so
+// leader-fenced store operations (recovery, outbox claim/ack/release, GC,
+// reservation expiry, CAS GC) are admissible. A real leader's store retains
+// exactly this value from its own acquisition; tests that drive two replicas
+// through the same leader-only store path arm the second replica here rather
+// than taking the database-wide advisory lock twice.
+func pgITSrvArmFence(t *testing.T, st *storage.PostgresStore) int64 {
+	t.Helper()
+	epoch, err := st.ReadLeaderEpoch(context.Background())
+	if err != nil {
+		t.Fatalf("read leader epoch: %v", err)
+	}
+	st.SetLeaderEpoch(epoch)
+	return epoch
+}
+
 // pgITDo serves one request against the server handler.
 func pgITDo(t *testing.T, s *Server, method, path, bearer, body string, headers map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
@@ -492,6 +508,8 @@ func TestPostgresIntegrationServerOutboxCancelledFlushReleasesClaims(t *testing.
 	env := pgITServerSetup(t)
 	stA := env.open(t)
 	stB := env.open(t)
+	pgITSrvArmFence(t, stA)
+	pgITSrvArmFence(t, stB)
 	ctx := context.Background()
 	base := time.Now().UTC().Add(-time.Minute)
 	for i, id := range []string{"pg-ctx-a", "pg-ctx-b", "pg-ctx-c", "pg-ctx-d"} {

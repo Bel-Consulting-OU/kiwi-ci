@@ -37,7 +37,7 @@ func TestCRLRevocationRejectsPeerCert(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("disable = %d: %s", w.Code, w.Body.String())
 	}
-	if !s.certSerialRevoked(serial) {
+	if !crlRevoked(t, s, serial) {
 		t.Fatal("serial not recorded in the CRL")
 	}
 	req2 := httptest.NewRequest(http.MethodPost, "/", nil)
@@ -71,7 +71,7 @@ func TestCRLPersistsAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !s2.certSerialRevoked("0c0ffee") {
+	if !crlRevoked(t, s2, "0c0ffee") {
 		t.Fatal("CRL not restored from runner-crl.json")
 	}
 }

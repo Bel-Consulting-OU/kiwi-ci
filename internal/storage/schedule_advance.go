@@ -13,6 +13,10 @@ import (
 // occurrence that another replica already passed is a no-op. An unknown
 // schedule reports ErrNotFound.
 //
+// Advancing the marker is part of leader-only schedule firing, so it runs in a
+// transaction FENCED by the store's leadership epoch: a stale leader advances
+// nothing (ErrStaleLeader).
+//
 // It lives beside the rest of the package's durable-advance contract rather
 // than in postgres.go so the monotonic semantics stay in one auditable
 // place; postgres.go holds the remaining ScheduleStore methods.
@@ -20,7 +24,12 @@ func (s *PostgresStore) AdvanceScheduleLastRun(ctx context.Context, id string, n
 	if id == "" {
 		return fmt.Errorf("storage: empty schedule id")
 	}
-	ct, err := s.pool.Exec(ctx,
+	tx, err := s.beginFencedTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	ct, err := tx.Exec(ctx,
 		`UPDATE schedules SET last_run = GREATEST(COALESCE(last_run, 'epoch'::timestamptz), $2) WHERE id=$1`,
 		id, nominal.UTC())
 	if err != nil {
@@ -29,5 +38,5 @@ func (s *PostgresStore) AdvanceScheduleLastRun(ctx context.Context, id string, n
 	if ct.RowsAffected() == 0 {
 		return ErrNotFound
 	}
-	return nil
+	return tx.Commit(ctx)
 }

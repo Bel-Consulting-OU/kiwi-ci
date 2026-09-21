@@ -27,9 +27,17 @@ type injectedStore struct {
 	heartbeatHook    func()
 	cancelRunErr     error
 	listRunsErr      error
+	listExpiredErr   error
+	listQueueTOErr   error
 	profileErr       error
 	acquireLeaseHook func(jobID string) error
+	recoverHook      func(jobID string) error
+	expireHook       func(jobID string) error
 	clearStartedAt   bool
+
+	// Discovery call counters prove the sweep pages (and how often).
+	listExpiredCalls int
+	listQueueTOCalls int
 }
 
 func newInjectedStore() *injectedStore {
@@ -100,6 +108,44 @@ func (s *injectedStore) ListRuns(ctx context.Context, limit int) ([]model.Run, e
 		return nil, s.listRunsErr
 	}
 	return s.fakeStore.ListRuns(ctx, limit)
+}
+
+func (s *injectedStore) ListExpiredRunningJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]model.Job, error) {
+	s.listExpiredCalls++
+	if s.listExpiredErr != nil {
+		return nil, s.listExpiredErr
+	}
+	return s.fakeStore.ListExpiredRunningJobs(ctx, now, afterID, limit)
+}
+
+func (s *injectedStore) ListQueueTimedOutJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]model.Job, error) {
+	s.listQueueTOCalls++
+	if s.listQueueTOErr != nil {
+		return nil, s.listQueueTOErr
+	}
+	return s.fakeStore.ListQueueTimedOutJobs(ctx, now, afterID, limit)
+}
+
+// RecoverExpiredLease lets a test fail ONE candidate persistently while the
+// others in the same sweep recover, proving the sweep's cursor advances past
+// a failed apply.
+func (s *injectedStore) RecoverExpiredLease(ctx context.Context, jobID string, expectedGeneration int64, now time.Time) error {
+	if s.recoverHook != nil {
+		if err := s.recoverHook(jobID); err != nil {
+			return err
+		}
+	}
+	return s.fakeStore.RecoverExpiredLease(ctx, jobID, expectedGeneration, now)
+}
+
+// ExpireQueuedJob is the queue-timeout counterpart of the recover hook.
+func (s *injectedStore) ExpireQueuedJob(ctx context.Context, jobID string, deadline time.Time) error {
+	if s.expireHook != nil {
+		if err := s.expireHook(jobID); err != nil {
+			return err
+		}
+	}
+	return s.fakeStore.ExpireQueuedJob(ctx, jobID, deadline)
 }
 
 func (s *injectedStore) ProfileForSerial(ctx context.Context, serial string) (model.RunnerProfile, bool, error) {
@@ -529,26 +575,23 @@ func TestRecoverExpiredErrorPaths(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
 
-	t.Run("list runs failure", func(t *testing.T) {
+	t.Run("expired lease discovery failure", func(t *testing.T) {
 		st := newInjectedStore()
 		st.leaderOK = true
-		st.listRunsErr = errors.New("run listing failed")
+		st.listExpiredErr = errors.New("lease discovery failed")
 		s := NewDB(st, time.Second, nil, nil)
-		if err := s.RecoverExpired(ctx, now); err == nil || !strings.Contains(err.Error(), "run listing failed") {
+		if err := s.RecoverExpired(ctx, now); err == nil || !strings.Contains(err.Error(), "lease discovery failed") {
 			t.Fatalf("error = %v", err)
 		}
 	})
 
-	t.Run("run job listing failure", func(t *testing.T) {
+	t.Run("queue-timeout discovery failure", func(t *testing.T) {
 		st := newInjectedStore()
 		st.leaderOK = true
-		if err := st.InsertRun(ctx, model.Run{ID: "run-1", Status: model.StatusRunning, CreatedAt: now}); err != nil {
-			t.Fatal(err)
-		}
-		st.listByRunErr = errors.New("job listing failed")
+		st.listQueueTOErr = errors.New("queue discovery failed")
 		s := NewDB(st, time.Second, nil, nil)
-		if err := s.RecoverExpired(ctx, now); err != nil {
-			t.Fatalf("a single run listing failure must be logged and skipped: %v", err)
+		if err := s.RecoverExpired(ctx, now); err == nil || !strings.Contains(err.Error(), "queue discovery failed") {
+			t.Fatalf("error = %v", err)
 		}
 	})
 
@@ -611,6 +654,89 @@ func TestRecoverExpiredErrorPaths(t *testing.T) {
 			t.Fatalf("recover calls = %d, want 2 per pass x 2 passes", len(st.recoverCalls))
 		}
 	})
+}
+
+// TestRecoverExpiredPagesBoundedCandidatesAndAdvancesPastFailures drives the
+// sweep with a page size smaller than the candidate set and one candidate
+// whose applier fails on every attempt: every page must be visited, the
+// failed row must not stall the candidates behind it, and the later
+// candidates must be recovered exactly once. The queue-timeout sweep gets the
+// same treatment.
+func TestRecoverExpiredPagesBoundedCandidatesAndAdvancesPastFailures(t *testing.T) {
+	oldPage := recoveryPageSize
+	recoveryPageSize = 2
+	t.Cleanup(func() { recoveryPageSize = oldPage })
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	expired := now.Add(-time.Minute)
+
+	st := newInjectedStore()
+	st.leaderOK = true
+	st.putRun(model.Run{ID: "run-1", Status: model.StatusRunning, CreatedAt: now})
+	for _, id := range []string{"job-a", "job-b", "job-c", "job-d", "job-e"} {
+		st.putJob(model.Job{ID: id, RunID: "run-1", Key: id, Status: model.StatusRunning, LeaseRunnerID: "runner-1", LeaseGeneration: 1, LeaseExpiresAt: &expired, Attempts: 5, MaxInfraRetries: 0})
+	}
+	for _, id := range []string{"q-a", "q-b", "q-c", "q-d", "q-e"} {
+		dl := expired
+		st.putJob(model.Job{ID: id, RunID: "run-1", Key: id, Status: model.StatusQueued, QueueDeadline: &dl})
+	}
+	st.recoverHook = func(jobID string) error {
+		if jobID == "job-a" {
+			return errors.New("persistently failing candidate")
+		}
+		return nil
+	}
+	st.expireHook = func(jobID string) error {
+		if jobID == "q-a" {
+			return errors.New("persistently failing queue candidate")
+		}
+		return nil
+	}
+	s := NewDB(st, time.Second, nil, nil)
+	if err := s.RecoverExpired(ctx, now); err != nil {
+		t.Fatalf("RecoverExpired: %v", err)
+	}
+
+	// Every page was requested: 5 candidates at page size 2 = 3 pages
+	// (2+2+1) per sweep.
+	if st.listExpiredCalls != 3 || st.listQueueTOCalls != 3 {
+		t.Fatalf("discovery pages = %d lease / %d queue, want 3/3", st.listExpiredCalls, st.listQueueTOCalls)
+	}
+	for _, id := range []string{"job-b", "job-c", "job-d", "job-e"} {
+		j, ok := st.job(id)
+		if !ok || j.Status != model.StatusFailure {
+			t.Fatalf("lease candidate %s after sweep = %+v, want failure", id, j)
+		}
+	}
+	if j, _ := st.job("job-a"); j.Status != model.StatusRunning {
+		t.Fatalf("persistently failing candidate = %+v, want still running", j)
+	}
+	for _, id := range []string{"q-b", "q-c", "q-d", "q-e"} {
+		j, ok := st.job(id)
+		if !ok || j.Status != model.StatusCancelled || j.Error != "queue timeout" {
+			t.Fatalf("queue candidate %s after sweep = %+v, want cancelled/queue timeout", id, j)
+		}
+	}
+	if j, _ := st.job("q-a"); j.Status != model.StatusQueued {
+		t.Fatalf("persistently failing queue candidate = %+v, want still queued", j)
+	}
+
+	// A second sweep revisits the failed rows from the start (their ids are
+	// below the cursor of the previous sweep) and touches nothing else: one
+	// short page per sweep, lease and queue.
+	if err := s.RecoverExpired(ctx, now); err != nil {
+		t.Fatalf("replayed RecoverExpired: %v", err)
+	}
+	if st.listExpiredCalls != 4 || st.listQueueTOCalls != 4 {
+		t.Fatalf("replayed discovery pages = %d lease / %d queue, want 4/4", st.listExpiredCalls, st.listQueueTOCalls)
+	}
+	for _, id := range []string{"job-b", "job-c", "job-d", "job-e", "q-b", "q-c", "q-d", "q-e"} {
+		j, _ := st.job(id)
+		if j.Status == model.StatusRunning || j.Status == model.StatusQueued {
+			t.Fatalf("candidate %s was recovered twice: %+v", id, j)
+		}
+	}
 }
 
 func TestAppendUniqueAndCloneMap(t *testing.T) {

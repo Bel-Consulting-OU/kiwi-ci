@@ -39,29 +39,40 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 	rep.JobID = j.ID
 	rep.JobKey = j.Key
 	rep.CreatedAt = time.Now().UTC()
-	repo := ""
-	if s.DB != nil {
-		if run, gerr := s.DB.GetRun(r.Context(), j.RunID); gerr == nil {
-			repo = repoIDForRun(run)
-		}
-	} else {
-		s.mu.Lock()
-		if run, ok := s.runs[j.RunID]; ok {
-			repo = repoIDForRun(run)
-		}
-		s.mu.Unlock()
+	// The report's history key is the run's canonical repository identity.
+	// The authoritative lookup is never best-effort: a failed or missing run
+	// fails the upload closed BEFORE the durable report insert and the
+	// history write, so history can never be recorded under an empty repo
+	// key that merges unrelated repositories.
+	run, ok := s.requireRunIdentity(w, r, j.RunID)
+	if !ok {
+		return
 	}
+	repo := repoIDForRun(run)
 	for _, c := range rep.Cases {
 		s.metricObserve("kiwi_test_duration_seconds", c.Duration, nil)
 	}
-	// The durable report commits FIRST; the test-history update follows in
-	// the same flow so a failed history write can never lose the report.
+	// The durable report and the test-history aggregates commit in ONE
+	// transaction: an aggregate-store upload writes the report, folds ONLY
+	// this report's cases into the per-repository aggregates and bumps the
+	// repository version atomically, so per-upload work never grows with the
+	// accumulated history and a canceled request commits nothing. A store
+	// without the incremental contract falls back to the legacy insert +
+	// full-rebuild maintenance path (never taken by PostgresStore).
 	if s.DB != nil {
-		if err := s.DB.InsertTestReport(r.Context(), rep); err != nil {
-			s.internalError(w, r, err, "")
-			return
+		if agg, ok := s.DB.(storage.TestHistoryAggregateStore); ok {
+			if _, err := agg.InsertTestReportWithHistory(r.Context(), rep, repo); err != nil {
+				s.internalError(w, r, err, "")
+				return
+			}
+			s.mirrorTestReportHistoryDB(repo, rep)
+		} else {
+			if err := s.DB.InsertTestReport(r.Context(), rep); err != nil {
+				s.internalError(w, r, err, "")
+				return
+			}
+			s.recordTestReportHistory(r.Context(), repo, rep)
 		}
-		s.recordTestReportHistory(repo, rep)
 		s.auditLocked("tests.uploaded", in.RunnerID, j.RunID, j.ID, "test report uploaded", map[string]string{"job": j.Key, "tests": strconv.Itoa(rep.Tests), "failures": strconv.Itoa(rep.Failures)})
 		writeJSON(w, http.StatusCreated, rep)
 		return
@@ -79,7 +90,7 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Unlock()
-	s.recordTestReportHistory(repo, rep)
+	s.recordTestReportHistory(r.Context(), repo, rep)
 	s.auditLocked("tests.uploaded", in.RunnerID, j.RunID, j.ID, "test report uploaded", map[string]string{"job": j.Key, "tests": strconv.Itoa(rep.Tests), "failures": strconv.Itoa(rep.Failures)})
 	writeJSON(w, http.StatusCreated, rep)
 }
@@ -126,6 +137,14 @@ func (s *Server) listTestReports(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// testHistoryRepoResolveLimit bounds how many canonical repository IDs one
+// test-intelligence query may resolve to (deterministic id order).
+const testHistoryRepoResolveLimit = 64
+
+// testHistoryFlakyLimit bounds the flaky-test list returned by
+// test-intelligence (deterministic rendered-name order before the bound).
+const testHistoryFlakyLimit = 1000
+
 // testIntelligence reports flaky-test history and report volume for one
 // repository. The repo query parameter is required and accepts the
 // human-readable full name, the canonical RepoID or the legacy canonical
@@ -148,7 +167,50 @@ func (s *Server) testIntelligence(w http.ResponseWriter, r *http.Request) {
 	}
 	historyKeys := map[string]bool{repo: true}
 	if s.DB != nil {
-		s.syncTestHistoryDB(r.Context())
+		// Incremental path: resolve the query to canonical repository IDs
+		// with one bounded set-based run query, then read ONLY those
+		// repositories' aggregates and report totals. Unrelated reports are
+		// never materialized and their payloads are never parsed.
+		if agg, ok := s.DB.(storage.TestHistoryAggregateStore); ok {
+			ids, err := agg.ResolveTestHistoryRepoIDs(r.Context(), repo, testHistoryRepoResolveLimit)
+			if err != nil {
+				s.internalError(w, r, err, "")
+				return
+			}
+			// Lazy repair: repositories whose aggregates predate migration
+			// 0026 are rebuilt once from their durable reports (explicit
+			// bounded maintenance), never per upload.
+			for _, id := range ids {
+				if r.Context().Err() != nil {
+					break
+				}
+				if _, _, err := s.loadRepoHistoryWithRepair(r.Context(), agg, id); err != nil {
+					s.logError("test history: repository repair failed", "repo", id, "error", err.Error())
+				}
+			}
+			reports, tests, failures, err := agg.TestReportTotals(r.Context(), ids, repo)
+			if err != nil {
+				s.internalError(w, r, err, "")
+				return
+			}
+			flaky, err := agg.FlakyTestNames(r.Context(), ids, testHistoryFlakyLimit)
+			if err != nil {
+				s.internalError(w, r, err, "")
+				return
+			}
+			if flaky == nil {
+				flaky = []string{}
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"repo":        repo,
+				"reports":     reports,
+				"total_tests": tests,
+				"failures":    failures,
+				"flaky_tests": flaky,
+			})
+			return
+		}
+		s.syncTestHistoryDBLegacy(r.Context())
 		reports, err := s.DB.ListTestReportsAll(r.Context())
 		if err != nil {
 			s.internalError(w, r, err, "")

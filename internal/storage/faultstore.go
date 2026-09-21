@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
@@ -33,6 +34,14 @@ type FaultyStore struct {
 	// a failing in-flight READ: an errored count is UNKNOWN and must never
 	// be treated as "zero active jobs, drained".
 	countRunningJobsErr error
+
+	// staleLeaderErr, when non-nil, makes every leader-FENCED operation
+	// return it before reaching Inner: the fault-injection analogue of a
+	// stale leadership epoch (storage.ErrStaleLeader). It is deliberately
+	// separate from FailAfter (whose counter models a mutation failing INSIDE
+	// the store) because the stale-epoch contract is "rejected before
+	// anything is touched".
+	staleLeaderErr error
 }
 
 // fail returns the injected error on the FailAfter-th mutating call and nil
@@ -47,6 +56,54 @@ func (f *FaultyStore) fail() error {
 		return f.Err
 	}
 	return nil
+}
+
+// FailFencedWith installs err (typically storage.ErrStaleLeader) as the
+// result of every leader-fenced operation without touching Inner, so tests
+// can prove the stale-leader fail-closed contract on the wrapper path too.
+// A nil err disables the injection.
+func (f *FaultyStore) FailFencedWith(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.staleLeaderErr = err
+}
+
+// fencedFail reports the injected stale-leader error, if any. It is checked
+// BEFORE fail() so the fence rejection never consumes a mutation fault.
+func (f *FaultyStore) fencedFail() error {
+	return f.staleLeaderErr
+}
+
+// LeaderFenceStore delegation. The wrapper's fence view is Inner's: when
+// Inner implements the contract (memStore, PostgresStore) its retained epoch
+// governs and every fenced call behaves exactly like the wrapped store. A
+// wrapper over a minimal Store that does not implement the contract reports
+// "no retained epoch" (0, false), which is the same fail-closed view the
+// wrapped store itself would present.
+func (f *FaultyStore) SetLeaderEpoch(epoch int64) {
+	if inner, ok := f.Inner.(LeaderFenceStore); ok {
+		inner.SetLeaderEpoch(epoch)
+	}
+}
+
+func (f *FaultyStore) LeaderEpoch() (int64, bool) {
+	if inner, ok := f.Inner.(LeaderFenceStore); ok {
+		return inner.LeaderEpoch()
+	}
+	return 0, false
+}
+
+func (f *FaultyStore) ClearLeaderEpoch() {
+	if inner, ok := f.Inner.(LeaderFenceStore); ok {
+		inner.ClearLeaderEpoch()
+	}
+}
+
+func (f *FaultyStore) ReadLeaderEpoch(ctx context.Context) (int64, error) {
+	if inner, ok := f.Inner.(LeaderFenceStore); ok {
+		return inner.ReadLeaderEpoch(ctx)
+	}
+	return 0, nil
 }
 
 // Mutations returns how many mutating calls have been attempted so far.
@@ -79,37 +136,42 @@ func errMissingInnerInterface(iface string) error {
 var _ Store = (*FaultyStore)(nil)
 
 var (
-	_ OutboxStore             = (*FaultyStore)(nil)
-	_ OutboxDeadLetterStore   = (*FaultyStore)(nil)
-	_ ForgeCheckStateStore    = (*FaultyStore)(nil)
-	_ ScheduleStore           = (*FaultyStore)(nil)
-	_ DeploymentStore         = (*FaultyStore)(nil)
-	_ SnapshotStore           = (*FaultyStore)(nil)
-	_ ArtifactContractStore   = (*FaultyStore)(nil)
-	_ QueueReasonStore        = (*FaultyStore)(nil)
-	_ DynamicStore            = (*FaultyStore)(nil)
-	_ DynamicStoreTx          = (*FaultyStore)(nil)
-	_ DownstreamStore         = (*FaultyStore)(nil)
-	_ UsageStore              = (*FaultyStore)(nil)
-	_ UsageOnceStore          = (*FaultyStore)(nil)
-	_ RunDownstreamStore      = (*FaultyStore)(nil)
-	_ ArtifactLookupStore     = (*FaultyStore)(nil)
-	_ RunnerJobStore          = (*FaultyStore)(nil)
-	_ RunEnqueueStore         = (*FaultyStore)(nil)
-	_ AtomicLeaseStore        = (*FaultyStore)(nil)
-	_ QuotaCounterStore       = (*FaultyStore)(nil)
-	_ CacheManifestStore      = (*FaultyStore)(nil)
-	_ ArtifactSidecarStore    = (*FaultyStore)(nil)
-	_ SecretClaimStore        = (*FaultyStore)(nil)
-	_ SecretClaimReleaser     = (*FaultyStore)(nil)
-	_ ProfileStore            = (*FaultyStore)(nil)
-	_ RunnerTokenStore        = (*FaultyStore)(nil)
-	_ CertRevocationStore     = (*FaultyStore)(nil)
-	_ EnrollGrantStore        = (*FaultyStore)(nil)
-	_ TestHistoryStore        = (*FaultyStore)(nil)
-	_ ArtifactIdempotentStore = (*FaultyStore)(nil)
-	_ GeneratedFragmentStore  = (*FaultyStore)(nil)
-	_ RecoveryStore           = (*FaultyStore)(nil)
+	_ OutboxStore               = (*FaultyStore)(nil)
+	_ OutboxDeadLetterStore     = (*FaultyStore)(nil)
+	_ ForgeCheckStateStore      = (*FaultyStore)(nil)
+	_ ScheduleStore             = (*FaultyStore)(nil)
+	_ DeploymentStore           = (*FaultyStore)(nil)
+	_ SnapshotStore             = (*FaultyStore)(nil)
+	_ ArtifactContractStore     = (*FaultyStore)(nil)
+	_ QueueReasonStore          = (*FaultyStore)(nil)
+	_ DynamicStore              = (*FaultyStore)(nil)
+	_ DynamicStoreTx            = (*FaultyStore)(nil)
+	_ DownstreamStore           = (*FaultyStore)(nil)
+	_ UsageStore                = (*FaultyStore)(nil)
+	_ UsageOnceStore            = (*FaultyStore)(nil)
+	_ RunDownstreamStore        = (*FaultyStore)(nil)
+	_ ArtifactLookupStore       = (*FaultyStore)(nil)
+	_ RunnerJobStore            = (*FaultyStore)(nil)
+	_ RunEnqueueStore           = (*FaultyStore)(nil)
+	_ AtomicLeaseStore          = (*FaultyStore)(nil)
+	_ QuotaCounterStore         = (*FaultyStore)(nil)
+	_ CacheManifestStore        = (*FaultyStore)(nil)
+	_ ArtifactSidecarStore      = (*FaultyStore)(nil)
+	_ SecretClaimStore          = (*FaultyStore)(nil)
+	_ SecretClaimReleaser       = (*FaultyStore)(nil)
+	_ ProfileStore              = (*FaultyStore)(nil)
+	_ RunnerTokenStore          = (*FaultyStore)(nil)
+	_ CertRevocationStore       = (*FaultyStore)(nil)
+	_ EnrollGrantStore          = (*FaultyStore)(nil)
+	_ TestHistoryStore          = (*FaultyStore)(nil)
+	_ TestHistoryAggregateStore = (*FaultyStore)(nil)
+	_ RunnerDisableStore        = (*FaultyStore)(nil)
+	_ ArtifactIdempotentStore   = (*FaultyStore)(nil)
+	_ GeneratedFragmentStore    = (*FaultyStore)(nil)
+	_ RecoveryStore             = (*FaultyStore)(nil)
+	_ RecoveryScanStore         = (*FaultyStore)(nil)
+	_ OutboxClaimBatchStore     = (*FaultyStore)(nil)
+	_ LeaderFenceStore          = (*FaultyStore)(nil)
 )
 
 func (f *FaultyStore) Close() error { return f.Inner.Close() }
@@ -278,6 +340,23 @@ func (f *FaultyStore) RevokeRunnerLeases(ctx context.Context, runnerID, reason s
 	return inner.RevokeRunnerLeases(ctx, runnerID, reason)
 }
 
+// DisableRunnerAndRevokeCert is a mutating wrapper: an armed fault fails the
+// whole atomic disable before the inner store is touched, so the injected
+// failure can never leave a partial disable/revocation (the fail-closed
+// contract the server relies on).
+func (f *FaultyStore) DisableRunnerAndRevokeCert(ctx context.Context, runnerID, certSerial, actor string) (int, error) {
+	inner, ok := f.Inner.(RunnerDisableStore)
+	if !ok {
+		return 0, errMissingInnerInterface("RunnerDisableStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return 0, err
+	}
+	return inner.DisableRunnerAndRevokeCert(ctx, runnerID, certSerial, actor)
+}
+
 func (f *FaultyStore) RecoverExpiredLease(ctx context.Context, jobID string, expectedGeneration int64, now time.Time) error {
 	inner, ok := f.Inner.(RecoveryStore)
 	if !ok {
@@ -285,6 +364,9 @@ func (f *FaultyStore) RecoverExpiredLease(ctx context.Context, jobID string, exp
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.fencedFail(); err != nil {
+		return err
+	}
 	if err := f.fail(); err != nil {
 		return err
 	}
@@ -298,10 +380,34 @@ func (f *FaultyStore) ExpireQueuedJob(ctx context.Context, jobID string, deadlin
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.fencedFail(); err != nil {
+		return err
+	}
 	if err := f.fail(); err != nil {
 		return err
 	}
 	return inner.ExpireQueuedJob(ctx, jobID, deadline)
+}
+
+// ListExpiredRunningJobs and ListQueueTimedOutJobs are read-only discovery
+// passthroughs: reads never consume the write-fault counter, so a sweep's
+// paging view can only fail through the inner store itself (the applier
+// failures that must not stall a sweep are injected on RecoverExpiredLease /
+// ExpireQueuedJob instead).
+func (f *FaultyStore) ListExpiredRunningJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]model.Job, error) {
+	inner, ok := f.Inner.(RecoveryDiscoveryStore)
+	if !ok {
+		return nil, errMissingInnerInterface("RecoveryDiscoveryStore")
+	}
+	return inner.ListExpiredRunningJobs(ctx, now, afterID, limit)
+}
+
+func (f *FaultyStore) ListQueueTimedOutJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]model.Job, error) {
+	inner, ok := f.Inner.(RecoveryDiscoveryStore)
+	if !ok {
+		return nil, errMissingInnerInterface("RecoveryDiscoveryStore")
+	}
+	return inner.ListQueueTimedOutJobs(ctx, now, afterID, limit)
 }
 
 func (f *FaultyStore) InsertArtifact(ctx context.Context, a model.ArtifactRecord) error {
@@ -458,6 +564,9 @@ func (f *FaultyStore) OutboxAck(ctx context.Context, id string) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.fencedFail(); err != nil {
+		return err
+	}
 	if err := f.fail(); err != nil {
 		return err
 	}
@@ -520,6 +629,9 @@ func (f *FaultyStore) ClaimOutbox(ctx context.Context, claimer string, limit int
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.fencedFail(); err != nil {
+		return nil, err
+	}
 	if err := f.fail(); err != nil {
 		return nil, err
 	}
@@ -533,10 +645,33 @@ func (f *FaultyStore) ReleaseOutboxClaim(ctx context.Context, id, claimer string
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.fencedFail(); err != nil {
+		return err
+	}
 	if err := f.fail(); err != nil {
 		return err
 	}
 	return inner.ReleaseOutboxClaim(ctx, id, claimer)
+}
+
+// ReleaseOutboxClaims delegates the BATCH release to the inner store under
+// the same fault counter as every other mutation: the wrapper is the
+// sanctioned way to prove one aggregate cleanup either releases the whole
+// matching batch or fails without touching any claim.
+func (f *FaultyStore) ReleaseOutboxClaims(ctx context.Context, ids []string, claimer string) (int, error) {
+	inner, ok := f.Inner.(OutboxClaimBatchStore)
+	if !ok {
+		return 0, errMissingInnerInterface("OutboxClaimBatchStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fencedFail(); err != nil {
+		return 0, err
+	}
+	if err := f.fail(); err != nil {
+		return 0, err
+	}
+	return inner.ReleaseOutboxClaims(ctx, ids, claimer)
 }
 
 // OutboxRetry delegates the retry/dead-letter transition to the inner store
@@ -618,6 +753,9 @@ func (f *FaultyStore) ClaimScheduleOccurrence(ctx context.Context, scheduleID st
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.fencedFail(); err != nil {
+		return false, err
+	}
 	if err := f.fail(); err != nil {
 		return false, err
 	}
@@ -639,6 +777,9 @@ func (f *FaultyStore) AdvanceScheduleLastRun(ctx context.Context, id string, nom
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.fencedFail(); err != nil {
+		return err
+	}
 	if err := f.fail(); err != nil {
 		return err
 	}
@@ -849,6 +990,14 @@ func (f *FaultyStore) InsertCompiledRun(ctx context.Context, req InsertCompiledR
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// A schedule occurrence claim makes the enqueue leader-only, so the
+	// stale-leader injection applies to it exactly as it does to the inner
+	// store's fenced branch. Ordinary submissions are not fenced.
+	if req.ScheduleClaim != nil {
+		if err := f.fencedFail(); err != nil {
+			return err
+		}
+	}
 	if err := f.fail(); err != nil {
 		return err
 	}
@@ -922,6 +1071,9 @@ func (f *FaultyStore) ExpireDownstreamReservations(ctx context.Context, olderTha
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.fencedFail(); err != nil {
+		return 0, err
+	}
 	if err := f.fail(); err != nil {
 		return 0, err
 	}
@@ -1037,6 +1189,9 @@ func (f *FaultyStore) PrunePendingSidecars(ctx context.Context, olderThan time.T
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.fencedFail(); err != nil {
+		return 0, err
+	}
 	if err := f.fail(); err != nil {
 		return 0, err
 	}
@@ -1224,24 +1379,95 @@ func (f *FaultyStore) SaveTestHistory(ctx context.Context, stats []byte) (int64,
 	return inner.SaveTestHistory(ctx, stats)
 }
 
+func (f *FaultyStore) InsertTestReportWithHistory(ctx context.Context, rep model.TestReport, repoID string) (int64, error) {
+	inner, ok := f.Inner.(TestHistoryAggregateStore)
+	if !ok {
+		return 0, errMissingInnerInterface("TestHistoryAggregateStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return 0, err
+	}
+	return inner.InsertTestReportWithHistory(ctx, rep, repoID)
+}
+
+func (f *FaultyStore) LoadRepoTestHistory(ctx context.Context, repoID string) (int64, []byte, error) {
+	inner, ok := f.Inner.(TestHistoryAggregateStore)
+	if !ok {
+		return 0, nil, errMissingInnerInterface("TestHistoryAggregateStore")
+	}
+	return inner.LoadRepoTestHistory(ctx, repoID)
+}
+
+func (f *FaultyStore) ResolveTestHistoryRepoIDs(ctx context.Context, query string, limit int) ([]string, error) {
+	inner, ok := f.Inner.(TestHistoryAggregateStore)
+	if !ok {
+		return nil, errMissingInnerInterface("TestHistoryAggregateStore")
+	}
+	return inner.ResolveTestHistoryRepoIDs(ctx, query, limit)
+}
+
+func (f *FaultyStore) TestReportTotals(ctx context.Context, repoIDs []string, repoQuery string) (int, int, int, error) {
+	inner, ok := f.Inner.(TestHistoryAggregateStore)
+	if !ok {
+		return 0, 0, 0, errMissingInnerInterface("TestHistoryAggregateStore")
+	}
+	return inner.TestReportTotals(ctx, repoIDs, repoQuery)
+}
+
+func (f *FaultyStore) FlakyTestNames(ctx context.Context, repoIDs []string, limit int) ([]string, error) {
+	inner, ok := f.Inner.(TestHistoryAggregateStore)
+	if !ok {
+		return nil, errMissingInnerInterface("TestHistoryAggregateStore")
+	}
+	return inner.FlakyTestNames(ctx, repoIDs, limit)
+}
+
+func (f *FaultyStore) RebuildRepoTestHistory(ctx context.Context, repoID string) (int64, error) {
+	inner, ok := f.Inner.(TestHistoryAggregateStore)
+	if !ok {
+		return 0, errMissingInnerInterface("TestHistoryAggregateStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return 0, err
+	}
+	return inner.RebuildRepoTestHistory(ctx, repoID)
+}
+
+func (f *FaultyStore) ListTestHistoryRepoIDs(ctx context.Context, limit int) ([]string, error) {
+	inner, ok := f.Inner.(TestHistoryAggregateStore)
+	if !ok {
+		return nil, errMissingInnerInterface("TestHistoryAggregateStore")
+	}
+	return inner.ListTestHistoryRepoIDs(ctx, limit)
+}
+
 // memStore is a fully functional in-memory Store used as the fault-free
 // baseline underneath FaultyStore in fault-injection tests.
 type memStore struct {
-	mu         sync.Mutex
-	fenceMu    sync.Mutex
-	fences     map[string]*sync.Mutex
-	checkRuns  checkRunMem
-	logBatches logBatchMem
-	runs       map[string]model.Run
-	jobs       map[string]model.Job
-	runners    map[string]model.Runner
-	receipts   map[string]model.CompletionReceipt
-	audit      []model.AuditEvent
-	logs       []model.LogEntry
-	artifacts  []model.ArtifactRecord
-	reports    []model.TestReport
-	deliveries map[string]string
-	outbox     []OutboxItem
+	mu sync.Mutex
+	// leaderEpoch is the retained leadership epoch (see the memStore fencing
+	// note above LeaderEpoch). It starts at 1 — the in-memory store models a
+	// single-process replica that always holds the claim — and is cleared to
+	// 0 to simulate loss.
+	leaderEpoch atomic.Int64
+	fenceMu     sync.Mutex
+	fences      map[string]*sync.Mutex
+	checkRuns   checkRunMem
+	logBatches  logBatchMem
+	runs        map[string]model.Run
+	jobs        map[string]model.Job
+	runners     map[string]model.Runner
+	receipts    map[string]model.CompletionReceipt
+	audit       []model.AuditEvent
+	logs        []model.LogEntry
+	artifacts   []model.ArtifactRecord
+	reports     []model.TestReport
+	deliveries  map[string]string
+	outbox      []OutboxItem
 	// outboxClaims tracks the cross-replica flush claims (claimed_at is
 	// compared against OutboxClaimTTL on every claim attempt).
 	outboxClaims map[string]outboxClaim
@@ -1274,6 +1500,11 @@ type memStore struct {
 
 	testHistoryVersion int64
 	testHistoryStats   []byte
+	// historyAggregates / historyVersions mirror migration 0026's
+	// test_history_aggregates / test_history_repos for the incremental
+	// repository-scoped contract.
+	historyAggregates map[string]map[string]TestHistoryAggregate
+	historyVersions   map[string]int64
 
 	// enqueueFaultOps, when > 0, makes the next InsertCompiledRun fail after
 	// staging that many operations (superseded cancellations first, then
@@ -1332,66 +1563,78 @@ func fragmentKey(parentJobID string, generation int64, fragmentID string) string
 }
 
 func newMemStore() *memStore {
-	return &memStore{
-		runs:            map[string]model.Run{},
-		jobs:            map[string]model.Job{},
-		runners:         map[string]model.Runner{},
-		receipts:        map[string]model.CompletionReceipt{},
-		deliveries:      map[string]string{},
-		outboxClaims:    map[string]outboxClaim{},
-		outboxMeta:      map[string]outboxMeta{},
-		forgeState:      map[string]int64{},
-		fragments:       map[string]GeneratedFragmentReceipt{},
-		schedules:       map[string]Schedule{},
-		occurrences:     map[string]map[time.Time]string{},
-		contracts:       map[string]map[string]ArtifactContract{},
-		downstream:      map[string]DownstreamLink{},
-		quotas:          map[string]quotaCounts{},
-		cacheMans:       map[string]CacheManifestRecord{},
-		claims:          map[string]time.Time{},
-		pendingSidecars: map[string]pendingSidecar{},
-		profiles:        map[string]model.RunnerProfile{},
-		certProfiles:    map[string]string{},
-		runnerTokens:    map[string]string{},
-		revocations:     map[string]string{},
-		grants:          map[string]EnrollGrantRecord{},
+	m := &memStore{
+		runs:              map[string]model.Run{},
+		jobs:              map[string]model.Job{},
+		runners:           map[string]model.Runner{},
+		receipts:          map[string]model.CompletionReceipt{},
+		deliveries:        map[string]string{},
+		outboxClaims:      map[string]outboxClaim{},
+		outboxMeta:        map[string]outboxMeta{},
+		forgeState:        map[string]int64{},
+		fragments:         map[string]GeneratedFragmentReceipt{},
+		schedules:         map[string]Schedule{},
+		occurrences:       map[string]map[time.Time]string{},
+		contracts:         map[string]map[string]ArtifactContract{},
+		downstream:        map[string]DownstreamLink{},
+		quotas:            map[string]quotaCounts{},
+		cacheMans:         map[string]CacheManifestRecord{},
+		claims:            map[string]time.Time{},
+		pendingSidecars:   map[string]pendingSidecar{},
+		profiles:          map[string]model.RunnerProfile{},
+		certProfiles:      map[string]string{},
+		runnerTokens:      map[string]string{},
+		revocations:       map[string]string{},
+		grants:            map[string]EnrollGrantRecord{},
+		historyAggregates: map[string]map[string]TestHistoryAggregate{},
+		historyVersions:   map[string]int64{},
 	}
+	// The in-memory store models a single-process replica that always holds
+	// the leadership claim, so it retains the initial epoch 1 (see
+	// memStore.LeaderEpoch).
+	m.leaderEpoch.Store(1)
+	return m
 }
 
 var _ Store = (*memStore)(nil)
 
 var (
-	_ OutboxStore             = (*memStore)(nil)
-	_ OutboxDeadLetterStore   = (*memStore)(nil)
-	_ ForgeCheckStateStore    = (*memStore)(nil)
-	_ ScheduleStore           = (*memStore)(nil)
-	_ DeploymentStore         = (*memStore)(nil)
-	_ SnapshotStore           = (*memStore)(nil)
-	_ ArtifactContractStore   = (*memStore)(nil)
-	_ QueueReasonStore        = (*memStore)(nil)
-	_ DynamicStore            = (*memStore)(nil)
-	_ DynamicStoreTx          = (*memStore)(nil)
-	_ DownstreamStore         = (*memStore)(nil)
-	_ UsageStore              = (*memStore)(nil)
-	_ UsageOnceStore          = (*memStore)(nil)
-	_ RunDownstreamStore      = (*memStore)(nil)
-	_ ArtifactLookupStore     = (*memStore)(nil)
-	_ RunnerJobStore          = (*memStore)(nil)
-	_ RunEnqueueStore         = (*memStore)(nil)
-	_ AtomicLeaseStore        = (*memStore)(nil)
-	_ QuotaCounterStore       = (*memStore)(nil)
-	_ CacheManifestStore      = (*memStore)(nil)
-	_ ArtifactSidecarStore    = (*memStore)(nil)
-	_ SecretClaimStore        = (*memStore)(nil)
-	_ SecretClaimReleaser     = (*memStore)(nil)
-	_ ProfileStore            = (*memStore)(nil)
-	_ ArtifactIdempotentStore = (*memStore)(nil)
-	_ GeneratedFragmentStore  = (*memStore)(nil)
-	_ RunnerTokenStore        = (*memStore)(nil)
-	_ CertRevocationStore     = (*memStore)(nil)
-	_ EnrollGrantStore        = (*memStore)(nil)
-	_ TestHistoryStore        = (*memStore)(nil)
-	_ RecoveryStore           = (*memStore)(nil)
+	_ OutboxStore               = (*memStore)(nil)
+	_ OutboxDeadLetterStore     = (*memStore)(nil)
+	_ ForgeCheckStateStore      = (*memStore)(nil)
+	_ ScheduleStore             = (*memStore)(nil)
+	_ DeploymentStore           = (*memStore)(nil)
+	_ SnapshotStore             = (*memStore)(nil)
+	_ ArtifactContractStore     = (*memStore)(nil)
+	_ QueueReasonStore          = (*memStore)(nil)
+	_ DynamicStore              = (*memStore)(nil)
+	_ DynamicStoreTx            = (*memStore)(nil)
+	_ DownstreamStore           = (*memStore)(nil)
+	_ UsageStore                = (*memStore)(nil)
+	_ UsageOnceStore            = (*memStore)(nil)
+	_ RunDownstreamStore        = (*memStore)(nil)
+	_ ArtifactLookupStore       = (*memStore)(nil)
+	_ RunnerJobStore            = (*memStore)(nil)
+	_ RunEnqueueStore           = (*memStore)(nil)
+	_ AtomicLeaseStore          = (*memStore)(nil)
+	_ QuotaCounterStore         = (*memStore)(nil)
+	_ CacheManifestStore        = (*memStore)(nil)
+	_ ArtifactSidecarStore      = (*memStore)(nil)
+	_ SecretClaimStore          = (*memStore)(nil)
+	_ SecretClaimReleaser       = (*memStore)(nil)
+	_ ProfileStore              = (*memStore)(nil)
+	_ ArtifactIdempotentStore   = (*memStore)(nil)
+	_ GeneratedFragmentStore    = (*memStore)(nil)
+	_ RunnerTokenStore          = (*memStore)(nil)
+	_ CertRevocationStore       = (*memStore)(nil)
+	_ EnrollGrantStore          = (*memStore)(nil)
+	_ TestHistoryStore          = (*memStore)(nil)
+	_ TestHistoryAggregateStore = (*memStore)(nil)
+	_ RunnerDisableStore        = (*memStore)(nil)
+	_ LeaderFenceStore          = (*memStore)(nil)
+	_ RecoveryStore             = (*memStore)(nil)
+	_ RecoveryScanStore         = (*memStore)(nil)
+	_ OutboxClaimBatchStore     = (*memStore)(nil)
 )
 
 func (m *memStore) Close() error { return nil }
@@ -2049,6 +2292,9 @@ func (m *memStore) RecoverExpiredLease(ctx context.Context, jobID string, expect
 	if err := ValidateJobID(jobID); err != nil {
 		return err
 	}
+	if err := m.fenceLeader(); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	j, ok := m.jobs[jobID]
@@ -2129,9 +2375,71 @@ func (m *memStore) RecoverExpiredLease(ctx context.Context, jobID string, expect
 	return nil
 }
 
+// ListExpiredRunningJobs mirrors the SQL discovery page (see
+// RecoveryDiscoveryStore): running jobs whose lease expiry elapsed or is
+// absent, ordered by id ASC and keyset-paged with id > afterID. The job map
+// under m.mu is a complete view, so paging is deterministic.
+func (m *memStore) ListExpiredRunningJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]model.Job, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []model.Job{}
+	for _, j := range m.jobs {
+		if j.ID <= afterID || j.Status != model.StatusRunning {
+			continue
+		}
+		if j.LeaseExpiresAt != nil && j.LeaseExpiresAt.After(now) {
+			continue
+		}
+		out = append(out, j)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// ListQueueTimedOutJobs mirrors the SQL discovery page: queued/waiting jobs
+// whose EFFECTIVE queue deadline elapsed, ordered by id ASC and keyset-paged
+// with id > afterID. The memory store has no derived deadline column, so
+// QueueDeadlineFor (persisted field first, compiled-payload fallback second)
+// is the single source of truth.
+func (m *memStore) ListQueueTimedOutJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]model.Job, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []model.Job{}
+	for _, j := range m.jobs {
+		if j.ID <= afterID {
+			continue
+		}
+		if j.Status != model.StatusQueued && j.Status != model.StatusWaitingApproval {
+			continue
+		}
+		dl := QueueDeadlineFor(j)
+		if dl == nil || dl.After(now) {
+			continue
+		}
+		out = append(out, j)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
 // ExpireQueuedJob mirrors the SQL transaction for one queue-timeout job.
 func (m *memStore) ExpireQueuedJob(ctx context.Context, jobID string, deadline time.Time) error {
 	if err := ValidateJobID(jobID); err != nil {
+		return err
+	}
+	if err := m.fenceLeader(); err != nil {
 		return err
 	}
 	m.mu.Lock()
@@ -2318,6 +2626,45 @@ func (m *memStore) TryAcquireLeadership(ctx context.Context, key string, ttl tim
 
 func (m *memStore) ReleaseLeadership(ctx context.Context, key string) error { return nil }
 
+// memStore fencing semantics: the in-memory store is single-process, so its
+// TryAcquireLeadership is trivially true and no cross-process split brain
+// exists to defend against. It therefore models a replica that ALWAYS retains
+// a valid leadership epoch: the epoch starts at 1 and every leader-fenced
+// operation is admitted. Clearing it (ClearLeaderEpoch / SetLeaderEpoch(0))
+// simulates loss, after which every fenced operation fails closed with
+// ErrStaleLeader until an epoch is set again — exact parity with the SQL
+// store's fail-closed contract, without a durable row to compare against.
+func (m *memStore) SetLeaderEpoch(epoch int64) {
+	if epoch <= 0 {
+		m.leaderEpoch.Store(0)
+		return
+	}
+	m.leaderEpoch.Store(epoch)
+}
+
+func (m *memStore) LeaderEpoch() (int64, bool) {
+	e := m.leaderEpoch.Load()
+	return e, e > 0
+}
+
+func (m *memStore) ClearLeaderEpoch() { m.leaderEpoch.Store(0) }
+
+func (m *memStore) ReadLeaderEpoch(ctx context.Context) (int64, error) {
+	e := m.leaderEpoch.Load()
+	return e, nil
+}
+
+// fenceLeader is the in-memory analogue of the SQL store's in-transaction
+// epoch assertion: it fails closed when this store retains no epoch. There is
+// no durable row to compare against, so presence is the whole contract (see
+// the fencing note above).
+func (m *memStore) fenceLeader() error {
+	if _, ok := m.LeaderEpoch(); !ok {
+		return ErrStaleLeader
+	}
+	return nil
+}
+
 func (m *memStore) Migrate(ctx context.Context) error { return nil }
 
 func (m *memStore) SchemaVersion(ctx context.Context) (int, error) { return 1, nil }
@@ -2346,6 +2693,9 @@ func (m *memStore) OutboxAppend(ctx context.Context, e OutboxItem) error {
 }
 
 func (m *memStore) OutboxAck(ctx context.Context, id string) error {
+	if err := m.fenceLeader(); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := m.outbox[:0]
@@ -2590,11 +2940,14 @@ func (m *memStore) hasOutboxLocked(id string) bool {
 // concurrent flushers under m.mu claim disjoint batches, mirroring the SQL
 // SELECT ... FOR UPDATE SKIP LOCKED claim.
 func (m *memStore) ClaimOutbox(ctx context.Context, claimer string, limit int) ([]OutboxItem, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	if claimer == "" || limit <= 0 {
 		return nil, nil
 	}
+	if err := m.fenceLeader(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	now := time.Now().UTC()
 	cutoff := now.Add(-OutboxClaimTTL)
 	out := []OutboxItem{}
@@ -2626,12 +2979,38 @@ func (m *memStore) ClaimOutbox(ctx context.Context, claimer string, limit int) (
 // ReleaseOutboxClaim clears one claim held by claimer so a retry can claim
 // the row again immediately.
 func (m *memStore) ReleaseOutboxClaim(ctx context.Context, id, claimer string) error {
+	if err := m.fenceLeader(); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if c, ok := m.outboxClaims[id]; ok && c.claimer == claimer {
 		delete(m.outboxClaims, id)
 	}
 	return nil
+}
+
+// ReleaseOutboxClaims clears every claim in the batch still held by claimer
+// and returns how many were released, mirroring the SQL single-statement
+// batch release: foreign-claimed or already-cleared ids do not match and do
+// not count, so a replayed batch is an idempotent no-op.
+func (m *memStore) ReleaseOutboxClaims(ctx context.Context, ids []string, claimer string) (int, error) {
+	if strings.TrimSpace(claimer) == "" {
+		return 0, fmt.Errorf("storage: empty outbox claimer")
+	}
+	if err := m.fenceLeader(); err != nil {
+		return 0, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	released := 0
+	for _, id := range ids {
+		if c, ok := m.outboxClaims[id]; ok && c.claimer == claimer {
+			delete(m.outboxClaims, id)
+			released++
+		}
+	}
+	return released, nil
 }
 
 func (m *memStore) UpsertSchedule(ctx context.Context, sc Schedule) error {
@@ -2852,6 +3231,9 @@ func (m *memStore) AdvanceScheduleLastRun(ctx context.Context, id string, nomina
 	if id == "" {
 		return fmt.Errorf("storage: empty schedule id")
 	}
+	if err := m.fenceLeader(); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	sc, ok := m.schedules[id]
@@ -2867,6 +3249,9 @@ func (m *memStore) AdvanceScheduleLastRun(ctx context.Context, id string, nomina
 }
 
 func (m *memStore) ClaimScheduleOccurrence(ctx context.Context, scheduleID string, nominal time.Time, runID string) (bool, error) {
+	if err := m.fenceLeader(); err != nil {
+		return false, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	byNominal, ok := m.occurrences[scheduleID]
@@ -3060,6 +3445,9 @@ func (m *memStore) ReleaseDownstreamReservation(ctx context.Context, parentJobID
 }
 
 func (m *memStore) ExpireDownstreamReservations(ctx context.Context, olderThan time.Time) (int, error) {
+	if err := m.fenceLeader(); err != nil {
+		return 0, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	n := 0
@@ -3205,12 +3593,20 @@ func (m *memStore) adjustQuotaLocked(repoID string, runningDelta, queuedDelta in
 // superseded runs marked cancelled in the SAME critical section that
 // publishes the new run.
 func (m *memStore) InsertCompiledRun(ctx context.Context, req InsertCompiledRunRequest) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	runID := req.Run.ID
 	if runID == "" {
 		return fmt.Errorf("storage: empty run id")
 	}
+	// A schedule occurrence claim makes this enqueue leader-only work, so the
+	// same fail-closed fence as the SQL store applies here. Ordinary
+	// submissions carry no claim and are deliberately not fenced.
+	if req.ScheduleClaim != nil {
+		if err := m.fenceLeader(); err != nil {
+			return err
+		}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	// Every reservation is STAGED first and committed only after the whole
 	// request validated: a rejection (duplicate delivery, quota limit, lost
 	// schedule claim) must leave zero partial state, exactly like the SQL
@@ -3884,6 +4280,9 @@ func (m *memStore) DeletePendingSidecars(ctx context.Context, jobID string) erro
 
 // PrunePendingSidecars drops rows created before the cutoff.
 func (m *memStore) PrunePendingSidecars(ctx context.Context, olderThan time.Time) (int, error) {
+	if err := m.fenceLeader(); err != nil {
+		return 0, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	n := 0
@@ -4080,4 +4479,350 @@ func (m *memStore) SaveTestHistory(ctx context.Context, stats []byte) (int64, er
 	m.testHistoryVersion++
 	m.testHistoryStats = append([]byte(nil), stats...)
 	return m.testHistoryVersion, nil
+}
+
+// ---------------------------------------------------------------------------
+// memStore: incremental repository-scoped test history (migration 0026)
+// ---------------------------------------------------------------------------
+
+// memHistoryKey is the in-memory analogue of the aggregate primary key.
+func memHistoryKey(suite, class, name string) string {
+	return suite + "\x00" + class + "\x00" + name
+}
+
+func (m *memStore) InsertTestReportWithHistory(ctx context.Context, rep model.TestReport, repoID string) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if repoID == "" {
+		return 0, fmt.Errorf("storage: test history repository identity is required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.reports = append(m.reports, rep)
+	rows := m.historyAggregates[repoID]
+	if rows == nil {
+		rows = map[string]TestHistoryAggregate{}
+		m.historyAggregates[repoID] = rows
+	}
+	for _, c := range rep.Cases {
+		key := memHistoryKey(rep.JobKey, c.Class, c.Name)
+		row := rows[key]
+		row.RepoID, row.Suite, row.Class, row.Name = repoID, rep.JobKey, c.Class, c.Name
+		rows[key] = FoldTestHistoryAggregate(row, TestHistoryEntry{Suite: rep.JobKey, Class: c.Class, Name: c.Name, Duration: c.Duration, Passed: c.Passed, When: rep.CreatedAt})
+	}
+	m.historyVersions[repoID]++
+	return m.historyVersions[repoID], nil
+}
+
+func (m *memStore) LoadRepoTestHistory(ctx context.Context, repoID string) (int64, []byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	version, ok := m.historyVersions[repoID]
+	if !ok {
+		return 0, nil, nil
+	}
+	rows := make([]TestHistoryAggregate, 0, len(m.historyAggregates[repoID]))
+	for _, row := range m.historyAggregates[repoID] {
+		rows = append(rows, row)
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Suite != rows[j].Suite {
+			return rows[i].Suite < rows[j].Suite
+		}
+		if rows[i].Class != rows[j].Class {
+			return rows[i].Class < rows[j].Class
+		}
+		return rows[i].Name < rows[j].Name
+	})
+	stats, err := EncodeTestHistoryStats(rows)
+	if err != nil {
+		return 0, nil, err
+	}
+	return version, stats, nil
+}
+
+// memRunMatchesRepoQuery mirrors the server's runMatchesRepoQuery for the
+// in-memory store: full name, canonical identity, or legacy host-less
+// canonical form.
+func memRunMatchesRepoQuery(r model.Run, query string) bool {
+	if query == "" {
+		return false
+	}
+	if query == r.RepoFullName || query == RepoIDForRun(r) {
+		return true
+	}
+	return query == CanonicalRepoID("", r.RepoFullName)
+}
+
+func (m *memStore) ResolveTestHistoryRepoIDs(ctx context.Context, query string, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 64
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	seen := map[string]bool{}
+	out := []string{}
+	for _, r := range m.runs {
+		if !memRunMatchesRepoQuery(r, query) {
+			continue
+		}
+		id := RepoIDForRun(r)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+		if len(out) >= limit {
+			break
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func (m *memStore) TestReportTotals(ctx context.Context, repoIDs []string, repoQuery string) (int, int, int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ids := map[string]bool{}
+	for _, id := range repoIDs {
+		ids[id] = true
+	}
+	var reports, tests, failures int
+	for _, rep := range m.reports {
+		run, ok := m.runs[rep.RunID]
+		if !ok {
+			continue
+		}
+		if !ids[RepoIDForRun(run)] && !memRunMatchesRepoQuery(run, repoQuery) {
+			continue
+		}
+		reports++
+		tests += rep.Tests
+		failures += rep.Failures
+	}
+	return reports, tests, failures, nil
+}
+
+func (m *memStore) FlakyTestNames(ctx context.Context, repoIDs []string, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	seen := map[string]bool{}
+	out := []string{}
+	for _, id := range repoIDs {
+		for _, row := range m.historyAggregates[id] {
+			if row.Passes == 0 || row.Fails == 0 {
+				continue
+			}
+			display := row.Name
+			if row.Class != "" {
+				display = row.Class + "." + row.Name
+			}
+			if seen[display] {
+				continue
+			}
+			seen[display] = true
+			out = append(out, display)
+		}
+	}
+	sort.Strings(out)
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (m *memStore) ListTestHistoryRepoIDs(ctx context.Context, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	seen := map[string]bool{}
+	for _, rep := range m.reports {
+		if run, ok := m.runs[rep.RunID]; ok {
+			if id := RepoIDForRun(run); id != "" {
+				seen[id] = true
+			}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for id := range seen {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// RebuildRepoTestHistory recomputes one repository's aggregates from the
+// in-memory reports in created_at/id order — the same ordering the SQL
+// repair uses.
+func (m *memStore) RebuildRepoTestHistory(ctx context.Context, repoID string) (int64, error) {
+	if repoID == "" {
+		return 0, fmt.Errorf("storage: test history repository identity is required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	reports := make([]model.TestReport, 0, len(m.reports))
+	for _, rep := range m.reports {
+		run, ok := m.runs[rep.RunID]
+		if !ok || RepoIDForRun(run) != repoID {
+			continue
+		}
+		reports = append(reports, rep)
+	}
+	sort.SliceStable(reports, func(i, j int) bool {
+		if !reports[i].CreatedAt.Equal(reports[j].CreatedAt) {
+			return reports[i].CreatedAt.Before(reports[j].CreatedAt)
+		}
+		return reports[i].ID < reports[j].ID
+	})
+	rows := map[string]TestHistoryAggregate{}
+	for _, rep := range reports {
+		for _, c := range rep.Cases {
+			key := memHistoryKey(rep.JobKey, c.Class, c.Name)
+			row := rows[key]
+			row.RepoID, row.Suite, row.Class, row.Name = repoID, rep.JobKey, c.Class, c.Name
+			rows[key] = FoldTestHistoryAggregate(row, TestHistoryEntry{Suite: rep.JobKey, Class: c.Class, Name: c.Name, Duration: c.Duration, Passed: c.Passed, When: rep.CreatedAt})
+		}
+	}
+	m.historyAggregates[repoID] = rows
+	m.historyVersions[repoID]++
+	return m.historyVersions[repoID], nil
+}
+
+// DisableRunnerAndRevokeCert is the memStore mirror of the SQL transaction:
+// under one lock it revokes the runner's leases, disables the runner,
+// records the durable-equivalent revocation and writes the audit evidence.
+// A missing runner reports ErrNotFound and changes nothing.
+func (m *memStore) DisableRunnerAndRevokeCert(ctx context.Context, runnerID, certSerial, actor string) (int, error) {
+	if err := ValidateRunnerID(runnerID); err != nil {
+		return 0, err
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	disableAuditID, err := newID()
+	if err != nil {
+		return 0, err
+	}
+	revokeAuditID := ""
+	if certSerial != "" {
+		revokeAuditID, err = newID()
+		if err != nil {
+			return 0, err
+		}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ri, ok := m.runners[runnerID]
+	if !ok {
+		return 0, ErrNotFound
+	}
+	ids := []string{}
+	for id, j := range m.jobs {
+		if j.Status == model.StatusRunning && j.LeaseRunnerID == runnerID {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	jobs := cloneRecoveryJobs(m.jobs)
+	runners := cloneRecoveryRunners(m.runners)
+	runs := cloneRecoveryRuns(m.runs)
+	quotas := cloneRecoveryQuotas(m.quotas)
+	audit := append([]model.AuditEvent(nil), m.audit...)
+	revocations := map[string]string{}
+	for k, v := range m.revocations {
+		revocations[k] = v
+	}
+	now := time.Now().UTC()
+	staged := 0
+	changed := map[string]bool{}
+	runIDs := map[string]bool{}
+	for _, id := range ids {
+		j := jobs[id]
+		requeue := j.Attempts <= j.MaxInfraRetries
+		if requeue {
+			j.Status = model.StatusQueued
+			j.Error = "runner disabled; retrying"
+		} else {
+			j.Status = model.StatusCancelled
+			j.Error = "runner disabled"
+			j.FinishedAt = &now
+		}
+		j.LeaseRunnerID = ""
+		j.LeaseTokenHash = nil
+		j.LeaseExpiresAt = nil
+		jobs[id] = j
+		if err := m.recoveryBumpFor(&staged); err != nil {
+			return 0, err
+		}
+		if requeue {
+			adjustQuotaMap(quotas, RepoIDForJob(j), -1, 1)
+		} else {
+			adjustQuotaMap(quotas, RepoIDForJob(j), -1, 0)
+		}
+		if err := m.recoveryBumpFor(&staged); err != nil {
+			return 0, err
+		}
+		action := "job.runner_disabled_cancelled"
+		if requeue {
+			action = "job.runner_disabled_requeued"
+		}
+		audit = append(audit, recoveryAudit(j, action, "admin", "runner disabled", map[string]string{"job": j.Key, "runner": runnerID}, now))
+		if err := m.recoveryBumpFor(&staged); err != nil {
+			return 0, err
+		}
+		changed[id] = true
+		if j.RunID != "" {
+			runIDs[j.RunID] = true
+		}
+	}
+	for _, id := range ids {
+		releaseRunnerSlotMap(runners, runnerID, id)
+		if r, ok := runners[runnerID]; ok {
+			r.Failed++
+			r.LastSeen = now
+			runners[runnerID] = r
+		}
+		if err := m.recoveryBumpFor(&staged); err != nil {
+			return 0, err
+		}
+	}
+	recomputeDependentsMap(jobs, changed, now)
+	if err := m.recoveryBumpFor(&staged); err != nil {
+		return 0, err
+	}
+	for runID := range runIDs {
+		recomputeRunMap(runs, jobs, runID)
+	}
+	if err := m.recoveryBumpFor(&staged); err != nil {
+		return 0, err
+	}
+	ri = runners[runnerID]
+	ri.LastSeen = now
+	ri.Disabled = true
+	if certSerial != "" && ri.RevokedAt == nil {
+		ri.RevokedAt = &now
+	}
+	runners[runnerID] = ri
+	if certSerial != "" {
+		revocations[certSerial] = runnerID
+	}
+	audit = append(audit, model.AuditEvent{ID: disableAuditID, Action: "runner.disable", Actor: actor, Message: "runner disabled", Metadata: map[string]string{"runner": runnerID}, CreatedAt: now})
+	if certSerial != "" {
+		audit = append(audit, model.AuditEvent{ID: revokeAuditID, Action: "runner.cert_revoked", Actor: actor, Message: "runner certificate serial revoked", Metadata: map[string]string{"runner": runnerID, "serial": certSerial}, CreatedAt: now})
+	}
+	if err := m.recoveryBumpFor(&staged); err != nil {
+		return 0, err
+	}
+	m.jobs, m.runners, m.runs, m.quotas = jobs, runners, runs, quotas
+	m.audit, m.revocations = audit, revocations
+	return len(ids), nil
 }

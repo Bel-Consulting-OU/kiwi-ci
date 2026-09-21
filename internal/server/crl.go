@@ -17,6 +17,13 @@ const crlFile = "runner-crl.json"
 // decision before re-consulting the durable cert_revocations row.
 const crlCacheTTL = 30 * time.Second
 
+// crlLookupTimeout bounds one durable cert_revocations lookup (the
+// uncached cache-fill on the runner authentication path) so a stalled
+// revocation store cannot pin an HTTP request after the client is gone.
+// It is a var, not a const, so tests can shorten it; production keeps the
+// 5s default.
+var crlLookupTimeout = 5 * time.Second
+
 // crlJSON is the on-disk CRL format: certificate serial (decimal hex from
 // x509 serial.Text(16)) -> runner ID, written atomically under dataDir.
 type crlJSON map[string]string
@@ -57,17 +64,59 @@ func (s *Server) persistCRL() error {
 	return marshalJSONFile(filepath.Join(s.dataDir, crlFile), crlJSON(s.crl))
 }
 
+// mirrorRunnerCertRevoked records an ALREADY DURABLY COMMITTED certificate
+// revocation in this replica's decision state: the in-memory CRL map, the
+// DB-mode decision cache and the file mirror. The admin disable path calls
+// it only after the store transaction committed the revocation, so a failure
+// here can never authorize a revoked certificate on this replica; the file
+// write is a dev-mode mirror and its failure is logged, never fatal (the
+// durable authority is the cert_revocations row). The caller must NOT hold
+// s.mu.
+func (s *Server) mirrorRunnerCertRevoked(ri model.Runner) {
+	if ri.CertSerial == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.crl == nil {
+		s.crl = map[string]string{}
+	}
+	s.crl[ri.CertSerial] = ri.ID
+	persistErr := s.persistCRL()
+	s.mu.Unlock()
+	now := time.Now()
+	s.crlMu.Lock()
+	if s.crlCache == nil {
+		s.crlCache = map[string]crlCacheEntry{}
+	}
+	s.crlCache[ri.CertSerial] = crlCacheEntry{revoked: true, at: now}
+	s.crlMu.Unlock()
+	if persistErr != nil {
+		s.logError("crl: persist failed", "error", persistErr.Error())
+	}
+}
+
 // revokeRunnerCert records the runner's certificate serial in the
 // revocation list. In DB mode the durable cert_revocations row is written
 // transactionally so every replica rejects the serial; the in-memory map
 // and file CRL remain the dev-mode mirror. Revocation is permanent:
 // re-enabling a runner does not un-revoke its certificate — the runner must
-// re-enroll to obtain fresh credentials.
-func (s *Server) revokeRunnerCert(ri model.Runner, actor string) {
+// re-enroll to obtain fresh credentials. ctx is the caller's request or
+// operation context: a hung durable write is bounded by the caller, never
+// by a context root minted here.
+//
+// This is the BEST-EFFORT helper for direct/dev callers; the admin disable
+// endpoint does NOT use it as its authority: runnerDisable commits the
+// revocation + disable + lease revocation atomically through
+// storage.RunnerDisableStore and fails closed, then mirrors the committed
+// revocation locally with mirrorRunnerCertRevoked.
+func (s *Server) revokeRunnerCert(ctx context.Context, ri model.Runner, actor string) {
 	if ri.CertSerial == "" {
 		return
 	}
 	s.mu.Lock()
+	if s.crl == nil {
+		s.crl = map[string]string{}
+	}
 	s.crl[ri.CertSerial] = ri.ID
 	persistErr := s.persistCRL()
 	s.mu.Unlock()
@@ -84,7 +133,7 @@ func (s *Server) revokeRunnerCert(ri model.Runner, actor string) {
 	s.crlMu.Unlock()
 	if s.DB != nil {
 		if rev, ok := s.DB.(storage.CertRevocationStore); ok {
-			if err := rev.RevokeCert(context.Background(), ri.CertSerial, ri.ID, "runner revoked"); err != nil {
+			if err := rev.RevokeCert(ctx, ri.CertSerial, ri.ID, "runner revoked"); err != nil {
 				s.logError("crl: durable revoke failed", "serial", ri.CertSerial, "error", err.Error())
 			}
 		}
@@ -103,15 +152,23 @@ func (s *Server) revokeRunnerCert(ri model.Runner, actor string) {
 // TTL. DB mode additionally consults a short-TTL cache backed by the
 // durable cert_revocations row, so a revocation written by any replica
 // rejects the certificate on every other replica within crlCacheTTL.
-func (s *Server) certSerialRevoked(serial string) bool {
+//
+// The durable lookup runs under the caller's ctx (the request context on
+// the authentication path), bounded by crlLookupTimeout: a stalled store
+// cannot pin the request past the client's cancellation. On any lookup
+// failure the decision is fail-closed — revoked=true is returned TOGETHER
+// WITH the error, so a caller that inspects the error rejects the
+// certificate and a caller that ignores it still treats the serial as
+// revoked (revoked/unknown must never authorize).
+func (s *Server) certSerialRevoked(ctx context.Context, serial string) (bool, error) {
 	if serial == "" {
-		return false
+		return false, nil
 	}
 	s.mu.Lock()
 	_, locallyRevoked := s.crl[serial]
 	s.mu.Unlock()
 	if locallyRevoked {
-		return true
+		return true, nil
 	}
 	if s.DB != nil {
 		if rev, ok := s.DB.(storage.CertRevocationStore); ok {
@@ -119,17 +176,19 @@ func (s *Server) certSerialRevoked(serial string) bool {
 			s.crlMu.Lock()
 			if e, hit := s.crlCache[serial]; hit && now.Sub(e.at) < crlCacheTTL {
 				s.crlMu.Unlock()
-				return e.revoked
+				return e.revoked, nil
 			}
 			s.crlMu.Unlock()
-			revoked, err := rev.CertRevoked(context.Background(), serial)
+			lookupCtx, cancel := context.WithTimeout(ctx, crlLookupTimeout)
+			defer cancel()
+			revoked, err := rev.CertRevoked(lookupCtx, serial)
 			if err != nil {
 				s.logError("crl: cache fill failed", "serial", serial, "error", err.Error())
 				// Fail closed on an unavailable revocation store: an
 				// unreachable revocation source must never resurrect a
 				// certificate it might have revoked. The local dev mirror
 				// can only make the decision MORE strict, never less.
-				return true
+				return true, err
 			}
 			s.crlMu.Lock()
 			if s.crlCache == nil {
@@ -137,8 +196,8 @@ func (s *Server) certSerialRevoked(serial string) bool {
 			}
 			s.crlCache[serial] = crlCacheEntry{revoked: revoked, at: now}
 			s.crlMu.Unlock()
-			return revoked
+			return revoked, nil
 		}
 	}
-	return false
+	return false, nil
 }

@@ -81,43 +81,119 @@ var (
 // requests: the body read and the response write respectively. They are
 // variables only so the socket-level tests can shrink the bound; production
 // uses these values.
+//
+// streamIdleTimeout is the SLIDING inactivity bound applied to streaming
+// routes instead: every successful body read re-arms the read deadline and
+// every write re-arms the write deadline, so a transfer that keeps making
+// progress (an 8 GiB artifact at any sustainable rate) completes regardless
+// of how long it takes, while a peer that stops moving bytes for this long is
+// dropped. It is a variable only so tests can shrink the bound; production
+// uses this value.
 var (
-	apiReadDeadline  = 30 * time.Second
-	apiWriteDeadline = 60 * time.Second
+	apiReadDeadline   = 30 * time.Second
+	apiWriteDeadline  = 60 * time.Second
+	streamIdleTimeout = 90 * time.Second
 )
 
 // withAPIDeadlines re-applies the former global ReadTimeout/WriteTimeout
 // contract to the ordinary API routes, while leaving bulk streaming routes
-// unbounded. The http.Server itself runs with ReadTimeout/WriteTimeout 0:
-// artifact/cache/snapshot traffic streams up to 8 GiB (maxBlobBytes in
-// internal/server/blobs.go) and the log stream is long-lived, so any fixed
-// global deadline cuts transfers Kiwi's own size limits allow (the P2
-// defect). Deadlines here are absolute per request, covering the body read
-// and the response write.
+// unbounded in total but bounded per idle window. The http.Server itself runs
+// with ReadTimeout/WriteTimeout 0: artifact/cache/snapshot traffic streams up
+// to 8 GiB (maxBlobBytes in internal/server/blobs.go) and the log stream is
+// long-lived, so any fixed global deadline cuts transfers Kiwi's own size
+// limits allow (the P2 defect). Deadlines here are absolute per request,
+// covering the body read and the response write.
 //
-// TRADE-OFF: routes listed in streamingRoute carry NO server-side transfer
-// deadline at all. Their transfer size stays bounded by Kiwi's own limits
-// (http.MaxBytesReader / artifact contracts) and a stalled peer is reaped by
-// IdleTimeout between requests; only operators can bound transfer time
-// externally. Keep the exemption list tight and in sync with the route table
-// in internal/server/server.go; any new long-lived/bulk route MUST be added
+// Streaming routes get two things:
+//
+//  1. Both connection deadlines are CLEARED before dispatch, so an absolute
+//     deadline set for an earlier request can never bound a later stream on
+//     a reused HTTP/1.1 keep-alive connection. Current net/http happens to
+//     reset connection deadlines between requests because the server's own
+//     ReadTimeout/WriteTimeout are 0, but the middleware must not depend on
+//     that incidental reset; clearing is explicit, cheap, and a no-op on
+//     writers that do not support deadlines.
+//  2. A sliding inactivity bound replaces the absolute one: each successful
+//     body Read re-arms the read deadline and each Write re-arms the write
+//     deadline, so continuous progress is never cut while a stalled peer is.
+//
+// Keep the exemption list tight and in sync with the route table in
+// internal/server/server.go; any new long-lived/bulk route MUST be added
 // there instead of dropping the deadline globally again.
 func withAPIDeadlines(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if streamingRoute(r.Method, r.URL.Path) {
-			next.ServeHTTP(w, r)
-			return
-		}
 		// ResponseController reaches the underlying net.Conn; on writers that
 		// do not support deadlines (httptest recorders) the error is
 		// deliberately ignored: deadlines are a production hardening, not an
 		// authorization decision.
 		rc := http.NewResponseController(w)
+		if streamingRoute(r.Method, r.URL.Path) {
+			_ = rc.SetReadDeadline(time.Time{})
+			_ = rc.SetWriteDeadline(time.Time{})
+			sw := &streamDeadlineWriter{ResponseWriter: w, rc: rc, idle: streamIdleTimeout}
+			r.Body = newStreamDeadlineBody(r.Body, rc, streamIdleTimeout)
+			next.ServeHTTP(sw, r)
+			return
+		}
 		now := time.Now()
 		_ = rc.SetReadDeadline(now.Add(apiReadDeadline))
 		_ = rc.SetWriteDeadline(now.Add(apiWriteDeadline))
 		next.ServeHTTP(w, r)
 	})
+}
+
+// streamDeadlineWriter implements the write half of the sliding bound: every
+// Write (and Flush) re-arms the connection write deadline. It preserves
+// http.Flusher so SSE handlers keep flushing, and exposes the underlying
+// writer via Unwrap so http.ResponseController reaches the real connection.
+type streamDeadlineWriter struct {
+	http.ResponseWriter
+	rc   *http.ResponseController
+	idle time.Duration
+}
+
+func (w *streamDeadlineWriter) Write(p []byte) (int, error) {
+	_ = w.rc.SetWriteDeadline(time.Now().Add(w.idle))
+	return w.ResponseWriter.Write(p)
+}
+
+// Flush forwards SSE flushes; a flush is progress too, so the deadline is
+// re-armed before delegating.
+func (w *streamDeadlineWriter) Flush() {
+	_ = w.rc.SetWriteDeadline(time.Now().Add(w.idle))
+	_ = w.rc.Flush()
+}
+
+// Unwrap exposes the underlying ResponseWriter to http.ResponseController.
+func (w *streamDeadlineWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// newStreamDeadlineBody wraps a streaming request body with the read half of
+// the sliding bound. Requests without a body (GET downloads, SSE) keep the
+// no-body sentinel and are bounded only by their writes; the guard is armed
+// immediately so an upload peer that sends nothing is dropped after one idle
+// window rather than holding the route open forever.
+func newStreamDeadlineBody(body io.ReadCloser, rc *http.ResponseController, idle time.Duration) io.ReadCloser {
+	if body == nil || body == http.NoBody {
+		return body
+	}
+	_ = rc.SetReadDeadline(time.Now().Add(idle))
+	return &streamDeadlineBody{ReadCloser: body, rc: rc, idle: idle}
+}
+
+// streamDeadlineBody implements the read half of the sliding bound: every
+// successful Read re-arms the connection read deadline.
+type streamDeadlineBody struct {
+	io.ReadCloser
+	rc   *http.ResponseController
+	idle time.Duration
+}
+
+func (b *streamDeadlineBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if n > 0 {
+		_ = b.rc.SetReadDeadline(time.Now().Add(b.idle))
+	}
+	return n, err
 }
 
 // streamingRoute reports whether the route legitimately streams bulk or

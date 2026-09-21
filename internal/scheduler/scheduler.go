@@ -6,6 +6,12 @@
 // leases. Leadership is a session-level Postgres advisory lock held by the
 // store on a dedicated connection; TryAcquireLeadership renews the claim and
 // reports ownership, so a standby can observe promotion by polling IsLeader.
+// Because a cached renewal may briefly report true after the lock session
+// died, leadership is enforced by a monotonic EPOCH (migration 0025), not by
+// the check alone: the store publishes a new epoch on acquisition, retains it
+// while it holds the claim, and every leader-only mutation re-validates it
+// inside its own transaction. A replica whose cached claim outlived its
+// session is rejected with storage.ErrStaleLeader and mutates nothing.
 package scheduler
 
 import (
@@ -149,6 +155,13 @@ func (s *DBScheduler) InitErr() error { return s.initErr }
 // IsLeader renews (or takes) the leadership claim and reports whether this
 // instance currently holds it. A false result means another instance is the
 // leader; a store error is logged and reported as not-leader.
+//
+// A true result can be served from the store's throttled cached proof (no
+// round-trip), so it may briefly survive the loss of the advisory-lock
+// session. That window is closed by the store's leadership EPOCH, not by this
+// check: every leader-only mutation validates the epoch inside its own
+// transaction and fails with storage.ErrStaleLeader when the claim is stale,
+// so a cached true can hand out no work that mutates shared state.
 func (s *DBScheduler) IsLeader(ctx context.Context) bool {
 	if s.Store == nil {
 		return false
@@ -224,6 +237,15 @@ func (s *DBScheduler) Enqueue(ctx context.Context, run model.Run, jobs map[strin
 // regions and environment concurrency. Dependency readiness and queue
 // deadlines are evaluated on top, then priority (downstream depth) and age.
 // The raw lease token is returned exactly once; only its hash is persisted.
+//
+// Deliberately NOT epoch-fenced, unlike the leader-only housekeeping
+// mutations: the lease claim is itself a single atomic conditional
+// transaction (AcquireLeaseAtomic / AcquireLease) whose mutual exclusion comes
+// from the row state — the queued->running transition, the lease generation
+// and the runner capacity/environment/quota predicates are checked under the
+// job row lock, so a stale leader cannot double-lease or corrupt a claim; its
+// worst case is handing out a job the current leader would also have handed
+// out. Leadership orders this work, it is not the safety boundary for it.
 //
 // Every scheduling attribute is resolved LIVE: when the runner has a linked
 // profile the profile's current labels/region/repo ACL/capabilities/capacity/
@@ -508,60 +530,107 @@ func (s *DBScheduler) CancelJobsByRunner(ctx context.Context, runnerID, reason s
 	return len(revoked), nil
 }
 
+// recoveryPageSize bounds every recovery-discovery page. Candidate discovery
+// is keyset-paged in job-id order, so this constant bounds memory and
+// round-trip size per page, not how many candidates a sweep can reach: the
+// loop keeps requesting the next page until a short page arrives, which means
+// every expired/elapsed candidate is eventually visited regardless of how
+// many newer runs exist. It is a var only so tests can shrink the page and
+// prove paging determinism over a candidate set larger than one page.
+var recoveryPageSize = 256
+
 // RecoverExpired requeues or fails jobs whose leases expired and cancels
 // queued jobs past their queue deadline, mirroring the in-memory
 // recoverLeasesLocked (infrastructure retry budget respected). Every job
 // transition is ONE transactional store operation that also releases the
 // runner slot / quota reservation and recomputes dependents and the run, so
-// no later best-effort pass can be lost to a crash. Leader-only.
+// no later best-effort pass can be lost to a crash. Leader-only, and every
+// transition is EPOCH-FENCED inside the store transaction: a replica whose
+// cached claim outlived its advisory-lock session gets
+// storage.ErrStaleLeader, mutates nothing, and is demoted here immediately
+// instead of sweeping on.
+//
+// Discovery is DIRECT and bounded: the store's id-paged candidate queries
+// (storage.RecoveryScanStore) return expired running leases and elapsed queue
+// deadlines themselves. ListRuns-style enumeration is deliberately gone: a
+// newest-N window permanently orphans an old non-terminal job once N newer
+// runs exist. Each page advances the id cursor past EVERY returned candidate,
+// including candidates whose applier fails (logged, not fatal), so one bad
+// row can never stall the candidates behind it; a later sweep revisits the
+// failure from the start. Page query errors abort the sweep with an error,
+// exactly as a ListRuns error did.
 func (s *DBScheduler) RecoverExpired(ctx context.Context, now time.Time) error {
 	if !s.IsLeader(ctx) {
 		return ErrNotLeader
 	}
-	rs, ok := s.Store.(storage.RecoveryStore)
+	scanner, ok := s.Store.(storage.RecoveryScanStore)
 	if !ok {
-		return fmt.Errorf("scheduler: store does not support transactional lease recovery")
+		return fmt.Errorf("scheduler: store does not support paged recovery discovery")
 	}
-	runs, err := s.Store.ListRuns(ctx, 10000)
-	if err != nil {
-		return fmt.Errorf("scheduler: list runs: %w", err)
-	}
-	for _, run := range runs {
-		all, err := s.Store.ListJobsByRun(ctx, run.ID)
+	// Expired running leases, in deterministic id order so the keyset cursor
+	// is a total order.
+	afterID := ""
+	for {
+		page, err := scanner.ListExpiredRunningJobs(ctx, now, afterID, recoveryPageSize)
 		if err != nil {
-			log.Printf("scheduler: recover run %s: %v", run.ID, err)
-			continue
+			return fmt.Errorf("scheduler: list expired running jobs: %w", err)
 		}
-		for _, j := range all {
-			switch j.Status {
-			case model.StatusQueued, model.StatusWaitingApproval:
-				// Queue-timeout expiry: a queued (or approval-waiting) job
-				// past its queue deadline is cancelled terminally,
-				// independent of its attempt count, and its reserved queued
-				// quota slot is released in the SAME transaction. The
-				// expected deadline guards against expiring a job whose
-				// deadline moved after this snapshot.
-				dl := QueueDeadlineFor(j)
-				if dl == nil || dl.After(now) {
-					continue
+		for _, j := range page {
+			// The expected generation makes the recovery idempotent and
+			// race-safe: a lease replaced by a concurrent re-lease is left
+			// untouched.
+			if err := scanner.RecoverExpiredLease(ctx, j.ID, j.LeaseGeneration, now); err != nil {
+				if errors.Is(err, storage.ErrStaleLeader) {
+					return s.staleLeader("recover expired lease", err)
 				}
-				if err := rs.ExpireQueuedJob(ctx, j.ID, *dl); err != nil {
+				log.Printf("scheduler: recover job %s: %v", j.ID, err)
+			}
+			afterID = j.ID
+		}
+		if len(page) < recoveryPageSize {
+			break
+		}
+	}
+	// Queue-timeout expiry: a queued (or approval-waiting) job past its
+	// queue deadline is cancelled terminally, independent of its attempt
+	// count, and its reserved queued quota slot is released in the SAME
+	// transaction. The expected deadline guards against expiring a job whose
+	// deadline moved after this snapshot; the query may return a superset
+	// (legacy payload-only deadlines), so the effective deadline is
+	// re-derived here before applying.
+	afterID = ""
+	for {
+		page, err := scanner.ListQueueTimedOutJobs(ctx, now, afterID, recoveryPageSize)
+		if err != nil {
+			return fmt.Errorf("scheduler: list queue-timed-out jobs: %w", err)
+		}
+		for _, j := range page {
+			if dl := storage.QueueDeadlineFor(j); dl != nil && !dl.After(now) {
+				if err := scanner.ExpireQueuedJob(ctx, j.ID, *dl); err != nil {
+					if errors.Is(err, storage.ErrStaleLeader) {
+						return s.staleLeader("expire queue deadline", err)
+					}
 					log.Printf("scheduler: expire queue deadline for job %s: %v", j.ID, err)
 				}
-			case model.StatusRunning:
-				if j.LeaseExpiresAt != nil && j.LeaseExpiresAt.After(now) {
-					continue
-				}
-				// The expected generation makes the recovery idempotent and
-				// race-safe: a lease replaced by a concurrent re-lease is
-				// left untouched.
-				if err := rs.RecoverExpiredLease(ctx, j.ID, j.LeaseGeneration, now); err != nil {
-					log.Printf("scheduler: recover job %s: %v", j.ID, err)
-				}
 			}
+			afterID = j.ID
+		}
+		if len(page) < recoveryPageSize {
+			break
 		}
 	}
 	return nil
+}
+
+// staleLeader marks this scheduler not-leader after a store mutation rejected
+// its leadership epoch and aborts the sweep. Every remaining candidate would
+// be rejected the same way (the store already cleared its retained epoch), so
+// continuing would be pure no-op work. The next IsLeader call either
+// re-acquires (publishing a fresh epoch) or stays a standby.
+func (s *DBScheduler) staleLeader(op string, err error) error {
+	s.leader.Store(false)
+	log.Printf("scheduler: %s rejected by the leadership fence; demoting to standby: %v", op, err)
+	return fmt.Errorf("scheduler: %s: %w", op, err)
 }
 
 // jobRuntimeCapability extracts the job's runtime capability

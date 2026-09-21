@@ -229,8 +229,21 @@ func TestPostgresIntegrationMigrationSplitPrePopulatedOutbox(t *testing.T) {
 		t.Fatalf("migrations.All: %v", err)
 	}
 	max := all[len(all)-1].Version
-	if len(versions) != max || versions[max-3] != 18 || versions[max-2] != 19 || versions[max-1] != 20 {
-		t.Fatalf("schema_migrations = %v, want 1..%d with 18,19,20 last", versions, max)
+	if len(versions) != max {
+		t.Fatalf("schema_migrations = %v, want 1..%d", versions, max)
+	}
+	// The outbox split is recorded in order at its original positions
+	// (18,19,20); any later migration (the recovery-discovery files) must
+	// follow contiguously.
+	for i, want := range []int{18, 19, 20} {
+		if versions[17+i] != want {
+			t.Fatalf("schema_migrations = %v, want 18,19,20 at positions 18..20", versions)
+		}
+	}
+	for v := 21; v <= max; v++ {
+		if versions[v-1] != v {
+			t.Fatalf("schema_migrations = %v, want a contiguous tail from 21", versions)
+		}
 	}
 
 	// Backlog untouched: same row count, new columns at their defaults.

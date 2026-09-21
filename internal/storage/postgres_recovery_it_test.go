@@ -449,6 +449,8 @@ func TestPostgresIntegrationExpireQueuedJobTwoReplicas(t *testing.T) {
 	storeA := env.open(t)
 	env.migrate(t, storeA)
 	storeB := env.open(t)
+	pgITArmFence(t, storeA)
+	pgITArmFence(t, storeB)
 	ctx := context.Background()
 	runID, jobID := pgITNewID(t), pgITNewID(t)
 	deadline := time.Now().UTC().Add(-time.Minute)

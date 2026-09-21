@@ -136,6 +136,7 @@ var _ storage.ProfileStore = (*fakeStore)(nil)
 var _ storage.QuotaCounterStore = (*fakeStore)(nil)
 var _ storage.RunEnqueueStore = (*fakeStore)(nil)
 var _ storage.RecoveryStore = (*fakeStore)(nil)
+var _ storage.RecoveryScanStore = (*fakeStore)(nil)
 
 // InsertCompiledRun applies the atomic enqueue in memory: the run, its jobs
 // (with the request's authoritative dependency edges), the supersede
@@ -490,6 +491,61 @@ func (f *fakeStore) RevokeRunnerLeases(ctx context.Context, runnerID, reason str
 		f.recomputeRunLocked(runID, now)
 	}
 	return ids, nil
+}
+
+// ListExpiredRunningJobs mirrors the storage discovery contract on the fake
+// store: running jobs with an elapsed or absent lease expiry, ordered by id
+// ASC and keyset-paged with id > afterID.
+func (f *fakeStore) ListExpiredRunningJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]model.Job, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []model.Job{}
+	for _, j := range f.jobs {
+		if j.ID <= afterID || j.Status != model.StatusRunning {
+			continue
+		}
+		if j.LeaseExpiresAt != nil && j.LeaseExpiresAt.After(now) {
+			continue
+		}
+		out = append(out, j)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// ListQueueTimedOutJobs mirrors the storage discovery contract on the fake
+// store: queued/waiting jobs whose effective queue deadline elapsed, ordered
+// by id ASC and keyset-paged with id > afterID.
+func (f *fakeStore) ListQueueTimedOutJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]model.Job, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []model.Job{}
+	for _, j := range f.jobs {
+		if j.ID <= afterID {
+			continue
+		}
+		if j.Status != model.StatusQueued && j.Status != model.StatusWaitingApproval {
+			continue
+		}
+		if dl := storage.QueueDeadlineFor(j); dl == nil || dl.After(now) {
+			continue
+		}
+		out = append(out, j)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
 // RecoverExpiredLease is the single expired-lease transition on the fake

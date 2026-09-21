@@ -25,8 +25,19 @@ import (
 // rewrites every existing row to the new type.
 func pgITBreakColumn(t *testing.T, st *PostgresStore, table, column string) {
 	t.Helper()
+	ctx := context.Background()
+	// 0026 derives two expression indexes from runs.payload; PostgreSQL
+	// cannot retype the column while they exist. They are irrelevant to the
+	// scanner-error assertion, so drop them in this throwaway schema first.
+	if table == "runs" && column == "payload" {
+		for _, idx := range []string{"runs_repo_identity_idx", "runs_repo_full_name_idx"} {
+			if _, err := st.pool.Exec(ctx, `DROP INDEX IF EXISTS `+idx); err != nil {
+				t.Fatalf("drop expression index %s: %v", idx, err)
+			}
+		}
+	}
 	q := fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN %s TYPE integer USING 0`, table, column)
-	if _, err := st.pool.Exec(context.Background(), q); err != nil {
+	if _, err := st.pool.Exec(ctx, q); err != nil {
 		t.Fatalf("break %s.%s: %v", table, column, err)
 	}
 }
@@ -1098,6 +1109,12 @@ func TestPostgresIntegrationMiscStatementBreaks(t *testing.T) {
 		runID, jobID := pgITNewID(t), pgITNewID(t)
 		pgITEnqueueOne(t, st, runID, jobID, pgITRepo)
 		if _, err := st.pool.Exec(context.Background(), `DROP INDEX jobs_environment_running_idx`); err != nil {
+			t.Fatal(err)
+		}
+		// Every partial index with a status predicate must be dropped before
+		// the column type changes: PostgreSQL cannot re-evaluate the predicate
+		// for a text[] column.
+		if _, err := st.pool.Exec(context.Background(), `DROP INDEX jobs_running_lease_recovery_idx, jobs_queue_deadline_recovery_idx`); err != nil {
 			t.Fatal(err)
 		}
 		pgITBreakColumnToArray(t, st, "jobs", "status")

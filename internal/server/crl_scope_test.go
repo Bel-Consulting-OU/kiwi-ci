@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,6 +29,18 @@ func crlRequestWithCert(t *testing.T, cert *x509.Certificate) *http.Request {
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 	req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{cert}}
 	return req
+}
+
+// crlRevoked reports whether serial is revoked, failing the test on a
+// lookup error. The fail-closed error path (revoked=true WITH the error) is
+// asserted explicitly where a store outage is injected.
+func crlRevoked(t *testing.T, s *Server, serial string) bool {
+	t.Helper()
+	revoked, err := s.certSerialRevoked(context.Background(), serial)
+	if err != nil {
+		t.Fatalf("certSerialRevoked(%q) error: %v", serial, err)
+	}
+	return revoked
 }
 
 // crlErrorStore injects a revocation-store outage while satisfying the
@@ -66,7 +79,7 @@ func TestCRLRevokedCertCannotReRegister(t *testing.T) {
 		if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/runner-a/disable", "admin-tok", ""); w.Code != http.StatusOK {
 			t.Fatalf("disable: %d", w.Code)
 		}
-		if !s.certSerialRevoked(serial) {
+		if !crlRevoked(t, s, serial) {
 			t.Fatal("serial not revoked")
 		}
 		// Re-registration with the revoked certificate is refused.
@@ -89,7 +102,7 @@ func TestCRLRevokedCertCannotReRegister(t *testing.T) {
 		if !reEnabled {
 			t.Fatal("runner was not re-enabled")
 		}
-		if !s.certSerialRevoked(serial) {
+		if !crlRevoked(t, s, serial) {
 			t.Fatal("enable cleared the certificate revocation")
 		}
 		if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/runner-a/next", map[string]any{}, "runner-tok", certA); w.Code != http.StatusUnauthorized && w.Code != http.StatusForbidden {
@@ -142,8 +155,8 @@ func TestCRLFailClosedWhenRevocationStoreUnavailable(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.DB = crlErrorStore{dbFakeStore: f}
-	if !s.certSerialRevoked("anything") {
-		t.Fatal("revocation store outage accepted the serial (fail open)")
+	if revoked, err := s.certSerialRevoked(context.Background(), "anything"); !revoked || err == nil {
+		t.Fatalf("revocation store outage = revoked %v, err %v; want revoked=true with the error (fail closed)", revoked, err)
 	}
 	_, certA := pkiSignRunner(t, ca, "runner-a")
 	if s.verifyRunnerIdentity(crlRequestWithCert(t, certA), "runner-a") {
@@ -163,17 +176,17 @@ func TestCRLSerialMatchingIsExact(t *testing.T) {
 	s.mu.Lock()
 	s.crl["deadbeef"] = "runner-a"
 	s.mu.Unlock()
-	if !s.certSerialRevoked("deadbeef") {
+	if !crlRevoked(t, s, "deadbeef") {
 		t.Fatal("exact serial not revoked")
 	}
 	for _, other := range []string{"DEADBEEF", "DeadBeef", "deadbeef ", " deadbeef", "0xdeadbeef", "deadbee", ""} {
-		if s.certSerialRevoked(other) {
+		if crlRevoked(t, s, other) {
 			t.Fatalf("serial %q matched the revoked entry", other)
 		}
 	}
 	// Revocation by record with an empty serial is a no-op, never a wildcard.
-	s.revokeRunnerCert(model.Runner{ID: "runner-b"}, "admin")
-	if s.certSerialRevoked("") {
+	s.revokeRunnerCert(context.Background(), model.Runner{ID: "runner-b"}, "admin")
+	if crlRevoked(t, s, "") {
 		t.Fatal("empty serial must never be revoked")
 	}
 }
@@ -266,29 +279,43 @@ func TestCorruptPersistedSecurityStateRefusesStartup(t *testing.T) {
 	}
 }
 
-// revokeErrStore accepts disables but always fails the durable revocation
-// write, modelling a store blip during disable.
+// revokeErrStore accepts disables but fails the CERTIFICATE REVOCATION write
+// inside the atomic disable transaction while fail is set, modelling a store
+// blip during disable.
 type revokeErrStore struct {
 	*dbFakeStore
+	fail atomic.Bool
 }
 
-func (revokeErrStore) RevokeCert(ctx context.Context, serial, runnerID, reason string) error {
-	return errors.New("durable revoke failed")
+func (r *revokeErrStore) DisableRunnerAndRevokeCert(ctx context.Context, runnerID, certSerial, actor string) (int, error) {
+	if r.fail.Load() {
+		return 0, errors.New("durable revoke failed")
+	}
+	return r.dbFakeStore.DisableRunnerAndRevokeCert(ctx, runnerID, certSerial, actor)
 }
 
-// TestLocalRevocationSurvivesCacheTTLAndStoreFailure proves a revocation
-// performed on this replica stays effective even when the durable write
-// fails and the decision cache expires: the local mirror is authoritative
-// for locally observed revocations, so a disable can never silently undo
-// itself after crlCacheTTL.
-func TestLocalRevocationSurvivesCacheTTLAndStoreFailure(t *testing.T) {
+// TestDisableRevocationWriteFailureFailsClosed is the ADAPTED former
+// TestLocalRevocationSurvivesCacheTTLAndStoreFailure (S6-B behavior change,
+// documented).
+//
+// The old admin disable composed UpsertRunner + RevokeRunnerLeases + a
+// best-effort RevokeCert and answered 200 even when the durable revocation
+// write failed, relying on this replica's local mirror to stay safe. The fix
+// makes disable + lease revocation + certificate revocation one store
+// transaction, so when the revocation cannot be recorded the handler answers
+// an opaque 503 and NOTHING changes: the runner is not disabled, no lease
+// moves and no local CRL entry appears (the certificate was never revoked
+// anywhere). Healing and retrying succeeds exactly once, and once the
+// revocation is durably recorded it stays effective after cache expiry.
+func TestDisableRevocationWriteFailureFailsClosed(t *testing.T) {
 	ca, err := runnerpki.NewCA("crl ca", time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, certA := pkiSignRunner(t, ca, "runner-a")
 	f := newDBFakeStore()
-	rs := revokeErrStore{dbFakeStore: f}
+	rs := &revokeErrStore{dbFakeStore: f}
+	rs.fail.Store(true)
 	s := New("runner-tok")
 	s.AdminToken = "admin-tok"
 	s.RunnerCA = ca
@@ -300,22 +327,54 @@ func TestLocalRevocationSurvivesCacheTTLAndStoreFailure(t *testing.T) {
 		map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "protocol_min": 3, "protocol_max": 3}, "runner-tok", certA); w.Code != http.StatusOK {
 		t.Fatalf("register: %d %s", w.Code, w.Body.String())
 	}
-	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/runner-a/disable", "admin-tok", ""); w.Code != http.StatusOK {
-		t.Fatalf("disable: %d %s", w.Code, w.Body.String())
+	// A leased job makes the lease revocation observable.
+	f.mu.Lock()
+	f.runs["run-a"] = model.Run{ID: "run-a", Status: model.StatusRunning}
+	f.jobs["job-a"] = model.Job{ID: "job-a", RunID: "run-a", Key: "build", Status: model.StatusRunning, LeaseRunnerID: "runner-a"}
+	f.mu.Unlock()
+
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/runner-a/disable", "admin-tok", "")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("disable with failing revocation = %d, want 503: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "durable revoke failed") {
+		t.Fatalf("disable failure leaked the raw store error: %q", w.Body.String())
 	}
 	serial := certA.SerialNumber.Text(16)
-	if !s.certSerialRevoked(serial) {
-		t.Fatal("local revocation not effective")
+	if crlRevoked(t, s, serial) {
+		t.Fatal("failed disable left a local revocation")
 	}
-	// Expire the decision cache (and clear the mirror-aware fast path) to
-	// prove the local mirror, not the cache, holds the decision.
+	f.mu.Lock()
+	ri, job := f.runners["runner-a"], f.jobs["job-a"]
+	f.mu.Unlock()
+	if ri.Disabled {
+		t.Fatalf("failed disable marked the runner disabled: %+v", ri)
+	}
+	if job.Status != model.StatusRunning || job.LeaseRunnerID != "runner-a" {
+		t.Fatalf("failed disable moved the lease: %+v", job)
+	}
+	// The certificate was never revoked, so identity verification still
+	// accepts it despite the failed attempt (no phantom revocation).
+	if !s.verifyRunnerIdentity(crlRequestWithCert(t, certA), "runner-a") {
+		t.Fatal("failed disable revoked the certificate on the identity path")
+	}
+
+	// Heal the store: the retry disables and revokes exactly once, and the
+	// revocation survives decision-cache expiry because the durable row and
+	// the local mirror agree.
+	rs.fail.Store(false)
+	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/runner-a/disable", "admin-tok", ""); w.Code != http.StatusOK {
+		t.Fatalf("healed disable = %d: %s", w.Code, w.Body.String())
+	}
+	if !crlRevoked(t, s, serial) {
+		t.Fatal("healed disable did not revoke locally")
+	}
 	s.crlMu.Lock()
 	s.crlCache = map[string]crlCacheEntry{}
 	s.crlMu.Unlock()
-	if !s.certSerialRevoked(serial) {
-		t.Fatal("revocation lost after cache expiry when the durable write failed")
+	if !crlRevoked(t, s, serial) {
+		t.Fatal("revocation lost after cache expiry")
 	}
-	// The certificate stays rejected on the identity path too.
 	if s.verifyRunnerIdentity(crlRequestWithCert(t, certA), "runner-a") {
 		t.Fatal("revoked certificate accepted after cache expiry")
 	}

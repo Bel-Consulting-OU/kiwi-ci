@@ -178,6 +178,8 @@ func TestPostgresIntegrationOutboxVersionedConcurrentReplicas(t *testing.T) {
 	stA := env.open(t)
 	env.migrate(t, stA)
 	stB := env.open(t)
+	pgITArmFence(t, stA)
+	pgITArmFence(t, stB)
 	ctx := context.Background()
 	key := "pg-race-key-" + pgITNewID(t)
 

@@ -164,13 +164,21 @@ type dbFakeStore struct {
 	// the caller's Seq and assigns the next value, mirroring the
 	// GENERATED ALWAYS AS IDENTITY column.
 	logSeq int64
-	// testHistoryVersion/testHistoryStats back the TestHistoryStore cache;
-	// testHistorySaveErr makes SaveTestHistory fail (report durability
-	// tests).
+	// testHistoryVersion/testHistoryStats back the legacy TestHistoryStore
+	// cache; testHistorySaveErr makes SaveTestHistory fail (legacy report
+	// durability tests). historyAggregates/historyVersions back the
+	// incremental TestHistoryAggregateStore contract (migration 0026), and
+	// insertReportHistoryErr / loadRepoHistoryErr inject its failures.
 	testHistoryVersion   int64
 	testHistoryStats     []byte
 	testHistorySaveErr   error
 	testHistorySaveCalls int
+
+	historyAggregates      map[string]map[string]storage.TestHistoryAggregate
+	historyVersions        map[string]int64
+	insertReportHistoryErr error
+	loadRepoHistoryErr     error
+	disableCertErr         error
 
 	insertRunCalls []model.Run
 	insertJobCalls []model.Job
@@ -239,6 +247,8 @@ var _ storage.RunnerTokenStore = (*dbFakeStore)(nil)
 var _ storage.CertRevocationStore = (*dbFakeStore)(nil)
 var _ storage.EnrollGrantStore = (*dbFakeStore)(nil)
 var _ storage.TestHistoryStore = (*dbFakeStore)(nil)
+var _ storage.TestHistoryAggregateStore = (*dbFakeStore)(nil)
+var _ storage.RunnerDisableStore = (*dbFakeStore)(nil)
 var _ storage.ArtifactIdempotentStore = (*dbFakeStore)(nil)
 var _ storage.GeneratedFragmentStore = (*dbFakeStore)(nil)
 var _ storage.CASReferenceStore = (*dbFakeStore)(nil)
@@ -282,31 +292,33 @@ func (f *dbFakeStore) TryAcquireCASGCLease(ctx context.Context, key string) (sto
 
 func newDBFakeStore() *dbFakeStore {
 	return &dbFakeStore{
-		runs:            map[string]model.Run{},
-		jobs:            map[string]model.Job{},
-		runners:         map[string]model.Runner{},
-		receipts:        map[string]model.CompletionReceipt{},
-		schedules:       map[string]storage.Schedule{},
-		occurrences:     map[string][]storage.Occurrence{},
-		deployments:     map[string]model.Deployment{},
-		contracts:       map[string]map[string]storage.ArtifactContract{},
-		queueReasons:    map[string]string{},
-		downstreamLinks: map[string]storage.DownstreamLink{},
-		deliveries:      map[string]string{},
-		quotas:          map[string][2]int{},
-		cacheMans:       map[string]storage.CacheManifestRecord{},
-		secretClaims:    map[string]bool{},
-		pendingSidecars: map[string]fakePendingSidecar{},
-		outboxClaims:    map[string]fakeOutboxClaim{},
-		outboxMeta:      map[string]fakeOutboxMeta{},
-		forgeState:      map[string]int64{},
-		fragments:       map[string]storage.GeneratedFragmentReceipt{},
-		profiles:        map[string]model.RunnerProfile{},
-		certProfiles:    map[string]string{},
-		runnerTokens:    map[string]string{},
-		revocations:     map[string]string{},
-		grants:          map[string]storage.EnrollGrantRecord{},
-		leaderOK:        true,
+		runs:              map[string]model.Run{},
+		jobs:              map[string]model.Job{},
+		runners:           map[string]model.Runner{},
+		receipts:          map[string]model.CompletionReceipt{},
+		schedules:         map[string]storage.Schedule{},
+		occurrences:       map[string][]storage.Occurrence{},
+		deployments:       map[string]model.Deployment{},
+		contracts:         map[string]map[string]storage.ArtifactContract{},
+		queueReasons:      map[string]string{},
+		downstreamLinks:   map[string]storage.DownstreamLink{},
+		deliveries:        map[string]string{},
+		quotas:            map[string][2]int{},
+		cacheMans:         map[string]storage.CacheManifestRecord{},
+		secretClaims:      map[string]bool{},
+		pendingSidecars:   map[string]fakePendingSidecar{},
+		outboxClaims:      map[string]fakeOutboxClaim{},
+		outboxMeta:        map[string]fakeOutboxMeta{},
+		forgeState:        map[string]int64{},
+		fragments:         map[string]storage.GeneratedFragmentReceipt{},
+		profiles:          map[string]model.RunnerProfile{},
+		certProfiles:      map[string]string{},
+		runnerTokens:      map[string]string{},
+		revocations:       map[string]string{},
+		grants:            map[string]storage.EnrollGrantRecord{},
+		historyAggregates: map[string]map[string]storage.TestHistoryAggregate{},
+		historyVersions:   map[string]int64{},
+		leaderOK:          true,
 	}
 }
 
@@ -744,6 +756,104 @@ func (f *dbFakeStore) RevokeRunnerLeases(ctx context.Context, runnerID, reason s
 	}
 	f.jobs, f.runners, f.runs, f.quotas, f.audit = jobs, runners, runs, quotas, audit
 	return ids, nil
+}
+
+// DisableRunnerAndRevokeCert mirrors the SQL RunnerDisableStore transaction:
+// the runner's leases are revoked, the runner is disabled (revoked_at
+// stamped), the certificate serial is revoked and the audit rows are written
+// together, staged on clones so an injected failure leaves NO partial state.
+// disableCertErr models the revoked-certificate write failing.
+func (f *dbFakeStore) DisableRunnerAndRevokeCert(ctx context.Context, runnerID, certSerial, actor string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.auditErr != nil {
+		// The audit rows commit inside the store transaction, so an
+		// unwritable audit fails the whole disable closed — exactly like the
+		// SQL insert of the audit rows aborting the transaction.
+		return 0, f.auditErr
+	}
+	if f.disableCertErr != nil {
+		return 0, f.disableCertErr
+	}
+	if _, ok := f.runners[runnerID]; !ok {
+		return 0, storage.ErrNotFound
+	}
+	now := time.Now().UTC()
+	ids := []string{}
+	for id, j := range f.jobs {
+		if j.Status == model.StatusRunning && j.LeaseRunnerID == runnerID {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	jobs := cloneJobMap(f.jobs)
+	runners := cloneRunnerMap(f.runners)
+	runs := cloneRunMap(f.runs)
+	quotas := cloneQuotaMap(f.quotas)
+	audit := append([]model.AuditEvent(nil), f.audit...)
+	revocations := map[string]string{}
+	for k, v := range f.revocations {
+		revocations[k] = v
+	}
+	changed := map[string]bool{}
+	runIDs := map[string]bool{}
+	for _, id := range ids {
+		j := jobs[id]
+		requeue := j.Attempts <= j.MaxInfraRetries
+		if requeue {
+			j.Status = model.StatusQueued
+			j.Error = "runner disabled; retrying"
+		} else {
+			j.Status = model.StatusCancelled
+			j.Error = "runner disabled"
+			j.FinishedAt = &now
+		}
+		j.LeaseRunnerID = ""
+		j.LeaseTokenHash = nil
+		j.LeaseExpiresAt = nil
+		jobs[id] = j
+		if requeue {
+			adjustQuotaMap(quotas, storage.RepoIDForJob(j), -1, 1)
+		} else {
+			adjustQuotaMap(quotas, storage.RepoIDForJob(j), -1, 0)
+		}
+		action := "job.runner_disabled_cancelled"
+		if requeue {
+			action = "job.runner_disabled_requeued"
+		}
+		audit = append(audit, recoveryAudit(j, action, "admin", "runner disabled", map[string]string{"job": j.Key, "runner": runnerID}, now))
+		changed[id] = true
+		if j.RunID != "" {
+			runIDs[j.RunID] = true
+		}
+	}
+	for _, id := range ids {
+		releaseRunnerSlotMap(runners, runnerID, id)
+		if r, ok := runners[runnerID]; ok {
+			r.Failed++
+			r.LastSeen = now
+			runners[runnerID] = r
+		}
+	}
+	recomputeDependentsMap(jobs, changed, now)
+	for runID := range runIDs {
+		recomputeRunMap(runs, jobs, runID)
+	}
+	ri := runners[runnerID]
+	ri.Disabled = true
+	if certSerial != "" && ri.RevokedAt == nil {
+		ri.RevokedAt = &now
+	}
+	runners[runnerID] = ri
+	if certSerial != "" {
+		revocations[certSerial] = runnerID
+	}
+	audit = append(audit, model.AuditEvent{ID: runnerID + "|runner.disable", Action: "runner.disable", Actor: actor, Message: "runner disabled", Metadata: map[string]string{"runner": runnerID}, CreatedAt: now})
+	if certSerial != "" {
+		audit = append(audit, model.AuditEvent{ID: runnerID + "|runner.cert_revoked", Action: "runner.cert_revoked", Actor: actor, Message: "runner certificate serial revoked", Metadata: map[string]string{"runner": runnerID, "serial": certSerial}, CreatedAt: now})
+	}
+	f.jobs, f.runners, f.runs, f.quotas, f.audit, f.revocations = jobs, runners, runs, quotas, audit, revocations
+	return len(ids), nil
 }
 
 // RecoverExpiredLease mirrors memStore.RecoverExpiredLease: an expired
@@ -1752,6 +1862,207 @@ func (f *dbFakeStore) SaveTestHistory(ctx context.Context, stats []byte) (int64,
 	f.testHistoryVersion++
 	f.testHistoryStats = append([]byte(nil), stats...)
 	return f.testHistoryVersion, nil
+}
+
+// ---------------------------------------------------------------------------
+// storage.TestHistoryAggregateStore: the incremental repository-scoped
+// history mirror of migration 0026. Every method works on the fake's maps
+// only, so server tests can prove scoping, bounded updates and the
+// fail-closed atomic upload without a database.
+// ---------------------------------------------------------------------------
+
+// historyKey is the fake's in-memory aggregate primary key.
+func fakeHistoryKey(suite, class, name string) string {
+	return suite + "\x00" + class + "\x00" + name
+}
+
+func (f *dbFakeStore) InsertTestReportWithHistory(ctx context.Context, rep model.TestReport, repoID string) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.insertReportHistoryErr != nil {
+		return 0, f.insertReportHistoryErr
+	}
+	f.reports = append(f.reports, rep)
+	rows := f.historyAggregates[repoID]
+	if rows == nil {
+		rows = map[string]storage.TestHistoryAggregate{}
+		f.historyAggregates[repoID] = rows
+	}
+	for _, c := range rep.Cases {
+		key := fakeHistoryKey(rep.JobKey, c.Class, c.Name)
+		row := rows[key]
+		row.RepoID, row.Suite, row.Class, row.Name = repoID, rep.JobKey, c.Class, c.Name
+		rows[key] = storage.FoldTestHistoryAggregate(row, storage.TestHistoryEntry{Suite: rep.JobKey, Class: c.Class, Name: c.Name, Duration: c.Duration, Passed: c.Passed, When: rep.CreatedAt})
+	}
+	f.historyVersions[repoID]++
+	f.testHistoryVersion++
+	return f.historyVersions[repoID], nil
+}
+
+func (f *dbFakeStore) LoadRepoTestHistory(ctx context.Context, repoID string) (int64, []byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.loadRepoHistoryErr != nil {
+		return 0, nil, f.loadRepoHistoryErr
+	}
+	version, ok := f.historyVersions[repoID]
+	if !ok {
+		return 0, nil, nil
+	}
+	rows := make([]storage.TestHistoryAggregate, 0, len(f.historyAggregates[repoID]))
+	for _, row := range f.historyAggregates[repoID] {
+		rows = append(rows, row)
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Suite != rows[j].Suite {
+			return rows[i].Suite < rows[j].Suite
+		}
+		if rows[i].Class != rows[j].Class {
+			return rows[i].Class < rows[j].Class
+		}
+		return rows[i].Name < rows[j].Name
+	})
+	stats, err := storage.EncodeTestHistoryStats(rows)
+	if err != nil {
+		return 0, nil, err
+	}
+	return version, stats, nil
+}
+
+func (f *dbFakeStore) ResolveTestHistoryRepoIDs(ctx context.Context, query string, limit int) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if limit <= 0 {
+		limit = 64
+	}
+	seen := map[string]bool{}
+	out := []string{}
+	for _, run := range f.runs {
+		if !runMatchesRepoQuery(run, query) {
+			continue
+		}
+		id := repoIDForRun(run)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+		if len(out) >= limit {
+			break
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func (f *dbFakeStore) TestReportTotals(ctx context.Context, repoIDs []string, repoQuery string) (int, int, int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ids := map[string]bool{}
+	for _, id := range repoIDs {
+		ids[id] = true
+	}
+	var reports, tests, failures int
+	for _, rep := range f.reports {
+		run, ok := f.runs[rep.RunID]
+		if !ok {
+			continue
+		}
+		if !ids[repoIDForRun(run)] && !runMatchesRepoQuery(run, repoQuery) {
+			continue
+		}
+		reports++
+		tests += rep.Tests
+		failures += rep.Failures
+	}
+	return reports, tests, failures, nil
+}
+
+func (f *dbFakeStore) FlakyTestNames(ctx context.Context, repoIDs []string, limit int) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if limit <= 0 {
+		limit = 1000
+	}
+	seen := map[string]bool{}
+	out := []string{}
+	for _, id := range repoIDs {
+		for _, row := range f.historyAggregates[id] {
+			if row.Passes == 0 || row.Fails == 0 {
+				continue
+			}
+			display := row.Name
+			if row.Class != "" {
+				display = row.Class + "." + row.Name
+			}
+			if seen[display] {
+				continue
+			}
+			seen[display] = true
+			out = append(out, display)
+		}
+	}
+	sort.Strings(out)
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (f *dbFakeStore) RebuildRepoTestHistory(ctx context.Context, repoID string) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	reports := []model.TestReport{}
+	for _, rep := range f.reports {
+		run, ok := f.runs[rep.RunID]
+		if !ok || repoIDForRun(run) != repoID {
+			continue
+		}
+		reports = append(reports, rep)
+	}
+	sort.SliceStable(reports, func(i, j int) bool {
+		if !reports[i].CreatedAt.Equal(reports[j].CreatedAt) {
+			return reports[i].CreatedAt.Before(reports[j].CreatedAt)
+		}
+		return reports[i].ID < reports[j].ID
+	})
+	rows := map[string]storage.TestHistoryAggregate{}
+	for _, rep := range reports {
+		for _, c := range rep.Cases {
+			key := fakeHistoryKey(rep.JobKey, c.Class, c.Name)
+			row := rows[key]
+			row.RepoID, row.Suite, row.Class, row.Name = repoID, rep.JobKey, c.Class, c.Name
+			rows[key] = storage.FoldTestHistoryAggregate(row, storage.TestHistoryEntry{Suite: rep.JobKey, Class: c.Class, Name: c.Name, Duration: c.Duration, Passed: c.Passed, When: rep.CreatedAt})
+		}
+	}
+	f.historyAggregates[repoID] = rows
+	f.historyVersions[repoID]++
+	return f.historyVersions[repoID], nil
+}
+
+func (f *dbFakeStore) ListTestHistoryRepoIDs(ctx context.Context, limit int) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if limit <= 0 {
+		limit = 1000
+	}
+	seen := map[string]bool{}
+	for _, rep := range f.reports {
+		if run, ok := f.runs[rep.RunID]; ok {
+			if id := repoIDForRun(run); id != "" {
+				seen[id] = true
+			}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for id := range seen {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
 func (f *dbFakeStore) PutCheckRun(ctx context.Context, key, checkRunID string) error {

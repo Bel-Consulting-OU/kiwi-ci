@@ -77,6 +77,15 @@ func (l *pgCASGCLease) Release(ctx context.Context) error {
 // advisory lock on a 64-bit key derived from the collector key. The lock is
 // released when the returned lease is released (rollback) or when its
 // connection dies, so a crashed collector never wedges the next pass.
+//
+// The pass is leader-only, so the transaction is FENCED first: the store's
+// retained leadership epoch must still match the durable leader_fence row.
+// A stale leader is rejected with ErrStaleLeader before taking the collector
+// lease, so it can start no pass and delete nothing. The fence's share lock
+// is held for the whole pass (the lease transaction stays open until
+// Release), which also keeps a new leader from publishing its epoch until the
+// in-flight pass has finished — a stale pass can therefore never overlap a
+// fresh one.
 func (s *PostgresStore) TryAcquireCASGCLease(ctx context.Context, key string) (CASGCLease, bool, error) {
 	if key == "" {
 		return nil, false, fmt.Errorf("storage: empty cas gc lease key")
@@ -87,6 +96,10 @@ func (s *PostgresStore) TryAcquireCASGCLease(ctx context.Context, key string) (C
 	}
 	tx, err := pool.Begin(ctx)
 	if err != nil {
+		return nil, false, err
+	}
+	if err := s.fenceLeaderTx(ctx, tx); err != nil {
+		_ = tx.Rollback(ctx)
 		return nil, false, err
 	}
 	var got bool

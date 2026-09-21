@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/giturl"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -82,6 +84,30 @@ var (
 	// workloads. A seam so the docker integration test can observe the
 	// post-run host-side state instead of racing the cleanup.
 	removeJobWorkspace = os.RemoveAll
+)
+
+// Client policy seams. Ordinary control-plane calls (register/next/heartbeat/
+// log-batch/completion/status JSON) carry a bounded TOTAL timeout: a stalled
+// control plane must fail fast and be retried, never pin a runner slot.
+// Bulk streaming transfers (artifact, cache, snapshot and dependency traffic)
+// must NOT carry a total wall-clock bound: Kiwi's own size limits allow
+// objects up to 8 GiB, which at any sustainable rate can legitimately outlive
+// any fixed total. The streaming client therefore has Timeout 0 and relies on
+// its transport's phase bounds plus a sliding idle guard (streamIdleTimeout)
+// so a dead peer is still torn down.
+var (
+	// controlClientTimeout bounds the total duration of one ordinary
+	// control-plane exchange. Production uses this value; the variable is a
+	// test seam so a stalled-transfer regression can be proven in bounded
+	// time.
+	controlClientTimeout = 65 * time.Second
+	// streamIdleTimeout is the runner-side sliding inactivity bound for bulk
+	// transfers: a request context is cancelled when no byte flows in either
+	// direction for this long, so an arbitrarily large object may take as
+	// long as it keeps making progress while a peer that stops transferring
+	// is disconnected. Production uses this value; the variable is a test
+	// seam.
+	streamIdleTimeout = 90 * time.Second
 )
 
 type Config struct {
@@ -159,6 +185,14 @@ type Runner struct {
 	ID      string
 	Client  *http.Client
 	Metrics *Metrics
+	// StreamClient carries bulk transfers (artifact/cache/snapshot/dependency
+	// uploads and downloads). It deliberately has no total timeout: the
+	// transport bounds dial/TLS-handshake/response-header phases and each
+	// request is bounded by its job context plus the sliding streamIdleTimeout
+	// stall guard. Client stays bounded-total and is used for ordinary
+	// control-plane calls. Run/prepareClient set both; a directly constructed
+	// Runner without StreamClient (tests) falls back to Client.
+	StreamClient *http.Client
 	// store is the identity store used when enrollment persistence is
 	// active (IdentityDir configured); it clears the persisted certificate
 	// when the control plane disables or revokes this runner.
@@ -256,12 +290,11 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err := r.prepareClient(ctx); err != nil {
 		return err
 	}
-	if r.Client == nil {
-		r.Client = &http.Client{Timeout: 65 * time.Second}
-	}
+	r.applyClientPolicy()
 	// Credential-bearing runner traffic must never follow redirects to a
 	// different origin.
 	r.Client = server.NoRedirectClient(r.Client)
+	r.StreamClient = server.NoRedirectClient(r.StreamClient)
 	if err := r.register(ctx); err != nil {
 		return err
 	}
@@ -1140,32 +1173,41 @@ func (r *Runner) restoreDownloads(ctx context.Context, t server.Task, inputs []p
 			return fmt.Errorf("invalid download declaration (from=%q name=%q)", in.From, in.Name)
 		}
 		url := r.Cfg.Server + "/api/v1/jobs/" + t.Job.ID + "/dependencies/" + url.PathEscape(producer) + "/" + url.PathEscape(name)
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		reqCtx, cancel := context.WithCancel(ctx)
+		guard := newStallGuard(cancel, streamIdleTimeout)
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
 		if err != nil {
+			guard.stop()
+			cancel()
 			return err
 		}
 		r.auth(req)
 		req.Header.Set("X-Kiwi-Runner-ID", r.ID)
 		req.Header.Set("X-Kiwi-Lease-Token", t.LeaseToken)
 		req.Header.Set("X-Kiwi-Lease-Generation", fmt.Sprint(t.LeaseGeneration))
-		resp, err := r.Client.Do(req)
+		resp, err := r.streamClient().Do(req)
 		if err != nil {
+			guard.stop()
+			cancel()
 			return err
 		}
 		if resp.StatusCode != 200 {
 			b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
+			guard.stop()
+			cancel()
 			return fmt.Errorf("download dependency %s from %s: %s: %s", name, producer, resp.Status, strings.TrimSpace(string(b)))
 		}
+		body := &stallGuardedBody{ReadCloser: resp.Body, guard: guard, cancel: cancel}
 		tmp, err := os.CreateTemp("", "kiwi-artifact-*.tar.gz")
 		if err != nil {
-			resp.Body.Close()
+			body.Close()
 			return err
 		}
 		tmpPath := tmp.Name()
 		h := sha256.New()
-		_, cp := io.Copy(io.MultiWriter(tmp, h), resp.Body)
-		resp.Body.Close()
+		_, cp := io.Copy(io.MultiWriter(tmp, h), body)
+		body.Close()
 		cl := closeRunnerTempFile(tmp)
 		if cp != nil {
 			os.Remove(tmpPath)
@@ -1217,7 +1259,10 @@ func (r *Runner) uploadArtifact(ctx context.Context, t server.Task, name, path s
 }
 
 // putArtifact performs one artifact PUT attempt. The archive is reopened on
-// every attempt because the request body is the file itself.
+// every attempt because the request body is the file itself. It runs on the
+// streaming client (no total timeout) with a sliding inactivity guard, so an
+// 8 GiB archive completes at any sustainable rate while a stalled peer is
+// still torn down.
 func (r *Runner) putArtifact(ctx context.Context, t server.Task, name, path string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -1225,7 +1270,11 @@ func (r *Runner) putArtifact(ctx context.Context, t server.Task, name, path stri
 	}
 	defer f.Close()
 	url := r.Cfg.Server + "/api/v1/jobs/" + t.Job.ID + "/artifacts/" + name
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, f)
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	guard := newStallGuard(cancel, streamIdleTimeout)
+	defer guard.stop()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPut, url, &stallGuardReader{r: f, guard: guard})
 	if err != nil {
 		return err
 	}
@@ -1234,7 +1283,7 @@ func (r *Runner) putArtifact(ctx context.Context, t server.Task, name, path stri
 	req.Header.Set("X-Kiwi-Runner-ID", r.ID)
 	req.Header.Set("X-Kiwi-Lease-Token", t.LeaseToken)
 	req.Header.Set("X-Kiwi-Lease-Generation", fmt.Sprint(t.LeaseGeneration))
-	resp, err := r.Client.Do(req)
+	resp, err := r.streamClient().Do(req)
 	if err != nil {
 		return err
 	}
@@ -1603,8 +1652,135 @@ func (r *Runner) prepareClient(ctx context.Context) error {
 		return err
 	}
 	r.clientCertPEM = append([]byte(nil), certPEM...)
-	r.Client = &http.Client{Timeout: 65 * time.Second, Transport: &http.Transport{TLSClientConfig: tlsConf}}
+	// Both clients share one connection pool; only the per-client total
+	// timeout differs (control bounded, streaming unbounded).
+	transport := newStreamingTransport(tlsConf)
+	r.Client = &http.Client{Timeout: controlClientTimeout, Transport: transport}
+	r.StreamClient = &http.Client{Transport: transport}
 	return nil
+}
+
+// applyClientPolicy installs the split control/streaming client policy on a
+// runner whose clients were not already built by prepareClient. A caller-
+// provided Client is preserved (its Timeout is the control bound) and the
+// streaming client reuses its transport, so tests and embedders that inject
+// one client keep exactly one connection pool.
+func (r *Runner) applyClientPolicy() {
+	if r.Client == nil {
+		r.Client = &http.Client{Timeout: controlClientTimeout}
+	}
+	if r.StreamClient != nil {
+		return
+	}
+	var transport http.RoundTripper
+	if r.Client.Transport != nil {
+		transport = r.Client.Transport
+	} else {
+		// Install the phase-bounded transport on the control client too, so
+		// both clients share one connection pool.
+		transport = newStreamingTransport(nil)
+		r.Client.Transport = transport
+	}
+	r.StreamClient = &http.Client{Transport: transport}
+}
+
+// newStreamingTransport builds the transport used by the streaming client
+// (and shared by the control client for connection reuse). It has no
+// whole-request bound but each phase is bounded: dial and TLS handshake, the
+// wait for response headers, and idle pooled connections. A peer that cannot
+// make any progress is torn down by these bounds (plus the per-request stall
+// guard); a peer that keeps transferring is never cut by wall-clock time.
+func newStreamingTransport(tlsConf *tls.Config) *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.DialContext = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	t.TLSHandshakeTimeout = 30 * time.Second
+	t.ResponseHeaderTimeout = 60 * time.Second
+	t.IdleConnTimeout = 90 * time.Second
+	if tlsConf != nil {
+		t.TLSClientConfig = tlsConf
+	}
+	return t
+}
+
+// streamClient returns the client for bulk streaming transfers. A runner
+// constructed directly by tests without a StreamClient falls back to Client
+// so the transfer stays bounded by that client's total timeout.
+func (r *Runner) streamClient() *http.Client {
+	if r.StreamClient != nil {
+		return r.StreamClient
+	}
+	if r.Client != nil {
+		return r.Client
+	}
+	return http.DefaultClient
+}
+
+// stallGuard cancels a streaming request's context when no byte has moved
+// for streamIdleTimeout. It is armed at creation and re-armed by every
+// successful transfer, so sustained progress keeps an arbitrarily large
+// object alive for exactly as long as it needs while a peer that stops
+// transferring is disconnected. The bound is expressed as a sliding idle
+// window, never as a total transfer time.
+type stallGuard struct {
+	cancel context.CancelFunc
+	idle   time.Duration
+	timer  *time.Timer
+}
+
+func newStallGuard(cancel context.CancelFunc, idle time.Duration) *stallGuard {
+	g := &stallGuard{cancel: cancel, idle: idle}
+	g.timer = time.AfterFunc(idle, cancel)
+	return g
+}
+
+// progress re-arms the inactivity timer after a successful transfer.
+func (g *stallGuard) progress() {
+	g.timer.Reset(g.idle)
+}
+
+// stop disarms the timer once the request has finished.
+func (g *stallGuard) stop() {
+	g.timer.Stop()
+}
+
+// stallGuardReader re-arms a stall guard on every successful read. It wraps
+// upload bodies: when the transport stops pulling bytes (a stalled peer
+// applying backpressure) the guard fires and cancels the request.
+type stallGuardReader struct {
+	r     io.Reader
+	guard *stallGuard
+}
+
+func (g *stallGuardReader) Read(p []byte) (int, error) {
+	n, err := g.r.Read(p)
+	if n > 0 {
+		g.guard.progress()
+	}
+	return n, err
+}
+
+// stallGuardedBody wraps a streaming response body so a read-level stall
+// cancels the request context. Close disarms the guard and releases the
+// derived context.
+type stallGuardedBody struct {
+	io.ReadCloser
+	guard  *stallGuard
+	cancel context.CancelFunc
+}
+
+func (b *stallGuardedBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if n > 0 {
+		b.guard.progress()
+	}
+	return n, err
+}
+
+func (b *stallGuardedBody) Close() error {
+	b.guard.stop()
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
 }
 
 // enroll requests a runner certificate for r.ID in exchange for the

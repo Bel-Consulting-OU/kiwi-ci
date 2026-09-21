@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -69,6 +70,14 @@ type PostgresStore struct {
 	// advisory try-lock). The cached hot path never takes it, so a slow or
 	// black-holed acquisition cannot block cached leadership calls.
 	leaderAcquireMu sync.Mutex
+	// leaderEpoch is the leadership epoch this store retains from its own
+	// successful advisory-lock acquisition (published on the SAME dedicated
+	// session in one transaction, migration 0025). 0 means "retained none":
+	// every leader-fenced operation then fails closed with ErrStaleLeader.
+	// It is set only by acquisition and cleared on any loss (release, dead
+	// session, key change, fence mismatch); it is never decremented, and the
+	// durable epoch is only ever advanced with epoch + 1.
+	leaderEpoch atomic.Int64
 }
 
 var _ Store = (*PostgresStore)(nil)
@@ -106,6 +115,9 @@ var (
 	_ SecretClaimReleaser   = (*PostgresStore)(nil)
 	_ OutboxDeadLetterStore = (*PostgresStore)(nil)
 	_ ForgeCheckStateStore  = (*PostgresStore)(nil)
+	_ RecoveryScanStore     = (*PostgresStore)(nil)
+	_ OutboxClaimBatchStore = (*PostgresStore)(nil)
+	_ LeaderFenceStore      = (*PostgresStore)(nil)
 )
 
 // NewPostgres opens a pool and verifies connectivity.
@@ -161,8 +173,16 @@ func NewPostgresFromPool(pool *pgxpool.Pool) *PostgresStore {
 }
 
 // advisoryPool returns the dedicated advisory-lock pool, creating it from
-// the operational pool's DSN on first use. A dedicated pool can never be
-// exhausted by ordinary operations.
+// the operational pool's configuration on first use. A dedicated pool can
+// never be exhausted by ordinary operations.
+//
+// The advisory pool must connect EXACTLY like the operational pool: the
+// leadership epoch is stored in leader_fence (a schema-qualified relation in
+// production; a per-test search_path schema in integration tests) and the
+// CAS GC lease transaction reads it, so the pool copies the operational
+// ConnConfig (hosts, TLS, credentials, RuntimeParams such as search_path)
+// rather than re-parsing the original DSN, which would silently drop
+// programmatic connection settings.
 func (s *PostgresStore) advisoryPool() (*pgxpool.Pool, error) {
 	s.fencePoolOnce.Do(func() {
 		dsn := ""
@@ -177,6 +197,9 @@ func (s *PostgresStore) advisoryPool() (*pgxpool.Pool, error) {
 		if err != nil {
 			s.fencePoolErr = fmt.Errorf("storage: parse dsn for advisory pool: %w", err)
 			return
+		}
+		if src := s.pool.Config(); src != nil && src.ConnConfig != nil {
+			cfg.ConnConfig = src.ConnConfig.Copy()
 		}
 		// Explicit cap: the lock pool exists to be INDEPENDENT of the
 		// operational pool, not to mirror its size.
@@ -452,6 +475,17 @@ func (s *PostgresStore) InsertCompiledRun(ctx context.Context, req InsertCompile
 		return err
 	}
 	defer tx.Rollback(ctx)
+
+	// A schedule occurrence claim makes this enqueue leader-only work (the
+	// fired run and its (schedule, nominal) occurrence commit together), so
+	// it is epoch-FENCED before anything is inserted: a stale leader fires no
+	// schedule. Ordinary submissions carry no claim and are not leader-gated,
+	// so they are deliberately not fenced.
+	if req.ScheduleClaim != nil {
+		if err := s.fenceLeaderTx(ctx, tx); err != nil {
+			return err
+		}
+	}
 
 	// The downstream launch claim is resolved BEFORE the run row is
 	// inserted: a link already launched with the SAME stable child ID
@@ -982,7 +1016,11 @@ func (s *PostgresStore) ListRuns(ctx context.Context, limit int) ([]model.Run, e
 // ---------------------------------------------------------------------------
 
 // jobWriteArgs marshals a job into the real-column + payload argument list
-// used by both INSERT and the upsert path of UpdateJob.
+// used by both INSERT and the upsert path of UpdateJob. queue_deadline is a
+// DERIVED index of the payload's QueueDeadline (migration 0021): stamping it
+// here keeps the bounded queue-timeout discovery (ListQueueTimedOutJobs, via
+// jobs_queue_deadline_recovery_idx) in sync with the authoritative payload
+// without touching the payload itself.
 func jobWriteArgs(j model.Job) ([]any, error) {
 	payload, err := jsonMarshal(j)
 	if err != nil {
@@ -999,7 +1037,7 @@ func jobWriteArgs(j model.Job) ([]any, error) {
 		j.Priority, j.Attempts,
 		nullText(j.Error), outputsJSON,
 		nullText(j.LeaseRunnerID), nullBytes(j.LeaseTokenHash), j.LeaseGeneration,
-		j.LeaseExpiresAt, j.StartedAt, j.FinishedAt, j.CreatedAt, payload,
+		j.LeaseExpiresAt, j.StartedAt, j.FinishedAt, j.CreatedAt, j.QueueDeadline, payload,
 	}, nil
 }
 
@@ -1019,7 +1057,7 @@ func (s *PostgresStore) insertJobRowTx(ctx context.Context, tx pgx.Tx, j model.J
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO jobs (id, run_id, key, status, dependency_status, priority, attempts, error, outputs, lease_runner_id, lease_token_hash, lease_generation, lease_expires_at, started_at, finished_at, created_at, payload) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`, args...)
+	_, err = tx.Exec(ctx, `INSERT INTO jobs (id, run_id, key, status, dependency_status, priority, attempts, error, outputs, lease_runner_id, lease_token_hash, lease_generation, lease_expires_at, started_at, finished_at, created_at, queue_deadline, payload) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`, args...)
 	return err
 }
 
@@ -1192,7 +1230,7 @@ func (s *PostgresStore) UpdateJob(ctx context.Context, job model.Job) error {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `INSERT INTO jobs (id, run_id, key, status, dependency_status, priority, attempts, error, outputs, lease_runner_id, lease_token_hash, lease_generation, lease_expires_at, started_at, finished_at, created_at, payload) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT (id) DO UPDATE SET run_id=EXCLUDED.run_id, key=EXCLUDED.key, status=EXCLUDED.status, dependency_status=EXCLUDED.dependency_status, priority=EXCLUDED.priority, attempts=EXCLUDED.attempts, error=EXCLUDED.error, outputs=EXCLUDED.outputs, lease_runner_id=EXCLUDED.lease_runner_id, lease_token_hash=EXCLUDED.lease_token_hash, lease_generation=EXCLUDED.lease_generation, lease_expires_at=EXCLUDED.lease_expires_at, started_at=EXCLUDED.started_at, finished_at=EXCLUDED.finished_at, created_at=EXCLUDED.created_at, payload=EXCLUDED.payload`, args...); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO jobs (id, run_id, key, status, dependency_status, priority, attempts, error, outputs, lease_runner_id, lease_token_hash, lease_generation, lease_expires_at, started_at, finished_at, created_at, queue_deadline, payload) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) ON CONFLICT (id) DO UPDATE SET run_id=EXCLUDED.run_id, key=EXCLUDED.key, status=EXCLUDED.status, dependency_status=EXCLUDED.dependency_status, priority=EXCLUDED.priority, attempts=EXCLUDED.attempts, error=EXCLUDED.error, outputs=EXCLUDED.outputs, lease_runner_id=EXCLUDED.lease_runner_id, lease_token_hash=EXCLUDED.lease_token_hash, lease_generation=EXCLUDED.lease_generation, lease_expires_at=EXCLUDED.lease_expires_at, started_at=EXCLUDED.started_at, finished_at=EXCLUDED.finished_at, created_at=EXCLUDED.created_at, queue_deadline=EXCLUDED.queue_deadline, payload=EXCLUDED.payload`, args...); err != nil {
 		return err
 	}
 	if err := s.replaceDependenciesTx(ctx, tx, job); err != nil {
@@ -2661,32 +2699,13 @@ func (s *PostgresStore) InsertTestReport(ctx context.Context, rep model.TestRepo
 	if err := ValidateRunID(rep.RunID); err != nil {
 		return err
 	}
-	payload, err := jsonMarshal(rep)
-	if err != nil {
-		return err
-	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `INSERT INTO test_results (id, run_id, job_id, job_key, path, tests, failures, duration, created_at, payload) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-		rep.ID, rep.RunID, nullText(rep.JobID), nullText(rep.JobKey), nullText(rep.Path), rep.Tests, rep.Failures, rep.Duration, rep.CreatedAt, payload); err != nil {
+	if err := insertTestReportRowsTx(ctx, tx, rep); err != nil {
 		return err
-	}
-	for _, c := range rep.Cases {
-		caseID, err := newID()
-		if err != nil {
-			return err
-		}
-		cp, err := jsonMarshal(c)
-		if err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO test_cases (id, report_id, name, class, duration, passed, message, payload) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-			caseID, rep.ID, c.Name, nullText(c.Class), c.Duration, c.Passed, nullText(c.Message), cp); err != nil {
-			return err
-		}
 	}
 	return tx.Commit(ctx)
 }
@@ -2963,6 +2982,10 @@ func jsonPayloadEqual(a, b []byte) bool {
 	return reflect.DeepEqual(x, y)
 }
 
+// OutboxAck removes a successfully dispatched row (clearing any claim). It is
+// the durable ACK of the leader-only outbox flush, so it runs in a
+// transaction FENCED by the store's leadership epoch: a stale leader's ACK is
+// rejected with ErrStaleLeader and the row stays durable for the retry.
 func (s *PostgresStore) OutboxAck(ctx context.Context, id string) error {
 	if id == "" {
 		return fmt.Errorf("storage: empty outbox id")
@@ -2975,7 +2998,12 @@ func (s *PostgresStore) OutboxAck(ctx context.Context, id string) error {
 	// watermark can never lag an acknowledged delivery, and it outlives the
 	// row deletion. GREATEST keeps the watermark monotonic when two replicas
 	// ack different versions of one logical key concurrently.
-	if _, err := s.pool.Exec(ctx, `WITH deleted AS (
+	tx, err := s.beginFencedTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `WITH deleted AS (
 			DELETE FROM outbox WHERE id=$1
 			RETURNING logical_key, state_version
 		)
@@ -2986,7 +3014,7 @@ func (s *PostgresStore) OutboxAck(ctx context.Context, id string) error {
 			    updated_at = now()`, id); err != nil {
 		return err
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 // OutboxMarkDelivered advances the durable delivered watermark for one
@@ -2995,6 +3023,12 @@ func (s *PostgresStore) OutboxAck(ctx context.Context, id string) error {
 // watermark; the dispatcher derives the identity from the payload and calls
 // this after the forge accepted the state. GREATEST keeps it monotonic under
 // concurrent publications of different versions.
+//
+// Deliberately not epoch-fenced, together with OutboxRetry: both are per-row
+// bookkeeping for a claim the caller already owns (the claim itself, the ACK
+// and the release ARE fenced), they are monotonic/idempotent, and OutboxRetry
+// is also reachable from the operator/CLI paths, so fencing them would reject
+// non-leader callers without protecting anything the claim fence does not.
 func (s *PostgresStore) OutboxMarkDelivered(ctx context.Context, logicalKey string, version int64) error {
 	if logicalKey == "" || version <= 0 {
 		return fmt.Errorf("storage: mark delivered requires a logical key and a positive version")
@@ -3203,6 +3237,9 @@ func (s *PostgresStore) OutboxDelete(ctx context.Context, id string) error {
 // rows that are unclaimed or whose claim is older than OutboxClaimTTL are
 // selected in FIFO order with FOR UPDATE SKIP LOCKED, so concurrent flushers
 // on different replicas claim disjoint batches and never double-dispatch.
+// The claim runs in a transaction FENCED by the store's leadership epoch: the
+// leader-only outbox flush rejects a stale leader with ErrStaleLeader before
+// claiming anything.
 func (s *PostgresStore) ClaimOutbox(ctx context.Context, claimer string, limit int) ([]OutboxItem, error) {
 	if strings.TrimSpace(claimer) == "" {
 		return nil, fmt.Errorf("storage: empty outbox claimer")
@@ -3210,8 +3247,13 @@ func (s *PostgresStore) ClaimOutbox(ctx context.Context, claimer string, limit i
 	if limit <= 0 {
 		return nil, nil
 	}
+	tx, err := s.beginFencedTx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
 	cutoff := time.Now().UTC().Add(-OutboxClaimTTL)
-	rows, err := s.pool.Query(ctx, `UPDATE outbox o SET claimed_at = now(), claimed_by = $1
+	rows, err := tx.Query(ctx, `UPDATE outbox o SET claimed_at = now(), claimed_by = $1
 		FROM (
 			SELECT id FROM outbox
 			WHERE dead_lettered_at IS NULL
@@ -3226,29 +3268,75 @@ func (s *PostgresStore) ClaimOutbox(ctx context.Context, claimer string, limit i
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	out := []OutboxItem{}
 	for rows.Next() {
 		var it OutboxItem
 		var key *string
 		if err := rows.Scan(&it.ID, &it.Kind, &it.Payload, &it.CreatedAt, &key, &it.StateVersion); err != nil {
+			rows.Close()
 			return nil, err
 		}
 		it.LogicalKey = nullableText(key)
 		out = append(out, it)
 	}
-	return out, rows.Err()
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Commit releases the claimed rows to the caller: the claim is durable
+	// (claimed_at/claimed_by), not transaction-scoped.
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // ReleaseOutboxClaim drops a claim the caller made but did not dispatch, so a
 // retry can claim the row again immediately instead of waiting out the TTL.
 // Only the claiming flusher can release: a stale claim is reclaimed by TTL.
+// Fenced like the rest of the leader-only outbox claim lifecycle.
 func (s *PostgresStore) ReleaseOutboxClaim(ctx context.Context, id, claimer string) error {
 	if id == "" {
 		return fmt.Errorf("storage: empty outbox id")
 	}
-	_, err := s.pool.Exec(ctx, `UPDATE outbox SET claimed_at = NULL, claimed_by = NULL WHERE id=$1 AND claimed_by=$2`, id, claimer)
-	return err
+	tx, err := s.beginFencedTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `UPDATE outbox SET claimed_at = NULL, claimed_by = NULL WHERE id=$1 AND claimed_by=$2`, id, claimer); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// ReleaseOutboxClaims drops every claim of the batch that is still owned by
+// claimer in ONE statement (see OutboxClaimBatchStore): the id list is bound
+// as an array and the claimer match makes the operation idempotent and safe
+// against a concurrent re-claim — a row another flusher claimed in the
+// meantime no longer matches claimed_by and is left untouched. It returns the
+// number of rows actually released. Fenced like the rest of the leader-only
+// outbox claim lifecycle.
+func (s *PostgresStore) ReleaseOutboxClaims(ctx context.Context, ids []string, claimer string) (int, error) {
+	if strings.TrimSpace(claimer) == "" {
+		return 0, fmt.Errorf("storage: empty outbox claimer")
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	tx, err := s.beginFencedTx(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	tag, err := tx.Exec(ctx, `UPDATE outbox SET claimed_at = NULL, claimed_by = NULL WHERE id = ANY($1) AND claimed_by = $2`, ids, claimer)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -3298,25 +3386,42 @@ func (s *PostgresStore) ListSchedules(ctx context.Context) ([]Schedule, error) {
 // ClaimScheduleOccurrence atomically reserves the (schedule, nominal) firing
 // for runID. The INSERT ... ON CONFLICT DO NOTHING makes concurrent claims
 // race-free: exactly one caller wins the row. Re-claiming the same nominal
-// for the same runID is idempotent and reports true.
+// for the same runID is idempotent and reports true. Occurrence insertion is
+// leader-only, so the claim runs in a transaction FENCED by the store's
+// leadership epoch (a stale leader claims no occurrence).
 func (s *PostgresStore) ClaimScheduleOccurrence(ctx context.Context, scheduleID string, nominal time.Time, runID string) (bool, error) {
 	if scheduleID == "" || runID == "" {
 		return false, fmt.Errorf("storage: empty schedule or run id")
 	}
-	ct, err := s.pool.Exec(ctx, `INSERT INTO schedule_occurrences (schedule_id, nominal, run_id) VALUES ($1, $2, $3) ON CONFLICT (schedule_id, nominal) DO NOTHING`,
+	tx, err := s.beginFencedTx(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+	ct, err := tx.Exec(ctx, `INSERT INTO schedule_occurrences (schedule_id, nominal, run_id) VALUES ($1, $2, $3) ON CONFLICT (schedule_id, nominal) DO NOTHING`,
 		scheduleID, nominal, runID)
 	if err != nil {
 		return false, err
 	}
 	if ct.RowsAffected() == 1 {
+		if err := tx.Commit(ctx); err != nil {
+			return false, err
+		}
 		return true, nil
 	}
 	var existing string
-	err = s.pool.QueryRow(ctx, `SELECT run_id FROM schedule_occurrences WHERE schedule_id=$1 AND nominal=$2`, scheduleID, nominal).Scan(&existing)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return true, nil
+	err = tx.QueryRow(ctx, `SELECT run_id FROM schedule_occurrences WHERE schedule_id=$1 AND nominal=$2`, scheduleID, nominal).Scan(&existing)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// The insert reported no row and the follow-up read found none: a
+		// concurrent claim rolled back, so retrying is safe and this call
+		// reports the claim as won (the caller's transaction owns the
+		// nominal).
+		existing = runID
+	case err != nil:
+		return false, err
 	}
-	if err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return false, err
 	}
 	return existing == runID, nil
@@ -3851,10 +3956,21 @@ func (s *PostgresStore) ReleaseDownstreamReservation(ctx context.Context, parent
 // ExpireDownstreamReservations releases reservations older than the cutoff
 // whose child never launched (crash recovery): the next dispatch can
 // re-reserve and launch them. Returns the number of expired reservations.
+// This is the leader-only reservation-recovery sweep, so it runs in a
+// transaction FENCED by the store's leadership epoch: a stale leader expires
+// nothing.
 func (s *PostgresStore) ExpireDownstreamReservations(ctx context.Context, olderThan time.Time) (int, error) {
-	ct, err := s.pool.Exec(ctx, `UPDATE downstream_links SET reserved=FALSE, reserved_at=NULL WHERE reserved AND (child_run_id IS NULL OR child_run_id='') AND (reserved_at IS NULL OR reserved_at < $1)`,
+	tx, err := s.beginFencedTx(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	ct, err := tx.Exec(ctx, `UPDATE downstream_links SET reserved=FALSE, reserved_at=NULL WHERE reserved AND (child_run_id IS NULL OR child_run_id='') AND (reserved_at IS NULL OR reserved_at < $1)`,
 		olderThan)
 	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return 0, err
 	}
 	return int(ct.RowsAffected()), nil
@@ -4061,10 +4177,20 @@ func (s *PostgresStore) DeletePendingSidecars(ctx context.Context, jobID string)
 }
 
 // PrunePendingSidecars deletes pending rows created before the cutoff and
-// reports how many were removed. It never touches CAS blobs.
+// reports how many were removed. It never touches CAS blobs. This is the
+// durable delete of the leader-only GC pass, so it is epoch-FENCED: a stale
+// leader prunes nothing.
 func (s *PostgresStore) PrunePendingSidecars(ctx context.Context, olderThan time.Time) (int, error) {
-	ct, err := s.pool.Exec(ctx, `DELETE FROM artifact_pending_sidecars WHERE created_at < $1`, olderThan)
+	tx, err := s.beginFencedTx(ctx)
 	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	ct, err := tx.Exec(ctx, `DELETE FROM artifact_pending_sidecars WHERE created_at < $1`, olderThan)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return 0, err
 	}
 	return int(ct.RowsAffected()), nil
@@ -4189,17 +4315,29 @@ var leaderProbeFn = func(ctx context.Context, conn *pgx.Conn) error {
 	return conn.Ping(ctx)
 }
 
-// Leadership invariant (S1A): leaderConn is the ONLY proof of leadership
-// this store exposes. Its session-level advisory lock lives exactly as long
-// as that PostgreSQL session, so the cached leaderKey/leaderHeldUntil pair is
-// never trusted on its own. A cached success is renewed only while the last
+// Leadership invariant: leaderConn is the ONLY proof of leadership this store
+// exposes. Its session-level advisory lock lives exactly as long as that
+// PostgreSQL session, so the cached leaderKey/leaderHeldUntil pair is never
+// trusted on its own. A cached success is renewed only while the last
 // successful proof (the acquisition round-trip that took the lock, or a later
 // liveness probe on the SAME connection) is younger than leaderProbeInterval;
 // beyond that a probe must succeed first. Any failed proof — or a locally
 // closed session, detected without I/O — clears the cache and falls through
-// to a real acquisition attempt instead of returning true. A stale true could
-// otherwise survive until the local TTL while ANOTHER replica legitimately
-// holds the lock: split-brain leadership.
+// to a real acquisition attempt instead of returning true.
+//
+// The throttle is still a window: a dead session can be reported true for up
+// to min(1s, ttl/5) without touching PostgreSQL, and no amount of health
+// checking can close that TOCTOU because the advisory lock lives on a
+// different connection than the mutations. The window is closed by the
+// leadership EPOCH instead (migration 0025): acquisition publishes a
+// strictly-greater epoch on the SAME dedicated session and this store retains
+// it; every leader-only mutation re-validates that epoch inside its own
+// transaction (assertLeaderEpoch) and fails closed with ErrStaleLeader
+// otherwise. A cached true can therefore briefly survive lock loss, but a
+// stale leader can complete none of its mutations: the epoch it presents is
+// no longer the durable one, so its transactions abort having mutated
+// nothing. Loss (release, dead session, key change, fence mismatch) clears
+// the retained epoch.
 //
 // Locking: leaderMu guards the cached fields only and is never held across a
 // round-trip. Fresh cached calls do no I/O at all; the probe runs OUTSIDE the
@@ -4228,12 +4366,14 @@ func (s *PostgresStore) TryAcquireLeadership(ctx context.Context, key string, tt
 		s.leaderMu.Lock()
 		if s.leaderConn != nil && s.leaderKey == key && time.Now().Before(s.leaderHeldUntil) {
 			conn := s.leaderConn
-			if !conn.IsClosed() {
+			if !conn.IsClosed() && s.leaderEpoch.Load() > 0 {
 				if time.Since(s.leaderProbedAt) < interval {
 					// The last successful proof is still fresh: renew the
 					// soft window and return without any round-trip. This is
 					// the scheduler hot path (every runner poll, twice per
-					// Maintain tick).
+					// Maintain tick). Serving the cached true here is safe
+					// because every leader-only mutation is epoch-fenced:
+					// see the invariant above.
 					s.leaderHeldUntil = time.Now().Add(ttl)
 					s.leaderMu.Unlock()
 					return true, nil
@@ -4284,8 +4424,10 @@ func (s *PostgresStore) TryAcquireLeadership(ctx context.Context, key string, tt
 				s.leaderMu.Unlock()
 				continue
 			}
-			// Locally closed session: the advisory lock died with it. Drop
-			// without a round-trip and re-enter the loop for acquisition.
+			// The session is locally closed (the advisory lock died with it)
+			// or this store retains no epoch (a fenced mutation observed a
+			// newer durable epoch, so the cached proof cannot mutate). Drop
+			// it and re-enter the loop for a real acquisition.
 			deadConn := s.detachLeaderSessionLocked()
 			s.leaderMu.Unlock()
 			s.closeLeaderConn(deadConn)
@@ -4339,7 +4481,7 @@ func (s *PostgresStore) acquireLeaderSession(ctx context.Context, key string, tt
 	// while this call waited. A fresh proof is reused; a stale one is left to
 	// the caller's cached path so the throttle and probe rules still apply.
 	s.leaderMu.Lock()
-	if s.leaderConn != nil && s.leaderKey == key && time.Now().Before(s.leaderHeldUntil) && !s.leaderConn.IsClosed() {
+	if s.leaderConn != nil && s.leaderKey == key && time.Now().Before(s.leaderHeldUntil) && !s.leaderConn.IsClosed() && s.leaderEpoch.Load() > 0 {
 		if time.Since(s.leaderProbedAt) < interval {
 			s.leaderHeldUntil = time.Now().Add(ttl)
 			s.leaderMu.Unlock()
@@ -4348,8 +4490,9 @@ func (s *PostgresStore) acquireLeaderSession(ctx context.Context, key string, tt
 		s.leaderMu.Unlock()
 		return false, false, nil
 	}
-	// A session for another key (or a locally closed one) must not outlive
-	// this acquisition: the store keeps at most one cached leader session.
+	// A session for another key (or a locally closed or unfenced one) must not
+	// outlive this acquisition: the store keeps at most one cached leader
+	// session. The detach also clears the retained epoch.
 	oldConn := s.detachLeaderSessionLocked()
 	s.leaderMu.Unlock()
 	s.closeLeaderConn(oldConn)
@@ -4376,7 +4519,24 @@ func (s *PostgresStore) acquireLeaderSession(ctx context.Context, key string, tt
 		s.closeLeaderConn(conn)
 		return false, true, nil
 	}
+	// The advisory lock is held. Publish the strictly-greater epoch on THIS
+	// same session: the increment is one transaction, so a connection that
+	// dies before commit publishes nothing, and the lock died with that same
+	// session — no replica can ever observe a leader that holds the lock
+	// without having published its epoch. A publish failure therefore closes
+	// the session (releasing the lock) and reports the error instead of
+	// caching a lock holder with no fence.
+	epoch, err := s.publishLeaderEpoch(actx, conn)
+	if err != nil {
+		s.closeLeaderConn(conn)
+		return false, true, fmt.Errorf("storage: publish leadership epoch: %w", err)
+	}
 	now := time.Now()
+	// Retain the epoch BEFORE caching the session: a concurrent fenced
+	// operation must never see the new session with the old (now-stale)
+	// retained epoch. clearLeaderEpochIf only clears the value it compared
+	// against, so a racing detection cannot clobber this fresh epoch.
+	s.leaderEpoch.Store(epoch)
 	s.leaderMu.Lock()
 	s.leaderConn = conn
 	s.leaderKey = key
@@ -4389,14 +4549,18 @@ func (s *PostgresStore) acquireLeaderSession(ctx context.Context, key string, tt
 // detachLeaderSessionLocked removes the cached leader session and returns its
 // connection, clearing every cached field BEFORE any I/O so no concurrent
 // reader can observe a released session as a held-leadership proof. The
-// caller holds leaderMu and must close the returned connection outside the
-// lock (closeLeaderConn). Returns nil when nothing was cached.
+// retained leadership epoch is cleared with it: once this store no longer
+// holds (or cannot prove) the claim, every leader-fenced operation must fail
+// closed until a fresh acquisition publishes a new epoch. The caller holds
+// leaderMu and must close the returned connection outside the lock
+// (closeLeaderConn). Returns nil when nothing was cached.
 func (s *PostgresStore) detachLeaderSessionLocked() *pgx.Conn {
 	conn := s.leaderConn
 	s.leaderConn = nil
 	s.leaderKey = ""
 	s.leaderHeldUntil = time.Time{}
 	s.leaderProbedAt = time.Time{}
+	s.leaderEpoch.Store(0)
 	return conn
 }
 
@@ -4715,9 +4879,11 @@ func (s *PostgresStore) RevokeCert(ctx context.Context, serial, runnerID, reason
 		return err
 	}
 	// The runner row's revoked_at mirrors the durable revocation so the
-	// disable flow and identity verification see the same state.
+	// disable flow and identity verification see the same state. to_jsonb of
+	// the timestamptz renders RFC3339 (with the "T" separator), which is what
+	// model.Runner's time.Time JSON decoding requires.
 	if runnerID != "" {
-		if _, err := tx.Exec(ctx, `UPDATE runners SET payload = jsonb_set(payload, '{revoked_at}', to_jsonb(now()::text), true) WHERE id=$1`, runnerID); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE runners SET payload = jsonb_set(payload, '{revoked_at}', to_jsonb(now()), true) WHERE id=$1`, runnerID); err != nil {
 			return err
 		}
 	}

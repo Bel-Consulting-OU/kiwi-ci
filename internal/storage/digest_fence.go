@@ -6,7 +6,70 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// fenceReleaseTimeout bounds the advisory-unlock round-trip on the release
+// path, and fenceCloseTimeout bounds the session close performed when the
+// unlock fails or times out. They are vars only so tests can shrink the hard
+// bounds; production never reassigns them (same seam convention as
+// randReader/leaderProbeFn).
+var (
+	fenceReleaseTimeout = 5 * time.Second
+	fenceCloseTimeout   = 2 * time.Second
+)
+
+// fenceReleaseFn performs the unlock round-trip on the acquired session. It
+// is a var so a test can simulate a wedged session whose call blocks until
+// the bound expires; production never reassigns it.
+var fenceReleaseFn = func(ctx context.Context, conn *pgxpool.Conn, key int64) error {
+	_, err := conn.Exec(ctx, `SELECT pg_advisory_unlock($1)`, key)
+	return err
+}
+
+// fenceCloseFn closes the underlying session (which releases every
+// session-level advisory lock it holds). It is a var for the same test seam
+// reason: a test blocks it to prove the close carries its OWN bound.
+var fenceCloseFn = func(ctx context.Context, conn *pgx.Conn) error {
+	return conn.Close(ctx)
+}
+
+// fenceReleaseContext derives the bounded context for the release round-trip.
+// The origin context may already be canceled — the request that acquired the
+// fence is gone by the time the release runs — so cancellation is stripped
+// (WithoutCancel) while values survive, and a FRESH timeout imposes the hard
+// bound. A bare Background at this call site is the defect this helper exists
+// to prevent: a wedged connection would pin the request goroutine and its
+// dedicated advisory-pool slot forever.
+func fenceReleaseContext(origin context.Context, bound time.Duration) (context.Context, context.CancelFunc) {
+	if origin == nil {
+		origin = context.Background()
+	}
+	return context.WithTimeout(context.WithoutCancel(origin), bound)
+}
+
+// releaseFenceConn releases one acquired advisory-fence session under hard
+// bounds: the unlock runs under fenceReleaseTimeout, and if it fails or times
+// out the session is CLOSED under its own fenceCloseTimeout — closing the
+// PostgreSQL session releases the advisory lock deterministically even when
+// the protocol round-trip cannot complete. The pool slot is always returned
+// (pgxpool discards a closed connection and replaces it), so neither the
+// goroutine nor the dedicated advisory connection can leak. Callers wrap this
+// in a sync.Once, so a second release is a no-op.
+func releaseFenceConn(origin context.Context, conn *pgxpool.Conn, key int64) {
+	uctx, cancel := fenceReleaseContext(origin, fenceReleaseTimeout)
+	err := fenceReleaseFn(uctx, conn, key)
+	cancel()
+	if err != nil {
+		cctx, ccancel := fenceReleaseContext(origin, fenceCloseTimeout)
+		_ = fenceCloseFn(cctx, conn.Conn())
+		ccancel()
+	}
+	conn.Release()
+}
 
 // DigestFenceStore is the cross-replica form of the CAS digest fence: a
 // transaction-scoped Postgres advisory lock on a key derived from the digest
@@ -47,8 +110,10 @@ func (s *PostgresStore) WithDigestFence(ctx context.Context, digest string, fn f
 
 // AcquireNamedFence takes a session advisory lock for an arbitrary
 // namespace/key pair on the dedicated lock pool (never the operational
-// pool). The release is idempotent and drops the session if the unlock
-// fails, so a crashed holder can never wedge the fence.
+// pool). The release is idempotent and hard-bounded: it unlocks under
+// fenceReleaseTimeout and, if that fails or times out, closes the session
+// under fenceCloseTimeout (closing releases the lock), so a crashed or wedged
+// holder can never pin the caller or the advisory-pool slot.
 func (s *PostgresStore) AcquireNamedFence(ctx context.Context, namespace, key string) (func(), error) {
 	namespace = strings.TrimSpace(namespace)
 	key = strings.TrimSpace(key)
@@ -70,12 +135,7 @@ func (s *PostgresStore) AcquireNamedFence(ctx context.Context, namespace, key st
 	}
 	var once sync.Once
 	return func() {
-		once.Do(func() {
-			if _, err := conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, lockKey); err != nil {
-				_ = conn.Conn().Close(context.Background())
-			}
-			conn.Release()
-		})
+		once.Do(func() { releaseFenceConn(ctx, conn, lockKey) })
 	}, nil
 }
 
@@ -107,13 +167,8 @@ func (s *PostgresStore) AcquireDigestFence(ctx context.Context, digest string) (
 	}
 	var once sync.Once
 	return func() {
-		once.Do(func() {
-			// Unlock on the same session, then return the connection; a
-			// failed unlock drops the session (and with it the lock).
-			if _, err := conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, key); err != nil {
-				_ = conn.Conn().Close(context.Background())
-			}
-			conn.Release()
-		})
+		// The release is idempotent (sync.Once) and hard-bounded: a wedged
+		// session cannot pin the caller or the advisory-pool slot.
+		once.Do(func() { releaseFenceConn(ctx, conn, key) })
 	}, nil
 }

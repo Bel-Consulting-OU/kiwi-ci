@@ -77,6 +77,12 @@ type Snapshot struct {
 	// lifecycle it acknowledged (docs/environments.md:67). Additive; older
 	// snapshots load with a nil map, which the server treats as empty.
 	Deployments map[string]model.Deployment `json:"deployments,omitempty"`
+	// CRL persists the fs-mode runner certificate revocation list (serial ->
+	// runner ID) in the SAME atomic snapshot write as the runner disable, so
+	// a crash can never durably disable a runner without also revoking its
+	// certificate. Additive; older snapshots load with a nil map and the
+	// legacy runner-crl.json file is merged in by the server.
+	CRL map[string]string `json:"crl,omitempty"`
 }
 
 type Repository struct {
@@ -179,6 +185,9 @@ func (r *Repository) loadLocked() (Snapshot, error) {
 	}
 	if s.Deployments == nil {
 		s.Deployments = map[string]model.Deployment{}
+	}
+	if s.CRL == nil {
+		s.CRL = map[string]string{}
 	}
 	return s, nil
 }

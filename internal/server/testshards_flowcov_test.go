@@ -106,14 +106,46 @@ func fcHistoryWithFlaky(t *testing.T) *testintel.History {
 	return h
 }
 
-func TestFlowTestShardsRunLookup(t *testing.T) {
-	// DB run read failure leaves a zero run; the shard key resolves empty.
-	s, f, _, hdrs := cacheFixture(t)
-	s.DB = &fcStore{dbFakeStore: f, getRunErr: errors.New("run read down")}
-	w := doJSONHeaders(t, s, http.MethodGet, "/api/v1/jobs/job-a/test-shards", "runner-tok", "", hdrs)
-	if w.Code != http.StatusOK {
-		t.Fatalf("run read failure shards = %d", w.Code)
-	}
+// TestFlowTestShardsRunLookupFailsClosed proves a failed or missing
+// authoritative run lookup never yields a shard assignment derived from an
+// empty repository key: the DB store error, the missing DB row and the
+// missing memory run entry all answer an opaque 5xx BEFORE any assignment.
+func TestFlowTestShardsRunLookupFailsClosed(t *testing.T) {
+	fault := errors.New("run read down")
+	t.Run("db store error", func(t *testing.T) {
+		s, f, _, hdrs := cacheFixture(t)
+		s.DB = &fcStore{dbFakeStore: f, getRunErr: fault}
+		w := doJSONHeaders(t, s, http.MethodGet, "/api/v1/jobs/job-a/test-shards", "runner-tok", "", hdrs)
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("run read failure shards = %d, want 503: %s", w.Code, w.Body.String())
+		}
+		if strings.Contains(w.Body.String(), fault.Error()) {
+			t.Fatalf("response leaked the raw store error: %q", w.Body.String())
+		}
+		if strings.Contains(w.Body.String(), `"assignment"`) || strings.Contains(w.Body.String(), `"repo"`) {
+			t.Fatalf("failed lookup returned a shard assignment: %s", w.Body.String())
+		}
+	})
+	t.Run("db run missing", func(t *testing.T) {
+		s, f, _, hdrs := cacheFixture(t)
+		f.mu.Lock()
+		delete(f.runs, "run-c")
+		f.mu.Unlock()
+		w := doJSONHeaders(t, s, http.MethodGet, "/api/v1/jobs/job-a/test-shards", "runner-tok", "", hdrs)
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("missing db run shards = %d, want 503: %s", w.Code, w.Body.String())
+		}
+	})
+	t.Run("memory run missing", func(t *testing.T) {
+		s, hdrs := fcMemoryBlobServer(t)
+		s.mu.Lock()
+		delete(s.runs, "run-c")
+		s.mu.Unlock()
+		w := doJSONHeaders(t, s, http.MethodGet, "/api/v1/jobs/job-a/test-shards", "runner-tok", "", hdrs)
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("missing memory run shards = %d, want 503: %s", w.Code, w.Body.String())
+		}
+	})
 }
 
 func TestFlowTestShardsHistoryNil(t *testing.T) {

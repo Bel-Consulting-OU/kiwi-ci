@@ -33,7 +33,11 @@ func (r *Runner) uploadJobSnapshot(ctx context.Context, t server.Task, workspace
 		return err
 	}
 	defer f.Close()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.Cfg.Server+"/api/v1/jobs/"+t.Job.ID+"/snapshots", f)
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	guard := newStallGuard(cancel, streamIdleTimeout)
+	defer guard.stop()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, r.Cfg.Server+"/api/v1/jobs/"+t.Job.ID+"/snapshots", &stallGuardReader{r: f, guard: guard})
 	if err != nil {
 		return err
 	}
@@ -42,7 +46,7 @@ func (r *Runner) uploadJobSnapshot(ctx context.Context, t server.Task, workspace
 	req.Header.Set("X-Kiwi-Runner-ID", r.ID)
 	req.Header.Set("X-Kiwi-Lease-Token", t.LeaseToken)
 	req.Header.Set("X-Kiwi-Lease-Generation", fmt.Sprint(t.LeaseGeneration))
-	resp, err := r.Client.Do(req)
+	resp, err := r.streamClient().Do(req)
 	if err != nil {
 		return err
 	}

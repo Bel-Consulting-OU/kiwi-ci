@@ -75,6 +75,13 @@ type fcStore struct {
 	insertReportErr         error
 	listReportsErr          error
 	loadHistoryErr          error
+	insertReportHistErr     error
+	loadRepoHistoryErr      error
+	resolveRepoIDsErr       error
+	reportTotalsErr         error
+	flakyNamesErr           error
+	listHistoryRepoIDsErr   error
+	rebuildRepoHistoryErr   error
 	readLogsErr             error
 	appendAuditErr          error
 	queuedOverride          []model.Job
@@ -128,6 +135,55 @@ func (f *fcStore) LoadTestHistory(ctx context.Context) (int64, []byte, error) {
 		return 0, nil, f.loadHistoryErr
 	}
 	return f.dbFakeStore.LoadTestHistory(ctx)
+}
+
+func (f *fcStore) InsertTestReportWithHistory(ctx context.Context, rep model.TestReport, repoID string) (int64, error) {
+	if f.insertReportHistErr != nil {
+		return 0, f.insertReportHistErr
+	}
+	return f.dbFakeStore.InsertTestReportWithHistory(ctx, rep, repoID)
+}
+
+func (f *fcStore) LoadRepoTestHistory(ctx context.Context, repoID string) (int64, []byte, error) {
+	if f.loadRepoHistoryErr != nil {
+		return 0, nil, f.loadRepoHistoryErr
+	}
+	return f.dbFakeStore.LoadRepoTestHistory(ctx, repoID)
+}
+
+func (f *fcStore) ResolveTestHistoryRepoIDs(ctx context.Context, query string, limit int) ([]string, error) {
+	if f.resolveRepoIDsErr != nil {
+		return nil, f.resolveRepoIDsErr
+	}
+	return f.dbFakeStore.ResolveTestHistoryRepoIDs(ctx, query, limit)
+}
+
+func (f *fcStore) TestReportTotals(ctx context.Context, repoIDs []string, repoQuery string) (int, int, int, error) {
+	if f.reportTotalsErr != nil {
+		return 0, 0, 0, f.reportTotalsErr
+	}
+	return f.dbFakeStore.TestReportTotals(ctx, repoIDs, repoQuery)
+}
+
+func (f *fcStore) FlakyTestNames(ctx context.Context, repoIDs []string, limit int) ([]string, error) {
+	if f.flakyNamesErr != nil {
+		return nil, f.flakyNamesErr
+	}
+	return f.dbFakeStore.FlakyTestNames(ctx, repoIDs, limit)
+}
+
+func (f *fcStore) ListTestHistoryRepoIDs(ctx context.Context, limit int) ([]string, error) {
+	if f.listHistoryRepoIDsErr != nil {
+		return nil, f.listHistoryRepoIDsErr
+	}
+	return f.dbFakeStore.ListTestHistoryRepoIDs(ctx, limit)
+}
+
+func (f *fcStore) RebuildRepoTestHistory(ctx context.Context, repoID string) (int64, error) {
+	if f.rebuildRepoHistoryErr != nil {
+		return 0, f.rebuildRepoHistoryErr
+	}
+	return f.dbFakeStore.RebuildRepoTestHistory(ctx, repoID)
 }
 
 func (f *fcStore) ListSchedules(ctx context.Context) ([]storage.Schedule, error) {

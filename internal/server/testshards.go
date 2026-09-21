@@ -15,6 +15,11 @@ import (
 
 const testHistoryFile = "test-history.json"
 
+// testHistoryIdentityUnavailable is the fixed opaque body for a failed or
+// missing authoritative run lookup on the test-intelligence paths (shard
+// assignment and report upload); the store detail stays in the server log.
+const testHistoryIdentityUnavailable = "test history identity unavailable"
+
 // testintelHistory wraps the package-level testintel.History with its
 // persistence path so the server owns save/load atomically.
 type testintelHistory struct {
@@ -62,25 +67,45 @@ func (s *Server) commitTestintelHistoryLocked() error {
 	return os.Rename(s.history.path+".tmp", s.history.path)
 }
 
-// recordTestReportHistory folds one uploaded test report into the
-// persistent history. In memory mode the history file under dataDir is the
-// durable store; in DB mode the durable reports are the source of truth and
-// the history is rebuilt from them and cached with a version bump (see
-// rebuildTestHistoryDB).
-func (s *Server) recordTestReportHistory(repo string, rep model.TestReport) {
+// mirrorTestReportHistoryDB folds one ALREADY DURABLY COMMITTED report into
+// this replica's in-memory history. In the aggregate-store path the durable
+// aggregate was updated in the same transaction as the report (see
+// storage.TestHistoryAggregateStore.InsertTestReportWithHistory), so this is
+// a local mirror only: it makes the new data visible immediately without any
+// database work, and it deliberately marks the in-memory history as a local
+// mix so the next sync reloads the repository's durable aggregates.
+func (s *Server) mirrorTestReportHistoryDB(repo string, rep model.TestReport) {
+	if s.history == nil {
+		return
+	}
+	s.mu.Lock()
+	for _, c := range rep.Cases {
+		s.history.h.Record(repo, rep.JobKey, c.Class, c.Name, c.Duration, c.Passed, rep.CreatedAt)
+	}
+	s.historyDBRepo = ""
+	s.mu.Unlock()
+}
+
+// recordTestReportHistory is the LEGACY-store and memory-mode history write.
+// In memory mode the history file under dataDir is the durable store. A DB
+// store without the incremental aggregate contract falls back to the
+// explicit full rebuild (the documented maintenance path); the production
+// PostgresStore implements the aggregate contract, so an upload never
+// rebuilds the whole history. ctx is the request context: a canceled request
+// performs no durable write (the legacy rebuild logs and aborts).
+func (s *Server) recordTestReportHistory(ctx context.Context, repo string, rep model.TestReport) {
 	if s.history == nil {
 		return
 	}
 	if s.DB != nil {
-		// Fold into the in-memory history first so this instance serves the
-		// new data immediately, then rebuild the durable cache from the
-		// committed reports (the upload already persisted the report).
+		// Legacy store: fold locally so this instance serves the new data,
+		// then repair the shared cache from the committed reports.
 		s.mu.Lock()
 		for _, c := range rep.Cases {
 			s.history.h.Record(repo, rep.JobKey, c.Class, c.Name, c.Duration, c.Passed, rep.CreatedAt)
 		}
 		s.mu.Unlock()
-		s.rebuildTestHistoryDB(context.Background())
+		s.rebuildTestHistoryDB(ctx)
 		return
 	}
 	s.mu.Lock()
@@ -95,13 +120,38 @@ func (s *Server) recordTestReportHistory(repo string, rep model.TestReport) {
 	s.mu.Unlock()
 }
 
-// rebuildTestHistoryDB recomputes the full test history from the durable
-// reports and caches the serialized aggregates with a version bump. Every
-// replica that rebuilds from the same committed reports derives the same
-// history, so shard assignments converge. A failure only logs: the durable
-// reports are untouched and the in-memory history (already folded with the
-// new report) keeps serving locally.
+// maintenanceRepoLimit bounds the explicit repair/rebuild enumeration.
+const maintenanceRepoLimit = 1000
+
+// rebuildTestHistoryDB is the EXPLICIT maintenance/repair operation (never
+// called per upload). With an incremental aggregate store it rebuilds every
+// repository's aggregates through the bounded per-repository repair; with a
+// legacy TestHistoryStore it recomputes the serialized cache from all
+// durable reports exactly as the pre-0026 code did. A failure only logs: the
+// durable reports are untouched and the in-memory history keeps serving.
 func (s *Server) rebuildTestHistoryDB(ctx context.Context) {
+	if agg, ok := s.DB.(storage.TestHistoryAggregateStore); ok {
+		repos, err := agg.ListTestHistoryRepoIDs(ctx, maintenanceRepoLimit)
+		if err != nil {
+			s.logError("test history: list repositories failed", "error", err.Error())
+			return
+		}
+		for _, repoID := range repos {
+			if err := ctx.Err(); err != nil {
+				s.logError("test history: repair aborted", "error", err.Error())
+				return
+			}
+			if _, err := agg.RebuildRepoTestHistory(ctx, repoID); err != nil {
+				s.logError("test history: repository repair failed", "repo", repoID, "error", err.Error())
+			}
+		}
+		// Force the next sync to reload the repaired aggregates.
+		s.mu.Lock()
+		s.historyDBVersion = 0
+		s.historyDBRepo = ""
+		s.mu.Unlock()
+		return
+	}
 	ts, ok := s.DB.(storage.TestHistoryStore)
 	if !ok {
 		return
@@ -138,13 +188,78 @@ func (s *Server) rebuildTestHistoryDB(ctx context.Context) {
 	s.mu.Lock()
 	s.history.h = h
 	s.historyDBVersion = version
+	s.historyDBRepo = ""
 	s.mu.Unlock()
 }
 
-// syncTestHistoryDB converges the in-memory history with the durable cache
-// when its version advanced (another replica uploaded reports). A load
-// failure keeps the current in-memory history.
-func (s *Server) syncTestHistoryDB(ctx context.Context) {
+// loadRepoHistoryWithRepair loads one repository's durable aggregates. A
+// repository with no version row predates migration 0026 (or its aggregates
+// were truncated): it is rebuilt ONCE from its durable reports through the
+// explicit bounded repair operation, then re-read. This is the upgrade
+// bridge — uploads never trigger a rebuild.
+func (s *Server) loadRepoHistoryWithRepair(ctx context.Context, agg storage.TestHistoryAggregateStore, repoID string) (int64, []byte, error) {
+	version, stats, err := agg.LoadRepoTestHistory(ctx, repoID)
+	if err != nil {
+		return 0, nil, err
+	}
+	if version == 0 && len(stats) == 0 {
+		if _, rerr := agg.RebuildRepoTestHistory(ctx, repoID); rerr != nil {
+			return 0, nil, rerr
+		}
+		return agg.LoadRepoTestHistory(ctx, repoID)
+	}
+	return version, stats, nil
+}
+
+// syncTestHistoryDB converges the in-memory history with the durable
+// per-repository aggregates when their version advanced (another replica
+// uploaded reports). Only the requested repository's aggregates are read; a
+// load failure keeps the current in-memory history. Stores without the
+// incremental contract fall back to the legacy whole-cache sync.
+func (s *Server) syncTestHistoryDB(ctx context.Context, repoID string) {
+	agg, ok := s.DB.(storage.TestHistoryAggregateStore)
+	if !ok {
+		s.syncTestHistoryDBLegacy(ctx)
+		return
+	}
+	if repoID == "" {
+		return
+	}
+	version, stats, err := s.loadRepoHistoryWithRepair(ctx, agg, repoID)
+	if err != nil {
+		s.logError("test history: repository load failed", "repo", repoID, "error", err.Error())
+		return
+	}
+	s.mu.Lock()
+	local, localRepo := s.historyDBVersion, s.historyDBRepo
+	s.mu.Unlock()
+	if version == local && repoID == localRepo {
+		return
+	}
+	if len(stats) == 0 {
+		// An empty repository is a valid state: record which repository the
+		// process observed so it does not reload it on every call.
+		s.mu.Lock()
+		s.historyDBVersion = version
+		s.historyDBRepo = repoID
+		s.mu.Unlock()
+		return
+	}
+	h, err := historyFromStats(stats)
+	if err != nil {
+		s.logError("test history: decode cached stats failed", "error", err.Error())
+		return
+	}
+	s.mu.Lock()
+	s.history.h = h
+	s.historyDBVersion = version
+	s.historyDBRepo = repoID
+	s.mu.Unlock()
+}
+
+// syncTestHistoryDBLegacy is the pre-0026 whole-cache convergence for stores
+// that only implement TestHistoryStore.
+func (s *Server) syncTestHistoryDBLegacy(ctx context.Context) {
 	ts, ok := s.DB.(storage.TestHistoryStore)
 	if !ok {
 		return
@@ -174,6 +289,7 @@ func (s *Server) syncTestHistoryDB(ctx context.Context) {
 	s.mu.Lock()
 	s.history.h = h
 	s.historyDBVersion = version
+	s.historyDBRepo = ""
 	s.mu.Unlock()
 }
 
@@ -222,6 +338,32 @@ func (s *Server) flakyFromHistory(repo string) []string {
 	return s.history.h.Flaky(repo)
 }
 
+// requireRunIdentity loads the run that keys every test-intelligence
+// decision (shard assignment, report history). The lookup is NEVER
+// best-effort: an unavailable or missing run answers an opaque 5xx and
+// reports false BEFORE any shard assignment or history write, so a
+// zero-valued run can never produce the empty repository key that would
+// merge unrelated repositories' test history. In DB mode the durable row is
+// authoritative; in memory mode the run map entry is required.
+func (s *Server) requireRunIdentity(w http.ResponseWriter, r *http.Request, runID string) (model.Run, bool) {
+	if s.DB != nil {
+		run, err := s.DB.GetRun(r.Context(), runID)
+		if err != nil {
+			s.serverError(w, r, http.StatusServiceUnavailable, err, testHistoryIdentityUnavailable)
+			return model.Run{}, false
+		}
+		return run, true
+	}
+	s.mu.Lock()
+	run, ok := s.runs[runID]
+	s.mu.Unlock()
+	if !ok {
+		s.serverError(w, r, http.StatusServiceUnavailable, storage.ErrNotFound, testHistoryIdentityUnavailable)
+		return model.Run{}, false
+	}
+	return run, true
+}
+
 // testShards implements GET /api/v1/jobs/{id}/test-shards: under the job's
 // active lease it returns the deterministic shard assignment derived from
 // the persisted test history plus the environment contract the runner must
@@ -238,22 +380,22 @@ func (s *Server) testShards(w http.ResponseWriter, r *http.Request) {
 		s.writeLeaseAuthError(w, r, authErr)
 		return
 	}
-	// DB mode: converge the in-memory test history with the durable cache
-	// before any decision so replicas shard identically.
-	if s.DB != nil {
-		s.syncTestHistoryDB(r.Context())
-	}
-	run := model.Run{}
-	if s.DB != nil {
-		run, _ = s.DB.GetRun(r.Context(), j.RunID)
-	} else {
-		s.mu.Lock()
-		run = s.runs[j.RunID]
-		s.mu.Unlock()
-	}
 	// The shard/history key is the run's canonical repository identity, so
-	// two forges presenting the same bare name never share test history.
+	// two forges presenting the same bare name never share test history. A
+	// failed or missing authoritative run lookup fails the request closed
+	// instead of sharding under an empty key.
+	run, ok := s.requireRunIdentity(w, r, j.RunID)
+	if !ok {
+		return
+	}
 	repo := repoIDForRun(run)
+	// DB mode: converge the in-memory history with THIS repository's durable
+	// aggregates before any decision so replicas shard identically. The read
+	// is scoped by the run's canonical repository identity and never touches
+	// another repository's history.
+	if s.DB != nil {
+		s.syncTestHistoryDB(r.Context(), repo)
+	}
 	suite := j.Key
 	shards := 1
 	if v, err := strconv.Atoi(r.URL.Query().Get("shards")); err == nil && v > 0 && v <= 256 {

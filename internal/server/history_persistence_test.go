@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -27,7 +28,7 @@ func TestHistoryPersistenceAcrossRestarts(t *testing.T) {
 			{Name: "TestB", Passed: true, Duration: 0.5},
 		},
 	}
-	s.recordTestReportHistory("o/r", rep)
+	s.recordTestReportHistory(context.Background(), "o/r", rep)
 	if _, err := os.Stat(filepath.Join(dir, testHistoryFile)); err != nil {
 		t.Fatalf("history file not persisted: %v", err)
 	}
@@ -67,7 +68,7 @@ func TestTestShardsEndpointDeterministic(t *testing.T) {
 			{Name: "QuickC", Passed: true, Duration: 2},
 		},
 	}
-	s.recordTestReportHistory("o/r", rep)
+	s.recordTestReportHistory(context.Background(), "o/r", rep)
 
 	runnerID, task := leaseArtifactJob(t, s, artifactsPipeline)
 	hdrs := leaseHeaders(task, runnerID)

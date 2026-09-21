@@ -185,6 +185,16 @@ type Store interface {
 	FindDelivery(ctx context.Context, forge, deliveryID string) (string, bool, error)
 
 	// leader / HA
+	//
+	// TryAcquireLeadership renews (or takes) the leadership claim and, on a
+	// successful acquisition, publishes and retains a strictly-greater
+	// leadership epoch on the same dedicated session (see LeaderFenceStore).
+	// A true result may be served from a throttled cache and can therefore
+	// briefly outlive the advisory-lock session; the epoch is what makes that
+	// window harmless, because every leader-only mutation re-validates the
+	// retained epoch inside its own transaction and fails closed with
+	// ErrStaleLeader. See PostgresStore.TryAcquireLeadership for the full
+	// invariant.
 	TryAcquireLeadership(ctx context.Context, key string, ttl time.Duration) (bool, error)
 	ReleaseLeadership(ctx context.Context, key string) error
 
@@ -407,6 +417,21 @@ type OutboxStore interface {
 	OutboxPending(ctx context.Context) ([]OutboxItem, error)
 	ClaimOutbox(ctx context.Context, claimer string, limit int) ([]OutboxItem, error)
 	ReleaseOutboxClaim(ctx context.Context, id, claimer string) error
+}
+
+// OutboxClaimBatchStore is the BATCH claim-release contract for a flusher
+// that claimed one OutboxClaimBatch and then failed to dispatch some of it.
+// ReleaseOutboxClaims clears every claim in ids that is still owned by
+// claimer in ONE store operation, so a batch cleanup costs one round-trip
+// with one aggregate deadline instead of one 5s-bounded round-trip per row
+// (OutboxClaimBatch * per-row bound). The claimer match is the concurrency
+// guard: a row re-claimed by another flusher in the meantime is left
+// untouched and is not counted. It returns how many rows this call actually
+// released; releasing an already-cleared or foreign-claimed id is a no-op,
+// so replaying the batch is idempotent. Stores without this optional
+// capability simply omit it; callers type-assert.
+type OutboxClaimBatchStore interface {
+	ReleaseOutboxClaims(ctx context.Context, ids []string, claimer string) (int, error)
 }
 
 // OutboxDeadLetter is one dead-lettered outbox row for operator inspection:
@@ -747,6 +772,76 @@ type RecoveryStore interface {
 	// itself is not in the future. A job that is no longer queued, or whose
 	// deadline moved past the observed one, is left untouched (no-op).
 	ExpireQueuedJob(ctx context.Context, jobID string, deadline time.Time) error
+}
+
+// RunnerDisableStore is the ATOMIC runner-disable kill switch. It exists
+// because the previous admin path composed several independent operations
+// (UpsertRunner(disabled), RevokeRunnerLeases, RevokeCert, audit) and answered
+// success even when the durable certificate revocation was never recorded: a
+// disabled runner's still-valid certificate could then be replayed on another
+// replica. DisableRunnerAndRevokeCert performs the whole disable in ONE
+// transaction and the handler fails closed (no success response) when it
+// cannot commit it.
+type RunnerDisableStore interface {
+	// DisableRunnerAndRevokeCert disables runnerID, invalidates every running
+	// lease it holds (requeue or terminal-cancel exactly like
+	// RevokeRunnerLeases), records the durable certificate revocation for
+	// certSerial (skipped when certSerial is empty; permanent — re-enabling
+	// the runner never clears it), and writes the audit evidence
+	// (runner.disable and, when a serial is revoked, runner.cert_revoked)
+	// inside the SAME transaction. It returns the number of invalidated
+	// leases. Replaying the call is state-idempotent: already-revoked leases
+	// move nothing and the revocation insert is conflict-tolerant.
+	DisableRunnerAndRevokeCert(ctx context.Context, runnerID, certSerial, actor string) (revoked int, err error)
+}
+
+// RecoveryDiscoveryStore is the READ-ONLY half of RecoveryScanStore: the
+// bounded, id-paged candidate queries the sweeper drives. It is a separate
+// interface so read-only wrappers (FaultyStore) can fail closed with a precise
+// capability error without demanding the applier transactions.
+//
+// Cursor semantics (both methods): results are a bounded page of model.Jobs
+// whose id is strictly greater than afterID, ordered by id ASC (jobs.id is
+// the TEXT PRIMARY KEY, so the order is total and stable, and the cursor is
+// the last id of the previous page). Ordering by (deadline, id) with an
+// id-only cursor would SKIP candidates whose deadline sorts later than the
+// last visited deadline while their id is smaller, so the cursor is the id
+// order itself. A caller pages by calling with afterID="" and then with the
+// last returned id until a page shorter than limit arrives. Because the
+// cursor advances past every returned row even when its apply fails, one
+// persistently failing row can never stall the rows behind it; a later sweep
+// (restarting at afterID="") revisits the failure. limit <= 0 returns no rows.
+//
+// The reads are candidates, not decisions: the applier transaction re-checks
+// the lease generation / effective deadline under its own lock, so a candidate
+// that changed after discovery is a no-op. Discovery must be robust against
+// individually undecodable rows: an unreadable payload is skipped so it can
+// never shadow the candidates after it.
+type RecoveryDiscoveryStore interface {
+	// ListExpiredRunningJobs returns running jobs whose lease expired at or
+	// before now: lease_expires_at <= now, or lease_expires_at IS NULL
+	// (a running job with no recorded expiry is exactly the orphaned lease
+	// the sweep exists to recover). Ordered by id ASC, id > afterID.
+	ListExpiredRunningJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]model.Job, error)
+	// ListQueueTimedOutJobs returns queued or approval-waiting jobs whose
+	// queue deadline elapsed (effective deadline <= now), ordered by id ASC,
+	// id > afterID. It may return the superset of jobs that have a deadline
+	// source but whose effective deadline still lies in the future when the
+	// deadline is only derivable from a legacy compiled payload; the caller
+	// filters with QueueDeadlineFor before applying.
+	ListQueueTimedOutJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]model.Job, error)
+}
+
+// RecoveryScanStore couples the transactional per-candidate recovery appliers
+// (RecoveryStore) with bounded, PAGED candidate discovery. The recovery
+// sweeper must never enumerate runs and filter jobs in Go: with more than one
+// page of newer runs, an old non-terminal job holding an expired lease (or an
+// elapsed queue deadline) would fall outside every future sweep permanently.
+// These queries visit candidates DIRECTLY, in id order, so every candidate is
+// eventually reached no matter how many newer runs exist.
+type RecoveryScanStore interface {
+	RecoveryStore
+	RecoveryDiscoveryStore
 }
 
 // WebhookClaim is the delivery-dedupe claim persisted inside the enqueue
@@ -1221,6 +1316,125 @@ type EnrollGrantStore interface {
 type TestHistoryStore interface {
 	LoadTestHistory(ctx context.Context) (version int64, stats []byte, err error)
 	SaveTestHistory(ctx context.Context, stats []byte) (version int64, err error)
+}
+
+// TestHistoryEntry is one test outcome of an uploaded report, as folded into
+// the per-repository aggregates.
+type TestHistoryEntry struct {
+	Suite    string
+	Class    string
+	Name     string
+	Duration float64
+	Passed   bool
+	When     time.Time
+}
+
+// TestHistoryAggregate is one per-(repo, suite, class, name) aggregate row of
+// the incremental test-history store (migration 0026). Its fields mirror
+// internal/testintel.TestStat exactly; FoldTestHistoryAggregate is the single
+// implementation of the fold and MUST stay equivalent to
+// testintel.History.Record (pinned by the equivalence tests).
+type TestHistoryAggregate struct {
+	RepoID      string
+	Suite       string
+	Class       string
+	Name        string
+	Runs        int64
+	Passes      int64
+	Fails       int64
+	EWMA        float64
+	LastFailure *time.Time
+	Outcomes    []bool
+	FlakeProb   float64
+}
+
+// FoldTestHistoryAggregate folds one outcome into an aggregate row. It is the
+// storage-side mirror of testintel.History.Record: the run/pass/fail
+// counters, the duration EWMA (alpha 0.3, seeded by the first observation),
+// the bounded 16-outcome window, the last failure time and the derived flake
+// probability (minority share, clamped to 0 for a single-outcome window).
+// Every constant and branch here is part of the persisted aggregation
+// contract; equivalence with testintel is asserted by
+// TestTestHistoryFoldMatchesTestintel.
+func FoldTestHistoryAggregate(row TestHistoryAggregate, e TestHistoryEntry) TestHistoryAggregate {
+	row.Runs++
+	if e.Passed {
+		row.Passes++
+	} else {
+		row.Fails++
+		when := e.When.UTC()
+		row.LastFailure = &when
+	}
+	if row.Runs == 1 {
+		row.EWMA = e.Duration
+	} else {
+		row.EWMA = testHistoryEWMAAlpha*e.Duration + (1-testHistoryEWMAAlpha)*row.EWMA
+	}
+	row.Outcomes = append(row.Outcomes, e.Passed)
+	if len(row.Outcomes) > testHistoryOutcomeWindow {
+		row.Outcomes = row.Outcomes[len(row.Outcomes)-testHistoryOutcomeWindow:]
+	}
+	row.FlakeProb = testHistoryFlakeProbability(row.Outcomes)
+	return row
+}
+
+// testHistoryEWMAAlpha / testHistoryOutcomeWindow mirror
+// internal/testintel's unexported ewmaAlpha / outcomeWindow.
+const (
+	testHistoryEWMAAlpha     = 0.3
+	testHistoryOutcomeWindow = 16
+)
+
+// testHistoryFlakeProbability mirrors internal/testintel.flakeProbability.
+func testHistoryFlakeProbability(outcomes []bool) float64 {
+	if len(outcomes) < 2 {
+		return 0
+	}
+	var pass, fail int
+	for _, ok := range outcomes {
+		if ok {
+			pass++
+		} else {
+			fail++
+		}
+	}
+	minority := pass
+	if fail < pass {
+		minority = fail
+	}
+	return float64(minority) / float64(len(outcomes))
+}
+
+// TestHistoryAggregateStore is the incremental, repository-scoped
+// test-history contract (migration 0026) that replaces the O(total history)
+// per-upload rebuild:
+//
+//   - InsertTestReportWithHistory writes the durable report AND folds its
+//     cases into the per-(repo, suite, class, name) aggregates AND bumps the
+//     repository's version in ONE transaction, so per-upload work is
+//     proportional to the report, never to the accumulated history, and a
+//     canceled context commits nothing.
+//   - LoadRepoTestHistory returns only the requested canonical repository's
+//     aggregates (in the legacy stats JSON shape) with its version.
+//   - ResolveTestHistoryRepoIDs resolves the query forms the API accepts
+//     (human full name, canonical RepoID, legacy host-less canonical form) to
+//     the canonical repository IDs they address, through a bounded,
+//     set-based run-identity query — never by materializing reports.
+//   - TestReportTotals and FlakyTestNames answer test-intelligence from the
+//     requested repository's rows only.
+//   - RebuildRepoTestHistory is the EXPLICIT bounded repair operation: it
+//     recomputes one repository's aggregates from its durable reports. It is
+//     never called per upload; the server invokes it once per repository as
+//     lazy repair when aggregates predate the migration, and operators can
+//     invoke it directly.
+type TestHistoryAggregateStore interface {
+	InsertTestReportWithHistory(ctx context.Context, rep model.TestReport, repoID string) (version int64, err error)
+	LoadRepoTestHistory(ctx context.Context, repoID string) (version int64, stats []byte, err error)
+	ResolveTestHistoryRepoIDs(ctx context.Context, query string, limit int) ([]string, error)
+	TestReportTotals(ctx context.Context, repoIDs []string, repoQuery string) (reports, tests, failures int, err error)
+	FlakyTestNames(ctx context.Context, repoIDs []string, limit int) ([]string, error)
+	RebuildRepoTestHistory(ctx context.Context, repoID string) (version int64, err error)
+	ListTestHistoryRepoIDs(ctx context.Context, limit int) ([]string, error)
 }
 
 // ValidateID checks the canonical control-plane identifier format produced

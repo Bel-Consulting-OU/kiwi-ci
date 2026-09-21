@@ -1,0 +1,30 @@
+-- 0021_jobs_recovery_queue_deadline.sql — queue_deadline column for bounded
+-- recovery discovery.
+--
+-- The queue-timeout sweeper must find candidates directly. Until now the
+-- effective queue deadline lived only in the job payload (QueueDeadline, with
+-- a compiled-payload queue_timeout fallback), so a sweep could only discover
+-- timed-out jobs by enumerating runs and filtering their jobs in Go — a scan
+-- bounded by ListRuns' newest-10000 window that permanently missed an old
+-- timed-out job once enough newer runs existed. This column materializes the
+-- persisted QueueDeadline so 0024's partial index can page straight to the
+-- expired candidates, independent of run age and count.
+--
+-- The column is a DERIVED INDEX of the payload field, never a second source
+-- of truth: every job write through the canonical INSERT/upsert path stamps
+-- it (queue_deadline is set at enqueue and never moves afterwards), and
+-- 0022 backfills existing rows from the persisted payload value. Jobs whose
+-- only deadline source is the legacy compiled-payload queue_timeout
+-- (persisted before the QueueDeadline field existed) keep a NULL column and
+-- are still discovered by the payload fallback predicate in
+-- ListQueueTimedOutJobs, so no candidate class is lost.
+--
+-- DEPLOY-SAFETY SPLIT (see 0018-0020): this file deliberately holds ONLY the
+-- metadata-only ADD COLUMN. The nullable, default-less column needs no table
+-- rewrite, so the ACCESS EXCLUSIVE lock this statement takes on jobs is held
+-- for the statement itself, not across the 0022 backfill (a row-level
+-- UPDATE) or the 0023/0024 index builds. Keeping them together would hold
+-- that ACCESS EXCLUSIVE lock — which blocks even reads — across the whole
+-- backfill and both index builds.
+
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS queue_deadline TIMESTAMPTZ;

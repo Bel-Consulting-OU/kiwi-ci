@@ -49,6 +49,17 @@ func pgITDSN(t *testing.T) string {
 	return dsn
 }
 
+// pgITLatestVersion returns the newest embedded migration version, so
+// version-pinning tests track the migration set instead of a stale literal.
+func pgITLatestVersion(t *testing.T) int {
+	t.Helper()
+	all, err := migrations.All()
+	if err != nil {
+		t.Fatalf("migrations.All: %v", err)
+	}
+	return all[len(all)-1].Version
+}
+
 // pgITRandomHex returns n random lowercase hex characters.
 func pgITRandomHex(t *testing.T, n int) string {
 	t.Helper()
@@ -132,12 +143,34 @@ func (e *pgITEnv) migrate(t *testing.T, st *PostgresStore) {
 	}
 }
 
-// pgITStore returns a migrated store on a fresh schema.
+// pgITArmFence makes st present the durable current leadership epoch, so
+// leader-fenced store operations are admissible (a real leader's store
+// retains exactly this value from its own acquisition). The helper does NOT
+// take the database-wide leadership advisory lock: that lock is shared by
+// every test schema in the process and taking it in every test would
+// serialize unrelated integration tests behind each other. Presenting the
+// current epoch is the whole fence contract; tests that exercise acquisition
+// itself use TryAcquireLeadership directly.
+func pgITArmFence(t *testing.T, st *PostgresStore) int64 {
+	t.Helper()
+	epoch, err := st.ReadLeaderEpoch(context.Background())
+	if err != nil {
+		t.Fatalf("read leader epoch: %v", err)
+	}
+	st.SetLeaderEpoch(epoch)
+	return epoch
+}
+
+// pgITStore returns a migrated store on a fresh schema that presents the
+// durable current leadership epoch, so leader-fenced operations run without
+// every test restating the arm. Tests that need a standby (or exercise
+// acquisition contention) open a raw store instead.
 func pgITStore(t *testing.T) *PostgresStore {
 	t.Helper()
 	env := pgITSetup(t)
 	st := env.open(t)
 	env.migrate(t, st)
+	pgITArmFence(t, st)
 	return st
 }
 

@@ -386,9 +386,13 @@ type Server struct {
 
 	// history is the persistent test-intelligence history (testshards.go).
 	history *testintelHistory
-	// historyDBVersion is the last durable test-history cache version loaded
-	// into the in-memory history in DB mode; guarded by s.mu.
+	// historyDBVersion is the last durable per-repository test-history
+	// version loaded into the in-memory history in DB mode, and historyDBRepo
+	// is the canonical repository that version belongs to. Both are guarded
+	// by s.mu. An empty historyDBRepo means the in-memory history is a local
+	// mix (a report was folded locally), so the next sync reloads.
 	historyDBVersion int64
+	historyDBRepo    string
 
 	// schedules/occurrences are the memory-mode schedule store; DB mode
 	// uses storage.ScheduleStore (schedules.go). orphanOccurrences remembers
@@ -604,6 +608,15 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 		return nil, err
 	}
 	s.runs, s.jobs, s.runners, s.artifacts, s.reports = snap.Runs, snap.Jobs, snap.Runners, snap.Artifacts, snap.Reports
+	// The CRL is monotonic: merge the snapshot's revocations (written with
+	// the runner disable) OVER the legacy runner-crl.json mirror loaded
+	// above. A revocation present in either source is permanent, so the
+	// union is the only safe reconciliation.
+	for serial, id := range snap.CRL {
+		if _, ok := s.crl[serial]; !ok {
+			s.crl[serial] = id
+		}
+	}
 	s.downstreamLinks = snap.DownstreamLinks
 	if s.downstreamLinks == nil {
 		s.downstreamLinks = map[string]storage.DownstreamLink{}
@@ -2296,8 +2309,10 @@ func (s *Server) runnerDrain(w http.ResponseWriter, r *http.Request) {
 // revokeRunnerDB invalidates every active lease held by the runner through
 // the SQL scheduler: running jobs requeue (retry budget permitting) or
 // cancel, their lease fields are cleared, and audit events are emitted.
-// It is the DB-mode half of the runner disable kill switch and returns the
-// number of invalidated leases.
+// It remains the standalone lease-revocation transaction (used by tests and
+// by maintenance callers); the admin disable endpoint uses the atomic
+// RunnerDisableStore transaction instead, which commits the disable flag and
+// the certificate revocation together with the lease revocation.
 func (s *Server) revokeRunnerDB(ctx context.Context, runnerID, reason string) (int, error) {
 	if s.Sched == nil {
 		return 0, errors.New("server: db runner revocation requires the sql scheduler")
@@ -2310,6 +2325,14 @@ func (s *Server) revokeRunnerDB(ctx context.Context, runnerID, reason string) (i
 // lease to it. Re-registration cannot clear the flag. In mTLS mode the
 // runner's certificate serial is also revoked (persisted CRL, see crl.go)
 // so a disabled runner's still-valid certificate cannot be replayed.
+//
+// DB mode commits disable + lease revocation + certificate revocation +
+// audit in ONE store transaction (storage.RunnerDisableStore) and fails
+// closed with an opaque 503 when it cannot be recorded: a success response
+// never describes a disable whose permanent cross-replica revocation was not
+// durable. The fs/memory path performs the equivalent under one lock
+// section, persists the snapshot (which now carries the CRL) before
+// acking, and rolls the whole state back on a failed write.
 func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	actor := actorFrom(r)
@@ -2326,33 +2349,32 @@ func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
 			s.internalError(w, r, err, "")
 			return
 		}
-		// Audit-first: the disable's evidence lands before the runner row is
-		// updated. The DB audit table is a separate transaction (the store
-		// API cannot join it), so a row may exist for a disable the store
-		// update then rejected.
-		if aerr := s.auditFirstLocked(r.Context(), "runner.disable", actor, "", "", "runner disabled", map[string]string{"runner": id}); aerr != nil {
-			http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
+		ds, ok := s.DB.(storage.RunnerDisableStore)
+		if !ok {
+			// A store that cannot commit the disable atomically must never
+			// answer success: the old best-effort path could leave the
+			// certificate unrevoked.
+			s.serverError(w, r, http.StatusServiceUnavailable, errors.New("store does not support atomic runner disable"), "runner disable unavailable")
 			return
 		}
+		revoked, err := ds.DisableRunnerAndRevokeCert(r.Context(), id, ri.CertSerial, actor)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				http.NotFound(w, r)
+				return
+			}
+			s.serverError(w, r, http.StatusServiceUnavailable, err, "runner disable not durable")
+			return
+		}
+		s.metricAdd("kiwi_runner_killswitch_jobs_total", float64(revoked), nil)
 		ri.Disabled = true
 		if ri.CertSerial != "" && ri.RevokedAt == nil {
 			now := time.Now().UTC()
 			ri.RevokedAt = &now
 		}
-		if err := s.DB.UpsertRunner(r.Context(), ri); err != nil {
-			s.internalError(w, r, err, "")
-			return
-		}
-		// The disable flag alone does not stop a job already in flight: the
-		// kill switch atomically invalidates every active lease held by the
-		// runner so no further work can run.
-		revoked, err := s.revokeRunnerDB(r.Context(), id, "runner disabled")
-		if err != nil {
-			s.internalError(w, r, err, "")
-			return
-		}
-		s.metricAdd("kiwi_runner_killswitch_jobs_total", float64(revoked), nil)
-		s.revokeRunnerCert(ri, actor)
+		// The durable revocation is committed; mirror it locally so this
+		// replica rejects the certificate immediately.
+		s.mirrorRunnerCertRevoked(ri)
 		writeJSON(w, http.StatusOK, ri)
 		return
 	}
@@ -2370,11 +2392,29 @@ func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	if ri.CertSerial != "" {
+		// The certificate revocation's evidence is written before the state
+		// transition, exactly like the disable's, so a transition that then
+		// fails to persist can never be acknowledged without both rows (the
+		// rows may outlive a rolled-back attempt: the documented
+		// evidence-first trade-off).
+		if aerr := s.auditFirstLocked(r.Context(), "runner.cert_revoked", actor, "", "", "runner certificate serial revoked", map[string]string{"runner": id, "serial": ri.CertSerial}); aerr != nil {
+			s.mu.Unlock()
+			http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
+			return
+		}
+	}
 	rb := s.captureStateRollbackLocked()
 	ri.Disabled = true
 	if ri.CertSerial != "" && ri.RevokedAt == nil {
 		now := time.Now().UTC()
 		ri.RevokedAt = &now
+	}
+	if ri.CertSerial != "" {
+		if s.crl == nil {
+			s.crl = map[string]string{}
+		}
+		s.crl[ri.CertSerial] = ri.ID
 	}
 	now := time.Now().UTC()
 	for jobID, j := range s.jobs {
@@ -2397,17 +2437,27 @@ func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
 		s.refreshRunLocked(runID)
 	}
 	if perr := s.persistCheckedErrLocked("runner.disable"); perr != nil {
-		// The kill switch never became durable: revive every cancelled job,
-		// restore the runner (flag, revocation marker, slots) and the
-		// re-aggregated runs, and answer 503. The certificate revocation
-		// below runs only after the durable write.
+		// The kill switch (including the CRL carried by the snapshot) never
+		// became durable: revive every cancelled job, restore the runner and
+		// its revocation marker, the re-aggregated runs and the CRL, and
+		// answer 503. No success response is ever produced for a disable the
+		// snapshot does not contain.
 		s.rollbackStateLocked(rb)
 		s.mu.Unlock()
 		http.Error(w, "runner disable not durable", http.StatusServiceUnavailable)
 		return
 	}
+	// The state is durable; seed the local decision cache (the in-memory CRL
+	// map is already part of the snapshot).
+	if ri.CertSerial != "" {
+		s.crlMu.Lock()
+		if s.crlCache == nil {
+			s.crlCache = map[string]crlCacheEntry{}
+		}
+		s.crlCache[ri.CertSerial] = crlCacheEntry{revoked: true, at: now}
+		s.crlMu.Unlock()
+	}
 	s.mu.Unlock()
-	s.revokeRunnerCert(ri, actor)
 	writeJSON(w, http.StatusOK, ri)
 }
 
@@ -3686,6 +3736,10 @@ type stateRollback struct {
 	downstreamLinks map[string]storage.DownstreamLink
 	occurrences     map[string]map[int64]string
 	deployments     map[string]model.Deployment
+	// crl is the certificate revocation mirror. The fs-mode disable commits
+	// the revocation into the same snapshot write as the runner flag, so a
+	// rolled-back disable must restore the CRL too.
+	crl map[string]string
 }
 
 // captureStateRollbackLocked snapshots every map the fs-mode authoritative
@@ -3700,6 +3754,7 @@ func (s *Server) captureStateRollbackLocked() stateRollback {
 		downstreamLinks: make(map[string]storage.DownstreamLink, len(s.downstreamLinks)),
 		occurrences:     make(map[string]map[int64]string, len(s.occurrences)),
 		deployments:     make(map[string]model.Deployment, len(s.deployments)),
+		crl:             make(map[string]string, len(s.crl)),
 	}
 	for id, v := range s.runs {
 		rb.runs[id] = v
@@ -3734,6 +3789,9 @@ func (s *Server) captureStateRollbackLocked() stateRollback {
 	for id, v := range s.deployments {
 		rb.deployments[id] = v
 	}
+	for serial, id := range s.crl {
+		rb.crl[serial] = id
+	}
 	return rb
 }
 
@@ -3750,6 +3808,7 @@ func (s *Server) rollbackStateLocked(rb stateRollback) {
 	restoreMap(s.downstreamLinks, rb.downstreamLinks)
 	restoreMap(s.occurrences, rb.occurrences)
 	restoreMap(s.deployments, rb.deployments)
+	restoreMap(s.crl, rb.crl)
 }
 
 // completionReplayReadyLocked recognizes an idempotent completion replay from
@@ -4665,7 +4724,7 @@ func (s *Server) persistLocked() error {
 		s.notePersistResult(s.persistFailForTest)
 		return s.persistFailForTest
 	}
-	err := s.store.Save(storage.Snapshot{Version: 1, Runs: s.runs, Jobs: s.jobs, Runners: s.runners, Artifacts: s.artifacts, Reports: s.reports, DownstreamLinks: s.downstreamLinks, Profiles: s.profiles, CertProfileLinks: s.certProfiles, Snapshots: s.snapshots, CompletionReceipts: s.completionReceiptRecordsLocked(), Deployments: s.deployments})
+	err := s.store.Save(storage.Snapshot{Version: 1, Runs: s.runs, Jobs: s.jobs, Runners: s.runners, Artifacts: s.artifacts, Reports: s.reports, DownstreamLinks: s.downstreamLinks, Profiles: s.profiles, CertProfileLinks: s.certProfiles, Snapshots: s.snapshots, CompletionReceipts: s.completionReceiptRecordsLocked(), Deployments: s.deployments, CRL: s.crl})
 	s.notePersistResult(err)
 	return err
 }
@@ -5400,11 +5459,20 @@ func (s *Server) maintainMemoryTick(ctx context.Context, now time.Time) {
 }
 
 // maintainDB is the DB-mode housekeeping tick. The leader recovers expired
-// leases, flushes the outbox, and garbage-collects memory artifacts (artifact
+// leases, expires queue timeouts, recovers downstream reservations, flushes
+// the outbox, and garbage-collects memory artifacts and CAS objects (artifact
 // bytes still live on the local filesystem, so DB-mode GC covers memory
-// records only). A standby serves reads and polls the leadership claim; on
-// promotion it runs RecoverExpired once so leases orphaned by the previous
-// leader are reclaimed immediately.
+// records and the durable pending-sidecar rows only). A standby serves reads
+// and polls the leadership claim; on promotion it runs RecoverExpired once so
+// leases orphaned by the previous leader are reclaimed immediately.
+//
+// The s.leader flag is only a fast gate. Every leader-only store mutation it
+// unlocks is independently FENCED by the store's leadership epoch inside its
+// transaction, so a replica whose cached claim outlived its advisory-lock
+// session gets storage.ErrStaleLeader and mutates nothing. The recovery sweep
+// surfaces that error first; this tick then demotes immediately and skips the
+// rest of the leader-only work instead of logging a stale leader's failures
+// every tick.
 func (s *Server) maintainDB(ctx context.Context, now time.Time) {
 	if !s.leader {
 		if !s.Sched.IsLeader(ctx) {
@@ -5413,6 +5481,14 @@ func (s *Server) maintainDB(ctx context.Context, now time.Time) {
 		s.leader = true
 		s.logInfo("promoted to leader", "key", s.LeaderKey)
 		if err := s.Sched.RecoverExpired(ctx, now); err != nil {
+			if errors.Is(err, storage.ErrStaleLeader) {
+				// The claim was lost between the promotion check and the
+				// first fenced mutation: nothing was recovered, so demote
+				// without reporting a leader's work as failed.
+				s.leader = false
+				s.logInfo("demoted to standby after stale leadership fence", "key", s.LeaderKey)
+				return
+			}
 			s.logError("post-promotion recovery", "error", err.Error())
 		}
 		// The in-memory schedule mirror may be arbitrarily stale (writes
@@ -5428,8 +5504,19 @@ func (s *Server) maintainDB(ctx context.Context, now time.Time) {
 		s.logInfo("demoted to standby", "key", s.LeaderKey)
 		return
 	}
-	if err := s.Sched.RecoverExpired(ctx, now); err != nil && !errors.Is(err, scheduler.ErrNotLeader) {
-		s.logError("lease recovery", "error", err.Error())
+	if err := s.Sched.RecoverExpired(ctx, now); err != nil {
+		if errors.Is(err, storage.ErrStaleLeader) {
+			// The store rejected this replica's leadership epoch inside the
+			// recovery transaction: another replica has published a newer
+			// epoch and is the leader now. Nothing was mutated; skip the
+			// remaining leader-only work and demote at once.
+			s.leader = false
+			s.logInfo("demoted to standby after stale leadership fence", "key", s.LeaderKey)
+			return
+		}
+		if !errors.Is(err, scheduler.ErrNotLeader) {
+			s.logError("lease recovery", "error", err.Error())
+		}
 	}
 	s.recoverDownstreamReservations(ctx, now)
 	s.flushOutbox(ctx)

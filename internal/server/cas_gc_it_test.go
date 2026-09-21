@@ -44,6 +44,7 @@ func TestCASGCIntegrationDBMode(t *testing.T) {
 	// Another replica holds the collector advisory lease: this pass must be
 	// skipped even though the orphan is old and unreferenced.
 	other := env.open(t)
+	pgITSrvArmFence(t, other)
 	lease, held, err := other.TryAcquireCASGCLease(ctx, casGCLeaseKey)
 	if err != nil || !held {
 		t.Fatalf("second replica lease: held=%v err=%v", held, err)

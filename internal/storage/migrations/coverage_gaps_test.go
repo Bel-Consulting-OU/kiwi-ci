@@ -36,6 +36,33 @@ func TestAllMigrationsAreWellFormed(t *testing.T) {
 	}
 }
 
+// TestMigrationCommentsContainNoSemicolons pins the splitter's constraint:
+// SplitStatements splits raw SQL on ';' BEFORE stripping comment lines, so a
+// semicolon inside a comment slices the comment in half and leaves the tail
+// as a stray non-comment fragment that the migration runner then executes as
+// SQL. This is exactly the deploy-time failure this guard exists to prevent.
+func TestMigrationCommentsContainNoSemicolons(t *testing.T) {
+	entries, err := FS.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read migration dir: %v", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
+			continue
+		}
+		raw, err := FS.ReadFile(e.Name())
+		if err != nil {
+			t.Fatalf("read %s: %v", e.Name(), err)
+		}
+		for i, line := range strings.Split(string(raw), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "--") && strings.Contains(trimmed, ";") {
+				t.Errorf("%s:%d comment contains a semicolon (the splitter will cut it): %q", e.Name(), i+1, trimmed)
+			}
+		}
+	}
+}
+
 func TestVersionOf(t *testing.T) {
 	if v, err := versionOf("0012_name.sql"); err != nil || v != 12 {
 		t.Fatalf("versionOf = (%d, %v)", v, err)

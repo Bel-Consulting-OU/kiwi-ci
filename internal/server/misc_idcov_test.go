@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -52,12 +53,12 @@ func TestIDCovLoadCRLPaths(t *testing.T) {
 	blocker := filepath.Join(t.TempDir(), "blocker")
 	writeTestFile(t, blocker, []byte("x"))
 	broken.dataDir = blocker
-	broken.revokeRunnerCert(model.Runner{ID: "runner-b", CertSerial: "serial-b"}, "admin")
-	if !broken.certSerialRevoked("serial-b") {
+	broken.revokeRunnerCert(context.Background(), model.Runner{ID: "runner-b", CertSerial: "serial-b"}, "admin")
+	if !crlRevoked(t, broken, "serial-b") {
 		t.Fatal("revocation lost after a failed persist")
 	}
 	// An empty serial is never revoked.
-	broken.revokeRunnerCert(model.Runner{ID: "runner-c"}, "admin")
+	broken.revokeRunnerCert(context.Background(), model.Runner{ID: "runner-c"}, "admin")
 	if len(broken.crl) != 1 {
 		t.Fatalf("empty-serial revocation wrote %v", broken.crl)
 	}

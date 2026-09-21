@@ -188,9 +188,14 @@ func sha256File(path string) (string, error) {
 }
 
 // putArtifactBytes PUTs an in-memory artifact sibling (sbom/sigstore) under
-// the job lease.
+// the job lease on the streaming client, with the same sliding inactivity
+// guard as file-backed artifact uploads.
 func (r *Runner) putArtifactBytes(ctx context.Context, t server.Task, name string, body []byte, contentType string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, r.Cfg.Server+"/api/v1/jobs/"+t.Job.ID+"/artifacts/"+name, strings.NewReader(string(body)))
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	guard := newStallGuard(cancel, streamIdleTimeout)
+	defer guard.stop()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPut, r.Cfg.Server+"/api/v1/jobs/"+t.Job.ID+"/artifacts/"+name, &stallGuardReader{r: strings.NewReader(string(body)), guard: guard})
 	if err != nil {
 		return err
 	}
@@ -199,7 +204,7 @@ func (r *Runner) putArtifactBytes(ctx context.Context, t server.Task, name strin
 	req.Header.Set("X-Kiwi-Runner-ID", r.ID)
 	req.Header.Set("X-Kiwi-Lease-Token", t.LeaseToken)
 	req.Header.Set("X-Kiwi-Lease-Generation", fmt.Sprint(t.LeaseGeneration))
-	resp, err := r.Client.Do(req)
+	resp, err := r.streamClient().Do(req)
 	if err != nil {
 		return err
 	}

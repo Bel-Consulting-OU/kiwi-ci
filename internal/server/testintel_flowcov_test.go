@@ -13,6 +13,7 @@ import (
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/testintel"
 )
 
@@ -95,14 +96,14 @@ func TestFlowTestintelRecordReportHistoryMemory(t *testing.T) {
 	s := New("tok")
 	// Nil history: no-op.
 	s.history = nil
-	s.recordTestReportHistory("github.com/o/repo-a", model.TestReport{})
+	s.recordTestReportHistory(context.Background(), "github.com/o/repo-a", model.TestReport{})
 	// Memory: fold, save, commit.
 	dir := t.TempDir()
 	if err := s.loadTestintelHistory(dir); err != nil {
 		t.Fatal(err)
 	}
 	rep := model.TestReport{Cases: []model.TestResult{{Name: "t1", Passed: true, Duration: 1}}, CreatedAt: time.Now().UTC()}
-	s.recordTestReportHistory("github.com/o/repo-a", rep)
+	s.recordTestReportHistory(context.Background(), "github.com/o/repo-a", rep)
 	if _, err := os.Stat(filepath.Join(dir, testHistoryFile)); err != nil {
 		t.Fatalf("history file not committed: %v", err)
 	}
@@ -115,7 +116,7 @@ func TestFlowTestintelRecordReportHistoryMemory(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.history.path = block + "/sub/history.json"
-	s.recordTestReportHistory("github.com/o/repo-a", rep)
+	s.recordTestReportHistory(context.Background(), "github.com/o/repo-a", rep)
 
 	// Commit failure (save succeeds, rename onto a directory fails) is
 	// logged, not fatal.
@@ -127,126 +128,222 @@ func TestFlowTestintelRecordReportHistoryMemory(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.history.path = blockDir
-	s.recordTestReportHistory("github.com/o/repo-a", rep)
+	s.recordTestReportHistory(context.Background(), "github.com/o/repo-a", rep)
+}
+
+// legacyHistoryStore exposes only Store + TestHistoryStore (hiding the
+// embedded aggregate contract), so tests can drive the legacy whole-cache
+// maintenance/sync path that production stores no longer use.
+type legacyHistoryStore struct {
+	storage.Store
+	version int64
+	stats   []byte
+	saveErr error
+}
+
+func (l *legacyHistoryStore) LoadTestHistory(context.Context) (int64, []byte, error) {
+	return l.version, append([]byte(nil), l.stats...), nil
+}
+
+func (l *legacyHistoryStore) SaveTestHistory(_ context.Context, stats []byte) (int64, error) {
+	if l.saveErr != nil {
+		return 0, l.saveErr
+	}
+	l.version++
+	l.stats = append([]byte(nil), stats...)
+	return l.version, nil
+}
+
+// corruptRepoHistoryStore returns corrupt aggregate stats for one repository.
+type corruptRepoHistoryStore struct {
+	*dbFakeStore
+	stats []byte
+}
+
+func (c corruptRepoHistoryStore) LoadRepoTestHistory(context.Context, string) (int64, []byte, error) {
+	return 10, c.stats, nil
 }
 
 func TestFlowTestintelRebuildHistoryDB(t *testing.T) {
 	ctx := context.Background()
-	// Store without the history extension.
+	// Store without any history extension.
 	s := New("tok")
 	s.DB = fcPlainStore{newDBFakeStore()}
 	s.rebuildTestHistoryDB(ctx)
 
-	// Report listing failure.
-	f := newDBFakeStore()
-	s2 := New("tok")
-	if err := s2.SwitchToDB(f); err != nil {
+	// Incremental store: repository enumeration failure.
+	f0 := newDBFakeStore()
+	s0 := New("tok")
+	if err := s0.SwitchToDB(f0); err != nil {
 		t.Fatal(err)
 	}
-	s2.DB = &fcStore{dbFakeStore: f, listReportsAllErr: errors.New("reports down")}
-	s2.rebuildTestHistoryDB(ctx)
+	s0.DB = &fcStore{dbFakeStore: f0, listHistoryRepoIDsErr: errors.New("repos down")}
+	s0.rebuildTestHistoryDB(ctx)
 
-	// Save failure.
+	// Incremental store: per-repository repair failure is logged, not fatal.
+	s1 := New("tok")
+	f1 := newDBFakeStore()
+	if err := s1.SwitchToDB(f1); err != nil {
+		t.Fatal(err)
+	}
+	f1.mu.Lock()
+	f1.runs["run-c"] = model.Run{ID: "run-c", RepoID: "github.com/o/repo-a", RepoFullName: "o/repo-a"}
+	f1.reports = []model.TestReport{{ID: "r1", RunID: "run-c", JobKey: "build", CreatedAt: time.Now().UTC(), Cases: []model.TestResult{{Name: "t", Passed: true}}}}
+	f1.mu.Unlock()
+	s1.DB = &fcStore{dbFakeStore: f1, rebuildRepoHistoryErr: errors.New("rebuild down")}
+	s1.rebuildTestHistoryDB(ctx)
+
+	// Incremental store success: the repository aggregates are repaired from
+	// the durable reports and the version advances.
 	f2 := newDBFakeStore()
-	s3 := New("tok")
-	if err := s3.SwitchToDB(f2); err != nil {
+	s2 := New("tok")
+	if err := s2.SwitchToDB(f2); err != nil {
 		t.Fatal(err)
 	}
 	f2.mu.Lock()
-	f2.testHistorySaveErr = errors.New("history save down")
-	f2.reports = []model.TestReport{{ID: "r1", RunID: "run-c", JobKey: "build", CreatedAt: time.Now().UTC(), Cases: []model.TestResult{{Name: "t", Passed: true}}}}
+	f2.runs["run-c"] = model.Run{ID: "run-c", RepoID: "github.com/o/repo-a", RepoFullName: "o/repo-a"}
+	f2.reports = []model.TestReport{
+		{ID: "r1", RunID: "run-c", JobKey: "build", Tests: 1, Failures: 1, CreatedAt: time.Now().UTC(), Cases: []model.TestResult{{Name: "t", Passed: false}}},
+		{ID: "r2", RunID: "run-c", JobKey: "build", Tests: 1, CreatedAt: time.Now().UTC(), Cases: []model.TestResult{{Name: "t", Passed: true}}},
+	}
 	f2.mu.Unlock()
+	s2.rebuildTestHistoryDB(ctx)
+	f2.mu.Lock()
+	version := f2.historyVersions["github.com/o/repo-a"]
+	f2.mu.Unlock()
+	if version == 0 {
+		t.Fatal("repair did not bump the repository history version")
+	}
+	if got := s2.flakyFromHistory("github.com/o/repo-a"); len(got) != 0 {
+		t.Fatalf("in-memory history must only reload on the next sync: %v", got)
+	}
+
+	// Legacy store: report listing failure, save failure, success (with a
+	// missing run exercising the identity fallback) and serialization failure.
+	f3 := newDBFakeStore()
+	s3 := New("tok")
+	s3.DB = &legacyHistoryStore{Store: &fcStore{dbFakeStore: f3, listReportsAllErr: errors.New("reports down")}}
 	s3.rebuildTestHistoryDB(ctx)
 
-	// Success: reports fold into the cached history and its run lookup
-	// failure path is exercised through a missing run.
-	f3 := newDBFakeStore()
-	s4 := New("tok")
-	if err := s4.SwitchToDB(f3); err != nil {
-		t.Fatal(err)
-	}
-	f3.mu.Lock()
-	f3.reports = []model.TestReport{
-		{ID: "r1", RunID: "run-missing", JobKey: "build", CreatedAt: time.Now().UTC(), Cases: []model.TestResult{{Name: "t", Passed: false}}},
-		{ID: "r2", RunID: "run-missing", JobKey: "build", CreatedAt: time.Now().UTC(), Cases: []model.TestResult{{Name: "t", Passed: true}}},
-	}
-	f3.mu.Unlock()
-	s4.rebuildTestHistoryDB(ctx)
-	f3.mu.Lock()
-	version := f3.testHistoryVersion
-	f3.mu.Unlock()
-	if version == 0 {
-		t.Fatal("rebuild did not bump the history version")
-	}
-	// Serialization failure (unwritable TMPDIR) is logged only.
 	f4 := newDBFakeStore()
-	s5 := New("tok")
-	if err := s5.SwitchToDB(f4); err != nil {
-		t.Fatal(err)
-	}
+	s4 := New("tok")
+	s4.DB = &legacyHistoryStore{Store: f4, saveErr: errors.New("history save down")}
 	f4.mu.Lock()
 	f4.reports = []model.TestReport{{ID: "r1", RunID: "run-c", JobKey: "build", CreatedAt: time.Now().UTC(), Cases: []model.TestResult{{Name: "t", Passed: true}}}}
 	f4.mu.Unlock()
-	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "missing"))
+	s4.rebuildTestHistoryDB(ctx)
+
+	legacy := &legacyHistoryStore{Store: f4}
+	s5 := New("tok")
+	s5.DB = legacy
+	f4.mu.Lock()
+	f4.reports = []model.TestReport{
+		{ID: "r1", RunID: "run-missing", JobKey: "build", CreatedAt: time.Now().UTC(), Cases: []model.TestResult{{Name: "t", Passed: false}}},
+		{ID: "r2", RunID: "run-missing", JobKey: "build", CreatedAt: time.Now().UTC(), Cases: []model.TestResult{{Name: "t", Passed: true}}},
+	}
+	f4.mu.Unlock()
 	s5.rebuildTestHistoryDB(ctx)
+	if legacy.version == 0 {
+		t.Fatal("legacy rebuild did not bump the cache version")
+	}
+
+	legacyTmp := &legacyHistoryStore{Store: f4}
+	s6 := New("tok")
+	s6.DB = legacyTmp
+	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "missing"))
+	s6.rebuildTestHistoryDB(ctx)
 }
 
 func TestFlowTestintelSyncHistoryDB(t *testing.T) {
 	ctx := context.Background()
+	// Neither history extension: no-op.
 	s := New("tok")
 	s.DB = fcPlainStore{newDBFakeStore()}
-	s.syncTestHistoryDB(ctx)
+	s.syncTestHistoryDB(ctx, "github.com/o/repo-a")
 
-	// Load failure.
+	// Aggregate load failure keeps the current history.
 	f := newDBFakeStore()
 	s2 := New("tok")
 	if err := s2.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
-	s2.DB = &fcStore{dbFakeStore: f, loadHistoryErr: errors.New("history load down")}
-	s2.syncTestHistoryDB(ctx)
+	s2.DB = &fcStore{dbFakeStore: f, loadRepoHistoryErr: errors.New("history load down")}
+	s2.syncTestHistoryDB(ctx, "github.com/o/repo-a")
 
-	// Older version: no-op.
+	// Empty repository: the observation is recorded without replacing the
+	// in-memory history.
 	f.mu.Lock()
-	f.testHistoryVersion = 1
+	f.historyVersions["github.com/o/repo-a"] = 9
 	f.mu.Unlock()
 	s2.DB = f
-	s2.historyDBVersion = 5
-	s2.syncTestHistoryDB(ctx)
-
-	// Newer empty stats: version recorded without replacing the history.
-	f.mu.Lock()
-	f.testHistoryVersion = 9
-	f.testHistoryStats = nil
-	f.mu.Unlock()
-	s2.syncTestHistoryDB(ctx)
-	if s2.historyDBVersion != 9 {
-		t.Fatalf("empty stats version = %d, want 9", s2.historyDBVersion)
+	s2.syncTestHistoryDB(ctx, "github.com/o/repo-a")
+	if s2.historyDBVersion != 9 || s2.historyDBRepo != "github.com/o/repo-a" {
+		t.Fatalf("empty stats observation = %d/%q, want 9/github.com/o/repo-a", s2.historyDBVersion, s2.historyDBRepo)
 	}
 
-	// Newer corrupt stats: decode error keeps the current history.
-	f.mu.Lock()
-	f.testHistoryVersion = 10
-	f.testHistoryStats = []byte("{")
-	f.mu.Unlock()
+	// Corrupt stats for a NEWER version: decode error keeps the current
+	// history (and the recorded version).
+	s2.DB = corruptRepoHistoryStore{dbFakeStore: f, stats: []byte("{")}
 	before := s2.history.h
-	s2.syncTestHistoryDB(ctx)
+	s2.syncTestHistoryDB(ctx, "github.com/o/repo-a")
 	if s2.history.h != before || s2.historyDBVersion != 9 {
 		t.Fatal("corrupt stats must not replace the history")
 	}
 
-	// Newer valid stats: history replaced.
-	stats, err := historyStats(before)
+	// Valid stats from a real commit: the history is replaced and a flaky
+	// test is visible.
+	if _, err := f.InsertTestReportWithHistory(ctx, model.TestReport{
+		ID: "rep-1", RunID: "run-c", JobKey: "build", CreatedAt: time.Now().UTC(),
+		Cases: []model.TestResult{{Class: "C", Name: "flaky", Passed: false}},
+	}, "github.com/o/repo-a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.InsertTestReportWithHistory(ctx, model.TestReport{
+		ID: "rep-2", RunID: "run-c", JobKey: "build", CreatedAt: time.Now().UTC(),
+		Cases: []model.TestResult{{Class: "C", Name: "flaky", Passed: true}},
+	}, "github.com/o/repo-a"); err != nil {
+		t.Fatal(err)
+	}
+	s2.DB = f
+	s2.syncTestHistoryDB(ctx, "github.com/o/repo-a")
+	if s2.historyDBVersion != 11 {
+		t.Fatalf("valid stats version = %d, want 11", s2.historyDBVersion)
+	}
+	if got := s2.flakyFromHistory("github.com/o/repo-a"); len(got) != 1 || got[0] != "C.flaky" {
+		t.Fatalf("flaky after sync = %v, want [C.flaky]", got)
+	}
+
+	// Legacy fallback store: load failure, older version no-op, empty stats
+	// and corrupt stats keep the history, valid stats replace it.
+	legacy := &legacyHistoryStore{Store: f, version: 7, stats: []byte("{")}
+	s3 := New("tok")
+	s3.DB = legacy
+	s3.historyDBVersion = 5
+	s3.syncTestHistoryDB(ctx, "github.com/o/repo-a")
+	legacyBefore := s3.history.h
+	if s3.historyDBVersion != 5 {
+		t.Fatalf("corrupt legacy stats version = %d, want 5", s3.historyDBVersion)
+	}
+	legacy.version = 3
+	s3.syncTestHistoryDB(ctx, "github.com/o/repo-a")
+	if s3.history.h != legacyBefore || s3.historyDBVersion != 5 {
+		t.Fatal("older legacy version must be ignored")
+	}
+	stats, err := historyStats(legacyBefore)
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.mu.Lock()
-	f.testHistoryVersion = 11
-	f.testHistoryStats = stats
-	f.mu.Unlock()
-	s2.syncTestHistoryDB(ctx)
-	if s2.historyDBVersion != 11 {
-		t.Fatalf("valid stats version = %d, want 11", s2.historyDBVersion)
+	legacy.version = 8
+	legacy.stats = stats
+	s3.syncTestHistoryDB(ctx, "github.com/o/repo-a")
+	if s3.historyDBVersion != 8 {
+		t.Fatalf("valid legacy stats version = %d, want 8", s3.historyDBVersion)
+	}
+	legacy.stats = nil
+	legacy.version = 10
+	s3.syncTestHistoryDB(ctx, "github.com/o/repo-a")
+	if s3.historyDBVersion != 10 {
+		t.Fatalf("empty legacy stats version = %d, want 10", s3.historyDBVersion)
 	}
 }
 
@@ -300,7 +397,7 @@ func TestFlowTestintelUploadReportBranches(t *testing.T) {
 	f.jobs["job-a"] = model.Job{ID: "job-a", RunID: "run-c", Key: "build", Status: model.StatusRunning, RepoURL: "https://github.com/o/repo-a.git", RepoFullName: "o/repo-a",
 		LeaseRunnerID: "runner-a", LeaseTokenHash: hashLeaseToken(s2.leaseKey, "cache-lease-token"), LeaseGeneration: 5, LeaseExpiresAt: timePtr(time.Now().UTC().Add(time.Hour))}
 	f.mu.Unlock()
-	s2.DB = &fcStore{dbFakeStore: f, insertReportErr: errors.New("report insert down")}
+	s2.DB = &fcStore{dbFakeStore: f, insertReportHistErr: errors.New("report insert down")}
 	if w := doJSONHeaders(t, s2, http.MethodPost, "/api/v1/jobs/job-a/tests", "runner-tok", fcReportBody("job-a", model.TestResult{Name: "t1", Passed: true}), hdrs2); w.Code != http.StatusInternalServerError {
 		t.Fatalf("db insert failure = %d, want 500", w.Code)
 	}
@@ -397,11 +494,21 @@ func TestFlowTestintelIntelligence(t *testing.T) {
 		t.Fatalf("memory intelligence = %d %s", w.Code, w.Body.String())
 	}
 
-	// DB: report listing failure.
+	// DB: repository resolution failure (the scoped read never lists every
+	// report, so the injected failure is on the set-based identity query).
 	s2, f, _, _ := cacheFixture(t)
-	s2.DB = &fcStore{dbFakeStore: f, listReportsAllErr: errors.New("reports down")}
+	s2.DB = &fcStore{dbFakeStore: f, resolveRepoIDsErr: errors.New("repos down")}
 	if w := doJSON(t, s2, http.MethodGet, "/api/v1/test-intelligence?repo=o/repo-a", "admin-tok", ""); w.Code != http.StatusInternalServerError {
-		t.Fatalf("db intelligence list failure = %d, want 500", w.Code)
+		t.Fatalf("db intelligence resolve failure = %d, want 500", w.Code)
+	}
+	// Totals and flaky failures surface as 500 too.
+	s2.DB = &fcStore{dbFakeStore: f, reportTotalsErr: errors.New("totals down")}
+	if w := doJSON(t, s2, http.MethodGet, "/api/v1/test-intelligence?repo=o/repo-a", "admin-tok", ""); w.Code != http.StatusInternalServerError {
+		t.Fatalf("db intelligence totals failure = %d, want 500", w.Code)
+	}
+	s2.DB = &fcStore{dbFakeStore: f, flakyNamesErr: errors.New("flaky down")}
+	if w := doJSON(t, s2, http.MethodGet, "/api/v1/test-intelligence?repo=o/repo-a", "admin-tok", ""); w.Code != http.StatusInternalServerError {
+		t.Fatalf("db intelligence flaky failure = %d, want 500", w.Code)
 	}
 	// DB success: matching reports fold; unmatchable runs are skipped.
 	s2.DB = f

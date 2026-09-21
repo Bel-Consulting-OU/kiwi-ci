@@ -215,7 +215,12 @@ func TestPostgresIntegrationServerReplicaForgeCheckConvergence(t *testing.T) {
 	env := pgITServerSetup(t)
 	sA, _ := pgITServerWithEnv(t, env, dir)
 	pgITServerAwaitLeadership(t, sA)
-	sB, _ := pgITServerWithEnv(t, env, dir)
+	sB, stB := pgITServerWithEnv(t, env, dir)
+	// The flush below runs on BOTH replicas deliberately (the claim lease is
+	// what admits exactly one): the standby presents the durable current
+	// epoch, the same fence view the promoted leader retains from its own
+	// acquisition.
+	pgITSrvArmFence(t, stB)
 	for _, s := range []*Server{sA, sB} {
 		s.GitHubToken = "tok"
 		s.gitHubAPIBase = srv.URL

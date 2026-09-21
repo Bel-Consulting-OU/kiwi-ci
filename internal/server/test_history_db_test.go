@@ -107,13 +107,21 @@ func TestTestHistoryDBReplicasShareShardDecisions(t *testing.T) {
 	}
 }
 
-// TestTestHistoryUpdateFailureKeepsReport proves the history cache write is
-// best-effort: a failing SaveTestHistory never loses the durable report and
-// the upload still acknowledges.
-func TestTestHistoryUpdateFailureKeepsReport(t *testing.T) {
+// TestTestHistoryUpdateFailureFailsUploadClosed is the ADAPTED former
+// TestTestHistoryUpdateFailureKeepsReport (S6-A behavior change, documented).
+//
+// Before the fix the history cache write was best-effort: a failing
+// SaveTestHistory still acknowledged the upload and kept the durable report,
+// and the whole aggregation was silently rebuilt from every report on the
+// next upload (the quadratic defect). The fix commits the report and its
+// per-repository aggregates in ONE transaction, so an aggregate write
+// failure must fail the upload closed: 503 with the raw store error hidden,
+// NO report and NO history row durable. Healing and retrying stores exactly
+// one report and its history.
+func TestTestHistoryUpdateFailureFailsUploadClosed(t *testing.T) {
 	f := newDBFakeStore()
 	f.mu.Lock()
-	f.testHistorySaveErr = fmt.Errorf("history store down")
+	f.insertReportHistoryErr = fmt.Errorf("history store down")
 	f.mu.Unlock()
 	s := New("token")
 	if err := s.SwitchToDB(f); err != nil {
@@ -130,21 +138,23 @@ func TestTestHistoryUpdateFailureKeepsReport(t *testing.T) {
 	body := uploadReportBody(task, runnerID, []map[string]any{
 		{"name": "solo", "duration": 5.0, "passed": true},
 	})
-	if w := doJSON(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/tests", "token", body); w.Code != http.StatusCreated {
-		t.Fatalf("upload report = %d: %s", w.Code, w.Body.String())
+	w := doJSON(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/tests", "token", body)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("upload with failing history = %d, want 500: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "history store down") {
+		t.Fatalf("response leaked the raw store error: %q", w.Body.String())
 	}
 	f.mu.Lock()
-	reports := len(f.reports)
+	reports, version := len(f.reports), f.historyVersions["github.com/o/r"]
 	f.mu.Unlock()
-	if reports != 1 {
-		t.Fatalf("durable reports = %d, want 1 (history failure must not lose the report)", reports)
+	if reports != 0 || version != 0 {
+		t.Fatalf("failed upload persisted reports=%d history_version=%d, want none", reports, version)
 	}
 
-	// Once the history store recovers, the next upload rebuilds the cache
-	// from ALL durable reports — including the one whose history write
-	// failed.
+	// Heal: the retry stores exactly one report and exactly its history.
 	f.mu.Lock()
-	f.testHistorySaveErr = nil
+	f.insertReportHistoryErr = nil
 	f.mu.Unlock()
 	body2 := uploadReportBody(task, runnerID, []map[string]any{
 		{"name": "second", "duration": 8.0, "passed": false},
@@ -153,13 +163,18 @@ func TestTestHistoryUpdateFailureKeepsReport(t *testing.T) {
 		t.Fatalf("second upload = %d: %s", w.Code, w.Body.String())
 	}
 	f.mu.Lock()
-	version := f.testHistoryVersion
-	stats := string(f.testHistoryStats)
+	reports, version = len(f.reports), f.historyVersions["github.com/o/r"]
 	f.mu.Unlock()
-	if version == 0 {
-		t.Fatal("history cache version never advanced")
+	if reports != 1 || version != 1 {
+		t.Fatalf("healed retry = reports %d, version %d; want exactly 1/1", reports, version)
 	}
-	if !strings.Contains(stats, "solo") || !strings.Contains(stats, "second") {
-		t.Fatalf("rebuilt cache missing earlier report: %s", stats)
+	_, stats, err := f.LoadRepoTestHistory(context.Background(), "github.com/o/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The failed upload left no phantom history: only the acknowledged
+	// report's case is present.
+	if strings.Contains(string(stats), "solo") || !strings.Contains(string(stats), "second") {
+		t.Fatalf("history after healed retry = %s", stats)
 	}
 }

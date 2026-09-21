@@ -110,6 +110,7 @@ func TestPostgresIntegrationCollectorLeaseAndFenceAndReferences(t *testing.T) {
 	if err := st.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
+	pgITArmFence(t, st)
 
 	lease, held, err := st.TryAcquireCASGCLease(ctx, "kiwi-cas-gc")
 	if err != nil || !held {

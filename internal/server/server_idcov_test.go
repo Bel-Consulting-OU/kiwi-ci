@@ -33,6 +33,17 @@ type idcovFaultStore struct {
 	hasReceiptErr error
 	revokeErr     error
 	listAuditErr  error
+	// disableAtomicErr makes the atomic disable transaction fail (the S6-B
+	// fail-closed injection point; the old upsert/revoke split no longer
+	// carries the authority for admins).
+	disableAtomicErr error
+}
+
+func (f *idcovFaultStore) DisableRunnerAndRevokeCert(ctx context.Context, runnerID, certSerial, actor string) (int, error) {
+	if f.disableAtomicErr != nil {
+		return 0, f.disableAtomicErr
+	}
+	return f.dbFakeStore.DisableRunnerAndRevokeCert(ctx, runnerID, certSerial, actor)
 }
 
 func (f *idcovFaultStore) GetRun(ctx context.Context, id string) (model.Run, error) {

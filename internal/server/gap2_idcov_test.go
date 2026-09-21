@@ -772,18 +772,38 @@ func TestIDCovRunnerDisableDBErrors(t *testing.T) {
 	}
 	fault.getRunnerErr = nil
 	f.mu.Lock()
-	f.runners["r1"] = model.Runner{ID: "r1", Name: "r1", Capacity: 1}
+	f.runners["r1"] = model.Runner{ID: "r1", Name: "r1", Capacity: 1, CertSerial: "serial-r1"}
 	f.mu.Unlock()
-	fault.upsertRunErr = errors.New("runner write failed")
-	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/r1/disable", "admin", ""); w.Code != http.StatusInternalServerError {
-		t.Fatalf("disable write failure = %d, want 500", w.Code)
+	// ADAPTATION (S6-B): the handler no longer composes UpsertRunner +
+	// RevokeRunnerLeases + best-effort RevokeCert; the whole disable is the
+	// atomic RunnerDisableStore transaction, so a failing transaction fails
+	// the request closed with an opaque 503 and NO partial state. The old
+	// upsert/revoke injections are therefore replaced by the atomic seam.
+	fault.disableAtomicErr = errors.New("atomic disable failed")
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/r1/disable", "admin", "")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("disable atomic failure = %d, want 503", w.Code)
 	}
-	fault.upsertRunErr = nil
-	// The kill switch itself fails when the store cannot revoke the runner's
-	// leases transactionally.
-	fault.revokeErr = errors.New("revoke leases failed")
-	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/r1/disable", "admin", ""); w.Code != http.StatusInternalServerError {
-		t.Fatalf("disable kill-switch failure = %d, want 500", w.Code)
+	if strings.Contains(w.Body.String(), "atomic disable failed") {
+		t.Fatalf("disable failure leaked the raw store error: %q", w.Body.String())
+	}
+	f.mu.Lock()
+	unchanged := f.runners["r1"]
+	revoked := f.revocations["serial-r1"]
+	f.mu.Unlock()
+	if unchanged.Disabled || revoked != "" {
+		t.Fatalf("failed disable left partial state: runner=%+v revocation=%q", unchanged, revoked)
+	}
+	fault.disableAtomicErr = nil
+	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/r1/disable", "admin", ""); w.Code != http.StatusOK {
+		t.Fatalf("healed disable = %d: %s", w.Code, w.Body.String())
+	}
+	f.mu.Lock()
+	healed := f.runners["r1"]
+	revoked = f.revocations["serial-r1"]
+	f.mu.Unlock()
+	if !healed.Disabled || revoked != "r1" {
+		t.Fatalf("healed disable = disabled %v revocation %q, want true/r1", healed.Disabled, revoked)
 	}
 }
 

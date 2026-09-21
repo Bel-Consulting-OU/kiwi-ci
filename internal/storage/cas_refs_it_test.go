@@ -129,18 +129,24 @@ func TestPostgresIntegrationCASGCLeaseSeparation(t *testing.T) {
 	ctx := context.Background()
 
 	// The scheduler leadership claim is held first, exactly as in
-	// production.
+	// production. The acquisition publishes the epoch st retains; `other`
+	// presents the same durable epoch (its CAS collector pass is
+	// leader-fenced) once it is published.
 	leader := "kiwi-leader-" + pgITRandomHex(t, 8)
 	got, err := st.TryAcquireLeadership(ctx, leader, time.Minute)
 	if err != nil || !got {
 		t.Fatalf("leadership claim: got=%v err=%v", got, err)
 	}
 	t.Cleanup(func() { _ = st.ReleaseLeadership(context.Background(), leader) })
+	pgITArmFence(t, other)
 
 	lease, held, err := st.TryAcquireCASGCLease(ctx, "kiwi-cas-gc")
 	if err != nil || !held {
 		t.Fatalf("collector lease: held=%v err=%v", held, err)
 	}
+	// A failing assertion below must not strand the lease transaction (the
+	// pool close in cleanup would block on the checked-out connection).
+	t.Cleanup(func() { _ = lease.Release(context.Background()) })
 	// The leadership claim must still be renewable on the same store: the
 	// collector lease uses its own connection.
 	if got, err := st.TryAcquireLeadership(ctx, leader, time.Minute); err != nil || !got {

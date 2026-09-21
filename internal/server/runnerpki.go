@@ -272,13 +272,20 @@ func (s *Server) resolveRunnerIdentity(r *http.Request, claimedID string) (resol
 // checkPeerCertRevoked rejects a request whose presented TLS peer
 // certificate is on the revocation list. No peer certificate (or no CA) is
 // not an error here: the requirement decision belongs to
-// resolveRunnerIdentity.
+// resolveRunnerIdentity. The lookup runs under the request context (bounded
+// by crlLookupTimeout), so a stalled revocation store can neither pin the
+// request after the client is gone nor authorize the certificate: a lookup
+// failure is an identity error (fail closed).
 func (s *Server) checkPeerCertRevoked(r *http.Request) error {
 	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 || r.TLS.PeerCertificates[0] == nil {
 		return nil
 	}
 	serial := r.TLS.PeerCertificates[0].SerialNumber.Text(16)
-	if s.certSerialRevoked(serial) {
+	revoked, err := s.certSerialRevoked(r.Context(), serial)
+	if err != nil {
+		return fmt.Errorf("runner certificate %s revocation check failed: %w", serial, err)
+	}
+	if revoked {
 		return fmt.Errorf("runner certificate %s is revoked", serial)
 	}
 	return nil

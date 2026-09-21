@@ -372,7 +372,7 @@ func (o *Outbox) Enqueue(ctx context.Context, item forge.OutboxItem) error {
 		o.items = append(o.items, item)
 		return nil
 	}
-	if err := o.appendJSONLLocked(outboxFile, item); err != nil {
+	if err := appendOutboxJSONL(o, outboxFile, item); err != nil {
 		return err
 	}
 	o.items = append(o.items, item)
@@ -419,29 +419,41 @@ func (o *Outbox) enqueueVersionedLocked(ctx context.Context, item forge.OutboxIt
 	// fs mode: the local queue is the durable store. Drop a version at or
 	// below the delivered watermark (rebuilding it from the done file is
 	// what makes this survive a restart), then supersede older pending
-	// versions. The supersede is durable: the superseded lines are retired
-	// through the done file in the SAME operation as the new line, so a
-	// restart can never replay an older state.
+	// versions.
 	if o.delivered[item.LogicalKey] >= item.StateVersion {
 		o.retireSupersededLocked(o.supersededIDsLocked(item.ID, item.LogicalKey, item.StateVersion))
 		return nil
 	}
 	superseded := o.supersededIDsLocked(item.ID, item.LogicalKey, item.StateVersion)
 	if o.store != nil {
-		if err := o.appendJSONLLocked(outboxFile, item); err != nil {
+		// Durable-first: the new line must exist before the intent can be
+		// dispatchable from RAM.
+		if err := appendOutboxJSONL(o, outboxFile, item); err != nil {
 			return err
 		}
+	}
+	// Mirror the durably appended line into the queue BEFORE the retirement
+	// appends below (an equal-version copy is replaced in place, never
+	// duplicated). Flush's version guard reads in-memory state, so if a
+	// retirement append fails the resident newer version already makes every
+	// older queued copy of this logical key stale: the old state can never be
+	// dispatched after the newer one is durably accepted. The failed append
+	// still surfaces as an error, and a caller retry (deterministic IDs)
+	// re-attempts the idempotent retirement records.
+	o.removeLocked(item.ID)
+	o.items = append(o.items, item)
+	if o.store != nil {
+		// The supersede is durable: the superseded lines are retired through
+		// the done file so a restart can never replay an older state. Done
+		// records are set entries, so re-attempts after a partial failure are
+		// idempotent.
 		for _, id := range superseded {
-			if err := o.appendJSONLLocked(outboxDoneFile, outboxDoneRecord{ID: id}); err != nil {
+			if err := appendOutboxJSONL(o, outboxDoneFile, outboxDoneRecord{ID: id}); err != nil {
 				return err
 			}
 		}
 	}
 	o.retireSupersededLocked(superseded)
-	// An equal-version copy is replaced in place (fresh payload), never
-	// duplicated in the queue.
-	o.removeLocked(item.ID)
-	o.items = append(o.items, item)
 	return nil
 }
 
@@ -545,7 +557,7 @@ func (o *Outbox) MarkDelivered(logicalKey string, version int64) error {
 	// reported as delivered, or a restart would allow the stale publication
 	// this guard exists to prevent.
 	if o.store != nil {
-		if err := o.appendJSONLLocked(outboxDoneFile, outboxDoneRecord{LogicalKey: logicalKey, StateVersion: version}); err != nil {
+		if err := appendOutboxJSONL(o, outboxDoneFile, outboxDoneRecord{LogicalKey: logicalKey, StateVersion: version}); err != nil {
 			return err
 		}
 	}
@@ -609,6 +621,15 @@ func (o *Outbox) EnqueueLocal(item forge.OutboxItem) {
 		}
 	}
 	o.items = append(o.items, item)
+}
+
+// appendOutboxJSONL is a test-only seam over the fs journal append:
+// production always writes through it (one JSON line plus fsync). Tests
+// replace it to inject a failure at a precise append boundary — e.g. the new
+// version's line is durably appended but the first retirement (done) append
+// fails — which pins the durable-first ordering of enqueueVersionedLocked.
+var appendOutboxJSONL = func(o *Outbox, name string, v any) error {
+	return o.appendJSONLLocked(name, v)
 }
 
 func (o *Outbox) appendJSONLLocked(name string, v any) error {
@@ -717,7 +738,7 @@ func (o *Outbox) flushLocal(ctx context.Context, dispatch func(context.Context, 
 				rec.LogicalKey = it.LogicalKey
 				rec.StateVersion = it.StateVersion
 			}
-			if err := o.appendJSONLLocked(outboxDoneFile, rec); err != nil {
+			if err := appendOutboxJSONL(o, outboxDoneFile, rec); err != nil {
 				return dispatched, err
 			}
 		}

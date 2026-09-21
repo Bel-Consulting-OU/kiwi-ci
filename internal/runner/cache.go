@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"path/filepath"
@@ -50,24 +51,42 @@ func (t *cacheTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		if err := safefs.FitsAvailable(t.root, t.maxDisk); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return nil, fmt.Errorf("cache download preflight: %w", err)
 		}
-		rc, err := t.client.Restore(ctx, t.jobID, t.lease, key)
+		// The restore stream carries no total timeout; the sliding guard
+		// cancels the transfer when the peer stops sending bytes.
+		guardCtx, cancel := context.WithCancel(ctx)
+		guard := newStallGuard(cancel, streamIdleTimeout)
+		rc, err := t.client.Restore(guardCtx, t.jobID, t.lease, key)
 		if errors.Is(err, cache.ErrRemoteNotFound) {
+			guard.stop()
+			cancel()
 			if t.metrics != nil {
 				t.metrics.Counter("kiwi_runner_cache_misses", 1)
 			}
 			return &http.Response{StatusCode: http.StatusNotFound, Status: "404 Not Found", Body: http.NoBody, Header: http.Header{}, Request: req}, nil
 		}
 		if err != nil {
+			guard.stop()
+			cancel()
 			return nil, err
 		}
 		if t.metrics != nil {
 			t.metrics.Counter("kiwi_runner_cache_hits", 1)
 		}
-		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: rc, Header: http.Header{}, Request: req}, nil
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: &stallGuardedBody{ReadCloser: rc, guard: guard, cancel: cancel}, Header: http.Header{}, Request: req}, nil
 	case http.MethodPut:
-		if err := t.client.Upload(ctx, t.jobID, t.lease, key, req.Body); err != nil {
+		guardCtx, cancel := context.WithCancel(ctx)
+		guard := newStallGuard(cancel, streamIdleTimeout)
+		var body io.Reader = req.Body
+		if body != nil {
+			body = &stallGuardReader{r: body, guard: guard}
+		}
+		if err := t.client.Upload(guardCtx, t.jobID, t.lease, key, body); err != nil {
+			guard.stop()
+			cancel()
 			return nil, err
 		}
+		guard.stop()
+		cancel()
 		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: http.NoBody, Header: http.Header{}, Request: req}, nil
 	default:
 		return t.passthrough(req)
@@ -93,15 +112,20 @@ func (r *Runner) newJobCache(t server.Task, metrics *Metrics) *cache.Store {
 	}
 	store.RemoteURL = r.Cfg.Server
 	store.Token = r.Cfg.Token
-	timeout := time.Duration(65 * time.Second)
+	// Cache traffic is bulk streaming traffic: it runs on the streaming
+	// client's transport with NO total timeout (an 8 GiB cache archive at any
+	// sustainable rate must complete). The per-request stall guard added in
+	// RoundTrip bounds inactivity instead. A runner built without an explicit
+	// StreamClient (tests) falls back to the control client and inherits its
+	// total timeout, preserving the historical bounded behavior.
+	stream := r.streamClient()
 	transport := http.RoundTripper(http.DefaultTransport)
-	if r.Client != nil {
-		if r.Client.Transport != nil {
-			transport = r.Client.Transport
+	var timeout time.Duration
+	if stream != nil {
+		if stream.Transport != nil {
+			transport = stream.Transport
 		}
-		if r.Client.Timeout > 0 {
-			timeout = r.Client.Timeout
-		}
+		timeout = stream.Timeout
 	}
 	client := &cache.Client{
 		Server: r.Cfg.Server,

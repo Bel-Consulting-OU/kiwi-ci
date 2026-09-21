@@ -196,6 +196,9 @@ var testRun = model.Run{ID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Status: model.St
 
 var testJob = model.Job{ID: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", RunID: testRun.ID, Key: "build", Status: model.StatusQueued, CreatedAt: time.Unix(1001, 0).UTC()}
 
+// testReportID is a canonical 32-hex report ID for the wrapper tests.
+var testReportID = "cccccccccccccccccccccccccccccccc"
+
 var testRunner = model.Runner{ID: "cccccccccccccccccccccccccccccccc", Capacity: 2, ActiveJobs: []string{}}
 
 var testSchedule = Schedule{ID: "11111111111111111111111111111111", Repository: "https://example.com/repo.git", Spec: "@daily", Enabled: true, CreatedAt: time.Unix(1010, 0).UTC()}

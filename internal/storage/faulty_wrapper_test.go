@@ -57,6 +57,25 @@ func faultyWrapperCases() map[string]wrapperCase {
 			return err
 		}},
 		"ListQueuedJobs": {seed: seedRunAndJob, call: func(f *FaultyStore) error { _, err := f.ListQueuedJobs(ctx()); return err }},
+		"ListExpiredRunningJobs": {seed: func(m *memStore) {
+			expired := time.Unix(2000, 0).UTC()
+			j := testJob
+			j.Status = model.StatusRunning
+			j.LeaseExpiresAt = &expired
+			_ = m.InsertJob(ctx(), j)
+		}, call: func(f *FaultyStore) error {
+			_, err := f.ListExpiredRunningJobs(ctx(), time.Unix(3000, 0).UTC(), "", 10)
+			return err
+		}},
+		"ListQueueTimedOutJobs": {seed: func(m *memStore) {
+			past := time.Unix(1500, 0).UTC()
+			j := testJob
+			j.QueueDeadline = &past
+			_ = m.InsertJob(ctx(), j)
+		}, call: func(f *FaultyStore) error {
+			_, err := f.ListQueueTimedOutJobs(ctx(), time.Unix(2000, 0).UTC(), "", 10)
+			return err
+		}},
 		"ListJobsByEnvironment": {seed: func(m *memStore) {
 			j := testJob
 			j.Environment = "prod"
@@ -186,6 +205,13 @@ func faultyWrapperCases() map[string]wrapperCase {
 		"ClaimOutbox":       {mutates: true, call: func(f *FaultyStore) error { _, err := f.ClaimOutbox(ctx(), "flusher", 1); return err }},
 		"ReleaseOutboxClaim": {mutates: true, call: func(f *FaultyStore) error {
 			return f.ReleaseOutboxClaim(ctx(), "o1", "flusher")
+		}},
+		"ReleaseOutboxClaims": {mutates: true, seed: func(m *memStore) {
+			_ = m.OutboxAppend(ctx(), OutboxItem{ID: "o1"})
+			_, _ = m.ClaimOutbox(ctx(), "flusher", 1)
+		}, call: func(f *FaultyStore) error {
+			_, err := f.ReleaseOutboxClaims(ctx(), []string{"o1"}, "flusher")
+			return err
 		}},
 		"UpsertSchedule": {mutates: true, call: func(f *FaultyStore) error { return f.UpsertSchedule(ctx(), testSchedule) }},
 		"ListSchedules": {seed: func(m *memStore) { _ = m.UpsertSchedule(ctx(), testSchedule) }, call: func(f *FaultyStore) error {
@@ -378,6 +404,72 @@ func faultyWrapperCases() map[string]wrapperCase {
 		}},
 		"SaveTestHistory": {mutates: true, call: func(f *FaultyStore) error {
 			_, err := f.SaveTestHistory(ctx(), []byte(`{}`))
+			return err
+		}},
+		"InsertTestReportWithHistory": {mutates: true, seed: func(m *memStore) {
+			run := testRun
+			run.RepoID = "github.com/o/r"
+			run.RepoFullName = "o/r"
+			_ = m.InsertRun(ctx(), run)
+		}, call: func(f *FaultyStore) error {
+			_, err := f.InsertTestReportWithHistory(ctx(), model.TestReport{ID: testReportID, RunID: testRun.ID, JobKey: "build",
+				Cases: []model.TestResult{{Name: "t", Passed: true}}}, "github.com/o/r")
+			return err
+		}},
+		"LoadRepoTestHistory": {seed: func(m *memStore) {
+			_, _ = m.InsertTestReportWithHistory(ctx(), model.TestReport{ID: testReportID, RunID: testRun.ID, JobKey: "build",
+				Cases: []model.TestResult{{Name: "t", Passed: true}}}, "github.com/o/r")
+		}, call: func(f *FaultyStore) error {
+			_, _, err := f.LoadRepoTestHistory(ctx(), "github.com/o/r")
+			return err
+		}},
+		"ResolveTestHistoryRepoIDs": {seed: func(m *memStore) {
+			run := testRun
+			run.RepoID = "github.com/o/r"
+			run.RepoFullName = "o/r"
+			_ = m.InsertRun(ctx(), run)
+		}, call: func(f *FaultyStore) error {
+			_, err := f.ResolveTestHistoryRepoIDs(ctx(), "o/r", 10)
+			return err
+		}},
+		"TestReportTotals": {seed: func(m *memStore) {
+			run := testRun
+			run.RepoID = "github.com/o/r"
+			run.RepoFullName = "o/r"
+			_ = m.InsertRun(ctx(), run)
+			_, _ = m.InsertTestReportWithHistory(ctx(), model.TestReport{ID: testReportID, RunID: testRun.ID, JobKey: "build",
+				Cases: []model.TestResult{{Name: "t", Passed: true}}}, "github.com/o/r")
+		}, call: func(f *FaultyStore) error {
+			_, _, _, err := f.TestReportTotals(ctx(), []string{"github.com/o/r"}, "o/r")
+			return err
+		}},
+		"FlakyTestNames": {seed: func(m *memStore) {
+			_, _ = m.InsertTestReportWithHistory(ctx(), model.TestReport{ID: testReportID, RunID: testRun.ID, JobKey: "build",
+				Cases: []model.TestResult{{Name: "t", Passed: true}}}, "github.com/o/r")
+		}, call: func(f *FaultyStore) error {
+			_, err := f.FlakyTestNames(ctx(), []string{"github.com/o/r"}, 10)
+			return err
+		}},
+		"RebuildRepoTestHistory": {mutates: true, call: func(f *FaultyStore) error {
+			_, err := f.RebuildRepoTestHistory(ctx(), "github.com/o/r")
+			return err
+		}},
+		"ListTestHistoryRepoIDs": {seed: func(m *memStore) {
+			run := testRun
+			run.RepoID = "github.com/o/r"
+			run.RepoFullName = "o/r"
+			_ = m.InsertRun(ctx(), run)
+			_, _ = m.InsertTestReportWithHistory(ctx(), model.TestReport{ID: testReportID, RunID: testRun.ID, JobKey: "build",
+				Cases: []model.TestResult{{Name: "t", Passed: true}}}, "github.com/o/r")
+		}, call: func(f *FaultyStore) error {
+			_, err := f.ListTestHistoryRepoIDs(ctx(), 10)
+			return err
+		}},
+		"DisableRunnerAndRevokeCert": {mutates: true, seed: func(m *memStore) {
+			seedRunningJob(m)
+			seedRunner(m)
+		}, call: func(f *FaultyStore) error {
+			_, err := f.DisableRunnerAndRevokeCert(ctx(), testRunner.ID, "serial", "admin")
 			return err
 		}},
 	}
@@ -632,6 +724,10 @@ func missingOptionalInterfaceCases() map[string]missingIfaceCase {
 		"ReleaseOutboxClaim": {mutates: true, iface: "OutboxStore", call: func(f *FaultyStore) error {
 			return f.ReleaseOutboxClaim(ctx(), "", "")
 		}},
+		"ReleaseOutboxClaims": {mutates: true, iface: "OutboxClaimBatchStore", call: func(f *FaultyStore) error {
+			_, err := f.ReleaseOutboxClaims(ctx(), nil, "")
+			return err
+		}},
 		"OutboxEnqueueVersioned": {mutates: true, iface: "ForgeCheckStateStore", call: func(f *FaultyStore) error {
 			_, err := f.OutboxEnqueueVersioned(ctx(), OutboxItem{})
 			return err
@@ -801,6 +897,14 @@ func missingOptionalInterfaceCases() map[string]missingIfaceCase {
 		"ExpireQueuedJob": {mutates: true, iface: "RecoveryStore", call: func(f *FaultyStore) error {
 			return f.ExpireQueuedJob(ctx(), "", time.Time{})
 		}},
+		"ListExpiredRunningJobs": {iface: "RecoveryDiscoveryStore", call: func(f *FaultyStore) error {
+			_, err := f.ListExpiredRunningJobs(ctx(), time.Time{}, "", 1)
+			return err
+		}},
+		"ListQueueTimedOutJobs": {iface: "RecoveryDiscoveryStore", call: func(f *FaultyStore) error {
+			_, err := f.ListQueueTimedOutJobs(ctx(), time.Time{}, "", 1)
+			return err
+		}},
 		"UpsertProfile": {mutates: true, iface: "ProfileStore", call: func(f *FaultyStore) error {
 			return f.UpsertProfile(ctx(), model.RunnerProfile{})
 		}},
@@ -854,6 +958,38 @@ func missingOptionalInterfaceCases() map[string]missingIfaceCase {
 		}},
 		"SaveTestHistory": {mutates: true, iface: "TestHistoryStore", call: func(f *FaultyStore) error {
 			_, err := f.SaveTestHistory(ctx(), nil)
+			return err
+		}},
+		"InsertTestReportWithHistory": {mutates: true, iface: "TestHistoryAggregateStore", call: func(f *FaultyStore) error {
+			_, err := f.InsertTestReportWithHistory(ctx(), model.TestReport{}, "")
+			return err
+		}},
+		"LoadRepoTestHistory": {iface: "TestHistoryAggregateStore", call: func(f *FaultyStore) error {
+			_, _, err := f.LoadRepoTestHistory(ctx(), "")
+			return err
+		}},
+		"ResolveTestHistoryRepoIDs": {iface: "TestHistoryAggregateStore", call: func(f *FaultyStore) error {
+			_, err := f.ResolveTestHistoryRepoIDs(ctx(), "", 0)
+			return err
+		}},
+		"TestReportTotals": {iface: "TestHistoryAggregateStore", call: func(f *FaultyStore) error {
+			_, _, _, err := f.TestReportTotals(ctx(), nil, "")
+			return err
+		}},
+		"FlakyTestNames": {iface: "TestHistoryAggregateStore", call: func(f *FaultyStore) error {
+			_, err := f.FlakyTestNames(ctx(), nil, 0)
+			return err
+		}},
+		"RebuildRepoTestHistory": {mutates: true, iface: "TestHistoryAggregateStore", call: func(f *FaultyStore) error {
+			_, err := f.RebuildRepoTestHistory(ctx(), "")
+			return err
+		}},
+		"ListTestHistoryRepoIDs": {iface: "TestHistoryAggregateStore", call: func(f *FaultyStore) error {
+			_, err := f.ListTestHistoryRepoIDs(ctx(), 0)
+			return err
+		}},
+		"DisableRunnerAndRevokeCert": {mutates: true, iface: "RunnerDisableStore", call: func(f *FaultyStore) error {
+			_, err := f.DisableRunnerAndRevokeCert(ctx(), "", "", "")
 			return err
 		}},
 	}
