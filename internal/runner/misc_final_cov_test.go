@@ -203,17 +203,17 @@ func TestFinalUploadJobSnapshotErrorPaths(t *testing.T) {
 	}
 	t.Setenv("TMPDIR", tmpAsFile)
 	r := &Runner{ID: "r", Cfg: Config{Server: "http://127.0.0.1:1"}, Client: &http.Client{Timeout: time.Second}, Metrics: NewMetrics()}
-	if err := r.uploadJobSnapshot(context.Background(), task, ws); err == nil {
+	if err := r.uploadJobSnapshot(context.Background(), task, ws, 0); err == nil {
 		t.Fatal("temp failure accepted")
 	}
 	t.Setenv("TMPDIR", "")
 
 	bad := &Runner{ID: "r", Cfg: Config{Server: "http://[::1"}, Client: &http.Client{Timeout: time.Second}, Metrics: NewMetrics()}
-	if err := bad.uploadJobSnapshot(context.Background(), task, ws); err == nil {
+	if err := bad.uploadJobSnapshot(context.Background(), task, ws, 0); err == nil {
 		t.Fatal("malformed snapshot URL accepted")
 	}
 	closed := &Runner{ID: "r", Cfg: Config{Server: "http://127.0.0.1:1"}, Client: &http.Client{Timeout: time.Second}, Metrics: NewMetrics()}
-	if err := closed.uploadJobSnapshot(context.Background(), task, ws); err == nil {
+	if err := closed.uploadJobSnapshot(context.Background(), task, ws, 0); err == nil {
 		t.Fatal("snapshot transport failure accepted")
 	}
 }

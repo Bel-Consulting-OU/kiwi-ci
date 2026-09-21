@@ -31,6 +31,19 @@ import (
 const maxBlobBytes int64 = 8 << 30 // 8 GiB hard safety limit for the built-in store.
 var cacheKeyRE = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
+// provenanceFenceTimeout bounds how long an artifact upload waits for the
+// provenance digest's second fence. Holding two digest fences per upload
+// means a fully saturated DB-mode advisory pool (every connection held by a
+// fence) must not be able to block a handler forever: the handler already
+// holds the payload digest's fence while it waits for the provenance
+// digest's, so an unbounded wait with every other upload in the same state
+// would never resolve. On timeout the provenance envelope is skipped — never
+// published unfenced — exactly like a failed Put; the artifact upload
+// itself still succeeds. It is a var only so tests can shrink the bound
+// (same seam convention as the storage fence release bounds); production
+// never reassigns it.
+var provenanceFenceTimeout = 5 * time.Second
+
 // uploadArtifact implements PUT /api/v1/jobs/{id}/artifacts/{name}.
 //
 // The upload is verified against the job's artifact contract: undeclared
@@ -294,6 +307,20 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 	signer := s.ensureProvenanceKey()
 	st := provenance.ArtifactStatement(provenance.ArtifactInput{Name: name, SHA256: rec.SHA256, RunID: j.RunID, JobID: j.ID, JobKey: j.Key, Repository: repoIDForRun(run), Ref: run.Ref, Commit: run.SHA, Runner: runnerID, Trusted: j.Trusted, Started: jobStart(j), Finished: finished})
 	st.Builder = provenance.BuilderPlaceholder
+	// Fence ordering (deadlock-free): the CAS fences of one handler are
+	// acquired in PUBLICATION order — the payload digest's fence was taken
+	// above, before the payload CAS.Put, and the provenance digest's fence is
+	// taken here, before its own CAS.Put. Both are held across the durable
+	// artifact insert below (and released, provenance first, when the
+	// handler returns), so the collector can never reclaim either object
+	// between its publication and the commit of the reference that makes it
+	// reachable. No path takes the pair in the opposite order, the collector
+	// takes one digest fence at a time, and the second acquisition is
+	// bounded (provenanceFenceTimeout) so a saturated advisory pool cannot
+	// pin the handler either. A provenance Put that cannot be fenced is
+	// SKIPPED (the envelope is non-essential metadata, exactly like a failed
+	// Put), never published unfenced.
+	var releaseProvenance func()
 	if env, er := provenance.Sign(st, signer.KID, signer.Private); er == nil {
 		if ab, mer := json.MarshalIndent(env, "", "  "); mer == nil {
 			sum := sha256.Sum256(ab)
@@ -302,9 +329,17 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 			// and the record carries the digest reference; fs dev mode
 			// keeps the local sidecar file for compatibility.
 			if casMode {
-				if _, perr := s.CAS.Put(ctx, bytes.NewReader(ab)); perr == nil {
-					rec.ProvenancePath = "cas:" + provDigest
-					rec.ProvenanceSHA256 = provDigest
+				fctx, cancel := context.WithTimeout(ctx, provenanceFenceTimeout)
+				release, ferr := s.acquireDigestFence(fctx, provDigest)
+				cancel()
+				if ferr != nil {
+					s.logError("artifact: provenance digest fence failed; provenance not stored", "job", j.ID, "sha256", provDigest, "error", ferr.Error())
+				} else {
+					releaseProvenance = release
+					if _, perr := s.CAS.Put(ctx, bytes.NewReader(ab)); perr == nil {
+						rec.ProvenancePath = "cas:" + provDigest
+						rec.ProvenanceSHA256 = provDigest
+					}
 				}
 			} else {
 				ap := dst + ".intoto.json"
@@ -314,6 +349,9 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 				}
 			}
 		}
+	}
+	if releaseProvenance != nil {
+		defer releaseProvenance()
 	}
 	if s.DB != nil {
 		// PostgreSQL is authoritative: the (job, generation, name) unique
@@ -931,6 +969,20 @@ func (s *Server) cleanupExpiredArtifactsLocked(now time.Time) int {
 		}
 		if a.ProvenancePath != "" {
 			_ = os.Remove(a.ProvenancePath)
+		}
+		// FS/dev sidecars are immutable per (lease generation, artifact,
+		// kind, digest): the record points at the exact digest-qualified
+		// file, so ONLY that file is removed. Another generation's (or
+		// another artifact's) sidecars live in different files and survive;
+		// the per-generation directory is dropped only once it is empty.
+		for _, p := range []string{a.SBOMPath, a.SigstorePath} {
+			if p == "" || strings.HasPrefix(p, "cas:") {
+				continue
+			}
+			_ = os.Remove(p)
+			if genDir := filepath.Dir(p); strings.HasPrefix(filepath.Base(genDir), "g-") {
+				_ = os.Remove(genDir)
+			}
 		}
 		delete(s.artifacts, id)
 		removed++

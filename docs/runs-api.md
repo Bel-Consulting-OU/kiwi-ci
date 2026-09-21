@@ -75,6 +75,23 @@ opaque `400`.
   advances the cursor strictly through `(created_at, id)`, so the walk is
   bounded by the number of underlying runs.
 
+## Store capability
+
+The server serves paged run collections only from stores that implement the
+`storage.RunPageStore` keyset interface; both stores shipped with Kiwi (memory
+and PostgreSQL) do. A custom `storage.Store` without that capability cannot
+present a consistent cursor — an older cursor applied to its bounded `ListRuns`
+window re-reads the same newest rows, so the walk would stop while older runs
+still exist — and every `/api/v1/runs` request against such a store therefore
+fails closed with an opaque `500` body (`internal server error`) instead of a
+truncated `200`. The diagnostic detail, `runs pagination unsupported by
+configured store`, is logged server-side and never returned to the client.
+
+The bundled dashboard follows the cursor through its **Load older runs**
+control: each click appends exactly one page using the previous
+`X-Kiwi-Next-Cursor` value, and the control disappears when the last page
+carries no cursor. It never walks the remaining pages on its own.
+
 ## Example
 
 ```sh

@@ -4,7 +4,9 @@ import "strings"
 
 // Action is one authorization decision the control plane can make. Repo-
 // scoped actions (read, run, approve, cancel, rerun, artifact_read) consult
-// repo-specific grants first; the rest are decided by global roles.
+// repo-specific grants first; the rest are decided by global roles. ActionAdmin
+// is global-only: it is the admin role or nothing, and it gates the workspace
+// snapshot archive download.
 type Action string
 
 const (
@@ -27,6 +29,12 @@ const (
 //   - repo-specific entries take precedence when present for repo;
 //   - repo may be a canonical repository ID (host/owner/name): an entry
 //     keyed by the bare owner/name full name also satisfies it;
+//   - CONFLICTING entries for the same repository identity (canonically
+//     equivalent keys with different permission sets) deny every action:
+//     they never fall through to global roles, because that would let a
+//     map duplicate silently widen a grant;
+//   - global roles apply only when the principal declares NO usable entry
+//     for the repository (RepoNoEntry);
 //   - RoleRun grants untrusted run only; trusted_run requires an explicit
 //     RoleTrustedRun, the admin role, or a repo TrustedRun grant;
 //   - ActionRun with trusted=true is equivalent to ActionTrustedRun.
@@ -34,7 +42,14 @@ func Authorize(p Principal, action Action, repo string, trusted bool) bool {
 	if p.Has(RoleAdmin) {
 		return true
 	}
-	if perm, ok := p.repoEntry(repo); ok {
+	perm, res := p.repoEntry(repo)
+	if res == RepoConflict {
+		// The repository's explicit grants disagree with each other: the
+		// entry is unusable, and resolving through map iteration order
+		// could flip the decision. Deny instead of consulting roles.
+		return false
+	}
+	if res == RepoFound {
 		switch action {
 		case ActionRead:
 			return perm.Read
@@ -91,8 +106,8 @@ func Authorize(p Principal, action Action, repo string, trusted bool) bool {
 // a canonical repository ID ("forge-host/owner/name") or a bare full name;
 // the call is equivalent to Authorize(p, ActionRead, repo, false) and shares
 // the full repository-entry semantics (an entry present for the repository is
-// authoritative; global roles cover the repositories the map does not
-// mention).
+// authoritative; conflicting entries deny; global roles cover only the
+// repositories the map does not mention).
 func CanReadRepo(p Principal, repo string) bool {
 	return Authorize(p, ActionRead, repo, false)
 }
@@ -103,9 +118,9 @@ func CanReadRepo(p Principal, repo string) bool {
 // coarse capability gate BEFORE resolving each candidate individually through
 // CanReadRepo. It is deliberately NOT a per-repository decision: an entry
 // whose equivalent duplicate key conflicts still counts here, because the
-// per-repository resolution fails closed later; a principal with no read
-// capability at all is refused outright instead of receiving an empty
-// collection.
+// per-repository resolution then answers RepoConflict and denies every
+// action; a principal with no read capability at all is refused outright
+// instead of receiving an empty collection.
 func CanReadAnyRepo(p Principal) bool {
 	if p.Has(RoleAdmin) || p.Has(RoleRead) {
 		return true
@@ -118,6 +133,28 @@ func CanReadAnyRepo(p Principal) bool {
 	return false
 }
 
+// RepoEntryResult reports how the principal's repository map resolved a
+// repository identity. It is a tri-state on purpose: the boolean it replaces
+// could not distinguish "the principal declares nothing for this repository"
+// (global roles apply) from "the principal declares contradictory entries"
+// (the repository is poisoned and every action must be denied).
+type RepoEntryResult int
+
+const (
+	// RepoNoEntry: the map declares no entry for the repository, so global
+	// roles decide. This is the ONLY result that may fall through to roles.
+	RepoNoEntry RepoEntryResult = iota
+	// RepoFound: exactly one effective entry exists for the repository.
+	// Equivalent duplicate spellings with IDENTICAL permission sets count
+	// as that one entry.
+	RepoFound
+	// RepoConflict: several equivalent entries carry DIFFERENT permission
+	// sets, so no entry can be chosen without depending on Go's randomized
+	// map iteration order. Authorize denies every action on the repository
+	// instead of falling back to roles.
+	RepoConflict
+)
+
 // repoEntry resolves the repo-specific permission entry for repo. The map
 // may be keyed by the canonical repository ID (host/owner/name) or by the
 // bare full name (owner/name): a canonical lookup falls back to the bare
@@ -125,15 +162,16 @@ func CanReadAnyRepo(p Principal) bool {
 // part, so both keying conventions work. Stored keys and the lookup key are
 // canonicalized first (host case, one trailing dot, default ports), so
 // equivalent spellings of the same forge host address the same grant. The
-// bare→canonical fallback is DETERMINISTIC and fails closed: when several
-// canonical keys share the bare part with DIFFERENT permission sets the
-// lookup resolves to no entry (role fallback applies) instead of depending
-// on Go's randomized map iteration order, which could otherwise flip an
-// authorization decision between calls.
-func (p Principal) repoEntry(repo string) (RepositoryPermission, bool) {
+// resolution is DETERMINISTIC and fails closed: when several equivalent keys
+// carry DIFFERENT permission sets at any stage (equivalent canonical keys,
+// canonical→bare, bare→canonical, or duplicate spellings of one canonical
+// key) the result is RepoConflict, which Authorize turns into an immediate
+// denial for every action. Only RepoNoEntry — a repository the map genuinely
+// does not mention — leaves the decision to the global roles.
+func (p Principal) repoEntry(repo string) (RepositoryPermission, RepoEntryResult) {
 	repo = NormalizeRepoKey(repo)
-	if perm, ok := lookupRepoEntry(p.Repositories, repo); ok {
-		return perm, true
+	if perm, res := lookupRepoEntry(p.Repositories, repo); res != RepoNoEntry {
+		return perm, res
 	}
 	_, bare, hasHost := splitCanonicalRepo(repo)
 	if hasHost {
@@ -142,13 +180,18 @@ func (p Principal) repoEntry(repo string) (RepositoryPermission, bool) {
 	// repo is a bare full name: match canonical keys whose bare part is repo.
 	var match RepositoryPermission
 	found, ambiguous := false, false
-	seen := map[string]bool{}
+	seen := map[string]RepositoryPermission{}
 	for key, perm := range p.Repositories {
 		nk := NormalizeRepoKey(key)
-		if seen[nk] {
+		if prev, ok := seen[nk]; ok {
+			// Duplicate spellings of one canonical key: identical grants
+			// are the same entry, different grants are a conflict.
+			if prev != perm {
+				ambiguous = true
+			}
 			continue
 		}
-		seen[nk] = true
+		seen[nk] = perm
 		if _, kb, kHost := splitCanonicalRepo(nk); kHost && kb == bare {
 			if !found {
 				match, found = perm, true
@@ -157,16 +200,20 @@ func (p Principal) repoEntry(repo string) (RepositoryPermission, bool) {
 			}
 		}
 	}
-	if found && !ambiguous {
-		return match, true
+	switch {
+	case ambiguous:
+		return RepositoryPermission{}, RepoConflict
+	case found:
+		return match, RepoFound
 	}
-	return RepositoryPermission{}, false
+	return RepositoryPermission{}, RepoNoEntry
 }
 
 // lookupRepoEntry resolves the entry whose key canonicalizes to target.
-// Equivalent keys carrying DIFFERENT permission sets resolve to no entry
-// (fail closed) instead of depending on map iteration order.
-func lookupRepoEntry(m map[string]RepositoryPermission, target string) (RepositoryPermission, bool) {
+// Equivalent keys carrying IDENTICAL permission sets resolve to that single
+// entry; equivalent keys carrying DIFFERENT permission sets resolve to
+// RepoConflict (fail closed) instead of depending on map iteration order.
+func lookupRepoEntry(m map[string]RepositoryPermission, target string) (RepositoryPermission, RepoEntryResult) {
 	var match RepositoryPermission
 	found, ambiguous := false, false
 	for key, perm := range m {
@@ -179,10 +226,13 @@ func lookupRepoEntry(m map[string]RepositoryPermission, target string) (Reposito
 			ambiguous = true
 		}
 	}
-	if found && !ambiguous {
-		return match, true
+	switch {
+	case ambiguous:
+		return RepositoryPermission{}, RepoConflict
+	case found:
+		return match, RepoFound
 	}
-	return RepositoryPermission{}, false
+	return RepositoryPermission{}, RepoNoEntry
 }
 
 // CanonicalRepoID renders the canonical repository identity "<host>/<fullName>"
@@ -278,6 +328,9 @@ func ActionFor(method, path string) (Action, string, bool) {
 					return ActionRerun, "", true
 				}
 			case "jobs", "logs", "tests", "deployments", "snapshots":
+				// snapshots at this depth is the metadata LISTING
+				// (manifests only) and stays read tier; the archive
+				// download below is admin tier.
 				if method == "GET" {
 					return ActionRead, "", true
 				}
@@ -288,8 +341,18 @@ func ActionFor(method, path string) (Action, string, bool) {
 			}
 		}
 		if len(rest) == 4 && method == "GET" {
-			if (rest[2] == "logs" && rest[3] == "stream") || rest[2] == "snapshots" {
+			if rest[2] == "logs" && rest[3] == "stream" {
 				return ActionRead, "", true
+			}
+			if rest[2] == "snapshots" {
+				// GET /api/v1/runs/{id}/snapshots/{sid} streams the full
+				// workspace archive (private checkout, generated code,
+				// secret-derived files), so it is genuinely admin tier:
+				// ActionAdmin scoped by the handler to the run's canonical
+				// repository. The handler-level requireRunAdmin enforces
+				// it so an authenticated non-admin is answered 403 (not
+				// merely screened by the outer admin gate).
+				return ActionAdmin, "", true
 			}
 		}
 	case "jobs":

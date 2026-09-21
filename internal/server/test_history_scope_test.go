@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 // historyCountingStore counts the full-history calls the fixed path must
@@ -39,6 +40,13 @@ func (c *historyCountingStore) GetRun(ctx context.Context, id string) (model.Run
 func (c *historyCountingStore) InsertTestReportWithHistory(ctx context.Context, rep model.TestReport, repoID string) (int64, error) {
 	c.incrementalOps.Add(1)
 	return c.dbFakeStore.InsertTestReportWithHistory(ctx, rep, repoID)
+}
+
+// InsertTestReportWithHistoryDelivery is the path the handler actually uses;
+// it counts as exactly the same single incremental aggregate transaction.
+func (c *historyCountingStore) InsertTestReportWithHistoryDelivery(ctx context.Context, rep model.TestReport, repoID string, delivery storage.TestReportDelivery) (storage.TestReportInsertOutcome, error) {
+	c.incrementalOps.Add(1)
+	return c.dbFakeStore.InsertTestReportWithHistoryDelivery(ctx, rep, repoID, delivery)
 }
 
 func (c *historyCountingStore) TestReportTotals(ctx context.Context, repoIDs []string, repoQuery string) (int, int, int, error) {

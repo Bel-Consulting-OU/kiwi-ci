@@ -14,6 +14,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/quotas"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runnerpki"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 // idcovFaultStore injects failures into the store methods the runner
@@ -58,6 +59,15 @@ func (f *idcovFaultStore) ListRuns(ctx context.Context, limit int) ([]model.Run,
 		return nil, f.listRunsErr
 	}
 	return f.dbFakeStore.ListRuns(ctx, limit)
+}
+
+// ListRunsPage carries the injected run-read failure into the paged path the
+// collection handler actually uses.
+func (f *idcovFaultStore) ListRunsPage(ctx context.Context, afterCreatedAt time.Time, afterID string, limit int) (storage.RunPage, error) {
+	if f.listRunsErr != nil {
+		return storage.RunPage{}, f.listRunsErr
+	}
+	return f.dbFakeStore.ListRunsPage(ctx, afterCreatedAt, afterID, limit)
 }
 
 func (f *idcovFaultStore) ListJobsByRun(ctx context.Context, runID string) ([]model.Job, error) {

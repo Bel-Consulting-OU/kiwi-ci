@@ -84,6 +84,11 @@ var (
 	// workloads. A seam so the docker integration test can observe the
 	// post-run host-side state instead of racing the cleanup.
 	removeJobWorkspace = os.RemoveAll
+	// executorOptionsSeam observes the executor options derived for a job
+	// immediately before it runs. It is a test seam: it lets tests assert
+	// the derived resource bounds (WorkspaceMaxBytes) without executing the
+	// job on a real backend. Production leaves it nil.
+	executorOptionsSeam func(executor.Options)
 )
 
 // Client policy seams. Ordinary control-plane calls (register/next/heartbeat/
@@ -529,6 +534,21 @@ func (r *Runner) onDisabled(err error) error {
 	return err
 }
 
+// workspaceMaxBytesForResources converts a job's declared resources.disk
+// request into the workspace bound handed to the executor. The unit is bytes:
+// pipeline.ByteSize is the pipeline decoder's canonical byte count ("2Gi" is
+// 2<<30 because the binary suffixes Ki/Gi/Ti are 1024-based; a plain integer
+// is bytes), so the value only needs widening to int64, never re-parsing. An
+// undeclared disk (zero) yields zero, the documented default: no workspace
+// bound is derived and pipelines without a disk declaration keep their
+// previous behavior.
+func workspaceMaxBytesForResources(res pipeline.Resources) int64 {
+	if res.Disk <= 0 {
+		return 0
+	}
+	return int64(res.Disk)
+}
+
 func (r *Runner) execute(parent context.Context, t server.Task) {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
@@ -695,6 +715,14 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// unconditional here: nothing may override RequireImmutableImages for
 	// an untrusted job.
 	opts := executor.Options{Workspace: tmp, RunID: t.Job.RunID, Event: t.Job.Event, Branch: branchFromRef(t.Job.Ref), ChangedFiles: effectiveChangedFiles(t.Job.ChangedFiles, t.Job.ChangedFilesKnown, tmp), SecretProvider: provider, Logs: logging.Func(func(job, step, line string) { sink.WriteLine(job, step, line) }), Cache: cacheStore, Artifacts: artifactStore, ArtifactReporter: reporter, DependencyStatus: t.Job.DependencyStatus, NeedsOutputs: t.Job.NeedsOutputs, CacheNamespace: cacheNamespace(t.Job), RequireImmutableImages: !t.Job.Trusted}
+	// The declared resources.disk is the job's workspace bound: it feeds the
+	// executor's pre-execution free-space check and the container backend's
+	// step-boundary workspace check, and it is what the snapshot capture
+	// derives its local archive cap from (see uploadJobSnapshot). An
+	// undeclared disk leaves the bound at zero, the documented default that
+	// preserves the behavior of pipelines without a disk declaration.
+	workspaceMaxBytes := workspaceMaxBytesForResources(cj.Job.Resources)
+	opts.WorkspaceMaxBytes = workspaceMaxBytes
 	// Step durations come from the executor's wall-clock step measurements
 	// (StepReporter), never from sink-derived log timing.
 	applyStepReporter(&opts, r.Metrics)
@@ -718,16 +746,51 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		sink.WriteLine(jobID, "generate", "generated fragment uploaded from "+path)
 		return nil
 	}
+	// The options are final here: report them to the test seam before the
+	// executor takes ownership.
+	if executorOptionsSeam != nil {
+		executorOptionsSeam(opts)
+	}
 	ex := executor.Executor{Opt: opts, Masker: masker}
 	res := ex.RunCompiledJob(ctx, spec, cj)
 	if len(cj.Job.TestReports) > 0 {
-		report, er := testintel.Aggregate(tmp, cj.Job.TestReports)
+		// Mask with the same masker the log path uses before the report is
+		// persisted and later served by the ordinary read tier. Masker.Mask
+		// takes its RWMutex read lock, so sharing it here is safe even while
+		// the executor registers more secrets.
+		report, er := testintel.AggregateMasked(tmp, cj.Job.TestReports, masker.Mask)
 		if er != nil {
 			sink.WriteLine(cj.ID, "tests", "report warning: "+er.Error())
 		} else if report.Tests > 0 {
-			er = r.post(parent, "/api/v1/jobs/"+t.Job.ID+"/tests", map[string]any{"runner_id": r.ID, "lease_token": t.LeaseToken, "lease_generation": t.LeaseGeneration, "report": report}, nil)
-			if er != nil {
-				sink.WriteLine(cj.ID, "tests", "upload warning: "+er.Error())
+			// The shared size contract is checked BEFORE any upload attempt:
+			// buildTestReportDelivery serializes the exact /tests body and
+			// rejects it against the same limits the parser and the server
+			// use, so an oversized report is warned about locally instead of
+			// being sent to be rejected (or worse, silently truncated).
+			delivery, derr := buildTestReportDelivery(t.Job.ID, t.LeaseGeneration, r.ID, t.LeaseToken, report)
+			if derr != nil {
+				sink.WriteLine(cj.ID, "tests", "report warning: "+derr.Error())
+			} else {
+				// Durable delivery: the body carries the stable delivery ID
+				// derived from (job, lease generation, payload digest), so
+				// the server can deduplicate a replay. A dropped response or
+				// a transient failure no longer discards the intelligence:
+				// the report is retried with the identical delivery ID until
+				// success, a permanent rejection (4xx) or the bounded attempt
+				// budget. Retries are safe by construction — the server
+				// answers an identical replay idempotently without
+				// re-folding history, and a reused ID with different content
+				// is an explicit 409. A permanent failure is only WARNED
+				// about (never retried, never fatal to the job): the report
+				// is advisory intelligence and its loss must not turn a
+				// finished job into a failure, but the warning makes the
+				// permanent rejection visible in the job log.
+				er = retryDelivery(parent, func() error {
+					return r.post(parent, "/api/v1/jobs/"+t.Job.ID+"/tests", delivery.Body, nil)
+				})
+				if er != nil {
+					sink.WriteLine(cj.ID, "tests", "upload warning: "+er.Error())
+				}
 			}
 		}
 	}
@@ -736,7 +799,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// on captures every outcome).
 	if r.Cfg.CaptureSnapshots && snapshotRequested(cj.Job.Snapshot, res.Status) {
 		snapStart := time.Now()
-		if err := r.uploadJobSnapshot(parent, t, tmp); err != nil {
+		if err := r.uploadJobSnapshot(parent, t, tmp, workspaceMaxBytes); err != nil {
 			sink.WriteLine(cj.ID, "snapshot", "upload warning: "+err.Error())
 		} else {
 			r.Metrics.Observe("kiwi_runner_snapshot_duration_seconds", time.Since(snapStart).Seconds())
@@ -1363,6 +1426,53 @@ func retryDelivery(ctx context.Context, deliver func() error) error {
 	return err
 }
 
+// testReportDelivery is one rendered /tests request: the exact body bytes,
+// the stable delivery ID they carry and the payload digest the ID is derived
+// from. The body is rendered ONCE and re-sent byte-identically on retries,
+// so the delivery ID and the payload can never disagree.
+type testReportDelivery struct {
+	Body       json.RawMessage
+	DeliveryID string
+	Digest     string
+}
+
+// buildTestReportDelivery renders the /tests request body for one aggregated
+// report and checks it against the SHARED size contract
+// (internal/testintel/limits.go) before any upload is attempted. The
+// delivery ID is sha256(jobID, lease generation, canonical payload digest),
+// which is exactly the durable-delivery identity the server records next to
+// the report, so retrying a dropped response can neither duplicate the report
+// nor fold its history twice.
+func buildTestReportDelivery(jobID string, leaseGeneration int64, runnerID, leaseToken string, report model.TestReport) (testReportDelivery, error) {
+	// The shared validator enforces the same case/message/payload budget the
+	// parser and the server apply, so an over-limit report is rejected here
+	// with the same reason string, before any upload attempt.
+	if err := testintel.ValidateReportPayload(report); err != nil {
+		return testReportDelivery{}, err
+	}
+	payload, err := json.Marshal(report)
+	if err != nil {
+		return testReportDelivery{}, fmt.Errorf("test report serialization: %w", err)
+	}
+	digest := testintel.ReportContentDigest(payload)
+	deliveryID := testintel.ReportDeliveryID(jobID, leaseGeneration, digest)
+	body, err := json.Marshal(map[string]any{
+		"runner_id":        runnerID,
+		"lease_token":      leaseToken,
+		"lease_generation": leaseGeneration,
+		"delivery_id":      deliveryID,
+		"content_digest":   digest,
+		"report":           json.RawMessage(payload),
+	})
+	if err != nil {
+		return testReportDelivery{}, fmt.Errorf("test report request serialization: %w", err)
+	}
+	if len(body) > testintel.MaxTestReportRequestBytes {
+		return testReportDelivery{}, fmt.Errorf("%w: /tests request body is %d bytes, over the %d-byte request budget", testintel.ErrLimitExceeded, len(body), testintel.MaxTestReportRequestBytes)
+	}
+	return testReportDelivery{Body: body, DeliveryID: deliveryID, Digest: digest}, nil
+}
+
 // snapshotRequested reports whether the job's snapshot declaration captures
 // this final status. An empty snapshot.on captures every outcome; a
 // non-empty list captures only the listed final status strings
@@ -1434,8 +1544,17 @@ func (r *Runner) uploadGeneratedFragmentData(ctx context.Context, t server.Task,
 	}
 	return nil
 }
+
+// post sends one JSON request to the control plane. The body is encoded
+// before any request is created, and an encoding failure is returned as a
+// real error (wrapped with the endpoint for context): a payload the JSON
+// encoder rejects (for example a NaN/Inf float) must never reach the wire as
+// a malformed request, and no request is sent at all.
 func (r *Runner) post(ctx context.Context, path string, in, out any) error {
-	b, _ := json.Marshal(in)
+	b, err := json.Marshal(in)
+	if err != nil {
+		return fmt.Errorf("encode request body for %s: %w", path, err)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.Cfg.Server+path, bytes.NewReader(b))
 	if err != nil {
 		return err
@@ -1794,7 +1913,10 @@ func (r *Runner) enroll(ctx context.Context, caPEM, csrPEM []byte) (*server.Enro
 		return nil, err
 	}
 	client := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{TLSClientConfig: tlsConf}}
-	b, _ := json.Marshal(server.EnrollRequest{RunnerID: r.ID, CSR: base64.StdEncoding.EncodeToString(csrPEM), Labels: r.Cfg.EnrollLabels})
+	b, err := json.Marshal(server.EnrollRequest{RunnerID: r.ID, CSR: base64.StdEncoding.EncodeToString(csrPEM), Labels: r.Cfg.EnrollLabels})
+	if err != nil {
+		return nil, fmt.Errorf("encode enrollment request: %w", err)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.Cfg.Server+"/api/v1/runners/enroll", bytes.NewReader(b))
 	if err != nil {
 		return nil, err

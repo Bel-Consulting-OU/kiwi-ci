@@ -1896,27 +1896,26 @@ func runsPageLimitParam(r *http.Request) int {
 	return storage.NormalizeRunsPageLimit(limit)
 }
 
-// listRunsPageFromStore reads one keyset page from a store. Stores that
-// implement RunPageStore do the keyset read natively; a store that predates
-// the capability (minimal test doubles, custom Stores) is served a bounded
-// ListRuns snapshot through the same in-memory PageRuns contract, so callers
-// see identical page semantics either way. The fallback asks for one extra
-// row to detect HasMore exactly, except at the cap where the extra row would
-// exceed the bound (and every ListRuns implementation caps at
-// MaxRunsPageLimit anyway).
+// errRunsPaginationUnsupported is the fail-closed answer for a configured
+// store without the RunPageStore capability. An unpaged ListRuns window
+// cannot page: an older cursor applied to it re-reads the same newest rows,
+// so the walk would terminate while older runs still exist — silently
+// truncating the collection. Every store shipped with Kiwi implements
+// RunPageStore; the detail is logged server-side and the client sees the
+// opaque 500 body.
+var errRunsPaginationUnsupported = errors.New("runs pagination unsupported by configured store")
+
+// listRunsPageFromStore reads one keyset page from a store that implements
+// storage.RunPageStore (the memory and PostgreSQL stores do). A store without
+// the capability fails closed instead of being served a bounded ListRuns
+// snapshot, so a misconfigured custom store reports the missing pagination
+// contract rather than returning a truncated page as if the history ended.
 func listRunsPageFromStore(ctx context.Context, store storage.Store, cursor runsCursor, limit int) (storage.RunPage, error) {
-	if paged, ok := store.(storage.RunPageStore); ok {
-		return paged.ListRunsPage(ctx, cursor.createdAt, cursor.id, limit)
+	paged, ok := store.(storage.RunPageStore)
+	if !ok {
+		return storage.RunPage{}, fmt.Errorf("%w: %T", errRunsPaginationUnsupported, store)
 	}
-	fetch := limit
-	if fetch < storage.MaxRunsPageLimit {
-		fetch++
-	}
-	runs, err := store.ListRuns(ctx, fetch)
-	if err != nil {
-		return storage.RunPage{}, err
-	}
-	return storage.PageRuns(runs, cursor.createdAt, cursor.id, limit), nil
+	return paged.ListRunsPage(ctx, cursor.createdAt, cursor.id, limit)
 }
 func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")

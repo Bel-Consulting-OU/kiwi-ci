@@ -906,3 +906,47 @@ func TestPostgresIntegrationTestHistoryFlakyWindowDropsOut(t *testing.T) {
 		t.Fatalf("flaky after a fresh failure = %v, %v; want [t]", flaky, err)
 	}
 }
+
+// TestPostgresIntegrationTestHistoryTotalsCanonicalSetOnly is the real-PG
+// proof of the authorized-set totals contract: resolution still finds BOTH
+// forges that present the same bare name, but TestReportTotals answers ONLY
+// the canonical IDs it is given — the bare-name predicate is gone, so a
+// one-repository authorized set can never include the other forge and an
+// empty set can never fan the query across every forge.
+func TestPostgresIntegrationTestHistoryTotalsCanonicalSetOnly(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	base := time.Now().UTC().Truncate(time.Second)
+	repoGH, repoGL := "github.com/acme/service", "gitlab.example/acme/service"
+	runGH, jobGH, runGL, jobGL := pgITNewID(t), pgITNewID(t), pgITNewID(t), pgITNewID(t)
+	pgITHistoryRun(t, st, runGH, jobGH, repoGH, "acme/service", base)
+	pgITHistoryRun(t, st, runGL, jobGL, repoGL, "acme/service", base.Add(time.Second))
+	repGH := pgITHistoryReport(runGH, pgITNewID(t), base, model.TestResult{Name: "gh", Passed: true})
+	repGL := pgITHistoryReport(runGL, pgITNewID(t), base.Add(time.Second),
+		model.TestResult{Name: "gl1", Passed: true},
+		model.TestResult{Name: "gl2", Passed: false},
+		model.TestResult{Name: "gl3", Passed: true})
+	for _, item := range []struct {
+		rep  model.TestReport
+		repo string
+	}{{repGH, repoGH}, {repGL, repoGL}} {
+		if _, err := st.InsertTestReportWithHistory(ctx, item.rep, item.repo); err != nil {
+			t.Fatalf("insert %s: %v", item.rep.ID, err)
+		}
+	}
+	// Candidate discovery keeps the bare-name fallback.
+	ids, err := st.ResolveTestHistoryRepoIDs(ctx, "acme/service", 10)
+	if err != nil || !reflect.DeepEqual(ids, []string{repoGH, repoGL}) {
+		t.Fatalf("resolve = %v, %v; want both forges", ids, err)
+	}
+	// The authorized canonical set is the ONLY totals predicate.
+	reports, tests, failures, err := st.TestReportTotals(ctx, []string{repoGH}, "acme/service")
+	if err != nil || reports != 1 || tests != 1 || failures != 0 {
+		t.Fatalf("canonical-set totals = %d/%d/%d, %v; want 1/1/0 (pre-fix the bare query added the GitLab forge)", reports, tests, failures, err)
+	}
+	// An empty set returns zero without touching the bare name.
+	reports, tests, failures, err = st.TestReportTotals(ctx, nil, "acme/service")
+	if err != nil || reports != 0 || tests != 0 || failures != 0 {
+		t.Fatalf("empty-set totals = %d/%d/%d, %v; want 0/0/0", reports, tests, failures, err)
+	}
+}

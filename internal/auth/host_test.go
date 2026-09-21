@@ -94,13 +94,18 @@ func TestAuthorizeMatchesEquivalentForgeHostKeys(t *testing.T) {
 	if Authorize(storedCanonical, ActionRun, "github.com:8443/o/r", false) {
 		t.Fatal("a non-default port is a different forge and must not match")
 	}
-	// Equivalent keys with CONFLICTING grants fail closed.
-	conflict := Principal{Subject: "bot", Repositories: map[string]RepositoryPermission{
+	// Equivalent keys with CONFLICTING grants fail closed: the conflicting
+	// pair denies even though the global read and run roles would otherwise
+	// cover the repository.
+	conflict := Principal{Subject: "bot", Roles: []Role{RoleRead, RoleRun}, Repositories: map[string]RepositoryPermission{
 		"github.com/o/r":     {Run: true},
 		"GITHUB.COM./o/r":    {},
 		"github.com:443/o/r": {},
 	}}
 	if Authorize(conflict, ActionRun, "github.com/o/r", false) {
 		t.Fatal("ambiguous equivalent keys must fail closed")
+	}
+	if Authorize(conflict, ActionRead, "github.com/o/r", false) {
+		t.Fatal("ambiguous equivalent keys must deny read despite the global read role")
 	}
 }

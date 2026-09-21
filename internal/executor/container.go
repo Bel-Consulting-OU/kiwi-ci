@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -38,7 +39,10 @@ type ContainerBackend struct {
 	ReadOnlyRootFS bool
 	// Resources carries the job's resource requests, rendered into docker
 	// run flags by StartJob. Values are already admission-checked by
-	// pipeline validation; zero requests produce no flags.
+	// pipeline validation; zero requests produce no flags. resources.disk
+	// has no docker run flag (a bind-mounted workspace has no per-mount
+	// quota): it is enforced as the workspace content bound instead, see
+	// workspaceMaxBytes/enforceWorkspaceBound.
 	Resources pipeline.Resources
 	// restoreWorkspace undoes the host-side workspace provisioning applied
 	// before a hardened rootful container started. It is set by StartJob and
@@ -62,6 +66,19 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 	if b.RequireImmutableImages && !digestPinned(b.Image) {
 		return unpinnedImageError("container image", b.Image)
 	}
+	abs, err := absWorkspacePath(workspace)
+	if err != nil {
+		return &RunError{Kind: ErrorInfra, Err: err}
+	}
+	b.workspace = abs
+	// The declared resources.disk request is a hard workspace bound: a
+	// checkout that already exceeds it is refused before any container is
+	// created, so an over-quota workspace can never half-run. The check is
+	// host-side and does not depend on the daemon, so it deliberately runs
+	// before the docker lookup.
+	if err := b.enforceWorkspaceBound(); err != nil {
+		return err
+	}
 	docker, err := exec.LookPath("docker")
 	if err != nil {
 		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("docker not found: %w", err)}
@@ -71,11 +88,7 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 			return err
 		}
 	}
-	abs, err := absWorkspacePath(workspace)
-	if err != nil {
-		return &RunError{Kind: ErrorInfra, Err: err}
-	}
-	b.docker, b.workspace = docker, abs
+	b.docker = docker
 	b.container = dockerNameClean.ReplaceAllString(fmt.Sprintf("kiwi-job-%d", time.Now().UnixNano()), "-")
 	network := b.Network
 	if network == "" {
@@ -121,9 +134,87 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 // resource requests: resources.cpu -> --cpus, resources.memory -> --memory,
 // resources.pids -> --pids-limit. Zero/absent requests produce no flags; the
 // values themselves are already range-checked by pipeline admission. The
-// disk request has no docker run equivalent and is not rendered.
+// disk request has no docker run equivalent and is not rendered as a flag:
+// it bounds the workspace content instead (workspaceMaxBytes /
+// enforceWorkspaceBound).
 func containerResourceArgs(j pipeline.Job) []string {
 	return resourceArgsFor(j.Resources)
+}
+
+// workspaceMaxBytes is the workspace content bound for one container job: the
+// declared resources.disk request. pipeline.ByteSize is already the canonical
+// byte count the pipeline decoder produced (binary suffixes: "2Gi" = 2<<30;
+// plain integers are bytes), and the same value the distributed runner copies
+// into executor.Options.WorkspaceMaxBytes, so no re-parsing is involved.
+//
+// An undeclared disk (zero) leaves the workspace unbounded. That is the
+// documented default: pipelines that never declared a disk request keep their
+// previous behavior exactly, and the bound only applies to jobs that opted
+// into a disk declaration.
+func (b *ContainerBackend) workspaceMaxBytes() int64 {
+	return int64(b.Resources.Disk)
+}
+
+// enforceWorkspaceBound fails with a clear error when the host-side workspace
+// already holds more than the declared resources.disk bound. A bind mount has
+// no per-mount quota, so the bound is measured at step boundaries (before a
+// step starts and again after it succeeded) and the offending step fails
+// instead of the workspace silently growing past its declaration. Nothing is
+// ever truncated: an over-bound workspace is reported, never silently trimmed.
+//
+// The measurement is a stat-only walk (see workspaceUsageBytes); it is not
+// part of the security boundary (the daemon has no quota to set), so it is
+// deliberately best-effort about concurrent workspace mutations.
+func (b *ContainerBackend) enforceWorkspaceBound() error {
+	limit := b.workspaceMaxBytes()
+	if limit <= 0 {
+		return nil
+	}
+	used, err := workspaceUsageBytes(b.workspace)
+	if err != nil {
+		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("measure workspace usage: %w", err)}
+	}
+	if used > limit {
+		return &RunError{Kind: ErrorFailure, Err: fmt.Errorf("workspace exceeds the declared resources.disk bound: %d bytes used, %d bytes allowed", used, limit)}
+	}
+	return nil
+}
+
+// workspaceUsageBytes sums the sizes of the regular files in the workspace
+// tree rooted at path. Symlinks are never followed (a link out of the tree
+// must not be able to inflate or hide the measurement) and non-regular
+// entries contribute nothing, matching what a bind-mounted workspace can
+// actually hold. The root is resolved through symlinks first, so a symlinked
+// workspace root is measured instead of silently reading as empty.
+func workspaceUsageBytes(path string) (int64, error) {
+	if path == "" {
+		return 0, fmt.Errorf("empty workspace path")
+	}
+	root, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return 0, err
+	}
+	var total int64
+	err = filepath.WalkDir(root, func(_ string, d fs.DirEntry, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, ierr := d.Info()
+		if ierr != nil {
+			return ierr
+		}
+		if info.Mode().IsRegular() {
+			total += info.Size()
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return total, nil
 }
 
 // resourceArgsFor renders the docker run resource flags for a Resources
@@ -338,11 +429,26 @@ func (b *ContainerBackend) Run(ctx context.Context, c Command, emit func(string)
 			args = append(args, "-e", e[:i])
 		}
 	}
+	// An already over-bound workspace never starts another step: the check
+	// fails closed before this step's command is launched.
+	if err := b.enforceWorkspaceBound(); err != nil {
+		return err
+	}
 	args = append(args, b.container)
 	args = append(args, shellCommand(c.Shell, c.Script)...)
 	cmd := exec.CommandContext(ctx, b.docker, args...)
 	cmd.Env = c.Env
-	return streamCommand(ctx, cmd, emit)
+	err = streamCommand(ctx, cmd, emit)
+	if err == nil {
+		// Catch growth caused by this step. A bind mount cannot be capped by
+		// the daemon, so the step that pushed the workspace past its
+		// declared disk bound fails here, deterministically and with a clear
+		// error, rather than being silently truncated or left unmeasured.
+		if berr := b.enforceWorkspaceBound(); berr != nil {
+			return berr
+		}
+	}
+	return err
 }
 
 func shellCommand(shell, script string) []string {

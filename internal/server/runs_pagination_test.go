@@ -334,17 +334,24 @@ func TestListRunsRBACFilteredPagesAdvanceAndTerminate(t *testing.T) {
 }
 
 // pagedRunsFake is a dbFakeStore that also implements storage.RunPageStore,
-// so the handler's native paged path is exercised without PostgreSQL.
+// so the handler's native paged path is exercised without PostgreSQL. It
+// records the cursor and limit each page read received, which pins that the
+// handler delegates the keyset position to the store instead of re-reading a
+// newest-first window.
 type pagedRunsFake struct {
 	*dbFakeStore
 	mu        sync.Mutex
 	pageCalls int
 	pageErr   error
+	afterIDs  []string
+	limits    []int
 }
 
 func (p *pagedRunsFake) ListRunsPage(ctx context.Context, afterCreatedAt time.Time, afterID string, limit int) (storage.RunPage, error) {
 	p.mu.Lock()
 	p.pageCalls++
+	p.afterIDs = append(p.afterIDs, afterID)
+	p.limits = append(p.limits, limit)
 	err := p.pageErr
 	p.mu.Unlock()
 	if err != nil {
@@ -365,42 +372,62 @@ func (p *pagedRunsFake) calls() int {
 	return p.pageCalls
 }
 
-// TestListRunsPagedStoreAndFallbackParity proves both store paths in DB mode
-// produce the same pages: a store implementing RunPageStore is read through
-// it, while a legacy store without the capability is served the bounded
-// ListRuns snapshot through the same PageRuns contract. A failing page read
-// stays a 500.
-func TestListRunsPagedStoreAndFallbackParity(t *testing.T) {
+// TestListRunsPagedStorePathUnchanged pins the supported path: a store that
+// implements RunPageStore is read through ListRunsPage only — the handler
+// passes the cursor position and the bounded limit straight through — and its
+// first page is byte-identical to memory mode, so the paged contract never
+// changes what a store that honors it returns. A failing page read stays a 500.
+func TestListRunsPagedStorePathUnchanged(t *testing.T) {
 	f := newDBFakeStore()
 	base := time.Date(2026, 8, 9, 10, 11, 12, 0, time.UTC)
-	f.mu.Lock()
+	runs := make([]model.Run, 0, 5)
 	for i := 0; i < 5; i++ {
-		run := runsPaginationRun(i, base, true)
+		runs = append(runs, runsPaginationRun(i, base, true))
+	}
+	f.mu.Lock()
+	for _, run := range runs {
 		f.runs[run.ID] = run
 	}
 	f.mu.Unlock()
-
-	fallback := New("admin")
-	fallback.DB = f
-	fallbackPages := walkRunsPages(t, fallback, "admin", 2, 5)
-	if len(fallbackPages) != 3 {
-		t.Fatalf("fallback walk = %d pages, want 3", len(fallbackPages))
-	}
 
 	paged := New("admin")
 	pf := &pagedRunsFake{dbFakeStore: f}
 	paged.DB = pf
 	pagedPages := walkRunsPages(t, paged, "admin", 2, 5)
+	if len(pagedPages) != 3 {
+		t.Fatalf("paged walk = %d pages, want 3", len(pagedPages))
+	}
 	if pf.calls() == 0 {
 		t.Fatal("paged store capability was not used")
 	}
-	if len(pagedPages) != len(fallbackPages) {
-		t.Fatalf("paged walk = %d pages, fallback = %d", len(pagedPages), len(fallbackPages))
-	}
-	for i := range pagedPages {
-		if strings.Join(pagedPages[i].ids, ",") != strings.Join(fallbackPages[i].ids, ",") {
-			t.Fatalf("page %d: paged %v != fallback %v", i, pagedPages[i].ids, fallbackPages[i].ids)
+	want := runsPaginationDescending(5)
+	got := []string{}
+	for i, page := range pagedPages {
+		if pf.limits[i] != 2 {
+			t.Fatalf("page %d limit = %d, want the requested 2", i, pf.limits[i])
 		}
+		got = append(got, page.ids...)
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("paged walk = %v, want %v", got, want)
+	}
+	// The continuation cursor was handed back to the store as the position,
+	// never re-derived from a newest-first window.
+	if pf.afterIDs[0] != "" || pf.afterIDs[1] != "run-0003" || pf.afterIDs[2] != "run-0001" {
+		t.Fatalf("page cursor positions = %v, want the previous page boundary", pf.afterIDs)
+	}
+
+	// Memory mode produces the identical first page: the paged store path is
+	// additive, not a rendering change.
+	mem := New("admin")
+	runsPaginationSeed(t, mem, runs)
+	memPage := doJSON(t, mem, http.MethodGet, "/api/v1/runs?limit=2", "admin", "")
+	pagedPage := doJSON(t, paged, http.MethodGet, "/api/v1/runs?limit=2", "admin", "")
+	if memPage.Body.String() != pagedPage.Body.String() {
+		t.Fatalf("memory %s != paged %s", memPage.Body.String(), pagedPage.Body.String())
+	}
+	if memPage.Header().Get("X-Kiwi-Next-Cursor") != pagedPage.Header().Get("X-Kiwi-Next-Cursor") {
+		t.Fatal("memory and paged stores disagree on the next cursor")
 	}
 
 	pf.mu.Lock()
@@ -408,5 +435,53 @@ func TestListRunsPagedStoreAndFallbackParity(t *testing.T) {
 	pf.mu.Unlock()
 	if w := doJSON(t, paged, http.MethodGet, "/api/v1/runs", "admin", ""); w.Code != http.StatusInternalServerError {
 		t.Fatalf("failing paged read = %d, want 500", w.Code)
+	}
+}
+
+// noPageStore hides the optional capability behind the static storage.Store
+// type: a store that satisfies Store but not RunPageStore.
+type noPageStore struct {
+	storage.Store
+}
+
+// TestListRunsStoreWithoutRunPageStoreFailsClosed pins the fail-closed
+// contract: a configured store without storage.RunPageStore cannot paginate,
+// so every /runs request — first page, explicit limit, or an older cursor —
+// answers the opaque 500 instead of a truncated 200 that pretends the
+// collection ended after the newest ListRuns window.
+func TestListRunsStoreWithoutRunPageStoreFailsClosed(t *testing.T) {
+	f := newDBFakeStore()
+	base := time.Date(2026, 9, 10, 11, 12, 13, 0, time.UTC)
+	for i := 0; i < 5; i++ {
+		run := runsPaginationRun(i, base, true)
+		f.mu.Lock()
+		f.runs[run.ID] = run
+		f.mu.Unlock()
+	}
+	s := New("admin")
+	s.DB = noPageStore{Store: f}
+
+	cursor := url.QueryEscape(encodeRunsCursor(base.Add(30*time.Second), "run-0030"))
+	for _, path := range []string{
+		"/api/v1/runs",
+		"/api/v1/runs?limit=2",
+		"/api/v1/runs?cursor=" + cursor,
+	} {
+		w := doJSON(t, s, http.MethodGet, path, "admin", "")
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("%s = %d, want the opaque 500: %s", path, w.Code, w.Body.String())
+		}
+		if w.Body.String() != "internal server error\n" {
+			t.Fatalf("%s body = %q, want the opaque 500 body", path, w.Body.String())
+		}
+		if w.Header().Get("X-Kiwi-Next-Cursor") != "" {
+			t.Fatalf("%s carried a next cursor despite the unsupported store", path)
+		}
+	}
+
+	if _, err := listRunsPageFromStore(context.Background(), noPageStore{Store: f}, runsCursor{}, 2); !errors.Is(err, errRunsPaginationUnsupported) {
+		t.Fatalf("unsupported store error = %v, want errRunsPaginationUnsupported", err)
+	} else if !strings.Contains(err.Error(), "runs pagination unsupported by configured store") {
+		t.Fatalf("unsupported store error = %q, want the documented detail", err)
 	}
 }

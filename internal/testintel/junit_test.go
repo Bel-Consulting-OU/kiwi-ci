@@ -138,7 +138,7 @@ func TestParseRejectsOversizedFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := f.Truncate(maxReportBytes + 1); err != nil {
+	if err := f.Truncate(MaxReportFileBytes + 1); err != nil {
 		t.Fatal(err)
 	}
 	f.Close()
@@ -151,7 +151,7 @@ func TestParseRejectsTooManyCases(t *testing.T) {
 	dir := t.TempDir()
 	var b strings.Builder
 	b.WriteString(`<testsuite name="s" tests="100001">`)
-	for i := 0; i < maxReportCases+1; i++ {
+	for i := 0; i < MaxReportCases+1; i++ {
 		b.WriteString(`<testcase name="t"/>`)
 	}
 	b.WriteString(`</testsuite>`)

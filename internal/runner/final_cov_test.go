@@ -529,7 +529,12 @@ func TestFinalExecuteTestReportPaths(t *testing.T) {
 	}{
 		{"malformed report warns", junitBad, 0, "report warning:", 0},
 		{"valid report uploads", junitOK, 0, "", 1},
-		{"failed upload warns", junitOK, http.StatusInternalServerError, "upload warning:", 1},
+		// A transient 5xx is retried with the identical delivery ID up to the
+		// bounded attempt budget, then warned about; the job still succeeds.
+		{"transient upload failure retries and warns", junitOK, http.StatusInternalServerError, "upload warning:", deliveryAttempts},
+		// A permanent 4xx is never retried (a replay cannot fix it) and is
+		// surfaced as a warning only.
+		{"permanent upload failure warns once", junitOK, http.StatusBadRequest, "upload warning:", 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

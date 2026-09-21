@@ -312,3 +312,47 @@ func TestMemStoreFlakyWindowAndRepoPaging(t *testing.T) {
 		t.Fatalf("enumeration is not ascending: %v", full)
 	}
 }
+
+// TestMemStoreReportTotalsCanonicalSetOnly pins the post-authorization totals
+// contract in memory: TestReportTotals answers EXACTLY the supplied canonical
+// repository IDs and never falls back to the bare query form. Two forges
+// present the same bare name, so the pre-fix OR implementation returned the
+// other forge's counts for a one-repository canonical set, and an empty set
+// fanned the query across both. Resolution keeps the bare-name fallback by
+// design — it is the candidate-discovery step, not an authorization
+// decision.
+func TestMemStoreReportTotalsCanonicalSetOnly(t *testing.T) {
+	ctx := context.Background()
+	m := newMemStore()
+	base := time.Now().UTC()
+	repoGH, repoGL := "github.com/acme/service", "gitlab.example/acme/service"
+	m.runs["run-gh"] = model.Run{ID: "run-gh", RepoID: repoGH, RepoFullName: "acme/service"}
+	m.runs["run-gl"] = model.Run{ID: "run-gl", RepoID: repoGL, RepoFullName: "acme/service"}
+	for _, item := range []struct {
+		rep  model.TestReport
+		repo string
+	}{
+		{model.TestReport{ID: "rep-gh", RunID: "run-gh", JobKey: "build", Tests: 3, Failures: 1, CreatedAt: base}, repoGH},
+		{model.TestReport{ID: "rep-gl", RunID: "run-gl", JobKey: "build", Tests: 9, Failures: 2, CreatedAt: base.Add(time.Second)}, repoGL},
+	} {
+		if _, err := m.InsertTestReportWithHistory(ctx, item.rep, item.repo); err != nil {
+			t.Fatalf("insert %s: %v", item.rep.ID, err)
+		}
+	}
+	// Candidate discovery still finds BOTH forges through the bare name.
+	ids, err := m.ResolveTestHistoryRepoIDs(ctx, "acme/service", 10)
+	if err != nil || !reflect.DeepEqual(ids, []string{repoGH, repoGL}) {
+		t.Fatalf("resolve = %v, %v; want both forges", ids, err)
+	}
+	// Totals for one canonical repository: the bare query must not add the
+	// other forge.
+	reports, tests, failures, err := m.TestReportTotals(ctx, []string{repoGH}, "acme/service")
+	if err != nil || reports != 1 || tests != 3 || failures != 1 {
+		t.Fatalf("canonical-set totals = %d/%d/%d, %v; want 1/3/1 (the bare query must not add the GitLab forge)", reports, tests, failures, err)
+	}
+	// No canonical set: no bare-name fallback and no scan work.
+	reports, tests, failures, err = m.TestReportTotals(ctx, nil, "acme/service")
+	if err != nil || reports != 0 || tests != 0 || failures != 0 {
+		t.Fatalf("empty-set totals = %d/%d/%d, %v; want 0/0/0", reports, tests, failures, err)
+	}
+}

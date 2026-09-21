@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -33,10 +34,84 @@ const (
 	maxSigstoreBytes = 8 << 20
 )
 
-// artifactSidecarPath is the deterministic sidecar location next to a job's
-// artifacts: <dir>/<base>.<kind>.json.
-func artifactSidecarPath(dir, base, kind string) string {
-	return filepath.Join(dir, cleanBlobName(base)+"."+kind+".json")
+// FS/dev sidecar layout. In dev mode the `<name>.sbom` / `<name>.sigstore`
+// uploads are persisted as local files next to the job's artifacts. The
+// layout is generation- and digest-qualified:
+//
+//	<dir>/g-<generation>/<base>.<kind>.<sha256>.json
+//
+// <generation> is the lease generation the sidecar was uploaded under and
+// <sha256> is the digest of its exact bytes, so a sidecar file is IMMUTABLE:
+// a retry generation writes into its own directory and can never overwrite
+// (or otherwise mutate) the file an older generation's artifact record still
+// points at, and the digest in the name always matches the bytes the owning
+// record references (record.SBOMSHA256/SigstoreSHA256). Re-uploading the
+// same content is an idempotent no-op; a re-upload with different content
+// inside ONE generation appends a second digest-qualified file instead of
+// rewriting the first.
+//
+// artifactSidecarDir is the per-generation sidecar directory.
+func artifactSidecarDir(dir string, generation int64) string {
+	return filepath.Join(dir, "g-"+strconv.FormatInt(generation, 10))
+}
+
+// artifactSidecarPath is the immutable path of one sidecar object.
+func artifactSidecarPath(dir string, generation int64, base, kind, digest string) string {
+	return filepath.Join(artifactSidecarDir(dir, generation), cleanBlobName(base)+"."+kind+"."+digest+".json")
+}
+
+// writeArtifactSidecar persists one sidecar object immutably: it creates the
+// generation directory and returns the existing path untouched when the
+// content-addressed file already exists (same bytes by construction), so no
+// write can ever replace another generation's file. It returns the sidecar
+// path stored on the artifact record.
+func writeArtifactSidecar(dir string, generation int64, base, kind, digest string, body []byte) (string, error) {
+	if err := os.MkdirAll(artifactSidecarDir(dir, generation), 0o700); err != nil {
+		return "", err
+	}
+	path := artifactSidecarPath(dir, generation, base, kind, digest)
+	if fi, err := os.Stat(path); err == nil && !fi.IsDir() {
+		return path, nil
+	}
+	if err := writeFileAtomic(path, body, 0o600); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// findArtifactSidecar resolves the readable sidecar file of one
+// (generation, base, kind) identity: the exact digest-qualified path when
+// digest is non-empty and present, else the lexicographically first
+// matching file in the generation directory. Several files can exist only
+// after an in-generation re-upload; whichever candidate is read is still
+// validated by the caller (SBOM document validation / sigstore bundle
+// verification), and the GENERATION boundary is never crossed.
+func findArtifactSidecar(dir string, generation int64, base, kind, digest string) (string, bool) {
+	if digest != "" {
+		path := artifactSidecarPath(dir, generation, base, kind, digest)
+		if fi, err := os.Stat(path); err == nil && !fi.IsDir() {
+			return path, true
+		}
+	}
+	genDir := artifactSidecarDir(dir, generation)
+	entries, err := os.ReadDir(genDir)
+	if err != nil {
+		return "", false
+	}
+	prefix := cleanBlobName(base) + "." + kind + "."
+	candidates := []string{}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		candidates = append(candidates, name)
+	}
+	if len(candidates) == 0 {
+		return "", false
+	}
+	sort.Strings(candidates)
+	return filepath.Join(genDir, candidates[0]), true
 }
 
 // SetSigstoreTrustRoot pins the Sigstore verification trust root: the
@@ -187,12 +262,8 @@ func (s *Server) uploadSBOM(w http.ResponseWriter, r *http.Request, j model.Job,
 		return
 	}
 	dir := filepath.Join(s.store.Root, "artifacts", j.RunID, j.ID)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		s.internalError(w, r, err, "")
-		return
-	}
-	sidecar := artifactSidecarPath(dir, base, "sbom")
-	if err := writeFileAtomic(sidecar, body, 0o600); err != nil {
+	sidecar, err := writeArtifactSidecar(dir, j.LeaseGeneration, base, "sbom", sum, body)
+	if err != nil {
 		s.internalError(w, r, err, "")
 		return
 	}
@@ -288,12 +359,8 @@ func (s *Server) uploadSigstore(w http.ResponseWriter, r *http.Request, j model.
 		return
 	}
 	dir := filepath.Join(s.store.Root, "artifacts", j.RunID, j.ID)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		s.internalError(w, r, err, "")
-		return
-	}
-	sidecar := artifactSidecarPath(dir, base, "sigstore")
-	if err := writeFileAtomic(sidecar, body, 0o600); err != nil {
+	sidecar, err := writeArtifactSidecar(dir, j.LeaseGeneration, base, "sigstore", sum, body)
+	if err != nil {
 		s.internalError(w, r, err, "")
 		return
 	}
@@ -568,13 +635,20 @@ func (s *Server) sidecarBytes(ctx context.Context, j model.Job, base, kind, dir 
 		}
 		return nil, os.ErrNotExist
 	}
-	if d, ok, err := s.pendingSidecarDigest(ctx, j.ID, j.LeaseGeneration, base, kind); err == nil && ok && d != "" && s.CAS != nil {
+	d, ok, _ := s.pendingSidecarDigest(ctx, j.ID, j.LeaseGeneration, base, kind)
+	if ok && d != "" && s.CAS != nil {
 		if rc, _, oerr := s.CAS.Open(ctx, d); oerr == nil {
 			defer rc.Close()
 			return io.ReadAll(io.LimitReader(rc, maxSBOMBytes+1))
 		}
 	}
-	return os.ReadFile(artifactSidecarPath(dir, base, kind))
+	// fs/dev fallback: the exact digest-qualified file when the pending
+	// mirror knows the digest, else this generation's unique candidate.
+	path, found := findArtifactSidecar(dir, j.LeaseGeneration, base, kind, d)
+	if !found {
+		return nil, os.ErrNotExist
+	}
+	return os.ReadFile(path)
 }
 
 // attachSidecarsToRecord fills the sidecar fields of a freshly built
@@ -605,19 +679,25 @@ func (s *Server) attachSidecarsToRecord(ctx context.Context, rec *model.Artifact
 		}
 		return nil
 	}
-	if d, ok, _ := s.pendingSidecarDigest(ctx, j.ID, j.LeaseGeneration, base, storage.ArtifactSidecarKindSBOM); ok && d != "" && s.CAS != nil {
-		rec.SBOMPath = "cas:" + d
-		rec.SBOMSHA256 = d
-	} else if b, err := os.ReadFile(artifactSidecarPath(dir, base, "sbom")); err == nil && json.Valid(b) {
-		rec.SBOMPath = artifactSidecarPath(dir, base, "sbom")
-		rec.SBOMSHA256 = sha256Hex(b)
+	sbomPending, sbomOK, _ := s.pendingSidecarDigest(ctx, j.ID, j.LeaseGeneration, base, storage.ArtifactSidecarKindSBOM)
+	if sbomOK && sbomPending != "" && s.CAS != nil {
+		rec.SBOMPath = "cas:" + sbomPending
+		rec.SBOMSHA256 = sbomPending
+	} else if path, found := findArtifactSidecar(dir, j.LeaseGeneration, base, "sbom", sbomPending); found {
+		if b, err := os.ReadFile(path); err == nil && json.Valid(b) {
+			rec.SBOMPath = path
+			rec.SBOMSHA256 = sha256Hex(b)
+		}
 	}
-	if d, ok, _ := s.pendingSidecarDigest(ctx, j.ID, j.LeaseGeneration, base, storage.ArtifactSidecarKindSigstore); ok && d != "" && s.CAS != nil {
-		rec.SigstorePath = "cas:" + d
-		rec.SigstoreSHA256 = d
-	} else if b, err := os.ReadFile(artifactSidecarPath(dir, base, "sigstore")); err == nil && json.Valid(b) {
-		rec.SigstorePath = artifactSidecarPath(dir, base, "sigstore")
-		rec.SigstoreSHA256 = sha256Hex(b)
+	sigPending, sigOK, _ := s.pendingSidecarDigest(ctx, j.ID, j.LeaseGeneration, base, storage.ArtifactSidecarKindSigstore)
+	if sigOK && sigPending != "" && s.CAS != nil {
+		rec.SigstorePath = "cas:" + sigPending
+		rec.SigstoreSHA256 = sigPending
+	} else if path, found := findArtifactSidecar(dir, j.LeaseGeneration, base, "sigstore", sigPending); found {
+		if b, err := os.ReadFile(path); err == nil && json.Valid(b) {
+			rec.SigstorePath = path
+			rec.SigstoreSHA256 = sha256Hex(b)
+		}
 	}
 	return nil
 }

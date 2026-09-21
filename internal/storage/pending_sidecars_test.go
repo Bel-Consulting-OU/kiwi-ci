@@ -86,8 +86,8 @@ func TestMigration0028GenerationScopedPendingSidecars(t *testing.T) {
 	if err != nil {
 		t.Fatalf("All: %v", err)
 	}
-	if got := all[len(all)-1].Version; got != 28 {
-		t.Fatalf("newest migration version = %d, want 28", got)
+	if got := all[len(all)-1].Version; got != 29 {
+		t.Fatalf("newest migration version = %d, want 29 (0029 adds the report-delivery receipts)", got)
 	}
 }
 

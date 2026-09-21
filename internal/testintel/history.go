@@ -78,19 +78,22 @@ type historyKeyParts struct {
 }
 
 // decodeHistoryKey parses one history key. ok reports whether the key is a
-// fully attributed identity: either a decodable v2 key or a legacy key with
-// exactly four "|"-separated fields. Ambiguous legacy keys (a pre-v2 part
-// containing "|", hence a different field count) return ok=false with the
-// leading repository and suite fields still filled in — exactly the leniency
-// the old repoPart/suitePart helpers had — while displayName renders them as
-// their raw key (also the old behavior). A corrupt v2 key can never be
-// attributed: it falls through to the legacy split, where it can only ever
-// match its own literal text as a repository.
+// fully attributed identity: either a decodable v2 key with EXACTLY four
+// elements or a legacy key with exactly four "|"-separated fields. Ambiguous
+// legacy keys (a pre-v2 part containing "|", hence a different field count)
+// return ok=false with the leading repository and suite fields still filled
+// in — exactly the leniency the old repoPart/suitePart helpers had — while
+// displayName renders them as their raw key (also the old behavior). A
+// corrupt v2 key can never be attributed — including one whose JSON array
+// does not have exactly four elements (a shorter array must not be
+// zero-filled and a longer one must not be truncated into a bogus identity):
+// it falls through to the legacy split, where it can only ever match its own
+// literal text as a repository.
 func decodeHistoryKey(key string) (historyKeyParts, bool) {
 	if rest, found := strings.CutPrefix(key, historyKeyV2Prefix); found {
 		if raw, err := base64.RawURLEncoding.DecodeString(rest); err == nil {
-			var fields [4]string
-			if err := json.Unmarshal(raw, &fields); err == nil {
+			var fields []string
+			if err := json.Unmarshal(raw, &fields); err == nil && len(fields) == 4 {
 				return historyKeyParts{repo: fields[0], suite: fields[1], class: fields[2], name: fields[3]}, true
 			}
 		}
@@ -256,9 +259,10 @@ func (h *History) Manifest(repo, suite string) []string {
 // defaultShardDuration is the nominal duration LPT schedules for a test
 // without a usable EWMA measurement: TestStat.Runs == 0 (a stat loaded from a
 // journal that predates duration recording, or one that has never run) or a
-// non-finite EWMA (a corrupt journal). A nominal unit rather than 0 keeps
-// unmeasured tests spread across shards; treating them all as zero-load would
-// pile every one of them into the first shard.
+// non-finite/negative EWMA (a corrupt journal: NaN, +Inf, -Inf or a negative
+// duration). A nominal unit rather than 0 keeps unmeasured tests spread
+// across shards; treating them all as zero-load would pile every one of them
+// into the first shard.
 const defaultShardDuration = 1.0
 
 // Shard deterministically splits the known tests of repo/suite into the
@@ -291,7 +295,12 @@ func (h *History) Shard(repo, suite string, shards int) [][]string {
 			continue
 		}
 		dur := st.EWMA
-		if st.Runs == 0 || math.IsNaN(dur) {
+		// A corrupt journal can carry a non-finite or negative EWMA: treating
+		// any of them as a real scheduling duration would either poison the
+		// load arithmetic (Inf/NaN) or invert the LPT order. They all
+		// schedule with the documented default, exactly like an unmeasured
+		// test.
+		if st.Runs == 0 || math.IsNaN(dur) || math.IsInf(dur, 0) || dur < 0 {
 			dur = defaultShardDuration
 		}
 		entries = append(entries, entry{name: displayName(key), ewma: dur})

@@ -1,7 +1,10 @@
 package server
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"sort"
 	"strconv"
@@ -16,12 +19,47 @@ import (
 
 func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		RunnerID        string           `json:"runner_id"`
-		LeaseToken      string           `json:"lease_token"`
-		LeaseGeneration int64            `json:"lease_generation"`
-		Report          model.TestReport `json:"report"`
+		RunnerID        string `json:"runner_id"`
+		LeaseToken      string `json:"lease_token"`
+		LeaseGeneration int64  `json:"lease_generation"`
+		// DeliveryID/ContentDigest are the durable-delivery identity of the
+		// upload (see internal/testintel/delivery.go). DeliveryID is the
+		// stable, content-derived name the runner computes for this report;
+		// ContentDigest is optional and, when present, must equal the digest
+		// the server computes from the bytes it received. A request without a
+		// delivery ID keeps the legacy per-request behavior.
+		DeliveryID    string          `json:"delivery_id"`
+		ContentDigest string          `json:"content_digest"`
+		Report        json.RawMessage `json:"report"`
 	}
-	if !decode(w, r, &in) {
+	// Endpoint-specific decode cap: the shared total-bytes budget of one
+	// report delivery (internal/testintel/limits.go). The global generic
+	// decode cap is deliberately untouched.
+	if !decodeLimit(w, r, &in, testintel.MaxTestReportRequestBytes) {
+		return
+	}
+	if in.DeliveryID != "" && !testintel.ValidReportDeliveryID(in.DeliveryID) {
+		http.Error(w, "invalid delivery_id", http.StatusBadRequest)
+		return
+	}
+	rep, ok := decodeTestReportPayload(w, in.Report)
+	if !ok {
+		return
+	}
+	// The shared size contract is enforced on the decoded report too (case
+	// count, retained message bytes, serialized payload budget): the parser,
+	// the runner's pre-upload check and this endpoint all reject the same
+	// boundary with the same reason. The raw payload bytes are additionally
+	// bounded by the endpoint decode cap above.
+	if err := testintel.ValidateReportPayload(rep); err != nil {
+		http.Error(w, "report over limits: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	// The digest is ALWAYS computed server-side from the received bytes; a
+	// client-supplied digest is verified against it and never trusted.
+	digest := testintel.ReportContentDigest(in.Report)
+	if in.ContentDigest != "" && in.ContentDigest != digest {
+		http.Error(w, "content_digest does not match the report payload", http.StatusBadRequest)
 		return
 	}
 	j, authErr := s.authorizeRunnerLease(r, in.RunnerID, in.LeaseToken, in.LeaseGeneration)
@@ -29,7 +67,6 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 		s.writeLeaseAuthError(w, r, authErr)
 		return
 	}
-	rep := in.Report
 	id, err := newID()
 	if err != nil {
 		http.Error(w, "internal server error", http.StatusInternalServerError)
@@ -40,6 +77,10 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 	rep.JobID = j.ID
 	rep.JobKey = j.Key
 	rep.CreatedAt = time.Now().UTC()
+	// The delivery key is scoped to the AUTHORITATIVE job/lease generation
+	// from the verified lease, never to client-supplied values, so a replay
+	// can never be re-attributed to another job or generation.
+	delivery := storage.TestReportDelivery{JobID: j.ID, LeaseGeneration: j.LeaseGeneration, DeliveryID: in.DeliveryID, ContentDigest: digest}
 	// The report's history key is the run's canonical repository identity.
 	// The authoritative lookup is never best-effort: a failed or missing run
 	// fails the upload closed BEFORE the durable report insert and the
@@ -50,37 +91,86 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	repo := repoIDForRun(run)
-	for _, c := range rep.Cases {
-		s.metricObserve("kiwi_test_duration_seconds", c.Duration, nil)
-	}
 	// The durable report and the test-history aggregates commit in ONE
 	// transaction: an aggregate-store upload writes the report, folds ONLY
-	// this report's cases into the per-repository aggregates and bumps the
-	// repository version atomically, so per-upload work never grows with the
-	// accumulated history and a canceled request commits nothing. A store
-	// without the incremental contract falls back to the legacy insert +
-	// full-rebuild maintenance path (never taken by PostgresStore).
+	// this report's cases into the per-repository aggregates, records the
+	// delivery receipt and bumps the repository version atomically, so
+	// per-upload work never grows with the accumulated history, a canceled
+	// request commits nothing, and a replay of the same delivery is an
+	// idempotent success that changes nothing. Legacy stores without the
+	// delivery contract fall back to the non-idempotent insert path.
 	if s.DB != nil {
-		if agg, ok := s.DB.(storage.TestHistoryAggregateStore); ok {
+		agg, isAgg := s.DB.(storage.TestHistoryAggregateStore)
+		if ds, isDelivery := s.DB.(storage.TestReportDeliveryStore); isAgg && isDelivery {
+			outcome, err := ds.InsertTestReportWithHistoryDelivery(r.Context(), rep, repo, delivery)
+			switch {
+			case errors.Is(err, storage.ErrTestReportDeliveryConflict):
+				// Same delivery identity, different payload: the stored
+				// report and history are untouched and the retry is refused
+				// explicitly instead of silently discarded.
+				http.Error(w, "test report delivery conflict: delivery_id was already used with different content", http.StatusConflict)
+				return
+			case err != nil:
+				s.internalError(w, r, err, "")
+				return
+			}
+			rep.ID = outcome.ReportID
+			if outcome.Replay {
+				// Idempotent success: the original report already committed,
+				// its history was folded once, and this retry must not
+				// re-observe metrics or audit twice.
+				writeJSON(w, http.StatusOK, rep)
+				return
+			}
+			s.observeTestReportMetrics(rep)
+			// Mark the cached snapshot stale; the next read reloads the
+			// repository's freshly committed durable aggregates.
+			s.mirrorTestReportHistoryDB(repo)
+			s.auditLocked("tests.uploaded", in.RunnerID, j.RunID, j.ID, "test report uploaded", map[string]string{"job": j.Key, "tests": strconv.Itoa(rep.Tests), "failures": strconv.Itoa(rep.Failures)})
+			writeJSON(w, http.StatusCreated, rep)
+			return
+		}
+		if isAgg {
 			if _, err := agg.InsertTestReportWithHistory(r.Context(), rep, repo); err != nil {
 				s.internalError(w, r, err, "")
 				return
 			}
-			// Mark the cached snapshot stale; the next read reloads the
-			// repository's freshly committed durable aggregates.
+			s.observeTestReportMetrics(rep)
 			s.mirrorTestReportHistoryDB(repo)
-		} else {
-			if err := s.DB.InsertTestReport(r.Context(), rep); err != nil {
-				s.internalError(w, r, err, "")
-				return
-			}
-			s.recordTestReportHistory(r.Context(), repo, rep)
+			s.auditLocked("tests.uploaded", in.RunnerID, j.RunID, j.ID, "test report uploaded", map[string]string{"job": j.Key, "tests": strconv.Itoa(rep.Tests), "failures": strconv.Itoa(rep.Failures)})
+			writeJSON(w, http.StatusCreated, rep)
+			return
 		}
+		if err := s.DB.InsertTestReport(r.Context(), rep); err != nil {
+			s.internalError(w, r, err, "")
+			return
+		}
+		s.observeTestReportMetrics(rep)
+		s.recordTestReportHistory(r.Context(), repo, rep)
 		s.auditLocked("tests.uploaded", in.RunnerID, j.RunID, j.ID, "test report uploaded", map[string]string{"job": j.Key, "tests": strconv.Itoa(rep.Tests), "failures": strconv.Itoa(rep.Failures)})
 		writeJSON(w, http.StatusCreated, rep)
 		return
 	}
+	// Memory/fs mode has no store transaction, so the delivery identity is
+	// bound into a deterministic report ID: the same delivery maps to the
+	// same record and a retry can never duplicate it (it either overwrites
+	// nothing on replay or is refused as a conflict). The digest conflict is
+	// detected by comparing the client-authored report content, because
+	// there is no delivery table to hold the digest.
+	if delivery.DeliveryID != "" {
+		rep.ID = testintel.DeliveryReportID(delivery.DeliveryID)
+	}
 	s.mu.Lock()
+	if existing, ok := s.reports[rep.ID]; ok {
+		s.mu.Unlock()
+		if sameTestReportContent(existing, rep) {
+			writeJSON(w, http.StatusOK, existing)
+			return
+		}
+		http.Error(w, "test report delivery conflict: delivery_id was already used with different content", http.StatusConflict)
+		return
+	}
+	s.observeTestReportMetrics(rep)
 	s.reports[rep.ID] = rep
 	perr := s.persistCheckedErrLocked("test.report")
 	if perr != nil {
@@ -96,6 +186,60 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 	s.recordTestReportHistory(r.Context(), repo, rep)
 	s.auditLocked("tests.uploaded", in.RunnerID, j.RunID, j.ID, "test report uploaded", map[string]string{"job": j.Key, "tests": strconv.Itoa(rep.Tests), "failures": strconv.Itoa(rep.Failures)})
 	writeJSON(w, http.StatusCreated, rep)
+}
+
+// decodeTestReportPayload strictly decodes the "report" member of a /tests
+// request. It keeps the request decoder's contract (unknown fields and
+// trailing data are rejected) while letting the handler digest and bound the
+// RAW payload bytes the runner sent.
+func decodeTestReportPayload(w http.ResponseWriter, raw json.RawMessage) (model.TestReport, bool) {
+	var rep model.TestReport
+	if len(raw) == 0 || string(raw) == "null" {
+		return rep, true
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&rep); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return model.TestReport{}, false
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		http.Error(w, "bad json: trailing data", http.StatusBadRequest)
+		return model.TestReport{}, false
+	}
+	return rep, true
+}
+
+// observeTestReportMetrics records one committed report's case durations.
+// Replayed deliveries skip it: the original upload already observed them.
+func (s *Server) observeTestReportMetrics(rep model.TestReport) {
+	for _, c := range rep.Cases {
+		s.metricObserve("kiwi_test_duration_seconds", c.Duration, nil)
+	}
+}
+
+// reportContentView is the client-authored part of a report. Server-assigned
+// fields (ID, run/job identity, CreatedAt) are deliberately excluded so a
+// replay of the same bytes compares equal even though the first delivery
+// stamped them.
+type reportContentView struct {
+	Path     string             `json:"path"`
+	Tests    int                `json:"tests"`
+	Failures int                `json:"failures"`
+	Errors   int                `json:"errors"`
+	Skipped  int                `json:"skipped"`
+	Duration float64            `json:"duration"`
+	Cases    []model.TestResult `json:"cases"`
+}
+
+// sameTestReportContent reports whether two reports carry the same
+// client-authored content. It is the memory-mode digest conflict check: a
+// reused delivery ID with different content must be refused, while an
+// identical replay is idempotent.
+func sameTestReportContent(a, b model.TestReport) bool {
+	ab, aerr := json.Marshal(reportContentView{Path: a.Path, Tests: a.Tests, Failures: a.Failures, Errors: a.Errors, Skipped: a.Skipped, Duration: a.Duration, Cases: a.Cases})
+	bb, berr := json.Marshal(reportContentView{Path: b.Path, Tests: b.Tests, Failures: b.Failures, Errors: b.Errors, Skipped: b.Skipped, Duration: b.Duration, Cases: b.Cases})
+	return aerr == nil && berr == nil && bytes.Equal(ab, bb)
 }
 
 func (s *Server) listTestReports(w http.ResponseWriter, r *http.Request) {
@@ -151,16 +295,22 @@ const testHistoryFlakyLimit = 1000
 // testIntelligence reports flaky-test history and report volume for one
 // repository. The repo query parameter is required and accepts the
 // human-readable full name, the canonical RepoID or the legacy canonical
-// form: reports are keyed by run and matched through the run's canonical
-// repository identity, so a control plane hosting many repositories — or
-// two forges presenting the same bare name — never leaks cross-repo test
-// history.
+// form. The query is only candidate discovery: one bare name can address
+// several forges, so every resolved canonical repository ID is authorized
+// INDIVIDUALLY through canReadRepo (auth.CanReadRepo) and the aggregates are
+// read from the authorized canonical-ID set ONLY. The bare query form is
+// never re-injected into an aggregate predicate, so a principal granted one
+// forge's repository can never receive another forge's test history.
 func (s *Server) testIntelligence(w http.ResponseWriter, r *http.Request) {
 	repo := r.URL.Query().Get("repo")
 	if repo == "" {
 		http.Error(w, "repo query parameter is required (e.g. ?repo=owner/name)", http.StatusBadRequest)
 		return
 	}
+	// Coarse gate: the principal must be able to address the query form at
+	// all. This is deliberately NOT the authorization decision for the data
+	// (a bare name is not a repository identity); the resolved canonical IDs
+	// are authorized one by one below.
 	if !s.requireAction(w, r, auth.ActionRead, auth.CanonicalRepoID("", repo), false) {
 		return
 	}
@@ -168,10 +318,12 @@ func (s *Server) testIntelligence(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	historyKeys := map[string]bool{repo: true}
+	historyKeys := map[string]bool{}
 	if s.DB != nil {
-		// Incremental path: resolve the query to canonical repository IDs
-		// with one bounded set-based run query, then read ONLY those
+		// Incremental path: resolve the query to CANDIDATE canonical
+		// repository IDs with one bounded set-based run query, authorize
+		// each candidate through canReadRepo and drop the unauthorized ones
+		// BEFORE any aggregate read, then read ONLY the authorized
 		// repositories' aggregates and report totals. Unrelated reports are
 		// never materialized and their payloads are never parsed.
 		if agg, ok := s.DB.(storage.TestHistoryAggregateStore); ok {
@@ -180,10 +332,12 @@ func (s *Server) testIntelligence(w http.ResponseWriter, r *http.Request) {
 				s.internalError(w, r, err, "")
 				return
 			}
+			authorized := s.authorizedTestHistoryRepoIDs(r, ids)
 			// Lazy repair: repositories whose aggregates predate migration
 			// 0026 are rebuilt once from their durable reports (explicit
-			// bounded maintenance), never per upload.
-			for _, id := range ids {
+			// bounded maintenance), never per upload. Unauthorized candidates
+			// are neither repaired nor read.
+			for _, id := range authorized {
 				if r.Context().Err() != nil {
 					break
 				}
@@ -191,12 +345,15 @@ func (s *Server) testIntelligence(w http.ResponseWriter, r *http.Request) {
 					s.logError("test history: repository repair failed", "repo", id, "error", err.Error())
 				}
 			}
-			reports, tests, failures, err := agg.TestReportTotals(r.Context(), ids, repo)
+			// The totals predicate is the authorized canonical set ONLY; the
+			// bare query form is empty here on purpose (it belongs to
+			// resolution, which is allowed to find candidates across forges).
+			reports, tests, failures, err := agg.TestReportTotals(r.Context(), authorized, "")
 			if err != nil {
 				s.internalError(w, r, err, "")
 				return
 			}
-			flaky, err := agg.FlakyTestNames(r.Context(), ids, testHistoryFlakyLimit)
+			flaky, err := agg.FlakyTestNames(r.Context(), authorized, testHistoryFlakyLimit)
 			if err != nil {
 				s.internalError(w, r, err, "")
 				return
@@ -226,10 +383,17 @@ func (s *Server) testIntelligence(w http.ResponseWriter, r *http.Request) {
 		filtered := make([]model.TestReport, 0, len(reports))
 		for _, rep := range reports {
 			run, gerr := s.DB.GetRun(r.Context(), rep.RunID)
-			if gerr == nil && runMatchesRepoQuery(run, repo) {
-				filtered = append(filtered, rep)
-				historyKeys[repoIDForRun(run)] = true
+			if gerr != nil || !runMatchesRepoQuery(run, repo) {
+				continue
 			}
+			// The human name matching the query is not enough: the run's
+			// canonical repository must itself be readable.
+			repoID := repoIDForRun(run)
+			if repoID == "" || !s.canReadRepo(r, repoID) {
+				continue
+			}
+			filtered = append(filtered, rep)
+			historyKeys[repoID] = true
 		}
 		out := summarizeTestIntelligence(filtered)
 		out["repo"] = repo
@@ -241,17 +405,49 @@ func (s *Server) testIntelligence(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.Unlock()
 	filtered := []model.TestReport{}
 	for _, rep := range s.reports {
-		if run, ok := s.runs[rep.RunID]; ok && runMatchesRepoQuery(run, repo) {
-			filtered = append(filtered, rep)
-			historyKeys[repoIDForRun(run)] = true
+		run, ok := s.runs[rep.RunID]
+		if !ok || !runMatchesRepoQuery(run, repo) {
+			continue
 		}
+		// The human name matching the query is not enough: the run's
+		// canonical repository must itself be readable, so two forges
+		// presenting the same bare name never share an answer.
+		repoID := repoIDForRun(run)
+		if repoID == "" || !s.canReadRepo(r, repoID) {
+			continue
+		}
+		filtered = append(filtered, rep)
+		historyKeys[repoID] = true
 	}
 	out := summarizeTestIntelligence(filtered)
 	out["repo"] = repo
 	// The snapshot is taken under s.mu (memory-mode history writes hold it)
-	// and answers every key of this response.
+	// and answers every key of this response. Only the AUTHORIZED canonical
+	// keys collected above are merged; the raw query form is never a key.
 	s.mergeHistoryFlakyKeys(s.cachedHistory(repo), historyKeys, out)
 	writeJSON(w, http.StatusOK, out)
+}
+
+// authorizedTestHistoryRepoIDs filters resolved candidate canonical repository
+// IDs down to the ones THIS request's principal may read, with one
+// canReadRepo decision per canonical ID (auth.CanReadRepo). Resolution is
+// intentionally permissive — a bare alias must still find every repository
+// that presents the name — so authorization can never be inherited from the
+// query string: a principal granted one forge's repository receives only that
+// forge's IDs, and the aggregate reads below never see the others. With no
+// principal (legacy mode/web session) the outer tier decides, so every ID
+// passes.
+func (s *Server) authorizedTestHistoryRepoIDs(r *http.Request, ids []string) []string {
+	authorized := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		if s.canReadRepo(r, id) {
+			authorized = append(authorized, id)
+		}
+	}
+	return authorized
 }
 
 // runMatchesRepoQuery reports whether a test-intelligence query addresses a
@@ -268,13 +464,40 @@ func runMatchesRepoQuery(run model.Run, query string) bool {
 	return query == auth.CanonicalRepoID("", run.RepoFullName)
 }
 
+// testOutcomeIdentity is the structured identity of one report-derived test
+// outcome: the suite (the report's job key) plus the case's class and name.
+// The persisted history model keys on (repo, suite, class, name), so the
+// report-derived fold must keep the suite too: two different suites can each
+// contain a case named "pkg.TestX", and merging them by class.name alone
+// would let one suite's failures classify the other suite's clean test as
+// flaky.
+type testOutcomeIdentity struct {
+	suite string
+	class string
+	name  string
+}
+
+// renderTestOutcomeName renders one structured identity as the API's display
+// name: "name" for an empty class, "class.name" otherwise. The suite is NOT
+// part of the rendered name (the API has always presented class.name); it is
+// only part of the internal key.
+func renderTestOutcomeName(k testOutcomeIdentity) string {
+	if k.class == "" {
+		return k.name
+	}
+	return k.class + "." + k.name
+}
+
 // summarizeTestIntelligence computes the flaky-test summary from an explicit
 // report list (both the DB and the in-memory path feed pre-filtered lists).
 // Each test's outcomes are folded in deterministic report order (created_at,
 // then id) into the SAME bounded 16-outcome window the persisted history and
 // the SQL aggregates use, so the report-derived set cannot keep a test that
 // dropped out of its window — the shard, API and aggregate flaky semantics
-// stay aligned.
+// stay aligned. Outcomes are keyed by the full (suite, class, name) identity
+// and rendered as class.name only at output; the same class.name in two
+// suites therefore keeps two independent windows, and the rendered list is
+// deduplicated.
 func summarizeTestIntelligence(reports []model.TestReport) map[string]any {
 	ordered := append([]model.TestReport(nil), reports...)
 	sort.SliceStable(ordered, func(i, j int) bool {
@@ -283,16 +506,13 @@ func summarizeTestIntelligence(reports []model.TestReport) map[string]any {
 		}
 		return ordered[i].ID < ordered[j].ID
 	})
-	history := map[string][]bool{}
+	history := map[testOutcomeIdentity][]bool{}
 	var tests, failures int
 	for _, rep := range ordered {
 		tests += rep.Tests
 		failures += rep.Failures
 		for _, c := range rep.Cases {
-			key := c.Name
-			if c.Class != "" {
-				key = c.Class + "." + c.Name
-			}
+			key := testOutcomeIdentity{suite: rep.JobKey, class: c.Class, name: c.Name}
 			window := append(history[key], c.Passed)
 			if len(window) > testintel.OutcomeWindow {
 				window = window[len(window)-testintel.OutcomeWindow:]
@@ -300,11 +520,15 @@ func summarizeTestIntelligence(reports []model.TestReport) map[string]any {
 			history[key] = window
 		}
 	}
-	flaky := []string{}
-	for name, results := range history {
+	flakySet := map[string]bool{}
+	for key, results := range history {
 		if testintel.FlakeProbability(results) > 0 {
-			flaky = append(flaky, name)
+			flakySet[renderTestOutcomeName(key)] = true
 		}
+	}
+	flaky := make([]string, 0, len(flakySet))
+	for name := range flakySet {
+		flaky = append(flaky, name)
 	}
 	sort.Strings(flaky)
 	return map[string]any{

@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cas"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/snapshot"
@@ -360,8 +361,22 @@ func verifyStoredSnapshot(ctx context.Context, c *cas.CAS, digest string, wantSi
 // does not touch the global server mutex. Production leaves it a no-op.
 var snapshotListMemoryLock = func() {}
 
+// requireRunAdmin enforces the admin action for the workspace snapshot
+// archive download, scoped by the run's canonical policy identity
+// (repoIDForRun). The repository resolution keeps the decision anchored to
+// the addressed run instead of a blanket gate, while auth.Authorize makes
+// ActionAdmin unsatisfiable by any repository grant: only the global admin
+// role (or the admin token, which carries no principal) passes. A
+// non-admin authenticated principal is answered 403 by requireAction.
+func (s *Server) requireRunAdmin(w http.ResponseWriter, r *http.Request, run model.Run) bool {
+	return s.requireAction(w, r, auth.ActionAdmin, repoIDForRun(run), false)
+}
+
 // listSnapshots is GET /api/v1/runs/{id}/snapshots: the manifests of every
-// snapshot uploaded by the run's jobs. DB mode reads the SQL records
+// snapshot uploaded by the run's jobs. The metadata listing is read tier
+// (requireRunRead): the records carry no archive contents and no local path
+// (redactSnapshot strips it). Only the archive DOWNLOAD is admin tier.
+// DB mode reads the SQL records
 // (SnapshotStore) as the single source of truth; memory mode reads the
 // in-memory map. Neither mode holds s.mu across a store call, response
 // serialization or a client write: the DB branch touches no in-memory state,
@@ -436,9 +451,16 @@ func (s *Server) snapshotRecordsForRunLocked(runID string) []model.SnapshotRecor
 }
 
 // downloadSnapshot is GET /api/v1/runs/{id}/snapshots/{sid}: streams one
-// uploaded workspace snapshot archive for replay/debugging (admin tier).
-// DB mode resolves the record through SnapshotStore and the bytes from CAS
-// by digest (any replica); memory mode streams the node-local archive.
+// uploaded workspace snapshot archive for replay/debugging (admin tier). The
+// archive is the full private workspace (checkout, generated and
+// secret-derived files), so the download demands the admin action
+// (requireRunAdmin, auth.ActionAdmin) — a repository read or artifact_read
+// grant is not enough — while the route map in auth.ActionFor classifies
+// exactly this path as ActionAdmin. The decision is scoped to the run's
+// canonical repository identity (repoIDForRun) and the record must belong to
+// the addressed run. DB mode resolves the record through SnapshotStore and
+// the bytes from CAS by digest (any replica); memory mode streams the
+// node-local archive.
 func (s *Server) downloadSnapshot(w http.ResponseWriter, r *http.Request) {
 	if s.DB != nil {
 		s.downloadSnapshotDB(w, r)
@@ -461,7 +483,7 @@ func (s *Server) downloadSnapshot(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if !s.requireRunRead(w, r, run) {
+	if !s.requireRunAdmin(w, r, run) {
 		return
 	}
 	f, err := os.Open(rec.Path)
@@ -481,8 +503,9 @@ func (s *Server) downloadSnapshot(w http.ResponseWriter, r *http.Request) {
 // downloadSnapshotDB streams one snapshot in DB mode: the record comes
 // from the SnapshotStore (not the in-memory map) and the archive bytes
 // from CAS by digest, so a fresh replica with the same store+CAS serves
-// the download. Records with a node-local Path (legacy) fall back to the
-// local file.
+// the download. Like the memory path it is admin tier — requireRunAdmin
+// resolves the run's canonical repository before the admin decision — and
+// records with a node-local Path (legacy) fall back to the local file.
 func (s *Server) downloadSnapshotDB(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	runID := r.PathValue("id")
@@ -496,7 +519,7 @@ func (s *Server) downloadSnapshotDB(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, r, err, "")
 		return
 	}
-	if !s.requireRunRead(w, r, run) {
+	if !s.requireRunAdmin(w, r, run) {
 		return
 	}
 	ss, ok := s.DB.(storage.SnapshotStore)

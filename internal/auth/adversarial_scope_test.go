@@ -49,14 +49,86 @@ func TestAuthorizeAmbiguousBareLookupFailsClosed(t *testing.T) {
 			t.Fatal("ambiguous inverted lookup granted trusted_run")
 		}
 	}
-	// Ambiguity must not silently widen role-derived grants either: the
-	// role fallback still applies for repos with no usable entry.
+	// Ambiguity is a CONFLICT, not a missing entry: the global read role
+	// must not resurrect the decision for the disputed bare identity.
 	role := Principal{Subject: "bot", Roles: []Role{RoleRead}, Repositories: map[string]RepositoryPermission{
 		"github.com/o/r": {Read: false},
 		"gitlab.com/o/r": {Read: true},
 	}}
-	if !Authorize(role, ActionRead, "o/r", false) {
-		t.Fatal("role fallback must still apply when the bare lookup is ambiguous")
+	for i := 0; i < 256; i++ {
+		if Authorize(role, ActionRead, "o/r", false) {
+			t.Fatal("ambiguous bare lookup fell through to the global read role")
+		}
+	}
+	// A canonical spelling still resolves deterministically: the explicit
+	// deny denies, the explicit grant grants.
+	if Authorize(role, ActionRead, "github.com/o/r", false) {
+		t.Fatal("canonical explicit deny ignored")
+	}
+	if !Authorize(role, ActionRead, "gitlab.com/o/r", false) {
+		t.Fatal("canonical explicit grant ignored")
+	}
+}
+
+// TestRepoEntryTriState pins the resolution contract directly: only a
+// repository the map does not mention is RepoNoEntry; canonically equivalent
+// keys with different permission sets are RepoConflict no matter which
+// spelling is looked up, and identical duplicate spellings collapse to one
+// RepoFound entry.
+func TestRepoEntryTriState(t *testing.T) {
+	conflict := Principal{Subject: "bot", Roles: []Role{RoleRead}, Repositories: map[string]RepositoryPermission{
+		"GITHUB.COM/acme/service":     {Read: true},
+		"github.com:443/acme/service": {Read: false},
+		"github.com/acme/other":       {},
+	}}
+	for _, repo := range []string{"github.com/acme/service", "GITHUB.COM:443/acme/service", "acme/service"} {
+		if _, res := conflict.repoEntry(repo); res != RepoConflict {
+			t.Fatalf("repoEntry(%q) = %v, want RepoConflict", repo, res)
+		}
+	}
+	if _, res := conflict.repoEntry("github.com/acme/other"); res != RepoFound {
+		t.Fatalf("single-entry repo = %v, want RepoFound", res)
+	}
+	if _, res := conflict.repoEntry("github.com/acme/third"); res != RepoNoEntry {
+		t.Fatalf("unmentioned repo = %v, want RepoNoEntry", res)
+	}
+	if _, res := lookupRepoEntry(conflict.Repositories, "github.com/acme/service"); res != RepoConflict {
+		t.Fatalf("lookupRepoEntry conflict = %v, want RepoConflict", res)
+	}
+	if _, res := lookupRepoEntry(conflict.Repositories, "github.com/acme/third"); res != RepoNoEntry {
+		t.Fatalf("lookupRepoEntry miss = %v, want RepoNoEntry", res)
+	}
+
+	// Identical duplicate spellings are ONE entry, not a conflict.
+	same := Principal{Subject: "bot", Repositories: map[string]RepositoryPermission{
+		"github.com/acme/service":     {Read: true},
+		"GitHub.COM:443/acme/service": {Read: true},
+	}}
+	for _, repo := range []string{"github.com/acme/service", "acme/service"} {
+		perm, res := same.repoEntry(repo)
+		if res != RepoFound || !perm.Read {
+			t.Fatalf("identical duplicates repoEntry(%q) = (%+v, %v), want a single read entry", repo, perm, res)
+		}
+	}
+
+	// Conflicting duplicate spellings of one canonical key are a conflict
+	// through the bare lookup too (the dedupe must compare, not skip).
+	dup := Principal{Subject: "bot", Repositories: map[string]RepositoryPermission{
+		"github.com/acme/service":     {Read: true},
+		"GitHub.COM:443/acme/service": {Read: false},
+	}}
+	if _, res := dup.repoEntry("acme/service"); res != RepoConflict {
+		t.Fatalf("duplicate spelling conflict = %v, want RepoConflict", res)
+	}
+
+	// RepoPerm reports nothing for a conflicting repository instead of
+	// widening it with role-derived permissions.
+	if got := conflict.RepoPerm("github.com/acme/service"); got != (RepositoryPermission{}) {
+		t.Fatalf("RepoPerm(conflict) = %+v, want the empty permission set", got)
+	}
+	// RepoPerm still derives roles for unmentioned repositories.
+	if got := conflict.RepoPerm("github.com/acme/third"); !got.Read {
+		t.Fatalf("RepoPerm(unmentioned) = %+v, want role-derived read", got)
 	}
 }
 

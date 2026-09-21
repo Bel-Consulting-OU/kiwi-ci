@@ -37,7 +37,9 @@ func TestActionForMapping(t *testing.T) {
 		{"GET", "/api/v1/runs/r1/tests", ActionRead, true},
 		{"GET", "/api/v1/runs/r1/deployments", ActionRead, true},
 		{"GET", "/api/v1/runs/r1/snapshots", ActionRead, true},
-		{"GET", "/api/v1/runs/r1/snapshots/s1", ActionRead, true},
+		// The archive download is admin tier while the metadata listing above
+		// stays read tier.
+		{"GET", "/api/v1/runs/r1/snapshots/s1", ActionAdmin, true},
 		{"GET", "/api/v1/runs/r1/artifacts", ActionArtifactRead, true},
 		{"GET", "/api/v1/artifacts/a1", ActionArtifactRead, true},
 		{"GET", "/api/v1/artifacts/a1/provenance", ActionArtifactRead, true},

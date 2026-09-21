@@ -64,7 +64,7 @@ func TestFinalSeamCloseTempFailures(t *testing.T) {
 		t.Fatalf("restoreDownloads = %v", err)
 	}
 	// uploadJobSnapshot: the close failure is wrapped as a snapshot error.
-	if err := r.uploadJobSnapshot(context.Background(), basicTask(payloadPipeline), t.TempDir()); err == nil || !strings.Contains(err.Error(), "snapshot close") {
+	if err := r.uploadJobSnapshot(context.Background(), basicTask(payloadPipeline), t.TempDir(), 0); err == nil || !strings.Contains(err.Error(), "snapshot close") {
 		t.Fatalf("uploadJobSnapshot = %v", err)
 	}
 }

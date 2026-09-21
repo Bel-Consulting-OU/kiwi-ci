@@ -166,6 +166,7 @@ var (
 	_ EnrollGrantStore          = (*FaultyStore)(nil)
 	_ TestHistoryStore          = (*FaultyStore)(nil)
 	_ TestHistoryAggregateStore = (*FaultyStore)(nil)
+	_ TestReportDeliveryStore   = (*FaultyStore)(nil)
 	_ RunnerDisableStore        = (*FaultyStore)(nil)
 	_ ArtifactIdempotentStore   = (*FaultyStore)(nil)
 	_ GeneratedFragmentStore    = (*FaultyStore)(nil)
@@ -1440,6 +1441,23 @@ func (f *FaultyStore) InsertTestReportWithHistory(ctx context.Context, rep model
 	return inner.InsertTestReportWithHistory(ctx, rep, repoID)
 }
 
+// InsertTestReportWithHistoryDelivery mirrors the wrapper contract for the
+// delivery-keyed upload: the injected fault surfaces exactly like the
+// non-delivery variant, otherwise the inner store's idempotent transaction
+// runs unchanged.
+func (f *FaultyStore) InsertTestReportWithHistoryDelivery(ctx context.Context, rep model.TestReport, repoID string, delivery TestReportDelivery) (TestReportInsertOutcome, error) {
+	inner, ok := f.Inner.(TestReportDeliveryStore)
+	if !ok {
+		return TestReportInsertOutcome{}, errMissingInnerInterface("TestReportDeliveryStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return TestReportInsertOutcome{}, err
+	}
+	return inner.InsertTestReportWithHistoryDelivery(ctx, rep, repoID, delivery)
+}
+
 func (f *FaultyStore) LoadRepoTestHistory(ctx context.Context, repoID string) (int64, []byte, error) {
 	inner, ok := f.Inner.(TestHistoryAggregateStore)
 	if !ok {
@@ -1553,6 +1571,10 @@ type memStore struct {
 	// repository-scoped contract.
 	historyAggregates map[string]map[string]TestHistoryAggregate
 	historyVersions   map[string]int64
+	// reportDeliveries mirrors migration 0029's test_report_deliveries rows:
+	// the durable report-delivery receipts that make a retried upload
+	// idempotent. Keyed by (job, lease generation, delivery ID).
+	reportDeliveries map[string]memReportDelivery
 
 	// enqueueFaultOps, when > 0, makes the next InsertCompiledRun fail after
 	// staging that many operations (superseded cancellations first, then
@@ -1647,6 +1669,7 @@ func newMemStore() *memStore {
 		grants:            map[string]EnrollGrantRecord{},
 		historyAggregates: map[string]map[string]TestHistoryAggregate{},
 		historyVersions:   map[string]int64{},
+		reportDeliveries:  map[string]memReportDelivery{},
 		undecodableJobs:   map[string]bool{},
 	}
 	// The in-memory store models a single-process replica that always holds
@@ -1691,6 +1714,7 @@ var (
 	_ EnrollGrantStore          = (*memStore)(nil)
 	_ TestHistoryStore          = (*memStore)(nil)
 	_ TestHistoryAggregateStore = (*memStore)(nil)
+	_ TestReportDeliveryStore   = (*memStore)(nil)
 	_ RunnerDisableStore        = (*memStore)(nil)
 	_ LeaderFenceStore          = (*memStore)(nil)
 	_ RecoveryStore             = (*memStore)(nil)
@@ -4695,15 +4719,54 @@ func memHistoryKey(suite, class, name string) string {
 	return suite + "\x00" + class + "\x00" + name
 }
 
+// memReportDelivery is one in-memory test_report_deliveries row (migration
+// 0029): the server-computed payload digest and the report ID of a committed
+// delivery.
+type memReportDelivery struct {
+	digest   string
+	reportID string
+}
+
+// memReportDeliveryKey is the in-memory analogue of the (job_id,
+// lease_generation, delivery_id) primary key.
+func memReportDeliveryKey(jobID string, generation int64, deliveryID string) string {
+	return jobID + "\x00" + strconv.FormatInt(generation, 10) + "\x00" + deliveryID
+}
+
+// InsertTestReportWithHistory mirrors the SQL contract without a database; it
+// is the legacy (non-idempotent) entry point.
 func (m *memStore) InsertTestReportWithHistory(ctx context.Context, rep model.TestReport, repoID string) (int64, error) {
-	if err := ctx.Err(); err != nil {
+	outcome, err := m.InsertTestReportWithHistoryDelivery(ctx, rep, repoID, TestReportDelivery{})
+	if err != nil {
 		return 0, err
 	}
+	return outcome.Version, nil
+}
+
+// InsertTestReportWithHistoryDelivery mirrors the SQL delivery transaction:
+// report append, aggregate fold and the (job, generation, delivery ID)
+// receipt commit together under the store lock. A replayed identical
+// delivery returns the original report ID without appending or folding;
+// a reused delivery ID with a different digest is a conflict.
+func (m *memStore) InsertTestReportWithHistoryDelivery(ctx context.Context, rep model.TestReport, repoID string, delivery TestReportDelivery) (TestReportInsertOutcome, error) {
+	if err := ctx.Err(); err != nil {
+		return TestReportInsertOutcome{}, err
+	}
 	if repoID == "" {
-		return 0, fmt.Errorf("storage: test history repository identity is required")
+		return TestReportInsertOutcome{}, fmt.Errorf("storage: test history repository identity is required")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if delivery.DeliveryID != "" {
+		key := memReportDeliveryKey(delivery.JobID, delivery.LeaseGeneration, delivery.DeliveryID)
+		if existing, ok := m.reportDeliveries[key]; ok {
+			if existing.digest != delivery.ContentDigest {
+				return TestReportInsertOutcome{}, fmt.Errorf("%w: job %s generation %d delivery %s", ErrTestReportDeliveryConflict, delivery.JobID, delivery.LeaseGeneration, delivery.DeliveryID)
+			}
+			return TestReportInsertOutcome{Replay: true, ReportID: existing.reportID}, nil
+		}
+		m.reportDeliveries[key] = memReportDelivery{digest: delivery.ContentDigest, reportID: rep.ID}
+	}
 	m.reports = append(m.reports, rep)
 	rows := m.historyAggregates[repoID]
 	if rows == nil {
@@ -4717,7 +4780,7 @@ func (m *memStore) InsertTestReportWithHistory(ctx context.Context, rep model.Te
 		rows[key] = FoldTestHistoryAggregate(row, TestHistoryEntry{Suite: rep.JobKey, Class: c.Class, Name: c.Name, Duration: c.Duration, Passed: c.Passed, When: rep.CreatedAt})
 	}
 	m.historyVersions[repoID]++
-	return m.historyVersions[repoID], nil
+	return TestReportInsertOutcome{Version: m.historyVersions[repoID], ReportID: rep.ID}, nil
 }
 
 func (m *memStore) LoadRepoTestHistory(ctx context.Context, repoID string) (int64, []byte, error) {
@@ -4786,12 +4849,21 @@ func (m *memStore) ResolveTestHistoryRepoIDs(ctx context.Context, query string, 
 	return out, nil
 }
 
+// TestReportTotals mirrors the SQL contract: totals over EXACTLY the supplied
+// canonical repository IDs, with no bare-name predicate (the full-name
+// fallback belongs only to ResolveTestHistoryRepoIDs, which is candidate
+// discovery). An empty set answers zero.
 func (m *memStore) TestReportTotals(ctx context.Context, repoIDs []string, repoQuery string) (int, int, int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	ids := map[string]bool{}
 	for _, id := range repoIDs {
-		ids[id] = true
+		if strings.TrimSpace(id) != "" {
+			ids[id] = true
+		}
+	}
+	if len(ids) == 0 {
+		return 0, 0, 0, nil
 	}
 	var reports, tests, failures int
 	for _, rep := range m.reports {
@@ -4799,7 +4871,7 @@ func (m *memStore) TestReportTotals(ctx context.Context, repoIDs []string, repoQ
 		if !ok {
 			continue
 		}
-		if !ids[RepoIDForRun(run)] && !memRunMatchesRepoQuery(run, repoQuery) {
+		if !ids[RepoIDForRun(run)] {
 			continue
 		}
 		reports++

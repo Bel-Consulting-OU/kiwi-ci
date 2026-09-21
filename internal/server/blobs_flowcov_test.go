@@ -145,6 +145,15 @@ func (f *fcStore) InsertTestReportWithHistory(ctx context.Context, rep model.Tes
 	return f.dbFakeStore.InsertTestReportWithHistory(ctx, rep, repoID)
 }
 
+// InsertTestReportWithHistoryDelivery keeps the insertReportHistErr fault
+// injection on the delivery-keyed path the handler prefers.
+func (f *fcStore) InsertTestReportWithHistoryDelivery(ctx context.Context, rep model.TestReport, repoID string, delivery storage.TestReportDelivery) (storage.TestReportInsertOutcome, error) {
+	if f.insertReportHistErr != nil {
+		return storage.TestReportInsertOutcome{}, f.insertReportHistErr
+	}
+	return f.dbFakeStore.InsertTestReportWithHistoryDelivery(ctx, rep, repoID, delivery)
+}
+
 func (f *fcStore) LoadRepoTestHistory(ctx context.Context, repoID string) (int64, []byte, error) {
 	if f.loadRepoHistoryErr != nil {
 		return 0, nil, f.loadRepoHistoryErr

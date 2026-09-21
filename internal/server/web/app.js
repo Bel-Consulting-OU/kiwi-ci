@@ -12,13 +12,21 @@
 
 (() => {
   const POLL_MS = 4000;
-  const state = { csrf: "", authed: false, selectedRun: null };
+  const state = {
+    csrf: "",
+    authed: false,
+    selectedRun: null,
+    nextCursor: "",
+    loadedRuns: [],
+    paged: false,
+  };
 
   const $ = (sel) => document.querySelector(sel);
   const conn = $("#conn");
   const loginForm = $("#login");
   const logoutBtn = $("#logout");
   const statsEl = $("#stats");
+  const runsTable = $("#runs");
   const runsBody = $("#runs tbody");
   const jobsBody = $("#jobs tbody");
   const detail = $("#detail");
@@ -69,6 +77,10 @@
   function setSignedOut() {
     state.authed = false;
     state.csrf = "";
+    state.selectedRun = null;
+    state.paged = false;
+    state.loadedRuns = [];
+    setNextCursor("");
     loginForm.classList.remove("hidden");
     logoutBtn.classList.add("hidden");
     detail.classList.add("hidden");
@@ -154,44 +166,106 @@
     }
   }
 
+  // runRow renders one run exactly as before: createElement/textContent only.
+  function runRow(run) {
+    const tr = el("tr");
+    tr.appendChild(el("td", "muted", run.id));
+    const tdStatus = el("td");
+    tdStatus.appendChild(statusPill(run.status));
+    tr.appendChild(tdStatus);
+    tr.appendChild(el("td", null, run.event));
+    tr.appendChild(el("td", null, run.repo || run.repo_full_name));
+    tr.appendChild(el("td", null, run.trusted ? "yes" : "no"));
+    tr.appendChild(el("td", "muted", age(run.created_at)));
+    const tdCancel = el("td");
+    if (state.authed && !isTerminal(run.status)) {
+      const btn = el("button", null, "Cancel");
+      btn.addEventListener("click", async (ev) => {
+        ev.stopPropagation();
+        try {
+          await api("/api/v1/runs/" + encodeURIComponent(run.id) + "/cancel", {
+            method: "POST",
+            body: "{}",
+          });
+          refresh();
+        } catch (err) {
+          showError("Cancel failed: " + err.message);
+        }
+      });
+      tdCancel.appendChild(btn);
+    }
+    tr.appendChild(tdCancel);
+    tr.addEventListener("click", () => selectRun(run.id));
+    return tr;
+  }
+
+  function appendRuns(runs) {
+    for (const run of runs) runsBody.appendChild(runRow(run));
+  }
+
   function renderRuns(runs) {
     renderStats(runs);
     runsBody.replaceChildren();
-    for (const run of runs) {
-      const tr = el("tr");
-      tr.appendChild(el("td", "muted", run.id));
-      const tdStatus = el("td");
-      tdStatus.appendChild(statusPill(run.status));
-      tr.appendChild(tdStatus);
-      tr.appendChild(el("td", null, run.event));
-      tr.appendChild(el("td", null, run.repo || run.repo_full_name));
-      tr.appendChild(el("td", null, run.trusted ? "yes" : "no"));
-      tr.appendChild(el("td", "muted", age(run.created_at)));
-      const tdCancel = el("td");
-      if (state.authed && !isTerminal(run.status)) {
-        const btn = el("button", null, "Cancel");
-        btn.addEventListener("click", async (ev) => {
-          ev.stopPropagation();
-          try {
-            await api("/api/v1/runs/" + encodeURIComponent(run.id) + "/cancel", {
-              method: "POST",
-              body: "{}",
-            });
-            refresh();
-          } catch (err) {
-            showError("Cancel failed: " + err.message);
-          }
-        });
-        tdCancel.appendChild(btn);
-      }
-      tr.appendChild(tdCancel);
-      tr.addEventListener("click", () => selectRun(run.id));
-      runsBody.appendChild(tr);
-    }
+    appendRuns(runs);
   }
 
   function isTerminal(status) {
     return ["success", "failure", "cancelled", "skipped", "blocked"].indexOf(status) >= 0;
+  }
+
+  // The "Load older runs" control appends exactly one keyset page per click.
+  // The next page is fetched with the opaque X-Kiwi-Next-Cursor value from the
+  // previous response; the control hides on the page that reports no further
+  // rows. It never walks pages on its own.
+  const loadOlderBtn = el("button", "load-older hidden", "Load older runs");
+  loadOlderBtn.addEventListener("click", loadOlderRuns);
+  runsTable.parentNode.insertBefore(loadOlderBtn, runsTable.nextSibling);
+
+  function setNextCursor(cursor) {
+    state.nextCursor = cursor || "";
+    loadOlderBtn.classList.toggle("hidden", !state.nextCursor);
+  }
+
+  // runsPage returns one collection page: its parsed run array plus the next
+  // cursor header, which is absent exactly on the last page.
+  async function runsPage(cursor) {
+    const path = cursor
+      ? "/api/v1/runs?cursor=" + encodeURIComponent(cursor)
+      : "/api/v1/runs";
+    const resp = await fetch(path, { credentials: "same-origin" });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      throw new Error(resp.status + " " + (text || resp.statusText));
+    }
+    return {
+      runs: await resp.json(),
+      nextCursor: resp.headers.get("X-Kiwi-Next-Cursor") || "",
+    };
+  }
+
+  async function loadOlderRuns() {
+    if (!state.nextCursor || loadOlderBtn.disabled) return;
+    const cursor = state.nextCursor;
+    loadOlderBtn.disabled = true;
+    try {
+      const page = await runsPage(cursor);
+      setConn(true);
+      showError("");
+      // Appending preserves the collection's newest-first order, and the stats
+      // cover every loaded run. Auto-refresh pauses while older pages are
+      // shown (see the interval below), so this page is not replaced under the
+      // reader; Refresh returns to the newest page explicitly.
+      state.paged = true;
+      state.loadedRuns = state.loadedRuns.concat(page.runs);
+      appendRuns(page.runs);
+      renderStats(state.loadedRuns);
+      setNextCursor(page.nextCursor);
+    } catch (err) {
+      if (String(err.message).indexOf("401") >= 0) setSignedOut();
+      else showError("Could not load older runs: " + err.message);
+    } finally {
+      loadOlderBtn.disabled = false;
+    }
   }
 
   async function selectRun(runID) {
@@ -224,10 +298,13 @@
 
   async function refresh() {
     try {
-      const runs = await api("/api/v1/runs");
+      const page = await runsPage("");
       setConn(true);
       showError("");
-      renderRuns(runs);
+      state.paged = false;
+      state.loadedRuns = page.runs;
+      renderRuns(page.runs);
+      setNextCursor(page.nextCursor);
       if (state.selectedRun) selectRun(state.selectedRun);
     } catch (err) {
       setConn(false);
@@ -238,5 +315,9 @@
   $("#refresh").addEventListener("click", refresh);
 
   refresh();
-  setInterval(refresh, POLL_MS);
+  setInterval(() => {
+    // Auto-refresh keeps the newest page current until the reader loads older
+    // runs: then the table is left alone so the appended pages survive.
+    if (!state.paged) refresh();
+  }, POLL_MS);
 })();

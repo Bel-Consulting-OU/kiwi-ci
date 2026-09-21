@@ -206,20 +206,20 @@ func TestParseMaskedErrorAndSystemErr(t *testing.T) {
 }
 
 func TestTruncateFailureLimits(t *testing.T) {
-	big := strings.Repeat("m", maxMessageLen+100)
+	big := strings.Repeat("m", MaxMessageBytes+100)
 	f := &Failure{Message: big, Body: big}
 	truncateFailure(f)
-	if len(f.Message) != maxMessageLen {
+	if len(f.Message) != MaxMessageBytes {
 		t.Fatalf("message len = %d", len(f.Message))
 	}
 	if len(f.Body) != 0 {
 		t.Fatalf("body len = %d, want 0 after the combined cap", len(f.Body))
 	}
 
-	f = &Failure{Message: "short", Body: strings.Repeat("b", maxMessageLen)}
+	f = &Failure{Message: "short", Body: strings.Repeat("b", MaxMessageBytes)}
 	truncateFailure(f)
-	if len(f.Message)+len(f.Body) != maxMessageLen {
-		t.Fatalf("combined len = %d, want %d", len(f.Message)+len(f.Body), maxMessageLen)
+	if len(f.Message)+len(f.Body) != MaxMessageBytes {
+		t.Fatalf("combined len = %d, want %d", len(f.Message)+len(f.Body), MaxMessageBytes)
 	}
 
 	// A nil failure and a small failure are left alone.
@@ -346,18 +346,18 @@ func TestFlakeProbabilityWindow(t *testing.T) {
 }
 
 // TestAggregateRejectsMoreThanMaxJobCases exercises the per-job case cap. It
-// needs more than maxJobCases (500k) cases spread across files, since each
-// file is separately capped at maxReportCases (100k).
+// needs more than MaxJobCases (500k) cases spread across files, since each
+// file is separately capped at MaxReportCases (100k).
 func TestAggregateRejectsMoreThanMaxJobCases(t *testing.T) {
 	ws := t.TempDir()
 	var sb strings.Builder
 	sb.WriteString(`<testsuite name="s">`)
-	for i := 0; i < maxReportCases; i++ {
+	for i := 0; i < MaxReportCases; i++ {
 		sb.WriteString(`<testcase name="t"/>`)
 	}
 	sb.WriteString(`</testsuite>`)
 	body := sb.String()
-	files := maxJobCases/maxReportCases + 1
+	files := MaxJobCases/MaxReportCases + 1
 	for i := 0; i < files; i++ {
 		if err := os.WriteFile(filepath.Join(ws, fmt.Sprintf("f%d.xml", i)), []byte(body), 0o600); err != nil {
 			t.Fatal(err)

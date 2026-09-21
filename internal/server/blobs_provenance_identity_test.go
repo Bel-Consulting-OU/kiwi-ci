@@ -10,8 +10,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/blob"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cas"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/provenance"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
@@ -162,5 +166,213 @@ func TestArtifactUploadProvenanceCarriesFullIdentity(t *testing.T) {
 	}
 	if got := st.Predicate.RunDetails.Metadata.InvocationID; got != "run-c/job-a" {
 		t.Fatalf("provenance invocationId = %q, want run-c/job-a", got)
+	}
+}
+
+// fenceRecorder wraps a cas.Fencer and tracks which digests are currently
+// held, so a test can assert the reachability invariant "every CAS object is
+// fenced from publish through durable reference" for each digest.
+type fenceRecorder struct {
+	inner cas.Fencer
+	mu    sync.Mutex
+	held  map[string]int
+}
+
+func newFenceRecorder() *fenceRecorder {
+	return &fenceRecorder{inner: cas.NewMemFencer(), held: map[string]int{}}
+}
+
+func (f *fenceRecorder) Acquire(ctx context.Context, digest string) (func(), error) {
+	release, err := f.inner.Acquire(ctx, digest)
+	if err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	f.held[digest]++
+	f.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			f.mu.Lock()
+			f.held[digest]--
+			f.mu.Unlock()
+			release()
+		})
+	}, nil
+}
+
+func (f *fenceRecorder) WithFence(ctx context.Context, digest string, fn func() error) error {
+	release, err := f.Acquire(ctx, digest)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return fn()
+}
+
+func (f *fenceRecorder) holds(digest string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.held[digest] > 0
+}
+
+// fenceAuditedBlob records, per CAS Put key, whether that key's digest fence
+// was held at the moment of the Put: an unfenced publication is exactly the
+// defect the fencing contract forbids.
+type fenceAuditedBlob struct {
+	blob.Store
+	fencer *fenceRecorder
+	mu     sync.Mutex
+	order  []string
+	fenced map[string]bool
+}
+
+func (b *fenceAuditedBlob) Put(ctx context.Context, key string, r io.Reader, size int64) (blob.Object, error) {
+	b.mu.Lock()
+	if b.fenced == nil {
+		b.fenced = map[string]bool{}
+	}
+	b.fenced[key] = b.fencer.holds(key)
+	b.order = append(b.order, key)
+	b.mu.Unlock()
+	return b.Store.Put(ctx, key, r, size)
+}
+
+// fenceAuditedStore records whether the durable artifact insert committed
+// while the record's digests were still fenced.
+type fenceAuditedStore struct {
+	*dbFakeStore
+	fencer   *fenceRecorder
+	mu       sync.Mutex
+	unfenced []string
+}
+
+func (st *fenceAuditedStore) InsertArtifactOnce(ctx context.Context, a model.ArtifactRecord) (model.ArtifactRecord, bool, error) {
+	st.mu.Lock()
+	for _, d := range []string{a.SHA256, a.ProvenanceSHA256} {
+		if d != "" && !st.fencer.holds(d) {
+			st.unfenced = append(st.unfenced, d)
+		}
+	}
+	st.mu.Unlock()
+	return st.dbFakeStore.InsertArtifactOnce(ctx, a)
+}
+
+// TestArtifactUploadFencesProvenanceDigest is the C4-C fence regression: the
+// provenance envelope's CAS.Put acquires the provenance digest's fence (the
+// payload digest fence alone covers only the payload), both fences are held
+// through the durable artifact insert, the publication order is payload
+// first then provenance, and every fence is released when the handler
+// returns. A CAS.Put observed without its own digest fence fails the test.
+func TestArtifactUploadFencesProvenanceDigest(t *testing.T) {
+	s, f, mb, hdrs := artifactIdentityFixture(t)
+	recorder := newFenceRecorder()
+	s.digestFence = recorder
+	audit := &fenceAuditedBlob{Store: mb, fencer: recorder}
+	s.SetBlobStore(audit)
+	store := &fenceAuditedStore{dbFakeStore: f, fencer: recorder}
+	s.DB = store
+
+	w := fcUploadBlobArtifact(t, s, hdrs, "payload")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("upload = %d, want 201: %s", w.Code, w.Body.String())
+	}
+	var out model.ArtifactRecord
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.ProvenanceSHA256 == "" || out.ProvenancePath != "cas:"+out.ProvenanceSHA256 {
+		t.Fatalf("provenance references = %q/%q, want a cas: digest", out.ProvenancePath, out.ProvenanceSHA256)
+	}
+	audit.mu.Lock()
+	order := append([]string(nil), audit.order...)
+	fenced := make(map[string]bool, len(audit.fenced))
+	for k, v := range audit.fenced {
+		fenced[k] = v
+	}
+	audit.mu.Unlock()
+	if len(order) != 2 || order[0] != out.SHA256 || order[1] != out.ProvenanceSHA256 {
+		t.Fatalf("CAS publication order = %v, want payload %s then provenance %s", order, out.SHA256, out.ProvenanceSHA256)
+	}
+	for _, digest := range order {
+		if !fenced[digest] {
+			t.Fatalf("CAS.Put for %s ran with no fence held for that digest", digest)
+		}
+	}
+	store.mu.Lock()
+	unfenced := append([]string(nil), store.unfenced...)
+	store.mu.Unlock()
+	if len(unfenced) != 0 {
+		t.Fatalf("artifact record committed with unfenced digest(s): %v", unfenced)
+	}
+	for _, digest := range order {
+		if recorder.holds(digest) {
+			t.Fatalf("digest fence for %s still held after the upload returned", digest)
+		}
+	}
+}
+
+// fenceBlockingProvenance delegates to inner for one allowed digest and
+// blocks every other acquisition until the context ends, simulating a
+// saturated DB-mode advisory pool that cannot grant the second fence.
+type fenceBlockingProvenance struct {
+	inner cas.Fencer
+	allow string
+}
+
+func (f *fenceBlockingProvenance) Acquire(ctx context.Context, digest string) (func(), error) {
+	if digest != f.allow {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return f.inner.Acquire(ctx, digest)
+}
+
+func (f *fenceBlockingProvenance) WithFence(ctx context.Context, digest string, fn func() error) error {
+	release, err := f.Acquire(ctx, digest)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return fn()
+}
+
+// TestArtifactUploadProvenanceFenceTimeoutSkipsUnfencedPut proves the second
+// fence is BOUNDED: when the provenance digest's fence cannot be acquired
+// (a saturated advisory pool), the envelope is not published at all — no
+// unfenced CAS.Put — and the payload upload still succeeds with its own
+// fence held through the commit and released afterwards.
+func TestArtifactUploadProvenanceFenceTimeoutSkipsUnfencedPut(t *testing.T) {
+	old := provenanceFenceTimeout
+	provenanceFenceTimeout = 20 * time.Millisecond
+	defer func() { provenanceFenceTimeout = old }()
+
+	s, _, mb, hdrs := artifactIdentityFixture(t)
+	payloadDigest := sha256Hex([]byte("payload"))
+	recorder := newFenceRecorder()
+	s.digestFence = &fenceBlockingProvenance{inner: recorder, allow: payloadDigest}
+	audit := &fenceAuditedBlob{Store: mb, fencer: recorder}
+	s.SetBlobStore(audit)
+
+	w := fcUploadBlobArtifact(t, s, hdrs, "payload")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("upload with unavailable provenance fence = %d, want 201: %s", w.Code, w.Body.String())
+	}
+	var out model.ArtifactRecord
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.ProvenanceSHA256 != "" || out.ProvenancePath != "" {
+		t.Fatalf("provenance published without its fence: %q/%q", out.ProvenancePath, out.ProvenanceSHA256)
+	}
+	audit.mu.Lock()
+	order := append([]string(nil), audit.order...)
+	fenced := audit.fenced[payloadDigest]
+	audit.mu.Unlock()
+	if len(order) != 1 || order[0] != payloadDigest || !fenced {
+		t.Fatalf("CAS puts = %v (payload fenced=%v), want only fenced payload %s", order, fenced, payloadDigest)
+	}
+	if recorder.holds(payloadDigest) {
+		t.Fatalf("payload fence still held after the upload returned")
 	}
 }

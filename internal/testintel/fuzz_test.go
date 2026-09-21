@@ -28,7 +28,7 @@ func FuzzJUnit(f *testing.F) {
 				t.Fatalf("masked reparse failed where unmasked succeeded: %v", err)
 			}
 			for _, c := range rep.Cases {
-				if c.Failure != nil && len(c.Failure.Message) > maxMessageLen {
+				if c.Failure != nil && len(c.Failure.Message) > MaxMessageBytes {
 					t.Fatalf("failure message exceeds mask limit: %d", len(c.Failure.Message))
 				}
 			}

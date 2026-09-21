@@ -23,7 +23,9 @@ const (
 
 // RepositoryPermission is a per-repository grant set. A repo entry present
 // in Principal.Repositories is authoritative for that repo: it is used
-// instead of role-derived permissions, not merged with them.
+// instead of role-derived permissions, not merged with them. Canonically
+// equivalent entries carrying different permission sets conflict: the
+// repository is unusable and every action on it is denied.
 type RepositoryPermission struct {
 	Read         bool `json:"read,omitempty"`
 	Run          bool `json:"run,omitempty"`
@@ -54,11 +56,14 @@ func (p Principal) Has(role Role) bool {
 
 // RepoPerm returns the effective permission set for repo. A repo-specific
 // entry, when present (keyed by canonical ID or bare full name), is
-// authoritative; otherwise permissions derive from roles (admin grants
-// everything).
+// authoritative; a conflicting entry set grants nothing unless the global
+// admin role overrides it; otherwise permissions derive from roles (admin
+// grants everything).
 func (p Principal) RepoPerm(repo string) RepositoryPermission {
-	if perm, ok := p.repoEntry(repo); ok {
+	if perm, res := p.repoEntry(repo); res == RepoFound {
 		return perm
+	} else if res == RepoConflict && !p.Has(RoleAdmin) {
+		return RepositoryPermission{}
 	}
 	admin := p.Has(RoleAdmin)
 	return RepositoryPermission{

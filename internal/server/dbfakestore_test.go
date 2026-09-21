@@ -190,6 +190,9 @@ type dbFakeStore struct {
 	insertReportHistoryErr error
 	loadRepoHistoryErr     error
 	disableCertErr         error
+	// reportDeliveries mirrors migration 0029's test_report_deliveries rows:
+	// the delivery receipts that make a retried report upload idempotent.
+	reportDeliveries map[string]fakeReportDelivery
 
 	insertRunCalls []model.Run
 	insertJobCalls []model.Job
@@ -261,6 +264,7 @@ var _ storage.CertRevocationStore = (*dbFakeStore)(nil)
 var _ storage.EnrollGrantStore = (*dbFakeStore)(nil)
 var _ storage.TestHistoryStore = (*dbFakeStore)(nil)
 var _ storage.TestHistoryAggregateStore = (*dbFakeStore)(nil)
+var _ storage.TestReportDeliveryStore = (*dbFakeStore)(nil)
 var _ storage.RunnerDisableStore = (*dbFakeStore)(nil)
 var _ storage.ArtifactIdempotentStore = (*dbFakeStore)(nil)
 var _ storage.GeneratedFragmentStore = (*dbFakeStore)(nil)
@@ -332,6 +336,7 @@ func newDBFakeStore() *dbFakeStore {
 		grants:            map[string]storage.EnrollGrantRecord{},
 		historyAggregates: map[string]map[string]storage.TestHistoryAggregate{},
 		historyVersions:   map[string]int64{},
+		reportDeliveries:  map[string]fakeReportDelivery{},
 		leaderOK:          true,
 	}
 }
@@ -388,6 +393,23 @@ func (f *dbFakeStore) ListRuns(ctx context.Context, limit int) ([]model.Run, err
 		out = append(out, r)
 	}
 	return out, nil
+}
+
+// ListRunsPage implements storage.RunPageStore like every shipped store does,
+// so DB-mode reads of the runs collection use the native keyset path (the
+// server no longer falls back to a bounded ListRuns snapshot). listRunsErr is
+// honored so tests that inject a hard run-read failure keep failing closed.
+func (f *dbFakeStore) ListRunsPage(ctx context.Context, afterCreatedAt time.Time, afterID string, limit int) (storage.RunPage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.listRunsErr != nil {
+		return storage.RunPage{}, f.listRunsErr
+	}
+	runs := make([]model.Run, 0, len(f.runs))
+	for _, r := range f.runs {
+		runs = append(runs, r)
+	}
+	return storage.PageRuns(runs, afterCreatedAt, afterID, limit), nil
 }
 
 func (f *dbFakeStore) InsertJob(ctx context.Context, job model.Job) error {
@@ -1967,11 +1989,37 @@ func fakeHistoryKey(suite, class, name string) string {
 	return suite + "\x00" + class + "\x00" + name
 }
 
-func (f *dbFakeStore) InsertTestReportWithHistory(ctx context.Context, rep model.TestReport, repoID string) (int64, error) {
+// fakeReportDelivery is one in-memory test_report_deliveries row (migration
+// 0029) of the fake store.
+type fakeReportDelivery struct {
+	digest   string
+	reportID string
+}
+
+func fakeReportDeliveryKey(jobID string, generation int64, deliveryID string) string {
+	return jobID + "\x00" + strconv.FormatInt(generation, 10) + "\x00" + deliveryID
+}
+
+// InsertTestReportWithHistory mirrors the SQL delivery transaction: the
+// report append, the aggregate fold and the (job, generation, delivery ID)
+// receipt commit together. An identical replay returns the original report
+// ID without appending or folding; a reused delivery ID with a different
+// digest is a conflict. Empty delivery IDs keep the legacy behavior.
+func (f *dbFakeStore) InsertTestReportWithHistoryDelivery(ctx context.Context, rep model.TestReport, repoID string, delivery storage.TestReportDelivery) (storage.TestReportInsertOutcome, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.insertReportHistoryErr != nil {
-		return 0, f.insertReportHistoryErr
+		return storage.TestReportInsertOutcome{}, f.insertReportHistoryErr
+	}
+	if delivery.DeliveryID != "" {
+		key := fakeReportDeliveryKey(delivery.JobID, delivery.LeaseGeneration, delivery.DeliveryID)
+		if existing, ok := f.reportDeliveries[key]; ok {
+			if existing.digest != delivery.ContentDigest {
+				return storage.TestReportInsertOutcome{}, fmt.Errorf("%w: job %s generation %d delivery %s", storage.ErrTestReportDeliveryConflict, delivery.JobID, delivery.LeaseGeneration, delivery.DeliveryID)
+			}
+			return storage.TestReportInsertOutcome{Replay: true, ReportID: existing.reportID}, nil
+		}
+		f.reportDeliveries[key] = fakeReportDelivery{digest: delivery.ContentDigest, reportID: rep.ID}
 	}
 	f.reports = append(f.reports, rep)
 	rows := f.historyAggregates[repoID]
@@ -1987,7 +2035,15 @@ func (f *dbFakeStore) InsertTestReportWithHistory(ctx context.Context, rep model
 	}
 	f.historyVersions[repoID]++
 	f.testHistoryVersion++
-	return f.historyVersions[repoID], nil
+	return storage.TestReportInsertOutcome{Version: f.historyVersions[repoID], ReportID: rep.ID}, nil
+}
+
+func (f *dbFakeStore) InsertTestReportWithHistory(ctx context.Context, rep model.TestReport, repoID string) (int64, error) {
+	outcome, err := f.InsertTestReportWithHistoryDelivery(ctx, rep, repoID, storage.TestReportDelivery{})
+	if err != nil {
+		return 0, err
+	}
+	return outcome.Version, nil
 }
 
 func (f *dbFakeStore) LoadRepoTestHistory(ctx context.Context, repoID string) (int64, []byte, error) {
@@ -2046,12 +2102,21 @@ func (f *dbFakeStore) ResolveTestHistoryRepoIDs(ctx context.Context, query strin
 	return out, nil
 }
 
+// TestReportTotals mirrors the SQL contract: totals over EXACTLY the supplied
+// canonical repository IDs, with no bare-name predicate (the full-name
+// fallback belongs only to ResolveTestHistoryRepoIDs, which is candidate
+// discovery). An empty set answers zero.
 func (f *dbFakeStore) TestReportTotals(ctx context.Context, repoIDs []string, repoQuery string) (int, int, int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	ids := map[string]bool{}
 	for _, id := range repoIDs {
-		ids[id] = true
+		if strings.TrimSpace(id) != "" {
+			ids[id] = true
+		}
+	}
+	if len(ids) == 0 {
+		return 0, 0, 0, nil
 	}
 	var reports, tests, failures int
 	for _, rep := range f.reports {
@@ -2059,7 +2124,7 @@ func (f *dbFakeStore) TestReportTotals(ctx context.Context, repoIDs []string, re
 		if !ok {
 			continue
 		}
-		if !ids[repoIDForRun(run)] && !runMatchesRepoQuery(run, repoQuery) {
+		if !ids[repoIDForRun(run)] {
 			continue
 		}
 		reports++

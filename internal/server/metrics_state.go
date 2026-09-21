@@ -50,8 +50,15 @@ func (s *Server) writeStateMetrics(w io.Writer, fam stateMetricFamilies) {
 	}
 	if fam.haveRunners {
 		fmt.Fprintf(w, "kiwi_runners %d\nkiwi_runner_slots %d\nkiwi_runner_slots_busy %d\n", fam.runners.Runners, fam.runners.Capacity, fam.runners.Busy)
+		// Zero total capacity means there are no runner slots at all, so
+		// saturation is explicitly ZERO: setting it unconditionally keeps a
+		// capacity drop to zero from exporting the previous scrape's ratio
+		// (a stale gauge). With capacity present the value is the usual
+		// busy/capacity fraction.
 		if fam.runners.Capacity > 0 {
 			s.metricSet("kiwi_runner_saturation", float64(fam.runners.Busy)/float64(fam.runners.Capacity), nil)
+		} else {
+			s.metricSet("kiwi_runner_saturation", 0, nil)
 		}
 	}
 }

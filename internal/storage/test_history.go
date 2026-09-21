@@ -170,54 +170,16 @@ func lockTestHistoryRepoTx(ctx context.Context, tx pgx.Tx, repoID string) (int64
 // InsertTestReportWithHistory inserts the durable report and folds its cases
 // into the repository's aggregates in ONE transaction (see
 // TestHistoryAggregateStore). The returned version is the repository's new
-// history version.
+// history version. It is the legacy delivery path (no durable delivery
+// receipt); callers that can supply a stable delivery identity use
+// InsertTestReportWithHistoryDelivery, which additionally makes the upload
+// idempotent across retries.
 func (s *PostgresStore) InsertTestReportWithHistory(ctx context.Context, rep model.TestReport, repoID string) (int64, error) {
-	if err := ValidateID(rep.ID); err != nil {
-		return 0, err
-	}
-	if err := ValidateRunID(rep.RunID); err != nil {
-		return 0, err
-	}
-	if strings.TrimSpace(repoID) == "" {
-		return 0, fmt.Errorf("storage: test history repository identity is required")
-	}
-	tx, err := s.pool.Begin(ctx)
+	outcome, err := s.InsertTestReportWithHistoryDelivery(ctx, rep, repoID, TestReportDelivery{})
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback(ctx)
-	version, err := lockTestHistoryRepoTx(ctx, tx, repoID)
-	if err != nil {
-		return 0, err
-	}
-	if version == 0 {
-		// Upgrade bridge: the repository predates migration 0026, so its
-		// durable reports must be folded ONCE before the new report, or the
-		// first post-upgrade upload would drop all pre-upgrade history. The
-		// work is bounded by this repository's reports and happens at most
-		// once per repository.
-		if err := rebuildRepoTestHistoryTx(ctx, tx, repoID); err != nil {
-			return 0, err
-		}
-	}
-	if err := insertTestReportRowsTx(ctx, tx, rep); err != nil {
-		return 0, err
-	}
-	for _, c := range rep.Cases {
-		if err := foldTestHistoryTx(ctx, tx, repoID, TestHistoryEntry{
-			Suite: rep.JobKey, Class: c.Class, Name: c.Name, Duration: c.Duration, Passed: c.Passed, When: rep.CreatedAt,
-		}); err != nil {
-			return 0, err
-		}
-	}
-	version, err = bumpTestHistoryVersionTx(ctx, tx, repoID)
-	if err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return 0, err
-	}
-	return version, nil
+	return outcome.Version, nil
 }
 
 // LoadRepoTestHistory returns one repository's history version and its
@@ -276,20 +238,24 @@ func scanTestHistoryAggregate(rows pgx.Rows) (TestHistoryAggregate, error) {
 	return row, nil
 }
 
-// ResolveTestHistoryRepoIDs maps a test-intelligence query to the canonical
-// repository IDs it addresses. The query forms are the human full name, the
+// ResolveTestHistoryRepoIDs maps a test-intelligence query to the CANDIDATE
+// canonical repository IDs it addresses: resolution is candidate discovery,
+// NOT an authorization decision. The query forms are the human full name, the
 // canonical RepoID and the legacy host-less canonical form; the returned set
 // mirrors runMatchesRepoQuery: a run matches when its full name or its
 // canonical identity (policy_repo_id first, then the repo_id/clone-URL +
 // full-name derivation — see canonicalPolicyRepoIDSQLExpr) equals the query,
-// or when the canonicalized full name equals the query. Resolution is a
-// single bounded, set-based run query (backed by the 0027 expression index
-// created on the SAME canonical policy-first expression) — it never
-// materializes reports or resolves runs one by one. Legacy records (no
-// repo_id/policy_repo_id) are matched by the canonical expression itself, so
-// they are never filtered out before the Go-side derivation can see them;
-// the Go fallback remains as a belt-and-braces derivation for rows the SQL
-// expression cannot resolve.
+// or when the canonicalized full name equals the query. A bare name can
+// address SEVERAL forges, so the caller must authorize every returned ID
+// individually before reading aggregates; this method deliberately keeps the
+// full-name fallback because that breadth is exactly how a configured bare
+// alias finds all of its repositories. Resolution is a single bounded,
+// set-based run query (backed by the 0027 expression index created on the
+// SAME canonical policy-first expression) — it never materializes reports or
+// resolves runs one by one. Legacy records (no repo_id/policy_repo_id) are
+// matched by the canonical expression itself, so they are never filtered out
+// before the Go-side derivation can see them; the Go fallback remains as a
+// belt-and-braces derivation for rows the SQL expression cannot resolve.
 func (s *PostgresStore) ResolveTestHistoryRepoIDs(ctx context.Context, query string, limit int) ([]string, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
@@ -331,22 +297,35 @@ func (s *PostgresStore) ResolveTestHistoryRepoIDs(ctx context.Context, query str
 }
 
 // TestReportTotals returns the report count and the report-declared test and
-// failure totals for the resolved repository IDs (and the raw query form, so
-// legacy runs whose full name matches are included). The query joins
-// test_results to runs and filters on the CANONICAL run identity
+// failure totals for EXACTLY the supplied canonical repository IDs. The query
+// joins test_results to runs and filters on the CANONICAL run identity
 // (policy-first, legacy rows derived from clone URL + full name), so
 // unrelated reports are never read — not even their payloads — and a
 // pre-RepoID run is never excluded from its repository's totals.
+//
+// There is deliberately NO bare-name predicate: a bare full name is not a
+// repository identity (several forges can present it), and re-injecting the
+// query form here would fan one query's totals across every forge that
+// presents the name — including repositories the caller is not authorized to
+// read. The caller resolves candidates (ResolveTestHistoryRepoIDs, which
+// keeps the full-name fallback) and authorizes every candidate individually
+// before calling this method; the repoQuery argument is retained for
+// interface compatibility and is IGNORED. An empty set returns zero totals
+// without touching the database.
 func (s *PostgresStore) TestReportTotals(ctx context.Context, repoIDs []string, repoQuery string) (int, int, int, error) {
-	repoQuery = strings.TrimSpace(repoQuery)
-	if len(repoIDs) == 0 && repoQuery == "" {
+	ids := make([]string, 0, len(repoIDs))
+	for _, id := range repoIDs {
+		if trimmed := strings.TrimSpace(id); trimmed != "" {
+			ids = append(ids, trimmed)
+		}
+	}
+	if len(ids) == 0 {
 		return 0, 0, 0, nil
 	}
 	var reports, tests, failures int
 	err := s.pool.QueryRow(ctx, `SELECT COUNT(*), COALESCE(SUM(tr.tests), 0)::int, COALESCE(SUM(tr.failures), 0)::int
 		FROM test_results tr JOIN runs r ON r.id = tr.run_id
-		WHERE `+canonicalPolicyRepoIDSQLExprOn("r.payload", "repo")+` = ANY($1::text[])
-		   OR r.payload->>'repo_full_name' = $2`, repoIDs, repoQuery).Scan(&reports, &tests, &failures)
+		WHERE `+canonicalPolicyRepoIDSQLExprOn("r.payload", "repo")+` = ANY($1::text[])`, ids).Scan(&reports, &tests, &failures)
 	if err != nil {
 		return 0, 0, 0, err
 	}
@@ -358,8 +337,10 @@ func (s *PostgresStore) TestReportTotals(ctx context.Context, repoIDs []string, 
 // repositories, bounded by limit. The predicate is the window-derived
 // flake_prob > 0 — the SAME rule as testintel.History.Flaky — not the
 // lifetime passes/fails counters, so a test that failed long ago and passed
-// its whole window drops out. Ordering is deterministic (rendered name, then
-// suite) before the bound is applied.
+// its whole window drops out. Deduplication happens in SQL on the RENDERED
+// identity (DISTINCT), BEFORE the limit is applied: the same class.name in
+// two suites renders to one output name, and duplicate rows can no longer
+// crowd out later unique names from the bounded list.
 func (s *PostgresStore) FlakyTestNames(ctx context.Context, repoIDs []string, limit int) ([]string, error) {
 	if len(repoIDs) == 0 {
 		return []string{}, nil
@@ -367,29 +348,21 @@ func (s *PostgresStore) FlakyTestNames(ctx context.Context, repoIDs []string, li
 	if limit <= 0 || limit > 10000 {
 		limit = 1000
 	}
-	rows, err := s.pool.Query(ctx, `SELECT suite, test_class, test_name FROM test_history_aggregates
+	rows, err := s.pool.Query(ctx, `SELECT DISTINCT (CASE WHEN test_class = '' THEN test_name ELSE test_class || '.' || test_name END) AS display
+		FROM test_history_aggregates
 		WHERE repo_id = ANY($1::text[]) AND flake_prob > 0
-		ORDER BY (CASE WHEN test_class = '' THEN test_name ELSE test_class || '.' || test_name END), suite, test_name
+		ORDER BY display
 		LIMIT $2`, repoIDs, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	seen := map[string]bool{}
 	out := []string{}
 	for rows.Next() {
-		var suite, class, name string
-		if err := rows.Scan(&suite, &class, &name); err != nil {
+		var display string
+		if err := rows.Scan(&display); err != nil {
 			return nil, err
 		}
-		display := name
-		if class != "" {
-			display = class + "." + name
-		}
-		if seen[display] {
-			continue
-		}
-		seen[display] = true
 		out = append(out, display)
 	}
 	if err := rows.Err(); err != nil {

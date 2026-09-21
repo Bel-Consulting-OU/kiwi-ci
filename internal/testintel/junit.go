@@ -8,22 +8,28 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/safefs"
 )
 
-// Hard limits that bound report ingestion. They exist so a hostile or
-// corrupted report file cannot exhaust memory or wedge the control plane.
+// The hard ingestion limits live in limits.go: MaxReportFileBytes,
+// MaxJobReportBytes, MaxReportCases, MaxJobCases, MaxMessageBytes and
+// MaxReportFiles, plus the shared request/payload budgets the server and the
+// runner enforce. Every layer (parser, runner pre-check, /tests decode) uses
+// those constants, so there is exactly one size contract.
 const (
-	maxReportBytes = 64 << 20 // 64 MiB per report file
-	maxReportCases = 100_000  // cases per report file
-	maxJobCases    = 500_000  // total cases per job across all files
-	maxMessageLen  = 64 << 10 // 64 KiB per failure/error message
+	// maxReportDuration is the largest suite/case duration (in seconds,
+	// about 31.7 years) accepted from a report. Non-finite, negative and
+	// larger values are dropped to 0 (see sanitizeDuration).
+	maxReportDuration = 1e9
 )
 
 // Suite is one <testsuite> element. Counts are the attributes when present
@@ -78,7 +84,7 @@ var ErrLimitExceeded = errors.New("test report exceeds limits")
 
 // Parse parses one JUnit file into a Report. The file must be a regular
 // file (symlinks, sockets and devices are rejected) no larger than
-// maxReportBytes.
+// MaxReportFileBytes.
 func Parse(path string) (Report, error) {
 	return ParseMasked(path, nil)
 }
@@ -95,8 +101,8 @@ func ParseMasked(path string, mask func(string) string) (Report, error) {
 	if fi.Mode()&os.ModeSymlink != 0 {
 		return out, fmt.Errorf("test report %s: symlinks are not allowed", path)
 	}
-	if fi.Size() > maxReportBytes {
-		return out, fmt.Errorf("%w: %s larger than 64 MiB", ErrLimitExceeded, path)
+	if fi.Size() > MaxReportFileBytes {
+		return out, fmt.Errorf("%w: %s larger than %d bytes", ErrLimitExceeded, path, MaxReportFileBytes)
 	}
 	f, err := os.Open(path)
 	if err != nil {
@@ -113,8 +119,16 @@ func ParseMasked(path string, mask func(string) string) (Report, error) {
 	if !st.Mode().IsRegular() {
 		return out, fmt.Errorf("test report %s: not a regular file", path)
 	}
+	return parseReport(f, path, mask)
+}
 
-	dec := xml.NewDecoder(f)
+// parseReport decodes one already-opened, verified regular JUnit file. It is
+// the shared body of ParseMasked and of the root-anchored aggregate path:
+// parseReport never opens, stats or closes anything, so callers that reach a
+// file through a held workspace descriptor keep that no-follow contract.
+func parseReport(r io.Reader, name string, mask func(string) string) (Report, error) {
+	var out Report
+	dec := xml.NewDecoder(r)
 	cases := 0
 	seen := false
 	for {
@@ -123,7 +137,7 @@ func ParseMasked(path string, mask func(string) string) (Report, error) {
 			break
 		}
 		if derr != nil {
-			return out, fmt.Errorf("parse %s: %w", path, derr)
+			return out, fmt.Errorf("parse %s: %w", name, derr)
 		}
 		se, ok := tok.(xml.StartElement)
 		if !ok {
@@ -134,7 +148,7 @@ func ParseMasked(path string, mask func(string) string) (Report, error) {
 			seen = true
 			suites, serr := readSuiteElement(dec, se, mask, &cases)
 			if serr != nil {
-				return out, fmt.Errorf("parse %s: %w", path, serr)
+				return out, fmt.Errorf("parse %s: %w", name, serr)
 			}
 			for _, s := range suites {
 				appendSuite(&out, s)
@@ -143,9 +157,9 @@ func ParseMasked(path string, mask func(string) string) (Report, error) {
 			seen = true
 			c, cerr := readCase(dec, se, mask, &cases)
 			if cerr != nil {
-				return out, fmt.Errorf("parse %s: %w", path, cerr)
+				return out, fmt.Errorf("parse %s: %w", name, cerr)
 			}
-			s := Suite{Name: path, Tests: 1, Time: c.Time, Cases: []Case{c}}
+			s := Suite{Name: name, Tests: 1, Time: c.Time, Cases: []Case{c}}
 			switch {
 			case c.Failure != nil:
 				s.Failures = 1
@@ -157,12 +171,12 @@ func ParseMasked(path string, mask func(string) string) (Report, error) {
 			appendSuite(&out, s)
 		default:
 			if err := dec.Skip(); err != nil {
-				return out, fmt.Errorf("parse %s: %w", path, err)
+				return out, fmt.Errorf("parse %s: %w", name, err)
 			}
 		}
 	}
 	if !seen {
-		return out, fmt.Errorf("parse %s: not a JUnit report (no testsuite/testcase elements)", path)
+		return out, fmt.Errorf("parse %s: not a JUnit report (no testsuite/testcase elements)", name)
 	}
 	return out, nil
 }
@@ -261,20 +275,48 @@ func readSuiteElement(dec *xml.Decoder, se xml.StartElement, mask func(string) s
 	}
 }
 
-// readCase decodes one <testcase> element, applies masking and truncation,
-// and enforces the per-report case limit.
+// caseXML is the decode mirror of Case used by readCase. It differs only in
+// carrying the time attribute as a string: decoding straight into Case.Time
+// would make encoding/xml reject the whole report for a malformed or
+// out-of-range duration, while every other duration in a report is dropped
+// to 0 by the numeric policy. The remaining fields are identical to Case.
+type caseXML struct {
+	Name      string   `xml:"name,attr"`
+	Class     string   `xml:"classname,attr"`
+	Time      string   `xml:"time,attr"`
+	Failure   *Failure `xml:"failure"`
+	Error     *Failure `xml:"error"`
+	Skipped   *Skipped `xml:"skipped"`
+	SystemErr string   `xml:"system-err"`
+}
+
+// readCase decodes one <testcase> element, applies the duration policy,
+// masking and truncation, and enforces the per-report case limit.
 func readCase(dec *xml.Decoder, se xml.StartElement, mask func(string) string, cases *int) (Case, error) {
-	var c Case
-	if err := dec.DecodeElement(&c, &se); err != nil {
-		return c, err
+	var cx caseXML
+	if err := dec.DecodeElement(&cx, &se); err != nil {
+		return Case{}, err
+	}
+	c := Case{
+		Name:      cx.Name,
+		Class:     cx.Class,
+		Failure:   cx.Failure,
+		Error:     cx.Error,
+		Skipped:   cx.Skipped,
+		SystemErr: cx.SystemErr,
+	}
+	if cx.Time != "" {
+		if f, err := strconv.ParseFloat(strings.TrimSpace(cx.Time), 64); err == nil {
+			c.Time = sanitizeDuration(f)
+		}
 	}
 	truncateCase(&c)
 	if mask != nil {
 		applyMask(&c, mask)
 	}
 	*cases++
-	if *cases > maxReportCases {
-		return c, fmt.Errorf("%w: more than %d cases", ErrLimitExceeded, maxReportCases)
+	if *cases > MaxReportCases {
+		return c, fmt.Errorf("%w: more than %d cases", ErrLimitExceeded, MaxReportCases)
 	}
 	return c, nil
 }
@@ -341,14 +383,14 @@ func truncateFailure(f *Failure) {
 	if f == nil {
 		return
 	}
-	if len(f.Message) > maxMessageLen {
-		f.Message = f.Message[:maxMessageLen]
+	if len(f.Message) > MaxMessageBytes {
+		f.Message = f.Message[:MaxMessageBytes]
 	}
-	if len(f.Body) > maxMessageLen {
-		f.Body = f.Body[:maxMessageLen]
+	if len(f.Body) > MaxMessageBytes {
+		f.Body = f.Body[:MaxMessageBytes]
 	}
-	if len(f.Message)+len(f.Body) > maxMessageLen {
-		keep := maxMessageLen - len(f.Message)
+	if len(f.Message)+len(f.Body) > MaxMessageBytes {
+		keep := MaxMessageBytes - len(f.Message)
 		if keep < 0 {
 			keep = 0
 		}
@@ -383,10 +425,31 @@ func attrFloat(se xml.StartElement, name string) (float64, bool) {
 		return 0, false
 	}
 	f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
-	if err != nil {
+	if err != nil || !validDuration(f) {
 		return 0, false
 	}
 	return f, true
+}
+
+// validDuration is the numeric policy for suite and case durations: only
+// finite, non-negative values within maxReportDuration are usable. NaN,
+// ±Inf, negatives and absurdly large values are producer garbage: a NaN
+// makes every later comparison false and would survive arithmetic into
+// totals, and Inf/negative values poison duration balancing.
+func validDuration(f float64) bool {
+	return !math.IsNaN(f) && !math.IsInf(f, 0) && f >= 0 && f <= maxReportDuration
+}
+
+// sanitizeDuration applies the numeric policy by dropping an invalid
+// duration to 0 instead of failing the report: durations are producer
+// metadata, so a malformed value must not reject an otherwise valid report,
+// but it must never reach sums or the API either. Zero is the same default a
+// missing time attribute gets, so dropping records nothing invalid.
+func sanitizeDuration(f float64) float64 {
+	if !validDuration(f) {
+		return 0
+	}
+	return f
 }
 
 // Within reports whether path (already cleaned) is lexically inside
@@ -403,35 +466,63 @@ func Within(workspace, path string) bool {
 // Aggregate parses every JUnit file matching the given workspace-relative
 // globs and merges them into one per-job report for flaky-test history and
 // future test splitting. It is equivalent to AggregateMasked with a nil
-// mask. Files resolving outside the workspace are rejected.
+// mask. Patterns are resolved component by component beneath the workspace
+// root without ever following a symlink; matched files are opened through a
+// held workspace root descriptor with the no-follow discipline, so a
+// symlinked parent directory or final file can never make the host collector
+// read outside the workspace.
 func Aggregate(workspace string, patterns []string) (model.TestReport, error) {
 	return AggregateMasked(workspace, patterns, nil)
 }
 
 // AggregateMasked is Aggregate with a secret-masking hook applied to
-// failure/error messages and system-err excerpts.
+// failure/error messages and system-err excerpts. The mask must be safe for
+// concurrent use when the caller shares it with other goroutines; the runner
+// passes secrets.Masker.Mask, which takes a read lock.
 func AggregateMasked(workspace string, patterns []string, mask func(string) string) (model.TestReport, error) {
+	root, err := safefs.OpenWorkspaceRoot(workspace)
+	if err != nil {
+		return model.TestReport{}, fmt.Errorf("test reports: open workspace %s: %w", workspace, err)
+	}
+	defer root.Close()
 	var files []string
 	for _, p := range patterns {
-		matches, err := filepath.Glob(filepath.Join(workspace, p))
+		matches, err := reportCandidates(root, p)
 		if err != nil {
 			return model.TestReport{}, err
 		}
 		files = append(files, matches...)
 	}
 	sort.Strings(files)
-	out := model.TestReport{}
-	for _, f := range files {
-		if !Within(workspace, f) {
-			return model.TestReport{}, fmt.Errorf("test report %s resolves outside workspace", f)
-		}
-		rep, err := ParseMasked(f, mask)
+	if len(files) > MaxReportFiles {
+		return model.TestReport{}, fmt.Errorf("%w: %d matched report files exceeds the %d file cap", ErrLimitExceeded, len(files), MaxReportFiles)
+	}
+	// Size every match through the no-follow workspace root before any
+	// content is parsed: the total-byte cap must hold even when the leading
+	// files would each parse cleanly. Each descriptor is closed immediately
+	// so a large match set cannot exhaust file descriptors.
+	var total int64
+	for _, rel := range files {
+		f, size, err := openReport(root, rel)
 		if err != nil {
 			return model.TestReport{}, err
 		}
-		rel, err := filepath.Rel(workspace, f)
+		f.Close()
+		total += size
+		if total > MaxJobReportBytes {
+			return model.TestReport{}, fmt.Errorf("%w: matched reports exceed %d bytes total", ErrLimitExceeded, MaxJobReportBytes)
+		}
+	}
+	out := model.TestReport{}
+	for _, rel := range files {
+		f, _, err := openReport(root, rel)
 		if err != nil {
-			rel = f
+			return model.TestReport{}, err
+		}
+		rep, err := parseReport(f, rel, mask)
+		f.Close()
+		if err != nil {
+			return model.TestReport{}, err
 		}
 		if out.Path == "" {
 			out.Path = rel
@@ -450,11 +541,168 @@ func AggregateMasked(workspace string, patterns []string, mask func(string) stri
 			} else if c.Error != nil {
 				r.Message = strings.TrimSpace(c.Error.Message + "\n" + c.Error.Body)
 			}
-			if len(out.Cases) >= maxJobCases {
-				return model.TestReport{}, fmt.Errorf("%w: more than %d cases per job", ErrLimitExceeded, maxJobCases)
+			if len(out.Cases) >= MaxJobCases {
+				return model.TestReport{}, fmt.Errorf("%w: more than %d cases per job", ErrLimitExceeded, MaxJobCases)
 			}
 			out.Cases = append(out.Cases, r)
 		}
 	}
+	// The serialized form is what the runner uploads and what the /tests
+	// endpoint must decode: enforce the shared payload contract HERE, with
+	// the exact encoding the runner sends, so the parser can never accept a
+	// report the endpoint would have to reject for size. The payload budget
+	// already reserves the request-envelope allowance, so an at-limit payload
+	// always fits MaxTestReportRequestBytes.
+	if err := ValidateReportPayload(out); err != nil {
+		return model.TestReport{}, err
+	}
 	return out, nil
+}
+
+// openReport opens one workspace-relative report candidate through the held
+// workspace root and returns the descriptor plus its verified size. OpenRel
+// rejects absolute paths, parent traversal, symlinked parents and symlinked
+// final components (its O_NOFOLLOW open plays the role of ParseMasked's
+// final-component Lstat symlink check), and fstat-verifies the descriptor is
+// a regular file, so every check the path-based ParseMasked makes still holds
+// here without any path-component race. The per-file byte cap is enforced
+// before the caller reads any content; the caller owns the returned
+// descriptor.
+func openReport(root *safefs.WorkspaceRoot, rel string) (*os.File, int64, error) {
+	f, err := root.OpenRel(rel)
+	if err != nil {
+		return nil, 0, fmt.Errorf("test report %s: %w", rel, err)
+	}
+	st, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, 0, fmt.Errorf("test report %s: %w", rel, err)
+	}
+	if !st.Mode().IsRegular() {
+		f.Close()
+		return nil, 0, fmt.Errorf("test report %s: not a regular file", rel)
+	}
+	if st.Size() > MaxReportFileBytes {
+		f.Close()
+		return nil, 0, fmt.Errorf("%w: %s larger than %d bytes", ErrLimitExceeded, rel, MaxReportFileBytes)
+	}
+	return f, st.Size(), nil
+}
+
+// reportCandidates expands one workspace-relative glob pattern into
+// candidate paths by walking the workspace one component at a time,
+// anchored at the canonical workspace root: a pattern component is matched
+// with filepath.Match against the entries of one directory, so "*" can
+// never cross a separator and a pattern can never name an absolute path or
+// a path above the workspace. Unlike filepath.Glob it never follows a
+// symlink: a symlink in any matched component fails the expansion (fail
+// closed) instead of being resolved, because resolving it would read files
+// outside the workspace. The returned paths are workspace-relative,
+// slash-separated names; the caller opens each through
+// safefs.WorkspaceRoot.OpenRel, which re-verifies no-follow at read time.
+//
+// The component walk uses os.Lstat/os.ReadDir on names below the canonical
+// root purely to enumerate candidates; a directory swapped for a symlink
+// while the walk runs can at most add names, never content: OpenRel refuses
+// the open, and no file is ever read by path.
+func reportCandidates(root *safefs.WorkspaceRoot, pattern string) ([]string, error) {
+	pat, err := reportPattern(pattern)
+	if err != nil {
+		return nil, err
+	}
+	comps := strings.Split(pat, "/")
+	current := []string{""}
+	for i, comp := range comps {
+		last := i == len(comps)-1
+		next := make([]string, 0, len(current))
+		for _, base := range current {
+			if !strings.ContainsAny(comp, "*?[") {
+				rel := joinRel(base, comp)
+				info, err := os.Lstat(rootAbs(root, rel))
+				if err != nil {
+					if os.IsNotExist(err) {
+						continue
+					}
+					return nil, err
+				}
+				if info.Mode()&os.ModeSymlink != 0 {
+					return nil, fmt.Errorf("test report %s: symlinks are not allowed", rel)
+				}
+				if !last && !info.IsDir() {
+					continue
+				}
+				next = append(next, rel)
+				continue
+			}
+			entries, err := os.ReadDir(rootAbs(root, base))
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				return nil, err
+			}
+			for _, e := range entries {
+				ok, merr := filepath.Match(comp, e.Name())
+				if merr != nil {
+					return nil, fmt.Errorf("test report pattern %q: %w", pattern, merr)
+				}
+				if !ok {
+					continue
+				}
+				rel := joinRel(base, e.Name())
+				if e.Type()&os.ModeSymlink != 0 {
+					return nil, fmt.Errorf("test report %s: symlinks are not allowed", rel)
+				}
+				if !last && !e.IsDir() {
+					continue
+				}
+				next = append(next, rel)
+			}
+		}
+		current = next
+	}
+	sort.Strings(current)
+	return current, nil
+}
+
+// reportPattern validates a job's workspace-relative glob pattern before it
+// is expanded. Absolute patterns, backslashes, NUL bytes and ".."
+// components are rejected up front so no pattern can even name a path
+// outside the workspace; "." and empty patterns are rejected because they
+// name no file. The pattern is normalized with path.Clean after the
+// traversal check so cleaning can never hide a "..".
+func reportPattern(pattern string) (string, error) {
+	if pattern == "" {
+		return "", fmt.Errorf("test report pattern is empty")
+	}
+	if strings.ContainsRune(pattern, '\x00') || strings.Contains(pattern, "\\") {
+		return "", fmt.Errorf("test report pattern %q contains an invalid character", pattern)
+	}
+	if strings.HasPrefix(pattern, "/") || filepath.IsAbs(pattern) {
+		return "", fmt.Errorf("test report pattern %q must be workspace-relative", pattern)
+	}
+	for _, comp := range strings.Split(pattern, "/") {
+		if comp == ".." {
+			return "", fmt.Errorf("test report pattern %q escapes the workspace", pattern)
+		}
+	}
+	clean := path.Clean(pattern)
+	if clean == "." || clean == "" {
+		return "", fmt.Errorf("test report pattern %q does not name a file", pattern)
+	}
+	return clean, nil
+}
+
+func rootAbs(root *safefs.WorkspaceRoot, rel string) string {
+	if rel == "" {
+		return root.Canonical
+	}
+	return filepath.Join(root.Canonical, filepath.FromSlash(rel))
+}
+
+func joinRel(base, name string) string {
+	if base == "" {
+		return name
+	}
+	return base + "/" + name
 }

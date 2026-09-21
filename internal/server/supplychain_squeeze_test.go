@@ -202,7 +202,8 @@ func TestSqueezeSBOMFSModeEdges(t *testing.T) {
 		s, hdrs := fcMemoryBlobServer(t)
 		fcSeedContract(s, "job-a", storage.ArtifactContract{Name: "bin", Paths: []string{"out/"}, SBOM: "spdx-json"})
 		dir := filepath.Join(s.store.Root, "artifacts", "run-c", "job-a")
-		if err := os.MkdirAll(filepath.Join(dir, "bin.sbom.json.tmp"), 0o700); err != nil {
+		tmp := artifactSidecarPath(dir, 5, "bin", "sbom", sha256Hex([]byte(validSPDX))) + ".tmp"
+		if err := os.MkdirAll(tmp, 0o700); err != nil {
 			t.Fatal(err)
 		}
 		w := doJSONHeaders(t, s, http.MethodPut, "/api/v1/jobs/job-a/artifacts/bin.sbom", "runner-tok", validSPDX, hdrs)
@@ -298,7 +299,8 @@ func TestSqueezeSigstoreUploadEdges(t *testing.T) {
 		fcSeedContract(s, "job-a", storage.ArtifactContract{Name: "bin", Paths: []string{"out/"}, SigstoreIssuer: "i", SigstoreIdentity: "id"})
 		pinSigstoreRoot(s, "key-1", make([]byte, 32))
 		dir := filepath.Join(s.store.Root, "artifacts", "run-c", "job-a")
-		if err := os.MkdirAll(filepath.Join(dir, "bin.sigstore.json.tmp"), 0o700); err != nil {
+		tmp := artifactSidecarPath(dir, 5, "bin", "sigstore", sha256Hex([]byte("{}"))) + ".tmp"
+		if err := os.MkdirAll(tmp, 0o700); err != nil {
 			t.Fatal(err)
 		}
 		w := doJSONHeaders(t, s, http.MethodPut, "/api/v1/jobs/job-a/artifacts/bin.sigstore", "runner-tok", "{}", hdrs)
@@ -453,7 +455,7 @@ func TestSqueezeSidecarBytesEdges(t *testing.T) {
 		s.mu.Lock()
 		s.pendingSidecars[sidecarPendingKey("job-a", 5, "bin", "sbom")] = encodePendingSidecar("missing-digest", time.Now().UTC())
 		s.mu.Unlock()
-		if err := writeFileAtomic(artifactSidecarPath(dir, "bin", "sbom"), []byte(validSPDX), 0o600); err != nil {
+		if _, err := writeArtifactSidecar(dir, 5, "bin", "sbom", "missing-digest", []byte(validSPDX)); err != nil {
 			t.Fatal(err)
 		}
 		b, err := s.sidecarBytes(context.Background(), model.Job{ID: "job-a", LeaseGeneration: 5}, "bin", "sbom", dir)
@@ -469,10 +471,11 @@ func TestSqueezeAttachSidecarsToRecordFS(t *testing.T) {
 	s, _ := fcMemoryBlobServer(t)
 	dir := t.TempDir()
 	// Local sbom + sigstore files, no pending digests.
-	if err := writeFileAtomic(artifactSidecarPath(dir, "bin", "sbom"), []byte(validSPDX), 0o600); err != nil {
+	sigBody := []byte(`{"b":1}`)
+	if _, err := writeArtifactSidecar(dir, 0, "bin", "sbom", sha256Hex([]byte(validSPDX)), []byte(validSPDX)); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeFileAtomic(artifactSidecarPath(dir, "bin", "sigstore"), []byte(`{"b":1}`), 0o600); err != nil {
+	if _, err := writeArtifactSidecar(dir, 0, "bin", "sigstore", sha256Hex(sigBody), sigBody); err != nil {
 		t.Fatal(err)
 	}
 	rec := model.ArtifactRecord{}
@@ -592,8 +595,17 @@ func TestSqueezeSidecarPendingKeyAndFormat(t *testing.T) {
 	if sidecarPendingKey("j", 3, "bin", "sbom") == sidecarPendingKey("j", 4, "bin", "sbom") {
 		t.Fatal("pending key must include the lease generation")
 	}
-	if got := artifactSidecarPath("/d", "bin", "sbom"); got != filepath.Join("/d", "bin.sbom.json") {
-		t.Fatalf("sidecar path = %q", got)
+	// The fs sidecar layout is generation- and digest-qualified: distinct
+	// generations (and distinct digests) can never name the same file.
+	want := filepath.Join("/d", "g-7", "bin.sbom."+strings.Repeat("a", 64)+".json")
+	if got := artifactSidecarPath("/d", 7, "bin", "sbom", strings.Repeat("a", 64)); got != want {
+		t.Fatalf("sidecar path = %q, want %q", got, want)
+	}
+	if artifactSidecarPath("/d", 7, "bin", "sbom", strings.Repeat("a", 64)) == artifactSidecarPath("/d", 8, "bin", "sbom", strings.Repeat("a", 64)) {
+		t.Fatal("sidecar path must include the lease generation")
+	}
+	if artifactSidecarPath("/d", 7, "bin", "sbom", strings.Repeat("a", 64)) == artifactSidecarPath("/d", 7, "bin", "sbom", strings.Repeat("b", 64)) {
+		t.Fatal("sidecar path must include the content digest")
 	}
 	if sha256Hex([]byte("x")) != "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881" {
 		t.Fatal("sha256Hex mismatch")
@@ -623,10 +635,8 @@ func TestSqueezeGateInvalidLocalSidecar(t *testing.T) {
 	s, hdrs := fcMemoryBlobServer(t)
 	fcSeedContract(s, "job-a", storage.ArtifactContract{Name: "bin", Paths: []string{"out/"}, SBOM: "spdx-json"})
 	dir := filepath.Join(s.store.Root, "artifacts", "run-c", "job-a")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeFileAtomic(artifactSidecarPath(dir, "bin", "sbom"), []byte(`{"spdxVersion":"SPDX-1.0"}`), 0o600); err != nil {
+	bad := []byte(`{"spdxVersion":"SPDX-1.0"}`)
+	if _, err := writeArtifactSidecar(dir, 5, "bin", "sbom", sha256Hex(bad), bad); err != nil {
 		t.Fatal(err)
 	}
 	if w := fcUploadBlobArtifact(t, s, hdrs, "payload"); w.Code != http.StatusUnprocessableEntity {

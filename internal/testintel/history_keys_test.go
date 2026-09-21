@@ -6,6 +6,7 @@ package testintel
 // semantics, and the flaky drop-out after a clean 16-outcome window.
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -14,6 +15,96 @@ import (
 	"testing"
 	"time"
 )
+
+// v2KeyOf renders a v2 history key wrapping an ARBITRARY JSON array, so
+// malformed element counts can be exercised without going through the
+// encoder (which always emits exactly four fields).
+func v2KeyOf(t *testing.T, fields []string) string {
+	t.Helper()
+	raw, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return historyKeyV2Prefix + base64.RawURLEncoding.EncodeToString(raw)
+}
+
+// TestHistoryKeyV2RequiresExactlyFourElements is the C4-C decode regression:
+// a v2 payload that is not a four-element string array is REJECTED, never
+// zero-filled (short arrays) or truncated (long arrays) into a fully
+// attributed identity. Rejected v2 keys fall through to the legacy split
+// exactly like other corrupt v2 keys (repo = the literal key, ok=false), so
+// legacy read semantics are untouched.
+func TestHistoryKeyV2RequiresExactlyFourElements(t *testing.T) {
+	// Exactly four elements is the one accepted shape.
+	good := v2KeyOf(t, []string{"repo", "suite", "class", "name"})
+	if parts, ok := decodeHistoryKey(good); !ok || parts != (historyKeyParts{repo: "repo", suite: "suite", class: "class", name: "name"}) {
+		t.Fatalf("four-element v2 decode = %+v ok=%v", parts, ok)
+	}
+	// Empty strings are values like any other, as long as there are four.
+	empty := v2KeyOf(t, []string{"", "", "", ""})
+	if parts, ok := decodeHistoryKey(empty); !ok || parts != (historyKeyParts{}) {
+		t.Fatalf("four-empty-element v2 decode = %+v ok=%v", parts, ok)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		fields []string
+	}{
+		{"two elements", []string{"repo", "suite"}},
+		{"three elements", []string{"repo", "suite", "class"}},
+		{"five elements", []string{"repo", "suite", "class", "name", "extra"}},
+		{"zero elements", []string{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			key := v2KeyOf(t, tc.fields)
+			parts, ok := decodeHistoryKey(key)
+			if ok {
+				t.Fatalf("malformed v2 key decoded as attributed: %+v", parts)
+			}
+			// The legacy fallback treats the literal key as a repository
+			// (and nothing else): no zero-filled or truncated identity.
+			if parts.repo != key || parts.suite != "" || parts.class != "" || parts.name != "" {
+				t.Fatalf("malformed v2 fallback = %+v, want repo=%q only", parts, key)
+			}
+			if got := displayName(key); got != key {
+				t.Fatalf("displayName(malformed v2) = %q, want the raw key", got)
+			}
+			// It must not match any real repository/suite either.
+			h := NewHistory()
+			h.stats[key] = &TestStat{Runs: 1, Passes: 1, EWMA: 1}
+			if got := h.Manifest("repo", "suite"); !reflect.DeepEqual(got, []string{}) {
+				t.Fatalf("malformed v2 key leaked into a manifest: %v", got)
+			}
+		})
+	}
+	// Non-array and non-string-element JSON also fail closed.
+	for _, raw := range []string{`{"repo":"r"}`, `"repo"`, `["r","s","c",4]`, `[["r"],"s","c","n"]`} {
+		key := historyKeyV2Prefix + base64.RawURLEncoding.EncodeToString([]byte(raw))
+		if parts, ok := decodeHistoryKey(key); ok {
+			t.Fatalf("non-array v2 %s decoded as attributed: %+v", raw, parts)
+		}
+	}
+}
+
+// TestHistoryKeyLegacyUnaffectedByV2Strictness re-asserts that the stricter
+// v2 element-count rule changed nothing for legacy pipe keys.
+func TestHistoryKeyLegacyUnaffectedByV2Strictness(t *testing.T) {
+	parts, ok := decodeHistoryKey("repo|suite|class|name")
+	if !ok || parts != (historyKeyParts{repo: "repo", suite: "suite", class: "class", name: "name"}) {
+		t.Fatalf("legacy four-field decode = %+v ok=%v", parts, ok)
+	}
+	parts, ok = decodeHistoryKey("repo|suite||name")
+	if !ok || parts != (historyKeyParts{repo: "repo", suite: "suite", name: "name"}) {
+		t.Fatalf("legacy empty-class decode = %+v ok=%v", parts, ok)
+	}
+	parts, ok = decodeHistoryKey("repo|suite||na|me")
+	if ok || parts.repo != "repo" || parts.suite != "suite" || parts.class != "" || parts.name != "" {
+		t.Fatalf("ambiguous legacy decode = %+v ok=%v", parts, ok)
+	}
+	if got := displayName("repo|suite||na|me"); got != "repo|suite||na|me" {
+		t.Fatalf("ambiguous legacy displayName = %q", got)
+	}
+}
 
 // TestHistoryKeyV2RoundTrip proves the structured key is unambiguous for
 // every part, including the ones the legacy "repo|suite|class|name" join

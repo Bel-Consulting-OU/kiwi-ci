@@ -237,6 +237,10 @@ func TestFlowSnapshotMemoryDownloadCopyFailure(t *testing.T) {
 	}
 }
 
+// TestFlowSnapshotMemoryDownloadScopedDenial: a repository-scoped reader of
+// another repository is denied the archive download. The download is admin
+// tier, so no repository read grant opens it (see
+// TestSnapshotDownloadIsAdminTierMemory), and the denial stays 403.
 func TestFlowSnapshotMemoryDownloadScopedDenial(t *testing.T) {
 	s, hdrs := fcMemoryBlobServer(t)
 	if w := fcUploadSnapshot(t, s, hdrs, fcSnapshotArchive(t)); w.Code != http.StatusCreated {
@@ -456,6 +460,9 @@ func TestFlowSnapshotDBCopyFailures(t *testing.T) {
 	}
 }
 
+// TestFlowSnapshotDBDownloadScopedDenial is the DB-mode counterpart of the
+// scoped denial: a repository-scoped reader of another repository never
+// reaches the archive, which is admin tier in both modes.
 func TestFlowSnapshotDBDownloadScopedDenial(t *testing.T) {
 	s, f, _, hdrs := cacheFixture(t)
 	if w := fcUploadSnapshot(t, s, hdrs, fcSnapshotArchive(t)); w.Code != http.StatusCreated {

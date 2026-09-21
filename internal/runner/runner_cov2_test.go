@@ -406,10 +406,10 @@ func TestUploadJobSnapshotErrors(t *testing.T) {
 	defer srv.Close()
 	r := &Runner{ID: "r", Cfg: Config{Server: srv.URL}, Client: srv.Client(), Metrics: NewMetrics()}
 	task := server.Task{Job: model.Job{ID: "job-1"}}
-	if err := r.uploadJobSnapshot(context.Background(), task, filepath.Join(t.TempDir(), "missing")); err == nil {
+	if err := r.uploadJobSnapshot(context.Background(), task, filepath.Join(t.TempDir(), "missing"), 0); err == nil {
 		t.Fatal("missing workspace accepted")
 	}
-	if err := r.uploadJobSnapshot(context.Background(), task, t.TempDir()); err == nil {
+	if err := r.uploadJobSnapshot(context.Background(), task, t.TempDir(), 0); err == nil {
 		t.Fatal("failing snapshot upload accepted")
 	}
 }

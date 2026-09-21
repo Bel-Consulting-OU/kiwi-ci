@@ -289,6 +289,48 @@ func TestHistoryShardMissingEWMAUsesDocumentedDefault(t *testing.T) {
 	}
 }
 
+// TestHistoryShardCorruptEWMAUsesDocumentedDefault pins the already-corrupt-
+// data guard for the sharder: NaN, +Inf, -Inf and negative EWMAs all
+// schedule with defaultShardDuration (they are not usable measurements),
+// the assignment stays deterministic, and no non-finite value can poison the
+// LPT load arithmetic (which previously let +Inf pin every later test to
+// shard 0 and left NaN's comparator order undefined).
+func TestHistoryShardCorruptEWMAUsesDocumentedDefault(t *testing.T) {
+	h := NewHistory()
+	h.stats[testKey("r", "s", "", "inf")] = &TestStat{Runs: 2, EWMA: math.Inf(1)}
+	h.stats[testKey("r", "s", "", "neg")] = &TestStat{Runs: 2, EWMA: -7}
+	h.stats[testKey("r", "s", "", "ninf")] = &TestStat{Runs: 2, EWMA: math.Inf(-1)}
+	h.stats[testKey("r", "s", "", "nan")] = &TestStat{Runs: 2, EWMA: math.NaN()}
+
+	got := h.Shard("r", "s", 4)
+	// All four schedule at the same nominal duration, so the tie-break by
+	// name decides the order and each shard receives exactly one test.
+	want := [][]string{{"inf"}, {"nan"}, {"neg"}, {"ninf"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("corrupt-EWMA shards = %v, want %v", got, want)
+	}
+	for i := 0; i < 5; i++ {
+		if again := h.Shard("r", "s", 4); !reflect.DeepEqual(got, again) {
+			t.Fatalf("corrupt-EWMA sharding not deterministic: %v vs %v", got, again)
+		}
+	}
+	// A single shard holds every test exactly once (no non-finite load can
+	// drop or duplicate entries).
+	one := h.Shard("r", "s", 1)
+	if len(one) != 1 || len(one[0]) != 4 {
+		t.Fatalf("single-shard partition = %v, want all four tests", one)
+	}
+	seen := map[string]int{}
+	for _, name := range one[0] {
+		seen[name]++
+	}
+	for _, name := range []string{"inf", "neg", "ninf", "nan"} {
+		if seen[name] != 1 {
+			t.Fatalf("partition lost or duplicated %q: %v", name, seen)
+		}
+	}
+}
+
 func TestHistorySaveLoad(t *testing.T) {
 	h := NewHistory()
 	now := time.Now()

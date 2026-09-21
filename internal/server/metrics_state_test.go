@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -351,6 +352,57 @@ func TestMetricsDBStateFamilyFailureSkipsFamily(t *testing.T) {
 			t.Fatalf("state gauges rendered without the aggregate contract: %v", lines)
 		}
 	})
+}
+
+// TestMetricsRunnerSaturationZeroCapacityIsNotStale pins C4-B: the exported
+// saturation always reflects the latest scrape — capacity > 0 exports the
+// busy/capacity fraction, capacity dropping to zero exports an explicit 0
+// (never the previous fraction), and restored capacity resumes updating.
+func TestMetricsRunnerSaturationZeroCapacityIsNotStale(t *testing.T) {
+	s := New("token")
+	setRunners := func(runners ...model.Runner) {
+		s.mu.Lock()
+		s.runners = map[string]model.Runner{}
+		for _, r := range runners {
+			s.runners[r.ID] = r
+		}
+		s.mu.Unlock()
+	}
+	saturation := func() float64 {
+		t.Helper()
+		for _, line := range strings.Split(metricsScrapeBody(t, s), "\n") {
+			if v, ok := strings.CutPrefix(line, "kiwi_runner_saturation "); ok {
+				f, err := strconv.ParseFloat(v, 64)
+				if err != nil {
+					t.Fatalf("parse saturation %q: %v", line, err)
+				}
+				return f
+			}
+		}
+		t.Fatal("kiwi_runner_saturation absent from the scrape")
+		return 0
+	}
+
+	setRunners(model.Runner{ID: "r1", Name: "r1", Capacity: 4, ActiveJobs: []string{"j1", "j2"}})
+	if got := saturation(); got != 0.5 {
+		t.Fatalf("saturation with capacity = %v, want 0.5", got)
+	}
+	// A capacity change updates the exported value.
+	setRunners(model.Runner{ID: "r1", Name: "r1", Capacity: 10, ActiveJobs: []string{"j1", "j2", "j3"}})
+	if got := saturation(); got != 0.3 {
+		t.Fatalf("saturation after capacity change = %v, want 0.3", got)
+	}
+	// Capacity drops to zero: the exported value must be 0, not the stale
+	// fraction from the previous scrape.
+	setRunners()
+	if got := saturation(); got != 0 {
+		t.Fatalf("saturation with zero capacity = %v, want 0 (stale value exported)", got)
+	}
+	// Capacity returns: the gauge resumes updating.
+	setRunners(model.Runner{ID: "r2", Name: "r2", Capacity: 2, ActiveJobs: []string{"j1"}})
+	if got := saturation(); got != 0.5 {
+		t.Fatalf("saturation after capacity returns = %v, want 0.5", got)
+	}
 }
 
 // TestMetricsDBStateCanceledContextSkipsReads proves a canceled request
