@@ -12,6 +12,24 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
+// Corruption reasons the emergency recovery transactions stamp when a job's
+// persisted payload cannot be decoded. Malformed metadata may sacrifice the
+// job, but it must never keep a runner active slot, a lease or a quota
+// reservation: the reason states exactly what was done to the job and why the
+// retry policy could not be honored (MaxInfraRetries lives in the payload and
+// cannot be trusted, so the forced transition is TERMINAL failure, never a
+// re-queue).
+const (
+	// CorruptLeaseRecoveryReason is the terminal error of an expired running
+	// lease whose payload could not be decoded (the job is failed, the lease
+	// columns cleared, and the runner slot plus running quota released).
+	CorruptLeaseRecoveryReason = "failure: persisted job payload is corrupt; lease forcibly recovered"
+	// CorruptQueueExpiryReason is the terminal error of a queue-timed-out job
+	// whose payload could not be decoded (the job is cancelled and the queued
+	// quota reservation released).
+	CorruptQueueExpiryReason = "queue timeout: persisted job payload is corrupt; queued reservation forcibly released"
+)
+
 // QueueDeadlineFor returns the job's queue deadline: the persisted
 // QueueDeadline field when present, otherwise the deadline derived from the
 // compiled payload's queue_timeout (CreatedAt + timeout). Jobs without either

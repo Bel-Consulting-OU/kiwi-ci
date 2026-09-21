@@ -11,10 +11,12 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage/migrations"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/testintel"
 )
 
@@ -87,6 +89,35 @@ func TestEncodeTestHistoryStatsEmpty(t *testing.T) {
 	stats, err := EncodeTestHistoryStats(nil)
 	if err != nil || stats != nil {
 		t.Fatalf("empty encode = %q, %v; want nil/nil", stats, err)
+	}
+}
+
+// TestCanonicalIdentitySQLMatchesMigration0027 pins the Go identity helpers
+// and the migration-0027 DDL together: the IMMUTABLE function body and both
+// expression-index definitions must be byte-identical to what
+// canonicalRepoIDFunctionBody / canonicalPolicyRepoIDSQLExpr render, so the
+// planner can match the scoped reads and the rebuild to the index and the Go
+// derivation can never drift from the database derivation.
+func TestCanonicalIdentitySQLMatchesMigration0027(t *testing.T) {
+	raw, err := migrations.FS.ReadFile("0027_test_history_canonical_identity_index.sql")
+	if err != nil {
+		t.Fatalf("read 0027: %v", err)
+	}
+	sql := string(raw)
+	wantFunction := "AS $$SELECT " + canonicalRepoIDFunctionBody() + "$$;"
+	if !strings.Contains(sql, wantFunction) {
+		t.Fatal("migration 0027 does not create kiwi_canonical_repo_id with the canonicalRepoIDFunctionBody body (Go and SQL derivations would drift)")
+	}
+	if want := "ON runs ((" + canonicalPolicyRepoIDSQLExpr("repo") + "));"; !strings.Contains(sql, want) {
+		t.Fatalf("migration 0027 identity index does not match canonicalPolicyRepoIDSQLExpr(\"repo\") (%s)", want)
+	}
+	if want := "ON runs ((payload->>'repo_full_name'));"; !strings.Contains(sql, want) {
+		t.Fatalf("migration 0027 full-name index does not match the read expression (%s)", want)
+	}
+	for _, drop := range []string{"DROP INDEX IF EXISTS runs_repo_identity_idx;", "DROP INDEX IF EXISTS runs_repo_full_name_idx;"} {
+		if !strings.Contains(sql, drop) {
+			t.Fatalf("migration 0027 does not replace the 0026 definition: missing %q", drop)
+		}
 	}
 }
 

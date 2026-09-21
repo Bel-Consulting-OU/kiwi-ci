@@ -384,15 +384,17 @@ type Server struct {
 	// under dataDir (secret.go). Guarded by s.mu.
 	secretReceipts map[string]bool
 
-	// history is the persistent test-intelligence history (testshards.go).
-	history *testintelHistory
-	// historyDBVersion is the last durable per-repository test-history
-	// version loaded into the in-memory history in DB mode, and historyDBRepo
-	// is the canonical repository that version belongs to. Both are guarded
-	// by s.mu. An empty historyDBRepo means the in-memory history is a local
-	// mix (a report was folded locally), so the next sync reloads.
-	historyDBVersion int64
-	historyDBRepo    string
+	// historyCache is the keyed, versioned per-repository test-history cache
+	// (testshards.go): one entry per repository holding the decoded snapshot
+	// and the durable version it was decoded from. It is guarded by its OWN
+	// mutex inside repoHistoryCache — s.mu never guards it, and the cache
+	// mutex is a leaf lock (never acquire s.mu while holding it).
+	historyCache *repoHistoryCache
+	// historyFile is the memory/fs-mode whole-history snapshot path under
+	// dataDir; empty keeps the history in memory only. Written once by
+	// loadTestintelHistory before the server serves requests (and by tests),
+	// read-only afterwards.
+	historyFile string
 
 	// schedules/occurrences are the memory-mode schedule store; DB mode
 	// uses storage.ScheduleStore (schedules.go). orphanOccurrences remembers
@@ -454,7 +456,7 @@ func New(token string) *Server {
 		checkRunFence:     cas.NewMemFencer(),
 		crl:               map[string]string{},
 		EnrollGrants:      map[string]EnrollGrant{},
-		history:           newTestintelHistory(""),
+		historyCache:      newEmptyHistoryCache(),
 		schedules:         map[string]storage.Schedule{},
 		occurrences:       map[string]map[int64]string{},
 		orphanOccurrences: map[string]bool{},

@@ -36,10 +36,13 @@ func TestFlowTestShardsBranches(t *testing.T) {
 		t.Fatalf("bad lease shards = %d, want 409", w.Code)
 	}
 	// Query shard count valid, invalid, and out of the 256 bound.
-	s.mu.Lock()
-	s.history.h.Record("github.com/o/repo-a", "build", "C", "flaky", 1, false, time.Now().UTC())
-	s.history.h.Record("github.com/o/repo-a", "build", "C", "flaky", 1, true, time.Now().UTC())
-	s.mu.Unlock()
+	// Seed the whole-history snapshot a memory-mode server serves. ADAPTED:
+	// the single-slot s.history field became the keyed cache, so the seed
+	// goes through the cache's whole-history entry.
+	s.historyCache.update(historyWholeCacheKey, func(e *repoHistoryCacheEntry) {
+		e.history.Record("github.com/o/repo-a", "build", "C", "flaky", 1, false, time.Now().UTC())
+		e.history.Record("github.com/o/repo-a", "build", "C", "flaky", 1, true, time.Now().UTC())
+	})
 	if w := doJSONHeaders(t, s, http.MethodGet, "/api/v1/jobs/job-a/test-shards?shards=3", "runner-tok", "", hdrs); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"shards":3`) {
 		t.Fatalf("query shards = %d %s", w.Code, w.Body.String())
 	}
@@ -150,12 +153,15 @@ func TestFlowTestShardsRunLookupFailsClosed(t *testing.T) {
 
 func TestFlowTestShardsHistoryNil(t *testing.T) {
 	s := New("tok")
-	s.history = nil
+	// ADAPTED: the nil single-slot history guard became the empty keyed
+	// cache, which has no snapshot for any repository.
+	s.historyCache.invalidateAll()
 	if got := s.flakyFromHistory("github.com/o/repo-a"); got != nil {
-		t.Fatalf("nil-history flaky = %v", got)
+		t.Fatalf("uncached flaky = %v", got)
 	}
-	// testShards with a nil history is not reachable through the handler
-	// (New always installs one); the helper guard is covered above.
+	// testShards with an empty cache is not reachable through the handler
+	// (New always installs one whole-history snapshot); the helper guard is
+	// covered above.
 	_ = context.Background()
 	_ = model.Job{}
 }

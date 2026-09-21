@@ -15,7 +15,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -187,6 +187,30 @@ func (s *PostgresStore) revokeRunnerLeasesTx(ctx context.Context, tx pgx.Tx, run
 	return revoked, runIDs, nil
 }
 
+// repoIDForRecoveryTx resolves the quota-scoped canonical repository identity
+// for a recovery transition whose job payload cannot be decoded. The run row
+// (jobs.run_id is a NOT NULL foreign key) is the authoritative repository
+// metadata: its payload holds the same PolicyRepoID/RepoID/Repo+RepoFullName
+// the job payload was copied from, and canonicalPolicyRepoIDSQLExpr applies
+// the exact policy-first derivation the quota keys use. An empty result (no
+// run row, or a run whose payload is itself unresolvable) means there is no
+// scoped counter key to move: the caller tolerates it exactly like a missing
+// quota_reservations row.
+func (s *PostgresStore) repoIDForRecoveryTx(ctx context.Context, tx pgx.Tx, runID string) (string, error) {
+	if runID == "" {
+		return "", nil
+	}
+	var id string
+	err := tx.QueryRow(ctx, `SELECT `+canonicalPolicyRepoIDSQLExpr("repo")+` FROM runs WHERE id=$1`, runID).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(id), nil
+}
+
 // RecoverExpiredLease requeues or terminally fails ONE expired running lease
 // in a single transaction (see RecoveryStore.RecoverExpiredLease). The job
 // row is locked first and the runner row second, matching the claim and
@@ -195,6 +219,16 @@ func (s *PostgresStore) revokeRunnerLeasesTx(ctx context.Context, tx pgx.Tx, run
 // (asserted inside this transaction), so a replica whose cached leadership
 // outlived its advisory lock is rejected with ErrStaleLeader and recovers
 // nothing.
+//
+// A payload that cannot be decoded is NOT an abort: the row is still a
+// running lease holding a runner slot and a quota reservation, so the same
+// fenced transaction fails it terminally with CorruptLeaseRecoveryReason,
+// clears the lease columns, releases the runner active slot, the runner
+// failure counter, the running quota reservation (scoped by the run's
+// canonical identity) and recomputes dependents/run; the corrupt payload is
+// left untouched as evidence, while the relational columns carry the terminal
+// state. Retry fields (MaxInfraRetries) live in the payload and cannot be
+// trusted, so the forced transition is terminal failure — never a re-queue.
 func (s *PostgresStore) RecoverExpiredLease(ctx context.Context, jobID string, expectedGeneration int64, now time.Time) error {
 	if err := ValidateJobID(jobID); err != nil {
 		return err
@@ -234,7 +268,7 @@ func (s *PostgresStore) RecoverExpiredLease(ctx context.Context, jobID string, e
 	}
 	var j model.Job
 	if err := json.Unmarshal(payload, &j); err != nil {
-		return err
+		return s.recoverCorruptLeaseTx(ctx, tx, jobID, runID, key, leaseRunnerID, now)
 	}
 	j.ID = jobID
 	j.RunID = runID
@@ -302,12 +336,71 @@ func (s *PostgresStore) RecoverExpiredLease(ctx context.Context, jobID string, e
 	return tx.Commit(ctx)
 }
 
+// recoverCorruptLeaseTx applies the forced terminal recovery of an expired
+// running lease whose payload cannot be decoded, inside the caller's fenced
+// transaction. It releases every piece of SHARED capacity from the
+// relational columns: the runner active slot and failure counter
+// (lease_runner_id), the running quota reservation (scoped by the run's
+// canonical identity, see repoIDForRecoveryTx), the lease columns, and the
+// dependent/run aggregation. The payload is deliberately left untouched: it
+// is the corruption evidence, and the jobs columns are the authoritative
+// state every reader merges over it. The audit row records the forced
+// transition and why it is terminal.
+func (s *PostgresStore) recoverCorruptLeaseTx(ctx context.Context, tx pgx.Tx, jobID, runID, key, leaseRunnerID string, now time.Time) error {
+	repoID, err := s.repoIDForRecoveryTx(ctx, tx, runID)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE jobs SET status=$2, error=$3, finished_at=$4, lease_runner_id=NULL, lease_token_hash=NULL, lease_expires_at=NULL WHERE id=$1`,
+		jobID, string(model.StatusFailure), CorruptLeaseRecoveryReason, now); err != nil {
+		return err
+	}
+	// Retry policy (MaxInfraRetries) lives in the payload and cannot be
+	// trusted, so the forced transition is terminal failure and the running
+	// reservation is RELEASED, never converted into a queued reservation.
+	if err := s.adjustQuotaTx(ctx, tx, repoID, -1, 0); err != nil {
+		return err
+	}
+	if leaseRunnerID != "" {
+		if err := s.releaseRunnerSlotTx(ctx, tx, leaseRunnerID, jobID); err != nil {
+			return err
+		}
+		// The same accounting as a lost-runner recovery: one invalidated
+		// lease, one runner failure.
+		if _, err := tx.Exec(ctx, `UPDATE runners SET failed = failed + 1, last_seen = $2 WHERE id = $1`, leaseRunnerID, now); err != nil {
+			return err
+		}
+	}
+	auditJob := model.Job{ID: jobID, RunID: runID, Key: key}
+	if err := insertRecoveryAuditTx(ctx, tx, "job.corrupt_payload_recovered", "scheduler", auditJob, CorruptLeaseRecoveryReason,
+		map[string]string{"job": key, "reason": "corrupt_payload", "transition": "terminal_failure"}, now); err != nil {
+		return err
+	}
+	if err := s.recomputeDependentsTx(ctx, tx, jobID, now); err != nil {
+		return err
+	}
+	if err := s.recomputeRunTx(ctx, tx, runID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // ExpireQueuedJob terminal-cancels ONE queue-timed-out job in a single
 // transaction (see RecoveryStore.ExpireQueuedJob). The queued quota
 // reservation is released inside the same transaction, so a crash can never
 // leave a cancelled job still holding queue depth. Like every leader-only
 // recovery mutation it is epoch-FENCED inside the transaction: a stale leader
 // is rejected with ErrStaleLeader and expires nothing.
+//
+// deadline is the queue_deadline COLUMN the discovery observed; a ZERO
+// deadline means the candidate carried no persisted column (a legacy row
+// whose only deadline source is the payload). The effective deadline is
+// re-derived under the row lock: the column first, then — only while the
+// payload decodes — the payload/compiled fallback with QueueDeadlineFor
+// semantics. A payload that cannot be decoded no longer aborts the expiry
+// when the column proves the deadline: the malformed job is terminally
+// cancelled with CorruptQueueExpiryReason, the queued reservation is
+// released, and the corrupt payload stays untouched as evidence.
 func (s *PostgresStore) ExpireQueuedJob(ctx context.Context, jobID string, deadline time.Time) error {
 	if err := ValidateJobID(jobID); err != nil {
 		return err
@@ -318,15 +411,20 @@ func (s *PostgresStore) ExpireQueuedJob(ctx context.Context, jobID string, deadl
 	}
 	defer tx.Rollback(ctx)
 	now := time.Now().UTC()
+	var observed *time.Time
+	if !deadline.IsZero() {
+		observed = &deadline
+	}
 
 	var (
-		payload []byte
-		status  string
-		runID   string
-		key     string
+		payload        []byte
+		status         string
+		runID          string
+		key            string
+		columnDeadline *time.Time
 	)
-	err = tx.QueryRow(ctx, `SELECT payload, status, run_id, key FROM jobs WHERE id=$1 FOR UPDATE`, jobID).
-		Scan(&payload, &status, &runID, &key)
+	err = tx.QueryRow(ctx, `SELECT payload, status, run_id, key, queue_deadline FROM jobs WHERE id=$1 FOR UPDATE`, jobID).
+		Scan(&payload, &status, &runID, &key, &columnDeadline)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -338,37 +436,73 @@ func (s *PostgresStore) ExpireQueuedJob(ctx context.Context, jobID string, deadl
 		return tx.Commit(ctx)
 	}
 	var j model.Job
-	if err := json.Unmarshal(payload, &j); err != nil {
-		return err
-	}
+	decodeErr := json.Unmarshal(payload, &j)
 	j.ID = jobID
 	j.RunID = runID
 	j.Key = key
-	eff := QueueDeadlineFor(j)
-	if eff == nil || eff.After(deadline) || deadline.After(now) {
-		// The deadline was cleared, moved past what the caller observed, or
-		// has not actually passed yet: nothing to expire.
+	// The persisted column is authoritative; a NULL column falls back to the
+	// payload-derived deadline exactly like QueueDeadlineFor, but only while
+	// the payload can be trusted. An undecodable payload can therefore never
+	// invent a deadline — it only keeps the row expirable when the column
+	// itself proves one elapsed.
+	eff := columnDeadline
+	if eff == nil {
+		if decodeErr != nil {
+			return tx.Commit(ctx)
+		}
+		eff = QueueDeadlineFor(j)
+	}
+	if eff == nil || eff.After(now) || (observed != nil && (eff.After(*observed) || observed.After(now))) {
+		// No provable deadline, the deadline was cleared or moved past what
+		// the caller observed, or it has not actually passed yet: nothing to
+		// expire.
 		return tx.Commit(ctx)
 	}
+	corrupt := decodeErr != nil
+	reason := "queue timeout"
+	action := "job.queue_timeout"
+	msg := "job cancelled after queue deadline"
+	if corrupt {
+		reason = CorruptQueueExpiryReason
+		action = "job.corrupt_payload_expired"
+		msg = CorruptQueueExpiryReason
+	}
 	j.Status = model.StatusCancelled
-	j.Error = "queue timeout"
+	j.Error = reason
 	j.FinishedAt = &now
 	j.LeaseRunnerID = ""
 	j.LeaseTokenHash = nil
 	j.LeaseExpiresAt = nil
-	jp, err := jsonMarshal(j)
-	if err != nil {
+	if corrupt {
+		// Columns only: the payload is the corruption evidence and is never
+		// rewritten (readers merge the columns over it).
+		if _, err := tx.Exec(ctx, `UPDATE jobs SET status='cancelled', error=$2, finished_at=$3, lease_runner_id=NULL, lease_token_hash=NULL, lease_expires_at=NULL WHERE id=$1`,
+			jobID, reason, now); err != nil {
+			return err
+		}
+	} else {
+		jp, err := jsonMarshal(j)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE jobs SET status='cancelled', error=$2, finished_at=$3, lease_runner_id=NULL, lease_token_hash=NULL, lease_expires_at=NULL, payload=$4 WHERE id=$1`,
+			jobID, reason, now, jp); err != nil {
+			return err
+		}
+	}
+	// A timed-out job never runs: return its reserved queued slot. The quota
+	// scope comes from the job payload normally, and from the run's canonical
+	// identity when the job payload is corrupt.
+	repoID := RepoIDForJob(j)
+	if corrupt {
+		if repoID, err = s.repoIDForRecoveryTx(ctx, tx, runID); err != nil {
+			return err
+		}
+	}
+	if err := s.adjustQuotaTx(ctx, tx, repoID, 0, -1); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE jobs SET status='cancelled', error=$2, finished_at=$3, lease_runner_id=NULL, lease_token_hash=NULL, lease_expires_at=NULL, payload=$4 WHERE id=$1`,
-		jobID, "queue timeout", now, jp); err != nil {
-		return err
-	}
-	// A timed-out job never runs: return its reserved queued slot.
-	if err := s.adjustQuotaTx(ctx, tx, RepoIDForJob(j), 0, -1); err != nil {
-		return err
-	}
-	if err := insertRecoveryAuditTx(ctx, tx, "job.queue_timeout", "scheduler", j, "job cancelled after queue deadline", map[string]string{"job": key}, now); err != nil {
+	if err := insertRecoveryAuditTx(ctx, tx, action, "scheduler", j, msg, map[string]string{"job": key}, now); err != nil {
 		return err
 	}
 	if err := s.recomputeDependentsTx(ctx, tx, jobID, now); err != nil {
@@ -384,79 +518,51 @@ func (s *PostgresStore) ExpireQueuedJob(ctx context.Context, jobID string, deadl
 // bounded candidate discovery (RecoveryScanStore)
 // ---------------------------------------------------------------------------
 
-// listRecoveryCandidates runs bounded, id-ordered candidate pages and
-// decodes each row. A row whose payload cannot be decoded is logged and
-// SKIPPED instead of failing the page: the page is ordered by id, so aborting
-// on one bad row would shadow every candidate behind it on every sweep (the
-// same permanent-miss class this discovery exists to remove). Because a
-// skipped row shrinks the DECODED page, the loop keeps scanning where the
-// previous page ended until it has returned at most limit decoded candidates
-// or the candidate set is exhausted — so the caller's "short page means done"
-// contract always holds. The applier re-reads and re-checks every candidate
-// inside its own transaction.
-func (s *PostgresStore) listRecoveryCandidates(ctx context.Context, what, query string, now time.Time, afterID string, limit int) ([]model.Job, error) {
-	out := []model.Job{}
-	for {
-		remaining := limit - len(out)
-		jobs, scanned, lastID, err := s.scanRecoveryPage(ctx, what, query, now, afterID, remaining)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, jobs...)
-		if len(out) >= limit || scanned < remaining {
-			return out, nil
-		}
-		// The SQL page was full but decoded fewer rows than it carried
-		// (undecodable rows were skipped): resume strictly after the last row
-		// the database actually returned.
-		afterID = lastID
-	}
-}
+// recoveryCandidateCols is the exact relational column list the queue-timeout
+// candidate query scans into RecoveryCandidate. lease_generation is taken
+// from the column (payload copies are stale by design: lease claims update
+// columns without rewriting the payload) and queue_deadline is the
+// migration-0021 column. The expired-running query selects a NULL deadline
+// instead: lease recovery has no queue deadline to observe.
+const recoveryCandidateCols = "id, lease_generation, queue_deadline"
 
-// scanRecoveryPage runs ONE SQL page (at most limit rows, id > afterID) and
-// returns the decoded jobs, how many rows the database actually returned, and
-// the last scanned id. scanned is the page-completeness signal: a full scan
-// that decoded fewer rows only means undecodable rows were skipped, so the
-// caller must continue from lastID rather than treat the page as exhausted.
-// The scan stops as soon as limit candidates were decoded; the cursor then
-// sits on the last consumed row, so unconsumed rows of this SQL page are
-// picked up by the next call rather than lost.
-func (s *PostgresStore) scanRecoveryPage(ctx context.Context, what, query string, now time.Time, afterID string, limit int) ([]model.Job, int, string, error) {
+// listRecoveryCandidates runs ONE bounded, id-ordered candidate page. No
+// payload is read, let alone decoded: an individually undecodable payload can
+// neither shrink the page (which used to make a corrupt row disappear from
+// every sweep) nor shadow the candidates after it. The applier re-reads and
+// re-checks every candidate inside its own transaction.
+func (s *PostgresStore) listRecoveryCandidates(ctx context.Context, query string, now time.Time, afterID string, limit int) ([]RecoveryCandidate, error) {
 	rows, err := s.pool.Query(ctx, query, now, afterID, limit)
 	if err != nil {
-		return nil, 0, afterID, err
+		return nil, err
 	}
 	defer rows.Close()
-	out := []model.Job{}
-	scanned := 0
-	lastID := afterID
-	for rows.Next() && len(out) < limit {
-		scanned++
-		js := jobScanner{}
-		if err := rows.Scan(jobTargets(&js)...); err != nil {
-			return nil, scanned, lastID, err
+	out := []RecoveryCandidate{}
+	for rows.Next() {
+		var c RecoveryCandidate
+		if err := rows.Scan(&c.ID, &c.LeaseGeneration, &c.QueueDeadline); err != nil {
+			return nil, err
 		}
-		lastID = js.id
-		j, err := js.job()
-		if err != nil {
-			log.Printf("storage: %s: skip undecodable job %s: %v", what, js.id, err)
-			continue
-		}
-		out = append(out, j)
+		out = append(out, c)
 	}
-	return out, scanned, lastID, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // ListExpiredRunningJobs returns one bounded page of running jobs whose lease
-// expired at or before now (see RecoveryScanStore for the cursor contract).
-// A running job with a NULL lease_expires_at is included: it is an orphaned
-// lease with no recorded expiry, exactly what the sweep must recover.
-func (s *PostgresStore) ListExpiredRunningJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]model.Job, error) {
+// expired at or before now (see RecoveryDiscoveryStore for the cursor
+// contract). A running job with a NULL lease_expires_at is included: it is an
+// orphaned lease with no recorded expiry, exactly what the sweep must recover.
+// The candidate's QueueDeadline is NULL by construction: a lease recovery has
+// no queue deadline to observe.
+func (s *PostgresStore) ListExpiredRunningJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]RecoveryCandidate, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
-	return s.listRecoveryCandidates(ctx, "list expired running jobs",
-		`SELECT `+jobCols+` FROM jobs
+	return s.listRecoveryCandidates(ctx,
+		`SELECT id, lease_generation, NULL::timestamptz FROM jobs
 		 WHERE status='running' AND (lease_expires_at IS NULL OR lease_expires_at <= $1) AND id > $2
 		 ORDER BY id ASC LIMIT $3`, now, afterID, limit)
 }
@@ -467,14 +573,15 @@ func (s *PostgresStore) ListExpiredRunningJobs(ctx context.Context, now time.Tim
 // indexed discovery source; rows whose column is NULL but whose payload still
 // carries a deadline (legacy compiled-payload queue_timeout, or a payload
 // written outside the canonical job path) are returned by the fallback
-// predicate as a SUPERSET, and the caller re-derives the effective deadline
-// with QueueDeadlineFor before applying.
-func (s *PostgresStore) ListQueueTimedOutJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]model.Job, error) {
+// predicate as a SUPERSET. The candidate carries the COLUMN deadline (nil for
+// the fallback rows); the applier re-derives the effective deadline with
+// QueueDeadlineFor semantics under its own row lock before applying.
+func (s *PostgresStore) ListQueueTimedOutJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]RecoveryCandidate, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
-	return s.listRecoveryCandidates(ctx, "list queue-timed-out jobs",
-		`SELECT `+jobCols+` FROM jobs
+	return s.listRecoveryCandidates(ctx,
+		`SELECT `+recoveryCandidateCols+` FROM jobs
 		 WHERE status IN ('queued', 'waiting_approval')
 		   AND id > $2
 		   AND (

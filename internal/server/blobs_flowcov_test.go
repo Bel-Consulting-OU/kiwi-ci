@@ -256,6 +256,21 @@ func (f *fcStore) AppendDownstreamRun(ctx context.Context, runID, childRunID str
 	return f.dbFakeStore.AppendDownstreamRun(ctx, runID, childRunID)
 }
 
+// The leader-fenced variants delegate to the fake's unfenced implementations:
+// the double models a store without a leadership epoch (fs-mode semantics),
+// so there is nothing to fence.
+func (f *fcStore) ReserveDownstreamLaunchLeader(ctx context.Context, parentJobID, targetRepo, targetRef, launchToken string) (bool, error) {
+	return f.ReserveDownstreamLaunch(ctx, parentJobID, targetRepo, targetRef, launchToken)
+}
+
+func (f *fcStore) ReleaseDownstreamReservationLeader(ctx context.Context, parentJobID, targetRepo, targetRef string) error {
+	return f.ReleaseDownstreamReservation(ctx, parentJobID, targetRepo, targetRef)
+}
+
+func (f *fcStore) AppendDownstreamRunLeader(ctx context.Context, runID, childRunID string) error {
+	return f.AppendDownstreamRun(ctx, runID, childRunID)
+}
+
 func (f *fcStore) ReopenRunForChildren(ctx context.Context, runID string) error {
 	if f.reopenRunErr != nil {
 		return f.reopenRunErr

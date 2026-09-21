@@ -7,8 +7,12 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -104,6 +108,131 @@ func TestPostgresIntegrationServerTestIntelScopedHistory(t *testing.T) {
 	shards := pgITDo(t, s, http.MethodGet, "/api/v1/jobs/"+task.Job.ID+"/test-shards?shards=2", "token", "", pgITLeaseHeaders(task, runnerID))
 	if shards.Code != http.StatusOK {
 		t.Fatalf("test-shards = %d: %s", shards.Code, shards.Body.String())
+	}
+}
+
+// TestPostgresIntegrationServerTestHistoryKeyedPerRepo is the live-PostgreSQL
+// half of the keyed-cache regression: two repositories in one schema with
+// disjoint histories, and every shard response (sequential and concurrent)
+// must answer exactly its OWN repository's generation — never the other
+// repository's history and never a mix.
+func TestPostgresIntegrationServerTestHistoryKeyedPerRepo(t *testing.T) {
+	env := pgITServerSetup(t)
+	s, _ := pgITServerWithEnv(t, env, t.TempDir())
+	pgITServerAwaitLeadership(t, s)
+	runnerID := pgITRegisterRunner(t, s)
+
+	submitRepo := func(fullName string) Task {
+		t.Helper()
+		body, err := json.Marshal(SubmitRun{
+			RepoURL: "https://github.com/" + fullName + ".git", RepoFullName: fullName,
+			Ref: "refs/heads/main", SHA: "abc123", Event: "push", Pipeline: pgITServerPipeline,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := pgITDo(t, s, http.MethodPost, "/api/v1/runs", "token", string(body), nil)
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("submit %s: %d %s", fullName, w.Code, w.Body.String())
+		}
+		return pgITNext(t, s, runnerID)
+	}
+
+	// Repo A: two tests, one of them flaky. Repo B: a different test.
+	taskA := submitRepo("o/pg-a")
+	if w := pgITUploadTestReport(t, s, runnerID, taskA, model.TestResult{Name: "pg-a-1", Passed: false}); w.Code != http.StatusCreated {
+		t.Fatalf("A upload 1 = %d: %s", w.Code, w.Body.String())
+	}
+	if w := pgITUploadTestReport(t, s, runnerID, taskA, model.TestResult{Name: "pg-a-1", Passed: true}); w.Code != http.StatusCreated {
+		t.Fatalf("A upload 2 = %d: %s", w.Code, w.Body.String())
+	}
+	if w := pgITUploadTestReport(t, s, runnerID, taskA, model.TestResult{Name: "pg-a-2", Passed: true}); w.Code != http.StatusCreated {
+		t.Fatalf("A upload 3 = %d: %s", w.Code, w.Body.String())
+	}
+	taskB := submitRepo("o/pg-b")
+	if w := pgITUploadTestReport(t, s, runnerID, taskB, model.TestResult{Name: "pg-b-1", Passed: true}); w.Code != http.StatusCreated {
+		t.Fatalf("B upload = %d: %s", w.Code, w.Body.String())
+	}
+
+	type shardBody struct {
+		Repo       string     `json:"repo"`
+		Manifest   []string   `json:"manifest"`
+		Assignment [][]string `json:"assignment"`
+		Flaky      []string   `json:"flaky_tests"`
+	}
+	var mu sync.Mutex
+	var problems []string
+	report := func(format string, args ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		if len(problems) < 10 {
+			problems = append(problems, fmt.Sprintf(format, args...))
+		}
+	}
+	check := func(task Task, wantRepo string, wantManifest, wantFlaky []string) {
+		w := pgITDo(t, s, http.MethodGet, "/api/v1/jobs/"+task.Job.ID+"/test-shards?shards=2", "token", "", pgITLeaseHeaders(task, runnerID))
+		if w.Code != http.StatusOK {
+			report("repo %s: test-shards = %d: %s", wantRepo, w.Code, w.Body.String())
+			return
+		}
+		var out shardBody
+		if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+			report("repo %s: decode: %v", wantRepo, err)
+			return
+		}
+		seen := map[string]int{}
+		for _, shard := range out.Assignment {
+			for _, name := range shard {
+				seen[name]++
+			}
+		}
+		for _, name := range wantManifest {
+			if seen[name] != 1 {
+				report("repo %s: test %s appears %d times across shards", wantRepo, name, seen[name])
+			}
+		}
+		if len(seen) != len(wantManifest) {
+			report("repo %s: assignment covers %d tests, want %d", wantRepo, len(seen), len(wantManifest))
+		}
+		if out.Repo != wantRepo || !reflect.DeepEqual(out.Manifest, wantManifest) || !reflect.DeepEqual(out.Flaky, wantFlaky) {
+			report("repo %s: response repo=%q manifest=%v flaky=%v; want %v/%v", wantRepo, out.Repo, out.Manifest, out.Flaky, wantManifest, wantFlaky)
+		}
+	}
+	manifestA, flakyA := []string{"pg-a-1", "pg-a-2"}, []string{"pg-a-1"}
+	manifestB, flakyB := []string{"pg-b-1"}, []string{}
+
+	// Sequential: the pre-fix single slot swapped A's generation for B's as
+	// soon as B was loaded.
+	check(taskA, "github.com/o/pg-a", manifestA, flakyA)
+	check(taskB, "github.com/o/pg-b", manifestB, flakyB)
+	check(taskA, "github.com/o/pg-a", manifestA, flakyA)
+
+	// Concurrent: many simultaneous requests for both repositories.
+	var wg sync.WaitGroup
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func(seed int) {
+			defer wg.Done()
+			order := []Task{taskA, taskB}
+			manifests := [][]string{manifestA, manifestB}
+			flakies := [][]string{flakyA, flakyB}
+			repos := []string{"github.com/o/pg-a", "github.com/o/pg-b"}
+			if seed%2 == 1 {
+				order = []Task{taskB, taskA}
+				manifests = [][]string{manifestB, manifestA}
+				flakies = [][]string{flakyB, flakyA}
+				repos = []string{"github.com/o/pg-b", "github.com/o/pg-a"}
+			}
+			for i := 0; i < 4; i++ {
+				for j := range order {
+					check(order[j], repos[j], manifests[j], flakies[j])
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	if len(problems) > 0 {
+		t.Fatalf("keyed snapshot verification failed:\n%s", strings.Join(problems, "\n"))
 	}
 }
 

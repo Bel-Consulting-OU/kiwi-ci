@@ -3,8 +3,10 @@ package storage
 // Real-PostgreSQL integration coverage for the bounded recovery discovery
 // queries (RecoveryDiscoveryStore): deterministic id-ordered keyset paging,
 // the queue_deadline column stamped by the canonical job writes, the legacy
-// compiled-payload fallback for rows whose column is NULL, and the tolerant
-// skip of individually undecodable payloads.
+// compiled-payload fallback for rows whose column is NULL, and the
+// relational-column candidate that keeps individually undecodable rows
+// discoverable (and their capacity reclaimable) instead of silently skipping
+// them out of every sweep.
 
 import (
 	"context"
@@ -22,7 +24,7 @@ func pgITRecoveryJob(runID, jobID string, status model.Status) model.Job {
 
 // pgITRecoveryPage collects one full id-ordered page walk (pages of 2) and
 // asserts the cursor is strictly increasing, so the caller only checks ids.
-func pgITRecoveryPage(t *testing.T, fetch func(afterID string) ([]model.Job, error)) []string {
+func pgITRecoveryPage(t *testing.T, fetch func(afterID string) ([]RecoveryCandidate, error)) []string {
 	t.Helper()
 	var got []string
 	afterID := ""
@@ -31,12 +33,12 @@ func pgITRecoveryPage(t *testing.T, fetch func(afterID string) ([]model.Job, err
 		if err != nil {
 			t.Fatalf("page after %q: %v", afterID, err)
 		}
-		for _, j := range page {
-			if afterID != "" && j.ID <= afterID {
-				t.Fatalf("cursor not strictly increasing: %q after %q", j.ID, afterID)
+		for _, c := range page {
+			if afterID != "" && c.ID <= afterID {
+				t.Fatalf("cursor not strictly increasing: %q after %q", c.ID, afterID)
 			}
-			got = append(got, j.ID)
-			afterID = j.ID
+			got = append(got, c.ID)
+			afterID = c.ID
 		}
 		if len(page) < 2 {
 			return got
@@ -97,7 +99,10 @@ func TestPostgresIntegrationRecoveryScanDiscoveryPagesDeterministically(t *testi
 	}
 
 	// A row whose payload is undecodable but whose id may sort before valid
-	// candidates must be skipped without failing the page.
+	// candidates must still be DISCOVERED: the candidate is built from the
+	// relational columns alone (id, lease_generation), so corruption can no
+	// longer hide the row (and its stranded lease/slot/quota) from every
+	// sweep. The applier transaction is where the corrupt payload is handled.
 	corruptID := "00000000000000000000000000000000"
 	if _, err := st.pool.Exec(ctx, `INSERT INTO jobs (id, run_id, key, status, attempts, lease_runner_id, lease_generation, lease_expires_at, created_at, queue_deadline, payload) VALUES ($1, $2, 'build', 'running', 1, 'runner-x', 1, $3, $4, $3, '"scalar"'::jsonb)`,
 		corruptID, runID, expired, now); err != nil {
@@ -115,18 +120,53 @@ func TestPostgresIntegrationRecoveryScanDiscoveryPagesDeterministically(t *testi
 		t.Fatalf("null column: %v", err)
 	}
 
-	leaseIDs := pgITRecoveryPage(t, func(afterID string) ([]model.Job, error) {
+	leaseIDs := pgITRecoveryPage(t, func(afterID string) ([]RecoveryCandidate, error) {
 		return st.ListExpiredRunningJobs(ctx, now, afterID, 2)
 	})
-	if len(leaseIDs) != 2 || !pgITSameSet(leaseIDs, runningExpired, runningNoExpiry) {
-		t.Fatalf("expired-lease candidates = %v, want [%s %s] (corrupt %s skipped)", leaseIDs, runningExpired, runningNoExpiry, corruptID)
+	if len(leaseIDs) != 3 || !pgITSameSet(leaseIDs, runningExpired, runningNoExpiry, corruptID) {
+		t.Fatalf("expired-lease candidates = %v, want [%s %s %s] (the corrupt row is discovered, never skipped)", leaseIDs, runningExpired, runningNoExpiry, corruptID)
+	}
+	// The candidate for the corrupt row carries the authoritative relational
+	// columns, not a decoded payload: generation 1, no queued deadline (the
+	// running page is lease-only, so its deadline column is NULL by
+	// construction even though the row itself has a queue_deadline column).
+	page, err := st.ListExpiredRunningJobs(ctx, now, "", 10)
+	if err != nil {
+		t.Fatalf("list expired running jobs: %v", err)
+	}
+	seenCorrupt := false
+	for _, c := range page {
+		if c.ID != corruptID {
+			continue
+		}
+		seenCorrupt = true
+		if c.LeaseGeneration != 1 || c.QueueDeadline != nil {
+			t.Fatalf("corrupt candidate = gen %d deadline %v, want 1/nil", c.LeaseGeneration, c.QueueDeadline)
+		}
+	}
+	if !seenCorrupt {
+		t.Fatalf("corrupt row %s missing from the running candidates %v", corruptID, page)
 	}
 
-	queueIDs := pgITRecoveryPage(t, func(afterID string) ([]model.Job, error) {
+	queueIDs := pgITRecoveryPage(t, func(afterID string) ([]RecoveryCandidate, error) {
 		return st.ListQueueTimedOutJobs(ctx, now, afterID, 2)
 	})
 	if len(queueIDs) != 4 || !pgITSameSet(queueIDs, queuedPast, waitingPast, legacyFallback, staleColumn) {
 		t.Fatalf("queue candidates = %v, want [%s %s %s %s]", queueIDs, queuedPast, waitingPast, legacyFallback, staleColumn)
+	}
+	// A payload-only legacy deadline surfaces as a candidate with a NIL
+	// column deadline: the applier derives the effective deadline itself.
+	legacyCandidates, err := st.ListQueueTimedOutJobs(ctx, now, "", 10)
+	if err != nil {
+		t.Fatalf("queue candidates: %v", err)
+	}
+	for _, c := range legacyCandidates {
+		if c.ID == legacyFallback && c.QueueDeadline != nil {
+			t.Fatalf("legacy payload-only candidate deadline = %v, want nil (column is the candidate source)", c.QueueDeadline)
+		}
+		if c.ID == queuedPast && (c.QueueDeadline == nil || !c.QueueDeadline.Equal(past)) {
+			t.Fatalf("column-deadline candidate = %v, want %v", c.QueueDeadline, past)
+		}
 	}
 
 	// The canonical job write stamped the derived column for the persisted
@@ -233,18 +273,29 @@ func TestPostgresIntegrationRecoveryQueueDeadlineMigration(t *testing.T) {
 		t.Fatalf("recovery indexes = %d, want 2", indexes)
 	}
 
-	// The backfilled elapsed row is a discovery candidate right away; the
-	// malformed one is not (its column stayed NULL and it has no legacy
-	// compiled-payload timeout either).
+	// The backfilled elapsed row is a discovery candidate right away with the
+	// backfilled column as its deadline. The malformed-deadline row is ALSO
+	// discovered (it has a deadline SOURCE, and discovery no longer decodes
+	// payloads), but its candidate carries a NIL column deadline: the applier
+	// cannot derive one from the malformed payload, so the row is never
+	// expire-without-proof (it never had a valid deadline to begin with).
 	page, err := st.ListQueueTimedOutJobs(ctx, time.Now().UTC(), "", 10)
 	if err != nil {
 		t.Fatalf("ListQueueTimedOutJobs: %v", err)
 	}
 	var ids []string
-	for _, j := range page {
-		ids = append(ids, j.ID)
+	deadlines := map[string]*time.Time{}
+	for _, c := range page {
+		ids = append(ids, c.ID)
+		deadlines[c.ID] = c.QueueDeadline
 	}
-	if !pgITSameSet(ids, backfilled) {
-		t.Fatalf("queue candidates after migration = %v, want [%s]", ids, backfilled)
+	if !pgITSameSet(ids, backfilled, guarded) {
+		t.Fatalf("queue candidates after migration = %v, want [%s %s]", ids, backfilled, guarded)
+	}
+	if deadlines[backfilled] == nil || !deadlines[backfilled].Equal(want) {
+		t.Fatalf("backfilled candidate deadline = %v, want %v", deadlines[backfilled], want)
+	}
+	if deadlines[guarded] != nil {
+		t.Fatalf("malformed candidate deadline = %v, want nil (no provable deadline)", deadlines[guarded])
 	}
 }

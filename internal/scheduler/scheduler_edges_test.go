@@ -110,7 +110,7 @@ func (s *injectedStore) ListRuns(ctx context.Context, limit int) ([]model.Run, e
 	return s.fakeStore.ListRuns(ctx, limit)
 }
 
-func (s *injectedStore) ListExpiredRunningJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]model.Job, error) {
+func (s *injectedStore) ListExpiredRunningJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]storage.RecoveryCandidate, error) {
 	s.listExpiredCalls++
 	if s.listExpiredErr != nil {
 		return nil, s.listExpiredErr
@@ -118,7 +118,7 @@ func (s *injectedStore) ListExpiredRunningJobs(ctx context.Context, now time.Tim
 	return s.fakeStore.ListExpiredRunningJobs(ctx, now, afterID, limit)
 }
 
-func (s *injectedStore) ListQueueTimedOutJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]model.Job, error) {
+func (s *injectedStore) ListQueueTimedOutJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]storage.RecoveryCandidate, error) {
 	s.listQueueTOCalls++
 	if s.listQueueTOErr != nil {
 		return nil, s.listQueueTOErr

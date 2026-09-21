@@ -762,8 +762,8 @@ func (o *Outbox) flushLocal(ctx context.Context, dispatch func(context.Context, 
 // next tick).
 const outboxFlushMaxBatches = 64
 
-// outboxClaimReleaseTimeout bounds one claim-cleanup statement issued after
-// dispatch (see releaseOutboxClaimCleanup).
+// outboxClaimReleaseTimeout bounds the aggregate claim-cleanup statement
+// issued after dispatch (see releaseOutboxClaimsCleanup).
 const outboxClaimReleaseTimeout = 5 * time.Second
 
 // outboxFlushTimeout bounds one outbox flush cycle (see flushOutbox).
@@ -790,17 +790,53 @@ func boundedDetach(origin context.Context, bound time.Duration) (context.Context
 	return context.WithTimeout(context.WithoutCancel(origin), bound)
 }
 
-// releaseOutboxClaimCleanup releases one claimed-but-unhandled outbox row
-// with a context that OUTLIVES the dispatch context. flushOutbox bounds the
-// dispatch to two minutes and the caller may cancel it sooner; a release on
-// that context reaches PostgreSQL already cancelled, so pgx refuses it and
-// (if the error were discarded) up to OutboxClaimBatch claimed rows would stay
-// invisible to every other replica until OutboxClaimTTL. The boundedDetach
+// releaseOutboxClaimsCleanup releases every claimed-but-unhandled row of one
+// claim batch with a context that OUTLIVES the dispatch context. flushOutbox
+// bounds the dispatch to two minutes and the caller may cancel it sooner; a
+// release on that context reaches PostgreSQL already cancelled, so pgx refuses
+// it and (if the error were discarded) up to OutboxClaimBatch claimed rows
+// would stay invisible to every other replica until OutboxClaimTTL.
+//
+// When the store implements storage.OutboxClaimBatchStore (PostgresStore and
+// every other shipped durable store do; the interface exists precisely for
+// this cleanup) the whole batch is cleared in ONE aggregate statement under
+// ONE fresh bounded deadline: one context, one round trip. The previous
+// per-row loop created a fresh outboxClaimReleaseTimeout per row, so a full
+// OutboxClaimBatch (64) could spend 64*5s after the dispatch context was
+// already gone — the pathology the batch primitive removes. The boundedDetach
 // helper is the ONLY sanctioned detach in this package: it drops cancellation
-// while preserving values and imposes a FRESH timeout per release (rather than
-// one per flush), so each release gets a full window even though the deferred
-// cleanup runs after the batch dispatch, when a context created at claim time
-// could already be expired. Failures are logged with the row ID instead of
+// while preserving values and imposes the FRESH timeout.
+//
+// Stores that lack the batch capability keep the per-row compatibility loop
+// (releaseOutboxClaimCleanup) so no store silently loses its cleanup. The
+// fallback names the store type once, so an operator can see which store is
+// missing the contract; batch-release failures are logged with the number of
+// stranded claims and the error instead of discarded: the rows stay durable
+// and are reclaimed after the TTL, but the operator must see why the retry is
+// delayed.
+func (o *Outbox) releaseOutboxClaimsCleanup(ctx context.Context, ids []string, claimer string) {
+	if len(ids) == 0 {
+		return
+	}
+	if batch, ok := o.db.(storage.OutboxClaimBatchStore); ok {
+		cleanupCtx, cancel := boundedDetach(ctx, outboxClaimReleaseTimeout)
+		defer cancel()
+		if _, err := batch.ReleaseOutboxClaims(cleanupCtx, ids, claimer); err != nil {
+			log.Printf("outbox: batch release of %d claim(s): %v (rows stay claimed until OutboxClaimTTL)", len(ids), err)
+		}
+		return
+	}
+	log.Printf("outbox: store %T lacks storage.OutboxClaimBatchStore; releasing %d claim(s) row by row", o.db, len(ids))
+	for _, id := range ids {
+		o.releaseOutboxClaimCleanup(ctx, id, claimer)
+	}
+}
+
+// releaseOutboxClaimCleanup is the per-row fallback of
+// releaseOutboxClaimsCleanup for stores without the batch capability: it
+// releases one claimed-but-unhandled outbox row with a context that OUTLIVES
+// the dispatch context. It is never used for PostgresStore, which always
+// takes the aggregate branch. Failures are logged with the row ID instead of
 // discarded: the row stays durable and is reclaimed after the TTL, but the
 // operator must see why the retry is delayed.
 func (o *Outbox) releaseOutboxClaimCleanup(ctx context.Context, id, claimer string) {
@@ -862,26 +898,32 @@ func (o *Outbox) flushDBBatch(ctx context.Context, dispatch func(context.Context
 	dispatched := 0
 	var failed []string
 	// acked records the claimed rows this call ACKed durably. The deferred
-	// release then covers EVERY OTHER claimed row, so the batch invariant is
+	// sweep then covers EVERY OTHER claimed row, so the batch invariant is
 	// simply "every claimed row ends this call ACKed or released". Deciding
 	// "handled" from local-queue membership was wrong: after an early ACK
 	// error every not-yet-dispatched claimed row is still queued locally and
-	// its claim was left held until OutboxClaimTTL expired. Every release (the
-	// explicit ones above/below and this deferred sweep) runs through
-	// releaseOutboxClaimCleanup, whose context survives the dispatch context:
-	// this cleanup runs exactly when that context may already be cancelled or
-	// expired, and a claim stranded there hides the row from every other
-	// replica for the whole TTL. Releasing an already-ACKed row or a claim
-	// this call already released is a no-op in every store (they clear only
-	// the caller's own claim).
+	// its claim was left held until OutboxClaimTTL expired. The sweep is the
+	// ONLY release path: the per-row releases that used to sit in the
+	// dispatch/ACK failure branches were redundant (OutboxRetry clears the
+	// claim atomically with the backoff, and the failed-ACK row plus every
+	// still-undispatched row is covered here), and each of them cost a
+	// separate round trip on a context that is typically already dead.
+	// releaseOutboxClaimsCleanup clears the whole slice in ONE aggregate call
+	// under one fresh bounded deadline when the store supports it, and its
+	// context survives the dispatch context: this cleanup runs exactly when
+	// that context may already be cancelled or expired, and a claim stranded
+	// there hides the row from every other replica for the whole TTL.
+	// Releasing an already-ACKed row or a claim this call already released is
+	// a no-op in every store (they clear only the caller's own claim).
 	acked := make(map[string]bool, len(claimed))
 	defer func() {
+		unacked := make([]string, 0, len(claimed))
 		for _, it := range claimed {
-			if acked[it.ID] {
-				continue
+			if !acked[it.ID] {
+				unacked = append(unacked, it.ID)
 			}
-			o.releaseOutboxClaimCleanup(ctx, it.ID, claimer)
 		}
+		o.releaseOutboxClaimsCleanup(ctx, unacked, claimer)
 	}()
 	for {
 		o.mu.Lock()
@@ -910,7 +952,12 @@ func (o *Outbox) flushDBBatch(ctx context.Context, dispatch func(context.Context
 				if rerr := o.retryOutboxRow(ctx, it, derr); rerr != nil {
 					log.Printf("outbox: retry record %s: %v", it.ID, rerr)
 				}
-				o.releaseOutboxClaimCleanup(ctx, it.ID, claimer)
+				// No explicit release: OutboxRetry clears the claim
+				// atomically with the backoff update (SQL NULLs
+				// claimed_at/claimed_by in the same statement), so a
+				// per-row release here would be a duplicate round trip. A
+				// store without retry metadata is covered by the deferred
+				// aggregate sweep like every other un-ACKed row.
 			}
 			// Drop the FAILED attempt from the local queue: the durable row
 			// (with next_attempt_at) is the retry vehicle, and leaving it
@@ -922,12 +969,11 @@ func (o *Outbox) flushDBBatch(ctx context.Context, dispatch func(context.Context
 			continue
 		}
 		// Durable ACK BEFORE the local removal (and before the claim is
-		// considered satisfied): an ack failure keeps the item queued and
-		// releases the claim so the retry does not wait out the TTL.
+		// considered satisfied): an ack failure keeps the item queued and the
+		// deferred sweep releases this row and every still-undispatched
+		// claimed row in one aggregate call, on a context that is not the
+		// dead flush context, so the retry does not wait out the TTL.
 		if err := o.db.OutboxAck(ctx, it.ID); err != nil {
-			if owned[it.ID] {
-				o.releaseOutboxClaimCleanup(ctx, it.ID, claimer)
-			}
 			return dispatched, len(claimed), err
 		}
 		// Durable ACK succeeded: this claim is satisfied and must not be

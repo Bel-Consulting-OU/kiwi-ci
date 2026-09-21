@@ -171,10 +171,13 @@ func TestPostgresIntegrationSchedulerRecoverExpiredBeyondListRunsWindow(t *testi
 
 // TestPostgresIntegrationSchedulerRecoverExpiredPagingAndFailureIsolation
 // seeds a candidate set larger than the page size (including one candidate
-// whose applier fails on every attempt because its id can never validate) and
-// proves: pages are visited deterministically and exactly once, every healthy
-// candidate is recovered exactly once, and the persistently failing candidate
-// neither stalls the sweep nor makes it return an error.
+// whose applier fails on every attempt because its id can never validate, and
+// one genuinely corrupt-payload row per class that sorts before the healthy
+// candidates) and proves: pages are visited deterministically and exactly
+// once, every healthy candidate is recovered exactly once, the persistently
+// failing candidate neither stalls the sweep nor makes it return an error,
+// and a corrupt row is discovered and force-recovered — never skipped out of
+// the sweep (which used to strand its lease/quota forever).
 func TestPostgresIntegrationSchedulerRecoverExpiredPagingAndFailureIsolation(t *testing.T) {
 	env := pgITSchedSetup(t)
 	st := env.open(t)
@@ -231,10 +234,29 @@ func TestPostgresIntegrationSchedulerRecoverExpiredPagingAndFailureIsolation(t *
 			t.Fatalf("insert failing candidate %q: %v", row.id, err)
 		}
 	}
+	// Genuinely CORRUPT payloads (valid jsonb, invalid model.Job), with valid
+	// ids that sort BEFORE every healthy candidate in their class: discovery
+	// must return them from the relational columns (they used to be skipped),
+	// and the fenced appliers must force-recover them instead of failing (a
+	// failure would previously have left them non-terminal forever).
+	corruptRunning := fmt.Sprintf("%032x", 0)
+	corruptQueued := fmt.Sprintf("%032x", 99)
+	for _, row := range []struct {
+		id, status string
+		deadline   time.Time
+	}{
+		{corruptRunning, "running", expired},
+		{corruptQueued, "queued", expired},
+	} {
+		if _, err := raw.Exec(ctx, `INSERT INTO jobs (id, run_id, key, status, attempts, lease_runner_id, lease_generation, lease_expires_at, created_at, queue_deadline, payload)
+			VALUES ($1, $2, 'build', $3, 1, 'runner-x', 1, $4, $5, $4, '"scalar"'::jsonb)`, row.id, runID, row.status, row.deadline, now); err != nil {
+			t.Fatalf("insert corrupt candidate %q: %v", row.id, err)
+		}
+	}
 
 	// Deterministic paging smaller than the candidate set: a full page walk
 	// yields every candidate exactly once, in strictly increasing id order.
-	collect := func(fetch func(afterID string) ([]model.Job, error)) []string {
+	collect := func(fetch func(afterID string) ([]storage.RecoveryCandidate, error)) []string {
 		var got []string
 		afterID := ""
 		for {
@@ -242,12 +264,12 @@ func TestPostgresIntegrationSchedulerRecoverExpiredPagingAndFailureIsolation(t *
 			if err != nil {
 				t.Fatalf("page after %q: %v", afterID, err)
 			}
-			for _, j := range page {
-				if afterID != "" && j.ID <= afterID {
-					t.Fatalf("cursor not strictly increasing: %q after %q", j.ID, afterID)
+			for _, c := range page {
+				if afterID != "" && c.ID <= afterID {
+					t.Fatalf("cursor not strictly increasing: %q after %q", c.ID, afterID)
 				}
-				got = append(got, j.ID)
-				afterID = j.ID
+				got = append(got, c.ID)
+				afterID = c.ID
 			}
 			if len(page) < recoveryPageSize {
 				break
@@ -255,17 +277,17 @@ func TestPostgresIntegrationSchedulerRecoverExpiredPagingAndFailureIsolation(t *
 		}
 		return got
 	}
-	leasePages := collect(func(afterID string) ([]model.Job, error) {
+	leasePages := collect(func(afterID string) ([]storage.RecoveryCandidate, error) {
 		return st.ListExpiredRunningJobs(ctx, now, afterID, recoveryPageSize)
 	})
-	if len(leasePages) != len(runningIDs)+1 {
-		t.Fatalf("expired-lease page walk = %v, want %d healthy + the failing candidate", leasePages, len(runningIDs))
+	if len(leasePages) != len(runningIDs)+2 {
+		t.Fatalf("expired-lease page walk = %v, want %d healthy + the failing and corrupt candidates", leasePages, len(runningIDs))
 	}
-	queuePages := collect(func(afterID string) ([]model.Job, error) {
+	queuePages := collect(func(afterID string) ([]storage.RecoveryCandidate, error) {
 		return st.ListQueueTimedOutJobs(ctx, now, afterID, recoveryPageSize)
 	})
-	if len(queuePages) != len(queuedIDs)+1 {
-		t.Fatalf("queue page walk = %v, want %d healthy + the failing candidate", queuePages, len(queuedIDs))
+	if len(queuePages) != len(queuedIDs)+2 {
+		t.Fatalf("queue page walk = %v, want %d healthy + the failing and corrupt candidates", queuePages, len(queuedIDs))
 	}
 
 	// A per-candidate applier failure is logged, never returned: the sweep
@@ -298,6 +320,30 @@ func TestPostgresIntegrationSchedulerRecoverExpiredPagingAndFailureIsolation(t *
 	if got := pgITSchedRawJobStatus(t, raw, failingQueued); got != string(model.StatusQueued) {
 		t.Fatalf("failing queued candidate status = %q, want queued", got)
 	}
+	// The CORRUPT candidates were discovered (relational columns), did not
+	// stall the healthy candidates behind them, and were force-recovered to a
+	// terminal state with the explicit corruption reason plus audit evidence.
+	// Their payloads stay untouched, so the state is read through the raw
+	// pool (GetJob cannot decode them by definition).
+	var status, errMsg string
+	if err := raw.QueryRow(ctx, `SELECT status, COALESCE(error, '') FROM jobs WHERE id=$1`, corruptRunning).Scan(&status, &errMsg); err != nil {
+		t.Fatalf("read corrupt running row: %v", err)
+	}
+	if status != string(model.StatusFailure) || errMsg != storage.CorruptLeaseRecoveryReason {
+		t.Fatalf("corrupt running candidate = %s/%q, want failure/%q", status, errMsg, storage.CorruptLeaseRecoveryReason)
+	}
+	if n := pgITSchedAuditCount(t, st, corruptRunning, "job.corrupt_payload_recovered"); n != 1 {
+		t.Fatalf("corrupt running audits = %d, want exactly 1", n)
+	}
+	if err := raw.QueryRow(ctx, `SELECT status, COALESCE(error, '') FROM jobs WHERE id=$1`, corruptQueued).Scan(&status, &errMsg); err != nil {
+		t.Fatalf("read corrupt queued row: %v", err)
+	}
+	if status != string(model.StatusCancelled) || errMsg != storage.CorruptQueueExpiryReason {
+		t.Fatalf("corrupt queued candidate = %s/%q, want cancelled/%q", status, errMsg, storage.CorruptQueueExpiryReason)
+	}
+	if n := pgITSchedAuditCount(t, st, corruptQueued, "job.corrupt_payload_expired"); n != 1 {
+		t.Fatalf("corrupt queued audits = %d, want exactly 1", n)
+	}
 
 	// A replay recovers nothing further: no candidate transitions twice.
 	if err := sched.RecoverExpired(ctx, now); err != nil {
@@ -311,5 +357,11 @@ func TestPostgresIntegrationSchedulerRecoverExpiredPagingAndFailureIsolation(t *
 		if j.Status == model.StatusRunning || j.Status == model.StatusQueued {
 			t.Fatalf("candidate %s transitioned more than once: %+v", id, j)
 		}
+	}
+	if n := pgITSchedAuditCount(t, st, corruptRunning, "job.corrupt_payload_recovered"); n != 1 {
+		t.Fatalf("replayed corrupt running audits = %d, want still 1", n)
+	}
+	if n := pgITSchedAuditCount(t, st, corruptQueued, "job.corrupt_payload_expired"); n != 1 {
+		t.Fatalf("replayed corrupt queued audits = %d, want still 1", n)
 	}
 }

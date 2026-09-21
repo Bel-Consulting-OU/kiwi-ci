@@ -11,8 +11,9 @@ package storage
 //     + the per-(repo, suite, class, name) aggregate upserts for exactly the
 //     report's cases + the repository version bump.
 //   - LoadRepoTestHistory / TestReportTotals / FlakyTestNames read only the
-//     requested canonical repository (through the run-identity indexes added
-//     by 0026).
+//     requested canonical repository (through the canonical run-identity
+//     index added by 0027, which matches these queries' policy-first
+//     canonical expression exactly).
 //   - RebuildRepoTestHistory is the explicit bounded repair operation.
 //
 // The aggregate rows serialize to the SAME JSON shape the legacy
@@ -272,13 +273,17 @@ func scanTestHistoryAggregate(rows pgx.Rows) (TestHistoryAggregate, error) {
 // ResolveTestHistoryRepoIDs maps a test-intelligence query to the canonical
 // repository IDs it addresses. The query forms are the human full name, the
 // canonical RepoID and the legacy host-less canonical form; the returned set
-// mirrors runMatchesRepoQuery: a run matches when its full name or its stored
-// canonical identity (policy_repo_id, then repo_id) equals the query, or when
-// the canonicalized full name equals the query. Resolution is a single
-// bounded, set-based run query (backed by the 0026 expression indexes) — it
-// never materializes reports or resolves runs one by one. When stored
-// identities are absent (legacy records), the canonical identity is derived
-// in Go from the returned URL + full name.
+// mirrors runMatchesRepoQuery: a run matches when its full name or its
+// canonical identity (policy_repo_id first, then the repo_id/clone-URL +
+// full-name derivation — see canonicalPolicyRepoIDSQLExpr) equals the query,
+// or when the canonicalized full name equals the query. Resolution is a
+// single bounded, set-based run query (backed by the 0027 expression index
+// created on the SAME canonical policy-first expression) — it never
+// materializes reports or resolves runs one by one. Legacy records (no
+// repo_id/policy_repo_id) are matched by the canonical expression itself, so
+// they are never filtered out before the Go-side derivation can see them;
+// the Go fallback remains as a belt-and-braces derivation for rows the SQL
+// expression cannot resolve.
 func (s *PostgresStore) ResolveTestHistoryRepoIDs(ctx context.Context, query string, limit int) ([]string, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
@@ -287,7 +292,7 @@ func (s *PostgresStore) ResolveTestHistoryRepoIDs(ctx context.Context, query str
 	if limit <= 0 || limit > 256 {
 		limit = 64
 	}
-	rows, err := s.pool.Query(ctx, `SELECT DISTINCT COALESCE(NULLIF(payload->>'policy_repo_id',''), NULLIF(payload->>'repo_id','')), COALESCE(payload->>'repo', ''), COALESCE(payload->>'repo_full_name', '') FROM runs WHERE payload->>'repo_full_name'=$1 OR COALESCE(NULLIF(payload->>'policy_repo_id',''), NULLIF(payload->>'repo_id',''))=$1 ORDER BY 1 LIMIT $2`, query, limit)
+	rows, err := s.pool.Query(ctx, `SELECT DISTINCT `+canonicalPolicyRepoIDSQLExpr("repo")+`, COALESCE(payload->>'repo', ''), COALESCE(payload->>'repo_full_name', '') FROM runs WHERE payload->>'repo_full_name'=$1 OR `+canonicalPolicyRepoIDSQLExpr("repo")+`=$1 ORDER BY 1 LIMIT $2`, query, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -322,8 +327,10 @@ func (s *PostgresStore) ResolveTestHistoryRepoIDs(ctx context.Context, query str
 // TestReportTotals returns the report count and the report-declared test and
 // failure totals for the resolved repository IDs (and the raw query form, so
 // legacy runs whose full name matches are included). The query joins
-// test_results to runs and filters on the run identity, so unrelated reports
-// are never read — not even their payloads.
+// test_results to runs and filters on the CANONICAL run identity
+// (policy-first, legacy rows derived from clone URL + full name), so
+// unrelated reports are never read — not even their payloads — and a
+// pre-RepoID run is never excluded from its repository's totals.
 func (s *PostgresStore) TestReportTotals(ctx context.Context, repoIDs []string, repoQuery string) (int, int, int, error) {
 	repoQuery = strings.TrimSpace(repoQuery)
 	if len(repoIDs) == 0 && repoQuery == "" {
@@ -332,7 +339,7 @@ func (s *PostgresStore) TestReportTotals(ctx context.Context, repoIDs []string, 
 	var reports, tests, failures int
 	err := s.pool.QueryRow(ctx, `SELECT COUNT(*), COALESCE(SUM(tr.tests), 0)::int, COALESCE(SUM(tr.failures), 0)::int
 		FROM test_results tr JOIN runs r ON r.id = tr.run_id
-		WHERE COALESCE(NULLIF(r.payload->>'policy_repo_id',''), NULLIF(r.payload->>'repo_id','')) = ANY($1::text[])
+		WHERE `+canonicalPolicyRepoIDSQLExprOn("r.payload", "repo")+` = ANY($1::text[])
 		   OR r.payload->>'repo_full_name' = $2`, repoIDs, repoQuery).Scan(&reports, &tests, &failures)
 	if err != nil {
 		return 0, 0, 0, err
@@ -422,6 +429,11 @@ func (s *PostgresStore) RebuildRepoTestHistory(ctx context.Context, repoID strin
 // rebuildRepoTestHistoryTx replaces one repository's aggregate rows with a
 // fresh fold of its durable reports (created_at/id order) inside the caller's
 // transaction. It does NOT touch the version counter: callers bump it once.
+// The report scan selects the repository through the SAME canonical
+// policy-first identity expression every scoped read uses
+// (canonicalPolicyRepoIDSQLExprOn), so a repository's pre-RepoID runs — whose
+// payload carries only the clone URL and full name — are folded into the
+// repository's aggregates instead of being silently dropped.
 func rebuildRepoTestHistoryTx(ctx context.Context, tx pgx.Tx, repoID string) error {
 	if _, err := tx.Exec(ctx, `DELETE FROM test_history_aggregates WHERE repo_id=$1`, repoID); err != nil {
 		return err
@@ -435,7 +447,7 @@ func rebuildRepoTestHistoryTx(ctx context.Context, tx pgx.Tx, repoID string) err
 	for {
 		rows, err := tx.Query(ctx, `SELECT tr.created_at, tr.id, tr.payload
 			FROM test_results tr JOIN runs r ON r.id = tr.run_id
-			WHERE COALESCE(NULLIF(r.payload->>'policy_repo_id',''), NULLIF(r.payload->>'repo_id','')) = $1
+			WHERE `+canonicalPolicyRepoIDSQLExprOn("r.payload", "repo")+` = $1
 			  AND (tr.created_at, tr.id) > ($2, $3)
 			ORDER BY tr.created_at ASC, tr.id ASC
 			LIMIT $4`, repoID, afterCreated, afterID, testHistoryRebuildPage)
@@ -505,14 +517,18 @@ func rebuildRepoTestHistoryTx(ctx context.Context, tx pgx.Tx, repoID string) err
 
 // ListTestHistoryRepoIDs returns the canonical repository IDs that have
 // durable reports, in id order and bounded by limit. It lets the explicit
-// maintenance rebuild enumerate the repositories it should repair.
+// maintenance rebuild enumerate the repositories it should repair. Legacy
+// runs (no repo_id/policy_repo_id) resolve through the same canonical
+// policy-first expression the scoped reads and the rebuild use, so their
+// repositories are listed too (a purely stored-identity enumeration would
+// omit every pre-RepoID repository and never repair it).
 func (s *PostgresStore) ListTestHistoryRepoIDs(ctx context.Context, limit int) ([]string, error) {
 	if limit <= 0 || limit > 10000 {
 		limit = 1000
 	}
-	rows, err := s.pool.Query(ctx, `SELECT DISTINCT COALESCE(NULLIF(r.payload->>'policy_repo_id',''), NULLIF(r.payload->>'repo_id',''))
+	rows, err := s.pool.Query(ctx, `SELECT DISTINCT `+canonicalPolicyRepoIDSQLExprOn("r.payload", "repo")+`
 		FROM test_results tr JOIN runs r ON r.id = tr.run_id
-		WHERE COALESCE(NULLIF(r.payload->>'policy_repo_id',''), NULLIF(r.payload->>'repo_id','')) <> ''
+		WHERE `+canonicalPolicyRepoIDSQLExprOn("r.payload", "repo")+` <> ''
 		ORDER BY 1 LIMIT $1`, limit)
 	if err != nil {
 		return nil, err

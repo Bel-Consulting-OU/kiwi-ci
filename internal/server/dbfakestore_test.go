@@ -229,6 +229,7 @@ var _ storage.QueueReasonStore = (*dbFakeStore)(nil)
 var _ storage.DynamicStore = (*dbFakeStore)(nil)
 var _ storage.DynamicStoreTx = (*dbFakeStore)(nil)
 var _ storage.DownstreamStore = (*dbFakeStore)(nil)
+var _ storage.DownstreamLeaderStore = (*dbFakeStore)(nil)
 var _ storage.UsageStore = (*dbFakeStore)(nil)
 var _ storage.UsageOnceStore = (*dbFakeStore)(nil)
 var _ storage.RunDownstreamStore = (*dbFakeStore)(nil)
@@ -2335,6 +2336,22 @@ func (f *dbFakeStore) AppendDownstreamRun(ctx context.Context, runID, childRunID
 	r.DownstreamRuns = append(r.DownstreamRuns, childRunID)
 	f.runs[runID] = r
 	return nil
+}
+
+// The leader-fenced variants delegate to the fake's unfenced implementations:
+// the double models a store without a leadership epoch (fs-mode semantics),
+// so there is nothing to fence. Production PostgresStore implements the real
+// fence.
+func (f *dbFakeStore) ReserveDownstreamLaunchLeader(ctx context.Context, parentJobID, targetRepo, targetRef, launchToken string) (bool, error) {
+	return f.ReserveDownstreamLaunch(ctx, parentJobID, targetRepo, targetRef, launchToken)
+}
+
+func (f *dbFakeStore) ReleaseDownstreamReservationLeader(ctx context.Context, parentJobID, targetRepo, targetRef string) error {
+	return f.ReleaseDownstreamReservation(ctx, parentJobID, targetRepo, targetRef)
+}
+
+func (f *dbFakeStore) AppendDownstreamRunLeader(ctx context.Context, runID, childRunID string) error {
+	return f.AppendDownstreamRun(ctx, runID, childRunID)
 }
 
 func (f *dbFakeStore) ReopenRunForChildren(ctx context.Context, runID string) error {

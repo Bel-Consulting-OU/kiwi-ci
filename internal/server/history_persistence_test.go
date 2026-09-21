@@ -46,7 +46,9 @@ func TestHistoryPersistenceAcrossRestarts(t *testing.T) {
 	if len(flaky2) != 1 || flaky2[0] != "TestA" {
 		t.Fatalf("flaky after restart = %v, want [TestA]", flaky2)
 	}
-	manifest := s2.history.h.Manifest("o/r", "tests")
+	// ADAPTED: the single-slot history wrapper became the keyed cache, so the
+	// reloaded whole-history snapshot is read through cachedHistory.
+	manifest := s2.cachedHistory("o/r").Manifest("o/r", "tests")
 	if len(manifest) != 2 {
 		t.Fatalf("manifest after restart = %v", manifest)
 	}

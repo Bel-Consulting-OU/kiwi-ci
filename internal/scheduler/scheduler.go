@@ -551,14 +551,17 @@ var recoveryPageSize = 256
 // instead of sweeping on.
 //
 // Discovery is DIRECT and bounded: the store's id-paged candidate queries
-// (storage.RecoveryScanStore) return expired running leases and elapsed queue
-// deadlines themselves. ListRuns-style enumeration is deliberately gone: a
-// newest-N window permanently orphans an old non-terminal job once N newer
-// runs exist. Each page advances the id cursor past EVERY returned candidate,
-// including candidates whose applier fails (logged, not fatal), so one bad
-// row can never stall the candidates behind it; a later sweep revisits the
-// failure from the start. Page query errors abort the sweep with an error,
-// exactly as a ListRuns error did.
+// (storage.RecoveryScanStore) return lightweight candidates built from the
+// authoritative relational columns (id, lease_generation, queue_deadline) for
+// expired running leases and elapsed queue deadlines. ListRuns-style
+// enumeration is deliberately gone: a newest-N window permanently orphans an
+// old non-terminal job once N newer runs exist. Each page advances the id
+// cursor past EVERY returned candidate, including candidates whose applier
+// fails (logged, not fatal), so one bad row can never stall the candidates
+// behind it; a later sweep revisits the failure from the start. Page query
+// errors abort the sweep with an error, exactly as a ListRuns error did.
+// Candidates are never decoded here, so a corrupt row is still swept: the
+// fenced applier applies the forced recovery that releases its capacity.
 func (s *DBScheduler) RecoverExpired(ctx context.Context, now time.Time) error {
 	if !s.IsLeader(ctx) {
 		return ErrNotLeader
@@ -575,17 +578,17 @@ func (s *DBScheduler) RecoverExpired(ctx context.Context, now time.Time) error {
 		if err != nil {
 			return fmt.Errorf("scheduler: list expired running jobs: %w", err)
 		}
-		for _, j := range page {
+		for _, c := range page {
 			// The expected generation makes the recovery idempotent and
 			// race-safe: a lease replaced by a concurrent re-lease is left
 			// untouched.
-			if err := scanner.RecoverExpiredLease(ctx, j.ID, j.LeaseGeneration, now); err != nil {
+			if err := scanner.RecoverExpiredLease(ctx, c.ID, c.LeaseGeneration, now); err != nil {
 				if errors.Is(err, storage.ErrStaleLeader) {
 					return s.staleLeader("recover expired lease", err)
 				}
-				log.Printf("scheduler: recover job %s: %v", j.ID, err)
+				log.Printf("scheduler: recover job %s: %v", c.ID, err)
 			}
-			afterID = j.ID
+			afterID = c.ID
 		}
 		if len(page) < recoveryPageSize {
 			break
@@ -594,26 +597,31 @@ func (s *DBScheduler) RecoverExpired(ctx context.Context, now time.Time) error {
 	// Queue-timeout expiry: a queued (or approval-waiting) job past its
 	// queue deadline is cancelled terminally, independent of its attempt
 	// count, and its reserved queued quota slot is released in the SAME
-	// transaction. The expected deadline guards against expiring a job whose
-	// deadline moved after this snapshot; the query may return a superset
-	// (legacy payload-only deadlines), so the effective deadline is
-	// re-derived here before applying.
+	// transaction. The candidate carries the persisted queue_deadline column
+	// (zero for legacy payload-only rows); the applier re-derives the
+	// effective deadline under its own row lock, so the query's superset
+	// (legacy payload deadlines) is filtered inside the transaction.
 	afterID = ""
 	for {
 		page, err := scanner.ListQueueTimedOutJobs(ctx, now, afterID, recoveryPageSize)
 		if err != nil {
 			return fmt.Errorf("scheduler: list queue-timed-out jobs: %w", err)
 		}
-		for _, j := range page {
-			if dl := storage.QueueDeadlineFor(j); dl != nil && !dl.After(now) {
-				if err := scanner.ExpireQueuedJob(ctx, j.ID, *dl); err != nil {
-					if errors.Is(err, storage.ErrStaleLeader) {
-						return s.staleLeader("expire queue deadline", err)
-					}
-					log.Printf("scheduler: expire queue deadline for job %s: %v", j.ID, err)
-				}
+		for _, c := range page {
+			// The candidate carries the persisted queue_deadline column; a
+			// nil deadline means the row is a legacy payload-only candidate,
+			// signalled to the applier as the zero time.
+			observed := time.Time{}
+			if c.QueueDeadline != nil {
+				observed = *c.QueueDeadline
 			}
-			afterID = j.ID
+			if err := scanner.ExpireQueuedJob(ctx, c.ID, observed); err != nil {
+				if errors.Is(err, storage.ErrStaleLeader) {
+					return s.staleLeader("expire queue deadline", err)
+				}
+				log.Printf("scheduler: expire queue deadline for job %s: %v", c.ID, err)
+			}
+			afterID = c.ID
 		}
 		if len(page) < recoveryPageSize {
 			break

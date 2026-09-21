@@ -313,6 +313,22 @@ func downstreamLinkKey(parentJobID, targetRepo, targetRef string) string {
 // leaves a reserved-but-unlaunched link that recovery re-dispatches with
 // the SAME stable child ID (never a duplicate). A failed fetch/enqueue
 // releases the reservation so the next flush can retry.
+//
+// Every durable mutation in this chain is leader-epoch-fenced, so a replica
+// whose cached leadership claim outlived its advisory-lock session returns
+// storage.ErrStaleLeader and commits nothing:
+//
+//   - the link reservation runs in ReserveDownstreamLaunchLeader's fenced
+//     transaction (AppendDownstreamRunLeader for the wait=true edge, and
+//     ReleaseDownstreamReservationLeader for the failure/cleanup release);
+//   - the child enqueue carries a storage.DownstreamLaunchClaim, so
+//     InsertCompiledRun is fenced before its first insert;
+//   - the outbox ACK/claim/release are fenced by the outbox store itself.
+//
+// The unfenced DownstreamStore/RunDownstreamStore variants remain the
+// operator surface (manual triage, admin tooling) and are never called by
+// dispatch; a DB store that cannot provide the fenced contract fails the
+// dispatch closed instead of silently mutating unfenced.
 func (s *Server) dispatchDownstream(ctx context.Context, item forge.OutboxItem) error {
 	var p downstreamPayload
 	if err := json.Unmarshal(item.Payload, &p); err != nil {
@@ -509,11 +525,28 @@ func (s *Server) downstreamAllowed(ctx context.Context, p downstreamPayload, tar
 	return false
 }
 
-// reserveDownstreamLaunch claims the link reservation through the store
-// (DB mode) or the fs-mode map.
+// downstreamLeaderStore resolves the leader-dispatch-fenced downstream
+// contract from the wired store. Downstream dispatch runs on the leader-only
+// outbox flush, so in DB mode the store MUST provide the fenced variants:
+// without them the dispatch fails closed instead of silently using the
+// unfenced operator methods. fs-mode dispatch never reaches here.
+func (s *Server) downstreamLeaderStore() (storage.DownstreamLeaderStore, bool) {
+	if s.DB == nil {
+		return nil, false
+	}
+	ls, ok := s.DB.(storage.DownstreamLeaderStore)
+	return ls, ok
+}
+
+// reserveDownstreamLaunch claims the link reservation through the store's
+// leader-fenced variant (DB mode) or the fs-mode map.
 func (s *Server) reserveDownstreamLaunch(ctx context.Context, parentJobID, targetRepo, targetRef, launchToken string) (bool, error) {
-	if ds, ok := s.downstreamStore(); ok {
-		return ds.ReserveDownstreamLaunch(ctx, parentJobID, targetRepo, targetRef, launchToken)
+	if _, ok := s.downstreamStore(); ok {
+		ls, ok := s.downstreamLeaderStore()
+		if !ok {
+			return false, fmt.Errorf("downstream: attached store lacks the leader-fenced reservation contract (storage.DownstreamLeaderStore); refusing an unfenced dispatch")
+		}
+		return ls.ReserveDownstreamLaunchLeader(ctx, parentJobID, targetRepo, targetRef, launchToken)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -544,9 +577,26 @@ func (s *Server) reserveDownstreamLaunch(ctx context.Context, parentJobID, targe
 }
 
 // releaseDownstreamReservation clears a reservation whose launch failed.
+// DB-mode dispatch uses the leader-fenced release: a replica that lost
+// leadership while its launch was in flight must not mutate the link. The
+// refused release leaves the reservation to the leader-only
+// ExpireDownstreamReservations sweep, which re-opens the link for the current
+// leader's retry. Operator triage keeps the unfenced store method.
 func (s *Server) releaseDownstreamReservation(ctx context.Context, parentJobID, targetRepo, targetRef string) {
-	if ds, ok := s.downstreamStore(); ok {
-		if err := ds.ReleaseDownstreamReservation(ctx, parentJobID, targetRepo, targetRef); err != nil {
+	if _, ok := s.downstreamStore(); ok {
+		ls, ok := s.downstreamLeaderStore()
+		if !ok {
+			s.logError("downstream: release refused: store lacks the leader-fenced contract")
+			return
+		}
+		if err := ls.ReleaseDownstreamReservationLeader(ctx, parentJobID, targetRepo, targetRef); err != nil {
+			if errors.Is(err, storage.ErrStaleLeader) {
+				// Expected: this flusher is no longer the leader. The
+				// reservation is not ours to clear; the leader-only expiry
+				// sweep reclaims it so the new leader's retry can launch.
+				s.logInfo("downstream: stale leader release refused; reservation left to the leader expiry sweep", "target_repo", targetRepo, "target_ref", targetRef)
+				return
+			}
 			s.logError("downstream: release reservation failed", "error", err.Error())
 		}
 		return
@@ -595,16 +645,20 @@ func (s *Server) recoverDownstreamReservations(ctx context.Context, now time.Tim
 	}
 }
 
-// appendDownstreamRun records the child run on the parent run for wait=true
-// aggregation and refreshes the parent's status.
-// appendDownstreamRun records the parent→child edge. The error is returned
-// (never swallowed): the downstream outbox row must not be ACKed while the
-// parent lacks the child linkage, or the parent can terminate prematurely.
-// Child IDs are deterministic, so a retry is safe.
+// appendDownstreamRun records the parent→child edge (and refreshes the
+// parent's status). The error is returned (never swallowed): the downstream
+// outbox row must not be ACKed while the parent lacks the child linkage, or
+// the parent can terminate prematurely. Child IDs are deterministic, so a
+// retry is safe. DB mode uses the leader-fenced append: a stale leader must
+// not record an edge for a child it never launched.
 func (s *Server) appendDownstreamRun(ctx context.Context, parentRunID, childRunID string) error {
 	if s.DB != nil {
-		if rs, ok := s.DB.(storage.RunDownstreamStore); ok {
-			if err := rs.AppendDownstreamRun(ctx, parentRunID, childRunID); err != nil {
+		if _, ok := s.DB.(storage.RunDownstreamStore); ok {
+			ls, ok := s.downstreamLeaderStore()
+			if !ok {
+				return fmt.Errorf("downstream: attached store lacks the leader-fenced parent-edge contract (storage.DownstreamLeaderStore); refusing an unfenced append")
+			}
+			if err := ls.AppendDownstreamRunLeader(ctx, parentRunID, childRunID); err != nil {
 				return fmt.Errorf("downstream: append child run: %w", err)
 			}
 		}

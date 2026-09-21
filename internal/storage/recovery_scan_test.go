@@ -124,6 +124,42 @@ func TestMemStoreListQueueTimedOutJobsPagesDeterministically(t *testing.T) {
 	}
 }
 
+// TestMemStoreRecoveryCandidatesCarryRelationalColumns pins the lightweight
+// candidate contract the scheduler sweep threads into the appliers: running
+// candidates carry the lease_generation column and no deadline, queued
+// candidates carry the PERSISTED QueueDeadline (nil for payload-derived
+// legacy rows, which the applier re-derives).
+func TestMemStoreRecoveryCandidatesCarryRelationalColumns(t *testing.T) {
+	now := time.Unix(10_000, 0).UTC()
+	past := now.Add(-time.Minute)
+	m := newMemStore()
+	recoveryScanSeed(m,
+		model.Job{ID: recoveryScanID("1"), Status: model.StatusRunning, LeaseGeneration: 7, LeaseExpiresAt: &past},
+		model.Job{ID: recoveryScanID("2"), Status: model.StatusQueued, LeaseGeneration: 3, QueueDeadline: &past},
+		model.Job{ID: recoveryScanID("3"), Status: model.StatusQueued, LeaseGeneration: 4, CreatedAt: now.Add(-time.Hour),
+			CompiledJobPayload: &model.CompiledJobPayload{EffectiveJob: []byte(`{"job":{"queue_timeout":"5m"}}`)}},
+	)
+
+	leases, err := m.ListExpiredRunningJobs(ctx(), now, "", 10)
+	if err != nil || len(leases) != 1 {
+		t.Fatalf("running candidates = %v, %v; want one", leases, err)
+	}
+	if leases[0].ID != recoveryScanID("1") || leases[0].LeaseGeneration != 7 || leases[0].QueueDeadline != nil {
+		t.Fatalf("running candidate = %+v, want id/generation 7/nil deadline", leases[0])
+	}
+
+	queued, err := m.ListQueueTimedOutJobs(ctx(), now, "", 10)
+	if err != nil || len(queued) != 2 {
+		t.Fatalf("queue candidates = %v, %v; want two", queued, err)
+	}
+	if queued[0].ID != recoveryScanID("2") || queued[0].LeaseGeneration != 3 || queued[0].QueueDeadline == nil || !queued[0].QueueDeadline.Equal(past) {
+		t.Fatalf("persisted-deadline candidate = %+v, want generation 3 and the persisted deadline", queued[0])
+	}
+	if queued[1].ID != recoveryScanID("3") || queued[1].QueueDeadline != nil {
+		t.Fatalf("payload-only candidate = %+v, want a nil (payload-derived) deadline", queued[1])
+	}
+}
+
 // TestMemStoreReleaseOutboxClaimsBatch pins the batch claim release: exactly
 // the matching claimed rows are cleared, other claimers' rows are untouched,
 // the affected count is returned, and replay is idempotent.
@@ -245,6 +281,7 @@ func TestFenceReleaseContextIsBoundedAndDetached(t *testing.T) {
 	if !ok || time.Until(deadline) > time.Second {
 		t.Fatalf("release context deadline = %v ok=%v, want a fresh short bound", deadline, ok)
 	}
+	//lint:ignore SA1012 nil origin is the behavior under test (a detached fresh deadline)
 	nilCtx, nilCancel := fenceReleaseContext(nil, 25*time.Millisecond)
 	defer nilCancel()
 	if err := nilCtx.Err(); err != nil {

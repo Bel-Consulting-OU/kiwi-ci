@@ -82,6 +82,10 @@ type PostgresStore struct {
 
 var _ Store = (*PostgresStore)(nil)
 
+// The leader-dispatch chain requires the fenced downstream contract; the
+// server fails dispatch closed if a wired DB store does not provide it.
+var _ DownstreamLeaderStore = (*PostgresStore)(nil)
+
 // randReader and jsonMarshal are test-only seams over crypto/rand and
 // encoding/json. Production always uses the standard library defaults below
 // (the var values are never reassigned outside tests); tests override them to
@@ -461,6 +465,12 @@ func (s *PostgresStore) reserveQuotaTx(ctx context.Context, tx pgx.Tx, q *QuotaR
 // and claims the delivery/quota/schedule/downstream-launch reservations. Any
 // failure rolls everything back.
 //
+// Leadership fencing: a request carrying a ScheduleClaim or a
+// DownstreamLaunch is leader-only work (a fired occurrence, a downstream
+// child launch) and its transaction is epoch-FENCED before the first insert,
+// so a stale leader commits none of it. A request carrying neither claim is
+// an ordinary submission and is deliberately not fenced.
+//
 // Concurrency-group supersession is resolved INSIDE the transaction: when
 // req.Supersede names a (repository, concurrency group) pair, the conflicting
 // non-terminal runs are selected under a per-key advisory lock, so
@@ -476,12 +486,20 @@ func (s *PostgresStore) InsertCompiledRun(ctx context.Context, req InsertCompile
 	}
 	defer tx.Rollback(ctx)
 
-	// A schedule occurrence claim makes this enqueue leader-only work (the
-	// fired run and its (schedule, nominal) occurrence commit together), so
-	// it is epoch-FENCED before anything is inserted: a stale leader fires no
-	// schedule. Ordinary submissions carry no claim and are not leader-gated,
-	// so they are deliberately not fenced.
-	if req.ScheduleClaim != nil {
+	// Two kinds of claim make this enqueue leader-only work, so it is
+	// epoch-FENCED before anything is inserted:
+	//
+	//   - a schedule occurrence claim: the fired run and its
+	//     (schedule, nominal) occurrence commit together, so a stale leader
+	//     fires no schedule;
+	//   - a downstream launch claim: the child run, the link update
+	//     (child_run_id + stable key, reservation consumed) and every other
+	//     enqueue mutation commit together, so a stale leader launches no
+	//     downstream child and cannot even create the child run.
+	//
+	// Ordinary submissions carry neither claim and are not leader-gated, so
+	// they are deliberately not fenced.
+	if req.ScheduleClaim != nil || req.DownstreamLaunch != nil {
 		if err := s.fenceLeaderTx(ctx, tx); err != nil {
 			return err
 		}
@@ -591,8 +609,43 @@ func advisoryLockKey(kind string, parts ...string) int64 {
 // repositories that merely share a name on different hosts or forges never
 // compare equal. Host and full name are trimmed; an empty repo_id and an
 // unparseable URL resolve to "".
+//
+// The expression is bound through the IMMUTABLE SQL function
+// kiwi_canonical_repo_id(payload, url_key) created by migration 0027 (see
+// canonicalRepoIDFunctionBody). The LONG form is deliberately not inlined:
+// PostgreSQL's pg_index catalog row cannot hold the parsed expression tree
+// (row is too big), so an expression INDEX must name the function while
+// every query compares through the same call, keeping index and predicate
+// expression-identical.
 func canonicalRepoIDSQLExpr(urlKey string) string {
-	u := "COALESCE(payload->>'" + urlKey + "', '')"
+	return canonicalRepoIDSQLExprOn("payload", urlKey)
+}
+
+// canonicalRepoIDSQLExprOn is canonicalRepoIDSQLExpr parameterized on the
+// jsonb COLUMN expression, so the same identity expression can be rendered
+// against a qualified column (r.payload) inside a join. The column expression
+// is emitted verbatim; callers pass either "payload" or a qualified name.
+func canonicalRepoIDSQLExprOn(col, urlKey string) string {
+	return canonicalRepoIDFunctionName + "(" + col + ", '" + urlKey + "')"
+}
+
+// canonicalRepoIDFunctionName is the SQL function created by migration 0027.
+const canonicalRepoIDFunctionName = "kiwi_canonical_repo_id"
+
+// canonicalRepoIDFunctionBody renders the body of the IMMUTABLE SQL function
+// kiwi_canonical_repo_id(payload jsonb, url_key text): exactly the canonical
+// repo_id/clone-URL derivation canonicalRepoIDSQLExprOn used to inline, with
+// the URL json key bound to the function parameter. Migration 0027 embeds
+// this text, so the index expression and every query expression resolve to
+// one shape.
+func canonicalRepoIDFunctionBody() string {
+	return canonicalRepoIDBody("payload->>url_key")
+}
+
+// canonicalRepoIDBody is canonicalRepoIDFunctionBody parameterized on the URL
+// json accessor so the migration generator and the tests can render it.
+func canonicalRepoIDBody(urlAccessor string) string {
+	u := "COALESCE(" + urlAccessor + ", '')"
 	f := "BTRIM(COALESCE(payload->>'repo_full_name', ''))"
 	scpLike := "STRPOS(" + u + ", ':') > 0 AND (STRPOS(" + u + ", '/') = 0 OR STRPOS(" + u + ", '/') > STRPOS(" + u + ", ':'))"
 	host := "CASE WHEN STRPOS(" + u + ", '://') > 0 " +
@@ -608,6 +661,25 @@ func canonicalRepoIDSQLExpr(urlKey string) string {
 		"CASE WHEN " + full + " = '' THEN '' " +
 		"WHEN " + host + " = '' OR LEFT(" + full + ", LENGTH(" + host + ") + 1) = " + host + " || '/' THEN " + full + " " +
 		"ELSE " + host + " || '/' || " + full + " END)"
+}
+
+// canonicalPolicyRepoIDSQLExpr renders the POLICY-FIRST canonical repository
+// identity of a payload: the stored policy_repo_id (the BASE repository of a
+// fork PR, which every authorization/quota/history decision uses) when
+// present, otherwise canonicalRepoIDSQLExpr's repo_id/clone-URL derivation.
+// It is the SQL mirror of RepoIDForRun / RepoIDForJob, so a row written
+// before RepoID existed (only repo + repo_full_name) resolves to the same
+// canonical ID as a modern row and is never silently excluded from an
+// identity-scoped read or join. The expression is short enough to back the
+// migration-0027 runs_repo_identity_idx expression index.
+func canonicalPolicyRepoIDSQLExpr(urlKey string) string {
+	return canonicalPolicyRepoIDSQLExprOn("payload", urlKey)
+}
+
+// canonicalPolicyRepoIDSQLExprOn is canonicalPolicyRepoIDSQLExpr
+// parameterized on the jsonb column expression (see canonicalRepoIDSQLExprOn).
+func canonicalPolicyRepoIDSQLExprOn(col, urlKey string) string {
+	return "COALESCE(NULLIF(BTRIM(" + col + "->>'policy_repo_id'), ''), " + canonicalRepoIDSQLExprOn(col, urlKey) + ")"
 }
 
 // supersededJobIDsTx resolves the supersede policy to the concrete
@@ -3879,24 +3951,64 @@ func (s *PostgresStore) GetDownstreamLink(ctx context.Context, parentJobID, targ
 	return l, true, nil
 }
 
-// ReserveDownstreamLaunch atomically reserves the link for the calling
-// flusher BEFORE the child run is enqueued: the reservation UPDATE wins
-// exactly once, and a missing row (restart dropped the in-memory copy) is
-// created reserved. Returns true only when this call made the reservation.
-func (s *PostgresStore) ReserveDownstreamLaunch(ctx context.Context, parentJobID, targetRepo, targetRef, launchToken string) (bool, error) {
+// validateDownstreamReservation validates the reservation coordinates shared
+// by the operator and leader-dispatch reservation variants.
+func validateDownstreamReservation(parentJobID, targetRepo, targetRef, launchToken string) error {
 	if err := ValidateJobID(parentJobID); err != nil {
-		return false, err
+		return err
 	}
 	if targetRepo == "" || targetRef == "" || launchToken == "" {
-		return false, fmt.Errorf("storage: incomplete downstream reservation")
+		return fmt.Errorf("storage: incomplete downstream reservation")
+	}
+	return nil
+}
+
+// ReserveDownstreamLaunch is the UNFENCED operator/compatibility variant of
+// the downstream reservation. It is NOT the leader-dispatch path: the server's
+// downstream dispatch (internal/server/downstream.go) calls the epoch-fenced
+// ReserveDownstreamLaunchLeader, so a stale leader cannot claim a link.
+//
+// This method carries no leader authority: reserving a link does not launch
+// anything, because the child can only be created by the child enqueue
+// (InsertCompiledRun with a DownstreamLaunch claim), which is itself fenced.
+// It remains for operator tooling and non-Postgres test doubles and keeps
+// working without a leadership epoch.
+func (s *PostgresStore) ReserveDownstreamLaunch(ctx context.Context, parentJobID, targetRepo, targetRef, launchToken string) (bool, error) {
+	if err := validateDownstreamReservation(parentJobID, targetRepo, targetRef, launchToken); err != nil {
+		return false, err
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback(ctx)
+	return s.reserveDownstreamLaunchTx(ctx, tx, parentJobID, targetRepo, targetRef, launchToken)
+}
+
+// ReserveDownstreamLaunchLeader is the leader-dispatch variant of the
+// reservation: it runs in a transaction FENCED by the store's leadership
+// epoch, so a replica whose cached claim outlived its advisory-lock session
+// gets ErrStaleLeader and reserves nothing. The leader-owned downstream
+// dispatch chain uses exactly this variant.
+func (s *PostgresStore) ReserveDownstreamLaunchLeader(ctx context.Context, parentJobID, targetRepo, targetRef, launchToken string) (bool, error) {
+	if err := validateDownstreamReservation(parentJobID, targetRepo, targetRef, launchToken); err != nil {
+		return false, err
+	}
+	tx, err := s.beginFencedTx(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+	return s.reserveDownstreamLaunchTx(ctx, tx, parentJobID, targetRepo, targetRef, launchToken)
+}
+
+// reserveDownstreamLaunchTx atomically reserves the link inside tx BEFORE the
+// child run is enqueued: the reservation UPDATE wins exactly once, and a
+// missing row (restart dropped the in-memory copy) is created reserved.
+// Returns true only when this call made the reservation.
+func (s *PostgresStore) reserveDownstreamLaunchTx(ctx context.Context, tx pgx.Tx, parentJobID, targetRepo, targetRef, launchToken string) (bool, error) {
 	var got string
-	err = tx.QueryRow(ctx, `UPDATE downstream_links SET reserved=TRUE, reserved_at=now(), launch_token=$4 WHERE parent_job_id=$1 AND target_repo=$2 AND target_ref=$3 AND NOT reserved AND (child_run_id IS NULL OR child_run_id='') RETURNING parent_job_id`,
+	err := tx.QueryRow(ctx, `UPDATE downstream_links SET reserved=TRUE, reserved_at=now(), launch_token=$4 WHERE parent_job_id=$1 AND target_repo=$2 AND target_ref=$3 AND NOT reserved AND (child_run_id IS NULL OR child_run_id='') RETURNING parent_job_id`,
 		parentJobID, targetRepo, targetRef, launchToken).Scan(&got)
 	if err == nil {
 		return true, tx.Commit(ctx)
@@ -3929,7 +4041,14 @@ func (s *PostgresStore) ReserveDownstreamLaunch(ctx context.Context, parentJobID
 }
 
 // MarkDownstreamLaunched atomically records the child run ID on a reserved
-// link and consumes the reservation.
+// link and consumes the reservation. It is an UNFENCED operator/compatibility
+// method: the leader-owned downstream dispatch chain no longer calls it — the
+// launch result is written inside the fenced child enqueue by
+// claimDownstreamLaunchTx (InsertCompiledRun with a DownstreamLaunch claim),
+// which commits child_run_id, stable_child_id and the consumed reservation
+// together with the child run. With no leader-dispatch caller, this method
+// carries no leader authority and deliberately works without an epoch (admin
+// tooling and non-Postgres doubles).
 func (s *PostgresStore) MarkDownstreamLaunched(ctx context.Context, parentJobID, targetRepo, targetRef, childRunID string) error {
 	if err := ValidateJobID(parentJobID); err != nil {
 		return err
@@ -3942,8 +4061,14 @@ func (s *PostgresStore) MarkDownstreamLaunched(ctx context.Context, parentJobID,
 	return err
 }
 
-// ReleaseDownstreamReservation clears a reservation whose launch failed so
-// a retried dispatch can re-reserve the link.
+// ReleaseDownstreamReservation is the UNFENCED safety/operator variant: it
+// clears a reservation whose launch failed so a retried dispatch can
+// re-reserve the link. It is a SAFETY RELEASE, not leader authority — it can
+// only transition reserved→unreserved on a link that has no child run, so it
+// can neither launch nor prevent a launch (the next dispatch must still win
+// the reservation and pass the fenced child enqueue). Operator triage and
+// manual recovery use this variant; the leader-owned dispatch chain uses the
+// fenced ReleaseDownstreamReservationLeader.
 func (s *PostgresStore) ReleaseDownstreamReservation(ctx context.Context, parentJobID, targetRepo, targetRef string) error {
 	if err := ValidateJobID(parentJobID); err != nil {
 		return err
@@ -3951,6 +4076,28 @@ func (s *PostgresStore) ReleaseDownstreamReservation(ctx context.Context, parent
 	_, err := s.pool.Exec(ctx, `UPDATE downstream_links SET reserved=FALSE, reserved_at=NULL WHERE parent_job_id=$1 AND target_repo=$2 AND target_ref=$3 AND reserved AND (child_run_id IS NULL OR child_run_id='')`,
 		parentJobID, targetRepo, targetRef)
 	return err
+}
+
+// ReleaseDownstreamReservationLeader is the leader-dispatch failure/cleanup
+// variant of the release: it runs in a transaction FENCED by the store's
+// leadership epoch, so a replica that lost leadership while its launch was in
+// flight gets ErrStaleLeader and leaves the reservation to the leader-only
+// ExpireDownstreamReservations sweep (which re-opens the link for the current
+// leader's retry). Nothing is mutated by a stale leader.
+func (s *PostgresStore) ReleaseDownstreamReservationLeader(ctx context.Context, parentJobID, targetRepo, targetRef string) error {
+	if err := ValidateJobID(parentJobID); err != nil {
+		return err
+	}
+	tx, err := s.beginFencedTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `UPDATE downstream_links SET reserved=FALSE, reserved_at=NULL WHERE parent_job_id=$1 AND target_repo=$2 AND target_ref=$3 AND reserved AND (child_run_id IS NULL OR child_run_id='')`,
+		parentJobID, targetRepo, targetRef); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // ExpireDownstreamReservations releases reservations older than the cutoff
@@ -4196,9 +4343,12 @@ func (s *PostgresStore) PrunePendingSidecars(ctx context.Context, olderThan time
 	return int(ct.RowsAffected()), nil
 }
 
-// AppendDownstreamRun appends childRunID to the parent run's downstream_runs
-// payload key exactly once (idempotent): the row is locked FOR UPDATE and
-// the append is skipped when the ID is already present.
+// AppendDownstreamRun is the UNFENCED operator/compatibility variant of the
+// parent→child edge append. It is NOT the leader-dispatch path: the wait=true
+// downstream append in internal/server/downstream.go calls the epoch-fenced
+// AppendDownstreamRunLeader. With no leader-dispatch caller this method
+// carries no leader authority and deliberately works without an epoch
+// (admin tooling and non-Postgres doubles).
 func (s *PostgresStore) AppendDownstreamRun(ctx context.Context, runID, childRunID string) error {
 	if err := ValidateRunID(runID); err != nil {
 		return err
@@ -4211,8 +4361,35 @@ func (s *PostgresStore) AppendDownstreamRun(ctx context.Context, runID, childRun
 		return err
 	}
 	defer tx.Rollback(ctx)
+	return s.appendDownstreamRunTx(ctx, tx, runID, childRunID)
+}
+
+// AppendDownstreamRunLeader is the leader-dispatch variant of the wait=true
+// parent→child edge append: it runs in a transaction FENCED by the store's
+// leadership epoch, so a stale leader cannot record a child edge on the
+// parent run (and therefore cannot re-open or finalize aggregation for a
+// child it never launched).
+func (s *PostgresStore) AppendDownstreamRunLeader(ctx context.Context, runID, childRunID string) error {
+	if err := ValidateRunID(runID); err != nil {
+		return err
+	}
+	if childRunID == "" {
+		return fmt.Errorf("storage: empty child run id")
+	}
+	tx, err := s.beginFencedTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	return s.appendDownstreamRunTx(ctx, tx, runID, childRunID)
+}
+
+// appendDownstreamRunTx appends childRunID to the parent run's
+// downstream_runs payload key inside tx exactly once (idempotent): the row is
+// locked FOR UPDATE and the append is skipped when the ID is already present.
+func (s *PostgresStore) appendDownstreamRunTx(ctx context.Context, tx pgx.Tx, runID, childRunID string) error {
 	var payload []byte
-	err = tx.QueryRow(ctx, `SELECT payload FROM runs WHERE id=$1 FOR UPDATE`, runID).Scan(&payload)
+	err := tx.QueryRow(ctx, `SELECT payload FROM runs WHERE id=$1 FOR UPDATE`, runID).Scan(&payload)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}

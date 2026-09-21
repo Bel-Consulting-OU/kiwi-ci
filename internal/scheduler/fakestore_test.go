@@ -495,14 +495,15 @@ func (f *fakeStore) RevokeRunnerLeases(ctx context.Context, runnerID, reason str
 
 // ListExpiredRunningJobs mirrors the storage discovery contract on the fake
 // store: running jobs with an elapsed or absent lease expiry, ordered by id
-// ASC and keyset-paged with id > afterID.
-func (f *fakeStore) ListExpiredRunningJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]model.Job, error) {
+// ASC and keyset-paged with id > afterID, each as the lightweight relational
+// candidate (id, lease_generation).
+func (f *fakeStore) ListExpiredRunningJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]storage.RecoveryCandidate, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	out := []model.Job{}
+	out := []storage.RecoveryCandidate{}
 	for _, j := range f.jobs {
 		if j.ID <= afterID || j.Status != model.StatusRunning {
 			continue
@@ -510,7 +511,7 @@ func (f *fakeStore) ListExpiredRunningJobs(ctx context.Context, now time.Time, a
 		if j.LeaseExpiresAt != nil && j.LeaseExpiresAt.After(now) {
 			continue
 		}
-		out = append(out, j)
+		out = append(out, storage.RecoveryCandidate{ID: j.ID, LeaseGeneration: j.LeaseGeneration})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	if len(out) > limit {
@@ -521,14 +522,16 @@ func (f *fakeStore) ListExpiredRunningJobs(ctx context.Context, now time.Time, a
 
 // ListQueueTimedOutJobs mirrors the storage discovery contract on the fake
 // store: queued/waiting jobs whose effective queue deadline elapsed, ordered
-// by id ASC and keyset-paged with id > afterID.
-func (f *fakeStore) ListQueueTimedOutJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]model.Job, error) {
+// by id ASC and keyset-paged with id > afterID. The candidate carries the
+// PERSISTED QueueDeadline (nil for payload-derived legacy rows), exactly like
+// the SQL page.
+func (f *fakeStore) ListQueueTimedOutJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]storage.RecoveryCandidate, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	out := []model.Job{}
+	out := []storage.RecoveryCandidate{}
 	for _, j := range f.jobs {
 		if j.ID <= afterID {
 			continue
@@ -539,7 +542,7 @@ func (f *fakeStore) ListQueueTimedOutJobs(ctx context.Context, now time.Time, af
 		if dl := storage.QueueDeadlineFor(j); dl == nil || dl.After(now) {
 			continue
 		}
-		out = append(out, j)
+		out = append(out, storage.RecoveryCandidate{ID: j.ID, LeaseGeneration: j.LeaseGeneration, QueueDeadline: j.QueueDeadline})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	if len(out) > limit {
@@ -623,8 +626,15 @@ func (f *fakeStore) ExpireQueuedJob(ctx context.Context, jobID string, deadline 
 		return nil
 	}
 	now := time.Now().UTC()
-	eff := storage.QueueDeadlineFor(j)
-	if eff == nil || eff.After(deadline) || deadline.After(now) {
+	var observed *time.Time
+	if !deadline.IsZero() {
+		observed = &deadline
+	}
+	eff := j.QueueDeadline
+	if eff == nil {
+		eff = storage.QueueDeadlineFor(j)
+	}
+	if eff == nil || eff.After(now) || (observed != nil && (eff.After(*observed) || observed.After(now))) {
 		return nil
 	}
 	j.Status = model.StatusCancelled

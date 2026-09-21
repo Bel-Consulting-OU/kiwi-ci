@@ -11,6 +11,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/testintel"
 )
 
 func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
@@ -210,7 +211,11 @@ func (s *Server) testIntelligence(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		s.syncTestHistoryDBLegacy(r.Context())
+		// Legacy whole-cache store: ONE whole-history snapshot is taken for
+		// this response (historyForRepo converges it through the same
+		// version-tracked path shard requests use) and answers every key of
+		// the merge below, so the response can never mix cache generations.
+		h, _ := s.historyForRepo(r.Context(), repo)
 		reports, err := s.DB.ListTestReportsAll(r.Context())
 		if err != nil {
 			s.internalError(w, r, err, "")
@@ -226,7 +231,7 @@ func (s *Server) testIntelligence(w http.ResponseWriter, r *http.Request) {
 		}
 		out := summarizeTestIntelligence(filtered)
 		out["repo"] = repo
-		s.mergeHistoryFlakyKeys(historyKeys, out)
+		s.mergeHistoryFlakyKeys(h, historyKeys, out)
 		writeJSON(w, http.StatusOK, out)
 		return
 	}
@@ -241,7 +246,9 @@ func (s *Server) testIntelligence(w http.ResponseWriter, r *http.Request) {
 	}
 	out := summarizeTestIntelligence(filtered)
 	out["repo"] = repo
-	s.mergeHistoryFlakyKeys(historyKeys, out)
+	// The snapshot is taken under s.mu (memory-mode history writes hold it)
+	// and answers every key of this response.
+	s.mergeHistoryFlakyKeys(s.cachedHistory(repo), historyKeys, out)
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -298,18 +305,21 @@ func summarizeTestIntelligence(reports []model.TestReport) map[string]any {
 	}
 }
 
-// mergeHistoryFlaky unions the report-derived flaky set with the persisted
-// history's flaky set for one repository key.
-func (s *Server) mergeHistoryFlaky(repo string, out map[string]any) {
+// mergeHistoryFlaky unions the report-derived flaky set with the flaky set of
+// ONE already-taken history snapshot for one repository key. A nil snapshot
+// (nothing cached) leaves the report-derived set untouched.
+func (s *Server) mergeHistoryFlaky(h *testintel.History, repo string, out map[string]any) {
 	existing, _ := out["flaky_tests"].([]string)
 	seen := map[string]bool{}
 	for _, name := range existing {
 		seen[name] = true
 	}
-	for _, name := range s.flakyFromHistory(repo) {
-		if !seen[name] {
-			seen[name] = true
-			existing = append(existing, name)
+	if h != nil {
+		for _, name := range h.Flaky(repo) {
+			if !seen[name] {
+				seen[name] = true
+				existing = append(existing, name)
+			}
 		}
 	}
 	sort.Strings(existing)
@@ -317,9 +327,11 @@ func (s *Server) mergeHistoryFlaky(repo string, out map[string]any) {
 }
 
 // mergeHistoryFlakyKeys unions the persisted flaky set over every canonical
-// history key a query matched.
-func (s *Server) mergeHistoryFlakyKeys(keys map[string]bool, out map[string]any) {
+// history key a query matched. h is the ONE snapshot already taken for the
+// whole response (nil when nothing is cached), so the merged set can never
+// mix cache generations.
+func (s *Server) mergeHistoryFlakyKeys(h *testintel.History, keys map[string]bool, out map[string]any) {
 	for key := range keys {
-		s.mergeHistoryFlaky(key, out)
+		s.mergeHistoryFlaky(h, key, out)
 	}
 }

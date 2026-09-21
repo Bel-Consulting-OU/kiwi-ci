@@ -394,7 +394,7 @@ func (f *FaultyStore) ExpireQueuedJob(ctx context.Context, jobID string, deadlin
 // paging view can only fail through the inner store itself (the applier
 // failures that must not stall a sweep are injected on RecoverExpiredLease /
 // ExpireQueuedJob instead).
-func (f *FaultyStore) ListExpiredRunningJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]model.Job, error) {
+func (f *FaultyStore) ListExpiredRunningJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]RecoveryCandidate, error) {
 	inner, ok := f.Inner.(RecoveryDiscoveryStore)
 	if !ok {
 		return nil, errMissingInnerInterface("RecoveryDiscoveryStore")
@@ -402,7 +402,7 @@ func (f *FaultyStore) ListExpiredRunningJobs(ctx context.Context, now time.Time,
 	return inner.ListExpiredRunningJobs(ctx, now, afterID, limit)
 }
 
-func (f *FaultyStore) ListQueueTimedOutJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]model.Job, error) {
+func (f *FaultyStore) ListQueueTimedOutJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]RecoveryCandidate, error) {
 	inner, ok := f.Inner.(RecoveryDiscoveryStore)
 	if !ok {
 		return nil, errMissingInnerInterface("RecoveryDiscoveryStore")
@@ -1524,6 +1524,15 @@ type memStore struct {
 	// One-shot.
 	recoveryFaultOps int
 	recoveryFaultErr error
+
+	// undecodableJobs is a TEST-ONLY seam: the listed job ids model a
+	// persisted payload the SQL store cannot json.Unmarshal (valid jsonb,
+	// invalid model.Job). RecoveryExpiredLease / ExpireQueuedJob treat such a
+	// job exactly like the SQL corruption path — terminal transition, lease
+	// and capacity released, corruption audit, payload untouched — so the
+	// in-memory and real-PostgreSQL recovery semantics stay in parity.
+	// Production paths never populate it.
+	undecodableJobs map[string]bool
 }
 
 // quotaCounts is the in-memory reserved counter pair for one quota key.
@@ -1588,6 +1597,7 @@ func newMemStore() *memStore {
 		grants:            map[string]EnrollGrantRecord{},
 		historyAggregates: map[string]map[string]TestHistoryAggregate{},
 		historyVersions:   map[string]int64{},
+		undecodableJobs:   map[string]bool{},
 	}
 	// The in-memory store models a single-process replica that always holds
 	// the leadership claim, so it retains the initial epoch 1 (see
@@ -2287,7 +2297,10 @@ func (m *memStore) RevokeRunnerLeases(ctx context.Context, runnerID, reason stri
 
 // RecoverExpiredLease mirrors the SQL transaction for one expired running
 // lease. A job that is not running with the expected generation, or whose
-// lease is still live, is a no-op.
+// lease is still live, is a no-op. A job marked undecodable (the test seam
+// modelling a corrupt payload) follows the SQL corruption path: terminal
+// failure with the corruption reason, capacity released, corruption audit —
+// the in-memory mirror of recoverCorruptLeaseTx.
 func (m *memStore) RecoverExpiredLease(ctx context.Context, jobID string, expectedGeneration int64, now time.Time) error {
 	if err := ValidateJobID(jobID); err != nil {
 		return err
@@ -2313,11 +2326,19 @@ func (m *memStore) RecoverExpiredLease(ctx context.Context, jobID string, expect
 	quotas := cloneRecoveryQuotas(m.quotas)
 	audit := append([]model.AuditEvent(nil), m.audit...)
 	staged := 0
-	requeue := j.Attempts <= j.MaxInfraRetries
-	if requeue {
+	corrupt := m.undecodableJobs[jobID]
+	requeue := !corrupt && j.Attempts <= j.MaxInfraRetries
+	switch {
+	case corrupt:
+		// Retry policy cannot be trusted from a corrupt payload: terminal
+		// failure, never a re-queue.
+		j.Status = model.StatusFailure
+		j.Error = CorruptLeaseRecoveryReason
+		j.FinishedAt = &now
+	case requeue:
 		j.Status = model.StatusQueued
 		j.Error = "runner lease expired; retrying"
-	} else {
+	default:
 		j.Status = model.StatusFailure
 		j.Error = "runner lease expired and infrastructure retry budget exhausted"
 		j.FinishedAt = &now
@@ -2355,6 +2376,10 @@ func (m *memStore) RecoverExpiredLease(ctx context.Context, jobID string, expect
 		action = "job.lost_runner"
 		msg = j.Error
 	}
+	if corrupt {
+		action = "job.corrupt_payload_recovered"
+		msg = CorruptLeaseRecoveryReason
+	}
 	audit = append(audit, recoveryAudit(j, action, "scheduler", msg, map[string]string{"job": j.Key}, now))
 	if err := m.recoveryBumpFor(&staged); err != nil {
 		return err
@@ -2377,15 +2402,16 @@ func (m *memStore) RecoverExpiredLease(ctx context.Context, jobID string, expect
 
 // ListExpiredRunningJobs mirrors the SQL discovery page (see
 // RecoveryDiscoveryStore): running jobs whose lease expiry elapsed or is
-// absent, ordered by id ASC and keyset-paged with id > afterID. The job map
+// absent, ordered by id ASC and keyset-paged with id > afterID, each as the
+// lightweight relational-column candidate (id, lease_generation). The job map
 // under m.mu is a complete view, so paging is deterministic.
-func (m *memStore) ListExpiredRunningJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]model.Job, error) {
+func (m *memStore) ListExpiredRunningJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]RecoveryCandidate, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := []model.Job{}
+	out := []RecoveryCandidate{}
 	for _, j := range m.jobs {
 		if j.ID <= afterID || j.Status != model.StatusRunning {
 			continue
@@ -2393,7 +2419,7 @@ func (m *memStore) ListExpiredRunningJobs(ctx context.Context, now time.Time, af
 		if j.LeaseExpiresAt != nil && j.LeaseExpiresAt.After(now) {
 			continue
 		}
-		out = append(out, j)
+		out = append(out, RecoveryCandidate{ID: j.ID, LeaseGeneration: j.LeaseGeneration})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	if len(out) > limit {
@@ -2406,14 +2432,17 @@ func (m *memStore) ListExpiredRunningJobs(ctx context.Context, now time.Time, af
 // whose EFFECTIVE queue deadline elapsed, ordered by id ASC and keyset-paged
 // with id > afterID. The memory store has no derived deadline column, so
 // QueueDeadlineFor (persisted field first, compiled-payload fallback second)
-// is the single source of truth.
-func (m *memStore) ListQueueTimedOutJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]model.Job, error) {
+// is the single source of truth; an undecodable payload is limited to the
+// persisted QueueDeadline field (the column analogue) so it can never derive
+// a deadline the SQL store could not. The candidate carries the PERSISTED
+// deadline (nil for payload-derived legacy rows), exactly like the SQL page.
+func (m *memStore) ListQueueTimedOutJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]RecoveryCandidate, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := []model.Job{}
+	out := []RecoveryCandidate{}
 	for _, j := range m.jobs {
 		if j.ID <= afterID {
 			continue
@@ -2421,11 +2450,15 @@ func (m *memStore) ListQueueTimedOutJobs(ctx context.Context, now time.Time, aft
 		if j.Status != model.StatusQueued && j.Status != model.StatusWaitingApproval {
 			continue
 		}
-		dl := QueueDeadlineFor(j)
-		if dl == nil || dl.After(now) {
+		persisted := j.QueueDeadline
+		eff := persisted
+		if eff == nil && !m.undecodableJobs[j.ID] {
+			eff = QueueDeadlineFor(j)
+		}
+		if eff == nil || eff.After(now) {
 			continue
 		}
-		out = append(out, j)
+		out = append(out, RecoveryCandidate{ID: j.ID, LeaseGeneration: j.LeaseGeneration, QueueDeadline: persisted})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	if len(out) > limit {
@@ -2434,7 +2467,14 @@ func (m *memStore) ListQueueTimedOutJobs(ctx context.Context, now time.Time, aft
 	return out, nil
 }
 
-// ExpireQueuedJob mirrors the SQL transaction for one queue-timeout job.
+// ExpireQueuedJob mirrors the SQL transaction for one queue-timeout job:
+// deadline is the persisted queue deadline the discovery observed (ZERO when
+// only a payload-derived legacy deadline exists), and the effective deadline
+// is re-derived under the lock with QueueDeadlineFor semantics. An
+// undecodable payload (test seam) may still expire when the persisted field
+// proves the elapsed deadline, with the corruption reason and the queued
+// reservation released — the in-memory mirror of ExpireQueuedJob's SQL
+// corruption path.
 func (m *memStore) ExpireQueuedJob(ctx context.Context, jobID string, deadline time.Time) error {
 	if err := ValidateJobID(jobID); err != nil {
 		return err
@@ -2452,8 +2492,19 @@ func (m *memStore) ExpireQueuedJob(ctx context.Context, jobID string, deadline t
 		return nil
 	}
 	now := time.Now().UTC()
-	eff := QueueDeadlineFor(j)
-	if eff == nil || eff.After(deadline) || deadline.After(now) {
+	var observed *time.Time
+	if !deadline.IsZero() {
+		observed = &deadline
+	}
+	corrupt := m.undecodableJobs[jobID]
+	eff := j.QueueDeadline
+	if eff == nil {
+		if corrupt {
+			return nil
+		}
+		eff = QueueDeadlineFor(j)
+	}
+	if eff == nil || eff.After(now) || (observed != nil && (eff.After(*observed) || observed.After(now))) {
 		return nil
 	}
 	jobs := cloneRecoveryJobs(m.jobs)
@@ -2461,8 +2512,16 @@ func (m *memStore) ExpireQueuedJob(ctx context.Context, jobID string, deadline t
 	quotas := cloneRecoveryQuotas(m.quotas)
 	audit := append([]model.AuditEvent(nil), m.audit...)
 	staged := 0
+	reason := "queue timeout"
+	action := "job.queue_timeout"
+	msg := "job cancelled after queue deadline"
+	if corrupt {
+		reason = CorruptQueueExpiryReason
+		action = "job.corrupt_payload_expired"
+		msg = CorruptQueueExpiryReason
+	}
 	j.Status = model.StatusCancelled
-	j.Error = "queue timeout"
+	j.Error = reason
 	j.FinishedAt = &now
 	j.LeaseRunnerID = ""
 	j.LeaseTokenHash = nil
@@ -2475,7 +2534,7 @@ func (m *memStore) ExpireQueuedJob(ctx context.Context, jobID string, deadline t
 	if err := m.recoveryBumpFor(&staged); err != nil {
 		return err
 	}
-	audit = append(audit, recoveryAudit(j, "job.queue_timeout", "scheduler", "job cancelled after queue deadline", map[string]string{"job": j.Key}, now))
+	audit = append(audit, recoveryAudit(j, action, "scheduler", msg, map[string]string{"job": j.Key}, now))
 	if err := m.recoveryBumpFor(&staged); err != nil {
 		return err
 	}

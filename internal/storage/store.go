@@ -573,11 +573,12 @@ type QueueReasonStore interface {
 
 // DownstreamLink is one cross-repo dispatch claim: a parent job's downstream
 // declaration resolved to a target repository/ref. The link row is the
-// exactly-once claim: ReserveDownstreamLaunch atomically reserves the link
-// BEFORE the child run is enqueued, and a link whose ChildRunID is set is
-// never launched twice. TargetForge/TargetBaseURL/TargetRepoID persist the
-// forge identity coordinates so dispatch never re-derives hosts from
-// hard-coded public endpoints.
+// exactly-once claim: leader dispatch atomically reserves the link
+// (ReserveDownstreamLaunchLeader, epoch-fenced) BEFORE the child run is
+// enqueued, and a link whose ChildRunID is set is never launched twice.
+// TargetForge/TargetBaseURL/TargetRepoID persist the forge identity
+// coordinates so dispatch never re-derives hosts from hard-coded public
+// endpoints.
 type DownstreamLink struct {
 	ParentJobID   string     `json:"parent_job_id"`
 	TargetRepo    string     `json:"target_repo"`
@@ -679,6 +680,24 @@ type DynamicStoreTx interface {
 // ReleaseDownstreamReservation clears a reservation whose launch failed so a
 // retried dispatch can re-reserve; ExpireDownstreamReservations releases
 // reservations older than the given cutoff (crash recovery).
+//
+// Fencing split, exactly:
+//
+//   - InsertDownstreamLink (completion-effect recording) and
+//     GetDownstreamLink (inspection) are unfenced plain persistence/reads:
+//     recording an intent launches nothing, and reading mutates nothing.
+//   - ReserveDownstreamLaunch, MarkDownstreamLaunched and
+//     ReleaseDownstreamReservation are the UNFENCED operator/compatibility
+//     mutators: no leader-dispatch caller uses them anymore (dispatch uses
+//     DownstreamLeaderStore), they carry no leader authority, and they keep
+//     working without a leadership epoch (operator triage, admin tooling,
+//     non-Postgres doubles).
+//   - ExpireDownstreamReservations is the leader-only reservation-recovery
+//     sweep and is epoch-fenced by its implementation.
+//
+// Leader-owned dispatch must use DownstreamLeaderStore for reserve/release/
+// append and reaches the fenced child enqueue through InsertCompiledRun's
+// DownstreamLaunch claim (epoch-fenced inside the enqueue itself).
 type DownstreamStore interface {
 	InsertDownstreamLink(ctx context.Context, l DownstreamLink) error
 	GetDownstreamLink(ctx context.Context, parentJobID, targetRepo, targetRef string) (DownstreamLink, bool, error)
@@ -686,6 +705,32 @@ type DownstreamStore interface {
 	MarkDownstreamLaunched(ctx context.Context, parentJobID, targetRepo, targetRef, childRunID string) error
 	ReleaseDownstreamReservation(ctx context.Context, parentJobID, targetRepo, targetRef string) error
 	ExpireDownstreamReservations(ctx context.Context, olderThan time.Time) (int, error)
+}
+
+// DownstreamLeaderStore is the leader-dispatch-fenced extension of
+// DownstreamStore, implemented by PostgresStore and used ONLY by the
+// leader-owned downstream dispatch chain (internal/server/downstream.go,
+// driven by the leader-only outbox flush). Every method validates the
+// store's retained leadership epoch inside its transaction and fails closed
+// with ErrStaleLeader — mutating nothing — when another replica has published
+// a newer epoch, so a replica whose cached claim outlived its advisory-lock
+// session can neither reserve a link, record a parent→child edge, nor clear a
+// reservation.
+//
+// The child launch itself is fenced by the enqueue that creates it:
+// InsertCompiledRun with req.DownstreamLaunch set is leader-only work and
+// epoch-fenced before the first insert. The unfenced DownstreamStore methods
+// remain the operator/compatibility surface and are not used by dispatch.
+type DownstreamLeaderStore interface {
+	// ReserveDownstreamLaunchLeader is the fenced sibling of
+	// ReserveDownstreamLaunch, used by leader dispatch.
+	ReserveDownstreamLaunchLeader(ctx context.Context, parentJobID, targetRepo, targetRef, launchToken string) (bool, error)
+	// ReleaseDownstreamReservationLeader is the fenced sibling of
+	// ReleaseDownstreamReservation, used by leader dispatch failure/cleanup.
+	ReleaseDownstreamReservationLeader(ctx context.Context, parentJobID, targetRepo, targetRef string) error
+	// AppendDownstreamRunLeader is the fenced sibling of AppendDownstreamRun,
+	// used by leader dispatch for the wait=true parent→child edge.
+	AppendDownstreamRunLeader(ctx context.Context, runID, childRunID string) error
 }
 
 // UsageStore reports aggregated cost and energy usage since a cutoff time
@@ -700,6 +745,12 @@ type UsageStore interface {
 // to the run's downstream_runs payload key exactly once (idempotent), and
 // ReopenRunForChildren marks a terminal-success run running again while
 // its wait=true children are still in flight (clearing finished_at).
+//
+// AppendDownstreamRun is the UNFENCED operator/compatibility variant; the
+// leader-owned downstream dispatch uses AppendDownstreamRunLeader from
+// DownstreamLeaderStore instead (epoch-fenced, fails closed with
+// ErrStaleLeader). ReopenRunForChildren is aggregation bookkeeping driven by
+// child completion from any replica; it is not leader-gated.
 type RunDownstreamStore interface {
 	AppendDownstreamRun(ctx context.Context, runID, childRunID string) error
 	ReopenRunForChildren(ctx context.Context, runID string) error
@@ -763,14 +814,34 @@ type RecoveryStore interface {
 	// running, is left untouched (nil error, no-op). The transition clears
 	// the lease, releases the runner slot, moves the quota counter, and
 	// recomputes dependents and the run in the same transaction.
+	//
+	// A payload that cannot be decoded does NOT leave the job running with
+	// its runner slot, quota reservation and lease stranded: retry policy
+	// cannot be trusted from a corrupt payload, so the job is terminally
+	// failed with an explicit corruption reason
+	// (CorruptLeaseRecoveryReason), the lease columns are cleared, the
+	// runner active slot and the running quota reservation are released from
+	// the relational columns (lease_runner_id, run_id), and one audit event
+	// records the forced recovery — all in the same fenced transaction.
 	RecoverExpiredLease(ctx context.Context, jobID string, expectedGeneration int64, now time.Time) error
 	// ExpireQueuedJob terminal-cancels ONE queued (or approval-waiting) job
 	// whose queue deadline has passed, releases its reserved queued quota
 	// slot, and recomputes dependents and the run in the same transaction.
-	// deadline is the deadline the caller observed: the job is expired only
-	// while its current effective deadline is not after it and the deadline
-	// itself is not in the future. A job that is no longer queued, or whose
-	// deadline moved past the observed one, is left untouched (no-op).
+	// deadline is the persisted queue_deadline column the caller observed; a
+	// ZERO deadline means the caller observed no persisted column (a legacy
+	// row whose only deadline source is the payload). The effective deadline
+	// is re-derived under the row lock exactly like QueueDeadlineFor (column
+	// first, then the payload/compiled fallback for legacy rows), and the
+	// job is expired only while that effective deadline is not after the
+	// observed one and has elapsed. A job that is no longer queued, whose
+	// deadline moved, or whose deadline cannot be established is left
+	// untouched (no-op).
+	//
+	// A payload that cannot be decoded does NOT keep the queued quota
+	// reservation forever: when the deadline is provable from the relational
+	// column, the malformed job is terminally cancelled with an explicit
+	// corruption reason (CorruptQueueExpiryReason) and the queued
+	// reservation is released in the same transaction.
 	ExpireQueuedJob(ctx context.Context, jobID string, deadline time.Time) error
 }
 
@@ -795,18 +866,42 @@ type RunnerDisableStore interface {
 	DisableRunnerAndRevokeCert(ctx context.Context, runnerID, certSerial, actor string) (revoked int, err error)
 }
 
+// RecoveryCandidate is one bounded-discovery result built ONLY from the
+// authoritative relational job columns: the recovery sweeper needs no decoded
+// payload to decide what to look at and to hand the appliers their guards.
+// Decoding the payload during discovery used to be the single point where a
+// malformed row silently disappeared from every sweep; carrying the
+// relational identity instead means a corrupt row is still discovered and
+// the fenced applier transaction (which re-reads the row and its columns
+// under FOR UPDATE) is the place that decides what can be done with it.
+//
+// Fields:
+//   - ID: jobs.id, the keyset cursor and the applier target.
+//   - LeaseGeneration: the lease_generation COLUMN (never the payload copy),
+//     the idempotence/race guard RecoverExpiredLease expects.
+//   - QueueDeadline: the authoritative queue_deadline COLUMN (migration
+//     0021, NULL when the row predates it). Nil means "the persisted column
+//     holds no deadline"; the applier then falls back to the payload-derived
+//     deadline EXACTLY as QueueDeadlineFor does, so legacy rows keep expiring
+//     while a corrupt payload can never invent one.
+type RecoveryCandidate struct {
+	ID              string
+	LeaseGeneration int64
+	QueueDeadline   *time.Time
+}
+
 // RecoveryDiscoveryStore is the READ-ONLY half of RecoveryScanStore: the
 // bounded, id-paged candidate queries the sweeper drives. It is a separate
 // interface so read-only wrappers (FaultyStore) can fail closed with a precise
 // capability error without demanding the applier transactions.
 //
-// Cursor semantics (both methods): results are a bounded page of model.Jobs
-// whose id is strictly greater than afterID, ordered by id ASC (jobs.id is
-// the TEXT PRIMARY KEY, so the order is total and stable, and the cursor is
-// the last id of the previous page). Ordering by (deadline, id) with an
-// id-only cursor would SKIP candidates whose deadline sorts later than the
-// last visited deadline while their id is smaller, so the cursor is the id
-// order itself. A caller pages by calling with afterID="" and then with the
+// Cursor semantics (both methods): results are a bounded page of
+// RecoveryCandidates whose id is strictly greater than afterID, ordered by id
+// ASC (jobs.id is the TEXT PRIMARY KEY, so the order is total and stable, and
+// the cursor is the last id of the previous page). Ordering by (deadline, id)
+// with an id-only cursor would SKIP candidates whose deadline sorts later than
+// the last visited deadline while their id is smaller, so the cursor is the
+// id order itself. A caller pages by calling with afterID="" and then with the
 // last returned id until a page shorter than limit arrives. Because the
 // cursor advances past every returned row even when its apply fails, one
 // persistently failing row can never stall the rows behind it; a later sweep
@@ -814,22 +909,24 @@ type RunnerDisableStore interface {
 //
 // The reads are candidates, not decisions: the applier transaction re-checks
 // the lease generation / effective deadline under its own lock, so a candidate
-// that changed after discovery is a no-op. Discovery must be robust against
-// individually undecodable rows: an unreadable payload is skipped so it can
-// never shadow the candidates after it.
+// that changed after discovery is a no-op. Discovery reads only relational
+// columns, so an individually undecodable payload can neither be skipped
+// (which used to hide the row from every sweep forever) nor shadow the
+// candidates after it.
 type RecoveryDiscoveryStore interface {
 	// ListExpiredRunningJobs returns running jobs whose lease expired at or
 	// before now: lease_expires_at <= now, or lease_expires_at IS NULL
 	// (a running job with no recorded expiry is exactly the orphaned lease
 	// the sweep exists to recover). Ordered by id ASC, id > afterID.
-	ListExpiredRunningJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]model.Job, error)
+	ListExpiredRunningJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]RecoveryCandidate, error)
 	// ListQueueTimedOutJobs returns queued or approval-waiting jobs whose
 	// queue deadline elapsed (effective deadline <= now), ordered by id ASC,
 	// id > afterID. It may return the superset of jobs that have a deadline
 	// source but whose effective deadline still lies in the future when the
-	// deadline is only derivable from a legacy compiled payload; the caller
-	// filters with QueueDeadlineFor before applying.
-	ListQueueTimedOutJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]model.Job, error)
+	// deadline is only derivable from a legacy compiled payload; the applier
+	// re-derives the effective deadline (QueueDeadlineFor semantics) and
+	// no-ops while it is absent or still in the future.
+	ListQueueTimedOutJobs(ctx context.Context, now time.Time, afterID string, limit int) ([]RecoveryCandidate, error)
 }
 
 // RecoveryScanStore couples the transactional per-candidate recovery appliers
@@ -891,6 +988,11 @@ type ScheduleClaim struct {
 // hex) whose first 32 hex chars are the child run ID. When the link is
 // already launched with the SAME stable child ID the enqueue returns
 // ErrDownstreamLaunched (the caller re-reads the existing child run).
+//
+// Carrying this claim makes the enqueue leader-only work: the whole
+// transaction is epoch-fenced (fails closed with ErrStaleLeader, mutating
+// nothing) before the first insert, because a downstream child launch is
+// leader-owned outbox work.
 type DownstreamLaunchClaim struct {
 	LinkKey       string `json:"link_key"`
 	StableChildID string `json:"stable_child_id"`
@@ -933,6 +1035,11 @@ type SupersedePolicy struct {
 // webhook-dedupe, quota-reservation, schedule-occurrence and
 // downstream-launch claims. Everything commits in a single transaction or
 // nothing does.
+//
+// ScheduleClaim and DownstreamLaunch make the enqueue leader-only work and
+// the transaction is epoch-fenced before the first insert: a stale leader
+// fires no occurrence and launches no downstream child. Requests carrying
+// neither are ordinary submissions and are not leader-gated.
 //
 // The run's and jobs' canonical RepoID rides the run/job payload (jsonb), so
 // no dedicated column is required; RepoIDForJob/RepoIDForRun recover the

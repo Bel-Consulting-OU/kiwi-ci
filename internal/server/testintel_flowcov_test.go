@@ -32,8 +32,10 @@ func fcReportBody(jobID string, cases ...model.TestResult) string {
 func TestFlowTestintelHistoryLifecycle(t *testing.T) {
 	// loadTestintelHistory: no data dir, missing file, corrupt file, valid file.
 	s := New("tok")
-	if err := s.loadTestintelHistory(""); err != nil || s.history.path != "" {
-		t.Fatalf("empty dir load = %v %q", err, s.history.path)
+	// ADAPTED: the snapshot path moved from the single-slot history wrapper
+	// to the server's historyFile field.
+	if err := s.loadTestintelHistory(""); err != nil || s.historyFile != "" {
+		t.Fatalf("empty dir load = %v %q", err, s.historyFile)
 	}
 	dir := t.TempDir()
 	if err := s.loadTestintelHistory(dir); err != nil {
@@ -61,19 +63,21 @@ func TestFlowTestintelHistoryLifecycle(t *testing.T) {
 }
 
 func TestFlowTestintelHistorySaveCommit(t *testing.T) {
+	// ADAPTED: the persistence helpers now take the snapshot they stage and
+	// read the path from the server's historyFile field (single-slot
+	// history.path is gone).
 	// Nil history and empty path are no-ops.
 	s := New("tok")
-	if err := s.saveTestintelHistoryLocked(); err != nil {
+	if err := s.saveTestintelHistory(nil); err != nil {
 		t.Fatalf("nil history save = %v", err)
 	}
-	if err := s.commitTestintelHistoryLocked(); err != nil {
+	if err := s.commitTestintelHistory(); err != nil {
 		t.Fatalf("nil history commit = %v", err)
 	}
-	s.history = newTestintelHistory("")
-	if err := s.saveTestintelHistoryLocked(); err != nil {
+	if err := s.saveTestintelHistory(testintel.NewHistory()); err != nil {
 		t.Fatalf("pathless save = %v", err)
 	}
-	if err := s.commitTestintelHistoryLocked(); err != nil {
+	if err := s.commitTestintelHistory(); err != nil {
 		t.Fatalf("pathless commit = %v", err)
 	}
 	// Save failure surfaces.
@@ -81,23 +85,22 @@ func TestFlowTestintelHistorySaveCommit(t *testing.T) {
 	if err := os.WriteFile(block, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	s.history = newTestintelHistory(block + "/sub/history.json")
-	if err := s.saveTestintelHistoryLocked(); err == nil {
+	s.historyFile = block + "/sub/history.json"
+	if err := s.saveTestintelHistory(testintel.NewHistory()); err == nil {
 		t.Fatal("unwritable history path must fail")
 	}
 	// Commit failure when the staged file is missing.
-	s.history = newTestintelHistory(filepath.Join(t.TempDir(), "missing.json"))
-	if err := s.commitTestintelHistoryLocked(); err == nil {
+	s.historyFile = filepath.Join(t.TempDir(), "missing.json")
+	if err := s.commitTestintelHistory(); err == nil {
 		t.Fatal("missing staged history must fail the commit")
 	}
 }
 
 func TestFlowTestintelRecordReportHistoryMemory(t *testing.T) {
-	s := New("tok")
-	// Nil history: no-op.
-	s.history = nil
-	s.recordTestReportHistory(context.Background(), "github.com/o/repo-a", model.TestReport{})
+	// A cache-less server records nothing and cannot panic.
+	(&Server{}).recordTestReportHistory(context.Background(), "github.com/o/repo-a", model.TestReport{})
 	// Memory: fold, save, commit.
+	s := New("tok")
 	dir := t.TempDir()
 	if err := s.loadTestintelHistory(dir); err != nil {
 		t.Fatal(err)
@@ -115,7 +118,7 @@ func TestFlowTestintelRecordReportHistoryMemory(t *testing.T) {
 	if err := os.WriteFile(block, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	s.history.path = block + "/sub/history.json"
+	s.historyFile = block + "/sub/history.json"
 	s.recordTestReportHistory(context.Background(), "github.com/o/repo-a", rep)
 
 	// Commit failure (save succeeds, rename onto a directory fails) is
@@ -127,7 +130,7 @@ func TestFlowTestintelRecordReportHistoryMemory(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(blockDir, "occupied"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	s.history.path = blockDir
+	s.historyFile = blockDir
 	s.recordTestReportHistory(context.Background(), "github.com/o/repo-a", rep)
 }
 
@@ -214,8 +217,13 @@ func TestFlowTestintelRebuildHistoryDB(t *testing.T) {
 	if version == 0 {
 		t.Fatal("repair did not bump the repository history version")
 	}
+	// ADAPTED: the explicit repair invalidates the keyed cache (the old
+	// single-slot reset to version 0), so the next read reloads.
+	if n := s2.historyCache.len(); n != 0 {
+		t.Fatalf("cache after explicit rebuild = %d entries, want 0", n)
+	}
 	if got := s2.flakyFromHistory("github.com/o/repo-a"); len(got) != 0 {
-		t.Fatalf("in-memory history must only reload on the next sync: %v", got)
+		t.Fatalf("in-memory history must only reload on the next read: %v", got)
 	}
 
 	// Legacy store: report listing failure, save failure, success (with a
@@ -254,43 +262,65 @@ func TestFlowTestintelRebuildHistoryDB(t *testing.T) {
 	s6.rebuildTestHistoryDB(ctx)
 }
 
+// TestFlowTestintelSyncHistoryDB is ADAPTED to the keyed, versioned cache:
+// the single-slot syncTestHistoryDB + historyDBVersion/historyDBRepo
+// assertions became per-repository cache entry assertions through
+// historyForRepo. The version-tracking semantics are unchanged: an unchanged
+// version is served from the cached snapshot, an empty repository records the
+// observation, a load/decode failure keeps the cached generation (degraded
+// mode, error reported), and the legacy whole-cache store keeps its
+// monotonic-version rule on the whole-history entry.
 func TestFlowTestintelSyncHistoryDB(t *testing.T) {
 	ctx := context.Background()
-	// Neither history extension: no-op.
+	// Neither history extension: the empty whole-history snapshot is served.
 	s := New("tok")
 	s.DB = fcPlainStore{newDBFakeStore()}
-	s.syncTestHistoryDB(ctx, "github.com/o/repo-a")
+	if h, err := s.historyForRepo(ctx, "github.com/o/repo-a"); err != nil || h == nil {
+		t.Fatalf("plain store snapshot = %v/%v", h, err)
+	}
 
-	// Aggregate load failure keeps the current history.
+	// Aggregate load failure serves the degraded (empty, cold) snapshot and
+	// reports the error instead of failing a request.
 	f := newDBFakeStore()
 	s2 := New("tok")
 	if err := s2.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
 	s2.DB = &fcStore{dbFakeStore: f, loadRepoHistoryErr: errors.New("history load down")}
-	s2.syncTestHistoryDB(ctx, "github.com/o/repo-a")
+	if h, err := s2.historyForRepo(ctx, "github.com/o/repo-a"); err == nil || h == nil {
+		t.Fatalf("load failure = %v/%v, want error + degraded snapshot", h, err)
+	}
 
-	// Empty repository: the observation is recorded without replacing the
-	// in-memory history.
+	// Empty repository: the observation is cached (version 9, empty
+	// snapshot) without replacing another repository's entry.
 	f.mu.Lock()
 	f.historyVersions["github.com/o/repo-a"] = 9
 	f.mu.Unlock()
 	s2.DB = f
-	s2.syncTestHistoryDB(ctx, "github.com/o/repo-a")
-	if s2.historyDBVersion != 9 || s2.historyDBRepo != "github.com/o/repo-a" {
-		t.Fatalf("empty stats observation = %d/%q, want 9/github.com/o/repo-a", s2.historyDBVersion, s2.historyDBRepo)
+	if h, err := s2.historyForRepo(ctx, "github.com/o/repo-a"); err != nil || h == nil {
+		t.Fatalf("empty repository snapshot = %v/%v", h, err)
+	}
+	emptyEntry, _ := s2.historyCache.lookup("github.com/o/repo-a")
+	if emptyEntry.version != 9 || emptyEntry.history == nil {
+		t.Fatalf("empty stats observation = %d/%v, want version 9 with a snapshot", emptyEntry.version, emptyEntry.history)
 	}
 
-	// Corrupt stats for a NEWER version: decode error keeps the current
-	// history (and the recorded version).
+	// Corrupt stats for a NEWER version: the decode error keeps the cached
+	// generation (and its recorded version).
 	s2.DB = corruptRepoHistoryStore{dbFakeStore: f, stats: []byte("{")}
-	before := s2.history.h
-	s2.syncTestHistoryDB(ctx, "github.com/o/repo-a")
-	if s2.history.h != before || s2.historyDBVersion != 9 {
-		t.Fatal("corrupt stats must not replace the history")
+	before, _ := s2.historyCache.lookup("github.com/o/repo-a")
+	h, err := s2.historyForRepo(ctx, "github.com/o/repo-a")
+	if err == nil {
+		t.Fatal("corrupt stats must report an error")
+	}
+	if h != before.history {
+		t.Fatal("corrupt stats must not replace the cached snapshot")
+	}
+	if e, _ := s2.historyCache.lookup("github.com/o/repo-a"); e.version != 9 {
+		t.Fatalf("corrupt stats version = %d, want 9", e.version)
 	}
 
-	// Valid stats from a real commit: the history is replaced and a flaky
+	// Valid stats from a real commit: the snapshot is replaced and a flaky
 	// test is visible.
 	if _, err := f.InsertTestReportWithHistory(ctx, model.TestReport{
 		ID: "rep-1", RunID: "run-c", JobKey: "build", CreatedAt: time.Now().UTC(),
@@ -305,45 +335,49 @@ func TestFlowTestintelSyncHistoryDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	s2.DB = f
-	s2.syncTestHistoryDB(ctx, "github.com/o/repo-a")
-	if s2.historyDBVersion != 11 {
-		t.Fatalf("valid stats version = %d, want 11", s2.historyDBVersion)
+	h, err = s2.historyForRepo(ctx, "github.com/o/repo-a")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := s2.flakyFromHistory("github.com/o/repo-a"); len(got) != 1 || got[0] != "C.flaky" {
+	if e, _ := s2.historyCache.lookup("github.com/o/repo-a"); e.version != 11 {
+		t.Fatalf("valid stats version = %d, want 11", e.version)
+	}
+	if got := h.Flaky("github.com/o/repo-a"); len(got) != 1 || got[0] != "C.flaky" {
 		t.Fatalf("flaky after sync = %v, want [C.flaky]", got)
 	}
 
-	// Legacy fallback store: load failure, older version no-op, empty stats
-	// and corrupt stats keep the history, valid stats replace it.
+	// Legacy fallback store: corrupt stats keep the whole-history entry,
+	// older versions are ignored, valid stats replace it and empty stats
+	// record the observation.
 	legacy := &legacyHistoryStore{Store: f, version: 7, stats: []byte("{")}
 	s3 := New("tok")
 	s3.DB = legacy
-	s3.historyDBVersion = 5
-	s3.syncTestHistoryDB(ctx, "github.com/o/repo-a")
-	legacyBefore := s3.history.h
-	if s3.historyDBVersion != 5 {
-		t.Fatalf("corrupt legacy stats version = %d, want 5", s3.historyDBVersion)
+	s3.historyCache.store(historyWholeCacheKey, repoHistoryCacheEntry{version: 5, history: testintel.NewHistory()})
+	s3.historyForRepo(ctx, "github.com/o/repo-a")
+	legacyEntry, _ := s3.historyCache.lookup(historyWholeCacheKey)
+	if legacyEntry.version != 5 {
+		t.Fatalf("corrupt legacy stats version = %d, want 5", legacyEntry.version)
 	}
 	legacy.version = 3
-	s3.syncTestHistoryDB(ctx, "github.com/o/repo-a")
-	if s3.history.h != legacyBefore || s3.historyDBVersion != 5 {
+	s3.historyForRepo(ctx, "github.com/o/repo-a")
+	if e, _ := s3.historyCache.lookup(historyWholeCacheKey); e.version != 5 || e.history != legacyEntry.history {
 		t.Fatal("older legacy version must be ignored")
 	}
-	stats, err := historyStats(legacyBefore)
+	stats, err := historyStats(legacyEntry.history)
 	if err != nil {
 		t.Fatal(err)
 	}
 	legacy.version = 8
 	legacy.stats = stats
-	s3.syncTestHistoryDB(ctx, "github.com/o/repo-a")
-	if s3.historyDBVersion != 8 {
-		t.Fatalf("valid legacy stats version = %d, want 8", s3.historyDBVersion)
+	s3.historyForRepo(ctx, "github.com/o/repo-a")
+	if e, _ := s3.historyCache.lookup(historyWholeCacheKey); e.version != 8 {
+		t.Fatalf("valid legacy stats version = %d, want 8", e.version)
 	}
 	legacy.stats = nil
 	legacy.version = 10
-	s3.syncTestHistoryDB(ctx, "github.com/o/repo-a")
-	if s3.historyDBVersion != 10 {
-		t.Fatalf("empty legacy stats version = %d, want 10", s3.historyDBVersion)
+	s3.historyForRepo(ctx, "github.com/o/repo-a")
+	if e, _ := s3.historyCache.lookup(historyWholeCacheKey); e.version != 10 {
+		t.Fatalf("empty legacy stats version = %d, want 10", e.version)
 	}
 }
 
@@ -543,20 +577,22 @@ func TestFlowTestintelRunMatchesRepoQuery(t *testing.T) {
 
 func TestFlowTestintelMergeHistoryFlaky(t *testing.T) {
 	s := New("tok")
-	s.history = nil
 	out := map[string]any{"flaky_tests": []string{"b"}}
-	s.mergeHistoryFlaky("github.com/o/repo-a", out)
+	// ADAPTED: the merge takes ONE already-taken snapshot (the old helper read
+	// the mutable global history); a nil snapshot leaves the report-derived
+	// set untouched.
+	s.mergeHistoryFlaky(nil, "github.com/o/repo-a", out)
 	if got, _ := out["flaky_tests"].([]string); len(got) != 1 || got[0] != "b" {
-		t.Fatalf("nil-history merge = %v", out)
+		t.Fatalf("nil-snapshot merge = %v", out)
 	}
 	// Merge dedupes and sorts persisted entries.
-	s.history = newTestintelHistory("")
-	s.history.h.Record("github.com/o/repo-a", "build", "C", "a", 1, false, time.Now().UTC())
-	s.history.h.Record("github.com/o/repo-a", "build", "C", "a", 1, true, time.Now().UTC())
-	s.history.h.Record("github.com/o/repo-a", "build", "C", "b", 1, false, time.Now().UTC())
-	s.history.h.Record("github.com/o/repo-a", "build", "C", "b", 1, true, time.Now().UTC())
+	h := testintel.NewHistory()
+	h.Record("github.com/o/repo-a", "build", "C", "a", 1, false, time.Now().UTC())
+	h.Record("github.com/o/repo-a", "build", "C", "a", 1, true, time.Now().UTC())
+	h.Record("github.com/o/repo-a", "build", "C", "b", 1, false, time.Now().UTC())
+	h.Record("github.com/o/repo-a", "build", "C", "b", 1, true, time.Now().UTC())
 	out = map[string]any{"flaky_tests": []string{"b"}}
-	s.mergeHistoryFlaky("github.com/o/repo-a", out)
+	s.mergeHistoryFlaky(h, "github.com/o/repo-a", out)
 	got, _ := out["flaky_tests"].([]string)
 	if len(got) != 3 || got[0] != "C.a" || got[1] != "C.b" || got[2] != "b" {
 		t.Fatalf("merged flaky = %v", got)

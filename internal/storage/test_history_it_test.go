@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -562,6 +563,212 @@ func TestPostgresIntegrationTestHistoryUpgradeBridge(t *testing.T) {
 	}
 	if string(before) != string(after) {
 		t.Fatalf("post-upgrade seed diverged from rebuild:\nbefore %s\nafter  %s", before, after)
+	}
+}
+
+// TestPostgresIntegrationTestHistoryLegacyIdentityCanonical is the T4-A
+// upgrade regression: pre-RepoID runs carry ONLY the clone URL and full name
+// (no repo_id/policy_repo_id), so their canonical identity exists only through
+// the canonicalPolicyRepoIDSQLExpr derivation. The test seeds such runs plus
+// pre-0026 reports, upgrades the schema, uploads one new report, and asserts
+// the aggregates and totals equal old+new (not only new), that scoped reads by
+// the canonical ID find the legacy data, and that the migration indexes match
+// the query expressions (planner verification with enable_seqscan=off).
+func TestPostgresIntegrationTestHistoryLegacyIdentityCanonical(t *testing.T) {
+	env := pgITSetup(t)
+	st := env.open(t)
+	ctx := context.Background()
+	// Schema before 0026: no aggregates tables and no canonical index yet.
+	pgITApplyThrough(t, st, 25)
+	canonical, full := "github.com/acme/widget", "acme/widget"
+	base := time.Now().UTC().Truncate(time.Second)
+
+	// Legacy run rows: no repo_id and no policy_repo_id, only the clone URL
+	// (HTTPS and scp-like SSH spellings) plus the full name.
+	legacyRun := func(id, url string, created time.Time) {
+		t.Helper()
+		payload := json.RawMessage(`{"id":"` + id + `","repo":"` + url + `","repo_full_name":"` + full + `","status":"success","created_at":"` + created.Format(time.RFC3339) + `"}`)
+		if _, err := st.pool.Exec(ctx, `INSERT INTO runs (id, status, created_at, payload) VALUES ($1, 'success', $2, $3::jsonb)`, id, created, payload); err != nil {
+			t.Fatalf("insert legacy run %s: %v", id, err)
+		}
+	}
+	runA, runB, runC := pgITNewID(t), pgITNewID(t), pgITNewID(t)
+	legacyRun(runA, "https://github.com/acme/widget.git", base)
+	legacyRun(runB, "git@github.com:acme/widget.git", base.Add(time.Second))
+
+	oldA := pgITHistoryReport(runA, pgITNewID(t), base,
+		model.TestResult{Name: "t1", Duration: 1, Passed: true},
+		model.TestResult{Name: "t2", Duration: 2, Passed: false},
+	)
+	oldB := pgITHistoryReport(runB, pgITNewID(t), base.Add(time.Second),
+		model.TestResult{Name: "t1", Duration: 3, Passed: true},
+	)
+	for _, rep := range []model.TestReport{oldA, oldB} {
+		if err := st.InsertTestReport(ctx, rep); err != nil {
+			t.Fatalf("pre-0026 report insert %s: %v", rep.ID, err)
+		}
+	}
+
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatalf("migrate to latest: %v", err)
+	}
+	if v, err := st.SchemaVersion(ctx); err != nil || v != pgITLatestVersion(t) {
+		t.Fatalf("schema version = %d/%v, want %d", v, err, pgITLatestVersion(t))
+	}
+
+	// The final index definitions live on the canonical expressions: the
+	// 0026 identity index would have omitted the clone-URL derivation.
+	var identityDef, fullNameDef string
+	if err := st.pool.QueryRow(ctx, `SELECT indexdef FROM pg_indexes WHERE schemaname=current_schema() AND indexname='runs_repo_identity_idx'`).Scan(&identityDef); err != nil {
+		t.Fatalf("read identity indexdef: %v", err)
+	}
+	if !strings.Contains(identityDef, `policy_repo_id`) || !strings.Contains(identityDef, `kiwi_canonical_repo_id`) {
+		t.Fatalf("runs_repo_identity_idx is not the canonical policy-first expression: %s", identityDef)
+	}
+	if err := st.pool.QueryRow(ctx, `SELECT indexdef FROM pg_indexes WHERE schemaname=current_schema() AND indexname='runs_repo_full_name_idx'`).Scan(&fullNameDef); err != nil {
+		t.Fatalf("read full-name indexdef: %v", err)
+	}
+	if !strings.Contains(fullNameDef, `repo_full_name`) {
+		t.Fatalf("runs_repo_full_name_idx = %s, want the full-name expression", fullNameDef)
+	}
+	// Planner proof: the query expression built by the SAME helper the reads
+	// use must resolve to the index (textual pg_indexes comparison would be
+	// normalization-sensitive; expression-tree equivalence is what matters).
+	tx, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL enable_seqscan = off`); err != nil {
+		t.Fatal(err)
+	}
+	planRows, err := tx.Query(ctx, `EXPLAIN SELECT id FROM runs WHERE `+canonicalPolicyRepoIDSQLExpr("repo")+` = $1`, canonical)
+	if err != nil {
+		t.Fatalf("explain canonical query: %v", err)
+	}
+	var plan strings.Builder
+	for planRows.Next() {
+		var line string
+		if err := planRows.Scan(&line); err != nil {
+			planRows.Close()
+			t.Fatal(err)
+		}
+		plan.WriteString(line)
+		plan.WriteString("\n")
+	}
+	planRows.Close()
+	if err := planRows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan.String(), "runs_repo_identity_idx") {
+		t.Fatalf("canonical identity query does not use runs_repo_identity_idx:\n%s", plan.String())
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Both scoped read forms find the legacy repository.
+	for _, query := range []string{canonical, full} {
+		ids, err := st.ResolveTestHistoryRepoIDs(ctx, query, 10)
+		if err != nil || !reflect.DeepEqual(ids, []string{canonical}) {
+			t.Fatalf("resolve %q = %v, %v; want [%s]", query, ids, err, canonical)
+		}
+	}
+	listed, err := st.ListTestHistoryRepoIDs(ctx, 100)
+	if err != nil || !reflect.DeepEqual(listed, []string{canonical}) {
+		t.Fatalf("ListTestHistoryRepoIDs = %v, %v; want [%s]", listed, err, canonical)
+	}
+
+	// First post-upgrade upload: its run is legacy-shaped too, and the upload
+	// seeds the legacy reports through the canonical rebuild filter BEFORE
+	// folding the new report.
+	legacyRun(runC, "https://github.com/acme/widget.git", base.Add(2*time.Second))
+	newRep := pgITHistoryReport(runC, pgITNewID(t), base.Add(2*time.Second),
+		model.TestResult{Name: "t1", Duration: 4, Passed: true},
+		model.TestResult{Name: "t3", Duration: 5, Passed: false},
+	)
+	if _, err := st.InsertTestReportWithHistory(ctx, newRep, canonical); err != nil {
+		t.Fatalf("first post-upgrade upload: %v", err)
+	}
+
+	// Aggregates equal the fold over old+new (the upgrade must not drop the
+	// pre-RepoID history).
+	h := testintel.NewHistory()
+	for _, rep := range []model.TestReport{oldA, oldB, newRep} {
+		for _, c := range rep.Cases {
+			h.Record(canonical, rep.JobKey, c.Class, c.Name, c.Duration, c.Passed, rep.CreatedAt)
+		}
+	}
+	want := map[string]testintel.TestStat{}
+	if err := json.Unmarshal(pgITHistoryStatsJSON(t, h), &want); err != nil {
+		t.Fatal(err)
+	}
+	if got := pgITHistoryStats(t, st, canonical); !reflect.DeepEqual(want, got) {
+		t.Fatalf("history dropped legacy data:\nwant %+v\ngot  %+v", want, got)
+	}
+	// The explicit repair rebuild agrees byte-for-byte (same canonical
+	// filter).
+	_, before, err := st.LoadRepoTestHistory(ctx, canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.RebuildRepoTestHistory(ctx, canonical); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	_, after, err := st.LoadRepoTestHistory(ctx, canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("post-upgrade history diverged from rebuild:\nbefore %s\nafter  %s", before, after)
+	}
+
+	// Scoped totals include old+new, both by canonical ID and by full name.
+	for _, query := range []string{canonical, full} {
+		reports, tests, failures, err := st.TestReportTotals(ctx, []string{canonical}, query)
+		if err != nil || reports != 3 || tests != 5 || failures != 2 {
+			t.Fatalf("totals(%q) = %d/%d/%d, %v; want 3/5/2", query, reports, tests, failures, err)
+		}
+	}
+}
+
+// TestPostgresIntegrationTestHistoryCanonicalIndexUpgradeFrom0026 pins the
+// 0026 -> 0027 upgrade path: a database that already applied 0026 (the
+// incomplete identity index, no canonical function) converges on the
+// canonical policy-first index and function when 0027 applies.
+func TestPostgresIntegrationTestHistoryCanonicalIndexUpgradeFrom0026(t *testing.T) {
+	env := pgITSetup(t)
+	st := env.open(t)
+	ctx := context.Background()
+	pgITApplyThrough(t, st, 26)
+
+	var oldDef string
+	if err := st.pool.QueryRow(ctx, `SELECT indexdef FROM pg_indexes WHERE schemaname=current_schema() AND indexname='runs_repo_identity_idx'`).Scan(&oldDef); err != nil {
+		t.Fatalf("read 0026 indexdef: %v", err)
+	}
+	if strings.Contains(oldDef, "kiwi_canonical_repo_id") {
+		t.Fatalf("0026 index already canonical (test premise broken): %s", oldDef)
+	}
+
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatalf("migrate 0026 -> 0027: %v", err)
+	}
+	if v, err := st.SchemaVersion(ctx); err != nil || v != pgITLatestVersion(t) {
+		t.Fatalf("schema version = %d/%v, want %d", v, err, pgITLatestVersion(t))
+	}
+	var functions int
+	if err := st.pool.QueryRow(ctx, `SELECT count(*) FROM pg_proc WHERE proname='kiwi_canonical_repo_id' AND pronamespace=current_schema()::regnamespace`).Scan(&functions); err != nil {
+		t.Fatalf("count canonical function: %v", err)
+	}
+	if functions != 1 {
+		t.Fatalf("kiwi_canonical_repo_id functions = %d, want 1", functions)
+	}
+	var newDef string
+	if err := st.pool.QueryRow(ctx, `SELECT indexdef FROM pg_indexes WHERE schemaname=current_schema() AND indexname='runs_repo_identity_idx'`).Scan(&newDef); err != nil {
+		t.Fatalf("read upgraded indexdef: %v", err)
+	}
+	if !strings.Contains(newDef, "kiwi_canonical_repo_id") || !strings.Contains(newDef, "policy_repo_id") {
+		t.Fatalf("upgraded runs_repo_identity_idx is not canonical: %s", newDef)
 	}
 }
 

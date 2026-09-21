@@ -27,6 +27,17 @@
 -- materializes reports for unrelated repositories (and never parses their
 -- payloads).
 --
+-- SUPERSEDED INDEX DEFINITIONS (migration 0027): the runs_repo_identity_idx
+-- expression created below is INCOMPLETE — it resolves only stored
+-- policy_repo_id/repo_id and omits the canonical clone-URL + full-name
+-- derivation (canonicalRepoIDSQLExpr) that every test-history read AND the
+-- upgrade bridge actually use, so legacy pre-RepoID rows never matched it.
+-- The DDL below is left exactly as shipped (replaying 0026 must stay
+-- idempotent). Migration 0027 drops both 0026 expression indexes and creates
+-- runs_repo_identity_idx on canonicalPolicyRepoIDSQLExpr("repo") plus
+-- runs_repo_full_name_idx on the full-name read expression. A fresh install
+-- applies both files in order and converges on the 0027 definitions.
+--
 -- DEPLOY-SAFETY (same discipline as 0021-0025): this file contains only
 -- metadata-only DDL — CREATE TABLE/CREATE INDEX for new relations plus
 -- expression indexes on existing rows. No existing table is rewritten and no
@@ -61,8 +72,11 @@ CREATE TABLE IF NOT EXISTS test_history_repos (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Superseded by migration 0027 (canonical policy-first expression). Do not
+-- add new reads against this definition.
 CREATE INDEX IF NOT EXISTS runs_repo_identity_idx
     ON runs ((COALESCE(NULLIF(payload->>'policy_repo_id',''), NULLIF(payload->>'repo_id',''))));
 
+-- Kept by 0027 on this exact full-name expression (see the 0027 header).
 CREATE INDEX IF NOT EXISTS runs_repo_full_name_idx
     ON runs ((payload->>'repo_full_name'));
