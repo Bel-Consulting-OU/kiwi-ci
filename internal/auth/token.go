@@ -26,7 +26,9 @@ var ErrSubjectConflict = errors.New("auth: conflicting principals for subject")
 // package variable so tests can inject storage failures at every durability
 // step; production always points it at fsutil.AtomicWriteFile (unique temp
 // file in the target directory, checked write/chmod/fsync/close, rename over
-// the target, parent-directory fsync).
+// the target, parent-directory fsync). Failures come back as typed
+// *fsutil.AtomicWriteError values whose Phase/Renamed report whether the
+// rename had already published the new file (see Save).
 var atomicWriteFile = fsutil.AtomicWriteFile
 
 // TokenStore maps token digests to principals. Raw tokens are never stored:
@@ -154,6 +156,17 @@ func buildSubjectIndex(tokens map[string]Principal) (map[string]Principal, error
 // already maps to a different effective principal; identical definitions
 // under one subject may coexist (e.g. a rotation pair). A rejected call
 // leaves the store unchanged.
+//
+// Repository grant keys are kept VERBATIM in the in-memory store. They are
+// parsed by the typed positional rule at every decision point
+// (ParseStoredRepoID), so a legacy canonical key ("github.com/o/repo-a",
+// dotted or dotless) or a bare key addresses the same repository it always
+// did. Keys are NOT collapsed to their explicit spelling here: two
+// canonically equivalent spellings with DIFFERENT permission sets are a
+// conflict the authorization layer must see (they deny every action), and a
+// Go map could not hold both collapsed spellings. Save migrates the keys to
+// the explicit spelling and fails closed if that migration would merge a
+// conflict, so a persisted store always reloads under the strict Load schema.
 func (t *TokenStore) AddToken(raw string, p Principal) error {
 	if t == nil {
 		return fmt.Errorf("auth: nil token store")
@@ -175,6 +188,42 @@ func (t *TokenStore) AddToken(raw string, p Principal) error {
 	t.tokens = next
 	t.bySubject = index
 	return nil
+}
+
+// normalizePrincipalRepoGrants rewrites every repository grant key of p into
+// its explicit serialized spelling. Legacy keys are migrated with the
+// documented positional rule (ParseRepoGrant); a key that cannot be parsed
+// fails closed with the offending string in the error. Two canonically
+// equivalent keys with DIFFERENT permission sets also fail closed: collapsing
+// them would silently pick one permission set, weakening the operator's
+// intent, so the caller must resolve the conflict explicitly.
+func normalizePrincipalRepoGrants(p Principal) (Principal, error) {
+	if len(p.Repositories) == 0 {
+		return p, nil
+	}
+	normalized := make(map[string]RepositoryPermission, len(p.Repositories))
+	for key, perm := range p.Repositories {
+		grant, err := ParseRepoGrant(key)
+		if err != nil {
+			return Principal{}, err
+		}
+		serialized := grant.Serialized()
+		if serialized == "" {
+			return Principal{}, &RepoGrantError{Grant: key, Detail: "grant renders no usable identity"}
+		}
+		if prev, ok := normalized[serialized]; ok {
+			if prev != perm {
+				return Principal{}, &RepoGrantError{
+					Grant:  key,
+					Detail: fmt.Sprintf("canonically equivalent grant %q already carries a different permission set", serialized),
+				}
+			}
+			continue
+		}
+		normalized[serialized] = perm
+	}
+	p.Repositories = normalized
+	return p, nil
 }
 
 // RemoveToken revokes the token identified by raw and reports whether it was
@@ -272,6 +321,16 @@ func (t *TokenStore) Empty() bool {
 // as a whole with an error wrapping ErrSubjectConflict that names the
 // subject; the in-memory contents are left untouched so the conflict is
 // never partially loaded.
+//
+// Repository grant keys are validated against the strict ACL schema
+// (ParseRepoGrantConfig): a canonical identity must be the unambiguous r1:
+// form and a bare alias must be the plain owner/name or a1: form. A legacy
+// ambiguous key — three or more path segments without an explicit tag, which
+// could be a dotless host plus a full name or a bare nested group path — is
+// refused with ErrRepoGrantAmbiguous naming the offending string and both
+// accepted spellings. The migration never guesses: an old token file must be
+// edited to the explicit form (or rewritten with AddToken + Save, which
+// migrate legacy in-process keys positionally).
 func (t *TokenStore) Load(path string) error {
 	if t == nil {
 		return fmt.Errorf("auth: nil token store")
@@ -284,6 +343,11 @@ func (t *TokenStore) Load(path string) error {
 	if err := json.Unmarshal(b, &m); err != nil {
 		return fmt.Errorf("auth: parse token file %s: %w", path, err)
 	}
+	for digest, p := range m {
+		if err := validatePrincipalRepoGrants(p); err != nil {
+			return fmt.Errorf("auth: load token file %s: token %s: %w", path, digest, err)
+		}
+	}
 	index, err := buildSubjectIndex(m)
 	if err != nil {
 		return fmt.Errorf("auth: load token file %s: %w", path, err)
@@ -295,11 +359,37 @@ func (t *TokenStore) Load(path string) error {
 	return nil
 }
 
+// validatePrincipalRepoGrants applies the strict ACL grant schema to every
+// repository key of p. It never rewrites the keys: validation and migration
+// are separate steps so a load can fail closed with the operator's exact
+// string.
+func validatePrincipalRepoGrants(p Principal) error {
+	for key := range p.Repositories {
+		if _, err := ParseRepoGrantConfig(key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Save atomically writes the store as a 0600 JSON file of token digests to
 // principals, creating the parent directory (0700) if needed. The write is
 // crash-durable: fsutil.AtomicWriteFile uses a unique temp file, fsyncs the
 // file, closes it with error checking, renames it over path and fsyncs the
-// parent directory, so a failure leaves the previous durable file intact.
+// parent directory.
+//
+// The failure phases are explicit and callers must not flatten them into
+// "the previous durable file is intact": every phase before the rename
+// (create/write/chmod/file-sync/close/rename) leaves the previous file at
+// path bit-for-bit intact and removes the temp file, so there the new store
+// was DEFINITELY NOT PUBLISHED. The parent-directory fsync runs AFTER the
+// rename: its failure means the new store IS visible at path while its crash
+// durability is uncertified (*fsutil.AtomicWriteError with Renamed=true,
+// errors.Is(err, fsutil.ErrPublishedUncertain)). A caller that maintains
+// monotonic security state must retain the published state in that case
+// rather than roll back to a permissive one; the server paths do this
+// through noteFilePersistResult (keys.go), which also keeps readiness
+// degraded until a later successful persist reconciles.
 //
 // Concurrent Save calls are legal and serialized by saveMu; each call
 // snapshots and writes its own bytes, so no call can acknowledge or corrupt
@@ -317,6 +407,15 @@ func (t *TokenStore) Save(path string) error {
 		m[k] = v
 	}
 	t.mu.RUnlock()
+	// Migrate any legacy in-process grant keys to the explicit schema so the
+	// persisted file always reloads under the strict Load validation.
+	for k, v := range m {
+		normalized, err := normalizePrincipalRepoGrants(v)
+		if err != nil {
+			return fmt.Errorf("auth: save token file %s: %w", path, err)
+		}
+		m[k] = normalized
+	}
 	b, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return err

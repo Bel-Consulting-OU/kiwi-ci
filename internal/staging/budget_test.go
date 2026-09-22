@@ -355,17 +355,29 @@ func TestSpoolFileStagesContentAndBounds(t *testing.T) {
 	if err != nil || !bytes.Equal(got, payload) {
 		t.Fatalf("spooled content = %q, %v", got, err)
 	}
-	// Exact limit passes.
-	if _, n, err := SpoolFile(dir, bytes.NewReader(payload), int64(len(payload))); err != nil || n != int64(len(payload)) {
+	// Exact limit passes and leaves exactly `limit` bytes on disk.
+	exactPath, n, err := SpoolFile(dir, bytes.NewReader(payload), int64(len(payload)))
+	if err != nil || n != int64(len(payload)) {
 		t.Fatalf("SpoolFile at limit = (%d, %v)", n, err)
 	}
-	// One byte over fails with ErrTooLarge and removes the partial file.
+	fi, statErr := os.Stat(exactPath)
+	if statErr != nil {
+		t.Fatalf("stat at-limit spool: %v", statErr)
+	}
+	if fi.Size() != int64(len(payload)) {
+		t.Fatalf("at-limit spool file is %d bytes on disk, want exactly %d", fi.Size(), len(payload))
+	}
+	// One byte over fails with ErrTooLarge and removes the partial file, and
+	// the reported staged count never exceeds the limit (nothing past it was
+	// written).
 	before, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := SpoolFile(dir, bytes.NewReader(payload), int64(len(payload)-1)); !errors.Is(err, ErrTooLarge) {
+	if _, n, err := SpoolFile(dir, bytes.NewReader(payload), int64(len(payload)-1)); !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("SpoolFile over limit = %v, want ErrTooLarge", err)
+	} else if n > int64(len(payload)-1) {
+		t.Fatalf("over-limit SpoolFile reported %d staged bytes with limit %d", n, len(payload)-1)
 	}
 	after, err := os.ReadDir(dir)
 	if err != nil {
@@ -377,6 +389,114 @@ func TestSpoolFileStagesContentAndBounds(t *testing.T) {
 	// Empty directory path is a bound error.
 	if _, _, err := SpoolFile("", bytes.NewReader(payload), 1); !errors.Is(err, ErrNoBound) {
 		t.Fatalf("SpoolFile empty dir = %v, want ErrNoBound", err)
+	}
+}
+
+// TestReservationConcurrentReleaseDecrementsExactlyOnce is the O3-C
+// regression: Release is documented idempotent, so 100 concurrent releases of
+// one reservation must decrement the ledger exactly once. A second live
+// reservation makes a double decrement observable (Used would fall to 100
+// instead of 200; the underflow clamp would only hide it at zero).
+func TestReservationConcurrentReleaseDecrementsExactlyOnce(t *testing.T) {
+	b, err := NewBudget(t.TempDir(), 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = b.Close() }()
+	first, err := b.Acquire(context.Background(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := b.Acquire(context.Background(), 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const racers = 100
+	var wg sync.WaitGroup
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			first.Release()
+		}()
+	}
+	wg.Wait()
+	if got := b.Used(); got != 200 {
+		t.Fatalf("Used() = %d after %d concurrent releases of a 100-byte reservation, want 200 (exactly one decrement)", got, racers)
+	}
+	// Releasing the other reservation concurrently converges to zero.
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			second.Release()
+		}()
+	}
+	wg.Wait()
+	if got := b.Used(); got != 0 {
+		t.Fatalf("Used() = %d after releasing both reservations, want 0", got)
+	}
+}
+
+// countingWriter records the bytes actually handed to a spool destination.
+type countingWriter struct{ written int64 }
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	w.written += int64(len(p))
+	return len(p), nil
+}
+
+// lyingEOFReader delivers its underlying bytes but never reports io.EOF,
+// returning (0, nil) instead: a source that cannot prove it is complete.
+type lyingEOFReader struct{ r io.Reader }
+
+func (l *lyingEOFReader) Read(p []byte) (int, error) {
+	n, err := l.r.Read(p)
+	if errors.Is(err, io.EOF) {
+		return n, nil
+	}
+	return n, err
+}
+
+// TestSpoolCopyNeverWritesBeyondLimit is the O3-D regression: the physical
+// bound is exactly `limit` bytes written to the destination. The limit+1 byte
+// that detects an over-long or lying source is read from the SOURCE for
+// detection but never reaches disk, and bytes-written always equals the
+// reported count.
+func TestSpoolCopyNeverWritesBeyondLimit(t *testing.T) {
+	const limit = 8
+	payload := []byte("0123456789") // limit + 2 bytes available
+	cases := map[string]struct {
+		src     io.Reader
+		wantN   int64
+		wantErr bool
+	}{
+		"exactly limit":             {bytes.NewReader(payload[:limit]), limit, false},
+		"limit+1":                   {bytes.NewReader(payload[:limit+1]), limit, true},
+		"lying reader beyond limit": {&lyingEOFReader{r: bytes.NewReader(payload)}, limit, true},
+		"lying reader at limit":     {&lyingEOFReader{r: bytes.NewReader(payload[:limit])}, limit, true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			w := &countingWriter{}
+			n, err := spoolCopy(w, tc.src, limit)
+			if tc.wantErr {
+				if !errors.Is(err, ErrTooLarge) {
+					t.Fatalf("spoolCopy error = %v, want ErrTooLarge", err)
+				}
+			} else if err != nil {
+				t.Fatalf("spoolCopy error = %v, want nil", err)
+			}
+			if n != tc.wantN {
+				t.Fatalf("spoolCopy reported %d bytes, want %d", n, tc.wantN)
+			}
+			if w.written > limit {
+				t.Fatalf("spoolCopy wrote %d bytes to disk with limit %d (exact bound violated)", w.written, limit)
+			}
+			if n != w.written {
+				t.Fatalf("reported bytes %d != physically written %d", n, w.written)
+			}
+		})
 	}
 }
 

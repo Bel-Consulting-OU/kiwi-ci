@@ -530,19 +530,6 @@ func (s *Server) authorizedTestHistoryRepoIDs(r *http.Request, ids []string) []s
 	return authorized
 }
 
-// splitForgeRepoKey splits a repository query or grant key into its bare
-// owner/name and, when the first segment is host-like (it contains a dot and
-// is followed by an owner/name remainder), its forge host. It mirrors auth's
-// unexported splitCanonicalRepo so the server classifies canonical IDs
-// exactly like the authorization layer and the storage resolver.
-func splitForgeRepoKey(key string) (host, bare string, hasHost bool) {
-	parts := strings.SplitN(key, "/", 2)
-	if len(parts) != 2 || !strings.Contains(parts[0], ".") || !strings.Contains(parts[1], "/") {
-		return "", key, false
-	}
-	return parts[0], parts[1], true
-}
-
 // testHistoryPermittedRepoIDs returns the canonical repository identities the
 // request's principal is explicitly granted AND that the query addresses. A
 // nil result means candidate resolution must NOT be identity-restricted:
@@ -553,6 +540,14 @@ func splitForgeRepoKey(key string) (host, bare string, hasHost bool) {
 // identities. A non-nil result is the exact permitted intersection —
 // possibly empty — that resolution must apply BEFORE its ambiguity cap, so an
 // authorized repository that sorts after a bare-name cap is still reachable.
+//
+// Both the query and every grant key are classified with the typed positional
+// rule (auth.ParseStoredRepoID): an explicit r1: identity, an r1:-migrated
+// canonical storage ID ("host/owner/name"), or a plain canonical ID with a
+// DOTLESS host all parse into a RepoIdentity compared by (host, full name)
+// equality; a bare owner/name or a1: string parses into a RepoAlias. The old
+// splitForgeRepoKey dot heuristic is gone, so a dotless canonical grant is
+// never mistaken for a bare nested group.
 func (s *Server) testHistoryPermittedRepoIDs(r *http.Request, query string) []string {
 	p, ok := auth.PrincipalFrom(r)
 	if !ok {
@@ -565,20 +560,23 @@ func (s *Server) testHistoryPermittedRepoIDs(r *http.Request, query string) []st
 	if query == "" {
 		return nil
 	}
-	// Canonicalize exactly like the authorization layer: the host is
-	// normalized, and a query that already carries this host is reduced to
-	// its bare remainder.
-	canonicalQuery := auth.CanonicalRepoID("", query)
-	_, queryBare, queryHasHost := splitForgeRepoKey(canonicalQuery)
+	qGrant, err := auth.ParseStoredRepoID(query)
+	if err != nil {
+		return nil
+	}
+	queryIdentity, queryIsCanonical := qGrant.Identity()
+	queryFullName := qGrant.AuthorizationID()
+	if queryIsCanonical {
+		queryFullName = queryIdentity.FullName
+	}
 	permitted := []string{}
 	for key := range p.Repositories {
-		normalized := auth.NormalizeRepoKey(strings.TrimSpace(key))
-		if normalized == "" {
+		grant, err := auth.ParseStoredRepoID(strings.TrimSpace(key))
+		if err != nil {
 			continue
 		}
-		_, bare, hasHost := splitForgeRepoKey(normalized)
-		if !hasHost {
-			if normalized == queryBare {
+		if alias, ok := grant.Alias(); ok {
+			if alias.FullName == queryFullName {
 				// A bare grant authorizes every forge presenting the name:
 				// the permitted identity set is not enumerable, so keep the
 				// unrestricted resolution (and its ambiguity refusal).
@@ -586,15 +584,19 @@ func (s *Server) testHistoryPermittedRepoIDs(r *http.Request, query string) []st
 			}
 			continue
 		}
-		if queryHasHost {
-			if normalized != canonicalQuery {
-				continue
-			}
-		} else if bare != queryBare {
+		id, ok := grant.Identity()
+		if !ok {
 			continue
 		}
-		if auth.CanReadRepo(p, normalized) {
-			permitted = append(permitted, normalized)
+		if queryIsCanonical {
+			if id != queryIdentity {
+				continue
+			}
+		} else if id.FullName != queryFullName {
+			continue
+		}
+		if auth.CanReadRepoIdentity(p, id) {
+			permitted = append(permitted, id.ID())
 		}
 	}
 	return permitted

@@ -364,9 +364,10 @@ func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j mode
 		return
 	}
 	// Publish + record commit under the digest fence (the collector re-reads
-	// references under the same fence). The digest is only known after Put,
-	// so the staging temp file is hashed here first; a matching CAS.Put is
-	// idempotent.
+	// references under the same fence). The digest is only known after the
+	// staged bytes are hashed, so the staging temp file is hashed here
+	// first; the publication then streams that SAME staged file into the
+	// backend (no second copy) and validates the object the backend reports.
 	stagedSum, sumErr := fileSHA256(tmp.Name())
 	if sumErr != nil {
 		s.internalError(w, r, sumErr, "")
@@ -378,8 +379,13 @@ func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j mode
 		return
 	}
 	defer releaseSnap()
-	obj, err := s.CAS.Put(ctx, tmp)
+	obj, err := s.CAS.PutFile(ctx, tmpName, stagedSum, n)
 	if err != nil {
+		if casIntegrityError(err) {
+			s.logf("snapshot upload: CAS publication failed: %v", err)
+			http.Error(w, "snapshot storage verification failed", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, "snapshot storage failed", http.StatusServiceUnavailable)
 		return
 	}
@@ -390,7 +396,7 @@ func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j mode
 	// upload instead of being acknowledged; the unreferenced blob is left
 	// for the reference-aware GC.
 	wantSHA := hex.EncodeToString(h.Sum(nil))
-	if obj.SHA256 != wantSHA || obj.Size != n {
+	if obj.Key != wantSHA || obj.SHA256 != wantSHA || obj.Size != n {
 		http.Error(w, "snapshot storage verification failed", http.StatusServiceUnavailable)
 		return
 	}

@@ -21,6 +21,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/blob"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/quotas"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/ratelimit"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
 )
 
 type ServerConfig struct {
@@ -216,14 +217,31 @@ type ComponentsConfig struct {
 // (job cache entries, workspace snapshots) before they are published to the
 // shared CAS. Without a bound, concurrent valid multi-GB uploads would spool
 // into an unbounded system temp directory and could exhaust the
-// control-plane root filesystem. The keys are all-or-nothing: either both
-// are set or neither is; production mode requires both.
+// control-plane root filesystem. dir/max_bytes are all-or-nothing: either
+// both are set or neither is; production mode requires both.
+//
+// Per-replica contract: Dir is a shared ROOT, not the directory bytes land
+// in. Every process takes exclusive ownership of <Dir>/<instance_id> at
+// startup, reclaims the spool files a dead owner left there, and bounds only
+// its own staged bytes. Replicas sharing one root MUST therefore use distinct
+// instance ids; when instance_id is unset the first process generates one and
+// persists it in the root, so a second replica without its own id is refused
+// at startup (it would otherwise stage another full max_bytes over the same
+// disk). The runtime also never needs two replicas to share one directory:
+// that mode is not supported and is refused, never silently multiplied.
 type StagingConfig struct {
-	// Dir is the staging directory large uploads spool into.
+	// Dir is the staging root; each process stages inside
+	// <Dir>/<instance_id> (or <Dir>/<generated id> when instance_id is
+	// unset).
 	Dir string `toml:"dir"`
-	// MaxBytes is the total byte budget shared by all concurrent staged
-	// uploads. A reservation larger than the budget is refused.
+	// MaxBytes is the byte budget of THIS replica's staged uploads. A
+	// reservation larger than the budget is refused.
 	MaxBytes int64 `toml:"max_bytes"`
+	// InstanceID names this replica's subdirectory under Dir. It is
+	// optional: when empty the process generates (and persists in Dir) an
+	// id, which also makes a shared root safe for exactly one replica.
+	// Replicas that share a root must set distinct ids.
+	InstanceID string `toml:"instance_id"`
 }
 
 type Config struct {
@@ -430,22 +448,36 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// validateStaging enforces the staging section's all-or-nothing contract: a
-// usable staging bound is either fully configured (a directory AND a
-// positive byte budget) or absent. A partial configuration is refused so a
-// typo cannot silently leave large uploads unbounded, and a non-positive
-// budget is refused because it can never hold a valid upload. Production
-// mode additionally REQUIRES both keys (see app.validateProductionConfig).
+// validateStaging enforces the staging section's contract: a usable staging
+// bound is either fully configured (a directory AND a positive byte budget)
+// or absent. A partial configuration is refused so a typo cannot silently
+// leave large uploads unbounded, and a non-positive budget is refused because
+// it can never hold a valid upload. Production mode additionally REQUIRES
+// both keys (see app.validateProductionConfig).
+//
+// The instance id is the per-replica half of the bound: staging.dir is a
+// root and each replica stages in <root>/<instance_id>, so replicas sharing
+// the root must carry distinct ids. An id without a root is refused because
+// there is no directory to place it under.
 func validateStaging(st StagingConfig) error {
 	dir := strings.TrimSpace(st.Dir)
+	instanceID := strings.TrimSpace(st.InstanceID)
 	if dir == "" && st.MaxBytes == 0 {
+		if instanceID != "" {
+			return fmt.Errorf("staging.instance_id requires staging.dir: the id names the per-replica directory <staging.dir>/<staging.instance_id> (each replica stages into its own subdirectory of the shared root)")
+		}
 		return nil
 	}
 	if dir == "" {
-		return fmt.Errorf("staging.dir is required when staging.max_bytes is set")
+		return fmt.Errorf("staging.dir is required when staging.max_bytes is set (staging.dir is the per-replica ROOT: every replica stages inside <staging.dir>/<staging.instance_id>)")
 	}
 	if st.MaxBytes <= 0 {
-		return fmt.Errorf("staging.max_bytes must be a positive byte budget when staging.dir is set, got %d", st.MaxBytes)
+		return fmt.Errorf("staging.max_bytes must be a positive byte budget when staging.dir is set, got %d (the budget bounds one replica's staged bytes; replicas sharing staging.dir must set distinct staging.instance_id values)", st.MaxBytes)
+	}
+	if instanceID != "" {
+		if err := staging.ValidateInstanceID(instanceID); err != nil {
+			return fmt.Errorf("staging.instance_id: %w (per-replica staging contract: each replica stages inside <staging.dir>/<staging.instance_id>; replicas sharing the root MUST use distinct ids, and startup refuses a root whose directory is already owned by a live replica)", err)
+		}
 	}
 	return nil
 }
@@ -582,6 +614,7 @@ func (c *Config) ApplyEnv() error {
 		{"KIWI_COMPONENT_REMOTE", &c.Components.RemoteURL},
 		{"KIWI_COMPONENT_REMOTE_TOKEN", &c.Components.RemoteToken},
 		{"KIWI_STAGING_DIR", &c.Staging.Dir},
+		{"KIWI_STAGING_INSTANCE_ID", &c.Staging.InstanceID},
 	}
 	for _, e := range vars {
 		if v, ok := os.LookupEnv(e.name); ok {
@@ -783,6 +816,8 @@ func (c *Config) OverrideFromFlags(fs *flag.FlagSet) error {
 			c.Components.RemoteToken = f.Value.String()
 		case "staging-dir":
 			c.Staging.Dir = f.Value.String()
+		case "staging-instance-id":
+			c.Staging.InstanceID = f.Value.String()
 		case "staging-max-bytes":
 			if f.Value.String() != "" {
 				v, perr := strconv.ParseInt(f.Value.String(), 10, 64)

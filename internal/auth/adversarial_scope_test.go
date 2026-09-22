@@ -92,11 +92,13 @@ func TestRepoEntryTriState(t *testing.T) {
 	if _, res := conflict.repoEntry("github.com/acme/third"); res != RepoNoEntry {
 		t.Fatalf("unmentioned repo = %v, want RepoNoEntry", res)
 	}
-	if _, res := lookupRepoEntry(conflict.Repositories, "github.com/acme/service"); res != RepoConflict {
-		t.Fatalf("lookupRepoEntry conflict = %v, want RepoConflict", res)
+	conflictID, _ := ParseStoredRepoID("github.com/acme/service")
+	if _, res := conflict.repoEntryGrant(conflictID); res != RepoConflict {
+		t.Fatalf("repoEntryGrant conflict = %v, want RepoConflict", res)
 	}
-	if _, res := lookupRepoEntry(conflict.Repositories, "github.com/acme/third"); res != RepoNoEntry {
-		t.Fatalf("lookupRepoEntry miss = %v, want RepoNoEntry", res)
+	missID, _ := ParseStoredRepoID("github.com/acme/third")
+	if _, res := conflict.repoEntryGrant(missID); res != RepoNoEntry {
+		t.Fatalf("repoEntryGrant miss = %v, want RepoNoEntry", res)
 	}
 
 	// Identical duplicate spellings are ONE entry, not a conflict.

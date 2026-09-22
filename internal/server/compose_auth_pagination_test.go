@@ -37,6 +37,13 @@ func composeTokenFile(t *testing.T, dir string, m map[string]auth.Principal) str
 	return path
 }
 
+// composeCanonicalKey renders an ACL grant in the explicit r1: spelling the
+// strict token-file Load schema requires (a legacy "host/owner/name" string is
+// ambiguous and refused).
+func composeCanonicalKey(host, fullName string) string {
+	return auth.RepoIdentity{Host: host, FullName: fullName}.Serialized()
+}
+
 // TestComposeConflictingSubjectTokenFileFailsClosed composes the startup
 // credential load with the paginated collection: two credentials for one
 // subject with different effective principals (each allowed to read a
@@ -47,8 +54,8 @@ func composeTokenFile(t *testing.T, dir string, m map[string]auth.Principal) str
 func TestComposeConflictingSubjectTokenFileFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 	conflictPath := composeTokenFile(t, dir, map[string]auth.Principal{
-		auth.TokenDigest("conflict-a"): {Subject: "svc-ambiguous", Repositories: map[string]auth.RepositoryPermission{"github.com/o/repo-a": {Read: true}}},
-		auth.TokenDigest("conflict-b"): {Subject: "svc-ambiguous", Repositories: map[string]auth.RepositoryPermission{"github.com/o/repo-b": {Read: true}}},
+		auth.TokenDigest("conflict-a"): {Subject: "svc-ambiguous", Repositories: map[string]auth.RepositoryPermission{composeCanonicalKey("github.com", "o/repo-a"): {Read: true}}},
+		auth.TokenDigest("conflict-b"): {Subject: "svc-ambiguous", Repositories: map[string]auth.RepositoryPermission{composeCanonicalKey("github.com", "o/repo-b"): {Read: true}}},
 	})
 	s, err := NewPersistent("runner-tok", "admin-tok", dir)
 	if err != nil {
@@ -110,8 +117,8 @@ func composeRotationPaginationServer(t *testing.T) *Server {
 	t.Helper()
 	dir := t.TempDir()
 	path := composeTokenFile(t, dir, map[string]auth.Principal{
-		auth.TokenDigest("rot-1"): {Subject: "svc-rotation", Repositories: map[string]auth.RepositoryPermission{"github.com/o/repo-a": {Read: true}}},
-		auth.TokenDigest("rot-2"): {Subject: "svc-rotation", Repositories: map[string]auth.RepositoryPermission{"github.com/o/repo-a": {Read: true}}},
+		auth.TokenDigest("rot-1"): {Subject: "svc-rotation", Repositories: map[string]auth.RepositoryPermission{composeCanonicalKey("github.com", "o/repo-a"): {Read: true}}},
+		auth.TokenDigest("rot-2"): {Subject: "svc-rotation", Repositories: map[string]auth.RepositoryPermission{composeCanonicalKey("github.com", "o/repo-a"): {Read: true}}},
 	})
 	s, err := NewPersistent("runner-tok", "admin-tok", dir)
 	if err != nil {

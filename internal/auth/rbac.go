@@ -27,12 +27,26 @@ const (
 // Semantics:
 //   - the admin role grants every action;
 //   - repo-specific entries take precedence when present for repo;
-//   - repo may be a canonical repository ID (host/owner/name): an entry
-//     keyed by the bare owner/name full name also satisfies it;
+//   - repo is read with the typed positional rule (ParseStoredRepoID):
+//     "host/owner/name" (three or more segments, dotted OR dotless host) is a
+//     canonical identity, and a name with fewer segments is a bare alias.
+//     Dots are never consulted. The typed entry points AuthorizeIdentity and
+//     AuthorizeAlias take the values directly;
+//   - a canonical identity matches canonical entries of the same
+//     (canonical host, full name), and falls back to an EXPLICIT bare grant
+//     with the same full name (a bare grant addresses every forge presenting
+//     the name);
+//   - the LEGACY string entry point keeps the historical positional
+//     fallback in BOTH directions: a bare string (a host-less address) also
+//     falls back to canonical entries with the same full name, and
+//     conflicting equivalent entries at any stage fail closed. The typed
+//     AuthorizeAlias entry point does NOT: a typed RepoAlias matches ONLY
+//     explicit bare grants, because it is an explicit statement that the
+//     value is host-less rather than a legacy string whose host is unknown;
 //   - CONFLICTING entries for the same repository identity (canonically
-//     equivalent keys with different permission sets) deny every action:
-//     they never fall through to global roles, because that would let a
-//     map duplicate silently widen a grant;
+//     equivalent identity keys, or equivalent bare keys, with different
+//     permission sets) deny every action: they never fall through to global
+//     roles, because that would let a map duplicate silently widen a grant;
 //   - global roles apply only when the principal declares NO usable entry
 //     for the repository (RepoNoEntry);
 //   - RoleRun grants untrusted run only; trusted_run requires an explicit
@@ -40,9 +54,45 @@ const (
 //   - ActionRun with trusted=true is equivalent to ActionTrustedRun.
 func Authorize(p Principal, action Action, repo string, trusted bool) bool {
 	if p.Has(RoleAdmin) {
+		// The admin role grants every action, including the repo-less global
+		// actions and an empty/malformed repository string that carries no
+		// identity the map could mention.
 		return true
 	}
-	perm, res := p.repoEntry(repo)
+	grant, err := ParseStoredRepoID(repo)
+	if err != nil {
+		// An empty or malformed repository string carries no identity the
+		// map could mention: only the global roles decide. The same path
+		// serves the deliberately repo-less global actions.
+		return authorizeGlobalRoles(p, action, trusted)
+	}
+	return authorizeGrantMode(p, action, grant, trusted, true)
+}
+
+// AuthorizeIdentity is the typed canonical-identity authorization entry
+// point: the repository is specified by its explicit (host, full name)
+// identity, so no string shape is interpreted and a dotless host is just
+// another host.
+func AuthorizeIdentity(p Principal, action Action, id RepoIdentity, trusted bool) bool {
+	return authorizeGrantMode(p, action, IdentityGrant(id), trusted, false)
+}
+
+// AuthorizeAlias is the typed bare-alias authorization entry point: a typed
+// RepoAlias is an EXPLICIT host-less value, so it matches ONLY explicit bare
+// grants and never borrows a canonical grant.
+func AuthorizeAlias(p Principal, action Action, alias RepoAlias, trusted bool) bool {
+	return authorizeGrantMode(p, action, AliasGrant(alias), trusted, false)
+}
+
+// authorizeGrantMode is the single repository-grant resolution behind every
+// Authorize entry point. legacyBareFallback selects whether a LEGACY bare
+// string may fall back to canonical entries with the same full name (the
+// historical positional behavior); the typed AuthorizeAlias passes false.
+func authorizeGrantMode(p Principal, action Action, grant RepoGrant, trusted, legacyBareFallback bool) bool {
+	if p.Has(RoleAdmin) {
+		return true
+	}
+	perm, res := p.repoEntryGrantMode(grant, legacyBareFallback)
 	if res == RepoConflict {
 		// The repository's explicit grants disagree with each other: the
 		// entry is unusable, and resolving through map iteration order
@@ -70,6 +120,12 @@ func Authorize(p Principal, action Action, repo string, trusted bool) bool {
 			return perm.ArtifactRead
 		}
 	}
+	return authorizeGlobalRoles(p, action, trusted)
+}
+
+// authorizeGlobalRoles resolves an action from the principal's global roles,
+// used only when the repository map declares no usable entry.
+func authorizeGlobalRoles(p Principal, action Action, trusted bool) bool {
 	switch action {
 	case ActionRead:
 		return p.Has(RoleRead)
@@ -100,16 +156,68 @@ func Authorize(p Principal, action Action, repo string, trusted bool) bool {
 
 // CanReadRepo reports whether the principal may read repository repo. It is
 // THE repository-visibility decision shared by the per-run read routes and
-// the scoped collection projections (run lists and serving runners), so
-// NormalizeRepoKey, default-port/host-case canonicalization, bare aliases and
-// the ambiguity fail-closed rule resolve identically everywhere. repo accepts
-// a canonical repository ID ("forge-host/owner/name") or a bare full name;
-// the call is equivalent to Authorize(p, ActionRead, repo, false) and shares
-// the full repository-entry semantics (an entry present for the repository is
-// authoritative; conflicting entries deny; global roles cover only the
-// repositories the map does not mention).
+// the scoped collection projections (run lists and serving runners), so host
+// canonicalization, typed identity/alias resolution and the ambiguity
+// fail-closed rule resolve identically everywhere. repo accepts a canonical
+// repository ID ("host/owner/name", dotted or dotless host) or a bare full
+// name, parsed by ParseStoredRepoID; the call is equivalent to
+// Authorize(p, ActionRead, repo, false) and shares the full repository-entry
+// semantics (an entry present for the repository is authoritative;
+// conflicting entries deny; global roles cover only the repositories the map
+// does not mention).
 func CanReadRepo(p Principal, repo string) bool {
 	return Authorize(p, ActionRead, repo, false)
+}
+
+// CanReadRepoIdentity is the typed canonical-identity read decision. A
+// canonical identity is authorized by an identical canonical grant or by an
+// explicit bare grant with the same full name.
+func CanReadRepoIdentity(p Principal, id RepoIdentity) bool {
+	return AuthorizeIdentity(p, ActionRead, id, false)
+}
+
+// CanReadRepoAlias is the typed bare-alias read decision. A bare alias is
+// authorized ONLY by an explicit bare grant with the same full name: a
+// canonical grant for one forge never authorizes another forge's repository
+// of the same name.
+func CanReadRepoAlias(p Principal, alias RepoAlias) bool {
+	return AuthorizeAlias(p, ActionRead, alias, false)
+}
+
+// CanReadAnyRepoAlias reports whether the principal holds a READ capability
+// that can cover at least one repository presenting alias.FullName: the
+// global read/admin role, a bare read grant for the name, or a canonical
+// read grant whose full name is the alias (the alias addresses every forge,
+// so any of those forges' repositories may match). It is the coarse
+// query-form gate for repository-spanning endpoints that address a bare
+// name; the per-candidate authorization still runs through
+// CanReadRepoIdentity, so a canonical grant only ever opens its own forge.
+func CanReadAnyRepoAlias(p Principal, alias RepoAlias) bool {
+	if p.Has(RoleAdmin) || p.Has(RoleRead) {
+		return true
+	}
+	if alias.FullName == "" {
+		return false
+	}
+	for key, perm := range p.Repositories {
+		if !perm.Read {
+			continue
+		}
+		grant, err := ParseStoredRepoID(key)
+		if err != nil {
+			continue
+		}
+		if grant.IsAlias() {
+			if a, _ := grant.Alias(); a.FullName == alias.FullName {
+				return true
+			}
+			continue
+		}
+		if id, _ := grant.Identity(); id.FullName == alias.FullName {
+			return true
+		}
+	}
+	return false
 }
 
 // CanReadAnyRepo reports whether the principal may read at least one
@@ -155,135 +263,167 @@ const (
 	RepoConflict
 )
 
-// repoEntry resolves the repo-specific permission entry for repo. The map
-// may be keyed by the canonical repository ID (host/owner/name) or by the
-// bare full name (owner/name): a canonical lookup falls back to the bare
-// form and a bare lookup falls back to canonical keys with the same bare
-// part, so both keying conventions work. Stored keys and the lookup key are
-// canonicalized first (host case, one trailing dot, default ports), so
-// equivalent spellings of the same forge host address the same grant. The
-// resolution is DETERMINISTIC and fails closed: when several equivalent keys
-// carry DIFFERENT permission sets at any stage (equivalent canonical keys,
-// canonical→bare, bare→canonical, or duplicate spellings of one canonical
-// key) the result is RepoConflict, which Authorize turns into an immediate
-// denial for every action. Only RepoNoEntry — a repository the map genuinely
-// does not mention — leaves the decision to the global roles.
+// repoEntry resolves the repo-specific permission entry for a repository
+// string with the typed positional rule (ParseStoredRepoID) and delegates to
+// repoEntryGrant (the legacy string path, which keeps the positional
+// bare↔canonical fallback).
 func (p Principal) repoEntry(repo string) (RepositoryPermission, RepoEntryResult) {
-	repo = NormalizeRepoKey(repo)
-	if perm, res := lookupRepoEntry(p.Repositories, repo); res != RepoNoEntry {
-		return perm, res
+	grant, err := ParseStoredRepoID(repo)
+	if err != nil {
+		return RepositoryPermission{}, RepoNoEntry
 	}
-	_, bare, hasHost := splitCanonicalRepo(repo)
-	if hasHost {
-		return lookupRepoEntry(p.Repositories, bare)
+	return p.repoEntryGrant(grant)
+}
+
+// repoEntryGrant is repoEntryGrantMode with the legacy positional fallback
+// enabled (the string-derived grant path and the repository-entry tests).
+func (p Principal) repoEntryGrant(grant RepoGrant) (RepositoryPermission, RepoEntryResult) {
+	return p.repoEntryGrantMode(grant, true)
+}
+
+// repoEntryGrantMode resolves the repo-specific permission entry for a typed
+// grant. The principal's map keys are parsed with the same documented rule
+// (ParseStoredRepoID), so a legacy canonical key written before typed
+// identity ("github.com/o/r", or the dotless "gitlab/acme/widget") addresses
+// the same identity it was derived from; an unusable key matches nothing.
+//
+// Resolution is DETERMINISTIC and fails closed:
+//
+//   - an identity lookup first considers canonical identity keys with the
+//     same (canonical host, full name); when several DIFFERENT permission
+//     sets collide there, the result is RepoConflict;
+//   - on a canonical miss it considers EXPLICIT bare keys with the same full
+//     name (a bare grant addresses every forge presenting the name), with the
+//     same conflict rule;
+//   - an alias lookup first considers explicit bare keys with the same full
+//     name (with the same conflict rule). A legacy bare STRING additionally
+//     falls back to canonical keys sharing its full name when
+//     legacyBareFallback is set, so the string entry point keeps the
+//     historical positional behavior; the typed AuthorizeAlias passes false,
+//     so a typed RepoAlias never borrows a canonical grant.
+//
+// Only RepoNoEntry — a repository the map genuinely does not mention — leaves
+// the decision to the global roles.
+func (p Principal) repoEntryGrantMode(grant RepoGrant, legacyBareFallback bool) (RepositoryPermission, RepoEntryResult) {
+	if grant.Kind() == RepoGrantInvalid {
+		return RepositoryPermission{}, RepoNoEntry
 	}
-	// repo is a bare full name: match canonical keys whose bare part is repo.
-	var match RepositoryPermission
-	found, ambiguous := false, false
-	seen := map[string]RepositoryPermission{}
-	for key, perm := range p.Repositories {
-		nk := NormalizeRepoKey(key)
-		if prev, ok := seen[nk]; ok {
-			// Duplicate spellings of one canonical key: identical grants
-			// are the same entry, different grants are a conflict.
+	identities := map[string]RepositoryPermission{}
+	identityFull := map[string]map[string]bool{}
+	aliases := map[string]RepositoryPermission{}
+	identityConflict := map[string]bool{}
+	aliasConflict := map[string]bool{}
+	record := func(m map[string]RepositoryPermission, conflicts map[string]bool, key string, perm RepositoryPermission) {
+		if prev, ok := m[key]; ok {
 			if prev != perm {
-				ambiguous = true
+				conflicts[key] = true
 			}
+			return
+		}
+		m[key] = perm
+	}
+	for key, perm := range p.Repositories {
+		keyGrant, err := ParseStoredRepoID(key)
+		if err != nil {
+			// Unusable key: it can never match a repository.
 			continue
 		}
-		seen[nk] = perm
-		if _, kb, kHost := splitCanonicalRepo(nk); kHost && kb == bare {
+		if keyGrant.IsAlias() {
+			a, _ := keyGrant.Alias()
+			record(aliases, aliasConflict, a.FullName, perm)
+			continue
+		}
+		id, _ := keyGrant.Identity()
+		record(identities, identityConflict, id.ID(), perm)
+		if identityFull[id.FullName] == nil {
+			identityFull[id.FullName] = map[string]bool{}
+		}
+		identityFull[id.FullName][id.ID()] = true
+	}
+	resolve := func(m map[string]RepositoryPermission, conflicts map[string]bool, key string) (RepositoryPermission, RepoEntryResult) {
+		if conflicts[key] {
+			return RepositoryPermission{}, RepoConflict
+		}
+		if perm, ok := m[key]; ok {
+			return perm, RepoFound
+		}
+		return RepositoryPermission{}, RepoNoEntry
+	}
+	// resolveAliasToIdentity mirrors the historical bare→canonical fallback:
+	// among the canonical keys sharing the bare full name, exactly one
+	// distinct permission set resolves (and several distinct sets, or a
+	// conflicting identity, fail closed).
+	resolveAliasToIdentity := func(fullName string) (RepositoryPermission, RepoEntryResult) {
+		ids := identityFull[fullName]
+		if len(ids) == 0 {
+			return RepositoryPermission{}, RepoNoEntry
+		}
+		var match RepositoryPermission
+		found, ambiguous := false, false
+		for idKey := range ids {
+			perm, res := resolve(identities, identityConflict, idKey)
+			if res == RepoConflict {
+				return RepositoryPermission{}, RepoConflict
+			}
+			if res != RepoFound {
+				continue
+			}
 			if !found {
 				match, found = perm, true
 			} else if perm != match {
 				ambiguous = true
 			}
 		}
-	}
-	switch {
-	case ambiguous:
-		return RepositoryPermission{}, RepoConflict
-	case found:
-		return match, RepoFound
-	}
-	return RepositoryPermission{}, RepoNoEntry
-}
-
-// lookupRepoEntry resolves the entry whose key canonicalizes to target.
-// Equivalent keys carrying IDENTICAL permission sets resolve to that single
-// entry; equivalent keys carrying DIFFERENT permission sets resolve to
-// RepoConflict (fail closed) instead of depending on map iteration order.
-func lookupRepoEntry(m map[string]RepositoryPermission, target string) (RepositoryPermission, RepoEntryResult) {
-	var match RepositoryPermission
-	found, ambiguous := false, false
-	for key, perm := range m {
-		if NormalizeRepoKey(key) != target {
-			continue
+		if ambiguous {
+			return RepositoryPermission{}, RepoConflict
 		}
-		if !found {
-			match, found = perm, true
-		} else if perm != match {
-			ambiguous = true
+		if found {
+			return match, RepoFound
 		}
+		return RepositoryPermission{}, RepoNoEntry
 	}
-	switch {
-	case ambiguous:
-		return RepositoryPermission{}, RepoConflict
-	case found:
-		return match, RepoFound
+	if grant.IsAlias() {
+		a, _ := grant.Alias()
+		if perm, res := resolve(aliases, aliasConflict, a.FullName); res != RepoNoEntry {
+			return perm, res
+		}
+		if !legacyBareFallback {
+			return RepositoryPermission{}, RepoNoEntry
+		}
+		return resolveAliasToIdentity(a.FullName)
 	}
-	return RepositoryPermission{}, RepoNoEntry
+	id, _ := grant.Identity()
+	if perm, res := resolve(identities, identityConflict, id.ID()); res != RepoNoEntry {
+		return perm, res
+	}
+	return resolve(aliases, aliasConflict, id.FullName)
 }
 
 // CanonicalRepoID renders the canonical repository identity "<host>/<fullName>"
 // (e.g. github.com/Bel-Consulting-OU/kiwi-ci). The forge host is
 // canonicalized first (lowercase, one trailing dot stripped, default port
-// dropped, userinfo stripped: see CanonicalHost), and a full name that
-// already starts with a canonically equivalent spelling of that host is
-// reduced to its owner/name remainder, so re-canonicalizing a stored
-// identity is idempotent. The forge host stays authoritative when the full
-// name embeds a DIFFERENT host: such a name is prefixed with the canonical
-// host, keeping identities host-scoped even when the first segment merely
-// looks like a host (the GitLab group "acme.co/service" previously collapsed
-// to the bare "acme.co/service", letting a github.com grant authorize a
-// gitlab.example run). With no known forge host the trimmed full name is
-// returned unchanged; an empty full name stays empty. The forge host is
-// usually derived from the run's repo URL.
+// dropped, userinfo stripped: see CanonicalHost). A full name that already
+// starts with a canonically equivalent spelling of that KNOWN host is reduced
+// to its owner/name remainder, so re-canonicalizing a stored identity is
+// idempotent. The host is never inferred from the full name: with no known
+// forge host the trimmed full name is returned unchanged (and parses as a
+// bare alias or, by the documented positional rule, as an identity whose first
+// segment is the host), and a full name embedding a DIFFERENT host stays part
+// of the name, keeping identities host-scoped. An empty full name stays empty.
+// The forge host is usually derived from the run's repo URL.
+//
+// This is the storage/SQL-facing spelling (the exact string persisted in
+// repository IDs). ACL configuration uses the unambiguous r1: form
+// (RepoIdentity.Serialized).
 func CanonicalRepoID(forgeHost, fullName string) string {
-	fullName = strings.TrimSpace(fullName)
-	if fullName == "" {
+	host, full := canonicalRepoParts(forgeHost, fullName)
+	if full == "" {
 		return ""
 	}
-	host := CanonicalHost(forgeHost)
-	if first, rest, ok := splitHostLike(fullName); ok {
-		canonFirst := CanonicalHost(first)
-		if host == "" || canonFirst == host {
-			// The full name already carries this host: keep one canonical
-			// spelling and drop the duplicate prefix.
-			if host == "" {
-				host = canonFirst
-			}
-			fullName = rest
-		}
-	}
 	if host == "" {
-		return fullName
+		return full
 	}
-	return host + "/" + fullName
-}
-
-// splitCanonicalRepo splits a canonical "host/owner/name" ID into host and
-// bare "owner/name" parts, reporting whether the input carried a host. A
-// dotted first segment alone is not enough: a canonical ID always carries
-// owner/name after the host, so the remainder must itself contain a slash.
-// Without that rule a GitLab group with a dot in its name ("acme.co/service")
-// would be misread as host "acme.co" + bare "service", and an unrelated bare
-// alias "service" would match it.
-func splitCanonicalRepo(repo string) (host, bare string, hasHost bool) {
-	if first, rest, ok := splitHostLike(repo); ok {
-		return first, rest, true
-	}
-	return "", repo, false
+	return host + "/" + full
 }
 
 // ActionFor maps a method+path pair onto the authorization decision the

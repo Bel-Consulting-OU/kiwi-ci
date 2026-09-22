@@ -87,6 +87,14 @@ func (b *lyingBlob) Put(ctx context.Context, key string, r io.Reader, size int64
 	case "put-digest":
 		// The backend reports a digest that is not the staged bytes.
 		obj.SHA256 = strings.Repeat("f", 64)
+	case "put-size":
+		// The backend reports a size that is not the staged byte count
+		// (the stored bytes are correct).
+		obj.Size = obj.Size + 1
+	case "put-key":
+		// The backend reports a key other than the one it was asked to
+		// store, even though the content is correct.
+		obj.Key = strings.Repeat("0", 64)
 	case "open-corrupt":
 		// The object is stored under the right digest but with different
 		// bytes of the same length, so only the read-back verification can
@@ -160,12 +168,8 @@ func TestCacheUploadStagesInsideBudgetDirectoryAndReleases(t *testing.T) {
 	if b.Used() != 0 {
 		t.Fatalf("budget used after upload = %d, want 0 (reservation released)", b.Used())
 	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("staging directory kept %d file(s) after upload", len(entries))
+	if leftovers := stageFiles(t, dir); len(leftovers) != 0 {
+		t.Fatalf("staging directory kept %d spool file(s) after upload: %v", len(leftovers), leftovers)
 	}
 	// The manifest commits the verified digest and exact size.
 	sum := sha256.Sum256([]byte(payload))
@@ -258,8 +262,8 @@ func TestCacheUploadRefusesReservationAboveStagingBudget(t *testing.T) {
 	if b.Used() != 0 {
 		t.Fatalf("refused upload left %d bytes reserved", b.Used())
 	}
-	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
-		t.Fatalf("refused upload left %d staged file(s)", len(entries))
+	if leftovers := stageFiles(t, dir); len(leftovers) != 0 {
+		t.Fatalf("refused upload left %d staged file(s)", len(leftovers))
 	}
 
 	// Unknown length with an endpoint maximum above the budget: the
@@ -303,8 +307,8 @@ func TestCacheUpload413Matrix(t *testing.T) {
 		if b.Used() != 0 {
 			t.Fatalf("budget used = %d, want 0", b.Used())
 		}
-		if entries, err := os.ReadDir(dir); err != nil || len(entries) != 0 {
-			t.Fatalf("staging dir entries = %d (%v), want 0", len(entries), err)
+		if leftovers := stageFiles(t, dir); len(leftovers) != 0 {
+			t.Fatalf("staging spool files = %v, want none", leftovers)
 		}
 	}
 
@@ -381,7 +385,7 @@ func TestCacheUpload413Matrix(t *testing.T) {
 // reported size, or silently different stored content) must be answered 503
 // and must never leave a signed manifest behind.
 func TestCacheCASIntegrityMismatchCommitsNoManifest(t *testing.T) {
-	for _, mode := range []string{"put-digest", "open-corrupt", "open-longer"} {
+	for _, mode := range []string{"put-digest", "put-size", "put-key", "open-corrupt", "open-longer"} {
 		t.Run(mode, func(t *testing.T) {
 			s, f, _, hdrs := cacheFixture(t)
 			setTestStagingBudget(t, s, filepath.Join(t.TempDir(), "staging"), 1<<20)
@@ -437,7 +441,7 @@ func TestCacheUploadReopenVerifiesHappyPath(t *testing.T) {
 // disagrees with the streamed bytes fails the upload with 503 and commits no
 // artifact record (and therefore no provenance statement for it).
 func TestArtifactCASIntegrityMismatchCommitsNoRecord(t *testing.T) {
-	for _, mode := range []string{"put-digest", "open-corrupt", "open-longer"} {
+	for _, mode := range []string{"put-digest", "put-size", "put-key", "open-corrupt", "open-longer"} {
 		t.Run(mode, func(t *testing.T) {
 			f := newDBFakeStore()
 			s, err := NewPersistent("token", "token", t.TempDir())

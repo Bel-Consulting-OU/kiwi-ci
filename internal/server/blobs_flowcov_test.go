@@ -615,21 +615,19 @@ func (seamFixedReader) Read(p []byte) (int, error) {
 }
 
 // TestFlowBlobUploadArtifactStagingOpenFailure covers the staging open
-// failing after the directory has been created: the fixed entropy makes the
-// exact staging filename known and a directory placed there refuses the
-// O_CREATE|O_EXCL open with EEXIST for any euid (path existence, not
-// permission bits), so the assertion stays active as root.
+// failing after the artifact directory has been created: the configured
+// staging directory is replaced by a regular file, so the spool open fails
+// with ENOTDIR for any euid (path type, not permission bits), and the upload
+// fails closed without falling back to any other location.
 func TestFlowBlobUploadArtifactStagingOpenFailure(t *testing.T) {
 	s, hdrs := fcMemoryBlobServer(t)
 	fcSeedContract(s, "job-a", fcBinContract())
-	restore := seamRand(t, seamFixedReader{})
-	defer restore()
-	id, err := newID()
-	if err != nil {
+	stagingDir := filepath.Join(t.TempDir(), "staging")
+	setTestStagingBudget(t, s, stagingDir, 1<<20)
+	if err := os.RemoveAll(stagingDir); err != nil {
 		t.Fatal(err)
 	}
-	dir := filepath.Join(s.store.Root, "artifacts", "run-c", "job-a")
-	if err := os.MkdirAll(filepath.Join(dir, "."+id+".tmp"), 0o700); err != nil {
+	if err := os.WriteFile(stagingDir, []byte("not a directory"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	w := fcUploadBlobArtifact(t, s, hdrs, "payload")
@@ -757,22 +755,21 @@ func TestFlowBlobUploadArtifactCASTempOpenFailure(t *testing.T) {
 	f.mu.Lock()
 	f.contracts["job-a"] = map[string]storage.ArtifactContract{"bin": fcBinContract()}
 	f.mu.Unlock()
-	dir := filepath.Join(s.store.Root, "artifacts", "run-c", "job-a")
-	reader := &fcHookReader{data: []byte("payload"), hook: func() {
-		entries, _ := os.ReadDir(dir)
-		for _, e := range entries {
-			_ = os.Remove(filepath.Join(dir, e.Name()))
-		}
-	}}
-	r := httptest.NewRequest(http.MethodPut, "/api/v1/jobs/job-a/artifacts/bin", reader)
-	r.Header.Set("Authorization", "Bearer runner-tok")
-	for k, v := range hdrs {
-		r.Header.Set(k, v)
-	}
-	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, r)
+	// Inject the failure after staging, before the CAS publication: the
+	// staged file cannot be opened/re-hashed, so the upload fails closed and
+	// commits no record (a 201 would name bytes the shared store never saw).
+	oldHook := artifactStageHook
+	artifactStageHook = func(path string, reserved int64) { _ = os.Remove(path) }
+	defer func() { artifactStageHook = oldHook }()
+	w := fcUploadBlobArtifact(t, s, hdrs, "payload")
 	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("cas staging open failure = %d, want 500: %s", w.Code, w.Body.String())
+		t.Fatalf("cas staged-file open failure = %d, want 500: %s", w.Code, w.Body.String())
+	}
+	f.mu.Lock()
+	records := len(f.artifacts)
+	f.mu.Unlock()
+	if records != 0 {
+		t.Fatalf("staged-file open failure committed %d artifact record(s), want 0", records)
 	}
 }
 

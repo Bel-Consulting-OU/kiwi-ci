@@ -316,7 +316,7 @@ func TestComposeStagingReleasesOnEveryExitPath(t *testing.T) {
 	<-reader.started
 	cancel()
 	reader.releaseBody()
-	_ = <-done
+	<-done
 	if got := budget.Used(); got != 0 {
 		t.Fatalf("snapshot disconnect left %d staged bytes", got)
 	}

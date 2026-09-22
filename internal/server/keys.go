@@ -175,6 +175,14 @@ func (s *Server) ensureCacheSigner() *cacheSigner {
 // dataDir, falling back to the KIWI_WEB_SESSION_SECRET environment variable
 // and finally generating and persisting a fresh key on first use. It runs
 // at NewPersistent time so restarts keep existing sessions valid.
+//
+// The first-use write is a startup gate: a pre-rename failure leaves the
+// previous (here: absent) file intact and a post-rename directory-fsync
+// failure leaves the new secret visible but not certified durable
+// (fsutil.Renamed). Either way the error propagates and construction fails
+// closed — no server is ever built on a session secret it might not be able
+// to reuse after a crash — and a later start loads the visible file, so the
+// published-uncertain case converges instead of forking the secret.
 func (s *Server) loadWebSessionSecret(dataDir string) error {
 	path := ""
 	if dataDir != "" {
@@ -251,19 +259,58 @@ func parseEd25519PublicPEM(pemBytes []byte) (ed25519.PublicKey, error) {
 // fsutil.AtomicWriteFile, whose real sequence is: a UNIQUE temp file in the
 // destination directory (os.CreateTemp), write, chmod 0600, checked file
 // fsync, checked close, rename over the destination, and a parent-directory
-// fsync. An error from any step means the new bytes are NOT certified
-// durable, so callers must treat the mutation as unacknowledged; no step
-// before the rename can leave the previous file truncated (the temp file is
-// removed on failure), and the unique temp name keeps concurrent writers
-// from clobbering each other. The only post-rename failure is the parent
-// fsync, which surfaces after the new bytes are already visible (see
-// fsutil.SyncDir).
+// fsync.
+//
+// The returned error is a typed *fsutil.AtomicWriteError, and its phase is
+// what decides how a caller may react:
+//
+//   - create/write/chmod/file-sync/close/rename failures happen BEFORE the
+//     rename, so the new bytes were definitely not published: the temp file
+//     is removed, the previous file at path is bit-for-bit intact (it was
+//     never touched), and the caller keeps its existing rollback behavior.
+//   - the parent-directory fsync runs AFTER the rename, so its failure means
+//     the new bytes ARE visible at path with uncertified crash durability
+//     (fsutil.ErrPublishedUncertain, fsutil.Renamed(err) == true). A caller
+//     must not read that as "the previous file is intact": for a
+//     security-monotonic mutation it must retain the published (more
+//     restrictive) state and leave readiness degraded
+//     (noteFilePersistResult) until a later successful persist reconciles.
+//
+// The unique temp name keeps concurrent writers from clobbering each other.
 func marshalJSONFile(path string, v any) error {
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
 	return fsutil.AtomicWriteFile(path, append(b, '\n'), 0o600)
+}
+
+// noteFilePersistResult folds the outcome of one durable security-state file
+// write into the shared degraded-readiness marker (stateDegraded — the same
+// signal /readiness and the lease gate consume; this is deliberately NOT a
+// new global failure mode):
+//
+//   - success heals the marker: the state has been re-persisted, so the
+//     uncertainty left by an earlier published-but-uncertified write is
+//     reconciled;
+//   - a published-but-uncertified failure (fsutil.Renamed) arms it: the new
+//     bytes are visible at the destination while their crash durability is
+//     unproven, so the node must not be described as healthy;
+//   - a pre-rename failure leaves the marker untouched: nothing observable
+//     changed on disk, and the caller keeps its existing rollback behavior.
+//
+// Reusing one global marker is coarser than per-file tracking: a successful
+// unrelated persist also clears it, exactly like the snapshot's own
+// notePersistResult. That trade-off is the point — one readiness signal and
+// one recovery path instead of several failure modes.
+func (s *Server) noteFilePersistResult(err error) {
+	if err == nil {
+		s.notePersistResult(nil)
+		return
+	}
+	if fsutil.Renamed(err) {
+		s.notePersistResult(err)
+	}
 }
 
 // readFileIfExists returns the file contents or nil when the file does not

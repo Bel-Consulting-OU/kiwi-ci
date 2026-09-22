@@ -33,6 +33,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cas"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/components"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/expr"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/logging"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
@@ -573,21 +574,24 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 	// Large runner uploads stage through a shared, bounded budget: default
 	// it under the data dir (never a bare system temp directory) so every
 	// persistent server has a bound. The app wiring replaces it with the
-	// configured staging.dir/staging.max_bytes budget, and production
-	// REFUSES to start without one; abandoned spool files from a crashed
-	// process are pruned before the first request.
+	// budget built from staging.dir/staging.max_bytes (a per-replica
+	// directory <root>/<instance-id>, see internal/staging), and production
+	// REFUSES to start without one. The constructor takes exclusive
+	// ownership of its directory and reclaims the spool files a dead owner
+	// left there before the first request; a second live process on the same
+	// data dir fails construction instead of double-counting the same disk.
 	stagingRoot := dataDir
 	if stagingRoot == "" {
 		stagingRoot = os.TempDir()
 	}
 	if s.Staging == nil {
-		budget, berr := staging.NewBudget(filepath.Join(stagingRoot, "kiwi-staging"), staging.DefaultMaxBytes)
+		budget, berr := staging.NewReplicaBudget(filepath.Join(stagingRoot, "kiwi-staging"), "", staging.DefaultMaxBytes)
 		if berr != nil {
 			return nil, berr
 		}
 		s.Staging = budget
-		if _, perr := budget.Prune(context.Background()); perr != nil { // allow-background: startup prune of crash-abandoned spool files runs before any request exists
-			s.logf("staging: startup prune failed: %v", perr)
+		if removed := budget.StaleFilesRemoved(); removed > 0 {
+			s.logf("staging: reclaimed %d abandoned spool file(s) from %s", removed, budget.Dir())
 		}
 	}
 	// Restore the logical-check → remote check-run ID mapping so a restart
@@ -1879,11 +1883,11 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 	// Coarse read gate: the collection spans repositories, so it is satisfied
 	// by global read/admin or any repository read grant (auth.CanReadAnyRepo,
 	// documented in requireReadAny). It is not the authorization decision for
-	// any run: the permitted canonical repository set is resolved once below
-	// (authorizedRunRepoIDs, the single repository-grant resolution
-	// auth.CanReadRepo) and applied INSIDE the page query, before the page
-	// boundary, so neither the returned rows nor the next cursor can ever be
-	// derived from a run the caller cannot read.
+	// any run: the principal's normalized repository predicate is resolved
+	// once below (runAuthzPolicy, built from the SINGLE repository-grant
+	// resolution every read route uses) and applied INSIDE the page query,
+	// before the page boundary, so neither the returned rows nor the next
+	// cursor can ever be derived from a run the caller cannot read.
 	if !s.requireReadAny(w, r) {
 		return
 	}
@@ -1895,22 +1899,21 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit := storage.NormalizeRunsPageLimit(runsPageLimitParam(r))
-	// Authorization precedes paging: resolve the caller's permitted
-	// canonical repository set ONCE, then read a page of ONLY those
-	// repositories. The page boundary (HasMore, NextCreatedAt/NextID) is
-	// computed on the authorized rows alone, so the response cursor is
-	// always the last visible run's position and an empty authorized page
-	// is terminal — it can never carry a cursor derived from an invisible
-	// run, and walking the collection reveals nothing about the density of
-	// repositories the caller cannot read.
-	allowedRepoIDs, err := s.authorizedRunRepoIDs(r)
-	if err != nil {
-		s.internalError(w, r, err, "")
-		return
-	}
+	// Authorization precedes paging: the principal's normalized repository
+	// read predicate is resolved ONCE and applied INSIDE the page query, so
+	// the page boundary (HasMore, NextCreatedAt/NextID) is computed on the
+	// authorized rows alone. The response cursor is always the last visible
+	// run's position and an empty authorized page is terminal — it can never
+	// carry a cursor derived from an invisible run, and walking the
+	// collection reveals nothing about the density of repositories the
+	// caller cannot read. Nothing enumerates the collection's repositories:
+	// the query cost is O(page size + index traversal), not O(repository
+	// cardinality).
+	policy := s.runAuthzPolicy(r)
 	var page storage.RunPage
+	var err error
 	if s.DB != nil {
-		page, err = listRunsPageForAuthorizedRepos(r.Context(), s.DB, allowedRepoIDs, cursor, limit)
+		page, err = listRunsPageAuthorized(r.Context(), s.DB, policy, cursor, limit)
 		if err != nil {
 			s.internalError(w, r, err, "")
 			return
@@ -1922,7 +1925,7 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 			snapshot = append(snapshot, v)
 		}
 		s.mu.Unlock()
-		page = storage.PageRunsForAuthorizedRepos(snapshot, allowedRepoIDs, cursor.createdAt, cursor.id, limit)
+		page = storage.PageRunsAuthorized(snapshot, policy, cursor.createdAt, cursor.id, limit)
 	}
 	// No post-filter: every returned run already belongs to the authorized
 	// set, so the DTO projection preserves the store's page boundary
@@ -2001,106 +2004,49 @@ func runsPageLimitParam(r *http.Request) int {
 // store without the authorized page contract: paging an unfiltered
 // collection and filtering afterwards leaks the page boundary (cursor
 // timestamps/IDs and the density of invisible runs), so a store that cannot
-// apply the permitted canonical repository set INSIDE the page query is
-// never served a page at all. The same answer covers a store that cannot
-// enumerate the collection's canonical repository identities
-// (storage.RunRepoIDStore), because the caller cannot resolve an exact
-// authorized set from it. Every store shipped with Kiwi implements both
-// capabilities; the detail is logged server-side and the client sees the
-// opaque 500 body.
+// apply the principal's repository predicate INSIDE the page query is never
+// served a page at all. Every store shipped with Kiwi implements the
+// capability; the detail is logged server-side and the client sees the opaque
+// 500 body.
 var errRunsPaginationUnsupported = errors.New("authorized runs pagination unsupported by configured store")
 
-// authorizedRunRepoIDs resolves the request's permitted canonical repository
-// set exactly once, BEFORE any page boundary exists:
+// runAuthzPolicy resolves the request's normalized repository-read policy
+// exactly once, BEFORE any page boundary exists:
 //
-//   - no principal (the legacy/web-session path, already decided by the
-//     outer auth gate) and an admin principal may read every repository;
-//     a global read role with NO repository entries does too — with no
-//     entries the resolution has nothing that could deny a repository, so
-//     the empty-map check only skips the enumeration and the decision
-//     itself stays in auth.CanReadRepo. These return nil, the store's
-//     unrestricted form;
-//   - every other principal is resolved against the CONCRETE canonical
-//     repository identities present in the collection, each through
-//     auth.CanReadRepo — the single repository-grant entry point the per-run
-//     read routes use — so a bare alias, host case, default ports, an
-//     explicit repository deny and the ambiguity fail-closed rule resolve
-//     identically to every other read path. The result is an exact,
-//     non-nil (possibly empty) allowlist: an empty set is a terminal empty
-//     page, never a fallback to the whole collection.
-//
-// Candidates come from the store (or the server's own run map in memory
-// mode), never from the principal's grant keys: only the collection knows
-// which concrete, possibly legacy-canonical spellings exist, and the
-// candidates are read from the SAME identity expression the page query
-// compares, so resolution and filtering can never disagree.
-func (s *Server) authorizedRunRepoIDs(r *http.Request) ([]string, error) {
-	p, ok := auth.PrincipalFrom(r)
-	if !ok {
-		return nil, nil
+//   - no principal (the legacy/web-session path, already decided by the outer
+//     auth gate), an admin principal, and a global read role with NO
+//     repository entries all authorize every repository (the policy's
+//     unrestricted form). With no entries there is nothing that could deny a
+//     repository, so the decision itself stays in auth semantics;
+//   - every other principal gets an exact predicate over its normalized
+//     grants, built by storage.RunAuthzPolicyForPrincipal from the SAME typed
+//     positional rule (auth.ParseStoredRepoID) every read route resolves
+//     through — so a bare alias, host case, default ports, an explicit
+//     repository deny and the conflict fail-closed rule resolve identically
+//     to every other read path. The predicate is pushed into the store's page
+//     query; no repository is enumerated from the collection.
+func (s *Server) runAuthzPolicy(r *http.Request) storage.RunAuthzPolicy {
+	if p, ok := auth.PrincipalFrom(r); ok {
+		return storage.RunAuthzPolicyForPrincipal(&p)
 	}
-	if p.Has(auth.RoleAdmin) || (p.Has(auth.RoleRead) && len(p.Repositories) == 0) {
-		return nil, nil
-	}
-	candidates, err := s.runRepoCandidates(r.Context())
-	if err != nil {
-		return nil, err
-	}
-	allowed := make([]string, 0, len(candidates))
-	for _, repoID := range candidates {
-		if auth.CanReadRepo(p, repoID) {
-			allowed = append(allowed, repoID)
-		}
-	}
-	return allowed, nil
+	return storage.RunAuthzPolicyForPrincipal(nil)
 }
 
-// runRepoCandidates returns the distinct canonical (policy-first) repository
-// identities present in the runs collection, ascending. It is candidate
-// discovery, not an authorization decision: the caller resolves each
-// candidate through the repository-grant entry point. DB mode requires the
-// store's enumeration capability and fails closed without it; memory mode
-// reads the server's own run map through the SAME repoIDForRun derivation
-// the per-run routes use, so the memory and DB candidate sets agree.
-func (s *Server) runRepoCandidates(ctx context.Context) ([]string, error) {
-	if s.DB != nil {
-		enum, ok := s.DB.(storage.RunRepoIDStore)
-		if !ok {
-			return nil, fmt.Errorf("%w: %T", errRunsPaginationUnsupported, s.DB)
-		}
-		return enum.ListRunRepoIDs(ctx)
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	seen := make(map[string]struct{}, len(s.runs))
-	out := make([]string, 0, len(s.runs))
-	for _, run := range s.runs {
-		id := repoIDForRun(run)
-		if _, ok := seen[id]; ok {
-			continue
-		}
-		seen[id] = struct{}{}
-		out = append(out, id)
-	}
-	sort.Strings(out)
-	return out, nil
-}
-
-// listRunsPageForAuthorizedRepos reads one authorized keyset page from a
-// store that implements storage.RunPageForPrincipalStore. The permitted
-// canonical repository set is a predicate INSIDE the query that computes the
-// keyset boundary, so the returned rows and the next position are authorized
-// by construction. A store without the capability — including one that still
-// implements only the unfiltered storage.RunPageStore — fails closed instead
-// of being served a page whose boundary could leak (see
-// errRunsPaginationUnsupported).
-func listRunsPageForAuthorizedRepos(ctx context.Context, store storage.Store, allowedRepoIDs []string, cursor runsCursor, limit int) (storage.RunPage, error) {
-	paged, ok := store.(storage.RunPageForPrincipalStore)
+// listRunsPageAuthorized reads one authorized keyset page from a store that
+// implements storage.RunPageAuthorizedStore. The principal's repository
+// predicate is a clause of the query that computes the keyset boundary, so
+// the returned rows and the next position are authorized by construction. A
+// store without the capability — including one that still implements only the
+// unfiltered storage.RunPageStore — fails closed instead of being served a
+// page whose boundary could leak (see errRunsPaginationUnsupported).
+func listRunsPageAuthorized(ctx context.Context, store storage.Store, policy storage.RunAuthzPolicy, cursor runsCursor, limit int) (storage.RunPage, error) {
+	paged, ok := store.(storage.RunPageAuthorizedStore)
 	if !ok {
 		return storage.RunPage{}, fmt.Errorf("%w: %T", errRunsPaginationUnsupported, store)
 	}
-	return paged.ListRunsPageForAuthorizedRepos(ctx, allowedRepoIDs, cursor.createdAt, cursor.id, limit)
+	return paged.ListRunsPageAuthorized(ctx, policy, cursor.createdAt, cursor.id, limit)
 }
+
 func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if s.DB != nil {
@@ -2736,12 +2682,34 @@ func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
 		s.refreshRunLocked(runID)
 	}
 	if perr := s.persistCheckedErrLocked("runner.disable"); perr != nil {
-		// The kill switch (including the CRL carried by the snapshot) never
-		// became durable: revive every cancelled job, restore the runner and
-		// its revocation marker, the re-aggregated runs and the CRL, and
-		// answer 503. No success response is ever produced for a disable the
-		// snapshot does not contain.
-		s.rollbackStateLocked(rb)
+		// The kill switch rides one snapshot write, so the failure phase
+		// decides what the visible state is. A pre-rename failure means the
+		// snapshot (including the CRL it carries) was definitely not
+		// published: revive every cancelled job, restore the runner and its
+		// revocation marker, the re-aggregated runs and the CRL, and answer
+		// 503. A post-rename directory-fsync failure (fsutil.Renamed) means
+		// the snapshot rename ALREADY published the disable, the lease
+		// cancellations and the CRL: rolling memory back there would make
+		// this replica more permissive than the visible file (the disable
+		// and revocation would be denied in memory while the durable record
+		// holds them), so the restrictive state is retained, the local
+		// decision cache is seeded, and readiness stays degraded
+		// (persistLocked armed it) until a retry's successful persist
+		// reconciles. No success response is ever produced for either phase.
+		if s.rollbackUnlessPublished(rb, perr) {
+			if ri.CertSerial != "" {
+				s.crlMu.Lock()
+				if s.crlCache == nil {
+					s.crlCache = map[string]crlCacheEntry{}
+				}
+				s.crlCache[ri.CertSerial] = crlCacheEntry{revoked: true, at: now}
+				s.crlMu.Unlock()
+			}
+			s.mu.Unlock()
+			w.Header().Set("X-Kiwi-State", "degraded")
+			http.Error(w, "runner disable not durable", http.StatusServiceUnavailable)
+			return
+		}
 		s.mu.Unlock()
 		http.Error(w, "runner disable not durable", http.StatusServiceUnavailable)
 		return
@@ -4151,6 +4119,29 @@ func (s *Server) captureStateRollbackLocked() stateRollback {
 		rb.crl[serial] = id
 	}
 	return rb
+}
+
+// rollbackUnlessPublished performs the fs-mode post-failure decision for a
+// security-monotonic mutation: it restores the captured state only when the
+// durability failure happened BEFORE the rename.
+//
+// fsutil.NotPublished means the destination file never changed, so after the
+// rollback memory and the visible file still agree. fsutil.Renamed means the
+// parent-directory fsync failed AFTER a successful rename: the new bytes ARE
+// visible, so restoring the captured (pre-mutation, more permissive) state
+// would leave memory denying a disable/revocation the durable record holds —
+// exactly the unsafe direction. The published state is retained instead and
+// the caller must answer 503 with the degraded marker (persistLocked already
+// armed it via notePersistResult; a later successful persist heals it).
+//
+// Returns true when the captured state was retained (published-uncertain),
+// false when it was rolled back. The caller holds s.mu.
+func (s *Server) rollbackUnlessPublished(rb stateRollback, err error) bool {
+	if fsutil.Renamed(err) {
+		return true
+	}
+	s.rollbackStateLocked(rb)
+	return false
 }
 
 // rollbackStateLocked restores a captureStateRollbackLocked snapshot. The

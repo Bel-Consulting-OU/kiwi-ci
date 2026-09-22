@@ -148,6 +148,8 @@ func TestAuthorizeCanonicalRepoKeys(t *testing.T) {
 	if !Authorize(p2, ActionApprove, "github.com/o/r", false) {
 		t.Fatal("canonical key not honored directly")
 	}
+	// A legacy bare STRING falls back to the canonical key (the historical
+	// positional behavior the string entry point keeps).
 	if !Authorize(p2, ActionApprove, "o/r", false) {
 		t.Fatal("bare key must fall back to the canonical key")
 	}

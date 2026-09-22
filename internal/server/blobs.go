@@ -23,6 +23,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/blob"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cache"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cas"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/provenance"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
@@ -44,6 +45,14 @@ var cacheUploadMaxBytes = maxBlobBytes
 // configured budget directory and the reservation is held — can be observed
 // without a multi-GB body.
 var cacheStageHook func(path string, reserved int64)
+
+// artifactStageHook, when non-nil, runs with the staged file path and the
+// reserved byte amount immediately after the artifact body is fully staged
+// (inside the budget reservation) and before it is hashed and published. It
+// is the artifact counterpart of cacheStageHook: a test-only seam
+// (production leaves it nil) so tests can observe the staging wiring or
+// inject a staged-file failure without a multi-GB body.
+var artifactStageHook func(path string, reserved int64)
 
 var cacheKeyRE = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
@@ -137,6 +146,17 @@ func (s *Server) uploadArtifact(w http.ResponseWriter, r *http.Request) {
 
 // uploadArtifactPayload commits one declared artifact payload under the
 // per-job critical section.
+//
+// Staging: the body spools through the server's shared bounded staging
+// budget (never a bare system temp directory and never the artifact data dir
+// itself), so concurrent uploads to every job together can never stage more
+// than staging.max_bytes. The reservation is the request's Content-Length, or
+// the effective artifact limit when the body length is unknown (chunked); it
+// is released on every exit path — including copy errors, gate rejections and
+// client disconnects — and held until the CAS publication / record commit no
+// longer needs the staged bytes. A body that exceeds the artifact limit or
+// the staging capacity is answered 413; a full budget blocks until room
+// frees up or the request context ends.
 func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j model.Job, run model.Run, contract storage.ArtifactContract, name, runnerID, token string, gen int64) {
 	ctx := r.Context()
 	dir := filepath.Join(s.store.Root, "artifacts", j.RunID, j.ID)
@@ -165,40 +185,75 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 		http.Error(w, "artifact exceeds the declared maximum size", http.StatusRequestEntityTooLarge)
 		return
 	}
-	id, err := newID()
-	if err != nil {
-		http.Error(w, "internal server error", http.StatusInternalServerError)
+	// Staging reservation (the cache-upload model): without a configured
+	// bound this path would spool into unbounded scratch space — exactly
+	// the control-plane root-filesystem exhaustion it must not allow — so
+	// it fails closed. A declared length above the whole staging capacity
+	// can never be admitted (413); an unknown length reserves the effective
+	// maximum, charging the endpoint's worst case before a byte is read.
+	budget := s.StagingBudget()
+	if budget == nil {
+		http.Error(w, "artifact staging budget unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	tmp := filepath.Join(dir, "."+id+".tmp")
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		s.internalError(w, r, err, "")
-		return
+	reserve := effectiveLimit
+	if cl := r.ContentLength; cl >= 0 {
+		if cl > budget.MaxBytes() {
+			s.auditLocked("artifact.contract_violation", runnerID, j.RunID, j.ID, "artifact exceeds the staging capacity", map[string]string{"name": name, "size": strconv.FormatInt(cl, 10), "staging_max": strconv.FormatInt(budget.MaxBytes(), 10)})
+			http.Error(w, "artifact exceeds the staging capacity", http.StatusRequestEntityTooLarge)
+			return
+		}
+		reserve = cl
 	}
-	start := time.Now()
-	h := sha256.New()
-	n, copyErr := io.Copy(io.MultiWriter(f, h), http.MaxBytesReader(w, r.Body, effectiveLimit+1))
-	syncErr := f.Sync()
-	closeErr := f.Close()
-	if err := firstErr(copyErr, syncErr, closeErr); err != nil {
-		_ = os.Remove(tmp)
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			s.auditLocked("artifact.contract_violation", runnerID, j.RunID, j.ID, "artifact exceeds declared max size", map[string]string{"name": name, "max": strconv.FormatInt(effectiveLimit, 10)})
-			http.Error(w, "artifact exceeds the declared maximum size", http.StatusRequestEntityTooLarge)
+	res, err := budget.Acquire(ctx, reserve)
+	if err != nil {
+		if errors.Is(err, staging.ErrBudgetExceeded) {
+			s.logError("artifact: staging reservation refused", "bytes", reserve, "budget", budget.MaxBytes())
+			http.Error(w, "artifact staging capacity unavailable for this upload", http.StatusServiceUnavailable)
+			return
+		}
+		if ctx.Err() != nil {
+			// The client is gone; there is nobody to answer.
 			return
 		}
 		s.internalError(w, r, err, "")
 		return
 	}
-	digest := hex.EncodeToString(h.Sum(nil))
+	defer res.Release()
+	start := time.Now()
+	// Stage and hash inside the budget directory, then publish: the digest
+	// whose fence we take is the digest actually staged. SpoolFile never
+	// writes more than the reservation to disk (the over-limit byte is
+	// detected on the source), so the reservation stays exact even when the
+	// body lies about its length.
+	stagedPath, n, err := staging.SpoolFile(budget.Dir(), http.MaxBytesReader(w, r.Body, effectiveLimit+1), reserve)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) || errors.Is(err, staging.ErrTooLarge) {
+			s.auditLocked("artifact.contract_violation", runnerID, j.RunID, j.ID, "artifact exceeds declared max size", map[string]string{"name": name, "max": strconv.FormatInt(effectiveLimit, 10)})
+			http.Error(w, "artifact exceeds the declared maximum size", http.StatusRequestEntityTooLarge)
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		s.internalError(w, r, err, "")
+		return
+	}
+	defer func() { _ = os.Remove(stagedPath) }()
+	if artifactStageHook != nil {
+		artifactStageHook(stagedPath, reserve)
+	}
+	digest, err := fileSHA256(stagedPath)
+	if err != nil {
+		s.internalError(w, r, err, "")
+		return
+	}
 	// Payload size limit: the stream is bounded at effectiveLimit+1, so any
 	// body that reached the bound (global OR contract) is rejected
 	// unconditionally — an absent/greater contract must not let a
 	// chunked-encoding body sneak one byte past the global ceiling.
 	if n > effectiveLimit {
-		_ = os.Remove(tmp)
 		s.auditLocked("artifact.contract_violation", runnerID, j.RunID, j.ID, "artifact exceeds the effective size limit", map[string]string{"name": name, "size": strconv.FormatInt(n, 10), "max": strconv.FormatInt(effectiveLimit, 10)})
 		http.Error(w, "artifact exceeds the declared maximum size", http.StatusRequestEntityTooLarge)
 		return
@@ -206,7 +261,6 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 	// Contract size limit (legacy path retained for contracts smaller than
 	// the global ceiling; effectiveLimit already covers it).
 	if contract.MaxSize > 0 && n > contract.MaxSize {
-		_ = os.Remove(tmp)
 		s.auditLocked("artifact.contract_violation", runnerID, j.RunID, j.ID, "artifact exceeds declared max size", map[string]string{"name": name, "size": strconv.FormatInt(n, 10), "max": strconv.FormatInt(contract.MaxSize, 10)})
 		http.Error(w, "artifact exceeds the declared maximum size", http.StatusRequestEntityTooLarge)
 		return
@@ -214,7 +268,6 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 	// Idempotency on (job, generation, name).
 	if existing, lerr := s.findArtifactByJobName(ctx, j.RunID, j.ID, name); lerr == nil {
 		if rec, found := existingArtifactForGeneration(existing, gen); found {
-			_ = os.Remove(tmp)
 			if rec.SHA256 == digest {
 				s.auditLocked("artifact.idempotent_replay", runnerID, j.RunID, j.ID, "duplicate artifact upload acknowledged", map[string]string{"name": name, "sha256": digest})
 				writeJSON(w, http.StatusOK, rec)
@@ -232,8 +285,12 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 	// present and valid before the payload is committed. The frozen
 	// artifact contract is authoritative — the pipeline is never re-parsed.
 	if code, msg := s.gateArtifactAttestations(ctx, contract, j, name, digest, dir); code != 0 {
-		_ = os.Remove(tmp)
 		http.Error(w, msg, code)
+		return
+	}
+	id, err := newID()
+	if err != nil {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 	dst := filepath.Join(dir, id+".tar.gz")
@@ -251,21 +308,20 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 		// after which the put recreates the object).
 		release, ferr := s.acquireDigestFence(ctx, digest)
 		if ferr != nil {
-			_ = os.Remove(tmp)
 			s.internalError(w, r, ferr, "")
 			return
 		}
 		defer release()
-		tf, oerr := os.Open(tmp)
-		if oerr != nil {
-			_ = os.Remove(tmp)
-			s.internalError(w, r, oerr, "")
-			return
-		}
-		obj, perr := s.CAS.Put(ctx, tf)
-		_ = tf.Close()
+		// Publish the STAGED file directly (no second copy): the CAS
+		// streams it into the backend, verifies the content against the
+		// staged digest, and validates the object the backend reports.
+		obj, perr := s.CAS.PutFile(ctx, stagedPath, digest, n)
 		if perr != nil {
-			_ = os.Remove(tmp)
+			if casIntegrityError(perr) {
+				s.auditLocked("artifact.integrity_failure", runnerID, j.RunID, j.ID, "artifact CAS object disagrees with the streamed bytes", map[string]string{"name": name, "want_sha256": digest, "want_size": strconv.FormatInt(n, 10), "error": perr.Error()})
+				http.Error(w, "artifact storage verification failed", http.StatusServiceUnavailable)
+				return
+			}
 			s.internalError(w, r, perr, "")
 			return
 		}
@@ -273,8 +329,7 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 		// staged bytes. A broken or misconfigured backend that reports a
 		// different digest/size must never leave a record (and provenance
 		// statement) naming the local digest while the shared object differs.
-		if obj.SHA256 != digest || obj.Size != n {
-			_ = os.Remove(tmp)
+		if obj.Key != digest || obj.SHA256 != digest || obj.Size != n {
 			s.auditLocked("artifact.integrity_failure", runnerID, j.RunID, j.ID, "artifact CAS object disagrees with the streamed bytes", map[string]string{"name": name, "want_sha256": digest, "want_size": strconv.FormatInt(n, 10), "got_sha256": obj.SHA256, "got_size": strconv.FormatInt(obj.Size, 10)})
 			http.Error(w, "artifact storage verification failed", http.StatusServiceUnavailable)
 			return
@@ -283,15 +338,17 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 		// newly written object, stream and hash it, and require the digest
 		// and exact byte length before the record is committed.
 		if verr := verifyStoredBlob(ctx, s.CAS, digest, n); verr != nil {
-			_ = os.Remove(tmp)
 			s.logError("artifact: stored object verification failed", "job", j.ID, "sha256", digest, "error", verr.Error())
 			http.Error(w, "artifact storage verification failed", http.StatusServiceUnavailable)
 			return
 		}
-		_ = os.Remove(tmp)
 	} else {
-		if err := os.Rename(tmp, dst); err != nil {
-			_ = os.Remove(tmp)
+		// Filesystem mode: move the staged bytes into the destination
+		// durably. The staging directory may live on another filesystem
+		// than the data dir, so a plain rename is only the fast path: the
+		// fallback is a destination-local streamed copy with the full
+		// fsync/rename/parent-fsync sequence.
+		if err := finalizeStagedFile(stagedPath, dst); err != nil {
 			s.internalError(w, r, err, "")
 			return
 		}
@@ -375,7 +432,9 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 					// object is the exact envelope bytes: the record must
 					// never reference a digest the shared store disagrees
 					// with (same invariant as the payload publication above).
-					if pobj, perr := s.CAS.Put(ctx, bytes.NewReader(ab)); perr == nil && pobj.SHA256 == provDigest && pobj.Size == int64(len(ab)) {
+					// The bytes are in memory and their digest is known, so
+					// PutKnown publishes them without any scratch file.
+					if pobj, perr := s.CAS.PutKnown(ctx, provDigest, int64(len(ab)), bytes.NewReader(ab)); perr == nil && pobj.Key == provDigest && pobj.SHA256 == provDigest && pobj.Size == int64(len(ab)) {
 						rec.ProvenancePath = "cas:" + provDigest
 						rec.ProvenanceSHA256 = provDigest
 					} else if perr != nil {
@@ -523,6 +582,82 @@ func removeStagedArtifact(dst string, casMode bool) {
 	}
 	_ = os.Remove(dst)
 	_ = os.Remove(dst + ".intoto.json")
+}
+
+// casIntegrityError reports whether err is a CAS publication integrity
+// failure: the backend reported an object that disagrees with the published
+// key/digest/size (ErrBackendIntegrity), or the content did not match the
+// advertised digest/size (ErrDigestMismatch/ErrSizeMismatch). Every such
+// failure fails the upload closed with 503 and commits nothing (no manifest,
+// no artifact record, no provenance statement), exactly like a failed
+// read-back verification.
+func casIntegrityError(err error) bool {
+	return errors.Is(err, cas.ErrBackendIntegrity) ||
+		errors.Is(err, cas.ErrDigestMismatch) ||
+		errors.Is(err, cas.ErrSizeMismatch)
+}
+
+// stagedRename is the test seam over the fast-path rename of
+// finalizeStagedFile. Production renames through fsutil.RealRename (the
+// shared durability primitive's rename step); tests replace it to exercise
+// the cross-filesystem fallback deterministically.
+var stagedRename = fsutil.RealRename
+
+// finalizeStagedFile moves a fully staged, fsynced file into its destination
+// durably. A same-filesystem rename is the fast path; when the staging
+// directory and the destination live on different filesystems the rename
+// cannot work (the failure is reported cross-device), so the bytes are
+// instead streamed into a destination-local temp file and published with the
+// full durability sequence — never assuming a rename across volumes is
+// possible.
+func finalizeStagedFile(staged, dst string) error {
+	if err := stagedRename(staged, dst); err == nil {
+		return fsutil.SyncDir(filepath.Dir(dst))
+	}
+	return copyFileIntoPlace(staged, dst)
+}
+
+// copyFileIntoPlace is the cross-filesystem finalization at the destination:
+// a unique temp file in the destination directory, the staged bytes
+// streamed into it (fsutil's durability steps: write, chmod, file fsync,
+// checked close, rename over the destination, parent-directory fsync). The
+// staged source is left untouched for the caller to remove.
+func copyFileIntoPlace(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	dir := filepath.Dir(dst)
+	f, err := os.CreateTemp(dir, "."+filepath.Base(dst)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	if _, err := io.Copy(f, in); err != nil {
+		_ = fsutil.RealFileClose(f)
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		_ = fsutil.RealFileClose(f)
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := fsutil.RealFileSync(f); err != nil {
+		_ = fsutil.RealFileClose(f)
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := fsutil.RealFileClose(f); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := fsutil.RealRename(tmp, dst); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return fsutil.SyncDir(dir)
 }
 
 // jobLock returns the per-job upload mutex.
@@ -806,39 +941,27 @@ func (s *Server) uploadJobCache(w http.ResponseWriter, r *http.Request) {
 	if cacheStageHook != nil {
 		cacheStageHook(stagedPath, reserve)
 	}
-	staged, err := os.Open(stagedPath)
+	sum, err := fileSHA256(stagedPath)
 	if err != nil {
 		s.internalError(w, r, err, "")
 		return
 	}
-	hasher := sha256.New()
-	hashed, hashErr := io.Copy(hasher, staged)
-	if err := firstErr(hashErr); err != nil {
-		_ = staged.Close()
-		s.internalError(w, r, err, "")
-		return
-	}
-	if hashed != n {
-		_ = staged.Close()
-		s.internalError(w, r, fmt.Errorf("staged cache entry size changed from %d to %d", n, hashed), "")
-		return
-	}
-	if _, err := staged.Seek(0, io.SeekStart); err != nil {
-		_ = staged.Close()
-		s.internalError(w, r, err, "")
-		return
-	}
-	sum := hex.EncodeToString(hasher.Sum(nil))
 	release, ferr := s.acquireDigestFence(r.Context(), sum)
 	if ferr != nil {
-		_ = staged.Close()
 		s.internalError(w, r, ferr, "")
 		return
 	}
 	defer release()
-	obj, err := s.CAS.Put(r.Context(), staged)
-	_ = staged.Close()
+	// Publish the STAGED file directly (no second copy): the CAS streams it
+	// into the backend, verifies the content against the staged digest, and
+	// validates the object the backend reports.
+	obj, err := s.CAS.PutFile(r.Context(), stagedPath, sum, n)
 	if err != nil {
+		if casIntegrityError(err) {
+			s.auditLocked("cache.integrity_failure", runnerID, j.RunID, j.ID, "cache CAS object disagrees with the staged bytes", map[string]string{"key": key, "want_sha256": sum, "want_size": strconv.FormatInt(n, 10), "error": err.Error()})
+			http.Error(w, "cache storage verification failed", http.StatusServiceUnavailable)
+			return
+		}
 		s.internalError(w, r, err, "")
 		return
 	}
@@ -846,7 +969,7 @@ func (s *Server) uploadJobCache(w http.ResponseWriter, r *http.Request) {
 	// staged bytes. A backend that reports (or stores) a different digest or
 	// size must never be acknowledged — otherwise the signed manifest would
 	// bind the locally computed digest to a shared object that differs.
-	if obj.SHA256 != sum || obj.Size != n {
+	if obj.Key != sum || obj.SHA256 != sum || obj.Size != n {
 		s.auditLocked("cache.integrity_failure", runnerID, j.RunID, j.ID, "cache CAS object disagrees with the staged bytes", map[string]string{"key": key, "want_sha256": sum, "want_size": strconv.FormatInt(n, 10), "got_sha256": obj.SHA256, "got_size": strconv.FormatInt(obj.Size, 10)})
 		http.Error(w, "cache storage verification failed", http.StatusServiceUnavailable)
 		return

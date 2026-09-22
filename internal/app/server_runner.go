@@ -48,9 +48,13 @@ type productionConfig struct {
 	// StagingDir/StagingMaxBytes are the large-upload staging bound. They
 	// are required in production: without a bound, concurrent valid runner
 	// uploads would spool into an unbounded temp directory and could
-	// exhaust the control-plane root filesystem.
-	StagingDir      string
-	StagingMaxBytes int64
+	// exhaust the control-plane root filesystem. StagingInstanceID is the
+	// optional per-replica id: staging.dir is a shared root and each replica
+	// stages inside <dir>/<id>, so replicas sharing the root must use
+	// distinct ids (an id may also come from the root's persisted file).
+	StagingDir        string
+	StagingMaxBytes   int64
+	StagingInstanceID string
 }
 
 // validateProductionConfig enforces the STATIC half of the production-mode
@@ -355,25 +359,26 @@ func validateProductionRunnerCredentials(ctx context.Context, db storage.Store, 
 }
 
 // buildStagingBudget constructs the configured large-upload staging budget
-// and prunes spool files abandoned by a previous process before the
-// listeners start. An unconfigured section returns (nil, 0, nil) so the
-// server keeps its bounded data-dir default; a configured but unusable bound
-// (a path under a regular file, a read-only or full directory) returns the
-// constructor's error, so startup fails closed instead of the first upload.
-// config.Validate already rejected a partial (dir xor max_bytes) section.
-func buildStagingBudget(ctx context.Context, cfg config.StagingConfig) (*staging.Budget, int, error) {
+// for this replica and reclaims the spool files its dead owner left behind,
+// before the listeners start. The configured directory is a ROOT: the budget
+// owns <root>/<instance-id> (staging.instance_id, or a generated-and-persisted
+// id when unset) and deletes every kiwi-stage-* file found there, plus legacy
+// bare spool files directly under the root — the ownership lock proves they
+// belong to a dead process. An unconfigured section returns (nil, 0, nil) so
+// the server keeps its bounded data-dir default; a configured but unusable
+// bound (a path under a regular file, a read-only or full directory, or a
+// directory already owned by a live replica) returns the constructor's error,
+// so startup fails closed instead of the first upload. config.Validate
+// already rejected a partial (dir xor max_bytes) section.
+func buildStagingBudget(cfg config.StagingConfig) (*staging.Budget, int, error) {
 	if strings.TrimSpace(cfg.Dir) == "" && cfg.MaxBytes == 0 {
 		return nil, 0, nil
 	}
-	b, err := staging.NewBudget(cfg.Dir, cfg.MaxBytes)
+	b, err := staging.NewReplicaBudget(cfg.Dir, cfg.InstanceID, cfg.MaxBytes)
 	if err != nil {
 		return nil, 0, fmt.Errorf("staging: %w", err)
 	}
-	pruned, perr := b.Prune(ctx)
-	if perr != nil {
-		return nil, pruned, fmt.Errorf("staging: startup prune: %w", perr)
-	}
-	return b, pruned, nil
+	return b, b.StaleFilesRemoved(), nil
 }
 
 func Server(ctx context.Context, args []string) error {
@@ -447,8 +452,9 @@ func Server(ctx context.Context, args []string) error {
 	componentRegistryDir := fs.String("component-registry-dir", "", "directory of component spec files (server-side component registry)")
 	componentRemote := fs.String("component-remote", "", "remote component registry base URL (https required)")
 	componentRemoteToken := fs.String("component-remote-token", "", "bearer token for the remote component registry")
-	stagingDir := fs.String("staging-dir", "", "bounded staging directory for large runner uploads (required in production)")
-	stagingMaxBytes := fs.String("staging-max-bytes", "", "total staging byte budget for concurrent large runner uploads (required in production)")
+	stagingDir := fs.String("staging-dir", "", "staging ROOT for large runner uploads; each replica stages inside <dir>/<instance-id> (required in production)")
+	stagingMaxBytes := fs.String("staging-max-bytes", "", "this replica's staging byte budget for concurrent large runner uploads (required in production)")
+	stagingInstanceID := fs.String("staging-instance-id", "", "this replica's id under staging-dir; replicas sharing the root must use distinct ids (default: a generated id persisted in the root)")
 	repoConcurrency := fs.String("repo-concurrency", "", "per-repository running-job concurrency limit (0 = unlimited)")
 	teamConcurrency := fs.String("team-concurrency", "", "per-team running-job concurrency limit (0 = unlimited)")
 	repoQueueDepth := fs.String("repo-queue-depth", "", "per-repository queued-job depth limit (0 = unlimited)")
@@ -496,7 +502,7 @@ func Server(ctx context.Context, args []string) error {
 	// The flag pointers exist only to register the flags; their values are
 	// read back through config.OverrideFromFlags (which inspects only
 	// explicitly set flags).
-	discard(listen, token, adminToken, webhookSecret, githubToken, externalURL, tlsCert, tlsKey, runnerCACert, runnerCAKey, runnerEnrollToken, databaseURL, mode, rateLimitPerSecond, rateLimitBurst, otelEndpoint, drainOnSigterm, githubAppID, githubAppPrivateKey, gitlabToken, gitlabWebhookSecret, gitlabBaseURL, forgejoToken, forgejoWebhookSecret, forgejoBaseURL, tokensFile, runnerTokensFile, databaseMaxConnections, metricsListen, secretBroker, vaultAddr, vaultToken, awsRegion, awsAccessKey, awsSecretKey, awsToken, gcpCredentials, gcpProject, azureTenant, azureClientID, azureClientSecret, azureVaultURL, onePasswordHost, onePasswordToken, onePasswordVault, componentRegistryDir, componentRemote, componentRemoteToken, stagingDir, stagingMaxBytes, repoConcurrency, teamConcurrency, repoQueueDepth, teamQueueDepth, dailyCostLimit, dailyEnergyLimit, quotaFailOpen, untrustedCPUCeiling, untrustedMemoryCeiling, untrustedDiskCeiling, untrustedPIDsCeiling)
+	discard(listen, token, adminToken, webhookSecret, githubToken, externalURL, tlsCert, tlsKey, runnerCACert, runnerCAKey, runnerEnrollToken, databaseURL, mode, rateLimitPerSecond, rateLimitBurst, otelEndpoint, drainOnSigterm, githubAppID, githubAppPrivateKey, gitlabToken, gitlabWebhookSecret, gitlabBaseURL, forgejoToken, forgejoWebhookSecret, forgejoBaseURL, tokensFile, runnerTokensFile, databaseMaxConnections, metricsListen, secretBroker, vaultAddr, vaultToken, awsRegion, awsAccessKey, awsSecretKey, awsToken, gcpCredentials, gcpProject, azureTenant, azureClientID, azureClientSecret, azureVaultURL, onePasswordHost, onePasswordToken, onePasswordVault, componentRegistryDir, componentRemote, componentRemoteToken, stagingDir, stagingMaxBytes, stagingInstanceID, repoConcurrency, teamConcurrency, repoQueueDepth, teamQueueDepth, dailyCostLimit, dailyEnergyLimit, quotaFailOpen, untrustedCPUCeiling, untrustedMemoryCeiling, untrustedDiskCeiling, untrustedPIDsCeiling)
 
 	// Effective values after the precedence merge.
 	listenV := cfg.Server.Listen
@@ -534,28 +540,35 @@ func Server(ctx context.Context, args []string) error {
 		return err
 	}
 	if err := validateProductionConfig(productionConfig{
-		Mode:             modeV,
-		DatabaseURL:      databaseURLV,
-		RunnerToken:      tokenV,
-		AdminToken:       adminTokenV,
-		ExternalURL:      externalURLV,
-		TLSCert:          tlsCertV,
-		TLSKey:           tlsKeyV,
-		AllowSharedToken: *allowSharedToken,
-		StagingDir:       cfg.Staging.Dir,
-		StagingMaxBytes:  cfg.Staging.MaxBytes,
+		Mode:              modeV,
+		DatabaseURL:       databaseURLV,
+		RunnerToken:       tokenV,
+		AdminToken:        adminTokenV,
+		ExternalURL:       externalURLV,
+		TLSCert:           tlsCertV,
+		TLSKey:            tlsKeyV,
+		AllowSharedToken:  *allowSharedToken,
+		StagingDir:        cfg.Staging.Dir,
+		StagingMaxBytes:   cfg.Staging.MaxBytes,
+		StagingInstanceID: cfg.Staging.InstanceID,
 	}); err != nil {
 		return err
 	}
-	// Shared staging budget: large uploads spool into the configured bounded
-	// directory (staging.dir/staging.max_bytes), never an unbounded system
-	// temp directory. It is constructed and startup-pruned BEFORE any
-	// network or datastore work so an unusable configured bound fails
-	// startup immediately; an unconfigured section keeps the server's
-	// data-dir bounded default, and production additionally refuses to start
-	// with no bound at all (validateProductionConfig above). It is installed
-	// on the server once the server exists.
-	stagingBudget, stagingPruned, berr := buildStagingBudget(ctx, cfg.Staging)
+	// Shared staging budget: large uploads spool into this replica's
+	// directory under the configured root (<staging.dir>/<staging.instance_id>,
+	// or a generated-and-persisted id when none is configured), never an
+	// unbounded system temp directory and never straight into a root shared
+	// with another replica. Constructing it takes exclusive ownership of the
+	// replica directory and reclaims every spool file a dead owner left
+	// (including legacy bare files directly under the root), so the ledger
+	// starts from a truthful zero. It happens BEFORE any network or datastore
+	// work so an unusable configured bound — or a directory already owned by
+	// a live replica — fails startup immediately. An unconfigured section
+	// keeps the server's data-dir bounded default, and production
+	// additionally refuses to start with no bound at all
+	// (validateProductionConfig above). It is installed on the server once
+	// the server exists.
+	stagingBudget, stagingPruned, berr := buildStagingBudget(cfg.Staging)
 	if berr != nil {
 		return berr
 	}

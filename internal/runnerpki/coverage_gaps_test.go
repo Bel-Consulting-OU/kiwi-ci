@@ -148,21 +148,10 @@ func TestLoadOrCreateCAErrorBranches(t *testing.T) {
 		t.Fatal("unreadable key path must error")
 	}
 
-	writeDir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(writeDir, caCertFile+".tmp"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := LoadOrCreateCA(writeDir); err == nil {
-		t.Fatal("certificate write must fail when the temp path is a directory")
-	}
-
-	keyWriteDir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(keyWriteDir, caKeyFile+".tmp"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := LoadOrCreateCA(keyWriteDir); err == nil {
-		t.Fatal("key write must fail when the temp path is a directory")
-	}
+	// Write-phase and durability-step failures are covered by
+	// TestRunnerCAAtomicDurabilitySeams, which injects a failing step through
+	// the fsutil hooks (the private non-fsync writer this branch used to
+	// probe with a directory at "<file>.tmp" is gone).
 
 	if os.Geteuid() != 0 {
 		ro := t.TempDir()

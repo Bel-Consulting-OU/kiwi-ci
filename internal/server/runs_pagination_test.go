@@ -570,11 +570,11 @@ func TestListRunsRBACEmptyAuthorizedSet(t *testing.T) {
 	}
 }
 
-// TestAuthorizedRunRepoIDsResolution pins the resolution itself: which
-// requests resolve to the unrestricted form (nil) and which resolve to an
-// exact non-nil allowlist derived from the collection's concrete canonical
-// identities.
-func TestAuthorizedRunRepoIDsResolution(t *testing.T) {
+// TestRunAuthzPolicyResolution pins the resolution itself: which requests
+// resolve to the unrestricted form and which resolve to an exact predicate
+// over the principal's normalized grants (canonical identities, bare aliases,
+// host canonicalization, deny overrides).
+func TestRunAuthzPolicyResolution(t *testing.T) {
 	base := time.Date(2026, 7, 12, 13, 14, 15, 0, time.UTC)
 	s := runsPaginationServer(t, nil)
 	runsPaginationSeed(t, s, []model.Run{
@@ -592,46 +592,49 @@ func TestAuthorizedRunRepoIDsResolution(t *testing.T) {
 	}
 
 	cases := []struct {
-		name    string
-		p       *auth.Principal
-		wantNil bool
-		want    []string
+		name           string
+		p              *auth.Principal
+		wantUnrestrict bool
+		want           map[string]bool
 	}{
 		{"no principal", nil, true, nil},
 		{"admin", &auth.Principal{Roles: []auth.Role{auth.RoleAdmin}}, true, nil},
 		{"global read without entries", &auth.Principal{Roles: []auth.Role{auth.RoleRead}}, true, nil},
-		{"bare alias", &auth.Principal{Repositories: map[string]auth.RepositoryPermission{"o/repo-a": {Read: true}}}, false, []string{"github.com/o/repo-a", "gitlab.com/o/repo-a"}},
-		{"host-case grant", &auth.Principal{Repositories: map[string]auth.RepositoryPermission{"GitHub.com/o/repo-b": {Read: true}}}, false, []string{"github.com/o/repo-b"}},
-		{"global read with a deny entry", &auth.Principal{Roles: []auth.Role{auth.RoleRead}, Repositories: map[string]auth.RepositoryPermission{"github.com/o/repo-b": {Read: false}}}, false, []string{"github.com/o/repo-a", "gitlab.com/o/repo-a"}},
-		{"no matching grant", &auth.Principal{Repositories: map[string]auth.RepositoryPermission{"o/repo-z": {Read: true}}}, false, []string{}},
+		{"bare alias", &auth.Principal{Repositories: map[string]auth.RepositoryPermission{"o/repo-a": {Read: true}}}, false,
+			map[string]bool{"github.com/o/repo-a": true, "gitlab.com/o/repo-a": true, "github.com/o/repo-b": false}},
+		{"host-case grant", &auth.Principal{Repositories: map[string]auth.RepositoryPermission{"GitHub.com/o/repo-b": {Read: true}}}, false,
+			map[string]bool{"github.com/o/repo-b": true, "github.com/o/repo-a": false, "gitlab.com/o/repo-a": false}},
+		{"global read with a deny entry", &auth.Principal{Roles: []auth.Role{auth.RoleRead}, Repositories: map[string]auth.RepositoryPermission{"github.com/o/repo-b": {Read: false}}}, false,
+			map[string]bool{"github.com/o/repo-a": true, "gitlab.com/o/repo-a": true, "github.com/o/repo-b": false}},
+		{"no matching grant", &auth.Principal{Repositories: map[string]auth.RepositoryPermission{"o/repo-z": {Read: true}}}, false,
+			map[string]bool{"github.com/o/repo-a": false, "github.com/o/repo-b": false, "gitlab.com/o/repo-a": false}},
 	}
 	for _, tc := range cases {
-		got, err := s.authorizedRunRepoIDs(request(tc.p))
-		if err != nil {
-			t.Fatalf("%s: %v", tc.name, err)
-		}
-		if tc.wantNil {
-			if got != nil {
-				t.Fatalf("%s = %v, want the unrestricted nil form", tc.name, got)
+		policy := s.runAuthzPolicy(request(tc.p))
+		if tc.wantUnrestrict {
+			if !policy.IsUnrestricted() {
+				t.Fatalf("%s = restricted, want the unrestricted form", tc.name)
 			}
 			continue
 		}
-		if got == nil {
-			t.Fatalf("%s = nil, want an exact (possibly empty) allowlist", tc.name)
+		if policy.IsUnrestricted() {
+			t.Fatalf("%s = unrestricted, want an exact predicate", tc.name)
 		}
-		if strings.Join(got, ",") != strings.Join(tc.want, ",") {
-			t.Fatalf("%s = %v, want %v", tc.name, got, tc.want)
+		for candidate, want := range tc.want {
+			if got := policy.Allows(candidate); got != want {
+				t.Fatalf("%s: Allows(%q) = %v, want %v", tc.name, candidate, got, want)
+			}
 		}
 	}
 }
 
 // pagedRunsFake is a dbFakeStore that also implements
-// storage.RunPageForPrincipalStore, so the handler's authorized paged path is
-// exercised without PostgreSQL. It records the permitted repository set, the
-// cursor and the limit each page read received, which pins that the handler
-// resolves authorization first and delegates the keyset position to the
-// store. legacyCalls counts uses of the UNFILTERED page method: the handler
-// must never take that path.
+// storage.RunPageAuthorizedStore, so the handler's authorized paged path is
+// exercised without PostgreSQL. It records the normalized policy, the cursor
+// and the limit each page read received, which pins that the handler resolves
+// authorization first and delegates the keyset position to the store.
+// legacyCalls counts uses of the UNFILTERED page method: the handler must
+// never take that path.
 type pagedRunsFake struct {
 	*dbFakeStore
 	mu          sync.Mutex
@@ -640,15 +643,15 @@ type pagedRunsFake struct {
 	pageErr     error
 	afterIDs    []string
 	limits      []int
-	allowedSets [][]string
+	policies    []storage.RunAuthzPolicy
 }
 
-func (p *pagedRunsFake) ListRunsPageForAuthorizedRepos(ctx context.Context, allowedRepoIDs []string, afterCreatedAt time.Time, afterID string, limit int) (storage.RunPage, error) {
+func (p *pagedRunsFake) ListRunsPageAuthorized(ctx context.Context, policy storage.RunAuthzPolicy, afterCreatedAt time.Time, afterID string, limit int) (storage.RunPage, error) {
 	p.mu.Lock()
 	p.pageCalls++
 	p.afterIDs = append(p.afterIDs, afterID)
 	p.limits = append(p.limits, limit)
-	p.allowedSets = append(p.allowedSets, append([]string(nil), allowedRepoIDs...))
+	p.policies = append(p.policies, policy)
 	err := p.pageErr
 	p.mu.Unlock()
 	if err != nil {
@@ -660,7 +663,7 @@ func (p *pagedRunsFake) ListRunsPageForAuthorizedRepos(ctx context.Context, allo
 		runs = append(runs, run)
 	}
 	p.dbFakeStore.mu.Unlock()
-	return storage.PageRunsForAuthorizedRepos(runs, allowedRepoIDs, afterCreatedAt, afterID, limit), nil
+	return storage.PageRunsAuthorized(runs, policy, afterCreatedAt, afterID, limit), nil
 }
 
 // ListRunsPage is the unfiltered legacy capability. The handler must never
@@ -687,8 +690,8 @@ func (p *pagedRunsFake) legacy() int {
 
 // TestListRunsPagedStorePathUnchanged pins the supported path: a store that
 // implements the authorized page contract is read through
-// ListRunsPageForAuthorizedRepos only — the handler resolves the permitted
-// repository set FIRST, passes it with the cursor position and the bounded
+// ListRunsPageAuthorized only — the handler resolves the principal's
+// normalized policy FIRST, passes it with the cursor position and the bounded
 // limit straight through, and never touches the unfiltered legacy page
 // method. Its first page is byte-identical to memory mode, and a failing page
 // read stays a 500.
@@ -724,8 +727,8 @@ func TestListRunsPagedStorePathUnchanged(t *testing.T) {
 		if pf.limits[i] != 2 {
 			t.Fatalf("page %d limit = %d, want the requested 2", i, pf.limits[i])
 		}
-		if pf.allowedSets[i] != nil {
-			t.Fatalf("admin page %d received allowlist %v, want the unrestricted nil form", i, pf.allowedSets[i])
+		if !pf.policies[i].IsUnrestricted() {
+			t.Fatalf("admin page %d received a restricted policy, want the unrestricted form", i)
 		}
 		got = append(got, page.ids...)
 	}
@@ -738,9 +741,9 @@ func TestListRunsPagedStorePathUnchanged(t *testing.T) {
 		t.Fatalf("page cursor positions = %v, want the previous page boundary", pf.afterIDs)
 	}
 
-	// A repo-scoped reader reaches the same store with the EXACT canonical
-	// allowlist resolved from the collection's identities (the bare grant
-	// resolves to the run's canonical policy identity).
+	// A repo-scoped reader reaches the same store with a policy that allows
+	// only the run's canonical policy identity (the bare grant resolves
+	// host-agnostically to it).
 	if err := paged.AuthStore.AddToken("reader", auth.Principal{
 		Subject:      "reader",
 		Repositories: map[string]auth.RepositoryPermission{"o/repo-a": {Read: true}},
@@ -748,15 +751,18 @@ func TestListRunsPagedStorePathUnchanged(t *testing.T) {
 		t.Fatal(err)
 	}
 	pf.mu.Lock()
-	pf.pageCalls, pf.afterIDs, pf.limits, pf.allowedSets, pf.legacyCalls = 0, nil, nil, nil, 0
+	pf.pageCalls, pf.afterIDs, pf.limits, pf.policies, pf.legacyCalls = 0, nil, nil, nil, 0
 	pf.mu.Unlock()
 	readerPages := walkRunsPages(t, paged, "reader", 2, 5)
 	if len(readerPages) != 3 {
 		t.Fatalf("reader paged walk = %d pages, want 3", len(readerPages))
 	}
-	for i, set := range pf.allowedSets {
-		if strings.Join(set, ",") != "github.com/o/repo-a" {
-			t.Fatalf("reader page %d allowlist = %v, want the resolved canonical identity", i, set)
+	for i, policy := range pf.policies {
+		if policy.IsUnrestricted() {
+			t.Fatalf("reader page %d received the unrestricted policy", i)
+		}
+		if !policy.Allows("github.com/o/repo-a") || policy.Allows("github.com/o/repo-b") {
+			t.Fatalf("reader page %d policy does not isolate the granted repository", i)
 		}
 	}
 	if pf.legacy() != 0 {
@@ -784,9 +790,9 @@ func TestListRunsPagedStorePathUnchanged(t *testing.T) {
 	}
 }
 
-// Capability-hiding wrappers: each exposes a strict subset of the paged-read
-// capabilities behind the static storage.Store type, so the handler's
-// fail-closed checks can be exercised without PostgreSQL.
+// Capability-hiding wrappers: each exposes the static storage.Store type with
+// at most the OLD unfiltered page capability, so the handler's fail-closed
+// check can be exercised without PostgreSQL.
 type (
 	// noPageStore satisfies Store only.
 	noPageStore struct {
@@ -799,38 +805,18 @@ type (
 		storage.Store
 		inner storage.RunPageStore
 	}
-	// enumerationOnlyStore exposes candidate enumeration but not the
-	// authorized page contract.
-	enumerationOnlyStore struct {
-		storage.Store
-		inner *dbFakeStore
-	}
-	// authorizedPageOnlyStore exposes the authorized page contract but not
-	// candidate enumeration.
-	authorizedPageOnlyStore struct {
-		storage.Store
-		inner *dbFakeStore
-	}
 )
 
 func (l legacyUnfilteredPageStore) ListRunsPage(ctx context.Context, afterCreatedAt time.Time, afterID string, limit int) (storage.RunPage, error) {
 	return l.inner.ListRunsPage(ctx, afterCreatedAt, afterID, limit)
 }
 
-func (e enumerationOnlyStore) ListRunRepoIDs(ctx context.Context) ([]string, error) {
-	return e.inner.ListRunRepoIDs(ctx)
-}
-
-func (a authorizedPageOnlyStore) ListRunsPageForAuthorizedRepos(ctx context.Context, allowedRepoIDs []string, afterCreatedAt time.Time, afterID string, limit int) (storage.RunPage, error) {
-	return a.inner.ListRunsPageForAuthorizedRepos(ctx, allowedRepoIDs, afterCreatedAt, afterID, limit)
-}
-
 // TestListRunsStoreWithoutAuthorizedPageContractFailsClosed pins the
-// fail-closed contract: a store missing EITHER the authorized page contract
-// or the candidate enumeration cannot serve the collection, so every /runs
-// request — first page, explicit limit, or an older cursor — answers the
-// opaque 500 instead of a page whose boundary could leak. In particular the
-// legacy unfiltered RunPageStore is NOT a fallback.
+// fail-closed contract: a store missing the authorized page contract cannot
+// serve the collection, so every /runs request — first page, explicit limit,
+// or an older cursor — answers the opaque 500 instead of a page whose
+// boundary could leak. In particular the legacy unfiltered RunPageStore is
+// NOT a fallback.
 func TestListRunsStoreWithoutAuthorizedPageContractFailsClosed(t *testing.T) {
 	f := newDBFakeStore()
 	base := time.Date(2026, 9, 10, 11, 12, 13, 0, time.UTC)
@@ -853,16 +839,11 @@ func TestListRunsStoreWithoutAuthorizedPageContractFailsClosed(t *testing.T) {
 	}{
 		{"store only", noPageStore{Store: f}},
 		{"legacy unfiltered page only", legacyUnfilteredPageStore{Store: f, inner: f}},
-		{"enumeration without authorized page", enumerationOnlyStore{Store: f, inner: f}},
-		{"authorized page without enumeration", authorizedPageOnlyStore{Store: f, inner: f}},
 	}
 	for _, tc := range stores {
 		s := New("admin")
-		// A repository-scoped reader forces candidate resolution, so every
-		// missing capability (enumeration OR the authorized page contract)
-		// is exercised. An admin needs no enumeration (its permitted set is
-		// everything by definition) but still fails closed without the
-		// authorized page contract.
+		// A repository-scoped reader exercises the policy path; an admin
+		// still fails closed without the authorized page contract.
 		if err := s.AuthStore.AddToken("reader", auth.Principal{
 			Subject:      "reader",
 			Repositories: map[string]auth.RepositoryPermission{"o/repo-a": {Read: true}},
@@ -886,16 +867,10 @@ func TestListRunsStoreWithoutAuthorizedPageContractFailsClosed(t *testing.T) {
 
 	// The page helper rejects the legacy unfiltered capability with the
 	// documented fail-closed error.
-	if _, err := listRunsPageForAuthorizedRepos(context.Background(), legacyUnfilteredPageStore{Store: f, inner: f}, nil, runsCursor{}, 2); !errors.Is(err, errRunsPaginationUnsupported) {
+	policy := storage.RunAuthzPolicyForPrincipal(nil)
+	if _, err := listRunsPageAuthorized(context.Background(), legacyUnfilteredPageStore{Store: f, inner: f}, policy, runsCursor{}, 2); !errors.Is(err, errRunsPaginationUnsupported) {
 		t.Fatalf("legacy store error = %v, want errRunsPaginationUnsupported", err)
 	} else if !strings.Contains(err.Error(), "authorized runs pagination unsupported by configured store") {
 		t.Fatalf("legacy store error = %q, want the documented detail", err)
-	}
-	// And candidate resolution rejects a store without enumeration the same
-	// way.
-	s := New("admin")
-	s.DB = authorizedPageOnlyStore{Store: f, inner: f}
-	if _, err := s.runRepoCandidates(context.Background()); !errors.Is(err, errRunsPaginationUnsupported) {
-		t.Fatalf("non-enumerating store error = %v, want errRunsPaginationUnsupported", err)
 	}
 }

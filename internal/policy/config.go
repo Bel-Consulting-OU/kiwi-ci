@@ -237,9 +237,15 @@ func (c *Config) RepoPolicyFor(repoID string) (RepoPolicy, bool) {
 //   - an exact canonical ("<host>/<owner>/<name>") key wins;
 //   - an exact bare ("owner/name") key wins when the lookup key itself is
 //     bare;
-//   - on a canonical lookup miss, a bare key equal to the identity's
-//     owner/name is honored as an EXPLICIT legacy alias applying to every
-//     forge presenting that name (aliases are never derived implicitly);
+//   - a canonical identity and a bare alias are distinguished ONLY by the
+//     shared typed positional rule (auth.ParseStoredRepoID): a value with
+//     three or more path segments is a canonical identity (its first segment
+//     is the host, dotted OR dotless) and a shorter value is a bare alias.
+//     There is no dot heuristic, so a dotless host cannot be misclassified;
+//   - on a canonical lookup miss, a stored key that PARSES AS A BARE ALIAS and
+//     equals the identity's owner/name is honored as an EXPLICIT legacy alias
+//     applying to every forge presenting that name (aliases are never derived
+//     implicitly, and a stored canonical key never doubles as a bare alias);
 //   - a bare lookup key (a submission with no forge host) matches canonical
 //     keys sharing its owner/name only when exactly one DISTINCT entry
 //     exists: several different entries make the lookup ambiguous and
@@ -253,9 +259,16 @@ func (c *Config) repoPolicy(repoID string) (RepoPolicy, bool) {
 	if rp, ok := lookupRepoPolicy(c.Repositories, repoID); ok {
 		return rp, true
 	}
-	_, bare, hasHost := splitCanonicalRepoKey(repoID)
-	if hasHost {
-		return lookupRepoPolicy(c.Repositories, bare)
+	if grant, err := auth.ParseStoredRepoID(repoID); err == nil {
+		if id, ok := grant.Identity(); ok {
+			// Canonical lookup: an EXPLICIT bare alias key equal to the
+			// identity's full name is honored as a legacy alias applying to
+			// every forge presenting that name. A key that itself parses as
+			// a canonical identity is NOT a bare alias and never matches
+			// here, so a dotless canonical host and another forge's
+			// same-named full name stay distinct.
+			return lookupBareAliasPolicy(c.Repositories, id.FullName)
+		}
 	}
 	var match RepoPolicy
 	found, ambiguous := false, false
@@ -266,12 +279,18 @@ func (c *Config) repoPolicy(repoID string) (RepoPolicy, bool) {
 			continue
 		}
 		seen[nk] = true
-		if _, kb, kHost := splitCanonicalRepoKey(nk); kHost && kb == repoID {
-			if !found {
-				match, found = rp, true
-			} else if !reflect.DeepEqual(rp, match) {
-				ambiguous = true
-			}
+		grant, err := auth.ParseStoredRepoID(nk)
+		if err != nil {
+			continue
+		}
+		id, ok := grant.Identity()
+		if !ok || id.FullName != repoID {
+			continue
+		}
+		if !found {
+			match, found = rp, true
+		} else if !reflect.DeepEqual(rp, match) {
+			ambiguous = true
 		}
 	}
 	if found && !ambiguous {
@@ -302,19 +321,42 @@ func lookupRepoPolicy(m map[string]RepoPolicy, target string) (RepoPolicy, bool)
 	return RepoPolicy{}, false
 }
 
-// splitCanonicalRepoKey splits a canonical "host/owner/name" identity into
-// host and bare "owner/name" parts, reporting whether the input carried a
-// host. A dotted first segment alone is not enough: a canonical identity
-// always carries owner/name after the host, so the remainder must itself
-// contain a slash. Without that rule a GitLab group with a dot in its name
-// ("acme.co/service") would be misread as host "acme.co" + bare "service".
-// It mirrors auth's canonical split so policy lookups and RBAC agree.
-func splitCanonicalRepoKey(repo string) (host, bare string, hasHost bool) {
-	parts := strings.SplitN(repo, "/", 2)
-	if len(parts) == 2 && strings.Contains(parts[0], ".") && strings.Contains(parts[1], "/") {
-		return parts[0], parts[1], true
+// lookupBareAliasPolicy resolves the entry whose key is an EXPLICIT bare
+// alias ("owner/name", or a nested group path that parses as an alias) equal
+// to name. A key that parses as a canonical identity is classified by the
+// typed positional rule (auth.ParseStoredRepoID) and is NOT a bare alias even
+// when its full name equals name: that is what keeps a canonical grant for
+// another forge (whose full name embeds the same string) from scoping a
+// different, dotless-host repository, and vice versa. Equivalent alias keys
+// carrying DIFFERENT policies resolve to no entry (fail closed).
+func lookupBareAliasPolicy(m map[string]RepoPolicy, name string) (RepoPolicy, bool) {
+	var match RepoPolicy
+	found, ambiguous := false, false
+	seen := map[string]bool{}
+	for key, rp := range m {
+		nk := auth.NormalizeRepoKey(key)
+		if seen[nk] {
+			continue
+		}
+		seen[nk] = true
+		grant, err := auth.ParseStoredRepoID(nk)
+		if err != nil || !grant.IsAlias() {
+			continue
+		}
+		alias, _ := grant.Alias()
+		if alias.FullName != name {
+			continue
+		}
+		if !found {
+			match, found = rp, true
+		} else if !reflect.DeepEqual(rp, match) {
+			ambiguous = true
+		}
 	}
-	return "", repo, false
+	if found && !ambiguous {
+		return match, true
+	}
+	return RepoPolicy{}, false
 }
 
 // GrantsFor returns the boolean capabilities explicitly granted by the

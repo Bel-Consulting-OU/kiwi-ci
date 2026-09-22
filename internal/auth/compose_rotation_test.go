@@ -19,6 +19,14 @@ import (
 	"testing"
 )
 
+// composeRepoAKey is the EXPLICIT ACL spelling of the canonical grant shared
+// by the rotation pair. ACL configuration must distinguish canonical from
+// bare explicitly, so the token file below carries the r1: form; a legacy
+// "github.com/o/repo-a" string would be refused at Load as ambiguous.
+func composeRepoAKey() string {
+	return RepoIdentity{Host: "github.com", FullName: "o/repo-a"}.Serialized()
+}
+
 // composeRotationCanonical is the effective identity shared by the rotation
 // pair: repository-scoped read+run on github.com/o/repo-a and NO global role,
 // so the difference between an authorized and an unauthorized repository is
@@ -26,7 +34,7 @@ import (
 func composeRotationCanonical() Principal {
 	return Principal{
 		Subject:      "svc-rotation",
-		Repositories: map[string]RepositoryPermission{"github.com/o/repo-a": {Read: true, Run: true}},
+		Repositories: map[string]RepositoryPermission{composeRepoAKey(): {Read: true, Run: true}},
 	}
 }
 
@@ -36,7 +44,7 @@ func composeRotationCanonical() Principal {
 func composeRotationVariant() Principal {
 	return Principal{
 		Subject:      "svc-rotation",
-		Repositories: map[string]RepositoryPermission{"github.com/o/repo-a": {Run: true, Read: true}},
+		Repositories: map[string]RepositoryPermission{composeRepoAKey(): {Run: true, Read: true}},
 	}
 }
 
@@ -180,7 +188,7 @@ func TestComposeWeakerSameSubjectTokenRejectedAndPairIntact(t *testing.T) {
 	before2, _ := s.Authenticate("rot-2")
 	weaker := Principal{
 		Subject:      "svc-rotation",
-		Repositories: map[string]RepositoryPermission{"github.com/o/repo-a": {Read: true}},
+		Repositories: map[string]RepositoryPermission{composeRepoAKey(): {Read: true}},
 	}
 	err := s.AddToken("weak", weaker)
 	if err == nil {

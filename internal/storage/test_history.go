@@ -31,6 +31,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/testintel"
 )
@@ -295,12 +296,18 @@ func testHistoryResolveLimit(limit int) int {
 
 // repoQueryHasForgeHost reports whether a query already carries a forge host
 // (host/owner/name) and is therefore an exact canonical repository identity
-// rather than a bare owner/name candidate hint. It mirrors the host-like rule
-// of auth.CanonicalRepoID (the remainder must itself contain a slash), so a
-// GitLab group whose name contains a dot is never mistaken for a host.
+// rather than a bare owner/name candidate hint. It classifies the query with
+// the typed positional rule (auth.ParseStoredRepoID): three or more path
+// segments parse into a canonical identity whose host is the FIRST segment, so
+// a DOTLESS host ("gitlab/acme/widget") is canonical exactly like a dotted
+// one. The old "first segment contains a dot" heuristic is gone; a GitLab
+// group whose name contains a dot is no longer mistaken for a host.
 func repoQueryHasForgeHost(query string) bool {
-	_, _, ok := splitHostLike(query)
-	return ok
+	grant, err := auth.ParseStoredRepoID(strings.TrimSpace(query))
+	if err != nil {
+		return false
+	}
+	return grant.IsIdentity()
 }
 
 // filterTestHistoryPermitted normalizes the permitted canonical identity set.

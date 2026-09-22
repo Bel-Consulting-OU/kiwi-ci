@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
@@ -63,6 +64,13 @@ func enrollTokenFrom(r *http.Request) string {
 // a canceled context mints nothing (no token is returned, no row written).
 // The fs/memory path persists synchronously and is not interruptible, so
 // cancellation is honored at the operation boundary, before the map mutation.
+//
+// The fs persist failure is phase-aware: a pre-rename failure rolls the new
+// grant back out of memory (the file never saw it), while a post-rename
+// directory-fsync failure RETAINS it, because the visible file already
+// carries the grant and memory must not deny what the durable record holds
+// (see consumeEnrollGrant for the same rule). Either way the mint returns no
+// token and readiness degrades until a later successful persist reconciles.
 func (s *Server) CreateEnrollGrant(ctx context.Context, ttl time.Duration, allowedLabels []string) (string, error) {
 	if ttl <= 0 {
 		return "", fmt.Errorf("enroll grant ttl must be positive")
@@ -95,12 +103,27 @@ func (s *Server) CreateEnrollGrant(ctx context.Context, ttl time.Duration, allow
 		s.EnrollGrants = map[string]EnrollGrant{}
 	}
 	s.pruneEnrollGrantsLocked(time.Now().UTC())
-	s.EnrollGrants[auth.TokenDigest(token)] = EnrollGrant{
+	digest := auth.TokenDigest(token)
+	s.EnrollGrants[digest] = EnrollGrant{
 		ExpiresAt:   expires,
 		BoundLabels: append([]string(nil), allowedLabels...),
 	}
 	if err := s.persistEnrollGrants(); err != nil {
-		delete(s.EnrollGrants, auth.TokenDigest(token))
+		if !fsutil.Renamed(err) {
+			// Pre-rename failure: the new grant was definitely not published
+			// and the previous file is intact, so roll the in-memory mint
+			// back and return no token. The caller never learns a value the
+			// store does not contain.
+			delete(s.EnrollGrants, digest)
+			return "", err
+		}
+		// Post-rename failure: the grant IS visible in the file with
+		// uncertified crash durability. Rolling memory back would leave the
+		// visible file holding a live grant memory denies (and a restart
+		// would resurrect it), so retain the published grant and let the
+		// shared degraded marker fail closed until a later successful
+		// persist reconciles. No token is returned: the mint is still not
+		// acknowledged.
 		return "", err
 	}
 	return token, nil
@@ -173,9 +196,21 @@ func checkGrantAllowedLabels(allowed, requested []string) error {
 // unpermitted label must not consume (and thereby destroy) the grant it
 // cannot use. BoundLabels are immutable for a grant digest, so the pre-read
 // cannot be raced into disagreeing with the consumed record. On success the
-// grant is marked used and persisted before any certificate is signed; if
-// the memory-mode persist fails the in-memory mutation is rolled back, so a
-// consume that is not durable stays consumable and no certificate is issued.
+// grant is marked used and persisted before any certificate is signed.
+//
+// The memory-mode persist failure handling is phase-aware, because the
+// memory-only / disk-only asymmetry it used to assume does not hold across
+// the rename (fsutil.AtomicWriteError):
+//
+//   - pre-rename failure (fsutil.NotPublished): nothing was published, the
+//     previous file is intact, and the pre-consume entry is restored — the
+//     grant stays consumable and no certificate is issued.
+//   - post-rename failure (fsutil.Renamed, the parent-directory fsync): the
+//     visible file already records the consumption, so the CONSUMED
+//     in-memory state is retained (never rolled back to the permissive
+//     unused entry), a replay is refused, readiness stays degraded until a
+//     later successful persist reconciles, and still no certificate is
+//     issued because the caller returns on this error.
 //
 // ctx is the enroll REQUEST context and threads into both durable store
 // calls. A canceled request aborts the consumption before the conditional
@@ -245,12 +280,23 @@ func (s *Server) consumeEnrollGrant(ctx context.Context, tok string, requestLabe
 	g.Used = true
 	s.EnrollGrants[digest] = g
 	if err := s.persistEnrollGrants(); err != nil {
-		// The consume is not durable: restore the pre-consume entry so a
-		// restart (which reloads the on-disk, still-unused grant) and a
-		// retry do not see a phantom consumption. No certificate is
-		// signed for a consume that did not persist, because the caller
-		// returns on this error.
-		s.EnrollGrants[digest] = prev
+		if !fsutil.Renamed(err) {
+			// Pre-rename failure: the consumption was definitely not
+			// published, so restore the pre-consume entry. A restart (which
+			// reloads the on-disk, still-unused grant) and a retry then see
+			// the grant as consumable, and no certificate is signed for a
+			// consume that never reached the file.
+			s.EnrollGrants[digest] = prev
+			return fmt.Errorf("persist enrollment grants: %w", err)
+		}
+		// Post-rename failure: the file ALREADY shows the grant as used
+		// (only its crash durability is uncertified). Restoring the
+		// permissive unused entry would make memory disagree with the
+		// visible file in the dangerous direction: a replay could burn the
+		// grant again in memory while the durable record says used, and a
+		// restart would flip the decision. Keep the CONSUMED state, keep the
+		// degraded readiness marker armed (persistEnrollGrants folded it),
+		// and still sign no certificate: the caller returns on this error.
 		return fmt.Errorf("persist enrollment grants: %w", err)
 	}
 	return nil
@@ -299,12 +345,21 @@ var persistEnrollGrantsFunc = func(s *Server) error {
 // persistEnrollGrants durably writes the grant state to dataDir
 // (digest-keyed only) through marshalJSONFile, i.e. fsutil.AtomicWriteFile's
 // unique temp file, checked file fsync/close, rename and parent-directory
-// fsync. An error means the grant mutation is NOT certified durable: the mint
-// path returns no token and rolls the new grant back, and the consume path
-// restores the unused grant and refuses to sign a certificate. Memory servers
-// without a data dir keep grants in process memory.
+// fsync. Every outcome is folded into the shared degraded marker
+// (noteFilePersistResult): a published-but-uncertified failure arms it and
+// any successful persist — including a deliberate re-persist used as the
+// reconciliation step — heals it.
+//
+// The error is a typed *fsutil.AtomicWriteError and the callers decide by
+// phase: the mint path rolls a new grant back only on a pre-rename failure
+// (returns no token either way), and the consume path keeps the consumed
+// entry once the rename has published it, restoring the unused entry only
+// for a pre-rename failure. Memory servers without a data dir keep grants in
+// process memory (no file, no phase).
 func (s *Server) persistEnrollGrants() error {
-	return persistEnrollGrantsFunc(s)
+	err := persistEnrollGrantsFunc(s)
+	s.noteFilePersistResult(err)
+	return err
 }
 
 // pruneEnrollGrantsLocked drops expired grants. Callers hold s.mu.

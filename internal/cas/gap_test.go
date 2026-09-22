@@ -9,9 +9,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/blob"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
 )
 
 type stubStore struct {
@@ -84,31 +86,86 @@ func TestCASPutStoreError(t *testing.T) {
 	}
 }
 
-// TestCASPutTempDirFailure proves a failing os.CreateTemp surfaces its error.
-func TestCASPutTempDirFailure(t *testing.T) {
-	// Create the temp dir before pointing TMPDIR at a nonexistent path.
-	missing := filepath.Join(t.TempDir(), "does-not-exist")
-	t.Setenv("TMPDIR", missing)
+// TestCASPutNeverUsesSystemTempDir proves Put no longer spools through the
+// bare system temp directory: a stream past the in-memory bound either uses
+// the configured staging budget's directory or fails closed with ErrNoSpool
+// — no file may ever appear under TMPDIR, and an unwritable TMPDIR must not
+// change the outcome.
+func TestCASPutNeverUsesSystemTempDir(t *testing.T) {
+	systemTmp := t.TempDir()
+	t.Setenv("TMPDIR", systemTmp)
+	data := bytes.Repeat([]byte("x"), int(DefaultPutMemoryBytes)+16)
+
+	// No staging budget: fail closed, nothing staged anywhere.
 	c := New(blob.NewFS(t.TempDir()))
-	if _, err := c.Put(context.Background(), bytes.NewReader([]byte("x"))); err == nil {
-		t.Fatal("Put with unusable TMPDIR succeeded, want error")
+	if _, err := c.Put(context.Background(), bytes.NewReader(data)); !errors.Is(err, ErrNoSpool) {
+		t.Fatalf("oversized Put without staging = %v, want ErrNoSpool", err)
 	}
-	if os.Getenv("TMPDIR") != missing {
-		t.Fatal("TMPDIR override did not apply")
+	if entries, err := os.ReadDir(systemTmp); err != nil || len(entries) != 0 {
+		t.Fatalf("Put touched the system temp dir (%d entries, %v)", len(entries), err)
+	}
+
+	// Configured staging budget: the spool file lives there, TMPDIR stays
+	// empty, and the object is published correctly.
+	stagingDir := filepath.Join(t.TempDir(), "staging")
+	budget, err := staging.NewBudget(stagingDir, 64<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c = New(blob.NewFS(t.TempDir()))
+	c.Staging = budget
+	obj, err := c.Put(context.Background(), bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("staged Put: %v", err)
+	}
+	sum := sha256.Sum256(data)
+	if obj.Key != hex.EncodeToString(sum[:]) || obj.Size != int64(len(data)) {
+		t.Fatalf("staged Put object = %s/%d, want %s/%d", obj.Key, obj.Size, hex.EncodeToString(sum[:]), len(data))
+	}
+	if entries, err := os.ReadDir(systemTmp); err != nil || len(entries) != 0 {
+		t.Fatalf("staged Put touched the system temp dir (%d entries, %v)", len(entries), err)
+	}
+	rc, _, err := c.Open(context.Background(), obj.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, readErr := io.ReadAll(rc)
+	_ = rc.Close()
+	if readErr != nil || !bytes.Equal(got, data) {
+		t.Fatalf("staged Put content mismatch: %v", readErr)
+	}
+	// The spool file is removed after publication; the budget directory
+	// keeps no scratch files.
+	entries, err := os.ReadDir(stagingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), staging.FilePrefix) {
+			t.Fatalf("spool file %s survived publication", e.Name())
+		}
 	}
 }
 
-// TestCASPutSeekFailure proves a failing seek on the temp file surfaces its
-// error instead of writing a corrupt object.
-func TestCASPutSeekFailure(t *testing.T) {
-	orig := fileSeek
-	fileSeek = func(f *os.File, off int64, whence int) (int64, error) {
-		return 0, errors.New("seek refused")
+// TestCASPutSpoolFailureSurfaces proves a failing staging spool (the
+// configured staging directory replaced by a regular file) surfaces its
+// error instead of publishing anything.
+func TestCASPutSpoolFailureSurfaces(t *testing.T) {
+	stagingDir := filepath.Join(t.TempDir(), "staging")
+	budget, err := staging.NewBudget(stagingDir, 64<<20)
+	if err != nil {
+		t.Fatal(err)
 	}
-	defer func() { fileSeek = orig }()
+	if err := os.RemoveAll(stagingDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stagingDir, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	c := New(blob.NewFS(t.TempDir()))
-	if _, err := c.Put(context.Background(), bytes.NewReader([]byte("x"))); err == nil {
-		t.Fatal("Put with failing seek succeeded, want error")
+	c.Staging = budget
+	if _, err := c.Put(context.Background(), bytes.NewReader(bytes.Repeat([]byte("x"), int(DefaultPutMemoryBytes)+1))); err == nil {
+		t.Fatal("Put with an unusable staging directory succeeded, want error")
 	}
 }
 

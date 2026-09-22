@@ -57,17 +57,30 @@ func (s *Server) loadCRL(dataDir string) error {
 
 // persistCRL durably writes the CRL to dataDir through marshalJSONFile, i.e.
 // fsutil.AtomicWriteFile's unique temp file, checked file fsync/close, rename
-// and parent-directory fsync. An error means the revocation file is NOT
-// certified durable and must not be acknowledged. The FS-mode authoritative
-// revocation path does not use this mirror: runnerDisable carries the CRL in
-// the checked state snapshot and answers an opaque 503 when it cannot be
-// persisted (see runnerDisable). Memory servers without a data dir keep the
-// revocation only in process memory.
+// and parent-directory fsync. The error is a typed *fsutil.AtomicWriteError:
+//
+//   - a pre-rename failure (fsutil.NotPublished) means the mirror file still
+//     holds the previous CRL and the revocation was definitely not published
+//     there; the in-memory decision stays revoked regardless (memory may be
+//     stricter than the mirror, never more permissive).
+//   - a post-rename failure (fsutil.Renamed, the parent-directory fsync)
+//     means the new CRL IS visible in the file with uncertified crash
+//     durability. The caller must not roll the in-memory revocation back:
+//     memory and the visible file both say revoked, and
+//     noteFilePersistResult keeps readiness degraded until a later
+//     successful persist reconciles.
+//
+// The FS-mode authoritative revocation path does not use this mirror:
+// runnerDisable carries the CRL in the checked state snapshot and answers an
+// opaque 503 when it cannot be persisted (see runnerDisable). Memory servers
+// without a data dir keep the revocation only in process memory.
 func (s *Server) persistCRL() error {
 	if s.dataDir == "" {
 		return nil
 	}
-	return marshalJSONFile(filepath.Join(s.dataDir, crlFile), crlJSON(s.crl))
+	err := marshalJSONFile(filepath.Join(s.dataDir, crlFile), crlJSON(s.crl))
+	s.noteFilePersistResult(err)
+	return err
 }
 
 // mirrorRunnerCertRevoked records an ALREADY DURABLY COMMITTED certificate
@@ -79,8 +92,16 @@ func (s *Server) persistCRL() error {
 // durable authority is the cert_revocations row). The write itself is the
 // same durable primitive as every other security-state file, so when it
 // succeeds the mirror survives a crash; the log-only failure policy is about
-// DB authority, not about the write's durability. The caller must NOT hold
-// s.mu.
+// DB authority, not about the write's durability.
+//
+// The in-memory decision is never rolled back: the revocation is set before
+// the write and a failure of any phase leaves it set, because memory may be
+// stricter than the mirror but never more permissive. A post-rename
+// directory-fsync failure (fsutil.Renamed) means the mirror file already
+// shows the revocation with uncertified durability; persistCRL folds that
+// into the shared degraded marker so /readiness and the lease gate fail
+// closed until a later successful persist reconciles. The caller must NOT
+// hold s.mu.
 func (s *Server) mirrorRunnerCertRevoked(ri model.Runner) {
 	if ri.CertSerial == "" {
 		return

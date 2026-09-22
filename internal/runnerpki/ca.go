@@ -17,6 +17,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 )
 
 const (
@@ -138,8 +140,15 @@ func LoadOrCreateCA(dir string) (*CA, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
+	// CA material is security material: both files are published through the
+	// shared crash-durable primitive (unique temp, checked write/fsync/close,
+	// rename, parent-directory fsync) so a failed durability step is never
+	// acknowledged. The certificate (0644, public) is written before the
+	// private key (0600): a pre-rename failure leaves the previous file
+	// bit-for-bit intact, and a post-rename dir-sync failure is still
+	// surfaced as an error rather than a successful install.
 	certOut := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca.Cert.Raw})
-	if err := writeFileAtomic(certPath, certOut, 0o644); err != nil {
+	if err := fsutil.AtomicWriteFile(certPath, certOut, 0o644); err != nil {
 		return nil, err
 	}
 	keyDER, err := x509.MarshalPKCS8PrivateKey(ca.Key)
@@ -147,7 +156,7 @@ func LoadOrCreateCA(dir string) (*CA, error) {
 		return nil, err
 	}
 	keyOut := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
-	if err := writeFileAtomic(keyPath, keyOut, 0o600); err != nil {
+	if err := fsutil.AtomicWriteFile(keyPath, keyOut, 0o600); err != nil {
 		return nil, err
 	}
 	return ca, nil
@@ -269,12 +278,4 @@ func randInt() (*big.Int, error) {
 		return nil, err
 	}
 	return n, nil
-}
-
-func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, mode); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
 }

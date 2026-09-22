@@ -3,6 +3,7 @@ package storage
 import (
 	"testing"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
@@ -143,6 +144,37 @@ func TestLeasePredicateUsesStoredRepoID(t *testing.T) {
 	}
 }
 
+// TestRepoAllowedDotlessCanonicalDoesNotCrossForge is the lease-side
+// regression for the typed identity: a runner allowlist entry for the dotless
+// canonical repository gitlab/acme/widget must not admit a job whose canonical
+// identity is the unrelated forge.example/gitlab/acme/widget (the exact
+// collision the old "first segment contains a dot" heuristic allowed), and
+// vice versa.
+func TestRepoAllowedDotlessCanonicalDoesNotCrossForge(t *testing.T) {
+	dotless := model.Job{ID: "j", RepoID: "gitlab/acme/widget", RepoFullName: "acme/widget"}
+	dotted := model.Job{ID: "j", RepoID: "forge.example/gitlab/acme/widget", RepoFullName: "gitlab/acme/widget"}
+	if RepoAllowed([]string{"gitlab/acme/widget"}, dotted) {
+		t.Fatal("dotless canonical allowlist entry admitted the unrelated forge.example repository")
+	}
+	if !RepoAllowed([]string{"gitlab/acme/widget"}, dotless) {
+		t.Fatal("dotless canonical allowlist entry must admit its own repository")
+	}
+	if RepoAllowed([]string{"forge.example/gitlab/acme/widget"}, dotless) {
+		t.Fatal("forge.example canonical allowlist entry admitted the dotless gitlab repository")
+	}
+	if !RepoAllowed([]string{"forge.example/gitlab/acme/widget"}, dotted) {
+		t.Fatal("forge.example canonical allowlist entry must admit its own repository")
+	}
+	// The shared lease predicate resolves the same typed identity.
+	runner := model.Runner{ID: "r", Capacity: 1, AllowedRepositories: []string{"gitlab/acme/widget"}}
+	if (LeasePredicate{Runner: runner, Job: dotted}).Allows() {
+		t.Fatal("lease predicate admitted a job on another forge through a dotless allowlist entry")
+	}
+	if !(LeasePredicate{Runner: runner, Job: dotless}).Allows() {
+		t.Fatal("lease predicate refused the job on the allowlisted dotless host")
+	}
+}
+
 // TestInsertCompiledRunPersistsRepoID: the canonical identity rides the
 // run/job payload through the atomic enqueue and reads back verbatim (no
 // dedicated column needed).
@@ -171,5 +203,48 @@ func TestInsertCompiledRunPersistsRepoID(t *testing.T) {
 	}
 	if got.RepoID != "github.com/acme/backend" || RepoIDForJob(got) != run.RepoID {
 		t.Fatalf("job RepoID = %q (derived %q)", got.RepoID, RepoIDForJob(got))
+	}
+}
+
+// TestRepoTeamKeyTypedIdentity is the storage-side regression for the typed
+// team-key derivation: a dotless canonical host and another forge's
+// same-named full name never share a team counter, and the exact canonical
+// identity string stays the first quota key (the SQL comparison key).
+func TestRepoTeamKeyTypedIdentity(t *testing.T) {
+	dotless := QuotaKeys("gitlab/acme/widget")
+	if len(dotless) != 2 || dotless[0] != "gitlab/acme/widget" || dotless[1] != "gitlab/acme" {
+		t.Fatalf("dotless quota keys = %v", dotless)
+	}
+	other := QuotaKeys("forge.example/gitlab/acme/widget")
+	if len(other) != 2 || other[0] != "forge.example/gitlab/acme/widget" || other[1] != "forge.example/gitlab" {
+		t.Fatalf("other-forge quota keys = %v", other)
+	}
+	if dotless[1] == other[1] {
+		t.Fatalf("team keys collided across forges: %q", dotless[1])
+	}
+	// A dotted owner/name is still a bare alias with no distinct team key.
+	if got := QuotaKeys("acme.co/service"); len(got) != 1 || got[0] != "acme.co/service" {
+		t.Fatalf("dotted bare quota keys = %v", got)
+	}
+}
+
+// TestRepoTeamKeyBracketedIPv6 pins the bracketed-literal path: the team key
+// derives from the canonical host (auth.CanonicalHost) and distinct literals
+// never collapse, while the exact persisted identity stays the first key.
+func TestRepoTeamKeyBracketedIPv6(t *testing.T) {
+	wantHost := auth.CanonicalHost("[::1]:8443")
+	if wantHost == "" {
+		t.Fatal("canonical host for bracketed literal is empty")
+	}
+	keys := QuotaKeys("[::1]:8443/o/repo")
+	if len(keys) != 2 || keys[0] != "[::1]:8443/o/repo" || keys[1] != wantHost+"/o" {
+		t.Fatalf("bracketed IPv6 quota keys = %v, want team %q", keys, wantHost+"/o")
+	}
+	otherHost := auth.CanonicalHost("[::2]:9000")
+	if otherHost == "" {
+		t.Fatal("canonical host for second bracketed literal is empty")
+	}
+	if RepoTeamKey("[::1]:8443/o/repo") == RepoTeamKey("[::2]:9000/o/repo") {
+		t.Fatalf("distinct IPv6 literals collapsed to %q", RepoTeamKey("[::1]:8443/o/repo"))
 	}
 }

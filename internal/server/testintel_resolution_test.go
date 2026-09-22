@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
@@ -44,7 +45,13 @@ func (f *dbFakeStore) ResolveTestHistoryRepoIDsScoped(ctx context.Context, query
 	if restricted && len(allowed) == 0 {
 		return []string{}, nil
 	}
-	_, _, canonical := splitForgeRepoKey(query)
+	canonical := false
+	canonicalID := ""
+	if g, err := auth.ParseStoredRepoID(query); err == nil {
+		if id, ok := g.Identity(); ok {
+			canonical, canonicalID = true, id.ID()
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	seen := map[string]bool{}
@@ -58,7 +65,7 @@ func (f *dbFakeStore) ResolveTestHistoryRepoIDsScoped(ctx context.Context, query
 			continue
 		}
 		if canonical {
-			if id != query {
+			if id != canonicalID {
 				continue
 			}
 		} else if !runMatchesRepoQuery(run, query) {
@@ -206,6 +213,40 @@ func TestTestIntelligenceResolutionNoMatchingGrantIsDeterministicEmpty(t *testin
 	}
 	if got.Reports != 0 || got.TotalTests != 0 || got.Failures != 0 || len(got.Flaky) != 0 {
 		t.Fatalf("unrelated-grant query leaked candidates: %+v", got)
+	}
+}
+
+// TestTestIntelligenceDotlessCanonicalNeverCrossesForge is the server-level
+// form of the concrete collision: a grant for the DOTLESS canonical
+// repository gitlab/acme/widget must not authorize test-intelligence for the
+// unrelated canonical repository forge.example/gitlab/acme/widget, and vice
+// versa. The old splitForgeRepoKey dot heuristic classified the grant as a
+// bare nested name and let the unrelated forge's query through.
+func TestTestIntelligenceDotlessCanonicalNeverCrossesForge(t *testing.T) {
+	f := newDBFakeStore()
+	s := New("")
+	if err := s.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.runs["run-dotless"] = model.Run{ID: "run-dotless", RepoID: "gitlab/acme/widget", RepoFullName: "acme/widget", Repo: "https://gitlab/acme/widget.git", Status: model.StatusSuccess}
+	f.runs["run-dotted"] = model.Run{ID: "run-dotted", RepoID: "forge.example/gitlab/acme/widget", RepoFullName: "gitlab/acme/widget", Repo: "https://forge.example/gitlab/acme/widget.git", Status: model.StatusSuccess}
+	f.mu.Unlock()
+
+	forgeIntelGrantReads(t, s, "dotless", "gitlab/acme/widget")
+	if code, _ := forgeIntelGet(t, s, "dotless", "gitlab/acme/widget"); code != http.StatusOK {
+		t.Fatalf("own canonical dotless query = %d, want 200", code)
+	}
+	if code, _ := forgeIntelGet(t, s, "dotless", "forge.example/gitlab/acme/widget"); code != http.StatusForbidden {
+		t.Fatalf("dotless grant authorized the unrelated forge.example query: %d, want 403", code)
+	}
+
+	forgeIntelGrantReads(t, s, "dotted", "forge.example/gitlab/acme/widget")
+	if code, _ := forgeIntelGet(t, s, "dotted", "forge.example/gitlab/acme/widget"); code != http.StatusOK {
+		t.Fatalf("own canonical dotted query = %d, want 200", code)
+	}
+	if code, _ := forgeIntelGet(t, s, "dotted", "gitlab/acme/widget"); code != http.StatusForbidden {
+		t.Fatalf("forge.example grant authorized the dotless gitlab query: %d, want 403", code)
 	}
 }
 

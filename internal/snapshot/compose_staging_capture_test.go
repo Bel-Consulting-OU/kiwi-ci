@@ -52,6 +52,24 @@ func composeWatchTemp(t *testing.T) string {
 	return dir
 }
 
+// composeSpoolEntries lists staging entries excluding the ownership lock file,
+// which legitimately exists for the lifetime of the budget.
+func composeSpoolEntries(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read staging dir: %v", err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.Name() == "kiwi-stage.lock" {
+			continue
+		}
+		names = append(names, e.Name())
+	}
+	return names
+}
+
 func composeTempEntries(t *testing.T, dir string) []string {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
@@ -138,8 +156,8 @@ func TestComposeSnapshotCaptureSpooledInsideStagingBudget(t *testing.T) {
 	if budget.Used() != 0 {
 		t.Fatalf("budget used after release = %d, want 0", budget.Used())
 	}
-	if entries, err := os.ReadDir(budget.Dir()); err != nil || len(entries) != 0 {
-		t.Fatalf("staging directory entries after release = %v (err %v), want none", entries, err)
+	if entries := composeSpoolEntries(t, budget.Dir()); len(entries) != 0 {
+		t.Fatalf("staging directory entries after release = %v, want none", entries)
 	}
 	if entries := composeTempEntries(t, watched); len(entries) != 0 {
 		t.Fatalf("snapshot capture staged into the bare system temp directory: %v", entries)
@@ -178,8 +196,8 @@ func TestComposeSnapshotCaptureExhaustionFailsTypedAndPartialFree(t *testing.T) 
 	if !errors.Is(err, staging.ErrTooLarge) {
 		t.Fatalf("spool of an oversized capture = %v, want ErrTooLarge", err)
 	}
-	if entries, rerr := os.ReadDir(budget.Dir()); rerr != nil || len(entries) != 0 {
-		t.Fatalf("oversized capture left staging entries %v (err %v)", entries, rerr)
+	if entries := composeSpoolEntries(t, budget.Dir()); len(entries) != 0 {
+		t.Fatalf("oversized capture left staging entries %v", entries)
 	}
 	if entries := composeTempEntries(t, watched); len(entries) != 0 {
 		t.Fatalf("oversized capture fell back to the bare system temp directory: %v", entries)
@@ -236,8 +254,8 @@ func TestComposeSnapshotCaptureSinkFailureLeavesNoPartialStaging(t *testing.T) {
 	}
 	_ = pr.CloseWithError(io.EOF)
 	<-captureDone
-	if entries, rerr := os.ReadDir(budget.Dir()); rerr != nil || len(entries) != 0 {
-		t.Fatalf("sink failure left staging entries %v (err %v)", entries, rerr)
+	if entries := composeSpoolEntries(t, budget.Dir()); len(entries) != 0 {
+		t.Fatalf("sink failure left staging entries %v", entries)
 	}
 	res.Release()
 	if budget.Used() != 0 {

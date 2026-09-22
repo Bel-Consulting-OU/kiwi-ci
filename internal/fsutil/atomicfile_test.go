@@ -19,22 +19,30 @@ type durableFault struct {
 	// preserve the old bytes (the rename is already visible); the write is
 	// still unacknowledged, which is what the tests assert for it.
 	preRename bool
-	hooks     Hooks
+	// phase is the AtomicWriteError.Phase the failure must report.
+	phase Phase
+	hooks Hooks
 }
 
 func durableFaults() []durableFault {
 	return []durableFault{
-		{"file sync", true, Hooks{FileSync: func(*os.File) error {
+		{"write", true, PhaseWrite, Hooks{Write: func(*os.File, []byte) (int, error) {
+			return 0, errors.New("injected write failure")
+		}}},
+		{"chmod", true, PhaseChmod, Hooks{Chmod: func(string, os.FileMode) error {
+			return errors.New("injected chmod failure")
+		}}},
+		{"file sync", true, PhaseFileSync, Hooks{FileSync: func(*os.File) error {
 			return errors.New("injected file fsync failure")
 		}}},
-		{"close", true, Hooks{FileClose: func(f *os.File) error {
+		{"close", true, PhaseClose, Hooks{FileClose: func(f *os.File) error {
 			_ = RealFileClose(f)
 			return errors.New("injected close failure")
 		}}},
-		{"rename", true, Hooks{Rename: func(string, string) error {
+		{"rename", true, PhaseRename, Hooks{Rename: func(string, string) error {
 			return errors.New("injected rename failure")
 		}}},
-		{"dir sync", false, Hooks{DirSync: func(string) error {
+		{"dir sync", false, PhaseDirSync, Hooks{DirSync: func(string) error {
 			return errors.New("injected directory fsync failure")
 		}}},
 	}
@@ -57,6 +65,144 @@ func assertNoScratch(t *testing.T, dir string, want ...string) {
 			t.Fatalf("scratch entry survived the write: %q", e.Name())
 		}
 	}
+}
+
+// assertPhaseFailure pins the typed contract of one durability-step failure:
+// the error is an *AtomicWriteError naming exactly the failed phase and the
+// destination path, Renamed agrees with the publish boundary, and the phase
+// sentinels classify it for errors.Is.
+func assertPhaseFailure(t *testing.T, err error, path string, wantPhase Phase, wantRenamed bool) {
+	t.Helper()
+	var awe *AtomicWriteError
+	if !errors.As(err, &awe) {
+		t.Fatalf("error %T %v is not an *AtomicWriteError", err, err)
+	}
+	if awe.Phase != wantPhase {
+		t.Fatalf("phase = %q, want %q (error: %v)", awe.Phase, wantPhase, err)
+	}
+	if awe.Renamed != wantRenamed {
+		t.Fatalf("Renamed = %v, want %v (error: %v)", awe.Renamed, wantRenamed, err)
+	}
+	if awe.Path != path {
+		t.Fatalf("Path = %q, want %q", awe.Path, path)
+	}
+	if got := Renamed(err); got != wantRenamed {
+		t.Fatalf("Renamed(err) = %v, want %v", got, wantRenamed)
+	}
+	if got := NotPublished(err); got == wantRenamed {
+		t.Fatalf("NotPublished(err) = %v, want %v", got, !wantRenamed)
+	}
+	if phase, ok := PhaseOf(err); !ok || phase != wantPhase {
+		t.Fatalf("PhaseOf(err) = %q,%v; want %q,true", phase, ok, wantPhase)
+	}
+	if wantRenamed {
+		if !errors.Is(err, ErrPublishedUncertain) {
+			t.Fatalf("post-rename error %v does not match ErrPublishedUncertain", err)
+		}
+		if errors.Is(err, ErrNotPublished) {
+			t.Fatalf("post-rename error %v must not match ErrNotPublished", err)
+		}
+		return
+	}
+	if !errors.Is(err, ErrNotPublished) {
+		t.Fatalf("pre-rename error %v does not match ErrNotPublished", err)
+	}
+	if errors.Is(err, ErrPublishedUncertain) {
+		t.Fatalf("pre-rename error %v must not match ErrPublishedUncertain", err)
+	}
+}
+
+// TestAtomicWriteFilePhaseMatrix drives every phase of the durability
+// sequence through a dedicated failure and pins the explicit state model:
+//
+//   - pre-rename phases (create, write, chmod, file-sync, close, rename):
+//     Renamed=false, ErrNotPublished, the PREVIOUS durable bytes are
+//     bit-for-bit intact, the temp file is gone;
+//   - the post-rename phase (dir-sync): Renamed=true, ErrPublishedUncertain,
+//     the NEW bytes are visible at the destination even though the write is
+//     not acknowledged.
+//
+// Every case then proves a healthy retry publishes the new value.
+func TestAtomicWriteFilePhaseMatrix(t *testing.T) {
+	phases := append(durableFaults(), durableFault{"create", true, PhaseCreate, Hooks{}})
+	for _, fault := range phases {
+		t.Run(fault.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "state.json")
+			if err := AtomicWriteFile(path, []byte("v1"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if fault.phase == PhaseCreate {
+				// The create phase has no hook: a missing destination
+				// directory fails it before any temp file exists.
+				missing := filepath.Join(dir, "missing", "state.json")
+				cerr := AtomicWriteFile(missing, []byte("v2"), 0o600)
+				assertPhaseFailure(t, cerr, missing, PhaseCreate, false)
+				if _, serr := os.Stat(filepath.Join(dir, "missing")); !os.IsNotExist(serr) {
+					t.Fatalf("failed create materialized the destination directory")
+				}
+				return
+			}
+
+			restore := SetHooks(fault.hooks)
+			err = AtomicWriteFile(path, []byte("v2"), 0o600)
+			restore()
+			if err == nil {
+				t.Fatalf("injected %s failure was acknowledged", fault.name)
+			}
+			assertPhaseFailure(t, err, path, fault.phase, !fault.preRename)
+			after, rerr := os.ReadFile(path)
+			if rerr != nil {
+				t.Fatal(rerr)
+			}
+			if fault.preRename {
+				if !bytes.Equal(after, before) {
+					t.Fatalf("previous durable bytes changed after a %s failure: %q, want %q", fault.name, after, before)
+				}
+			} else if string(after) != "v2" {
+				t.Fatalf("post-rename failure %s did not publish the new bytes: %q, want v2", fault.name, after)
+			}
+			assertNoScratch(t, dir, "state.json")
+
+			if err := AtomicWriteFile(path, []byte("v3"), 0o600); err != nil {
+				t.Fatalf("retry after %s failure: %v", fault.name, err)
+			}
+			if b, err := os.ReadFile(path); err != nil || string(b) != "v3" {
+				t.Fatalf("content after retry = %q, %v; want v3", b, err)
+			}
+		})
+	}
+}
+
+// TestAtomicWriteErrorShortWriteIsPreRename pins the short-write guard: a
+// write hook that reports fewer bytes than the payload fails the write with
+// the write phase (definitely not published), never a silently truncated
+// file.
+func TestAtomicWriteErrorShortWriteIsPreRename(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	if err := AtomicWriteFile(path, []byte("v1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restore := SetHooks(Hooks{Write: func(f *os.File, b []byte) (int, error) {
+		n, _ := f.Write(b[:1])
+		return n, nil
+	}})
+	err := AtomicWriteFile(path, []byte("payload"), 0o600)
+	restore()
+	if err == nil {
+		t.Fatal("short write was acknowledged")
+	}
+	assertPhaseFailure(t, err, path, PhaseWrite, false)
+	if b, rerr := os.ReadFile(path); rerr != nil || string(b) != "v1" {
+		t.Fatalf("short write changed the previous file: %q, %v", b, rerr)
+	}
+	assertNoScratch(t, dir, "state.json")
 }
 
 // TestAtomicWriteFileDurableSuccess proves the full sequence on the happy
@@ -180,6 +326,7 @@ func TestAtomicWriteFileFaultsBlockDurability(t *testing.T) {
 			if !strings.Contains(err.Error(), "injected") {
 				t.Fatalf("error %q does not surface the injected failure", err)
 			}
+			assertPhaseFailure(t, err, path, fault.phase, !fault.preRename)
 			if fault.preRename {
 				after, rerr := os.ReadFile(path)
 				if rerr != nil {

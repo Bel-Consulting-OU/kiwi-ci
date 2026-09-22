@@ -557,6 +557,24 @@ func (s *FSClusterKeyStore) Lookup(kind string) ([]byte, bool, error) {
 	}
 }
 
+// Store persists key material for kind with overwrite semantics (the OIDC
+// ring rotation and an explicit runner-CA replacement are the callers).
+//
+// Failures are typed (*fsutil.AtomicWriteError) and phase-aware, because the
+// store holds no in-memory authority to roll back:
+//
+//   - a pre-rename failure means the material was definitely not published:
+//     the previous file at the kind's path is bit-for-bit intact (or absent),
+//     the temp file is removed, and the caller may keep serving the previous
+//     material as if the write had never been attempted.
+//   - a post-rename directory-fsync failure (fsutil.Renamed) means the NEW
+//     material IS visible at the kind's path with uncertified crash
+//     durability. The caller must not treat the new material as "not
+//     installed" and must not overwrite it back to the previous value:
+//     fsutil.Renamed is the signal to retain the published material (it is
+//     what every read of the store now returns) and — on a server path that
+//     owns readiness — to leave the degraded marker armed until a later
+//     successful persist reconciles.
 func (s *FSClusterKeyStore) Store(kind string, data []byte) error {
 	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
 		return err
@@ -618,6 +636,13 @@ func (s *FSClusterKeyStore) Store(kind string, data []byte) error {
 // sidecars derived from the single runner-ca object so legacy consumers
 // (data-dir readers, operator tooling) keep working. Both sidecars are
 // written atomically from the same object.
+//
+// The object file is the authoritative copy: a sidecar failure (either
+// phase) never invalidates it, and a post-rename failure
+// (fsutil.Renamed) leaves that sidecar already visible. The error still
+// propagates so the caller fails closed — a half-published legacy pair is
+// never reported as a successful install — and a retry re-derives both
+// sidecars from the object, which converges because the object did not move.
 func (s *FSClusterKeyStore) publishRunnerCASidecars(obj []byte) error {
 	certPEM, keyPEM, err := splitRunnerCAPEMs(obj)
 	if err != nil {

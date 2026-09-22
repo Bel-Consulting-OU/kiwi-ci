@@ -11,12 +11,25 @@ import "github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
 // (they all require a persistent store or CAS). Callers must nil-check and
 // fail closed.
 //
+// Ownership contract: the budget owns exactly one directory. The persistent
+// constructors and the app wiring build it through staging.NewReplicaBudget,
+// so the directory is the replica's private <configured-root>/<instance-id>
+// (a generated id persisted in the root when none is configured) and not a
+// path other replicas also stage into. The constructor took exclusive
+// ownership of it (owner lock) and reclaimed every spool file left by a dead
+// process, so Used() starts from a truthful zero; the process holds ownership
+// until exit. A second live process that resolves to the same directory fails
+// startup with staging.ErrStagingDirOwned rather than doubling the bound.
+//
 // This accessor is the stable consumption point for the snapshot path:
 // s.StagingBudget().Acquire(ctx, n) / res.Release(), and
 // staging.SpoolFile(s.StagingBudget().Dir(), body, n) for the staged bytes.
 func (s *Server) StagingBudget() *staging.Budget { return s.Staging }
 
 // SetStagingBudget installs the shared staging budget. The app wiring calls
-// it after config.Validate and staging.NewBudget, so an unusable configured
-// bound fails startup instead of the first multi-GB upload.
+// it after config.Validate and staging.NewReplicaBudget, so an unusable
+// configured bound — or a directory owned by another live replica — fails
+// startup instead of the first multi-GB upload. Replacing a budget does not
+// release the previous one's ownership (production replaces only the
+// data-dir default, whose directory stays reserved for this process).
 func (s *Server) SetStagingBudget(b *staging.Budget) { s.Staging = b }

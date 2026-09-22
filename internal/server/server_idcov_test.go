@@ -61,13 +61,13 @@ func (f *idcovFaultStore) ListRuns(ctx context.Context, limit int) ([]model.Run,
 	return f.dbFakeStore.ListRuns(ctx, limit)
 }
 
-// ListRunsPageForAuthorizedRepos carries the injected run-read failure into
-// the authorized paged path the collection handler actually uses.
-func (f *idcovFaultStore) ListRunsPageForAuthorizedRepos(ctx context.Context, allowedRepoIDs []string, afterCreatedAt time.Time, afterID string, limit int) (storage.RunPage, error) {
+// ListRunsPageAuthorized carries the injected run-read failure into the
+// authorized paged path the collection handler actually uses.
+func (f *idcovFaultStore) ListRunsPageAuthorized(ctx context.Context, policy storage.RunAuthzPolicy, afterCreatedAt time.Time, afterID string, limit int) (storage.RunPage, error) {
 	if f.listRunsErr != nil {
 		return storage.RunPage{}, f.listRunsErr
 	}
-	return f.dbFakeStore.ListRunsPageForAuthorizedRepos(ctx, allowedRepoIDs, afterCreatedAt, afterID, limit)
+	return f.dbFakeStore.ListRunsPageAuthorized(ctx, policy, afterCreatedAt, afterID, limit)
 }
 
 // ListRunsPage keeps the injected failure on the legacy unfiltered capability

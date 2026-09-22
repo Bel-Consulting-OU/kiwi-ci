@@ -197,7 +197,7 @@ func TestSnapshotUploadStagingReservationReleasedOnDisconnect(t *testing.T) {
 
 	cancel() // the client disconnects
 	reader.releaseBody()
-	_ = <-done // whatever the dead connection produced, the handler must exit cleanly
+	<-done // whatever the dead connection produced, the handler must exit cleanly
 
 	if got := budget.Used(); got != 0 {
 		t.Fatalf("staging used = %d after disconnect, want 0", got)
@@ -267,36 +267,42 @@ func TestSnapshotUploadStagingDeclaredLengthOverCap(t *testing.T) {
 	}
 }
 
-// TestSnapshotUploadStagingStartupPrune proves the persistent constructors
-// prune abandoned staging files (staging.FilePrefix, older than the package
-// minimum age) before serving, while never touching fresh or foreign files.
+// TestSnapshotUploadStagingStartupPrune proves the persistent constructor
+// reclaims every spool file (staging.FilePrefix) left in the configured
+// staging root before serving — without an age floor, because taking the
+// exclusive directory lock proves no live owner can still be writing them —
+// while never touching foreign files. Runtime Prune is age-based: it removes a
+// stale spool file but keeps a fresh one.
 func TestSnapshotUploadStagingStartupPrune(t *testing.T) {
 	dir := t.TempDir()
-	stagingDir := filepath.Join(dir, "kiwi-staging")
-	if err := os.MkdirAll(stagingDir, 0o700); err != nil {
+	stagingRoot := filepath.Join(dir, "kiwi-staging")
+	if err := os.MkdirAll(stagingRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	abandoned := filepath.Join(stagingDir, staging.FilePrefix+"snapshot-abandoned")
-	if err := os.WriteFile(abandoned, []byte("partial archive from a crashed process"), 0o600); err != nil {
-		t.Fatal(err)
+	staleTime := time.Now().Add(-2 * staging.DefaultPruneMinAge)
+	writeSpool := func(name string, stale bool) string {
+		p := filepath.Join(stagingRoot, name)
+		if err := os.WriteFile(p, []byte("spool"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if stale {
+			if err := os.Chtimes(p, staleTime, staleTime); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return p
 	}
-	old := time.Now().Add(-2 * staging.DefaultPruneMinAge)
-	if err := os.Chtimes(abandoned, old, old); err != nil {
-		t.Fatal(err)
-	}
-	fresh := filepath.Join(stagingDir, staging.FilePrefix+"snapshot-live")
-	if err := os.WriteFile(fresh, []byte("a live upload"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	foreign := filepath.Join(stagingDir, "unrelated-file")
+	abandoned := writeSpool(staging.FilePrefix+"snapshot-abandoned", true)
+	fresh := writeSpool(staging.FilePrefix+"snapshot-live", false)
+	foreign := filepath.Join(stagingRoot, "unrelated-file")
 	if err := os.WriteFile(foreign, []byte("not ours"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	foreignOld := filepath.Join(stagingDir, "unrelated-old-file")
+	foreignOld := filepath.Join(stagingRoot, "unrelated-old-file")
 	if err := os.WriteFile(foreignOld, []byte("not ours either"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chtimes(foreignOld, old, old); err != nil {
+	if err := os.Chtimes(foreignOld, staleTime, staleTime); err != nil {
 		t.Fatal(err)
 	}
 
@@ -304,19 +310,53 @@ func TestSnapshotUploadStagingStartupPrune(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.StagingBudget() == nil {
+	budget := s.StagingBudget()
+	if budget == nil {
 		t.Fatal("persistent server has no staging budget")
 	}
-	if _, err := os.Stat(abandoned); !os.IsNotExist(err) {
-		t.Fatalf("abandoned staging file survived startup prune: %v", err)
+	if budget.Dir() == stagingRoot || !strings.HasPrefix(budget.Dir(), stagingRoot+string(os.PathSeparator)) {
+		t.Fatalf("budget dir %q is not the replica-private subdirectory of %q", budget.Dir(), stagingRoot)
 	}
-	if _, err := os.Stat(fresh); err != nil {
-		t.Fatalf("fresh staging file was pruned: %v", err)
+	// Startup reclaim covers the configured root without an age floor: every
+	// FilePrefix entry there is a pre-contract leftover (no live process spools
+	// bare files into the root), so both the old and the fresh one are removed.
+	for _, gone := range []string{abandoned, fresh} {
+		if _, err := os.Stat(gone); !os.IsNotExist(err) {
+			t.Fatalf("spool file %s survived startup reclaim: %v", filepath.Base(gone), err)
+		}
 	}
 	for _, keep := range []string{foreign, foreignOld} {
 		if _, err := os.Stat(keep); err != nil {
-			t.Fatalf("foreign file %s was pruned: %v", filepath.Base(keep), err)
+			t.Fatalf("foreign file %s was removed: %v", filepath.Base(keep), err)
 		}
+	}
+	// Runtime Prune is age-based, inside the replica-private directory.
+	stale := filepath.Join(budget.Dir(), staging.FilePrefix+"runtime-stale")
+	if err := os.WriteFile(stale, []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(stale, staleTime, staleTime); err != nil {
+		t.Fatal(err)
+	}
+	live := filepath.Join(budget.Dir(), staging.FilePrefix+"runtime-live")
+	if err := os.WriteFile(live, []byte("live"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	foreignInReplica := filepath.Join(budget.Dir(), "foreign.dat")
+	if err := os.WriteFile(foreignInReplica, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := budget.Prune(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale spool file survived Prune: %v", err)
+	}
+	if _, err := os.Stat(live); err != nil {
+		t.Fatalf("fresh spool file was pruned: %v", err)
+	}
+	if _, err := os.Stat(foreignInReplica); err != nil {
+		t.Fatalf("Prune touched a foreign file: %v", err)
 	}
 }
 

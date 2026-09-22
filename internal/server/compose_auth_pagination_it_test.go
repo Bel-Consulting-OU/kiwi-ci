@@ -94,8 +94,8 @@ func TestComposeRotationPairPaginationSharedGrantsPG(t *testing.T) {
 	s := New("admin-tok")
 	s.DB = st
 	path := composeTokenFile(t, t.TempDir(), map[string]auth.Principal{
-		auth.TokenDigest("rot-1"): {Subject: "svc-rotation", Repositories: map[string]auth.RepositoryPermission{"github.com/o/repo-a": {Read: true}}},
-		auth.TokenDigest("rot-2"): {Subject: "svc-rotation", Repositories: map[string]auth.RepositoryPermission{"github.com/o/repo-a": {Read: true}}},
+		auth.TokenDigest("rot-1"): {Subject: "svc-rotation", Repositories: map[string]auth.RepositoryPermission{composeCanonicalKey("github.com", "o/repo-a"): {Read: true}}},
+		auth.TokenDigest("rot-2"): {Subject: "svc-rotation", Repositories: map[string]auth.RepositoryPermission{composeCanonicalKey("github.com", "o/repo-a"): {Read: true}}},
 	})
 	if err := s.AuthStore.Load(path); err != nil {
 		t.Fatalf("rotation pair failed to load: %v", err)
@@ -166,8 +166,8 @@ func TestComposeConflictingSubjectTokenFileFailsClosedPG(t *testing.T) {
 		t.Fatal(err)
 	}
 	conflictPath := composeTokenFile(t, t.TempDir(), map[string]auth.Principal{
-		auth.TokenDigest("conflict-a"): {Subject: "svc-ambiguous", Repositories: map[string]auth.RepositoryPermission{"github.com/o/repo-a": {Read: true}}},
-		auth.TokenDigest("conflict-b"): {Subject: "svc-ambiguous", Repositories: map[string]auth.RepositoryPermission{"github.com/o/repo-b": {Read: true}}},
+		auth.TokenDigest("conflict-a"): {Subject: "svc-ambiguous", Repositories: map[string]auth.RepositoryPermission{composeCanonicalKey("github.com", "o/repo-a"): {Read: true}}},
+		auth.TokenDigest("conflict-b"): {Subject: "svc-ambiguous", Repositories: map[string]auth.RepositoryPermission{composeCanonicalKey("github.com", "o/repo-b"): {Read: true}}},
 	})
 
 	base := time.Now().UTC().Truncate(time.Microsecond)

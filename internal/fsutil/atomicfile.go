@@ -8,10 +8,16 @@
 // server's JSON state writers, the storage layer's snapshots and journals,
 // and the auth token store) can share one implementation of the durability
 // sequence instead of re-deriving it.
+//
+// Failures are typed (see AtomicWriteError): the failing Phase and whether
+// the rename already published the new bytes are explicit, so callers can
+// tell "definitely not published, previous state intact" from "published,
+// crash durability uncertain" instead of inferring it from the error text.
 package fsutil
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -29,12 +35,16 @@ import (
 //  6. rename the temp file over path,
 //  7. fsync the parent directory so the rename itself survives a crash.
 //
-// Any failure before the rename removes the temp file and returns an error;
-// the previous file at path is never touched before the rename, so a failed
-// write leaves the old contents intact. A parent-directory fsync failure is
-// returned AFTER the rename: the new bytes are visible but their durability
-// is not certified, which is why every caller must treat the error as "not
-// acknowledged" (see SyncDir).
+// Every failure is returned as a typed *AtomicWriteError naming the failed
+// Phase and whether the rename had already published the new bytes. A failure
+// before the rename (phases create/write/chmod/file-sync/close/rename) means
+// the new state was definitely not published: the temp file is removed and
+// the previous file at path is bit-for-bit intact, so a caller may roll its
+// mutation back. The only post-rename failure is the parent-directory fsync
+// (PhaseDirSync, Renamed=true): the new bytes are visible at path but their
+// crash durability is not certified, so a caller must NOT treat the previous
+// state as intact and must not roll a security-monotonic mutation back to
+// its permissive value (see ErrPublishedUncertain and Renamed).
 //
 // The destination directory must already exist. This primitive deliberately
 // does not create it: callers that own a data directory create it once at
@@ -42,22 +52,34 @@ import (
 // write into a missing directory is an error rather than an implicit mkdir.
 func AtomicWriteFile(path string, data []byte, mode os.FileMode) error {
 	dir := filepath.Dir(path)
+	h := currentHooks()
 	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
-		return fmt.Errorf("fsutil: create temp file for %s: %w", path, err)
+		return newAtomicWriteError(path, PhaseCreate, fmt.Errorf("create temp file in %s: %w", dir, err))
 	}
 	tmp := f.Name()
-	h := currentHooks()
 
-	if _, err := f.Write(data); err != nil {
-		_ = RealFileClose(f)
-		_ = os.Remove(tmp)
-		return fmt.Errorf("fsutil: write %s: %w", tmp, err)
+	write := h.Write
+	if write == nil {
+		write = func(f *os.File, b []byte) (int, error) { return f.Write(b) }
 	}
-	if err := os.Chmod(tmp, mode); err != nil {
+	n, werr := write(f, data)
+	if werr == nil && n != len(data) {
+		werr = io.ErrShortWrite
+	}
+	if werr != nil {
 		_ = RealFileClose(f)
 		_ = os.Remove(tmp)
-		return fmt.Errorf("fsutil: chmod %s: %w", tmp, err)
+		return newAtomicWriteError(path, PhaseWrite, fmt.Errorf("write %s: %w", tmp, werr))
+	}
+	chmod := h.Chmod
+	if chmod == nil {
+		chmod = os.Chmod
+	}
+	if err := chmod(tmp, mode); err != nil {
+		_ = RealFileClose(f)
+		_ = os.Remove(tmp)
+		return newAtomicWriteError(path, PhaseChmod, fmt.Errorf("chmod %s: %w", tmp, err))
 	}
 	syncFile := RealFileSync
 	if h.FileSync != nil {
@@ -66,7 +88,7 @@ func AtomicWriteFile(path string, data []byte, mode os.FileMode) error {
 	if err := syncFile(f); err != nil {
 		_ = RealFileClose(f)
 		_ = os.Remove(tmp)
-		return fmt.Errorf("fsutil: sync %s: %w", tmp, err)
+		return newAtomicWriteError(path, PhaseFileSync, fmt.Errorf("sync %s: %w", tmp, err))
 	}
 	closeFile := RealFileClose
 	if h.FileClose != nil {
@@ -74,7 +96,7 @@ func AtomicWriteFile(path string, data []byte, mode os.FileMode) error {
 	}
 	if err := closeFile(f); err != nil {
 		_ = os.Remove(tmp)
-		return fmt.Errorf("fsutil: close %s: %w", tmp, err)
+		return newAtomicWriteError(path, PhaseClose, fmt.Errorf("close %s: %w", tmp, err))
 	}
 	rename := RealRename
 	if h.Rename != nil {
@@ -82,9 +104,12 @@ func AtomicWriteFile(path string, data []byte, mode os.FileMode) error {
 	}
 	if err := rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
-		return fmt.Errorf("fsutil: rename %s to %s: %w", tmp, path, err)
+		return newAtomicWriteError(path, PhaseRename, fmt.Errorf("rename %s to %s: %w", tmp, path, err))
 	}
-	return SyncDir(dir)
+	if err := SyncDir(dir); err != nil {
+		return newAtomicWriteError(path, PhaseDirSync, err)
+	}
+	return nil
 }
 
 // SyncDir fsyncs a directory so a rename into it is durable. It is the unix

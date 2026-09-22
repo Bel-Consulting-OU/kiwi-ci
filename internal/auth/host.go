@@ -62,7 +62,14 @@ func CanonicalHost(raw string) string {
 	if strings.HasPrefix(s, "[") {
 		return canonHostPort("", s)
 	}
-	if colon := strings.Index(s, ":"); colon > 0 && !strings.Contains(s[:colon], ":") {
+	// The legacy "host:port"/"host:path" split only applies to a spelling with
+	// EXACTLY ONE colon. Several colons name an UNBRACKETED IPv6 literal
+	// ("2001:db8::1"), which must be treated as one host: splitting it on the
+	// first colon would truncate the literal to "2001" and collapse distinct
+	// forges onto one identity. A literal's canonical form (brackets stripped
+	// by canonHostPort) is therefore stable under re-canonicalization, so an
+	// r1:-serialized IPv6 host round-trips.
+	if colon := strings.Index(s, ":"); colon > 0 && strings.Count(s, ":") == 1 {
 		if _, err := strconv.Atoi(s[colon+1:]); err != nil {
 			// Legacy "host:path" spelling with no scp user and no numeric
 			// port: the colon separates the host from a path, not a port.
@@ -92,11 +99,15 @@ func scpHostColon(s string) int {
 
 // NormalizeRepoKey canonicalizes the forge-host segment of a repository key
 // ("host/owner/name") onto the same canonical host spelling CanonicalRepoID
-// produces, so policy, RBAC and allowlist keys match regardless of host
-// case, one trailing dot or the scheme's default port. A bare "owner/name"
-// key is returned unchanged, and a dotted GitLab group name
-// ("acme.co/service") is never mistaken for a host because the host rule
-// requires an owner/name remainder after it.
+// produces, so policy, RBAC and allowlist keys match regardless of host case,
+// one trailing dot or the scheme's default port. The key is classified by the
+// typed positional rule (ParseStoredRepoID), never by "does the first segment
+// contain a dot": a key with three or more path segments is a canonical
+// identity whose first segment is the host, so a DOTLESS host
+// ("gitlab/acme/widget") is canonicalized exactly like a dotted one. A bare
+// key with fewer segments is returned unchanged, because a bare name is not a
+// canonical identity and has no host to canonicalize. Surrounding whitespace
+// is never canonicalized away.
 func NormalizeRepoKey(key string) string {
 	if key == "" {
 		return ""
@@ -106,15 +117,12 @@ func NormalizeRepoKey(key string) string {
 	if strings.TrimSpace(key) != key {
 		return key
 	}
-	first, rest, ok := splitHostLike(key)
-	if !ok {
+	grant, err := ParseStoredRepoID(key)
+	if err != nil || grant.IsAlias() {
 		return key
 	}
-	host := CanonicalHost(first)
-	if host == "" {
-		return key
-	}
-	return host + "/" + rest
+	id, _ := grant.Identity()
+	return id.ID()
 }
 
 // canonHostPort lowercases hostPort and drops its default port for scheme.
@@ -173,16 +181,4 @@ func isDefaultHostPort(scheme, port string) bool {
 	default:
 		return port == "443" || port == "80" || port == "22"
 	}
-}
-
-// splitHostLike splits "host/rest" when the first segment is host-like
-// (contains a dot) and the remainder itself contains a slash. The remainder
-// rule is what distinguishes a canonical host from a GitLab group whose
-// name contains a dot ("acme.co/service"), mirroring splitCanonicalRepo.
-func splitHostLike(key string) (first, rest string, ok bool) {
-	parts := strings.SplitN(key, "/", 2)
-	if len(parts) != 2 || !strings.Contains(parts[0], ".") || !strings.Contains(parts[1], "/") {
-		return "", "", false
-	}
-	return parts[0], parts[1], true
 }

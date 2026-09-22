@@ -238,12 +238,17 @@ func TestComposeFSCrashReloadClaimAndRevocationNotResurrected(t *testing.T) {
 	}
 }
 
-// TestComposeFSCrashReloadStagingSpoolPrunedAndFreshKept composes the crash
-// boundary with the staging area: a spool file abandoned by the crashed
-// process is reclaimed at startup while a fresh one (a live upload's) is kept,
-// a foreign file is never touched, and the reloaded staging budget accepts a
-// real upload that stages inside the budget directory.
-func TestComposeFSCrashReloadStagingSpoolPrunedAndFreshKept(t *testing.T) {
+// TestComposeFSCrashReloadStagingDeadOwnerSpoolReclaimed composes the crash
+// boundary with the staging area under the single-writer ownership contract:
+// when the first owner is gone (Close releases the lock, exactly what process
+// exit does), every kiwi-stage-* file left in the replica directory is
+// provably a dead owner's and is reclaimed at startup WITHOUT an age floor — a
+// fresh-looking file cannot belong to a live handler because no other live
+// process can hold the directory lock — while a foreign file is never touched
+// and the reloaded ledger starts at zero. Runtime age-based Prune remains for
+// files abandoned by the CURRENT process, and the reloaded budget still
+// accepts a real upload that stages inside the budget directory.
+func TestComposeFSCrashReloadStagingDeadOwnerSpoolReclaimed(t *testing.T) {
 	watched := composeTmpWatcher(t)
 	dir := t.TempDir()
 	s, err := NewPersistent("token", "token", dir)
@@ -254,9 +259,10 @@ func TestComposeFSCrashReloadStagingSpoolPrunedAndFreshKept(t *testing.T) {
 	if budget == nil {
 		t.Fatal("persistent server has no staging budget")
 	}
-	// An abandoned spool file from the crashed process, older than the prune
-	// age, plus a foreign file that must never be touched.
-	abandoned := filepath.Join(budget.Dir(), staging.FilePrefix+"snapshot-abandoned")
+	stagingDir := budget.Dir()
+	// Two spool files a dead owner left behind — one aged, one fresh — plus a
+	// foreign file that must never be touched.
+	abandoned := filepath.Join(stagingDir, staging.FilePrefix+"snapshot-abandoned")
 	if err := os.WriteFile(abandoned, []byte("partial"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -264,35 +270,63 @@ func TestComposeFSCrashReloadStagingSpoolPrunedAndFreshKept(t *testing.T) {
 	if err := os.Chtimes(abandoned, old, old); err != nil {
 		t.Fatal(err)
 	}
-	foreign := filepath.Join(budget.Dir(), "unrelated.dat")
+	freshDeadOwner := filepath.Join(stagingDir, staging.FilePrefix+"snapshot-fresh-dead-owner")
+	if err := os.WriteFile(freshDeadOwner, []byte("fresh"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	foreign := filepath.Join(stagingDir, "unrelated.dat")
 	if err := os.WriteFile(foreign, []byte("keep"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chtimes(foreign, old, old); err != nil {
 		t.Fatal(err)
 	}
-	// A fresh spool file (a live upload's staging) must survive the restart.
-	live := filepath.Join(budget.Dir(), staging.FilePrefix+"snapshot-live")
-	if err := os.WriteFile(live, []byte("live"), 0o600); err != nil {
-		t.Fatal(err)
+	// Crash: release ownership and drop the ledger exactly as process exit
+	// does, then reload from the same data dir. The persisted replica id
+	// resolves the successor to the same replica directory.
+	if err := budget.Close(); err != nil {
+		t.Fatalf("close the crashed owner: %v", err)
 	}
-
 	s2, err := NewPersistent("token", "token", dir)
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
-	if _, err := os.Stat(abandoned); !os.IsNotExist(err) {
-		t.Fatalf("abandoned spool file survived the startup prune: %v", err)
-	}
-	if _, err := os.Stat(live); err != nil {
-		t.Fatalf("fresh spool file was pruned at startup: %v", err)
+	for _, dead := range []string{abandoned, freshDeadOwner} {
+		if _, err := os.Stat(dead); !os.IsNotExist(err) {
+			t.Fatalf("dead owner's spool file %s survived the restart (unaccounted bytes left on disk): %v", filepath.Base(dead), err)
+		}
 	}
 	if _, err := os.Stat(foreign); err != nil {
-		t.Fatalf("startup prune touched a foreign file: %v", err)
+		t.Fatalf("restart reclaim touched a foreign file: %v", err)
 	}
 	b2 := s2.StagingBudget()
-	if b2 == nil || b2.Used() != 0 {
-		t.Fatalf("reloaded staging budget = %v, want a fresh zero ledger", b2)
+	if b2 == nil || b2.Used() != 0 || b2.Dir() != stagingDir {
+		t.Fatalf("reloaded staging budget = %v, want dir %q with a fresh zero ledger", b2, stagingDir)
+	}
+	// Runtime Prune is still age-based for files abandoned by the RUNNING
+	// process: an aged spool file is removed, a fresh one is kept.
+	runtimeAbandoned := filepath.Join(stagingDir, staging.FilePrefix+"runtime-abandoned")
+	if err := os.WriteFile(runtimeAbandoned, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(runtimeAbandoned, old, old); err != nil {
+		t.Fatal(err)
+	}
+	runtimeLive := filepath.Join(stagingDir, staging.FilePrefix+"runtime-live")
+	if err := os.WriteFile(runtimeLive, []byte("live"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := b2.Prune(context.Background()); err != nil || n != 1 {
+		t.Fatalf("runtime Prune = (%d, %v), want (1, nil)", n, err)
+	}
+	if _, err := os.Stat(runtimeAbandoned); !os.IsNotExist(err) {
+		t.Fatalf("runtime Prune kept an aged spool file: %v", err)
+	}
+	if _, err := os.Stat(runtimeLive); err != nil {
+		t.Fatalf("runtime Prune removed a fresh spool file: %v", err)
+	}
+	if err := os.Remove(runtimeLive); err != nil {
+		t.Fatal(err)
 	}
 	// The reloaded budget is usable: a full reservation succeeds and releases.
 	res, err := b2.Acquire(context.Background(), 1024)

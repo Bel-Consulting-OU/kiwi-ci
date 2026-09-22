@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/config"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
@@ -287,6 +288,20 @@ func loadOIDCSigner(root string) (*oidcSigner, error) {
 // write leaves the old ring active everywhere, never a ring only this
 // replica can verify. The caller must hold s.mu. It is internal to this
 // file.
+//
+// The persist outcome is phase-aware because the shared key store returns
+// typed fsutil errors:
+//
+//   - a definitely-not-published failure (fsutil.Renamed false: create,
+//     write, chmod, file fsync, close or rename failed) leaves the previous
+//     ring bit-for-bit intact in the store, so the old ring stays active and
+//     readiness is untouched;
+//   - a published-but-uncertain failure (fsutil.Renamed: only the parent
+//     directory fsync failed, after the rename) means the store's reads now
+//     return the NEW ring. Rolling back to the old ring would make this
+//     replica disagree with every peer and with the next read, so the new
+//     ring is retained in memory and the shared degraded marker is armed
+//     until a later successful persist reconciles it.
 func (s *Server) rotateOIDCKeyLocked(now time.Time) {
 	if s.oidc == nil {
 		s.oidc = newOIDCSigner()
@@ -312,10 +327,22 @@ func (s *Server) rotateOIDCKeyLocked(now time.Time) {
 		RetireAfter: now.Add(oidcPreviousKeyRetireAfter),
 	})
 	if err := persistOIDCKeyRing(next); err != nil {
+		if fsutil.Renamed(err) {
+			// The rename succeeded: the new ring is what the shared store now
+			// serves. Retain it in memory and leave readiness degraded until a
+			// successful persist proves durability.
+			s.oidc = next
+			s.noteFilePersistResult(err)
+			s.logError("oidc: key rotation published but not durably certified; retaining new ring and arming degraded readiness", "error", err.Error())
+			return
+		}
 		s.logError("oidc: key rotation not persisted; keeping current ring active", "error", err.Error())
 		return
 	}
 	s.oidc = next
+	// A successful persist reconciles any earlier published-but-uncertain
+	// rotation (the shared marker is coarser by design).
+	s.noteFilePersistResult(nil)
 }
 
 // clusterKeyRotationFencer returns the cross-replica rotation fence for the

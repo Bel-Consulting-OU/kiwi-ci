@@ -465,7 +465,7 @@ func TestComposeCancelLeavesDigestAbsentAndBudgetBaseline(t *testing.T) {
 	}()
 	<-blocking.started
 	cancel()
-	_ = <-done
+	<-done
 
 	if _, _, err := s.CAS.Open(context.Background(), digest); err == nil {
 		t.Fatal("cancelled publication stored an object")

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
@@ -18,11 +19,114 @@ func authzPageRun(id string, at time.Time, repoID string) model.Run {
 	return model.Run{ID: id, Status: model.StatusSuccess, CreatedAt: at, PolicyRepoID: repoID}
 }
 
-// TestPageRunsForAuthorizedReposFiltersBeforePaging pins the memory half of
-// the authorized page contract: the permitted repository set is applied
-// BEFORE the page boundary, so an invisible run can never occupy a page slot,
-// decide HasMore, or become the NextCreatedAt/NextID position.
-func TestPageRunsForAuthorizedReposFiltersBeforePaging(t *testing.T) {
+// authzPolicyFor builds the normalized policy of a repository-scoped reader
+// from raw grant spellings, exactly as the server does from a request
+// principal.
+func authzPolicyFor(grants map[string]auth.RepositoryPermission, roles ...auth.Role) RunAuthzPolicy {
+	p := auth.Principal{Subject: "reader", Roles: roles, Repositories: grants}
+	return RunAuthzPolicyForPrincipal(&p)
+}
+
+// TestRunAuthzPolicyGrantMatrix pins the normalized visibility predicate for
+// the full grant matrix: unrestricted global read, exact canonical grants,
+// explicit bare aliases, explicit deny overrides and conflict fail-closed —
+// each candidate resolved with the same typed positional rule as
+// auth.CanReadRepo.
+func TestRunAuthzPolicyGrantMatrix(t *testing.T) {
+	const (
+		ghRepoA = "github.com/o/repo-a"
+		ghRepoB = "github.com/o/repo-b"
+		glRepoA = "gitlab.com/o/repo-a"
+		bareA   = "o/repo-a"
+	)
+	cases := []struct {
+		name   string
+		policy RunAuthzPolicy
+		want   map[string]bool
+	}{
+		{
+			name:   "nil principal is unrestricted",
+			policy: RunAuthzPolicyForPrincipal(nil),
+			want:   map[string]bool{ghRepoA: true, ghRepoB: true, glRepoA: true, bareA: true, "": true},
+		},
+		{
+			name:   "admin is unrestricted",
+			policy: authzPolicyFor(nil, auth.RoleAdmin),
+			want:   map[string]bool{ghRepoA: true, ghRepoB: true, glRepoA: true, "": true},
+		},
+		{
+			name:   "global read with no entries is unrestricted",
+			policy: authzPolicyFor(nil, auth.RoleRead),
+			want:   map[string]bool{ghRepoA: true, ghRepoB: true, "": true},
+		},
+		{
+			name:   "exact canonical grant",
+			policy: authzPolicyFor(map[string]auth.RepositoryPermission{ghRepoA: {Read: true}}),
+			want:   map[string]bool{ghRepoA: true, ghRepoB: false, glRepoA: false, bareA: false, "": false},
+		},
+		{
+			name:   "bare alias is host-agnostic and authorizes its own bare name",
+			policy: authzPolicyFor(map[string]auth.RepositoryPermission{bareA: {Read: true}}),
+			want:   map[string]bool{ghRepoA: true, glRepoA: true, ghRepoB: false, bareA: true, "": false},
+		},
+		{
+			name:   "host case canonicalizes",
+			policy: authzPolicyFor(map[string]auth.RepositoryPermission{"GitHub.com/o/repo-a": {Read: true}}),
+			want:   map[string]bool{ghRepoA: true, ghRepoB: false, glRepoA: false},
+		},
+		{
+			name:   "default port canonicalizes",
+			policy: authzPolicyFor(map[string]auth.RepositoryPermission{"github.com:443/o/repo-a": {Read: true}}),
+			want:   map[string]bool{ghRepoA: true, ghRepoB: false},
+		},
+		{
+			name:   "trailing dot canonicalizes",
+			policy: authzPolicyFor(map[string]auth.RepositoryPermission{"github.com./o/repo-a": {Read: true}}),
+			want:   map[string]bool{ghRepoA: true, ghRepoB: false},
+		},
+		{
+			name:   "global read with an explicit deny overrides",
+			policy: authzPolicyFor(map[string]auth.RepositoryPermission{ghRepoB: {Read: false}}, auth.RoleRead),
+			want:   map[string]bool{ghRepoA: true, glRepoA: true, ghRepoB: false, "": true},
+		},
+		{
+			name: "canonical read with a bare read for another name",
+			policy: authzPolicyFor(map[string]auth.RepositoryPermission{
+				ghRepoB: {Read: true},
+				bareA:   {Read: true},
+			}),
+			want: map[string]bool{ghRepoB: true, glRepoA: true, ghRepoA: true, "": false},
+		},
+		{
+			name: "conflicting equivalent canonical entries fail closed",
+			policy: authzPolicyFor(map[string]auth.RepositoryPermission{
+				ghRepoB:               {Read: true},
+				"GitHub.com/o/repo-b": {Read: true, Run: true},
+			}),
+			want: map[string]bool{ghRepoB: false, ghRepoA: false, "": false},
+		},
+		{
+			name:   "grant on a repository with no runs authorizes nothing",
+			policy: authzPolicyFor(map[string]auth.RepositoryPermission{"o/repo-z": {Read: true}}),
+			want:   map[string]bool{ghRepoA: false, ghRepoB: false, "": false},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for candidate, want := range tc.want {
+				if got := tc.policy.Allows(candidate); got != want {
+					t.Fatalf("Allows(%q) = %v, want %v", candidate, got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestPageRunsAuthorizedFiltersBeforePaging pins the memory half of the
+// authorized page contract: the policy is applied BEFORE the page boundary,
+// so an invisible run can never occupy a page slot, decide HasMore, or become
+// the NextCreatedAt/NextID position.
+func TestPageRunsAuthorizedFiltersBeforePaging(t *testing.T) {
 	const (
 		repoA = "github.com/o/repo-a"
 		repoB = "github.com/o/repo-b"
@@ -37,10 +141,10 @@ func TestPageRunsForAuthorizedReposFiltersBeforePaging(t *testing.T) {
 		authzPageRun("a3", base.Add(4*time.Second), repoA),
 		authzPageRun("b3", base.Add(5*time.Second), repoB),
 	}
-	allowedA := []string{repoA}
+	allowedA := authzPolicyFor(map[string]auth.RepositoryPermission{repoA: {Read: true}})
 
 	// First page: only A runs newest-first, boundary on the last visible run.
-	page1 := PageRunsForAuthorizedRepos(runs, allowedA, time.Time{}, "", 2)
+	page1 := PageRunsAuthorized(runs, allowedA, time.Time{}, "", 2)
 	if got := strings.Join(runsPageIDs(page1), ","); got != "a3,a2" {
 		t.Fatalf("page1 = %s, want the newest two A runs", got)
 	}
@@ -51,7 +155,7 @@ func TestPageRunsForAuthorizedReposFiltersBeforePaging(t *testing.T) {
 	// Continuation reaches the older A run and terminates on the authorized
 	// set: b1 exists strictly older than a1 but is invisible, so HasMore must
 	// be false and no cursor may be emitted.
-	page2 := PageRunsForAuthorizedRepos(runs, allowedA, page1.NextCreatedAt, page1.NextID, 2)
+	page2 := PageRunsAuthorized(runs, allowedA, page1.NextCreatedAt, page1.NextID, 2)
 	if got := strings.Join(runsPageIDs(page2), ","); got != "a1" {
 		t.Fatalf("page2 = %s, want a1", got)
 	}
@@ -61,7 +165,7 @@ func TestPageRunsForAuthorizedReposFiltersBeforePaging(t *testing.T) {
 
 	// An invisible row at the cursor instant is simply absent; the visible
 	// rows newer than the cursor still page normally.
-	pageAfterB2 := PageRunsForAuthorizedRepos(runs, allowedA, base.Add(2*time.Second), "b2", 10)
+	pageAfterB2 := PageRunsAuthorized(runs, allowedA, base.Add(2*time.Second), "b2", 10)
 	if got := strings.Join(runsPageIDs(pageAfterB2), ","); got != "a1" {
 		t.Fatalf("page after b2 = %s, want only a1", got)
 	}
@@ -69,8 +173,8 @@ func TestPageRunsForAuthorizedReposFiltersBeforePaging(t *testing.T) {
 		t.Fatalf("page after b2 = HasMore %v next %q, want terminal and no B-derived cursor", pageAfterB2.HasMore, pageAfterB2.NextID)
 	}
 
-	// nil means unrestricted: the same definition as PageRuns.
-	unrestricted := PageRunsForAuthorizedRepos(runs, nil, time.Time{}, "", 3)
+	// The unrestricted policy is the same definition as PageRuns.
+	unrestricted := PageRunsAuthorized(runs, RunAuthzPolicyForPrincipal(nil), time.Time{}, "", 3)
 	if got := strings.Join(runsPageIDs(unrestricted), ","); got != "b3,a3,a2" {
 		t.Fatalf("unrestricted page = %s, want the global newest three", got)
 	}
@@ -78,17 +182,19 @@ func TestPageRunsForAuthorizedReposFiltersBeforePaging(t *testing.T) {
 		t.Fatalf("unrestricted boundary = HasMore %v next %q", unrestricted.HasMore, unrestricted.NextID)
 	}
 
-	// An exact empty allowlist matches nothing and is terminal: no rows, no
-	// cursor, and HasMore cannot be inferred from the global collection.
-	empty := PageRunsForAuthorizedRepos(runs, []string{}, time.Time{}, "", 10)
+	// A policy with no permitted repository matches nothing and is terminal:
+	// no rows, no cursor, and HasMore cannot be inferred from the global
+	// collection.
+	emptyPolicy := authzPolicyFor(map[string]auth.RepositoryPermission{"o/repo-z": {Read: true}})
+	empty := PageRunsAuthorized(runs, emptyPolicy, time.Time{}, "", 10)
 	if len(empty.Runs) != 0 || empty.HasMore || empty.NextID != "" || !empty.NextCreatedAt.IsZero() {
-		t.Fatalf("empty allowlist = %d runs HasMore %v next (%v,%q), want terminal empty page", len(empty.Runs), empty.HasMore, empty.NextCreatedAt, empty.NextID)
+		t.Fatalf("empty policy = %d runs HasMore %v next (%v,%q), want terminal empty page", len(empty.Runs), empty.HasMore, empty.NextCreatedAt, empty.NextID)
 	}
 
 	// A cursor positioned by the last visible run never returns an invisible
 	// newer row, even though one exists between the cursor and the visible
 	// tail.
-	pageFromA3 := PageRunsForAuthorizedRepos(runs, allowedA, base.Add(4*time.Second), "a3", 10)
+	pageFromA3 := PageRunsAuthorized(runs, allowedA, base.Add(4*time.Second), "a3", 10)
 	if got := strings.Join(runsPageIDs(pageFromA3), ","); got != "a2,a1" {
 		t.Fatalf("page after a3 = %s, want a2,a1 only", got)
 	}
@@ -97,12 +203,12 @@ func TestPageRunsForAuthorizedReposFiltersBeforePaging(t *testing.T) {
 	}
 }
 
-// TestPageRunsForAuthorizedReposUsesPolicyIdentity pins that the filter uses
-// the same canonical policy-first identity as the per-run read routes: a run
-// whose POLICY identity is B is excluded from an A allowlist even when its
-// checkout URL names A, and a legacy run (no stored identity) derives its
-// identity from the clone URL + full name.
-func TestPageRunsForAuthorizedReposUsesPolicyIdentity(t *testing.T) {
+// TestPageRunsAuthorizedUsesPolicyIdentity pins that the filter uses the same
+// canonical policy-first identity as the per-run read routes: a run whose
+// POLICY identity is B is excluded from an A grant even when its checkout URL
+// names A, and a legacy run (no stored identity) derives its identity from
+// the clone URL + full name.
+func TestPageRunsAuthorizedUsesPolicyIdentity(t *testing.T) {
 	base := time.Date(2026, 4, 2, 0, 0, 0, 0, time.UTC)
 	forkRun := model.Run{
 		ID: "fork", Status: model.StatusSuccess, CreatedAt: base.Add(time.Second),
@@ -114,10 +220,8 @@ func TestPageRunsForAuthorizedReposUsesPolicyIdentity(t *testing.T) {
 		ID: "legacy", Status: model.StatusSuccess, CreatedAt: base.Add(2 * time.Second),
 		Repo: "https://github.com/o/repo-a.git", RepoFullName: "o/repo-a",
 	}
-	page := PageRunsForAuthorizedRepos(
-		[]model.Run{forkRun, legacyRun},
-		[]string{"github.com/o/repo-a"}, time.Time{}, "", 10,
-	)
+	policy := authzPolicyFor(map[string]auth.RepositoryPermission{"github.com/o/repo-a": {Read: true}})
+	page := PageRunsAuthorized([]model.Run{forkRun, legacyRun}, policy, time.Time{}, "", 10)
 	if got := strings.Join(runsPageIDs(page), ","); got != "legacy" {
 		t.Fatalf("page = %s, want only the legacy repo-a run (policy identity decides)", got)
 	}
@@ -126,7 +230,7 @@ func TestPageRunsForAuthorizedReposUsesPolicyIdentity(t *testing.T) {
 // TestAuthorizedPageMemoryParity pins that memStore's authorized page is the
 // same definition as the exported helper (and therefore the same contract the
 // SQL store implements): identical ids, HasMore and next positions across a
-// full walk and an empty allowlist.
+// full walk and an empty policy.
 func TestAuthorizedPageMemoryParity(t *testing.T) {
 	const (
 		repoA = "github.com/o/repo-a"
@@ -143,15 +247,15 @@ func TestAuthorizedPageMemoryParity(t *testing.T) {
 	}
 	m := runsPageMemoryStore(t, runs)
 	ctx := context.Background()
-	allowed := []string{repoA}
+	policy := authzPolicyFor(map[string]auth.RepositoryPermission{repoA: {Read: true}})
 
 	afterAt, afterID := time.Time{}, ""
 	for page := 0; ; page++ {
 		if page > len(runs)+2 {
 			t.Fatal("walk did not terminate")
 		}
-		want := PageRunsForAuthorizedRepos(runs, allowed, afterAt, afterID, 3)
-		got, err := m.ListRunsPageForAuthorizedRepos(ctx, allowed, afterAt, afterID, 3)
+		want := PageRunsAuthorized(runs, policy, afterAt, afterID, 3)
+		got, err := m.ListRunsPageAuthorized(ctx, policy, afterAt, afterID, 3)
 		if err != nil {
 			t.Fatalf("page %d: %v", page, err)
 		}
@@ -166,46 +270,56 @@ func TestAuthorizedPageMemoryParity(t *testing.T) {
 		afterAt, afterID = got.NextCreatedAt, got.NextID
 	}
 
-	empty, err := m.ListRunsPageForAuthorizedRepos(ctx, []string{}, time.Time{}, "", 5)
+	emptyPolicy := authzPolicyFor(map[string]auth.RepositoryPermission{"o/repo-z": {Read: true}})
+	empty, err := m.ListRunsPageAuthorized(ctx, emptyPolicy, time.Time{}, "", 5)
 	if err != nil {
-		t.Fatalf("empty allowlist: %v", err)
+		t.Fatalf("empty policy: %v", err)
 	}
 	if len(empty.Runs) != 0 || empty.HasMore || empty.NextID != "" {
-		t.Fatalf("empty allowlist = %d runs HasMore %v next %q, want terminal empty page", len(empty.Runs), empty.HasMore, empty.NextID)
+		t.Fatalf("empty policy = %d runs HasMore %v next %q, want terminal empty page", len(empty.Runs), empty.HasMore, empty.NextID)
 	}
 }
 
-// TestListRunRepoIDs pins the candidate enumeration used to resolve the
-// authorized repository set: distinct canonical policy-first identities,
-// ascending, including the derived identity of legacy rows and the empty
-// identity of unresolvable rows (the caller decides visibility through the
-// repository-grant resolution).
-func TestListRunRepoIDs(t *testing.T) {
-	base := time.Date(2026, 4, 4, 0, 0, 0, 0, time.UTC)
-	m := runsPageMemoryStore(t, []model.Run{
-		authzPageRun("r1", base.Add(time.Second), "github.com/o/repo-b"),
-		authzPageRun("r2", base.Add(2*time.Second), "github.com/o/repo-a"),
-		authzPageRun("r3", base.Add(3*time.Second), "github.com/o/repo-b"),
-		{ID: "legacy", Status: model.StatusSuccess, CreatedAt: base.Add(4 * time.Second), Repo: "https://github.com/o/repo-a.git", RepoFullName: "o/repo-a"},
-		{ID: "hostless", Status: model.StatusSuccess, CreatedAt: base.Add(5 * time.Second), RepoFullName: "o/repo-c"},
-		{ID: "none", Status: model.StatusSuccess, CreatedAt: base.Add(6 * time.Second)},
-	})
-	got, err := m.ListRunRepoIDs(context.Background())
-	if err != nil {
-		t.Fatalf("ListRunRepoIDs: %v", err)
+// TestRunAuthzPolicyCanonicalizesLegacyHostCandidates pins that a canonical
+// grant matches a legacy candidate whose persisted/derived host is spelled
+// with different case, a trailing dot, the scheme's default port or a
+// bracketed IPv6 literal — exactly the normalization auth.CanReadRepo applied
+// to the candidate before the policy was pushed into SQL.
+func TestRunAuthzPolicyCanonicalizesLegacyHostCandidates(t *testing.T) {
+	policy := authzPolicyFor(map[string]auth.RepositoryPermission{"github.com/o/repo-a": {Read: true}})
+	for _, candidate := range []string{
+		"github.com/o/repo-a",
+		"GitHub.com/o/repo-a",
+		"github.com./o/repo-a",
+		"github.com:443/o/repo-a",
+	} {
+		if !policy.Allows(candidate) {
+			t.Fatalf("Allows(%q) = false, want the canonical grant to match", candidate)
+		}
 	}
-	want := []string{"", "github.com/o/repo-a", "github.com/o/repo-b", "o/repo-c"}
-	if strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Fatalf("ListRunRepoIDs = %q, want %q", got, want)
+	for _, candidate := range []string{"gitlab.com/o/repo-a", "github.com:8443/o/repo-a", "github.com/o/repo-b"} {
+		if policy.Allows(candidate) {
+			t.Fatalf("Allows(%q) = true, want denied", candidate)
+		}
+	}
+
+	// A bracketed IPv6 host canonicalizes on both sides: brackets and a
+	// default port are dropped, a non-default port is kept.
+	bracket := authzPolicyFor(map[string]auth.RepositoryPermission{"[::1]:8443/o/repo-a": {Read: true}})
+	if !bracket.Allows("[::1]:8443/o/repo-a") {
+		t.Fatal("bracketed identity did not match its own grant")
+	}
+	if bracket.Allows("[::1]/o/repo-a") || bracket.Allows("[::1]:443/o/repo-a") {
+		t.Fatal("a different bracketed identity was authorized")
 	}
 }
 
-// TestAuthorizedPageFaultyStoreDelegation proves FaultyStore delegates both
-// new capabilities without consuming the mutation-fault counter, and fails
-// closed with a diagnosable capability error when Inner lacks them.
+// TestAuthorizedPageFaultyStoreDelegation proves FaultyStore delegates the
+// authorized page capability without consuming the mutation-fault counter,
+// and fails closed with a diagnosable capability error when Inner lacks it.
 func TestAuthorizedPageFaultyStoreDelegation(t *testing.T) {
 	base := time.Date(2026, 4, 5, 0, 0, 0, 0, time.UTC)
-	allowed := []string{"github.com/o/repo-a"}
+	policy := authzPolicyFor(map[string]auth.RepositoryPermission{"github.com/o/repo-a": {Read: true}})
 	m := runsPageMemoryStore(t, []model.Run{
 		authzPageRun("b", base.Add(time.Second), "github.com/o/repo-b"),
 		authzPageRun("a", base.Add(2*time.Second), "github.com/o/repo-a"),
@@ -213,29 +327,19 @@ func TestAuthorizedPageFaultyStoreDelegation(t *testing.T) {
 	fault := &FaultyStore{Inner: m, FailAfter: 1, Err: errors.New("write fault")}
 	ctx := context.Background()
 
-	page, err := fault.ListRunsPageForAuthorizedRepos(ctx, allowed, time.Time{}, "", 5)
+	page, err := fault.ListRunsPageAuthorized(ctx, policy, time.Time{}, "", 5)
 	if err != nil {
-		t.Fatalf("ListRunsPageForAuthorizedRepos through FaultyStore: %v", err)
+		t.Fatalf("ListRunsPageAuthorized through FaultyStore: %v", err)
 	}
 	if got := strings.Join(runsPageIDs(page), ","); got != "a" {
 		t.Fatalf("delegated page = %s, want only a", got)
-	}
-	ids, err := fault.ListRunRepoIDs(ctx)
-	if err != nil {
-		t.Fatalf("ListRunRepoIDs through FaultyStore: %v", err)
-	}
-	if strings.Join(ids, ",") != "github.com/o/repo-a,github.com/o/repo-b" {
-		t.Fatalf("delegated ids = %q", ids)
 	}
 	if fault.Mutations() != 0 {
 		t.Fatalf("authorized page reads consumed %d write fault(s)", fault.Mutations())
 	}
 
 	missing := &FaultyStore{Inner: storeOnlyInner{}}
-	if _, err := missing.ListRunsPageForAuthorizedRepos(ctx, allowed, time.Time{}, "", 5); err == nil || !strings.Contains(err.Error(), "RunPageForPrincipalStore") {
-		t.Fatalf("missing inner capability = %v, want RunPageForPrincipalStore error", err)
-	}
-	if _, err := missing.ListRunRepoIDs(ctx); err == nil || !strings.Contains(err.Error(), "RunRepoIDStore") {
-		t.Fatalf("missing inner capability = %v, want RunRepoIDStore error", err)
+	if _, err := missing.ListRunsPageAuthorized(ctx, policy, time.Time{}, "", 5); err == nil || !strings.Contains(err.Error(), "RunPageAuthorizedStore") {
+		t.Fatalf("missing inner capability = %v, want RunPageAuthorizedStore error", err)
 	}
 }

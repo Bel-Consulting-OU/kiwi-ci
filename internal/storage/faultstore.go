@@ -178,8 +178,7 @@ var (
 	_ OutboxClaimBatchStore          = (*FaultyStore)(nil)
 	_ LeaderFenceStore               = (*FaultyStore)(nil)
 	_ RunPageStore                   = (*FaultyStore)(nil)
-	_ RunPageForPrincipalStore       = (*FaultyStore)(nil)
-	_ RunRepoIDStore                 = (*FaultyStore)(nil)
+	_ RunPageAuthorizedStore         = (*FaultyStore)(nil)
 	_ RunnerProfileLinkStore         = (*FaultyStore)(nil)
 	_ LiveProfileResolver            = (*FaultyStore)(nil)
 )
@@ -224,29 +223,16 @@ func (f *FaultyStore) ListRunsPage(ctx context.Context, afterCreatedAt time.Time
 	return inner.ListRunsPage(ctx, afterCreatedAt, afterID, limit)
 }
 
-// ListRunsPageForAuthorizedRepos delegates the authorized keyset-paged run
-// read to Inner when it implements RunPageForPrincipalStore, and fails
-// closed with a diagnosable capability error otherwise. Like ListRunsPage it
-// is a READ: the FailAfter mutation counter is never consumed.
-func (f *FaultyStore) ListRunsPageForAuthorizedRepos(ctx context.Context, allowedRepoIDs []string, afterCreatedAt time.Time, afterID string, limit int) (RunPage, error) {
-	inner, ok := f.Inner.(RunPageForPrincipalStore)
+// ListRunsPageAuthorized delegates the authorized keyset-paged run read to
+// Inner when it implements RunPageAuthorizedStore, and fails closed with a
+// diagnosable capability error otherwise. Like ListRunsPage it is a READ: the
+// FailAfter mutation counter is never consumed.
+func (f *FaultyStore) ListRunsPageAuthorized(ctx context.Context, policy RunAuthzPolicy, afterCreatedAt time.Time, afterID string, limit int) (RunPage, error) {
+	inner, ok := f.Inner.(RunPageAuthorizedStore)
 	if !ok {
-		return RunPage{}, errMissingInnerInterface("RunPageForPrincipalStore")
+		return RunPage{}, errMissingInnerInterface("RunPageAuthorizedStore")
 	}
-	return inner.ListRunsPageForAuthorizedRepos(ctx, allowedRepoIDs, afterCreatedAt, afterID, limit)
-}
-
-// ListRunRepoIDs delegates the candidate repository enumeration to Inner when
-// it implements RunRepoIDStore, and fails closed with a diagnosable
-// capability error otherwise (a store that cannot enumerate candidates cannot
-// resolve an exact authorized repository set, so the collection must not be
-// served from it).
-func (f *FaultyStore) ListRunRepoIDs(ctx context.Context) ([]string, error) {
-	inner, ok := f.Inner.(RunRepoIDStore)
-	if !ok {
-		return nil, errMissingInnerInterface("RunRepoIDStore")
-	}
-	return inner.ListRunRepoIDs(ctx)
+	return inner.ListRunsPageAuthorized(ctx, policy, afterCreatedAt, afterID, limit)
 }
 
 func (f *FaultyStore) InsertJob(ctx context.Context, job model.Job) error {
@@ -1915,8 +1901,7 @@ var (
 	_ RecoveryScanStore              = (*memStore)(nil)
 	_ OutboxClaimBatchStore          = (*memStore)(nil)
 	_ RunPageStore                   = (*memStore)(nil)
-	_ RunPageForPrincipalStore       = (*memStore)(nil)
-	_ RunRepoIDStore                 = (*memStore)(nil)
+	_ RunPageAuthorizedStore         = (*memStore)(nil)
 )
 
 func (m *memStore) Close() error { return nil }
@@ -1981,41 +1966,19 @@ func (m *memStore) ListRunsPage(ctx context.Context, afterCreatedAt time.Time, a
 	return PageRuns(runs, afterCreatedAt, afterID, limit), nil
 }
 
-// ListRunsPageForAuthorizedRepos mirrors the SQL authorized keyset page (see
-// RunPageForPrincipalStore): the run's canonical policy repository identity
-// is filtered BEFORE the page boundary, through the shared
-// PageRunsForAuthorizedRepos definition, so memory and SQL pages cannot
-// drift. The run map under m.mu is a complete view, so paging is
-// deterministic.
-func (m *memStore) ListRunsPageForAuthorizedRepos(ctx context.Context, allowedRepoIDs []string, afterCreatedAt time.Time, afterID string, limit int) (RunPage, error) {
+// ListRunsPageAuthorized mirrors the SQL authorized keyset page (see
+// RunPageAuthorizedStore): the run's canonical policy repository identity is
+// filtered through the shared RunAuthzPolicy BEFORE the page boundary, via
+// PageRunsAuthorized, so memory and SQL pages cannot drift. The run map under
+// m.mu is a complete view, so paging is deterministic.
+func (m *memStore) ListRunsPageAuthorized(ctx context.Context, policy RunAuthzPolicy, afterCreatedAt time.Time, afterID string, limit int) (RunPage, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	runs := make([]model.Run, 0, len(m.runs))
 	for _, r := range m.runs {
 		runs = append(runs, r)
 	}
-	return PageRunsForAuthorizedRepos(runs, allowedRepoIDs, afterCreatedAt, afterID, limit), nil
-}
-
-// ListRunRepoIDs implements RunRepoIDStore for the in-memory store: the
-// distinct canonical policy repository identities (RepoIDForRun, the same
-// derivation the server and SQL page predicate use) ascending. Candidate
-// discovery only.
-func (m *memStore) ListRunRepoIDs(ctx context.Context) ([]string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	seen := make(map[string]struct{}, len(m.runs))
-	out := make([]string, 0, len(m.runs))
-	for _, r := range m.runs {
-		id := RepoIDForRun(r)
-		if _, ok := seen[id]; ok {
-			continue
-		}
-		seen[id] = struct{}{}
-		out = append(out, id)
-	}
-	sort.Strings(out)
-	return out, nil
+	return PageRunsAuthorized(runs, policy, afterCreatedAt, afterID, limit), nil
 }
 
 func (m *memStore) InsertJob(ctx context.Context, job model.Job) error {

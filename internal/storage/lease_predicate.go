@@ -3,9 +3,9 @@ package storage
 import (
 	"encoding/json"
 	"net/url"
-	"strconv"
 	"strings"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
@@ -99,22 +99,69 @@ func ResolveRunnerProfile(r model.Runner, profile model.RunnerProfile, linked bo
 	return r
 }
 
-// RepoAllowed reports whether the job's canonical repository identity (or,
-// as an explicitly configured alias, its bare full name) is inside the
-// allowlist. An empty allowlist imposes no restriction. The canonical
-// identity is read from the job's immutable RepoID, falling back to the
-// RepoURL + RepoFullName derivation for legacy payloads.
+// RepoAllowed reports whether the job's repository is inside the runner's
+// allowlist. An empty allowlist imposes no restriction. Both sides are parsed
+// into typed values with the documented positional rule
+// (auth.ParseStoredRepoID): an allowlist entry is a canonical identity when
+// its first segment is the host (three or more path segments, dotted OR
+// dotless) and a bare alias otherwise, and a job's identity is its canonical
+// repository ID (RepoIDForJob) with the bare full name as a legacy alias.
+//
+// Matching is deliberately narrower than byte equality on the two strings:
+//
+//   - a canonical entry matches the SAME canonical identity (canonically
+//     equivalent host spellings included);
+//   - a bare entry matches the same bare full name, and falls back to a
+//     canonical job identity with that full name (a bare alias addresses
+//     every forge presenting the name);
+//   - a canonical entry NEVER matches a job whose identity is a different
+//     forge, and never matches a bare full name by string equality. The
+//     legacy "entry == RepoFullName" comparison is gone: an allowlist entry
+//     for dotless host "gitlab" plus full name "acme/widget" can no longer
+//     admit a job on another forge that merely presents the same nested
+//     name.
+//
+// An entry that cannot be parsed fails closed (it matches nothing).
 func RepoAllowed(allowed []string, j model.Job) bool {
 	if len(allowed) == 0 {
 		return true
 	}
-	canon := RepoIDForJob(j)
+	jobGrant, err := auth.ParseStoredRepoID(RepoIDForJob(j))
+	if err != nil {
+		return false
+	}
 	for _, a := range allowed {
-		if a == canon || (j.RepoFullName != "" && a == j.RepoFullName) {
+		entry, err := auth.ParseStoredRepoID(a)
+		if err != nil {
+			continue
+		}
+		if repoEntryMatchesJob(entry, jobGrant) {
 			return true
 		}
 	}
 	return false
+}
+
+// repoEntryMatchesJob is the typed allowlist membership test.
+func repoEntryMatchesJob(entry, job auth.RepoGrant) bool {
+	switch {
+	case entry.IsIdentity() && job.IsIdentity():
+		e, _ := entry.Identity()
+		j, _ := job.Identity()
+		return e.Host == j.Host && e.FullName == j.FullName
+	case entry.IsIdentity():
+		// A canonical entry never matches a host-less job alias: the job's
+		// host is unknown, so no canonical identity is known to match.
+		return false
+	case job.IsIdentity():
+		e, _ := entry.Alias()
+		j, _ := job.Identity()
+		return e.FullName == j.FullName
+	default:
+		e, _ := entry.Alias()
+		j, _ := job.Alias()
+		return e.FullName == j.FullName
+	}
 }
 
 // RepoIDFor resolves the canonical repository identity from an optional
@@ -284,184 +331,30 @@ func JobRuntime(j model.Job) string {
 
 // RepoHost extracts and CANONICALIZES the forge host from a repository URL
 // in the common forms (https://host/owner/repo, ssh://git@host/owner/repo
-// and the scp-like git@host:owner/repo), mirroring the server's host
-// derivation so canonical repo IDs agree across packages. The host is
-// lowercased with ONE trailing dot stripped and the default port of the
-// scheme dropped (443 https, 80 http, 22 ssh); a non-default port stays part
-// of the identity, and scp-like forms never carry a port.
+// and the scp-like git@host:owner/repo), delegating to auth.CanonicalHost so
+// every package derives the same host. The host is lowercased with ONE
+// trailing dot stripped and the default port of the scheme dropped (443
+// https, 80 http, 22 ssh); a non-default port stays part of the identity, and
+// scp-like forms never carry a port.
 func RepoHost(repoURL string) string {
-	return canonicalHost(repoURL)
-}
-
-// canonicalHost normalizes a forge host spelling onto ONE canonical form so
-// equivalent spellings of the same forge derive the same repository identity
-// and the same quota/ACL keys: lowercase, ONE trailing dot stripped,
-// userinfo stripped, and the scheme's default port dropped (443 https, 80
-// http, 22 ssh; with no scheme the well-known default ports 443/80/22 are
-// dropped). Non-default ports stay part of the identity. It mirrors
-// auth.CanonicalHost and the server's canonicalHost; the pinning tests keep
-// the three implementations identical.
-func canonicalHost(raw string) string {
-	s := strings.TrimSpace(raw)
-	if s == "" {
-		return ""
-	}
-	if i := strings.Index(s, "://"); i >= 0 {
-		scheme := strings.ToLower(strings.TrimSpace(s[:i]))
-		rest := s[i+3:]
-		if j := strings.IndexAny(rest, "/?#"); j >= 0 {
-			rest = rest[:j]
-		}
-		if at := strings.LastIndex(rest, "@"); at >= 0 {
-			rest = rest[at+1:]
-		}
-		return canonicalHostPort(scheme, rest)
-	}
-	if at := strings.LastIndex(s, "@"); at >= 0 {
-		rest := s[at+1:]
-		if colon := scpHostColon(rest); colon >= 0 {
-			tail := rest[colon+1:]
-			if tail == "" || strings.Contains(tail, "/") {
-				return canonicalHostPort("ssh", rest[:colon])
-			}
-		}
-		return canonicalHostPort("", rest)
-	}
-	if j := strings.IndexAny(s, "/?#"); j >= 0 {
-		s = s[:j]
-	}
-	// A bracketed IPv6 literal is host material, never the legacy
-	// "host:path" spelling: its internal colons must not split it (the
-	// legacy rule below would otherwise canonicalize "[::1]:8443" to the
-	// bare "[" and collapse every distinct literal onto one identity key).
-	// canonicalHostPort's bracket parser handles both well-formed and
-	// truncated literals; a truncated one is preserved verbatim.
-	if strings.HasPrefix(s, "[") {
-		return canonicalHostPort("", s)
-	}
-	if colon := strings.Index(s, ":"); colon > 0 && !strings.Contains(s[:colon], ":") {
-		if _, err := strconv.Atoi(s[colon+1:]); err != nil {
-			// Legacy "host:path" spelling with no scp user and no numeric
-			// port: the colon separates the host from a path, not a port.
-			s = s[:colon]
-		}
-	}
-	return canonicalHostPort("", s)
-}
-
-// scpHostColon mirrors auth.scpHostColon: the first colon AFTER a bracketed
-// IPv6 literal's closing bracket, the first colon otherwise, or -1 when no
-// colon separates a host from a tail.
-func scpHostColon(s string) int {
-	if strings.HasPrefix(s, "[") {
-		end := strings.Index(s, "]")
-		if end < 0 {
-			return -1
-		}
-		if colon := strings.Index(s[end+1:], ":"); colon >= 0 {
-			return end + 1 + colon
-		}
-		return -1
-	}
-	return strings.Index(s, ":")
-}
-
-// canonicalHostPort lowercases hostPort and drops its default port for
-// scheme.
-func canonicalHostPort(scheme, hostPort string) string {
-	hostPort = strings.TrimSpace(hostPort)
-	if hostPort == "" {
-		return ""
-	}
-	if at := strings.LastIndex(hostPort, "@"); at >= 0 {
-		hostPort = hostPort[at+1:]
-	}
-	host, port := splitCanonHostPort(hostPort)
-	host = strings.ToLower(strings.TrimSuffix(host, "."))
-	if host == "" {
-		return ""
-	}
-	if port != "" && isDefaultHostPort(scheme, port) {
-		port = ""
-	}
-	if port != "" {
-		return host + ":" + port
-	}
-	return host
-}
-
-func splitCanonHostPort(hostPort string) (host, port string) {
-	if strings.HasPrefix(hostPort, "[") {
-		if end := strings.Index(hostPort, "]"); end > 0 {
-			host = hostPort[1:end]
-			if rest := hostPort[end+1:]; strings.HasPrefix(rest, ":") {
-				port = rest[1:]
-			}
-			return host, port
-		}
-		return hostPort, ""
-	}
-	if colon := strings.LastIndex(hostPort, ":"); colon > 0 && !strings.Contains(hostPort[:colon], ":") {
-		if _, err := strconv.Atoi(hostPort[colon+1:]); err == nil {
-			return hostPort[:colon], hostPort[colon+1:]
-		}
-	}
-	return hostPort, ""
-}
-
-func isDefaultHostPort(scheme, port string) bool {
-	switch scheme {
-	case "https":
-		return port == "443"
-	case "http":
-		return port == "80"
-	case "ssh":
-		return port == "22"
-	default:
-		return port == "443" || port == "80" || port == "22"
-	}
-}
-
-// splitHostLike splits "host/rest" when the first segment is host-like
-// (contains a dot) and the remainder itself contains a slash, so a GitLab
-// group with a dot in its name ("acme.co/service") is never mistaken for a
-// host. It mirrors auth's splitHostLike.
-func splitHostLike(key string) (first, rest string, ok bool) {
-	parts := strings.SplitN(key, "/", 2)
-	if len(parts) != 2 || !strings.Contains(parts[0], ".") || !strings.Contains(parts[1], "/") {
-		return "", "", false
-	}
-	return parts[0], parts[1], true
+	return auth.CanonicalHost(repoURL)
 }
 
 // CanonicalRepoID is the canonical "<host>/<owner>/<name>" identity used by
-// repository allowlists and quota counters. It mirrors auth.CanonicalRepoID
-// without importing the auth package, so storage stays independent of the
-// server identity layer; the two derivations MUST stay identical. The forge
-// host is canonicalized first (see canonicalHost) and a full name that
-// already carries a canonically equivalent spelling of that host is reduced
-// to its owner/name remainder (idempotent); a name embedding a DIFFERENT
-// host is re-prefixed with the authoritative host. With no known host the
-// trimmed full name is returned unchanged; an empty full name stays empty.
+// repository allowlists, quota counters and the SQL canonical-identity
+// expressions. It delegates to auth.CanonicalRepoID — the SINGLE
+// canonicalization entry point — so storage and the authorization layer can
+// never drift. The forge host is canonicalized first and a full name that
+// already carries a canonically equivalent spelling of that KNOWN host is
+// reduced to its owner/name remainder (idempotent); a name embedding a
+// DIFFERENT host keeps the authoritative host prefix, so identities stay
+// host-scoped. The host is never inferred from the name: with no known host
+// the trimmed full name is returned unchanged; an empty full name stays
+// empty. The output string is the exact value persisted in repository IDs and
+// compared by the storage SQL; the typed r1: form is the ACL spelling
+// (auth.RepoIdentity.Serialized).
 func CanonicalRepoID(host, fullName string) string {
-	fullName = strings.TrimSpace(fullName)
-	if fullName == "" {
-		return ""
-	}
-	host = canonicalHost(host)
-	if first, rest, ok := splitHostLike(fullName); ok {
-		canonFirst := canonicalHost(first)
-		if host == "" || canonFirst == host {
-			if host == "" {
-				host = canonFirst
-			}
-			fullName = rest
-		}
-	}
-	if host == "" {
-		return fullName
-	}
-	return host + "/" + fullName
+	return auth.CanonicalRepoID(host, fullName)
 }
 
 func labelsSatisfy(have, need []string) bool {

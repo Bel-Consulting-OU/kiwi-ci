@@ -421,12 +421,11 @@ func (f *dbFakeStore) ListRunsPage(ctx context.Context, afterCreatedAt time.Time
 	return storage.PageRuns(runs, afterCreatedAt, afterID, limit), nil
 }
 
-// ListRunsPageForAuthorizedRepos implements
-// storage.RunPageForPrincipalStore: the same keyset page, but with the
-// permitted canonical repository set applied BEFORE paging through the
-// shared storage.PageRunsForAuthorizedRepos definition, exactly like the
-// shipped stores.
-func (f *dbFakeStore) ListRunsPageForAuthorizedRepos(ctx context.Context, allowedRepoIDs []string, afterCreatedAt time.Time, afterID string, limit int) (storage.RunPage, error) {
+// ListRunsPageAuthorized implements storage.RunPageAuthorizedStore: the same
+// keyset page, but with the principal's normalized repository predicate
+// applied BEFORE paging through the shared storage.PageRunsAuthorized
+// definition, exactly like the shipped stores.
+func (f *dbFakeStore) ListRunsPageAuthorized(ctx context.Context, policy storage.RunAuthzPolicy, afterCreatedAt time.Time, afterID string, limit int) (storage.RunPage, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.listRunsErr != nil {
@@ -436,26 +435,7 @@ func (f *dbFakeStore) ListRunsPageForAuthorizedRepos(ctx context.Context, allowe
 	for _, r := range f.runs {
 		runs = append(runs, r)
 	}
-	return storage.PageRunsForAuthorizedRepos(runs, allowedRepoIDs, afterCreatedAt, afterID, limit), nil
-}
-
-// ListRunRepoIDs implements storage.RunRepoIDStore for the fake, using the
-// same canonical policy-first derivation as the shipped stores.
-func (f *dbFakeStore) ListRunRepoIDs(ctx context.Context) ([]string, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	seen := map[string]bool{}
-	out := []string{}
-	for _, r := range f.runs {
-		id := storage.RepoIDForRun(r)
-		if seen[id] {
-			continue
-		}
-		seen[id] = true
-		out = append(out, id)
-	}
-	sort.Strings(out)
-	return out, nil
+	return storage.PageRunsAuthorized(runs, policy, afterCreatedAt, afterID, limit), nil
 }
 
 func (f *dbFakeStore) InsertJob(ctx context.Context, job model.Job) error {

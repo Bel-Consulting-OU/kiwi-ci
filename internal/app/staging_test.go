@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/config"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
@@ -108,36 +107,62 @@ func TestServerProductionRefusesUnusableStagingDirectoryAtStartup(t *testing.T) 
 	}
 }
 
-// TestBuildStagingBudgetPrunesAndRefusesUnusable: an unconfigured section
-// leaves the server default in place, a configured one is constructed and
-// startup-pruned, and an unusable configured bound fails startup.
-func TestBuildStagingBudgetPrunesAndRefusesUnusable(t *testing.T) {
-	b, pruned, err := buildStagingBudget(context.Background(), config.StagingConfig{})
+// TestBuildStagingBudgetPerReplicaAndRefusesUnusable: an unconfigured section
+// leaves the server default in place; a configured section constructs the
+// replica-private budget <root>/<instance-id> and reclaims spool files a dead
+// owner left (including legacy bare files directly under the shared root); an
+// unusable, partial or unsafe configured bound fails startup.
+func TestBuildStagingBudgetPerReplicaAndRefusesUnusable(t *testing.T) {
+	b, pruned, err := buildStagingBudget(config.StagingConfig{})
 	if err != nil || b != nil || pruned != 0 {
 		t.Fatalf("unconfigured budget = (%v, %d, %v), want (nil, 0, nil)", b, pruned, err)
 	}
 
-	dir := t.TempDir()
-	abandoned := filepath.Join(dir, staging.FilePrefix+"crash-leftover")
+	root := t.TempDir()
+	// A pre-contract process spooled directly into the configured root; the
+	// new owner reclaims it (the ownership lock proves it is a dead owner's).
+	abandoned := filepath.Join(root, staging.FilePrefix+"crash-leftover")
 	if err := os.WriteFile(abandoned, []byte("stale"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	old := time.Now().Add(-2 * time.Hour)
-	if err := os.Chtimes(abandoned, old, old); err != nil {
+	foreign := filepath.Join(root, "unrelated.dat")
+	if err := os.WriteFile(foreign, []byte("keep"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	b, pruned, err = buildStagingBudget(context.Background(), config.StagingConfig{Dir: dir, MaxBytes: 1 << 20})
+	b, pruned, err = buildStagingBudget(config.StagingConfig{Dir: root, InstanceID: "replica-a", MaxBytes: 1 << 20})
 	if err != nil {
 		t.Fatalf("buildStagingBudget: %v", err)
 	}
-	if b == nil || b.Dir() != dir || b.MaxBytes() != 1<<20 {
-		t.Fatalf("budget = %+v", b)
+	if b == nil {
+		t.Fatal("configured staging budget is nil")
+	}
+	if want := filepath.Join(root, "replica-a"); b.Dir() != want || b.MaxBytes() != 1<<20 {
+		t.Fatalf("configured replica budget = (dir %q, max %d), want (%q, %d)", b.Dir(), b.MaxBytes(), want, 1<<20)
 	}
 	if pruned != 1 {
-		t.Fatalf("startup prune removed %d files, want 1", pruned)
+		t.Fatalf("startup reclaim removed %d files, want 1", pruned)
 	}
 	if _, err := os.Stat(abandoned); !os.IsNotExist(err) {
-		t.Fatalf("abandoned spool file survived startup prune: %v", err)
+		t.Fatalf("abandoned spool file survived the startup reclaim: %v", err)
+	}
+	if _, err := os.Stat(foreign); err != nil {
+		t.Fatalf("startup reclaim removed a foreign file: %v", err)
+	}
+	if got := b.Used(); got != 0 {
+		t.Fatalf("new replica budget started with Used() = %d, want 0", got)
+	}
+
+	// Without an explicit id the process generates and persists one, so the
+	// configured root is still never the staging directory itself.
+	generated, _, err := buildStagingBudget(config.StagingConfig{Dir: root, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatalf("generated-id budget: %v", err)
+	}
+	if generated.Dir() == root || !strings.HasPrefix(generated.Dir(), root+string(os.PathSeparator)) {
+		t.Fatalf("generated replica dir %q is not a private subdirectory of the root %q", generated.Dir(), root)
+	}
+	if _, err := os.Stat(filepath.Join(root, staging.InstanceIDFileName)); err != nil {
+		t.Fatalf("generated instance id was not persisted in the root: %v", err)
 	}
 
 	// An unusable bound (the parent is a regular file) must fail startup.
@@ -145,14 +170,18 @@ func TestBuildStagingBudgetPrunesAndRefusesUnusable(t *testing.T) {
 	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := buildStagingBudget(context.Background(), config.StagingConfig{Dir: filepath.Join(file, "staging"), MaxBytes: 1 << 20}); err == nil {
+	if _, _, err := buildStagingBudget(config.StagingConfig{Dir: filepath.Join(file, "staging"), MaxBytes: 1 << 20}); err == nil {
 		t.Fatal("unusable configured staging directory was accepted")
 	} else if !strings.Contains(err.Error(), "staging") {
 		t.Fatalf("unusable staging error %q does not name staging", err)
 	}
 	// A partial configuration is caught by config.Validate in the real
 	// startup path; the helper itself must not silently accept it either.
-	if _, _, err := buildStagingBudget(context.Background(), config.StagingConfig{Dir: dir}); err == nil {
+	if _, _, err := buildStagingBudget(config.StagingConfig{Dir: t.TempDir()}); err == nil {
 		t.Fatal("partial staging configuration (dir without max_bytes) was accepted")
+	}
+	// An unsafe explicit id never becomes a path outside the root.
+	if _, _, err := buildStagingBudget(config.StagingConfig{Dir: t.TempDir(), InstanceID: "../escape", MaxBytes: 1 << 20}); err == nil {
+		t.Fatal("unsafe staging instance id was accepted")
 	}
 }

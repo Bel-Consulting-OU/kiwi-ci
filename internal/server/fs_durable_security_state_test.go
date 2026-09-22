@@ -8,12 +8,13 @@ package server
 // mutation must not be acknowledged and, for every pre-rename failure, the
 // PREVIOUS on-disk bytes must be intact with no scratch files left behind.
 //
-// The one documented asymmetry is the parent-directory fsync: it runs after
-// the rename, so its failure surfaces as an error (nothing is acknowledged,
-// in-memory state rolls back) but the new bytes are already visible. The
-// tests assert the unacknowledged/rollback contract there instead of the
-// byte-preservation one, matching storage's
-// TestAtomicWriteFileParentDirErrorIsReturned.
+// The documented asymmetry is the parent-directory fsync: it runs after the
+// rename, so its failure surfaces as an error (nothing is acknowledged) but
+// the new bytes are already visible. There the contract is NOT rollback:
+// the tests assert the published-uncertain contract — the new state stays
+// visible and is retained in memory, readiness stays degraded, and a later
+// successful persist reconciles. Pre-rename failures keep the
+// rollback/byte-preservation contract.
 
 import (
 	"bytes"
@@ -130,23 +131,47 @@ func TestCRLPersistFailuresBlockDisableAcknowledgment(t *testing.T) {
 			}
 			assertNoAtomicScratch(t, dir)
 
-			// Whole-state rollback: no phantom disable and no phantom
-			// revocation after an unacknowledged kill switch.
+			// The failure phase decides the state contract. Pre-rename: no
+			// phantom disable and no phantom revocation after an
+			// unacknowledged kill switch. Post-rename (dir sync): the
+			// snapshot IS published, so the disable and the revocation are
+			// retained in memory and the degraded marker stays armed until
+			// a later successful persist.
 			s.mu.Lock()
 			ri := s.runners["runner-a"]
 			_, locallyRevoked := s.crl[serial]
 			s.mu.Unlock()
-			if ri.Disabled {
-				t.Fatalf("failed %s disable left the runner disabled", fault.name)
-			}
-			if locallyRevoked {
-				t.Fatalf("failed %s disable left a local CRL revocation", fault.name)
+			if fault.preRename {
+				if ri.Disabled {
+					t.Fatalf("failed %s disable left the runner disabled", fault.name)
+				}
+				if locallyRevoked {
+					t.Fatalf("failed %s disable left a local CRL revocation", fault.name)
+				}
+			} else {
+				if !ri.Disabled {
+					t.Fatalf("published %s disable rolled the runner back to enabled", fault.name)
+				}
+				if !locallyRevoked {
+					t.Fatalf("published %s disable rolled the CRL revocation back", fault.name)
+				}
+				published, rerr := os.ReadFile(statePath)
+				if rerr != nil {
+					t.Fatal(rerr)
+				}
+				if !bytes.Contains(published, []byte(serial)) {
+					t.Fatalf("published %s disable is not in state.json: %s", fault.name, published)
+				}
 			}
 
-			// The previous durable state is still usable: the healed retry
-			// acknowledges exactly once and survives a restart.
+			// A later successful persist acknowledges the kill switch (a
+			// no-op re-disable when it was already published) and reconciles
+			// the degraded marker.
 			if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/runner-a/disable", "admin-tok", ""); w.Code != http.StatusOK {
 				t.Fatalf("healed disable = %d: %s", w.Code, w.Body.String())
+			}
+			if s.stateDegraded.Load() {
+				t.Fatalf("successful persist after a %s failure did not clear the degraded marker", fault.name)
 			}
 			if !crlRevoked(t, s, serial) {
 				t.Fatal("healed disable did not revoke locally")
@@ -221,9 +246,11 @@ func TestCRLPersistFailuresKeepPreviousDurableFile(t *testing.T) {
 
 // TestEnrollGrantPersistFailuresBlockMintAcknowledgment proves CreateEnrollGrant
 // never returns a token for a grant whose write was not certified durable:
-// every durability-step failure surfaces as an error with an empty token, the
-// in-memory map is rolled back, and (pre-rename) the previous
-// enroll-grants.json bytes are intact.
+// every durability-step failure surfaces as an error with an empty token. A
+// pre-rename failure also rolls the grant out of memory (the file never saw
+// it); a post-rename directory-fsync failure retains it, because the visible
+// file already carries the grant, and leaves readiness degraded until a
+// later successful persist reconciles.
 func TestEnrollGrantPersistFailuresBlockMintAcknowledgment(t *testing.T) {
 	for _, fault := range fsDurableFaults() {
 		t.Run(fault.name, func(t *testing.T) {
@@ -253,16 +280,36 @@ func TestEnrollGrantPersistFailuresBlockMintAcknowledgment(t *testing.T) {
 			s.mu.Lock()
 			grants := len(s.EnrollGrants)
 			s.mu.Unlock()
-			if grants != 1 {
-				t.Fatalf("failed %s mint left %d grants in memory, want the 1 seeded", fault.name, grants)
+			after, rerr := os.ReadFile(grantPath)
+			if rerr != nil {
+				t.Fatal(rerr)
 			}
 			if fault.preRename {
-				after, rerr := os.ReadFile(grantPath)
-				if rerr != nil {
-					t.Fatal(rerr)
+				if grants != 1 {
+					t.Fatalf("failed %s mint left %d grants in memory, want the 1 seeded", fault.name, grants)
 				}
 				if !bytes.Equal(after, before) {
 					t.Fatalf("previous enroll-grants.json changed after a %s failure", fault.name)
+				}
+			} else {
+				// Post-rename: the published grant is retained in memory AND
+				// on disk (never rolled back to a state that denies the
+				// visible file), and readiness stays degraded until the later
+				// successful persist reconciles.
+				if grants != 2 {
+					t.Fatalf("published %s mint left %d grants in memory, want the published grant retained", fault.name, grants)
+				}
+				if !bytes.Contains(after, []byte("os:linux")) {
+					t.Fatalf("published %s mint is not in enroll-grants.json: %s", fault.name, after)
+				}
+				if !s.stateDegraded.Load() {
+					t.Fatalf("published %s mint did not leave readiness degraded", fault.name)
+				}
+				if err := s.persistEnrollGrants(); err != nil {
+					t.Fatalf("reconcile persist after %s mint: %v", fault.name, err)
+				}
+				if s.stateDegraded.Load() {
+					t.Fatalf("successful reconcile after a %s mint did not clear the degraded marker", fault.name)
 				}
 			}
 			assertNoAtomicScratch(t, dir)
@@ -290,8 +337,11 @@ func TestEnrollGrantPersistFailuresBlockMintAcknowledgment(t *testing.T) {
 // TestEnrollGrantPersistFailuresBlockConsumeAcknowledgment proves the enroll
 // handler never issues a certificate for a consumption whose write was not
 // certified durable: each failure refuses the request with the enrollment
-// tier's existing 401 convention, rolls the consumed grant back, and
-// (pre-rename) leaves the on-disk file showing the grant as unused.
+// tier's existing 401 convention. The phase then decides the in-memory and
+// on-disk outcome: a pre-rename failure leaves the grant unused (rolled
+// back) and consumable; a post-rename directory-fsync failure leaves it
+// CONSUMED in memory and on disk (the visible file already says used), so a
+// replay is refused instead of the permissive entry being restored.
 func TestEnrollGrantPersistFailuresBlockConsumeAcknowledgment(t *testing.T) {
 	ca, err := runnerpki.NewCA("durable grant ca", time.Hour)
 	if err != nil {
@@ -332,10 +382,12 @@ func TestEnrollGrantPersistFailuresBlockConsumeAcknowledgment(t *testing.T) {
 			s.mu.Lock()
 			g := s.EnrollGrants[auth.TokenDigest(raw)]
 			s.mu.Unlock()
-			if g.Used {
-				t.Fatalf("failed %s consume left the grant used in memory", fault.name)
-			}
 			if fault.preRename {
+				// Definitely not published: the permissive pre-consume entry
+				// is restored and the previous file is bit-for-bit intact.
+				if g.Used {
+					t.Fatalf("failed %s consume left the grant used in memory", fault.name)
+				}
 				after, rerr := os.ReadFile(grantPath)
 				if rerr != nil {
 					t.Fatal(rerr)
@@ -343,15 +395,66 @@ func TestEnrollGrantPersistFailuresBlockConsumeAcknowledgment(t *testing.T) {
 				if !bytes.Equal(after, before) {
 					t.Fatalf("previous enroll-grants.json changed after a %s failure", fault.name)
 				}
+				assertNoAtomicScratch(t, dir)
+
+				// The grant is still consumable exactly once after healing.
+				if err := s.consumeEnrollGrant(context.Background(), raw, nil); err != nil {
+					t.Fatalf("consume after healed %s failure: %v", fault.name, err)
+				}
+				if err := s.consumeEnrollGrant(context.Background(), raw, nil); err == nil {
+					t.Fatal("grant consumed twice after healing")
+				}
+				return
+			}
+
+			// Post-rename: the file already records the consumption. The
+			// CONSUMED state must be retained (never rolled back to the
+			// permissive unused entry), the degraded marker must stay armed,
+			// and every replay path must refuse.
+			if !g.Used {
+				t.Fatalf("published %s consume rolled the grant back to unused in memory", fault.name)
+			}
+			after, rerr := os.ReadFile(grantPath)
+			if rerr != nil {
+				t.Fatal(rerr)
+			}
+			if !bytes.Contains(after, []byte(`"used": true`)) {
+				t.Fatalf("published %s consume is not in enroll-grants.json: %s", fault.name, after)
+			}
+			if !s.stateDegraded.Load() {
+				t.Fatalf("published %s consume did not leave readiness degraded", fault.name)
+			}
+			if s.enrollGrantOK(context.Background(), raw) {
+				t.Fatalf("published %s consume still validates the grant", fault.name)
+			}
+			if err := s.consumeEnrollGrant(context.Background(), raw, nil); err == nil {
+				t.Fatalf("published %s consume allowed a replay", fault.name)
 			}
 			assertNoAtomicScratch(t, dir)
 
-			// The grant is still consumable exactly once after healing.
-			if err := s.consumeEnrollGrant(context.Background(), raw, nil); err != nil {
-				t.Fatalf("consume after healed %s failure: %v", fault.name, err)
+			// A restart agrees: the grant is consumed and a replay is
+			// refused there too.
+			s2, err := NewPersistent("runner-tok", "admin-tok", dir)
+			if err != nil {
+				t.Fatal(err)
 			}
-			if err := s.consumeEnrollGrant(context.Background(), raw, nil); err == nil {
-				t.Fatal("grant consumed twice after healing")
+			s2.mu.Lock()
+			diskGrant := s2.EnrollGrants[auth.TokenDigest(raw)]
+			s2.mu.Unlock()
+			if !diskGrant.Used {
+				t.Fatalf("restart after a %s consume resurrected an unused grant", fault.name)
+			}
+			if err := s2.consumeEnrollGrant(context.Background(), raw, nil); err == nil {
+				t.Fatalf("restart after a %s consume allowed a replay", fault.name)
+			}
+
+			// Reconciliation: a later successful persist of the same state
+			// heals the degraded marker.
+			if err := s.persistEnrollGrants(); err != nil {
+				t.Fatalf("reconcile persist after %s failure: %v", fault.name, err)
+			}
+			if s.stateDegraded.Load() {
+				t.Fatalf("successful reconcile after a %s consume did not clear the degraded marker", fault.name)
 			}
 		})
 	}

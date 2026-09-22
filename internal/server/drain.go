@@ -69,6 +69,15 @@ func (s *Server) BeginDrain(reason string) {
 // leases) even when the flag cannot be written, because resuming service
 // after an operator/signal drain would be worse. On error a prominent log
 // states that the node is draining in memory only.
+//
+// The two failure phases leave different on-disk states and both keep the
+// drain set: a pre-rename failure means drain.flag was definitely not
+// published (a restart resumes leases — hence the fail-closed in-memory
+// state and the 503), while a post-rename directory-fsync failure
+// (fsutil.Renamed) means the flag IS visible with uncertified durability.
+// persistDrainFlagLocked folds the outcome into the shared degraded marker,
+// so a published-but-uncertain drain keeps /readiness 503 degraded until a
+// retry persists successfully and reconciles.
 func (s *Server) beginDrain(reason string) error {
 	s.drainMu.Lock()
 	s.draining = true
@@ -89,6 +98,13 @@ func (s *Server) beginDrain(reason string) error {
 // configured: there is no file to become durable and a restarted process
 // starts clean. Callers must not acknowledge a durable drain when this
 // returns an error.
+//
+// The fsutil.AtomicWriteError phase decides what a restart would see: a
+// pre-rename failure leaves the previous flag (here: absent) intact, while a
+// post-rename failure leaves the NEW flag visible but uncertified. Every
+// outcome is folded into the shared degraded marker (noteFilePersistResult):
+// a published-but-uncertain failure arms it and a later successful persist —
+// the retry's reconciliation — heals it.
 func (s *Server) persistDrainFlagLocked() error {
 	if s.dataDir == "" {
 		return nil
@@ -99,7 +115,9 @@ func (s *Server) persistDrainFlagLocked() error {
 	if err != nil {
 		return err
 	}
-	return fsutil.AtomicWriteFile(joinDataDir(s.dataDir, drainFlagFile), b, 0o600)
+	err = fsutil.AtomicWriteFile(joinDataDir(s.dataDir, drainFlagFile), b, 0o600)
+	s.noteFilePersistResult(err)
+	return err
 }
 
 // loadDrainFlag restores a persisted drain state at startup.
@@ -188,10 +206,14 @@ func (s *Server) drainServer(w http.ResponseWriter, r *http.Request) {
 		reason = "administrative drain"
 	}
 	if err := s.beginDrain(reason); err != nil {
-		// Fail closed: the node is draining in memory (no new leases) but
-		// drain.flag could not be written, so a restart would resume taking
-		// leases. Answer the readiness degraded pattern instead of
-		// acknowledging a durable drain. A retry persists and acks.
+		// Fail closed for both phases: the node is draining in memory (no
+		// new leases). On a pre-rename failure drain.flag was not published
+		// at all, so a restart would resume taking leases; on a post-rename
+		// failure the flag is visible but its crash durability is
+		// uncertified. Either way the drain is not acknowledged as durable:
+		// answer the readiness degraded pattern (the shared marker is armed
+		// for the published-uncertain phase by persistDrainFlagLocked). A
+		// retry persists and acks.
 		w.Header().Set("X-Kiwi-State", "degraded")
 		http.Error(w, statePersistenceDegradedBody, http.StatusServiceUnavailable)
 		return

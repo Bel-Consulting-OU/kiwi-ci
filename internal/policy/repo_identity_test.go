@@ -123,3 +123,32 @@ func TestRepoPolicyLookupTables(t *testing.T) {
 		})
 	}
 }
+
+// TestDotlessCanonicalPolicyHostSeparatesForge is the typed-identity
+// regression for the dot heuristic: a policy entry scoped to the dotless
+// canonical host "gitlab" (key "gitlab/acme/widget") applies to that host's
+// repository — including equivalent host spellings — and never to another
+// forge presenting the same name ("forge.example/gitlab/acme/widget"), whose
+// full name merely embeds the dotless string. The reverse direction is also
+// pinned: a canonical entry for the other forge must not scope the dotless
+// repository.
+func TestDotlessCanonicalPolicyHostSeparatesForge(t *testing.T) {
+	inv := RepoPolicy{AllowedRegions: []string{"eu"}}
+	cfg := &Config{Repositories: map[string]RepoPolicy{"gitlab/acme/widget": inv}}
+	if got, ok := cfg.RepoPolicyFor("gitlab/acme/widget"); !ok || !reflect.DeepEqual(got, inv) {
+		t.Fatalf("dotless canonical entry must resolve its own repository: %+v ok=%v", got, ok)
+	}
+	if _, ok := cfg.RepoPolicyFor("GitLab/acme/widget"); !ok {
+		t.Fatal("equivalent spelling of the dotless host must resolve the entry")
+	}
+	if _, ok := cfg.RepoPolicyFor("forge.example/gitlab/acme/widget"); ok {
+		t.Fatal("dotless canonical policy leaked to another forge with the same name")
+	}
+	rev := &Config{Repositories: map[string]RepoPolicy{"forge.example/gitlab/acme/widget": inv}}
+	if _, ok := rev.RepoPolicyFor("gitlab/acme/widget"); ok {
+		t.Fatal("another forge's canonical entry scoped the dotless repository")
+	}
+	if got, ok := rev.RepoPolicyFor("forge.example/gitlab/acme/widget"); !ok || !reflect.DeepEqual(got, inv) {
+		t.Fatalf("other-forge canonical entry must resolve its own repository: %+v ok=%v", got, ok)
+	}
+}

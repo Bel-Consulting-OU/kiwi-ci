@@ -356,3 +356,27 @@ func TestMemStoreReportTotalsCanonicalSetOnly(t *testing.T) {
 		t.Fatalf("empty-set totals = %d/%d/%d, %v; want 0/0/0", reports, tests, failures, err)
 	}
 }
+
+// TestRepoQueryHasForgeHostTyped pins the test-intelligence query
+// classification on the typed positional rule: three or more path segments
+// name a canonical identity (so a DOTLESS host like "gitlab/acme/widget" is an
+// exact canonical query), while zero/one slash is a bare candidate hint. The
+// old "first segment contains a dot" heuristic is gone.
+func TestRepoQueryHasForgeHostTyped(t *testing.T) {
+	canonical := []string{
+		"gitlab/acme/widget",
+		"forge.example/gitlab/acme/widget",
+		"github.com/owner/name",
+	}
+	for _, q := range canonical {
+		if !repoQueryHasForgeHost(q) {
+			t.Fatalf("repoQueryHasForgeHost(%q) = false, want a canonical identity", q)
+		}
+	}
+	bare := []string{"acme/widget", "widget", "acme.co/service", ""}
+	for _, q := range bare {
+		if repoQueryHasForgeHost(q) {
+			t.Fatalf("repoQueryHasForgeHost(%q) = true, want a bare hint", q)
+		}
+	}
+}

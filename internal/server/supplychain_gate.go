@@ -28,7 +28,14 @@ import (
 // `<name>.sigstore`. The server validates them against the job's artifact
 // contract and gates the artifact payload itself, so a required-but-missing
 // attestation can never ship.
-
+//
+// Body caps: these two bodies deliberately DO NOT go through the shared
+// staging budget. They are small documents (8 MiB each, enforced by
+// http.MaxBytesReader BEFORE the read) that are parsed/verified in memory
+// and never spooled anywhere, and they are published with CAS.PutKnown —
+// the caller already computed the digest and size — so no scratch file
+// exists at all. A document that needs more than 8 MiB is rejected as an
+// invalid payload (SBOM: 400, Sigstore: 422) instead of being staged.
 const (
 	maxSBOMBytes     = 8 << 20
 	maxSigstoreBytes = 8 << 20
@@ -258,7 +265,12 @@ func (s *Server) uploadSBOM(w http.ResponseWriter, r *http.Request, j model.Job,
 			return
 		}
 		defer releaseGate()
-		if _, perr := s.CAS.Put(ctx, bytes.NewReader(body)); perr != nil {
+		if _, perr := s.CAS.PutKnown(ctx, sum, int64(len(body)), bytes.NewReader(body)); perr != nil {
+			if casIntegrityError(perr) {
+				s.logError("artifact: sbom CAS publication failed verification", "job", j.ID, "sha256", sum, "error", perr.Error())
+				http.Error(w, "sbom storage verification failed", http.StatusServiceUnavailable)
+				return
+			}
 			s.internalError(w, r, perr, "")
 			return
 		}
@@ -368,7 +380,12 @@ func (s *Server) uploadSigstore(w http.ResponseWriter, r *http.Request, j model.
 			return
 		}
 		defer releaseGate()
-		if _, perr := s.CAS.Put(ctx, bytes.NewReader(body)); perr != nil {
+		if _, perr := s.CAS.PutKnown(ctx, sum, int64(len(body)), bytes.NewReader(body)); perr != nil {
+			if casIntegrityError(perr) {
+				s.logError("artifact: sigstore CAS publication failed verification", "job", j.ID, "sha256", sum, "error", perr.Error())
+				http.Error(w, "sigstore storage verification failed", http.StatusServiceUnavailable)
+				return
+			}
 			s.internalError(w, r, perr, "")
 			return
 		}
@@ -498,9 +515,21 @@ func (s *Server) rememberPendingSidecar(ctx context.Context, j model.Job, base, 
 	s.pendingSidecars[key] = value
 	perr := s.persistCheckedErrLocked("artifact.sidecar_pending")
 	if perr != nil {
-		// Durability first: a pointer the snapshot does not contain must not
-		// survive in memory, or the next unrelated persist commits pending
-		// state the uploader was told failed.
+		if fsutil.Renamed(perr) {
+			// Post-rename failure: the snapshot rename already published the
+			// pointer, so the visible state contains it. Restoring the
+			// previous (or absent) entry would make memory deny a pointer
+			// the durable snapshot holds and a restart would resurrect it;
+			// retain the published entry and let the degraded marker (armed
+			// by persistLocked) fail closed until a later persist reconciles.
+			// The caller still refuses the upload: the pointer is not
+			// acknowledged as durable.
+			s.mu.Unlock()
+			return perr
+		}
+		// Pre-rename failure: the pointer was definitely not published, so
+		// it must not survive in memory, or the next unrelated persist
+		// commits pending state the uploader was told failed.
 		if hadPrev {
 			s.pendingSidecars[key] = prev
 		} else {
@@ -666,9 +695,18 @@ func (s *Server) attachSidecarToArtifact(ctx context.Context, j model.Job, base,
 		}
 		s.artifacts[rec.ID] = cur
 		if perr := s.persistCheckedErrLocked("artifact.sidecar"); perr != nil {
-			// Durability first: an attachment the snapshot does not contain
-			// must not survive in memory, or the next unrelated persist
-			// commits a sidecar the uploader was told failed.
+			if fsutil.Renamed(perr) {
+				// Post-rename failure: the snapshot already published the
+				// attachment. Rolling memory back would deny a digest the
+				// durable record contains, so retain it; the caller still
+				// answers 503 and readiness stays degraded until a later
+				// successful persist reconciles.
+				s.mu.Unlock()
+				return perr
+			}
+			// Pre-rename failure: an attachment the snapshot does not
+			// contain must not survive in memory, or the next unrelated
+			// persist commits a sidecar the uploader was told failed.
 			s.artifacts[rec.ID] = prev
 			s.mu.Unlock()
 			return perr

@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
@@ -1246,29 +1247,42 @@ func QuotaKeys(repoID string) []string {
 }
 
 // repoTeamKey derives the team counter key of a canonical repository
-// identity: the forge host plus the owner segment. Legacy URL inputs derive
-// the same pair (host + first path segment) so pre-canonical counters stay
-// addressable.
+// identity: the canonical forge host plus the owner segment. The identity is
+// classified with the shared typed positional rule (auth.ParseStoredRepoID,
+// never a dot heuristic), so a DOTLESS host ("gitlab/acme/widget") derives
+// the same host+owner pair as a dotted one, and the host is canonicalized
+// (auth.CanonicalHost) exactly as the rest of storage does — a legacy
+// host:port URL and a bracketed IPv6 literal cannot be misread. A bare
+// "owner/name" (or a shorter name) has no host and therefore no distinct team
+// key, and the exact identity string stays the caller's first quota key.
+//
+// Legacy URL inputs ("https://github.com/acme/backend.git") keep deriving
+// host + first path segment so pre-canonical counters stay addressable.
 func repoTeamKey(repo string) string {
 	if u, err := url.Parse(repo); err == nil && u.Host != "" {
+		host := auth.CanonicalHost(u.Host)
+		if host == "" {
+			return repo
+		}
 		parts := strings.Split(strings.Trim(u.Path, "/"), "/")
 		if len(parts) > 0 && parts[0] != "" {
-			return u.Host + "/" + parts[0]
+			return host + "/" + parts[0]
 		}
-		return u.Host
+		return host
 	}
-	// Canonical "host/owner/name": the first two slash-separated segments.
-	// A bare "owner/name" (no forge host) has no distinct team key; a first
-	// segment containing a dot with a nested remainder also qualifies as a
-	// canonical host.
-	parts := strings.Split(repo, "/")
-	if len(parts) >= 3 && parts[0] != "" && parts[1] != "" {
-		return parts[0] + "/" + parts[1]
+	grant, err := auth.ParseStoredRepoID(repo)
+	if err != nil {
+		return repo
 	}
-	if len(parts) == 2 && strings.Contains(parts[0], ".") {
-		return parts[0] + "/" + parts[1]
+	id, ok := grant.Identity()
+	if !ok {
+		return repo
 	}
-	return repo
+	owner, _, ok := strings.Cut(id.FullName, "/")
+	if !ok || owner == "" {
+		return repo
+	}
+	return id.Host + "/" + owner
 }
 
 // RepoTeamKey returns the team counter key for a canonical repository
