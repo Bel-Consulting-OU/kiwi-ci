@@ -382,6 +382,27 @@ func faultyWrapperCases() map[string]wrapperCase {
 			_, _, err := f.ProfileForSerial(ctx(), "serial")
 			return err
 		}},
+		"LinkRunnerProfile": {mutates: true, call: func(f *FaultyStore) error {
+			return f.LinkRunnerProfile(ctx(), testRunner.ID, memProfileID)
+		}},
+		"ProfileForRunnerID": {seed: func(m *memStore) {
+			_ = m.UpsertProfile(ctx(), model.RunnerProfile{ID: memProfileID})
+			_ = m.LinkRunnerProfile(ctx(), testRunner.ID, memProfileID)
+		}, call: func(f *FaultyStore) error {
+			_, _, err := f.ProfileForRunnerID(ctx(), testRunner.ID)
+			return err
+		}},
+		"UnlinkRunnerProfile": {mutates: true, seed: func(m *memStore) {
+			_ = m.LinkRunnerProfile(ctx(), testRunner.ID, memProfileID)
+		}, call: func(f *FaultyStore) error {
+			return f.UnlinkRunnerProfile(ctx(), testRunner.ID)
+		}},
+		"RunnerIDsForProfile": {seed: func(m *memStore) {
+			_ = m.LinkRunnerProfile(ctx(), testRunner.ID, memProfileID)
+		}, call: func(f *FaultyStore) error {
+			_, err := f.RunnerIDsForProfile(ctx(), memProfileID)
+			return err
+		}},
 		"UpsertRunnerToken": {mutates: true, call: func(f *FaultyStore) error {
 			return f.UpsertRunnerToken(ctx(), testRunner.ID, "digest")
 		}},
@@ -539,7 +560,7 @@ func equalSnapshots(a, b memSnapshot) bool {
 		a.reportsLen == b.reportsLen && len(a.outbox) == len(b.outbox) && len(a.deployments) == len(b.deployments) &&
 		len(a.snapshots) == len(b.snapshots) && len(a.fragments) == len(b.fragments) &&
 		len(a.pendingSidecars) == len(b.pendingSidecars) && len(a.claims) == len(b.claims) &&
-		len(a.outboxClaims) == len(b.outboxClaims)
+		len(a.outboxClaims) == len(b.outboxClaims) && len(a.runnerProfiles) == len(b.runnerProfiles)
 }
 
 func TestFaultyStoreCloseAndFaultState(t *testing.T) {
@@ -931,6 +952,20 @@ func missingOptionalInterfaceCases() map[string]missingIfaceCase {
 		}},
 		"ProfileForSerial": {iface: "ProfileStore", call: func(f *FaultyStore) error {
 			_, _, err := f.ProfileForSerial(ctx(), "")
+			return err
+		}},
+		"LinkRunnerProfile": {mutates: true, iface: "RunnerProfileLinkStore", call: func(f *FaultyStore) error {
+			return f.LinkRunnerProfile(ctx(), "", "")
+		}},
+		"ProfileForRunnerID": {iface: "RunnerProfileLinkStore", call: func(f *FaultyStore) error {
+			_, _, err := f.ProfileForRunnerID(ctx(), "")
+			return err
+		}},
+		"UnlinkRunnerProfile": {mutates: true, iface: "RunnerProfileLinkStore", call: func(f *FaultyStore) error {
+			return f.UnlinkRunnerProfile(ctx(), "")
+		}},
+		"RunnerIDsForProfile": {iface: "RunnerProfileLinkStore", call: func(f *FaultyStore) error {
+			_, err := f.RunnerIDsForProfile(ctx(), "")
 			return err
 		}},
 		"UpsertRunnerToken": {mutates: true, iface: "RunnerTokenStore", call: func(f *FaultyStore) error {

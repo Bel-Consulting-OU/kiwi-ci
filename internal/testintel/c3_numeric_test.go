@@ -102,8 +102,8 @@ func TestValidateReportPayloadNumericPolicy(t *testing.T) {
 		{"negative failures", model.TestReport{Tests: 2, Failures: -1}, "negative failures counter"},
 		{"negative errors", model.TestReport{Tests: 2, Errors: -1}, "negative errors counter"},
 		{"negative skipped", model.TestReport{Tests: 2, Skipped: -1}, "negative skipped counter"},
-		{"failures+errors over tests", model.TestReport{Tests: 1, Failures: 1, Errors: 1}, "failures+errors (1+1) exceeds tests (1)"},
-		{"skipped over tests", model.TestReport{Tests: 1, Skipped: 2}, "skipped (2) exceeds tests (1)"},
+		{"failures+errors over tests", model.TestReport{Tests: 1, Failures: 1, Errors: 1}, "failures+errors+skipped (1+1+0) exceeds tests (1)"},
+		{"skipped over tests", model.TestReport{Tests: 1, Skipped: 2}, "failures+errors+skipped (0+0+2) exceeds tests (1)"},
 		{"negative report duration", model.TestReport{Duration: -1}, "report duration"},
 		{"NaN report duration", model.TestReport{Duration: math.NaN()}, "report duration"},
 		{"infinite report duration", model.TestReport{Duration: math.Inf(1)}, "report duration"},
@@ -124,11 +124,16 @@ func TestValidateReportPayloadNumericPolicy(t *testing.T) {
 		})
 	}
 
-	// Boundary-valid payload: counters exactly on the relation limits and
-	// durations exactly at maxReportDuration.
+	// Boundary-valid payload: the three outcome counters sum to exactly
+	// Tests, one materialized failing case explains Failures+Errors, one
+	// skipped case explains Skipped, and the durations sit exactly at
+	// maxReportDuration.
 	at := model.TestReport{
-		Tests: 2, Failures: 1, Errors: 1, Skipped: 2, Duration: maxReportDuration,
-		Cases: []model.TestResult{{Name: "t", Duration: maxReportDuration, Passed: false}},
+		Tests: 2, Failures: 1, Errors: 0, Skipped: 1, Duration: maxReportDuration,
+		Cases: []model.TestResult{
+			{Name: "fail", Duration: maxReportDuration, Passed: false},
+			{Name: "skip", Duration: 0, Skipped: true},
+		},
 	}
 	if err := ValidateReportPayload(at); err != nil {
 		t.Fatalf("boundary-valid payload rejected: %v", err)

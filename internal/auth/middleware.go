@@ -109,8 +109,12 @@ func PublicRoute(method, path string) bool {
 		return true
 	}
 	// The job OIDC issuance endpoint is public at the auth layer because it
-	// authenticates with the lease token embedded in the body.
-	if method == http.MethodPost && strings.HasSuffix(path, "/oidc") {
+	// authenticates with the lease token embedded in the body. Only the EXACT
+	// route shape POST /api/v1/jobs/{id}/oidc is public: a suffix match would
+	// also open any future route that happens to end in /oidc (for example
+	// /api/v1/admin/foo/oidc), silently exempting it from store-principal
+	// authentication.
+	if method == http.MethodPost && isJobOIDCIssuePath(path) {
 		return true
 	}
 	// Runner enrollment is public to the middleware (the enrollment
@@ -128,6 +132,26 @@ func PublicRoute(method, path string) bool {
 // server's auth() chain.
 func isPublicPath(r *http.Request) bool {
 	return PublicRoute(r.Method, r.URL.Path)
+}
+
+// jobOIDCIssuePrefix is the registered job route prefix.
+const jobOIDCIssuePrefix = "/api/v1/jobs/"
+
+// isJobOIDCIssuePath reports whether path is EXACTLY the job OIDC issuance
+// route shape /api/v1/jobs/{id}/oidc with a single, non-empty {id} segment.
+// Segment counting (instead of a "/oidc" suffix test) is what keeps every
+// other route that merely ends in the same word — a future
+// /api/v1/admin/foo/oidc, or /api/v1/jobs/x/y/oidc — out of the public set.
+func isJobOIDCIssuePath(path string) bool {
+	rest, ok := strings.CutPrefix(path, jobOIDCIssuePrefix)
+	if !ok {
+		return false
+	}
+	id, ok := strings.CutSuffix(rest, "/oidc")
+	if !ok || id == "" {
+		return false
+	}
+	return !strings.Contains(id, "/")
 }
 
 func tokenMatches(got, want string) bool {

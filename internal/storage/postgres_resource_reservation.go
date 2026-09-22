@@ -5,10 +5,13 @@ package storage
 // The lease claim is the ONLY place a reservation is acquired: the same
 // transaction that flips a queued job to running (AcquireLeaseAtomic, and
 // the in-memory mirror in faultstore.go) sums the runner's live reservations,
-// checks the job's requested CPU/memory/disk/PIDs against the runner's
-// remaining resource capacity, and inserts the ledger row. Every path that
-// ends or invalidates a lease deletes the row in its own transaction, so no
-// transition can strand a reservation:
+// checks the candidate's TOTAL request — its own CPU/memory/disk/PIDs plus
+// the aggregate service envelope (LeaseClaim.RequestedResources) — against
+// the runner's remaining resource capacity, and inserts the ledger row. The
+// single row therefore covers the main container and every declared service;
+// there is no separate service row and the release paths are unchanged. Every
+// path that ends or invalidates a lease deletes the row in its own
+// transaction, so no transition can strand a reservation:
 //
 //   - completion             (CompleteJob)
 //   - run cancellation       (CancelRunJobs)
@@ -145,16 +148,30 @@ func overCapacity(capacity, requested model.ResourceCapacity) bool {
 // resource capacity the claim resolved (live profile first, registration
 // snapshot second); the runner row is locked by the caller, so the SUM
 // cannot move under a concurrent claim for the same runner.
+//
+// The reserved quantities are the claim's TOTAL request — the candidate job's
+// own request PLUS its aggregate service envelope (LeaseClaim.
+// RequestedResources, the same model.Job.ReservedResources the scheduler
+// pre-filter and the fs/dev path charge) — so the single row per job covers
+// the main container and every declared service; there is no separate service
+// row and the release paths are unchanged.
+//
+// The SUM EXCLUDES the candidate job's own row: a surviving stale row for
+// THIS job (a release a crashed replica never completed, or a pre-reconcile
+// row with an older generation) must never make the job count its own
+// request twice and spuriously fail the claim. The DELETE below replaces that
+// row, so the exclusion cannot under-count a live sibling.
 func reserveResourcesTx(ctx context.Context, tx pgx.Tx, claim LeaseClaim, capacity model.ResourceCapacity) error {
-	reserved, err := runnerReservedResourcesTx(ctx, tx, claim.RunnerID)
+	reserved, err := runnerReservedResourcesExcludingTx(ctx, tx, claim.RunnerID, claim.JobID)
 	if err != nil {
 		return err
 	}
-	admission := ResourceAdmission{Capacity: capacity, Reserved: reserved, Requested: claim.RequestedResources()}
+	requested := claim.RequestedResources()
+	admission := ResourceAdmission{Capacity: capacity, Reserved: reserved, Requested: requested}
 	if !admission.Allows() {
 		return fmt.Errorf("%w: runner %s requested cpu=%v memory=%d disk=%d pids=%d, reserved cpu=%v memory=%d disk=%d pids=%d, capacity cpu=%v memory=%d disk=%d pids=%d",
 			ErrResourceCapacity, claim.RunnerID,
-			claim.CPURequest, claim.MemoryRequest, claim.DiskRequest, claim.PIDsRequest,
+			requested.CPU, requested.Memory, requested.Disk, requested.PIDs,
 			reserved.CPU, reserved.Memory, reserved.Disk, reserved.PIDs,
 			capacity.CPU, capacity.Memory, capacity.Disk, capacity.PIDs)
 	}
@@ -166,7 +183,7 @@ func reserveResourcesTx(ctx context.Context, tx pgx.Tx, claim LeaseClaim, capaci
 		return err
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO job_resource_reservations (job_id, runner_id, generation, cpu, memory, disk, pids) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		claim.JobID, claim.RunnerID, claim.Generation, claim.CPURequest, claim.MemoryRequest, claim.DiskRequest, claim.PIDsRequest); err != nil {
+		claim.JobID, claim.RunnerID, claim.Generation, requested.CPU, requested.Memory, requested.Disk, requested.PIDs); err != nil {
 		return err
 	}
 	return nil
@@ -192,8 +209,16 @@ type rowQuerier interface {
 // caller's transaction (or over the pool for the observation API). No row
 // means zero on every dimension.
 func runnerReservedResourcesTx(ctx context.Context, q rowQuerier, runnerID string) (model.ResourceCapacity, error) {
+	return runnerReservedResourcesExcludingTx(ctx, q, runnerID, "")
+}
+
+// runnerReservedResourcesExcludingTx is runnerReservedResourcesTx with one
+// job's row excluded from the SUM (empty excludeJobID sums every row). The
+// lease claim excludes the candidate's own row so a stale row for the SAME
+// job can never double-count against it.
+func runnerReservedResourcesExcludingTx(ctx context.Context, q rowQuerier, runnerID, excludeJobID string) (model.ResourceCapacity, error) {
 	var out model.ResourceCapacity
-	err := q.QueryRow(ctx, `SELECT COALESCE(SUM(cpu), 0), COALESCE(SUM(memory), 0), COALESCE(SUM(disk), 0), COALESCE(SUM(pids), 0) FROM job_resource_reservations WHERE runner_id=$1`, runnerID).
+	err := q.QueryRow(ctx, `SELECT COALESCE(SUM(cpu), 0), COALESCE(SUM(memory), 0), COALESCE(SUM(disk), 0), COALESCE(SUM(pids), 0) FROM job_resource_reservations WHERE runner_id=$1 AND ($2 = '' OR job_id <> $2)`, runnerID, excludeJobID).
 		Scan(&out.CPU, &out.Memory, &out.Disk, &out.PIDs)
 	if err != nil {
 		return model.ResourceCapacity{}, err

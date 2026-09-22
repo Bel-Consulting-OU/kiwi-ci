@@ -119,7 +119,29 @@ func TestProfileBindingFourCombinations(t *testing.T) {
 		})
 		createProfile(t, s, model.RunnerProfile{ID: "p", Labels: []string{"container"}, Capabilities: []string{"container"}, MaxCapacity: 2})
 		bindSerial(t, s, "p", "0owned")
-		// Runner B legitimately claims the serial first.
+		// Two per-runner bearer identities present the same pre-bound
+		// certificate serial. In per-runner bearer mode the payload serial
+		// is never a binding key (it is attacker-chosen), so NEITHER runner
+		// inherits the profile; the ownership scan that used to decide this
+		// is not an authorization gate anymore.
+		for i, id := range []string{"runner-a", "runner-b"} {
+			token := []string{"token-a", "token-b"}[i]
+			w := pkiRequest(t, s.Handler(), http.MethodPost, "/api/v1/runners/register",
+				map[string]any{"id": id, "name": id, "protocol_min": 3, "protocol_max": 3, "cert_serial": "0owned"}, token, nil)
+			if w.Code != http.StatusOK {
+				t.Fatalf("register %s: %d %s", id, w.Code, w.Body.String())
+			}
+			var ri model.Runner
+			if err := json.Unmarshal(w.Body.Bytes(), &ri); err != nil {
+				t.Fatal(err)
+			}
+			if len(ri.Labels) != 0 || ri.Capacity != 0 || ri.CertSerial != "" {
+				t.Fatalf("%s inherited the serial-bound profile: %+v", id, ri)
+			}
+		}
+		// The supported path is the admin runner-profile binding: bound
+		// runner-b then resolves its own profile by runner ID.
+		bindRunnerProfile(t, s, "p", "runner-b", "admin-tok")
 		w := pkiRequest(t, s.Handler(), http.MethodPost, "/api/v1/runners/register",
 			map[string]any{"id": "runner-b", "name": "rb", "protocol_min": 3, "protocol_max": 3, "cert_serial": "0owned"}, "token-b", nil)
 		if w.Code != http.StatusOK {
@@ -129,26 +151,8 @@ func TestProfileBindingFourCombinations(t *testing.T) {
 		if err := json.Unmarshal(w.Body.Bytes(), &rb); err != nil {
 			t.Fatal(err)
 		}
-		if len(rb.Labels) != 1 || rb.CertSerial != "0owned" {
-			t.Fatalf("runner-b profile not applied: %+v", rb)
-		}
-		// Runner A presents B's serial: must NOT inherit the profile.
-		w = pkiRequest(t, s.Handler(), http.MethodPost, "/api/v1/runners/register",
-			map[string]any{"id": "runner-a", "name": "ra", "protocol_min": 3, "protocol_max": 3, "cert_serial": "0owned"}, "token-a", nil)
-		if w.Code != http.StatusOK {
-			t.Fatalf("runner-a register: %d %s", w.Code, w.Body.String())
-		}
-		var ra model.Runner
-		if err := json.Unmarshal(w.Body.Bytes(), &ra); err != nil {
-			t.Fatal(err)
-		}
-		if len(ra.Labels) != 0 || ra.Capacity != 0 || ra.CertSerial != "" {
-			t.Fatalf("runner-a stole runner-b's profile through the serial: %+v", ra)
-		}
-		// B's ownership is untouched.
-		rbo, err := s.getRunnerForTest("runner-b")
-		if err != nil || rbo.CertSerial != "0owned" {
-			t.Fatalf("runner-b serial ownership changed: %+v err=%v", rbo, err)
+		if len(rb.Labels) != 1 || rb.Labels[0] != "container" || rb.Capacity != 2 || rb.CertSerial != "" {
+			t.Fatalf("runner-b bound profile not applied: %+v", rb)
 		}
 	})
 }
@@ -250,26 +254,6 @@ func TestProfileEditShrinksLeaseAuthorizationDB(t *testing.T) {
 	}
 }
 
-// getRunnerForTest resolves a runner from the memory map or the store.
-func (s *Server) getRunnerForTest(id string) (model.Runner, error) {
-	if s.DB != nil {
-		return s.DB.GetRunner(context.Background(), id)
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ri, ok := s.runners[id]
-	if !ok {
-		return model.Runner{}, errNotFoundForTest
-	}
-	return ri, nil
-}
-
-var errNotFoundForTest = &testNotFoundError{}
-
-type testNotFoundError struct{}
-
-func (*testNotFoundError) Error() string { return "not found" }
-
 // listErrStore injects a ListRunners failure while satisfying the base
 // storage contract.
 type listErrStore struct {
@@ -282,11 +266,13 @@ func (listErrStore) ListRunners(ctx context.Context) ([]model.Runner, error) {
 
 var errListRunnersForTest = errors.New("list runners down")
 
-// TestBearerSerialOwnershipLookupFailsClosed proves the profile binding is
-// only granted when serial ownership can be POSITIVELY verified as absent
-// or self: a store that cannot answer the ownership question yields no
-// profile instead of trusting the client-asserted serial.
-func TestBearerSerialOwnershipLookupFailsClosed(t *testing.T) {
+// TestBearerSerialNeverConsultedUnderStoreOutage proves the per-runner
+// bearer path does not depend on any runner-listing scan at all: even with a
+// store whose ListRunners fails, the client-asserted serial grants no
+// profile (the binding is the admin-managed runner_profile_links row, which
+// is consulted instead). The old serial-ownership scan is no longer an
+// authorization gate.
+func TestBearerSerialNeverConsultedUnderStoreOutage(t *testing.T) {
 	f := newDBFakeStore()
 	s := New("runner-tok")
 	s.AdminToken = "admin-tok"
@@ -299,20 +285,36 @@ func TestBearerSerialOwnershipLookupFailsClosed(t *testing.T) {
 	if err := s.ProvisionRunnerTokensDB(context.Background(), map[string]string{"runner-a": auth.TokenDigest("token-a")}); err != nil {
 		t.Fatal(err)
 	}
-	// Swap in a store that can still resolve tokens but fails the
-	// ownership scan.
+	// Swap in a store that can still resolve tokens (and runner-ID links)
+	// but fails every runner listing.
 	s.DB = listErrStore{dbFakeStore: f}
 
 	w := pkiRequest(t, s.Handler(), http.MethodPost, "/api/v1/runners/register",
 		map[string]any{"id": "runner-a", "name": "ra", "protocol_min": 3, "protocol_max": 3, "cert_serial": "0owned2"}, "token-a", nil)
 	if w.Code != http.StatusOK {
-		t.Fatalf("register with ownership lookup outage = %d %s", w.Code, w.Body.String())
+		t.Fatalf("register with runner-listing outage = %d %s", w.Code, w.Body.String())
 	}
 	var ri model.Runner
 	if err := json.Unmarshal(w.Body.Bytes(), &ri); err != nil {
 		t.Fatal(err)
 	}
 	if len(ri.Labels) != 0 || ri.Capacity != 0 || ri.CertSerial != "" {
-		t.Fatalf("ownership outage granted the profile: %+v", ri)
+		t.Fatalf("client-asserted serial granted the profile: %+v", ri)
+	}
+	// An admin runner-ID binding still resolves through the same outage
+	// (it never scans runners).
+	if err := f.LinkRunnerProfile(context.Background(), "runner-a", "p"); err != nil {
+		t.Fatal(err)
+	}
+	w = pkiRequest(t, s.Handler(), http.MethodPost, "/api/v1/runners/register",
+		map[string]any{"id": "runner-a", "name": "ra", "protocol_min": 3, "protocol_max": 3, "cert_serial": "0owned2"}, "token-a", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("bound register with runner-listing outage = %d %s", w.Code, w.Body.String())
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &ri); err != nil {
+		t.Fatal(err)
+	}
+	if len(ri.Labels) != 1 || ri.Labels[0] != "container" || ri.Capacity != 2 {
+		t.Fatalf("runner-ID binding lost under runner-listing outage: %+v", ri)
 	}
 }

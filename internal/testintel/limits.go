@@ -86,21 +86,39 @@ const (
 )
 
 // ValidateReportPayload is the SHARED, authoritative enforcement of the
-// report contract on an already-aggregated report: identity byte bounds,
-// numeric semantics, case count, retained message bytes and the serialized
-// payload budget. It is called by the parser after aggregation, by the
-// runner's pre-upload check and by the /tests handler after decoding, so a
-// report just over any shared limit is rejected with the same
-// ErrLimitExceeded reason at every layer. The numeric policy matters even
-// though the JUnit parser sanitizes: a lease-authenticated runner can POST a
-// model.TestReport directly to /tests, and its counters and durations flow
-// into SQL, metrics and EWMA state, so this validator is the trust boundary
-// regardless of the producer. The parser additionally enforces the
-// input-side limits (per-file bytes, per-file cases, matched files and total
-// input bytes) that only exist while reading files, and truncates retained
-// messages to MaxMessageBytes rather than rejecting a producer's oversized
-// failure text.
+// report contract on an already-aggregated report:
+//
+//   - every declared counter lies in [0, MaxJobCases];
+//   - Failures+Errors+Skipped <= Tests (the three outcomes partition Tests,
+//     so their sum — not each counter individually — must fit);
+//   - len(Cases) <= Tests (a report may declare more tests than it
+//     materialized, never fewer than its cases);
+//   - Failures+Errors >= the materialized failing cases and Skipped >= the
+//     materialized skipped cases (case-derived lower bounds; the model
+//     collapses <failure> and <error> into one non-passing case, so the
+//     failing observations are bounded as a pair);
+//   - no case is both Passed and Skipped;
+//   - identities, durations and retained message bytes are bounded, and the
+//     serialized payload fits MaxTestReportPayloadBytes.
+//
+// It is called by the parser after aggregation, by the runner's pre-upload
+// check and by the /tests handler after decoding, so a report just over any
+// shared limit is rejected with the same ErrLimitExceeded reason at every
+// layer. The numeric policy matters even though the JUnit parser sanitizes: a
+// lease-authenticated runner can POST a model.TestReport directly to /tests,
+// and its counters and durations flow into SQL, metrics and EWMA state, so
+// this validator is the trust boundary regardless of the producer. The parser
+// additionally enforces the input-side limits (per-file bytes, per-file
+// cases, matched files and total input bytes) that only exist while reading
+// files, and truncates retained messages to MaxMessageBytes rather than
+// rejecting a producer's oversized failure text.
 func ValidateReportPayload(rep model.TestReport) error {
+	// Counter bounds. Every declared counter is an int that flows into SQL
+	// int columns, the aggregate fold and metrics, so it must be inside the
+	// job's case budget: MaxJobCases bounds every counter both ways
+	// (negative counts are producer garbage and 64-bit values above the
+	// budget would overflow the SQL int column or fabricate history no
+	// materialized case explains).
 	for _, c := range []struct {
 		name  string
 		value int
@@ -113,12 +131,22 @@ func ValidateReportPayload(rep model.TestReport) error {
 		if c.value < 0 {
 			return fmt.Errorf("%w: report declares a negative %s counter (%d)", ErrLimitExceeded, c.name, c.value)
 		}
+		if c.value > MaxJobCases {
+			return fmt.Errorf("%w: report declares %s=%d, over the %d-case job budget", ErrLimitExceeded, c.name, c.value, MaxJobCases)
+		}
 	}
-	if int64(rep.Failures)+int64(rep.Errors) > int64(rep.Tests) {
-		return fmt.Errorf("%w: failures+errors (%d+%d) exceeds tests (%d)", ErrLimitExceeded, rep.Failures, rep.Errors, rep.Tests)
+	// Counter RELATIONS. The three outcome counters partition the tests, so
+	// their SUM (not each individually) must fit inside tests: failures=8,
+	// errors=8, skipped=8 with tests=10 is contradictory even though every
+	// individual counter is within tests.
+	if int64(rep.Failures)+int64(rep.Errors)+int64(rep.Skipped) > int64(rep.Tests) {
+		return fmt.Errorf("%w: failures+errors+skipped (%d+%d+%d) exceeds tests (%d)", ErrLimitExceeded, rep.Failures, rep.Errors, rep.Skipped, rep.Tests)
 	}
-	if rep.Skipped > rep.Tests {
-		return fmt.Errorf("%w: skipped (%d) exceeds tests (%d)", ErrLimitExceeded, rep.Skipped, rep.Tests)
+	// The declared test count is authoritative: a report may declare more
+	// tests than it materialized (truncated case lists are legal), but never
+	// fewer than the cases it actually carries.
+	if len(rep.Cases) > rep.Tests {
+		return fmt.Errorf("%w: %d materialized cases exceed the declared tests counter (%d)", ErrLimitExceeded, len(rep.Cases), rep.Tests)
 	}
 	if !validDuration(rep.Duration) {
 		return fmt.Errorf("%w: report duration %v is not finite, non-negative and at most %v seconds", ErrLimitExceeded, rep.Duration, float64(maxReportDuration))
@@ -129,7 +157,27 @@ func ValidateReportPayload(rep model.TestReport) error {
 	if len(rep.Cases) > MaxJobCases {
 		return fmt.Errorf("%w: %d cases exceeds the %d-case job budget", ErrLimitExceeded, len(rep.Cases), MaxJobCases)
 	}
+	// CASE-DERIVED LOWER BOUNDS. The materialized cases are what the
+	// historical fold observes, so no counter may be SMALLER than the cases
+	// that explain it. A skipped case (Passed=false, Skipped=true) is a skip
+	// and nothing else; a case with Passed=false and Skipped=false is a
+	// FAILURE or an ERROR — model.TestResult deliberately collapses the
+	// JUnit <failure>/<error> distinction into one non-passing outcome, so
+	// the faithful lower bound is the PAIR bound
+	// Failures+Errors >= failing cases (a direct submission can neither
+	// under-state the failing observations nor claim a failing case is a
+	// pass), together with Skipped >= skipped cases. The parser's suite
+	// derivation satisfies exactly this bound.
+	var skippedCases, failingCases int
 	for i, c := range rep.Cases {
+		if c.Passed && c.Skipped {
+			return fmt.Errorf("%w: case %d is both passed and skipped", ErrLimitExceeded, i)
+		}
+		if c.Skipped {
+			skippedCases++
+		} else if !c.Passed {
+			failingCases++
+		}
 		if len(c.Name) > MaxTestNameBytes {
 			return fmt.Errorf("%w: case %d name is %d bytes, over the %d-byte name budget", ErrLimitExceeded, i, len(c.Name), MaxTestNameBytes)
 		}
@@ -142,6 +190,12 @@ func ValidateReportPayload(rep model.TestReport) error {
 		if len(c.Message) > MaxMessageBytes {
 			return fmt.Errorf("%w: case %d message is %d bytes, over the %d-byte message budget", ErrLimitExceeded, i, len(c.Message), MaxMessageBytes)
 		}
+	}
+	if skippedCases > rep.Skipped {
+		return fmt.Errorf("%w: %d materialized skipped cases exceed the skipped counter (%d)", ErrLimitExceeded, skippedCases, rep.Skipped)
+	}
+	if int64(failingCases) > int64(rep.Failures)+int64(rep.Errors) {
+		return fmt.Errorf("%w: %d materialized failing cases exceed failures+errors (%d+%d)", ErrLimitExceeded, failingCases, rep.Failures, rep.Errors)
 	}
 	payload, err := json.Marshal(rep)
 	if err != nil {

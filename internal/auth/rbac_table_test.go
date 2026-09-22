@@ -71,6 +71,12 @@ func TestActionForMapping(t *testing.T) {
 		{"POST", "/api/v1/drain", "", false},
 		{"GET", "/api/v1/drain", "", false},
 		{"POST", "/api/v1/runners/enroll", "", false},
+		// Runner-ID profile bind/unbind is deliberately unhandled so
+		// classifyRoute sends it to the admin tier (the AdminToken or an
+		// admin role), matching the other admin-only operations such as
+		// drain.
+		{"PUT", "/api/v1/runner-profiles/p1/runner/r1", "", false},
+		{"DELETE", "/api/v1/runner-profiles/p1/runner/r1", "", false},
 		{"GET", "/api/v1/oidc/jwks", "", false},
 		{"POST", "/api/v1/jobs/j1/secrets", "", false},
 		{"GET", "/metrics", "", false},

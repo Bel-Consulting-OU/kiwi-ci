@@ -58,6 +58,12 @@ type Snapshot struct {
 	// equivalents). Additive; older snapshots load with nil maps.
 	Profiles         map[string]model.RunnerProfile `json:"profiles,omitempty"`
 	CertProfileLinks map[string]string              `json:"cert_profile_links,omitempty"`
+	// RunnerProfileLinks persists the fs-mode runner-ID -> profile bindings
+	// (the runner_profile_links equivalents introduced with migration 0031):
+	// per-runner bearer identities resolve their profile through this map,
+	// never through a client-asserted certificate serial. Additive; older
+	// snapshots load with a nil map.
+	RunnerProfileLinks map[string]string `json:"runner_profile_links,omitempty"`
 	// Snapshots persists the fs-mode uploaded workspace snapshot records
 	// (workspace_snapshots equivalents) so the archives written under the
 	// data dir stay addressable across restarts instead of becoming
@@ -188,6 +194,9 @@ func (r *Repository) loadLocked() (Snapshot, error) {
 	}
 	if s.CertProfileLinks == nil {
 		s.CertProfileLinks = map[string]string{}
+	}
+	if s.RunnerProfileLinks == nil {
+		s.RunnerProfileLinks = map[string]string{}
 	}
 	if s.Snapshots == nil {
 		s.Snapshots = map[string]model.SnapshotRecord{}

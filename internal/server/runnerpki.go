@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/pem"
@@ -59,16 +60,32 @@ func (s *Server) loadRunnerCA(dataDir string) error {
 }
 
 // EnsureRunnerCA makes sure a runner CA is available for enrollment. Every
-// auto-CA path goes through the cluster key store: the CA material is ONE
-// atomic cluster-key object ("runner-ca") shared by all replicas, never
-// node-local dataDir files. In DB mode without a cluster key store this
-// refuses — a data-dir-local CA could never be shared with replicas.
+// auto-CA path goes through the cluster key store's InstallOrLoad primitive:
+// the CA material is ONE atomic cluster-key object ("runner-ca") shared by
+// all replicas, never node-local dataDir files. A store that already holds
+// material wins, so replicas racing to enroll converge on ONE CA instead of
+// each minting its own. In DB mode without a cluster key store this refuses —
+// a data-dir-local CA could never be shared with replicas.
 func (s *Server) EnsureRunnerCA() error {
 	if s.RunnerCA != nil {
 		return nil
 	}
 	if s.ClusterKeys == nil {
-		return fmt.Errorf("runner CA requires a cluster key store: configure --cluster-key-dir (with --data-dir) or pass explicit --runner-ca-cert/--runner-ca-key")
+		return fmt.Errorf("runner CA requires a cluster key store: configure --database-url (the DB-backed store), --cluster-key-dir (with --data-dir), or pass explicit --runner-ca-cert/--runner-ca-key")
+	}
+	if installer, ok := s.ClusterKeys.(ClusterKeyInstaller); ok {
+		// Generate a candidate and let the store's create-if-absent
+		// semantics decide: when a shared CA already exists it is returned
+		// and the candidate is discarded, so every replica trusts one CA.
+		candidate, err := createClusterKey(clusterKindRunnerCA)
+		if err != nil {
+			return err
+		}
+		b, _, err := installer.InstallOrLoad(clusterKindRunnerCA, candidate)
+		if err != nil {
+			return err
+		}
+		return s.setRunnerCAFromBlob(b)
 	}
 	b, err := s.ClusterKeys.LoadOrCreate(clusterKindRunnerCA)
 	if err != nil {
@@ -77,7 +94,14 @@ func (s *Server) EnsureRunnerCA() error {
 	return s.setRunnerCAFromBlob(b)
 }
 
-// SetRunnerCA installs a runner CA from explicit PEM file paths.
+// SetRunnerCA installs a runner CA from explicit PEM file paths. When a
+// shared cluster key store is configured, the material is atomically
+// installed into it (create-if-absent) and compared against the shared
+// runner CA the other replicas trust: bytes that disagree with the cluster's
+// CA fail startup with a clear error instead of silently trusting a
+// node-local CA that peers reject. The loaded CA always comes from the
+// store's bytes, never from the local files alone. Without a cluster store
+// (in-memory dev server) the explicit files remain the only CA source.
 func (s *Server) SetRunnerCA(certPath, keyPath string) error {
 	certPEM, err := os.ReadFile(certPath)
 	if err != nil {
@@ -91,8 +115,53 @@ func (s *Server) SetRunnerCA(certPath, keyPath string) error {
 	if err != nil {
 		return err
 	}
-	s.RunnerCA = ca
-	return nil
+	if s.ClusterKeys == nil {
+		s.RunnerCA = ca
+		return nil
+	}
+	installer, ok := s.ClusterKeys.(ClusterKeyInstaller)
+	if !ok {
+		return fmt.Errorf("configured runner CA requires a cluster key store that supports install-or-load sharing; the configured store cannot share runner CA material")
+	}
+	explicit := runnerCAObject(certPEM, keyPEM)
+	shared, created, err := installer.InstallOrLoad(clusterKindRunnerCA, explicit)
+	if err != nil {
+		return fmt.Errorf("install runner CA in the cluster key store: %w", err)
+	}
+	if !created && !runnerCAObjectsAgree(shared, explicit) {
+		return fmt.Errorf("configured runner CA disagrees with cluster runner CA: the shared cluster key store already holds different runner CA material, so --runner-ca-cert/--runner-ca-key would make this replica trust certificates the other replicas reject; use the shared CA material or remove the divergent files")
+	}
+	return s.setRunnerCAFromBlob(shared)
+}
+
+// runnerCAObject joins a runner CA certificate PEM and private key PEM into
+// the canonical single cluster-key object (cert PEM + NUL + key PEM).
+func runnerCAObject(certPEM, keyPEM []byte) []byte {
+	obj := make([]byte, 0, len(certPEM)+1+len(keyPEM))
+	obj = append(obj, certPEM...)
+	obj = append(obj, 0)
+	obj = append(obj, keyPEM...)
+	return obj
+}
+
+// runnerCAObjectsAgree reports whether two runner CA cluster objects
+// identify the same CA. Byte-identical objects agree trivially; otherwise
+// both are parsed and compared by certificate DER, so PEM formatting
+// differences and the legacy separator-less object layout cannot turn the
+// same CA into a startup failure while a genuinely different CA always
+// disagrees.
+func runnerCAObjectsAgree(a, b []byte) bool {
+	if bytes.Equal(a, b) {
+		return true
+	}
+	certA, keyA, errA := splitRunnerCAPEMs(a)
+	certB, keyB, errB := splitRunnerCAPEMs(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	caA, errA := runnerpki.LoadCA(certA, keyA)
+	caB, errB := runnerpki.LoadCA(certB, keyB)
+	return errA == nil && errB == nil && bytes.Equal(caA.Cert.Raw, caB.Cert.Raw)
 }
 
 // enroll signs a runner CSR after the enrollment token check already
@@ -325,43 +394,86 @@ func (s *Server) verifyRunnerIdentity(r *http.Request, payloadRunnerID string) b
 	return true
 }
 
-// requestCertSerial resolves the certificate serial identifying the
-// registering runner: the TLS peer certificate when runner mTLS is in
-// play, otherwise the payload's cert_serial (bearer mode, where the serial
-// is the profile binding key). An empty result means no binding.
+// runnerProfileBinding names the identity a registering request was
+// AUTHENTICATED with, which is the only thing allowed to select a runner
+// profile. At most one field is set:
 //
-// In bearer mode the payload serial is client-asserted, so it is honored
-// only when it is not already owned by a DIFFERENT runner: a per-runner
-// bearer token must not be able to claim another runner's serial, because
-// that would hand the presenter the other runner's profile (labels,
-// capabilities, capacity, repository ACL) and with it the other runner's
-// leases. A serial already owned by the authenticated runner (legacy
-// re-registration without a bearer identity) or not owned at all (first
-// registration) is honored.
-func (s *Server) requestCertSerial(r *http.Request, payloadSerial string) string {
+//   - Serial: a certificate serial safe to use as a binding key. It is the
+//     serial of the TLS peer certificate AFTER that certificate verified
+//     against the runner CA (mTLS identity), or — in the legacy/dev
+//     shared-token mode only — the client-asserted payload serial.
+//   - RunnerID: the authenticated per-runner bearer identity, resolved
+//     through the durable runner_profile_links binding.
+type runnerProfileBinding struct {
+	Serial   string
+	RunnerID string
+}
+
+// resolveRegistrationProfileBinding derives the profile-binding identity
+// from the transport identity that AUTHENTICATED the request. It is the
+// ONLY place a registration profile key is chosen, and it NEVER honors the
+// client-asserted cert_serial while a per-runner identity mode is active:
+//
+//   - mTLS: the serial of the VERIFIED TLS peer certificate. peerRunnerID
+//     verifies the chain against the runner CA, so a presented-but-
+//     unverified certificate contributes nothing (an arbitrary client
+//     certificate must not select another runner's serial binding).
+//   - per-runner bearer token (with or without a runner CA): the
+//     authenticated runner ID. The payload cert_serial is ignored, so a
+//     bearer token can never claim another runner's certificate-serial
+//     binding. This replaces the old payload-serial ownership scan, which
+//     was client-asserted and racy: two concurrent bearers both saw the
+//     serial "unclaimed" and both inherited the profile.
+//   - legacy/dev shared-token mode (no runner CA and no per-runner token
+//     resolved): the payload serial is the dev binding key, honored only
+//     while no OTHER runner row currently holds it (serialClaimedByOther).
+//     Production bearer mode always has per-runner credentials, so this
+//     branch is unreachable there.
+//
+// self is the runner ID the registration acts for (the authenticated ID, or
+// the claimed/minted one in legacy mode); it only scopes the legacy
+// uniqueness check to "owned by someone else". An auth-store failure yields
+// an empty binding: registration continues WITHOUT a profile and fails
+// closed under RequireProfiles.
+func (s *Server) resolveRegistrationProfileBinding(r *http.Request, self, payloadSerial string) runnerProfileBinding {
 	if s.RunnerCA != nil {
+		// mTLS identity: only a certificate that verified against the
+		// runner CA may contribute its serial.
 		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 && r.TLS.PeerCertificates[0] != nil {
-			return r.TLS.PeerCertificates[0].SerialNumber.Text(16)
+			if _, err := s.peerRunnerID(r); err == nil {
+				return runnerProfileBinding{Serial: r.TLS.PeerCertificates[0].SerialNumber.Text(16)}
+			}
 		}
-		return ""
+		if bearerID, ok, err := s.runnerBearerID(r); err == nil && ok {
+			return runnerProfileBinding{RunnerID: bearerID}
+		}
+		return runnerProfileBinding{}
+	}
+	if bearerID, ok, err := s.runnerBearerID(r); err == nil && ok {
+		return runnerProfileBinding{RunnerID: bearerID}
+	} else if err != nil {
+		// Identity-store failure: no binding, no profile (fail closed).
+		return runnerProfileBinding{}
 	}
 	serial := strings.TrimSpace(payloadSerial)
 	if serial == "" {
-		return ""
+		return runnerProfileBinding{}
 	}
-	if bearerID, ok, err := s.runnerBearerID(r); err == nil && ok {
-		stolen, err := s.serialClaimedByOther(r.Context(), serial, bearerID)
-		if err != nil || stolen {
-			return ""
-		}
+	if claimed, err := s.serialClaimedByOther(r.Context(), serial, self); err != nil || claimed {
+		return runnerProfileBinding{}
 	}
-	return serial
+	return runnerProfileBinding{Serial: serial}
 }
 
 // serialClaimedByOther reports whether a certificate serial is currently
-// registered to a runner other than self. A store error fails closed
-// (reported as claimed): the profile binding is only granted when ownership
-// can be positively verified as absent or self.
+// registered to a runner other than self. It is a DEV/LEGACY uniqueness
+// helper ONLY (the legacy shared-token registration path), so two dev
+// runners do not both record one payload serial. It is NOT an authorization
+// gate: no profile is ever selected from a client-asserted serial, so a
+// false "unclaimed" answer cannot hand the caller a profile — profile
+// selection for per-runner identities comes exclusively from the
+// runner_profile_links PRIMARY KEY binding. A store error fails closed
+// (reported as claimed).
 func (s *Server) serialClaimedByOther(ctx context.Context, serial, self string) (bool, error) {
 	if serial == "" {
 		return false, nil

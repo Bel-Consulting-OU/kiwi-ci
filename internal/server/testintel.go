@@ -173,6 +173,13 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 	if existing, ok := s.reports[rep.ID]; ok {
 		s.mu.Unlock()
 		if sameTestReportContent(existing, rep) {
+			// Retry convergence: the durable report is the source of truth,
+			// so an identical replay whose fold never reached the derived
+			// history snapshot is folded NOW, exactly once (the fold is
+			// idempotent by report ID), before the success is answered. A
+			// replayed delivery can therefore never leave the history
+			// permanently missing this report.
+			s.ensureReportFolded(repo, existing)
 			writeJSON(w, http.StatusOK, existing)
 			return
 		}
@@ -412,6 +419,10 @@ func (s *Server) testIntelligence(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Memory/fs mode: make sure the snapshot is derived from the DURABLE
+	// reports before answering, so a report whose history cache write failed
+	// (or a stale cache file loaded at startup) can never hide its history.
+	s.ensureDerivedHistoryLocked()
 	filtered := []model.TestReport{}
 	for _, rep := range s.reports {
 		run, ok := s.runs[rep.RunID]
@@ -521,6 +532,12 @@ func summarizeTestIntelligence(reports []model.TestReport) map[string]any {
 		tests += rep.Tests
 		failures += rep.Failures
 		for _, c := range rep.Cases {
+			// Skip policy: a skipped case is not a pass/fail observation, so
+			// it must not enter the report-derived outcome window (it would
+			// read as a failure and fabricate flakiness).
+			if c.Skipped {
+				continue
+			}
 			key := testOutcomeIdentity{suite: rep.JobKey, class: c.Class, name: c.Name}
 			window := append(history[key], c.Passed)
 			if len(window) > testintel.OutcomeWindow {

@@ -195,6 +195,28 @@ type Job struct {
 	MemoryRequest int64   `json:"memory_request,omitempty"`
 	DiskRequest   int64   `json:"disk_request,omitempty"`
 	PIDsRequest   int     `json:"pids_request,omitempty"`
+	// ServiceEnvelopeRequest is the AGGREGATE CPU/memory/PIDs the job's
+	// declared service containers may consume. It is stamped at enqueue from
+	// the effective compiled job through the executor's ONE fair-split
+	// planner (executor.ServiceEnvelopeRequest), for trusted and untrusted
+	// jobs alike. Disk is never part of it: service containers are read-only
+	// with a tmpfs and carry no workspace bound.
+	//
+	// Reservation semantics: a lease reserves the job's own request PLUS this
+	// aggregate (see ReservedResources). Where the runner can establish a
+	// job-scoped parent cgroup, the kernel additionally bounds the main
+	// container and every service together by the job's declared envelope;
+	// where it cannot (non-Linux, cgroup v1, no delegation, systemd driver —
+	// probed and logged by the runner), the per-container caps plus the fair
+	// split are the only enforcement, and this reservation is the bound that
+	// keeps aggregate host usage within the runner's capacity across
+	// replicas. The scheduler cannot probe the runner's host, so the
+	// aggregate is charged either way and is never double-counted against
+	// the job's own envelope.
+	//
+	// Additive: jobs persisted before this field default to the zero value,
+	// which reserves exactly what the pre-envelope ledger reserved.
+	ServiceEnvelopeRequest ResourceCapacity `json:"service_envelope_request,omitempty"`
 	// QueueDeadline is the absolute queue-residence deadline derived from
 	// the job's queue_timeout at enqueue (CreatedAt + queue_timeout). The
 	// scheduler skips candidates past the deadline and RecoverExpired
@@ -297,6 +319,25 @@ func ResourceCapacityFromProfile(p RunnerProfile) ResourceCapacity {
 // ResourceCapacity.
 func (j Job) ResourceRequest() ResourceCapacity {
 	return ResourceCapacity{CPU: j.CPURequest, Memory: j.MemoryRequest, Disk: j.DiskRequest, PIDs: j.PIDsRequest}
+}
+
+// AddResourceCapacity returns a+b dimension by dimension. It is the ONE
+// summation the job/service reservation shares: Job.ReservedResources and
+// LeaseClaim.RequestedResources both call it, so the scheduler's pre-filter,
+// the SQL claim and its reservation row, the memory-store claim, the fs/dev
+// admission in server.next and the leader-promotion reconciliation always
+// agree on the reserved total.
+func AddResourceCapacity(a, b ResourceCapacity) ResourceCapacity {
+	return ResourceCapacity{CPU: a.CPU + b.CPU, Memory: a.Memory + b.Memory, Disk: a.Disk + b.Disk, PIDs: a.PIDs + b.PIDs}
+}
+
+// ReservedResources returns the TOTAL resources a lease on this job reserves
+// against its runner: the job's own declared request plus its aggregate
+// service envelope (ServiceEnvelopeRequest). A job without services — or a
+// legacy payload persisted before the envelope field — reserves exactly its
+// own request, the pre-envelope behavior.
+func (j Job) ReservedResources() ResourceCapacity {
+	return AddResourceCapacity(j.ResourceRequest(), j.ServiceEnvelopeRequest)
 }
 
 // CompiledJobPayload is the enqueue-time compilation record persisted on a

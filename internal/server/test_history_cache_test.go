@@ -660,17 +660,21 @@ func TestTestHistoryMemorySnapshotStableAcrossUpdate(t *testing.T) {
 	}
 }
 
-// TestTestHistoryMemoryWriteFailureKeepsSnapshot proves the durability rule of
-// the memory/fs copy-on-write: when the history file write (save or commit)
-// fails, the old snapshot keeps serving and the failed fold is NEVER visible.
-func TestTestHistoryMemoryWriteFailureKeepsSnapshot(t *testing.T) {
+// TestTestHistoryMemoryWriteFailureKeepsFoldVisible pins the durability rule
+// of the memory/fs copy-on-write AFTER the durable-report fix: the report is
+// the durable artifact (the caller committed it to state.json before calling
+// this), so a failed history-CACHE write must not withhold the fold — the
+// derived snapshot is published as a NEW generation while every snapshot a
+// reader already holds stays frozen (never mutated in place). The cache file
+// is repaired by the next successful write or by the startup rebuild.
+func TestTestHistoryMemoryWriteFailureKeepsFoldVisible(t *testing.T) {
 	ctx := context.Background()
 	repo := "github.com/o/a"
 	s, err := NewPersistent("token", "token", t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.recordTestReportHistory(ctx, repo, model.TestReport{JobKey: "build", CreatedAt: time.Now().UTC(),
+	s.recordTestReportHistory(ctx, repo, model.TestReport{ID: "rep-1", JobKey: "build", CreatedAt: time.Now().UTC(),
 		Cases: []model.TestResult{{Class: "C", Name: "a-slow", Passed: false}, {Class: "C", Name: "a-slow", Passed: true}}})
 	held := s.cachedHistory(repo)
 	before := held.Manifest(repo, "build")
@@ -681,25 +685,33 @@ func TestTestHistoryMemoryWriteFailureKeepsSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.historyFile = block + "/sub/history.json"
-	s.recordTestReportHistory(ctx, repo, model.TestReport{JobKey: "build", CreatedAt: time.Now().UTC(),
+	s.recordTestReportHistory(ctx, repo, model.TestReport{ID: "rep-2", JobKey: "build", CreatedAt: time.Now().UTC(),
 		Cases: []model.TestResult{{Class: "C", Name: "a-late", Passed: true}}})
-	if s.cachedHistory(repo) != held {
-		t.Fatal("a failed save published a mutated snapshot")
+	afterSave := s.cachedHistory(repo)
+	if afterSave == held {
+		t.Fatal("the durable report's fold did not publish a new snapshot")
 	}
 	if got := held.Manifest(repo, "build"); !reflect.DeepEqual(got, before) {
-		t.Fatalf("a failed save mutated the held snapshot: %v", got)
+		t.Fatalf("a failed save mutated a held snapshot: %v", got)
+	}
+	if got := afterSave.Manifest(repo, "build"); !reflect.DeepEqual(got, []string{"C.a-late", "C.a-slow"}) {
+		t.Fatalf("the fold was withheld after a failed cache save: %v", got)
 	}
 
 	// Commit failure: the staged file writes next to a DIRECTORY, so the
 	// rename onto the history path fails after a successful stage.
 	s.historyFile = t.TempDir()
-	s.recordTestReportHistory(ctx, repo, model.TestReport{JobKey: "build", CreatedAt: time.Now().UTC(),
+	s.recordTestReportHistory(ctx, repo, model.TestReport{ID: "rep-3", JobKey: "build", CreatedAt: time.Now().UTC(),
 		Cases: []model.TestResult{{Class: "C", Name: "a-later", Passed: true}}})
-	if s.cachedHistory(repo) != held {
-		t.Fatal("a failed commit published a mutated snapshot")
+	afterCommit := s.cachedHistory(repo)
+	if afterCommit == afterSave {
+		t.Fatal("the durable report's fold did not publish a new snapshot after a failed commit")
 	}
-	if got := strings.Join(held.Manifest(repo, "build"), ","); got != strings.Join(before, ",") {
-		t.Fatalf("a failed commit mutated the held snapshot: %v", got)
+	if got := strings.Join(afterSave.Manifest(repo, "build"), ","); got != "C.a-late,C.a-slow" {
+		t.Fatalf("held snapshot changed after a failed commit: %v", got)
+	}
+	if got := afterCommit.Manifest(repo, "build"); !reflect.DeepEqual(got, []string{"C.a-late", "C.a-later", "C.a-slow"}) {
+		t.Fatalf("fold after a failed commit = %v", got)
 	}
 }
 

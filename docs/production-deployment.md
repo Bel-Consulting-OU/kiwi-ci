@@ -20,9 +20,12 @@ local testing and is not covered here beyond the basics.
     runner mTLS (`--runner-ca-cert`/`--runner-ca-key` with
     `--runner-require-client-certs`) or provisioned per-runner bearer
     credentials (`--runner-tokens-file`, or rows already present in
-    `runner_bearer_tokens`). This half of the contract is checked AFTER
-    the database opens, because the credentials may already be
-    provisioned there. The shared `--runner-token` is dev/bootstrap
+    `runner_bearer_tokens`). The runner PKI is initialized BEFORE this
+    check (an explicit CA is installed into the shared cluster key store,
+    an enrollment token materializes the shared CA), and the decision uses
+    the ACTUAL initialized state, because the credentials may already be
+    provisioned in the database and the CA only exists once the cluster
+    key store is reachable. The shared `--runner-token` is dev/bootstrap
     compatibility only: the server clears it at startup and production
     refuses runner traffic authenticated with it;
   - `--external-url` starting with `https://` is required (the OIDC
@@ -84,6 +87,16 @@ two replicas with separate data dirs would each pass a naive readiness
 check while holding different keys. When a data dir exists, its existing
 key files are migrated into the shared store on first use, so upgrading a
 single-node deployment keeps its OIDC/provenance/runner-CA trust roots.
+
+The runner CA obeys the same one-trust-root rule: `--runner-ca-cert`/
+`--runner-ca-key` is atomically installed-or-compared against the shared
+cluster key store (create-if-absent; the stored material wins). An explicit
+CA whose bytes disagree with the already-installed cluster CA fails startup
+with a "configured runner CA disagrees with cluster runner CA" error instead
+of silently trusting a node-local CA the other replicas reject. A CA
+generated from an enrollment token is created through the same
+install-or-load primitive, so replicas that race to enroll converge on ONE
+CA rather than minting one each.
 
 OIDC key rotation is fenced across replicas: a due rotation takes a
 PostgreSQL advisory lock, reloads the shared ring, re-checks that rotation
@@ -147,7 +160,8 @@ least one actual per-runner mechanism exists:
   server rejects the shared token as soon as per-runner credentials exist;
 - **enforced runner mTLS** — `--runner-ca-cert`/`--runner-ca-key` plus
   runner certificates (see below), with `--runner-require-client-certs`
-  at its default.
+  at its default. The CA is installed into the shared cluster key store
+  and must agree with the CA every other replica already trusts.
 
 If the per-runner credential store is unavailable at request time, the
 runner tier answers 503 and never falls back to the shared token.
@@ -160,7 +174,9 @@ openssl req -x509 -newkey ed25519 -keyout runner-ca.key -out runner-ca.crt \
 ```
 
 Then start the server with `--runner-ca-cert`/`--runner-ca-key` (or
-`--data-dir` plus `--runner-enroll-token` to persist a generated CA),
+`--runner-enroll-token` to persist a generated CA in the shared cluster key
+store: PostgreSQL in DB mode, which needs NO node-local `--data-dir`; the
+FS cluster key store under `--data-dir`/`--cluster-key-dir` in file mode),
 and enroll runners:
 
 ```bash

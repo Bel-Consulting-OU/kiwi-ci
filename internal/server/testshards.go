@@ -53,6 +53,22 @@ const historyStaleVersion = -1
 type repoHistoryCacheEntry struct {
 	version int64
 	history *testintel.History
+	// foldedReports is the set of DURABLE report IDs this snapshot was
+	// derived from in memory/fs mode. A nil set means the snapshot came from
+	// the test-history.json cache and has not been derived from the durable
+	// reports (s.reports) in this process yet: the first derived use rebuilds
+	// it. A non-nil set is exact — every ID in it has been folded into
+	// history and no other durable report has — so a retry can fold a report
+	// exactly once and a restart's rebuild cannot double-count. It is unused
+	// in DB modes (the aggregates are the durable history there).
+	foldedReports map[string]struct{}
+	// reportsSeen is len(s.reports) at the moment this snapshot last absorbed
+	// the durable report set. A derived read whose count differs means a
+	// durable report was committed (or rolled back) without this snapshot
+	// observing it, so the snapshot is rebuilt from the reports before it is
+	// served — the backstop that makes convergence independent of which
+	// mutation path ran.
+	reportsSeen int
 }
 
 // historyOrNew returns the entry's snapshot, allocating an empty one when the
@@ -204,8 +220,12 @@ func (c *repoHistoryCache) has(key string) bool {
 
 // loadTestintelHistory installs the whole-history snapshot. In memory/fs mode
 // it restores the persisted history from dataDir/test-history.json; a missing
-// file starts empty. The file is always persisted (both memory and DB modes):
-// it is the complete durable history store for servers without SQL.
+// file starts empty. The file is a CACHE: the durable reports (s.reports,
+// committed to state.json by the upload path) are the source of truth, and
+// the loaded snapshot is marked as not-yet-derived from them, so the first
+// derived use rebuilds it from the durable reports (ensureDerivedHistoryLocked).
+// A corrupt file still fails startup closed rather than silently starting
+// from a snapshot of unknown provenance.
 func (s *Server) loadTestintelHistory(dataDir string) error {
 	path := ""
 	if dataDir != "" {
@@ -265,11 +285,148 @@ func (s *Server) mirrorTestReportHistoryDB(repo string) {
 	})
 }
 
-// foldReportCases records every case of rep under repo into h. h must be
-// privately owned by the caller (a clone): the fold is the mutation that must
-// never reach a published snapshot.
+// ensureDerivedHistoryLocked returns the whole-history snapshot for memory/fs
+// mode, rebuilding it from the DURABLE reports (s.reports) when this process
+// has not derived it yet. Reports are the source of truth in fs mode — they
+// commit to state.json with the upload — while test-history.json and the
+// in-memory snapshot are only caches, so a snapshot that predates a durable
+// report (a failed cache write, or a restart that loaded a stale cache file)
+// can never keep serving a history that omits it. The rebuild folds the
+// reports in the SAME deterministic (created_at, id) order every other
+// history builder uses, and records exactly which report IDs it folded so an
+// identical retry never folds one twice.
+//
+// The caller must hold s.mu (it reads s.reports and s.runs and publishes the
+// rebuilt snapshot). The cache mutex is taken inside, which is the documented
+// leaf-lock order. DB modes are untouched: their durable aggregates are the
+// source of truth and are converged by historyForRepo/mirrorTestReportHistoryDB.
+func (s *Server) ensureDerivedHistoryLocked() repoHistoryCacheEntry {
+	entry, _ := s.historyCache.lookup(historyWholeCacheKey)
+	if s.DB != nil {
+		return entry
+	}
+	if entry.foldedReports != nil && entry.reportsSeen == len(s.reports) {
+		return entry
+	}
+	reports := make([]model.TestReport, 0, len(s.reports))
+	for _, rep := range s.reports {
+		reports = append(reports, rep)
+	}
+	// Deterministic build order (created_at, then id), the SAME order the
+	// incremental upload path observes them in and the SQL rebuild uses, so
+	// derived and incrementally folded histories agree exactly.
+	sort.SliceStable(reports, func(i, j int) bool {
+		if !reports[i].CreatedAt.Equal(reports[j].CreatedAt) {
+			return reports[i].CreatedAt.Before(reports[j].CreatedAt)
+		}
+		return reports[i].ID < reports[j].ID
+	})
+	h := testintel.NewHistory()
+	folded := make(map[string]struct{}, len(reports))
+	for _, rep := range reports {
+		// A report is attributed to its run's canonical repository identity;
+		// without an authoritative run there is no key the report could be
+		// folded under (the upload path fails such a report closed before it
+		// is ever stored, so this only skips stray in-memory entries).
+		run, ok := s.runs[rep.RunID]
+		if !ok {
+			continue
+		}
+		repo := repoIDForRun(run)
+		if repo == "" {
+			continue
+		}
+		foldReportCases(h, repo, rep)
+		folded[rep.ID] = struct{}{}
+	}
+	entry.history = h
+	entry.foldedReports = folded
+	entry.reportsSeen = len(s.reports)
+	// Repair the cache file with the fresh derivation (best effort: the cache
+	// is disposable, and the durable reports can re-derive it at any time).
+	if err := s.saveTestintelHistory(h); err != nil {
+		s.logError("test history: save failed", "error", err.Error())
+	} else if err := s.commitTestintelHistory(); err != nil {
+		s.logError("test history: commit failed", "error", err.Error())
+	}
+	s.historyCache.store(historyWholeCacheKey, entry)
+	return entry
+}
+
+// foldDurableReportLocked folds one DURABLE report into the derived snapshot
+// exactly once and publishes the new generation. The clone is published even
+// when the cache-file write fails: the report itself already committed to
+// state.json, so the derived view may not be withheld because a disposable
+// cache could not be rewritten (a restart rebuilds it from the reports).
+// Caller must hold s.mu; the entry must be derived already.
+func (s *Server) foldDurableReportLocked(entry repoHistoryCacheEntry, repo string, rep model.TestReport) {
+	tracked := rep.ID != ""
+	if tracked {
+		if _, done := entry.foldedReports[rep.ID]; done {
+			// Already folded: a replay must not re-observe the outcomes and a
+			// rebuild already included this report.
+			return
+		}
+	}
+	next := entry.historyOrNew().Clone()
+	foldReportCases(next, repo, rep)
+	if err := s.saveTestintelHistory(next); err != nil {
+		s.logError("test history: save failed", "error", err.Error())
+	}
+	if err := s.commitTestintelHistory(); err != nil {
+		s.logError("test history: commit failed", "error", err.Error())
+	}
+	if entry.foldedReports == nil {
+		entry.foldedReports = map[string]struct{}{}
+	}
+	if tracked {
+		entry.foldedReports[rep.ID] = struct{}{}
+	}
+	entry.history = next
+	// The snapshot has now absorbed the current durable report set.
+	entry.reportsSeen = len(s.reports)
+	s.historyCache.store(historyWholeCacheKey, entry)
+}
+
+// ensureReportFolded folds one durable report into the derived history if it
+// has not been folded yet (memory/fs mode). It is the retry-convergence
+// primitive: an identical delivery replay whose original fold never reached
+// the snapshot (the cache write failed, or the process restarted before
+// deriving it) is folded here — exactly once, because the folded-report set
+// makes the fold idempotent.
+func (s *Server) ensureReportFolded(repo string, rep model.TestReport) {
+	if s.DB != nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry := s.ensureDerivedHistoryLocked()
+	s.foldDurableReportLocked(entry, repo, rep)
+}
+
+// derivedHistory returns the memory/fs whole-history snapshot, derived from
+// the durable reports on first use.
+func (s *Server) derivedHistory() *testintel.History {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ensureDerivedHistoryLocked().historyOrNew()
+}
+
+// foldReportCases records every OBSERVED case of rep under repo into h. h
+// must be privately owned by the caller (a clone): the fold is the mutation
+// that must never reach a published snapshot.
+//
+// Skip policy (one rule for every fold path — incremental, memory, legacy and
+// rebuild): a skipped case is not a pass/fail observation. JUnit reports it
+// as Passed=false plus Skipped=true, so folding it would invent a failure and
+// poison Fails, LastFailure, the 16-outcome window and FlakeProb. Skipped
+// cases contribute nothing to the historical counters; the report's declared
+// Tests/Failures/Errors/Skipped totals still describe the run.
 func foldReportCases(h *testintel.History, repo string, rep model.TestReport) {
 	for _, c := range rep.Cases {
+		if c.Skipped {
+			continue
+		}
 		h.Record(repo, rep.JobKey, c.Class, c.Name, c.Duration, c.Passed, rep.CreatedAt)
 	}
 }
@@ -281,13 +438,14 @@ func foldReportCases(h *testintel.History, repo string, rep model.TestReport) {
 // the previous pointer can neither observe the fold nor have its generation
 // change under it.
 //
-// In memory mode the history file under dataDir is the durable store: the
-// clone's staged-then-renamed file commit runs in one critical section (s.mu,
-// as before, so concurrent test-intelligence readers holding s.mu cannot
-// observe a report without its history), with the cache mutex taken inside
-// s.mu, and the clone is published ONLY after the commit SUCCEEDED. On a
-// failed save or commit the old snapshot keeps serving and the failure is
-// logged: mutation is never visible without durability.
+// Memory/fs mode: the DURABLE report is the source of truth and the snapshot
+// plus test-history.json are derived caches (see ensureDerivedHistoryLocked).
+// The report is already committed to state.json by the caller, so the fold is
+// idempotent by report ID and the clone is published even when the cache-file
+// write fails — a disposable cache must never withhold an observation of a
+// durable report. The staged-then-renamed commit runs in one critical section
+// (s.mu, so concurrent test-intelligence readers holding s.mu cannot observe a
+// report without its history) with the cache mutex taken inside s.mu.
 //
 // A DB store without the incremental aggregate contract falls back to the
 // explicit full rebuild (the documented maintenance path); the production
@@ -309,22 +467,8 @@ func (s *Server) recordTestReportHistory(ctx context.Context, repo string, rep m
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	entry := repoHistoryCacheEntry{}
-	if cached, hit := s.historyCache.lookup(historyWholeCacheKey); hit {
-		entry = cached
-	}
-	next := entry.historyOrNew().Clone()
-	foldReportCases(next, repo, rep)
-	if err := s.saveTestintelHistory(next); err != nil {
-		s.logError("test history: save failed", "error", err.Error())
-		return
-	}
-	if err := s.commitTestintelHistory(); err != nil {
-		s.logError("test history: commit failed", "error", err.Error())
-		return
-	}
-	entry.history = next
-	s.historyCache.store(historyWholeCacheKey, entry)
+	entry := s.ensureDerivedHistoryLocked()
+	s.foldDurableReportLocked(entry, repo, rep)
 }
 
 // rebuildTestHistoryDB is the EXPLICIT maintenance/repair operation (never
@@ -377,6 +521,11 @@ func (s *Server) rebuildTestHistoryDB(ctx context.Context) {
 			repoForRun[r.RunID] = repo
 		}
 		for _, c := range r.Cases {
+			// Skip policy: the legacy whole-cache rebuild excludes skipped
+			// cases exactly like the aggregate and memory folds.
+			if c.Skipped {
+				continue
+			}
 			h.Record(repo, r.JobKey, c.Class, c.Name, c.Duration, c.Passed, r.CreatedAt)
 		}
 	}
@@ -429,6 +578,11 @@ func (s *Server) loadRepoHistoryWithRepair(ctx context.Context, agg storage.Test
 // error and MUST NOT consult a nil snapshot: the returned history is never
 // nil.
 func (s *Server) historyForRepo(ctx context.Context, repoID string) (*testintel.History, error) {
+	if s.DB == nil {
+		// Memory/fs mode has no per-repository aggregates: the whole-history
+		// snapshot derived from the durable reports answers every key.
+		return s.derivedHistory(), nil
+	}
 	agg, ok := s.DB.(storage.TestHistoryAggregateStore)
 	if !ok {
 		if s.DB != nil {
@@ -564,7 +718,14 @@ func historyFromStats(stats []byte) (*testintel.History, error) {
 // need the full Shard/Manifest/Flaky trio take ONE snapshot through
 // historyForRepo instead.
 func (s *Server) flakyFromHistory(repo string) []string {
-	h := s.cachedHistory(repo)
+	var h *testintel.History
+	if s.DB == nil {
+		// Memory/fs mode: the answer comes from the snapshot derived from the
+		// durable reports, never from the raw cache entry.
+		h = s.derivedHistory()
+	} else {
+		h = s.cachedHistory(repo)
+	}
 	if h == nil {
 		return nil
 	}

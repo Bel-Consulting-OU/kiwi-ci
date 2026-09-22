@@ -127,6 +127,41 @@ invariant that at most one valid generation of a job runs after its
 lease expires; the control plane requeues the job independently, within
 the job's infrastructure retry budget.
 
+## Runner identity and profile bindings
+
+Runner scheduling attributes (labels, region, repository ACL,
+capabilities, capacity, rates) come from a server-owned profile
+(`docs/environments.md`, `kiwi runner` profiles). Which profile a runner
+gets is decided by the identity it **authenticated with**, never by a
+value the runner asserts:
+
+| authentication | profile binding key | store |
+|----------------|---------------------|-------|
+| runner mTLS (client certificate chaining to the runner CA) | the serial of the **verified** peer certificate | `cert_profile_links` |
+| per-runner bearer token (`runner_bearer_tokens`) | the authenticated runner ID | `runner_profile_links` |
+| shared dev token, no runner CA, no per-runner credentials (dev only) | the payload `cert_serial` (dev compatibility) | `cert_profile_links` |
+
+Rules that keep this safe:
+
+- A client-asserted `cert_serial` in the registration payload is **never**
+  a privilege key while runner mTLS or per-runner bearer credentials are
+  configured. A presented certificate counts only after it verifies
+  against the runner CA. A bearer token therefore cannot claim another
+  runner's serial and inherit its profile.
+- The runner-ID binding is an explicit admin fact with a PRIMARY KEY, so
+  exactly one profile applies per runner: at most one binding per runner
+  ID, enforced by the database instead of a payload scan (a payload scan
+  is client-asserted and racy — two concurrent registrations could both
+  see a serial "unclaimed").
+- Bind and unbind runner-ID bindings through the admin-tier API:
+  `PUT /api/v1/runner-profiles/{profile}/runner/{runnerID}` and
+  `DELETE /api/v1/runner-profiles/{profile}/runner/{runnerID}`.
+  Pre-binding a runner before its first registration is supported. The
+  admin token or an `admin` role is required.
+- Under `require_profiles` a runner with no binding registers empty
+  (capacity 0, no labels/region/repository ACL/rates) and receives no
+  work. Unbinding a runner takes effect at its next registration.
+
 ## Operating advice
 
 - Run untrusted jobs only through `container` or `tart` backends on
@@ -135,11 +170,11 @@ the job's infrastructure retry budget.
   container jobs.
 - Give each runner a dedicated enrollment: a per-runner certificate via
   the single-use enrollment grant/token flow, and revoke the certificate
-  when a runner is decommissioned. The runner BEARER token is a shared
-  credential across all runners — it is not a per-runner identity, and a
-  bearer-token deployment cannot attribute traffic to one runner or
-  revoke one runner without rotating the shared token. Prefer persistent
-  mTLS identities in production.
+  when a runner is decommissioned. A per-runner bearer token
+  (`runner_bearer_tokens`) is a per-runner identity too; the shared
+  runner token is a dev/bootstrap credential that production rejects once
+  per-runner credentials exist. Prefer persistent mTLS identities in
+  production.
 - Keep deployment-capable runners separate from ordinary build runners
   (see [environments.md](environments.md)).
 - Drain runners before maintenance: `kiwi runner drain <id>`.

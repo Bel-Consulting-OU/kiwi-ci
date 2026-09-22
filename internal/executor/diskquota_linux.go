@@ -4,10 +4,8 @@ package executor
 
 import (
 	"fmt"
-	"hash/fnv"
 	"os"
 	"os/exec"
-	"strings"
 )
 
 // setupWorkspaceDiskQuota is the Linux capability probe: it inspects the
@@ -20,9 +18,11 @@ import (
 // caller fails the untrusted job closed unless the operator escape hatch is
 // set.
 //
-// The attempt is genuine: when XFS, prjquota and root are all present, the
+// The attempt is genuine: when XFS, prjquota and root are all present, a
+// collision-free project ID is allocated for the workspace's filesystem, the
 // project entry is created and a bhard limit is applied. The returned cleanup
-// removes the project assignment and the limit.
+// removes the project assignment (naming the ID) and the limit, and releases
+// the ID.
 func setupWorkspaceDiskQuota(workspace string, limit int64) (DiskQuotaStatus, func() error) {
 	data, err := os.ReadFile("/proc/self/mountinfo")
 	if err != nil {
@@ -42,11 +42,9 @@ func setupWorkspaceDiskQuota(workspace string, limit int64) (DiskQuotaStatus, fu
 	}
 }
 
-// setupXFSProjectQuota applies an XFS project quota (tree quota) to the
-// workspace directory: the containing XFS mount must carry the prjquota mount
-// option, the process must be root (project quota manipulation needs
-// CAP_SYS_ADMIN), and xfs_quota must be installed. Only when the project
-// entry and the bhard limit are both accepted is Hard reported true.
+// setupXFSProjectQuota checks the host prerequisites for an XFS tree quota
+// (prjquota mount option, root, xfs_quota on PATH) and then applies it through
+// the portable core (setupXFSProjectQuotaOnMount).
 func setupXFSProjectQuota(workspace string, entry mountInfoEntry, limit int64) (DiskQuotaStatus, func() error) {
 	if !hasMountOption(entry.superOptions, "prjquota") && !hasMountOption(entry.superOptions, "pquota") {
 		return DiskQuotaStatus{Detail: fmt.Sprintf("XFS mount %s is not mounted with prjquota (super options: %s)", entry.mountPoint, entry.superOptions)}, nil
@@ -58,57 +56,5 @@ func setupXFSProjectQuota(workspace string, entry mountInfoEntry, limit int64) (
 	if err != nil {
 		return DiskQuotaStatus{Detail: fmt.Sprintf("xfs_quota not found: %v", err)}, nil
 	}
-	projID := workspaceProjectID(workspace)
-	quoted := xfsQuote(workspace)
-	run := func(command string) error {
-		out, err := exec.Command(xq, "-x", "-c", command, entry.mountPoint).CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("%s: %v: %s", command, err, strings.TrimSpace(string(out)))
-		}
-		return nil
-	}
-	if err := run(fmt.Sprintf("project -s -p %s %d", quoted, projID)); err != nil {
-		return DiskQuotaStatus{Detail: "assign XFS project quota: " + err.Error()}, nil
-	}
-	if err := run(fmt.Sprintf("limit -p bhard=%d %d", limit, projID)); err != nil {
-		// Leave nothing half-applied: drop the project assignment again.
-		_ = run(fmt.Sprintf("project -C -p %s", quoted))
-		return DiskQuotaStatus{Detail: "apply XFS project hard limit: " + err.Error()}, nil
-	}
-	cleanup := func() error {
-		var errs []string
-		if err := run(fmt.Sprintf("project -C -p %s", quoted)); err != nil {
-			errs = append(errs, err.Error())
-		}
-		if err := run(fmt.Sprintf("limit -p bhard=0 %d", projID)); err != nil {
-			errs = append(errs, err.Error())
-		}
-		if len(errs) > 0 {
-			return fmt.Errorf("remove XFS project quota: %s", strings.Join(errs, "; "))
-		}
-		return nil
-	}
-	return DiskQuotaStatus{
-		Hard:   true,
-		Detail: fmt.Sprintf("XFS project quota %d enforces a hard %d-byte bound on %s (mount %s)", projID, limit, workspace, entry.mountPoint),
-	}, cleanup
-}
-
-// workspaceProjectID derives a stable, nonzero 31-bit project ID from the
-// absolute workspace path. XFS project IDs are 32-bit; keeping the high bit
-// clear avoids signedness surprises in xfs_quota arguments.
-func workspaceProjectID(workspace string) uint32 {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(workspace))
-	id := h.Sum32() & 0x7fffffff
-	if id == 0 {
-		id = 1
-	}
-	return id
-}
-
-// xfsQuote single-quotes a path argument for the xfs_quota command language,
-// escaping embedded single quotes.
-func xfsQuote(path string) string {
-	return "'" + strings.ReplaceAll(path, "'", `'\''`) + "'"
+	return setupXFSProjectQuotaOnMount(workspace, entry, limit, xq)
 }

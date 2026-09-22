@@ -149,8 +149,10 @@ claims themselves.
     `drain`/`disable`/`enable`, and generated fragments
     (`POST /api/v1/jobs/{id}/generated`) (503, with the record or
     artifact rolled back).
-  - Runner-profile writes and cert-profile binds (`POST`/`PUT
-    /api/v1/runner-profiles`, `PUT /api/v1/runner-profiles/{id}/cert/{serial}`),
+  - Runner-profile writes, cert-profile binds and runner-ID profile
+    binds (`POST`/`PUT /api/v1/runner-profiles`,
+    `PUT /api/v1/runner-profiles/{id}/cert/{serial}`,
+    `PUT`/`DELETE /api/v1/runner-profiles/{id}/runner/{runnerID}`),
     test reports (`POST /api/v1/jobs/{id}/tests`) and schedule creation
     (`PUT /api/v1/schedules`) answer 500 or 503 after rolling back the
     partial record.

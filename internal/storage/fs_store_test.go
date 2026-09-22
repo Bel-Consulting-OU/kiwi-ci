@@ -47,7 +47,8 @@ func TestFSRepositorySaveLoadRoundTrip(t *testing.T) {
 		Profiles: map[string]model.RunnerProfile{
 			"prof-1": {ID: "prof-1", MaxCapacity: 4},
 		},
-		CertProfileLinks: map[string]string{"serial-1": "prof-1"},
+		CertProfileLinks:   map[string]string{"serial-1": "prof-1"},
+		RunnerProfileLinks: map[string]string{"runner-1": "prof-1"},
 	}
 	if err := repo.Save(in); err != nil {
 		t.Fatalf("save: %v", err)
@@ -82,6 +83,9 @@ func TestFSRepositorySaveLoadRoundTrip(t *testing.T) {
 	}
 	if out.CertProfileLinks["serial-1"] != "prof-1" {
 		t.Fatalf("cert profile links not round-tripped: %+v", out.CertProfileLinks)
+	}
+	if out.RunnerProfileLinks["runner-1"] != "prof-1" {
+		t.Fatalf("runner profile links not round-tripped: %+v", out.RunnerProfileLinks)
 	}
 }
 
@@ -124,7 +128,8 @@ func TestFSLoadNilPayloadMapsAreFilled(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 	if out.Runs == nil || out.Jobs == nil || out.Runners == nil || out.Artifacts == nil ||
-		out.Reports == nil || out.DownstreamLinks == nil || out.Profiles == nil || out.CertProfileLinks == nil {
+		out.Reports == nil || out.DownstreamLinks == nil || out.Profiles == nil || out.CertProfileLinks == nil ||
+		out.RunnerProfileLinks == nil {
 		t.Fatalf("nil maps must be filled on load: %+v", out)
 	}
 }

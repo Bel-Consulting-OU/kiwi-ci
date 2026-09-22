@@ -363,42 +363,62 @@ func TestIDCovResolveRunnerIdentityBranches(t *testing.T) {
 	}
 }
 
-// TestIDCovRequestCertSerial covers the CA-present and bearer-ownership
-// branches.
-func TestIDCovRequestCertSerial(t *testing.T) {
+// TestIDCovResolveRegistrationProfileBinding covers the mTLS, per-runner
+// bearer and legacy branches of the ONLY registration profile-key chooser.
+// The security-critical properties: only a peer certificate that VERIFIED
+// against the runner CA contributes a serial, and a per-runner bearer
+// identity never contributes a client-asserted serial.
+func TestIDCovResolveRegistrationProfileBinding(t *testing.T) {
 	s, _, certA := idcovCARunnerFixture(t)
-	if got := s.requestCertSerial(crlRequestWithCert(t, certA), "payload-serial"); got != certA.SerialNumber.Text(16) {
-		t.Fatalf("peer serial = %q", got)
+	if got := s.resolveRegistrationProfileBinding(crlRequestWithCert(t, certA), "runner-a", "payload-serial"); got.Serial != certA.SerialNumber.Text(16) || got.RunnerID != "" {
+		t.Fatalf("verified peer binding = %+v", got)
 	}
-	if got := s.requestCertSerial(httptest.NewRequest(http.MethodPost, "/", nil), "payload-serial"); got != "" {
-		t.Fatalf("no peer serial = %q, want empty", got)
+	if got := s.resolveRegistrationProfileBinding(httptest.NewRequest(http.MethodPost, "/", nil), "runner-a", "payload-serial"); got.Serial != "" || got.RunnerID != "" {
+		t.Fatalf("no peer cert binding = %+v, want empty", got)
+	}
+	// A certificate that does NOT chain to the runner CA must not select a
+	// serial binding, even though it is presented.
+	otherCA, err := runnerpki.NewCA("unrelated ca", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, foreign := pkiSignRunner(t, otherCA, "runner-a")
+	if got := s.resolveRegistrationProfileBinding(crlRequestWithCert(t, foreign), "runner-a", "payload-serial"); got.Serial != "" || got.RunnerID != "" {
+		t.Fatalf("unverified peer certificate selected a binding: %+v", got)
 	}
 
-	// Bearer mode: the payload serial is honored unless another runner owns
-	// it.
+	// Per-runner bearer: the authenticated runner ID is the key and the
+	// client-asserted payload serial is NEVER consulted.
 	bare := New("t")
-	if got := bare.requestCertSerial(httptest.NewRequest(http.MethodPost, "/", nil), "  "); got != "" {
-		t.Fatalf("blank payload serial = %q", got)
-	}
-	plain := httptest.NewRequest(http.MethodPost, "/", nil)
-	if got := bare.requestCertSerial(plain, "serial-1"); got != "serial-1" {
-		t.Fatalf("unowned payload serial = %q", got)
-	}
 	bare.LoadRunnerTokens(map[string]string{"runner-a": auth.TokenDigest("tok-a")})
-	bare.mu.Lock()
-	bare.runners["runner-b"] = model.Runner{ID: "runner-b", CertSerial: "serial-owned"}
-	bare.mu.Unlock()
 	bearer := httptest.NewRequest(http.MethodPost, "/", nil)
 	bearer.Header.Set("Authorization", "Bearer tok-a")
-	if got := bare.requestCertSerial(bearer, "serial-owned"); got != "" {
-		t.Fatalf("stolen serial accepted: %q", got)
+	for _, payload := range []string{"  ", "serial-1", "serial-owned", "serial-mine"} {
+		got := bare.resolveRegistrationProfileBinding(bearer, "runner-a", payload)
+		if got.RunnerID != "runner-a" || got.Serial != "" {
+			t.Fatalf("bearer payload %q binding = %+v, want runner-id only", payload, got)
+		}
 	}
-	// The same runner may re-claim its own serial.
-	bare.mu.Lock()
-	bare.runners["runner-a"] = model.Runner{ID: "runner-a", CertSerial: "serial-mine"}
-	bare.mu.Unlock()
-	if got := bare.requestCertSerial(bearer, "serial-mine"); got != "serial-mine" {
-		t.Fatalf("own serial refused: %q", got)
+
+	// Legacy shared-token mode (no CA, no per-runner token): the payload
+	// serial stays the dev binding key, and another runner's recorded
+	// serial is refused.
+	plain := New("t")
+	if got := plain.resolveRegistrationProfileBinding(httptest.NewRequest(http.MethodPost, "/", nil), "runner-a", "  "); got.Serial != "" {
+		t.Fatalf("blank payload serial = %+v", got)
+	}
+	if got := plain.resolveRegistrationProfileBinding(httptest.NewRequest(http.MethodPost, "/", nil), "runner-a", "serial-1"); got.Serial != "serial-1" || got.RunnerID != "" {
+		t.Fatalf("unowned legacy payload serial = %+v", got)
+	}
+	plain.mu.Lock()
+	plain.runners["runner-b"] = model.Runner{ID: "runner-b", CertSerial: "serial-owned"}
+	plain.runners["runner-a"] = model.Runner{ID: "runner-a", CertSerial: "serial-mine"}
+	plain.mu.Unlock()
+	if got := plain.resolveRegistrationProfileBinding(httptest.NewRequest(http.MethodPost, "/", nil), "runner-a", "serial-owned"); got.Serial != "" {
+		t.Fatalf("serial owned by another runner accepted: %+v", got)
+	}
+	if got := plain.resolveRegistrationProfileBinding(httptest.NewRequest(http.MethodPost, "/", nil), "runner-a", "serial-mine"); got.Serial != "serial-mine" {
+		t.Fatalf("own legacy serial refused: %+v", got)
 	}
 }
 

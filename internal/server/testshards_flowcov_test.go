@@ -156,7 +156,10 @@ func TestFlowTestShardsHistoryNil(t *testing.T) {
 	// ADAPTED: the nil single-slot history guard became the empty keyed
 	// cache, which has no snapshot for any repository.
 	s.historyCache.invalidateAll()
-	if got := s.flakyFromHistory("github.com/o/repo-a"); got != nil {
+	// ADAPTED for the derived-history contract: the memory/fs read derives an
+	// empty snapshot from the (empty) durable report set instead of returning
+	// a nil cache miss.
+	if got := s.flakyFromHistory("github.com/o/repo-a"); len(got) != 0 {
 		t.Fatalf("uncached flaky = %v", got)
 	}
 	// testShards with an empty cache is not reachable through the handler

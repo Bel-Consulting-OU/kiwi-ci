@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executor"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
@@ -124,8 +125,38 @@ func jobQueueDeadline(cj pipeline.CompiledJob, now time.Time) *time.Time {
 // applyCompiledJobFields populates the additive resource-request and queue
 // deadline fields of a model.Job from its effective compiled job at
 // enqueue. The scheduler's queue-timeout expiry reads QueueDeadline
-// (payload-based; see internal/scheduler queueDeadlineFor).
+// (payload-based; see internal/scheduler queueDeadlineFor), and the lease
+// reservation reads ReservedResources — the job's own request plus
+// ServiceEnvelopeRequest — so a job's declared services are charged to the
+// runner too.
 func applyCompiledJobFields(j *model.Job, cj pipeline.CompiledJob, now time.Time) {
 	j.CPURequest, j.MemoryRequest, j.DiskRequest, j.PIDsRequest = jobResourceRequests(cj)
 	j.QueueDeadline = jobQueueDeadline(cj, now)
+	j.ServiceEnvelopeRequest = serviceEnvelopeRequest(cj)
+}
+
+// serviceEnvelopeRequest derives the aggregate service-container request of a
+// compiled job through the executor's ONE fair-split planner
+// (executor.ServiceEnvelopeRequest), so the aggregate the control plane
+// reserves is exactly the aggregate the executor allocates — admission and
+// execution can never disagree. The envelope is derived from the EFFECTIVE
+// compiled job, i.e. after the untrusted ceilings have been applied, which is
+// also what the runner executes (the signed CompiledJobPayload.EffectiveJob).
+//
+// A job without services gets the zero value (the reservation is then exactly
+// its own request, the pre-envelope behavior). An oversubscribed envelope —
+// the planner fails when a service's fair share rounds to zero — also gets
+// the zero value: the executor fails that job closed before starting any
+// container, so no service consumes host resources and reserving a partial
+// sum would misstate the job. The envelope is stamped for trusted and
+// untrusted jobs alike.
+func serviceEnvelopeRequest(cj pipeline.CompiledJob) model.ResourceCapacity {
+	if len(cj.Job.Services) == 0 {
+		return model.ResourceCapacity{}
+	}
+	req, err := executor.ServiceEnvelopeRequest(cj.Job.Resources, cj.Job.Services)
+	if err != nil {
+		return model.ResourceCapacity{}
+	}
+	return model.ResourceCapacity{CPU: req.CPU, Memory: int64(req.Memory), PIDs: req.PIDs}
 }

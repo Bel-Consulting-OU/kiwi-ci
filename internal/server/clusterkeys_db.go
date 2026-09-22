@@ -35,6 +35,7 @@ var (
 	_ ClusterKeyStore          = (*DBClusterKeyStore)(nil)
 	_ ClusterKeyWriter         = (*DBClusterKeyStore)(nil)
 	_ ClusterKeyLookup         = (*DBClusterKeyStore)(nil)
+	_ ClusterKeyInstaller      = (*DBClusterKeyStore)(nil)
 	_ ClusterKeyRotationFencer = (*DBClusterKeyStore)(nil)
 )
 
@@ -120,6 +121,30 @@ func (s *DBClusterKeyStore) Lookup(kind string) ([]byte, bool, error) {
 		return nil, false, err
 	}
 	return stored, true, nil
+}
+
+// InstallOrLoad atomically installs data for kind when the shared table has
+// no row yet and returns the stored bytes; created reports whether this
+// caller's bytes were installed. CreateClusterKey is insert-if-absent, so a
+// concurrent installer's material wins and is returned instead of data.
+// Unlike LoadOrCreate/Lookup the node-local Seed migration is deliberately
+// NOT consulted: explicit material (an operator-provided runner CA) must be
+// installed as given and compared against the shared row, never silently
+// replaced by node-local state.
+func (s *DBClusterKeyStore) InstallOrLoad(kind string, data []byte) ([]byte, bool, error) {
+	if s.Blobs == nil {
+		return nil, false, errors.New("cluster keys: database-backed store requires a blob store")
+	}
+	if len(data) == 0 {
+		return nil, false, errors.New("cluster keys: empty key material")
+	}
+	ctx, cancel := s.opCtx()
+	defer cancel()
+	stored, created, err := s.Blobs.CreateClusterKey(ctx, kind, data)
+	if err != nil {
+		return nil, false, err
+	}
+	return stored, created, nil
 }
 
 // Store persists a rotated blob (OIDC ring) through the shared table.

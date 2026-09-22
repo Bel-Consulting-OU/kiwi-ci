@@ -20,6 +20,8 @@ func TestHistoryPersistenceAcrossRestarts(t *testing.T) {
 		t.Fatal(err)
 	}
 	rep := model.TestReport{
+		ID:        "rep-tests",
+		RunID:     "run-tests",
 		JobKey:    "tests",
 		CreatedAt: time.Now().UTC(),
 		Cases: []model.TestResult{
@@ -28,6 +30,18 @@ func TestHistoryPersistenceAcrossRestarts(t *testing.T) {
 			{Name: "TestB", Passed: true, Duration: 0.5},
 		},
 	}
+	// Durable reports are the source of truth: the upload path commits the
+	// report (and its run) to the state snapshot before folding, so the
+	// restarted control plane re-derives the history from them even though
+	// test-history.json is only a cache.
+	s.mu.Lock()
+	s.runs[rep.RunID] = model.Run{ID: rep.RunID, RepoFullName: "o/r"}
+	s.reports[rep.ID] = rep
+	if err := s.persistLocked(); err != nil { // the upload path's durable commit
+		s.mu.Unlock()
+		t.Fatal(err)
+	}
+	s.mu.Unlock()
 	s.recordTestReportHistory(context.Background(), "o/r", rep)
 	if _, err := os.Stat(filepath.Join(dir, testHistoryFile)); err != nil {
 		t.Fatalf("history file not persisted: %v", err)

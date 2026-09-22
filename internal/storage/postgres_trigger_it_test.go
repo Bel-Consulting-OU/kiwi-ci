@@ -463,6 +463,29 @@ func TestPostgresIntegrationTriggeredSQLErrors(t *testing.T) {
 				t.Fatal("expected the profile binding to fail")
 			}
 		}},
+		"runner_profile_links/Link": {"runner_profile_links", func(t *testing.T, st *PostgresStore, ids *boomerIds) {
+			if err := st.LinkRunnerProfile(ctx, ids.runner, pgITNewID(t)); err == nil {
+				t.Fatal("expected the runner profile link to fail")
+			}
+		}},
+		"runner_profile_links/Unlink": {"runner_profile_links", func(t *testing.T, st *PostgresStore, ids *boomerIds) {
+			// BEFORE DELETE ... FOR EACH ROW only fires for rows the statement
+			// actually touches, and the Link case above fails by design, so
+			// seed one binding with user triggers disabled to give the
+			// injected failure a row to fire on.
+			if _, err := st.pool.Exec(ctx, `ALTER TABLE runner_profile_links DISABLE TRIGGER USER`); err != nil {
+				t.Fatalf("disable triggers: %v", err)
+			}
+			if _, err := st.pool.Exec(ctx, `INSERT INTO runner_profile_links (runner_id, profile_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, ids.runner, pgITNewID(t)); err != nil {
+				t.Fatalf("seed link: %v", err)
+			}
+			if _, err := st.pool.Exec(ctx, `ALTER TABLE runner_profile_links ENABLE TRIGGER USER`); err != nil {
+				t.Fatalf("enable triggers: %v", err)
+			}
+			if err := st.UnlinkRunnerProfile(ctx, ids.runner); err == nil {
+				t.Fatal("expected the runner profile unlink to fail")
+			}
+		}},
 		"runner_bearer_tokens/Upsert": {"runner_bearer_tokens", func(t *testing.T, st *PostgresStore, ids *boomerIds) {
 			if err := st.UpsertRunnerToken(ctx, ids.runner, "digest"); err == nil {
 				t.Fatal("expected the token upsert to fail")
@@ -586,6 +609,14 @@ func TestPostgresIntegrationDroppedTableReadErrors(t *testing.T) {
 		}},
 		"ProfileForSerial": {"cert_profile_links", func(t *testing.T, st *PostgresStore, ids *boomerIds) error {
 			_, _, err := st.ProfileForSerial(ctx, "serial")
+			return err
+		}},
+		"ProfileForRunnerID": {"runner_profile_links", func(t *testing.T, st *PostgresStore, ids *boomerIds) error {
+			_, _, err := st.ProfileForRunnerID(ctx, ids.runner)
+			return err
+		}},
+		"RunnerIDsForProfile": {"runner_profile_links", func(t *testing.T, st *PostgresStore, ids *boomerIds) error {
+			_, err := st.RunnerIDsForProfile(ctx, pgITNewID(t))
 			return err
 		}},
 		"RunnerIDForToken": {"runner_bearer_tokens", func(t *testing.T, st *PostgresStore, ids *boomerIds) error {

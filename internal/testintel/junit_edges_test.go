@@ -218,8 +218,9 @@ func TestTruncateFailureLimits(t *testing.T) {
 
 	f = &Failure{Message: "short", Body: strings.Repeat("b", MaxMessageBytes)}
 	truncateFailure(f)
-	if len(f.Message)+len(f.Body) != MaxMessageBytes {
-		t.Fatalf("combined len = %d, want %d", len(f.Message)+len(f.Body), MaxMessageBytes)
+	// The budget covers the JOINED retained text: message + "\n" + body.
+	if len(f.Message)+1+len(f.Body) != MaxMessageBytes {
+		t.Fatalf("joined len = %d, want %d", len(f.Message)+1+len(f.Body), MaxMessageBytes)
 	}
 
 	// A nil failure and a small failure are left alone.

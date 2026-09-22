@@ -39,6 +39,7 @@ type memSnapshot struct {
 	outboxClaims    map[string]outboxClaim
 	fragments       map[string]GeneratedFragmentReceipt
 	pendingSidecars map[string]pendingSidecar
+	runnerProfiles  map[string]string
 }
 
 func (m *memStore) snapshot() memSnapshot {
@@ -75,6 +76,7 @@ func (m *memStore) snapshot() memSnapshot {
 		outboxClaims:    cloneOutboxClaims(m.outboxClaims),
 		fragments:       cloneFragments(m.fragments),
 		pendingSidecars: clonePendingSidecars(m.pendingSidecars),
+		runnerProfiles:  cloneDeliveries(m.runnerProfiles),
 	}
 }
 

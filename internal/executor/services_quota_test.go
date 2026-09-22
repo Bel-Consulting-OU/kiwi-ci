@@ -66,7 +66,7 @@ func TestConcurrentJobsSameServiceAliasBothStartAndCleanup(t *testing.T) {
 		wg.Add(1)
 		go func(runID, jobID string) {
 			defer wg.Done()
-			_, cleanup, err := startContainerServices(ctx, runID, jobID, services, resources, false, false, func(string) {})
+			_, cleanup, err := startContainerServices(ctx, runID, jobID, services, resources, false, false, "", func(string) {})
 			if err != nil {
 				errs <- err
 				return
@@ -106,7 +106,7 @@ func TestServiceWithoutNameKeepsPhysicalNameBehavior(t *testing.T) {
 	installFakeBins(t)
 	var emitted []string
 	_, cleanup, err := startContainerServices(context.Background(), "r", "j",
-		[]pipeline.Service{{Image: "postgres:16"}}, pipeline.Resources{}, false, false, func(s string) { emitted = append(emitted, s) })
+		[]pipeline.Service{{Image: "postgres:16"}}, pipeline.Resources{}, false, false, "", func(s string) { emitted = append(emitted, s) })
 	if err != nil {
 		t.Fatalf("nameless service: %v", err)
 	}
@@ -149,57 +149,154 @@ func TestServiceAliasSanitization(t *testing.T) {
 // formula: services share the job's declared resources, with the documented
 // fallbacks when a resource is undeclared.
 func TestServiceBudgetForDerivesJobEnvelope(t *testing.T) {
-	def := serviceBudgetFor(pipeline.Resources{})
+	def := serviceBudgetFor(pipeline.Resources{}, 2)
 	if def.CPU != serviceAggregateDefaultCPUs || def.Memory != serviceAggregateDefaultMemory || def.PIDs != serviceAggregateDefaultPIDs {
 		t.Fatalf("default budget = %+v", def)
 	}
-	declared := serviceBudgetFor(pipeline.Resources{CPU: 2, Memory: 4 << 30, PIDs: 512})
+	if def.remaining != 2 {
+		t.Fatalf("default remaining = %d, want 2", def.remaining)
+	}
+	declared := serviceBudgetFor(pipeline.Resources{CPU: 2, Memory: 4 << 30, PIDs: 512}, 8)
 	if declared.CPU != 2 || declared.Memory != 4<<30 || declared.PIDs != 512 {
 		t.Fatalf("declared budget = %+v", declared)
 	}
-	partial := serviceBudgetFor(pipeline.Resources{CPU: 1.5})
+	partial := serviceBudgetFor(pipeline.Resources{CPU: 1.5}, 1)
 	if partial.CPU != 1.5 || partial.Memory != serviceAggregateDefaultMemory || partial.PIDs != serviceAggregateDefaultPIDs {
 		t.Fatalf("partial budget = %+v", partial)
 	}
 }
 
-// TestServiceBudgetAllocationThrottlesToAggregate pins the allocation math:
-// min(per-service default, remaining) with a fail-closed exhaustion error and
-// exact remaining accounting.
-func TestServiceBudgetAllocationThrottlesToAggregate(t *testing.T) {
-	b := serviceBudgetFor(pipeline.Resources{CPU: 4.5, Memory: 3 << 30, PIDs: 700})
+// TestServiceBudgetAllocationFairSplit pins the E3-B fair-split math:
+// min(per-service default, remaining / remaining-services), so the first
+// service of an 8-service job gets 1/8 of the envelope instead of the whole
+// per-service default, the last service absorbs the integer-division
+// remainder, and the aggregate never exceeds the envelope.
+func TestServiceBudgetAllocationFairSplit(t *testing.T) {
+	// Two services on a 4.5 CPU / 3 GiB / 700 PID envelope: the first gets
+	// its fair half, the second the remainder (both capped by the
+	// per-service defaults).
+	b := serviceBudgetFor(pipeline.Resources{CPU: 4.5, Memory: 3 << 30, PIDs: 700}, 2)
 	a1, err := b.allocate()
 	if err != nil {
 		t.Fatalf("first allocation: %v", err)
 	}
-	if a1.CPU != 2 || a1.Memory != 2<<30 || a1.PIDs != 256 {
+	if a1.CPU != 2 || a1.Memory != 1610612736 || a1.PIDs != 256 {
 		t.Fatalf("first allocation = %+v", a1)
 	}
-	if b.CPU != 2.5 || b.Memory != 1<<30 || b.PIDs != 444 {
+	if b.CPU != 2.5 || b.Memory != 1610612736 || b.PIDs != 444 || b.remaining != 1 {
 		t.Fatalf("remaining after first = %+v", b)
 	}
 	a2, err := b.allocate()
 	if err != nil {
 		t.Fatalf("second allocation: %v", err)
 	}
-	if a2.CPU != 2 || a2.Memory != 1<<30 || a2.PIDs != 256 {
+	if a2.CPU != 2 || a2.Memory != 1610612736 || a2.PIDs != 256 {
 		t.Fatalf("second allocation = %+v", a2)
 	}
-	if b.CPU != 0.5 || b.Memory != 0 || b.PIDs != 188 {
+	if b.CPU != 0.5 || b.Memory != 0 || b.PIDs != 188 || b.remaining != 0 {
 		t.Fatalf("remaining after second = %+v", b)
-	}
-	if _, err := b.allocate(); err == nil || !strings.Contains(err.Error(), "budget exhausted") {
-		t.Fatalf("exhausted allocation = %v", err)
 	}
 	// A single service on an undeclared-resource job keeps the historical
 	// per-service defaults exactly (2 CPU / 2 GiB / 256 PIDs).
-	single := serviceBudgetFor(pipeline.Resources{})
+	single := serviceBudgetFor(pipeline.Resources{}, 1)
 	a, err := single.allocate()
 	if err != nil {
 		t.Fatalf("single allocation: %v", err)
 	}
 	if a.CPU != serviceDefaultCPUs || a.Memory != serviceDefaultMemory || a.PIDs != serviceDefaultPIDs {
 		t.Fatalf("single-service allocation = %+v", a)
+	}
+}
+
+// TestServiceBudgetFairSplitMakesEightServicesPossible is the E3-B proof:
+// the untrusted default envelope (2 CPU / 4 GiB / 512 PIDs, the aggregate
+// defaults) admits pipeline.MaxUntrustedServicesPerJob = 8 services, each
+// with a sensible share, and the aggregate exactly fits the envelope. The
+// previous min(default, remaining) rule gave service #1 min(2 CPU, 256 PIDs)
+// and left nothing for the rest.
+func TestServiceBudgetFairSplitMakesEightServicesPossible(t *testing.T) {
+	const n = pipeline.MaxUntrustedServicesPerJob
+	b := serviceBudgetFor(pipeline.Resources{CPU: 2, Memory: 4 << 30, PIDs: 512}, n)
+	var total serviceAllocation
+	for i := 0; i < n; i++ {
+		a, err := b.allocate()
+		if err != nil {
+			t.Fatalf("service %d/%d: %v", i+1, n, err)
+		}
+		if a.CPU != 0.25 || a.Memory != 512<<20 || a.PIDs != 64 {
+			t.Fatalf("service %d allocation = %+v, want 0.25 CPU / 512 MiB / 64 PIDs", i+1, a)
+		}
+		total.CPU += a.CPU
+		total.Memory += a.Memory
+		total.PIDs += a.PIDs
+	}
+	if total.CPU != 2 || total.Memory != 4<<30 || total.PIDs != 512 {
+		t.Fatalf("aggregate = %+v, want the envelope exactly", total)
+	}
+	if b.CPU != 0 || b.Memory != 0 || b.PIDs != 0 || b.remaining != 0 {
+		t.Fatalf("remaining after the plan = %+v", b)
+	}
+}
+
+// TestServiceBudgetExhaustsOnlyWhenGenuinelyOversubscribed pins the
+// fail-closed boundary: a share that rounds to zero (or an already empty
+// plan) fails with the clear budget error, while an envelope that can host
+// every declared service never does.
+func TestServiceBudgetExhaustsOnlyWhenGenuinelyOversubscribed(t *testing.T) {
+	// 2 PIDs across 3 services: every fair share floors to zero.
+	oversubscribed := serviceBudgetFor(pipeline.Resources{CPU: 4, Memory: 4 << 30, PIDs: 2}, 3)
+	if _, err := oversubscribed.allocate(); err == nil || !strings.Contains(err.Error(), "budget exhausted") {
+		t.Fatalf("oversubscribed allocation = %v", err)
+	}
+	// The same PIDs across 2 services fit (1 PID each).
+	fits := serviceBudgetFor(pipeline.Resources{CPU: 4, Memory: 4 << 30, PIDs: 2}, 2)
+	for i := 0; i < 2; i++ {
+		a, err := fits.allocate()
+		if err != nil {
+			t.Fatalf("service %d: %v", i+1, err)
+		}
+		if a.PIDs != 1 {
+			t.Fatalf("service %d PIDs = %d, want 1", i+1, a.PIDs)
+		}
+	}
+	// Allocating past the plan is an explicit error, never a zero flag.
+	if _, err := fits.allocate(); err == nil || !strings.Contains(err.Error(), "exhausted") {
+		t.Fatalf("plan-exhausted allocation = %v", err)
+	}
+	// A zero-service plan allocates nothing and reports exhaustion.
+	empty := serviceBudgetFor(pipeline.Resources{}, 0)
+	if _, err := empty.allocate(); err == nil {
+		t.Fatal("zero-service plan allocated")
+	}
+}
+
+// TestServiceEnvelopeRequestAggregate pins the exported aggregate the
+// scheduler follow-up must reserve when no job-scoped parent cgroup is
+// available: it is the fair-split sum, bounded by the envelope, and it
+// reports the oversubscription instead of a partial sum.
+func TestServiceEnvelopeRequestAggregate(t *testing.T) {
+	services := make([]pipeline.Service, pipeline.MaxUntrustedServicesPerJob)
+	for i := range services {
+		services[i] = pipeline.Service{Name: fmt.Sprintf("svc%d", i), Image: "postgres:16"}
+	}
+	req, err := ServiceEnvelopeRequest(pipeline.Resources{CPU: 2, Memory: 4 << 30, PIDs: 512}, services)
+	if err != nil {
+		t.Fatalf("aggregate: %v", err)
+	}
+	if req.CPU != 2 || int64(req.Memory) != 4<<30 || req.PIDs != 512 {
+		t.Fatalf("aggregate = %+v, want the envelope", req)
+	}
+	if _, err := ServiceEnvelopeRequest(pipeline.Resources{CPU: 4, Memory: 4 << 30, PIDs: 2}, services[:3]); err == nil {
+		t.Fatal("oversubscribed plan reported an aggregate")
+	}
+	// A single-service aggregate on an undeclared job equals one per-service
+	// default (2 CPU / 2 GiB / 256 PIDs).
+	req, err = ServiceEnvelopeRequest(pipeline.Resources{}, services[:1])
+	if err != nil {
+		t.Fatalf("single aggregate: %v", err)
+	}
+	if req.CPU != serviceDefaultCPUs || int64(req.Memory) != serviceDefaultMemory || req.PIDs != serviceDefaultPIDs {
+		t.Fatalf("single aggregate = %+v", req)
 	}
 }
 
@@ -214,17 +311,18 @@ func runLines(log string) []string {
 	return out
 }
 
-// TestStartContainerServicesThrottlesServiceLimits proves two services on a
-// 4 CPU / 3 GiB / 700 PID job are throttled by the remaining aggregate: the
-// second service gets the remaining 1 GiB instead of a fresh 2 GiB.
-func TestStartContainerServicesThrottlesServiceLimits(t *testing.T) {
+// TestStartContainerServicesFairSplitsEnvelope proves the started containers
+// carry the fair-split flags: two services on a 4 CPU / 3 GiB / 700 PID job
+// share the envelope evenly (2 CPU and 1.5 GiB each) instead of the second
+// service inheriting whatever the first left.
+func TestStartContainerServicesFairSplitsEnvelope(t *testing.T) {
 	installFakeBins(t)
 	services := []pipeline.Service{
 		{Name: "first", Image: "postgres:16"},
 		{Name: "second", Image: "redis:7"},
 	}
 	_, cleanup, err := startContainerServices(context.Background(), "r", "j", services,
-		pipeline.Resources{CPU: 4, Memory: 3 << 30, PIDs: 700}, false, false, func(string) {})
+		pipeline.Resources{CPU: 4, Memory: 3 << 30, PIDs: 700}, false, false, "", func(string) {})
 	if err != nil {
 		t.Fatalf("throttled services: %v", err)
 	}
@@ -233,21 +331,52 @@ func TestStartContainerServicesThrottlesServiceLimits(t *testing.T) {
 	if len(runs) != 2 {
 		t.Fatalf("docker run count = %d, want 2:\n%v", len(runs), runs)
 	}
-	for _, want := range []string{"--cpus=2", "--memory=2147483648", "--pids-limit=256"} {
+	for i, want := range []string{"--cpus=2", "--memory=1610612736", "--pids-limit=256"} {
 		if !strings.Contains(runs[0], want) {
 			t.Fatalf("first service run missing %q: %s", want, runs[0])
 		}
-	}
-	if !strings.Contains(runs[1], "--cpus=2") || !strings.Contains(runs[1], "--memory=1073741824") || !strings.Contains(runs[1], "--pids-limit=256") {
-		t.Fatalf("second service was not throttled to the remaining envelope: %s", runs[1])
+		if !strings.Contains(runs[1], want) {
+			t.Fatalf("second service run missing %q (fair split, not first-come): %s", want, runs[1])
+		}
+		_ = i
 	}
 }
 
-// TestStartContainerServicesRejectsAggregateOverflow proves a second service
-// on a 2 CPU / 4 GiB / 512 PID job fails closed with a clear policy error
-// after cleaning up the one service the envelope allowed, instead of silently
-// starting another container with a zero (unlimited) docker limit.
-func TestStartContainerServicesRejectsAggregateOverflow(t *testing.T) {
+// TestStartContainerServicesEightServicesFitEnvelope proves the E3-B fix on
+// the start path: 8 untrusted-limit services on the default 2 CPU / 4 GiB /
+// 512 PID envelope all start with a fair share, rather than failing after the
+// first service consumed everything.
+func TestStartContainerServicesEightServicesFitEnvelope(t *testing.T) {
+	installFakeBins(t)
+	const n = pipeline.MaxUntrustedServicesPerJob
+	services := make([]pipeline.Service, n)
+	for i := range services {
+		services[i] = pipeline.Service{Name: fmt.Sprintf("svc%d", i), Image: "postgres:16"}
+	}
+	_, cleanup, err := startContainerServices(context.Background(), "r", "j", services,
+		pipeline.Resources{CPU: 2, Memory: 4 << 30, PIDs: 512}, false, false, "", func(string) {})
+	if err != nil {
+		t.Fatalf("eight services on the default envelope: %v", err)
+	}
+	cleanup()
+	runs := runLines(readFakeLog(t, "FAKE_DOCKER_LOG"))
+	if len(runs) != n {
+		t.Fatalf("docker run count = %d, want %d", len(runs), n)
+	}
+	for i, run := range runs {
+		for _, want := range []string{"--cpus=0.25", "--memory=536870912", "--pids-limit=64"} {
+			if !strings.Contains(run, want) {
+				t.Fatalf("service %d run missing %q: %s", i+1, want, run)
+			}
+		}
+	}
+}
+
+// TestStartContainerServicesRejectsGenuinelyOversubscribedEnvelope proves a
+// genuinely oversubscribed envelope still fails closed with a clear policy
+// error and starts NO container (not even the first), instead of degrading to
+// a zero (unlimited) docker limit.
+func TestStartContainerServicesRejectsGenuinelyOversubscribedEnvelope(t *testing.T) {
 	installFakeBins(t)
 	services := []pipeline.Service{
 		{Name: "s1", Image: "postgres:16"},
@@ -255,7 +384,7 @@ func TestStartContainerServicesRejectsAggregateOverflow(t *testing.T) {
 		{Name: "s3", Image: "memcached:1"},
 	}
 	_, _, err := startContainerServices(context.Background(), "r", "j", services,
-		pipeline.Resources{CPU: 2, Memory: 4 << 30, PIDs: 512}, false, false, func(string) {})
+		pipeline.Resources{CPU: 2, Memory: 4 << 30, PIDs: 2}, false, false, "", func(string) {})
 	if err == nil {
 		t.Fatal("over-envelope services accepted")
 	}
@@ -266,14 +395,17 @@ func TestStartContainerServicesRejectsAggregateOverflow(t *testing.T) {
 		t.Fatalf("kind = %q, want %q", kind, ErrorPolicy)
 	}
 	log := readFakeLog(t, "FAKE_DOCKER_LOG")
-	if got := len(runLines(log)); got != 1 {
-		t.Fatalf("docker run count = %d, want 1 (only the first service fits 2 CPU):\n%s", got, log)
+	if got := len(runLines(log)); got != 0 {
+		t.Fatalf("docker run count = %d, want 0 (the plan is refused before any container):\n%s", got, log)
 	}
-	if !strings.Contains(log, "rm -f "+serviceContainerName("r", "j", 0)) {
-		t.Fatalf("cleanup did not remove the started service:\n%s", log)
+	for i := 0; i < len(services); i++ {
+		if strings.Contains(log, "--name "+serviceContainerName("r", "j", i)) {
+			t.Fatalf("service %d started despite the exhausted envelope:\n%s", i+1, log)
+		}
 	}
-	if strings.Contains(log, "--name "+serviceContainerName("r", "j", 1)) {
-		t.Fatalf("second service started after the budget was exhausted:\n%s", log)
+	// The just-created network is removed again on the failure path.
+	if !strings.Contains(log, "network rm ") {
+		t.Fatalf("failure path did not remove the services network:\n%s", log)
 	}
 }
 
@@ -336,40 +468,70 @@ func TestUntrustedServiceCountCeilingAtParseTime(t *testing.T) {
 	}
 }
 
-// TestUntrustedServicesThrottledToAggregateEnvelope proves the D1-C fix on
-// the executor path: an untrusted job whose service count is within the
-// untrusted ceiling but whose declared 2 CPU / 4 GiB envelope cannot host them
-// fails with the aggregate-budget error after starting only the services that
-// fit, never 8 sidecars each with their own defaults.
-func TestUntrustedServicesThrottledToAggregateEnvelope(t *testing.T) {
+// TestUntrustedServicesFairSplitWithinEnvelope is the E3-B fix on the
+// executor path: an untrusted job at the service-count ceiling (8) with the
+// untrusted default envelope (2 CPU / 4 GiB / 512 PIDs) starts every service
+// with a fair 1/8 share, and the services' aggregate never exceeds the
+// envelope. The main container keeps its declared per-container flags (the
+// kernel-level job cgroup, when the host provides one, is what makes the two
+// groups share the envelope; see the jobcgroup tests).
+func TestUntrustedServicesFairSplitWithinEnvelope(t *testing.T) {
 	installFakeBins(t)
 	ws := t.TempDir()
-	services := make([]pipeline.Service, pipeline.MaxUntrustedServicesPerJob)
+	t.Setenv("FAKE_WS", ws)
+	setFakeWS(t, ws)
+	const n = pipeline.MaxUntrustedServicesPerJob
+	services := make([]pipeline.Service, n)
 	for i := range services {
-		services[i] = pipeline.Service{Name: fmt.Sprintf("svc%d", i), Image: "postgres:16"}
+		services[i] = pipeline.Service{Name: fmt.Sprintf("svc%d", i), Image: "postgres@sha256:" + strings.Repeat("a", 64)}
 	}
 	spec := &pipeline.Spec{Version: 1, Jobs: map[string]pipeline.Job{
-		"build": {Runtime: "container", Image: "alpine:3.19", Services: services, Steps: []pipeline.Step{{Run: "echo hi"}}},
+		"build": {Runtime: "container", Image: "alpine@sha256:" + strings.Repeat("b", 64), Services: services, Steps: []pipeline.Step{{Run: "echo hi"}}},
 	}}
 	j := pipeline.CompiledJob{ID: "build", BaseID: "build", Job: pipeline.Job{
 		Runtime:   "container",
-		Image:     "alpine:3.19",
+		Image:     "alpine@sha256:" + strings.Repeat("b", 64),
 		Resources: pipeline.Resources{CPU: 2, Memory: 4 << 30, PIDs: 512},
 		Services:  services,
 		Steps:     []pipeline.Step{{Run: "echo hi"}},
 	}}
 	ex := &Executor{Opt: Options{Workspace: ws, RunID: "r", Untrusted: true, RequireImmutableImages: true}, Masker: &secrets.Masker{}}
-	// Untrusted service images must be digest-pinned: use a pinned image so
-	// the job reaches the aggregate budget check rather than the pin check.
-	for i := range services {
-		services[i].Image = "postgres@sha256:" + strings.Repeat("a", 64)
-	}
-	j.Job.Services = services
 	res := ex.runJob(context.Background(), spec, j, "success", nil)
-	if res.Status != "failure" || !strings.Contains(res.Error, "budget exhausted") {
-		t.Fatalf("aggregate throttling = status %q error %q", res.Status, res.Error)
+	if res.Status != "success" {
+		t.Fatalf("fair-split services = status %q error %q", res.Status, res.Error)
 	}
-	if got := len(runLines(readFakeLog(t, "FAKE_DOCKER_LOG"))); got > pipeline.MaxUntrustedServicesPerJob {
-		t.Fatalf("docker run count = %d, over the untrusted ceiling", got)
+	log := readFakeLog(t, "FAKE_DOCKER_LOG")
+	// Sum the service run flags and prove the aggregate stays within the
+	// envelope: 8 x 0.25 CPU, 8 x 512 MiB, 8 x 64 PIDs.
+	seen := 0
+	for _, line := range runLines(log) {
+		if !strings.Contains(line, "kiwi-svc-") {
+			continue
+		}
+		seen++
+		for _, want := range []string{"--cpus=0.25", "--memory=536870912", "--pids-limit=64"} {
+			if !strings.Contains(line, want) {
+				t.Fatalf("service run %d missing fair share %q: %s", seen, want, line)
+			}
+		}
+	}
+	if seen != n {
+		t.Fatalf("service runs = %d, want %d", seen, n)
+	}
+}
+
+// TestServiceAliasSharesValidationCanonicalization pins the E3-E extraction:
+// the alias execution attaches is exactly pipeline.CanonicalServiceAlias, the
+// function admission uses to reject duplicates. Because execution collapses
+// "Redis" and "redis" onto one DNS name, admission must reject the pair (see
+// internal/pipeline/service_alias_test.go).
+func TestServiceAliasSharesValidationCanonicalization(t *testing.T) {
+	for _, name := range []string{"postgres", "Postgres", "My.DB", "My DB!", "!!!"} {
+		if got, want := serviceAlias(pipeline.Service{Name: name}), pipeline.CanonicalServiceAlias(name); got != want {
+			t.Fatalf("serviceAlias(%q) = %q, want the shared canonical form %q", name, got, want)
+		}
+	}
+	if serviceAlias(pipeline.Service{Name: "Redis"}) != serviceAlias(pipeline.Service{Name: "redis"}) {
+		t.Fatal("canonical aliases diverged: admission could not detect the runtime collision")
 	}
 }

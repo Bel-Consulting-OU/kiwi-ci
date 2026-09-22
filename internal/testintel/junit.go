@@ -160,13 +160,17 @@ func parseReport(r io.Reader, name string, mask func(string) string) (Report, er
 				return out, fmt.Errorf("parse %s: %w", name, cerr)
 			}
 			s := Suite{Name: name, Tests: 1, Time: c.Time, Cases: []Case{c}}
+			// Skipped wins over a co-occurring failure/error: the case is
+			// modeled as skipped (model.TestResult.Skipped=true), so the
+			// declared counters must classify it the same way or the report
+			// would contradict the shared validator's case-derived bounds.
 			switch {
+			case c.Skipped != nil:
+				s.Skipped = 1
 			case c.Failure != nil:
 				s.Failures = 1
 			case c.Error != nil:
 				s.Errors = 1
-			case c.Skipped != nil:
-				s.Skipped = 1
 			}
 			appendSuite(&out, s)
 		default:
@@ -209,13 +213,15 @@ func readSuiteElement(dec *xml.Decoder, se xml.StartElement, mask func(string) s
 						return nil, cerr
 					}
 					s := Suite{Name: "testsuites", Tests: 1, Time: c.Time, Cases: []Case{c}}
+					// Skipped wins over a co-occurring failure/error (see the
+					// case-level synthesis above).
 					switch {
+					case c.Skipped != nil:
+						s.Skipped = 1
 					case c.Failure != nil:
 						s.Failures = 1
 					case c.Error != nil:
 						s.Errors = 1
-					case c.Skipped != nil:
-						s.Skipped = 1
 					}
 					suites = append(suites, s)
 				default:
@@ -330,9 +336,15 @@ func readCase(dec *xml.Decoder, se xml.StartElement, mask func(string) string, c
 			c.Time = sanitizeDuration(f)
 		}
 	}
-	truncateCase(&c)
+	// Order matters: mask the raw producer text FIRST, then bound the
+	// retained parts. Masking a truncated string could leave a secret that
+	// straddled the byte boundary unmasked in what is kept, and the two
+	// parts are bounded as the ONE joined text the model retains (see
+	// truncateFailure). applyMask already truncates after masking.
 	if mask != nil {
 		applyMask(&c, mask)
+	} else {
+		truncateCase(&c)
 	}
 	*cases++
 	if *cases > MaxReportCases {
@@ -376,13 +388,19 @@ func finalizeSuite(s *Suite) {
 		s.Skipped = 0
 	}
 	for _, c := range s.Cases {
+		// Skipped wins over a co-occurring failure/error: the model marks the
+		// case Skipped (and the fold ignores it), so the declared counters
+		// must count it as a skip too. A pathological producer emitting both
+		// elements would otherwise make the parser produce a report its own
+		// validator rejects (the skipped case would exceed the skipped
+		// counter).
 		switch {
+		case c.Skipped != nil:
+			skip++
 		case c.Failure != nil:
 			fail++
 		case c.Error != nil:
 			errs++
-		case c.Skipped != nil:
-			skip++
 		}
 	}
 	if s.Failures < fail {
@@ -417,6 +435,15 @@ func truncateCase(c *Case) {
 	truncateFailure(c.Error)
 }
 
+// truncateFailure bounds ONE <failure>/<error> element to the shared message
+// budget. The contract is the JOINED text the model retains (message + "\n" +
+// body, see retainedFailureText): the budget applies to the combination, not
+// to each part, because the validator measures exactly the joined value. The
+// separator is therefore charged against the budget too — that one byte is
+// what used to let a 40 KiB message plus a 40 KiB body survive the per-part
+// caps, join to 64 KiB + 1 byte and then be rejected by this package's own
+// validator. Message is kept as the priority (it is the producer's summary)
+// and only the remainder is left to the body.
 func truncateFailure(f *Failure) {
 	if f == nil {
 		return
@@ -424,16 +451,30 @@ func truncateFailure(f *Failure) {
 	if len(f.Message) > MaxMessageBytes {
 		f.Message = f.Message[:MaxMessageBytes]
 	}
-	if len(f.Body) > MaxMessageBytes {
-		f.Body = f.Body[:MaxMessageBytes]
+	keep := MaxMessageBytes - len(f.Message)
+	if f.Body != "" && len(f.Message) > 0 {
+		keep-- // the join's newline separator
 	}
-	if len(f.Message)+len(f.Body) > MaxMessageBytes {
-		keep := MaxMessageBytes - len(f.Message)
-		if keep < 0 {
-			keep = 0
-		}
+	if keep < 0 {
+		keep = 0
+	}
+	if len(f.Body) > keep {
 		f.Body = f.Body[:keep]
 	}
+}
+
+// retainedFailureText combines a failure/error message and body into the ONE
+// retained text model.TestResult carries, in the order the contract
+// requires: combine (and mask, which the caller already applied) FIRST, then
+// truncate ONCE to MaxMessageBytes. Joining and trimming before the cut is
+// what makes the retained value always exactly within the budget the
+// validator enforces, whatever the part sizes.
+func retainedFailureText(message, body string) string {
+	combined := strings.TrimSpace(message + "\n" + body)
+	if len(combined) > MaxMessageBytes {
+		combined = combined[:MaxMessageBytes]
+	}
+	return combined
 }
 
 func attrValue(se xml.StartElement, name string) string {
@@ -592,9 +633,9 @@ func AggregateMasked(workspace string, patterns []string, mask func(string) stri
 		for _, c := range rep.Cases {
 			r := model.TestResult{Name: c.Name, Class: c.Class, Duration: c.Time, Passed: c.Failure == nil && c.Error == nil && c.Skipped == nil, Skipped: c.Skipped != nil}
 			if c.Failure != nil {
-				r.Message = strings.TrimSpace(c.Failure.Message + "\n" + c.Failure.Body)
+				r.Message = retainedFailureText(c.Failure.Message, c.Failure.Body)
 			} else if c.Error != nil {
-				r.Message = strings.TrimSpace(c.Error.Message + "\n" + c.Error.Body)
+				r.Message = retainedFailureText(c.Error.Message, c.Error.Body)
 			}
 			if len(out.Cases) >= MaxJobCases {
 				return model.TestReport{}, fmt.Errorf("%w: more than %d cases per job", ErrLimitExceeded, MaxJobCases)

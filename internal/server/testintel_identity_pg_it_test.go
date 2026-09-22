@@ -66,6 +66,16 @@ func TestPostgresIntegrationServerRejectsReportIdentityAndNumbersBeforeSQL(t *te
 			model.TestReport{Tests: 1, Duration: 1e18},
 			"report duration",
 		},
+		{
+			"undeclared failing case",
+			model.TestReport{Tests: 1, Cases: []model.TestResult{{Name: "t", Passed: false}}},
+			"materialized failing cases exceed failures+errors",
+		},
+		{
+			"64-bit counter over the SQL int range",
+			model.TestReport{Tests: 3_000_000_000},
+			"tests=3000000000",
+		},
 	}
 	for _, tc := range rejected {
 		w := pgITUploadRawReport(t, s, runnerID, task, tc.rep)
@@ -97,8 +107,10 @@ func TestPostgresIntegrationServerRejectsReportIdentityAndNumbersBeforeSQL(t *te
 		t.Fatalf("rejected uploads folded history: version=%d stats=%d", version, len(stats))
 	}
 
-	// Boundary-valid identity and counters commit normally.
-	at := model.TestReport{Tests: 1, Cases: []model.TestResult{{Name: strings.Repeat("n", testintel.MaxTestNameBytes), Passed: false}}}
+	// Boundary-valid identity and counters commit normally: the failing case
+	// is declared in the failures counter, which is exactly the case-derived
+	// lower bound the validator enforces.
+	at := model.TestReport{Tests: 1, Failures: 1, Cases: []model.TestResult{{Name: strings.Repeat("n", testintel.MaxTestNameBytes), Passed: false}}}
 	if w := pgITUploadRawReport(t, s, runnerID, task, at); w.Code != http.StatusCreated {
 		t.Fatalf("boundary report upload = %d: %s", w.Code, w.Body.String())
 	}

@@ -42,7 +42,7 @@ func CanonicalHost(raw string) string {
 	// scp-like user@host:path (the colon separates host from path).
 	if at := strings.LastIndex(s, "@"); at >= 0 {
 		rest := s[at+1:]
-		if colon := strings.Index(rest, ":"); colon >= 0 {
+		if colon := scpHostColon(rest); colon >= 0 {
 			tail := rest[colon+1:]
 			if tail == "" || strings.Contains(tail, "/") {
 				return canonHostPort("ssh", rest[:colon])
@@ -53,6 +53,15 @@ func CanonicalHost(raw string) string {
 	if j := strings.IndexAny(s, "/?#"); j >= 0 {
 		s = s[:j]
 	}
+	// A bracketed IPv6 literal is host material, never the legacy
+	// "host:path" spelling: its internal colons must not split it (the
+	// legacy rule below would otherwise canonicalize "[::1]:8443" to the
+	// bare "[" and collapse every distinct literal onto one identity key).
+	// canonHostPort's bracket parser handles both well-formed and truncated
+	// literals; a truncated one is preserved verbatim rather than mangled.
+	if strings.HasPrefix(s, "[") {
+		return canonHostPort("", s)
+	}
 	if colon := strings.Index(s, ":"); colon > 0 && !strings.Contains(s[:colon], ":") {
 		if _, err := strconv.Atoi(s[colon+1:]); err != nil {
 			// Legacy "host:path" spelling with no scp user and no numeric
@@ -61,6 +70,24 @@ func CanonicalHost(raw string) string {
 		}
 	}
 	return canonHostPort("", s)
+}
+
+// scpHostColon returns the index of the colon separating an scp-like host
+// from its path: the first colon AFTER a bracketed IPv6 literal's closing
+// bracket, the first colon otherwise, or -1 when no colon separates a host
+// from a tail. A literal's internal colons never split the host.
+func scpHostColon(s string) int {
+	if strings.HasPrefix(s, "[") {
+		end := strings.Index(s, "]")
+		if end < 0 {
+			return -1
+		}
+		if colon := strings.Index(s[end+1:], ":"); colon >= 0 {
+			return end + 1 + colon
+		}
+		return -1
+	}
+	return strings.Index(s, ":")
 }
 
 // NormalizeRepoKey canonicalizes the forge-host segment of a repository key

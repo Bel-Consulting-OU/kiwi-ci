@@ -60,6 +60,20 @@ type ClusterKeyLookup interface {
 	Lookup(kind string) ([]byte, bool, error)
 }
 
+// ClusterKeyInstaller optionally installs caller-provided key material with
+// atomic create-if-absent semantics: the STORED material always wins when
+// the kind already exists, and created reports whether this call's bytes
+// were installed. It is what lets an explicit runner CA be installed into
+// the shared cluster store and compared against what every replica already
+// trusts (see Server.SetRunnerCA): material that disagrees with the stored
+// bytes fails startup instead of silently replacing the shared trust root.
+// Stores that do not implement it can still serve read-only material through
+// Lookup; the runner-CA install path refuses them rather than falling back to
+// node-local files.
+type ClusterKeyInstaller interface {
+	InstallOrLoad(kind string, data []byte) (stored []byte, created bool, err error)
+}
+
 // ClusterKeyRotationFencer optionally provides the cross-replica fence that
 // serializes key-material rotation. It is what makes rotation safe in HA: a
 // local mutex only serializes goroutines inside one replica, while two
@@ -103,12 +117,14 @@ type StaticClusterKeyStore struct {
 }
 
 var (
-	_ ClusterKeyStore  = (*FSClusterKeyStore)(nil)
-	_ ClusterKeyWriter = (*FSClusterKeyStore)(nil)
-	_ ClusterKeyLookup = (*FSClusterKeyStore)(nil)
-	_ ClusterKeyStore  = (*StaticClusterKeyStore)(nil)
-	_ ClusterKeyWriter = (*StaticClusterKeyStore)(nil)
-	_ ClusterKeyLookup = (*StaticClusterKeyStore)(nil)
+	_ ClusterKeyStore     = (*FSClusterKeyStore)(nil)
+	_ ClusterKeyWriter    = (*FSClusterKeyStore)(nil)
+	_ ClusterKeyLookup    = (*FSClusterKeyStore)(nil)
+	_ ClusterKeyInstaller = (*FSClusterKeyStore)(nil)
+	_ ClusterKeyStore     = (*StaticClusterKeyStore)(nil)
+	_ ClusterKeyWriter    = (*StaticClusterKeyStore)(nil)
+	_ ClusterKeyLookup    = (*StaticClusterKeyStore)(nil)
+	_ ClusterKeyInstaller = (*StaticClusterKeyStore)(nil)
 )
 
 // ---------------------------------------------------------------------------
@@ -308,14 +324,79 @@ func (s *FSClusterKeyStore) LoadOrCreate(kind string) ([]byte, error) {
 	return created, nil
 }
 
+// InstallOrLoad installs data for kind when the store holds nothing yet and
+// returns the stored bytes; created reports whether this call's bytes were
+// installed. An existing value always wins (the hard-link CAS plus a
+// read-back), so the call is an atomic compare-or-install against the shared
+// trust root. The runner-CA object also publishes its ca.crt/ca.key sidecars,
+// mirroring LoadOrCreate, and key-pair kinds publish their public sidecar.
+func (s *FSClusterKeyStore) InstallOrLoad(kind string, data []byte) ([]byte, bool, error) {
+	if len(data) == 0 {
+		return nil, false, errors.New("cluster keys: empty key material")
+	}
+	if existing, ok, err := s.Lookup(kind); err != nil {
+		return nil, false, err
+	} else if ok {
+		return existing, false, nil
+	}
+	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
+		return nil, false, err
+	}
+	encoded, err := s.encodedBytes(kind, data)
+	if err != nil {
+		return nil, false, err
+	}
+	path, err := s.path(kind)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := createFileCAS(path, encoded); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			return nil, false, err
+		}
+		// A concurrent installer won: the stored bytes are authoritative.
+		existing, ok, lerr := s.Lookup(kind)
+		if lerr != nil {
+			return nil, false, lerr
+		}
+		if !ok {
+			return nil, false, fmt.Errorf("cluster keys: %s was installed concurrently but cannot be read", kind)
+		}
+		return existing, false, nil
+	}
+	if kind == clusterKindRunnerCA {
+		if err := s.publishRunnerCASidecars(data); err != nil {
+			return nil, false, err
+		}
+	}
+	if kind == clusterKindProvenance || kind == clusterKindCacheSigning {
+		priv, perr := parseEd25519PrivatePEM(data)
+		if perr != nil {
+			return nil, false, perr
+		}
+		pubPEM, perr := encodeEd25519PublicPEM(priv.Public().(ed25519.PublicKey))
+		if perr != nil {
+			return nil, false, perr
+		}
+		pubPath := filepath.Join(s.Dir, "provenance.pub")
+		if kind == clusterKindCacheSigning {
+			pubPath = filepath.Join(s.Dir, cacheSigningPubFile)
+		}
+		if perr := writeFileAtomic(pubPath, pubPEM, 0o644); perr != nil {
+			return nil, false, perr
+		}
+	}
+	return data, true, nil
+}
+
 // encodedBytes renders the canonical on-disk encoding for one kind without
 // touching the filesystem (hex for raw 32-byte material, identity for the
-// self-describing formats).
+// self-describing formats including the runner-CA object).
 func (s *FSClusterKeyStore) encodedBytes(kind string, data []byte) ([]byte, error) {
 	switch kind {
 	case clusterKindLease, clusterKindWebSession:
 		return []byte(hex.EncodeToString(data)), nil
-	case clusterKindOIDC, clusterKindProvenance, clusterKindCacheSigning:
+	case clusterKindOIDC, clusterKindProvenance, clusterKindCacheSigning, clusterKindRunnerCA:
 		return data, nil
 	default:
 		return nil, fmt.Errorf("cluster keys: unknown key kind %q", kind)
@@ -594,6 +675,26 @@ func (s *StaticClusterKeyStore) LoadOrCreate(kind string) ([]byte, error) {
 	}
 	s.Keys[kind] = append([]byte(nil), b...)
 	return append([]byte(nil), b...), nil
+}
+
+// InstallOrLoad installs data for kind when absent (create-if-absent under
+// the store mutex) and returns the stored bytes; created reports whether the
+// caller's bytes were installed. An existing value always wins, so
+// concurrent installers converge on one trust root.
+func (s *StaticClusterKeyStore) InstallOrLoad(kind string, data []byte) ([]byte, bool, error) {
+	if len(data) == 0 {
+		return nil, false, errors.New("cluster keys: empty key material")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Keys == nil {
+		s.Keys = map[string][]byte{}
+	}
+	if existing, ok := s.Keys[kind]; ok {
+		return append([]byte(nil), existing...), false, nil
+	}
+	s.Keys[kind] = append([]byte(nil), data...)
+	return append([]byte(nil), data...), true, nil
 }
 
 func (s *StaticClusterKeyStore) Lookup(kind string) ([]byte, bool, error) {

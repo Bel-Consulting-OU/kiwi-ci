@@ -1112,10 +1112,14 @@ type RunEnqueueStore interface {
 //     transition: the quota_reservations row is updated conditionally and
 //     zero matched rows rolls the whole lease back with ErrQuotaExceeded.
 //   - CPURequest/MemoryRequest/DiskRequest/PIDsRequest are the candidate
-//     job's requested resources (model.Job.ResourceRequest). The claim
-//     reserves them against the runner's remaining resource capacity in the
-//     same transaction (see postgres_resource_reservation.go); a rejected
-//     admission rolls the lease back with ErrResourceCapacity.
+//     job's requested resources (model.Job.ResourceRequest) and
+//     ServiceEnvelopeRequest its aggregate service request
+//     (model.Job.ServiceEnvelopeRequest). The claim reserves their SUM
+//     against the runner's remaining resource capacity in the same
+//     transaction (see postgres_resource_reservation.go); a rejected
+//     admission rolls the lease back with ErrResourceCapacity. A job
+//     without services (or a legacy payload) leaves the envelope zero, so
+//     the reservation is byte-identical to the pre-envelope behavior.
 //   - ResourceCapacity is the caller's registration-snapshot resource
 //     capacity. The SQL claim reads the runner row's live resource capacity
 //     (and, when linked, the profile's max_* columns) instead; memory stores
@@ -1146,11 +1150,23 @@ type LeaseClaim struct {
 	MemoryRequest int64
 	DiskRequest   int64
 	PIDsRequest   int
+
+	// ServiceEnvelopeRequest is the candidate job's aggregate service
+	// request (model.Job.ServiceEnvelopeRequest). The claim reserves the sum
+	// of the job request and this envelope (RequestedResources), so a runner
+	// without room for the aggregate never takes the job.
+	ServiceEnvelopeRequest model.ResourceCapacity
 }
 
-// RequestedResources returns the claim's requested resources.
+// RequestedResources returns the TOTAL resources the claim reserves against
+// the runner: the job's own declared request plus its aggregate service
+// envelope. It is model.Job.ReservedResources through one shared summation
+// (model.AddResourceCapacity), so every admission and ledger path charges
+// exactly the same total.
 func (c LeaseClaim) RequestedResources() model.ResourceCapacity {
-	return model.ResourceCapacity{CPU: c.CPURequest, Memory: c.MemoryRequest, Disk: c.DiskRequest, PIDs: c.PIDsRequest}
+	return model.AddResourceCapacity(
+		model.ResourceCapacity{CPU: c.CPURequest, Memory: c.MemoryRequest, Disk: c.DiskRequest, PIDs: c.PIDsRequest},
+		c.ServiceEnvelopeRequest)
 }
 
 // EnvKey names the environment concurrency key: the CANONICAL repository

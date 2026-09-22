@@ -63,6 +63,19 @@ type ContainerBackend struct {
 	// operator escape hatch for trusted-only/self-hosted runners lives in
 	// Options/KIWI_ALLOW_UNQUOTAED_UNTRUSTED_DISK.
 	RequireDiskQuota bool
+	// WorkspaceQuota, when non-nil, is the outcome of a hard workspace
+	// quota attempt the CALLER already performed before the workspace was
+	// populated (the distributed runner installs it before checkout, see
+	// runner.execute). A Hard outcome satisfies RequireDiskQuota without a
+	// second probe; a non-Hard outcome fails the gate closed with the
+	// caller's reason. Nil (direct backend users) keeps the historical
+	// probe-at-StartJob behavior.
+	WorkspaceQuota *DiskQuotaStatus
+	// CgroupParent, when non-empty, is the job's scoped parent cgroup (see
+	// jobcgroup.go): the container is placed in it with --cgroup-parent so
+	// the main container and the job's service containers together can never
+	// exceed the job's declared envelope at the kernel.
+	CgroupParent string
 	// restoreWorkspace undoes the host-side workspace provisioning applied
 	// before a hardened rootful container started. It is set by StartJob and
 	// run exactly once by CloseJob (or by StartJob itself when the docker run
@@ -104,16 +117,28 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 		return err
 	}
 	// Untrusted jobs must not advertise a disk bound that exists only at step
-	// boundaries. When the caller demands a hard bound, the capability probe
-	// must actually establish one (XFS project quota); otherwise the job
-	// fails closed before docker is even looked up, with a message that names
-	// the escape hatch instead of silently running unbounded.
+	// boundaries. When the caller demands a hard bound, either the caller
+	// already installed one before the workspace was populated (runner
+	// lifecycle, WorkspaceQuota) or the capability probe must establish one
+	// (XFS project quota); otherwise the job fails closed before docker is
+	// even looked up, with a message that names the escape hatch instead of
+	// silently running unbounded. The runner-side gate is the primary check
+	// (it runs before checkout); this is defense in depth for direct backend
+	// users and for callers that pass a preinstalled non-hard status.
 	if b.Untrusted && b.RequireDiskQuota {
-		status, cleanup := workspaceDiskQuotaSetup(abs, b.workspaceMaxBytes())
-		if !status.Hard {
-			return &RunError{Kind: ErrorConfig, Err: fmt.Errorf("untrusted job requires a hard workspace disk quota, but none could be established: %s (the step-boundary resources.disk check is not a hard bound; set %s=1 only on trusted-only self-hosted runners to accept that residual, or run the runner on an XFS workspace with prjquota and root)", status.Detail, AllowUnquotaedUntrustedDiskEnv)}
+		switch {
+		case b.WorkspaceQuota != nil && b.WorkspaceQuota.Hard:
+			// Already bounded by the caller, before any workspace content
+			// existed.
+		case b.WorkspaceQuota != nil:
+			return UntrustedDiskQuotaGateError(b.WorkspaceQuota.Detail)
+		default:
+			status, cleanup := workspaceDiskQuotaSetup(abs, b.workspaceMaxBytes())
+			if !status.Hard {
+				return UntrustedDiskQuotaGateError(status.Detail)
+			}
+			b.quotaCleanup = cleanup
 		}
-		b.quotaCleanup = cleanup
 	}
 	docker, err := exec.LookPath("docker")
 	if err != nil {
@@ -136,6 +161,9 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 		"run", "-d", "--rm", "--init", "--network=" + network,
 		"--cap-drop=ALL", "--security-opt=no-new-privileges",
 		"-v", abs + ":/workspace", "-w", "/workspace", "--name", b.container,
+	}
+	if b.CgroupParent != "" {
+		args = append(args, "--cgroup-parent="+b.CgroupParent)
 	}
 	args = append(args, resourceArgsFor(b.Resources)...)
 	args = append(args, containerLabels(b.RunID, b.JobID)...)
@@ -181,34 +209,22 @@ func containerResourceArgs(j pipeline.Job) []string {
 }
 
 // workspaceMaxBytes is the workspace content bound for one container job.
-// pipeline.ByteSize is already the canonical byte count the pipeline decoder
-// produced (binary suffixes: "2Gi" = 2<<30; plain integers are bytes), so no
-// re-parsing is involved.
-//
-// Precedence:
-//  1. a declared resources.disk request (any job), then
-//  2. for an untrusted job, UntrustedDiskMaxBytes when set, otherwise the
-//     mandatory DefaultUntrustedWorkspaceMaxBytes, then
-//  3. trusted jobs without a declaration: zero (unbounded), the documented
-//     historical default.
+// The precedence (declared resources.disk, then an untrusted job's
+// UntrustedDiskMaxBytes override or the mandatory default, then zero for
+// trusted undeclared jobs) lives in the shared WorkspaceBoundBytes so the
+// runner and the backend can never disagree. pipeline.ByteSize is already the
+// canonical byte count the pipeline decoder produced (binary suffixes: "2Gi"
+// = 2<<30; plain integers are bytes), so no re-parsing is involved.
 //
 // The untrusted default is the fix for the unbounded-workspace defect: an
 // undeclared disk no longer means "unbounded" for jobs the runner does not
 // trust. The bound is still measured at step boundaries (a bind mount has no
 // per-mount quota); the hard OS-level bound for untrusted jobs comes from the
-// RequireDiskQuota capability gate, which fails closed when no project quota
-// can be established.
+// RequireDiskQuota capability gate (runner-installed before checkout, or
+// probed here when no caller installed one), which fails closed when no
+// project quota can be established.
 func (b *ContainerBackend) workspaceMaxBytes() int64 {
-	if disk := int64(b.Resources.Disk); disk > 0 {
-		return disk
-	}
-	if b.Untrusted {
-		if b.UntrustedDiskMaxBytes > 0 {
-			return b.UntrustedDiskMaxBytes
-		}
-		return DefaultUntrustedWorkspaceMaxBytes
-	}
-	return 0
+	return WorkspaceBoundBytes(int64(b.Resources.Disk), b.Untrusted, b.UntrustedDiskMaxBytes)
 }
 
 // enforceWorkspaceBound fails with a clear error when the host-side workspace

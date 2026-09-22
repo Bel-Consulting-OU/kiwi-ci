@@ -55,6 +55,13 @@ var (
 	// foo_bar after projection. Rejecting punctuation at admission makes
 	// collisions impossible for accepted names.
 	secretNameRegexp = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
+	// serviceAliasCleanRegexp mirrors the executor's docker name sanitizer
+	// (dockerNameClean): every character docker does not accept in a
+	// container/network name is replaced with "-". CanonicalServiceAlias
+	// applies it together with the lowercasing the runtime performs, so
+	// admission and execution agree on one canonical alias per declared
+	// name.
+	serviceAliasCleanRegexp = regexp.MustCompile(`[^a-zA-Z0-9_.-]`)
 
 	shellNames = map[string]bool{
 		"": true, "bash": true, "sh": true, "zsh": true, "pwsh": true,
@@ -196,6 +203,17 @@ func ValidateServiceQuota(s *Spec, untrusted bool) error {
 		}
 	}
 	return nil
+}
+
+// CanonicalServiceAlias returns the single canonical form of a declared
+// service alias. Docker network aliases are resolved through case-insensitive
+// DNS, and the executor attaches the alias lowercased (and with docker-invalid
+// characters replaced, defensively, for names that reach execution without a
+// fresh validation pass). Admission and execution both go through this
+// function, so two declared aliases that differ only in case are rejected at
+// parse time instead of colliding at runtime.
+func CanonicalServiceAlias(name string) string {
+	return strings.ToLower(serviceAliasCleanRegexp.ReplaceAllString(name, "-"))
 }
 
 // ValidateLimits enforces the hard resource limits independent of structural
@@ -396,15 +414,22 @@ func validateJob(s *Spec, id string, j Job) error {
 	if err := validateMatrix(fmt.Sprintf("job %q", id), j.Matrix); err != nil {
 		return err
 	}
-	seenAliases := map[string]bool{}
+	seenAliases := map[string]string{}
 	for i := range j.Services {
 		if err := validateService(id, &j.Services[i]); err != nil {
 			return err
 		}
-		if seenAliases[j.Services[i].Name] {
-			return fmt.Errorf("job %q declares service alias %q more than once", id, j.Services[i].Name)
+		// Duplicate detection is canonical, not literal: "Redis" and
+		// "redis" resolve to the same docker network alias at runtime, so
+		// accepting both would let two containers share one DNS name.
+		canon := CanonicalServiceAlias(j.Services[i].Name)
+		if prev, dup := seenAliases[canon]; dup {
+			if prev == j.Services[i].Name {
+				return fmt.Errorf("job %q declares service alias %q more than once", id, j.Services[i].Name)
+			}
+			return fmt.Errorf("job %q declares service aliases %q and %q that both resolve to %q", id, prev, j.Services[i].Name, canon)
 		}
-		seenAliases[j.Services[i].Name] = true
+		seenAliases[canon] = j.Services[i].Name
 	}
 	seenStepIDs := map[string]bool{}
 	for i := range j.Steps {

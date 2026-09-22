@@ -238,16 +238,18 @@ func (s *DBScheduler) Enqueue(ctx context.Context, run model.Run, jobs map[strin
 // deadlines are evaluated on top, then priority (downstream depth) and age.
 // The raw lease token is returned exactly once; only its hash is persisted.
 //
-// RESOURCE ADMISSION: a candidate whose requested CPU/memory/disk/PIDs do
-// not fit the runner's REMAINING resource capacity is skipped, so it waits
-// (or is leased to another runner with room) instead of oversubscribing this
-// one. The check here is a pre-filter over the live reservation sum; the
-// authoritative check-and-reserve happens inside the claim transaction
-// (storage.AcquireLeaseAtomic), which fails with storage.ErrResourceCapacity
-// when a concurrent lease won the remaining capacity first — that error is
-// treated exactly like a lost capacity race (try the next candidate). A
-// runner without configured capacities (all dimensions zero, the documented
-// default) admits every candidate: only the job-count capacity applies.
+// RESOURCE ADMISSION: a candidate whose TOTAL request (its own
+// CPU/memory/disk/PIDs plus the aggregate service envelope,
+// model.Job.ReservedResources) does not fit the runner's REMAINING resource
+// capacity is skipped, so it waits (or is leased to another runner with room)
+// instead of oversubscribing this one. The check here is a pre-filter over the
+// live reservation sum; the authoritative check-and-reserve happens inside the
+// claim transaction (storage.AcquireLeaseAtomic), which fails with
+// storage.ErrResourceCapacity when a concurrent lease won the remaining
+// capacity first — that error is treated exactly like a lost capacity race
+// (try the next candidate). A runner without configured capacities (all
+// dimensions zero, the documented default) admits every candidate: only the
+// job-count capacity applies.
 //
 // Deliberately NOT epoch-fenced, unlike the leader-only housekeeping
 // mutations: the lease claim is itself a single atomic conditional
@@ -308,11 +310,13 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 		// Resource admission pre-filter: a candidate that cannot fit the
 		// runner's remaining resource capacity waits for room on this
 		// runner (or a lease on another one) instead of being claimed and
-		// rolling back.
+		// rolling back. The requested total is the job's OWN request plus
+		// its aggregate service envelope (model.Job.ReservedResources) —
+		// the same total the claim transaction and the fs/dev path charge.
 		if !(storage.ResourceAdmission{
 			Capacity:  eff.ResourceCapacity,
 			Reserved:  reserved,
-			Requested: candidate.ResourceRequest(),
+			Requested: candidate.ReservedResources(),
 		}).Allows() {
 			continue
 		}
@@ -401,6 +405,10 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 			MemoryRequest:          candidate.MemoryRequest,
 			DiskRequest:            candidate.DiskRequest,
 			PIDsRequest:            candidate.PIDsRequest,
+			// The aggregate service envelope rides the claim so the claim
+			// transaction reserves job request + envelope in the ONE
+			// ledger row (LeaseClaim.RequestedResources).
+			ServiceEnvelopeRequest: candidate.ServiceEnvelopeRequest,
 		}
 		// Capacity-atomic lease: the job claim, every predicate above, the
 		// resource reservation and the runner's active-jobs append happen in

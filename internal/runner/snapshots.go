@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/safefs"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
@@ -68,39 +67,53 @@ func snapshotArchiveMaxBytes(workspaceMaxBytes int64) int64 {
 // POSTs it to /api/v1/jobs/{id}/snapshots under the active lease. The
 // caller treats any error as a warning: snapshot uploads never fail a job.
 //
+// The archive is STREAMED directly into the request body through an io.Pipe:
+// the tar.gz bytes are produced by snapshot.Create and consumed by the HTTP
+// transport as they are written, so no second workspace-sized copy is ever
+// materialized on the runner's disk. The old implementation wrote the whole
+// archive to a temporary file under TMPDIR (up to the shared 4 GiB cap)
+// outside the workspace quota and the scheduler's disk reservation, which
+// doubled the runner's peak disk cost for a capture that defaults on. The
+// archive cap is still enforced WHILE STREAMING by the same
+// safefs.CappedWriter the file path used, so an oversized workspace aborts
+// the capture with the same clear error (and the aborted request body is
+// rejected by the control plane's upload handler, which removes its partial
+// file and never records an archive).
+//
 // workspaceMaxBytes is the job's declared disk bound (zero when none was
-// declared); the temporary archive is capped with snapshotArchiveMaxBytes
-// and an over-cap archive aborts the capture with a clear error instead of
-// filling the runner's disk.
+// declared).
 func (r *Runner) uploadJobSnapshot(ctx context.Context, t server.Task, workspace string, workspaceMaxBytes int64) error {
 	limit := snapshotArchiveMaxBytes(workspaceMaxBytes)
-	tmp, err := os.CreateTemp("", "kiwi-snapshot-*.tar.gz")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	if _, err := snapshot.Create(workspace, safefs.NewCappedWriter(tmp, limit)); err != nil {
-		tmp.Close()
-		if errors.Is(err, safefs.ErrCapExceeded) {
-			return fmt.Errorf("snapshot archive exceeds the runner limit of %d bytes (declared workspace bound %d bytes): %w", limit, workspaceMaxBytes, err)
+	pr, pw := io.Pipe()
+	// capture carries snapshot.Create's result from its goroutine. The writer
+	// end is always closed with that result, so the reader (the HTTP body and
+	// then this function) observes the capture error as a body error instead
+	// of a hang.
+	capture := make(chan error, 1)
+	go func() {
+		_, err := snapshot.Create(workspace, safefs.NewCappedWriter(pw, limit))
+		if err != nil {
+			if errors.Is(err, safefs.ErrCapExceeded) {
+				err = fmt.Errorf("snapshot archive exceeds the runner limit of %d bytes (declared workspace bound %d bytes): %w", limit, workspaceMaxBytes, err)
+			} else {
+				err = fmt.Errorf("snapshot create: %w", err)
+			}
 		}
-		return fmt.Errorf("snapshot create: %w", err)
-	}
-	if err := closeRunnerTempFile(tmp); err != nil {
-		return fmt.Errorf("snapshot close: %w", err)
-	}
-	f, err := os.Open(tmpPath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
+		_ = pw.CloseWithError(err)
+		capture <- err
+	}()
+	// The transport closes the request body when the request finishes; this
+	// close also covers the paths where it does not, so the capture goroutine
+	// can never block a write forever after the request is gone.
+	defer pr.Close()
 	reqCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	guard := newStallGuard(cancel, streamIdleTimeout)
 	defer guard.stop()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, r.Cfg.Server+"/api/v1/jobs/"+t.Job.ID+"/snapshots", &stallGuardReader{r: f, guard: guard})
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, r.Cfg.Server+"/api/v1/jobs/"+t.Job.ID+"/snapshots", &stallGuardReader{r: pr, guard: guard})
 	if err != nil {
+		_ = pr.CloseWithError(err)
+		<-capture
 		return err
 	}
 	r.auth(req)
@@ -110,12 +123,26 @@ func (r *Runner) uploadJobSnapshot(ctx context.Context, t server.Task, workspace
 	req.Header.Set("X-Kiwi-Lease-Generation", fmt.Sprint(t.LeaseGeneration))
 	resp, err := r.streamClient().Do(req)
 	if err != nil {
+		// Abort a capture that may still be writing, then surface the
+		// capture failure (the cap-exceeded error is the actionable one) or
+		// the transport error.
+		_ = pr.CloseWithError(err)
+		if cerr := <-capture; cerr != nil {
+			return cerr
+		}
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		_ = pr.CloseWithError(errors.New("snapshot upload rejected"))
+		if cerr := <-capture; cerr != nil {
+			return cerr
+		}
 		return fmt.Errorf("snapshot upload %s: %s", resp.Status, string(b))
 	}
-	return nil
+	// The response is in; the body was fully consumed, so the capture has
+	// finished. Surface a capture error even if the server answered 2xx
+	// before observing the very end of the stream.
+	return <-capture
 }

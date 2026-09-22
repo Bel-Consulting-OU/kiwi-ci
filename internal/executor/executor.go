@@ -85,6 +85,15 @@ type Options struct {
 	// escape hatch (KIWI_ALLOW_UNQUOTAED_UNTRUSTED_DISK) cover trusted-only
 	// self-hosted setups.
 	RequireUntrustedDiskQuota bool
+	// WorkspaceQuota carries the outcome of a hard workspace quota attempt
+	// the caller already performed BEFORE the workspace was populated (the
+	// distributed runner installs the bound before checkout, so an untrusted
+	// repository can no longer fill the host disk during checkout). A
+	// non-nil Hard outcome satisfies RequireUntrustedDiskQuota without a
+	// second probe; a non-nil non-Hard outcome fails the gate closed with
+	// the caller's probe reason. Nil means no caller attempt: the container
+	// backend probes at StartJob itself (defense in depth / direct users).
+	WorkspaceQuota *DiskQuotaStatus
 	// CaptureSnapshot archives the job workspace after its steps ran (for
 	// any status other than skipped/blocked) under the host temp dir.
 	// Snapshot failures are logged as warnings and never change job status.
@@ -426,10 +435,42 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		res.Error = err.Error()
 		return finish(res)
 	}
+	// The job-scoped parent cgroup (when the host supports one) is shared by
+	// the service containers started here and by the main container started
+	// below.
+	cgroupParent := ""
 	if cj.Job.Runtime == "container" && len(cj.Job.Services) > 0 {
+		// One job-scoped parent cgroup holds the main container AND every
+		// service container, with the declared envelope applied to the
+		// PARENT (see jobcgroup.go): the scheduler reserved the envelope
+		// once, so the two groups must not be able to add up to twice it.
+		// When the host genuinely cannot provide the parent cgroup, the
+		// fallback keeps per-container caps plus the fair-split aggregate
+		// service budget, and the aggregate the scheduler must additionally
+		// reserve is logged (control-plane follow-up, see
+		// ServiceEnvelopeRequest).
+		cgStatus, cgCleanup := jobCgroupSetup(ctx, jobCgroupRequest{
+			JobID:  cj.ID,
+			CPU:    cj.Job.Resources.CPU,
+			Memory: int64(cj.Job.Resources.Memory),
+			PIDs:   cj.Job.Resources.PIDs,
+		})
+		if cgStatus.Enabled && cgCleanup != nil {
+			cgroupParent = cgStatus.Parent
+			// Registered before the services/backend cleanup defers below,
+			// so it runs AFTER the containers are gone (LIFO).
+			defer func() {
+				if cerr := cgCleanup(); cerr != nil {
+					e.log(cj.ID, "service", "job cgroup cleanup warning: "+cerr.Error())
+				}
+			}()
+			e.log(cj.ID, "service", "job resource cgroup: "+cgStatus.Detail)
+		} else {
+			e.log(cj.ID, "service", "job resource cgroup unavailable ("+cgStatus.Detail+"); per-container caps apply, and the aggregate service request ("+serviceEnvelopeSummary(cj.Job.Resources, cj.Job.Services)+") must be reserved by the scheduler to bound aggregate host usage")
+		}
 		isolated := networkPolicy == pipeline.NetworkPolicyNone || networkPolicy == pipeline.NetworkPolicyServicesOnly
 		var er error
-		network, cleanupServices, er = startContainerServices(ctx, e.Opt.RunID, cj.ID, cj.Job.Services, cj.Job.Resources, isolated, e.Opt.RequireImmutableImages, func(line string) { e.log(cj.ID, "service", line) })
+		network, cleanupServices, er = startContainerServices(ctx, e.Opt.RunID, cj.ID, cj.Job.Services, cj.Job.Resources, isolated, e.Opt.RequireImmutableImages, cgroupParent, func(line string) { e.log(cj.ID, "service", line) })
 		if er != nil {
 			res.Status = model.StatusFailure
 			res.Error = er.Error()
@@ -458,6 +499,8 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		b.Untrusted = e.Opt.Untrusted
 		b.UntrustedDiskMaxBytes = e.Opt.UntrustedWorkspaceMaxBytes
 		b.RequireDiskQuota = e.Opt.RequireUntrustedDiskQuota
+		b.WorkspaceQuota = e.Opt.WorkspaceQuota
+		b.CgroupParent = cgroupParent
 	case *TartBackend:
 		b.RequireImmutableImages = e.Opt.RequireImmutableImages
 		b.Resources = cj.Job.Resources

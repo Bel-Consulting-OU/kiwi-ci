@@ -468,6 +468,13 @@ func rebuildRepoTestHistoryTx(ctx context.Context, tx pgx.Tx, repoID string) err
 		}
 		for _, p := range page {
 			for _, c := range p.rep.Cases {
+				// Skip policy: skipped cases are excluded from the fold here
+				// exactly as they are on the incremental path, so a rebuilt
+				// history is byte-identical to one built by uploads and a
+				// skip can never surface as a failure or as flakiness.
+				if c.Skipped {
+					continue
+				}
 				key := testHistoryAggregateKey(p.rep.JobKey, c.Class, c.Name)
 				row := aggregates[key]
 				row.RepoID = repoID

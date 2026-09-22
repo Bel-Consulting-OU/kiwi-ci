@@ -118,6 +118,16 @@ func (s *PostgresStore) InsertTestReportWithHistoryDelivery(ctx context.Context,
 		return TestReportInsertOutcome{}, err
 	}
 	for _, c := range rep.Cases {
+		// Skip policy (one rule for every fold path): a skipped case is NOT
+		// a pass/fail observation. JUnit marks it Passed=false plus
+		// Skipped=true, so folding it would record a failure the test never
+		// had and poison Fails, LastFailure, the 16-outcome window and
+		// FlakeProb. Skipped cases contribute nothing to the historical
+		// counters; the report's own Tests/Failures/Errors/Skipped totals
+		// still describe the run.
+		if c.Skipped {
+			continue
+		}
 		if err := foldTestHistoryTx(ctx, tx, repoID, TestHistoryEntry{
 			Suite: rep.JobKey, Class: c.Class, Name: c.Name, Duration: c.Duration, Passed: c.Passed, When: rep.CreatedAt,
 		}); err != nil {

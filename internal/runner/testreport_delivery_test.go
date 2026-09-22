@@ -24,7 +24,7 @@ import (
 // and payload are part of the identity, and an over-limit report is refused
 // before any upload with the shared ErrLimitExceeded reason.
 func TestBuildTestReportDeliveryStableAndBounded(t *testing.T) {
-	rep := model.TestReport{Tests: 2, Cases: []model.TestResult{
+	rep := model.TestReport{Tests: 2, Failures: 1, Cases: []model.TestResult{
 		{Name: "t", Class: "C", Duration: 1, Passed: true},
 		{Name: "t", Class: "C", Duration: 2, Passed: false},
 	}}
@@ -73,6 +73,7 @@ func TestBuildTestReportDeliveryStableAndBounded(t *testing.T) {
 		t.Fatalf("generation is not part of the delivery ID: %+v err=%v", nextGen, err)
 	}
 	changed := rep
+	changed.Failures = 2 // both cases now fail; keep the counters consistent
 	changed.Cases = append([]model.TestResult(nil), rep.Cases...)
 	changed.Cases[0].Passed = false
 	changedRep, err := buildTestReportDelivery("job-1", 7, "runner-1", "lease-token", changed)

@@ -335,26 +335,31 @@ func (s *Server) clusterKeyRotationFencer() ClusterKeyRotationFencer {
 }
 
 // ensureOIDCSigner returns the signer issueOIDC must sign under, rotating the
-// active key first when it is due. The shared ring is reloaded before the
+// active key first when it is due. The shared ring is refreshed before the
 // check so a rotation published by another replica is adopted immediately.
 //
+// The refresh loads and parses ring material OUTSIDE s.mu (see
+// refreshOIDCRing): a key store is remote I/O, and holding the global server
+// mutex across it would let one public JWKS request stall every control-plane
+// operation. Only the pointer comparison and swap take s.mu, for a few
+// instructions.
+//
 // When a cross-replica fence is available the due-rotation path is: acquire
-// the fence, reload the shared ring AGAIN, re-check whether rotation is still
-// due, then rotate and persist exactly once while still holding the fence.
-// The loser of a concurrent rotation therefore observes the winner's
-// published key and does not overwrite it, and no replica ever activates a
-// replacement before it is published. When the fence cannot be acquired
-// within clusterKeyRotationFenceTimeout the current (published) key stays
-// active: issuing under an unpublished key would produce tokens no peer can
-// verify. Without any fence (dev mode) the reload + local mutex path is the
-// best available guarantee.
+// the fence, refresh the shared ring AGAIN (still outside s.mu), re-check
+// whether rotation is still due, then rotate and persist exactly once. The
+// loser of a concurrent rotation therefore observes the winner's published
+// key and does not overwrite it, and no replica ever activates a replacement
+// before it is published. When the fence cannot be acquired within
+// clusterKeyRotationFenceTimeout the current (published) key stays active:
+// issuing under an unpublished key would produce tokens no peer can verify.
+// Without any fence (dev mode) the local mutex serializes rotation.
 func (s *Server) ensureOIDCSigner(ctx context.Context, now time.Time) *oidcSigner {
 	// >= (not >): coarse-clock platforms can report an exactly-zero age for
 	// a freshly created key, and a max age of 0 must mean "rotate now".
+	s.refreshOIDCRing(ctx)
 	s.mu.Lock()
-	s.reloadOIDCRingLocked()
-	due := s.oidc == nil || now.Sub(s.oidc.NotBefore) >= oidcActiveKeyMaxAge
 	signer := s.oidc
+	due := signer == nil || now.Sub(signer.NotBefore) >= oidcActiveKeyMaxAge
 	s.mu.Unlock()
 	if !due {
 		return signer
@@ -362,9 +367,13 @@ func (s *Server) ensureOIDCSigner(ctx context.Context, now time.Time) *oidcSigne
 	if fencer := s.clusterKeyRotationFencer(); fencer != nil {
 		fctx, cancel := context.WithTimeout(ctx, clusterKeyRotationFenceTimeout)
 		err := fencer.WithClusterKeyRotationFence(fctx, clusterKindOIDC, func() error {
+			// Refresh INSIDE the fence — the winner may have published while
+			// this replica waited — but OUTSIDE s.mu: the re-read is key-store
+			// I/O like any other. The re-check then runs under the short lock
+			// against whatever the refresh published.
+			s.refreshOIDCRing(fctx)
 			s.mu.Lock()
 			defer s.mu.Unlock()
-			s.reloadOIDCRingLocked()
 			if s.oidc == nil || now.Sub(s.oidc.NotBefore) >= oidcActiveKeyMaxAge {
 				s.rotateOIDCKeyLocked(now)
 			}
@@ -376,7 +385,6 @@ func (s *Server) ensureOIDCSigner(ctx context.Context, now time.Time) *oidcSigne
 		}
 	} else {
 		s.mu.Lock()
-		s.reloadOIDCRingLocked()
 		if s.oidc == nil || now.Sub(s.oidc.NotBefore) >= oidcActiveKeyMaxAge {
 			s.rotateOIDCKeyLocked(now)
 		}
@@ -387,66 +395,133 @@ func (s *Server) ensureOIDCSigner(ctx context.Context, now time.Time) *oidcSigne
 	return s.oidc
 }
 
-// reloadOIDCRingLocked replaces the in-memory signer when the persisted
-// ring changed since it was loaded — another replica rotated it. The caller
-// must hold s.mu. File mode compares the ring file's mtime/size; cluster
-// mode compares the stored bytes' digest. A changed ring that fails to
-// parse keeps the current signer active (fail closed).
-func (s *Server) reloadOIDCRingLocked() {
-	if s.oidc == nil {
-		return
+// contextClusterKeyLookup is the optional context-aware form of
+// ClusterKeyLookup. The base interface carries no context; a store that can
+// honor the caller's request context (a JWKS request, or a rotation fence
+// deadline) should implement this and the refresh uses it directly, so an
+// abandoned request aborts the key-store read instead of waiting for the
+// store's own timeout. Stores without it are still called OUTSIDE s.mu and
+// give up at the caller's context (see lookupOIDCRingBytes).
+type contextClusterKeyLookup interface {
+	LookupContext(ctx context.Context, kind string) ([]byte, bool, error)
+}
+
+// lookupOIDCRingBytes loads the shared OIDC ring bytes without holding s.mu.
+// A context-aware store is called directly; otherwise the store's bounded,
+// context-less Lookup runs in its own goroutine and this call gives up when
+// the caller's context ends, returning ctx.Err(). Giving up is safe: the
+// caller keeps the signer it already published, and the abandoned lookup's
+// result only affects a future refresh.
+func (s *Server) lookupOIDCRingBytes(ctx context.Context, cluster ClusterKeyStore) ([]byte, bool, error) {
+	if cl, ok := cluster.(contextClusterKeyLookup); ok {
+		return cl.LookupContext(ctx, clusterKindOIDC)
 	}
-	if s.oidc.cluster != nil {
-		lookup, ok := s.oidc.cluster.(ClusterKeyLookup)
-		if !ok {
-			return
-		}
+	lookup, ok := cluster.(ClusterKeyLookup)
+	if !ok {
+		return nil, false, nil
+	}
+	type lookupResult struct {
+		b     []byte
+		found bool
+		err   error
+	}
+	done := make(chan lookupResult, 1)
+	go func() {
 		b, found, err := lookup.Lookup(clusterKindOIDC)
+		done <- lookupResult{b: b, found: found, err: err}
+	}()
+	select {
+	case r := <-done:
+		return r.b, r.found, r.err
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	}
+}
+
+// installReloadedSigner publishes a freshly parsed signer under a SHORT s.mu
+// critical section. observed is the signer the caller based its read on: if
+// the published pointer changed in the meantime (another refresh, or a
+// rotation that persisted a newer ring) the newer published signer wins and
+// the parsed one is dropped, so a stale read can never roll the cluster back
+// to an older ring.
+func (s *Server) installReloadedSigner(observed, loaded *oidcSigner) *oidcSigner {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.oidc != observed {
+		return s.oidc
+	}
+	s.oidc = loaded
+	return loaded
+}
+
+// refreshOIDCRing converges the in-memory signer with the persisted ring when
+// it changed since it was loaded — another replica rotated it. All key-store
+// I/O and parsing happen OUTSIDE s.mu; only the compare-and-swap takes the
+// lock briefly. File mode compares the ring file's mtime/size; cluster mode
+// compares the stored bytes' digest. A changed ring that fails to parse keeps
+// the current signer active (fail closed), and a context that ends during the
+// load returns the current signer unchanged.
+func (s *Server) refreshOIDCRing(ctx context.Context) *oidcSigner {
+	s.mu.Lock()
+	current := s.oidc
+	s.mu.Unlock()
+	if current == nil || (current.cluster == nil && current.ringPath == "") {
+		return current
+	}
+	if current.cluster != nil {
+		b, found, err := s.lookupOIDCRingBytes(ctx, current.cluster)
 		if err != nil {
-			s.logError("oidc: ring reload lookup failed", "error", err.Error())
-			return
+			if ctx.Err() == nil {
+				s.logError("oidc: ring reload lookup failed", "error", err.Error())
+			}
+			return s.currentOIDCSigner()
 		}
 		if !found {
-			return
+			return s.currentOIDCSigner()
 		}
 		sum := sha256.Sum256(b)
 		digest := hex.EncodeToString(sum[:])
-		if s.oidc.ringDigest == digest {
-			return
+		if digest == current.ringDigest {
+			return current
 		}
 		signer, err := oidcSignerFromRing(b)
 		if err != nil {
 			s.logError("oidc: ring reload parse failed", "error", err.Error())
-			return
+			return s.currentOIDCSigner()
 		}
-		signer.cluster = s.oidc.cluster
+		signer.cluster = current.cluster
 		signer.ringDigest = digest
-		s.oidc = signer
-		return
+		return s.installReloadedSigner(current, signer)
 	}
-	if s.oidc.ringPath == "" {
-		return
-	}
-	info, err := os.Stat(s.oidc.ringPath)
+	info, err := os.Stat(current.ringPath)
 	if err != nil {
-		return
+		return s.currentOIDCSigner()
 	}
-	if info.ModTime().Equal(s.oidc.ringMod) && info.Size() == s.oidc.ringSize {
-		return
+	if info.ModTime().Equal(current.ringMod) && info.Size() == current.ringSize {
+		return current
 	}
-	b, err := os.ReadFile(s.oidc.ringPath)
+	b, err := os.ReadFile(current.ringPath)
 	if err != nil {
-		return
+		return s.currentOIDCSigner()
 	}
 	signer, err := oidcSignerFromRing(b)
 	if err != nil {
 		s.logError("oidc: ring reload parse failed", "error", err.Error())
-		return
+		return s.currentOIDCSigner()
 	}
-	signer.ringPath = s.oidc.ringPath
+	signer.ringPath = current.ringPath
 	signer.ringMod = info.ModTime()
 	signer.ringSize = info.Size()
-	s.oidc = signer
+	return s.installReloadedSigner(current, signer)
+}
+
+// currentOIDCSigner reads the published signer under a short lock. Used when a
+// refresh could not load anything: the caller must serve what is published,
+// never the signer its (possibly stale) read was based on.
+func (s *Server) currentOIDCSigner() *oidcSigner {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.oidc
 }
 
 // oidcIssuer validates and returns the OIDC issuer identifier through the
@@ -487,14 +562,14 @@ func oidcJWK(kid string, pub ed25519.PublicKey) map[string]any {
 }
 
 func (s *Server) oidcJWKS(w http.ResponseWriter, r *http.Request) {
-	// Reload the shared ring BEFORE serving: a replica that has not issued a
+	// Refresh the shared ring BEFORE serving: a replica that has not issued a
 	// token since a peer rotated would otherwise keep publishing a JWKS
 	// without the peer's active key, and tokens signed under that key would
-	// fail verification at every consumer of this endpoint.
-	s.mu.Lock()
-	s.reloadOIDCRingLocked()
-	signer := s.oidc
-	s.mu.Unlock()
+	// fail verification at every consumer of this endpoint. The refresh does
+	// its key-store I/O outside s.mu (bounded by this request's context), so
+	// this public endpoint can never pin the control plane on a slow store:
+	// on a stall it serves the last published key set.
+	signer := s.refreshOIDCRing(r.Context())
 	if signer == nil {
 		http.Error(w, "OIDC unavailable", http.StatusServiceUnavailable)
 		return
@@ -544,11 +619,6 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 	}
 	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	now := time.Now().UTC()
-	signer := s.ensureOIDCSigner(r.Context(), now)
-	if signer == nil {
-		s.serverError(w, r, http.StatusServiceUnavailable, fmt.Errorf("OIDC signer unavailable"), "OIDC unavailable")
-		return
-	}
 	// DB mode: the store is the source of truth for the lease/audience
 	// checks; the in-memory maps are only the dev-mode mirror.
 	var j model.Job
@@ -605,6 +675,17 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(j.LeaseTokenHash) == 0 || subtle.ConstantTimeCompare(hashLeaseToken(s.leaseKey, token), j.LeaseTokenHash) != 1 {
 		http.Error(w, "invalid job token", http.StatusUnauthorized)
+		return
+	}
+	// AUTHENTICATION BEFORE SIGNER WORK. The endpoint is public at the auth
+	// layer (the lease token is the credential), so nothing above this point
+	// may touch the signing key or its shared key store: the signer is
+	// resolved — and a due rotation may do key-store I/O — only after the
+	// job, audience and lease checks have all passed. Unauthenticated traffic
+	// therefore performs zero key-store reads.
+	signer := s.ensureOIDCSigner(r.Context(), now)
+	if signer == nil {
+		s.serverError(w, r, http.StatusServiceUnavailable, fmt.Errorf("OIDC signer unavailable"), "OIDC unavailable")
 		return
 	}
 	// The subject and the repository_id claim use the canonical repository

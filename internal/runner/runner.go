@@ -84,6 +84,13 @@ var (
 	// workloads. A seam so the docker integration test can observe the
 	// post-run host-side state instead of racing the cleanup.
 	removeJobWorkspace = os.RemoveAll
+	// installWorkspaceDiskQuota installs the OS-level hard workspace bound
+	// (XFS project quota, capability-probed and fail-closed) that execute
+	// owns: it runs BEFORE the workspace is populated, so an untrusted
+	// repository cannot fill the runner's disk during checkout or
+	// dependency restore. A seam so tests can drive the quota lifecycle
+	// without a quota-capable host filesystem.
+	installWorkspaceDiskQuota = executor.WorkspaceDiskQuotaSetup
 	// executorOptionsSeam observes the executor options derived for a job
 	// immediately before it runs. It is a test seam: it lets tests assert
 	// the derived resource bounds (WorkspaceMaxBytes) without executing the
@@ -549,6 +556,41 @@ func workspaceMaxBytesForResources(res pipeline.Resources) int64 {
 	return int64(res.Disk)
 }
 
+// workspaceQuotaLimitForTask derives the hard workspace bound execute installs
+// BEFORE the workspace is populated, using the same shared precedence as the
+// executor: the authoritative persisted t.Job.DiskRequest, then the mandatory
+// untrusted default for jobs the runner does not trust, and zero (no hard
+// bound requested) for trusted jobs without a declaration. The unit is bytes;
+// no re-parsing happens.
+func workspaceQuotaLimitForTask(t server.Task) int64 {
+	return executor.WorkspaceBoundBytes(t.Job.DiskRequest, !t.Job.Trusted, executor.DefaultUntrustedWorkspaceMaxBytes)
+}
+
+// payloadRunsOnContainer reports whether the verified compiled payload's
+// effective job runs on the container backend. It lets execute apply the
+// fail-closed disk-quota gate BEFORE checkout for production (payload) tasks
+// without recompiling; a nil/undecodable payload returns false, and the
+// identical gate then runs in the container backend (defense in depth) after
+// checkout, exactly as before this lifecycle move.
+func payloadRunsOnContainer(p *model.CompiledJobPayload) bool {
+	if p == nil || p.EffectiveJob == nil {
+		return false
+	}
+	raw, err := json.Marshal(p.EffectiveJob)
+	if err != nil {
+		return false
+	}
+	var shape struct {
+		Job struct {
+			Runtime string `json:"runtime"`
+		} `json:"job"`
+	}
+	if err := json.Unmarshal(raw, &shape); err != nil {
+		return false
+	}
+	return shape.Job.Runtime == "container"
+}
+
 func (r *Runner) execute(parent context.Context, t server.Task) {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
@@ -561,7 +603,44 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		r.complete(parent, t, model.StatusFailure, err, nil)
 		return
 	}
-	defer func() { _ = removeJobWorkspace(tmp) }()
+	untrusted := !t.Job.Trusted
+	requireDiskQuota := untrusted && !executor.AllowUnquotaedUntrustedDisk()
+	// The workspace quota lifecycle is OWNED by execute, not by the backend:
+	// the hard bound is installed on the empty workspace directory BEFORE
+	// checkout (and before dependency restore), so an untrusted repository
+	// can no longer fill the host disk during clone. The bound comes from the
+	// authoritative persisted t.Job.DiskRequest, or the mandatory untrusted
+	// default when the job declares none. Teardown runs on EVERY return path
+	// (defer), removes the quota before the workspace itself, and is
+	// idempotent.
+	quotaLimit := workspaceQuotaLimitForTask(t)
+	var workspaceQuota *executor.DiskQuotaStatus
+	var quotaCleanup func() error
+	if quotaLimit > 0 {
+		status, cleanup := installWorkspaceDiskQuota(tmp, quotaLimit)
+		workspaceQuota = &status
+		quotaCleanup = cleanup
+	}
+	defer func() {
+		if quotaCleanup != nil {
+			if qerr := quotaCleanup(); qerr != nil {
+				fmt.Fprintf(os.Stderr, "kiwi runner %s: remove workspace quota for %s: %v\n", r.ID, t.Job.ID, qerr)
+			}
+			quotaCleanup = nil
+		}
+		if rerr := removeJobWorkspace(tmp); rerr != nil {
+			fmt.Fprintf(os.Stderr, "kiwi runner %s: remove job workspace %s: %v\n", r.ID, tmp, rerr)
+		}
+	}()
+	// An untrusted job that demands a hard bound must not even check out
+	// when no hard bound could be established: the checkout itself is the
+	// window the quota protects. The runtime is taken from the verified
+	// compiled payload (production tasks always carry it); legacy
+	// payload-less tasks defer the identical gate to the container backend.
+	if requireDiskQuota && workspaceQuota != nil && !workspaceQuota.Hard && payloadRunsOnContainer(t.Job.CompiledJobPayload) {
+		r.complete(parent, t, model.StatusFailure, executor.UntrustedDiskQuotaGateError(workspaceQuota.Detail), nil)
+		return
+	}
 	checkoutStart := time.Now()
 	if err = r.checkoutTask(ctx, t.Job, tmp); err != nil {
 		r.complete(parent, t, statusForErr(ctx, err), err, nil)
@@ -685,6 +764,13 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		}()
 	}
 	sink := newJournaledAsyncLogSink(consoleSink, r.logBatchPost(t, masker), journal)
+	// The workspace quota outcome is reported on the job's own log: a job
+	// that runs without a hard bound (trusted without a declaration, or the
+	// documented operator escape hatch) should say so, and a blocked hard
+	// bound must never hide behind the step-boundary measurement.
+	if workspaceQuota != nil {
+		sink.WriteLine(cj.ID, "workspace", "disk quota: "+workspaceQuota.Detail)
+	}
 	// Distributed runs resolve secrets exclusively through the control
 	// plane's lease-bound delivery endpoint. Host env/Keychain providers
 	// are local-CLI-only (app.RunLocal keeps that chain); the runner never
@@ -718,23 +804,30 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// The declared resources.disk is the job's workspace bound: it feeds the
 	// executor's pre-execution free-space check and the container backend's
 	// step-boundary workspace check, and it is what the snapshot capture
-	// derives its local archive cap from (see uploadJobSnapshot). Untrusted
-	// jobs without a declaration get the mandatory executor default budget
-	// instead of zero, so an undeclared disk can never mean "unbounded" for a
-	// job the runner does not trust. Trusted jobs without a declaration keep
-	// the documented zero (unbounded) behavior.
-	untrusted := !t.Job.Trusted
-	workspaceMaxBytes := workspaceMaxBytesForResources(cj.Job.Resources)
-	if workspaceMaxBytes == 0 && untrusted {
-		workspaceMaxBytes = executor.DefaultUntrustedWorkspaceMaxBytes
+	// derives its local archive cap from (see uploadJobSnapshot). The
+	// authoritative source is the persisted t.Job.DiskRequest (what the
+	// scheduler reserved); the compiled job's declaration is the fallback
+	// for legacy control planes that did not persist resource requests.
+	// Untrusted jobs without a declaration get the mandatory executor default
+	// budget instead of zero, so an undeclared disk can never mean
+	// "unbounded" for a job the runner does not trust. Trusted jobs without a
+	// declaration keep the documented zero (unbounded) behavior.
+	declaredDisk := workspaceMaxBytesForResources(cj.Job.Resources)
+	if t.Job.DiskRequest > 0 {
+		declaredDisk = t.Job.DiskRequest
 	}
+	workspaceMaxBytes := executor.WorkspaceBoundBytes(declaredDisk, untrusted, executor.DefaultUntrustedWorkspaceMaxBytes)
 	opts.WorkspaceMaxBytes = workspaceMaxBytes
 	opts.Untrusted = untrusted
 	// Production untrusted policy: the step-boundary resources.disk check is
 	// not a security boundary, so an untrusted job whose workspace cannot get
 	// a hard OS-level bound (project quota) fails closed. The escape hatch is
 	// the documented operator switch for trusted-only/self-hosted runners.
-	opts.RequireUntrustedDiskQuota = untrusted && !executor.AllowUnquotaedUntrustedDisk()
+	// The bound itself was already installed (or its absence recorded) above,
+	// before checkout: the container backend consumes the outcome as defense
+	// in depth and never re-probes when execute reported one.
+	opts.RequireUntrustedDiskQuota = requireDiskQuota
+	opts.WorkspaceQuota = workspaceQuota
 	// Step durations come from the executor's wall-clock step measurements
 	// (StepReporter), never from sink-derived log timing.
 	applyStepReporter(&opts, r.Metrics)

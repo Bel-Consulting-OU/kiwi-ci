@@ -313,11 +313,16 @@ func validateProductionConfig(cfg productionConfig) error {
 // runner-auth contract: at least one actual per-runner mechanism must exist —
 // enforced runner mTLS, per-runner bearer credentials supplied through
 // --runner-tokens-file (provisioned into runner_bearer_tokens next), or rows
-// already provisioned in runner_bearer_tokens. The shared runner token is
-// dev/bootstrap compatibility only: production accepts it at neither this
-// check nor the request path (Server() clears Server.RunnerToken once this
-// function passes), so a production server holding only --runner-token
-// refuses to start.
+// already provisioned in runner_bearer_tokens. mtlsEnforced must be the
+// ACTUAL initialized server state (a loaded runner CA with client
+// certificates required), never the presence of flags: the runner PKI is
+// initialized before this check, so a shared CA, an explicit CA installed
+// into the cluster key store, and an auto-enrolled CA all count exactly when
+// they really enforce mTLS. The shared runner token is dev/bootstrap
+// compatibility only: production accepts it at neither this check nor the
+// request path (Server() clears Server.RunnerToken once this function
+// passes), so a production server holding only --runner-token refuses to
+// start.
 func validateProductionRunnerCredentials(ctx context.Context, db storage.Store, mtlsEnforced bool, fileTokens map[string]string) error {
 	if mtlsEnforced || len(fileTokens) > 0 {
 		return nil
@@ -497,6 +502,11 @@ func Server(ctx context.Context, args []string) error {
 	}
 	var srv *server.Server
 	var clusterStore *server.FSClusterKeyStore
+	// db is the durable SQL store in DB mode. It is declared here because the
+	// production runner-auth decision runs AFTER the runner PKI is
+	// initialized and still needs the store to probe provisioned
+	// per-runner bearer credentials.
+	var db storage.Store
 	if *clusterKeyDir != "" {
 		if *dataDir == "" {
 			return fmt.Errorf("--cluster-key-dir requires --data-dir (the persistent state root)")
@@ -512,7 +522,8 @@ func Server(ctx context.Context, args []string) error {
 		if cfg.Database.MaxConnections > 0 {
 			pgOpts = append(pgOpts, storage.WithMaxConnections(cfg.Database.MaxConnections))
 		}
-		db, derr := storage.NewPostgresOpt(ctx, databaseURLV, pgOpts...)
+		var derr error
+		db, derr = storage.NewPostgresOpt(ctx, databaseURLV, pgOpts...)
 		if derr != nil {
 			return derr
 		}
@@ -561,26 +572,6 @@ func Server(ctx context.Context, args []string) error {
 		if err := srv.SwitchToDB(db); err != nil {
 			return err
 		}
-		// A production DB control plane without a shared cluster key store
-		// would mint per-replica signing material: replicas could not verify
-		// each other's tokens. Surface that at startup. Runner credentials
-		// are then validated post-DB (per-runner tokens may already be
-		// provisioned in runner_bearer_tokens).
-		if modeV == "production" {
-			if err := srv.ValidateHAReady(); err != nil {
-				return err
-			}
-			if err := validateProductionRunnerCredentials(ctx, db,
-				runnerCACertV != "" && runnerCAKeyV != "" && *runnerRequireClientCerts, runnerTokens); err != nil {
-				return err
-			}
-			// The shared runner token is dev/bootstrap compatibility only.
-			// The production per-runner contract above now holds, so disable
-			// the shared credential PERMANENTLY (static startup decision, not
-			// per-request DB contents): production runner traffic is
-			// authenticated only by per-runner bearer tokens or mTLS.
-			srv.RunnerToken = ""
-		}
 		if len(runnerTokens) > 0 {
 			if err := srv.ProvisionRunnerTokensDB(ctx, runnerTokens); err != nil {
 				return err
@@ -602,12 +593,73 @@ func Server(ctx context.Context, args []string) error {
 			srv.AdminToken = adminTokenV
 		}
 	}
-	// Profile enforcement is a production hardening: runner-supplied
-	// scheduling attributes are ignored and only a certificate-bound
-	// runner profile supplies them (a profile-less runner registers with
-	// capacity 0). Dev mode keeps the legacy self-reported registration.
+	// Runner PKI is initialized BEFORE HA and production credential
+	// validation: those checks must judge the ACTUAL initialized server
+	// state (a shared cluster CA the DB store already holds, an explicit CA
+	// installed into that store, or an auto-generated shared CA), not the
+	// presence of flags. An explicit CA is installed-or-compared against the
+	// shared cluster key store: bytes that disagree with the store's runner
+	// CA fail startup (a replica must never trust a node-local CA its peers
+	// reject). runner_pki.enabled is authoritative: when enabled, the CA
+	// pair is mandatory at startup (config.Validate already enforces it; this
+	// is the belt-and-braces check for direct flag use). An enroll token
+	// without an explicit pair makes the server persist a generated CA in
+	// the shared cluster key store.
+	if cfg.RunnerPKI.Enabled || runnerCACertV != "" || runnerCAKeyV != "" {
+		if runnerCACertV == "" || runnerCAKeyV == "" {
+			return fmt.Errorf("runner_pki enabled requires --runner-ca-cert and --runner-ca-key")
+		}
+		if err := srv.SetRunnerCA(runnerCACertV, runnerCAKeyV); err != nil {
+			return err
+		}
+	} else if runnerEnrollTokenV != "" {
+		// Enrollment needs a durable SHARED CA. In DB mode PostgreSQL is the
+		// durable shared key store, so a node-local --data-dir is NOT
+		// required; in file/dev mode the FS cluster key store under
+		// --data-dir (or an explicit pair above) is still required.
+		if databaseURLV == "" && *dataDir == "" {
+			return fmt.Errorf("runner enrollment requires --data-dir (to persist the shared runner CA through the cluster key store) or explicit --runner-ca-cert/--runner-ca-key")
+		}
+		if err := srv.EnsureRunnerCA(); err != nil {
+			return err
+		}
+	}
+	// With a runner CA present (configured, shared or enrolled), the TLS
+	// listener verifies runner client certificates against it and runner-tier
+	// routes require the certificate when --runner-require-client-certs
+	// (default) is set. The shared listener itself stays
+	// VerifyClientCertIfGiven so non-runner traffic keeps working. This runs
+	// before validation so the production decision uses the actual state.
+	applyRunnerTLSConfig(srv, *runnerRequireClientCerts)
 	if modeV == "production" {
+		// Profile enforcement is a production hardening: runner-supplied
+		// scheduling attributes are ignored and only a certificate-bound
+		// runner profile supplies them (a profile-less runner registers with
+		// capacity 0). Dev mode keeps the legacy self-reported registration.
 		srv.RequireProfiles = true
+		// A production DB control plane without a shared cluster key store
+		// would mint per-replica signing material: replicas could not verify
+		// each other's tokens. Surface that at startup. Runner credentials
+		// are then validated post-DB (per-runner tokens may already be
+		// provisioned in runner_bearer_tokens).
+		if err := srv.ValidateHAReady(); err != nil {
+			return err
+		}
+		// The runner-auth half of the contract is decided on the ACTUAL
+		// initialized state: enforced mTLS (a runner CA with client certs
+		// required) or provisioned per-runner bearer credentials. The shared
+		// runner token is dev/bootstrap compatibility only, and the
+		// production per-runner contract above now holds, so disable it
+		// PERMANENTLY (static startup decision, not per-request DB
+		// contents): production runner traffic is authenticated only by
+		// per-runner bearer tokens or mTLS.
+		mtlsReady := srv.RunnerCA != nil && srv.RequireRunnerClientCerts
+		if db != nil {
+			if err := validateProductionRunnerCredentials(ctx, db, mtlsReady, runnerTokens); err != nil {
+				return err
+			}
+		}
+		srv.RunnerToken = ""
 	}
 	// Per-runner bearer credentials in memory/fs mode (DB mode provisioned
 	// them through ProvisionRunnerTokensDB above).
@@ -675,32 +727,6 @@ func Server(ctx context.Context, args []string) error {
 	if m := cfg.RateLimitMiddleware(); m != nil {
 		srv.RateLimiter = m
 	}
-	// runner_pki.enabled is authoritative: when enabled, the CA pair is
-	// mandatory at startup (config.Validate already enforces it; this is
-	// the belt-and-braces check for direct flag use). An enroll token
-	// without an explicit pair lets the server persist a generated CA in
-	// the data dir.
-	if cfg.RunnerPKI.Enabled || runnerCACertV != "" || runnerCAKeyV != "" {
-		if runnerCACertV == "" || runnerCAKeyV == "" {
-			return fmt.Errorf("runner_pki enabled requires --runner-ca-cert and --runner-ca-key")
-		}
-		if err := srv.SetRunnerCA(runnerCACertV, runnerCAKeyV); err != nil {
-			return err
-		}
-	} else if runnerEnrollTokenV != "" {
-		if *dataDir == "" {
-			return fmt.Errorf("runner enrollment requires --data-dir (to persist the shared runner CA through the cluster key store) or explicit --runner-ca-cert/--runner-ca-key")
-		}
-		if err := srv.EnsureRunnerCA(); err != nil {
-			return err
-		}
-	}
-	// With a runner CA present (configured or enrolled), the TLS listener
-	// verifies runner client certificates against it and runner-tier
-	// routes require the certificate when --runner-require-client-certs
-	// (default) is set. The shared listener itself stays
-	// VerifyClientCertIfGiven so non-runner traffic keeps working.
-	applyRunnerTLSConfig(srv, *runnerRequireClientCerts)
 	// Blob backend wiring: an s3 backend or an explicit data-dir feeds the
 	// server's blob store when the server build provides SetBlobStore.
 	if cfg.Blob.Backend == "s3" || *dataDir != "" {

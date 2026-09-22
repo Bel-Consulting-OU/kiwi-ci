@@ -107,7 +107,7 @@ func TestFinalServicesHealthcheckCancelled(t *testing.T) {
 	// The emit callback fires after the container started and before the
 	// healthcheck loop runs: cancelling there deterministically lands the
 	// retry select on the ctx.Done branch.
-	_, _, err := startContainerServices(ctx, "r", "j", services, pipeline.Resources{}, false, false, func(line string) {
+	_, _, err := startContainerServices(ctx, "r", "j", services, pipeline.Resources{}, false, false, "", func(line string) {
 		if strings.Contains(line, "started") {
 			cancel()
 		}

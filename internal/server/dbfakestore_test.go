@@ -74,11 +74,12 @@ type dbFakeStore struct {
 	// (fail-closed attachment tests).
 	sidecarAttachErr error
 
-	profiles     map[string]model.RunnerProfile
-	certProfiles map[string]string
-	runnerTokens map[string]string
-	revocations  map[string]string
-	grants       map[string]storage.EnrollGrantRecord
+	profiles       map[string]model.RunnerProfile
+	certProfiles   map[string]string
+	runnerProfiles map[string]string
+	runnerTokens   map[string]string
+	revocations    map[string]string
+	grants         map[string]storage.EnrollGrantRecord
 
 	// claimErr, when non-nil, makes ClaimSecretDelivery fail (fail-closed
 	// secret delivery tests).
@@ -331,6 +332,7 @@ func newDBFakeStore() *dbFakeStore {
 		fragments:         map[string]storage.GeneratedFragmentReceipt{},
 		profiles:          map[string]model.RunnerProfile{},
 		certProfiles:      map[string]string{},
+		runnerProfiles:    map[string]string{},
 		runnerTokens:      map[string]string{},
 		revocations:       map[string]string{},
 		grants:            map[string]storage.EnrollGrantRecord{},
@@ -2028,6 +2030,11 @@ func (f *dbFakeStore) InsertTestReportWithHistoryDelivery(ctx context.Context, r
 		f.historyAggregates[repoID] = rows
 	}
 	for _, c := range rep.Cases {
+		// Skip policy: skipped cases are not folded as pass/fail observations
+		// (mirrors PostgresStore/memStore).
+		if c.Skipped {
+			continue
+		}
 		key := fakeHistoryKey(rep.JobKey, c.Class, c.Name)
 		row := rows[key]
 		row.RepoID, row.Suite, row.Class, row.Name = repoID, rep.JobKey, c.Class, c.Name
@@ -2186,6 +2193,11 @@ func (f *dbFakeStore) RebuildRepoTestHistory(ctx context.Context, repoID string)
 	rows := map[string]storage.TestHistoryAggregate{}
 	for _, rep := range reports {
 		for _, c := range rep.Cases {
+			// Skip policy: the rebuilt aggregates exclude skipped cases, so
+			// the fake's rebuild agrees with its incremental fold.
+			if c.Skipped {
+				continue
+			}
 			key := fakeHistoryKey(rep.JobKey, c.Class, c.Name)
 			row := rows[key]
 			row.RepoID, row.Suite, row.Class, row.Name = repoID, rep.JobKey, c.Class, c.Name
@@ -3263,6 +3275,51 @@ func (f *dbFakeStore) ProfileForSerial(ctx context.Context, serial string) (mode
 	}
 	p, ok := f.profiles[id]
 	return p, ok, nil
+}
+
+// LinkRunnerProfile/ProfileForRunnerID/UnlinkRunnerProfile/
+// RunnerIDsForProfile mirror migration 0031's runner_profile_links rows (the
+// PRIMARY KEY semantics included) so DB-mode server tests exercise the same
+// runner-ID binding contract the PostgresStore implements.
+func (f *dbFakeStore) LinkRunnerProfile(ctx context.Context, runnerID, profileID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.runnerProfiles[runnerID] = profileID
+	return nil
+}
+
+func (f *dbFakeStore) ProfileForRunnerID(ctx context.Context, runnerID string) (model.RunnerProfile, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	id, ok := f.runnerProfiles[runnerID]
+	if !ok {
+		return model.RunnerProfile{}, false, nil
+	}
+	p, ok := f.profiles[id]
+	if !ok {
+		return model.RunnerProfile{}, false, nil
+	}
+	return p, true, nil
+}
+
+func (f *dbFakeStore) UnlinkRunnerProfile(ctx context.Context, runnerID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.runnerProfiles, runnerID)
+	return nil
+}
+
+func (f *dbFakeStore) RunnerIDsForProfile(ctx context.Context, profileID string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []string{}
+	for id, pid := range f.runnerProfiles {
+		if pid == profileID {
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 func (f *dbFakeStore) UpsertRunnerToken(ctx context.Context, runnerID, tokenDigest string) error {

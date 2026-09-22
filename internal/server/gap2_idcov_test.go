@@ -272,6 +272,7 @@ func TestIDCovReloadOIDCRingFileModeSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	firstKID := s.oidc.KID
+	s.mu.Unlock()
 	// An external writer installs a different ring (different size/mtime).
 	other := newOIDCSigner()
 	other.ringPath = path
@@ -286,7 +287,9 @@ func TestIDCovReloadOIDCRingFileModeSuccess(t *testing.T) {
 	if err := os.Chtimes(path, later, later); err != nil {
 		t.Fatal(err)
 	}
-	s.reloadOIDCRingLocked()
+	// The refresh takes s.mu internally: call it without holding the lock.
+	s.refreshOIDCRing(context.Background())
+	s.mu.Lock()
 	gotKID := s.oidc.KID
 	gotPath := s.oidc.ringPath
 	s.mu.Unlock()

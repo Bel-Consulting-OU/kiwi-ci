@@ -1324,6 +1324,48 @@ func (f *FaultyStore) ProfileForSerial(ctx context.Context, serial string) (mode
 	return inner.ProfileForSerial(ctx, serial)
 }
 
+func (f *FaultyStore) LinkRunnerProfile(ctx context.Context, runnerID, profileID string) error {
+	inner, ok := f.Inner.(RunnerProfileLinkStore)
+	if !ok {
+		return errMissingInnerInterface("RunnerProfileLinkStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return inner.LinkRunnerProfile(ctx, runnerID, profileID)
+}
+
+func (f *FaultyStore) ProfileForRunnerID(ctx context.Context, runnerID string) (model.RunnerProfile, bool, error) {
+	inner, ok := f.Inner.(RunnerProfileLinkStore)
+	if !ok {
+		return model.RunnerProfile{}, false, errMissingInnerInterface("RunnerProfileLinkStore")
+	}
+	return inner.ProfileForRunnerID(ctx, runnerID)
+}
+
+func (f *FaultyStore) UnlinkRunnerProfile(ctx context.Context, runnerID string) error {
+	inner, ok := f.Inner.(RunnerProfileLinkStore)
+	if !ok {
+		return errMissingInnerInterface("RunnerProfileLinkStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return inner.UnlinkRunnerProfile(ctx, runnerID)
+}
+
+func (f *FaultyStore) RunnerIDsForProfile(ctx context.Context, profileID string) ([]string, error) {
+	inner, ok := f.Inner.(RunnerProfileLinkStore)
+	if !ok {
+		return nil, errMissingInnerInterface("RunnerProfileLinkStore")
+	}
+	return inner.RunnerIDsForProfile(ctx, profileID)
+}
+
 // RunnerReservedResources / ListResourceReservations delegate the
 // reservation-ledger reads to the wrapped store (the lease claim itself is
 // delegated through AcquireLeaseAtomic, fault-injectable like every other
@@ -1342,6 +1384,27 @@ func (f *FaultyStore) ListResourceReservations(ctx context.Context, runnerID str
 		return nil, errMissingInnerInterface("ResourceReservationStore")
 	}
 	return inner.ListResourceReservations(ctx, runnerID)
+}
+
+// ReconcileResourceReservations delegates the leader-fenced promotion/repair
+// reconciliation to the wrapped store. The capability check runs first (a
+// missing contract is a wiring error, not a simulated failure), then the
+// injected stale-leader error, then the write-fault counter — the same order
+// every other fenced mutation uses.
+func (f *FaultyStore) ReconcileResourceReservations(ctx context.Context) (ResourceReconcileResult, error) {
+	inner, ok := f.Inner.(ResourceReconcileStore)
+	if !ok {
+		return ResourceReconcileResult{}, errMissingInnerInterface("ResourceReconcileStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fencedFail(); err != nil {
+		return ResourceReconcileResult{}, err
+	}
+	if err := f.fail(); err != nil {
+		return ResourceReconcileResult{}, err
+	}
+	return inner.ReconcileResourceReservations(ctx)
 }
 
 func (f *FaultyStore) UpsertRunnerToken(ctx context.Context, runnerID, tokenDigest string) error {
@@ -1581,9 +1644,14 @@ type memStore struct {
 
 	profiles     map[string]model.RunnerProfile
 	certProfiles map[string]string
-	runnerTokens map[string]string
-	revocations  map[string]string
-	grants       map[string]EnrollGrantRecord
+	// runnerProfiles mirrors migration 0031's runner_profile_links rows: the
+	// durable runner-ID -> profile bindings that per-runner bearer
+	// identities resolve their profile through (never the client-asserted
+	// certificate serial).
+	runnerProfiles map[string]string
+	runnerTokens   map[string]string
+	revocations    map[string]string
+	grants         map[string]EnrollGrantRecord
 
 	// reservations mirrors migration 0030's job_resource_reservations rows:
 	// the per-lease resource reservations of RUNNING jobs, keyed by job ID.
@@ -1692,6 +1760,7 @@ func newMemStore() *memStore {
 		pendingSidecars:   map[string]pendingSidecar{},
 		profiles:          map[string]model.RunnerProfile{},
 		certProfiles:      map[string]string{},
+		runnerProfiles:    map[string]string{},
 		runnerTokens:      map[string]string{},
 		revocations:       map[string]string{},
 		reservations:      map[string]ResourceReservation{},
@@ -1736,6 +1805,7 @@ var (
 	_ SecretClaimStore          = (*memStore)(nil)
 	_ SecretClaimReleaser       = (*memStore)(nil)
 	_ ProfileStore              = (*memStore)(nil)
+	_ RunnerProfileLinkStore    = (*memStore)(nil)
 	_ ArtifactIdempotentStore   = (*memStore)(nil)
 	_ GeneratedFragmentStore    = (*memStore)(nil)
 	_ RunnerTokenStore          = (*memStore)(nil)
@@ -4278,17 +4348,21 @@ func (m *memStore) reservedResourcesLocked(runnerID string) model.ResourceCapaci
 
 // reserveResourcesLocked is the in-memory mirror of reserveResourcesTx: the
 // shared ResourceAdmission predicate over the runner's remaining capacity,
-// then the ledger row. It reports ErrResourceCapacity (wrapped with the
-// requested/reserved/capacity values) when the request does not fit. The
-// caller holds m.mu and has already passed every other claim predicate, so a
-// rejection leaves the job queued and the runner untouched.
+// then the ledger row. The reserved quantities are the claim's TOTAL request
+// (job request + aggregate service envelope, LeaseClaim.RequestedResources),
+// so the one row per job covers the main container and every declared
+// service and the release paths stay unchanged. It reports ErrResourceCapacity
+// (wrapped with the requested/reserved/capacity values) when the request does
+// not fit. The caller holds m.mu and has already passed every other claim
+// predicate, so a rejection leaves the job queued and the runner untouched.
 func (m *memStore) reserveResourcesLocked(claim LeaseClaim, capacity model.ResourceCapacity) error {
 	reserved := m.reservedResourcesLocked(claim.RunnerID)
-	admission := ResourceAdmission{Capacity: capacity, Reserved: reserved, Requested: claim.RequestedResources()}
+	requested := claim.RequestedResources()
+	admission := ResourceAdmission{Capacity: capacity, Reserved: reserved, Requested: requested}
 	if !admission.Allows() {
 		return fmt.Errorf("%w: runner %s requested cpu=%v memory=%d disk=%d pids=%d, reserved cpu=%v memory=%d disk=%d pids=%d, capacity cpu=%v memory=%d disk=%d pids=%d",
 			ErrResourceCapacity, claim.RunnerID,
-			claim.CPURequest, claim.MemoryRequest, claim.DiskRequest, claim.PIDsRequest,
+			requested.CPU, requested.Memory, requested.Disk, requested.PIDs,
 			reserved.CPU, reserved.Memory, reserved.Disk, reserved.PIDs,
 			capacity.CPU, capacity.Memory, capacity.Disk, capacity.PIDs)
 	}
@@ -4296,7 +4370,7 @@ func (m *memStore) reserveResourcesLocked(claim LeaseClaim, capacity model.Resou
 	// live reservation per job exactly like the SQL DELETE + INSERT.
 	m.reservations[claim.JobID] = ResourceReservation{
 		JobID: claim.JobID, RunnerID: claim.RunnerID, Generation: claim.Generation,
-		CPU: claim.CPURequest, Memory: claim.MemoryRequest, Disk: claim.DiskRequest, PIDs: claim.PIDsRequest,
+		CPU: requested.CPU, Memory: requested.Memory, Disk: requested.Disk, PIDs: requested.PIDs,
 		CreatedAt: time.Now().UTC(),
 	}
 	return nil
@@ -4351,6 +4425,52 @@ func (m *memStore) ListResourceReservations(ctx context.Context, runnerID string
 }
 
 var _ ResourceReservationStore = (*memStore)(nil)
+
+// ReconcileResourceReservations implements ResourceReconcileStore for the
+// in-memory ledger (mem parity with the SQL promotion reconciliation): rows
+// without a matching live lease are dropped, and every running leased job's
+// row is rewritten from the authoritative job state (runner, generation, the
+// job's TOTAL request — its own request plus the aggregate service envelope,
+// Job.ReservedResources) under m.mu, so no claim can interleave. CreatedAt of
+// a surviving row is preserved. Idempotent: a second pass on unchanged data
+// deletes nothing and rewrites the same rows.
+func (m *memStore) ReconcileResourceReservations(ctx context.Context) (ResourceReconcileResult, error) {
+	if err := ctx.Err(); err != nil {
+		return ResourceReconcileResult{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	res := ResourceReconcileResult{}
+	// Phase 1: drop rows that do not describe a live running lease.
+	for jobID, r := range m.reservations {
+		j, ok := m.jobs[jobID]
+		if !ok || j.Status != model.StatusRunning || j.LeaseRunnerID == "" || j.LeaseGeneration != r.Generation {
+			delete(m.reservations, jobID)
+			res.Deleted++
+		}
+	}
+	// Phase 2: rewrite one reservation per running leased job.
+	for jobID, j := range m.jobs {
+		if j.Status != model.StatusRunning || j.LeaseRunnerID == "" {
+			continue
+		}
+		res.Running++
+		req := j.ReservedResources()
+		want := ResourceReservation{
+			JobID: jobID, RunnerID: j.LeaseRunnerID, Generation: j.LeaseGeneration,
+			CPU: req.CPU, Memory: req.Memory, Disk: req.Disk, PIDs: req.PIDs,
+			CreatedAt: time.Now().UTC(),
+		}
+		if cur, ok := m.reservations[jobID]; ok {
+			want.CreatedAt = cur.CreatedAt
+		}
+		m.reservations[jobID] = want
+		res.Upserted++
+	}
+	return res, nil
+}
+
+var _ ResourceReconcileStore = (*memStore)(nil)
 
 // releaseRunnerSlotLocked splices one job ID out of a runner's active set
 // and recomputes busy/current_job (caller holds m.mu). Capacity 0 survives:
@@ -4792,6 +4912,66 @@ func (m *memStore) ProfileForSerial(ctx context.Context, serial string) (model.R
 	return p, true, nil
 }
 
+// LinkRunnerProfile mirrors the SQL PRIMARY KEY upsert: one binding per
+// runner ID, replaced in place. Empty IDs are rejected exactly like the SQL
+// store so the mem and PostgreSQL contracts agree.
+func (m *memStore) LinkRunnerProfile(ctx context.Context, runnerID, profileID string) error {
+	if runnerID == "" {
+		return fmt.Errorf("storage: runner id is required")
+	}
+	if profileID == "" {
+		return fmt.Errorf("storage: profile id is required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.runnerProfiles[runnerID] = profileID
+	return nil
+}
+
+// ProfileForRunnerID resolves the LIVE profile for a runner-ID binding; a
+// dangling link reports found=false, matching the SQL join.
+func (m *memStore) ProfileForRunnerID(ctx context.Context, runnerID string) (model.RunnerProfile, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	id, ok := m.runnerProfiles[runnerID]
+	if !ok {
+		return model.RunnerProfile{}, false, nil
+	}
+	p, ok := m.profiles[id]
+	if !ok {
+		return model.RunnerProfile{}, false, nil
+	}
+	return p, true, nil
+}
+
+// UnlinkRunnerProfile drops one runner's binding; a missing binding is a
+// successful no-op like the SQL DELETE. An empty runner ID is rejected
+// exactly like the SQL store so the mem and PostgreSQL contracts agree.
+func (m *memStore) UnlinkRunnerProfile(ctx context.Context, runnerID string) error {
+	if runnerID == "" {
+		return fmt.Errorf("storage: runner id is required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.runnerProfiles, runnerID)
+	return nil
+}
+
+// RunnerIDsForProfile lists the runner IDs bound to one profile, ordered by
+// runner ID to match the SQL ORDER BY.
+func (m *memStore) RunnerIDsForProfile(ctx context.Context, profileID string) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []string{}
+	for id, pid := range m.runnerProfiles {
+		if pid == profileID {
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 func (m *memStore) UpsertRunnerToken(ctx context.Context, runnerID, tokenDigest string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -4939,6 +5119,11 @@ func (m *memStore) InsertTestReportWithHistoryDelivery(ctx context.Context, rep 
 		m.historyAggregates[repoID] = rows
 	}
 	for _, c := range rep.Cases {
+		// Skip policy: skipped cases are never folded as pass/fail
+		// observations (see the PostgresStore delivery path).
+		if c.Skipped {
+			continue
+		}
 		key := memHistoryKey(rep.JobKey, c.Class, c.Name)
 		row := rows[key]
 		row.RepoID, row.Suite, row.Class, row.Name = repoID, rep.JobKey, c.Class, c.Name
@@ -5129,6 +5314,11 @@ func (m *memStore) RebuildRepoTestHistory(ctx context.Context, repoID string) (i
 	rows := map[string]TestHistoryAggregate{}
 	for _, rep := range reports {
 		for _, c := range rep.Cases {
+			// Skip policy: excluded from the rebuilt aggregates exactly as
+			// on the incremental path, so both agree.
+			if c.Skipped {
+				continue
+			}
 			key := memHistoryKey(rep.JobKey, c.Class, c.Name)
 			row := rows[key]
 			row.RepoID, row.Suite, row.Class, row.Name = repoID, rep.JobKey, c.Class, c.Name

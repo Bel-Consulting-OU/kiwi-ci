@@ -190,6 +190,20 @@ type Server struct {
 	LeaderKey string
 	leader    bool
 
+	// resourceReconcileMu serializes the resource-ledger reconciliation so a
+	// promotion and concurrent first polls run it once (the store operation
+	// is itself idempotent and cross-replica serialized; this only avoids
+	// duplicate work in one process).
+	resourceReconcileMu sync.Mutex
+	// resourceReconciled is armed once the durable resource reservation
+	// ledger has been rebuilt from the live leases (leader promotion or the
+	// ReconcileResourceReservations repair path). nextDB refuses to issue a
+	// lease while it is unarmed: a database that predates migration 0030, or
+	// one an OLD-version leader kept claiming jobs on, must never be
+	// scheduled against an empty ledger (rolling-upgrade over-admission).
+	// Cleared on demotion, so the next promotion reconciles again.
+	resourceReconciled atomic.Bool
+
 	// Forge API base overrides, used by tests to point adapters at local
 	// HTTP servers; empty means the public API endpoints.
 	gitHubAPIBase  string
@@ -367,12 +381,14 @@ type Server struct {
 	// this; dev mode keeps the legacy self-reported registration.
 	RequireProfiles bool
 
-	// profiles and certProfiles are the memory-mode mirror of the durable
-	// runner_profiles/cert_profile_links tables (profiles.go); DB mode
-	// reads and writes go through the ProfileStore. Guarded by s.mu and
-	// persisted in the fs snapshot.
-	profiles     map[string]model.RunnerProfile
-	certProfiles map[string]string
+	// profiles, certProfiles and runnerProfiles are the memory-mode mirror
+	// of the durable runner_profiles/cert_profile_links/runner_profile_links
+	// tables (profiles.go, runner_profile_bindings.go); DB mode reads and
+	// writes go through the ProfileStore/RunnerProfileLinkStore. Guarded by
+	// s.mu and persisted in the fs snapshot.
+	profiles       map[string]model.RunnerProfile
+	certProfiles   map[string]string
+	runnerProfiles map[string]string
 
 	// runnerTokens maps SHA-256 token digests to runner IDs for
 	// per-runner bearer credentials in memory/fs mode; DB mode consults
@@ -469,6 +485,7 @@ func New(token string) *Server {
 		downstreamLinks:   map[string]storage.DownstreamLink{},
 		profiles:          map[string]model.RunnerProfile{},
 		certProfiles:      map[string]string{},
+		runnerProfiles:    map[string]string{},
 		runnerTokens:      map[string]string{},
 		Logger:            logging.NewStructured(os.Stderr),
 		Metrics:           NewMetrics(),
@@ -636,6 +653,12 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 	s.certProfiles = snap.CertProfileLinks
 	if s.certProfiles == nil {
 		s.certProfiles = map[string]string{}
+	}
+	// Runner-ID profile bindings (migration 0031 mirror) ride the snapshot
+	// like the certificate bindings: older snapshots load as an empty map.
+	s.runnerProfiles = snap.RunnerProfileLinks
+	if s.runnerProfiles == nil {
+		s.runnerProfiles = map[string]string{}
 	}
 	// Deployment records ride the snapshot so an acknowledged environment
 	// lifecycle survives a restart (docs/environments.md:67). Older
@@ -859,6 +882,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/runner-profiles/{id}", s.getRunnerProfile)
 	mux.HandleFunc("PUT /api/v1/runner-profiles/{id}", s.updateRunnerProfile)
 	mux.HandleFunc("PUT /api/v1/runner-profiles/{id}/cert/{serial}", s.bindRunnerProfileCert)
+	// Runner-ID bindings are the profile source for per-runner bearer
+	// identities; both operations are admin tier (unmapped by
+	// auth.ActionFor, so classifyRoute sends them to tierAdmin).
+	mux.HandleFunc("PUT /api/v1/runner-profiles/{id}/runner/{runnerID}", s.bindRunnerProfileRunner)
+	mux.HandleFunc("DELETE /api/v1/runner-profiles/{id}/runner/{runnerID}", s.unbindRunnerProfileRunner)
 	mux.HandleFunc("GET /api/v1/audit", s.listAudit)
 	// The auth middleware runs inside statusLogger/recoverer and outside
 	// s.auth so authenticated principals are available to handlers; s.auth
@@ -2178,14 +2206,18 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	if in.Name == "" {
 		in.Name = in.ID
 	}
-	// Profile resolution: the certificate serial (TLS peer cert, or the
-	// payload cert_serial in bearer mode where it is the profile binding
-	// key) selects the profile that supplies every scheduling attribute.
-	serial := s.requestCertSerial(r, in.CertSerial)
+	// Profile resolution: the AUTHENTICATED transport identity selects the
+	// profile that supplies every scheduling attribute — the verified TLS
+	// peer certificate serial for mTLS, the runner_profile_links binding for
+	// a per-runner bearer identity. The client-asserted cert_serial is NEVER
+	// a privilege key while a per-runner identity mode is active (it is
+	// attacker-chosen; the legacy shared-token mode keeps it for dev
+	// compatibility only, see resolveRegistrationProfileBinding).
+	binding := s.resolveRegistrationProfileBinding(r, in.ID, in.CertSerial)
 	reported := append([]string{}, in.Capabilities...)
-	profile, hasProfile, perr := s.profileForSerial(r.Context(), serial)
+	profile, hasProfile, perr := s.profileForRunnerBinding(r.Context(), binding)
 	if perr != nil {
-		s.logError("register: profile lookup failed", "serial", serial, "error", perr.Error())
+		s.logError("register: profile lookup failed", "serial", binding.Serial, "runner", binding.RunnerID, "error", perr.Error())
 	}
 	if hasProfile {
 		in.Labels = append([]string(nil), profile.Labels...)
@@ -2207,7 +2239,12 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		in.CostPerHour = 0
 		in.PowerWatts = 0
 	}
-	in.CertSerial = serial
+	// The stored certificate serial is the resolution-derived one: the
+	// verified peer serial, or the legacy payload serial. A per-runner
+	// bearer identity always stores "" — the client-asserted serial never
+	// reaches the runner row, so no later path can mistake it for an
+	// ownership fact.
+	in.CertSerial = binding.Serial
 	now := time.Now().UTC()
 	if s.DB != nil {
 		old, gerr := s.DB.GetRunner(r.Context(), in.ID)
@@ -2806,6 +2843,27 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	candidates := make([]model.Job, 0)
+	// The runner's live resource reservations, summed ONCE for this poll from
+	// the jobs it currently holds. This is the memory-mode mirror of the SQL
+	// ledger's SUM (storage.runnerReservedResourcesTx) and of the scheduler's
+	// reservation pre-filter: the reservation of a RUNNING job exists exactly
+	// while the job is running — and it is the job's TOTAL reservation, its
+	// own request plus the aggregate service envelope (model.Job.
+	// ReservedResources), the same total the SQL claim writes — so every
+	// terminal path (completion, cancellation, lease expiry/requeue, queue
+	// timeout, runner revoke/disable) releases it by construction; there is no
+	// separate row that a missed release could strand, which is the documented
+	// memory-mode capacity semantics (single process; the SQL store is
+	// authoritative across replicas). The reservation is re-derived after
+	// recovery above, so an expired lease was already released before this SUM
+	// ran.
+	reserved := model.ResourceCapacity{}
+	for _, other := range s.jobs {
+		if other.Status != model.StatusRunning || other.LeaseRunnerID != id {
+			continue
+		}
+		reserved = model.AddResourceCapacity(reserved, other.ReservedResources())
+	}
 	// Lease-time quota transition: a queued job may only move to running
 	// while the repository/team running count is below the configured
 	// concurrency (the SQL claim applies the same conditional transition
@@ -2829,6 +2887,21 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if s.QuotaLimits.TeamConcurrency > 0 && float64(teamRunning[repoTeamKey(jobRepo)]) >= s.QuotaLimits.TeamConcurrency {
+			continue
+		}
+		// Resource admission: the SAME shared predicate the SQL claim and the
+		// in-memory stores apply. A candidate whose TOTAL request (its own
+		// request plus the aggregate service envelope, model.Job.
+		// ReservedResources) does not fit the runner's REMAINING resource
+		// capacity waits (it will be leased when one of this runner's jobs
+		// finishes, or by another runner with room) instead of oversubscribing
+		// this one. The count-capacity gate above
+		// (len(ri.ActiveJobs) >= ri.Capacity) stays authoritative for slots.
+		if !(storage.ResourceAdmission{
+			Capacity:  ri.ResourceCapacity,
+			Reserved:  reserved,
+			Requested: j.ReservedResources(),
+		}).Allows() {
 			continue
 		}
 		// The shared lease predicate is the SAME decision the SQL claim and
@@ -2865,9 +2938,15 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(candidates) == 0 {
 		// Explainable queueing: annotate every waiting job with the reason
-		// it is not leasable by this runner. In-memory mode; nextDB applies
-		// the same rules through applyQueueReasonsDB.
-		s.applyQueueReasonsLocked(ri)
+		// it is not leasable by the FLEET, not merely by this runner (a job
+		// another runner can take must not be pinned with a runner-local
+		// NO_COMPATIBLE_RUNNER). The evaluation uses the same shared
+		// predicate dimensions the in-memory lease path uses — dependency
+		// gating, labels, regions, environment capacity and (new) resource
+		// capacity against every active effective runner profile — and
+		// nextDB applies the same fleet-wide rules through
+		// applyQueueReasonsDB.
+		s.applyQueueReasonsMemoryLocked(ri)
 		s.runners[id] = ri
 		s.persistCheckedLocked("runner.queue_reasons")
 		w.WriteHeader(http.StatusNoContent)
@@ -2972,6 +3051,17 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 // filtering happens inside scheduler.Lease against the runner's region.
 func (s *Server) nextDB(w http.ResponseWriter, r *http.Request, id string) {
 	ctx := r.Context()
+	// Resource-ledger gate: a lease reserves the job's resources against the
+	// runner's durable ledger, so the ledger must be authoritative BEFORE the
+	// first lease this replica issues. A replica that has just been promoted
+	// (or one whose promotion hook failed) reconciles here, inline; a failed
+	// reconciliation refuses the lease (503) instead of over-admitting.
+	if err := s.ensureResourceReconciled(ctx); err != nil {
+		s.logError("resource ledger reconciliation", "error", err.Error())
+		w.Header().Set("X-Kiwi-State", "reconciling")
+		http.Error(w, "resource ledger not reconciled", http.StatusServiceUnavailable)
+		return
+	}
 	reason, exceeded, err := s.dailyBudgetStateDB(ctx)
 	switch {
 	case err != nil && !s.QuotaFailOpen:
@@ -4857,7 +4947,7 @@ func (s *Server) persistLocked() error {
 		s.notePersistResult(s.persistFailForTest)
 		return s.persistFailForTest
 	}
-	err := s.store.Save(storage.Snapshot{Version: 1, Runs: s.runs, Jobs: s.jobs, Runners: s.runners, Artifacts: s.artifacts, Reports: s.reports, DownstreamLinks: s.downstreamLinks, Profiles: s.profiles, CertProfileLinks: s.certProfiles, Snapshots: s.snapshots, CompletionReceipts: s.completionReceiptRecordsLocked(), Deployments: s.deployments, CRL: s.crl, PendingSidecars: s.pendingSidecarSnapshotLocked()})
+	err := s.store.Save(storage.Snapshot{Version: 1, Runs: s.runs, Jobs: s.jobs, Runners: s.runners, Artifacts: s.artifacts, Reports: s.reports, DownstreamLinks: s.downstreamLinks, Profiles: s.profiles, CertProfileLinks: s.certProfiles, RunnerProfileLinks: s.runnerProfiles, Snapshots: s.snapshots, CompletionReceipts: s.completionReceiptRecordsLocked(), Deployments: s.deployments, CRL: s.crl, PendingSidecars: s.pendingSidecarSnapshotLocked()})
 	s.notePersistResult(err)
 	return err
 }
@@ -5489,6 +5579,70 @@ func (s *Server) maintainMemoryTick(ctx context.Context, now time.Time) {
 	}
 }
 
+// ensureResourceReconciled guarantees that no lease is issued against a
+// stale resource ledger. It is called on the DB lease path BEFORE the claim:
+// the first poll after a promotion (or after a failed promotion hook)
+// performs the reconciliation inline; every later poll is one atomic load.
+// A store that does not implement ResourceReconcileStore has no separate
+// ledger to rebuild (its claim path is the ledger), so the gate opens
+// immediately.
+func (s *Server) ensureResourceReconciled(ctx context.Context) error {
+	if s.DB == nil || s.resourceReconciled.Load() {
+		return nil
+	}
+	rs, ok := s.DB.(storage.ResourceReconcileStore)
+	if !ok {
+		s.resourceReconciled.Store(true)
+		return nil
+	}
+	s.resourceReconcileMu.Lock()
+	defer s.resourceReconcileMu.Unlock()
+	if s.resourceReconciled.Load() {
+		return nil
+	}
+	_, err := s.reconcileResourceLedger(ctx, rs)
+	return err
+}
+
+// ReconcileResourceReservations rebuilds the durable runner resource
+// reservation ledger from the live running leases and arms the lease gate.
+// It is THE promotion hook (maintainDB calls it immediately after a
+// promotion, before recovery and before any lease can be served) and the
+// operator repair path: an operator can re-run it at any time to repair a
+// ledger left behind by an old-version leader, and it is idempotent, so
+// repeated or concurrent repair passes converge on the same ledger. A
+// store without the contract is a no-op that opens the gate.
+func (s *Server) ReconcileResourceReservations(ctx context.Context) (storage.ResourceReconcileResult, error) {
+	if s.DB == nil {
+		return storage.ResourceReconcileResult{}, nil
+	}
+	rs, ok := s.DB.(storage.ResourceReconcileStore)
+	if !ok {
+		s.resourceReconciled.Store(true)
+		return storage.ResourceReconcileResult{}, nil
+	}
+	s.resourceReconcileMu.Lock()
+	defer s.resourceReconcileMu.Unlock()
+	return s.reconcileResourceLedger(ctx, rs)
+}
+
+// reconcileResourceLedger runs one store reconciliation and arms the lease
+// gate on success. The mutex is held by the caller; the store operation is
+// itself idempotent and cross-replica serialized, so a repair pass racing a
+// promotion converges on the same ledger.
+func (s *Server) reconcileResourceLedger(ctx context.Context, rs storage.ResourceReconcileStore) (storage.ResourceReconcileResult, error) {
+	res, err := rs.ReconcileResourceReservations(ctx)
+	if err != nil {
+		return res, err
+	}
+	s.resourceReconciled.Store(true)
+	s.logInfo("resource ledger reconciled",
+		"running", strconv.Itoa(res.Running),
+		"upserted", strconv.Itoa(res.Upserted),
+		"deleted", strconv.Itoa(res.Deleted))
+	return res, nil
+}
+
 // maintainDB is the DB-mode housekeeping tick. The leader recovers expired
 // leases, expires queue timeouts, recovers downstream reservations, flushes
 // the outbox, and garbage-collects memory artifacts and CAS objects (artifact
@@ -5511,12 +5665,32 @@ func (s *Server) maintainDB(ctx context.Context, now time.Time) {
 		}
 		s.leader = true
 		s.logInfo("promoted to leader", "key", s.LeaderKey)
+		// BEFORE any lease can be issued by this replica: rebuild the durable
+		// resource reservation ledger from the live leases the previous
+		// leader left behind (which may be an OLD version that never wrote
+		// reservations, or a pre-0030 database with none at all).
+		// ensureResourceReconciled on the lease path closes the window
+		// between this tick and a runner poll; this call makes promotion the
+		// normal place it happens.
+		if _, err := s.ReconcileResourceReservations(ctx); err != nil {
+			if errors.Is(err, storage.ErrStaleLeader) {
+				// The claim was lost between the promotion check and the
+				// first fenced mutation: nothing was reconciled, so demote
+				// without reporting a leader's work as failed.
+				s.leader = false
+				s.resourceReconciled.Store(false)
+				s.logInfo("demoted to standby after stale leadership fence", "key", s.LeaderKey)
+				return
+			}
+			s.logError("post-promotion resource reconciliation", "error", err.Error())
+		}
 		if err := s.Sched.RecoverExpired(ctx, now); err != nil {
 			if errors.Is(err, storage.ErrStaleLeader) {
 				// The claim was lost between the promotion check and the
 				// first fenced mutation: nothing was recovered, so demote
 				// without reporting a leader's work as failed.
 				s.leader = false
+				s.resourceReconciled.Store(false)
 				s.logInfo("demoted to standby after stale leadership fence", "key", s.LeaderKey)
 				return
 			}
@@ -5532,6 +5706,7 @@ func (s *Server) maintainDB(ctx context.Context, now time.Time) {
 	}
 	if !s.Sched.IsLeader(ctx) {
 		s.leader = false
+		s.resourceReconciled.Store(false)
 		s.logInfo("demoted to standby", "key", s.LeaderKey)
 		return
 	}
@@ -5542,6 +5717,7 @@ func (s *Server) maintainDB(ctx context.Context, now time.Time) {
 			// epoch and is the leader now. Nothing was mutated; skip the
 			// remaining leader-only work and demote at once.
 			s.leader = false
+			s.resourceReconciled.Store(false)
 			s.logInfo("demoted to standby after stale leadership fence", "key", s.LeaderKey)
 			return
 		}

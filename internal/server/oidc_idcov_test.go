@@ -283,33 +283,48 @@ func TestIDCovLoadOIDCSignerPaths(t *testing.T) {
 	}
 }
 
-// TestIDCovReloadOIDCRingLocked covers both reload modes and every
-// early-return branch.
-func TestIDCovReloadOIDCRingLocked(t *testing.T) {
+// TestIDCovRefreshOIDCRing covers both refresh modes and every early-return
+// branch. The refresh takes s.mu internally, so the fixtures are installed
+// under a short lock and the refresh is then called without one.
+func TestIDCovRefreshOIDCRing(t *testing.T) {
+	setSigner := func(s *Server, signer *oidcSigner) {
+		s.mu.Lock()
+		s.oidc = signer
+		s.mu.Unlock()
+	}
+	kid := func(s *Server) string {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.oidc == nil {
+			return "<nil>"
+		}
+		return s.oidc.KID
+	}
+
 	// Nil signer: no-op.
 	s := New("t")
-	s.mu.Lock()
-	s.oidc = nil
-	s.reloadOIDCRingLocked()
-	s.mu.Unlock()
+	setSigner(s, nil)
+	if got := s.refreshOIDCRing(context.Background()); got != nil {
+		t.Fatalf("nil signer refresh = %+v", got)
+	}
 
 	// Cluster store without Lookup support: no-op.
 	s2 := New("t")
-	s2.mu.Lock()
-	s2.oidc = newOIDCSigner()
-	s2.oidc.cluster = fixedClusterStore{b: []byte("x")}
-	s2.reloadOIDCRingLocked()
-	s2.mu.Unlock()
+	setSigner(s2, &oidcSigner{cluster: fixedClusterStore{b: []byte("x")}})
+	s2.refreshOIDCRing(context.Background())
+	if got := kid(s2); got != "" {
+		t.Fatalf("lookup-less store swapped the signer: %q", got)
+	}
 
 	// Lookup error and not-found are tolerated.
 	s3 := New("t")
-	s3.mu.Lock()
-	s3.oidc = newOIDCSigner()
-	s3.oidc.cluster = lookupErrorStore{failingClusterStore{err: errors.New("down")}}
-	s3.reloadOIDCRingLocked()
-	s3.oidc.cluster = fixedLookupStore{found: false}
-	s3.reloadOIDCRingLocked()
-	s3.mu.Unlock()
+	setSigner(s3, &oidcSigner{cluster: lookupErrorStore{failingClusterStore{err: errors.New("down")}}})
+	s3.refreshOIDCRing(context.Background())
+	setSigner(s3, &oidcSigner{cluster: fixedLookupStore{found: false}})
+	s3.refreshOIDCRing(context.Background())
+	if got := kid(s3); got != "" {
+		t.Fatalf("failed lookup swapped the signer: %q", got)
+	}
 
 	// Unchanged digest is a no-op; changed valid bytes swap the signer;
 	// changed invalid bytes keep the current signer.
@@ -321,67 +336,91 @@ func TestIDCovReloadOIDCRingLocked(t *testing.T) {
 	store := &StaticClusterKeyStore{Keys: map[string][]byte{clusterKindOIDC: ringA}}
 	sumA := sha256.Sum256(ringA)
 	s4 := New("t")
-	s4.mu.Lock()
-	s4.oidc = &oidcSigner{cluster: store, ringDigest: hex.EncodeToString(sumA[:])}
-	s4.reloadOIDCRingLocked()
-	if s4.oidc.KID != "" {
+	setSigner(s4, &oidcSigner{cluster: store, ringDigest: hex.EncodeToString(sumA[:])})
+	s4.refreshOIDCRing(context.Background())
+	if got := kid(s4); got != "" {
 		t.Fatal("unchanged digest swapped the signer")
 	}
+	s4.mu.Lock()
 	s4.oidc.ringDigest = "different"
-	s4.reloadOIDCRingLocked()
-	if s4.oidc.KID != "a" {
-		t.Fatalf("changed ring not loaded: kid %q", s4.oidc.KID)
+	s4.mu.Unlock()
+	s4.refreshOIDCRing(context.Background())
+	if got := kid(s4); got != "a" {
+		t.Fatalf("changed ring not loaded: kid %q", got)
 	}
+	s4.mu.Lock()
 	s4.oidc.ringDigest = "different-again"
+	s4.mu.Unlock()
 	if err := store.Store(clusterKindOIDC, []byte("{")); err != nil {
 		t.Fatal(err)
 	}
-	s4.reloadOIDCRingLocked()
-	if s4.oidc.KID != "a" {
+	s4.refreshOIDCRing(context.Background())
+	if got := kid(s4); got != "a" {
 		t.Fatal("invalid changed ring replaced the signer")
 	}
-	s4.mu.Unlock()
 
-	// File mode: no path, stat failure, unchanged, changed-invalid.
+	// A canceled context gives up on the stalled key-store read and keeps the
+	// signer.
+	stalled := newCountingOIDCClusterStore()
+	stalled.mu.Lock()
+	stalled.block = true
+	stalled.mu.Unlock()
+	s4b := New("t")
+	setSigner(s4b, &oidcSigner{cluster: stalled, ringDigest: "stale"})
+	deadlineCtx, cancelDeadline := context.WithCancel(context.Background())
+	cancelDeadline()
+	if got := s4b.refreshOIDCRing(deadlineCtx); got == nil || got.KID != "" {
+		t.Fatalf("canceled refresh = %+v, want the current signer", got)
+	}
+	close(stalled.release)
+
+	// File mode: no path, stat failure, unchanged, changed-invalid. The
+	// fixture signer carries no KID so an accidental swap is visible.
 	s5 := New("t")
+	setSigner(s5, &oidcSigner{})
+	s5.refreshOIDCRing(context.Background()) // ringPath == ""
 	s5.mu.Lock()
-	s5.oidc = newOIDCSigner()
-	s5.reloadOIDCRingLocked() // ringPath == ""
 	s5.oidc.ringPath = filepath.Join(t.TempDir(), "missing.json")
-	s5.reloadOIDCRingLocked() // stat failure
 	s5.mu.Unlock()
+	s5.refreshOIDCRing(context.Background()) // stat failure
+	if got := kid(s5); got != "" {
+		t.Fatalf("missing file swapped the signer: %q", got)
+	}
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, oidcKeyRingFile)
 	s6 := New("t")
-	s6.mu.Lock()
-	s6.oidc = newOIDCSigner()
-	s6.oidc.ringPath = path
-	s6.oidc.Public, s6.oidc.Private, _ = ed25519.GenerateKey(nil)
-	s6.oidc.KID = "file-a"
-	if err := persistOIDCKeyRing(s6.oidc); err != nil {
+	signer6 := newOIDCSigner()
+	signer6.Public, signer6.Private, _ = ed25519.GenerateKey(nil)
+	signer6.KID = "file-a"
+	signer6.ringPath = path
+	if err := persistOIDCKeyRing(signer6); err != nil {
 		t.Fatal(err)
 	}
-	s6.reloadOIDCRingLocked() // unchanged mtime/size
-	if s6.oidc.KID != "file-a" {
+	setSigner(s6, signer6)
+	s6.refreshOIDCRing(context.Background()) // unchanged mtime/size
+	if got := kid(s6); got != "file-a" {
 		t.Fatal("unchanged file ring reloaded")
 	}
 	writeTestFile(t, path, []byte("{"))
 	os.Chtimes(path, time.Now(), time.Now())
+	s6.mu.Lock()
 	s6.oidc.ringMod = time.Time{}
-	s6.reloadOIDCRingLocked() // parse failure keeps the signer
-	if s6.oidc.KID != "file-a" {
+	s6.mu.Unlock()
+	s6.refreshOIDCRing(context.Background()) // parse failure keeps the signer
+	if got := kid(s6); got != "file-a" {
 		t.Fatal("invalid file ring replaced the signer")
 	}
 	// A directory at the ring path makes the post-stat read fail.
+	s6.mu.Lock()
 	s6.oidc.ringPath = dir
 	s6.oidc.ringMod = time.Time{}
 	s6.oidc.ringSize = 0
-	s6.reloadOIDCRingLocked()
-	if s6.oidc.KID != "file-a" {
+	s6.mu.Unlock()
+	s6.refreshOIDCRing(context.Background())
+	if got := kid(s6); got != "file-a" {
 		t.Fatal("unreadable ring replaced the signer")
 	}
-	s6.mu.Unlock()
 }
 
 // TestIDCovOIDCJWKSUnavailable pins the 503 when no signer is installed.

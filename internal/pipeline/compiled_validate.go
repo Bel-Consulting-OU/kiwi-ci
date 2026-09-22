@@ -143,7 +143,7 @@ func ValidateCompiledJob(cj CompiledJob) error {
 	if err := validateResources(where, j.Runtime, j.Resources); err != nil {
 		return err
 	}
-	seenAliases := map[string]bool{}
+	seenAliases := map[string]string{}
 	for i := range j.Services {
 		svc := &j.Services[i]
 		if strings.TrimSpace(svc.Name) == "" {
@@ -152,10 +152,19 @@ func ValidateCompiledJob(cj CompiledJob) error {
 		if !envNameRegexp.MatchString(svc.Name) {
 			return fmt.Errorf("%s has invalid service alias %q", where, svc.Name)
 		}
-		if seenAliases[svc.Name] {
-			return fmt.Errorf("%s declares service alias %q more than once", where, svc.Name)
+		// Duplicate detection is canonical, exactly like the raw admission
+		// validator: docker network aliases resolve case-insensitively, so
+		// "Redis" and "redis" are one runtime DNS name and must be rejected
+		// together (CanonicalServiceAlias is the same function the executor
+		// attaches aliases with).
+		canon := CanonicalServiceAlias(svc.Name)
+		if prev, dup := seenAliases[canon]; dup {
+			if prev == svc.Name {
+				return fmt.Errorf("%s declares service alias %q more than once", where, svc.Name)
+			}
+			return fmt.Errorf("%s declares service aliases %q and %q that both resolve to %q", where, prev, svc.Name, canon)
 		}
-		seenAliases[svc.Name] = true
+		seenAliases[canon] = svc.Name
 		if strings.TrimSpace(svc.Image) == "" {
 			return fmt.Errorf("%s service %q has empty image", where, svc.Name)
 		}

@@ -150,8 +150,12 @@ func TestSnapshotArchiveMaxBytesDerivation(t *testing.T) {
 }
 
 // TestUploadJobSnapshotOverCapAbortsAndRemovesTemp proves an archive over the
-// derived cap aborts with a clear error while streaming, sends no upload and
-// leaves no partial temporary file behind.
+// derived cap aborts with the same clear error the file-based capture raised
+// while it is being STREAMED: the capture goroutine trips the shared capped
+// writer mid-stream, the request body aborts, and nothing is ever written to
+// the runner's temporary directory (there is no temporary file at all). The
+// control plane sees at most an aborted body, which the real upload handler
+// rejects and removes.
 func TestUploadJobSnapshotOverCapAbortsAndRemovesTemp(t *testing.T) {
 	tmpRoot := t.TempDir()
 	fsrv := &fakeRunnerServer{}
@@ -175,9 +179,6 @@ func TestUploadJobSnapshotOverCapAbortsAndRemovesTemp(t *testing.T) {
 	if !strings.Contains(err.Error(), "snapshot archive exceeds the runner limit of 131072 bytes") {
 		t.Fatalf("error does not name the cap: %v", err)
 	}
-	if paths := fsrv.pathsFor(""); len(paths) != 0 {
-		t.Fatalf("oversized snapshot reached the control plane: %v", paths)
-	}
 	entries, rerr := os.ReadDir(tmpRoot)
 	if rerr != nil {
 		t.Fatal(rerr)
@@ -189,11 +190,25 @@ func TestUploadJobSnapshotOverCapAbortsAndRemovesTemp(t *testing.T) {
 	if len(leftover) != 0 {
 		t.Fatalf("aborted capture left temp files behind: %v", leftover)
 	}
+	// Whatever partial bytes the control plane observed can never be a
+	// complete, parseable archive: the cap aborts the stream before a valid
+	// tar.gz footer is written, so the upload handler's parse/validation
+	// step necessarily rejects it. The recorded bodies are read under the
+	// fake's mutex: the handler goroutine may still be draining the aborted
+	// request when the client returns.
+	fsrv.mu.Lock()
+	bodies := append([][]byte(nil), fsrv.snapshotBodies...)
+	fsrv.mu.Unlock()
+	for i, body := range bodies {
+		if _, perr := snapshot.Parse(bytes.NewReader(body)); perr == nil {
+			t.Fatalf("over-cap upload %d formed a complete parseable archive (%d bytes)", i, len(body))
+		}
+	}
 }
 
 // TestUploadJobSnapshotUnderCapUploads proves the cap does not reject a
-// workspace within its declared bound: the archive is uploaded as a gzip
-// stream.
+// workspace within its declared bound: the archive is uploaded as a complete
+// gzip stream.
 func TestUploadJobSnapshotUnderCapUploads(t *testing.T) {
 	fsrv := &fakeRunnerServer{}
 	ts := httptest.NewServer(fsrv.handler())
@@ -206,11 +221,52 @@ func TestUploadJobSnapshotUnderCapUploads(t *testing.T) {
 	if err := r.uploadJobSnapshot(context.Background(), basicTask(payloadPipeline), ws, 64<<10); err != nil {
 		t.Fatalf("upload within cap: %v", err)
 	}
-	if len(fsrv.snapshotBodies) != 1 {
-		t.Fatalf("snapshot uploads = %d, want 1", len(fsrv.snapshotBodies))
+	fsrv.mu.Lock()
+	bodies := append([][]byte(nil), fsrv.snapshotBodies...)
+	fsrv.mu.Unlock()
+	if len(bodies) != 1 {
+		t.Fatalf("snapshot uploads = %d, want 1", len(bodies))
 	}
-	if !bytes.HasPrefix(fsrv.snapshotBodies[0], []byte{0x1f, 0x8b}) {
-		t.Fatalf("uploaded body is not a gzip stream: %d bytes", len(fsrv.snapshotBodies[0]))
+	if !bytes.HasPrefix(bodies[0], []byte{0x1f, 0x8b}) {
+		t.Fatalf("uploaded body is not a gzip stream: %d bytes", len(bodies[0]))
+	}
+	if _, err := snapshot.Parse(bytes.NewReader(bodies[0])); err != nil {
+		t.Fatalf("uploaded body is not a complete parseable archive: %v", err)
+	}
+}
+
+// TestUploadJobSnapshotNeedsNoTempDir is the E5-F streaming proof: a capture
+// whose temporary directory does not exist cannot fall back to a temporary
+// archive file, so a successful upload through it proves the archive is
+// streamed straight into the request. The body the control plane decodes is
+// still the complete archive.
+func TestUploadJobSnapshotNeedsNoTempDir(t *testing.T) {
+	fsrv := &fakeRunnerServer{}
+	ts := httptest.NewServer(fsrv.handler())
+	defer ts.Close()
+	r := testRunnerFor(t, ts, Config{})
+	// A TMPDIR that does not exist: any os.CreateTemp would fail here.
+	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "does-not-exist"))
+
+	ws := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ws, "data.txt"), bytes.Repeat([]byte("y"), 64<<10), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.uploadJobSnapshot(context.Background(), basicTask(payloadPipeline), ws, 256<<10); err != nil {
+		t.Fatalf("streaming capture must not require a temporary directory: %v", err)
+	}
+	fsrv.mu.Lock()
+	bodies := append([][]byte(nil), fsrv.snapshotBodies...)
+	fsrv.mu.Unlock()
+	if len(bodies) != 1 {
+		t.Fatalf("snapshot uploads = %d, want 1", len(bodies))
+	}
+	man, err := snapshot.Parse(bytes.NewReader(bodies[0]))
+	if err != nil {
+		t.Fatalf("streamed body is not a parseable archive: %v", err)
+	}
+	if len(man.Entries) == 0 {
+		t.Fatalf("streamed archive manifest is empty: %+v", man)
 	}
 }
 
@@ -277,8 +333,13 @@ func TestExecuteDiskBoundAndSnapshotCapEndToEnd(t *testing.T) {
 	if !strings.Contains(logs, "snapshot archive exceeds the runner limit of 131072 bytes") {
 		t.Fatalf("snapshot cap warning missing: %q", logs)
 	}
-	if snapshots != 0 {
-		t.Fatalf("over-cap snapshot uploads = %d, want 0", snapshots)
+	// Streaming cannot retract the request that is already in flight when the
+	// cap trips, so the attempt reaches the control plane — but only as an
+	// aborted body the upload handler cannot turn into a snapshot (the fake
+	// counts requests, not accepted archives). The invariant is that at most
+	// one attempt is made and the job warning names the local cap.
+	if snapshots > 1 {
+		t.Fatalf("over-cap snapshot attempts = %d, want at most 1", snapshots)
 	}
 	entries, rerr := os.ReadDir(tmpRoot)
 	if rerr != nil {

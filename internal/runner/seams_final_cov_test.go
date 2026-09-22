@@ -63,9 +63,13 @@ func TestFinalSeamCloseTempFailures(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "close refused") {
 		t.Fatalf("restoreDownloads = %v", err)
 	}
-	// uploadJobSnapshot: the close failure is wrapped as a snapshot error.
-	if err := r.uploadJobSnapshot(context.Background(), basicTask(payloadPipeline), t.TempDir(), 0); err == nil || !strings.Contains(err.Error(), "snapshot close") {
-		t.Fatalf("uploadJobSnapshot = %v", err)
+	// uploadJobSnapshot no longer stages the archive through a temporary file
+	// (E5-F streaming capture), so the temp-file close seam cannot affect it:
+	// it streams successfully even while the seam refuses every close. The
+	// "no temporary file at all" property is pinned by
+	// TestUploadJobSnapshotNeedsNoTempDir.
+	if err := r.uploadJobSnapshot(context.Background(), basicTask(payloadPipeline), t.TempDir(), 0); err != nil {
+		t.Fatalf("streaming uploadJobSnapshot must not depend on the temp-file seam: %v", err)
 	}
 }
 

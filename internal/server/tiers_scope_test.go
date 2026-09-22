@@ -148,6 +148,11 @@ var expectedRouteTiers = map[string]routeTier{
 	"GET /api/v1/runner-profiles/{id}":               tierRBAC,
 	"PUT /api/v1/runner-profiles/{id}":               tierRBAC,
 	"PUT /api/v1/runner-profiles/{id}/cert/{serial}": tierRBAC,
+	// Runner-ID profile bindings are an admin operation: deliberately
+	// unmapped by auth.ActionFor so they fall through to the blanket admin
+	// gate (like drain), never the RBAC table.
+	"PUT /api/v1/runner-profiles/{id}/runner/{runnerID}":    tierAdmin,
+	"DELETE /api/v1/runner-profiles/{id}/runner/{runnerID}": tierAdmin,
 	// Admin: blanket admin gate.
 	"GET /metrics":                       tierAdmin,
 	"POST /api/v1/jobs/{id}/deployments": tierAdmin,

@@ -47,7 +47,10 @@ func TestFlowTestintelHistoryLifecycle(t *testing.T) {
 	if err := s.loadTestintelHistory(dir); err == nil {
 		t.Fatal("corrupt history file must fail")
 	}
-	// Valid file round-trip.
+	// Valid file round-trip. The file is a CACHE: it loads verbatim (the raw
+	// cachedHistory read sees it), but the first DERIVED read rebuilds the
+	// snapshot from the durable reports, so a cache entry no durable report
+	// backs must not survive as history.
 	h := testintel.NewHistory()
 	h.Record("github.com/o/repo-a", "build", "C", "t1", 1, false, time.Now().UTC())
 	h.Record("github.com/o/repo-a", "build", "C", "t1", 1, true, time.Now().UTC())
@@ -57,8 +60,21 @@ func TestFlowTestintelHistoryLifecycle(t *testing.T) {
 	if err := s.loadTestintelHistory(dir); err != nil {
 		t.Fatal(err)
 	}
+	if got := s.cachedHistory("github.com/o/repo-a"); got == nil || len(got.Flaky("github.com/o/repo-a")) == 0 {
+		t.Fatal("loaded cache file is not installed as the cache snapshot")
+	}
+	if got := s.flakyFromHistory("github.com/o/repo-a"); len(got) != 0 {
+		t.Fatalf("cache-only history survived the durable-report rebuild: %v", got)
+	}
+	// Once the report is DURABLE (in s.reports, as the upload path commits
+	// it), the very same history is re-derived from it.
+	s.mu.Lock()
+	s.runs["run-a"] = model.Run{ID: "run-a", RepoID: "github.com/o/repo-a", RepoFullName: "o/repo-a"}
+	s.reports["rep-a"] = model.TestReport{ID: "rep-a", RunID: "run-a", JobKey: "build", CreatedAt: time.Now().UTC(),
+		Cases: []model.TestResult{{Class: "C", Name: "t1", Passed: false}, {Class: "C", Name: "t1", Passed: true}}}
+	s.mu.Unlock()
 	if got := s.flakyFromHistory("github.com/o/repo-a"); len(got) == 0 {
-		t.Fatal("loaded history missing flaky entry")
+		t.Fatal("durable report did not re-derive the history")
 	}
 }
 

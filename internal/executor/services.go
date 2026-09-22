@@ -58,16 +58,18 @@ func serviceContainerName(runID, jobID string, index int) string {
 }
 
 // serviceAlias derives the user-facing network alias for one service: the
-// sanitized, lowercased declared name, or "" when the service declares none
-// (or the name sanitizes to nothing). The alias is attached with
-// `--network-alias` on the job's dedicated network, so the job can reach
-// `postgres` exactly as before while the physical container name stays
-// globally unique.
+// canonical form of the declared name (lowercased, docker-name-sanitized), or
+// "" when the service declares none (or the name sanitizes to nothing). The
+// alias is attached with `--network-alias` on the job's dedicated network, so
+// the job can reach `postgres` exactly as before while the physical container
+// name stays globally unique. Validation uses the SAME canonicalization
+// (pipeline.CanonicalServiceAlias) to reject two declarations that would
+// collide at runtime.
 func serviceAlias(svc pipeline.Service) string {
 	if svc.Name == "" {
 		return ""
 	}
-	return strings.ToLower(dockerNameClean.ReplaceAllString(svc.Name, "-"))
+	return pipeline.CanonicalServiceAlias(svc.Name)
 }
 
 // serviceDisplayName is the name used in user-facing messages and errors: the
@@ -81,7 +83,8 @@ func serviceDisplayName(runID, jobID string, index int, svc pipeline.Service) st
 
 // Per-service resource defaults: the limits one service container gets when
 // the job's aggregate envelope still has room for them. These are ceilings,
-// not grants: a service may only consume what is left of the job's resources.
+// not grants: a service may only consume its fair share of what is left of
+// the job's resources.
 const (
 	serviceDefaultCPUs   = 2.0
 	serviceDefaultMemory = int64(2) << 30
@@ -107,18 +110,32 @@ const (
 //	total service memory <= job resources.memory (default: 2 GiB)
 //	total service PIDs   <= job resources.pids   (default: 512)
 //
-// Each service then gets min(per-service default, remaining budget), so the
-// services are throttled to the job's envelope and a budget that is fully
-// consumed fails the job instead of starting another unbounded service.
-// cgroup-level placement (docker --cgroup-parent with a job-scoped cgroup)
-// would enforce the same envelope at the kernel level, but it requires a
-// delegated cgroup-v2 hierarchy on the daemon (systemd user delegation for
-// rootless setups) that the runner cannot assume; the aggregate budget is the
-// portable mechanism and is applied on every platform.
+// The services are then allocated with a fair split: each of the N services
+// gets min(per-service default, remaining / services-not-yet-allocated), so
+// the FIRST service can no longer consume the whole envelope and leave the
+// remaining ones starved (the E3-B defect: with the untrusted defaults, one
+// service used to take min(remaining, 2 CPU / 256 PIDs) and exhaust the
+// budget although admission permits up to
+// pipeline.MaxUntrustedServicesPerJob = 8 services). The aggregate stays
+// <= the envelope by construction, and only a genuinely oversubscribed
+// envelope (a share rounding to zero) fails closed with a clear
+// "budget exhausted" error.
+//
+// Kernel-level placement (docker --cgroup-parent onto a job-scoped cgroup
+// that contains the main container too) is the stronger mechanism and is
+// applied whenever the host supports it (see jobcgroup.go): it bounds the
+// main container plus every service by the declared envelope at the kernel,
+// which per-container docker flags cannot do. This budget remains in force
+// either way, and when no parent cgroup can be established it is the only
+// aggregate bound, which is why ServiceEnvelopeRequest exposes the aggregate
+// for the scheduler reservation follow-up.
 type serviceResourceBudget struct {
 	CPU    float64
 	Memory int64
 	PIDs   int
+	// remaining is the number of services still to be allocated. The fair
+	// split divides the remaining budget by it.
+	remaining int
 }
 
 // serviceAllocation is the per-service slice of the budget.
@@ -129,12 +146,14 @@ type serviceAllocation struct {
 }
 
 // serviceBudgetFor derives the aggregate service envelope from a job's
-// declared resources (see serviceResourceBudget for the formula).
-func serviceBudgetFor(jobResources pipeline.Resources) serviceResourceBudget {
+// declared resources (see serviceResourceBudget for the formula) for a plan
+// of count services.
+func serviceBudgetFor(jobResources pipeline.Resources, count int) serviceResourceBudget {
 	b := serviceResourceBudget{
-		CPU:    jobResources.CPU,
-		Memory: int64(jobResources.Memory),
-		PIDs:   jobResources.PIDs,
+		CPU:       jobResources.CPU,
+		Memory:    int64(jobResources.Memory),
+		PIDs:      jobResources.PIDs,
+		remaining: count,
 	}
 	if b.CPU <= 0 {
 		b.CPU = serviceAggregateDefaultCPUs
@@ -148,23 +167,87 @@ func serviceBudgetFor(jobResources pipeline.Resources) serviceResourceBudget {
 	return b
 }
 
-// allocate reserves the next service's slice of the budget: the per-service
-// default capped by what remains. A fully consumed resource fails closed with
-// a clear error naming the exhausted resource; it never degrades to an
+// allocate reserves the next service's slice of the budget with the
+// documented fair split: min(per-service default, remaining / remaining
+// services). Memory and PIDs use integer division, so the last service
+// absorbs the floor remainder; CPU divides exactly. A share that rounds to
+// zero means the envelope is genuinely too small for the declared service
+// count (for example 2 PIDs across 3 services); that fails closed with a
+// clear error naming the exhausted resource instead of degrading to an
 // unlimited docker flag (which is what a zero value would mean to docker).
 func (b *serviceResourceBudget) allocate() (serviceAllocation, error) {
+	if b.remaining <= 0 {
+		return serviceAllocation{}, fmt.Errorf("service resource budget plan exhausted (no services left to allocate)")
+	}
 	if b.CPU <= 0 || b.Memory <= 0 || b.PIDs <= 0 {
-		return serviceAllocation{}, fmt.Errorf("service resource budget exhausted (remaining cpu=%s memory=%d pids=%d); services share the job's resource envelope, declare resources.cpu/memory/pids or fewer services", strconv.FormatFloat(b.CPU, 'f', -1, 64), b.Memory, b.PIDs)
+		return serviceAllocation{}, b.exhaustedError()
 	}
 	a := serviceAllocation{
-		CPU:    min(b.CPU, serviceDefaultCPUs),
-		Memory: min(b.Memory, serviceDefaultMemory),
-		PIDs:   min(b.PIDs, serviceDefaultPIDs),
+		CPU:    min(b.CPU/float64(b.remaining), serviceDefaultCPUs),
+		Memory: min(b.Memory/int64(b.remaining), serviceDefaultMemory),
+		PIDs:   min(b.PIDs/b.remaining, serviceDefaultPIDs),
+	}
+	if a.CPU <= 0 || a.Memory <= 0 || a.PIDs <= 0 {
+		return serviceAllocation{}, b.exhaustedError()
 	}
 	b.CPU -= a.CPU
 	b.Memory -= a.Memory
 	b.PIDs -= a.PIDs
+	if b.CPU < 0 {
+		b.CPU = 0
+	}
+	b.remaining--
 	return a, nil
+}
+
+// exhaustedError renders the fail-closed oversubscription error. It names the
+// remaining envelope and the fair-split rule so the job author can either
+// declare more resources or declare fewer services.
+func (b *serviceResourceBudget) exhaustedError() error {
+	return fmt.Errorf("service resource budget exhausted (remaining cpu=%s memory=%d pids=%d across %d remaining services); services share the job's resource envelope, declare resources.cpu/memory/pids or fewer services", strconv.FormatFloat(b.CPU, 'f', -1, 64), b.Memory, b.PIDs, max(b.remaining, 0))
+}
+
+// serviceAllocationPlan returns the fair-split allocation for every declared
+// service, or the exhaustion error when the envelope cannot host the declared
+// count. It is the single planner behind both the executor's start path and
+// ServiceEnvelopeRequest, so the reported aggregate and the started limits can
+// never disagree.
+func serviceAllocationPlan(jobResources pipeline.Resources, services []pipeline.Service) ([]serviceAllocation, error) {
+	b := serviceBudgetFor(jobResources, len(services))
+	out := make([]serviceAllocation, 0, len(services))
+	for range services {
+		a, err := b.allocate()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, nil
+}
+
+// ServiceEnvelopeRequest returns the aggregate service resources the
+// fair-split plan allocates for a job's declared services. When a job-scoped
+// parent cgroup can be established this aggregate is already inside the job's
+// declared envelope at the kernel; when it cannot, the services are bounded
+// only by per-container docker flags, so the scheduler reservation must
+// include this aggregate IN ADDITION to the job's declared envelope to keep
+// host usage bounded across replicas. The control plane computes this
+// aggregate at enqueue with this same function and persists it as
+// model.Job.ServiceEnvelopeRequest; the scheduler charges it (with the job's
+// own request) to the runner and the runner logs it when it runs services
+// without a parent cgroup.
+func ServiceEnvelopeRequest(jobResources pipeline.Resources, services []pipeline.Service) (pipeline.Resources, error) {
+	plan, err := serviceAllocationPlan(jobResources, services)
+	if err != nil {
+		return pipeline.Resources{}, err
+	}
+	var out pipeline.Resources
+	for _, a := range plan {
+		out.CPU += a.CPU
+		out.Memory += pipeline.ByteSize(a.Memory)
+		out.PIDs += a.PIDs
+	}
+	return out, nil
 }
 
 // serviceResourceArgs renders the docker run flags for one service's
@@ -176,6 +259,17 @@ func serviceResourceArgs(a serviceAllocation) []string {
 		"--memory=" + strconv.FormatInt(a.Memory, 10),
 		"--cpus=" + strconv.FormatFloat(a.CPU, 'f', -1, 64),
 	}
+}
+
+// serviceEnvelopeSummary renders the fair-split aggregate service request for
+// log lines (see ServiceEnvelopeRequest). An oversubscribed plan is reported
+// as such instead of a misleading partial sum.
+func serviceEnvelopeSummary(jobResources pipeline.Resources, services []pipeline.Service) string {
+	req, err := ServiceEnvelopeRequest(jobResources, services)
+	if err != nil {
+		return "oversubscribed: " + err.Error()
+	}
+	return fmt.Sprintf("cpu=%s memory=%d pids=%d", strconv.FormatFloat(req.CPU, 'f', -1, 64), int64(req.Memory), req.PIDs)
 }
 
 // validateServiceImages pre-checks every declared service before any docker
@@ -201,16 +295,20 @@ func validateServiceImages(services []pipeline.Service, runID, jobID string, req
 // services resolve by name. When isolated is true the network is created with
 // --internal, giving the job and its services no route to the outside world.
 // requireImmutable rejects any service image without a strict digest pin
-// before docker is ever invoked.
+// before docker is ever invoked. cgroupParent, when non-empty, is the job's
+// scoped parent cgroup (see jobcgroup.go): every service is placed in it with
+// --cgroup-parent so the main container and the services together can never
+// exceed the job's declared envelope at the kernel.
 //
 // Every service container gets a globally unique physical name
 // (serviceContainerName) for docker run/exec/rm, and its declared alias is
 // attached with --network-alias on this job's network only. Two concurrent
 // jobs declaring the same alias therefore never collide on the daemon, while
-// the job still reaches `postgres` by alias. Per-service resource limits are
-// min(per-service default, remaining job envelope); a job whose service
-// declarations exceed its own resource envelope fails closed.
-func startContainerServices(ctx context.Context, runID, jobID string, services []pipeline.Service, jobResources pipeline.Resources, isolated, requireImmutable bool, emit func(string)) (string, func(), error) {
+// the job still reaches `postgres` by alias. Per-service resource limits use
+// the documented fair split of the job's envelope (allocating the remaining
+// budget across the remaining services); a job whose service declarations
+// genuinely cannot fit its own resource envelope fails closed.
+func startContainerServices(ctx context.Context, runID, jobID string, services []pipeline.Service, jobResources pipeline.Resources, isolated, requireImmutable bool, cgroupParent string, emit func(string)) (string, func(), error) {
 	if err := validateServiceImages(services, runID, jobID, requireImmutable); err != nil {
 		return "", func() {}, err
 	}
@@ -235,15 +333,15 @@ func startContainerServices(ctx context.Context, runID, jobID string, services [
 		_ = exec.Command(docker, "network", "rm", network).Run()
 	}
 	cleanupAll := func() { cleanup() }
-	budget := serviceBudgetFor(jobResources)
+	plan, planErr := serviceAllocationPlan(jobResources, services)
+	if planErr != nil {
+		cleanupAll()
+		return "", func() {}, &RunError{Kind: ErrorPolicy, Err: planErr}
+	}
 	for i, svc := range services {
 		name := serviceContainerName(runID, jobID, i)
 		display := serviceDisplayName(runID, jobID, i, svc)
-		alloc, aerr := budget.allocate()
-		if aerr != nil {
-			cleanupAll()
-			return "", func() {}, &RunError{Kind: ErrorPolicy, Err: fmt.Errorf("service %q: %w", display, aerr)}
-		}
+		alloc := plan[i]
 		// Every service runs maximally hardened. The user is hard-coded to
 		// 65534:65534 (nobody) rather than omitted: images known to require
 		// root are not a reason to weaken isolation for the rest. Services
@@ -253,6 +351,9 @@ func startContainerServices(ctx context.Context, runID, jobID string, services [
 			"--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
 			"--tmpfs", "/tmp:rw,nosuid,nodev",
 			"--user=" + serviceWorkloadUser,
+		}
+		if cgroupParent != "" {
+			args = append(args, "--cgroup-parent="+cgroupParent)
 		}
 		args = append(args, serviceResourceArgs(alloc)...)
 		if alias := serviceAlias(svc); alias != "" {

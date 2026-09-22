@@ -9,10 +9,23 @@ import (
 	"testing"
 )
 
-// uploadReportBody renders the POST /tests body for a leased job.
+// uploadReportBody renders the POST /tests body for a leased job. The
+// failure/skipped counters are derived from the cases so the body satisfies
+// the validator's case-derived lower bounds (a failing case must be declared
+// as a failure, and a skipped case as a skip).
 func uploadReportBody(task Task, runnerID string, cases []map[string]any) string {
+	failures, skipped := 0, 0
+	for _, c := range cases {
+		if isSkipped, _ := c["skipped"].(bool); isSkipped {
+			skipped++
+			continue
+		}
+		if passed, ok := c["passed"].(bool); ok && !passed {
+			failures++
+		}
+	}
 	rep := map[string]any{
-		"id": "", "tests": len(cases), "failures": 0, "cases": cases,
+		"id": "", "tests": len(cases), "failures": failures, "skipped": skipped, "cases": cases,
 	}
 	b, _ := json.Marshal(map[string]any{
 		"runner_id": runnerID, "lease_token": task.LeaseToken, "lease_generation": task.LeaseGeneration,

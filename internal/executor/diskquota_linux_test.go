@@ -4,23 +4,6 @@ package executor
 
 import "testing"
 
-// TestWorkspaceProjectIDStableAndNonzero pins the project-id derivation: the
-// same workspace always maps to the same nonzero 31-bit id, and distinct
-// workspaces map to distinct ids.
-func TestWorkspaceProjectIDStableAndNonzero(t *testing.T) {
-	a := workspaceProjectID("/var/lib/kiwi/run-1")
-	b := workspaceProjectID("/var/lib/kiwi/run-1")
-	if a != b || a == 0 {
-		t.Fatalf("project id not stable/nonzero: %d vs %d", a, b)
-	}
-	if a > 0x7fffffff {
-		t.Fatalf("project id %d outside the 31-bit range", a)
-	}
-	if c := workspaceProjectID("/var/lib/kiwi/run-2"); c == a {
-		t.Fatalf("distinct workspaces share project id %d", a)
-	}
-}
-
 // TestXFSQuoteEscapesSingleQuotes proves paths with quotes stay one command
 // argument for the xfs_quota command language.
 func TestXFSQuoteEscapesSingleQuotes(t *testing.T) {
