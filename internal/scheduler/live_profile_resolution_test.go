@@ -5,7 +5,7 @@ package scheduler
 // the claim does: certificate-serial binding first, then the runner-ID
 // binding (runner_profile_links), then the registration snapshot — so a
 // profile edit takes effect on the next lease without re-registration and a
-// dangling certificate binding is presented fail-closed.
+// dangling binding of EITHER source is presented fail-closed.
 
 import (
 	"context"
@@ -143,10 +143,10 @@ func TestLeaseCertBindingBeatsRunnerIDBinding(t *testing.T) {
 	}
 }
 
-// TestLeaseDanglingBindingsPrefilter: a dangling certificate binding
-// fails the prefilter closed (zero capacity, no candidates) even when a live
-// runner-ID binding exists; a dangling runner-ID binding resolves as "no
-// profile" (the registration snapshot).
+// TestLeaseDanglingBindingsPrefilter: a dangling binding fails the prefilter
+// closed (zero capacity, no candidates) for BOTH sources — the certificate
+// binding (even when a live runner-ID binding exists) and the runner-ID
+// binding (the binding governs, the snapshot is not a fallback).
 func TestLeaseDanglingBindingsPrefilter(t *testing.T) {
 	ctx := context.Background()
 	st := newAtomicFakeStore()
@@ -175,22 +175,21 @@ func TestLeaseDanglingBindingsPrefilter(t *testing.T) {
 		t.Fatalf("dangling cert binding lease = %v, want ErrNoJobs", err)
 	}
 
-	// Dangling runner-ID binding: the snapshot applies (not fail closed, and
-	// never the deleted profile).
+	// Dangling runner-ID binding: fail closed as well, never the snapshot.
 	st2 := newAtomicFakeStore()
 	now2 := liveProfileLeaseFixture(t, st2, "job2", []string{"snapshot"}, "r2", []string{"snapshot"}, 1)
 	if err := st2.LinkRunnerProfile(ctx, "r2", "ghost-p"); err != nil {
 		t.Fatal(err)
 	}
 	s2 := NewDB(st2, time.Minute, nil, nil)
-	if _, _, _, err := s2.Lease(ctx, "r2", now2); err != nil {
-		t.Fatalf("dangling runner-ID binding lease = %v, want the registration snapshot", err)
+	if _, _, _, err := s2.Lease(ctx, "r2", now2); !errors.Is(err, ErrNoJobs) {
+		t.Fatalf("dangling runner-ID binding lease = %v, want ErrNoJobs", err)
 	}
 	got2, err := st2.GetRunner(ctx, "r2")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if eff := s2.EffectiveRunner(ctx, got2); eff.Capacity != 1 {
-		t.Fatalf("dangling runner-ID effective capacity = %d, want the snapshot 1", eff.Capacity)
+	if eff := s2.EffectiveRunner(ctx, got2); eff.Capacity != 0 {
+		t.Fatalf("dangling runner-ID effective capacity = %d, want 0 (fail closed)", eff.Capacity)
 	}
 }

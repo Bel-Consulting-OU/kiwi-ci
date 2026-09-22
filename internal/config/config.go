@@ -12,6 +12,7 @@ package config
 import (
 	"flag"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"strconv"
@@ -158,6 +159,18 @@ type QuotaConfig struct {
 	// FailOpen lets enqueues and leases proceed when the usage store is
 	// unavailable instead of failing closed.
 	FailOpen bool `toml:"fail_open"`
+	// UntrustedCPUCeiling/UntrustedMemoryCeiling/UntrustedDiskCeiling/
+	// UntrustedPIDsCeiling are the resource ceilings admission applies to
+	// UNTRUSTED jobs. An explicit request above a ceiling is rejected
+	// (400 untrusted_resource_ceiling_exceeded) before the run is signed
+	// or persisted; an unset dimension is filled with the ceiling value so
+	// the executor always applies limits to untrusted work. Memory and
+	// disk are plain byte counts. 0 disables that dimension. Trusted jobs
+	// are unconstrained. Defaults: 2 CPU, 4 GiB, 10 GiB, 256 PIDs.
+	UntrustedCPUCeiling    float64 `toml:"untrusted_cpu_ceiling"`
+	UntrustedMemoryCeiling float64 `toml:"untrusted_memory_ceiling"`
+	UntrustedDiskCeiling   float64 `toml:"untrusted_disk_ceiling"`
+	UntrustedPIDsCeiling   float64 `toml:"untrusted_pids_ceiling"`
 }
 
 // SecretBrokerConfig selects the secret backend (vault, aws, gcp, azure,
@@ -220,8 +233,14 @@ type Config struct {
 // chain).
 func Default() *Config {
 	return &Config{
-		Server:    ServerConfig{Listen: ":8080", Mode: "dev"},
-		Blob:      BlobConfig{Backend: "fs"},
+		Server: ServerConfig{Listen: ":8080", Mode: "dev"},
+		Blob:   BlobConfig{Backend: "fs"},
+		Quota: QuotaConfig{
+			UntrustedCPUCeiling:    2,
+			UntrustedMemoryCeiling: 4 << 30,
+			UntrustedDiskCeiling:   10 << 30,
+			UntrustedPIDsCeiling:   256,
+		},
 		RateLimit: RateLimitConfig{Burst: 100},
 	}
 }
@@ -360,6 +379,9 @@ func (c *Config) Validate() error {
 	if err := ql.Validate(); err != nil {
 		return fmt.Errorf("quota: %w", err)
 	}
+	if err := validateUntrustedCeilings(c.Quota); err != nil {
+		return err
+	}
 	if err := validateSecretBroker(c.SecretBroker); err != nil {
 		return err
 	}
@@ -386,6 +408,39 @@ func (c *Config) Validate() error {
 		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
 			return fmt.Errorf("%s must be an http(s):// URL, got %q", name, base)
 		}
+	}
+	return nil
+}
+
+// validateUntrustedCeilings rejects ceiling values that can never be
+// enforced honestly: NaN/Inf/negative, or byte/pid counts above the
+// representation the server converts them to. 0 is legal (the dimension is
+// disabled).
+func validateUntrustedCeilings(q QuotaConfig) error {
+	for name, v := range map[string]float64{
+		"quota.untrusted_cpu_ceiling":    q.UntrustedCPUCeiling,
+		"quota.untrusted_memory_ceiling": q.UntrustedMemoryCeiling,
+		"quota.untrusted_disk_ceiling":   q.UntrustedDiskCeiling,
+		"quota.untrusted_pids_ceiling":   q.UntrustedPIDsCeiling,
+	} {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return fmt.Errorf("%s must be a finite number, got %v", name, v)
+		}
+		if v < 0 {
+			return fmt.Errorf("%s must not be negative, got %v", name, v)
+		}
+	}
+	// Memory/disk are converted to int64 bytes and PIDs to int; reject
+	// magnitudes that would overflow (or round to a negative conversion)
+	// instead of silently wrapping to a different ceiling.
+	if q.UntrustedMemoryCeiling >= float64(math.MaxInt64) {
+		return fmt.Errorf("quota.untrusted_memory_ceiling must stay below %d bytes, got %v", int64(math.MaxInt64), q.UntrustedMemoryCeiling)
+	}
+	if q.UntrustedDiskCeiling >= float64(math.MaxInt64) {
+		return fmt.Errorf("quota.untrusted_disk_ceiling must stay below %d bytes, got %v", int64(math.MaxInt64), q.UntrustedDiskCeiling)
+	}
+	if q.UntrustedPIDsCeiling > float64(math.MaxInt32) {
+		return fmt.Errorf("quota.untrusted_pids_ceiling must stay below %d, got %v", int64(math.MaxInt32), q.UntrustedPIDsCeiling)
 	}
 	return nil
 }
@@ -542,6 +597,26 @@ func (c *Config) ApplyEnv() error {
 			*q.dst = f
 		}
 	}
+	// Untrusted ceiling overrides share the KIWI_QUOTA_ prefix.
+	for _, q := range []struct {
+		name string
+		dst  *float64
+	}{
+		{"KIWI_QUOTA_UNTRUSTED_CPU_CEILING", &c.Quota.UntrustedCPUCeiling},
+		{"KIWI_QUOTA_UNTRUSTED_MEMORY_CEILING", &c.Quota.UntrustedMemoryCeiling},
+		{"KIWI_QUOTA_UNTRUSTED_DISK_CEILING", &c.Quota.UntrustedDiskCeiling},
+		{"KIWI_QUOTA_UNTRUSTED_PIDS_CEILING", &c.Quota.UntrustedPIDsCeiling},
+	} {
+		v, ok := os.LookupEnv(q.name)
+		if !ok {
+			continue
+		}
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return fmt.Errorf("%s: invalid number %q", q.name, v)
+		}
+		*q.dst = f
+	}
 	return nil
 }
 
@@ -692,6 +767,22 @@ func (c *Config) OverrideFromFlags(fs *flag.FlagSet) error {
 				} else {
 					c.Quota.FailOpen = v
 				}
+			}
+		case "untrusted-cpu-ceiling":
+			if perr := flagFloat(f, &c.Quota.UntrustedCPUCeiling); perr != nil {
+				err = perr
+			}
+		case "untrusted-memory-ceiling":
+			if perr := flagFloat(f, &c.Quota.UntrustedMemoryCeiling); perr != nil {
+				err = perr
+			}
+		case "untrusted-disk-ceiling":
+			if perr := flagFloat(f, &c.Quota.UntrustedDiskCeiling); perr != nil {
+				err = perr
+			}
+		case "untrusted-pids-ceiling":
+			if perr := flagFloat(f, &c.Quota.UntrustedPIDsCeiling); perr != nil {
+				err = perr
 			}
 		case "otel-endpoint":
 			c.Observability.OTelEndpoint = f.Value.String()

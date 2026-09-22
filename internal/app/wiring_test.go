@@ -94,13 +94,17 @@ func TestApplyAuthConfig(t *testing.T) {
 func TestApplyQuotaConfig(t *testing.T) {
 	cfg := config.Default()
 	cfg.Quota = config.QuotaConfig{
-		RepoConcurrency:  4,
-		TeamConcurrency:  12,
-		RepoQueueDepth:   8,
-		TeamQueueDepth:   24,
-		DailyCostLimit:   1.5,
-		DailyEnergyLimit: 2500,
-		FailOpen:         true,
+		RepoConcurrency:        4,
+		TeamConcurrency:        12,
+		RepoQueueDepth:         8,
+		TeamQueueDepth:         24,
+		DailyCostLimit:         1.5,
+		DailyEnergyLimit:       2500,
+		FailOpen:               true,
+		UntrustedCPUCeiling:    3.5,
+		UntrustedMemoryCeiling: 16 << 30,
+		UntrustedDiskCeiling:   20 << 30,
+		UntrustedPIDsCeiling:   1024,
 	}
 	srv := server.New("r")
 	applyQuotaConfig(srv, cfg)
@@ -109,6 +113,22 @@ func TestApplyQuotaConfig(t *testing.T) {
 	}
 	if srv.DailyCostLimit != 1.5 || srv.DailyEnergyLimit != 2500 || !srv.QuotaFailOpen {
 		t.Errorf("budgets = %g %g failOpen=%t", srv.DailyCostLimit, srv.DailyEnergyLimit, srv.QuotaFailOpen)
+	}
+	if srv.UntrustedCPUCeiling != 3.5 || srv.UntrustedMemoryCeiling != 16<<30 || srv.UntrustedDiskCeiling != 20<<30 || srv.UntrustedPIDCeiling != 1024 {
+		t.Errorf("untrusted ceilings = %v/%d/%d/%d, want 3.5/16GiB/20GiB/1024",
+			srv.UntrustedCPUCeiling, srv.UntrustedMemoryCeiling, srv.UntrustedDiskCeiling, srv.UntrustedPIDCeiling)
+	}
+}
+
+// TestApplyQuotaConfigUsesDefaultCeilings proves a config loaded the normal
+// way (Default/Load) keeps the documented ceiling defaults on the server,
+// whether or not the file mentions them.
+func TestApplyQuotaConfigUsesDefaultCeilings(t *testing.T) {
+	srv := server.New("r")
+	applyQuotaConfig(srv, config.Default())
+	if srv.UntrustedCPUCeiling != 2 || srv.UntrustedMemoryCeiling != 4<<30 || srv.UntrustedDiskCeiling != 10<<30 || srv.UntrustedPIDCeiling != 256 {
+		t.Fatalf("default ceilings = %v/%d/%d/%d, want 2/4GiB/10GiB/256",
+			srv.UntrustedCPUCeiling, srv.UntrustedMemoryCeiling, srv.UntrustedDiskCeiling, srv.UntrustedPIDCeiling)
 	}
 }
 

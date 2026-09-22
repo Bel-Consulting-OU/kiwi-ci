@@ -86,6 +86,46 @@ transaction, so each file is its own lock window:
 5. Verify health (`/readiness`), a canary pipeline run, and forge
    status delivery (outbox replay).
 
+### Resource reservation ledger after a rolling upgrade
+
+Migration 0030 adds the durable per-lease resource reservation ledger
+(`job_resource_reservations`). It is written by the ATOMIC lease claim, so a
+mixed-version window has two gaps: an OLD binary leases jobs without writing
+rows (the ledger under-reserves, and a new leader could admit work the runner
+cannot hold), and an OLD binary serving `/complete` or `/cancel` does not
+delete the row of the job it finished (the ledger over-reserves that runner).
+The new binary closes both:
+
+- A new leader rebuilds the ledger from the authoritative persisted lease
+  state BEFORE its first lease (the promotion hook), and the capacity reads
+  count only rows whose job is still running, still leased and at the
+  recorded generation — so an orphan row an old replica left behind stops
+  shrinking the runner's capacity immediately, without operator action, and a
+  new leader's rebuilt rows stop the over-admission.
+- If a ledger is still mis-stated (the promotion hook failed, or the repair
+  is wanted after the old replicas have drained), run the repair command an
+  operator can invoke at any time:
+
+  ```bash
+  kiwi storage reconcile-reservations --database-url "$DATABASE_URL"
+  ```
+
+  It is idempotent, safe while the fleet serves traffic, serialized against
+  other reconciliations and against leadership hand-over, and prints the
+  operator-facing counters
+  (`resource reservations reconciled: running=N upserted=N deleted=N`).
+  It derives every row from the running jobs' persisted leases, never from
+  caller input, so re-running it converges. No schema change is needed for
+  the repair.
+- Legacy service jobs: a job enqueued before the service-envelope field
+  existed declares services with no `service_envelope_request`. A promoted
+  leader cannot know the aggregate those services may consume, so it charges
+  the job's own request a second time as the envelope (a conservative upper
+  bound of the executor's fair split) instead of a zero envelope that would
+  oversubscribe the runner. The rule stops applying as soon as those jobs
+  end; a job written by this release always carries the field and is charged
+  exactly its persisted envelope.
+
 ## Rollback
 
 Rolling back the server binary is safe as long as the database schema
@@ -243,6 +283,28 @@ claims themselves.
   service unit that does not set `HOME` (common under systemd) must set
   `HOME` for the runner user or pass `--identity-dir <dir>`; the identity
   directory doubles as the state directory.
+- Untrusted resource ceilings are configurable, and their rejections are
+  named. An untrusted pipeline that declares a resource above a ceiling is
+  refused at admission with `400` and reason
+  `untrusted_resource_ceiling_exceeded` (never clamped); an unset dimension
+  is filled with the ceiling, and trusted jobs are unconstrained. The
+  built-in defaults are unchanged — 2 CPU, 4 GiB memory, 10 GiB disk,
+  256 PIDs — so a pipeline that previously ran with e.g. `memory: 8GiB`
+  under an older release now fails at submission. Raise a ceiling without
+  rebuilding via `kiwi.toml`
+  (`[quota] untrusted_memory_ceiling = 8589934592`, memory/disk in plain
+  bytes, `0` disables a dimension), the equivalent flags
+  (`--untrusted-cpu-ceiling`, `--untrusted-memory-ceiling`,
+  `--untrusted-disk-ceiling`, `--untrusted-pids-ceiling`) or the
+  `KIWI_QUOTA_UNTRUSTED_*` environment variables.
+- The untrusted per-job service ceiling (`8`) is now enforced at
+  ADMISSION instead of only by the executor before it starts containers: an
+  untrusted submission declaring 9–32 services is rejected before it is
+  signed, persisted or queued, with `400` and reason
+  `untrusted_service_ceiling_exceeded`. Trusted pipelines keep the 32
+  service allowance. Existing untrusted pipelines with more than 8 services
+  that used to fail mid-run now fail at submission; split the job or
+  reduce its sidecars (the ceiling is not configurable).
 
 ## Dependency upgrade policy
 

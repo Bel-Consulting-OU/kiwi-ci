@@ -1,8 +1,10 @@
 package scheduler
 
 // Real-PostgreSQL integration coverage for the transactional recovery paths:
-// DBScheduler.CancelJobsByRunner, DBScheduler.RecoverExpired (expired lease
-// and queue timeout) and their idempotency under two replicas. Gated on
+// the runner-disable kill switch (storage.RecoveryStore.RevokeRunnerLeases,
+// which the disable path calls directly — the DBScheduler.CancelJobsByRunner
+// wrapper was removed as dead code), DBScheduler.RecoverExpired (expired
+// lease and queue timeout) and their idempotency under two replicas. Gated on
 // KIWI_TEST_POSTGRES_URL like the other scheduler integration tests.
 
 import (
@@ -62,9 +64,9 @@ func TestPostgresIntegrationSchedulerKillSwitchTransactional(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	count, err := sched.CancelJobsByRunner(ctx, runnerID, "runner disabled")
+	count, err := revokeRunnerLeases(ctx, st, runnerID, "runner disabled")
 	if err != nil {
-		t.Fatalf("CancelJobsByRunner: %v", err)
+		t.Fatalf("RevokeRunnerLeases: %v", err)
 	}
 	if count != 2 {
 		t.Fatalf("revoked count = %d, want 2", count)
@@ -86,7 +88,7 @@ func TestPostgresIntegrationSchedulerKillSwitchTransactional(t *testing.T) {
 	}
 
 	// A second replica racing the same disable sees nothing to revoke.
-	count, err = sched.CancelJobsByRunner(ctx, runnerID, "runner disabled")
+	count, err = revokeRunnerLeases(ctx, st, runnerID, "runner disabled")
 	if err != nil || count != 0 {
 		t.Fatalf("replayed kill switch = %d/%v, want 0/nil", count, err)
 	}
@@ -214,22 +216,20 @@ func TestPostgresIntegrationSchedulerKillSwitchTwoReplicas(t *testing.T) {
 		}
 	}
 
-	schedA := NewDB(storeA, time.Minute, nil, nil)
-	schedB := NewDB(storeB, time.Minute, nil, nil)
 	var wg sync.WaitGroup
 	counts := make(chan int, 2)
-	for _, sched := range []*DBScheduler{schedA, schedB} {
+	for _, store := range []*storage.PostgresStore{storeA, storeB} {
 		wg.Add(1)
-		go func(sched *DBScheduler) {
+		go func(store *storage.PostgresStore) {
 			defer wg.Done()
-			n, err := sched.CancelJobsByRunner(ctx, runnerID, "runner disabled")
+			revoked, err := store.RevokeRunnerLeases(ctx, runnerID, "runner disabled")
 			if err != nil {
 				t.Errorf("concurrent kill switch: %v", err)
 				counts <- -1
 				return
 			}
-			counts <- n
-		}(sched)
+			counts <- len(revoked)
+		}(store)
 	}
 	wg.Wait()
 	close(counts)

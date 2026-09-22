@@ -28,6 +28,17 @@ package storage
 // key, which makes "at most one live reservation per job" a database
 // invariant rather than a discipline.
 //
+// Self-healing reads (K6-B): during a rolling upgrade an OLD binary can
+// complete or cancel a job while the NEW binary owns the release paths, so
+// that job's row is left behind with no live lease. The live SUM and the
+// batched fold therefore count only rows that STILL describe a live lease —
+// the job is running, still leased, and at the SAME generation the row
+// recorded (liveReservationExistsSQL, the exact predicate the leader's stale
+// sweep deletes by). A leaked row stops shrinking the runner's remaining
+// capacity the moment this binary serves claims, with no operator action, and
+// the orphan row itself is removed by the next
+// ReconcileResourceReservations pass (promotion or the repair command).
+//
 // Capacity model: a runner's resource capacity is the linked profile's
 // max_cpu/max_memory/max_disk/max_pids (migration 0030); a runner without a
 // linked profile uses its registration snapshot (ResourceCapacity), which
@@ -205,20 +216,36 @@ type rowQuerier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-// runnerReservedResourcesTx sums the runner's live reservations inside the
-// caller's transaction (or over the pool for the observation API). No row
-// means zero on every dimension.
+// liveReservationExistsSQL is the ONE "this row still describes a live lease"
+// predicate (alias r), shared by the capacity SUM, the batched fleet fold and
+// the leader's stale sweep so all three can never disagree about which rows
+// count. A row is live only when its job is still running, still leased, and
+// still at the generation the row recorded: an old-replica completion or a
+// crashed release leaves a row that fails this test, and such a row must
+// neither shrink the runner's remaining capacity nor survive a reconcile.
+const liveReservationExistsSQL = `EXISTS (
+			SELECT 1 FROM jobs j
+			WHERE j.id = r.job_id
+			  AND j.status = 'running'
+			  AND COALESCE(j.lease_runner_id, '') <> ''
+			  AND j.lease_generation = r.generation
+		)`
+
+// runnerReservedResourcesTx sums the runner's LIVE reservations inside the
+// caller's transaction (or over the pool for the observation API). No live
+// row means zero on every dimension; a stale row a pre-upgrade replica left
+// behind contributes nothing.
 func runnerReservedResourcesTx(ctx context.Context, q rowQuerier, runnerID string) (model.ResourceCapacity, error) {
 	return runnerReservedResourcesExcludingTx(ctx, q, runnerID, "")
 }
 
 // runnerReservedResourcesExcludingTx is runnerReservedResourcesTx with one
-// job's row excluded from the SUM (empty excludeJobID sums every row). The
-// lease claim excludes the candidate's own row so a stale row for the SAME
-// job can never double-count against it.
+// job's row excluded from the SUM (empty excludeJobID sums every live row).
+// The lease claim excludes the candidate's own row so a stale row for the
+// SAME job can never double-count against it.
 func runnerReservedResourcesExcludingTx(ctx context.Context, q rowQuerier, runnerID, excludeJobID string) (model.ResourceCapacity, error) {
 	var out model.ResourceCapacity
-	err := q.QueryRow(ctx, `SELECT COALESCE(SUM(cpu), 0), COALESCE(SUM(memory), 0), COALESCE(SUM(disk), 0), COALESCE(SUM(pids), 0) FROM job_resource_reservations WHERE runner_id=$1 AND ($2 = '' OR job_id <> $2)`, runnerID, excludeJobID).
+	err := q.QueryRow(ctx, `SELECT COALESCE(SUM(r.cpu), 0), COALESCE(SUM(r.memory), 0), COALESCE(SUM(r.disk), 0), COALESCE(SUM(r.pids), 0) FROM job_resource_reservations r WHERE r.runner_id=$1 AND ($2 = '' OR r.job_id <> $2) AND `+liveReservationExistsSQL, runnerID, excludeJobID).
 		Scan(&out.CPU, &out.Memory, &out.Disk, &out.PIDs)
 	if err != nil {
 		return model.ResourceCapacity{}, err
@@ -232,10 +259,17 @@ func runnerReservedResourcesExcludingTx(ctx context.Context, q rowQuerier, runne
 // and the in-memory store implement it.
 type ResourceReservationStore interface {
 	// RunnerReservedResources sums the resources currently reserved by the
-	// runner's running jobs (zero when nothing is reserved).
+	// runner's running jobs (zero when nothing is reserved). Only rows whose
+	// job is still running, still leased and at the recorded generation
+	// count: a row an old replica left behind after a completion it served
+	// contributes zero immediately (see liveReservationExistsSQL), so a
+	// rolling upgrade can never shrink a runner's capacity permanently.
 	RunnerReservedResources(ctx context.Context, runnerID string) (model.ResourceCapacity, error)
-	// ListResourceReservations returns the runner's live reservations
-	// ordered by job ID (empty when none).
+	// ListResourceReservations returns the runner's ledger rows ordered by
+	// job ID (empty when none). The listing is RAW: it reports every stored
+	// row, including a stale row a pre-upgrade replica left behind (which the
+	// SUM already ignores and the next reconcile deletes), so operators can
+	// see exactly what a repair pass will sweep.
 	ListResourceReservations(ctx context.Context, runnerID string) ([]ResourceReservation, error)
 }
 

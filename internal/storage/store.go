@@ -847,12 +847,12 @@ type RecoveryStore interface {
 
 // RunnerDisableStore is the ATOMIC runner-disable kill switch. It exists
 // because the previous admin path composed several independent operations
-// (UpsertRunner(disabled), RevokeRunnerLeases, RevokeCert, audit) and answered
-// success even when the durable certificate revocation was never recorded: a
-// disabled runner's still-valid certificate could then be replayed on another
-// replica. DisableRunnerAndRevokeCert performs the whole disable in ONE
-// transaction and the handler fails closed (no success response) when it
-// cannot commit it.
+// (UpsertRunner(disabled), RevokeRunnerLeases, the certificate revocation,
+// audit) and answered success even when the durable certificate revocation
+// was never recorded: a disabled runner's still-valid certificate could then
+// be replayed on another replica. DisableRunnerAndRevokeCert performs the
+// whole disable in ONE transaction and the handler fails closed (no success
+// response) when it cannot commit it.
 type RunnerDisableStore interface {
 	// DisableRunnerAndRevokeCert disables runnerID, invalidates every running
 	// lease it holds (requeue or terminal-cancel exactly like
@@ -1118,13 +1118,18 @@ type RunEnqueueStore interface {
 //     against the runner's remaining resource capacity in the same
 //     transaction (see postgres_resource_reservation.go); a rejected
 //     admission rolls the lease back with ErrResourceCapacity. A job
-//     without services (or a legacy payload) leaves the envelope zero, so
-//     the reservation is byte-identical to the pre-envelope behavior.
-//   - ResourceCapacity is the caller's registration-snapshot resource
-//     capacity. The SQL claim reads the runner row's live resource capacity
-//     (and, when linked, the profile's max_* columns) instead; memory stores
-//     that keep no live row read this field. Zero dimensions are
-//     unconstrained (the documented default).
+//     without services (or a legacy payload, which decodes with an empty
+//     envelope) leaves the envelope zero, so the claim's reservation is
+//     byte-identical to the pre-envelope behavior. The promoted-leader
+//     reconcile charges a legacy services-without-envelope payload
+//     conservatively (its own request as the envelope) instead of zero, so a
+//     rolling upgrade cannot under-reserve it (see
+//     ReconcileResourceReservations).
+//
+// The runner's capacity is NOT carried on the claim: every claim path reads
+// the runner's live capacity itself (the SQL claim from the locked runner row
+// plus its resolved profile's max_* columns, the mem claim from its stored
+// runner), so a capacity resolved by the caller could only go stale.
 type LeaseClaim struct {
 	JobID      string
 	RunnerID   string
@@ -1132,8 +1137,7 @@ type LeaseClaim struct {
 	Generation int64
 	ExpiresAt  time.Time
 
-	RunnerCapacity   int
-	ResourceCapacity model.ResourceCapacity
+	RunnerCapacity int
 
 	Runtime          string
 	CanonRepoID      string
@@ -1354,12 +1358,14 @@ type RunnerTokenStore interface {
 	HasRunnerTokens(ctx context.Context) (bool, error)
 }
 
-// CertRevocationStore is the durable certificate revocation contract
-// (migration 0006: cert_revocations). RevokeCert records the revocation
-// transactionally so every replica rejects the serial; CertRevoked is the
-// replica-side check behind the server's short-TTL cache.
+// CertRevocationStore is the durable certificate revocation READ contract
+// (migration 0006: cert_revocations). A revocation is never a standalone
+// operation: the only production path that records one is
+// RunnerDisableStore.DisableRunnerAndRevokeCert, which writes
+// cert_revocations, the runner's disabled state, the revoked lease set and
+// the audit evidence in ONE transaction. CertRevoked is the replica-side
+// check behind the server's short-TTL cache.
 type CertRevocationStore interface {
-	RevokeCert(ctx context.Context, serial, runnerID, reason string) error
 	CertRevoked(ctx context.Context, serial string) (bool, error)
 }
 

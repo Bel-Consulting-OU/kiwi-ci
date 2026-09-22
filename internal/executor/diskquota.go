@@ -403,11 +403,6 @@ func xfsProjectCleanupCommands(workspace string, projID uint32) []string {
 	}
 }
 
-// xfsQuotaRun executes one xfs_quota command against a mount point. It is a
-// package variable so tests can drive the XFS quota flow deterministically
-// (the portable core below is exercised on every platform).
-var xfsQuotaRun = runXFSQuotaCommand
-
 // runXFSQuotaCommand executes `xfs_quota -x -c <command> <mountPoint>`.
 func runXFSQuotaCommand(xq, mountPoint, command string) error {
 	out, err := exec.Command(xq, "-x", "-c", command, mountPoint).CombinedOutput()
@@ -432,11 +427,11 @@ func setupXFSProjectQuotaOnMount(workspace string, entry mountInfoEntry, limit i
 	if err != nil {
 		return DiskQuotaStatus{Detail: "allocate XFS project id: " + err.Error()}, nil
 	}
-	if err := xfsQuotaRun(xq, entry.mountPoint, xfsProjectAssignCommand(workspace, projID)); err != nil {
+	if err := runXFSQuotaCommand(xq, entry.mountPoint, xfsProjectAssignCommand(workspace, projID)); err != nil {
 		releaseXFSProjectID(fsKey, projID)
 		return DiskQuotaStatus{Detail: "assign XFS project quota: " + err.Error()}, nil
 	}
-	if err := xfsQuotaRun(xq, entry.mountPoint, xfsProjectLimitCommand(limit, projID)); err != nil {
+	if err := runXFSQuotaCommand(xq, entry.mountPoint, xfsProjectLimitCommand(limit, projID)); err != nil {
 		// Leave nothing half-applied: drop the project assignment again with
 		// the same cleanup used on the normal path (it names the ID and
 		// releases it only when both commands succeed).
@@ -460,7 +455,7 @@ func setupXFSProjectQuotaOnMount(workspace string, entry mountInfoEntry, limit i
 func runXFSProjectCleanup(xq, mountPoint, workspace string, projID uint32, fsKey string) error {
 	var errs []string
 	for _, command := range xfsProjectCleanupCommands(workspace, projID) {
-		if err := xfsQuotaRun(xq, mountPoint, command); err != nil {
+		if err := runXFSQuotaCommand(xq, mountPoint, command); err != nil {
 			errs = append(errs, err.Error())
 		}
 	}

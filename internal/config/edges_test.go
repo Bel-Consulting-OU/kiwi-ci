@@ -263,6 +263,7 @@ func TestOverrideFromFlagsAllArms(t *testing.T) {
 		"component-registry-dir", "component-remote", "component-remote-token",
 		"repo-concurrency", "team-concurrency", "repo-queue-depth", "team-queue-depth",
 		"daily-cost-limit", "daily-energy-limit", "quota-fail-open",
+		"untrusted-cpu-ceiling", "untrusted-memory-ceiling", "untrusted-disk-ceiling", "untrusted-pids-ceiling",
 		"otel-endpoint", "rate-limit-per-second", "rate-limit-burst",
 	} {
 		fs.String(name, "", "")
@@ -287,6 +288,8 @@ func TestOverrideFromFlagsAllArms(t *testing.T) {
 		"-component-registry-dir", "/direg", "-component-remote", "https://reg", "-component-remote-token", "regtok",
 		"-repo-concurrency", "1", "-team-concurrency", "2", "-repo-queue-depth", "3", "-team-queue-depth", "4",
 		"-daily-cost-limit", "5", "-daily-energy-limit", "6", "-quota-fail-open", "true",
+		"-untrusted-cpu-ceiling", "7", "-untrusted-memory-ceiling", "8589934592",
+		"-untrusted-disk-ceiling", "17179869184", "-untrusted-pids-ceiling", "2048",
 		"-otel-endpoint", "otel:4318", "-rate-limit-per-second", "12.5", "-rate-limit-burst", "9",
 	}
 	if err := fs.Parse(args); err != nil {
@@ -336,6 +339,10 @@ func TestOverrideFromFlagsAllArms(t *testing.T) {
 	if q.RepoConcurrency != 1 || q.TeamConcurrency != 2 || q.RepoQueueDepth != 3 || q.TeamQueueDepth != 4 ||
 		q.DailyCostLimit != 5 || q.DailyEnergyLimit != 6 || !q.FailOpen {
 		t.Fatalf("quota = %+v", q)
+	}
+	if q.UntrustedCPUCeiling != 7 || q.UntrustedMemoryCeiling != 8<<30 ||
+		q.UntrustedDiskCeiling != 16<<30 || q.UntrustedPIDsCeiling != 2048 {
+		t.Fatalf("untrusted ceilings = %+v", q)
 	}
 	if cfg.RateLimit.PerSecond != 12.5 || cfg.RateLimit.Burst != 9 {
 		t.Fatalf("rate limit = %+v", cfg.RateLimit)

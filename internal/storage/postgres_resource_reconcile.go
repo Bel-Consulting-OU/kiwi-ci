@@ -27,15 +27,23 @@ package storage
 // request PLUS the aggregate service envelope persisted in the payload
 // (service_envelope_request.cpu/memory/pids), the same total the claim's
 // reserveResourcesTx writes, so a rolling upgrade cannot under-reserve a
-// running job with services. A legacy payload without the field contributes
-// zero, which reproduces the pre-field reservation exactly (the documented
-// backward-compatible behavior); the pre-field ledger never charged an
-// envelope, so nothing regresses for those rows.
+// running job with services. Two legacy shapes are handled WITHOUT aborting
+// the pass: a payload whose request values are unrepresentable or negative
+// contributes zero per field (magnitude-safe guards, see resourceRequestSQL),
+// and a payload that declares services but predates the envelope field is
+// charged its own request a second time as a conservative envelope
+// (legacyServiceEnvelopeSQL) instead of a zero envelope that would let a
+// promoted leader oversubscribe the runner.
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
 // ResourceReconcileResult reports what one reconciliation pass observed and
@@ -159,35 +167,235 @@ func (s *PostgresStore) ReconcileResourceReservations(ctx context.Context) (Reso
 // zero. The job's OWN request and its aggregate service envelope
 // (service_envelope_request) are summed here, matching
 // LeaseClaim.RequestedResources / model.Job.ReservedResources exactly, so the
-// promoted leader's ledger equals what the claim would have written. The
-// legacy case — a payload persisted before the envelope field — contributes
-// zero envelope, which is precisely what the pre-field reservation charged.
-// The regex guards keep a corrupt payload (including a non-object
-// service_envelope_request) from aborting the pass with a cast error: a
-// corrupt value contributes zero, the only knowable answer, and the job is
-// terminally recovered by the expiry sweep rather than leased again.
-const resourceRequestSQL = `
-	       COALESCE(CASE WHEN (j.payload->>'cpu_request') ~ '^[0-9.eE+-]+$' THEN (j.payload->>'cpu_request')::double precision END, 0)
-	       + COALESCE(CASE WHEN (j.payload->'service_envelope_request'->>'cpu') ~ '^[0-9.eE+-]+$' THEN (j.payload->'service_envelope_request'->>'cpu')::double precision END, 0),
-	       COALESCE(CASE WHEN (j.payload->>'memory_request') ~ '^[0-9]+$' THEN (j.payload->>'memory_request')::bigint END, 0)
-	       + COALESCE(CASE WHEN (j.payload->'service_envelope_request'->>'memory') ~ '^[0-9]+$' THEN (j.payload->'service_envelope_request'->>'memory')::bigint END, 0),
-	       COALESCE(CASE WHEN (j.payload->>'disk_request') ~ '^[0-9]+$' THEN (j.payload->>'disk_request')::bigint END, 0)
-	       + COALESCE(CASE WHEN (j.payload->'service_envelope_request'->>'disk') ~ '^[0-9]+$' THEN (j.payload->'service_envelope_request'->>'disk')::bigint END, 0),
-	       COALESCE(CASE WHEN (j.payload->>'pids_request') ~ '^[0-9]+$' THEN (j.payload->>'pids_request')::int END, 0)
-	       + COALESCE(CASE WHEN (j.payload->'service_envelope_request'->>'pids') ~ '^[0-9]+$' THEN (j.payload->'service_envelope_request'->>'pids')::int END, 0)`
+// promoted leader's ledger equals what the claim would have written.
+//
+// MAGNITUDE-SAFE, NON-NEGATIVE GUARDS (K6-A): the values are decoded from an
+// untrusted payload, and a cast of an out-of-range value RAISES inside the
+// reconcile transaction — the pass then aborts, the promotion gate never
+// arms, and every lease poll fleet-wide answers 503 until the offending
+// job's lease ends. Each read is therefore guarded in two nested steps:
+//
+//  1. `jsonb_typeof(...) = 'number'` rejects strings, booleans, objects,
+//     arrays and null outright (the old character-class regex accepted the
+//     TEXT of any scalar and then raised on the cast).
+//  2. the numeric value is bounded with an exact `numeric` comparison against
+//     the ledger column's domain (and, for the integer dimensions, must be a
+//     plain non-negative digit string, mirroring Go's int decoding): a
+//     negative value, `1e999` (1000 canonical digits), an over-long pid
+//     count or a fractional integer request falls through to the 0 default
+//     instead of raising. PostgreSQL stores jsonb numbers as `numeric`, so
+//     the comparison itself can never overflow.
+//
+// The four bounds are the ledger's own column domains — double precision for
+// cpu, BIGINT for memory/disk, INTEGER for pids — so a value that passes the
+// guard is always representable in the row the upsert writes.
+//
+// LEGACY SERVICE JOBS (K6-C): a job enqueued before the envelope field
+// declares services without `service_envelope_request`, so a promoted leader
+// would reconstruct a zero envelope and oversubscribe the runner. Such a
+// payload is charged CONSERVATIVELY: when the envelope KEY is absent and the
+// persisted compiled job declares at least one service its runtime would
+// start (legacyServiceEnvelopeSQL), the job's own request is charged a second
+// time as the envelope. That is an upper bound on the pre-envelope
+// under-charge (the executor's fair split allocates the services out of the
+// job's own resources), it is self-limiting — the rule stops applying as soon
+// as the legacy jobs end — and it keeps the promotion gate ARMED instead of
+// refusing to schedule until the last legacy job finishes. The key's ABSENCE
+// is a reliable legacy marker: encoding/json's omitempty does not drop a
+// struct, so every payload the current binary writes carries the key (as
+// `{}` at minimum) and is charged exactly its persisted envelope. A payload
+// that carries the key with a corrupt value still contributes zero (the
+// documented corrupt-value behavior).
+var resourceRequestSQL = buildResourceRequestSQL()
 
-// deleteStaleReservationsTx removes every reservation row that does not match
-// a running job's live lease identity (job id, runner, generation) and
+// resourceLedgerMaxInt64 / resourceLedgerMaxInt32 are the largest values the
+// reservation ledger's BIGINT (memory, disk) and INTEGER (pids) columns can
+// hold: a request beyond them is unrepresentable in the ledger, so it
+// contributes zero rather than aborting the pass.
+const (
+	resourceLedgerMaxInt64 = "9223372036854775807"
+	resourceLedgerMaxInt32 = "2147483647"
+	// resourceLedgerMaxFloat64 is the largest finite float64, the CPU
+	// column's domain: Go's json decode rejects anything above it, so the
+	// guard falls through to the same zero default.
+	resourceLedgerMaxFloat64 = "1.7976931348623157e308"
+)
+
+// guardedResourceFloatSQL renders one non-negative, magnitude-safe
+// double-precision read of a payload value. The nested CASE is deliberate:
+// the jsonb->numeric comparison only evaluates after jsonb_typeof proved the
+// value is a JSON number, and the numeric comparison only promotes to
+// double precision when the value is inside float64's domain, so no cast in
+// the expression can raise on any persisted payload.
+func guardedResourceFloatSQL(jsonExpr, _ string) string {
+	return fmt.Sprintf(`CASE WHEN jsonb_typeof(%[1]s) = 'number'
+				THEN CASE WHEN (%[1]s)::numeric BETWEEN 0 AND %[2]s
+					THEN (%[1]s)::double precision
+				END
+			END`, jsonExpr, resourceLedgerMaxFloat64)
+}
+
+// guardedResourceIntSQL renders one non-negative, magnitude-safe integer read
+// of a payload value into the ledger column domain [0, maxValue]. The text
+// form must be a plain digit string (no sign, fraction or exponent), exactly
+// the literal shape Go's json decoding accepts for an integer field; a
+// jsonb-stored number always renders in plain decimal form, so this rejects
+// only values the Go formula would have rejected (or that the ledger column
+// cannot hold).
+func guardedResourceIntSQL(maxValue, cast string) func(jsonExpr, textExpr string) string {
+	return func(jsonExpr, textExpr string) string {
+		return fmt.Sprintf(`CASE WHEN jsonb_typeof(%[1]s) = 'number' AND (%[2]s) ~ '^[0-9]+$'
+				THEN CASE WHEN (%[1]s)::numeric BETWEEN 0 AND %[3]s
+					THEN (%[2]s)::%[4]s
+				END
+			END`, jsonExpr, textExpr, maxValue, cast)
+	}
+}
+
+// compiledServiceServicesRef is the persisted reference to the compiled
+// job's declared services: model.Job.CompiledJobPayload.EffectiveJob is the
+// canonical pipeline.CompiledJob JSON (see internal/server/enqueue.go), whose
+// Job.Services array is the declaration a pre-envelope payload carries.
+const compiledServiceServicesRef = `j.payload #> '{compiled_job_payload,effective_job,job,services}'`
+
+// compiledServiceRuntimeRef is the persisted reference to the compiled job's
+// runtime, the same field executor.RuntimeRunsServices gates service
+// execution on (only "container" runs services).
+const compiledServiceRuntimeRef = `j.payload #>> '{compiled_job_payload,effective_job,job,runtime}'`
+
+// legacyServiceEnvelopeSQL is TRUE exactly when the payload declares at least
+// one service container that its runtime would actually start (container),
+// but carries no service_envelope_request field — i.e. the payload was
+// enqueued before the envelope field existed (or its computed envelope was
+// entirely zero, which models as the same absent key). The CASE keeps
+// jsonb_array_length from ever seeing a non-array value; the runtime arm
+// mirrors the enqueue-time gate so a native/tart job, whose declared services
+// are never started, is never over-charged.
+var legacyServiceEnvelopeSQL = fmt.Sprintf(`(NOT (j.payload ? 'service_envelope_request')
+			AND %[2]s = 'container'
+			AND CASE WHEN jsonb_typeof(%[1]s) = 'array'
+				THEN jsonb_array_length(%[1]s) > 0
+				ELSE FALSE
+			END)`, compiledServiceServicesRef, compiledServiceRuntimeRef)
+
+// envelopeContributionSQL renders one dimension's service-envelope charge:
+// the persisted envelope when the key is present (a corrupt value contributes
+// zero), the conservatively re-charged own request for a legacy
+// services-without-envelope payload, and zero otherwise.
+func envelopeContributionSQL(envelopeSQL, ownSQL string) string {
+	return fmt.Sprintf(`CASE WHEN j.payload ? 'service_envelope_request' THEN COALESCE(%[1]s, 0)
+				WHEN %[3]s THEN COALESCE(%[2]s, 0)
+				ELSE 0
+			END`, envelopeSQL, ownSQL, legacyServiceEnvelopeSQL)
+}
+
+// jobRunsDeclaredServices reports whether the persisted compiled job declares
+// at least one service its runtime would actually start (container), the
+// mem-mode form of the services and runtime arms of
+// legacyServiceEnvelopeSQL. The effective compiled job is decoded from the
+// same shapes JobRuntime accepts (raw JSON, bytes, a JSON string, or an
+// in-process struct), so a value kept in memory and a JSON-round-tripped one
+// answer identically.
+func jobRunsDeclaredServices(j model.Job) bool {
+	if j.CompiledJobPayload == nil || j.CompiledJobPayload.EffectiveJob == nil {
+		return false
+	}
+	var raw []byte
+	switch v := j.CompiledJobPayload.EffectiveJob.(type) {
+	case json.RawMessage:
+		raw = v
+	case []byte:
+		raw = v
+	case string:
+		raw = []byte(v)
+	default:
+		b, err := jsonMarshal(v)
+		if err != nil {
+			return false
+		}
+		raw = b
+	}
+	var cj struct {
+		Job struct {
+			Runtime  string     `json:"runtime"`
+			Services []struct{} `json:"services"`
+		} `json:"job"`
+	}
+	if err := json.Unmarshal(raw, &cj); err != nil {
+		return false
+	}
+	return cj.Job.Runtime == "container" && len(cj.Job.Services) > 0
+}
+
+// legacyServiceEnvelopeCharge returns the job's OWN request as the
+// conservatively re-charged envelope when the payload is the legacy shape the
+// SQL policy defines (services declared, runtime container, envelope absent),
+// and ok=false otherwise. The mem store has no key-presence bit after
+// decoding the payload into model.Job, so the zero envelope struct is its
+// only representation of "absent": a mem job whose computed envelope is
+// entirely zero — only the oversubscribed-plan case, where the executor fails
+// the job closed before starting any service — is therefore over-charged by
+// the same rule, which is conservative (never more work admitted than the
+// claim's own-request charge) and bounded. Negative dimensions are clamped to
+// zero so the answer matches the SQL guards.
+func legacyServiceEnvelopeCharge(j model.Job) (model.ResourceCapacity, bool) {
+	if j.ServiceEnvelopeRequest != (model.ResourceCapacity{}) {
+		return model.ResourceCapacity{}, false
+	}
+	if !jobRunsDeclaredServices(j) {
+		return model.ResourceCapacity{}, false
+	}
+	return nonNegativeCapacity(j.ResourceRequest()), true
+}
+
+// nonNegativeCapacity clamps every negative dimension to zero: the SQL
+// reservation guards refuse a negative payload value (charging it would
+// INFLATE the runner's remaining capacity), so the mem reconciliation clamps
+// to the same answer instead of mirroring the negative value.
+func nonNegativeCapacity(c model.ResourceCapacity) model.ResourceCapacity {
+	if c.CPU < 0 {
+		c.CPU = 0
+	}
+	if c.Memory < 0 {
+		c.Memory = 0
+	}
+	if c.Disk < 0 {
+		c.Disk = 0
+	}
+	if c.PIDs < 0 {
+		c.PIDs = 0
+	}
+	return c
+}
+
+// buildResourceRequestSQL assembles the four ledger dimensions in the
+// column order of job_resource_reservations (cpu, memory, disk, pids).
+func buildResourceRequestSQL() string {
+	own := func(jsonPath string, guard func(jsonExpr, textExpr string) string) string {
+		return guard("j.payload->'"+jsonPath+"'", "j.payload->>'"+jsonPath+"'")
+	}
+	envelope := func(key string, guard func(jsonExpr, textExpr string) string) string {
+		return guard("j.payload->'service_envelope_request'->'"+key+"'", "j.payload->'service_envelope_request'->>'"+key+"'")
+	}
+	dimension := func(jsonPath, envelopeKey string, guard func(jsonExpr, textExpr string) string) string {
+		ownSQL := own(jsonPath, guard)
+		return "COALESCE(" + ownSQL + `, 0)
+	       + ` + envelopeContributionSQL(envelope(envelopeKey, guard), ownSQL)
+	}
+	return strings.Join([]string{
+		dimension("cpu_request", "cpu", guardedResourceFloatSQL),
+		dimension("memory_request", "memory", guardedResourceIntSQL(resourceLedgerMaxInt64, "bigint")),
+		dimension("disk_request", "disk", guardedResourceIntSQL(resourceLedgerMaxInt64, "bigint")),
+		dimension("pids_request", "pids", guardedResourceIntSQL(resourceLedgerMaxInt32, "int")),
+	}, ",\n\t       ")
+}
+
+// deleteStaleReservationsTx removes every ledger row that no longer describes
+// a live lease (job id, runner, generation) — the exact negation of
+// liveReservationExistsSQL, the predicate the capacity SUM counts by — and
 // returns the number of rows deleted.
 func deleteStaleReservationsTx(ctx context.Context, tx pgx.Tx) (int, error) {
-	ct, err := tx.Exec(ctx, `DELETE FROM job_resource_reservations AS r
-		WHERE NOT EXISTS (
-			SELECT 1 FROM jobs j
-			WHERE j.id = r.job_id
-			  AND j.status = 'running'
-			  AND COALESCE(j.lease_runner_id, '') <> ''
-			  AND j.lease_generation = r.generation
-		)`)
+	ct, err := tx.Exec(ctx, `DELETE FROM job_resource_reservations AS r WHERE NOT `+liveReservationExistsSQL)
 	if err != nil {
 		return 0, err
 	}

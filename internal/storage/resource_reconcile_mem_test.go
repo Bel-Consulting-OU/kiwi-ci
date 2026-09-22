@@ -48,8 +48,15 @@ func TestMemReconcileResourceReservationsRebuildsLedger(t *testing.T) {
 	m.jobs["mem-old"] = old
 	m.reservations["mem-terminal"] = ResourceReservation{JobID: "mem-terminal", RunnerID: "abcdef0123456789abcdef0123456789", Generation: 1, Memory: 5 << 30}
 	m.reservations["mem-new"] = ResourceReservation{JobID: "mem-new", RunnerID: "abcdef0123456789abcdef0123456789", Generation: 2, Memory: 1 << 30}
-	if got, _ := m.RunnerReservedResources(ctx, "abcdef0123456789abcdef0123456789"); got.Memory != 6<<30 {
-		t.Fatalf("precondition reserved = %d, want the two stale rows only (6 GiB)", got.Memory)
+	// The two orphan rows (a terminal job and a stale generation) are
+	// PHYSICALLY present but charge nothing: the capacity fold counts only
+	// rows that still describe a live lease, exactly like the SQL SUM
+	// (K6-B self-healing read).
+	if got, _ := m.RunnerReservedResources(ctx, "abcdef0123456789abcdef0123456789"); got != (model.ResourceCapacity{}) {
+		t.Fatalf("precondition reserved = %+v, want the orphan rows ignored", got)
+	}
+	if list, _ := m.ListResourceReservations(ctx, "abcdef0123456789abcdef0123456789"); len(list) != 2 {
+		t.Fatalf("precondition ledger rows = %d, want the 2 raw orphan rows (listing is raw)", len(list))
 	}
 
 	res, err := m.ReconcileResourceReservations(ctx)

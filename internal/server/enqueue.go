@@ -22,6 +22,31 @@ func jobResourceRequests(cj pipeline.CompiledJob) (cpu float64, memory, disk int
 	return r.CPU, int64(r.Memory), int64(r.Disk), r.PIDs
 }
 
+// admitUntrustedServiceQuota enforces the trust-dependent per-job
+// service-count ceiling at ADMISSION, before a run is signed, persisted or
+// scheduled: an untrusted spec whose job declares more than
+// pipeline.MaxUntrustedServicesPerJob services is rejected with an opaque
+// 400 instead of being admitted and failing mid-run in the executor. It is
+// the server-side caller of pipeline.ValidateServiceQuota and runs for
+// every enqueue (API submit, webhook, rerun, schedule firing and downstream
+// dispatch all enter through enqueueID), so no untrusted run can reach the
+// queue with an unenforceable service fan-out. Trusted specs are
+// unconstrained here (they keep the absolute 32-service limit enforced by
+// pipeline validation).
+func (s *Server) admitUntrustedServiceQuota(spec *pipeline.Spec, trusted bool) error {
+	if trusted {
+		return nil
+	}
+	if err := pipeline.ValidateServiceQuota(spec, true); err != nil {
+		return &admissionError{
+			Status: http.StatusBadRequest,
+			Reason: "untrusted_service_ceiling_exceeded",
+			Msg:    err.Error(),
+		}
+	}
+	return nil
+}
+
 // applyUntrustedResourceCeilings applies the server-side resource CEILINGS
 // to the compiled job of an UNTRUSTED run: an explicit request in any
 // dimension above the configured ceiling is REJECTED (never clamped — a
@@ -31,6 +56,13 @@ func jobResourceRequests(cj pipeline.CompiledJob) (cpu float64, memory, disk int
 // that never mention resources. The offending field, the requested value and
 // the ceiling travel in the returned admission error so the API can answer
 // an opaque 4xx naming the field and both values.
+//
+// It also enforces the compiled-job form of the untrusted service-count
+// ceiling (pipeline.ValidateServiceCount, the per-job form of
+// pipeline.ValidateServiceQuota) at the same admission choke point, so a
+// generated fragment — which is validated and admitted without passing
+// through enqueueID — can never smuggle more than
+// pipeline.MaxUntrustedServicesPerJob services into execution.
 //
 // Only fields the job's runtime backend can actually enforce are filled (see
 // pipeline.ResourceCapabilities), with one documented exception: the disk
@@ -45,6 +77,13 @@ func jobResourceRequests(cj pipeline.CompiledJob) (cpu float64, memory, disk int
 func (s *Server) applyUntrustedResourceCeilings(cj pipeline.CompiledJob, trusted bool) (pipeline.CompiledJob, error) {
 	if trusted {
 		return cj, nil
+	}
+	if err := pipeline.ValidateServiceCount(cj.BaseID, cj.Job.Services, true); err != nil {
+		return cj, &admissionError{
+			Status: http.StatusBadRequest,
+			Reason: "untrusted_service_ceiling_exceeded",
+			Msg:    err.Error(),
+		}
 	}
 	cpu, mem, _, pids := pipeline.ResourceCapabilities(cj.Job.Runtime)
 	if err := s.checkUntrustedCeiling("cpu", cj.Job.Resources.CPU, s.UntrustedCPUCeiling); err != nil {
@@ -148,10 +187,18 @@ func applyCompiledJobFields(j *model.Job, cj pipeline.CompiledJob, now time.Time
 // the planner fails when a service's fair share rounds to zero — also gets
 // the zero value: the executor fails that job closed before starting any
 // container, so no service consumes host resources and reserving a partial
-// sum would misstate the job. The envelope is stamped for trusted and
-// untrusted jobs alike.
+// sum would misstate the job.
+//
+// The envelope is charged for the CONTAINER runtime only
+// (executor.RuntimeRunsServices, the same predicate the executor's service
+// start path gates on): a native or tart job's declared services are never
+// started, so charging their aggregate would reserve capacity no container
+// ever allocates — on a runner whose capacity the aggregate alone exceeds,
+// such a job would wait forever for room that cannot exist. The zero value is
+// then exactly the job's own request, matching execution. The envelope is
+// stamped for trusted and untrusted container jobs alike.
 func serviceEnvelopeRequest(cj pipeline.CompiledJob) model.ResourceCapacity {
-	if len(cj.Job.Services) == 0 {
+	if !executor.RuntimeRunsServices(cj.Job.Runtime) || len(cj.Job.Services) == 0 {
 		return model.ResourceCapacity{}
 	}
 	req, err := executor.ServiceEnvelopeRequest(cj.Job.Resources, cj.Job.Services)

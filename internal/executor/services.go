@@ -225,6 +225,20 @@ func serviceAllocationPlan(jobResources pipeline.Resources, services []pipeline.
 	return out, nil
 }
 
+// RuntimeRunsServices reports whether the executor starts a compiled job's
+// declared service containers for the given runtime. Services are
+// container-only: the service network, the job-scoped cgroup parent and every
+// service container are created solely on the container path (runJob), so a
+// native or tart job's declared services never run. The control plane's
+// enqueue stamping calls this SAME predicate, so it never reserves the
+// aggregate service envelope (model.Job.ServiceEnvelopeRequest) for
+// containers that will not be started: an envelope charged for an inert
+// service set can make a job permanently un-leasable on a runner whose
+// capacity the aggregate alone exceeds.
+func RuntimeRunsServices(runtime string) bool {
+	return runtime == "container"
+}
+
 // ServiceEnvelopeRequest returns the aggregate service resources the
 // fair-split plan allocates for a job's declared services. When a job-scoped
 // parent cgroup can be established this aggregate is already inside the job's

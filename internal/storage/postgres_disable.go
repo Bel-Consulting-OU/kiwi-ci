@@ -3,9 +3,10 @@ package storage
 // Atomic runner disable for PostgresStore.
 //
 // The previous admin path composed UpsertRunner(disabled) + RevokeRunnerLeases
-// + RevokeCert + audit as independent operations and answered success even
-// when the durable certificate revocation was never recorded, so a disabled
-// runner's still-valid certificate could be replayed on another replica.
+// + a certificate revocation + audit as independent operations and answered
+// success even when the durable certificate revocation was never recorded, so
+// a disabled runner's still-valid certificate could be replayed on another
+// replica.
 // DisableRunnerAndRevokeCert commits all four effects in ONE transaction and
 // the handler fails closed when it cannot commit.
 

@@ -108,6 +108,33 @@ Native execution runs on the host in its own process group so
 cancellation terminates children. It is available only to trusted
 pipelines and should be restricted to dedicated runner machines.
 
+## Untrusted resource admission
+
+Untrusted work is bounded before it is ever queued. Admission applies
+server-side ceilings to every untrusted job: 2 CPU, 4 GiB memory, 10 GiB
+disk and 256 PIDs by default, plus at most 8 sidecar services per job.
+
+- A declared request above a ceiling is rejected with `400`
+  (`untrusted_resource_ceiling_exceeded`; services:
+  `untrusted_service_ceiling_exceeded`) before the run is signed, persisted
+  or scheduled — it is never clamped to a smaller value, so admission and
+  execution always agree on what was requested.
+- A dimension the job leaves unset is filled with the ceiling, so the
+  executor always has a limit to apply.
+- Trusted jobs are unconstrained by the untrusted ceilings.
+- The service ceiling is re-checked by the executor immediately before any
+  service container starts, so a path that bypassed admission cannot fan
+  out sidecars.
+
+The ceilings are operator configuration (`[quota] untrusted_*_ceiling` in
+`kiwi.toml`, `--untrusted-*-ceiling` flags, `KIWI_QUOTA_UNTRUSTED_*`
+environment variables); memory and disk are plain byte counts and `0`
+disables a dimension. See
+[pipeline-reference.md](pipeline-reference.md#untrusted-ceilings) for the
+exact semantics and defaults. Keep the defaults unless a workload genuinely
+needs more: every raise widens what an untrusted job can consume on the
+runner host.
+
 ## Logs and secrets
 
 - Log lines are masked at the source with compiled multi-form patterns

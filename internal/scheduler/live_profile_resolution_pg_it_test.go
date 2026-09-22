@@ -4,10 +4,9 @@ package scheduler
 // resolution: the candidate pre-filter (effectiveRunner) and the claim
 // transaction resolve the runner-ID binding (runner_profile_links) through
 // the same shared precedence as the certificate-serial binding, so a profile
-// edit takes effect on the NEXT Lease without re-registration, a dangling
-// runner-ID binding falls back to the registration snapshot, and a dangling
-// certificate binding fails closed. Gated on KIWI_TEST_POSTGRES_URL via the
-// shared pgITSched* helpers.
+// edit takes effect on the NEXT Lease without re-registration, and a
+// dangling binding of either source fails closed. Gated on
+// KIWI_TEST_POSTGRES_URL via the shared pgITSched* helpers.
 
 import (
 	"context"
@@ -66,9 +65,9 @@ func TestIntegrationLeaseRunnerIDProfilePrefilterPostgres(t *testing.T) {
 		t.Fatalf("frozen cost rate = %v, want 4.5 from the edited live profile", leased.CostRate)
 	}
 
-	// Dangling runner-ID binding: no profile applies, so the registration
-	// snapshot decides and the snapshot-label job leases (never the deleted
-	// profile, never more than the snapshot).
+	// Dangling runner-ID binding: the prefilter presents the runner as
+	// zero-capacity and the claim fails closed, never falling back to the
+	// registration snapshot.
 	if err := st.UnlinkRunnerProfile(ctx, runnerID); err != nil {
 		t.Fatalf("unlink: %v", err)
 	}
@@ -81,8 +80,8 @@ func TestIntegrationLeaseRunnerIDProfilePrefilterPostgres(t *testing.T) {
 	if err := sched.Enqueue(ctx, model.Run{ID: snapRun, Repo: pgITSchedRepo, Status: model.StatusQueued, CreatedAt: time.Now().UTC()}, map[string]model.Job{snapJob: snapshot}, nil, false); err != nil {
 		t.Fatalf("enqueue snapshot job: %v", err)
 	}
-	if _, _, _, err := sched.Lease(ctx, runnerID, time.Now().UTC()); err != nil {
-		t.Fatalf("dangling runner-ID binding lease = %v, want the registration snapshot", err)
+	if _, _, _, err := sched.Lease(ctx, runnerID, time.Now().UTC()); !errors.Is(err, ErrNoJobs) {
+		t.Fatalf("dangling runner-ID binding lease = %v, want ErrNoJobs (fail closed)", err)
 	}
 
 	// Dangling certificate binding: the explicit binding wins and fails the

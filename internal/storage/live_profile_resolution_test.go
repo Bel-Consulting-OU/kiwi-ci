@@ -6,8 +6,10 @@ package storage
 // registration snapshot when neither applies. These tests pin that a
 // per-runner bearer identity's profile EDITS take effect on the NEXT lease
 // without re-registration, that the certificate binding wins, and the
-// documented dangling-binding policy (cert dangling fails closed; runner-ID
-// dangling resolves as "no profile" — the snapshot, never more).
+// documented dangling-binding policy (a dangling binding fails closed for
+// BOTH sources: the binding governs and its profile is gone), plus the
+// unlink revocation (the store clears the profile-derived snapshot fields in
+// the same operation as the binding removal).
 
 import (
 	"context"
@@ -185,7 +187,10 @@ func TestMemLeaseDanglingCertBindingDeniesEvenWithRunnerIDBinding(t *testing.T) 
 }
 
 // TestMemLeaseUnbindFallsBackToSnapshot: unlinking removes the live
-// overlay; the next lease uses the registration snapshot again.
+// overlay; for an UNMARKED runner row (self-reported dev-mode attributes,
+// which an unlink must not touch) the next lease uses the registration
+// snapshot again. A MARKED row is revoked instead; see
+// TestMemLeaseUnlinkRevokesProfileSnapshot.
 func TestMemLeaseUnbindFallsBackToSnapshot(t *testing.T) {
 	m := newMemStore()
 	ctx := context.Background()
@@ -221,14 +226,15 @@ func TestMemLeaseUnbindFallsBackToSnapshot(t *testing.T) {
 	}
 }
 
-// TestMemLeaseDanglingRunnerIDBindingUsesSnapshot: a runner-ID
-// binding whose profile row is gone resolves as "no profile": the
-// registration snapshot applies (never the deleted profile, never more than
-// the snapshot), and the claim is NOT failed closed.
-func TestMemLeaseDanglingRunnerIDBindingUsesSnapshot(t *testing.T) {
+// TestMemLeaseDanglingRunnerIDBindingDenies: a runner-ID binding whose
+// profile row is gone DENIES the lease (parity with the dangling
+// certificate-serial binding): the binding governs the runner, so a deleted
+// profile must not silently fall back to the registration snapshot (which may
+// itself hold attributes copied from that profile).
+func TestMemLeaseDanglingRunnerIDBindingDenies(t *testing.T) {
 	m := newMemStore()
 	ctx := context.Background()
-	runner := model.Runner{ID: "cccccccccccccccccccccccccccccc06", Capacity: 2, Labels: []string{"snapshot"}, CostPerHour: 7}
+	runner := model.Runner{ID: "cccccccccccccccccccccccccccccc06", Capacity: 2, Labels: []string{"snapshot"}, CostPerHour: 7, ProfileID: "ghost-p"}
 	if err := m.UpsertRunner(ctx, runner); err != nil {
 		t.Fatal(err)
 	}
@@ -237,18 +243,124 @@ func TestMemLeaseDanglingRunnerIDBindingUsesSnapshot(t *testing.T) {
 	}
 	job := liveProfileJob("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa18", "snap", []string{"snapshot"}, "")
 	liveProfileInsert(t, m, job)
-	leased, err := liveProfileClaim(m, job.ID, runner.ID)
+	if _, err := liveProfileClaim(m, job.ID, runner.ID); !errors.Is(err, ErrNoCapacity) {
+		t.Fatalf("dangling runner-ID binding = %v, want ErrNoCapacity (fail closed)", err)
+	}
+}
+
+// TestMemLeaseUnlinkRevokesProfileSnapshot: the store's UnlinkRunnerProfile
+// is revocation, not merely row deletion — it clears the profile-derived
+// registration attributes of the MARKED runner row in the same operation, so
+// the very next claim can neither take the removed profile's labels, nor its
+// capacity, nor its repository ACL through the snapshot fallback. A re-bind
+// restores the profile (live overlay), and the mTLS/certificate path is
+// unaffected.
+func TestMemLeaseUnlinkRevokesProfileSnapshot(t *testing.T) {
+	m := newMemStore()
+	ctx := context.Background()
+	runner := model.Runner{
+		ID: "cccccccccccccccccccccccccccccc07",
+		// The registration snapshot as a bound registration would store it:
+		// every scheduling attribute below was copied from the profile, and
+		// the marker records that provenance.
+		ProfileID: "revoke-p", Capacity: 4, Labels: []string{"bound"},
+		AllowedRepositories: []string{liveProfileRepoA},
+		Capabilities:        []string{"container"},
+		ResourceCapacity:    model.ResourceCapacity{Memory: 8 << 30},
+		CostPerHour:         2.5, PowerWatts: 60,
+	}
+	if err := m.UpsertRunner(ctx, runner); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.UpsertProfile(ctx, model.RunnerProfile{
+		ID: "revoke-p", Labels: []string{"bound"}, Repositories: []string{liveProfileRepoA},
+		Capabilities: []string{"container"}, MaxCapacity: 4, MaxMemory: 8 << 30, CostPerHour: 2.5, PowerWatts: 60,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.LinkRunnerProfile(ctx, runner.ID, "revoke-p"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bound: the snapshot already admits the profile's grants.
+	first := liveProfileJob("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa21", "first", []string{"bound"}, liveProfileRepoA)
+	liveProfileInsert(t, m, first)
+	if _, err := liveProfileClaim(m, first.ID, runner.ID); err != nil {
+		t.Fatalf("bound lease = %v", err)
+	}
+
+	if err := m.UnlinkRunnerProfile(ctx, runner.ID); err != nil {
+		t.Fatal(err)
+	}
+	// The revocation cleared the marked snapshot row in the store itself.
+	got, err := m.GetRunner(ctx, runner.ID)
 	if err != nil {
-		t.Fatalf("dangling runner-ID binding = %v, want the registration snapshot", err)
+		t.Fatal(err)
 	}
-	if leased.CostRate != 7 {
-		t.Fatalf("frozen rate = %v, want the snapshot rate 7", leased.CostRate)
+	if got.ProfileID != "" || got.Capacity != 0 || len(got.Labels) != 0 || len(got.AllowedRepositories) != 0 ||
+		len(got.Capabilities) != 0 || got.ResourceCapacity != (model.ResourceCapacity{}) || got.CostPerHour != 0 || got.PowerWatts != 0 {
+		t.Fatalf("snapshot after unlink = %+v, want the profile-derived fields cleared", got)
 	}
-	// The deleted profile's own label grants nothing.
-	ghost := liveProfileJob("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa19", "ghost", []string{"ghost"}, "")
-	liveProfileInsert(t, m, ghost)
-	if _, err := liveProfileClaim(m, ghost.ID, runner.ID); !errors.Is(err, ErrNoCapacity) {
-		t.Fatalf("deleted profile label = %v, want ErrNoCapacity", err)
+	// No lease under the removed grants: the label no longer matches, and
+	// even a label-free job cannot be admitted by the revoked capacity.
+	bound := liveProfileJob("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa22", "bound", []string{"bound"}, "")
+	liveProfileInsert(t, m, bound)
+	if _, err := liveProfileClaim(m, bound.ID, runner.ID); !errors.Is(err, ErrNoCapacity) {
+		t.Fatalf("post-unlink bound label = %v, want ErrNoCapacity", err)
+	}
+	plain := liveProfileJob("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa23", "plain", nil, "")
+	liveProfileInsert(t, m, plain)
+	if _, err := liveProfileClaim(m, plain.ID, runner.ID); !errors.Is(err, ErrNoCapacity) {
+		t.Fatalf("post-unlink revoked capacity = %v, want ErrNoCapacity", err)
+	}
+	// The repository ACL is gone too: even if capacity were restored by a
+	// re-registration, the removed profile's ACL cannot survive the unlink.
+	if got.AllowedRepositories != nil {
+		t.Fatalf("removed profile's repository ACL survived unlink: %v", got.AllowedRepositories)
+	}
+
+	// Re-bind restores the profile: the live overlay applies again.
+	if err := m.LinkRunnerProfile(ctx, runner.ID, "revoke-p"); err != nil {
+		t.Fatal(err)
+	}
+	rebound := liveProfileJob("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa24", "rebound", []string{"bound"}, liveProfileRepoA)
+	liveProfileInsert(t, m, rebound)
+	if _, err := liveProfileClaim(m, rebound.ID, runner.ID); err != nil {
+		t.Fatalf("re-bound lease = %v, want the re-bound live profile", err)
+	}
+}
+
+// TestMemLeaseUnlinkKeepsRunnerDeclaredSnapshot: an UNMARKED runner row
+// carries the runner's own self-reported attributes (legacy dev mode), so an
+// unlink must not touch it — the documented revocation rule clears
+// profile-derived grants only.
+func TestMemLeaseUnlinkKeepsRunnerDeclaredSnapshot(t *testing.T) {
+	m := newMemStore()
+	ctx := context.Background()
+	runner := model.Runner{ID: "cccccccccccccccccccccccccccccc08", Capacity: 4, Labels: []string{"snapshot"}}
+	if err := m.UpsertRunner(ctx, runner); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.UpsertProfile(ctx, model.RunnerProfile{ID: "live-p", Labels: []string{"bound"}, MaxCapacity: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.LinkRunnerProfile(ctx, runner.ID, "live-p"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.UnlinkRunnerProfile(ctx, runner.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.GetRunner(ctx, runner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ProfileID != "" || got.Capacity != 4 || len(got.Labels) != 1 || got.Labels[0] != "snapshot" {
+		t.Fatalf("unmarked snapshot after unlink = %+v, want the runner's own attributes", got)
+	}
+	snap := liveProfileJob("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa25", "snap", []string{"snapshot"}, "")
+	liveProfileInsert(t, m, snap)
+	if _, err := liveProfileClaim(m, snap.ID, runner.ID); err != nil {
+		t.Fatalf("post-unlink snapshot lease = %v, want the runner's own snapshot", err)
 	}
 }
 
@@ -296,10 +408,11 @@ func TestResolveLiveProfileBindingPrecedence(t *testing.T) {
 	if err != nil || !res.DeniesLease() || res.Source != ProfileBindingCertSerial || res.Applies() {
 		t.Fatalf("dangling cert = (%+v, %v)", res, err)
 	}
-	// A dangling runner-ID binding resolves as "no profile" (snapshot), not
-	// fail closed.
+	// A dangling runner-ID binding also resolves as linked+missing and
+	// DENIES the lease: the binding governs, so the snapshot is not a
+	// fallback (parity with the dangling certificate binding).
 	res, err = ResolveLiveProfileBinding("", unreachable, runnerState(model.RunnerProfile{}, true, false))
-	if err != nil || res.DeniesLease() || res.Applies() || res.Source != ProfileBindingRunnerID {
+	if err != nil || !res.DeniesLease() || res.Applies() || res.Source != ProfileBindingRunnerID {
 		t.Fatalf("dangling runner-ID = (%+v, %v)", res, err)
 	}
 	// Lookup errors propagate.
@@ -347,10 +460,11 @@ func TestMemStoreResolveLiveRunnerProfileParity(t *testing.T) {
 	if err != nil || !res.DeniesLease() {
 		t.Fatalf("dangling cert resolution = (%+v, %v)", res, err)
 	}
-	// Dangling runner-ID binding: no overlay, no deny.
+	// Dangling runner-ID binding: linked but missing, so the lease denies
+	// (parity with the dangling certificate binding).
 	m.runnerProfiles["runner-2"] = "99999999999999999999999999999999"
 	res, err = m.ResolveLiveRunnerProfile(ctx, "runner-2", "")
-	if err != nil || res.DeniesLease() || res.Applies() || res.Source != ProfileBindingRunnerID {
+	if err != nil || !res.DeniesLease() || res.Applies() || res.Source != ProfileBindingRunnerID {
 		t.Fatalf("dangling runner-ID resolution = (%+v, %v)", res, err)
 	}
 	// Unbound runner: no binding.

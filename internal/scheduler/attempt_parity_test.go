@@ -49,9 +49,10 @@ func releaseAttemptParityRunnerSlot(st *atomicFakeStore) {
 }
 
 // TestRecoveryAttemptParityLeaseExpiryAndRunnerDisable: lease-expiry recovery
-// (RecoverExpired) and runner-disable recovery (CancelJobsByRunner) apply the
-// SAME requeue/exhaustion decision to identical jobs and consume the SAME
-// attempts count. Attempts are charged by the lease only: a recovery pass
+// (RecoverExpired) and runner-disable recovery
+// (RecoveryStore.RevokeRunnerLeases, the kill switch the disable path calls)
+// apply the SAME requeue/exhaustion decision to identical jobs and consume
+// the SAME attempts count. Attempts are charged by the lease only: a recovery pass
 // never increments them a second time, so N leases/executions means exactly
 // N attempts on both paths.
 func TestRecoveryAttemptParityLeaseExpiryAndRunnerDisable(t *testing.T) {
@@ -64,8 +65,8 @@ func TestRecoveryAttemptParityLeaseExpiryAndRunnerDisable(t *testing.T) {
 		if err := expiredSched.RecoverExpired(ctx, time.Now().UTC()); err != nil {
 			t.Fatalf("RecoverExpired: %v", err)
 		}
-		if _, err := disableSched.CancelJobsByRunner(ctx, "runner", "runner disabled"); err != nil {
-			t.Fatalf("CancelJobsByRunner: %v", err)
+		if _, err := revokeRunnerLeases(ctx, disableStore, "runner", "runner disabled"); err != nil {
+			t.Fatalf("RevokeRunnerLeases: %v", err)
 		}
 
 		expiredJob, _ := expiredStore.job("job")
@@ -104,13 +105,13 @@ func TestRecoveryAttemptParityLeaseExpiryAndRunnerDisable(t *testing.T) {
 
 	t.Run("budget exhausted", func(t *testing.T) {
 		expiredStore, expiredSched := leasedParityJob(t, 0)
-		disableStore, disableSched := leasedParityJob(t, 0)
+		disableStore, _ := leasedParityJob(t, 0)
 
 		if err := expiredSched.RecoverExpired(ctx, time.Now().UTC()); err != nil {
 			t.Fatalf("RecoverExpired: %v", err)
 		}
-		if _, err := disableSched.CancelJobsByRunner(ctx, "runner", "runner disabled"); err != nil {
-			t.Fatalf("CancelJobsByRunner: %v", err)
+		if _, err := revokeRunnerLeases(ctx, disableStore, "runner", "runner disabled"); err != nil {
+			t.Fatalf("RevokeRunnerLeases: %v", err)
 		}
 
 		expiredJob, _ := expiredStore.job("job")

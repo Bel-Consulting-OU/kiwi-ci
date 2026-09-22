@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"sync/atomic"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/queue"
@@ -170,29 +171,78 @@ func jobScopedQueueReason(reason queue.ReasonCode) bool {
 // returns the views and whether the fleet listing succeeded: on a listing
 // failure only the polling runner is known, and the caller must not persist
 // fleet-scoped reasons from that partial view.
+//
+// BATCHED PASS (K4-A): the effective views come from ONE set-based binding
+// query and the reservation sums from ONE GROUP BY runner_id query, no matter
+// how many runners the fleet holds — previously each runner cost up to four
+// sequential link/profile round trips plus one SUM. The batched binding rows
+// are resolved through the SAME precedence the per-runner lease path uses
+// (storage.FleetRunnerBinding.Resolve -> ResolveLiveProfileBinding), and a
+// store without the batch contract (or a failed batch read) falls back to the
+// per-runner resolver, so the answer never depends on which path served it. A
+// runner the batch did not return (a registration that raced the listing) is
+// likewise resolved per-runner, so the views are complete for every listed
+// runner.
 func (s *Server) fleetQueueRunnerViewsDB(ctx context.Context, ri model.Runner) ([]queueRunnerView, bool) {
 	fleet := make([]queueRunnerView, 0, 8)
 	seen := map[string]bool{}
+	complete := true
+	var runners []model.Runner
+	if s.DB != nil {
+		listed, err := s.DB.ListRunners(ctx)
+		if err != nil {
+			// Degraded fleet view: keep the pass running for job-scoped
+			// reasons, but never claim fleet incompatibility from it.
+			s.logError("queue reasons: list runners", "error", err.Error())
+			complete = false
+		} else {
+			runners = listed
+		}
+	}
+	var effective map[string]model.Runner
+	if s.Sched != nil && len(runners) > 0 {
+		if batch, ok := s.Sched.EffectiveRunnerBatch(ctx, runners); ok {
+			effective = batch
+		}
+	}
+	reservedSums := map[string]model.ResourceCapacity{}
+	reservedBatched := false
+	if s.Sched != nil {
+		if sums, ok := s.Sched.ReservedResourcesBatch(ctx); ok {
+			reservedSums, reservedBatched = sums, true
+		}
+	}
 	add := func(r model.Runner) {
 		if r.ID == "" || seen[r.ID] {
 			return
 		}
 		seen[r.ID] = true
-		eff := r
-		if s.Sched != nil {
-			eff = s.Sched.EffectiveRunner(ctx, r)
+		eff, ok := effective[r.ID]
+		if !ok {
+			eff = r
+			if s.Sched != nil {
+				eff = s.Sched.EffectiveRunner(ctx, r)
+			}
 		}
 		// A disabled/draining runner cannot take new work, so it is not part
 		// of the fleet's compatibility answer. A zero-capacity runner (e.g. a
-		// profile that sets no max_capacity) still participates in the
-		// label/region/configured-capacity evaluation — its presence is what
-		// keeps a compatible job from being mislabelled NO_COMPATIBLE_RUNNER —
-		// but it contributes zero slots, so it never "fits right now".
+		// profile that sets no max_capacity, or a dangling binding that denies
+		// the lease) still participates in the label/region/configured-
+		// capacity evaluation — its presence is what keeps a compatible job
+		// from being mislabelled NO_COMPATIBLE_RUNNER — but it contributes
+		// zero slots, so it never "fits right now".
 		if eff.Disabled || eff.Draining {
 			return
 		}
 		var reserved model.ResourceCapacity
-		if s.Sched != nil {
+		switch {
+		case reservedBatched:
+			reserved = reservedSums[eff.ID]
+		case s.Sched != nil:
+			// The batched SUM failed (or the store has no batch contract):
+			// fall back to the per-runner read, exactly the pre-batch
+			// behavior, so a degraded batch is never treated as "no
+			// reservations".
 			reserved = s.Sched.ReservedResources(ctx, eff.ID)
 		}
 		fleet = append(fleet, queueRunnerView{
@@ -204,30 +254,30 @@ func (s *Server) fleetQueueRunnerViewsDB(ctx context.Context, ri model.Runner) (
 			reserved: reserved,
 		})
 	}
-	complete := true
-	if s.DB != nil {
-		runners, err := s.DB.ListRunners(ctx)
-		if err != nil {
-			// Degraded fleet view: keep the pass running for job-scoped
-			// reasons, but never claim fleet incompatibility from it.
-			s.logError("queue reasons: list runners", "error", err.Error())
-			complete = false
-		} else {
-			for _, r := range runners {
-				add(r)
-			}
-		}
+	for _, r := range runners {
+		add(r)
 	}
+	// The polling runner is always part of its own fleet evaluation, even if
+	// a concurrent registration changed the map under this pass.
 	add(ri)
 	return fleet, complete
 }
 
 // applyQueueReasonsMemoryLocked is the fs/memory-mode mirror of
 // applyQueueReasonsDB: the fleet is the in-memory runner map with each
-// runner's live profile applied, and each runner's reservations are derived
-// from the running jobs it holds (the memory ledger). The caller holds s.mu.
+// runner's live profile applied, and each runner's reservations come from
+// the per-poll ledger folded by runnerReservationSumsLocked. The caller holds
+// s.mu.
 func (s *Server) applyQueueReasonsMemoryLocked(ri model.Runner) {
-	fleet := s.fleetQueueRunnerViewsLocked(ri)
+	s.applyQueueReasonsMemoryLockedWithSums(ri, s.runnerReservationSumsLocked())
+}
+
+// applyQueueReasonsMemoryLockedWithSums is the shared explainer body: the
+// reservation ledger was already folded ONCE for this poll by the caller
+// (next() admission shares the same map), so this pass never re-scans the job
+// map for it. The caller holds s.mu.
+func (s *Server) applyQueueReasonsMemoryLockedWithSums(ri model.Runner, reserved map[string]model.ResourceCapacity) {
+	fleet := s.fleetQueueRunnerViewsLocked(ri, reserved)
 	for id, j := range s.jobs {
 		reason := queue.None
 		switch j.Status {
@@ -243,21 +293,72 @@ func (s *Server) applyQueueReasonsMemoryLocked(ri model.Runner) {
 	}
 }
 
-// fleetQueueRunnerViewsLocked builds the memory-mode fleet view. Reservations
-// are summed per runner in ONE pass over the job map: a reservation exists
-// exactly while the job is running, so this is the memory ledger the fs lease
-// path charges against (and every terminal path releases by construction).
-func (s *Server) fleetQueueRunnerViewsLocked(ri model.Runner) []queueRunnerView {
-	reserved := map[string]model.ResourceCapacity{}
-	for _, j := range s.jobs {
-		if j.Status != model.StatusRunning || j.LeaseRunnerID == "" {
+// memReservationSumVisits counts the job reservations the fs/dev per-poll
+// ledger folds, i.e. the entries of each runner's running-job index it reads.
+// It is a TEST-ONLY seam proving the poll's ledger work scales with the
+// RUNNING jobs the runner holds, never with the job HISTORY; production
+// behavior never reads it. The increments happen under s.mu, like the fold
+// itself; tests read it after the poll returned.
+var memReservationSumVisits atomic.Int64
+
+// runnerReservationSumsLocked folds the fs/dev reservation ledger ONCE per
+// poll for every runner, keyed by runner ID, in O(the running jobs the fleet
+// holds): each runner's running-job index (model.Runner.ActiveJobs — the same
+// index the slot gate and the DTO use, maintained by every lease/release/
+// rollback path and rebuilt from the live leases on load) names exactly the
+// jobs that hold a reservation, so neither this fold nor its consumers touch
+// the job history.
+//
+// The returned map is shared by next()'s admission gate and the queue-reason
+// explainer of the SAME poll (next calls this once and passes the map on), so
+// the two decisions always charge the same ledger. The caller holds s.mu, so
+// the fold and both consumers see one consistent snapshot: a concurrent
+// completion/cancel/expiry either ran before the fold (and its release is
+// included) or waits for the critical section to end (and the next poll folds
+// it) — never a torn ledger.
+//
+// Ledger identity: a job holds a reservation exactly while it is RUNNING on
+// the runner (the memory mirror of migration 0030's job_resource_reservations
+// row, released by every terminal path by construction), and the quantity is
+// the job's TOTAL reservation (its own request plus the aggregate service
+// envelope, model.Job.ReservedResources) — the same total the SQL ledger
+// stores. A stale index entry (a job no longer running on this runner) folds
+// nothing, because the fold reads the JOB's authoritative state, not the
+// index's.
+func (s *Server) runnerReservationSumsLocked() map[string]model.ResourceCapacity {
+	sums := make(map[string]model.ResourceCapacity, len(s.runners))
+	for _, r := range s.runners {
+		sum := s.runnerReservationSumLocked(r)
+		if sum != (model.ResourceCapacity{}) {
+			sums[r.ID] = sum
+		}
+	}
+	return sums
+}
+
+// runnerReservationSumLocked folds ONE runner's live reservation ledger from
+// its running-job index. Zero on every dimension when the runner holds no
+// running job.
+func (s *Server) runnerReservationSumLocked(r model.Runner) model.ResourceCapacity {
+	var out model.ResourceCapacity
+	for _, jobID := range r.ActiveJobs {
+		memReservationSumVisits.Add(1)
+		j, ok := s.jobs[jobID]
+		if !ok || j.Status != model.StatusRunning || j.LeaseRunnerID != r.ID {
 			continue
 		}
 		// The memory ledger charges the job's TOTAL reservation (own request
 		// plus aggregate service envelope), exactly like the SQL ledger the
 		// DB-mode fleet view reads, so both explainers agree.
-		reserved[j.LeaseRunnerID] = model.AddResourceCapacity(reserved[j.LeaseRunnerID], j.ReservedResources())
+		out = model.AddResourceCapacity(out, j.ReservedResources())
 	}
+	return out
+}
+
+// fleetQueueRunnerViewsLocked builds the memory-mode fleet view from the
+// per-poll reservation ledger the caller folded (see
+// runnerReservationSumsLocked); it never scans the job map itself.
+func (s *Server) fleetQueueRunnerViewsLocked(ri model.Runner, reserved map[string]model.ResourceCapacity) []queueRunnerView {
 	fleet := make([]queueRunnerView, 0, len(s.runners)+1)
 	seen := map[string]bool{}
 	add := func(r model.Runner) {

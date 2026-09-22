@@ -83,6 +83,73 @@ func TestPostgresIntegrationClusterKeySchemaAndValidation(t *testing.T) {
 	}
 }
 
+// TestIntegrationClusterKeySchemaConcurrentBootstrapPostgres (K2-B): the
+// cluster-key schema bootstrap is serialized by the same transaction-scoped
+// advisory lock the migration path takes, so two replicas starting
+// simultaneously against a fresh database both succeed. Before the fix both
+// ran CREATE TABLE IF NOT EXISTS outside that lock; the catalog existence
+// check could pass in every session and the losers aborted with SQLSTATE
+// 23505 (duplicate key value violates unique constraint
+// "pg_type_typname_nsp_index"), taking a startup down with a raw duplicate-key
+// error. The test opens its own fresh schema with NO migrations applied (the
+// table is deliberately outside the numbered migrations) and races eight
+// pools through the real bootstrap.
+func TestIntegrationClusterKeySchemaConcurrentBootstrapPostgres(t *testing.T) {
+	env := pgITSetup(t)
+	const replicas = 8
+	stores := make([]*PostgresStore, replicas)
+	for i := range stores {
+		stores[i] = env.open(t)
+	}
+	ctx := context.Background()
+	// Warm every pool so the DDL statements really race instead of racing
+	// TCP connects.
+	for i, st := range stores {
+		if _, err := st.pool.Exec(ctx, `SELECT 1`); err != nil {
+			t.Fatalf("warm pool %d: %v", i, err)
+		}
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, replicas)
+	var wg sync.WaitGroup
+	for _, st := range stores {
+		wg.Add(1)
+		go func(st *PostgresStore) {
+			defer wg.Done()
+			<-start
+			errs <- st.EnsureClusterKeySchema(ctx)
+		}(st)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent EnsureClusterKeySchema: %v", err)
+		}
+	}
+
+	// Exactly one table, usable through every replica, still idempotent.
+	var tables int
+	if err := stores[0].pool.QueryRow(ctx, `SELECT count(*) FROM pg_tables WHERE schemaname=current_schema() AND tablename='cluster_keys'`).Scan(&tables); err != nil {
+		t.Fatalf("count cluster_keys tables: %v", err)
+	}
+	if tables != 1 {
+		t.Fatalf("cluster_keys tables = %d, want 1", tables)
+	}
+	if err := stores[replicas-1].EnsureClusterKeySchema(ctx); err != nil {
+		t.Fatalf("post-race idempotent bootstrap: %v", err)
+	}
+	got, created, err := stores[1].CreateClusterKey(ctx, "oidc", []byte("ring"))
+	if err != nil || !created || string(got) != "ring" {
+		t.Fatalf("create after bootstrap = (%q, %v, %v)", got, created, err)
+	}
+	if v, found, err := stores[2].ClusterKeyVersion(ctx, "oidc"); err != nil || !found || v != 1 {
+		t.Fatalf("version after bootstrap = (%d, %v, %v), want 1", v, found, err)
+	}
+}
+
 // TestPostgresIntegrationClusterKeyCreateEveryCallerSeesOneMaterial is the
 // CAS proof: the first creator's bytes win for every later creator (returned
 // with created=false), absent kinds report not-found, versions advance only

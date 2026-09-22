@@ -112,6 +112,17 @@ Configuration can also come from a `kiwi.toml` file
 (`--config kiwi.toml`, checked with `kiwi config check`); precedence is
 CLI flags > `KIWI_*` environment variables > config file > defaults.
 
+Untrusted jobs are bounded at admission by server-side resource ceilings —
+2 CPU, 4 GiB memory, 10 GiB disk and 256 PIDs per job plus at most 8
+services — and a declaration above a ceiling is rejected before the run is
+signed or persisted (`untrusted_resource_ceiling_exceeded` /
+`untrusted_service_ceiling_exceeded`); trusted jobs are unconstrained. The
+ceilings are configurable under `[quota]` (`untrusted_cpu_ceiling`,
+`untrusted_memory_ceiling`, `untrusted_disk_ceiling`,
+`untrusted_pids_ceiling`), by flag, or by `KIWI_QUOTA_UNTRUSTED_*`
+environment variable; see
+[docs/pipeline-reference.md](docs/pipeline-reference.md#untrusted-ceilings).
+
 ## Runner
 
 ```bash

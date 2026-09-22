@@ -123,7 +123,20 @@ a plaintext request to a TLS listener fails.
 variables > config file > defaults. `kiwi config check --config
 kiwi.toml` validates a file. Sections: `server`, `database`,
 `runner_pki`, `blob`, `github`, `gitlab`, `forgejo`, `policy`,
-`observability`, `rate_limit`, `auth`.
+`observability`, `rate_limit`, `auth`, `quota`, `secret_broker`,
+`components`.
+
+The `quota` section also carries the untrusted resource ceilings
+(`untrusted_cpu_ceiling`, `untrusted_memory_ceiling`,
+`untrusted_disk_ceiling`, `untrusted_pids_ceiling`; memory/disk in bytes),
+which admission enforces before a run is signed or persisted. The defaults
+(2 CPU, 4 GiB, 10 GiB, 256 PIDs) are deliberately conservative production
+values: raise them per deployment only when untrusted jobs legitimately
+need more, because each raise widens the resources a fork pipeline can
+consume on a runner host — see
+[pipeline-reference.md](pipeline-reference.md#untrusted-ceilings). Raising
+them at runtime via the flags/environment variables does not require a
+config-file change.
 
 ## Blob storage
 

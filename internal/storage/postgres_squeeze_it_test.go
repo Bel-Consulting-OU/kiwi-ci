@@ -550,19 +550,21 @@ func TestPostgresIntegrationSimpleStatementFailures(t *testing.T) {
 			t.Fatal("ConsumeEnrollGrant over a boom trigger = nil error")
 		}
 	})
-	t.Run("RevokeCert", func(t *testing.T) {
+	t.Run("DisableRunnerAndRevokeCert", func(t *testing.T) {
 		st := pgITStore(t)
 		runnerID := pgITNewID(t)
 		pgITSeedRunner(t, st, runnerID, 1, 0, 0)
 		if err := st.BindCertProfile(context.Background(), "serial-1", pgITNewID(t)); err != nil {
 			t.Fatal(err)
 		}
-		if err := st.RevokeCert(context.Background(), "serial-1", runnerID, "reason"); err != nil {
+		// The healthy path records the revocation...
+		if _, err := st.DisableRunnerAndRevokeCert(context.Background(), runnerID, "serial-1", "admin"); err != nil {
 			t.Fatal(err)
 		}
+		// ...and a failing revocation insert fails the whole disable closed.
 		pgITBoom(t, st, "cert_revocations")
-		if err := st.RevokeCert(context.Background(), "serial-2", runnerID, "reason"); err == nil {
-			t.Fatal("RevokeCert over a boom trigger = nil error")
+		if _, err := st.DisableRunnerAndRevokeCert(context.Background(), runnerID, "serial-2", "admin"); err == nil {
+			t.Fatal("DisableRunnerAndRevokeCert over a boom trigger = nil error")
 		}
 	})
 	t.Run("AdjustQuotaCounter", func(t *testing.T) {
@@ -936,8 +938,8 @@ func TestPostgresIntegrationClosedPoolBeginSweep(t *testing.T) {
 	if _, err := st.ReserveDownstreamLaunch(ctx, jobID, "acme/child", "main", "tok"); err == nil {
 		t.Fatal("ReserveDownstreamLaunch on a closed pool = nil error")
 	}
-	if err := st.RevokeCert(ctx, "serial", runnerID, "reason"); err == nil {
-		t.Fatal("RevokeCert on a closed pool = nil error")
+	if _, err := st.DisableRunnerAndRevokeCert(ctx, runnerID, "serial", "admin"); err == nil {
+		t.Fatal("DisableRunnerAndRevokeCert on a closed pool = nil error")
 	}
 	if _, err := st.ConsumeEnrollGrant(ctx, "digest", "cb"); err == nil {
 		t.Fatal("ConsumeEnrollGrant on a closed pool = nil error")
@@ -1048,7 +1050,7 @@ func TestPostgresIntegrationMiscStatementBreaks(t *testing.T) {
 			t.Fatal("claimQuotaTx over a boom trigger = nil error")
 		}
 	})
-	t.Run("profileForSerialTx failure", func(t *testing.T) {
+	t.Run("liveProfileBindingTx failure", func(t *testing.T) {
 		st := pgITStore(t)
 		serial := "serial-x"
 		runnerID := pgITNewID(t)
@@ -1064,8 +1066,8 @@ func TestPostgresIntegrationMiscStatementBreaks(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer func() { _ = tx.Rollback(context.Background()) }()
-		if _, _, _, err := profileForSerialTx(context.Background(), tx, serial); err == nil {
-			t.Fatal("profileForSerialTx over a broken table = nil error")
+		if _, err := liveProfileBindingTx(context.Background(), tx, runnerID, serial); err == nil {
+			t.Fatal("liveProfileBindingTx over a broken table = nil error")
 		}
 	})
 	t.Run("HeartbeatLease failure", func(t *testing.T) {

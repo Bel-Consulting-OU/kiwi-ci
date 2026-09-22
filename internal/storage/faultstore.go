@@ -1347,6 +1347,10 @@ func (f *FaultyStore) ProfileForRunnerID(ctx context.Context, runnerID string) (
 	return inner.ProfileForRunnerID(ctx, runnerID)
 }
 
+// UnlinkRunnerProfile delegates the unlink to the wrapped store, which
+// performs the revocation (binding removal + marked-snapshot clearing) as one
+// operation; an injected failure returns before the inner call, so a
+// fault-injected unlink never partially revokes.
 func (f *FaultyStore) UnlinkRunnerProfile(ctx context.Context, runnerID string) error {
 	inner, ok := f.Inner.(RunnerProfileLinkStore)
 	if !ok {
@@ -1400,6 +1404,28 @@ func (f *FaultyStore) ListResourceReservations(ctx context.Context, runnerID str
 	return inner.ListResourceReservations(ctx, runnerID)
 }
 
+// FleetRunnerProfileBindings / RunnerReservationSums delegate the batched
+// fleet-view reads (K4-A) to the wrapped store, so the queue-reason
+// explainer's single set-based pass keeps working under fault injection
+// instead of silently degrading to the per-runner path. A missing inner
+// contract is a wiring error, not a simulated failure (read paths inject no
+// faults).
+func (f *FaultyStore) FleetRunnerProfileBindings(ctx context.Context) (map[string]FleetRunnerBinding, error) {
+	inner, ok := f.Inner.(FleetRunnerViewStore)
+	if !ok {
+		return nil, errMissingInnerInterface("FleetRunnerViewStore")
+	}
+	return inner.FleetRunnerProfileBindings(ctx)
+}
+
+func (f *FaultyStore) RunnerReservationSums(ctx context.Context) (map[string]model.ResourceCapacity, error) {
+	inner, ok := f.Inner.(FleetRunnerViewStore)
+	if !ok {
+		return nil, errMissingInnerInterface("FleetRunnerViewStore")
+	}
+	return inner.RunnerReservationSums(ctx)
+}
+
 // ReconcileResourceReservations delegates the leader-fenced promotion/repair
 // reconciliation to the wrapped store. The capability check runs first (a
 // missing contract is a wiring error, not a simulated failure), then the
@@ -1448,19 +1474,6 @@ func (f *FaultyStore) HasRunnerTokens(ctx context.Context) (bool, error) {
 		return false, errMissingInnerInterface("RunnerTokenStore")
 	}
 	return inner.HasRunnerTokens(ctx)
-}
-
-func (f *FaultyStore) RevokeCert(ctx context.Context, serial, runnerID, reason string) error {
-	inner, ok := f.Inner.(CertRevocationStore)
-	if !ok {
-		return errMissingInnerInterface("CertRevocationStore")
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if err := f.fail(); err != nil {
-		return err
-	}
-	return inner.RevokeCert(ctx, serial, runnerID, reason)
 }
 
 func (f *FaultyStore) CertRevoked(ctx context.Context, serial string) (bool, error) {
@@ -4306,9 +4319,9 @@ func (m *memStore) recomputeDependentsLocked(cancelled map[string]bool, now time
 // through the ONE shared precedence (caller holds m.mu): the explicit
 // certificate-serial binding wins when the runner presents a registered
 // serial, otherwise the runner-ID binding applies, otherwise the
-// registration snapshot. A dangling certificate binding denies the lease; a
-// dangling runner-ID binding resolves as "no profile" (the snapshot, never
-// more). See ResolveLiveProfileBinding for the documented policy.
+// registration snapshot. A dangling binding — certificate-serial OR
+// runner-ID — denies the lease (the binding governs, and its profile is
+// gone). See ResolveLiveProfileBinding for the documented policy.
 func (m *memStore) resolveProfileLocked(r model.Runner) (effective model.Runner, resolution LiveProfileResolution) {
 	certLookup := func() (model.RunnerProfile, bool, bool, error) {
 		profileID, ok := m.certProfiles[r.CertSerial]
@@ -4344,6 +4357,81 @@ func (m *memStore) resolveProfileLocked(r model.Runner) (effective model.Runner,
 	return r, res
 }
 
+// fleetBindingLocked builds one source's batched binding state from the
+// in-memory binding map (caller holds m.mu): linked reports the binding row,
+// found the profile row. It is the exact input resolveProfileLocked feeds to
+// the shared precedence.
+func (m *memStore) fleetBindingLocked(profileID string, linked bool) FleetProfileBinding {
+	if !linked {
+		return FleetProfileBinding{}
+	}
+	p, found := m.profiles[profileID]
+	return FleetProfileBinding{Linked: true, Found: found, Profile: p}
+}
+
+// FleetRunnerProfileBindings implements FleetRunnerViewStore on the
+// in-memory store: every registered runner's certificate-serial and
+// runner-ID binding state, in one pass under m.mu. The caller resolves the
+// result through FleetRunnerBinding.Resolve, the SAME precedence helper
+// resolveProfileLocked uses, so the batched and per-runner answers cannot
+// diverge.
+func (m *memStore) FleetRunnerProfileBindings(ctx context.Context) (map[string]FleetRunnerBinding, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]FleetRunnerBinding, len(m.runners))
+	for id, r := range m.runners {
+		certProfileID, certLinked := m.certProfiles[r.CertSerial]
+		runnerProfileID, runnerLinked := m.runnerProfiles[id]
+		out[id] = FleetRunnerBinding{
+			Cert:   m.fleetBindingLocked(certProfileID, certLinked),
+			Runner: m.fleetBindingLocked(runnerProfileID, runnerLinked),
+		}
+	}
+	return out, nil
+}
+
+// reservationSumsLocked folds the in-memory reservation ledger by runner in
+// one pass (caller holds m.mu). It is the mem-mode mirror of the SQL
+// GROUP BY runner_id read, and the one body both the batched and the
+// per-runner reads use, so they are equal by construction. Like the SQL fold
+// (liveReservationExistsSQL) it counts only rows that still describe a live
+// lease: a row whose job is not running, not leased, or at an older
+// generation is ignored by the admission reads until the reconcile sweep
+// removes it, so the mem and SQL capacity answers cannot diverge.
+func (m *memStore) reservationSumsLocked() map[string]model.ResourceCapacity {
+	out := map[string]model.ResourceCapacity{}
+	for jobID, r := range m.reservations {
+		if !m.liveReservationLocked(jobID, r) {
+			continue
+		}
+		out[r.RunnerID] = model.AddResourceCapacity(out[r.RunnerID], r.Capacity())
+	}
+	return out
+}
+
+// liveReservationLocked reports whether one ledger row still describes a live
+// lease (caller holds m.mu): the job exists, is running, is leased, and is at
+// the generation the row recorded. It is the in-memory form of
+// liveReservationExistsSQL, so the mem and SQL folds agree on every row.
+func (m *memStore) liveReservationLocked(jobID string, r ResourceReservation) bool {
+	j, ok := m.jobs[jobID]
+	return ok && j.Status == model.StatusRunning && j.LeaseRunnerID != "" && j.LeaseGeneration == r.Generation
+}
+
+// RunnerReservationSums implements FleetRunnerViewStore: the per-runner
+// reservation sums in ONE fold over the ledger.
+func (m *memStore) RunnerReservationSums(ctx context.Context) (map[string]model.ResourceCapacity, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.reservationSumsLocked(), nil
+}
+
 // claimQuotaLocked re-checks the conditional queued->running quota
 // transition for the repository/team keys (limit <= 0 means unlimited) and
 // reports a *QuotaExceededError when the running count is already at the
@@ -4369,19 +4457,11 @@ func (m *memStore) claimQuotaLocked(repoID string, repoLimit, teamLimit float64)
 }
 
 // reservedResourcesLocked sums the live reservations of one runner (caller
-// holds m.mu). No reservation means zero on every dimension.
+// holds m.mu). No reservation means zero on every dimension. It reads the
+// SAME grouped fold the batched RunnerReservationSums returns, so the
+// per-runner and batched answers are equal by construction.
 func (m *memStore) reservedResourcesLocked(runnerID string) model.ResourceCapacity {
-	var out model.ResourceCapacity
-	for _, r := range m.reservations {
-		if r.RunnerID != runnerID {
-			continue
-		}
-		out.CPU += r.CPU
-		out.Memory += r.Memory
-		out.Disk += r.Disk
-		out.PIDs += r.PIDs
-	}
-	return out
+	return m.reservationSumsLocked()[runnerID]
 }
 
 // reserveResourcesLocked is the in-memory mirror of reserveResourcesTx: the
@@ -4464,6 +4544,8 @@ func (m *memStore) ListResourceReservations(ctx context.Context, runnerID string
 
 var _ ResourceReservationStore = (*memStore)(nil)
 
+var _ FleetRunnerViewStore = (*memStore)(nil)
+
 // ReconcileResourceReservations implements ResourceReconcileStore for the
 // in-memory ledger (mem parity with the SQL promotion reconciliation): rows
 // without a matching live lease are dropped, and every running leased job's
@@ -4479,21 +4561,28 @@ func (m *memStore) ReconcileResourceReservations(ctx context.Context) (ResourceR
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	res := ResourceReconcileResult{}
-	// Phase 1: drop rows that do not describe a live running lease.
+	// Phase 1: drop rows that do not describe a live running lease (the exact
+	// negation of the fold predicate the capacity reads count by).
 	for jobID, r := range m.reservations {
-		j, ok := m.jobs[jobID]
-		if !ok || j.Status != model.StatusRunning || j.LeaseRunnerID == "" || j.LeaseGeneration != r.Generation {
+		if !m.liveReservationLocked(jobID, r) {
 			delete(m.reservations, jobID)
 			res.Deleted++
 		}
 	}
-	// Phase 2: rewrite one reservation per running leased job.
+	// Phase 2: rewrite one reservation per running leased job, charging the
+	// same total the SQL pass reconstructs — the job's own request plus the
+	// envelope policy (a persisted envelope, or the conservative own-request
+	// re-charge for a legacy services-without-envelope payload).
 	for jobID, j := range m.jobs {
 		if j.Status != model.StatusRunning || j.LeaseRunnerID == "" {
 			continue
 		}
 		res.Running++
-		req := j.ReservedResources()
+		// Negative dimensions are clamped exactly like the SQL guards.
+		req := nonNegativeCapacity(j.ReservedResources())
+		if extra, ok := legacyServiceEnvelopeCharge(j); ok {
+			req = model.AddResourceCapacity(req, extra)
+		}
 		want := ResourceReservation{
 			JobID: jobID, RunnerID: j.LeaseRunnerID, Generation: j.LeaseGeneration,
 			CPU: req.CPU, Memory: req.Memory, Disk: req.Disk, PIDs: req.PIDs,
@@ -4993,9 +5082,13 @@ func (m *memStore) ResolveLiveRunnerProfile(ctx context.Context, runnerID, seria
 	return resolution, nil
 }
 
-// UnlinkRunnerProfile drops one runner's binding; a missing binding is a
-// successful no-op like the SQL DELETE. An empty runner ID is rejected
-// exactly like the SQL store so the mem and PostgreSQL contracts agree.
+// UnlinkRunnerProfile drops one runner's binding AND revokes the
+// profile-derived registration attributes of the runner's marked snapshot, in
+// the same critical section as the SQL store's transaction (parity: a
+// missing binding is a successful no-op, an unmarked runner row is never
+// touched, an empty runner ID is rejected). See
+// RunnerProfileLinkStore.UnlinkRunnerProfile and
+// ClearProfileDerivedRunnerFields for the revocation rule.
 func (m *memStore) UnlinkRunnerProfile(ctx context.Context, runnerID string) error {
 	if runnerID == "" {
 		return fmt.Errorf("storage: runner id is required")
@@ -5003,6 +5096,11 @@ func (m *memStore) UnlinkRunnerProfile(ctx context.Context, runnerID string) err
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.runnerProfiles, runnerID)
+	if r, ok := m.runners[runnerID]; ok {
+		if cleared, changed := ClearProfileDerivedRunnerFields(r); changed {
+			m.runners[runnerID] = cleared
+		}
+	}
 	return nil
 }
 
@@ -5039,13 +5137,6 @@ func (m *memStore) HasRunnerTokens(ctx context.Context) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.runnerTokens) > 0, nil
-}
-
-func (m *memStore) RevokeCert(ctx context.Context, serial, runnerID, reason string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.revocations[serial] = runnerID
-	return nil
 }
 
 func (m *memStore) CertRevoked(ctx context.Context, serial string) (bool, error) {

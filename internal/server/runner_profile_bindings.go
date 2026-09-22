@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sort"
 	"strings"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
@@ -35,8 +34,9 @@ func (s *Server) profileForRunnerBinding(ctx context.Context, b runnerProfileBin
 // resolves the runner-ID binding through the same shared precedence as the
 // certificate-serial binding (storage.ResolveLiveProfileBinding), so a
 // profile edit takes effect on the next lease without re-registration; a
-// dangling binding resolves as "no profile" and the registration snapshot
-// applies (never more, never the deleted profile).
+// dangling binding — runner-ID included — DENIES the lease, exactly like a
+// dangling certificate binding, so a deleted profile can never keep applying
+// through the registration snapshot.
 func (s *Server) profileForRunnerID(ctx context.Context, runnerID string) (model.RunnerProfile, bool, error) {
 	if runnerID == "" {
 		return model.RunnerProfile{}, false, nil
@@ -108,9 +108,14 @@ func (s *Server) linkRunnerProfile(ctx context.Context, runnerID, profileID stri
 	return nil
 }
 
-// unlinkRunnerProfile removes a runner's binding (admin operation). It is
-// idempotent: an unbound runner is a successful no-op, so an admin can
-// always assert the unbound state.
+// unlinkRunnerProfile removes a runner's binding (admin operation) and
+// revokes the profile-derived registration-snapshot attributes it supplied,
+// in one locked step that is mirrored into the fs snapshot: after the call,
+// neither the binding nor s.runners carries the removed profile's grants.
+// It is idempotent: an unbound runner with no marked snapshot is a
+// successful no-op (and does not touch the snapshot), so an admin can always
+// assert the unbound state. The DB path delegates the same revocation to the
+// store's UnlinkRunnerProfile.
 func (s *Server) unlinkRunnerProfile(ctx context.Context, runnerID string) error {
 	if runnerID == "" {
 		return fmt.Errorf("runner id is required")
@@ -125,41 +130,31 @@ func (s *Server) unlinkRunnerProfile(ctx context.Context, runnerID string) error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	prev, had := s.runnerProfiles[runnerID]
-	if !had {
+	prevRunner, hadRunner := s.runners[runnerID]
+	clearedRunner, runnerChanged := prevRunner, false
+	if hadRunner {
+		clearedRunner, runnerChanged = storage.ClearProfileDerivedRunnerFields(prevRunner)
+	}
+	if !had && !runnerChanged {
 		return nil
 	}
 	delete(s.runnerProfiles, runnerID)
+	if runnerChanged {
+		s.runners[runnerID] = clearedRunner
+	}
 	if perr := s.persistCheckedErrLocked("runner_profile.unlink"); perr != nil {
-		s.runnerProfiles[runnerID] = prev
+		// Durability first: the binding AND the snapshot fields must roll
+		// back together, or memory would keep a revocation the snapshot
+		// does not contain.
+		if had {
+			s.runnerProfiles[runnerID] = prev
+		}
+		if runnerChanged {
+			s.runners[runnerID] = prevRunner
+		}
 		return notDurable(perr)
 	}
 	return nil
-}
-
-// runnerIDsForProfile lists the runner IDs bound to one profile (DB mode via
-// the store, memory mode from the fs-snapshot mirror, both ordered by runner
-// ID).
-func (s *Server) runnerIDsForProfile(ctx context.Context, profileID string) ([]string, error) {
-	if profileID == "" {
-		return []string{}, nil
-	}
-	if s.DB != nil {
-		ls, ok := s.DB.(storage.RunnerProfileLinkStore)
-		if !ok {
-			return []string{}, nil
-		}
-		return ls.RunnerIDsForProfile(ctx, profileID)
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := []string{}
-	for id, pid := range s.runnerProfiles {
-		if pid == profileID {
-			out = append(out, id)
-		}
-	}
-	sort.Strings(out)
-	return out, nil
 }
 
 // bindRunnerProfileRunner implements PUT
@@ -200,8 +195,11 @@ func (s *Server) bindRunnerProfileRunner(w http.ResponseWriter, r *http.Request)
 
 // unbindRunnerProfileRunner implements DELETE
 // /api/v1/runner-profiles/{id}/runner/{runnerID}: it removes the runner's
-// binding so the next registration is unprofiled (which fails closed under
-// RequireProfiles). Unbinding an unbound runner is a 200 no-op.
+// binding AND revokes the profile-derived registration-snapshot attributes
+// in the same store operation, so the removed profile stops applying to the
+// very next lease (not only after a re-registration); the next registration
+// is unprofiled and fails closed under RequireProfiles. Unbinding an unbound
+// runner is a 200 no-op.
 func (s *Server) unbindRunnerProfileRunner(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAction(w, r, auth.ActionAdmin, "", false) {
 		return

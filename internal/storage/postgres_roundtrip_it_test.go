@@ -1082,12 +1082,19 @@ func TestPostgresIntegrationProfilesTokensRevocationsGrants(t *testing.T) {
 	if revoked, err := st.CertRevoked(ctx, "serial"); err != nil || revoked {
 		t.Fatalf("fresh cert = %v, %v", revoked, err)
 	}
-	if err := st.RevokeCert(ctx, "serial", runnerID, "compromised"); err != nil {
-		t.Fatalf("RevokeCert: %v", err)
+	// The only production revocation writer is the runner-disable
+	// transaction (the standalone RevokeCert was removed as dead code).
+	if err := st.UpsertRunner(ctx, model.Runner{ID: runnerID, Name: "roundtrip", Capacity: 1, CertSerial: "serial"}); err != nil {
+		t.Fatalf("UpsertRunner: %v", err)
 	}
-	// Revoking again replaces the reason without failing.
-	if err := st.RevokeCert(ctx, "serial", runnerID, "renewed"); err != nil {
-		t.Fatalf("RevokeCert again: %v", err)
+	if _, err := st.DisableRunnerAndRevokeCert(ctx, runnerID, "serial", "admin"); err != nil {
+		t.Fatalf("DisableRunnerAndRevokeCert: %v", err)
+	}
+	// Replaying the disable (a different actor/reason) is conflict-tolerant
+	// and never fails, matching the previous replace-without-failing
+	// revocation semantics.
+	if _, err := st.DisableRunnerAndRevokeCert(ctx, runnerID, "serial", "operator"); err != nil {
+		t.Fatalf("DisableRunnerAndRevokeCert replay: %v", err)
 	}
 	if revoked, err := st.CertRevoked(ctx, "serial"); err != nil || !revoked {
 		t.Fatalf("revoked cert = %v, %v", revoked, err)

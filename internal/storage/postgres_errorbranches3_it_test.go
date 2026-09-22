@@ -510,13 +510,13 @@ func TestPostgresIntegrationReservationAndSidecarErrors(t *testing.T) {
 	})
 }
 
-func TestPostgresIntegrationRevokeCertRunnerUpdateError(t *testing.T) {
+func TestPostgresIntegrationDisableRunnerUpdateError(t *testing.T) {
 	st := pgITStore(t)
 	ctx := context.Background()
 	ids := boomerSeedFor(t, st, pgITRepo)
 	pgITBoom(t, st, "runners")
-	if err := st.RevokeCert(ctx, "serial", ids.runner, "reason"); err == nil {
-		t.Fatal("expected the runner revocation marker update to fail")
+	if _, err := st.DisableRunnerAndRevokeCert(ctx, ids.runner, "serial", "admin"); err == nil {
+		t.Fatal("expected the runner disable update to fail")
 	}
 }
 

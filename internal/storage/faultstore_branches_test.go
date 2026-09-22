@@ -216,18 +216,18 @@ func TestMemStoreResolveProfileLocked(t *testing.T) {
 	if _, res := m.resolveProfileLocked(r); !res.Linked || res.Found || !res.DeniesLease() {
 		t.Fatalf("dangling cert link = %+v, want linked+missing and fail closed", res)
 	}
-	// A dangling runner-ID binding reports linked+missing but resolves as
-	// "no profile" (the registration snapshot, never the deleted profile).
+	// A dangling runner-ID binding reports linked+missing and DENIES the
+	// lease too (the binding governs; the snapshot is not a fallback).
 	r.CertSerial = ""
 	if err := m.LinkRunnerProfile(ctx(), r.ID, "99999999999999999999999999999999"); err != nil {
 		t.Fatal(err)
 	}
 	eff, res := m.resolveProfileLocked(r)
-	if !res.Linked || res.Found || res.DeniesLease() || res.Source != ProfileBindingRunnerID {
-		t.Fatalf("dangling runner-ID link = %+v, want linked+missing without fail closed", res)
+	if !res.Linked || res.Found || !res.DeniesLease() || res.Source != ProfileBindingRunnerID {
+		t.Fatalf("dangling runner-ID link = %+v, want linked+missing and fail closed", res)
 	}
 	if eff.ID != r.ID || eff.CertSerial != "" {
-		t.Fatalf("dangling runner-ID effective = %+v, want the registration snapshot", eff)
+		t.Fatalf("dangling runner-ID effective = %+v, want the registration snapshot unchanged", eff)
 	}
 }
 

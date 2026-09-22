@@ -512,24 +512,19 @@ func TestCancelRunError(t *testing.T) {
 	}
 }
 
-func TestCancelJobsByRunnerEdges(t *testing.T) {
+// TestRevokeRunnerLeasesEdges pins the kill-switch contract the scheduler
+// disable path drives (the former DBScheduler.CancelJobsByRunner wrapper was
+// removed as dead code; its assertions moved onto the store contract).
+func TestRevokeRunnerLeasesEdges(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
-
-	t.Run("empty runner id", func(t *testing.T) {
-		s := NewDB(newFakeStore(), time.Second, nil, nil)
-		if _, err := s.CancelJobsByRunner(ctx, "", "disable"); err == nil || !strings.Contains(err.Error(), "empty runner id") {
-			t.Fatalf("error = %v", err)
-		}
-	})
 
 	t.Run("transaction failure is returned with zero partial state", func(t *testing.T) {
 		st := newFakeStore()
 		st.putJob(model.Job{ID: "job-run", RunID: "run-1", Key: "r", Status: model.StatusRunning, LeaseRunnerID: "runner-1", Attempts: 5, MaxInfraRetries: 1, LeaseExpiresAt: &now})
 		st.putRunner(model.Runner{ID: "runner-1", Name: "r", Capacity: 1, ActiveJobs: []string{"job-run"}})
 		st.revokeErr = errors.New("revoke transaction failed")
-		s := NewDB(st, time.Second, nil, nil)
-		count, err := s.CancelJobsByRunner(ctx, "runner-1", "disable")
+		count, err := revokeRunnerLeases(ctx, st, "runner-1", "disable")
 		if count != 0 || err == nil {
 			t.Fatalf("count/err = %d/%v, want the transaction failure returned", count, err)
 		}
@@ -545,8 +540,7 @@ func TestCancelJobsByRunnerEdges(t *testing.T) {
 		st := newFakeStore()
 		st.putJob(model.Job{ID: "job-queued", RunID: "run-1", Key: "q", Status: model.StatusQueued, LeaseRunnerID: "runner-1"})
 		st.putJob(model.Job{ID: "job-run", RunID: "run-1", Key: "r", Status: model.StatusRunning, LeaseRunnerID: "runner-1", Attempts: 5, MaxInfraRetries: 1, LeaseExpiresAt: &now})
-		s := NewDB(st, time.Second, nil, nil)
-		count, err := s.CancelJobsByRunner(ctx, "runner-1", "disable")
+		count, err := revokeRunnerLeases(ctx, st, "runner-1", "disable")
 		if err != nil || count != 1 {
 			t.Fatalf("count/err = %d/%v", count, err)
 		}
@@ -559,13 +553,11 @@ func TestCancelJobsByRunnerEdges(t *testing.T) {
 		st := newFakeStore()
 		st.putJob(model.Job{ID: "job-run", RunID: "run-1", Key: "r", Status: model.StatusRunning, LeaseRunnerID: "runner-1", Attempts: 5, MaxInfraRetries: 1, LeaseExpiresAt: &now})
 		st.putRunner(model.Runner{ID: "runner-1", Name: "r", Capacity: 1, ActiveJobs: []string{"job-run"}})
-		s := NewDB(st, time.Second, nil, nil)
-		count, err := s.CancelJobsByRunner(ctx, "runner-1", "disable")
+		count, err := revokeRunnerLeases(ctx, st, "runner-1", "disable")
 		if err != nil || count != 1 {
 			t.Fatalf("count/err = %d/%v", count, err)
 		}
-		// Adaptation note: the old scheduler drove UpdateJob + ReleaseRunnerJob
-		// per job; the transactional contract must be the ONLY write path.
+		// The transactional contract must be the ONLY write path.
 		if len(st.releaseRunnerCalls) != 0 || len(st.updateJobCalls) != 0 {
 			t.Fatalf("multi-step recovery writes were used: release=%d update=%d", len(st.releaseRunnerCalls), len(st.updateJobCalls))
 		}
@@ -573,7 +565,7 @@ func TestCancelJobsByRunnerEdges(t *testing.T) {
 			t.Fatalf("revoke calls = %d, want exactly 1", len(st.revokeCalls))
 		}
 		// A second replica racing the same revocation observes an empty set.
-		count, err = s.CancelJobsByRunner(ctx, "runner-1", "disable")
+		count, err = revokeRunnerLeases(ctx, st, "runner-1", "disable")
 		if err != nil || count != 0 {
 			t.Fatalf("replayed count/err = %d/%v, want 0/nil", count, err)
 		}

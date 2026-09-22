@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -32,19 +33,23 @@ import (
 //  3. otherwise no binding applies and the registration snapshot is used
 //     unchanged.
 //
-// Dangling bindings (a binding whose profile row is gone) are decided
-// deliberately and identically everywhere:
+// Dangling bindings (a binding whose profile row is gone) DENY the lease
+// closed, identically for both sources ([LiveProfileResolution.DeniesLease]):
+// the binding exists, so the profile SELECTED by it is authoritative, and a
+// missing profile row must neither silently resurrect the registration
+// snapshot (which can carry attributes copied from a profile that no longer
+// governs the runner) nor fall back to another binding. Registration still
+// treats a dangling binding as not-found — it fails closed under
+// RequireProfiles and registers empty otherwise — because a registration is
+// the repair point (the admin re-binds or re-creates the profile), whereas a
+// lease is a privilege decision that must not trust a stale snapshot.
 //
-//   - a dangling CERTIFICATE-SERIAL binding fails the lease closed
-//     ([LiveProfileResolution.DeniesLease]): the explicit binding won, so the
-//     runner-ID binding must not be consulted, and a deleted profile must not
-//     silently resurrect the registration snapshot.
-//   - a dangling RUNNER-ID binding resolves as "no profile": no binding
-//     applies, so the existing unprofiled semantics hold and the registration
-//     snapshot is used. This is bounded by construction — the snapshot is
-//     exactly what the runner registered with, never more — and it mirrors
-//     registration, where a dangling binding resolves to not-found (and fails
-//     closed there under RequireProfiles). It is never the deleted profile.
+// Revocation is enforced by the SAME store operation that removes a binding:
+// [RunnerProfileLinkStore.UnlinkRunnerProfile] clears the profile-derived
+// registration-snapshot attributes of a marked runner row (see
+// [ClearProfileDerivedRunnerFields]) together with the binding row, so after
+// an unlink neither the binding nor the snapshot carries the removed
+// profile's grants.
 
 // ProfileBindingSource identifies which binding supplied a runner's effective
 // profile.
@@ -108,13 +113,18 @@ func ResolveLiveProfileBinding(serial string, certLookup, runnerIDLookup Profile
 // replace the registration snapshot.
 func (r LiveProfileResolution) Applies() bool { return r.Found }
 
-// DeniesLease reports whether the resolution fails the lease closed: only a
-// dangling CERTIFICATE-SERIAL binding does (see the precedence comment). The
-// SQL claim and the mem claim must both deny on this; the scheduler prefilter
-// and the explainers present the same runner as zero-capacity so they agree
-// with the claim instead of proposing candidates it will reject.
+// DeniesLease reports whether the resolution fails the lease closed: a
+// binding exists but its profile row is gone (a dangling binding), for the
+// certificate-serial source AND the runner-ID source alike. A binding is an
+// explicit statement of which profile governs the runner, so a missing
+// profile must not silently fall back to the registration snapshot — after a
+// profile deletion the snapshot may still carry attributes copied from that
+// profile. The SQL claim and the mem claim must both deny on this; the
+// scheduler prefilter and the explainers present the same runner as
+// zero-capacity so they agree with the claim instead of proposing candidates
+// it will reject.
 func (r LiveProfileResolution) DeniesLease() bool {
-	return r.Linked && !r.Found && r.Source == ProfileBindingCertSerial
+	return r.Linked && !r.Found
 }
 
 // LiveProfileResolver is the store-level live resolution contract: the shared
@@ -131,8 +141,8 @@ type LiveProfileResolver interface {
 
 // profileForSerialQ resolves the LIVE profile bound to a certificate serial
 // with link awareness. It is the query behind ProfileForSerial AND the
-// claim's transaction-local resolver. It shares the package rowQuerier
-// (pgx.Tx / *pgxpool.Pool) with the reservation reads.
+// per-source resolver behind ResolveLiveRunnerProfile. It shares the package
+// rowQuerier (pgx.Tx / *pgxpool.Pool) with the reservation reads.
 func profileForSerialQ(ctx context.Context, q rowQuerier, serial string) (p model.RunnerProfile, linked, found bool, err error) {
 	if strings.TrimSpace(serial) == "" {
 		return model.RunnerProfile{}, false, false, nil
@@ -190,6 +200,79 @@ func (s *PostgresStore) ResolveLiveRunnerProfile(ctx context.Context, runnerID, 
 	)
 }
 
+// liveProfileBindingTx resolves BOTH binding sources of one runner in ONE
+// statement (K6-D): the per-source lookups cost up to four sequential round
+// trips (link, profile, link, profile) while the claim holds the job and
+// runner row locks, multiplied by every retry attempt. The query is the
+// claim's per-runner form of the fleet view's two LEFT JOINs — the
+// certificate-serial binding (matched verbatim, only when the runner
+// presents a non-blank serial) and the runner-ID binding, each joined to
+// runner_profiles — and the result is the SAME raw linked/found state the
+// fleet view carries, so the caller resolves it through the SAME shared
+// precedence helper ([FleetRunnerBinding.Resolve] ->
+// [ResolveLiveProfileBinding]). Precedence and deny semantics therefore
+// cannot drift from the per-source resolver: they are one function.
+//
+// The blank-serial decision is made in Go with the exact semantics of
+// [profileForSerialQ]/[profileForRunnerIDQ] (strings.TrimSpace), passed as
+// the use_serial/use_runner flags: a whitespace-only serial or runner ID
+// must never match a binding row, and a non-blank serial is matched
+// VERBATIM (never trimmed), exactly as the per-source reads do.
+func liveProfileBindingTx(ctx context.Context, q rowQuerier, runnerID, serial string) (FleetRunnerBinding, error) {
+	var (
+		certLinked, certFound     bool
+		certRow                   fleetProfileRow
+		runnerLinked, runnerFound bool
+		runnerRow                 fleetProfileRow
+	)
+	dest := []any{&certLinked, &certFound}
+	dest = append(dest, certRow.targets()...)
+	dest = append(dest, &runnerLinked, &runnerFound)
+	dest = append(dest, runnerRow.targets()...)
+	err := q.QueryRow(ctx, `SELECT (cpl.serial IS NOT NULL), (cp.id IS NOT NULL), `+fleetCertProfileCols+`,
+		(rpl.runner_id IS NOT NULL), (rp.id IS NOT NULL), `+fleetRunnerIDProfileCols+`
+		FROM (SELECT $1::text AS runner_id, $2::text AS serial, $3::boolean AS use_serial, $4::boolean AS use_runner) q
+		LEFT JOIN cert_profile_links cpl ON q.use_serial AND cpl.serial = q.serial
+		LEFT JOIN runner_profiles cp ON cp.id = cpl.profile_id
+		LEFT JOIN runner_profile_links rpl ON q.use_runner AND rpl.runner_id = q.runner_id
+		LEFT JOIN runner_profiles rp ON rp.id = rpl.profile_id`,
+		runnerID, serial, strings.TrimSpace(serial) != "", strings.TrimSpace(runnerID) != "").Scan(dest...)
+	if err != nil {
+		return FleetRunnerBinding{}, err
+	}
+	binding := FleetRunnerBinding{
+		Cert:   FleetProfileBinding{Linked: certLinked, Found: certFound},
+		Runner: FleetProfileBinding{Linked: runnerLinked, Found: runnerFound},
+	}
+	if certFound {
+		p, err := certRow.profile()
+		if err != nil {
+			return FleetRunnerBinding{}, err
+		}
+		binding.Cert.Profile = p
+	}
+	if runnerFound {
+		p, err := runnerRow.profile()
+		if err != nil {
+			return FleetRunnerBinding{}, err
+		}
+		binding.Runner.Profile = p
+	}
+	return binding, nil
+}
+
+// LiveProfileBindingTx resolves a runner's live profile inside the caller's
+// transaction through the single-statement resolver above. It is the claim's
+// entry point; the returned resolution carries the shared precedence and deny
+// semantics.
+func liveProfileResolutionTx(ctx context.Context, q rowQuerier, runnerID, serial string) (LiveProfileResolution, error) {
+	binding, err := liveProfileBindingTx(ctx, q, runnerID, serial)
+	if err != nil {
+		return LiveProfileResolution{}, err
+	}
+	return binding.Resolve(serial), nil
+}
+
 // RunnerProfileLinkStore is the durable runner-ID -> profile binding
 // contract (migration 0031: runner_profile_links).
 //
@@ -206,9 +289,13 @@ func (s *PostgresStore) ResolveLiveRunnerProfile(ctx context.Context, runnerID, 
 // effect on the next resolution; a link whose profile row is missing
 // resolves to "not found" (false). Registration treats that as unprofiled
 // (and fails closed under RequireProfiles); lease-time live resolution
-// treats it as "no profile" — the registration snapshot applies, never the
-// deleted profile (see ResolveLiveProfileBinding for the documented
+// DENIES the lease (see ResolveLiveProfileBinding for the documented
 // dangling-binding policy).
+//
+// UnlinkRunnerProfile is revocation, not merely row deletion: in one
+// operation it removes the binding AND clears the profile-derived
+// registration attributes of a marked runner row, so the removed profile
+// cannot keep applying through the registration snapshot.
 type RunnerProfileLinkStore interface {
 	// LinkRunnerProfile binds a runner ID to a profile, replacing any
 	// previous binding for the same runner in one statement.
@@ -217,8 +304,11 @@ type RunnerProfileLinkStore interface {
 	// found=false means "no binding" or "binding without a profile row";
 	// both are treated as unprofiled by the caller.
 	ProfileForRunnerID(ctx context.Context, runnerID string) (model.RunnerProfile, bool, error)
-	// UnlinkRunnerProfile removes a runner's binding. It is idempotent: a
-	// missing row is a successful no-op.
+	// UnlinkRunnerProfile removes a runner's binding AND clears the
+	// profile-derived attributes of the runner's marked registration
+	// snapshot (ClearProfileDerivedRunnerFields) in the same operation: a
+	// removed profile is revoked immediately, not on the next registration.
+	// It is idempotent: a missing row is a successful no-op.
 	UnlinkRunnerProfile(ctx context.Context, runnerID string) error
 	// RunnerIDsForProfile lists the runner IDs bound to one profile,
 	// ordered by runner ID so the answer is deterministic.
@@ -259,14 +349,98 @@ func (s *PostgresStore) ProfileForRunnerID(ctx context.Context, runnerID string)
 	return p, true, nil
 }
 
-// UnlinkRunnerProfile removes a runner's binding; a missing row is a
-// successful no-op, so an admin can always assert the unbound state.
+// UnlinkRunnerProfile removes a runner's binding AND revokes the
+// profile-derived registration attributes copied onto the runner row, in the
+// same transaction: after the call returns, neither the binding nor the
+// snapshot carries the removed profile's grants. A missing binding is a
+// successful no-op (an admin can always assert the unbound state), and a
+// runner row without a stored profile marker is never touched (legacy
+// dev-mode self-reported attributes are the runner's own). The runner row is
+// locked FOR UPDATE, so a concurrent claim either sees the binding and the
+// untouched snapshot (the unlink not yet committed) or the cleared row (the
+// unlink committed) — never a binding-less row that still carries the
+// profile's attributes.
 func (s *PostgresStore) UnlinkRunnerProfile(ctx context.Context, runnerID string) error {
 	if runnerID == "" {
 		return fmt.Errorf("storage: runner id is required")
 	}
-	_, err := s.pool.Exec(ctx, `DELETE FROM runner_profile_links WHERE runner_id=$1`, runnerID)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `DELETE FROM runner_profile_links WHERE runner_id=$1`, runnerID); err != nil {
+		return err
+	}
+	if err := clearRunnerProfileSnapshotTx(ctx, tx, runnerID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// clearRunnerProfileSnapshotTx clears the profile-derived registration
+// attributes of one MARKED runner row (payload.profile_id != "") inside the
+// unlink transaction. It locks the row and rewrites the payload plus the
+// capacity/busy columns, so the runner row and the returned runner view stay
+// consistent for the claim's snapshot path. A missing runner row, or a row
+// with no profile marker, is a no-op — unlink must stay idempotent for
+// runners that never registered.
+func clearRunnerProfileSnapshotTx(ctx context.Context, tx pgx.Tx, runnerID string) error {
+	var payload []byte
+	err := tx.QueryRow(ctx, `SELECT payload FROM runners WHERE id=$1 FOR UPDATE`, runnerID).Scan(&payload)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var r model.Runner
+	if err := json.Unmarshal(payload, &r); err != nil {
+		return fmt.Errorf("storage: decode runner payload: %w", err)
+	}
+	cleared, changed := ClearProfileDerivedRunnerFields(r)
+	if !changed {
+		return nil
+	}
+	newPayload, err := jsonMarshal(cleared)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `UPDATE runners SET payload=$2, capacity=$3, busy=$4 WHERE id=$1`,
+		runnerID, newPayload, cleared.Capacity, cleared.Busy)
 	return err
+}
+
+// ClearProfileDerivedRunnerFields clears the registration-snapshot
+// attributes a runner profile supplied when the row carries a stored profile
+// marker (Runner.ProfileID != ""). changed=false means the row is the
+// runner's OWN registration (legacy dev-mode self-reported attributes, or a
+// row that never had a profile) and is returned unchanged.
+//
+// The rule is deliberately all-or-nothing per marked row: while the marker
+// is set, every scheduling attribute of the row was copied from a profile
+// (labels, region, repository ACL, capabilities, job capacity, resource
+// capacity, cost and energy rates), so an unlink clears ALL of them and the
+// runner re-registers to regain whatever its current binding grants. Fields
+// the runner itself declared (dev-mode labels/capacity/rates on an unmarked
+// row, identity, metadata, admin state) are never touched. Busy is
+// recomputed for the cleared capacity so the row cannot claim to be busy on
+// zero capacity.
+func ClearProfileDerivedRunnerFields(r model.Runner) (model.Runner, bool) {
+	if r.ProfileID == "" {
+		return r, false
+	}
+	r.ProfileID = ""
+	r.Labels = nil
+	r.Region = ""
+	r.AllowedRepositories = nil
+	r.Capabilities = nil
+	r.Capacity = 0
+	r.ResourceCapacity = model.ResourceCapacity{}
+	r.CostPerHour = 0
+	r.PowerWatts = 0
+	r.Busy = r.Capacity > 0 && len(r.ActiveJobs) >= r.Capacity
+	return r, true
 }
 
 // RunnerIDsForProfile lists the runner IDs bound to one profile. The empty

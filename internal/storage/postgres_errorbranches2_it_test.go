@@ -225,18 +225,19 @@ func TestPostgresIntegrationDirectHelperCalls(t *testing.T) {
 		t.Fatalf("lease with an unlinked serial: %v", err)
 	}
 
-	// profileForSerialTx query errors surface (aborted transaction).
+	// The single-statement binding resolver surfaces query errors (aborted
+	// transaction).
 	_, ack := pgITAbortedTx(t, st)
-	if _, _, _, err := profileForSerialTx(ctx, ack, "serial"); err == nil {
-		t.Fatal("expected the profile lookup to fail on an aborted transaction")
+	if _, err := liveProfileBindingTx(ctx, ack, runnerID, "serial"); err == nil {
+		t.Fatal("expected the binding lookup to fail on an aborted transaction")
 	}
 	// The cert link lookup then the profile lookup each fail.
 	_, ack2 := pgITAbortedTx(t, st)
 	if err := st.BindCertProfile(ctx, "serial-2", pgITNewID(t)); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
-	if _, _, _, err := profileForSerialTx(ctx, ack2, "serial-2"); err == nil {
-		t.Fatal("expected the aborted profile lookup to fail")
+	if _, err := liveProfileBindingTx(ctx, ack2, runnerID, "serial-2"); err == nil {
+		t.Fatal("expected the aborted binding lookup to fail")
 	}
 }
 

@@ -34,9 +34,24 @@ func TestLeaseSkipsRegionConstrainedJobsForRegionlessRunner(t *testing.T) {
 	}
 }
 
-func TestCancelJobsByRunnerRequeuesWithinBudget(t *testing.T) {
+// revokeRunnerLeases is the runner-disable kill switch the scheduler used to
+// wrap (DBScheduler.CancelJobsByRunner, removed as dead code): the disable
+// path calls the store's transactional RecoveryStore.RevokeRunnerLeases
+// directly, so the requeue-budget assertions live on the store contract.
+func revokeRunnerLeases(ctx context.Context, st storage.Store, runnerID, reason string) (int, error) {
+	rs, ok := st.(storage.RecoveryStore)
+	if !ok {
+		return 0, errors.New("scheduler: store does not support transactional runner lease revocation")
+	}
+	revoked, err := rs.RevokeRunnerLeases(ctx, runnerID, reason)
+	if err != nil {
+		return 0, err
+	}
+	return len(revoked), nil
+}
+
+func TestRevokeRunnerLeasesRequeuesWithinBudget(t *testing.T) {
 	st := newFakeStore()
-	s := NewDB(st, DefaultLeaseDuration, nil, nil)
 	ctx := context.Background()
 	now := time.Now().UTC()
 	exp := now.Add(time.Hour)
@@ -50,12 +65,12 @@ func TestCancelJobsByRunnerRequeuesWithinBudget(t *testing.T) {
 	st.runners["runner-1"] = model.Runner{ID: "runner-1", Name: "r", Capacity: 2, ActiveJobs: []string{"job-retry", "job-doomed"}}
 	st.mu.Unlock()
 
-	count, err := s.CancelJobsByRunner(ctx, "runner-1", "runner disabled")
+	count, err := revokeRunnerLeases(ctx, st, "runner-1", "runner disabled")
 	if err != nil {
-		t.Fatalf("CancelJobsByRunner: %v", err)
+		t.Fatalf("RevokeRunnerLeases: %v", err)
 	}
 	if count != 2 {
-		t.Fatalf("CancelJobsByRunner count = %d, want 2", count)
+		t.Fatalf("RevokeRunnerLeases count = %d, want 2", count)
 	}
 
 	st.mu.Lock()
@@ -68,9 +83,8 @@ func TestCancelJobsByRunnerRequeuesWithinBudget(t *testing.T) {
 	updates := append([]model.Job(nil), st.updateJobCalls...)
 	st.mu.Unlock()
 
-	// Adaptation note: the old scheduler drove one UpdateJob + one
-	// ReleaseRunnerJob per job; the transactional contract is a single
-	// RevokeRunnerLeases call and no legacy write.
+	// The disable path is ONE transactional RevokeRunnerLeases call with no
+	// legacy per-job write.
 	if len(releases) != 0 || len(updates) != 0 {
 		t.Fatalf("legacy multi-step revocation writes used: release=%d update=%d", len(releases), len(updates))
 	}
@@ -116,7 +130,7 @@ func TestCancelJobsByRunnerRequeuesWithinBudget(t *testing.T) {
 
 	// A second replica racing the same revocation sees no leases and releases
 	// nothing a second time.
-	count, err = s.CancelJobsByRunner(ctx, "runner-1", "runner disabled")
+	count, err = revokeRunnerLeases(ctx, st, "runner-1", "runner disabled")
 	if err != nil || count != 0 {
 		t.Fatalf("replayed revocation count/err = %d/%v, want 0/nil", count, err)
 	}
@@ -126,16 +140,22 @@ func TestCancelJobsByRunnerRequeuesWithinBudget(t *testing.T) {
 }
 
 // legacyRecoveryStore hides the RecoveryStore methods by embedding only the
-// storage.Store interface, so the scheduler's fail-closed contract check is
-// reachable.
+// storage.Store interface, so the fail-closed contract checks are reachable.
 type legacyRecoveryStore struct {
 	storage.Store
 }
 
-func TestCancelJobsByRunnerRequiresStoreSupport(t *testing.T) {
-	s := NewDB(&legacyRecoveryStore{Store: newFakeStore()}, DefaultLeaseDuration, nil, nil)
-	if _, err := s.CancelJobsByRunner(context.Background(), "r", "x"); err == nil {
+// TestRevokeRunnerLeasesRequiresStoreSupport: with the scheduler wrapper
+// gone, the fail-closed guard is the type assertion every kill-switch caller
+// performs; a store without the transactional contract never falls back to
+// the retired multi-step sequence.
+func TestRevokeRunnerLeasesRequiresStoreSupport(t *testing.T) {
+	st := &legacyRecoveryStore{Store: newFakeStore()}
+	if _, err := revokeRunnerLeases(context.Background(), st, "r", "x"); err == nil {
 		t.Fatal("expected error when the store cannot revoke leases transactionally")
+	}
+	if _, ok := any(st).(storage.RecoveryStore); ok {
+		t.Fatal("the fail-closed fixture unexpectedly implements RecoveryStore")
 	}
 }
 

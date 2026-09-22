@@ -300,6 +300,28 @@ func TestServiceEnvelopeRequestAggregate(t *testing.T) {
 	}
 }
 
+// TestRuntimeRunsServicesContainerOnly pins the one runtime whose declared
+// services the executor starts: the service network, cgroup parent and
+// containers are created solely for "container", so the control plane's
+// envelope stamping (internal/server serviceEnvelopeRequest) must charge
+// nothing for an empty, native or tart runtime.
+func TestRuntimeRunsServicesContainerOnly(t *testing.T) {
+	for _, tc := range []struct {
+		runtime string
+		want    bool
+	}{
+		{"container", true},
+		{"native", false},
+		{"tart", false},
+		{"", false},
+		{"unknown", false},
+	} {
+		if got := RuntimeRunsServices(tc.runtime); got != tc.want {
+			t.Errorf("RuntimeRunsServices(%q) = %v, want %v", tc.runtime, got, tc.want)
+		}
+	}
+}
+
 // runLines returns the docker log lines that invoked `docker run`.
 func runLines(log string) []string {
 	var out []string

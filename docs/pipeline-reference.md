@@ -115,7 +115,8 @@ A job has a `steps` list (required, at least one step) plus:
 - `outputs` — named job outputs, interpolatable by dependents.
 - `sandbox` — `rootless`, `read_only_rootfs`, `network`.
 - `placement` — `regions`, `labels` steering.
-- `resources` — `cpu`, `memory`, `disk`, `pids`.
+- `resources` — `cpu`, `memory`, `disk`, `pids` (see
+  [Resources](#resources)).
 - `tests` — `reports`, `manifest`, `shards`, `retry_failed`,
   `quarantine_flaky`.
 - `generate` — child graph generation (`path`, `max_jobs`, `max_depth`).
@@ -196,6 +197,63 @@ created with `--internal`, so the job can reach its services but not the
 internet. With no services, those policies map to network `none`
 (container backend) or fail closed (Tart backend).
 
+Untrusted pipelines may declare at most **8 services per job**. A ninth
+service is rejected at ADMISSION — before the run is signed, persisted or
+queued — with `400` and reason `untrusted_service_ceiling_exceeded`; the
+executor additionally re-checks the same ceiling immediately before it
+starts any service container, so a job can never reach execution with an
+unenforceable service fan-out. Trusted pipelines keep the absolute
+`32`-service limit.
+
+### Resources
+
+`resources` declares the compute a job may consume:
+
+| Key | Type | Description |
+|---|---|---|
+| `cpu` | number | CPU cores (fractional values allowed). |
+| `memory` | byte size | Memory limit (`1GiB`, `512Mi`, or plain bytes). |
+| `disk` | byte size | Workspace-content bound; enforced by the container backend. |
+| `pids` | int | Process/thread limit. |
+
+A declaration the job's backend cannot enforce is rejected at admission
+(for example `pids` on `tart`).
+
+#### Untrusted ceilings
+
+Untrusted jobs are additionally bounded by server-side **ceilings**. The
+semantics are:
+
+- an explicit request **above** a ceiling is rejected before the run is
+  signed or persisted (`400`, reason `untrusted_resource_ceiling_exceeded`,
+  message naming the field, the requested value and the ceiling) — it is
+  never silently clamped;
+- a dimension the job leaves **unset** is filled with the ceiling value,
+  so every untrusted job runs with limits even when it never mentions
+  `resources`;
+- **trusted** jobs are unconstrained by these ceilings and keep their
+  declared resources exactly, including requests above every ceiling.
+
+Defaults: `2` CPU, `4 GiB` memory, `10 GiB` disk, `256` PIDs. A ceiling of
+`0` disables that dimension (no rejection, no fill). Operators raise the
+ceilings in `kiwi.toml`:
+
+```toml
+[quota]
+untrusted_cpu_ceiling = 4              # cores
+untrusted_memory_ceiling = 17179869184 # bytes (16 GiB)
+untrusted_disk_ceiling = 21474836480   # bytes (20 GiB)
+untrusted_pids_ceiling = 1024
+```
+
+The same values are available as flags (`--untrusted-cpu-ceiling`,
+`--untrusted-memory-ceiling`, `--untrusted-disk-ceiling`,
+`--untrusted-pids-ceiling`) and environment variables
+(`KIWI_QUOTA_UNTRUSTED_CPU_CEILING`, `KIWI_QUOTA_UNTRUSTED_MEMORY_CEILING`,
+`KIWI_QUOTA_UNTRUSTED_DISK_CEILING`, `KIWI_QUOTA_UNTRUSTED_PIDS_CEILING`),
+with the usual precedence: flags > environment > config file > defaults.
+Memory and disk use plain byte counts, like the rest of `kiwi.toml`.
+
 ### Cache
 
 ```yaml
@@ -260,7 +318,8 @@ Enforced on every admission path (`internal/pipeline/validate.go`):
 | Matrix dimensions | 12 |
 | Matrix combinations per job | 512 |
 | Steps per job | 512 |
-| Services per job | 32 |
+| Services per job (trusted) | 32 |
+| Services per job (untrusted) | 8 |
 | Secret names per job | 128 |
 | Env vars per job (and per step) | 1,024 |
 | Command | 1 MiB |

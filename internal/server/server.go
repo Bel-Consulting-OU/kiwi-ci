@@ -253,6 +253,10 @@ type Server struct {
 	// executor always applies limits to untrusted work. A zero ceiling
 	// disables that dimension. Trusted jobs are unconstrained by these.
 	// Defaults: 2.0 CPU, 4 GiB memory, 10 GiB disk, 256 PIDs.
+	// Operators override them through the quota.untrusted_*_ceiling kiwi.toml
+	// keys (--untrusted-*-ceiling flags, KIWI_QUOTA_UNTRUSTED_* environment
+	// variables); the app wiring copies the effective config values here and
+	// keeps these defaults when the config is not loaded.
 	UntrustedCPUCeiling    float64
 	UntrustedMemoryCeiling int64
 	UntrustedDiskCeiling   int64
@@ -1338,6 +1342,15 @@ func (s *Server) enqueueID(ctx context.Context, in SubmitRun, preRunID string) (
 	if err = s.admitCompiledSpec(repoIdentity{RepoID: policyID, RepoURL: in.RepoURL, RepoFullName: in.RepoFullName}, spec, caps); err != nil {
 		return model.Run{}, err
 	}
+	// The untrusted service-count ceiling is an ADMISSION rule, not an
+	// execution-time guard: a spec declaring more services than the
+	// untrusted ceiling allows (pipeline.MaxUntrustedServicesPerJob) is
+	// rejected here, before the job digest is signed and before anything is
+	// persisted or queued. Trusted specs are unchecked (they keep the
+	// absolute ceiling enforced by pipeline validation).
+	if err = s.admitUntrustedServiceQuota(spec, in.Trusted); err != nil {
+		return model.Run{}, err
+	}
 	pipelineDigest, err := pipeline.PipelineDigest(spec)
 	if err != nil {
 		return model.Run{}, err
@@ -2153,11 +2166,14 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The runner may report version, protocol and health/load only. The
-	// scheduling attributes (labels, region, repositories, capacity, cost,
-	// power, capabilities) are server-owned: with profile enforcement the
-	// payload values are ignored entirely and the linked profile supplies
-	// them; the hardware capabilities the runner reports are INTERSECTED
-	// with the profile (never enlarging it).
+	// scheduling attributes (labels, region, repositories, capacity, resource
+	// capacity, cost, power, capabilities, the profile marker) are
+	// server-owned: with profile enforcement the payload values are ignored
+	// entirely and the linked profile supplies them; the hardware
+	// capabilities the runner reports are INTERSECTED with the profile (never
+	// enlarging it), and resource_capacity is never accepted from the payload
+	// (a zero dimension is unconstrained, so an accepted value could only
+	// widen the runner's admission).
 	info := RunnerInfo{
 		ID:          in.ID,
 		ProtocolMin: in.ProtocolMin,
@@ -2214,27 +2230,38 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	// compatibility only, see resolveRegistrationProfileBinding).
 	binding := s.resolveRegistrationProfileBinding(r, in.ID, in.CertSerial)
 	reported := append([]string{}, in.Capabilities...)
+	// Client-asserted server-owned attributes never survive: resource_capacity
+	// has no legacy self-report semantics (a zero dimension is UNCONSTRAINED,
+	// so an accepted client value would silently widen the runner's
+	// admission), and the profile marker is always derived from the resolved
+	// binding below. Both are cleared before the overlay so the only writer is
+	// the profile (or the empty registration).
+	in.ResourceCapacity = model.ResourceCapacity{}
+	in.ProfileID = ""
 	profile, hasProfile, perr := s.profileForRunnerBinding(r.Context(), binding)
 	if perr != nil {
 		s.logError("register: profile lookup failed", "serial", binding.Serial, "runner", binding.RunnerID, "error", perr.Error())
 	}
 	if hasProfile {
-		in.Labels = append([]string(nil), profile.Labels...)
-		in.Region = profile.Region
-		in.AllowedRepositories = append([]string(nil), profile.Repositories...)
+		// The SAME overlay the lease-time resolution applies
+		// (storage.ResolveRunnerProfile): labels, region, repository ACL,
+		// capabilities, both capacities and both rates come from the linked
+		// profile, never from the payload. The reported hardware capabilities
+		// then narrow the profile's ceiling (the runner can only lose
+		// capabilities, never gain them).
+		in = storage.ResolveRunnerProfile(in, profile, true)
 		in.Capabilities = intersectCapabilities(profile.Capabilities, reported)
-		in.Capacity = profile.MaxCapacity
-		in.CostPerHour = profile.CostPerHour
-		in.PowerWatts = profile.PowerWatts
+		in.ProfileID = profile.ID
 	} else if s.RequireProfiles {
 		// Without a linked profile the runner registers empty: no labels,
 		// no region (cannot match constrained jobs), capacity 0 (receives
-		// nothing) and no cost rates.
+		// nothing), no costs and no resource grants.
 		in.Labels = nil
 		in.Region = ""
 		in.AllowedRepositories = nil
 		in.Capabilities = nil
 		in.Capacity = 0
+		in.ResourceCapacity = model.ResourceCapacity{}
 		in.CostPerHour = 0
 		in.PowerWatts = 0
 	}
@@ -2828,27 +2855,24 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	candidates := make([]model.Job, 0)
-	// The runner's live resource reservations, summed ONCE for this poll from
-	// the jobs it currently holds. This is the memory-mode mirror of the SQL
-	// ledger's SUM (storage.runnerReservedResourcesTx) and of the scheduler's
-	// reservation pre-filter: the reservation of a RUNNING job exists exactly
-	// while the job is running — and it is the job's TOTAL reservation, its
-	// own request plus the aggregate service envelope (model.Job.
-	// ReservedResources), the same total the SQL claim writes — so every
-	// terminal path (completion, cancellation, lease expiry/requeue, queue
-	// timeout, runner revoke/disable) releases it by construction; there is no
-	// separate row that a missed release could strand, which is the documented
-	// memory-mode capacity semantics (single process; the SQL store is
-	// authoritative across replicas). The reservation is re-derived after
-	// recovery above, so an expired lease was already released before this SUM
-	// ran.
-	reserved := model.ResourceCapacity{}
-	for _, other := range s.jobs {
-		if other.Status != model.StatusRunning || other.LeaseRunnerID != id {
-			continue
-		}
-		reserved = model.AddResourceCapacity(reserved, other.ReservedResources())
-	}
+	// The fs/dev reservation ledger is folded ONCE for this poll, for EVERY
+	// runner, and the same map is handed to the queue-reason explainer below
+	// (lease miss) so the two decisions charge one identical ledger. The fold
+	// walks each runner's running-job index (ActiveJobs), never the job
+	// history: this is the memory-mode mirror of the SQL ledger's SUM
+	// (storage.runnerReservedResourcesTx) and of the scheduler's reservation
+	// pre-filter. The reservation of a RUNNING job exists exactly while the
+	// job is running — and it is the job's TOTAL reservation, its own request
+	// plus the aggregate service envelope (model.Job.ReservedResources), the
+	// same total the SQL claim writes — so every terminal path (completion,
+	// cancellation, lease expiry/requeue, queue timeout, runner
+	// revoke/disable) releases it by construction; there is no separate row
+	// that a missed release could strand, which is the documented memory-mode
+	// capacity semantics (single process; the SQL store is authoritative
+	// across replicas). The ledger is folded after recovery above, so an
+	// expired lease was already released before this fold ran.
+	reservedSums := s.runnerReservationSumsLocked()
+	reserved := reservedSums[ri.ID]
 	// Lease-time quota transition: a queued job may only move to running
 	// while the repository/team running count is below the configured
 	// concurrency (the SQL claim applies the same conditional transition
@@ -2930,8 +2954,10 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 		// gating, labels, regions, environment capacity and (new) resource
 		// capacity against every active effective runner profile — and
 		// nextDB applies the same fleet-wide rules through
-		// applyQueueReasonsDB.
-		s.applyQueueReasonsMemoryLocked(ri)
+		// applyQueueReasonsDB. The ledger already folded for this poll
+		// (reservedSums) is the SAME map the admission gate above charged, so
+		// the explainer never re-scans the job map for reservations.
+		s.applyQueueReasonsMemoryLockedWithSums(ri, reservedSums)
 		s.runners[id] = ri
 		s.persistCheckedLocked("runner.queue_reasons")
 		w.WriteHeader(http.StatusNoContent)
@@ -3042,6 +3068,13 @@ func (s *Server) nextDB(w http.ResponseWriter, r *http.Request, id string) {
 	// (or one whose promotion hook failed) reconciles here, inline; a failed
 	// reconciliation refuses the lease (503) instead of over-admitting.
 	if err := s.ensureResourceReconciled(ctx); err != nil {
+		if errors.Is(err, errResourceReconcileStandby) {
+			// Not this replica's ledger to rebuild: answer the scheduler's
+			// normal not-leader rejection (no reconcile attempt, no error
+			// log, no reconciling state), like every other standby poll.
+			http.Error(w, "scheduler standby", http.StatusServiceUnavailable)
+			return
+		}
 		s.logError("resource ledger reconciliation", "error", err.Error())
 		w.Header().Set("X-Kiwi-State", "reconciling")
 		http.Error(w, "resource ledger not reconciled", http.StatusServiceUnavailable)
@@ -5108,10 +5141,19 @@ func environmentBranchAllowed(ref string, patterns []string) bool {
 // applies, otherwise the registration snapshot. A profile edit therefore
 // takes effect on the next lease for mTLS AND per-runner bearer identities.
 //
-// linked reports whether a live profile overlay applies. A dangling
-// certificate-serial binding fails closed as a zero-capacity runner; a
-// dangling runner-ID binding resolves as "no profile" (the registration
-// snapshot applies, never more, never the deleted profile).
+// A live profile's attributes are materialized with their PROVENANCE: the
+// returned runner carries the profile's ID as its marker, so a caller that
+// writes the effective view back into s.runners (next does, on every poll
+// branch) records that the stored attributes are profile-derived — and an
+// unlink can revoke them even when the runner registered BEFORE the binding
+// existed. Without the stamp the write-back would leave profile-derived
+// attributes on an unmarked row, which ClearProfileDerivedRunnerFields
+// would (correctly) treat as the runner's own.
+//
+// linked reports whether a live profile overlay applies. A dangling binding —
+// certificate-serial OR runner-ID — fails closed as a zero-capacity runner,
+// so a deleted profile can never keep applying through the registration
+// snapshot.
 func (s *Server) liveRunnerLocked(ri model.Runner) (model.Runner, bool) {
 	certLookup := func() (model.RunnerProfile, bool, bool, error) {
 		profileID, ok := s.certProfiles[ri.CertSerial]
@@ -5141,7 +5183,9 @@ func (s *Server) liveRunnerLocked(ri model.Runner) (model.Runner, bool) {
 		return ri, true
 	}
 	if resolution.Applies() {
-		return storage.ResolveRunnerProfile(ri, resolution.Profile, true), true
+		eff := storage.ResolveRunnerProfile(ri, resolution.Profile, true)
+		eff.ProfileID = resolution.Profile.ID
+		return eff, true
 	}
 	return ri, false
 }
@@ -5561,6 +5605,14 @@ func (s *Server) maintainMemoryTick(ctx context.Context, now time.Time) {
 	}
 }
 
+// errResourceReconcileStandby reports that the resource-ledger gate was
+// skipped because this replica does not hold the leadership claim (or lost it
+// while reconciling). It is not a reconciliation failure: the lease path must
+// fall through to the scheduler's own not-leader rejection instead of
+// answering the misleading "resource ledger not reconciled" state, and
+// nothing is logged.
+var errResourceReconcileStandby = errors.New("server: resource ledger gate skipped on standby")
+
 // ensureResourceReconciled guarantees that no lease is issued against a
 // stale resource ledger. It is called on the DB lease path BEFORE the claim:
 // the first poll after a promotion (or after a failed promotion hook)
@@ -5568,6 +5620,17 @@ func (s *Server) maintainMemoryTick(ctx context.Context, now time.Time) {
 // A store that does not implement ResourceReconcileStore has no separate
 // ledger to rebuild (its claim path is the ledger), so the gate opens
 // immediately.
+//
+// Reconciliation is a leader-only fenced mutation. Checking leadership first
+// is what keeps a standby's polls quiet: without it every poll attempted the
+// reconcile, failed with storage.ErrStaleLeader, and answered a misleading
+// 503 "resource ledger not reconciled" (plus X-Kiwi-State: reconciling) with
+// an error-level log, instead of the normal not-leader rejection. A replica
+// that loses the claim between the leadership check and the fenced store call
+// is treated the same way (errResourceReconcileStandby): it reconciles
+// nothing, logs nothing, and the lease path answers the scheduler's normal
+// standby response. A leader whose reconciliation genuinely fails still
+// refuses leases (fail closed).
 func (s *Server) ensureResourceReconciled(ctx context.Context) error {
 	if s.DB == nil || s.resourceReconciled.Load() {
 		return nil
@@ -5577,13 +5640,21 @@ func (s *Server) ensureResourceReconciled(ctx context.Context) error {
 		s.resourceReconciled.Store(true)
 		return nil
 	}
+	if s.Sched == nil || !s.Sched.IsLeader(ctx) {
+		return errResourceReconcileStandby
+	}
 	s.resourceReconcileMu.Lock()
 	defer s.resourceReconcileMu.Unlock()
 	if s.resourceReconciled.Load() {
 		return nil
 	}
-	_, err := s.reconcileResourceLedger(ctx, rs)
-	return err
+	if _, err := s.reconcileResourceLedger(ctx, rs); err != nil {
+		if errors.Is(err, storage.ErrStaleLeader) {
+			return errResourceReconcileStandby
+		}
+		return err
+	}
+	return nil
 }
 
 // ReconcileResourceReservations rebuilds the durable runner resource

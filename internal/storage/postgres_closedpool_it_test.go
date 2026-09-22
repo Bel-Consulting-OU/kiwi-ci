@@ -170,7 +170,7 @@ func TestPostgresClosedPoolErrorPaths(t *testing.T) {
 		{"UpsertRunnerToken", func() error { return st.UpsertRunnerToken(ctx, runnerID, "digest") }},
 		{"RunnerIDForToken", func() error { _, _, err := st.RunnerIDForToken(ctx, "digest"); return err }},
 		{"HasRunnerTokens", func() error { _, err := st.HasRunnerTokens(ctx); return err }},
-		{"RevokeCert", func() error { return st.RevokeCert(ctx, "serial", runnerID, "reason") }},
+		{"DisableRunnerAndRevokeCert", func() error { _, err := st.DisableRunnerAndRevokeCert(ctx, runnerID, "serial", "admin"); return err }},
 		{"CertRevoked", func() error { _, err := st.CertRevoked(ctx, "serial"); return err }},
 		{"PutEnrollGrant", func() error { return st.PutEnrollGrant(ctx, "digest", now.Add(time.Hour), nil) }},
 		{"GetEnrollGrant", func() error { _, _, err := st.GetEnrollGrant(ctx, "digest"); return err }},

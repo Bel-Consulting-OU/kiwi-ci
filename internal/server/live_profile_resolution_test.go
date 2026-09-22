@@ -35,8 +35,9 @@ func liveRunnerForTest(t *testing.T, s *Server, ri model.Runner) (model.Runner, 
 
 // TestMemoryLiveRunnerUsesRunnerIDBinding: the memory lease path
 // resolves the runner-ID binding, honors live profile edits without
-// re-registration, follows certificate precedence, and falls back to the
-// snapshot on unbind and on a dangling runner-ID binding.
+// re-registration, follows certificate precedence, falls back to the
+// runner's own (unmarked) snapshot on unbind, and fails closed on a dangling
+// runner-ID binding.
 func TestMemoryLiveRunnerUsesRunnerIDBinding(t *testing.T) {
 	s := adminProfileServer(t)
 	createProfile(t, s, model.RunnerProfile{ID: "p", Labels: []string{"bound"}, Region: "east", Repositories: []string{"github.com/o/allowed"}, MaxCapacity: 2, CostPerHour: 3, PowerWatts: 40})
@@ -71,14 +72,16 @@ func TestMemoryLiveRunnerUsesRunnerIDBinding(t *testing.T) {
 		t.Fatalf("unbound effective = (%+v, linked=%v), want the snapshot", eff, linked)
 	}
 
-	// A dangling runner-ID binding resolves as "no profile" (the snapshot).
+	// A dangling runner-ID binding fails closed (capacity 0) exactly like a
+	// dangling certificate binding: the binding governs, so the snapshot is
+	// not a fallback.
 	bindRunnerProfile(t, s, "p", "runner-a", "admin-tok")
 	s.mu.Lock()
 	delete(s.profiles, "p")
 	s.mu.Unlock()
 	eff, linked = liveRunnerForTest(t, s, snapshot)
-	if linked || eff.Capacity != 9 || len(eff.Labels) != 1 || eff.Labels[0] != "snapshot" {
-		t.Fatalf("dangling runner-ID effective = (%+v, linked=%v), want the snapshot", eff, linked)
+	if !linked || eff.Capacity != 0 {
+		t.Fatalf("dangling runner-ID effective = (%+v, linked=%v), want capacity 0 fail closed", eff, linked)
 	}
 }
 

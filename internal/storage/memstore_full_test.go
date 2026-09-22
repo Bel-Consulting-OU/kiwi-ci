@@ -996,8 +996,13 @@ func TestMemStoreRevocationsAndGrants(t *testing.T) {
 	if err != nil || revoked {
 		t.Fatalf("fresh cert = %v, %v", revoked, err)
 	}
-	if err := m.RevokeCert(ctx, "serial", memRunnerID, "compromised"); err != nil {
-		t.Fatalf("RevokeCert: %v", err)
+	// The production revocation path is the runner-disable transaction (the
+	// standalone RevokeCert was removed as dead code).
+	if err := m.UpsertRunner(ctx, model.Runner{ID: memRunnerID, Name: memRunnerID, Capacity: 1, CertSerial: "serial"}); err != nil {
+		t.Fatalf("seed runner: %v", err)
+	}
+	if _, err := m.DisableRunnerAndRevokeCert(ctx, memRunnerID, "serial", "admin"); err != nil {
+		t.Fatalf("DisableRunnerAndRevokeCert: %v", err)
 	}
 	if revoked, err = m.CertRevoked(ctx, "serial"); err != nil || !revoked {
 		t.Fatalf("revoked cert = %v, %v", revoked, err)

@@ -120,8 +120,7 @@ func seedResourceScheduler(t *testing.T, st *resourceFakeStore, runnerID string,
 
 // TestSchedulerResourceAdmissionPrefilter: a candidate above the runner's
 // profile capacity is never claimed (it waits or goes elsewhere), and an
-// admitted candidate carries its requests plus the effective runner
-// capacity into the claim.
+// admitted candidate carries its requests into the claim.
 func TestSchedulerResourceAdmissionPrefilter(t *testing.T) {
 	ctx := context.Background()
 	st := newResourceFakeStore()
@@ -139,9 +138,13 @@ func TestSchedulerResourceAdmissionPrefilter(t *testing.T) {
 	if j.ID != "job-small" {
 		t.Fatalf("leased %s, want job-small (the oversized candidate must wait)", j.ID)
 	}
+	// The claim carries the candidate's requests and the envelope total; the
+	// runner's capacity is NOT part of the claim (every store reads the
+	// runner's live capacity inside its own claim transaction), so the
+	// pre-filter above is what pins that the 4 GiB profile capacity decided.
 	claim := st.lastClaim(t)
-	if claim.MemoryRequest != 2<<30 || claim.ResourceCapacity.Memory != 4<<30 {
-		t.Fatalf("claim requests/capacity = %d/%d, want 2GiB/4GiB", claim.MemoryRequest, claim.ResourceCapacity.Memory)
+	if claim.MemoryRequest != 2<<30 || claim.RequestedResources().Memory != 2<<30 {
+		t.Fatalf("claim requests = %d (total %d), want 2GiB", claim.MemoryRequest, claim.RequestedResources().Memory)
 	}
 }
 

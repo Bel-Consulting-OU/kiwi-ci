@@ -11,6 +11,7 @@ package server
 // only), and the fs and DB explainers agree on the reasons.
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"testing"
@@ -276,5 +277,106 @@ func TestMemoryServiceEnvelopeStampedAtEnqueue(t *testing.T) {
 	}
 	if plain := fsJob(t, s, plainJob); plain.ServiceEnvelopeRequest != (model.ResourceCapacity{}) {
 		t.Fatalf("plain job envelope = %+v, want zero", plain.ServiceEnvelopeRequest)
+	}
+}
+
+// nativeServiceEnvelopePipeline declares one service on a NATIVE job: the
+// executor starts declared services only on the container runtime
+// (executor.RuntimeRunsServices), so the services are inert and must not be
+// charged to the runner.
+const nativeServiceEnvelopePipeline = `version: 1
+jobs:
+  build:
+    runtime: native
+    services:
+      - name: db
+        image: postgres:16
+    steps:
+      - run: echo hi
+`
+
+// nativeServiceEnvelopeServer builds a memory-mode server with one runner
+// whose live profile carries the native and container labels and capabilities
+// and a 1 GiB memory capacity — smaller than the 2 GiB fair-split envelope a
+// single undeclared service costs. The runtime is projected into the job's
+// required labels, so the runner needs both.
+func nativeServiceEnvelopeServer(t *testing.T) (*Server, string) {
+	t.Helper()
+	s := adminProfileServer(t)
+	serial := "native-env-serial"
+	createProfile(t, s, model.RunnerProfile{
+		ID: "native-env-prof", Labels: []string{"native", "container"},
+		Capabilities: []string{"native", "container"},
+		MaxCapacity:  4, MaxMemory: 1 << 30,
+	})
+	bindSerial(t, s, "native-env-prof", serial)
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "runner-tok",
+		`{"name":"native-env-runner","cert_serial":"`+serial+`","protocol_min":3,"protocol_max":3}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("register: %d %s", w.Code, w.Body.String())
+	}
+	var ri model.Runner
+	if err := json.Unmarshal(w.Body.Bytes(), &ri); err != nil {
+		t.Fatal(err)
+	}
+	return s, ri.ID
+}
+
+// fsEnqueueTrusted submits one TRUSTED run through the internal enqueue path
+// (direct API submissions are untrusted by construction, and native execution
+// is a trusted-only capability) and returns the run's first job ID.
+func fsEnqueueTrusted(t *testing.T, s *Server, repoPath, pipelineSrc string) string {
+	t.Helper()
+	run, err := s.enqueue(context.Background(), SubmitRun{
+		RepoURL: "https://github.com/" + repoPath + ".git", RepoFullName: repoPath,
+		Ref: "refs/heads/main", Pipeline: pipelineSrc, Trusted: true,
+	})
+	if err != nil {
+		t.Fatalf("enqueue trusted %s: %v", repoPath, err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, j := range s.jobs {
+		if j.RunID == run.ID {
+			return j.ID
+		}
+	}
+	t.Fatalf("run %s has no jobs", run.ID)
+	return ""
+}
+
+// TestNativeServiceEnvelopeNotCharged pins the K7-B runtime gate: services
+// are started only for the container runtime, so a native job's declared
+// services are not charged the aggregate envelope at enqueue. Before the fix
+// the native job carried a 2 GiB service envelope against a 1 GiB runner and
+// was permanently un-leasable (the aggregate alone exceeded the capacity,
+// although the executor would never start a service container); the container
+// variant of the same declaration keeps the fair-split envelope unchanged.
+func TestNativeServiceEnvelopeNotCharged(t *testing.T) {
+	s, runnerID := nativeServiceEnvelopeServer(t)
+	nativeJob := fsEnqueueTrusted(t, s, "native/env", nativeServiceEnvelopePipeline)
+	containerJob := fsEnqueueTrusted(t, s, "native/env-container", fsEnvelopePipeline)
+
+	// Container is unchanged: the job+service job still carries the 2 GiB
+	// fair-split envelope.
+	if got := fsJob(t, s, containerJob).ServiceEnvelopeRequest; got.Memory != 2<<30 {
+		t.Fatalf("container envelope = %+v, want the fair-split 2GiB", got)
+	}
+	// Native services are inert and uncharged.
+	if got := fsJob(t, s, nativeJob).ServiceEnvelopeRequest; got != (model.ResourceCapacity{}) {
+		t.Fatalf("native envelope = %+v, want zero (services never start on a native runtime)", got)
+	}
+	// The native job is leasable on a runner whose capacity is below the
+	// fair-split aggregate its declared service would have cost, and the
+	// lease reserves exactly its own (zero) request.
+	task := fsLeaseOne(t, s, runnerID)
+	if task.Job.ID != nativeJob {
+		t.Fatalf("lease = %s, want the native job %s", task.Job.ID, nativeJob)
+	}
+	if task.Job.ServiceEnvelopeRequest != (model.ResourceCapacity{}) {
+		t.Fatalf("leased native envelope = %+v, want zero", task.Job.ServiceEnvelopeRequest)
+	}
+	if got := fsReservedMemory(s, runnerID); got != 0 {
+		t.Fatalf("reserved after native lease = %d, want 0", got)
 	}
 }

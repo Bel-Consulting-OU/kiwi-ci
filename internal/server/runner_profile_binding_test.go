@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"sort"
 	"testing"
 	"time"
 
@@ -26,6 +27,37 @@ func bindRunnerProfile(t *testing.T, s *Server, profileID, runnerID, token strin
 	if w.Code != http.StatusOK {
 		t.Fatalf("bind %s -> %s: %d %s", profileID, runnerID, w.Code, w.Body.String())
 	}
+}
+
+// runnerIDsForProfile lists the runner IDs bound to ONE profile, ordered by
+// runner ID: DB mode through the store's RunnerIDsForProfile (the SELECT that
+// migration 0031's profile_id index, runner_profile_links_profile_idx, backs)
+// and memory mode from the fs-snapshot mirror. It is a TEST-ONLY helper:
+// production has no profile -> runners listing route (registration and every
+// lease path resolve runner -> profile, never the reverse), so the server
+// method was removed as a dead seam (K7-C) and the listing is exercised here
+// over both store modes.
+func (s *Server) runnerIDsForProfile(ctx context.Context, profileID string) ([]string, error) {
+	if profileID == "" {
+		return []string{}, nil
+	}
+	if s.DB != nil {
+		ls, ok := s.DB.(storage.RunnerProfileLinkStore)
+		if !ok {
+			return []string{}, nil
+		}
+		return ls.RunnerIDsForProfile(ctx, profileID)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := []string{}
+	for id, pid := range s.runnerProfiles {
+		if pid == profileID {
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // registerWithToken registers through the HTTP API with an explicit bearer

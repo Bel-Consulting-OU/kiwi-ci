@@ -439,7 +439,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	// the service containers started here and by the main container started
 	// below.
 	cgroupParent := ""
-	if cj.Job.Runtime == "container" && len(cj.Job.Services) > 0 {
+	if RuntimeRunsServices(cj.Job.Runtime) && len(cj.Job.Services) > 0 {
 		// One job-scoped parent cgroup holds the main container AND every
 		// service container, with the declared envelope applied to the
 		// PARENT (see jobcgroup.go): the scheduler reserved the envelope

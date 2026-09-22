@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -10,18 +11,23 @@ import (
 )
 
 // runnerProfileContractStore is the surface the shared contract needs: the
-// link contract under test plus the profile writes that seed the live rows.
+// link contract under test, the profile writes that seed the live rows, and
+// the runner reads/writes that seed and observe the marked registration
+// snapshot the unlink must revoke.
 type runnerProfileContractStore interface {
 	RunnerProfileLinkStore
 	ProfileStore
+	UpsertRunner(ctx context.Context, runner model.Runner) error
+	GetRunner(ctx context.Context, id string) (model.Runner, error)
 }
 
 // runRunnerProfileLinkContract exercises the RunnerProfileLinkStore contract
 // against one implementation. The mem store and the real-PostgreSQL IT both
 // run it, so the in-memory mirror and the durable table are pinned to the
 // same semantics: PRIMARY KEY uniqueness per runner, live profile joins,
-// dangling-link fail-closed resolution, idempotent unlink and deterministic
-// profile-scoped listing.
+// dangling-link fail-closed resolution, revocation on unlink (binding row AND
+// profile-derived snapshot fields cleared together), idempotent unlink and
+// deterministic profile-scoped listing.
 func runRunnerProfileLinkContract(t *testing.T, st runnerProfileContractStore) {
 	t.Helper()
 	ctx := context.Background()
@@ -115,6 +121,61 @@ func runRunnerProfileLinkContract(t *testing.T, st runnerProfileContractStore) {
 		t.Fatalf("second UnlinkRunnerProfile must be a no-op: %v", err)
 	}
 
+	// Unlink is REVOCATION: a marked runner row (its scheduling attributes
+	// were copied from the linked profile) has those attributes cleared in
+	// the same operation as the binding row, so the removed profile cannot
+	// keep applying through the registration snapshot. Unmarked rows
+	// (self-reported dev-mode attributes) are untouched. The runner IDs are
+	// canonical (32 hex) because the SQL store validates them.
+	const markedID, unmarkedID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa02"
+	if err := st.UpsertRunner(ctx, model.Runner{
+		ID: markedID, Name: "marked", ProfileID: "p-primary",
+		Labels: []string{"container"}, Region: "region-1", AllowedRepositories: []string{"github.com/o/mine"},
+		Capabilities: []string{"container"}, Capacity: 3, ResourceCapacity: model.ResourceCapacity{CPU: 2, Memory: 1 << 30, Disk: 2 << 30, PIDs: 128},
+		CostPerHour: 1.5, PowerWatts: 75, Busy: true, ActiveJobs: []string{"job-1"}, CurrentJob: "job-1",
+	}); err != nil {
+		t.Fatalf("seed marked runner: %v", err)
+	}
+	if err := st.UpsertRunner(ctx, model.Runner{ID: unmarkedID, Name: "unmarked", Labels: []string{"self"}, Capacity: 5}); err != nil {
+		t.Fatalf("seed unmarked runner: %v", err)
+	}
+	for _, id := range []string{markedID, unmarkedID} {
+		if err := st.LinkRunnerProfile(ctx, id, "p-primary"); err != nil {
+			t.Fatalf("link %s: %v", id, err)
+		}
+	}
+	if err := st.UnlinkRunnerProfile(ctx, markedID); err != nil {
+		t.Fatalf("unlink marked: %v", err)
+	}
+	got, err := st.GetRunner(ctx, markedID)
+	if err != nil {
+		t.Fatalf("get marked: %v", err)
+	}
+	if got.ProfileID != "" || got.Labels != nil || got.Region != "" || got.AllowedRepositories != nil ||
+		got.Capabilities != nil || got.Capacity != 0 || got.ResourceCapacity != (model.ResourceCapacity{}) ||
+		got.CostPerHour != 0 || got.PowerWatts != 0 || got.Busy {
+		t.Fatalf("marked runner after unlink = %+v, want the profile-derived fields cleared", got)
+	}
+	// The runner's own non-derived state survives: identity, admin state,
+	// active jobs and metadata are not profile grants.
+	if got.ID != markedID || got.Name != "marked" || len(got.ActiveJobs) != 1 || got.ActiveJobs[0] != "job-1" || got.CurrentJob != "job-1" {
+		t.Fatalf("marked runner lost non-derived state: %+v", got)
+	}
+	if err := st.UnlinkRunnerProfile(ctx, unmarkedID); err != nil {
+		t.Fatalf("unlink unmarked: %v", err)
+	}
+	got, err = st.GetRunner(ctx, unmarkedID)
+	if err != nil {
+		t.Fatalf("get unmarked: %v", err)
+	}
+	if got.ProfileID != "" || got.Capacity != 5 || len(got.Labels) != 1 || got.Labels[0] != "self" {
+		t.Fatalf("unmarked runner after unlink = %+v, want its own self-reported attributes", got)
+	}
+	// Unlinking a runner that never registered is a successful no-op.
+	if err := st.UnlinkRunnerProfile(ctx, "r-never-registered"); err != nil {
+		t.Fatalf("unbound unregistered unlink: %v", err)
+	}
+
 	// Empty/unknown profile listing stays an empty (non-nil) slice.
 	if ids, err := st.RunnerIDsForProfile(ctx, ""); err != nil || ids == nil || len(ids) != 0 {
 		t.Fatalf("RunnerIDsForProfile(\"\") = (%v, %v)", ids, err)
@@ -128,6 +189,47 @@ func runRunnerProfileLinkContract(t *testing.T, st runnerProfileContractStore) {
 // 0031 to the RunnerProfileLinkStore contract the PostgreSQL IT also runs.
 func TestRunnerProfileLinksMemoryParity(t *testing.T) {
 	runRunnerProfileLinkContract(t, newMemStore())
+}
+
+// TestRunnerProfileLinksFaultyStoreParity: the fault-injectable wrapper
+// delegates the whole RunnerProfileLinkStore contract — revocation on unlink
+// included — to the wrapped store, so the mem/PG parity holds under the
+// fault-injection wiring as well (a fault-injected unlink returns before the
+// inner call and revokes nothing).
+func TestRunnerProfileLinksFaultyStoreParity(t *testing.T) {
+	runRunnerProfileLinkContract(t, &FaultyStore{Inner: newMemStore()})
+}
+
+// TestFaultyStoreFailedUnlinkRevokesNothing: an injected write failure makes
+// the unlink fail BEFORE the inner call, so neither the binding nor the
+// marked snapshot is touched — revocation is all-or-nothing.
+func TestFaultyStoreFailedUnlinkRevokesNothing(t *testing.T) {
+	ctx := context.Background()
+	inner := newMemStore()
+	runnerID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa03"
+	if err := inner.UpsertProfile(ctx, model.RunnerProfile{ID: "p-fault", Labels: []string{"bound"}, MaxCapacity: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := inner.UpsertRunner(ctx, model.Runner{ID: runnerID, ProfileID: "p-fault", Capacity: 2, Labels: []string{"bound"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := inner.LinkRunnerProfile(ctx, runnerID, "p-fault"); err != nil {
+		t.Fatal(err)
+	}
+	f := &FaultyStore{Inner: inner, FailAfter: 1, Err: errors.New("synthetic unlink failure")}
+	if err := f.UnlinkRunnerProfile(ctx, runnerID); err == nil {
+		t.Fatal("fault-injected unlink must fail")
+	}
+	if _, ok, err := inner.ProfileForRunnerID(ctx, runnerID); err != nil || !ok {
+		t.Fatalf("failed unlink dropped the binding: ok=%v err=%v", ok, err)
+	}
+	got, err := inner.GetRunner(ctx, runnerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ProfileID != "p-fault" || got.Capacity != 2 || len(got.Labels) != 1 {
+		t.Fatalf("failed unlink cleared the snapshot: %+v", got)
+	}
 }
 
 // TestRunnerProfileLinksMigrationShape pins the deploy-safe shape of

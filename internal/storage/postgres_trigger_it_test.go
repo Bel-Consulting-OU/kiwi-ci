@@ -491,8 +491,8 @@ func TestPostgresIntegrationTriggeredSQLErrors(t *testing.T) {
 				t.Fatal("expected the token upsert to fail")
 			}
 		}},
-		"cert_revocations/Revoke": {"cert_revocations", func(t *testing.T, st *PostgresStore, ids *boomerIds) {
-			if err := st.RevokeCert(ctx, "serial", ids.runner, "reason"); err == nil {
+		"cert_revocations/DisableRevoke": {"cert_revocations", func(t *testing.T, st *PostgresStore, ids *boomerIds) {
+			if _, err := st.DisableRunnerAndRevokeCert(ctx, ids.runner, "serial", "admin"); err == nil {
 				t.Fatal("expected the revocation insert to fail")
 			}
 		}},

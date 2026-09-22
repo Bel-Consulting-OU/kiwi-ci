@@ -25,10 +25,26 @@ import (
 // MaxReportFiles, plus the shared request/payload budgets the server and the
 // runner enforce. Every layer (parser, runner pre-check, /tests decode) uses
 // those constants, so there is exactly one size contract.
+//
+// Sanitize, don't reject: producer-declared METADATA that exceeds a shared
+// budget is clamped at the parser-side aggregation points (budgetCounters,
+// clampDuration) exactly like a negative counter or an oversized failure
+// message is sanitized. AggregateMasked validates its own output with the
+// shared validator (limits.go) and the runner warn-only discards the WHOLE
+// aggregated report set when that validation fails, so an absurd declared
+// counter must cost the producer its excess claim, never the cases the
+// report did materialize. ValidateReportPayload itself stays strict for a
+// direct /tests submission, where the declared values ARE the payload and no
+// parser has sanitized them.
 const (
-	// maxReportDuration is the largest suite/case duration (in seconds,
-	// about 31.7 years) accepted from a report. Non-finite, negative and
-	// larger values are dropped to 0 (see sanitizeDuration).
+	// maxReportDuration is the largest suite/case/report duration (in
+	// seconds, about 31.7 years) accepted from a report. A single
+	// non-finite, negative or larger value is dropped to 0 (see
+	// sanitizeDuration); a SUM of individually valid durations (many suites
+	// in one file, or many files in one job) is clamped to this shared
+	// maximum at the aggregation points (see clampDuration), because a job
+	// may legitimately merge many suites whose separate times each sit at
+	// the bound.
 	maxReportDuration = 1e9
 )
 
@@ -182,6 +198,7 @@ func parseReport(r io.Reader, name string, mask func(string) string) (Report, er
 	if !seen {
 		return out, fmt.Errorf("parse %s: not a JUnit report (no testsuite/testcase elements)", name)
 	}
+	finalizeReport(&out)
 	return out, nil
 }
 
@@ -353,7 +370,10 @@ func readCase(dec *xml.Decoder, se xml.StartElement, mask func(string) string, c
 	return c, nil
 }
 
-// appendSuite merges one suite into the report totals.
+// appendSuite merges one suite into the report totals. The suite is
+// finalized here a second time (idempotently, see budgetCounters), and the
+// report duration stays inside the shared maximum while merging because one
+// file may sum many individually valid suite times.
 func appendSuite(out *Report, s Suite) {
 	finalizeSuite(&s)
 	out.Suites = append(out.Suites, s)
@@ -361,60 +381,215 @@ func appendSuite(out *Report, s Suite) {
 	out.Failures += s.Failures
 	out.Errors += s.Errors
 	out.Skipped += s.Skipped
-	out.Duration += s.Time
+	out.Duration = clampDuration(out.Duration + s.Time)
 	out.Cases = append(out.Cases, s.Cases...)
 }
 
-// finalizeSuite derives counters from case outcomes when the producer's
-// attributes are missing or smaller than the case-derived counts. A negative
-// producer counter is producer garbage and is dropped to zero exactly like
-// an invalid duration, so the parser never emits a negative count; an
-// impossible counter RELATION (failures+errors or skipped above tests after
-// derivation) is rejected by the shared ValidateReportPayload the aggregate
-// path calls, so producer attributes can never fabricate a report the
-// validator would refuse.
+// counterFloors carries the case-derived lower bounds budgetCounters must
+// preserve: the materialized case count, the exclusive failure/error
+// classification floors and the failing/skipped floors the shared validator
+// enforces.
+type counterFloors struct {
+	cases    int // materialized cases: tests >= cases
+	failures int // failure-only materialized cases: failures >= failures
+	errors   int // error-only materialized cases: errors >= errors
+	failing  int // any materialized failing case: failures+errors >= failing
+	skipped  int // materialized skipped cases: skipped >= skipped
+}
+
+// budgetCounters is the ONE implementation of the parser-side counter
+// policy, shared by the per-suite (finalizeSuite), per-file (finalizeReport)
+// and per-job (AggregateMasked) aggregation points so none of them can
+// reconcile differently. It derives the counters from the materialized
+// cases, CLAMPS every producer-declared counter into the shared job budget
+// [0, MaxJobCases], and reconciles the declared values into the relation the
+// shared ValidateReportPayload enforces, so the parser can never emit a
+// report its own validator rejects and the runner never discards an
+// aggregate it parsed itself.
+//
+// Sanitize, don't reject: a counter above MaxJobCases is producer garbage
+// exactly like a negative counter or an oversized failure message, so it is
+// clamped into the budget instead of being allowed to fail the parse.
+// ValidateReportPayload itself stays strict for a direct /tests submission,
+// where the declared values are the payload and no parser has sanitized
+// them. A negative producer counter is dropped to zero exactly like an
+// invalid duration.
+//
+// The clamp runs AFTER the floors deliberately: the floors are materialized
+// evidence, and clamping one down would leave the report smaller than the
+// cases it carries (the validator rejects "materialized cases exceed the
+// declared tests counter"). Every caller guarantees fl.cases <= MaxJobCases
+// — readCase rejects a file over MaxReportCases and AggregateMasked rejects
+// a job the moment its materialized cases would exceed MaxJobCases — so the
+// clamp can only ever remove declared excess, never a floor. A materialized
+// case list genuinely over the job budget is an input-size breach enforced
+// per case at ingestion, NOT a declared counter for this policy to
+// sanitize.
+//
+// The reconciliation exists because the declared counters and the
+// materialized cases can disagree in two ways:
+//
+//   - skipped wins over a co-occurring failure/error (the model folds such a
+//     case as skipped, see the case-level synthesis), so a case the producer
+//     counted as a failure is a skip here;
+//   - the model collapses <failure> and <error> into ONE non-passing
+//     observation, so a producer that counts one failing case in BOTH
+//     declared counters still explains only one materialized case.
+//
+// Either makes failures+errors+skipped exceed tests. The rule:
+//
+//  1. Tests is raised to the number of materialized cases; a report may
+//     declare more tests than it materialized, never fewer.
+//  2. Each declared failure/error counter is raised to its exclusive
+//     classification floor (failure-only cases for Failures, error-only cases
+//     for Errors), and the PAIR floor — failures+errors must cover every
+//     non-skipped failing case, however it was spelled — is topped up on
+//     Failures (deterministic; the fold observes the pair, not the
+//     classification).
+//  3. Skipped is raised to the skipped case count and clamped to
+//     tests - failing cases: a declared skip can never displace a
+//     materialized failure. The floor always fits because skipped and
+//     failing cases are disjoint materialized cases (skipped + failing <=
+//     len(Cases) <= tests).
+//  4. If the declared pair still exceeds tests - skipped, the excess is
+//     conceded by Errors first, then Failures, never below the case-derived
+//     floors. Errors is the deterministic concession order; the exclusive
+//     floors keep a failure-only or error-only case's own counter, so only
+//     the unsupported claim is dropped.
+//
+// The result always satisfies the validator's counter relation and
+// case-derived lower bounds: failures+errors+skipped <= tests, with
+// failures+errors >= the materialized failing cases and skipped >= the
+// materialized skipped cases. Every step is a monotone clamp against a
+// case-derived floor, so budgetCounters is IDEMPOTENT: a suite is finalized
+// once when its element closes and again in appendSuite, and the second pass
+// must not change the reconciliation.
+func budgetCounters(tests, failures, errors, skipped int, fl counterFloors) (int, int, int, int) {
+	if tests < 0 {
+		tests = 0
+	}
+	if failures < 0 {
+		failures = 0
+	}
+	if errors < 0 {
+		errors = 0
+	}
+	if skipped < 0 {
+		skipped = 0
+	}
+	if tests < fl.cases {
+		tests = fl.cases
+	}
+	if failures < fl.failures {
+		failures = fl.failures
+	}
+	if errors < fl.errors {
+		errors = fl.errors
+	}
+	// The pair top-up compares budget-clamped operands: two MaxInt producer
+	// counters would overflow an int, and any operand above MaxJobCases is
+	// about to be clamped anyway. Because the pair floor is itself a
+	// materialized count bounded by MaxJobCases, an operand at the budget
+	// already covers the floor, so the condition and the top-up are
+	// identical to the raw comparison while never overflowing (and the
+	// top-up then only ever operates on in-budget values).
+	if pair := min(failures, MaxJobCases) + min(errors, MaxJobCases); pair < fl.failing {
+		failures += fl.failing - pair
+	}
+	if skipped < fl.skipped {
+		skipped = fl.skipped
+	}
+	// The shared budget clamp, AFTER the floors (see the doc comment).
+	tests = min(tests, MaxJobCases)
+	failures = min(failures, MaxJobCases)
+	errors = min(errors, MaxJobCases)
+	skipped = min(skipped, MaxJobCases)
+	if maxSkip := tests - fl.failing; skipped > maxSkip {
+		// maxSkip >= fl.skipped: skipped and failing cases are disjoint
+		// materialized cases, so fl.skipped <= fl.cases-fl.failing and the
+		// clamp never cuts tests below fl.cases.
+		skipped = maxSkip
+	}
+	if over := failures + errors - (tests - skipped); over > 0 {
+		if drop := min(over, errors-fl.errors); drop > 0 {
+			errors -= drop
+			over -= drop
+		}
+		if over > 0 {
+			// Feasible: tests-skipped >= fl.failing >=
+			// fl.failures+fl.errors, so the remaining excess never exceeds
+			// Failures' reducible claim.
+			failures -= min(over, failures-fl.failures)
+		}
+	}
+	return tests, failures, errors, skipped
+}
+
+// finalizeSuite prepares one parsed suite before it is merged into a report:
+// it derives the case-derived floors from the materialized cases (skipped
+// wins over a co-occurring failure/error: the model marks such a case
+// Skipped and the fold ignores it) and applies budgetCounters, which also
+// clamps the producer-declared counters into the shared job budget. It is
+// idempotent, because appendSuite finalizes the suite a second time.
 func finalizeSuite(s *Suite) {
-	var fail, errs, skip int
-	if s.Tests < 0 {
-		s.Tests = 0
-	}
-	if s.Failures < 0 {
-		s.Failures = 0
-	}
-	if s.Errors < 0 {
-		s.Errors = 0
-	}
-	if s.Skipped < 0 {
-		s.Skipped = 0
-	}
+	var failOnly, errOnly, failing, skip int
 	for _, c := range s.Cases {
-		// Skipped wins over a co-occurring failure/error: the model marks the
-		// case Skipped (and the fold ignores it), so the declared counters
-		// must count it as a skip too. A pathological producer emitting both
-		// elements would otherwise make the parser produce a report its own
-		// validator rejects (the skipped case would exceed the skipped
-		// counter).
 		switch {
 		case c.Skipped != nil:
 			skip++
+		case c.Failure != nil && c.Error != nil:
+			failing++
 		case c.Failure != nil:
-			fail++
+			failOnly++
+			failing++
 		case c.Error != nil:
-			errs++
+			errOnly++
+			failing++
 		}
 	}
-	if s.Failures < fail {
-		s.Failures = fail
+	s.Tests, s.Failures, s.Errors, s.Skipped = budgetCounters(s.Tests, s.Failures, s.Errors, s.Skipped, counterFloors{
+		cases:    len(s.Cases),
+		failures: failOnly,
+		errors:   errOnly,
+		failing:  failing,
+		skipped:  skip,
+	})
+}
+
+// finalizeReport applies the same budget policy to one file's report totals
+// after every suite was merged: the declared counters are clamped into the
+// job budget (with the file's materialized cases as floors) and the summed
+// duration is clamped to the shared maximum. finalizeSuite keeps each suite
+// internally consistent, but one file may merge many suites and
+// AggregateMasked sums many files, so every aggregation level clamps before
+// handing the next level a report.
+func finalizeReport(out *Report) {
+	var failing, skipped int
+	for _, c := range out.Cases {
+		switch {
+		case c.Skipped != nil:
+			skipped++
+		case c.Failure != nil || c.Error != nil:
+			failing++
+		}
 	}
-	if s.Errors < errs {
-		s.Errors = errs
-	}
-	if s.Skipped < skip {
-		s.Skipped = skip
-	}
-	if s.Tests < len(s.Cases) {
-		s.Tests = len(s.Cases)
-	}
+	out.Tests, out.Failures, out.Errors, out.Skipped = budgetCounters(out.Tests, out.Failures, out.Errors, out.Skipped, counterFloors{
+		cases:   len(out.Cases),
+		failing: failing,
+		skipped: skipped,
+	})
+	out.Duration = clampDuration(out.Duration)
+}
+
+// clampDuration bounds a SUM of individually valid durations (a file's suite
+// times, or a job's file totals) to the shared maximum. Many suites may each
+// be validly near maxReportDuration while their sum is far above it, and the
+// shared validator measures exactly this bound on the report total: like the
+// counter clamp, the total is pinned at the budget instead of rejecting the
+// parse. A single declared value above the bound is still producer garbage
+// and is dropped to 0 by sanitizeDuration.
+func clampDuration(total float64) float64 {
+	return min(total, maxReportDuration)
 }
 
 func applyMask(c *Case, mask func(string) string) {
@@ -643,6 +818,29 @@ func AggregateMasked(workspace string, patterns []string, mask func(string) stri
 			out.Cases = append(out.Cases, r)
 		}
 	}
+	// Job-level budget sanitization, the same sanitize-not-reject policy as
+	// finalizeSuite/finalizeReport: each file's totals were clamped already,
+	// but a job sums many files, so the declared counters are clamped into
+	// the job budget again with the job's OWN materialized cases as floors,
+	// and the summed duration is clamped to the shared maximum. Without this
+	// clamp an over-declared counter or a summed suite duration would make
+	// the aggregate fail its own validation just below, and the runner would
+	// warn-only discard the whole report set.
+	var failingCases, skippedCases int
+	for _, c := range out.Cases {
+		switch {
+		case c.Skipped:
+			skippedCases++
+		case !c.Passed:
+			failingCases++
+		}
+	}
+	out.Tests, out.Failures, out.Errors, out.Skipped = budgetCounters(out.Tests, out.Failures, out.Errors, out.Skipped, counterFloors{
+		cases:   len(out.Cases),
+		failing: failingCases,
+		skipped: skippedCases,
+	})
+	out.Duration = clampDuration(out.Duration)
 	// The serialized form is what the runner uploads and what the /tests
 	// endpoint must decode: enforce the shared payload contract HERE, with
 	// the exact encoding the runner sends, so the parser can never accept a

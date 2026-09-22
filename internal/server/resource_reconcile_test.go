@@ -6,12 +6,15 @@ package server
 // the exported repair call must re-run the store operation on demand.
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/logging"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
@@ -74,6 +77,106 @@ func TestServerResourceReconcileGateBlocksLeasesUntilReconciled(t *testing.T) {
 	}
 	if got := f.calls; got != 2 {
 		t.Fatalf("reconcile calls after arming = %d, want 2 (gate is a single load)", got)
+	}
+}
+
+// TestServerResourceReconcileStandbyPollQuiet pins K2-C: reconciliation is a
+// leader-only fenced mutation, so a standby's poll must not attempt it.
+// Before the fix every standby poll attempted the reconcile, failed with
+// ErrStaleLeader, logged "resource ledger reconciliation: stale leader epoch"
+// at error level and answered 503 "resource ledger not reconciled" with
+// X-Kiwi-State: reconciling instead of the normal not-leader rejection. The
+// leader path is unchanged: the same poll after regaining the claim
+// reconciles once and arms the gate.
+func TestServerResourceReconcileStandbyPollQuiet(t *testing.T) {
+	f := &reconcileFakeStore{dbFakeStore: newDBFakeStore()}
+	s := New("token")
+	var logs bytes.Buffer
+	s.Logger = logging.NewStructured(&logs)
+	if err := s.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	f.setLeader(false)
+	f.mu.Lock()
+	f.runners["gate-runner"] = model.Runner{ID: "gate-runner", Name: "gate", Capacity: 1}
+	f.mu.Unlock()
+
+	logs.Reset()
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/gate-runner/next", "token", "")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("standby next = %d, want 503: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "scheduler standby") {
+		t.Fatalf("standby next body = %q, want the normal not-leader rejection", w.Body.String())
+	}
+	if got := w.Header().Get("X-Kiwi-State"); got != "" {
+		t.Fatalf("standby next reported X-Kiwi-State %q, want none", got)
+	}
+	if got := f.calls; got != 0 {
+		t.Fatalf("standby reconcile attempts = %d, want 0", got)
+	}
+	if s.resourceReconciled.Load() {
+		t.Fatal("standby poll armed the reconcile gate")
+	}
+	if got := logs.String(); strings.Contains(got, "resource ledger reconciliation") || strings.Contains(got, "stale leader epoch") {
+		t.Fatalf("standby poll produced reconcile noise: %s", got)
+	}
+
+	// Leader path unchanged: the poll reconciles once, arms the gate, and
+	// with no queued work answers 204.
+	f.setLeader(true)
+	logs.Reset()
+	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/gate-runner/next", "token", ""); w.Code != http.StatusNoContent {
+		t.Fatalf("leader next = %d, want 204: %s", w.Code, w.Body.String())
+	}
+	if got := f.calls; got != 1 {
+		t.Fatalf("leader reconcile calls = %d, want 1", got)
+	}
+	if !s.resourceReconciled.Load() {
+		t.Fatal("leader poll did not arm the reconcile gate")
+	}
+	if !strings.Contains(logs.String(), "resource ledger reconciled") {
+		t.Fatalf("leader reconcile not logged: %s", logs.String())
+	}
+}
+
+// TestServerResourceReconcileStaleLeaderRaceIsQuiet pins the second half of
+// K2-C: when the leadership check passes but the fenced reconcile still fails
+// with ErrStaleLeader (a newer leader published its epoch in between), that is
+// "not leader", not a reconciliation failure. It must produce the normal
+// not-leader rejection, no error-level reconcile noise and no lease attempt —
+// never the misleading "resource ledger not reconciled".
+func TestServerResourceReconcileStaleLeaderRaceIsQuiet(t *testing.T) {
+	f := &reconcileFakeStore{dbFakeStore: newDBFakeStore(), err: storage.ErrStaleLeader}
+	s := New("token")
+	var logs bytes.Buffer
+	s.Logger = logging.NewStructured(&logs)
+	if err := s.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.runners["race-runner"] = model.Runner{ID: "race-runner", Name: "race", Capacity: 1}
+	f.mu.Unlock()
+
+	logs.Reset()
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/race-runner/next", "token", "")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("stale-leader next = %d, want 503: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "scheduler standby") {
+		t.Fatalf("stale-leader next body = %q, want the normal not-leader rejection", w.Body.String())
+	}
+	if got := w.Header().Get("X-Kiwi-State"); got != "" {
+		t.Fatalf("stale-leader next reported X-Kiwi-State %q, want none", got)
+	}
+	if got := f.calls; got != 1 {
+		t.Fatalf("reconcile attempts = %d, want the one fenced attempt", got)
+	}
+	if s.resourceReconciled.Load() {
+		t.Fatal("stale-leader race armed the reconcile gate")
+	}
+	if got := logs.String(); strings.Contains(got, "resource ledger reconciliation") || strings.Contains(got, "stale leader epoch") {
+		t.Fatalf("stale-leader race produced reconcile noise: %s", got)
 	}
 }
 

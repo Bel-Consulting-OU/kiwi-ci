@@ -34,17 +34,23 @@ func TestMemStoreProfilesAndTokens(t *testing.T) {
 		t.Fatalf("unbound serial: ok=%v err=%v", ok, err)
 	}
 
-	if err := m.UpsertRunnerToken(ctx, "runner-a", "digest-a"); err != nil {
+	// Runner IDs are validated 32-hex identifiers; the revocation below goes
+	// through the production disable transaction, which enforces that.
+	const runnerA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	if err := m.UpsertRunnerToken(ctx, runnerA, "digest-a"); err != nil {
 		t.Fatal(err)
 	}
-	if id, ok, err := m.RunnerIDForToken(ctx, "digest-a"); err != nil || !ok || id != "runner-a" {
+	if id, ok, err := m.RunnerIDForToken(ctx, "digest-a"); err != nil || !ok || id != runnerA {
 		t.Fatalf("token lookup: %q %v %v", id, ok, err)
 	}
 	if has, err := m.HasRunnerTokens(ctx); err != nil || !has {
 		t.Fatalf("HasRunnerTokens: %v %v", has, err)
 	}
 
-	if err := m.RevokeCert(ctx, "0cafe", "runner-a", "disabled"); err != nil {
+	if err := m.UpsertRunner(ctx, model.Runner{ID: runnerA, Name: runnerA, Capacity: 1, CertSerial: "0cafe"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.DisableRunnerAndRevokeCert(ctx, runnerA, "0cafe", "admin"); err != nil {
 		t.Fatal(err)
 	}
 	if revoked, err := m.CertRevoked(ctx, "0cafe"); err != nil || !revoked {

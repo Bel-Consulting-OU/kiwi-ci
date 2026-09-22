@@ -62,7 +62,11 @@ func applyAuthConfig(srv *server.Server, cfg *config.Config) error {
 
 // applyQuotaConfig populates the server's quota policy: per-repo/team
 // concurrency and queue depth, the trailing-24h daily cost/energy budgets,
-// and the fail-open switch.
+// the fail-open switch, and the untrusted resource ceilings (memory/disk in
+// bytes). A ceiling of 0 disables that dimension; the server's own defaults
+// (2 CPU / 4 GiB / 10 GiB / 256 PIDs) survive only for callers that
+// construct a server without a loaded config, since config.Default() carries
+// the same values.
 func applyQuotaConfig(srv *server.Server, cfg *config.Config) {
 	srv.QuotaLimits = quotas.Limits{
 		RepoConcurrency: cfg.Quota.RepoConcurrency,
@@ -73,6 +77,10 @@ func applyQuotaConfig(srv *server.Server, cfg *config.Config) {
 	srv.DailyCostLimit = cfg.Quota.DailyCostLimit
 	srv.DailyEnergyLimit = cfg.Quota.DailyEnergyLimit
 	srv.QuotaFailOpen = cfg.Quota.FailOpen
+	srv.UntrustedCPUCeiling = cfg.Quota.UntrustedCPUCeiling
+	srv.UntrustedMemoryCeiling = int64(cfg.Quota.UntrustedMemoryCeiling)
+	srv.UntrustedDiskCeiling = int64(cfg.Quota.UntrustedDiskCeiling)
+	srv.UntrustedPIDCeiling = int(cfg.Quota.UntrustedPIDsCeiling)
 }
 
 // buildSecretBroker constructs the secret broker chain from the

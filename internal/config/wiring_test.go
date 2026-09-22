@@ -30,6 +30,10 @@ team_queue_depth = 24
 daily_cost_limit = 1.5
 daily_energy_limit = 2500
 fail_open = true
+untrusted_cpu_ceiling = 1.5
+untrusted_memory_ceiling = 8589934592
+untrusted_disk_ceiling = 21474836480
+untrusted_pids_ceiling = 1024
 
 [secret_broker]
 broker = "vault"
@@ -59,6 +63,10 @@ max_connections = 25
 	}
 	if cfg.Quota.DailyCostLimit != 1.5 || cfg.Quota.DailyEnergyLimit != 2500 || !cfg.Quota.FailOpen {
 		t.Errorf("daily budgets not applied: %+v", cfg.Quota)
+	}
+	if cfg.Quota.UntrustedCPUCeiling != 1.5 || cfg.Quota.UntrustedMemoryCeiling != 8<<30 ||
+		cfg.Quota.UntrustedDiskCeiling != 20<<30 || cfg.Quota.UntrustedPIDsCeiling != 1024 {
+		t.Errorf("untrusted ceilings not applied: %+v", cfg.Quota)
 	}
 	if cfg.SecretBroker.Broker != "vault" || cfg.SecretBroker.VaultAddr != "https://vault.internal.example" || cfg.SecretBroker.VaultToken != "hvs.token" {
 		t.Errorf("secret broker not applied: %+v", cfg.SecretBroker)
@@ -126,18 +134,22 @@ func TestValidateNewFields(t *testing.T) {
 
 func TestApplyEnvNewFields(t *testing.T) {
 	env := map[string]string{
-		"KIWI_GITHUB_APP_ID":            "4242",
-		"KIWI_GITLAB_BASE_URL":          "https://gl.env.example",
-		"KIWI_FORGEJO_BASE_URL":         "https://fj.env.example",
-		"KIWI_AUTH_TOKENS_FILE":         "/tokens.json",
-		"KIWI_METRICS_LISTEN":           ":9091",
-		"KIWI_SECRET_BROKER":            "aws",
-		"KIWI_AWS_REGION":               "eu-west-1",
-		"KIWI_COMPONENT_REMOTE":         "https://reg.env.example",
-		"KIWI_REPO_CONCURRENCY":         "6",
-		"KIWI_DAILY_COST_LIMIT":         "2.5",
-		"KIWI_QUOTA_FAIL_OPEN":          "true",
-		"KIWI_DATABASE_MAX_CONNECTIONS": "17",
+		"KIWI_GITHUB_APP_ID":                  "4242",
+		"KIWI_GITLAB_BASE_URL":                "https://gl.env.example",
+		"KIWI_FORGEJO_BASE_URL":               "https://fj.env.example",
+		"KIWI_AUTH_TOKENS_FILE":               "/tokens.json",
+		"KIWI_METRICS_LISTEN":                 ":9091",
+		"KIWI_SECRET_BROKER":                  "aws",
+		"KIWI_AWS_REGION":                     "eu-west-1",
+		"KIWI_COMPONENT_REMOTE":               "https://reg.env.example",
+		"KIWI_REPO_CONCURRENCY":               "6",
+		"KIWI_DAILY_COST_LIMIT":               "2.5",
+		"KIWI_QUOTA_FAIL_OPEN":                "true",
+		"KIWI_QUOTA_UNTRUSTED_CPU_CEILING":    "3",
+		"KIWI_QUOTA_UNTRUSTED_MEMORY_CEILING": "17179869184",
+		"KIWI_QUOTA_UNTRUSTED_DISK_CEILING":   "32212254720",
+		"KIWI_QUOTA_UNTRUSTED_PIDS_CEILING":   "512",
+		"KIWI_DATABASE_MAX_CONNECTIONS":       "17",
 	}
 	for k, v := range env {
 		os.Setenv(k, v)
@@ -169,6 +181,10 @@ func TestApplyEnvNewFields(t *testing.T) {
 	if cfg.Quota.RepoConcurrency != 6 || cfg.Quota.DailyCostLimit != 2.5 || !cfg.Quota.FailOpen {
 		t.Errorf("quota = %+v", cfg.Quota)
 	}
+	if cfg.Quota.UntrustedCPUCeiling != 3 || cfg.Quota.UntrustedMemoryCeiling != 16<<30 ||
+		cfg.Quota.UntrustedDiskCeiling != 30<<30 || cfg.Quota.UntrustedPIDsCeiling != 512 {
+		t.Errorf("untrusted ceilings = %+v", cfg.Quota)
+	}
 	if cfg.Database.MaxConnections != 17 {
 		t.Errorf("max connections = %d", cfg.Database.MaxConnections)
 	}
@@ -199,6 +215,10 @@ func TestOverrideFromFlagsNewFlags(t *testing.T) {
 	_ = fs.String("daily-cost-limit", "", "")
 	_ = fs.String("daily-energy-limit", "", "")
 	_ = fs.String("quota-fail-open", "", "")
+	_ = fs.String("untrusted-cpu-ceiling", "", "")
+	_ = fs.String("untrusted-memory-ceiling", "", "")
+	_ = fs.String("untrusted-disk-ceiling", "", "")
+	_ = fs.String("untrusted-pids-ceiling", "", "")
 	args := []string{
 		"-github-app-id", "4242",
 		"-github-app-private-key", "/k.pem",
@@ -223,6 +243,10 @@ func TestOverrideFromFlagsNewFlags(t *testing.T) {
 		"-daily-cost-limit", "2.5",
 		"-daily-energy-limit", "900",
 		"-quota-fail-open", "true",
+		"-untrusted-cpu-ceiling", "1.25",
+		"-untrusted-memory-ceiling", "2147483648",
+		"-untrusted-disk-ceiling", "5368709120",
+		"-untrusted-pids-ceiling", "128",
 	}
 	if err := fs.Parse(args); err != nil {
 		t.Fatal(err)
@@ -248,6 +272,10 @@ func TestOverrideFromFlagsNewFlags(t *testing.T) {
 	}
 	if cfg.Quota.RepoConcurrency != 6 || cfg.Quota.TeamConcurrency != 8 || cfg.Quota.RepoQueueDepth != 10 || cfg.Quota.TeamQueueDepth != 12 || cfg.Quota.DailyCostLimit != 2.5 || cfg.Quota.DailyEnergyLimit != 900 || !cfg.Quota.FailOpen {
 		t.Errorf("quota = %+v", cfg.Quota)
+	}
+	if cfg.Quota.UntrustedCPUCeiling != 1.25 || cfg.Quota.UntrustedMemoryCeiling != 2<<30 ||
+		cfg.Quota.UntrustedDiskCeiling != 5<<30 || cfg.Quota.UntrustedPIDsCeiling != 128 {
+		t.Errorf("untrusted ceilings = %+v", cfg.Quota)
 	}
 	// Bad numeric values surface as errors.
 	bad := flag.NewFlagSet("bad", flag.ContinueOnError)

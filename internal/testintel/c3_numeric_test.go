@@ -143,9 +143,12 @@ func TestValidateReportPayloadNumericPolicy(t *testing.T) {
 // TestAggregateAndValidatorAgreeOnNumbers pins the D4-C "parser and
 // validator agree" contract on the aggregate path: the parser sanitizes
 // producer durations to zero (so its output always passes the duration
-// policy), while an impossible producer counter relation is rejected by the
-// shared validator that AggregateMasked invokes, never silently written to
-// the model.
+// policy) and RECONCILES a producer-declared counter relation its cases
+// cannot explain, so the aggregate the runner uploads is always accepted by
+// the shared validator instead of the runner silently discarding a
+// contradicting producer file. The validator itself stays strict for a
+// direct /tests submission (see TestE5CounterMatrixRejectsContradictions and
+// TestValidateReportPayloadNumericPolicy).
 func TestAggregateAndValidatorAgreeOnNumbers(t *testing.T) {
 	ws := t.TempDir()
 	writeFixture(t, ws, "sanitized.xml", c3DurationReport)
@@ -157,11 +160,21 @@ func TestAggregateAndValidatorAgreeOnNumbers(t *testing.T) {
 		t.Fatalf("parser output rejected by the shared validator: %v", err)
 	}
 
+	// The single materialized case passes, yet the producer declares
+	// failures=1 errors=1. The reconciliation must produce a satisfiable
+	// relation (here: the unsupported errors claim is conceded) rather than
+	// an aggregate ValidateReportPayload would reject.
 	writeFixture(t, ws, "impossible.xml",
 		`<testsuite name="s" tests="1" failures="1" errors="1"><testcase name="t"/></testsuite>`)
-	_, err = Aggregate(ws, []string{"impossible.xml"})
-	if !errors.Is(err, ErrLimitExceeded) || !strings.Contains(err.Error(), "failures+errors") {
-		t.Fatalf("impossible counter relation = %v, want the shared validator's rejection", err)
+	agg, err = Aggregate(ws, []string{"impossible.xml"})
+	if err != nil {
+		t.Fatalf("producer counter contradiction must be reconciled, not rejected: %v", err)
+	}
+	if err := ValidateReportPayload(agg); err != nil {
+		t.Fatalf("reconciled aggregate rejected by the shared validator: %v", err)
+	}
+	if agg.Tests != 1 || agg.Failures+agg.Errors+agg.Skipped > agg.Tests {
+		t.Fatalf("reconciled counters = tests %d failures %d errors %d skipped %d", agg.Tests, agg.Failures, agg.Errors, agg.Skipped)
 	}
 
 	// The parser's own numeric sanitizing: a negative declared counter is

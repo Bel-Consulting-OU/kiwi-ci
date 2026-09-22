@@ -155,6 +155,8 @@ func TestDispatchRoutesEveryCommand(t *testing.T) {
 		{"outbox", []string{"outbox", "--no-such-flag"}},
 		{"config-empty", []string{"config"}},
 		{"config", []string{"config", "--no-such-flag"}},
+		{"storage-empty", []string{"storage"}},
+		{"storage", []string{"storage", "--no-such-flag"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -282,12 +284,39 @@ func TestOutboxCommand(t *testing.T) {
 	}
 }
 
+// TestStorageCommand mirrors TestDatabaseCommand for the operator storage
+// repair command group.
+func TestStorageCommand(t *testing.T) {
+	ctx := context.Background()
+	if err := app.Storage(ctx, nil); err == nil || !strings.Contains(err.Error(), "requires a subcommand") {
+		t.Fatalf("Storage(nil) = %v", err)
+	}
+	if err := app.Storage(ctx, []string{"compact"}); err == nil || !strings.Contains(err.Error(), "unknown storage subcommand") {
+		t.Fatalf("Storage(compact) = %v", err)
+	}
+	err := app.Storage(ctx, []string{"reconcile-reservations", "--no-such-flag"})
+	if err == nil {
+		t.Fatal("Storage(reconcile-reservations bad flag) = nil, want flag error")
+	}
+	if strings.Contains(err.Error(), "subcommand") {
+		t.Fatalf("Storage(reconcile-reservations) rejected a known subcommand: %v", err)
+	}
+	// A known subcommand without a database URL fails on the URL requirement,
+	// never as a usage/subcommand error.
+	t.Setenv("KIWI_DATABASE_URL", "")
+	err = app.Storage(ctx, []string{"reconcile-reservations"})
+	if err == nil || !strings.Contains(err.Error(), "--database-url is required") {
+		t.Fatalf("Storage(reconcile-reservations) without a URL = %v", err)
+	}
+}
+
 func TestUsageListsCommands(t *testing.T) {
 	text := captureUsage(t, usage)
 	for _, want := range []string{
 		"kiwi run", "kiwi validate", "kiwi explain", "kiwi doctor",
 		"kiwi server", "kiwi runner", "kiwi dispatch", "kiwi init",
 		"kiwi tui", "kiwi config check", "kiwi outbox dead-letters",
+		"kiwi storage  reconcile-reservations",
 		"kiwi version", "identical local and remote DAG execution",
 	} {
 		if !strings.Contains(text, want) {

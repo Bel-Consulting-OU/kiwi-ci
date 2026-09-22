@@ -326,6 +326,75 @@ func TestCustomUntrustedCeilings(t *testing.T) {
 	}
 }
 
+// TestUntrustedCeilingOverrideChangesAcceptance (K5-A): the configured
+// ceiling is what decides admission, not a hard-coded constant. A request
+// above the default ceiling is rejected; after the operator raises that
+// dimension on the same server the identical pipeline is admitted and the
+// declared request is preserved exactly. This is the behavior the
+// quota.untrusted_*_ceiling / --untrusted-*-ceiling configuration changes.
+func TestUntrustedCeilingOverrideChangesAcceptance(t *testing.T) {
+	cases := []struct {
+		name     string
+		resource string
+		raise    func(*Server)
+		wantCPU  float64
+		wantMem  int64
+		wantDisk int64
+		wantPIDs int
+	}{
+		{"cpu", "      cpu: 8\n", func(s *Server) { s.UntrustedCPUCeiling = 16 }, 8, 4 << 30, 10 << 30, 256},
+		{"memory", "      memory: 8GiB\n", func(s *Server) { s.UntrustedMemoryCeiling = 16 << 30 }, 2, 8 << 30, 10 << 30, 256},
+		{"disk", "      disk: 20GiB\n", func(s *Server) { s.UntrustedDiskCeiling = 30 << 30 }, 2, 4 << 30, 20 << 30, 256},
+		{"pids", "      pids: 4096\n", func(s *Server) { s.UntrustedPIDCeiling = 8192 }, 2, 4 << 30, 10 << 30, 4096},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			yaml := `version: 1
+jobs:
+  build:
+    runtime: container
+    image: alpine@sha256:` + pinnedImageDigest + `
+    resources:
+` + tc.resource + `    steps:
+      - run: echo hi
+`
+			s, err := NewPersistent("token", "token", t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The default ceiling rejects the same pipeline first, proving
+			// the override (not the declaration) flips the outcome.
+			if _, err := s.enqueue(context.Background(), SubmitRun{
+				RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
+				Ref: "main", Pipeline: yaml,
+			}); err == nil {
+				t.Fatalf("default ceiling accepted the oversized %s request", tc.name)
+			}
+			tc.raise(s)
+			run, err := s.enqueue(context.Background(), SubmitRun{
+				RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
+				Ref: "main", Pipeline: yaml,
+			})
+			if err != nil {
+				t.Fatalf("raised ceiling rejected the declared %s request: %v", tc.name, err)
+			}
+			s.mu.Lock()
+			var job model.Job
+			for _, j := range s.jobs {
+				if j.RunID == run.ID {
+					job = j
+				}
+			}
+			s.mu.Unlock()
+			if job.CPURequest != tc.wantCPU || job.MemoryRequest != tc.wantMem || job.DiskRequest != tc.wantDisk || job.PIDsRequest != tc.wantPIDs {
+				t.Fatalf("requests = %v/%d/%d/%d, want %v/%d/%d/%d",
+					job.CPURequest, job.MemoryRequest, job.DiskRequest, job.PIDsRequest,
+					tc.wantCPU, tc.wantMem, tc.wantDisk, tc.wantPIDs)
+			}
+		})
+	}
+}
+
 // TestZeroUntrustedCeilingDisablesDimension (D2-A): a zero ceiling disables
 // that dimension entirely — no rejection and no fill — while the remaining
 // dimensions keep their ceilings.

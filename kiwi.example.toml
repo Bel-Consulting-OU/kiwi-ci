@@ -152,6 +152,17 @@
 # daily_energy_limit = 0
 # fail_open = false
 
+# Server-side resource ceilings applied to UNTRUSTED jobs at admission: an
+# explicit request above a ceiling is rejected (400,
+# untrusted_resource_ceiling_exceeded) before the run is signed or persisted,
+# an unset dimension is filled with the ceiling, and trusted jobs are
+# unconstrained. Memory and disk are plain byte counts; 0 disables that
+# dimension. Defaults: 2 CPU, 4 GiB, 10 GiB, 256 PIDs.
+# untrusted_cpu_ceiling = 2                # cores
+# untrusted_memory_ceiling = 4294967296    # 4 GiB
+# untrusted_disk_ceiling = 10737418240     # 10 GiB
+# untrusted_pids_ceiling = 256
+
 [secret_broker]
 # backend = "static"   # vault | aws | gcp | azure | onepassword | static
 # vault_addr = ""

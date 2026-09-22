@@ -265,6 +265,19 @@ type Runner struct {
 	CostPerHour float64 `json:"cost_per_hour,omitempty"`
 	PowerWatts  float64 `json:"power_watts,omitempty"`
 
+	// ProfileID records the runner profile whose scheduling attributes were
+	// COPIED onto this row at registration ("" when the row carries only the
+	// runner's own self-reported attributes, e.g. legacy dev-mode
+	// registration). It is the revocation marker of the runner-ID binding
+	// model: while it is set, every scheduling attribute below is
+	// profile-derived, and unlinking the runner (UnlinkRunnerProfile, the
+	// admin DELETE endpoint) clears the marked attributes in the SAME store
+	// operation so a removed profile cannot keep applying through the
+	// registration snapshot. It is server-owned: the registration handler
+	// overwrites it with the resolved profile's ID (or clears it when no
+	// profile applies), so a client-asserted profile_id never survives.
+	ProfileID string `json:"profile_id,omitempty"`
+
 	// Runner certificate state.
 	CertSerial string     `json:"cert_serial,omitempty"`
 	RevokedAt  *time.Time `json:"revoked_at,omitempty"`

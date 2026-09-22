@@ -1358,15 +1358,6 @@ func leaseRates(linked bool, p model.RunnerProfile, runnerCost, runnerWatts floa
 	return runnerCost, runnerWatts
 }
 
-// profileForSerialTx resolves the LIVE profile bound to a certificate serial
-// inside the caller's transaction (the shared link-aware query, see
-// profileForSerialQ). linked reports whether a cert_profile_links row exists;
-// found reports whether its profile row exists. A linked-but-missing profile
-// fails the claim closed.
-func profileForSerialTx(ctx context.Context, tx pgx.Tx, serial string) (p model.RunnerProfile, linked, found bool, err error) {
-	return profileForSerialQ(ctx, tx, serial)
-}
-
 // profileAllowsCandidate evaluates the live profile's scheduling
 // predicates against one candidate job: runtime capability, canonical repo
 // allowlist, required labels and placement regions. An empty profile field
@@ -1542,21 +1533,22 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 	// (the explicit certificate-serial binding when the runner presents a
 	// registered serial, then the runner_profile_links runner-ID binding,
 	// then the registration snapshot) and replace the registration snapshot
-	// with its values for every scheduling predicate. A dangling
-	// certificate-serial binding fails the claim closed; a dangling
-	// runner-ID binding resolves as "no profile" (the snapshot, never more),
-	// so a profile DELETE can neither resurrect a deleted profile nor fail a
-	// runner that registration already admitted.
-	resolution, err := ResolveLiveProfileBinding(runnerCertSerial,
-		func() (model.RunnerProfile, bool, bool, error) { return profileForSerialTx(ctx, tx, runnerCertSerial) },
-		func() (model.RunnerProfile, bool, bool, error) { return profileForRunnerIDQ(ctx, tx, claim.RunnerID) },
-	)
+	// with its values for every scheduling predicate. Both bindings are
+	// resolved in ONE statement (liveProfileResolutionTx) while the job and
+	// runner rows are locked, and the raw states are decided by the same
+	// shared precedence helper the scheduler prefilter and the fleet view
+	// use. A dangling certificate-serial OR runner-ID binding fails the
+	// claim closed; a profile DELETE can therefore neither resurrect a
+	// deleted profile nor fail a runner whose snapshot registration already
+	// admitted it (the snapshot is never larger than what the binding
+	// granted).
+	resolution, err := liveProfileResolutionTx(ctx, tx, claim.RunnerID, runnerCertSerial)
 	if err != nil {
 		return model.Job{}, err
 	}
 	if resolution.DeniesLease() {
-		// A runner whose explicitly bound certificate profile vanished takes
-		// no work: fail closed.
+		// A runner whose explicitly bound profile vanished takes no work:
+		// fail closed.
 		return model.Job{}, ErrNoCapacity
 	}
 	profile := resolution.Profile
@@ -4964,30 +4956,6 @@ func (s *PostgresStore) HasRunnerTokens(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	return exists, nil
-}
-
-func (s *PostgresStore) RevokeCert(ctx context.Context, serial, runnerID, reason string) error {
-	if serial == "" {
-		return fmt.Errorf("storage: certificate serial is required")
-	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `INSERT INTO cert_revocations (serial, revoked_at, reason, runner_id) VALUES ($1, now(), $2, $3) ON CONFLICT (serial) DO NOTHING`, serial, reason, runnerID); err != nil {
-		return err
-	}
-	// The runner row's revoked_at mirrors the durable revocation so the
-	// disable flow and identity verification see the same state. to_jsonb of
-	// the timestamptz renders RFC3339 (with the "T" separator), which is what
-	// model.Runner's time.Time JSON decoding requires.
-	if runnerID != "" {
-		if _, err := tx.Exec(ctx, `UPDATE runners SET payload = jsonb_set(payload, '{revoked_at}', to_jsonb(now()), true) WHERE id=$1`, runnerID); err != nil {
-			return err
-		}
-	}
-	return tx.Commit(ctx)
 }
 
 func (s *PostgresStore) CertRevoked(ctx context.Context, serial string) (bool, error) {

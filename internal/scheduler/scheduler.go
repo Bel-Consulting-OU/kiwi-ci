@@ -390,7 +390,6 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 			Generation:             generation,
 			ExpiresAt:              expires,
 			RunnerCapacity:         eff.Capacity,
-			ResourceCapacity:       eff.ResourceCapacity,
 			Runtime:                storage.JobRuntime(candidate),
 			CanonRepoID:            storage.RepoIDForJob(candidate),
 			RepoFullName:           candidate.RepoFullName,
@@ -483,11 +482,10 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 // edit therefore takes effect on the next lease for mTLS AND per-runner
 // bearer identities.
 //
-// A dangling certificate-serial binding is presented as a zero-capacity
-// runner (the claim fails it closed with ErrNoCapacity), so the prefilter
-// never proposes candidates the claim will reject. A dangling runner-ID
-// binding resolves as "no profile": the registration snapshot applies,
-// exactly like an unbound runner. Stores without the resolver contract fall
+// A dangling binding fails the lease closed ([LiveProfileResolution.
+// DeniesLease]) and is presented here as a zero-capacity runner (the claim
+// fails it closed with ErrNoCapacity), so the prefilter never proposes
+// candidates the claim will reject. Stores without the resolver contract fall
 // back to composing the same precedence from their profile read contracts
 // (without dangling detection, since those report only found/not-found); the
 // claim transaction remains the authoritative decision.
@@ -501,15 +499,7 @@ func (s *DBScheduler) effectiveRunner(ctx context.Context, ri model.Runner) mode
 			log.Printf("scheduler: resolve live profile for runner %s: %v", ri.ID, err)
 			return ri
 		}
-		switch {
-		case resolution.DeniesLease():
-			ri.Capacity = 0
-			return ri
-		case resolution.Applies():
-			return storage.ResolveRunnerProfile(ri, resolution.Profile, true)
-		default:
-			return ri
-		}
+		return applyLiveResolution(ri, resolution)
 	}
 	var runnerLookup storage.ProfileBindingLookup
 	if ls, ok := s.Store.(storage.RunnerProfileLinkStore); ok {
@@ -530,10 +520,25 @@ func (s *DBScheduler) effectiveRunner(ctx context.Context, ri model.Runner) mode
 		log.Printf("scheduler: resolve live profile for runner %s: %v", ri.ID, err)
 		return ri
 	}
-	if resolution.Applies() {
+	return applyLiveResolution(ri, resolution)
+}
+
+// applyLiveResolution overlays one live-profile resolution on the runner's
+// registration snapshot: a dangling binding presents the runner as
+// zero-capacity (the claim fails it closed), a found profile replaces the
+// snapshot attributes, and no binding keeps the snapshot unchanged. It is the
+// ONE overlay body the per-runner and the batched entry points share, so the
+// two paths cannot diverge.
+func applyLiveResolution(ri model.Runner, resolution storage.LiveProfileResolution) model.Runner {
+	switch {
+	case resolution.DeniesLease():
+		ri.Capacity = 0
+		return ri
+	case resolution.Applies():
 		return storage.ResolveRunnerProfile(ri, resolution.Profile, true)
+	default:
+		return ri
 	}
-	return ri
 }
 
 // EffectiveRunner exposes the LIVE scheduling view of one runner (profile
@@ -544,11 +549,64 @@ func (s *DBScheduler) EffectiveRunner(ctx context.Context, ri model.Runner) mode
 	return s.effectiveRunner(ctx, ri)
 }
 
+// EffectiveRunnerBatch resolves the LIVE scheduling view of every runner in
+// ONE set-based read when the store implements storage.FleetRunnerViewStore:
+// the batched binding rows are resolved through the SAME shared precedence
+// the per-runner path uses (storage.FleetRunnerBinding.Resolve ->
+// ResolveLiveProfileBinding) and overlaid by the SAME body, so a batched view
+// always equals EffectiveRunner's answer for the same runner.
+//
+// ok=false means the caller must use the per-runner entry point: the store
+// has no batch contract, or the batch read failed (logged; the claim remains
+// authoritative). Even on ok=true a runner the batch did not return (it
+// raced the listing) is resolved per-runner, so the map is complete for every
+// input runner.
+func (s *DBScheduler) EffectiveRunnerBatch(ctx context.Context, runners []model.Runner) (map[string]model.Runner, bool) {
+	vs, ok := s.Store.(storage.FleetRunnerViewStore)
+	if !ok {
+		return nil, false
+	}
+	bindings, err := vs.FleetRunnerProfileBindings(ctx)
+	if err != nil {
+		log.Printf("scheduler: batch resolve live profiles: %v", err)
+		return nil, false
+	}
+	out := make(map[string]model.Runner, len(runners))
+	for _, ri := range runners {
+		binding, found := bindings[ri.ID]
+		if !found {
+			out[ri.ID] = s.effectiveRunner(ctx, ri)
+			continue
+		}
+		out[ri.ID] = applyLiveResolution(ri, binding.Resolve(ri.CertSerial))
+	}
+	return out, true
+}
+
 // ReservedResources exposes the runner's live resource reservation sum to the
 // queue-reason explainer. A store without the ledger contract reports zero,
 // which makes the resource reasons vacuous.
 func (s *DBScheduler) ReservedResources(ctx context.Context, runnerID string) model.ResourceCapacity {
 	return s.reservedResources(ctx, runnerID)
+}
+
+// ReservedResourcesBatch returns every runner's live reservation sum from ONE
+// GROUP BY runner_id read when the store implements
+// storage.FleetRunnerViewStore, byte-for-byte the quantities the per-runner
+// ReservedResources returns. ok=false means the caller falls back to the
+// per-runner reads (the store has no batch contract, or the batch read failed
+// and was logged).
+func (s *DBScheduler) ReservedResourcesBatch(ctx context.Context) (map[string]model.ResourceCapacity, bool) {
+	vs, ok := s.Store.(storage.FleetRunnerViewStore)
+	if !ok {
+		return nil, false
+	}
+	sums, err := vs.RunnerReservationSums(ctx)
+	if err != nil {
+		log.Printf("scheduler: batch read reserved resources: %v", err)
+		return nil, false
+	}
+	return sums, true
 }
 
 // reservedResources reads the runner's live resource reservations when the
@@ -612,39 +670,6 @@ func (s *DBScheduler) CancelRun(ctx context.Context, runID, reason string) error
 		return err
 	}
 	return nil
-}
-
-// CancelJobsByRunner is the runner disable kill switch: it invalidates every
-// active lease the runner holds through ONE transactional store operation
-// (storage.RecoveryStore.RevokeRunnerLeases). Each running job either
-// requeues (the infrastructure retry budget still available) or cancels;
-// lease fields are cleared so a stale lease token is dead, the runner's
-// active set and counters are released, the quota counters move, dependent
-// jobs and run statuses are recomputed, and the audit events are written —
-// all in the same durable commit, so a crash can never strand a runner slot
-// or a quota reservation. It returns the number of invalidated leases.
-//
-// The requeue/exhaustion decision consumes the SAME attempt count as
-// RecoverExpired: attempts increment exactly once per lease (see
-// storage.AcquireLeaseAtomic / AcquireLease), so a lease recovered here is
-// not charged a second attempt — the budget compares the job's attempt
-// count, it does not manufacture a new one.
-//
-// A store without the transactional contract fails closed instead of falling
-// back to the retired multi-step sequence.
-func (s *DBScheduler) CancelJobsByRunner(ctx context.Context, runnerID, reason string) (int, error) {
-	if runnerID == "" {
-		return 0, fmt.Errorf("scheduler: cancel jobs by runner: empty runner id")
-	}
-	rs, ok := s.Store.(storage.RecoveryStore)
-	if !ok {
-		return 0, fmt.Errorf("scheduler: store does not support transactional runner lease revocation")
-	}
-	revoked, err := rs.RevokeRunnerLeases(ctx, runnerID, reason)
-	if err != nil {
-		return 0, err
-	}
-	return len(revoked), nil
 }
 
 // recoveryPageSize bounds every recovery-discovery page. Candidate discovery

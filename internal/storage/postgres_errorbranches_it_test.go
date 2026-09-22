@@ -145,7 +145,6 @@ func TestPostgresIntegrationValidationSweep(t *testing.T) {
 		}
 		return nil
 	}(), false)
-	bad("RevokeCert/empty-serial", st.RevokeCert(ctx, "", good, "reason"), true)
 	bad("CertRevoked/empty-serial", func() error {
 		revoked, err := st.CertRevoked(ctx, "")
 		if revoked || err != nil {

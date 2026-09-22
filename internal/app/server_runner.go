@@ -415,6 +415,10 @@ func Server(ctx context.Context, args []string) error {
 	dailyCostLimit := fs.String("daily-cost-limit", "", "trailing-24h cost budget (0 = unlimited)")
 	dailyEnergyLimit := fs.String("daily-energy-limit", "", "trailing-24h energy budget in Wh (0 = unlimited)")
 	quotaFailOpen := fs.Bool("quota-fail-open", false, "let enqueues/leases proceed when the usage store is unavailable instead of failing closed")
+	untrustedCPUCeiling := fs.String("untrusted-cpu-ceiling", "", "untrusted job CPU ceiling in cores (0 disables; default 2)")
+	untrustedMemoryCeiling := fs.String("untrusted-memory-ceiling", "", "untrusted job memory ceiling in bytes (0 disables; default 4 GiB = 4294967296)")
+	untrustedDiskCeiling := fs.String("untrusted-disk-ceiling", "", "untrusted job disk ceiling in bytes (0 disables; default 10 GiB = 10737418240)")
+	untrustedPIDsCeiling := fs.String("untrusted-pids-ceiling", "", "untrusted job PIDs ceiling (0 disables; default 256)")
 	var downstreamAllow repeatFlag
 	fs.Var(&downstreamAllow, "downstream-allow", "downstream dispatch authorization: target=src[,src...] (repeatable; a target with no sources allows any source)")
 	var downstreamTrustedIngress repeatFlag
@@ -451,7 +455,7 @@ func Server(ctx context.Context, args []string) error {
 	// The flag pointers exist only to register the flags; their values are
 	// read back through config.OverrideFromFlags (which inspects only
 	// explicitly set flags).
-	discard(listen, token, adminToken, webhookSecret, githubToken, externalURL, tlsCert, tlsKey, runnerCACert, runnerCAKey, runnerEnrollToken, databaseURL, mode, rateLimitPerSecond, rateLimitBurst, otelEndpoint, drainOnSigterm, githubAppID, githubAppPrivateKey, gitlabToken, gitlabWebhookSecret, gitlabBaseURL, forgejoToken, forgejoWebhookSecret, forgejoBaseURL, tokensFile, runnerTokensFile, databaseMaxConnections, metricsListen, secretBroker, vaultAddr, vaultToken, awsRegion, awsAccessKey, awsSecretKey, awsToken, gcpCredentials, gcpProject, azureTenant, azureClientID, azureClientSecret, azureVaultURL, onePasswordHost, onePasswordToken, onePasswordVault, componentRegistryDir, componentRemote, componentRemoteToken, repoConcurrency, teamConcurrency, repoQueueDepth, teamQueueDepth, dailyCostLimit, dailyEnergyLimit, quotaFailOpen)
+	discard(listen, token, adminToken, webhookSecret, githubToken, externalURL, tlsCert, tlsKey, runnerCACert, runnerCAKey, runnerEnrollToken, databaseURL, mode, rateLimitPerSecond, rateLimitBurst, otelEndpoint, drainOnSigterm, githubAppID, githubAppPrivateKey, gitlabToken, gitlabWebhookSecret, gitlabBaseURL, forgejoToken, forgejoWebhookSecret, forgejoBaseURL, tokensFile, runnerTokensFile, databaseMaxConnections, metricsListen, secretBroker, vaultAddr, vaultToken, awsRegion, awsAccessKey, awsSecretKey, awsToken, gcpCredentials, gcpProject, azureTenant, azureClientID, azureClientSecret, azureVaultURL, onePasswordHost, onePasswordToken, onePasswordVault, componentRegistryDir, componentRemote, componentRemoteToken, repoConcurrency, teamConcurrency, repoQueueDepth, teamQueueDepth, dailyCostLimit, dailyEnergyLimit, quotaFailOpen, untrustedCPUCeiling, untrustedMemoryCeiling, untrustedDiskCeiling, untrustedPIDsCeiling)
 
 	// Effective values after the precedence merge.
 	listenV := cfg.Server.Listen

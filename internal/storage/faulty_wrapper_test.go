@@ -414,10 +414,7 @@ func faultyWrapperCases() map[string]wrapperCase {
 			_, err := f.HasRunnerTokens(ctx())
 			return err
 		}},
-		"RevokeCert": {mutates: true, call: func(f *FaultyStore) error {
-			return f.RevokeCert(ctx(), "serial", testRunner.ID, "reason")
-		}},
-		"CertRevoked": {seed: func(m *memStore) { _ = m.RevokeCert(ctx(), "serial", testRunner.ID, "reason") }, call: func(f *FaultyStore) error {
+		"CertRevoked": {seed: func(m *memStore) { seedMemRevocation(m, "serial", testRunner.ID) }, call: func(f *FaultyStore) error {
 			_, err := f.CertRevoked(ctx(), "serial")
 			return err
 		}},
@@ -513,6 +510,16 @@ func faultyWrapperCases() map[string]wrapperCase {
 // method: the fault-free call must reach the inner store, and a mutating
 // wrapper armed with FailAfter=1 must surface the injected error without
 // touching the inner store.
+// seedMemRevocation records one revocation in the in-memory store. A
+// revocation is only ever written by RunnerDisableStore.DisableRunnerAndRevokeCert
+// in production (the standalone RevokeCert was removed as dead code), so the
+// test seeds the ledger entry directly instead of inventing a production API.
+func seedMemRevocation(m *memStore, serial, runnerID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.revocations[serial] = runnerID
+}
+
 func TestFaultyStoreWrappersPassThroughAndFault(t *testing.T) {
 	for name, tc := range faultyWrapperCases() {
 		t.Run(name, func(t *testing.T) {
@@ -978,9 +985,6 @@ func missingOptionalInterfaceCases() map[string]missingIfaceCase {
 		"HasRunnerTokens": {iface: "RunnerTokenStore", call: func(f *FaultyStore) error {
 			_, err := f.HasRunnerTokens(ctx())
 			return err
-		}},
-		"RevokeCert": {mutates: true, iface: "CertRevocationStore", call: func(f *FaultyStore) error {
-			return f.RevokeCert(ctx(), "", "", "")
 		}},
 		"CertRevoked": {iface: "CertRevocationStore", call: func(f *FaultyStore) error {
 			_, err := f.CertRevoked(ctx(), "")

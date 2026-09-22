@@ -61,12 +61,34 @@ func (s *PostgresStore) requireClusterKeyPool() error {
 // EnsureClusterKeySchema creates the cluster_keys table when absent. It runs
 // against the operational pool so the table lands in the same schema as the
 // rest of the store (the integration tests' per-test search_path included).
+//
+// The CREATE is wrapped in a transaction that holds the SAME transaction-
+// scoped advisory lock Migrate uses. CREATE TABLE IF NOT EXISTS resolves the
+// catalog BEFORE inserting its own catalog rows, so two replicas bootstrapping
+// simultaneously (or a bootstrap racing a migration) can both miss the check
+// and then collide on the catalog insert with SQLSTATE 23505, aborting one
+// startup with a raw duplicate-key error. The advisory lock serializes the
+// bootstrap instead: the waiting replica's statement sees the committed table
+// and becomes a no-op. The lock is the established serialization primitive in
+// this package (per-migration and cross-replica), it also orders the bootstrap
+// against schema migrations, and it removes the race outright instead of
+// retrying on a raw SQLSTATE that could have other causes.
 func (s *PostgresStore) EnsureClusterKeySchema(ctx context.Context) error {
 	if err := s.requireClusterKeyPool(); err != nil {
 		return err
 	}
-	_, err := s.pool.Exec(ctx, clusterKeySchemaSQL)
-	return err
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('kiwi_schema_migrations'))`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, clusterKeySchemaSQL); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // GetClusterKey reads one kind's blob. found=false with a nil error means the
