@@ -63,7 +63,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		if d.IsDir() {
 			switch d.Name() {
-			case ".git", "dist", "tmp", "vendor", "testdata":
+			case ".git", "dist", "tmp", "vendor", "testdata",
+				".kilo", ".cache", "node_modules", ".venv", "bin":
+				return filepath.SkipDir
+			}
+			// A nested .git (Agent Manager worktree or vendored checkout)
+			// means a second repository lives inside this tree; never index it.
+			if _, err := os.Stat(filepath.Join(p, ".git")); err == nil {
 				return filepath.SkipDir
 			}
 			return nil
