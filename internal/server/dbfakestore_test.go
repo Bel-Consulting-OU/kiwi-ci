@@ -260,6 +260,7 @@ var _ storage.ArtifactSidecarStore = (*dbFakeStore)(nil)
 var _ storage.SecretClaimStore = (*dbFakeStore)(nil)
 var _ storage.SecretClaimReleaser = (*dbFakeStore)(nil)
 var _ storage.ProfileStore = (*dbFakeStore)(nil)
+var _ storage.LiveProfileResolver = (*dbFakeStore)(nil)
 var _ storage.RunnerTokenStore = (*dbFakeStore)(nil)
 var _ storage.CertRevocationStore = (*dbFakeStore)(nil)
 var _ storage.EnrollGrantStore = (*dbFakeStore)(nil)
@@ -2871,14 +2872,18 @@ func (f *dbFakeStore) AcquireLeaseAtomic(ctx context.Context, claim storage.Leas
 		return model.Job{}, storage.ErrNoCapacity
 	}
 	eff := r
-	if strings.TrimSpace(r.CertSerial) != "" {
-		if profileID, linked := f.certProfiles[r.CertSerial]; linked {
-			p, pok := f.profiles[profileID]
-			if !pok {
-				return model.Job{}, storage.ErrNoCapacity
-			}
-			eff = storage.ResolveRunnerProfile(r, p, true)
-		}
+	// Mirror the SQL claim's live resolution: the ONE shared precedence
+	// (certificate-serial binding, then runner-ID binding, then the
+	// registration snapshot); a dangling certificate binding fails closed.
+	resolution, lerr := f.resolveLiveRunnerProfileLocked(claim.RunnerID, r.CertSerial)
+	if lerr != nil {
+		return model.Job{}, lerr
+	}
+	if resolution.DeniesLease() {
+		return model.Job{}, storage.ErrNoCapacity
+	}
+	if resolution.Applies() {
+		eff = storage.ResolveRunnerProfile(r, resolution.Profile, true)
 	}
 	if f.atomicLeaseCapacity > 0 {
 		eff.Capacity = f.atomicLeaseCapacity
@@ -3300,6 +3305,37 @@ func (f *dbFakeStore) ProfileForRunnerID(ctx context.Context, runnerID string) (
 		return model.RunnerProfile{}, false, nil
 	}
 	return p, true, nil
+}
+
+// ResolveLiveRunnerProfile mirrors the SQL store's shared live resolution so
+// the scheduler prefilter and the queue explainers consume the same
+// effective profile the fake claim applies.
+func (f *dbFakeStore) ResolveLiveRunnerProfile(ctx context.Context, runnerID, serial string) (storage.LiveProfileResolution, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.resolveLiveRunnerProfileLocked(runnerID, serial)
+}
+
+// resolveLiveRunnerProfileLocked is the shared resolution body (caller holds
+// f.mu), so AcquireLeaseAtomic can reuse it inside its own critical section.
+func (f *dbFakeStore) resolveLiveRunnerProfileLocked(runnerID, serial string) (storage.LiveProfileResolution, error) {
+	return storage.ResolveLiveProfileBinding(serial,
+		func() (model.RunnerProfile, bool, bool, error) {
+			id, ok := f.certProfiles[serial]
+			if !ok {
+				return model.RunnerProfile{}, false, false, nil
+			}
+			p, ok := f.profiles[id]
+			return p, true, ok, nil
+		},
+		func() (model.RunnerProfile, bool, bool, error) {
+			id, ok := f.runnerProfiles[runnerID]
+			if !ok {
+				return model.RunnerProfile{}, false, false, nil
+			}
+			p, ok := f.profiles[id]
+			return p, true, ok, nil
+		})
 }
 
 func (f *dbFakeStore) UnlinkRunnerProfile(ctx context.Context, runnerID string) error {

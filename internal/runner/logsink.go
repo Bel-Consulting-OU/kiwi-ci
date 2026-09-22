@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -148,6 +149,12 @@ const (
 	asyncPostBatch = 200
 )
 
+// encodeSpoolEntry encodes one spool entry for HTTP batch-size accounting.
+// Production always uses json.Marshal; the indirection exists because a
+// logLine (three strings) always encodes, so the sizing loop's fail-closed
+// handling of an encoding error is only reachable with an injected value.
+var encodeSpoolEntry = func(v any) ([]byte, error) { return json.Marshal(v) }
+
 // newJournaledAsyncLogSink builds a sink whose batches are durable before
 // they are sent. The journal's unconsumed records are loaded at construction
 // and replayed, with their original batch ids and sequences, before the sink
@@ -285,7 +292,16 @@ func (s *asyncLogSink) run() {
 		n := 0
 		var encodedBytes int64
 		for n < len(s.spool) && n < asyncPostBatch {
-			encoded, _ := json.Marshal(s.spool[n])
+			encoded, merr := encodeSpoolEntry(s.spool[n])
+			if merr != nil {
+				// Fail closed BEFORE any batch is formed: the spool and its
+				// budget charge are left exactly as they were (no partial or
+				// corrupt entry is sent or dropped), and the job outcome
+				// surfaces the wrapped encoding error.
+				s.mu.Unlock()
+				s.recordSendErr(fmt.Errorf("log sink: encode spool entry %d: %w", n, merr))
+				return
+			}
 			add := int64(len(encoded))
 			if n > 0 && encodedBytes+add > asyncPostBytes {
 				break

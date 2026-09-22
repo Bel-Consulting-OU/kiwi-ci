@@ -689,19 +689,8 @@ func TestIDCovRunnerAdminDBBranches(t *testing.T) {
 	}
 }
 
-// TestIDCovRunnerDisableDBKillSwitch covers the disable kill switch and the
-// missing-scheduler refusal.
+// TestIDCovRunnerDisableDBKillSwitch covers the disable kill switch.
 func TestIDCovRunnerDisableDBKillSwitch(t *testing.T) {
-	// DB set without a scheduler: the kill switch refuses.
-	bare := New("admin")
-	bare.DB = newDBFakeStore()
-	bare.mu.Lock()
-	bare.runners = map[string]model.Runner{}
-	bare.mu.Unlock()
-	if _, err := bare.revokeRunnerDB(context.Background(), "r1", "test"); err == nil {
-		t.Fatal("revokeRunnerDB without a scheduler = nil error")
-	}
-
 	f := newDBFakeStore()
 	s := New("admin")
 	if err := s.SwitchToDB(f); err != nil {

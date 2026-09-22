@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"log"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -476,23 +475,65 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 	return nil, "", time.Time{}, ErrNoJobs
 }
 
-// effectiveRunner resolves the runner's LIVE scheduling view at lease time:
-// when a profile is linked to the runner's certificate serial, the profile's
-// current labels/region/repo ACL/capabilities/capacity/rates replace the
-// registration snapshot, so a profile edit takes effect on the next lease.
-// Stores without a profile contract (or an unlinked runner) return the
-// snapshot unchanged; the atomic claim independently fails closed on a
-// linked-but-missing profile.
+// effectiveRunner resolves the runner's LIVE scheduling view at lease time
+// through the ONE shared live-profile precedence (storage.ResolveLiveProfileBinding):
+// an explicit certificate-serial binding wins when the runner presents a
+// registered serial, otherwise the runner-ID binding (runner_profile_links)
+// applies, otherwise the registration snapshot is used unchanged. A profile
+// edit therefore takes effect on the next lease for mTLS AND per-runner
+// bearer identities.
+//
+// A dangling certificate-serial binding is presented as a zero-capacity
+// runner (the claim fails it closed with ErrNoCapacity), so the prefilter
+// never proposes candidates the claim will reject. A dangling runner-ID
+// binding resolves as "no profile": the registration snapshot applies,
+// exactly like an unbound runner. Stores without the resolver contract fall
+// back to composing the same precedence from their profile read contracts
+// (without dangling detection, since those report only found/not-found); the
+// claim transaction remains the authoritative decision.
 func (s *DBScheduler) effectiveRunner(ctx context.Context, ri model.Runner) model.Runner {
-	ps, ok := s.Store.(storage.ProfileStore)
-	if !ok || strings.TrimSpace(ri.CertSerial) == "" {
+	if lr, ok := s.Store.(storage.LiveProfileResolver); ok {
+		resolution, err := lr.ResolveLiveRunnerProfile(ctx, ri.ID, ri.CertSerial)
+		if err != nil {
+			// The prefilter is best-effort: a read failure falls back to the
+			// snapshot and the claim (which re-reads inside its transaction)
+			// decides with its own error.
+			log.Printf("scheduler: resolve live profile for runner %s: %v", ri.ID, err)
+			return ri
+		}
+		switch {
+		case resolution.DeniesLease():
+			ri.Capacity = 0
+			return ri
+		case resolution.Applies():
+			return storage.ResolveRunnerProfile(ri, resolution.Profile, true)
+		default:
+			return ri
+		}
+	}
+	var runnerLookup storage.ProfileBindingLookup
+	if ls, ok := s.Store.(storage.RunnerProfileLinkStore); ok {
+		runnerLookup = func() (model.RunnerProfile, bool, bool, error) {
+			p, found, err := ls.ProfileForRunnerID(ctx, ri.ID)
+			return p, found, found, err
+		}
+	}
+	var certLookup storage.ProfileBindingLookup
+	if ps, ok := s.Store.(storage.ProfileStore); ok {
+		certLookup = func() (model.RunnerProfile, bool, bool, error) {
+			p, found, err := ps.ProfileForSerial(ctx, ri.CertSerial)
+			return p, found, found, err
+		}
+	}
+	resolution, err := storage.ResolveLiveProfileBinding(ri.CertSerial, certLookup, runnerLookup)
+	if err != nil {
+		log.Printf("scheduler: resolve live profile for runner %s: %v", ri.ID, err)
 		return ri
 	}
-	p, found, err := ps.ProfileForSerial(ctx, ri.CertSerial)
-	if err != nil || !found {
-		return ri
+	if resolution.Applies() {
+		return storage.ResolveRunnerProfile(ri, resolution.Profile, true)
 	}
-	return storage.ResolveRunnerProfile(ri, p, true)
+	return ri
 }
 
 // EffectiveRunner exposes the LIVE scheduling view of one runner (profile

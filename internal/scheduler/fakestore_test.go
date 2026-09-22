@@ -27,8 +27,9 @@ type fakeStore struct {
 	artifacts []model.ArtifactRecord
 	reports   []model.TestReport
 
-	profiles     map[string]model.RunnerProfile
-	certProfiles map[string]string
+	profiles       map[string]model.RunnerProfile
+	certProfiles   map[string]string
+	runnerProfiles map[string]string
 
 	leaderOK    bool
 	leaderErr   error
@@ -122,17 +123,20 @@ type expireCall struct {
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		runs:         map[string]model.Run{},
-		jobs:         map[string]model.Job{},
-		runners:      map[string]model.Runner{},
-		receipts:     map[string]model.CompletionReceipt{},
-		profiles:     map[string]model.RunnerProfile{},
-		certProfiles: map[string]string{},
+		runs:           map[string]model.Run{},
+		jobs:           map[string]model.Job{},
+		runners:        map[string]model.Runner{},
+		receipts:       map[string]model.CompletionReceipt{},
+		profiles:       map[string]model.RunnerProfile{},
+		certProfiles:   map[string]string{},
+		runnerProfiles: map[string]string{},
 	}
 }
 
 var _ storage.Store = (*fakeStore)(nil)
 var _ storage.ProfileStore = (*fakeStore)(nil)
+var _ storage.RunnerProfileLinkStore = (*fakeStore)(nil)
+var _ storage.LiveProfileResolver = (*fakeStore)(nil)
 var _ storage.QuotaCounterStore = (*fakeStore)(nil)
 var _ storage.RunEnqueueStore = (*fakeStore)(nil)
 var _ storage.RecoveryStore = (*fakeStore)(nil)
@@ -750,6 +754,73 @@ func (f *fakeStore) ProfileForSerial(ctx context.Context, serial string) (model.
 	}
 	p, ok := f.profiles[id]
 	return p, ok, nil
+}
+
+// LinkRunnerProfile/ProfileForRunnerID/UnlinkRunnerProfile/
+// RunnerIDsForProfile mirror the durable runner_profile_links binding
+// (migration 0031): one binding per runner ID, resolved against the LIVE
+// profiles map, with a dangling binding reporting not-found.
+func (f *fakeStore) LinkRunnerProfile(ctx context.Context, runnerID, profileID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.runnerProfiles[runnerID] = profileID
+	return nil
+}
+
+func (f *fakeStore) ProfileForRunnerID(ctx context.Context, runnerID string) (model.RunnerProfile, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	id, ok := f.runnerProfiles[runnerID]
+	if !ok {
+		return model.RunnerProfile{}, false, nil
+	}
+	p, ok := f.profiles[id]
+	return p, ok, nil
+}
+
+func (f *fakeStore) UnlinkRunnerProfile(ctx context.Context, runnerID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.runnerProfiles, runnerID)
+	return nil
+}
+
+func (f *fakeStore) RunnerIDsForProfile(ctx context.Context, profileID string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []string{}
+	for id, pid := range f.runnerProfiles {
+		if pid == profileID {
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// ResolveLiveRunnerProfile mirrors the SQL store's live resolution: the ONE
+// shared precedence over the fake's profile maps, so the scheduler prefilter
+// and the queue explainers decide exactly like the fake atomic claim.
+func (f *fakeStore) ResolveLiveRunnerProfile(ctx context.Context, runnerID, serial string) (storage.LiveProfileResolution, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return storage.ResolveLiveProfileBinding(serial,
+		func() (model.RunnerProfile, bool, bool, error) {
+			id, ok := f.certProfiles[serial]
+			if !ok {
+				return model.RunnerProfile{}, false, false, nil
+			}
+			p, ok := f.profiles[id]
+			return p, true, ok, nil
+		},
+		func() (model.RunnerProfile, bool, bool, error) {
+			id, ok := f.runnerProfiles[runnerID]
+			if !ok {
+				return model.RunnerProfile{}, false, false, nil
+			}
+			p, ok := f.profiles[id]
+			return p, true, ok, nil
+		})
 }
 
 func (f *fakeStore) Close() error { return nil }

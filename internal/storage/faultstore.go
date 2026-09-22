@@ -176,6 +176,8 @@ var (
 	_ OutboxClaimBatchStore     = (*FaultyStore)(nil)
 	_ LeaderFenceStore          = (*FaultyStore)(nil)
 	_ RunPageStore              = (*FaultyStore)(nil)
+	_ RunnerProfileLinkStore    = (*FaultyStore)(nil)
+	_ LiveProfileResolver       = (*FaultyStore)(nil)
 )
 
 func (f *FaultyStore) Close() error { return f.Inner.Close() }
@@ -1366,6 +1368,18 @@ func (f *FaultyStore) RunnerIDsForProfile(ctx context.Context, profileID string)
 	return inner.RunnerIDsForProfile(ctx, profileID)
 }
 
+// ResolveLiveRunnerProfile delegates the shared live resolution to the
+// wrapped store so the scheduler prefilter and the queue explainers keep the
+// same effective profile under fault injection; a missing inner contract is a
+// wiring error, not a simulated failure (read paths inject no faults).
+func (f *FaultyStore) ResolveLiveRunnerProfile(ctx context.Context, runnerID, serial string) (LiveProfileResolution, error) {
+	inner, ok := f.Inner.(LiveProfileResolver)
+	if !ok {
+		return LiveProfileResolution{}, errMissingInnerInterface("LiveProfileResolver")
+	}
+	return inner.ResolveLiveRunnerProfile(ctx, runnerID, serial)
+}
+
 // RunnerReservedResources / ListResourceReservations delegate the
 // reservation-ledger reads to the wrapped store (the lease claim itself is
 // delegated through AcquireLeaseAtomic, fault-injectable like every other
@@ -1800,6 +1814,7 @@ var (
 	_ RunEnqueueStore           = (*memStore)(nil)
 	_ AtomicLeaseStore          = (*memStore)(nil)
 	_ QuotaCounterStore         = (*memStore)(nil)
+	_ LiveProfileResolver       = (*memStore)(nil)
 	_ CacheManifestStore        = (*memStore)(nil)
 	_ ArtifactSidecarStore      = (*memStore)(nil)
 	_ SecretClaimStore          = (*memStore)(nil)
@@ -4287,23 +4302,46 @@ func (m *memStore) recomputeDependentsLocked(cancelled map[string]bool, now time
 	}
 }
 
-// resolveProfileLocked resolves the LIVE profile bound to the runner's
-// certificate serial (caller holds m.mu). linked reports whether a
-// cert_profile_links row exists; found whether its profile row exists. A
-// linked-but-missing profile denies the lease (fail closed).
-func (m *memStore) resolveProfileLocked(r model.Runner) (effective model.Runner, linked, found bool) {
-	if strings.TrimSpace(r.CertSerial) == "" {
-		return r, false, false
+// resolveProfileLocked resolves the runner's LIVE effective scheduling view
+// through the ONE shared precedence (caller holds m.mu): the explicit
+// certificate-serial binding wins when the runner presents a registered
+// serial, otherwise the runner-ID binding applies, otherwise the
+// registration snapshot. A dangling certificate binding denies the lease; a
+// dangling runner-ID binding resolves as "no profile" (the snapshot, never
+// more). See ResolveLiveProfileBinding for the documented policy.
+func (m *memStore) resolveProfileLocked(r model.Runner) (effective model.Runner, resolution LiveProfileResolution) {
+	certLookup := func() (model.RunnerProfile, bool, bool, error) {
+		profileID, ok := m.certProfiles[r.CertSerial]
+		if !ok {
+			return model.RunnerProfile{}, false, false, nil
+		}
+		p, ok := m.profiles[profileID]
+		if !ok {
+			return model.RunnerProfile{}, true, false, nil
+		}
+		return p, true, true, nil
 	}
-	profileID, ok := m.certProfiles[r.CertSerial]
-	if !ok {
-		return r, false, false
+	runnerLookup := func() (model.RunnerProfile, bool, bool, error) {
+		profileID, ok := m.runnerProfiles[r.ID]
+		if !ok {
+			return model.RunnerProfile{}, false, false, nil
+		}
+		p, ok := m.profiles[profileID]
+		if !ok {
+			return model.RunnerProfile{}, true, false, nil
+		}
+		return p, true, true, nil
 	}
-	p, ok := m.profiles[profileID]
-	if !ok {
-		return r, true, false
+	res, err := ResolveLiveProfileBinding(r.CertSerial, certLookup, runnerLookup)
+	if err != nil {
+		// Map lookups cannot fail; keep the registration snapshot on the
+		// impossible error so the caller's own predicates still decide.
+		return r, res
 	}
-	return ResolveRunnerProfile(r, p, true), true, true
+	if res.Applies() {
+		return ResolveRunnerProfile(r, res.Profile, true), res
+	}
+	return r, res
 }
 
 // claimQuotaLocked re-checks the conditional queued->running quota
@@ -4516,8 +4554,8 @@ func (m *memStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim) (mo
 	if !rok {
 		return model.Job{}, ErrNoCapacity
 	}
-	effective, linked, found := m.resolveProfileLocked(r)
-	if linked && !found {
+	effective, resolution := m.resolveProfileLocked(r)
+	if resolution.DeniesLease() {
 		return model.Job{}, ErrNoCapacity
 	}
 	// The environment key is the CANONICAL repository identity of the claim
@@ -4942,6 +4980,17 @@ func (m *memStore) ProfileForRunnerID(ctx context.Context, runnerID string) (mod
 		return model.RunnerProfile{}, false, nil
 	}
 	return p, true, nil
+}
+
+// ResolveLiveRunnerProfile implements LiveProfileResolver on the in-memory
+// store: the scheduler prefilter and the queue explainers resolve through the
+// same shared precedence and the same maps the mem claim uses, so memory mode
+// and the SQL store agree (including the dangling-binding policy).
+func (m *memStore) ResolveLiveRunnerProfile(ctx context.Context, runnerID, serial string) (LiveProfileResolution, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, resolution := m.resolveProfileLocked(model.Runner{ID: runnerID, CertSerial: serial})
+	return resolution, nil
 }
 
 // UnlinkRunnerProfile drops one runner's binding; a missing binding is a

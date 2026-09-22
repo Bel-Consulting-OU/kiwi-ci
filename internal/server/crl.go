@@ -95,59 +95,10 @@ func (s *Server) mirrorRunnerCertRevoked(ri model.Runner) {
 	}
 }
 
-// revokeRunnerCert records the runner's certificate serial in the
-// revocation list. In DB mode the durable cert_revocations row is written
-// transactionally so every replica rejects the serial; the in-memory map
-// and file CRL remain the dev-mode mirror. Revocation is permanent:
-// re-enabling a runner does not un-revoke its certificate — the runner must
-// re-enroll to obtain fresh credentials. ctx is the caller's request or
-// operation context: a hung durable write is bounded by the caller, never
-// by a context root minted here.
-//
-// This is the BEST-EFFORT helper for direct/dev callers; the admin disable
-// endpoint does NOT use it as its authority: runnerDisable commits the
-// revocation + disable + lease revocation atomically through
-// storage.RunnerDisableStore and fails closed, then mirrors the committed
-// revocation locally with mirrorRunnerCertRevoked.
-func (s *Server) revokeRunnerCert(ctx context.Context, ri model.Runner, actor string) {
-	if ri.CertSerial == "" {
-		return
-	}
-	s.mu.Lock()
-	if s.crl == nil {
-		s.crl = map[string]string{}
-	}
-	s.crl[ri.CertSerial] = ri.ID
-	persistErr := s.persistCRL()
-	s.mu.Unlock()
-	// The local decision is authoritative immediately: seed the DB-mode
-	// decision cache with revoked=true so a certificate revoked HERE is
-	// rejected on this replica at once (the cross-replica TTL only bounds
-	// revocations written by other replicas).
-	now := time.Now()
-	s.crlMu.Lock()
-	if s.crlCache == nil {
-		s.crlCache = map[string]crlCacheEntry{}
-	}
-	s.crlCache[ri.CertSerial] = crlCacheEntry{revoked: true, at: now}
-	s.crlMu.Unlock()
-	if s.DB != nil {
-		if rev, ok := s.DB.(storage.CertRevocationStore); ok {
-			if err := rev.RevokeCert(ctx, ri.CertSerial, ri.ID, "runner revoked"); err != nil {
-				s.logError("crl: durable revoke failed", "serial", ri.CertSerial, "error", err.Error())
-			}
-		}
-	}
-	if persistErr != nil {
-		s.logError("crl: persist failed", "error", persistErr.Error())
-	}
-	s.auditLocked("runner.cert_revoked", actor, "", "", "runner certificate serial revoked", map[string]string{"runner": ri.ID, "serial": ri.CertSerial})
-}
-
 // certSerialRevoked reports whether a peer certificate serial is on the
 // CRL. A locally observed revocation (the persisted in-process mirror,
-// written by revokeRunnerCert) is authoritative and never expires locally:
-// it stays effective even if the durable revocation row could not be
+// written by mirrorRunnerCertRevoked) is authoritative and never expires
+// locally: it stays effective even if the durable revocation row could not be
 // written, so a disable on this replica can never be undone by the cache
 // TTL. DB mode additionally consults a short-TTL cache backed by the
 // durable cert_revocations row, so a revocation written by any replica

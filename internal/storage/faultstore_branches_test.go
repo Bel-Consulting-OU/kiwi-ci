@@ -203,18 +203,31 @@ func TestMemStoreResolveProfileLocked(t *testing.T) {
 	m := newMemStore()
 	r := testRunner
 	r.CertSerial = "serial-unlinked"
-	if _, linked, found := m.resolveProfileLocked(r); linked || found {
+	if _, res := m.resolveProfileLocked(r); res.Linked || res.Found {
 		t.Fatal("unlinked serial must report unlinked")
 	}
 	r.CertSerial = ""
-	if _, linked, found := m.resolveProfileLocked(r); linked || found {
+	if _, res := m.resolveProfileLocked(r); res.Linked || res.Found {
 		t.Fatal("empty serial must report unlinked")
 	}
-	// A dangling link reports linked but not found (fail closed).
+	// A dangling certificate link reports linked but not found (fail closed).
 	m.certProfiles["serial-dangling"] = "99999999999999999999999999999999"
 	r.CertSerial = "serial-dangling"
-	if _, linked, found := m.resolveProfileLocked(r); !linked || found {
-		t.Fatal("dangling link must report linked+missing")
+	if _, res := m.resolveProfileLocked(r); !res.Linked || res.Found || !res.DeniesLease() {
+		t.Fatalf("dangling cert link = %+v, want linked+missing and fail closed", res)
+	}
+	// A dangling runner-ID binding reports linked+missing but resolves as
+	// "no profile" (the registration snapshot, never the deleted profile).
+	r.CertSerial = ""
+	if err := m.LinkRunnerProfile(ctx(), r.ID, "99999999999999999999999999999999"); err != nil {
+		t.Fatal(err)
+	}
+	eff, res := m.resolveProfileLocked(r)
+	if !res.Linked || res.Found || res.DeniesLease() || res.Source != ProfileBindingRunnerID {
+		t.Fatalf("dangling runner-ID link = %+v, want linked+missing without fail closed", res)
+	}
+	if eff.ID != r.ID || eff.CertSerial != "" {
+		t.Fatalf("dangling runner-ID effective = %+v, want the registration snapshot", eff)
 	}
 }
 

@@ -257,6 +257,93 @@ jobs:
 	}
 }
 
+// TestMemoryQueueReasonTableIsFleetGlobal relocates the reason-branch table
+// that used to pin the removed per-runner explainer (applyQueueReasonsLocked)
+// onto the fleet-global memory path. The per-runner premise is gone — a
+// verdict describes the fleet, not the polling runner — so this evaluates the
+// same fixtures through applyQueueReasonsMemoryLocked: every code the removed
+// function assigned is still assigned for a single-runner fleet, and the
+// stale-reason clearing is preserved.
+func TestMemoryQueueReasonTableIsFleetGlobal(t *testing.T) {
+	s := New("shared-dev-tok")
+	now := time.Now().UTC()
+	runner := model.Runner{ID: "runner-1", Labels: []string{"linux"}, Region: "eu", Capacity: 4}
+
+	// A stale annotation on a job that is now leasable must be cleared.
+	jobs := map[string]model.Job{
+		"approval": {ID: "approval", RunID: "run-1", Status: model.StatusWaitingApproval, CreatedAt: now},
+		"dep-wait": {ID: "dep-wait", RunID: "run-1", Status: model.StatusQueued, Needs: []string{"upstream"}, Condition: "success()", CreatedAt: now},
+		"label":    {ID: "label", RunID: "run-1", Status: model.StatusQueued, RequiredLabels: []string{"gpu"}, CreatedAt: now},
+		"region":   {ID: "region", RunID: "run-1", Status: model.StatusQueued, PlacementRegions: []string{"us"}, CreatedAt: now},
+		"ready":    {ID: "ready", RunID: "run-1", Status: model.StatusQueued, CreatedAt: now, QueueReason: string(queue.WaitingDependency)},
+		"running":  {ID: "running", RunID: "run-1", Status: model.StatusRunning, CreatedAt: now},
+		"upstream": {ID: "upstream", RunID: "run-1", Status: model.StatusQueued, CreatedAt: now},
+	}
+	// The environment-capacity fixture: one running plus one queued job in
+	// the same (repo, environment) with concurrency 1.
+	jobs["env-running"] = model.Job{ID: "env-running", RunID: "run-1", Status: model.StatusRunning, Environment: "prod", EnvironmentConcurrency: 1, RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r", CreatedAt: now}
+	jobs["env-blocked"] = model.Job{ID: "env-blocked", RunID: "run-1", Status: model.StatusQueued, Environment: "prod", EnvironmentConcurrency: 1, RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r", CreatedAt: now}
+	s.jobs = jobs
+
+	s.mu.Lock()
+	s.applyQueueReasonsMemoryLocked(runner)
+	s.mu.Unlock()
+
+	want := map[string]queue.ReasonCode{
+		"approval":    queue.WaitingApproval,
+		"dep-wait":    queue.WaitingDependency,
+		"label":       queue.NoCompatibleRunner,
+		"region":      queue.RegionUnavailable,
+		"ready":       queue.None,
+		"running":     queue.None,
+		"upstream":    queue.None,
+		"env-running": queue.None,
+		"env-blocked": queue.EnvironmentLocked,
+	}
+	for id, code := range want {
+		if got := queue.ReasonCode(fsJob(t, s, id).QueueReason); got != code {
+			t.Errorf("job %s reason = %q, want %q", id, got, code)
+		}
+	}
+}
+
+// TestMemoryQueueReasonRequiresOneRunnerWithAllLabels keeps the removed
+// per-runner "labels are an exact subset" assertion under fleet semantics: a
+// partial match by one runner PLUS a partial match by another must not make
+// the job leasable, because one runner must satisfy every required label;
+// once a single runner carries them all, the stale diagnostic clears.
+func TestMemoryQueueReasonRequiresOneRunnerWithAllLabels(t *testing.T) {
+	s := New("shared-dev-tok")
+	now := time.Now().UTC()
+	s.jobs = map[string]model.Job{
+		"both":   {ID: "both", RunID: "run-1", Status: model.StatusQueued, RequiredLabels: []string{"linux", "gpu"}, CreatedAt: now},
+		"subset": {ID: "subset", RunID: "run-1", Status: model.StatusQueued, RequiredLabels: []string{"linux"}, CreatedAt: now},
+	}
+	linuxOnly := model.Runner{ID: "linux-only", Labels: []string{"linux"}, Capacity: 1}
+	gpuOnly := model.Runner{ID: "gpu-only", Labels: []string{"gpu"}, Capacity: 1}
+	s.runners = map[string]model.Runner{linuxOnly.ID: linuxOnly, gpuOnly.ID: gpuOnly}
+
+	s.mu.Lock()
+	s.applyQueueReasonsMemoryLocked(linuxOnly)
+	s.mu.Unlock()
+	if got := fsJob(t, s, "both").QueueReason; got != string(queue.NoCompatibleRunner) {
+		t.Fatalf("two partial label matches: reason = %q, want NO_COMPATIBLE_RUNNER", got)
+	}
+	if got := fsJob(t, s, "subset").QueueReason; got != "" {
+		t.Fatalf("satisfied labels reason = %q, want none", got)
+	}
+
+	// One runner carrying every required label clears the stale diagnostic.
+	s.mu.Lock()
+	linuxOnly.Labels = []string{"linux", "gpu"}
+	s.runners[linuxOnly.ID] = linuxOnly
+	s.applyQueueReasonsMemoryLocked(linuxOnly)
+	s.mu.Unlock()
+	if got := fsJob(t, s, "both").QueueReason; got != "" {
+		t.Fatalf("full label match reason = %q, want none", got)
+	}
+}
+
 // fleetReservationStore adds PER-RUNNER reservation sums to the fake store so
 // a fleet can have one runner with room and another without.
 type fleetReservationStore struct {

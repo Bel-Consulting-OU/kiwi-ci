@@ -155,6 +155,15 @@ func (s *injectedStore) ProfileForSerial(ctx context.Context, serial string) (mo
 	return s.fakeStore.ProfileForSerial(ctx, serial)
 }
 
+// ResolveLiveRunnerProfile injects the profile-read failure into the shared
+// live resolver the prefilter and the explainers consume.
+func (s *injectedStore) ResolveLiveRunnerProfile(ctx context.Context, runnerID, serial string) (storage.LiveProfileResolution, error) {
+	if s.profileErr != nil {
+		return storage.LiveProfileResolution{}, s.profileErr
+	}
+	return s.fakeStore.ResolveLiveRunnerProfile(ctx, runnerID, serial)
+}
+
 func (s *injectedStore) AcquireLease(ctx context.Context, jobID, runnerID string, tokenHash []byte, generation int64, expiresAt time.Time) (model.Job, error) {
 	if s.acquireLeaseHook != nil {
 		if err := s.acquireLeaseHook(jobID); err != nil {

@@ -65,7 +65,9 @@ type RunPage struct {
 // RunPageStore is the optional paged-read capability of a store. It is
 // deliberately separate from Store so minimal read-only wrappers and test
 // doubles keep compiling; callers that need pagination assert this interface
-// and otherwise fall back to a bounded ListRuns page.
+// and fail closed when it is missing (see listRunsPageFromStore): an
+// unpaged ListRuns window cannot honor an older cursor, so it is never a
+// fallback.
 type RunPageStore interface {
 	// ListRunsPage returns the page of runs strictly older than the cursor
 	// position, newest-first. See the file comment for the full cursor,
@@ -116,9 +118,12 @@ func SortRunsNewestFirst(runs []model.Run) {
 // PageRuns applies the keyset contract to an unordered in-memory run
 // snapshot: it drops every row at or above the cursor, sorts the rest
 // newest-first, and returns at most limit rows plus the exact HasMore and
-// next position. It is the memory half of the contract (memStore and the
-// server's memory mode) and the fallback for stores that do not implement
-// RunPageStore, so both the memory and the SQL pages share one definition.
+// next position. It is the memory half of the contract, used by the server's
+// memory mode (Server.listRuns) and by memStore.ListRunsPage (the in-package
+// in-memory Store), plus package test doubles, so the memory and SQL pages
+// share one definition. It is NOT a fallback for stores without
+// RunPageStore: paged reads require that capability and fail closed without
+// it, because an unpaged ListRuns window cannot honor an older cursor.
 func PageRuns(runs []model.Run, afterCreatedAt time.Time, afterID string, limit int) RunPage {
 	limit = NormalizeRunsPageLimit(limit)
 	eligible := make([]model.Run, 0, len(runs))

@@ -52,12 +52,19 @@ func (a *atomicFakeStore) AcquireLeaseAtomic(ctx context.Context, claim storage.
 		return model.Job{}, storage.ErrNoCapacity
 	}
 	eff := ri
-	if ri.CertSerial != "" {
-		if p, linked, perr := a.fakeStore.ProfileForSerial(ctx, ri.CertSerial); perr != nil {
-			return model.Job{}, perr
-		} else if linked {
-			eff = storage.ResolveRunnerProfile(ri, p, true)
-		}
+	// Mirror the SQL claim's live resolution (the ONE shared precedence:
+	// certificate-serial binding, then runner-ID binding, then the
+	// registration snapshot) so the prefilter and this claim agree; a
+	// dangling certificate binding fails the claim closed.
+	resolution, rerr := a.fakeStore.ResolveLiveRunnerProfile(ctx, claim.RunnerID, ri.CertSerial)
+	if rerr != nil {
+		return model.Job{}, rerr
+	}
+	if resolution.DeniesLease() {
+		return model.Job{}, storage.ErrNoCapacity
+	}
+	if resolution.Applies() {
+		eff = storage.ResolveRunnerProfile(ri, resolution.Profile, true)
 	}
 	if eff.Disabled || eff.Draining || cap <= 0 || len(a.active[claim.RunnerID]) >= cap {
 		return model.Job{}, storage.ErrNoCapacity

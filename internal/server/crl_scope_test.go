@@ -185,7 +185,7 @@ func TestCRLSerialMatchingIsExact(t *testing.T) {
 		}
 	}
 	// Revocation by record with an empty serial is a no-op, never a wildcard.
-	s.revokeRunnerCert(context.Background(), model.Runner{ID: "runner-b"}, "admin")
+	s.mirrorRunnerCertRevoked(model.Runner{ID: "runner-b"})
 	if crlRevoked(t, s, "") {
 		t.Fatal("empty serial must never be revoked")
 	}

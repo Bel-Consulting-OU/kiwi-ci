@@ -30,12 +30,13 @@ func (s *Server) profileForRunnerBinding(ctx context.Context, b runnerProfileBin
 // dangling binding all resolve to not-found, so registration fails closed
 // under RequireProfiles instead of inheriting anything.
 //
-// Lease-time live resolution (the SQL claim's cert_profile_links step, the
-// DB scheduler's effectiveRunner and the memory-mode liveRunnerLocked)
-// resolves certificate-serial bindings only; a runner-ID-bound runner
-// schedules from its registration snapshot, which already carries the bound
-// profile's labels, capabilities, repository ACL, capacity and rates, until
-// it registers again.
+// Lease-time live resolution (the SQL claim, the DB scheduler's
+// effectiveRunner, the memory-mode liveRunnerLocked and the queue explainers)
+// resolves the runner-ID binding through the same shared precedence as the
+// certificate-serial binding (storage.ResolveLiveProfileBinding), so a
+// profile edit takes effect on the next lease without re-registration; a
+// dangling binding resolves as "no profile" and the registration snapshot
+// applies (never more, never the deleted profile).
 func (s *Server) profileForRunnerID(ctx context.Context, runnerID string) (model.RunnerProfile, bool, error) {
 	if runnerID == "" {
 		return model.RunnerProfile{}, false, nil

@@ -14,10 +14,10 @@ import (
 // A persisted queue reason is a FLEET-level diagnostic: it is shown to
 // operators and drives the queue metrics, and it is written on any runner's
 // lease miss, so it must not depend on which runner happened to poll. The
-// per-runner explainer (the legacy applyQueueReasonsLocked) could persist
-// NO_COMPATIBLE_RUNNER while another runner in the fleet satisfied the job —
-// visible for labels/regions, and made sharp by resource capacity, where a
-// job above one runner's remaining capacity is perfectly leasable elsewhere.
+// removed per-runner explainer could persist NO_COMPATIBLE_RUNNER while
+// another runner in the fleet satisfied the job — visible for labels/regions,
+// and made sharp by resource capacity, where a job above one runner's
+// remaining capacity is perfectly leasable elsewhere.
 //
 // Every pass therefore evaluates the job against ALL ACTIVE effective runner
 // profiles (disabled/draining runners and zero-capacity profile-less runners

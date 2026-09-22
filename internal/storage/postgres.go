@@ -1359,29 +1359,12 @@ func leaseRates(linked bool, p model.RunnerProfile, runnerCost, runnerWatts floa
 }
 
 // profileForSerialTx resolves the LIVE profile bound to a certificate serial
-// inside the caller's transaction. linked reports whether a
-// cert_profile_links row exists; found reports whether its profile row
-// exists. A linked-but-missing profile fails the claim closed.
+// inside the caller's transaction (the shared link-aware query, see
+// profileForSerialQ). linked reports whether a cert_profile_links row exists;
+// found reports whether its profile row exists. A linked-but-missing profile
+// fails the claim closed.
 func profileForSerialTx(ctx context.Context, tx pgx.Tx, serial string) (p model.RunnerProfile, linked, found bool, err error) {
-	if strings.TrimSpace(serial) == "" {
-		return model.RunnerProfile{}, false, false, nil
-	}
-	var profileID string
-	err = tx.QueryRow(ctx, `SELECT profile_id FROM cert_profile_links WHERE serial=$1`, serial).Scan(&profileID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return model.RunnerProfile{}, false, false, nil
-	}
-	if err != nil {
-		return model.RunnerProfile{}, false, false, err
-	}
-	p, err = scanProfile(tx.QueryRow(ctx, `SELECT `+profileCols+` FROM runner_profiles WHERE id=$1`, profileID))
-	if errors.Is(err, pgx.ErrNoRows) {
-		return model.RunnerProfile{}, true, false, nil
-	}
-	if err != nil {
-		return model.RunnerProfile{}, false, false, err
-	}
-	return p, true, true, nil
+	return profileForSerialQ(ctx, tx, serial)
 }
 
 // profileAllowsCandidate evaluates the live profile's scheduling
@@ -1464,9 +1447,12 @@ func (s *PostgresStore) claimQuotaTx(ctx context.Context, tx pgx.Tx, repoID stri
 //     incremented once and started_at stamped on the first lease only;
 //  3. the runner row is locked and its live admin state (disabled/draining,
 //     capacity, cert serial, registered rates) is read;
-//  4. the LIVE profile is resolved through cert_profile_links (a profile
-//     edit takes effect on the next lease) and its capacity/repo ACL/
-//     capabilities/labels/region/rates replace the registration snapshot;
+//  4. the LIVE profile is resolved through the shared precedence
+//     (cert_profile_links when the runner presents a registered serial,
+//     runner_profile_links otherwise) so a profile edit takes effect on the
+//     next lease for mTLS AND per-runner bearer identities, and its
+//     capacity/repo ACL/capabilities/labels/region/rates replace the
+//     registration snapshot;
 //  5. the frozen usage rates are written into the job payload;
 //  6. the job's requested resources are CHECKED AND RESERVED against the
 //     runner's remaining resource capacity (live profile max_* first, the
@@ -1552,16 +1538,29 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 		return model.Job{}, ErrNoCapacity
 	}
 
-	// Step 4: resolve the LIVE profile and replace the registration
-	// snapshot with its values for every scheduling predicate.
-	profile, linked, found, err := profileForSerialTx(ctx, tx, runnerCertSerial)
+	// Step 4: resolve the LIVE profile through the ONE shared precedence
+	// (the explicit certificate-serial binding when the runner presents a
+	// registered serial, then the runner_profile_links runner-ID binding,
+	// then the registration snapshot) and replace the registration snapshot
+	// with its values for every scheduling predicate. A dangling
+	// certificate-serial binding fails the claim closed; a dangling
+	// runner-ID binding resolves as "no profile" (the snapshot, never more),
+	// so a profile DELETE can neither resurrect a deleted profile nor fail a
+	// runner that registration already admitted.
+	resolution, err := ResolveLiveProfileBinding(runnerCertSerial,
+		func() (model.RunnerProfile, bool, bool, error) { return profileForSerialTx(ctx, tx, runnerCertSerial) },
+		func() (model.RunnerProfile, bool, bool, error) { return profileForRunnerIDQ(ctx, tx, claim.RunnerID) },
+	)
 	if err != nil {
 		return model.Job{}, err
 	}
-	if linked && !found {
-		// A runner whose linked profile vanished takes no work: fail closed.
+	if resolution.DeniesLease() {
+		// A runner whose explicitly bound certificate profile vanished takes
+		// no work: fail closed.
 		return model.Job{}, ErrNoCapacity
 	}
+	profile := resolution.Profile
+	linked := resolution.Applies()
 	capacity := runnerCapacity
 	// The runner's effective resource capacity: the LIVE profile's max_*
 	// columns when linked, the runner row's registration snapshot

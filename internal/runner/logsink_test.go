@@ -473,6 +473,76 @@ func TestLogSpoolAccountingMatchesStoredCosts(t *testing.T) {
 	}
 }
 
+// TestLogSpoolEncodeFailureFailsJobWithoutPartialBatch is the H2-B
+// regression: the spool sizing loop used to discard the json.Marshal error
+// (`encoded, _ :=`). An entry encoding/json rejects must stop the sender with
+// the wrapped error surfaced on the job outcome, while the spool, its byte
+// accounting and the shared memory budget stay exactly as they were: no
+// partial or corrupt batch is formed, removed or sent.
+func TestLogSpoolEncodeFailureFailsJobWithoutPartialBatch(t *testing.T) {
+	oldEncode := encodeSpoolEntry
+	t.Cleanup(func() { encodeSpoolEntry = oldEncode })
+
+	// A genuinely non-marshallable value: encoding/json rejects it, and the
+	// production call site sees exactly this error shape.
+	bad := make(chan int)
+	//lint:ignore SA1026 the non-marshallable value is the behavior under test
+	if _, err := json.Marshal(bad); err == nil {
+		t.Fatal("chan int unexpectedly marshals")
+	}
+	encodeSpoolEntry = func(any) ([]byte, error) {
+		//lint:ignore SA1026 the non-marshallable value is the behavior under test
+		return json.Marshal(bad)
+	}
+
+	var posted atomic.Int64
+	sink := newLogSink(nil, func(context.Context, logBatch) error {
+		posted.Add(1)
+		return nil
+	}, nil)
+	sink.WriteLine("build", "step", "line-1")
+
+	sink.mu.Lock()
+	spooled, tracked := len(sink.spool), sink.spoolBytes
+	var stored int64
+	for _, l := range sink.spool {
+		stored += l.spoolCost
+	}
+	sink.mu.Unlock()
+	if spooled != 1 || tracked == 0 || tracked != stored {
+		t.Fatalf("precondition: spool=%d tracked=%d stored=%d", spooled, tracked, stored)
+	}
+
+	out := sink.Finish(5 * time.Second)
+	if out.Err == nil {
+		t.Fatal("encoding failure did not surface on the job outcome")
+	}
+	if msg := out.Err.Error(); !strings.Contains(msg, "log sink: encode spool entry 0") ||
+		!strings.Contains(msg, "unsupported type: chan int") {
+		t.Fatalf("error = %v, want the wrapped encoding failure", out.Err)
+	}
+	if posted.Load() != 0 {
+		t.Fatalf("posted %d batches, want none (no partial batch)", posted.Load())
+	}
+	if out.Remaining != 1 {
+		t.Fatalf("remaining = %d, want the undelivered line reported", out.Remaining)
+	}
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if len(sink.spool) != 1 || sink.spool[0].Line != "line-1" {
+		t.Fatalf("spool after failure = %+v, want the original line retained", sink.spool)
+	}
+	if sink.spoolBytes != stored {
+		t.Fatalf("tracked spool bytes = %d after failure, want %d (accounting drift)", sink.spoolBytes, stored)
+	}
+	if charged := sink.mem.load(); charged != stored {
+		t.Fatalf("shared memory budget = %d after failure, want %d (charge not kept)", charged, stored)
+	}
+	if sink.dropped.Load() != 0 {
+		t.Fatalf("dropped = %d, want 0 (the line is retained, not dropped)", sink.dropped.Load())
+	}
+}
+
 // TestLogDeliveryHTTPStatusClassification is the R-D regression: the
 // callback classifies delivery failures from the typed HTTP status, not
 // from parsing the error string. 400/401/403/404/409/422 are permanent

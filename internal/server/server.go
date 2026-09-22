@@ -37,7 +37,6 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
-	"github.com/Bel-Consulting-OU/kiwi-ci/internal/queue"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/quotas"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/ratelimit"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runnerpki"
@@ -2476,20 +2475,6 @@ func (s *Server) runnerDrain(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, ri)
 }
 
-// revokeRunnerDB invalidates every active lease held by the runner through
-// the SQL scheduler: running jobs requeue (retry budget permitting) or
-// cancel, their lease fields are cleared, and audit events are emitted.
-// It remains the standalone lease-revocation transaction (used by tests and
-// by maintenance callers); the admin disable endpoint uses the atomic
-// RunnerDisableStore transaction instead, which commits the disable flag and
-// the certificate revocation together with the lease revocation.
-func (s *Server) revokeRunnerDB(ctx context.Context, runnerID, reason string) (int, error) {
-	if s.Sched == nil {
-		return 0, errors.New("server: db runner revocation requires the sql scheduler")
-	}
-	return s.Sched.CancelJobsByRunner(ctx, runnerID, reason)
-}
-
 // runnerDisable takes a runner out of service: it is marked disabled, its
 // active jobs are cancelled with "runner disabled", and next() refuses to
 // lease to it. Re-registration cannot clear the flag. In mTLS mode the
@@ -4629,35 +4614,6 @@ func (s *Server) scheduleStateLocked() {
 	}
 }
 
-// applyQueueReasonsLocked annotates every waiting job with the queue reason
-// explaining why it is not leasable by runner ri. Only the reasons the
-// spec models are assigned: dependency gating, label mismatch, environment
-// capacity and pending approval.
-func (s *Server) applyQueueReasonsLocked(ri model.Runner) {
-	for id, j := range s.jobs {
-		reason := queue.None
-		switch j.Status {
-		case model.StatusWaitingApproval:
-			reason = queue.WaitingApproval
-		case model.StatusQueued:
-			switch {
-			case !depsReadyLocked(j, s.jobs):
-				reason = queue.WaitingDependency
-			case !labelsSatisfied(ri.Labels, j.RequiredLabels):
-				reason = queue.NoCompatibleRunner
-			case !regionSatisfied(ri.Region, j.PlacementRegions):
-				reason = queue.RegionUnavailable
-			case environmentAtCapacityScoped(j, s.jobs):
-				reason = queue.EnvironmentLocked
-			}
-		}
-		if j.QueueReason != string(reason) {
-			j.QueueReason = string(reason)
-			s.jobs[id] = j
-		}
-	}
-}
-
 // dependencyOutcomeLocked wraps the scheduler's unified DependencyOutcome
 // over the in-memory job map (dev mode).
 func dependencyOutcomeLocked(j model.Job, jobs map[string]model.Job) (bool, model.Status) {
@@ -5144,24 +5100,50 @@ func environmentBranchAllowed(ref string, patterns []string) bool {
 	return false
 }
 
-// liveRunnerLocked resolves the LIVE linked profile for the in-memory
-// scheduling path (caller holds s.mu): a profile edit takes effect on the
-// next lease. A linked-but-missing profile fails closed as a zero-capacity
-// runner. linked reports whether a cert_profile_links row exists.
+// liveRunnerLocked resolves the LIVE effective profile for the in-memory
+// scheduling path (caller holds s.mu) through the ONE shared precedence
+// (storage.ResolveLiveProfileBinding): an explicit certificate-serial
+// binding wins when the runner presents a registered serial, otherwise the
+// runner-ID binding (the fs-snapshot mirror of runner_profile_links)
+// applies, otherwise the registration snapshot. A profile edit therefore
+// takes effect on the next lease for mTLS AND per-runner bearer identities.
+//
+// linked reports whether a live profile overlay applies. A dangling
+// certificate-serial binding fails closed as a zero-capacity runner; a
+// dangling runner-ID binding resolves as "no profile" (the registration
+// snapshot applies, never more, never the deleted profile).
 func (s *Server) liveRunnerLocked(ri model.Runner) (model.Runner, bool) {
-	if strings.TrimSpace(ri.CertSerial) == "" {
-		return ri, false
+	certLookup := func() (model.RunnerProfile, bool, bool, error) {
+		profileID, ok := s.certProfiles[ri.CertSerial]
+		if !ok {
+			return model.RunnerProfile{}, false, false, nil
+		}
+		p, ok := s.profiles[profileID]
+		if !ok {
+			return model.RunnerProfile{}, true, false, nil
+		}
+		return p, true, true, nil
 	}
-	profileID, ok := s.certProfiles[ri.CertSerial]
-	if !ok {
-		return ri, false
+	runnerLookup := func() (model.RunnerProfile, bool, bool, error) {
+		profileID, ok := s.runnerProfiles[ri.ID]
+		if !ok {
+			return model.RunnerProfile{}, false, false, nil
+		}
+		p, ok := s.profiles[profileID]
+		if !ok {
+			return model.RunnerProfile{}, true, false, nil
+		}
+		return p, true, true, nil
 	}
-	p, ok := s.profiles[profileID]
-	if !ok {
+	resolution, err := storage.ResolveLiveProfileBinding(ri.CertSerial, certLookup, runnerLookup)
+	if err != nil || resolution.DeniesLease() {
 		ri.Capacity = 0
 		return ri, true
 	}
-	return storage.ResolveRunnerProfile(ri, p, true), true
+	if resolution.Applies() {
+		return storage.ResolveRunnerProfile(ri, resolution.Profile, true), true
+	}
+	return ri, false
 }
 
 func labelsSatisfied(have, need []string) bool {
