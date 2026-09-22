@@ -229,6 +229,12 @@ type ComponentsConfig struct {
 // at startup (it would otherwise stage another full max_bytes over the same
 // disk). The runtime also never needs two replicas to share one directory:
 // that mode is not supported and is refused, never silently multiplied.
+//
+// Legacy layout: a pre-per-replica process staged its active files directly in
+// Dir with no ownership lock. Startup NEVER reclaims those top-level files
+// (doing so could delete a live old-layout replica's upload during a rolling
+// upgrade). Once every old-layout replica has drained, an operator reclaims
+// them explicitly with `kiwi storage migrate-staging-layout --dir DIR`.
 type StagingConfig struct {
 	// Dir is the staging root; each process stages inside
 	// <Dir>/<instance_id> (or <Dir>/<generated id> when instance_id is

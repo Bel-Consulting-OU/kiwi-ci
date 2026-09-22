@@ -12,7 +12,7 @@ import (
 func TestCanonicalRepoLookupSeparatesForges(t *testing.T) {
 	enabled := true
 	cfg := &Config{Repositories: map[string]RepoPolicy{
-		"github.com/acme/backend": {
+		r1("github.com", "acme/backend"): {
 			RequireDigestPins:  &enabled,
 			CrossRepoTrigger:   &enabled,
 			AllowedCloneHosts:  []string{"github.com"},
@@ -80,14 +80,14 @@ func TestBareLookupAmbiguousCanonicalKeysFailClosed(t *testing.T) {
 	enabled := true
 	disabled := false
 	cfg := &Config{Repositories: map[string]RepoPolicy{
-		"github.com/acme/backend":         {RequireDigestPins: &enabled},
-		"gitlab.company.com/acme/backend": {RequireDigestPins: &disabled},
+		r1("github.com", "acme/backend"):         {RequireDigestPins: &enabled},
+		r1("gitlab.company.com", "acme/backend"): {RequireDigestPins: &disabled},
 	}}
 	if _, ok := cfg.RepoPolicyFor("acme/backend"); ok {
 		t.Fatal("ambiguous bare lookup must fail closed")
 	}
 	single := &Config{Repositories: map[string]RepoPolicy{
-		"github.com/acme/backend": {RequireDigestPins: &enabled},
+		r1("github.com", "acme/backend"): {RequireDigestPins: &enabled},
 	}}
 	rp, ok := single.RepoPolicyFor("acme/backend")
 	if !ok || rp.RequireDigestPins == nil || !*rp.RequireDigestPins {
@@ -105,12 +105,12 @@ func TestRepoPolicyLookupTables(t *testing.T) {
 		want   RepoPolicy
 		wantOK bool
 	}{
-		{"exact canonical", map[string]RepoPolicy{"github.com/o/r": inv}, "github.com/o/r", inv, true},
-		{"other forge", map[string]RepoPolicy{"github.com/o/r": inv}, "gitlab.example/o/r", RepoPolicy{}, false},
+		{"exact canonical", map[string]RepoPolicy{r1("github.com", "o/r"): inv}, "github.com/o/r", inv, true},
+		{"other forge", map[string]RepoPolicy{r1("github.com", "o/r"): inv}, "gitlab.example/o/r", RepoPolicy{}, false},
 		{"canonical via bare alias", map[string]RepoPolicy{"o/r": inv}, "github.com/o/r", inv, true},
 		{"bare exact", map[string]RepoPolicy{"o/r": inv}, "o/r", inv, true},
-		{"bare canonical host-less", map[string]RepoPolicy{"github.com/o/r": inv}, "o/r", inv, true},
-		{"unrelated", map[string]RepoPolicy{"github.com/o/r": inv}, "github.com/o/x", RepoPolicy{}, false},
+		{"bare canonical host-less", map[string]RepoPolicy{r1("github.com", "o/r"): inv}, "o/r", inv, true},
+		{"unrelated", map[string]RepoPolicy{r1("github.com", "o/r"): inv}, "github.com/o/x", RepoPolicy{}, false},
 		{"gitlab group with dot", map[string]RepoPolicy{"acme.co/service": inv}, "gitlab.example/acme.co/service", inv, true},
 	}
 	for _, tc := range cases {
@@ -134,7 +134,7 @@ func TestRepoPolicyLookupTables(t *testing.T) {
 // repository.
 func TestDotlessCanonicalPolicyHostSeparatesForge(t *testing.T) {
 	inv := RepoPolicy{AllowedRegions: []string{"eu"}}
-	cfg := &Config{Repositories: map[string]RepoPolicy{"gitlab/acme/widget": inv}}
+	cfg := &Config{Repositories: map[string]RepoPolicy{r1("gitlab", "acme/widget"): inv}}
 	if got, ok := cfg.RepoPolicyFor("gitlab/acme/widget"); !ok || !reflect.DeepEqual(got, inv) {
 		t.Fatalf("dotless canonical entry must resolve its own repository: %+v ok=%v", got, ok)
 	}
@@ -144,7 +144,7 @@ func TestDotlessCanonicalPolicyHostSeparatesForge(t *testing.T) {
 	if _, ok := cfg.RepoPolicyFor("forge.example/gitlab/acme/widget"); ok {
 		t.Fatal("dotless canonical policy leaked to another forge with the same name")
 	}
-	rev := &Config{Repositories: map[string]RepoPolicy{"forge.example/gitlab/acme/widget": inv}}
+	rev := &Config{Repositories: map[string]RepoPolicy{r1("forge.example", "gitlab/acme/widget"): inv}}
 	if _, ok := rev.RepoPolicyFor("gitlab/acme/widget"); ok {
 		t.Fatal("another forge's canonical entry scoped the dotless repository")
 	}

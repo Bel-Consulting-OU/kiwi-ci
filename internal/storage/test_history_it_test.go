@@ -36,6 +36,33 @@ func pgITHistoryRun(t *testing.T, st *PostgresStore, runID, jobID, repoID, fullN
 	}
 }
 
+// pgITLegacyHistoryRun seeds one run + job exactly as a schema BEFORE
+// migration 0033 wrote them: a raw INSERT that does not touch the normalized
+// repository identity columns (which do not exist at the historical schema
+// version under test). It is the legacy shape migration 0034 backfills.
+func pgITLegacyHistoryRun(t *testing.T, st *PostgresStore, runID, jobID, repoID, fullName string, created time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	run := model.Run{ID: runID, RepoID: repoID, PolicyRepoID: repoID, Repo: "https://" + repoID + ".git", RepoFullName: fullName, Status: model.StatusQueued, CreatedAt: created}
+	rp, err := jsonMarshal(run)
+	if err != nil {
+		t.Fatalf("marshal legacy history run %s: %v", runID, err)
+	}
+	if _, err := st.pool.Exec(ctx, `INSERT INTO runs (id, status, started_at, finished_at, created_at, payload) VALUES ($1,$2,$3,$4,$5,$6)`,
+		runID, string(run.Status), run.StartedAt, run.FinishedAt, run.CreatedAt, rp); err != nil {
+		t.Fatalf("raw insert legacy history run %s: %v", runID, err)
+	}
+	job := model.Job{ID: jobID, RunID: runID, Key: "build", RepoID: repoID, PolicyRepoID: repoID, RepoURL: "https://" + repoID + ".git", RepoFullName: fullName, Status: model.StatusQueued, CreatedAt: created}
+	jp, err := jsonMarshal(job)
+	if err != nil {
+		t.Fatalf("marshal legacy history job %s: %v", jobID, err)
+	}
+	if _, err := st.pool.Exec(ctx, `INSERT INTO jobs (id, run_id, key, status, created_at, payload) VALUES ($1,$2,$3,$4,$5,$6)`,
+		jobID, runID, job.Key, string(job.Status), job.CreatedAt, jp); err != nil {
+		t.Fatalf("raw insert legacy history job %s: %v", jobID, err)
+	}
+}
+
 func pgITHistoryReport(runID, id string, created time.Time, cases ...model.TestResult) model.TestReport {
 	tests, failures := 0, 0
 	for _, c := range cases {
@@ -522,7 +549,7 @@ func TestPostgresIntegrationTestHistoryUpgradeBridge(t *testing.T) {
 	repo, full := "github.com/kiwi-it/legacy", "kiwi-it/legacy"
 	base := time.Now().UTC().Truncate(time.Second)
 	runID, jobID := pgITNewID(t), pgITNewID(t)
-	pgITHistoryRun(t, st, runID, jobID, repo, full, base)
+	pgITLegacyHistoryRun(t, st, runID, jobID, repo, full, base)
 	oldRep := pgITHistoryReport(runID, pgITNewID(t), base, model.TestResult{Name: "old", Duration: 1, Passed: false})
 	if err := st.InsertTestReport(ctx, oldRep); err != nil {
 		t.Fatalf("pre-upgrade report insert: %v", err)

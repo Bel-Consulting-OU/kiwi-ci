@@ -38,6 +38,17 @@
 // replica without its own id is refused by the ownership lock rather than
 // silently doubling the total footprint. The contract is enforced at startup
 // and spelled out in the configuration validation text.
+//
+// Legacy-layout policy: a pre-contract process (< commit 72d887d) staged its
+// ACTIVE spool files directly in the shared root, with no ownership lock, so a
+// top-level kiwi-stage-* entry in the root is NOT provably abandoned — during
+// a rolling HA upgrade it can be a still-running old replica's in-flight
+// upload. Constructing a replica budget therefore NEVER reclaims top-level
+// entries in the root; they stay untouched until an operator runs the explicit
+// MigrateLegacyStagingLayout (kiwi storage migrate-staging-layout) once every
+// old-layout replica has drained. Only the files inside a replica's own
+// <root>/<instance-id> directory are reclaimed at construction, under that
+// directory's ownership lock.
 package staging
 
 import (
@@ -130,7 +141,19 @@ type Budget struct {
 	registryKey  string
 	staleRemoved int
 
+	// closed is the CLOSING flag: Close sets it (under mu) before waiting, so
+	// every Acquire that checks it under mu observes a budget that is at least
+	// closing and fails closed. Reading it only under mu is what closes the
+	// Close/Acquire race (a bare pre-lock check could see false and then
+	// increment used after Close had already retired the budget).
 	closed atomic.Bool
+
+	// finalized and done implement the exactly-once ownership release. Close
+	// sets finalized under mu when used has reached zero and then releases the
+	// lock outside mu, closing done so every concurrent/retrying Close call
+	// converges. Both are mu-guarded.
+	finalized bool
+	done      chan struct{}
 }
 
 // ownedDirs is the process-wide ownership registry: at most one live Budget
@@ -207,13 +230,13 @@ func validateBound(dir string, maxBytes int64) error {
 // hold a configured ROOT (staging.dir) must use NewReplicaBudget instead, so
 // replicas sharing the root stage into distinct subdirectories.
 func NewBudget(dir string, maxBytes int64) (*Budget, error) {
-	return newBudget(dir, maxBytes, 0)
+	return newBudget(dir, maxBytes)
 }
 
-// newBudget is the constructor shared by NewBudget and NewReplicaBudget.
-// legacyRemoved carries the count of legacy bare spool files already
-// reclaimed from a configured root, attributed to the fresh ledger.
-func newBudget(dir string, maxBytes int64, legacyRemoved int) (*Budget, error) {
+// newBudget is the constructor shared by NewBudget and NewReplicaBudget. It
+// reclaims the spool files of the EXACT directory it owns (a dead owner's,
+// proven by the ownership lock); it never touches a parent root.
+func newBudget(dir string, maxBytes int64) (*Budget, error) {
 	dir = strings.TrimSpace(dir)
 	if err := validateBound(dir, maxBytes); err != nil {
 		return nil, err
@@ -262,7 +285,8 @@ func newBudget(dir string, maxBytes int64, legacyRemoved int) (*Budget, error) {
 		notify:       make(chan struct{}),
 		lock:         lock,
 		registryKey:  key,
-		staleRemoved: removed + legacyRemoved,
+		staleRemoved: removed,
+		done:         make(chan struct{}),
 	}
 	registerBudget(b)
 	return b, nil
@@ -325,8 +349,10 @@ func (b *Budget) MaxBytes() int64 { return b.maxBytes }
 
 // StaleFilesRemoved returns how many abandoned spool files the constructor
 // reclaimed when it took ownership: files left by a previous, dead process in
-// the staging directory, plus legacy bare spool files reclaimed from a
-// configured root. It is immutable after construction.
+// the exact staging directory it owns. It never counts legacy bare files in a
+// configured root, because replica construction deliberately leaves those
+// untouched (see MigrateLegacyStagingLayout). It is immutable after
+// construction.
 func (b *Budget) StaleFilesRemoved() int { return b.staleRemoved }
 
 // Used returns the number of bytes currently reserved. It is a snapshot:
@@ -339,26 +365,91 @@ func (b *Budget) Used() int64 {
 }
 
 // Close releases the directory ownership token and unregisters the budget
-// from the process-wide registry. It is idempotent and nil-safe. After Close,
-// Acquire fails closed with ErrClosed: the directory may already belong to a
-// successor process, so admitting more bytes would break the bound. Calls
-// released after Close still return their bytes to the (now retired) ledger.
+// from the process-wide registry. It is idempotent and nil-safe and is the
+// unbounded fallback for CloseWithContext: it waits until every
+// outstanding reservation has been released before returning.
+//
+// Close first transitions the budget to CLOSING, so Acquire fails closed with
+// ErrClosed (the directory may already belong to a successor process) and
+// acquires already blocked on the budget wake up and fail closed too. It then
+// waits for Used() to reach zero before releasing the ownership lock: a
+// successor budget must never start (and sweep spool files) while a
+// reservation from this budget still covers staged bytes. Calls released
+// after Close still return their bytes to the (now retired) ledger.
 //
 // Production servers hold ownership for the process lifetime and rely on
 // process exit; Close exists for orderly hand-off and for tests that simulate
-// a crash and restart.
+// a crash and restart. Because it waits for outstanding reservations, a
+// caller that cannot guarantee a bounded drain should use CloseWithContext.
 func (b *Budget) Close() error {
+	return b.CloseWithContext(context.Background())
+}
+
+// CloseWithContext is Close bounded by ctx. It transitions the budget to
+// CLOSING (rejecting new acquisitions with ErrClosed and waking blocked
+// acquirers), then waits for Used() to reach zero before releasing the
+// directory ownership lock and unregistering the budget.
+//
+// If ctx ends before the last reservation is released, CloseWithContext
+// returns ctx.Err() WITHOUT releasing ownership: the directory stays ours and
+// a later Close/CloseWithContext completes the hand-off once the ledger
+// drains. That is the safe direction — a successor must never sweep bytes a
+// live reservation still covers.
+//
+// Concurrent Close calls converge: exactly one performs the release and the
+// others block until it completes (bounded by their own ctx). The release
+// error is returned by the call that performed it; the others return nil.
+func (b *Budget) CloseWithContext(ctx context.Context) error {
 	if b == nil {
 		return nil
 	}
-	if !b.closed.CompareAndSwap(false, true) {
-		return nil
-	}
-	unregisterBudget(b)
 	b.mu.Lock()
-	b.broadcastLocked()
-	b.mu.Unlock()
-	return b.lock.release()
+	if b.done == nil {
+		b.done = make(chan struct{})
+	}
+	if !b.closed.Load() {
+		b.closed.Store(true)
+		b.broadcastLocked()
+	}
+	for {
+		if b.finalized {
+			// Another call already completed (or is completing) the
+			// hand-off; wait for it rather than releasing twice.
+			done := b.done
+			b.mu.Unlock()
+			select {
+			case <-done:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		if b.used == 0 {
+			// Last reservation gone (or never existed): release ownership.
+			b.finalized = true
+			done := b.done
+			lock := b.lock
+			b.mu.Unlock()
+			unregisterBudget(b)
+			err := lock.release()
+			close(done)
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			// Keep the CLOSING state and ownership: the last Release (or a
+			// later Close) drains and releases.
+			b.mu.Unlock()
+			return err
+		}
+		wait := b.notify
+		b.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-wait:
+		}
+		b.mu.Lock()
+	}
 }
 
 // Acquire reserves n bytes, blocking until the reservation fits inside the
@@ -376,10 +467,18 @@ func (b *Budget) Acquire(ctx context.Context, n int64) (*Reservation, error) {
 		return nil, fmt.Errorf("%w: %d bytes requested, budget is %d", ErrBudgetExceeded, n, b.maxBytes)
 	}
 	for {
+		// The closed check MUST happen under mu, immediately before the
+		// increment: Close sets closed under the same mu, so once a caller
+		// observes closed==false and then increments used, Close cannot have
+		// retired the directory in between (it would have had to take mu
+		// first and flip closed). A pre-lock check would let Close release the
+		// ownership lock and a successor start while this call still handed
+		// out a reservation against the retired ledger.
+		b.mu.Lock()
 		if b.closed.Load() {
+			b.mu.Unlock()
 			return nil, fmt.Errorf("%w: %s", ErrClosed, b.dir)
 		}
-		b.mu.Lock()
 		if b.used+n <= b.maxBytes {
 			b.used += n
 			b.mu.Unlock()

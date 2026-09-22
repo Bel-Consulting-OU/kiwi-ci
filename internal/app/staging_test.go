@@ -110,8 +110,10 @@ func TestServerProductionRefusesUnusableStagingDirectoryAtStartup(t *testing.T) 
 // TestBuildStagingBudgetPerReplicaAndRefusesUnusable: an unconfigured section
 // leaves the server default in place; a configured section constructs the
 // replica-private budget <root>/<instance-id> and reclaims spool files a dead
-// owner left (including legacy bare files directly under the shared root); an
-// unusable, partial or unsafe configured bound fails startup.
+// owner left INSIDE that directory, while a legacy top-level file in the
+// shared root is left untouched (a pre-layout process staged it with no lock,
+// so it may be a live old replica's upload); an unusable, partial or unsafe
+// configured bound fails startup.
 func TestBuildStagingBudgetPerReplicaAndRefusesUnusable(t *testing.T) {
 	b, pruned, err := buildStagingBudget(config.StagingConfig{})
 	if err != nil || b != nil || pruned != 0 {
@@ -119,8 +121,8 @@ func TestBuildStagingBudgetPerReplicaAndRefusesUnusable(t *testing.T) {
 	}
 
 	root := t.TempDir()
-	// A pre-contract process spooled directly into the configured root; the
-	// new owner reclaims it (the ownership lock proves it is a dead owner's).
+	// A pre-contract process spooled directly into the configured root with
+	// no ownership lock: startup must NOT reclaim it.
 	abandoned := filepath.Join(root, staging.FilePrefix+"crash-leftover")
 	if err := os.WriteFile(abandoned, []byte("stale"), 0o600); err != nil {
 		t.Fatal(err)
@@ -139,14 +141,28 @@ func TestBuildStagingBudgetPerReplicaAndRefusesUnusable(t *testing.T) {
 	if want := filepath.Join(root, "replica-a"); b.Dir() != want || b.MaxBytes() != 1<<20 {
 		t.Fatalf("configured replica budget = (dir %q, max %d), want (%q, %d)", b.Dir(), b.MaxBytes(), want, 1<<20)
 	}
-	if pruned != 1 {
-		t.Fatalf("startup reclaim removed %d files, want 1", pruned)
+	if pruned != 0 {
+		t.Fatalf("startup reclaim removed %d files, want 0 (legacy top-level files must survive)", pruned)
 	}
-	if _, err := os.Stat(abandoned); !os.IsNotExist(err) {
-		t.Fatalf("abandoned spool file survived the startup reclaim: %v", err)
+	if _, err := os.Stat(abandoned); err != nil {
+		t.Fatalf("legacy top-level spool file was reclaimed at startup: %v", err)
 	}
 	if _, err := os.Stat(foreign); err != nil {
 		t.Fatalf("startup reclaim removed a foreign file: %v", err)
+	}
+	// The explicit migration is the only path that reclaims it.
+	res, err := staging.MigrateLegacyStagingLayout(context.Background(), root)
+	if err != nil {
+		t.Fatalf("MigrateLegacyStagingLayout: %v", err)
+	}
+	if len(res.Reclaimed) != 1 {
+		t.Fatalf("migration reclaimed %d files, want 1", len(res.Reclaimed))
+	}
+	if _, err := os.Stat(abandoned); !os.IsNotExist(err) {
+		t.Fatalf("migration did not reclaim the legacy spool file: %v", err)
+	}
+	if _, err := os.Stat(foreign); err != nil {
+		t.Fatalf("migration removed a foreign file: %v", err)
 	}
 	if got := b.Used(); got != 0 {
 		t.Fatalf("new replica budget started with Used() = %d, want 0", got)

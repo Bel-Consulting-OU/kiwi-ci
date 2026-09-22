@@ -171,13 +171,17 @@ type Server struct {
 	oidc               *oidcSigner
 	outbox             *Outbox
 
-	// stateDegraded is armed when a filesystem snapshot persist fails and
-	// cleared by the next successful persist. /readiness reports 503 with a
-	// fixed body while armed, and next() refuses to issue new lease tokens,
-	// so a mutation that could not be made durable is never silently
-	// acknowledged as healthy. The diagnostic itself is logged by
-	// persistCheckedErrLocked.
-	stateDegraded atomic.Bool
+	// stateDegraded is the readiness degraded signal: it is armed when a
+	// filesystem snapshot persist fails (cleared by the next successful
+	// snapshot persist) OR when a security-state file in some directory was
+	// published but its crash durability could not be certified (a failed
+	// parent-directory fsync; cleared only by a successful persist/fsync in
+	// that SAME directory — see Server.noteFilePersistResult). /readiness
+	// reports 503 with a fixed body while armed, and next() refuses to issue
+	// new lease tokens, so a mutation that could not be made durable is never
+	// silently acknowledged as healthy. The diagnostic itself is logged by
+	// persistCheckedErrLocked / noteFilePersistResult.
+	stateDegraded degradedReadiness
 	// persistFailForTest, when non-nil, makes persistLocked report this
 	// error without touching disk. Test-only seam; production leaves it nil.
 	persistFailForTest error
@@ -550,18 +554,53 @@ func loadLeaseKey(root string) ([]byte, error) {
 	return key, nil
 }
 
-func NewPersistent(runnerToken, adminToken, dataDir string) (*Server, error) {
+// newServerCAS is the ONE constructor for every server CAS instance. It pins
+// the authoritative per-object maximum — maxBlobBytes, the same 8 GiB bound
+// the cache and artifact HTTP endpoints advertise — and the server's shared
+// staging budget, which the legacy CAS.Put fallback spools through. Building
+// every instance here (the persistent constructors, SetBlobStore and tests)
+// is what keeps the advertised upload interval and the CAS write bound from
+// drifting apart: a valid 5 GiB upload can no longer pass HTTP and then be
+// rejected by CAS.PutFile.
+//
+// The snapshot endpoint deliberately keeps its own 4 GiB
+// snapshot.MaxArchiveBytes body cap: that is a separate archive-size contract
+// (the runner's capture cap is clamped to it), not the generic object maximum.
+func newServerCAS(blobStore blob.Store, stagingBudget *staging.Budget) *cas.CAS {
+	return &cas.CAS{Blobs: blobStore, MaxBlobBytes: maxBlobBytes, Staging: stagingBudget}
+}
+
+func NewPersistent(runnerToken, adminToken, dataDir string, opts ...PersistentOption) (*Server, error) {
 	// The filesystem cluster key store under dataDir reproduces the legacy
 	// per-file key layout exactly (see FSClusterKeyStore), so existing
 	// deployments keep their key material and behavior unchanged while the
 	// cluster identity is present for HA validation.
-	return NewPersistentWithCluster(runnerToken, adminToken, dataDir, &FSClusterKeyStore{Dir: dataDir})
+	return NewPersistentWithCluster(runnerToken, adminToken, dataDir, &FSClusterKeyStore{Dir: dataDir}, opts...)
+}
+
+// PersistentOption customizes a persistent server constructor. Options run
+// once on the freshly created server, before any data-dir loader and before
+// the CAS/staging wiring, so a supplied value wins over the constructor's
+// built-in default.
+type PersistentOption func(*Server)
+
+// WithStagingBudget installs b as the server's shared staging budget (and,
+// through the CAS wiring, the budget every server CAS instance carries)
+// instead of letting the constructor build its own data-dir default. The
+// caller keeps ownership of b — the server never closes it — and is
+// responsible for having taken its directory lock. Production passes the
+// budget it already built from staging.dir/staging.max_bytes here so the
+// process owns exactly one staging directory and holds exactly one lock,
+// rather than the constructor locking a second directory (or colliding on the
+// same directory with a different max_bytes).
+func WithStagingBudget(b *staging.Budget) PersistentOption {
+	return func(s *Server) { s.Staging = b }
 }
 
 // NewPersistentWithCluster is NewPersistent with an explicit cluster key
 // store. A nil store keeps the legacy data-dir loaders. When the store is
 // non-nil every signing material loads and persists through it.
-func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster ClusterKeyStore) (*Server, error) {
+func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster ClusterKeyStore, opts ...PersistentOption) (*Server, error) {
 	if adminToken == "" {
 		adminToken = runnerToken
 	}
@@ -569,17 +608,35 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 	s.AdminToken = adminToken
 	s.dataDir = dataDir
 	s.ClusterKeys = cluster
+	// A filesystem cluster key store reports every durable key publish to
+	// this server's per-directory uncertainty tracker, so a first-time key
+	// creation whose directory entry is not certified durable (a failed
+	// parent-directory fsync) fails closed at /readiness for that directory.
+	if fs, ok := cluster.(*FSClusterKeyStore); ok {
+		fs.setPersistObserver(s.noteFilePersistResult)
+	}
+	// Options run before the data-dir default staging budget is built, so a
+	// caller-supplied budget (WithStagingBudget) is used verbatim and the
+	// constructor never constructs — and locks — a second directory.
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
+	}
 	s.store = storage.New(dataDir)
 	s.outbox = NewOutbox(s.store)
 	// Large runner uploads stage through a shared, bounded budget: default
 	// it under the data dir (never a bare system temp directory) so every
-	// persistent server has a bound. The app wiring replaces it with the
-	// budget built from staging.dir/staging.max_bytes (a per-replica
-	// directory <root>/<instance-id>, see internal/staging), and production
-	// REFUSES to start without one. The constructor takes exclusive
-	// ownership of its directory and reclaims the spool files a dead owner
-	// left there before the first request; a second live process on the same
-	// data dir fails construction instead of double-counting the same disk.
+	// persistent server has a bound. The app wiring supplies the budget it
+	// already built from staging.dir/staging.max_bytes through
+	// WithStagingBudget (a per-replica directory <root>/<instance-id>, see
+	// internal/staging), so this default is built only for callers that pass
+	// none; production REFUSES to start without one. Either way the
+	// constructor ends up with exactly one owned directory: the default path
+	// takes exclusive ownership, and a supplied budget is used verbatim
+	// (never constructed again, so no second lock and no registry collision).
+	// A second live process on the same data dir fails construction instead
+	// of double-counting the same disk.
 	stagingRoot := dataDir
 	if stagingRoot == "" {
 		stagingRoot = os.TempDir()
@@ -735,7 +792,7 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 	if s.BlobStore == nil {
 		s.BlobStore = blob.NewFS(filepath.Join(dataDir, "cas"))
 	}
-	s.CAS = cas.New(s.BlobStore)
+	s.CAS = newServerCAS(s.BlobStore, s.Staging)
 	if err := s.loadDrainFlag(dataDir); err != nil {
 		return nil, err
 	}

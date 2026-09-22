@@ -14,7 +14,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -106,6 +105,47 @@ type ClusterKeyRotationFencer interface {
 //	                                    from the object
 type FSClusterKeyStore struct {
 	Dir string
+
+	// persistObserver, when non-nil, receives (path, err) after every durable
+	// filesystem publish this store performs. The owning server installs its
+	// per-directory uncertainty tracker here so a create-if-absent publish
+	// whose crash durability could not be certified arms readiness for the
+	// store's directory (see Server.noteFilePersistResult). It is set once
+	// before the store serves traffic; a nil observer (a store used
+	// standalone, without a server) simply drops the outcome.
+	persistObserver func(path string, err error)
+}
+
+// setPersistObserver installs the outcome observer for this store's durable
+// publishes. It is called once by the server that owns the store.
+func (s *FSClusterKeyStore) setPersistObserver(fn func(path string, err error)) {
+	s.persistObserver = fn
+}
+
+// observePersist reports one durable filesystem publish outcome to the
+// installed observer, if any.
+func (s *FSClusterKeyStore) observePersist(path string, err error) {
+	if s.persistObserver != nil {
+		s.persistObserver(path, err)
+	}
+}
+
+// casPublish is createFileCAS with the store's persist observer attached: the
+// outcome (success or typed error) is folded into the server's per-directory
+// uncertainty state, so a first-time key publication whose directory entry is
+// not certified durable fails closed at /readiness as well as at the caller.
+func (s *FSClusterKeyStore) casPublish(path string, data []byte) error {
+	err := createFileCAS(path, data)
+	s.observePersist(path, err)
+	return err
+}
+
+// writeFile is fsutil.AtomicWriteFile with the store's persist observer
+// attached, used for every overwrite-style key write and derived sidecar.
+func (s *FSClusterKeyStore) writeFile(path string, data []byte, mode os.FileMode) error {
+	err := fsutil.AtomicWriteFile(path, data, mode)
+	s.observePersist(path, err)
+	return err
 }
 
 // StaticClusterKeyStore is an in-memory ClusterKeyStore for tests and
@@ -247,7 +287,7 @@ func (s *FSClusterKeyStore) LoadOrCreate(kind string) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := createFileCAS(path, created); err != nil {
+		if err := s.casPublish(path, created); err != nil {
 			if !errors.Is(err, os.ErrExist) {
 				return nil, err
 			}
@@ -289,7 +329,7 @@ func (s *FSClusterKeyStore) LoadOrCreate(kind string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := createFileCAS(path, enc); err != nil {
+	if err := s.casPublish(path, enc); err != nil {
 		if !errors.Is(err, os.ErrExist) {
 			return nil, err
 		}
@@ -318,7 +358,7 @@ func (s *FSClusterKeyStore) LoadOrCreate(kind string) ([]byte, error) {
 		if kind == clusterKindCacheSigning {
 			pubPath = filepath.Join(s.Dir, cacheSigningPubFile)
 		}
-		if perr := fsutil.AtomicWriteFile(pubPath, pub, 0o644); perr != nil {
+		if perr := s.writeFile(pubPath, pub, 0o644); perr != nil {
 			return nil, perr
 		}
 	}
@@ -351,7 +391,7 @@ func (s *FSClusterKeyStore) InstallOrLoad(kind string, data []byte) ([]byte, boo
 	if err != nil {
 		return nil, false, err
 	}
-	if err := createFileCAS(path, encoded); err != nil {
+	if err := s.casPublish(path, encoded); err != nil {
 		if !errors.Is(err, os.ErrExist) {
 			return nil, false, err
 		}
@@ -383,7 +423,7 @@ func (s *FSClusterKeyStore) InstallOrLoad(kind string, data []byte) ([]byte, boo
 		if kind == clusterKindCacheSigning {
 			pubPath = filepath.Join(s.Dir, cacheSigningPubFile)
 		}
-		if perr := fsutil.AtomicWriteFile(pubPath, pubPEM, 0o644); perr != nil {
+		if perr := s.writeFile(pubPath, pubPEM, 0o644); perr != nil {
 			return nil, false, perr
 		}
 	}
@@ -404,51 +444,27 @@ func (s *FSClusterKeyStore) encodedBytes(kind string, data []byte) ([]byte, erro
 	}
 }
 
-// createFileCAS publishes data at path with create-if-absent semantics: the
-// bytes are written to a unique temp file, fsynced, and hard-linked into
-// place. A link racing an existing file fails with os.ErrExist. On Windows
-// (where hard links can be unsupported on some filesystems) the O_CREATE|
-// O_EXCL fallback is used instead.
+// createFileCAS publishes data at path with create-if-absent semantics and a
+// full crash-durability sequence: a unique temp file in the destination
+// directory, write, chmod 0600, checked file fsync, checked close, then the
+// create-if-absent publish — a hard link on unix (a link racing an existing
+// file fails with os.ErrExist) or an O_CREATE|O_EXCL open on Windows — and
+// finally a parent-directory fsync. It is the cluster-key realization of
+// fsutil.CreateFileCAS, which owns the sequence and the typed error contract:
+//
+//   - a pre-publish failure is definitely not published (ErrNotPublished):
+//     the temp file is removed and the destination is untouched.
+//   - a post-publish failure (the parent-directory fsync, or a Windows
+//     O_EXCL write/sync/close after the entry became visible) is
+//     published-but-uncertain (fsutil.Renamed, ErrPublishedUncertain): the
+//     NEW file IS at path with uncertified crash durability. The caller MUST
+//     NOT delete or regenerate it — a restart reads it back and converges;
+//     deleting it would let a later start mint different trust material.
+//
+// os.ErrExist is returned unwrapped for a lost create race so the existing
+// errors.Is(err, os.ErrExist) callers keep working.
 func createFileCAS(path string, data []byte) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".cas-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if runtime.GOOS == "windows" {
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-		if err != nil {
-			return err
-		}
-		if _, err := f.Write(data); err != nil {
-			f.Close()
-			return err
-		}
-		return f.Close()
-	}
-	if err := os.Link(tmpName, path); err != nil {
-		if os.IsExist(err) {
-			return os.ErrExist
-		}
-		return err
-	}
-	return nil
+	return fsutil.CreateFileCAS(path, data, 0o600)
 }
 
 // Lookup reports the stored bytes for kind without creating anything.
@@ -490,7 +506,7 @@ func (s *FSClusterKeyStore) Lookup(kind string) ([]byte, bool, error) {
 			}
 			return nil, false, lerr
 		}
-		if werr := fsutil.AtomicWriteFile(p, legacy, 0o600); werr != nil {
+		if werr := s.writeFile(p, legacy, 0o600); werr != nil {
 			return nil, false, werr
 		}
 		return legacy, true, nil
@@ -548,7 +564,7 @@ func (s *FSClusterKeyStore) Lookup(kind string) ([]byte, bool, error) {
 		migrated = append(migrated, certPEM...)
 		migrated = append(migrated, 0)
 		migrated = append(migrated, keyPEM...)
-		if werr := createFileCAS(filepath.Join(s.Dir, runnerCAObjectFile), migrated); werr != nil && !errors.Is(werr, os.ErrExist) {
+		if werr := s.casPublish(filepath.Join(s.Dir, runnerCAObjectFile), migrated); werr != nil && !errors.Is(werr, os.ErrExist) {
 			return nil, false, werr
 		}
 		return migrated, true, nil
@@ -585,11 +601,11 @@ func (s *FSClusterKeyStore) Store(kind string, data []byte) error {
 		if err != nil {
 			return err
 		}
-		return fsutil.AtomicWriteFile(p, []byte(hex.EncodeToString(data)), 0o600)
+		return s.writeFile(p, []byte(hex.EncodeToString(data)), 0o600)
 	case clusterKindOIDC:
-		return fsutil.AtomicWriteFile(filepath.Join(s.Dir, oidcKeyRingFile), data, 0o600)
+		return s.writeFile(filepath.Join(s.Dir, oidcKeyRingFile), data, 0o600)
 	case clusterKindProvenance:
-		if err := fsutil.AtomicWriteFile(filepath.Join(s.Dir, "provenance.key"), data, 0o600); err != nil {
+		if err := s.writeFile(filepath.Join(s.Dir, "provenance.key"), data, 0o600); err != nil {
 			return err
 		}
 		priv, err := parseEd25519PrivatePEM(data)
@@ -600,9 +616,9 @@ func (s *FSClusterKeyStore) Store(kind string, data []byte) error {
 		if err != nil {
 			return err
 		}
-		return fsutil.AtomicWriteFile(filepath.Join(s.Dir, "provenance.pub"), pub, 0o644)
+		return s.writeFile(filepath.Join(s.Dir, "provenance.pub"), pub, 0o644)
 	case clusterKindCacheSigning:
-		if err := fsutil.AtomicWriteFile(filepath.Join(s.Dir, cacheSigningKeyFile), data, 0o600); err != nil {
+		if err := s.writeFile(filepath.Join(s.Dir, cacheSigningKeyFile), data, 0o600); err != nil {
 			return err
 		}
 		priv, err := parseEd25519PrivatePEM(data)
@@ -613,13 +629,13 @@ func (s *FSClusterKeyStore) Store(kind string, data []byte) error {
 		if err != nil {
 			return err
 		}
-		return fsutil.AtomicWriteFile(filepath.Join(s.Dir, cacheSigningPubFile), pub, 0o644)
+		return s.writeFile(filepath.Join(s.Dir, cacheSigningPubFile), pub, 0o644)
 	case clusterKindRunnerCA:
-		if err := createFileCAS(filepath.Join(s.Dir, runnerCAObjectFile), data); err != nil {
+		if err := s.casPublish(filepath.Join(s.Dir, runnerCAObjectFile), data); err != nil {
 			if errors.Is(err, os.ErrExist) {
 				// The object already exists: overwrite semantics need the
 				// explicit Store path, which the CAS link cannot provide.
-				if werr := fsutil.AtomicWriteFile(filepath.Join(s.Dir, runnerCAObjectFile), data, 0o600); werr != nil {
+				if werr := s.writeFile(filepath.Join(s.Dir, runnerCAObjectFile), data, 0o600); werr != nil {
 					return werr
 				}
 			} else {
@@ -648,10 +664,10 @@ func (s *FSClusterKeyStore) publishRunnerCASidecars(obj []byte) error {
 	if err != nil {
 		return err
 	}
-	if err := fsutil.AtomicWriteFile(filepath.Join(s.Dir, "ca.crt"), certPEM, 0o644); err != nil {
+	if err := s.writeFile(filepath.Join(s.Dir, "ca.crt"), certPEM, 0o644); err != nil {
 		return err
 	}
-	return fsutil.AtomicWriteFile(filepath.Join(s.Dir, "ca.key"), keyPEM, 0o600)
+	return s.writeFile(filepath.Join(s.Dir, "ca.key"), keyPEM, 0o600)
 }
 
 // ---------------------------------------------------------------------------
@@ -937,6 +953,9 @@ func (s *Server) UseClusterKeyStore(store ClusterKeyStore) error {
 		return errors.New("cluster keys: nil store")
 	}
 	s.ClusterKeys = store
+	if fs, ok := store.(*FSClusterKeyStore); ok {
+		fs.setPersistObserver(s.noteFilePersistResult)
+	}
 	if signer, err := s.loadOIDCSignerCluster(store); err != nil {
 		return err
 	} else {

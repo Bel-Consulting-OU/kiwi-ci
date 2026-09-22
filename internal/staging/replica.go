@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 )
 
 // InstanceIDFileName is the file inside a configured staging ROOT that
@@ -97,17 +99,21 @@ func ReplicaDir(configuredRoot, instanceID string) (string, string, error) {
 }
 
 // NewReplicaBudget is the production constructor: it resolves the
-// replica-private directory under the configured root (see ReplicaDir),
-// reclaims legacy bare spool files that an older process left directly in the
-// root, and then takes ownership of the replica directory exactly like
-// NewBudget.
+// replica-private directory under the configured root (see ReplicaDir) and
+// then takes ownership of that directory exactly like NewBudget.
 //
-// Legacy reclaim is safe for the same reason the per-directory reclaim is: no
-// process under this contract ever spools a bare file into the root (spool
-// files are created inside <root>/<instance-id>), so a top-level
-// kiwi-stage-* entry in the root can only be an artifact of a pre-contract
-// process. Replica subdirectories are skipped — they belong to other,
-// possibly live, replicas and each carries its own ownership lock.
+// It deliberately does NOT reclaim legacy bare spool files that a pre-contract
+// process left directly in the shared root. Under the pre-contract layout
+// (< commit 72d887d) a live old replica staged its ACTIVE spool files at the
+// top level of the root WITH NO ownership lock, so a top-level kiwi-stage-*
+// entry is not provably abandoned: unlinking it during a rolling HA upgrade
+// would delete a still-running old replica's in-flight upload. Top-level
+// legacy files are left untouched until an operator runs the explicit
+// MigrateLegacyStagingLayout (kiwi storage migrate-staging-layout), which
+// takes the root's ownership lock and requires the operator to confirm that
+// every old-layout replica has drained. Only files inside this replica's own
+// <root>/<instance-id> directory are reclaimed at construction, under that
+// directory's ownership lock.
 func NewReplicaBudget(configuredRoot, instanceID string, maxBytes int64) (*Budget, error) {
 	root := strings.TrimSpace(configuredRoot)
 	if err := validateBound(root, maxBytes); err != nil {
@@ -123,11 +129,7 @@ func NewReplicaBudget(configuredRoot, instanceID string, maxBytes int64) (*Budge
 	} else if existing != nil {
 		return existing, nil
 	}
-	legacy, lerr := sweepSpoolFiles(root)
-	if lerr != nil {
-		return nil, fmt.Errorf("staging: reclaim legacy spool files in %s: %w", root, lerr)
-	}
-	return newBudget(dir, maxBytes, legacy)
+	return newBudget(dir, maxBytes)
 }
 
 // loadOrCreateInstanceID returns the persisted instance id of a configured
@@ -155,10 +157,24 @@ func loadOrCreateInstanceID(root string) (string, error) {
 	syncErr := f.Sync()
 	closeErr := f.Close()
 	if err := firstErr(writeErr, syncErr, closeErr); err != nil {
-		// Never leave a torn id behind: it would resolve later starts to a
-		// different (orphaned) replica directory than this attempt.
+		// Definitively not published (or torn): remove it so a later start
+		// does not adopt a partial id that names a different directory.
 		_ = os.Remove(path)
 		return "", fmt.Errorf("staging: persist instance id %s: %w", path, err)
+	}
+	// The id bytes are durable, but the file's NAME is not until the root
+	// directory itself is fsynced. Without this a power loss can leave the
+	// name absent, so the next start generates a SECOND id, stages in a new
+	// subdirectory, and strands the previous replica directory (up to
+	// max_bytes) unreclaimable.
+	//
+	// On failure the visible id file is deliberately LEFT in place
+	// (published-uncertain, like fsutil's post-rename PhaseDirSync): the
+	// content is on disk and readable, so the next attempt adopts it instead
+	// of generating another generation. Failing startup is still correct: the
+	// id's crash durability is not certified.
+	if err := fsutil.SyncDir(root); err != nil {
+		return "", fmt.Errorf("staging: instance id %s is published but its durability is not certified, leaving it for the next start to adopt: %w: %v", path, fsutil.ErrPublishedUncertain, err)
 	}
 	return id, nil
 }

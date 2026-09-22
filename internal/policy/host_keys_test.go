@@ -1,6 +1,25 @@
 package policy
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
+)
+
+// r1 renders a canonical policy key in the explicit ACL spelling
+// "r1:<base64url(host)>:<base64url(full_name)>". Repository policy keys are
+// validated with the strict ACL configuration schema, so a canonical entry
+// MUST use this form: an untagged "host/owner/name" key is ambiguous and is
+// rejected by Config.Validate (see TestValidateRejectsAmbiguousRepoKey).
+func r1(host, fullName string) string {
+	return auth.RepoIdentity{Host: host, FullName: fullName}.Serialized()
+}
+
+// a1 renders a nested bare-alias policy key in the explicit ACL spelling
+// "a1:<base64url(full_name)>".
+func a1(fullName string) string {
+	return auth.RepoAlias{FullName: fullName}.Serialized()
+}
 
 // TestRepoPolicyKeysMatchEquivalentForgeHosts: configured repository keys are
 // canonicalized on both sides, so equivalent forge-host spellings address the
@@ -8,7 +27,7 @@ import "testing"
 func TestRepoPolicyKeysMatchEquivalentForgeHosts(t *testing.T) {
 	enabled := true
 	cfg := &Config{Repositories: map[string]RepoPolicy{
-		"GitHub.com:443/acme/backend": {RequireDigestPins: &enabled, CrossRepoTrigger: &enabled},
+		r1("GitHub.com:443", "acme/backend"): {RequireDigestPins: &enabled, CrossRepoTrigger: &enabled},
 	}}
 	for _, lookup := range []string{
 		"github.com/acme/backend",
@@ -36,16 +55,16 @@ func TestRepoPolicyKeysMatchEquivalentForgeHosts(t *testing.T) {
 func TestRepoPolicyEquivalentKeysConflictFailsClosed(t *testing.T) {
 	enabled := true
 	cfg := &Config{Repositories: map[string]RepoPolicy{
-		"github.com/acme/backend":     {RequireDigestPins: &enabled},
-		"GITHUB.COM./acme/backend":    {},
-		"github.com:443/acme/backend": {},
+		r1("github.com", "acme/backend"):     {RequireDigestPins: &enabled},
+		r1("GITHUB.COM.", "acme/backend"):    {},
+		r1("github.com:443", "acme/backend"): {},
 	}}
 	if _, ok := cfg.RepoPolicyFor("github.com/acme/backend"); ok {
 		t.Fatal("ambiguous equivalent keys must fail closed")
 	}
 	// Equal policies on equivalent keys still resolve.
-	cfg.Repositories["GITHUB.COM./acme/backend"] = RepoPolicy{RequireDigestPins: &enabled}
-	delete(cfg.Repositories, "github.com:443/acme/backend")
+	cfg.Repositories[r1("GITHUB.COM.", "acme/backend")] = RepoPolicy{RequireDigestPins: &enabled}
+	delete(cfg.Repositories, r1("github.com:443", "acme/backend"))
 	rp, ok := cfg.RepoPolicyFor("github.com/acme/backend")
 	if !ok || rp.RequireDigestPins == nil || !*rp.RequireDigestPins {
 		t.Fatalf("equal equivalent keys must resolve: %+v ok=%v", rp, ok)

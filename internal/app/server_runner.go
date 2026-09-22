@@ -362,14 +362,18 @@ func validateProductionRunnerCredentials(ctx context.Context, db storage.Store, 
 // for this replica and reclaims the spool files its dead owner left behind,
 // before the listeners start. The configured directory is a ROOT: the budget
 // owns <root>/<instance-id> (staging.instance_id, or a generated-and-persisted
-// id when unset) and deletes every kiwi-stage-* file found there, plus legacy
-// bare spool files directly under the root — the ownership lock proves they
-// belong to a dead process. An unconfigured section returns (nil, 0, nil) so
-// the server keeps its bounded data-dir default; a configured but unusable
-// bound (a path under a regular file, a read-only or full directory, or a
-// directory already owned by a live replica) returns the constructor's error,
-// so startup fails closed instead of the first upload. config.Validate
-// already rejected a partial (dir xor max_bytes) section.
+// id when unset) and deletes every kiwi-stage-* file found there — the
+// ownership lock proves they belong to a dead process. Legacy top-level files
+// directly under the root are NOT reclaimed here: a pre-per-replica process
+// staged them with no lock, so one may be a live old replica's upload during a
+// rolling upgrade. An operator reclaims them explicitly after draining the old
+// fleet (kiwi storage migrate-staging-layout --dir <root>). An unconfigured
+// section returns (nil, 0, nil) so the server keeps its bounded data-dir
+// default; a configured but unusable bound (a path under a regular file, a
+// read-only or full directory, or a directory already owned by a live replica)
+// returns the constructor's error, so startup fails closed instead of the
+// first upload. config.Validate already rejected a partial (dir xor max_bytes)
+// section.
 func buildStagingBudget(cfg config.StagingConfig) (*staging.Budget, int, error) {
 	if strings.TrimSpace(cfg.Dir) == "" && cfg.MaxBytes == 0 {
 		return nil, 0, nil
@@ -572,6 +576,16 @@ func Server(ctx context.Context, args []string) error {
 	if berr != nil {
 		return berr
 	}
+	// The configured budget is handed to the persistent constructors so they
+	// use it verbatim: the constructor must NOT build a second data-dir
+	// default, which would take a second directory lock (different root) or
+	// collide in the staging registry (same root, different max_bytes).
+	// In-memory servers have no constructor budget hook and get it installed
+	// after construction below.
+	var persistentOpts []server.PersistentOption
+	if stagingBudget != nil {
+		persistentOpts = append(persistentOpts, server.WithStagingBudget(stagingBudget))
+	}
 	var srv *server.Server
 	var clusterStore *server.FSClusterKeyStore
 	// db is the durable SQL store in DB mode. It is declared here because the
@@ -604,9 +618,9 @@ func Server(ctx context.Context, args []string) error {
 			return fmt.Errorf("auto-migrate: %w", merr)
 		}
 		if clusterStore != nil {
-			srv, err = server.NewPersistentWithCluster(tokenV, adminTokenV, *dataDir, clusterStore)
+			srv, err = server.NewPersistentWithCluster(tokenV, adminTokenV, *dataDir, clusterStore, persistentOpts...)
 		} else if *dataDir != "" {
-			srv, err = server.NewPersistent(tokenV, adminTokenV, *dataDir)
+			srv, err = server.NewPersistent(tokenV, adminTokenV, *dataDir, persistentOpts...)
 		} else {
 			srv = server.New(tokenV)
 			if adminTokenV != "" {
@@ -650,12 +664,12 @@ func Server(ctx context.Context, args []string) error {
 			}
 		}
 	} else if clusterStore != nil {
-		srv, err = server.NewPersistentWithCluster(tokenV, adminTokenV, *dataDir, clusterStore)
+		srv, err = server.NewPersistentWithCluster(tokenV, adminTokenV, *dataDir, clusterStore, persistentOpts...)
 		if err != nil {
 			return err
 		}
 	} else if *dataDir != "" {
-		srv, err = server.NewPersistent(tokenV, adminTokenV, *dataDir)
+		srv, err = server.NewPersistent(tokenV, adminTokenV, *dataDir, persistentOpts...)
 		if err != nil {
 			return err
 		}
@@ -666,6 +680,9 @@ func Server(ctx context.Context, args []string) error {
 		}
 	}
 	// Install the staging budget built before the server existed (see above).
+	// The persistent constructors already received it through persistentOpts
+	// (so they never built a second one); this installs it on an in-memory
+	// server and is a no-op re-install on the persistent path.
 	if stagingBudget != nil {
 		srv.SetStagingBudget(stagingBudget)
 		if stagingPruned > 0 {

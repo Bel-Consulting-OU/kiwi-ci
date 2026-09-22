@@ -7,11 +7,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/provenance"
@@ -285,32 +289,167 @@ func marshalJSONFile(path string, v any) error {
 	return fsutil.AtomicWriteFile(path, append(b, '\n'), 0o600)
 }
 
+// degradedReadiness is the composite degraded signal consumed by /readiness
+// and the lease gate. It is armed by the fs snapshot's own persist outcome
+// (snapshot) OR by any directory that holds a published-but-uncertified
+// security-state file (dirs). Load reports the OR, so the historical
+// stateDegraded.Load() call sites keep working while the two causes can be
+// cleared independently: a successful snapshot persist clears only snapshot,
+// and a successful security-state persist clears only its own directory.
+type degradedReadiness struct {
+	snapshot atomic.Bool
+	dirs     persistDirSet
+}
+
+func (d *degradedReadiness) Load() bool {
+	return d.snapshot.Load() || d.dirs.any()
+}
+
+func (d *degradedReadiness) Store(v bool) { d.snapshot.Store(v) }
+
+// persistDirSet tracks the canonical parent directories in which a durable
+// security-state file was published but its crash durability could not be
+// certified. A directory fsync flushes only that directory's metadata, so
+// uncertainty is cleared only by a successful persist/fsync in the SAME
+// directory; a successful write elsewhere must not heal it.
+type persistDirSet struct {
+	mu sync.Mutex
+	m  map[string]struct{}
+}
+
+// arm marks dir uncertain and reports whether it was newly armed.
+func (d *persistDirSet) arm(dir string) (newly bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.m == nil {
+		d.m = map[string]struct{}{}
+	}
+	if _, ok := d.m[dir]; ok {
+		return false
+	}
+	d.m[dir] = struct{}{}
+	return true
+}
+
+// clear drops dir's uncertainty (a successful persist/fsync in that dir).
+func (d *persistDirSet) clear(dir string) {
+	d.mu.Lock()
+	delete(d.m, dir)
+	d.mu.Unlock()
+}
+
+func (d *persistDirSet) any() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.m) > 0
+}
+
+// list returns the uncertain directories sorted, for deterministic
+// reporting.
+func (d *persistDirSet) list() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.m) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(d.m))
+	for dir := range d.m {
+		out = append(out, dir)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // noteFilePersistResult folds the outcome of one durable security-state file
-// write into the shared degraded-readiness marker (stateDegraded — the same
-// signal /readiness and the lease gate consume; this is deliberately NOT a
-// new global failure mode):
+// write into the PER-DIRECTORY uncertainty set (not the snapshot's own
+// stateDegraded bit): a directory fsync only flushes the metadata of its own
+// directory, so a successful write in an unrelated directory must not clear
+// the uncertainty left by a different one.
 //
-//   - success heals the marker: the state has been re-persisted, so the
-//     uncertainty left by an earlier published-but-uncertified write is
-//     reconciled;
-//   - a published-but-uncertified failure (fsutil.Renamed) arms it: the new
-//     bytes are visible at the destination while their crash durability is
-//     unproven, so the node must not be described as healthy;
-//   - a pre-rename failure leaves the marker untouched: nothing observable
+//   - success clears uncertainty for filepath.Dir(path): the state in THAT
+//     directory has been re-persisted, so an earlier published-but-uncertified
+//     write there is reconciled;
+//   - a published-but-uncertified failure (fsutil.Renamed) arms uncertainty
+//     for filepath.Dir(path): the new bytes are visible at the destination
+//     while their crash durability is unproven, so /readiness must fail
+//     closed until a successful persist/fsync in that same directory;
+//   - a pre-rename failure leaves the set untouched: nothing observable
 //     changed on disk, and the caller keeps its existing rollback behavior.
 //
-// Reusing one global marker is coarser than per-file tracking: a successful
-// unrelated persist also clears it, exactly like the snapshot's own
-// notePersistResult. That trade-off is the point — one readiness signal and
-// one recovery path instead of several failure modes.
-func (s *Server) noteFilePersistResult(err error) {
-	if err == nil {
-		s.notePersistResult(nil)
+// When path is empty the directory is recovered from a typed
+// *fsutil.AtomicWriteError's Path, so a caller that only has the error still
+// attributes the uncertainty correctly; an error with no attributable
+// directory (a pure in-memory or DB failure) is ignored. The fixed
+// /readiness body is preserved: the uncertain directories are reported to
+// the structured log, never on the unauthenticated probe.
+func (s *Server) noteFilePersistResult(path string, err error) {
+	dir := canonicalPersistDir(path)
+	if dir == "" {
+		var awe *fsutil.AtomicWriteError
+		if errors.As(err, &awe) {
+			dir = canonicalPersistDir(awe.Path)
+		}
+	}
+	if dir == "" {
 		return
 	}
-	if fsutil.Renamed(err) {
-		s.notePersistResult(err)
+	if err == nil {
+		s.stateDegraded.dirs.clear(dir)
+		return
 	}
+	if !fsutil.Renamed(err) {
+		return
+	}
+	if s.stateDegraded.dirs.arm(dir) {
+		s.logError("state persistence uncertainty armed for directory; readiness degraded until a same-directory persist succeeds", "dir", dir, "error", err.Error())
+	}
+}
+
+// canonicalPersistDir normalizes the parent directory of a durable-state file
+// path so two spellings of the same directory share one uncertainty slot.
+func canonicalPersistDir(path string) string {
+	if path == "" {
+		return ""
+	}
+	return filepath.Clean(filepath.Dir(path))
+}
+
+// uncertainPersistDirs returns the canonical directories holding at least one
+// published-but-uncertified security-state file, sorted for deterministic
+// reporting.
+func (s *Server) uncertainPersistDirs() []string {
+	return s.stateDegraded.dirs.list()
+}
+
+// persistenceDegraded reports whether /readiness must fail closed: either the
+// fs snapshot itself is not durable or some security-state file was published
+// without certified crash durability in its directory.
+func (s *Server) persistenceDegraded() bool {
+	return s.stateDegraded.Load()
+}
+
+// oidcPersistPath returns the filesystem path the OIDC ring is (or would be)
+// persisted to, for per-directory uncertainty attribution: the signer's own
+// ring path in file mode, the FS cluster store's ring path when the signer
+// persists through one, and empty for a DB-backed or in-memory ring (nothing
+// directory-scoped to track).
+func (s *Server) oidcPersistPath(signer *oidcSigner) string {
+	if signer != nil {
+		if signer.ringPath != "" {
+			return signer.ringPath
+		}
+		if fs, ok := signer.cluster.(*FSClusterKeyStore); ok {
+			if p, err := fs.path(clusterKindOIDC); err == nil {
+				return p
+			}
+		}
+	}
+	if fs, ok := s.ClusterKeys.(*FSClusterKeyStore); ok {
+		if p, err := fs.path(clusterKindOIDC); err == nil {
+			return p
+		}
+	}
+	return ""
 }
 
 // readFileIfExists returns the file contents or nil when the file does not

@@ -296,6 +296,11 @@ func (s *Server) uploadSBOM(w http.ResponseWriter, r *http.Request, j model.Job,
 	}
 	dir := filepath.Join(s.store.Root, "artifacts", j.RunID, j.ID)
 	sidecar, err := writeArtifactSidecar(dir, j.LeaseGeneration, base, "sbom", sum, body)
+	// A published-but-uncertified sidecar file (failed parent-directory
+	// fsync) is retained and read back on restart; arm readiness for its
+	// directory, and let a later successful sidecar write in the same
+	// directory reconcile it.
+	s.noteFilePersistResult(artifactSidecarPath(dir, j.LeaseGeneration, base, "sbom", sum), err)
 	if err != nil {
 		s.internalError(w, r, err, "")
 		return
@@ -405,6 +410,9 @@ func (s *Server) uploadSigstore(w http.ResponseWriter, r *http.Request, j model.
 	}
 	dir := filepath.Join(s.store.Root, "artifacts", j.RunID, j.ID)
 	sidecar, err := writeArtifactSidecar(dir, j.LeaseGeneration, base, "sigstore", sum, body)
+	// See uploadSBOM: retain the published file and arm the directory, and
+	// reconcile on a later successful sidecar write in the same directory.
+	s.noteFilePersistResult(artifactSidecarPath(dir, j.LeaseGeneration, base, "sigstore", sum), err)
 	if err != nil {
 		s.internalError(w, r, err, "")
 		return

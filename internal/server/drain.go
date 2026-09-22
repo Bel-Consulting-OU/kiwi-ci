@@ -116,7 +116,7 @@ func (s *Server) persistDrainFlagLocked() error {
 		return err
 	}
 	err = fsutil.AtomicWriteFile(joinDataDir(s.dataDir, drainFlagFile), b, 0o600)
-	s.noteFilePersistResult(err)
+	s.noteFilePersistResult(joinDataDir(s.dataDir, drainFlagFile), err)
 	return err
 }
 

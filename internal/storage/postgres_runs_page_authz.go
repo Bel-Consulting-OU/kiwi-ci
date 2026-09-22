@@ -35,6 +35,16 @@ import (
 // normalized policy before paging (filter-before-paging), so the two modes
 // agree run-for-run.
 //
+// The predicate compares the run's MATERIALIZED normalized identity columns
+// (repo_identity_normalized / repo_full_name_normalized, stamped on every
+// write and backfilled by migration 0034) by simple equality, so the page is
+// served by the (repo_identity_normalized, created_at DESC, id) /
+// (repo_full_name_normalized, created_at DESC, id) indexes instead of
+// re-deriving the identity from the JSONB payload row by row — the pre-fix
+// predicate parsed identity with SUBSTRING/STRPOS/CASE/LOWER/REGEXP_REPLACE
+// inside the page predicate, so a sparse tenant could force a long walk of
+// the created-at index.
+//
 // The predicate mirrors auth.CanReadRepo exactly for the canonical policy
 // repository identity of a run (RepoIDForRun: stored policy_repo_id first,
 // then repo_id / clone-URL + full-name):
@@ -169,8 +179,9 @@ func (p RunAuthzPolicy) IsUnrestricted() bool { return p.unrestricted }
 // typed positional rule (auth.ParseStoredRepoID): two or more path segments
 // (a slash after the first segment, dotted OR dotless host) is a canonical
 // identity whose full name is the remainder; fewer segments is a bare alias
-// whose full name is the whole value. The SQL predicate mirrors this with
-// STRPOS/SUBSTRING.
+// whose full name is the whole value. The SQL mirror is the canonical
+// policy-first expression in normalizedRunRepoFullNameFunctionBody (the same
+// STRPOS/SUBSTRING rule), materialized into repo_full_name_normalized.
 func splitRepoCandidate(repoID string) (canonical bool, fullName string) {
 	i := strings.Index(repoID, "/")
 	if i < 0 {
@@ -188,7 +199,8 @@ func splitRepoCandidate(repoID string) (canonical bool, fullName string) {
 // row whose persisted/derived host is spelled with different case, a trailing
 // dot or the scheme's default port resolves to the same identity as its
 // canonical grant (the pre-fix auth.CanReadRepo canonicalized the candidate;
-// the SQL predicate mirrors this helper with canonicalHostSQL).
+// normalizedRunRepoIdentityFunctionBody mirrors this helper with the SQL
+// canonicalHostSQL expression, materialized into repo_identity_normalized).
 func canonicalCandidateID(repoID, fullName string) string {
 	i := strings.Index(repoID, "/")
 	if i < 0 {
@@ -243,43 +255,59 @@ func (p RunAuthzPolicy) Allows(repoID string) bool {
 	return p.globalRead
 }
 
-// sqlPredicate renders the SQL equivalent of Allows against the canonical
-// policy repository identity produced by repoExpr. It appends every bound
-// array to args and returns a boolean expression. The unrestricted policy
-// renders TRUE (the caller normally bypasses the predicate entirely).
+// sqlPredicate renders the SQL equivalent of Allows against the MATERIALIZED
+// normalized policy repository identity of a run: identityExpr is the
+// repo_identity_normalized column (the canonical "host/full" for a canonical
+// identity, ” for a bare one) and fullNameExpr is
+// repo_full_name_normalized (the owner/name remainder for a canonical
+// identity, the whole value for a bare one). Both are stamped on every run
+// write and backfilled by migration 0034 using the same canonicalization, so
+// the predicate is simple equality over indexed columns — no SUBSTRING /
+// STRPOS / CASE / LOWER / REGEXP_REPLACE parsing inside the page predicate,
+// which is what made a sparse tenant walk the created-at index.
 //
-// The canonical read-grant-only case (no aliases, no explicit denies, no
-// conflicts, no global read) simplifies to one equality over the canonicalized
-// identity. Every other shape falls back to the fully general predicate; both
-// are part of the single ordered keyset query with LIMIT n+1 and no
-// collection-wide enumeration or DISTINCT.
-func (p RunAuthzPolicy) sqlPredicate(repoExpr string, args *[]any) string {
+// It appends every bound array to args and returns a boolean expression. The
+// unrestricted policy renders TRUE (the caller normally bypasses the
+// predicate entirely). The canonical read-grant-only case (no aliases, no
+// explicit denies, no conflicts, no global read) simplifies to one equality
+// over repo_identity_normalized. Every other shape falls back to the fully
+// general predicate; both are part of the single ordered keyset query with
+// LIMIT n+1 and no collection-wide enumeration or DISTINCT. The Go half of
+// each decision is Allows (and auth.CanReadRepo); the parity corpus IT pins
+// them together.
+func (p RunAuthzPolicy) sqlPredicate(identityExpr, fullNameExpr string, args *[]any) string {
 	if p.unrestricted {
 		return "TRUE"
 	}
-	// suffix is the candidate after its first path segment; a slash inside it
-	// means the candidate is a canonical identity (>= 2 path segments), which
-	// is exactly auth.ParseStoredRepoID's positional rule.
-	suffix := "SUBSTRING(" + repoExpr + " FROM STRPOS(" + repoExpr + ", '/') + 1)"
-	canonical := "STRPOS(" + suffix + ", '/') > 0"
-	fullName := "CASE WHEN " + canonical + " THEN " + suffix + " ELSE " + repoExpr + " END"
-	hostRaw := "CASE WHEN STRPOS(" + repoExpr + ", '/') > 0 THEN LEFT(" + repoExpr + ", STRPOS(" + repoExpr + ", '/') - 1) ELSE '' END"
-	canonID := canonicalHostSQL(hostRaw) + " || '/' || " + fullName
+	// A canonical identity always carries its host, so its normalized identity
+	// is non-empty; a bare identity has no canonical identity at all. This is
+	// exactly splitRepoCandidate's >= 2 path segments rule.
+	canonical := identityExpr + " <> ''"
 
 	if !p.globalRead && len(p.aliasPresent) == 0 && len(p.aliasRead) == 0 && len(p.aliasConflict) == 0 &&
 		len(p.identityConflict) == 0 && len(p.identityPresent) == len(p.identityRead) {
 		if len(p.identityRead) == 0 {
 			return "FALSE"
 		}
-		return "(" + canonical + " AND " + canonID + " = ANY(" + textArrayArg(args, p.identityRead) + "))"
+		// A single granted identity is bound as a scalar equality rather than
+		// `= ANY(array)`: a ScalarArrayOp index scan is not declared
+		// order-preserving, so the planner would add a Sort, while `= $n`
+		// walks the normalized keyset index directly in
+		// (created_at DESC, id COLLATE "C" DESC) order. The decision is
+		// identical.
+		if len(p.identityRead) == 1 {
+			*args = append(*args, p.identityRead[0])
+			return "(" + canonical + " AND " + identityExpr + " = $" + strconv.Itoa(len(*args)) + ")"
+		}
+		return "(" + canonical + " AND " + identityExpr + " = ANY(" + textArrayArg(args, p.identityRead) + "))"
 	}
 
-	idRead := canonID + " = ANY(" + textArrayArg(args, p.identityRead) + ")"
-	idPresent := canonID + " = ANY(" + textArrayArg(args, p.identityPresent) + ")"
-	idConflict := canonID + " = ANY(" + textArrayArg(args, p.identityConflict) + ")"
-	alRead := fullName + " = ANY(" + textArrayArg(args, p.aliasRead) + ")"
-	alPresent := fullName + " = ANY(" + textArrayArg(args, p.aliasPresent) + ")"
-	alConflict := fullName + " = ANY(" + textArrayArg(args, p.aliasConflict) + ")"
+	idRead := identityExpr + " = ANY(" + textArrayArg(args, p.identityRead) + ")"
+	idPresent := identityExpr + " = ANY(" + textArrayArg(args, p.identityPresent) + ")"
+	idConflict := identityExpr + " = ANY(" + textArrayArg(args, p.identityConflict) + ")"
+	alRead := fullNameExpr + " = ANY(" + textArrayArg(args, p.aliasRead) + ")"
+	alPresent := fullNameExpr + " = ANY(" + textArrayArg(args, p.aliasPresent) + ")"
+	alConflict := fullNameExpr + " = ANY(" + textArrayArg(args, p.aliasConflict) + ")"
 
 	// Canonical candidate: conflict, then explicit identity entry, then the
 	// explicit bare entry fallback, then the global read role.
@@ -290,36 +318,191 @@ func (p RunAuthzPolicy) sqlPredicate(repoExpr string, args *[]any) string {
 
 	// Bare-alias candidate: only explicit bare grants are consulted; a
 	// canonical grant never authorizes another forge's repository.
-	aliasArm := "(NOT " + canonical + " AND " + repoExpr + " <> '' AND NOT " + alConflict +
+	aliasArm := "(NOT " + canonical + " AND " + fullNameExpr + " <> '' AND NOT " + alConflict +
 		" AND (" + alRead + " OR (NOT " + alPresent + " AND " + sqlBool(p.globalRead) + ")))"
 
 	// The empty identity carries no repository identity, so only the global
-	// read role decides it (auth.CanReadRepo rejects it as unparsable).
-	emptyArm := "(" + repoExpr + " = '' AND " + sqlBool(p.globalRead) + ")"
+	// read role decides it (auth.CanReadRepo rejects it as unparsable). A
+	// canonical identity always has a non-empty full name, so an empty
+	// normalized full name with no canonical identity is the empty candidate.
+	emptyArm := "(NOT " + canonical + " AND " + fullNameExpr + " = '' AND " + sqlBool(p.globalRead) + ")"
 
 	return "(" + canonicalArm + " OR " + aliasArm + " OR " + emptyArm + ")"
 }
 
-// canonicalHostSQL renders hostExpr canonicalized the way auth.CanonicalHost
-// canonicalizes a bare (already URL-stripped) host: lowercased, one trailing
-// dot stripped, and the scheme's default port (443/80/22) dropped. A bracketed
-// IPv6 literal loses its brackets and a default port but keeps a non-default
-// one. The SQL identity predicate uses it so a legacy row whose host is
-// spelled "GitHub.com", "github.com." or "github.com:443" resolves to the
-// same canonical grant as "github.com" — the behavior auth.CanReadRepo had
-// before the policy was pushed into SQL.
+// canonicalHostSQL renders hostExpr canonicalized EXACTLY the way
+// auth.CanonicalHost canonicalizes a bare (already URL-stripped) host:
+// lowercased, one trailing dot stripped, and the scheme's default port
+// (443/80/22) dropped. The R1-A defect this pins: the pre-fix expression
+// stripped a default-port suffix from EVERY unbracketed host, so an
+// UNBRACKETED IPv6 literal ending in :443/:80/:22 ("::1:443") was reduced to
+// "::1" while auth.CanonicalHost preserved it (its legacy "host:port" split
+// applies only to a spelling with EXACTLY ONE colon). The result was a
+// SQL/Go authorization divergence: a run could be visible in the collection
+// under a grant for a DIFFERENT forge than the per-run RBAC path authorized.
+//
+// The fix mirrors auth.CanonicalHost's branches (see canonHostPort /
+// splitHostPort there):
+//
+//   - a bracketed literal loses its brackets, its host is lowercased and one
+//     trailing dot is stripped, and a following default port is dropped (a
+//     non-default one is kept; a non-port tail is discarded);
+//   - an unbracketed value with EXACTLY ONE colon (not leading) splits into
+//     host:port when the tail is numeric — default ports dropped, non-default
+//     kept — and otherwise degenerates to the legacy "host:path" host alone;
+//   - an unbracketed value with zero or several colons is treated as ONE host
+//     (several colons means an IPv6 literal), lowercased with one trailing
+//     dot stripped and NO port stripping.
 func canonicalHostSQL(hostExpr string) string {
 	lower := "LOWER(" + hostExpr + ")"
-	// Bracketed literal: [::1] -> ::1, [::1]:443 -> ::1, [::1]:8443 -> ::1:8443.
-	bracket := "CASE WHEN LEFT(" + hostExpr + ", 1) = '[' AND STRPOS(" + hostExpr + ", ']') > 0 THEN " +
-		"SUBSTRING(" + lower + " FROM 2 FOR STRPOS(" + hostExpr + ", ']') - 2) || " +
-		"CASE WHEN SUBSTRING(" + lower + " FROM STRPOS(" + hostExpr + ", ']') + 1) IN (':443', ':80', ':22') THEN '' " +
-		"ELSE SUBSTRING(" + lower + " FROM STRPOS(" + hostExpr + ", ']') + 1) END " +
-		"ELSE " + lower + " END"
-	// Plain host: drop a default port, then one trailing dot.
+	trimDot := func(expr string) string {
+		return "REGEXP_REPLACE(" + expr + ", '\\.$', '')"
+	}
+
+	// Bracketed IPv6 literal. The guard keeps a truncated literal ("[::1",
+	// no closing bracket) verbatim instead of running SUBSTRING with a
+	// negative length.
+	bracketHost := trimDot("SUBSTRING(" + lower + " FROM 2 FOR STRPOS(" + hostExpr + ", ']') - 2)")
+	bracketRest := "SUBSTRING(" + lower + " FROM STRPOS(" + hostExpr + ", ']') + 1)"
+	bracketLiteral := "CASE WHEN STRPOS(" + hostExpr + ", ']') > 0 THEN " + bracketHost +
+		" || CASE WHEN LEFT(" + bracketRest + ", 1) <> ':' OR SUBSTRING(" + bracketRest + " FROM 2) IN ('443', '80', '22') THEN '' ELSE " + bracketRest + " END " +
+		"ELSE " + trimDot(lower) + " END"
+
+	// Unbracketed. The legacy split applies only to a value with EXACTLY ONE
+	// colon at position > 1; a numeric tail is the port, anything else is the
+	// legacy host:path host.
+	colonCount := "(LENGTH(" + hostExpr + ") - LENGTH(REPLACE(" + hostExpr + ", ':', '')))"
+	colonPos := "STRPOS(" + hostExpr + ", ':')"
+	beforeColon := trimDot("LEFT(" + lower + ", " + colonPos + " - 1)")
+	tail := "SUBSTRING(" + lower + " FROM " + colonPos + " + 1)"
+	singleColon := "CASE WHEN " + tail + " ~ '^[+-]?[0-9]+$' THEN " + beforeColon +
+		" || CASE WHEN " + tail + " IN ('443', '80', '22') THEN '' ELSE ':' || " + tail + " END " +
+		"ELSE " + beforeColon + " END"
+	plain := "CASE WHEN " + colonCount + " = 1 AND " + colonPos + " > 1 THEN " + singleColon +
+		" ELSE " + trimDot(lower) + " END"
+
 	return "CASE WHEN " + hostExpr + " = '' THEN '' " +
-		"WHEN LEFT(" + hostExpr + ", 1) = '[' THEN " + bracket + " " +
-		"ELSE REGEXP_REPLACE(REGEXP_REPLACE(" + lower + ", ':(443|80|22)$', ''), '\\.$', '') END"
+		"WHEN LEFT(" + hostExpr + ", 1) = '[' THEN " + bracketLiteral + " " +
+		"ELSE " + plain + " END"
+}
+
+// normalizedRunRepoIdentityColumn and normalizedRunRepoFullNameColumn are the
+// materialized identity columns added by migration 0033. The page predicate
+// compares them by equality; the write path and migration 0034's backfill
+// derive them through the IMMUTABLE SQL functions below, whose bodies
+// normalizedRunRepoIdentityFunctionBody / normalizedRunRepoFullNameFunctionBody
+// render so Go and the database can never drift.
+const (
+	normalizedRunRepoIdentityColumn = "repo_identity_normalized"
+	normalizedRunRepoFullNameColumn = "repo_full_name_normalized"
+
+	// canonicalHostFunctionName is the IMMUTABLE SQL function created by
+	// migration 0034: it is exactly canonicalHostSQL's expression, callable
+	// from the normalized-column functions (and from the parity corpus IT,
+	// which compares it to auth.CanonicalHost directly).
+	canonicalHostFunctionName = "kiwi_canonical_host"
+
+	normalizedRunRepoIdentityFunctionName = "kiwi_normalize_run_repo_identity"
+	normalizedRunRepoFullNameFunctionName = "kiwi_normalize_run_repo_full_name"
+)
+
+// canonicalHostFunctionBody renders the body of the IMMUTABLE SQL function
+// kiwi_canonical_host(host text): the auth.CanonicalHost normalizer as SQL.
+func canonicalHostFunctionBody() string {
+	return canonicalHostSQL("host")
+}
+
+// normalizedRunRepoIdentitySQL is the write-path expression that stamps
+// repo_identity_normalized from a run payload bound to payloadExpr (a jsonb
+// placeholder or column expression). It is the function the migration
+// backfills with, so a row written through any INSERT/UPDATE and a legacy row
+// backfilled by 0034 resolve identically.
+func normalizedRunRepoIdentitySQL(payloadExpr string) string {
+	return normalizedRunRepoIdentityFunctionName + "(" + payloadExpr + ", 'repo')"
+}
+
+// normalizedRunRepoFullNameSQL is the write-path expression that stamps
+// repo_full_name_normalized.
+func normalizedRunRepoFullNameSQL(payloadExpr string) string {
+	return normalizedRunRepoFullNameFunctionName + "(" + payloadExpr + ", 'repo')"
+}
+
+// normalizedRunRepoIdentityFunctionBody renders the body of the IMMUTABLE SQL
+// function kiwi_normalize_run_repo_identity(payload jsonb, url_key text): the
+// canonical "host/full" identity for a canonical policy repository identity
+// (>= 2 path segments), ” for a bare/empty one. The host is canonicalized by
+// canonicalHostSQL and the full name is the remainder; a host that
+// canonicalizes to ” leaves the raw identity (the canonicalCandidateID
+// contract).
+func normalizedRunRepoIdentityFunctionBody() string {
+	r := normalizedRunRepoRepoExpr()
+	slash := "STRPOS(" + r + ", '/')"
+	suffix := "SUBSTRING(" + r + " FROM " + slash + " + 1)"
+	canonical := "(" + slash + " > 0 AND STRPOS(" + suffix + ", '/') > 0)"
+	hostRaw := "CASE WHEN " + slash + " > 0 THEN LEFT(" + r + ", " + slash + " - 1) ELSE '' END"
+	canonHost := canonicalHostFunctionName + "(" + hostRaw + ")"
+	canonID := "CASE WHEN " + canonHost + " = '' THEN " + r + " ELSE " + canonHost + " || '/' || " + suffix + " END"
+	return "CASE WHEN " + canonical + " THEN " + canonID + " ELSE '' END"
+}
+
+// normalizedRunRepoFullNameFunctionBody renders the body of the IMMUTABLE SQL
+// function kiwi_normalize_run_repo_full_name(payload jsonb, url_key text): the
+// owner/name remainder for a canonical identity, the whole value for a bare
+// one, and ” for the empty identity. It is exactly the fullName expression
+// the pre-materialization predicate computed.
+func normalizedRunRepoFullNameFunctionBody() string {
+	r := normalizedRunRepoRepoExpr()
+	slash := "STRPOS(" + r + ", '/')"
+	suffix := "SUBSTRING(" + r + " FROM " + slash + " + 1)"
+	canonical := "(" + slash + " > 0 AND STRPOS(" + suffix + ", '/') > 0)"
+	return "CASE WHEN " + canonical + " THEN " + suffix + " ELSE " + r + " END"
+}
+
+// normalizedRunRepoRepoExpr renders the canonical policy-first repository
+// identity inside the normalized-column SQL functions: the stored
+// policy_repo_id when present, otherwise the migration-0027
+// kiwi_canonical_repo_id derivation. It is the SQL mirror of RepoIDForRun.
+func normalizedRunRepoRepoExpr() string {
+	return "COALESCE(NULLIF(BTRIM(payload->>'policy_repo_id'), ''), " + canonicalRepoIDFunctionName + "(payload, url_key))"
+}
+
+// normalizedRunRepoBackfillSQL renders the migration-0034 backfill UPDATE: it
+// derives both normalized columns for every row that does not have them yet
+// (legacy rows, and rows written by a pre-upgrade binary between 0033 and
+// 0034), through the same functions the write path uses.
+func normalizedRunRepoBackfillSQL() string {
+	return "UPDATE runs SET " + normalizedRunRepoIdentityColumn + " = " + normalizedRunRepoIdentitySQL("payload") +
+		", " + normalizedRunRepoFullNameColumn + " = " + normalizedRunRepoFullNameSQL("payload") +
+		" WHERE " + normalizedRunRepoIdentityColumn + " IS NULL OR " + normalizedRunRepoFullNameColumn + " IS NULL"
+}
+
+// normalizedRunRepoIdentityKeysetIndexDDL and
+// normalizedRunRepoFullNameKeysetIndexDDL render the two migration-0034
+// composite indexes. The id key is COLLATE "C" DESC (the query's keyset order)
+// so a fixed normalized identity is walked in exactly
+// (created_at DESC, id COLLATE "C" DESC) order: the page is a bounded index
+// range read with no sort.
+func normalizedRunRepoIdentityKeysetIndexDDL() string {
+	return "CREATE INDEX IF NOT EXISTS runs_repo_identity_normalized_keyset_idx\n    ON runs (" +
+		normalizedRunRepoIdentityColumn + ", created_at DESC, id COLLATE \"C\" DESC)"
+}
+
+func normalizedRunRepoFullNameKeysetIndexDDL() string {
+	return "CREATE INDEX IF NOT EXISTS runs_repo_full_name_normalized_keyset_idx\n    ON runs (" +
+		normalizedRunRepoFullNameColumn + ", created_at DESC, id COLLATE \"C\" DESC)"
+}
+
+// normalizedRepoColumns returns the (repo_identity_normalized,
+// repo_full_name_normalized) pair for a canonical policy repository identity,
+// mirroring the SQL function bodies above exactly. It is the Go half of the
+// parity corpus: the write path stamps SQL-computed values, and this helper
+// lets tests (and memory-mode reasoning) derive the expected pair.
+func normalizedRepoColumns(repoID string) (identity, fullName string) {
+	canonical, full := splitRepoCandidate(repoID)
+	if !canonical {
+		return "", full
+	}
+	return canonicalCandidateID(repoID, full), full
 }
 
 // textArrayArg binds vals as a text[] parameter and returns its placeholder.
@@ -413,7 +596,7 @@ func authorizedRunsPageSQL(policy RunAuthzPolicy, afterCreatedAt time.Time, afte
 	limit = NormalizeRunsPageLimit(limit)
 	args := make([]any, 0, 8)
 	conds := make([]string, 0, 2)
-	conds = append(conds, policy.sqlPredicate(canonicalPolicyRepoIDSQLExpr("repo"), &args))
+	conds = append(conds, policy.sqlPredicate(normalizedRunRepoIdentityColumn, normalizedRunRepoFullNameColumn, &args))
 	if !afterCreatedAt.IsZero() || afterID != "" {
 		args = append(args, afterCreatedAt, afterID)
 		conds = append(conds, `(created_at, id COLLATE "C") < ($`+strconv.Itoa(len(args)-1)+`::timestamptz, $`+strconv.Itoa(len(args))+`::text COLLATE "C")`)

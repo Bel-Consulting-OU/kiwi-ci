@@ -349,11 +349,14 @@ func TestReplicaBudgetSharedRootWithoutDistinctIDIsRefused(t *testing.T) {
 	}
 }
 
-// TestReplicaBudgetReclaimsLegacyBareRootSpoolFiles: pre-contract processes
-// spooled directly into the configured directory. Those bare files are
-// reclaimed when the root is adopted, while replica subdirectories (each with
-// its own lock) are never entered.
-func TestReplicaBudgetReclaimsLegacyBareRootSpoolFiles(t *testing.T) {
+// TestReplicaBudgetLeavesLegacyBareRootSpoolFilesUntouched is the R4-A
+// regression: a pre-contract (8f6) replica staged its ACTIVE spool files
+// directly in the shared root with NO ownership lock, so during a rolling HA
+// upgrade a top-level kiwi-stage-* file can be a still-running old replica's
+// in-flight upload. Starting a new replica on the same root must therefore
+// unlink nothing at the top level; only files INSIDE the new replica's own
+// directory are reclaimed. The other replica's subdirectory is never entered.
+func TestReplicaBudgetLeavesLegacyBareRootSpoolFilesUntouched(t *testing.T) {
 	root := t.TempDir()
 	bare := filepath.Join(root, FilePrefix+"legacy")
 	if err := os.WriteFile(bare, []byte("old layout"), 0o600); err != nil {
@@ -376,11 +379,11 @@ func TestReplicaBudgetReclaimsLegacyBareRootSpoolFiles(t *testing.T) {
 		t.Fatalf("NewReplicaBudget: %v", err)
 	}
 	defer func() { _ = b.Close() }()
-	if got := b.StaleFilesRemoved(); got != 1 {
-		t.Fatalf("StaleFilesRemoved() = %d, want 1 (only the legacy bare file)", got)
+	if got := b.StaleFilesRemoved(); got != 0 {
+		t.Fatalf("StaleFilesRemoved() = %d, want 0 (legacy top-level files are never auto-reclaimed)", got)
 	}
-	if _, err := os.Stat(bare); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("legacy bare spool file survived: %v", err)
+	if _, err := os.Stat(bare); err != nil {
+		t.Fatalf("new replica unlinked a live old-layout upload %s: %v", bare, err)
 	}
 	if _, err := os.Stat(otherSpool); err != nil {
 		t.Fatalf("another replica's spool file was reclaimed: %v", err)
@@ -394,7 +397,7 @@ func TestReplicaBudgetReclaimsLegacyBareRootSpoolFiles(t *testing.T) {
 	}
 	res, err := b.Acquire(context.Background(), 1<<20)
 	if err != nil {
-		t.Fatalf("reclaimed replica budget refused its full bound: %v", err)
+		t.Fatalf("replica budget refused its full bound: %v", err)
 	}
 	res.Release()
 	// A missing root and a non-positive bound are still bound errors.
@@ -403,6 +406,58 @@ func TestReplicaBudgetReclaimsLegacyBareRootSpoolFiles(t *testing.T) {
 	}
 	if _, err := NewReplicaBudget(root, "replica-x", 0); !errors.Is(err, ErrNoBound) {
 		t.Fatalf("non-positive replica bound = %v, want ErrNoBound", err)
+	}
+}
+
+// TestReplicaBudgetRollingUpgradeKeepsLiveLegacySpoolFile is the rolling-version
+// integration test for R4-A: an old-layout top-level spool file is present
+// (simulating a live 8f6 upload) when a new replica starts on the same root.
+// The file must NOT be unlinked. Only the explicit migration, run with the
+// root lock held and after the caller confirms the old replica drained,
+// reclaims it — and it reclaims ONLY the top-level legacy file, leaving the
+// new replica's own subdirectory and the foreign file alone.
+func TestReplicaBudgetRollingUpgradeKeepsLiveLegacySpoolFile(t *testing.T) {
+	root := t.TempDir()
+	live := filepath.Join(root, FilePrefix+"old-replica-inflight")
+	if err := os.WriteFile(live, []byte("bytes an 8f6 replica is still uploading"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	foreign := filepath.Join(root, "unrelated.dat")
+	if err := os.WriteFile(foreign, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	newReplica, err := NewReplicaBudget(root, "replica-new", 1<<20)
+	if err != nil {
+		t.Fatalf("new replica on the shared root: %v", err)
+	}
+	// The new replica is live; the old-layout upload must survive.
+	if _, err := os.Stat(live); err != nil {
+		t.Fatalf("new replica unlinked the live old-layout upload: %v", err)
+	}
+	// Its own dir is private and bounded.
+	if newReplica.Dir() != filepath.Join(root, "replica-new") {
+		t.Fatalf("new replica dir = %q", newReplica.Dir())
+	}
+	if err := newReplica.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// Explicit migration (acquires the root lock itself) reclaims the legacy
+	// file; the new replica's directory is untouched.
+	res, err := MigrateLegacyStagingLayout(context.Background(), root)
+	if err != nil {
+		t.Fatalf("MigrateLegacyStagingLayout: %v", err)
+	}
+	if len(res.Reclaimed) != 1 || res.Reclaimed[0] != FilePrefix+"old-replica-inflight" {
+		t.Fatalf("migration reclaimed %v, want [%s]", res.Reclaimed, FilePrefix+"old-replica-inflight")
+	}
+	if _, err := os.Stat(live); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("migration did not reclaim the legacy file: %v", err)
+	}
+	if _, err := os.Stat(foreign); err != nil {
+		t.Fatalf("migration removed a foreign file: %v", err)
+	}
+	if fi, err := os.Stat(newReplica.Dir()); err != nil || !fi.IsDir() {
+		t.Fatalf("migration entered/removed the new replica directory: %v", err)
 	}
 }
 

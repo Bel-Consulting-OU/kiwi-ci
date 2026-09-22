@@ -268,11 +268,13 @@ func TestSnapshotUploadStagingDeclaredLengthOverCap(t *testing.T) {
 }
 
 // TestSnapshotUploadStagingStartupPrune proves the persistent constructor
-// reclaims every spool file (staging.FilePrefix) left in the configured
-// staging root before serving — without an age floor, because taking the
-// exclusive directory lock proves no live owner can still be writing them —
-// while never touching foreign files. Runtime Prune is age-based: it removes a
-// stale spool file but keeps a fresh one.
+// reclaims every spool file (staging.FilePrefix) left inside its OWN
+// replica-private directory, while legacy top-level files in the configured
+// staging root are NOT reclaimed at startup (R4-A: a pre-contract replica
+// staged them with no ownership lock, so a live old replica may still be
+// writing one during a rolling upgrade). They are reclaimed only by the
+// explicit migration. Foreign files are never touched. Runtime Prune is
+// age-based: it removes a stale spool file but keeps a fresh one.
 func TestSnapshotUploadStagingStartupPrune(t *testing.T) {
 	dir := t.TempDir()
 	stagingRoot := filepath.Join(dir, "kiwi-staging")
@@ -317,12 +319,26 @@ func TestSnapshotUploadStagingStartupPrune(t *testing.T) {
 	if budget.Dir() == stagingRoot || !strings.HasPrefix(budget.Dir(), stagingRoot+string(os.PathSeparator)) {
 		t.Fatalf("budget dir %q is not the replica-private subdirectory of %q", budget.Dir(), stagingRoot)
 	}
-	// Startup reclaim covers the configured root without an age floor: every
-	// FilePrefix entry there is a pre-contract leftover (no live process spools
-	// bare files into the root), so both the old and the fresh one are removed.
+	// Startup does NOT reclaim legacy top-level files: they may belong to a
+	// still-live old-layout replica. Foreign files are never touched either.
+	for _, keep := range []string{abandoned, fresh, foreign, foreignOld} {
+		if _, err := os.Stat(keep); err != nil {
+			t.Fatalf("startup removed %s (legacy top-level files must survive): %v", filepath.Base(keep), err)
+		}
+	}
+	// The explicit migration (run once the old replicas have drained) is the
+	// only path that reclaims them, and it reclaims only top-level FilePrefix
+	// entries.
+	res, err := staging.MigrateLegacyStagingLayout(context.Background(), stagingRoot)
+	if err != nil {
+		t.Fatalf("staging layout migration: %v", err)
+	}
+	if len(res.Reclaimed) != 2 {
+		t.Fatalf("migration reclaimed %v, want the 2 legacy spool files", res.Reclaimed)
+	}
 	for _, gone := range []string{abandoned, fresh} {
 		if _, err := os.Stat(gone); !os.IsNotExist(err) {
-			t.Fatalf("spool file %s survived startup reclaim: %v", filepath.Base(gone), err)
+			t.Fatalf("spool file %s survived the explicit migration: %v", filepath.Base(gone), err)
 		}
 	}
 	for _, keep := range []string{foreign, foreignOld} {

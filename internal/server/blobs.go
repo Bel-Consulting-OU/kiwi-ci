@@ -54,6 +54,17 @@ var cacheStageHook func(path string, reserved int64)
 // inject a staged-file failure without a multi-GB body.
 var artifactStageHook func(path string, reserved int64)
 
+// provenanceSidecarWrite publishes the fs-mode provenance envelope sidecar.
+// Production uses fsutil.AtomicWriteFile — the shared durable sequence: a
+// unique temp file in the destination directory, checked write/chmod/file
+// fsync/close, rename over the destination, and a parent-directory fsync — so
+// a crash can never leave a durable artifact record whose local
+// `.intoto.json` sidecar is missing, truncated or not durable. It is a var
+// only so tests can inject a specific durability-phase failure through the
+// real primitive (scoped to this writer, so the payload finalization in the
+// same request is unaffected); production never reassigns it.
+var provenanceSidecarWrite = fsutil.AtomicWriteFile
+
 var cacheKeyRE = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 // provenanceFenceTimeout bounds how long an artifact upload waits for the
@@ -445,10 +456,36 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 				}
 			} else {
 				ap := dst + ".intoto.json"
-				if os.WriteFile(ap, ab, 0o600) == nil {
-					rec.ProvenancePath = ap
-					rec.ProvenanceSHA256 = provDigest
+				if werr := s.publishProvenanceSidecarFS(ap, ab, provDigest); werr != nil {
+					if fsutil.Renamed(werr) {
+						// Post-rename (parent-directory fsync) failure: the
+						// sidecar bytes ARE visible at ap but their crash
+						// durability is not certified. The artifact must NOT
+						// be acknowledged — a durable record naming a
+						// ProvenanceSHA256 whose sidecar may vanish in a crash
+						// is exactly the defect this sequence prevents. Keep
+						// the published sidecar (and the already-fsynced
+						// payload) in place; the degraded marker folded by
+						// publishProvenanceSidecarFS fails /readiness closed
+						// until a later successful persist in this directory
+						// reconciles it.
+						s.logError("artifact: provenance sidecar published but not durably certified; upload refused", "job", j.ID, "path", ap, "error", werr.Error())
+						http.Error(w, statePersistenceDegradedBody, http.StatusServiceUnavailable)
+						return
+					}
+					// Definitely not published (or published bytes that could
+					// not be re-verified): never acknowledge an artifact whose
+					// provenance sidecar is not durably recorded, and never
+					// record a ProvenanceSHA256 whose bytes were not
+					// re-hashed. Drop the now-unreferenced payload; the
+					// envelope is regenerated on retry.
+					_ = os.Remove(dst)
+					s.logError("artifact: provenance sidecar not durably published; upload refused", "job", j.ID, "path", ap, "error", werr.Error())
+					http.Error(w, "artifact provenance sidecar not durable", http.StatusServiceUnavailable)
+					return
 				}
+				rec.ProvenancePath = ap
+				rec.ProvenanceSHA256 = provDigest
 			}
 		}
 	}
@@ -582,6 +619,39 @@ func removeStagedArtifact(dst string, casMode bool) {
 	}
 	_ = os.Remove(dst)
 	_ = os.Remove(dst + ".intoto.json")
+}
+
+// publishProvenanceSidecarFS durably publishes the filesystem-mode provenance
+// envelope next to its artifact payload and returns the sidecar path only
+// after REOPENING and RE-HASHING it: the digest the caller records is thereby
+// proven to match the bytes actually on disk, never merely the in-memory
+// envelope digest. A sidecar whose published bytes cannot be re-read or whose
+// re-hash disagrees is reported as an error, so no ProvenanceSHA256 is ever
+// recorded for unverified bytes.
+//
+// The durable write's outcome is folded into the per-directory uncertainty
+// set (noteFilePersistResult, the same signal /readiness and the lease gate
+// consume) exactly like every other security-state file write: a
+// parent-directory-fsync failure (fsutil.Renamed) arms uncertainty for the
+// sidecar's directory because it is visible while its crash durability is
+// unproven; a pre-rename failure leaves the set untouched; a success clears
+// that directory's uncertainty. The caller decides the HTTP contract from
+// fsutil.Renamed: post-rename uncertainty must not be acknowledged, while a
+// pre-rename failure must not leave a record behind.
+func (s *Server) publishProvenanceSidecarFS(path string, envelope []byte, digest string) error {
+	werr := provenanceSidecarWrite(path, envelope, 0o600)
+	s.noteFilePersistResult(path, werr)
+	if werr != nil {
+		return werr
+	}
+	got, herr := fileSHA256(path)
+	if herr != nil {
+		return fmt.Errorf("reopen provenance sidecar %s: %w", path, herr)
+	}
+	if got != digest {
+		return fmt.Errorf("provenance sidecar %s re-hashed to %s, envelope digest %s", path, got, digest)
+	}
+	return nil
 }
 
 // casIntegrityError reports whether err is a CAS publication integrity
@@ -1277,10 +1347,13 @@ func (s *Server) cleanupExpiredArtifactsLocked(now time.Time) int {
 
 // SetBlobStore replaces the CAS blob backend (the app agent wires the S3
 // backend here when config selects blob.backend = "s3"; the default remains
-// the filesystem store under dataDir/cas).
+// the filesystem store under dataDir/cas). The replacement CAS is rebuilt
+// through newServerCAS with the SAME authoritative object maximum and the
+// server's current staging budget, so swapping the backend can never drop the
+// bound or strand the fallback CAS.Put path without a spool budget.
 func (s *Server) SetBlobStore(b blob.Store) {
 	s.BlobStore = b
-	s.CAS = cas.New(b)
+	s.CAS = newServerCAS(b, s.Staging)
 }
 
 func cleanBlobName(s string) string {

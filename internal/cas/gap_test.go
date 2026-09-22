@@ -108,7 +108,9 @@ func TestCASPutNeverUsesSystemTempDir(t *testing.T) {
 	// Configured staging budget: the spool file lives there, TMPDIR stays
 	// empty, and the object is published correctly.
 	stagingDir := filepath.Join(t.TempDir(), "staging")
-	budget, err := staging.NewBudget(stagingDir, 64<<20)
+	// The budget must be at least the per-object bound: Put reserves the
+	// spool's worst-case disk amount (the whole object) before writing.
+	budget, err := staging.NewBudget(stagingDir, DefaultMaxBlobBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +154,10 @@ func TestCASPutNeverUsesSystemTempDir(t *testing.T) {
 // error instead of publishing anything.
 func TestCASPutSpoolFailureSurfaces(t *testing.T) {
 	stagingDir := filepath.Join(t.TempDir(), "staging")
-	budget, err := staging.NewBudget(stagingDir, 64<<20)
+	// The budget must be at least the per-object bound: Put reserves the
+	// spool's worst-case disk amount before writing, and this test exercises
+	// the SpoolFile failure (not a budget refusal).
+	budget, err := staging.NewBudget(stagingDir, DefaultMaxBlobBytes)
 	if err != nil {
 		t.Fatal(err)
 	}

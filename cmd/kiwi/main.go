@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -9,9 +10,11 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/app"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/version"
 )
 
@@ -76,7 +79,9 @@ func dispatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	case "database":
 		return databaseCommand(ctx, args[1:])
 	case "storage":
-		return app.Storage(ctx, args[1:])
+		return storageCommand(ctx, args[1:], os.Stdin, stdout, stderr)
+	case "repair-repo-identities":
+		return repairRepoIdentitiesCommand(ctx, args[1:])
 	case "outbox":
 		return app.Outbox(ctx, args[1:])
 	case "config":
@@ -126,6 +131,79 @@ func databaseCommand(ctx context.Context, args []string) error {
 	}
 }
 
+// storageCommand routes the operator storage subcommands. The staging-layout
+// migration is implemented here (it only needs internal/staging and the
+// interactive confirmation); the remaining subcommands stay in internal/app.
+func storageCommand(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	if len(args) >= 1 && args[0] == "migrate-staging-layout" {
+		return migrateStagingLayout(ctx, args[1:], stdin, stdout, stderr)
+	}
+	return app.Storage(ctx, args)
+}
+
+// migrateStagingLayout implements
+// `kiwi storage migrate-staging-layout --dir DIR [--force]`.
+//
+// It reclaims the pre-per-replica "legacy" spool files that a process older
+// than the per-replica contract left directly in the shared staging root.
+// Those files were staged with NO ownership lock, so the lock the migration
+// acquires cannot prove an old process is dead: the operator must confirm the
+// old replicas have drained, either interactively or with --force. Without
+// one of those confirmations the command refuses and removes nothing.
+func migrateStagingLayout(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("storage migrate-staging-layout", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	dir := fs.String("dir", os.Getenv("KIWI_STAGING_DIR"), "staging root directory (or KIWI_STAGING_DIR)")
+	force := fs.Bool("force", false, "confirm every old-layout replica has drained/stopped; skips the interactive prompt")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("storage migrate-staging-layout takes no arguments")
+	}
+	root := strings.TrimSpace(*dir)
+	if root == "" {
+		return fmt.Errorf("--dir is required (or set KIWI_STAGING_DIR)")
+	}
+	if !*force {
+		confirmed, err := confirmStagingMigration(stdin, stderr, root)
+		if err != nil {
+			return err
+		}
+		if !confirmed {
+			return fmt.Errorf("staging layout migration aborted: run with --force once every old-layout replica has drained")
+		}
+	}
+	res, err := staging.MigrateLegacyStagingLayout(ctx, root)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "staging layout migrated: root=%s reclaimed=%d bytes=%d replica_dirs_skipped=%d foreign_files_kept=%d\n",
+		res.Root, len(res.Reclaimed), res.ReclaimedBytes, res.ReplicaDirs, res.ForeignFiles)
+	for _, name := range res.Reclaimed {
+		fmt.Fprintf(stdout, "  reclaimed %s\n", name)
+	}
+	return nil
+}
+
+// confirmStagingMigration asks the operator to type "yes" before the
+// destructive pass. An unreadable or non-interactive stdin (EOF) is treated as
+// a refusal, so a cron/script invocation without --force removes nothing.
+func confirmStagingMigration(stdin io.Reader, stderr io.Writer, root string) (bool, error) {
+	fmt.Fprintf(stderr, "This removes legacy top-level kiwi-stage-* spool files from %s.\n", root)
+	fmt.Fprintln(stderr, "It is only safe once EVERY old-layout replica has drained/stopped (the lock cannot prove a pre-contract process is dead).")
+	fmt.Fprint(stderr, "Type 'yes' to continue: ")
+	scanner := bufio.NewScanner(stdin)
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			return false, fmt.Errorf("read confirmation: %w", err)
+		}
+		return false, nil
+	}
+	answer := strings.ToLower(strings.TrimSpace(scanner.Text()))
+	return answer == "yes" || answer == "y", nil
+}
+
 func configCommand(ctx context.Context, args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("config requires a subcommand: check")
@@ -153,6 +231,8 @@ Usage:
   kiwi config check --config kiwi.toml
   kiwi database migrate|status --database-url URL
   kiwi storage  reconcile-reservations --database-url URL
+  kiwi storage  migrate-staging-layout --dir DIR [--force]
+  kiwi repair-repo-identities [--database-url URL] [--apply]
   kiwi outbox dead-letters list|requeue|delete [--database-url URL] [ID]
   kiwi runner   --server http://127.0.0.1:8080 --token TOKEN [--drain]
   kiwi runner list|drain|disable|enable --server URL --token ADMIN_TOKEN [RUNNER_ID]

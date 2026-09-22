@@ -748,7 +748,7 @@ func (s *PostgresStore) insertRunTx(ctx context.Context, tx pgx.Tx, run model.Ru
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO runs (id, status, started_at, finished_at, created_at, payload) VALUES ($1, $2, $3, $4, $5, $6)`,
+	_, err = tx.Exec(ctx, `INSERT INTO runs (id, status, started_at, finished_at, created_at, `+normalizedRunRepoIdentityColumn+`, `+normalizedRunRepoFullNameColumn+`, payload) VALUES ($1, $2, $3, $4, $5, `+normalizedRunRepoIdentitySQL("$6")+`, `+normalizedRunRepoFullNameSQL("$6")+`, $6)`,
 		run.ID, string(run.Status), run.StartedAt, run.FinishedAt, run.CreatedAt, payload)
 	return err
 }
@@ -897,7 +897,7 @@ func (s *PostgresStore) cancelSupersededRunTx(ctx context.Context, tx pgx.Tx, ru
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `UPDATE runs SET status=$2, finished_at=$3, payload=$4 WHERE id=$1`, runID, string(model.StatusCancelled), now, rp)
+	_, err = tx.Exec(ctx, `UPDATE runs SET status=$2, finished_at=$3, payload=$4, `+normalizedRunRepoIdentityColumn+`=`+normalizedRunRepoIdentitySQL("$4")+`, `+normalizedRunRepoFullNameColumn+`=`+normalizedRunRepoFullNameSQL("$4")+` WHERE id=$1`, runID, string(model.StatusCancelled), now, rp)
 	return err
 }
 
@@ -1000,7 +1000,7 @@ func (s *PostgresStore) InsertRun(ctx context.Context, run model.Run) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.pool.Exec(ctx, `INSERT INTO runs (id, status, started_at, finished_at, created_at, payload) VALUES ($1, $2, $3, $4, $5, $6)`,
+	_, err = s.pool.Exec(ctx, `INSERT INTO runs (id, status, started_at, finished_at, created_at, `+normalizedRunRepoIdentityColumn+`, `+normalizedRunRepoFullNameColumn+`, payload) VALUES ($1, $2, $3, $4, $5, `+normalizedRunRepoIdentitySQL("$6")+`, `+normalizedRunRepoFullNameSQL("$6")+`, $6)`,
 		run.ID, string(run.Status), run.StartedAt, run.FinishedAt, run.CreatedAt, payload)
 	return err
 }
@@ -1049,7 +1049,7 @@ func (s *PostgresStore) UpdateRunStatus(ctx context.Context, id string, status m
 	if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE runs SET payload=$2 WHERE id=$1`, id, rp); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE runs SET payload=$2, `+normalizedRunRepoIdentityColumn+`=`+normalizedRunRepoIdentitySQL("$2")+`, `+normalizedRunRepoFullNameColumn+`=`+normalizedRunRepoFullNameSQL("$2")+` WHERE id=$1`, id, rp); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -2208,7 +2208,7 @@ func (s *PostgresStore) recomputeRunTx(ctx context.Context, tx pgx.Tx, runID str
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `UPDATE runs SET status=$2, started_at=$3, finished_at=$4, payload=$5 WHERE id=$1`,
+	_, err = tx.Exec(ctx, `UPDATE runs SET status=$2, started_at=$3, finished_at=$4, payload=$5, `+normalizedRunRepoIdentityColumn+`=`+normalizedRunRepoIdentitySQL("$5")+`, `+normalizedRunRepoFullNameColumn+`=`+normalizedRunRepoFullNameSQL("$5")+` WHERE id=$1`,
 		runID, string(run.Status), run.StartedAt, run.FinishedAt, rp)
 	return err
 }
@@ -2430,7 +2430,7 @@ func (s *PostgresStore) CancelRunJobs(ctx context.Context, runID string, reason 
 			if err != nil {
 				return nil, err
 			}
-			if _, err := tx.Exec(ctx, `UPDATE runs SET status=$2, finished_at=$3, payload=$4 WHERE id=$1`, runID, string(model.StatusCancelled), now, rp); err != nil {
+			if _, err := tx.Exec(ctx, `UPDATE runs SET status=$2, finished_at=$3, payload=$4, `+normalizedRunRepoIdentityColumn+`=`+normalizedRunRepoIdentitySQL("$4")+`, `+normalizedRunRepoFullNameColumn+`=`+normalizedRunRepoFullNameSQL("$4")+` WHERE id=$1`, runID, string(model.StatusCancelled), now, rp); err != nil {
 				return nil, err
 			}
 		}
@@ -4335,7 +4335,7 @@ func (s *PostgresStore) appendDownstreamRunTx(ctx context.Context, tx pgx.Tx, ru
 	if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE runs SET payload=$2 WHERE id=$1`, runID, rp); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE runs SET payload=$2, `+normalizedRunRepoIdentityColumn+`=`+normalizedRunRepoIdentitySQL("$2")+`, `+normalizedRunRepoFullNameColumn+`=`+normalizedRunRepoFullNameSQL("$2")+` WHERE id=$1`, runID, rp); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -4349,7 +4349,7 @@ func (s *PostgresStore) ReopenRunForChildren(ctx context.Context, runID string) 
 	if err := ValidateRunID(runID); err != nil {
 		return err
 	}
-	_, err := s.pool.Exec(ctx, `UPDATE runs SET status='running', finished_at=NULL, payload = jsonb_set(payload, '{status}', '"running"', true) WHERE id=$1 AND status='success'`, runID)
+	_, err := s.pool.Exec(ctx, `UPDATE runs SET status='running', finished_at=NULL, payload = jsonb_set(payload, '{status}', '"running"', true), `+normalizedRunRepoIdentityColumn+`=`+normalizedRunRepoIdentitySQL("payload")+`, `+normalizedRunRepoFullNameColumn+`=`+normalizedRunRepoFullNameSQL("payload")+` WHERE id=$1 AND status='success'`, runID)
 	return err
 }
 

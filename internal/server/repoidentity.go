@@ -65,7 +65,13 @@ func forgePathFromFullName(full string) (string, bool) {
 //     repo_full_name=acme/allowed is rejected outright so it can never
 //     authorize as acme/allowed;
 //   - repo_url with a malformed/empty/ambiguous path is rejected;
-//   - a URL-less legacy submission keeps the bare full-name identity.
+//   - a URL-less legacy submission stores an EXPLICIT host-less alias: the
+//     plain "owner/name" spelling when the full name has exactly one slash,
+//     and the "a1:<base64url(full_name)>" form for a nested group path. A
+//     URL-less nested name is NEVER stored as a plain nested string
+//     ("group/sub/project"), which the typed positional rule would later
+//     reinterpret as host "group" + full name "sub/project" and silently
+//     authorize/scope the wrong repository.
 //
 // On success RepoID, PolicyRepoID and CheckoutRepoURL are set consistently.
 func bindSubmissionRepoIdentity(in *SubmitRun) error {
@@ -79,7 +85,13 @@ func bindSubmissionRepoIdentity(in *SubmitRun) error {
 		if !ok {
 			return &admissionError{Status: 400, Reason: "repo_full_name_invalid", Msg: "repo_full_name names no repository path"}
 		}
-		in.RepoID = auth.CanonicalRepoID("", p)
+		// Persist the EXPLICIT alias spelling: plain owner/name when it is
+		// unambiguous (exactly one slash), a1:<base64url> for a nested path.
+		alias, err := auth.CanonicalHostAlias(p)
+		if err != nil {
+			return &admissionError{Status: 400, Reason: "repo_full_name_invalid", Msg: "repo_full_name names no repository path"}
+		}
+		in.RepoID = alias.Serialized()
 		in.PolicyRepoID = in.RepoID
 		return nil
 	}

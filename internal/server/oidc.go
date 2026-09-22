@@ -332,7 +332,7 @@ func (s *Server) rotateOIDCKeyLocked(now time.Time) {
 			// serves. Retain it in memory and leave readiness degraded until a
 			// successful persist proves durability.
 			s.oidc = next
-			s.noteFilePersistResult(err)
+			s.noteFilePersistResult(s.oidcPersistPath(next), err)
 			s.logError("oidc: key rotation published but not durably certified; retaining new ring and arming degraded readiness", "error", err.Error())
 			return
 		}
@@ -341,8 +341,9 @@ func (s *Server) rotateOIDCKeyLocked(now time.Time) {
 	}
 	s.oidc = next
 	// A successful persist reconciles any earlier published-but-uncertain
-	// rotation (the shared marker is coarser by design).
-	s.noteFilePersistResult(nil)
+	// rotation IN THE SAME DIRECTORY; uncertainty for another directory (for
+	// example a separate --cluster-key-dir) is deliberately left armed.
+	s.noteFilePersistResult(s.oidcPersistPath(next), nil)
 }
 
 // clusterKeyRotationFencer returns the cross-replica rotation fence for the

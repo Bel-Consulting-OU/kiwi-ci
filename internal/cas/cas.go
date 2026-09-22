@@ -212,6 +212,21 @@ func (c *CAS) Put(ctx context.Context, r io.Reader) (blob.Object, error) {
 	if c.Staging == nil {
 		return blob.Object{}, fmt.Errorf("%w: %d bytes buffered, in-memory bound is %d", ErrNoSpool, n, mem)
 	}
+	// Charge the spool's worst-case disk amount BEFORE writing a byte: the
+	// spool file can hold the whole stream, up to the per-object bound, so
+	// concurrent Put callers serialize on the budget instead of each staging
+	// a full-size file unaccounted. The reservation is held until the
+	// publication (and its read of the staged file) is done, and released on
+	// every exit path, so Budget.Used() always accounts the in-flight spool.
+	res, aerr := c.Staging.Acquire(ctx, limit)
+	if aerr != nil {
+		if errors.Is(aerr, staging.ErrBudgetExceeded) {
+			return blob.Object{}, fmt.Errorf("%w: %d bytes can never fit the %d-byte staging budget",
+				ErrBlobTooLarge, limit, c.Staging.MaxBytes())
+		}
+		return blob.Object{}, aerr
+	}
+	defer res.Release()
 	// The bytes already buffered are hashed; the remaining stream is hashed
 	// while SpoolFile writes it, so the digest covers the whole stream.
 	src := io.MultiReader(bytes.NewReader(buf.Bytes()), io.TeeReader(r, h))

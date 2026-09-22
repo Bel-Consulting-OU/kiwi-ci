@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/app"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/version"
 )
 
@@ -157,6 +158,7 @@ func TestDispatchRoutesEveryCommand(t *testing.T) {
 		{"config", []string{"config", "--no-such-flag"}},
 		{"storage-empty", []string{"storage"}},
 		{"storage", []string{"storage", "--no-such-flag"}},
+		{"repair-repo-identities", []string{"repair-repo-identities", "--no-such-flag"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -310,6 +312,123 @@ func TestStorageCommand(t *testing.T) {
 	}
 }
 
+// TestStorageCommandRoutesMigrateStagingLayout: the staging-layout migration
+// is routed by cmd/kiwi (it only needs internal/staging); every other storage
+// subcommand still goes to internal/app.
+func TestStorageCommandRoutesMigrateStagingLayout(t *testing.T) {
+	ctx := context.Background()
+	// A missing --dir is a usage error, not an app dispatch.
+	t.Setenv("KIWI_STAGING_DIR", "")
+	var out, errOut bytes.Buffer
+	err := storageCommand(ctx, []string{"migrate-staging-layout"}, strings.NewReader(""), &out, &errOut)
+	if err == nil || !strings.Contains(err.Error(), "--dir is required") {
+		t.Fatalf("migrate-staging-layout without --dir = %v", err)
+	}
+	// The reconcile subcommand is unchanged and delegated to internal/app.
+	if err := storageCommand(ctx, nil, strings.NewReader(""), &out, &errOut); err == nil || !strings.Contains(err.Error(), "requires a subcommand") {
+		t.Fatalf("storageCommand(nil) = %v", err)
+	}
+	if err := storageCommand(ctx, []string{"reconcile-reservations", "--no-such-flag"}, strings.NewReader(""), &out, &errOut); err == nil {
+		t.Fatal("storageCommand(reconcile-reservations bad flag) = nil, want a flag error")
+	}
+}
+
+// TestRepairRepoIdentitiesCommandFlags pins the operator repair command's
+// flag/URL contract: a missing database URL and stray positional arguments are
+// usage errors, and an unknown flag never reaches the store.
+func TestRepairRepoIdentitiesCommandFlags(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("KIWI_DATABASE_URL", "")
+	var out bytes.Buffer
+	if err := repairRepoIdentities(ctx, nil, &out); err == nil || !strings.Contains(err.Error(), "--database-url is required") {
+		t.Fatalf("repairRepoIdentities without a URL = %v", err)
+	}
+	if err := repairRepoIdentities(ctx, []string{"--no-such-flag"}, &out); err == nil {
+		t.Fatal("repairRepoIdentities(bad flag) = nil, want a flag error")
+	}
+	if err := repairRepoIdentities(ctx, []string{"--database-url", "postgres://example/db", "extra"}, &out); err == nil || !strings.Contains(err.Error(), "takes no arguments") {
+		t.Fatalf("repairRepoIdentities(extra arg) = %v", err)
+	}
+}
+
+// TestMigrateStagingLayoutCommandReclaimsWithForce: --force skips the prompt
+// and reclaims the legacy top-level file; the report names the root and count.
+func TestMigrateStagingLayoutCommandReclaimsWithForce(t *testing.T) {
+	root := t.TempDir()
+	legacy := filepath.Join(root, staging.FilePrefix+"old-layout")
+	if err := os.WriteFile(legacy, []byte("legacy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	if err := migrateStagingLayout(context.Background(), []string{"--dir", root, "--force"}, strings.NewReader(""), &out, &errOut); err != nil {
+		t.Fatalf("migrateStagingLayout: %v (stderr %q)", err, errOut.String())
+	}
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Fatalf("legacy file survived the forced migration: %v", err)
+	}
+	if !strings.Contains(out.String(), "reclaimed=1") || !strings.Contains(out.String(), root) {
+		t.Fatalf("migration report = %q", out.String())
+	}
+}
+
+// TestMigrateStagingLayoutCommandRequiresConfirmation: without --force the
+// command removes nothing unless the operator types yes; EOF (non-interactive
+// stdin) is a refusal, so a script cannot wipe the root by accident.
+func TestMigrateStagingLayoutCommandRequiresConfirmation(t *testing.T) {
+	newRoot := func(t *testing.T) (string, string) {
+		t.Helper()
+		root := t.TempDir()
+		legacy := filepath.Join(root, staging.FilePrefix+"old-layout")
+		if err := os.WriteFile(legacy, []byte("legacy"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return root, legacy
+	}
+	t.Setenv("KIWI_STAGING_DIR", "")
+	for name, answer := range map[string]string{
+		"no":   "no\n",
+		"eof":  "",
+		"n":    "n\n",
+		"junk": "maybe\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			root, legacy := newRoot(t)
+			var out, errOut bytes.Buffer
+			err := migrateStagingLayout(context.Background(), []string{"--dir", root}, strings.NewReader(answer), &out, &errOut)
+			if err == nil || !strings.Contains(err.Error(), "aborted") {
+				t.Fatalf("unconfirmed migration (%q) = %v, want an abort", answer, err)
+			}
+			if _, serr := os.Stat(legacy); serr != nil {
+				t.Fatalf("unconfirmed migration removed the file: %v", serr)
+			}
+		})
+	}
+	t.Run("yes", func(t *testing.T) {
+		root, legacy := newRoot(t)
+		var out, errOut bytes.Buffer
+		if err := migrateStagingLayout(context.Background(), []string{"--dir", root}, strings.NewReader("yes\n"), &out, &errOut); err != nil {
+			t.Fatalf("confirmed migration: %v", err)
+		}
+		if _, serr := os.Stat(legacy); !os.IsNotExist(serr) {
+			t.Fatalf("confirmed migration did not remove the file: %v", serr)
+		}
+	})
+	// Extra positional arguments are refused.
+	var out, errOut bytes.Buffer
+	if err := migrateStagingLayout(context.Background(), []string{"--dir", t.TempDir(), "--force", "extra"}, strings.NewReader(""), &out, &errOut); err == nil || !strings.Contains(err.Error(), "takes no arguments") {
+		t.Fatalf("migrateStagingLayout(extra arg) = %v", err)
+	}
+	// KIWI_STAGING_DIR is honored when --dir is omitted.
+	root, legacy := newRoot(t)
+	t.Setenv("KIWI_STAGING_DIR", root)
+	if err := migrateStagingLayout(context.Background(), []string{"--force"}, strings.NewReader(""), &out, &errOut); err != nil {
+		t.Fatalf("migration via KIWI_STAGING_DIR: %v", err)
+	}
+	if _, serr := os.Stat(legacy); !os.IsNotExist(serr) {
+		t.Fatalf("migration via KIWI_STAGING_DIR did not reclaim: %v", serr)
+	}
+}
+
 func TestUsageListsCommands(t *testing.T) {
 	text := captureUsage(t, usage)
 	for _, want := range []string{
@@ -317,6 +436,8 @@ func TestUsageListsCommands(t *testing.T) {
 		"kiwi server", "kiwi runner", "kiwi dispatch", "kiwi init",
 		"kiwi tui", "kiwi config check", "kiwi outbox dead-letters",
 		"kiwi storage  reconcile-reservations",
+		"kiwi storage  migrate-staging-layout",
+		"kiwi repair-repo-identities",
 		"kiwi version", "identical local and remote DAG execution",
 	} {
 		if !strings.Contains(text, want) {

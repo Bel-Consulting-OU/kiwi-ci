@@ -358,7 +358,11 @@ var persistEnrollGrantsFunc = func(s *Server) error {
 // process memory (no file, no phase).
 func (s *Server) persistEnrollGrants() error {
 	err := persistEnrollGrantsFunc(s)
-	s.noteFilePersistResult(err)
+	path := ""
+	if s.dataDir != "" {
+		path = filepath.Join(s.dataDir, enrollGrantsFile)
+	}
+	s.noteFilePersistResult(path, err)
 	return err
 }
 

@@ -134,7 +134,7 @@ func TestPolicySeparatesSameNameAcrossForges(t *testing.T) {
 	yes := true
 	s := New("token")
 	s.Policy = &policy.Config{Repositories: map[string]policy.RepoPolicy{
-		"github.com/acme/backend": {RequireDigestPins: &yes, CrossRepoTrigger: &yes},
+		auth.RepoIdentity{Host: "github.com", FullName: "acme/backend"}.Serialized(): {RequireDigestPins: &yes, CrossRepoTrigger: &yes},
 	}}
 	if w := submitPipeline(t, s, "https://github.com/acme/backend.git", "acme/backend", unpinnedContainerPipeline); w.Code != http.StatusForbidden {
 		t.Fatalf("github unpinned = %d, want 403 (repo policy applies): %s", w.Code, w.Body.String())

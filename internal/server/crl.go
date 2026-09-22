@@ -79,7 +79,7 @@ func (s *Server) persistCRL() error {
 		return nil
 	}
 	err := marshalJSONFile(filepath.Join(s.dataDir, crlFile), crlJSON(s.crl))
-	s.noteFilePersistResult(err)
+	s.noteFilePersistResult(filepath.Join(s.dataDir, crlFile), err)
 	return err
 }
 
