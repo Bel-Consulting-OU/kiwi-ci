@@ -311,6 +311,7 @@ func TestServerProductionRunnerTokenDecisionIsPostDB(t *testing.T) {
 		"--external-url", "https://ci.example.com",
 		"--tls-cert", "c.pem", "--tls-key", "k.pem",
 		"--admin-token", "admin", "--runner-token", "runner",
+		"--staging-dir", t.TempDir(), "--staging-max-bytes", "1073741824",
 	})
 	if err == nil {
 		t.Fatal("production Server with an unreachable database succeeded")

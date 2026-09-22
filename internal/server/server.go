@@ -42,6 +42,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runnerpki"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/scheduler"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secretbroker"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/version"
 	"go.opentelemetry.io/otel/codes"
@@ -273,6 +274,16 @@ type Server struct {
 	// dataDir/cas. SetBlobStore overrides both.
 	BlobStore blob.Store
 	CAS       *cas.CAS
+
+	// Staging is the shared weighted budget for large-upload scratch space
+	// (job cache entries and — consumed by the snapshot path — workspace
+	// snapshots). Persistent constructors install a bounded default under
+	// the data dir; the app wiring replaces it with the configured
+	// staging.dir/staging.max_bytes budget, and production REFUSES to start
+	// without one. Large uploads must be charged here before a byte is
+	// staged; handlers fail closed (503) when it is nil. Read it through
+	// StagingBudget().
+	Staging *staging.Budget
 
 	// CASGCInterval, CASGCMinAge and CASGCBatch tune the reference-aware
 	// CAS garbage collector Maintain runs (see cas_gc.go). Zero values use
@@ -559,6 +570,26 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 	s.ClusterKeys = cluster
 	s.store = storage.New(dataDir)
 	s.outbox = NewOutbox(s.store)
+	// Large runner uploads stage through a shared, bounded budget: default
+	// it under the data dir (never a bare system temp directory) so every
+	// persistent server has a bound. The app wiring replaces it with the
+	// configured staging.dir/staging.max_bytes budget, and production
+	// REFUSES to start without one; abandoned spool files from a crashed
+	// process are pruned before the first request.
+	stagingRoot := dataDir
+	if stagingRoot == "" {
+		stagingRoot = os.TempDir()
+	}
+	if s.Staging == nil {
+		budget, berr := staging.NewBudget(filepath.Join(stagingRoot, "kiwi-staging"), staging.DefaultMaxBytes)
+		if berr != nil {
+			return nil, berr
+		}
+		s.Staging = budget
+		if _, perr := budget.Prune(context.Background()); perr != nil { // allow-background: startup prune of crash-abandoned spool files runs before any request exists
+			s.logf("staging: startup prune failed: %v", perr)
+		}
+	}
 	// Restore the logical-check → remote check-run ID mapping so a restart
 	// UPDATES existing checks instead of creating duplicates. A corrupt
 	// mirror fails startup (fail closed) rather than silently resetting
@@ -1848,10 +1879,11 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 	// Coarse read gate: the collection spans repositories, so it is satisfied
 	// by global read/admin or any repository read grant (auth.CanReadAnyRepo,
 	// documented in requireReadAny). It is not the authorization decision for
-	// any run: every candidate is filtered individually below through
-	// canReadRepo, the single repository-grant resolution (auth.CanReadRepo),
-	// so an explicit repository deny wins and a repository-only read grant
-	// still reaches its repository.
+	// any run: the permitted canonical repository set is resolved once below
+	// (authorizedRunRepoIDs, the single repository-grant resolution
+	// auth.CanReadRepo) and applied INSIDE the page query, before the page
+	// boundary, so neither the returned rows nor the next cursor can ever be
+	// derived from a run the caller cannot read.
 	if !s.requireReadAny(w, r) {
 		return
 	}
@@ -1863,11 +1895,22 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit := storage.NormalizeRunsPageLimit(runsPageLimitParam(r))
-	visible := func(run model.Run) bool { return s.canReadRepo(r, repoIDForRun(run)) }
+	// Authorization precedes paging: resolve the caller's permitted
+	// canonical repository set ONCE, then read a page of ONLY those
+	// repositories. The page boundary (HasMore, NextCreatedAt/NextID) is
+	// computed on the authorized rows alone, so the response cursor is
+	// always the last visible run's position and an empty authorized page
+	// is terminal — it can never carry a cursor derived from an invisible
+	// run, and walking the collection reveals nothing about the density of
+	// repositories the caller cannot read.
+	allowedRepoIDs, err := s.authorizedRunRepoIDs(r)
+	if err != nil {
+		s.internalError(w, r, err, "")
+		return
+	}
 	var page storage.RunPage
 	if s.DB != nil {
-		var err error
-		page, err = listRunsPageFromStore(r.Context(), s.DB, cursor, limit)
+		page, err = listRunsPageForAuthorizedRepos(r.Context(), s.DB, allowedRepoIDs, cursor, limit)
 		if err != nil {
 			s.internalError(w, r, err, "")
 			return
@@ -1879,22 +1922,13 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 			snapshot = append(snapshot, v)
 		}
 		s.mu.Unlock()
-		page = storage.PageRuns(snapshot, cursor.createdAt, cursor.id, limit)
+		page = storage.PageRunsForAuthorizedRepos(snapshot, allowedRepoIDs, cursor.createdAt, cursor.id, limit)
 	}
-	// RBAC filtering runs AFTER paging: the store page is cut on the
-	// underlying (created_at, id) keyset and the next cursor comes from the
-	// page boundary the store reported, never from how many runs survived the
-	// filter. A page may therefore return fewer — even zero — runs while a
-	// next cursor still leads to the remaining visible runs, and the walk
-	// terminates on the first page for which the store reported no further
-	// rows. Deciding "more data" from the visible count instead would stop
-	// early (false last page) whenever the newest rows of a page are
-	// invisible, silently hiding every older visible run.
+	// No post-filter: every returned run already belongs to the authorized
+	// set, so the DTO projection preserves the store's page boundary
+	// exactly.
 	dto := make([]v1.RunDTO, 0, len(page.Runs))
 	for _, v := range page.Runs {
-		if !visible(v) {
-			continue
-		}
 		dto = append(dto, v1.RunDTOFrom(v))
 	}
 	w.Header().Set("X-Kiwi-Runs-Limit-Cap", strconv.Itoa(storage.MaxRunsPageLimit))
@@ -1964,25 +1998,108 @@ func runsPageLimitParam(r *http.Request) int {
 }
 
 // errRunsPaginationUnsupported is the fail-closed answer for a configured
-// store without the RunPageStore capability. An unpaged ListRuns window
-// cannot page: an older cursor applied to it re-reads the same newest rows,
-// so the walk would terminate while older runs still exist — silently
-// truncating the collection. Every store shipped with Kiwi implements
-// RunPageStore; the detail is logged server-side and the client sees the
+// store without the authorized page contract: paging an unfiltered
+// collection and filtering afterwards leaks the page boundary (cursor
+// timestamps/IDs and the density of invisible runs), so a store that cannot
+// apply the permitted canonical repository set INSIDE the page query is
+// never served a page at all. The same answer covers a store that cannot
+// enumerate the collection's canonical repository identities
+// (storage.RunRepoIDStore), because the caller cannot resolve an exact
+// authorized set from it. Every store shipped with Kiwi implements both
+// capabilities; the detail is logged server-side and the client sees the
 // opaque 500 body.
-var errRunsPaginationUnsupported = errors.New("runs pagination unsupported by configured store")
+var errRunsPaginationUnsupported = errors.New("authorized runs pagination unsupported by configured store")
 
-// listRunsPageFromStore reads one keyset page from a store that implements
-// storage.RunPageStore (the memory and PostgreSQL stores do). A store without
-// the capability fails closed instead of being served a bounded ListRuns
-// snapshot, so a misconfigured custom store reports the missing pagination
-// contract rather than returning a truncated page as if the history ended.
-func listRunsPageFromStore(ctx context.Context, store storage.Store, cursor runsCursor, limit int) (storage.RunPage, error) {
-	paged, ok := store.(storage.RunPageStore)
+// authorizedRunRepoIDs resolves the request's permitted canonical repository
+// set exactly once, BEFORE any page boundary exists:
+//
+//   - no principal (the legacy/web-session path, already decided by the
+//     outer auth gate) and an admin principal may read every repository;
+//     a global read role with NO repository entries does too — with no
+//     entries the resolution has nothing that could deny a repository, so
+//     the empty-map check only skips the enumeration and the decision
+//     itself stays in auth.CanReadRepo. These return nil, the store's
+//     unrestricted form;
+//   - every other principal is resolved against the CONCRETE canonical
+//     repository identities present in the collection, each through
+//     auth.CanReadRepo — the single repository-grant entry point the per-run
+//     read routes use — so a bare alias, host case, default ports, an
+//     explicit repository deny and the ambiguity fail-closed rule resolve
+//     identically to every other read path. The result is an exact,
+//     non-nil (possibly empty) allowlist: an empty set is a terminal empty
+//     page, never a fallback to the whole collection.
+//
+// Candidates come from the store (or the server's own run map in memory
+// mode), never from the principal's grant keys: only the collection knows
+// which concrete, possibly legacy-canonical spellings exist, and the
+// candidates are read from the SAME identity expression the page query
+// compares, so resolution and filtering can never disagree.
+func (s *Server) authorizedRunRepoIDs(r *http.Request) ([]string, error) {
+	p, ok := auth.PrincipalFrom(r)
+	if !ok {
+		return nil, nil
+	}
+	if p.Has(auth.RoleAdmin) || (p.Has(auth.RoleRead) && len(p.Repositories) == 0) {
+		return nil, nil
+	}
+	candidates, err := s.runRepoCandidates(r.Context())
+	if err != nil {
+		return nil, err
+	}
+	allowed := make([]string, 0, len(candidates))
+	for _, repoID := range candidates {
+		if auth.CanReadRepo(p, repoID) {
+			allowed = append(allowed, repoID)
+		}
+	}
+	return allowed, nil
+}
+
+// runRepoCandidates returns the distinct canonical (policy-first) repository
+// identities present in the runs collection, ascending. It is candidate
+// discovery, not an authorization decision: the caller resolves each
+// candidate through the repository-grant entry point. DB mode requires the
+// store's enumeration capability and fails closed without it; memory mode
+// reads the server's own run map through the SAME repoIDForRun derivation
+// the per-run routes use, so the memory and DB candidate sets agree.
+func (s *Server) runRepoCandidates(ctx context.Context) ([]string, error) {
+	if s.DB != nil {
+		enum, ok := s.DB.(storage.RunRepoIDStore)
+		if !ok {
+			return nil, fmt.Errorf("%w: %T", errRunsPaginationUnsupported, s.DB)
+		}
+		return enum.ListRunRepoIDs(ctx)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seen := make(map[string]struct{}, len(s.runs))
+	out := make([]string, 0, len(s.runs))
+	for _, run := range s.runs {
+		id := repoIDForRun(run)
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// listRunsPageForAuthorizedRepos reads one authorized keyset page from a
+// store that implements storage.RunPageForPrincipalStore. The permitted
+// canonical repository set is a predicate INSIDE the query that computes the
+// keyset boundary, so the returned rows and the next position are authorized
+// by construction. A store without the capability — including one that still
+// implements only the unfiltered storage.RunPageStore — fails closed instead
+// of being served a page whose boundary could leak (see
+// errRunsPaginationUnsupported).
+func listRunsPageForAuthorizedRepos(ctx context.Context, store storage.Store, allowedRepoIDs []string, cursor runsCursor, limit int) (storage.RunPage, error) {
+	paged, ok := store.(storage.RunPageForPrincipalStore)
 	if !ok {
 		return storage.RunPage{}, fmt.Errorf("%w: %T", errRunsPaginationUnsupported, store)
 	}
-	return paged.ListRunsPage(ctx, cursor.createdAt, cursor.id, limit)
+	return paged.ListRunsPageForAuthorizedRepos(ctx, allowedRepoIDs, cursor.createdAt, cursor.id, limit)
 }
 func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")

@@ -14,6 +14,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/snapshot"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
 )
 
 func fcSnapshotArchive(t *testing.T) []byte {
@@ -312,12 +313,37 @@ func TestFlowSnapshotDBUploadBranches(t *testing.T) {
 	}
 }
 
-func TestFlowSnapshotDBTempDirFailure(t *testing.T) {
+// TestFlowSnapshotDBStagingBudgetMissing covers the fail-closed staging
+// contract: a DB-mode upload without an installed staging budget refuses with
+// 503 instead of falling back to the bare system temporary directory.
+func TestFlowSnapshotDBStagingBudgetMissing(t *testing.T) {
 	s, _, _, hdrs := cacheFixture(t)
-	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "missing-dir"))
+	s.SetStagingBudget(nil)
 	w := fcUploadSnapshot(t, s, hdrs, fcSnapshotArchive(t))
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("snapshot temp dir failure = %d, want 500: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("snapshot upload without a staging budget = %d, want 503: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestFlowSnapshotDBStagingDirFailure covers an unusable configured staging
+// directory: the wiring's budget construction refuses the bound (so startup
+// fails instead of the first upload), and a server left without a budget
+// fails the upload closed rather than staging elsewhere.
+func TestFlowSnapshotDBStagingDirFailure(t *testing.T) {
+	s, _, _, hdrs := cacheFixture(t)
+	// A FILE at the configured staging path makes NewBudget's directory
+	// probe fail for any euid (path shape, not permission bits).
+	blocked := filepath.Join(t.TempDir(), "staging-blocked")
+	if err := os.WriteFile(blocked, []byte("not a dir"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := staging.NewBudget(blocked, 1<<20); err == nil {
+		t.Fatal("staging budget over a file path must not install")
+	}
+	s.SetStagingBudget(nil)
+	w := fcUploadSnapshot(t, s, hdrs, fcSnapshotArchive(t))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("snapshot upload with unusable staging = %d, want 503: %s", w.Code, w.Body.String())
 	}
 }
 
@@ -333,6 +359,12 @@ func TestFlowSnapshotDBListBranches(t *testing.T) {
 	s.DB = &fcStore{dbFakeStore: f, listSnapshotsErr: errors.New("snapshot table down")}
 	if w := doJSON(t, s, http.MethodGet, "/api/v1/runs/run-c/snapshots", "admin-tok", ""); w.Code != http.StatusInternalServerError {
 		t.Fatalf("db list snapshots error = %d, want 500", w.Code)
+	}
+	// A store without the paged capability fails closed: an unbounded list
+	// window cannot honor a cursor.
+	s.DB = fcPlainStore{f}
+	if w := doJSON(t, s, http.MethodGet, "/api/v1/runs/run-c/snapshots", "admin-tok", ""); w.Code != http.StatusInternalServerError {
+		t.Fatalf("db list without paged capability = %d, want 500: %s", w.Code, w.Body.String())
 	}
 	s.DB = f
 	// Two records exercise the ordering comparator.
@@ -379,9 +411,9 @@ func TestFlowSnapshotDBDownloadBranches(t *testing.T) {
 	if w := doJSON(t, s, http.MethodGet, "/api/v1/runs/run-c/snapshots/"+rec.ID, "admin-tok", ""); w.Code != http.StatusInternalServerError {
 		t.Fatalf("db download run error = %d, want 500", w.Code)
 	}
-	s.DB = &fcStore{dbFakeStore: f, listSnapshotsErr: errors.New("snapshot table down")}
+	s.DB = &fcStore{dbFakeStore: f, snapshotGetErr: errors.New("snapshot table down")}
 	if w := doJSON(t, s, http.MethodGet, "/api/v1/runs/run-c/snapshots/"+rec.ID, "admin-tok", ""); w.Code != http.StatusInternalServerError {
-		t.Fatalf("db download list error = %d, want 500", w.Code)
+		t.Fatalf("db download get error = %d, want 500", w.Code)
 	}
 	// Store without the snapshot extension.
 	s.DB = fcPlainStore{f}

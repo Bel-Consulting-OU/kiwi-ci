@@ -30,6 +30,8 @@ func productionPKIServerArgs(t *testing.T, dsn, addr string, extra ...string) []
 		"--mode", "production", "--external-url", "https://ci.example.com",
 		"--tls-cert", certFile, "--tls-key", keyFile,
 		"--admin-token", "admin",
+		// Production requires a bounded staging area for large runner uploads.
+		"--staging-dir", t.TempDir(), "--staging-max-bytes", "67108864",
 	}
 	return append(args, extra...)
 }

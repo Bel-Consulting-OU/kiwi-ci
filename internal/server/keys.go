@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/provenance"
 )
 
@@ -207,7 +208,7 @@ func (s *Server) loadWebSessionSecret(dataDir string) error {
 		if err := os.MkdirAll(dataDir, 0o700); err != nil {
 			return err
 		}
-		return writeFileAtomic(path, []byte(hex.EncodeToString(b)), 0o600)
+		return fsutil.AtomicWriteFile(path, []byte(hex.EncodeToString(b)), 0o600)
 	}
 	return nil
 }
@@ -244,27 +245,25 @@ func parseEd25519PublicPEM(pemBytes []byte) (ed25519.PublicKey, error) {
 	return pub, nil
 }
 
-// writeFileAtomic writes data to path via a temp file and rename so a crash
-// mid-write can never leave a truncated key file.
-func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, mode); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return err
-	}
-	return nil
-}
-
-// marshalJSONFile is a small shared helper for atomic JSON persistence of
-// server-owned state files (schedules, CRL, test history).
+// marshalJSONFile is the shared durable JSON persistence helper for
+// server-owned security state files (the runner CRL mirror, enrollment
+// grants, secret receipts, test history). It delegates to
+// fsutil.AtomicWriteFile, whose real sequence is: a UNIQUE temp file in the
+// destination directory (os.CreateTemp), write, chmod 0600, checked file
+// fsync, checked close, rename over the destination, and a parent-directory
+// fsync. An error from any step means the new bytes are NOT certified
+// durable, so callers must treat the mutation as unacknowledged; no step
+// before the rename can leave the previous file truncated (the temp file is
+// removed on failure), and the unique temp name keeps concurrent writers
+// from clobbering each other. The only post-rename failure is the parent
+// fsync, which surfaces after the new bytes are already visible (see
+// fsutil.SyncDir).
 func marshalJSONFile(path string, v any) error {
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(path, append(b, '\n'), 0o600)
+	return fsutil.AtomicWriteFile(path, append(b, '\n'), 0o600)
 }
 
 // readFileIfExists returns the file contents or nil when the file does not

@@ -25,10 +25,26 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cas"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/provenance"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 const maxBlobBytes int64 = 8 << 30 // 8 GiB hard safety limit for the built-in store.
+
+// cacheUploadMaxBytes is the receiver's HTTP body cap for cache uploads: the
+// same 8 GiB safety limit the artifact path enforces. It is a variable so
+// tests can exercise the boundary with small bodies; production leaves it at
+// maxBlobBytes.
+var cacheUploadMaxBytes = maxBlobBytes
+
+// cacheStageHook, when non-nil, runs with the staged file path and the
+// reserved byte amount immediately after the body is fully staged (inside
+// the budget reservation) and before publication. It is a test-only seam
+// (production leaves it nil) so the staging wiring — the path is inside the
+// configured budget directory and the reservation is held — can be observed
+// without a multi-GB body.
+var cacheStageHook func(path string, reserved int64)
+
 var cacheKeyRE = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 // provenanceFenceTimeout bounds how long an artifact upload waits for the
@@ -246,13 +262,32 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 			s.internalError(w, r, oerr, "")
 			return
 		}
-		if _, perr := s.CAS.Put(ctx, tf); perr != nil {
-			_ = tf.Close()
+		obj, perr := s.CAS.Put(ctx, tf)
+		_ = tf.Close()
+		if perr != nil {
 			_ = os.Remove(tmp)
 			s.internalError(w, r, perr, "")
 			return
 		}
-		_ = tf.Close()
+		// CAS integrity invariant: the published object must be exactly the
+		// staged bytes. A broken or misconfigured backend that reports a
+		// different digest/size must never leave a record (and provenance
+		// statement) naming the local digest while the shared object differs.
+		if obj.SHA256 != digest || obj.Size != n {
+			_ = os.Remove(tmp)
+			s.auditLocked("artifact.integrity_failure", runnerID, j.RunID, j.ID, "artifact CAS object disagrees with the streamed bytes", map[string]string{"name": name, "want_sha256": digest, "want_size": strconv.FormatInt(n, 10), "got_sha256": obj.SHA256, "got_size": strconv.FormatInt(obj.Size, 10)})
+			http.Error(w, "artifact storage verification failed", http.StatusServiceUnavailable)
+			return
+		}
+		// Read-back verification (parity with the snapshot path): reopen the
+		// newly written object, stream and hash it, and require the digest
+		// and exact byte length before the record is committed.
+		if verr := verifyStoredBlob(ctx, s.CAS, digest, n); verr != nil {
+			_ = os.Remove(tmp)
+			s.logError("artifact: stored object verification failed", "job", j.ID, "sha256", digest, "error", verr.Error())
+			http.Error(w, "artifact storage verification failed", http.StatusServiceUnavailable)
+			return
+		}
 		_ = os.Remove(tmp)
 	} else {
 		if err := os.Rename(tmp, dst); err != nil {
@@ -336,9 +371,17 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 					s.logError("artifact: provenance digest fence failed; provenance not stored", "job", j.ID, "sha256", provDigest, "error", ferr.Error())
 				} else {
 					releaseProvenance = release
-					if _, perr := s.CAS.Put(ctx, bytes.NewReader(ab)); perr == nil {
+					// The provenance envelope is published only when the CAS
+					// object is the exact envelope bytes: the record must
+					// never reference a digest the shared store disagrees
+					// with (same invariant as the payload publication above).
+					if pobj, perr := s.CAS.Put(ctx, bytes.NewReader(ab)); perr == nil && pobj.SHA256 == provDigest && pobj.Size == int64(len(ab)) {
 						rec.ProvenancePath = "cas:" + provDigest
 						rec.ProvenanceSHA256 = provDigest
+					} else if perr != nil {
+						s.logError("artifact: provenance store failed; provenance not stored", "job", j.ID, "sha256", provDigest, "error", perr.Error())
+					} else {
+						s.logError("artifact: provenance CAS object disagrees with the envelope; provenance not stored", "job", j.ID, "sha256", provDigest, "got_sha256", pobj.SHA256, "got_size", pobj.Size)
 					}
 				}
 			} else {
@@ -674,6 +717,15 @@ func (s *Server) cacheLease(w http.ResponseWriter, r *http.Request) (model.Job, 
 // written CAS blob is left in place as an orphan for the reference-aware
 // blob GC — never deleted, because the digest may be referenced by
 // another entry.
+//
+// Staging: the body spools into the server's shared bounded staging budget
+// (never a bare system temp directory). The reservation is the request's
+// Content-Length, or the endpoint maximum when the body length is unknown
+// (chunked), so concurrent valid runners can never stage more than
+// staging.max_bytes in total; the reservation is released on every exit
+// path, including copy errors and client disconnects. A body that exceeds
+// either the endpoint cap or the staging capacity is answered 413; a full
+// budget blocks until room frees up or the request context ends.
 func (s *Server) uploadJobCache(w http.ResponseWriter, r *http.Request) {
 	if s.store == nil {
 		http.Error(w, "cache storage requires persistent server", http.StatusServiceUnavailable)
@@ -681,6 +733,14 @@ func (s *Server) uploadJobCache(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.CAS == nil {
 		http.Error(w, "cache storage requires a blob store", http.StatusServiceUnavailable)
+		return
+	}
+	if s.Staging == nil {
+		// Fail closed: without a bound this path would spool into unbounded
+		// scratch space, exactly the control-plane root-filesystem
+		// exhaustion it must not allow. Production startup refuses to serve
+		// in this state; this is the belt-and-braces runtime guard.
+		http.Error(w, "cache staging budget unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	j, runnerID, ok := s.cacheLease(w, r)
@@ -694,46 +754,112 @@ func (s *Server) uploadJobCache(w http.ResponseWriter, r *http.Request) {
 	}
 	repo, trust := cacheNamespace(j)
 	fileKey := cacheFileKey(repo, trust, key)
-	// Stage and hash first so the digest whose fence we take is the digest
-	// being published, then hold the fence across Put + manifest commit.
-	staged, err := os.CreateTemp("", "kiwi-cache-put-*")
+	// The body cap is the endpoint maximum; an oversized Content-Length is
+	// rejected before any staging happens, and the stream is bounded at the
+	// same value so an unknown-length (chunked) body cannot run past it.
+	limit := cacheUploadMaxBytes
+	cl := r.ContentLength
+	if cl > limit {
+		http.Error(w, cacheTooLargeError(), http.StatusRequestEntityTooLarge)
+		return
+	}
+	reserve := limit
+	if cl >= 0 {
+		if cl > s.Staging.MaxBytes() {
+			// The reservation can never succeed: refuse before staging.
+			http.Error(w, "cache entry exceeds the staging capacity", http.StatusRequestEntityTooLarge)
+			return
+		}
+		reserve = cl
+	}
+	res, err := s.Staging.Acquire(r.Context(), reserve)
+	if err != nil {
+		if errors.Is(err, staging.ErrBudgetExceeded) {
+			s.logError("cache: staging reservation refused", "bytes", reserve, "budget", s.Staging.MaxBytes())
+			http.Error(w, "cache staging capacity unavailable for this upload", http.StatusServiceUnavailable)
+			return
+		}
+		if r.Context().Err() != nil {
+			// The client is gone; there is nobody to answer.
+			return
+		}
+		s.internalError(w, r, err, "")
+		return
+	}
+	defer res.Release()
+	// Stage and hash on disk inside the budget directory, then publish: the
+	// digest whose fence we take is the digest actually staged.
+	stagedPath, n, err := staging.SpoolFile(s.Staging.Dir(), http.MaxBytesReader(w, r.Body, limit), reserve)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) || errors.Is(err, staging.ErrTooLarge) {
+			http.Error(w, cacheTooLargeError(), http.StatusRequestEntityTooLarge)
+			return
+		}
+		if r.Context().Err() != nil {
+			return
+		}
+		s.internalError(w, r, err, "")
+		return
+	}
+	defer func() { _ = os.Remove(stagedPath) }()
+	if cacheStageHook != nil {
+		cacheStageHook(stagedPath, reserve)
+	}
+	staged, err := os.Open(stagedPath)
 	if err != nil {
 		s.internalError(w, r, err, "")
 		return
 	}
-	stagedPath := staged.Name()
-	defer func() { _ = os.Remove(stagedPath) }()
 	hasher := sha256.New()
-	n, copyErr := io.Copy(io.MultiWriter(staged, hasher), http.MaxBytesReader(w, r.Body, maxBlobBytes))
-	if copyErr != nil {
-		staged.Close()
-		s.internalError(w, r, copyErr, "")
+	hashed, hashErr := io.Copy(hasher, staged)
+	if err := firstErr(hashErr); err != nil {
+		_ = staged.Close()
+		s.internalError(w, r, err, "")
+		return
+	}
+	if hashed != n {
+		_ = staged.Close()
+		s.internalError(w, r, fmt.Errorf("staged cache entry size changed from %d to %d", n, hashed), "")
 		return
 	}
 	if _, err := staged.Seek(0, io.SeekStart); err != nil {
-		staged.Close()
+		_ = staged.Close()
 		s.internalError(w, r, err, "")
 		return
 	}
 	sum := hex.EncodeToString(hasher.Sum(nil))
 	release, ferr := s.acquireDigestFence(r.Context(), sum)
 	if ferr != nil {
-		staged.Close()
+		_ = staged.Close()
 		s.internalError(w, r, ferr, "")
 		return
 	}
 	defer release()
 	obj, err := s.CAS.Put(r.Context(), staged)
-	staged.Close()
+	_ = staged.Close()
 	if err != nil {
 		s.internalError(w, r, err, "")
 		return
 	}
-	size := obj.Size
-	if size != n {
-		size = n
+	// CAS integrity invariant: the published object must be exactly the
+	// staged bytes. A backend that reports (or stores) a different digest or
+	// size must never be acknowledged — otherwise the signed manifest would
+	// bind the locally computed digest to a shared object that differs.
+	if obj.SHA256 != sum || obj.Size != n {
+		s.auditLocked("cache.integrity_failure", runnerID, j.RunID, j.ID, "cache CAS object disagrees with the staged bytes", map[string]string{"key": key, "want_sha256": sum, "want_size": strconv.FormatInt(n, 10), "got_sha256": obj.SHA256, "got_size": strconv.FormatInt(obj.Size, 10)})
+		http.Error(w, "cache storage verification failed", http.StatusServiceUnavailable)
+		return
 	}
-	envelope, err := s.writeCacheManifest(r.Context(), fileKey, key, repo, trust, sum, size, j)
+	// Read-back verification (parity with the snapshot path): reopen the
+	// newly written object, stream and hash it, and require the digest and
+	// the exact byte length before the signed manifest is committed.
+	if verr := verifyStoredBlob(r.Context(), s.CAS, sum, n); verr != nil {
+		s.logError("cache: stored object verification failed", "sha256", sum, "error", verr.Error())
+		http.Error(w, "cache storage verification failed", http.StatusServiceUnavailable)
+		return
+	}
+	envelope, err := s.writeCacheManifest(r.Context(), fileKey, key, repo, trust, sum, n, j)
 	if err != nil {
 		// The manifest is the durable mapping: without it the blob is an
 		// unreachable ORPHAN, and the upload fails closed. It is never
@@ -744,12 +870,47 @@ func (s *Server) uploadJobCache(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "cache manifest persist failed", http.StatusInternalServerError)
 		return
 	}
-	s.metricAdd("kiwi_cache_bytes_total", float64(size), nil)
+	s.metricAdd("kiwi_cache_bytes_total", float64(n), nil)
 	w.Header().Set("X-Kiwi-Cache-SHA256", sum)
 	w.Header().Set("X-Kiwi-Content-SHA256", sum)
 	w.Header().Set("X-Kiwi-Cache-Manifest-SHA256", manifestDigestOf(envelope))
 	s.auditLocked("cache.uploaded", runnerID, j.RunID, j.ID, "cache entry stored", map[string]string{"key": key, "repository": repo, "trust_domain": trust})
 	w.WriteHeader(http.StatusCreated)
+}
+
+// cacheTooLargeError renders the fixed cache body-cap rejection. It is
+// deliberately free of request-supplied data so the 413 body is stable.
+func cacheTooLargeError() string {
+	return fmt.Sprintf("cache entry exceeds the %d-byte upload limit", cacheUploadMaxBytes)
+}
+
+// verifyStoredBlob reopens a just-published CAS object, streams and hashes
+// it, and requires the digest and the exact byte length computed while the
+// request body was staged. CAS.Open already fails a digest mismatch at EOF;
+// this read-back additionally proves the object is readable and its length
+// is what the committed record/manifest advertises. It is the artifact/cache
+// counterpart of the snapshot path's verifyStoredSnapshot.
+func verifyStoredBlob(ctx context.Context, c *cas.CAS, digest string, wantSize int64) error {
+	rc, obj, err := c.Open(ctx, digest)
+	if err != nil {
+		return err
+	}
+	h := sha256.New()
+	n, copyErr := io.Copy(h, rc)
+	closeErr := rc.Close()
+	if err := firstErr(copyErr, closeErr); err != nil {
+		return err
+	}
+	if n != wantSize {
+		return fmt.Errorf("stored object is %d bytes, want %d", n, wantSize)
+	}
+	if obj.Size != wantSize {
+		return fmt.Errorf("stored object reports size %d, want %d", obj.Size, wantSize)
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != digest {
+		return fmt.Errorf("stored object digest %s, want %s", got, digest)
+	}
+	return nil
 }
 
 // writeCacheManifest signs the cache manifest with the dedicated cache

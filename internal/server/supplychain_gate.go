@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/supplychain"
@@ -72,7 +73,7 @@ func writeArtifactSidecar(dir string, generation int64, base, kind, digest strin
 	if fi, err := os.Stat(path); err == nil && !fi.IsDir() {
 		return path, nil
 	}
-	if err := writeFileAtomic(path, body, 0o600); err != nil {
+	if err := fsutil.AtomicWriteFile(path, body, 0o600); err != nil {
 		return "", err
 	}
 	return path, nil

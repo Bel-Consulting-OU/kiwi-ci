@@ -58,6 +58,21 @@
 # http:// for local gateways (MinIO and friends) without the override.
 # s3_allow_plaintext = false
 
+[staging]
+# Bounded scratch space for large runner uploads (job cache entries and
+# workspace snapshots) before they are published to the shared CAS. Large
+# bodies spool here, never into an unbounded system temp directory, and
+# concurrent uploads are charged against max_bytes before a byte is written.
+#
+# Both keys are all-or-nothing, and PRODUCTION MODE REFUSES TO START without
+# them: without a bound, concurrent valid multi-GB uploads could exhaust the
+# control-plane root filesystem. Pick a directory on a volume sized for at
+# least a few concurrent maximum-size uploads, and a max_bytes budget that
+# bounds the total in-flight staged bytes. In dev mode an unset section falls
+# back to a bounded default under the server data dir.
+# dir = "/var/lib/kiwi/staging"
+# max_bytes = 34359738368
+
 [github]
 # GitHub App ID and private key for the API client.
 # app_id = 0

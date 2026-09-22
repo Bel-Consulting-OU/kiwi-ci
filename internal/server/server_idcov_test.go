@@ -61,8 +61,18 @@ func (f *idcovFaultStore) ListRuns(ctx context.Context, limit int) ([]model.Run,
 	return f.dbFakeStore.ListRuns(ctx, limit)
 }
 
-// ListRunsPage carries the injected run-read failure into the paged path the
-// collection handler actually uses.
+// ListRunsPageForAuthorizedRepos carries the injected run-read failure into
+// the authorized paged path the collection handler actually uses.
+func (f *idcovFaultStore) ListRunsPageForAuthorizedRepos(ctx context.Context, allowedRepoIDs []string, afterCreatedAt time.Time, afterID string, limit int) (storage.RunPage, error) {
+	if f.listRunsErr != nil {
+		return storage.RunPage{}, f.listRunsErr
+	}
+	return f.dbFakeStore.ListRunsPageForAuthorizedRepos(ctx, allowedRepoIDs, afterCreatedAt, afterID, limit)
+}
+
+// ListRunsPage keeps the injected failure on the legacy unfiltered capability
+// too, so any direct use of it in a test stays fail-closed while the handler
+// itself must never take this path.
 func (f *idcovFaultStore) ListRunsPage(ctx context.Context, afterCreatedAt time.Time, afterID string, limit int) (storage.RunPage, error) {
 	if f.listRunsErr != nil {
 		return storage.RunPage{}, f.listRunsErr

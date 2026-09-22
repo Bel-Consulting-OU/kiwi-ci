@@ -212,6 +212,20 @@ type ComponentsConfig struct {
 	RemoteToken string `toml:"remote_token"`
 }
 
+// StagingConfig bounds the scratch space used to stage large runner uploads
+// (job cache entries, workspace snapshots) before they are published to the
+// shared CAS. Without a bound, concurrent valid multi-GB uploads would spool
+// into an unbounded system temp directory and could exhaust the
+// control-plane root filesystem. The keys are all-or-nothing: either both
+// are set or neither is; production mode requires both.
+type StagingConfig struct {
+	// Dir is the staging directory large uploads spool into.
+	Dir string `toml:"dir"`
+	// MaxBytes is the total byte budget shared by all concurrent staged
+	// uploads. A reservation larger than the budget is refused.
+	MaxBytes int64 `toml:"max_bytes"`
+}
+
 type Config struct {
 	Server        ServerConfig        `toml:"server"`
 	Database      DatabaseConfig      `toml:"database"`
@@ -227,6 +241,7 @@ type Config struct {
 	Quota         QuotaConfig         `toml:"quota"`
 	SecretBroker  SecretBrokerConfig  `toml:"secret_broker"`
 	Components    ComponentsConfig    `toml:"components"`
+	Staging       StagingConfig       `toml:"staging"`
 }
 
 // Default returns the built-in defaults (the bottom of the precedence
@@ -385,6 +400,9 @@ func (c *Config) Validate() error {
 	if err := validateSecretBroker(c.SecretBroker); err != nil {
 		return err
 	}
+	if err := validateStaging(c.Staging); err != nil {
+		return err
+	}
 	if c.Components.RemoteURL != "" {
 		u, err := url.Parse(c.Components.RemoteURL)
 		if err != nil {
@@ -408,6 +426,26 @@ func (c *Config) Validate() error {
 		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
 			return fmt.Errorf("%s must be an http(s):// URL, got %q", name, base)
 		}
+	}
+	return nil
+}
+
+// validateStaging enforces the staging section's all-or-nothing contract: a
+// usable staging bound is either fully configured (a directory AND a
+// positive byte budget) or absent. A partial configuration is refused so a
+// typo cannot silently leave large uploads unbounded, and a non-positive
+// budget is refused because it can never hold a valid upload. Production
+// mode additionally REQUIRES both keys (see app.validateProductionConfig).
+func validateStaging(st StagingConfig) error {
+	dir := strings.TrimSpace(st.Dir)
+	if dir == "" && st.MaxBytes == 0 {
+		return nil
+	}
+	if dir == "" {
+		return fmt.Errorf("staging.dir is required when staging.max_bytes is set")
+	}
+	if st.MaxBytes <= 0 {
+		return fmt.Errorf("staging.max_bytes must be a positive byte budget when staging.dir is set, got %d", st.MaxBytes)
 	}
 	return nil
 }
@@ -543,6 +581,7 @@ func (c *Config) ApplyEnv() error {
 		{"KIWI_COMPONENT_REGISTRY_DIR", &c.Components.RegistryDir},
 		{"KIWI_COMPONENT_REMOTE", &c.Components.RemoteURL},
 		{"KIWI_COMPONENT_REMOTE_TOKEN", &c.Components.RemoteToken},
+		{"KIWI_STAGING_DIR", &c.Staging.Dir},
 	}
 	for _, e := range vars {
 		if v, ok := os.LookupEnv(e.name); ok {
@@ -564,6 +603,13 @@ func (c *Config) ApplyEnv() error {
 			return fmt.Errorf("KIWI_GITHUB_APP_ID: invalid integer %q", v)
 		}
 		c.GitHub.AppID = n
+	}
+	if v, ok := os.LookupEnv("KIWI_STAGING_MAX_BYTES"); ok {
+		n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		if err != nil {
+			return fmt.Errorf("KIWI_STAGING_MAX_BYTES: invalid integer %q", v)
+		}
+		c.Staging.MaxBytes = n
 	}
 	if v, ok := os.LookupEnv("KIWI_QUOTA_FAIL_OPEN"); ok {
 		b, err := strconv.ParseBool(v)
@@ -735,6 +781,17 @@ func (c *Config) OverrideFromFlags(fs *flag.FlagSet) error {
 			c.Components.RemoteURL = f.Value.String()
 		case "component-remote-token":
 			c.Components.RemoteToken = f.Value.String()
+		case "staging-dir":
+			c.Staging.Dir = f.Value.String()
+		case "staging-max-bytes":
+			if f.Value.String() != "" {
+				v, perr := strconv.ParseInt(f.Value.String(), 10, 64)
+				if perr != nil {
+					err = fmt.Errorf("--staging-max-bytes: %w", perr)
+				} else {
+					c.Staging.MaxBytes = v
+				}
+			}
 		case "repo-concurrency":
 			if perr := flagFloat(f, &c.Quota.RepoConcurrency); perr != nil {
 				err = perr

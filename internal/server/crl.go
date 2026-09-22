@@ -55,8 +55,14 @@ func (s *Server) loadCRL(dataDir string) error {
 	return nil
 }
 
-// persistCRL atomically writes the CRL to dataDir. Memory servers without
-// a data dir keep the revocation only in process memory.
+// persistCRL durably writes the CRL to dataDir through marshalJSONFile, i.e.
+// fsutil.AtomicWriteFile's unique temp file, checked file fsync/close, rename
+// and parent-directory fsync. An error means the revocation file is NOT
+// certified durable and must not be acknowledged. The FS-mode authoritative
+// revocation path does not use this mirror: runnerDisable carries the CRL in
+// the checked state snapshot and answers an opaque 503 when it cannot be
+// persisted (see runnerDisable). Memory servers without a data dir keep the
+// revocation only in process memory.
 func (s *Server) persistCRL() error {
 	if s.dataDir == "" {
 		return nil
@@ -70,7 +76,10 @@ func (s *Server) persistCRL() error {
 // it only after the store transaction committed the revocation, so a failure
 // here can never authorize a revoked certificate on this replica; the file
 // write is a dev-mode mirror and its failure is logged, never fatal (the
-// durable authority is the cert_revocations row). The caller must NOT hold
+// durable authority is the cert_revocations row). The write itself is the
+// same durable primitive as every other security-state file, so when it
+// succeeds the mirror survives a crash; the log-only failure policy is about
+// DB authority, not about the write's durability. The caller must NOT hold
 // s.mu.
 func (s *Server) mirrorRunnerCertRevoked(ri model.Runner) {
 	if ri.CertSerial == "" {

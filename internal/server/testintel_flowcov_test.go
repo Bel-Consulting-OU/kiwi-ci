@@ -430,13 +430,18 @@ func TestFlowTestintelUploadReportBranches(t *testing.T) {
 	if w := doJSONHeaders(t, s, http.MethodPost, path, "runner-tok", body, hdrs); w.Code != http.StatusCreated {
 		t.Fatalf("memory report = %d: %s", w.Code, w.Body.String())
 	}
-	// Memory persist failure.
+	// Memory persist failure. The body is a DIFFERENT report (a different
+	// case duration, hence a different synthesized delivery identity): the
+	// identical body would now be an idempotent replay of the report that
+	// just committed, so a fresh delivery is what exercises the failing
+	// persist path.
 	block := filepath.Join(t.TempDir(), "block")
 	if err := os.WriteFile(block, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	s.store.Root = block
-	if w := doJSONHeaders(t, s, http.MethodPost, path, "runner-tok", body, hdrs); w.Code != http.StatusInternalServerError {
+	persistBody := fcReportBody(jobID, model.TestResult{Name: "t1", Duration: 7, Passed: true})
+	if w := doJSONHeaders(t, s, http.MethodPost, path, "runner-tok", persistBody, hdrs); w.Code != http.StatusInternalServerError {
 		t.Fatalf("persist failure report = %d, want 500", w.Code)
 	}
 	_ = ctx

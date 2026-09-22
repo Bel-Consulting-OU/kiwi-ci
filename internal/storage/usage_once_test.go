@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
@@ -203,17 +204,15 @@ func TestSnapshotCompletionReceiptsSurviveFailedSave(t *testing.T) {
 		inject func() func()
 	}{
 		{"Sync", func() func() {
-			old := atomicFileSync
-			atomicFileSync = func(*os.File) error { return errors.New("injected sync failure") }
-			return func() { atomicFileSync = old }
+			return fsutil.SetHooks(fsutil.Hooks{FileSync: func(*os.File) error {
+				return errors.New("injected sync failure")
+			}})
 		}},
 		{"Close", func() func() {
-			old := atomicFileClose
-			atomicFileClose = func(f *os.File) error {
-				_ = old(f)
+			return fsutil.SetHooks(fsutil.Hooks{FileClose: func(f *os.File) error {
+				_ = fsutil.RealFileClose(f)
 				return errors.New("injected close failure")
-			}
-			return func() { atomicFileClose = old }
+			}})
 		}},
 	}
 	for _, fail := range preRename {
@@ -240,10 +239,11 @@ func TestSnapshotCompletionReceiptsSurviveFailedSave(t *testing.T) {
 	// The directory fsync fails AFTER the rename: Save reports an error (the
 	// rename is not yet guaranteed durable), but state.json must already be
 	// the complete new document.
-	oldDirSync := atomicDirSync
-	atomicDirSync = func(string) error { return errors.New("injected dir fsync failure") }
+	restoreDir := fsutil.SetHooks(fsutil.Hooks{DirSync: func(string) error {
+		return errors.New("injected dir fsync failure")
+	}})
 	err := repo.Save(Snapshot{Version: 1, CompletionReceipts: []CompletionReceiptRecord{first, second}})
-	atomicDirSync = oldDirSync
+	restoreDir()
 	if err == nil {
 		t.Fatal("dir fsync failure: Save succeeded, want error")
 	}

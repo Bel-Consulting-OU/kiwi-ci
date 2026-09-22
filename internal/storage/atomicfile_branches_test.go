@@ -4,6 +4,10 @@ package storage
 // fsync helper: an unwritable parent, a rename that cannot replace its
 // target, and a directory that cannot be opened. Every case asserts the
 // previous contents survive.
+//
+// The directory-fsync fault now injects through fsutil.SetHooks (the seam
+// moved to the shared primitive); the helper under test is storage.SyncDir,
+// which delegates to fsutil.SyncDir.
 
 import (
 	"errors"
@@ -11,6 +15,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 )
 
 // TestAtomicWriteFileUnwritableParent: when the parent path cannot be created
@@ -54,9 +60,10 @@ func TestAtomicWriteFileRenameOntoNonEmptyDirectory(t *testing.T) {
 func TestAtomicWriteFileParentDirErrorIsReturned(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")
-	old := atomicDirSync
-	atomicDirSync = func(string) error { return errors.New("parent fsync failed") }
-	t.Cleanup(func() { atomicDirSync = old })
+	restore := fsutil.SetHooks(fsutil.Hooks{DirSync: func(string) error {
+		return errors.New("parent fsync failed")
+	}})
+	t.Cleanup(restore)
 	err := AtomicWriteFile(path, []byte("v1"), 0o600)
 	if err == nil {
 		t.Fatal("failing parent fsync was ignored")
@@ -72,15 +79,12 @@ func TestAtomicWriteFileParentDirErrorIsReturned(t *testing.T) {
 	assertNoScratchFiles(t, dir, "state.json")
 }
 
-// TestSyncDirMissingDirectory: SyncDir and syncDir both report an
-// unopenable directory instead of silently claiming durability.
+// TestSyncDirMissingDirectory: SyncDir reports an unopenable directory
+// instead of silently claiming durability.
 func TestSyncDirMissingDirectory(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "absent")
 	if err := SyncDir(missing); err == nil {
 		t.Fatal("SyncDir on a missing directory succeeded")
-	}
-	if err := syncDir(missing); err == nil {
-		t.Fatal("syncDir on a missing directory succeeded")
 	}
 	// A real directory syncs cleanly.
 	if err := SyncDir(t.TempDir()); err != nil {

@@ -296,9 +296,13 @@ var persistEnrollGrantsFunc = func(s *Server) error {
 	return marshalJSONFile(filepath.Join(s.dataDir, enrollGrantsFile), s.EnrollGrants)
 }
 
-// persistEnrollGrants atomically writes the grant state to dataDir
-// (digest-keyed only). Memory servers without a data dir keep grants in
-// process memory.
+// persistEnrollGrants durably writes the grant state to dataDir
+// (digest-keyed only) through marshalJSONFile, i.e. fsutil.AtomicWriteFile's
+// unique temp file, checked file fsync/close, rename and parent-directory
+// fsync. An error means the grant mutation is NOT certified durable: the mint
+// path returns no token and rolls the new grant back, and the consume path
+// restores the unused grant and refuses to sign a certificate. Memory servers
+// without a data dir keep grants in process memory.
 func (s *Server) persistEnrollGrants() error {
 	return persistEnrollGrantsFunc(s)
 }

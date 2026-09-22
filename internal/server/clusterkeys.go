@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runnerpki"
 )
 
@@ -317,7 +318,7 @@ func (s *FSClusterKeyStore) LoadOrCreate(kind string) ([]byte, error) {
 		if kind == clusterKindCacheSigning {
 			pubPath = filepath.Join(s.Dir, cacheSigningPubFile)
 		}
-		if perr := writeFileAtomic(pubPath, pub, 0o644); perr != nil {
+		if perr := fsutil.AtomicWriteFile(pubPath, pub, 0o644); perr != nil {
 			return nil, perr
 		}
 	}
@@ -382,7 +383,7 @@ func (s *FSClusterKeyStore) InstallOrLoad(kind string, data []byte) ([]byte, boo
 		if kind == clusterKindCacheSigning {
 			pubPath = filepath.Join(s.Dir, cacheSigningPubFile)
 		}
-		if perr := writeFileAtomic(pubPath, pubPEM, 0o644); perr != nil {
+		if perr := fsutil.AtomicWriteFile(pubPath, pubPEM, 0o644); perr != nil {
 			return nil, false, perr
 		}
 	}
@@ -489,7 +490,7 @@ func (s *FSClusterKeyStore) Lookup(kind string) ([]byte, bool, error) {
 			}
 			return nil, false, lerr
 		}
-		if werr := writeFileAtomic(p, legacy, 0o600); werr != nil {
+		if werr := fsutil.AtomicWriteFile(p, legacy, 0o600); werr != nil {
 			return nil, false, werr
 		}
 		return legacy, true, nil
@@ -566,11 +567,11 @@ func (s *FSClusterKeyStore) Store(kind string, data []byte) error {
 		if err != nil {
 			return err
 		}
-		return writeFileAtomic(p, []byte(hex.EncodeToString(data)), 0o600)
+		return fsutil.AtomicWriteFile(p, []byte(hex.EncodeToString(data)), 0o600)
 	case clusterKindOIDC:
-		return writeFileAtomic(filepath.Join(s.Dir, oidcKeyRingFile), data, 0o600)
+		return fsutil.AtomicWriteFile(filepath.Join(s.Dir, oidcKeyRingFile), data, 0o600)
 	case clusterKindProvenance:
-		if err := writeFileAtomic(filepath.Join(s.Dir, "provenance.key"), data, 0o600); err != nil {
+		if err := fsutil.AtomicWriteFile(filepath.Join(s.Dir, "provenance.key"), data, 0o600); err != nil {
 			return err
 		}
 		priv, err := parseEd25519PrivatePEM(data)
@@ -581,9 +582,9 @@ func (s *FSClusterKeyStore) Store(kind string, data []byte) error {
 		if err != nil {
 			return err
 		}
-		return writeFileAtomic(filepath.Join(s.Dir, "provenance.pub"), pub, 0o644)
+		return fsutil.AtomicWriteFile(filepath.Join(s.Dir, "provenance.pub"), pub, 0o644)
 	case clusterKindCacheSigning:
-		if err := writeFileAtomic(filepath.Join(s.Dir, cacheSigningKeyFile), data, 0o600); err != nil {
+		if err := fsutil.AtomicWriteFile(filepath.Join(s.Dir, cacheSigningKeyFile), data, 0o600); err != nil {
 			return err
 		}
 		priv, err := parseEd25519PrivatePEM(data)
@@ -594,13 +595,13 @@ func (s *FSClusterKeyStore) Store(kind string, data []byte) error {
 		if err != nil {
 			return err
 		}
-		return writeFileAtomic(filepath.Join(s.Dir, cacheSigningPubFile), pub, 0o644)
+		return fsutil.AtomicWriteFile(filepath.Join(s.Dir, cacheSigningPubFile), pub, 0o644)
 	case clusterKindRunnerCA:
 		if err := createFileCAS(filepath.Join(s.Dir, runnerCAObjectFile), data); err != nil {
 			if errors.Is(err, os.ErrExist) {
 				// The object already exists: overwrite semantics need the
 				// explicit Store path, which the CAS link cannot provide.
-				if werr := writeFileAtomic(filepath.Join(s.Dir, runnerCAObjectFile), data, 0o600); werr != nil {
+				if werr := fsutil.AtomicWriteFile(filepath.Join(s.Dir, runnerCAObjectFile), data, 0o600); werr != nil {
 					return werr
 				}
 			} else {
@@ -622,10 +623,10 @@ func (s *FSClusterKeyStore) publishRunnerCASidecars(obj []byte) error {
 	if err != nil {
 		return err
 	}
-	if err := writeFileAtomic(filepath.Join(s.Dir, "ca.crt"), certPEM, 0o644); err != nil {
+	if err := fsutil.AtomicWriteFile(filepath.Join(s.Dir, "ca.crt"), certPEM, 0o644); err != nil {
 		return err
 	}
-	return writeFileAtomic(filepath.Join(s.Dir, "ca.key"), keyPEM, 0o600)
+	return fsutil.AtomicWriteFile(filepath.Join(s.Dir, "ca.key"), keyPEM, 0o600)
 }
 
 // ---------------------------------------------------------------------------

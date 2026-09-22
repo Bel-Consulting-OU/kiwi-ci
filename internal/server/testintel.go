@@ -2,6 +2,8 @@ package server
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -27,7 +29,9 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 		// stable, content-derived name the runner computes for this report;
 		// ContentDigest is optional and, when present, must equal the digest
 		// the server computes from the bytes it received. A request without a
-		// delivery ID keeps the legacy per-request behavior.
+		// delivery ID gets a server-synthesized deterministic identity
+		// (synthesizedReportDeliveryID) after the lease is verified, so even
+		// a legacy client's dropped-response resend is idempotent.
 		DeliveryID    string          `json:"delivery_id"`
 		ContentDigest string          `json:"content_digest"`
 		Report        json.RawMessage `json:"report"`
@@ -88,8 +92,17 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 	}
 	// The delivery key is scoped to the AUTHORITATIVE job/lease generation
 	// from the verified lease, never to client-supplied values, so a replay
-	// can never be re-attributed to another job or generation.
-	delivery := storage.TestReportDelivery{JobID: j.ID, LeaseGeneration: j.LeaseGeneration, DeliveryID: in.DeliveryID, ContentDigest: digest}
+	// can never be re-attributed to another job or generation. A client that
+	// omitted delivery_id still gets a delivery identity: the synthesized one
+	// binds the verified job/lease generation and the server-computed content
+	// digest, so the dropped-response resend of an OLDER client converges on
+	// exactly one report and one history fold instead of inserting a second
+	// report and re-folding history.
+	deliveryID := in.DeliveryID
+	if deliveryID == "" {
+		deliveryID = synthesizedReportDeliveryID(j.ID, j.LeaseGeneration, digest)
+	}
+	delivery := storage.TestReportDelivery{JobID: j.ID, LeaseGeneration: j.LeaseGeneration, DeliveryID: deliveryID, ContentDigest: digest}
 	// The report's history key is the run's canonical repository identity.
 	// The authoritative lookup is never best-effort: a failed or missing run
 	// fails the upload closed BEFORE the durable report insert and the
@@ -101,74 +114,57 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 	}
 	repo := repoIDForRun(run)
 	// The durable report and the test-history aggregates commit in ONE
-	// transaction: an aggregate-store upload writes the report, folds ONLY
-	// this report's cases into the per-repository aggregates, records the
-	// delivery receipt and bumps the repository version atomically, so
-	// per-upload work never grows with the accumulated history, a canceled
-	// request commits nothing, and a replay of the same delivery is an
-	// idempotent success that changes nothing. Legacy stores without the
-	// delivery contract fall back to the non-idempotent insert path.
+	// transaction: the delivery store writes the report, folds ONLY this
+	// report's cases into the per-repository aggregates, records the delivery
+	// receipt and bumps the repository version atomically, so per-upload work
+	// never grows with the accumulated history, a canceled request commits
+	// nothing, and a replay of the same delivery is an idempotent success
+	// that changes nothing. The non-idempotent aggregate/store fallbacks are
+	// GONE: a configured store without the delivery contract cannot
+	// deduplicate a replayed upload, so it is refused with an opaque 503
+	// instead of double-inserting the report and re-folding history.
 	if s.DB != nil {
-		agg, isAgg := s.DB.(storage.TestHistoryAggregateStore)
-		if ds, isDelivery := s.DB.(storage.TestReportDeliveryStore); isAgg && isDelivery {
-			outcome, err := ds.InsertTestReportWithHistoryDelivery(r.Context(), rep, repo, delivery)
-			switch {
-			case errors.Is(err, storage.ErrTestReportDeliveryConflict):
-				// Same delivery identity, different payload: the stored
-				// report and history are untouched and the retry is refused
-				// explicitly instead of silently discarded.
-				http.Error(w, "test report delivery conflict: delivery_id was already used with different content", http.StatusConflict)
-				return
-			case err != nil:
-				s.internalError(w, r, err, "")
-				return
-			}
-			rep.ID = outcome.ReportID
-			if outcome.Replay {
-				// Idempotent success: the original report already committed,
-				// its history was folded once, and this retry must not
-				// re-observe metrics or audit twice.
-				writeJSON(w, http.StatusOK, rep)
-				return
-			}
-			s.observeTestReportMetrics(rep)
-			// Mark the cached snapshot stale; the next read reloads the
-			// repository's freshly committed durable aggregates.
-			s.mirrorTestReportHistoryDB(repo)
-			s.auditLocked("tests.uploaded", in.RunnerID, j.RunID, j.ID, "test report uploaded", map[string]string{"job": j.Key, "tests": strconv.Itoa(rep.Tests), "failures": strconv.Itoa(rep.Failures)})
-			writeJSON(w, http.StatusCreated, rep)
+		ds, isDelivery := s.DB.(storage.TestReportDeliveryStore)
+		if !isDelivery {
+			http.Error(w, "test report delivery storage is unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		if isAgg {
-			if _, err := agg.InsertTestReportWithHistory(r.Context(), rep, repo); err != nil {
-				s.internalError(w, r, err, "")
-				return
-			}
-			s.observeTestReportMetrics(rep)
-			s.mirrorTestReportHistoryDB(repo)
-			s.auditLocked("tests.uploaded", in.RunnerID, j.RunID, j.ID, "test report uploaded", map[string]string{"job": j.Key, "tests": strconv.Itoa(rep.Tests), "failures": strconv.Itoa(rep.Failures)})
-			writeJSON(w, http.StatusCreated, rep)
+		outcome, err := ds.InsertTestReportWithHistoryDelivery(r.Context(), rep, repo, delivery)
+		switch {
+		case errors.Is(err, storage.ErrTestReportDeliveryConflict):
+			// Same delivery identity, different payload: the stored
+			// report and history are untouched and the retry is refused
+			// explicitly instead of silently discarded.
+			http.Error(w, "test report delivery conflict: delivery_id was already used with different content", http.StatusConflict)
 			return
-		}
-		if err := s.DB.InsertTestReport(r.Context(), rep); err != nil {
+		case err != nil:
 			s.internalError(w, r, err, "")
 			return
 		}
+		rep.ID = outcome.ReportID
+		if outcome.Replay {
+			// Idempotent success: the original report already committed,
+			// its history was folded once, and this retry must not
+			// re-observe metrics or audit twice.
+			writeJSON(w, http.StatusOK, rep)
+			return
+		}
 		s.observeTestReportMetrics(rep)
-		s.recordTestReportHistory(r.Context(), repo, rep)
+		// Mark the cached snapshot stale; the next read reloads the
+		// repository's freshly committed durable aggregates.
+		s.mirrorTestReportHistoryDB(repo)
 		s.auditLocked("tests.uploaded", in.RunnerID, j.RunID, j.ID, "test report uploaded", map[string]string{"job": j.Key, "tests": strconv.Itoa(rep.Tests), "failures": strconv.Itoa(rep.Failures)})
 		writeJSON(w, http.StatusCreated, rep)
 		return
 	}
-	// Memory/fs mode has no store transaction, so the delivery identity is
-	// bound into a deterministic report ID: the same delivery maps to the
-	// same record and a retry can never duplicate it (it either overwrites
-	// nothing on replay or is refused as a conflict). The digest conflict is
-	// detected by comparing the client-authored report content, because
-	// there is no delivery table to hold the digest.
-	if delivery.DeliveryID != "" {
-		rep.ID = testintel.DeliveryReportID(delivery.DeliveryID)
-	}
+	// Memory/fs mode has no store transaction, so the delivery identity
+	// (client-supplied or synthesized above) is ALWAYS bound into a
+	// deterministic report ID: the same delivery maps to the same record and
+	// a retry can never duplicate it (it either overwrites nothing on replay
+	// or is refused as a conflict). The digest conflict is detected by
+	// comparing the client-authored report content, because there is no
+	// delivery table to hold the digest.
+	rep.ID = testintel.DeliveryReportID(delivery.DeliveryID)
 	s.mu.Lock()
 	if existing, ok := s.reports[rep.ID]; ok {
 		s.mu.Unlock()
@@ -232,6 +228,35 @@ func (s *Server) observeTestReportMetrics(rep model.TestReport) {
 	for _, c := range rep.Cases {
 		s.metricObserve("kiwi_test_duration_seconds", c.Duration, nil)
 	}
+}
+
+// synthesizedReportDeliveryID derives the deterministic delivery identity of
+// a report upload whose client omitted delivery_id: the hex SHA-256 of
+//
+//	"legacy-report" \x00 jobID \x00 leaseGeneration \x00 contentDigest
+//
+// Every part is length-delimited by a NUL byte so the parts can never be
+// confused for one another, and the "legacy-report" namespace keeps the
+// synthesized identity disjoint from the runner-derived one
+// (testintel.ReportDeliveryID). It is computed AFTER the lease is verified
+// and from the SERVER-computed digest, so:
+//
+//   - a resend of the identical bytes after a lost response resolves to the
+//     same delivery and is an idempotent replay (one report, one fold, one
+//     metrics observation, one audit event);
+//   - different bytes under the same lease are a different delivery, never a
+//     spurious conflict;
+//   - a replay can never be re-attributed to another job or lease generation.
+func synthesizedReportDeliveryID(jobID string, leaseGeneration int64, contentDigest string) string {
+	h := sha256.New()
+	h.Write([]byte("legacy-report"))
+	h.Write([]byte{0})
+	h.Write([]byte(jobID))
+	h.Write([]byte{0})
+	h.Write([]byte(strconv.FormatInt(leaseGeneration, 10)))
+	h.Write([]byte{0})
+	h.Write([]byte(contentDigest))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // reportContentView is the client-authored part of a report. Server-assigned
@@ -300,8 +325,12 @@ func (s *Server) listTestReports(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// testHistoryRepoResolveLimit bounds how many canonical repository IDs one
-// test-intelligence query may resolve to (deterministic id order).
+// testHistoryRepoResolveLimit bounds the supported AMBIGUITY of a
+// test-intelligence query. A canonical (forge-scoped) repository ID is an
+// exact identity and is never capped; a bare owner/name may address one
+// repository per forge, so at most this many distinct canonical repositories
+// are accepted and an over-limit query is refused with an opaque 409 instead
+// of being answered with an arbitrary first `limit` candidates.
 const testHistoryRepoResolveLimit = 64
 
 // testHistoryFlakyLimit bounds the flaky-test list returned by
@@ -342,9 +371,40 @@ func (s *Server) testIntelligence(w http.ResponseWriter, r *http.Request) {
 		// BEFORE any aggregate read, then read ONLY the authorized
 		// repositories' aggregates and report totals. Unrelated reports are
 		// never materialized and their payloads are never parsed.
+		//
+		// The principal's explicitly permitted canonical identities are
+		// intersected with candidate discovery BEFORE the ambiguity cap: an
+		// authorized repository that would sort after a bare-name cap is
+		// therefore still resolved (pre-fix it was silently invisible to its
+		// own owner). An over-limit bare name is refused explicitly, never
+		// truncated.
 		if agg, ok := s.DB.(storage.TestHistoryAggregateStore); ok {
-			ids, err := agg.ResolveTestHistoryRepoIDs(r.Context(), repo, testHistoryRepoResolveLimit)
+			permitted := s.testHistoryPermittedRepoIDs(r, repo)
+			var (
+				ids []string
+				err error
+			)
+			if scoped, ok := s.DB.(storage.TestHistoryRepoResolutionStore); ok {
+				ids, err = scoped.ResolveTestHistoryRepoIDsScoped(r.Context(), repo, permitted, testHistoryRepoResolveLimit)
+			} else {
+				// Legacy resolution contract: intersect in the caller. The
+				// bare-name ambiguity limit still fails closed, so an
+				// authorized repository beyond the cap is refused (opaque
+				// 409) rather than silently omitted.
+				ids, err = agg.ResolveTestHistoryRepoIDs(r.Context(), repo, testHistoryRepoResolveLimit)
+				if err == nil {
+					ids = intersectTestHistoryRepoIDs(ids, permitted)
+				}
+			}
 			if err != nil {
+				if errors.Is(err, storage.ErrRepoQueryAmbiguous) {
+					// Opaque: the query addresses more canonical
+					// repositories than a bare name can resolve
+					// unambiguously. The caller re-addresses the repository
+					// by its forge-scoped canonical ID.
+					http.Error(w, "repository query is ambiguous: use the forge-scoped canonical repository ID (host/owner/name)", http.StatusConflict)
+					return
+				}
 				s.internalError(w, r, err, "")
 				return
 			}
@@ -468,6 +528,96 @@ func (s *Server) authorizedTestHistoryRepoIDs(r *http.Request, ids []string) []s
 		}
 	}
 	return authorized
+}
+
+// splitForgeRepoKey splits a repository query or grant key into its bare
+// owner/name and, when the first segment is host-like (it contains a dot and
+// is followed by an owner/name remainder), its forge host. It mirrors auth's
+// unexported splitCanonicalRepo so the server classifies canonical IDs
+// exactly like the authorization layer and the storage resolver.
+func splitForgeRepoKey(key string) (host, bare string, hasHost bool) {
+	parts := strings.SplitN(key, "/", 2)
+	if len(parts) != 2 || !strings.Contains(parts[0], ".") || !strings.Contains(parts[1], "/") {
+		return "", key, false
+	}
+	return parts[0], parts[1], true
+}
+
+// testHistoryPermittedRepoIDs returns the canonical repository identities the
+// request's principal is explicitly granted AND that the query addresses. A
+// nil result means candidate resolution must NOT be identity-restricted:
+// either no principal is bound (legacy mode/web-session tier, already decided
+// by the outer gate), or the principal holds a global read/admin role, or a
+// grant is keyed by the bare owner/name — which authorizes EVERY forge
+// presenting that name and therefore cannot be enumerated as canonical
+// identities. A non-nil result is the exact permitted intersection —
+// possibly empty — that resolution must apply BEFORE its ambiguity cap, so an
+// authorized repository that sorts after a bare-name cap is still reachable.
+func (s *Server) testHistoryPermittedRepoIDs(r *http.Request, query string) []string {
+	p, ok := auth.PrincipalFrom(r)
+	if !ok {
+		return nil
+	}
+	if p.Has(auth.RoleAdmin) || p.Has(auth.RoleRead) {
+		return nil
+	}
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil
+	}
+	// Canonicalize exactly like the authorization layer: the host is
+	// normalized, and a query that already carries this host is reduced to
+	// its bare remainder.
+	canonicalQuery := auth.CanonicalRepoID("", query)
+	_, queryBare, queryHasHost := splitForgeRepoKey(canonicalQuery)
+	permitted := []string{}
+	for key := range p.Repositories {
+		normalized := auth.NormalizeRepoKey(strings.TrimSpace(key))
+		if normalized == "" {
+			continue
+		}
+		_, bare, hasHost := splitForgeRepoKey(normalized)
+		if !hasHost {
+			if normalized == queryBare {
+				// A bare grant authorizes every forge presenting the name:
+				// the permitted identity set is not enumerable, so keep the
+				// unrestricted resolution (and its ambiguity refusal).
+				return nil
+			}
+			continue
+		}
+		if queryHasHost {
+			if normalized != canonicalQuery {
+				continue
+			}
+		} else if bare != queryBare {
+			continue
+		}
+		if auth.CanReadRepo(p, normalized) {
+			permitted = append(permitted, normalized)
+		}
+	}
+	return permitted
+}
+
+// intersectTestHistoryRepoIDs keeps the resolved candidate IDs inside the
+// permitted set. A nil permitted set is no restriction: the candidates are
+// returned unchanged (the caller still authorizes every ID individually).
+func intersectTestHistoryRepoIDs(ids, permitted []string) []string {
+	if permitted == nil {
+		return ids
+	}
+	allowed := make(map[string]bool, len(permitted))
+	for _, id := range permitted {
+		allowed[id] = true
+	}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if allowed[id] {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // runMatchesRepoQuery reports whether a test-intelligence query addresses a

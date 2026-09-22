@@ -327,12 +327,23 @@ func ActionFor(method, path string) (Action, string, bool) {
 				if method == "POST" {
 					return ActionRerun, "", true
 				}
-			case "jobs", "logs", "tests", "deployments", "snapshots":
-				// snapshots at this depth is the metadata LISTING
-				// (manifests only) and stays read tier; the archive
-				// download below is admin tier.
+			case "jobs", "logs", "tests", "deployments":
 				if method == "GET" {
 					return ActionRead, "", true
+				}
+			case "snapshots":
+				// GET /api/v1/runs/{id}/snapshots is the snapshot record
+				// LISTING: every record carries the workspace manifest
+				// (file names, modes, sizes, SHA-256), the manifest root
+				// digest and the archive digest — an inventory of the
+				// private workspace archive (checkout, generated and
+				// secret-derived files). That is the same class of data as
+				// the archive download below, so the listing is admin tier
+				// too: ActionAdmin scoped by the handler to the run's
+				// canonical repository. A repository read grant (or
+				// artifact_read) never satisfies it.
+				if method == "GET" {
+					return ActionAdmin, "", true
 				}
 			case "artifacts":
 				if method == "GET" {

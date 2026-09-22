@@ -538,6 +538,13 @@ type DeploymentStore interface {
 // SnapshotStore is the durable workspace snapshot record contract.
 type SnapshotStore interface {
 	InsertSnapshotRecord(ctx context.Context, rec model.SnapshotRecord) error
+	// GetSnapshot resolves one record of runID by its id through a
+	// (run_id, id) lookup. The bool reports whether the record exists; a
+	// record of another run is reported as missing, so the download route
+	// can never serve a cross-run snapshot. Implementations must not list
+	// and scan the run's records: that read is O(records per run) for a
+	// request that needs exactly one (see postgres_snapshot_get.go).
+	GetSnapshot(ctx context.Context, runID, snapshotID string) (model.SnapshotRecord, bool, error)
 	ListSnapshotsByRun(ctx context.Context, runID string) ([]model.SnapshotRecord, error)
 }
 

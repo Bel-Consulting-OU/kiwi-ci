@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/supplychain"
@@ -201,12 +202,20 @@ func TestSqueezeSBOMFSModeEdges(t *testing.T) {
 	t.Run("sidecar write failure", func(t *testing.T) {
 		s, hdrs := fcMemoryBlobServer(t)
 		fcSeedContract(s, "job-a", storage.ArtifactContract{Name: "bin", Paths: []string{"out/"}, SBOM: "spdx-json"})
+		// Fault adaptation: the durable writer now uses a UNIQUE temp file,
+		// so a stale "<target>.tmp" directory is inert by design. The sidecar
+		// write failure is injected precisely at the fsutil rename into the
+		// digest-qualified target, which is the actual durability step.
 		dir := filepath.Join(s.store.Root, "artifacts", "run-c", "job-a")
-		tmp := artifactSidecarPath(dir, 5, "bin", "sbom", sha256Hex([]byte(validSPDX))) + ".tmp"
-		if err := os.MkdirAll(tmp, 0o700); err != nil {
-			t.Fatal(err)
-		}
+		target := artifactSidecarPath(dir, 5, "bin", "sbom", sha256Hex([]byte(validSPDX)))
+		restore := fsutil.SetHooks(fsutil.Hooks{Rename: func(oldpath, newpath string) error {
+			if newpath == target {
+				return errors.New("injected sidecar rename failure")
+			}
+			return fsutil.RealRename(oldpath, newpath)
+		}})
 		w := doJSONHeaders(t, s, http.MethodPut, "/api/v1/jobs/job-a/artifacts/bin.sbom", "runner-tok", validSPDX, hdrs)
+		restore()
 		if w.Code != http.StatusInternalServerError {
 			t.Fatalf("sbom sidecar write failure = %d, want 500: %s", w.Code, w.Body.String())
 		}
@@ -298,12 +307,19 @@ func TestSqueezeSigstoreUploadEdges(t *testing.T) {
 		s, hdrs := fcMemoryBlobServer(t)
 		fcSeedContract(s, "job-a", storage.ArtifactContract{Name: "bin", Paths: []string{"out/"}, SigstoreIssuer: "i", SigstoreIdentity: "id"})
 		pinSigstoreRoot(s, "key-1", make([]byte, 32))
+		// Fault adaptation: see the SBOM sidecar write failure above; the
+		// unique temp name makes the legacy "<target>.tmp" injection inert,
+		// so the rename into the digest-qualified target is failed instead.
 		dir := filepath.Join(s.store.Root, "artifacts", "run-c", "job-a")
-		tmp := artifactSidecarPath(dir, 5, "bin", "sigstore", sha256Hex([]byte("{}"))) + ".tmp"
-		if err := os.MkdirAll(tmp, 0o700); err != nil {
-			t.Fatal(err)
-		}
+		target := artifactSidecarPath(dir, 5, "bin", "sigstore", sha256Hex([]byte("{}")))
+		restore := fsutil.SetHooks(fsutil.Hooks{Rename: func(oldpath, newpath string) error {
+			if newpath == target {
+				return errors.New("injected sidecar rename failure")
+			}
+			return fsutil.RealRename(oldpath, newpath)
+		}})
 		w := doJSONHeaders(t, s, http.MethodPut, "/api/v1/jobs/job-a/artifacts/bin.sigstore", "runner-tok", "{}", hdrs)
+		restore()
 		if w.Code != http.StatusInternalServerError {
 			t.Fatalf("sigstore write failure = %d, want 500: %s", w.Code, w.Body.String())
 		}

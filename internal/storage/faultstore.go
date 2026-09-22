@@ -136,48 +136,52 @@ func errMissingInnerInterface(iface string) error {
 var _ Store = (*FaultyStore)(nil)
 
 var (
-	_ OutboxStore               = (*FaultyStore)(nil)
-	_ OutboxDeadLetterStore     = (*FaultyStore)(nil)
-	_ ForgeCheckStateStore      = (*FaultyStore)(nil)
-	_ ScheduleStore             = (*FaultyStore)(nil)
-	_ DeploymentStore           = (*FaultyStore)(nil)
-	_ SnapshotStore             = (*FaultyStore)(nil)
-	_ ArtifactContractStore     = (*FaultyStore)(nil)
-	_ QueueReasonStore          = (*FaultyStore)(nil)
-	_ DynamicStore              = (*FaultyStore)(nil)
-	_ DynamicStoreTx            = (*FaultyStore)(nil)
-	_ DownstreamStore           = (*FaultyStore)(nil)
-	_ UsageStore                = (*FaultyStore)(nil)
-	_ UsageOnceStore            = (*FaultyStore)(nil)
-	_ RunDownstreamStore        = (*FaultyStore)(nil)
-	_ DownstreamParentRunStore  = (*FaultyStore)(nil)
-	_ ArtifactLookupStore       = (*FaultyStore)(nil)
-	_ RunnerJobStore            = (*FaultyStore)(nil)
-	_ RunEnqueueStore           = (*FaultyStore)(nil)
-	_ AtomicLeaseStore          = (*FaultyStore)(nil)
-	_ QuotaCounterStore         = (*FaultyStore)(nil)
-	_ CacheManifestStore        = (*FaultyStore)(nil)
-	_ ArtifactSidecarStore      = (*FaultyStore)(nil)
-	_ SecretClaimStore          = (*FaultyStore)(nil)
-	_ SecretClaimReleaser       = (*FaultyStore)(nil)
-	_ ProfileStore              = (*FaultyStore)(nil)
-	_ RunnerTokenStore          = (*FaultyStore)(nil)
-	_ CertRevocationStore       = (*FaultyStore)(nil)
-	_ EnrollGrantStore          = (*FaultyStore)(nil)
-	_ TestHistoryStore          = (*FaultyStore)(nil)
-	_ TestHistoryAggregateStore = (*FaultyStore)(nil)
-	_ TestReportDeliveryStore   = (*FaultyStore)(nil)
-	_ RunnerDisableStore        = (*FaultyStore)(nil)
-	_ ResourceReservationStore  = (*FaultyStore)(nil)
-	_ ArtifactIdempotentStore   = (*FaultyStore)(nil)
-	_ GeneratedFragmentStore    = (*FaultyStore)(nil)
-	_ RecoveryStore             = (*FaultyStore)(nil)
-	_ RecoveryScanStore         = (*FaultyStore)(nil)
-	_ OutboxClaimBatchStore     = (*FaultyStore)(nil)
-	_ LeaderFenceStore          = (*FaultyStore)(nil)
-	_ RunPageStore              = (*FaultyStore)(nil)
-	_ RunnerProfileLinkStore    = (*FaultyStore)(nil)
-	_ LiveProfileResolver       = (*FaultyStore)(nil)
+	_ OutboxStore                    = (*FaultyStore)(nil)
+	_ OutboxDeadLetterStore          = (*FaultyStore)(nil)
+	_ ForgeCheckStateStore           = (*FaultyStore)(nil)
+	_ ScheduleStore                  = (*FaultyStore)(nil)
+	_ DeploymentStore                = (*FaultyStore)(nil)
+	_ SnapshotStore                  = (*FaultyStore)(nil)
+	_ SnapshotPageStore              = (*FaultyStore)(nil)
+	_ ArtifactContractStore          = (*FaultyStore)(nil)
+	_ QueueReasonStore               = (*FaultyStore)(nil)
+	_ DynamicStore                   = (*FaultyStore)(nil)
+	_ DynamicStoreTx                 = (*FaultyStore)(nil)
+	_ DownstreamStore                = (*FaultyStore)(nil)
+	_ UsageStore                     = (*FaultyStore)(nil)
+	_ UsageOnceStore                 = (*FaultyStore)(nil)
+	_ RunDownstreamStore             = (*FaultyStore)(nil)
+	_ DownstreamParentRunStore       = (*FaultyStore)(nil)
+	_ ArtifactLookupStore            = (*FaultyStore)(nil)
+	_ RunnerJobStore                 = (*FaultyStore)(nil)
+	_ RunEnqueueStore                = (*FaultyStore)(nil)
+	_ AtomicLeaseStore               = (*FaultyStore)(nil)
+	_ QuotaCounterStore              = (*FaultyStore)(nil)
+	_ CacheManifestStore             = (*FaultyStore)(nil)
+	_ ArtifactSidecarStore           = (*FaultyStore)(nil)
+	_ SecretClaimStore               = (*FaultyStore)(nil)
+	_ SecretClaimReleaser            = (*FaultyStore)(nil)
+	_ ProfileStore                   = (*FaultyStore)(nil)
+	_ RunnerTokenStore               = (*FaultyStore)(nil)
+	_ CertRevocationStore            = (*FaultyStore)(nil)
+	_ EnrollGrantStore               = (*FaultyStore)(nil)
+	_ TestHistoryStore               = (*FaultyStore)(nil)
+	_ TestHistoryAggregateStore      = (*FaultyStore)(nil)
+	_ TestHistoryRepoResolutionStore = (*FaultyStore)(nil)
+	_ TestReportDeliveryStore        = (*FaultyStore)(nil)
+	_ RunnerDisableStore             = (*FaultyStore)(nil)
+	_ ResourceReservationStore       = (*FaultyStore)(nil)
+	_ ArtifactIdempotentStore        = (*FaultyStore)(nil)
+	_ GeneratedFragmentStore         = (*FaultyStore)(nil)
+	_ RecoveryStore                  = (*FaultyStore)(nil)
+	_ RecoveryScanStore              = (*FaultyStore)(nil)
+	_ OutboxClaimBatchStore          = (*FaultyStore)(nil)
+	_ LeaderFenceStore               = (*FaultyStore)(nil)
+	_ RunPageStore                   = (*FaultyStore)(nil)
+	_ RunPageForPrincipalStore       = (*FaultyStore)(nil)
+	_ RunRepoIDStore                 = (*FaultyStore)(nil)
+	_ RunnerProfileLinkStore         = (*FaultyStore)(nil)
+	_ LiveProfileResolver            = (*FaultyStore)(nil)
 )
 
 func (f *FaultyStore) Close() error { return f.Inner.Close() }
@@ -218,6 +222,31 @@ func (f *FaultyStore) ListRunsPage(ctx context.Context, afterCreatedAt time.Time
 		return RunPage{}, errMissingInnerInterface("RunPageStore")
 	}
 	return inner.ListRunsPage(ctx, afterCreatedAt, afterID, limit)
+}
+
+// ListRunsPageForAuthorizedRepos delegates the authorized keyset-paged run
+// read to Inner when it implements RunPageForPrincipalStore, and fails
+// closed with a diagnosable capability error otherwise. Like ListRunsPage it
+// is a READ: the FailAfter mutation counter is never consumed.
+func (f *FaultyStore) ListRunsPageForAuthorizedRepos(ctx context.Context, allowedRepoIDs []string, afterCreatedAt time.Time, afterID string, limit int) (RunPage, error) {
+	inner, ok := f.Inner.(RunPageForPrincipalStore)
+	if !ok {
+		return RunPage{}, errMissingInnerInterface("RunPageForPrincipalStore")
+	}
+	return inner.ListRunsPageForAuthorizedRepos(ctx, allowedRepoIDs, afterCreatedAt, afterID, limit)
+}
+
+// ListRunRepoIDs delegates the candidate repository enumeration to Inner when
+// it implements RunRepoIDStore, and fails closed with a diagnosable
+// capability error otherwise (a store that cannot enumerate candidates cannot
+// resolve an exact authorized repository set, so the collection must not be
+// served from it).
+func (f *FaultyStore) ListRunRepoIDs(ctx context.Context) ([]string, error) {
+	inner, ok := f.Inner.(RunRepoIDStore)
+	if !ok {
+		return nil, errMissingInnerInterface("RunRepoIDStore")
+	}
+	return inner.ListRunRepoIDs(ctx)
 }
 
 func (f *FaultyStore) InsertJob(ctx context.Context, job model.Job) error {
@@ -894,6 +923,28 @@ func (f *FaultyStore) ListSnapshotsByRun(ctx context.Context, runID string) ([]m
 		return nil, errMissingInnerInterface("SnapshotStore")
 	}
 	return inner.ListSnapshotsByRun(ctx, runID)
+}
+
+// GetSnapshot forwards the single-record lookup to the wrapped store's
+// SnapshotStore. Reads never inject the fault: the fault models mutation
+// failures, and a download must still observe the store's real answer.
+func (f *FaultyStore) GetSnapshot(ctx context.Context, runID, snapshotID string) (model.SnapshotRecord, bool, error) {
+	inner, ok := f.Inner.(SnapshotStore)
+	if !ok {
+		return model.SnapshotRecord{}, false, errMissingInnerInterface("SnapshotStore")
+	}
+	return inner.GetSnapshot(ctx, runID, snapshotID)
+}
+
+// ListSnapshotsPage forwards the paged collection read to the wrapped
+// store's SnapshotPageStore. Like the other paged read, it is a capability:
+// a wrapped store without it fails closed with the missing-interface error.
+func (f *FaultyStore) ListSnapshotsPage(ctx context.Context, runID string, afterCreatedAt time.Time, afterID string, limit int) (SnapshotPage, error) {
+	inner, ok := f.Inner.(SnapshotPageStore)
+	if !ok {
+		return SnapshotPage{}, errMissingInnerInterface("SnapshotPageStore")
+	}
+	return inner.ListSnapshotsPage(ctx, runID, afterCreatedAt, afterID, limit)
 }
 
 func (f *FaultyStore) InsertJobContracts(ctx context.Context, jobID string, contracts map[string]ArtifactContract) error {
@@ -1585,6 +1636,20 @@ func (f *FaultyStore) ResolveTestHistoryRepoIDs(ctx context.Context, query strin
 	return inner.ResolveTestHistoryRepoIDs(ctx, query, limit)
 }
 
+// ResolveTestHistoryRepoIDsScoped delegates the authorization-aware
+// resolution to Inner when it implements TestHistoryRepoResolutionStore, and
+// fails closed with a diagnosable capability error otherwise: a wrapper over
+// a store without the scoped contract must never silently degrade to the
+// un-scoped (truncating) resolution. It is a READ: the fault counter is never
+// consumed.
+func (f *FaultyStore) ResolveTestHistoryRepoIDsScoped(ctx context.Context, query string, permitted []string, limit int) ([]string, error) {
+	inner, ok := f.Inner.(TestHistoryRepoResolutionStore)
+	if !ok {
+		return nil, errMissingInnerInterface("TestHistoryRepoResolutionStore")
+	}
+	return inner.ResolveTestHistoryRepoIDsScoped(ctx, query, permitted, limit)
+}
+
 func (f *FaultyStore) TestReportTotals(ctx context.Context, repoIDs []string, repoQuery string) (int, int, int, error) {
 	inner, ok := f.Inner.(TestHistoryAggregateStore)
 	if !ok {
@@ -1807,47 +1872,51 @@ func newMemStore() *memStore {
 var _ Store = (*memStore)(nil)
 
 var (
-	_ OutboxStore               = (*memStore)(nil)
-	_ OutboxDeadLetterStore     = (*memStore)(nil)
-	_ ForgeCheckStateStore      = (*memStore)(nil)
-	_ ScheduleStore             = (*memStore)(nil)
-	_ DeploymentStore           = (*memStore)(nil)
-	_ SnapshotStore             = (*memStore)(nil)
-	_ ArtifactContractStore     = (*memStore)(nil)
-	_ QueueReasonStore          = (*memStore)(nil)
-	_ DynamicStore              = (*memStore)(nil)
-	_ DynamicStoreTx            = (*memStore)(nil)
-	_ DownstreamStore           = (*memStore)(nil)
-	_ UsageStore                = (*memStore)(nil)
-	_ UsageOnceStore            = (*memStore)(nil)
-	_ RunDownstreamStore        = (*memStore)(nil)
-	_ DownstreamParentRunStore  = (*memStore)(nil)
-	_ ArtifactLookupStore       = (*memStore)(nil)
-	_ RunnerJobStore            = (*memStore)(nil)
-	_ RunEnqueueStore           = (*memStore)(nil)
-	_ AtomicLeaseStore          = (*memStore)(nil)
-	_ QuotaCounterStore         = (*memStore)(nil)
-	_ LiveProfileResolver       = (*memStore)(nil)
-	_ CacheManifestStore        = (*memStore)(nil)
-	_ ArtifactSidecarStore      = (*memStore)(nil)
-	_ SecretClaimStore          = (*memStore)(nil)
-	_ SecretClaimReleaser       = (*memStore)(nil)
-	_ ProfileStore              = (*memStore)(nil)
-	_ RunnerProfileLinkStore    = (*memStore)(nil)
-	_ ArtifactIdempotentStore   = (*memStore)(nil)
-	_ GeneratedFragmentStore    = (*memStore)(nil)
-	_ RunnerTokenStore          = (*memStore)(nil)
-	_ CertRevocationStore       = (*memStore)(nil)
-	_ EnrollGrantStore          = (*memStore)(nil)
-	_ TestHistoryStore          = (*memStore)(nil)
-	_ TestHistoryAggregateStore = (*memStore)(nil)
-	_ TestReportDeliveryStore   = (*memStore)(nil)
-	_ RunnerDisableStore        = (*memStore)(nil)
-	_ LeaderFenceStore          = (*memStore)(nil)
-	_ RecoveryStore             = (*memStore)(nil)
-	_ RecoveryScanStore         = (*memStore)(nil)
-	_ OutboxClaimBatchStore     = (*memStore)(nil)
-	_ RunPageStore              = (*memStore)(nil)
+	_ OutboxStore                    = (*memStore)(nil)
+	_ OutboxDeadLetterStore          = (*memStore)(nil)
+	_ ForgeCheckStateStore           = (*memStore)(nil)
+	_ ScheduleStore                  = (*memStore)(nil)
+	_ DeploymentStore                = (*memStore)(nil)
+	_ SnapshotStore                  = (*memStore)(nil)
+	_ SnapshotPageStore              = (*memStore)(nil)
+	_ ArtifactContractStore          = (*memStore)(nil)
+	_ QueueReasonStore               = (*memStore)(nil)
+	_ DynamicStore                   = (*memStore)(nil)
+	_ DynamicStoreTx                 = (*memStore)(nil)
+	_ DownstreamStore                = (*memStore)(nil)
+	_ UsageStore                     = (*memStore)(nil)
+	_ UsageOnceStore                 = (*memStore)(nil)
+	_ RunDownstreamStore             = (*memStore)(nil)
+	_ DownstreamParentRunStore       = (*memStore)(nil)
+	_ ArtifactLookupStore            = (*memStore)(nil)
+	_ RunnerJobStore                 = (*memStore)(nil)
+	_ RunEnqueueStore                = (*memStore)(nil)
+	_ AtomicLeaseStore               = (*memStore)(nil)
+	_ QuotaCounterStore              = (*memStore)(nil)
+	_ LiveProfileResolver            = (*memStore)(nil)
+	_ CacheManifestStore             = (*memStore)(nil)
+	_ ArtifactSidecarStore           = (*memStore)(nil)
+	_ SecretClaimStore               = (*memStore)(nil)
+	_ SecretClaimReleaser            = (*memStore)(nil)
+	_ ProfileStore                   = (*memStore)(nil)
+	_ RunnerProfileLinkStore         = (*memStore)(nil)
+	_ ArtifactIdempotentStore        = (*memStore)(nil)
+	_ GeneratedFragmentStore         = (*memStore)(nil)
+	_ RunnerTokenStore               = (*memStore)(nil)
+	_ CertRevocationStore            = (*memStore)(nil)
+	_ EnrollGrantStore               = (*memStore)(nil)
+	_ TestHistoryStore               = (*memStore)(nil)
+	_ TestHistoryAggregateStore      = (*memStore)(nil)
+	_ TestHistoryRepoResolutionStore = (*memStore)(nil)
+	_ TestReportDeliveryStore        = (*memStore)(nil)
+	_ RunnerDisableStore             = (*memStore)(nil)
+	_ LeaderFenceStore               = (*memStore)(nil)
+	_ RecoveryStore                  = (*memStore)(nil)
+	_ RecoveryScanStore              = (*memStore)(nil)
+	_ OutboxClaimBatchStore          = (*memStore)(nil)
+	_ RunPageStore                   = (*memStore)(nil)
+	_ RunPageForPrincipalStore       = (*memStore)(nil)
+	_ RunRepoIDStore                 = (*memStore)(nil)
 )
 
 func (m *memStore) Close() error { return nil }
@@ -1910,6 +1979,43 @@ func (m *memStore) ListRunsPage(ctx context.Context, afterCreatedAt time.Time, a
 		runs = append(runs, r)
 	}
 	return PageRuns(runs, afterCreatedAt, afterID, limit), nil
+}
+
+// ListRunsPageForAuthorizedRepos mirrors the SQL authorized keyset page (see
+// RunPageForPrincipalStore): the run's canonical policy repository identity
+// is filtered BEFORE the page boundary, through the shared
+// PageRunsForAuthorizedRepos definition, so memory and SQL pages cannot
+// drift. The run map under m.mu is a complete view, so paging is
+// deterministic.
+func (m *memStore) ListRunsPageForAuthorizedRepos(ctx context.Context, allowedRepoIDs []string, afterCreatedAt time.Time, afterID string, limit int) (RunPage, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	runs := make([]model.Run, 0, len(m.runs))
+	for _, r := range m.runs {
+		runs = append(runs, r)
+	}
+	return PageRunsForAuthorizedRepos(runs, allowedRepoIDs, afterCreatedAt, afterID, limit), nil
+}
+
+// ListRunRepoIDs implements RunRepoIDStore for the in-memory store: the
+// distinct canonical policy repository identities (RepoIDForRun, the same
+// derivation the server and SQL page predicate use) ascending. Candidate
+// discovery only.
+func (m *memStore) ListRunRepoIDs(ctx context.Context) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	seen := make(map[string]struct{}, len(m.runs))
+	out := make([]string, 0, len(m.runs))
+	for _, r := range m.runs {
+		id := RepoIDForRun(r)
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 func (m *memStore) InsertJob(ctx context.Context, job model.Job) error {
@@ -3704,6 +3810,30 @@ func (m *memStore) ListSnapshotsByRun(ctx context.Context, runID string) ([]mode
 	return out, nil
 }
 
+// GetSnapshot implements the SnapshotStore single-record lookup for the
+// in-memory mirror: a (run_id, id) scan of the resident records, reporting a
+// record of another run as missing.
+func (m *memStore) GetSnapshot(ctx context.Context, runID, snapshotID string) (model.SnapshotRecord, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, rec := range m.snapshots {
+		if rec.RunID == runID && rec.ID == snapshotID {
+			return rec, true, nil
+		}
+	}
+	return model.SnapshotRecord{}, false, nil
+}
+
+// ListSnapshotsPage implements SnapshotPageStore for the in-memory mirror:
+// the shared PageSnapshots keyset contract over a copy of the resident
+// records, so the lock is held only while copying and never across sorting.
+func (m *memStore) ListSnapshotsPage(ctx context.Context, runID string, afterCreatedAt time.Time, afterID string, limit int) (SnapshotPage, error) {
+	m.mu.Lock()
+	recs := append([]model.SnapshotRecord(nil), m.snapshots...)
+	m.mu.Unlock()
+	return PageSnapshots(recs, runID, afterCreatedAt, afterID, limit), nil
+}
+
 func (m *memStore) InsertJobContracts(ctx context.Context, jobID string, contracts map[string]ArtifactContract) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -5232,7 +5362,11 @@ func (m *memStore) InsertTestReportWithHistory(ctx context.Context, rep model.Te
 // report append, aggregate fold and the (job, generation, delivery ID)
 // receipt commit together under the store lock. A replayed identical
 // delivery returns the original report ID without appending or folding;
-// a reused delivery ID with a different digest is a conflict.
+// a reused delivery ID with a different digest is a conflict. The server
+// always supplies a non-empty identity (the runner-derived one or the
+// synthesized legacy-client identity); an empty ID is the legacy
+// store-internal path of InsertTestReportWithHistory only, exactly like the
+// PostgreSQL store.
 func (m *memStore) InsertTestReportWithHistoryDelivery(ctx context.Context, rep model.TestReport, repoID string, delivery TestReportDelivery) (TestReportInsertOutcome, error) {
 	if err := ctx.Err(); err != nil {
 		return TestReportInsertOutcome{}, err
@@ -5313,29 +5447,60 @@ func memRunMatchesRepoQuery(r model.Run, query string) bool {
 	return query == CanonicalRepoID("", r.RepoFullName)
 }
 
+// ResolveTestHistoryRepoIDs mirrors the SQL policy without an identity
+// restriction (see PostgresStore.ResolveTestHistoryRepoIDsScoped).
 func (m *memStore) ResolveTestHistoryRepoIDs(ctx context.Context, query string, limit int) ([]string, error) {
-	if limit <= 0 {
-		limit = 64
+	return m.ResolveTestHistoryRepoIDsScoped(ctx, query, nil, limit)
+}
+
+// ResolveTestHistoryRepoIDsScoped mirrors the SQL repository resolution
+// policy exactly: a canonical (host/owner/name) query is an exact identity
+// lookup with NO ambiguity cap; a bare owner/name query collects every
+// distinct canonical identity it addresses and reports ErrRepoQueryAmbiguous
+// when more than the supported limit exist, never a silently truncated list;
+// and a non-nil permitted set is intersected BEFORE the ambiguity check.
+// The run map under m.mu is a complete view, so the counts are exact.
+func (m *memStore) ResolveTestHistoryRepoIDsScoped(ctx context.Context, query string, permitted []string, limit int) ([]string, error) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, nil
+	}
+	allowed, restricted := filterTestHistoryPermitted(permitted)
+	if restricted && len(allowed) == 0 {
+		return []string{}, nil
+	}
+	limit = testHistoryResolveLimit(limit)
+	canonicalQuery := repoQueryHasForgeHost(query)
+	allow := make(map[string]bool, len(allowed))
+	for _, id := range allowed {
+		allow[id] = true
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	seen := map[string]bool{}
 	out := []string{}
 	for _, r := range m.runs {
-		if !memRunMatchesRepoQuery(r, query) {
-			continue
-		}
 		id := RepoIDForRun(r)
 		if id == "" || seen[id] {
 			continue
 		}
+		if restricted && !allow[id] {
+			continue
+		}
+		if canonicalQuery {
+			if id != query {
+				continue
+			}
+		} else if !memRunMatchesRepoQuery(r, query) {
+			continue
+		}
 		seen[id] = true
 		out = append(out, id)
-		if len(out) >= limit {
-			break
-		}
 	}
 	sort.Strings(out)
+	if !canonicalQuery && len(out) > limit {
+		return nil, &repoQueryAmbiguousError{query: query, found: len(out), limit: limit}
+	}
 	return out, nil
 }
 

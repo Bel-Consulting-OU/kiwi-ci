@@ -346,7 +346,7 @@ func TestDrainMemoryModeCountKnown(t *testing.T) {
 // draining. A retry after the seam clears persists and acknowledges.
 func TestDrainPersistFailureFailsClosed(t *testing.T) {
 	s := New("secret")
-	// A data dir whose parent does not exist makes writeFileAtomic fail, the
+	// A data dir whose parent does not exist makes the durable write fail, the
 	// same failure class as a full or read-only state directory.
 	s.dataDir = filepath.Join(t.TempDir(), "missing")
 	w := doJSON(t, s, http.MethodPost, "/api/v1/drain", "secret", `{"reason":"rolling update"}`)

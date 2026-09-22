@@ -36,9 +36,12 @@ func TestActionForMapping(t *testing.T) {
 		{"GET", "/api/v1/runs/r1/logs/stream", ActionRead, true},
 		{"GET", "/api/v1/runs/r1/tests", ActionRead, true},
 		{"GET", "/api/v1/runs/r1/deployments", ActionRead, true},
-		{"GET", "/api/v1/runs/r1/snapshots", ActionRead, true},
-		// The archive download is admin tier while the metadata listing above
-		// stays read tier.
+		// The whole snapshot surface is admin tier (L4-A): a record
+		// carries the workspace file inventory (names, modes, sizes,
+		// SHA-256) plus the manifest root and archive digests, so the
+		// listing is as sensitive as the archive download and no
+		// repository read/artifact_read grant may obtain it.
+		{"GET", "/api/v1/runs/r1/snapshots", ActionAdmin, true},
 		{"GET", "/api/v1/runs/r1/snapshots/s1", ActionAdmin, true},
 		{"GET", "/api/v1/runs/r1/artifacts", ActionArtifactRead, true},
 		{"GET", "/api/v1/artifacts/a1", ActionArtifactRead, true},
@@ -85,6 +88,39 @@ func TestActionForMapping(t *testing.T) {
 		action, _, handled := ActionFor(c.method, c.path)
 		if handled != c.wantHandled || (c.wantHandled && action != c.wantAction) {
 			t.Errorf("ActionFor(%s %s) = (%q, handled=%v), want (%q, handled=%v)", c.method, c.path, action, handled, c.wantAction, c.wantHandled)
+		}
+	}
+}
+
+// TestSnapshotRoutesAreAdminTierForEveryRepositoryGrant is the L4-A
+// route-shape authorization pin: both snapshot routes map to ActionAdmin, and
+// no repository-scoped grant — not even one carrying every repository
+// permission — can satisfy it. Only the global admin role does, so a
+// repository-read principal can never obtain the workspace manifest
+// (filenames, modes, sizes, SHA-256) or the archive.
+func TestSnapshotRoutesAreAdminTierForEveryRepositoryGrant(t *testing.T) {
+	allRepoPerms := RepositoryPermission{
+		Read: true, Run: true, TrustedRun: true, Approve: true,
+		Cancel: true, Rerun: true, ArtifactRead: true,
+	}
+	repoSuperuser := Principal{Subject: "repo-superuser", Roles: []Role{RoleRead, RoleArtifactRead}, Repositories: map[string]RepositoryPermission{
+		"o/repo-a": allRepoPerms,
+	}}
+	globalReader := Principal{Subject: "global-reader", Roles: []Role{RoleRead}}
+	admin := Principal{Subject: "admin", Roles: []Role{RoleAdmin}}
+
+	for _, path := range []string{"/api/v1/runs/r1/snapshots", "/api/v1/runs/r1/snapshots/s1"} {
+		action, _, handled := ActionFor("GET", path)
+		if !handled || action != ActionAdmin {
+			t.Fatalf("ActionFor(GET %s) = (%q, handled=%v), want ActionAdmin", path, action, handled)
+		}
+		for _, p := range []Principal{repoSuperuser, globalReader} {
+			if Authorize(p, action, "github.com/o/repo-a", false) {
+				t.Fatalf("%s: %s satisfied ActionAdmin", path, p.Subject)
+			}
+		}
+		if !Authorize(admin, action, "github.com/o/repo-a", false) {
+			t.Fatalf("%s: the admin role must satisfy ActionAdmin", path)
 		}
 	}
 }

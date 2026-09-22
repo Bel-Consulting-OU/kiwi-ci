@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -11,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +20,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cas"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/snapshot"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
@@ -43,6 +44,36 @@ func isSnapshotBodyTooLarge(err error) bool {
 // snapshotTooLargeError renders the shared body-cap rejection.
 func snapshotTooLargeError() string {
 	return fmt.Sprintf("snapshot archive exceeds the %d-byte upload limit", snapshotUploadMaxBytes)
+}
+
+// Snapshot staging integration (L4-C).
+//
+// DB-mode uploads spool the archive through the server's shared bounded
+// staging budget (Server.Staging, see server.go and staging.go) instead of
+// the bare system temporary directory: the reservation is taken BEFORE the
+// request body is accepted, so concurrent valid runners can never stage more
+// bytes than the configured bound, and the startup prune (part of the
+// constructor / app wiring) reclaims files abandoned by a crashed process.
+// Production refuses startup without an explicit staging.dir and
+// staging.max_bytes (internal/config validateStaging plus the app wiring's
+// production check); a server without an installed budget fails the upload
+// closed with 503.
+
+// snapshotStagingReserve reports how many staging bytes to reserve BEFORE the
+// request body is accepted: the declared Content-Length when the client
+// announced a positive one, otherwise the endpoint maximum (the worst case
+// the request can still stream). A declared length above the endpoint cap is
+// refused outright, so a lying client can neither stage past the endpoint cap
+// nor past its own declaration (the body reader is capped at the reserved
+// amount).
+func snapshotStagingReserve(r *http.Request) (int64, bool) {
+	if r.ContentLength > snapshotUploadMaxBytes {
+		return 0, false
+	}
+	if r.ContentLength > 0 {
+		return r.ContentLength, true
+	}
+	return snapshotUploadMaxBytes, true
 }
 
 // uploadSnapshot is POST /api/v1/jobs/{id}/snapshots: the runner uploads a
@@ -247,8 +278,11 @@ func validateSnapshotFiles(rec model.SnapshotRecord) error {
 	return nil
 }
 
-// uploadSnapshotDB is the DB-mode upload: the archive bytes are stored in
-// CAS and the record is inserted through SnapshotStore in the same flow.
+// uploadSnapshotDB is the DB-mode upload: the archive bytes are staged
+// through the configured bounded staging area (never the bare system
+// temporary directory, so concurrent valid runners cannot exhaust the
+// control-plane root filesystem), published to CAS, and the record is
+// inserted through SnapshotStore in the same flow.
 // Insertion failure fails the upload (503); the already written CAS blob is
 // left as an orphan for the reference-aware blob GC — never deleted,
 // because a failed metadata persist must not remove a digest another
@@ -256,7 +290,44 @@ func validateSnapshotFiles(rec model.SnapshotRecord) error {
 // so any replica resolves the archive by digest.
 func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j model.Job, runnerID string) {
 	ctx := r.Context()
-	tmp, err := os.CreateTemp("", "kiwi-snapshot-*")
+	stagingBudget := s.StagingBudget()
+	if stagingBudget == nil {
+		http.Error(w, "snapshot storage requires a configured staging budget", http.StatusServiceUnavailable)
+		return
+	}
+	// Reserve BEFORE accepting the body: the staging bound is enforced
+	// against the declared Content-Length (or the endpoint maximum when the
+	// length is unknown), so two concurrent uploads whose combined size
+	// exceeds the budget serialize on the reservation instead of both
+	// writing to disk. The reservation is released on every exit path —
+	// including copy errors, parse failures and client disconnects (the
+	// deferred Release plus the request-context cancellation Acquire
+	// observes).
+	reserve, ok := snapshotStagingReserve(r)
+	if !ok {
+		http.Error(w, snapshotTooLargeError(), http.StatusRequestEntityTooLarge)
+		return
+	}
+	res, err := stagingBudget.Acquire(ctx, reserve)
+	if err != nil {
+		if ctx.Err() != nil {
+			// The client is gone; there is nobody to answer. The failed
+			// Acquire released nothing, so the budget is intact.
+			return
+		}
+		if errors.Is(err, staging.ErrBudgetExceeded) {
+			// The request itself is larger than the whole configured
+			// staging budget: waiting could never make it fit.
+			http.Error(w, "snapshot archive exceeds the configured staging budget", http.StatusServiceUnavailable)
+			return
+		}
+		http.Error(w, "snapshot staging capacity unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	defer res.Release()
+	// The staging file carries staging.FilePrefix, so an abandoned file left
+	// by a crashed process is reclaimed by the package's startup Prune.
+	tmp, err := os.CreateTemp(stagingBudget.Dir(), staging.FilePrefix+"snapshot-*")
 	if err != nil {
 		s.internalError(w, r, err, "")
 		return
@@ -265,7 +336,7 @@ func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j mode
 	defer os.Remove(tmpName)
 	defer tmp.Close()
 	h := sha256.New()
-	n, copyErr := io.Copy(io.MultiWriter(tmp, h), http.MaxBytesReader(w, r.Body, snapshotUploadMaxBytes))
+	n, copyErr := io.Copy(io.MultiWriter(tmp, h), http.MaxBytesReader(w, r.Body, reserve))
 	if err := firstErr(copyErr); err != nil {
 		if isSnapshotBodyTooLarge(copyErr) {
 			http.Error(w, snapshotTooLargeError(), http.StatusRequestEntityTooLarge)
@@ -392,29 +463,53 @@ func verifyStoredSnapshot(ctx context.Context, c *cas.CAS, digest string, wantSi
 var snapshotListMemoryLock = func() {}
 
 // requireRunAdmin enforces the admin action for the workspace snapshot
-// archive download, scoped by the run's canonical policy identity
-// (repoIDForRun). The repository resolution keeps the decision anchored to
-// the addressed run instead of a blanket gate, while auth.Authorize makes
-// ActionAdmin unsatisfiable by any repository grant: only the global admin
-// role (or the admin token, which carries no principal) passes. A
-// non-admin authenticated principal is answered 403 by requireAction.
+// surface — the record/manifest LISTING and the archive DOWNLOAD, both of
+// which describe or carry the private workspace — scoped by the run's
+// canonical policy identity (repoIDForRun). The repository resolution keeps
+// the decision anchored to the addressed run instead of a blanket gate, while
+// auth.Authorize makes ActionAdmin unsatisfiable by any repository grant:
+// only the global admin role (or the admin token, which carries no principal)
+// passes. A non-admin authenticated principal is answered 403 by
+// requireAction.
 func (s *Server) requireRunAdmin(w http.ResponseWriter, r *http.Request, run model.Run) bool {
 	return s.requireAction(w, r, auth.ActionAdmin, repoIDForRun(run), false)
 }
 
-// listSnapshots is GET /api/v1/runs/{id}/snapshots: the manifests of every
-// snapshot uploaded by the run's jobs. The metadata listing is read tier
-// (requireRunRead): the records carry no archive contents and no local path
-// (redactSnapshot strips it). Only the archive DOWNLOAD is admin tier.
-// DB mode reads the SQL records
-// (SnapshotStore) as the single source of truth; memory mode reads the
-// in-memory map. Neither mode holds s.mu across a store call, response
-// serialization or a client write: the DB branch touches no in-memory state,
-// and the memory branch copies the run and its matching records under the
-// lock, releases it, and only then sorts and serializes — a slow PostgreSQL
-// or a slow client can never stall unrelated control-plane operations.
+// listSnapshots is GET /api/v1/runs/{id}/snapshots: the snapshot records of
+// the run's jobs, ADMIN tier — the same tier as the archive download.
+//
+// TIER DECISION (L4-A): a record is not innocuous metadata. It carries every
+// SnapshotEntry (workspace file name, mode, size, SHA-256), the manifest root
+// digest and the archive digest — an inventory of the private workspace the
+// archive holds (checkout, generated and secret-derived files). The download
+// is already admin tier, so the collection that describes exactly that
+// archive is admin tier too: requireRunAdmin resolves auth.ActionAdmin
+// against the run's canonical repository identity (repoIDForRun) and no
+// repository grant (not even artifact_read) satisfies it. The server-local
+// archive path is still stripped (redactSnapshot); the admin caller sees the
+// digests and entries the archive itself contains.
+//
+// The response is keyset-paginated (bounded limit + opaque cursor,
+// created_at ASC, id ASC) so neither manifests nor metadata can be requested
+// unbounded: one page holds at most storage.MaxSnapshotPageLimit records,
+// the cap is advertised in X-Kiwi-Snapshots-Limit-Cap, and
+// X-Kiwi-Next-Cursor carries the position of the last returned record while
+// more exist. DB mode reads through SnapshotPageStore (failing closed if the
+// configured store lacks that capability, never falling back to an unbounded
+// list); memory mode applies the same contract through
+// storage.PageSnapshots. Neither mode holds s.mu across a store call,
+// response serialization or a client write.
 func (s *Server) listSnapshots(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
+	cursor, ok := decodeSnapshotsCursor(r.URL.Query().Get("cursor"))
+	if !ok {
+		// Opaque: the malformed value and the decoder's reason are never
+		// echoed back.
+		http.Error(w, "invalid cursor", http.StatusBadRequest)
+		return
+	}
+	limit := storage.NormalizeSnapshotPageLimit(snapshotsPageLimitParam(r))
+	var page storage.SnapshotPage
 	if s.DB != nil {
 		run, err := s.DB.GetRun(r.Context(), runID)
 		if errors.Is(err, storage.ErrNotFound) {
@@ -424,47 +519,125 @@ func (s *Server) listSnapshots(w http.ResponseWriter, r *http.Request) {
 			s.internalError(w, r, err, "")
 			return
 		}
-		if !s.requireRunRead(w, r, run) {
+		if !s.requireRunAdmin(w, r, run) {
 			return
 		}
-		out := []model.SnapshotRecord{}
-		if ss, ok := s.DB.(storage.SnapshotStore); ok {
-			recs, err := ss.ListSnapshotsByRun(r.Context(), runID)
-			if err != nil {
-				s.internalError(w, r, err, "")
-				return
-			}
-			for _, rec := range recs {
-				out = append(out, redactSnapshot(rec))
-			}
+		page, err = listSnapshotsPageFromStore(r.Context(), s.DB, runID, cursor, limit)
+		if err != nil {
+			s.internalError(w, r, err, "")
+			return
 		}
-		sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
-		writeJSON(w, http.StatusOK, out)
-		return
+	} else {
+		// Memory mode: resolve the run and copy only its records under the
+		// lock, then page, redact and serialize outside it.
+		snapshotListMemoryLock()
+		s.mu.Lock()
+		run, ok := s.runs[runID]
+		var recs []model.SnapshotRecord
+		if ok {
+			recs = s.snapshotRecordsForRunLocked(runID)
+		}
+		s.mu.Unlock()
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		if !s.requireRunAdmin(w, r, run) {
+			return
+		}
+		page = storage.PageSnapshots(recs, runID, cursor.createdAt, cursor.id, limit)
 	}
-	// Memory mode: resolve the run and copy only its records under the lock,
-	// then redact, sort and serialize outside it.
-	snapshotListMemoryLock()
-	s.mu.Lock()
-	run, ok := s.runs[runID]
-	var out []model.SnapshotRecord
-	if ok {
-		out = s.snapshotRecordsForRunLocked(runID)
+	out := make([]model.SnapshotRecord, 0, len(page.Snapshots))
+	for _, rec := range page.Snapshots {
+		out = append(out, redactSnapshot(rec))
 	}
-	s.mu.Unlock()
+	w.Header().Set("X-Kiwi-Snapshots-Limit-Cap", strconv.Itoa(storage.MaxSnapshotPageLimit))
+	if page.HasMore && page.NextID != "" {
+		w.Header().Set("X-Kiwi-Next-Cursor", encodeSnapshotsCursor(page.NextCreatedAt, page.NextID))
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// snapshotsCursorPrefix versions the opaque snapshot-collection cursor. The
+// encoding is the repository's structured-key style (runs' rk1, testintel
+// history keys): a version prefix plus base64.RawURLEncoding of a JSON array,
+// here [created_at in RFC3339Nano UTC, record id], so every id byte
+// round-trips exactly (including separators, unicode and whitespace).
+const snapshotsCursorPrefix = "sk1:"
+
+// snapshotsCursor is the decoded position of the previous page: the
+// (created_at, id) of its last record. The zero value is the first-page
+// position.
+type snapshotsCursor struct {
+	createdAt time.Time
+	id        string
+}
+
+// encodeSnapshotsCursor renders the opaque cursor for the record that ended a
+// page.
+func encodeSnapshotsCursor(createdAt time.Time, id string) string {
+	raw, _ := json.Marshal([2]string{createdAt.UTC().Format(time.RFC3339Nano), id})
+	return snapshotsCursorPrefix + base64.RawURLEncoding.EncodeToString(raw)
+}
+
+// decodeSnapshotsCursor parses the opaque cursor query parameter. An empty
+// value is the first-page position. Anything else must be exactly the
+// encoding encodeSnapshotsCursor produces; malformed input reports ok=false
+// so the handler answers an opaque 400 instead of guessing at a position.
+func decodeSnapshotsCursor(raw string) (snapshotsCursor, bool) {
+	if raw == "" {
+		return snapshotsCursor{}, true
+	}
+	rest, found := strings.CutPrefix(raw, snapshotsCursorPrefix)
+	if !found {
+		return snapshotsCursor{}, false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(rest)
+	if err != nil {
+		return snapshotsCursor{}, false
+	}
+	var fields [2]string
+	if err := json.Unmarshal(decoded, &fields); err != nil {
+		return snapshotsCursor{}, false
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, fields[0])
+	if err != nil {
+		return snapshotsCursor{}, false
+	}
+	return snapshotsCursor{createdAt: createdAt, id: fields[1]}, true
+}
+
+// snapshotsPageLimitParam parses the bounded page-size query parameter.
+// Absent, unparsable and non-positive values select the default; values above
+// the cap are clamped (the cap is advertised in X-Kiwi-Snapshots-Limit-Cap).
+func snapshotsPageLimitParam(r *http.Request) int {
+	limit, err := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("limit")))
+	if err != nil {
+		return storage.DefaultSnapshotPageLimit
+	}
+	return storage.NormalizeSnapshotPageLimit(limit)
+}
+
+// errSnapshotsPaginationUnsupported is the fail-closed answer for a
+// configured store without the SnapshotPageStore capability. An unbounded
+// ListSnapshotsByRun window cannot honor an older cursor, so the walk would
+// re-read the oldest records forever instead of reaching the rest of the
+// collection. Every store shipped with Kiwi implements SnapshotPageStore;
+// the detail is logged server-side and the client sees the opaque 500 body.
+var errSnapshotsPaginationUnsupported = errors.New("snapshots pagination unsupported by configured store")
+
+// listSnapshotsPageFromStore reads one keyset page from a store that
+// implements storage.SnapshotPageStore (the memory and PostgreSQL stores do).
+// A store without the capability fails closed instead of being served an
+// unbounded ListSnapshotsByRun snapshot, so a misconfigured custom store
+// reports the missing pagination contract rather than returning a truncated
+// or unbounded collection.
+func listSnapshotsPageFromStore(ctx context.Context, store storage.Store, runID string, cursor snapshotsCursor, limit int) (storage.SnapshotPage, error) {
+	paged, ok := store.(storage.SnapshotPageStore)
 	if !ok {
-		http.NotFound(w, r)
-		return
+		return storage.SnapshotPage{}, fmt.Errorf("%w: %T", errSnapshotsPaginationUnsupported, store)
 	}
-	if !s.requireRunRead(w, r, run) {
-		return
-	}
-	redacted := make([]model.SnapshotRecord, 0, len(out))
-	for _, rec := range out {
-		redacted = append(redacted, redactSnapshot(rec))
-	}
-	sort.Slice(redacted, func(i, j int) bool { return redacted[i].CreatedAt.Before(redacted[j].CreatedAt) })
-	writeJSON(w, http.StatusOK, redacted)
+	return paged.ListSnapshotsPage(ctx, runID, cursor.createdAt, cursor.id, limit)
 }
 
 // snapshotRecordsForRunLocked copies the in-memory snapshot records of one
@@ -530,12 +703,14 @@ func (s *Server) downloadSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// downloadSnapshotDB streams one snapshot in DB mode: the record comes
-// from the SnapshotStore (not the in-memory map) and the archive bytes
-// from CAS by digest, so a fresh replica with the same store+CAS serves
-// the download. Like the memory path it is admin tier — requireRunAdmin
-// resolves the run's canonical repository before the admin decision — and
-// records with a node-local Path (legacy) fall back to the local file.
+// downloadSnapshotDB streams one snapshot in DB mode: the record comes from
+// the SnapshotStore through the single-record GetSnapshot (run_id, id) lookup
+// — never by listing every record of the run and scanning the slice — and
+// the archive bytes from CAS by digest, so a fresh replica with the same
+// store+CAS serves the download. Like the memory path it is admin tier —
+// requireRunAdmin resolves the run's canonical repository before the admin
+// decision — and records with a node-local Path (legacy) fall back to the
+// local file.
 func (s *Server) downloadSnapshotDB(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	runID := r.PathValue("id")
@@ -557,19 +732,10 @@ func (s *Server) downloadSnapshotDB(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	recs, err := ss.ListSnapshotsByRun(ctx, runID)
+	rec, found, err := ss.GetSnapshot(ctx, runID, sid)
 	if err != nil {
 		s.internalError(w, r, err, "")
 		return
-	}
-	var rec model.SnapshotRecord
-	found := false
-	for _, c := range recs {
-		if c.ID == sid {
-			rec = c
-			found = true
-			break
-		}
 	}
 	if !found {
 		http.NotFound(w, r)

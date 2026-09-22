@@ -238,59 +238,167 @@ func scanTestHistoryAggregate(rows pgx.Rows) (TestHistoryAggregate, error) {
 	return row, nil
 }
 
-// ResolveTestHistoryRepoIDs maps a test-intelligence query to the CANDIDATE
-// canonical repository IDs it addresses: resolution is candidate discovery,
-// NOT an authorization decision. The query forms are the human full name, the
-// canonical RepoID and the legacy host-less canonical form; the returned set
-// mirrors runMatchesRepoQuery: a run matches when its full name or its
-// canonical identity (policy_repo_id first, then the repo_id/clone-URL +
-// full-name derivation — see canonicalPolicyRepoIDSQLExpr) equals the query,
-// or when the canonicalized full name equals the query. A bare name can
-// address SEVERAL forges, so the caller must authorize every returned ID
-// individually before reading aggregates; this method deliberately keeps the
-// full-name fallback because that breadth is exactly how a configured bare
-// alias finds all of its repositories. Resolution is a single bounded,
-// set-based run query (backed by the 0027 expression index created on the
-// SAME canonical policy-first expression) — it never materializes reports or
-// resolves runs one by one. Legacy records (no repo_id/policy_repo_id) are
-// matched by the canonical expression itself, so they are never filtered out
-// before the Go-side derivation can see them; the Go fallback remains as a
-// belt-and-braces derivation for rows the SQL expression cannot resolve.
-func (s *PostgresStore) ResolveTestHistoryRepoIDs(ctx context.Context, query string, limit int) ([]string, error) {
-	query = strings.TrimSpace(query)
-	if query == "" {
-		return nil, nil
-	}
+// ErrRepoQueryAmbiguous reports that a BARE (host-less) repository query
+// addresses more distinct canonical repositories than the supported ambiguity
+// limit. A bare owner/name is not a repository identity — several forges can
+// present the same name — so a query that exceeds the limit is REFUSED
+// explicitly instead of being answered with an arbitrary first `limit`
+// candidates: a silently truncated candidate list would make an authorized
+// repository sorting after the cap invisible to its own owner. The caller
+// re-addresses the repository with its forge-scoped canonical ID
+// (host/owner/name), which resolves by exact identity with no ambiguity.
+var ErrRepoQueryAmbiguous = errors.New("storage: repository query addresses more canonical repositories than the ambiguity limit")
+
+// repoQueryAmbiguousError carries the diagnosable context of an over-limit
+// bare-name resolution. It matches ErrRepoQueryAmbiguous through errors.Is;
+// the HTTP layer deliberately maps it to an OPAQUE response that never leaks
+// the candidate identities or their count.
+type repoQueryAmbiguousError struct {
+	query string
+	found int
+	limit int
+}
+
+func (e *repoQueryAmbiguousError) Error() string {
+	return fmt.Sprintf("%v: query %q addresses at least %d canonical repositories (limit %d); use the forge-scoped canonical repository ID", ErrRepoQueryAmbiguous, e.query, e.found, e.limit)
+}
+
+// Is makes errors.Is(err, ErrRepoQueryAmbiguous) succeed.
+func (e *repoQueryAmbiguousError) Is(target error) bool { return target == ErrRepoQueryAmbiguous }
+
+// TestHistoryRepoResolutionStore is the authorization-aware form of
+// ResolveTestHistoryRepoIDs: the caller passes the canonical repository
+// identities the request's principal is explicitly permitted to read, and the
+// implementation intersects candidate discovery with that set BEFORE applying
+// the ambiguity limit. Intersecting first is what makes an authorized
+// repository that sorts after the bare-name cap reachable; the limit+1
+// ambiguity check then applies to what remains. permitted == nil means "no
+// identity restriction" (no principal, or a global/bare-alias grant that
+// authorizes every forge presenting the name); a non-nil slice — possibly
+// empty — is the exact permitted identity set, and an empty one resolves to
+// no candidates without touching the database.
+type TestHistoryRepoResolutionStore interface {
+	ResolveTestHistoryRepoIDsScoped(ctx context.Context, query string, permitted []string, limit int) ([]string, error)
+}
+
+var _ TestHistoryRepoResolutionStore = (*PostgresStore)(nil)
+
+// testHistoryResolveLimit normalizes the supported ambiguity limit of one
+// bare-name resolution. Non-positive or oversized values select the
+// documented default.
+func testHistoryResolveLimit(limit int) int {
 	if limit <= 0 || limit > 256 {
-		limit = 64
+		return 64
 	}
-	rows, err := s.pool.Query(ctx, `SELECT DISTINCT `+canonicalPolicyRepoIDSQLExpr("repo")+`, COALESCE(payload->>'repo', ''), COALESCE(payload->>'repo_full_name', '') FROM runs WHERE payload->>'repo_full_name'=$1 OR `+canonicalPolicyRepoIDSQLExpr("repo")+`=$1 ORDER BY 1 LIMIT $2`, query, limit)
-	if err != nil {
-		return nil, err
+	return limit
+}
+
+// repoQueryHasForgeHost reports whether a query already carries a forge host
+// (host/owner/name) and is therefore an exact canonical repository identity
+// rather than a bare owner/name candidate hint. It mirrors the host-like rule
+// of auth.CanonicalRepoID (the remainder must itself contain a slash), so a
+// GitLab group whose name contains a dot is never mistaken for a host.
+func repoQueryHasForgeHost(query string) bool {
+	_, _, ok := splitHostLike(query)
+	return ok
+}
+
+// filterTestHistoryPermitted normalizes the permitted canonical identity set.
+// The second result reports whether the restriction is active (permitted was
+// non-nil); an active restriction with no usable identity resolves to zero
+// candidates.
+func filterTestHistoryPermitted(permitted []string) ([]string, bool) {
+	if permitted == nil {
+		return nil, false
 	}
-	defer rows.Close()
-	seen := map[string]bool{}
-	out := []string{}
-	for rows.Next() {
-		var storedID, repoURL, fullName string
-		if err := rows.Scan(&storedID, &repoURL, &fullName); err != nil {
-			return nil, err
-		}
-		id := strings.TrimSpace(storedID)
-		if id == "" {
-			id = RepoIDFor("", repoURL, fullName)
-		}
+	seen := make(map[string]bool, len(permitted))
+	out := make([]string, 0, len(permitted))
+	for _, id := range permitted {
+		id = strings.TrimSpace(id)
 		if id == "" || seen[id] {
-			continue
-		}
-		if id != query && fullName != query && CanonicalRepoID("", fullName) != query {
 			continue
 		}
 		seen[id] = true
 		out = append(out, id)
 	}
+	return out, true
+}
+
+// ResolveTestHistoryRepoIDs maps a test-intelligence query to the CANDIDATE
+// canonical repository IDs it addresses: resolution is candidate discovery,
+// NOT an authorization decision. It is ResolveTestHistoryRepoIDsScoped with
+// no identity restriction.
+func (s *PostgresStore) ResolveTestHistoryRepoIDs(ctx context.Context, query string, limit int) ([]string, error) {
+	return s.ResolveTestHistoryRepoIDsScoped(ctx, query, nil, limit)
+}
+
+// ResolveTestHistoryRepoIDsScoped resolves one test-intelligence query with
+// the repository resolution policy:
+//
+//   - a Canonical repository ID query (host/owner/name) is an EXACT identity
+//     lookup: it addresses at most one canonical repository, so it is never
+//     capped and can never be reported ambiguous;
+//   - a bare owner/name query is candidate discovery across every forge that
+//     presents the name. At most limit+1 distinct canonical identities are
+//     fetched: more than limit means ErrRepoQueryAmbiguous, never a silently
+//     truncated list;
+//   - when permitted is non-nil, candidate discovery is INTERSECTED with the
+//     principal's permitted canonical identities FIRST (for the canonical
+//     form too: the exact identity is offered only inside the permitted set),
+//     and the limit+1 ambiguity check applies to the intersection. An
+//     authorized repository that would sort after a bare-name cap is
+//     therefore still resolved.
+//
+// The query forms mirror runMatchesRepoQuery (full name, canonical identity,
+// legacy host-less canonical form); resolution is a single set-based run
+// query backed by the 0027 canonical-identity expression index — it never
+// materializes reports or resolves runs one by one. The caller must still
+// authorize every returned canonical ID individually before reading
+// aggregates.
+func (s *PostgresStore) ResolveTestHistoryRepoIDsScoped(ctx context.Context, query string, permitted []string, limit int) ([]string, error) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, nil
+	}
+	allowed, restricted := filterTestHistoryPermitted(permitted)
+	if restricted && len(allowed) == 0 {
+		return []string{}, nil
+	}
+	limit = testHistoryResolveLimit(limit)
+	canonicalQuery := repoQueryHasForgeHost(query)
+	args := []any{query}
+	predicate := canonicalPolicyRepoIDSQLExpr("repo") + ` = $1`
+	if !canonicalQuery {
+		predicate = `(payload->>'repo_full_name' = $1 OR ` + canonicalPolicyRepoIDSQLExpr("repo") + ` = $1)`
+	}
+	if restricted {
+		args = append(args, allowed)
+		predicate += ` AND ` + canonicalPolicyRepoIDSQLExpr("repo") + fmt.Sprintf(` = ANY($%d::text[])`, len(args))
+	}
+	inner := `SELECT DISTINCT ` + canonicalPolicyRepoIDSQLExpr("repo") + ` AS id FROM runs WHERE ` + predicate
+	q := `SELECT id FROM (` + inner + `) AS candidates WHERE id <> '' ORDER BY id`
+	if !canonicalQuery {
+		args = append(args, limit+1)
+		q += fmt.Sprintf(` LIMIT $%d`, len(args))
+	}
+	rows, err := s.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	if !canonicalQuery && len(out) > limit {
+		return nil, &repoQueryAmbiguousError{query: query, found: len(out), limit: limit}
 	}
 	sort.Strings(out)
 	return out, nil

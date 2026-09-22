@@ -7,10 +7,13 @@ package storage
 // server minted for the request. A runner whose request committed and whose
 // response was lost has no way to replay without inserting a second report
 // and folding its cases a second time. TestReportDeliveryStore closes that
-// gap: the caller supplies the stable delivery identity the runner derived
-// from the payload (job, lease generation, delivery ID) plus the digest of
-// the bytes it received; the store records that receipt and the report in the
-// same transaction, so:
+// gap: the caller supplies the stable delivery identity of the upload — for
+// runners that send one, the ID derived from the payload (job, lease
+// generation, delivery ID); for legacy clients that send none, the
+// server-synthesized deterministic identity (see
+// internal/server/testintel.go, synthesizedReportDeliveryID) — plus the
+// digest of the bytes it received; the store records that receipt and the
+// report in the same transaction, so:
 //
 //   - a first delivery inserts the report, folds its cases once and bumps the
 //     repository version;
@@ -23,6 +26,12 @@ package storage
 // The delivery receipt is written by the same transaction as the report and
 // the fold, so a failure anywhere commits neither. Delivery rows are
 // retained; test_report_deliveries_created_at_idx supports future pruning.
+//
+// Callers that own the delivery policy (the server) must never fall back to
+// the non-idempotent entry points: a store that does not implement this
+// contract cannot deduplicate a replay and must be refused. The empty-ID
+// branch below exists only for InsertTestReportWithHistory, the legacy
+// store-internal repair/import path; it is not a production upload path.
 
 import (
 	"context"

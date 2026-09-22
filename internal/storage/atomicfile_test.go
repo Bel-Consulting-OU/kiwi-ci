@@ -6,8 +6,16 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
+
+// The durability fault seams moved to internal/fsutil when AtomicWriteFile
+// was delegated there (the primitive is shared with the server's security-
+// state writers and the auth token store). These tests now inject failures
+// through fsutil.SetHooks, which is mutex-guarded so a concurrent writer
+// cannot race a hook swap; the injected step behavior is the same as the
+// former unexported atomicFileSync/atomicFileClose/atomicDirSync seams.
 
 // TestAtomicWriteFileDurableSuccess proves a successful write is readable
 // after a simulated crash-reopen: no scratch file survives the write, the
@@ -18,12 +26,11 @@ func TestAtomicWriteFileDurableSuccess(t *testing.T) {
 	path := filepath.Join(dir, "state.json")
 
 	syncs := 0
-	oldDirSync := atomicDirSync
-	atomicDirSync = func(d string) error {
+	restore := fsutil.SetHooks(fsutil.Hooks{DirSync: func(d string) error {
 		syncs++
-		return oldDirSync(d)
-	}
-	t.Cleanup(func() { atomicDirSync = oldDirSync })
+		return fsutil.RealSyncDir(d)
+	}})
+	t.Cleanup(restore)
 
 	if err := AtomicWriteFile(path, []byte("v1"), 0o600); err != nil {
 		t.Fatalf("first write: %v", err)
@@ -78,9 +85,10 @@ func TestAtomicWriteFileSyncFailureKeepsOldFile(t *testing.T) {
 	if err := AtomicWriteFile(path, []byte("v1"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	oldSync := atomicFileSync
-	atomicFileSync = func(*os.File) error { return errors.New("sync boom") }
-	t.Cleanup(func() { atomicFileSync = oldSync })
+	restore := fsutil.SetHooks(fsutil.Hooks{FileSync: func(*os.File) error {
+		return errors.New("sync boom")
+	}})
+	t.Cleanup(restore)
 
 	if err := AtomicWriteFile(path, []byte("v2"), 0o600); err == nil {
 		t.Fatal("failing Sync must fail the write")
@@ -104,12 +112,11 @@ func TestAtomicWriteFileCloseFailureKeepsOldFile(t *testing.T) {
 	if err := AtomicWriteFile(path, []byte("v1"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	oldClose := atomicFileClose
-	atomicFileClose = func(f *os.File) error {
-		_ = oldClose(f)
+	restore := fsutil.SetHooks(fsutil.Hooks{FileClose: func(f *os.File) error {
+		_ = fsutil.RealFileClose(f)
 		return errors.New("close boom")
-	}
-	t.Cleanup(func() { atomicFileClose = oldClose })
+	}})
+	t.Cleanup(restore)
 
 	if err := AtomicWriteFile(path, []byte("v2"), 0o600); err == nil {
 		t.Fatal("failing Close must fail the write")
@@ -130,9 +137,10 @@ func TestAtomicWriteFileCloseFailureKeepsOldFile(t *testing.T) {
 func TestAtomicWriteFileDirSyncFailureIsReturned(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")
-	oldDirSync := atomicDirSync
-	atomicDirSync = func(string) error { return errors.New("dir fsync boom") }
-	t.Cleanup(func() { atomicDirSync = oldDirSync })
+	restore := fsutil.SetHooks(fsutil.Hooks{DirSync: func(string) error {
+		return errors.New("dir fsync boom")
+	}})
+	t.Cleanup(restore)
 
 	if err := AtomicWriteFile(path, []byte("v1"), 0o600); err == nil {
 		t.Fatal("failing directory fsync must fail the write")
@@ -178,12 +186,13 @@ func TestRepositorySaveIsAtomicAndDurable(t *testing.T) {
 		t.Fatalf("snapshot records did not round-trip: %+v", loaded.Snapshots)
 	}
 
-	oldSync := atomicFileSync
-	atomicFileSync = func(*os.File) error { return errors.New("sync boom") }
+	restore := fsutil.SetHooks(fsutil.Hooks{FileSync: func(*os.File) error {
+		return errors.New("sync boom")
+	}})
 	if err := r.Save(Snapshot{Version: 1, Runs: map[string]model.Run{"r2": {ID: "r2"}}}); err == nil {
 		t.Fatal("failing state Sync must fail Save")
 	}
-	atomicFileSync = oldSync
+	restore()
 	loaded, err = r.Load()
 	if err != nil {
 		t.Fatal(err)

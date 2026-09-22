@@ -1,0 +1,58 @@
+package fsutil
+
+import (
+	"os"
+	"sync"
+)
+
+// Hooks overrides individual durability steps of AtomicWriteFile and SyncDir
+// so fault-injection tests can prove that a failed step is surfaced and never
+// acknowledged. A nil field keeps the production behavior (RealFileSync,
+// RealFileClose, RealRename, RealSyncDir); a hook that needs the real
+// behavior (to wrap or count it) calls the corresponding Real* function
+// directly, because calling the hooked entry point from inside a hook would
+// recurse.
+//
+// A FileClose hook that returns an error must still close the file: the
+// production path relies on the checked close having released the descriptor,
+// and the cleanup path (temp removal after a failed write) uses RealFileClose
+// regardless of hooks.
+//
+// Hooks are process-global and swapped under a mutex, so a concurrent reader
+// observes either the whole previous set or the whole new set, and the race
+// detector sees no unsynchronized access. Tests must install hooks with
+// SetHooks and restore them before any other test depends on the real
+// behavior (the returned restore function does this, typically via
+// t.Cleanup).
+type Hooks struct {
+	FileSync  func(f *os.File) error
+	FileClose func(f *os.File) error
+	Rename    func(oldpath, newpath string) error
+	DirSync   func(dir string) error
+}
+
+var (
+	hooksMu sync.RWMutex
+	hooks   Hooks
+)
+
+// SetHooks installs h for the calling test and returns a function that
+// restores the previous hooks. Production code never calls it.
+func SetHooks(h Hooks) (restore func()) {
+	hooksMu.Lock()
+	prev := hooks
+	hooks = h
+	hooksMu.Unlock()
+	return func() {
+		hooksMu.Lock()
+		hooks = prev
+		hooksMu.Unlock()
+	}
+}
+
+// currentHooks returns a consistent snapshot of the installed hooks.
+func currentHooks() Hooks {
+	hooksMu.RLock()
+	defer hooksMu.RUnlock()
+	return hooks
+}

@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 )
 
 // TestIDCovProvenanceKeyLoadPaths covers loadProvenanceKey in ephemeral,
@@ -291,19 +293,19 @@ func TestIDCovPEMParsers(t *testing.T) {
 	}
 }
 
-// TestIDCovFileHelpers covers writeFileAtomic, marshalJSONFile,
-// readFileIfExists, jsonUnmarshal and joinDataDir.
+// TestIDCovFileHelpers covers the durable atomic writer (fsutil), the
+// marshalJSONFile delegate, readFileIfExists, jsonUnmarshal and joinDataDir.
 func TestIDCovFileHelpers(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "atomic.txt")
-	if err := writeFileAtomic(path, []byte("data"), 0o600); err != nil {
+	if err := fsutil.AtomicWriteFile(path, []byte("data"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if b, err := os.ReadFile(path); err != nil || string(b) != "data" {
-		t.Fatalf("writeFileAtomic did not write: %v %q", err, b)
+		t.Fatalf("AtomicWriteFile did not write: %v %q", err, b)
 	}
-	if err := writeFileAtomic(filepath.Join(dir, "missing", "x.txt"), []byte("data"), 0o600); err == nil {
-		t.Fatal("writeFileAtomic in a missing directory = nil, want error")
+	if err := fsutil.AtomicWriteFile(filepath.Join(dir, "missing", "x.txt"), []byte("data"), 0o600); err == nil {
+		t.Fatal("AtomicWriteFile in a missing directory = nil, want error")
 	}
 
 	jpath := filepath.Join(dir, "state.json")

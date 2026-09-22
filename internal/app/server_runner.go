@@ -25,6 +25,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runner"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
@@ -44,6 +45,12 @@ type productionConfig struct {
 	TLSCert          string
 	TLSKey           string
 	AllowSharedToken bool
+	// StagingDir/StagingMaxBytes are the large-upload staging bound. They
+	// are required in production: without a bound, concurrent valid runner
+	// uploads would spool into an unbounded temp directory and could
+	// exhaust the control-plane root filesystem.
+	StagingDir      string
+	StagingMaxBytes int64
 }
 
 // validateProductionConfig enforces the STATIC half of the production-mode
@@ -303,6 +310,16 @@ func validateProductionConfig(cfg productionConfig) error {
 	if cfg.TLSCert == "" || cfg.TLSKey == "" {
 		return fmt.Errorf("production mode requires --tls-cert and --tls-key")
 	}
+	// Large-upload staging MUST have a configured bound in production: the
+	// cache/snapshot/artifact routes stage multi-GB request bodies, and
+	// without staging.dir + staging.max_bytes those bytes would land in an
+	// unbounded system temp directory on the control-plane root filesystem.
+	// The directory must also be USABLE — that half is enforced when the
+	// budget is constructed (staging.NewBudget) so an unusable path fails
+	// startup instead of the first upload.
+	if strings.TrimSpace(cfg.StagingDir) == "" || cfg.StagingMaxBytes <= 0 {
+		return fmt.Errorf("production mode requires --staging-dir and --staging-max-bytes (large runner uploads must stage inside a bounded directory; set staging.dir and staging.max_bytes)")
+	}
 	// Runner credentials are a POST-DB decision (per-runner tokens may
 	// already live in the runner_bearer_tokens table), so the static
 	// validator deliberately says nothing about --runner-token here.
@@ -335,6 +352,28 @@ func validateProductionRunnerCredentials(ctx context.Context, db storage.Store, 
 		return fmt.Errorf("production requires runner mTLS or per-runner credentials; the shared runner token is dev/bootstrap-only and is disabled in production")
 	}
 	return nil
+}
+
+// buildStagingBudget constructs the configured large-upload staging budget
+// and prunes spool files abandoned by a previous process before the
+// listeners start. An unconfigured section returns (nil, 0, nil) so the
+// server keeps its bounded data-dir default; a configured but unusable bound
+// (a path under a regular file, a read-only or full directory) returns the
+// constructor's error, so startup fails closed instead of the first upload.
+// config.Validate already rejected a partial (dir xor max_bytes) section.
+func buildStagingBudget(ctx context.Context, cfg config.StagingConfig) (*staging.Budget, int, error) {
+	if strings.TrimSpace(cfg.Dir) == "" && cfg.MaxBytes == 0 {
+		return nil, 0, nil
+	}
+	b, err := staging.NewBudget(cfg.Dir, cfg.MaxBytes)
+	if err != nil {
+		return nil, 0, fmt.Errorf("staging: %w", err)
+	}
+	pruned, perr := b.Prune(ctx)
+	if perr != nil {
+		return nil, pruned, fmt.Errorf("staging: startup prune: %w", perr)
+	}
+	return b, pruned, nil
 }
 
 func Server(ctx context.Context, args []string) error {
@@ -408,6 +447,8 @@ func Server(ctx context.Context, args []string) error {
 	componentRegistryDir := fs.String("component-registry-dir", "", "directory of component spec files (server-side component registry)")
 	componentRemote := fs.String("component-remote", "", "remote component registry base URL (https required)")
 	componentRemoteToken := fs.String("component-remote-token", "", "bearer token for the remote component registry")
+	stagingDir := fs.String("staging-dir", "", "bounded staging directory for large runner uploads (required in production)")
+	stagingMaxBytes := fs.String("staging-max-bytes", "", "total staging byte budget for concurrent large runner uploads (required in production)")
 	repoConcurrency := fs.String("repo-concurrency", "", "per-repository running-job concurrency limit (0 = unlimited)")
 	teamConcurrency := fs.String("team-concurrency", "", "per-team running-job concurrency limit (0 = unlimited)")
 	repoQueueDepth := fs.String("repo-queue-depth", "", "per-repository queued-job depth limit (0 = unlimited)")
@@ -455,7 +496,7 @@ func Server(ctx context.Context, args []string) error {
 	// The flag pointers exist only to register the flags; their values are
 	// read back through config.OverrideFromFlags (which inspects only
 	// explicitly set flags).
-	discard(listen, token, adminToken, webhookSecret, githubToken, externalURL, tlsCert, tlsKey, runnerCACert, runnerCAKey, runnerEnrollToken, databaseURL, mode, rateLimitPerSecond, rateLimitBurst, otelEndpoint, drainOnSigterm, githubAppID, githubAppPrivateKey, gitlabToken, gitlabWebhookSecret, gitlabBaseURL, forgejoToken, forgejoWebhookSecret, forgejoBaseURL, tokensFile, runnerTokensFile, databaseMaxConnections, metricsListen, secretBroker, vaultAddr, vaultToken, awsRegion, awsAccessKey, awsSecretKey, awsToken, gcpCredentials, gcpProject, azureTenant, azureClientID, azureClientSecret, azureVaultURL, onePasswordHost, onePasswordToken, onePasswordVault, componentRegistryDir, componentRemote, componentRemoteToken, repoConcurrency, teamConcurrency, repoQueueDepth, teamQueueDepth, dailyCostLimit, dailyEnergyLimit, quotaFailOpen, untrustedCPUCeiling, untrustedMemoryCeiling, untrustedDiskCeiling, untrustedPIDsCeiling)
+	discard(listen, token, adminToken, webhookSecret, githubToken, externalURL, tlsCert, tlsKey, runnerCACert, runnerCAKey, runnerEnrollToken, databaseURL, mode, rateLimitPerSecond, rateLimitBurst, otelEndpoint, drainOnSigterm, githubAppID, githubAppPrivateKey, gitlabToken, gitlabWebhookSecret, gitlabBaseURL, forgejoToken, forgejoWebhookSecret, forgejoBaseURL, tokensFile, runnerTokensFile, databaseMaxConnections, metricsListen, secretBroker, vaultAddr, vaultToken, awsRegion, awsAccessKey, awsSecretKey, awsToken, gcpCredentials, gcpProject, azureTenant, azureClientID, azureClientSecret, azureVaultURL, onePasswordHost, onePasswordToken, onePasswordVault, componentRegistryDir, componentRemote, componentRemoteToken, stagingDir, stagingMaxBytes, repoConcurrency, teamConcurrency, repoQueueDepth, teamQueueDepth, dailyCostLimit, dailyEnergyLimit, quotaFailOpen, untrustedCPUCeiling, untrustedMemoryCeiling, untrustedDiskCeiling, untrustedPIDsCeiling)
 
 	// Effective values after the precedence merge.
 	listenV := cfg.Server.Listen
@@ -501,8 +542,22 @@ func Server(ctx context.Context, args []string) error {
 		TLSCert:          tlsCertV,
 		TLSKey:           tlsKeyV,
 		AllowSharedToken: *allowSharedToken,
+		StagingDir:       cfg.Staging.Dir,
+		StagingMaxBytes:  cfg.Staging.MaxBytes,
 	}); err != nil {
 		return err
+	}
+	// Shared staging budget: large uploads spool into the configured bounded
+	// directory (staging.dir/staging.max_bytes), never an unbounded system
+	// temp directory. It is constructed and startup-pruned BEFORE any
+	// network or datastore work so an unusable configured bound fails
+	// startup immediately; an unconfigured section keeps the server's
+	// data-dir bounded default, and production additionally refuses to start
+	// with no bound at all (validateProductionConfig above). It is installed
+	// on the server once the server exists.
+	stagingBudget, stagingPruned, berr := buildStagingBudget(ctx, cfg.Staging)
+	if berr != nil {
+		return berr
 	}
 	var srv *server.Server
 	var clusterStore *server.FSClusterKeyStore
@@ -595,6 +650,13 @@ func Server(ctx context.Context, args []string) error {
 		srv = server.New(tokenV)
 		if adminTokenV != "" {
 			srv.AdminToken = adminTokenV
+		}
+	}
+	// Install the staging budget built before the server existed (see above).
+	if stagingBudget != nil {
+		srv.SetStagingBudget(stagingBudget)
+		if stagingPruned > 0 {
+			fmt.Printf("Kiwi staging: pruned %d abandoned file(s) from %s\n", stagingPruned, stagingBudget.Dir())
 		}
 	}
 	// Runner PKI is initialized BEFORE HA and production credential

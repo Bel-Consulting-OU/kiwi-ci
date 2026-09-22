@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
@@ -98,7 +99,7 @@ func (s *Server) persistDrainFlagLocked() error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(joinDataDir(s.dataDir, drainFlagFile), b, 0o600)
+	return fsutil.AtomicWriteFile(joinDataDir(s.dataDir, drainFlagFile), b, 0o600)
 }
 
 // loadDrainFlag restores a persisted drain state at startup.

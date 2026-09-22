@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
@@ -87,20 +88,21 @@ func TestFSAppendLogBatchRetryAcrossRestartSingleCopy(t *testing.T) {
 }
 
 // TestFSAppendLogBatchJournalWriteFailureRetrySingleCopy injects a failure in
-// the journal's AtomicWriteFile (the file Sync seam). Nothing may be exposed
-// as durable, and the retry must leave exactly one copy of every line.
+// the journal's AtomicWriteFile (the fsutil file Sync seam). Nothing may be
+// exposed as durable, and the retry must leave exactly one copy of every line.
 func TestFSAppendLogBatchJournalWriteFailureRetrySingleCopy(t *testing.T) {
 	repo := New(t.TempDir())
 	id := LogBatchIdentity{JobID: "job-1", Generation: 1, BatchID: "batch-1"}
 	entries := wave1BatchEntries("run-1", "job-1")
 
-	oldSync := atomicFileSync
-	atomicFileSync = func(*os.File) error { return errors.New("injected journal sync failure") }
+	restoreSync := fsutil.SetHooks(fsutil.Hooks{FileSync: func(*os.File) error {
+		return errors.New("injected journal sync failure")
+	}})
 	if err := repo.AppendLogBatch(id, entries); err == nil {
 		t.Fatal("append must fail when the journal cannot be made durable")
 	}
-	atomicFileSync = oldSync
-	t.Cleanup(func() { atomicFileSync = oldSync })
+	restoreSync()
+	t.Cleanup(restoreSync)
 
 	got, err := repo.ReadLogs("run-1", 0, 100)
 	if err != nil || len(got) != 0 {
@@ -129,19 +131,20 @@ func TestFSAppendLogBatchPublishFsyncFailureRetrySingleCopy(t *testing.T) {
 	// Layout adaptation: the max-seq index write adds directory fsyncs of its
 	// own, so the injected failure is targeted at the committed RUN
 	// directory's sync (the publication step, after the rename) instead of
-	// relying on the ordinal call count.
-	oldDir := atomicDirSync
+	// relying on the ordinal call count. The dir-sync seam now lives in
+	// fsutil; the hook delegates to fsutil.RealSyncDir for every other
+	// directory.
 	failed := 0
-	atomicDirSync = func(dir string) error {
+	restoreDir := fsutil.SetHooks(fsutil.Hooks{DirSync: func(dir string) error {
 		if filepath.Base(filepath.Dir(dir)) == filepath.Base(repo.logBatchCommittedDir()) {
 			failed++
 			return errors.New("injected publication dir fsync failure")
 		}
-		return oldDir(dir)
-	}
+		return fsutil.RealSyncDir(dir)
+	}})
 	err := repo.AppendLogBatch(id, entries)
-	atomicDirSync = oldDir
-	t.Cleanup(func() { atomicDirSync = oldDir })
+	restoreDir()
+	t.Cleanup(restoreDir)
 	if err == nil {
 		t.Fatal("append must surface the publication fsync failure")
 	}

@@ -52,6 +52,7 @@ type fcStore struct {
 	consumeSidecarErr  error
 	getCacheManErr     error
 	listSnapshotsErr   error
+	snapshotGetErr     error
 	fragmentGetErr     error
 	fragmentGetMiss    bool
 
@@ -357,6 +358,20 @@ func (f *fcStore) ListSnapshotsByRun(ctx context.Context, runID string) ([]model
 		return nil, f.listSnapshotsErr
 	}
 	return f.dbFakeStore.ListSnapshotsByRun(ctx, runID)
+}
+
+func (f *fcStore) GetSnapshot(ctx context.Context, runID, snapshotID string) (model.SnapshotRecord, bool, error) {
+	if f.snapshotGetErr != nil {
+		return model.SnapshotRecord{}, false, f.snapshotGetErr
+	}
+	return f.dbFakeStore.GetSnapshot(ctx, runID, snapshotID)
+}
+
+func (f *fcStore) ListSnapshotsPage(ctx context.Context, runID string, afterCreatedAt time.Time, afterID string, limit int) (storage.SnapshotPage, error) {
+	if f.listSnapshotsErr != nil {
+		return storage.SnapshotPage{}, f.listSnapshotsErr
+	}
+	return f.dbFakeStore.ListSnapshotsPage(ctx, runID, afterCreatedAt, afterID, limit)
 }
 
 func (f *fcStore) GetJobContracts(ctx context.Context, jobID string) (map[string]storage.ArtifactContract, bool, error) {

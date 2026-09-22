@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 // gatedSnapshotStore stalls the two SnapshotStore reads the DB branch of
@@ -43,10 +44,10 @@ func (g *gatedSnapshotStore) GetRun(ctx context.Context, id string) (model.Run, 
 	return g.dbFakeStore.GetRun(ctx, id)
 }
 
-func (g *gatedSnapshotStore) ListSnapshotsByRun(ctx context.Context, runID string) ([]model.SnapshotRecord, error) {
+func (g *gatedSnapshotStore) ListSnapshotsPage(ctx context.Context, runID string, afterCreatedAt time.Time, afterID string, limit int) (storage.SnapshotPage, error) {
 	g.listOnce.Do(func() { close(g.listEntered) })
 	<-g.releaseList
-	return g.dbFakeStore.ListSnapshotsByRun(ctx, runID)
+	return g.dbFakeStore.ListSnapshotsPage(ctx, runID, afterCreatedAt, afterID, limit)
 }
 
 // probeServerLock proves s.mu is free by acquiring it without blocking
@@ -66,7 +67,8 @@ func probeServerLock(t *testing.T, s *Server, stage string) {
 
 // TestSnapshotListDBLookupReleasesServerLock proves the P2 control-plane
 // contract: while the DB branch of listSnapshots is stalled inside GetRun and
-// then inside ListSnapshotsByRun, an unrelated goroutine can acquire s.mu and
+// then inside the paged snapshot record read, an unrelated goroutine can
+// acquire s.mu and
 // read/write server state. Channels gate the fake store and Mutex.TryLock
 // probes acquisition, so the test uses no timing sleeps and cannot deadlock.
 func TestSnapshotListDBLookupReleasesServerLock(t *testing.T) {

@@ -90,6 +90,12 @@ type dbFakeStore struct {
 	// snapshotErr, when non-nil, makes InsertSnapshotRecord fail (P2-31
 	// fail-closed snapshot upload tests).
 	snapshotErr error
+	// snapshotGetErr, when non-nil, makes GetSnapshot fail (download
+	// fail-closed tests).
+	snapshotGetErr error
+	// listSnapshotsErr, when non-nil, makes the snapshot collection reads
+	// fail: ListSnapshotsByRun and the keyset-paginated ListSnapshotsPage.
+	listSnapshotsErr error
 	// auditErr, when non-nil, makes AppendAudit fail (OIDC issuance
 	// fail-closed tests).
 	auditErr error
@@ -413,6 +419,43 @@ func (f *dbFakeStore) ListRunsPage(ctx context.Context, afterCreatedAt time.Time
 		runs = append(runs, r)
 	}
 	return storage.PageRuns(runs, afterCreatedAt, afterID, limit), nil
+}
+
+// ListRunsPageForAuthorizedRepos implements
+// storage.RunPageForPrincipalStore: the same keyset page, but with the
+// permitted canonical repository set applied BEFORE paging through the
+// shared storage.PageRunsForAuthorizedRepos definition, exactly like the
+// shipped stores.
+func (f *dbFakeStore) ListRunsPageForAuthorizedRepos(ctx context.Context, allowedRepoIDs []string, afterCreatedAt time.Time, afterID string, limit int) (storage.RunPage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.listRunsErr != nil {
+		return storage.RunPage{}, f.listRunsErr
+	}
+	runs := make([]model.Run, 0, len(f.runs))
+	for _, r := range f.runs {
+		runs = append(runs, r)
+	}
+	return storage.PageRunsForAuthorizedRepos(runs, allowedRepoIDs, afterCreatedAt, afterID, limit), nil
+}
+
+// ListRunRepoIDs implements storage.RunRepoIDStore for the fake, using the
+// same canonical policy-first derivation as the shipped stores.
+func (f *dbFakeStore) ListRunRepoIDs(ctx context.Context) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	seen := map[string]bool{}
+	out := []string{}
+	for _, r := range f.runs {
+		id := storage.RepoIDForRun(r)
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 func (f *dbFakeStore) InsertJob(ctx context.Context, job model.Job) error {
@@ -2377,6 +2420,34 @@ func (f *dbFakeStore) ListSnapshotsByRun(ctx context.Context, runID string) ([]m
 		}
 	}
 	return out, nil
+}
+
+// GetSnapshot is the single-record lookup of the fake: one (run_id, id) scan
+// with the shared store contract (a record of another run is missing), plus
+// the same error injection the record writes use.
+func (f *dbFakeStore) GetSnapshot(ctx context.Context, runID, snapshotID string) (model.SnapshotRecord, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.snapshotGetErr != nil {
+		return model.SnapshotRecord{}, false, f.snapshotGetErr
+	}
+	for _, rec := range f.snapshots {
+		if rec.RunID == runID && rec.ID == snapshotID {
+			return rec, true, nil
+		}
+	}
+	return model.SnapshotRecord{}, false, nil
+}
+
+// ListSnapshotsPage is the paged collection read of the fake, using the same
+// shared storage.PageSnapshots keyset definition as the shipped stores.
+func (f *dbFakeStore) ListSnapshotsPage(ctx context.Context, runID string, afterCreatedAt time.Time, afterID string, limit int) (storage.SnapshotPage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.listSnapshotsErr != nil {
+		return storage.SnapshotPage{}, f.listSnapshotsErr
+	}
+	return storage.PageSnapshots(f.snapshots, runID, afterCreatedAt, afterID, limit), nil
 }
 
 func (f *dbFakeStore) InsertJobContracts(ctx context.Context, jobID string, contracts map[string]storage.ArtifactContract) error {

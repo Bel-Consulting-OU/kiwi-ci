@@ -55,12 +55,18 @@ func TestTokenStoreLoadAndSaveErrors(t *testing.T) {
 		t.Fatal("Save under a regular file must fail creating the parent directory")
 	}
 
-	tmpBlocker := filepath.Join(dir, "tokens.json")
-	if err := os.MkdirAll(tmpBlocker+".tmp", 0o700); err != nil {
+	// A stale fixed temp path from a pre-fsutil release is inert: durable
+	// writes use unique temp names, so Save must succeed and leave the stale
+	// entry untouched.
+	staleTmp := filepath.Join(dir, "tokens.json.tmp")
+	if err := os.MkdirAll(staleTmp, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Save(tmpBlocker); err == nil {
-		t.Fatal("Save must fail when the temp path is a directory")
+	if err := store.Save(filepath.Join(dir, "tokens.json")); err != nil {
+		t.Fatalf("Save must ignore a stale fixed temp path: %v", err)
+	}
+	if fi, err := os.Stat(staleTmp); err != nil || !fi.IsDir() {
+		t.Fatalf("stale temp path was modified: fi=%v err=%v", fi, err)
 	}
 }
 

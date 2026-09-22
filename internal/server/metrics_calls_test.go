@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cache"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secretbroker"
 )
@@ -163,7 +164,7 @@ func seedCacheEntry(s *Server, fileKey, logicalKey, repo, trust string, data []b
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	return writeFileAtomic(path, b, 0o600)
+	return fsutil.AtomicWriteFile(path, b, 0o600)
 }
 
 var _ = model.StatusSuccess

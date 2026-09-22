@@ -80,6 +80,10 @@ func TestValidateProductionConfig(t *testing.T) {
 		ExternalURL: "https://ci.example.com",
 		TLSCert:     "cert.pem",
 		TLSKey:      "key.pem",
+		// A production config must carry an explicit large-upload staging
+		// bound (the staging validation matrix lives in staging_test.go).
+		StagingDir:      "/var/lib/kiwi/staging",
+		StagingMaxBytes: 1 << 30,
 	}
 	if err := validateProductionConfig(valid); err != nil {
 		t.Fatalf("valid production config rejected: %v", err)

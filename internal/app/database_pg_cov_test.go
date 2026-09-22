@@ -130,6 +130,7 @@ func TestServerDBModeProductionUsesDBClusterKeyStore(t *testing.T) {
 		"--mode", "production", "--external-url", "https://ci.example.com",
 		"--tls-cert", certFile, "--tls-key", keyFile, "--admin-token", "admin",
 		"--data-dir", t.TempDir(),
+		"--staging-dir", t.TempDir(), "--staging-max-bytes", "67108864",
 		"--runner-tokens-file", writeRunnerTokensFile(t))
 	waitTCPUp(t, addr, errCh, 15*time.Second)
 	if err := stopServer(t, cancel, errCh); err != nil {
@@ -174,7 +175,8 @@ func TestServerDBModeProductionRunnerTokenOnlyWithProvisionedTokens(t *testing.T
 	errCh := startServer(t, ctx, "--listen", addr, "--database-url", dsn,
 		"--mode", "production", "--external-url", "https://ci.example.com",
 		"--tls-cert", certFile, "--tls-key", keyFile,
-		"--admin-token", "admin", "--runner-token", "shared-runner-token")
+		"--admin-token", "admin", "--runner-token", "shared-runner-token",
+		"--staging-dir", t.TempDir(), "--staging-max-bytes", "67108864")
 	waitTCPUp(t, addr, errCh, 15*time.Second)
 	if err := stopServer(t, cancel, errCh); err != nil {
 		t.Fatalf("production with --runner-token and provisioned bearer tokens returned %v", err)
@@ -190,7 +192,8 @@ func TestServerDBModeProductionNoRunnerMechanismFailsPostDB(t *testing.T) {
 	err := Server(context.Background(), []string{"--listen", freeTCPAddr(t), "--database-url", dsn,
 		"--mode", "production", "--external-url", "https://ci.example.com",
 		"--tls-cert", certFile, "--tls-key", keyFile,
-		"--admin-token", "admin", "--runner-token", "shared-runner-token"})
+		"--admin-token", "admin", "--runner-token", "shared-runner-token",
+		"--staging-dir", t.TempDir(), "--staging-max-bytes", "67108864"})
 	if err == nil || !strings.Contains(err.Error(), "production requires runner mTLS or per-runner credentials") {
 		t.Fatalf("production without runner credentials = %v", err)
 	}
@@ -245,6 +248,7 @@ func TestServerDBModeProductionWithCluster(t *testing.T) {
 		"--mode", "production", "--external-url", "https://ci.example.com",
 		"--tls-cert", certFile, "--tls-key", keyFile,
 		"--data-dir", dataDir, "--cluster-key-dir", clusterDir, "--admin-token", "admin",
+		"--staging-dir", t.TempDir(), "--staging-max-bytes", "67108864",
 		"--runner-tokens-file", writeRunnerTokensFile(t))
 	waitTCPUp(t, addr, errCh, 15*time.Second)
 	if err := stopServer(t, cancel, errCh); err != nil {
@@ -264,6 +268,7 @@ func TestServerDBModeProductionChecksProvisionedTokens(t *testing.T) {
 	err := Server(context.Background(), []string{"--listen", addr, "--database-url", dsn,
 		"--mode", "production", "--external-url", "https://ci.example.com",
 		"--tls-cert", certFile, "--tls-key", keyFile, "--allow-shared-token",
+		"--staging-dir", t.TempDir(), "--staging-max-bytes", "67108864",
 		"--data-dir", dataDir, "--cluster-key-dir", clusterDir})
 	if err == nil || !strings.Contains(err.Error(), "production requires runner mTLS or per-runner credentials") {
 		t.Fatalf("production without runner credentials = %v", err)
@@ -283,7 +288,7 @@ func TestServerDBModeProductionChecksProvisionedTokens(t *testing.T) {
 	errCh := startServer(t, ctx2, "--listen", addr, "--database-url", dsn,
 		"--mode", "production", "--external-url", "https://ci.example.com",
 		"--tls-cert", certFile, "--tls-key", keyFile, "--allow-shared-token",
-		"--data-dir", dataDir, "--cluster-key-dir", clusterDir)
+		"--data-dir", dataDir, "--cluster-key-dir", clusterDir, "--staging-dir", t.TempDir(), "--staging-max-bytes", "67108864")
 	waitTCPUp(t, addr, errCh, 15*time.Second)
 	if err := stopServer(t, cancel2, errCh); err != nil {
 		t.Fatalf("production DB-mode Server with provisioned tokens returned %v", err)
