@@ -225,7 +225,7 @@ func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "snapshot storage requires a CAS blob store in DB mode", http.StatusServiceUnavailable)
 			return
 		}
-		s.uploadSnapshotDB(w, r, j, runnerID)
+		s.uploadSnapshotDB(w, r, j, runnerID, gen)
 		return
 	}
 	if s.store == nil {
@@ -322,6 +322,17 @@ func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
 	// the in-memory record and the unreferenced files, so the runner can
 	// retry instead of losing the snapshot silently.
 	s.mu.Lock()
+	// Commit-time lease predicate under the SAME lock as the record insert:
+	// a revoke/cancel/replacement/expiry during the (multi-GB) staging must
+	// not be acknowledged in dev mode either.
+	if !s.validActiveLease(s.jobs[j.ID], runnerID, token, gen, time.Now().UTC()) {
+		s.mu.Unlock()
+		_ = os.Remove(dst)
+		_ = os.Remove(dst + ".manifest.json")
+		s.auditLocked("snapshot.lease_lost_at_commit", runnerID, j.RunID, j.ID, "lease lost before snapshot commit", nil)
+		http.Error(w, "lease expired during upload", http.StatusConflict)
+		return
+	}
 	s.snapshots[id] = rec
 	persistErr := s.persistLocked()
 	if persistErr != nil {
@@ -415,7 +426,7 @@ func validateSnapshotFiles(rec model.SnapshotRecord) error {
 // because a failed metadata persist must not remove a digest another
 // record may reference. The record's Path is the cas:<digest> reference,
 // so any replica resolves the archive by digest.
-func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j model.Job, runnerID string) {
+func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j model.Job, runnerID string, gen int64) {
 	ctx := r.Context()
 	stagingBudget := s.StagingBudget()
 	if stagingBudget == nil {
@@ -452,37 +463,35 @@ func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j mode
 		return
 	}
 	defer res.Release()
-	// The staging file carries staging.FilePrefix, so an abandoned file left
-	// by a crashed process is reclaimed by the package's startup Prune.
-	tmp, err := os.CreateTemp(stagingBudget.Dir(), staging.FilePrefix+"snapshot-*")
+	// Stage the archive through the budget-owned spool primitive: the file is
+	// created AND registered as an active spool under the budget mutex, so a
+	// concurrent Budget.Prune can never unlink a live snapshot spool by age
+	// (a raw os.CreateTemp with the reclaimable FilePrefix would be invisible
+	// to the active-spool set). The body is bounded at the reservation, which
+	// SpoolFile also enforces on the source.
+	stagedPath, n, err := stagingBudget.SpoolFile(http.MaxBytesReader(w, r.Body, reserve), reserve)
 	if err != nil {
-		s.internalError(w, r, err, "")
-		return
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	defer tmp.Close()
-	h := sha256.New()
-	n, copyErr := io.Copy(io.MultiWriter(tmp, h), http.MaxBytesReader(w, r.Body, reserve))
-	if err := firstErr(copyErr); err != nil {
-		if isSnapshotBodyTooLarge(copyErr) {
+		if isSnapshotBodyTooLarge(err) || errors.Is(err, staging.ErrTooLarge) {
 			http.Error(w, snapshotTooLargeError(), http.StatusRequestEntityTooLarge)
+			return
+		}
+		if ctx.Err() != nil {
+			// The client is gone; there is nobody to answer.
 			return
 		}
 		s.internalError(w, r, err, "")
 		return
 	}
-	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+	defer os.Remove(stagedPath)
+	f, err := os.Open(stagedPath)
+	if err != nil {
 		s.internalError(w, r, err, "")
 		return
 	}
-	m, err := snapshot.Parse(tmp)
+	m, err := snapshot.Parse(f)
+	_ = f.Close()
 	if err != nil {
 		http.Error(w, "invalid snapshot archive: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
-		s.internalError(w, r, err, "")
 		return
 	}
 	id, err := newID()
@@ -492,10 +501,10 @@ func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j mode
 	}
 	// Publish + record commit under the digest fence (the collector re-reads
 	// references under the same fence). The digest is only known after the
-	// staged bytes are hashed, so the staging temp file is hashed here
-	// first; the publication then streams that SAME staged file into the
-	// backend (no second copy) and validates the object the backend reports.
-	stagedSum, sumErr := fileSHA256(tmp.Name())
+	// staged bytes are hashed, so the staging spool is hashed here first; the
+	// publication then streams that SAME staged file into the backend (no
+	// second copy) and validates the object the backend reports.
+	stagedSum, sumErr := fileSHA256(stagedPath)
 	if sumErr != nil {
 		s.internalError(w, r, sumErr, "")
 		return
@@ -506,7 +515,7 @@ func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j mode
 		return
 	}
 	defer releaseSnap()
-	obj, err := s.CAS.PutFile(ctx, tmpName, stagedSum, n)
+	obj, err := s.CAS.PutFile(ctx, stagedPath, stagedSum, n)
 	if err != nil {
 		if casIntegrityError(err) {
 			s.logf("snapshot upload: CAS publication failed: %v", err)
@@ -522,7 +531,7 @@ func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j mode
 	// stored object failing the CAS digest check on re-read) fails the
 	// upload instead of being acknowledged; the unreferenced blob is left
 	// for the reference-aware GC.
-	wantSHA := hex.EncodeToString(h.Sum(nil))
+	wantSHA := stagedSum
 	if obj.Key != wantSHA || obj.SHA256 != wantSHA || obj.Size != n {
 		http.Error(w, "snapshot storage verification failed", http.StatusServiceUnavailable)
 		return
@@ -552,7 +561,20 @@ func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j mode
 		http.Error(w, "snapshot record storage unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	if err := ss.InsertSnapshotRecord(ctx, rec); err != nil {
+	// Prefer the lease-fenced store method: the live-lease predicate and the
+	// record insert run in ONE transaction, so a lease lost during the
+	// multi-GB staging can never be acknowledged as a snapshot commit.
+	if leaseStore, ok := s.DB.(storage.LeaseCommitStore); ok {
+		if err := leaseStore.InsertSnapshotForLease(ctx, j.ID, runnerID, gen, rec); err != nil {
+			if leaseLostAtCommit(err) {
+				s.auditLocked("snapshot.lease_lost_at_commit", runnerID, j.RunID, j.ID, "lease lost before snapshot commit", nil)
+				http.Error(w, "lease expired during upload", http.StatusConflict)
+				return
+			}
+			http.Error(w, "snapshot record persistence failed", http.StatusServiceUnavailable)
+			return
+		}
+	} else if err := ss.InsertSnapshotRecord(ctx, rec); err != nil {
 		// Fail the upload instead of logging: a snapshot whose record is
 		// not durable must not be acknowledged. The CAS blob is left in
 		// place as an orphan (content-addressed, possibly referenced by
@@ -827,13 +849,13 @@ func (s *Server) downloadSnapshot(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "snapshot archive missing", http.StatusNotFound)
 		return
 	}
-	defer f.Close()
-	w.Header().Set("Content-Type", "application/gzip")
-	w.Header().Set("Content-Length", strconv.FormatInt(rec.Size, 10))
-	w.Header().Set("X-Kiwi-Snapshot-SHA256", rec.SHA256)
-	if _, err := io.Copy(w, f); err != nil {
-		s.logf("snapshot download: %v", err)
-	}
+	// Strong integrity: the archive is preverified (exact length + digest)
+	// before the response is committed; the verified file is then streamed.
+	s.serveVerifiedDownload(w, r, "snapshot", f, rec.Size, rec.SHA256, func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/gzip")
+		w.Header().Set("Content-Length", strconv.FormatInt(rec.Size, 10))
+		w.Header().Set("X-Kiwi-Snapshot-SHA256", rec.SHA256)
+	})
 }
 
 // downloadSnapshotDB streams one snapshot in DB mode: the record comes from
@@ -881,13 +903,21 @@ func (s *Server) downloadSnapshotDB(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "snapshot archive missing", http.StatusNotFound)
 			return
 		}
-		defer rc.Close()
-		w.Header().Set("Content-Type", "application/gzip")
-		w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
-		w.Header().Set("X-Kiwi-Snapshot-SHA256", digest)
-		if _, err := io.Copy(w, rc); err != nil {
-			s.logf("snapshot download: %v", err)
+		wantSize := rec.Size
+		if wantSize <= 0 {
+			wantSize = obj.Size
 		}
+		wantSHA := rec.SHA256
+		if wantSHA == "" {
+			wantSHA = digest
+		}
+		// Strong integrity: preverify the CAS object (exact length + digest)
+		// before committing the response; a corrupt backend yields no 200.
+		s.serveVerifiedDownload(w, r, "snapshot", rc, wantSize, wantSHA, func(w http.ResponseWriter) {
+			w.Header().Set("Content-Type", "application/gzip")
+			w.Header().Set("Content-Length", strconv.FormatInt(wantSize, 10))
+			w.Header().Set("X-Kiwi-Snapshot-SHA256", digest)
+		})
 		return
 	}
 	if rec.Path != "" {
@@ -896,13 +926,11 @@ func (s *Server) downloadSnapshotDB(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "snapshot archive missing", http.StatusNotFound)
 			return
 		}
-		defer f.Close()
-		w.Header().Set("Content-Type", "application/gzip")
-		w.Header().Set("Content-Length", strconv.FormatInt(rec.Size, 10))
-		w.Header().Set("X-Kiwi-Snapshot-SHA256", rec.SHA256)
-		if _, err := io.Copy(w, f); err != nil {
-			s.logf("snapshot download: %v", err)
-		}
+		s.serveVerifiedDownload(w, r, "snapshot", f, rec.Size, rec.SHA256, func(w http.ResponseWriter) {
+			w.Header().Set("Content-Type", "application/gzip")
+			w.Header().Set("Content-Length", strconv.FormatInt(rec.Size, 10))
+			w.Header().Set("X-Kiwi-Snapshot-SHA256", rec.SHA256)
+		})
 		return
 	}
 	http.NotFound(w, r)

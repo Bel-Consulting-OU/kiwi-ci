@@ -47,6 +47,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"math"
 	"os"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/blob"
@@ -147,7 +148,20 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	if c.err != nil {
 		return 0, c.err
 	}
-	room := c.max + 1 - c.read
+	// Compute the room for one byte PAST the bound (the over-limit probe
+	// byte) without overflowing int64 when max is math.MaxInt64: the naive
+	// max+1-read wraps to a negative room and would fail a legal stream
+	// immediately. With read <= max, max-read is non-negative and cannot
+	// wrap; the +1 is skipped only in the MaxInt64 corner, where no
+	// physically reachable stream can exceed the bound anyway.
+	if c.read > c.max {
+		c.err = c.overError()
+		return 0, c.err
+	}
+	room := c.max - c.read
+	if room < math.MaxInt64 {
+		room++
+	}
 	if room <= 0 {
 		c.err = c.overError()
 		return 0, c.err
@@ -230,7 +244,7 @@ func (c *CAS) Put(ctx context.Context, r io.Reader) (blob.Object, error) {
 	// The bytes already buffered are hashed; the remaining stream is hashed
 	// while SpoolFile writes it, so the digest covers the whole stream.
 	src := io.MultiReader(bytes.NewReader(buf.Bytes()), io.TeeReader(r, h))
-	path, total, spoolErr := staging.SpoolFile(c.Staging.Dir(), src, limit)
+	path, total, spoolErr := c.Staging.SpoolFile(src, limit)
 	if spoolErr != nil {
 		if errors.Is(spoolErr, staging.ErrTooLarge) {
 			return blob.Object{}, ErrBlobTooLarge

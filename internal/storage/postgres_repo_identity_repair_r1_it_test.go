@@ -330,18 +330,20 @@ func TestPostgresIntegrationRepoIdentityRepairQuarantineInert(t *testing.T) {
 
 	runID := pgITNewID(t)
 	jobID := pgITNewID(t)
-	pgITInsertRunIdentity(t, st, runID, "group/sub/project", "group/sub/project", "", "")
-	pgITInsertJobIdentity(t, st, runID, jobID, "group/sub/project", "group/sub/project", "", "")
+	pgITInsertRunIdentityStatus(t, st, runID, "queued", "group/sub/project", "group/sub/project", "", "")
+	pgITInsertJobIdentityStatus(t, st, runID, jobID, "queued", "group/sub/project", "group/sub/project", "", "")
 
 	okRun := pgITNewID(t)
 	okJob := pgITNewID(t)
-	pgITInsertRunIdentity(t, st, okRun, "github.com/acme/ok", "github.com/acme/ok", "https://github.com/acme/ok.git", "acme/ok")
-	pgITInsertJobIdentity(t, st, okRun, okJob, "github.com/acme/ok", "github.com/acme/ok", "https://github.com/acme/ok.git", "acme/ok")
+	pgITInsertRunIdentityStatus(t, st, okRun, "queued", "github.com/acme/ok", "github.com/acme/ok", "https://github.com/acme/ok.git", "acme/ok")
+	pgITInsertJobIdentityStatus(t, st, okRun, okJob, "queued", "github.com/acme/ok", "github.com/acme/ok", "https://github.com/acme/ok.git", "acme/ok")
 
 	runnerID := pgITNewID(t)
 	pgITSeedRunner(t, st, runnerID, 5, 0, 0)
 
-	res, err := st.RepairRepoIdentities(ctx, RepoIdentityRepairApply)
+	// The run/job are non-terminal: the drain-then-quarantine path requires
+	// the explicit --cancel-active (T1-1).
+	res, err := st.RepairRepoIdentitiesWithOptions(ctx, RepoIdentityRepairApply, RepoIdentityRepairOptions{CancelActive: true})
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}

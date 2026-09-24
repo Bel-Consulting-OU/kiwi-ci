@@ -502,7 +502,11 @@ func (b *Budget) Acquire(ctx context.Context, n int64) (*Reservation, error) {
 			b.mu.Unlock()
 			return nil, fmt.Errorf("%w: %s", ErrClosed, b.dir)
 		}
-		if b.used+n <= b.maxBytes {
+		// Subtraction form: with the maintained invariant
+		// 0 <= used <= maxBytes, maxBytes-used cannot overflow, whereas
+		// used+n can wrap for a large n and a large configured limit,
+		// silently admitting an over-budget reservation.
+		if n <= b.maxBytes-b.used {
 			b.used += n
 			b.mu.Unlock()
 			return &Reservation{budget: b, n: n}, nil
@@ -560,21 +564,6 @@ func (r *Reservation) Release() {
 	})
 }
 
-// budgetForDir returns the process's live Budget owning dir, or nil when the
-// directory has no in-process owner (for example a bare SpoolFile target or a
-// budget closed and handed to a successor). It is the bridge that lets the
-// package-level SpoolFile register an active spool with the Budget whose Prune
-// must skip it.
-func budgetForDir(dir string) *Budget {
-	ownedDirsMu.Lock()
-	defer ownedDirsMu.Unlock()
-	b := ownedDirs[canonicalDir(dir)]
-	if b == nil || b.closed.Load() {
-		return nil
-	}
-	return b
-}
-
 // trackSpoolLocked records path as an active spool of this budget. The caller
 // holds b.mu.
 func (b *Budget) trackSpoolLocked(path string) {
@@ -589,17 +578,25 @@ func (b *Budget) trackSpoolLocked(path string) {
 // process that never calls Prune while keeping the reconcile off the hot path.
 const spoolSweepEvery = 256
 
-// beginSpool creates a fresh spool file and, when a Budget owns dir, registers
-// it as active atomically with its creation: both the create and the tracking
-// happen under the budget's mutex, so a concurrent Prune can never observe an
-// untracked spool file it is free to unlink. It returns the open file (the
-// caller streams into it), its path, and whether the path was tracked.
-func (b *Budget) beginSpool(dir string) (*os.File, string, bool, error) {
+// beginSpool creates a fresh spool file in the budget's directory and
+// registers it as active atomically with its creation: both the create and
+// the tracking happen under the budget's mutex, so a concurrent Prune can
+// never observe an untracked spool file it is free to unlink. The closed
+// check happens under that SAME mutex immediately before the create, so a
+// caller can never create (or register) a spool after CloseWithContext has
+// retired the directory: once Close flips closed under mu, no new spool can
+// appear, and the directory hand-off to a successor is therefore not racing a
+// late spool. It returns the open file (the caller streams into it) and its
+// path.
+func (b *Budget) beginSpool() (*os.File, string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	f, err := os.CreateTemp(dir, FilePrefix+"*")
+	if b.closed.Load() {
+		return nil, "", fmt.Errorf("%w: %s", ErrClosed, b.dir)
+	}
+	f, err := os.CreateTemp(b.dir, FilePrefix+"*")
 	if err != nil {
-		return nil, "", false, err
+		return nil, "", err
 	}
 	path := f.Name()
 	b.trackSpoolLocked(path)
@@ -607,7 +604,7 @@ func (b *Budget) beginSpool(dir string) (*os.File, string, bool, error) {
 	if b.spoolTracked%spoolSweepEvery == 0 {
 		b.forgetMissingSpoolsLocked()
 	}
-	return f, path, true, nil
+	return f, path, nil
 }
 
 // ReleaseSpool drops path from the active set, so a later Prune may reclaim it
@@ -701,47 +698,28 @@ func (b *Budget) Prune(ctx context.Context) (int, error) {
 	return removed, nil
 }
 
-// SpoolFile stages r into a fresh file in dir under FilePrefix and returns
-// its path and the number of bytes written. When limit is positive the copy
-// never writes more than limit bytes to disk: the stream is read up to limit
-// and then probed for a single extra byte on the SOURCE, so an over-limit
-// reader is detected and rejected (error wrapping ErrTooLarge, partial file
-// removed) without that byte ever reaching the filesystem. A reader error
-// (for example http.MaxBytesError from the caller's body cap) is returned
-// unchanged after the partial file is removed. The caller owns the returned
-// path and must remove it.
+// SpoolFile stages r into a fresh file in the budget's directory under
+// FilePrefix and returns its path and the number of bytes written. When limit
+// is positive the copy never writes more than limit bytes to disk: the stream
+// is read up to limit and then probed for a single extra byte on the SOURCE,
+// so an over-limit reader is detected and rejected (error wrapping ErrTooLarge,
+// partial file removed) without that byte ever reaching the filesystem. A
+// reader error (for example http.MaxBytesError from the caller's body cap) is
+// returned unchanged after the partial file is removed. The caller owns the
+// returned path and must remove it.
 //
-// When a Budget owns dir in this process the spool is registered as active at
-// creation, so a concurrent Prune skips it even if its age passes the
-// threshold; the registration is dropped when the file is observed gone (by
-// Prune) or explicitly with Budget.ReleaseSpool. A failed copy releases the
-// registration together with the partial file.
-func SpoolFile(dir string, r io.Reader, limit int64) (string, int64, error) {
-	dir = strings.TrimSpace(dir)
-	if dir == "" {
+// The spool is registered as active at creation under the budget mutex, so a
+// concurrent Prune skips it even if its age passes the threshold; the
+// registration is dropped when the file is observed gone (by Prune) or
+// explicitly with Budget.ReleaseSpool. A failed copy releases the registration
+// together with the partial file. A closed budget fails closed with ErrClosed
+// before any file is created: ownership may already have been handed to a
+// successor, so no new bytes may be admitted.
+func (b *Budget) SpoolFile(r io.Reader, limit int64) (string, int64, error) {
+	if b == nil || strings.TrimSpace(b.dir) == "" {
 		return "", 0, fmt.Errorf("%w: staging directory is not configured", ErrNoBound)
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", 0, err
-	}
-	// When this process owns dir, create and register the spool atomically so
-	// a concurrent Prune can never unlink it in the window between the file
-	// appearing and being recorded as active.
-	owner := budgetForDir(dir)
-	var (
-		f       *os.File
-		path    string
-		tracked bool
-		err     error
-	)
-	if owner != nil {
-		f, path, tracked, err = owner.beginSpool(dir)
-	} else {
-		f, err = os.CreateTemp(dir, FilePrefix+"*")
-		if err == nil {
-			path = f.Name()
-		}
-	}
+	f, path, err := b.beginSpool()
 	if err != nil {
 		return "", 0, err
 	}
@@ -750,9 +728,7 @@ func SpoolFile(dir string, r io.Reader, limit int64) (string, int64, error) {
 	closeErr := f.Close()
 	if err := firstErr(copyErr, syncErr, closeErr); err != nil {
 		_ = os.Remove(path)
-		if tracked {
-			owner.ReleaseSpool(path)
-		}
+		b.ReleaseSpool(path)
 		return "", n, err
 	}
 	return path, n, nil

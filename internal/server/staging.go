@@ -23,7 +23,8 @@ import "github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
 //
 // This accessor is the stable consumption point for the snapshot path:
 // s.StagingBudget().Acquire(ctx, n) / res.Release(), and
-// staging.SpoolFile(s.StagingBudget().Dir(), body, n) for the staged bytes.
+// s.StagingBudget().SpoolFile(body, n) for the staged bytes (the spool is
+// registered active with the budget, so a concurrent Prune cannot unlink it).
 func (s *Server) StagingBudget() *staging.Budget { return s.Staging }
 
 // installStagingBudget is the construction-time-only staging wiring: it

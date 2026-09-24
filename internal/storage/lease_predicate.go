@@ -11,6 +11,42 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
 )
 
+// LeaseParentRunEligibleSQL is the defense-in-depth parent-run predicate for a
+// queued job, evaluated against the `jobs` table (the caller's FROM/UPDATE
+// table must be named `jobs`). A job is ineligible when its parent run row
+// exists and is TERMINAL (success/failure/cancelled/skipped/blocked) or
+// carries the durable repo_identity_quarantined payload flag: a queued child
+// must never be leased while its run is cancelled+quarantined, even if an
+// operator ever requeues it. A MISSING run row is tolerated (the predicate
+// denies only a PRESENT run that is ineligible) for the same reason the
+// in-memory mirror and legacy orphan jobs are; a job's OWN quarantine flag is
+// checked separately by the caller.
+//
+// The flag is read from the run payload because the run's quarantine marker is
+// durable in `payload->>'repo_identity_quarantined'`, exactly like the
+// job-level flag (the schema carries no separate column).
+const LeaseParentRunEligibleSQL = `NOT EXISTS (
+        SELECT 1 FROM runs r
+        WHERE r.id = jobs.run_id
+          AND (r.status IN ('success', 'failure', 'cancelled', 'skipped', 'blocked')
+               OR COALESCE(r.payload->>'repo_identity_quarantined', '') = 'true')
+    )`
+
+// leaseParentRunEligibleLocked is the in-memory mirror of
+// LeaseParentRunEligibleSQL, evaluated under the store mutex. A missing run row
+// is eligible (legacy/orphan tolerance); a present terminal or quarantined run
+// denies.
+func (m *memStore) leaseParentRunEligibleLocked(j model.Job) bool {
+	if j.RunID == "" {
+		return true
+	}
+	r, ok := m.runs[j.RunID]
+	if !ok {
+		return true
+	}
+	return !r.Status.Terminal() && !r.RepoIdentityQuarantined
+}
+
 // LeasePredicate is the single scheduling decision shared by every lease
 // path: the PostgresStore claim, the in-memory stores, the DB scheduler's
 // candidate pre-filter and the server's dev-mode next(). Keeping one

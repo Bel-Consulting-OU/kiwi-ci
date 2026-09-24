@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -31,6 +32,16 @@ import (
 )
 
 const maxBlobBytes int64 = 8 << 30 // 8 GiB hard safety limit for the built-in store.
+
+// limitPlusOne returns limit+1 without signed overflow. A limit at
+// math.MaxInt64 is returned unchanged: the naive +1 wraps to a negative bound
+// and would reject every body instead of admitting the caller's limit.
+func limitPlusOne(limit int64) int64 {
+	if limit == math.MaxInt64 {
+		return limit
+	}
+	return limit + 1
+}
 
 // cacheUploadMaxBytes is the receiver's HTTP body cap for cache uploads: the
 // same 8 GiB safety limit the artifact path enforces. It is a variable so
@@ -237,7 +248,7 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 	// writes more than the reservation to disk (the over-limit byte is
 	// detected on the source), so the reservation stays exact even when the
 	// body lies about its length.
-	stagedPath, n, err := staging.SpoolFile(budget.Dir(), http.MaxBytesReader(w, r.Body, effectiveLimit+1), reserve)
+	stagedPath, n, err := budget.SpoolFile(http.MaxBytesReader(w, r.Body, limitPlusOne(effectiveLimit)), reserve)
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) || errors.Is(err, staging.ErrTooLarge) {
@@ -497,13 +508,35 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 		// index admits exactly one record across replicas. Losing a race to
 		// a concurrent upload returns the stored record (same digest, 200)
 		// or conflicts (409); the stored record is never overwritten.
-		idem, ok := s.DB.(storage.ArtifactIdempotentStore)
-		if !ok {
-			_ = os.Remove(dst)
-			http.Error(w, "artifact store does not support idempotent artifact insertion", 500)
+		//
+		// The record is inserted through the lease-fenced store method when
+		// available: the live-lease predicate and the insert run in ONE
+		// transaction, so a lease revoked/cancelled/replaced/expired during
+		// the (potentially multi-GB) staging can never be acknowledged. The
+		// handler-side late check above is a fast path; the transaction is
+		// the enforcement point.
+		var (
+			stored  model.ArtifactRecord
+			created bool
+			ierr    error
+		)
+		if leaseStore, ok := s.DB.(storage.LeaseCommitStore); ok {
+			stored, created, ierr = leaseStore.InsertArtifactOnceForLease(ctx, j.ID, runnerID, gen, rec)
+		} else {
+			idem, ok := s.DB.(storage.ArtifactIdempotentStore)
+			if !ok {
+				_ = os.Remove(dst)
+				http.Error(w, "artifact store does not support idempotent artifact insertion", 500)
+				return
+			}
+			stored, created, ierr = idem.InsertArtifactOnce(ctx, rec)
+		}
+		if leaseLostAtCommit(ierr) {
+			removeStagedArtifact(dst, casMode)
+			s.auditLocked("artifact.lease_lost_at_commit", runnerID, j.RunID, j.ID, "lease lost before artifact commit", map[string]string{"name": name})
+			http.Error(w, "lease expired during upload", http.StatusConflict)
 			return
 		}
-		stored, created, ierr := idem.InsertArtifactOnce(ctx, rec)
 		if errors.Is(ierr, storage.ErrArtifactDigestConflict) {
 			removeStagedArtifact(dst, casMode)
 			s.auditLocked("artifact.contract_violation", runnerID, j.RunID, j.ID, "artifact digest changed within one lease generation", map[string]string{"name": name, "existing": stored.SHA256, "incoming": digest})
@@ -540,6 +573,18 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 	// under s.mu, so concurrent uploads on one instance resolve exactly like
 	// the SQL unique key.
 	s.mu.Lock()
+	// Commit-time lease predicate under the SAME lock as the insert: the
+	// earlier late check ran in its own critical section, so a concurrent
+	// in-memory cancel could interleave. Re-checking here makes the check and
+	// the insert atomic in dev mode too.
+	if !s.validActiveLease(s.jobs[j.ID], runnerID, token, gen, time.Now().UTC()) {
+		s.mu.Unlock()
+		_ = os.Remove(dst)
+		_ = os.Remove(dst + ".intoto.json")
+		s.auditLocked("artifact.lease_lost_at_commit", runnerID, j.RunID, j.ID, "lease lost before artifact commit", map[string]string{"name": name})
+		http.Error(w, "lease expired during upload", http.StatusConflict)
+		return
+	}
 	stored, created, merr := s.insertArtifactMemoryLocked(rec)
 	switch {
 	case errors.Is(merr, storage.ErrArtifactDigestConflict):
@@ -822,12 +867,17 @@ func (s *Server) downloadArtifact(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	defer f.Close()
-	w.Header().Set("Content-Type", rec.ContentType)
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.tar.gz"`, cleanBlobName(rec.Name)))
-	w.Header().Set("X-Kiwi-Content-SHA256", rec.SHA256)
-	w.Header().Set("Content-Length", strconv.FormatInt(rec.Size, 10))
-	_, _ = io.Copy(w, f)
+	// Strong integrity: preverify the exact digest+length into a bounded
+	// staging spool BEFORE committing the response, then stream the verified
+	// file. A corrupt backend can no longer produce a complete-length corrupt
+	// body with a 200; a verification failure serves nothing and a write
+	// failure aborts the connection.
+	s.serveVerifiedDownload(w, r, "artifact", f, rec.Size, rec.SHA256, func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", rec.ContentType)
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.tar.gz"`, cleanBlobName(rec.Name)))
+		w.Header().Set("X-Kiwi-Content-SHA256", rec.SHA256)
+		w.Header().Set("Content-Length", strconv.FormatInt(rec.Size, 10))
+	})
 }
 
 // artifactRecord loads one artifact record: from the store in DB mode
@@ -952,6 +1002,12 @@ func (s *Server) uploadJobCache(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// The lease generation (and token) are carried into the commit-time
+	// predicate: the cache manifest must commit only while the SAME lease is
+	// still live, never after a revoke/cancel/replacement/expiry that
+	// happened while a multi-GB body was staged.
+	gen, _ := strconv.ParseInt(r.Header.Get("X-Kiwi-Lease-Generation"), 10, 64)
+	token := r.Header.Get("X-Kiwi-Lease-Token")
 	key := r.PathValue("key")
 	if !cacheKeyRE.MatchString(key) {
 		http.Error(w, "invalid cache key", 400)
@@ -994,7 +1050,7 @@ func (s *Server) uploadJobCache(w http.ResponseWriter, r *http.Request) {
 	defer res.Release()
 	// Stage and hash on disk inside the budget directory, then publish: the
 	// digest whose fence we take is the digest actually staged.
-	stagedPath, n, err := staging.SpoolFile(s.Staging.Dir(), http.MaxBytesReader(w, r.Body, limit), reserve)
+	stagedPath, n, err := s.Staging.SpoolFile(http.MaxBytesReader(w, r.Body, limit), reserve)
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) || errors.Is(err, staging.ErrTooLarge) {
@@ -1052,8 +1108,21 @@ func (s *Server) uploadJobCache(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "cache storage verification failed", http.StatusServiceUnavailable)
 		return
 	}
-	envelope, err := s.writeCacheManifest(r.Context(), fileKey, key, repo, trust, sum, n, j)
+	// Commit-time lease predicate: in memory/fs mode re-check the in-memory
+	// lease; in DB mode the writeCacheManifest call uses the lease-fenced
+	// store method whose transaction re-evaluates the predicate.
+	if !s.leaseActiveAtCommit(r.Context(), j.ID, runnerID, token, gen) {
+		s.auditLocked("cache.lease_lost_at_commit", runnerID, j.RunID, j.ID, "lease lost before cache manifest commit", map[string]string{"key": key})
+		http.Error(w, "lease expired during upload", http.StatusConflict)
+		return
+	}
+	envelope, err := s.writeCacheManifest(r.Context(), fileKey, key, repo, trust, sum, n, j, runnerID, gen)
 	if err != nil {
+		if leaseLostAtCommit(err) {
+			s.auditLocked("cache.lease_lost_at_commit", runnerID, j.RunID, j.ID, "lease lost before cache manifest commit", map[string]string{"key": key})
+			http.Error(w, "lease expired during upload", http.StatusConflict)
+			return
+		}
 		// The manifest is the durable mapping: without it the blob is an
 		// unreachable ORPHAN, and the upload fails closed. It is never
 		// deleted here: CAS writes are append/deduplicate, so the digest
@@ -1113,7 +1182,7 @@ func verifyStoredBlob(ctx context.Context, c *cas.CAS, digest string, wantSize i
 // namespace is server-derived from the leased job — repository and trust
 // domain never come from client headers. It returns the signed envelope
 // bytes and any persistence error.
-func (s *Server) writeCacheManifest(ctx context.Context, fileKey, logicalKey, repo, trust, sum string, size int64, j model.Job) ([]byte, error) {
+func (s *Server) writeCacheManifest(ctx context.Context, fileKey, logicalKey, repo, trust, sum string, size int64, j model.Job, runnerID string, generation int64) ([]byte, error) {
 	signer := s.ensureCacheSigner()
 	m := cache.CacheManifest{
 		Version:     1,
@@ -1131,9 +1200,7 @@ func (s *Server) writeCacheManifest(ctx context.Context, fileKey, logicalKey, re
 		return nil, err
 	}
 	if s.DB != nil {
-		if cs, ok := s.DB.(storage.CacheManifestStore); !ok {
-			return nil, fmt.Errorf("cache manifest store unavailable")
-		} else if err := cs.PutCacheManifest(ctx, storage.CacheManifestRecord{
+		rec := storage.CacheManifestRecord{
 			Repo:        repo,
 			TrustDomain: trust,
 			LogicalKey:  logicalKey,
@@ -1143,7 +1210,23 @@ func (s *Server) writeCacheManifest(ctx context.Context, fileKey, logicalKey, re
 			ProducerJob: j.ID,
 			CreatedAt:   m.CreatedAt,
 			Envelope:    b,
-		}); err != nil {
+		}
+		// The lease-fenced method commits the manifest only while the job is
+		// still running under this runner+generation with an unexpired lease,
+		// in the SAME transaction as the write. Without the capability (a
+		// custom store) fall back to the plain upsert; the handler-side
+		// commit-time check remains the guard there.
+		if leaseStore, ok := s.DB.(storage.LeaseCommitStore); ok {
+			if err := leaseStore.PutCacheManifestForLease(ctx, j.ID, runnerID, generation, rec); err != nil {
+				return nil, err
+			}
+			return b, nil
+		}
+		cs, ok := s.DB.(storage.CacheManifestStore)
+		if !ok {
+			return nil, fmt.Errorf("cache manifest store unavailable")
+		}
+		if err := cs.PutCacheManifest(ctx, rec); err != nil {
 			return nil, err
 		}
 		return b, nil
@@ -1249,7 +1332,6 @@ func (s *Server) downloadJobCache(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, r, err, "")
 		return
 	}
-	defer rc.Close()
 	s.metricAdd("kiwi_cache_hits_total", 1, nil)
 	w.Header().Set("X-Kiwi-Cache-SHA256", digest)
 	w.Header().Set("X-Kiwi-Content-SHA256", digest)
@@ -1257,7 +1339,16 @@ func (s *Server) downloadJobCache(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Kiwi-Cache-Manifest-SHA256", manifestDigestOf(envelope))
 	}
 	w.Header().Set("Content-Type", "application/gzip")
-	n, _ := io.Copy(w, rc)
+	// Cache downloads intentionally keep the RUNNER-SIDE hashing contract:
+	// the response carries the digest and the runner verifies the bytes, so no
+	// server preverification staging is done. The copy error is still checked
+	// and a mismatch/abort tears the connection down instead of being
+	// discarded, and CAS.Open's verifying reader fails the stream at EOF on a
+	// digest mismatch.
+	n, ok := s.serveStreamCheckedWithDigest(w, r, "cache", digest, rc)
+	if !ok {
+		return
+	}
 	s.metricAdd("kiwi_cache_bytes_total", float64(n), nil)
 	s.auditLocked("cache.downloaded", runnerID, j.RunID, j.ID, "cache entry read", map[string]string{"key": key, "repository": repo, "trust_domain": trust})
 }
@@ -1284,10 +1375,11 @@ func (s *Server) downloadProvenance(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	defer rc.Close()
 	w.Header().Set("Content-Type", "application/vnd.dsse.envelope.v1+json")
 	w.Header().Set("X-Kiwi-Content-SHA256", a.ProvenanceSHA256)
-	_, _ = io.Copy(w, rc)
+	// The envelope digest is checked while streaming; a mismatch (or a copy
+	// failure) aborts the connection instead of being discarded.
+	s.serveStreamCheckedWithDigest(w, r, "provenance", a.ProvenanceSHA256, rc)
 }
 
 // openSidecar resolves a sidecar (provenance/SBOM/sigstore) byte stream:

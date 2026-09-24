@@ -74,6 +74,7 @@ func NewMetrics() *Metrics {
 	m.declare("kiwi_cache_misses_total", "Cache download misses", "counter", nil)
 	m.declare("kiwi_cache_bytes_total", "Bytes served from the cache", "counter", nil)
 	m.declare("kiwi_artifact_bytes_total", "Bytes uploaded as artifacts", "counter", nil)
+	m.declare("kiwi_download_integrity_failures_total", "Downloads refused or aborted because the advertised bytes could not be verified", "counter", nil)
 	m.declare("kiwi_webhook_failures_total", "Webhook deliveries rejected or failed", "counter", nil)
 	m.declare("kiwi_oidc_issues_total", "OIDC tokens issued to jobs", "counter", nil)
 	m.declare("kiwi_secret_deliveries_total", "Secrets delivered to leased jobs", "counter", nil)

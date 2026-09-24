@@ -172,16 +172,24 @@ func TestIntegrationSnapshotDownloadSingleRecordLookup(t *testing.T) {
 	itSnapshotInsertRun(t, st, otherRun)
 
 	// A node-local archive path keeps the download test free of CAS wiring.
+	// The record carries the archive's REAL size and digest: the download
+	// preverifies before committing the response, so a record that disagrees
+	// with its bytes is refused.
 	dir := t.TempDir()
 	archive := filepath.Join(dir, "snapshot.tar.gz")
-	if err := os.WriteFile(archive, []byte("legacy-archive-bytes"), 0o600); err != nil {
+	data := []byte("legacy-archive-bytes")
+	if err := os.WriteFile(archive, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	rec := model.SnapshotRecord{ID: fmt.Sprintf("%032x", 7), RunID: runID, JobKey: "build", Path: archive, Size: 20, SHA256: "abc", CreatedAt: time.Now().UTC()}
+	digest, err := fileSHA256(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := model.SnapshotRecord{ID: fmt.Sprintf("%032x", 7), RunID: runID, JobKey: "build", Path: archive, Size: int64(len(data)), SHA256: digest, CreatedAt: time.Now().UTC()}
 	if err := st.InsertSnapshotRecord(context.Background(), rec); err != nil {
 		t.Fatal(err)
 	}
-	foreign := model.SnapshotRecord{ID: fmt.Sprintf("%032x", 8), RunID: otherRun, Path: archive, Size: 20, SHA256: "def", CreatedAt: time.Now().UTC()}
+	foreign := model.SnapshotRecord{ID: fmt.Sprintf("%032x", 8), RunID: otherRun, Path: archive, Size: int64(len(data)), SHA256: digest, CreatedAt: time.Now().UTC()}
 	if err := st.InsertSnapshotRecord(context.Background(), foreign); err != nil {
 		t.Fatal(err)
 	}

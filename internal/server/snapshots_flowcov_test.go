@@ -232,10 +232,25 @@ func TestFlowSnapshotMemoryDownloadCopyFailure(t *testing.T) {
 	r.SetPathValue("sid", rec.ID)
 	r.Header.Set("Authorization", "Bearer admin-tok")
 	fw := &fcFailWriter{limit: 0}
-	s.downloadSnapshot(fw, r)
+	assertDownloadAborts(t, func() { s.downloadSnapshot(fw, r) })
 	if got := fw.Header().Get("X-Kiwi-Snapshot-SHA256"); got != rec.SHA256 {
 		t.Fatalf("copy-failure download did not reach the copy stage: %q", got)
 	}
+}
+
+// assertDownloadAborts runs fn and requires it to abort the response with the
+// standard library's abort sentinel (the fcFailWriter cannot be hijacked, so
+// the abort takes the panic branch). It is the shared expectation for every
+// download copy-failure test now that a body write error is no longer
+// discarded.
+func assertDownloadAborts(t *testing.T, fn func()) {
+	t.Helper()
+	defer func() {
+		if r := recover(); r != http.ErrAbortHandler {
+			t.Fatalf("download abort = %v, want http.ErrAbortHandler", r)
+		}
+	}()
+	fn()
 }
 
 // TestFlowSnapshotMemoryDownloadScopedDenial: a repository-scoped reader of
@@ -428,15 +443,23 @@ func TestFlowSnapshotDBDownloadBranches(t *testing.T) {
 	if w := doJSON(t, s, http.MethodGet, "/api/v1/runs/run-c/snapshots/"+rec.ID, "admin-tok", ""); w.Code != http.StatusNotFound {
 		t.Fatalf("db download missing blob = %d, want 404", w.Code)
 	}
-	// Legacy local file records cover the non-cas branches.
+	// Legacy local file records cover the non-cas branches. The legacy-ok
+	// record must carry the archive's real size and digest: the download now
+	// preverifies before committing the response, so a record that disagrees
+	// with its bytes is refused instead of served.
 	dir := t.TempDir()
 	archive := filepath.Join(dir, "legacy.tar.gz")
-	if err := os.WriteFile(archive, []byte("legacy-bytes"), 0o600); err != nil {
+	data := []byte("legacy-bytes")
+	if err := os.WriteFile(archive, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	legacyDigest, err := fileSHA256(archive)
+	if err != nil {
 		t.Fatal(err)
 	}
 	f.mu.Lock()
 	f.snapshots = append(f.snapshots,
-		model.SnapshotRecord{ID: "legacy-ok", RunID: "run-c", Path: archive, Size: 12, SHA256: "abc"},
+		model.SnapshotRecord{ID: "legacy-ok", RunID: "run-c", Path: archive, Size: int64(len(data)), SHA256: legacyDigest},
 		model.SnapshotRecord{ID: "legacy-gone", RunID: "run-c", Path: filepath.Join(dir, "gone"), Size: 1},
 		model.SnapshotRecord{ID: "legacy-empty", RunID: "run-c"})
 	f.mu.Unlock()
@@ -466,26 +489,34 @@ func TestFlowSnapshotDBCopyFailures(t *testing.T) {
 	r.SetPathValue("sid", rec.ID)
 	r.Header.Set("Authorization", "Bearer admin-tok")
 	fw := &fcFailWriter{limit: 0}
-	s.downloadSnapshotDB(fw, r)
+	assertDownloadAborts(t, func() { s.downloadSnapshotDB(fw, r) })
 	if got := fw.Header().Get("X-Kiwi-Snapshot-SHA256"); got != rec.SHA256 {
 		t.Fatalf("db copy failure did not reach the copy stage: %q", got)
 	}
-	// Legacy local file write failure.
+	// Legacy local file write failure. The record must carry the archive's
+	// real size and digest or the preverification (correctly) refuses it
+	// before the copy; with a correct record the copy is reached and the
+	// write failure aborts.
 	dir := t.TempDir()
 	archive := filepath.Join(dir, "legacy.tar.gz")
-	if err := os.WriteFile(archive, []byte("legacy-bytes"), 0o600); err != nil {
+	data := []byte("legacy-bytes")
+	if err := os.WriteFile(archive, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := fileSHA256(archive)
+	if err != nil {
 		t.Fatal(err)
 	}
 	f.mu.Lock()
-	f.snapshots = append(f.snapshots, model.SnapshotRecord{ID: "legacy-copy", RunID: "run-c", Path: archive, Size: 12, SHA256: "abc"})
+	f.snapshots = append(f.snapshots, model.SnapshotRecord{ID: "legacy-copy", RunID: "run-c", Path: archive, Size: int64(len(data)), SHA256: digest})
 	f.mu.Unlock()
 	r = httptest.NewRequest(http.MethodGet, "/api/v1/runs/run-c/snapshots/legacy-copy", nil)
 	r.SetPathValue("id", "run-c")
 	r.SetPathValue("sid", "legacy-copy")
 	r.Header.Set("Authorization", "Bearer admin-tok")
 	fw = &fcFailWriter{limit: 0}
-	s.downloadSnapshotDB(fw, r)
-	if got := fw.Header().Get("X-Kiwi-Snapshot-SHA256"); got != "abc" {
+	assertDownloadAborts(t, func() { s.downloadSnapshotDB(fw, r) })
+	if got := fw.Header().Get("X-Kiwi-Snapshot-SHA256"); got != digest {
 		t.Fatalf("legacy copy failure did not reach the copy stage: %q", got)
 	}
 }

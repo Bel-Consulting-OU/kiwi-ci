@@ -2,6 +2,7 @@ package config
 
 import (
 	"flag"
+	"math"
 	"strings"
 	"testing"
 )
@@ -49,6 +50,15 @@ func TestStagingValidationAllOrNothing(t *testing.T) {
 		"blank dir":   {StagingConfig{Dir: "   ", MaxBytes: 1 << 30}, "staging.dir"},
 		"blank+bytes": {StagingConfig{Dir: "   ", MaxBytes: 0}, ""},
 		"tiny budget": {StagingConfig{Dir: "/tmp/staging", MaxBytes: 1}, ""},
+		"max sane":    {StagingConfig{Dir: "/tmp/staging", MaxBytes: MaxStagingMaxBytes}, ""},
+		"near int64 max": {
+			StagingConfig{Dir: "/tmp/staging", MaxBytes: math.MaxInt64},
+			"staging.max_bytes must not exceed",
+		},
+		"one over the bound": {
+			StagingConfig{Dir: "/tmp/staging", MaxBytes: MaxStagingMaxBytes + 1},
+			"staging.max_bytes must not exceed",
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

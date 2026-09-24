@@ -39,27 +39,48 @@ package storage
 //
 // MIGRATION/UPGRADE: operators run
 //
-//	kiwi storage repair-repo-identities [--database-url URL] [--apply] [--batch-size N]
+//	kiwi storage repair-repo-identities [--database-url URL] [--apply] [--cancel-active]
 //
-// without --apply it only LISTS the rows that would be rewritten or
-// quarantined; with --apply it rewrites the provable rows and quarantines the
-// unprovable ones. The pass is keyset-batched (ORDER BY created_at, id with a
-// (created_at, id) > cursor bounds and a configurable LIMIT), one transaction
-// per batch, committing each batch before advancing the cursor: a mid-run
-// failure leaves the earlier batches committed and a re-run resumes from the
-// start without duplicating work (the transformation is idempotent), and the
-// memory footprint never scales with the table size (R1-5). It is idempotent:
-// an explicit a1:/host-full value is left as is, and quarantined rows are
-// stable (the reserved host is not re-derived).
+// without --apply it only LISTS the rows that would change; with --apply it
+// rewrites the provable rows and quarantines the unprovable ones.
+//
+// The planner classifies every row as keep | rewrite_terminal |
+// quarantine_terminal | active_requires_drain | conflict (T1-1). The
+// lifecycle rule is what makes an identity IMMUTABLE for the lifetime of a
+// lease: a TERMINAL row may be rewritten/quarantined in place, but a
+// NON-terminal row (pending/queued/waiting_approval/running) whose effective
+// identity would change is active_requires_drain and is NEVER rewritten by
+// default — a lease/queue slot admitted under A must not silently become B
+// accounting while post-lease privileged operations (OIDC issuance, the cache
+// namespace, artifact provenance) resolve identity from the CURRENT record.
+// Such a row is reported; --cancel-active then, for those rows only, FIRST
+// performs the canonical cancellation transaction (cancelJobTx/cancelRunTx:
+// lease cleared, runner slot freed, resource reservation deleted, quota
+// released under the OLD identity, dependents recomputed, audit appended, run
+// aggregation recomputed) and only THEN rewrites/quarantines the identity.
+// Quarantining a run cascades to its non-terminal child jobs in the same
+// transaction, so a child is never left queued under a cancelled+quarantined
+// parent (T1-3).
+//
+// The pass is keyset-batched (ORDER BY created_at, id with a (created_at, id)
+// > cursor bounds and a configurable LIMIT), one transaction per batch,
+// committing each batch before advancing the cursor: a mid-run failure leaves
+// the earlier batches committed and a re-run resumes from the start without
+// duplicating work (the transformation is idempotent), and the memory
+// footprint never scales with the table size (R1-5). It is idempotent: an
+// explicit a1:/host-full value is left as is, and quarantined rows are stable
+// (the reserved host is not re-derived).
 //
 // Every guarded UPDATE checks that it actually matched the classified row. A
 // concurrent writer that makes it match zero rows is re-read/re-planned under
 // the same transaction and either applied with the fresh plan or recorded as a
 // distinct conflict; a counter is never incremented without a successful
-// UPDATE (R1-4). A quarantined queued/running row additionally gets the
-// durable payload flag repo_identity_quarantined=true and is transitioned to
-// cancelled in the same statement, so it is operationally inert even under an
-// allow-everything repository policy (R1-6).
+// UPDATE (R1-4). A quarantined row additionally gets the durable payload flag
+// repo_identity_quarantined=true, and an already-cancelled active row keeps
+// its cancelled status, so it is operationally inert even under an
+// allow-everything repository policy (R1-6). The lease-acquisition predicates
+// additionally deny a queued job whose PARENT run is cancelled/quarantined,
+// independently of the job's own flag (T1-3).
 //
 // SCOPE: runs and jobs, whose repo_id/policy_repo_id are written by
 // bindSubmissionRepoIdentity and its webhook/schedule/downstream siblings. A
@@ -82,35 +103,63 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
 // RepoIdentityRepairAction is the outcome of classifying one stored identity.
+//
+// The classification is a function of BOTH the provable identity change and
+// the row's lifecycle state (T1-1). A TERMINAL row may be rewritten or
+// quarantined in place. A NON-terminal row (pending/queued/waiting_approval/
+// running) whose effective identity would change is NEVER rewritten in place:
+// its lease generation/token/runner was admitted under the OLD identity while
+// every post-lease privileged operation (OIDC issuance via repoIDForRun, the
+// cache namespace via repoIDForJob, artifact provenance) resolves identity
+// from the CURRENT record, so an in-place A->B rewrite would let a lease
+// admitted under A obtain B-scoped tokens/cache/provenance. Such a row is
+// reported as active_requires_drain and only the explicit --cancel-active
+// option cancels it first (through the canonical cancellation transaction) and
+// then rewrites it.
 type RepoIdentityRepairAction int
 
 const (
 	// RepoIdentityKeep: the stored value is already an unambiguous explicit
 	// form (or there is nothing to store); no write is needed.
 	RepoIdentityKeep RepoIdentityRepairAction = iota
-	// RepoIdentityRewrite: the clone URL or the host-less full name proves the
-	// explicit form the row must carry.
-	RepoIdentityRewrite
-	// RepoIdentityQuarantine: neither interpretation can be proven; the row
-	// must fail closed and be surfaced for operator review.
-	RepoIdentityQuarantine
+	// RepoIdentityRewriteTerminal: a terminal row whose provable identity may
+	// be restamped in place.
+	RepoIdentityRewriteTerminal
+	// RepoIdentityQuarantineTerminal: a terminal row whose identity cannot be
+	// proven; fail closed and surface it for operator review.
+	RepoIdentityQuarantineTerminal
+	// RepoIdentityActiveRequiresDrain: a non-terminal row whose effective
+	// identity would change. Reported, never rewritten unless the operator
+	// passes --cancel-active.
+	RepoIdentityActiveRequiresDrain
 	// RepoIdentityConflict is an APPLY-time outcome, never a plan: the guarded
 	// UPDATE matched no row and a re-read/re-plan under the same transaction
 	// still could not claim it (a concurrent writer kept moving the row). It
 	// is reported distinctly so the operator never reads a phantom repair.
 	RepoIdentityConflict
+
+	// RepoIdentityRewrite and RepoIdentityQuarantine are the identity-only
+	// planner's spelling of the terminal outcomes (PlanStoredRepoIdentity has
+	// no status argument). They are aliases so the identity rules and their
+	// tests keep reading naturally; the status-aware ClassifyRepoIdentity
+	// turns a non-terminal row's outcome into RepoIdentityActiveRequiresDrain.
+	RepoIdentityRewrite    = RepoIdentityRewriteTerminal
+	RepoIdentityQuarantine = RepoIdentityQuarantineTerminal
 )
 
 // String renders the action for operator output.
 func (a RepoIdentityRepairAction) String() string {
 	switch a {
-	case RepoIdentityRewrite:
-		return "rewrite"
-	case RepoIdentityQuarantine:
-		return "quarantine"
+	case RepoIdentityRewriteTerminal:
+		return "rewrite_terminal"
+	case RepoIdentityQuarantineTerminal:
+		return "quarantine_terminal"
+	case RepoIdentityActiveRequiresDrain:
+		return "active_requires_drain"
 	case RepoIdentityConflict:
 		return "conflict"
 	default:
@@ -124,10 +173,36 @@ type RepoIdentityPlan struct {
 	// value, possibly empty) and Rewrite (the proven explicit form), and is
 	// the reserved quarantine identity for Quarantine.
 	Explicit string
-	// Action is the classification.
+	// Action is the classification. For a non-terminal row it is
+	// RepoIdentityActiveRequiresDrain; see Desired for the change that a
+	// --cancel-active pass would apply.
 	Action RepoIdentityRepairAction
+	// Desired is the identity change the row WOULD receive (always
+	// RewriteTerminal or QuarantineTerminal when Action is anything other
+	// than Keep, including ActiveRequiresDrain). It is the action applied
+	// after an active row has been cancelled.
+	Desired RepoIdentityRepairAction
 	// Reason explains a Rewrite or Quarantine to the operator.
 	Reason string
+}
+
+// ClassifyRepoIdentity applies the lifecycle rule on top of the identity-only
+// planner: an identity change on a terminal row is classified as
+// rewrite_terminal/quarantine_terminal, while the SAME change on a
+// non-terminal (pending/queued/waiting_approval/running) row is classified as
+// active_requires_drain. The Desired field always carries the terminal action
+// so a --cancel-active pass knows what to apply after cancelling.
+func ClassifyRepoIdentity(storedID, repoURL, repoFullName string, status model.Status) RepoIdentityPlan {
+	plan := PlanStoredRepoIdentity(storedID, repoURL, repoFullName)
+	if plan.Action == RepoIdentityKeep {
+		plan.Desired = RepoIdentityKeep
+		return plan
+	}
+	plan.Desired = plan.Action
+	if !status.Terminal() {
+		plan.Action = RepoIdentityActiveRequiresDrain
+	}
+	return plan
 }
 
 // RepoIdentityQuarantineHost is the reserved host of a quarantined row's
@@ -142,21 +217,31 @@ const RepoIdentityQuarantineHost = "quarantine.invalid"
 const RepoIdentityQuarantinedFlag = "repo_identity_quarantined"
 
 // RepoIdentityQuarantineReason is the operator-facing reason recorded on the
-// cancelled status of a quarantined queued/running job.
+// cancelled status of a quarantined active run/job.
 const RepoIdentityQuarantineReason = "repository identity quarantined by operator repair"
+
+// RepoIdentityDrainReason is the operator-facing reason recorded on the
+// cancelled status of an active run/job drained by --cancel-active before its
+// identity is rewritten.
+const RepoIdentityDrainReason = "repository identity repair: drained active work before the identity change"
 
 // QuarantinedRepoIdentity renders the reserved replacement identity for an
 // unprovable stored value. It is an untagged canonical "host/full-name"
 // identity (three path segments), so the typed positional rule classifies it
 // exactly like every other stored canonical ID. The tail is the lowercase
-// SHA-256 hex digest of the ORIGINAL (trimmed) value: a fixed-size,
+// SHA-256 hex digest of the RAW stored value (T1-4): a fixed-size,
 // collision-resistant identifier that cannot collide after the path
 // case-folding every reader applies (the previous base64url tail was
 // case-significant and could), and that never embeds the original slash path.
-// The original value is preserved verbatim in repo_identity_quarantine for
-// operator review.
+//
+// The digest is taken over the RAW value, never a trimmed copy: two rows whose
+// stored identities differ only by surrounding whitespace are DIFFERENT stored
+// values and must not collapse to the same quarantine identity (trimming first
+// would silently merge them). Trimming is used only for CLASSIFICATION
+// (PlanStoredRepoIdentity compares the trimmed form); the original, raw value
+// is preserved verbatim in repo_identity_quarantine for operator review.
 func QuarantinedRepoIdentity(original string) string {
-	sum := sha256.Sum256([]byte(strings.TrimSpace(original)))
+	sum := sha256.Sum256([]byte(original))
 	return RepoIdentityQuarantineHost + "/quarantined/" + hex.EncodeToString(sum[:])
 }
 
@@ -221,13 +306,13 @@ func PlanStoredRepoIdentity(storedID, repoURL, repoFullName string) RepoIdentity
 	// storage spelling "host/full-name".
 	if strings.HasPrefix(stored, auth.RepoAliasPrefix) {
 		if _, err := auth.ParseRepoAlias(stored); err != nil {
-			return RepoIdentityPlan{Explicit: QuarantinedRepoIdentity(stored), Action: RepoIdentityQuarantine, Reason: "malformed a1: alias"}
+			return RepoIdentityPlan{Explicit: QuarantinedRepoIdentity(storedID), Action: RepoIdentityQuarantine, Reason: "malformed a1: alias"}
 		}
 		return RepoIdentityPlan{Explicit: stored, Action: RepoIdentityKeep}
 	}
 	if strings.HasPrefix(stored, auth.RepoIdentityPrefix) {
 		if _, err := auth.ParseRepoIdentity(stored); err != nil {
-			return RepoIdentityPlan{Explicit: QuarantinedRepoIdentity(stored), Action: RepoIdentityQuarantine, Reason: "malformed r1: identity"}
+			return RepoIdentityPlan{Explicit: QuarantinedRepoIdentity(storedID), Action: RepoIdentityQuarantine, Reason: "malformed r1: identity"}
 		}
 		// An r1: value is already explicit and typed. It is left as is rather
 		// than rewritten to "host/full-name": stripping the explicit tag
@@ -241,7 +326,7 @@ func PlanStoredRepoIdentity(storedID, repoURL, repoFullName string) RepoIdentity
 	if full != "" {
 		alias, err := auth.CanonicalHostAlias(full)
 		if err != nil {
-			return RepoIdentityPlan{Explicit: QuarantinedRepoIdentity(stored), Action: RepoIdentityQuarantine, Reason: "unparseable repository full name"}
+			return RepoIdentityPlan{Explicit: QuarantinedRepoIdentity(storedID), Action: RepoIdentityQuarantine, Reason: "unparseable repository full name"}
 		}
 		proven := alias.Serialized()
 		switch {
@@ -259,7 +344,7 @@ func PlanStoredRepoIdentity(storedID, repoURL, repoFullName string) RepoIdentity
 			// repository as the host-less full name (a host-bearing value
 			// implies a forge this row no longer names). Fail closed.
 			if grant, err := auth.ParseStoredRepoID(stored); err == nil && grant.IsIdentity() {
-				return RepoIdentityPlan{Explicit: QuarantinedRepoIdentity(stored), Action: RepoIdentityQuarantine, Reason: "stored identity disagrees with the host-less repository full name"}
+				return RepoIdentityPlan{Explicit: QuarantinedRepoIdentity(storedID), Action: RepoIdentityQuarantine, Reason: "stored identity disagrees with the host-less repository full name"}
 			}
 			return RepoIdentityPlan{Explicit: proven, Action: RepoIdentityRewrite, Reason: "store the explicit host-less alias form"}
 		}
@@ -268,13 +353,13 @@ func PlanStoredRepoIdentity(storedID, repoURL, repoFullName string) RepoIdentity
 	// No URL and no full name. Only an already-unambiguous value may stay.
 	grant, err := auth.ParseStoredRepoID(stored)
 	if err != nil {
-		return RepoIdentityPlan{Explicit: QuarantinedRepoIdentity(stored), Action: RepoIdentityQuarantine, Reason: "unparseable stored identity"}
+		return RepoIdentityPlan{Explicit: QuarantinedRepoIdentity(storedID), Action: RepoIdentityQuarantine, Reason: "unparseable stored identity"}
 	}
 	if grant.IsAlias() {
 		return RepoIdentityPlan{Explicit: stored, Action: RepoIdentityKeep}
 	}
 	return RepoIdentityPlan{
-		Explicit: QuarantinedRepoIdentity(stored),
+		Explicit: QuarantinedRepoIdentity(storedID),
 		Action:   RepoIdentityQuarantine,
 		Reason:   "untagged nested identity with no clone URL or full name to prove host vs bare nested",
 	}
@@ -286,8 +371,10 @@ type RepoIdentityRepairMode int
 const (
 	// RepoIdentityRepairReport lists what would change without writing.
 	RepoIdentityRepairReport RepoIdentityRepairMode = iota
-	// RepoIdentityRepairApply rewrites provable rows and quarantines the
-	// unprovable ones.
+	// RepoIdentityRepairApply rewrites terminal provable rows and quarantines
+	// the terminal unprovable ones. Non-terminal rows whose identity would
+	// change are reported as active_requires_drain and left untouched unless
+	// RepoIdentityRepairOptions.CancelActive is set.
 	RepoIdentityRepairApply
 )
 
@@ -309,6 +396,14 @@ type RepoIdentityRepairResult struct {
 	Rewritten   int
 	Quarantined int
 	Unchanged   int
+	// ActiveRequiresDrain counts non-terminal run/job rows whose effective
+	// identity would change but which were NOT touched because --cancel-active
+	// was not requested. In report mode they are a subset of Scanned; in apply
+	// mode they are the rows the operator still has to drain.
+	ActiveRequiresDrain int
+	// Drained counts rows the --cancel-active pass actually cancelled before
+	// applying their identity change.
+	Drained int
 	// Conflicts counts rows the guarded UPDATE could not claim even after a
 	// same-transaction re-read/re-plan (a concurrent writer kept moving them).
 	// They are NOT counted as repaired or quarantined.
@@ -321,20 +416,51 @@ type RepoIdentityRepairResult struct {
 type RepoIdentityRepairOptions struct {
 	// BatchSize is the keyset page size (the LIMIT of each batch). <= 0 uses
 	// KIWI_REPO_IDENTITY_REPAIR_BATCH_SIZE when it parses to a positive value,
-	// otherwise defaultRepoIdentityRepairBatchSize; it is clamped to the
-	// documented 500..2000 operator range for values that exceed it.
+	// otherwise defaultRepoIdentityRepairBatchSize. An explicit positive value
+	// is clamped to the documented [minRepoIdentityRepairBatchSize,
+	// maxRepoIdentityRepairBatchSize] contract; see
+	// clampRepoIdentityRepairBatchSize for the operator semantics.
 	BatchSize int
+	// CancelActive enables the explicit drain-then-rewrite path for a
+	// non-terminal run/job whose effective identity would change. Without it
+	// such a row is reported as active_requires_drain and left untouched (see
+	// the file comment).
+	CancelActive bool
 }
 
 const (
-	// defaultRepoIdentityRepairBatchSize is the operator default: within the
-	// documented 500..2000 range, large enough to keep the batch count small
+	// defaultRepoIdentityRepairBatchSize is the operator default: inside the
+	// recommended 500..2000 range, large enough to keep the batch count small
 	// and small enough that memory never scales with the table size.
 	defaultRepoIdentityRepairBatchSize = 1000
+	// minRepoIdentityRepairBatchSize is the documented low clamp. The
+	// RECOMMENDED operator range is 500..2000 (each batch is one transaction,
+	// so a smaller page means more commits and a slower pass, while a larger
+	// one holds more row locks per transaction); values below the floor of 1
+	// are not a meaningful page size. Small explicit values are honored
+	// (rather than raised to 500) so tests and diagnostics can drive the
+	// keyset/batch contract deterministically. This is a deliberate change to
+	// the earlier "500..2000 only" wording: the hard contract is [1, 2000].
+	minRepoIdentityRepairBatchSize = 1
 	// maxRepoIdentityRepairBatchSize caps an explicit override at the top of
 	// the documented range.
 	maxRepoIdentityRepairBatchSize = 2000
 )
+
+// clampRepoIdentityRepairBatchSize applies the documented batch-size contract.
+// A caller therefore always observes batchSize in
+// [minRepoIdentityRepairBatchSize, maxRepoIdentityRepairBatchSize] for every
+// input (the caller resolves env/default first), and the operator semantics
+// are "one transaction per batch, recommended 500..2000".
+func clampRepoIdentityRepairBatchSize(batchSize int) int {
+	if batchSize < minRepoIdentityRepairBatchSize {
+		return minRepoIdentityRepairBatchSize
+	}
+	if batchSize > maxRepoIdentityRepairBatchSize {
+		return maxRepoIdentityRepairBatchSize
+	}
+	return batchSize
+}
 
 // repoIdentityQuarantineSchemaSQL creates the quarantine log. Like the
 // cluster-key schema it is deliberately outside the numbered migrations
@@ -384,11 +510,11 @@ func newRepoIdentityRepairTables() []repoIdentityRepairTable {
 		table:      "runs",
 		oldURLExpr: "payload->>'repo'",
 		batchSQL: `SELECT id, COALESCE(payload->>'repo_id',''), COALESCE(payload->>'policy_repo_id',''), ` +
-			`COALESCE(payload->>'repo',''), COALESCE(payload->>'repo_full_name',''), created_at ` +
+			`COALESCE(payload->>'repo',''), COALESCE(payload->>'repo_full_name',''), COALESCE(status,''), created_at ` +
 			`FROM runs WHERE (created_at, id) > ($1::timestamptz, $2::text) ` +
 			`ORDER BY created_at ASC, id ASC LIMIT $3`,
 		recordSQL: `SELECT id, COALESCE(payload->>'repo_id',''), COALESCE(payload->>'policy_repo_id',''), ` +
-			`COALESCE(payload->>'repo',''), COALESCE(payload->>'repo_full_name',''), created_at ` +
+			`COALESCE(payload->>'repo',''), COALESCE(payload->>'repo_full_name',''), COALESCE(status,''), created_at ` +
 			`FROM runs WHERE id=$1`,
 	}
 	job := repoIdentityRepairTable{
@@ -396,11 +522,11 @@ func newRepoIdentityRepairTables() []repoIdentityRepairTable {
 		table:      "jobs",
 		oldURLExpr: "payload->>'repo_url'",
 		batchSQL: `SELECT id, COALESCE(payload->>'repo_id',''), COALESCE(payload->>'policy_repo_id',''), ` +
-			`COALESCE(payload->>'repo_url',''), COALESCE(payload->>'repo_full_name',''), created_at ` +
+			`COALESCE(payload->>'repo_url',''), COALESCE(payload->>'repo_full_name',''), COALESCE(status,''), created_at ` +
 			`FROM jobs WHERE (created_at, id) > ($1::timestamptz, $2::text) ` +
 			`ORDER BY created_at ASC, id ASC LIMIT $3`,
 		recordSQL: `SELECT id, COALESCE(payload->>'repo_id',''), COALESCE(payload->>'policy_repo_id',''), ` +
-			`COALESCE(payload->>'repo_url',''), COALESCE(payload->>'repo_full_name',''), created_at ` +
+			`COALESCE(payload->>'repo_url',''), COALESCE(payload->>'repo_full_name',''), COALESCE(status,''), created_at ` +
 			`FROM jobs WHERE id=$1`,
 	}
 	return []repoIdentityRepairTable{run, job}
@@ -445,16 +571,14 @@ func (s *PostgresStore) RepairRepoIdentitiesWithOptions(ctx context.Context, mod
 	if batchSize <= 0 {
 		batchSize = defaultRepoIdentityRepairBatchSize
 	}
-	if batchSize > maxRepoIdentityRepairBatchSize {
-		batchSize = maxRepoIdentityRepairBatchSize
-	}
+	batchSize = clampRepoIdentityRepairBatchSize(batchSize)
 	if mode == RepoIdentityRepairApply {
 		if err := s.ensureRepoIdentityQuarantineSchema(ctx); err != nil {
 			return result, err
 		}
 	}
 	for _, table := range newRepoIdentityRepairTables() {
-		if err := s.repairRepoIdentityTable(ctx, mode, table, batchSize, &result); err != nil {
+		if err := s.repairRepoIdentityTable(ctx, mode, table, batchSize, opts.CancelActive, &result); err != nil {
 			return result, err
 		}
 	}
@@ -480,7 +604,7 @@ func (s *PostgresStore) ensureRepoIdentityQuarantineSchema(ctx context.Context) 
 }
 
 // repairRepoIdentityTable walks one table in keyset batches.
-func (s *PostgresStore) repairRepoIdentityTable(ctx context.Context, mode RepoIdentityRepairMode, table repoIdentityRepairTable, batchSize int, result *RepoIdentityRepairResult) error {
+func (s *PostgresStore) repairRepoIdentityTable(ctx context.Context, mode RepoIdentityRepairMode, table repoIdentityRepairTable, batchSize int, cancelActive bool, result *RepoIdentityRepairResult) error {
 	var (
 		cursor     time.Time
 		cursorID   string
@@ -495,7 +619,7 @@ func (s *PostgresStore) repairRepoIdentityTable(ctx context.Context, mode RepoId
 			}
 			records, err = readRepoIdentityRepairBatch(ctx, tx, table, cursor, cursorID, batchSize)
 			if err == nil {
-				err = s.runRepoIdentityRepairBatch(ctx, tx, table, records, batchIndex, result)
+				err = s.runRepoIdentityRepairBatch(ctx, tx, table, records, batchIndex, cancelActive, result)
 			}
 			if err != nil {
 				_ = tx.Rollback(ctx)
@@ -510,7 +634,7 @@ func (s *PostgresStore) repairRepoIdentityTable(ctx context.Context, mode RepoId
 			if err != nil {
 				return err
 			}
-			if err := s.runRepoIdentityRepairBatch(ctx, nil, table, records, batchIndex, result); err != nil {
+			if err := s.runRepoIdentityRepairBatch(ctx, nil, table, records, batchIndex, cancelActive, result); err != nil {
 				return err
 			}
 		}
@@ -528,7 +652,7 @@ func (s *PostgresStore) repairRepoIdentityTable(ctx context.Context, mode RepoId
 
 // runRepoIdentityRepairBatch classifies (report) or applies (apply) one batch.
 // tx is nil in report mode.
-func (s *PostgresStore) runRepoIdentityRepairBatch(ctx context.Context, tx pgx.Tx, table repoIdentityRepairTable, records []repoIdentityRepairRow, batchIndex int, result *RepoIdentityRepairResult) error {
+func (s *PostgresStore) runRepoIdentityRepairBatch(ctx context.Context, tx pgx.Tx, table repoIdentityRepairTable, records []repoIdentityRepairRow, batchIndex int, cancelActive bool, result *RepoIdentityRepairResult) error {
 	if len(records) == 0 {
 		return nil
 	}
@@ -540,14 +664,16 @@ func (s *PostgresStore) runRepoIdentityRepairBatch(ctx context.Context, tx pgx.T
 	for _, r := range records {
 		result.Scanned++
 		if tx == nil {
-			plan := PlanStoredRepoIdentity(r.repoID, r.url, r.full)
-			if plan.Action == RepoIdentityKeep {
+			plan := ClassifyRepoIdentity(r.repoID, r.url, r.full, model.Status(r.status))
+			switch plan.Action {
+			case RepoIdentityKeep:
 				result.Unchanged++
 				continue
-			}
-			if plan.Action == RepoIdentityQuarantine {
+			case RepoIdentityActiveRequiresDrain:
+				result.ActiveRequiresDrain++
+			case RepoIdentityQuarantineTerminal:
 				result.Quarantined++
-			} else {
+			default: // RepoIdentityRewriteTerminal
 				result.Rewritten++
 			}
 			result.Entries = append(result.Entries, RepoIdentityRepairEntry{
@@ -556,7 +682,7 @@ func (s *PostgresStore) runRepoIdentityRepairBatch(ctx context.Context, tx pgx.T
 			})
 			continue
 		}
-		if err := s.applyRepoIdentityRecord(ctx, tx, table, r, result); err != nil {
+		if err := s.applyRepoIdentityRecord(ctx, tx, table, r, cancelActive, result); err != nil {
 			return err
 		}
 	}
@@ -567,17 +693,46 @@ func (s *PostgresStore) runRepoIdentityRepairBatch(ctx context.Context, tx pgx.T
 // guard matches zero rows it re-reads the row under the SAME transaction,
 // re-plans and applies the fresh plan once; if that also loses, it records a
 // distinct conflict. Counters move only after a successful UPDATE (R1-4).
-func (s *PostgresStore) applyRepoIdentityRecord(ctx context.Context, tx pgx.Tx, table repoIdentityRepairTable, r repoIdentityRepairRow, result *RepoIdentityRepairResult) error {
-	plan := PlanStoredRepoIdentity(r.repoID, r.url, r.full)
-	if plan.Action == RepoIdentityKeep {
-		result.Unchanged++
-		return nil
-	}
+//
+// An active_requires_drain row is left untouched unless cancelActive is set,
+// in which case it is cancelled through the canonical cancellation
+// transaction (cancelJobTx/cancelRunTx, quota released under the OLD identity)
+// BEFORE the guarded identity UPDATE (T1-1/T1-2).
+func (s *PostgresStore) applyRepoIdentityRecord(ctx context.Context, tx pgx.Tx, table repoIdentityRepairTable, r repoIdentityRepairRow, cancelActive bool, result *RepoIdentityRepairResult) error {
+	lastPlan := RepoIdentityPlan{Action: RepoIdentityKeep}
 	for attempt := 0; attempt < 2; attempt++ {
+		plan := ClassifyRepoIdentity(r.repoID, r.url, r.full, model.Status(r.status))
+		lastPlan = plan
+		if plan.Action == RepoIdentityKeep {
+			result.Unchanged++
+			return nil
+		}
+		active := plan.Action == RepoIdentityActiveRequiresDrain
+		if active && !cancelActive {
+			// Report only: never silently rewrite (or quarantine) a row whose
+			// lease/queue slot was admitted under the old identity.
+			result.ActiveRequiresDrain++
+			result.Entries = append(result.Entries, RepoIdentityRepairEntry{
+				Kind: table.kind, ID: r.id, Stored: r.repoID, Repaired: plan.Explicit,
+				Action: RepoIdentityActiveRequiresDrain, Reason: plan.Reason,
+			})
+			return nil
+		}
+		desired := plan.Action
+		if active {
+			desired = plan.Desired
+		}
 		if h := s.repoIdentityRepairHooks; h != nil && h.BeforeApply != nil {
 			if err := h.BeforeApply(table.kind, r.id); err != nil {
 				return err
 			}
+		}
+		// Drain the active row (or cascade a run quarantine to its
+		// non-terminal children) BEFORE the guarded identity UPDATE, so the
+		// quota is released under the identity the row still carries.
+		drained, err := s.drainRepoIdentityRowTx(ctx, tx, table, r, desired)
+		if err != nil {
+			return err
 		}
 		// A fork PR's policy_repo_id is the BASE repository: only rewrite it
 		// when it is the same value as the checkout identity.
@@ -585,12 +740,12 @@ func (s *PostgresStore) applyRepoIdentityRecord(ctx context.Context, tx pgx.Tx, 
 		if strings.TrimSpace(r.policyID) != strings.TrimSpace(r.repoID) {
 			repairedPolicy = r.policyID
 		}
-		oldVals, applied, err := applyGuardedRepoIdentity(ctx, tx, table, r, plan, repairedPolicy)
+		oldVals, applied, err := applyGuardedRepoIdentity(ctx, tx, table, r, desired, plan.Explicit, repairedPolicy)
 		if err != nil {
 			return err
 		}
 		if applied {
-			if plan.Action == RepoIdentityQuarantine {
+			if desired == RepoIdentityQuarantineTerminal {
 				if err := insertRepoIdentityQuarantine(ctx, tx, table.kind, r.id, oldVals, plan.Reason); err != nil {
 					return err
 				}
@@ -598,9 +753,12 @@ func (s *PostgresStore) applyRepoIdentityRecord(ctx context.Context, tx pgx.Tx, 
 			} else {
 				result.Rewritten++
 			}
+			if drained && active {
+				result.Drained++
+			}
 			result.Entries = append(result.Entries, RepoIdentityRepairEntry{
 				Kind: table.kind, ID: r.id, Stored: r.repoID, Repaired: plan.Explicit,
-				Action: plan.Action, Reason: plan.Reason,
+				Action: desired, Reason: plan.Reason,
 			})
 			return nil
 		}
@@ -620,18 +778,47 @@ func (s *PostgresStore) applyRepoIdentityRecord(ctx context.Context, tx pgx.Tx, 
 			return nil
 		}
 		r = fresh
-		plan = PlanStoredRepoIdentity(r.repoID, r.url, r.full)
-		if plan.Action == RepoIdentityKeep {
-			result.Unchanged++
-			return nil
-		}
 	}
 	result.Conflicts++
 	result.Entries = append(result.Entries, RepoIdentityRepairEntry{
-		Kind: table.kind, ID: r.id, Stored: r.repoID, Repaired: plan.Explicit,
+		Kind: table.kind, ID: r.id, Stored: r.repoID, Repaired: lastPlan.Explicit,
 		Action: RepoIdentityConflict, Reason: "concurrent writer kept changing the row; re-run the repair",
 	})
 	return nil
+}
+
+// drainRepoIdentityRowTx performs the cancellation half of an identity change
+// for one row, inside the caller's transaction. The quota release therefore
+// always happens under the identity the row still carries, before the guarded
+// UPDATE rewrites it.
+//
+// A TERMINAL row needs no cancellation of its own: the guarded UPDATE writes
+// the flag/identity under its own row lock, so touching the row here would only
+// hold a lock the concurrent-writer re-read path does not need. A terminal RUN
+// may still have non-terminal children (an inconsistent but possible tree), so
+// it cascades to those through cancelRunChildrenTx; a terminal JOB is left to
+// the guarded UPDATE. A non-terminal (active) row is cancelled through
+// cancelJobTx/cancelRunTx exactly like CancelRunJobs.
+func (s *PostgresStore) drainRepoIdentityRowTx(ctx context.Context, tx pgx.Tx, table repoIdentityRepairTable, r repoIdentityRepairRow, desired RepoIdentityRepairAction) (bool, error) {
+	reason := RepoIdentityDrainReason
+	cause := JobCancelRepairDrain
+	if desired == RepoIdentityQuarantineTerminal {
+		reason = RepoIdentityQuarantineReason
+		cause = JobCancelQuarantine
+	}
+	terminal := model.Status(r.status).Terminal()
+	if table.kind == "job" {
+		if terminal {
+			return false, nil
+		}
+		return s.cancelJobTx(ctx, tx, r.id, reason, cause)
+	}
+	if terminal {
+		// A terminal run is quarantined/rewritten by the guarded UPDATE; only
+		// its non-terminal children (if any) need the cascade.
+		return s.cancelRunChildrenTx(ctx, tx, r.id, reason, cause)
+	}
+	return s.cancelRunTx(ctx, tx, r.id, reason, cause)
 }
 
 // readRepoIdentityRepairBatch reads one keyset page.
@@ -644,7 +831,7 @@ func readRepoIdentityRepairBatch(ctx context.Context, q repoIdentityRepairQuerye
 	var out []repoIdentityRepairRow
 	for rows.Next() {
 		var r repoIdentityRepairRow
-		if err := rows.Scan(&r.id, &r.repoID, &r.policyID, &r.url, &r.full, &r.createdAt); err != nil {
+		if err := rows.Scan(&r.id, &r.repoID, &r.policyID, &r.url, &r.full, &r.status, &r.createdAt); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -666,7 +853,7 @@ func readRepoIdentityRepairRecord(ctx context.Context, q repoIdentityRepairQuery
 		}
 		return r, false, nil
 	}
-	if err := rows.Scan(&r.id, &r.repoID, &r.policyID, &r.url, &r.full, &r.createdAt); err != nil {
+	if err := rows.Scan(&r.id, &r.repoID, &r.policyID, &r.url, &r.full, &r.status, &r.createdAt); err != nil {
 		return r, false, err
 	}
 	return r, true, rows.Err()
@@ -680,10 +867,11 @@ func readRepoIdentityRepairRecord(ctx context.Context, q repoIdentityRepairQuery
 // queued/running work, transitions it to cancelled (R1-6). The guarded UPDATE
 // is the data-modifying CTE, so a zero-row match is observable (applied=false)
 // and no counter can advance on a phantom repair (R1-4).
-func applyGuardedRepoIdentity(ctx context.Context, tx pgx.Tx, table repoIdentityRepairTable, r repoIdentityRepairRow, plan RepoIdentityPlan, repairedPolicy string) (repoIdentityRepairRow, bool, error) {
-	sql := repoIdentityRepairGuardedUpdateSQL(table, plan.Action == RepoIdentityQuarantine)
-	args := []any{r.id, plan.Explicit, repairedPolicy, r.repoID}
-	if plan.Action == RepoIdentityQuarantine && table.kind == "job" {
+func applyGuardedRepoIdentity(ctx context.Context, tx pgx.Tx, table repoIdentityRepairTable, r repoIdentityRepairRow, desired RepoIdentityRepairAction, explicit, repairedPolicy string) (repoIdentityRepairRow, bool, error) {
+	quarantine := desired == RepoIdentityQuarantineTerminal
+	sql := repoIdentityRepairGuardedUpdateSQL(table, quarantine)
+	args := []any{r.id, explicit, repairedPolicy, r.repoID}
+	if quarantine && table.kind == "job" {
 		args = append(args, RepoIdentityQuarantineReason)
 	}
 	var old repoIdentityRepairRow
@@ -742,9 +930,9 @@ func insertRepoIdentityQuarantine(ctx context.Context, tx pgx.Tx, kind, recordID
 	return err
 }
 
-// repoIdentityRepairRow is one runs/jobs payload's identity fields plus its
-// keyset position.
+// repoIdentityRepairRow is one runs/jobs payload's identity fields, its
+// lifecycle status, plus its keyset position.
 type repoIdentityRepairRow struct {
-	id, repoID, policyID, url, full string
-	createdAt                       time.Time
+	id, repoID, policyID, url, full, status string
+	createdAt                               time.Time
 }

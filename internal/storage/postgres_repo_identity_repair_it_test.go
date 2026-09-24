@@ -39,24 +39,37 @@ func pgITIdentityPayload(t *testing.T, repoID, policyID, url, full string) strin
 	return string(raw)
 }
 
-func pgITInsertRunIdentity(t *testing.T, st *PostgresStore, runID, repoID, policyID, url, full string) {
+func pgITInsertRunIdentityStatus(t *testing.T, st *PostgresStore, runID, status, repoID, policyID, url, full string) {
 	t.Helper()
 	_, err := st.pool.Exec(context.Background(),
-		`INSERT INTO runs (id, status, created_at, payload) VALUES ($1, 'queued', now(), $2::jsonb)`,
-		runID, pgITIdentityPayload(t, repoID, policyID, url, full))
+		`INSERT INTO runs (id, status, created_at, payload) VALUES ($1, $2, now(), $3::jsonb)`,
+		runID, status, pgITIdentityPayload(t, repoID, policyID, url, full))
 	if err != nil {
 		t.Fatalf("insert run %s: %v", runID, err)
 	}
 }
 
-func pgITInsertJobIdentity(t *testing.T, st *PostgresStore, runID, jobID, repoID, policyID, url, full string) {
+func pgITInsertJobIdentityStatus(t *testing.T, st *PostgresStore, runID, jobID, status, repoID, policyID, url, full string) {
 	t.Helper()
 	_, err := st.pool.Exec(context.Background(),
-		`INSERT INTO jobs (id, run_id, key, status, created_at, payload) VALUES ($1, $2, 'build', 'queued', now(), $3::jsonb)`,
-		jobID, runID, pgITIdentityPayload(t, repoID, policyID, url, full))
+		`INSERT INTO jobs (id, run_id, key, status, created_at, payload) VALUES ($1, $2, 'build', $3, now(), $4::jsonb)`,
+		jobID, runID, status, pgITIdentityPayload(t, repoID, policyID, url, full))
 	if err != nil {
 		t.Fatalf("insert job %s: %v", jobID, err)
 	}
+}
+
+// pgITInsertRunIdentity inserts a TERMINAL (success) run: rewrites and
+// quarantines on terminal rows are applied in place without a drain.
+func pgITInsertRunIdentity(t *testing.T, st *PostgresStore, runID, repoID, policyID, url, full string) {
+	t.Helper()
+	pgITInsertRunIdentityStatus(t, st, runID, "success", repoID, policyID, url, full)
+}
+
+// pgITInsertJobIdentity inserts a TERMINAL (success) job (see above).
+func pgITInsertJobIdentity(t *testing.T, st *PostgresStore, runID, jobID, repoID, policyID, url, full string) {
+	t.Helper()
+	pgITInsertJobIdentityStatus(t, st, runID, jobID, "success", repoID, policyID, url, full)
 }
 
 func pgITRunIdentity(t *testing.T, st *PostgresStore, runID string) (repoID, policyID string) {

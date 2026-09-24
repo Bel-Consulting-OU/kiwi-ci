@@ -61,3 +61,79 @@ func TestMemStoreQuarantineInert(t *testing.T) {
 		t.Fatalf("quarantined AcquireLease err = %v, want ErrLeaseConflict", err)
 	}
 }
+
+// TestMemStoreLeaseParentRunPredicate is the T1-3 mem/SQL parity pin: a queued
+// child of a CANCELLED or QUARANTINED parent run is ineligible on BOTH claim
+// paths, even on a global-allow runner, while a healthy parent run (or a
+// missing run row, the documented legacy/orphan tolerance) admits it.
+func TestMemStoreLeaseParentRunPredicate(t *testing.T) {
+	ctx := context.Background()
+	claim := LeaseClaim{JobID: "job", RunnerID: "runner", TokenHash: []byte("tok"), Generation: 1, ExpiresAt: time.Now().UTC().Add(time.Hour)}
+	queuedJob := func() model.Job {
+		return model.Job{ID: "job", RunID: "run", Status: model.StatusQueued, RepoID: "github.com/acme/api"}
+	}
+
+	cases := []struct {
+		name    string
+		run     *model.Run
+		wantErr error
+	}{
+		{
+			name:    "healthy parent run admits",
+			run:     &model.Run{ID: "run", Status: model.StatusQueued},
+			wantErr: nil,
+		},
+		{
+			name:    "cancelled parent run denies",
+			run:     &model.Run{ID: "run", Status: model.StatusCancelled},
+			wantErr: ErrNoCapacity,
+		},
+		{
+			name:    "failed parent run denies",
+			run:     &model.Run{ID: "run", Status: model.StatusFailure},
+			wantErr: ErrNoCapacity,
+		},
+		{
+			name:    "quarantined parent run denies",
+			run:     &model.Run{ID: "run", Status: model.StatusQueued, RepoIdentityQuarantined: true},
+			wantErr: ErrNoCapacity,
+		},
+		{
+			name:    "missing parent run tolerates (legacy/orphan)",
+			run:     nil,
+			wantErr: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run("atomic/"+tc.name, func(t *testing.T) {
+			m := newMemStore()
+			m.runners["runner"] = model.Runner{ID: "runner", Capacity: 4}
+			m.jobs["job"] = queuedJob()
+			if tc.run != nil {
+				m.runs["run"] = *tc.run
+			}
+			_, err := m.AcquireLeaseAtomic(ctx, claim)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("AcquireLeaseAtomic err = %v, want %v", err, tc.wantErr)
+			}
+		})
+		t.Run("non-atomic/"+tc.name, func(t *testing.T) {
+			m := newMemStore()
+			m.runners["runner"] = model.Runner{ID: "runner", Capacity: 4}
+			m.jobs["job"] = queuedJob()
+			if tc.run != nil {
+				m.runs["run"] = *tc.run
+			}
+			want := tc.wantErr
+			if want == ErrNoCapacity {
+				// The non-atomic claim reports a conflict, mirroring the SQL
+				// path (ErrLeaseConflict).
+				want = ErrLeaseConflict
+			}
+			_, err := m.AcquireLease(ctx, "job", "runner", []byte("tok"), 1, time.Now().UTC().Add(time.Hour))
+			if !errors.Is(err, want) {
+				t.Fatalf("AcquireLease err = %v, want %v", err, want)
+			}
+		})
+	}
+}

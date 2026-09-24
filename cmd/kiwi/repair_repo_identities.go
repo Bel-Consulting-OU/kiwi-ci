@@ -14,7 +14,7 @@ import (
 // repairRepoIdentitiesCommand is the dispatch entry for the operator repair
 // command (see repair_repo_identities usage in usage()):
 //
-//	kiwi repair-repo-identities [--database-url URL] [--apply]
+//	kiwi repair-repo-identities [--database-url URL] [--apply] [--cancel-active]
 //
 // It talks DIRECTLY to the PostgreSQL control-plane store, like the other
 // operator repair commands: an identity that can no longer be proven must be
@@ -29,6 +29,7 @@ func repairRepoIdentities(ctx context.Context, args []string, out io.Writer) err
 	fs := flag.NewFlagSet("repair-repo-identities", flag.ContinueOnError)
 	url := fs.String("database-url", os.Getenv("KIWI_DATABASE_URL"), "PostgreSQL connection URL")
 	apply := fs.Bool("apply", false, "rewrite provable identities and quarantine unprovable rows (default: list only)")
+	cancelActive := fs.Bool("cancel-active", false, "cancel a non-terminal run/job whose identity would change (through the canonical cancellation transaction) BEFORE rewriting it; without this flag such rows are reported as active_requires_drain and left untouched")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -48,15 +49,21 @@ func repairRepoIdentities(ctx context.Context, args []string, out io.Writer) err
 	if *apply {
 		mode = storage.RepoIdentityRepairApply
 	}
-	res, err := st.RepairRepoIdentities(ctx, mode)
+	res, err := st.RepairRepoIdentitiesWithOptions(ctx, mode, storage.RepoIdentityRepairOptions{CancelActive: *cancelActive})
 	if err != nil {
 		return err
 	}
 	writeRepoIdentityRepairReport(out, res)
-	// Fail closed: a report-only run that found unprovable rows exits non-zero
-	// so an operator/CI notices and re-runs with --apply (which quarantines).
-	if mode == storage.RepoIdentityRepairReport && res.Quarantined > 0 {
-		return fmt.Errorf("%d repository identities cannot be proven and need quarantine: re-run with --apply", res.Quarantined)
+	// Fail closed: a report-only run that found unprovable rows OR active rows
+	// that would change identity exits non-zero so an operator/CI notices and
+	// re-runs with --apply (and --cancel-active for the active rows).
+	if mode == storage.RepoIdentityRepairReport {
+		if res.Quarantined > 0 {
+			return fmt.Errorf("%d repository identities cannot be proven and need quarantine: re-run with --apply", res.Quarantined)
+		}
+		if res.ActiveRequiresDrain > 0 {
+			return fmt.Errorf("%d non-terminal runs/jobs would change identity and require --cancel-active to drain first", res.ActiveRequiresDrain)
+		}
 	}
 	return nil
 }
@@ -72,6 +79,6 @@ func writeRepoIdentityRepairReport(out io.Writer, res storage.RepoIdentityRepair
 	if res.Mode == storage.RepoIdentityRepairApply {
 		verb = "applied"
 	}
-	fmt.Fprintf(out, "repository identities %s: scanned=%d rewritten=%d quarantined=%d unchanged=%d\n",
-		verb, res.Scanned, res.Rewritten, res.Quarantined, res.Unchanged)
+	fmt.Fprintf(out, "repository identities %s: scanned=%d rewritten=%d quarantined=%d unchanged=%d active_requires_drain=%d drained=%d\n",
+		verb, res.Scanned, res.Rewritten, res.Quarantined, res.Unchanged, res.ActiveRequiresDrain, res.Drained)
 }

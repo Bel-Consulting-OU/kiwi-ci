@@ -206,7 +206,8 @@ func TestSpoolFileAndSpoolCopyEdges(t *testing.T) {
 	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := SpoolFile(filepath.Join(blocker, "staging"), bytes.NewReader([]byte("x")), 0); err == nil {
+	bad := &Budget{dir: filepath.Join(blocker, "staging"), notify: make(chan struct{})}
+	if _, _, err := bad.SpoolFile(bytes.NewReader([]byte("x")), 0); err == nil {
 		t.Fatal("SpoolFile under a file parent succeeded")
 	}
 

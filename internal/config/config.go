@@ -516,12 +516,20 @@ func redactURL(raw string) string {
 	}
 }
 
+// MaxStagingMaxBytes is the largest accepted staging.max_bytes (1 TiB). A
+// value approaching int64 max is not a real disk budget: admitting it would
+// let the staging ledger's reservation arithmetic run near the signed-overflow
+// boundary, so it is rejected with a clear error instead of being silently
+// truncated or wrapped.
+const MaxStagingMaxBytes int64 = 1 << 40
+
 // validateStaging enforces the staging section's contract: a usable staging
 // bound is either fully configured (a directory AND a positive byte budget)
 // or absent. A partial configuration is refused so a typo cannot silently
-// leave large uploads unbounded, and a non-positive budget is refused because
-// it can never hold a valid upload. Production mode additionally REQUIRES
-// both keys (see app.validateProductionConfig).
+// leave large uploads unbounded, a non-positive budget is refused because it
+// can never hold a valid upload, and an absurdly large budget (near int64
+// max) is refused because it is not a real disk bound. Production mode
+// additionally REQUIRES both keys (see app.validateProductionConfig).
 //
 // The instance id is the per-replica half of the bound: staging.dir is a
 // root and each replica stages in <root>/<instance_id>, so replicas sharing
@@ -541,6 +549,9 @@ func validateStaging(st StagingConfig) error {
 	}
 	if st.MaxBytes <= 0 {
 		return fmt.Errorf("staging.max_bytes must be a positive byte budget when staging.dir is set, got %d (the budget bounds one replica's staged bytes; replicas sharing staging.dir must set distinct staging.instance_id values)", st.MaxBytes)
+	}
+	if st.MaxBytes > MaxStagingMaxBytes {
+		return fmt.Errorf("staging.max_bytes must not exceed %d bytes (1 TiB), got %d: a value near the int64 maximum is not a usable disk budget", MaxStagingMaxBytes, st.MaxBytes)
 	}
 	if instanceID != "" {
 		if err := staging.ValidateInstanceID(instanceID); err != nil {

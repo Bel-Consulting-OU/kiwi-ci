@@ -234,7 +234,7 @@ Usage:
   kiwi database migrate|status --database-url URL
   kiwi storage  reconcile-reservations --database-url URL
   kiwi storage  migrate-staging-layout --dir DIR [--force]
-  kiwi repair-repo-identities [--database-url URL] [--apply]
+  kiwi repair-repo-identities [--database-url URL] [--apply] [--cancel-active]
   kiwi outbox dead-letters list|requeue|delete [--database-url URL] [ID]
   kiwi runner   --server http://127.0.0.1:8080 --token TOKEN [--drain]
   kiwi runner list|drain|disable|enable --server URL --token ADMIN_TOKEN [RUNNER_ID]

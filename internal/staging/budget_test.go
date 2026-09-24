@@ -340,8 +340,13 @@ func TestBudgetPruneHonoursMinAgeAndCancellation(t *testing.T) {
 
 func TestSpoolFileStagesContentAndBounds(t *testing.T) {
 	dir := t.TempDir()
+	b, err := NewBudget(dir, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = b.Close() }()
 	payload := []byte("spool-me")
-	path, n, err := SpoolFile(dir, bytes.NewReader(payload), 0)
+	path, n, err := b.SpoolFile(bytes.NewReader(payload), 0)
 	if err != nil {
 		t.Fatalf("SpoolFile: %v", err)
 	}
@@ -356,7 +361,7 @@ func TestSpoolFileStagesContentAndBounds(t *testing.T) {
 		t.Fatalf("spooled content = %q, %v", got, err)
 	}
 	// Exact limit passes and leaves exactly `limit` bytes on disk.
-	exactPath, n, err := SpoolFile(dir, bytes.NewReader(payload), int64(len(payload)))
+	exactPath, n, err := b.SpoolFile(bytes.NewReader(payload), int64(len(payload)))
 	if err != nil || n != int64(len(payload)) {
 		t.Fatalf("SpoolFile at limit = (%d, %v)", n, err)
 	}
@@ -374,7 +379,7 @@ func TestSpoolFileStagesContentAndBounds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, n, err := SpoolFile(dir, bytes.NewReader(payload), int64(len(payload)-1)); !errors.Is(err, ErrTooLarge) {
+	if _, n, err := b.SpoolFile(bytes.NewReader(payload), int64(len(payload)-1)); !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("SpoolFile over limit = %v, want ErrTooLarge", err)
 	} else if n > int64(len(payload)-1) {
 		t.Fatalf("over-limit SpoolFile reported %d staged bytes with limit %d", n, len(payload)-1)
@@ -386,8 +391,8 @@ func TestSpoolFileStagesContentAndBounds(t *testing.T) {
 	if len(after) != len(before) {
 		t.Fatalf("over-limit spool left files behind: %d -> %d", len(before), len(after))
 	}
-	// Empty directory path is a bound error.
-	if _, _, err := SpoolFile("", bytes.NewReader(payload), 1); !errors.Is(err, ErrNoBound) {
+	// A Budget with no directory is a bound error.
+	if _, _, err := (&Budget{}).SpoolFile(bytes.NewReader(payload), 1); !errors.Is(err, ErrNoBound) {
 		t.Fatalf("SpoolFile empty dir = %v, want ErrNoBound", err)
 	}
 }
@@ -516,7 +521,7 @@ func TestBudgetPruneSkipsActiveSpoolsAndRemovesAbandoned(t *testing.T) {
 	// below is aged well past the threshold.
 	b.PruneMinAge = time.Nanosecond
 
-	active, n, err := SpoolFile(dir, bytes.NewReader([]byte("legitimately slow publication")), 0)
+	active, n, err := b.SpoolFile(bytes.NewReader([]byte("legitimately slow publication")), 0)
 	if err != nil || n == 0 {
 		t.Fatalf("SpoolFile active spool = (%q, %d, %v)", active, n, err)
 	}
@@ -593,7 +598,7 @@ func TestBudgetPruneConcurrentWithInFlightSpool(t *testing.T) {
 	}
 	done := make(chan spoolResult, 1)
 	go func() {
-		path, _, err := SpoolFile(dir, reader, 0)
+		path, _, err := b.SpoolFile(reader, 0)
 		done <- spoolResult{path, err}
 	}()
 	select {
@@ -656,27 +661,45 @@ func (f failingReader) Read([]byte) (int, error) { return 0, f.err }
 
 func TestSpoolFilePropagatesReaderErrorAndKeepsNoFile(t *testing.T) {
 	dir := t.TempDir()
+	b, err := NewBudget(dir, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = b.Close() }()
 	boom := fmt.Errorf("client disconnected")
-	if _, _, err := SpoolFile(dir, failingReader{err: boom}, 1024); !errors.Is(err, boom) {
+	if _, _, err := b.SpoolFile(failingReader{err: boom}, 1024); !errors.Is(err, boom) {
 		t.Fatalf("SpoolFile reader error = %v, want %v", err, boom)
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 0 {
-		t.Fatalf("failed spool left %d file(s)", len(entries))
+	if n := countSpoolFiles(entries); n != 0 {
+		t.Fatalf("failed spool left %d file(s)", n)
 	}
 	// A reader that returns data then fails also leaves nothing behind.
 	r := io.MultiReader(bytes.NewReader([]byte("partial")), failingReader{err: boom})
-	if _, _, err := SpoolFile(dir, r, 1024); !errors.Is(err, boom) {
+	if _, _, err := b.SpoolFile(r, 1024); !errors.Is(err, boom) {
 		t.Fatalf("SpoolFile partial reader error = %v, want %v", err, boom)
 	}
 	entries, err = os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 0 {
-		t.Fatalf("partial spool left %d file(s)", len(entries))
+	if n := countSpoolFiles(entries); n != 0 {
+		t.Fatalf("partial spool left %d file(s)", n)
 	}
+}
+
+// countSpoolFiles counts the staged spool entries, ignoring the ownership
+// lock file (and any foreign file) a constructed budget leaves in the
+// directory.
+func countSpoolFiles(entries []os.DirEntry) int {
+	n := 0
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasPrefix(e.Name(), FilePrefix) {
+			n++
+		}
+	}
+	return n
 }

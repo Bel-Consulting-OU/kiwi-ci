@@ -446,9 +446,12 @@ func compiledPayloadWithRuntime(runtimeName string) *model.CompiledJobPayload {
 
 // TestPostgresCancelRunJobsCursorIsClosedBeforeUpdates is the structural
 // regression test for the pgx cursor misuse: CancelRunJobs must drain the
-// FOR UPDATE cursor and close it BEFORE any tx.Exec. The test reads the
-// implementation source (there is no live Postgres in unit tests) and
-// asserts the ordering inside the function body.
+// FOR UPDATE cursor and close it BEFORE any statement that touches the
+// connection again. Since T1-2 the per-job statements live in cancelJobTx, so
+// the test pins that the cursor loop only SCANS and that the first
+// cancelJobTx call comes after rows.Close(). The test reads the
+// implementation source (there is no live Postgres in unit tests) and asserts
+// the ordering inside the CancelRunJobs body.
 func TestPostgresCancelRunJobsCursorIsClosedBeforeUpdates(t *testing.T) {
 	raw, err := os.ReadFile("postgres.go")
 	if err != nil {
@@ -465,20 +468,20 @@ func TestPostgresCancelRunJobsCursorIsClosedBeforeUpdates(t *testing.T) {
 	}
 	nextIdx := strings.Index(rest, "rows.Next()")
 	closeIdx := strings.Index(rest, "rows.Close()")
-	execIdx := strings.Index(rest, "tx.Exec(ctx,")
-	if nextIdx < 0 || closeIdx < 0 || execIdx < 0 {
-		t.Fatalf("CancelRunJobs structure changed: next=%d close=%d exec=%d", nextIdx, closeIdx, execIdx)
+	cancelIdx := strings.Index(rest, "s.cancelJobTx(ctx,")
+	if nextIdx < 0 || closeIdx < 0 || cancelIdx < 0 {
+		t.Fatalf("CancelRunJobs structure changed: next=%d close=%d cancelJobTx=%d", nextIdx, closeIdx, cancelIdx)
 	}
 	if closeIdx < nextIdx {
 		t.Fatalf("rows.Close() (at %d) precedes the cursor loop (at %d)", closeIdx, nextIdx)
 	}
-	if execIdx < closeIdx {
-		t.Fatal("CancelRunJobs runs tx.Exec while the FOR UPDATE cursor is still open (pgx cursor misuse)")
+	if cancelIdx < closeIdx {
+		t.Fatal("CancelRunJobs issues a statement while the FOR UPDATE cursor is still open (pgx cursor misuse)")
 	}
 	// The cursor loop body itself must not execute statements: the first
-	// tx.Exec must come after the loop closed the rows.
+	// cancelJobTx must come after the loop closed the rows.
 	loopBody := rest[nextIdx:closeIdx]
-	if strings.Contains(loopBody, "tx.Exec(") || strings.Contains(loopBody, "tx.Query(") || strings.Contains(loopBody, "tx.QueryRow(") {
+	if strings.Contains(loopBody, "tx.Exec(") || strings.Contains(loopBody, "tx.Query(") || strings.Contains(loopBody, "tx.QueryRow(") || strings.Contains(loopBody, "cancelJobTx(") {
 		t.Fatal("CancelRunJobs issues a statement inside the open-cursor loop")
 	}
 }

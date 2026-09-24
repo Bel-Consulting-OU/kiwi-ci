@@ -5908,6 +5908,13 @@ func recovererWith(next http.Handler, onPanic func(id, method, path string, x an
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if x := recover(); x != nil {
+				if x == http.ErrAbortHandler {
+					// The standard library's unconditional-abort sentinel
+					// (used by the download integrity paths): re-raise it so
+					// net/http tears the connection down instead of this
+					// middleware turning a deliberate abort into a 500.
+					panic(x)
+				}
 				id := requestIDFrom(r)
 				onPanic(id, r.Method, r.URL.Path, x, string(debug.Stack()))
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error", "request_id": id})

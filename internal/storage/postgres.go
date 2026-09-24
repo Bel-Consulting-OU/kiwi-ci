@@ -1421,7 +1421,7 @@ func (s *PostgresStore) AcquireLease(ctx context.Context, jobID, runnerID string
 	// the FIRST lease only (COALESCE) so requeues and lost-runner re-leases
 	// preserve the original start time. A quarantined job is denied here too:
 	// the durable flag is checked in the claim statement itself.
-	err := s.pool.QueryRow(ctx, `UPDATE jobs SET status='running', attempts = attempts + 1, started_at = COALESCE(started_at, now()), lease_runner_id=$2, lease_token_hash=$3, lease_generation=$4, lease_expires_at=$5 WHERE id=$1 AND status='queued' AND COALESCE(payload->>'repo_identity_quarantined','') <> 'true' AND (lease_expires_at IS NULL OR lease_expires_at < now()) RETURNING `+jobCols,
+	err := s.pool.QueryRow(ctx, `UPDATE jobs SET status='running', attempts = attempts + 1, started_at = COALESCE(started_at, now()), lease_runner_id=$2, lease_token_hash=$3, lease_generation=$4, lease_expires_at=$5 WHERE id=$1 AND status='queued' AND COALESCE(payload->>'repo_identity_quarantined','') <> 'true' AND `+LeaseParentRunEligibleSQL+` AND (lease_expires_at IS NULL OR lease_expires_at < now()) RETURNING `+jobCols,
 		jobID, runnerID, tokenHash, generation, expiresAt).Scan(jobTargets(&js)...)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return model.Job{}, ErrLeaseConflict
@@ -1551,14 +1551,18 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 
 	// Step 1: lock the job row first (job -> runner ordering, matching
 	// CompleteJob) and fail fast when the job is not queued. The durable
-	// repo_identity_quarantined payload flag is read under the SAME row lock,
-	// so a quarantined job can never be leased even if the claim's
-	// Quarantined field was not populated by a direct caller (R1-6).
+	// repo_identity_quarantined payload flag AND the parent-run eligibility
+	// predicate are read under the SAME row lock, so a quarantined job — or a
+	// queued child of a cancelled/quarantined run — can never be leased even
+	// if the claim's Quarantined field was not populated by a direct caller
+	// (R1-6/T1-3).
 	var (
 		jobStatus      string
 		jobQuarantined bool
+		runEligible    bool
 	)
-	err = tx.QueryRow(ctx, `SELECT status, COALESCE(payload->>'repo_identity_quarantined','') = 'true' FROM jobs WHERE id=$1 FOR UPDATE`, claim.JobID).Scan(&jobStatus, &jobQuarantined)
+	err = tx.QueryRow(ctx, `SELECT status, COALESCE(payload->>'repo_identity_quarantined','') = 'true', `+LeaseParentRunEligibleSQL+` FROM jobs WHERE id=$1 FOR UPDATE`, claim.JobID).
+		Scan(&jobStatus, &jobQuarantined, &runEligible)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return model.Job{}, ErrLeaseConflict
 	}
@@ -1568,7 +1572,7 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 	if model.Status(jobStatus) != model.StatusQueued {
 		return model.Job{}, ErrLeaseConflict
 	}
-	if jobQuarantined || claim.Quarantined {
+	if jobQuarantined || claim.Quarantined || !runEligible {
 		return model.Job{}, ErrNoCapacity
 	}
 
@@ -2391,21 +2395,260 @@ func dependencyConditionAllows(expr string, status model.Status) bool {
 	return pipeline.ConditionAllows(expr, status)
 }
 
-// cancelTarget is one row drained from the CancelRunJobs FOR UPDATE
-// cursor. The rows are collected and the cursor closed BEFORE any update
-// runs: pgx forbids issuing tx.Exec while a Query cursor is still open on
-// the same connection.
-type cancelTarget struct {
-	id         string
-	payload    []byte
-	wasRunning bool
-	runnerID   string
+// JobCancelCause selects the cancellation variant performed by cancelJobTx.
+// It exists so the SAME per-job cancellation transaction serves the operator
+// CancelRunJobs path (its exact historical behavior) and the identity-repair
+// drain/quarantine path, which additionally recomputes dependents, appends an
+// audit event and recomputes the run aggregation (T1-2).
+type JobCancelCause int
+
+const (
+	// JobCancelOperator is the CancelRunJobs cancellation: clear the lease,
+	// release the runner slot, the resource reservation and the quota counter
+	// under the PRE-cancellation identity. The additive steps (7)-(9) are left
+	// to the caller's run-level update exactly as before, so refactoring
+	// CancelRunJobs onto cancelJobTx changes no behavior.
+	JobCancelOperator JobCancelCause = iota
+	// JobCancelRepairDrain is the --cancel-active identity repair: the full
+	// canonical cancellation, including dependent recomputation, an audit
+	// event and run aggregation.
+	JobCancelRepairDrain
+	// JobCancelQuarantine is JobCancelRepairDrain plus the durable
+	// repo_identity_quarantined flag, so a cascaded child of a quarantined run
+	// stays inert even if it is ever requeued.
+	JobCancelQuarantine
+)
+
+// additive reports whether the cause performs steps (7)-(9): dependent
+// recomputation, audit append and run aggregation.
+func (c JobCancelCause) additive() bool { return c != JobCancelOperator }
+
+// auditAction is the audit action recorded for the cause.
+func (c JobCancelCause) auditAction() string {
+	if c == JobCancelQuarantine {
+		return "job.quarantined"
+	}
+	return "job.cancelled"
+}
+
+// cancelJobTx is the ONE transactional job cancellation.
+//
+//  1. lock the job FOR UPDATE;
+//  2. capture its PRE-cancellation repository identity (RepoIDForJob);
+//  3. clear lease_runner_id/lease_token_hash/lease_expires_at (row AND
+//     payload);
+//  4. delete its job_resource_reservations row;
+//  5. remove it from the runner's active_jobs and repair current_job/busy;
+//  6. decrement the quota counters under the OLD identity keys;
+//
+// and, for an additive cause,
+//
+//  7. recompute its dependent jobs;
+//  8. append the cancellation audit event;
+//  9. recompute the run aggregation.
+//
+// Using the OLD identity for the quota release is mandatory: the identity
+// repair performs the guarded rewrite in a LATER statement, so decrementing
+// after a rewrite would release the NEW repository's counter and leak the
+// original reservation (finding 7). A terminal (or missing) job is a no-op.
+func (s *PostgresStore) cancelJobTx(ctx context.Context, tx pgx.Tx, jobID, reason string, cause JobCancelCause) (bool, error) {
+	var (
+		runID    string
+		runnerID string
+		payload  []byte
+		status   string
+	)
+	err := tx.QueryRow(ctx, `SELECT run_id, COALESCE(lease_runner_id,''), payload, status FROM jobs WHERE id=$1 FOR UPDATE`, jobID).
+		Scan(&runID, &runnerID, &payload, &status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	st := model.Status(status)
+	if st.Terminal() {
+		return false, nil
+	}
+	var j model.Job
+	if err := json.Unmarshal(payload, &j); err != nil {
+		return false, err
+	}
+	// (2) the identity the quota was reserved under, captured BEFORE any
+	// rewrite.
+	oldRepoID := RepoIDForJob(j)
+	now := time.Now().UTC()
+	j.Status = model.StatusCancelled
+	j.Error = reason
+	j.FinishedAt = &now
+	j.LeaseRunnerID = ""
+	j.LeaseTokenHash = nil
+	j.LeaseExpiresAt = nil
+	if cause == JobCancelQuarantine {
+		j.RepoIdentityQuarantined = true
+	}
+	jp, err := jsonMarshal(j)
+	if err != nil {
+		return false, err
+	}
+	// (3) clear the lease columns on the row as well as in the payload.
+	if _, err := tx.Exec(ctx, `UPDATE jobs SET status='cancelled', error=$2, finished_at=$3, lease_runner_id=NULL, lease_token_hash=NULL, lease_expires_at=NULL, payload=$4 WHERE id=$1`,
+		jobID, reason, now, jp); err != nil {
+		return false, err
+	}
+	// (4) the resource reservation (no-op for a queued job, which never
+	// acquired one).
+	if err := releaseResourcesTx(ctx, tx, jobID); err != nil {
+		return false, err
+	}
+	// (5)/(6) the runner slot and the quota counter, under the OLD identity.
+	if st == model.StatusRunning {
+		if err := s.adjustQuotaTx(ctx, tx, oldRepoID, -1, 0); err != nil {
+			return false, err
+		}
+		if runnerID != "" {
+			if err := s.releaseRunnerSlotTx(ctx, tx, runnerID, jobID); err != nil {
+				return false, err
+			}
+		}
+	} else {
+		if err := s.adjustQuotaTx(ctx, tx, oldRepoID, 0, -1); err != nil {
+			return false, err
+		}
+	}
+	if !cause.additive() {
+		return true, nil
+	}
+	// (7) dependents.
+	if err := s.recomputeDependentsTx(ctx, tx, jobID, now); err != nil {
+		return false, err
+	}
+	// (8) audit.
+	auditID, err := newID()
+	if err != nil {
+		return false, err
+	}
+	meta := []byte(`{"job":` + strconv.Quote(j.Key) + `}`)
+	if _, err := tx.Exec(ctx, `INSERT INTO audit_events (id, action, actor, run_id, job_id, message, metadata, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		auditID, cause.auditAction(), "operator", runID, jobID, reason, meta, now); err != nil {
+		return false, err
+	}
+	// (9) run aggregation.
+	if err := s.recomputeRunTx(ctx, tx, runID); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// cancelRunRowTx locks the run row and marks it cancelled (a terminal or
+// missing run is a no-op). The run row is locked AFTER any child jobs; see
+// cancelRunTx for the documented lock order.
+func (s *PostgresStore) cancelRunRowTx(ctx context.Context, tx pgx.Tx, runID, reason string, cause JobCancelCause) (bool, error) {
+	var (
+		payload   []byte
+		curStatus string
+	)
+	err := tx.QueryRow(ctx, `SELECT payload, status FROM runs WHERE id=$1 FOR UPDATE`, runID).Scan(&payload, &curStatus)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if model.Status(curStatus).Terminal() {
+		return false, nil
+	}
+	var run model.Run
+	if err := json.Unmarshal(payload, &run); err != nil {
+		return false, err
+	}
+	now := time.Now().UTC()
+	run.Status = model.StatusCancelled
+	run.FinishedAt = &now
+	rp, err := jsonMarshal(run)
+	if err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE runs SET status=$2, finished_at=$3, payload=$4, `+normalizedRunRepoIdentityColumn+`=`+normalizedRunRepoIdentitySQL("$4")+`, `+normalizedRunRepoFullNameColumn+`=`+normalizedRunRepoFullNameSQL("$4")+` WHERE id=$1`,
+		runID, string(model.StatusCancelled), now, rp); err != nil {
+		return false, err
+	}
+	if cause.additive() {
+		auditID, err := newID()
+		if err != nil {
+			return false, err
+		}
+		action := "run.cancelled"
+		if cause == JobCancelQuarantine {
+			action = "run.quarantined"
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO audit_events (id, action, actor, run_id, message, created_at) VALUES ($1, $2, $3, $4, $5, $6)`,
+			auditID, action, "operator", runID, reason, now); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// cancelRunChildrenTx cancels every non-terminal child job of a run through
+// cancelJobTx, in the caller's transaction, without touching the run row. It
+// reports whether any child was actually cancelled. The child jobs are locked
+// (SELECT ... FOR UPDATE) FIRST, in id order, and the run row is never locked
+// here: that keeps the job -> run order AcquireLeaseAtomic (job -> runner) and
+// CompleteJob (job -> run through recomputeRunTx) use, so a cascade can never
+// deadlock against a completion that already holds the job row.
+func (s *PostgresStore) cancelRunChildrenTx(ctx context.Context, tx pgx.Tx, runID, reason string, cause JobCancelCause) (bool, error) {
+	rows, err := tx.Query(ctx, `SELECT id FROM jobs WHERE run_id=$1 AND NOT (status IN ('success', 'failure', 'cancelled', 'skipped', 'blocked')) ORDER BY id FOR UPDATE`, runID)
+	if err != nil {
+		return false, err
+	}
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return false, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	cancelled := false
+	for _, id := range ids {
+		ok, err := s.cancelJobTx(ctx, tx, id, reason, cause)
+		if err != nil {
+			return false, err
+		}
+		if ok {
+			cancelled = true
+		}
+	}
+	return cancelled, nil
+}
+
+// cancelRunTx cancels a run and every non-terminal child job through
+// cancelJobTx, in the caller's transaction, and reports whether the RUN row
+// was transitioned. It is the run-level cancellation used by the repair
+// quarantine cascade and by --cancel-active.
+//
+// LOCK ORDER: cancelRunChildrenTx locks and cancels the non-terminal child
+// jobs FIRST; the run row is locked LAST by cancelRunRowTx. That is job -> run
+// (see cancelRunChildrenTx).
+func (s *PostgresStore) cancelRunTx(ctx context.Context, tx pgx.Tx, runID, reason string, cause JobCancelCause) (bool, error) {
+	if _, err := s.cancelRunChildrenTx(ctx, tx, runID, reason, cause); err != nil {
+		return false, err
+	}
+	return s.cancelRunRowTx(ctx, tx, runID, reason, cause)
 }
 
 // CancelRunJobs cancels every non-terminal job of the run and the run
 // itself in one transaction. Every cancelled RUNNING job releases its
 // runner's active_jobs slot (and its quota running slot) in the SAME
-// transaction, so a cancelled run can never leak a runner slot.
+// transaction, so a cancelled run can never leak a runner slot. It delegates
+// each job to cancelJobTx (T1-2); the operator cause preserves the historical
+// behavior (no per-job audit/dependent/aggregation side effects).
 func (s *PostgresStore) CancelRunJobs(ctx context.Context, runID string, reason string) ([]string, error) {
 	if err := ValidateRunID(runID); err != nil {
 		return nil, err
@@ -2415,102 +2658,38 @@ func (s *PostgresStore) CancelRunJobs(ctx context.Context, runID string, reason 
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
-	now := time.Now().UTC()
 	// Phase 1: lock and collect the target rows. The cursor is closed before
 	// any tx.Exec so this never nests a query on an open cursor.
-	rows, err := tx.Query(ctx, `SELECT id, payload, status, COALESCE(lease_runner_id, '') FROM jobs WHERE run_id=$1 AND NOT (status IN ('success', 'failure', 'cancelled', 'skipped', 'blocked')) ORDER BY id FOR UPDATE`, runID)
+	rows, err := tx.Query(ctx, `SELECT id FROM jobs WHERE run_id=$1 AND NOT (status IN ('success', 'failure', 'cancelled', 'skipped', 'blocked')) ORDER BY id FOR UPDATE`, runID)
 	if err != nil {
 		return nil, err
 	}
-	targets := []cancelTarget{}
+	targets := []string{}
 	for rows.Next() {
-		var (
-			t             cancelTarget
-			status        string
-			leaseRunnerID string
-			payload       []byte
-		)
-		if err := rows.Scan(&t.id, &payload, &status, &leaseRunnerID); err != nil {
+		var id string
+		if err := rows.Scan(&id); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		t.payload = payload
-		t.wasRunning = model.Status(status) == model.StatusRunning
-		t.runnerID = leaseRunnerID
-		targets = append(targets, t)
+		targets = append(targets, id)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	// Phase 2: apply every cancellation in the same transaction.
+	// Phase 2: cancel each target in the same transaction.
 	ids := []string{}
-	for _, t := range targets {
-		var j model.Job
-		if err := json.Unmarshal(t.payload, &j); err != nil {
-			return nil, err
-		}
-		j.Status = model.StatusCancelled
-		j.Error = reason
-		j.FinishedAt = &now
-		j.LeaseRunnerID = ""
-		j.LeaseTokenHash = nil
-		j.LeaseExpiresAt = nil
-		jp, err := jsonMarshal(j)
+	for _, id := range targets {
+		cancelled, err := s.cancelJobTx(ctx, tx, id, reason, JobCancelOperator)
 		if err != nil {
 			return nil, err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE jobs SET status='cancelled', error=$2, finished_at=$3, lease_runner_id=NULL, lease_token_hash=NULL, lease_expires_at=NULL, payload=$4 WHERE id=$1`,
-			t.id, reason, now, jp); err != nil {
-			return nil, err
+		if cancelled {
+			ids = append(ids, id)
 		}
-		// The cancelled job releases its reserved slot (running or queued)
-		// and its resource reservation (no-op for a queued job, which never
-		// acquired one).
-		if err := releaseResourcesTx(ctx, tx, t.id); err != nil {
-			return nil, err
-		}
-		if t.wasRunning {
-			if err := s.adjustQuotaTx(ctx, tx, RepoIDForJob(j), -1, 0); err != nil {
-				return nil, err
-			}
-			// A running job also held a runner capacity slot: splice it out
-			// of the runner's active set in the same transaction.
-			if t.runnerID != "" {
-				if err := s.releaseRunnerSlotTx(ctx, tx, t.runnerID, t.id); err != nil {
-					return nil, err
-				}
-			}
-		} else {
-			if err := s.adjustQuotaTx(ctx, tx, RepoIDForJob(j), 0, -1); err != nil {
-				return nil, err
-			}
-		}
-		ids = append(ids, t.id)
 	}
 	// Cancel the run itself, mirroring the in-memory cancelRunLocked.
-	var (
-		payload   []byte
-		curStatus string
-	)
-	err = tx.QueryRow(ctx, `SELECT payload, status FROM runs WHERE id=$1 FOR UPDATE`, runID).Scan(&payload, &curStatus)
-	if err == nil {
-		var run model.Run
-		if err := json.Unmarshal(payload, &run); err != nil {
-			return nil, err
-		}
-		if !run.Status.Terminal() {
-			run.Status = model.StatusCancelled
-			run.FinishedAt = &now
-			rp, err := jsonMarshal(run)
-			if err != nil {
-				return nil, err
-			}
-			if _, err := tx.Exec(ctx, `UPDATE runs SET status=$2, finished_at=$3, payload=$4, `+normalizedRunRepoIdentityColumn+`=`+normalizedRunRepoIdentitySQL("$4")+`, `+normalizedRunRepoFullNameColumn+`=`+normalizedRunRepoFullNameSQL("$4")+` WHERE id=$1`, runID, string(model.StatusCancelled), now, rp); err != nil {
-				return nil, err
-			}
-		}
-	} else if !errors.Is(err, pgx.ErrNoRows) {
+	if _, err := s.cancelRunRowTx(ctx, tx, runID, reason, JobCancelOperator); err != nil {
 		return nil, err
 	}
 	return ids, tx.Commit(ctx)

@@ -203,8 +203,30 @@ func TestCacheUploadNoBareTempStaging(t *testing.T) {
 			t.Fatalf("blobs.go still stages in an unbounded temp location: contains %q", forbidden)
 		}
 	}
-	if !strings.Contains(code, "staging.SpoolFile") {
-		t.Fatal("blobs.go does not stage through staging.SpoolFile")
+	if !strings.Contains(code, "SpoolFile(") {
+		t.Fatal("blobs.go does not stage through the budget's SpoolFile")
+	}
+	if strings.Contains(code, "staging.SpoolFile") {
+		t.Fatal("blobs.go uses the retired package-level staging.SpoolFile instead of the budget-owned method")
+	}
+}
+
+// TestSnapshotUploadUsesBudgetOwnedSpool pins T2-3: the snapshot DB upload
+// must stage through the budget-owned SpoolFile (which registers the file as
+// an active spool under the budget mutex, so a runtime Prune cannot unlink a
+// live snapshot spool), never a raw os.CreateTemp that carries the
+// reclaimable prefix without being tracked.
+func TestSnapshotUploadUsesBudgetOwnedSpool(t *testing.T) {
+	src, err := os.ReadFile("snapshots.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := string(src)
+	if strings.Contains(code, "os.CreateTemp(") {
+		t.Fatal("snapshots.go still creates a raw staging temp (untracked): a concurrent Prune could unlink a live spool")
+	}
+	if !strings.Contains(code, "SpoolFile(") {
+		t.Fatal("snapshots.go does not stage through the budget-owned SpoolFile")
 	}
 }
 

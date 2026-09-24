@@ -14,14 +14,44 @@ import (
 // every classification, including the zero value.
 func TestRepoIdentityRepairActionString(t *testing.T) {
 	cases := map[RepoIdentityRepairAction]string{
-		RepoIdentityKeep:             "keep",
-		RepoIdentityRewrite:          "rewrite",
-		RepoIdentityQuarantine:       "quarantine",
-		RepoIdentityRepairAction(99): "keep",
+		RepoIdentityKeep:                "keep",
+		RepoIdentityRewriteTerminal:     "rewrite_terminal",
+		RepoIdentityQuarantineTerminal:  "quarantine_terminal",
+		RepoIdentityActiveRequiresDrain: "active_requires_drain",
+		RepoIdentityConflict:            "conflict",
+		RepoIdentityRepairAction(99):    "keep",
 	}
 	for action, want := range cases {
 		if got := action.String(); got != want {
 			t.Errorf("Action(%d).String() = %q, want %q", action, got, want)
+		}
+	}
+}
+
+// TestQuarantinedRepoIdentityHashesRawNotTrimmed is the T1-4 regression: the
+// digest is taken over the RAW stored value, so rows whose stored identities
+// differ only by surrounding whitespace produce DISTINCT quarantine identities
+// while trimming keeps them the same for classification.
+func TestQuarantinedRepoIdentityHashesRawNotTrimmed(t *testing.T) {
+	variants := []string{"group/sub/project", " group/sub/project", "group/sub/project ", "\tgroup/sub/project\n"}
+	seen := map[string]string{}
+	for _, v := range variants {
+		q := QuarantinedRepoIdentity(v)
+		if prev, ok := seen[q]; ok {
+			t.Fatalf("whitespace variants %q and %q collided to %q", prev, v, q)
+		}
+		seen[q] = v
+		sum := sha256.Sum256([]byte(v))
+		if want := RepoIdentityQuarantineHost + "/quarantined/" + hex.EncodeToString(sum[:]); q != want {
+			t.Fatalf("QuarantinedRepoIdentity(%q) = %q, want raw-sha256 %q", v, q, want)
+		}
+	}
+	// Classification still trims: all whitespace variants share one planner
+	// outcome (and one Explicit form only when the raw values coincide).
+	for _, v := range variants {
+		plan := PlanStoredRepoIdentity(v, "", "")
+		if plan.Action != RepoIdentityQuarantine {
+			t.Fatalf("PlanStoredRepoIdentity(%q) action = %v, want quarantine", v, plan.Action)
 		}
 	}
 }

@@ -2212,8 +2212,10 @@ func (m *memStore) AcquireLease(ctx context.Context, jobID, runnerID string, tok
 	}
 	// A quarantined job is operationally inert even on the non-atomic claim
 	// path (R1-6): the durable flag denies the lease regardless of the
-	// runner's repository allowlist.
-	if j.RepoIdentityQuarantined {
+	// runner's repository allowlist. The parent-run predicate is the same
+	// defense in depth as the SQL claim (T1-3): a queued child of a
+	// cancelled/quarantined run is never leased.
+	if j.RepoIdentityQuarantined || !m.leaseParentRunEligibleLocked(j) {
 		return model.Job{}, ErrLeaseConflict
 	}
 	now := time.Now().UTC()
@@ -4831,6 +4833,13 @@ func (m *memStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim) (mo
 	}
 	if j.Status != model.StatusQueued {
 		return model.Job{}, ErrLeaseConflict
+	}
+	// Defense in depth (T1-3): a queued child of a cancelled/quarantined
+	// parent run is never leased, mirroring LeaseParentRunEligibleSQL. The
+	// job's OWN durable quarantine flag is enforced by LeasePredicate.Allows
+	// below and by the claim's Quarantined field.
+	if !m.leaseParentRunEligibleLocked(j) {
+		return model.Job{}, ErrNoCapacity
 	}
 	r, rok := m.runners[claim.RunnerID]
 	if !rok {

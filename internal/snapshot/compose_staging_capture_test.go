@@ -114,7 +114,7 @@ func TestComposeSnapshotCaptureSpooledInsideStagingBudget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("staging reservation: %v", err)
 	}
-	stagedPath, n, err := staging.SpoolFile(budget.Dir(), pr, 64<<10)
+	stagedPath, n, err := budget.SpoolFile(pr, 64<<10)
 	if err != nil {
 		res.Release()
 		t.Fatalf("spool snapshot capture: %v", err)
@@ -191,7 +191,7 @@ func TestComposeSnapshotCaptureExhaustionFailsTypedAndPartialFree(t *testing.T) 
 		_, cerr := snapshot.Create(ws, pw)
 		_ = pw.CloseWithError(cerr)
 	}()
-	_, _, err = staging.SpoolFile(budget.Dir(), pr, 32)
+	_, _, err = budget.SpoolFile(pr, 32)
 	_ = pr.CloseWithError(io.EOF)
 	if !errors.Is(err, staging.ErrTooLarge) {
 		t.Fatalf("spool of an oversized capture = %v, want ErrTooLarge", err)
@@ -249,7 +249,7 @@ func TestComposeSnapshotCaptureSinkFailureLeavesNoPartialStaging(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer res.Release()
-	if _, _, err := staging.SpoolFile(budget.Dir(), io.TeeReader(pr, sink), 64<<10); err == nil {
+	if _, _, err := budget.SpoolFile(io.TeeReader(pr, sink), 64<<10); err == nil {
 		t.Fatal("spool with a failing sink succeeded")
 	}
 	_ = pr.CloseWithError(io.EOF)
