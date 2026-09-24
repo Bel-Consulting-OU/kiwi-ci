@@ -221,7 +221,7 @@ func pgITSameSet(got []string, want ...string) bool {
 // (guarding malformed ones to NULL), both partial indexes are created, and
 // the backfilled elapsed row is immediately discoverable.
 func TestPostgresIntegrationRecoveryQueueDeadlineMigration(t *testing.T) {
-	env := pgITSetup(t)
+	env := pgITSetupAtVersion(t, 20)
 	st := env.open(t)
 	ctx := context.Background()
 	pgITApplyThrough(t, st, 20)

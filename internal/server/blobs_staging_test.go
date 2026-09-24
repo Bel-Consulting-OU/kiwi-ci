@@ -20,15 +20,21 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
 )
 
-// setTestStagingBudget installs a fresh staging budget on the server.
-func setTestStagingBudget(t *testing.T, s *Server, dir string, max int64) *staging.Budget {
+// cacheFixtureWithStaging builds the DB-mode cache fixture with a
+// CONSTRUCTION-TIME staging budget of max over a fresh "staging" directory,
+// returning the fixture, the budget and the budget directory. Staging is
+// immutable after construction, so a fixture that needs a specific budget must
+// supply it to the constructor rather than swap it afterwards.
+func cacheFixtureWithStaging(t *testing.T, max int64) (*Server, *dbFakeStore, *staging.Budget, map[string]string, string) {
 	t.Helper()
+	dir := filepath.Join(t.TempDir(), "staging")
 	b, err := staging.NewBudget(dir, max)
 	if err != nil {
 		t.Fatalf("staging budget: %v", err)
 	}
-	s.SetStagingBudget(b)
-	return b
+	t.Cleanup(func() { _ = b.Close() })
+	s, f, _, hdrs := cacheFixture(t, WithStagingBudget(b))
+	return s, f, b, hdrs, dir
 }
 
 // doRawBody serves one request with an explicit body and Content-Length
@@ -127,9 +133,7 @@ func (b *lyingBlob) Delete(ctx context.Context, key string) error { return b.inn
 // the spool file removed on the success path, and the manifest records the
 // verified digest/size.
 func TestCacheUploadStagesInsideBudgetDirectoryAndReleases(t *testing.T) {
-	s, f, _, hdrs := cacheFixture(t)
-	dir := filepath.Join(t.TempDir(), "staging")
-	b := setTestStagingBudget(t, s, dir, 1<<20)
+	s, f, b, hdrs, dir := cacheFixtureWithStaging(t, 1<<20)
 
 	var (
 		mu         sync.Mutex
@@ -208,9 +212,7 @@ func TestCacheUploadNoBareTempStaging(t *testing.T) {
 // shared budget: while the budget is fully reserved by another upload, a
 // valid cache upload blocks instead of staging concurrently.
 func TestCacheUploadWaitsForStagingBudget(t *testing.T) {
-	s, _, _, hdrs := cacheFixture(t)
-	dir := filepath.Join(t.TempDir(), "staging")
-	b := setTestStagingBudget(t, s, dir, 1024)
+	s, _, b, hdrs, _ := cacheFixtureWithStaging(t, 1024)
 
 	hold, err := b.Acquire(context.Background(), 1024)
 	if err != nil {
@@ -245,9 +247,7 @@ func TestCacheUploadWaitsForStagingBudget(t *testing.T) {
 // fail-closed 503 (unknown length, where the endpoint maximum is reserved),
 // and nothing is staged.
 func TestCacheUploadRefusesReservationAboveStagingBudget(t *testing.T) {
-	s, f, _, hdrs := cacheFixture(t)
-	dir := filepath.Join(t.TempDir(), "staging")
-	b := setTestStagingBudget(t, s, dir, 16)
+	s, f, b, hdrs, dir := cacheFixtureWithStaging(t, 16)
 	key := strings.Repeat("c", 64)
 	payload := strings.Repeat("x", 64)
 
@@ -297,9 +297,7 @@ func TestCacheUpload413Matrix(t *testing.T) {
 	defer func() { cacheUploadMaxBytes = oldLimit }()
 
 	setup := func(t *testing.T) (*Server, *dbFakeStore, *staging.Budget, map[string]string, string) {
-		s, f, _, hdrs := cacheFixture(t)
-		dir := filepath.Join(t.TempDir(), "staging")
-		b := setTestStagingBudget(t, s, dir, 1<<20)
+		s, f, b, hdrs, dir := cacheFixtureWithStaging(t, 1<<20)
 		return s, f, b, hdrs, dir
 	}
 	assertClean := func(t *testing.T, b *staging.Budget, dir string) {
@@ -387,8 +385,7 @@ func TestCacheUpload413Matrix(t *testing.T) {
 func TestCacheCASIntegrityMismatchCommitsNoManifest(t *testing.T) {
 	for _, mode := range []string{"put-digest", "put-size", "put-key", "open-corrupt", "open-longer"} {
 		t.Run(mode, func(t *testing.T) {
-			s, f, _, hdrs := cacheFixture(t)
-			setTestStagingBudget(t, s, filepath.Join(t.TempDir(), "staging"), 1<<20)
+			s, f, _, hdrs, _ := cacheFixtureWithStaging(t, 1<<20)
 			s.SetBlobStore(&lyingBlob{inner: newMemBlob(), mode: mode})
 			key := strings.Repeat("a", 64)
 			w := doJSONHeaders(t, s, http.MethodPut, "/api/v1/jobs/job-a/cache/"+key, "runner-tok", "cache-integrity-payload", hdrs)
@@ -413,8 +410,7 @@ func TestCacheCASIntegrityMismatchCommitsNoManifest(t *testing.T) {
 // reopened and re-hashed before the manifest commits: reads through CAS.Open
 // return the exact payload bytes and digest.
 func TestCacheUploadReopenVerifiesHappyPath(t *testing.T) {
-	s, _, _, hdrs := cacheFixture(t)
-	setTestStagingBudget(t, s, filepath.Join(t.TempDir(), "staging"), 1<<20)
+	s, _, _, hdrs, _ := cacheFixtureWithStaging(t, 1<<20)
 	payload := "reopen-verify-payload"
 	w := doJSONHeaders(t, s, http.MethodPut, "/api/v1/jobs/job-a/cache/"+strings.Repeat("a", 64), "runner-tok", payload, hdrs)
 	if w.Code != http.StatusCreated {

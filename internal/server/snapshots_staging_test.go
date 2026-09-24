@@ -72,18 +72,6 @@ func snapshotUploadRequest(method, target string, body io.Reader, contentLength 
 	return r
 }
 
-// newUploadBudget installs a budget of maxBytes over a fresh directory and
-// returns it.
-func newUploadBudget(t *testing.T, s *Server, maxBytes int64) *staging.Budget {
-	t.Helper()
-	b, err := staging.NewBudget(t.TempDir(), maxBytes)
-	if err != nil {
-		t.Fatalf("staging budget: %v", err)
-	}
-	s.SetStagingBudget(b)
-	return b
-}
-
 // uploadSnapshotAsync runs the upload handler in a goroutine and returns the
 // response channel.
 func uploadSnapshotAsync(s *Server, r *http.Request) chan *httptest.ResponseRecorder {
@@ -102,10 +90,9 @@ func uploadSnapshotAsync(s *Server, r *http.Request) chan *httptest.ResponseReco
 // instead of overcommitting the staging directory — and both complete once
 // the first releases.
 func TestSnapshotUploadStagingReservationEnforced(t *testing.T) {
-	s, _, _, hdrs := cacheFixture(t)
 	body := fcSnapshotArchive(t)
 	size := int64(len(body))
-	budget := newUploadBudget(t, s, 2*size-1)
+	s, _, budget, hdrs, _ := cacheFixtureWithStaging(t, 2*size-1)
 
 	first := newGatedBodyReader(body)
 	aDone := uploadSnapshotAsync(s, snapshotUploadRequest(http.MethodPost, "/api/v1/jobs/job-a/snapshots", first, size, hdrs))
@@ -154,8 +141,7 @@ func TestSnapshotUploadStagingReservationEnforced(t *testing.T) {
 // leaves the budget intact (a full-budget reservation succeeds immediately
 // afterwards) and no staging file survives.
 func TestSnapshotUploadStagingReservationReleasedOnCopyError(t *testing.T) {
-	s, _, _, hdrs := cacheFixture(t)
-	budget := newUploadBudget(t, s, 4096)
+	s, _, budget, hdrs, _ := cacheFixtureWithStaging(t, 4096)
 
 	r := snapshotUploadRequest(http.MethodPost, "/api/v1/jobs/job-a/snapshots", &fcErrReader{}, 1024, hdrs)
 	w := httptest.NewRecorder()
@@ -181,10 +167,9 @@ func TestSnapshotUploadStagingReservationReleasedOnCopyError(t *testing.T) {
 // disconnect (request context cancelled mid-copy) neither leaks the
 // reservation nor a partial staging file.
 func TestSnapshotUploadStagingReservationReleasedOnDisconnect(t *testing.T) {
-	s, _, _, hdrs := cacheFixture(t)
 	body := fcSnapshotArchive(t)
 	size := int64(len(body))
-	budget := newUploadBudget(t, s, size)
+	s, _, budget, hdrs, _ := cacheFixtureWithStaging(t, size)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	reader := newGatedBodyReader(body)
@@ -218,17 +203,19 @@ func TestSnapshotUploadStagingReservationReleasedOnDisconnect(t *testing.T) {
 // whole endpoint cap is refused when that cap exceeds the budget — and the
 // body is never touched.
 func TestSnapshotUploadStagingUnknownLengthReservesMaximum(t *testing.T) {
-	s, _, _, hdrs := cacheFixture(t)
 	body := fcSnapshotArchive(t)
 	oldMax := snapshotUploadMaxBytes
 	t.Cleanup(func() { snapshotUploadMaxBytes = oldMax })
 	snapshotUploadMaxBytes = int64(len(body))
-	newUploadBudget(t, s, int64(len(body))-1)
+	// A budget one byte below the endpoint maximum: an unknown-length upload
+	// must reserve the maximum up front and fail closed without reading the
+	// body.
+	sBad, _, _, hdrsBad, _ := cacheFixtureWithStaging(t, int64(len(body))-1)
 
 	reader := &countingBodyReader{}
-	r := snapshotUploadRequest(http.MethodPost, "/api/v1/jobs/job-a/snapshots", reader, -1, hdrs)
+	r := snapshotUploadRequest(http.MethodPost, "/api/v1/jobs/job-a/snapshots", reader, -1, hdrsBad)
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, r)
+	sBad.Handler().ServeHTTP(w, r)
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("unknown-length upload over the budget = %d, want 503: %s", w.Code, w.Body.String())
 	}
@@ -238,7 +225,7 @@ func TestSnapshotUploadStagingUnknownLengthReservesMaximum(t *testing.T) {
 
 	// With the endpoint maximum inside the budget the same unknown-length
 	// upload succeeds, charging exactly the maximum.
-	budget2 := newUploadBudget(t, s, int64(len(body)))
+	s, _, budget2, hdrs, _ := cacheFixtureWithStaging(t, int64(len(body)))
 	r2 := snapshotUploadRequest(http.MethodPost, "/api/v1/jobs/job-a/snapshots", bytes.NewReader(body), -1, hdrs)
 	w = httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r2)
@@ -380,8 +367,7 @@ func TestSnapshotUploadStagingStartupPrune(t *testing.T) {
 // upload is created under staging.FilePrefix inside the configured directory
 // (so the package's prune owns it) and removed on every exit path.
 func TestSnapshotUploadStagingUsesConfiguredPrefix(t *testing.T) {
-	s, _, _, hdrs := cacheFixture(t)
-	budget := newUploadBudget(t, s, snapshotUploadMaxBytes)
+	s, _, budget, hdrs, _ := cacheFixtureWithStaging(t, snapshotUploadMaxBytes)
 	body := fcSnapshotArchive(t)
 	r := snapshotUploadRequest(http.MethodPost, "/api/v1/jobs/job-a/snapshots", bytes.NewReader(body), int64(len(body)), hdrs)
 	w := httptest.NewRecorder()
@@ -401,10 +387,9 @@ func TestSnapshotUploadStagingUsesConfiguredPrefix(t *testing.T) {
 func TestSnapshotUploadStagingNeverUsesSystemTempDir(t *testing.T) {
 	systemTmp := t.TempDir()
 	t.Setenv("TMPDIR", systemTmp)
-	s, _, _, hdrs := cacheFixture(t)
 	body := fcSnapshotArchive(t)
 	size := int64(len(body))
-	newUploadBudget(t, s, snapshotUploadMaxBytes)
+	s, _, _, hdrs, _ := cacheFixtureWithStaging(t, snapshotUploadMaxBytes)
 
 	reader := newGatedBodyReader(body)
 	done := uploadSnapshotAsync(s, snapshotUploadRequest(http.MethodPost, "/api/v1/jobs/job-a/snapshots", reader, size, hdrs))

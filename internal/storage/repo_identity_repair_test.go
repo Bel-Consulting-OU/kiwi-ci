@@ -103,12 +103,30 @@ func TestPlanStoredRepoIdentity(t *testing.T) {
 			wantExplicit: QuarantinedRepoIdentity("group/sub/project"),
 		},
 		{
-			name:         "empty identity with a URL host stays empty",
+			// R1-3: the URL proof now has precedence over the empty stored
+			// value. The pre-fix early return left this row identity-less.
+			name:         "empty identity with a URL host is repaired to the URL-proven canonical identity",
 			stored:       "",
 			url:          "https://github.com/acme/backend.git",
 			full:         "acme/backend",
-			wantAction:   RepoIdentityKeep,
-			wantExplicit: "",
+			wantAction:   RepoIdentityRewrite,
+			wantExplicit: "github.com/acme/backend",
+		},
+		{
+			name:         "empty identity with an SSH URL is repaired to the URL-proven canonical identity",
+			stored:       "",
+			url:          "ssh://git@gitlab.company.com/group/sub/project.git",
+			full:         "group/sub/project",
+			wantAction:   RepoIdentityRewrite,
+			wantExplicit: "gitlab.company.com/group/sub/project",
+		},
+		{
+			name:         "empty identity with an scp-like URL is repaired to the URL-proven canonical identity",
+			stored:       "",
+			url:          "git@github.com:acme/backend.git",
+			full:         "acme/backend",
+			wantAction:   RepoIdentityRewrite,
+			wantExplicit: "github.com/acme/backend",
 		},
 		{
 			// R3-B: the old early return left this row with no identity at

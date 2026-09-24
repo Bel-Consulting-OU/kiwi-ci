@@ -31,7 +31,6 @@ func runsPageITID(i int) string { return fmt.Sprintf("%032x", i+1) }
 // insertion order.
 func runsPageITSeedOrdered(t *testing.T, st *PostgresStore, total int) []model.Run {
 	t.Helper()
-	ctx := context.Background()
 	base := time.Now().UTC().Truncate(time.Microsecond)
 	runs := make([]model.Run, total)
 	for i := range runs {
@@ -40,10 +39,10 @@ func runsPageITSeedOrdered(t *testing.T, st *PostgresStore, total int) []model.R
 			Status:    model.StatusSuccess,
 			CreatedAt: base.Add(time.Duration(i) * time.Second),
 		}
-		if err := st.InsertRun(ctx, runs[i]); err != nil {
-			t.Fatalf("insert run %d: %v", i, err)
-		}
 	}
+	// One bulk statement (identical rows to a loop of InsertRun): per-row
+	// autocommit inserts into runs are pathologically slow at fixture scale.
+	pgITBulkInsertRuns(t, st, runs)
 	return runs
 }
 

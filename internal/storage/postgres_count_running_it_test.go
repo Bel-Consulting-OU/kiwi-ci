@@ -25,9 +25,13 @@ func TestPostgresIntegrationCountRunningJobs(t *testing.T) {
 		t.Fatalf("empty CountRunningJobs = %d, %v; want 0", n, err)
 	}
 
-	// More runs than the old 10000 ceiling, all newer and terminal, so a
-	// paginated walk would look at them and skip every one.
-	const bulkRuns = 10050
+	// One run past the old 10000 ListRuns window: the smallest fixture that
+	// still crosses the boundary the pre-fix drain walk depended on (it called
+	// ListRuns(10000)), all newer and terminal, so a paginated walk would look
+	// at them and skip every one. Seeding 10,001 rather than 10,050 keeps the
+	// boundary exact without thousands of redundant rows.
+	const legacyRunWindow = 10000
+	const bulkRuns = legacyRunWindow + 1
 	if _, err := st.pool.Exec(ctx, `INSERT INTO runs (id, status, created_at, payload)
 		SELECT 'zz-bulk-' || lpad(g::text, 6, '0'), 'success', now(), '{}'::jsonb
 		FROM generate_series(1, $1) g`, bulkRuns); err != nil {
@@ -46,7 +50,7 @@ func TestPostgresIntegrationCountRunningJobs(t *testing.T) {
 	}
 
 	// Pin the premise: the running job's run is NOT inside the first page.
-	runs, err := st.ListRuns(ctx, 10000)
+	runs, err := st.ListRuns(ctx, legacyRunWindow)
 	if err != nil {
 		t.Fatalf("ListRuns(10000): %v", err)
 	}

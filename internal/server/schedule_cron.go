@@ -252,11 +252,20 @@ type cronScanBudget struct {
 }
 
 // newCronScanBudget returns a budget of n day-steps; n <= 0 means unlimited.
+// cronScanBudgetHook, when non-nil, observes every budget created for a cron
+// scan. It exists so tests can assert the shared per-tick bound deterministically
+// instead of relying on wall-clock timing. Production leaves it nil.
+var cronScanBudgetHook func(*cronScanBudget)
+
 func newCronScanBudget(n int) *cronScanBudget {
 	if n <= 0 {
 		return nil
 	}
-	return &cronScanBudget{remaining: n}
+	b := &cronScanBudget{remaining: n}
+	if cronScanBudgetHook != nil {
+		cronScanBudgetHook(b)
+	}
+	return b
 }
 
 // spend deducts n units, reporting false (and leaving the budget at zero)

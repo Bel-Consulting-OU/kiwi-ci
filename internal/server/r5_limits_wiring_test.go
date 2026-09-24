@@ -24,8 +24,15 @@ func TestServerCASMaximumParity(t *testing.T) {
 	if cacheUploadMaxBytes != maxBlobBytes {
 		t.Fatalf("cache endpoint cap %d drifted from maxBlobBytes %d", cacheUploadMaxBytes, maxBlobBytes)
 	}
+	// The staging budget is supplied at CONSTRUCTION time: the constructor
+	// uses it verbatim and every CAS instance it builds carries it.
+	b, err := staging.NewBudget(filepath.Join(t.TempDir(), "staging"), 1<<20)
+	if err != nil {
+		t.Fatalf("staging budget: %v", err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
 	dir := t.TempDir()
-	s, err := NewPersistent("tok", "tok", dir)
+	s, err := NewPersistent("tok", "tok", dir, WithStagingBudget(b))
 	if err != nil {
 		t.Fatalf("NewPersistent: %v", err)
 	}
@@ -35,8 +42,8 @@ func TestServerCASMaximumParity(t *testing.T) {
 	if s.CAS.MaxBlobBytes != maxBlobBytes {
 		t.Fatalf("constructor CAS MaxBlobBytes = %d, want maxBlobBytes %d", s.CAS.MaxBlobBytes, maxBlobBytes)
 	}
-	if s.CAS.Staging != s.Staging || s.Staging == nil {
-		t.Fatalf("constructor CAS staging = %v, want the server budget %v", s.CAS.Staging, s.Staging)
+	if s.CAS.Staging != b || s.Staging != b {
+		t.Fatalf("constructor CAS staging = %v, want the supplied budget %v", s.CAS.Staging, b)
 	}
 
 	// The cluster-key constructor builds the same authoritative CAS.
@@ -50,7 +57,6 @@ func TestServerCASMaximumParity(t *testing.T) {
 
 	// SetBlobStore must preserve BOTH the object maximum and the staging
 	// budget instead of rebuilding a bare cas.New.
-	b := setTestStagingBudget(t, s, filepath.Join(t.TempDir(), "staging"), 1<<20)
 	s.SetBlobStore(newMemBlob())
 	if s.CAS.MaxBlobBytes != maxBlobBytes {
 		t.Fatalf("SetBlobStore dropped the object maximum: %d, want %d", s.CAS.MaxBlobBytes, maxBlobBytes)
@@ -59,19 +65,21 @@ func TestServerCASMaximumParity(t *testing.T) {
 		t.Fatalf("SetBlobStore dropped the staging budget: %v, want %v", s.CAS.Staging, b)
 	}
 
-	// SetStagingBudget must propagate to the live CAS (the fallback Put
-	// spools through CAS.Staging).
-	b2 := setTestStagingBudget(t, s, filepath.Join(t.TempDir(), "staging2"), 1<<20)
-	if s.Staging != b2 || s.CAS.Staging != b2 {
-		t.Fatalf("SetStagingBudget wiring = (server %v, cas %v), want %v", s.Staging, s.CAS.Staging, b2)
-	}
-
-	// A bare in-memory server has no CAS until a backend is installed; the
-	// nil-CAS guard keeps SetStagingBudget from panicking.
-	mem := New("tok")
-	mem.SetStagingBudget(b2)
-	if mem.Staging != b2 || mem.CAS != nil {
+	// A bare in-memory server has no CAS until a backend is installed; a
+	// construction-time budget is still installed, and there is no
+	// post-construction swap.
+	mem := New("tok", WithStagingBudget(b))
+	if mem.Staging != b || mem.CAS != nil {
 		t.Fatalf("in-memory staging wiring = (%v, %v)", mem.Staging, mem.CAS)
+	}
+	// The explicit-nil option suppresses the constructor default and leaves
+	// large uploads failing closed, which is only expressible at construction.
+	noBound, err := NewPersistent("tok", "tok", t.TempDir(), WithStagingBudget(nil))
+	if err != nil {
+		t.Fatalf("NewPersistent with explicit nil staging: %v", err)
+	}
+	if noBound.Staging != nil || noBound.CAS.Staging != nil {
+		t.Fatalf("explicit nil staging = (server %v, cas %v), want nil", noBound.Staging, noBound.CAS.Staging)
 	}
 }
 
@@ -139,8 +147,7 @@ func TestObjectMaximumBoundaryTinyScale(t *testing.T) {
 	cacheUploadMaxBytes = limit
 	t.Cleanup(func() { cacheUploadMaxBytes = oldCache })
 
-	s, _, _, hdrs := cacheFixture(t)
-	setTestStagingBudget(t, s, filepath.Join(t.TempDir(), "staging"), 1<<20)
+	s, _, _, hdrs, _ := cacheFixtureWithStaging(t, 1<<20)
 	// Endpoint == CAS == 8 KiB: the two bounds a real deployment must keep in
 	// lockstep; the default wiring sets both from maxBlobBytes.
 	s.CAS.MaxBlobBytes = limit

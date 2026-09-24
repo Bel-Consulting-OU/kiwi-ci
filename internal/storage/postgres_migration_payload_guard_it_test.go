@@ -23,7 +23,7 @@ import (
 // abc/notabool booleans, abc/1e999/1.5/boolean bigints, and out-of-range or
 // calendar-invalid timestamps must all default rather than abort the migration.
 func TestPostgresIntegrationMigrationPayloadCastsGuarded(t *testing.T) {
-	env := pgITSetup(t)
+	env := pgITSetupAtVersion(t, 8)
 	st := env.open(t)
 	ctx := context.Background()
 

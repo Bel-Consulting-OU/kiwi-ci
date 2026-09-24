@@ -71,6 +71,12 @@ type Run struct {
 	// declare downstream with wait=true; the run's aggregation keeps those
 	// child runs in view until they finish. Additive.
 	DownstreamRuns []string `json:"downstream_runs,omitempty"`
+	// RepoIdentityQuarantined is the durable marker set by the operator
+	// repository-identity repair on a run whose stored identity could not be
+	// proven. Its queued/running jobs are cancelled in the same statement and
+	// the shared lease predicate denies them independently of repository ACLs
+	// (see Job.RepoIdentityQuarantined). Additive.
+	RepoIdentityQuarantined bool `json:"repo_identity_quarantined,omitempty"`
 }
 
 // Job is the control-plane representation of one compiled job. It deliberately
@@ -223,6 +229,13 @@ type Job struct {
 	// cancels them with reason "queue timeout". Nil means no timeout.
 	// Additive; payload-based, no dedicated storage column.
 	QueueDeadline *time.Time `json:"queue_deadline,omitempty"`
+	// RepoIdentityQuarantined is the durable marker set by the operator
+	// repository-identity repair on a row whose stored identity could not be
+	// proven. A quarantined job is operationally inert: the shared lease
+	// predicate (storage.LeasePredicate.Allows / ClaimAllowsRunner) denies it
+	// independently of every repository allowlist or policy grant, so an
+	// allow-everything ACL cannot admit unprovable work. Additive.
+	RepoIdentityQuarantined bool `json:"repo_identity_quarantined,omitempty"`
 }
 
 type Runner struct {

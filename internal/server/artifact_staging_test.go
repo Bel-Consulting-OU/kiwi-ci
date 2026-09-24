@@ -16,6 +16,20 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
+// fcMemoryBlobServerWithStaging builds the artifact fixture server with a
+// CONSTRUCTION-TIME staging budget of max over a fresh directory and returns
+// it (staging is immutable after construction).
+func fcMemoryBlobServerWithStaging(t *testing.T, max int64) (*Server, map[string]string, *staging.Budget) {
+	t.Helper()
+	b, err := staging.NewBudget(filepath.Join(t.TempDir(), "staging"), max)
+	if err != nil {
+		t.Fatalf("staging budget: %v", err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	s, hdrs := fcMemoryBlobServer(t, WithStagingBudget(b))
+	return s, hdrs, b
+}
+
 // TestArtifactUploadStagesInsideBudgetAndReleases proves the artifact body
 // spools through the configured bounded staging budget (never the artifact
 // data dir, never a bare system temp directory), charges exactly the request's
@@ -23,12 +37,10 @@ import (
 // the spool file on the success path — the same contract the cache endpoint
 // carries.
 func TestArtifactUploadStagesInsideBudgetAndReleases(t *testing.T) {
-	s, f, _, hdrs := cacheFixture(t)
+	s, f, b, hdrs, _ := cacheFixtureWithStaging(t, 1<<20)
 	f.mu.Lock()
 	f.contracts["job-a"] = map[string]storage.ArtifactContract{"bin": fcBinContract()}
 	f.mu.Unlock()
-	dir := filepath.Join(t.TempDir(), "staging")
-	b := setTestStagingBudget(t, s, dir, 1<<20)
 
 	var (
 		mu         sync.Mutex
@@ -78,9 +90,8 @@ func TestArtifactUploadStagesInsideBudgetAndReleases(t *testing.T) {
 // close, rename, parent fsync) and the artifact is still committed with the
 // exact staged bytes.
 func TestArtifactUploadCrossFilesystemFinalize(t *testing.T) {
-	s, hdrs := fcMemoryBlobServer(t)
+	s, hdrs, b := fcMemoryBlobServerWithStaging(t, 1<<20)
 	fcSeedContract(s, "job-a", fcBinContract())
-	b := newUploadBudget(t, s, 1<<20)
 
 	orig := stagedRename
 	stagedRename = func(oldpath, newpath string) error {
@@ -123,9 +134,13 @@ func TestArtifactUploadCrossFilesystemFinalize(t *testing.T) {
 // being staged, nothing appears in the system temporary directory: the bytes
 // go through the configured staging budget, not os.CreateTemp("", ...).
 func TestArtifactUploadNeverUsesSystemTempDir(t *testing.T) {
-	s, hdrs := fcMemoryBlobServer(t)
+	b, err := staging.NewBudget(filepath.Join(t.TempDir(), "staging"), 1<<20)
+	if err != nil {
+		t.Fatalf("staging budget: %v", err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	s, hdrs := fcMemoryBlobServer(t, WithStagingBudget(b))
 	fcSeedContract(s, "job-a", fcBinContract())
-	setTestStagingBudget(t, s, filepath.Join(t.TempDir(), "staging"), 1<<20)
 	systemTmp := t.TempDir()
 	t.Setenv("TMPDIR", systemTmp)
 
@@ -179,8 +194,7 @@ func TestMaxSizePublicationsIgnoreUnusableSystemTempDir(t *testing.T) {
 	}
 	// Build every fixture before TMPDIR becomes unusable (t.TempDir resolves
 	// TMPDIR, so a later t.TempDir would fail or land inside the watcher).
-	s, f, _, hdrs := cacheFixture(t)
-	newUploadBudget(t, s, 1<<20)
+	s, f, _, hdrs, _ := cacheFixtureWithStaging(t, 1<<20)
 
 	cachePayload := "max-sized-cache-entry"
 	oldCacheMax := cacheUploadMaxBytes

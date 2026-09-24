@@ -63,8 +63,8 @@ func ValidateInstanceID(id string) error {
 // ReplicaDir resolves the replica-private staging directory for a configured
 // ROOT: <root>/<instance-id>. The explicit instanceID (flag/env/config) wins;
 // when it is empty the process reads the id persisted in the root, or
-// generates and persists a fresh one (atomic O_EXCL publish, so concurrent
-// first starts converge on one id).
+// generates and persists a fresh one (durable create-if-absent publish, so
+// concurrent first starts converge on one id).
 //
 // Per-replica contract: the configured directory is shared infrastructure,
 // never a per-replica budget by itself. Each process stages inside its own
@@ -133,7 +133,22 @@ func NewReplicaBudget(configuredRoot, instanceID string, maxBytes int64) (*Budge
 }
 
 // loadOrCreateInstanceID returns the persisted instance id of a configured
-// root, generating and publishing one when the root has none yet.
+// root, generating and publishing one when the root has none yet. Publishing
+// goes through fsutil.CreateFileCAS: the id is written to a unique temp file
+// with a checked write/fsync/close, published create-if-absent (a hard link on
+// unix), and only then is the root directory fsynced. The visible
+// staging.instance therefore never exists in a torn/empty state, and the old
+// sequence that created the destination name first and then unlinked it on a
+// failed write (without a parent-directory fsync) is gone.
+//
+// The failure classes are handled explicitly:
+//
+//   - os.ErrExist: another process won the create-if-absent publish; adopt it.
+//   - fsutil.Renamed (a failed root fsync after the publish): the visible file
+//     is valid, so leave it untouched and fail this startup; the next attempt
+//     adopts it instead of generating a second id.
+//   - any pre-publish failure: the destination was never created and the
+//     unique temp file was removed, so fail normally (nothing to adopt).
 func loadOrCreateInstanceID(root string) (string, error) {
 	path := filepath.Join(root, InstanceIDFileName)
 	if id, err := readPublishedInstanceID(path); err == nil {
@@ -145,38 +160,24 @@ func loadOrCreateInstanceID(root string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		if errors.Is(err, os.ErrExist) {
-			// Another process is publishing an id right now; adopt theirs.
-			return readInstanceIDWithRetry(path)
-		}
+	switch err := fsutil.CreateFileCAS(path, []byte(id+"\n"), 0o600); {
+	case err == nil:
+		return id, nil
+	case errors.Is(err, os.ErrExist):
+		// Another process is publishing an id right now; adopt theirs.
+		return readInstanceIDWithRetry(path)
+	case fsutil.Renamed(err):
+		// Published-uncertain, exactly like fsutil's post-rename PhaseDirSync:
+		// the id bytes are visible and readable but their crash durability is
+		// not certified. LEAVE the visible file in place so the next start
+		// adopts it instead of generating another generation; failing startup
+		// is still correct because the id is not certified durable.
+		return "", fmt.Errorf("staging: instance id %s is published but its durability is not certified, leaving it for the next start to adopt: %w", path, err)
+	default:
+		// Pre-publish: the destination was never created and the unique temp
+		// file was removed, so there is nothing torn to clean up.
 		return "", fmt.Errorf("staging: persist instance id %s: %w", path, err)
 	}
-	_, writeErr := f.WriteString(id + "\n")
-	syncErr := f.Sync()
-	closeErr := f.Close()
-	if err := firstErr(writeErr, syncErr, closeErr); err != nil {
-		// Definitively not published (or torn): remove it so a later start
-		// does not adopt a partial id that names a different directory.
-		_ = os.Remove(path)
-		return "", fmt.Errorf("staging: persist instance id %s: %w", path, err)
-	}
-	// The id bytes are durable, but the file's NAME is not until the root
-	// directory itself is fsynced. Without this a power loss can leave the
-	// name absent, so the next start generates a SECOND id, stages in a new
-	// subdirectory, and strands the previous replica directory (up to
-	// max_bytes) unreclaimable.
-	//
-	// On failure the visible id file is deliberately LEFT in place
-	// (published-uncertain, like fsutil's post-rename PhaseDirSync): the
-	// content is on disk and readable, so the next attempt adopts it instead
-	// of generating another generation. Failing startup is still correct: the
-	// id's crash durability is not certified.
-	if err := fsutil.SyncDir(root); err != nil {
-		return "", fmt.Errorf("staging: instance id %s is published but its durability is not certified, leaving it for the next start to adopt: %w: %v", path, fsutil.ErrPublishedUncertain, err)
-	}
-	return id, nil
 }
 
 // readPublishedInstanceID reads and validates the persisted id. A missing

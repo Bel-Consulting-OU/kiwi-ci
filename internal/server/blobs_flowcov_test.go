@@ -538,9 +538,9 @@ func fcSeedContract(s *Server, jobID string, c storage.ArtifactContract) {
 	s.mu.Unlock()
 }
 
-func fcMemoryBlobServer(t *testing.T) (*Server, map[string]string) {
+func fcMemoryBlobServer(t *testing.T, opts ...Option) (*Server, map[string]string) {
 	t.Helper()
-	s, err := NewPersistent("runner-tok", "admin-tok", t.TempDir())
+	s, err := NewPersistent("runner-tok", "admin-tok", t.TempDir(), opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -620,10 +620,9 @@ func (seamFixedReader) Read(p []byte) (int, error) {
 // with ENOTDIR for any euid (path type, not permission bits), and the upload
 // fails closed without falling back to any other location.
 func TestFlowBlobUploadArtifactStagingOpenFailure(t *testing.T) {
-	s, hdrs := fcMemoryBlobServer(t)
+	s, hdrs, b := fcMemoryBlobServerWithStaging(t, 1<<20)
 	fcSeedContract(s, "job-a", fcBinContract())
-	stagingDir := filepath.Join(t.TempDir(), "staging")
-	setTestStagingBudget(t, s, stagingDir, 1<<20)
+	stagingDir := b.Dir()
 	if err := os.RemoveAll(stagingDir); err != nil {
 		t.Fatal(err)
 	}

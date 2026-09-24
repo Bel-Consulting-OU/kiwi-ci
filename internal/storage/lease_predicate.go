@@ -34,6 +34,8 @@ type LeasePredicate struct {
 //
 //   - admission state: disabled/draining runners take no work, capacity 0
 //     means "take no work", and a full active set is at capacity;
+//   - quarantine: a job carrying the durable repo_identity_quarantined flag
+//     can never be leased, regardless of every allowlist/policy grant;
 //   - labels: every required label is declared;
 //   - repository ACL: the canonical repo ID (or bare full name) is in the
 //     runner's allowlist (empty = unrestricted);
@@ -50,6 +52,13 @@ type LeasePredicate struct {
 func (p LeasePredicate) Allows() bool {
 	r := p.Runner
 	j := p.Job
+	// A quarantined job is operationally inert: its repository identity could
+	// not be proven at repair time, so no lease decision may rely on an
+	// allow-everything repository ACL to admit it. The durable payload flag is
+	// checked BEFORE every other predicate (R1-6).
+	if j.RepoIdentityQuarantined {
+		return false
+	}
 	if r.Disabled || r.Draining {
 		return false
 	}
@@ -117,6 +126,13 @@ func ResolveRunnerProfile(r model.Runner, profile model.RunnerProfile, linked bo
 // enforced-policy grant is applied by the scheduler prefilter and the
 // in-memory predicate.
 func ClaimAllowsRunner(r model.Runner, c LeaseClaim) bool {
+	if c.Quarantined {
+		// A quarantined job is operationally inert (R1-6): the durable
+		// repo_identity_quarantined payload flag denies every claim even when
+		// the runner's repository allowlist is empty or grants the whole
+		// forge.
+		return false
+	}
 	if r.Disabled || r.Draining {
 		return false
 	}

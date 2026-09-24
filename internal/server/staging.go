@@ -6,10 +6,10 @@ import "github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
 // path must charge before spooling bytes: the job cache upload and (through
 // the snapshot agent) the workspace snapshot upload. Persistent servers
 // always carry one (defaulted under the data dir by the constructors and
-// replaced by the configured budget in the app wiring); it is nil only on a
-// bare in-memory server, where the large-upload routes are unreachable
-// (they all require a persistent store or CAS). Callers must nil-check and
-// fail closed.
+// supplied by the configured budget through server.WithStagingBudget at
+// construction); it is nil only on a bare in-memory server, where the
+// large-upload routes are unreachable (they all require a persistent store or
+// CAS). Callers must nil-check and fail closed.
 //
 // Ownership contract: the budget owns exactly one directory. The persistent
 // constructors and the app wiring build it through staging.NewReplicaBudget,
@@ -26,22 +26,29 @@ import "github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
 // staging.SpoolFile(s.StagingBudget().Dir(), body, n) for the staged bytes.
 func (s *Server) StagingBudget() *staging.Budget { return s.Staging }
 
-// SetStagingBudget installs the shared staging budget. The app wiring calls
-// it after config.Validate and staging.NewReplicaBudget (or supplies the same
-// budget through server.WithStagingBudget at construction), so an unusable
-// configured bound — or a directory owned by another live replica — fails
-// startup instead of the first multi-GB upload. Replacing a budget does not
-// release the previous one's ownership (production replaces only the
-// data-dir default, whose directory stays reserved for this process).
-//
-// The installed budget is also pushed onto the live CAS instance: the legacy
-// CAS.Put fallback spools through CAS.Staging, so a budget installed after the
-// CAS was built must not leave the fallback failing ErrNoSpool. The
-// constructor path installs the budget before newServerCAS, and SetBlobStore
-// preserves the current budget, so all three wiring paths agree.
-func (s *Server) SetStagingBudget(b *staging.Budget) {
+// installStagingBudget is the construction-time-only staging wiring: it
+// records the server's shared budget (and, when a CAS already exists, the
+// budget that CAS spools through) and panics if called after construction. It
+// is unexported and guarded by stagingSealed, so a live server can never swap
+// its staging budget. The previous exported SetStagingBudget allowed a
+// post-construction replacement that left in-flight requests charging the old
+// budget while new requests charged the new one — a temporary double bound
+// over the same disk. WithStagingBudget is the supported construction-time
+// entry point; a persistent constructor's data-dir default is installed
+// directly before the seal.
+func (s *Server) installStagingBudget(b *staging.Budget) {
+	if s.stagingSealed {
+		panic("server: staging budget is immutable after construction (pass WithStagingBudget to a constructor instead)")
+	}
+	// stagingSet distinguishes an explicit nil (no staging bound; large
+	// uploads fail closed) from "not supplied" (build the data-dir default).
+	s.stagingSet = true
 	s.Staging = b
 	if s.CAS != nil {
 		s.CAS.Staging = b
 	}
 }
+
+// sealStaging marks the end of a server's construction: from here on the
+// staging budget is immutable and installStagingBudget panics.
+func (s *Server) sealStaging() { s.stagingSealed = true }

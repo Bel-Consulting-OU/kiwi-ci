@@ -27,8 +27,11 @@
 // directory maps to exactly one shared ledger (a process is one accounting
 // authority). Budget.Close releases ownership explicitly, which is how a
 // restart is simulated in tests and how a caller hands the directory to a
-// successor. Prune stays for the runtime age-based sweep of files abandoned
-// by the *current* process (a panicked or cancelled handler) and never
+// successor. The runtime sweeper is Prune: it reclaims spool files that carry
+// the package name prefix and are older than the minimum age, but it skips
+// every path still registered as an active spool of this Budget (see
+// SpoolFile/ReleaseSpool), so age alone can never prove abandonment and a
+// legitimately slow publication cannot have its live spool unlinked. It never
 // touches files outside the package's own name prefix.
 //
 // Per-replica contract: the configured directory is a ROOT, and every process
@@ -140,6 +143,25 @@ type Budget struct {
 	// construction, so accessors need no synchronization.
 	registryKey  string
 	staleRemoved int
+
+	// activeSpools is the set of spool paths this process is currently
+	// staging: every file SpoolFile created for this directory that has not
+	// yet been released (or observed gone). It is mu-guarded and is what
+	// makes Prune safe: a spool owned by a live request must never be
+	// unlinked by age alone, so age can no longer be mistaken for
+	// abandonment. SpoolFile registers a path under mu at the same moment it
+	// creates it, and Prune runs its whole pass under mu, so a file can never
+	// exist untracked while Prune is deciding.
+	//
+	// The set is reconciled with the files still on disk every
+	// spoolSweepEvery registrations (see beginSpool), so it stays bounded by
+	// the in-flight spools plus at most one sweep interval of entries even
+	// when the process never calls Prune: a spool the caller removed is
+	// forgotten on the next sweep.
+	activeSpools map[string]struct{}
+	// spoolTracked counts registrations since construction; beginSpool uses
+	// it to schedule the periodic reconcile. mu-guarded.
+	spoolTracked int
 
 	// closed is the CLOSING flag: Close sets it (under mu) before waiting, so
 	// every Acquire that checks it under mu observes a budget that is at least
@@ -427,6 +449,7 @@ func (b *Budget) CloseWithContext(ctx context.Context) error {
 		if b.used == 0 {
 			// Last reservation gone (or never existed): release ownership.
 			b.finalized = true
+			b.activeSpools = nil
 			done := b.done
 			lock := b.lock
 			b.mu.Unlock()
@@ -537,6 +560,81 @@ func (r *Reservation) Release() {
 	})
 }
 
+// budgetForDir returns the process's live Budget owning dir, or nil when the
+// directory has no in-process owner (for example a bare SpoolFile target or a
+// budget closed and handed to a successor). It is the bridge that lets the
+// package-level SpoolFile register an active spool with the Budget whose Prune
+// must skip it.
+func budgetForDir(dir string) *Budget {
+	ownedDirsMu.Lock()
+	defer ownedDirsMu.Unlock()
+	b := ownedDirs[canonicalDir(dir)]
+	if b == nil || b.closed.Load() {
+		return nil
+	}
+	return b
+}
+
+// trackSpoolLocked records path as an active spool of this budget. The caller
+// holds b.mu.
+func (b *Budget) trackSpoolLocked(path string) {
+	if b.activeSpools == nil {
+		b.activeSpools = make(map[string]struct{})
+	}
+	b.activeSpools[path] = struct{}{}
+}
+
+// spoolSweepEvery is how many spool registrations pass between reconciles of
+// the active-spool set with the files still on disk. It bounds the set on a
+// process that never calls Prune while keeping the reconcile off the hot path.
+const spoolSweepEvery = 256
+
+// beginSpool creates a fresh spool file and, when a Budget owns dir, registers
+// it as active atomically with its creation: both the create and the tracking
+// happen under the budget's mutex, so a concurrent Prune can never observe an
+// untracked spool file it is free to unlink. It returns the open file (the
+// caller streams into it), its path, and whether the path was tracked.
+func (b *Budget) beginSpool(dir string) (*os.File, string, bool, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	f, err := os.CreateTemp(dir, FilePrefix+"*")
+	if err != nil {
+		return nil, "", false, err
+	}
+	path := f.Name()
+	b.trackSpoolLocked(path)
+	b.spoolTracked++
+	if b.spoolTracked%spoolSweepEvery == 0 {
+		b.forgetMissingSpoolsLocked()
+	}
+	return f, path, true, nil
+}
+
+// ReleaseSpool drops path from the active set, so a later Prune may reclaim it
+// once it is older than the minimum age. Callers that finish with a spool
+// before the process exits should call it (the file is typically removed
+// first, which Prune also detects lazily); a spool whose file is gone is
+// forgotten automatically. It is safe to call on a nil receiver.
+func (b *Budget) ReleaseSpool(path string) {
+	if b == nil || path == "" {
+		return
+	}
+	b.mu.Lock()
+	delete(b.activeSpools, path)
+	b.mu.Unlock()
+}
+
+// forgetMissingSpoolsLocked drops active entries whose file no longer exists:
+// the caller that owned the spool removed it, so there is nothing left to
+// protect. The caller holds b.mu.
+func (b *Budget) forgetMissingSpoolsLocked() {
+	for path := range b.activeSpools {
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			delete(b.activeSpools, path)
+		}
+	}
+}
+
 // Prune removes abandoned spool files older than the prune minimum age and
 // returns how many were removed. Only files carrying FilePrefix are
 // considered; directories and foreign files are never touched. A missing
@@ -548,10 +646,20 @@ func (r *Reservation) Release() {
 // process are already reclaimed at construction, without an age floor,
 // because ownership of the directory proves they cannot belong to anyone
 // live.
+//
+// Age alone never proves abandonment: a spool that SpoolFile created and has
+// not released is skipped regardless of age, because a legitimately slow
+// publication can keep a live spool around longer than the minimum age. The
+// whole pass runs under the budget mutex, and SpoolFile creates and registers
+// a spool under that same mutex, so there is no window in which a freshly
+// created (untracked) spool file is visible to Prune.
 func (b *Budget) Prune(ctx context.Context) (int, error) {
 	if b == nil {
 		return 0, nil
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.forgetMissingSpoolsLocked()
 	entries, err := os.ReadDir(b.dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -572,6 +680,11 @@ func (b *Budget) Prune(ctx context.Context) (int, error) {
 		if e.IsDir() || !strings.HasPrefix(e.Name(), FilePrefix) {
 			continue
 		}
+		path := filepath.Join(b.dir, e.Name())
+		if _, active := b.activeSpools[path]; active {
+			// An actively-owned spool: age cannot prove abandonment.
+			continue
+		}
 		info, err := e.Info()
 		if err != nil {
 			// The entry vanished between ReadDir and Info: nothing to prune.
@@ -580,7 +693,7 @@ func (b *Budget) Prune(ctx context.Context) (int, error) {
 		if info.ModTime().After(cutoff) {
 			continue
 		}
-		if err := os.Remove(filepath.Join(b.dir, e.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return removed, err
 		}
 		removed++
@@ -597,6 +710,12 @@ func (b *Budget) Prune(ctx context.Context) (int, error) {
 // (for example http.MaxBytesError from the caller's body cap) is returned
 // unchanged after the partial file is removed. The caller owns the returned
 // path and must remove it.
+//
+// When a Budget owns dir in this process the spool is registered as active at
+// creation, so a concurrent Prune skips it even if its age passes the
+// threshold; the registration is dropped when the file is observed gone (by
+// Prune) or explicitly with Budget.ReleaseSpool. A failed copy releases the
+// registration together with the partial file.
 func SpoolFile(dir string, r io.Reader, limit int64) (string, int64, error) {
 	dir = strings.TrimSpace(dir)
 	if dir == "" {
@@ -605,16 +724,35 @@ func SpoolFile(dir string, r io.Reader, limit int64) (string, int64, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", 0, err
 	}
-	f, err := os.CreateTemp(dir, FilePrefix+"*")
+	// When this process owns dir, create and register the spool atomically so
+	// a concurrent Prune can never unlink it in the window between the file
+	// appearing and being recorded as active.
+	owner := budgetForDir(dir)
+	var (
+		f       *os.File
+		path    string
+		tracked bool
+		err     error
+	)
+	if owner != nil {
+		f, path, tracked, err = owner.beginSpool(dir)
+	} else {
+		f, err = os.CreateTemp(dir, FilePrefix+"*")
+		if err == nil {
+			path = f.Name()
+		}
+	}
 	if err != nil {
 		return "", 0, err
 	}
-	path := f.Name()
 	n, copyErr := spoolCopy(f, r, limit)
 	syncErr := f.Sync()
 	closeErr := f.Close()
 	if err := firstErr(copyErr, syncErr, closeErr); err != nil {
 		_ = os.Remove(path)
+		if tracked {
+			owner.ReleaseSpool(path)
+		}
 		return "", n, err
 	}
 	return path, n, nil

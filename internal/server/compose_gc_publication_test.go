@@ -41,10 +41,13 @@ import (
 // composeGCWorld builds the DB-mode composition server: a persistent server
 // (real data dir, real state persistence, real staging budget) switched to
 // the fake durable store with a real enumerating filesystem CAS installed.
-func composeGCWorld(t *testing.T) (*Server, *dbFakeStore, *blob.FS) {
+// Construction-time options (for example WithStagingBudget) are honoured, so
+// a fixture that needs a specific staging budget supplies it to the
+// constructor: staging is immutable after construction.
+func composeGCWorld(t *testing.T, opts ...Option) (*Server, *dbFakeStore, *blob.FS) {
 	t.Helper()
 	f := newDBFakeStore()
-	s, err := NewPersistent("token", "token", t.TempDir())
+	s, err := NewPersistent("token", "token", t.TempDir(), opts...)
 	if err != nil {
 		t.Fatalf("NewPersistent: %v", err)
 	}

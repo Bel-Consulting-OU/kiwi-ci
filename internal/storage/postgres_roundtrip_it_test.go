@@ -1329,7 +1329,10 @@ func TestPostgresIntegrationDownstreamLinks(t *testing.T) {
 }
 
 func TestPostgresIntegrationMigrateHelpers(t *testing.T) {
-	env := pgITSetup(t)
+	// A genuinely fresh (unmigrated) database: the first Migrate below runs the
+	// real bootstrap path from zero, so migration coverage is preserved here in
+	// addition to the template build.
+	env := pgITSetupFresh(t)
 	st := env.open(t)
 	ctx := context.Background()
 	// A fresh schema migrates from zero; a second run is a no-op.
@@ -1364,8 +1367,9 @@ func TestPostgresIntegrationMigrateHelpers(t *testing.T) {
 	if err := st.applyMigration(ctx, migrations.Migration{Version: version, Name: "already"}); err != nil {
 		t.Fatalf("applied migration no-op: %v", err)
 	}
-	// SchemaVersion reads zero before the bootstrap table exists.
-	fresh := pgITSetup(t)
+	// SchemaVersion reads zero before the bootstrap table exists. The clone is
+	// deliberately unmigrated, so the empty-template database is required.
+	fresh := pgITSetupFresh(t)
 	unst := fresh.open(t)
 	if v, err := unst.SchemaVersion(ctx); err != nil || v != 0 {
 		t.Fatalf("unmigrated SchemaVersion = %d, %v", v, err)

@@ -43,32 +43,34 @@ func authzITPolicy(grants map[string]auth.RepositoryPermission, roles ...auth.Ro
 	return RunAuthzPolicyForPrincipal(&p)
 }
 
-// authzITSeed inserts runs and returns them.
+// authzITSeed inserts runs and returns them. It seeds in one bulk statement
+// (identical rows to a loop of InsertRun) because the runs table's expression
+// indexes make per-row autocommit inserts pathologically slow at fixture
+// scale; the resulting rows and every assertion are unchanged.
 func authzITSeed(t *testing.T, st *PostgresStore, runs []model.Run) []model.Run {
 	t.Helper()
-	for _, run := range runs {
-		if err := st.InsertRun(context.Background(), run); err != nil {
-			t.Fatalf("insert run %s: %v", run.ID, err)
-		}
-	}
+	pgITBulkInsertRuns(t, st, runs)
 	return runs
 }
 
 // TestPostgresIntegrationRunsPageAuthorizedReposNoLeak is the real-PG
-// regression for the authorization leak: 2,500 private-B runs surround three
-// readable-A runs, and an A-only policy must page exactly the A runs with
-// boundaries derived from A rows only. No B id, no B timestamp and no
-// B-derived cursor position may ever be observable, and the walk terminates
-// after the last visible A run even though 2,499 older B runs exist.
+// regression for the authorization leak: private-B runs NEWER and OLDER than
+// the A window surround three readable-A runs, and an A-only policy must page
+// exactly the A runs with boundaries derived from A rows only. No B id, no B
+// timestamp and no B-derived cursor position may ever be observable, and the
+// walk terminates after the last visible A run even though older B runs exist.
+// The fixture crosses the boundary the leak needs (B rows on both sides of an
+// A window that spans more than one page); its absolute size is immaterial, so
+// it is kept minimal rather than thousands of redundant rows.
 func TestPostgresIntegrationRunsPageAuthorizedReposNoLeak(t *testing.T) {
 	st := pgITStore(t)
 	ctx := context.Background()
 	const (
 		repoA  = "github.com/o/repo-a"
 		repoB  = "github.com/o/repo-b"
-		total  = 2500
-		firstA = 1200
-		lastA  = 1202
+		total  = 13
+		firstA = 6
+		lastA  = 8
 	)
 	base := time.Now().UTC().Truncate(time.Microsecond)
 	runs := make([]model.Run, 0, total)

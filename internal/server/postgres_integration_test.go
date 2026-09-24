@@ -4,12 +4,16 @@ package server
 // SwitchToDB against a live database, driven over the HTTP handlers. Gated on
 // KIWI_TEST_POSTGRES_URL (skipped when unset, and in -short mode).
 //
-// Every test opens its own throwaway schema (kiwi_it_<random>) by setting
-// search_path on the pool and DROP SCHEMA ... CASCADE on cleanup. The
-// cross-instance test runs two servers over the same database and the same
-// data directory (shared CAS blobs and cluster/lease keys, the production HA
-// topology) to prove leases, heartbeats, completions and artifacts flow
-// across replicas.
+// Every test owns its own throwaway DATABASE (kiwi_sitdb_<random>), cloned
+// from a process-wide TEMPLATE database migrated once with the real embedded
+// migrations (see internal/testutil/pg_template.go). The clone is a complete
+// copy, so tests never share tables and parallel tests cannot observe each
+// other, while the per-test cost drops from a full 369-table migration to a
+// ~100 ms database clone. Cleanup DROP DATABASE ... WITH (FORCE) runs on
+// failure too. The cross-instance test runs two servers over the same clone
+// and the same data directory (shared CAS blobs and cluster/lease keys, the
+// production HA topology) to prove leases, heartbeats, completions and
+// artifacts flow across replicas.
 
 import (
 	"context"
@@ -25,12 +29,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/forge"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 )
 
 const pgITServerPipeline = `version: 1
@@ -79,44 +83,54 @@ func pgITServerRandomHex(t *testing.T, n int) string {
 	return hex.EncodeToString(b)[:n]
 }
 
-// pgITServerEnv owns one per-test schema.
+// pgITServerEnv owns one per-test database. schema is the constant public
+// schema of the clone; base is the clone's DSN.
 type pgITServerEnv struct {
 	base   string
 	schema string
 }
 
+const (
+	// pgITServerTemplate is the template database migrated once per process
+	// through the real embedded migrations.
+	pgITServerTemplate = "kiwi_sitdb_tmpl"
+	// pgITServerClonePrefix names every throwaway per-test database.
+	pgITServerClonePrefix = "kiwi_sitdb_"
+)
+
+// pgITServerMigrateTemplate applies the embedded migrations to the template
+// database through storage.PostgresStore.Migrate.
+func pgITServerMigrateTemplate(ctx context.Context, dsn string) error {
+	st, err := storage.NewPostgresOpt(ctx, dsn, func(c *pgxpool.Config) {
+		if c.ConnConfig.RuntimeParams == nil {
+			c.ConnConfig.RuntimeParams = map[string]string{}
+		}
+		c.ConnConfig.RuntimeParams["search_path"] = "public"
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = st.Close() }()
+	return st.Migrate(ctx)
+}
+
+// pgITServerSetup creates a throwaway database cloned from the template and
+// registers its teardown.
 func pgITServerSetup(t *testing.T) *pgITServerEnv {
 	t.Helper()
 	base := pgITServerDSN(t)
-	schema := "kiwi_it_" + pgITServerRandomHex(t, 12)
-	ctx := context.Background()
-	admin, err := pgx.Connect(ctx, base)
-	if err != nil {
-		t.Fatalf("connect to KIWI_TEST_POSTGRES_URL: %v", err)
-	}
-	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+pgx.Identifier{schema}.Sanitize()); err != nil {
-		_ = admin.Close(ctx)
-		t.Fatalf("create schema %s: %v", schema, err)
-	}
-	if err := admin.Close(ctx); err != nil {
-		t.Fatalf("close admin connection: %v", err)
-	}
-	t.Cleanup(func() {
-		cctx := context.Background()
-		c, cerr := pgx.Connect(cctx, base)
-		if cerr != nil {
-			t.Logf("drop schema %s: connect: %v", schema, cerr)
-			return
-		}
-		defer func() { _ = c.Close(cctx) }()
-		if _, err := c.Exec(cctx, "DROP SCHEMA IF EXISTS "+pgx.Identifier{schema}.Sanitize()+" CASCADE"); err != nil {
-			t.Logf("drop schema %s: %v", schema, err)
-		}
-	})
-	return &pgITServerEnv{base: base, schema: schema}
+	testutil.EnsureTemplate(t, testutil.TemplateSpec{
+		BaseDSN: base,
+		Name:    pgITServerTemplate,
+		Migrate: pgITServerMigrateTemplate,
+	}, pgITServerClonePrefix)
+	dsn := testutil.CloneDatabase(t, base, pgITServerTemplate, pgITServerClonePrefix)
+	return &pgITServerEnv{base: dsn, schema: "public"}
 }
 
-// open opens one migrated pool bound to the test schema.
+// open opens one pool on the test's database (already migrated by the
+// template; Migrate is re-run to keep exercising the real, idempotent path)
+// and closes it on cleanup before the database is dropped.
 func (e *pgITServerEnv) open(t *testing.T) *storage.PostgresStore {
 	t.Helper()
 	ctx := context.Background()
@@ -126,9 +140,13 @@ func (e *pgITServerEnv) open(t *testing.T) *storage.PostgresStore {
 			c.ConnConfig.RuntimeParams = map[string]string{}
 		}
 		c.ConnConfig.RuntimeParams["search_path"] = schema
+		// Fixtures commit many single-row transactions; skipping the per-commit
+		// WAL flush changes no logical assertion (the PostgreSQL server is
+		// never crashed or restarted) and removes the fsync-dominated cost.
+		c.ConnConfig.RuntimeParams["synchronous_commit"] = "off"
 	})
 	if err != nil {
-		t.Fatalf("open store on schema %s: %v", schema, err)
+		t.Fatalf("open store on %s: %v", e.base, err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
 

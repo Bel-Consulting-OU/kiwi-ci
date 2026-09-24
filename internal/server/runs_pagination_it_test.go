@@ -57,6 +57,52 @@ func pgITRunsPageSeed(t *testing.T, st *storage.PostgresStore, runs []model.Run)
 	}
 }
 
+// pgITServerBulkSeedRuns seeds runs with ONE statement/transaction instead of
+// a loop of InsertRun calls, producing exactly the rows InsertRun would (same
+// payload and the same normalized columns via the shared SQL functions). It is
+// used by fixture-scale seeds because per-row autocommit inserts into the runs
+// table are pathologically slow under the expression indexes.
+func pgITServerBulkSeedRuns(t *testing.T, env *pgITServerEnv, runs []model.Run) {
+	t.Helper()
+	if len(runs) == 0 {
+		return
+	}
+	ids := make([]string, len(runs))
+	statuses := make([]string, len(runs))
+	started := make([]string, len(runs))
+	finished := make([]string, len(runs))
+	created := make([]string, len(runs))
+	payloads := make([]string, len(runs))
+	for i, r := range runs {
+		p, err := json.Marshal(r)
+		if err != nil {
+			t.Fatalf("bulk seed run %d marshal: %v", i, err)
+		}
+		ids[i] = r.ID
+		statuses[i] = string(r.Status)
+		created[i] = r.CreatedAt.UTC().Format(time.RFC3339Nano)
+		if r.StartedAt != nil {
+			started[i] = r.StartedAt.UTC().Format(time.RFC3339Nano)
+		}
+		if r.FinishedAt != nil {
+			finished[i] = r.FinishedAt.UTC().Format(time.RFC3339Nano)
+		}
+		payloads[i] = string(p)
+	}
+	pgITServerExec(t, env, `
+		INSERT INTO runs (id, status, started_at, finished_at, created_at, repo_identity_normalized, repo_full_name_normalized, payload)
+		SELECT u.id, u.status,
+		       NULLIF(u.started_at,'')::timestamptz,
+		       NULLIF(u.finished_at,'')::timestamptz,
+		       u.created_at::timestamptz,
+		       kiwi_normalize_run_repo_identity(u.payload::jsonb, 'repo'),
+		       kiwi_normalize_run_repo_full_name(u.payload::jsonb, 'repo'),
+		       u.payload::jsonb
+		FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[])
+		     AS u(id, status, started_at, finished_at, created_at, payload)`,
+		ids, statuses, started, finished, created, payloads)
+}
+
 type pgITRunsPageWalkPage struct {
 	ids    []string
 	cursor string
@@ -93,22 +139,24 @@ func pgITRunsPageWalk(t *testing.T, s *Server, bearer string, limit, maxPages in
 }
 
 // TestPostgresIntegrationRunsPaginationHTTP is the end-to-end regression pin
-// for the defect: with 1005 runs the first HTTP page is still the newest
-// 1000 and the cursor header leads to the remaining five — no duplicate, no
-// omission — and the cap is advertised.
+// for the defect: with one run past the 1000 default page the first HTTP page
+// is still the newest 1000 and the cursor header leads to the remaining run —
+// no duplicate, no omission — and the cap is advertised.
 func TestPostgresIntegrationRunsPaginationHTTP(t *testing.T) {
 	env := pgITServerSetup(t)
 	st := env.open(t)
 	s := New("token")
 	s.DB = st
 
-	const total = 1005
+	// One past storage.DefaultRunsPageLimit: the smallest fixture that still
+	// crosses the boundary the defect truncated at.
+	const total = 1001
 	base := time.Now().UTC().Truncate(time.Microsecond)
 	runs := make([]model.Run, 0, total)
 	for i := 0; i < total; i++ {
 		runs = append(runs, pgITRunsPageRun(i, base, true))
 	}
-	pgITRunsPageSeed(t, st, runs)
+	pgITServerBulkSeedRuns(t, env, runs)
 
 	pages := pgITRunsPageWalk(t, s, "token", storage.DefaultRunsPageLimit, 4)
 	if len(pages) != 2 {
@@ -311,8 +359,8 @@ func pgITRunsPageAOnlyServer(t *testing.T, runs []model.Run) *Server {
 }
 
 // TestPostgresIntegrationRunsPaginationAuthorizedReposNoLeak is the real-PG
-// P1 regression: 2,500 private-B runs surround three readable-A runs and an
-// A-only principal must observe (a) exactly the A runs with no B id or
+// P1 regression: private-B runs newer and older surround three readable-A runs
+// and an A-only principal must observe (a) exactly the A runs with no B id or
 // timestamp anywhere, (b) cursors that decode to the last visible A run,
 // (c) the same pages as an equivalent A-only data set, and (d) no empty
 // intermediate page that would reveal B density.
@@ -329,10 +377,13 @@ func TestPostgresIntegrationRunsPaginationAuthorizedReposNoLeak(t *testing.T) {
 	}
 
 	base := time.Now().UTC().Truncate(time.Microsecond)
+	// Private-B runs newer and older than the A window; the absolute count is
+	// immaterial to the leak contract, so the fixture keeps only B rows on
+	// both sides of an A window rather than thousands of redundant rows.
 	const (
-		total  = 2500
-		firstA = 1200
-		lastA  = 1202
+		total  = 13
+		firstA = 6
+		lastA  = 8
 	)
 	aRuns := make([]model.Run, 0, 3)
 	for i := 0; i < total; i++ {

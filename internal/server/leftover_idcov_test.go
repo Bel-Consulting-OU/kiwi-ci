@@ -343,14 +343,15 @@ func TestLeftoverLeaseKeyLoadErrors(t *testing.T) {
 }
 
 // TestLeftoverLeaseKeyPersistFailure covers loadLeaseKey's persist failure
-// branches. A dangling symlink as the parent keeps the read looking like a
+// branch. A dangling symlink as the parent keeps the read looking like a
 // missing file (ENOENT, so the load step falls through to key generation)
 // while MkdirAll cannot materialize the directory through the dangling link:
 // path resolution, not permission bits, refuses it, so the injection works
-// for root too. The second case puts a directory at the temp-key path so the
-// key write (open) fails. Both assert the failing op, proving the read step
-// succeeded and the persist step failed; the ENOTDIR read case stays in
-// TestLeftoverLeaseKeyLoadErrors.
+// for root too. The failure asserts the failing op, proving the read step
+// succeeded and the persist setup failed; the ENOTDIR read case stays in
+// TestLeftoverLeaseKeyLoadErrors. The remaining creation-phase seams (write,
+// file-sync, close, dir-sync) are driven through the fsutil hooks in
+// leasekey_durability_test.go.
 func TestLeftoverLeaseKeyPersistFailure(t *testing.T) {
 	root := t.TempDir()
 	dangling := filepath.Join(root, "dangling")
@@ -361,15 +362,6 @@ func TestLeftoverLeaseKeyPersistFailure(t *testing.T) {
 	var pathErr *os.PathError
 	if !errors.As(err, &pathErr) || pathErr.Op != "mkdir" {
 		t.Fatalf("dangling-parent load = %v; want the MkdirAll (mkdir) failure after the read resolved to not-exist", err)
-	}
-
-	root2 := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root2, "lease.key.tmp"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	_, err = loadLeaseKey(root2)
-	if !errors.As(err, &pathErr) || pathErr.Op != "open" {
-		t.Fatalf("temp-key-path-directory load = %v; want the key write (open) failure", err)
 	}
 }
 

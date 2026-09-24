@@ -2210,6 +2210,12 @@ func (m *memStore) AcquireLease(ctx context.Context, jobID, runnerID string, tok
 	if j.Status != model.StatusQueued {
 		return model.Job{}, ErrLeaseConflict
 	}
+	// A quarantined job is operationally inert even on the non-atomic claim
+	// path (R1-6): the durable flag denies the lease regardless of the
+	// runner's repository allowlist.
+	if j.RepoIdentityQuarantined {
+		return model.Job{}, ErrLeaseConflict
+	}
 	now := time.Now().UTC()
 	j.Status = model.StatusRunning
 	j.Attempts++

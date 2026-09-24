@@ -1,6 +1,9 @@
 package storage
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"strings"
 	"testing"
 
@@ -104,13 +107,17 @@ func TestPlanStoredRepoIdentityBranches(t *testing.T) {
 	}
 }
 
-// TestQuarantinedRepoIdentityRecoverable pins that the reserved identity is a
-// canonical, non-alias storage value that neither policy nor RBAC matches, and
-// that the original value is recoverable from the encoded tail.
-func TestQuarantinedRepoIdentityRecoverable(t *testing.T) {
-	q := QuarantinedRepoIdentity("group/sub/project")
-	if !strings.HasPrefix(q, RepoIdentityQuarantineHost+"/") {
-		t.Fatalf("quarantine identity %q does not carry the reserved host", q)
+// TestQuarantinedRepoIdentityHashedAndCollisionResistant pins the R1-2 fix:
+// the reserved identity is a canonical, non-alias storage value carrying the
+// SHA-256 hex digest of the ORIGINAL value. Two originals whose legacy base64
+// spellings differed only by letter CASE (which the path case-folding readers
+// apply would have collapsed to one identity) now produce DISTINCT IDs, and
+// the digest never embeds the original value.
+func TestQuarantinedRepoIdentityHashedAndCollisionResistant(t *testing.T) {
+	original := "group/sub/project"
+	q := QuarantinedRepoIdentity(original)
+	if !strings.HasPrefix(q, RepoIdentityQuarantineHost+"/quarantined/") {
+		t.Fatalf("quarantine identity %q does not carry the reserved host/path", q)
 	}
 	grant, err := auth.ParseStoredRepoID(q)
 	if err != nil {
@@ -123,7 +130,35 @@ func TestQuarantinedRepoIdentityRecoverable(t *testing.T) {
 	if id.Host != RepoIdentityQuarantineHost {
 		t.Fatalf("quarantine host = %q, want %q", id.Host, RepoIdentityQuarantineHost)
 	}
-	if strings.Contains(q, "group/sub/project") {
+	if strings.Contains(q, original) {
 		t.Fatal("quarantine identity embeds the original slash path verbatim")
+	}
+	tail := strings.TrimPrefix(q, RepoIdentityQuarantineHost+"/quarantined/")
+	if len(tail) != 64 || strings.ToLower(tail) != tail {
+		t.Fatalf("quarantine digest %q is not a lowercase 64-hex SHA-256", tail)
+	}
+	sum := sha256.Sum256([]byte(original))
+	if want := hex.EncodeToString(sum[:]); tail != want {
+		t.Fatalf("quarantine digest = %q, want sha256 hex %q", tail, want)
+	}
+	// The prior base64url tail was case-sensitive: two originals whose base64
+	// encodings differed ONLY by letter case produced tails that the
+	// case-folding readers (LOWER / FoldRepoFullName) collapsed onto one
+	// identity. The digest must keep them distinct. The fixture is built from
+	// two one-byte originals whose RawURLEncoding is "AA"/"aA".
+	rawA := string([]byte{0x00})
+	rawB := "h"
+	encA := base64.RawURLEncoding.EncodeToString([]byte(rawA))
+	encB := base64.RawURLEncoding.EncodeToString([]byte(rawB))
+	if encA == encB || !strings.EqualFold(encA, encB) {
+		t.Fatalf("fixture is not a case-only base64 pair: %q vs %q", encA, encB)
+	}
+	a := QuarantinedRepoIdentity(rawA)
+	b := QuarantinedRepoIdentity(rawB)
+	if a == b {
+		t.Fatalf("case-differing originals collided: %q", a)
+	}
+	if strings.EqualFold(a, b) {
+		t.Fatalf("case-differing originals collide after case folding: %q vs %q", a, b)
 	}
 }

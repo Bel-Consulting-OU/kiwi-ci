@@ -576,12 +576,13 @@ func Server(ctx context.Context, args []string) error {
 	if berr != nil {
 		return berr
 	}
-	// The configured budget is handed to the persistent constructors so they
-	// use it verbatim: the constructor must NOT build a second data-dir
-	// default, which would take a second directory lock (different root) or
-	// collide in the staging registry (same root, different max_bytes).
-	// In-memory servers have no constructor budget hook and get it installed
-	// after construction below.
+	// The configured budget is passed to EVERY server constructor (persistent
+	// and in-memory) through the construction-time WithStagingBudget option,
+	// so each uses it verbatim: the constructor must NOT build a second
+	// data-dir default, which would take a second directory lock (different
+	// root) or collide in the staging registry (same root, different
+	// max_bytes). Staging is immutable after construction, so there is no
+	// post-construction install.
 	var persistentOpts []server.PersistentOption
 	if stagingBudget != nil {
 		persistentOpts = append(persistentOpts, server.WithStagingBudget(stagingBudget))
@@ -622,7 +623,7 @@ func Server(ctx context.Context, args []string) error {
 		} else if *dataDir != "" {
 			srv, err = server.NewPersistent(tokenV, adminTokenV, *dataDir, persistentOpts...)
 		} else {
-			srv = server.New(tokenV)
+			srv = server.New(tokenV, persistentOpts...)
 			if adminTokenV != "" {
 				srv.AdminToken = adminTokenV
 			}
@@ -674,20 +675,16 @@ func Server(ctx context.Context, args []string) error {
 			return err
 		}
 	} else {
-		srv = server.New(tokenV)
+		srv = server.New(tokenV, persistentOpts...)
 		if adminTokenV != "" {
 			srv.AdminToken = adminTokenV
 		}
 	}
-	// Install the staging budget built before the server existed (see above).
-	// The persistent constructors already received it through persistentOpts
-	// (so they never built a second one); this installs it on an in-memory
-	// server and is a no-op re-install on the persistent path.
-	if stagingBudget != nil {
-		srv.SetStagingBudget(stagingBudget)
-		if stagingPruned > 0 {
-			fmt.Printf("Kiwi staging: pruned %d abandoned file(s) from %s\n", stagingPruned, stagingBudget.Dir())
-		}
+	// Report the constructor-time reclaim of abandoned spool files. The
+	// budget was already passed to every constructor through persistentOpts,
+	// so no post-construction install happens (staging is immutable).
+	if stagingBudget != nil && stagingPruned > 0 {
+		fmt.Printf("Kiwi staging: pruned %d abandoned file(s) from %s\n", stagingPruned, stagingBudget.Dir())
 	}
 	// Runner PKI is initialized BEFORE HA and production credential
 	// validation: those checks must judge the ACTUAL initialized server

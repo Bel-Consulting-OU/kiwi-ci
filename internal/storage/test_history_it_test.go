@@ -541,7 +541,7 @@ func TestPostgresIntegrationDisableRunnerCertTwoReplicas(t *testing.T) {
 // cases, because that upload seeds the repository's existing reports once
 // (bounded by the repository) in the same transaction.
 func TestPostgresIntegrationTestHistoryUpgradeBridge(t *testing.T) {
-	env := pgITSetup(t)
+	env := pgITSetupAtVersion(t, 25)
 	st := env.open(t)
 	ctx := context.Background()
 	// The schema is at 0025: test_history_aggregates does not exist yet.
@@ -603,7 +603,7 @@ func TestPostgresIntegrationTestHistoryUpgradeBridge(t *testing.T) {
 // the canonical ID find the legacy data, and that the migration indexes match
 // the query expressions (planner verification with enable_seqscan=off).
 func TestPostgresIntegrationTestHistoryLegacyIdentityCanonical(t *testing.T) {
-	env := pgITSetup(t)
+	env := pgITSetupAtVersion(t, 25)
 	st := env.open(t)
 	ctx := context.Background()
 	// Schema before 0026: no aggregates tables and no canonical index yet.
@@ -765,7 +765,7 @@ func TestPostgresIntegrationTestHistoryLegacyIdentityCanonical(t *testing.T) {
 // incomplete identity index, no canonical function) converges on the
 // canonical policy-first index and function when 0027 applies.
 func TestPostgresIntegrationTestHistoryCanonicalIndexUpgradeFrom0026(t *testing.T) {
-	env := pgITSetup(t)
+	env := pgITSetupAtVersion(t, 26)
 	st := env.open(t)
 	ctx := context.Background()
 	pgITApplyThrough(t, st, 26)
@@ -858,7 +858,9 @@ func pgITSeedHistoryRepoPage(t *testing.T, st *PostgresStore, n int) []string {
 func TestPostgresIntegrationTestHistoryRepairRepoPagination(t *testing.T) {
 	st := pgITStore(t)
 	ctx := context.Background()
-	const repos = 1005
+	// One past the old 1000-repository enumeration cap: the smallest set that
+	// still crosses the boundary the pre-fix cap truncated at.
+	const repos = 1001
 	want := pgITSeedHistoryRepoPage(t, st, repos)
 
 	full, err := st.ListTestHistoryRepoIDs(ctx, 0)

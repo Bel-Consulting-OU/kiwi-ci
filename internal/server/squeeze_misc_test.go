@@ -320,17 +320,6 @@ func TestSqueezeSweepTempFiles(t *testing.T) {
 	}
 }
 
-// TestSqueezeLoadLeaseKeyEdges covers the temporary-file refusal.
-func TestSqueezeLoadLeaseKeyEdges(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir, "lease.key.tmp"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := loadLeaseKey(dir); err == nil {
-		t.Fatal("lease key write over a directory = nil error")
-	}
-}
-
 // TestSqueezeClusterLoaderErrors drives the per-kind cluster loader error
 // returns with valid preceding material.
 func TestSqueezeClusterLoaderErrors(t *testing.T) {

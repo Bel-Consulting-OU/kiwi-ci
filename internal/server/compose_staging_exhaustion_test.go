@@ -59,13 +59,13 @@ func composeTempEntries(t *testing.T, dir string) []string {
 // of maxBytes in its own directory, returning the budget.
 func composeStagingWorld(t *testing.T, maxBytes int64) (*Server, *dbFakeStore, *staging.Budget) {
 	t.Helper()
-	s, f, _ := composeGCWorld(t)
 	dir := filepath.Join(t.TempDir(), "staging")
 	b, err := staging.NewBudget(dir, maxBytes)
 	if err != nil {
 		t.Fatalf("staging budget: %v", err)
 	}
-	s.SetStagingBudget(b)
+	t.Cleanup(func() { _ = b.Close() })
+	s, f, _ := composeGCWorld(t, WithStagingBudget(b))
 	return s, f, b
 }
 
@@ -397,9 +397,10 @@ func TestComposeNoUsableStagingBoundRefusesStartupAndFailsUploadsClosed(t *testi
 	}
 
 	// The runtime guard: a server with no usable bound still serves, but
-	// every large upload fails closed BEFORE touching the body.
-	s, f, _ := composeGCWorld(t)
-	s.SetStagingBudget(nil)
+	// every large upload fails closed BEFORE touching the body. An explicit
+	// construction-time nil budget (WithStagingBudget(nil)) supplies "no
+	// bound" and suppresses the constructor's data-dir default.
+	s, f, _ := composeGCWorld(t, WithStagingBudget(nil))
 	hdrs := composeSeedLeasedJob(t, s, f, "job-nobound", "runner-nobound")
 	archive, _ := snapshotArchive(t)
 

@@ -8,7 +8,6 @@ package storage
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"testing"
 
@@ -146,11 +145,19 @@ func TestPostgresIntegrationRepoIdentityRepair(t *testing.T) {
 	if jobRepo != a1Nested || jobPolicy != a1Nested {
 		t.Fatalf("legacy nested job = %q/%q, want %q", jobRepo, jobPolicy, a1Nested)
 	}
-	// Unprovable row quarantined to the reserved canonical identity.
-	wantQuarantine := "quarantine.invalid/quarantined/" + base64.RawURLEncoding.EncodeToString([]byte("group/sub/project"))
+	// Unprovable row quarantined to the reserved canonical identity (the
+	// original is preserved in the quarantine table, not in the ID).
+	wantQuarantine := QuarantinedRepoIdentity("group/sub/project")
 	quarRepo, quarPolicy := pgITRunIdentity(t, st, unprovableRun)
 	if quarRepo != wantQuarantine || quarPolicy != wantQuarantine {
 		t.Fatalf("quarantined row = %q/%q, want %q", quarRepo, quarPolicy, wantQuarantine)
+	}
+	var storedOriginal string
+	if err := st.pool.QueryRow(ctx, `SELECT stored_repo_id FROM repo_identity_quarantine WHERE kind='run' AND record_id=$1`, unprovableRun).Scan(&storedOriginal); err != nil {
+		t.Fatalf("read quarantine original: %v", err)
+	}
+	if storedOriginal != "group/sub/project" {
+		t.Fatalf("quarantine table original = %q, want group/sub/project", storedOriginal)
 	}
 	var quarantined int
 	if err := st.pool.QueryRow(ctx, `SELECT count(*) FROM repo_identity_quarantine WHERE kind='run' AND record_id=$1`, unprovableRun).Scan(&quarantined); err != nil {

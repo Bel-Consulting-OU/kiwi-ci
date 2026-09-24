@@ -54,11 +54,13 @@ func (m *memBlob) Delete(ctx context.Context, key string) error {
 }
 
 // cacheFixture wires a DB-mode server with a seeded leased job and an
-// observable CAS blob store.
-func cacheFixture(t *testing.T) (*Server, *dbFakeStore, *memBlob, map[string]string) {
+// observable CAS blob store. Construction-time options (for example
+// WithStagingBudget) are passed to the persistent constructor, since staging
+// is immutable after construction.
+func cacheFixture(t *testing.T, opts ...Option) (*Server, *dbFakeStore, *memBlob, map[string]string) {
 	t.Helper()
 	f := newDBFakeStore()
-	s, err := NewPersistent("runner-tok", "admin-tok", t.TempDir())
+	s, err := NewPersistent("runner-tok", "admin-tok", t.TempDir(), opts...)
 	if err != nil {
 		t.Fatal(err)
 	}

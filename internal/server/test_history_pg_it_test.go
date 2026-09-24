@@ -411,7 +411,9 @@ func TestPostgresIntegrationServerTestHistoryRepairAllReposAcrossPages(t *testin
 	env := pgITServerSetup(t)
 	s, st := pgITServerWithEnv(t, env, t.TempDir())
 	pgITServerAwaitLeadership(t, s)
-	const repos = 1005
+	// One past the old 1000-repository cap: the smallest set that still
+	// crosses the boundary the pre-fix enumeration truncated at.
+	const repos = 1001
 	pgITServerSeedHistoryRepoPage(t, env, repos)
 
 	counting := &repairCountingStore{PostgresStore: st, page: 97, rebuilt: map[string]int{}}
@@ -429,7 +431,7 @@ func TestPostgresIntegrationServerTestHistoryRepairAllReposAcrossPages(t *testin
 		t.Fatalf("test_history_repos rows = %d, want %d", n, repos)
 	}
 	// Spot check through the store API: a repaired repository loads.
-	if v, _, err := st.LoadRepoTestHistory(context.Background(), "github.com/kiwi-it/page-1005"); err != nil || v == 0 {
+	if v, _, err := st.LoadRepoTestHistory(context.Background(), "github.com/kiwi-it/page-1001"); err != nil || v == 0 {
 		t.Fatalf("spot-check repaired history = version %d err %v, want a repaired version", v, err)
 	}
 }

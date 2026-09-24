@@ -129,13 +129,13 @@ func composeReportPost(ctx context.Context, s *Server, jobID, body string) int {
 // gone, and the next upload of the same key must succeed.
 func TestComposeCancelDuringCacheCASPublication(t *testing.T) {
 	watched := composeTmpWatcher(t)
-	s, f, _ := composeGCWorld(t)
 	dir := filepath.Join(t.TempDir(), "staging")
 	b, err := staging.NewBudget(dir, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.SetStagingBudget(b)
+	t.Cleanup(func() { _ = b.Close() })
+	s, f, _ := composeGCWorld(t, WithStagingBudget(b))
 	hdrs := composeSeedLeasedJob(t, s, f, "job-cancel-cache", "runner-cancel-cache")
 
 	blocking := newComposeBlockingPutBlob(s.BlobStore)
@@ -197,13 +197,13 @@ func TestComposeCancelDuringCacheCASPublication(t *testing.T) {
 func TestComposeCancelDuringSnapshotStagingCopy(t *testing.T) {
 	watched := composeTmpWatcher(t)
 	archive, _ := snapshotArchive(t)
-	s, f, _ := composeGCWorld(t)
 	dir := filepath.Join(t.TempDir(), "staging")
 	b, err := staging.NewBudget(dir, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.SetStagingBudget(b)
+	t.Cleanup(func() { _ = b.Close() })
+	s, f, _ := composeGCWorld(t, WithStagingBudget(b))
 	hdrs := composeSeedLeasedJob(t, s, f, "job-cancel-snap", "runner-cancel-snap")
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -436,13 +436,13 @@ func totalFoldedRuns(aggs map[string]map[string]storage.TestHistoryAggregate) in
 // reference, so the digest the request would have published is either absent
 // (the blocking backend stored nothing) and the full invariant walk is clean.
 func TestComposeCancelLeavesDigestAbsentAndBudgetBaseline(t *testing.T) {
-	s, f, _ := composeGCWorld(t)
 	dir := filepath.Join(t.TempDir(), "staging")
 	b, err := staging.NewBudget(dir, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.SetStagingBudget(b)
+	t.Cleanup(func() { _ = b.Close() })
+	s, f, _ := composeGCWorld(t, WithStagingBudget(b))
 	hdrs := composeSeedLeasedJob(t, s, f, "job-cancel-gc", "runner-cancel-gc")
 
 	blocking := newComposeBlockingPutBlob(s.BlobStore)

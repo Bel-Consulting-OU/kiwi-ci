@@ -403,7 +403,7 @@ func TestPostgresIntegrationLeaderEpochAtomicity(t *testing.T) {
 // advanced epoch survives re-migration, and unrelated pre-existing rows are
 // untouched by the upgrade.
 func TestPostgresIntegrationLeaderFenceMigration(t *testing.T) {
-	env := pgITSetup(t)
+	env := pgITSetupAtVersion(t, 24)
 	st := env.open(t)
 	ctx := context.Background()
 

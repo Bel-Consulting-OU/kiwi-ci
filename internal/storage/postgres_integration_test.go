@@ -4,10 +4,15 @@ package storage
 // on KIWI_TEST_POSTGRES_URL (skipped when the variable is unset, and in
 // -short mode) so `go test ./...` stays hermetic without a database.
 //
-// Every test opens its own throwaway schema (kiwi_it_<random>) by setting
-// search_path on the pool and DROP SCHEMA ... CASCADE on cleanup, so tests
-// never share tables and never depend on local state. The exported store
-// APIs under test are the same ones the control plane uses in production.
+// Every test owns its own throwaway DATABASE (kiwi_itdb_<random>), cloned
+// from a process-wide TEMPLATE database that was migrated once with the real
+// embedded migrations (see internal/testutil/pg_template.go). Cloning a whole
+// database is ~100 ms where applying 369 tables of migrations was ~13 s per
+// test, and the clone is a complete copy: tests never share tables, parallel
+// tests cannot observe each other, and the schema still comes from the
+// production migration path. Cleanup DROP DATABASE ... WITH (FORCE) runs on
+// failure too. The exported store APIs under test are the same ones the
+// control plane uses in production.
 
 import (
 	"context"
@@ -26,6 +31,7 @@ import (
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage/migrations"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 )
 
 const pgITRepo = "https://github.com/kiwi-it/repo.git"
@@ -76,58 +82,129 @@ func pgITNewID(t *testing.T) string {
 	return pgITRandomHex(t, 32)
 }
 
-// pgITEnv owns one per-test schema and can open additional pools on it (used
-// to exercise concurrent stores/instances over the same tables).
+// pgITEnv owns one per-test database and can open additional pools on it (used
+// to exercise concurrent stores/instances over the same tables). schema is the
+// constant public schema of the clone; base is the clone's DSN.
 type pgITEnv struct {
 	base   string
 	schema string
 }
 
-// pgITSetup creates the throwaway schema and registers its teardown.
-func pgITSetup(t *testing.T) *pgITEnv {
-	t.Helper()
-	base := pgITDSN(t)
-	schema := "kiwi_it_" + pgITRandomHex(t, 12)
-	ctx := context.Background()
-	admin, err := pgx.Connect(ctx, base)
-	if err != nil {
-		t.Fatalf("connect to KIWI_TEST_POSTGRES_URL: %v", err)
+const (
+	// pgITTemplateName is the full-schema template database, migrated once per
+	// process from the real embedded migrations.
+	pgITTemplateName = "kiwi_itdb_tmpl"
+	// pgITVersionTemplatePrefix names the historical-schema templates used by
+	// tests that stop the migration path at an older version.
+	pgITVersionTemplatePrefix = "kiwi_itdb_tmpl_v"
+	// pgITClonePrefix names every throwaway per-test database.
+	pgITClonePrefix = "kiwi_itdb_"
+)
+
+// pgITMigrateTemplate applies the embedded migrations to the template database
+// through the real per-file transaction path. maxVersion > 0 stops after that
+// version, so a test can clone a database at a historical schema and then seed
+// data before the next migration runs.
+func pgITMigrateTemplate(ctx context.Context, dsn string, maxVersion int) error {
+	// A negative maxVersion builds an EMPTY template (no migrations at all),
+	// for tests that must observe the unmigrated state or the full bootstrap.
+	if maxVersion < 0 {
+		return nil
 	}
-	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+pgx.Identifier{schema}.Sanitize()); err != nil {
-		_ = admin.Close(ctx)
-		t.Fatalf("create schema %s: %v", schema, err)
-	}
-	if err := admin.Close(ctx); err != nil {
-		t.Fatalf("close admin connection: %v", err)
-	}
-	t.Cleanup(func() {
-		cctx := context.Background()
-		c, cerr := pgx.Connect(cctx, base)
-		if cerr != nil {
-			t.Logf("drop schema %s: connect: %v", schema, cerr)
-			return
+	st, err := NewPostgresOpt(ctx, dsn, func(c *pgxpool.Config) {
+		if c.ConnConfig.RuntimeParams == nil {
+			c.ConnConfig.RuntimeParams = map[string]string{}
 		}
-		defer func() { _ = c.Close(cctx) }()
-		if _, err := c.Exec(cctx, "DROP SCHEMA IF EXISTS "+pgx.Identifier{schema}.Sanitize()+" CASCADE"); err != nil {
-			t.Logf("drop schema %s: %v", schema, err)
-		}
+		c.ConnConfig.RuntimeParams["search_path"] = "public"
 	})
-	return &pgITEnv{base: base, schema: schema}
+	if err != nil {
+		return err
+	}
+	defer func() { _ = st.Close() }()
+	all, err := migrations.All()
+	if err != nil {
+		return err
+	}
+	for _, m := range all {
+		if maxVersion > 0 && m.Version > maxVersion {
+			continue
+		}
+		if err := st.applyMigration(ctx, m); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// open opens one pool bound to the test schema (search_path) and closes it
-// on cleanup before the schema is dropped.
+// pgITTemplateAt returns (building it on first use) the template database
+// migrated through the newest embedded migration, or through maxVersion when
+// maxVersion > 0.
+func pgITTemplateAt(t *testing.T, maxVersion int) string {
+	t.Helper()
+	name := pgITTemplateName
+	switch {
+	case maxVersion < 0:
+		name = pgITTemplateName + "_empty"
+	case maxVersion > 0:
+		name = fmt.Sprintf("%s%d", pgITVersionTemplatePrefix, maxVersion)
+	}
+	testutil.EnsureTemplate(t, testutil.TemplateSpec{
+		BaseDSN: pgITDSN(t),
+		Name:    name,
+		Migrate: func(ctx context.Context, dsn string) error {
+			return pgITMigrateTemplate(ctx, dsn, maxVersion)
+		},
+	}, pgITClonePrefix)
+	return name
+}
+
+// pgITSetup creates a throwaway database cloned from the full-schema template
+// and registers its teardown.
+func pgITSetup(t *testing.T) *pgITEnv {
+	t.Helper()
+	return pgITSetupAtVersion(t, 0)
+}
+
+// pgITSetupFresh creates a throwaway database cloned from an EMPTY template:
+// no migrations are applied, so tests can observe the unmigrated state and run
+// the real bootstrap path themselves.
+func pgITSetupFresh(t *testing.T) *pgITEnv {
+	t.Helper()
+	return pgITSetupAtVersion(t, -1)
+}
+
+// pgITSetupAtVersion creates a throwaway database cloned from a template
+// migrated through maxVersion (0 selects the newest schema, a negative value
+// selects an empty database), so tests that exercise a historical schema still
+// start from a real migrated database instead of paying for a full migration
+// themselves.
+func pgITSetupAtVersion(t *testing.T, maxVersion int) *pgITEnv {
+	t.Helper()
+	base := pgITDSN(t)
+	tmpl := pgITTemplateAt(t, maxVersion)
+	dsn := testutil.CloneDatabase(t, base, tmpl, pgITClonePrefix)
+	return &pgITEnv{base: dsn, schema: "public"}
+}
+
+// open opens one pool on the test's database and closes it on cleanup before
+// the database is dropped.
 func (e *pgITEnv) open(t *testing.T) *PostgresStore {
 	t.Helper()
-	schema := e.schema
 	st, err := NewPostgresOpt(context.Background(), e.base, func(c *pgxpool.Config) {
 		if c.ConnConfig.RuntimeParams == nil {
 			c.ConnConfig.RuntimeParams = map[string]string{}
 		}
-		c.ConnConfig.RuntimeParams["search_path"] = schema
+		c.ConnConfig.RuntimeParams["search_path"] = e.schema
+		// Seeding fixtures commit hundreds to thousands of single-row
+		// transactions; on a local server the WAL fsync per commit dominates
+		// their runtime. synchronous_commit=off keeps every assertion (all
+		// logical: commit visibility, locking, uniqueness) and only skips the
+		// per-commit flush, which no test observes because the PostgreSQL
+		// server itself is never crashed or restarted.
+		c.ConnConfig.RuntimeParams["synchronous_commit"] = "off"
 	})
 	if err != nil {
-		t.Fatalf("open store on schema %s: %v", schema, err)
+		t.Fatalf("open store on %s: %v", e.base, err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	return st
@@ -172,6 +249,60 @@ func pgITStore(t *testing.T) *PostgresStore {
 	env.migrate(t, st)
 	pgITArmFence(t, st)
 	return st
+}
+
+// pgITBulkInsertRuns seeds runs with ONE statement/transaction instead of a
+// loop of InsertRun calls. It produces exactly the rows InsertRun would: the
+// same payload (jsonMarshal of the model) and the same normalized columns
+// computed by the shared SQL normalization functions. The single statement
+// matters because the runs table carries several expression indexes; per-row
+// autocommit inserts into it are ~100x slower here than a bulk write, and no
+// assertion depends on the rows arriving in separate transactions.
+func pgITBulkInsertRuns(t *testing.T, st *PostgresStore, runs []model.Run) {
+	t.Helper()
+	if len(runs) == 0 {
+		return
+	}
+	ids := make([]string, len(runs))
+	statuses := make([]string, len(runs))
+	started := make([]string, len(runs))
+	finished := make([]string, len(runs))
+	created := make([]string, len(runs))
+	payloads := make([]string, len(runs))
+	for i, r := range runs {
+		if err := ValidateRunID(r.ID); err != nil {
+			t.Fatalf("bulk insert run %d: %v", i, err)
+		}
+		p, err := jsonMarshal(r)
+		if err != nil {
+			t.Fatalf("bulk insert run %d marshal: %v", i, err)
+		}
+		ids[i] = r.ID
+		statuses[i] = string(r.Status)
+		created[i] = r.CreatedAt.UTC().Format(time.RFC3339Nano)
+		if r.StartedAt != nil {
+			started[i] = r.StartedAt.UTC().Format(time.RFC3339Nano)
+		}
+		if r.FinishedAt != nil {
+			finished[i] = r.FinishedAt.UTC().Format(time.RFC3339Nano)
+		}
+		payloads[i] = string(p)
+	}
+	_, err := st.pool.Exec(context.Background(), `
+		INSERT INTO runs (id, status, started_at, finished_at, created_at, `+normalizedRunRepoIdentityColumn+`, `+normalizedRunRepoFullNameColumn+`, payload)
+		SELECT u.id, u.status,
+		       NULLIF(u.started_at,'')::timestamptz,
+		       NULLIF(u.finished_at,'')::timestamptz,
+		       u.created_at::timestamptz,
+		       `+normalizedRunRepoIdentitySQL("u.payload::jsonb")+`,
+		       `+normalizedRunRepoFullNameSQL("u.payload::jsonb")+`,
+		       u.payload::jsonb
+		FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[])
+		     AS u(id, status, started_at, finished_at, created_at, payload)`,
+		ids, statuses, started, finished, created, payloads)
+	if err != nil {
+		t.Fatalf("bulk insert %d runs: %v", len(runs), err)
+	}
 }
 
 // pgITSeedRunner upserts a runner with the given capacity and rates.
@@ -1185,11 +1316,11 @@ func TestIntegrationPendingSidecarGenerationScoped(t *testing.T) {
 // with generation-less rows is drained and recreated with the generation in
 // the primary key, so old rows can never resolve for any generation.
 func TestIntegrationPendingSidecarMigrationDrainsRows(t *testing.T) {
-	env := pgITSetup(t)
+	env := pgITSetupAtVersion(t, 27)
 	st := env.open(t)
 	ctx := context.Background()
-	// Bring the schema to the pre-0028 state: apply every migration before
-	// 0028, including the shipped 0012 shape.
+	// The clone is already at the pre-0028 state (migrations through 0027); the
+	// loop below re-asserts that and is a no-op on these applied versions.
 	all, err := migrations.All()
 	if err != nil {
 		t.Fatalf("migrations.All: %v", err)

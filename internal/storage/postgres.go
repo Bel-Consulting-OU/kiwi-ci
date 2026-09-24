@@ -78,6 +78,12 @@ type PostgresStore struct {
 	// session, key change, fence mismatch); it is never decremented, and the
 	// durable epoch is only ever advanced with epoch + 1.
 	leaderEpoch atomic.Int64
+
+	// repoIdentityRepairHooks is a test-only seam for the repository-identity
+	// repair pass (a deterministic barrier for concurrent-writer and
+	// mid-batch-failure injection). Production leaves it nil. See
+	// repo_identity_repair.go.
+	repoIdentityRepairHooks *repoIdentityRepairTestHooks
 }
 
 var _ Store = (*PostgresStore)(nil)
@@ -1413,8 +1419,9 @@ func (s *PostgresStore) AcquireLease(ctx context.Context, jobID, runnerID string
 	js := jobScanner{}
 	// attempts increments exactly once per lease; started_at is stamped on
 	// the FIRST lease only (COALESCE) so requeues and lost-runner re-leases
-	// preserve the original start time.
-	err := s.pool.QueryRow(ctx, `UPDATE jobs SET status='running', attempts = attempts + 1, started_at = COALESCE(started_at, now()), lease_runner_id=$2, lease_token_hash=$3, lease_generation=$4, lease_expires_at=$5 WHERE id=$1 AND status='queued' AND (lease_expires_at IS NULL OR lease_expires_at < now()) RETURNING `+jobCols,
+	// preserve the original start time. A quarantined job is denied here too:
+	// the durable flag is checked in the claim statement itself.
+	err := s.pool.QueryRow(ctx, `UPDATE jobs SET status='running', attempts = attempts + 1, started_at = COALESCE(started_at, now()), lease_runner_id=$2, lease_token_hash=$3, lease_generation=$4, lease_expires_at=$5 WHERE id=$1 AND status='queued' AND COALESCE(payload->>'repo_identity_quarantined','') <> 'true' AND (lease_expires_at IS NULL OR lease_expires_at < now()) RETURNING `+jobCols,
 		jobID, runnerID, tokenHash, generation, expiresAt).Scan(jobTargets(&js)...)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return model.Job{}, ErrLeaseConflict
@@ -1543,9 +1550,15 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 	}
 
 	// Step 1: lock the job row first (job -> runner ordering, matching
-	// CompleteJob) and fail fast when the job is not queued.
-	var jobStatus string
-	err = tx.QueryRow(ctx, `SELECT status FROM jobs WHERE id=$1 FOR UPDATE`, claim.JobID).Scan(&jobStatus)
+	// CompleteJob) and fail fast when the job is not queued. The durable
+	// repo_identity_quarantined payload flag is read under the SAME row lock,
+	// so a quarantined job can never be leased even if the claim's
+	// Quarantined field was not populated by a direct caller (R1-6).
+	var (
+		jobStatus      string
+		jobQuarantined bool
+	)
+	err = tx.QueryRow(ctx, `SELECT status, COALESCE(payload->>'repo_identity_quarantined','') = 'true' FROM jobs WHERE id=$1 FOR UPDATE`, claim.JobID).Scan(&jobStatus, &jobQuarantined)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return model.Job{}, ErrLeaseConflict
 	}
@@ -1554,6 +1567,9 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 	}
 	if model.Status(jobStatus) != model.StatusQueued {
 		return model.Job{}, ErrLeaseConflict
+	}
+	if jobQuarantined || claim.Quarantined {
+		return model.Job{}, ErrNoCapacity
 	}
 
 	// Step 2: environment concurrency is reserved inside this transaction:

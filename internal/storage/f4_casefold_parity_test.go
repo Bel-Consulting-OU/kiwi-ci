@@ -187,7 +187,7 @@ func isAnyID(ids []string, runs []model.Run) bool {
 // were computed with the unfolded derivation (and whose stored identity is
 // mixed-case) is re-stamped onto the folded form by migration 0035.
 func TestPostgresIntegrationFold0035UpgradeRefoldsRows(t *testing.T) {
-	env := pgITSetup(t)
+	env := pgITSetupAtVersion(t, 34)
 	st := env.open(t)
 	pgITApplyThrough(t, st, 34)
 	ctx := context.Background()

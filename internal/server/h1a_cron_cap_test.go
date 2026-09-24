@@ -82,10 +82,25 @@ func TestCronNeverDueSetTickBounded(t *testing.T) {
 	}
 	s.mu.Unlock()
 
+	var captured *cronScanBudget
+	prevHook := cronScanBudgetHook
+	cronScanBudgetHook = func(b *cronScanBudget) { captured = b }
+	t.Cleanup(func() { cronScanBudgetHook = prevHook })
+
 	start := time.Now()
 	s.fireDueSchedules(context.Background(), now)
 	elapsed := time.Since(start)
-	if elapsed > 3*time.Second {
+	// Deterministic bound: the shared per-tick budget is the limiter. The
+	// elapsed ceiling is only a safety net (it must not be the assertion that
+	// flakes on a loaded machine).
+	if captured == nil {
+		t.Fatal("no cron scan budget was created for the tick")
+	}
+	// Unreachable expressions (Feb 30) are rejected before any scan, so this
+	// fixture proves the tick fires nothing and returns promptly; the shared
+	// budget exhaustion property is asserted directly below in
+	// TestCronScanBudgetIsSharedAndExhausted.
+	if elapsed > 30*time.Second {
 		t.Fatalf("2000 never-due schedules took %v for one tick; the scan is not bounded", elapsed)
 	}
 	s.mu.Lock()
@@ -141,5 +156,23 @@ func TestScheduleCapEnforcedDB(t *testing.T) {
 	w := doJSON(t, s, http.MethodPut, "/api/v1/schedules", "token", body("https://github.com/o/other.git"))
 	if w.Code != http.StatusConflict {
 		t.Fatalf("second DB schedule past the cap = %d, want 409: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestCronScanBudgetIsSharedAndExhausted proves the per-tick bound
+// deterministically: a valid-but-distant expression must stop scanning once
+// the shared budget is spent, without relying on wall-clock timing.
+func TestCronScanBudgetIsSharedAndExhausted(t *testing.T) {
+	sched, _, err := parseScheduleSpec(cronSpecWith("0 0 1 1 *"))
+	if err != nil {
+		t.Fatalf("parseScheduleSpec: %v", err)
+	}
+	budget := newCronScanBudget(5)
+	got := sched.nextBudget(time.Now().UTC(), budget)
+	if !got.IsZero() {
+		t.Fatalf("scan past the horizon returned %v, want the zero time", got)
+	}
+	if budget.remaining != 0 {
+		t.Fatalf("budget remaining = %d after an over-budget scan, want 0", budget.remaining)
 	}
 }

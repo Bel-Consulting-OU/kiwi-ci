@@ -186,7 +186,7 @@ func pgITAssertSplitIndexDefs(t *testing.T, st *PostgresStore, schema string) {
 // migration must succeed with data present, keep the backlog intact, and
 // leave the unique versioned identity enforced.
 func TestPostgresIntegrationMigrationSplitPrePopulatedOutbox(t *testing.T) {
-	env := pgITSetup(t)
+	env := pgITSetupAtVersion(t, 17)
 	st := env.open(t)
 	ctx := context.Background()
 
@@ -276,7 +276,7 @@ func TestPostgresIntegrationMigrationSplitPrePopulatedOutbox(t *testing.T) {
 // upgrade path: Migrate over the legacy schema applies 0019/0020 as no-ops
 // and leaves the snapshot unchanged.
 func TestPostgresIntegrationMigrationSplitFinalSchemaMatchesLegacySingleFile(t *testing.T) {
-	legacyEnv := pgITSetup(t)
+	legacyEnv := pgITSetupAtVersion(t, 17)
 	legacy := legacyEnv.open(t)
 	pgITApplyThrough(t, legacy, 17)
 	pgITApplyLegacy0018(t, legacy)

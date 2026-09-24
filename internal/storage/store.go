@@ -1222,6 +1222,11 @@ type LeaseClaim struct {
 	// of the job request and this envelope (RequestedResources), so a runner
 	// without room for the aggregate never takes the job.
 	ServiceEnvelopeRequest model.ResourceCapacity
+
+	// Quarantined mirrors model.Job.RepoIdentityQuarantined: the claim's job
+	// carries the durable repo_identity_quarantined flag, so no runner may
+	// lease it (ClaimAllowsRunner denies independent of the repository ACL).
+	Quarantined bool
 }
 
 // RequestedResources returns the TOTAL resources the claim reserves against

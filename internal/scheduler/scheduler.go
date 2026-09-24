@@ -407,6 +407,10 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 			// transaction reserves job request + envelope in the ONE
 			// ledger row (LeaseClaim.RequestedResources).
 			ServiceEnvelopeRequest: candidate.ServiceEnvelopeRequest,
+			// A quarantined candidate carries the durable identity flag, so
+			// the SQL claim denies it independently of every allowlist just
+			// as the in-memory predicate does (R1-6).
+			Quarantined: candidate.RepoIdentityQuarantined,
 		}
 		// Capacity-atomic lease: the job claim, every predicate above, the
 		// resource reservation and the runner's active-jobs append happen in

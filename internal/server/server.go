@@ -288,12 +288,28 @@ type Server struct {
 	// Staging is the shared weighted budget for large-upload scratch space
 	// (job cache entries and — consumed by the snapshot path — workspace
 	// snapshots). Persistent constructors install a bounded default under
-	// the data dir; the app wiring replaces it with the configured
-	// staging.dir/staging.max_bytes budget, and production REFUSES to start
-	// without one. Large uploads must be charged here before a byte is
-	// staged; handlers fail closed (503) when it is nil. Read it through
-	// StagingBudget().
+	// the data dir; the app wiring supplies the budget it already built from
+	// staging.dir/staging.max_bytes through WithStagingBudget, and production
+	// REFUSES to start without one. Large uploads must be charged here before
+	// a byte is staged; handlers fail closed (503) when it is nil. Read it
+	// through StagingBudget().
+	//
+	// Staging is immutable after construction: it is set through the
+	// WithStagingBudget construction option (or the constructor's own
+	// default) and installStagingBudget refuses — by panic — to change it once
+	// stagingSealed is set at the end of construction. A live server can never
+	// swap budgets, so there is no window in which in-flight requests consume
+	// one budget while new ones consume another.
 	Staging *staging.Budget
+	// stagingSet records that a construction-time WithStagingBudget option
+	// supplied the staging value explicitly — including an explicit nil, which
+	// means "no staging bound, fail large uploads closed" and suppresses the
+	// constructor's data-dir default. It is set by installStagingBudget before
+	// the seal.
+	stagingSet bool
+	// stagingSealed marks the end of construction; after it the staging
+	// budget is immutable (installStagingBudget panics).
+	stagingSealed bool
 
 	// CASGCInterval, CASGCMinAge and CASGCBatch tune the reference-aware
 	// CAS garbage collector Maintain runs (see cas_gc.go). Zero values use
@@ -498,7 +514,37 @@ type Server struct {
 	otelEnabled  bool
 }
 
-func New(token string) *Server {
+// Option customizes a server at construction time. Both the one-shot New
+// constructor and the persistent constructors accept them; options run on the
+// fresh server before it is sealed. The staging budget in particular is
+// immutable after construction (see WithStagingBudget/installStagingBudget),
+// so a construction-time Option is the only supported way to install one.
+type Option func(*Server)
+
+// PersistentOption is the constructor-option type the persistent constructors
+// accept. It is an alias of Option so a single option value works with every
+// server constructor.
+type PersistentOption = Option
+
+// New builds an in-memory server from token. Construction-time options run
+// before the server is returned and sealed; a staging budget supplied through
+// WithStagingBudget is installed here, at construction, because there is no
+// post-construction setter (staging is immutable once a server exists).
+func New(token string, opts ...Option) *Server {
+	s := newServer(token)
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
+	}
+	s.sealStaging()
+	return s
+}
+
+// newServer is the unsealed constructor body shared by New and the persistent
+// constructors. The persistent constructors call it, apply their own options,
+// load durable state, and only then seal the server.
+func newServer(token string) *Server {
 	key, err := newLeaseKey()
 	if err != nil {
 		// A fresh lease key is security-critical state; without entropy the
@@ -547,19 +593,43 @@ func newLeaseKey() ([]byte, error) {
 	return b, nil
 }
 
+// readPersistedLeaseKey reads and validates the hex-encoded 32-byte lease HMAC
+// key at path. A missing file returns the underlying os.ErrNotExist so the
+// caller can distinguish first use from a corrupt key.
+func readPersistedLeaseKey(path string) ([]byte, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := hex.DecodeString(strings.TrimSpace(string(b)))
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) != 32 {
+		return nil, fmt.Errorf("invalid lease key size")
+	}
+	return raw, nil
+}
+
 // loadLeaseKey loads the persisted lease HMAC key from dataDir, generating and
 // persisting a fresh one on first use. The key is what lets lease tokens
 // survive control-plane restarts: only their HMAC is stored in job state.
+//
+// First-time creation goes through fsutil.CreateFileCAS — the same durable
+// create-if-absent primitive the FS cluster-key store uses — so the key is
+// published with a unique temp file, a checked write/chmod/file-fsync/close,
+// a create-if-absent publish and a parent-directory fsync. The previous
+// fixed-suffix scratch file plus os.WriteFile plus os.Rename sequence
+// certified none of those steps, so a crash after a successful startup could
+// leave the publish non-durable; a later start then minted a DIFFERENT lease
+// key while persisted running jobs still held leases derived from the previous
+// one, breaking lease authentication. A pre-existing valid key is always
+// adopted, never overwritten, and a published-but-uncertain failure (a failed
+// parent-directory fsync, fsutil.ErrPublishedUncertain) keeps the visible key
+// and fails startup closed instead of regenerating it.
 func loadLeaseKey(root string) ([]byte, error) {
 	path := filepath.Join(root, "lease.key")
-	if b, err := os.ReadFile(path); err == nil {
-		raw, er := hex.DecodeString(strings.TrimSpace(string(b)))
-		if er != nil {
-			return nil, er
-		}
-		if len(raw) != 32 {
-			return nil, fmt.Errorf("invalid lease key size")
-		}
+	if raw, err := readPersistedLeaseKey(path); err == nil {
 		return raw, nil
 	} else if !os.IsNotExist(err) {
 		return nil, err
@@ -571,12 +641,16 @@ func loadLeaseKey(root string) ([]byte, error) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(hex.EncodeToString(key)), 0o600); err != nil {
-		return nil, err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return nil, err
+	if err := fsutil.CreateFileCAS(path, []byte(hex.EncodeToString(key)), 0o600); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			// A published-but-uncertain failure (fsutil.Renamed) keeps the
+			// visible key: the next start reads it back and converges, so it
+			// must never be deleted or regenerated here.
+			return nil, err
+		}
+		// A concurrent creator won the create-if-absent publish: its file is
+		// authoritative and is adopted.
+		return readPersistedLeaseKey(path)
 	}
 	return key, nil
 }
@@ -605,23 +679,20 @@ func NewPersistent(runnerToken, adminToken, dataDir string, opts ...PersistentOp
 	return NewPersistentWithCluster(runnerToken, adminToken, dataDir, &FSClusterKeyStore{Dir: dataDir}, opts...)
 }
 
-// PersistentOption customizes a persistent server constructor. Options run
-// once on the freshly created server, before any data-dir loader and before
-// the CAS/staging wiring, so a supplied value wins over the constructor's
-// built-in default.
-type PersistentOption func(*Server)
-
 // WithStagingBudget installs b as the server's shared staging budget (and,
 // through the CAS wiring, the budget every server CAS instance carries)
-// instead of letting the constructor build its own data-dir default. The
-// caller keeps ownership of b — the server never closes it — and is
-// responsible for having taken its directory lock. Production passes the
-// budget it already built from staging.dir/staging.max_bytes here so the
-// process owns exactly one staging directory and holds exactly one lock,
-// rather than the constructor locking a second directory (or colliding on the
-// same directory with a different max_bytes).
+// instead of letting the constructor build its own data-dir default. It is a
+// CONSTRUCTION-TIME option: it must be passed to a constructor, because once
+// the server is built the staging budget is immutable (installStagingBudget
+// panics) and there is no post-construction setter. The caller keeps ownership
+// of b — the server never closes it — and is responsible for having taken its
+// directory lock. Production passes the budget it already built from
+// staging.dir/staging.max_bytes here so the process owns exactly one staging
+// directory and holds exactly one lock, rather than the constructor locking a
+// second directory (or colliding on the same directory with a different
+// max_bytes).
 func WithStagingBudget(b *staging.Budget) PersistentOption {
-	return func(s *Server) { s.Staging = b }
+	return func(s *Server) { s.installStagingBudget(b) }
 }
 
 // WithMaxSchedules overrides the durable schedule cap. n <= 0 disables it.
@@ -645,7 +716,7 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 	if adminToken == "" {
 		adminToken = runnerToken
 	}
-	s := New(runnerToken)
+	s := newServer(runnerToken)
 	s.AdminToken = adminToken
 	s.dataDir = dataDir
 	s.ClusterKeys = cluster
@@ -682,7 +753,7 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 	if stagingRoot == "" {
 		stagingRoot = os.TempDir()
 	}
-	if s.Staging == nil {
+	if !s.stagingSet {
 		budget, berr := staging.NewReplicaBudget(filepath.Join(stagingRoot, "kiwi-staging"), "", staging.DefaultMaxBytes)
 		if berr != nil {
 			return nil, berr
@@ -894,6 +965,10 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 		return nil, err
 	}
 	s.initTracingFromEnv()
+	// Construction is complete: the staging budget can no longer be changed
+	// (installStagingBudget panics), which is what makes the bound immutable
+	// for the server's lifetime.
+	s.sealStaging()
 	return s, nil
 }
 

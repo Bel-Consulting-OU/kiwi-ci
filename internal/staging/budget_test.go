@@ -500,6 +500,156 @@ func TestSpoolCopyNeverWritesBeyondLimit(t *testing.T) {
 	}
 }
 
+// TestBudgetPruneSkipsActiveSpoolsAndRemovesAbandoned is the R2-2 regression:
+// age alone must never prove abandonment. A spool that SpoolFile created for
+// this Budget stays live past the age threshold and survives Prune, while a
+// file nobody owns is removed; ReleaseSpool (or the file disappearing) lets a
+// later Prune reclaim it.
+func TestBudgetPruneSkipsActiveSpoolsAndRemovesAbandoned(t *testing.T) {
+	dir := t.TempDir()
+	b, err := NewBudget(dir, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = b.Close() }()
+	// A tiny floor isolates "active" tracking from the age floor: every file
+	// below is aged well past the threshold.
+	b.PruneMinAge = time.Nanosecond
+
+	active, n, err := SpoolFile(dir, bytes.NewReader([]byte("legitimately slow publication")), 0)
+	if err != nil || n == 0 {
+		t.Fatalf("SpoolFile active spool = (%q, %d, %v)", active, n, err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(active, old, old); err != nil {
+		t.Fatal(err)
+	}
+	abandoned := filepath.Join(dir, FilePrefix+"abandoned")
+	if err := os.WriteFile(abandoned, []byte("dead handler"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(abandoned, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := b.Prune(context.Background())
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("Prune removed %d file(s), want 1 (only the abandoned one)", removed)
+	}
+	if _, err := os.Stat(active); err != nil {
+		t.Fatalf("an actively-owned spool was unlinked by age: %v", err)
+	}
+	if _, err := os.Stat(abandoned); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("an abandoned spool survived: %v", err)
+	}
+
+	// Once the owner releases the spool, age-based Prune may reclaim it.
+	b.ReleaseSpool(active)
+	if err := os.Chtimes(active, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err = b.Prune(context.Background()); err != nil || removed != 1 {
+		t.Fatalf("Prune after ReleaseSpool = (%d, %v), want (1, nil)", removed, err)
+	}
+	if _, err := os.Stat(active); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a released spool survived Prune: %v", err)
+	}
+}
+
+// blockingSpoolReader signals that SpoolFile has created and registered the
+// spool file, then blocks until released, holding the spool in flight.
+type blockingSpoolReader struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *blockingSpoolReader) Read([]byte) (int, error) {
+	r.once.Do(func() { close(r.started) })
+	<-r.release
+	return 0, io.EOF
+}
+
+// TestBudgetPruneConcurrentWithInFlightSpool is the R2-2 barrier test: Prune
+// runs while a spool is mid-copy and already older than the threshold. The
+// active registration (made atomically with file creation, under the budget
+// mutex) must stop Prune from unlinking a live spool. Run under -race.
+func TestBudgetPruneConcurrentWithInFlightSpool(t *testing.T) {
+	dir := t.TempDir()
+	b, err := NewBudget(dir, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = b.Close() }()
+	b.PruneMinAge = time.Nanosecond
+
+	reader := &blockingSpoolReader{started: make(chan struct{}), release: make(chan struct{})}
+	type spoolResult struct {
+		path string
+		err  error
+	}
+	done := make(chan spoolResult, 1)
+	go func() {
+		path, _, err := SpoolFile(dir, reader, 0)
+		done <- spoolResult{path, err}
+	}()
+	select {
+	case <-reader.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the in-flight spool never started")
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var spool string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), FilePrefix) {
+			spool = filepath.Join(dir, e.Name())
+		}
+	}
+	if spool == "" {
+		t.Fatal("no in-flight spool file was found in the budget directory")
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(spool, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	pruned := make(chan int, 1)
+	go func() {
+		n, perr := b.Prune(context.Background())
+		if perr != nil {
+			t.Errorf("concurrent Prune: %v", perr)
+		}
+		pruned <- n
+	}()
+	select {
+	case n := <-pruned:
+		if n != 0 {
+			t.Fatalf("Prune unlinked %d in-flight spool file(s)", n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent Prune never returned")
+	}
+	if _, err := os.Stat(spool); err != nil {
+		t.Fatalf("an in-flight spool was unlinked by a concurrent Prune: %v", err)
+	}
+
+	close(reader.release)
+	res := <-done
+	if res.err != nil {
+		t.Fatalf("SpoolFile: %v", res.err)
+	}
+	if _, err := os.Stat(res.path); err != nil {
+		t.Fatalf("the completed spool vanished: %v", err)
+	}
+}
+
 type failingReader struct{ err error }
 
 func (f failingReader) Read([]byte) (int, error) { return 0, f.err }

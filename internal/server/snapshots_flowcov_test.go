@@ -317,8 +317,7 @@ func TestFlowSnapshotDBUploadBranches(t *testing.T) {
 // contract: a DB-mode upload without an installed staging budget refuses with
 // 503 instead of falling back to the bare system temporary directory.
 func TestFlowSnapshotDBStagingBudgetMissing(t *testing.T) {
-	s, _, _, hdrs := cacheFixture(t)
-	s.SetStagingBudget(nil)
+	s, _, _, hdrs := cacheFixture(t, WithStagingBudget(nil))
 	w := fcUploadSnapshot(t, s, hdrs, fcSnapshotArchive(t))
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("snapshot upload without a staging budget = %d, want 503: %s", w.Code, w.Body.String())
@@ -330,7 +329,7 @@ func TestFlowSnapshotDBStagingBudgetMissing(t *testing.T) {
 // fails instead of the first upload), and a server left without a budget
 // fails the upload closed rather than staging elsewhere.
 func TestFlowSnapshotDBStagingDirFailure(t *testing.T) {
-	s, _, _, hdrs := cacheFixture(t)
+	s, _, _, hdrs := cacheFixture(t, WithStagingBudget(nil))
 	// A FILE at the configured staging path makes NewBudget's directory
 	// probe fail for any euid (path shape, not permission bits).
 	blocked := filepath.Join(t.TempDir(), "staging-blocked")
@@ -340,7 +339,6 @@ func TestFlowSnapshotDBStagingDirFailure(t *testing.T) {
 	if _, err := staging.NewBudget(blocked, 1<<20); err == nil {
 		t.Fatal("staging budget over a file path must not install")
 	}
-	s.SetStagingBudget(nil)
 	w := fcUploadSnapshot(t, s, hdrs, fcSnapshotArchive(t))
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("snapshot upload with unusable staging = %d, want 503: %s", w.Code, w.Body.String())
