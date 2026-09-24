@@ -33,6 +33,10 @@ type TartBackend struct {
 	// the tart run flags the installed CLI supports; disk is advisory.
 	// PIDs requests never reach here (admission rejects them for tart).
 	Resources pipeline.Resources
+	// AgentPort overrides the guest kiwi-agent bootstrap port. Zero keeps the
+	// production default (tartAgentPort); tests use an ephemeral port so they
+	// never collide with an external process.
+	AgentPort int
 	tart      string
 	ssh       string
 	clone     string
@@ -164,6 +168,14 @@ const (
 	tartAgentKeyPath = "/kiwi/v1/bootstrap/authorized-key"
 )
 
+// agentPort is the effective guest kiwi-agent bootstrap port.
+func (b *TartBackend) agentPort() int {
+	if b.AgentPort > 0 {
+		return b.AgentPort
+	}
+	return tartAgentPort
+}
+
 // tartGetArgs builds the `tart get --format json <vm>` invocation used to
 // query an image's labels. Pure helper so the invocation shape is testable.
 func tartGetArgs(vm string) []string {
@@ -236,7 +248,7 @@ func (b *TartBackend) injectBootstrapKey(ctx context.Context) error {
 	if err != nil {
 		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("read ephemeral public key: %w", err)}
 	}
-	endpoint := fmt.Sprintf("http://%s:%d%s", b.ip, tartAgentPort, tartAgentKeyPath)
+	endpoint := fmt.Sprintf("http://%s:%d%s", b.ip, b.agentPort(), tartAgentKeyPath)
 	if err := postAuthorizedKey(ctx, endpoint, string(pub), tartBootstrapHTTPClient()); err != nil {
 		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("kiwi-agent key injection failed (image must support the kiwi ssh bootstrap contract): %w", err)}
 	}

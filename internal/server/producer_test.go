@@ -1,8 +1,12 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -160,5 +164,155 @@ func TestDependencyDownloadStaleLease(t *testing.T) {
 	w := doJSONHeaders(t, s, http.MethodGet, "/api/v1/jobs/"+jobID+"/dependencies/build/bin", "token", "", hdrs)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("stale lease = %d, want 409: %s", w.Code, w.Body.String())
+	}
+}
+
+// downloadDependencyFixture drives the producer/consumer flow to the point
+// where the consumer may download the producer's artifact, returning the
+// server, the consumer job ID, its lease headers, and the on-disk artifact
+// path whose bytes a test can corrupt.
+func downloadDependencyFixture(t *testing.T) (*Server, string, map[string]string, string) {
+	t.Helper()
+	s, err := NewPersistent("token", "token", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runnerID, _ := leaseArtifactJob(t, s, producerPipeline)
+	buildID, buildHdrs := seedRunningJob(t, s, "build", runnerID, "build-token")
+	if w := doJSONHeaders(t, s, http.MethodPut, "/api/v1/jobs/"+buildID+"/artifacts/bin", "token", "the-binary", buildHdrs); w.Code != http.StatusCreated {
+		t.Fatalf("upload = %d: %s", w.Code, w.Body.String())
+	}
+	complete := `{"runner_id":` + jsonString(runnerID) + `,"lease_token":` + jsonString("build-token") + `,"lease_generation":1,"status":"success"}`
+	if w := doJSON(t, s, http.MethodPost, "/api/v1/jobs/"+buildID+"/complete", "token", complete); w.Code != http.StatusNoContent {
+		t.Fatalf("complete = %d: %s", w.Code, w.Body.String())
+	}
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/"+runnerID+"/next", "token", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("consumer lease = %d: %s", w.Code, w.Body.String())
+	}
+	var consumerTask Task
+	if err := json.Unmarshal(w.Body.Bytes(), &consumerTask); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	runID := s.jobs[buildID].RunID
+	s.mu.Unlock()
+	dir := filepath.Join(s.store.Root, "artifacts", runID, buildID)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read artifact dir: %v", err)
+	}
+	artifactPath := ""
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tar.gz") {
+			artifactPath = filepath.Join(dir, e.Name())
+		}
+	}
+	if artifactPath == "" {
+		t.Fatal("artifact file not found on disk")
+	}
+	return s, consumerTask.Job.ID, leaseHeaders(consumerTask, runnerID), artifactPath
+}
+
+// integrityFailureCount sums the download-integrity counter across labels.
+func integrityFailureCount(s *Server) float64 {
+	s.Metrics.mu.Lock()
+	defer s.Metrics.mu.Unlock()
+	var got float64
+	for _, v := range s.Metrics.counters[metricDownloadIntegrityFailures] {
+		got += v
+	}
+	return got
+}
+
+// TestDependencyDownloadValidByteIdentical proves the integrity path does not
+// alter a valid dependency download.
+func TestDependencyDownloadValidByteIdentical(t *testing.T) {
+	s, jobID, hdrs, _ := downloadDependencyFixture(t)
+	before := integrityFailureCount(s)
+	w := doJSONHeaders(t, s, http.MethodGet, "/api/v1/jobs/"+jobID+"/dependencies/build/bin", "token", "", hdrs)
+	if w.Code != http.StatusOK {
+		t.Fatalf("valid download = %d: %s", w.Code, w.Body.String())
+	}
+	if w.Body.String() != "the-binary" {
+		t.Fatalf("download body = %q, want the-binary", w.Body.String())
+	}
+	if got := integrityFailureCount(s); got != before {
+		t.Fatalf("valid download incremented the integrity metric: %v != %v", got, before)
+	}
+}
+
+// TestDependencyDownloadShortBodyAborts is the regression: a backend that
+// returns FEWER bytes than the record advertises must not be served as a
+// successful download. The preverify path serves nothing and meters it.
+func TestDependencyDownloadShortBodyAborts(t *testing.T) {
+	s, jobID, hdrs, path := downloadDependencyFixture(t)
+	if err := os.WriteFile(path, []byte("the-"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before := integrityFailureCount(s)
+	w := doJSONHeaders(t, s, http.MethodGet, "/api/v1/jobs/"+jobID+"/dependencies/build/bin", "token", "", hdrs)
+	if w.Code == http.StatusOK {
+		t.Fatalf("short dependency body served a 200 with %d bytes", w.Body.Len())
+	}
+	if got := integrityFailureCount(s); got != before+1 {
+		t.Fatalf("integrity metric = %v, want %v", got, before+1)
+	}
+	if bytes.Contains(w.Body.Bytes(), []byte("the-")) {
+		t.Fatal("response body contains the truncated dependency bytes")
+	}
+}
+
+// TestDependencyDownloadOversizedBodyAborts proves a body LONGER than the
+// record advertises is refused and metered rather than streamed.
+func TestDependencyDownloadOversizedBodyAborts(t *testing.T) {
+	s, jobID, hdrs, path := downloadDependencyFixture(t)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("EXTRA"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before := integrityFailureCount(s)
+	w := doJSONHeaders(t, s, http.MethodGet, "/api/v1/jobs/"+jobID+"/dependencies/build/bin", "token", "", hdrs)
+	if w.Code == http.StatusOK {
+		t.Fatalf("oversized dependency body served a 200 with %d bytes", w.Body.Len())
+	}
+	if got := integrityFailureCount(s); got != before+1 {
+		t.Fatalf("integrity metric = %v, want %v", got, before+1)
+	}
+}
+
+// TestDependencyDownloadDigestMismatchAborts proves a same-length but
+// different-content body is refused and metered rather than served.
+func TestDependencyDownloadDigestMismatchAborts(t *testing.T) {
+	s, jobID, hdrs, path := downloadDependencyFixture(t)
+	orig, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong := append([]byte(nil), orig...)
+	for i := range wrong {
+		if i < len(wrong)-1 {
+			wrong[i] = 'Z'
+		}
+	}
+	if err := os.WriteFile(path, wrong, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before := integrityFailureCount(s)
+	w := doJSONHeaders(t, s, http.MethodGet, "/api/v1/jobs/"+jobID+"/dependencies/build/bin", "token", "", hdrs)
+	if w.Code == http.StatusOK {
+		t.Fatalf("corrupt dependency body served a 200 with %d bytes", w.Body.Len())
+	}
+	if got := integrityFailureCount(s); got != before+1 {
+		t.Fatalf("integrity metric = %v, want %v", got, before+1)
+	}
+	if bytes.Contains(w.Body.Bytes(), wrong) {
+		t.Fatal("response body contains the corrupt dependency bytes")
 	}
 }

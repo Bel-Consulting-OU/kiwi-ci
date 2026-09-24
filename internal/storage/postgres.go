@@ -1610,7 +1610,7 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 		runnerDraining bool
 		activeJSON     []byte
 	)
-	err = tx.QueryRow(ctx, `SELECT payload, capacity, disabled, draining, COALESCE(active_jobs, '[]'::jsonb) FROM runners WHERE id=$1 FOR UPDATE`, claim.RunnerID).
+	err = tx.QueryRow(ctx, `SELECT payload, capacity, (disabled OR COALESCE(payload->>'disabled','false') = 'true') AS disabled, (draining OR COALESCE(payload->>'draining','false') = 'true') AS draining, COALESCE(active_jobs, '[]'::jsonb) FROM runners WHERE id=$1 FOR UPDATE`, claim.RunnerID).
 		Scan(&runnerPayload, &runnerCapacity, &runnerDisabled, &runnerDraining, &activeJSON)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return model.Job{}, ErrNoCapacity
@@ -1717,7 +1717,7 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 	// re-asserts the admin state and the capacity bound. Keeping the capacity
 	// comparison in SQL means a peer transaction can never overrun the count
 	// between the Go decision and the append.
-	ct, err := tx.Exec(ctx, `UPDATE runners SET active_jobs = COALESCE(active_jobs, '[]'::jsonb) || to_jsonb($1::text), busy = TRUE, current_job = CASE WHEN COALESCE(current_job, '') = '' THEN $1 ELSE current_job END, last_seen = now() WHERE id = $2 AND disabled = FALSE AND draining = FALSE AND $3 > 0 AND jsonb_array_length(COALESCE(active_jobs, '[]'::jsonb)) < $3`,
+	ct, err := tx.Exec(ctx, `UPDATE runners SET active_jobs = COALESCE(active_jobs, '[]'::jsonb) || to_jsonb($1::text), busy = TRUE, current_job = CASE WHEN COALESCE(current_job, '') = '' THEN $1 ELSE current_job END, last_seen = now() WHERE id = $2 AND disabled = FALSE AND draining = FALSE AND COALESCE(payload->>'disabled','false') <> 'true' AND COALESCE(payload->>'draining','false') <> 'true' AND $3 > 0 AND jsonb_array_length(COALESCE(active_jobs, '[]'::jsonb)) < $3`,
 		claim.JobID, claim.RunnerID, capacity)
 	if err != nil {
 		return model.Job{}, err
@@ -2072,7 +2072,7 @@ func (s *PostgresStore) requiredArtifactMissingTx(ctx context.Context, tx pgx.Tx
 			continue
 		}
 		var exists bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM artifacts WHERE job_id=$1 AND job_generation=$2 AND name=$3)`, jobID, generation, name).Scan(&exists); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM artifacts WHERE job_id=$1 AND COALESCE(NULLIF(job_generation,0), CASE WHEN jsonb_typeof(payload->'lease_generation')='number' AND (payload->>'lease_generation') ~ '^[0-9]{1,18}$' THEN (payload->>'lease_generation')::bigint ELSE 0 END) = $2 AND name=$3)`, jobID, generation, name).Scan(&exists); err != nil {
 			return "", err
 		}
 		if !exists {
@@ -3100,7 +3100,7 @@ func (s *PostgresStore) InsertArtifactOnce(ctx context.Context, a model.Artifact
 // artifactByGenerationKey reads the artifact row under the idempotency key.
 func (s *PostgresStore) artifactByGenerationKey(ctx context.Context, jobID string, generation int64, name string) (model.ArtifactRecord, error) {
 	var payload []byte
-	err := s.pool.QueryRow(ctx, `SELECT payload FROM artifacts WHERE job_id=$1 AND job_generation=$2 AND name=$3 LIMIT 1`,
+	err := s.pool.QueryRow(ctx, `SELECT payload FROM artifacts WHERE job_id=$1 AND COALESCE(NULLIF(job_generation,0), CASE WHEN jsonb_typeof(payload->'lease_generation')='number' AND (payload->>'lease_generation') ~ '^[0-9]{1,18}$' THEN (payload->>'lease_generation')::bigint ELSE 0 END) = $2 AND name=$3 LIMIT 1`,
 		jobID, generation, name).Scan(&payload)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return model.ArtifactRecord{}, ErrNotFound

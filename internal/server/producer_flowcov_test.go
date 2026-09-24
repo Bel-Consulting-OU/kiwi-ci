@@ -154,8 +154,9 @@ func TestFlowProducerDownloadSuccessAndWriteFailure(t *testing.T) {
 		t.Fatal("missing producer header")
 	}
 
-	// A response writer that fails mid-stream must not panic; the handler
-	// only logs the copy failure.
+	// A response writer that fails mid-stream must abort the handler: the
+	// integrity copy path panics with http.ErrAbortHandler so the connection
+	// is closed instead of silently completing a truncated response.
 	r := httptest.NewRequest(http.MethodGet, "/api/v1/jobs/"+jobID+"/dependencies/build/bin", nil)
 	r.SetPathValue("id", jobID)
 	r.SetPathValue("producer", "build")
@@ -164,7 +165,16 @@ func TestFlowProducerDownloadSuccessAndWriteFailure(t *testing.T) {
 	r.Header.Set("X-Kiwi-Lease-Token", "cache-lease-token")
 	r.Header.Set("X-Kiwi-Lease-Generation", "5")
 	fw := &fcFailWriter{limit: 0}
-	s.downloadDependency(fw, r)
+	func() {
+		defer func() {
+			rec := recover()
+			err, ok := rec.(error)
+			if rec == nil || !ok || !errors.Is(err, http.ErrAbortHandler) {
+				t.Fatalf("write-failure download panic = %v, want http.ErrAbortHandler", rec)
+			}
+		}()
+		s.downloadDependency(fw, r)
+	}()
 	if got := fw.Header().Get("X-Kiwi-Producer-Job"); got != "build" {
 		t.Fatalf("write-failure download did not reach the copy stage: header %q", got)
 	}

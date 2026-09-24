@@ -257,6 +257,9 @@ func TestBuildBlobStoreS3(t *testing.T) {
 		S3PathStyle: true,
 		S3AccessKey: "ak",
 		S3SecretKey: "sk",
+		// The fixture points at a plaintext local endpoint; the store requires
+		// an explicit acknowledgement because the transport uses UNSIGNED-PAYLOAD.
+		S3AllowPlaintext: true,
 	}
 	store := buildBlobStore(cfg, "")
 	s3, ok := store.(*blob.S3)

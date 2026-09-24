@@ -77,7 +77,7 @@ func TestMaskMultiLargeLineTimeBound(t *testing.T) {
 	line := strings.Repeat("lorem ipsum dolor sit amet ", 400000) // ~10.8 MiB
 	start := time.Now()
 	out := m.MaskMulti(line)
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
+	if elapsed := time.Since(start); elapsed > maskMultiTimeBound() {
 		t.Fatalf("MaskMulti of 10 MiB took %v", elapsed)
 	}
 	if out != line {

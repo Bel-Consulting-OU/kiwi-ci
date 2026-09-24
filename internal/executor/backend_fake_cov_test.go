@@ -130,13 +130,13 @@ eval "$cmd"
 // constant, so a test cannot choose an ephemeral port without a production
 // seam; the helper fails closed instead of skipping when the port is
 // occupied, so the StartJob bootstrap contract never silently stops running.
-func listenTartAgentBootstrap(t *testing.T) net.Listener {
+func listenTartAgentBootstrap(t *testing.T) (net.Listener, int) {
 	t.Helper()
-	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", tartAgentPort))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("cannot bind the production tart-agent bootstrap port %d: %v (an external process holds it)", tartAgentPort, err)
+		t.Fatalf("cannot bind an ephemeral tart-agent bootstrap port: %v", err)
 	}
-	return ln
+	return ln, ln.Addr().(*net.TCPAddr).Port
 }
 
 // installFakeBins writes the fake bin scripts and prepends them to PATH.
@@ -596,7 +596,7 @@ func TestTartBackendStartJobViaFakes(t *testing.T) {
 	installFakeBins(t)
 	ws := t.TempDir()
 	// A local kiwi-agent on the production bootstrap port accepts the key.
-	ln := listenTartAgentBootstrap(t)
+	ln, agentPort := listenTartAgentBootstrap(t)
 	agent := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != tartAgentKeyPath || r.Method != http.MethodPost {
 			http.NotFound(w, r)
@@ -607,7 +607,7 @@ func TestTartBackendStartJobViaFakes(t *testing.T) {
 	go func() { _ = agent.Serve(ln) }()
 	t.Cleanup(func() { _ = agent.Close() })
 	t.Setenv("FAKE_TART_RUN_SLEEP", "1")
-	b := &TartBackend{VM: "ghcr.io/x/vm:latest", Resources: pipeline.Resources{CPU: 2, Memory: 1 << 30, Disk: 1 << 20}}
+	b := &TartBackend{VM: "ghcr.io/x/vm:latest", AgentPort: agentPort, Resources: pipeline.Resources{CPU: 2, Memory: 1 << 30, Disk: 1 << 20}}
 	var emitted []string
 	if err := b.StartJob(context.Background(), ws, func(s string) { emitted = append(emitted, s) }); err != nil {
 		t.Fatalf("tart StartJob: %v", err)

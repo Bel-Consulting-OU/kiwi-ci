@@ -126,14 +126,14 @@ func TestRunJobTartFullPath(t *testing.T) {
 	installFakeBins(t)
 	ws := canonicalTempDir(t)
 	t.Setenv("FAKE_WS", ws)
-	ln := listenTartAgentBootstrap(t)
+	ln, agentPort := listenTartAgentBootstrap(t)
 	agent := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})}
 	go func() { _ = agent.Serve(ln) }()
 	t.Cleanup(func() { _ = agent.Close() })
 	t.Setenv("FAKE_TART_RUN_SLEEP", "1")
-	ex := &Executor{Opt: Options{Workspace: ws, RunID: "r"}, Masker: &secrets.Masker{}}
+	ex := &Executor{Opt: Options{Workspace: ws, RunID: "r", TartAgentPort: agentPort}, Masker: &secrets.Masker{}}
 	res := ex.runJob(context.Background(), &pipeline.Spec{}, pipeline.CompiledJob{
 		ID: "tj", Job: pipeline.Job{
 			Runtime: "tart", VM: "ghcr.io/x/macos:latest", Resources: pipeline.Resources{CPU: 2},

@@ -2,10 +2,13 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -140,6 +143,46 @@ func (s *Server) maybeRunCASGC(ctx context.Context, now time.Time) {
 // older than the age floor, under the HA lease and the batch bound. It
 // returns the observed statistics; an error means nothing further was
 // deleted (the collector fails closed).
+// verifyCASObjectContent streams the stored object and compares its SHA-256
+// with the digest the garbage collector enumerated, so a replaced or corrupted
+// object is never unlinked. It returns an error when the content cannot be
+// verified; callers treat that as "skip, do not delete".
+func verifyCASObjectContent(ctx context.Context, store blob.Store, key, enumerated, backendSHA string) error {
+	want := enumerated
+	if want == "" || !looksLikeSHA256Hex(want) {
+		want = backendSHA
+	}
+	if want == "" || !looksLikeSHA256Hex(want) {
+		return fmt.Errorf("no verifiable digest for %q (enumerated %q, backend %q)", key, enumerated, backendSHA)
+	}
+	rc, _, err := store.Open(ctx, key)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rc.Close() }()
+	h := sha256.New()
+	if _, err := io.Copy(h, rc); err != nil {
+		return fmt.Errorf("hash %q: %w", key, err)
+	}
+	got := hex.EncodeToString(h.Sum(nil))
+	if got != strings.ToLower(want) {
+		return fmt.Errorf("content digest mismatch for %q: got %s want %s", key, got, want)
+	}
+	return nil
+}
+
+func looksLikeSHA256Hex(v string) bool {
+	if len(v) != 64 {
+		return false
+	}
+	for _, c := range v {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Server) runCASGC(ctx context.Context, opts casGCOptions) (casGCStats, error) {
 	var stats casGCStats
 	store := s.BlobStore
@@ -228,6 +271,19 @@ func (s *Server) runCASGC(ctx context.Context, opts casGCOptions) (casGCStats, e
 				freshStat = got
 			}
 			if freshStat.ModTime.IsZero() || !freshStat.ModTime.Before(cutoff) {
+				return nil
+			}
+			// Re-verify the object's CONTENT digest immediately before the
+			// unlink. A concurrent publisher that replaced the object after
+			// our reference re-read would otherwise have its live object
+			// deleted; comparing the bytes we are about to remove against the
+			// digest we enumerated catches that. An object whose digest cannot
+			// be verified from content is never deleted.
+			if err := verifyCASObjectContent(ctx, store, obj.Key, digest, obj.SHA256); err != nil {
+				if errors.Is(err, blob.ErrNotFound) {
+					return nil
+				}
+				s.logError("cas gc: skipping unverifiable object", "key", obj.Key, "digest", digest, "error", err.Error())
 				return nil
 			}
 			if err := store.Delete(ctx, obj.Key); err != nil {

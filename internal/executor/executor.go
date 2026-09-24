@@ -85,6 +85,10 @@ type Options struct {
 	// escape hatch (KIWI_ALLOW_UNQUOTAED_UNTRUSTED_DISK) cover trusted-only
 	// self-hosted setups.
 	RequireUntrustedDiskQuota bool
+	// TartAgentPort overrides the guest kiwi-agent bootstrap port for Tart
+	// jobs. Zero keeps the production default. Tests set an ephemeral port so
+	// they never collide with an external process.
+	TartAgentPort int
 	// WorkspaceQuota carries the outcome of a hard workspace quota attempt
 	// the caller already performed BEFORE the workspace was populated (the
 	// distributed runner installs the bound before checkout, so an untrusted
@@ -503,6 +507,9 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		b.CgroupParent = cgroupParent
 	case *TartBackend:
 		b.RequireImmutableImages = e.Opt.RequireImmutableImages
+		if e.Opt.TartAgentPort > 0 {
+			b.AgentPort = e.Opt.TartAgentPort
+		}
 		b.Resources = cj.Job.Resources
 	case *NativeBackend:
 		// The native runtime has no container boundary to apply resource
