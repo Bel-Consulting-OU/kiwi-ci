@@ -92,6 +92,7 @@ func CreateFileCAS(path string, data []byte, mode os.FileMode) error {
 		pf, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
 		if err != nil {
 			if os.IsExist(err) {
+				_ = os.Remove(tmp)
 				return os.ErrExist
 			}
 			_ = os.Remove(tmp)
@@ -119,10 +120,10 @@ func CreateFileCAS(path string, data []byte, mode os.FileMode) error {
 			return published(PhaseClose, fmt.Errorf("close %s: %w", path, err))
 		}
 	} else if err := os.Link(tmp, path); err != nil {
+		_ = os.Remove(tmp)
 		if os.IsExist(err) {
 			return os.ErrExist
 		}
-		_ = os.Remove(tmp)
 		return prePublish(PhaseRename, fmt.Errorf("link %s to %s: %w", tmp, path, err))
 	}
 	// The temp file is no longer needed (unix: the link made a second name;

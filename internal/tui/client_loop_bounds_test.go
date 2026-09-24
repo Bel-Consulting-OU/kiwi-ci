@@ -14,11 +14,11 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
-// Probe 1 (fixed): Run()'s initial page loop must advance `after` from EVERY
+// Run()'s initial page loop must advance `after` from EVERY
 // entry, not only the entries the active job filter keeps. The pre-fix code
 // left `after` at 0 after a full page of non-matching entries, so the same
 // page was re-fetched forever and the TUI never reached the next page.
-func TestAuditRunNonMatchingFullPageAdvances(t *testing.T) {
+func TestRunNonMatchingFullPageAdvances(t *testing.T) {
 	page := make([]model.LogEntry, 1000)
 	for i := range page {
 		page[i] = model.LogEntry{Seq: int64(i + 1), JobKey: "other", Step: "s", Line: "x"}
@@ -57,10 +57,10 @@ type ioDiscard struct{}
 
 func (ioDiscard) Write(p []byte) (int, error) { return len(p), nil }
 
-// Probe 2 (fixed): chunkReader.readLine must bound the line it buffers. A
+// chunkReader.readLine must bound the line it buffers. A
 // hostile SSE peer that streams bytes without a newline now gets a typed
 // error past the cap instead of an unbounded allocation.
-func TestAuditChunkReaderLineBounded(t *testing.T) {
+func TestChunkReaderLineBounded(t *testing.T) {
 	r := &auditOneShot{buf: make([]byte, 4<<20), err: errEOFAfter}
 	for i := range r.buf {
 		r.buf[i] = 'a'
@@ -97,9 +97,9 @@ func (o *auditOneShot) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// Probe 3 (cleared): redirects during log reads are refused rather than
+// Redirects during log reads are refused rather than
 // followed with the bearer token.
-func TestAuditLogRedirectRefused(t *testing.T) {
+func TestLogReadRedirectRefused(t *testing.T) {
 	var targetHits int64
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&targetHits, 1)

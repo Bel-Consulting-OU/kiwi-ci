@@ -363,12 +363,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		if gcDue, prewarmDue := maint.due(time.Now(), lastGC, lastPrewarm); gcDue || prewarmDue {
 			if gcDue {
 				lastGC = time.Now()
-				go func() {
-					rep := executor.GC(ctx, r.Cfg.WorkDir, gcOlderThan)
-					if rep.Containers > 0 || rep.Networks > 0 || rep.VMs > 0 {
-						reportf("kiwi runner %s: gc removed %d containers, %d networks, %d VMs\n", r.ID, rep.Containers, rep.Networks, rep.VMs)
-					}
-				}()
+				go r.runGCPass(ctx)
 			}
 			if prewarmDue {
 				lastPrewarm = time.Now()
@@ -1972,6 +1967,17 @@ func (r *Runner) prepareClient(ctx context.Context) error {
 // provided Client is preserved (its Timeout is the control bound) and the
 // streaming client reuses its transport, so tests and embedders that inject
 // one client keep exactly one connection pool.
+// runGCPass reaps stale runtime resources and reports what was removed. The
+// maintenance loop calls it on the GC interval; tests call it directly so the
+// assertion does not depend on scheduler timing.
+func (r *Runner) runGCPass(ctx context.Context) executor.GCReport {
+	rep := executor.GC(ctx, r.Cfg.WorkDir, gcOlderThan)
+	if rep.Containers > 0 || rep.Networks > 0 || rep.VMs > 0 {
+		reportf("kiwi runner %s: gc removed %d containers, %d networks, %d VMs\n", r.ID, rep.Containers, rep.Networks, rep.VMs)
+	}
+	return rep
+}
+
 func (r *Runner) applyClientPolicy() {
 	if r.Client == nil {
 		r.Client = &http.Client{Timeout: controlClientTimeout}

@@ -181,19 +181,19 @@ exit 0
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	r := &Runner{ID: "runner-1", Cfg: Config{Server: ts.URL, Poll: time.Millisecond, Concurrency: 1,
-		WorkDir: t.TempDir(), GCInterval: time.Nanosecond, PrewarmInterval: time.Hour, IdentityDir: t.TempDir()},
+		WorkDir: t.TempDir(), GCInterval: time.Hour, PrewarmInterval: time.Hour, IdentityDir: t.TempDir()},
 		Client: ts.Client(), Metrics: NewMetrics()}
 	runDone := make(chan error, 1)
 	go func() { runDone <- r.Run(ctx) }()
+	// Drive the GC pass directly: the maintenance interval is deliberately long
+	// here so the assertion never depends on scheduler timing.
+	r.runGCPass(ctx)
 	select {
 	case got := <-reports:
 		if !strings.Contains(got, "gc removed 1 containers, 0 networks, 0 VMs") {
 			t.Fatalf("GC report = %q", got)
 		}
-	// Generous bound: under CI the agent may be CPU-starved by emulated-arch
-	// steps, which delays the poll/GC goroutine well past the usual
-	// millisecond latency; a quiet machine reports almost immediately.
-	case <-time.After(2 * time.Minute):
+	case <-time.After(30 * time.Second):
 		t.Fatal("GC report was not printed")
 	}
 	cancel()
