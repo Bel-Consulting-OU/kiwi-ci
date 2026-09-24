@@ -239,6 +239,15 @@ if [ "$SNAPSHOT" = "1" ]; then
 	fi
 	BRANCH="$(git symbolic-ref --short -q HEAD 2>/dev/null || echo detached)"
 	BASE_VERSION="${VERSION:-0.1.0-dev}"
+	# VERSION is embedded in -ldflags below. A caller-supplied value carrying
+	# whitespace, quotes or an extra `-X ...` pair would be whitespace-split by
+	# cmd/go into an attacker-controlled linker argument. Apply the same
+	# charset rule the Dockerfile enforces (VERSION in [A-Za-z0-9._+-]).
+	case "$BASE_VERSION" in
+	"" | *[!A-Za-z0-9._+-]*)
+		die "snapshot VERSION '$BASE_VERSION' must match [A-Za-z0-9._+-] (no whitespace, quotes or extra linker flags)"
+		;;
+	esac
 	VERSION="${BASE_VERSION}-snapshot+${SHORT_SHA}"
 	if [ "$DIRTY" = "true" ]; then
 		VERSION="${VERSION}.dirty"
@@ -324,6 +333,21 @@ else
 		esac
 	fi
 fi
+
+# Final defense in depth before interpolation: every value embedded in
+# LDFLAGS must be whitespace-free so cmd/go cannot split it into additional
+# linker arguments. VERSION/COMMIT/BUILD_DATE are validated on their own
+# paths above; this check catches any future mode that forgets to.
+case "$VERSION" in
+"" | *[!A-Za-z0-9._+-]*)
+	die "VERSION '$VERSION' must match [A-Za-z0-9._+-] before it is embedded in the linker flags"
+	;;
+esac
+case "$COMMIT" in
+"" | *[!0-9a-f]*)
+	die "COMMIT '$COMMIT' must be lowercase hex before it is embedded in the linker flags"
+	;;
+esac
 
 LDFLAGS="-X github.com/Bel-Consulting-OU/kiwi-ci/internal/version.Version=$VERSION \
 -X github.com/Bel-Consulting-OU/kiwi-ci/internal/version.Commit=$COMMIT \
@@ -415,11 +439,19 @@ else
 fi
 (
 	cd "$OUT"
-	: >SHA256SUMS
+	# Hash to a temp file first, then sort separately. A
+	# `for ...; done | sort >SHA256SUMS` pipeline reports sort's status and
+	# would swallow a hash_cmd failure, silently publishing an incomplete
+	# bundle; with the loop redirected to a file, `set -e` aborts the release
+	# on the first failed hash. (release.sh runs under POSIX sh/dash, where
+	# `set -o pipefail` is not available.)
 	for f in *; do
-		[ "$f" = "SHA256SUMS" ] && continue
+		if [ "$f" = "SHA256SUMS" ]; then
+			continue
+		fi
 		hash_cmd "$f"
-	done | LC_ALL=C sort -k2 >SHA256SUMS
+	done >"$TMP_DIR/SHA256SUMS.unsorted"
+	LC_ALL=C sort -k2 "$TMP_DIR/SHA256SUMS.unsorted" >SHA256SUMS
 )
 
 echo "release: bundle at $OUT"

@@ -471,6 +471,12 @@ func TestComposeGCIntegrityMismatchAfterPutLeavesNoDanglingReference(t *testing.
 // deletions) run against two continuous collectors with a hostile age floor,
 // and every acknowledged publication must remain resolvable afterwards.
 func TestComposeGCConcurrentPublishersStress(t *testing.T) {
+	// The stress scenario deliberately publishes far more snapshots than the
+	// production per-job retention cap allows, so disable the cap here; the
+	// cap itself is covered by TestSnapshotPerJobCapRejectsWithoutStaging.
+	prevCap := snapshotMaxPerJob
+	SetSnapshotMaxPerJob(0)
+	t.Cleanup(func() { SetSnapshotMaxPerJob(prevCap) })
 	s, f, _ := composeGCWorld(t)
 	hdrs := composeSeedLeasedJob(t, s, f, "job-stress", "runner-stress")
 	archive, _ := snapshotArchive(t)

@@ -48,22 +48,37 @@ func TestLimiterRetryAfterBranches(t *testing.T) {
 	}
 }
 
-func TestLimiterSweepEvictsIdleFullBuckets(t *testing.T) {
+// TestLimiterHardCapEvictsLRU pins the G2-A regression: a flood of distinct
+// keys keeps the bucket map hard-capped at maxBuckets (it never grows to 4x or
+// beyond as the old idle-only sweep allowed), the most recently used keys
+// survive, and each Allow call stays O(1).
+func TestLimiterHardCapEvictsLRU(t *testing.T) {
 	l := New(1, 1)
-	old := time.Now().Add(-2 * time.Minute)
-	for i := 0; i <= maxBuckets; i++ {
-		l.buckets[fmt.Sprintf("k%d", i)] = &bucket{tokens: 1, last: old}
+	total := maxBuckets * 4
+	for i := 0; i < total; i++ {
+		l.Allow(fmt.Sprintf("k%d", i))
 	}
-	l.buckets["fresh"] = &bucket{tokens: 0, last: time.Now()}
-	l.Allow("trigger")
-	if len(l.buckets) >= maxBuckets {
-		t.Fatalf("sweep did not evict idle buckets: %d remain", len(l.buckets))
+	if got := len(l.buckets); got > maxBuckets {
+		t.Fatalf("bucket map = %d, want <= %d", got, maxBuckets)
 	}
-	if _, ok := l.buckets["fresh"]; !ok {
-		t.Fatal("sweep must keep buckets that are not at full capacity")
+	if got := l.Len(); got != len(l.buckets) {
+		t.Fatalf("Len = %d, map = %d", got, len(l.buckets))
+	}
+	// The most recently inserted key is resident; the oldest are evicted.
+	if _, ok := l.buckets[fmt.Sprintf("k%d", total-1)]; !ok {
+		t.Fatal("most-recently-used bucket evicted")
 	}
 	if _, ok := l.buckets["k0"]; ok {
-		t.Fatal("sweep must drop idle full buckets")
+		t.Fatal("least-recently-used bucket survived the cap")
+	}
+	// Touching an old-but-resident key protects it from the next eviction.
+	old := fmt.Sprintf("k%d", total-maxBuckets)
+	l.Allow(old) // move to front
+	for i := 0; i < 10; i++ {
+		l.Allow(fmt.Sprintf("new%d", i))
+	}
+	if _, ok := l.buckets[old]; !ok {
+		t.Fatal("recently touched bucket evicted despite LRU order")
 	}
 }
 
@@ -81,9 +96,16 @@ func TestKeyFallbackBranches(t *testing.T) {
 	if got := Key(r); got != "ip:unknown" {
 		t.Fatalf("Key(empty RemoteAddr) = %q", got)
 	}
+	// A runner-tier path without a credential falls back to the IP, never
+	// the path-derived id.
 	r.RemoteAddr = "203.0.113.7:1"
 	r.URL.Path = "/api/v1/runners/runner-9/next"
-	if got := Key(r); got != "runner:runner-9" {
-		t.Fatalf("Key(runner path) = %q", got)
+	if got := Key(r); got != "ip:203.0.113.7" {
+		t.Fatalf("Key(runner path, no credential) = %q", got)
+	}
+	// A malformed Authorization scheme is not treated as a credential.
+	r.Header.Set("Authorization", "Token abc")
+	if got := Key(r); got != "ip:203.0.113.7" {
+		t.Fatalf("Key(non-bearer scheme) = %q", got)
 	}
 }

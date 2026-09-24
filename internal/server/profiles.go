@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
@@ -95,15 +96,23 @@ func (s *Server) upsertProfile(ctx context.Context, p model.RunnerProfile) error
 	prev, had := s.profiles[p.ID]
 	s.profiles[p.ID] = p
 	if perr := s.persistCheckedErrLocked("runner_profile.upsert"); perr != nil {
-		// Durability first: restore the previous profile (or remove the
-		// fresh entry) so the next successful persist cannot commit a
-		// profile the admin was told failed.
-		if had {
-			s.profiles[p.ID] = prev
-		} else {
-			delete(s.profiles, p.ID)
+		// Durability failure: wrap it so the handler answers 503 (the caller
+		// retries) instead of a 500. A pre-rename failure means the snapshot
+		// was definitely not published: restore the previous profile (or
+		// remove the fresh entry) so the next successful persist cannot
+		// commit a profile the admin was told failed. A post-rename
+		// directory-fsync failure (fsutil.Renamed) means the visible snapshot
+		// already holds the profile: retain it (readiness armed by the
+		// persist) so memory matches the file and a later persist cannot
+		// erase it.
+		if !fsutil.Renamed(perr) {
+			if had {
+				s.profiles[p.ID] = prev
+			} else {
+				delete(s.profiles, p.ID)
+			}
 		}
-		return perr
+		return notDurable(perr)
 	}
 	return nil
 }
@@ -247,6 +256,11 @@ func (s *Server) createRunnerProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.upsertProfile(r.Context(), in); err != nil {
+		// A durability failure is not a client error: fail closed with 503
+		// so the caller retries instead of treating the profile as rejected.
+		if s.respondNotDurableError(w, r, err) {
+			return
+		}
 		s.internalError(w, r, err, "")
 		return
 	}
@@ -316,6 +330,11 @@ func (s *Server) updateRunnerProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.upsertProfile(r.Context(), in); err != nil {
+		// A durability failure is not a client error: fail closed with 503
+		// so the caller retries instead of treating the profile as rejected.
+		if s.respondNotDurableError(w, r, err) {
+			return
+		}
 		s.internalError(w, r, err, "")
 		return
 	}

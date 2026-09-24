@@ -38,6 +38,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -116,32 +117,16 @@ func (s *PostgresStore) InsertTestReportWithHistoryDelivery(ctx context.Context,
 	if err != nil {
 		return TestReportInsertOutcome{}, err
 	}
-	if version == 0 {
-		// Upgrade bridge: fold the repository's pre-aggregate durable reports
-		// ONCE before the new report, exactly like the non-delivery path.
-		if err := rebuildRepoTestHistoryTx(ctx, tx, repoID); err != nil {
-			return TestReportInsertOutcome{}, err
-		}
-	}
 	if err := insertTestReportRowsTx(ctx, tx, rep); err != nil {
 		return TestReportInsertOutcome{}, err
 	}
-	for _, c := range rep.Cases {
-		// Skip policy (one rule for every fold path): a skipped case is NOT
-		// a pass/fail observation. JUnit marks it Passed=false plus
-		// Skipped=true, so folding it would record a failure the test never
-		// had and poison Fails, LastFailure, the 16-outcome window and
-		// FlakeProb. Skipped cases contribute nothing to the historical
-		// counters; the report's own Tests/Failures/Errors/Skipped totals
-		// still describe the run.
-		if c.Skipped {
-			continue
-		}
-		if err := foldTestHistoryTx(ctx, tx, repoID, TestHistoryEntry{
-			Suite: rep.JobKey, Class: c.Class, Name: c.Name, Duration: c.Duration, Passed: c.Passed, When: rep.CreatedAt,
-		}); err != nil {
-			return TestReportInsertOutcome{}, err
-		}
+	// Fold the new report in (created_at,id) order, rebuilding the repository
+	// when the new report is not its canonical newest. The rebuild folds the
+	// report too (it reads every durable report for the repository), so the
+	// two branches are mutually exclusive and the resulting aggregates always
+	// equal a rebuild.
+	if err := foldOrRebuildTestReportTx(ctx, tx, repoID, version, rep); err != nil {
+		return TestReportInsertOutcome{}, err
 	}
 	version, err = bumpTestHistoryVersionTx(ctx, tx, repoID)
 	if err != nil {
@@ -180,4 +165,58 @@ func claimTestReportDeliveryTx(ctx context.Context, tx pgx.Tx, delivery TestRepo
 		return false, "", fmt.Errorf("%w: job %s generation %d delivery %s", ErrTestReportDeliveryConflict, delivery.JobID, delivery.LeaseGeneration, delivery.DeliveryID)
 	}
 	return false, storedReportID, nil
+}
+
+// foldOrRebuildTestReportTx folds the just-inserted report into the
+// repository's aggregates while preserving the (created_at,id) fold order the
+// rebuild uses. version is the repository's locked history version observed
+// before the insert (0 = pre-aggregate repository, so the durable reports
+// were never folded). The report is folded incrementally only when it is the
+// repository's canonical NEWEST report; otherwise (version 0, or an
+// out-of-order commit whose created_at/id precedes an already-folded report)
+// the repository is rebuilt from its durable reports in (created_at,id) order.
+// Both branches read/replace the same rows, so an incremental history can no
+// longer drift from a repaired or restarted one.
+func foldOrRebuildTestReportTx(ctx context.Context, tx pgx.Tx, repoID string, version int64, rep model.TestReport) error {
+	if version == 0 {
+		return rebuildRepoTestHistoryTx(ctx, tx, repoID)
+	}
+	outOfOrder, err := hasNewerTestReportTx(ctx, tx, repoID, rep.CreatedAt, rep.ID)
+	if err != nil {
+		return err
+	}
+	if outOfOrder {
+		return rebuildRepoTestHistoryTx(ctx, tx, repoID)
+	}
+	for _, c := range rep.Cases {
+		// Skip policy (one rule for every fold path): a skipped case is NOT
+		// a pass/fail observation. JUnit marks it Passed=false plus
+		// Skipped=true, so folding it would record a failure the test never
+		// had and poison Fails, LastFailure, the 16-outcome window and
+		// FlakeProb. Skipped cases contribute nothing to the historical
+		// counters; the report's own Tests/Failures/Errors/Skipped totals
+		// still describe the run.
+		if c.Skipped {
+			continue
+		}
+		if err := foldTestHistoryTx(ctx, tx, repoID, TestHistoryEntry{
+			Suite: rep.JobKey, Class: c.Class, Name: c.Name, Duration: c.Duration, Passed: c.Passed, When: rep.CreatedAt,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// hasNewerTestReportTx reports whether repoID already holds a durable report
+// that sorts AFTER (createdAt, id) under the canonical (created_at,id) order
+// the rebuild uses. Such a report proves the new one is out of order, so the
+// incremental fold must fall back to a rebuild. The repository predicate is
+// the SAME canonical policy-first identity expression the rebuild and every
+// scoped read use, so a pre-RepoID report is compared too.
+func hasNewerTestReportTx(ctx context.Context, tx pgx.Tx, repoID string, createdAt time.Time, id string) (bool, error) {
+	var newer bool
+	err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM test_results tr JOIN runs r ON r.id = tr.run_id WHERE `+canonicalPolicyRepoIDSQLExprOn("r.payload", "repo")+` = $1 AND (tr.created_at, tr.id) > ($2, $3))`,
+		repoID, createdAt, id).Scan(&newer)
+	return newer, err
 }

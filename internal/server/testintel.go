@@ -164,7 +164,7 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 	// or is refused as a conflict). The digest conflict is detected by
 	// comparing the client-authored report content, because there is no
 	// delivery table to hold the digest.
-	rep.ID = testintel.DeliveryReportID(delivery.DeliveryID)
+	rep.ID = testintel.DeliveryReportID(delivery.JobID, delivery.LeaseGeneration, delivery.DeliveryID)
 	s.mu.Lock()
 	if existing, ok := s.reports[rep.ID]; ok {
 		s.mu.Unlock()
@@ -259,11 +259,17 @@ func synthesizedReportDeliveryID(jobID string, leaseGeneration int64, contentDig
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// reportContentView is the client-authored part of a report. Server-assigned
-// fields (ID, run/job identity, CreatedAt) are deliberately excluded so a
-// replay of the same bytes compares equal even though the first delivery
-// stamped them.
+// reportContentView is the client-authored part of a report plus the
+// delivery-scoped job identity the server stamps. ID and CreatedAt are
+// deliberately excluded (the first delivery stamps them, so a replay of the
+// same bytes must still compare equal), but RunID and JobID are INCLUDED: two
+// deliveries that somehow map to one record with different job identities are
+// a conflict, never an idempotent replay. Together with the job/generation
+// scoping of the report ID, this makes the memory-mode conflict check agree
+// with the durable (job, generation, delivery ID) delivery key.
 type reportContentView struct {
+	RunID    string             `json:"run_id"`
+	JobID    string             `json:"job_id"`
 	Path     string             `json:"path"`
 	Tests    int                `json:"tests"`
 	Failures int                `json:"failures"`
@@ -278,8 +284,8 @@ type reportContentView struct {
 // reused delivery ID with different content must be refused, while an
 // identical replay is idempotent.
 func sameTestReportContent(a, b model.TestReport) bool {
-	ab, aerr := json.Marshal(reportContentView{Path: a.Path, Tests: a.Tests, Failures: a.Failures, Errors: a.Errors, Skipped: a.Skipped, Duration: a.Duration, Cases: a.Cases})
-	bb, berr := json.Marshal(reportContentView{Path: b.Path, Tests: b.Tests, Failures: b.Failures, Errors: b.Errors, Skipped: b.Skipped, Duration: b.Duration, Cases: b.Cases})
+	ab, aerr := json.Marshal(reportContentView{RunID: a.RunID, JobID: a.JobID, Path: a.Path, Tests: a.Tests, Failures: a.Failures, Errors: a.Errors, Skipped: a.Skipped, Duration: a.Duration, Cases: a.Cases})
+	bb, berr := json.Marshal(reportContentView{RunID: b.RunID, JobID: b.JobID, Path: b.Path, Tests: b.Tests, Failures: b.Failures, Errors: b.Errors, Skipped: b.Skipped, Duration: b.Duration, Cases: b.Cases})
 	return aerr == nil && berr == nil && bytes.Equal(ab, bb)
 }
 

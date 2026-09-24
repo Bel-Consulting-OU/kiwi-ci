@@ -3,9 +3,7 @@ package blob
 import (
 	"context"
 	"crypto/hmac"
-	"crypto/md5"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
 	"fmt"
@@ -13,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -23,6 +20,28 @@ import (
 )
 
 const emptyPayloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+// s3UnsignedPayload is the SigV4 payload-hash sentinel Put signs with. Put
+// streams the caller's reader straight to the endpoint and therefore cannot
+// hash the body before signing, so the body is sent as UNSIGNED-PAYLOAD
+// instead of being spooled into a full local copy first. The destination
+// hashes the streamed bytes while they are sent, so digest violations are
+// still detected, and TLS (required by AWS for UNSIGNED-PAYLOAD) protects the
+// bytes in transit.
+const s3UnsignedPayload = "UNSIGNED-PAYLOAD"
+
+// byteCounter counts the bytes read from an underlying reader; Put uses it to
+// enforce the advertised size exactly without buffering the payload.
+type byteCounter struct {
+	r io.Reader
+	n int64
+}
+
+func (c *byteCounter) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
 
 // s3RequestDeadlines bound requests whose caller context carries no
 // deadline, so a stalled S3 endpoint can never hang a request forever.
@@ -84,13 +103,6 @@ var s3Dialer = &net.Dialer{
 	Timeout:   10 * time.Second,
 	KeepAlive: 30 * time.Second,
 }
-
-// Test-only seams over the temp-file seek and reopen used by Put. Production
-// behavior is unchanged: the defaults are (*os.File).Seek and os.Open.
-var (
-	seekTemp        = (*os.File).Seek
-	openTempForRead = func(name string) (io.ReadCloser, error) { return os.Open(name) }
-)
 
 // s3Transport builds the default S3 HTTP transport with explicit
 // connection timeouts and idle limits: 10s dial, 90s idle connection
@@ -405,55 +417,30 @@ func (s *S3) Put(ctx context.Context, key string, r io.Reader, size int64) (Obje
 	}
 	ctx, cancel := withDeadline(ctx, s3PutTimeout)
 	defer cancel()
-	// Buffer to compute MD5 and SHA256 before sending; S3 PutObject requires
-	// the body hash for SigV4. The read is bounded to size+1 so a stream
-	// longer than the declared size is rejected instead of silently
-	// uploaded; short streams fail the exact-size check below.
-	tmp, err := os.CreateTemp("", "kiwi-s3-put-*")
-	if err != nil {
-		return Object{}, err
-	}
-	defer os.Remove(tmp.Name())
-	defer tmp.Close()
-	h := sha256.New()
-	m := md5.New()
-	n, err := io.Copy(io.MultiWriter(tmp, h, m), io.LimitReader(r, size+1))
-	if err != nil {
-		return Object{}, err
-	}
-	if n != size {
-		return Object{}, fmt.Errorf("blob: s3 put size mismatch: wrote %d bytes, expected %d", n, size)
-	}
-	if _, err := seekTemp(tmp, 0, io.SeekStart); err != nil {
-		return Object{}, err
-	}
-	digest := hex.EncodeToString(h.Sum(nil))
-	// Re-read the temp file to compute the exact request body hash for SigV4.
-	h2 := sha256.New()
-	tmp2, err := openTempForRead(tmp.Name())
-	if err != nil {
-		return Object{}, err
-	}
-	if _, err := io.Copy(h2, tmp2); err != nil {
-		tmp2.Close()
-		return Object{}, err
-	}
-	tmp2.Close()
-	bodyHash := hex.EncodeToString(h2.Sum(nil))
-
 	rawURL, err := s.objectURL(key)
 	if err != nil {
 		return Object{}, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, rawURL, tmp)
+	// Stream the payload straight to the endpoint: no full local copy is
+	// staged (the previous implementation spooled up to 8 GiB into the system
+	// temp directory just to hash it). The source is bounded to the declared
+	// size for the transfer, the destination hashes exactly the bytes sent,
+	// and one byte past the bound is probed afterwards so an over-long stream
+	// is rejected rather than silently truncated.
+	src := &byteCounter{r: r}
+	h := sha256.New()
+	body := io.TeeReader(io.LimitReader(src, size), h)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, rawURL, body)
 	if err != nil {
 		return Object{}, err
 	}
-	req.ContentLength = n
-	req.Header.Set("Content-MD5", base64.StdEncoding.EncodeToString(m.Sum(nil)))
-	s.sign(req, bodyHash, time.Now().UTC())
+	req.ContentLength = size
+	s.sign(req, s3UnsignedPayload, time.Now().UTC())
 	resp, err := s.client().Do(req)
 	if err != nil {
+		if src.n < size {
+			return Object{}, fmt.Errorf("blob: s3 put size mismatch: read %d bytes, expected %d: %w", src.n, size, err)
+		}
 		return Object{}, err
 	}
 	defer resp.Body.Close()
@@ -461,7 +448,16 @@ func (s *S3) Put(ctx context.Context, key string, r io.Reader, size int64) (Obje
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return Object{}, fmt.Errorf("blob: s3 put %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
-	return Object{Key: key, SHA256: digest, Size: n}, nil
+	if src.n != size {
+		return Object{}, fmt.Errorf("blob: s3 put size mismatch: read %d bytes, expected %d", src.n, size)
+	}
+	// The endpoint only received `size` bytes. A source with more is a
+	// declared-size violation and must fail closed.
+	var extra [1]byte
+	if n, _ := src.Read(extra[:]); n > 0 {
+		return Object{}, fmt.Errorf("blob: s3 put size mismatch: stream longer than the declared %d bytes", size)
+	}
+	return Object{Key: key, SHA256: hex.EncodeToString(h.Sum(nil)), Size: size}, nil
 }
 
 // Open returns a stream for the object addressed by key. The returned reader

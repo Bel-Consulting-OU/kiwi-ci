@@ -63,6 +63,9 @@ func Eval(expr string, c EvalContext) (bool, error) {
 	case "cancelled()":
 		return c.Status == model.StatusCancelled, nil
 	}
+	if pattern, ok := branchMatchCall(expr); ok {
+		return branchGlobMatch(pattern, c.Branch), nil
+	}
 	if left, op, right, ok := comparison(expr); ok {
 		actual, err := resolveConditionValue(left, c)
 		if err != nil {
@@ -75,6 +78,32 @@ func Eval(expr string, c EvalContext) (bool, error) {
 		return actual != expected, nil
 	}
 	return false, fmt.Errorf("unsupported condition %q", expr)
+}
+
+// branchMatchCall recognizes the predicate `branchMatch('<glob>')`. The
+// pattern is a single quoted literal; the importer emits this for Woodpecker
+// `when.branch` wildcard filters, which have no exact-equality equivalent.
+func branchMatchCall(expr string) (string, bool) {
+	const name = "branchMatch"
+	if !strings.HasPrefix(expr, name) {
+		return "", false
+	}
+	rest := strings.TrimSpace(expr[len(name):])
+	if len(rest) < 2 || rest[0] != '(' || rest[len(rest)-1] != ')' {
+		return "", false
+	}
+	inner := strings.TrimSpace(rest[1 : len(rest)-1])
+	if !isQuoted(inner) {
+		return "", false
+	}
+	return trimLiteral(inner), true
+}
+
+// branchGlobMatch matches a branch against a glob pattern using the same
+// path-segment semantics as trigger path filters (`*` within a segment, `**`
+// across segments, `?` one character).
+func branchGlobMatch(pattern, branch string) bool {
+	return globMatch(pattern, branch)
 }
 
 func comparison(expr string) (left, op, right string, ok bool) {

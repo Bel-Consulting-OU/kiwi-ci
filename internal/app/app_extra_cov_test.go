@@ -12,7 +12,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runnerpki"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -274,11 +273,10 @@ func TestServerRunnerEnrollmentKeyStoreFailure(t *testing.T) {
 	}
 }
 
-func TestRunnerAdminDoWithoutOutputIsUnreachable(t *testing.T) {
-	// discard is a no-op marker used to keep flag pointers referenced.
-	discard("x", 1, nil)
-	_ = runnerpki.RunnerURIPrefix
-}
+// TestRunnerAdminDoWithoutOutputIsUnreachable was removed: it only called the
+// no-op production `discard` helper and referenced runnerpki.RunnerURIPrefix,
+// asserting nothing. The RunnerAdmin argument contract is covered by
+// TestRunnerAdminListShortIDs and the other RunnerAdmin tests in this file.
 
 func TestRunnerAdminListShortIDs(t *testing.T) {
 	ts, _ := runnerAdminFake(t, http.StatusOK, `[{"id":"short","name":"n"}]`)

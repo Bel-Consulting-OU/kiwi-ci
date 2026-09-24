@@ -157,17 +157,125 @@ func (f cronField) isRestricted() bool {
 // next returns the first occurrence strictly after t, or a zero time when
 // none exists within the search horizon.
 func (c cronSchedule) next(t time.Time) time.Time {
-	t = t.Truncate(time.Minute)
-	for i := 1; i <= maxCronScanMinutes; i++ {
-		t = t.Add(time.Minute)
-		if c.matches(t) {
-			return t
+	return c.nextBudget(t, nil)
+}
+
+// nextBudget is next with an optional shared scan budget. Every calendar day
+// examined spends one unit; when the budget is exhausted the search stops and
+// reports "no occurrence" (a zero time). A nil budget is unlimited.
+//
+// The search is DAY-granular, not minute-granular: for each day the
+// month/day-of-month/day-of-week fields are checked first, and only a day
+// that can match pays for locating the earliest matching hour/minute. This
+// bounds every call to maxCronHorizonDays day steps (plus at most 24*60
+// minute probes on days that can match), instead of the ~1M minute steps the
+// previous minute-by-minute scan needed. The horizon is wide enough to cover
+// day-of-month/day-of-week combinations that only occur across a four-year
+// (or, around a skipped century leap year, eight-year) span, so a zero
+// result now means the expression is genuinely unreachable rather than merely
+// far away.
+func (c cronSchedule) nextBudget(t time.Time, budget *cronScanBudget) time.Time {
+	start := t.Truncate(time.Minute)
+	day := time.Date(start.Year(), start.Month(), start.Day(), 0, 0, 0, 0, start.Location())
+	for i := 0; i <= maxCronHorizonDays; i++ {
+		if !budget.spend(1) {
+			return time.Time{}
+		}
+		if c.dayMatches(day) {
+			if hit := c.firstTimeOnDay(day, start); !hit.IsZero() {
+				return hit
+			}
+		}
+		day = day.AddDate(0, 0, 1)
+	}
+	return time.Time{}
+}
+
+// dayMatches reports whether a day satisfies the month plus the day-of-month
+// / day-of-week fields (OR semantics when both are restricted), ignoring the
+// time-of-day fields.
+func (c cronSchedule) dayMatches(day time.Time) bool {
+	if !c.month.mask[int(day.Month())-c.month.min] {
+		return false
+	}
+	domSet := c.dom.mask[day.Day()-c.dom.min]
+	dowSet := c.dow.mask[int(day.Weekday())-c.dow.min]
+	domRestricted, dowRestricted := c.dom.isRestricted(), c.dow.isRestricted()
+	switch {
+	case domRestricted && dowRestricted:
+		return domSet || dowSet
+	case domRestricted:
+		return domSet
+	case dowRestricted:
+		return dowSet
+	default:
+		return true
+	}
+}
+
+// firstTimeOnDay returns the earliest hour/minute on day that matches the
+// hour and minute fields and is strictly after start (when start is on a
+// later day every time qualifies). It returns the zero time when the day has
+// no matching time left.
+func (c cronSchedule) firstTimeOnDay(day, start time.Time) time.Time {
+	for h := c.hour.min; h <= c.hour.max; h++ {
+		if !c.hour.mask[h-c.hour.min] {
+			continue
+		}
+		for m := c.minute.min; m <= c.minute.max; m++ {
+			if !c.minute.mask[m-c.minute.min] {
+				continue
+			}
+			cand := time.Date(day.Year(), day.Month(), day.Day(), h, m, 0, 0, start.Location())
+			if cand.After(start) {
+				return cand
+			}
 		}
 	}
 	return time.Time{}
 }
 
-// maxCronScanMinutes bounds the next-occurrence search (~2 years at
-// minute granularity); beyond it the expression is treated as never
-// matching.
-const maxCronScanMinutes = 366 * 24 * 60 * 2
+// maxCronHorizonDays bounds the next-occurrence search. Eight years (plus a
+// small leap-day margin) covers every Gregorian day-of-month/day-of-week
+// combination that can occur: a valid Feb-29 expression fires at least every
+// eight years even across a skipped century leap year, and any other valid
+// month/day combination fires within a year. An expression with no match in
+// this window is genuinely unreachable and is rejected at admission.
+const maxCronHorizonDays = 366*8 + 2
+
+// cronScanBudget is a shared, per-tick bound on total cron scan work. Every
+// calendar day examined by nextBudget spends one unit; when the budget is
+// exhausted, remaining schedules in the tick are skipped rather than letting
+// a large schedule set turn one maintenance tick into an unbounded scan.
+type cronScanBudget struct {
+	remaining int
+}
+
+// newCronScanBudget returns a budget of n day-steps; n <= 0 means unlimited.
+func newCronScanBudget(n int) *cronScanBudget {
+	if n <= 0 {
+		return nil
+	}
+	return &cronScanBudget{remaining: n}
+}
+
+// spend deducts n units, reporting false (and leaving the budget at zero)
+// when n would exceed the remainder. A nil budget is unlimited.
+func (b *cronScanBudget) spend(n int) bool {
+	if b == nil {
+		return true
+	}
+	if b.remaining < n {
+		b.remaining = 0
+		return false
+	}
+	b.remaining -= n
+	return true
+}
+
+// maxCronScanDaysPerTick bounds total next-occurrence scan work per
+// maintenance tick across all schedules. With every call bounded by
+// maxCronHorizonDays, this additionally bounds the schedule-set size's
+// contribution to a single tick. A schedule the budget cannot reach is
+// skipped by the caller and retried on the next tick.
+const maxCronScanDaysPerTick = 250_000

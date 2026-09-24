@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/forge"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
@@ -25,6 +26,16 @@ const (
 	outboxFile     = "outbox.jsonl"
 	outboxDoneFile = "outbox.done.jsonl"
 )
+
+// outboxDoneMaxIDs bounds the acked-id set kept by the fs done journal and in
+// memory. The journal is append-only between compactions; compaction rewrites
+// outbox.jsonl to the currently-pending intents (dropping every acked line)
+// and then rewrites outbox.done.jsonl to the delivered watermarks plus at
+// most this many most-recent acked IDs. After compaction a restart loads a
+// bounded journal, while the retained IDs keep re-enqueues of recent
+// deterministic intents idempotent. Older acked IDs are forgotten on purpose:
+// their outbox lines no longer exist, so there is nothing for them to filter.
+const outboxDoneMaxIDs = 4096
 
 // outboxDoneRecord is one line of the fs done journal. ID is the acked
 // intent. LogicalKey/StateVersion form an optional DELIVERED WATERMARK marker:
@@ -61,6 +72,14 @@ type Outbox struct {
 	store *storage.Repository
 	db    storage.OutboxStore
 	done  map[string]bool
+	// doneOrder records the order acked IDs were added, for bounded
+	// compaction (oldest first). It is rebuilt from the done journal at load.
+	doneOrder []string
+	// doneCompactAt is the doneOrder length that triggers the next
+	// compaction. It is raised by outboxDoneMaxIDs after each compaction so
+	// compaction is amortized (once per max acks), never once per ack.
+	// Guarded by mu.
+	doneCompactAt int
 	// delivered is the highest state_version acknowledged per logical key.
 	// It mirrors forge_check_state in DB mode (where the durable guard is
 	// authoritative) and is the fs-mode supersede watermark: it is rebuilt
@@ -78,7 +97,7 @@ type Outbox struct {
 // NewOutbox creates an outbox. When store is non-nil, unflushed intents
 // from a previous process are replayed into the queue.
 func NewOutbox(store *storage.Repository) *Outbox {
-	o := &Outbox{store: store, done: map[string]bool{}, delivered: map[string]int64{}}
+	o := &Outbox{store: store, done: map[string]bool{}, delivered: map[string]int64{}, doneCompactAt: outboxDoneMaxIDs}
 	if store == nil {
 		return o
 	}
@@ -155,6 +174,7 @@ func (o *Outbox) ReplayDB(ctx context.Context) error {
 
 func (o *Outbox) loadLocked() error {
 	done := map[string]bool{}
+	var doneOrder []string
 	delivered := map[string]int64{}
 	f, err := os.Open(filepath.Join(o.store.Root, outboxDoneFile))
 	if err == nil {
@@ -164,8 +184,9 @@ func (o *Outbox) loadLocked() error {
 			if json.Unmarshal(sc.Bytes(), &rec) != nil {
 				continue
 			}
-			if rec.ID != "" {
+			if rec.ID != "" && !done[rec.ID] {
 				done[rec.ID] = true
+				doneOrder = append(doneOrder, rec.ID)
 			}
 			if rec.LogicalKey != "" && rec.StateVersion > 0 && rec.StateVersion > delivered[rec.LogicalKey] {
 				delivered[rec.LogicalKey] = rec.StateVersion
@@ -176,6 +197,8 @@ func (o *Outbox) loadLocked() error {
 		return err
 	}
 	o.done = done
+	o.doneOrder = doneOrder
+	o.doneCompactAt = outboxDoneMaxIDs
 	// Rebuild the fs-mode delivered watermark from the done IDs too: versioned
 	// IDs carry their logical key and version, so a stale state re-enqueued
 	// after a restart is still recognized as older than what was delivered.
@@ -467,18 +490,32 @@ func (o *Outbox) supersededIDsLocked(newID, logicalKey string, version int64) []
 	return ids
 }
 
+// markDoneLocked records one acked/retired intent ID in the bounded
+// in-memory done set and its insertion order. The caller holds o.mu. Repeated
+// marks of the same ID are idempotent and do not disturb the order.
+func (o *Outbox) markDoneLocked(id string) {
+	if id == "" {
+		return
+	}
+	if o.done == nil {
+		o.done = map[string]bool{}
+	}
+	if o.done[id] {
+		return
+	}
+	o.done[id] = true
+	o.doneOrder = append(o.doneOrder, id)
+}
+
 // retireSupersededLocked removes superseded intents from the queue and marks
 // them retired locally. The caller holds o.mu.
 func (o *Outbox) retireSupersededLocked(ids []string) {
 	if len(ids) == 0 {
 		return
 	}
-	if o.done == nil {
-		o.done = map[string]bool{}
-	}
 	for _, id := range ids {
 		o.removeLocked(id)
-		o.done[id] = true
+		o.markDoneLocked(id)
 	}
 }
 
@@ -674,9 +711,114 @@ func (o *Outbox) Flush(ctx context.Context, dispatch func(context.Context, forge
 	o.flushMu.Lock()
 	defer o.flushMu.Unlock()
 	if o.db != nil {
-		return o.flushDB(ctx, dispatch)
+		n, err := o.flushDB(ctx, dispatch)
+		o.compactDoneIfNeeded()
+		return n, err
 	}
-	return o.flushLocal(ctx, dispatch)
+	n, err := o.flushLocal(ctx, dispatch)
+	o.compactDoneIfNeeded()
+	return n, err
+}
+
+// compactDoneIfNeeded bounds the fs-mode done journal and the in-memory done
+// set once they grow past outboxDoneMaxIDs. It runs at the end of a flush
+// (with flushMu held), so the cost is paid rarely and never on the dispatch
+// path. DB mode has no done journal; only the in-memory set is trimmed there.
+func (o *Outbox) compactDoneIfNeeded() {
+	o.mu.Lock()
+	need := len(o.doneOrder) > o.doneCompactAt
+	fsJournal := o.store != nil && o.db == nil
+	o.mu.Unlock()
+	if !need {
+		return
+	}
+	if !fsJournal {
+		o.mu.Lock()
+		o.trimDoneLocked()
+		o.mu.Unlock()
+		return
+	}
+	if err := o.compactLocked(); err != nil {
+		log.Printf("outbox: done journal compaction failed: %v", err)
+	}
+}
+
+// trimDoneLocked keeps only the most-recent outboxDoneMaxIDs acked IDs in
+// memory. The caller holds o.mu.
+func (o *Outbox) trimDoneLocked() {
+	if len(o.doneOrder) <= outboxDoneMaxIDs {
+		return
+	}
+	keep := o.doneOrder[len(o.doneOrder)-outboxDoneMaxIDs:]
+	bounded := append([]string(nil), keep...)
+	next := make(map[string]bool, len(bounded))
+	for _, id := range bounded {
+		next[id] = true
+	}
+	o.done = next
+	o.doneOrder = bounded
+	o.doneCompactAt = len(bounded) + outboxDoneMaxIDs
+}
+
+// compactLocked rewrites the fs journals atomically (fsutil.AtomicWriteFile):
+// outbox.jsonl is rewritten to exactly the pending intents, dropping every
+// acked/superseded line, and outbox.done.jsonl is rewritten to the delivered
+// watermarks plus at most the most-recent outboxDoneMaxIDs acked IDs. The
+// pending journal is written FIRST: if the process crashes between the two
+// renames, the done journal still holds the old (superset) IDs while the
+// pending journal no longer carries their lines, so no acked intent can
+// replay. The in-memory done set is then trimmed to match the rewritten file,
+// bounding memory. The caller holds flushMu; this method takes o.mu for the
+// whole rewrite so no concurrent Enqueue can append to the files being
+// replaced.
+func (o *Outbox) compactLocked() error {
+	if o.store == nil || o.db != nil {
+		return nil
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	var pending bytes.Buffer
+	penc := json.NewEncoder(&pending)
+	for _, it := range o.items {
+		if err := penc.Encode(it); err != nil {
+			return fmt.Errorf("outbox: encode pending intent %s: %w", it.ID, err)
+		}
+	}
+
+	keep := o.doneOrder
+	if len(keep) > outboxDoneMaxIDs {
+		keep = keep[len(keep)-outboxDoneMaxIDs:]
+	}
+	var done bytes.Buffer
+	denc := json.NewEncoder(&done)
+	for key, version := range o.delivered {
+		if err := denc.Encode(outboxDoneRecord{LogicalKey: key, StateVersion: version}); err != nil {
+			return fmt.Errorf("outbox: encode watermark %s: %w", key, err)
+		}
+	}
+	for _, id := range keep {
+		if err := denc.Encode(outboxDoneRecord{ID: id}); err != nil {
+			return fmt.Errorf("outbox: encode done id %s: %w", id, err)
+		}
+	}
+
+	if err := fsutil.AtomicWriteFile(filepath.Join(o.store.Root, outboxFile), pending.Bytes(), 0o600); err != nil {
+		return fmt.Errorf("outbox: rewrite pending journal: %w", err)
+	}
+	if err := fsutil.AtomicWriteFile(filepath.Join(o.store.Root, outboxDoneFile), done.Bytes(), 0o600); err != nil {
+		return fmt.Errorf("outbox: rewrite done journal: %w", err)
+	}
+
+	bounded := append([]string(nil), keep...)
+	next := make(map[string]bool, len(bounded))
+	for _, id := range bounded {
+		next[id] = true
+	}
+	o.done = next
+	o.doneOrder = bounded
+	o.doneCompactAt = len(bounded) + outboxDoneMaxIDs
+	return nil
 }
 
 // flushLocal drains the in-memory/fs queue: dispatch → durable done-file
@@ -710,7 +852,7 @@ func (o *Outbox) flushLocal(ctx context.Context, dispatch func(context.Context, 
 			}
 			if stale {
 				o.removeLocked(it.ID)
-				o.done[it.ID] = true
+				o.markDoneLocked(it.ID)
 				o.mu.Unlock()
 				continue
 			}
@@ -741,7 +883,7 @@ func (o *Outbox) flushLocal(ctx context.Context, dispatch func(context.Context, 
 		if len(o.items) > 0 && o.items[0].ID == it.ID {
 			o.items = o.items[1:]
 		}
-		o.done[it.ID] = true
+		o.markDoneLocked(it.ID)
 		o.recordDeliveredLocked(it)
 		dispatched++
 		o.mu.Unlock()
@@ -974,7 +1116,7 @@ func (o *Outbox) flushDBBatch(ctx context.Context, dispatch func(context.Context
 		acked[it.ID] = true
 		o.mu.Lock()
 		o.removeLocked(it.ID)
-		o.done[it.ID] = true
+		o.markDoneLocked(it.ID)
 		o.recordDeliveredLocked(it)
 		dispatched++
 		o.mu.Unlock()

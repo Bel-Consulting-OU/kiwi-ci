@@ -22,7 +22,10 @@ package storage
 //   - with no URL, a repository full name proves a HOST-LESS record, stored
 //     as the explicit alias spelling "owner/name" (one slash) or
 //     "a1:<base64url(full_name)>" (nested group path). A plain nested string
-//     is never produced again;
+//     is never produced again. This includes a row whose stored repo_id is
+//     EMPTY (R3-B): previously the planner returned Keep early for any empty
+//     value, so an empty repo_id with no URL and a nested full name was
+//     neither rewritten to a1: nor quarantined and carried no identity at all.
 //   - a row where neither interpretation can be proven (an untagged nested
 //     value with no URL and no full name) is QUARANTINED, never guessed: its
 //     repo_id/policy_repo_id are replaced with a reserved
@@ -125,7 +128,39 @@ func PlanStoredRepoIdentity(storedID, repoURL, repoFullName string) RepoIdentity
 
 	// A row already carrying the reserved quarantine identity is stable: it
 	// was quarantined by an earlier repair and must not be re-classified.
-	if stored == "" || strings.HasPrefix(stored, RepoIdentityQuarantineHost+"/") {
+	if strings.HasPrefix(stored, RepoIdentityQuarantineHost+"/") {
+		return RepoIdentityPlan{Explicit: stored, Action: RepoIdentityKeep}
+	}
+
+	// A clone URL proves the canonical identity. Only a genuinely URL-shaped
+	// value contributes a host: a bare owner/name stored in the URL field
+	// (legacy) must never be read as "host = first segment".
+	var host, path string
+	if strings.Contains(url, "://") || strings.Contains(url, "@") {
+		host = auth.CanonicalHost(url)
+		path = RepoFullNameFromURL(url)
+		if path == "" {
+			path = full
+		}
+	}
+
+	// An EMPTY stored identity is the hole the old early return left (R3-B): a
+	// row with no repo_id, no URL host and a repository full name was neither
+	// rewritten nor quarantined, so it carried no repository identity at all.
+	// With no URL host, the full name proves a HOST-LESS record — the legacy
+	// URL-less submission stored auth.CanonicalRepoID("", full) == full
+	// verbatim — so stamp the explicit alias form (plain "owner/name", or the
+	// nested "a1:..." spelling). The URL-proven and all-empty cases keep the
+	// pre-fix behavior (a URL host alone is not a host-less proof; there is
+	// nothing to store when neither evidence exists).
+	if stored == "" {
+		if host == "" && full != "" {
+			alias, err := auth.CanonicalHostAlias(full)
+			if err != nil {
+				return RepoIdentityPlan{Explicit: stored, Action: RepoIdentityKeep}
+			}
+			return RepoIdentityPlan{Explicit: alias.Serialized(), Action: RepoIdentityRewrite, Reason: "stamp the explicit host-less alias form for an empty stored identity"}
+		}
 		return RepoIdentityPlan{Explicit: stored, Action: RepoIdentityKeep}
 	}
 
@@ -150,17 +185,7 @@ func PlanStoredRepoIdentity(storedID, repoURL, repoFullName string) RepoIdentity
 		return RepoIdentityPlan{Explicit: stored, Action: RepoIdentityKeep}
 	}
 
-	// A clone URL proves the canonical identity. Only a genuinely URL-shaped
-	// value contributes a host: a bare owner/name stored in the URL field
-	// (legacy) must never be read as "host = first segment".
-	var host, path string
-	if strings.Contains(url, "://") || strings.Contains(url, "@") {
-		host = auth.CanonicalHost(url)
-		path = RepoFullNameFromURL(url)
-		if path == "" {
-			path = full
-		}
-	}
+	// A clone URL proves the canonical identity (host/path computed above).
 	if host != "" && path != "" {
 		proven := auth.CanonicalRepoID(host, path)
 		switch {

@@ -63,11 +63,34 @@ func TestLimitedSinkZeroIsUnlimited(t *testing.T) {
 }
 
 func TestQuotaSinkNilInner(t *testing.T) {
-	// A quota sink without an inner sink must drop lines without panicking
-	// once the quota is exhausted.
+	// A quota sink without an inner sink must still account bytes and drop
+	// over-quota lines without panicking. The nil inner sink removes every
+	// observable forward, so the assertions track the accounting side of the
+	// drop path: a no-op WriteLine leaves `used` at zero and fails.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("nil-inner quota sink panicked: %v", r)
+		}
+	}()
 	s := &quotaSink{max: 10}
 	s.WriteLine("j", "s", "hello")
+	if got := s.used.Load(); got != 5 {
+		t.Fatalf("used after first in-quota line = %d, want 5", got)
+	}
+	s.WriteLine("j", "s", "world")
+	if got := s.used.Load(); got != 10 {
+		t.Fatalf("used after quota-filling line = %d, want 10", got)
+	}
+	// Over-quota lines are charged and dropped; the terminal marker cannot be
+	// forwarded (nil inner) so it must be suppressed without panicking.
 	s.WriteLine("j", "s", strings.Repeat("x", 100))
+	if got := s.used.Load(); got != 110 {
+		t.Fatalf("used after dropped line = %d, want 110 (dropped lines are still charged)", got)
+	}
+	s.WriteLine("j", "s", "y")
+	if got := s.used.Load(); got != 111 {
+		t.Fatalf("used after a second dropped line = %d, want 111", got)
+	}
 }
 
 func TestLimitedSinkConcurrentSingleMarker(t *testing.T) {

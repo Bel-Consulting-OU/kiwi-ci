@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"io"
 	"math"
 	"os"
@@ -16,6 +15,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/safefs"
+	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 )
 
 func requireNonRoot(t *testing.T) {
@@ -85,15 +88,21 @@ func TestSaveStoreSetupErrors(t *testing.T) {
 		t.Fatal("impossible cap must fail the free-space check")
 	}
 
-	// os.Create of the temp archive fails: pre-create the same path as a
-	// directory so creation is refused regardless of privileges.
-	root := t.TempDir()
-	jobDir := filepath.Join(root, "r", "j")
-	if err := os.MkdirAll(filepath.Join(jobDir, "a.tar.gz.tmp"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := (&Store{Root: root}).Save("r", "j", "a", ws, []string{"."}); err == nil {
-		t.Fatal("temp archive path occupied by a directory must fail")
+	// os.CreateTemp of the unique temp archive fails: the job directory is
+	// read-only (permission-based injection does not apply to root).
+	if os.Geteuid() != 0 {
+		rootRO := t.TempDir()
+		jobDirRO := filepath.Join(rootRO, "r", "j")
+		if err := os.MkdirAll(jobDirRO, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(jobDirRO, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(jobDirRO, 0o755) })
+		if _, err := (&Store{Root: rootRO}).Save("r", "j", "a", ws, []string{"."}); err == nil {
+			t.Fatal("read-only job directory must fail temp creation")
+		}
 	}
 
 	// os.Rename fails: the destination archive path is already a directory.
@@ -152,13 +161,45 @@ func TestSaveCloseAndCopyErrors(t *testing.T) {
 		t.Fatalf("close failure left %q behind", e.Name())
 	}
 
-	origCopy := copyDigest
-	copyDigest = func(io.Writer, io.Reader) (int64, error) {
-		return 0, errors.New("copy refused")
+	origSync := syncArtifactFile
+	syncArtifactFile = func(*os.File) error { return errors.New("sync refused") }
+	root2 := t.TempDir()
+	if _, err := (&Store{Root: root2}).Save("r", "j", "a", ws, []string{"."}); err == nil {
+		t.Fatal("file sync failure must surface")
 	}
-	defer func() { copyDigest = origCopy }()
-	if _, err := (&Store{Root: t.TempDir()}).Save("r", "j", "a", ws, []string{"."}); err == nil {
-		t.Fatal("digest copy failure must surface")
+	syncArtifactFile = origSync
+	entries2, err := os.ReadDir(filepath.Join(root2, "r", "j"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries2 {
+		t.Fatalf("sync failure left %q behind", e.Name())
+	}
+}
+
+// TestSaveDirSyncFailureIsFatalAndLeavesNoArchive proves a failed archive
+// directory fsync (the rename's durability step) fails the save, removes the
+// published-but-uncertain archive and writes no manifest.
+func TestSaveDirSyncFailureIsFatalAndLeavesNoArchive(t *testing.T) {
+	ws := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ws, "f"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	restore := fsutil.SetHooks(fsutil.Hooks{DirSync: func(string) error {
+		return errors.New("dir sync refused")
+	}})
+	defer restore()
+
+	root := t.TempDir()
+	if _, err := (&Store{Root: root}).Save("r", "j", "a", ws, []string{"."}); err == nil {
+		t.Fatal("archive dir-sync failure must surface")
+	}
+	entries, err := os.ReadDir(filepath.Join(root, "r", "j"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		t.Fatalf("dir-sync failure left %q behind", e.Name())
 	}
 }
 
@@ -416,7 +457,8 @@ func TestVerifyArchiveEntryErrorMatrix(t *testing.T) {
 }
 
 // TestExtractErrorBranches proves Extract surfaces destination creation
-// failures, unopenable archives, and a symlinked destination root.
+// failures, unopenable archives, a symlinked destination root, and a
+// symlinked ancestor that must never be traversed.
 func TestExtractErrorBranches(t *testing.T) {
 	// A valid archive to keep the failure at the intended stage.
 	ws := t.TempDir()
@@ -427,34 +469,54 @@ func TestExtractErrorBranches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	// MkdirAll failure: a parent component is a regular file.
-	blocker := filepath.Join(t.TempDir(), "file")
-	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+	wsRoot, err := safefs.OpenWorkspaceRoot(ws)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := Extract(archive, filepath.Join(blocker, "dest")); err == nil {
+	defer wsRoot.Close()
+
+	// A parent component that is a regular file fails the component walk.
+	blockerWS := t.TempDir()
+	if err := os.WriteFile(filepath.Join(blockerWS, "file"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	blockerRoot, err := safefs.OpenWorkspaceRoot(blockerWS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blockerRoot.Close()
+	if err := Extract(archive, blockerRoot.Root, "file/dest"); err == nil {
 		t.Fatal("dest under a regular file must fail")
 	}
 
 	// Archive open failure.
-	if err := Extract(filepath.Join(t.TempDir(), "missing.tar.gz"), t.TempDir()); err == nil {
+	if err := Extract(filepath.Join(t.TempDir(), "missing.tar.gz"), wsRoot.Root, "dest"); err == nil {
 		t.Fatal("missing archive must fail")
 	}
 
-	// Symlinked destination: MkdirAll follows the link, the no-follow root
-	// open rejects it.
-	real := t.TempDir()
-	link := filepath.Join(t.TempDir(), "link")
-	if err := os.Symlink(real, link); err != nil {
+	// Symlinked ancestor: a checkout can leave `evil -> outside`, and the
+	// destination must never be created or written through it.
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(blockerWS, "evil")); err != nil {
 		t.Fatal(err)
 	}
-	if err := Extract(archive, link); err == nil {
+	if err := Extract(archive, blockerRoot.Root, "evil/.ssh"); err == nil {
+		t.Fatal("symlinked ancestor must fail")
+	}
+	if _, err := os.Stat(filepath.Join(outside, ".ssh")); !os.IsNotExist(err) {
+		t.Fatal("content escaped through a symlinked ancestor")
+	}
+
+	// Symlinked final component is rejected by the no-follow walk too.
+	if err := os.Symlink(outside, filepath.Join(ws, "link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := Extract(archive, wsRoot.Root, "link"); err == nil {
 		t.Fatal("symlinked destination must fail")
 	}
 
 	// Happy path still works after all of the above.
-	if err := Extract(archive, t.TempDir()); err != nil {
+	if err := Extract(archive, wsRoot.Root, "dest"); err != nil {
 		t.Fatalf("valid extraction: %v", err)
 	}
 }

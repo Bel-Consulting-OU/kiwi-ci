@@ -222,17 +222,26 @@ func FlakeProbability(outcomes []bool) float64 {
 // their 16-outcome window: the window-derived flake probability is positive
 // (both outcomes present in the window), NOT the lifetime counters a test
 // that failed long ago and then passed its whole window would otherwise keep.
-// Names are rendered as "name" or "class.name" exactly as recorded.
+// Names are rendered as "name" or "class.name" exactly as recorded. The
+// rendered list is de-duplicated: the same class.name in two suites keeps two
+// independent windows internally but is ONE display name, matching the SQL
+// (DISTINCT on the rendered name) and in-memory (seen-set) flaky queries.
 func (h *History) Flaky(repo string) []string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	out := []string{}
+	seen := map[string]bool{}
 	for key, st := range h.stats {
 		if !repoMatches(key, repo) {
 			continue
 		}
 		if st.FlakeProb > 0 {
-			out = append(out, displayName(key))
+			name := displayName(key)
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			out = append(out, name)
 		}
 	}
 	sort.Strings(out)

@@ -335,6 +335,22 @@ func (f *FaultyStore) UpdateJob(ctx context.Context, job model.Job) error {
 	return f.Inner.UpdateJob(ctx, job)
 }
 
+// ApproveJob is the mutating wrapper over the optional JobApprovalStore
+// contract: an armed fault fails the approval before the inner store is
+// touched, so a faulted approval can never leave a partial transition.
+func (f *FaultyStore) ApproveJob(ctx context.Context, jobID, actor string) (model.Job, error) {
+	inner, ok := f.Inner.(JobApprovalStore)
+	if !ok {
+		return model.Job{}, errMissingInnerInterface("JobApprovalStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return model.Job{}, err
+	}
+	return inner.ApproveJob(ctx, jobID, actor)
+}
+
 func (f *FaultyStore) AcquireLease(ctx context.Context, jobID, runnerID string, tokenHash []byte, generation int64, expiresAt time.Time) (model.Job, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -378,6 +394,22 @@ func (f *FaultyStore) UpsertRunner(ctx context.Context, runner model.Runner) err
 		return err
 	}
 	return f.Inner.UpsertRunner(ctx, runner)
+}
+
+// UpdateRunnerProfileFields is the mutating wrapper over the optional
+// RunnerProfileUpdateStore contract: an armed fault fails the guarded profile
+// write before the inner store is touched.
+func (f *FaultyStore) UpdateRunnerProfileFields(ctx context.Context, runner model.Runner) error {
+	inner, ok := f.Inner.(RunnerProfileUpdateStore)
+	if !ok {
+		return errMissingInnerInterface("RunnerProfileUpdateStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return inner.UpdateRunnerProfileFields(ctx, runner)
 }
 
 func (f *FaultyStore) GetRunner(ctx context.Context, id string) (model.Runner, error) {
@@ -2137,6 +2169,34 @@ func (m *memStore) UpdateJob(ctx context.Context, job model.Job) error {
 	return nil
 }
 
+// ApproveJob mirrors the SQL transactional approval under m.mu: it writes only
+// the approval-owned fields (and the waiting_approval -> queued transition)
+// and never touches the lease, so approve-vs-claim keeps the runner slot,
+// quota reservation and resource reservation consistent with the job state.
+func (m *memStore) ApproveJob(ctx context.Context, jobID, actor string) (model.Job, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	j, ok := m.jobs[jobID]
+	if !ok {
+		return model.Job{}, ErrNotFound
+	}
+	if !j.ApprovalRequired {
+		return model.Job{}, ErrApprovalNotRequired
+	}
+	if j.Status.Terminal() {
+		return model.Job{}, ErrJobTerminal
+	}
+	j.ApprovedBy = actor
+	if j.Status == model.StatusWaitingApproval {
+		j.Status = model.StatusQueued
+		j.WaitingSince = nil
+	}
+	m.jobs[jobID] = j
+	return j, nil
+}
+
+var _ JobApprovalStore = (*memStore)(nil)
+
 // AcquireLease is the non-atomic in-memory claim (see the SQL counterpart):
 // it claims the job without a runner-slot predicate and reserves no resource
 // capacity. Bundle users claim through AcquireLeaseAtomic.
@@ -2224,7 +2284,7 @@ func (m *memStore) CompleteJob(ctx context.Context, jobID string, generation int
 	// A missing artifact fails closed (the job stays running) with
 	// ErrRequiredArtifactMissing; a contract-store failure does the same.
 	if status == model.StatusSuccess {
-		if missing := m.requiredArtifactMissingLocked(jobID); missing != "" {
+		if missing := m.requiredArtifactMissingLocked(jobID, generation); missing != "" {
 			return fmt.Errorf("%w: %s", ErrRequiredArtifactMissing, missing)
 		}
 	}
@@ -2321,12 +2381,35 @@ func (m *memStore) CancelRunJobs(ctx context.Context, runID string, reason strin
 	return ids, nil
 }
 
+// UpsertRunner mirrors the SQL store's guarded write: on an existing row the
+// lease-owned fields (active_jobs, busy, current_job) and the completed/failed
+// counters are preserved, so a stale Get-then-Upsert re-registration can never
+// shrink the active set and admit a second job beyond capacity.
 func (m *memStore) UpsertRunner(ctx context.Context, runner model.Runner) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if existing, ok := m.runners[runner.ID]; ok {
+		runner = mergeRunnerProfile(runner, existing)
+	}
 	m.runners[runner.ID] = runner
 	return nil
 }
+
+// UpdateRunnerProfileFields implements RunnerProfileUpdateStore: it updates
+// only an EXISTING runner's profile/admin fields, preserving the lease-owned
+// fields, and reports ErrNotFound for a missing runner.
+func (m *memStore) UpdateRunnerProfileFields(ctx context.Context, runner model.Runner) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	existing, ok := m.runners[runner.ID]
+	if !ok {
+		return ErrNotFound
+	}
+	m.runners[runner.ID] = mergeRunnerProfile(runner, existing)
+	return nil
+}
+
+var _ RunnerProfileUpdateStore = (*memStore)(nil)
 
 func (m *memStore) GetRunner(ctx context.Context, id string) (model.Runner, error) {
 	m.mu.Lock()
@@ -3032,10 +3115,21 @@ func (m *memStore) ReadAudit(ctx context.Context, limit int) ([]model.AuditEvent
 	return append([]model.AuditEvent(nil), m.audit...), nil
 }
 
+// InsertCompletionReceipt persists one completion idempotency receipt with
+// the SAME first-wins semantics as the SQL store's ON CONFLICT DO NOTHING: the
+// first receipt for a (job, generation, runner) identity is authoritative and
+// a later insert never overwrites it. The receipt is evidence of what the
+// lease's completion actually was, so a second, conflicting insert must not
+// silently rewrite it; callers that need to detect the conflict compare the
+// stored ResultHash (HasCompletionReceipt / CompleteJob).
 func (m *memStore) InsertCompletionReceipt(ctx context.Context, r model.CompletionReceipt) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.receipts[m.receiptKey(r.JobID, r.Generation, r.RunnerID)] = r
+	key := m.receiptKey(r.JobID, r.Generation, r.RunnerID)
+	if _, exists := m.receipts[key]; exists {
+		return nil
+	}
+	m.receipts[key] = r
 	return nil
 }
 
@@ -5030,9 +5124,11 @@ func (m *memStore) PrunePendingSidecars(ctx context.Context, olderThan time.Time
 }
 
 // requiredArtifactMissingLocked returns the name of the first Required
-// contract entry with no artifact record for (job, name), or "" when every
-// required artifact is present. The caller holds m.mu.
-func (m *memStore) requiredArtifactMissingLocked(jobID string) string {
+// contract entry with no artifact record for (job, generation, name), or ""
+// when every required artifact is present. The generation is part of the
+// artifact idempotency key, so an artifact uploaded under an earlier lease
+// generation cannot satisfy a later completion. The caller holds m.mu.
+func (m *memStore) requiredArtifactMissingLocked(jobID string, generation int64) string {
 	contracts, ok := m.contracts[jobID]
 	if !ok || len(contracts) == 0 {
 		return ""
@@ -5043,7 +5139,7 @@ func (m *memStore) requiredArtifactMissingLocked(jobID string) string {
 		}
 		found := false
 		for _, a := range m.artifacts {
-			if a.JobID == jobID && a.Name == name {
+			if a.JobID == jobID && a.LeaseGeneration == generation && a.Name == name {
 				found = true
 				break
 			}
@@ -5350,24 +5446,54 @@ func (m *memStore) InsertTestReportWithHistoryDelivery(ctx context.Context, rep 
 		m.reportDeliveries[key] = memReportDelivery{digest: delivery.ContentDigest, reportID: rep.ID}
 	}
 	m.reports = append(m.reports, rep)
-	rows := m.historyAggregates[repoID]
-	if rows == nil {
-		rows = map[string]TestHistoryAggregate{}
-		m.historyAggregates[repoID] = rows
-	}
-	for _, c := range rep.Cases {
-		// Skip policy: skipped cases are never folded as pass/fail
-		// observations (see the PostgresStore delivery path).
-		if c.Skipped {
-			continue
+	// Fold in the canonical (created_at,id) order: only the repository's
+	// newest report is folded incrementally, otherwise (a first insert, or an
+	// out-of-order commit) the repository is rebuilt from its reports. This
+	// is the in-memory mirror of foldOrRebuildTestReportTx, so memory and SQL
+	// agree and a live aggregate can never drift from a rebuilt one.
+	if m.historyVersions[repoID] == 0 || !m.reportIsNewestForRepoLocked(repoID, rep) {
+		m.rebuildRepoTestHistoryLocked(repoID)
+	} else {
+		rows := m.historyAggregates[repoID]
+		if rows == nil {
+			rows = map[string]TestHistoryAggregate{}
+			m.historyAggregates[repoID] = rows
 		}
-		key := memHistoryKey(rep.JobKey, c.Class, c.Name)
-		row := rows[key]
-		row.RepoID, row.Suite, row.Class, row.Name = repoID, rep.JobKey, c.Class, c.Name
-		rows[key] = FoldTestHistoryAggregate(row, TestHistoryEntry{Suite: rep.JobKey, Class: c.Class, Name: c.Name, Duration: c.Duration, Passed: c.Passed, When: rep.CreatedAt})
+		for _, c := range rep.Cases {
+			// Skip policy: skipped cases are never folded as pass/fail
+			// observations (see the PostgresStore delivery path).
+			if c.Skipped {
+				continue
+			}
+			key := memHistoryKey(rep.JobKey, c.Class, c.Name)
+			row := rows[key]
+			row.RepoID, row.Suite, row.Class, row.Name = repoID, rep.JobKey, c.Class, c.Name
+			rows[key] = FoldTestHistoryAggregate(row, TestHistoryEntry{Suite: rep.JobKey, Class: c.Class, Name: c.Name, Duration: c.Duration, Passed: c.Passed, When: rep.CreatedAt})
+		}
 	}
 	m.historyVersions[repoID]++
 	return TestReportInsertOutcome{Version: m.historyVersions[repoID], ReportID: rep.ID}, nil
+}
+
+// reportIsNewestForRepoLocked reports whether rep sorts at or after every
+// OTHER durable report of repoID under the canonical (created_at,id) order
+// (exact ties cannot occur: report IDs are unique). It is the in-memory
+// analogue of hasNewerTestReportTx.
+func (m *memStore) reportIsNewestForRepoLocked(repoID string, rep model.TestReport) bool {
+	for i := range m.reports {
+		other := m.reports[i]
+		if other.ID == rep.ID {
+			continue
+		}
+		run, ok := m.runs[other.RunID]
+		if !ok || RepoIDForRun(run) != repoID {
+			continue
+		}
+		if other.CreatedAt.After(rep.CreatedAt) || (other.CreatedAt.Equal(rep.CreatedAt) && other.ID > rep.ID) {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *memStore) LoadRepoTestHistory(ctx context.Context, repoID string) (int64, []byte, error) {
@@ -5558,13 +5684,22 @@ func (m *memStore) ListTestHistoryRepoIDs(ctx context.Context, limit int) ([]str
 
 // RebuildRepoTestHistory recomputes one repository's aggregates from the
 // in-memory reports in created_at/id order — the same ordering the SQL
-// repair uses.
+// repair uses — and bumps the repository version.
 func (m *memStore) RebuildRepoTestHistory(ctx context.Context, repoID string) (int64, error) {
 	if repoID == "" {
 		return 0, fmt.Errorf("storage: test history repository identity is required")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.rebuildRepoTestHistoryLocked(repoID)
+	m.historyVersions[repoID]++
+	return m.historyVersions[repoID], nil
+}
+
+// rebuildRepoTestHistoryLocked replaces one repository's aggregates with a
+// fresh created_at/id-ordered fold of its reports. It does NOT touch the
+// version counter: callers bump it once. The caller must hold m.mu.
+func (m *memStore) rebuildRepoTestHistoryLocked(repoID string) {
 	reports := make([]model.TestReport, 0, len(m.reports))
 	for _, rep := range m.reports {
 		run, ok := m.runs[rep.RunID]
@@ -5594,8 +5729,6 @@ func (m *memStore) RebuildRepoTestHistory(ctx context.Context, repoID string) (i
 		}
 	}
 	m.historyAggregates[repoID] = rows
-	m.historyVersions[repoID]++
-	return m.historyVersions[repoID], nil
 }
 
 // DisableRunnerAndRevokeCert is the memStore mirror of the SQL transaction:

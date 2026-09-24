@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
@@ -252,6 +253,16 @@ func parseScheduleSpec(specText string) (cronSchedule, string, error) {
 	if err != nil {
 		return cronSchedule{}, "", err
 	}
+	// Reject an expression with no occurrence in the bounded horizon at
+	// admission: the previous minute-by-minute scan spent ~1M iterations per
+	// evaluation on such an expression and treated it as "never due", so a
+	// set of doomed schedules could burn a maintenance tick indefinitely.
+	// A zero next() within maxCronHorizonDays now means the expression is
+	// genuinely unreachable (e.g. "0 0 31 2 *"), which is a schedule the
+	// operator cannot have meant.
+	if cron.next(time.Now().UTC()).IsZero() {
+		return cronSchedule{}, "", fmt.Errorf("cron spec %q has no occurrence within %d days and is unreachable", sc.Cron[0].Cron, maxCronHorizonDays)
+	}
 	ref := ""
 	if len(sc.Cron[0].Branches) > 0 {
 		ref = strings.TrimSpace(sc.Cron[0].Branches[0])
@@ -426,7 +437,16 @@ func (s *Server) persistSchedulesWithLocked(overrides map[string]storage.Schedul
 		f.Schedules = append(f.Schedules, sc)
 	}
 	sort.Slice(f.Schedules, func(i, j int) bool { return f.Schedules[i].ID < f.Schedules[j].ID })
-	return writeSchedulesFile(joinDataDir(s.dataDir, schedulesFile), f)
+	path := joinDataDir(s.dataDir, schedulesFile)
+	err := writeSchedulesFile(path, f)
+	// Fold the outcome into the per-directory uncertainty set: a pre-rename
+	// failure leaves the set untouched (the previous file is intact), a
+	// post-rename directory-fsync failure (fsutil.Renamed) arms the data
+	// directory because the new schedules.json is visible but its crash
+	// durability is uncertified, and success clears it (the directory was
+	// fsynced).
+	s.noteFilePersistResult(path, err)
+	return err
 }
 
 // listSchedules implements GET /api/v1/schedules. Authorization requires
@@ -521,12 +541,25 @@ func (s *Server) upsertSchedule(w http.ResponseWriter, r *http.Request) {
 					break
 				}
 			}
+			if sc.ID == "" && s.MaxSchedules > 0 && len(existing) >= s.MaxSchedules {
+				http.Error(w, fmt.Sprintf("schedule limit (%d) reached", s.MaxSchedules), http.StatusConflict)
+				return
+			}
 			action = "schedule.updated"
 			if sc.ID == "" {
 				sc = storage.Schedule{ID: in.ID, CreatedAt: now}
 				action = "schedule.created"
 			}
 		} else {
+			all, err := ss.ListSchedules(r.Context())
+			if err != nil {
+				s.internalError(w, r, err, "")
+				return
+			}
+			if s.MaxSchedules > 0 && len(all) >= s.MaxSchedules {
+				http.Error(w, fmt.Sprintf("schedule limit (%d) reached", s.MaxSchedules), http.StatusConflict)
+				return
+			}
 			id, err := newID()
 			if err != nil {
 				http.Error(w, "internal server error", 500)
@@ -569,6 +602,11 @@ func (s *Server) upsertSchedule(w http.ResponseWriter, r *http.Request) {
 			sc = storage.Schedule{ID: id, CreatedAt: now}
 			action = "schedule.created"
 		}
+		if action == "schedule.created" && s.MaxSchedules > 0 && len(s.schedules) >= s.MaxSchedules {
+			s.mu.Unlock()
+			http.Error(w, fmt.Sprintf("schedule limit (%d) reached", s.MaxSchedules), http.StatusConflict)
+			return
+		}
 		sc.Repository = in.Repository
 		sc.RepoID = repoID
 		sc.RepoURL = repoURL
@@ -581,17 +619,24 @@ func (s *Server) upsertSchedule(w http.ResponseWriter, r *http.Request) {
 		s.schedules[sc.ID] = sc
 		persistErr := s.persistSchedulesLocked()
 		if persistErr != nil {
-			// The schedule never became durable: restore the previous row
-			// (or remove the fresh entry) before answering 5xx, so the next
-			// successful schedules write cannot commit a schedule the client
-			// was told failed.
-			if had {
-				s.schedules[sc.ID] = prev
-			} else {
-				delete(s.schedules, sc.ID)
+			// Durability failure, not a client error: answer 503 with the
+			// fixed opaque body so the caller retries instead of treating the
+			// schedule as invalid. A pre-rename failure means the journal
+			// never changed: restore the previous row (or remove the fresh
+			// entry) so the next successful write cannot commit a schedule the
+			// client was told failed. A post-rename directory-fsync failure
+			// (fsutil.Renamed) means schedules.json ALREADY carries the row:
+			// retain it in memory (readiness armed by the persist) so memory
+			// matches the visible file and a later persist cannot erase it.
+			if !fsutil.Renamed(persistErr) {
+				if had {
+					s.schedules[sc.ID] = prev
+				} else {
+					delete(s.schedules, sc.ID)
+				}
 			}
 			s.mu.Unlock()
-			s.internalError(w, r, persistErr, "")
+			s.serverError(w, r, http.StatusServiceUnavailable, persistErr, "state not durable")
 			return
 		}
 		s.mu.Unlock()
@@ -632,7 +677,7 @@ func (s *Server) triggerSchedule(w http.ResponseWriter, r *http.Request) {
 		// other ingress: 503 + the fixed opaque "state not durable" body.
 		// Any other fire error (invalid stored identity, ID generation, a
 		// failed durable re-read) stays the generic 500.
-		if s.respondEnqueueError(w, r, err) {
+		if s.respondNotDurableError(w, r, err) {
 			return
 		}
 		s.internalError(w, r, err, "")
@@ -701,8 +746,12 @@ func (s *Server) fireDueSchedules(ctx context.Context, now time.Time) {
 	}
 	seen := map[string]bool{}
 	var dues []dueFire
+	// One scan budget is shared by every due-discovery call in this tick, so
+	// the total next-occurrence work stays bounded regardless of how many
+	// schedules exist or how far behind their LastRun markers are.
+	scanBudget := newCronScanBudget(maxCronScanDaysPerTick)
 	for i := 0; i < 100; i++ {
-		sc, nominal, ok := s.nextDueScheduleFrom(now, seen)
+		sc, nominal, ok := s.nextDueScheduleFromBudget(now, seen, scanBudget)
 		if !ok {
 			break
 		}
@@ -815,10 +864,22 @@ func (s *Server) advanceSchedulePast(ctx context.Context, sc storage.Schedule, n
 	cand := cur
 	cand.LastRun = &nominal
 	persistErr := s.persistSchedulesWithLocked(map[string]storage.Schedule{sc.ID: cand})
-	s.mu.Unlock()
 	if persistErr != nil {
+		// A pre-rename failure leaves memory exactly where it was and the
+		// caller retries on the next tick. A post-rename directory-fsync
+		// failure (fsutil.Renamed) means schedules.json already carries the
+		// advanced marker: adopt it in the mirror so memory matches the
+		// visible journal and the next tick does not re-evaluate the same
+		// nominal; readiness is armed by the persist.
+		if fsutil.Renamed(persistErr) {
+			s.schedules[sc.ID] = cand
+			s.mu.Unlock()
+			return nil
+		}
+		s.mu.Unlock()
 		return persistErr
 	}
+	s.mu.Unlock()
 	s.setScheduleLastRunMirror(sc.ID, nominal)
 	return nil
 }
@@ -842,8 +903,15 @@ func (s *Server) setScheduleLastRunMirror(id string, nominal time.Time) {
 // nextDueScheduleFrom returns the next enabled schedule with a due nominal
 // occurrence not already in seen (the collection loop's skip set), or
 // ok=false when nothing is due. Nominals are derived from LastRun/CreatedAt
-// without advancing anything.
+// without advancing anything. It shares one scan budget per maintenance tick
+// so a large or far-behind schedule set cannot make a single tick unbounded.
 func (s *Server) nextDueScheduleFrom(now time.Time, seen map[string]bool) (storage.Schedule, time.Time, bool) {
+	return s.nextDueScheduleFromBudget(now, seen, newCronScanBudget(maxCronScanDaysPerTick))
+}
+
+// nextDueScheduleFromBudget is nextDueScheduleFrom with an explicit scan
+// budget. A nil budget is unlimited (used by tests and one-shot probes).
+func (s *Server) nextDueScheduleFromBudget(now time.Time, seen map[string]bool, budget *cronScanBudget) (storage.Schedule, time.Time, bool) {
 	now = now.UTC()
 	s.mu.Lock()
 	ids := make([]string, 0, len(s.schedules))
@@ -868,7 +936,7 @@ func (s *Server) nextDueScheduleFrom(now time.Time, seen map[string]bool) (stora
 			base = *sc.LastRun
 		}
 		for i := 0; i < 64; i++ {
-			next := cron.next(base)
+			next := cron.nextBudget(base, budget)
 			if next.IsZero() {
 				break
 			}

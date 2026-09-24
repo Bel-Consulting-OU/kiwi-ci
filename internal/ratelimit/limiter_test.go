@@ -3,6 +3,7 @@ package ratelimit
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -70,7 +71,7 @@ func TestClassify(t *testing.T) {
 		method, path, want string
 	}{
 		{http.MethodPost, "/hooks/github", ClassWebhooks},
-		{http.MethodPost, "/login", ClassLogin},
+		{http.MethodPost, "/api/v1/login", ClassLogin},
 		{http.MethodPost, "/api/v1/runners/enroll", ClassEnroll},
 		{http.MethodPost, "/api/v1/runners/register", ClassRegister},
 		{http.MethodPost, "/api/v1/runners/r1/next", ClassNext},
@@ -78,10 +79,12 @@ func TestClassify(t *testing.T) {
 		{http.MethodPost, "/api/v1/jobs/j1/oidc", ClassOIDC},
 		{http.MethodPost, "/api/v1/jobs/j1/secrets", ClassSecrets},
 		{http.MethodGet, "/api/v1/runs/run1/logs", ClassLogs},
+		{http.MethodGet, "/api/v1/runs/run1/logs/stream", ClassLogs},
 		{http.MethodPost, "/api/v1/jobs/j1/log", ClassLogs},
+		{http.MethodPost, "/api/v1/jobs/j1/log/batch", ClassLogs},
 		{http.MethodPut, "/api/v1/jobs/j1/artifacts/dist", ClassArtifactUpload},
-		{http.MethodPut, "/api/v1/cache/my-key", ClassCacheUpload},
-		{http.MethodGet, "/api/v1/cache/my-key", ClassDefault},
+		{http.MethodPut, "/api/v1/jobs/j1/cache/my-key", ClassCacheUpload},
+		{http.MethodGet, "/api/v1/jobs/j1/cache/my-key", ClassDefault},
 		{http.MethodPost, "/api/v1/runs", ClassDispatch},
 		{http.MethodGet, "/api/v1/runs", ClassDefault},
 		{http.MethodGet, "/metrics", ClassDefault},
@@ -113,8 +116,10 @@ func TestRunnerIDFromPath(t *testing.T) {
 func TestKeyPriority(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "/api/v1/runners/r1/next", nil)
 	r.RemoteAddr = "10.0.0.1:1234"
-	if got := Key(r); got != "runner:r1" {
-		t.Errorf("Key = %q, want runner:r1", got)
+	// Without an authenticated credential the runner tier falls back to the
+	// client IP: the path id is never a rate-limit identity.
+	if got := Key(r); got != "ip:10.0.0.1" {
+		t.Errorf("Key = %q, want ip:10.0.0.1", got)
 	}
 	r = r.WithContext(auth.WithPrincipal(r.Context(), auth.Principal{Subject: "svc-1"}))
 	if got := Key(r); got != "principal:svc-1" {
@@ -124,6 +129,37 @@ func TestKeyPriority(t *testing.T) {
 	r2.RemoteAddr = "10.0.0.2:5678"
 	if got := Key(r2); got != "ip:10.0.0.2" {
 		t.Errorf("Key by IP = %q, want ip:10.0.0.2", got)
+	}
+}
+
+// TestKeyRunnerTierUsesCredentialNotPath pins the G2-A identity fix: a
+// runner-tier request is keyed on its authenticated bearer credential, so
+// varying the (attacker-controlled) path id with one credential yields ONE
+// bucket, and one credential cannot mint unlimited buckets.
+func TestKeyRunnerTierUsesCredential(t *testing.T) {
+	mk := func(path, token string) *http.Request {
+		r := httptest.NewRequest(http.MethodPost, path, nil)
+		r.RemoteAddr = "10.0.0.9:1234"
+		if token != "" {
+			r.Header.Set("Authorization", "Bearer "+token)
+		}
+		return r
+	}
+	k1 := Key(mk("/api/v1/runners/r1/next", "tok-a"))
+	k1b := Key(mk("/api/v1/runners/different-id/next", "tok-a"))
+	if k1 != k1b {
+		t.Fatalf("same credential produced different keys: %q vs %q", k1, k1b)
+	}
+	if !strings.HasPrefix(k1, "credential:") {
+		t.Fatalf("runner-tier key = %q, want a credential key", k1)
+	}
+	if k2 := Key(mk("/api/v1/runners/r1/next", "tok-b")); k2 == k1 {
+		t.Fatal("distinct credentials must get distinct budgets")
+	}
+	// A public route never keys on an arbitrary bearer.
+	pub := mk("/hooks/github", "attacker")
+	if got := Key(pub); got != "ip:10.0.0.9" {
+		t.Fatalf("public route key = %q, want ip:10.0.0.9", got)
 	}
 }
 

@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -251,6 +253,86 @@ func TestGitLabFetchFileOversizeRejected(t *testing.T) {
 	g := &GitLab{BaseURL: ts.URL}
 	if _, err := g.FetchFile(context.Background(), "mike/diaspora", ".kiwi/pipeline.yaml", "main"); err == nil {
 		t.Fatal("oversize file must be rejected")
+	}
+}
+
+// TestGitLabChangedFilesPageCap proves a hostile GitLab that always answers
+// with a full page (per_page=100) cannot drive unbounded pagination: the
+// client stops after gitLabCompareMaxPages and reports the diff incomplete,
+// exactly like the GitHub compare cap.
+func TestGitLabChangedFilesPageCap(t *testing.T) {
+	var served int64
+	full := make([]map[string]string, gitLabComparePerPage)
+	for i := range full {
+		full[i] = map[string]string{"new_path": fmt.Sprintf("f/%d", i)}
+	}
+	body, err := json.Marshal(map[string]any{"diffs": full})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt64(&served, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+		if n > gitLabCompareMaxPages {
+			// A vulnerable unbounded client would keep paging forever;
+			// cancel so the regression fails fast instead of hanging.
+			cancel()
+		}
+	}))
+	defer srv.Close()
+
+	g := &GitLab{BaseURL: srv.URL, Token: "tok"}
+	res, err := g.ChangedFiles(ctx, EventContext{
+		HeadSHA:    "aaaa",
+		BaseSHA:    "bbbb",
+		Repository: Repository{FullName: "o/r"},
+	})
+	if err != nil {
+		t.Fatalf("ChangedFiles: %v", err)
+	}
+	if got := atomic.LoadInt64(&served); got != gitLabCompareMaxPages {
+		t.Fatalf("compare pages served = %d, want cap %d", got, gitLabCompareMaxPages)
+	}
+	if res.Complete {
+		t.Fatal("a full page at the cap must be reported incomplete")
+	}
+	if want := gitLabComparePerPage * gitLabCompareMaxPages; len(res.Files) != want {
+		t.Fatalf("accumulated files = %d, want %d", len(res.Files), want)
+	}
+}
+
+// TestGitLabChangedFilesContextCanceled proves a canceled context stops
+// pagination between pages instead of issuing another request.
+func TestGitLabChangedFilesContextCanceled(t *testing.T) {
+	var served int64
+	full := make([]map[string]string, gitLabComparePerPage)
+	for i := range full {
+		full[i] = map[string]string{"new_path": fmt.Sprintf("f/%d", i)}
+	}
+	body, _ := json.Marshal(map[string]any{"diffs": full})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&served, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+		cancel()
+	}))
+	defer srv.Close()
+
+	g := &GitLab{BaseURL: srv.URL, Token: "tok"}
+	if _, err := g.ChangedFiles(ctx, EventContext{
+		HeadSHA:    "aaaa",
+		BaseSHA:    "bbbb",
+		Repository: Repository{FullName: "o/r"},
+	}); err == nil {
+		t.Fatal("a canceled context must stop pagination with an error")
+	}
+	if got := atomic.LoadInt64(&served); got > 1 {
+		t.Fatalf("pagination continued after cancellation: %d pages served", got)
 	}
 }
 

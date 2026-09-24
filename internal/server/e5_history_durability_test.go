@@ -71,7 +71,7 @@ func TestE5FsHistoryWriteFailureThenRestartRebuildsFromReports(t *testing.T) {
 	if w.Code != http.StatusCreated {
 		t.Fatalf("upload with a failing history cache = %d, want 201: %s", w.Code, w.Body.String())
 	}
-	reportID := testintel.DeliveryReportID("delivery-1")
+	reportID := testintel.DeliveryReportID("job-a", 5, "delivery-1")
 	s.mu.Lock()
 	_, durable := s.reports[reportID]
 	s.mu.Unlock()
@@ -114,7 +114,7 @@ func TestE5FsReplayAfterLostFoldFoldsExactlyOnce(t *testing.T) {
 	hdrs := seedCacheJob(t, s, "job-a", "runner-a", "https://github.com/o/repo-a.git", "o/repo-a", true)
 
 	cases := e5FlakyReport()
-	reportID := testintel.DeliveryReportID("delivery-crash")
+	reportID := testintel.DeliveryReportID("job-a", 5, "delivery-crash")
 	// The durable report a crashed upload would have left behind: server
 	// fields stamped, no history fold yet.
 	crashed := model.TestReport{

@@ -51,6 +51,9 @@ func ExplainWhy(spec *pipeline.Spec, g *pipeline.Graph, jobID string, ctx Explai
 	if spec == nil {
 		return nil, fmt.Errorf("nil pipeline spec")
 	}
+	if g == nil {
+		return nil, fmt.Errorf("nil pipeline graph")
+	}
 	cj, ok := g.Jobs[jobID]
 	if !ok {
 		return nil, fmt.Errorf("job %q not found (compiled jobs: %s)", jobID, strings.Join(sortedKeys(g.Jobs), ", "))

@@ -87,19 +87,27 @@ func outboxDeadLetterFlags(name string, args []string) (url string, rest []strin
 	return *u, fs.Args(), nil
 }
 
-// outboxDeadLetterMutation implements requeue/delete ID. The ID may appear
-// before or after the flags, so it is extracted first and the remaining
-// arguments are parsed as flags (Go's flag package stops at the first
-// positional argument).
+// outboxDeadLetterMutation implements requeue/delete ID. The ID must be the
+// first argument (the documented form is `requeue ID [--database-url URL]`):
+// only arguments before the first "-"-prefixed token are treated as the ID,
+// so `--database-url URL ID` can never be misread as an ID/DSN swap — it is
+// rejected because the trailing ID becomes a stray positional.
 func outboxDeadLetterMutation(ctx context.Context, sub string, args []string) error {
 	id := ""
 	flagArgs := make([]string, 0, len(args))
-	for _, a := range args {
-		if id == "" && !strings.HasPrefix(a, "-") {
-			id = a
+	for i, a := range args {
+		if strings.HasPrefix(a, "-") && a != "-" {
+			flagArgs = append(flagArgs, args[i:]...)
+			break
+		}
+		if id != "" {
+			// A second positional before any flag: let the flag parser see
+			// it so the command fails with a clear stray-argument error
+			// instead of silently picking one.
+			flagArgs = append(flagArgs, a)
 			continue
 		}
-		flagArgs = append(flagArgs, a)
+		id = a
 	}
 	url, rest, err := outboxDeadLetterFlags("outbox dead-letters "+sub, flagArgs)
 	if err != nil {

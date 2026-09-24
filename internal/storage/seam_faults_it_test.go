@@ -145,49 +145,15 @@ func TestPostgresIntegrationStatementFaults(t *testing.T) {
 			t.Fatal("runner scan with a mistyped payload succeeded")
 		}
 	})
-	t.Run("AcquireLeaseAtomic/labelsEncode", func(t *testing.T) {
-		st := pgITStore(t)
-		jobID := pgITNewID(t)
-		runnerID := pgITNewID(t)
-		pgITEnqueueOne(t, st, pgITNewID(t), jobID, pgITRepo)
-		pgITSeedRunner(t, st, runnerID, 1, 0, 0)
-		defer seamPGFailAll(t)()
-		if _, err := st.AcquireLeaseAtomic(ctx, LeaseClaim{JobID: jobID, RunnerID: runnerID}); !errors.Is(err, errPGSeamJSON) {
-			t.Fatalf("labels encode failure = %v", err)
-		}
-	})
-	t.Run("AcquireLeaseAtomic/regionsEncode", func(t *testing.T) {
-		st := pgITStore(t)
-		jobID := pgITNewID(t)
-		runnerID := pgITNewID(t)
-		pgITEnqueueOne(t, st, pgITNewID(t), jobID, pgITRepo)
-		pgITSeedRunner(t, st, runnerID, 1, 0, 0)
-		defer seamPGFailAt(t, 2)()
-		if _, err := st.AcquireLeaseAtomic(ctx, LeaseClaim{JobID: jobID, RunnerID: runnerID}); !errors.Is(err, errPGSeamJSON) {
-			t.Fatalf("regions encode failure = %v", err)
-		}
-	})
-	t.Run("AcquireLeaseAtomic/profileEncode", func(t *testing.T) {
-		st := pgITStore(t)
-		jobID := pgITNewID(t)
-		runnerID := pgITNewID(t)
-		serial := "serial-" + pgITNewID(t)
-		profileID := pgITNewID(t)
-		if err := st.UpsertProfile(ctx, model.RunnerProfile{ID: profileID, MaxCapacity: 2, CreatedAt: time.Now().UTC()}); err != nil {
-			t.Fatal(err)
-		}
-		if err := st.BindCertProfile(ctx, serial, profileID); err != nil {
-			t.Fatal(err)
-		}
-		if err := st.UpsertRunner(ctx, model.Runner{ID: runnerID, Name: "linked", Capacity: 2, CertSerial: serial}); err != nil {
-			t.Fatal(err)
-		}
-		pgITEnqueueOne(t, st, pgITNewID(t), jobID, pgITRepo)
-		defer seamPGFailAll(t)()
-		if _, err := st.AcquireLeaseAtomic(ctx, LeaseClaim{JobID: jobID, RunnerID: runnerID}); !errors.Is(err, errPGSeamJSON) {
-			t.Fatalf("profile encode failure = %v", err)
-		}
-	})
+	// NOTE (H1-G): the former AcquireLeaseAtomic/{labelsEncode,regionsEncode,
+	// profileEncode} subtests asserted that the claim JSON-encoded the
+	// candidate's labels/regions/profile snapshot. The claim rewrite now
+	// decides those predicates with the TYPED helper (ClaimAllowsRunner, see
+	// lease_predicate.go) against the decoded runner/profile rows, so no such
+	// json.Marshal call remains on the claim path and the seams (and their
+	// fault-injection subtests) were dead. They were removed rather than
+	// asserting a call that no longer exists; the typed-predicate behavior is
+	// covered by the lease_claim/parity tests.
 	t.Run("AcquireLeaseAtomic/usageFreeze", func(t *testing.T) {
 		st := pgITStore(t)
 		jobID := pgITNewID(t)

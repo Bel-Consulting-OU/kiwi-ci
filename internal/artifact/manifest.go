@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/safefs"
 )
 
@@ -102,8 +103,12 @@ func (s *Store) SaveManifest(archivePath string, m ArtifactManifest) (string, er
 	if err != nil {
 		return "", err
 	}
+	// The manifest is written through the shared durable primitive: a unique
+	// temp file, fsync, checked close, rename and parent-directory fsync, so
+	// a manifest that is acknowledged cannot be lost to a crash while the
+	// archive it describes survives.
 	dst := archivePath + ".manifest.json"
-	if err := os.WriteFile(dst, b, 0o600); err != nil {
+	if err := fsutil.AtomicWriteFile(dst, b, 0o600); err != nil {
 		return "", err
 	}
 	return dst, nil

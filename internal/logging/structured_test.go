@@ -3,6 +3,7 @@ package logging
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"strings"
 	"testing"
 )
@@ -92,6 +93,13 @@ func TestStructuredConcurrentWrites(t *testing.T) {
 }
 
 func TestNewStructuredNilWriter(t *testing.T) {
+	// A nil writer must be replaced with io.Discard (never left nil, never
+	// pointed at stdout), and logging through it must not panic.
 	s := NewStructured(nil)
+	if s.w != io.Discard {
+		t.Fatalf("NewStructured(nil).w = %v, want io.Discard", s.w)
+	}
 	s.Info("should not panic")
+	s.Warn("should not panic")
+	s.Error("should not panic")
 }

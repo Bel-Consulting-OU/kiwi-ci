@@ -246,7 +246,7 @@ func TestPostgresIntegrationTxAbortedHelperSweep(t *testing.T) {
 			return st.releaseRunnerSlotTx(ctx, tx, runnerID, jobID)
 		},
 		"requiredArtifactMissingTx": func(ctx context.Context, tx pgx.Tx) error {
-			_, err := st.requiredArtifactMissingTx(ctx, tx, jobID, []byte(`{"artifact_contracts":{"bundle":{"name":"bundle","required":true}}}`))
+			_, err := st.requiredArtifactMissingTx(ctx, tx, jobID, 1, []byte(`{"artifact_contracts":{"bundle":{"name":"bundle","required":true}}}`))
 			return err
 		},
 		"artifactByGenerationKey": func(ctx context.Context, tx pgx.Tx) error {

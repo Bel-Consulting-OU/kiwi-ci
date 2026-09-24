@@ -30,7 +30,11 @@ func TestMigration0010Content(t *testing.T) {
 		`ALTER TABLE outbox ADD COLUMN IF NOT EXISTS claimed_by`,
 		`outbox_claim_idx`,
 		`ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS job_generation`,
-		`UPDATE artifacts SET job_generation = COALESCE((payload->>'lease_generation')::bigint, 0)`,
+		// G5-A: the generation backfill must guard the cast, or one malformed
+		// payload aborts the whole migration transaction.
+		`UPDATE artifacts SET job_generation = CASE`,
+		`WHEN jsonb_typeof(payload->'lease_generation') = 'number'`,
+		`'^-?[0-9]+$'`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS artifacts_job_generation_name_idx ON artifacts (job_id, job_generation, name)`,
 	} {
 		if !strings.Contains(sql, want) {

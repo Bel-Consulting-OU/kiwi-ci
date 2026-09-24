@@ -207,15 +207,18 @@ func TestRestoreDownloadsVerifiesContentSHA(t *testing.T) {
 }
 
 func TestSafeDownloadDest(t *testing.T) {
-	ok, err := safeDownloadDest("/ws", "sub/dir")
-	if err != nil || ok != filepath.Join("/ws", "sub", "dir") {
+	ok, err := safeDownloadDest("sub/dir")
+	if err != nil || ok != "sub/dir" {
 		t.Fatalf("safeDownloadDest(sub/dir) = %q, %v", ok, err)
 	}
-	if ok, err = safeDownloadDest("/ws", ""); err != nil || ok != "/ws" {
+	if ok, err = safeDownloadDest(""); err != nil || ok != "" {
 		t.Fatalf("safeDownloadDest(\"\") = %q, %v", ok, err)
 	}
-	for _, bad := range []string{"..", "../x", "/abs", "a/../../x"} {
-		if _, err := safeDownloadDest("/ws", bad); err == nil {
+	if ok, err = safeDownloadDest("."); err != nil || ok != "" {
+		t.Fatalf("safeDownloadDest(.) = %q, %v", ok, err)
+	}
+	for _, bad := range []string{"..", "../x", "/abs", "a/../../x", `a\b`} {
+		if _, err := safeDownloadDest(bad); err == nil {
 			t.Errorf("path %q accepted", bad)
 		}
 	}

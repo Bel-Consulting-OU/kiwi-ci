@@ -71,6 +71,19 @@ func (d Duration) MarshalJSON() ([]byte, error) {
 	return json.Marshal(d.Duration.String())
 }
 
+// MarshalYAML emits a Duration as a plain duration scalar ("5m0s"), never as
+// the nested {duration: ...} mapping the embedded time.Duration would
+// otherwise produce. A post-encode rewrite of those mappings cannot tell a
+// Duration from a user env/vars map whose only key happens to be "duration",
+// so the scalar form is produced here instead. An unset Duration marshals as
+// null; every Duration field carries omitempty, so absent values stay absent.
+func (d Duration) MarshalYAML() (any, error) {
+	if !d.Set {
+		return nil, nil
+	}
+	return d.Duration.String(), nil
+}
+
 // ByteSize is a memory or disk size in bytes. UnmarshalYAML accepts plain
 // byte counts ("1073741824") as well as binary-suffixed values ("512Mi",
 // "512MiB", "2Gi", "1T").

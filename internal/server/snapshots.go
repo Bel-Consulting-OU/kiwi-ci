@@ -32,6 +32,113 @@ import (
 // it at the shared constant.
 var snapshotUploadMaxBytes = snapshot.MaxArchiveBytes
 
+// DefaultSnapshotMaxPerJob bounds how many snapshot records one (run, job)
+// pair may retain. Each record pins its archive blob in CAS until the record
+// is deleted (the reference-aware GC treats records as live references), so
+// an unbounded per-job snapshot history would pin arbitrary storage forever.
+// The cap is enforced BEFORE any staging reservation, directory creation or
+// archive write, so a rejected upload leaves no staging artifact behind.
+// Repository is implied by the run/job: a job's repository cannot change, so
+// a per-(run, job) cap is the per-(run, job, repository) bound.
+const DefaultSnapshotMaxPerJob = 32
+
+// snapshotMaxPerJob is the effective per-job snapshot cap. It is a package
+// var so tests and embedders can override it without a config-file change;
+// production keeps DefaultSnapshotMaxPerJob. A value <= 0 disables the cap.
+var snapshotMaxPerJob = DefaultSnapshotMaxPerJob
+
+// SetSnapshotMaxPerJob overrides the per-job snapshot cap (0 or negative
+// disables it). It exists so operators/tests can tighten the documented
+// default without a config-file schema change.
+func SetSnapshotMaxPerJob(n int) { snapshotMaxPerJob = n }
+
+// snapshotDeleteStore is the optional durable deletion capability. A store
+// that implements it can remove one snapshot record by its (run_id, id)
+// identity; a store without it fails the admin deletion closed rather than
+// silently leaving the record (and its pinned blob) in place.
+type snapshotDeleteStore interface {
+	DeleteSnapshotRecord(ctx context.Context, runID, snapshotID string) (bool, error)
+}
+
+// errSnapshotStoreUnavailable is reported when a DB store lacks the
+// SnapshotStore capability: the cap check delegates to the same fail-closed
+// 503 the upload path uses.
+var errSnapshotStoreUnavailable = errors.New("snapshot record storage unavailable")
+
+// snapshotCountForJob returns how many snapshot records the (run, job) pair
+// currently holds. DB mode reads the run's records through SnapshotStore;
+// memory mode counts the in-memory mirror.
+func (s *Server) snapshotCountForJob(ctx context.Context, runID, jobID string) (int, error) {
+	if s.DB != nil {
+		ss, ok := s.DB.(storage.SnapshotStore)
+		if !ok {
+			return 0, errSnapshotStoreUnavailable
+		}
+		recs, err := ss.ListSnapshotsByRun(ctx, runID)
+		if err != nil {
+			return 0, err
+		}
+		n := 0
+		for _, rec := range recs {
+			if rec.JobID == jobID {
+				n++
+			}
+		}
+		return n, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, rec := range s.snapshots {
+		if rec.RunID == runID && rec.JobID == jobID {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// DeleteSnapshot is the admin retention/deletion path: it removes one
+// snapshot record (scoped to its run) so the record stops pinning its CAS
+// blob, which the reference-aware GC then reclaims once no other record
+// references the digest. Node-local archive files are removed best-effort;
+// the CAS object is NEVER deleted here because it is content-addressed and
+// may be shared (deletion belongs to GC). It returns ok=false when no record
+// with that (run, id) exists. In DB mode the store must implement
+// snapshotDeleteStore or the call fails closed.
+func (s *Server) DeleteSnapshot(ctx context.Context, runID, snapshotID string) (bool, error) {
+	if runID == "" || snapshotID == "" {
+		return false, nil
+	}
+	if s.DB != nil {
+		del, ok := s.DB.(snapshotDeleteStore)
+		if !ok {
+			return false, fmt.Errorf("snapshot deletion unsupported by configured store")
+		}
+		return del.DeleteSnapshotRecord(ctx, runID, snapshotID)
+	}
+	s.mu.Lock()
+	rec, ok := s.snapshots[snapshotID]
+	if !ok || rec.RunID != runID {
+		s.mu.Unlock()
+		return false, nil
+	}
+	delete(s.snapshots, snapshotID)
+	if err := s.persistLocked(); err != nil {
+		// Keep the record (and therefore the blob reference) when the
+		// durable state write fails, so a restart cannot resurrect a
+		// deleted-but-still-referenced record or lose the tombstone.
+		s.snapshots[snapshotID] = rec
+		s.mu.Unlock()
+		return false, err
+	}
+	s.mu.Unlock()
+	if rec.Path != "" && !strings.HasPrefix(rec.Path, "cas:") {
+		_ = os.Remove(rec.Path)
+		_ = os.Remove(rec.Path + ".manifest.json")
+	}
+	return true, nil
+}
+
 // isSnapshotBodyTooLarge reports whether a body copy failed because the
 // request exceeded snapshotUploadMaxBytes (http.MaxBytesReader), so the
 // handler can answer 413 with a clear snapshot-archive reason instead of an
@@ -92,6 +199,26 @@ func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
 	if authErr != nil {
 		s.writeLeaseAuthError(w, r, authErr)
 		return
+	}
+	// Retention bound: refuse BEFORE taking a staging reservation, creating
+	// a directory or writing a byte, so an over-cap upload leaves no stage
+	// file and no orphan blob. The record's CAS blob stays pinned until an
+	// admin deletes the record (DeleteSnapshot), after which the
+	// reference-aware GC reclaims it.
+	if snapshotMaxPerJob > 0 {
+		n, cerr := s.snapshotCountForJob(r.Context(), j.RunID, j.ID)
+		if cerr != nil {
+			if errors.Is(cerr, errSnapshotStoreUnavailable) {
+				http.Error(w, "snapshot record storage unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			s.internalError(w, r, cerr, "")
+			return
+		}
+		if n >= snapshotMaxPerJob {
+			http.Error(w, fmt.Sprintf("snapshot count limit reached for this job (max %d)", snapshotMaxPerJob), http.StatusConflict)
+			return
+		}
 	}
 	if s.DB != nil {
 		if s.CAS == nil {

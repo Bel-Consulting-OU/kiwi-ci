@@ -2,6 +2,8 @@ package logging
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"math"
 	"strings"
@@ -31,6 +33,49 @@ func TestConsoleWriteLineBranches(t *testing.T) {
 
 	quiet := &Console{}
 	quiet.WriteLine("job", "step", "dropped")
+}
+
+// TestConsoleMasksDerivedSecretForms pins F5-B: the operator console sink must
+// apply the same derived-form masking as every other trust-boundary sink, so
+// raw, lower/upper hex and wrapped base64 copies of a secret never reach the
+// console verbatim.
+func TestConsoleMasksDerivedSecretForms(t *testing.T) {
+	const secret = "s3cr3t-Value-0123456789abcdef"
+	m := &secrets.Masker{}
+	if err := m.AddStrict(secret); err != nil {
+		t.Fatal(err)
+	}
+	oneLine := base64.StdEncoding.EncodeToString([]byte(secret))
+	var wrapped strings.Builder
+	for i := 0; i < len(oneLine); i += 76 {
+		end := i + 76
+		if end > len(oneLine) {
+			end = len(oneLine)
+		}
+		wrapped.WriteString(oneLine[i:end])
+		wrapped.WriteByte('\n')
+	}
+
+	forms := map[string]string{
+		"raw":           secret,
+		"hex lower":     hex.EncodeToString([]byte(secret)),
+		"hex upper":     strings.ToUpper(hex.EncodeToString([]byte(secret))),
+		"base64 wrap":   wrapped.String(),
+		"base64 onelin": oneLine,
+	}
+	var buf bytes.Buffer
+	c := &Console{Writer: &buf, Masker: m}
+	for label, form := range forms {
+		buf.Reset()
+		c.WriteLine("job", "step", "leaked="+form)
+		out := buf.String()
+		if strings.Contains(out, form) {
+			t.Errorf("%s secret form reached the console: %q", label, out)
+		}
+		if !strings.Contains(out, "***") {
+			t.Errorf("%s secret form was not masked at all: %q", label, out)
+		}
+	}
 }
 
 func TestFuncAndMultiSinks(t *testing.T) {

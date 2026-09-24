@@ -120,8 +120,10 @@ func TestParseExpandedBudget(t *testing.T) {
 	if _, err := ParseWithLimits(bytes.NewReader(buf.Bytes()), limits); err == nil || !errors.Is(err, safefs.ErrLimits) {
 		t.Fatalf("expanded budget = %v, want ErrLimits", err)
 	}
-	// Exactly at the budget passes.
-	limits = safefs.ExtractLimits{MaxExpandedBytes: 12, MaxFileBytes: 4}
+	// Every tar header now charges manifestHeaderBytes toward the expanded
+	// budget (G2-C), so the exact-budget value is headers + bodies.
+	atBudget := int64(3) * (manifestHeaderBytes + 4)
+	limits = safefs.ExtractLimits{MaxExpandedBytes: atBudget, MaxFileBytes: 4}
 	if _, err := ParseWithLimits(bytes.NewReader(buf.Bytes()), limits); err != nil {
 		t.Fatalf("at budget: %v", err)
 	}

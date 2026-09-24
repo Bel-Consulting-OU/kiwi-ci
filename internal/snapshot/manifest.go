@@ -47,6 +47,35 @@ const ManifestVersion = 1
 // compression-ratio guard and a 1 GiB per-entry cap still apply on top).
 const MaxArchiveBytes int64 = 4 << 30
 
+// MaxManifestEntries is the default per-archive tar-header bound Parse
+// enforces (one per header, regardless of type). It matches the safefs
+// extraction default (safefs.DefaultLimits().MaxEntries = 100_000): a
+// snapshot manifest can never describe more entries than extraction would
+// accept, and the 1_000_000 default this replaced let a zero-byte-file flood
+// build an unbounded in-memory entry slice/map.
+const MaxManifestEntries int64 = 100_000
+
+// MaxManifestMetadataBytes caps the AGGREGATE in-memory metadata Parse may
+// allocate while describing an archive: every accepted header charges
+// len(path) plus manifestEntryOverheadBytes against this budget, BEFORE its
+// entry (or duplicate-tracking key) is appended to the slice/map. Path length
+// alone is already bounded, but without this aggregate cap MaxEntries short
+// paths could still allocate hundreds of MiB; with it the worst-case manifest
+// footprint is bounded regardless of how the archive is shaped.
+const MaxManifestMetadataBytes int64 = 64 << 20
+
+// manifestEntryOverheadBytes is the per-entry bookkeeping charged on top of
+// the path length (Entry struct fields, slice growth, the duplicate-tracking
+// map key and its Go string/map overhead).
+const manifestEntryOverheadBytes int64 = 256
+
+// manifestHeaderBytes is the virtual expanded-size cost charged for every tar
+// header, including non-regular and zero-byte ones. Counting only regular
+// file bodies let an archive of zero-byte files consume unbounded metadata
+// while contributing nothing to the expansion/ratio budgets; charging the
+// header makes the flood visible to those budgets too.
+const manifestHeaderBytes int64 = 512
+
 // Entry is one regular file in a snapshot.
 type Entry struct {
 	Path   string `json:"path"`
@@ -174,12 +203,12 @@ func Parse(r io.Reader) (Manifest, error) {
 
 // parseLimits are the hard bounds Parse enforces on untrusted snapshot
 // archives: at most MaxArchiveBytes of compressed input, 16 GiB of expanded
-// data, 1_000_000 tar headers (MaxEntries, counted per header regardless of
-// type), 1 GiB per entry, path length 2048, depth 64 and a compression
-// ratio of 1000 (the same envelope safefs extraction applies). A
-// caller-supplied positive MaxArchiveBytes overrides the shared default (the
-// server parses with the default, so the upload body cap and the parser
-// agree).
+// data, MaxManifestEntries tar headers (counted per header regardless of
+// type, including the virtual manifestHeaderBytes charged per header), 1 GiB
+// per entry, path length 2048, depth 64 and a compression ratio of 1000 (the
+// same envelope safefs extraction applies). A caller-supplied positive value
+// overrides the corresponding default (the server parses with the defaults,
+// so the upload body cap and the parser agree).
 func parseLimits(l safefs.ExtractLimits) safefs.ExtractLimits {
 	if l.MaxArchiveBytes <= 0 {
 		l.MaxArchiveBytes = MaxArchiveBytes
@@ -191,7 +220,7 @@ func parseLimits(l safefs.ExtractLimits) safefs.ExtractLimits {
 		l.MaxFileBytes = 1 << 30
 	}
 	if l.MaxEntries <= 0 {
-		l.MaxEntries = 1_000_000
+		l.MaxEntries = MaxManifestEntries
 	}
 	if l.MaxPathLength <= 0 {
 		l.MaxPathLength = 2048
@@ -240,7 +269,14 @@ func ParseWithLimits(r io.Reader, limits safefs.ExtractLimits) (Manifest, error)
 	var entries []Entry
 	seen := map[string]bool{}
 	var expanded int64
+	var metadata int64
 	var headers int64
+	// ONE reusable copy buffer for the whole parse: io.Copy allocates a fresh
+	// 32 KiB buffer per call when neither side implements ReaderFrom/WriterTo
+	// (tar.Reader and hash.Hash do not), so a many-entry archive would
+	// otherwise allocate 32 KiB per entry — the dominant cost of the
+	// zero-byte-flood footprint.
+	copyBuf := make([]byte, 32*1024)
 	for {
 		h, err := tr.Next()
 		// The archive budget is checked on every Next call, INCLUDING the
@@ -269,6 +305,22 @@ func ParseWithLimits(r io.Reader, limits safefs.ExtractLimits) (Manifest, error)
 		if seen[key] {
 			return Manifest{}, fmt.Errorf("snapshot: %w: %q", safefs.ErrDuplicateEntry, name)
 		}
+		// Charge the header's aggregate metadata and virtual expansion
+		// BEFORE it can be added to the entry slice or the duplicate map,
+		// so an archive of short or zero-byte entries is rejected as soon
+		// as its in-memory footprint would exceed the budget instead of
+		// after the slice/map have already grown.
+		metadata += int64(len(name)) + manifestEntryOverheadBytes
+		if metadata > MaxManifestMetadataBytes {
+			return Manifest{}, fmt.Errorf("snapshot: manifest metadata exceeds the %d-byte limit: %w", MaxManifestMetadataBytes, safefs.ErrLimits)
+		}
+		if expanded+manifestHeaderBytes > limits.MaxExpandedBytes {
+			return Manifest{}, fmt.Errorf("snapshot: %w", safefs.ErrLimits)
+		}
+		if compressed.n > 0 && expanded+manifestHeaderBytes > int64(limits.MaxCompressionRatio)*compressed.n {
+			return Manifest{}, fmt.Errorf("snapshot: %w", safefs.ErrCompression)
+		}
+		expanded += manifestHeaderBytes
 		seen[key] = true
 		if h.Typeflag != tar.TypeReg {
 			continue
@@ -293,8 +345,10 @@ func ParseWithLimits(r io.Reader, limits safefs.ExtractLimits) (Manifest, error)
 			return Manifest{}, fmt.Errorf("snapshot: %w", safefs.ErrLimits)
 		}
 		hasher := sha256.New()
-		if _, err := io.Copy(hasher, tr); err != nil {
-			return Manifest{}, fmt.Errorf("snapshot: hash entry %q: %w", name, err)
+		if h.Size > 0 {
+			if _, err := io.CopyBuffer(hasher, tr, copyBuf); err != nil {
+				return Manifest{}, fmt.Errorf("snapshot: hash entry %q: %w", name, err)
+			}
 		}
 		entries = append(entries, Entry{
 			Path:   name,

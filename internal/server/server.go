@@ -52,6 +52,11 @@ import (
 const (
 	defaultLeaseDuration  = 45 * time.Second
 	maxCompletionReceipts = storage.MaxCompletionReceipts
+	// defaultMaxSchedules bounds the durable schedule count per server when
+	// server.max_schedules is unset. It caps the per-tick schedule scan work
+	// (bounded by maxCronScanDaysPerTick, but still linear in the schedule
+	// count) and is documented as an operator-tunable limit.
+	defaultMaxSchedules = 1000
 )
 
 // randReader and jsonMarshal are test-only seams over crypto/rand and
@@ -444,6 +449,27 @@ type Server struct {
 	occurrences       map[string]map[int64]string
 	orphanOccurrences map[string]bool
 
+	// MaxSchedules caps the number of durable schedules accepted (memory/fs
+	// and DB mode alike). 0 disables the cap. It is wired from
+	// server.max_schedules and documented as the operator's bound on the
+	// per-tick schedule scan work. Guarded by s.mu (last write wins; the
+	// value is stable after startup wiring).
+	MaxSchedules int
+
+	// RunRetention is how long a TERMINAL fs-mode run (and its jobs,
+	// reports, snapshots and indexes) is retained after it finishes.
+	// MaxRetainedRuns additionally bounds the total fs-mode run count by
+	// pruning the oldest terminal runs first. Both default to ZERO
+	// (disabled) and are enabled only when the operator configures
+	// server.run_retention / server.max_retained_runs; zero disables that
+	// bound. Retention is deliberately opt-in because the fs log-batch
+	// reclamation lifecycle (pruneDeadRunLogBatches) keys off the preserved
+	// run row, and existing deployments must not silently start evicting
+	// aged history. These are the fs-mode retention policy (DB mode retains
+	// through the SQL store). Guarded by s.mu.
+	RunRetention    time.Duration
+	MaxRetainedRuns int
+
 	// opaPolicy is the compiled OPA deny gate (nil when no rules are
 	// configured); opaBroken is set when a configured gate failed to
 	// compile, which fails every admission closed.
@@ -501,6 +527,7 @@ func New(token string) *Server {
 		schedules:         map[string]storage.Schedule{},
 		occurrences:       map[string]map[int64]string{},
 		orphanOccurrences: map[string]bool{},
+		MaxSchedules:      defaultMaxSchedules,
 		downstreamLinks:   map[string]storage.DownstreamLink{},
 		profiles:          map[string]model.RunnerProfile{},
 		certProfiles:      map[string]string{},
@@ -595,6 +622,20 @@ type PersistentOption func(*Server)
 // same directory with a different max_bytes).
 func WithStagingBudget(b *staging.Budget) PersistentOption {
 	return func(s *Server) { s.Staging = b }
+}
+
+// WithMaxSchedules overrides the durable schedule cap. n <= 0 disables it.
+func WithMaxSchedules(n int) PersistentOption {
+	return func(s *Server) { s.MaxSchedules = n }
+}
+
+// WithRunRetention overrides the fs-mode run retention: d is the terminal-run
+// age bound and maxRuns the total-run bound (0 disables that bound).
+func WithRunRetention(d time.Duration, maxRuns int) PersistentOption {
+	return func(s *Server) {
+		s.RunRetention = d
+		s.MaxRetainedRuns = maxRuns
+	}
 }
 
 // NewPersistentWithCluster is NewPersistent with an explicit cluster key
@@ -1246,17 +1287,18 @@ func (s *Server) internalError(w http.ResponseWriter, r *http.Request, err error
 	s.serverError(w, r, http.StatusInternalServerError, err, clientMsg)
 }
 
-// respondEnqueueError is the ONE mapping from a run-enqueue error
-// (s.enqueue / s.enqueueID / s.enqueueDB) to its HTTP response. A durability
-// failure (stateNotDurableError) is a server-side condition, not a client
-// error: it answers 503 with the fixed opaque "state not durable" body and
-// keeps the store/path detail server-side (serverError logs it with the
-// request identity), so every ingress — submit, webhooks, dynamic fragments,
-// rerun and schedule trigger — reports persistence failures identically and
-// never echoes raw store text. It reports whether it wrote the response; a
-// false return leaves the error to the caller's ingress-specific mapping
-// (admission, OPA denial, quota, or a genuine 4xx validation message).
-func (s *Server) respondEnqueueError(w http.ResponseWriter, r *http.Request, err error) bool {
+// respondNotDurableError is the ONE mapping from a durability failure error
+// (stateNotDurableError) to its HTTP response. A durability failure is a
+// server-side condition, not a client error: it answers 503 with the fixed
+// opaque "state not durable" body and keeps the store/path detail server-side
+// (serverError logs it with the request identity), so every caller — run
+// enqueue (submit, webhooks, dynamic fragments, rerun and schedule trigger)
+// and the other durable mutations (runner profiles) — reports persistence
+// failures identically and never echoes raw store text. It reports whether it
+// wrote the response; a false return leaves the error to the caller's
+// ingress-specific mapping (admission, OPA denial, quota, or a genuine 4xx
+// validation message).
+func (s *Server) respondNotDurableError(w http.ResponseWriter, r *http.Request, err error) bool {
 	var nd *stateNotDurableError
 	if errors.As(err, &nd) {
 		s.serverError(w, r, http.StatusServiceUnavailable, nd, "state not durable")
@@ -1657,13 +1699,21 @@ func (s *Server) enqueueID(ctx context.Context, in SubmitRun, preRunID string) (
 		return model.Run{}, err
 	}
 	if err := s.persistCheckedErrLocked("run.enqueue"); err != nil {
-		// The enqueue never became durable: restore the exact pre-enqueue
-		// state (superseded runs revived, ghost run/jobs/contracts removed,
-		// occurrence claim and downstream link reverted) before returning the
-		// error. The webhook deliveries map is untouched on this path, so a
-		// retry cannot be mistaken for a replay of the ghost run. The typed
-		// error lets submit and the webhook answer 503 instead of 400.
-		s.rollbackStateLocked(rb)
+		// The enqueue never became durable. A pre-rename failure means the
+		// snapshot was definitely not published: restore the exact
+		// pre-enqueue state (superseded runs revived, ghost run/jobs/contracts
+		// removed, occurrence claim and downstream link reverted) before
+		// returning the error. A post-rename directory-fsync failure
+		// (fsutil.Renamed) means the snapshot rename ALREADY published the
+		// run and its occurrence claim: rolling memory back would leave the
+		// in-memory maps denying a run the visible state.json holds, and the
+		// next successful persist would erase it (or a restart would
+		// resurrect a ghost), so the published state is retained and
+		// readiness stays degraded until a same-directory persist
+		// reconciles. The webhook deliveries map is untouched on this path,
+		// so a retry cannot be mistaken for a replay of the ghost run. The
+		// typed error lets submit and the webhook answer 503 instead of 400.
+		s.rollbackUnlessPublished(rb, err)
 		s.mu.Unlock()
 		return model.Run{}, notDurable(err)
 	}
@@ -2280,6 +2330,33 @@ func newRegisterResponse(in model.Runner, profileBound bool) registerResponse {
 	}
 }
 
+// writeRunnerProfileDB persists only a runner's profile/admin fields through
+// the guarded RunnerProfileUpdateStore when the store provides it. The caller
+// passes a runner whose LEASE-OWNED fields are zero (registration, drain and
+// enable all intend admin fields only); the guarded store preserves the
+// committed active_jobs/busy/current_job/completed/failed under the runner
+// row lock, so a stale read can never drop a slot a concurrent claim reserved.
+// create lets registration insert a brand-new runner (the profile contract
+// never creates one); drain/enable pass false so a concurrently deleted
+// runner is a 404, not a resurrection. A legacy store without the contract
+// falls back to UpsertRunner carrying the lease-owned fields of the row that
+// was just read, which is the strongest guarantee such a store supports.
+func (s *Server) writeRunnerProfileDB(ctx context.Context, runner, old model.Runner, create bool) error {
+	if u, ok := s.DB.(storage.RunnerProfileUpdateStore); ok {
+		err := u.UpdateRunnerProfileFields(ctx, runner)
+		if errors.Is(err, storage.ErrNotFound) && create {
+			return s.DB.UpsertRunner(ctx, runner)
+		}
+		return err
+	}
+	runner.ActiveJobs = append([]string(nil), old.ActiveJobs...)
+	runner.CurrentJob = old.CurrentJob
+	runner.Completed = old.Completed
+	runner.Failed = old.Failed
+	runner.Busy = runner.Capacity > 0 && len(runner.ActiveJobs) >= runner.Capacity
+	return s.DB.UpsertRunner(ctx, runner)
+}
+
 func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	var in model.Runner
 	if !decode(w, r, &in) {
@@ -2407,25 +2484,31 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 			in.Registered = now
 		} else {
 			in.Registered = old.Registered
-			in.Completed = old.Completed
-			in.Failed = old.Failed
 		}
 		if in.Capacity < 1 && !s.RequireProfiles {
 			in.Capacity = 1
 		}
 		in.LastSeen = now
+		// Registration intends profile/admin fields only: the lease-owned
+		// fields are preserved by the guarded store and never supplied by
+		// this caller.
+		in.ActiveJobs, in.CurrentJob, in.Busy = nil, "", false
+		in.Completed, in.Failed = 0, 0
+		if err := s.writeRunnerProfileDB(r.Context(), in, old, true); err != nil {
+			s.internalError(w, r, err, "")
+			return
+		}
+		// Echo the lease-owned fields a guarded store preserved so the
+		// registration ACK describes the current row exactly as before.
 		in.ActiveJobs = append([]string{}, old.ActiveJobs...)
 		if len(in.ActiveJobs) == 0 && old.CurrentJob != "" {
 			in.ActiveJobs = []string{old.CurrentJob}
 		}
-		in.Busy = len(in.ActiveJobs) >= in.Capacity
 		if len(in.ActiveJobs) > 0 {
 			in.CurrentJob = in.ActiveJobs[0]
 		}
-		if err := s.DB.UpsertRunner(r.Context(), in); err != nil {
-			s.internalError(w, r, err, "")
-			return
-		}
+		in.Busy = in.Capacity > 0 && len(in.ActiveJobs) >= in.Capacity
+		in.Completed, in.Failed = old.Completed, old.Failed
 		s.auditLocked("runner.register", in.Name, "", "", "runner registered", nil)
 		writeJSON(w, http.StatusOK, newRegisterResponse(in, s.RequireProfiles || hasProfile))
 		return
@@ -2590,11 +2673,21 @@ func (s *Server) runnerDrain(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		ri.Draining = true
-		if err := s.DB.UpsertRunner(r.Context(), ri); err != nil {
+		profile := ri
+		profile.Draining = true
+		// Drain intends the admin field only: the lease-owned fields are
+		// preserved by the guarded store, never supplied by this caller.
+		profile.ActiveJobs, profile.CurrentJob, profile.Busy = nil, "", false
+		profile.Completed, profile.Failed = 0, 0
+		if err := s.writeRunnerProfileDB(r.Context(), profile, ri, false); err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				http.NotFound(w, r)
+				return
+			}
 			s.internalError(w, r, err, "")
 			return
 		}
+		ri.Draining = true
 		writeJSON(w, http.StatusOK, ri)
 		return
 	}
@@ -2806,12 +2899,23 @@ func (s *Server) runnerEnable(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		ri.Disabled = false
-		ri.Draining = false
-		if err := s.DB.UpsertRunner(r.Context(), ri); err != nil {
+		profile := ri
+		profile.Disabled = false
+		profile.Draining = false
+		// Enable intends the admin fields only: the lease-owned fields are
+		// preserved by the guarded store, never supplied by this caller.
+		profile.ActiveJobs, profile.CurrentJob, profile.Busy = nil, "", false
+		profile.Completed, profile.Failed = 0, 0
+		if err := s.writeRunnerProfileDB(r.Context(), profile, ri, false); err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				http.NotFound(w, r)
+				return
+			}
 			s.internalError(w, r, err, "")
 			return
 		}
+		ri.Disabled = false
+		ri.Draining = false
 		writeJSON(w, http.StatusOK, ri)
 		return
 	}
@@ -3352,16 +3456,26 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		s.runners[in.RunnerID] = ri
 	}
 	if perr := s.persistCheckedErrLocked("job.heartbeat"); perr != nil {
-		// Roll the extension back and refuse the heartbeat with a fixed body:
-		// the runner keeps its OLD deadline and retries, so the only durable
-		// expiry is one the snapshot actually recorded.
-		s.jobs[jobID] = prevJob
-		if hadRunner {
-			s.runners[in.RunnerID] = prevRunner
-		} else {
-			delete(s.runners, in.RunnerID)
+		// The persist phase decides what the visible snapshot is. A
+		// pre-rename failure means the extension was definitely not
+		// published: roll it back and refuse the heartbeat with a fixed body,
+		// so the runner keeps its OLD deadline and retries. A post-rename
+		// directory-fsync failure (fsutil.Renamed) means the visible snapshot
+		// already holds the extended deadline: rolling memory back would
+		// re-issue a lease the disk shows as live, so the published (newer)
+		// deadline is retained and the refusal is the standard degraded
+		// body. The runner retries against the same still-valid lease.
+		if !fsutil.Renamed(perr) {
+			s.jobs[jobID] = prevJob
+			if hadRunner {
+				s.runners[in.RunnerID] = prevRunner
+			} else {
+				delete(s.runners, in.RunnerID)
+			}
+			http.Error(w, "heartbeat not durable", http.StatusServiceUnavailable)
+			return
 		}
-		http.Error(w, "heartbeat not durable", http.StatusServiceUnavailable)
+		s.serverError(w, r, http.StatusServiceUnavailable, perr, "state not durable")
 		return
 	}
 	writeJSON(w, http.StatusOK, HeartbeatResponse{LeaseExpiresAt: exp})
@@ -3763,7 +3877,23 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	// surviving without its metrics) nor applied twice (terminal state and
 	// receipt only survive a successful persist).
 	if perr := s.persistCheckedErrLocked("job.complete"); perr != nil {
-		s.rollbackCompletionLocked(rollback)
+		// The persist phase decides what the visible snapshot is. A
+		// pre-rename failure means the terminal job, the run aggregation and
+		// the receipt were definitely not published: roll the whole capture
+		// back and answer 503, the retry re-runs the path from the leased
+		// running job. A post-rename directory-fsync failure
+		// (fsutil.Renamed) means the snapshot rename ALREADY published the
+		// terminal state, the usage marker and the receipt: rolling back
+		// would leave memory rejecting a completion the visible file holds,
+		// and a later successful persist would revert it. The published state
+		// is retained, readiness stays degraded until a same-directory
+		// persist reconciles, and the runner's idempotent replay re-enters
+		// through the receipt to run the effects.
+		if s.rollbackCompletionUnlessPublished(rollback, perr) {
+			s.mu.Unlock()
+			s.serverError(w, r, http.StatusServiceUnavailable, perr, "state not durable")
+			return
+		}
 		s.mu.Unlock()
 		s.serverError(w, r, http.StatusServiceUnavailable, perr, "completion state not durable")
 		return
@@ -4201,6 +4331,20 @@ func (s *Server) rollbackUnlessPublished(rb stateRollback, err error) bool {
 	return false
 }
 
+// rollbackCompletionUnlessPublished is rollbackUnlessPublished for the inline
+// completion path, whose captured snapshot is a completionRollback (it also
+// covers the receipt table, the deployment mirror and the runner slot, which
+// the generic stateRollback does not). It returns true when the published
+// (terminal) state was retained after a post-rename directory-fsync failure,
+// false when the snapshot was rolled back. The caller holds s.mu.
+func (s *Server) rollbackCompletionUnlessPublished(rb completionRollback, err error) bool {
+	if fsutil.Renamed(err) {
+		return true
+	}
+	s.rollbackCompletionLocked(rb)
+	return false
+}
+
 // rollbackStateLocked restores a captureStateRollbackLocked snapshot. The
 // caller holds s.mu and invokes it only after the durability write failed,
 // immediately before the fail-closed response. The maps are restored in
@@ -4297,9 +4441,6 @@ func (s *Server) rebuildUsageWindow(jobs map[string]model.Job) {
 		ranked = append(ranked, rankedUsage{jobID: id, entry: usageEntry{FinishedAt: *j.FinishedAt, Cost: j.Cost, EnergyWh: j.EnergyWh}})
 	}
 	s.mu.Unlock()
-	if len(ranked) == 0 {
-		return
-	}
 	sort.Slice(ranked, func(i, j int) bool {
 		if !ranked[i].entry.FinishedAt.Equal(ranked[j].entry.FinishedAt) {
 			return ranked[i].entry.FinishedAt.Before(ranked[j].entry.FinishedAt)
@@ -4311,6 +4452,9 @@ func (s *Server) rebuildUsageWindow(jobs map[string]model.Job) {
 		entries = append(entries, r.entry)
 	}
 	s.usageMu.Lock()
+	// Always replace the window, including with an empty slice: after a
+	// retention prune removes every usage-recorded job, the window must
+	// shrink to zero or the daily budget would keep counting deleted jobs.
 	s.usage = entries
 	s.usageMu.Unlock()
 }
@@ -4431,6 +4575,17 @@ func (s *Server) approveJobDB(w http.ResponseWriter, r *http.Request, jobID, act
 	if !s.requireAction(w, r, auth.ActionApprove, repoIDForJob(j), false) {
 		return
 	}
+	approver, ok := s.DB.(storage.JobApprovalStore)
+	if !ok {
+		// A store that cannot commit approval transactionally could clobber a
+		// concurrent claim's lease: fail closed instead of falling back to a
+		// whole-row UpdateJob from this (possibly stale) read.
+		s.serverError(w, r, http.StatusServiceUnavailable, errors.New("store does not support transactional approval"), "approval unavailable")
+		return
+	}
+	// Optimistic pre-checks so the common non-gated/terminal case is refused
+	// without writing an audit row; ApproveJob re-checks both under the row
+	// lock and its typed errors carry the decision for a racing transition.
 	if !j.ApprovalRequired {
 		http.Error(w, "job does not require approval", http.StatusConflict)
 		return
@@ -4438,10 +4593,6 @@ func (s *Server) approveJobDB(w http.ResponseWriter, r *http.Request, jobID, act
 	if j.Status.Terminal() {
 		http.Error(w, "job is already terminal", http.StatusConflict)
 		return
-	}
-	j.ApprovedBy = actor
-	if j.Status == model.StatusWaitingApproval {
-		j.Status = model.StatusQueued
 	}
 	waitSeconds, waited := approvalWaitSeconds(&j)
 	// Audit-first: the DB audit table is a separate transaction from the job
@@ -4452,7 +4603,23 @@ func (s *Server) approveJobDB(w http.ResponseWriter, r *http.Request, jobID, act
 		http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	if err := s.DB.UpdateJob(ctx, j); err != nil {
+	// The transactional approval writes ONLY the approval-owned fields (and
+	// the waiting_approval -> queued transition) under the job row lock and
+	// never touches a lease column, so an approval racing a claim cannot
+	// reset a running job's status/lease while its runner slot, quota
+	// reservation and resource reservation stay held.
+	approved, err := approver.ApproveJob(ctx, jobID, actor)
+	switch {
+	case errors.Is(err, storage.ErrApprovalNotRequired):
+		http.Error(w, "job does not require approval", http.StatusConflict)
+		return
+	case errors.Is(err, storage.ErrJobTerminal):
+		http.Error(w, "job is already terminal", http.StatusConflict)
+		return
+	case errors.Is(err, storage.ErrNotFound):
+		http.NotFound(w, r)
+		return
+	case err != nil:
 		s.internalError(w, r, err, "")
 		return
 	}
@@ -4460,7 +4627,7 @@ func (s *Server) approveJobDB(w http.ResponseWriter, r *http.Request, jobID, act
 		s.metricObserve("kiwi_approval_wait_seconds", waitSeconds, nil)
 		s.metricObserve("kiwi_environment_wait_seconds", waitSeconds, nil)
 	}
-	writeJSON(w, http.StatusOK, redactJob(j))
+	writeJSON(w, http.StatusOK, redactJob(approved))
 }
 
 // approvalWaitSeconds derives how long an approval-gated job waited from
@@ -4530,7 +4697,7 @@ func (s *Server) rerunRun(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// A non-durable enqueue is answered like every other ingress (503 +
 		// opaque body); only a genuine validation error keeps its message.
-		if s.respondEnqueueError(w, r, err) {
+		if s.respondNotDurableError(w, r, err) {
 			return
 		}
 		http.Error(w, err.Error(), 400)
@@ -4594,7 +4761,7 @@ func (s *Server) rerunRunDB(w http.ResponseWriter, r *http.Request, id string) {
 	if err != nil {
 		// Same durability mapping as rerunRun: persistence failures answer
 		// 503 with the fixed opaque body, validation errors keep their 400.
-		if s.respondEnqueueError(w, r, err) {
+		if s.respondNotDurableError(w, r, err) {
 			return
 		}
 		http.Error(w, err.Error(), 400)
@@ -4658,12 +4825,22 @@ func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 	s.cancelRunLocked(id, reason)
 	run = s.runs[id]
 	if perr := s.persistCheckedErrLocked("job.cancel"); perr != nil {
-		// The cancellation never became durable: restore every job, run and
-		// runner slot the cancel path touched, answer 503, and publish NO
-		// forge status (the outbox intent is only enqueued after durability).
-		s.rollbackStateLocked(rb)
+		// A pre-rename failure means the cancellation was definitely not
+		// published: restore every job, run and runner slot the cancel path
+		// touched, answer 503, and publish NO forge status (the outbox intent
+		// is only enqueued after durability). A post-rename failure
+		// (fsutil.Renamed) means the visible snapshot already holds the
+		// cancellation: rolling memory back would un-cancel a run the disk
+		// cancelled until a later persist erases the durable cancel, so the
+		// published state is retained (readiness degraded) and the caller
+		// retries.
+		rolledBack := !s.rollbackUnlessPublished(rb, perr)
 		s.mu.Unlock()
-		http.Error(w, "cancel state not durable", http.StatusServiceUnavailable)
+		if rolledBack {
+			http.Error(w, "cancel state not durable", http.StatusServiceUnavailable)
+			return
+		}
+		s.serverError(w, r, http.StatusServiceUnavailable, perr, "state not durable")
 		return
 	}
 	s.mu.Unlock()
@@ -5102,8 +5279,25 @@ func (s *Server) persistLocked() error {
 		return s.persistFailForTest
 	}
 	err := s.store.Save(storage.Snapshot{Version: 1, Runs: s.runs, Jobs: s.jobs, Runners: s.runners, Artifacts: s.artifacts, Reports: s.reports, DownstreamLinks: s.downstreamLinks, Profiles: s.profiles, CertProfileLinks: s.certProfiles, RunnerProfileLinks: s.runnerProfiles, Snapshots: s.snapshots, CompletionReceipts: s.completionReceiptRecordsLocked(), Deployments: s.deployments, CRL: s.crl, PendingSidecars: s.pendingSidecarSnapshotLocked()})
-	s.notePersistResult(err)
+	s.noteSnapshotPersistResult(err)
 	return err
+}
+
+// noteSnapshotPersistResult folds one state.json write outcome into both
+// degraded signals: the snapshot bit (stateDegraded) and the per-directory
+// uncertainty set for the data directory. The directory is the snapshot's own
+// data dir because fsutil fsyncs exactly that directory after the rename: on a
+// post-rename failure the published snapshot is uncertain until a later
+// successful persist/fsync in the same directory. A plain (non-typed) error
+// matches neither arm nor clear unless it is nil, so the persistFailForTest
+// seam keeps its historical behavior (snapshot bit only, through
+// notePersistResult).
+func (s *Server) noteSnapshotPersistResult(err error) {
+	s.notePersistResult(err)
+	if s.dataDir == "" {
+		return
+	}
+	s.noteFilePersistResult(joinDataDir(s.dataDir, "state.json"), err)
 }
 
 // persistCheckedErrLocked persists the in-memory state under the caller's
@@ -5675,10 +5869,6 @@ func (s *Server) pruneDeadRunLogBatches(now time.Time) {
 	if s.store == nil || s.DB != nil {
 		return
 	}
-	pruner, ok := any(s.store).(logBatchPruner)
-	if !ok {
-		return
-	}
 	cutoff := now.UTC().Add(-logBatchRetention)
 	s.mu.Lock()
 	var dead []string
@@ -5689,7 +5879,23 @@ func (s *Server) pruneDeadRunLogBatches(now time.Time) {
 		dead = append(dead, id)
 	}
 	s.mu.Unlock()
-	for _, id := range dead {
+	s.pruneLogBatchesForRuns(dead)
+}
+
+// pruneLogBatchesForRuns runs the fs-mode log-batch pruner for exactly the
+// named runs. It is shared by the run-keyed lifecycle hook above and by the
+// run retention cascade in GC (a retention-pruned run no longer appears in
+// s.runs, so the hook would never discover it). A no-op for memory servers
+// and DB-mode servers, which own their logs elsewhere.
+func (s *Server) pruneLogBatchesForRuns(ids []string) {
+	if s.store == nil || s.DB != nil || len(ids) == 0 {
+		return
+	}
+	pruner, ok := any(s.store).(logBatchPruner)
+	if !ok {
+		return
+	}
+	for _, id := range ids {
 		if err := pruner.PruneLogBatches(id); err != nil {
 			s.logError("log batches: prune failed", "run", id, "error", err.Error())
 		}
@@ -5729,12 +5935,15 @@ func (s *Server) Maintain(ctx context.Context) {
 
 // maintainMemoryTick is the fs/memory-mode housekeeping tick: it recovers
 // expired leases and publishes the forge statuses caused by lost runners.
-// Recovery and its snapshot write are ONE critical section so a failed
-// persist rolls the whole pass back — the in-memory state must match the
-// disk, or a crash would "lose" a recovery the process already reported while
-// the next tick double-requeues it. No HTTP status exists here; the degraded
-// flag armed by the persist helper plus the rollback log carry the failure.
-// Exposed as a method so tests can drive one tick deterministically.
+// Recovery and its snapshot write are ONE critical section and the persist
+// phase decides the outcome: a pre-rename failure rolls the whole pass back
+// (memory matches the disk's pre-recovery state), while a post-rename
+// directory-fsync failure (fsutil.Renamed) retains the published recovery —
+// memory matches the visible snapshot and the next persist cannot revert it —
+// with readiness degraded until a same-directory persist succeeds. No HTTP
+// status exists here; the degraded flag armed by the persist helper plus the
+// rollback log carry the failure. Exposed as a method so tests can drive one
+// tick deterministically.
 func (s *Server) maintainMemoryTick(ctx context.Context, now time.Time) {
 	s.mu.Lock()
 	before := map[string]model.Status{}
@@ -5745,8 +5954,17 @@ func (s *Server) maintainMemoryTick(ctx context.Context, now time.Time) {
 	expirations, lostRunners, timedOut := s.recoverLeasesLocked(now, false)
 	recoveryDurable := true
 	if perr := s.persistCheckedErrLocked("maintain.lease_recovery"); perr != nil {
-		s.rollbackStateLocked(rb)
-		recoveryDurable = false
+		// A pre-rename failure means the recovery pass was definitely not
+		// published: roll the whole pass back so a crash cannot "lose" a
+		// recovery the process already reported while the next tick
+		// double-requeues it. A post-rename directory-fsync failure
+		// (fsutil.Renamed) means the visible snapshot already holds the
+		// recovery: the recovered (requeued) state is retained, readiness
+		// stays degraded until a same-directory persist reconciles, and the
+		// metrics/forge publication reflect the published recovery.
+		if !s.rollbackUnlessPublished(rb, perr) {
+			recoveryDurable = false
+		}
 	}
 	var changed []model.Run
 	if recoveryDurable {

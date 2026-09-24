@@ -1278,6 +1278,60 @@ func (f *dbFakeStore) UpsertRunner(ctx context.Context, runner model.Runner) err
 	return nil
 }
 
+// UpdateRunnerProfileFields mirrors the guarded RunnerProfileUpdateStore
+// contract: it edits only the profile/admin fields of an EXISTING runner and
+// preserves the lease-owned fields (active_jobs/current_job/busy) and the
+// completed/failed counters from the locked row. A missing runner is
+// ErrNotFound, never a create.
+func (f *dbFakeStore) UpdateRunnerProfileFields(ctx context.Context, runner model.Runner) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	existing, ok := f.runners[runner.ID]
+	if !ok {
+		return storage.ErrNotFound
+	}
+	merged := runner
+	merged.ActiveJobs = append([]string(nil), existing.ActiveJobs...)
+	merged.CurrentJob = existing.CurrentJob
+	merged.Completed = existing.Completed
+	merged.Failed = existing.Failed
+	if !existing.Registered.IsZero() {
+		merged.Registered = existing.Registered
+	}
+	merged.Busy = merged.Capacity > 0 && len(merged.ActiveJobs) >= merged.Capacity
+	f.runners[runner.ID] = merged
+	return nil
+}
+
+// ApproveJob mirrors the transactional JobApprovalStore contract in memory:
+// only the approval-owned fields are written, the waiting_approval -> queued
+// transition is applied, and a lease is never touched. updateJobErr models a
+// failed durable write (the DB-mode approval handler's 500 path).
+func (f *dbFakeStore) ApproveJob(ctx context.Context, jobID, actor string) (model.Job, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.updateJobErr != nil {
+		return model.Job{}, f.updateJobErr
+	}
+	j, ok := f.jobs[jobID]
+	if !ok {
+		return model.Job{}, storage.ErrNotFound
+	}
+	if !j.ApprovalRequired {
+		return model.Job{}, storage.ErrApprovalNotRequired
+	}
+	if j.Status.Terminal() {
+		return model.Job{}, storage.ErrJobTerminal
+	}
+	j.ApprovedBy = actor
+	if j.Status == model.StatusWaitingApproval {
+		j.Status = model.StatusQueued
+		j.WaitingSince = nil
+	}
+	f.jobs[jobID] = j
+	return j, nil
+}
+
 func (f *dbFakeStore) GetRunner(ctx context.Context, id string) (model.Runner, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

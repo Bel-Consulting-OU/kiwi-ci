@@ -23,6 +23,21 @@ func openRootHandle(path string) (*os.File, error) {
 	return os.Open(path)
 }
 
+// openBeneathHandle implements OpenRootBeneath on Windows: it verifies (and
+// creates) every component of rel beneath the held root with Lstat, rejecting
+// reparse points, then opens the final directory with the no-follow root
+// opener.
+func openBeneathHandle(ws *Root, rel string) (*os.File, error) {
+	target := ws.Canonical
+	if rel != "" {
+		if err := ensureParentDirs(ws, rel+"/."); err != nil {
+			return nil, err
+		}
+		target = filepath.Join(ws.Canonical, filepath.FromSlash(rel))
+	}
+	return openRootHandle(target)
+}
+
 // ensureParentDirs walks the parent components of name beneath the canonical
 // root path one component at a time: existing components are verified with
 // Lstat to be real directories (never reparse points), missing components are

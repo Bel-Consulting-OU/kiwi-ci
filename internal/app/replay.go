@@ -30,19 +30,20 @@ func Replay(ctx context.Context, args []string) error {
 	server := fs.String("server", os.Getenv("KIWI_SERVER"), "control plane URL")
 	token := fs.String("token", os.Getenv("KIWI_ADMIN_TOKEN"), "admin token")
 	pipelineFile := fs.String("pipeline", ".kiwi/pipeline.yaml", "pipeline file for the run being replayed")
-	if err := fs.Parse(args); err != nil {
+	rest, err := parseFlagsAndPositionals(fs, args)
+	if err != nil {
 		return err
 	}
-	if fs.NArg() != 2 && fs.NArg() != 3 {
+	if len(rest) != 2 && len(rest) != 3 {
 		return fmt.Errorf("usage: kiwi replay RUN JOB [STEP] --server URL --token TOKEN --pipeline FILE")
 	}
 	if *server == "" {
 		return fmt.Errorf("--server (or KIWI_SERVER) is required")
 	}
-	runID, jobKey := fs.Arg(0), fs.Arg(1)
+	runID, jobKey := rest[0], rest[1]
 	var stepID string
-	if fs.NArg() == 3 {
-		stepID = fs.Arg(2)
+	if len(rest) == 3 {
+		stepID = rest[2]
 	}
 	client := &http.Client{
 		Timeout: 120 * time.Second,

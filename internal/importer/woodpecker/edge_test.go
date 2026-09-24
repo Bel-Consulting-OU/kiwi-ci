@@ -138,6 +138,63 @@ func TestConvertWhenSingleAndEmptyBranch(t *testing.T) {
 	}
 }
 
+// TestImportWhenBranchScalarGlobAndInjection locks the F6-C fixes: a scalar
+// when.branch is honored; a wildcard pattern becomes a glob predicate that
+// still matches glob-style; and a branch value containing a quote cannot
+// inject condition operators (the condition is left unset and reported).
+func TestImportWhenBranchScalarGlobAndInjection(t *testing.T) {
+	const src = `steps:
+  scalar:
+    image: alpine
+    commands: [echo s]
+    when:
+      branch: main
+  glob:
+    image: alpine
+    commands: [echo g]
+    when:
+      branch: release/*
+`
+	res, err := New().Import(src)
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	spec, err := pipeline.Parse([]byte(res.PipelineYAML))
+	if err != nil {
+		t.Fatalf("generated pipeline does not parse: %v\n%s", err, res.PipelineYAML)
+	}
+	if got := spec.Jobs["scalar"].If; got != "branch == 'main'" {
+		t.Fatalf("scalar branch if = %q", got)
+	}
+	glob := spec.Jobs["glob"].If
+	if glob != "branchMatch('release/*')" {
+		t.Fatalf("glob branch if = %q", glob)
+	}
+	// The glob predicate keeps glob semantics (release/1.2 matches,
+	// main does not).
+	if ok, err := pipeline.Eval(glob, pipeline.EvalContext{Branch: "release/1.2"}); err != nil || !ok {
+		t.Fatalf("glob if must match release/1.2: ok=%v err=%v", ok, err)
+	}
+	if ok, err := pipeline.Eval(glob, pipeline.EvalContext{Branch: "main"}); err != nil || ok {
+		t.Fatalf("glob if must not match main: ok=%v err=%v", ok, err)
+	}
+
+	// Injection: a branch value carrying a quote cannot become a condition.
+	var root yaml.Node
+	if err := yaml.Unmarshal([]byte("when:\n  branch: \"x' || true || '\"\n"), &root); err != nil {
+		t.Fatal(err)
+	}
+	res = &importer.Result{}
+	j := pipeline.Job{}
+	convertWhen(res, importer.Key(importer.Document(&root), "when"), "job", &j)
+	if j.If != "" {
+		t.Fatalf("quote-bearing branch must not produce a condition, got %q", j.If)
+	}
+	if !hasNote(res.Unsupported, "cannot be expressed") {
+		t.Fatalf("unsafe branch value not reported: %v", res.Unsupported)
+	}
+}
+
 func TestSeqAnyNilAndScalars(t *testing.T) {
 	if got := seqAny(nil); len(got) != 0 {
 		t.Fatalf("seqAny(nil) = %#v", got)

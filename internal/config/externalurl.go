@@ -2,9 +2,10 @@ package config
 
 import (
 	"fmt"
-	"net"
 	"net/url"
 	"strings"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/giturl"
 )
 
 // ValidateExternalURL parses raw as the control plane's public base URL (the
@@ -59,15 +60,13 @@ func ValidateExternalURL(raw, mode string) (string, error) {
 			return v, nil
 		}
 	}
-	return "", fmt.Errorf("external URL must use https://, or plaintext http only for a genuine loopback development host, got %q", raw)
+	return "", fmt.Errorf("external URL must use https://, or plaintext http only for a genuine loopback development host, got %s", redactURL(raw))
 }
 
 // isLoopbackHost reports whether host is a genuine loopback name or address
-// ("localhost", 127.0.0.0/8, ::1) — never a prefix lookalike.
+// ("localhost", 127.0.0.0/8, ::1) — never a prefix lookalike. It delegates to
+// the single shared giturl.IsLoopbackHost so the clone-URL rule and the
+// external-URL rule can never diverge.
 func isLoopbackHost(host string) bool {
-	if strings.EqualFold(host, "localhost") {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return giturl.IsLoopbackHost(host)
 }

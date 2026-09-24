@@ -95,7 +95,9 @@ func (b *TartBackend) StartJob(ctx context.Context, workspace string, emit func(
 		_ = b.CloseJob()
 		return &RunError{Kind: ErrorInfra, Err: err}
 	}
-	if out, err := exec.CommandContext(ctx, tart, "clone", b.VM, b.clone).CombinedOutput(); err != nil {
+	// "--" terminates tart's own flag parsing before the image reference, so
+	// a flag-shaped VM reference can never be injected as an option.
+	if out, err := exec.CommandContext(ctx, tart, "clone", "--", b.VM, b.clone).CombinedOutput(); err != nil {
 		_ = b.CloseJob()
 		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("tart clone: %v: %s", err, strings.TrimSpace(string(out)))}
 	}

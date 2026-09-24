@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 )
 
 const (
@@ -435,9 +437,9 @@ func (p *prewarmer) saveState(st prewarmState) error {
 	if err != nil {
 		return err
 	}
-	tmp := p.stateFile + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, p.stateFile)
+	// Durable replace through the shared fsutil primitive: unique temp,
+	// chmod, file fsync, checked close, rename and parent-directory fsync. A
+	// plain WriteFile+Rename could leave the prewarm state file with content
+	// that survives the rename but not a crash (no file or directory sync).
+	return fsutil.AtomicWriteFile(p.stateFile, b, 0o600)
 }

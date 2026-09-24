@@ -20,6 +20,8 @@ package workspace
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -63,7 +65,12 @@ func NewManager(source string) (*Manager, error) {
 }
 
 // Close removes the run-scoped Root and every workspace created under it.
+// It takes Manager.mu so it can never race a concurrent Prepare: without the
+// lock, RemoveAll could delete the Root while snapshot() is materializing a
+// workspace under it, leaving a half-created tree behind a "prepared" path.
 func (m *Manager) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.Root == "" {
 		return nil
 	}
@@ -241,7 +248,26 @@ func copyFile(src, dst string, mode os.FileMode) error {
 // ID. Characters outside [A-Za-z0-9_-] are replaced with "-" (runs are
 // collapsed) and the result is trimmed of leading and trailing "-", so the
 // output can never contain "..", path separators, or be empty.
+//
+// The mapping is INJECTIVE: when the sanitized form differs from the input
+// (i.e. the ID was lossy), a short SHA-256 suffix of the original ID is
+// appended. Without it, distinct IDs such as "a/b" and "a.b" both collapsed
+// to "a-b" and shared one workspace path (Prepare would then refuse the
+// second job as "already exists", or worse, a stale workspace could be
+// reused). The suffix is derived from the raw ID, so the mapping is stable
+// across processes and a replayed job always lands on the same directory.
 func sanitizeJobID(id string) string {
+	out := sanitizeJobIDBare(id)
+	if out == id {
+		return out
+	}
+	sum := sha256.Sum256([]byte(id))
+	return out + "-" + hex.EncodeToString(sum[:4])
+}
+
+// sanitizeJobIDBare is the lossy, human-readable sanitizer used for the
+// injective wrapper above and by callers that only need a safe component.
+func sanitizeJobIDBare(id string) string {
 	var b strings.Builder
 	prevDash := false
 	for _, r := range id {

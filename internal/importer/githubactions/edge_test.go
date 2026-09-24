@@ -252,6 +252,67 @@ jobs:
 	}
 }
 
+// TestImportOnScalarAndSequence locks the F6-A fix: `on: push` and
+// `on: [push, pull_request]` must produce real triggers, not an empty `on`
+// (an empty on matches every event). Unsupported events in sequence form are
+// still reported.
+func TestImportOnScalarAndSequence(t *testing.T) {
+	const jobs = "jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+
+	t.Run("scalar", func(t *testing.T) {
+		res, err := New().Import("on: push\n" + jobs)
+		if err != nil {
+			t.Fatalf("import: %v", err)
+		}
+		spec, err := pipeline.Parse([]byte(res.PipelineYAML))
+		if err != nil {
+			t.Fatalf("generated pipeline does not parse: %v\n%s", err, res.PipelineYAML)
+		}
+		if len(spec.On) != 1 {
+			t.Fatalf("on = %+v, want exactly push", spec.On)
+		}
+		if _, ok := spec.On["push"]; !ok {
+			t.Fatalf("push trigger missing: %+v", spec.On)
+		}
+	})
+
+	t.Run("sequence", func(t *testing.T) {
+		res, err := New().Import("on: [push, pull_request]\n" + jobs)
+		if err != nil {
+			t.Fatalf("import: %v", err)
+		}
+		spec, err := pipeline.Parse([]byte(res.PipelineYAML))
+		if err != nil {
+			t.Fatalf("generated pipeline does not parse: %v\n%s", err, res.PipelineYAML)
+		}
+		if len(spec.On) != 2 {
+			t.Fatalf("on = %+v, want push and pull_request", spec.On)
+		}
+		for _, ev := range []string{"push", "pull_request"} {
+			if _, ok := spec.On[ev]; !ok {
+				t.Fatalf("trigger %q missing: %+v", ev, spec.On)
+			}
+		}
+	})
+
+	t.Run("unsupported event reported", func(t *testing.T) {
+		res, err := New().Import("on: [push, workflow_dispatch]\n" + jobs)
+		if err != nil {
+			t.Fatalf("import: %v", err)
+		}
+		if !hasUnsupported(res, "workflow_dispatch") {
+			t.Fatalf("unsupported event not reported: %v", res.Unsupported)
+		}
+		spec, err := pipeline.Parse([]byte(res.PipelineYAML))
+		if err != nil {
+			t.Fatalf("generated pipeline does not parse: %v\n%s", err, res.PipelineYAML)
+		}
+		if len(spec.On) != 1 {
+			t.Fatalf("on = %+v, want only push", spec.On)
+		}
+	})
+}
+
 func TestImportRejectsMalformedInput(t *testing.T) {
 	if _, err := New().Import("a: [unclosed\n"); err == nil {
 		t.Fatal("malformed YAML must fail")

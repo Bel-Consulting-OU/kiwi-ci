@@ -74,8 +74,8 @@ func TestBareRepoKeyIsExplicitAlias(t *testing.T) {
 
 // TestBareLookupAmbiguousCanonicalKeysFailClosed: a bare lookup key with
 // several DIFFERENT canonical entries (same owner/name on different forges)
-// resolves to no entry instead of depending on map iteration order. One
-// unambiguous canonical entry still resolves.
+// DENIES (a restrictive entry is returned) instead of depending on map
+// iteration order. One unambiguous canonical entry still resolves.
 func TestBareLookupAmbiguousCanonicalKeysFailClosed(t *testing.T) {
 	enabled := true
 	disabled := false
@@ -83,8 +83,8 @@ func TestBareLookupAmbiguousCanonicalKeysFailClosed(t *testing.T) {
 		r1("github.com", "acme/backend"):         {RequireDigestPins: &enabled},
 		r1("gitlab.company.com", "acme/backend"): {RequireDigestPins: &disabled},
 	}}
-	if _, ok := cfg.RepoPolicyFor("acme/backend"); ok {
-		t.Fatal("ambiguous bare lookup must fail closed")
+	if rp, ok := cfg.RepoPolicyFor("acme/backend"); !ok || rp.Network != "none" {
+		t.Fatalf("ambiguous bare lookup must deny (not fall back to org-only): %+v ok=%v", rp, ok)
 	}
 	single := &Config{Repositories: map[string]RepoPolicy{
 		r1("github.com", "acme/backend"): {RequireDigestPins: &enabled},

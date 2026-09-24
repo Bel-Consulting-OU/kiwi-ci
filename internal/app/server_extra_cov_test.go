@@ -16,6 +16,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/config"
 )
 
 func TestServerRejectsAddressInUse(t *testing.T) {
@@ -81,17 +83,20 @@ func TestServerRateLimiterWiring(t *testing.T) {
 }
 
 func TestServerDefaultListenAndModeFromEmptyEnvironment(t *testing.T) {
-	// Empty env values fall through to the built-in defaults (:8080, dev).
-	probe, err := net.Listen("tcp", ":8080")
-	if err != nil {
-		t.Skipf("port 8080 unavailable: %v", err)
+	// Empty KIWI_SERVER_* env values must fall through to the built-in
+	// defaults (:8080, dev). Assert the defaults directly (no fixed-port
+	// bind), then prove startup on an ephemeral listener so the empty-env
+	// path is exercised without racing another process for :8080.
+	def := config.Default()
+	if def.Server.Listen != ":8080" || def.Server.Mode != "dev" {
+		t.Fatalf("built-in server defaults = listen %q mode %q, want \":8080\"/\"dev\"", def.Server.Listen, def.Server.Mode)
 	}
-	_ = probe.Close()
 	t.Setenv("KIWI_SERVER_LISTEN", "")
 	t.Setenv("KIWI_SERVER_MODE", "")
+	addr := freeTCPAddr(t)
 	ctx, cancel := context.WithCancel(context.Background())
-	errCh := startServer(t, ctx)
-	waitTCPUp(t, "127.0.0.1:8080", errCh, 10*time.Second)
+	errCh := startServer(t, ctx, "--listen", addr)
+	waitTCPUp(t, addr, errCh, 10*time.Second)
 	if err := stopServer(t, cancel, errCh); err != nil {
 		t.Fatalf("Server returned %v", err)
 	}

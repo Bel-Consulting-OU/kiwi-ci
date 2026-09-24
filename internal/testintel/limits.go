@@ -112,6 +112,25 @@ const (
 // cases, matched files and total input bytes) that only exist while reading
 // files, and truncates retained messages to MaxMessageBytes rather than
 // rejecting a producer's oversized failure text.
+// hasForbiddenControlByte reports whether s contains a byte XML 1.0 cannot
+// represent: a C0 control character other than tab (0x09), newline (0x0A) or
+// carriage return (0x0D). NUL is the dangerous case (PostgreSQL text cannot
+// store U+0000, so a report that reaches SQL fails with 22P05), but every
+// other forbidden control byte is rejected too, because the XML parser already
+// refuses it: without this check a direct /tests submission could carry a byte
+// the JUnit parser can never produce, so parser, validator and the in-memory
+// store would disagree about what a valid report is.
+func hasForbiddenControlByte(s string) bool {
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '\t' || c == '\n' || c == '\r':
+		case c < 0x20:
+			return true
+		}
+	}
+	return false
+}
+
 func ValidateReportPayload(rep model.TestReport) error {
 	// Counter bounds. Every declared counter is an int that flows into SQL
 	// int columns, the aggregate fold and metrics, so it must be inside the
@@ -154,6 +173,9 @@ func ValidateReportPayload(rep model.TestReport) error {
 	if len(rep.JobKey) > MaxTestSuiteBytes {
 		return fmt.Errorf("%w: suite identity is %d bytes, over the %d-byte suite budget", ErrLimitExceeded, len(rep.JobKey), MaxTestSuiteBytes)
 	}
+	if hasForbiddenControlByte(rep.JobKey) {
+		return fmt.Errorf("%w: suite identity contains a NUL or control byte", ErrLimitExceeded)
+	}
 	if len(rep.Cases) > MaxJobCases {
 		return fmt.Errorf("%w: %d cases exceeds the %d-case job budget", ErrLimitExceeded, len(rep.Cases), MaxJobCases)
 	}
@@ -181,14 +203,23 @@ func ValidateReportPayload(rep model.TestReport) error {
 		if len(c.Name) > MaxTestNameBytes {
 			return fmt.Errorf("%w: case %d name is %d bytes, over the %d-byte name budget", ErrLimitExceeded, i, len(c.Name), MaxTestNameBytes)
 		}
+		if hasForbiddenControlByte(c.Name) {
+			return fmt.Errorf("%w: case %d name contains a NUL or control byte", ErrLimitExceeded, i)
+		}
 		if len(c.Class) > MaxTestClassBytes {
 			return fmt.Errorf("%w: case %d class is %d bytes, over the %d-byte class budget", ErrLimitExceeded, i, len(c.Class), MaxTestClassBytes)
+		}
+		if hasForbiddenControlByte(c.Class) {
+			return fmt.Errorf("%w: case %d class contains a NUL or control byte", ErrLimitExceeded, i)
 		}
 		if !validDuration(c.Duration) {
 			return fmt.Errorf("%w: case %d duration %v is not finite, non-negative and at most %v seconds", ErrLimitExceeded, i, c.Duration, float64(maxReportDuration))
 		}
 		if len(c.Message) > MaxMessageBytes {
 			return fmt.Errorf("%w: case %d message is %d bytes, over the %d-byte message budget", ErrLimitExceeded, i, len(c.Message), MaxMessageBytes)
+		}
+		if hasForbiddenControlByte(c.Message) {
+			return fmt.Errorf("%w: case %d message contains a NUL or control byte", ErrLimitExceeded, i)
 		}
 	}
 	if skippedCases > rep.Skipped {

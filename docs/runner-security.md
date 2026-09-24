@@ -10,12 +10,19 @@ Remote jobs run in a minimal clean environment built by the runner:
 `PATH`, `LANG`, `LC_ALL`, `CI`, `KIWI`. The host environment (HOME,
 SSH_AUTH_SOCK, cloud credentials, tokens) never leaks into a remote job.
 
-Two opt-in flags exist for local trusted runs only:
+Local trusted runs differ: `kiwi run` inherits the host environment **by
+default** (`--inherit-env=true`), for parity with a developer shell. Three
+flags control the boundary, and they apply to local `kiwi run` only:
 
-- `kiwi run --inherit-env` — inherit the full host environment;
-- `kiwi run --pass-env=FOO,BAR` — allowlist specific host variables.
+- `--no-inherit-env` — opt out and start from the clean environment;
+- `--inherit-env=false` — the same opt-out spelled explicitly;
+- `--pass-env=FOO,BAR` — allowlist specific host variables; when given it
+  wins over `--inherit-env` and supplies exactly those variables plus the
+  clean env.
 
-Distributed runners must never enable environment inheritance.
+Distributed runners never inherit: the runner process leaves inheritance off
+and passes no allowlist, so remote jobs always start from the clean env
+regardless of any local flag default.
 
 ## Workspaces
 

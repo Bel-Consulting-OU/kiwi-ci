@@ -50,10 +50,23 @@ func ReportDeliveryID(jobID string, leaseGeneration int64, contentDigest string)
 
 // DeliveryReportID derives the deterministic report ID for a delivery in
 // stores that have no delivery table (the in-memory dev-mode server). It is a
-// 128-bit hex ID in the same shape as newID(), derived only from the delivery
-// ID, so a retried delivery overwrites (never duplicates) the same record.
-func DeliveryReportID(deliveryID string) string {
-	sum := sha256.Sum256([]byte("kiwi-ci/report-delivery\x00" + deliveryID))
+// 128-bit hex ID in the same shape as newID(), derived from the delivery's
+// FULL identity — job, lease generation and delivery ID, each NUL-delimited
+// so the parts can never be confused for one another. The delivery table keys
+// on (job_id, lease_generation, delivery_id), so scoping the synthesized
+// report ID identically means two different jobs (or generations) that reuse
+// one delivery ID can never collide on a single record, while a retried
+// delivery still maps to exactly one record.
+func DeliveryReportID(jobID string, leaseGeneration int64, deliveryID string) string {
+	h := sha256.New()
+	h.Write([]byte("kiwi-ci/report-delivery"))
+	h.Write([]byte{0})
+	h.Write([]byte(jobID))
+	h.Write([]byte{0})
+	h.Write([]byte(strconv.FormatInt(leaseGeneration, 10)))
+	h.Write([]byte{0})
+	h.Write([]byte(deliveryID))
+	sum := h.Sum(nil)
 	return hex.EncodeToString(sum[:16])
 }
 

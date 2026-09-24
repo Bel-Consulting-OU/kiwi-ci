@@ -5,10 +5,49 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
+	"flag"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+// TestParseFlagsAndPositionals pins the flag/positional split that lets the
+// documented `COMMAND RUN [--flags]` order work: value-taking flags consume
+// their value, boolean flags do not, --flag=value works, and unknown flags
+// still fail.
+func TestParseFlagsAndPositionals(t *testing.T) {
+	fs := flag.NewFlagSet("t", flag.ContinueOnError)
+	srv := fs.String("server", "", "server")
+	follow := fs.Bool("follow", false, "follow")
+	rest, err := parseFlagsAndPositionals(fs, []string{"run1", "--server", "http://x", "--follow"})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(rest) != 1 || rest[0] != "run1" {
+		t.Fatalf("positionals = %v, want [run1]", rest)
+	}
+	if *srv != "http://x" || !*follow {
+		t.Fatalf("flags = %q,%v", *srv, *follow)
+	}
+
+	fs2 := flag.NewFlagSet("t2", flag.ContinueOnError)
+	srv2 := fs2.String("server", "", "server")
+	rest, err = parseFlagsAndPositionals(fs2, []string{"--server=http://y", "run2", "--", "--looks-like-a-flag"})
+	if err != nil {
+		t.Fatalf("parse2: %v", err)
+	}
+	if *srv2 != "http://y" {
+		t.Fatalf("server = %q", *srv2)
+	}
+	if len(rest) != 2 || rest[0] != "run2" || rest[1] != "--looks-like-a-flag" {
+		t.Fatalf("positionals after -- = %v", rest)
+	}
+
+	fs3 := flag.NewFlagSet("t3", flag.ContinueOnError)
+	if _, err := parseFlagsAndPositionals(fs3, []string{"run", "--nope"}); err == nil {
+		t.Fatal("unknown flag must fail")
+	}
+}
 
 func TestParseDownstreamAllowlist(t *testing.T) {
 	got, err := parseDownstreamAllowlist([]string{

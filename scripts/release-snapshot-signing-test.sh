@@ -163,6 +163,30 @@ if grep -q '^keyperm:' "$SNAP_LOG"; then
 	fail "snapshot mode materialized a key file (permission record present)"
 fi
 
+# --- Snapshot VERSION injection must be refused before any build. ---
+# VERSION is embedded in -ldflags; a value carrying whitespace or an extra
+# `-X ...` pair would otherwise be whitespace-split by cmd/go into additional
+# linker arguments. The charset rule must reject it before the stub go is ever
+# invoked, so nothing reaches release-tool.
+INJ_CLONE="$TMP/snapshot-inject-repo"
+clone_repo "$INJ_CLONE"
+INJ_LOG="$LOG_DIR/snapshot-inject.log"
+: >"$INJ_LOG"
+if env -i \
+	PATH="$STUB_BIN:$PATH" \
+	HOME="${HOME:-$TMP}" \
+	KIWI_RELEASE_SIGNING_KEY="$KEY_PEM" \
+	KC_TEST_RELEASE_TOOL_LOG="$INJ_LOG" \
+	VERSION="1.0.0 -X github.com/Bel-Consulting-OU/kiwi-ci/internal/version.Commit=evil" \
+	sh "$INJ_CLONE/scripts/release.sh" --snapshot >"$TMP/snapshot-inject.out" 2>&1; then
+	fail "snapshot with a VERSION carrying whitespace/extra -X was accepted"
+fi
+grep -q "snapshot VERSION" "$TMP/snapshot-inject.out" ||
+	fail "snapshot VERSION rejection did not name the charset rule: $(tail -n 1 "$TMP/snapshot-inject.out")"
+if [ -s "$INJ_LOG" ]; then
+	fail "snapshot VERSION injection reached release-tool: $(head -n 1 "$INJ_LOG")"
+fi
+
 # --- Release control: the same environment must sign. ---
 REL_CLONE="$TMP/release-repo"
 clone_repo "$REL_CLONE"
@@ -179,4 +203,4 @@ grep -Eq '\[-key\] \[[^]]*release-signing-key\.pem\]' "$REL_LOG" ||
 grep -q '^keyperm: \[release-signing-key\.pem\] -rw-------' "$REL_LOG" ||
 	fail "release mode did not materialize the inline PEM as a mode-600 temp file"
 
-echo "release-snapshot-signing-test: snapshot ignored KIWI_RELEASE_SIGNING_KEY (no -key, no key file) and release control passed -key pointing at a mode-600 temp file"
+echo "release-snapshot-signing-test: snapshot ignored KIWI_RELEASE_SIGNING_KEY (no -key, no key file), refused a VERSION carrying whitespace/extra -X before any build, and release control passed -key pointing at a mode-600 temp file"

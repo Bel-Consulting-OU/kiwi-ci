@@ -184,7 +184,11 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 			b.restoreWorkspace = restore
 		}
 	}
-	args = append(args, b.Image, "sh", "-c", "while :; do sleep 3600; done")
+	// "--" terminates docker's own flag parsing, so a hostile or malformed
+	// image reference can never be reinterpreted as an option (the digest
+	// grammar also rejects flag-shaped refs for untrusted jobs, but the argv
+	// boundary is defense in depth for trusted jobs and future grammars).
+	args = append(args, "--", b.Image, "sh", "-c", "while :; do sleep 3600; done")
 	out, err := exec.CommandContext(ctx, docker, args...).CombinedOutput()
 	if err != nil {
 		restoreErr := errors.Join(b.restoreProvisionedWorkspace(), b.cleanupWorkspaceQuota())

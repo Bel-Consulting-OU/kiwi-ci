@@ -159,7 +159,7 @@ func TestTestReportLegacyResendConvergesOnce(t *testing.T) {
 		if w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/job-a/tests", "runner-tok", body, hdrs); w.Code != http.StatusCreated {
 			t.Fatalf("first legacy upload = %d: %s", w.Code, w.Body.String())
 		}
-		wantID := testintel.DeliveryReportID(synthesizedReportDeliveryID("job-a", 5, testintel.ReportContentDigest(payload)))
+		wantID := testintel.DeliveryReportID("job-a", 5, synthesizedReportDeliveryID("job-a", 5, testintel.ReportContentDigest(payload)))
 		s.mu.Lock()
 		_, durable := s.reports[wantID]
 		reports := len(s.reports)
@@ -327,7 +327,7 @@ func TestTestReportExplicitDeliveryIDIsPreserved(t *testing.T) {
 		if w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/job-a/tests", "runner-tok", body, hdrs); w.Code != http.StatusOK {
 			t.Fatalf("explicit-id resend = %d, want 200", w.Code)
 		}
-		wantID := testintel.DeliveryReportID(explicit)
+		wantID := testintel.DeliveryReportID("job-a", 5, explicit)
 		s.mu.Lock()
 		_, ok := s.reports[wantID]
 		reports := len(s.reports)

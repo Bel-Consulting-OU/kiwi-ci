@@ -331,6 +331,36 @@ func TestInputNamesSorted(t *testing.T) {
 	}
 }
 
+func TestResolveComponentRefRemoteTraversal(t *testing.T) {
+	hex := strings.Repeat("a", 64)
+	// The name half of a pinned remote ref must obey the same clean
+	// relative-path rules as a local ref: otherwise the registry name is
+	// joined into a request URL and escapes the component namespace.
+	rejected := []string{
+		"../x@sha256:" + hex,
+		"../../x@sha256:" + hex,
+		"a/../../b@sha256:" + hex,
+		"/etc/passwd@sha256:" + hex,
+		`..\x@sha256:` + hex,
+	}
+	for _, ref := range rejected {
+		if err := ResolveComponentRef(ref); err == nil {
+			t.Errorf("ResolveComponentRef(%q) = nil, want an error", ref)
+		}
+	}
+	// Well-formed pinned names still validate.
+	accepted := []string{
+		"build@sha256:" + hex,
+		"org/build@sha256:" + hex,
+		"a_b/c.d-e@sha256:" + hex,
+	}
+	for _, ref := range accepted {
+		if err := ResolveComponentRef(ref); err != nil {
+			t.Errorf("ResolveComponentRef(%q) = %v, want nil", ref, err)
+		}
+	}
+}
+
 func TestResolveComponentRefMatrix(t *testing.T) {
 	valid := []string{
 		"build.yaml",

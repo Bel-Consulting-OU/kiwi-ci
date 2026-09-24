@@ -26,15 +26,14 @@ import (
 func pgITBreakColumn(t *testing.T, st *PostgresStore, table, column string) {
 	t.Helper()
 	ctx := context.Background()
-	// 0026 derives two expression indexes from runs.payload; PostgreSQL
-	// cannot retype the column while they exist. They are irrelevant to the
-	// scanner-error assertion, so drop them in this throwaway schema first.
+	// Expression indexes derived from runs.payload (0026/0027/0034/0035/0036)
+	// block retyping the column, so drop ALL indexes on runs that reference it
+	// in this throwaway schema first (a hardcoded list would miss migration
+	// 0036's NULL-tolerant COALESCE keyset indexes, which reference payload
+	// through kiwi_normalize_run_repo_identity). They are irrelevant to the
+	// scanner-error assertion.
 	if table == "runs" && column == "payload" {
-		for _, idx := range []string{"runs_repo_identity_idx", "runs_repo_full_name_idx"} {
-			if _, err := st.pool.Exec(ctx, `DROP INDEX IF EXISTS `+idx); err != nil {
-				t.Fatalf("drop expression index %s: %v", idx, err)
-			}
-		}
+		pgITDropExpressionIndexes(t, st, "runs", "payload")
 	}
 	q := fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN %s TYPE integer USING 0`, table, column)
 	if _, err := st.pool.Exec(ctx, q); err != nil {

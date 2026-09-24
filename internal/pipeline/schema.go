@@ -136,7 +136,8 @@ const schemaSource = `{
           "enum": [
             "string",
             "boolean",
-            "integer"
+            "integer",
+            "enum"
           ]
         },
         "required": {
@@ -997,8 +998,14 @@ func checkSchemaJob(id string, j *yaml.Node) []string {
 					errs = append(errs, fmt.Sprintf("yaml: job %q cache %d must be a mapping", id, i+1))
 					continue
 				}
-				if p := mappingValue(cn, "paths"); p == nil {
+				p := mappingValue(cn, "paths")
+				switch {
+				case p == nil:
 					errs = append(errs, fmt.Sprintf("job %q cache %d is missing required field paths", id, i+1))
+				case p.Kind != yaml.SequenceNode:
+					errs = append(errs, fmt.Sprintf("yaml: job %q cache %d paths must be a sequence", id, i+1))
+				case len(p.Content) == 0:
+					errs = append(errs, fmt.Sprintf("job %q cache %d has no paths", id, i+1))
 				}
 			}
 		}
@@ -1012,8 +1019,14 @@ func checkSchemaJob(id string, j *yaml.Node) []string {
 					errs = append(errs, fmt.Sprintf("yaml: job %q artifact %d must be a mapping", id, i+1))
 					continue
 				}
-				if p := mappingValue(an, "paths"); p == nil {
+				p := mappingValue(an, "paths")
+				switch {
+				case p == nil:
 					errs = append(errs, fmt.Sprintf("job %q artifact %d is missing required field paths", id, i+1))
+				case p.Kind != yaml.SequenceNode:
+					errs = append(errs, fmt.Sprintf("yaml: job %q artifact %d paths must be a sequence", id, i+1))
+				case len(p.Content) == 0:
+					errs = append(errs, fmt.Sprintf("job %q artifact %d has no paths", id, i+1))
 				}
 			}
 		}

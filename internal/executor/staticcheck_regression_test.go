@@ -2,7 +2,6 @@ package executor
 
 import (
 	"context"
-	"os/exec"
 	"strings"
 	"testing"
 
@@ -17,9 +16,11 @@ import (
 // deferred: it is only assigned by a successful startContainerServices call,
 // and every startContainerServices failure path returns before the defer.
 func TestServiceStartupFailureFailsClosed(t *testing.T) {
-	if _, err := exec.LookPath("docker"); err == nil {
-		t.Skip("docker is available; the failure path requires its absence")
-	}
+	// Force the docker-absent path on every host (including docker-capable CI
+	// runners) instead of skipping: an empty PATH makes every
+	// exec.LookPath("docker") fail, so the fails-closed contract runs
+	// everywhere.
+	t.Setenv("PATH", t.TempDir())
 	s, err := pipeline.Parse([]byte(`version: 1
 jobs:
   svc:

@@ -24,7 +24,10 @@ var localPathRE = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
 // ResolveComponentRef validates a component reference. Remote refs must be
 // the pinned name@sha256:<hex> form; anything else containing "@" is
 // rejected. References without "@" are treated as local paths and must be
-// clean relative paths (no absolute paths, no "..", no backslashes).
+// clean relative paths (no absolute paths, no "..", no backslashes) — and the
+// name half of a remote ref is held to exactly the same rules, because it is
+// joined into a registry request URL and would otherwise escape the component
+// namespace.
 func ResolveComponentRef(ref string) error {
 	ref = strings.TrimSpace(ref)
 	if ref == "" {
@@ -34,16 +37,31 @@ func ResolveComponentRef(ref string) error {
 		if !remoteRefRE.MatchString(ref) {
 			return fmt.Errorf("invalid component reference %q: remote refs must be name@sha256:<64 hex chars> (digest pinning is mandatory)", ref)
 		}
+		name, _ := splitRemoteRef(ref)
+		if err := validateCleanRelativePath(name); err != nil {
+			return fmt.Errorf("invalid component reference %q: %v", ref, err)
+		}
 		return nil
 	}
+	if err := validateCleanRelativePath(ref); err != nil {
+		return fmt.Errorf("invalid component reference %q: %v", ref, err)
+	}
+	return nil
+}
+
+// validateCleanRelativePath rejects a component name/path that is not a clean
+// workspace-relative path: an absolute path, a backslash, a ".." segment, or
+// a character outside the accepted set. It is shared by local refs and by the
+// name half of remote refs so the two can never diverge.
+func validateCleanRelativePath(ref string) error {
 	if strings.Contains(ref, "\\") {
-		return fmt.Errorf("invalid component reference %q: backslashes are not allowed", ref)
+		return fmt.Errorf("backslashes are not allowed")
 	}
 	if strings.HasPrefix(ref, "/") {
-		return fmt.Errorf("invalid component reference %q: absolute paths are not allowed", ref)
+		return fmt.Errorf("absolute paths are not allowed")
 	}
 	if strings.Contains(ref, "..") || !localPathRE.MatchString(ref) {
-		return fmt.Errorf("invalid component reference %q: must be a clean relative path", ref)
+		return fmt.Errorf("must be a clean relative path")
 	}
 	return nil
 }

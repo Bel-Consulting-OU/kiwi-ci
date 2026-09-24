@@ -37,13 +37,17 @@ import (
 //
 // The predicate compares the run's MATERIALIZED normalized identity columns
 // (repo_identity_normalized / repo_full_name_normalized, stamped on every
-// write and backfilled by migration 0034) by simple equality, so the page is
-// served by the (repo_identity_normalized, created_at DESC, id) /
+// write and backfilled by migration 0034) through a NULL-tolerant COALESCE
+// fallback to the shared IMMUTABLE derivation functions (migration 0036,
+// rolling-upgrade gap R3-A), by simple equality, so the page is served by the
+// (repo_identity_normalized, created_at DESC, id) /
 // (repo_full_name_normalized, created_at DESC, id) indexes instead of
 // re-deriving the identity from the JSONB payload row by row — the pre-fix
 // predicate parsed identity with SUBSTRING/STRPOS/CASE/LOWER/REGEXP_REPLACE
 // inside the page predicate, so a sparse tenant could force a long walk of
-// the created-at index.
+// the created-at index. The 0036 indexes are created on the identical COALESCE
+// expression, so equality stays index-backed even for a NULL row written by a
+// pre-0034 replica, which is otherwise permanently invisible.
 //
 // The predicate mirrors auth.CanReadRepo exactly for the canonical policy
 // repository identity of a run (RepoIDForRun: stored policy_repo_id first,
@@ -185,13 +189,26 @@ func (p RunAuthzPolicy) IsUnrestricted() bool { return p.unrestricted }
 func splitRepoCandidate(repoID string) (canonical bool, fullName string) {
 	i := strings.Index(repoID, "/")
 	if i < 0 {
-		return false, repoID
+		return false, foldRepoCandidate(repoID)
 	}
 	suffix := repoID[i+1:]
 	if strings.Contains(suffix, "/") {
-		return true, suffix
+		return true, foldRepoCandidate(suffix)
 	}
-	return false, repoID
+	return false, foldRepoCandidate(repoID)
+}
+
+// foldRepoCandidate folds a candidate repository value onto the one canonical
+// path case (auth.FoldRepoFullName) EXCEPT for the explicit r1:/a1: serialized
+// spellings, whose base64url payload is case-significant and must never be
+// lowercased. It is the Go mirror of the SQL fold in
+// canonicalRepoIDBody / normalizedRunRepo*FunctionBody, so the materialized
+// columns and the in-memory decision can never disagree on case.
+func foldRepoCandidate(s string) string {
+	if strings.HasPrefix(s, auth.RepoIdentityPrefix) || strings.HasPrefix(s, auth.RepoAliasPrefix) {
+		return s
+	}
+	return auth.FoldRepoFullName(s)
 }
 
 // canonicalCandidateID canonicalizes the HOST segment of a canonical candidate
@@ -210,7 +227,7 @@ func canonicalCandidateID(repoID, fullName string) string {
 	if host == "" {
 		return repoID
 	}
-	return host + "/" + fullName
+	return host + "/" + foldRepoCandidate(fullName)
 }
 
 // Allows reports whether the policy authorizes repoID. It is the in-memory
@@ -246,31 +263,38 @@ func (p RunAuthzPolicy) Allows(repoID string) bool {
 		}
 		return p.globalRead
 	}
-	if containsString(p.aliasConflict, repoID) {
+	// Bare/alias candidate: splitRepoCandidate already folded the value onto
+	// the canonical path case (untagged only), so the alias entry comparison
+	// is case-insensitive exactly like the SQL full-name predicate.
+	if containsString(p.aliasConflict, fullName) {
 		return false
 	}
-	if containsString(p.aliasPresent, repoID) {
-		return containsString(p.aliasRead, repoID)
+	if containsString(p.aliasPresent, fullName) {
+		return containsString(p.aliasRead, fullName)
 	}
 	return p.globalRead
 }
 
-// sqlPredicate renders the SQL equivalent of Allows against the MATERIALIZED
+// sqlPredicate renders the SQL equivalent of Allows against the EFFECTIVE
 // normalized policy repository identity of a run: identityExpr is the
-// repo_identity_normalized column (the canonical "host/full" for a canonical
-// identity, ” for a bare one) and fullNameExpr is
-// repo_full_name_normalized (the owner/name remainder for a canonical
-// identity, the whole value for a bare one). Both are stamped on every run
-// write and backfilled by migration 0034 using the same canonicalization, so
-// the predicate is simple equality over indexed columns — no SUBSTRING /
-// STRPOS / CASE / LOWER / REGEXP_REPLACE parsing inside the page predicate,
-// which is what made a sparse tenant walk the created-at index.
+// NULL-tolerant repo_identity_normalized expression (the canonical "host/full"
+// for a canonical identity, ” for a bare one) and fullNameExpr is the
+// NULL-tolerant repo_full_name_normalized expression (the owner/name remainder
+// for a canonical identity, the whole value for a bare one). Both are stamped
+// on every run write and backfilled by migration 0034; the COALESCE fallback
+// (migration 0036) derives them through the SAME IMMUTABLE functions for a row
+// written by a pre-0034 replica during a rolling upgrade, which leaves the
+// columns NULL. Because the fallback closes over the columns, the expression
+// remains equality over an index — no SUBSTRING / STRPOS / CASE / LOWER /
+// REGEXP_REPLACE parsing inside the page predicate, which is what made a
+// sparse tenant walk the created-at index — and the migration-0036 keyset
+// indexes are created on the identical COALESCE expression.
 //
 // It appends every bound array to args and returns a boolean expression. The
 // unrestricted policy renders TRUE (the caller normally bypasses the
 // predicate entirely). The canonical read-grant-only case (no aliases, no
 // explicit denies, no conflicts, no global read) simplifies to one equality
-// over repo_identity_normalized. Every other shape falls back to the fully
+// over the effective identity. Every other shape falls back to the fully
 // general predicate; both are part of the single ordered keyset query with
 // LIMIT n+1 and no collection-wide enumeration or DISTINCT. The Go half of
 // each decision is Allows (and auth.CanReadRepo); the parity corpus IT pins
@@ -427,6 +451,22 @@ func normalizedRunRepoFullNameSQL(payloadExpr string) string {
 	return normalizedRunRepoFullNameFunctionName + "(" + payloadExpr + ", 'repo')"
 }
 
+// normalizedRunRepoIdentityEffectiveSQL / normalizedRunRepoFullNameEffectiveSQL
+// render the NULL-tolerant identity expressions the authorized page predicate
+// compares. COALESCE falls back to the SHARED IMMUTABLE function when the
+// materialized column is NULL — the row a pre-0034 replica inserted during a
+// rolling upgrade — so that row is classified exactly like a canonically
+// written one. Migration 0036 indexes the identical expression, so equality
+// on it stays index-backed. The expression is also the Go<->SQL seam the
+// rolling-upgrade regression IT asserts against.
+func normalizedRunRepoIdentityEffectiveSQL() string {
+	return "COALESCE(" + normalizedRunRepoIdentityColumn + ", " + normalizedRunRepoIdentitySQL("payload") + ")"
+}
+
+func normalizedRunRepoFullNameEffectiveSQL() string {
+	return "COALESCE(" + normalizedRunRepoFullNameColumn + ", " + normalizedRunRepoFullNameSQL("payload") + ")"
+}
+
 // normalizedRunRepoIdentityFunctionBody renders the body of the IMMUTABLE SQL
 // function kiwi_normalize_run_repo_identity(payload jsonb, url_key text): the
 // canonical "host/full" identity for a canonical policy repository identity
@@ -441,21 +481,24 @@ func normalizedRunRepoIdentityFunctionBody() string {
 	canonical := "(" + slash + " > 0 AND STRPOS(" + suffix + ", '/') > 0)"
 	hostRaw := "CASE WHEN " + slash + " > 0 THEN LEFT(" + r + ", " + slash + " - 1) ELSE '' END"
 	canonHost := canonicalHostFunctionName + "(" + hostRaw + ")"
-	canonID := "CASE WHEN " + canonHost + " = '' THEN " + r + " ELSE " + canonHost + " || '/' || " + suffix + " END"
+	canonID := "CASE WHEN " + canonHost + " = '' THEN " + r + " ELSE " + canonHost + " || '/' || LOWER(" + suffix + ") END"
 	return "CASE WHEN " + canonical + " THEN " + canonID + " ELSE '' END"
 }
 
 // normalizedRunRepoFullNameFunctionBody renders the body of the IMMUTABLE SQL
 // function kiwi_normalize_run_repo_full_name(payload jsonb, url_key text): the
 // owner/name remainder for a canonical identity, the whole value for a bare
-// one, and ” for the empty identity. It is exactly the fullName expression
-// the pre-materialization predicate computed.
+// one, and ” for the empty identity. The full name is folded onto the one
+// canonical PATH case (LOWER for untagged values; the explicit r1:/a1:
+// spellings are left byte-identical because their base64url payload is
+// case-significant), mirroring auth.FoldRepoFullName.
 func normalizedRunRepoFullNameFunctionBody() string {
 	r := normalizedRunRepoRepoExpr()
 	slash := "STRPOS(" + r + ", '/')"
 	suffix := "SUBSTRING(" + r + " FROM " + slash + " + 1)"
 	canonical := "(" + slash + " > 0 AND STRPOS(" + suffix + ", '/') > 0)"
-	return "CASE WHEN " + canonical + " THEN " + suffix + " ELSE " + r + " END"
+	bare := "CASE WHEN LEFT(" + r + ", 3) IN ('r1:', 'a1:') THEN " + r + " ELSE LOWER(" + r + ") END"
+	return "CASE WHEN " + canonical + " THEN LOWER(" + suffix + ") ELSE " + bare + " END"
 }
 
 // normalizedRunRepoRepoExpr renders the canonical policy-first repository
@@ -490,6 +533,25 @@ func normalizedRunRepoIdentityKeysetIndexDDL() string {
 func normalizedRunRepoFullNameKeysetIndexDDL() string {
 	return "CREATE INDEX IF NOT EXISTS runs_repo_full_name_normalized_keyset_idx\n    ON runs (" +
 		normalizedRunRepoFullNameColumn + ", created_at DESC, id COLLATE \"C\" DESC)"
+}
+
+// normalizedRunRepoIdentityFallbackKeysetIndexDDL and
+// normalizedRunRepoFullNameFallbackKeysetIndexDDL render the migration-0036
+// replacement indexes: the same composite keyset shape as the 0034 indexes,
+// but on the EFFECTIVE COALESCE expression the predicate now compares. The
+// expression MUST be byte-identical to normalizedRunRepo*EffectiveSQL, or the
+// planner cannot serve the predicate from the index (audit class: expression
+// indexes that must match query predicates). The id key stays
+// COLLATE "C" DESC (the query's keyset order) so a fixed effective identity is
+// walked in exactly (created_at DESC, id COLLATE "C" DESC) order.
+func normalizedRunRepoIdentityFallbackKeysetIndexDDL() string {
+	return "CREATE INDEX IF NOT EXISTS runs_repo_identity_normalized_keyset_idx\n    ON runs (" +
+		normalizedRunRepoIdentityEffectiveSQL() + ", created_at DESC, id COLLATE \"C\" DESC)"
+}
+
+func normalizedRunRepoFullNameFallbackKeysetIndexDDL() string {
+	return "CREATE INDEX IF NOT EXISTS runs_repo_full_name_normalized_keyset_idx\n    ON runs (" +
+		normalizedRunRepoFullNameEffectiveSQL() + ", created_at DESC, id COLLATE \"C\" DESC)"
 }
 
 // normalizedRepoColumns returns the (repo_identity_normalized,
@@ -596,7 +658,7 @@ func authorizedRunsPageSQL(policy RunAuthzPolicy, afterCreatedAt time.Time, afte
 	limit = NormalizeRunsPageLimit(limit)
 	args := make([]any, 0, 8)
 	conds := make([]string, 0, 2)
-	conds = append(conds, policy.sqlPredicate(normalizedRunRepoIdentityColumn, normalizedRunRepoFullNameColumn, &args))
+	conds = append(conds, policy.sqlPredicate(normalizedRunRepoIdentityEffectiveSQL(), normalizedRunRepoFullNameEffectiveSQL(), &args))
 	if !afterCreatedAt.IsZero() || afterID != "" {
 		args = append(args, afterCreatedAt, afterID)
 		conds = append(conds, `(created_at, id COLLATE "C") < ($`+strconv.Itoa(len(args)-1)+`::timestamptz, $`+strconv.Itoa(len(args))+`::text COLLATE "C")`)

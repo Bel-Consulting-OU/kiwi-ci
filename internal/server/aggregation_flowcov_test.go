@@ -1,10 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/logging"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
@@ -169,7 +172,19 @@ func TestFlowAggregationRecoverLeases(t *testing.T) {
 func TestFlowAggregationAuditStoreFailure(t *testing.T) {
 	s, f, _, _ := cacheFixture(t)
 	s.DB = &fcStore{dbFakeStore: f, appendAuditErr: context.DeadlineExceeded}
+	// An audit append failure is best-effort: the server must log it (with
+	// the action and the underlying error) instead of silently swallowing it
+	// or panicking.
+	var buf bytes.Buffer
+	s.Logger = logging.NewStructured(&buf)
 	s.mu.Lock()
 	s.auditLocked("test.action", "actor", "run-c", "job-a", "msg", nil)
 	s.mu.Unlock()
+	out := buf.String()
+	if !strings.Contains(out, "audit: append failed") {
+		t.Fatalf("audit failure was not logged: %s", out)
+	}
+	if !strings.Contains(out, context.DeadlineExceeded.Error()) {
+		t.Fatalf("audit failure log is missing the underlying error: %s", out)
+	}
 }

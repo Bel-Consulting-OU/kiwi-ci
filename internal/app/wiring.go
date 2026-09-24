@@ -81,6 +81,20 @@ func applyQuotaConfig(srv *server.Server, cfg *config.Config) {
 	srv.UntrustedMemoryCeiling = int64(cfg.Quota.UntrustedMemoryCeiling)
 	srv.UntrustedDiskCeiling = int64(cfg.Quota.UntrustedDiskCeiling)
 	srv.UntrustedPIDCeiling = int(cfg.Quota.UntrustedPIDsCeiling)
+	// Schedule cap and fs-mode run retention are operator-tunable bounds:
+	// 0/empty keeps the server's built-in default, -1/"0" explicitly
+	// disables the respective bound.
+	if cfg.Server.MaxSchedules != 0 {
+		srv.MaxSchedules = cfg.Server.MaxSchedules
+	}
+	if cfg.Server.MaxRetainedRuns != 0 {
+		srv.MaxRetainedRuns = cfg.Server.MaxRetainedRuns
+	}
+	if raw := strings.TrimSpace(cfg.Server.RunRetention); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil {
+			srv.RunRetention = d
+		}
+	}
 }
 
 // buildSecretBroker constructs the secret broker chain from the

@@ -42,9 +42,17 @@ published through the durable outbox.
 
 ```toml
 [gitlab]
+# Instance root. Default https://gitlab.com; point it at a self-managed
+# instance (https:// required in production; plaintext http is allowed
+# only for a loopback development instance).
+base_url = "https://gitlab.example.com"
 webhook_secret = "high-entropy-secret"
 token = ""        # API token for private pipeline fetches and statuses
 ```
+
+`base_url` may also be set with `--gitlab-base-url` or
+`KIWI_GITLAB_BASE_URL`. It must not carry userinfo, a query or a fragment;
+credentials go in `token`.
 
 See [production-deployment.md](production-deployment.md) for server
 setup.

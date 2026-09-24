@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +14,19 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+)
+
+// Bounded JSON decodes for the log-fetch endpoints. A hostile or broken
+// control plane must not be able to make the TUI buffer an unbounded body:
+// each successful response is decoded through io.LimitReader, so a body past
+// the cap fails the decode instead of growing memory without bound. Tests
+// shrink these through the vars.
+var (
+	// maxTUIListJobsBytes bounds the GET /jobs response.
+	maxTUIListJobsBytes int64 = 8 << 20
+	// maxTUILogPageBytes bounds one GET /logs page (1000 entries of
+	// potentially long lines).
+	maxTUILogPageBytes int64 = 64 << 20
 )
 
 // Client fetches run logs from a Kiwi control plane: paginated log reads
@@ -91,7 +105,7 @@ func (c *Client) ListJobs(ctx context.Context, runID string) ([]string, error) {
 	var out []struct {
 		Key string `json:"key"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxTUIListJobsBytes)).Decode(&out); err != nil {
 		return nil, err
 	}
 	keys := make([]string, 0, len(out))
@@ -121,7 +135,7 @@ func (c *Client) ReadPage(ctx context.Context, runID string, after int64, limit 
 		return nil, fmt.Errorf("logs %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
 	var out []model.LogEntry
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxTUILogPageBytes)).Decode(&out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -185,11 +199,20 @@ func readSSE(ctx context.Context, r io.Reader, onData func(string) error) error 
 	}
 }
 
+// maxChunkLineBytes bounds one buffered line in chunkReader. A hostile peer
+// that streams bytes without a newline must not grow the reader's buffer
+// without bound; past the cap readLine fails with errChunkLineTooLong rather
+// than allocating without limit.
+const maxChunkLineBytes = 1 << 20
+
+// errChunkLineTooLong is returned when a line exceeds maxChunkLineBytes.
+var errChunkLineTooLong = errors.New("tui: log line exceeds the maximum length")
+
 // chunkReader adapts an arbitrary reader into line reads without bufio's
 // per-line allocation limits. It serves exactly one line per readLine call:
 // buffered bytes are drained first, and a terminal short read (data plus a
 // read error, including io.EOF) still yields every complete line before the
-// error surfaces.
+// error surfaces. Lines are length-bounded (maxChunkLineBytes).
 type chunkReader struct {
 	r   io.Reader
 	buf []byte
@@ -201,12 +224,18 @@ func newChunkReader(r io.Reader) *chunkReader { return &chunkReader{r: r} }
 func (c *chunkReader) readLine() (string, error) {
 	for {
 		if i := indexByte(c.buf, '\n'); i >= 0 {
+			if i > maxChunkLineBytes {
+				return "", errChunkLineTooLong
+			}
 			line := strings.TrimRight(string(c.buf[:i]), "\r")
 			c.buf = c.buf[i+1:]
 			return line, nil
 		}
 		if c.err != nil {
 			if len(c.buf) > 0 {
+				if len(c.buf) > maxChunkLineBytes {
+					return "", errChunkLineTooLong
+				}
 				// Final line without a trailing newline.
 				line := strings.TrimRight(string(c.buf), "\r")
 				c.buf = nil
@@ -214,9 +243,17 @@ func (c *chunkReader) readLine() (string, error) {
 			}
 			return "", c.err
 		}
+		if len(c.buf) > maxChunkLineBytes {
+			return "", errChunkLineTooLong
+		}
 		p := make([]byte, 4096)
 		n, err := c.r.Read(p)
 		if n > 0 {
+			if len(c.buf)+n > maxChunkLineBytes && indexByte(p[:n], '\n') < 0 {
+				// No newline in this chunk and the accumulated line is
+				// already past the cap: fail closed without buffering more.
+				return "", errChunkLineTooLong
+			}
 			c.buf = append(c.buf, p[:n]...)
 		}
 		if err != nil {

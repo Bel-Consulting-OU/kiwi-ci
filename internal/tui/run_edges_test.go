@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -353,8 +354,9 @@ func TestRunInteractiveContextAndErrorChannels(t *testing.T) {
 	}
 }
 
-// TestRunInteractiveTickerRepaint blocks the key reader past the 2s repaint
-// tick so the ticker branch is exercised, then cancels the context.
+// TestRunInteractiveTickerRepaint blocks the key reader and synchronizes on
+// the second painted frame: the initial frame is synchronous, so a second
+// occurrence of the header can only come from the 2s ticker repaint branch.
 func TestRunInteractiveTickerRepaint(t *testing.T) {
 	gate := make(chan struct{})
 	reader := &gatedReader{gate: gate}
@@ -362,11 +364,19 @@ func TestRunInteractiveTickerRepaint(t *testing.T) {
 	defer cancel()
 
 	done := make(chan error, 1)
-	var out bytes.Buffer
+	var out syncBuffer
 	go func() {
 		done <- runInteractive(ctx, interactiveRing(), &Config{RunID: "r"}, &out, reader, make(chan error, 1), newJobFilter(&Client{}, "", ""), &logState{})
 	}()
-	time.Sleep(2200 * time.Millisecond)
+	// Behavior, not elapsed time: wait until a repaint actually happens.
+	deadline := time.Now().Add(8 * time.Second)
+	for strings.Count(out.String(), "run r |") < 2 {
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatalf("ticker branch never repainted; output = %q", out.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	cancel()
 	select {
 	case err := <-done:
@@ -377,9 +387,25 @@ func TestRunInteractiveTickerRepaint(t *testing.T) {
 		t.Fatal("runInteractive did not return after cancellation")
 	}
 	close(gate)
-	if !strings.Contains(out.String(), "run r |") {
-		t.Fatalf("repaint output = %q", out.String())
-	}
+}
+
+// syncBuffer is a bytes.Buffer safe for the concurrent frame writer and the
+// test's polling reader.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
 }
 
 type gatedReader struct{ gate chan struct{} }

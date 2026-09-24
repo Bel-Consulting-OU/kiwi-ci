@@ -106,6 +106,34 @@ func TestOneTimeConcurrentSingleDelivery(t *testing.T) {
 	}
 }
 
+// TestOneTimeTrustScopeIsolation pins F5-C: the delivery key includes the
+// trust scope, so a delivery made in an untrusted (fork) scope cannot consume
+// the single delivery owed to the same secret in a trusted scope, and vice
+// versa.
+func TestOneTimeTrustScopeIsolation(t *testing.T) {
+	var calls atomic.Int64
+	o := &OneTime{Inner: countingBroker{calls: &calls}}
+	ctx := context.Background()
+	untrusted := SecretScope{Repository: "r", Environment: "e", Trusted: false}
+	trusted := SecretScope{Repository: "r", Environment: "e", Trusted: true}
+
+	if _, err := o.Resolve(ctx, "TOKEN", untrusted); err != nil {
+		t.Fatalf("untrusted resolve: %v", err)
+	}
+	if _, err := o.Resolve(ctx, "TOKEN", trusted); err != nil {
+		t.Fatalf("trusted resolve after untrusted delivery must succeed: %v", err)
+	}
+	if _, err := o.Resolve(ctx, "TOKEN", untrusted); !errors.Is(err, ErrAlreadyDelivered) {
+		t.Fatalf("repeat untrusted resolve = %v, want ErrAlreadyDelivered", err)
+	}
+	if _, err := o.Resolve(ctx, "TOKEN", trusted); !errors.Is(err, ErrAlreadyDelivered) {
+		t.Fatalf("repeat trusted resolve = %v, want ErrAlreadyDelivered", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("inner resolutions = %d, want 2", got)
+	}
+}
+
 // countingBroker counts resolutions and returns a constant value.
 type countingBroker struct{ calls *atomic.Int64 }
 

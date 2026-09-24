@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"gopkg.in/yaml.v3"
@@ -79,61 +80,44 @@ func TestMarshalSpecRejectsUnencodable(t *testing.T) {
 	}
 }
 
-func TestFixDurationNodesNestedAndNonScalar(t *testing.T) {
-	const src = `
-version: 1
-name: nested
-jobs:
-  ok:
-    runtime: container
-    image: alpine
-    steps:
-      - name: one
-        run: "true"
-        timeout: 30s
-`
-	var doc yaml.Node
-	if err := yaml.Unmarshal([]byte(src), &doc); err != nil {
-		t.Fatal(err)
+// TestMarshalSpecDurationScalarAndEnvRoundTrip locks the F6-B fix: a Duration
+// serializes as a plain scalar ("30s"), and an env map whose only key is
+// "duration" survives verbatim and round-trips through pipeline.Parse. The
+// old node rewrite collapsed any single-key "duration" mapping, corrupting
+// such env maps and producing a document pipeline.Parse rejects.
+func TestMarshalSpecDurationScalarAndEnvRoundTrip(t *testing.T) {
+	spec := &pipeline.Spec{
+		Version: 1,
+		Env:     map[string]string{"duration": "5m"},
+		Jobs: map[string]pipeline.Job{
+			"ok": {
+				Runtime: "container",
+				Image:   "alpine",
+				Timeout: pipeline.Duration{Duration: 30 * time.Second, Set: true},
+				Steps:   []pipeline.Step{{Name: "one", Run: "true"}},
+			},
+		},
 	}
-	fixDurationNodes(&doc)
-	out, err := yaml.Marshal(&doc)
+	out, err := MarshalSpec(spec)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("MarshalSpec: %v", err)
 	}
-	if strings.Contains(string(out), "duration:") {
-		t.Fatalf("duration mapping survived:\n%s", out)
+	if strings.Contains(out, "duration: 30s") {
+		t.Fatalf("raw duration mapping leaked into output:\n%s", out)
 	}
-	if !strings.Contains(string(out), "timeout: 30s") {
+	if !strings.Contains(out, "timeout: 30s") {
 		t.Fatalf("timeout scalar missing:\n%s", out)
 	}
-
-	mapping := &yaml.Node{Kind: yaml.MappingNode}
-	mapping.Content = []*yaml.Node{
-		{Kind: yaml.ScalarNode, Value: "duration"},
-		{Kind: yaml.MappingNode, Content: []*yaml.Node{
-			{Kind: yaml.ScalarNode, Value: "nested"},
-			{Kind: yaml.ScalarNode, Value: "1s"},
-		}},
+	parsed, err := pipeline.Parse([]byte(out))
+	if err != nil {
+		t.Fatalf("generated pipeline does not parse: %v\n%s", err, out)
 	}
-	fixDurationNodes(mapping)
-	if mapping.Kind != yaml.MappingNode {
-		t.Fatalf("non-scalar duration value must not be collapsed")
+	if parsed.Env["duration"] != "5m" {
+		t.Fatalf("env duration key corrupted: %v", parsed.Env)
 	}
-
-	multi := &yaml.Node{Kind: yaml.MappingNode}
-	multi.Content = []*yaml.Node{
-		{Kind: yaml.ScalarNode, Value: "duration"},
-		{Kind: yaml.ScalarNode, Value: "1s"},
-		{Kind: yaml.ScalarNode, Value: "other"},
-		{Kind: yaml.ScalarNode, Value: "x"},
+	if got := parsed.Jobs["ok"].Timeout.Duration; got != 30*time.Second {
+		t.Fatalf("timeout round-trip = %v, want 30s", got)
 	}
-	fixDurationNodes(multi)
-	if multi.Content[1].Value != "1s" {
-		t.Fatalf("multi-key mapping must not be collapsed")
-	}
-
-	fixDurationNodes(&yaml.Node{Kind: yaml.ScalarNode, Value: "plain"})
 }
 
 func TestSanitizeIDLongNameIsTruncated(t *testing.T) {

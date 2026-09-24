@@ -40,6 +40,36 @@ type cachedInstallationToken struct {
 	expiresAt time.Time
 }
 
+// maxCachedInstallationTokens bounds the per-repository installation-token
+// cache. Expired entries are always dropped on access; if the cap is still
+// exceeded (a burst of distinct repositories), the soonest-expiring entries
+// are evicted so the cache cannot grow without bound.
+const maxCachedInstallationTokens = 1024
+
+// pruneCacheLocked drops expired tokens and, while the cache is over the cap,
+// evicts the soonest-expiring entries. The caller holds a.mu.
+func (a *App) pruneCacheLocked(now time.Time) {
+	for k, c := range a.cache {
+		if !c.expiresAt.After(now) {
+			delete(a.cache, k)
+		}
+	}
+	for len(a.cache) > maxCachedInstallationTokens {
+		var victim string
+		var victimExp time.Time
+		first := true
+		for k, c := range a.cache {
+			if first || c.expiresAt.Before(victimExp) {
+				victim, victimExp, first = k, c.expiresAt, false
+			}
+		}
+		if first {
+			break
+		}
+		delete(a.cache, victim)
+	}
+}
+
 type installTokenFlight struct {
 	done chan struct{}
 	tok  string
@@ -182,6 +212,7 @@ func (a *App) TokenFor(ctx context.Context, repoFullName string) (string, error)
 	now := time.Now()
 	floor := now.Add(5 * time.Minute)
 	a.mu.Lock()
+	a.pruneCacheLocked(now)
 	if c, ok := a.cache[repoFullName]; ok && c.expiresAt.After(floor) {
 		a.mu.Unlock()
 		return c.token, nil
@@ -211,6 +242,7 @@ func (a *App) TokenFor(ctx context.Context, repoFullName string) (string, error)
 	a.mu.Lock()
 	if err == nil && token != "" {
 		a.cache[repoFullName] = cachedInstallationToken{token: token, expiresAt: expires}
+		a.pruneCacheLocked(time.Now())
 	}
 	f.tok, f.exp, f.err = token, expires, err
 	delete(a.inFlight, repoFullName)

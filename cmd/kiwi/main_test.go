@@ -434,6 +434,7 @@ func TestUsageListsCommands(t *testing.T) {
 	for _, want := range []string{
 		"kiwi run", "kiwi validate", "kiwi explain", "kiwi doctor",
 		"kiwi server", "kiwi runner", "kiwi dispatch", "kiwi init",
+		"kiwi import", "kiwi replay",
 		"kiwi tui", "kiwi config check", "kiwi outbox dead-letters",
 		"kiwi storage  reconcile-reservations",
 		"kiwi storage  migrate-staging-layout",

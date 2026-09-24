@@ -105,20 +105,55 @@ func (i *Importer) Import(src string) (*importer.Result, error) {
 	return res, nil
 }
 
-// convertOn maps the `on` trigger table onto spec.On. Events Kiwi cannot
-// trigger on (workflow_dispatch, schedule, release, ...) are reported as
-// unsupported rather than silently dropped.
+// convertOn maps the `on` trigger value onto spec.On. GitHub Actions accepts
+// three shapes:
+//
+//	on: push                      (scalar: one event, no config)
+//	on: [push, pull_request]      (sequence: each entry is an event, no config)
+//	on:                           (mapping: event → config)
+//	  push:
+//	    branches: [main]
+//
+// Reading a scalar/sequence as a mapping yields no events, which would leave
+// spec.On empty — and an empty `on` matches EVERY event, silently widening
+// the trigger. All three shapes are therefore handled explicitly. Events
+// Kiwi cannot trigger on (workflow_dispatch, schedule, release, ...) are
+// reported as unsupported rather than silently dropped.
 func convertOn(res *importer.Result, on *yaml.Node, spec *pipeline.Spec) {
 	if spec.On == nil {
 		spec.On = map[string]pipeline.Trigger{}
 	}
-	for event, cfg := range importer.Mapping(on) {
+	add := func(event string, cfg *yaml.Node) {
 		switch event {
 		case "push", "pull_request":
 			spec.On[event] = triggerFrom(cfg)
 		default:
 			res.AddUnsupported("trigger %q has no Kiwi equivalent; Kiwi triggers on push/pull_request webhooks only", event)
 		}
+	}
+	switch on.Kind {
+	case yaml.ScalarNode:
+		// A null `on:` (on: with no value) carries no event names; a scalar
+		// with a value names exactly one event.
+		if strings.TrimSpace(on.Value) != "" {
+			add(strings.TrimSpace(on.Value), nil)
+		}
+	case yaml.SequenceNode:
+		for _, item := range on.Content {
+			if item.Kind != yaml.ScalarNode {
+				res.AddUnsupported("trigger entry at line %d is not a scalar event name", item.Line)
+				continue
+			}
+			if name := strings.TrimSpace(item.Value); name != "" {
+				add(name, nil)
+			}
+		}
+	case yaml.MappingNode:
+		for event, cfg := range importer.Mapping(on) {
+			add(event, cfg)
+		}
+	default:
+		res.AddUnsupported("trigger `on` must be an event name, a list of event names, or an event mapping")
 	}
 }
 

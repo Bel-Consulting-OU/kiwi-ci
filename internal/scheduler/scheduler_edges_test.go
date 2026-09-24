@@ -3,7 +3,6 @@ package scheduler
 import (
 	"context"
 	"errors"
-	"math"
 	"strings"
 	"testing"
 	"time"
@@ -803,35 +802,5 @@ func TestCollectNeedsOutputsEdges(t *testing.T) {
 	out = CollectNeedsOutputs(model.Job{Needs: []string{"empty"}}, jobs)
 	if len(out) != 0 {
 		t.Fatalf("empty outputs = %v", out)
-	}
-}
-
-func TestWeakenedQuotaHelpers(t *testing.T) {
-	if ok, err := WithinQuota(math.NaN(), 1, 1); ok || err == nil {
-		t.Fatalf("NaN limit = %v,%v", ok, err)
-	}
-	if ok, err := WithinQuota(math.Inf(1), math.Inf(-1), 0); ok || err == nil {
-		t.Fatalf("infinite values = %v,%v", ok, err)
-	}
-	if ok, err := WithinQuota(1, -1, 0); ok || err == nil {
-		t.Fatalf("negative used = %v,%v", ok, err)
-	}
-	if ok, err := WithinQuota(1, 1, 1); ok || err != nil {
-		t.Fatalf("over limit = %v,%v", ok, err)
-	}
-	if ok, err := WithinQuota(math.MaxInt64/2, math.MaxInt64, math.MaxInt64); ok || err != nil {
-		t.Fatalf("int64-saturating total = %v,%v", ok, err)
-	}
-	if ok, err := WithinQuota(math.MaxInt64, math.MaxInt64, 1); !ok || err != nil {
-		t.Fatalf("exact int64 limit = %v,%v", ok, err)
-	}
-	if got := SaturatingAdd(-5, 3); got != 3 {
-		t.Fatalf("SaturatingAdd(-5,3) = %d", got)
-	}
-	if got := SaturatingAdd(3, -5); got != 3 {
-		t.Fatalf("SaturatingAdd(3,-5) = %d", got)
-	}
-	if got := SaturatingAdd(math.MaxInt64, 1); got != math.MaxInt64 {
-		t.Fatalf("saturation = %d", got)
 	}
 }

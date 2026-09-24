@@ -6,7 +6,7 @@ func TestCanonicalRepoID(t *testing.T) {
 	cases := []struct {
 		host, fullName, want string
 	}{
-		{"github.com", "Bel-Consulting-OU/kiwi-ci", "github.com/Bel-Consulting-OU/kiwi-ci"},
+		{"github.com", "Bel-Consulting-OU/kiwi-ci", "github.com/bel-consulting-ou/kiwi-ci"},
 		{"gitlab.com", "o/r", "gitlab.com/o/r"},
 		{"", "o/r", "o/r"},
 		{"github.com", "github.com/already/hosted", "github.com/already/hosted"},

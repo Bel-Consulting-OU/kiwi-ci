@@ -11,7 +11,7 @@ privilege). Status: **Mitigated** (implemented and tested), **Partial**
 
 | Threat | Class | Mitigation | Status |
 |---|---|---|---|
-| Job inherits host credentials via environment | I | Minimal clean env; host inheritance is a local-only explicit opt-in; `--pass-env` allowlist | Mitigated |
+| Job inherits host credentials via environment | I | Minimal clean env for distributed jobs; local trusted runs inherit the host env by default (`kiwi run --inherit-env=true`), with `--no-inherit-env` as the opt-out and `--pass-env=FOO,BAR` an explicit allowlist | Mitigated |
 | `network: none` regains internet via services | E | Isolated service network created `--internal`; egress policy enforced by backend | Mitigated |
 | Unpinned image/VM swapped by mutable tag | T | `require_immutable_images` for untrusted jobs; digest check before any docker invocation | Mitigated |
 | Rootless promise not honored by daemon | E | `docker info` verification refuses rootful daemons | Mitigated |
@@ -88,16 +88,32 @@ privilege). Status: **Mitigated** (implemented and tested), **Partial**
 
 ## Residual risks to track
 
-1. **OIDC key rotation** — no previous-key window; a key compromise
-   forces immediate provider reconfiguration.
+1. **OIDC key rotation** — the key ring keeps a rotated-out signing key
+   in the JWKS for a 72-hour previous-verification window, so tokens it
+   signed stay verifiable across a rotation; a compromise is still a
+   live-key event, but verifiers are not cut off immediately and no
+   provider reconfiguration is forced within the window
+   (`internal/server/oidc.go`: `oidcPreviousKeyRetireAfter`).
 2. **Bearer-token runner mode** — shared runner tokens remain a
    supported configuration; prefer enrollment-based mTLS in multi-tenant
    environments.
-3. **Memory-backed deployment/snapshot records** — lost across
-   restarts even in DB mode.
-4. **No SBOM/Sigstore verification gates** — provenance statements
-   exist; automated signature verification gates are planned.
-5. **OpenTelemetry export** — endpoint accepted, export not
-   implemented; no distributed tracing for incident response yet.
+3. **Deployment/snapshot records** — persist durably: through
+   `DeploymentStore`/`SnapshotStore` in PostgreSQL mode (`deployments`,
+   `workspace_snapshots` tables) and through the data-dir state file in
+   filesystem mode. They are lost on restart only in the stateless
+   in-memory dev mode (no database and no `--data-dir`).
+4. **SBOM/Sigstore gates** — implemented as server-side artifact
+   contract gates: a declared `sbom` format is validated on upload, and
+   a `sigstore` gate is cryptographically verified against configured
+   trust roots. A missing or invalid required attestation fails the
+   upload (SBOM payload `400`, contract and Sigstore verification
+   `422`), and a required Sigstore gate with no configured trust root
+   fails closed (`422`) rather than being skipped
+   (`internal/server/supplychain_gate.go`).
+5. **OpenTelemetry export** — implemented: setting
+   `observability.otel_endpoint`/`--otel-endpoint` installs an OTLP/HTTP
+   exporter that emits request, forge-intake, enqueue, lease and
+   completion spans (`internal/server/tracing.go`). There is no
+   OpenTelemetry metrics/log pipeline yet.
 6. **Windows Job Object cancellation** — process-group kill covers
    common cases but not all descendants.

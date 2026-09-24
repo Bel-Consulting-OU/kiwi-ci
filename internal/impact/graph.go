@@ -111,10 +111,30 @@ func (g *Graph) AffectedJobs(jobs map[string]pipeline.Job, changed []string) []s
 	return out
 }
 
+// Bounds on graph validation. A hostile pipeline can declare an arbitrarily
+// large package graph with a long dependency chain; the recursive cycle
+// probe and the pairwise path-overlap check must be bounded so neither can
+// recurse without limit nor run for O(n^2) (or worse) time.
+const (
+	// maxImpactPackages is the largest package graph New/Validate will
+	// analyze. Larger graphs are refused rather than validated.
+	maxImpactPackages = 4000
+	// maxImpactEdgeVisits bounds total dependency-edge visits in the cycle
+	// probe, independent of the package count (a node may appear once, but
+	// each edge is still counted).
+	maxImpactEdgeVisits = 200000
+	// maxImpactOverlapPairs bounds the pairwise path-overlap comparison.
+	maxImpactOverlapPairs = 500000
+)
+
 // Validate checks the graph's integrity: every depends_on edge must
 // reference a declared package, the graph must be acyclic, and packages
-// that share path patterns are reported as warnings.
+// that share path patterns are reported as warnings. A graph larger than the
+// documented bounds is rejected before any superlinear work runs.
 func (g *Graph) Validate() error {
+	if len(g.Packages) > maxImpactPackages {
+		return fmt.Errorf("package graph has %d packages, over the %d-package validation limit", len(g.Packages), maxImpactPackages)
+	}
 	var errs []string
 	for name, p := range g.Packages {
 		for _, dep := range p.DependsOn {
@@ -135,7 +155,12 @@ func (g *Graph) Validate() error {
 	return nil
 }
 
-// findCycle returns one dependency cycle as a name chain, if any.
+// findCycle returns one dependency cycle as a name chain, if any. It is an
+// explicit-stack traversal (never Go recursion), so a hostile deep chain
+// cannot overflow the goroutine stack, and it stops after
+// maxImpactEdgeVisits edges. A traversal budget exhaustion reports "no
+// cycle" rather than spinning: missing a cycle is a validation miss, never a
+// hang or a crash.
 func (g *Graph) findCycle() ([]string, bool) {
 	const (
 		unvisited = 0
@@ -148,26 +173,46 @@ func (g *Graph) findCycle() ([]string, bool) {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	var dfs func(name string) ([]string, bool)
-	dfs = func(name string) ([]string, bool) {
-		state[name] = visiting
-		for _, dep := range g.Packages[name].DependsOn {
+	type frame struct {
+		name string
+		next int
+	}
+	visits := 0
+	for _, start := range names {
+		if state[start] != unvisited {
+			continue
+		}
+		state[start] = visiting
+		stack := []frame{{name: start}}
+		for len(stack) > 0 {
+			top := &stack[len(stack)-1]
+			deps := g.Packages[top.name].DependsOn
+			if top.next >= len(deps) {
+				state[top.name] = done
+				stack = stack[:len(stack)-1]
+				continue
+			}
+			dep := deps[top.next]
+			top.next++
+			visits++
+			if visits > maxImpactEdgeVisits {
+				return nil, false
+			}
 			switch state[dep] {
 			case visiting:
-				return []string{name, dep}, true
-			case unvisited:
-				if chain, ok := dfs(dep); ok {
-					return append([]string{name}, chain...), true
+				// dep is on the current stack: build the chain from dep back
+				// up to the top for a readable cycle description.
+				chain := []string{dep}
+				for i := len(stack) - 1; i >= 0; i-- {
+					chain = append([]string{stack[i].name}, chain...)
+					if stack[i].name == dep {
+						break
+					}
 				}
-			}
-		}
-		state[name] = done
-		return nil, false
-	}
-	for _, name := range names {
-		if state[name] == unvisited {
-			if chain, ok := dfs(name); ok {
 				return chain, true
+			case unvisited:
+				state[dep] = visiting
+				stack = append(stack, frame{name: dep})
 			}
 		}
 	}
@@ -175,7 +220,10 @@ func (g *Graph) findCycle() ([]string, bool) {
 }
 
 // pathOverlaps warns when two packages declare overlapping path patterns,
-// which makes impact attribution ambiguous.
+// which makes impact attribution ambiguous. The pairwise comparison is
+// bounded by maxImpactOverlapPairs; a larger graph reports no overlap
+// warnings (Validate already refuses graphs past maxImpactPackages) instead
+// of running for superlinear time.
 func (g *Graph) pathOverlaps() []string {
 	names := make([]string, 0, len(g.Packages))
 	for name := range g.Packages {
@@ -183,8 +231,13 @@ func (g *Graph) pathOverlaps() []string {
 	}
 	sort.Strings(names)
 	var out []string
+	pairs := 0
 	for i := 0; i < len(names); i++ {
 		for j := i + 1; j < len(names); j++ {
+			pairs++
+			if pairs > maxImpactOverlapPairs {
+				return out
+			}
 			a, b := names[i], names[j]
 			if pathsOverlap(g.Packages[a].Paths, g.Packages[b].Paths) {
 				out = append(out, fmt.Sprintf("packages %s and %s share path patterns", a, b))

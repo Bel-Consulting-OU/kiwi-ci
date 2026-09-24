@@ -162,15 +162,26 @@ func convertStepBlock(res *importer.Result, node *yaml.Node, name string) pipeli
 // reported.
 func convertWhen(res *importer.Result, when *yaml.Node, name string, j *pipeline.Job) {
 	if branches := importer.Key(when, "branch"); branches != nil {
-		vals := importer.SeqScalars(branches)
-		if len(vals) == 1 {
-			j.If = fmt.Sprintf("branch == '%s'", vals[0])
-		} else if len(vals) > 1 {
-			parts := make([]string, 0, len(vals))
-			for _, b := range vals {
-				parts = append(parts, fmt.Sprintf("branch == '%s'", b))
-			}
-			j.If = "(" + strings.Join(parts, " || ") + ")"
+		// Woodpecker accepts a scalar (`branch: main`) or a list. Reading it
+		// only as a list silently dropped the scalar form, which left the job
+		// running on every branch.
+		conds, rejected := branchConditions(branchValues(branches))
+		switch len(conds) {
+		case 0:
+		case 1:
+			j.If = conds[0]
+		default:
+			j.If = "(" + strings.Join(conds, " || ") + ")"
+		}
+		for _, bad := range rejected {
+			// The branch value cannot be interpolated into a Kiwi condition
+			// without changing its meaning (a quote would inject condition
+			// operators; a wildcard has no equality equivalent), so it is
+			// reported instead of emitted as a corrupt predicate.
+			res.AddUnsupported("step %q: when.branch %q cannot be expressed as a Kiwi job condition; the condition does not gate on it", name, bad)
+		}
+		if len(rejected) > 0 {
+			res.AddTODO("step %q: review the when.branch filters by hand (see the unsupported entry)", name)
 		}
 	}
 	if paths := importer.Key(when, "path"); paths != nil {
@@ -191,6 +202,67 @@ func convertWhen(res *importer.Result, when *yaml.Node, name string, j *pipeline
 	if importer.Key(when, "repo") != nil || importer.Key(when, "platform") != nil {
 		res.AddUnsupported("step %q: when.repo/platform filters are not converted", name)
 	}
+}
+
+// branchValues reads a Woodpecker `when.branch` value in either the scalar
+// (`branch: main`) or sequence form, skipping empty entries.
+func branchValues(n *yaml.Node) []string {
+	if n == nil {
+		return nil
+	}
+	switch n.Kind {
+	case yaml.ScalarNode:
+		if s := strings.TrimSpace(n.Value); s != "" {
+			return []string{s}
+		}
+	case yaml.SequenceNode:
+		var out []string
+		for _, item := range n.Content {
+			if item.Kind != yaml.ScalarNode {
+				continue
+			}
+			if s := strings.TrimSpace(item.Value); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// branchConditions translates Woodpecker branch filters into Kiwi job
+// condition predicates. An exact branch becomes `branch == '<name>'`; a
+// wildcard pattern (`*`, `?`, `[`) becomes a `branchMatch('<glob>')` predicate
+// so it keeps its glob meaning instead of collapsing to a literal equality
+// that never matches. Values that cannot be embedded in a single-quoted
+// condition without changing its meaning (quotes, control characters) are
+// returned in rejected and left out of the predicate.
+func branchConditions(vals []string) (conds, rejected []string) {
+	for _, b := range vals {
+		if branchValueUnsafe(b) {
+			rejected = append(rejected, b)
+			continue
+		}
+		if strings.ContainsAny(b, "*?[") {
+			conds = append(conds, fmt.Sprintf("branchMatch('%s')", b))
+			continue
+		}
+		conds = append(conds, fmt.Sprintf("branch == '%s'", b))
+	}
+	return conds, rejected
+}
+
+// branchValueUnsafe reports whether v contains a single quote or control
+// character. Kiwi's condition evaluator has no escape sequence inside string
+// literals, so a quote would terminate the literal early and let the rest of
+// the value become condition operators (`branch == 'x' || true || ”`).
+func branchValueUnsafe(v string) bool {
+	for _, r := range v {
+		if r == '\'' || r < 0x20 || r == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 
 func seqAny(n *yaml.Node) []any {

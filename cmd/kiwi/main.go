@@ -70,6 +70,8 @@ func dispatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return app.Import(args[1:])
 	case "replay":
 		return app.Replay(ctx, args[1:])
+	case "verify":
+		return app.VerifyArtifact(args[1:])
 	case "init":
 		return app.Init(args[1:])
 	case "runs", "jobs", "logs", "cancel", "approve", "rerun", "artifacts", "schedules", "policy":
@@ -237,6 +239,9 @@ Usage:
   kiwi runner   --server http://127.0.0.1:8080 --token TOKEN [--drain]
   kiwi runner list|drain|disable|enable --server URL --token ADMIN_TOKEN [RUNNER_ID]
   kiwi dispatch --repo owner/name --ref main --input k=v --pipeline FILE
+  kiwi import   github-actions|gitlab|circleci|woodpecker [--file PATH] [--out PATH] [--list-unsupported]
+  kiwi replay   RUN JOB [STEP] --server URL --token TOKEN --pipeline FILE
+  kiwi verify   [--server URL] [--token TOKEN] [--trusted-key PATH] ARTIFACT_ID
   kiwi runs [--server URL] [--token ADMIN_TOKEN]
   kiwi jobs RUN [--server URL] [--token ADMIN_TOKEN]
   kiwi logs RUN [--job KEY] [--follow] [--interactive] [--server URL] [--token ADMIN_TOKEN]

@@ -88,47 +88,21 @@ func Confidence(supported, unsupported, todos int) float64 {
 }
 
 // MarshalSpec renders a pipeline.Spec as YAML suitable for pipeline.Parse.
-// pipeline.Duration is a struct wrapping time.Duration, so yaml.v3 encodes it
-// as a nested {duration: "5m0s"} mapping; a post-encode pass collapses those
-// mappings back into plain duration string scalars that pipeline.Parse
-// accepts.
+// pipeline.Duration implements MarshalYAML, so durations are encoded as plain
+// duration string scalars ("5m0s") rather than nested {duration: ...}
+// mappings. There is deliberately no post-encode rewrite of "duration"
+// mappings: such a pass cannot distinguish a Duration from a user env/vars
+// map whose only key is "duration", and would corrupt the latter.
 func MarshalSpec(spec *pipeline.Spec) (string, error) {
 	var doc yaml.Node
 	if err := doc.Encode(spec); err != nil {
 		return "", fmt.Errorf("encode spec: %w", err)
 	}
-	fixDurationNodes(&doc)
 	out, err := yaml.Marshal(&doc)
 	if err != nil {
 		return "", fmt.Errorf("marshal spec: %w", err)
 	}
 	return string(out), nil
-}
-
-// fixDurationNodes rewrites the encoded form of pipeline.Duration (a mapping
-// whose only key is "duration" with a scalar duration-string value) into a
-// plain string scalar ("5m0s"). No other spec field produces a single-key
-// "duration" mapping, so the match is unambiguous.
-func fixDurationNodes(n *yaml.Node) {
-	switch n.Kind {
-	case yaml.DocumentNode:
-		for _, c := range n.Content {
-			fixDurationNodes(c)
-		}
-	case yaml.MappingNode:
-		for i := 0; i+1 < len(n.Content); i += 2 {
-			k, v := n.Content[i], n.Content[i+1]
-			if k.Value == "duration" && len(n.Content) == 2 && v.Kind == yaml.ScalarNode {
-				*n = *v
-				return
-			}
-			fixDurationNodes(v)
-		}
-	case yaml.SequenceNode:
-		for _, c := range n.Content {
-			fixDurationNodes(c)
-		}
-	}
 }
 
 // idRegexp mirrors pipeline's job id grammar: the importer must only emit

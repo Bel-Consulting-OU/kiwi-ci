@@ -41,9 +41,17 @@ outbox.
 
 ```toml
 [forgejo]
+# Instance root. Default https://codeberg.org; point it at a self-managed
+# Forgejo/Gitea instance (https:// required in production; plaintext http
+# is allowed only for a loopback development instance).
+base_url = "https://forgejo.example.com"
 webhook_secret = "high-entropy-secret"
 token = ""        # API token for private pipeline fetches and statuses
 ```
+
+`base_url` may also be set with `--forgejo-base-url` or
+`KIWI_FORGEJO_BASE_URL`. It must not carry userinfo, a query or a fragment;
+credentials go in `token`.
 
 See [production-deployment.md](production-deployment.md) for server
 setup.

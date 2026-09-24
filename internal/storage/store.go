@@ -84,6 +84,14 @@ var (
 	// different lines, and the append fails closed (nothing is inserted)
 	// instead of silently accepting the second payload or dropping it.
 	ErrLogBatchConflict = errors.New("storage: log batch payload conflict")
+	// ErrApprovalNotRequired means ApproveJob addressed a job whose
+	// ApprovalRequired flag is false: there is nothing to approve. The
+	// handler maps it to 409.
+	ErrApprovalNotRequired = errors.New("storage: job does not require approval")
+	// ErrJobTerminal means ApproveJob addressed a job already in a terminal
+	// state: approval can never move a terminal job. The handler maps it to
+	// 409.
+	ErrJobTerminal = errors.New("storage: job is already terminal")
 )
 
 // QuotaExceededError is returned by quota admission inside InsertCompiledRun
@@ -872,6 +880,52 @@ type RunnerDisableStore interface {
 	// leases. Replaying the call is state-idempotent: already-revoked leases
 	// move nothing and the revocation insert is conflict-tolerant.
 	DisableRunnerAndRevokeCert(ctx context.Context, runnerID, certSerial, actor string) (revoked int, err error)
+}
+
+// RunnerProfileUpdateStore is the guarded runner-profile write contract.
+//
+// A runner row mixes two owners:
+//
+//   - PROFILE/ADMIN fields (name, labels, region, repository allowlist,
+//     capabilities, capacity, resource capacity, costs, certificate serial,
+//     profile marker, registered/last_seen, disabled/draining) are written by
+//     registration and admin actions;
+//   - LEASE-OWNED fields (active_jobs, busy, current_job) and the counters
+//     (completed, failed) are written ONLY by the lease/transition
+//     transactions (AcquireLeaseAtomic, CompleteJob, ReleaseRunnerJob,
+//     recovery), under the runner row lock.
+//
+// A whole-row UpsertRunner from a caller's stale model used to overwrite the
+// lease-owned fields: a re-registration (or drain/enable) that raced a
+// concurrent claim could drop the just-appended slot and then admit a second
+// job beyond capacity. Both implementations now merge the profile/admin
+// fields under the runner row lock and preserve the lease-owned fields, so a
+// stale caller can never shrink or clear the active set; a fresh runner row
+// is the only path that seeds those fields.
+type RunnerProfileUpdateStore interface {
+	// UpdateRunnerProfileFields updates only the profile/admin fields of an
+	// EXISTING runner, preserving active_jobs/busy/current_job/completed/
+	// failed from the locked row. A missing runner returns ErrNotFound: a
+	// profile edit never creates a runner (use UpsertRunner to register).
+	UpdateRunnerProfileFields(ctx context.Context, runner model.Runner) error
+}
+
+// JobApprovalStore is the transactional approval contract for
+// environment-gated jobs. approveJobDB previously did GetJob then a whole-row
+// UpdateJob: a caller that read a waiting_approval job and then wrote after a
+// concurrent approve+claim could reset status/lease from its stale model,
+// leaving the runner slot, quota reservation and resource reservation held
+// while the job looked re-queued. ApproveJob locks the job row FOR UPDATE and
+// writes ONLY the approval-owned payload fields (and the waiting_approval ->
+// queued status transition); it never touches a lease column.
+type JobApprovalStore interface {
+	// ApproveJob records actor as the approver of jobID and, while the job is
+	// waiting_approval, moves it to queued. A job that does not require
+	// approval returns ErrApprovalNotRequired; a terminal job returns
+	// ErrJobTerminal. A job already approved (queued or running) keeps its
+	// status and lease: only the approver is (re)recorded. The updated job is
+	// returned.
+	ApproveJob(ctx context.Context, jobID, actor string) (model.Job, error)
 }
 
 // RecoveryCandidate is one bounded-discovery result built ONLY from the

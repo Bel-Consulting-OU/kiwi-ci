@@ -55,6 +55,12 @@ func TestMetricsServeHTTPErrorStatus(t *testing.T) {
 	m.Counter("x", 1)
 	rec := httptest.NewRecorder()
 	m.ServeHTTP(&failThenRecorder{ResponseRecorder: rec}, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("ServeHTTP after an exposition write failure = %d, want 500", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "flush refused") {
+		t.Fatalf("ServeHTTP error body = %q, want the exposition error surfaced", rec.Body.String())
+	}
 }
 
 type failThenRecorder struct {

@@ -31,6 +31,8 @@ explicit `if` runs only while the job status still admits `success()`.
 ## Condition syntax
 
 - `success()`, `failure()`, `cancelled()`, `always()`
+- `branchMatch('<glob>')` — true when the branch being built matches the
+  quoted glob
 - `!expr`, `a && b`, `a || b`, parentheses
 - comparisons: `left == right`, `left != right`
 - left-hand values: `status`, `event`, `branch`, `env.NAME`, or a
@@ -40,7 +42,17 @@ Example:
 
 ```yaml
 if: always() && branch == 'main'
+if: branchMatch('release/**')
 ```
+
+`branchMatch` takes exactly one single- or double-quoted literal (an
+unquoted or empty argument is not a `branchMatch` call and falls through
+to the unsupported-condition error). The glob uses the same path-segment
+semantics as trigger path filters: `*` matches within one path segment,
+`**` matches across segments, and `?` matches one character. It exists
+for imported Woodpecker `when.branch` wildcard filters, which have no
+exact-equality equivalent; `branch == '<name>'` remains the exact-match
+comparison.
 
 Condition evaluation errors yield false (the step or job does not run).
 

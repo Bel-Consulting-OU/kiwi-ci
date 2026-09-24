@@ -134,12 +134,17 @@ func TestImportEdgeFixture(t *testing.T) {
 		t.Fatalf("gamma retry = %+v", gamma.Retry)
 	}
 
-	// rules: changes → paths; when: never → if false.
+	// rules: changes → paths. The trailing when: never is guarded by that
+	// earlier changes rule, so it must NOT become an unconditional if false:
+	// doing so silently disables a job the source runs on docs changes.
 	if len(gamma.Paths) != 1 || gamma.Paths[0] != "docs/**" {
 		t.Fatalf("gamma paths = %v", gamma.Paths)
 	}
-	if gamma.If != "false" {
-		t.Fatalf("gamma if = %q, want false", gamma.If)
+	if gamma.If != "" {
+		t.Fatalf("guarded when: never must leave if unset, got %q", gamma.If)
+	}
+	if !hasNote(res.Unsupported, "when: never") {
+		t.Fatalf("guarded when: never not reported: %v", res.Unsupported)
 	}
 
 	// Job cache.
@@ -271,6 +276,57 @@ func TestConvertCacheVariants(t *testing.T) {
 	}
 	if len(res.Unsupported) != 1 || !strings.Contains(res.Unsupported[0], "no paths") {
 		t.Fatalf("unsupported = %v", res.Unsupported)
+	}
+}
+
+// TestConvertRulesGuardedWhenNever locks the F6-D fix: only an unguarded
+// when: never becomes if "false". A never guarded by a sibling changes/if or
+// by an earlier conditional rule is reported and leaves if unset, instead of
+// silently disabling a job the source would run under the guard.
+func TestConvertRulesGuardedWhenNever(t *testing.T) {
+	rulesNode := func(t *testing.T, src string) *yaml.Node {
+		t.Helper()
+		var root yaml.Node
+		if err := yaml.Unmarshal([]byte(src), &root); err != nil {
+			t.Fatal(err)
+		}
+		return importer.Key(importer.Document(&root), "rules")
+	}
+
+	j := pipeline.Job{}
+	res := &importer.Result{}
+	convertRules(res, rulesNode(t, "rules:\n  - when: never\n"), "job", &j)
+	if j.If != "false" {
+		t.Fatalf("unguarded when: never = %q, want false", j.If)
+	}
+	if len(res.Unsupported) != 0 {
+		t.Fatalf("unguarded when: never reported: %v", res.Unsupported)
+	}
+
+	j = pipeline.Job{}
+	res = &importer.Result{}
+	convertRules(res, rulesNode(t, "rules:\n  - changes: [docs/**]\n    when: never\n"), "job", &j)
+	if j.If != "" {
+		t.Fatalf("guarded when: never must not force false, got %q", j.If)
+	}
+	if len(j.Paths) != 0 {
+		t.Fatalf("a never-with-changes rule is an exclusion, not a path include: %v", j.Paths)
+	}
+	if !hasNote(res.Unsupported, "when: never") {
+		t.Fatalf("guarded when: never not reported: %v", res.Unsupported)
+	}
+
+	j = pipeline.Job{}
+	res = &importer.Result{}
+	convertRules(res, rulesNode(t, "rules:\n  - changes: [docs/**]\n  - when: never\n"), "job", &j)
+	if j.If != "" {
+		t.Fatalf("when: never after a guarded rule must not force false, got %q", j.If)
+	}
+	if len(j.Paths) != 1 || j.Paths[0] != "docs/**" {
+		t.Fatalf("guarded changes rule paths = %v", j.Paths)
+	}
+	if !hasNote(res.Unsupported, "earlier rule") {
+		t.Fatalf("guarded-by-earlier-rule when: never not reported: %v", res.Unsupported)
 	}
 }
 

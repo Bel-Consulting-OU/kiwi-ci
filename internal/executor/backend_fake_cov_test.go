@@ -125,6 +125,20 @@ cmd=$(printf '%s' "$last" | sed "s#/Volumes/My Shared Files/workspace#${FAKE_WS}
 eval "$cmd"
 `
 
+// listenTartAgentBootstrap binds the guest kiwi-agent endpoint on the
+// production bootstrap port (tartAgentPort). That port is a production
+// constant, so a test cannot choose an ephemeral port without a production
+// seam; the helper fails closed instead of skipping when the port is
+// occupied, so the StartJob bootstrap contract never silently stops running.
+func listenTartAgentBootstrap(t *testing.T) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", tartAgentPort))
+	if err != nil {
+		t.Fatalf("cannot bind the production tart-agent bootstrap port %d: %v (an external process holds it)", tartAgentPort, err)
+	}
+	return ln
+}
+
 // installFakeBins writes the fake bin scripts and prepends them to PATH.
 func installFakeBins(t *testing.T) string {
 	t.Helper()
@@ -581,11 +595,8 @@ func TestTartBackendStartJobViaFakes(t *testing.T) {
 	testutil.UnixShell(t)
 	installFakeBins(t)
 	ws := t.TempDir()
-	// A local kiwi-agent on the fixed bootstrap port accepts the key.
-	ln, err := net.Listen("tcp", "127.0.0.1:4545")
-	if err != nil {
-		t.Skipf("port 4545 unavailable: %v", err)
-	}
+	// A local kiwi-agent on the production bootstrap port accepts the key.
+	ln := listenTartAgentBootstrap(t)
 	agent := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != tartAgentKeyPath || r.Method != http.MethodPost {
 			http.NotFound(w, r)

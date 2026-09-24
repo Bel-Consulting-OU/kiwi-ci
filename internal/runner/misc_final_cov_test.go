@@ -258,7 +258,10 @@ func TestFinalPrewarmStaleTartDeleteFailure(t *testing.T) {
 func TestFinalPrewarmSaveStateWriteFailure(t *testing.T) {
 	dir := t.TempDir()
 	stateFile := filepath.Join(dir, "state.json")
-	if err := os.Mkdir(stateFile+".tmp", 0o755); err != nil {
+	// The durable writer renames a unique temp file over stateFile; a
+	// non-empty directory at that path makes the rename fail, so the
+	// failure is surfaced instead of silently dropped.
+	if err := os.MkdirAll(filepath.Join(stateFile, "child"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	p := &prewarmer{stateFile: stateFile}

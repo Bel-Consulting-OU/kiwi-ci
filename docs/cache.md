@@ -47,9 +47,28 @@ cache state later consumed by trusted runs.
 ## Remote protocol
 
 When a runner's cache store has `RemoteURL` set, restore falls back to
-`GET /api/v1/cache/{key}` and save mirrors to
-`PUT /api/v1/cache/{key}` on the control plane, authenticated with the
-runner credential. The server records cache uploads per job.
+`GET /api/v1/jobs/{id}/cache/{key}` and save mirrors to
+`PUT /api/v1/jobs/{id}/cache/{key}` on the control plane. The route is
+job-scoped: the control plane derives the cache namespace (repository plus
+trust domain) from the leased job, so the repository and trust-domain headers
+are never sent and must not be. The legacy un-scoped `/api/v1/cache/{key}`
+path does not exist and answers `404`.
+
+Both verbs authenticate with the runner credential (`Authorization: Bearer`)
+and carry the same job-lease headers as every runner-tier route:
+
+| Header | Meaning |
+| --- | --- |
+| `X-Kiwi-Runner-ID` | Authenticated runner ID. |
+| `X-Kiwi-Lease-Token` | The active lease's raw token (HMAC-verified server-side). |
+| `X-Kiwi-Lease-Generation` | The lease generation the runner holds; a stale generation is refused. |
+
+The runner client never follows redirects on these requests. `PUT` answers
+`201 Created` with `X-Kiwi-Cache-SHA256` / `X-Kiwi-Content-SHA256` (the archive
+digest) and `X-Kiwi-Cache-Manifest-SHA256`; `GET` streams the archive with the
+same digest headers (and `X-Kiwi-Cache-Manifest-SHA256` when the signed
+envelope is available), which the runner uses to verify the bytes it restores.
+The server records cache uploads per job.
 
 ## Signed manifests
 

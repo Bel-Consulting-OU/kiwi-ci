@@ -17,6 +17,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/blob"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/quotas"
@@ -35,6 +36,18 @@ type ServerConfig struct {
 	TLSKey  string `toml:"tls_key"`
 	// Mode is "dev" (in-memory, default) or "production".
 	Mode string `toml:"mode"`
+	// MaxSchedules caps the number of stored schedules. 0 uses the built-in
+	// default (1000); -1 disables the cap. The cap bounds the per-tick
+	// schedule scan work.
+	MaxSchedules int `toml:"max_schedules"`
+	// RunRetention is the fs-mode terminal-run retention window as a Go
+	// duration string (e.g. "720h"). Unset uses the built-in default of 30
+	// days; "0" disables age-based retention.
+	RunRetention string `toml:"run_retention"`
+	// MaxRetainedRuns bounds the fs-mode run count; the oldest terminal runs
+	// are pruned first. 0 uses the built-in default (10000); -1 disables the
+	// bound.
+	MaxRetainedRuns int `toml:"max_retained_runs"`
 }
 
 type DatabaseConfig struct {
@@ -297,7 +310,9 @@ func validateForgeBaseURL(field, raw, mode string) error {
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("%s is not a valid URL: %w", field, err)
+		// The wrapped parse error can echo the raw URL, which may embed
+		// userinfo; print scheme/host only.
+		return fmt.Errorf("%s is not a valid URL (%s)", field, redactURL(raw))
 	}
 	if u.Scheme != "https" && u.Scheme != "http" {
 		return fmt.Errorf("%s must use http:// or https://, got %q", field, u.Scheme)
@@ -332,6 +347,21 @@ func (c *Config) Validate() error {
 	if mode == "production" {
 		if c.Server.ExternalURL == "" {
 			return fmt.Errorf("server.external_url is required in production mode (the OIDC issuer always serves in production)")
+		}
+	}
+	if c.Server.MaxSchedules < -1 {
+		return fmt.Errorf("server.max_schedules must be >= -1 (0 = default, -1 = disabled), got %d", c.Server.MaxSchedules)
+	}
+	if c.Server.MaxRetainedRuns < -1 {
+		return fmt.Errorf("server.max_retained_runs must be >= -1 (0 = default, -1 = disabled), got %d", c.Server.MaxRetainedRuns)
+	}
+	if raw := strings.TrimSpace(c.Server.RunRetention); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return fmt.Errorf("server.run_retention must be a duration such as \"720h\": %v", err)
+		}
+		if d < 0 {
+			return fmt.Errorf("server.run_retention must not be negative, got %q", raw)
 		}
 	}
 	if c.Server.ExternalURL != "" {
@@ -430,13 +460,18 @@ func (c *Config) Validate() error {
 	if c.Components.RemoteURL != "" {
 		u, err := url.Parse(c.Components.RemoteURL)
 		if err != nil {
-			return fmt.Errorf("components.remote_url: %w", err)
+			// Do NOT print the raw value: a malformed URL can still embed
+			// credentials (userinfo) that must never reach a log or error.
+			return fmt.Errorf("components.remote_url is not a valid URL (%s)", redactURL(c.Components.RemoteURL))
+		}
+		if u.User != nil {
+			return fmt.Errorf("components.remote_url must not carry userinfo (credentials go in components.remote_token)")
 		}
 		if u.Scheme != "https" {
-			return fmt.Errorf("components.remote_url must use https:// (got %q)", c.Components.RemoteURL)
+			return fmt.Errorf("components.remote_url must use https:// (got scheme %q for %s)", u.Scheme, redactURL(c.Components.RemoteURL))
 		}
 		if u.Host == "" {
-			return fmt.Errorf("components.remote_url has no host: %q", c.Components.RemoteURL)
+			return fmt.Errorf("components.remote_url has no host (%s)", redactURL(c.Components.RemoteURL))
 		}
 	}
 	for name, base := range map[string]string{
@@ -448,10 +483,37 @@ func (c *Config) Validate() error {
 		}
 		u, err := url.Parse(base)
 		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
-			return fmt.Errorf("%s must be an http(s):// URL, got %q", name, base)
+			// Print scheme/host only; the raw value may carry userinfo.
+			return fmt.Errorf("%s must be an http(s):// URL with a host, got %s", name, redactURL(base))
 		}
 	}
 	return nil
+}
+
+// redactURL renders a URL for an error message WITHOUT credentials or other
+// secret-bearing components: scheme://host only (host excludes userinfo), or
+// a placeholder when it cannot be parsed. It is used everywhere a config
+// error would otherwise echo a raw URL an operator may have populated with
+// credentials.
+func redactURL(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "(empty)"
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return "(unparseable)"
+	}
+	switch {
+	case u.Scheme != "" && u.Host != "":
+		return u.Scheme + "://" + u.Host
+	case u.Host != "":
+		return u.Host
+	case u.Scheme != "":
+		return u.Scheme // scheme present, no usable host
+	default:
+		return "(unparseable)"
+	}
 }
 
 // validateStaging enforces the staging section's contract: a usable staging
@@ -624,6 +686,15 @@ func (c *Config) ApplyEnv() error {
 	}
 	for _, e := range vars {
 		if v, ok := os.LookupEnv(e.name); ok {
+			// An EMPTY override is not a value: it must never silently
+			// replace a configured setting (KIWI_SERVER_MODE="" downgraded
+			// a production deployment to dev, skipping every production
+			// check). The mode in particular is security-bearing, so an
+			// empty value is ignored rather than coerced; a whitespace-only
+			// value is left to Validate, which rejects it.
+			if e.name == "KIWI_SERVER_MODE" && v == "" {
+				continue
+			}
 			*e.dst = v
 		}
 	}
@@ -719,7 +790,11 @@ func (c *Config) OverrideFromFlags(fs *flag.FlagSet) error {
 		case "listen":
 			c.Server.Listen = f.Value.String()
 		case "mode":
-			c.Server.Mode = f.Value.String()
+			// An explicitly empty --mode is not a value either: never let it
+			// replace a configured production mode with the dev default.
+			if v := f.Value.String(); v != "" {
+				c.Server.Mode = v
+			}
 		case "external-url":
 			c.Server.ExternalURL = f.Value.String()
 		case "tls-cert":

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
+	"net"
 	"net/url"
 	"strings"
 )
@@ -55,7 +56,7 @@ func ParseCloneURL(raw string) (host, forgePath, scheme string, err error) {
 				return "", "", "", errors.New("clone URL must not carry credentials (userinfo)")
 			}
 		}
-		if sch == "http" && !isLoopbackHost(u.Hostname()) {
+		if sch == "http" && !IsLoopbackHost(u.Hostname()) {
 			return "", "", "", errors.New("http clone URLs are only allowed for loopback hosts")
 		}
 		p, perr := cleanPath(u.Path)
@@ -151,11 +152,18 @@ func cleanPath(p string) (string, error) {
 	return p, nil
 }
 
-func isLoopbackHost(host string) bool {
-	h := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
-	switch h {
-	case "localhost", "127.0.0.1", "::1":
+// IsLoopbackHost reports whether host is a genuine loopback name or address:
+// exactly "localhost" (case-insensitive) or an IP literal that
+// net.IP.IsLoopback accepts (127.0.0.0/8, ::1). It deliberately does NOT use a
+// string prefix: a lookalike such as "127.evil.example" is a routable name,
+// and treating it as loopback would let an http:// clone URL (or a plaintext
+// issuer) point at an attacker host. This is the ONE helper shared by
+// ParseCloneURL's http rule and config.ValidateExternalURL.
+func IsLoopbackHost(host string) bool {
+	h := strings.TrimSpace(host)
+	if strings.EqualFold(h, "localhost") {
 		return true
 	}
-	return strings.HasPrefix(h, "127.")
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
 }

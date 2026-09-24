@@ -574,9 +574,10 @@ func TestSlowUploadStreamingDeadlinePolicy(t *testing.T) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	runner, jobID, leaseToken, leaseGeneration := leaseArtifactJob(t, client, base, "tok")
 
-	// The streaming-exempt artifact upload: ~1s of trickled chunks, twice the
-	// shrunk 500ms bound.
-	uploadStart := time.Now()
+	// The streaming-exempt artifact upload: a trickled body that outlives the
+	// shrunk 500ms ordinary read deadline must still be accepted (201 below);
+	// acceptance of the full slowly-trickled body is the behavioral proof, so
+	// no wall-clock lower bound is asserted.
 	upReq, err := http.NewRequest(http.MethodPut, base+"/api/v1/jobs/"+jobID+"/artifacts/bin",
 		newTrickleReader(8, 6, 200*time.Millisecond))
 	if err != nil {
@@ -594,9 +595,6 @@ func TestSlowUploadStreamingDeadlinePolicy(t *testing.T) {
 	upResp.Body.Close()
 	if upResp.StatusCode != http.StatusCreated {
 		t.Fatalf("slow artifact upload = %d %s, want 201", upResp.StatusCode, upBody)
-	}
-	if elapsed := time.Since(uploadStart); elapsed < 500*time.Millisecond {
-		t.Fatalf("slow upload finished in %v; the test did not exercise the body deadline", elapsed)
 	}
 
 	// The same trickle against an ordinary JSON route is cut by the bound:
@@ -640,8 +638,11 @@ func TestStreamingDeadlineStalledHeaderDropped(t *testing.T) {
 	if _, err := io.WriteString(conn, "GET /readiness HTTP/1.1\r\nHost: kiwi\r\n"); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(600 * time.Millisecond) // 3x the shrunken header bound
-	_, werr := io.WriteString(conn, "\r\n")
+	// The headers are deliberately left incomplete: the server must enforce
+	// ReadHeaderTimeout on its own. Blocking on the response (instead of
+	// sleeping a fixed multiple of the bound) makes the assertion behavioral:
+	// a server that never times out leaves us blocked until our own 2s read
+	// deadline fires, which fails below.
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	resp, rerr := http.ReadResponse(bufio.NewReader(conn), nil)
 	if rerr != nil {
@@ -649,9 +650,7 @@ func TestStreamingDeadlineStalledHeaderDropped(t *testing.T) {
 		if errors.As(rerr, &ne) && ne.Timeout() {
 			t.Fatal("stalled header connection was neither dropped nor answered past ReadHeaderTimeout")
 		}
-		if werr == nil {
-			t.Logf("connection dropped after the header stall: %v", rerr)
-		}
+		t.Logf("connection dropped after the header stall: %v", rerr)
 		return
 	}
 	resp.Body.Close()
@@ -708,8 +707,10 @@ func TestKeepAliveStreamClearsInheritedDeadlines(t *testing.T) {
 		t.Fatalf("readiness = %d, want 200", resp.StatusCode)
 	}
 
-	// Let the first request's absolute deadlines expire before the stream.
-	time.Sleep(700 * time.Millisecond)
+	// Request 2 starts immediately: the previous request's absolute deadlines
+	// are still inherited on the connection (they need not have expired yet),
+	// and the 1.5s stream outlives them by construction. The streaming branch
+	// must clear them before dispatch; a silent fixed sleep is not used.
 
 	// Request 2: a slow streaming PUT on the SAME connection, ~1.5s > the
 	// 400ms ordinary deadlines.
@@ -747,11 +748,13 @@ func TestKeepAliveStreamClearsInheritedDeadlines(t *testing.T) {
 	}
 }
 
-// stallAfterFirstRead sends one small chunk and then stalls long past any
-// (test-shrunk) idle bound before completing, forcing the server-side sliding
-// read deadline to fire.
+// stallAfterFirstRead sends one small chunk and then stalls on a channel
+// (released by the test once the request has been answered) before
+// completing, forcing the server-side sliding read deadline to fire without a
+// fixed sleep.
 type stallAfterFirstRead struct {
-	sent bool
+	sent    bool
+	release <-chan struct{}
 }
 
 func (b *stallAfterFirstRead) Read(p []byte) (int, error) {
@@ -759,7 +762,7 @@ func (b *stallAfterFirstRead) Read(p []byte) (int, error) {
 		b.sent = true
 		return copy(p, "kiwi"), nil
 	}
-	time.Sleep(2 * time.Second)
+	<-b.release
 	return 0, io.EOF
 }
 
@@ -783,8 +786,10 @@ func TestStreamingStalledUploadDroppedByIdleBound(t *testing.T) {
 	client := &http.Client{Timeout: 15 * time.Second}
 	runner, jobID, leaseToken, leaseGeneration := leaseArtifactJob(t, client, base, "tok")
 
-	req, err := http.NewRequest(http.MethodPut, base+"/api/v1/jobs/"+jobID+"/artifacts/bin", io.NopCloser(&stallAfterFirstRead{}))
+	release := make(chan struct{})
+	req, err := http.NewRequest(http.MethodPut, base+"/api/v1/jobs/"+jobID+"/artifacts/bin", io.NopCloser(&stallAfterFirstRead{release: release}))
 	if err != nil {
+		close(release)
 		t.Fatal(err)
 	}
 	req.ContentLength = -1
@@ -797,6 +802,9 @@ func TestStreamingStalledUploadDroppedByIdleBound(t *testing.T) {
 	start := time.Now()
 	resp, err := client.Do(req)
 	elapsed := time.Since(start)
+	// The request has been answered (or refused): release the stalled reader
+	// so the transport goroutine can finish.
+	close(release)
 	if err == nil {
 		defer resp.Body.Close()
 		_, _ = io.Copy(io.Discard, resp.Body)
@@ -843,16 +851,14 @@ func TestStreamingContinuousUploadOutlivesIdleWindows(t *testing.T) {
 	req.Header.Set("X-Kiwi-Lease-Generation", strconv.FormatInt(leaseGeneration, 10))
 	req.Header.Set("Content-Type", "application/gzip")
 
-	start := time.Now()
+	// A 201 for the full slowly-trickled body is the behavioral proof that
+	// the sliding idle bound kept resetting; no elapsed-time lower bound.
 	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("continuous slow upload failed at the transport: %v", err)
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	resp.Body.Close()
-	if elapsed := time.Since(start); elapsed < 800*time.Millisecond {
-		t.Fatalf("upload finished in %v; it never streamed past the idle window", elapsed)
-	}
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("continuous slow upload = %d %s, want 201", resp.StatusCode, body)
 	}

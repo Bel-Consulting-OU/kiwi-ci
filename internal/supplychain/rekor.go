@@ -43,6 +43,11 @@ func defaultRekorHTTPClient() *http.Client {
 
 // fetchRekorEntry fetches one log entry by UUID over strict HTTPS without
 // following redirects, bounding the response at 1 MiB.
+//
+// The configured base URL is held to the shared provider-endpoint policy: it
+// must be an https:// URL with a host and no userinfo, query or fragment.
+// Userinfo would smuggle credentials into every request line and log it, and
+// a query or fragment would survive verbatim into the assembled log-entry URL.
 func fetchRekorEntry(baseURL, uuid string) ([]byte, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
@@ -53,6 +58,15 @@ func fetchRekorEntry(baseURL, uuid string) ([]byte, error) {
 	}
 	if u.Host == "" {
 		return nil, fmt.Errorf("supplychain: Rekor base URL has no host: %q", baseURL)
+	}
+	if u.User != nil {
+		return nil, fmt.Errorf("supplychain: Rekor base URL must not carry userinfo: %q", baseURL)
+	}
+	if u.RawQuery != "" || u.ForceQuery {
+		return nil, fmt.Errorf("supplychain: Rekor base URL must not carry a query: %q", baseURL)
+	}
+	if u.Fragment != "" {
+		return nil, fmt.Errorf("supplychain: Rekor base URL must not carry a fragment: %q", baseURL)
 	}
 	target := strings.TrimRight(baseURL, "/") + rekorEntryPathPrefix + url.PathEscape(uuid)
 	c := *rekorHTTPClient()

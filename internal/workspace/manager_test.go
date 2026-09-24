@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func writeFile(t *testing.T, path, content string) {
@@ -29,28 +30,41 @@ func readFile(t *testing.T, path string) string {
 }
 
 func TestSanitizeJobID(t *testing.T) {
-	cases := map[string]string{
-		"build":           "build",
-		"build[go=1.21]":  "build-go-1-21",
-		"a/b":             "a-b",
-		"a\\b":            "a-b",
-		"..":              "job",
-		"../evil":         "evil",
-		"":                "job",
-		"matrix[x=1,y=2]": "matrix-x-1-y-2",
-		"UPPER_case-1":    "UPPER_case-1",
-		"  spaced  out ":  "spaced-out",
-	}
-	for in, want := range cases {
-		got := sanitizeJobID(in)
-		if got != want {
-			t.Errorf("sanitizeJobID(%q) = %q, want %q", in, got, want)
+	// Safe IDs sanitize to themselves exactly (no suffix), so existing
+	// workspace paths are unchanged.
+	for _, in := range []string{"build", "UPPER_case-1", "job-1", "a-b"} {
+		if got := sanitizeJobID(in); got != in {
+			t.Errorf("sanitizeJobID(%q) = %q, want the input unchanged", in, got)
 		}
+	}
+	// Lossy IDs stay safe and deterministic while carrying a stable hash
+	// suffix so distinct raw IDs can never collapse to the same component.
+	lossy := []string{"build[go=1.21]", "a/b", "a\\b", "..", "../evil", "", "matrix[x=1,y=2]", "  spaced  out "}
+	seen := map[string]string{}
+	for _, in := range lossy {
+		got := sanitizeJobID(in)
 		if got == "" || got == "." || got == ".." {
 			t.Errorf("sanitizeJobID(%q) = %q is not a safe path component", in, got)
 		}
 		if strings.ContainsAny(got, `/\`) || filepath.Base(got) != got {
 			t.Errorf("sanitizeJobID(%q) = %q contains a separator or extra component", in, got)
+		}
+		if prev, ok := seen[got]; ok {
+			t.Errorf("sanitizeJobID collision: %q and %q both map to %q", prev, in, got)
+		}
+		seen[got] = in
+		if again := sanitizeJobID(in); again != got {
+			t.Errorf("sanitizeJobID(%q) not deterministic: %q then %q", in, got, again)
+		}
+	}
+	// The auditor's collision pair must now be distinct.
+	if sanitizeJobID("a/b") == sanitizeJobID("a.b") {
+		t.Fatalf("a/b and a.b still collide: %q", sanitizeJobID("a/b"))
+	}
+	// Safe IDs keep the historical human-readable form.
+	for in, want := range map[string]string{"build": "build", "a-b": "a-b"} {
+		if got := sanitizeJobID(in); got != want {
+			t.Errorf("sanitizeJobID(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
@@ -201,5 +215,35 @@ func TestPrepareFallsBackWhenGitFails(t *testing.T) {
 	defer cleanup()
 	if got := readFile(t, filepath.Join(dir, "plain.txt")); got != "plain" {
 		t.Fatalf("fallback copy content = %q, want plain", got)
+	}
+}
+
+// TestCloseSerializesWithPrepare is the H1-E workspace regression: Close must
+// take Manager.mu, so it can never RemoveAll the run Root while a concurrent
+// Prepare is materializing a workspace under it. The test holds the lock and
+// proves Close blocks until it is released (the pre-fix Close ignored mu and
+// returned immediately).
+func TestCloseSerializesWithPrepare(t *testing.T) {
+	src := t.TempDir()
+	writeFile(t, filepath.Join(src, "file.txt"), "x")
+	m, err := NewManager(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	done := make(chan error, 1)
+	go func() { done <- m.Close() }()
+	select {
+	case <-done:
+		m.mu.Unlock()
+		t.Fatal("Close returned without waiting for Manager.mu")
+	case <-time.After(200 * time.Millisecond):
+	}
+	m.mu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatalf("Close after unlock = %v", err)
+	}
+	if _, err := os.Stat(m.Root); !os.IsNotExist(err) {
+		t.Fatalf("workspace root survived Close: %v", err)
 	}
 }

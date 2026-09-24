@@ -178,6 +178,47 @@ func TestOpsRequiresRunID(t *testing.T) {
 	}
 }
 
+// TestOpsAcceptsFlagsAfterPositionals locks the F6-E fix: the documented
+// `COMMAND RUN [--flags]` form must work, not only undocumented flags-first.
+func TestOpsAcceptsFlagsAfterPositionals(t *testing.T) {
+	srv, seen := fakeAPIServer(t)
+	flags := []string{"--server", srv.URL, "--token", "admin-token"}
+
+	run := func(sub string, args ...string) {
+		t.Helper()
+		if err := Ops(context.Background(), sub, append(append([]string{}, args...), flags...)); err != nil {
+			t.Fatalf("%s %v: %v", sub, args, err)
+		}
+	}
+	run("jobs", "run1")
+	run("cancel", "run1")
+	run("rerun", "run1")
+	run("approve", "job1")
+	run("artifacts", "run1")
+	run("logs", "run1")
+	if err := Ops(context.Background(), "schedules", append([]string{"trigger", "sch1"}, flags...)); err != nil {
+		t.Fatalf("schedules trigger sch1 [flags]: %v", err)
+	}
+
+	want := []string{
+		"GET /api/v1/runs/run1/jobs",
+		"POST /api/v1/runs/run1/cancel",
+		"POST /api/v1/runs/run1/rerun",
+		"POST /api/v1/jobs/job1/approve",
+		"GET /api/v1/runs/run1/artifacts",
+		"GET /api/v1/runs/run1/logs",
+		"POST /api/v1/schedules/sch1/trigger",
+	}
+	if len(*seen) != len(want) {
+		t.Fatalf("requests = %v, want %v", *seen, want)
+	}
+	for i, w := range want {
+		if (*seen)[i] != w {
+			t.Fatalf("request %d = %q, want %q", i, (*seen)[i], w)
+		}
+	}
+}
+
 // TestOpsLogsFollow runs the full logs+SSE path against a real Kiwi server
 // with a persistent store: the paginated backlog prints once and the
 // follow stream drains until the idle timeout closes it.

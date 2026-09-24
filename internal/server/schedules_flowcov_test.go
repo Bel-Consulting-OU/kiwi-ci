@@ -480,14 +480,14 @@ func TestFlowSchedulesUpsertMemoryBranches(t *testing.T) {
 	if _, ok := s.schedules["chosen"]; !ok {
 		t.Fatal("explicit-ID schedule not stored")
 	}
-	// Persist failure surfaces as 500.
+	// Persist failure surfaces as 503 (durability failure, not a client error).
 	block := filepath.Join(t.TempDir(), "block")
 	if err := os.WriteFile(block, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	s.dataDir = block
-	if w := doJSON(t, s, http.MethodPut, "/api/v1/schedules", "token", body); w.Code != http.StatusInternalServerError {
-		t.Fatalf("persist failure = %d, want 500", w.Code)
+	if w := doJSON(t, s, http.MethodPut, "/api/v1/schedules", "token", body); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("persist failure = %d, want 503", w.Code)
 	}
 }
 

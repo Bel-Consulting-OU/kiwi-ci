@@ -87,6 +87,28 @@ accepted.
 - Job-level secrets resolve once into the job environment; step secrets
   never reach other steps, cache keys, or persisted state.
 
+### Broker configuration
+
+`secret_broker.broker` selects the provider (`vault`, `aws`, `gcp`, `azure`,
+`onepassword` or `static`; empty disables resolution). Only the selected
+provider's fields are required, and a missing one fails startup. Each field
+also has a `--<flag>` spelling and a `KIWI_*` environment variable:
+
+| Provider | Required keys | Optional keys |
+|---|---|---|
+| `vault` | `vault_addr` | `vault_token` |
+| `aws` | `aws_region` | `aws_access_key`, `aws_secret_key`, `aws_token` (session token) |
+| `gcp` | `gcp_project`, `gcp_credentials` (service-account JSON file) | — |
+| `azure` | `azure_tenant`, `azure_client_id`, `azure_client_secret`, `azure_vault_url` | — |
+| `onepassword` | `onepassword_host`, `onepassword_token`, `onepassword_vault` | — |
+| `static` | at least one `static = "KEY=value"` entry (comma-separated) | — |
+
+`static` is a plain comma-separated `k=v` string, not a TOML array. Provider
+endpoints are validated as https (plaintext http only for an explicitly
+acknowledged loopback development instance). See
+[production-deployment.md](production-deployment.md) and
+`kiwi.example.toml`.
+
 ## OIDC
 
 The control plane is an OIDC issuer (Ed25519 key ring) with discovery

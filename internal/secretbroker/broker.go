@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"sync"
 )
 
@@ -56,9 +57,11 @@ var ErrAlreadyDelivered = errors.New("secretbroker: secret already delivered")
 // broker, so a misconfigured wrapper fails closed instead of panicking.
 var ErrNilInner = errors.New("secretbroker: broker not configured")
 
-// OneTime wraps a Broker and guarantees each (name, repository, environment)
-// combination is delivered at most once. A failed resolution does not consume
-// the delivery.
+// OneTime wraps a Broker and guarantees each (name, repository, environment,
+// trust scope) combination is delivered at most once. The trust scope is part
+// of the key so an untrusted (e.g. fork) delivery cannot consume the single
+// delivery of a trusted scope. A failed resolution does not consume the
+// delivery.
 type OneTime struct {
 	mu        sync.Mutex
 	delivered map[string]bool
@@ -71,14 +74,14 @@ func (o *OneTime) Resolve(ctx context.Context, name string, scope SecretScope) (
 	if o.Inner == nil {
 		return "", fmt.Errorf("%w: OneTime wrapper has no Inner broker", ErrNilInner)
 	}
-	key := name + "\x00" + scope.Repository + "\x00" + scope.Environment
+	key := name + "\x00" + scope.Repository + "\x00" + scope.Environment + "\x00" + strconv.FormatBool(scope.Trusted)
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.delivered == nil {
 		o.delivered = make(map[string]bool)
 	}
 	if o.delivered[key] {
-		return "", fmt.Errorf("%w: %s (repo=%q env=%q)", ErrAlreadyDelivered, name, scope.Repository, scope.Environment)
+		return "", fmt.Errorf("%w: %s (repo=%q env=%q trusted=%t)", ErrAlreadyDelivered, name, scope.Repository, scope.Environment, scope.Trusted)
 	}
 	v, err := o.Inner.Resolve(ctx, name, scope)
 	if err != nil {

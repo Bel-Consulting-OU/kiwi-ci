@@ -2,6 +2,7 @@ package secrets
 
 import (
 	"context"
+	"encoding/base32"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -154,15 +155,28 @@ func (m *Masker) Len() int {
 }
 
 // ContainsSecret reports whether s contains a registered secret value or
-// any of its derived forms (URL-escaped, base64, hex, JSON-quoted,
-// shell-quoted, multiline fragments). It is the taint predicate: a string
-// reporting true must not leave the trust boundary unmasked.
+// any of its derived forms (URL-escaped, base64/base32 in their standard and
+// URL alphabets, lower- and upper-case hex, JSON-quoted, shell-quoted,
+// multiline fragments). It is the taint predicate: a string reporting true
+// must not leave the trust boundary unmasked.
+//
+// Matching is ASCII-whitespace-insensitive: a derived form split across line
+// wraps (MIME/base64(1) 76-column output) or indented with spaces is still
+// detected, because ASCII whitespace is stripped from the candidate before
+// the second, wrapped-form comparison.
 func (m *Masker) ContainsSecret(s string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, f := range m.multiForms {
 		if strings.Contains(s, f) {
 			return true
+		}
+	}
+	if stripped := stripASCIIWhitespace(s); stripped != s {
+		for _, f := range m.multiForms {
+			if strings.Contains(stripped, f) {
+				return true
+			}
 		}
 	}
 	return false
@@ -199,15 +213,122 @@ func (m *Masker) Mask(s string) string {
 }
 
 // MaskMulti replaces occurrences of the raw secret values and all derived
-// forms (URL-escaped, base64, hex, JSON-quoted, shell-quoted, multiline
-// fragments).
+// forms (URL-escaped, base64/base32, lower- and upper-case hex, JSON-quoted,
+// shell-quoted, multiline fragments), including forms split across ASCII
+// whitespace by line wrapping (MIME/base64(1)) or indentation.
 func (m *Masker) MaskMulti(s string) string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.multiReplacer == nil {
 		return s
 	}
-	return m.multiReplacer.Replace(s)
+	out := m.multiReplacer.Replace(s)
+	stripped := stripASCIIWhitespace(out)
+	if stripped == out {
+		return out
+	}
+	// A form may span whitespace (wrapped/indented output). Only pay for the
+	// whitespace-insensitive pass when the collapsed text still holds a form.
+	if m.multiReplacer.Replace(stripped) == stripped {
+		return out
+	}
+	return m.maskAcrossWhitespace(out, stripped)
+}
+
+// maskAcrossWhitespace rewrites s so that every masked form match in the
+// ASCII-whitespace-collapsed text is replaced in place, preserving the
+// original whitespace outside each match. Forms are sorted longest-first by
+// maskForms, so the first prefix match at each position is the longest one.
+func (m *Masker) maskAcrossWhitespace(s, stripped string) string {
+	origIdx := make([]int, 0, len(stripped))
+	for i := 0; i < len(s); i++ {
+		if !isASCIIWhitespace(s[i]) {
+			origIdx = append(origIdx, i)
+		}
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	last := 0
+	for p := 0; p < len(stripped); {
+		matched := ""
+		for _, f := range m.multiForms {
+			if len(f) <= len(stripped)-p && stripped[p:p+len(f)] == f {
+				matched = f
+				break
+			}
+		}
+		if matched == "" {
+			p++
+			continue
+		}
+		start := origIdx[p]
+		end := origIdx[p+len(matched)-1] + 1
+		b.WriteString(s[last:start])
+		b.WriteString(maskReplacement)
+		last = end
+		p += len(matched)
+	}
+	b.WriteString(s[last:])
+	return b.String()
+}
+
+// lowerPercentHex lowercases the hex digits of %XX escapes so a URL-encoded
+// form written with lower-case percent hex is still matched. Bytes outside
+// escapes are untouched. It returns "" when s has no escapes, avoiding a
+// duplicate form.
+func lowerPercentHex(s string) string {
+	if !strings.Contains(s, "%") {
+		return ""
+	}
+	b := []byte(s)
+	changed := false
+	for i := 0; i+2 < len(b); i++ {
+		if b[i] != '%' {
+			continue
+		}
+		for _, j := range []int{i + 1, i + 2} {
+			if b[j] >= 'A' && b[j] <= 'F' {
+				b[j] += 'a' - 'A'
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return ""
+	}
+	return string(b)
+}
+
+// isASCIIWhitespace reports whether b is one of the ASCII whitespace bytes
+// stripped before wrapped/indented form matching.
+func isASCIIWhitespace(b byte) bool {
+	switch b {
+	case ' ', '\t', '\n', '\v', '\f', '\r':
+		return true
+	}
+	return false
+}
+
+// stripASCIIWhitespace removes ASCII whitespace from s, returning s unchanged
+// when it holds none.
+func stripASCIIWhitespace(s string) string {
+	hasWS := false
+	for i := 0; i < len(s); i++ {
+		if isASCIIWhitespace(s[i]) {
+			hasWS = true
+			break
+		}
+	}
+	if !hasWS {
+		return s
+	}
+	buf := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		if !isASCIIWhitespace(s[i]) {
+			buf = append(buf, s[i])
+		}
+	}
+	return string(buf)
 }
 
 func newMaskReplacer(forms []string) *strings.Replacer {
@@ -218,11 +339,23 @@ func newMaskReplacer(forms []string) *strings.Replacer {
 	return strings.NewReplacer(pairs...)
 }
 
+// base32NoPad is the unpadded standard base32 alphabet; base32HexNoPad is the
+// unpadded extended-hex alphabet. Both are common CLI encodings (base32(1)).
+var (
+	base32NoPad    = base32.StdEncoding.WithPadding(base32.NoPadding)
+	base32HexNoPad = base32.HexEncoding.WithPadding(base32.NoPadding)
+)
+
 // maskForms derives all maskable representations of the registered values and
-// sorts them longest-first so the Replacer prefers the longest match.
+// sorts them longest-first so the Replacer prefers the longest match. Hex is
+// derived in both cases; base64 and base32 in their standard/URL/extended-hex
+// alphabets with and without padding; URL escapes in both percent-hex cases.
+// Long encoded forms that a tool wraps or indents are matched separately by
+// the ASCII-whitespace-insensitive pass in MaskMulti/ContainsSecret, so they
+// are not enumerated here.
 func maskForms(values []string) []string {
-	seen := make(map[string]bool, len(values)*8)
-	forms := make([]string, 0, len(values)*8)
+	seen := make(map[string]bool, len(values)*16)
+	forms := make([]string, 0, len(values)*16)
 	add := func(f string) {
 		if f == "" || seen[f] {
 			return
@@ -231,12 +364,24 @@ func maskForms(values []string) []string {
 		forms = append(forms, f)
 	}
 	for _, v := range values {
+		b := []byte(v)
 		add(v)
 		add(url.QueryEscape(v))
+		add(lowerPercentHex(url.QueryEscape(v)))
 		add(url.PathEscape(v))
-		add(base64.StdEncoding.EncodeToString([]byte(v)))
-		add(base64.RawURLEncoding.EncodeToString([]byte(v)))
-		add(hex.EncodeToString([]byte(v)))
+		add(lowerPercentHex(url.PathEscape(v)))
+		add(base64.StdEncoding.EncodeToString(b))
+		add(base64.RawStdEncoding.EncodeToString(b))
+		add(base64.URLEncoding.EncodeToString(b))
+		add(base64.RawURLEncoding.EncodeToString(b))
+		add(base32.StdEncoding.EncodeToString(b))
+		add(base32NoPad.EncodeToString(b))
+		add(base32.HexEncoding.EncodeToString(b))
+		add(base32HexNoPad.EncodeToString(b))
+		add(strings.ToLower(base32.StdEncoding.EncodeToString(b)))
+		add(strings.ToLower(base32.HexEncoding.EncodeToString(b)))
+		add(hex.EncodeToString(b))
+		add(strings.ToUpper(hex.EncodeToString(b)))
 		add(strconv.Quote(v))
 		add("'" + v + "'")
 		if strings.Contains(v, "\n") {

@@ -253,6 +253,9 @@ func readSuiteElement(dec *xml.Decoder, se xml.StartElement, mask func(string) s
 			}
 		}
 	}
+	if dup, ok := duplicateAttr(se); ok {
+		return nil, fmt.Errorf("duplicate %q attribute on <%s>", dup, se.Name.Local)
+	}
 	var s Suite
 	s.Name = attrValue(se, "name")
 	// The suite name is an indexed identity component in the persisted
@@ -324,6 +327,9 @@ type caseXML struct {
 // readCase decodes one <testcase> element, applies the duration policy,
 // masking and truncation, and enforces the per-report case limit.
 func readCase(dec *xml.Decoder, se xml.StartElement, mask func(string) string, cases *int) (Case, error) {
+	if dup, ok := duplicateAttr(se); ok {
+		return Case{}, fmt.Errorf("duplicate %q attribute on <%s>", dup, se.Name.Local)
+	}
 	var cx caseXML
 	if err := dec.DecodeElement(&cx, &se); err != nil {
 		return Case{}, err
@@ -652,6 +658,24 @@ func retainedFailureText(message, body string) string {
 	return combined
 }
 
+// duplicateAttr returns the name of the first attribute (matched by local
+// name) that appears more than once on se. XML 1.0 makes duplicate attributes
+// a well-formedness error, and the two decode paths in this file used to
+// disagree about them: suites resolved the first match (attrValue) while
+// testcases, decoded through encoding/xml, resolved the last. Rejecting
+// duplicates in ONE place gives every element the same deterministic rule and
+// refuses the ambiguous input instead of silently picking a value.
+func duplicateAttr(se xml.StartElement) (string, bool) {
+	seen := make(map[string]bool, len(se.Attr))
+	for _, a := range se.Attr {
+		if seen[a.Name.Local] {
+			return a.Name.Local, true
+		}
+		seen[a.Name.Local] = true
+	}
+	return "", false
+}
+
 func attrValue(se xml.StartElement, name string) string {
 	for _, a := range se.Attr {
 		if a.Name.Local == name {
@@ -749,10 +773,14 @@ func AggregateMasked(workspace string, patterns []string, mask func(string) stri
 	// "reports/unit.xml" would otherwise parse unit.xml twice, doubling its
 	// counters, cases and byte accounting. The candidate paths are already
 	// root-relative and cleaned (reportCandidates), so the path is the
-	// identity.
+	// identity. The remaining file budget is threaded into expansion and
+	// already-seen candidates are skipped there, so a pattern that matches
+	// far more files than the cap cannot materialize or sort the whole
+	// directory before the cap is applied.
 	seen := make(map[string]bool)
 	for _, p := range patterns {
-		matches, err := reportCandidates(root, p)
+		remaining := MaxReportFiles - len(files)
+		matches, err := reportCandidates(root, p, seen, remaining)
 		if err != nil {
 			return model.TestReport{}, err
 		}
@@ -883,23 +911,36 @@ func openReport(root *safefs.WorkspaceRoot, rel string) (*os.File, int64, error)
 	return f, st.Size(), nil
 }
 
-// reportCandidates expands one workspace-relative glob pattern into
-// candidate paths by walking the workspace one component at a time,
-// anchored at the canonical workspace root: a pattern component is matched
-// with filepath.Match against the entries of one directory, so "*" can
-// never cross a separator and a pattern can never name an absolute path or
-// a path above the workspace. Unlike filepath.Glob it never follows a
-// symlink: a symlink in any matched component fails the expansion (fail
-// closed) instead of being resolved, because resolving it would read files
-// outside the workspace. The returned paths are workspace-relative,
-// slash-separated names; the caller opens each through
-// safefs.WorkspaceRoot.OpenRel, which re-verifies no-follow at read time.
+// reportCandidates expands one workspace-relative glob pattern into NEW
+// candidate paths by walking the workspace one component at a time, anchored
+// at the canonical workspace root: a pattern component is matched with
+// filepath.Match against the entries of one directory, so "*" can never cross
+// a separator and a pattern can never name an absolute path or a path above
+// the workspace. Unlike filepath.Glob it never follows a symlink: a symlink in
+// any matched component fails the expansion (fail closed) instead of being
+// resolved, because resolving it would read files outside the workspace. The
+// returned paths are workspace-relative, slash-separated names; the caller
+// opens each through safefs.WorkspaceRoot.OpenRel, which re-verifies no-follow
+// at read time.
+//
+// Only REGULAR FILES are emitted at the last component: a directory (or any
+// other non-regular object) matched by the final glob is skipped, not handed
+// to openReport, because a directory match used to abort the WHOLE report
+// aggregation (openReport errors "not a regular file") and lose every other
+// report for the job.
+//
+// seen carries the paths already claimed by earlier patterns and remaining is
+// the number of additional files the per-job cap still permits. Candidates in
+// seen are skipped during the walk and expansion STOPS with ErrLimitExceeded
+// as soon as more than remaining new files are found, so a pattern whose last
+// component matches thousands of files cannot materialize or sort them all
+// before the cap is applied.
 //
 // The component walk uses os.Lstat/os.ReadDir on names below the canonical
-// root purely to enumerate candidates; a directory swapped for a symlink
-// while the walk runs can at most add names, never content: OpenRel refuses
-// the open, and no file is ever read by path.
-func reportCandidates(root *safefs.WorkspaceRoot, pattern string) ([]string, error) {
+// root purely to enumerate candidates; a directory swapped for a symlink while
+// the walk runs can at most add names, never content: OpenRel refuses the
+// open, and no file is ever read by path.
+func reportCandidates(root *safefs.WorkspaceRoot, pattern string, seen map[string]bool, remaining int) ([]string, error) {
 	pat, err := reportPattern(pattern)
 	if err != nil {
 		return nil, err
@@ -922,10 +963,17 @@ func reportCandidates(root *safefs.WorkspaceRoot, pattern string) ([]string, err
 				if info.Mode()&os.ModeSymlink != 0 {
 					return nil, fmt.Errorf("test report %s: symlinks are not allowed", rel)
 				}
-				if !last && !info.IsDir() {
+				if last {
+					if !info.Mode().IsRegular() || seen[rel] {
+						continue
+					}
+				} else if !info.IsDir() {
 					continue
 				}
 				next = append(next, rel)
+				if last && len(next) > remaining {
+					return nil, fmt.Errorf("%w: more than %d matched report files", ErrLimitExceeded, remaining)
+				}
 				continue
 			}
 			entries, err := os.ReadDir(rootAbs(root, base))
@@ -947,10 +995,23 @@ func reportCandidates(root *safefs.WorkspaceRoot, pattern string) ([]string, err
 				if e.Type()&os.ModeSymlink != 0 {
 					return nil, fmt.Errorf("test report %s: symlinks are not allowed", rel)
 				}
-				if !last && !e.IsDir() {
+				if last {
+					// Classify through Info (not just the directory-entry
+					// type bits) so a directory or special file matched by
+					// the final glob is skipped even on a filesystem that
+					// reports DT_UNKNOWN; the walk is bounded by remaining,
+					// so the extra stat is bounded too.
+					fi, ierr := e.Info()
+					if ierr != nil || !fi.Mode().IsRegular() || seen[rel] {
+						continue
+					}
+				} else if !e.IsDir() {
 					continue
 				}
 				next = append(next, rel)
+				if last && len(next) > remaining {
+					return nil, fmt.Errorf("%w: more than %d matched report files", ErrLimitExceeded, remaining)
+				}
 			}
 		}
 		current = next

@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"time"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 )
 
 var keyRE = regexp.MustCompile(`^[a-f0-9]{64}$`)
@@ -43,12 +45,24 @@ func (s *FS) Put(ctx context.Context, key string, r io.Reader, size int64) (Obje
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return Object{}, err
 	}
+	// Make the shard directory itself durable before anything is published
+	// into it: the directory entry a later object rename depends on must
+	// survive a crash, or a durable manifest could reference an object whose
+	// rename did not survive. MkdirAll may have created the store root, the
+	// "sha256" level and the shard, so each level is fsynced.
+	if root := filepath.Clean(s.Root); root != "" && root != "." {
+		if err := fsutil.SyncDir(root); err != nil {
+			return Object{}, fmt.Errorf("blob: sync store root: %w", err)
+		}
+	}
+	if err := fsutil.SyncDir(filepath.Dir(dir)); err != nil {
+		return Object{}, fmt.Errorf("blob: sync shard parent: %w", err)
+	}
+	if err := fsutil.SyncDir(dir); err != nil {
+		return Object{}, fmt.Errorf("blob: sync shard: %w", err)
+	}
 	dst := filepath.Join(dir, key)
 	if _, err := fsStat(dst); err == nil {
-		fi, statErr := fsStat(dst)
-		if statErr != nil {
-			return Object{}, statErr
-		}
 		// A deduplicated re-put refreshes the object's mtime. The payload
 		// is immutable, but the age floor the CAS GC applies must reflect
 		// the last time an upload made the object reachable again: without
@@ -56,15 +70,31 @@ func (s *FS) Put(ctx context.Context, key string, r io.Reader, size int64) (Obje
 		// re-put concurrently with a GC pass could be deleted out from
 		// under its new reference.
 		now := time.Now()
-		_ = os.Chtimes(dst, now, now)
-		return Object{Key: key, SHA256: key, Size: fi.Size()}, nil
+		// A GC pass may delete the object between the stat and the touch.
+		// The touch then fails with ErrNotExist; the re-check below sees the
+		// object is gone and falls through to re-create it from r instead of
+		// acknowledging a dedup to a missing object.
+		if cherr := os.Chtimes(dst, now, now); cherr != nil && !errors.Is(cherr, os.ErrNotExist) {
+			return Object{}, cherr
+		}
+		fi, statErr := fsStat(dst)
+		if statErr == nil {
+			return Object{Key: key, SHA256: key, Size: fi.Size()}, nil
+		}
+		if !errors.Is(statErr, os.ErrNotExist) {
+			return Object{}, statErr
+		}
+		// The object vanished under us: fall through and rewrite it. The
+		// residual race (GC deleting after this re-stat but before the
+		// caller durably records its reference) is bounded by the CAS GC's
+		// digest fence, which blob.FS cannot take from this package; a
+		// re-put always recreates the object, so the reference converges.
 	}
-	tmp := filepath.Join(dir, "."+key+".tmp")
 	f, err := os.CreateTemp(dir, "."+key+".tmp-*")
 	if err != nil {
 		return Object{}, err
 	}
-	tmp = f.Name()
+	tmp := f.Name()
 	defer func() { _ = os.Remove(tmp) }()
 	h := sha256.New()
 	n, cpErr := io.Copy(io.MultiWriter(f, h), r)
@@ -89,6 +119,16 @@ func (s *FS) Put(ctx context.Context, key string, r io.Reader, size int64) (Obje
 		}
 		_ = os.Remove(tmp)
 		return Object{}, err
+	}
+	// The rename is only durable once the shard directory is fsynced. The
+	// object is already visible at dst, so a failed directory fsync is a
+	// published-but-uncertain write: it is returned as the typed
+	// fsutil.AtomicWriteError (Renamed=true) so the CAS layer can treat the
+	// object as possibly-durable rather than as never written, and must not
+	// ack a durable manifest on the strength of a rename that may not have
+	// survived.
+	if err := fsutil.SyncDir(dir); err != nil {
+		return Object{}, &fsutil.AtomicWriteError{Path: dst, Phase: fsutil.PhaseDirSync, Renamed: true, Err: err}
 	}
 	return Object{Key: key, SHA256: key, Size: n}, nil
 }

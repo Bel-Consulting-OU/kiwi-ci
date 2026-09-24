@@ -5,6 +5,7 @@
 package ratelimit
 
 import (
+	"container/list"
 	"net"
 	"net/http"
 	"strconv"
@@ -33,14 +34,20 @@ const (
 	ClassDefault        = "default"
 )
 
-// maxBuckets bounds the per-key bucket map: when it grows past this the
-// oldest idle buckets are swept so a flood of distinct keys cannot exhaust
-// memory.
+// maxBuckets is the HARD cap on the per-key bucket map. A flood of distinct
+// keys cannot grow the map past it: each insert over the cap unconditionally
+// evicts the least-recently-used bucket in O(1), so the map length is bounded
+// and every Allow call is O(1) — there is no full-map sweep per call (the
+// previous design only evicted full, idle buckets, so fresh distinct keys
+// accumulated without bound and each Allow scanned the whole map).
 const maxBuckets = 10000
 
 type bucket struct {
 	tokens float64
 	last   time.Time
+	key    string
+	// el is this bucket's position in l.lru (front = most recently seen).
+	el *list.Element
 }
 
 // Limiter is a token bucket keyed by an arbitrary string. It is safe for
@@ -50,6 +57,9 @@ type Limiter struct {
 	rate    float64 // tokens per second
 	burst   float64 // bucket capacity
 	buckets map[string]*bucket
+	// lru orders buckets by last use (front = most recent). The tail is the
+	// eviction victim when the map is at maxBuckets.
+	lru *list.List
 }
 
 // New returns a Limiter allowing rate tokens per second with a burst of at
@@ -58,20 +68,32 @@ func New(rate float64, burst int) *Limiter {
 	if burst < 1 {
 		burst = 1
 	}
-	return &Limiter{rate: rate, burst: float64(burst), buckets: map[string]*bucket{}}
+	return &Limiter{rate: rate, burst: float64(burst), buckets: map[string]*bucket{}, lru: list.New()}
+}
+
+// Len reports the number of live keyed buckets. It is bounded by maxBuckets.
+func (l *Limiter) Len() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.buckets)
 }
 
 // Allow consumes one token for key if available, returning whether the
-// request is admitted. Denied requests consume nothing.
+// request is admitted. Denied requests consume nothing. The per-call cost is
+// O(1): map lookup plus (only on insert) an unconditional LRU eviction, never
+// a scan of the map.
 func (l *Limiter) Allow(key string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.sweepLocked()
-	b := l.buckets[key]
 	now := time.Now()
+	b := l.buckets[key]
 	if b == nil {
-		b = &bucket{tokens: l.burst, last: now}
+		b = &bucket{tokens: l.burst, last: now, key: key}
 		l.buckets[key] = b
+		b.el = l.lru.PushFront(b)
+		l.evictOverCapLocked()
+	} else {
+		l.touchLocked(b)
 	}
 	b.tokens += l.rate * now.Sub(b.last).Seconds()
 	if b.tokens > l.burst {
@@ -83,6 +105,43 @@ func (l *Limiter) Allow(key string) bool {
 		return true
 	}
 	return false
+}
+
+// touchLocked moves a bucket to the front of the LRU list. A bucket with no
+// list position (only reachable from a package-internal test crafting map
+// entries directly) is linked lazily.
+func (l *Limiter) touchLocked(b *bucket) {
+	if b.el == nil {
+		b.el = l.lru.PushFront(b)
+		return
+	}
+	l.lru.MoveToFront(b.el)
+}
+
+// evictOverCapLocked drops least-recently-used buckets until the map is at or
+// below maxBuckets. It is O(over-cap) and over-cap is zero on every steady
+// state call, so it never scans the map.
+func (l *Limiter) evictOverCapLocked() {
+	for len(l.buckets) > maxBuckets {
+		back := l.lru.Back()
+		if back == nil {
+			// Defensive: an unlinked bucket (test-crafted map entry) must
+			// still be evictable so the cap cannot be bypassed.
+			for k := range l.buckets {
+				delete(l.buckets, k)
+				break
+			}
+			continue
+		}
+		victim := back.Value.(*bucket)
+		l.lru.Remove(back)
+		if victim.el == back {
+			victim.el = nil
+		}
+		if cur, ok := l.buckets[victim.key]; ok && cur == victim {
+			delete(l.buckets, victim.key)
+		}
+	}
 }
 
 // RetryAfter reports how long key must wait before a token becomes
@@ -104,20 +163,6 @@ func (l *Limiter) RetryAfter(key string) time.Duration {
 		return time.Hour
 	}
 	return time.Duration((1 - tokens) / l.rate * float64(time.Second))
-}
-
-// sweepLocked drops buckets that are back at full capacity and idle, once
-// the map exceeds maxBuckets. Must be called with l.mu held.
-func (l *Limiter) sweepLocked() {
-	if len(l.buckets) <= maxBuckets {
-		return
-	}
-	now := time.Now()
-	for k, b := range l.buckets {
-		if b.tokens >= l.burst && now.Sub(b.last) > time.Minute {
-			delete(l.buckets, k)
-		}
-	}
 }
 
 // Middleware enforces per-class rate limits. Classes without an explicit
@@ -166,13 +211,23 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 }
 
 // Classify maps a request to one of the Class* constants by path and
-// method. The classification is ordered so more specific routes win.
+// method. The table is matched against the REAL registered routes (see
+// internal/server/server.go) rather than loose prefixes, so the login, logs
+// and cache_upload buckets actually engage:
+//
+//   - POST /api/v1/login                      -> ClassLogin
+//   - POST /api/v1/jobs/{id}/log               -> ClassLogs
+//   - POST /api/v1/jobs/{id}/log/batch         -> ClassLogs
+//   - GET  /api/v1/runs/{id}/logs[/stream]     -> ClassLogs
+//   - PUT  /api/v1/jobs/{id}/cache/{key}       -> ClassCacheUpload
+//
+// The classification is ordered so more specific routes win.
 func Classify(r *http.Request) string {
 	p := r.URL.Path
 	switch {
 	case strings.HasPrefix(p, "/hooks/"):
 		return ClassWebhooks
-	case strings.HasPrefix(p, "/login"):
+	case p == "/api/v1/login" || p == "/login":
 		return ClassLogin
 	case p == "/api/v1/runners/enroll":
 		return ClassEnroll
@@ -186,11 +241,12 @@ func Classify(r *http.Request) string {
 		return ClassOIDC
 	case strings.HasSuffix(p, "/secrets"):
 		return ClassSecrets
-	case strings.HasSuffix(p, "/logs") || strings.HasSuffix(p, "/log"):
+	case strings.HasSuffix(p, "/log") || strings.HasSuffix(p, "/log/batch") ||
+		strings.HasSuffix(p, "/logs") || strings.HasSuffix(p, "/logs/stream"):
 		return ClassLogs
 	case r.Method == http.MethodPut && strings.Contains(p, "/artifacts/"):
 		return ClassArtifactUpload
-	case r.Method == http.MethodPut && strings.HasPrefix(p, "/api/v1/cache/"):
+	case r.Method == http.MethodPut && strings.Contains(p, "/cache/"):
 		return ClassCacheUpload
 	case r.Method == http.MethodPost && p == "/api/v1/runs":
 		return ClassDispatch
@@ -199,15 +255,24 @@ func Classify(r *http.Request) string {
 }
 
 // Key derives the rate-limit identity for a request: the authenticated
-// principal's subject when present, otherwise the runner ID extracted from
-// the path, otherwise the client IP from RemoteAddr. Distinct identities
-// get independent token budgets.
+// principal's subject when present, otherwise — for the runner tier whose
+// credentials are authenticated by the server's tier gate before this
+// middleware runs — the authenticated bearer CREDENTIAL, otherwise the client
+// IP from RemoteAddr.
+//
+// The runner identity is deliberately never derived from the request path:
+// the path segment is attacker-controlled, so a caller could mint an
+// unlimited number of distinct buckets (and unbounded budgets) by varying
+// it. The bearer digest is one identity per credential, independent of the
+// path. Requests without a credential fall back to the client IP.
 func Key(r *http.Request) string {
 	if p, ok := auth.PrincipalFrom(r); ok && p.Subject != "" {
 		return "principal:" + p.Subject
 	}
-	if id := RunnerIDFromPath(r.URL.Path); id != "" {
-		return "runner:" + id
+	if runnerTierPath(r.Method, r.URL.Path) {
+		if tok := bearerToken(r); tok != "" {
+			return "credential:" + auth.TokenDigest(tok)
+		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -217,6 +282,58 @@ func Key(r *http.Request) string {
 		host = "unknown"
 	}
 	return "ip:" + host
+}
+
+// bearerToken extracts the raw bearer token from the Authorization header,
+// tolerating the case-insensitive scheme spelling.
+func bearerToken(r *http.Request) string {
+	const prefix = "Bearer "
+	h := r.Header.Get("Authorization")
+	if len(h) <= len(prefix) || !strings.EqualFold(h[:len(prefix)], prefix) {
+		return ""
+	}
+	return strings.TrimSpace(h[len(prefix):])
+}
+
+// runnerTierPath mirrors internal/server's runnerPath classifier: it reports
+// whether a route is authenticated by the runner credential (or mTLS) before
+// the limiter runs. Credential keying is restricted to this tier so a bearer
+// on a public route can never mint buckets either.
+func runnerTierPath(method, path string) bool {
+	if method == http.MethodPost && path == "/api/v1/runners/register" {
+		return true
+	}
+	segs := strings.Split(strings.Trim(path, "/"), "/")
+	if len(segs) < 4 || segs[0] != "api" || segs[1] != "v1" {
+		return false
+	}
+	switch {
+	case len(segs) == 5 && segs[2] == "runners" && method == http.MethodPost && segs[4] == "next":
+		return true
+	case segs[2] == "jobs":
+		if len(segs) == 5 && method == http.MethodPost {
+			switch segs[4] {
+			case "heartbeat", "log", "complete", "generated", "secrets", "tests", "snapshots":
+				return true
+			}
+		}
+		if len(segs) == 5 && segs[4] == "test-shards" && method == http.MethodGet {
+			return true
+		}
+		if len(segs) == 6 && segs[4] == "log" && segs[5] == "batch" && method == http.MethodPost {
+			return true
+		}
+		if len(segs) == 6 && segs[4] == "artifacts" && method == http.MethodPut {
+			return true
+		}
+		if len(segs) == 7 && segs[4] == "dependencies" && method == http.MethodGet {
+			return true
+		}
+		if len(segs) == 6 && segs[4] == "cache" && (method == http.MethodGet || method == http.MethodPut) {
+			return true
+		}
+	}
+	return false
 }
 
 // RunnerIDFromPath extracts the runner ID from paths of the form

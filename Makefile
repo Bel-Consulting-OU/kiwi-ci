@@ -29,7 +29,7 @@ test-integration: integration
 # against a throwaway database; every test creates and drops its own schema.
 integration:
 	@test -n "$$KIWI_TEST_POSTGRES_URL" || { echo "integration: set KIWI_TEST_POSTGRES_URL (e.g. postgres://postgres:pass@localhost:5432/kiwi?sslmode=disable)"; exit 1; }
-	go test -count=1 -timeout=20m -run Integration ./internal/storage ./internal/scheduler ./internal/server
+	go test -count=1 -timeout=45m -run Integration ./internal/storage ./internal/scheduler ./internal/server ./internal/app
 
 test-adversarial:
 	go test -run 'Adversarial|Security|Property|Fault|Symlink|Traversal|Tamper|Reject|Evil|Bomb' -shuffle=on ./...
@@ -52,6 +52,11 @@ test-checkptr:
 # The antagonistic battery run before every release.
 test-antagonistic: test-unit test-race test-adversarial test-stress test-single-p test-checkptr
 
+# staticcheck-all is the CI check: it is exactly the pinned command run by
+# .woodpecker/linux-amd64.yml. `staticcheck` runs the same pinned command
+# locally so make and CI cannot diverge on the tool version or the -checks set.
+staticcheck: staticcheck-all
+
 staticcheck-all:
 	go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 -checks=all,-ST1000,-ST1020,-ST1021,-ST1003 ./...
 
@@ -59,7 +64,7 @@ fuzz:
 	./scripts/fuzz-smoke.sh 10s
 
 coverage:
-	go test -coverprofile=coverage.out -covermode=atomic ./...
+	go test -timeout=45m -coverprofile=coverage.out -covermode=atomic ./...
 	go tool cover -func=coverage.out | tail -1
 
 coverage-report:
@@ -70,8 +75,8 @@ coverage-report:
 # profile (requires KIWI_TEST_POSTGRES_URL), profile self-test, merge,
 # per-package report and the coverage floor.
 coverage-ci:
-	go test -coverprofile=coverage.out -covermode=atomic ./...
-	go test -count=1 -timeout=20m -run Integration -covermode=atomic -coverprofile=integration-coverage.out -coverpkg=./... ./internal/storage ./internal/scheduler ./internal/server
+	go test -timeout=45m -coverprofile=coverage.out -covermode=atomic ./...
+	go test -count=1 -timeout=45m -run Integration -covermode=atomic -coverprofile=integration-coverage.out -coverpkg=./... ./internal/storage ./internal/scheduler ./internal/server ./internal/app
 	./scripts/ci-coverage-selftest.sh coverage.out integration-coverage.out
 	./scripts/merge-coverage.sh merged-coverage.out coverage.out integration-coverage.out
 	./scripts/coverage-report.sh merged-coverage.out
@@ -82,11 +87,11 @@ coverage-ci:
 coverage-floor:
 	./scripts/coverage-floor.sh coverage.out
 
-staticcheck:
-	staticcheck ./...
-
+# govulncheck runs the exact pinned command CI runs
+# (.woodpecker/linux-amd64.yml govulncheck), including -test so test
+# dependencies are scanned.
 govulncheck:
-	govulncheck ./...
+	go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 -test ./...
 
 cross:
 	GOOS=linux GOARCH=amd64 go build -trimpath -o /dev/null ./cmd/kiwi

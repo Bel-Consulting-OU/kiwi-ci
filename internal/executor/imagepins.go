@@ -5,11 +5,32 @@ import (
 	"regexp"
 )
 
-// imageDigestPin matches a reference that ends in a well-formed sha256
-// digest pin: "@sha256:" followed by exactly 64 lowercase hex characters.
-// Nothing may trail the digest, so "alpine@sha256:<digest>:latest" is not a
-// pin and an uppercase or truncated digest is not a pin.
-var imageDigestPin = regexp.MustCompile(`@sha256:[0-9a-f]{64}$`)
+// imageName is the distribution/reference name grammar shared by docker and
+// tart image references: an optional registry domain, one or more lowercase
+// path components, and an optional tag. Go's regexp has no non-capturing
+// groups, so the grouping parentheses are plain capturing groups.
+//
+//	domain-component = [a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?
+//	domain           = domain-component("." domain-component)*(":" [0-9]+)?
+//	path-component   = [a-z0-9]+(("."|"_"|"__"|"-"+)[a-z0-9]+)*
+//	tag              = [a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}
+const imageName = `(([a-zA-Z0-9](([a-zA-Z0-9-])*[a-zA-Z0-9])?)(\.([a-zA-Z0-9](([a-zA-Z0-9-])*[a-zA-Z0-9])?))*(:[0-9]+)?/)?` +
+	`[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*` +
+	`(/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*` +
+	`(:[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127})?`
+
+// imageDigestPin matches a reference that is ENTIRELY a well-formed image
+// reference ending in a strict sha256 digest pin: the full reference grammar
+// (name, optional tag) followed by "@sha256:" and exactly 64 lowercase hex
+// characters with nothing trailing.
+//
+// The whole pattern is anchored with "^...$", which is what closes the
+// flag-injection bypass: a value like "-v/:/host@sha256:<digest>" is not a
+// reference at all (it starts with "-", carries ":" and "/" in an invalid
+// position), so it can never be reported as pinned even though the digest
+// suffix is well-formed. Leading whitespace and control characters are
+// rejected by the same full-match rule.
+var imageDigestPin = regexp.MustCompile(`^` + imageName + `@sha256:[0-9a-f]{64}$`)
 
 // digestPinned reports whether ref carries a strict, well-formed sha256
 // digest pin. The hard untrusted floor requires a pin on every executable

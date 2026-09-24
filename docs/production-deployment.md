@@ -122,9 +122,21 @@ a plaintext request to a TLS listener fails.
 `kiwi.example.toml`. Precedence: CLI flags > `KIWI_*` environment
 variables > config file > defaults. `kiwi config check --config
 kiwi.toml` validates a file. Sections: `server`, `database`,
-`runner_pki`, `blob`, `github`, `gitlab`, `forgejo`, `policy`,
-`observability`, `rate_limit`, `auth`, `quota`, `secret_broker`,
-`components`.
+`runner_pki`, `blob`, `staging`, `github`, `gitlab`, `forgejo`,
+`policy`, `observability`, `rate_limit`, `auth`, `quota`,
+`secret_broker`, `components`.
+
+The `staging` section bounds the scratch space for large runner uploads
+(job cache entries and workspace snapshots) before they reach the shared
+CAS. **Production mode refuses to start** without a bound: `staging.dir`
+(a shared ROOT) and `staging.max_bytes` (a positive per-replica byte
+budget) are all-or-nothing and both required. `dir` is a root, not the
+directory bytes land in — each replica stages inside
+`<dir>/<instance_id>`, so replicas sharing a root MUST set distinct
+`staging.instance_id` values (optional: when unset the first process
+generates one and persists it, and a second replica without its own id is
+refused at startup). Dev mode falls back to a bounded default under the
+server data dir when the section is unset.
 
 The `quota` section also carries the untrusted resource ceilings
 (`untrusted_cpu_ceiling`, `untrusted_memory_ceiling`,
@@ -261,21 +273,30 @@ The Woodpecker instance hosting it must be configured so CI reflects reality:
   passes without exercising the real database.
 - Commit-status contexts use Woodpecker's canonical
   `ci/woodpecker/<event>/<workflow>[/<axis>]` form, with the `pull_request`
-  event mapped to the literal `pr`, so branch protection requires names like
+  event mapped to the literal `pr`, so branch protection names look like
   `ci/woodpecker/pr/linux-amd64` (the flat pre-event form can never be
-  satisfied). The native macOS/Windows workflows run on trusted events only,
-  so their `push/` contexts are not required for pull requests.
+  satisfied). `scripts/gh-branch-protection.sh` (invoked by
+  `make protect-branch`) installs exactly three contexts as required checks:
+  `ci/woodpecker/pr/linux-amd64`, `ci/woodpecker/pr/linux-arm64` and
+  `ci/woodpecker/pr/integration-coverage`. The native macOS/Windows
+  workflows run on trusted events only, so their `push/` contexts are not
+  required for pull requests.
 - Agents labelled `platform=linux/amd64`, `platform=linux/arm64`,
   `capability=docker`, `platform=windows/amd64` and `platform=darwin/arm64`
-  matching the workflow label sets; the Docker lane is REQUIRED and fails
-  (never skips) when its daemon is unavailable.
+  matching the workflow label sets; the `docker-workspace` lane fails
+  (never skips) when its daemon is unavailable, but it is not a required PR
+  context (see below).
 - `docker-workspace` is a trusted, push/manual/tag-only lane: it mounts the
   agent host's Docker daemon socket in its steps. Woodpecker gates host
   volumes on the repository-level Trusted flag alone -- there is no per-event
   or fork gating -- so a `pull_request` run would execute PR-authored code
   with host-daemon control (host-root equivalent). It is therefore recorded
   as `ci/woodpecker/push/docker-workspace`, not as a required PR context;
-  re-gating pull requests needs a socket-less variant of the lane.
+  re-gating pull requests needs a socket-less variant of the lane. It is
+  informational/post-merge by default: the script lists the `push/*`
+  variants (including `push/docker-workspace` and the native lanes) only so
+  an operator can require them instead for direct pushes
+  (`KIWI_PUSH_CONTEXTS`), and does not install them as required checks.
 - The clone plugin and every workflow image are pinned by OCI digest.
 
 ## Native and local CI agents
@@ -309,7 +330,7 @@ trusted build boundary; provision them on that basis:
 
 ## CI test image
 
-The required `docker-workspace` lane needs a Docker CLI and must not
+The `docker-workspace` lane needs a Docker CLI and must not
 depend on a registry image. Its first step builds
 `ci/image/Dockerfile` locally on the agent's daemon as
 `kiwi-ci-test:go1.27`; the test step uses `pull: false`, so it runs those

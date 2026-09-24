@@ -103,7 +103,7 @@ func TestPlanStoredRepoIdentity(t *testing.T) {
 			wantExplicit: QuarantinedRepoIdentity("group/sub/project"),
 		},
 		{
-			name:         "empty identity stays empty",
+			name:         "empty identity with a URL host stays empty",
 			stored:       "",
 			url:          "https://github.com/acme/backend.git",
 			full:         "acme/backend",
@@ -111,12 +111,48 @@ func TestPlanStoredRepoIdentity(t *testing.T) {
 			wantExplicit: "",
 		},
 		{
-			name:         "bare name in the url field is not read as a host",
+			// R3-B: the old early return left this row with no identity at
+			// all (empty repo_id, no URL, nested full name). With no URL host
+			// the full name proves a host-less record, so it is stamped with
+			// the explicit nested alias form.
+			name:         "empty identity with a nested full name is stamped a1",
+			stored:       "",
+			url:          "",
+			full:         "group/sub/project",
+			wantAction:   RepoIdentityRewrite,
+			wantExplicit: a1Nested,
+		},
+		{
+			name:         "empty identity with a plain full name is stamped as the plain alias",
+			stored:       "",
+			url:          "",
+			full:         "acme/backend",
+			wantAction:   RepoIdentityRewrite,
+			wantExplicit: "acme/backend",
+		},
+		{
+			name:         "empty identity with no evidence stays empty",
+			stored:       "",
+			url:          "",
+			full:         "",
+			wantAction:   RepoIdentityKeep,
+			wantExplicit: "",
+		},
+		{
+			name:         "empty identity with an unparseable full name stays empty",
+			stored:       "",
+			url:          "",
+			full:         "bad name",
+			wantAction:   RepoIdentityKeep,
+			wantExplicit: "",
+		},
+		{
+			name:         "bare name in the url field is not read as a host and the nested full name is stamped a1",
 			stored:       "",
 			url:          "acme/backend",
 			full:         "group/sub/project",
-			wantAction:   RepoIdentityKeep,
-			wantExplicit: "",
+			wantAction:   RepoIdentityRewrite,
+			wantExplicit: a1Nested,
 		},
 	}
 	for _, tc := range cases {
@@ -135,6 +171,8 @@ func TestPlanStoredRepoIdentity(t *testing.T) {
 func TestPlanStoredRepoIdentityIdempotent(t *testing.T) {
 	for _, tc := range []struct{ stored, url, full string }{
 		{"group/sub/project", "", "group/sub/project"},
+		{"", "", "group/sub/project"},
+		{"", "", "acme/backend"},
 		{"acme/backend", "https://github.com/acme/backend.git", "acme/backend"},
 		{"gitlab.company.com/group/sub/project", "https://gitlab.company.com/group/sub/project.git", "group/sub/project"},
 		{auth.RepoIdentity{Host: "gitlab", FullName: "team/sub/project"}.Serialized(), "", ""},

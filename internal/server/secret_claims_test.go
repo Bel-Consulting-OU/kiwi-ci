@@ -126,8 +126,9 @@ func TestIssueSecretDBModeClaimSurvivesRestart(t *testing.T) {
 }
 
 // TestIssueSecretMemoryReceiptPersistenceFailsClosed proves the memory-mode
-// receipt file write failure returns 500 and never returns an envelope
-// (no more log-and-continue for delivery state).
+// receipt file write failure returns 503 and never returns an envelope (no
+// more log-and-continue for delivery state; a durability failure is a
+// server-side condition, not a 500 client error).
 func TestIssueSecretMemoryReceiptPersistenceFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 	s, err := NewPersistent("secret", "secret", dir)
@@ -144,8 +145,8 @@ func TestIssueSecretMemoryReceiptPersistenceFailsClosed(t *testing.T) {
 	}
 	_, pubB64 := ephemeralKey(t)
 	w := issue(t, c, jobID, SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pubB64})
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("receipt write failure: want 500, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("receipt write failure: want 503, got %d: %s", w.Code, w.Body.String())
 	}
 	if strings.Contains(w.Body.String(), "ciphertext") {
 		t.Fatalf("envelope leaked on receipt failure: %s", w.Body.String())

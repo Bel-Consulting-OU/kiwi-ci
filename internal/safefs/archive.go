@@ -101,6 +101,64 @@ func OpenRootNoFollow(path string) (*Root, error) {
 	return &Root{F: f, Canonical: canonical}, nil
 }
 
+// OpenRootBeneath resolves rel beneath the held workspace/extraction root ws
+// and returns it as an extraction Root. rel is a slash-separated,
+// workspace-relative directory: it must not be absolute and must not traverse
+// above ws. Every component is opened relative to its parent with O_NOFOLLOW
+// (Lstat-verified reparse points on Windows) and missing components are
+// created one at a time, so a symlink anywhere in the chain is rejected with
+// ErrSymlinkParent and can never redirect the returned root outside ws. ""
+// or "." returns a duplicate handle of ws itself.
+//
+// This is the safe way to obtain an extraction root for attacker-controlled
+// input: OpenRootNoFollow only rejects a symlink in the final component, so a
+// destination reached through a symlinked ancestor (for example a checkout
+// that left `evil -> $HOME` and a download path of `evil/.ssh`) would open a
+// root outside the workspace.
+func OpenRootBeneath(ws *Root, rel string) (*Root, error) {
+	if ws == nil || ws.F == nil {
+		return nil, fmt.Errorf("safefs: nil workspace root")
+	}
+	clean, err := cleanBeneath(rel)
+	if err != nil {
+		return nil, err
+	}
+	f, err := openBeneathHandle(ws, clean)
+	if err != nil {
+		return nil, err
+	}
+	canonical := ws.Canonical
+	if clean != "" {
+		canonical = filepath.Join(ws.Canonical, filepath.FromSlash(clean))
+	}
+	return &Root{F: f, Canonical: canonical}, nil
+}
+
+// cleanBeneath validates a workspace-relative destination path: no absolute
+// path, no backslash, no NUL and no parent traversal. It returns the cleaned
+// slash path ("" when rel denotes the root itself).
+func cleanBeneath(rel string) (string, error) {
+	if strings.ContainsRune(rel, '\x00') {
+		return "", fmt.Errorf("safefs: NUL byte in relative path")
+	}
+	if rel == "" {
+		return "", nil
+	}
+	if strings.HasPrefix(rel, "/") || strings.Contains(rel, "\\") {
+		return "", fmt.Errorf("safefs: absolute path %q", rel)
+	}
+	clean := path.Clean(rel)
+	if clean == "." {
+		return "", nil
+	}
+	for _, comp := range strings.Split(clean, "/") {
+		if comp == ".." {
+			return "", fmt.Errorf("safefs: parent traversal in %q", rel)
+		}
+	}
+	return clean, nil
+}
+
 // CappedWriter limits the total number of bytes written to the underlying
 // writer. A limit <= 0 disables the cap. Once the budget is exhausted,
 // Write returns ErrCapExceeded.

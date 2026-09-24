@@ -32,6 +32,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runnerpki"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/safefs"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secretbroker"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secrets"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
@@ -739,7 +740,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// and send failures are surfaced on completion (never a clean green job
 	// with lost logs).
 	consoleSink := logging.Func(func(job, step, line string) {
-		fmt.Printf("[%s/%s] %s\n", job, step, masker.Mask(line))
+		fmt.Printf("[%s/%s] %s\n", job, step, masker.MaskMulti(line))
 	})
 	// Durable batch journal: every batch is journaled (masked) and fsynced
 	// before its first POST, unconditionally acked after the control plane
@@ -747,7 +748,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// this same lease generation are replayed with their original identities
 	// before new lines are sent. Opening fails closed: a corrupt/unreadable
 	// journal fails the job instead of silently dropping durable state.
-	journal, jerr := r.openJobLogJournal(t.Job.ID, t.LeaseGeneration, masker.Mask)
+	journal, jerr := r.openJobLogJournal(t.Job.ID, t.LeaseGeneration, masker.MaskMulti)
 	if jerr != nil {
 		r.complete(parent, t, model.StatusFailure, fmt.Errorf("log journal: %w", jerr), nil)
 		return
@@ -863,7 +864,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		// persisted and later served by the ordinary read tier. Masker.Mask
 		// takes its RWMutex read lock, so sharing it here is safe even while
 		// the executor registers more secrets.
-		report, er := testintel.AggregateMasked(tmp, cj.Job.TestReports, masker.Mask)
+		report, er := testintel.AggregateMasked(tmp, cj.Job.TestReports, masker.MaskMulti)
 		if er != nil {
 			sink.WriteLine(cj.ID, "tests", "report warning: "+er.Error())
 		} else if report.Tests > 0 {
@@ -968,7 +969,7 @@ func (r *Runner) logBatchPost(t server.Task, masker *secrets.Masker) func(contex
 	return func(ctx context.Context, batch logBatch) error {
 		out := make([]server.LogLine, 0, len(batch.Lines))
 		for _, l := range batch.Lines {
-			out = append(out, server.LogLine{RunnerID: r.ID, LeaseToken: t.LeaseToken, LeaseGeneration: t.LeaseGeneration, JobKey: l.Job, Step: l.Step, Line: masker.Mask(l.Line)})
+			out = append(out, server.LogLine{RunnerID: r.ID, LeaseToken: t.LeaseToken, LeaseGeneration: t.LeaseGeneration, JobKey: l.Job, Step: l.Step, Line: masker.MaskMulti(l.Line)})
 		}
 		var body struct {
 			RunnerID        string           `json:"runner_id"`
@@ -1322,6 +1323,43 @@ func splitCSV(s string) []string {
 	return strings.Split(s, ",")
 }
 
+// ErrDependencyArtifactTooLarge reports that a dependency artifact body
+// exceeded the runner's hard spool cap. The transfer fails closed before
+// extraction and the spool file is removed.
+var ErrDependencyArtifactTooLarge = errors.New("dependency artifact exceeds maximum size")
+
+// dependencyArtifactMaxBytes is the hard cap on a spooled dependency body.
+// It mirrors the server's authoritative per-object maximum (8 GiB) so a
+// peer cannot make the runner spool an unbounded stream. It is a variable so
+// tests can lower the bound.
+var dependencyArtifactMaxBytes int64 = 8 << 30
+
+// dependencySpoolSink wraps the spool temp file with the hard byte cap. It is
+// a test seam so bounded-write behavior can be observed before the temp file
+// is removed; production wraps the file with safefs.NewCappedWriter.
+var dependencySpoolSink = func(f *os.File, limit int64) io.Writer {
+	return safefs.NewCappedWriter(f, limit)
+}
+
+// dependencySpoolDir is the directory a dependency body is spooled into.
+//
+// Wiring gap: the runner has no staging budget. executor.Options carries no
+// Staging field and the server-owned staging.Budget is never passed to the
+// runner process, so the runner cannot reserve a spool slot from the shared
+// budget the way cache.Client.Restore does. It falls back to the
+// runner-owned cache root (then the configured work dir, then the system temp
+// dir); the explicit artifact-size cap below — not a budget reservation — is
+// what bounds the transfer.
+func (r *Runner) dependencySpoolDir() string {
+	if r.Cfg.CacheRoot != "" {
+		return r.Cfg.CacheRoot
+	}
+	if r.Cfg.WorkDir != "" {
+		return r.Cfg.WorkDir
+	}
+	return os.TempDir()
+}
+
 // restoreDownloads fetches the job's declared dependency artifacts through
 // the lease-bound dependency endpoint (GET /api/v1/jobs/{id}/dependencies/
 // {producer}/{artifact}) — never through the run-level artifact list API.
@@ -1329,9 +1367,21 @@ func splitCSV(s string) []string {
 // undeclared downloads, and the runner never enumerates run artifacts to
 // pick by name. Matrix producers follow the compiled Downloads semantics:
 // From may name a BaseKey or a compiled Key and is passed through verbatim.
+//
+// The workspace root is opened once (no-follow) and every destination is
+// resolved component-wise beneath that held handle, so a symlink left by a
+// checkout can never redirect an extraction outside the workspace.
 func (r *Runner) restoreDownloads(ctx context.Context, t server.Task, inputs []pipeline.ArtifactInput, workspace string) error {
+	if len(inputs) == 0 {
+		return nil
+	}
+	wsRoot, err := safefs.OpenWorkspaceRoot(workspace)
+	if err != nil {
+		return fmt.Errorf("downloads: open workspace root: %w", err)
+	}
+	defer wsRoot.Close()
 	for _, in := range inputs {
-		dest, err := safeDownloadDest(workspace, in.Path)
+		rel, err := safeDownloadDest(in.Path)
 		if err != nil {
 			return err
 		}
@@ -1340,78 +1390,111 @@ func (r *Runner) restoreDownloads(ctx context.Context, t server.Task, inputs []p
 		if producer == "" || name == "" {
 			return fmt.Errorf("invalid download declaration (from=%q name=%q)", in.From, in.Name)
 		}
-		url := r.Cfg.Server + "/api/v1/jobs/" + t.Job.ID + "/dependencies/" + url.PathEscape(producer) + "/" + url.PathEscape(name)
-		reqCtx, cancel := context.WithCancel(ctx)
-		guard := newStallGuard(cancel, streamIdleTimeout)
-		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
-		if err != nil {
-			guard.stop()
-			cancel()
+		if err := r.restoreDownload(ctx, t, producer, name, rel, wsRoot.Root); err != nil {
 			return err
 		}
-		r.auth(req)
-		req.Header.Set("X-Kiwi-Runner-ID", r.ID)
-		req.Header.Set("X-Kiwi-Lease-Token", t.LeaseToken)
-		req.Header.Set("X-Kiwi-Lease-Generation", fmt.Sprint(t.LeaseGeneration))
-		resp, err := r.streamClient().Do(req)
-		if err != nil {
-			guard.stop()
-			cancel()
-			return err
-		}
-		if resp.StatusCode != 200 {
-			b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-			resp.Body.Close()
-			guard.stop()
-			cancel()
-			return fmt.Errorf("download dependency %s from %s: %s: %s", name, producer, resp.Status, strings.TrimSpace(string(b)))
-		}
-		body := &stallGuardedBody{ReadCloser: resp.Body, guard: guard, cancel: cancel}
-		tmp, err := os.CreateTemp("", "kiwi-artifact-*.tar.gz")
-		if err != nil {
-			body.Close()
-			return err
-		}
-		tmpPath := tmp.Name()
-		h := sha256.New()
-		_, cp := io.Copy(io.MultiWriter(tmp, h), body)
-		body.Close()
-		cl := closeRunnerTempFile(tmp)
-		if cp != nil {
-			os.Remove(tmpPath)
-			return cp
-		}
-		if cl != nil {
-			os.Remove(tmpPath)
-			return cl
-		}
-		if want := resp.Header.Get("X-Kiwi-Content-SHA256"); want != "" {
-			if got := hex.EncodeToString(h.Sum(nil)); got != want {
-				os.Remove(tmpPath)
-				return fmt.Errorf("artifact %s from %s integrity mismatch", name, producer)
-			}
-		}
-		if err := artifact.Extract(tmpPath, dest); err != nil {
-			os.Remove(tmpPath)
-			return err
-		}
-		os.Remove(tmpPath)
 	}
 	return nil
 }
 
-// safeDownloadDest resolves a declared download path against the workspace
-// and rejects anything that escapes it.
-func safeDownloadDest(workspace, inPath string) (string, error) {
-	dest := workspace
-	if inPath != "" {
-		clean := filepath.Clean(inPath)
-		if pipeline.IsPortableAbsPath(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-			return "", fmt.Errorf("unsafe download path %q", inPath)
-		}
-		dest = filepath.Join(workspace, clean)
+// restoreDownload fetches and extracts one declared dependency artifact. The
+// body is spooled through a hard byte cap and the temp file is removed on
+// every path; extraction resolves rel beneath the held workspace root so a
+// symlinked ancestor is rejected instead of traversed.
+func (r *Runner) restoreDownload(ctx context.Context, t server.Task, producer, name, rel string, wsRoot *safefs.Root) error {
+	url := r.Cfg.Server + "/api/v1/jobs/" + t.Job.ID + "/dependencies/" + url.PathEscape(producer) + "/" + url.PathEscape(name)
+	reqCtx, cancel := context.WithCancel(ctx)
+	guard := newStallGuard(cancel, streamIdleTimeout)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	if err != nil {
+		guard.stop()
+		cancel()
+		return err
 	}
-	return dest, nil
+	r.auth(req)
+	req.Header.Set("X-Kiwi-Runner-ID", r.ID)
+	req.Header.Set("X-Kiwi-Lease-Token", t.LeaseToken)
+	req.Header.Set("X-Kiwi-Lease-Generation", fmt.Sprint(t.LeaseGeneration))
+	resp, err := r.streamClient().Do(req)
+	if err != nil {
+		guard.stop()
+		cancel()
+		return err
+	}
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		guard.stop()
+		cancel()
+		return fmt.Errorf("download dependency %s from %s: %s: %s", name, producer, resp.Status, strings.TrimSpace(string(b)))
+	}
+	body := &stallGuardedBody{ReadCloser: resp.Body, guard: guard, cancel: cancel}
+	limit := dependencyArtifactMaxBytes
+	if limit <= 0 {
+		limit = 8 << 30
+	}
+	if resp.ContentLength > limit {
+		body.Close()
+		return fmt.Errorf("%w: content length %d exceeds limit %d", ErrDependencyArtifactTooLarge, resp.ContentLength, limit)
+	}
+	tmp, err := os.CreateTemp(r.dependencySpoolDir(), "kiwi-artifact-*.tar.gz")
+	if err != nil {
+		body.Close()
+		return err
+	}
+	tmpPath := tmp.Name()
+	removeTemp := func() { _ = os.Remove(tmpPath) }
+	h := sha256.New()
+	n, cp := io.Copy(io.MultiWriter(dependencySpoolSink(tmp, limit), h), io.LimitReader(body, limit+1))
+	body.Close()
+	cl := closeRunnerTempFile(tmp)
+	if cp != nil {
+		removeTemp()
+		if errors.Is(cp, safefs.ErrCapExceeded) || n > limit {
+			return fmt.Errorf("%w: limit %d bytes", ErrDependencyArtifactTooLarge, limit)
+		}
+		return cp
+	}
+	if cl != nil {
+		removeTemp()
+		return cl
+	}
+	if n > limit {
+		removeTemp()
+		return fmt.Errorf("%w: limit %d bytes", ErrDependencyArtifactTooLarge, limit)
+	}
+	if want := resp.Header.Get("X-Kiwi-Content-SHA256"); want != "" {
+		if got := hex.EncodeToString(h.Sum(nil)); got != want {
+			removeTemp()
+			return fmt.Errorf("artifact %s from %s integrity mismatch", name, producer)
+		}
+	}
+	if err := artifact.Extract(tmpPath, wsRoot, rel); err != nil {
+		removeTemp()
+		return err
+	}
+	removeTemp()
+	return nil
+}
+
+// safeDownloadDest validates a declared download path and returns the
+// workspace-relative destination (cleaned, no traversal). The result must be
+// resolved through a held workspace root (safefs.OpenRootBeneath); it is
+// never a filesystem path by itself. It rejects portable-absolute paths,
+// parent traversal and backslashes/absolute paths that filepath.Clean would
+// otherwise hide.
+func safeDownloadDest(inPath string) (string, error) {
+	if inPath == "" {
+		return "", nil
+	}
+	clean := filepath.Clean(inPath)
+	if pipeline.IsPortableAbsPath(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) || strings.ContainsRune(clean, '\\') {
+		return "", fmt.Errorf("unsafe download path %q", inPath)
+	}
+	if clean == "." {
+		return "", nil
+	}
+	return filepath.ToSlash(clean), nil
 }
 
 // uploadArtifact delivers one captured artifact archive with bounded

@@ -216,8 +216,8 @@ func TestDirectSubmitBindingAcceptsEquivalentForms(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &run); err != nil {
 		t.Fatal(err)
 	}
-	if run.RepoID != "github.com/Acme/Backend" || run.PolicyRepoID != run.RepoID {
-		t.Fatalf("RepoID/PolicyRepoID = %q/%q, want the URL-derived canonical identity", run.RepoID, run.PolicyRepoID)
+	if run.RepoID != "github.com/acme/backend" || run.PolicyRepoID != run.RepoID {
+		t.Fatalf("RepoID/PolicyRepoID = %q/%q, want the folded URL-derived canonical identity github.com/acme/backend", run.RepoID, run.PolicyRepoID)
 	}
 	if run.CheckoutRepoURL != "https://GitHub.com./Acme/Backend.git" {
 		t.Fatalf("CheckoutRepoURL = %q", run.CheckoutRepoURL)

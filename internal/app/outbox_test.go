@@ -31,6 +31,14 @@ func TestOutboxDeadLettersUsageErrors(t *testing.T) {
 		{"requeue-no-id", []string{"dead-letters", "requeue"}, "requires a dead-letter ID"},
 		{"requeue-empty-id", []string{"dead-letters", "requeue", "  "}, "requires a dead-letter ID"},
 		{"delete-no-id", []string{"dead-letters", "delete"}, "requires a dead-letter ID"},
+		// F6-F: a flag's value must never be mistaken for the ID. With the
+		// flag first, the trailing ID is a stray positional, so the command
+		// is rejected before any connection is attempted.
+		{"requeue-dsn-first-rejected", []string{"dead-letters", "requeue", "--database-url", "postgres://example/db", "abc"}, "requires a dead-letter ID"},
+		{"delete-dsn-first-rejected", []string{"dead-letters", "delete", "--database-url", "postgres://example/db", "abc"}, "requires a dead-letter ID"},
+		// ID-first with an explicit empty DSN: the ID parses, and the DSN
+		// requirement is what fails.
+		{"requeue-id-then-empty-dsn", []string{"dead-letters", "requeue", "abc", "--database-url", ""}, "--database-url is required"},
 		{"list-no-dsn", []string{"dead-letters", "list"}, "--database-url is required"},
 		{"requeue-no-dsn", []string{"dead-letters", "requeue", "abc"}, "--database-url is required"},
 		{"delete-no-dsn", []string{"dead-letters", "delete", "abc"}, "--database-url is required"},

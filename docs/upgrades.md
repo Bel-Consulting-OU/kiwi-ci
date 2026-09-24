@@ -257,7 +257,7 @@ claims themselves.
   workers as one-shot ephemeral hosts running the agent as a dedicated
   low-privilege user with no persistent credentials and Go 1.27.x on
   `PATH` (`GOTOOLCHAIN=local` prevents Go from downloading a toolchain
-  and masking a stale worker). The required Docker lane builds its
+  and masking a stale worker). The `docker-workspace` lane builds its
   digest-pinned test image locally from `ci/image/Dockerfile`
   (Go + git + Docker CLI + certs + make/gcc) instead of pulling one
   from a registry; see

@@ -643,7 +643,12 @@ func canonicalRepoIDFunctionBody() string {
 }
 
 // canonicalRepoIDBody is canonicalRepoIDFunctionBody parameterized on the URL
-// json accessor so the migration generator and the tests can render it.
+// json accessor so the migration generator and the tests can render it. The
+// resolved identity is folded onto the one canonical PATH case (see
+// foldRepoIdentitySQL / auth.FoldRepoFullName): the stored repo_id and the
+// clone-URL + repo_full_name derivation both resolve to the folded form, so a
+// row written from repo_url=https://github.com/Acme/Backend.git resolves to
+// github.com/acme/backend and can never bypass an explicit lowercase deny.
 func canonicalRepoIDBody(urlAccessor string) string {
 	u := "COALESCE(" + urlAccessor + ", '')"
 	f := "BTRIM(COALESCE(payload->>'repo_full_name', ''))"
@@ -657,10 +662,27 @@ func canonicalRepoIDBody(urlAccessor string) string {
 		"WHEN " + scpLike + " THEN SUBSTRING(" + u + " FROM STRPOS(" + u + ", ':') + 1) " +
 		"ELSE " + u + " END, '\\.git$', ''), '/')"
 	full := "CASE WHEN " + f + " <> '' THEN " + f + " ELSE " + path + " END"
-	return "COALESCE(NULLIF(BTRIM(payload->>'repo_id'), ''), " +
+	base := "COALESCE(NULLIF(BTRIM(payload->>'repo_id'), ''), " +
 		"CASE WHEN " + full + " = '' THEN '' " +
 		"WHEN " + host + " = '' OR LEFT(" + full + ", LENGTH(" + host + ") + 1) = " + host + " || '/' THEN " + full + " " +
 		"ELSE " + host + " || '/' || " + full + " END)"
+	return foldRepoIdentitySQL(base)
+}
+
+// foldRepoIdentitySQL renders the SQL that folds a resolved repository
+// identity onto the one canonical PATH case, mirroring auth.FoldRepoFullName:
+// ASCII-lowercase the full-name portion while PRESERVING the forge host (which
+// CanonicalHost canonicalizes separately), and never touch the explicit r1:/
+// a1: serialized spellings (their base64url payload is case-significant). The
+// positional rule is used, not dots: a value with two or more path segments is
+// host/full and only the remainder is folded; a bare value is folded whole.
+func foldRepoIdentitySQL(expr string) string {
+	slash := "STRPOS(" + expr + ", '/')"
+	suffix := "SUBSTRING(" + expr + " FROM " + slash + " + 1)"
+	return "CASE WHEN LEFT(" + expr + ", 3) IN ('r1:', 'a1:') THEN " + expr +
+		" WHEN " + slash + " = 0 THEN LOWER(" + expr + ")" +
+		" WHEN STRPOS(" + suffix + ", '/') > 0 THEN LEFT(" + expr + ", " + slash + " - 1) || '/' || LOWER(" + suffix + ")" +
+		" ELSE LOWER(" + expr + ") END"
 }
 
 // canonicalPolicyRepoIDSQLExpr renders the POLICY-FIRST canonical repository
@@ -1315,6 +1337,62 @@ func (s *PostgresStore) UpdateJob(ctx context.Context, job model.Job) error {
 	return tx.Commit(ctx)
 }
 
+// ApproveJob approves an environment-gated job in ONE transaction under the
+// job row lock. It writes only the approval-owned payload fields and, while
+// the job is waiting_approval, the waiting_approval -> queued status; it never
+// touches a lease column and never rewrites the whole row from a caller model.
+// That makes approve-vs-claim safe: a concurrent AcquireLeaseAtomic either
+// commits first (the job is running, so the approval only (re)records the
+// approver and the lease, runner slot, quota reservation and resource
+// reservation stay consistent) or waits on the lock and then sees the queued
+// job.
+func (s *PostgresStore) ApproveJob(ctx context.Context, jobID, actor string) (model.Job, error) {
+	if err := ValidateJobID(jobID); err != nil {
+		return model.Job{}, err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return model.Job{}, err
+	}
+	defer tx.Rollback(ctx)
+	js := jobScanner{}
+	err = tx.QueryRow(ctx, `SELECT `+jobCols+` FROM jobs WHERE id=$1 FOR UPDATE`, jobID).Scan(jobTargets(&js)...)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return model.Job{}, ErrNotFound
+	}
+	if err != nil {
+		return model.Job{}, err
+	}
+	j, err := js.job()
+	if err != nil {
+		return model.Job{}, err
+	}
+	if !j.ApprovalRequired {
+		return model.Job{}, ErrApprovalNotRequired
+	}
+	if j.Status.Terminal() {
+		return model.Job{}, ErrJobTerminal
+	}
+	j.ApprovedBy = actor
+	if j.Status == model.StatusWaitingApproval {
+		j.Status = model.StatusQueued
+		j.WaitingSince = nil
+	}
+	newPayload, err := jsonMarshal(j)
+	if err != nil {
+		return model.Job{}, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE jobs SET status=$2, payload=$3 WHERE id=$1`, jobID, string(j.Status), newPayload); err != nil {
+		return model.Job{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return model.Job{}, err
+	}
+	return j, nil
+}
+
+var _ JobApprovalStore = (*PostgresStore)(nil)
+
 // ---------------------------------------------------------------------------
 // leases
 // ---------------------------------------------------------------------------
@@ -1347,52 +1425,17 @@ func (s *PostgresStore) AcquireLease(ctx context.Context, jobID, runnerID string
 	return js.job()
 }
 
-// leaseRates resolves the usage rates frozen into a leased job: the live
-// profile's rates when the runner is linked, the runner row's registered
-// rates otherwise. The caller holds the runner row (and its profile) from
-// the same transaction.
-func leaseRates(linked bool, p model.RunnerProfile, runnerCost, runnerWatts float64) (float64, float64) {
-	if linked {
-		return p.CostPerHour, p.PowerWatts
+// validateClaimText rejects a claim string that cannot be persisted as a
+// bound text/jsonb parameter (a NUL byte is invalid in every text parameter
+// and in jsonb), before any statement touches the database. The previous
+// runner-slot UPDATE failed incidentally when a NUL runtime was bound; this
+// keeps that fail-fast behavior explicit now that the runtime is no longer
+// bound.
+func validateClaimText(field, value string) error {
+	if strings.IndexByte(value, 0) >= 0 {
+		return fmt.Errorf("storage: claim %s contains a NUL byte", field)
 	}
-	return runnerCost, runnerWatts
-}
-
-// profileAllowsCandidate evaluates the live profile's scheduling
-// predicates against one candidate job: runtime capability, canonical repo
-// allowlist, required labels and placement regions. An empty profile field
-// imposes no restriction (matching the registration-time semantics).
-func profileAllowsCandidate(p model.RunnerProfile, jobRuntime, canonRepoID, repoFullName string, requiredLabels, placementRegions []string) bool {
-	if len(p.Capabilities) > 0 && jobRuntime != "" && !containsString(p.Capabilities, jobRuntime) {
-		return false
-	}
-	if len(p.Repositories) > 0 {
-		ok := false
-		for _, allowed := range p.Repositories {
-			if allowed == canonRepoID || (repoFullName != "" && allowed == repoFullName) {
-				ok = true
-				break
-			}
-		}
-		if !ok {
-			return false
-		}
-	}
-	if len(requiredLabels) > 0 {
-		have := map[string]bool{}
-		for _, l := range p.Labels {
-			have[l] = true
-		}
-		for _, l := range requiredLabels {
-			if !have[l] {
-				return false
-			}
-		}
-	}
-	if len(placementRegions) > 0 && !containsString(placementRegions, p.Region) {
-		return false
-	}
-	return true
+	return nil
 }
 
 // claimQuotaTx moves one reservation slot from queued to running for the
@@ -1450,8 +1493,12 @@ func (s *PostgresStore) claimQuotaTx(ctx context.Context, tx pgx.Tx, repoID stri
 //     registration snapshot second; a zero dimension is unconstrained) and
 //     the reservation row is inserted in the same transaction;
 //  7. the quota queued->running transition is conditional;
-//  8. the runner slot update enforces disabled/draining, capacity > 0, the
-//     capacity bound and the live profile predicates in SQL.
+//  8. the runner slot update appends the job and re-asserts disabled/draining,
+//     capacity > 0 and the capacity bound in SQL. The scheduling predicates
+//     (labels, canonical repository ACL, runtime capability, region) were
+//     evaluated in Go over the SAME effective runner view the in-memory claim
+//     uses (ClaimAllowsRunner) while this transaction held the runner row
+//     lock, so SQL and memory cannot diverge.
 //
 // Any failed predicate rolls every step back and returns the matching
 // sentinel error (ErrNoCapacity, ErrEnvConcurrency, ErrQuotaExceeded,
@@ -1468,6 +1515,32 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 		return model.Job{}, err
 	}
 	defer tx.Rollback(ctx)
+
+	// Reject claim text that cannot be persisted (a NUL byte is invalid in
+	// every bound text/jsonb parameter) before touching the database, so a
+	// malformed claim fails the same way the previous runner-slot UPDATE did.
+	if err := validateClaimText("runtime", claim.Runtime); err != nil {
+		return model.Job{}, err
+	}
+	if err := validateClaimText("canonical repository id", claim.CanonRepoID); err != nil {
+		return model.Job{}, err
+	}
+	if err := validateClaimText("repository full name", claim.RepoFullName); err != nil {
+		return model.Job{}, err
+	}
+	if err := validateClaimText("environment", claim.Environment); err != nil {
+		return model.Job{}, err
+	}
+	for _, l := range claim.RequiredLabels {
+		if err := validateClaimText("required label", l); err != nil {
+			return model.Job{}, err
+		}
+	}
+	for _, r := range claim.PlacementRegions {
+		if err := validateClaimText("placement region", r); err != nil {
+			return model.Job{}, err
+		}
+	}
 
 	// Step 1: lock the job row first (job -> runner ordering, matching
 	// CompleteJob) and fail fast when the job is not queued.
@@ -1504,21 +1577,21 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 		}
 	}
 
-	// Step 3: lock the runner row and read its live admin state.
+	// Step 3: lock the runner row and read its full registration snapshot
+	// (the same model the in-memory store holds) plus its live admin state.
+	// The snapshot is the fallback scheduling view for an unlinked runner;
+	// reading the whole payload is what lets the claim enforce the SAME
+	// snapshot labels/capabilities/region/repository ACL the in-memory claim
+	// enforces instead of skipping them when no profile is linked.
 	var (
-		runnerCapacity   int
-		runnerCost       float64
-		runnerWatts      float64
-		runnerDisabled   bool
-		runnerDraining   bool
-		runnerCertSerial string
-		runnerResCPU     float64
-		runnerResMemory  int64
-		runnerResDisk    int64
-		runnerResPIDs    int
+		runnerPayload  []byte
+		runnerCapacity int
+		runnerDisabled bool
+		runnerDraining bool
+		activeJSON     []byte
 	)
-	err = tx.QueryRow(ctx, `SELECT capacity, COALESCE((payload->>'cost_per_hour')::double precision, 0), COALESCE((payload->>'power_watts')::double precision, 0), disabled, draining, COALESCE(payload->>'cert_serial', ''), COALESCE((payload->'resource_capacity'->>'cpu')::double precision, 0), COALESCE((payload->'resource_capacity'->>'memory')::bigint, 0), COALESCE((payload->'resource_capacity'->>'disk')::bigint, 0), COALESCE((payload->'resource_capacity'->>'pids')::int, 0) FROM runners WHERE id=$1 FOR UPDATE`, claim.RunnerID).
-		Scan(&runnerCapacity, &runnerCost, &runnerWatts, &runnerDisabled, &runnerDraining, &runnerCertSerial, &runnerResCPU, &runnerResMemory, &runnerResDisk, &runnerResPIDs)
+	err = tx.QueryRow(ctx, `SELECT payload, capacity, disabled, draining, COALESCE(active_jobs, '[]'::jsonb) FROM runners WHERE id=$1 FOR UPDATE`, claim.RunnerID).
+		Scan(&runnerPayload, &runnerCapacity, &runnerDisabled, &runnerDraining, &activeJSON)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return model.Job{}, ErrNoCapacity
 	}
@@ -1528,21 +1601,31 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 	if runnerDisabled || runnerDraining {
 		return model.Job{}, ErrNoCapacity
 	}
+	snapshot := model.Runner{}
+	if uerr := json.Unmarshal(runnerPayload, &snapshot); uerr != nil {
+		return model.Job{}, fmt.Errorf("storage: decode runner payload: %w", uerr)
+	}
+	snapshot.ID = claim.RunnerID
+	snapshot.Capacity = runnerCapacity
+	snapshot.Disabled = runnerDisabled
+	snapshot.Draining = runnerDraining
+	if uerr := json.Unmarshal(activeJSON, &snapshot.ActiveJobs); uerr != nil {
+		return model.Job{}, fmt.Errorf("storage: decode runner active jobs: %w", uerr)
+	}
 
 	// Step 4: resolve the LIVE profile through the ONE shared precedence
 	// (the explicit certificate-serial binding when the runner presents a
 	// registered serial, then the runner_profile_links runner-ID binding,
-	// then the registration snapshot) and replace the registration snapshot
-	// with its values for every scheduling predicate. Both bindings are
-	// resolved in ONE statement (liveProfileResolutionTx) while the job and
-	// runner rows are locked, and the raw states are decided by the same
-	// shared precedence helper the scheduler prefilter and the fleet view
-	// use. A dangling certificate-serial OR runner-ID binding fails the
-	// claim closed; a profile DELETE can therefore neither resurrect a
-	// deleted profile nor fail a runner whose snapshot registration already
-	// admitted it (the snapshot is never larger than what the binding
-	// granted).
-	resolution, err := liveProfileResolutionTx(ctx, tx, claim.RunnerID, runnerCertSerial)
+	// then the registration snapshot) and overlay it onto the registration
+	// snapshot. Both bindings are resolved in ONE statement
+	// (liveProfileResolutionTx) while the job and runner rows are locked, and
+	// the raw states are decided by the same shared precedence helper the
+	// scheduler prefilter and the fleet view use. A dangling
+	// certificate-serial OR runner-ID binding fails the claim closed; a
+	// profile DELETE can therefore neither resurrect a deleted profile nor
+	// fail a runner whose snapshot registration already admitted it (the
+	// snapshot is never larger than what the binding granted).
+	resolution, err := liveProfileResolutionTx(ctx, tx, claim.RunnerID, snapshot.CertSerial)
 	if err != nil {
 		return model.Job{}, err
 	}
@@ -1551,26 +1634,25 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 		// fail closed.
 		return model.Job{}, ErrNoCapacity
 	}
-	profile := resolution.Profile
-	linked := resolution.Applies()
-	capacity := runnerCapacity
+	// The EFFECTIVE scheduling view is resolved through the SAME shared
+	// overlay the in-memory store uses: the live profile for a linked runner,
+	// the registration snapshot unchanged otherwise. The ONE typed predicate
+	// (ClaimAllowsRunner -> RepoAllowed/labels/capabilities/region) is then
+	// evaluated over it, so an unlinked runner's snapshot restrictions — and
+	// the typed positional allowlist rule, "r1:" spellings included — bind the
+	// SQL claim exactly as they bind memory.
+	effective := ResolveRunnerProfile(snapshot, resolution.Profile, resolution.Applies())
+	if !ClaimAllowsRunner(effective, claim) {
+		return model.Job{}, ErrNoCapacity
+	}
+	capacity := effective.Capacity
 	// The runner's effective resource capacity: the LIVE profile's max_*
 	// columns when linked, the runner row's registration snapshot
 	// (payload.resource_capacity) otherwise. Zero dimensions are
 	// unconstrained (documented default), so a runner with no configured
 	// capacities admits every job exactly as before.
-	resourceCapacity := model.ResourceCapacity{CPU: runnerResCPU, Memory: runnerResMemory, Disk: runnerResDisk, PIDs: runnerResPIDs}
-	if linked {
-		capacity = profile.MaxCapacity
-		resourceCapacity = model.ResourceCapacityFromProfile(profile)
-		if !profileAllowsCandidate(profile, claim.Runtime, claim.CanonRepoID, claim.RepoFullName, claim.RequiredLabels, claim.PlacementRegions) {
-			return model.Job{}, ErrNoCapacity
-		}
-	}
-	if capacity <= 0 {
-		return model.Job{}, ErrNoCapacity
-	}
-	costRate, powerWatts := leaseRates(linked, profile, runnerCost, runnerWatts)
+	resourceCapacity := effective.ResourceCapacity
+	costRate, powerWatts := effective.CostPerHour, effective.PowerWatts
 
 	// Step 5: claim the job (queued -> running) with attempts/started_at.
 	js := jobScanner{}
@@ -1608,40 +1690,15 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 		return model.Job{}, err
 	}
 
-	// Step 8: reserve the runner slot. The predicates are evaluated in SQL
-	// against the live row + resolved profile values: disabled/draining,
-	// capacity > 0, capacity bound, runtime capability, repo allowlist,
-	// required labels and placement regions. profileJSON carries every
-	// predicate field explicitly (empty arrays, never omitted keys) so the
-	// jsonb operators never see NULL.
-	var profileJSON []byte
-	if linked {
-		view := struct {
-			Labels       []string `json:"labels"`
-			Region       string   `json:"region"`
-			Repositories []string `json:"repositories"`
-			Capabilities []string `json:"capabilities"`
-		}{
-			Labels:       append([]string{}, profile.Labels...),
-			Region:       profile.Region,
-			Repositories: append([]string{}, profile.Repositories...),
-			Capabilities: append([]string{}, profile.Capabilities...),
-		}
-		profileJSON, err = jsonMarshal(view)
-		if err != nil {
-			return model.Job{}, err
-		}
-	}
-	labelsJSON, err := jsonMarshal(append([]string{}, claim.RequiredLabels...))
-	if err != nil {
-		return model.Job{}, err
-	}
-	regionsJSON, err := jsonMarshal(append([]string{}, claim.PlacementRegions...))
-	if err != nil {
-		return model.Job{}, err
-	}
-	ct, err := tx.Exec(ctx, `UPDATE runners SET active_jobs = COALESCE(active_jobs, '[]'::jsonb) || to_jsonb($1::text), busy = TRUE, current_job = CASE WHEN COALESCE(current_job, '') = '' THEN $1 ELSE current_job END, last_seen = now() WHERE id = $2 AND disabled = FALSE AND draining = FALSE AND $3 > 0 AND jsonb_array_length(COALESCE(active_jobs, '[]'::jsonb)) < $3 AND ($4::jsonb IS NULL OR ((jsonb_array_length(COALESCE($4::jsonb->'capabilities', '[]'::jsonb)) = 0 OR $5 = '' OR ($4::jsonb->'capabilities') ? $5) AND (jsonb_array_length(COALESCE($4::jsonb->'repositories', '[]'::jsonb)) = 0 OR ($4::jsonb->'repositories') ? $6 OR ($7 <> '' AND ($4::jsonb->'repositories') ? $7)) AND (jsonb_array_length($8::jsonb) = 0 OR COALESCE($4::jsonb->'labels', '[]'::jsonb) @> $8::jsonb) AND (jsonb_array_length($9::jsonb) = 0 OR COALESCE($4::jsonb->>'region', '') IN (SELECT jsonb_array_elements_text($9::jsonb)))))`,
-		claim.JobID, claim.RunnerID, capacity, profileJSON, claim.Runtime, claim.CanonRepoID, claim.RepoFullName, labelsJSON, regionsJSON)
+	// Step 8: reserve the runner slot. Every scheduling predicate was already
+	// evaluated in Go over the locked runner row by ClaimAllowsRunner above
+	// (the SAME typed predicate the in-memory claim uses), so this statement
+	// is the atomic reservation: it appends the job under the row lock and
+	// re-asserts the admin state and the capacity bound. Keeping the capacity
+	// comparison in SQL means a peer transaction can never overrun the count
+	// between the Go decision and the append.
+	ct, err := tx.Exec(ctx, `UPDATE runners SET active_jobs = COALESCE(active_jobs, '[]'::jsonb) || to_jsonb($1::text), busy = TRUE, current_job = CASE WHEN COALESCE(current_job, '') = '' THEN $1 ELSE current_job END, last_seen = now() WHERE id = $2 AND disabled = FALSE AND draining = FALSE AND $3 > 0 AND jsonb_array_length(COALESCE(active_jobs, '[]'::jsonb)) < $3`,
+		claim.JobID, claim.RunnerID, capacity)
 	if err != nil {
 		return model.Job{}, err
 	}
@@ -1833,7 +1890,7 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 	// ErrRequiredArtifactMissing so the runner can upload the artifact and
 	// retry. A read/decode error also rolls the completion back.
 	if st == model.StatusSuccess {
-		if missing, err := s.requiredArtifactMissingTx(ctx, tx, jobID, payload); err != nil {
+		if missing, err := s.requiredArtifactMissingTx(ctx, tx, jobID, generation, payload); err != nil {
 			return err
 		} else if missing != "" {
 			return fmt.Errorf("%w: %s", ErrRequiredArtifactMissing, missing)
@@ -1978,9 +2035,12 @@ func (s *PostgresStore) insertCompletionEffectsTx(ctx context.Context, tx pgx.Tx
 // requiredArtifactMissingTx checks the completing job's artifact contracts
 // (the payload jsonb key artifact_contracts) against the artifacts table
 // inside the caller's transaction and returns the name of the first
-// Required contract entry without a matching artifact row, or "" when every
-// required artifact is present.
-func (s *PostgresStore) requiredArtifactMissingTx(ctx context.Context, tx pgx.Tx, jobID string, payload []byte) (string, error) {
+// Required contract entry without a matching artifact row FOR THIS LEASE
+// GENERATION, or "" when every required artifact is present. The generation
+// is part of the artifact idempotency key (job_id, job_generation, name), so
+// an artifact uploaded under an earlier generation can no longer satisfy a
+// later lease's completion.
+func (s *PostgresStore) requiredArtifactMissingTx(ctx context.Context, tx pgx.Tx, jobID string, generation int64, payload []byte) (string, error) {
 	var wrapper struct {
 		ArtifactContracts map[string]ArtifactContract `json:"artifact_contracts"`
 	}
@@ -1992,7 +2052,7 @@ func (s *PostgresStore) requiredArtifactMissingTx(ctx context.Context, tx pgx.Tx
 			continue
 		}
 		var exists bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM artifacts WHERE job_id=$1 AND name=$2)`, jobID, name).Scan(&exists); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM artifacts WHERE job_id=$1 AND job_generation=$2 AND name=$3)`, jobID, generation, name).Scan(&exists); err != nil {
 			return "", err
 		}
 		if !exists {
@@ -2444,17 +2504,116 @@ func (s *PostgresStore) CancelRunJobs(ctx context.Context, runID string, reason 
 // runners
 // ---------------------------------------------------------------------------
 
+// mergeRunnerProfile overlays the caller's PROFILE/ADMIN fields onto an
+// existing runner row while preserving the fields the lease/transition
+// transactions own (active_jobs, busy, current_job, completed, failed) and the
+// original registration time. busy is recomputed from the preserved active
+// set and the caller's capacity, so a capacity edit cannot leave a stale busy
+// flag.
+func mergeRunnerProfile(caller, existing model.Runner) model.Runner {
+	merged := caller
+	merged.ActiveJobs = append([]string(nil), existing.ActiveJobs...)
+	merged.CurrentJob = existing.CurrentJob
+	merged.Completed = existing.Completed
+	merged.Failed = existing.Failed
+	if !existing.Registered.IsZero() {
+		merged.Registered = existing.Registered
+	}
+	merged.Busy = merged.Capacity > 0 && len(merged.ActiveJobs) >= merged.Capacity
+	return merged
+}
+
+// UpsertRunner registers or re-registers a runner. On an existing row it
+// merges only the profile/admin fields under the runner row lock: the
+// LEASE-OWNED fields (active_jobs, busy, current_job) and the completed/failed
+// counters are preserved, so a re-registration from a stale snapshot — the
+// server's Get-then-Upsert registration path — can never drop a slot that a
+// concurrent AcquireLeaseAtomic just reserved. A brand-new runner row is the
+// only path that seeds those fields. UpdateRunnerProfileFields is the same
+// guarded merge for callers that must not create a runner.
 func (s *PostgresStore) UpsertRunner(ctx context.Context, runner model.Runner) error {
 	if err := ValidateRunnerID(runner.ID); err != nil {
 		return err
 	}
-	payload, err := jsonMarshal(runner)
+	return s.writeRunnerProfile(ctx, runner, false)
+}
+
+// UpdateRunnerProfileFields updates only the profile/admin fields of an
+// EXISTING runner (see the contract on RunnerProfileUpdateStore). It is the
+// explicit guarded operation registration/drain/enable adopt so their
+// in-memory model never has to carry active_jobs at all.
+func (s *PostgresStore) UpdateRunnerProfileFields(ctx context.Context, runner model.Runner) error {
+	if err := ValidateRunnerID(runner.ID); err != nil {
+		return err
+	}
+	return s.writeRunnerProfile(ctx, runner, true)
+}
+
+// writeRunnerProfile is the ONE guarded runner write. It locks the runner row
+// (if any) and, on an existing row, writes the caller's profile/admin fields
+// while preserving the lease-owned fields; requireExisting fails closed with
+// ErrNotFound instead of creating a row.
+func (s *PostgresStore) writeRunnerProfile(ctx context.Context, runner model.Runner, requireExisting bool) error {
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	activeJSON, err := jsonMarshal(runner.ActiveJobs)
+	defer tx.Rollback(ctx)
+
+	rs := runnerScanner{}
+	err = tx.QueryRow(ctx, `SELECT `+runnerCols+` FROM runners WHERE id=$1 FOR UPDATE`, runner.ID).Scan(rs.targets()...)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		if requireExisting {
+			return ErrNotFound
+		}
+		// A fresh registration seeds the supplied fields: there is no lease
+		// state to preserve.
+		if err := s.insertRunnerRowTx(ctx, tx, runner); err != nil {
+			return err
+		}
+	case err != nil:
+		return err
+	default:
+		existing, err := rs.runner()
+		if err != nil {
+			return err
+		}
+		if err := s.updateRunnerProfileRowTx(ctx, tx, mergeRunnerProfile(runner, existing)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *PostgresStore) insertRunnerRowTx(ctx context.Context, tx pgx.Tx, runner model.Runner) error {
+	args, err := runnerWriteArgs(runner)
 	if err != nil {
 		return err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO runners (id, busy, capacity, completed, failed, current_job, active_jobs, registered, last_seen, payload, disabled, draining) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`, args...)
+	return err
+}
+
+func (s *PostgresStore) updateRunnerProfileRowTx(ctx context.Context, tx pgx.Tx, runner model.Runner) error {
+	args, err := runnerWriteArgs(runner)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `UPDATE runners SET busy=$2, capacity=$3, completed=$4, failed=$5, current_job=$6, active_jobs=$7, registered=$8, last_seen=$9, payload=$10, disabled=$11, draining=$12 WHERE id=$1`, args...)
+	return err
+}
+
+// runnerWriteArgs marshals a runner for the runner-row INSERT/UPDATE. It is
+// shared by both so the two statements can never drift.
+func runnerWriteArgs(runner model.Runner) ([]any, error) {
+	payload, err := jsonMarshal(runner)
+	if err != nil {
+		return nil, err
+	}
+	activeJSON, err := jsonMarshal(runner.ActiveJobs)
+	if err != nil {
+		return nil, err
 	}
 	if len(activeJSON) == 0 || string(activeJSON) == "null" {
 		activeJSON = []byte("[]")
@@ -2467,10 +2626,14 @@ func (s *PostgresStore) UpsertRunner(ctx context.Context, runner model.Runner) e
 	if !runner.LastSeen.IsZero() {
 		lastSeen = runner.LastSeen
 	}
-	_, err = s.pool.Exec(ctx, `INSERT INTO runners (id, busy, capacity, completed, failed, current_job, active_jobs, registered, last_seen, payload, disabled, draining) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (id) DO UPDATE SET busy=EXCLUDED.busy, capacity=EXCLUDED.capacity, completed=EXCLUDED.completed, failed=EXCLUDED.failed, current_job=EXCLUDED.current_job, active_jobs=EXCLUDED.active_jobs, registered=EXCLUDED.registered, last_seen=EXCLUDED.last_seen, payload=EXCLUDED.payload, disabled=EXCLUDED.disabled, draining=EXCLUDED.draining`,
-		runner.ID, runner.Busy, runner.Capacity, runner.Completed, runner.Failed, nullText(runner.CurrentJob), activeJSON, registered, lastSeen, payload, runner.Disabled, runner.Draining)
-	return err
+	return []any{
+		runner.ID, runner.Busy, runner.Capacity, runner.Completed, runner.Failed,
+		nullText(runner.CurrentJob), activeJSON, registered, lastSeen, payload,
+		runner.Disabled, runner.Draining,
+	}, nil
 }
+
+var _ RunnerProfileUpdateStore = (*PostgresStore)(nil)
 
 func (s *PostgresStore) GetRunner(ctx context.Context, id string) (model.Runner, error) {
 	if err := ValidateRunnerID(id); err != nil {
@@ -2942,9 +3105,14 @@ func (s *PostgresStore) ReadAudit(ctx context.Context, limit int) ([]model.Audit
 
 // InsertCompletionReceipt persists one completion idempotency receipt and
 // then applies the shared retention prune in the same transaction, so the
-// receipt set stays bounded by the fs-mode contract. The insert is idempotent
-// (ON CONFLICT DO NOTHING) and a prune failure rolls the whole transaction
-// back, leaving the receipt absent; a retry re-applies both.
+// receipt set stays bounded by the fs-mode contract. The semantic is
+// FIRST-WINS: the first receipt for a (job, generation, runner) identity is
+// authoritative and a later insert never overwrites it (ON CONFLICT DO
+// NOTHING), matching the in-memory store. The receipt records what the lease's
+// completion actually was, so a second, conflicting insert must not silently
+// rewrite it; callers that must detect the conflict compare the stored
+// ResultHash. A prune failure rolls the whole transaction back, leaving the
+// receipt absent; a retry re-applies both.
 func (s *PostgresStore) InsertCompletionReceipt(ctx context.Context, r model.CompletionReceipt) error {
 	if err := ValidateJobID(r.JobID); err != nil {
 		return err

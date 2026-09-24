@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/forge"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
@@ -153,9 +154,18 @@ func (s *Server) effectDeploymentFinish(ctx context.Context, j model.Job) error 
 	cur.FinishedAt = &finished
 	s.deployments[j.ID] = cur
 	if err := persistDeploymentFinishState(s); err != nil {
-		// Durability first: the marker must not survive a failed write, or
-		// the retry would treat the effect as already done.
-		s.deployments[j.ID] = prev
+		// Durability first: a pre-rename failure must not leave the marker
+		// behind, or the retry would treat the effect as already done. A
+		// post-rename directory-fsync failure (fsutil.Renamed) means the
+		// visible snapshot already carries the finished marker: rolling it
+		// back would make memory deny a deployment the disk finished, so the
+		// published marker is retained (readiness armed by the persist) and
+		// the returned error keeps the completion outbox retrying until a
+		// same-directory persist reconciles; the retained marker then makes
+		// the retry a no-op.
+		if !fsutil.Renamed(err) {
+			s.deployments[j.ID] = prev
+		}
 		return err
 	}
 	s.auditLocked("deployment.completed", "scheduler", j.RunID, j.ID, "deployment finished", map[string]string{"environment": j.Environment, "status": string(j.Status)})

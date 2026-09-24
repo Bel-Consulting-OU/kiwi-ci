@@ -3,7 +3,6 @@ package executor
 import (
 	"context"
 	"errors"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -127,10 +126,7 @@ func TestRunJobTartFullPath(t *testing.T) {
 	installFakeBins(t)
 	ws := canonicalTempDir(t)
 	t.Setenv("FAKE_WS", ws)
-	ln, err := net.Listen("tcp", "127.0.0.1:4545")
-	if err != nil {
-		t.Skipf("port 4545 unavailable: %v", err)
-	}
+	ln := listenTartAgentBootstrap(t)
 	agent := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})}

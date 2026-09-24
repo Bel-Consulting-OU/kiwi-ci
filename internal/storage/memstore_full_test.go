@@ -209,7 +209,7 @@ func TestMemStoreCompleteJobBranches(t *testing.T) {
 	if err := m.CompleteJob(ctx, memJobID, 3, memRunnerID, model.StatusSuccess, "", nil, receipt()); !errors.Is(err, ErrRequiredArtifactMissing) {
 		t.Fatalf("missing required artifact = %v", err)
 	}
-	if err := m.InsertArtifact(ctx, model.ArtifactRecord{ID: memArtifactID, RunID: memRunID, JobID: memJobID, Name: "bin"}); err != nil {
+	if err := m.InsertArtifact(ctx, model.ArtifactRecord{ID: memArtifactID, RunID: memRunID, JobID: memJobID, Name: "bin", LeaseGeneration: 3}); err != nil {
 		t.Fatalf("artifact: %v", err)
 	}
 	// A non-required contract entry never blocks the completion.

@@ -48,7 +48,10 @@ const (
 //     permission sets) deny every action: they never fall through to global
 //     roles, because that would let a map duplicate silently widen a grant;
 //   - global roles apply only when the principal declares NO usable entry
-//     for the repository (RepoNoEntry);
+//     for the repository (RepoNoEntry); an empty repository string is the
+//     deliberately repo-less case and also uses global roles, but a
+//     NON-empty unparseable repository string is denied outright (it names
+//     no repository, so a global role must not be borrowed for it);
 //   - RoleRun grants untrusted run only; trusted_run requires an explicit
 //     RoleTrustedRun, the admin role, or a repo TrustedRun grant;
 //   - ActionRun with trusted=true is equivalent to ActionTrustedRun.
@@ -61,10 +64,16 @@ func Authorize(p Principal, action Action, repo string, trusted bool) bool {
 	}
 	grant, err := ParseStoredRepoID(repo)
 	if err != nil {
-		// An empty or malformed repository string carries no identity the
-		// map could mention: only the global roles decide. The same path
-		// serves the deliberately repo-less global actions.
-		return authorizeGlobalRoles(p, action, trusted)
+		// A non-empty but unparseable repository string carries no identity
+		// the map could mention, so it must NOT fall through to the global
+		// roles: that would let a malformed scope borrow a broad role and
+		// silently authorize a repository the caller never named. Only the
+		// deliberately repo-less empty string is decided by global roles
+		// (the same path serves the global actions).
+		if strings.TrimSpace(repo) == "" {
+			return authorizeGlobalRoles(p, action, trusted)
+		}
+		return false
 	}
 	return authorizeGrantMode(p, action, grant, trusted, true)
 }
@@ -196,7 +205,8 @@ func CanReadAnyRepoAlias(p Principal, alias RepoAlias) bool {
 	if p.Has(RoleAdmin) || p.Has(RoleRead) {
 		return true
 	}
-	if alias.FullName == "" {
+	fullName := alias.normalized().FullName
+	if fullName == "" {
 		return false
 	}
 	for key, perm := range p.Repositories {
@@ -208,12 +218,12 @@ func CanReadAnyRepoAlias(p Principal, alias RepoAlias) bool {
 			continue
 		}
 		if grant.IsAlias() {
-			if a, _ := grant.Alias(); a.FullName == alias.FullName {
+			if a, _ := grant.Alias(); a.FullName == fullName {
 				return true
 			}
 			continue
 		}
-		if id, _ := grant.Identity(); id.FullName == alias.FullName {
+		if id, _ := grant.Identity(); id.FullName == fullName {
 			return true
 		}
 	}

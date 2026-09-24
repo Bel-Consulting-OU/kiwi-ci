@@ -1,6 +1,7 @@
 package secrets
 
 import (
+	"encoding/base32"
 	"encoding/base64"
 	"encoding/hex"
 	"net/url"
@@ -116,4 +117,107 @@ func TestTaintCheckDetectsEncodedForms(t *testing.T) {
 	if err := m.TaintCheck(map[string]string{"clean": "nothing here"}, nil); err != nil {
 		t.Fatalf("clean output flagged: %v", err)
 	}
+}
+
+// TestTaintCheckUppercaseHex pins F5-A: upper-case hex is a trivial
+// re-encoding and must be detected and masked, not only lower-case hex.
+func TestTaintCheckUppercaseHex(t *testing.T) {
+	const secret = "s3cr3t-Value-0123456789abcdef"
+	m := &Masker{}
+	if err := m.AddStrict(secret); err != nil {
+		t.Fatal(err)
+	}
+	upper := strings.ToUpper(hex.EncodeToString([]byte(secret)))
+	if !m.ContainsSecret(upper) {
+		t.Fatal("upper-case hex secret not detected")
+	}
+	if got := m.MaskMulti(upper); got != maskReplacement {
+		t.Fatalf("MaskMulti(upper hex) = %q, want %q", got, maskReplacement)
+	}
+	if err := m.TaintCheck(map[string]string{"out": upper}, nil); err == nil {
+		t.Fatal("upper-case hex secret passed TaintCheck and would be persisted")
+	}
+}
+
+// TestTaintCheckBase32Forms pins base32 as a covered derived encoding in both
+// the padded/unpadded standard and extended-hex alphabets.
+func TestTaintCheckBase32Forms(t *testing.T) {
+	const secret = "s3cr3t-Value-0123456789abcdef"
+	m := &Masker{}
+	if err := m.AddStrict(secret); err != nil {
+		t.Fatal(err)
+	}
+	b := []byte(secret)
+	forms := map[string]string{
+		"base32":           base32.StdEncoding.EncodeToString(b),
+		"base32 nopad":     base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b),
+		"base32 hex":       base32.HexEncoding.EncodeToString(b),
+		"base32 lower":     strings.ToLower(base32.StdEncoding.EncodeToString(b)),
+		"base32 hex lower": strings.ToLower(base32.HexEncoding.EncodeToString(b)),
+	}
+	for label, f := range forms {
+		if !m.ContainsSecret("out=" + f) {
+			t.Errorf("%s form not detected: %q", label, f)
+		}
+		if got := m.MaskMulti("out=" + f); strings.Contains(got, f) {
+			t.Errorf("%s form left unmasked: %q", label, got)
+		}
+		if err := m.TaintCheck(map[string]string{"out": f}, nil); err == nil {
+			t.Errorf("%s form passed TaintCheck", label)
+		}
+	}
+}
+
+// TestTaintCheckAndMaskWrappedBase64 pins F5-A: base64(1)/MIME output wraps
+// long values at 76 columns. Whitespace must not split the form past
+// detection or masking.
+func TestTaintCheckAndMaskWrappedBase64(t *testing.T) {
+	secret := strings.Repeat("A1b2C3d4E5f6G7h8", 8) // 128 bytes
+	m := &Masker{}
+	if err := m.AddStrict(secret); err != nil {
+		t.Fatal(err)
+	}
+	oneLine := base64.StdEncoding.EncodeToString([]byte(secret))
+	wrapped := wrap76(oneLine)
+
+	if !m.ContainsSecret(oneLine) {
+		t.Fatal("single-line base64 not detected")
+	}
+	if !m.ContainsSecret(wrapped) {
+		t.Fatal("76-column-wrapped base64 not detected")
+	}
+	masked := m.MaskMulti(wrapped)
+	if strings.Contains(masked, oneLine[0:76]) {
+		t.Fatalf("wrapped base64 left unmasked: %q", masked)
+	}
+	if !strings.Contains(masked, maskReplacement) {
+		t.Fatalf("wrapped base64 produced no mask replacement: %q", masked)
+	}
+	if err := m.TaintCheck(map[string]string{"out": wrapped}, nil); err == nil {
+		t.Fatal("76-column-wrapped base64 secret passed TaintCheck and would be persisted")
+	}
+
+	// An indented form (leading whitespace on the wrap) must also be caught.
+	indented := "  " + strings.ReplaceAll(wrapped, "\n", "\n  ")
+	if !m.ContainsSecret(indented) {
+		t.Fatal("indented wrapped base64 not detected")
+	}
+	if got := m.MaskMulti(indented); strings.Contains(got, oneLine[0:32]) {
+		t.Fatalf("indented wrapped base64 left unmasked: %q", got)
+	}
+}
+
+// wrap76 emulates the base64(1) command: 76-character lines, each terminated
+// by a newline.
+func wrap76(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i += 76 {
+		end := i + 76
+		if end > len(s) {
+			end = len(s)
+		}
+		b.WriteString(s[i:end])
+		b.WriteByte('\n')
+	}
+	return b.String()
 }

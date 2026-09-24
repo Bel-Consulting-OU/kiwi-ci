@@ -120,6 +120,15 @@ const (
 // canonical forge host (see CanonicalHost) and is required; FullName is the
 // forge-native repository path (owner/name, nested group paths allowed). Two
 // identities are the same repository exactly when both fields are equal.
+//
+// The FullName is case-folded to ONE canonical form (see FoldRepoFullName):
+// repository path case is NOT identity-bearing. The forges Kiwi supports treat
+// owner/name case-insensitively, and an unfolded path let
+// repo_url=https://github.com/Acme/Backend.git persist
+// "github.com/Acme/Backend" and bypass an explicit
+// "github.com/acme/backend" deny plus every repository policy. Every
+// constructor, parser and comparator folds the path, so all spellings of one
+// repository resolve to the same identity.
 type RepoIdentity struct {
 	Host     string
 	FullName string
@@ -128,8 +137,40 @@ type RepoIdentity struct {
 // RepoAlias is a bare, host-less repository name ("owner/name", possibly a
 // nested group path). An alias is not an identity: it addresses every forge
 // presenting the name and therefore only ever matches an explicit bare grant.
+// Its FullName is folded like an identity's.
 type RepoAlias struct {
 	FullName string
+}
+
+// FoldRepoFullName canonicalizes the case of a repository full name (path)
+// onto the ONE folded form every identity uses: ASCII A-Z are lowercased.
+// Repository paths are case-insensitive on the forges Kiwi supports, and path
+// case used to be identity-bearing (a mixed-case clone URL stored an unfolded
+// canonical ID and bypassed an explicit lowercase deny and its policies).
+//
+// Only ASCII is folded, deliberately: PostgreSQL's LOWER() folds ASCII
+// identically, so the Go identity and the SQL kiwi_canonical_repo_id /
+// kiwi_normalize_* functions agree byte-for-byte on every path that can name a
+// repository (the forges restrict repository paths to ASCII). The forge HOST
+// is folded separately by CanonicalHost.
+func FoldRepoFullName(s string) string {
+	upper := false
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			upper = true
+			break
+		}
+	}
+	if !upper {
+		return s
+	}
+	b := []byte(s)
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b)
 }
 
 // RepoGrantKind classifies a parsed repository ACL grant.
@@ -171,20 +212,35 @@ func (g RepoGrant) IsIdentity() bool { return g.kind == RepoGrantIdentity }
 // IsAlias reports whether the grant is a bare, host-less alias.
 func (g RepoGrant) IsAlias() bool { return g.kind == RepoGrantAlias }
 
-// Identity returns the canonical identity and true for identity grants.
+// Identity returns the canonical identity and true for identity grants. The
+// returned value is normalized (path case folded), so a directly constructed
+// grant can never compare unfolded.
 func (g RepoGrant) Identity() (RepoIdentity, bool) {
 	if g.kind != RepoGrantIdentity {
 		return RepoIdentity{}, false
 	}
-	return g.ident, true
+	return g.ident.normalized(), true
 }
 
-// Alias returns the bare alias and true for alias grants.
+// Alias returns the bare alias and true for alias grants. The returned value
+// is normalized (path case folded).
 func (g RepoGrant) Alias() (RepoAlias, bool) {
 	if g.kind != RepoGrantAlias {
 		return RepoAlias{}, false
 	}
-	return g.alias, true
+	return g.alias.normalized(), true
+}
+
+// normalized returns the identity with its full name folded onto the one
+// canonical path form. The host is left as-is (constructors canonicalize it;
+// a directly constructed value is not silently reinterpreted).
+func (id RepoIdentity) normalized() RepoIdentity {
+	return RepoIdentity{Host: id.Host, FullName: FoldRepoFullName(id.FullName)}
+}
+
+// normalized returns the alias with its full name folded.
+func (a RepoAlias) normalized() RepoAlias {
+	return RepoAlias{FullName: FoldRepoFullName(a.FullName)}
 }
 
 // AuthorizationID is the value a canonical lookup compares against the
@@ -196,7 +252,7 @@ func (g RepoGrant) AuthorizationID() string {
 	case RepoGrantIdentity:
 		return g.ident.ID()
 	case RepoGrantAlias:
-		return g.alias.FullName
+		return g.alias.normalized().FullName
 	}
 	return ""
 }
@@ -217,22 +273,23 @@ func (g RepoGrant) Serialized() string {
 
 // ID renders the canonical identity as the legacy "host/fullName" string used
 // by storage, SQL comparisons and persisted records. The value always carries
-// the explicit canonical host; an empty FullName yields "".
+// the explicit canonical host and the FOLDED full name (see FoldRepoFullName);
+// an empty FullName yields "".
 func (id RepoIdentity) ID() string {
 	if id.Host == "" || id.FullName == "" {
 		return ""
 	}
-	return id.Host + "/" + id.FullName
+	return id.Host + "/" + FoldRepoFullName(id.FullName)
 }
 
 // Serialized renders the identity in the unambiguous ACL form
-// "r1:<base64url(host)>:<base64url(full_name)>".
+// "r1:<base64url(host)>:<base64url(full_name)>". The full name part is folded.
 func (id RepoIdentity) Serialized() string {
 	if id.Host == "" || id.FullName == "" {
 		return ""
 	}
 	return RepoIdentityPrefix + base64.RawURLEncoding.EncodeToString([]byte(id.Host)) +
-		":" + base64.RawURLEncoding.EncodeToString([]byte(id.FullName))
+		":" + base64.RawURLEncoding.EncodeToString([]byte(FoldRepoFullName(id.FullName)))
 }
 
 // String renders the identity in its canonical storage form, identical to ID.
@@ -241,19 +298,20 @@ func (id RepoIdentity) String() string { return id.ID() }
 // Serialized renders the alias in its explicit ACL spelling: the plain
 // "owner/name" form when the name has exactly one slash (unambiguous: a
 // canonical identity always needs a host in front of owner/name), the
-// "a1:<base64url(full_name)>" form otherwise.
+// "a1:<base64url(full_name)>" form otherwise. The full name is folded.
 func (a RepoAlias) Serialized() string {
 	if a.FullName == "" {
 		return ""
 	}
-	if strings.Count(a.FullName, "/") == 1 {
-		return a.FullName
+	full := FoldRepoFullName(a.FullName)
+	if strings.Count(full, "/") == 1 {
+		return full
 	}
-	return RepoAliasPrefix + base64.RawURLEncoding.EncodeToString([]byte(a.FullName))
+	return RepoAliasPrefix + base64.RawURLEncoding.EncodeToString([]byte(full))
 }
 
-// String renders the alias as its bare full name.
-func (a RepoAlias) String() string { return a.FullName }
+// String renders the alias as its bare folded full name.
+func (a RepoAlias) String() string { return FoldRepoFullName(a.FullName) }
 
 // CanonicalHostIdentity canonicalizes host and fullName into a RepoIdentity:
 // the host is normalized with CanonicalHost, the full name is trimmed, and a
@@ -276,9 +334,10 @@ func CanonicalHostIdentity(host, fullName string) (RepoIdentity, error) {
 	return RepoIdentity{Host: h, FullName: full}, nil
 }
 
-// CanonicalHostAlias canonicalizes a bare full name into a RepoAlias.
+// CanonicalHostAlias canonicalizes a bare full name into a RepoAlias. The
+// full name is folded onto the one canonical path form.
 func CanonicalHostAlias(fullName string) (RepoAlias, error) {
-	a := RepoAlias{FullName: strings.TrimSpace(fullName)}
+	a := RepoAlias{FullName: FoldRepoFullName(strings.TrimSpace(fullName))}
 	if err := validateFullName(a.FullName, false); err != nil {
 		return RepoAlias{}, err
 	}
@@ -293,7 +352,7 @@ func CanonicalHostAlias(fullName string) (RepoAlias, error) {
 // A host of "" (the caller knows no host) keeps the trimmed full name
 // unchanged; the host is never guessed from the name.
 func canonicalRepoParts(host, fullName string) (canonHost, canonFull string) {
-	canonFull = strings.TrimSpace(fullName)
+	canonFull = FoldRepoFullName(strings.TrimSpace(fullName))
 	if canonFull == "" {
 		return CanonicalHost(host), ""
 	}
@@ -380,7 +439,7 @@ func ParseRepoIdentity(s string) (RepoIdentity, error) {
 		return RepoIdentity{}, &RepoGrantError{Grant: s, Detail: "full-name part is not valid base64url"}
 	}
 	host := string(hostBytes)
-	full := string(fullBytes)
+	full := FoldRepoFullName(string(fullBytes))
 	canonHost := CanonicalHost(host)
 	if !validCanonicalHost(canonHost) {
 		return RepoIdentity{}, &RepoGrantError{Grant: s, Detail: fmt.Sprintf("host %q is empty or malformed", host)}
@@ -406,7 +465,7 @@ func ParseRepoAlias(s string) (RepoAlias, error) {
 	if err != nil {
 		return RepoAlias{}, &RepoGrantError{Grant: s, Detail: "the part after " + RepoAliasPrefix + " is not valid base64url"}
 	}
-	full := string(raw)
+	full := FoldRepoFullName(string(raw))
 	if err := validateFullName(full, false); err != nil {
 		return RepoAlias{}, &RepoGrantError{Grant: s, Detail: err.Error()}
 	}
@@ -472,10 +531,10 @@ func parseRepoGrant(s string, allowLegacyCanonical bool) (RepoGrant, error) {
 	}
 	first, rest, ok := splitFirstPathSegment(s)
 	if !ok {
-		return AliasGrant(RepoAlias{FullName: s}), nil
+		return AliasGrant(RepoAlias{FullName: FoldRepoFullName(s)}), nil
 	}
 	if !strings.Contains(rest, "/") {
-		return AliasGrant(RepoAlias{FullName: s}), nil
+		return AliasGrant(RepoAlias{FullName: FoldRepoFullName(s)}), nil
 	}
 	if !allowLegacyCanonical {
 		return RepoGrant{}, &RepoGrantError{
@@ -491,7 +550,7 @@ func parseRepoGrant(s string, allowLegacyCanonical bool) (RepoGrant, error) {
 	if err := validateFullName(rest, true); err != nil {
 		return RepoGrant{}, &RepoGrantError{Grant: s, Detail: err.Error()}
 	}
-	return IdentityGrant(RepoIdentity{Host: host, FullName: rest}), nil
+	return IdentityGrant(RepoIdentity{Host: host, FullName: FoldRepoFullName(rest)}), nil
 }
 
 // ParseStoredRepoID parses a persisted repository ID (run/job/schedule

@@ -99,6 +99,53 @@ func ResolveRunnerProfile(r model.Runner, profile model.RunnerProfile, linked bo
 	return r
 }
 
+// ClaimAllowsRunner evaluates the shared, TYPED scheduling predicates for one
+// candidate claim against a runner's EFFECTIVE scheduling view. The caller
+// resolves the live profile first (see ResolveRunnerProfile) for linked
+// runners; for unlinked runners the registration snapshot is used unchanged.
+//
+// It exists so the SQL claim and the in-memory claim make the SAME decision
+// for the runner-side predicates (admission state, capacity, labels,
+// canonical repository ACL, runtime capability and placement regions): the
+// previous SQL claim compared raw strings and skipped every predicate for an
+// unlinked runner, so a cross-forge allowlist entry, an "r1:" identity spelling
+// or a snapshot capability could admit a job the in-memory store denied.
+//
+// Environment concurrency and the enforced-policy runtime grant are NOT part
+// of this helper: the SQL claim reserves the environment slot under the
+// per-key advisory lock using the claim's environment fields, and the
+// enforced-policy grant is applied by the scheduler prefilter and the
+// in-memory predicate.
+func ClaimAllowsRunner(r model.Runner, c LeaseClaim) bool {
+	if r.Disabled || r.Draining {
+		return false
+	}
+	if r.Capacity <= 0 || len(r.ActiveJobs) >= r.Capacity {
+		return false
+	}
+	if !labelsSatisfy(r.Labels, c.RequiredLabels) {
+		return false
+	}
+	if !RepoAllowed(r.AllowedRepositories, claimRepoIdentity(c)) {
+		return false
+	}
+	if !RuntimeAllowed(r.Capabilities, c.Runtime) {
+		return false
+	}
+	if len(c.PlacementRegions) > 0 && !containsString(c.PlacementRegions, r.Region) {
+		return false
+	}
+	return true
+}
+
+// claimRepoIdentity renders a claim's repository identity as a job value so
+// the ONE typed allowlist predicate (RepoAllowed) can evaluate it: the
+// canonical RepoID is authoritative (RepoIDForJob precedence), with the bare
+// full name as its legacy alias.
+func claimRepoIdentity(c LeaseClaim) model.Job {
+	return model.Job{PolicyRepoID: c.CanonRepoID, RepoFullName: c.RepoFullName}
+}
+
 // RepoAllowed reports whether the job's repository is inside the runner's
 // allowlist. An empty allowlist imposes no restriction. Both sides are parsed
 // into typed values with the documented positional rule

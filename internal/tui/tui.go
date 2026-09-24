@@ -37,11 +37,17 @@ func Run(ctx context.Context, cfg Config, out io.Writer, in io.Reader) error {
 		}
 		for _, e := range page {
 			state.set(e.Seq)
+			// Advance the cursor from EVERY entry, not only the entries the
+			// active job filter keeps: a full page belonging entirely to
+			// other jobs must still move `after` past it, or the same page is
+			// refetched forever.
+			if e.Seq > after {
+				after = e.Seq
+			}
 			if !filter.matches(e.JobKey) {
 				continue
 			}
 			lines.Append(formatEntry(entryFromModel(e)))
-			after = e.Seq
 		}
 		if len(page) < 1000 {
 			break

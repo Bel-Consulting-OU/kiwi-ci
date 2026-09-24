@@ -32,20 +32,21 @@ func openRootHandle(path string) (*os.File, error) {
 // unchanged; it lets the descriptor-duplication failure be exercised.
 var dupRootFD = unix.Dup
 
-// openParentChain walks the parent components of name beneath the held root
+// walkDirChain walks the slash-separated rel beneath the held root
 // descriptor one component at a time: each existing component is opened with
-// O_NOFOLLOW|O_DIRECTORY, and each missing component is created with a
-// single-component mkdirat followed by an immediate O_NOFOLLOW re-open.
-// Every open is relative to a held descriptor (openat), never to a path, so
-// renames or symlink swaps above or inside the root cannot redirect the
-// write. The caller owns the returned descriptor of the deepest parent.
-func openParentChain(root *Root, name string) (int, error) {
+// O_NOFOLLOW|O_DIRECTORY relative to its parent descriptor, and each missing
+// component is created with a single-component mkdirat followed by an
+// immediate O_NOFOLLOW re-open. Every open is relative to a held descriptor
+// (openat), never to a path, so renames or symlink swaps above or inside the
+// root cannot redirect the walk and no component that is a symlink is ever
+// traversed. rel "" returns a duplicate of the root descriptor. The caller
+// owns the returned descriptor.
+func walkDirChain(root *Root, rel string) (int, error) {
 	fd, err := dupRootFD(int(root.F.Fd()))
 	if err != nil {
 		return -1, err
 	}
-	parts := strings.Split(name, "/")
-	for _, p := range parts[:len(parts)-1] {
+	for _, p := range strings.Split(rel, "/") {
 		if p == "" {
 			continue
 		}
@@ -77,6 +78,38 @@ func openParentChain(root *Root, name string) (int, error) {
 		fd = child
 	}
 	return fd, nil
+}
+
+// openBeneathHandle implements OpenRootBeneath on unix: it walks the whole
+// relative path from the held root and returns a descriptor of the deepest
+// directory. A component that is not a real directory — a symlink (ELOOP, or
+// ENOTDIR where O_NOFOLLOW|O_DIRECTORY reports the link as a non-directory,
+// as on darwin) or a regular file — is reported as ErrSymlinkParent, because
+// OpenRootBeneath's destination must consist only of real directories.
+func openBeneathHandle(ws *Root, rel string) (*os.File, error) {
+	fd, err := walkDirChain(ws, rel)
+	if err != nil {
+		if errors.Is(err, unix.ENOTDIR) || errors.Is(err, unix.ELOOP) {
+			return nil, ErrSymlinkParent
+		}
+		return nil, err
+	}
+	name := ws.Canonical
+	if rel != "" {
+		name = filepath.Join(ws.Canonical, filepath.FromSlash(rel))
+	}
+	return os.NewFile(uintptr(fd), name), nil
+}
+
+// openParentChain walks the parent components of name beneath the held root
+// descriptor (see walkDirChain) and returns a descriptor of the deepest
+// existing or newly created parent directory. The caller owns it.
+func openParentChain(root *Root, name string) (int, error) {
+	parts := strings.Split(name, "/")
+	if len(parts) <= 1 {
+		return dupRootFD(int(root.F.Fd()))
+	}
+	return walkDirChain(root, strings.Join(parts[:len(parts)-1], "/"))
 }
 
 // openatFn is a test-only seam over unix.Openat. Production behavior is

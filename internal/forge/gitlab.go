@@ -254,15 +254,28 @@ type gitLabComparePayload struct {
 // GitLab compare paginates diffs (per_page up to 100). A complete list is
 // claimed only when pagination terminates on a short page; a 4xx (unknown
 // refs, private repo, ...) means the diff is not available and yields an
-// incomplete result instead of an error.
-const gitLabComparePerPage = 100
+// incomplete result instead of an error. Pagination is capped like GitHub's
+// compare API so a hostile or compromised instance that always answers with a
+// full page cannot drive an unbounded loop or unbounded memory.
+const (
+	gitLabComparePerPage  = 100
+	gitLabCompareMaxPages = 3
+	// gitLabCompareMaxFiles bounds the accumulated diff list to the product
+	// of the page cap and the page size, even if a page lies about its size.
+	gitLabCompareMaxFiles = gitLabComparePerPage * gitLabCompareMaxPages
+)
 
 func (g *GitLab) ChangedFiles(ctx context.Context, ec EventContext) (ChangedFilesResult, error) {
 	if ec.HeadSHA == "" || ec.BaseSHA == "" || ec.Repository.FullName == "" {
 		return ChangedFilesResult{}, nil
 	}
 	files := make([]string, 0, gitLabComparePerPage)
-	for page := 1; ; page++ {
+	for page := 1; page <= gitLabCompareMaxPages; page++ {
+		if page > 1 {
+			if err := ctx.Err(); err != nil {
+				return ChangedFilesResult{Files: files, Complete: false}, err
+			}
+		}
 		u := fmt.Sprintf("%s/projects/%s/repository/compare?from=%s&to=%s&per_page=%d&page=%d",
 			g.apiBase(), url.QueryEscape(ec.Repository.FullName), url.QueryEscape(ec.BaseSHA), url.QueryEscape(ec.HeadSHA), gitLabComparePerPage, page)
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -292,16 +305,26 @@ func (g *GitLab) ChangedFiles(ctx context.Context, ec EventContext) (ChangedFile
 			return ChangedFilesResult{}, err
 		}
 		for _, d := range v.Diffs {
+			if len(files) >= gitLabCompareMaxFiles {
+				break
+			}
 			name := d.NewPath
 			if name == "" {
 				name = d.OldPath
 			}
 			files = append(files, name)
 		}
+		if len(files) >= gitLabCompareMaxFiles {
+			// The accumulated list hit the cap: the diff may be incomplete.
+			return ChangedFilesResult{Files: files, Complete: false}, nil
+		}
 		if len(v.Diffs) < gitLabComparePerPage {
 			return ChangedFilesResult{Files: files, Complete: true}, nil
 		}
 	}
+	// Three full pages: the API may truncate the diff, so the list is
+	// conservatively reported incomplete.
+	return ChangedFilesResult{Files: files, Complete: false}, nil
 }
 
 // PublishCheck falls back to a commit status: GitLab has no check-runs

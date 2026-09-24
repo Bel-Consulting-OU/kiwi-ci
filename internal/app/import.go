@@ -60,15 +60,21 @@ func Import(args []string) error {
 	for _, w := range res.Warnings {
 		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
 	}
-	for _, u := range res.Unsupported {
-		fmt.Fprintf(os.Stderr, "unsupported: %s\n", u)
-	}
 	if *listUnsupported {
+		// The report is the requested output, so it goes to stdout; the
+		// unsupported constructs used to be written to stderr regardless of
+		// the flag.
 		fmt.Printf("confidence: %.0f%%\n", res.Confidence*100)
+		for _, u := range res.Unsupported {
+			fmt.Printf("unsupported: %s\n", u)
+		}
 		for _, t := range res.TODOs {
 			fmt.Printf("TODO: %s\n", t)
 		}
 		return nil
+	}
+	for _, u := range res.Unsupported {
+		fmt.Fprintf(os.Stderr, "unsupported: %s\n", u)
 	}
 	if err := os.MkdirAll(filepath.Dir(*out), 0o755); err != nil {
 		return err

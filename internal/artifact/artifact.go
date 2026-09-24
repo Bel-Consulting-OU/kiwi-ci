@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/safefs"
 )
 
@@ -22,11 +23,27 @@ type Store struct {
 }
 
 // Test-only seams for otherwise unreachable OS failure branches. Production
-// behavior is unchanged: the defaults are os.File.Close and io.Copy.
+// behavior is unchanged: the defaults are os.File.Close, os.File.Sync and
+// os.Rename (copyDigest is the digest copy used by VerifyArchive).
 var (
-	closeArtifactFile = (*os.File).Close
-	copyDigest        = io.Copy
+	closeArtifactFile  = (*os.File).Close
+	syncArtifactFile   = (*os.File).Sync
+	renameArtifactFile = os.Rename
+	copyDigest         = io.Copy
 )
+
+// countWriter counts the bytes written through it so Save can report the
+// archive size without a second read of the file.
+type countWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
+}
 
 func Default() *Store {
 	home, _ := os.UserHomeDir()
@@ -59,36 +76,46 @@ func (s *Store) Save(runID, jobID, name, workspace string, paths []string) (stri
 		return "", err
 	}
 	dst := filepath.Join(dir, encodeArtifactName(name)+".tar.gz")
-	f, err := os.Create(dst + ".tmp")
+	// Stage into a UNIQUE temp file in the destination directory, fsync and
+	// checked-close it, rename it into place and fsync the directory: the
+	// same crash-durability sequence as fsutil.AtomicWriteFile, applied to a
+	// streamed archive that is far too large to buffer. A fixed ".tmp" name
+	// would let two concurrent saves clobber each other's scratch file.
+	f, err := os.CreateTemp(dir, "."+filepath.Base(dst)+"-*.tmp")
 	if err != nil {
 		return "", err
 	}
-	var w io.Writer = f
+	tmp := f.Name()
+	h := sha256.New()
+	cw := &countWriter{w: io.MultiWriter(f, h)}
+	var w io.Writer = cw
 	if s.MaxArtifactBytes > 0 {
-		w = safefs.NewCappedWriter(f, s.MaxArtifactBytes)
+		w = safefs.NewCappedWriter(cw, s.MaxArtifactBytes)
 	}
 	archived, err := safefs.WriteTarGzFromRootEntries(w, wsRoot, paths)
 	if err != nil {
-		f.Close()
-		_ = os.Remove(dst + ".tmp")
+		_ = f.Close()
+		_ = os.Remove(tmp)
 		return "", err
 	}
-	if err := closeArtifactFile(f); err != nil {
-		_ = os.Remove(dst + ".tmp")
+	syncErr := syncArtifactFile(f)
+	closeErr := closeArtifactFile(f)
+	if syncErr != nil || closeErr != nil {
+		_ = os.Remove(tmp)
+		if syncErr != nil {
+			return "", syncErr
+		}
+		return "", closeErr
+	}
+	if err := renameArtifactFile(tmp, dst); err != nil {
+		_ = os.Remove(tmp)
 		return "", err
 	}
-	if err := os.Rename(dst+".tmp", dst); err != nil {
-		return "", err
-	}
-	archive, err := os.Open(dst)
-	if err != nil {
-		return "", err
-	}
-	h := sha256.New()
-	size, cpErr := copyDigest(h, archive)
-	archive.Close()
-	if cpErr != nil {
-		return "", cpErr
+	if err := fsutil.SyncDir(dir); err != nil {
+		// The archive is visible but its rename may not survive a crash;
+		// no manifest may be written for it.
+		_ = os.Remove(dst)
+		return "", fmt.Errorf("artifact: sync archive directory: %w", err)
 	}
 	entries := make([]ArtifactEntry, 0, len(archived))
 	for _, e := range archived {
@@ -101,7 +128,7 @@ func (s *Store) Save(runID, jobID, name, workspace string, paths []string) (stri
 		RunID:     runID,
 		JobID:     jobID,
 		SHA256:    hex.EncodeToString(h.Sum(nil)),
-		Size:      size,
+		Size:      cw.n,
 		Entries:   entries,
 		CreatedAt: time.Now().UTC(),
 	}
@@ -158,25 +185,31 @@ func encodeArtifactName(s string) string {
 	return base64.RawURLEncoding.EncodeToString([]byte(s))
 }
 
-// Extract restores a tar.gz artifact under dest using the hardened safefs
-// extractor: only regular files and directories, no symlink following, and
-// hard resource limits. The destination directory is created if missing and
-// then opened as a held no-follow root handle so extraction stays anchored
-// to it.
-func Extract(path, dest string) error {
-	if err := os.MkdirAll(dest, 0o755); err != nil {
-		return err
+// Extract restores the tar.gz artifact at archivePath beneath the held
+// workspace root at the workspace-relative directory rel, using the hardened
+// safefs extractor: only regular files and directories, no symlink
+// following, and hard resource limits.
+//
+// The destination is resolved by walking rel component by component from the
+// held workspace root handle with a no-follow discipline (safefs.OpenRootBeneath),
+// and the destination directory is created one component at a time. A
+// symlinked ancestor can therefore never be traversed, even when the
+// workspace contains a symlink left by a checkout (for example
+// `evil -> $HOME` with rel `evil/.ssh`).
+func Extract(archivePath string, workspace *safefs.Root, rel string) error {
+	if workspace == nil || workspace.F == nil {
+		return fmt.Errorf("artifact extract: nil workspace root")
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	root, err := safefs.OpenRootNoFollow(dest)
+	root, err := safefs.OpenRootBeneath(workspace, rel)
 	if err != nil {
 		return fmt.Errorf("artifact extract: %w", err)
 	}
 	defer root.Close()
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
 	if _, err := safefs.Extract(root, f, safefs.DefaultLimits()); err != nil {
 		return fmt.Errorf("artifact extract: %w", err)
 	}

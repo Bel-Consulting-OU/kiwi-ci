@@ -9,9 +9,9 @@ to restore a Kiwi CI deployment.
 |---|---|---|
 | Runs, jobs, leases, runners, receipts, artifacts metadata, logs, audit, deliveries | PostgreSQL | Durable SQL control plane (production). |
 | Dev/persistent mode snapshot | `<data-dir>/state.json` | Atomically replaced JSON snapshot plus append-only log/audit files (filesystem `Repository`). |
-| Lease HMAC key | `<data-dir>/lease.key` | Must survive restarts or lease tokens cannot be verified. |
-| OIDC signing key | `<data-dir>/oidc-ed25519.key` | Must survive restarts or issued tokens become unverifiable. |
-| Runner CA | `<data-dir>/runner-ca.*` or operator-provided PEM | Must survive or enrolled runners lose trust. |
+| Lease HMAC key | `<data-dir>/lease.key` (fs mode) or `cluster_keys` table (DB mode) | Must survive restarts or lease tokens cannot be verified. |
+| OIDC signing key | `<data-dir>/oidc-keyring.json` (fs mode) or `cluster_keys` table (DB mode) | Must survive restarts or issued tokens become unverifiable. Legacy `<data-dir>/oidc-ed25519.key` migrates into the ring on load. |
+| Runner CA | `<data-dir>/runner-ca.*` (fs mode), `cluster_keys` table (DB mode), or operator-provided PEM | Must survive or enrolled runners lose trust. |
 | Artifact/cache payload bytes | blob backend (`fs` path or S3 bucket) | The CAS layer stores `sha256/<first-2>/<full-digest>` objects. |
 | Forge outbox | `<data-dir>/outbox.jsonl` + `outbox.done.jsonl` | Unflushed forge-status intents. |
 

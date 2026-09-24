@@ -50,8 +50,9 @@ func TestRepoPolicyKeysMatchEquivalentForgeHosts(t *testing.T) {
 }
 
 // TestRepoPolicyEquivalentKeysConflictFailsClosed: two keys that canonicalize
-// onto the same identity with DIFFERENT policies resolve to no entry instead
-// of depending on map iteration order.
+// onto the same identity with DIFFERENT policies DENY the repository (a
+// restrictive entry is returned) instead of depending on map iteration order
+// or silently falling back to org-only policy.
 func TestRepoPolicyEquivalentKeysConflictFailsClosed(t *testing.T) {
 	enabled := true
 	cfg := &Config{Repositories: map[string]RepoPolicy{
@@ -59,13 +60,14 @@ func TestRepoPolicyEquivalentKeysConflictFailsClosed(t *testing.T) {
 		r1("GITHUB.COM.", "acme/backend"):    {},
 		r1("github.com:443", "acme/backend"): {},
 	}}
-	if _, ok := cfg.RepoPolicyFor("github.com/acme/backend"); ok {
-		t.Fatal("ambiguous equivalent keys must fail closed")
+	rp, ok := cfg.RepoPolicyFor("github.com/acme/backend")
+	if !ok || rp.Network != "none" {
+		t.Fatalf("ambiguous equivalent keys must deny (not fall back to org-only): %+v ok=%v", rp, ok)
 	}
 	// Equal policies on equivalent keys still resolve.
 	cfg.Repositories[r1("GITHUB.COM.", "acme/backend")] = RepoPolicy{RequireDigestPins: &enabled}
 	delete(cfg.Repositories, r1("github.com:443", "acme/backend"))
-	rp, ok := cfg.RepoPolicyFor("github.com/acme/backend")
+	rp, ok = cfg.RepoPolicyFor("github.com/acme/backend")
 	if !ok || rp.RequireDigestPins == nil || !*rp.RequireDigestPins {
 		t.Fatalf("equal equivalent keys must resolve: %+v ok=%v", rp, ok)
 	}

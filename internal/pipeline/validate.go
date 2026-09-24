@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/expr"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secrets"
 )
 
@@ -406,6 +407,9 @@ func validateJob(s *Spec, id string, j Job) error {
 			return err
 		}
 	}
+	if err := validateCondition(j.If, fmt.Sprintf("job %q if", id)); err != nil {
+		return err
+	}
 	for key, v := range j.With {
 		if err := checkInterpolation(v, fmt.Sprintf("job %q with.%s", id, key)); err != nil {
 			return err
@@ -493,6 +497,9 @@ func validateJob(s *Spec, id string, j Job) error {
 			if err := checkInterpolation(p, fmt.Sprintf("job %q artifact %q paths", id, a.Name)); err != nil {
 				return err
 			}
+		}
+		if err := validateCondition(a.If, fmt.Sprintf("job %q artifact %q if", id, a.Name)); err != nil {
+			return err
 		}
 		if r := strings.TrimSpace(a.Retention); r != "" {
 			d, err := ParseRetention(r)
@@ -673,6 +680,24 @@ func validateStep(jobID string, idx int, st *Step, seenIDs map[string]bool) erro
 			return err
 		}
 	}
+	if err := validateCondition(st.If, where+" if"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateCondition checks that an `if` field is parseable by the condition
+// evaluator that actually runs it. Reusing Eval (with an empty context) makes
+// a condition such as `github.ref == ...` fail at admission instead of
+// surfacing later as an opaque job failure. An empty condition is valid and
+// behaves like success().
+func validateCondition(condition, where string) error {
+	if strings.TrimSpace(condition) == "" {
+		return nil
+	}
+	if _, err := Eval(condition, EvalContext{}); err != nil {
+		return fmt.Errorf("%s is not a valid condition: %w", where, err)
+	}
 	return nil
 }
 
@@ -729,7 +754,21 @@ func validateInputs(s *Spec) error {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	return checkInputNames(names)
+	if err := checkInputNames(names); err != nil {
+		return err
+	}
+	for _, name := range names {
+		in := s.Inputs[name]
+		switch in.Type {
+		case "", "string", "boolean", "integer", "enum":
+		default:
+			return fmt.Errorf("input %q has unknown type %q (want string, boolean, integer or enum)", name, in.Type)
+		}
+		if in.Type == "enum" && len(in.Options) == 0 {
+			return fmt.Errorf("input %q is an enum but declares no options", name)
+		}
+	}
+	return nil
 }
 
 // checkInputNames validates each input name against the identifier grammar
@@ -814,19 +853,18 @@ func checkRelPath(where string, paths ...string) error {
 // interpolation contexts. matrix/needs/steps are resolved by the compiler and
 // executor; ref/event/sha by the server concurrency expansion; the remaining
 // contexts are reserved for future or policy-managed use.
+//
+// Hole scanning goes through expr.Holes so it is quote-aware: a "}}" inside a
+// string literal is part of the expression body, not the terminator. A naive
+// first-"}}" split would misread `${{ contains(env.MSG, '}}') }}` as a hole
+// whose body is an unknown context and reject a valid expression.
 func checkInterpolation(s, where string) error {
-	rest := s
-	for {
-		i := strings.Index(rest, "${{")
-		if i < 0 {
-			return nil
-		}
-		expr := rest[i+3:]
-		j := strings.Index(expr, "}}")
-		if j < 0 {
-			return fmt.Errorf("unresolved interpolation in %s: missing closing }}", where)
-		}
-		body := strings.TrimSpace(expr[:j])
+	holes, err := expr.Holes(s)
+	if err != nil {
+		return fmt.Errorf("unresolved interpolation in %s: %w", where, err)
+	}
+	for _, h := range holes {
+		body := strings.TrimSpace(h.Body)
 		if body == "" {
 			return fmt.Errorf("empty interpolation in %s", where)
 		}
@@ -837,8 +875,8 @@ func checkInterpolation(s, where string) error {
 		if !interpContexts[prefix] {
 			return fmt.Errorf("unknown interpolation context %q in %s", prefix, where)
 		}
-		rest = expr[j+2:]
 	}
+	return nil
 }
 
 func contains(list []string, v string) bool {

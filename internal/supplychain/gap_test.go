@@ -500,6 +500,55 @@ func TestVerifySigstoreBundleRekorLogEntryValidation(t *testing.T) {
 	}
 }
 
+// TestFetchRekorEntryHostileBaseURL proves the configured base URL is held
+// to the shared provider-endpoint policy: userinfo, query and fragment must
+// all be rejected before any request is made, even when the origin itself is
+// reachable.
+func TestFetchRekorEntryHostileBaseURL(t *testing.T) {
+	ok := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(ok.Close)
+	swapRekorClient(t, ok.Client())
+
+	hostile := map[string]string{
+		"userinfo": strings.Replace(ok.URL, "https://", "https://user:pw@", 1),
+		"query":    ok.URL + "/?token=abc",
+		"fragment": ok.URL + "/#frag",
+	}
+	for label, base := range hostile {
+		if _, err := fetchRekorEntry(base, "uuid"); err == nil {
+			t.Errorf("%s: fetchRekorEntry(%q) succeeded, want rejection", label, base)
+		}
+	}
+
+	// A bare origin still works.
+	if _, err := fetchRekorEntry(ok.URL, "uuid"); err != nil {
+		t.Fatalf("plain base URL rejected: %v", err)
+	}
+}
+
+// TestStatementSubjectRequiresSHA256Digest proves parse-time parity with
+// provenance.VerifyWith: a signed statement whose subject carries no sha256
+// digest binds nothing and is rejected even when the caller passes no
+// expected digest.
+func TestStatementSubjectRequiresSHA256Digest(t *testing.T) {
+	pub, priv := sigKey(t)
+	noDigest := Statement{
+		Type:          StatementType,
+		Subject:       []Subject{{Name: "repo@ref", Digest: map[string]string{"sha512": strings.Repeat("a", 128)}}},
+		PredicateType: PredicateType,
+	}
+	payload := statementPayload(t, noDigest)
+	if _, err := VerifyAttestation(envelopeBytes(t, payload, priv), pub, VerifyOptions{}); err == nil {
+		t.Fatal("statement whose subject has no sha256 digest must be rejected")
+	}
+	bundle := bundleWith(t, pub, payload, priv, nil)
+	if err := VerifySigstoreBundle(bundle, "", verifyCfgFor(t, pinKeys("kid-1", pub))); err == nil {
+		t.Fatal("bundle whose subject has no sha256 digest must be rejected")
+	}
+}
+
 // TestVerifySigstoreBundleRekorInclusionFailure proves a fetch failure from
 // the Rekor log propagates through bundle verification.
 func TestVerifySigstoreBundleRekorInclusionFailure(t *testing.T) {

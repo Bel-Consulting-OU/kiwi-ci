@@ -58,8 +58,16 @@ Go 1.27.1 or later is required.
    make staticcheck    # staticcheck v0.8.1
    make govulncheck    # govulncheck v1.8.0, needs network
    make coverage       # writes coverage.out and prints the total
-   make coverage-floor # fails under KC_MIN_COVERAGE (default 60)
+   make coverage-floor # unit-only profile; fails under KC_MIN_COVERAGE (default 95)
    ```
+
+   `make coverage-floor` measures the unit-only `coverage.out` profile.
+   CI enforces the floor on the MERGED profile instead: the
+   `integration-coverage` lane runs `make coverage-ci`, which merges the unit
+   and PostgreSQL-integration profiles into `merged-coverage.out` and only
+   then applies the same 95% floor (`scripts/coverage-floor.sh`). Run
+   `make coverage-ci` (with `KIWI_TEST_POSTGRES_URL` set) to reproduce the
+   enforced number locally.
 
    The real-PostgreSQL lane is env-gated: point it at any throwaway
    database (each test creates and drops its own `kiwi_it_<random>`
@@ -70,9 +78,11 @@ Go 1.27.1 or later is required.
    ```
 
    Without `KIWI_TEST_POSTGRES_URL` (and in `-short` mode) the
-   integration tests skip, so `make test-unit` stays hermetic. The CI
-   lane name is `integration-postgres` in
-   `.woodpecker/integration-coverage.yml`.
+   integration tests skip, so `make test-unit` stays hermetic. In CI the
+   workflow is `integration-coverage` (`.woodpecker/integration-coverage.yml`,
+   status context `ci/woodpecker/pr/integration-coverage`); its
+   `integration-postgres` step runs the database tests and its `coverage`
+   step merges and enforces the floor.
 
 5. If you changed Go files, run `go run ./cmd/filemap` and commit the
    regenerated `FILE_MAP.md`.

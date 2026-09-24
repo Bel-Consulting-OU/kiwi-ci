@@ -105,10 +105,61 @@ func opsFlags(name string, args []string) (serverURL, token string, rest []strin
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	srv := fs.String("server", "http://127.0.0.1:8080", "Kiwi server URL")
 	tok := fs.String("token", os.Getenv("KIWI_ADMIN_TOKEN"), "admin bearer token")
-	if err := fs.Parse(args); err != nil {
+	rest, err = parseFlagsAndPositionals(fs, args)
+	if err != nil {
 		return "", "", nil, err
 	}
-	return *srv, *tok, fs.Args(), nil
+	return *srv, *tok, rest, nil
+}
+
+// parseFlagsAndPositionals parses fs over args in any order: Go's flag
+// package stops at the first positional argument, so the documented
+// `COMMAND RUN [--flags]` form (flags after the run ID) would otherwise drop
+// every flag. Positionals and flags are separated first — a value-taking flag
+// consumes the following argument unless it is written as --flag=value, and a
+// bare "--" ends flag parsing — then only the flag tokens are handed to
+// fs.Parse. The positionals are returned in order. Unknown flags still fail
+// in fs.Parse.
+func parseFlagsAndPositionals(fs *flag.FlagSet, args []string) ([]string, error) {
+	var flagArgs, positional []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			positional = append(positional, args[i+1:]...)
+			break
+		}
+		if a == "-" || !strings.HasPrefix(a, "-") {
+			positional = append(positional, a)
+			continue
+		}
+		flagArgs = append(flagArgs, a)
+		if strings.Contains(a, "=") {
+			continue
+		}
+		if flagTakesValue(fs, strings.TrimLeft(a, "-")) && i+1 < len(args) {
+			i++
+			flagArgs = append(flagArgs, args[i])
+		}
+	}
+	if err := fs.Parse(flagArgs); err != nil {
+		return nil, err
+	}
+	// fs.Parse cannot see positionals when flagArgs is non-empty; when it is
+	// empty it returns none either, so the collected list is authoritative.
+	return positional, nil
+}
+
+// flagTakesValue reports whether the named flag requires a following value.
+// Boolean flags (such as --follow) never consume the next argument.
+func flagTakesValue(fs *flag.FlagSet, name string) bool {
+	f := fs.Lookup(name)
+	if f == nil {
+		return false
+	}
+	if bf, ok := f.Value.(interface{ IsBoolFlag() bool }); ok && bf.IsBoolFlag() {
+		return false
+	}
+	return true
 }
 
 func opsRuns(ctx context.Context, args []string) error {
@@ -164,13 +215,14 @@ func opsLogs(ctx context.Context, args []string) error {
 	job := fs.String("job", "", "only print entries for this job key")
 	follow := fs.Bool("follow", false, "follow the SSE log stream after the backlog")
 	interactive := fs.Bool("interactive", false, "open the interactive TUI log viewer (same as kiwi tui)")
-	if err := fs.Parse(args); err != nil {
+	rest, err := parseFlagsAndPositionals(fs, args)
+	if err != nil {
 		return err
 	}
-	if fs.NArg() != 1 {
+	if len(rest) != 1 {
 		return fmt.Errorf("kiwi logs requires a run ID")
 	}
-	runID := fs.Arg(0)
+	runID := rest[0]
 	if *interactive {
 		tuiArgs := []string{"--server", *srv, "--token", *tok, "--job", *job}
 		if *follow {

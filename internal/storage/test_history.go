@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -437,14 +438,33 @@ func (s *PostgresStore) TestReportTotals(ctx context.Context, repoIDs []string, 
 	if len(ids) == 0 {
 		return 0, 0, 0, nil
 	}
-	var reports, tests, failures int
-	err := s.pool.QueryRow(ctx, `SELECT COUNT(*), COALESCE(SUM(tr.tests), 0)::int, COALESCE(SUM(tr.failures), 0)::int
+	// The sums stay BIGINT: casting SUM(...) to int (int4) aborts the whole
+	// query with 22P05/22003 once two reports' counts exceed the int32 range,
+	// losing every total for the repository. SUM(integer) is already bigint,
+	// so scan int64 and narrow once, clamped, at the API boundary.
+	var reports, tests, failures int64
+	err := s.pool.QueryRow(ctx, `SELECT COUNT(*), COALESCE(SUM(tr.tests), 0), COALESCE(SUM(tr.failures), 0)
 		FROM test_results tr JOIN runs r ON r.id = tr.run_id
 		WHERE `+canonicalPolicyRepoIDSQLExprOn("r.payload", "repo")+` = ANY($1::text[])`, ids).Scan(&reports, &tests, &failures)
 	if err != nil {
 		return 0, 0, 0, err
 	}
-	return reports, tests, failures, nil
+	return clampToInt(reports), clampToInt(tests), clampToInt(failures), nil
+}
+
+// clampToInt narrows a non-negative bigint aggregate to the int API type
+// without ever wrapping: a value beyond the platform int range pins at MaxInt
+// instead of going negative. The sums here cannot realistically reach that
+// bound with the shared per-report limits, but a direct SQL write can, and a
+// saturated total is strictly better than a wrapped one.
+func clampToInt(v int64) int {
+	if v > int64(math.MaxInt) {
+		return math.MaxInt
+	}
+	if v < 0 {
+		return 0
+	}
+	return int(v)
 }
 
 // FlakyTestNames returns the sorted, deduplicated class-qualified test names
@@ -492,11 +512,15 @@ const testHistoryRebuildPage = 500
 
 // RebuildRepoTestHistory is the explicit bounded repair operation: it
 // recomputes ONE repository's aggregates from its durable reports in one
-// transaction (delete + re-insert + version bump) using the exact
-// created_at/id ordering the legacy full rebuild used, so an incremental
-// history and a rebuilt history are byte-identical. It is never called per
-// upload; the server uses it as lazy repair when a repository predates the
-// aggregates migration.
+// transaction (delete + re-insert + version bump) using the canonical
+// created_at/id ordering. The incremental upload path applies the SAME
+// ordering (foldOrRebuildTestReportTx rebuilds instead of folding
+// incrementally whenever the new report is not the canonical newest), so a
+// repository's live aggregates and a repaired/restarted rebuild agree. They
+// are equivalent, not guaranteed byte-identical: the JSON encoding is
+// deterministic but the two paths persist at different times. It is never
+// called per upload; the server uses it as lazy repair when a repository
+// predates the aggregates migration.
 func (s *PostgresStore) RebuildRepoTestHistory(ctx context.Context, repoID string) (int64, error) {
 	repoID = strings.TrimSpace(repoID)
 	if repoID == "" {
@@ -585,8 +609,9 @@ func rebuildRepoTestHistoryTx(ctx context.Context, tx pgx.Tx, repoID string) err
 			for _, c := range p.rep.Cases {
 				// Skip policy: skipped cases are excluded from the fold here
 				// exactly as they are on the incremental path, so a rebuilt
-				// history is byte-identical to one built by uploads and a
-				// skip can never surface as a failure or as flakiness.
+				// history is equivalent to one built by uploads (same fold
+				// order and same observations) and a skip can never surface
+				// as a failure or as flakiness.
 				if c.Skipped {
 					continue
 				}

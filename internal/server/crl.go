@@ -17,6 +17,44 @@ const crlFile = "runner-crl.json"
 // decision before re-consulting the durable cert_revocations row.
 const crlCacheTTL = 30 * time.Second
 
+// crlCacheMax bounds the DB-mode revocation decision cache. Without it the
+// cache grew with every distinct certificate serial ever consulted. When the
+// cap is crossed, expired entries are dropped first and then the least
+// recently consulted serials, so the cache stays bounded.
+const crlCacheMax = 10000
+
+// putCRLCacheLocked records one decision and prunes the cache back to
+// crlCacheMax (expired entries first, then oldest). The caller holds s.crlMu.
+func (s *Server) putCRLCacheLocked(serial string, e crlCacheEntry) {
+	if s.crlCache == nil {
+		s.crlCache = map[string]crlCacheEntry{}
+	}
+	s.crlCache[serial] = e
+	if len(s.crlCache) <= crlCacheMax {
+		return
+	}
+	now := time.Now()
+	for k, v := range s.crlCache {
+		if now.Sub(v.at) >= crlCacheTTL {
+			delete(s.crlCache, k)
+		}
+	}
+	for len(s.crlCache) > crlCacheMax {
+		var oldest string
+		var oldestAt time.Time
+		first := true
+		for k, v := range s.crlCache {
+			if first || v.at.Before(oldestAt) {
+				oldest, oldestAt, first = k, v.at, false
+			}
+		}
+		if first {
+			break
+		}
+		delete(s.crlCache, oldest)
+	}
+}
+
 // crlLookupTimeout bounds one durable cert_revocations lookup (the
 // uncached cache-fill on the runner authentication path) so a stalled
 // revocation store cannot pin an HTTP request after the client is gone.
@@ -115,10 +153,7 @@ func (s *Server) mirrorRunnerCertRevoked(ri model.Runner) {
 	s.mu.Unlock()
 	now := time.Now()
 	s.crlMu.Lock()
-	if s.crlCache == nil {
-		s.crlCache = map[string]crlCacheEntry{}
-	}
-	s.crlCache[ri.CertSerial] = crlCacheEntry{revoked: true, at: now}
+	s.putCRLCacheLocked(ri.CertSerial, crlCacheEntry{revoked: true, at: now})
 	s.crlMu.Unlock()
 	if persistErr != nil {
 		s.logError("crl: persist failed", "error", persistErr.Error())
@@ -172,10 +207,7 @@ func (s *Server) certSerialRevoked(ctx context.Context, serial string) (bool, er
 				return true, err
 			}
 			s.crlMu.Lock()
-			if s.crlCache == nil {
-				s.crlCache = map[string]crlCacheEntry{}
-			}
-			s.crlCache[serial] = crlCacheEntry{revoked: revoked, at: now}
+			s.putCRLCacheLocked(serial, crlCacheEntry{revoked: revoked, at: now})
 			s.crlMu.Unlock()
 			return revoked, nil
 		}

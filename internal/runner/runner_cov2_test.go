@@ -468,18 +468,48 @@ func TestRegisterDisabledClearsCert(t *testing.T) {
 }
 
 func TestHeartbeatLoopTransientErrorKeepsGoing(t *testing.T) {
+	// Each heartbeat answers 500 (a transient control-plane error). The loop
+	// must survive the error and keep ticking; the test synchronizes on the
+	// server observing a second attempt instead of sleeping.
+	attempts := make(chan struct{}, 8)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/heartbeat") {
+			select {
+			case attempts <- struct{}{}:
+			default:
+			}
+		}
 		http.Error(w, "boom", http.StatusInternalServerError)
 	}))
 	defer ts.Close()
 	r := &Runner{ID: "r", Cfg: Config{Server: ts.URL, Heartbeat: 10 * time.Millisecond}, Client: ts.Client(), Metrics: NewMetrics()}
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan struct{})
-	go r.heartbeatLoop(ctx, cancel, basicTask("version: 1\njobs: {}\n"), done)
-	time.Sleep(60 * time.Millisecond)
-	close(done)
+	stop := make(chan struct{})
+	loopDone := make(chan struct{})
+	go func() {
+		defer close(loopDone)
+		r.heartbeatLoop(ctx, cancel, basicTask("version: 1\njobs: {}\n"), stop)
+	}()
+	for i := 1; i <= 2; i++ {
+		select {
+		case <-attempts:
+		case <-time.After(5 * time.Second):
+			cancel()
+			t.Fatalf("heartbeat attempt %d never happened: the loop stopped after a transient error", i)
+		}
+	}
+	select {
+	case <-loopDone:
+		cancel()
+		t.Fatal("heartbeatLoop exited after a transient error instead of retrying")
+	default:
+	}
 	cancel()
+	select {
+	case <-loopDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("heartbeatLoop did not stop after cancellation")
+	}
 }
 
 func canonicalRunnerDir(t *testing.T) string {

@@ -1,15 +1,19 @@
 # Kiwi CI server configuration
 #
 # Precedence: CLI flags > KIWI_* environment variables > this file > defaults.
-# Every key shown here is optional; defaults are documented per key.
+# Every key is optional; defaults are documented per key. Keys left commented
+# below are examples. At least one key is active in every section so that
+# `kiwi config check --config kiwi.example.toml` (and `make docs-check`)
+# actually exercises the strict parser against this file instead of validating
+# a config with no keys at all.
 
 [server]
 # Public base URL advertised to runners, for OIDC issuer and forge statuses.
 # Required and https:// in production mode.
-# external_url = "https://ci.example.com"
+external_url = "https://ci.example.com"
 
 # HTTP listen address. Default ":8080".
-# listen = ":8080"
+listen = ":8080"
 
 # TLS certificate and private key. Both must be set to enable HTTPS.
 # tls_cert = "/etc/kiwi/server.crt"
@@ -20,10 +24,10 @@
 
 [database]
 # PostgreSQL connection URL; enables the durable SQL control plane.
-# url = "postgres://kiwi:secret@db:5432/kiwi"
+url = "postgres://kiwi:secret@db:5432/kiwi"
 
 # Maximum connections in the pgx pool. Default: driver default.
-# max_connections = 25
+max_connections = 25
 
 [runner_pki]
 # Runner certificate enrollment and mTLS identity binding.
@@ -32,12 +36,12 @@
 # ca_key  = "/etc/kiwi/runner-ca.key"
 
 # Token authorizing POST /api/v1/runners/enroll.
-# enroll_token = "change-me"
+enroll_token = "change-me"
 
 [blob]
 # Artifact blob storage backend: "fs" (local data dir, default) or "s3".
-# backend = "fs"
-# path = "/var/lib/kiwi/blobs"
+backend = "fs"
+path = "/var/lib/kiwi/blobs"
 
 # S3 settings, required when backend = "s3".
 # s3_endpoint  = "https://s3.example.com"
@@ -64,35 +68,49 @@
 # bodies spool here, never into an unbounded system temp directory, and
 # concurrent uploads are charged against max_bytes before a byte is written.
 #
-# Both keys are all-or-nothing, and PRODUCTION MODE REFUSES TO START without
-# them: without a bound, concurrent valid multi-GB uploads could exhaust the
-# control-plane root filesystem. Pick a directory on a volume sized for at
-# least a few concurrent maximum-size uploads, and a max_bytes budget that
-# bounds the total in-flight staged bytes. In dev mode an unset section falls
-# back to a bounded default under the server data dir.
-# dir = "/var/lib/kiwi/staging"
-# max_bytes = 34359738368
+# dir/max_bytes are all-or-nothing, and PRODUCTION MODE REFUSES TO START
+# WITHOUT BOTH: without a bound, concurrent valid multi-GB uploads could
+# exhaust the control-plane root filesystem. Pick a directory on a volume
+# sized for at least a few concurrent maximum-size uploads, and a max_bytes
+# budget that bounds the total in-flight staged bytes. In dev mode an unset
+# section falls back to a bounded default under the server data dir.
+dir = "/var/lib/kiwi/staging"
+max_bytes = 34359738368
+
+# Per-replica identity under dir (the ROOT, not the directory bytes land in):
+# each process stages inside <dir>/<instance_id> and bounds only its own
+# staged bytes. Optional; when unset the process generates one and persists it
+# in dir. Replicas that share one dir MUST set distinct instance ids, and a
+# second replica without its own id is refused at startup.
+instance_id = "kiwi-1"
 
 [github]
-# GitHub App ID and private key for the API client.
-# app_id = 0
-# private_key_path = "/etc/kiwi/github.pem"
+# GitHub App ID and private key for the API client. The pair is validated:
+# app_id and private_key_path must be set together.
+app_id = 12345
+private_key_path = "/etc/kiwi/github.pem"
 
 # Webhook HMAC secret and API token.
-# webhook_secret = ""
-# token = ""
+webhook_secret = "change-me"
+token = "change-me"
 
 [gitlab]
-# webhook_secret = ""
-# token = ""
+# GitLab instance root. Default https://gitlab.com; production requires
+# https:// (plaintext http is allowed only for a loopback dev instance).
+base_url = "https://gitlab.example.com"
+webhook_secret = "change-me"
+token = "change-me"
 
 [forgejo]
-# webhook_secret = ""
-# token = ""
+# Forgejo/Gitea instance root. Default https://codeberg.org; production
+# requires https:// (plaintext http is only for a loopback dev instance).
+base_url = "https://codeberg.org"
+webhook_secret = "change-me"
+token = "change-me"
 
 [policy]
 # Repository/organization policy document (strict YAML, fail-closed).
-# file = "/etc/kiwi/policy.yaml"
+file = "/etc/kiwi/policy.yaml"
 
 # Optional OPA/Rego deny rules (fail-closed, in-process).
 # opa_file = "/etc/kiwi/policy.rego"
@@ -109,19 +127,19 @@
 [observability]
 # OpenTelemetry collector endpoint (OTLP/HTTP): request spans and
 # forge/enqueue/lease/completion traces are exported when set.
-# otel_endpoint = ""
+otel_endpoint = "https://otel.example.com:4318/v1/traces"
 
 # Serve /metrics on a separate listen address when set.
-# metrics_listen = ":9090"
+metrics_listen = ":9090"
 
 [rate_limit]
 # Per-request rate limits, applied per principal / runner / client IP.
 # 0 (the default) disables limiting.
-# per_second = 0
+per_second = 0
 
 # Burst: instantaneous token budget before the per_second rate applies.
 # Default 100.
-# burst = 100
+burst = 100
 
 # Per-class overrides (tokens/second); each falls back to per_second.
 # next_per_second             = 0
@@ -139,7 +157,7 @@
 
 [auth]
 # Admin bearer token (admin-tier API routes).
-# admin_token = ""
+admin_token = "change-me"
 
 # Runner bearer token shared by all runners. This is a SHARED credential
 # without per-runner identity, so production refuses to rely on it: in
@@ -158,33 +176,71 @@
 # runner_tokens_file = "/etc/kiwi/runner-tokens.json"
 
 [quota]
-# Repository/team admission and cost budgets.
-# repo_concurrency = 0
-# team_concurrency = 0
-# repo_queue_depth = 0
-# team_queue_depth = 0
-# daily_cost_limit = 0
-# daily_energy_limit = 0
-# fail_open = false
+# Repository/team admission and cost budgets. 0 means unlimited.
+repo_concurrency = 0
+team_concurrency = 0
+repo_queue_depth = 0
+team_queue_depth = 0
+daily_cost_limit = 0
+daily_energy_limit = 0
+fail_open = false
 
 # Server-side resource ceilings applied to UNTRUSTED jobs at admission: an
 # explicit request above a ceiling is rejected (400,
 # untrusted_resource_ceiling_exceeded) before the run is signed or persisted,
 # an unset dimension is filled with the ceiling, and trusted jobs are
 # unconstrained. Memory and disk are plain byte counts; 0 disables that
-# dimension. Defaults: 2 CPU, 4 GiB, 10 GiB, 256 PIDs.
-# untrusted_cpu_ceiling = 2                # cores
-# untrusted_memory_ceiling = 4294967296    # 4 GiB
-# untrusted_disk_ceiling = 10737418240     # 10 GiB
-# untrusted_pids_ceiling = 256
+# dimension. Defaults: 2 CPU, 4 GiB, 10 GiB, 256 PIDs. Overridable with the
+# --untrusted-*-ceiling flags and the KIWI_QUOTA_UNTRUSTED_* environment
+# variables.
+untrusted_cpu_ceiling = 2                # cores
+untrusted_memory_ceiling = 4294967296    # 4 GiB
+untrusted_disk_ceiling = 10737418240     # 10 GiB
+untrusted_pids_ceiling = 256
 
 [secret_broker]
-# backend = "static"   # vault | aws | gcp | azure | onepassword | static
-# vault_addr = ""
+# Secret backend: "vault", "aws", "gcp", "azure", "onepassword" or "static"
+# (empty disables secret resolution). Only the fields of the selected broker
+# are required; a missing required field fails startup.
+broker = "static"
+
+# Vault: requires vault_addr; vault_token is optional.
+# vault_addr = "https://vault.example.com:8200"
 # vault_token = ""
-# static = ["DEPLOY_KEY=value"]
+
+# AWS Secrets Manager: requires aws_region; the access key, secret key and
+# session token are optional (the default credential chain is used when
+# unset).
+# aws_region = "eu-central-1"
+# aws_access_key = ""
+# aws_secret_key = ""
+# aws_token = ""
+
+# GCP Secret Manager: requires gcp_project and gcp_credentials (the path to a
+# service-account JSON credentials file).
+# gcp_project = "my-project"
+# gcp_credentials = "/etc/kiwi/gcp-credentials.json"
+
+# Azure Key Vault: requires azure_tenant, azure_client_id,
+# azure_client_secret and azure_vault_url.
+# azure_tenant = "tenant-id"
+# azure_client_id = "client-id"
+# azure_client_secret = ""
+# azure_vault_url = "https://my-vault.vault.azure.net"
+
+# 1Password Connect: requires onepassword_host, onepassword_token and
+# onepassword_vault.
+# onepassword_host = "https://connect.example.com"
+# onepassword_token = ""
+# onepassword_vault = "ci"
+
+# Static broker: comma-separated k=v entries served in-process.
+static = "DEPLOY_KEY=value"
 
 [components]
-# registry_dir = "/etc/kiwi/components"
-# remote = ""
+# Server-side component resolution: a local directory registry and/or a remote
+# registry HTTP API (remote_url requires https:// and remote_token is its
+# bearer credential).
+registry_dir = "/etc/kiwi/components"
+# remote_url = "https://components.example.com"
 # remote_token = ""

@@ -377,7 +377,9 @@ func startContainerServices(ctx context.Context, runID, jobID string, services [
 		for k, v := range svc.Env {
 			args = append(args, "-e", k+"="+v)
 		}
-		args = append(args, svc.Image)
+		// "--" terminates docker's flag parsing before the image reference,
+		// so a flag-shaped reference can never be injected as an option.
+		args = append(args, "--", svc.Image)
 		if out, err := exec.CommandContext(ctx, docker, args...).CombinedOutput(); err != nil {
 			cleanupAll()
 			return "", func() {}, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("start service %q: %v: %s", display, err, strings.TrimSpace(string(out)))}

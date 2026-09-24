@@ -270,13 +270,17 @@ func TestSaveSetupErrors(t *testing.T) {
 		t.Fatal("impossible cache quota must fail the free-space check")
 	}
 
-	// Temp-file path occupied by a directory.
-	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, gapCacheKey+".tmp"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := (&Store{Root: root}).Save(gapCacheKey, ws, []string{"f"}); err == nil {
-		t.Fatal("temp path occupied by a directory must fail")
+	// Unique temp-file creation fails: the store root is read-only
+	// (permission injection does not apply to root).
+	if os.Geteuid() != 0 {
+		rootRO := t.TempDir()
+		if err := os.Chmod(rootRO, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(rootRO, 0o755) })
+		if err := (&Store{Root: rootRO}).Save(gapCacheKey, ws, []string{"f"}); err == nil {
+			t.Fatal("read-only store root must fail temp creation")
+		}
 	}
 
 	// Destination archive path occupied by a directory.
@@ -390,14 +394,18 @@ func TestFetchRemoteStoreErrors(t *testing.T) {
 		t.Fatal("uncreatable store root must fail")
 	}
 
-	// Temp path occupied by a directory.
-	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, gapCacheKey+".remote.tmp"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	s = &Store{Root: root, RemoteURL: "http://cache.test", Client: &http.Client{Transport: freshTripper()}}
-	if err := s.fetchRemote(gapCacheKey); err == nil {
-		t.Fatal("temp path occupied by a directory must fail")
+	// Unique temp creation fails on a read-only store root (permission
+	// injection does not apply to root).
+	if os.Geteuid() != 0 {
+		rootRO := t.TempDir()
+		if err := os.Chmod(rootRO, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(rootRO, 0o755) })
+		s = &Store{Root: rootRO, RemoteURL: "http://cache.test", Client: &http.Client{Transport: freshTripper()}}
+		if err := s.fetchRemote(gapCacheKey); err == nil {
+			t.Fatal("read-only store root must fail temp creation")
+		}
 	}
 
 	// Body copy failure.

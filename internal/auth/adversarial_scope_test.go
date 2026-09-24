@@ -145,7 +145,6 @@ func TestAuthorizeRepoIdentityExact(t *testing.T) {
 		"github.com/o/r": {Read: true},
 	}}
 	denied := []string{
-		"github.com/O/R",
 		"github.com/o/r ",
 		" github.com/o/r",
 		"github.com/o/r/extra",
@@ -160,6 +159,14 @@ func TestAuthorizeRepoIdentityExact(t *testing.T) {
 	}
 	if !Authorize(p, ActionRead, "github.com/o/r", false) {
 		t.Fatal("exact repo must be authorized")
+	}
+	// Repository PATH case is NOT identity-bearing (F4-A): a mixed-case path
+	// addresses the same repository as its folded spelling, so it must match
+	// the declared lowercase grant instead of bypassing it.
+	for _, repo := range []string{"github.com/O/R", "GitHub.com/O/R"} {
+		if !Authorize(p, ActionRead, repo, false) {
+			t.Fatalf("path-case variant %q must match the declared entry", repo)
+		}
 	}
 	// Canonically equivalent HOST spellings address the same declared grant.
 	for _, repo := range []string{"GitHub.com/o/r", "github.com./o/r", "github.com:443/o/r"} {

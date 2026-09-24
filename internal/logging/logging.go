@@ -24,7 +24,7 @@ func (c *Console) WriteLine(job, step, line string) {
 		return
 	}
 	if c.Masker != nil {
-		line = c.Masker.Mask(line)
+		line = c.Masker.MaskMulti(line)
 	}
 	fmt.Fprintf(c.Writer, "[%s] [%s/%s] %s\n", time.Now().Format("15:04:05"), job, step, line)
 }

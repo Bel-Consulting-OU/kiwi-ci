@@ -16,7 +16,16 @@ ALTER TABLE runners ADD COLUMN IF NOT EXISTS disabled BOOLEAN NOT NULL DEFAULT F
 
 ALTER TABLE runners ADD COLUMN IF NOT EXISTS draining BOOLEAN NOT NULL DEFAULT FALSE;
 
-UPDATE runners SET disabled = COALESCE((payload->>'disabled')::boolean, FALSE), draining = COALESCE((payload->>'draining')::boolean, FALSE);
+-- The backfill reads an untrusted payload: a malformed value must default the
+-- column, never raise and abort the migration transaction (which would leave
+-- the version unrecorded and block every subsequent startup). jsonb_typeof
+-- proves the value is a JSON boolean BEFORE any cast, so (payload->>'x') can
+-- never raise. An absent key, a JSON null, a string ("true"), a number or an
+-- object all fall through to FALSE. This mirrors the guarded-cast pattern in
+-- postgres_resource_reconcile.go.
+UPDATE runners SET
+    disabled = CASE WHEN jsonb_typeof(payload->'disabled') = 'boolean' THEN (payload->>'disabled')::boolean ELSE FALSE END,
+    draining = CASE WHEN jsonb_typeof(payload->'draining') = 'boolean' THEN (payload->>'draining')::boolean ELSE FALSE END;
 
 CREATE INDEX IF NOT EXISTS runners_claim_idx ON runners (disabled, draining);
 

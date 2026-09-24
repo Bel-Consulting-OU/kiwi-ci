@@ -320,25 +320,61 @@ func convertRetry(res *importer.Result, retry *yaml.Node, job string, j *pipelin
 	}
 }
 
-// convertRules maps the subset of GitLab rules Kiwi can express: changes →
-// job paths, when: never → if "false". Rules using predefined variables
-// ($CI_*) are reported, never approximated.
+// convertRules maps the subset of GitLab rules Kiwi can express: an
+// unguarded when: never → if "false"; changes → job paths. Rules using
+// predefined variables ($CI_*) are reported, never approximated.
+//
+// A when: never that carries a guard (a sibling changes/if, or any earlier
+// rule that had a condition) is NOT an unconditional "never": GitLab
+// evaluates rules top-to-bottom and the guard decides whether the never
+// applies. Forcing if "false" there silently disables a job the source would
+// run on the guarded condition, so the rule is reported and no If is set.
 func convertRules(res *importer.Result, rules *yaml.Node, job string, j *pipeline.Job) {
 	if rules == nil || rules.Kind != yaml.SequenceNode {
 		return
 	}
+	sawGuard := false
 	for _, rule := range rules.Content {
-		if ifc := importer.StrScalar(importer.Key(rule, "if")); ifc != "" {
-			res.AddUnsupported("job %q: rule `if: %s` uses GitLab predefined variables Kiwi cannot evaluate; review by hand", job, ifc)
+		if rule.Kind != yaml.MappingNode {
 			continue
 		}
+		if ifc := importer.StrScalar(importer.Key(rule, "if")); ifc != "" {
+			res.AddUnsupported("job %q: rule `if: %s` uses GitLab predefined variables Kiwi cannot evaluate; review by hand", job, ifc)
+			sawGuard = true
+			continue
+		}
+		changes := importer.Key(rule, "changes")
 		if when := importer.StrScalar(importer.Key(rule, "when")); when == "never" {
+			if guard := ruleGuardKeys(rule); len(guard) > 0 || sawGuard {
+				detail := "an earlier rule"
+				if len(guard) > 0 {
+					detail = "its sibling " + strings.Join(guard, "/")
+				}
+				res.AddUnsupported("job %q: `when: never` is guarded by %s; Kiwi cannot express a conditional exclusion, so the job's `if` was left unset", job, detail)
+				res.AddTODO("job %q: decide whether this job should ever run and set `if` explicitly by hand", job)
+				continue
+			}
 			j.If = "false"
 		}
-		if changes := importer.Key(rule, "changes"); changes != nil {
+		if changes != nil {
 			j.Paths = append(j.Paths, importer.SeqScalars(changes)...)
+			sawGuard = true
 		}
 	}
+}
+
+// ruleGuardKeys returns the rule keys other than "when" (sorted). A when:
+// never rule with any other key is a guarded rule, not an unconditional
+// disable.
+func ruleGuardKeys(rule *yaml.Node) []string {
+	var out []string
+	for i := 0; i+1 < len(rule.Content); i += 2 {
+		if rule.Content[i].Value != "when" {
+			out = append(out, rule.Content[i].Value)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func convertCache(res *importer.Result, c *yaml.Node) (pipeline.Cache, bool) {

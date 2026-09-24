@@ -74,9 +74,12 @@ func TestStepReporterWiring(t *testing.T) {
 	m := NewMetrics()
 	var opts executor.Options
 	if !applyStepReporter(&opts, m) {
-		t.Skip("executor.Options.StepReporter not present in this build")
+		t.Fatal("applyStepReporter found no usable StepReporter field: the executor/runner wiring must be present in every build")
 	}
 	f := reflect.ValueOf(&opts).Elem().FieldByName("StepReporter")
+	if !f.IsValid() || f.Kind() != reflect.Func || f.IsNil() {
+		t.Fatal("applyStepReporter reported success but did not install the StepReporter hook")
+	}
 	f.Call([]reflect.Value{
 		reflect.ValueOf("job-1"),
 		reflect.ValueOf("build"),
@@ -90,20 +93,9 @@ func TestStepReporterWiring(t *testing.T) {
 	}
 }
 
-// TestApplyStepReporterRejectsWrongShape guards the reflection seam against
-// a future StepReporter field with an unexpected signature.
-func TestApplyStepReporterRejectsWrongShape(t *testing.T) {
-	m := NewMetrics()
-	var opts executor.Options
-	v := reflect.ValueOf(&opts).Elem()
-	f := v.FieldByName("StepReporter")
-	if !f.IsValid() {
-		t.Skip("executor.Options.StepReporter not present in this build")
-	}
-	_ = m
-	// The field exists: verify the seam only accepts a 3-arg, 0-result func.
-	applyStepReporter(&opts, m)
-	if !f.CanSet() {
-		t.Fatal("seam must set an existing StepReporter field")
-	}
-}
+// TestApplyStepReporterRejectsWrongShape was removed: executor.Options.StepReporter
+// is a compile-time-fixed field of exactly the accepted signature
+// (func(jobID, stepID string, d time.Duration)), so no test input can present
+// the wrong shape to applyStepReporter without editing production types. The
+// reachable contract (the hook is installed and observes real durations) is
+// covered mutation-proof by TestStepReporterWiring above.

@@ -440,6 +440,15 @@ func parseStatement(payload []byte) (*Statement, error) {
 	if len(st.Subject) == 0 {
 		return nil, fmt.Errorf("supplychain: statement has no subject")
 	}
+	// A subject that carries no sha256 digest binds nothing: reject it at
+	// parse time rather than let a caller that omits an expected digest
+	// mistake the statement for a verified artifact binding. This mirrors
+	// provenance.VerifyWith.
+	for _, s := range st.Subject {
+		if s.Digest["sha256"] == "" {
+			return nil, fmt.Errorf("supplychain: subject %q has no sha256 digest", s.Name)
+		}
+	}
 	return &st, nil
 }
 

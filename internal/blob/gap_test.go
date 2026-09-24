@@ -6,9 +6,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -141,6 +144,98 @@ func TestFSPutRenameRaceBranches(t *testing.T) {
 	}
 	for _, e := range entries {
 		t.Fatalf("failed put left %q behind", e.Name())
+	}
+}
+
+// TestFSPutSurfacesPostRenameDirSyncFailure proves a failed shard-directory
+// fsync after the rename is surfaced as a typed published-but-uncertain
+// failure (fsutil.Renamed) instead of being silently acked: a durable
+// manifest must not be built on a rename whose durability is not certified.
+func TestFSPutSurfacesPostRenameDirSyncFailure(t *testing.T) {
+	content := []byte("payload")
+	sum := sha256.Sum256(content)
+	key := hex.EncodeToString(sum[:])
+
+	calls := 0
+	restore := fsutil.SetHooks(fsutil.Hooks{DirSync: func(dir string) error {
+		calls++
+		// The first three dir syncs make the store root/shard durable before
+		// publication; fail only the post-rename sync.
+		if calls >= 4 {
+			return errors.New("dir sync refused")
+		}
+		return fsutil.RealSyncDir(dir)
+	}})
+	defer restore()
+
+	s := NewFS(t.TempDir())
+	_, err := s.Put(context.Background(), key, bytes.NewReader(content), int64(len(content)))
+	if err == nil {
+		t.Fatal("post-rename dir-sync failure must surface")
+	}
+	if !fsutil.Renamed(err) {
+		t.Fatalf("error = %v, want published-but-uncertain (fsutil.Renamed)", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(s.Root, "sha256", key[:2], key)); statErr != nil {
+		t.Fatalf("published object must remain after an uncertain dir sync: %v", statErr)
+	}
+}
+
+// TestFSPutSurfacesShardDirSyncFailure proves a failed shard-creation fsync
+// fails before anything is published and is not reported as uncertain.
+func TestFSPutSurfacesShardDirSyncFailure(t *testing.T) {
+	restore := fsutil.SetHooks(fsutil.Hooks{DirSync: func(string) error {
+		return errors.New("dir sync refused")
+	}})
+	defer restore()
+
+	s := NewFS(t.TempDir())
+	_, err := s.Put(context.Background(), gapKey, bytes.NewReader([]byte("x")), 1)
+	if err == nil {
+		t.Fatal("shard dir-sync failure must surface")
+	}
+	if fsutil.Renamed(err) {
+		t.Fatalf("pre-publication failure reported as uncertain: %v", err)
+	}
+}
+
+// TestFSPutRecreatesObjectDeletedByGC proves the dedup fast path does not
+// acknowledge an object a concurrent GC deleted between the stat and the
+// touch: the put falls back to rewriting the object from the stream.
+func TestFSPutRecreatesObjectDeletedByGC(t *testing.T) {
+	content := []byte("payload")
+	sum := sha256.Sum256(content)
+	key := hex.EncodeToString(sum[:])
+	s := NewFS(t.TempDir())
+	if _, err := s.Put(context.Background(), key, bytes.NewReader(content), int64(len(content))); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(s.Root, "sha256", key[:2], key)
+	// Simulate a GC delete racing the re-put: the first stat (the dedup
+	// probe) is hijacked to succeed on an object that is then removed before
+	// the touch.
+	origStat := fsStat
+	restore := func() { fsStat = origStat }
+	defer restore()
+	first := true
+	fsStat = func(name string) (os.FileInfo, error) {
+		if first {
+			first = false
+			fi, err := os.Stat(name)
+			_ = os.Remove(dst)
+			return fi, err
+		}
+		return origStat(name)
+	}
+	obj, err := s.Put(context.Background(), key, bytes.NewReader(content), int64(len(content)))
+	if err != nil {
+		t.Fatalf("re-put after GC delete: %v", err)
+	}
+	if obj.Size != int64(len(content)) {
+		t.Fatalf("size = %d, want %d", obj.Size, len(content))
+	}
+	if _, err := os.Stat(dst); err != nil {
+		t.Fatalf("object not re-created: %v", err)
 	}
 }
 
@@ -440,44 +535,105 @@ func TestS3PutInputErrors(t *testing.T) {
 	}
 }
 
-// TestS3PutTempDirFailure proves temp-file creation failures surface.
-func TestS3PutTempDirFailure(t *testing.T) {
-	missing := filepath.Join(t.TempDir(), "missing")
-	t.Setenv("TMPDIR", missing)
-	s := s3WithTripper(nil)
-	if _, err := s.Put(context.Background(), gapKey, bytes.NewReader([]byte("x")), 1); err == nil {
-		t.Fatal("unusable TMPDIR must fail")
+// TestS3PutNeverUsesSystemTemp proves Put streams the payload end to end and
+// never spools it into the system temp directory, even when the object is
+// larger than any in-memory bound. TMPDIR points at an empty directory that
+// must stay empty.
+func TestS3PutNeverUsesSystemTemp(t *testing.T) {
+	bodies := map[string][]byte{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		bodies[r.URL.Path] = b
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	s := &S3{Endpoint: srv.URL, Region: "us-east-1", Bucket: "bucket", AccessKeyID: "key", SecretAccessKey: "secret", PathStyle: true}
+
+	payload := bytes.Repeat([]byte("x"), 1<<20)
+	key := fmt.Sprintf("%064x", 0) // arbitrary key: S3 does not verify key==digest
+	obj, err := s.Put(context.Background(), key, bytes.NewReader(payload), int64(len(payload)))
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if obj.Size != int64(len(payload)) {
+		t.Fatalf("size = %d, want %d", obj.Size, len(payload))
+	}
+	if got := bodies["/bucket/"+key]; !bytes.Equal(got, payload) {
+		t.Fatalf("stored body length = %d, want %d", len(got), len(payload))
+	}
+	entries, err := os.ReadDir(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("Put left %d entries in the system temp directory", len(entries))
 	}
 }
 
-// TestS3PutReaderAndSeekErrors proves reader, seek, and re-read failures are
-// surfaced.
-func TestS3PutReaderAndSeekErrors(t *testing.T) {
-	s := s3WithTripper(nil)
+// TestS3PutUnsignedPayload proves the streamed request is signed with
+// UNSIGNED-PAYLOAD (no body pre-hash, no Content-MD5) while still carrying an
+// exact Content-Length.
+func TestS3PutUnsignedPayload(t *testing.T) {
+	type captured struct {
+		sha     string
+		md5     string
+		length  int64
+		payload []byte
+	}
+	got := make(chan captured, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got <- captured{
+			sha:     r.Header.Get("x-amz-content-sha256"),
+			md5:     r.Header.Get("Content-MD5"),
+			length:  r.ContentLength,
+			payload: b,
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	s := &S3{Endpoint: srv.URL, Region: "us-east-1", Bucket: "bucket", AccessKeyID: "key", SecretAccessKey: "secret", PathStyle: true}
+
+	data := []byte("streamed payload")
+	if _, err := s.Put(context.Background(), gapKey, bytes.NewReader(data), int64(len(data))); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	c := <-got
+	if c.sha != s3UnsignedPayload {
+		t.Fatalf("x-amz-content-sha256 = %q, want %q", c.sha, s3UnsignedPayload)
+	}
+	if c.md5 != "" {
+		t.Fatalf("Content-MD5 = %q, want empty (no body pre-hash)", c.md5)
+	}
+	if c.length != int64(len(data)) {
+		t.Fatalf("Content-Length = %d, want %d", c.length, len(data))
+	}
+	if !bytes.Equal(c.payload, data) {
+		t.Fatalf("payload = %q, want %q", c.payload, data)
+	}
+}
+
+// TestS3PutReaderError proves a failing source surfaces when the endpoint
+// reads the streamed body.
+func TestS3PutReaderError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	s := &S3{Endpoint: srv.URL, Region: "us-east-1", Bucket: "bucket", AccessKeyID: "key", SecretAccessKey: "secret", PathStyle: true}
+
 	boom := errors.New("reader broke")
-	if _, err := s.Put(context.Background(), gapKey, failingReader{err: boom}, 1); !errors.Is(err, boom) {
-		t.Fatalf("reader failure = %v, want %v", err, boom)
+	if _, err := s.Put(context.Background(), gapKey, failingReader{err: boom}, 1); err == nil {
+		t.Fatal("reader failure must surface")
 	}
-
-	origSeek := seekTemp
-	seekTemp = func(*os.File, int64, int) (int64, error) { return 0, errors.New("seek refused") }
-	if _, err := s.Put(context.Background(), gapKey, bytes.NewReader([]byte("x")), 1); err == nil {
-		t.Fatal("seek failure must surface")
-	}
-	seekTemp = origSeek
-
-	origOpen := openTempForRead
-	openTempForRead = func(string) (io.ReadCloser, error) { return nil, errors.New("reopen refused") }
-	if _, err := s.Put(context.Background(), gapKey, bytes.NewReader([]byte("x")), 1); err == nil {
-		t.Fatal("reopen failure must surface")
-	}
-	openTempForRead = func(string) (io.ReadCloser, error) {
-		return io.NopCloser(failingReader{err: errors.New("reread refused")}), nil
-	}
-	if _, err := s.Put(context.Background(), gapKey, bytes.NewReader([]byte("x")), 1); err == nil {
-		t.Fatal("re-read failure must surface")
-	}
-	openTempForRead = origOpen
 }
 
 // TestS3PutTransportAndStatusErrors proves transport failures and non-2xx

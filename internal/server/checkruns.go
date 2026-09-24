@@ -9,14 +9,51 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
+
+// maxCheckRunIDs bounds the fs-mode logical-check → check-run ID mirror. A
+// retried publication resolves the mapping to PATCH instead of duplicating a
+// check, so dropping a mapping can at worst cause one duplicate publish for a
+// very old, already-terminal check. The cap keeps the most recently written
+// mappings and evicts oldest-first, so the mirror (and its whole-map rewrite
+// per publish) can never grow without bound.
+const maxCheckRunIDs = 10000
 
 // checkRunIDs is the fs-mode mirror of the logical-check → GitHub check-run
 // ID mapping; DB mode stores it in PostgreSQL (visible to every replica) and
 // the fs mirror is persisted in the data dir with the atomic writer.
 type checkRunIDs struct {
 	m map[string]string
+	// order records keys written this process, oldest first, so eviction can
+	// drop the least-recently added mapping. Keys loaded from disk have no
+	// recorded order and are evicted arbitrarily when the map is full.
+	order []string
+}
+
+// set records one mapping and prunes the mirror back to maxCheckRunIDs. The
+// caller holds s.mu.
+func (c *checkRunIDs) set(key, id string) {
+	if c.m == nil {
+		c.m = map[string]string{}
+	}
+	if _, exists := c.m[key]; !exists {
+		c.order = append(c.order, key)
+	}
+	c.m[key] = id
+	for len(c.m) > maxCheckRunIDs {
+		if len(c.order) > 0 {
+			victim := c.order[0]
+			c.order = c.order[1:]
+			delete(c.m, victim)
+			continue
+		}
+		for k := range c.m {
+			delete(c.m, k)
+			break
+		}
+	}
 }
 
 // checkRunPersistMu serializes mutation + snapshot + write + rollback of the
@@ -53,7 +90,11 @@ func (s *Server) getCheckRunID(ctx context.Context, key string) (string, error) 
 // putCheckRunID persists the mapping. The error is returned so dispatch can
 // refuse to ACK: a lost remote ID would make the next retry POST a duplicate
 // check. In fs mode the mirror file is written through the atomic writer and
-// must succeed before the mapping counts as durable.
+// must succeed before the mapping counts as durable. The failure phase decides
+// the in-memory outcome: a pre-rename failure rolls the staged mapping back,
+// while a post-rename directory-fsync failure (fsutil.Renamed) retains the
+// mapping the visible mirror already carries and arms per-directory degraded
+// readiness until a same-directory persist reconciles.
 func (s *Server) putCheckRunID(ctx context.Context, key, id string) error {
 	if key == "" || id == "" {
 		return fmt.Errorf("check-run mapping requires key and id")
@@ -70,7 +111,7 @@ func (s *Server) putCheckRunID(ctx context.Context, key, id string) error {
 		s.checkRuns = &checkRunIDs{m: map[string]string{}}
 	}
 	prev, hadPrev := s.checkRuns.m[key]
-	s.checkRuns.m[key] = id
+	s.checkRuns.set(key, id)
 	dir := s.dataDir
 	var snapshot map[string]string
 	if dir != "" {
@@ -95,19 +136,42 @@ func (s *Server) putCheckRunID(ctx context.Context, key, id string) error {
 		return fmt.Errorf("check-run mapping encode: %w", err)
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	if err := storage.AtomicWriteFile(filepath.Join(dir, "check-runs.json"), b, 0o600); err != nil {
+		// Pre-rename by construction: nothing was published, so the staged
+		// in-memory mapping must not survive.
 		s.mu.Lock()
-		if hadPrev {
-			s.checkRuns.m[key] = prev
-		} else {
-			delete(s.checkRuns.m, key)
-		}
+		rollbackCheckRunMappingLocked(s, key, prev, hadPrev)
 		s.mu.Unlock()
 		return fmt.Errorf("check-run mapping persist: %w", err)
 	}
+	path := filepath.Join(dir, "check-runs.json")
+	if err := storage.AtomicWriteFile(path, b, 0o600); err != nil {
+		// A pre-rename failure means the mirror was definitely not replaced:
+		// roll the staged mapping back. A post-rename directory-fsync failure
+		// (fsutil.Renamed) means the mirror file ALREADY carries the new
+		// mapping: rolling memory back would let the next retry POST a
+		// duplicate check while the visible file holds the real ID, so the
+		// published mapping is retained and readiness stays degraded until a
+		// same-directory persist reconciles.
+		s.mu.Lock()
+		if !fsutil.Renamed(err) {
+			rollbackCheckRunMappingLocked(s, key, prev, hadPrev)
+		}
+		s.mu.Unlock()
+		s.noteFilePersistResult(path, err)
+		return fmt.Errorf("check-run mapping persist: %w", err)
+	}
+	s.noteFilePersistResult(path, nil)
 	return nil
+}
+
+// rollbackCheckRunMappingLocked restores the staged check-run mapping to its
+// pre-mutation value. The caller holds s.mu.
+func rollbackCheckRunMappingLocked(s *Server, key, prev string, hadPrev bool) {
+	if hadPrev {
+		s.checkRuns.m[key] = prev
+	} else {
+		delete(s.checkRuns.m, key)
+	}
 }
 
 // lockCheckRunKey serializes publication for one logical check (run+name)

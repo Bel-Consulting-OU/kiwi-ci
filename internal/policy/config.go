@@ -33,6 +33,15 @@ type Config struct {
 	// OPARules embeds the Rego policy source inline. Mutually exclusive
 	// with OPAFile.
 	OPARules string `yaml:"opa_rules"`
+
+	// opaFileSet/opaRulesSet record that the opa_file/opa_rules KEY was
+	// present in the loaded document, even when its value is the empty
+	// string. An explicitly configured-but-empty OPA source disables the
+	// gate silently, so it is a configuration error (see Validate) rather
+	// than "no OPA". They are false for programmatically built Configs,
+	// where an empty field means "not configured".
+	opaFileSet  bool
+	opaRulesSet bool
 }
 
 // EnvRule restricts a named deployment environment.
@@ -155,10 +164,31 @@ func Load(path string) (*Config, error) {
 	if err := doc.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("policy: %w", err)
 	}
+	set := topLevelKeysSet(doc, "opa_file", "opa_rules")
+	cfg.opaFileSet, cfg.opaRulesSet = set[0], set[1]
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// topLevelKeysSet reports, for each named key, whether it is present in the
+// top-level mapping of doc. Presence is what distinguishes "opa_file was
+// explicitly set to the empty string" (a configuration error: the gate would
+// be disabled) from "opa_file was not configured" (no OPA).
+func topLevelKeysSet(doc *yaml.Node, keys ...string) (present []bool) {
+	present = make([]bool, len(keys))
+	if doc == nil || doc.Kind != yaml.MappingNode {
+		return present
+	}
+	for i := 0; i+1 < len(doc.Content); i += 2 {
+		for j, want := range keys {
+			if doc.Content[i].Value == want {
+				present[j] = true
+			}
+		}
+	}
+	return present
 }
 
 func (c *Config) Validate() error {
@@ -170,11 +200,44 @@ func (c *Config) Validate() error {
 	if c.OPAFile != "" && c.OPARules != "" {
 		return fmt.Errorf("policy: opa_file and opa_rules are mutually exclusive")
 	}
+	// A configured OPA source that is EMPTY must not silently become "no
+	// OPA" and disable the deny gate: the operator asked for a gate, so an
+	// empty source is a configuration error. This covers an explicitly
+	// present but empty key (opa_file = "" / opa_rules = "") and a file
+	// whose content is empty/whitespace-only.
+	if c.opaFileSet && c.OPAFile == "" {
+		return fmt.Errorf("policy: opa_file is set but empty; an empty OPA source disables the deny gate (remove the key for no OPA)")
+	}
+	if c.opaRulesSet && c.OPARules == "" {
+		return fmt.Errorf("policy: opa_rules is set but empty; an empty OPA source disables the deny gate (remove the key for no OPA)")
+	}
 	if c.OPAFile != "" {
-		if _, err := os.ReadFile(c.OPAFile); err != nil {
+		data, err := os.ReadFile(c.OPAFile)
+		if err != nil {
 			return fmt.Errorf("policy: opa_file: %w", err)
 		}
+		if strings.TrimSpace(string(data)) == "" {
+			return fmt.Errorf("policy: opa_file %q is empty; an empty OPA source disables the deny gate", c.OPAFile)
+		}
 	}
+	if c.OPARules != "" && strings.TrimSpace(c.OPARules) == "" {
+		return fmt.Errorf("policy: opa_rules is whitespace-only; an empty OPA source disables the deny gate")
+	}
+	// canonRepoKey is the canonical identity of one policy key: two keys with
+	// the same value address the SAME repository (identical canonical host
+	// and full name, or identical bare alias full name). Equivalent keys with
+	// DIFFERENT policies are rejected: a Go map cannot hold both, so the
+	// lookup would see a conflict and silently drop BOTH restrictions (fail
+	// open). The token ACL loader fails closed on exactly this shape.
+	type canonRepoKey struct {
+		kind auth.RepoGrantKind
+		host string
+		full string
+	}
+	seen := map[canonRepoKey]struct {
+		key    string
+		policy RepoPolicy
+	}{}
 	for repo, rp := range c.Repositories {
 		if repo == "" {
 			return fmt.Errorf("policy: empty repository name")
@@ -189,8 +252,25 @@ func (c *Config) Validate() error {
 		// "sub/project", or a bare nested group path — so it is rejected
 		// instead of being silently read as host/full-name, which made the
 		// intended policy never apply to the named repository (fail open).
-		if _, err := auth.ParseRepoGrantConfig(repo); err != nil {
+		grant, err := auth.ParseRepoGrantConfig(repo)
+		if err != nil {
 			return fmt.Errorf("policy: repositories key %q: %w", repo, err)
+		}
+		var ck canonRepoKey
+		if id, ok := grant.Identity(); ok {
+			ck = canonRepoKey{kind: auth.RepoGrantIdentity, host: id.Host, full: id.FullName}
+		} else {
+			a, _ := grant.Alias()
+			ck = canonRepoKey{kind: auth.RepoGrantAlias, full: a.FullName}
+		}
+		if prev, ok := seen[ck]; ok && !reflect.DeepEqual(prev.policy, rp) {
+			return fmt.Errorf("policy: repositories keys %q and %q are canonically equivalent but carry different policies; remove one or make them identical (a conflicting pair would silently drop the repository's restrictions)", prev.key, repo)
+		}
+		if _, ok := seen[ck]; !ok {
+			seen[ck] = struct {
+				key    string
+				policy RepoPolicy
+			}{key: repo, policy: rp}
 		}
 		if rp.Network != "" {
 			if _, err := parseNetworkPolicy(rp.Network); err != nil {
@@ -221,6 +301,10 @@ func (c *Config) CompileOPA() (*OPAPolicy, error) {
 	if c.OPAFile != "" && c.OPARules != "" {
 		return nil, fmt.Errorf("policy: opa_file and opa_rules are mutually exclusive")
 	}
+	if !c.opaFileSet && !c.opaRulesSet && c.OPAFile == "" && c.OPARules == "" {
+		// Neither source is configured: OPA is genuinely absent.
+		return nil, nil
+	}
 	src := c.OPARules
 	if c.OPAFile != "" {
 		data, err := os.ReadFile(c.OPAFile)
@@ -229,10 +313,19 @@ func (c *Config) CompileOPA() (*OPAPolicy, error) {
 		}
 		src = string(data)
 	}
-	if src == "" {
-		return nil, nil
+	if strings.TrimSpace(src) == "" {
+		// A configured-but-empty source must never compile to "no gate":
+		// that silently disables the deny gate.
+		return nil, fmt.Errorf("policy: configured OPA source is empty; an empty OPA source disables the deny gate")
 	}
-	return LoadOPAPolicy(src)
+	p, err := LoadOPAPolicy(src)
+	if err != nil {
+		return nil, err
+	}
+	if p == nil {
+		return nil, fmt.Errorf("policy: configured OPA source compiled to no gate")
+	}
+	return p, nil
 }
 
 // RepoPolicyFor returns the repository policy entry for a canonical
@@ -283,17 +376,57 @@ func (c *Config) repoPolicy(repoID string) (RepoPolicy, bool) {
 		// that, an EXPLICIT bare alias key equal to the identity's full
 		// name applies to every forge presenting that name. A key that
 		// itself parses as a canonical identity is NOT a bare alias and
-		// never matches here.
-		if rp, ok := lookupCanonicalPolicy(c.Repositories, id); ok {
+		// never matches here. An AMBIGUOUS lookup (equivalent keys with
+		// different policies) denies the repository outright rather than
+		// falling through to org-only policy.
+		if rp, found, ambiguous := lookupCanonicalPolicy(c.Repositories, id); found {
 			return rp, true
+		} else if ambiguous {
+			return denyRepoPolicy(), true
 		}
-		return lookupAliasPolicy(c.Repositories, id.FullName)
+		if rp, found, ambiguous := lookupAliasPolicy(c.Repositories, id.FullName); found {
+			return rp, true
+		} else if ambiguous {
+			return denyRepoPolicy(), true
+		}
+		return RepoPolicy{}, false
 	}
 	alias, _ := lookup.Alias()
-	if rp, ok := lookupAliasPolicy(c.Repositories, alias.FullName); ok {
+	if rp, found, ambiguous := lookupAliasPolicy(c.Repositories, alias.FullName); found {
 		return rp, true
+	} else if ambiguous {
+		return denyRepoPolicy(), true
 	}
-	return lookupCanonicalByFullNamePolicy(c.Repositories, alias.FullName)
+	if rp, found, ambiguous := lookupCanonicalByFullNamePolicy(c.Repositories, alias.FullName); found {
+		return rp, true
+	} else if ambiguous {
+		return denyRepoPolicy(), true
+	}
+	return RepoPolicy{}, false
+}
+
+// denyRepoPolicy is the fail-closed repository policy returned when an
+// AMBIGUOUS policy lookup is detected (canonically equivalent keys carrying
+// different policies). Every restriction is enabled: all list allowlists are
+// explicitly empty (deny-all, distinct from the nil "unrestricted"), network
+// is none, every boolean grant is false. Callers that intersect it with the
+// organization policy therefore deny instead of silently falling back to
+// org-only, which is the fail-open this closes.
+func denyRepoPolicy() RepoPolicy {
+	no, yes := false, true
+	return RepoPolicy{
+		AllowedCloneHosts:  []string{},
+		AllowedRunnerPools: []string{},
+		AllowedRegions:     []string{},
+		RequireDigestPins:  &yes,
+		RequireRootless:    &yes,
+		Network:            "none",
+		SecretAllowlist:    []string{},
+		OIDCAudiences:      []string{},
+		Deployments:        &no,
+		CrossRepoTrigger:   &no,
+		GenerateChildGraph: &no,
+	}
 }
 
 // parsePolicyKey parses one Config.Repositories key with the STRICT ACL
@@ -311,11 +444,11 @@ func parsePolicyKey(key string) (auth.RepoGrant, bool) {
 
 // lookupCanonicalPolicy resolves the entry whose STRICT config key is the
 // canonical identity id (same host and full name). Equivalent r1: keys
-// carrying DIFFERENT policies resolve to no entry (fail closed) instead of
-// depending on map iteration order.
-func lookupCanonicalPolicy(m map[string]RepoPolicy, id auth.RepoIdentity) (RepoPolicy, bool) {
+// carrying DIFFERENT policies are reported ambiguous (found=false,
+// ambiguous=true) instead of depending on map iteration order, so the caller
+// can deny rather than fall back to org-only policy.
+func lookupCanonicalPolicy(m map[string]RepoPolicy, id auth.RepoIdentity) (rp RepoPolicy, found, ambiguous bool) {
 	var match RepoPolicy
-	found, ambiguous := false, false
 	for key, rp := range m {
 		grant, ok := parsePolicyKey(key)
 		if !ok {
@@ -332,18 +465,18 @@ func lookupCanonicalPolicy(m map[string]RepoPolicy, id auth.RepoIdentity) (RepoP
 		}
 	}
 	if found && !ambiguous {
-		return match, true
+		return match, true, false
 	}
-	return RepoPolicy{}, false
+	return RepoPolicy{}, false, ambiguous
 }
 
 // lookupAliasPolicy resolves the entry whose STRICT config key is an explicit
 // bare alias equal to fullName: the plain "owner/name" spelling or the
 // explicit "a1:<base64url(full_name)>" form (a nested group path). Equivalent
-// alias keys carrying DIFFERENT policies resolve to no entry (fail closed).
-func lookupAliasPolicy(m map[string]RepoPolicy, fullName string) (RepoPolicy, bool) {
+// alias keys carrying DIFFERENT policies are reported ambiguous so the caller
+// can deny rather than fall back to org-only policy.
+func lookupAliasPolicy(m map[string]RepoPolicy, fullName string) (rp RepoPolicy, found, ambiguous bool) {
 	var match RepoPolicy
-	found, ambiguous := false, false
 	for key, rp := range m {
 		grant, ok := parsePolicyKey(key)
 		if !ok {
@@ -360,20 +493,19 @@ func lookupAliasPolicy(m map[string]RepoPolicy, fullName string) (RepoPolicy, bo
 		}
 	}
 	if found && !ambiguous {
-		return match, true
+		return match, true, false
 	}
-	return RepoPolicy{}, false
+	return RepoPolicy{}, false, ambiguous
 }
 
 // lookupCanonicalByFullNamePolicy resolves a BARE lookup key against
 // canonical config keys sharing its owner/name: exactly one DISTINCT canonical
-// entry resolves; several different entries make the lookup ambiguous and
-// resolve to no entry (fail closed) instead of depending on map iteration
-// order. A key that does not parse under the strict configuration schema
-// matches nothing.
-func lookupCanonicalByFullNamePolicy(m map[string]RepoPolicy, fullName string) (RepoPolicy, bool) {
+// entry resolves; several different entries make the lookup ambiguous
+// (found=false, ambiguous=true) so the caller can deny rather than fall back
+// to org-only policy. A key that does not parse under the strict configuration
+// schema matches nothing.
+func lookupCanonicalByFullNamePolicy(m map[string]RepoPolicy, fullName string) (rp RepoPolicy, found, ambiguous bool) {
 	var match RepoPolicy
-	found, ambiguous := false, false
 	seen := map[string]bool{}
 	for key, rp := range m {
 		grant, ok := parsePolicyKey(key)
@@ -396,9 +528,9 @@ func lookupCanonicalByFullNamePolicy(m map[string]RepoPolicy, fullName string) (
 		}
 	}
 	if found && !ambiguous {
-		return match, true
+		return match, true, false
 	}
-	return RepoPolicy{}, false
+	return RepoPolicy{}, false, ambiguous
 }
 
 // GrantsFor returns the boolean capabilities explicitly granted by the

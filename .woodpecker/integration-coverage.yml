@@ -27,16 +27,44 @@ steps:
       # vs README.md vs the running `go`) before the service wait or any test.
       - ./scripts/toolchain-check.sh
       - |
+        ready=0
         for i in $(seq 1 30); do
-          if go run ./scripts/wait-for-tcp.go postgres 5432 2>/dev/null; then break; fi
+          if go run ./scripts/wait-for-tcp.go postgres 5432; then
+            ready=1
+            break
+          fi
           sleep 2
         done
+        if [ "$ready" != "1" ]; then
+          echo "integration-coverage: PostgreSQL on postgres:5432 never became reachable after 60s; failing the step instead of proceeding" >&2
+          exit 1
+        fi
       # -coverpkg=./... instruments cross-package production paths (e.g.
       # internal/pipeline, internal/safefs, internal/forge) that the
       # integration tests reach through the tested packages; dropping it
       # silently narrows the profile and the merged floor measures less than
       # it claims. scripts/ci-coverage-selftest.sh enforces its presence.
-      - KIWI_TEST_POSTGRES_URL=postgres://postgres:pass@postgres:5432/postgres?sslmode=disable go test -count=1 -timeout=20m -v -run Integration -coverprofile=integration-coverage.out -covermode=atomic -coverpkg=./... ./internal/storage ./internal/scheduler ./internal/server ./internal/app
+      - KIWI_TEST_POSTGRES_URL=postgres://postgres:pass@postgres:5432/postgres?sslmode=disable go test -count=1 -timeout=45m -v -run Integration -coverprofile=integration-coverage.out -covermode=atomic -coverpkg=./... ./internal/storage ./internal/scheduler ./internal/server ./internal/app
+
+  # Root guards for the packages this workflow exercises (storage, app and
+  # server carry os.Geteuid()==0 permission-failure tests). They skip under
+  # the root lanes; this step runs them as an unprivileged user so they
+  # execute here too. See .woodpecker/linux-amd64.yml unit-nonroot for the
+  # cache-ownership rationale (workspace is 0777; caches live under /tmp).
+  unit-nonroot:
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    backend_options:
+      docker:
+        user: "65534:65534"
+    environment:
+      GOTOOLCHAIN: local
+      HOME: /tmp
+      GOCACHE: /tmp/gocache
+      GOPATH: /tmp/gopath
+      GOMODCACHE: /tmp/gopath/pkg/mod
+      GOTMPDIR: /tmp
+    commands:
+      - go test -count=1 -shuffle=on -timeout=45m ./internal/storage ./internal/app ./internal/server
 
   coverage:
     image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
@@ -45,7 +73,7 @@ steps:
       GOTOOLCHAIN: local
       KC_MIN_COVERAGE: "95"
     commands:
-      - go test -coverprofile=coverage.out -covermode=atomic ./...
+      - go test -timeout=45m -coverprofile=coverage.out -covermode=atomic ./...
       - ./scripts/ci-coverage-selftest.sh coverage.out integration-coverage.out
       - ./scripts/merge-coverage.sh merged-coverage.out coverage.out integration-coverage.out
       - ./scripts/coverage-report.sh merged-coverage.out

@@ -38,6 +38,33 @@ steps:
       # shuffle rotates test order so order-dependent state leaks surface.
       - go test -vet=all -shuffle=on -timeout=15m ./...
 
+  # Root guards: ~18 tests inject permission failures and skip under the root
+  # lanes above (they have no backend_options user, so the step container runs
+  # as root and os.Geteuid()==0 suppresses the test). This step runs the
+  # guarded packages as an unprivileged user so those branches EXECUTE in CI.
+  # The cloned workspace is 0777 (Woodpecker's root clone step), and /tmp is
+  # world-writable in the golang image, so the Go caches below are created by
+  # the unprivileged user without a pre-chown. The module cache is re-fetched
+  # into the writable GOPATH because /go/pkg/mod is root-owned and read-only
+  # for uid 65534. Guarded packages (each has an os.Geteuid()==0 skip):
+  #   blob, executor, artifact, cas, auth, app, safefs, cache, snapshot,
+  #   server, storage.
+  unit-nonroot:
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    depends_on: [unit]
+    backend_options:
+      docker:
+        user: "65534:65534"
+    environment:
+      GOTOOLCHAIN: local
+      HOME: /tmp
+      GOCACHE: /tmp/gocache
+      GOPATH: /tmp/gopath
+      GOMODCACHE: /tmp/gopath/pkg/mod
+      GOTMPDIR: /tmp
+    commands:
+      - go test -count=1 -shuffle=on -timeout=25m ./internal/blob ./internal/executor ./internal/artifact ./internal/cas ./internal/auth ./internal/app ./internal/safefs ./internal/cache ./internal/snapshot ./internal/server ./internal/storage
+
   race:
     image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
     depends_on: [unit]

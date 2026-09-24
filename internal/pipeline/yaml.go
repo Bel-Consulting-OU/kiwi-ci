@@ -241,6 +241,19 @@ var sequenceSections = map[string]bool{
 	"jobs.*.deployment.canary": true, "jobs.*.deployment.verify": true, "jobs.*.deployment.rollback": true,
 }
 
+// on.* trigger mappings have two mutually exclusive shapes (mirroring the
+// schema's trigger oneOf): a cron form that allows only cron/branches, and an
+// event form that allows the branch/tag/path/action filters but NOT cron.
+// Keying off the presence of "cron" rejects sibling keys that are valid for
+// the other shape (e.g. `actions` next to `cron`).
+var (
+	onEventTriggerFields = map[string]bool{
+		"branches": true, "branches_ignore": true, "tags": true, "tags_ignore": true,
+		"paths": true, "paths_ignore": true, "actions": true, "draft": true,
+	}
+	onCronTriggerFields = map[string]bool{"cron": true, "branches": true}
+)
+
 func validateKnownFields(n *yaml.Node, path string) error {
 	switch n.Kind {
 	case yaml.DocumentNode:
@@ -252,6 +265,18 @@ func validateKnownFields(n *yaml.Node, path string) error {
 		return nil
 	case yaml.MappingNode:
 		if table, ok := knownFieldTables[path]; ok {
+			for i := 0; i+1 < len(n.Content); i += 2 {
+				k := n.Content[i]
+				if !table[k.Value] {
+					return fmt.Errorf("yaml: line %d: unknown field %q", k.Line, k.Value)
+				}
+			}
+		}
+		if path == "on.*" {
+			table := onEventTriggerFields
+			if mappingValue(n, "cron") != nil {
+				table = onCronTriggerFields
+			}
 			for i := 0; i+1 < len(n.Content); i += 2 {
 				k := n.Content[i]
 				if !table[k.Value] {

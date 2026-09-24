@@ -116,7 +116,8 @@
           "enum": [
             "string",
             "boolean",
-            "integer"
+            "integer",
+            "enum"
           ]
         },
         "required": {

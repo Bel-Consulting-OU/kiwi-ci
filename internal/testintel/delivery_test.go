@@ -37,17 +37,30 @@ func TestReportDeliveryIDStableAndContentBound(t *testing.T) {
 }
 
 // TestDeliveryReportIDDeterministic pins the memory-mode deterministic report
-// ID: stable per delivery ID and distinct across deliveries.
+// ID: stable per full delivery identity and distinct across any part change.
 func TestDeliveryReportIDDeterministic(t *testing.T) {
-	id := DeliveryReportID("abc")
+	id := DeliveryReportID("job-1", 5, "abc")
 	if len(id) != 32 {
 		t.Fatalf("deterministic report id = %d chars, want 32", len(id))
 	}
-	if again := DeliveryReportID("abc"); again != id {
+	if again := DeliveryReportID("job-1", 5, "abc"); again != id {
 		t.Fatalf("deterministic report id changed: %s vs %s", id, again)
 	}
-	if other := DeliveryReportID("abd"); other == id {
+	if other := DeliveryReportID("job-1", 5, "abd"); other == id {
 		t.Fatal("different deliveries derived the same report id")
+	}
+	// G1-B: the report ID is scoped by job and generation exactly like the
+	// durable delivery key, so two jobs (or generations) reusing one delivery
+	// ID can never collide on a single memory-mode record.
+	if other := DeliveryReportID("job-2", 5, "abc"); other == id {
+		t.Fatal("two jobs reusing a delivery id collided on one report id")
+	}
+	if other := DeliveryReportID("job-1", 6, "abc"); other == id {
+		t.Fatal("two generations reusing a delivery id collided on one report id")
+	}
+	// NUL-delimited parts cannot be confused for one another.
+	if DeliveryReportID("a\x001", 0, "x") == DeliveryReportID("a", 1, "x") {
+		t.Fatal("delivery report id parts are delimiter-ambiguous")
 	}
 }
 

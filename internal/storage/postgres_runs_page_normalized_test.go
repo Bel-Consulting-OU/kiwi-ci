@@ -96,10 +96,14 @@ func TestNormalizedRunRepoSQLMatchesMigrations(t *testing.T) {
 }
 
 // TestAuthorizedRunsPageSQLUsesNormalizedColumns pins that the shipped
-// authorized page predicate reads the materialized columns by equality and
-// contains NO JSONB identity parsing — the R1-B defect (SUBSTRING / STRPOS /
-// CASE / LOWER / REGEXP_REPLACE inside the page predicate forced a long walk
-// of the created-at index for a sparse tenant).
+// authorized page predicate reads the materialized columns by equality with a
+// NULL-tolerant fallback to the shared IMMUTABLE derivation functions, and
+// contains NO INLINE JSONB identity parsing — the R1-B defect (SUBSTRING /
+// STRPOS / CASE / LOWER / REGEXP_REPLACE inside the page predicate forced a
+// long walk of the created-at index for a sparse tenant). The fallback is a
+// single opaque function call per identity (not an inline JSONB expression),
+// so a row written by a pre-0034 replica during a rolling upgrade is still
+// classified without re-introducing per-row parsing (R3-A).
 func TestAuthorizedRunsPageSQLUsesNormalizedColumns(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -118,14 +122,14 @@ func TestAuthorizedRunsPageSQLUsesNormalizedColumns(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			query, _ := authorizedRunsPageSQL(tc.policy, time.Time{}, "", 25)
 			// runCols legitimately selects the payload column; only the
-			// predicate must be free of JSONB identity parsing.
+			// predicate must be free of INLINE JSONB identity parsing.
 			predicate := query
 			if i := strings.Index(predicate, " FROM runs WHERE "); i >= 0 {
 				predicate = predicate[i+len(" FROM runs WHERE "):]
 			}
-			for _, forbidden := range []string{"payload", "SUBSTRING", "STRPOS", "REGEXP_REPLACE", "LOWER(", "canonicalHostSQL"} {
+			for _, forbidden := range []string{"->", "->>", "#>>", "SUBSTRING", "STRPOS", "REGEXP_REPLACE", "LOWER(", "canonicalHostSQL"} {
 				if strings.Contains(predicate, forbidden) {
-					t.Fatalf("authorized page predicate still parses identity (%q):\n%s", forbidden, predicate)
+					t.Fatalf("authorized page predicate inlines identity parsing (%q):\n%s", forbidden, predicate)
 				}
 			}
 			if tc.policy.IsUnrestricted() {
@@ -137,7 +141,71 @@ func TestAuthorizedRunsPageSQLUsesNormalizedColumns(t *testing.T) {
 			if !strings.Contains(query, normalizedRunRepoIdentityColumn) {
 				t.Fatalf("authorized page query does not read the normalized identity column:\n%s", query)
 			}
+			// The NULL-tolerant fallback is the shared IMMUTABLE function, not
+			// an inline derivation.
+			if !strings.Contains(predicate, normalizedRunRepoIdentityFunctionName) {
+				t.Fatalf("authorized page predicate has no NULL-tolerant identity fallback:\n%s", predicate)
+			}
 		})
+	}
+}
+
+// TestNormalizedRunRepoEffectiveExpressionsAndMigration0036 pins the
+// rolling-upgrade fix: the predicate's effective expressions COALESCE the
+// materialized columns with the shared IMMUTABLE derivation (migration 0036),
+// the re-backfill is the 0034 idempotent backfill, and the two keyset indexes
+// migration 0036 creates are on the EXACT effective expression the predicate
+// compares (audit class: expression indexes that must match query predicates).
+func TestNormalizedRunRepoEffectiveExpressionsAndMigration0036(t *testing.T) {
+	if got, want := normalizedRunRepoIdentityEffectiveSQL(),
+		"COALESCE("+normalizedRunRepoIdentityColumn+", "+normalizedRunRepoIdentityFunctionName+"(payload, 'repo'))"; got != want {
+		t.Fatalf("identity effective expression = %q, want %q", got, want)
+	}
+	if got, want := normalizedRunRepoFullNameEffectiveSQL(),
+		"COALESCE("+normalizedRunRepoFullNameColumn+", "+normalizedRunRepoFullNameFunctionName+"(payload, 'repo'))"; got != want {
+		t.Fatalf("full-name effective expression = %q, want %q", got, want)
+	}
+	// The index definition must name the same expression the predicate uses,
+	// or the planner cannot serve the equality from the index.
+	if idx := normalizedRunRepoIdentityFallbackKeysetIndexDDL(); !strings.Contains(idx, normalizedRunRepoIdentityEffectiveSQL()) {
+		t.Fatalf("0036 identity index does not index the predicate expression:\n%s", idx)
+	}
+	if idx := normalizedRunRepoFullNameFallbackKeysetIndexDDL(); !strings.Contains(idx, normalizedRunRepoFullNameEffectiveSQL()) {
+		t.Fatalf("0036 full-name index does not index the predicate expression:\n%s", idx)
+	}
+
+	all, err := migrations.All()
+	if err != nil {
+		t.Fatalf("migrations.All: %v", err)
+	}
+	byVersion := map[int]migrations.Migration{}
+	for _, m := range all {
+		byVersion[m.Version] = m
+	}
+	m36, ok := byVersion[36]
+	if !ok || m36.Name != "0036_normalized_run_repo_identity_effective_fallback.sql" {
+		t.Fatalf("migration 0036 missing or misnamed: %+v", m36)
+	}
+	if len(m36.Statements) != 5 {
+		t.Fatalf("0036 statements = %d, want re-backfill + (drop+create) x2", len(m36.Statements))
+	}
+	raw, err := migrations.FS.ReadFile(m36.Name)
+	if err != nil {
+		t.Fatalf("read 0036: %v", err)
+	}
+	sql := string(raw)
+	if want := normalizedRunRepoBackfillSQL() + ";"; !strings.Contains(sql, want) {
+		t.Fatalf("0036 re-backfill drifted from normalizedRunRepoBackfillSQL (%s)", want)
+	}
+	for _, want := range []string{
+		normalizedRunRepoIdentityFallbackKeysetIndexDDL() + ";",
+		normalizedRunRepoFullNameFallbackKeysetIndexDDL() + ";",
+		"DROP INDEX IF EXISTS runs_repo_identity_normalized_keyset_idx",
+		"DROP INDEX IF EXISTS runs_repo_full_name_normalized_keyset_idx",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("0036 missing %q", want)
+		}
 	}
 }
 

@@ -26,16 +26,17 @@ func tuiWithIO(ctx context.Context, args []string, out io.Writer, in io.Reader) 
 	job := fs.String("job", "", "only render entries for this job key")
 	follow := fs.Bool("follow", false, "follow the live log stream")
 	search := fs.String("search", "", "filter rendered lines to matches")
-	if err := fs.Parse(args); err != nil {
+	rest, err := parseFlagsAndPositionals(fs, args)
+	if err != nil {
 		return err
 	}
-	if fs.NArg() != 1 {
+	if len(rest) != 1 {
 		return fmt.Errorf("kiwi tui requires a run ID")
 	}
 	return tui.Run(ctx, tui.Config{
 		Server: *serverURL,
 		Token:  *token,
-		RunID:  fs.Arg(0),
+		RunID:  rest[0],
 		JobKey: *job,
 		Follow: *follow,
 		Search: *search,

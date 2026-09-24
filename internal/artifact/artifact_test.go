@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/safefs"
 )
 
 func base64RawURL(s string) string {
@@ -43,7 +45,12 @@ func TestSaveExtractRoundTrip(t *testing.T) {
 		t.Fatalf("unexpected entries: %+v", m.Entries)
 	}
 	dest := t.TempDir()
-	if err := Extract(path, dest); err != nil {
+	destRoot, err := safefs.OpenWorkspaceRoot(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destRoot.Close()
+	if err := Extract(path, destRoot.Root, ""); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(filepath.Join(dest, "dist", "app"))
@@ -69,7 +76,12 @@ func TestExtractRejectsEvilArchive(t *testing.T) {
 	if err := os.WriteFile(f, buf.Bytes(), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := Extract(f, dest); err == nil {
+	destRoot, err := safefs.OpenWorkspaceRoot(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destRoot.Close()
+	if err := Extract(f, destRoot.Root, ""); err == nil {
 		t.Fatal("evil archive must be rejected")
 	}
 }
@@ -104,7 +116,12 @@ func TestSaveSkipsSymlinks(t *testing.T) {
 		}
 	}
 	dest := t.TempDir()
-	if err := Extract(path, dest); err != nil {
+	destRoot, err := safefs.OpenWorkspaceRoot(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destRoot.Close()
+	if err := Extract(path, destRoot.Root, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(filepath.Join(dest, "link")); !os.IsNotExist(err) {

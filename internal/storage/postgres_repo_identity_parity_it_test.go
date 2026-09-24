@@ -340,9 +340,11 @@ func TestPostgresIntegrationRunsPageAuthorizedNormalizedKeysetPlan(t *testing.T)
 	if !strings.Contains(query, normalizedRunRepoIdentityColumn) {
 		t.Fatalf("authorized page query does not use the normalized identity column:\n%s", query)
 	}
-	for _, forbidden := range []string{"payload", "SUBSTRING", "STRPOS", "REGEXP_REPLACE", "LOWER("} {
+	// The NULL-tolerant COALESCE fallback calls the shared IMMUTABLE function;
+	// no INLINE JSONB identity access/parsing may appear in the predicate.
+	for _, forbidden := range []string{"->", "->>", "#>>", "SUBSTRING", "STRPOS", "REGEXP_REPLACE", "LOWER("} {
 		if strings.Contains(predicate, forbidden) {
-			t.Fatalf("authorized page predicate parses identity (%q):\n%s", forbidden, predicate)
+			t.Fatalf("authorized page predicate inlines identity parsing (%q):\n%s", forbidden, predicate)
 		}
 	}
 	plan := authzITExplain(t, st, query, args)

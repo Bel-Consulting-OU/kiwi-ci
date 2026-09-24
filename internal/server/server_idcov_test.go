@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -122,11 +124,29 @@ func (f *idcovFaultStore) UpsertRunner(ctx context.Context, ri model.Runner) err
 	return f.dbFakeStore.UpsertRunner(ctx, ri)
 }
 
+// UpdateRunnerProfileFields carries the same injected write failure into the
+// guarded profile path drain/enable/register now use.
+func (f *idcovFaultStore) UpdateRunnerProfileFields(ctx context.Context, ri model.Runner) error {
+	if f.upsertRunErr != nil {
+		return f.upsertRunErr
+	}
+	return f.dbFakeStore.UpdateRunnerProfileFields(ctx, ri)
+}
+
 func (f *idcovFaultStore) UpdateJob(ctx context.Context, j model.Job) error {
 	if f.updateJobErr != nil {
 		return f.updateJobErr
 	}
 	return f.dbFakeStore.UpdateJob(ctx, j)
+}
+
+// ApproveJob carries the injected write failure into the transactional
+// approval path.
+func (f *idcovFaultStore) ApproveJob(ctx context.Context, jobID, actor string) (model.Job, error) {
+	if f.updateJobErr != nil {
+		return model.Job{}, f.updateJobErr
+	}
+	return f.dbFakeStore.ApproveJob(ctx, jobID, actor)
 }
 
 func (f *idcovFaultStore) ReadAudit(ctx context.Context, limit int) ([]model.AuditEvent, error) {
@@ -218,13 +238,29 @@ func TestIDCovAuthLegacyOpenMode(t *testing.T) {
 	}
 }
 
-// TestIDCovLoggerNilFallbacks covers the standard-logger fallbacks.
+// TestIDCovLoggerNilFallbacks covers the standard-logger fallbacks: with no
+// structured logger configured, each helper must still emit the message
+// through the standard logger instead of dropping it.
 func TestIDCovLoggerNilFallbacks(t *testing.T) {
 	s := New("t")
 	s.Logger = nil
+	var buf bytes.Buffer
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+	})
 	s.logf("idcov %d", 1)
 	s.logInfo("idcov info", "k", "v")
 	s.logError("idcov error", "k", "v")
+	out := buf.String()
+	for _, want := range []string{"idcov 1", "idcov info", "idcov error"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("nil-logger fallback output %q is missing %q", out, want)
+		}
+	}
 }
 
 // TestIDCovRunnerTierMTLSOnlyWithoutBearer covers the mTLS-only runner gate:
