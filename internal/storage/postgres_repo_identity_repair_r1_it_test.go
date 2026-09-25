@@ -148,10 +148,12 @@ func runPageContains(page RunPage, runID string) bool {
 
 // TestPostgresIntegrationRepoIdentityRepairConcurrentWriter is the R1-4
 // regression: a concurrent writer (driven by the deterministic hook, no
-// sleeps) makes the guarded UPDATE match zero rows on both attempts, so the
-// row must be reported as a conflict, never quarantined, and no phantom
-// quarantine row may be written. A separate, uncontended row's quarantine
-// audit must match its actual pre-update payload.
+// sleeps) changes the row between the batch read and the repair's row lock.
+// Under lock-then-classify the repair must act on the LOCKED value (never the
+// stale batch plan): the row is not quarantined from what it used to be, no
+// phantom quarantine row is written, and the outcome reflects the current
+// committed identity. A separate, uncontended row's quarantine audit must
+// match its actual pre-update payload.
 func TestPostgresIntegrationRepoIdentityRepairConcurrentWriter(t *testing.T) {
 	env := pgITSetup(t)
 	st := env.open(t)
@@ -182,40 +184,34 @@ func TestPostgresIntegrationRepoIdentityRepairConcurrentWriter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	if calls != 2 {
-		t.Fatalf("concurrent writer injections = %d, want 2 (initial + re-plan attempt)", calls)
+	if calls != 1 {
+		t.Fatalf("concurrent writer injections = %d, want 1 (before the row lock)", calls)
 	}
-	if res.Conflicts != 1 {
-		t.Fatalf("conflicts = %d, want 1", res.Conflicts)
+	// Both rows are now quarantined, but the concurrent row MUST have been
+	// classified from the LOCKED value (the writer's injection), never from
+	// the stale batch snapshot.
+	if res.Quarantined != 2 {
+		t.Fatalf("quarantined = %d, want 2 (audit row + the concurrent row from its locked value)", res.Quarantined)
 	}
-	if res.Quarantined != 1 {
-		t.Fatalf("quarantined = %d, want 1 (the uncontended audit row only; no phantom for the concurrent row)", res.Quarantined)
-	}
-	wantConflicted := false
+	sawTarget := false
 	for _, e := range res.Entries {
 		if e.ID == target {
-			if e.Action != RepoIdentityConflict {
-				t.Fatalf("concurrent row reported as %v, want conflict", e.Action)
-			}
-			wantConflicted = true
+			sawTarget = true
 		}
 	}
-	if !wantConflicted {
+	if !sawTarget {
 		t.Fatal("concurrent row missing from the operator entries")
 	}
-	// Reality: the concurrent row kept the writer's last value and was NOT
-	// quarantined, and no phantom quarantine row exists.
-	if got, _ := pgITRunIdentity(t, st, target); got != "group/concurrent/b" {
-		t.Fatalf("concurrent row repo_id = %q, want the writer's last value", got)
+	var storedStale string
+	if err := st.pool.QueryRow(ctx, `SELECT stored_repo_id FROM repo_identity_quarantine WHERE kind='run' AND record_id=$1`, target).Scan(&storedStale); err != nil {
+		t.Fatalf("read concurrent row quarantine audit: %v", err)
 	}
-	var phantom int
-	if err := st.pool.QueryRow(ctx, `SELECT count(*) FROM repo_identity_quarantine WHERE kind='run' AND record_id=$1`, target).Scan(&phantom); err != nil {
-		t.Fatalf("read phantom quarantine: %v", err)
+	if storedStale != "group/concurrent/a" {
+		t.Fatalf("quarantine audit stored %q, want the LOCKED value group/concurrent/a (the stale batch value would be group/sub/project)", storedStale)
 	}
-	if phantom != 0 {
-		t.Fatalf("phantom quarantine rows for the concurrent row = %d, want 0", phantom)
-	}
-
+	// The row keeps a quarantined identity derived from the LOCKED value, and
+	// its lifecycle was NOT mutated by the identity UPDATE (cancellation is
+	// the canonical transaction's job).
 	// The uncontended quarantine audit matches the actual pre-update payload.
 	var storedRepo, storedPolicy, storedURL, storedFull string
 	if err := st.pool.QueryRow(ctx,

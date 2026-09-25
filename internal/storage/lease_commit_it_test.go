@@ -57,7 +57,7 @@ func TestIntegrationLeaseCommitPredicatesLive(t *testing.T) {
 		t.Fatalf("cache manifest after live commit = (%v, %v)", found, err)
 	}
 	rec := model.SnapshotRecord{ID: pgITNewID(t), RunID: runID, JobID: jobID, CreatedAt: time.Now().UTC()}
-	if err := st.InsertSnapshotForLease(ctx, jobID, runnerID, gen, rec); err != nil {
+	if err := st.InsertSnapshotForLease(ctx, jobID, runnerID, gen, 0, rec); err != nil {
 		t.Fatalf("InsertSnapshotForLease: %v", err)
 	}
 	if got, err := st.ListSnapshotsByRun(ctx, runID); err != nil || len(got) != 1 {
@@ -108,7 +108,7 @@ func TestIntegrationLeaseCommitPredicatesRevoked(t *testing.T) {
 			if _, found, _ := st.GetCacheManifest(ctx, "github.com/kiwi-it/repo", "trusted", key); found {
 				t.Fatal("cache manifest committed despite a revoked lease")
 			}
-			if err := st.InsertSnapshotForLease(ctx, jobID, runnerID, gen, model.SnapshotRecord{ID: pgITNewID(t), RunID: runID, JobID: jobID, CreatedAt: time.Now().UTC()}); !errors.Is(err, ErrLeaseLost) {
+			if err := st.InsertSnapshotForLease(ctx, jobID, runnerID, gen, 0, model.SnapshotRecord{ID: pgITNewID(t), RunID: runID, JobID: jobID, CreatedAt: time.Now().UTC()}); !errors.Is(err, ErrLeaseLost) {
 				t.Fatalf("InsertSnapshotForLease = %v, want ErrLeaseLost", err)
 			}
 			if got, _ := st.ListSnapshotsByRun(ctx, runID); len(got) != 0 {
@@ -147,7 +147,7 @@ func TestIntegrationLeaseCommitConcurrentCancel(t *testing.T) {
 		done <- st.PutCacheManifestForLease(ctx, jobID, runnerID, gen, leaseCommitITManifest("race-cache"))
 	}()
 	go func() {
-		done <- st.InsertSnapshotForLease(ctx, jobID, runnerID, gen, model.SnapshotRecord{ID: pgITNewID(t), RunID: runID, JobID: jobID, CreatedAt: time.Now().UTC()})
+		done <- st.InsertSnapshotForLease(ctx, jobID, runnerID, gen, 0, model.SnapshotRecord{ID: pgITNewID(t), RunID: runID, JobID: jobID, CreatedAt: time.Now().UTC()})
 	}()
 	go func() {
 		_, _, err := st.InsertArtifactOnceForLease(ctx, jobID, runnerID, gen, model.ArtifactRecord{ID: pgITNewID(t), RunID: runID, JobID: jobID, Name: "dist", LeaseGeneration: gen, CreatedAt: time.Now().UTC()})

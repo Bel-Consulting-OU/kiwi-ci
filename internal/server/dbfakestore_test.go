@@ -3528,3 +3528,67 @@ func (f *dbFakeStore) ConsumeEnrollGrant(ctx context.Context, digest string, con
 	f.grants[digest] = rec
 	return rec, nil
 }
+
+// --- LeaseCommitStore: the transactional commit contract -------------------
+// Production DB stores implement this; the fake must too because DB mode now
+// REFUSES runner-produced commits when the store lacks the capability.
+
+// leaseHeldLocked reports whether the job is running under this runner and
+// generation with an unexpired lease. Callers hold f.mu.
+func (f *dbFakeStore) leaseHeldLocked(jobID, runnerID string, generation int64) bool {
+	j, ok := f.jobs[jobID]
+	if !ok || j.Status != model.StatusRunning {
+		return false
+	}
+	if j.LeaseRunnerID != runnerID || j.LeaseGeneration != generation {
+		return false
+	}
+	return j.LeaseExpiresAt != nil && j.LeaseExpiresAt.After(time.Now().UTC())
+}
+
+// PutCacheManifestForLease commits the cache manifest only while the lease
+// still owns the job, mirroring the SQL predicate.
+func (f *dbFakeStore) PutCacheManifestForLease(ctx context.Context, jobID, runnerID string, generation int64, rec storage.CacheManifestRecord) error {
+	f.mu.Lock()
+	held := f.leaseHeldLocked(jobID, runnerID, generation)
+	f.mu.Unlock()
+	if !held {
+		return fmt.Errorf("%w: cache manifest for job %s", storage.ErrLeaseLost, jobID)
+	}
+	return f.PutCacheManifest(ctx, rec)
+}
+
+// InsertSnapshotForLease commits the snapshot record with the same predicate
+// plus the commit-time per-job cap.
+func (f *dbFakeStore) InsertSnapshotForLease(ctx context.Context, jobID, runnerID string, generation int64, maxPerJob int, rec model.SnapshotRecord) error {
+	f.mu.Lock()
+	held := f.leaseHeldLocked(jobID, runnerID, generation)
+	n := 0
+	if maxPerJob > 0 {
+		for _, existing := range f.snapshots {
+			if existing.RunID == rec.RunID && existing.JobID == rec.JobID {
+				n++
+			}
+		}
+	}
+	f.mu.Unlock()
+	if !held {
+		return fmt.Errorf("%w: snapshot %s for job %s", storage.ErrLeaseLost, rec.ID, jobID)
+	}
+	if maxPerJob > 0 && n >= maxPerJob {
+		return fmt.Errorf("%w: job %s already has %d snapshots (cap %d)", storage.ErrSnapshotCapReached, jobID, n, maxPerJob)
+	}
+	return f.InsertSnapshotRecord(ctx, rec)
+}
+
+// InsertArtifactOnceForLease mirrors the transactional artifact commit: the
+// predicate takes precedence over the idempotency conflict.
+func (f *dbFakeStore) InsertArtifactOnceForLease(ctx context.Context, jobID, runnerID string, generation int64, a model.ArtifactRecord) (model.ArtifactRecord, bool, error) {
+	f.mu.Lock()
+	held := f.leaseHeldLocked(jobID, runnerID, generation)
+	f.mu.Unlock()
+	if !held {
+		return model.ArtifactRecord{}, false, fmt.Errorf("%w: artifact %s for job %s", storage.ErrLeaseLost, a.Name, jobID)
+	}
+	return f.InsertArtifactOnce(ctx, a)
+}

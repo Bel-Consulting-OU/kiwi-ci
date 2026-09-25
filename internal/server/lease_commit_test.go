@@ -68,9 +68,22 @@ func (f *leaseFakeStore) PutCacheManifestForLease(ctx context.Context, jobID, ru
 	return f.dbFakeStore.PutCacheManifest(ctx, rec)
 }
 
-func (f *leaseFakeStore) InsertSnapshotForLease(ctx context.Context, jobID, runnerID string, generation int64, rec model.SnapshotRecord) error {
+func (f *leaseFakeStore) InsertSnapshotForLease(ctx context.Context, jobID, runnerID string, generation int64, maxPerJob int, rec model.SnapshotRecord) error {
 	if !f.leaseOK(jobID, runnerID, generation) {
 		return fmt.Errorf("%w: snapshot", storage.ErrLeaseLost)
+	}
+	if maxPerJob > 0 {
+		f.mu.Lock()
+		n := 0
+		for _, existing := range f.snapshots {
+			if existing.RunID == rec.RunID && existing.JobID == rec.JobID {
+				n++
+			}
+		}
+		f.mu.Unlock()
+		if n >= maxPerJob {
+			return fmt.Errorf("%w: job %s already has %d snapshots", storage.ErrSnapshotCapReached, jobID, n)
+		}
 	}
 	return f.dbFakeStore.InsertSnapshotRecord(ctx, rec)
 }

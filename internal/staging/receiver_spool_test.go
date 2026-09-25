@@ -89,7 +89,7 @@ func TestBudgetSpoolFileConcurrentClose(t *testing.T) {
 					return
 				default:
 				}
-				path, _, err := b.SpoolFile(bytes.NewReader([]byte("payload")), 0)
+				path, _, err := b.SpoolFile(bytes.NewReader([]byte("payload")), 1<<20)
 				if err == nil {
 					_ = os.Remove(path)
 				} else if !errors.Is(err, ErrClosed) {

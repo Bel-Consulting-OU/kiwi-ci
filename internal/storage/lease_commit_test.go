@@ -73,7 +73,7 @@ func TestMemStoreLeaseCommitPredicates(t *testing.T) {
 		t.Fatalf("PutCacheManifestForLease live: %v", err)
 	}
 	snap := model.SnapshotRecord{ID: pgITNewID(t), RunID: pgITNewID(t), JobID: jobID, CreatedAt: time.Now().UTC()}
-	if err := m.InsertSnapshotForLease(ctx, jobID, strings.Repeat("1", 32), 7, snap); err != nil {
+	if err := m.InsertSnapshotForLease(ctx, jobID, strings.Repeat("1", 32), 7, 0, snap); err != nil {
 		t.Fatalf("InsertSnapshotForLease live: %v", err)
 	}
 	art := model.ArtifactRecord{ID: pgITNewID(t), RunID: pgITNewID(t), JobID: jobID, Name: "dist", LeaseGeneration: 7, SHA256: strings64('b'), CreatedAt: time.Now().UTC()}
@@ -119,7 +119,7 @@ func TestMemStoreLeaseCommitPredicates(t *testing.T) {
 			if _, found, _ := mm.GetCacheManifest(ctx, "github.com/acme/widget", "trusted", "k2"); found {
 				t.Fatal("cache manifest was committed despite a lost lease")
 			}
-			if err := mm.InsertSnapshotForLease(ctx, id, tc.runnerID, tc.generation, model.SnapshotRecord{ID: pgITNewID(t), RunID: pgITNewID(t), CreatedAt: time.Now().UTC()}); !errors.Is(err, ErrLeaseLost) {
+			if err := mm.InsertSnapshotForLease(ctx, id, tc.runnerID, tc.generation, 0, model.SnapshotRecord{ID: pgITNewID(t), RunID: pgITNewID(t), CreatedAt: time.Now().UTC()}); !errors.Is(err, ErrLeaseLost) {
 				t.Fatalf("InsertSnapshotForLease = %v, want ErrLeaseLost", err)
 			}
 			if got, _ := mm.ListSnapshotsByRun(ctx, ""); len(got) != 0 {
@@ -171,7 +171,7 @@ func TestFaultyStoreLeaseCommitParity(t *testing.T) {
 		t.Fatalf("FaultyStore fault = %v, want %v", err, boom)
 	}
 	f.FailAfter = 2
-	if err := f.InsertSnapshotForLease(ctx, jobID, strings.Repeat("1", 32), 3, model.SnapshotRecord{ID: pgITNewID(t), RunID: pgITNewID(t), CreatedAt: time.Now().UTC()}); !errors.Is(err, boom) {
+	if err := f.InsertSnapshotForLease(ctx, jobID, strings.Repeat("1", 32), 3, 0, model.SnapshotRecord{ID: pgITNewID(t), RunID: pgITNewID(t), CreatedAt: time.Now().UTC()}); !errors.Is(err, boom) {
 		t.Fatalf("FaultyStore snapshot fault = %v, want %v", err, boom)
 	}
 	f.FailAfter = 3
@@ -192,7 +192,7 @@ func TestLeaseCommitValidationRejectsMalformedKeys(t *testing.T) {
 	if err := m.PutCacheManifestForLease(ctx, pgITNewID(t), "", 1, leaseCommitManifest(t, "k")); err == nil {
 		t.Fatal("empty runner id accepted")
 	}
-	if err := m.InsertSnapshotForLease(ctx, pgITNewID(t), strings.Repeat("1", 32), -1, model.SnapshotRecord{ID: pgITNewID(t), RunID: pgITNewID(t)}); err == nil {
+	if err := m.InsertSnapshotForLease(ctx, pgITNewID(t), strings.Repeat("1", 32), -1, 0, model.SnapshotRecord{ID: pgITNewID(t), RunID: pgITNewID(t)}); err == nil {
 		t.Fatal("negative generation accepted")
 	}
 }

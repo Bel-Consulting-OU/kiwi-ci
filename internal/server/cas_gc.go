@@ -51,17 +51,14 @@ import (
 //     pending-sidecar digests are part of the reference set, so an upload
 //     window can never be collected.
 //
-// Residual race, documented rather than hidden: reference collection and the
-// delete sweep are not atomic. The dangerous interleaving is a long-dead
-// object (older than the floor) being re-put at the same moment a pass
-// decides to delete it: the reference is recorded after the pass read the
-// reference set, and on the FS backend a deduplicated re-put only refreshes
-// the mtime, which the pass may already have observed as old. The window is
-// bounded by one pass (a single enumeration, at most CASGCBatch deletes) and
-// by the hourly Maintain cadence; an object caught in it is restored by the
-// next upload of the same content, since CAS Put is idempotent. Every
-// reference created by a NEW upload names a fresh object and is fully
-// protected by the age floor.
+// Deletion is fenced against publication for each digest: the sweeper takes
+// the digest fence, re-reads the durable references, re-stats the object and
+// re-hashes its CONTENT, and only then unlinks it. A concurrent publish
+// therefore either records its reference before the re-read (the object is
+// skipped as live) or replaces the bytes (the content re-verification fails
+// and the object is skipped, never deleted). An object whose digest cannot be
+// established from content is likewise skipped rather than unlinked, so the
+// sweeper can no longer destroy a live object inside the pass.
 
 // casGCAfterEnumeration is a test seam invoked between reference
 // collection and the delete sweep, so tests can publish a digest in exactly

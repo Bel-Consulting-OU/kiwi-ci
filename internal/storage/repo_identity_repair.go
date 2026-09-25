@@ -192,6 +192,26 @@ type RepoIdentityPlan struct {
 // non-terminal (pending/queued/waiting_approval/running) row is classified as
 // active_requires_drain. The Desired field always carries the terminal action
 // so a --cancel-active pass knows what to apply after cancelling.
+// ClassifyRepoIdentityWithChildren additionally treats a TERMINAL run that
+// still owns non-terminal children as active_requires_drain: the operation can
+// cascade into those children, so the run's own status is not sufficient to
+// decide that a plain rewrite is safe.
+func ClassifyRepoIdentityWithChildren(storedID, repoURL, repoFullName string, status model.Status, hasActiveChildren bool) RepoIdentityPlan {
+	plan := ClassifyRepoIdentity(storedID, repoURL, repoFullName, status)
+	if !hasActiveChildren {
+		return plan
+	}
+	switch plan.Action {
+	case RepoIdentityRewriteTerminal, RepoIdentityQuarantineTerminal:
+		plan.Desired = plan.Action
+		plan.Action = RepoIdentityActiveRequiresDrain
+		if plan.Reason == "" {
+			plan.Reason = "run owns non-terminal child jobs"
+		}
+	}
+	return plan
+}
+
 func ClassifyRepoIdentity(storedID, repoURL, repoFullName string, status model.Status) RepoIdentityPlan {
 	plan := PlanStoredRepoIdentity(storedID, repoURL, repoFullName)
 	if plan.Action == RepoIdentityKeep {
@@ -510,11 +530,13 @@ func newRepoIdentityRepairTables() []repoIdentityRepairTable {
 		table:      "runs",
 		oldURLExpr: "payload->>'repo'",
 		batchSQL: `SELECT id, COALESCE(payload->>'repo_id',''), COALESCE(payload->>'policy_repo_id',''), ` +
-			`COALESCE(payload->>'repo',''), COALESCE(payload->>'repo_full_name',''), COALESCE(status,''), created_at ` +
+			`COALESCE(payload->>'repo',''), COALESCE(payload->>'repo_full_name',''), COALESCE(status,''), created_at, ` +
+			`EXISTS(SELECT 1 FROM jobs j WHERE j.run_id = runs.id AND j.status NOT IN ('success','failure','cancelled','skipped','blocked')) ` +
 			`FROM runs WHERE (created_at, id) > ($1::timestamptz, $2::text) ` +
 			`ORDER BY created_at ASC, id ASC LIMIT $3`,
 		recordSQL: `SELECT id, COALESCE(payload->>'repo_id',''), COALESCE(payload->>'policy_repo_id',''), ` +
-			`COALESCE(payload->>'repo',''), COALESCE(payload->>'repo_full_name',''), COALESCE(status,''), created_at ` +
+			`COALESCE(payload->>'repo',''), COALESCE(payload->>'repo_full_name',''), COALESCE(status,''), created_at, ` +
+			`EXISTS(SELECT 1 FROM jobs j WHERE j.run_id = runs.id AND j.status NOT IN ('success','failure','cancelled','skipped','blocked')) ` +
 			`FROM runs WHERE id=$1`,
 	}
 	job := repoIdentityRepairTable{
@@ -522,11 +544,11 @@ func newRepoIdentityRepairTables() []repoIdentityRepairTable {
 		table:      "jobs",
 		oldURLExpr: "payload->>'repo_url'",
 		batchSQL: `SELECT id, COALESCE(payload->>'repo_id',''), COALESCE(payload->>'policy_repo_id',''), ` +
-			`COALESCE(payload->>'repo_url',''), COALESCE(payload->>'repo_full_name',''), COALESCE(status,''), created_at ` +
+			`COALESCE(payload->>'repo_url',''), COALESCE(payload->>'repo_full_name',''), COALESCE(status,''), created_at, FALSE ` +
 			`FROM jobs WHERE (created_at, id) > ($1::timestamptz, $2::text) ` +
 			`ORDER BY created_at ASC, id ASC LIMIT $3`,
 		recordSQL: `SELECT id, COALESCE(payload->>'repo_id',''), COALESCE(payload->>'policy_repo_id',''), ` +
-			`COALESCE(payload->>'repo_url',''), COALESCE(payload->>'repo_full_name',''), COALESCE(status,''), created_at ` +
+			`COALESCE(payload->>'repo_url',''), COALESCE(payload->>'repo_full_name',''), COALESCE(status,''), created_at, FALSE ` +
 			`FROM jobs WHERE id=$1`,
 	}
 	return []repoIdentityRepairTable{run, job}
@@ -664,7 +686,7 @@ func (s *PostgresStore) runRepoIdentityRepairBatch(ctx context.Context, tx pgx.T
 	for _, r := range records {
 		result.Scanned++
 		if tx == nil {
-			plan := ClassifyRepoIdentity(r.repoID, r.url, r.full, model.Status(r.status))
+			plan := ClassifyRepoIdentityWithChildren(r.repoID, r.url, r.full, model.Status(r.status), r.hasActiveChildren)
 			switch plan.Action {
 			case RepoIdentityKeep:
 				result.Unchanged++
@@ -701,7 +723,29 @@ func (s *PostgresStore) runRepoIdentityRepairBatch(ctx context.Context, tx pgx.T
 func (s *PostgresStore) applyRepoIdentityRecord(ctx context.Context, tx pgx.Tx, table repoIdentityRepairTable, r repoIdentityRepairRow, cancelActive bool, result *RepoIdentityRepairResult) error {
 	lastPlan := RepoIdentityPlan{Action: RepoIdentityKeep}
 	for attempt := 0; attempt < 2; attempt++ {
-		plan := ClassifyRepoIdentity(r.repoID, r.url, r.full, model.Status(r.status))
+		if h := s.repoIdentityRepairHooks; h != nil && h.BeforeApply != nil {
+			if err := h.BeforeApply(table.kind, r.id); err != nil {
+				return err
+			}
+		}
+		// Finding 6: re-read and LOCK the current row before any destructive
+		// action, and classify from those locked values. A concurrent writer
+		// that changed the row after the batch read must never be cancelled
+		// for an identity it no longer carries.
+		locked, found, lerr := readRepoIdentityRepairRecordLocked(ctx, tx, table, r.id)
+		if lerr != nil {
+			return lerr
+		}
+		if !found {
+			result.Conflicts++
+			result.Entries = append(result.Entries, RepoIdentityRepairEntry{
+				Kind: table.kind, ID: r.id, Stored: r.repoID, Repaired: "",
+				Action: RepoIdentityConflict, Reason: "row disappeared before the repair could lock it",
+			})
+			return nil
+		}
+		r = locked
+		plan := ClassifyRepoIdentityWithChildren(r.repoID, r.url, r.full, model.Status(r.status), r.hasActiveChildren)
 		lastPlan = plan
 		if plan.Action == RepoIdentityKeep {
 			result.Unchanged++
@@ -721,11 +765,6 @@ func (s *PostgresStore) applyRepoIdentityRecord(ctx context.Context, tx pgx.Tx, 
 		desired := plan.Action
 		if active {
 			desired = plan.Desired
-		}
-		if h := s.repoIdentityRepairHooks; h != nil && h.BeforeApply != nil {
-			if err := h.BeforeApply(table.kind, r.id); err != nil {
-				return err
-			}
 		}
 		// Drain the active row (or cascade a run quarantine to its
 		// non-terminal children) BEFORE the guarded identity UPDATE, so the
@@ -831,7 +870,7 @@ func readRepoIdentityRepairBatch(ctx context.Context, q repoIdentityRepairQuerye
 	var out []repoIdentityRepairRow
 	for rows.Next() {
 		var r repoIdentityRepairRow
-		if err := rows.Scan(&r.id, &r.repoID, &r.policyID, &r.url, &r.full, &r.status, &r.createdAt); err != nil {
+		if err := rows.Scan(&r.id, &r.repoID, &r.policyID, &r.url, &r.full, &r.status, &r.createdAt, &r.hasActiveChildren); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -871,9 +910,6 @@ func applyGuardedRepoIdentity(ctx context.Context, tx pgx.Tx, table repoIdentity
 	quarantine := desired == RepoIdentityQuarantineTerminal
 	sql := repoIdentityRepairGuardedUpdateSQL(table, quarantine)
 	args := []any{r.id, explicit, repairedPolicy, r.repoID}
-	if quarantine && table.kind == "job" {
-		args = append(args, RepoIdentityQuarantineReason)
-	}
 	var old repoIdentityRepairRow
 	err := tx.QueryRow(ctx, sql, args...).Scan(&old.repoID, &old.policyID, &old.url, &old.full)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -884,6 +920,21 @@ func applyGuardedRepoIdentity(ctx context.Context, tx pgx.Tx, table repoIdentity
 	}
 	old.id = r.id
 	return old, true, nil
+}
+
+// readRepoIdentityRepairRecordLocked reads one row FOR UPDATE inside the
+// caller's transaction so classification and any cancellation act on the
+// committed, locked state rather than a stale batch snapshot.
+func readRepoIdentityRepairRecordLocked(ctx context.Context, tx pgx.Tx, table repoIdentityRepairTable, id string) (repoIdentityRepairRow, bool, error) {
+	var r repoIdentityRepairRow
+	err := tx.QueryRow(ctx, table.recordSQL+" FOR UPDATE", id).Scan(&r.id, &r.repoID, &r.policyID, &r.url, &r.full, &r.status, &r.createdAt, &r.hasActiveChildren)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return repoIdentityRepairRow{}, false, nil
+	}
+	if err != nil {
+		return repoIdentityRepairRow{}, false, err
+	}
+	return r, true, nil
 }
 
 // repoIdentityRepairGuardedUpdateSQL renders the single guarded UPDATE. The
@@ -899,13 +950,9 @@ func repoIdentityRepairGuardedUpdateSQL(table repoIdentityRepairTable, quarantin
 		set += ", repo_identity_normalized = " + normalizedRunRepoIdentitySQL("np.payload") +
 			", repo_full_name_normalized = " + normalizedRunRepoFullNameSQL("np.payload")
 	}
-	if quarantine {
-		set += ", status = CASE WHEN r.status IN ('queued','running') THEN 'cancelled' ELSE r.status END" +
-			", finished_at = CASE WHEN r.status IN ('queued','running') THEN COALESCE(r.finished_at, now()) ELSE r.finished_at END"
-		if table.kind == "job" {
-			set += ", error = CASE WHEN r.status IN ('queued','running') AND COALESCE(r.error,'') = '' THEN $5::text ELSE r.error END"
-		}
-	}
+	// Lifecycle (status, finished_at, error) is written ONLY by the canonical
+	// cancellation transaction (cancelJobTx/cancelRunTx); the identity UPDATE
+	// never mutates it, so a stale identity never cancels work by itself.
 	cur := "SELECT id, payload, " +
 		"COALESCE(payload->>'repo_id','') AS old_repo_id, " +
 		"COALESCE(payload->>'policy_repo_id','') AS old_policy_id, " +
@@ -935,4 +982,9 @@ func insertRepoIdentityQuarantine(ctx context.Context, tx pgx.Tx, kind, recordID
 type repoIdentityRepairRow struct {
 	id, repoID, policyID, url, full, status string
 	createdAt                               time.Time
+	// hasActiveChildren is true when a RUN still owns a non-terminal child
+	// job. A run's lifecycle cannot be judged from its own status alone when
+	// the operation may cascade into jobs, so such a run is classified
+	// active_requires_drain even when its own status is terminal.
+	hasActiveChildren bool
 }

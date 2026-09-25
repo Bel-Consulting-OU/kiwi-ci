@@ -556,8 +556,7 @@ func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j mode
 	for _, e := range m.Entries {
 		rec.Entries = append(rec.Entries, model.SnapshotEntry{Path: e.Path, Mode: e.Mode, Size: e.Size, SHA256: e.SHA256})
 	}
-	ss, ok := s.DB.(storage.SnapshotStore)
-	if !ok {
+	if _, ok := s.DB.(storage.SnapshotStore); !ok {
 		http.Error(w, "snapshot record storage unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -565,7 +564,7 @@ func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j mode
 	// record insert run in ONE transaction, so a lease lost during the
 	// multi-GB staging can never be acknowledged as a snapshot commit.
 	if leaseStore, ok := s.DB.(storage.LeaseCommitStore); ok {
-		if err := leaseStore.InsertSnapshotForLease(ctx, j.ID, runnerID, gen, rec); err != nil {
+		if err := leaseStore.InsertSnapshotForLease(ctx, j.ID, runnerID, gen, snapshotMaxPerJob, rec); err != nil {
 			if leaseLostAtCommit(err) {
 				s.auditLocked("snapshot.lease_lost_at_commit", runnerID, j.RunID, j.ID, "lease lost before snapshot commit", nil)
 				http.Error(w, "lease expired during upload", http.StatusConflict)
@@ -574,12 +573,9 @@ func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j mode
 			http.Error(w, "snapshot record persistence failed", http.StatusServiceUnavailable)
 			return
 		}
-	} else if err := ss.InsertSnapshotRecord(ctx, rec); err != nil {
-		// Fail the upload instead of logging: a snapshot whose record is
-		// not durable must not be acknowledged. The CAS blob is left in
-		// place as an orphan (content-addressed, possibly referenced by
-		// another record); the reference-aware GC reclaims it.
-		http.Error(w, "snapshot record persistence failed", http.StatusServiceUnavailable)
+	} else {
+		s.logError("snapshot commit refused: store lacks transactional lease commits", "job", j.ID)
+		http.Error(w, "store does not support transactional lease commits", http.StatusServiceUnavailable)
 		return
 	}
 	s.auditLocked("snapshot.uploaded", runnerID, j.RunID, j.ID, "workspace snapshot uploaded", map[string]string{"sha256": rec.SHA256})
@@ -851,7 +847,8 @@ func (s *Server) downloadSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 	// Strong integrity: the archive is preverified (exact length + digest)
 	// before the response is committed; the verified file is then streamed.
-	s.serveVerifiedDownload(w, r, "snapshot", f, rec.Size, rec.SHA256, func(w http.ResponseWriter) {
+	reopenFile := func() (io.ReadCloser, error) { return os.Open(rec.Path) }
+	s.serveVerifiedDownload(w, r, "snapshot", f, reopenFile, rec.Size, rec.SHA256, func(w http.ResponseWriter) {
 		w.Header().Set("Content-Type", "application/gzip")
 		w.Header().Set("Content-Length", strconv.FormatInt(rec.Size, 10))
 		w.Header().Set("X-Kiwi-Snapshot-SHA256", rec.SHA256)
@@ -913,7 +910,11 @@ func (s *Server) downloadSnapshotDB(w http.ResponseWriter, r *http.Request) {
 		}
 		// Strong integrity: preverify the CAS object (exact length + digest)
 		// before committing the response; a corrupt backend yields no 200.
-		s.serveVerifiedDownload(w, r, "snapshot", rc, wantSize, wantSHA, func(w http.ResponseWriter) {
+		reopenCAS := func() (io.ReadCloser, error) {
+			again, _, oerr := s.CAS.Open(r.Context(), digest)
+			return again, oerr
+		}
+		s.serveVerifiedDownload(w, r, "snapshot", rc, reopenCAS, wantSize, wantSHA, func(w http.ResponseWriter) {
 			w.Header().Set("Content-Type", "application/gzip")
 			w.Header().Set("Content-Length", strconv.FormatInt(wantSize, 10))
 			w.Header().Set("X-Kiwi-Snapshot-SHA256", digest)
@@ -926,7 +927,8 @@ func (s *Server) downloadSnapshotDB(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "snapshot archive missing", http.StatusNotFound)
 			return
 		}
-		s.serveVerifiedDownload(w, r, "snapshot", f, rec.Size, rec.SHA256, func(w http.ResponseWriter) {
+		reopenFile := func() (io.ReadCloser, error) { return os.Open(rec.Path) }
+		s.serveVerifiedDownload(w, r, "snapshot", f, reopenFile, rec.Size, rec.SHA256, func(w http.ResponseWriter) {
 			w.Header().Set("Content-Type", "application/gzip")
 			w.Header().Set("Content-Length", strconv.FormatInt(rec.Size, 10))
 			w.Header().Set("X-Kiwi-Snapshot-SHA256", rec.SHA256)

@@ -346,7 +346,7 @@ func TestSpoolFileStagesContentAndBounds(t *testing.T) {
 	}
 	defer func() { _ = b.Close() }()
 	payload := []byte("spool-me")
-	path, n, err := b.SpoolFile(bytes.NewReader(payload), 0)
+	path, n, err := b.SpoolFile(bytes.NewReader(payload), int64(len(payload)))
 	if err != nil {
 		t.Fatalf("SpoolFile: %v", err)
 	}
@@ -521,7 +521,7 @@ func TestBudgetPruneSkipsActiveSpoolsAndRemovesAbandoned(t *testing.T) {
 	// below is aged well past the threshold.
 	b.PruneMinAge = time.Nanosecond
 
-	active, n, err := b.SpoolFile(bytes.NewReader([]byte("legitimately slow publication")), 0)
+	active, n, err := b.SpoolFile(bytes.NewReader([]byte("legitimately slow publication")), 64)
 	if err != nil || n == 0 {
 		t.Fatalf("SpoolFile active spool = (%q, %d, %v)", active, n, err)
 	}
@@ -598,7 +598,7 @@ func TestBudgetPruneConcurrentWithInFlightSpool(t *testing.T) {
 	}
 	done := make(chan spoolResult, 1)
 	go func() {
-		path, _, err := b.SpoolFile(reader, 0)
+		path, _, err := b.SpoolFile(reader, 1<<20)
 		done <- spoolResult{path, err}
 	}()
 	select {

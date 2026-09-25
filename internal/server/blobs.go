@@ -520,17 +520,16 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 			created bool
 			ierr    error
 		)
-		if leaseStore, ok := s.DB.(storage.LeaseCommitStore); ok {
-			stored, created, ierr = leaseStore.InsertArtifactOnceForLease(ctx, j.ID, runnerID, gen, rec)
-		} else {
-			idem, ok := s.DB.(storage.ArtifactIdempotentStore)
-			if !ok {
-				_ = os.Remove(dst)
-				http.Error(w, "artifact store does not support idempotent artifact insertion", 500)
-				return
-			}
-			stored, created, ierr = idem.InsertArtifactOnce(ctx, rec)
+		leaseStore, ok := s.DB.(storage.LeaseCommitStore)
+		if !ok {
+			// A DB store without the transactional lease predicate is refused:
+			// runner-produced durable state must never commit best-effort.
+			removeStagedArtifact(dst, casMode)
+			s.logError("artifact commit refused: store lacks transactional lease commits", "job", j.ID)
+			http.Error(w, "store does not support transactional lease commits", http.StatusServiceUnavailable)
+			return
 		}
+		stored, created, ierr = leaseStore.InsertArtifactOnceForLease(ctx, j.ID, runnerID, gen, rec)
 		if leaseLostAtCommit(ierr) {
 			removeStagedArtifact(dst, casMode)
 			s.auditLocked("artifact.lease_lost_at_commit", runnerID, j.RunID, j.ID, "lease lost before artifact commit", map[string]string{"name": name})
@@ -872,7 +871,8 @@ func (s *Server) downloadArtifact(w http.ResponseWriter, r *http.Request) {
 	// file. A corrupt backend can no longer produce a complete-length corrupt
 	// body with a 200; a verification failure serves nothing and a write
 	// failure aborts the connection.
-	s.serveVerifiedDownload(w, r, "artifact", f, rec.Size, rec.SHA256, func(w http.ResponseWriter) {
+	reopenArtifact := func() (io.ReadCloser, error) { return s.openArtifact(r.Context(), rec) }
+	s.serveVerifiedDownload(w, r, "artifact", f, reopenArtifact, rec.Size, rec.SHA256, func(w http.ResponseWriter) {
 		w.Header().Set("Content-Type", rec.ContentType)
 		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.tar.gz"`, cleanBlobName(rec.Name)))
 		w.Header().Set("X-Kiwi-Content-SHA256", rec.SHA256)
@@ -1108,15 +1108,40 @@ func (s *Server) uploadJobCache(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "cache storage verification failed", http.StatusServiceUnavailable)
 		return
 	}
-	// Commit-time lease predicate: in memory/fs mode re-check the in-memory
-	// lease; in DB mode the writeCacheManifest call uses the lease-fenced
-	// store method whose transaction re-evaluates the predicate.
-	if !s.leaseActiveAtCommit(r.Context(), j.ID, runnerID, token, gen) {
-		s.auditLocked("cache.lease_lost_at_commit", runnerID, j.RunID, j.ID, "lease lost before cache manifest commit", map[string]string{"key": key})
-		http.Error(w, "lease expired during upload", http.StatusConflict)
+	// Commit-time lease predicate. DB mode uses the lease-fenced store method
+	// whose transaction re-evaluates the predicate; a DB store without that
+	// capability is refused outright (never a best-effort downgrade). Memory/fs
+	// mode validates the lease and publishes the manifest inside ONE s.mu
+	// critical section — the same lock cancellation takes — so a cancellation
+	// can never interleave between validation and publication.
+	if !s.requireLeaseCommitSupport(w, r) {
 		return
 	}
-	envelope, err := s.writeCacheManifest(r.Context(), fileKey, key, repo, trust, sum, n, j, runnerID, gen)
+	var envelope []byte
+	var merr error
+	if s.DB == nil {
+		s.mu.Lock()
+		cur, found := s.jobs[j.ID]
+		if !found || !s.validActiveLease(cur, runnerID, token, gen, time.Now().UTC()) {
+			s.mu.Unlock()
+			s.auditLocked("cache.lease_lost_at_commit", runnerID, j.RunID, j.ID, "lease lost before cache manifest commit", map[string]string{"key": key})
+			http.Error(w, "lease expired during upload", http.StatusConflict)
+			return
+		}
+		if cacheCommitHook != nil {
+			cacheCommitHook()
+		}
+		envelope, merr = s.writeCacheManifest(r.Context(), fileKey, key, repo, trust, sum, n, j, runnerID, gen)
+		s.mu.Unlock()
+	} else {
+		if !s.leaseActiveAtCommit(r.Context(), j.ID, runnerID, token, gen) {
+			s.auditLocked("cache.lease_lost_at_commit", runnerID, j.RunID, j.ID, "lease lost before cache manifest commit", map[string]string{"key": key})
+			http.Error(w, "lease expired during upload", http.StatusConflict)
+			return
+		}
+		envelope, merr = s.writeCacheManifest(r.Context(), fileKey, key, repo, trust, sum, n, j, runnerID, gen)
+	}
+	err = merr
 	if err != nil {
 		if leaseLostAtCommit(err) {
 			s.auditLocked("cache.lease_lost_at_commit", runnerID, j.RunID, j.ID, "lease lost before cache manifest commit", map[string]string{"key": key})
@@ -1139,6 +1164,12 @@ func (s *Server) uploadJobCache(w http.ResponseWriter, r *http.Request) {
 	s.auditLocked("cache.uploaded", runnerID, j.RunID, j.ID, "cache entry stored", map[string]string{"key": key, "repository": repo, "trust_domain": trust})
 	w.WriteHeader(http.StatusCreated)
 }
+
+// cacheCommitHook, when non-nil, runs inside the memory/fs cache commit
+// critical section immediately after the lease revalidation. Tests use it to
+// race a cancellation against publication deterministically. Production
+// leaves it nil.
+var cacheCommitHook func()
 
 // cacheTooLargeError renders the fixed cache body-cap rejection. It is
 // deliberately free of request-supplied data so the 413 body is stable.

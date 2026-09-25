@@ -925,8 +925,10 @@ func TestFlowBlobUploadArtifactNoIdempotentStore(t *testing.T) {
 	var iface fcNoIdemIface = f
 	s.DB = fcNoIdemStore{iface}
 	w := fcUploadBlobArtifact(t, s, hdrs, "payload")
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("no idempotent store = %d, want 500: %s", w.Code, w.Body.String())
+	// A DB store without the transactional lease-commit capability is refused
+	// (fail closed), never downgraded to a best-effort commit.
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("no lease-commit store = %d, want 503: %s", w.Code, w.Body.String())
 	}
 }
 
@@ -1103,8 +1105,8 @@ func TestFlowBlobUploadJobCacheManifestStoreUnavailable(t *testing.T) {
 	s, f, _, hdrs := cacheFixture(t)
 	s.DB = fcPlainStore{f}
 	w := doJSONHeaders(t, s, http.MethodPut, "/api/v1/jobs/job-a/cache/"+strings.Repeat("a", 64), "runner-tok", "x", hdrs)
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("cache manifest store unavailable = %d, want 500: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("cache manifest store unavailable = %d, want 503: %s", w.Code, w.Body.String())
 	}
 }
 

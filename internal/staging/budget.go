@@ -116,6 +116,12 @@ var ErrStagingDirOwned = errors.New("staging: staging directory is owned by anot
 // so no new bytes may be admitted.
 var ErrClosed = errors.New("staging: budget is closed")
 
+// ErrInvalidLimit reports a negative spool limit. The budget-owned spool is
+// strictly bounded: zero means zero bytes, and there is no "unlimited" mode on
+// this API (an unbounded copy belongs to a separately named helper, never to
+// a Budget).
+var ErrInvalidLimit = errors.New("staging: invalid spool limit")
+
 // Budget is the weighted byte budget over one staging directory. The zero
 // value is not usable; construct with NewBudget (exact directory) or
 // NewReplicaBudget (configured root + replica instance id). A Budget is safe
@@ -734,15 +740,33 @@ func (b *Budget) SpoolFile(r io.Reader, limit int64) (string, int64, error) {
 	return path, n, nil
 }
 
-// spoolCopy copies at most limit bytes of src into dst (unlimited when limit
-// is not positive) and reports ErrTooLarge when the source still has data
-// after those limit bytes. The over-limit byte is read from the SOURCE but
+// spoolCopy copies at most limit bytes of src into dst (limit == 0 permits
+// exactly zero bytes; a negative limit is ErrInvalidLimit, never unlimited)
+// and reports ErrTooLarge when the source still has data after those limit
+// bytes. The over-limit byte is read from the SOURCE but
 // never written, so a caller whose reservation equals limit can hold the
 // exact "staged bytes never exceed the reservation" invariant even when the
 // body lies about its length.
 func spoolCopy(dst io.Writer, src io.Reader, limit int64) (int64, error) {
-	if limit <= 0 {
-		return io.Copy(dst, src)
+	if limit < 0 {
+		return 0, ErrInvalidLimit
+	}
+	if limit == 0 {
+		// Zero means zero bytes: write nothing and prove the source is empty
+		// by probing a single byte. A source that lies about its length gets
+		// no unbounded write and no zero-byte reservation.
+		var probe [1]byte
+		m, perr := src.Read(probe[:])
+		switch {
+		case m > 0:
+			return 0, fmt.Errorf("%w: source has data but the limit is zero", ErrTooLarge)
+		case perr == nil:
+			return 0, fmt.Errorf("%w: source made no progress at the zero limit", ErrTooLarge)
+		case errors.Is(perr, io.EOF):
+			return 0, nil
+		default:
+			return 0, perr
+		}
 	}
 	n, err := io.Copy(dst, io.LimitReader(src, limit))
 	if err != nil {

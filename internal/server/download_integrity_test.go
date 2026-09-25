@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -9,7 +10,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
 )
@@ -195,7 +198,7 @@ func TestDownloadCopyErrorAborts(t *testing.T) {
 				t.Fatalf("recover = %v, want http.ErrAbortHandler", r)
 			}
 		}()
-		s.serveVerifiedDownload(&failingResponseWriter{}, req, "artifact", io.NopCloser(bytes.NewReader(payload)), int64(len(payload)), digest, nil)
+		s.serveVerifiedDownload(&failingResponseWriter{}, req, "artifact", io.NopCloser(bytes.NewReader(payload)), reopenFrom(payload), int64(len(payload)), digest, nil)
 	}()
 	s.Metrics.mu.Lock()
 	got := 0.0
@@ -209,9 +212,10 @@ func TestDownloadCopyErrorAborts(t *testing.T) {
 }
 
 // TestDownloadOversizedObjectFallbackAborts covers the fallback when the
-// object cannot be staged (larger than the whole budget): a valid object
-// streams byte-identically, and a corrupt one aborts the connection rather
-// than being served as a 200.
+// object cannot be staged (larger than the whole budget): the two-pass
+// verification proves the digest first, so a valid object streams
+// byte-identically, and a corrupt one is refused with 503 BEFORE any bytes
+// are committed — a complete-length corrupt body can never be served.
 func TestDownloadOversizedObjectFallbackAborts(t *testing.T) {
 	b, err := staging.NewBudget(t.TempDir(), 8)
 	if err != nil {
@@ -230,21 +234,21 @@ func TestDownloadOversizedObjectFallbackAborts(t *testing.T) {
 
 	// Valid: the fallback streams byte-identically.
 	rec := httptest.NewRecorder()
-	s.serveVerifiedDownload(rec, req, "artifact", io.NopCloser(bytes.NewReader(payload)), int64(len(payload)), digest, nil)
+	s.serveVerifiedDownload(rec, req, "artifact", io.NopCloser(bytes.NewReader(payload)), reopenFrom(payload), int64(len(payload)), digest, nil)
 	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), payload) {
 		t.Fatalf("oversized valid download = %d, %q", rec.Code, rec.Body.String())
 	}
 
-	// Corrupt: the digest mismatch aborts the connection.
+	// Corrupt: the first verification pass fails, so nothing is served (503).
 	corrupt := bytes.Repeat([]byte{'Z'}, len(payload))
-	func() {
-		defer func() {
-			if r := recover(); r != http.ErrAbortHandler {
-				t.Fatalf("recover = %v, want http.ErrAbortHandler", r)
-			}
-		}()
-		s.serveVerifiedDownload(&failingResponseWriter{}, req, "artifact", io.NopCloser(bytes.NewReader(corrupt)), int64(len(payload)), digest, nil)
-	}()
+	rec2 := httptest.NewRecorder()
+	s.serveVerifiedDownload(rec2, req, "artifact", io.NopCloser(bytes.NewReader(corrupt)), reopenFrom(corrupt), int64(len(payload)), digest, nil)
+	if rec2.Code != http.StatusServiceUnavailable {
+		t.Fatalf("oversized corrupt download = %d, want 503 (no bytes served)", rec2.Code)
+	}
+	if bytes.Equal(rec2.Body.Bytes(), corrupt) {
+		t.Fatal("oversized corrupt download served its bytes")
+	}
 }
 
 // TestCacheDownloadCopyErrorAborts pins the cache download contract: it keeps
@@ -268,4 +272,87 @@ func TestCacheDownloadCopyErrorAborts(t *testing.T) {
 		}()
 		s.serveStreamCheckedWithDigest(&failingResponseWriter{}, req, "cache", digest, io.NopCloser(bytes.NewReader(payload)))
 	}()
+}
+
+// reopenFrom returns a reopen function serving the same bytes, so the
+// two-pass verification path can be exercised without a real store.
+func reopenFrom(b []byte) func() (io.ReadCloser, error) {
+	return func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(b)), nil }
+}
+
+// TestVerifiedDownloadKeepsReservationWhileStreaming pins the staging
+// invariant: the byte reservation is charged for as long as the verified
+// spool is on disk, so a second download cannot over-admit the directory.
+func TestVerifiedDownloadKeepsReservationWhileStreaming(t *testing.T) {
+	dir := t.TempDir()
+	budget, err := staging.NewBudget(dir, 150)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New("tok", WithStagingBudget(budget))
+	payload := bytes.Repeat([]byte("x"), 100)
+	digest := sha256Hex(payload)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	prev := downloadAfterPreverifyHook
+	downloadAfterPreverifyHook = func() {
+		close(entered)
+		<-release
+	}
+	t.Cleanup(func() { downloadAfterPreverifyHook = prev })
+
+	src := io.NopCloser(bytes.NewReader(payload))
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.serveVerifiedDownload(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil), "artifact", src, reopenFrom(payload), int64(len(payload)), digest, nil)
+	}()
+	<-entered
+	if used := budget.Used(); used != 100 {
+		t.Fatalf("reservation released too early: Used()=%d, want 100", used)
+	}
+	// A second download of the same size cannot fit: the first 100 bytes are
+	// physically present and still charged, so Acquire waits for capacity
+	// rather than admitting an over-budget reservation.
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	if res, err := budget.Acquire(ctx, 100); err == nil {
+		res.Release()
+		t.Fatal("second acquisition admitted past the bound while the first spool is live")
+	}
+	close(release)
+	<-done
+	if used := budget.Used(); used != 0 {
+		t.Fatalf("reservation leaked after the download: Used()=%d, want 0", used)
+	}
+}
+
+// TestCorruptCompleteBodyNeverSucceeds pins that a backend returning the exact
+// advertised length with wrong bytes cannot produce a successful complete
+// response: over real HTTP/1 the client sees a 503, never a complete 200 body.
+func TestCorruptCompleteBodyNeverSucceeds(t *testing.T) {
+	good := []byte("the-real-archive-bytes")
+	corrupt := bytes.Repeat([]byte("z"), len(good))
+	digest := sha256Hex(good)
+	s := New("tok") // no staging budget: the two-pass path must still fail closed
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.serveVerifiedDownload(w, r, "artifact", io.NopCloser(bytes.NewReader(corrupt)), reopenFrom(corrupt), int64(len(good)), digest, func(w http.ResponseWriter) {
+			w.Header().Set("Content-Length", strconv.Itoa(len(good)))
+		})
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusOK && len(body) == len(good) {
+		t.Fatalf("corrupt complete body accepted: %d bytes with 200", len(body))
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (no bytes served)", resp.StatusCode)
+	}
 }

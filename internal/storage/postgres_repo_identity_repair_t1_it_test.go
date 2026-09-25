@@ -121,10 +121,12 @@ func TestPostgresIntegrationRepairActiveIdentityImmutable(t *testing.T) {
 	}
 }
 
-// TestPostgresIntegrationRepairRunQuarantineCascades is T1-6(c): a terminal
-// (unprovable) run with queued child jobs must cancel every non-terminal
-// child, and a requeued child must stay unleasable through the parent-run
-// predicate even on a global-allow runner.
+// TestPostgresIntegrationRepairRunQuarantineCascades is T1-6(c) plus the
+// finding-5 refinement: a terminal (unprovable) run that still owns
+// non-terminal children classifies as active_requires_drain, so a plain apply
+// leaves it alone; with --cancel-active the run is quarantined AND every
+// non-terminal child is cancelled, and a requeued child stays unleasable
+// through the parent-run predicate even on a global-allow runner.
 func TestPostgresIntegrationRepairRunQuarantineCascades(t *testing.T) {
 	st := pgITStore(t)
 	ctx := context.Background()
@@ -142,8 +144,24 @@ func TestPostgresIntegrationRepairRunQuarantineCascades(t *testing.T) {
 	runnerID := pgITNewID(t)
 	pgITSeedRunner(t, st, runnerID, 5, 0, 0) // empty allowlist = global allow
 
-	if _, err := st.RepairRepoIdentities(ctx, RepoIdentityRepairApply); err != nil {
-		t.Fatalf("repair: %v", err)
+	// Plain apply must NOT quarantine the run or touch its children (finding 5).
+	plain, err := st.RepairRepoIdentities(ctx, RepoIdentityRepairApply)
+	if err != nil {
+		t.Fatalf("plain repair: %v", err)
+	}
+	if plain.Quarantined != 0 {
+		t.Fatalf("plain apply quarantined %d rows, want 0 (active children require --cancel-active)", plain.Quarantined)
+	}
+	before, err := st.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if before.RepoIdentityQuarantined {
+		t.Fatal("plain apply quarantined a run that still owns non-terminal children")
+	}
+
+	if _, err := st.RepairRepoIdentitiesWithOptions(ctx, RepoIdentityRepairApply, RepoIdentityRepairOptions{CancelActive: true}); err != nil {
+		t.Fatalf("repair with cancel-active: %v", err)
 	}
 
 	run, err := st.GetRun(ctx, runID)

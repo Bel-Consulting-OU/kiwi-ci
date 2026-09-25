@@ -20,6 +20,12 @@ import (
 // artifact row.
 var ErrLeaseLost = errors.New("storage: lease lost before commit")
 
+// ErrSnapshotCapReached reports that a (run, job) already holds the maximum
+// number of snapshot records. The cap is enforced at COMMIT time (under the
+// job row lock in PostgreSQL, under the store mutex in memory), not only as a
+// preflight check, so concurrent uploads cannot exceed it.
+var ErrSnapshotCapReached = errors.New("storage: snapshot cap reached")
+
 // LeaseCommitStore is the transactional commit-time lease-predicate contract.
 //
 // The runner upload endpoints (job cache, workspace snapshot, artifact)
@@ -45,7 +51,7 @@ type LeaseCommitStore interface {
 	// InsertSnapshotForLease inserts a workspace snapshot record only while
 	// the named job is still running under (runnerID, generation) with an
 	// unexpired lease.
-	InsertSnapshotForLease(ctx context.Context, jobID, runnerID string, generation int64, rec model.SnapshotRecord) error
+	InsertSnapshotForLease(ctx context.Context, jobID, runnerID string, generation int64, maxPerJob int, rec model.SnapshotRecord) error
 	// InsertArtifactOnceForLease is the lease-fenced sibling of
 	// InsertArtifactOnce: it inserts the artifact row (idempotent on the
 	// (job, generation, name) key) only while the named job is still running
@@ -131,7 +137,7 @@ func (s *PostgresStore) PutCacheManifestForLease(ctx context.Context, jobID, run
 	if !held {
 		return fmt.Errorf("%w: cache manifest for job %s", ErrLeaseLost, jobID)
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO cache_manifests (repo, trust_domain, logical_key, blob_sha256, blob_size, producer_run, producer_job, created_at, payload) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (repo, trust_domain, logical_key) DO UPDATE SET blob_sha256=EXCLUDED.blob_sha256, blob_size=EXCLUDED.blob_size, producer_run=EXCLUDED.producer_run, producer_job=EXCLUDED.producer_job, payload=EXCLUDED.payload`,
+	if _, err := tx.Exec(ctx, `INSERT INTO cache_manifests (repo, trust_domain, logical_key, blob_sha256, blob_size, producer_run, producer_job, created_at, payload) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (repo, trust_domain, logical_key) DO UPDATE SET blob_sha256=EXCLUDED.blob_sha256, blob_size=EXCLUDED.blob_size, producer_run=EXCLUDED.producer_run, producer_job=EXCLUDED.producer_job, created_at=EXCLUDED.created_at, payload=EXCLUDED.payload`,
 		rec.Repo, rec.TrustDomain, rec.LogicalKey, rec.BlobSHA256, rec.BlobSize, nullText(rec.ProducerRun), nullText(rec.ProducerJob), rec.CreatedAt, payload); err != nil {
 		return err
 	}
@@ -141,7 +147,7 @@ func (s *PostgresStore) PutCacheManifestForLease(ctx context.Context, jobID, run
 // InsertSnapshotForLease is the transactional snapshot-record commit: it
 // locks the job row, re-evaluates the live-lease predicate, and only then
 // inserts the record, all in one transaction.
-func (s *PostgresStore) InsertSnapshotForLease(ctx context.Context, jobID, runnerID string, generation int64, rec model.SnapshotRecord) error {
+func (s *PostgresStore) InsertSnapshotForLease(ctx context.Context, jobID, runnerID string, generation int64, maxPerJob int, rec model.SnapshotRecord) error {
 	if err := validateLeaseCommitKey(jobID, runnerID, generation); err != nil {
 		return err
 	}
@@ -166,6 +172,18 @@ func (s *PostgresStore) InsertSnapshotForLease(ctx context.Context, jobID, runne
 	}
 	if !held {
 		return fmt.Errorf("%w: snapshot %s for job %s", ErrLeaseLost, rec.ID, jobID)
+	}
+	// Cap enforcement at COMMIT, not just as a preflight check: the job row is
+	// locked, so concurrent snapshot commits for one job serialize here and
+	// can never exceed the cap.
+	if maxPerJob > 0 {
+		var n int
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM workspace_snapshots WHERE run_id=$1 AND job_id=$2`, rec.RunID, nullText(rec.JobID)).Scan(&n); err != nil {
+			return err
+		}
+		if n >= maxPerJob {
+			return fmt.Errorf("%w: job %s already has %d snapshots (cap %d)", ErrSnapshotCapReached, jobID, n, maxPerJob)
+		}
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO workspace_snapshots (id, run_id, job_id, created_at, payload) VALUES ($1, $2, $3, $4, $5)`,
 		rec.ID, rec.RunID, nullText(rec.JobID), rec.CreatedAt, payload); err != nil {
@@ -282,7 +300,7 @@ func (m *memStore) PutCacheManifestForLease(ctx context.Context, jobID, runnerID
 
 // InsertSnapshotForLease is the in-memory mirror of the SQL transactional
 // snapshot-record commit.
-func (m *memStore) InsertSnapshotForLease(ctx context.Context, jobID, runnerID string, generation int64, rec model.SnapshotRecord) error {
+func (m *memStore) InsertSnapshotForLease(ctx context.Context, jobID, runnerID string, generation int64, maxPerJob int, rec model.SnapshotRecord) error {
 	if err := validateLeaseCommitKey(jobID, runnerID, generation); err != nil {
 		return err
 	}
@@ -290,6 +308,17 @@ func (m *memStore) InsertSnapshotForLease(ctx context.Context, jobID, runnerID s
 	defer m.mu.Unlock()
 	if !m.leaseHeldLocked(jobID, runnerID, generation, time.Now().UTC()) {
 		return fmt.Errorf("%w: snapshot %s for job %s", ErrLeaseLost, rec.ID, jobID)
+	}
+	if maxPerJob > 0 {
+		n := 0
+		for _, existing := range m.snapshots {
+			if existing.RunID == rec.RunID && existing.JobID == rec.JobID {
+				n++
+			}
+		}
+		if n >= maxPerJob {
+			return fmt.Errorf("%w: job %s already has %d snapshots (cap %d)", ErrSnapshotCapReached, jobID, n, maxPerJob)
+		}
 	}
 	m.snapshots = append(m.snapshots, rec)
 	return nil
@@ -337,7 +366,7 @@ func (f *FaultyStore) PutCacheManifestForLease(ctx context.Context, jobID, runne
 
 // InsertSnapshotForLease forwards the faulted backend's inner implementation
 // while injecting the configured mutation fault.
-func (f *FaultyStore) InsertSnapshotForLease(ctx context.Context, jobID, runnerID string, generation int64, rec model.SnapshotRecord) error {
+func (f *FaultyStore) InsertSnapshotForLease(ctx context.Context, jobID, runnerID string, generation int64, maxPerJob int, rec model.SnapshotRecord) error {
 	inner, ok := f.Inner.(LeaseCommitStore)
 	if !ok {
 		return errMissingInnerInterface("LeaseCommitStore")
@@ -347,7 +376,7 @@ func (f *FaultyStore) InsertSnapshotForLease(ctx context.Context, jobID, runnerI
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return inner.InsertSnapshotForLease(ctx, jobID, runnerID, generation, rec)
+	return inner.InsertSnapshotForLease(ctx, jobID, runnerID, generation, maxPerJob, rec)
 }
 
 // InsertArtifactOnceForLease forwards the faulted backend's inner

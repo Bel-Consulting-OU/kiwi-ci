@@ -26,35 +26,73 @@ const metricDownloadIntegrityFailures = "kiwi_download_integrity_failures_total"
 // (with connection abort on mismatch) rather than serving unverified bytes.
 var errDownloadStagingUnavailable = errors.New("download integrity staging unavailable")
 
+// downloadAfterPreverifyHook, when non-nil, runs after a successful
+// preverification and before the verified bytes are streamed. Tests use it to
+// freeze a download while its staging reservation is still held. Production
+// leaves it nil.
+var downloadAfterPreverifyHook func()
+
+// verifiedSpool owns a staged file together with the byte reservation that
+// accounts for it. The reservation represents LIVE DISK OCCUPANCY, not write
+// activity, so it is released only after the file is removed.
+type verifiedSpool struct {
+	budget *staging.Budget
+	path   string
+	res    *staging.Reservation
+	closed bool
+}
+
+// Close removes the staged file, releases its spool tracking and only then
+// releases the byte reservation. It is idempotent.
+func (v *verifiedSpool) Close() {
+	if v == nil || v.closed {
+		return
+	}
+	v.closed = true
+	if v.path != "" {
+		_ = os.Remove(v.path)
+		if v.budget != nil {
+			v.budget.ReleaseSpool(v.path)
+		}
+	}
+	if v.res != nil {
+		v.res.Release()
+	}
+}
+
 // preverifyToSpool streams src through the shared bounded staging budget into
-// a spool file and returns a path proven to hold EXACTLY wantSize bytes. The
-// caller owns the returned path. The budget reservation is held for the whole
-// staging (so a concurrent Close waits) and released on every path.
-func (s *Server) preverifyToSpool(ctx context.Context, src io.Reader, wantSize int64) (string, error) {
+// a spool file and returns an owned spool proven to hold EXACTLY wantSize
+// bytes. Ownership of BOTH the file and its byte reservation transfers to the
+// caller, whose Close removes the file before releasing the reservation, so
+// Budget.Used() always reflects bytes physically present in the staging
+// directory.
+func (s *Server) preverifyToSpool(ctx context.Context, src io.Reader, wantSize int64) (*verifiedSpool, error) {
 	budget := s.StagingBudget()
 	if budget == nil {
-		return "", errDownloadStagingUnavailable
+		return nil, errDownloadStagingUnavailable
 	}
 	if wantSize < 0 {
-		return "", fmt.Errorf("negative advertised size %d", wantSize)
+		return nil, fmt.Errorf("negative advertised size %d", wantSize)
 	}
 	if wantSize > budget.MaxBytes() {
-		return "", fmt.Errorf("%w: object is %d bytes, staging budget is %d", errDownloadStagingUnavailable, wantSize, budget.MaxBytes())
+		return nil, fmt.Errorf("%w: object is %d bytes, staging budget is %d", errDownloadStagingUnavailable, wantSize, budget.MaxBytes())
 	}
 	res, err := budget.Acquire(ctx, wantSize)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	defer res.Release()
+	sp := &verifiedSpool{budget: budget, res: res}
 	path, n, err := budget.SpoolFile(src, wantSize)
 	if err != nil {
-		return "", err
+		sp.Close()
+		return nil, err
 	}
+	sp.path = path
 	if n != wantSize {
-		_ = os.Remove(path)
-		return "", fmt.Errorf("staged object is %d bytes, want %d", n, wantSize)
+		sp.Close()
+		return nil, fmt.Errorf("staged object is %d bytes, want %d", n, wantSize)
 	}
-	return path, nil
+	return sp, nil
 }
 
 // abortDownload tears the response down so a client can never accept a
@@ -82,11 +120,14 @@ func (s *Server) abortDownload(w http.ResponseWriter, r *http.Request, scope, di
 // the connection. When the object cannot be staged (no budget, or larger than
 // the whole budget) it falls back to a streamed digest-checked copy that
 // aborts on mismatch, so corrupt bytes are never silently accepted either way.
-func (s *Server) serveVerifiedDownload(w http.ResponseWriter, r *http.Request, scope string, src io.ReadCloser, wantSize int64, wantSHA256 string, setHeaders func(http.ResponseWriter)) {
+func (s *Server) serveVerifiedDownload(w http.ResponseWriter, r *http.Request, scope string, src io.ReadCloser, reopen func() (io.ReadCloser, error), wantSize int64, wantSHA256 string, setHeaders func(http.ResponseWriter)) {
 	defer src.Close()
-	if path, err := s.preverifyToSpool(r.Context(), src, wantSize); err == nil {
-		defer os.Remove(path)
-		got, herr := fileSHA256(path)
+	if sp, err := s.preverifyToSpool(r.Context(), src, wantSize); err == nil {
+		defer sp.Close()
+		if downloadAfterPreverifyHook != nil {
+			downloadAfterPreverifyHook()
+		}
+		got, herr := fileSHA256(sp.path)
 		if herr != nil || got != wantSHA256 {
 			if herr == nil {
 				herr = fmt.Errorf("staged object digest %s, want %s", got, wantSHA256)
@@ -96,7 +137,7 @@ func (s *Server) serveVerifiedDownload(w http.ResponseWriter, r *http.Request, s
 			http.Error(w, "download verification failed", http.StatusServiceUnavailable)
 			return
 		}
-		f, oerr := os.Open(path)
+		f, oerr := os.Open(sp.path)
 		if oerr != nil {
 			s.internalError(w, r, oerr, "")
 			return
@@ -119,21 +160,53 @@ func (s *Server) serveVerifiedDownload(w http.ResponseWriter, r *http.Request, s
 		http.Error(w, "download verification failed", http.StatusServiceUnavailable)
 		return
 	}
-	// Fallback: stream through a digest-checked writer and abort on any
-	// short/long/digest mismatch. The object is bigger than the whole staging
-	// budget (or no budget is configured), so it cannot be pre-staged.
+	// The object could not be staged (no budget, or larger than the whole
+	// budget). Server-guaranteed integrity must not be weakened: verify the
+	// source in a first pass and stream it in a second pass from a reopenable
+	// source, committing no headers until the digest is proven. A source that
+	// cannot be reopened is refused (503) rather than streamed unverified.
+	if err := s.verifySourceByTwoPass(r, scope, src, wantSize, wantSHA256); err != nil {
+		s.metricAdd(metricDownloadIntegrityFailures, 1, map[string]string{"scope": scope, "kind": "verify"})
+		s.logError("download verification failed; no bytes served", "scope", scope, "sha256", wantSHA256, "error", err.Error())
+		http.Error(w, "download verification failed", http.StatusServiceUnavailable)
+		return
+	}
+	if reopen == nil {
+		s.metricAdd(metricDownloadIntegrityFailures, 1, map[string]string{"scope": scope, "kind": "verify"})
+		s.logError("download cannot be served with server-verified integrity: source is not reopenable and staging is unavailable", "scope", scope, "sha256", wantSHA256)
+		http.Error(w, "download verification unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	second, oerr := reopen()
+	if oerr != nil {
+		s.internalError(w, r, oerr, "")
+		return
+	}
+	defer second.Close()
 	if setHeaders != nil {
 		setHeaders(w)
 	}
-	h := sha256.New()
-	n, cerr := io.Copy(io.MultiWriter(w, h), src)
-	if cerr != nil {
+	if _, cerr := io.Copy(w, second); cerr != nil {
 		s.abortDownload(w, r, scope, wantSHA256, "write", cerr)
-		return
 	}
-	if got := hex.EncodeToString(h.Sum(nil)); n != wantSize || got != wantSHA256 {
-		s.abortDownload(w, r, scope, wantSHA256, "verify", fmt.Errorf("streamed object is %d bytes digest %s, want %d bytes digest %s", n, got, wantSize, wantSHA256))
+}
+
+// verifySourceByTwoPass hashes a discard-copy of the source and requires the
+// exact advertised length and digest. It is used when staging is unavailable
+// but the source can be reopened for the serving pass.
+func (s *Server) verifySourceByTwoPass(r *http.Request, scope string, src io.Reader, wantSize int64, wantSHA256 string) error {
+	h := sha256.New()
+	n, err := io.Copy(h, src)
+	if err != nil {
+		return fmt.Errorf("verify pass: %w", err)
 	}
+	if n != wantSize {
+		return fmt.Errorf("verified object is %d bytes, want %d", n, wantSize)
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != wantSHA256 {
+		return fmt.Errorf("verified object digest %s, want %s", got, wantSHA256)
+	}
+	return nil
 }
 
 // serveStreamCheckedWithDigest streams src to the client while hashing it and
