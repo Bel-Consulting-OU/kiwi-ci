@@ -703,3 +703,68 @@ func countSpoolFiles(entries []os.DirEntry) int {
 	}
 	return n
 }
+
+// TestSpoolFileZeroLimitIsStrictlyZero pins the budget-owned spool contract:
+// zero means ZERO bytes (write nothing, probe the source), and a negative
+// limit is invalid rather than unlimited. A source that lies about its length
+// must never get a zero reservation plus an unbounded write.
+func TestSpoolFileZeroLimitIsStrictlyZero(t *testing.T) {
+	b, err := NewBudget(t.TempDir(), 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+
+	// An empty source at the zero limit is accepted and writes no bytes.
+	path, n, err := b.SpoolFile(bytes.NewReader(nil), 0)
+	if err != nil {
+		t.Fatalf("empty source at limit 0: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("empty source at limit 0 staged %d bytes", n)
+	}
+	// The zero-byte spool file is legitimate and owned by the caller: it must
+	// exist, be empty, and be tracked until released.
+	fi, serr := os.Stat(path)
+	if serr != nil {
+		t.Fatalf("stat zero-byte spool: %v", serr)
+	}
+	if fi.Size() != 0 {
+		t.Fatalf("zero-limit spool holds %d bytes, want 0", fi.Size())
+	}
+	before := len(spoolEntries(t, b.Dir()))
+	// Anything at all at the zero limit is refused, with nothing written.
+	if _, _, err := b.SpoolFile(bytes.NewReader([]byte("x")), 0); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("one-byte source at limit 0 = %v, want ErrTooLarge", err)
+	}
+	if after := len(spoolEntries(t, b.Dir())); after != before {
+		t.Fatalf("refused zero-limit spools changed the staging directory: %d -> %d entries", before, after)
+	}
+	// A negative limit is invalid, never unlimited.
+	if _, _, err := b.SpoolFile(bytes.NewReader([]byte("x")), -1); !errors.Is(err, ErrInvalidLimit) {
+		t.Fatalf("negative limit = %v, want ErrInvalidLimit", err)
+	}
+	// Releasing the zero-byte spool reclaims its directory entry.
+	_ = os.Remove(path)
+	b.ReleaseSpool(path)
+	if entries := spoolEntries(t, b.Dir()); len(entries) != 0 {
+		t.Fatalf("released zero-byte spool still tracked: %v", entries)
+	}
+}
+
+// spoolEntries lists staging entries excluding the ownership lock file.
+func spoolEntries(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		if e.Name() == "kiwi-stage.lock" {
+			continue
+		}
+		names = append(names, e.Name())
+	}
+	return names
+}
