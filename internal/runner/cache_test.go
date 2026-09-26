@@ -229,8 +229,10 @@ func TestCacheClientRestoreDigestAndBounds(t *testing.T) {
 			digest = hex.EncodeToString(sum[:])
 			mu.Unlock()
 		}()
+		// An absent digest header is only accepted through the explicit
+		// legacy opt-in; the modern job-scoped route always sends it.
 		var logged bool
-		c := &cache.Client{Server: srv.URL, Logf: func(string, ...any) { logged = true }}
+		c := &cache.Client{Server: srv.URL, AllowUnverifiedLegacyRestore: true, Logf: func(string, ...any) { logged = true }}
 		rc, err := c.Restore(context.Background(), "job-9", lease, "k")
 		if err != nil {
 			t.Fatal(err)

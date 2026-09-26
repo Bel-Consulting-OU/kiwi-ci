@@ -3677,6 +3677,37 @@ func (f *dbFakeStore) InsertArtifactOnceForLease(ctx context.Context, jobID, run
 	return a, true, nil
 }
 
+// CommitOIDCIssuance mirrors the transactional issuer commit: under the fake's
+// single lock it re-reads the authoritative job, evaluates the shared
+// predicate/claim binding and appends the oidc.issued audit row, honoring the
+// injected audit failure exactly like AppendAudit.
+func (f *dbFakeStore) CommitOIDCIssuance(ctx context.Context, req storage.OIDCIssuance) (storage.LockedOIDCIdentity, error) {
+	if err := storage.ValidateOIDCIssuanceRequest(req); err != nil {
+		return storage.LockedOIDCIdentity{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	j, ok := f.jobs[req.JobID]
+	if !ok {
+		return storage.LockedOIDCIdentity{}, storage.ErrNotFound
+	}
+	locked := storage.LockedOIDCIdentityForJob(j)
+	if err := storage.ValidateOIDCIssuance(locked, req); err != nil {
+		return storage.LockedOIDCIdentity{}, err
+	}
+	if f.auditErr != nil {
+		return storage.LockedOIDCIdentity{}, f.auditErr
+	}
+	auditID, err := newID()
+	if err != nil {
+		return storage.LockedOIDCIdentity{}, err
+	}
+	f.audit = append(f.audit, storage.OIDCIssuanceAuditEvent(req, auditID))
+	return locked, nil
+}
+
+var _ storage.LeaseOIDCIssueStore = (*dbFakeStore)(nil)
+
 // fence returns the fake's per-store digest fencer (lazily created so tests
 // that never publish pay nothing). A test-installed digestFenceOverride is
 // used verbatim, which is how fence-observability tests instrument the

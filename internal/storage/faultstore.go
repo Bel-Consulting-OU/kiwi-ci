@@ -5880,3 +5880,50 @@ func (m *memStore) DisableRunnerAndRevokeCert(ctx context.Context, runnerID, cer
 	m.audit, m.revocations = audit, revocations
 	return len(ids), nil
 }
+
+// CommitOIDCIssuance is the in-memory mirror of the SQL transactional
+// issuance commit: under m.mu — this store's transaction — the authoritative
+// job is re-read, the shared issuance predicate (lease holder/generation/
+// token hash, status, expiry, trust, permission, audience) and the claim
+// binding are evaluated, and the oidc.issued audit event is appended in the
+// same critical section. A refusal returns the same typed error as the SQL
+// store and appends NOTHING.
+func (m *memStore) CommitOIDCIssuance(ctx context.Context, req OIDCIssuance) (LockedOIDCIdentity, error) {
+	if err := ValidateOIDCIssuanceRequest(req); err != nil {
+		return LockedOIDCIdentity{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	j, ok := m.jobs[req.JobID]
+	if !ok {
+		return LockedOIDCIdentity{}, ErrNotFound
+	}
+	locked := LockedOIDCIdentityForJob(j)
+	if err := ValidateOIDCIssuance(locked, req); err != nil {
+		return LockedOIDCIdentity{}, err
+	}
+	auditID, err := newID()
+	if err != nil {
+		return LockedOIDCIdentity{}, err
+	}
+	m.audit = append(m.audit, OIDCIssuanceAuditEvent(req, auditID))
+	return locked, nil
+}
+
+// CommitOIDCIssuance forwards the faulted backend's inner implementation
+// while injecting the configured mutation fault, exactly like the other
+// mutating extension methods: the predicate and the identity binding are the
+// inner implementation's contract and the wrapper never writes anything
+// itself, so a forwarding call cannot bypass either.
+func (f *FaultyStore) CommitOIDCIssuance(ctx context.Context, req OIDCIssuance) (LockedOIDCIdentity, error) {
+	inner, ok := f.Inner.(LeaseOIDCIssueStore)
+	if !ok {
+		return LockedOIDCIdentity{}, errMissingInnerInterface("LeaseOIDCIssueStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return LockedOIDCIdentity{}, err
+	}
+	return inner.CommitOIDCIssuance(ctx, req)
+}

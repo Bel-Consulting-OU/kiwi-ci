@@ -30,7 +30,10 @@ func Restore(r io.Reader, dest string) (Manifest, error) {
 		return Manifest{}, fmt.Errorf("snapshot: open root: %w", err)
 	}
 	defer root.Close()
-	if _, err := safefs.Extract(root, r, safefs.DefaultLimits()); err != nil {
+	// Snapshot restore restores the whole archive: opt in explicitly.
+	limits := safefs.DefaultLimits()
+	limits.AllowAll = true
+	if _, err := safefs.Extract(root, r, limits); err != nil {
 		return Manifest{}, fmt.Errorf("snapshot: extract: %w", err)
 	}
 	m, err := manifestAfterRestore(dest)

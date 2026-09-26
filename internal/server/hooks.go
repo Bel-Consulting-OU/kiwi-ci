@@ -12,61 +12,56 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
-// triggerFilesFetch fetches the authoritative changed-file list BEFORE
-// trigger evaluation when the pipeline declares include-path filters:
-// matching against an empty or partial list is fail-open. The fetch must
-// also be complete: an include-path trigger with a truncated or
-// best-effort diff fails the webhook closed. When the pipeline only uses
-// paths_ignore the fetch is best-effort — a missing or incomplete list
-// cannot wrongly admit an event, because a paths_ignore filter never
-// matches an empty list. It returns the files, whether the list is the
-// authoritative complete diff, and whether a fetch error must fail the
-// webhook closed.
-func (s *Server) triggerFilesFetch(ctx context.Context, fg forge.Forge, spec *pipeline.Spec, ec *forge.EventContext) (files []string, complete bool, mustFail error) {
-	needsInclude := false
-	for _, t := range spec.On {
-		if len(t.Paths) > 0 {
-			needsInclude = true
-			break
-		}
-	}
+// triggerFilesFetch fetches the event's changed-file diff once, before
+// trigger evaluation, and attaches the authoritative complete list to the
+// event context. The matcher itself owns the fail-closed invariant:
+// forge.MatchesTrigger refuses include-path triggers when the attached diff
+// is incomplete, so this wrapper no longer inspects the trigger set.
+// Incomplete, partial or failed fetches leave the context with an unknown
+// diff; non-authoritative partial lists are deliberately not propagated
+// downstream. The fetch error is returned so the caller can surface a
+// retryable failure when the diff was required.
+func (s *Server) triggerFilesFetch(ctx context.Context, fg forge.Forge, ec *forge.EventContext) (forge.ChangedFilesResult, error) {
 	res, err := fg.ChangedFiles(ctx, *ec)
 	if err != nil {
-		if needsInclude {
-			return nil, false, fmt.Errorf("changed files unavailable for path-filtered trigger: %w", err)
-		}
-		log.Printf("webhook: changed files for %s: %v", ec.Repository.FullName, err)
-		return nil, false, nil
+		ec.ChangedFiles = forge.ChangedFilesResult{}
+		return forge.ChangedFilesResult{}, err
 	}
 	if !res.Complete {
-		if needsInclude {
-			return nil, false, fmt.Errorf("changed files incomplete for path-filtered trigger")
-		}
-		// Ignore-only trigger: proceeding without the list is safe — a
-		// paths_ignore filter never matches an empty list, so an
-		// incomplete diff cannot wrongly admit an event.
-		log.Printf("webhook: changed files for %s: incomplete diff (ignore-only trigger)", ec.Repository.FullName)
-		return nil, false, nil
+		ec.ChangedFiles = forge.ChangedFilesResult{}
+		return res, nil
 	}
-	return res.Files, true, nil
+	ec.ChangedFiles = res
+	return res, nil
 }
 
-// evalTriggerMatches evaluates the pipeline trigger with authoritative
-// changed files populated. A failed include-path fetch fails closed. The
-// third return reports whether the changed-files list attached to the
-// event context is the authoritative complete diff: the enqueue persists
-// it as ChangedFilesKnown so the runner never applies a local git
-// fallback over a known (possibly empty) server-side list.
+// evalTriggerMatches attaches the changed files (when authoritative),
+// evaluates the pipeline trigger, and reports whether the attached list is
+// the authoritative complete diff: the enqueue persists it as
+// ChangedFilesKnown so the runner never applies a local git fallback over a
+// known (possibly empty) server-side list.
+//
+// forge.MatchesTrigger itself fails closed for include-path triggers on an
+// incomplete diff. When that fail-closed reason fires, the webhook answers a
+// retryable error so the forge redelivers instead of silently dropping a
+// path-filtered event. A fetch failure on a trigger that does not depend on
+// the diff is only logged: paths_ignore-only and path-less triggers remain
+// best-effort.
 func (s *Server) evalTriggerMatches(ctx context.Context, fg forge.Forge, spec *pipeline.Spec, ec *forge.EventContext) (bool, string, bool, error) {
-	files, complete, err := s.triggerFilesFetch(ctx, fg, spec, ec)
-	if err != nil {
-		return false, "", false, err
+	res, ferr := s.triggerFilesFetch(ctx, fg, ec)
+	if ferr != nil {
+		log.Printf("webhook: changed files for %s: %v", ec.Repository.FullName, ferr)
+	} else if !res.Complete {
+		log.Printf("webhook: changed files for %s: incomplete diff", ec.Repository.FullName)
 	}
-	if files != nil {
-		ec.ChangedFiles = files
+	match := forge.EvaluateTrigger(spec.On, *ec)
+	if match.Reason == forge.ReasonChangedFilesIncomplete {
+		if ferr != nil {
+			return false, "", false, fmt.Errorf("changed files unavailable for path-filtered trigger: %w", ferr)
+		}
+		return false, "", false, errors.New("changed files incomplete for path-filtered trigger")
 	}
-	ok, matched := forge.MatchesTrigger(spec.On, *ec)
-	return ok, matched, complete, nil
+	return match.Matched, match.Key, res.Complete, nil
 }
 
 func (s *Server) gitLabForge() *forge.GitLab {
@@ -144,7 +139,7 @@ func (s *Server) gitlabWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	files := ec.ChangedFiles
+	files := ec.ChangedFiles.Files
 
 	repoID := s.forgeRepoID("gitlab", webhookRepoCoordinate(ec))
 	delivery := r.Header.Get("X-GitLab-Event-UUID")
@@ -258,7 +253,7 @@ func (s *Server) forgejoWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	files := ec.ChangedFiles
+	files := ec.ChangedFiles.Files
 
 	repoID := s.forgeRepoID("forgejo", webhookRepoCoordinate(ec))
 	delivery := r.Header.Get("X-Forgejo-Delivery")

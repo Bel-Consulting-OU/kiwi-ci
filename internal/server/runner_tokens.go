@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
@@ -39,8 +38,8 @@ func (s *Server) LoadRunnerTokens(tokens map[string]string) {
 // request closed (503) instead of treating it as "no per-runner credentials"
 // and falling back to the weaker shared runner token.
 func (s *Server) runnerBearerID(r *http.Request) (string, bool, error) {
-	tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if tok == "" {
+	tok, ok := auth.ParseBearer(r.Header.Get("Authorization"))
+	if !ok {
 		return "", false, nil
 	}
 	digest := auth.TokenDigest(tok)

@@ -31,7 +31,7 @@ func TestOpenParentChainDupFailure(t *testing.T) {
 	}
 	defer root.Close()
 	data := tarGz(t, []tarEntry{{name: "f.txt", data: []byte("x"), typeflag: tar.TypeReg}})
-	if _, err := Extract(root, bytes.NewReader(data), ExtractLimits{}); err == nil || !strings.Contains(err.Error(), "dup refused") {
+	if _, err := Extract(root, bytes.NewReader(data), ExtractLimits{AllowAll: true}); err == nil || !strings.Contains(err.Error(), "dup refused") {
 		t.Fatalf("dup failure = %v", err)
 	}
 }

@@ -210,7 +210,10 @@ func Extract(archivePath string, workspace *safefs.Root, rel string) error {
 		return err
 	}
 	defer f.Close()
-	if _, err := safefs.Extract(root, f, safefs.DefaultLimits()); err != nil {
+	// Artifact extraction restores the whole archive: opt in explicitly.
+	limits := safefs.DefaultLimits()
+	limits.AllowAll = true
+	if _, err := safefs.Extract(root, f, limits); err != nil {
 		return fmt.Errorf("artifact extract: %w", err)
 	}
 	return nil

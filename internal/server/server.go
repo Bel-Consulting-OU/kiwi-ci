@@ -1041,7 +1041,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /", s.ui)
 	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServerFS(webAssets())))
 	mux.HandleFunc("POST /api/v1/login", s.webLogin)
-	mux.HandleFunc("GET /api/v1/logout", s.webLogout)
+	// Logout mutates session state (it clears the session cookie), so it is
+	// POST-only and requires the same double-submit CSRF proof as every other
+	// cookie-authenticated mutation. The route stays public at the auth tier,
+	// so the CSRF gate lives in webLogout; GET is registered explicitly to
+	// answer 405 instead of falling through to the "GET /" dashboard
+	// catch-all.
+	mux.HandleFunc("GET /api/v1/logout", s.webLogoutMethodNotAllowed)
+	mux.HandleFunc("POST /api/v1/logout", s.webLogout)
 	mux.HandleFunc("GET /readiness", s.readiness)
 	mux.HandleFunc("GET /liveness", s.liveness)
 	mux.HandleFunc("POST /hooks/github", s.githubWebhook)
@@ -1150,7 +1157,7 @@ func (s *Server) auth(next http.Handler) http.Handler {
 			}
 			tok := enrollTokenFrom(r)
 			switch {
-			case s.RunnerEnrollToken != "" && bearerOK(tok, s.RunnerEnrollToken):
+			case s.RunnerEnrollToken != "" && tokenEqual(tok, s.RunnerEnrollToken):
 			case s.enrollGrantOK(r.Context(), tok):
 			default:
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -1310,12 +1317,25 @@ func actorFrom(r *http.Request) string {
 	return "api"
 }
 
-func bearerOK(header, want string) bool {
-	got := strings.TrimPrefix(header, "Bearer ")
+// tokenEqual compares a presented credential with the configured one in
+// constant time.
+func tokenEqual(got, want string) bool {
 	if len(got) != len(want) {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+// bearerOK reports whether an Authorization header carries want as its
+// credential under the ONE strict bearer grammar (auth.ParseBearer): the
+// exact "Bearer " scheme prefix and a non-empty token. A header that IS the
+// raw token is not a bearer presentation.
+func bearerOK(header, want string) bool {
+	got, ok := auth.ParseBearer(header)
+	if !ok {
+		return false
+	}
+	return tokenEqual(got, want)
 }
 
 // logf routes formatted messages (the auth middleware callback contract)

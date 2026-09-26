@@ -65,14 +65,14 @@ func MiddlewareWithClassifier(store *TokenStore, adminToken string, classifier f
 			next.ServeHTTP(w, r)
 			return
 		}
-		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if token != "" && store != nil {
+		token, hasBearer := ParseBearer(r.Header.Get("Authorization"))
+		if hasBearer && store != nil {
 			if p, ok := store.Authenticate(token); ok {
 				next.ServeHTTP(w, r.WithContext(WithPrincipal(r.Context(), p)))
 				return
 			}
 		}
-		if adminToken != "" && token != "" && tokenMatches(token, adminToken) {
+		if hasBearer && adminToken != "" && tokenMatches(token, adminToken) {
 			next.ServeHTTP(w, r.WithContext(WithPrincipal(r.Context(), AdminPrincipal())))
 			return
 		}

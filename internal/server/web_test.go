@@ -181,10 +181,11 @@ func TestWebSessionExpiry(t *testing.T) {
 
 func TestWebLogoutClearsCookie(t *testing.T) {
 	s := testWebServer(t, "admin-token")
-	cookie, _, _ := login(t, s, "admin-token")
+	cookie, csrf, _ := login(t, s, "admin-token")
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/api/v1/logout", nil)
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/logout", nil)
 	r.Header.Set("Cookie", webSessionCookie+"="+cookie)
+	r.Header.Set(webCSRFHeader, csrf)
 	s.Handler().ServeHTTP(w, r)
 	if w.Code != http.StatusOK {
 		t.Fatalf("logout = %d", w.Code)

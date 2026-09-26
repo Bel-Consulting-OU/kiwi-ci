@@ -111,9 +111,13 @@
 
   logoutBtn.addEventListener("click", async () => {
     try {
-      await fetch("/api/v1/logout", { credentials: "same-origin" });
+      // POST, never GET: logout clears the session cookie server-side and
+      // therefore counts as a mutation. api() attaches the double-submit
+      // X-Kiwi-CSRF header from the login response like every other mutating
+      // call; the server refuses a logout without it.
+      await api("/api/v1/logout", { method: "POST" });
     } catch (err) {
-      /* the cookie clears server-side regardless */
+      /* local sign-out proceeds regardless; the server cookie clears only on a valid CSRF token */
     }
     setSignedOut();
   });

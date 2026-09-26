@@ -28,12 +28,21 @@ type ExtractLimits struct {
 	MaxPathLength       int
 	MaxDepth            int
 	MaxCompressionRatio float64
+	// AllowAll makes the whole archive eligible for extraction. It is an
+	// explicit opt-in: with AllowAll=false and an empty Allowed list NOTHING
+	// is written (fail-closed). Callers that want everything must say so.
+	AllowAll bool
 	// Allowed restricts extraction to entries within these workspace-relative
-	// slash paths ("" or "." means the whole archive). Entries outside the
-	// roots are validated but not written.
+	// slash paths. It is consulted only when AllowAll is false: entries
+	// outside the roots are validated but not written, and an empty list
+	// writes nothing.
 	Allowed []string
 }
 
+// DefaultLimits returns the default resource bounds. AllowAll is left false
+// on purpose: the zero/default value is fail-closed (nothing is written), so
+// every caller must explicitly opt in to whole-archive extraction with
+// AllowAll=true or list the roots it wants in Allowed.
 func DefaultLimits() ExtractLimits {
 	return ExtractLimits{
 		MaxArchiveBytes:     4 << 30,
@@ -160,8 +169,11 @@ func cleanBeneath(rel string) (string, error) {
 }
 
 // CappedWriter limits the total number of bytes written to the underlying
-// writer. A limit <= 0 disables the cap. Once the budget is exhausted,
-// Write returns ErrCapExceeded.
+// writer. A limit <= 0 disables the cap. Once the budget is exhausted, Write
+// returns ErrCapExceeded — but only after the final partial chunk was written
+// and its result inspected: an underlying write error is propagated
+// unchanged, and a short write with a nil error becomes io.ErrShortWrite, so
+// a sink failure can never be masked by the cap signal.
 type CappedWriter struct {
 	w         io.Writer
 	limit     int64
@@ -185,8 +197,17 @@ func (c *CappedWriter) Write(p []byte) (int, error) {
 		return 0, fmt.Errorf("%w: limit %d bytes", ErrCapExceeded, c.limit)
 	}
 	if int64(len(p)) > c.remaining {
-		n, _ := c.w.Write(p[:c.remaining])
+		chunk := p[:c.remaining]
+		n, err := c.w.Write(chunk)
 		c.remaining -= int64(n)
+		if err != nil {
+			// The underlying writer failed: its error wins over the cap
+			// signal, never the other way around.
+			return n, err
+		}
+		if n < len(chunk) {
+			return n, io.ErrShortWrite
+		}
 		return n, fmt.Errorf("%w: limit %d bytes", ErrCapExceeded, c.limit)
 	}
 	n, err := c.w.Write(p)
@@ -202,12 +223,21 @@ func (c *CappedWriter) Write(p []byte) (int, error) {
 // final files are opened O_CREAT|O_EXCL|O_NOFOLLOW. Every component is thus
 // re-verified at open time, and the root itself was opened no-follow and
 // canonicalized once.
+//
+// Which entries are written is explicit: limits.AllowAll writes the whole
+// archive, otherwise only entries under limits.Allowed are written; with
+// AllowAll=false and an empty Allowed list every entry is validated and
+// skipped (fail-closed). The compressed input is bounded continuously below
+// gzip by MaxArchiveBytes, so a single oversized member cannot bypass it.
 func Extract(root *Root, r io.Reader, limits ExtractLimits) (*ExtractStats, error) {
 	if root == nil || root.F == nil {
 		return nil, fmt.Errorf("safefs: nil extraction root")
 	}
 	limits = applyDefaults(limits)
-	compressed := &countReader{r: r}
+	// The compressed-byte budget is enforced on EVERY read below gzip, not at
+	// tar-entry boundaries: a single member can consume the whole budget
+	// inside writeFileNoFollow with no further header to trigger a check.
+	compressed := newBoundedArchiveReader(r, limits.MaxArchiveBytes)
 	gz, err := gzip.NewReader(compressed)
 	if err != nil {
 		return nil, fmt.Errorf("safefs: gzip: %w", err)
@@ -225,9 +255,6 @@ func Extract(root *Root, r io.Reader, limits ExtractLimits) (*ExtractStats, erro
 		if err != nil {
 			return stats, fmt.Errorf("safefs: tar: %w", err)
 		}
-		if compressed.n > limits.MaxArchiveBytes {
-			return stats, ErrLimits
-		}
 		if expanded > limits.MaxExpandedBytes {
 			return stats, ErrLimits
 		}
@@ -242,7 +269,7 @@ func Extract(root *Root, r io.Reader, limits ExtractLimits) (*ExtractStats, erro
 			return stats, ErrLimits
 		}
 		expanded += stats0
-		if compressed.n > 0 && expanded > int64(limits.MaxCompressionRatio)*compressed.n {
+		if compressed.read > 0 && expanded > int64(limits.MaxCompressionRatio)*compressed.read {
 			return stats, ErrCompression
 		}
 		if int64(len(seen)) >= limits.MaxEntries {
@@ -267,7 +294,7 @@ func Extract(root *Root, r io.Reader, limits ExtractLimits) (*ExtractStats, erro
 		if h.Typeflag != tar.TypeReg && h.Typeflag != tar.TypeDir {
 			return stats, fmt.Errorf("%w: entry %q has type %v", ErrUnsafeEntry, name, h.Typeflag)
 		}
-		allowed := underAllowed(name, limits.Allowed)
+		allowed := underAllowed(name, limits)
 		if !allowed {
 			stats.Skipped++
 			if h.Typeflag == tar.TypeReg {
@@ -431,15 +458,16 @@ func pathDepth(name string) int {
 	return strings.Count(name, "/") + 1
 }
 
-func underAllowed(name string, roots []string) bool {
-	if len(roots) == 0 {
+// underAllowed reports whether name may be written under limits. AllowAll is
+// the only whole-archive switch; when it is false an empty Allowed list
+// matches nothing (fail-closed), and no Allowed entry — including "" or "."
+// — silently widens the set.
+func underAllowed(name string, limits ExtractLimits) bool {
+	if limits.AllowAll {
 		return true
 	}
-	for _, r := range roots {
+	for _, r := range limits.Allowed {
 		r = path.Clean(strings.TrimSpace(r))
-		if r == "" || r == "." {
-			return true
-		}
 		if name == r || strings.HasPrefix(name, r+"/") {
 			return true
 		}
@@ -447,15 +475,56 @@ func underAllowed(name string, roots []string) bool {
 	return false
 }
 
-type countReader struct {
-	r io.Reader
-	n int64
+// boundedArchiveReader enforces the compressed-archive budget below gzip: it
+// never delivers more than max bytes to the decompressor, and once the budget
+// is spent it probes the source exactly once. A clean EOF there permits
+// io.EOF (the archive ended exactly at the bound); any byte still present is
+// an ErrLimits violation and is never delivered to gzip. The error is latched
+// so a decompressor that keeps reading after the violation sees the same
+// error without further source reads.
+type boundedArchiveReader struct {
+	r    io.Reader
+	max  int64
+	read int64
+	eof  bool
+	err  error
 }
 
-func (c *countReader) Read(p []byte) (int, error) {
-	n, err := c.r.Read(p)
-	c.n += int64(n)
-	return n, err
+func newBoundedArchiveReader(r io.Reader, max int64) *boundedArchiveReader {
+	if max < 0 {
+		max = 0
+	}
+	return &boundedArchiveReader{r: r, max: max}
+}
+
+func (b *boundedArchiveReader) Read(p []byte) (int, error) {
+	if b.err != nil {
+		return 0, b.err
+	}
+	if b.read < b.max {
+		if remaining := b.max - b.read; int64(len(p)) > remaining {
+			p = p[:remaining]
+		}
+		n, err := b.r.Read(p)
+		b.read += int64(n)
+		if err == io.EOF {
+			b.eof = true
+		}
+		return n, err
+	}
+	if b.eof {
+		return 0, io.EOF
+	}
+	var probe [1]byte
+	n, err := b.r.Read(probe[:])
+	if n > 0 {
+		b.err = fmt.Errorf("%w: compressed archive exceeds %d bytes", ErrLimits, b.max)
+		return 0, b.err
+	}
+	if err == io.EOF {
+		b.eof = true
+	}
+	return 0, err
 }
 
 // WriteTarGz writes a deterministic tar.gz of the given workspace-relative

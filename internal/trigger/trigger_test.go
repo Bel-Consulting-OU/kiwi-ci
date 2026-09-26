@@ -152,11 +152,11 @@ func TestMatchesPaths(t *testing.T) {
 		"push": {Paths: []string{"src/**"}},
 	}
 	ec := push()
-	ec.ChangedFiles = []string{"src/main.go"}
+	ec.ChangedFiles = forge.ChangedFilesResult{Files: []string{"src/main.go"}, Complete: true}
 	if ok, _ := Matches(triggers, ec); !ok {
 		t.Fatal("matching path rejected")
 	}
-	ec.ChangedFiles = []string{"docs/readme.md"}
+	ec.ChangedFiles = forge.ChangedFilesResult{Files: []string{"docs/readme.md"}, Complete: true}
 	if ok, _ := Matches(triggers, ec); ok {
 		t.Fatal("non-matching path accepted")
 	}
@@ -172,7 +172,11 @@ func TestMatchesMirrorsForge(t *testing.T) {
 	cases := []forge.EventContext{
 		push(),
 		func() forge.EventContext { ec := push(); ec.Ref = "refs/heads/feature"; return ec }(),
-		func() forge.EventContext { ec := push(); ec.ChangedFiles = []string{"docs/x"}; return ec }(),
+		func() forge.EventContext {
+			ec := push()
+			ec.ChangedFiles = forge.ChangedFilesResult{Files: []string{"docs/x"}, Complete: true}
+			return ec
+		}(),
 		func() forge.EventContext { ec := push(); ec.Event = "pull_request"; ec.Action = "opened"; return ec }(),
 		func() forge.EventContext {
 			ec := push()

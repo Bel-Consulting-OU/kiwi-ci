@@ -14,9 +14,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/config"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
@@ -32,6 +34,13 @@ const (
 // before the next token issuance rotates it. Tests shorten it to force a
 // rotation.
 var oidcActiveKeyMaxAge = 30 * 24 * time.Hour
+
+// oidcBeforeCommitHook is a TEST-ONLY seam: when non-nil it runs after the
+// preliminary authentication and signing work and immediately before the
+// final commit-time issuance transaction, so race tests can interleave a
+// concurrent cancel/complete/revoke/audience change in exactly that window.
+// Production code never sets it.
+var oidcBeforeCommitHook func()
 
 // oidcPreviousKeyRetireAfter is how long a rotated-out signing key remains
 // advertised in the JWKS so tokens it signed stay verifiable.
@@ -689,7 +698,14 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "audience is required", http.StatusBadRequest)
 		return
 	}
-	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	token, hasBearer := auth.ParseBearer(r.Header.Get("Authorization"))
+	if !hasBearer {
+		// A header without the exact "Bearer " scheme is not a lease token
+		// presentation (the pre-fix TrimPrefix accepted the raw header as the
+		// token); answer the same 401 as a wrong token, before any store read.
+		http.Error(w, "invalid job token", http.StatusUnauthorized)
+		return
+	}
 	now := time.Now().UTC()
 	// DB mode: the store is the source of truth for the lease/audience
 	// checks; the in-memory maps are only the dev-mode mirror.
@@ -775,14 +791,138 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, r, err, "")
 		return
 	}
-	// The audit trail records the issuance before the token is returned; a
-	// persistence failure fails the issuance closed (no log-and-continue).
-	if err := s.auditOIDCIssuance(r, j.LeaseRunnerID, j.RunID, j.ID, signer.KID, j.Key, in.Audience); err != nil {
-		http.Error(w, "OIDC issuance audit failed", http.StatusInternalServerError)
+	// FINAL AUTHORITY. The preliminary read authorized the request cheaply,
+	// but the signer work above (shared key-ring refresh and a possible
+	// rotation fence) can span seconds, and a concurrent cancel/complete/
+	// revoke could land in that window. The commit re-evaluates the ENTIRE
+	// issuance predicate against the authoritative job with the durable audit
+	// append in one atomic unit (PostgreSQL: job row locked FOR UPDATE;
+	// memory/fs: s.mu held), and cross-checks the candidate claims against
+	// the locked identity. The already-signed JWT is discarded on any
+	// refusal, so no credential leaves the server without the durable audit.
+	if oidcBeforeCommitHook != nil {
+		oidcBeforeCommitHook()
+	}
+	req := storage.OIDCIssuance{
+		JobID:           j.ID,
+		RunnerID:        j.LeaseRunnerID,
+		LeaseGeneration: j.LeaseGeneration,
+		LeaseTokenHash:  j.LeaseTokenHash,
+		Audience:        in.Audience,
+		KID:             signer.KID,
+		JTI:             jti,
+		IssuedAt:        now,
+		ExpiresAt:       now.Add(5 * time.Minute),
+		Claims: map[string]string{
+			storage.OIDCClaimJobID:        j.ID,
+			storage.OIDCClaimRunID:        j.RunID,
+			storage.OIDCClaimJob:          j.Key,
+			storage.OIDCClaimRepositoryID: repoID,
+			storage.OIDCClaimRepository:   run.RepoFullName,
+			storage.OIDCClaimTrusted:      strconv.FormatBool(j.Trusted),
+			storage.OIDCClaimAudience:     in.Audience,
+		},
+	}
+	if err := s.commitOIDCIssuance(r.Context(), req); err != nil {
+		s.oidcIssuanceRefusal(w, r, err)
 		return
 	}
 	s.metricAdd("kiwi_oidc_issues_total", 1, nil)
 	writeJSON(w, 200, map[string]any{"value": jwt, "expires_at": now.Add(5 * time.Minute)})
+}
+
+// errOIDCIssuanceStoreUnsupported reports a DB-mode store that cannot commit
+// issuances transactionally. It is a wiring failure (the startup capability
+// check refuses such a store) and is answered 503, never by minting without
+// the audit.
+var errOIDCIssuanceStoreUnsupported = errors.New("server: database store lacks LeaseOIDCIssueStore")
+
+// errOIDCIssuanceAudit marks a failure to mint or durably append the
+// oidc.issued audit event on the in-process (memory/fs) commit path. The
+// handler answers 500 with an "audit failed" body so the refusal is
+// diagnosable, and the token is never returned.
+var errOIDCIssuanceAudit = errors.New("OIDC issuance audit failed")
+
+// commitOIDCIssuance runs the commit-time issuance authority for the server's
+// storage mode: DB mode delegates to the store's transactional
+// CommitOIDCIssuance (optional interface), while memory/fs mode executes the
+// identical predicate, claim binding and audit append under s.mu.
+func (s *Server) commitOIDCIssuance(ctx context.Context, req storage.OIDCIssuance) error {
+	if s.DB != nil {
+		store, ok := s.DB.(storage.LeaseOIDCIssueStore)
+		if !ok {
+			return errOIDCIssuanceStoreUnsupported
+		}
+		_, err := store.CommitOIDCIssuance(ctx, req)
+		return err
+	}
+	_, err := s.commitOIDCIssuanceLocked(req)
+	return err
+}
+
+// commitOIDCIssuanceLocked is the memory/fs-mode issuance authority. The
+// authoritative job, the predicate, the claim binding and the durable audit
+// append all happen inside ONE s.mu critical section, so a concurrent server
+// mutation (cancel/complete/revoke/re-lease) can never interleave between the
+// check and the audit. A store without an audit sink (pure in-memory dev
+// mode) has no durable trail to require; every store-backed mode appends the
+// event and fails the issuance closed when the append fails.
+func (s *Server) commitOIDCIssuanceLocked(req storage.OIDCIssuance) (storage.LockedOIDCIdentity, error) {
+	if err := storage.ValidateOIDCIssuanceRequest(req); err != nil {
+		return storage.LockedOIDCIdentity{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j, ok := s.jobs[req.JobID]
+	if !ok {
+		return storage.LockedOIDCIdentity{}, storage.ErrNotFound
+	}
+	locked := storage.LockedOIDCIdentityForJob(j)
+	if err := storage.ValidateOIDCIssuance(locked, req); err != nil {
+		return storage.LockedOIDCIdentity{}, err
+	}
+	auditID, err := newID()
+	if err != nil {
+		return storage.LockedOIDCIdentity{}, fmt.Errorf("%w: %v", errOIDCIssuanceAudit, err)
+	}
+	ev := storage.OIDCIssuanceAuditEvent(req, auditID)
+	if s.store != nil {
+		if err := s.store.AppendAudit(ev); err != nil {
+			return storage.LockedOIDCIdentity{}, fmt.Errorf("%w: %v", errOIDCIssuanceAudit, err)
+		}
+	}
+	return locked, nil
+}
+
+// oidcIssuanceRefusal maps a commit-time issuance refusal onto its HTTP
+// response: a vanished job is 404; audience/trust/permission refusals are
+// 403; every lease or claim-identity refusal is 409 (the same semantics as a
+// stale lease at request start); an unsupported store is 503. Anything else
+// is a server-side failure answered 500 — never a token.
+func (s *Server) oidcIssuanceRefusal(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, storage.ErrNotFound):
+		http.NotFound(w, r)
+	case errors.Is(err, storage.ErrOIDCIssuanceUntrusted):
+		http.Error(w, "untrusted jobs may not issue id_tokens", http.StatusForbidden)
+	case errors.Is(err, storage.ErrOIDCIssuanceNotAllowed):
+		http.Error(w, "job does not have permissions.id_token", http.StatusForbidden)
+	case errors.Is(err, storage.ErrOIDCIssuanceAudience):
+		http.Error(w, "audience not allowed for this job", http.StatusForbidden)
+	case errors.Is(err, storage.ErrOIDCIssuanceRevoked),
+		errors.Is(err, storage.ErrOIDCIssuanceRunner),
+		errors.Is(err, storage.ErrOIDCIssuanceGeneration),
+		errors.Is(err, storage.ErrOIDCIssuanceToken),
+		errors.Is(err, storage.ErrOIDCIssuanceExpired),
+		errors.Is(err, storage.ErrOIDCIssuanceIdentity):
+		http.Error(w, "job lease is not active", http.StatusConflict)
+	case errors.Is(err, errOIDCIssuanceStoreUnsupported):
+		s.serverError(w, r, http.StatusServiceUnavailable, err, "OIDC issuance store unavailable")
+	case errors.Is(err, errOIDCIssuanceAudit):
+		s.internalError(w, r, err, "OIDC issuance audit failed")
+	default:
+		s.internalError(w, r, err, "OIDC issuance failed")
+	}
 }
 
 // auditOIDCIssuance appends the oidc.issued audit event (kid, audience —

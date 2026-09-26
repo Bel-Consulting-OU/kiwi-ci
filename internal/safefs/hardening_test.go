@@ -25,6 +25,7 @@ func TestExtractEntryCapBoundary(t *testing.T) {
 		return tarGz(t, entries)
 	}
 	limits := DefaultLimits()
+	limits.AllowAll = true
 	limits.MaxEntries = 4096
 	if err := extractWith(t, mk(4096), t.TempDir(), limits); err != nil {
 		t.Fatalf("archive with exactly MaxEntries entries must extract: %v", err)
@@ -49,11 +50,13 @@ func TestExtractCompressionRatioBoundary(t *testing.T) {
 		t.Fatalf("test archive %d bytes; expected the whole compressed stream to be buffered", len(data))
 	}
 	at := DefaultLimits()
+	at.AllowAll = true
 	at.MaxCompressionRatio = 1 // 2000 expanded <= 1 x total compressed bytes
 	if err := extractWith(t, data, t.TempDir(), at); err != nil {
 		t.Fatalf("expanded size at the ratio limit must extract: %v", err)
 	}
 	below := DefaultLimits()
+	below.AllowAll = true
 	below.MaxCompressionRatio = 0.5 // int64 truncation: any expansion exceeds the budget
 	if err := extractWith(t, data, t.TempDir(), below); !errors.Is(err, ErrCompression) {
 		t.Fatalf("ratio below the limit: want ErrCompression, got %v", err)
@@ -98,10 +101,12 @@ func TestExtractRejectsWindowsDangerousNames(t *testing.T) {
 		"console.txt", "complex", "a.b", "COM10", "LPT0", "auxiliary",
 		"a b", "dir/file", "a-B_c.d",
 	}
+	goodLimits := DefaultLimits()
+	goodLimits.AllowAll = true
 	for _, name := range good {
 		dest := t.TempDir()
 		data := tarGz(t, []tarEntry{{name: name, data: []byte("x"), typeflag: tar.TypeReg}})
-		if err := extractWith(t, data, dest, DefaultLimits()); err != nil {
+		if err := extractWith(t, data, dest, goodLimits); err != nil {
 			t.Errorf("name %q must extract, got %v", name, err)
 		}
 	}

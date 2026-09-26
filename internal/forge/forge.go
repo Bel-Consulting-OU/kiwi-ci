@@ -42,8 +42,12 @@ type EventContext struct {
 	HeadRepository Repository // repository to clone
 	Trusted        bool
 	Draft          bool
-	Tag            string   // tag name when Ref is refs/tags/...
-	ChangedFiles   []string // server-fetched list when available
+	Tag            string // tag name when Ref is refs/tags/...
+	// ChangedFiles is the changed-file diff for this event together with
+	// its completeness. It is part of the matching contract: include-path
+	// triggers never match unless Complete is true, so the matcher cannot
+	// be evaluated fail-open by a caller that leaves the diff unknown.
+	ChangedFiles ChangedFilesResult
 }
 
 // CheckAnnotation is one annotation attached to a GitHub check run output.
@@ -133,9 +137,28 @@ const (
 	maxAPIErrorBodyBytes = 4096
 )
 
+// ReasonChangedFilesIncomplete is the MatchResult.Reason reported when a
+// trigger declaring include-path filters (`paths`) cannot be evaluated
+// because EventContext.ChangedFiles is not the authoritative complete diff.
+// Matching fails closed in that case: the trigger does not match and the
+// caller must not enqueue a run.
+const ReasonChangedFilesIncomplete = "changed files incomplete: include-path trigger not evaluated"
+
+// MatchResult is the detailed outcome of EvaluateTrigger. Reason is
+// non-empty only for a fail-closed non-match (ReasonChangedFilesIncomplete);
+// callers log it and must not enqueue a run.
+type MatchResult struct {
+	Matched bool
+	Key     string
+	Reason  string
+}
+
 // MatchesTrigger evaluates a pipeline's `on` section against a webhook
 // event. It returns whether the event should enqueue a run and the trigger
-// key that matched ("" for the empty-section fallback).
+// key that matched ("" for the empty-section fallback). It is the
+// convenience form of EvaluateTrigger, which additionally reports the
+// fail-closed reason for path-filtered triggers evaluated against an
+// incomplete changed-file diff.
 //
 // Semantics:
 //   - An empty/missing `on` section matches everything (backwards compat).
@@ -161,12 +184,29 @@ const (
 //     For pull_request/merge_request events the branch filters match
 //     ec.BaseRef — the TARGET branch the adapters supply — never the head
 //     branch; push events match ec.Ref.
-//   - Paths: pipeline.PathsMatch over ec.ChangedFiles. With no changed-file
-//     data, paths filters cannot be evaluated and are treated as matching
-//     (consistent with pipeline.PathsMatch's empty-list behavior).
+//   - Paths: include-path filters (`paths`) are fail-closed. They evaluate
+//     pipeline.PathsMatch over ec.ChangedFiles.Files only when
+//     ec.ChangedFiles.Complete is true; a partial, truncated, fallback or
+//     unknown diff never matches, even when it happens to contain a
+//     matching path (EvaluateTrigger reports
+//     ReasonChangedFilesIncomplete). `paths_ignore` alone is deliberately
+//     best-effort: it is evaluated against whatever ec.ChangedFiles.Files
+//     is present, so an unknown or empty diff admits the event rather than
+//     silently skipping work on incomplete data, while a diff that does
+//     contain an ignored path still rejects it.
 func MatchesTrigger(triggers map[string]pipeline.Trigger, ec EventContext) (bool, string) {
+	res := EvaluateTrigger(triggers, ec)
+	return res.Matched, res.Key
+}
+
+// EvaluateTrigger evaluates MatchesTrigger's semantics and additionally
+// reports the fail-closed reason. Reason is non-empty only when a trigger
+// with include-path filters matched every non-path rule but the changed-file
+// diff is not authoritative (ReasonChangedFilesIncomplete); Matched is false
+// in that case and the caller must not enqueue.
+func EvaluateTrigger(triggers map[string]pipeline.Trigger, ec EventContext) MatchResult {
 	if len(triggers) == 0 {
-		return true, ""
+		return MatchResult{Matched: true}
 	}
 	key := ec.Event
 	if ec.Event == "merge_request" {
@@ -189,13 +229,13 @@ func MatchesTrigger(triggers map[string]pipeline.Trigger, ec EventContext) (bool
 		trg = t
 		matched = key
 	} else {
-		return false, ""
+		return MatchResult{}
 	}
 	if len(trg.Actions) > 0 && !matchAction(trg.Actions, ec.Action) {
-		return false, ""
+		return MatchResult{}
 	}
 	if trg.Draft != nil && *trg.Draft != ec.Draft {
-		return false, ""
+		return MatchResult{}
 	}
 	tagRef := ec.Tag != "" || strings.HasPrefix(ec.Ref, "refs/tags/")
 	if tagRef {
@@ -207,14 +247,14 @@ func MatchesTrigger(triggers map[string]pipeline.Trigger, ec EventContext) (bool
 			// No tag filters: tag refs only match triggers with no ref
 			// filters at all; branch filters never admit tags.
 			if len(trg.Branches) > 0 || len(trg.BranchesIgnore) > 0 {
-				return false, ""
+				return MatchResult{}
 			}
 		} else {
 			if len(trg.Tags) > 0 && !matchRefPatterns(name, trg.Tags) {
-				return false, ""
+				return MatchResult{}
 			}
 			if matchRefPatterns(name, trg.TagsIgnore) {
-				return false, ""
+				return MatchResult{}
 			}
 		}
 	} else {
@@ -228,21 +268,35 @@ func MatchesTrigger(triggers map[string]pipeline.Trigger, ec EventContext) (bool
 		// ref must not match it, symmetric with the branch-only rejection
 		// of tag refs above.
 		if len(trg.Branches) == 0 && len(trg.BranchesIgnore) == 0 && (len(trg.Tags) > 0 || len(trg.TagsIgnore) > 0) {
-			return false, ""
+			return MatchResult{}
 		}
 		if len(trg.Branches) > 0 && !matchRefPatterns(branch, trg.Branches) {
-			return false, ""
+			return MatchResult{}
 		}
 		if matchRefPatterns(branch, trg.BranchesIgnore) {
-			return false, ""
+			return MatchResult{}
 		}
 	}
-	if len(trg.Paths) > 0 || len(trg.PathsIgnore) > 0 {
-		if !pipeline.PathsMatch(ec.ChangedFiles, trg.Paths, trg.PathsIgnore) {
-			return false, ""
+	if len(trg.Paths) > 0 {
+		// Include-path filters are fail-closed: without an authoritative
+		// complete diff the trigger cannot be evaluated, so it must not
+		// match. This invariant lives here, not in a caller wrapper.
+		if !ec.ChangedFiles.Complete {
+			return MatchResult{Reason: ReasonChangedFilesIncomplete}
+		}
+		if !pipeline.PathsMatch(ec.ChangedFiles.Files, trg.Paths, trg.PathsIgnore) {
+			return MatchResult{}
+		}
+	} else if len(trg.PathsIgnore) > 0 {
+		// Deliberate best-effort override: an ignore-only trigger is
+		// evaluated against whatever diff is present. An unknown or empty
+		// diff cannot prove an ignored path changed, so the event is
+		// admitted; a visible ignored path still rejects it.
+		if !pipeline.PathsMatch(ec.ChangedFiles.Files, nil, trg.PathsIgnore) {
+			return MatchResult{}
 		}
 	}
-	return true, matched
+	return MatchResult{Matched: true, Key: matched}
 }
 
 func isPullRequestEvent(event string) bool {

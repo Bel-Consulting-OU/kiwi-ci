@@ -244,15 +244,81 @@ func TestWebSessionSecretConfiguration(t *testing.T) {
 	}
 }
 
-// TestWebLogoutRequiresNoAuthButClearsTheCookie pins the logout contract:
-// it is public (no token), returns no session material, and clears the
-// cookie with MaxAge<0.
-func TestWebLogoutRequiresNoAuthButClearsTheCookie(t *testing.T) {
+// TestWebLogoutGETIsMethodNotAllowed pins the method contract: logout is a
+// state-changing POST, so the read method is answered 405 (with an explicit
+// Allow header) and touches no session state.
+func TestWebLogoutGETIsMethodNotAllowed(t *testing.T) {
 	s := testWebServer(t, "admin-token")
+	cookie, csrf, code := login(t, s, "admin-token")
+	if code != http.StatusOK {
+		t.Fatalf("login = %d", code)
+	}
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/logout", nil))
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/logout", nil)
+	r.Header.Set("Cookie", webSessionCookie+"="+cookie)
+	r.Header.Set(webCSRFHeader, csrf)
+	s.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET logout = %d, want 405", w.Code)
+	}
+	if allow := w.Header().Get("Allow"); !strings.Contains(allow, http.MethodPost) {
+		t.Fatalf("GET logout Allow = %q, want POST", allow)
+	}
+	if set := w.Header().Get("Set-Cookie"); set != "" {
+		t.Fatalf("GET logout must not touch the session cookie: %q", set)
+	}
+}
+
+// TestWebLogoutRequiresSessionCSRFAndClearsTheCookie pins the logout contract:
+// the route no longer changes state on GET, and POST is a cookie-authenticated
+// mutation that requires the double-submit CSRF token. Without the session
+// cookie and its matching X-Kiwi-CSRF header the request is refused 403 before
+// the cookie is touched; with both, the cookie is cleared (MaxAge<0) and no
+// token material is returned.
+func TestWebLogoutRequiresSessionCSRFAndClearsTheCookie(t *testing.T) {
+	s := testWebServer(t, "admin-token")
+	cookie, csrf, code := login(t, s, "admin-token")
+	if code != http.StatusOK {
+		t.Fatalf("login = %d", code)
+	}
+	post := func(cookie, csrf string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodPost, "/api/v1/logout", nil)
+		if cookie != "" {
+			r.Header.Set("Cookie", webSessionCookie+"="+cookie)
+		}
+		if csrf != "" {
+			r.Header.Set(webCSRFHeader, csrf)
+		}
+		s.Handler().ServeHTTP(w, r)
+		return w
+	}
+
+	// No session and no CSRF: refused like any unauthenticated mutation.
+	if w := post("", ""); w.Code != http.StatusForbidden {
+		t.Fatalf("anonymous POST logout = %d, want 403", w.Code)
+	}
+	// The session cookie alone is not enough: the header must carry the
+	// matching double-submit token, and a refused logout never clears it.
+	for _, csrfValue := range []string{"", "bogus|0"} {
+		w := post(cookie, csrfValue)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("POST logout with csrf=%q = %d, want 403", csrfValue, w.Code)
+		}
+		if set := w.Header().Get("Set-Cookie"); set != "" {
+			t.Fatalf("refused logout touched the cookie: %q", set)
+		}
+	}
+	// A CSRF token without its session cookie can never validate.
+	if w := post("", csrf); w.Code != http.StatusForbidden {
+		t.Fatalf("POST logout with csrf but no session = %d, want 403", w.Code)
+	}
+
+	// Session + matching CSRF: the cookie is cleared and no session
+	// material is returned.
+	w := post(cookie, csrf)
 	if w.Code != http.StatusOK {
-		t.Fatalf("logout = %d", w.Code)
+		t.Fatalf("POST logout = %d, want 200", w.Code)
 	}
 	setCookie := w.Header().Get("Set-Cookie")
 	for _, want := range []string{webSessionCookie + "=;", "Max-Age=0", "HttpOnly", "Secure", "SameSite=Strict"} {

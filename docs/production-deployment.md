@@ -299,6 +299,48 @@ The Woodpecker instance hosting it must be configured so CI reflects reality:
   (`KIWI_PUSH_CONTEXTS`), and does not install them as required checks.
 - The clone plugin and every workflow image are pinned by OCI digest.
 
+### Required-check governance
+
+Woodpecker publishes one commit status per workflow and event, not one per
+step, so branch protection on `main` requires the three pull-request workflow
+contexts (`ci/woodpecker/pr/<workflow>`), not individual lanes. This is the
+intended required-check set and where each lane is enforced:
+
+| Intended check | Enforced by | Gate |
+| --- | --- | --- |
+| unit-linux-amd64 | `unit` step, `linux-amd64` | PR-gating via `ci/woodpecker/pr/linux-amd64` |
+| unit-linux-arm64 | `unit` step, `linux-arm64` | PR-gating via `ci/woodpecker/pr/linux-arm64` |
+| race | `race`/`race-double` (linux-amd64), `race` (linux-arm64) | PR-gating via both contexts |
+| postgres-integration | `integration-postgres` step, `integration-coverage` | PR-gating via `ci/woodpecker/pr/integration-coverage` |
+| adversarial | `adversarial` step, `linux-amd64` | PR-gating via `ci/woodpecker/pr/linux-amd64` |
+| coverage-floor | `coverage` step, `integration-coverage` | PR-gating via `ci/woodpecker/pr/integration-coverage` |
+| staticcheck | `staticcheck` step, `linux-amd64` | PR-gating via `ci/woodpecker/pr/linux-amd64` |
+| govulncheck | `govulncheck` step, `linux-amd64` | PR-gating via `ci/woodpecker/pr/linux-amd64` |
+| non-root | `unit-nonroot` steps, `linux-amd64` and `integration-coverage` | PR-gating via both contexts |
+| release-reproducibility | `repro` step, `linux-amd64` | PR-gating via `ci/woodpecker/pr/linux-amd64`; re-run by release promotion on the tag |
+| windows | `native-windows` workflow | Post-merge/release only: push/manual/tag, never a required PR check |
+| macos | `native-macos` workflow | Post-merge/release only: push/manual/tag, never a required PR check |
+| docker-integration | `docker-workspace` workflow | Post-merge only: push/manual/tag (host Docker socket, trusted events; see above) |
+
+Only the three `pr/*` contexts are installed as required checks. The native
+and Docker-socket lanes are deliberately unrequirable on pull requests: a fork
+PR never schedules them, so requiring them would leave every fork PR waiting
+forever. The context list in `scripts/gh-branch-protection.sh` is validated
+against each workflow's `when` events by `go test ./internal/workflowguard/`.
+
+Apply or refresh protection with repository-admin credentials:
+
+```bash
+make protect-branch          # = ./scripts/gh-branch-protection.sh
+```
+
+It targets `Bel-Consulting-OU/kiwi-ci@main` by default; override with
+`KIWI_REPO` and `KIWI_BRANCH`. The script refuses to install any context it
+has not observed on a recent commit, so a Woodpecker status-format drift
+cannot silently weaken (or brick) protection. Do not run it against the live
+repository without the operator's intent: it rewrites the branch-protection
+rule.
+
 ## Native and local CI agents
 
 The native macOS and Windows workflows run on Woodpecker's local backend,

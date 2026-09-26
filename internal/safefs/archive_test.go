@@ -48,7 +48,9 @@ type tarEntry struct {
 
 func extract(t *testing.T, data []byte, dest string) error {
 	t.Helper()
-	return extractWith(t, data, dest, DefaultLimits())
+	limits := DefaultLimits()
+	limits.AllowAll = true
+	return extractWith(t, data, dest, limits)
 }
 
 func extractWith(t *testing.T, data []byte, dest string, limits ExtractLimits) error {
@@ -178,6 +180,7 @@ func TestExtractRejectsCompressionBomb(t *testing.T) {
 	big := bytes.Repeat([]byte("A"), 64<<20)
 	data := tarGz(t, []tarEntry{{name: "bomb", data: big, typeflag: tar.TypeReg}})
 	limits := DefaultLimits()
+	limits.AllowAll = true
 	limits.MaxCompressionRatio = 10 // 64MiB zeros compress far beyond 10x
 	if err := extractWith(t, data, dest, limits); err == nil {
 		t.Fatal("expected compression ratio rejection")
@@ -188,6 +191,7 @@ func TestExtractEnforcesFileLimit(t *testing.T) {
 	dest := t.TempDir()
 	data := tarGz(t, []tarEntry{{name: "big", data: bytes.Repeat([]byte("B"), 1024), typeflag: tar.TypeReg}})
 	limits := DefaultLimits()
+	limits.AllowAll = true
 	limits.MaxFileBytes = 512
 	if err := extractWith(t, data, dest, limits); err == nil {
 		t.Fatal("expected file size limit rejection")
@@ -211,6 +215,7 @@ func TestExtractEnforcesEntryLimit(t *testing.T) {
 	}
 	data := tarGz(t, entries)
 	limits := DefaultLimits()
+	limits.AllowAll = true
 	limits.MaxEntries = 5
 	if err := extractWith(t, data, dest, limits); err == nil {
 		t.Fatal("expected entry count rejection")
@@ -280,7 +285,9 @@ func TestExtractPathShimStillWorks(t *testing.T) {
 		{name: "dir/", typeflag: tar.TypeDir},
 		{name: "dir/file.txt", data: []byte("hello"), typeflag: tar.TypeReg},
 	})
-	if _, err := ExtractPath(dest, bytes.NewReader(data), DefaultLimits()); err != nil {
+	limits := DefaultLimits()
+	limits.AllowAll = true
+	if _, err := ExtractPath(dest, bytes.NewReader(data), limits); err != nil {
 		t.Fatal(err)
 	}
 	if b, err := os.ReadFile(filepath.Join(dest, "dir", "file.txt")); err != nil || string(b) != "hello" {
@@ -396,7 +403,9 @@ func TestExtractParentSwapNeverEscapes(t *testing.T) {
 		}
 	}()
 
-	stats, err := Extract(root, bytes.NewReader(data), DefaultLimits())
+	limits := DefaultLimits()
+	limits.AllowAll = true
+	stats, err := Extract(root, bytes.NewReader(data), limits)
 	close(stop)
 	wg.Wait()
 	if err != nil {

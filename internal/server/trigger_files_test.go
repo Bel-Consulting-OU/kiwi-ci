@@ -37,60 +37,94 @@ func (f *fakeForgeFiles) PublishCheck(context.Context, string, string, string, s
 }
 func (f *fakeForgeFiles) CloneCredentialFor(string) (string, bool) { return "", false }
 
-func TestTriggerFilesFetchFailsClosedOnIncludePaths(t *testing.T) {
+func TestTriggerFilesFetchFetchErrorLeavesDiffUnknown(t *testing.T) {
 	s := New("x")
 	fg := &fakeForgeFiles{err: context.DeadlineExceeded}
-	spec, err := pipeline.Parse([]byte("version: 1\non:\n  push:\n    paths: [\"svc/**\"]\njobs:\n  b:\n    runtime: container\n    image: alpine\n    steps: [{run: echo}]\n"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	ec := forge.EventContext{Event: "push", Repository: forge.Repository{FullName: "o/r"}}
-	if _, _, err := s.triggerFilesFetch(context.Background(), fg, spec, &ec); err == nil {
-		t.Fatal("include-path trigger with unavailable changed files must fail closed")
+	res, err := s.triggerFilesFetch(context.Background(), fg, &ec)
+	if err == nil {
+		t.Fatal("fetch failure must be reported")
+	}
+	if res.Complete || res.Files != nil || ec.ChangedFiles.Complete || ec.ChangedFiles.Files != nil {
+		t.Fatalf("fetch failure must leave the diff unknown: %+v / %+v", res, ec.ChangedFiles)
 	}
 	if fg.calls == 0 {
 		t.Fatal("changed files must be fetched before evaluation")
 	}
 }
 
-func TestTriggerFilesFetchIncompleteIncludePathsFailsClosed(t *testing.T) {
+func TestTriggerFilesFetchIncompleteDiffIsNotPropagated(t *testing.T) {
+	s := New("x")
+	fg := &fakeForgeFiles{files: []string{"svc/main.go"}, complete: false}
+	ec := forge.EventContext{Event: "push", Repository: forge.Repository{FullName: "o/r"}}
+	res, err := s.triggerFilesFetch(context.Background(), fg, &ec)
+	if err != nil {
+		t.Fatalf("an incomplete diff is not a fetch failure: %v", err)
+	}
+	if res.Complete || len(res.Files) != 1 {
+		t.Fatalf("result must report the incomplete diff: %+v", res)
+	}
+	if ec.ChangedFiles.Complete || ec.ChangedFiles.Files != nil {
+		t.Fatalf("partial diffs must not be propagated to the event context: %+v", ec.ChangedFiles)
+	}
+}
+
+func TestEvalTriggerMatchesIncompleteIncludePathsFailsClosed(t *testing.T) {
 	s := New("x")
 	fg := &fakeForgeFiles{files: []string{"svc/main.go"}, complete: false}
 	spec, err := pipeline.Parse([]byte("version: 1\non:\n  push:\n    paths: [\"svc/**\"]\njobs:\n  b:\n    runtime: container\n    image: alpine\n    steps: [{run: echo}]\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	ec := forge.EventContext{Event: "push", Repository: forge.Repository{FullName: "o/r"}}
-	if _, _, err := s.triggerFilesFetch(context.Background(), fg, spec, &ec); err == nil {
-		t.Fatal("include-path trigger with an incomplete diff must fail closed")
+	ec := forge.EventContext{Event: "push", Ref: "refs/heads/main", Repository: forge.Repository{FullName: "o/r"}}
+	ok, _, known, err := s.evalTriggerMatches(context.Background(), fg, spec, &ec)
+	if err == nil || ok || known {
+		t.Fatalf("include-path trigger with an incomplete diff must fail closed: ok=%v known=%v err=%v", ok, known, err)
 	}
 }
 
-func TestTriggerFilesFetchIncompleteIgnoreOnlyProceeds(t *testing.T) {
+func TestEvalTriggerMatchesUnavailableIncludePathsFailsClosed(t *testing.T) {
+	s := New("x")
+	fg := &fakeForgeFiles{err: context.DeadlineExceeded}
+	spec, err := pipeline.Parse([]byte("version: 1\non:\n  push:\n    paths: [\"svc/**\"]\njobs:\n  b:\n    runtime: container\n    image: alpine\n    steps: [{run: echo}]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ec := forge.EventContext{Event: "push", Ref: "refs/heads/main", Repository: forge.Repository{FullName: "o/r"}}
+	ok, _, known, err := s.evalTriggerMatches(context.Background(), fg, spec, &ec)
+	if err == nil || ok || known {
+		t.Fatalf("include-path trigger with an unfetchable diff must fail closed: ok=%v known=%v err=%v", ok, known, err)
+	}
+}
+
+func TestEvalTriggerMatchesIncompleteIgnoreOnlyProceeds(t *testing.T) {
 	s := New("x")
 	fg := &fakeForgeFiles{files: []string{"svc/main.go"}, complete: false}
 	spec, err := pipeline.Parse([]byte("version: 1\non:\n  push:\n    paths_ignore: [\"docs/**\"]\njobs:\n  b:\n    runtime: container\n    image: alpine\n    steps: [{run: echo}]\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	ec := forge.EventContext{Event: "push", Repository: forge.Repository{FullName: "o/r"}}
-	files, complete, err := s.triggerFilesFetch(context.Background(), fg, spec, &ec)
-	if err != nil || files != nil || complete {
-		t.Fatalf("ignore-only trigger with an incomplete diff must degrade to nil and incomplete, got %v %v %v", files, complete, err)
+	ec := forge.EventContext{Event: "push", Ref: "refs/heads/main", Repository: forge.Repository{FullName: "o/r"}}
+	ok, key, known, err := s.evalTriggerMatches(context.Background(), fg, spec, &ec)
+	if err != nil || !ok || key != "push" || known {
+		t.Fatalf("ignore-only trigger with an incomplete diff must admit best-effort: ok=%v key=%q known=%v err=%v", ok, key, known, err)
+	}
+	if ec.ChangedFiles.Files != nil {
+		t.Fatalf("best-effort admit must not propagate the partial diff: %v", ec.ChangedFiles.Files)
 	}
 }
 
-func TestTriggerFilesFetchBestEffortWithoutIncludePaths(t *testing.T) {
+func TestEvalTriggerMatchesBestEffortWithoutIncludePaths(t *testing.T) {
 	s := New("x")
 	fg := &fakeForgeFiles{err: context.DeadlineExceeded}
 	spec, err := pipeline.Parse([]byte("version: 1\non:\n  push:\n    paths_ignore: [\"docs/**\"]\njobs:\n  b:\n    runtime: container\n    image: alpine\n    steps: [{run: echo}]\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	ec := forge.EventContext{Event: "push", Repository: forge.Repository{FullName: "o/r"}}
-	files, _, err := s.triggerFilesFetch(context.Background(), fg, spec, &ec)
-	if err != nil || files != nil {
-		t.Fatalf("ignore-only trigger must degrade gracefully, got %v %v", files, err)
+	ec := forge.EventContext{Event: "push", Ref: "refs/heads/main", Repository: forge.Repository{FullName: "o/r"}}
+	ok, _, known, err := s.evalTriggerMatches(context.Background(), fg, spec, &ec)
+	if err != nil || !ok || known {
+		t.Fatalf("ignore-only trigger must degrade gracefully on fetch failure: ok=%v known=%v err=%v", ok, known, err)
 	}
 }
 
@@ -109,8 +143,8 @@ func TestEvalTriggerMatchesPopulatesChangedFiles(t *testing.T) {
 	if !known {
 		t.Fatal("a complete fetch must report the changed-files list as known")
 	}
-	if len(ec.ChangedFiles) != 1 || ec.ChangedFiles[0] != "svc/main.go" {
-		t.Fatalf("changed files not populated: %v", ec.ChangedFiles)
+	if len(ec.ChangedFiles.Files) != 1 || ec.ChangedFiles.Files[0] != "svc/main.go" {
+		t.Fatalf("changed files not populated: %v", ec.ChangedFiles.Files)
 	}
 	ec2 := forge.EventContext{Event: "push", Ref: "refs/heads/main", Repository: forge.Repository{FullName: "o/r"}}
 	fg.files = []string{"docs/readme.md"}
@@ -122,8 +156,8 @@ func TestEvalTriggerMatchesPopulatesChangedFiles(t *testing.T) {
 
 // TestWebhookPathFilterIncompleteDiffFailsClosed exercises the full
 // GitHub webhook handler against a forge API whose compare endpoint can
-// never produce a complete diff (three full pages), so an include-path
-// pipeline must fail the webhook closed with 502.
+// never produce a complete diff (three full pages): the matcher fails the
+// include-path trigger closed and the webhook answers 502 without queueing.
 func TestWebhookPathFilterIncompleteDiffFailsClosed(t *testing.T) {
 	const filtered = `version: 1
 on:
@@ -166,5 +200,50 @@ jobs:
 	s.mu.Unlock()
 	if n != 0 {
 		t.Fatalf("incomplete diff enqueued %d runs", n)
+	}
+}
+
+// TestWebhookPathFilterUnfetchableDiffFailsClosed is the fetch-failure
+// sibling: the compare API errors, the matcher still sees an unknown diff,
+// refuses the include-path trigger, and the webhook answers 502 without
+// queueing the job.
+func TestWebhookPathFilterUnfetchableDiffFailsClosed(t *testing.T) {
+	const filtered = `version: 1
+on:
+  push:
+    paths: ["svc/**"]
+jobs:
+  build:
+    runtime: native
+    steps:
+      - run: echo hi
+`
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/contents/.kiwi/pipeline.yaml"):
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"content":  base64.StdEncoding.EncodeToString([]byte(filtered)),
+				"encoding": "base64",
+			})
+		case strings.Contains(r.URL.Path, "/compare/"):
+			http.Error(w, "compare unavailable", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer api.Close()
+	s := New("runner-secret")
+	s.GitHubWebhookSecret = "hunter2"
+	s.gitHubAPIBase = api.URL
+	s.PipelinePath = ".kiwi/pipeline.yaml"
+	w := postWebhook(t, s, "hunter2", "push", "unfetchable-diff", pushPayload("9049f1265b7d61be4a8904a9a27120d2064dab3b"))
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("include-path trigger with an unfetchable diff must fail closed (502), got %d: %s", w.Code, w.Body.String())
+	}
+	s.mu.Lock()
+	n := len(s.runs)
+	s.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("unfetchable diff enqueued %d runs", n)
 	}
 }

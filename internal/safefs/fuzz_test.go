@@ -22,6 +22,7 @@ func fuzzExtractLimits() ExtractLimits {
 		MaxPathLength:       256,
 		MaxDepth:            16,
 		MaxCompressionRatio: 64,
+		AllowAll:            true,
 	}
 }
 

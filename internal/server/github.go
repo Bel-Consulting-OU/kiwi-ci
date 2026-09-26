@@ -110,7 +110,7 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 	// Authoritative changed files were populated by evalTriggerMatches
 	// before trigger evaluation: the runner is never the source of truth,
 	// and include-path triggers fail closed when the list is unobtainable.
-	files := ec.ChangedFiles
+	files := ec.ChangedFiles.Files
 
 	repoID := s.forgeRepoID("github", webhookRepoCoordinate(ec))
 	delivery := r.Header.Get("X-GitHub-Delivery")

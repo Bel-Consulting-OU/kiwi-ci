@@ -578,6 +578,9 @@ func TestClientRestoreMatrix(t *testing.T) {
 			http.Error(w, "cache down", http.StatusInternalServerError)
 		case "nodigest":
 			_, _ = w.Write(payload)
+		case "baddigest":
+			w.Header().Set(HeaderCacheSHA256, "not-a-sha256-digest")
+			_, _ = w.Write(payload)
 		case "wrongdigest":
 			w.Header().Set(HeaderCacheSHA256, strings.Repeat("0", 64))
 			_, _ = w.Write(payload)
@@ -596,10 +599,17 @@ func TestClientRestoreMatrix(t *testing.T) {
 		t.Fatalf("500 = %v, want body", err)
 	}
 
-	// Missing digest header logs and skips verification.
+	// Missing digest header fails closed by default.
+	if _, err := c.Restore(context.Background(), "job", lease, "nodigest"); !errors.Is(err, ErrMissingOrInvalidDigest) {
+		t.Fatalf("missing digest = %v, want ErrMissingOrInvalidDigest", err)
+	}
+
+	// The explicit legacy opt-in logs and skips verification for an ABSENT
+	// header; a malformed value is still rejected.
 	var logged []string
-	c.Logf = func(format string, args ...any) { logged = append(logged, format) }
-	rc, err := c.Restore(context.Background(), "job", lease, "nodigest")
+	legacy := &Client{Server: srv.URL, Token: "tok", AllowUnverifiedLegacyRestore: true,
+		Logf: func(format string, args ...any) { logged = append(logged, format) }}
+	rc, err := legacy.Restore(context.Background(), "job", lease, "nodigest")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -612,6 +622,9 @@ func TestClientRestoreMatrix(t *testing.T) {
 	}
 	if err := rc.Close(); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := legacy.Restore(context.Background(), "job", lease, "baddigest"); !errors.Is(err, ErrMissingOrInvalidDigest) {
+		t.Fatalf("malformed digest = %v, want ErrMissingOrInvalidDigest even with the legacy opt-in", err)
 	}
 
 	// Wrong digest fails at EOF.

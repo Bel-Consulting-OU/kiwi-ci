@@ -59,6 +59,19 @@ var tartIPWait = 60 * time.Second
 // Go fallback cannot write).
 var generateSSHKey = generateEphemeralSSHKey
 
+// tartCloneName derives the physical name of this job's disposable VM clone:
+// kiwi-<unique-unix-nano>. The grammar is fixed by the GC contract
+// (parseTartVMs parses the numeric suffix as a creation timestamp), so the
+// name cannot carry a hash of the run/job identity; uniqueness comes from the
+// shared monotonic timestamp (nextPhysicalNano), which guarantees two clones
+// created by one process can never share a name (the clock resolution on
+// some hosts is coarser than a nanosecond). A cross-process name clash is
+// detected by tart itself: `tart clone` refuses an existing VM instead of
+// silently reusing or deleting another job's VM.
+func tartCloneName() string {
+	return fmt.Sprintf("kiwi-%d", nextPhysicalNano())
+}
+
 // StartJob clones and boots one disposable Tart VM for the entire CI job.
 // The VM is deleted by CloseJob; steps share VM state and the mounted checkout.
 func (b *TartBackend) StartJob(ctx context.Context, workspace string, emit func(string)) error {
@@ -94,7 +107,7 @@ func (b *TartBackend) StartJob(ctx context.Context, workspace string, emit func(
 		return &RunError{Kind: ErrorInfra, Err: err}
 	}
 	b.tart, b.ssh, b.workspace = tart, ssh, abs
-	b.clone = fmt.Sprintf("kiwi-%d", time.Now().UnixNano())
+	b.clone = tartCloneName()
 	if err := b.setupSSHDir(); err != nil {
 		_ = b.CloseJob()
 		return &RunError{Kind: ErrorInfra, Err: err}

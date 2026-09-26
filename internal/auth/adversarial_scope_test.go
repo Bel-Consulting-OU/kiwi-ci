@@ -224,13 +224,15 @@ func TestMiddlewareTokenEdges(t *testing.T) {
 	}{
 		{"no header", "", http.StatusUnauthorized, ""},
 		{"empty bearer", "Bearer ", http.StatusUnauthorized, ""},
-		// Tolerant parsing (shared with the server's bearerOK): a bare
-		// token without the "Bearer " scheme is still a full credential
-		// presentation, so it authenticates — possession of the secret is
-		// what is proven, never the scheme spelling.
-		{"prefix missing", "store-token", http.StatusOK, "bot"},
+		// Strict grammar (the ONE auth.ParseBearer parser): a bare token
+		// without the "Bearer " scheme is not a bearer presentation and is
+		// rejected. Possession of the secret only authenticates when it is
+		// presented through the scheme; the header is never the credential.
+		{"prefix missing", "store-token", http.StatusUnauthorized, ""},
 		{"lowercase scheme", "bearer store-token", http.StatusUnauthorized, ""},
-		{"trailing space", "Bearer store-token ", http.StatusUnauthorized, ""},
+		// The extracted token is trimmed, so trailing header whitespace is
+		// tolerated rather than becoming part of the credential.
+		{"trailing space", "Bearer store-token ", http.StatusOK, "bot"},
 		{"near miss", "Bearer store-toke", http.StatusUnauthorized, ""},
 		{"digest as bearer", "Bearer " + TokenDigest("store-token"), http.StatusUnauthorized, ""},
 		{"store token", "Bearer store-token", http.StatusOK, "bot"},

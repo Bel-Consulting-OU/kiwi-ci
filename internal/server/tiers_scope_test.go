@@ -86,13 +86,16 @@ func concretePath(path string) string {
 // expectedRouteTiers is the classification contract for EVERY registered
 // route. A new route in server.go fails the walk until it is added here with
 // an explicit tier decision, so no route can silently fall through to the
-// blanket admin gate (or worse, a public tier) by accident.
+// blanket admin gate (or worse, a public tier) by accident. Logout is listed
+// for both methods: it stays public at the auth tier, but the state-change
+// gate lives in the handler (session+CSRF on POST, a 405 stub on GET).
 var expectedRouteTiers = map[string]routeTier{
 	// Public: no bearer required.
 	"GET /":                                                    tierPublic,
 	"GET /static/":                                             tierPublic,
 	"POST /api/v1/login":                                       tierPublic,
 	"GET /api/v1/logout":                                       tierPublic,
+	"POST /api/v1/logout":                                      tierPublic,
 	"GET /readiness":                                           tierPublic,
 	"GET /liveness":                                            tierPublic,
 	"POST /hooks/github":                                       tierPublic,

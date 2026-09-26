@@ -195,7 +195,7 @@ func (s *Server) enroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tok := enrollTokenFrom(r)
-	if s.RunnerEnrollToken == "" || !bearerOK(tok, s.RunnerEnrollToken) {
+	if s.RunnerEnrollToken == "" || !tokenEqual(tok, s.RunnerEnrollToken) {
 		// Not the static enrollment token: the request must have been
 		// gated by a grant. Consume it (single-use + expiry + allowed
 		// labels) before signing.

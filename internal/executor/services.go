@@ -34,6 +34,30 @@ func serviceNetworkArgs(isolated bool) []string {
 // tmpfs keep them restricted on either daemon kind.
 const serviceWorkloadUser = "65534:65534"
 
+// boundedNormalizedName renders raw as a deterministic physical docker/VM
+// name bounded by limit. The full identity is normalized first
+// (dockerNameClean -> "-", then lowercased) and returned unchanged when it
+// fits. When it does not fit, the result is a (limit-17)-character prefix of
+// the normalized name, a "-", and the first 8 bytes of the SHA-256 of the
+// FULL normalized identity as 16 hex characters, sized so the result is
+// exactly <= limit. The hash ALWAYS covers the entire identity, never the
+// truncated prefix, so two identities that share a long prefix but differ
+// later still get distinct physical names. This is the single canonicalizer
+// behind every generated docker name in the executor (service containers,
+// the services network, the job container).
+func boundedNormalizedName(raw string, limit int) string {
+	full := strings.ToLower(dockerNameClean.ReplaceAllString(raw, "-"))
+	if len(full) <= limit {
+		return full
+	}
+	sum := sha256.Sum256([]byte(full))
+	suffix := hex.EncodeToString(sum[:8])
+	if limit <= len(suffix) {
+		return suffix[:limit]
+	}
+	return full[:limit-len(suffix)-1] + "-" + suffix
+}
+
 // maxServiceContainerNameLen bounds the physical docker container name so a
 // pathological run/job ID cannot exceed docker's 255-character name limit.
 // The trailing 16-hex SHA-256 prefix of the full untruncated name keeps
@@ -47,14 +71,29 @@ const maxServiceContainerNameLen = 200
 // a service aliased "postgres", and each must get its own container. The
 // user-facing alias is attached separately with --network-alias (see
 // serviceAlias), scoped to the job's own network, where uniqueness is
-// guaranteed by pipeline validation.
+// guaranteed by pipeline validation. Over-long identities are bounded by
+// boundedNormalizedName, which hashes the full identity, so two sanitized
+// names sharing a long prefix can never collapse onto one container.
 func serviceContainerName(runID, jobID string, index int) string {
-	name := strings.ToLower(dockerNameClean.ReplaceAllString(fmt.Sprintf("kiwi-svc-%s-%s-%d", runID, jobID, index+1), "-"))
-	if len(name) > maxServiceContainerNameLen {
-		sum := sha256.Sum256([]byte(name))
-		name = name[:maxServiceContainerNameLen-len(hex.EncodeToString(sum[:8]))-1] + "-" + hex.EncodeToString(sum[:8])
-	}
-	return name
+	return boundedNormalizedName(fmt.Sprintf("kiwi-svc-%s-%s-%d", runID, jobID, index+1), maxServiceContainerNameLen)
+}
+
+// maxServiceNetworkNameLen bounds the job's physical docker network name.
+// Docker accepts longer names, but the generated name must stay injective
+// under bounding: the previous `network[:60]` truncation mapped two distinct
+// run/job identities sharing their first 60 normalized characters onto ONE
+// physical network, so stale state from one job could be addressed (and
+// removed) by another. 60 is the historical physical name budget.
+const maxServiceNetworkNameLen = 60
+
+// serviceNetworkName derives the physical docker network name for one job:
+// kiwi-net-<run>-<job>, normalized and bounded by boundedNormalizedName. When
+// the full normalized identity exceeds 60 characters the name becomes
+// full[:60-17] + "-" + the first 16 hex characters of the SHA-256 of the FULL
+// identity, so distinct jobs always own distinct networks (isolation and
+// cleanup stay injective) and short identities keep their historical name.
+func serviceNetworkName(runID, jobID string) string {
+	return boundedNormalizedName(fmt.Sprintf("kiwi-net-%s-%s", runID, jobID), maxServiceNetworkNameLen)
 }
 
 // serviceAlias derives the user-facing network alias for one service: the
@@ -330,11 +369,7 @@ func startContainerServices(ctx context.Context, runID, jobID string, services [
 	if err != nil {
 		return "", func() {}, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("docker not found: %w", err)}
 	}
-	base := dockerNameClean.ReplaceAllString(fmt.Sprintf("kiwi-net-%s-%s", runID, jobID), "-")
-	network := strings.ToLower(base)
-	if len(network) > 60 {
-		network = network[:60]
-	}
+	network := serviceNetworkName(runID, jobID)
 	createArgs := append(serviceNetworkArgs(isolated), "--label", "kiwi.run="+runID, network)
 	if out, err := exec.CommandContext(ctx, docker, append([]string{"network"}, createArgs...)...).CombinedOutput(); err != nil {
 		return "", func() {}, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("create services network: %v: %s", err, strings.TrimSpace(string(out)))}
@@ -342,9 +377,13 @@ func startContainerServices(ctx context.Context, runID, jobID string, services [
 	containers := make([]string, 0, len(services))
 	cleanup := func() {
 		for _, name := range containers {
-			_ = exec.Command(docker, "rm", "-f", name).Run()
+			if err := dockerCleanupCommand(ctx, docker, "rm", "-f", name); err != nil {
+				emit("cleanup required: " + err.Error())
+			}
 		}
-		_ = exec.Command(docker, "network", "rm", network).Run()
+		if err := dockerCleanupCommand(ctx, docker, "network", "rm", network); err != nil {
+			emit("cleanup required: " + err.Error())
+		}
 	}
 	cleanupAll := func() { cleanup() }
 	plan, planErr := serviceAllocationPlan(jobResources, services)

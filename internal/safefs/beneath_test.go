@@ -87,7 +87,9 @@ func TestOpenRootBeneathTOCTOUBarrier(t *testing.T) {
 	}
 
 	data := tarGz(t, []tarEntry{{name: "payload.txt", data: []byte("safe"), typeflag: tar.TypeReg}})
-	if _, err := Extract(dest, bytes.NewReader(data), DefaultLimits()); err != nil {
+	limits := DefaultLimits()
+	limits.AllowAll = true
+	if _, err := Extract(dest, bytes.NewReader(data), limits); err != nil {
 		t.Fatalf("extract through held root: %v", err)
 	}
 	// The held descriptor still addresses the original directory (now named

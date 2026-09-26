@@ -71,11 +71,12 @@ func ExplainWhy(spec *pipeline.Spec, g *pipeline.Graph, jobID string, ctx Explai
 	}
 
 	// Trigger evaluation reuses the forge evaluator so explain and the
-	// webhook path decide identically.
+	// webhook path decide identically. The explanation's change set is
+	// explicit caller input, so it is a complete diff.
 	matched, triggerKey := forge.MatchesTrigger(spec.On, forge.EventContext{
 		Event:        ctx.Event,
 		Ref:          "refs/heads/" + ctx.Branch,
-		ChangedFiles: ctx.ChangedFiles,
+		ChangedFiles: forge.ChangedFilesResult{Files: ctx.ChangedFiles, Complete: true},
 	})
 	w.EventMatched = matched
 	w.TriggerKey = triggerKey

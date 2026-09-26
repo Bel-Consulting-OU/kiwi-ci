@@ -225,17 +225,25 @@ func TestCheckNameComponentEmpty(t *testing.T) {
 	}
 }
 
-// TestUnderAllowedBlankRoots proves blank and dot roots allow everything.
-func TestUnderAllowedBlankRoots(t *testing.T) {
+// TestUnderAllowedExplicitSemantics proves the allow set is explicit and
+// fail-closed: only AllowAll means everything, an empty Allowed list means
+// nothing, and no Allowed entry (including "" or ".") silently widens it.
+func TestUnderAllowedExplicitSemantics(t *testing.T) {
+	if underAllowed("any/path", ExtractLimits{}) {
+		t.Fatal("empty limits must write nothing")
+	}
+	if !underAllowed("any/path", ExtractLimits{AllowAll: true}) {
+		t.Fatal("AllowAll must allow everything")
+	}
 	for _, roots := range [][]string{{""}, {"."}, {"   "}} {
-		if !underAllowed("any/path", roots) {
-			t.Fatalf("roots %q must allow everything", roots)
+		if underAllowed("any/path", ExtractLimits{Allowed: roots}) {
+			t.Fatalf("blank/dot roots %q must not silently allow everything", roots)
 		}
 	}
-	if underAllowed("b/x", []string{"a"}) {
+	if underAllowed("b/x", ExtractLimits{Allowed: []string{"a"}}) {
 		t.Fatal("outside root allowed")
 	}
-	if !underAllowed("a", []string{"a"}) || !underAllowed("a/b", []string{"a"}) {
+	if !underAllowed("a", ExtractLimits{Allowed: []string{"a"}}) || !underAllowed("a/b", ExtractLimits{Allowed: []string{"a"}}) {
 		t.Fatal("root and descendants must be allowed")
 	}
 }

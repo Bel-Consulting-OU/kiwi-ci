@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
@@ -16,6 +17,61 @@ import (
 // (real on Windows where the Job Object assign can fail) be exercised on
 // hosts without the Windows Job Object API.
 var attachChildSupervision = superviseChildNow
+
+// nativeWait is a test-only seam over cmd.Wait in the reaper goroutine.
+// Production behavior is unchanged; it lets the un-reapable-after-SIGKILL
+// branch be exercised deterministically (a real process stuck in an
+// uninterruptible kernel wait cannot be fabricated portably).
+var nativeWait = func(cmd *exec.Cmd) error { return cmd.Wait() }
+
+// reapDetached is a test-only seam over the detached drain started when
+// SIGKILL could not reap the process: production spawns a goroutine that
+// consumes the wait result whenever the process is finally reaped, so the
+// reaper goroutine never blocks forever on the channel send and no zombie is
+// left behind. Tests substitute a recorder to prove the drain happens.
+var reapDetached = func(wait <-chan error) {
+	go func() { <-wait }()
+}
+
+// nativeTermGrace is the grace period between SIGTERM and SIGKILL for a
+// canceled native command. A var so tests can shorten it.
+var nativeTermGrace = 2 * time.Second
+
+// killGrace bounds how long the backend waits for the process to be reaped
+// after SIGKILL. SIGKILL cannot be caught, but a process wedged in an
+// uninterruptible kernel wait can still fail to exit; the backend must not
+// block forever on Wait in that case. A var so tests can shorten it.
+var killGrace = 2 * time.Second
+
+// nativeCleanupMarker is the durable marker the native backend writes into
+// the step directory when a command tree could not be reaped after SIGKILL.
+// A workspace carrying it is refused until the existing workspace cleanup
+// (Options.WorkspaceFor's cleanup, or workspace.Manager's RemoveAll of the
+// job directory) has removed the directory: an un-reapable process may still
+// mutate the workspace after the job failed, so the directory must never be
+// reused as-is.
+const nativeCleanupMarker = ".kiwi-needs-cleanup"
+
+// workspaceCleanupRequired reports whether dir was marked as requiring
+// cleanup by a previous un-reapable command.
+func workspaceCleanupRequired(dir string) error {
+	if dir == "" {
+		return nil
+	}
+	if _, err := os.Stat(filepath.Join(dir, nativeCleanupMarker)); err != nil {
+		return nil
+	}
+	return fmt.Errorf("workspace %q requires cleanup before reuse: an un-reapable command left the %s marker; remove the workspace (or the marker) before running again", dir, nativeCleanupMarker)
+}
+
+// markWorkspaceNeedsCleanup writes the durable cleanup marker into dir.
+func markWorkspaceNeedsCleanup(dir string) error {
+	if dir == "" {
+		return fmt.Errorf("no step directory recorded")
+	}
+	content := fmt.Sprintf("native command could not be reaped after SIGKILL at %s\n", time.Now().UTC().Format(time.RFC3339Nano))
+	return os.WriteFile(filepath.Join(dir, nativeCleanupMarker), []byte(content), 0o600)
+}
 
 type NativeBackend struct{}
 
@@ -53,6 +109,9 @@ func (*NativeBackend) ReadFile(ctx context.Context, path string, maxBytes int64)
 }
 
 func (*NativeBackend) Run(ctx context.Context, c Command, emit func(string)) error {
+	if err := workspaceCleanupRequired(c.Dir); err != nil {
+		return &RunError{Kind: ErrorInfra, Err: err}
+	}
 	shell := c.Shell
 	if shell == "" {
 		shell = "bash"
@@ -114,7 +173,7 @@ func (*NativeBackend) Run(ctx context.Context, c Command, emit func(string)) err
 	go func() { defer func() { done <- struct{}{} }(); streamLines(stderrR, defaultMaxLine, emit) }()
 	wait := make(chan error, 1)
 	go func() {
-		err := cmd.Wait()
+		err := nativeWait(cmd)
 		cleanup()
 		joinDrains(done, 2*time.Second, stdoutR, stderrR)
 		wait <- err
@@ -126,16 +185,32 @@ func (*NativeBackend) Run(ctx context.Context, c Command, emit func(string)) err
 		}
 		return nil
 	case <-ctx.Done():
-		_ = terminateProcess(cmd)
-		select {
-		case <-wait:
-		case <-time.After(2 * time.Second):
-			_ = killProcess(cmd)
-			<-wait
-		}
 		kind := ErrorCancelled
 		if ctx.Err() == context.DeadlineExceeded {
 			kind = ErrorTimeout
+		}
+		_ = terminateProcess(cmd)
+		select {
+		case <-wait:
+		case <-time.After(nativeTermGrace):
+			_ = killProcess(cmd)
+			select {
+			case <-wait:
+			case <-time.After(killGrace):
+				// SIGKILL could not reap the process within the bound
+				// (for example it is wedged in an uninterruptible kernel
+				// wait). Detach a drain so the reaper goroutine's final
+				// send never blocks and the process is reaped once it
+				// finally exits (no zombie), and fail as infra with the
+				// workspace marked as requiring cleanup before reuse.
+				reapDetached(wait)
+				markErr := markWorkspaceNeedsCleanup(c.Dir)
+				reapErr := fmt.Errorf("process could not be reaped after SIGKILL within %s (command stopped: %v)", killGrace, ctx.Err())
+				if markErr != nil {
+					reapErr = fmt.Errorf("%w; marking workspace %q for cleanup also failed: %v", reapErr, c.Dir, markErr)
+				}
+				return &RunError{Kind: ErrorInfra, Err: reapErr}
+			}
 		}
 		return &RunError{Kind: kind, Err: fmt.Errorf("command stopped: %w", ctx.Err())}
 	}

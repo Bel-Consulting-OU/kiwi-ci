@@ -1,17 +1,21 @@
 package cache
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/safefs"
@@ -42,6 +46,55 @@ type Store struct {
 func Default() *Store {
 	home, _ := os.UserHomeDir()
 	return &Store{Root: filepath.Join(home, ".kiwi", "cache")}
+}
+
+// defaultAPITimeout is the finite bound the legacy Store.Restore/Save
+// wrappers (and the unexported fetchRemote/pushRemote entry points) apply
+// when the Store has no caller-supplied HTTP client. It is a total deadline
+// for the convenience path only: callers that need bulk transfers or their
+// own lifetime must use RestoreContext/SaveContext (or configure Client, as
+// the runner does with its streaming+stall transport).
+const defaultAPITimeout = 30 * time.Second
+
+// Bounded transport phases for cache HTTP traffic. These bound each control
+// phase of an exchange without imposing a total transfer deadline: bulk
+// archive bodies must be able to run as long as they make progress, so no
+// Client.Timeout is ever set by default.
+const (
+	defaultDialTimeout           = 10 * time.Second
+	defaultTLSHandshakeTimeout   = 10 * time.Second
+	defaultResponseHeaderTimeout = 30 * time.Second
+	defaultIdleConnTimeout       = 90 * time.Second
+)
+
+// defaultTransport returns a transport with bounded dial, TLS handshake,
+// response-header and idle phases. Proxy settings, HTTP/2 support and other
+// defaults are preserved from http.DefaultTransport.
+func defaultTransport() *http.Transport {
+	var t *http.Transport
+	if base, ok := http.DefaultTransport.(*http.Transport); ok {
+		t = base.Clone()
+	} else {
+		t = &http.Transport{}
+	}
+	t.DialContext = (&net.Dialer{Timeout: defaultDialTimeout, KeepAlive: 30 * time.Second}).DialContext
+	t.TLSHandshakeTimeout = defaultTLSHandshakeTimeout
+	t.ResponseHeaderTimeout = defaultResponseHeaderTimeout
+	t.IdleConnTimeout = defaultIdleConnTimeout
+	t.ExpectContinueTimeout = time.Second
+	return t
+}
+
+// defaultContext is the context the legacy wrapper methods use. A
+// caller-supplied Client owns its own bounds (the runner configures a
+// streaming transport with per-request stall guards), so the wrappers defer
+// to it with a background context; otherwise they apply the explicit finite
+// defaultAPITimeout so direct use can never hang forever.
+func (s *Store) defaultContext() (context.Context, context.CancelFunc) {
+	if s.Client != nil {
+		return context.Background(), func() {}
+	}
+	return context.WithTimeout(context.Background(), defaultAPITimeout)
 }
 
 // Key computes the cache key for base and the workspace's hashFiles. Every
@@ -80,7 +133,28 @@ func (s *Store) Key(base string, workspace string, hashFiles []string) (string, 
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// Restore is RestoreContext with the Store's default context: a caller-owned
+// Client supplies its own bounds, otherwise an explicit finite
+// defaultAPITimeout applies so a direct call cannot hang forever. Use
+// RestoreContext to supply the caller's context.
 func (s *Store) Restore(key, workspace string, paths []string) (bool, error) {
+	ctx, cancel := s.defaultContext()
+	defer cancel()
+	return s.RestoreContext(ctx, key, workspace, paths)
+}
+
+// RestoreContext restores a cache archive for key into workspace. The context
+// is checked before any work and bounds every remote (HTTP) phase; local
+// hashing and extraction are separately bounded by the archive size limits.
+//
+// Restriction semantics are explicit: paths must either contain the
+// deliberate whole-root marker "." or a non-empty list of clean
+// workspace-relative roots (validated by cleanRoots). An empty list restores
+// NOTHING; it is never treated as "everything".
+func (s *Store) RestoreContext(ctx context.Context, key, workspace string, paths []string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	if !validKey(key) {
 		return false, fmt.Errorf("cache: invalid cache key")
 	}
@@ -96,7 +170,7 @@ func (s *Store) Restore(key, workspace string, paths []string) (bool, error) {
 		// fail-closed and surfaced rather than silently extracted.
 		return false, err
 	}
-	if ferr := s.fetchRemote(key); ferr != nil {
+	if ferr := s.fetchRemoteContext(ctx, key); ferr != nil {
 		if ferr == errRemoteNotFound {
 			return false, nil
 		}
@@ -187,6 +261,10 @@ func (s *Store) maxStoredBytes() int64 {
 }
 
 func (s *Store) restoreLocal(key, workspace string, paths []string) (bool, error) {
+	roots, err := cleanRoots(paths)
+	if err != nil {
+		return false, err
+	}
 	dst := s.archivePath(key)
 	fi, err := os.Lstat(dst)
 	if os.IsNotExist(err) {
@@ -238,8 +316,15 @@ func (s *Store) restoreLocal(key, workspace string, paths []string) (bool, error
 		return false, err
 	}
 	defer root.Close()
+	// Make the restriction explicit: "." is the deliberate whole-root choice
+	// and is the only thing that maps to safefs AllowAll. Any other list is
+	// passed verbatim as Allowed; an empty list therefore restores nothing
+	// instead of silently extracting the whole archive.
 	limits := safefs.DefaultLimits()
-	limits.Allowed = cleanRoots(paths)
+	limits.AllowAll = len(roots) == 1 && roots[0] == "."
+	if !limits.AllowAll {
+		limits.Allowed = roots
+	}
 	limits.MaxArchiveBytes = bound
 	if _, err := safefs.Extract(root, f, limits); err != nil {
 		return false, fmt.Errorf("cache restore: %w", err)
@@ -297,7 +382,22 @@ func openExtractRoot(workspace string) (*safefs.Root, error) {
 	return root, nil
 }
 
+// Save is SaveContext with the Store's default context: a caller-owned
+// Client supplies its own bounds, otherwise an explicit finite
+// defaultAPITimeout applies so a direct call cannot hang forever.
 func (s *Store) Save(key, workspace string, paths []string) error {
+	ctx, cancel := s.defaultContext()
+	defer cancel()
+	return s.SaveContext(ctx, key, workspace, paths)
+}
+
+// SaveContext captures workspace paths into the local store and, when
+// RemoteURL is set, uploads the archive. The context bounds every remote
+// (HTTP) phase; the local archive write itself is bounded by MaxCacheBytes.
+func (s *Store) SaveContext(ctx context.Context, key, workspace string, paths []string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if !validKey(key) {
 		return fmt.Errorf("cache: invalid cache key")
 	}
@@ -356,7 +456,7 @@ func (s *Store) Save(key, workspace string, paths []string) error {
 		return err
 	}
 	if s.RemoteURL != "" {
-		if err := s.pushRemote(key); err != nil {
+		if err := s.pushRemoteContext(ctx, key); err != nil {
 			return err
 		}
 	}
@@ -369,14 +469,26 @@ func (s *Store) client() *http.Client {
 		c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 		return &c
 	}
-	return &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	return &http.Client{
+		Transport:     defaultTransport(),
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 }
 
 func (s *Store) fetchRemote(key string) error {
+	ctx, cancel := s.defaultContext()
+	defer cancel()
+	return s.fetchRemoteContext(ctx, key)
+}
+
+func (s *Store) fetchRemoteContext(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if !validKey(key) {
 		return fmt.Errorf("cache: invalid cache key")
 	}
-	req, err := http.NewRequest(http.MethodGet, s.RemoteURL+"/api/v1/cache/"+key, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.RemoteURL+"/api/v1/cache/"+key, nil)
 	if err != nil {
 		return err
 	}
@@ -451,16 +563,25 @@ func (s *Store) fetchRemote(key string) error {
 }
 
 func (s *Store) pushRemote(key string) error {
+	ctx, cancel := s.defaultContext()
+	defer cancel()
+	return s.pushRemoteContext(ctx, key)
+}
+
+func (s *Store) pushRemoteContext(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if !validKey(key) {
 		return fmt.Errorf("cache: invalid cache key")
 	}
-	path := filepath.Join(s.Root, key+".tar.gz")
-	f, err := os.Open(path)
+	archive := filepath.Join(s.Root, key+".tar.gz")
+	f, err := os.Open(archive)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	req, err := http.NewRequest(http.MethodPut, s.RemoteURL+"/api/v1/cache/"+key, f)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, s.RemoteURL+"/api/v1/cache/"+key, f)
 	if err != nil {
 		return err
 	}
@@ -483,13 +604,56 @@ func (s *Store) auth(req *http.Request) {
 	}
 }
 
-func cleanRoots(in []string) []string {
+// cleanRoots validates and normalizes cache restore path restrictions. It
+// rejects empty entries, portable absolute paths (Unix "/..." and Windows
+// "C:..." shapes), any ".." component, backslashes and NUL bytes, and
+// returns the cleaned slash form otherwise. "." is the deliberate whole-root
+// choice: it is returned as the sole element so the caller can opt into
+// safefs AllowAll explicitly. An empty input yields an empty (non-nil) list,
+// which extraction treats as "write nothing". Invalid restrictions are an
+// error; they are never silently dropped into an empty list.
+func cleanRoots(in []string) ([]string, error) {
 	out := make([]string, 0, len(in))
 	for _, p := range in {
-		p = filepath.ToSlash(filepath.Clean(p))
-		if p != "." && !strings.HasPrefix(p, "../") {
-			out = append(out, p)
+		if p == "" {
+			return nil, fmt.Errorf("cache restore: empty path restriction")
 		}
+		if strings.ContainsRune(p, '\x00') {
+			return nil, fmt.Errorf("cache restore: NUL byte in path restriction %q", p)
+		}
+		if strings.Contains(p, "\\") {
+			return nil, fmt.Errorf("cache restore: backslash in path restriction %q", p)
+		}
+		if portableAbsPath(p) {
+			return nil, fmt.Errorf("cache restore: absolute path restriction %q", p)
+		}
+		// Reject every raw ".." component, not just the ones that survive
+		// path.Clean: an input that merely hides one behind a preceding
+		// component is still an invalid restriction.
+		for _, comp := range strings.Split(p, "/") {
+			if comp == ".." {
+				return nil, fmt.Errorf("cache restore: parent traversal in path restriction %q", p)
+			}
+		}
+		clean := path.Clean(p)
+		if clean == "." {
+			return []string{"."}, nil
+		}
+		out = append(out, clean)
 	}
-	return out
+	return out, nil
+}
+
+// portableAbsPath reports whether p is absolute in the portable path shapes
+// this codebase accepts: a leading slash, or a Windows drive designator
+// ("C:") followed by a separator. Backslash forms are rejected separately.
+func portableAbsPath(p string) bool {
+	if strings.HasPrefix(p, "/") {
+		return true
+	}
+	if len(p) >= 3 && p[1] == ':' && (p[2] == '/' || p[2] == '\\') {
+		c := p[0]
+		return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+	}
+	return false
 }

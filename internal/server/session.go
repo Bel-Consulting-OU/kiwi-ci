@@ -147,8 +147,20 @@ func (s *Server) webLogin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// webLogout implements GET /api/v1/logout by clearing the session cookie.
+// webLogout implements POST /api/v1/logout by clearing the session cookie.
+//
+// Logout changes session state, so it is a POST that demands the same
+// double-submit CSRF proof as every other cookie-authenticated mutation: a
+// valid session cookie plus the matching X-Kiwi-CSRF header (the exact checks
+// auth() applies to mutating tierAdmin/tierRBAC requests). The route is
+// public — no bearer is required — so auth() never sees it and the check must
+// live here, before the cookie is touched: a cross-site request can never log
+// the user out.
 func (s *Server) webLogout(w http.ResponseWriter, r *http.Request) {
+	if !s.webSessionOK(r) || !s.webCSRFOK(r) {
+		http.Error(w, "invalid csrf token", http.StatusForbidden)
+		return
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     webSessionCookie,
 		Value:    "",
@@ -159,6 +171,15 @@ func (s *Server) webLogout(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   -1,
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// webLogoutMethodNotAllowed implements GET /api/v1/logout: logout is a
+// state-changing POST, so the read method is refused with 405 and an explicit
+// Allow header rather than being served by the dashboard's "GET /"
+// catch-all.
+func (s *Server) webLogoutMethodNotAllowed(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Allow", http.MethodPost)
+	http.Error(w, "method not allowed: logout is POST /api/v1/logout", http.StatusMethodNotAllowed)
 }
 
 // webSessionOK validates the session cookie: a valid HMAC (constant time)

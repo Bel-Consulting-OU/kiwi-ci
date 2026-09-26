@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
@@ -45,12 +44,27 @@ type EnrollGrant struct {
 }
 
 // enrollTokenFrom extracts the enrollment credential from the Authorization
-// bearer or the X-Kiwi-Enroll-Token header.
+// bearer or the X-Kiwi-Enroll-Token header, using the ONE strict bearer
+// grammar (auth.ParseBearer): a header without the exact "Bearer " scheme is
+// not a credential presentation. Authorization wins when present; a malformed
+// Authorization never falls back to the secondary header, so a bad primary
+// credential cannot be silently swapped for another.
 func enrollTokenFrom(r *http.Request) string {
-	if tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "); tok != "" {
+	if h := r.Header.Get("Authorization"); h != "" {
+		tok, ok := auth.ParseBearer(h)
+		if !ok {
+			return ""
+		}
 		return tok
 	}
-	return strings.TrimPrefix(r.Header.Get("X-Kiwi-Enroll-Token"), "Bearer ")
+	if h := r.Header.Get("X-Kiwi-Enroll-Token"); h != "" {
+		tok, ok := auth.ParseBearer(h)
+		if !ok {
+			return ""
+		}
+		return tok
+	}
+	return ""
 }
 
 // CreateEnrollGrant mints a single-use enrollment grant: 32 random bytes

@@ -352,8 +352,12 @@ type dbStoreRequirement struct {
 //
 // RunnerTokenStore is added when per-runner bearer tokens are configured for
 // provisioning: a store that cannot hold them cannot honor the credential
-// contract. A nil store (memory/fs mode) requires nothing.
-func requiredDBStoreCapabilities(db storage.Store, runnerTokensConfigured bool) []dbStoreRequirement {
+// contract. LeaseOIDCIssueStore is added when OIDC issuance is enabled (an
+// external URL is configured, so the issuance endpoint can serve): without it
+// DB mode could not re-check the lease and append the issuance audit
+// atomically, and a credential could be minted after the lease ceased. A nil
+// store (memory/fs mode) requires nothing.
+func requiredDBStoreCapabilities(db storage.Store, runnerTokensConfigured, oidcIssuanceEnabled bool) []dbStoreRequirement {
 	if db == nil {
 		return nil
 	}
@@ -365,6 +369,10 @@ func requiredDBStoreCapabilities(db storage.Store, runnerTokensConfigured bool) 
 		{Name: "CASGCLeaseStore", Held: casGCLease},
 		{Name: "LeaseCommitStore", Held: leaseCommit},
 	}
+	if oidcIssuanceEnabled {
+		_, oidcIssue := db.(storage.LeaseOIDCIssueStore)
+		reqs = append(reqs, dbStoreRequirement{Name: "LeaseOIDCIssueStore", Held: oidcIssue})
+	}
 	if runnerTokensConfigured {
 		_, runnerTokens := db.(storage.RunnerTokenStore)
 		reqs = append(reqs, dbStoreRequirement{Name: "RunnerTokenStore", Held: runnerTokens})
@@ -375,12 +383,13 @@ func requiredDBStoreCapabilities(db storage.Store, runnerTokensConfigured bool) 
 // validateDBStoreCapabilities rejects a DB-mode startup whose store is missing
 // a mandatory capability for the features enabled. The failure is a hard
 // startup error, not a per-request degradation: a store that cannot fence
-// digest publication, serialize the collector or commit lease-bound metadata
-// transactionally would silently weaken those invariants across replicas.
-// Memory/fs mode (nil db) requires nothing.
-func validateDBStoreCapabilities(db storage.Store, runnerTokensConfigured bool) error {
+// digest publication, serialize the collector, commit lease-bound metadata
+// transactionally, or commit OIDC issuances under the locked lease would
+// silently weaken those invariants across replicas. Memory/fs mode (nil db)
+// requires nothing.
+func validateDBStoreCapabilities(db storage.Store, runnerTokensConfigured, oidcIssuanceEnabled bool) error {
 	var missing []string
-	for _, req := range requiredDBStoreCapabilities(db, runnerTokensConfigured) {
+	for _, req := range requiredDBStoreCapabilities(db, runnerTokensConfigured, oidcIssuanceEnabled) {
 		if !req.Held {
 			missing = append(missing, req.Name)
 		}
@@ -389,6 +398,9 @@ func validateDBStoreCapabilities(db storage.Store, runnerTokensConfigured bool) 
 		return nil
 	}
 	enforced := "DigestFenceStore, CASGCLeaseStore, LeaseCommitStore"
+	if oidcIssuanceEnabled {
+		enforced += ", LeaseOIDCIssueStore"
+	}
 	if runnerTokensConfigured {
 		enforced += ", RunnerTokenStore"
 	}
@@ -684,12 +696,14 @@ func Server(ctx context.Context, args []string) error {
 			return fmt.Errorf("auto-migrate: %w", merr)
 		}
 		// Startup capability rejection: DB mode enables CAS publication/GC
-		// fencing, the collector lease and transactional lease-bound commits,
-		// so a store missing any of those contracts must not start (it would
-		// silently fall back to weaker, non-distributed behavior). The real
-		// PostgreSQL store provides all of them; this guards custom/partial
-		// stores and regressions that drop a capability.
-		if cerr := validateDBStoreCapabilities(db, len(runnerTokens) > 0); cerr != nil {
+		// fencing, the collector lease, transactional lease-bound commits and
+		// (when an external URL makes OIDC issuance available)
+		// lease-fenced, audited token issuance, so a store missing any of
+		// those contracts must not start (it would silently fall back to
+		// weaker, non-distributed behavior). The real PostgreSQL store
+		// provides all of them; this guards custom/partial stores and
+		// regressions that drop a capability.
+		if cerr := validateDBStoreCapabilities(db, len(runnerTokens) > 0, strings.TrimSpace(externalURLV) != ""); cerr != nil {
 			return cerr
 		}
 		if clusterStore != nil {

@@ -2,6 +2,8 @@ package runner
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cache"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
@@ -136,16 +139,17 @@ func TestFinalNewJobCacheTransportSeams(t *testing.T) {
 }
 
 func TestFinalNewJobCacheLogfAndRestore(t *testing.T) {
+	body := []byte("cached-bytes")
+	sum := sha256.Sum256(body)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("cached-bytes"))
+		w.Header().Set(cache.HeaderCacheSHA256, hex.EncodeToString(sum[:]))
+		_, _ = w.Write(body)
 	}))
 	defer ts.Close()
 	r := &Runner{ID: "runner-1", Cfg: Config{Server: ts.URL, CacheRoot: t.TempDir()},
 		Client: ts.Client(), Metrics: NewMetrics()}
 	task := basicTask(payloadPipeline)
 	store := r.newJobCache(task, r.Metrics)
-	// A restore without a digest header logs through the runner's cache
-	// logger and still returns the body.
 	req := httptest.NewRequest(http.MethodGet, ts.URL+cacheRoutePrefix+"key", nil)
 	resp, err := store.Client.Transport.RoundTrip(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
@@ -155,6 +159,20 @@ func TestFinalNewJobCacheLogfAndRestore(t *testing.T) {
 	_ = resp.Body.Close()
 	if err != nil || string(b) != "cached-bytes" {
 		t.Fatalf("cache body = %q %v", b, err)
+	}
+
+	// A digest-less response is refused by the job-scoped restore path: the
+	// modern route must always claim integrity.
+	tsNoDigest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer tsNoDigest.Close()
+	r2 := &Runner{ID: "runner-1", Cfg: Config{Server: tsNoDigest.URL, CacheRoot: t.TempDir()},
+		Client: tsNoDigest.Client(), Metrics: NewMetrics()}
+	store2 := r2.newJobCache(task, r2.Metrics)
+	req2 := httptest.NewRequest(http.MethodGet, tsNoDigest.URL+cacheRoutePrefix+"key", nil)
+	if _, err := store2.Client.Transport.RoundTrip(req2); !errors.Is(err, cache.ErrMissingOrInvalidDigest) {
+		t.Fatalf("digest-less job-scoped restore = %v, want ErrMissingOrInvalidDigest", err)
 	}
 }
 

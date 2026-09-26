@@ -13,6 +13,25 @@
 #   ci/woodpecker/pr/linux-arm64
 #   ci/woodpecker/pr/integration-coverage
 #
+# Woodpecker publishes ONE commit status per workflow and event, not one per
+# step, so the lanes inside a workflow are not separately requireable. The
+# three contexts above are the COMPLETE pull_request workflow set (re-verified
+# against every .woodpecker/*.yml `when`; internal/workflowguard fails the
+# build if an entry names a workflow that never runs on its claimed event) and
+# therefore carry the whole PR lane matrix:
+#
+#   pr/linux-amd64           format, vet, unit, unit-nonroot, race,
+#                            race-double, single-p, checkptr, stress,
+#                            adversarial, schema, cross, license, docs, repro,
+#                            staticcheck, govulncheck, fuzz-smoke
+#   pr/linux-arm64           unit, race
+#   pr/integration-coverage  integration-postgres, unit-nonroot, coverage
+#                            (merged unit+integration coverage floor)
+#
+# The native windows/macos lanes and docker-integration run on trusted events
+# only (push/manual/tag) and stay post-merge gates (see NATIVE_CONTEXTS and
+# the docker-workspace note below); never add them to the required PR list.
+#
 # docker-workspace is deliberately NOT a required PR context: it mounts the
 # agent host's Docker daemon socket with host volumes, and Woodpecker gates
 # volumes on the repository-level Trusted flag alone (no PR/fork gating), so a
@@ -59,13 +78,16 @@
 set -eu
 REPO="${KIWI_REPO:-Bel-Consulting-OU/kiwi-ci}"
 BRANCH="${KIWI_BRANCH:-main}"
-# Required for PRs: only workflows whose `when` contains `pull_request`.
-# Woodpecker's context format is `{{context}}/{{event}}/{{workflow}}` with the
-# pull_request event mapped to the literal `pr` (verified against
-# server/forge/common/status.go in v3.18.1 and against observed statuses).
-# Matrix axes append `/<axis_id>`; none of these workflows use a matrix.
-# docker-workspace is absent on purpose: it mounts the host Docker socket and is
-# push/manual/tag only (see the invariant above).
+# Required for PRs: the complete set of workflows whose `when` contains
+# `pull_request` (the lane inventory is in the header). Woodpecker's context
+# format is `{{context}}/{{event}}/{{workflow}}` with the pull_request event
+# mapped to the literal `pr` (verified against server/forge/common/status.go
+# in v3.18.1 and against observed statuses). Matrix axes append `/<axis_id>`;
+# none of these workflows use a matrix. docker-workspace is absent on purpose:
+# it mounts the host Docker socket and is push/manual/tag only (see the
+# invariant above). One status per workflow, not per step: the lanes listed in
+# the header are enforced through these three contexts, while windows, macos
+# and docker-integration remain post-merge gates.
 CONTEXTS="${KIWI_CONTEXTS:-ci/woodpecker/pr/linux-amd64 ci/woodpecker/pr/linux-arm64 ci/woodpecker/pr/integration-coverage}"
 # Push variants are posted for every push; they are listed so operators can
 # require them for direct pushes instead (a direct push to a protected branch
