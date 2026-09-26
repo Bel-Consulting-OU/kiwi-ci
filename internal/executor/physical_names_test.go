@@ -146,10 +146,10 @@ func TestJobContainerNameBoundedAndDistinct(t *testing.T) {
 	}
 }
 
-// TestTartCloneNameUniqueParseableAndGCCompatible proves the tart VM/session
-// name stays within the GC parser's kiwi-<unix-nano> grammar (so leak cleanup
-// still works) while the monotonic timestamp makes same-process collisions
-// impossible.
+// TestTartCloneNameUniqueParseableAndGCCompatible proves the tart VM name
+// stays within the GC parser's kiwi-<unix-nano>-<hash16> grammar (so leak
+// cleanup still works) while the monotonic timestamp makes same-process
+// collisions impossible.
 func TestTartCloneNameUniqueParseableAndGCCompatible(t *testing.T) {
 	const n = 32
 	names := make([]string, n)
@@ -158,7 +158,7 @@ func TestTartCloneNameUniqueParseableAndGCCompatible(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			names[i] = tartCloneName()
+			names[i] = tartCloneName("run-1", "job-1")
 		}(i)
 	}
 	wg.Wait()
@@ -167,8 +167,18 @@ func TestTartCloneNameUniqueParseableAndGCCompatible(t *testing.T) {
 		if !strings.HasPrefix(name, "kiwi-") {
 			t.Fatalf("clone name %q missing the kiwi- prefix", name)
 		}
-		if _, err := strconv.ParseInt(strings.TrimPrefix(name, "kiwi-"), 10, 64); err != nil {
-			t.Fatalf("clone name %q is not parseable by the GC contract: %v", name, err)
+		parts := strings.SplitN(strings.TrimPrefix(name, "kiwi-"), "-", 2)
+		if len(parts) != 2 {
+			t.Fatalf("clone name %q is not kiwi-<nano>-<hash16>", name)
+		}
+		if _, err := strconv.ParseInt(parts[0], 10, 64); err != nil {
+			t.Fatalf("clone name %q timestamp is not numeric: %v", name, err)
+		}
+		if len(parts[1]) != 16 {
+			t.Fatalf("clone name %q hash suffix = %q, want 16 hex characters", name, parts[1])
+		}
+		if len(name) > maxTartCloneNameLen {
+			t.Fatalf("clone name %q exceeds the %d-character tart name budget", name, maxTartCloneNameLen)
 		}
 		if seen[name] {
 			t.Fatalf("duplicate tart clone name %q", name)
@@ -178,5 +188,35 @@ func TestTartCloneNameUniqueParseableAndGCCompatible(t *testing.T) {
 	future := time.Now().Add(time.Hour)
 	if got := parseTartVMs([]byte(names[0]+"\tother\tcolumns\n"), future); len(got) != 1 || got[0] != names[0] {
 		t.Fatalf("parseTartVMs rejected a generated clone name: %v", got)
+	}
+}
+
+// TestTartCloneNameSameNanoDistinctIdentities is the cross-process collision
+// case: two clones from different run/job identities that happen to carry the
+// identical nanosecond timestamp must never share a name.
+func TestTartCloneNameSameNanoDistinctIdentities(t *testing.T) {
+	const nano = int64(1758888888888888888)
+	a := tartCloneNameFor("run-1", "job-1", nano)
+	b := tartCloneNameFor("run-1", "job-2", nano)
+	c := tartCloneNameFor("run-2", "job-1", nano)
+	if a == b || a == c || b == c {
+		t.Fatalf("same-nano clones collided: %q %q %q", a, b, c)
+	}
+	if again := tartCloneNameFor("run-1", "job-1", nano); again != a {
+		t.Fatalf("naming is not deterministic: %q != %q", again, a)
+	}
+}
+
+// TestTartIdentityHashMatchesBoundedNormalizedNameSuffix pins the shared hash
+// construction: the tart identity hash is the same 16-hex suffix
+// boundedNormalizedName embeds, so the executor keeps one hash rule.
+func TestTartIdentityHashMatchesBoundedNormalizedNameSuffix(t *testing.T) {
+	identity := "run-1-job-1-" + strings.Repeat("x", 100)
+	bounded := boundedNormalizedName(identity, 60)
+	if len(bounded) != 60 {
+		t.Fatalf("bounded identity = %q (%d chars), want exactly 60", bounded, len(bounded))
+	}
+	if got, want := bounded[len(bounded)-16:], identityHash16(identity); got != want {
+		t.Fatalf("tart identity hash %q != boundedNormalizedName suffix %q", got, want)
 	}
 }

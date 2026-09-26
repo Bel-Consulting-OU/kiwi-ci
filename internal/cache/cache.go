@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
@@ -48,13 +49,33 @@ func Default() *Store {
 	return &Store{Root: filepath.Join(home, ".kiwi", "cache")}
 }
 
-// defaultAPITimeout is the finite bound the legacy Store.Restore/Save
+// defaultAPITimeout is the finite total bound the legacy Store.Restore/Save
 // wrappers (and the unexported fetchRemote/pushRemote entry points) apply
 // when the Store has no caller-supplied HTTP client. It is a total deadline
 // for the convenience path only: callers that need bulk transfers or their
 // own lifetime must use RestoreContext/SaveContext (or configure Client, as
-// the runner does with its streaming+stall transport).
+// the runner does). It is layered UNDER the sliding storeStallTimeout
+// watchdog, which bounds every remote body in both paths.
 const defaultAPITimeout = 30 * time.Second
+
+// storeStallTimeout is the sliding inactivity bound for every remote Store
+// transfer body. The watchdog cancels the request context when no byte has
+// flowed through a request or response body for this long; every successful
+// read or write re-arms it, so a bulk archive transfer may run for an
+// arbitrarily long total time as long as it keeps making progress. It is a
+// variable (a test seam) so tests can shrink it.
+var storeStallTimeout = 90 * time.Second
+
+// ErrTransferStalled reports a remote cache transfer canceled by the Store's
+// inactivity watchdog (no byte moved for storeStallTimeout). It is
+// deliberately distinct from context cancellation: errors.Is(err,
+// ErrTransferStalled) is true only when the watchdog fired, while a caller's
+// own context cancellation surfaces as context.Canceled/DeadlineExceeded.
+var ErrTransferStalled = errors.New("cache: transfer stalled")
+
+// storeStallGuardHook, when set (tests only), observes watchdog arm and stop
+// events so a test can prove every armed timer is stopped.
+var storeStallGuardHook func(armed bool)
 
 // Bounded transport phases for cache HTTP traffic. These bound each control
 // phase of an exchange without imposing a total transfer deadline: bulk
@@ -85,16 +106,162 @@ func defaultTransport() *http.Transport {
 	return t
 }
 
-// defaultContext is the context the legacy wrapper methods use. A
-// caller-supplied Client owns its own bounds (the runner configures a
-// streaming transport with per-request stall guards), so the wrappers defer
-// to it with a background context; otherwise they apply the explicit finite
-// defaultAPITimeout so direct use can never hang forever.
+// defaultContext is the context the legacy wrapper methods use. The bound is
+// layered, and no layer imposes a total-duration cap on a transfer that keeps
+// making progress:
+//
+//   - With no caller-supplied Client the wrapper carries the explicit finite
+//     defaultAPITimeout (30s) for the convenience path, and the default
+//     client bounds every transport phase (dial, TLS, response headers,
+//     idle).
+//   - With a caller-supplied Client the client's own bounds (and the
+//     defaultTransport phases when it has none) apply; the context is
+//     deliberately unbounded so the client owns the total policy.
+//   - In BOTH cases every remote request/response body is wrapped by the
+//     sliding storeStallTimeout watchdog, which is the Store's own
+//     enforcement and cancels a transfer that stops making progress with
+//     ErrTransferStalled.
 func (s *Store) defaultContext() (context.Context, context.CancelFunc) {
 	if s.Client != nil {
 		return context.Background(), func() {}
 	}
 	return context.WithTimeout(context.Background(), defaultAPITimeout)
+}
+
+// storeStallGuard is a sliding inactivity watchdog for one remote transfer.
+// It cancels the transfer context when no byte has moved for idle, is
+// re-armed by every successful body read or write, and is stopped when the
+// transfer finishes. Exactly one timer is armed per transfer and stopped on
+// completion, so a finished transfer leaves no timer or goroutine behind.
+//
+// Unlike the runner-side stall guard, the Store guard maps its own
+// cancellation to ErrTransferStalled (see stallError) so direct Store callers
+// can tell a stalled peer from their own canceled context.
+type storeStallGuard struct {
+	cancel context.CancelFunc
+	idle   time.Duration
+	timer  *time.Timer
+
+	mu      sync.Mutex
+	last    time.Time
+	fired   bool
+	stopped bool
+}
+
+// newStoreStallGuard derives a cancelable context from parent and arms the
+// watchdog on it. The returned context must be released via release once the
+// transfer is done.
+func newStoreStallGuard(parent context.Context, idle time.Duration) (context.Context, *storeStallGuard) {
+	ctx, cancel := context.WithCancel(parent)
+	g := &storeStallGuard{cancel: cancel, idle: idle, last: time.Now()}
+	g.timer = time.AfterFunc(idle, g.check)
+	if storeStallGuardHook != nil {
+		storeStallGuardHook(true)
+	}
+	return ctx, g
+}
+
+// check runs when the watchdog timer fires. Progress recorded after the timer
+// was scheduled re-arms it for the remainder of the window; otherwise the
+// guard is latched as fired and the transfer context is canceled.
+func (g *storeStallGuard) check() {
+	g.mu.Lock()
+	if g.stopped {
+		g.mu.Unlock()
+		return
+	}
+	if left := g.idle - time.Since(g.last); left > 0 {
+		g.timer.Reset(left)
+		g.mu.Unlock()
+		return
+	}
+	g.fired = true
+	g.mu.Unlock()
+	g.cancel()
+}
+
+// progress records a successful body transfer and re-arms the watchdog.
+func (g *storeStallGuard) progress() {
+	g.mu.Lock()
+	g.last = time.Now()
+	g.mu.Unlock()
+}
+
+// stop disarms the watchdog. It is idempotent, and a stopped guard never
+// fires or reports a stall.
+func (g *storeStallGuard) stop() {
+	g.mu.Lock()
+	first := !g.stopped
+	g.stopped = true
+	g.mu.Unlock()
+	if first {
+		g.timer.Stop()
+		if storeStallGuardHook != nil {
+			storeStallGuardHook(false)
+		}
+	}
+}
+
+// release stops the watchdog and releases the derived context.
+func (g *storeStallGuard) release() {
+	g.stop()
+	g.cancel()
+}
+
+// stalled reports whether the watchdog canceled the transfer.
+func (g *storeStallGuard) stalled() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.fired
+}
+
+// stallError maps a failed remote operation: a watchdog cancellation is
+// surfaced as ErrTransferStalled, everything else (including the caller's own
+// context cancellation) is passed through unchanged.
+func stallError(ctx context.Context, guard *storeStallGuard, err error) error {
+	if err == nil {
+		return nil
+	}
+	if guard.stalled() && ctx.Err() == nil {
+		return fmt.Errorf("cache: remote transfer made no progress for %s: %w", guard.idle, ErrTransferStalled)
+	}
+	return err
+}
+
+// stallGuardReader re-arms a watchdog on every successful read. It wraps
+// request (upload) bodies: when the transport stops pulling bytes because the
+// peer applies backpressure, the watchdog fires and cancels the request.
+type stallGuardReader struct {
+	r     io.Reader
+	guard *storeStallGuard
+}
+
+func (r *stallGuardReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if n > 0 {
+		r.guard.progress()
+	}
+	return n, err
+}
+
+// stallGuardedBody wraps a response body so every read re-arms the watchdog
+// and Close disarms it and releases the transfer context.
+type stallGuardedBody struct {
+	io.ReadCloser
+	guard *storeStallGuard
+}
+
+func (b *stallGuardedBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if n > 0 {
+		b.guard.progress()
+	}
+	return n, err
+}
+
+func (b *stallGuardedBody) Close() error {
+	b.guard.release()
+	return b.ReadCloser.Close()
 }
 
 // Key computes the cache key for base and the workspace's hashFiles. Every
@@ -135,7 +302,9 @@ func (s *Store) Key(base string, workspace string, hashFiles []string) (string, 
 
 // Restore is RestoreContext with the Store's default context: a caller-owned
 // Client supplies its own bounds, otherwise an explicit finite
-// defaultAPITimeout applies so a direct call cannot hang forever. Use
+// defaultAPITimeout applies so a direct call cannot hang forever. In every
+// case the remote body is bounded by the sliding storeStallTimeout watchdog,
+// so a stalled transfer fails with ErrTransferStalled instead of hanging. Use
 // RestoreContext to supply the caller's context.
 func (s *Store) Restore(key, workspace string, paths []string) (bool, error) {
 	ctx, cancel := s.defaultContext()
@@ -382,9 +551,11 @@ func openExtractRoot(workspace string) (*safefs.Root, error) {
 	return root, nil
 }
 
-// Save is SaveContext with the Store's default context: a caller-owned
-// Client supplies its own bounds, otherwise an explicit finite
-// defaultAPITimeout applies so a direct call cannot hang forever.
+// Save is SaveContext with the Store's default context: a caller-owned Client
+// supplies its own bounds, otherwise an explicit finite defaultAPITimeout
+// applies so a direct call cannot hang forever. In every case the remote body
+// is bounded by the sliding storeStallTimeout watchdog, so a stalled upload
+// fails with ErrTransferStalled instead of hanging.
 func (s *Store) Save(key, workspace string, paths []string) error {
 	ctx, cancel := s.defaultContext()
 	defer cancel()
@@ -488,21 +659,30 @@ func (s *Store) fetchRemoteContext(ctx context.Context, key string) error {
 	if !validKey(key) {
 		return fmt.Errorf("cache: invalid cache key")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.RemoteURL+"/api/v1/cache/"+key, nil)
+	// The watchdog is the Store's own enforcement: it is layered over the
+	// caller's context and whatever bounds the client has, so a stalled
+	// download fails even when the client carries no total timeout.
+	reqCtx, guard := newStoreStallGuard(ctx, storeStallTimeout)
+	defer guard.release()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, s.RemoteURL+"/api/v1/cache/"+key, nil)
 	if err != nil {
 		return err
 	}
 	s.auth(req)
 	resp, err := s.client().Do(req)
 	if err != nil {
-		return err
+		return stallError(ctx, guard, err)
 	}
-	defer resp.Body.Close()
+	body := &stallGuardedBody{ReadCloser: resp.Body, guard: guard}
+	defer body.Close()
 	if resp.StatusCode == http.StatusNotFound {
 		return errRemoteNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		b, rerr := io.ReadAll(io.LimitReader(body, 4096))
+		if rerr != nil {
+			return stallError(ctx, guard, rerr)
+		}
 		return fmt.Errorf("cache download %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
 	if err := os.MkdirAll(s.Root, 0o755); err != nil {
@@ -524,7 +704,7 @@ func (s *Store) fetchRemoteContext(ctx context.Context, key string) error {
 	}
 	tmp := f.Name()
 	h := sha256.New()
-	n, cp := io.Copy(io.MultiWriter(f, h), io.LimitReader(resp.Body, bound+1))
+	n, cp := io.Copy(io.MultiWriter(f, h), io.LimitReader(body, bound+1))
 	if cp == nil && n > bound {
 		cp = fmt.Errorf("cache download exceeds %d compressed bytes", bound)
 	}
@@ -532,7 +712,7 @@ func (s *Store) fetchRemoteContext(ctx context.Context, key string) error {
 	cl := closeCacheFile(f)
 	if cp != nil {
 		_ = os.Remove(tmp)
-		return cp
+		return stallError(ctx, guard, cp)
 	}
 	if syncErr != nil {
 		_ = os.Remove(tmp)
@@ -581,18 +761,35 @@ func (s *Store) pushRemoteContext(ctx context.Context, key string) error {
 		return err
 	}
 	defer f.Close()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, s.RemoteURL+"/api/v1/cache/"+key, f)
+	fi, err := f.Stat()
 	if err != nil {
 		return err
 	}
+	// The watchdog wraps the upload body, so the transfer is canceled when
+	// the transport stops pulling bytes (peer backpressure) or the server
+	// stops responding.
+	reqCtx, guard := newStoreStallGuard(ctx, storeStallTimeout)
+	defer guard.release()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPut, s.RemoteURL+"/api/v1/cache/"+key, &stallGuardReader{r: f, guard: guard})
+	if err != nil {
+		return err
+	}
+	// The wrapped body defeats net/http's *os.File length detection, so set
+	// the length explicitly to keep the upload a fixed-length body (a chunked
+	// body would make the server reserve the full cap before staging).
+	req.ContentLength = fi.Size()
 	s.auth(req)
 	resp, err := s.client().Do(req)
 	if err != nil {
-		return err
+		return stallError(ctx, guard, err)
 	}
-	defer resp.Body.Close()
+	body := &stallGuardedBody{ReadCloser: resp.Body, guard: guard}
+	defer body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		b, rerr := io.ReadAll(io.LimitReader(body, 4096))
+		if rerr != nil {
+			return stallError(ctx, guard, rerr)
+		}
 		return fmt.Errorf("cache upload %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
 	return nil

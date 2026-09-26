@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +28,11 @@ import (
 type TartBackend struct {
 	VM      string
 	Network string
+	// RunID and JobID identify the owning run/job. The clone name embeds a
+	// hash of them, so two runner processes that generate the same nanosecond
+	// timestamp still derive distinct VM names. Set by the executor.
+	RunID string
+	JobID string
 	// RequireImmutableImages rejects VM references that are not pinned by an
 	// @sha256: digest. Set by the executor from Options for untrusted jobs.
 	RequireImmutableImages bool
@@ -53,23 +60,76 @@ func (*TartBackend) Name() string { return "tart" }
 // exercise the never-got-an-IP failure without waiting a minute.
 var tartIPWait = 60 * time.Second
 
+// tartProbeTimeout bounds the quick `tart run --help` capability probe, so a
+// wedged tart cannot stall job startup waiting for diagnostic output; a probe
+// that times out yields no help text and the unsupported flags are reported
+// as advisory.
+var tartProbeTimeout = 15 * time.Second
+
+// tartRunHelp runs the bounded `tart run --help` probe and returns its output
+// (empty on error or timeout).
+func tartRunHelp(ctx context.Context, tart string) string {
+	hctx, cancel := context.WithTimeout(ctx, tartProbeTimeout)
+	defer cancel()
+	out, _ := exec.CommandContext(hctx, tart, "run", "--help").CombinedOutput()
+	return string(out)
+}
+
+// tartIPProbe asks tart for the clone's IP under a context bounded by the
+// remaining IP-wait window (and the job context), so a wedged `tart ip`
+// cannot defeat the loop's tartIPWait bound. An error or timeout yields "".
+func tartIPProbe(ctx context.Context, deadline time.Time, tart, clone string) string {
+	pctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	out, err := exec.CommandContext(pctx, tart, "ip", clone).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // generateSSHKey is a test-only seam over generateEphemeralSSHKey. Production
 // behavior is unchanged; it lets the checked SSH key-generation failure branch
 // be exercised (key generation can genuinely fail: ssh-keygen errors and the
 // Go fallback cannot write).
 var generateSSHKey = generateEphemeralSSHKey
 
-// tartCloneName derives the physical name of this job's disposable VM clone:
-// kiwi-<unique-unix-nano>. The grammar is fixed by the GC contract
-// (parseTartVMs parses the numeric suffix as a creation timestamp), so the
-// name cannot carry a hash of the run/job identity; uniqueness comes from the
-// shared monotonic timestamp (nextPhysicalNano), which guarantees two clones
-// created by one process can never share a name (the clock resolution on
-// some hosts is coarser than a nanosecond). A cross-process name clash is
-// detected by tart itself: `tart clone` refuses an existing VM instead of
-// silently reusing or deleting another job's VM.
-func tartCloneName() string {
-	return fmt.Sprintf("kiwi-%d", nextPhysicalNano())
+// maxTartCloneNameLen bounds the generated tart clone name. Tart stores a VM
+// as a directory on the host filesystem, whose component limit is 255 bytes;
+// 200 keeps the same headroom as the executor's docker physical names.
+const maxTartCloneNameLen = 200
+
+// tartCleanupTimeout bounds every tart delete (job cleanup and the deferred
+// delete after a failed run start).
+var tartCleanupTimeout = 15 * time.Second
+
+// identityHash16 returns the first 8 bytes (16 hex characters) of the SHA-256
+// of an identity. The identity is hashed verbatim; callers choose the field
+// separator so distinct identities cannot collide through concatenation
+// ambiguity. This is the same construction as the bounding suffix of
+// boundedNormalizedName (SHA-256 of the full identity, first 8 bytes as hex).
+func identityHash16(identity string) string {
+	sum := sha256.Sum256([]byte(identity))
+	return hex.EncodeToString(sum[:8])
+}
+
+// tartCloneNameFor is the pure naming rule behind tartCloneName: the physical
+// name of a disposable VM clone is kiwi-<unix-nano>-<hash16>, where hash16 is
+// the first 8 bytes of the SHA-256 of the full run/job identity. The
+// monotonic timestamp keeps two clones from one process distinct even on a
+// coarse clock; the identity hash keeps clones from different run/job
+// identities distinct even when two processes generate the same nanosecond.
+// The name is passed through boundedNormalizedName so it can never exceed the
+// executor's tart name budget, and the GC grammar (parseTartVMs) accepts both
+// this form and the legacy kiwi-<unix-nano>.
+func tartCloneNameFor(runID, jobID string, nano int64) string {
+	return boundedNormalizedName(fmt.Sprintf("kiwi-%d-%s", nano, identityHash16(runID+"\x00"+jobID)), maxTartCloneNameLen)
+}
+
+// tartCloneName derives the clone name with this process's next monotonic
+// timestamp.
+func tartCloneName(runID, jobID string) string {
+	return tartCloneNameFor(runID, jobID, nextPhysicalNano())
 }
 
 // StartJob clones and boots one disposable Tart VM for the entire CI job.
@@ -107,7 +167,7 @@ func (b *TartBackend) StartJob(ctx context.Context, workspace string, emit func(
 		return &RunError{Kind: ErrorInfra, Err: err}
 	}
 	b.tart, b.ssh, b.workspace = tart, ssh, abs
-	b.clone = tartCloneName()
+	b.clone = tartCloneName(b.RunID, b.JobID)
 	if err := b.setupSSHDir(); err != nil {
 		_ = b.CloseJob()
 		return &RunError{Kind: ErrorInfra, Err: err}
@@ -121,8 +181,7 @@ func (b *TartBackend) StartJob(ctx context.Context, workspace string, emit func(
 	// Resource requests map onto the tart run flags the installed CLI
 	// actually supports; unsupported requests are reported as advisory
 	// lines (the requests themselves were already admission-checked).
-	runHelp, _ := exec.CommandContext(ctx, tart, "run", "--help").CombinedOutput()
-	flags, advisory := tartResourceFlags(b.Resources, string(runHelp))
+	flags, advisory := tartResourceFlags(b.Resources, tartRunHelp(ctx, tart))
 	for _, a := range advisory {
 		emit(a)
 	}
@@ -131,8 +190,15 @@ func (b *TartBackend) StartJob(ctx context.Context, workspace string, emit func(
 	runArgs = append(runArgs, "--dir=workspace:"+abs, b.clone)
 	b.run = exec.CommandContext(ctx, tart, runArgs...)
 	if err := b.run.Start(); err != nil {
-		_ = exec.Command(tart, "delete", b.clone).Run()
+		// The clone was created by the successful clone step even though the
+		// run process never started: delete it through the bounded cleanup
+		// path (so a wedged tart cannot strand this goroutine) and fold a
+		// cleanup failure into the returned error instead of discarding it.
+		cerr := b.deleteCloneBounded(ctx)
 		_ = b.CloseJob()
+		if cerr != nil {
+			return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("start tart VM: %w (clone cleanup: %v)", err, cerr)}
+		}
 		return &RunError{Kind: ErrorInfra, Err: err}
 	}
 	deadline := time.Now().Add(tartIPWait)
@@ -141,9 +207,8 @@ func (b *TartBackend) StartJob(ctx context.Context, workspace string, emit func(
 			_ = b.CloseJob()
 			return &RunError{Kind: ErrorCancelled, Err: ctx.Err()}
 		}
-		out, er := exec.CommandContext(ctx, tart, "ip", b.clone).Output()
-		if er == nil && strings.TrimSpace(string(out)) != "" {
-			b.ip = strings.TrimSpace(string(out))
+		if ip := tartIPProbe(ctx, deadline, tart, b.clone); ip != "" {
+			b.ip = ip
 			break
 		}
 		time.Sleep(time.Second)
@@ -346,17 +411,39 @@ func (b *TartBackend) setupSSHDir() error {
 	return nil
 }
 
+// sshKeygenTimeout bounds the ssh-keygen invocation: a wedged keygen must
+// fall back to the in-process generator within the bound instead of stranding
+// job startup.
+var sshKeygenTimeout = 30 * time.Second
+
+// runSSHKeygen runs the bounded ssh-keygen invocation. Split out so the
+// typed-timeout contract is directly testable.
+func runSSHKeygen(keygen, path string) error {
+	_, err := boundedToolCommand(context.Background(), sshKeygenTimeout, keygen, "-t", "ed25519", "-N", "", "-C", "kiwi-job", "-f", path)
+	return err
+}
+
 // generateEphemeralSSHKey writes a fresh Ed25519 keypair. It prefers
 // ssh-keygen (present on every Mac with ssh) and falls back to generating the
 // key in Go and encoding it as an OpenSSH PKCS8 PEM file, which ssh accepts
-// via -i alongside the written .pub file.
+// via -i alongside the written .pub file. The ssh-keygen invocation is
+// bounded; any keygen failure (including a timeout) falls back to the Go
+// generator, and the keygen failure is preserved and reported if the fallback
+// also fails.
 func generateEphemeralSSHKey(path string) error {
+	var keygenErr error
 	if keygen, err := exec.LookPath("ssh-keygen"); err == nil {
-		if _, kerr := exec.Command(keygen, "-t", "ed25519", "-N", "", "-C", "kiwi-job", "-f", path).CombinedOutput(); kerr == nil {
+		if keygenErr = runSSHKeygen(keygen, path); keygenErr == nil {
 			return nil
 		}
 	}
-	return writeGoGeneratedKey(path)
+	if err := writeGoGeneratedKey(path); err != nil {
+		if keygenErr != nil {
+			return fmt.Errorf("ssh-keygen invocation failed (%v); in-process key generation also failed: %w", keygenErr, err)
+		}
+		return err
+	}
+	return nil
 }
 
 func writeGoGeneratedKey(path string) error {
@@ -388,19 +475,30 @@ func wrapBase64(b []byte) string {
 	return sb.String()
 }
 
+// deleteCloneBounded removes the job's VM clone through the bounded cleanup
+// helper and clears the clone name, so the call is idempotent and safe from
+// both CloseJob and the run-start failure path. A clone tart reports as
+// missing is not an error; a timeout or any other failure is returned with
+// the bounded output, never silently discarded.
+func (b *TartBackend) deleteCloneBounded(parent context.Context) error {
+	if b.clone == "" || b.tart == "" {
+		return nil
+	}
+	clone := b.clone
+	b.clone = ""
+	out, err := boundedToolCommand(parent, tartCleanupTimeout, b.tart, "delete", clone)
+	if err != nil && !strings.Contains(string(out), "does not exist") {
+		return fmt.Errorf("delete Tart VM: %w", err)
+	}
+	return nil
+}
+
 func (b *TartBackend) CloseJob() error {
 	if b.run != nil && b.run.Process != nil {
 		_ = b.run.Process.Kill()
 		_, _ = b.run.Process.Wait()
 	}
-	var err error
-	if b.clone != "" && b.tart != "" {
-		out, derr := exec.Command(b.tart, "delete", b.clone).CombinedOutput()
-		b.clone = ""
-		if derr != nil && !strings.Contains(string(out), "does not exist") {
-			err = fmt.Errorf("delete Tart VM: %v: %s", derr, strings.TrimSpace(string(out)))
-		}
-	}
+	err := b.deleteCloneBounded(context.Background())
 	if b.sshDir != "" {
 		_ = os.RemoveAll(b.sshDir)
 		b.sshDir = ""

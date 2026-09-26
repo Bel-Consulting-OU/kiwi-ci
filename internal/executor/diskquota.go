@@ -1,13 +1,14 @@
 package executor
 
 import (
+	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // DefaultUntrustedWorkspaceMaxBytes is the mandatory workspace disk budget for
@@ -403,11 +404,17 @@ func xfsProjectCleanupCommands(workspace string, projID uint32) []string {
 	}
 }
 
-// runXFSQuotaCommand executes `xfs_quota -x -c <command> <mountPoint>`.
+// xfsQuotaTimeout bounds every xfs_quota invocation: a wedged xfs_quota must
+// fail quota setup or workspace cleanup within the bound instead of stranding
+// the runner goroutine.
+var xfsQuotaTimeout = 30 * time.Second
+
+// runXFSQuotaCommand executes `xfs_quota -x -c <command> <mountPoint>` under
+// the bounded tool-command helper. A timeout or failure is returned with the
+// bounded command output, never silently discarded.
 func runXFSQuotaCommand(xq, mountPoint, command string) error {
-	out, err := exec.Command(xq, "-x", "-c", command, mountPoint).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%s: %v: %s", command, err, strings.TrimSpace(string(out)))
+	if _, err := boundedToolCommand(context.Background(), xfsQuotaTimeout, xq, "-x", "-c", command, mountPoint); err != nil {
+		return fmt.Errorf("%s: %w", command, err)
 	}
 	return nil
 }

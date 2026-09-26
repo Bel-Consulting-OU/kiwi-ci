@@ -506,6 +506,8 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		b.WorkspaceQuota = e.Opt.WorkspaceQuota
 		b.CgroupParent = cgroupParent
 	case *TartBackend:
+		b.RunID = e.Opt.RunID
+		b.JobID = cj.ID
 		b.RequireImmutableImages = e.Opt.RequireImmutableImages
 		if e.Opt.TartAgentPort > 0 {
 			b.AgentPort = e.Opt.TartAgentPort

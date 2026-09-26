@@ -2590,59 +2590,6 @@ func (s *PostgresStore) cancelRunRowTx(ctx context.Context, tx pgx.Tx, runID, re
 	return true, nil
 }
 
-// cancelRunChildrenTx cancels every non-terminal child job of a run through
-// cancelJobTx, in the caller's transaction, without touching the run row. It
-// reports whether any child was actually cancelled. The child jobs are locked
-// (SELECT ... FOR UPDATE) FIRST, in id order, and the run row is never locked
-// here: that keeps the job -> run order AcquireLeaseAtomic (job -> runner) and
-// CompleteJob (job -> run through recomputeRunTx) use, so a cascade can never
-// deadlock against a completion that already holds the job row.
-func (s *PostgresStore) cancelRunChildrenTx(ctx context.Context, tx pgx.Tx, runID, reason string, cause JobCancelCause) (bool, error) {
-	rows, err := tx.Query(ctx, `SELECT id FROM jobs WHERE run_id=$1 AND NOT (status IN ('success', 'failure', 'cancelled', 'skipped', 'blocked')) ORDER BY id FOR UPDATE`, runID)
-	if err != nil {
-		return false, err
-	}
-	ids := []string{}
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return false, err
-		}
-		ids = append(ids, id)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return false, err
-	}
-	cancelled := false
-	for _, id := range ids {
-		ok, err := s.cancelJobTx(ctx, tx, id, reason, cause)
-		if err != nil {
-			return false, err
-		}
-		if ok {
-			cancelled = true
-		}
-	}
-	return cancelled, nil
-}
-
-// cancelRunTx cancels a run and every non-terminal child job through
-// cancelJobTx, in the caller's transaction, and reports whether the RUN row
-// was transitioned. It is the run-level cancellation used by the repair
-// quarantine cascade and by --cancel-active.
-//
-// LOCK ORDER: cancelRunChildrenTx locks and cancels the non-terminal child
-// jobs FIRST; the run row is locked LAST by cancelRunRowTx. That is job -> run
-// (see cancelRunChildrenTx).
-func (s *PostgresStore) cancelRunTx(ctx context.Context, tx pgx.Tx, runID, reason string, cause JobCancelCause) (bool, error) {
-	if _, err := s.cancelRunChildrenTx(ctx, tx, runID, reason, cause); err != nil {
-		return false, err
-	}
-	return s.cancelRunRowTx(ctx, tx, runID, reason, cause)
-}
-
 // CancelRunJobs cancels every non-terminal job of the run and the run
 // itself in one transaction. Every cancelled RUNNING job releases its
 // runner's active_jobs slot (and its quota running slot) in the SAME
