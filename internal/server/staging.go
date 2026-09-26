@@ -1,6 +1,32 @@
 package server
 
-import "github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
+import (
+	"context"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
+)
+
+// retryStagingCleanup runs the shared budget's pending-cleanup retry: every
+// spool file whose removal failed after its bytes were no longer needed is
+// retried here (Maintain calls this every tick). Until a retry succeeds the
+// bytes stay charged and the spool stays registered, so Used() keeps
+// reflecting physical occupancy and no new reservation can be admitted
+// against unreclaimable bytes. A still-failing removal is logged with the
+// pending count, which is the observable degraded/cleanup-required condition.
+func (s *Server) retryStagingCleanup(ctx context.Context) {
+	b := s.StagingBudget()
+	if b == nil || b.PendingCleanup() == 0 {
+		return
+	}
+	removed, err := b.RetryCleanup(ctx)
+	if err != nil {
+		s.logError("staging: pending spool cleanup retry failed", "removed", removed, "pending", b.PendingCleanup(), "error", err.Error())
+		return
+	}
+	if removed > 0 {
+		s.logf("staging: reclaimed %d pending spool file(s)", removed)
+	}
+}
 
 // StagingBudget returns the shared weighted staging budget every large-upload
 // path must charge before spooling bytes: the job cache upload and (through

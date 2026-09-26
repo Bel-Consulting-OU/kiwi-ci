@@ -50,7 +50,9 @@ type TokenStore struct {
 	// saveMu serializes Save. Concurrent Save calls on one store are legal:
 	// each call snapshots, marshals and durably writes its own bytes with no
 	// other Save interleaved, so a call can never acknowledge another call's
-	// writes and the file at path always matches exactly one call.
+	// writes and the file at path always matches exactly one call. Save also
+	// holds mu's read lock through publication so token mutations cannot
+	// complete mid-save (see Save).
 	saveMu sync.Mutex
 }
 
@@ -393,20 +395,33 @@ func validatePrincipalRepoGrants(p Principal) error {
 //
 // Concurrent Save calls are legal and serialized by saveMu; each call
 // snapshots and writes its own bytes, so no call can acknowledge or corrupt
-// another call's write. The on-disk format is unchanged (a JSON map of
-// digest to principal).
+// another call's write. Save is ALSO serialized against token mutations: the
+// token-state read lock is held from the snapshot through durable publication,
+// so AddToken/RemoveToken/Load cannot complete while a Save is in flight. A
+// mutation acknowledged before Save began is always in the saved snapshot, and
+// a mutation arriving during publication blocks until the file is durable —
+// a crash can therefore never restore a state older than a mutation that
+// already returned success. (Mutations are administrative and rare, so
+// serializing them behind an fsync is the deliberate correctness trade.) The
+// on-disk format is unchanged (a JSON map of digest to principal).
 func (t *TokenStore) Save(path string) error {
 	if t == nil {
 		return fmt.Errorf("auth: nil token store")
 	}
 	t.saveMu.Lock()
 	defer t.saveMu.Unlock()
+	// Hold the read lock through serialization AND durable publication:
+	// AddToken/RemoveToken/Load take the write lock, so no mutation can
+	// complete between this snapshot and the rename below. Releasing the lock
+	// before publication would allow: snapshot old state -> mutation commits
+	// and returns success -> Save publishes the old state -> crash restores
+	// the revoked token (or loses the added one).
 	t.mu.RLock()
+	defer t.mu.RUnlock()
 	m := make(map[string]Principal, len(t.tokens))
 	for k, v := range t.tokens {
 		m[k] = v
 	}
-	t.mu.RUnlock()
 	// Migrate any legacy in-process grant keys to the explicit schema so the
 	// persisted file always reloads under the strict Load validation.
 	for k, v := range m {

@@ -37,20 +37,21 @@ var snapshotUploadMaxBytes = snapshot.MaxArchiveBytes
 // is deleted (the reference-aware GC treats records as live references), so
 // an unbounded per-job snapshot history would pin arbitrary storage forever.
 // The cap is enforced BEFORE any staging reservation, directory creation or
-// archive write, so a rejected upload leaves no staging artifact behind.
-// Repository is implied by the run/job: a job's repository cannot change, so
-// a per-(run, job) cap is the per-(run, job, repository) bound.
+// archive write (preflight) AND at commit time (under the job row lock in
+// PostgreSQL, under the store mutex in memory), so concurrent uploads cannot
+// exceed it. Repository is implied by the run/job: a job's repository cannot
+// change, so a per-(run, job) cap is the per-(run, job, repository) bound.
 const DefaultSnapshotMaxPerJob = 32
 
-// snapshotMaxPerJob is the effective per-job snapshot cap. It is a package
-// var so tests and embedders can override it without a config-file change;
-// production keeps DefaultSnapshotMaxPerJob. A value <= 0 disables the cap.
-var snapshotMaxPerJob = DefaultSnapshotMaxPerJob
-
-// SetSnapshotMaxPerJob overrides the per-job snapshot cap (0 or negative
-// disables it). It exists so operators/tests can tighten the documented
-// default without a config-file schema change.
-func SetSnapshotMaxPerJob(n int) { snapshotMaxPerJob = n }
+// WithSnapshotMaxPerJob overrides the per-(run, job) snapshot retention cap at
+// construction (0 or negative disables it). It is a construction-time option
+// because the effective cap is an immutable per-Server field: a package-global
+// mutable policy would let two concurrent handlers (or two replicas of one
+// process) enforce different caps for the same request stream. Servers default
+// to DefaultSnapshotMaxPerJob.
+func WithSnapshotMaxPerJob(n int) PersistentOption {
+	return func(s *Server) { s.snapshotMaxPerJob = n }
+}
 
 // snapshotDeleteStore is the optional durable deletion capability. A store
 // that implements it can remove one snapshot record by its (run_id, id)
@@ -65,26 +66,40 @@ type snapshotDeleteStore interface {
 // 503 the upload path uses.
 var errSnapshotStoreUnavailable = errors.New("snapshot record storage unavailable")
 
+// errSnapshotCountUnsupported reports that the configured DB store has no
+// store-level per-(run, job) count. The upload preflight then SKIPS the early
+// cap check entirely and relies on the commit-time cap (enforced under the job
+// row lock for PostgreSQL and under the store mutex for memory), which is
+// authoritative. The preflight must never fall back to listing and decoding
+// every record of the run: that read is O(records in run) for every upload
+// while the commit-time cap already makes the check exact.
+var errSnapshotCountUnsupported = errors.New("snapshot count unsupported by configured store")
+
+// SnapshotCountStore is the optional store-level count capability the snapshot
+// upload preflight prefers: it reports how many snapshot records the (run,
+// job) pair currently holds through one bounded aggregate query, so an
+// over-cap upload is rejected before its body is read without decoding the
+// run's whole snapshot history. A DB store that does not implement it keeps
+// the full commit-time cap and skips the preflight (see
+// errSnapshotCountUnsupported). It is declared here (not in internal/storage)
+// because it is an optional optimization the control plane probes for, not a
+// required store contract.
+type SnapshotCountStore interface {
+	CountSnapshotsForJob(ctx context.Context, runID, jobID string) (int, error)
+}
+
 // snapshotCountForJob returns how many snapshot records the (run, job) pair
-// currently holds. DB mode reads the run's records through SnapshotStore;
-// memory mode counts the in-memory mirror.
+// currently holds. DB mode uses the optional store-level count when available;
+// a store without it reports errSnapshotCountUnsupported so the caller skips
+// the preflight and relies on the commit-time cap rather than scanning the
+// run. Memory mode counts the in-memory mirror, which is already O(job).
 func (s *Server) snapshotCountForJob(ctx context.Context, runID, jobID string) (int, error) {
 	if s.DB != nil {
-		ss, ok := s.DB.(storage.SnapshotStore)
+		cs, ok := s.DB.(SnapshotCountStore)
 		if !ok {
-			return 0, errSnapshotStoreUnavailable
+			return 0, errSnapshotCountUnsupported
 		}
-		recs, err := ss.ListSnapshotsByRun(ctx, runID)
-		if err != nil {
-			return 0, err
-		}
-		n := 0
-		for _, rec := range recs {
-			if rec.JobID == jobID {
-				n++
-			}
-		}
-		return n, nil
+		return cs.CountSnapshotsForJob(ctx, runID, jobID)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -200,23 +215,39 @@ func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
 		s.writeLeaseAuthError(w, r, authErr)
 		return
 	}
+	// Static wiring gate FIRST: a DB store without transactional lease-commit
+	// support is refused before the count preflight, before a body byte is read
+	// and before any staging reservation is taken, instead of failing after
+	// the whole archive was staged, hashed and published. The late assertion
+	// in uploadSnapshotDB stays as defense in depth.
+	if !s.requireLeaseCommitSupport(w, r) {
+		return
+	}
 	// Retention bound: refuse BEFORE taking a staging reservation, creating
 	// a directory or writing a byte, so an over-cap upload leaves no stage
 	// file and no orphan blob. The record's CAS blob stays pinned until an
 	// admin deletes the record (DeleteSnapshot), after which the
 	// reference-aware GC reclaims it.
-	if snapshotMaxPerJob > 0 {
+	//
+	// The preflight uses a store-level count when the store provides one. A
+	// store without that optional capability is NOT scanned (listing and
+	// decoding every record of the run per upload is unbounded work): the
+	// preflight is skipped and the commit-time cap — under the job row lock
+	// in PostgreSQL, under the store mutex in memory — is the authoritative
+	// enforcement point, surfaced as 409 below.
+	if cap := s.snapshotMaxPerJob; cap > 0 {
 		n, cerr := s.snapshotCountForJob(r.Context(), j.RunID, j.ID)
-		if cerr != nil {
-			if errors.Is(cerr, errSnapshotStoreUnavailable) {
-				http.Error(w, "snapshot record storage unavailable", http.StatusServiceUnavailable)
-				return
-			}
+		switch {
+		case errors.Is(cerr, errSnapshotCountUnsupported):
+			// No early count available: rely on the commit-time cap.
+		case errors.Is(cerr, errSnapshotStoreUnavailable):
+			http.Error(w, "snapshot record storage unavailable", http.StatusServiceUnavailable)
+			return
+		case cerr != nil:
 			s.internalError(w, r, cerr, "")
 			return
-		}
-		if n >= snapshotMaxPerJob {
-			http.Error(w, fmt.Sprintf("snapshot count limit reached for this job (max %d)", snapshotMaxPerJob), http.StatusConflict)
+		case n >= cap:
+			http.Error(w, fmt.Sprintf("snapshot count limit reached for this job (max %d)", cap), http.StatusConflict)
 			return
 		}
 	}
@@ -482,7 +513,11 @@ func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j mode
 		s.internalError(w, r, err, "")
 		return
 	}
-	defer os.Remove(stagedPath)
+	// Cleanup is budget-owned: the reservation is released only once the
+	// staged file is gone; a failed removal stays charged as cleanup debt for
+	// the maintenance retry. The deferred res.Release above becomes a no-op
+	// once cleanup has consumed the reservation.
+	defer func() { stagingBudget.CleanupSpool(stagedPath, res) }()
 	f, err := os.Open(stagedPath)
 	if err != nil {
 		s.internalError(w, r, err, "")
@@ -562,12 +597,18 @@ func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j mode
 	}
 	// Prefer the lease-fenced store method: the live-lease predicate and the
 	// record insert run in ONE transaction, so a lease lost during the
-	// multi-GB staging can never be acknowledged as a snapshot commit.
+	// multi-GB staging can never be acknowledged as a snapshot commit. The
+	// transaction also enforces the per-job cap under the job row lock; a
+	// rejected commit is surfaced as the same 409 the preflight would answer.
 	if leaseStore, ok := s.DB.(storage.LeaseCommitStore); ok {
-		if err := leaseStore.InsertSnapshotForLease(ctx, j.ID, runnerID, gen, snapshotMaxPerJob, rec); err != nil {
+		if err := leaseStore.InsertSnapshotForLease(ctx, j.ID, runnerID, gen, s.snapshotMaxPerJob, rec); err != nil {
 			if leaseLostAtCommit(err) {
 				s.auditLocked("snapshot.lease_lost_at_commit", runnerID, j.RunID, j.ID, "lease lost before snapshot commit", nil)
 				http.Error(w, "lease expired during upload", http.StatusConflict)
+				return
+			}
+			if errors.Is(err, storage.ErrSnapshotCapReached) {
+				http.Error(w, fmt.Sprintf("snapshot count limit reached for this job (max %d)", s.snapshotMaxPerJob), http.StatusConflict)
 				return
 			}
 			http.Error(w, "snapshot record persistence failed", http.StatusServiceUnavailable)
@@ -847,8 +888,10 @@ func (s *Server) downloadSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 	// Strong integrity: the archive is preverified (exact length + digest)
 	// before the response is committed; the verified file is then streamed.
-	reopenFile := func() (io.ReadCloser, error) { return os.Open(rec.Path) }
-	s.serveVerifiedDownload(w, r, "snapshot", f, reopenFile, rec.Size, rec.SHA256, func(w http.ResponseWriter) {
+	// When staging is unavailable the source's own seekable handle is verified
+	// and rewound (no pathname re-open); a non-seekable source is refused
+	// with 503 before headers.
+	s.serveVerifiedDownload(w, r, "snapshot", f, rec.Size, rec.SHA256, func(w http.ResponseWriter) {
 		w.Header().Set("Content-Type", "application/gzip")
 		w.Header().Set("Content-Length", strconv.FormatInt(rec.Size, 10))
 		w.Header().Set("X-Kiwi-Snapshot-SHA256", rec.SHA256)
@@ -910,11 +953,10 @@ func (s *Server) downloadSnapshotDB(w http.ResponseWriter, r *http.Request) {
 		}
 		// Strong integrity: preverify the CAS object (exact length + digest)
 		// before committing the response; a corrupt backend yields no 200.
-		reopenCAS := func() (io.ReadCloser, error) {
-			again, _, oerr := s.CAS.Open(r.Context(), digest)
-			return again, oerr
-		}
-		s.serveVerifiedDownload(w, r, "snapshot", rc, reopenCAS, wantSize, wantSHA, func(w http.ResponseWriter) {
+		// When staging is unavailable the opened handle is verified and
+		// rewound when seekable (never a pathname re-open); a non-seekable
+		// source is refused with 503 before headers.
+		s.serveVerifiedDownload(w, r, "snapshot", rc, wantSize, wantSHA, func(w http.ResponseWriter) {
 			w.Header().Set("Content-Type", "application/gzip")
 			w.Header().Set("Content-Length", strconv.FormatInt(wantSize, 10))
 			w.Header().Set("X-Kiwi-Snapshot-SHA256", digest)
@@ -927,8 +969,7 @@ func (s *Server) downloadSnapshotDB(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "snapshot archive missing", http.StatusNotFound)
 			return
 		}
-		reopenFile := func() (io.ReadCloser, error) { return os.Open(rec.Path) }
-		s.serveVerifiedDownload(w, r, "snapshot", f, reopenFile, rec.Size, rec.SHA256, func(w http.ResponseWriter) {
+		s.serveVerifiedDownload(w, r, "snapshot", f, rec.Size, rec.SHA256, func(w http.ResponseWriter) {
 			w.Header().Set("Content-Type", "application/gzip")
 			w.Header().Set("Content-Length", strconv.FormatInt(rec.Size, 10))
 			w.Header().Set("X-Kiwi-Snapshot-SHA256", rec.SHA256)

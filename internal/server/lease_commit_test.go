@@ -65,6 +65,21 @@ func (f *leaseFakeStore) PutCacheManifestForLease(ctx context.Context, jobID, ru
 	if !f.leaseOK(jobID, runnerID, generation) {
 		return fmt.Errorf("%w: cache manifest", storage.ErrLeaseLost)
 	}
+	j, ok := f.lockedJob(jobID)
+	if !ok {
+		return fmt.Errorf("%w: cache manifest", storage.ErrLeaseLost)
+	}
+	repo, trust := cacheNamespace(j)
+	if rec.Repo != repo || rec.TrustDomain != trust {
+		return fmt.Errorf("%w: cache manifest namespace (%s/%s) does not match leased job (%s/%s)", storage.ErrLeaseIdentityMismatch, rec.Repo, rec.TrustDomain, repo, trust)
+	}
+	if rec.ProducerJob != "" && rec.ProducerJob != jobID {
+		return fmt.Errorf("%w: cache manifest producer job %q does not match leased job %s", storage.ErrLeaseIdentityMismatch, rec.ProducerJob, jobID)
+	}
+	if rec.ProducerRun != "" && rec.ProducerRun != j.RunID {
+		return fmt.Errorf("%w: cache manifest producer run %q does not match leased job run %s", storage.ErrLeaseIdentityMismatch, rec.ProducerRun, j.RunID)
+	}
+	rec.ProducerJob, rec.ProducerRun = jobID, j.RunID
 	return f.dbFakeStore.PutCacheManifest(ctx, rec)
 }
 
@@ -72,15 +87,31 @@ func (f *leaseFakeStore) InsertSnapshotForLease(ctx context.Context, jobID, runn
 	if !f.leaseOK(jobID, runnerID, generation) {
 		return fmt.Errorf("%w: snapshot", storage.ErrLeaseLost)
 	}
+	j, ok := f.lockedJob(jobID)
+	if !ok {
+		return fmt.Errorf("%w: snapshot", storage.ErrLeaseLost)
+	}
+	if rec.JobID != jobID {
+		return fmt.Errorf("%w: snapshot %s job id %q does not match leased job %s", storage.ErrLeaseIdentityMismatch, rec.ID, rec.JobID, jobID)
+	}
+	if rec.RunID != j.RunID {
+		return fmt.Errorf("%w: snapshot %s run id %q does not match leased job run %s", storage.ErrLeaseIdentityMismatch, rec.ID, rec.RunID, j.RunID)
+	}
+	if rec.JobKey != "" && rec.JobKey != j.Key {
+		return fmt.Errorf("%w: snapshot %s job key %q does not match leased job key %q", storage.ErrLeaseIdentityMismatch, rec.ID, rec.JobKey, j.Key)
+	}
+	if rec.JobKey == "" {
+		rec.JobKey = j.Key
+	}
 	if maxPerJob > 0 {
-		f.mu.Lock()
+		f.dbFakeStore.mu.Lock()
 		n := 0
 		for _, existing := range f.snapshots {
-			if existing.RunID == rec.RunID && existing.JobID == rec.JobID {
+			if existing.RunID == j.RunID && existing.JobID == jobID {
 				n++
 			}
 		}
-		f.mu.Unlock()
+		f.dbFakeStore.mu.Unlock()
 		if n >= maxPerJob {
 			return fmt.Errorf("%w: job %s already has %d snapshots", storage.ErrSnapshotCapReached, jobID, n)
 		}
@@ -92,7 +123,34 @@ func (f *leaseFakeStore) InsertArtifactOnceForLease(ctx context.Context, jobID, 
 	if !f.leaseOK(jobID, runnerID, generation) {
 		return model.ArtifactRecord{}, false, fmt.Errorf("%w: artifact", storage.ErrLeaseLost)
 	}
+	j, ok := f.lockedJob(jobID)
+	if !ok {
+		return model.ArtifactRecord{}, false, fmt.Errorf("%w: artifact", storage.ErrLeaseLost)
+	}
+	if a.JobID != jobID {
+		return model.ArtifactRecord{}, false, fmt.Errorf("%w: artifact %s job id %q does not match leased job %s", storage.ErrLeaseIdentityMismatch, a.Name, a.JobID, jobID)
+	}
+	if a.RunID != j.RunID {
+		return model.ArtifactRecord{}, false, fmt.Errorf("%w: artifact %s run id %q does not match leased job run %s", storage.ErrLeaseIdentityMismatch, a.Name, a.RunID, j.RunID)
+	}
+	if a.LeaseGeneration != generation {
+		return model.ArtifactRecord{}, false, fmt.Errorf("%w: artifact %s lease generation %d does not match leased generation %d", storage.ErrLeaseIdentityMismatch, a.Name, a.LeaseGeneration, generation)
+	}
+	if a.JobKey != "" && a.JobKey != j.Key {
+		return model.ArtifactRecord{}, false, fmt.Errorf("%w: artifact %s job key %q does not match leased job key %q", storage.ErrLeaseIdentityMismatch, a.Name, a.JobKey, j.Key)
+	}
+	if a.JobKey == "" {
+		a.JobKey = j.Key
+	}
 	return f.dbFakeStore.InsertArtifactOnce(ctx, a)
+}
+
+// lockedJob reads the wrapped store's job under its mutex.
+func (f *leaseFakeStore) lockedJob(jobID string) (model.Job, bool) {
+	f.dbFakeStore.mu.Lock()
+	defer f.dbFakeStore.mu.Unlock()
+	j, ok := f.dbFakeStore.jobs[jobID]
+	return j, ok
 }
 
 func (f *leaseFakeStore) PutCacheManifest(ctx context.Context, rec storage.CacheManifestRecord) error {

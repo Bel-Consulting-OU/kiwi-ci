@@ -32,9 +32,12 @@ func leaseCommitITJob(t *testing.T, st *PostgresStore, repo string) (runID, jobI
 }
 
 func leaseCommitITManifest(key string) CacheManifestRecord {
+	// pgITEnqueueOne's jobs carry RepoURL pgITRepo + RepoFullName
+	// "kiwi-it/repo" and no Trusted flag: the authoritative namespace derived
+	// from the locked job is (pgITRepoID, "untrusted").
 	return CacheManifestRecord{
-		Repo:        "github.com/kiwi-it/repo",
-		TrustDomain: "trusted",
+		Repo:        pgITRepoID,
+		TrustDomain: "untrusted",
 		LogicalKey:  key,
 		BlobSHA256:  strings.Repeat("a", 64),
 		BlobSize:    11,
@@ -53,7 +56,7 @@ func TestIntegrationLeaseCommitPredicatesLive(t *testing.T) {
 	if err := st.PutCacheManifestForLease(ctx, jobID, runnerID, gen, leaseCommitITManifest("live")); err != nil {
 		t.Fatalf("PutCacheManifestForLease: %v", err)
 	}
-	if _, found, err := st.GetCacheManifest(ctx, "github.com/kiwi-it/repo", "trusted", "live"); err != nil || !found {
+	if _, found, err := st.GetCacheManifest(ctx, pgITRepoID, "untrusted", "live"); err != nil || !found {
 		t.Fatalf("cache manifest after live commit = (%v, %v)", found, err)
 	}
 	rec := model.SnapshotRecord{ID: pgITNewID(t), RunID: runID, JobID: jobID, CreatedAt: time.Now().UTC()}
@@ -105,7 +108,7 @@ func TestIntegrationLeaseCommitPredicatesRevoked(t *testing.T) {
 			if err := st.PutCacheManifestForLease(ctx, jobID, runnerID, gen, leaseCommitITManifest(key)); !errors.Is(err, ErrLeaseLost) {
 				t.Fatalf("PutCacheManifestForLease = %v, want ErrLeaseLost", err)
 			}
-			if _, found, _ := st.GetCacheManifest(ctx, "github.com/kiwi-it/repo", "trusted", key); found {
+			if _, found, _ := st.GetCacheManifest(ctx, pgITRepoID, "untrusted", key); found {
 				t.Fatal("cache manifest committed despite a revoked lease")
 			}
 			if err := st.InsertSnapshotForLease(ctx, jobID, runnerID, gen, 0, model.SnapshotRecord{ID: pgITNewID(t), RunID: runID, JobID: jobID, CreatedAt: time.Now().UTC()}); !errors.Is(err, ErrLeaseLost) {
@@ -171,7 +174,7 @@ func TestIntegrationLeaseCommitConcurrentCancel(t *testing.T) {
 			t.Fatalf("commit after concurrent cancel = %v, want ErrLeaseLost", err)
 		}
 	}
-	if _, found, _ := st.GetCacheManifest(ctx, "github.com/kiwi-it/repo", "trusted", "race-cache"); found {
+	if _, found, _ := st.GetCacheManifest(ctx, pgITRepoID, "untrusted", "race-cache"); found {
 		t.Fatal("cache manifest committed after a concurrent cancel")
 	}
 	if got, _ := st.ListSnapshotsByRun(ctx, runID); len(got) != 0 {
@@ -208,5 +211,145 @@ func TestIntegrationLeaseCommitArtifactConflictPrecedence(t *testing.T) {
 	}
 	if _, _, err := st.InsertArtifactOnceForLease(ctx, jobID, runnerID, gen, conflict); !errors.Is(err, ErrLeaseLost) {
 		t.Fatalf("revoked conflict = %v, want ErrLeaseLost (predicate precedes conflict)", err)
+	}
+}
+
+// TestIntegrationLeaseCommitIdentityBindingCrossJobRefused is the X3-A
+// fresh-DB regression: a live lease over job A cannot carry job B's
+// snapshot/artifact/cache identity. Every cross-bound field is refused with
+// the typed ErrLeaseIdentityMismatch and commits NOTHING (the assertion
+// covers both jobs' runs and every cache namespace variant).
+func TestIntegrationLeaseCommitIdentityBindingCrossJobRefused(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	runA, jobA, runnerA, genA := leaseCommitITJob(t, st, pgITRepo)
+	runB, jobB, _, _ := leaseCommitITJob(t, st, pgITRepo)
+
+	// Snapshot carrying B's run and job id while proving A's lease.
+	snapB := model.SnapshotRecord{ID: pgITNewID(t), RunID: runB, JobID: jobB, CreatedAt: time.Now().UTC()}
+	if err := st.InsertSnapshotForLease(ctx, jobA, runnerA, genA, 0, snapB); !errors.Is(err, ErrLeaseIdentityMismatch) {
+		t.Fatalf("cross-bound snapshot = %v, want ErrLeaseIdentityMismatch", err)
+	}
+	// Right job id, B's run.
+	snapWrongRun := snapB
+	snapWrongRun.ID = pgITNewID(t)
+	snapWrongRun.JobID = jobA
+	if err := st.InsertSnapshotForLease(ctx, jobA, runnerA, genA, 0, snapWrongRun); !errors.Is(err, ErrLeaseIdentityMismatch) {
+		t.Fatalf("wrong-run snapshot = %v, want ErrLeaseIdentityMismatch", err)
+	}
+
+	// Artifact carrying B's job/run/generation while proving A's lease.
+	artB := model.ArtifactRecord{ID: pgITNewID(t), RunID: runB, JobID: jobB, Name: "dist", LeaseGeneration: 1, SHA256: strings.Repeat("b", 64), CreatedAt: time.Now().UTC()}
+	if _, _, err := st.InsertArtifactOnceForLease(ctx, jobA, runnerA, genA, artB); !errors.Is(err, ErrLeaseIdentityMismatch) {
+		t.Fatalf("cross-bound artifact = %v, want ErrLeaseIdentityMismatch", err)
+	}
+	// Right job/run, wrong generation.
+	artWrongGen := artB
+	artWrongGen.ID = pgITNewID(t)
+	artWrongGen.RunID = runA
+	artWrongGen.JobID = jobA
+	artWrongGen.LeaseGeneration = genA + 1
+	if _, _, err := st.InsertArtifactOnceForLease(ctx, jobA, runnerA, genA, artWrongGen); !errors.Is(err, ErrLeaseIdentityMismatch) {
+		t.Fatalf("wrong-generation artifact = %v, want ErrLeaseIdentityMismatch", err)
+	}
+
+	// Cache manifest claiming B's producer coordinates under A's lease.
+	cacheB := leaseCommitITManifest("x")
+	cacheB.ProducerJob = jobB
+	cacheB.ProducerRun = runB
+	if err := st.PutCacheManifestForLease(ctx, jobA, runnerA, genA, cacheB); !errors.Is(err, ErrLeaseIdentityMismatch) {
+		t.Fatalf("cross-bound cache manifest = %v, want ErrLeaseIdentityMismatch", err)
+	}
+	// Correct namespace, wrong trust domain (the job is untrusted).
+	cacheTrust := leaseCommitITManifest("x")
+	cacheTrust.TrustDomain = "trusted"
+	if err := st.PutCacheManifestForLease(ctx, jobA, runnerA, genA, cacheTrust); !errors.Is(err, ErrLeaseIdentityMismatch) {
+		t.Fatalf("wrong-trust cache manifest = %v, want ErrLeaseIdentityMismatch", err)
+	}
+	// Wrong repository.
+	cacheRepo := leaseCommitITManifest("x")
+	cacheRepo.Repo = "github.com/other/repo"
+	if err := st.PutCacheManifestForLease(ctx, jobA, runnerA, genA, cacheRepo); !errors.Is(err, ErrLeaseIdentityMismatch) {
+		t.Fatalf("wrong-repo cache manifest = %v, want ErrLeaseIdentityMismatch", err)
+	}
+
+	// NOTHING was committed anywhere.
+	for _, runID := range []string{runA, runB} {
+		if got, _ := st.ListSnapshotsByRun(ctx, runID); len(got) != 0 {
+			t.Fatalf("snapshots committed for run %s: %d", runID, len(got))
+		}
+		if got, _ := st.ListArtifacts(ctx, runID); len(got) != 0 {
+			t.Fatalf("artifacts committed for run %s: %d", runID, len(got))
+		}
+	}
+	for _, ns := range [][2]string{{pgITRepoID, "untrusted"}, {pgITRepoID, "trusted"}, {"github.com/other/repo", "untrusted"}} {
+		if _, found, _ := st.GetCacheManifest(ctx, ns[0], ns[1], "x"); found {
+			t.Fatalf("cache manifest committed under (%s, %s)", ns[0], ns[1])
+		}
+	}
+
+	// The matching record commits, and its producer coordinates are stamped
+	// from the locked job.
+	if err := st.PutCacheManifestForLease(ctx, jobA, runnerA, genA, leaseCommitITManifest("good")); err != nil {
+		t.Fatalf("matching cache manifest: %v", err)
+	}
+	rec, found, err := st.GetCacheManifest(ctx, pgITRepoID, "untrusted", "good")
+	if err != nil || !found {
+		t.Fatalf("matching manifest lookup = (%v, %v)", found, err)
+	}
+	if rec.ProducerJob != jobA || rec.ProducerRun != runA {
+		t.Fatalf("manifest producer = %s/%s, want %s/%s", rec.ProducerRun, rec.ProducerJob, runA, jobA)
+	}
+}
+
+// TestIntegrationLeaseCommitSnapshotCapCountsLockedJob is the X3-A cap
+// regression on a fresh database: the commit-time cap counts the LOCKED job's
+// records only. A legacy NULL-job_id row on the same run and another job's
+// records never count toward A, and a cross-bound record is refused by the
+// identity binding before the cap is even evaluated.
+func TestIntegrationLeaseCommitSnapshotCapCountsLockedJob(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	runA, jobA, runnerA, genA := leaseCommitITJob(t, st, pgITRepo)
+	runB, jobB, runnerB, genB := leaseCommitITJob(t, st, pgITRepo)
+	runC, jobC, _, _ := leaseCommitITJob(t, st, pgITRepo)
+
+	// A legacy workspace_snapshots row on A's run with a NULL job id (the
+	// pre-X3-A shape) must not count toward A's cap.
+	if _, err := st.pool.Exec(ctx, `INSERT INTO workspace_snapshots (id, run_id, job_id, created_at, payload) VALUES ($1, $2, NULL, now(), '{}'::jsonb)`, pgITNewID(t), runA); err != nil {
+		t.Fatalf("seed legacy NULL-job snapshot: %v", err)
+	}
+	// B's own snapshot under B's lease does not count toward A either.
+	if err := st.InsertSnapshotForLease(ctx, jobB, runnerB, genB, 0, model.SnapshotRecord{ID: pgITNewID(t), RunID: runB, JobID: jobB, CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("B snapshot: %v", err)
+	}
+	// A's first snapshot fits under cap 1.
+	if err := st.InsertSnapshotForLease(ctx, jobA, runnerA, genA, 1, model.SnapshotRecord{ID: pgITNewID(t), RunID: runA, JobID: jobA, CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("A first snapshot under cap 1: %v", err)
+	}
+	// A's second exceeds the cap (counted under the locked job).
+	if err := st.InsertSnapshotForLease(ctx, jobA, runnerA, genA, 1, model.SnapshotRecord{ID: pgITNewID(t), RunID: runA, JobID: jobA, CreatedAt: time.Now().UTC()}); !errors.Is(err, ErrSnapshotCapReached) {
+		t.Fatalf("A second snapshot = %v, want ErrSnapshotCapReached", err)
+	}
+	// A record naming job C under A's lease is an identity mismatch, never a
+	// cap decision about C.
+	cross := model.SnapshotRecord{ID: pgITNewID(t), RunID: runC, JobID: jobC, CreatedAt: time.Now().UTC()}
+	if err := st.InsertSnapshotForLease(ctx, jobA, runnerA, genA, 1, cross); !errors.Is(err, ErrLeaseIdentityMismatch) {
+		t.Fatalf("cross-bound snapshot under cap = %v, want ErrLeaseIdentityMismatch", err)
+	}
+	// A's run holds exactly the NULL legacy row plus the one A record.
+	if got, _ := st.ListSnapshotsByRun(ctx, runA); len(got) != 2 {
+		t.Fatalf("A run snapshots = %d, want 2 (legacy NULL + one A record)", len(got))
+	}
+	nA := 0
+	if got, _ := st.ListSnapshotsByRun(ctx, runA); len(got) > 0 {
+		for _, s := range got {
+			if s.JobID == jobA {
+				nA++
+			}
+		}
+	}
+	if nA != 1 {
+		t.Fatalf("job A snapshots = %d, want 1", nA)
 	}
 }

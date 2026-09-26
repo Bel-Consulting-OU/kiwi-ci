@@ -267,7 +267,10 @@ func (st *fenceAuditedStore) InsertArtifactOnce(ctx context.Context, a model.Art
 func TestArtifactUploadFencesProvenanceDigest(t *testing.T) {
 	s, f, mb, hdrs := artifactIdentityFixture(t)
 	recorder := newFenceRecorder()
-	s.digestFence = recorder
+	// The DB-mode fake now carries the distributed capability, so the
+	// observability seam is the store's fencer override (not s.digestFence,
+	// which DB mode no longer falls back to).
+	f.digestFenceOverride = recorder
 	audit := &fenceAuditedBlob{Store: mb, fencer: recorder}
 	s.SetBlobStore(audit)
 	store := &fenceAuditedStore{dbFakeStore: f, fencer: recorder}
@@ -347,10 +350,12 @@ func TestArtifactUploadProvenanceFenceTimeoutSkipsUnfencedPut(t *testing.T) {
 	provenanceFenceTimeout = 20 * time.Millisecond
 	defer func() { provenanceFenceTimeout = old }()
 
-	s, _, mb, hdrs := artifactIdentityFixture(t)
+	s, f, mb, hdrs := artifactIdentityFixture(t)
 	payloadDigest := sha256Hex([]byte("payload"))
 	recorder := newFenceRecorder()
-	s.digestFence = &fenceBlockingProvenance{inner: recorder, allow: payloadDigest}
+	// DB mode uses the store's fence (the fake's override), never the local
+	// server fencer: install the blocking fencer on the store.
+	f.digestFenceOverride = &fenceBlockingProvenance{inner: recorder, allow: payloadDigest}
 	audit := &fenceAuditedBlob{Store: mb, fencer: recorder}
 	s.SetBlobStore(audit)
 

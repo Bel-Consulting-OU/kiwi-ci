@@ -118,6 +118,15 @@ func (s *Server) uploadArtifact(w http.ResponseWriter, r *http.Request) {
 		s.writeLeaseAuthError(w, r, authErr)
 		return
 	}
+	// Static wiring gate FIRST: a DB store that cannot commit runner-produced
+	// metadata transactionally is refused before the run lookup, contract
+	// resolution, body read or staging reservation. Without this early gate a
+	// static wiring error would surface only after the whole body was staged,
+	// hashed and published — an expensive, repeatedly retried 503. The late
+	// assertion in uploadArtifactPayload stays as defense in depth.
+	if !s.requireLeaseCommitSupport(w, r) {
+		return
+	}
 	// The run record carries the signed provenance identity
 	// (repository/ref/commit), so loading it is never best-effort: an
 	// unavailable or missing run fails the upload closed BEFORE any bytes
@@ -262,7 +271,12 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 		s.internalError(w, r, err, "")
 		return
 	}
-	defer func() { _ = os.Remove(stagedPath) }()
+	// Cleanup is budget-owned: the reservation is released only once the
+	// staged file is gone. A failed removal keeps the bytes charged as
+	// cleanup debt for the maintenance retry instead of silently freeing
+	// capacity that is physically occupied. The deferred res.Release above
+	// becomes a no-op once cleanup has consumed the reservation.
+	defer func() { budget.CleanupSpool(stagedPath, res) }()
 	if artifactStageHook != nil {
 		artifactStageHook(stagedPath, reserve)
 	}
@@ -868,11 +882,13 @@ func (s *Server) downloadArtifact(w http.ResponseWriter, r *http.Request) {
 	}
 	// Strong integrity: preverify the exact digest+length into a bounded
 	// staging spool BEFORE committing the response, then stream the verified
-	// file. A corrupt backend can no longer produce a complete-length corrupt
-	// body with a 200; a verification failure serves nothing and a write
-	// failure aborts the connection.
-	reopenArtifact := func() (io.ReadCloser, error) { return s.openArtifact(r.Context(), rec) }
-	s.serveVerifiedDownload(w, r, "artifact", f, reopenArtifact, rec.Size, rec.SHA256, func(w http.ResponseWriter) {
+	// file. When the object cannot be staged (larger than the whole budget)
+	// the source's OWN handle is verified and rewound (no pathname is
+	// reopened), and a non-seekable source is refused with 503. A corrupt
+	// backend can no longer produce a complete-length corrupt body with a 200:
+	// a verification failure serves nothing and a write failure aborts the
+	// connection.
+	s.serveVerifiedDownload(w, r, "artifact", f, rec.Size, rec.SHA256, func(w http.ResponseWriter) {
 		w.Header().Set("Content-Type", rec.ContentType)
 		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.tar.gz"`, cleanBlobName(rec.Name)))
 		w.Header().Set("X-Kiwi-Content-SHA256", rec.SHA256)
@@ -1002,6 +1018,13 @@ func (s *Server) uploadJobCache(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// Static wiring gate FIRST: refuse a store without transactional
+	// lease-commit support before the key is even parsed, before a body byte is
+	// read and before any staging reservation is taken. The later check just
+	// before writeCacheManifest stays as defense in depth.
+	if !s.requireLeaseCommitSupport(w, r) {
+		return
+	}
 	// The lease generation (and token) are carried into the commit-time
 	// predicate: the cache manifest must commit only while the SAME lease is
 	// still live, never after a revoke/cancel/replacement/expiry that
@@ -1063,7 +1086,11 @@ func (s *Server) uploadJobCache(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, r, err, "")
 		return
 	}
-	defer func() { _ = os.Remove(stagedPath) }()
+	// Cleanup is budget-owned: the reservation is released only once the
+	// staged file is gone; a failed removal stays charged as cleanup debt for
+	// the maintenance retry. The deferred res.Release above becomes a no-op
+	// once cleanup has consumed the reservation.
+	defer func() { s.Staging.CleanupSpool(stagedPath, res) }()
 	if cacheStageHook != nil {
 		cacheStageHook(stagedPath, reserve)
 	}
@@ -1244,20 +1271,18 @@ func (s *Server) writeCacheManifest(ctx context.Context, fileKey, logicalKey, re
 		}
 		// The lease-fenced method commits the manifest only while the job is
 		// still running under this runner+generation with an unexpired lease,
-		// in the SAME transaction as the write. Without the capability (a
-		// custom store) fall back to the plain upsert; the handler-side
-		// commit-time check remains the guard there.
-		if leaseStore, ok := s.DB.(storage.LeaseCommitStore); ok {
-			if err := leaseStore.PutCacheManifestForLease(ctx, j.ID, runnerID, generation, rec); err != nil {
-				return nil, err
-			}
-			return b, nil
-		}
-		cs, ok := s.DB.(storage.CacheManifestStore)
+		// in the SAME transaction as the write. A store without that
+		// capability is refused with the typed unsupported error — there is
+		// deliberately NO plain-upsert fallback, because a handler-side check
+		// plus a separate write is not atomic and would invite a bypass of
+		// the commit-time predicate. The upload gate
+		// (requireLeaseCommitSupport) refuses such a store before any work;
+		// this check is defense in depth for direct callers.
+		leaseStore, ok := s.DB.(storage.LeaseCommitStore)
 		if !ok {
-			return nil, fmt.Errorf("cache manifest store unavailable")
+			return nil, fmt.Errorf("cache manifest: %w", errLeaseCommitUnsupported)
 		}
-		if err := cs.PutCacheManifest(ctx, rec); err != nil {
+		if err := leaseStore.PutCacheManifestForLease(ctx, j.ID, runnerID, generation, rec); err != nil {
 			return nil, err
 		}
 		return b, nil

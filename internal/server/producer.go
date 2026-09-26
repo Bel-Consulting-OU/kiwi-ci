@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 
@@ -131,10 +130,11 @@ func (s *Server) downloadDependency(w http.ResponseWriter, r *http.Request) {
 	// the exact length and digest before committing the response and aborts
 	// (with the shared integrity metric) on any copy/size/digest failure. A
 	// truncated or corrupt dependency can therefore never be served as a
-	// successful download.
+	// successful download. When the object cannot be staged the source's own
+	// handle is verified and rewound (never a pathname re-open); a
+	// non-seekable source is refused with 503.
 	s.metricAdd("kiwi_artifact_bytes_total", float64(rec.Size), nil)
-	reopenArtifact := func() (io.ReadCloser, error) { return s.openArtifact(r.Context(), rec) }
-	s.serveVerifiedDownload(w, r, "dependency", f, reopenArtifact, rec.Size, rec.SHA256, func(w http.ResponseWriter) {
+	s.serveVerifiedDownload(w, r, "dependency", f, rec.Size, rec.SHA256, func(w http.ResponseWriter) {
 		w.Header().Set("Content-Type", rec.ContentType)
 		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.tar.gz"`, cleanBlobName(rec.Name)))
 		w.Header().Set("X-Kiwi-Content-SHA256", rec.SHA256)

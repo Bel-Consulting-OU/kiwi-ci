@@ -40,12 +40,8 @@ func uploadTestSnapshot(t *testing.T, c *testClient, jobID, runnerID, token stri
 // per-job snapshot count cap rejects the over-cap upload with 409 and leaves
 // no staged file behind (the check runs before any staging/write).
 func TestSnapshotPerJobCapRejectsWithoutStaging(t *testing.T) {
-	prev := snapshotMaxPerJob
-	SetSnapshotMaxPerJob(1)
-	t.Cleanup(func() { SetSnapshotMaxPerJob(prev) })
-
 	dir := t.TempDir()
-	s, err := NewPersistent("secret", "secret", dir)
+	s, err := NewPersistent("secret", "secret", dir, WithSnapshotMaxPerJob(1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,6 +70,34 @@ func TestSnapshotPerJobCapRejectsWithoutStaging(t *testing.T) {
 		if strings.HasSuffix(e.Name(), ".tmp") {
 			t.Fatalf("over-cap upload left a temp file %q", e.Name())
 		}
+	}
+}
+
+// TestSnapshotMaxPerJobIsPerServer pins the X1-E contract: the cap is an
+// immutable per-server field chosen at construction, so two servers can
+// enforce different caps concurrently with no process-global mutable request
+// policy, and an unconfigured server keeps the documented default.
+func TestSnapshotMaxPerJobIsPerServer(t *testing.T) {
+	one, err := NewPersistent("secret", "secret", t.TempDir(), WithSnapshotMaxPerJob(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabled, err := NewPersistent("secret", "secret", t.TempDir(), WithSnapshotMaxPerJob(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fallback, err := NewPersistent("secret", "secret", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if one.snapshotMaxPerJob != 1 {
+		t.Fatalf("WithSnapshotMaxPerJob(1) => %d, want 1", one.snapshotMaxPerJob)
+	}
+	if disabled.snapshotMaxPerJob != 0 {
+		t.Fatalf("WithSnapshotMaxPerJob(0) => %d, want 0 (cap disabled)", disabled.snapshotMaxPerJob)
+	}
+	if fallback.snapshotMaxPerJob != DefaultSnapshotMaxPerJob {
+		t.Fatalf("default cap = %d, want %d", fallback.snapshotMaxPerJob, DefaultSnapshotMaxPerJob)
 	}
 }
 

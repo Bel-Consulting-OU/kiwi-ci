@@ -15,13 +15,15 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/blob"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/snapshot"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
 )
 
 // snapshotCASServer builds a DB-mode server whose CAS backend is a
-// filesystem blob store, and enqueues + leases a job.
-func snapshotCASServer(t *testing.T, f *dbFakeStore, casDir string) (*Server, string, string, Task, *testClient) {
+// filesystem blob store, and enqueues + leases a job. Construction-time
+// options (for example WithSnapshotMaxPerJob) are passed through.
+func snapshotCASServer(t *testing.T, f *dbFakeStore, casDir string, opts ...Option) (*Server, string, string, Task, *testClient) {
 	t.Helper()
-	s, err := NewPersistent("token", "token", t.TempDir())
+	s, err := NewPersistent("token", "token", t.TempDir(), opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,8 +146,16 @@ func TestSnapshotUploadDBModeCASAndRecord(t *testing.T) {
 
 	// A fresh server instance on the same store+CAS serves the download:
 	// the in-memory map of s2 is empty, so the record must come from the
-	// SnapshotStore and the bytes from CAS by digest.
-	s2 := New("token")
+	// SnapshotStore and the bytes from CAS by digest. Like every production
+	// replica, s2 carries a staging budget: a CAS reader is not seekable, so
+	// the strong-integrity path preverifies through the bounded spool before
+	// committing the response.
+	budget2, err := staging.NewBudget(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = budget2.Close() })
+	s2 := New("token", WithStagingBudget(budget2))
 	if err := s2.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}

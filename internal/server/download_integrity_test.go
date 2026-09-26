@@ -10,6 +10,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -198,7 +200,7 @@ func TestDownloadCopyErrorAborts(t *testing.T) {
 				t.Fatalf("recover = %v, want http.ErrAbortHandler", r)
 			}
 		}()
-		s.serveVerifiedDownload(&failingResponseWriter{}, req, "artifact", io.NopCloser(bytes.NewReader(payload)), reopenFrom(payload), int64(len(payload)), digest, nil)
+		s.serveVerifiedDownload(&failingResponseWriter{}, req, "artifact", io.NopCloser(bytes.NewReader(payload)), int64(len(payload)), digest, nil)
 	}()
 	s.Metrics.mu.Lock()
 	got := 0.0
@@ -211,11 +213,23 @@ func TestDownloadCopyErrorAborts(t *testing.T) {
 	}
 }
 
+// readSeekCloser adapts an in-memory byte slice to an io.ReadSeeker plus
+// io.Closer, i.e. the shape of an open local file: the seekable fallback can
+// hash the handle and rewind it. io.NopCloser would hide the Seeker and force
+// the non-seekable refusal path.
+type readSeekCloser struct{ *bytes.Reader }
+
+func (readSeekCloser) Close() error { return nil }
+
+func newReadSeekCloser(b []byte) readSeekCloser { return readSeekCloser{bytes.NewReader(b)} }
+
 // TestDownloadOversizedObjectFallbackAborts covers the fallback when the
-// object cannot be staged (larger than the whole budget): the two-pass
-// verification proves the digest first, so a valid object streams
-// byte-identically, and a corrupt one is refused with 503 BEFORE any bytes
-// are committed — a complete-length corrupt body can never be served.
+// object cannot be staged (larger than the whole budget). A SEEKABLE source
+// is verified on its own handle and rewound, so a valid object streams
+// byte-identically and a corrupt one is refused with 503 BEFORE any bytes are
+// committed — a complete-length corrupt body can never be served. A
+// NON-seekable source is refused with 503 for both valid and corrupt bytes:
+// staging is unavailable and there is no handle to trust.
 func TestDownloadOversizedObjectFallbackAborts(t *testing.T) {
 	b, err := staging.NewBudget(t.TempDir(), 8)
 	if err != nil {
@@ -232,22 +246,35 @@ func TestDownloadOversizedObjectFallbackAborts(t *testing.T) {
 	digest := hex.EncodeToString(sum[:])
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/artifacts/x", nil)
 
-	// Valid: the fallback streams byte-identically.
+	// Valid seekable source: the fallback verifies the same handle, rewinds
+	// it and streams byte-identically.
 	rec := httptest.NewRecorder()
-	s.serveVerifiedDownload(rec, req, "artifact", io.NopCloser(bytes.NewReader(payload)), reopenFrom(payload), int64(len(payload)), digest, nil)
+	s.serveVerifiedDownload(rec, req, "artifact", newReadSeekCloser(payload), int64(len(payload)), digest, nil)
 	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), payload) {
 		t.Fatalf("oversized valid download = %d, %q", rec.Code, rec.Body.String())
 	}
 
-	// Corrupt: the first verification pass fails, so nothing is served (503).
+	// Corrupt seekable source: the first verification pass fails, so nothing
+	// is served (503).
 	corrupt := bytes.Repeat([]byte{'Z'}, len(payload))
 	rec2 := httptest.NewRecorder()
-	s.serveVerifiedDownload(rec2, req, "artifact", io.NopCloser(bytes.NewReader(corrupt)), reopenFrom(corrupt), int64(len(payload)), digest, nil)
+	s.serveVerifiedDownload(rec2, req, "artifact", newReadSeekCloser(corrupt), int64(len(payload)), digest, nil)
 	if rec2.Code != http.StatusServiceUnavailable {
 		t.Fatalf("oversized corrupt download = %d, want 503 (no bytes served)", rec2.Code)
 	}
 	if bytes.Equal(rec2.Body.Bytes(), corrupt) {
 		t.Fatal("oversized corrupt download served its bytes")
+	}
+
+	// Non-seekable source: even a VALID object is refused with 503 before any
+	// header is committed, because there is no handle to verify AND serve.
+	rec3 := httptest.NewRecorder()
+	s.serveVerifiedDownload(rec3, req, "artifact", io.NopCloser(bytes.NewReader(payload)), int64(len(payload)), digest, nil)
+	if rec3.Code != http.StatusServiceUnavailable {
+		t.Fatalf("oversized non-seekable valid download = %d, want 503", rec3.Code)
+	}
+	if bytes.Contains(rec3.Body.Bytes(), payload) {
+		t.Fatal("non-seekable unverified bytes were served")
 	}
 }
 
@@ -272,12 +299,6 @@ func TestCacheDownloadCopyErrorAborts(t *testing.T) {
 		}()
 		s.serveStreamCheckedWithDigest(&failingResponseWriter{}, req, "cache", digest, io.NopCloser(bytes.NewReader(payload)))
 	}()
-}
-
-// reopenFrom returns a reopen function serving the same bytes, so the
-// two-pass verification path can be exercised without a real store.
-func reopenFrom(b []byte) func() (io.ReadCloser, error) {
-	return func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(b)), nil }
 }
 
 // TestVerifiedDownloadKeepsReservationWhileStreaming pins the staging
@@ -306,7 +327,7 @@ func TestVerifiedDownloadKeepsReservationWhileStreaming(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.serveVerifiedDownload(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil), "artifact", src, reopenFrom(payload), int64(len(payload)), digest, nil)
+		s.serveVerifiedDownload(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil), "artifact", src, int64(len(payload)), digest, nil)
 	}()
 	<-entered
 	if used := budget.Used(); used != 100 {
@@ -337,7 +358,7 @@ func TestCorruptCompleteBodyNeverSucceeds(t *testing.T) {
 	digest := sha256Hex(good)
 	s := New("tok") // no staging budget: the two-pass path must still fail closed
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		s.serveVerifiedDownload(w, r, "artifact", io.NopCloser(bytes.NewReader(corrupt)), reopenFrom(corrupt), int64(len(good)), digest, func(w http.ResponseWriter) {
+		s.serveVerifiedDownload(w, r, "artifact", io.NopCloser(bytes.NewReader(corrupt)), int64(len(good)), digest, func(w http.ResponseWriter) {
 			w.Header().Set("Content-Length", strconv.Itoa(len(good)))
 		})
 	})
@@ -354,5 +375,159 @@ func TestCorruptCompleteBodyNeverSucceeds(t *testing.T) {
 	}
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503 (no bytes served)", resp.StatusCode)
+	}
+}
+
+// TestVerifiedSpoolCloseKeepsChargeWhenRemovalFails is the server-level X1-B
+// integration: a verified spool whose file cannot be removed (a read-only
+// staging directory) must keep its bytes charged and stay registered as
+// cleanup-required, and the maintenance retry must release them once the
+// filesystem allows the removal. The filesystem may ignore the permission
+// (root), in which case the case is skipped.
+func TestVerifiedSpoolCloseKeepsChargeWhenRemovalFails(t *testing.T) {
+	dir := t.TempDir()
+	b, err := staging.NewBudget(dir, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New("tok", WithStagingBudget(b))
+	payload := []byte("0123456789abcdef")
+	sp, err := s.preverifyToSpool(context.Background(), bytes.NewReader(payload), int64(len(payload)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("chmod staging dir: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(dir, 0o700)
+		_ = b.Close()
+	})
+	sp.Close()
+	if _, err := os.Stat(sp.path); err != nil {
+		// The removal succeeded despite the permission bits (for example a
+		// root-run test): there is no cleanup debt to prove.
+		return
+	}
+	if used := b.Used(); used != int64(len(payload)) {
+		t.Fatalf("failed cleanup dropped the charge: Used()=%d, want %d", used, len(payload))
+	}
+	if got := b.PendingCleanup(); got != 1 {
+		t.Fatalf("PendingCleanup() = %d, want 1", got)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// The maintenance helper (the exact call Maintain performs each tick)
+	// reclaims the debt once the filesystem allows the removal.
+	s.retryStagingCleanup(context.Background())
+	if used := b.Used(); used != 0 {
+		t.Fatalf("Used() after retry = %d, want 0", used)
+	}
+	if got := b.PendingCleanup(); got != 0 {
+		t.Fatalf("PendingCleanup() after retry = %d, want 0", got)
+	}
+}
+
+// TestVerifiedDownloadSameHandleBeatsPathnameSwap is the X1-A regression: a
+// pathname replacement between verification and serving must not change what
+// the client receives. The source is opened once, the SAME handle is hashed
+// and then rewound for serving, so a same-length replacement renamed over the
+// verified path is invisible to the response. Real HTTP/1 proves the complete
+// 200 body is the VERIFIED bytes, and the pathname really was replaced.
+func TestVerifiedDownloadSameHandleBeatsPathnameSwap(t *testing.T) {
+	dir := t.TempDir()
+	verified := []byte("the-verified-artifact-bytes")
+	digest := sha256Hex(verified)
+	verifiedPath := filepath.Join(dir, "object.bin")
+	if err := os.WriteFile(verifiedPath, verified, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	replacement := bytes.Repeat([]byte("R"), len(verified))
+	replacementPath := filepath.Join(dir, "replacement.bin")
+	if err := os.WriteFile(replacementPath, replacement, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New("tok") // no staging budget: forces the same-handle verify+seek fallback
+	swapped := make(chan struct{})
+	prev := downloadBetweenVerifyAndServeHook
+	downloadBetweenVerifyAndServeHook = func() {
+		// Pathname replacement: same-length different bytes, atomically
+		// renamed over the verified path between verification and serving.
+		if err := os.Rename(replacementPath, verifiedPath); err != nil {
+			t.Errorf("pathname swap: %v", err)
+		}
+		close(swapped)
+	}
+	t.Cleanup(func() { downloadBetweenVerifyAndServeHook = prev })
+
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f, err := os.Open(verifiedPath)
+		if err != nil {
+			http.Error(w, "missing", http.StatusNotFound)
+			return
+		}
+		s.serveVerifiedDownload(w, r, "artifact", f, int64(len(verified)), digest, func(w http.ResponseWriter) {
+			w.Header().Set("Content-Length", strconv.Itoa(len(verified)))
+		})
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	select {
+	case <-swapped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("between-verify-and-serve hook was never invoked")
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, body)
+	}
+	if !bytes.Equal(body, verified) {
+		t.Fatalf("client received %q, want the verified bytes %q", body, verified)
+	}
+	onDisk, err := os.ReadFile(verifiedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(onDisk, replacement) {
+		t.Fatalf("pathname was not actually replaced: %q", onDisk)
+	}
+}
+
+// TestNonSeekableNoStagingRefusedBeforeHeaders pins the second X1-A
+// requirement: a non-seekable source with staging unavailable is refused with
+// 503 BEFORE any header is committed, so no unverified byte can be part of a
+// complete response.
+func TestNonSeekableNoStagingRefusedBeforeHeaders(t *testing.T) {
+	good := []byte("would-be-complete-body")
+	digest := sha256Hex(good)
+	s := New("tok") // no staging budget
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.serveVerifiedDownload(w, r, "artifact", io.NopCloser(bytes.NewReader(good)), int64(len(good)), digest, func(w http.ResponseWriter) {
+			w.Header().Set("Content-Length", strconv.Itoa(len(good)))
+		})
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (no unverified streaming)", resp.StatusCode)
+	}
+	if bytes.Equal(body, good) {
+		t.Fatal("unverified bytes were served as a complete body")
+	}
+	if got := resp.Header.Get("Content-Length"); got == strconv.Itoa(len(good)) {
+		t.Fatalf("refusal committed the advertised Content-Length %s", got)
 	}
 }

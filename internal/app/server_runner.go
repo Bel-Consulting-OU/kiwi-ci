@@ -330,6 +330,71 @@ func validateProductionConfig(cfg productionConfig) error {
 	return nil
 }
 
+// dbStoreRequirement is one capability contract DB mode needs from its store,
+// plus whether the configured store provides it.
+type dbStoreRequirement struct {
+	Name string
+	Held bool
+}
+
+// requiredDBStoreCapabilities returns the coherent capability set every DB-mode
+// control plane enforces at startup, in check order. The three unconditional
+// contracts back the features DB mode always enables:
+//
+//   - DigestFenceStore: CAS publication and garbage collection serialize on a
+//     cross-replica advisory lock (without it a multi-replica deployment would
+//     take unrelated process-local locks and could delete a just-published
+//     object);
+//   - CASGCLeaseStore: exactly one replica collects per pass;
+//   - LeaseCommitStore: runner-produced metadata (cache manifest, snapshot
+//     record, artifact row) commits only under the live lease in the same
+//     transaction that locks the job.
+//
+// RunnerTokenStore is added when per-runner bearer tokens are configured for
+// provisioning: a store that cannot hold them cannot honor the credential
+// contract. A nil store (memory/fs mode) requires nothing.
+func requiredDBStoreCapabilities(db storage.Store, runnerTokensConfigured bool) []dbStoreRequirement {
+	if db == nil {
+		return nil
+	}
+	_, digestFence := db.(storage.DigestFenceStore)
+	_, casGCLease := db.(storage.CASGCLeaseStore)
+	_, leaseCommit := db.(storage.LeaseCommitStore)
+	reqs := []dbStoreRequirement{
+		{Name: "DigestFenceStore", Held: digestFence},
+		{Name: "CASGCLeaseStore", Held: casGCLease},
+		{Name: "LeaseCommitStore", Held: leaseCommit},
+	}
+	if runnerTokensConfigured {
+		_, runnerTokens := db.(storage.RunnerTokenStore)
+		reqs = append(reqs, dbStoreRequirement{Name: "RunnerTokenStore", Held: runnerTokens})
+	}
+	return reqs
+}
+
+// validateDBStoreCapabilities rejects a DB-mode startup whose store is missing
+// a mandatory capability for the features enabled. The failure is a hard
+// startup error, not a per-request degradation: a store that cannot fence
+// digest publication, serialize the collector or commit lease-bound metadata
+// transactionally would silently weaken those invariants across replicas.
+// Memory/fs mode (nil db) requires nothing.
+func validateDBStoreCapabilities(db storage.Store, runnerTokensConfigured bool) error {
+	var missing []string
+	for _, req := range requiredDBStoreCapabilities(db, runnerTokensConfigured) {
+		if !req.Held {
+			missing = append(missing, req.Name)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	enforced := "DigestFenceStore, CASGCLeaseStore, LeaseCommitStore"
+	if runnerTokensConfigured {
+		enforced += ", RunnerTokenStore"
+	}
+	return fmt.Errorf("database store lacks mandatory capabilities (%s): DB mode requires %s; refusing to start", strings.Join(missing, ", "), enforced)
+}
+
 // validateProductionRunnerCredentials is the post-DB half of the production
 // runner-auth contract: at least one actual per-runner mechanism must exist —
 // enforced runner mTLS, per-runner bearer credentials supplied through
@@ -617,6 +682,15 @@ func Server(ctx context.Context, args []string) error {
 		defer db.Close()
 		if merr := db.Migrate(ctx); merr != nil {
 			return fmt.Errorf("auto-migrate: %w", merr)
+		}
+		// Startup capability rejection: DB mode enables CAS publication/GC
+		// fencing, the collector lease and transactional lease-bound commits,
+		// so a store missing any of those contracts must not start (it would
+		// silently fall back to weaker, non-distributed behavior). The real
+		// PostgreSQL store provides all of them; this guards custom/partial
+		// stores and regressions that drop a capability.
+		if cerr := validateDBStoreCapabilities(db, len(runnerTokens) > 0); cerr != nil {
+			return cerr
 		}
 		if clusterStore != nil {
 			srv, err = server.NewPersistentWithCluster(tokenV, adminTokenV, *dataDir, clusterStore, persistentOpts...)

@@ -364,6 +364,15 @@ type Server struct {
 	// snapshots.go).
 	snapshots map[string]model.SnapshotRecord
 
+	// snapshotMaxPerJob is the effective per-(run, job) snapshot retention
+	// cap: DefaultSnapshotMaxPerJob unless WithSnapshotMaxPerJob overrides it
+	// at construction; a value <= 0 disables the cap. It is an IMMUTABLE
+	// per-Server field — there is no process-global mutable request policy, so
+	// concurrent handlers always read one stable value. The cap is enforced
+	// both as an early preflight and at COMMIT time (under the job row lock in
+	// PostgreSQL, under the store mutex in memory); see snapshots.go.
+	snapshotMaxPerJob int
+
 	// dataDir is the persistent state root ("" for in-memory servers).
 	dataDir string
 
@@ -563,6 +572,7 @@ func newServer(token string) *Server {
 		AuthStore:         auth.NewTokenStore(),
 		deployments:       map[string]model.Deployment{},
 		snapshots:         map[string]model.SnapshotRecord{},
+		snapshotMaxPerJob: DefaultSnapshotMaxPerJob,
 		contracts:         map[string]map[string]storage.ArtifactContract{},
 		pendingSidecars:   map[string]string{},
 		jobLocks:          map[string]*sync.Mutex{},
@@ -1357,8 +1367,15 @@ func (s *Server) serverError(w http.ResponseWriter, r *http.Request, status int,
 }
 
 // internalError is the 500 shorthand for serverError: the detail is logged
-// with the request ID and the client only ever sees an opaque body.
+// with the request ID and the client only ever sees an opaque body. The
+// digest-fence-unavailable error (DB mode lacking the distributed fence
+// capability) is a server-side configuration condition, not an internal bug,
+// so it answers 503 like the other fail-closed capability refusals.
 func (s *Server) internalError(w http.ResponseWriter, r *http.Request, err error, clientMsg string) {
+	if errors.Is(err, errDigestFenceUnsupported) {
+		s.serverError(w, r, http.StatusServiceUnavailable, err, "distributed operation fence unavailable")
+		return
+	}
 	s.serverError(w, r, http.StatusInternalServerError, err, clientMsg)
 }
 
@@ -2353,15 +2370,28 @@ func (s *Server) getLogs(w http.ResponseWriter, r *http.Request) {
 // build zero-value Servers) so publication and collection still serialize.
 var defaultDigestFence cas.Fencer = cas.NewMemFencer()
 
+// errDigestFenceUnsupported reports that DB mode was configured with a store
+// that cannot provide the cross-replica digest fence. Falling back to a
+// process-local MemFencer there would silently reopen the publication/GC race
+// the fence closes (two replicas would take unrelated locks), so DB mode fails
+// closed instead. The startup capability check rejects such a store before the
+// listeners open; this error is the runtime backstop and maps to 503 (see
+// internalError).
+var errDigestFenceUnsupported = errors.New("server: database store lacks the cross-replica digest fence capability")
+
 // withDigestFence serializes "publish object + commit durable reference"
 // (writers) against "re-read references + delete" (the CAS collector) for one
-// digest. DB mode uses the store-backed advisory lock so the fence spans HA
-// replicas; memory/fs mode uses the in-process fencer.
+// digest. DB mode REQUIRES the store-backed advisory lock so the fence spans HA
+// replicas: a DB store without storage.DigestFenceStore fails closed (503 for
+// request paths) rather than silently downgrading to a process-local fence.
+// Memory/fs mode uses the in-process fencer.
 func (s *Server) withDigestFence(ctx context.Context, digest string, fn func() error) error {
 	if s.DB != nil {
-		if fencer, ok := s.DB.(storage.DigestFenceStore); ok {
-			return fencer.WithDigestFence(ctx, digest, fn)
+		fencer, ok := s.DB.(storage.DigestFenceStore)
+		if !ok {
+			return fmt.Errorf("%w: refusing to serialize digest publication against collection with a process-local fence", errDigestFenceUnsupported)
 		}
+		return fencer.WithDigestFence(ctx, digest, fn)
 	}
 	if s.digestFence == nil {
 		return defaultDigestFence.WithFence(ctx, digest, fn)
@@ -2370,12 +2400,17 @@ func (s *Server) withDigestFence(ctx context.Context, digest string, fn func() e
 }
 
 // acquireDigestFence takes the digest fence for a handler whose critical
-// section spans more than one call; the returned release is idempotent.
+// section spans more than one call; the returned release is idempotent. DB
+// mode fails closed without storage.DigestFenceStore (never a MemFencer
+// fallback, which would not span replicas); memory/fs mode keeps using the
+// local fencer.
 func (s *Server) acquireDigestFence(ctx context.Context, digest string) (func(), error) {
 	if s.DB != nil {
-		if fencer, ok := s.DB.(storage.DigestFenceStore); ok {
-			return fencer.AcquireDigestFence(ctx, digest)
+		fencer, ok := s.DB.(storage.DigestFenceStore)
+		if !ok {
+			return nil, fmt.Errorf("%w: refusing to serialize digest publication against collection with a process-local fence", errDigestFenceUnsupported)
 		}
+		return fencer.AcquireDigestFence(ctx, digest)
 	}
 	f := s.digestFence
 	if f == nil {
@@ -5996,6 +6031,11 @@ func (s *Server) Maintain(ctx context.Context) {
 			return
 		case tick := <-ticker.C:
 			loopStart := time.Now()
+			// Reclaim spool files whose removal failed on an earlier request:
+			// until this retry succeeds their bytes stay charged, so the
+			// staging bound can never admit new reservations against bytes
+			// that still occupy the directory.
+			s.retryStagingCleanup(ctx)
 			if s.Sched != nil {
 				s.maintainDB(ctx, tick.UTC())
 				if s.leader {

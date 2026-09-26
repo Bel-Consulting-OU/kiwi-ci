@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cas"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/forge"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
@@ -32,6 +33,16 @@ type dbFakeStore struct {
 	logs       []model.LogEntry
 	artifacts  []model.ArtifactRecord
 	reports    []model.TestReport
+
+	// digestFenceOnce/digestFence back the fake's DigestFenceStore surface:
+	// DB-mode handlers require the cross-replica-capability contract and fail
+	// closed (503) without it, so the production-like fake provides a real
+	// per-store fencer. Tests that need the missing-capability shape wrap the
+	// fake in an interface-embedding store; tests that must observe fence
+	// acquisition set digestFenceOverride before the first acquisition.
+	digestFenceOnce     sync.Once
+	digestFence         cas.Fencer
+	digestFenceOverride cas.Fencer
 
 	outboxItems  []storage.OutboxItem
 	outboxAcked  []string
@@ -3534,61 +3545,166 @@ func (f *dbFakeStore) ConsumeEnrollGrant(ctx context.Context, digest string, con
 // REFUSES runner-produced commits when the store lacks the capability.
 
 // leaseHeldLocked reports whether the job is running under this runner and
-// generation with an unexpired lease. Callers hold f.mu.
-func (f *dbFakeStore) leaseHeldLocked(jobID, runnerID string, generation int64) bool {
+// generation with an unexpired lease, returning the LOCKED job when it is.
+// Callers hold f.mu. The returned job is the authoritative identity every
+// lease-fenced write validates the record against (X3-A parity).
+func (f *dbFakeStore) leaseHeldLocked(jobID, runnerID string, generation int64) (model.Job, bool) {
 	j, ok := f.jobs[jobID]
 	if !ok || j.Status != model.StatusRunning {
-		return false
+		return model.Job{}, false
 	}
 	if j.LeaseRunnerID != runnerID || j.LeaseGeneration != generation {
-		return false
+		return model.Job{}, false
 	}
-	return j.LeaseExpiresAt != nil && j.LeaseExpiresAt.After(time.Now().UTC())
+	if j.LeaseExpiresAt == nil || !j.LeaseExpiresAt.After(time.Now().UTC()) {
+		return model.Job{}, false
+	}
+	return j, true
 }
 
 // PutCacheManifestForLease commits the cache manifest only while the lease
-// still owns the job, mirroring the SQL predicate.
+// still owns the job, mirroring the SQL predicate AND the X3-A identity
+// binding: the namespace and producer coordinates must match the locked job.
 func (f *dbFakeStore) PutCacheManifestForLease(ctx context.Context, jobID, runnerID string, generation int64, rec storage.CacheManifestRecord) error {
 	f.mu.Lock()
-	held := f.leaseHeldLocked(jobID, runnerID, generation)
-	f.mu.Unlock()
+	defer f.mu.Unlock()
+	j, held := f.leaseHeldLocked(jobID, runnerID, generation)
 	if !held {
 		return fmt.Errorf("%w: cache manifest for job %s", storage.ErrLeaseLost, jobID)
 	}
-	return f.PutCacheManifest(ctx, rec)
+	repo, trust := cacheNamespace(j)
+	if rec.Repo != repo {
+		return fmt.Errorf("%w: cache manifest repo %q does not match leased job repository %q", storage.ErrLeaseIdentityMismatch, rec.Repo, repo)
+	}
+	if rec.TrustDomain != trust {
+		return fmt.Errorf("%w: cache manifest trust domain %q does not match leased job trust domain %q", storage.ErrLeaseIdentityMismatch, rec.TrustDomain, trust)
+	}
+	if rec.ProducerJob != "" && rec.ProducerJob != jobID {
+		return fmt.Errorf("%w: cache manifest producer job %q does not match leased job %s", storage.ErrLeaseIdentityMismatch, rec.ProducerJob, jobID)
+	}
+	if rec.ProducerRun != "" && rec.ProducerRun != j.RunID {
+		return fmt.Errorf("%w: cache manifest producer run %q does not match leased job run %s", storage.ErrLeaseIdentityMismatch, rec.ProducerRun, j.RunID)
+	}
+	rec.ProducerJob, rec.ProducerRun = jobID, j.RunID
+	if rec.CreatedAt.IsZero() {
+		rec.CreatedAt = time.Now().UTC()
+	}
+	if f.cacheManErr != nil {
+		return f.cacheManErr
+	}
+	f.cacheMans[rec.Repo+"\x00"+rec.TrustDomain+"\x00"+rec.LogicalKey] = rec
+	return nil
 }
 
 // InsertSnapshotForLease commits the snapshot record with the same predicate
-// plus the commit-time per-job cap.
+// plus the commit-time per-job cap. The record's run/job must match the
+// locked job, and the cap counts the locked job's (run, job) coordinates.
 func (f *dbFakeStore) InsertSnapshotForLease(ctx context.Context, jobID, runnerID string, generation int64, maxPerJob int, rec model.SnapshotRecord) error {
 	f.mu.Lock()
-	held := f.leaseHeldLocked(jobID, runnerID, generation)
-	n := 0
-	if maxPerJob > 0 {
-		for _, existing := range f.snapshots {
-			if existing.RunID == rec.RunID && existing.JobID == rec.JobID {
-				n++
-			}
-		}
-	}
-	f.mu.Unlock()
+	defer f.mu.Unlock()
+	j, held := f.leaseHeldLocked(jobID, runnerID, generation)
 	if !held {
 		return fmt.Errorf("%w: snapshot %s for job %s", storage.ErrLeaseLost, rec.ID, jobID)
 	}
-	if maxPerJob > 0 && n >= maxPerJob {
-		return fmt.Errorf("%w: job %s already has %d snapshots (cap %d)", storage.ErrSnapshotCapReached, jobID, n, maxPerJob)
+	if rec.JobID != jobID {
+		return fmt.Errorf("%w: snapshot %s job id %q does not match leased job %s", storage.ErrLeaseIdentityMismatch, rec.ID, rec.JobID, jobID)
 	}
-	return f.InsertSnapshotRecord(ctx, rec)
+	if rec.RunID != j.RunID {
+		return fmt.Errorf("%w: snapshot %s run id %q does not match leased job run %s", storage.ErrLeaseIdentityMismatch, rec.ID, rec.RunID, j.RunID)
+	}
+	if rec.JobKey != "" && rec.JobKey != j.Key {
+		return fmt.Errorf("%w: snapshot %s job key %q does not match leased job key %q", storage.ErrLeaseIdentityMismatch, rec.ID, rec.JobKey, j.Key)
+	}
+	if rec.JobKey == "" {
+		rec.JobKey = j.Key
+	}
+	if maxPerJob > 0 {
+		n := 0
+		for _, existing := range f.snapshots {
+			if existing.RunID == j.RunID && existing.JobID == jobID {
+				n++
+			}
+		}
+		if n >= maxPerJob {
+			return fmt.Errorf("%w: job %s already has %d snapshots (cap %d)", storage.ErrSnapshotCapReached, jobID, n, maxPerJob)
+		}
+	}
+	if f.snapshotErr != nil {
+		return f.snapshotErr
+	}
+	f.snapshots = append(f.snapshots, rec)
+	return nil
 }
 
 // InsertArtifactOnceForLease mirrors the transactional artifact commit: the
-// predicate takes precedence over the idempotency conflict.
+// predicate and the identity binding take precedence over the idempotency
+// conflict.
 func (f *dbFakeStore) InsertArtifactOnceForLease(ctx context.Context, jobID, runnerID string, generation int64, a model.ArtifactRecord) (model.ArtifactRecord, bool, error) {
 	f.mu.Lock()
-	held := f.leaseHeldLocked(jobID, runnerID, generation)
-	f.mu.Unlock()
+	defer f.mu.Unlock()
+	j, held := f.leaseHeldLocked(jobID, runnerID, generation)
 	if !held {
 		return model.ArtifactRecord{}, false, fmt.Errorf("%w: artifact %s for job %s", storage.ErrLeaseLost, a.Name, jobID)
 	}
-	return f.InsertArtifactOnce(ctx, a)
+	if a.JobID != jobID {
+		return model.ArtifactRecord{}, false, fmt.Errorf("%w: artifact %s job id %q does not match leased job %s", storage.ErrLeaseIdentityMismatch, a.Name, a.JobID, jobID)
+	}
+	if a.RunID != j.RunID {
+		return model.ArtifactRecord{}, false, fmt.Errorf("%w: artifact %s run id %q does not match leased job run %s", storage.ErrLeaseIdentityMismatch, a.Name, a.RunID, j.RunID)
+	}
+	if a.LeaseGeneration != generation {
+		return model.ArtifactRecord{}, false, fmt.Errorf("%w: artifact %s lease generation %d does not match leased generation %d", storage.ErrLeaseIdentityMismatch, a.Name, a.LeaseGeneration, generation)
+	}
+	if a.JobKey != "" && a.JobKey != j.Key {
+		return model.ArtifactRecord{}, false, fmt.Errorf("%w: artifact %s job key %q does not match leased job key %q", storage.ErrLeaseIdentityMismatch, a.Name, a.JobKey, j.Key)
+	}
+	if a.JobKey == "" {
+		a.JobKey = j.Key
+	}
+	if f.artifactInsertErr != nil {
+		return model.ArtifactRecord{}, false, f.artifactInsertErr
+	}
+	for _, existing := range f.artifacts {
+		if existing.JobID != a.JobID || existing.LeaseGeneration != a.LeaseGeneration || existing.Name != a.Name {
+			continue
+		}
+		if existing.SHA256 != a.SHA256 {
+			return existing, false, storage.ErrArtifactDigestConflict
+		}
+		return existing, false, nil
+	}
+	f.artifacts = append(f.artifacts, a)
+	return a, true, nil
 }
+
+// fence returns the fake's per-store digest fencer (lazily created so tests
+// that never publish pay nothing). A test-installed digestFenceOverride is
+// used verbatim, which is how fence-observability tests instrument the
+// DB-mode path now that the fake carries the real capability.
+func (f *dbFakeStore) fence() cas.Fencer {
+	f.digestFenceOnce.Do(func() {
+		if f.digestFenceOverride != nil {
+			f.digestFence = f.digestFenceOverride
+			return
+		}
+		f.digestFence = cas.NewMemFencer()
+	})
+	return f.digestFence
+}
+
+// WithDigestFence implements storage.DigestFenceStore for the DB-mode fake.
+func (f *dbFakeStore) WithDigestFence(ctx context.Context, digest string, fn func() error) error {
+	return f.fence().WithFence(ctx, digest, fn)
+}
+
+// AcquireDigestFence implements storage.DigestFenceStore for the DB-mode fake.
+func (f *dbFakeStore) AcquireDigestFence(ctx context.Context, digest string) (func(), error) {
+	return f.fence().Acquire(ctx, digest)
+}
+
+// AcquireNamedFence implements storage.DigestFenceStore for the DB-mode fake.
+func (f *dbFakeStore) AcquireNamedFence(ctx context.Context, namespace, key string) (func(), error) {
+	return f.fence().Acquire(ctx, namespace+"\x00"+key)
+}
+
+var _ storage.DigestFenceStore = (*dbFakeStore)(nil)

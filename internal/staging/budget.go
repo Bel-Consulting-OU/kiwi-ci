@@ -72,6 +72,14 @@ import (
 // staging directory at a shared path can never destroy unrelated files.
 const FilePrefix = "kiwi-stage-"
 
+// removeSpoolFile is the removal primitive every budget-owned cleanup uses
+// (SpoolFile failure cleanup, CleanupSpool and RetryCleanup). It is a
+// package variable so tests can inject a failing removal (for example EPERM)
+// and prove the cleanup-debt accounting: a failed removal keeps the bytes
+// charged and the spool registered until a retry succeeds. Production uses
+// os.Remove.
+var removeSpoolFile = os.Remove
+
 // LockFileName is the ownership lock file inside a staging directory. It
 // deliberately does not match FilePrefix (dot instead of dash), so neither
 // the startup reclaim nor Prune can delete the lock that proves ownership.
@@ -138,6 +146,22 @@ type Budget struct {
 	mu     sync.Mutex
 	used   int64
 	notify chan struct{}
+
+	// pendingCleanup maps a spool path whose removal FAILED after the bytes
+	// were no longer needed to the bytes still charged for it. A failed
+	// removal must never silently drop the charge: the path stays in
+	// activeSpools (so Prune cannot mistake the file for abandoned and the
+	// registration alone proves it is tracked) and the bytes stay charged in
+	// pendingBytes until RetryCleanup successfully removes the file. This is
+	// what keeps Used() a truthful statement about physical occupancy even
+	// when the filesystem refuses deletion (a permission error, a busy
+	// mount): the ledger can never advertise room that unreclaimable bytes
+	// still occupy. mu-guarded.
+	pendingCleanup map[string]int64
+	// pendingBytes is the sum of the pendingCleanup charges: bytes physically
+	// present in the staging directory without a live reservation. It is part
+	// of Used() and of Acquire's admission bound. mu-guarded.
+	pendingBytes int64
 
 	// lock is the held ownership token of dir; release happens in Close (or
 	// at process exit, when the OS drops the lock).
@@ -383,13 +407,14 @@ func (b *Budget) MaxBytes() int64 { return b.maxBytes }
 // construction.
 func (b *Budget) StaleFilesRemoved() int { return b.staleRemoved }
 
-// Used returns the number of bytes currently reserved. It is a snapshot:
-// concurrent Acquire/Release may change the value immediately after it
-// returns.
+// Used returns the number of bytes currently charged: live reservations plus
+// the cleanup debt of spool files whose removal failed (see PendingCleanup).
+// It is a snapshot: concurrent Acquire/Release/RetryCleanup may change the
+// value immediately after it returns.
 func (b *Budget) Used() int64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.used
+	return b.used + b.pendingBytes
 }
 
 // Close releases the directory ownership token and unregisters the budget
@@ -400,29 +425,36 @@ func (b *Budget) Used() int64 {
 // Close first transitions the budget to CLOSING, so Acquire fails closed with
 // ErrClosed (the directory may already belong to a successor process) and
 // acquires already blocked on the budget wake up and fail closed too. It then
-// waits for Used() to reach zero before releasing the ownership lock: a
+// waits for the whole ledger to drain — every reservation released AND every
+// cleanup-debt entry reclaimed — before releasing the ownership lock: a
 // successor budget must never start (and sweep spool files) while a
-// reservation from this budget still covers staged bytes. Calls released
-// after Close still return their bytes to the (now retired) ledger.
+// reservation or an unreclaimable spool file still occupies the directory.
+// Cleanup debt drains through RetryCleanup (Maintain runs it); a removal that
+// keeps failing therefore keeps ownership and the bytes charged rather than
+// silently handing unreclaimable bytes to a successor. Calls released after
+// Close still return their bytes to the (now retired) ledger.
 //
 // Production servers hold ownership for the process lifetime and rely on
 // process exit; Close exists for orderly hand-off and for tests that simulate
-// a crash and restart. Because it waits for outstanding reservations, a
-// caller that cannot guarantee a bounded drain should use CloseWithContext.
+// a crash and restart. Because it waits for outstanding reservations and
+// cleanup retries, a caller that cannot guarantee a bounded drain should use
+// CloseWithContext.
 func (b *Budget) Close() error {
 	return b.CloseWithContext(context.Background())
 }
 
 // CloseWithContext is Close bounded by ctx. It transitions the budget to
 // CLOSING (rejecting new acquisitions with ErrClosed and waking blocked
-// acquirers), then waits for Used() to reach zero before releasing the
-// directory ownership lock and unregistering the budget.
+// acquirers), then waits for Used() (reservations plus cleanup debt) to reach
+// zero before releasing the directory ownership lock and unregistering the
+// budget.
 //
-// If ctx ends before the last reservation is released, CloseWithContext
-// returns ctx.Err() WITHOUT releasing ownership: the directory stays ours and
-// a later Close/CloseWithContext completes the hand-off once the ledger
-// drains. That is the safe direction — a successor must never sweep bytes a
-// live reservation still covers.
+// If ctx ends before the last reservation is released or the cleanup debt is
+// reclaimed, CloseWithContext returns ctx.Err() WITHOUT releasing ownership:
+// the directory stays ours and a later Close/CloseWithContext completes the
+// hand-off once the ledger drains. That is the safe direction — a successor
+// must never sweep bytes a live reservation or an unreclaimable file still
+// covers.
 //
 // Concurrent Close calls converge: exactly one performs the release and the
 // others block until it completes (bounded by their own ctx). The release
@@ -452,10 +484,12 @@ func (b *Budget) CloseWithContext(ctx context.Context) error {
 				return ctx.Err()
 			}
 		}
-		if b.used == 0 {
-			// Last reservation gone (or never existed): release ownership.
+		if b.used == 0 && b.pendingBytes == 0 {
+			// Last reservation gone and no unreclaimable spool bytes remain
+			// (or none ever existed): release ownership.
 			b.finalized = true
 			b.activeSpools = nil
+			b.pendingCleanup = nil
 			done := b.done
 			lock := b.lock
 			b.mu.Unlock()
@@ -466,7 +500,7 @@ func (b *Budget) CloseWithContext(ctx context.Context) error {
 		}
 		if err := ctx.Err(); err != nil {
 			// Keep the CLOSING state and ownership: the last Release (or a
-			// later Close) drains and releases.
+			// later Close, after a RetryCleanup succeeds) drains and releases.
 			b.mu.Unlock()
 			return err
 		}
@@ -486,8 +520,10 @@ func (b *Budget) CloseWithContext(ctx context.Context) error {
 // immediately. A request larger than the whole budget fails immediately with
 // an error wrapping ErrBudgetExceeded (waiting could never make it fit); a
 // cancelled context fails with ctx.Err(); a closed budget fails with
-// ErrClosed. The returned reservation must be released exactly once (Release
-// is idempotent).
+// ErrClosed. Admission also honors any cleanup debt (files whose removal
+// failed and whose bytes are still charged): those bytes are not reclaimable
+// capacity until RetryCleanup removes them. The returned reservation must be
+// released exactly once (Release is idempotent).
 func (b *Budget) Acquire(ctx context.Context, n int64) (*Reservation, error) {
 	if n < 0 {
 		return nil, fmt.Errorf("staging: negative reservation %d", n)
@@ -509,10 +545,10 @@ func (b *Budget) Acquire(ctx context.Context, n int64) (*Reservation, error) {
 			return nil, fmt.Errorf("%w: %s", ErrClosed, b.dir)
 		}
 		// Subtraction form: with the maintained invariant
-		// 0 <= used <= maxBytes, maxBytes-used cannot overflow, whereas
-		// used+n can wrap for a large n and a large configured limit,
-		// silently admitting an over-budget reservation.
-		if n <= b.maxBytes-b.used {
+		// 0 <= used+pendingBytes <= maxBytes, maxBytes-used-pendingBytes
+		// cannot overflow, whereas used+n can wrap for a large n and a large
+		// configured limit, silently admitting an over-budget reservation.
+		if n <= b.maxBytes-b.used-b.pendingBytes {
 			b.used += n
 			b.mu.Unlock()
 			return &Reservation{budget: b, n: n}, nil
@@ -550,7 +586,9 @@ type Reservation struct {
 
 // Release returns the reserved bytes. It must be called on every exit path of
 // the staged transfer, including error and disconnect paths. Concurrent calls
-// are safe: exactly one decrement happens, the rest are no-ops.
+// are safe: exactly one decrement happens, the rest are no-ops. Cleanup that
+// may fail must go through Budget.CleanupSpool instead: that path releases
+// the reservation only when the staged file is actually gone.
 func (r *Reservation) Release() {
 	if r == nil {
 		return
@@ -568,6 +606,31 @@ func (r *Reservation) Release() {
 		b.broadcastLocked()
 		b.mu.Unlock()
 	})
+}
+
+// consumeLocked converts this reservation into cleanup debt exactly once: the
+// bytes leave the live ledger (used) and are charged to the debt ledger
+// (pendingBytes) instead, so Used() keeps reflecting bytes that are physically
+// present in the staging directory after a failed removal. It returns the
+// consumed amount (0 when the reservation was already released). The caller
+// holds the charging budget's mu.
+func (r *Reservation) consumeLocked() int64 {
+	if r == nil {
+		return 0
+	}
+	var n int64
+	r.releaseOnce.Do(func() {
+		n = r.n
+		b := r.budget
+		if b == nil {
+			return
+		}
+		b.used -= n
+		if b.used < 0 {
+			b.used = 0
+		}
+	})
+	return n
 }
 
 // trackSpoolLocked records path as an active spool of this budget. The caller
@@ -618,6 +681,11 @@ func (b *Budget) beginSpool() (*os.File, string, error) {
 // before the process exits should call it (the file is typically removed
 // first, which Prune also detects lazily); a spool whose file is gone is
 // forgotten automatically. It is safe to call on a nil receiver.
+//
+// A spool whose removal FAILED and that is therefore tracked as cleanup debt
+// must not be released through this method without removing the file:
+// CleanupSpool (or RetryCleanup) is the accounting-aware path that drops both
+// the registration and the charge only when the file is gone.
 func (b *Budget) ReleaseSpool(path string) {
 	if b == nil || path == "" {
 		return
@@ -627,13 +695,135 @@ func (b *Budget) ReleaseSpool(path string) {
 	b.mu.Unlock()
 }
 
+// chargeCleanupDebtLocked records path as cleanup-required and charges n bytes
+// to the debt ledger. It is only called after a removal attempt failed (or the
+// bytes are otherwise known to remain on disk). The caller holds b.mu and is
+// responsible for waking waiters (broadcastLocked is called here).
+func (b *Budget) chargeCleanupDebtLocked(path string, n int64) {
+	if b.pendingCleanup == nil {
+		b.pendingCleanup = make(map[string]int64)
+	}
+	b.pendingCleanup[path] += n
+	b.pendingBytes += n
+	b.broadcastLocked()
+}
+
+// CleanupSpool removes a spool file that is no longer needed and releases its
+// byte reservation ONLY when the file is gone: removal succeeded, or the file
+// was already absent (os.ErrNotExist). On any other removal error the spool
+// stays registered as active (so Prune cannot mistake it for an abandoned file)
+// and the reservation's bytes stay charged as cleanup debt — the reservation
+// is consumed exactly once, so the caller's deferred Release is a no-op and
+// the charge can only be dropped by a successful RetryCleanup. The bool
+// reports whether the file is gone. It is safe to call on a nil receiver.
+func (b *Budget) CleanupSpool(path string, res *Reservation) bool {
+	if b == nil {
+		if res != nil {
+			res.Release()
+		}
+		return true
+	}
+	var removeErr error
+	if path != "" {
+		removeErr = removeSpoolFile(path)
+		if errors.Is(removeErr, os.ErrNotExist) {
+			removeErr = nil
+		}
+	}
+	b.mu.Lock()
+	if removeErr != nil {
+		b.chargeCleanupDebtLocked(path, res.consumeLocked())
+		b.mu.Unlock()
+		return false
+	}
+	delete(b.activeSpools, path)
+	b.mu.Unlock()
+	if res != nil {
+		res.Release()
+	}
+	return true
+}
+
+// PendingCleanup reports how many spool files could not be removed and whose
+// bytes are therefore still charged (and still counted by Used()). The value
+// is the degraded/cleanup-required signal: a non-zero count means the staging
+// directory holds bytes that a failed removal left behind and that
+// RetryCleanup still has to reclaim. It is safe to call on a nil receiver.
+func (b *Budget) PendingCleanup() int {
+	if b == nil {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.pendingCleanup)
+}
+
+// RetryCleanup retries removing every spool file whose earlier removal failed
+// and, for each success, unregisters the spool and releases its charged bytes.
+// It returns how many files were reclaimed and the first removal error (the
+// remaining debt stays charged and registered, so a later retry converges). A
+// cancelled context stops the pass after the current attempt, returning the
+// count reclaimed so far and ctx.Err() when no earlier error occurred. It is
+// safe to call on a nil receiver. Maintenance calls it every tick; production
+// callers can also invoke it directly.
+func (b *Budget) RetryCleanup(ctx context.Context) (int, error) {
+	if b == nil {
+		return 0, nil
+	}
+	b.mu.Lock()
+	paths := make([]string, 0, len(b.pendingCleanup))
+	for path := range b.pendingCleanup {
+		paths = append(paths, path)
+	}
+	b.mu.Unlock()
+	removed := 0
+	var firstErr error
+	for _, path := range paths {
+		if err := ctx.Err(); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			break
+		}
+		err := removeSpoolFile(path)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		b.mu.Lock()
+		if n, ok := b.pendingCleanup[path]; ok {
+			delete(b.pendingCleanup, path)
+			b.pendingBytes -= n
+			if b.pendingBytes < 0 {
+				b.pendingBytes = 0
+			}
+		}
+		delete(b.activeSpools, path)
+		b.broadcastLocked()
+		b.mu.Unlock()
+		removed++
+	}
+	return removed, firstErr
+}
+
 // forgetMissingSpoolsLocked drops active entries whose file no longer exists:
 // the caller that owned the spool removed it, so there is nothing left to
-// protect. The caller holds b.mu.
+// protect. A vanished file also settles any cleanup debt charged for it — the
+// bytes no longer occupy the directory, so the charge must not outlive them.
+// The caller holds b.mu.
 func (b *Budget) forgetMissingSpoolsLocked() {
 	for path := range b.activeSpools {
 		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 			delete(b.activeSpools, path)
+			if n, ok := b.pendingCleanup[path]; ok {
+				delete(b.pendingCleanup, path)
+				b.pendingBytes -= n
+				if b.pendingBytes < 0 {
+					b.pendingBytes = 0
+				}
+			}
 		}
 	}
 }
@@ -717,10 +907,12 @@ func (b *Budget) Prune(ctx context.Context) (int, error) {
 // The spool is registered as active at creation under the budget mutex, so a
 // concurrent Prune skips it even if its age passes the threshold; the
 // registration is dropped when the file is observed gone (by Prune) or
-// explicitly with Budget.ReleaseSpool. A failed copy releases the registration
-// together with the partial file. A closed budget fails closed with ErrClosed
-// before any file is created: ownership may already have been handed to a
-// successor, so no new bytes may be admitted.
+// explicitly with Budget.ReleaseSpool. A failed copy removes the partial file
+// and releases the registration; when that removal itself fails, the partial
+// bytes stay registered and charged as cleanup debt (see PendingCleanup) and
+// RetryCleanup retries the removal. A closed budget fails closed with
+// ErrClosed before any file is created: ownership may already have been handed
+// to a successor, so no new bytes may be admitted.
 func (b *Budget) SpoolFile(r io.Reader, limit int64) (string, int64, error) {
 	if b == nil || strings.TrimSpace(b.dir) == "" {
 		return "", 0, fmt.Errorf("%w: staging directory is not configured", ErrNoBound)
@@ -733,11 +925,26 @@ func (b *Budget) SpoolFile(r io.Reader, limit int64) (string, int64, error) {
 	syncErr := f.Sync()
 	closeErr := f.Close()
 	if err := firstErr(copyErr, syncErr, closeErr); err != nil {
-		_ = os.Remove(path)
-		b.ReleaseSpool(path)
+		b.abandonSpool(path, n)
 		return "", n, err
 	}
 	return path, n, nil
+}
+
+// abandonSpool is SpoolFile's failed-copy cleanup. A successful removal (or an
+// already-gone file) unregisters the spool; any other failure keeps the
+// registration and charges the bytes actually written as cleanup debt, so
+// Used() keeps reflecting the partial file and RetryCleanup can reclaim it.
+// The caller's byte reservation is NOT touched here: it belongs to the caller,
+// which releases it on its own error path.
+func (b *Budget) abandonSpool(path string, n int64) {
+	if err := removeSpoolFile(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		b.mu.Lock()
+		b.chargeCleanupDebtLocked(path, n)
+		b.mu.Unlock()
+		return
+	}
+	b.ReleaseSpool(path)
 }
 
 // spoolCopy copies at most limit bytes of src into dst (limit == 0 permits

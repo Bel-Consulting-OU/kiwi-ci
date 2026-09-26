@@ -54,13 +54,13 @@ package storage
 // accounting while post-lease privileged operations (OIDC issuance, the cache
 // namespace, artifact provenance) resolve identity from the CURRENT record.
 // Such a row is reported; --cancel-active then, for those rows only, FIRST
-// performs the canonical cancellation transaction (cancelJobTx/cancelRunTx:
-// lease cleared, runner slot freed, resource reservation deleted, quota
-// released under the OLD identity, dependents recomputed, audit appended, run
-// aggregation recomputed) and only THEN rewrites/quarantines the identity.
-// Quarantining a run cascades to its non-terminal child jobs in the same
-// transaction, so a child is never left queued under a cancelled+quarantined
-// parent (T1-3).
+// performs the canonical cancellation (cancelJobTx per child job and
+// cancelRunRowTx for the run row: lease cleared, runner slot freed, resource
+// reservation deleted, quota released under the OLD identity, dependents
+// recomputed, audit appended, run aggregation recomputed) and only THEN
+// rewrites/quarantines the identity. Quarantining a run cascades to its
+// non-terminal child jobs in the same transaction, so a child is never left
+// queued under a cancelled+quarantined parent (T1-3).
 //
 // The pass is keyset-batched (ORDER BY created_at, id with a (created_at, id)
 // > cursor bounds and a configurable LIMIT), one transaction per batch,
@@ -71,16 +71,31 @@ package storage
 // explicit a1:/host-full value is left as is, and quarantined rows are stable
 // (the reserved host is not re-derived).
 //
-// Every guarded UPDATE checks that it actually matched the classified row. A
-// concurrent writer that makes it match zero rows is re-read/re-planned under
-// the same transaction and either applied with the fresh plan or recorded as a
-// distinct conflict; a counter is never incremented without a successful
-// UPDATE (R1-4). A quarantined row additionally gets the durable payload flag
+// Every guarded UPDATE checks that it actually matched the classified row. The
+// row (and, for a run, its child jobs) is locked before classification, so a
+// concurrent writer can neither move the row between the locked read and the
+// UPDATE nor make the guard match zero rows; a zero-row match can only be
+// foreign/inconsistent state and is recorded as a distinct conflict. A counter
+// is never incremented without a successful UPDATE (R1-4). A quarantined row
+// additionally gets the durable payload flag
 // repo_identity_quarantined=true, and an already-cancelled active row keeps
 // its cancelled status, so it is operationally inert even under an
 // allow-everything repository policy (R1-6). The lease-acquisition predicates
 // additionally deny a queued job whose PARENT run is cancelled/quarantined,
 // independently of the job's own flag (T1-3).
+//
+// LOCK ORDER: the repair obeys the established job -> run order, so it can
+// never deadlock against CompleteJob (job -> run through recomputeRunTx) or
+// AcquireLeaseAtomic. A JOB is locked on its own row. A RUN is locked only
+// AFTER its non-terminal child jobs, in deterministic id order (ORDER BY id
+// ASC), and the run's hasActiveChildren flag — the one that decides whether a
+// plain apply may rewrite the run at all — is derived from those LOCKED child
+// rows, never from an unlocked snapshot. The drain then cancels exactly the
+// child jobs locked before the run row; it never re-scans for a job to lock
+// while holding the run lock. A concurrent CompleteJob that already holds a
+// child job row therefore always wins or waits at the child lock, and the
+// repair can never form the run -> job / job -> run cycle PostgreSQL aborts
+// with SQLSTATE 40P01.
 //
 // SCOPE: runs and jobs, whose repo_id/policy_repo_id are written by
 // bindSubmissionRepoIdentity and its webhook/schedule/downstream siblings. A
@@ -136,10 +151,11 @@ const (
 	// identity would change. Reported, never rewritten unless the operator
 	// passes --cancel-active.
 	RepoIdentityActiveRequiresDrain
-	// RepoIdentityConflict is an APPLY-time outcome, never a plan: the guarded
-	// UPDATE matched no row and a re-read/re-plan under the same transaction
-	// still could not claim it (a concurrent writer kept moving the row). It
-	// is reported distinctly so the operator never reads a phantom repair.
+	// RepoIdentityConflict is an APPLY-time outcome, never a plan: the row
+	// could not be locked (it disappeared) or the guarded UPDATE matched no
+	// row against the locked value, or the run gained a child job outside the
+	// locked set. It is reported distinctly so the operator never reads a
+	// phantom repair.
 	RepoIdentityConflict
 
 	// RepoIdentityRewrite and RepoIdentityQuarantine are the identity-only
@@ -424,9 +440,10 @@ type RepoIdentityRepairResult struct {
 	// Drained counts rows the --cancel-active pass actually cancelled before
 	// applying their identity change.
 	Drained int
-	// Conflicts counts rows the guarded UPDATE could not claim even after a
-	// same-transaction re-read/re-plan (a concurrent writer kept moving them).
-	// They are NOT counted as repaired or quarantined.
+	// Conflicts counts rows the guarded UPDATE could not claim under the row
+	// lock (a disappeared row, a guard that matched nothing, or a run that
+	// gained a child job outside the locked set). They are NOT counted as
+	// repaired or quarantined.
 	Conflicts int
 	Entries   []RepoIdentityRepairEntry
 }
@@ -515,13 +532,32 @@ type repoIdentityRepairTestHooks struct {
 	BeforeApply func(kind, id string) error
 }
 
+// repoIdentityRepairNonTerminalJobsSQL is the shared run-child predicate: the
+// child jobs a run's cancellation/classification touches. It matches the
+// lease-acquisition predicate's terminal set.
+const repoIdentityRepairNonTerminalJobsSQL = `status NOT IN ('success','failure','cancelled','skipped','blocked')`
+
+// repoIdentityRepairChildLockSQL is the run-child lock statement of the repair:
+// every non-terminal child job of the run, locked in deterministic id order
+// (ORDER BY id ASC, the canonical run-cancellation order) and always BEFORE the
+// run row itself (lockRepoIdentityRepairRunTx). It deliberately does not touch
+// the run row, so the run lock is never taken ahead of a job lock.
+const repoIdentityRepairChildLockSQL = `SELECT id FROM jobs WHERE run_id=$1 AND ` + repoIdentityRepairNonTerminalJobsSQL + ` ORDER BY id ASC FOR UPDATE`
+
 // repoIdentityRepairTable bundles the per-kind SQL fragments.
 type repoIdentityRepairTable struct {
 	kind       string // "run" or "job"
 	table      string // "runs" or "jobs"
 	oldURLExpr string // payload field carrying the clone URL
 	batchSQL   string
-	recordSQL  string
+	// lockedSQL is the FOR UPDATE re-read of one row by id. A JOB row is
+	// locked on its own (a job lock is the FIRST lock of every job->run
+	// transaction, so there is nothing to order it against). A RUN row omits
+	// the hasActiveChildren EXISTS on purpose: the run's non-terminal child
+	// jobs are locked BEFORE the run (lockRepoIdentityRepairRunTx) and the
+	// flag is derived from those locked rows, so no job lock is ever taken
+	// after the run lock.
+	lockedSQL string
 }
 
 func newRepoIdentityRepairTables() []repoIdentityRepairTable {
@@ -531,13 +567,12 @@ func newRepoIdentityRepairTables() []repoIdentityRepairTable {
 		oldURLExpr: "payload->>'repo'",
 		batchSQL: `SELECT id, COALESCE(payload->>'repo_id',''), COALESCE(payload->>'policy_repo_id',''), ` +
 			`COALESCE(payload->>'repo',''), COALESCE(payload->>'repo_full_name',''), COALESCE(status,''), created_at, ` +
-			`EXISTS(SELECT 1 FROM jobs j WHERE j.run_id = runs.id AND j.status NOT IN ('success','failure','cancelled','skipped','blocked')) ` +
+			`EXISTS(SELECT 1 FROM jobs j WHERE j.run_id = runs.id AND j.` + repoIdentityRepairNonTerminalJobsSQL + `) ` +
 			`FROM runs WHERE (created_at, id) > ($1::timestamptz, $2::text) ` +
 			`ORDER BY created_at ASC, id ASC LIMIT $3`,
-		recordSQL: `SELECT id, COALESCE(payload->>'repo_id',''), COALESCE(payload->>'policy_repo_id',''), ` +
-			`COALESCE(payload->>'repo',''), COALESCE(payload->>'repo_full_name',''), COALESCE(status,''), created_at, ` +
-			`EXISTS(SELECT 1 FROM jobs j WHERE j.run_id = runs.id AND j.status NOT IN ('success','failure','cancelled','skipped','blocked')) ` +
-			`FROM runs WHERE id=$1`,
+		lockedSQL: `SELECT id, COALESCE(payload->>'repo_id',''), COALESCE(payload->>'policy_repo_id',''), ` +
+			`COALESCE(payload->>'repo',''), COALESCE(payload->>'repo_full_name',''), COALESCE(status,''), created_at ` +
+			`FROM runs WHERE id=$1 FOR UPDATE`,
 	}
 	job := repoIdentityRepairTable{
 		kind:       "job",
@@ -547,9 +582,9 @@ func newRepoIdentityRepairTables() []repoIdentityRepairTable {
 			`COALESCE(payload->>'repo_url',''), COALESCE(payload->>'repo_full_name',''), COALESCE(status,''), created_at, FALSE ` +
 			`FROM jobs WHERE (created_at, id) > ($1::timestamptz, $2::text) ` +
 			`ORDER BY created_at ASC, id ASC LIMIT $3`,
-		recordSQL: `SELECT id, COALESCE(payload->>'repo_id',''), COALESCE(payload->>'policy_repo_id',''), ` +
+		lockedSQL: `SELECT id, COALESCE(payload->>'repo_id',''), COALESCE(payload->>'policy_repo_id',''), ` +
 			`COALESCE(payload->>'repo_url',''), COALESCE(payload->>'repo_full_name',''), COALESCE(status,''), created_at, FALSE ` +
-			`FROM jobs WHERE id=$1`,
+			`FROM jobs WHERE id=$1 FOR UPDATE`,
 	}
 	return []repoIdentityRepairTable{run, job}
 }
@@ -711,117 +746,134 @@ func (s *PostgresStore) runRepoIdentityRepairBatch(ctx context.Context, tx pgx.T
 	return nil
 }
 
-// applyRepoIdentityRecord claims one row with the guarded UPDATE. When the
-// guard matches zero rows it re-reads the row under the SAME transaction,
-// re-plans and applies the fresh plan once; if that also loses, it records a
-// distinct conflict. Counters move only after a successful UPDATE (R1-4).
+// applyRepoIdentityRecord claims one row with the guarded UPDATE, classifying
+// from the values it locked under the documented lock order: a run's
+// non-terminal child jobs are locked first (deterministic id order), then the
+// run row; a job is locked on its own row. Holding those locks, no concurrent
+// writer can move the row between the locked read and the UPDATE, so the
+// guarded UPDATE can only fail on foreign/inconsistent state — there is no
+// optimistic re-read/re-plan loop to run, and a zero-row match is reported as
+// a distinct conflict instead of a phantom repair. Counters move only after a
+// successful UPDATE (R1-4).
 //
 // An active_requires_drain row is left untouched unless cancelActive is set,
 // in which case it is cancelled through the canonical cancellation
-// transaction (cancelJobTx/cancelRunTx, quota released under the OLD identity)
-// BEFORE the guarded identity UPDATE (T1-1/T1-2).
+// transaction (cancelJobTx/cancelRunRowTx, quota released under the OLD
+// identity) BEFORE the guarded identity UPDATE (T1-1/T1-2).
 func (s *PostgresStore) applyRepoIdentityRecord(ctx context.Context, tx pgx.Tx, table repoIdentityRepairTable, r repoIdentityRepairRow, cancelActive bool, result *RepoIdentityRepairResult) error {
-	lastPlan := RepoIdentityPlan{Action: RepoIdentityKeep}
-	for attempt := 0; attempt < 2; attempt++ {
-		if h := s.repoIdentityRepairHooks; h != nil && h.BeforeApply != nil {
-			if err := h.BeforeApply(table.kind, r.id); err != nil {
-				return err
-			}
-		}
-		// Finding 6: re-read and LOCK the current row before any destructive
-		// action, and classify from those locked values. A concurrent writer
-		// that changed the row after the batch read must never be cancelled
-		// for an identity it no longer carries.
-		locked, found, lerr := readRepoIdentityRepairRecordLocked(ctx, tx, table, r.id)
-		if lerr != nil {
-			return lerr
-		}
-		if !found {
-			result.Conflicts++
-			result.Entries = append(result.Entries, RepoIdentityRepairEntry{
-				Kind: table.kind, ID: r.id, Stored: r.repoID, Repaired: "",
-				Action: RepoIdentityConflict, Reason: "row disappeared before the repair could lock it",
-			})
-			return nil
-		}
-		r = locked
-		plan := ClassifyRepoIdentityWithChildren(r.repoID, r.url, r.full, model.Status(r.status), r.hasActiveChildren)
-		lastPlan = plan
-		if plan.Action == RepoIdentityKeep {
-			result.Unchanged++
-			return nil
-		}
-		active := plan.Action == RepoIdentityActiveRequiresDrain
-		if active && !cancelActive {
-			// Report only: never silently rewrite (or quarantine) a row whose
-			// lease/queue slot was admitted under the old identity.
-			result.ActiveRequiresDrain++
-			result.Entries = append(result.Entries, RepoIdentityRepairEntry{
-				Kind: table.kind, ID: r.id, Stored: r.repoID, Repaired: plan.Explicit,
-				Action: RepoIdentityActiveRequiresDrain, Reason: plan.Reason,
-			})
-			return nil
-		}
-		desired := plan.Action
-		if active {
-			desired = plan.Desired
-		}
-		// Drain the active row (or cascade a run quarantine to its
-		// non-terminal children) BEFORE the guarded identity UPDATE, so the
-		// quota is released under the identity the row still carries.
-		drained, err := s.drainRepoIdentityRowTx(ctx, tx, table, r, desired)
-		if err != nil {
+	if h := s.repoIdentityRepairHooks; h != nil && h.BeforeApply != nil {
+		if err := h.BeforeApply(table.kind, r.id); err != nil {
 			return err
 		}
-		// A fork PR's policy_repo_id is the BASE repository: only rewrite it
-		// when it is the same value as the checkout identity.
-		repairedPolicy := plan.Explicit
-		if strings.TrimSpace(r.policyID) != strings.TrimSpace(r.repoID) {
-			repairedPolicy = r.policyID
-		}
-		oldVals, applied, err := applyGuardedRepoIdentity(ctx, tx, table, r, desired, plan.Explicit, repairedPolicy)
-		if err != nil {
-			return err
-		}
-		if applied {
-			if desired == RepoIdentityQuarantineTerminal {
-				if err := insertRepoIdentityQuarantine(ctx, tx, table.kind, r.id, oldVals, plan.Reason); err != nil {
-					return err
-				}
-				result.Quarantined++
-			} else {
-				result.Rewritten++
-			}
-			if drained && active {
-				result.Drained++
-			}
-			result.Entries = append(result.Entries, RepoIdentityRepairEntry{
-				Kind: table.kind, ID: r.id, Stored: r.repoID, Repaired: plan.Explicit,
-				Action: desired, Reason: plan.Reason,
-			})
-			return nil
-		}
-		// The guard matched zero rows: a concurrent writer moved the row
-		// between the batch read and the UPDATE. Re-read the committed state
-		// under the same transaction and re-plan.
-		fresh, found, err := readRepoIdentityRepairRecord(ctx, tx, table, r.id)
-		if err != nil {
-			return err
-		}
-		if !found {
-			result.Conflicts++
-			result.Entries = append(result.Entries, RepoIdentityRepairEntry{
-				Kind: table.kind, ID: r.id, Stored: r.repoID, Repaired: plan.Explicit,
-				Action: RepoIdentityConflict, Reason: "row disappeared before the repair could claim it",
-			})
-			return nil
-		}
-		r = fresh
 	}
-	result.Conflicts++
+	// Finding 6: re-read and LOCK the current row(s) before any destructive
+	// action, and classify from those locked values. A concurrent writer that
+	// changed the row after the batch read must never be cancelled for an
+	// identity it no longer carries.
+	var (
+		locked         repoIdentityRepairRow
+		lockedChildren []string
+		extraChildren  bool
+		found          bool
+		lerr           error
+	)
+	if table.kind == "run" {
+		locked, lockedChildren, extraChildren, found, lerr = lockRepoIdentityRepairRunTx(ctx, tx, table, r.id)
+	} else {
+		locked, found, lerr = readRepoIdentityRepairRecordLocked(ctx, tx, table, r.id)
+	}
+	if lerr != nil {
+		return lerr
+	}
+	if !found {
+		result.Conflicts++
+		result.Entries = append(result.Entries, RepoIdentityRepairEntry{
+			Kind: table.kind, ID: r.id, Stored: r.repoID, Repaired: "",
+			Action: RepoIdentityConflict, Reason: "row disappeared before the repair could lock it",
+		})
+		return nil
+	}
+	r = locked
+	plan := ClassifyRepoIdentityWithChildren(r.repoID, r.url, r.full, model.Status(r.status), r.hasActiveChildren)
+	if plan.Action == RepoIdentityKeep {
+		result.Unchanged++
+		return nil
+	}
+	active := plan.Action == RepoIdentityActiveRequiresDrain
+	if active && !cancelActive {
+		// Report only: never silently rewrite (or quarantine) a row whose
+		// lease/queue slot was admitted under the old identity.
+		result.ActiveRequiresDrain++
+		result.Entries = append(result.Entries, RepoIdentityRepairEntry{
+			Kind: table.kind, ID: r.id, Stored: r.repoID, Repaired: plan.Explicit,
+			Action: RepoIdentityActiveRequiresDrain, Reason: plan.Reason,
+		})
+		return nil
+	}
+	if extraChildren {
+		// A non-terminal child appeared between the child scan and the run
+		// lock (a concurrent requeue of a terminal row, or a raw job insert).
+		// Cancelling it now would take a job lock while the run lock is held —
+		// the exact run -> job inversion the lock order forbids — so the row
+		// is left untouched and reported as a conflict for the operator to
+		// re-run. It is still classified from the locked values PLUS the extra
+		// child (hasActiveChildren is true), so the plain apply path above can
+		// never rewrite the run behind an active child's back.
+		result.Conflicts++
+		result.Entries = append(result.Entries, RepoIdentityRepairEntry{
+			Kind: table.kind, ID: r.id, Stored: r.repoID, Repaired: plan.Explicit,
+			Action: RepoIdentityConflict, Reason: "run gained a non-terminal child job while its children were being locked; re-run the repair",
+		})
+		return nil
+	}
+	desired := plan.Action
+	if active {
+		desired = plan.Desired
+	}
+	// Drain the active row (or cascade a run quarantine to its
+	// non-terminal children) BEFORE the guarded identity UPDATE, so the
+	// quota is released under the identity the row still carries. For a run
+	// the cascade uses exactly the child rows locked before the run row.
+	drained, err := s.drainRepoIdentityRowTx(ctx, tx, table, r, desired, lockedChildren)
+	if err != nil {
+		return err
+	}
+	// A fork PR's policy_repo_id is the BASE repository: only rewrite it
+	// when it is the same value as the checkout identity.
+	repairedPolicy := plan.Explicit
+	if strings.TrimSpace(r.policyID) != strings.TrimSpace(r.repoID) {
+		repairedPolicy = r.policyID
+	}
+	oldVals, applied, err := applyGuardedRepoIdentity(ctx, tx, table, r, desired, plan.Explicit, repairedPolicy)
+	if err != nil {
+		return err
+	}
+	if !applied {
+		// The row is locked and the guard compares the identity against that
+		// locked value, so a zero-row match means foreign/inconsistent state
+		// (never a concurrent-writer race): report it rather than counting a
+		// phantom repair.
+		result.Conflicts++
+		result.Entries = append(result.Entries, RepoIdentityRepairEntry{
+			Kind: table.kind, ID: r.id, Stored: r.repoID, Repaired: plan.Explicit,
+			Action: RepoIdentityConflict, Reason: "guarded identity UPDATE matched no row under the row lock; state is inconsistent",
+		})
+		return nil
+	}
+	if desired == RepoIdentityQuarantineTerminal {
+		if err := insertRepoIdentityQuarantine(ctx, tx, table.kind, r.id, oldVals, plan.Reason); err != nil {
+			return err
+		}
+		result.Quarantined++
+	} else {
+		result.Rewritten++
+	}
+	if drained && active {
+		result.Drained++
+	}
 	result.Entries = append(result.Entries, RepoIdentityRepairEntry{
-		Kind: table.kind, ID: r.id, Stored: r.repoID, Repaired: lastPlan.Explicit,
-		Action: RepoIdentityConflict, Reason: "concurrent writer kept changing the row; re-run the repair",
+		Kind: table.kind, ID: r.id, Stored: r.repoID, Repaired: plan.Explicit,
+		Action: desired, Reason: plan.Reason,
 	})
 	return nil
 }
@@ -833,12 +885,18 @@ func (s *PostgresStore) applyRepoIdentityRecord(ctx context.Context, tx pgx.Tx, 
 //
 // A TERMINAL row needs no cancellation of its own: the guarded UPDATE writes
 // the flag/identity under its own row lock, so touching the row here would only
-// hold a lock the concurrent-writer re-read path does not need. A terminal RUN
-// may still have non-terminal children (an inconsistent but possible tree), so
-// it cascades to those through cancelRunChildrenTx; a terminal JOB is left to
-// the guarded UPDATE. A non-terminal (active) row is cancelled through
-// cancelJobTx/cancelRunTx exactly like CancelRunJobs.
-func (s *PostgresStore) drainRepoIdentityRowTx(ctx context.Context, tx pgx.Tx, table repoIdentityRepairTable, r repoIdentityRepairRow, desired RepoIdentityRepairAction) (bool, error) {
+// hold a lock the guarded UPDATE does not need. A terminal RUN may still have
+// non-terminal children (an inconsistent but possible tree), so it cascades to
+// the child jobs locked BEFORE the run row (lockedChildren); a terminal JOB is
+// left to the guarded UPDATE. A non-terminal (active) row is cancelled through
+// cancelJobTx/cancelRunRowTx exactly like CancelRunJobs.
+//
+// The RUN cascade never re-scans for child jobs: a re-scan under the held run
+// lock could observe a concurrently requeued child and wait for its job lock
+// AFTER the run lock, inverting the job -> run order this repair guarantees
+// (see lockRepoIdentityRepairRunTx; such a child is reported as a conflict by
+// applyRepoIdentityRecord instead).
+func (s *PostgresStore) drainRepoIdentityRowTx(ctx context.Context, tx pgx.Tx, table repoIdentityRepairTable, r repoIdentityRepairRow, desired RepoIdentityRepairAction, lockedChildren []string) (bool, error) {
 	reason := RepoIdentityDrainReason
 	cause := JobCancelRepairDrain
 	if desired == RepoIdentityQuarantineTerminal {
@@ -852,12 +910,94 @@ func (s *PostgresStore) drainRepoIdentityRowTx(ctx context.Context, tx pgx.Tx, t
 		}
 		return s.cancelJobTx(ctx, tx, r.id, reason, cause)
 	}
-	if terminal {
-		// A terminal run is quarantined/rewritten by the guarded UPDATE; only
-		// its non-terminal children (if any) need the cascade.
-		return s.cancelRunChildrenTx(ctx, tx, r.id, reason, cause)
+	cancelledChildren, err := s.cancelRepoIdentityLockedChildrenTx(ctx, tx, lockedChildren, reason, cause)
+	if err != nil {
+		return false, err
 	}
-	return s.cancelRunTx(ctx, tx, r.id, reason, cause)
+	if terminal {
+		// The terminal run itself is quarantined/rewritten by the guarded
+		// UPDATE; only its locked non-terminal children need the cascade.
+		return cancelledChildren, nil
+	}
+	return s.cancelRunRowTx(ctx, tx, r.id, reason, cause)
+}
+
+// lockRepoIdentityRepairRunTx locks one run for an identity repair in the
+// established job -> run order: FIRST the run's non-terminal child jobs in
+// deterministic id order, THEN the run row. It returns the locked row, the
+// child ids it locked, and whether a non-terminal child appeared outside that
+// locked set (extraChildren).
+//
+// The run's hasActiveChildren flag is derived from the locked child rows plus
+// the post-lock count, never from an unlocked snapshot, so the run is
+// rewritten only when no active child can be left behind. Because the child
+// scan precedes the run lock, the repair never waits for a job lock while
+// holding the run lock: a concurrent CompleteJob (job -> run) either holds the
+// child row and makes the repair wait at the child lock, or waits on the run
+// lock after the repair committed — no lock cycle, no 40P01.
+func lockRepoIdentityRepairRunTx(ctx context.Context, tx pgx.Tx, table repoIdentityRepairTable, runID string) (repoIdentityRepairRow, []string, bool, bool, error) {
+	children, err := lockRepoIdentityRepairChildJobs(ctx, tx, runID)
+	if err != nil {
+		return repoIdentityRepairRow{}, nil, false, false, err
+	}
+	r, found, err := readRepoIdentityRepairRecordLocked(ctx, tx, table, runID)
+	if err != nil || !found {
+		return r, children, false, found, err
+	}
+	// The run row is locked now, so new rows cannot be inserted under it
+	// (the FK key-share conflicts with FOR UPDATE); re-read the non-terminal
+	// child set and treat any child outside the locked set as extra. Locked
+	// children are still non-terminal (we hold their locks and have not
+	// modified them), so the count is always >= len(children).
+	var activeChildren int
+	if err := tx.QueryRow(ctx,
+		`SELECT count(*) FROM jobs WHERE run_id=$1 AND `+repoIdentityRepairNonTerminalJobsSQL, runID).Scan(&activeChildren); err != nil {
+		return repoIdentityRepairRow{}, nil, false, false, err
+	}
+	r.hasActiveChildren = activeChildren > 0
+	return r, children, activeChildren > len(children), true, nil
+}
+
+// lockRepoIdentityRepairChildJobs locks the run's non-terminal child jobs in
+// deterministic id order (ORDER BY id ASC), the order the canonical run
+// cancellation uses, and returns their ids. A terminal child is never locked
+// (nothing to cancel); a child that turns terminal while the lock query waits
+// is skipped by the FOR UPDATE predicate re-check.
+func lockRepoIdentityRepairChildJobs(ctx context.Context, tx pgx.Tx, runID string) ([]string, error) {
+	rows, err := tx.Query(ctx, repoIdentityRepairChildLockSQL, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// cancelRepoIdentityLockedChildrenTx cancels exactly the child job ids that
+// were locked before the run row (lockRepoIdentityRepairRunTx) through the
+// canonical cancelJobTx. Every id is already locked by this transaction, so no
+// job lock is taken AFTER the run lock; a child that appeared after the run
+// lock is left to the conflict report, never cancelled here. It reports
+// whether any child was actually transitioned.
+func (s *PostgresStore) cancelRepoIdentityLockedChildrenTx(ctx context.Context, tx pgx.Tx, jobIDs []string, reason string, cause JobCancelCause) (bool, error) {
+	cancelled := false
+	for _, id := range jobIDs {
+		ok, err := s.cancelJobTx(ctx, tx, id, reason, cause)
+		if err != nil {
+			return false, err
+		}
+		if ok {
+			cancelled = true
+		}
+	}
+	return cancelled, nil
 }
 
 // readRepoIdentityRepairBatch reads one keyset page.
@@ -876,26 +1016,6 @@ func readRepoIdentityRepairBatch(ctx context.Context, q repoIdentityRepairQuerye
 		out = append(out, r)
 	}
 	return out, rows.Err()
-}
-
-// readRepoIdentityRepairRecord re-reads one row by id.
-func readRepoIdentityRepairRecord(ctx context.Context, q repoIdentityRepairQueryer, table repoIdentityRepairTable, id string) (repoIdentityRepairRow, bool, error) {
-	var r repoIdentityRepairRow
-	rows, err := q.Query(ctx, table.recordSQL, id)
-	if err != nil {
-		return r, false, err
-	}
-	defer rows.Close()
-	if !rows.Next() {
-		if err := rows.Err(); err != nil {
-			return r, false, err
-		}
-		return r, false, nil
-	}
-	if err := rows.Scan(&r.id, &r.repoID, &r.policyID, &r.url, &r.full, &r.status, &r.createdAt); err != nil {
-		return r, false, err
-	}
-	return r, true, rows.Err()
 }
 
 // applyGuardedRepoIdentity executes the guarded, single-statement UPDATE for
@@ -924,10 +1044,17 @@ func applyGuardedRepoIdentity(ctx context.Context, tx pgx.Tx, table repoIdentity
 
 // readRepoIdentityRepairRecordLocked reads one row FOR UPDATE inside the
 // caller's transaction so classification and any cancellation act on the
-// committed, locked state rather than a stale batch snapshot.
+// committed, locked state rather than a stale batch snapshot. A JOB's
+// hasActiveChildren column is the constant FALSE (a job has no children); a
+// RUN's is derived by the caller from the child rows it locked first (see
+// lockRepoIdentityRepairRunTx).
 func readRepoIdentityRepairRecordLocked(ctx context.Context, tx pgx.Tx, table repoIdentityRepairTable, id string) (repoIdentityRepairRow, bool, error) {
 	var r repoIdentityRepairRow
-	err := tx.QueryRow(ctx, table.recordSQL+" FOR UPDATE", id).Scan(&r.id, &r.repoID, &r.policyID, &r.url, &r.full, &r.status, &r.createdAt, &r.hasActiveChildren)
+	dest := []any{&r.id, &r.repoID, &r.policyID, &r.url, &r.full, &r.status, &r.createdAt}
+	if table.kind != "run" {
+		dest = append(dest, &r.hasActiveChildren)
+	}
+	err := tx.QueryRow(ctx, table.lockedSQL, id).Scan(dest...)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return repoIdentityRepairRow{}, false, nil
 	}
