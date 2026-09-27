@@ -558,14 +558,6 @@ func leaseArtifactJob(t *testing.T, client *http.Client, base, token string) (mo
 // production 30s/60s in withAPIDeadlines makes the exempt route outlive the
 // bound and cuts the non-exempt route.
 func TestSlowUploadStreamingDeadlinePolicy(t *testing.T) {
-	prevRead, prevWrite := apiReadDeadline.get(), apiWriteDeadline.get()
-	apiReadDeadline.set(500 * time.Millisecond)
-	apiWriteDeadline.set(10 * time.Second)
-	t.Cleanup(func() {
-		apiReadDeadline.set(prevRead)
-		apiWriteDeadline.set(prevWrite)
-	})
-
 	ctx, cancel := context.WithCancel(context.Background())
 	addr, errCh := startServerEphemeral(t, ctx, "--runner-token", "tok", "--data-dir", t.TempDir())
 	defer func() {
@@ -576,7 +568,19 @@ func TestSlowUploadStreamingDeadlinePolicy(t *testing.T) {
 
 	base := "http://" + addr
 	client := &http.Client{Timeout: 30 * time.Second}
+	// The setup runs under the PRODUCTION deadlines; the seams shrink only
+	// once the job is leased, so the test's own register/lease traffic cannot
+	// be cut by the short bound under -race load. The seams are atomic, so
+	// shrinking them while the server is live is race-free.
 	runner, jobID, leaseToken, leaseGeneration := leaseArtifactJob(t, client, base, "tok")
+
+	prevRead, prevWrite := apiReadDeadline.get(), apiWriteDeadline.get()
+	apiReadDeadline.set(500 * time.Millisecond)
+	apiWriteDeadline.set(10 * time.Second)
+	t.Cleanup(func() {
+		apiReadDeadline.set(prevRead)
+		apiWriteDeadline.set(prevWrite)
+	})
 
 	// The streaming-exempt artifact upload: a trickled body that outlives the
 	// shrunk 500ms ordinary read deadline must still be accepted (201 below);
@@ -836,16 +840,6 @@ func TestStreamingStalledUploadDroppedByIdleBound(t *testing.T) {
 // keeps resetting it, so the transfer completes even though its total
 // duration exceeds both the ordinary API deadlines and several idle windows.
 func TestStreamingContinuousUploadOutlivesIdleWindows(t *testing.T) {
-	prevRead, prevWrite, prevIdle := apiReadDeadline.get(), apiWriteDeadline.get(), streamIdleTimeout
-	apiReadDeadline.set(300 * time.Millisecond)
-	apiWriteDeadline.set(300 * time.Millisecond)
-	streamIdleTimeout = 400 * time.Millisecond
-	t.Cleanup(func() {
-		apiReadDeadline.set(prevRead)
-		apiWriteDeadline.set(prevWrite)
-		streamIdleTimeout = prevIdle
-	})
-
 	ctx, cancel := context.WithCancel(context.Background())
 	addr, errCh := startServerEphemeral(t, ctx, "--runner-token", "tok", "--data-dir", t.TempDir())
 	defer func() {
@@ -856,7 +850,21 @@ func TestStreamingContinuousUploadOutlivesIdleWindows(t *testing.T) {
 
 	base := "http://" + addr
 	client := &http.Client{Timeout: 15 * time.Second}
+	// The setup runs under the PRODUCTION deadlines; the seams shrink only
+	// once the job is leased, so the test's own register/lease traffic cannot
+	// be cut by the short bound under -race load. The seams are atomic, so
+	// shrinking them while the server is live is race-free.
 	runner, jobID, leaseToken, leaseGeneration := leaseArtifactJob(t, client, base, "tok")
+
+	prevRead, prevWrite, prevIdle := apiReadDeadline.get(), apiWriteDeadline.get(), streamIdleTimeout
+	apiReadDeadline.set(300 * time.Millisecond)
+	apiWriteDeadline.set(300 * time.Millisecond)
+	streamIdleTimeout = 400 * time.Millisecond
+	t.Cleanup(func() {
+		apiReadDeadline.set(prevRead)
+		apiWriteDeadline.set(prevWrite)
+		streamIdleTimeout = prevIdle
+	})
 
 	// 12 chunks, one every 120ms: ~1.44s total, three-plus idle windows,
 	// with every individual gap well inside one window.
