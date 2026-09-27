@@ -3176,8 +3176,9 @@ func fragmentReceiptKey(parentJobID string, generation int64, fragmentID string)
 
 // InsertGeneratedFragmentTx mirrors the SQL transaction under f.mu: a
 // committed receipt is returned with replayed=true and nothing is inserted;
-// otherwise the verifier runs with the run's job count read under the same
-// lock and the fragment + receipt commit atomically.
+// otherwise the storage-owned lease predicate runs at the fake store's clock
+// under the same lock, then the verifier runs with the run's job count read
+// under that lock and the fragment + receipt commit atomically.
 func (f *dbFakeStore) InsertGeneratedFragmentTx(ctx context.Context, req storage.GeneratedFragmentRequest, verify storage.GeneratedJobVerifier) (storage.GeneratedFragmentReceipt, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -3189,6 +3190,10 @@ func (f *dbFakeStore) InsertGeneratedFragmentTx(ctx context.Context, req storage
 	if !ok {
 		return storage.GeneratedFragmentReceipt{}, false, storage.ErrNotFound
 	}
+	commitNow := time.Now().UTC()
+	if err := storage.ValidateGeneratedParentLease(parent, req, commitNow); err != nil {
+		return storage.GeneratedFragmentReceipt{}, false, err
+	}
 	count := 0
 	for _, j := range f.jobs {
 		if j.RunID == parent.RunID {
@@ -3196,7 +3201,7 @@ func (f *dbFakeStore) InsertGeneratedFragmentTx(ctx context.Context, req storage
 		}
 	}
 	if verify != nil {
-		if err := verify(parent, count); err != nil {
+		if err := verify(parent, count, commitNow); err != nil {
 			return storage.GeneratedFragmentReceipt{}, false, err
 		}
 	}
@@ -3211,7 +3216,7 @@ func (f *dbFakeStore) InsertGeneratedFragmentTx(ctx context.Context, req storage
 		LeaseGeneration: req.LeaseGeneration,
 		FragmentID:      req.FragmentID,
 		Children:        append([]storage.GeneratedFragmentChild(nil), req.Children...),
-		CreatedAt:       time.Now().UTC(),
+		CreatedAt:       commitNow,
 	}
 	f.fragments[key] = rec
 	return rec, false, nil

@@ -310,16 +310,24 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err := r.register(ctx); err != nil {
 		return err
 	}
-	if r.Cfg.MetricsListen != "" {
-		r.startMetricsServer(ctx)
-	}
-	prewarmer := newPrewarmer(r.Cfg)
-	// background tracks every goroutine Run spawns (executes and the
-	// maintenance passes with their own lifetimes). Run must not return while
-	// spawned work can still touch runner state: the process exits after Run
-	// returns, and tests swap package seams (workspace removal, quota install,
-	// reportf) that a live execute or GC pass reads. waitBackground enforces
-	// that contract, bounded by backgroundDrainGrace.
+	// runCtx is Run's private lifecycle context: everything Run spawns
+	// (executes, maintenance passes, the metrics server) runs under it, and
+	// Run cancels it before joining on EVERY return path — external
+	// cancellation, remote disable and graceful drain alike — so no owned
+	// component can outlive Run on a still-live parent context (a drain
+	// leaves the caller's ctx alive, which is exactly the case a detached
+	// metrics listener or maintenance goroutine would otherwise survive).
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+	// background tracks every goroutine Run spawns. On every return path Run
+	// first cancels runCtx and then joins the tracked work, bounded by
+	// backgroundDrainGrace: spawned work can still touch runner state (test
+	// seams, workspace teardown, a bound metrics port), so Run must not
+	// return while any of it is alive — and if the grace expires anyway (a
+	// job or probe that ignores cancellation must not pin process shutdown
+	// forever), the worker is already canceled and can only wind down; the
+	// detached waiter goroutine lives until it finishes. The grace case is
+	// reported on stderr, never silent.
 	var background sync.WaitGroup
 	waitBackground := func() {
 		finished := make(chan struct{})
@@ -327,13 +335,25 @@ func (r *Runner) Run(ctx context.Context) error {
 		select {
 		case <-finished:
 		case <-time.After(backgroundDrainGrace):
-			fmt.Fprintf(os.Stderr, "kiwi runner %s: background work still running after %s; exiting anyway\n", r.ID, backgroundDrainGrace)
+			fmt.Fprintf(os.Stderr, "kiwi runner %s: background work still running after %s; exiting anyway (its context is canceled)\n", r.ID, backgroundDrainGrace)
 		}
 	}
+	stop := func() {
+		runCancel()
+		waitBackground()
+	}
+	if r.Cfg.MetricsListen != "" {
+		background.Add(1)
+		go func() {
+			defer background.Done()
+			r.runMetricsServer(runCtx)
+		}()
+	}
+	prewarmer := newPrewarmer(r.Cfg)
 	background.Add(1)
 	go func() {
 		defer background.Done()
-		_ = prewarmer.run(ctx)
+		_ = prewarmer.run(runCtx)
 	}()
 	lastPrewarm := time.Now()
 	lastGC := time.Now()
@@ -348,10 +368,10 @@ func (r *Runner) Run(ctx context.Context) error {
 		// Fill every free local execution slot before sleeping. The control plane
 		// independently capacity-checks this runner, so a race cannot over-lease it.
 		for active < r.Cfg.Concurrency {
-			task, drainSignal, err := r.next(ctx)
+			task, drainSignal, err := r.next(runCtx)
 			if err != nil {
 				if errors.Is(err, ErrRunnerDisabledOrRevoked) {
-					waitBackground()
+					stop()
 					return err
 				}
 				fmt.Fprintf(os.Stderr, "kiwi runner %s: next: %v\n", r.ID, err)
@@ -367,22 +387,22 @@ func (r *Runner) Run(ctx context.Context) error {
 			background.Add(1)
 			go func(t server.Task) {
 				defer background.Done()
-				r.execute(ctx, t)
+				r.execute(runCtx, t)
 				done <- struct{}{}
 			}(*task)
 		}
 		if draining && active == 0 {
 			fmt.Printf("kiwi runner %s drained: no active work, exiting\n", r.ID)
-			waitBackground()
+			stop()
 			return nil
 		}
 		select {
 		case <-ctx.Done():
-			// Stop leasing, then let the work already started finish so no
-			// execute or maintenance pass outlives Run (bounded by
+			// Stop leasing, then cancel and join the work already started so
+			// no execute or maintenance pass outlives Run (bounded by
 			// backgroundDrainGrace: a job that ignores cancellation must not
 			// pin process shutdown forever).
-			waitBackground()
+			stop()
 			return ctx.Err()
 		case <-done:
 			active--
@@ -394,7 +414,7 @@ func (r *Runner) Run(ctx context.Context) error {
 				background.Add(1)
 				go func() {
 					defer background.Done()
-					r.runGCPass(ctx)
+					r.runGCPass(runCtx)
 				}()
 			}
 			if prewarmDue {
@@ -402,28 +422,45 @@ func (r *Runner) Run(ctx context.Context) error {
 				background.Add(1)
 				go func() {
 					defer background.Done()
-					_ = prewarmer.run(ctx)
+					_ = prewarmer.run(runCtx)
 				}()
 			}
 		}
 	}
 }
 
-// startMetricsServer serves the Prometheus text metrics on the configured
-// listen address for the runner's lifetime.
-func (r *Runner) startMetricsServer(ctx context.Context) {
+// runMetricsServer serves the Prometheus text metrics until ctx is canceled,
+// then shuts the server down within a bounded grace and returns. It is a
+// TRACKED Run-owned component, not detached goroutines: Run cancels runCtx
+// before joining, so a graceful drain releases the listen port before Run
+// returns and an in-process restart cannot collide with the old listener. A
+// bind failure is reported and the component returns; Run continues (metrics
+// are diagnostics, not job execution).
+func (r *Runner) runMetricsServer(ctx context.Context) {
 	srv := newMetricsServer(r.Cfg.MetricsListen, r.Metrics)
-	go func() {
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe() }()
+	select {
+	case <-ctx.Done():
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			fmt.Fprintf(os.Stderr, "kiwi runner metrics: %v\n", err)
 		}
-	}()
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
-	}()
+		return
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(shutdownCtx)
+	// Shutdown closes the listener first, so ListenAndServe returns promptly;
+	// the short select is a belt-and-braces bound, never an indefinite wait.
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			fmt.Fprintf(os.Stderr, "kiwi runner metrics: %v\n", err)
+		}
+	case <-time.After(time.Second):
+		fmt.Fprintf(os.Stderr, "kiwi runner metrics: shutdown did not complete in time\n")
+	}
 }
 func (r *Runner) register(ctx context.Context) error {
 	labels := append([]string{}, r.Cfg.Labels...)
@@ -518,11 +555,14 @@ func intersectStringLists(a, b []string) []string {
 	return out
 }
 
-// next polls for work. The boolean reports the server's drain signal
-// (X-Kiwi-Draining on a 204): the runner is draining and should exit once
-// its active slots are free. A disabled runner (X-Kiwi-Disabled) or a
-// rejected identity (403 — certificate revoked) is a terminal
-// ErrRunnerDisabledOrRevoked: the runner exits instead of re-polling.
+// next polls for work. The boolean reports the server's drain signal: the
+// control plane advertises it as X-Kiwi-Draining, on a 204 (no work) and on
+// the 503 it returns while draining (no new leases are issued), and the
+// runner should exit once its active slots are free. Other 503s (durability
+// degraded, no capacity) carry no drain header and stay retryable errors. A
+// disabled runner (X-Kiwi-Disabled) or a rejected identity (403 —
+// certificate revoked) is a terminal ErrRunnerDisabledOrRevoked: the runner
+// exits instead of re-polling.
 func (r *Runner) next(ctx context.Context) (*server.Task, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.Cfg.Server+"/api/v1/runners/"+r.ID+"/next", bytes.NewReader([]byte("{}")))
 	if err != nil {
@@ -539,6 +579,13 @@ func (r *Runner) next(ctx context.Context) (*server.Task, bool, error) {
 	}
 	if resp.StatusCode == http.StatusNoContent {
 		return nil, resp.Header.Get("X-Kiwi-Draining") == "true", nil
+	}
+	// The control plane signals a drain while it refuses new leases as 503 +
+	// X-Kiwi-Draining. That is the graceful-exit signal, not a transport
+	// error: without this mapping a remotely drained runner would poll and
+	// log forever instead of draining.
+	if resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get("X-Kiwi-Draining") == "true" {
+		return nil, true, nil
 	}
 	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
 		b, _ := io.ReadAll(resp.Body)
@@ -2122,10 +2169,13 @@ func (b *stallGuardedBody) Read(p []byte) (int, error) {
 }
 
 func (b *stallGuardedBody) Close() error {
-	b.guard.stop()
-	err := b.ReadCloser.Close()
-	b.cancel()
-	return err
+	// The inner Close may still move bytes (a verifying reader drains the
+	// remaining stream to validate its digest), so the stall guard and the
+	// request context must stay armed until that drain returns: disarming
+	// first would let a peer that stops sending hang Close forever.
+	defer b.cancel()
+	defer b.guard.stop()
+	return b.ReadCloser.Close()
 }
 
 // enroll requests a runner certificate for r.ID in exchange for the

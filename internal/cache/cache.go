@@ -289,7 +289,11 @@ func (b *stallGuardedBody) Read(p []byte) (int, error) {
 }
 
 func (b *stallGuardedBody) Close() error {
-	b.guard.release()
+	// The inner Close may still move bytes (a verifying reader drains the
+	// remaining stream to validate its digest), so the watchdog must stay
+	// armed until that drain returns: releasing first would let a peer that
+	// stops sending hang Close forever.
+	defer b.guard.release()
 	return b.ReadCloser.Close()
 }
 

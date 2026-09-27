@@ -499,18 +499,18 @@ func TestMemStoreDownstreamReservationExpiry(t *testing.T) {
 // fragment together with its idempotency receipt.
 func TestMemStoreInsertGeneratedFragmentTxVerifier(t *testing.T) {
 	m := newMemStore()
-	seedRunAndJob(m)
+	generation := seedLeasedParentForGeneration(t, m)
 	child := testJob
 	child.ID = "ffffffffffffffffffffffffffffffff"
 	child.Key = "generated"
 	contracts := map[string]map[string]ArtifactContract{
 		child.ID: {"dist": {Name: "dist", Required: true}},
 	}
-	req := GeneratedFragmentRequest{
+	req := withGeneratedLease(GeneratedFragmentRequest{
 		ParentJobID: testJob.ID, Depth: 1, FragmentID: "frag-1",
 		Jobs: map[string]model.Job{child.ID: child}, Contracts: contracts, Children: []GeneratedFragmentChild{{Key: child.Key, ID: child.ID}},
-	}
-	_, _, err := m.InsertGeneratedFragmentTx(ctx(), req, func(parent model.Job, count int) error {
+	}, generation)
+	_, _, err := m.InsertGeneratedFragmentTx(ctx(), req, func(parent model.Job, count int, _ time.Time) error {
 		return errors.New("rejected by verifier")
 	})
 	if err == nil {
@@ -527,9 +527,12 @@ func TestMemStoreInsertGeneratedFragmentTxVerifier(t *testing.T) {
 		t.Fatal("rejected fragment left a receipt")
 	}
 	// Acceptance inserts the fragment AND its contracts atomically.
-	rec, replayed, err := m.InsertGeneratedFragmentTx(ctx(), req, func(parent model.Job, count int) error {
+	rec, replayed, err := m.InsertGeneratedFragmentTx(ctx(), req, func(parent model.Job, count int, commitNow time.Time) error {
 		if count != 1 {
 			t.Fatalf("run job count = %d, want 1", count)
+		}
+		if commitNow.IsZero() {
+			t.Fatal("verifier did not receive the storage commit clock")
 		}
 		return nil
 	})
@@ -546,7 +549,7 @@ func TestMemStoreInsertGeneratedFragmentTxVerifier(t *testing.T) {
 		t.Fatalf("accepted fragment contracts = %v, ok=%v, err=%v", got, ok, err)
 	}
 	// A replay returns the SAME receipt and inserts nothing new.
-	again, replayed, err := m.InsertGeneratedFragmentTx(ctx(), req, func(parent model.Job, count int) error {
+	again, replayed, err := m.InsertGeneratedFragmentTx(ctx(), req, func(parent model.Job, count int, _ time.Time) error {
 		t.Fatalf("replay must not run the verifier (count=%d)", count)
 		return nil
 	})

@@ -17,17 +17,17 @@ import (
 // fragment contracts behind.
 func TestMemStoreGeneratedContractFailureRollsBackJobs(t *testing.T) {
 	m := newMemStore()
-	seedRunAndJob(m)
+	generation := seedLeasedParentForGeneration(t, m)
 	child := testJob
 	child.ID = "ffffffffffffffffffffffffffffffff"
 	child.Key = "generated"
 	badContracts := map[string]map[string]ArtifactContract{
 		"NOT-A-VALID-ID": {"dist": {Name: "dist", Required: true}},
 	}
-	_, _, err := m.InsertGeneratedFragmentTx(ctx(), GeneratedFragmentRequest{
+	_, _, err := m.InsertGeneratedFragmentTx(ctx(), withGeneratedLease(GeneratedFragmentRequest{
 		ParentJobID: testJob.ID, Depth: 1, FragmentID: "frag-bad-contract",
 		Jobs: map[string]model.Job{child.ID: child}, Contracts: badContracts, Children: []GeneratedFragmentChild{{Key: child.Key, ID: child.ID}},
-	}, nil)
+	}, generation), nil)
 	if err == nil {
 		t.Fatal("malformed contract job id must fail the fragment")
 	}
@@ -47,17 +47,17 @@ func TestMemStoreGeneratedContractFailureRollsBackJobs(t *testing.T) {
 // after the fragment commit — before any completion can run against it.
 func TestMemStoreGeneratedContractsVisibleBeforeCompletion(t *testing.T) {
 	m := newMemStore()
-	seedRunAndJob(m)
+	generation := seedLeasedParentForGeneration(t, m)
 	child := testJob
 	child.ID = "ffffffffffffffffffffffffffffffff"
 	child.Key = "generated"
 	contracts := map[string]map[string]ArtifactContract{
 		child.ID: {"dist": {Name: "dist", Required: true}},
 	}
-	if _, _, err := m.InsertGeneratedFragmentTx(ctx(), GeneratedFragmentRequest{
+	if _, _, err := m.InsertGeneratedFragmentTx(ctx(), withGeneratedLease(GeneratedFragmentRequest{
 		ParentJobID: testJob.ID, Depth: 1, FragmentID: "frag-contracts",
 		Jobs: map[string]model.Job{child.ID: child}, Contracts: contracts, Children: []GeneratedFragmentChild{{Key: child.Key, ID: child.ID}},
-	}, nil); err != nil {
+	}, generation), nil); err != nil {
 		t.Fatalf("InsertGeneratedFragmentTx: %v", err)
 	}
 	got, ok, err := m.GetJobContracts(ctx(), child.ID)
@@ -171,5 +171,40 @@ func TestMigration0007ScheduleIdentity(t *testing.T) {
 	stmts := migrations.SplitStatements(sql)
 	if len(stmts) != 7 {
 		t.Fatalf("0007 has %d statements, want 7 (one statement per semicolon-terminated DDL: 5 ALTER + 2 CREATE INDEX)", len(stmts))
+	}
+}
+
+// TestMemStoreGeneratedFragmentRejectsLeaseMismatch proves the memory store
+// owns the lease predicate: a request presenting a different runner is
+// refused BEFORE the verifier runs and leaves no jobs, contracts or receipt.
+// The handler's clock and its callback can never launder the lease.
+func TestMemStoreGeneratedFragmentRejectsLeaseMismatch(t *testing.T) {
+	m := newMemStore()
+	generation := seedLeasedParentForGeneration(t, m)
+	child := testJob
+	child.ID = "ffffffffffffffffffffffffffffffff"
+	child.Key = "generated"
+	req := withGeneratedLease(GeneratedFragmentRequest{
+		ParentJobID: testJob.ID, Depth: 1, FragmentID: "frag-lease-mismatch",
+		Jobs:      map[string]model.Job{child.ID: child},
+		Contracts: map[string]map[string]ArtifactContract{child.ID: {"dist": {Name: "dist"}}},
+		Children:  []GeneratedFragmentChild{{Key: child.Key, ID: child.ID}},
+	}, generation)
+	req.RunnerID = "00000000000000000000000000000000"
+	_, _, err := m.InsertGeneratedFragmentTx(ctx(), req, func(parent model.Job, count int, _ time.Time) error {
+		t.Fatal("verifier must not run after a lease refusal")
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "runner") {
+		t.Fatalf("mismatched runner = %v, want a runner refusal", err)
+	}
+	if _, err := m.GetJob(ctx(), child.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("refused fragment leaked a job: %v", err)
+	}
+	if got, ok, _ := m.GetJobContracts(ctx(), child.ID); ok || got != nil {
+		t.Fatalf("refused fragment leaked contracts: %v", got)
+	}
+	if _, found, _ := m.GetGeneratedFragment(ctx(), testJob.ID, generation, "frag-lease-mismatch"); found {
+		t.Fatal("refused fragment left a receipt")
 	}
 }

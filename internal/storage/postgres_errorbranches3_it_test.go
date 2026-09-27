@@ -395,7 +395,17 @@ func TestPostgresIntegrationFragmentErrorBranches(t *testing.T) {
 	t.Run("corrupt-receipt", func(t *testing.T) {
 		st := pgITStore(t)
 		ids := boomerSeedFor(t, st, pgITRepo)
-		req := GeneratedFragmentRequest{ParentJobID: ids.job, LeaseGeneration: 1, FragmentID: "f", Jobs: map[string]model.Job{}}
+		// The fragment transaction owns the lease predicate: the parent must
+		// be running under a live lease the request presents.
+		leased, lerr := st.AcquireLease(ctx, ids.job, ids.runner, []byte("frag-branch-token"), 1, time.Now().UTC().Add(time.Hour))
+		if lerr != nil {
+			t.Fatalf("lease parent: %v", lerr)
+		}
+		req := GeneratedFragmentRequest{
+			ParentJobID: ids.job, RunnerID: leased.LeaseRunnerID,
+			LeaseGeneration: leased.LeaseGeneration, LeaseTokenHash: leased.LeaseTokenHash,
+			FragmentID: "f", Jobs: map[string]model.Job{},
+		}
 		if _, _, err := st.InsertGeneratedFragmentTx(ctx, req, nil); err != nil {
 			t.Fatalf("fragment: %v", err)
 		}

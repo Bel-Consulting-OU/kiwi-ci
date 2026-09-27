@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cache"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/safefs"
@@ -274,4 +276,47 @@ func TestCacheClientRestoreDigestAndBounds(t *testing.T) {
 			t.Fatal("missing digest header must be logged as a debug diagnostic")
 		}
 	})
+}
+
+// TestCacheRestoreCloseDrainStaysStallBounded pins the runner adaptation's
+// close ordering: the cache client verifies the digest on Close by draining
+// the unread stream, and the runner's stall guard must stay armed through
+// that drain, so a peer that delivered a prefix and stopped sending
+// terminates Close on the idle bound instead of hanging it. Disarming the
+// guard (or canceling the request) before the inner Close is the regression
+// this guards.
+func TestCacheRestoreCloseDrainStaysStallBounded(t *testing.T) {
+	full := bytes.Repeat([]byte("z"), 64)
+	sum := sha256.Sum256(full)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(cache.HeaderCacheSHA256, hex.EncodeToString(sum[:]))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(full[:8])
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	c := &cache.Client{Server: srv.URL, HTTP: srv.Client()}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	guard := newStallGuard(cancel, 200*time.Millisecond)
+	rc, err := c.Restore(ctx, "job-1", nil, "key")
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	body := &stallGuardedBody{ReadCloser: rc, guard: guard, cancel: cancel}
+	if _, err := io.ReadFull(body, make([]byte, 4)); err != nil {
+		t.Fatalf("prefix read: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- body.Close() }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("stalled verifying drain reported success")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close hung: the stall guard was disarmed before the verifying drain")
+	}
 }

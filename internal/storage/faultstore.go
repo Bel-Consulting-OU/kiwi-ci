@@ -4992,6 +4992,14 @@ func (m *memStore) InsertGeneratedFragmentTx(ctx context.Context, req GeneratedF
 	if !ok {
 		return GeneratedFragmentReceipt{}, false, ErrNotFound
 	}
+	// The store owns the complete lease predicate in memory mode too: the
+	// clock is sampled inside the same critical section that reads the parent
+	// and inserts the fragment, so a skewed handler clock can never launder
+	// an expired lease.
+	commitNow := time.Now().UTC()
+	if err := ValidateGeneratedParentLease(parent, req, commitNow); err != nil {
+		return GeneratedFragmentReceipt{}, false, err
+	}
 	count := 0
 	for _, j := range m.jobs {
 		if j.RunID == parent.RunID {
@@ -4999,7 +5007,7 @@ func (m *memStore) InsertGeneratedFragmentTx(ctx context.Context, req GeneratedF
 		}
 	}
 	if verify != nil {
-		if err := verify(parent, count); err != nil {
+		if err := verify(parent, count, commitNow); err != nil {
 			return GeneratedFragmentReceipt{}, false, err
 		}
 	}
@@ -5040,7 +5048,7 @@ func (m *memStore) InsertGeneratedFragmentTx(ctx context.Context, req GeneratedF
 		LeaseGeneration: req.LeaseGeneration,
 		FragmentID:      req.FragmentID,
 		Children:        append([]GeneratedFragmentChild(nil), req.Children...),
-		CreatedAt:       time.Now().UTC(),
+		CreatedAt:       commitNow,
 	}
 	m.fragments[fragmentKey(req.ParentJobID, req.LeaseGeneration, req.FragmentID)] = rec
 	return rec, false, nil

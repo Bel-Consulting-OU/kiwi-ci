@@ -729,7 +729,9 @@ func TestFinalMetricsServerListenError(t *testing.T) {
 	defer cancel()
 	// A listener with no port is rejected synchronously by ListenAndServe.
 	r := &Runner{Metrics: NewMetrics(), Cfg: Config{MetricsListen: "not-a-listen-address"}}
-	r.startMetricsServer(ctx)
+	// A listen failure returns promptly from the tracked component (the
+	// failure is reported on stderr, not fatal to Run).
+	r.runMetricsServer(ctx)
 	read := make(chan string, 1)
 	go func() {
 		buf := make([]byte, 512)
@@ -1092,7 +1094,8 @@ func TestFinalMetricsServerAddrInUseLogs(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	r := &Runner{Metrics: NewMetrics(), Cfg: Config{MetricsListen: ln.Addr().String()}}
-	r.startMetricsServer(ctx)
+	// The tracked component returns on its own after the bind failure.
+	r.runMetricsServer(ctx)
 	read := make(chan string, 1)
 	go func() {
 		buf := make([]byte, 512)

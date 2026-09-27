@@ -8,6 +8,7 @@ package storage
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -623,11 +624,17 @@ type DynamicStore interface {
 	InsertGeneratedJobs(ctx context.Context, parentJobID string, depth int, jobs map[string]model.Job, deps map[string][]string) error
 }
 
-// GeneratedJobVerifier is the transactional recheck closure for dynamic
-// fragment insertion: the store reads the parent job FOR UPDATE and counts
-// the run's jobs inside the transaction, then calls the verifier with that
-// fresh state; a returned error rolls the whole fragment back.
-type GeneratedJobVerifier func(parent model.Job, runJobCount int) error
+// GeneratedJobVerifier is the transactional graph-only recheck closure for
+// dynamic fragment insertion. The store owns the complete lease predicate:
+// inside the transaction it locks the parent row, samples the STORAGE clock
+// AFTER the lock, and rejects the fragment unless the locked parent is still
+// running under the exact runner, lease generation and token hash of the
+// request with a lease that is live at that storage clock (the same
+// clock-domain rule secret/OIDC issuance use). Only then does it call the
+// verifier with that locked state, the run's job count and the storage clock
+// for graph-specific checks (the max-jobs-per-run bound, identity
+// invariants). A returned error rolls the whole fragment back.
+type GeneratedJobVerifier func(parent model.Job, runJobCount int, commitNow time.Time) error
 
 // GeneratedFragmentChild is one created child of a generated fragment: the
 // compiled fragment key (matrix/shard suffixes included) and the assigned
@@ -651,20 +658,54 @@ type GeneratedFragmentReceipt struct {
 }
 
 // GeneratedFragmentRequest is the full transactional fragment payload: the
-// receipt identity, the already-compiled child jobs, their dependency edges
-// and artifact contracts. The verification closure and the receipt are
-// evaluated inside the same transaction as the insertion. Children lists the
-// created child key/ID pairs in canonical (sorted fragment key) order,
-// matching the response the admitting server reported.
+// receipt identity, the presenting lease identity and the already-compiled
+// child jobs, their dependency edges and artifact contracts. The RUNNER/TOKEN
+// fields are the lease the runner presented; the store verifies them and the
+// lease expiry against the locked parent row at the storage clock. The
+// verification closure and the receipt are evaluated inside the same
+// transaction as the insertion. Children lists the created child key/ID pairs
+// in canonical (sorted fragment key) order, matching the response the
+// admitting server reported.
 type GeneratedFragmentRequest struct {
 	ParentJobID     string
-	Depth           int
+	RunnerID        string
 	LeaseGeneration int64
+	LeaseTokenHash  []byte
+	Depth           int
 	FragmentID      string
 	Jobs            map[string]model.Job
 	Deps            map[string][]string
 	Contracts       map[string]map[string]ArtifactContract
 	Children        []GeneratedFragmentChild
+}
+
+// ValidateGeneratedParentLease is the complete storage-side lease predicate
+// for dynamic fragment insertion, shared by the PostgreSQL transaction and
+// the memory store: the locked parent must still be running under the exact
+// runner, lease generation and token hash of the request, with a lease that
+// is live at the storage clock. commitNow MUST be sampled after the parent
+// row lock (or inside the memory store's critical section), so the decision
+// is made in the same clock domain that persists the expiry — never by the
+// request handler's clock, which a skewed replica could use to launder an
+// expired lease.
+func ValidateGeneratedParentLease(parent model.Job, req GeneratedFragmentRequest, commitNow time.Time) error {
+	if parent.Status != model.StatusRunning {
+		return fmt.Errorf("storage: parent job is not running")
+	}
+	if parent.LeaseRunnerID != req.RunnerID {
+		return fmt.Errorf("storage: parent lease runner changed")
+	}
+	if parent.LeaseGeneration != req.LeaseGeneration {
+		return fmt.Errorf("storage: parent lease generation changed")
+	}
+	if len(parent.LeaseTokenHash) == 0 || len(req.LeaseTokenHash) == 0 ||
+		subtle.ConstantTimeCompare(parent.LeaseTokenHash, req.LeaseTokenHash) != 1 {
+		return fmt.Errorf("storage: parent lease token changed")
+	}
+	if parent.LeaseExpiresAt == nil || !parent.LeaseExpiresAt.After(commitNow) {
+		return fmt.Errorf("storage: parent lease expired")
+	}
+	return nil
 }
 
 // GeneratedFragmentStore reads the idempotency receipt of a previously

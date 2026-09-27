@@ -296,11 +296,19 @@ func TestPostgresIntegrationJSONSeamSweep(t *testing.T) {
 	})
 	t.Run("InsertGeneratedFragmentTx/contracts", func(t *testing.T) {
 		childID := pgITNewID(t)
+		fragRun, fragJob := pgITNewID(t), pgITNewID(t)
+		pgITEnqueueOne(t, st, fragRun, fragJob, pgITRepo)
+		leased, lerr := st.AcquireLease(ctx, fragJob, runnerID, []byte("seam-frag-token"), 1, time.Now().UTC().Add(time.Hour))
+		if lerr != nil {
+			t.Fatal(lerr)
+		}
 		defer seamPGFailAt(t, 2)()
 		_, _, err := st.InsertGeneratedFragmentTx(ctx, GeneratedFragmentRequest{
-			ParentJobID: jobID, FragmentID: pgITNewID(t), LeaseGeneration: 1,
-			Jobs:      map[string]model.Job{"child": {ID: childID, RunID: runID, Key: "child", Status: model.StatusQueued, CreatedAt: time.Now().UTC()}},
-			Contracts: map[string]map[string]ArtifactContract{childID: {"bin": {Name: "bin"}}},
+			ParentJobID: fragJob, RunnerID: leased.LeaseRunnerID,
+			LeaseGeneration: leased.LeaseGeneration, LeaseTokenHash: leased.LeaseTokenHash,
+			FragmentID: pgITNewID(t),
+			Jobs:       map[string]model.Job{"child": {ID: childID, RunID: fragRun, Key: "child", Status: model.StatusQueued, CreatedAt: time.Now().UTC()}},
+			Contracts:  map[string]map[string]ArtifactContract{childID: {"bin": {Name: "bin"}}},
 		}, nil)
 		if !errors.Is(err, errPGSeamJSON) {
 			t.Fatalf("InsertGeneratedFragmentTx contracts = %v", err)
@@ -308,11 +316,19 @@ func TestPostgresIntegrationJSONSeamSweep(t *testing.T) {
 	})
 	t.Run("InsertGeneratedFragmentTx/children", func(t *testing.T) {
 		childID := pgITNewID(t)
+		fragRun, fragJob := pgITNewID(t), pgITNewID(t)
+		pgITEnqueueOne(t, st, fragRun, fragJob, pgITRepo)
+		leased, lerr := st.AcquireLease(ctx, fragJob, runnerID, []byte("seam-frag-token"), 1, time.Now().UTC().Add(time.Hour))
+		if lerr != nil {
+			t.Fatal(lerr)
+		}
 		defer seamPGFailAt(t, 3)()
 		_, _, err := st.InsertGeneratedFragmentTx(ctx, GeneratedFragmentRequest{
-			ParentJobID: jobID, FragmentID: pgITNewID(t), LeaseGeneration: 1,
-			Jobs:      map[string]model.Job{"child": {ID: childID, RunID: runID, Key: "child", Status: model.StatusQueued, CreatedAt: time.Now().UTC()}},
-			Contracts: map[string]map[string]ArtifactContract{childID: {"bin": {Name: "bin"}}},
+			ParentJobID: fragJob, RunnerID: leased.LeaseRunnerID,
+			LeaseGeneration: leased.LeaseGeneration, LeaseTokenHash: leased.LeaseTokenHash,
+			FragmentID: pgITNewID(t),
+			Jobs:       map[string]model.Job{"child": {ID: childID, RunID: fragRun, Key: "child", Status: model.StatusQueued, CreatedAt: time.Now().UTC()}},
+			Contracts:  map[string]map[string]ArtifactContract{childID: {"bin": {Name: "bin"}}},
 		}, nil)
 		if !errors.Is(err, errPGSeamJSON) {
 			t.Fatalf("InsertGeneratedFragmentTx children = %v", err)

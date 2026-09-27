@@ -4185,7 +4185,17 @@ func (s *PostgresStore) InsertGeneratedFragmentTx(ctx context.Context, req Gener
 		return GeneratedFragmentReceipt{}, false, err
 	}
 	js := jobScanner{}
-	err = tx.QueryRow(ctx, `SELECT `+jobCols+` FROM jobs WHERE id=$1 FOR UPDATE`, req.ParentJobID).Scan(jobTargets(&js)...)
+	var commitNow time.Time
+	// The parent row is locked and the STORAGE clock is sampled after the
+	// lock, via a materialized locking CTE: a target-list clock_timestamp()
+	// would be evaluated during the scan, BEFORE LockRows acquires the lock,
+	// and a replica whose own clock lags could then accept a lease that is
+	// already dead in the authoritative clock domain (the same construction
+	// CommitSecretIssuance and CommitOIDCIssuance use).
+	err = tx.QueryRow(ctx, `WITH locked AS (
+		SELECT `+jobCols+` FROM jobs WHERE id=$1 FOR UPDATE
+	)
+	SELECT locked.*, clock_timestamp() FROM locked`, req.ParentJobID).Scan(append(jobTargets(&js), &commitNow)...)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return GeneratedFragmentReceipt{}, false, ErrNotFound
 	}
@@ -4196,12 +4206,18 @@ func (s *PostgresStore) InsertGeneratedFragmentTx(ctx context.Context, req Gener
 	if err != nil {
 		return GeneratedFragmentReceipt{}, false, err
 	}
+	// The store owns the complete lease predicate, decided at the storage
+	// clock sampled after the lock. The verifier below only sees graph
+	// checks.
+	if err := ValidateGeneratedParentLease(parent, req, commitNow); err != nil {
+		return GeneratedFragmentReceipt{}, false, err
+	}
 	var runJobCount int
 	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM jobs WHERE run_id=$1`, parent.RunID).Scan(&runJobCount); err != nil {
 		return GeneratedFragmentReceipt{}, false, err
 	}
 	if verify != nil {
-		if err := verify(parent, runJobCount); err != nil {
+		if err := verify(parent, runJobCount, commitNow); err != nil {
 			return GeneratedFragmentReceipt{}, false, err
 		}
 	}
@@ -4230,7 +4246,6 @@ func (s *PostgresStore) InsertGeneratedFragmentTx(ctx context.Context, req Gener
 			return GeneratedFragmentReceipt{}, false, err
 		}
 	}
-	now := time.Now().UTC()
 	// Canonical order contract: the caller passes Children in sorted-key
 	// order (the same order its response reported).
 	children := append([]GeneratedFragmentChild(nil), req.Children...)
@@ -4239,7 +4254,7 @@ func (s *PostgresStore) InsertGeneratedFragmentTx(ctx context.Context, req Gener
 		return GeneratedFragmentReceipt{}, false, err
 	}
 	ct, err := tx.Exec(ctx, `INSERT INTO generated_fragments (parent_job_id, lease_generation, fragment_id, children, created_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (parent_job_id, lease_generation, fragment_id) DO NOTHING`,
-		req.ParentJobID, req.LeaseGeneration, req.FragmentID, cb, now)
+		req.ParentJobID, req.LeaseGeneration, req.FragmentID, cb, commitNow)
 	if err != nil {
 		return GeneratedFragmentReceipt{}, false, err
 	}
@@ -4260,7 +4275,7 @@ func (s *PostgresStore) InsertGeneratedFragmentTx(ctx context.Context, req Gener
 	if err := tx.Commit(ctx); err != nil {
 		return GeneratedFragmentReceipt{}, false, err
 	}
-	return GeneratedFragmentReceipt{ParentJobID: req.ParentJobID, LeaseGeneration: req.LeaseGeneration, FragmentID: req.FragmentID, Children: children, CreatedAt: now}, false, nil
+	return GeneratedFragmentReceipt{ParentJobID: req.ParentJobID, LeaseGeneration: req.LeaseGeneration, FragmentID: req.FragmentID, Children: children, CreatedAt: commitNow}, false, nil
 }
 
 // ---------------------------------------------------------------------------

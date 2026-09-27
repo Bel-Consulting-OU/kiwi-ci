@@ -975,6 +975,134 @@ func TestStreamingBranchClearsInheritedDeadlines(t *testing.T) {
 	}
 }
 
+// TestStreamingDownloadArmsWriteBoundBeforeFirstWrite pins the download/SSE
+// half of the P2 close: a streaming GET (or SSE) must carry the write bound
+// from DISPATCH, before the handler can reach its first write, so the
+// pre-first-byte backend gap is never unbounded. Arming only on the first
+// Write is the regression this guards.
+func TestStreamingDownloadArmsWriteBoundBeforeFirstWrite(t *testing.T) {
+	prevIdle := streamIdleTimeout
+	streamIdleTimeout = 3 * time.Second
+	t.Cleanup(func() { streamIdleTimeout = prevIdle })
+
+	rec := &deadlineRecordingWriter{ResponseWriter: httptest.NewRecorder()}
+	handlerEntered := false
+	h := withAPIDeadlines(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlerEntered = true
+		// The write bound must already be armed before any write happens.
+		if rec.writeArms == 0 {
+			t.Error("streaming download reached the handler without a write bound")
+		}
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/artifacts/"+strings.Repeat("a", 32), nil)
+	h.ServeHTTP(rec, req)
+	if !handlerEntered {
+		t.Fatal("handler did not run")
+	}
+	if rec.readClears == 0 {
+		t.Fatal("download dispatch did not clear the inherited read deadline")
+	}
+	if until := time.Until(rec.lastWrite); until <= time.Second || until > 4*time.Second {
+		t.Fatalf("write bound armed at %v from now, want ~%v", until, streamIdleTimeout)
+	}
+}
+
+// TestStreamingUploadArmsWriteBoundAtBodyEOF pins the upload half: while the
+// body streams, only the read bound is armed; at EOF the wrapper clears the
+// read bound and arms the write bound for the post-body
+// processing/commit/response phase, which otherwise has no socket bound at
+// all.
+func TestStreamingUploadArmsWriteBoundAtBodyEOF(t *testing.T) {
+	prevIdle := streamIdleTimeout
+	streamIdleTimeout = 3 * time.Second
+	t.Cleanup(func() { streamIdleTimeout = prevIdle })
+
+	rec := &deadlineRecordingWriter{ResponseWriter: httptest.NewRecorder()}
+	writeArmsAtEOF := 0
+	h := withAPIDeadlines(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if rec.writeArms != 0 {
+			t.Errorf("upload phase armed the write bound early (%d arms)", rec.writeArms)
+		}
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			t.Errorf("drain upload body: %v", err)
+		}
+		writeArmsAtEOF = rec.writeArms
+	}))
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/jobs/job-1/cache/key", strings.NewReader("chunk"))
+	h.ServeHTTP(rec, req)
+	if writeArmsAtEOF == 0 {
+		t.Fatal("body EOF did not arm the write bound for the response phase")
+	}
+	if rec.readClears == 0 || rec.writeClears == 0 {
+		t.Fatal("upload dispatch did not clear the inherited deadlines")
+	}
+	if until := time.Until(rec.lastWrite); until <= time.Second || until > 4*time.Second {
+		t.Fatalf("write bound armed at %v from now, want ~%v", until, streamIdleTimeout)
+	}
+}
+
+// TestStreamingGetImplicitWriteAfterIdleFails is the behavioral socket test
+// for the download gap: a handler that blocks past the idle window and then
+// returns WITHOUT writing must not have its implicit response written onto an
+// unbounded connection. The write bound is armed at dispatch, so net/http's
+// own response write fails and the client observes a failed/truncated
+// response instead of a clean 200. Arming only on the first handler Write
+// leaves this gap unbounded.
+func TestStreamingGetImplicitWriteAfterIdleFails(t *testing.T) {
+	prevIdle := streamIdleTimeout
+	streamIdleTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { streamIdleTimeout = prevIdle })
+
+	srv := httptest.NewServer(withAPIDeadlines(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(400 * time.Millisecond)
+		// Return without writing: net/http writes the implicit response
+		// through the connection, which must fail on the armed bound.
+	})))
+	defer srv.Close()
+	resp, err := srv.Client().Get(srv.URL + "/api/v1/artifacts/" + strings.Repeat("a", 32))
+	if err == nil {
+		// Some transports surface the truncation on the body read instead.
+		body, rerr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if rerr == nil && resp.StatusCode == http.StatusOK && len(body) == 0 {
+			t.Fatal("implicit response write after the idle window succeeded; the download dispatch bound is not in force")
+		}
+	}
+}
+
+// TestStreamingUploadImplicitWriteAfterIdleFails is the behavioral socket
+// test for the upload gap: after the body reaches EOF the response side
+// carries the write bound, so a handler that stalls in post-body processing
+// past the idle window and returns without writing fails net/http's implicit
+// response write — the client observes a failure instead of a clean 200.
+func TestStreamingUploadImplicitWriteAfterIdleFails(t *testing.T) {
+	prevIdle := streamIdleTimeout
+	streamIdleTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { streamIdleTimeout = prevIdle })
+
+	srv := httptest.NewServer(withAPIDeadlines(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			return
+		}
+		time.Sleep(400 * time.Millisecond)
+		// Return without writing: the post-EOF bound must fail the implicit
+		// response write.
+	})))
+	defer srv.Close()
+	req, err := http.NewRequest(http.MethodPut, srv.URL+"/api/v1/jobs/job-1/cache/key", strings.NewReader("body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := srv.Client().Do(req)
+	if err == nil {
+		body, rerr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if rerr == nil && resp.StatusCode == http.StatusOK && len(body) == 0 {
+			t.Fatal("implicit response write after the idle window succeeded; the upload EOF bound is not in force")
+		}
+	}
+}
+
 // jsonString marshals a string as a JSON literal for embedding in a request
 // body.
 func jsonString(t *testing.T, s string) string {

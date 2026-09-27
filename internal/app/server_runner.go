@@ -128,16 +128,24 @@ func (d *apiDeadline) set(v time.Duration) { d.nanos.Store(int64(v)) }
 //
 // Streaming routes get two things:
 //
-//  1. Both connection deadlines are CLEARED before dispatch, so an absolute
+//  1. Any inherited absolute deadline is CLEARED before dispatch, so a
 //     deadline set for an earlier request can never bound a later stream on
 //     a reused HTTP/1.1 keep-alive connection. Current net/http happens to
-//     reset connection deadlines between requests because the server's own
+//     reset read deadlines between requests because the server's own
 //     ReadTimeout/WriteTimeout are 0, but the middleware must not depend on
 //     that incidental reset; clearing is explicit, cheap, and a no-op on
 //     writers that do not support deadlines.
-//  2. A sliding inactivity bound replaces the absolute one: each successful
-//     body Read re-arms the read deadline and each Write re-arms the write
-//     deadline, so continuous progress is never cut while a stalled peer is.
+//  2. A sliding inactivity bound replaces the absolute one, and BOTH
+//     directions are bounded across the whole streaming lifetime:
+//     - upload routes arm the read bound at dispatch and transition to the
+//     write bound when the body reaches EOF, so neither the body phase nor
+//     the post-body processing/commit phase has an unbounded gap;
+//     - download/SSE routes have no body, so the write bound is armed at
+//     dispatch, before the handler can reach its first write (arming only
+//     on the first Write would leave the backend lookup before it
+//     unbounded);
+//     - every successful Read, Write and Flush re-arms its side's bound, so
+//     continuous progress is never cut while a stalled peer is.
 //
 // Keep the exemption list tight and in sync with the route table in
 // internal/server/server.go; any new long-lived/bulk route MUST be added
@@ -150,10 +158,27 @@ func withAPIDeadlines(next http.Handler) http.Handler {
 		// authorization decision.
 		rc := http.NewResponseController(w)
 		if streamingRoute(r.Method, r.URL.Path) {
-			_ = rc.SetReadDeadline(time.Time{})
-			_ = rc.SetWriteDeadline(time.Time{})
 			sw := &streamDeadlineWriter{ResponseWriter: w, rc: rc, idle: streamIdleTimeout}
-			r.Body = newStreamDeadlineBody(r.Body, rc, streamIdleTimeout)
+			if streamingUpload(r.Method, r.URL.Path) {
+				// Upload: clear any inherited absolute deadlines, then arm the
+				// READ side for the body streaming phase. No socket write
+				// happens until the body has been fully received; the body
+				// wrapper transitions to the response/processing phase (clear
+				// the read bound, arm the write bound) at EOF, so a backend
+				// wedged after the body cannot leave the response side
+				// unbounded.
+				_ = rc.SetReadDeadline(time.Time{})
+				_ = rc.SetWriteDeadline(time.Time{})
+				r.Body = newStreamDeadlineBody(r.Body, rc, streamIdleTimeout)
+			} else {
+				// Download/SSE: no request body, so the response write is the
+				// only traffic. Arm the write bound IMMEDIATELY at dispatch:
+				// arming only on the first Write would leave the pre-first-
+				// byte gap (backend lookup/stall before any output) with no
+				// bound at all.
+				_ = rc.SetReadDeadline(time.Time{})
+				_ = rc.SetWriteDeadline(time.Now().Add(streamIdleTimeout))
+			}
 			next.ServeHTTP(sw, r)
 			return
 		}
@@ -189,11 +214,12 @@ func (w *streamDeadlineWriter) Flush() {
 // Unwrap exposes the underlying ResponseWriter to http.ResponseController.
 func (w *streamDeadlineWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
-// newStreamDeadlineBody wraps a streaming request body with the read half of
-// the sliding bound. Requests without a body (GET downloads, SSE) keep the
-// no-body sentinel and are bounded only by their writes; the guard is armed
-// immediately so an upload peer that sends nothing is dropped after one idle
-// window rather than holding the route open forever.
+// newStreamDeadlineBody wraps a streaming UPLOAD body with the read half of
+// the sliding bound and arms it immediately, so an upload peer that sends
+// nothing is dropped after one idle window rather than holding the route open
+// forever. The wrapper clears the read bound and arms the write bound when
+// the body reaches EOF (see streamDeadlineBody). Download/SSE routes carry no
+// body and take the write bound at dispatch instead.
 func newStreamDeadlineBody(body io.ReadCloser, rc *http.ResponseController, idle time.Duration) io.ReadCloser {
 	if body == nil || body == http.NoBody {
 		return body
@@ -202,8 +228,11 @@ func newStreamDeadlineBody(body io.ReadCloser, rc *http.ResponseController, idle
 	return &streamDeadlineBody{ReadCloser: body, rc: rc, idle: idle}
 }
 
-// streamDeadlineBody implements the read half of the sliding bound: every
-// successful Read re-arms the connection read deadline.
+// streamDeadlineBody implements the read half of the sliding bound for upload
+// bodies: every successful Read re-arms the connection read deadline, and EOF
+// transitions the connection to the response/processing phase — no further
+// socket reads happen while the handler hashes/commits, so the read bound is
+// cleared and the write bound is armed for the response.
 type streamDeadlineBody struct {
 	io.ReadCloser
 	rc   *http.ResponseController
@@ -214,6 +243,10 @@ func (b *streamDeadlineBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if n > 0 {
 		_ = b.rc.SetReadDeadline(time.Now().Add(b.idle))
+	}
+	if err == io.EOF {
+		_ = b.rc.SetReadDeadline(time.Time{})
+		_ = b.rc.SetWriteDeadline(time.Now().Add(b.idle))
 	}
 	return n, err
 }
@@ -230,7 +263,12 @@ func (b *streamDeadlineBody) Read(p []byte) (int, error) {
 //	GET  /api/v1/artifacts/{id}[/provenance]     download (streamed)
 //	GET  /api/v1/runs/{id}/snapshots/{sid}       download (streamed)
 //	GET  /api/v1/runs/{id}/logs/stream           SSE, long-lived
-func streamingRoute(method, path string) bool {
+//
+// streamingUpload reports whether a streaming route carries a request body:
+// its upload phase is read-bounded, and the body wrapper transitions the
+// connection to the write bound at EOF. Download and SSE routes carry no
+// body and are write-bounded from dispatch.
+func streamingUpload(method, path string) bool {
 	switch {
 	case method == http.MethodPut && strings.HasPrefix(path, "/api/v1/jobs/") &&
 		(strings.Contains(path, "/artifacts/") || strings.Contains(path, "/cache/")):
@@ -238,6 +276,15 @@ func streamingRoute(method, path string) bool {
 	case method == http.MethodPost && strings.HasPrefix(path, "/api/v1/jobs/") &&
 		strings.HasSuffix(path, "/snapshots"):
 		return true
+	}
+	return false
+}
+
+func streamingRoute(method, path string) bool {
+	if streamingUpload(method, path) {
+		return true
+	}
+	switch {
 	case method == http.MethodGet && strings.HasPrefix(path, "/api/v1/jobs/") &&
 		(strings.Contains(path, "/cache/") || strings.Contains(path, "/dependencies/")):
 		return true

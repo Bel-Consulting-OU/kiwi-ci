@@ -25,13 +25,12 @@ func faultyWrapperCases() map[string]wrapperCase {
 		_ = m.RememberPendingSidecar(ctx(), testJob.ID, 1, "bin", ArtifactSidecarKindSBOM, memDigest)
 	}
 	fragment := func(m *memStore) {
-		seedRunningJob(m)
-		req := GeneratedFragmentRequest{
-			ParentJobID:     testJob.ID,
-			LeaseGeneration: 1,
-			FragmentID:      "frag",
-			Jobs:            map[string]model.Job{},
-		}
+		leaseParentForGeneration(m)
+		req := withGeneratedLease(GeneratedFragmentRequest{
+			ParentJobID: testJob.ID,
+			FragmentID:  "frag",
+			Jobs:        map[string]model.Job{},
+		}, 1)
 		_, _, _ = m.InsertGeneratedFragmentTx(ctx(), req, nil)
 	}
 	cacheMan := func(m *memStore) {
@@ -324,8 +323,8 @@ func faultyWrapperCases() map[string]wrapperCase {
 			_, err := f.ExpireDownstreamReservations(ctx(), time.Unix(5000, 0).UTC())
 			return err
 		}},
-		"InsertGeneratedFragmentTx": {mutates: true, seed: seedRunningJob, call: func(f *FaultyStore) error {
-			_, _, err := f.InsertGeneratedFragmentTx(ctx(), GeneratedFragmentRequest{ParentJobID: testJob.ID, LeaseGeneration: 1, FragmentID: "frag"}, nil)
+		"InsertGeneratedFragmentTx": {mutates: true, seed: leaseParentForGeneration, call: func(f *FaultyStore) error {
+			_, _, err := f.InsertGeneratedFragmentTx(ctx(), withGeneratedLease(GeneratedFragmentRequest{ParentJobID: testJob.ID, FragmentID: "frag"}, 1), nil)
 			return err
 		}},
 		"GetGeneratedFragment": {seed: fragment, call: func(f *FaultyStore) error {

@@ -10,7 +10,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
@@ -62,39 +61,15 @@ func fcDynamicFixtureHTTP(t *testing.T) (*Server, Task) {
 }
 
 func TestFlowDynamicVerifyParentState(t *testing.T) {
-	exp := time.Now().UTC().Add(time.Hour)
-	base := model.Job{ID: "p", Status: model.StatusRunning, LeaseExpiresAt: &exp, LeaseRunnerID: "r1", LeaseGeneration: 3, LeaseTokenHash: []byte{1, 2, 3}}
-	cases := []struct {
-		name   string
-		fresh  model.Job
-		jobs   int
-		childs int
-		substr string
-	}{
-		{"identity changed", model.Job{ID: "other", Status: model.StatusRunning, LeaseExpiresAt: &exp, LeaseRunnerID: "r1", LeaseGeneration: 3, LeaseTokenHash: []byte{1, 2, 3}}, 0, 1, "changed"},
-		{"lease expired", func() model.Job {
-			j := base
-			past := time.Now().UTC().Add(-time.Minute)
-			j.LeaseExpiresAt = &past
-			return j
-		}(), 0, 1, "expired"},
-		{"not running", func() model.Job { j := base; j.Status = model.StatusQueued; return j }(), 0, 1, "expired"},
-		{"runner changed", func() model.Job { j := base; j.LeaseRunnerID = "r2"; return j }(), 0, 1, "lease changed"},
-		{"generation changed", func() model.Job { j := base; j.LeaseGeneration = 4; return j }(), 0, 1, "lease changed"},
-		{"token empty", func() model.Job { j := base; j.LeaseTokenHash = nil; return j }(), 0, 1, "token changed"},
-		{"token mismatch", func() model.Job { j := base; j.LeaseTokenHash = []byte{9}; return j }(), 0, 1, "token changed"},
-		{"run cap", base, maxJobsPerRun, 1, "limit"},
+	base := model.Job{ID: "p", Status: model.StatusRunning}
+	if err := verifyGeneratedFragmentGraph(base, base, 0, 1); err != nil {
+		t.Fatalf("valid parent graph state = %v", err)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			err := verifyGeneratedParentState(base, tc.fresh, tc.jobs, tc.childs)
-			if err == nil || !strings.Contains(err.Error(), tc.substr) {
-				t.Fatalf("verify = %v, want substring %q", err, tc.substr)
-			}
-		})
+	if err := verifyGeneratedFragmentGraph(base, model.Job{ID: "other", Status: model.StatusRunning}, 0, 1); err == nil || !strings.Contains(err.Error(), "changed") {
+		t.Fatalf("identity change = %v, want a changed-parent refusal", err)
 	}
-	if err := verifyGeneratedParentState(base, base, 0, 1); err != nil {
-		t.Fatalf("valid parent state = %v", err)
+	if err := verifyGeneratedFragmentGraph(base, base, maxJobsPerRun, 1); err == nil || !strings.Contains(err.Error(), "limit") {
+		t.Fatalf("run cap = %v, want the limit refusal", err)
 	}
 }
 

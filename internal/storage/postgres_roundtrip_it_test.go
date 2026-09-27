@@ -1163,11 +1163,20 @@ func TestPostgresIntegrationGeneratedJobsAndFragments(t *testing.T) {
 	if _, ok, err := st.GetGeneratedFragment(ctx, parentID, 1, "frag"); err != nil || ok {
 		t.Fatalf("missing fragment = %v, %v", ok, err)
 	}
+	// The fragment transaction owns the lease predicate, so the parent must
+	// be running under a live lease the request presents.
+	const fragRunnerID = "abababababababababababababababab"
+	fragTokenHash := []byte("fragment-lease-token")
+	if _, err := st.AcquireLease(ctx, parentID, fragRunnerID, fragTokenHash, 1, time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatalf("AcquireLease for fragment parent: %v", err)
+	}
 	fragChild := pgITNewID(t)
 	req := GeneratedFragmentRequest{
 		ParentJobID:     parentID,
-		Depth:           1,
+		RunnerID:        fragRunnerID,
 		LeaseGeneration: 1,
+		LeaseTokenHash:  fragTokenHash,
+		Depth:           1,
 		FragmentID:      "frag-1",
 		Jobs:            map[string]model.Job{fragChild: pgITJob(runID, fragChild, pgITRepo)},
 		Deps:            map[string][]string{fragChild: {}},
@@ -1187,21 +1196,21 @@ func TestPostgresIntegrationGeneratedJobsAndFragments(t *testing.T) {
 		t.Fatalf("GetGeneratedFragment = %+v, %v, %v", got, ok, err)
 	}
 	// The verifier runs inside the transaction and its error rolls back.
-	verifier := func(parent model.Job, runJobCount int) error {
+	verifier := func(parent model.Job, runJobCount int, _ time.Time) error {
 		if runJobCount <= 0 {
 			return errors.New("no jobs")
 		}
 		return nil
 	}
 	rejChild := pgITNewID(t)
-	rejReq := GeneratedFragmentRequest{ParentJobID: parentID, LeaseGeneration: 1, FragmentID: "rejected", Jobs: map[string]model.Job{rejChild: pgITJob(runID, rejChild, pgITRepo)}}
+	rejReq := GeneratedFragmentRequest{ParentJobID: parentID, RunnerID: fragRunnerID, LeaseGeneration: 1, LeaseTokenHash: fragTokenHash, FragmentID: "rejected", Jobs: map[string]model.Job{rejChild: pgITJob(runID, rejChild, pgITRepo)}}
 	if _, _, err := st.InsertGeneratedFragmentTx(ctx, rejReq, verifier); err != nil {
 		t.Fatalf("verifier pass: %v", err)
 	}
 	rejectedChild := pgITNewID(t)
 	rejReq.FragmentID = "rejected-2"
 	rejReq.Jobs = map[string]model.Job{rejectedChild: pgITJob(runID, rejectedChild, pgITRepo)}
-	failVerifier := func(parent model.Job, runJobCount int) error { return errors.New("rejected by verifier") }
+	failVerifier := func(parent model.Job, runJobCount int, _ time.Time) error { return errors.New("rejected by verifier") }
 	if _, _, err := st.InsertGeneratedFragmentTx(ctx, rejReq, failVerifier); err == nil {
 		t.Fatal("failing verifier must reject the fragment")
 	}
@@ -1227,10 +1236,13 @@ func TestPostgresIntegrationGeneratedJobsAndFragments(t *testing.T) {
 	// updates no row.
 	contractChild := pgITNewID(t)
 	if _, _, err := st.InsertGeneratedFragmentTx(ctx, GeneratedFragmentRequest{
-		ParentJobID: parentID,
-		FragmentID:  "with-contract",
-		Jobs:        map[string]model.Job{contractChild: pgITJob(runID, contractChild, pgITRepo)},
-		Contracts:   map[string]map[string]ArtifactContract{contractChild: testContracts},
+		ParentJobID:     parentID,
+		RunnerID:        fragRunnerID,
+		LeaseGeneration: 1,
+		LeaseTokenHash:  fragTokenHash,
+		FragmentID:      "with-contract",
+		Jobs:            map[string]model.Job{contractChild: pgITJob(runID, contractChild, pgITRepo)},
+		Contracts:       map[string]map[string]ArtifactContract{contractChild: testContracts},
 	}, nil); err != nil {
 		t.Fatalf("fragment with contracts: %v", err)
 	}
@@ -1239,10 +1251,13 @@ func TestPostgresIntegrationGeneratedJobsAndFragments(t *testing.T) {
 		t.Fatalf("fragment contracts = %+v, %v, %v", contracts, ok, err)
 	}
 	if _, _, err := st.InsertGeneratedFragmentTx(ctx, GeneratedFragmentRequest{
-		ParentJobID: parentID,
-		FragmentID:  "unknown-contract",
-		Jobs:        map[string]model.Job{},
-		Contracts:   map[string]map[string]ArtifactContract{pgITNewID(t): testContracts},
+		ParentJobID:     parentID,
+		RunnerID:        fragRunnerID,
+		LeaseGeneration: 1,
+		LeaseTokenHash:  fragTokenHash,
+		FragmentID:      "unknown-contract",
+		Jobs:            map[string]model.Job{},
+		Contracts:       map[string]map[string]ArtifactContract{pgITNewID(t): testContracts},
 	}, nil); err != nil {
 		t.Fatalf("unknown contract job id is a no-op update: %v", err)
 	}

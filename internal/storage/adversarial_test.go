@@ -433,17 +433,17 @@ func TestMemStoreOutboxAppendDuplicateIDRejected(t *testing.T) {
 // the two stores would otherwise disagree on the primary key.
 func TestMemStoreFragmentJobKeyIDMismatchRejected(t *testing.T) {
 	m := newMemStore()
-	seedRunAndJob(m)
+	generation := seedLeasedParentForGeneration(t, m)
 	child := testJob
 	child.ID = "ffffffffffffffffffffffffffffffff"
 	child.Key = "generated"
 	child.DynamicDepth = 1
-	req := GeneratedFragmentRequest{
+	req := withGeneratedLease(GeneratedFragmentRequest{
 		ParentJobID: testJob.ID, Depth: 1, FragmentID: "frag-mismatch",
 		Jobs:      map[string]model.Job{"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee": child},
 		Contracts: map[string]map[string]ArtifactContract{child.ID: {"dist": {Name: "dist"}}},
 		Children:  []GeneratedFragmentChild{{Key: child.Key, ID: child.ID}},
-	}
+	}, generation)
 	if _, _, err := m.InsertGeneratedFragmentTx(ctx(), req, nil); err == nil {
 		t.Fatal("job key/id mismatch accepted")
 	}
@@ -454,12 +454,12 @@ func TestMemStoreFragmentJobKeyIDMismatchRejected(t *testing.T) {
 		t.Fatal("mismatched fragment left a receipt")
 	}
 	// Contracts outside the fragment are rejected too.
-	req2 := GeneratedFragmentRequest{
+	req2 := withGeneratedLease(GeneratedFragmentRequest{
 		ParentJobID: testJob.ID, Depth: 1, FragmentID: "frag-orphan-contract",
 		Jobs:      map[string]model.Job{child.ID: child},
 		Contracts: map[string]map[string]ArtifactContract{"99999999999999999999999999999999": {"dist": {Name: "dist"}}},
 		Children:  []GeneratedFragmentChild{{Key: child.Key, ID: child.ID}},
-	}
+	}, generation)
 	if _, _, err := m.InsertGeneratedFragmentTx(ctx(), req2, nil); err == nil {
 		t.Fatal("orphan contract accepted")
 	}

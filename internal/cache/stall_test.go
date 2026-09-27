@@ -492,3 +492,64 @@ func TestStoreStallGuardNoGoroutineLeak(t *testing.T) {
 		t.Fatalf("goroutines after 40 bounded transfers = %d, warm baseline %d", got, base)
 	}
 }
+
+// orderedDrainBody simulates a peer that delivered a prefix and then stopped
+// sending: every Read after the prefix blocks until the transfer context is
+// canceled, and Close performs the drain a verification-on-close reader does
+// when the caller stops reading early, recording whether the watchdog had
+// already been released when the drain started.
+type orderedDrainBody struct {
+	prefix []byte
+	ctx    context.Context
+	guard  *storeStallGuard
+
+	releasedBeforeDrain bool
+}
+
+func (b *orderedDrainBody) Read(p []byte) (int, error) {
+	if len(b.prefix) > 0 {
+		n := copy(p, b.prefix)
+		b.prefix = b.prefix[n:]
+		return n, nil
+	}
+	<-b.ctx.Done()
+	return 0, b.ctx.Err()
+}
+
+func (b *orderedDrainBody) Close() error {
+	b.guard.mu.Lock()
+	b.releasedBeforeDrain = b.guard.stopped
+	b.guard.mu.Unlock()
+	_, err := io.Copy(io.Discard, b)
+	return err
+}
+
+// TestStoreGuardedBodyCloseKeepsWatchdogThroughDrain pins the Store wrapper's
+// close ordering: the inner Close (which drains the remaining stream for
+// verification-on-close) must run BEFORE the watchdog is released, and the
+// armed watchdog must terminate a stalled drain on the idle bound instead of
+// hanging Close. Releasing first is the regression this guards.
+func TestStoreGuardedBodyCloseKeepsWatchdogThroughDrain(t *testing.T) {
+	ctx, guard := newStoreStallGuard(context.Background(), 200*time.Millisecond)
+	inner := &orderedDrainBody{prefix: []byte("part"), ctx: ctx, guard: guard}
+	body := &stallGuardedBody{ReadCloser: inner, guard: guard}
+
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(body, buf); err != nil {
+		t.Fatalf("prefix read: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- body.Close() }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("stalled drain reported success")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close hung: the watchdog was disarmed before the verification drain")
+	}
+	if inner.releasedBeforeDrain {
+		t.Fatal("the watchdog was released before the inner Close returned; a drain that ignores the canceled context would be unbounded")
+	}
+	guard.release()
+}

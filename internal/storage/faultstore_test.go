@@ -226,6 +226,42 @@ func seedRunAndJob(m *memStore) {
 	_ = m.InsertJob(ctx(), testJob)
 }
 
+// testGeneratedRunnerID and testGeneratedTokenHash are the lease identity the
+// generated-fragment tests present; seedLeasedParentForGeneration puts the
+// parent under exactly that lease so the storage-owned predicate accepts it.
+const testGeneratedRunnerID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+var testGeneratedTokenHash = []byte("generated-lease-token-hash")
+
+// leaseParentForGeneration seeds the run and job and acquires the fixture
+// lease on testJob, ignoring the error so table-driven setups without a *T
+// can use it.
+func leaseParentForGeneration(m *memStore) {
+	seedRunAndJob(m)
+	exp := time.Now().UTC().Add(time.Hour)
+	_, _ = m.AcquireLease(ctx(), testJob.ID, testGeneratedRunnerID, testGeneratedTokenHash, 1, exp)
+}
+
+// seedLeasedParentForGeneration seeds the run and job and acquires a live
+// lease on testJob, returning the generation the fragment requests must
+// present. The storage-owned predicate reads this lease from the parent row
+// at the store clock, so tests must present the matching identity instead of
+// relying on a verifier closure.
+func seedLeasedParentForGeneration(t *testing.T, m *memStore) int64 {
+	t.Helper()
+	leaseParentForGeneration(m)
+	return 1
+}
+
+// withGeneratedLease fills the presenting lease identity into a fragment
+// request so tests exercise the store-owned predicate with the fixture lease.
+func withGeneratedLease(req GeneratedFragmentRequest, generation int64) GeneratedFragmentRequest {
+	req.RunnerID = testGeneratedRunnerID
+	req.LeaseGeneration = generation
+	req.LeaseTokenHash = testGeneratedTokenHash
+	return req
+}
+
 func seedRunningJob(m *memStore) {
 	seedRunAndJob(m)
 	exp := time.Unix(2000, 0).UTC()
@@ -546,21 +582,24 @@ func faultOps() []opCase {
 		{
 			name: "InsertGeneratedFragmentTx",
 			setup: func(m *memStore) {
-				seedRunAndJob(m)
+				leaseParentForGeneration(m)
 			},
 			call: func(s Store) error {
 				child := testJob
 				child.ID = "ffffffffffffffffffffffffffffffff"
 				child.Key = "generated"
 				child.DynamicDepth = 1
-				_, _, err := s.(DynamicStoreTx).InsertGeneratedFragmentTx(ctx(), GeneratedFragmentRequest{
+				_, _, err := s.(DynamicStoreTx).InsertGeneratedFragmentTx(ctx(), withGeneratedLease(GeneratedFragmentRequest{
 					ParentJobID: testJob.ID, Depth: 1, FragmentID: "frag-fault",
 					Jobs: map[string]model.Job{child.ID: child}, Deps: map[string][]string{child.ID: nil},
 					Contracts: map[string]map[string]ArtifactContract{child.ID: {"dist": {Name: "dist"}}},
 					Children:  []GeneratedFragmentChild{{Key: child.Key, ID: child.ID}},
-				}, func(parent model.Job, count int) error {
+				}, 1), func(parent model.Job, count int, commitNow time.Time) error {
 					if count != 1 {
 						return fmt.Errorf("unexpected run job count %d", count)
+					}
+					if commitNow.IsZero() {
+						return fmt.Errorf("verifier did not receive the storage commit clock")
 					}
 					return nil
 				})

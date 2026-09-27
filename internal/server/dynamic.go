@@ -23,18 +23,6 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/version"
 )
 
-// subtleCompare compares two byte slices in constant time.
-func subtleCompare(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	var v byte
-	for i := range a {
-		v |= a[i] ^ b[i]
-	}
-	return v == 0
-}
-
 const (
 	// maxGeneratedFragmentBytes bounds one generated graph fragment upload.
 	maxGeneratedFragmentBytes = 256 << 10
@@ -115,25 +103,17 @@ func (s *Server) generateJobs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, res)
 }
 
-// verifyGeneratedParentState is the single lease/state predicate applied at
-// fragment insertion time in BOTH storage modes (the DB transaction verifier
-// and the memory-mode critical section): the parent must still be running
-// under the same runner, lease generation and token hash, with a live lease,
-// and the run must stay within the max-jobs-per-run cap. snapshot is the
-// authorized parent the handler admitted against; fresh is the current
-// durable/in-memory state.
-func verifyGeneratedParentState(snapshot, fresh model.Job, runJobCount, childCount int) error {
+// verifyGeneratedFragmentGraph is the graph-only recheck applied at fragment
+// insertion time in BOTH storage modes, AFTER the storage layer has verified
+// the complete parent lease predicate at its own storage clock
+// (storage.ValidateGeneratedParentLease): the locked parent must be the same
+// job the handler admitted against and the run must stay within the
+// max-jobs-per-run cap. Lease liveness, runner, generation and token are the
+// storage layer's authority — never the request handler's clock, which a
+// skewed replica could otherwise use to accept children of an expired lease.
+func verifyGeneratedFragmentGraph(snapshot, fresh model.Job, runJobCount, childCount int) error {
 	if fresh.ID != snapshot.ID {
 		return fmt.Errorf("parent job changed during generation")
-	}
-	if fresh.Status != model.StatusRunning || fresh.LeaseExpiresAt == nil || !fresh.LeaseExpiresAt.After(time.Now().UTC()) {
-		return fmt.Errorf("parent lease expired during generation")
-	}
-	if fresh.LeaseRunnerID != snapshot.LeaseRunnerID || fresh.LeaseGeneration != snapshot.LeaseGeneration {
-		return fmt.Errorf("parent lease changed during generation")
-	}
-	if len(fresh.LeaseTokenHash) == 0 || !subtleCompare(fresh.LeaseTokenHash, snapshot.LeaseTokenHash) {
-		return fmt.Errorf("parent lease token changed during generation")
 	}
 	if runJobCount+childCount > maxJobsPerRun {
 		return fmt.Errorf("run would grow to %d jobs, limit is %d", runJobCount+childCount, maxJobsPerRun)
@@ -381,19 +361,23 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 		for id, j := range created {
 			deps[id] = append([]string(nil), j.Needs...)
 		}
-		// Transactional recheck: the store locks the parent FOR UPDATE, counts
+		// Transactional recheck: the store locks the parent FOR UPDATE, samples
+		// its OWN clock after the lock, verifies the complete lease predicate
+		// {running, runner, generation, token, expiry} at that clock, counts
 		// the run's jobs and records the idempotency receipt in the SAME
-		// transaction; the closure re-validates {job, runner, generation,
-		// token, expiry} and the max-jobs-per-run bound against that fresh
-		// state. A concurrently committed duplicate returns the winner's
-		// receipt instead of inserting a second fragment.
-		verify := func(fresh model.Job, runJobCount int) error {
-			return verifyGeneratedParentState(parent, fresh, runJobCount, len(created))
+		// transaction; the closure only re-validates graph invariants (parent
+		// identity, max-jobs-per-run) against that locked state. A concurrently
+		// committed duplicate returns the winner's receipt instead of inserting
+		// a second fragment.
+		verify := func(fresh model.Job, runJobCount int, _ time.Time) error {
+			return verifyGeneratedFragmentGraph(parent, fresh, runJobCount, len(created))
 		}
 		rec, replayed, err := ds.InsertGeneratedFragmentTx(ctx, storage.GeneratedFragmentRequest{
 			ParentJobID:     parent.ID,
-			Depth:           childDepth,
+			RunnerID:        parent.LeaseRunnerID,
 			LeaseGeneration: parent.LeaseGeneration,
+			LeaseTokenHash:  parent.LeaseTokenHash,
+			Depth:           childDepth,
 			FragmentID:      fragmentID,
 			Jobs:            created,
 			Deps:            deps,
@@ -409,10 +393,11 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 		return &generatedResponse{ParentJobID: parent.ID, RunID: parent.RunID, Depth: childDepth, JobIDs: ids, Keys: keys}, nil
 	}
 
-	// Memory mode: the IDENTICAL lease/state predicate runs inside the same
-	// critical section as the job-count check and the insertion, so a
-	// concurrent fragment can neither race the cap nor slip past a lease
-	// that changed while this request was being admitted.
+	// Memory mode: the IDENTICAL storage-owned lease predicate and the
+	// graph checks run inside the same critical section as the job-count
+	// check and the insertion, with the clock sampled in that critical
+	// section, so a concurrent fragment can neither race the cap nor slip
+	// past a lease that changed while this request was being admitted.
 	s.mu.Lock()
 	current, still := s.jobs[parent.ID]
 	if !still {
@@ -425,7 +410,17 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 			runJobCount++
 		}
 	}
-	if verr := verifyGeneratedParentState(parent, current, runJobCount, len(created)); verr != nil {
+	commitNow := time.Now().UTC()
+	if lerr := storage.ValidateGeneratedParentLease(current, storage.GeneratedFragmentRequest{
+		ParentJobID:     parent.ID,
+		RunnerID:        parent.LeaseRunnerID,
+		LeaseGeneration: parent.LeaseGeneration,
+		LeaseTokenHash:  parent.LeaseTokenHash,
+	}, commitNow); lerr != nil {
+		s.mu.Unlock()
+		return nil, lerr
+	}
+	if verr := verifyGeneratedFragmentGraph(parent, current, runJobCount, len(created)); verr != nil {
 		s.mu.Unlock()
 		return nil, verr
 	}
@@ -459,7 +454,7 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 		LeaseGeneration: parent.LeaseGeneration,
 		FragmentID:      fragmentID,
 		Children:        children,
-		CreatedAt:       time.Now().UTC(),
+		CreatedAt:       commitNow,
 	}
 	s.mu.Unlock()
 	return &generatedResponse{ParentJobID: parent.ID, RunID: parent.RunID, Depth: childDepth, JobIDs: ids, Keys: keys}, nil
