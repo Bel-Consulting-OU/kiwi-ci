@@ -246,6 +246,14 @@ Operational requirements for the Woodpecker instance:
 - `WOODPECKER_FORCE_IGNORE_SERVICE_FAILURE=false` on the server, so the
   PostgreSQL service being down fails `integration-coverage` instead of
   being ignored (see [docs/production-deployment.md](docs/production-deployment.md)).
+- The `integration-coverage` PostgreSQL step exports
+  `PGOPTIONS="-c jit=off"`: PostgreSQL's LLVM JIT can crash a backend
+  mid-query under the concurrent clone/`DROP DATABASE ... WITH (FORCE)`
+  workload on some hosts and kernels, which drops the service into recovery
+  mode and cascades every later integration test into failure. JIT is an
+  execution optimization, not semantics, so the lane pins it off rather than
+  depending on JIT being safe on every agent host. `PGOPTIONS` is honored by
+  pgx and applies to derived clone DSNs as well.
 - `docker-workspace` mounts the agent host's Docker socket into its steps
   (`volumes: - /var/run/docker.sock:/var/run/docker.sock`), so the repository
   must be marked **trusted** in Woodpecker; `capability=docker` only selects
