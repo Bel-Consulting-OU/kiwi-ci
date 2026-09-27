@@ -196,6 +196,13 @@ exit 0
 	case <-time.After(30 * time.Second):
 		t.Fatal("GC report was not printed")
 	}
+	// Run must have polled at least once BEFORE cancellation: the assertion
+	// below checks the server observed the poll, and under GOMAXPROCS=1 the
+	// first request may still be in flight when cancel lands (an aborted
+	// in-flight request never reaches the handler).
+	waitUntil(t, 10*time.Second, "the runner's first next poll", func() bool {
+		return nextCalls.Load() > 0
+	})
 	cancel()
 	select {
 	case err := <-runDone:
