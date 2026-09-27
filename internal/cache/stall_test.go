@@ -141,11 +141,11 @@ func TestStoreStallGuardBoundsStalledUploadWithCallerClient(t *testing.T) {
 }
 
 // TestStoreStallGuardAllowsSlowContinuousDownload proves the watchdog is
-// sliding, not a total transfer cap: 32 chunks arrive slower than the shrunken
-// stall timeout in total but faster than it per chunk, so the download
-// completes intact.
+// sliding, not a total transfer cap: 40 chunks arrive slower than the shrunken
+// stall timeout in total but far faster than it per chunk (20ms vs 500ms), so
+// the download completes intact.
 func TestStoreStallGuardAllowsSlowContinuousDownload(t *testing.T) {
-	shrinkStoreStallTimeout(t, 150*time.Millisecond)
+	shrinkStoreStallTimeout(t, 500*time.Millisecond)
 
 	payload := bytes.Repeat([]byte("d"), 32<<10)
 	sum := sha256.Sum256(payload)
@@ -175,7 +175,7 @@ func TestStoreStallGuardAllowsSlowContinuousDownload(t *testing.T) {
 	if err := s.fetchRemote("deadbeef"); err != nil {
 		t.Fatalf("slow continuous download failed: %v", err)
 	}
-	if elapsed := time.Since(begin); elapsed < 150*time.Millisecond {
+	if elapsed := time.Since(begin); elapsed < 500*time.Millisecond {
 		t.Fatalf("download finished in %v, below the shrunken stall timeout; the test premise was not met", elapsed)
 	}
 	if got := readFile(t, s.archivePath("deadbeef")); !bytes.Equal(got, payload) {
@@ -183,27 +183,49 @@ func TestStoreStallGuardAllowsSlowContinuousDownload(t *testing.T) {
 	}
 }
 
-// TestStoreStallGuardReaderAllowsSlowContinuousUpload proves the request-body
-// wrapper re-arms the watchdog on every successful read: a body that drips
-// bytes over a total longer than the stall window is never cut. (At HTTP
-// level the transport may buffer a whole upload into the socket and then wait
-// on the response, which is conservatively a stall; per-read progress is the
-// contract the wrapper enforces.)
-func TestStoreStallGuardReaderAllowsSlowContinuousUpload(t *testing.T) {
-	ctx, guard := newStoreStallGuard(context.Background(), 250*time.Millisecond)
+// TestStoreStallGuardCheckFiresOnStaleProgress pins the firing edge
+// deterministically, without relying on a real timer: a check whose recorded
+// progress is stale latches the stall and cancels the transfer. The real timer
+// is effectively disarmed (one hour) so the test cannot race it.
+func TestStoreStallGuardCheckFiresOnStaleProgress(t *testing.T) {
+	ctx, guard := newStoreStallGuard(context.Background(), time.Hour)
 	defer guard.release()
 
-	body := &stallGuardReader{r: &dripReader{remaining: 24, chunk: 4, every: 50 * time.Millisecond}, guard: guard}
+	guard.mu.Lock()
+	guard.last = time.Now().Add(-2 * time.Hour)
+	guard.mu.Unlock()
+	guard.check()
+	if err := ctx.Err(); err == nil {
+		t.Fatal("stale progress did not trip the watchdog")
+	}
+	if !guard.stalled() {
+		t.Fatal("fired watchdog did not latch a stall")
+	}
+}
+
+// TestStoreStallGuardReaderAllowsSlowContinuousUpload proves the request-body
+// wrapper re-arms the watchdog on every successful read: a body that drips
+// bytes over a total longer than the stall window is never cut. Each gap is
+// far inside the window (25ms vs 500ms) so load-induced scheduling delays
+// cannot turn continuous progress into a stall. (At HTTP level the transport
+// may buffer a whole upload into the socket and then wait on the response,
+// which is conservatively a stall; per-read progress is the contract the
+// wrapper enforces.)
+func TestStoreStallGuardReaderAllowsSlowContinuousUpload(t *testing.T) {
+	ctx, guard := newStoreStallGuard(context.Background(), 500*time.Millisecond)
+	defer guard.release()
+
+	body := &stallGuardReader{r: &dripReader{remaining: 96, chunk: 4, every: 25 * time.Millisecond}, guard: guard}
 	begin := time.Now()
 	n, err := io.Copy(io.Discard, body)
 	if err != nil {
 		t.Fatalf("continuous upload body failed: %v", err)
 	}
-	if elapsed := time.Since(begin); elapsed < 250*time.Millisecond {
+	if elapsed := time.Since(begin); elapsed < 500*time.Millisecond {
 		t.Fatalf("body finished in %v, below the stall window; the test premise was not met", elapsed)
 	}
-	if n != 24 {
-		t.Fatalf("read %d body bytes, want 24", n)
+	if n != 96 {
+		t.Fatalf("read %d body bytes, want 96", n)
 	}
 	if err := ctx.Err(); err != nil {
 		t.Fatalf("continuous body progress was cut by the watchdog: %v", err)
@@ -332,13 +354,19 @@ func TestStoreStallGuardStopDisarmsTimer(t *testing.T) {
 }
 
 // TestStoreStallGuardProgressRearms proves uninterrupted progress keeps a
-// transfer alive beyond the stall window.
+// transfer alive beyond the stall window, deterministically: every recorded
+// progress pushes the deadline out, so a check that fires inside the idle
+// window (simulated directly here) re-arms instead of latching a stall. The
+// real timer is effectively disarmed (one hour) so the test cannot race it.
 func TestStoreStallGuardProgressRearms(t *testing.T) {
-	ctx, guard := newStoreStallGuard(context.Background(), 250*time.Millisecond)
+	ctx, guard := newStoreStallGuard(context.Background(), time.Hour)
 	defer guard.release()
 	for i := 0; i < 6; i++ {
-		time.Sleep(50 * time.Millisecond)
 		guard.progress()
+		guard.mu.Lock()
+		guard.last = time.Now().Add(-time.Minute)
+		guard.mu.Unlock()
+		guard.check()
 	}
 	if err := ctx.Err(); err != nil {
 		t.Fatalf("continuous progress let the watchdog fire: %v", err)
