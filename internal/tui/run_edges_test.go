@@ -118,15 +118,24 @@ func TestRunFollowNonTerminalDegrades(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/logs/stream") {
 			w.(http.Flusher).Flush()
-			<-release
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
 			_, _ = w.Write([]byte("event: done\n\n"))
 			w.(http.Flusher).Flush()
 			return
 		}
 		_, _ = w.Write([]byte(`[{"seq":1,"job_key":"build","step":"s","line":"only"}]`))
 	}))
+	// LIFO: close(release) must run BEFORE ts.Close(), because Close blocks
+	// until every handler returns and the stream handler is parked on release.
+	// A t.Cleanup would run after the deferred Close and deadlock the test
+	// (the handler also watches the request context so a client-side
+	// cancellation can never leave it parked either).
 	defer ts.Close()
-	t.Cleanup(func() { close(release) })
+	defer close(release)
 
 	var buf bytes.Buffer
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
