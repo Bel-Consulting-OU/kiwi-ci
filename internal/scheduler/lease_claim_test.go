@@ -125,15 +125,15 @@ func TestLeaseResolvesLiveProfileRepoACL(t *testing.T) {
 	_ = st.InsertJob(context.Background(), leaseTestJob("job1", "run1"))
 	// The registration snapshot carries an empty ACL (no restriction); the
 	// linked profile restricts the runner to a different repository.
-	_ = st.UpsertRunner(context.Background(), model.Runner{ID: "r1", Name: "r1", Capacity: 2, CertSerial: "cert-1"})
-	_ = st.UpsertProfile(context.Background(), model.RunnerProfile{ID: "p1", MaxCapacity: 2, Repositories: []string{"github.com/o/other"}})
+	_ = st.UpsertRunner(context.Background(), model.Runner{ID: "r1", Name: "r1", Capacity: 2, CertSerial: "cert-1", ReportedCapabilities: []string{"native"}})
+	_ = st.UpsertProfile(context.Background(), model.RunnerProfile{ID: "p1", Capabilities: []string{"native"}, MaxCapacity: 2, Repositories: []string{"github.com/o/other"}})
 	_ = st.BindCertProfile(context.Background(), "cert-1", "p1")
 	s := NewDB(st, time.Minute, nil, nil)
 	if _, _, _, err := s.Lease(context.Background(), "r1", time.Now().UTC()); !errors.Is(err, ErrNoJobs) {
 		t.Fatalf("lease against live profile ACL = %v, want ErrNoJobs", err)
 	}
 	// Widen the live profile: the same job now leases.
-	_ = st.UpsertProfile(context.Background(), model.RunnerProfile{ID: "p1", MaxCapacity: 2, Repositories: []string{"github.com/o/r"}})
+	_ = st.UpsertProfile(context.Background(), model.RunnerProfile{ID: "p1", Capabilities: []string{"native"}, MaxCapacity: 2, Repositories: []string{"github.com/o/r"}})
 	if _, _, _, err := s.Lease(context.Background(), "r1", time.Now().UTC()); err != nil {
 		t.Fatalf("lease after profile widen: %v", err)
 	}
@@ -248,14 +248,14 @@ func TestLeaseLiveProfileCapacityShrinkTakesNoWork(t *testing.T) {
 	st.setLeader(true, nil)
 	_ = st.InsertRun(context.Background(), model.Run{ID: "run1", Status: model.StatusQueued, CreatedAt: time.Now().UTC()})
 	_ = st.InsertJob(context.Background(), leaseTestJob("job1", "run1"))
-	_ = st.UpsertRunner(context.Background(), model.Runner{ID: "r1", Name: "r1", Capacity: 2, CertSerial: "cert-1"})
-	_ = st.UpsertProfile(context.Background(), model.RunnerProfile{ID: "p1", MaxCapacity: 1})
+	_ = st.UpsertRunner(context.Background(), model.Runner{ID: "r1", Name: "r1", Capacity: 2, CertSerial: "cert-1", ReportedCapabilities: []string{"native"}})
+	_ = st.UpsertProfile(context.Background(), model.RunnerProfile{ID: "p1", Capabilities: []string{"native"}, MaxCapacity: 1})
 	_ = st.BindCertProfile(context.Background(), "cert-1", "p1")
 	s := NewDB(st, time.Minute, nil, nil)
 	if _, _, _, err := s.Lease(context.Background(), "r1", time.Now().UTC()); err != nil {
 		t.Fatalf("initial profile lease: %v", err)
 	}
-	_ = st.UpsertProfile(context.Background(), model.RunnerProfile{ID: "p1", MaxCapacity: 0})
+	_ = st.UpsertProfile(context.Background(), model.RunnerProfile{ID: "p1", Capabilities: []string{"native"}, MaxCapacity: 0})
 	_ = st.InsertJob(context.Background(), leaseTestJob("job2", "run1"))
 	if _, _, _, err := s.Lease(context.Background(), "r1", time.Now().UTC()); !errors.Is(err, ErrNoJobs) {
 		t.Fatalf("zero-capacity profile lease = %v, want ErrNoJobs", err)

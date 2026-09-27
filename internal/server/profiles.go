@@ -209,26 +209,6 @@ func (s *Server) profileForSerial(ctx context.Context, serial string) (model.Run
 	return p, ok, nil
 }
 
-// intersectCapabilities returns the elements of profile caps that are also
-// in reported, preserving profile order. The profile is the ceiling; the
-// runner's hardware-discovered capabilities can only narrow it.
-func intersectCapabilities(profile, reported []string) []string {
-	if len(profile) == 0 || len(reported) == 0 {
-		return nil
-	}
-	have := map[string]bool{}
-	for _, c := range reported {
-		have[c] = true
-	}
-	out := make([]string, 0, len(profile))
-	for _, c := range profile {
-		if have[c] {
-			out = append(out, c)
-		}
-	}
-	return out
-}
-
 // runnerProfiles handler: POST /api/v1/runner-profiles (admin or
 // policy_manage) creates a profile; the ID may be chosen by the caller or
 // left empty to mint a canonical control-plane ID.

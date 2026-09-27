@@ -48,9 +48,9 @@ func TestQueueReasonResourceAdmissionDBMode(t *testing.T) {
 	}
 	serial := "resource-serial"
 	f.mu.Lock()
-	f.profiles["resource-prof"] = model.RunnerProfile{ID: "resource-prof", MaxCapacity: 8, MaxMemory: 4 << 30}
+	f.profiles["resource-prof"] = model.RunnerProfile{ID: "resource-prof", Capabilities: []string{"native"}, MaxCapacity: 8, MaxMemory: 4 << 30}
 	f.certProfiles[serial] = "resource-prof"
-	f.runners["runner-res"] = model.Runner{ID: "runner-res", Name: "runner-res", Capacity: 8, CertSerial: serial}
+	f.runners["runner-res"] = model.Runner{ID: "runner-res", Name: "runner-res", Capacity: 8, CertSerial: serial, ReportedCapabilities: []string{"native"}}
 	f.runs["run-res"] = model.Run{ID: "run-res", Status: model.StatusQueued}
 	f.jobs["job-over"] = model.Job{ID: "job-over", RunID: "run-res", Key: "over", Status: model.StatusQueued, MemoryRequest: 8 << 30, CreatedAt: time.Now().UTC()}
 	f.jobs["job-wait"] = model.Job{ID: "job-wait", RunID: "run-res", Key: "wait", Status: model.StatusQueued, MemoryRequest: 4 << 30, CreatedAt: time.Now().UTC().Add(time.Second)}

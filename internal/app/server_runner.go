@@ -355,9 +355,12 @@ type dbStoreRequirement struct {
 // contract. LeaseOIDCIssueStore is added when OIDC issuance is enabled (an
 // external URL is configured, so the issuance endpoint can serve): without it
 // DB mode could not re-check the lease and append the issuance audit
-// atomically, and a credential could be minted after the lease ceased. A nil
-// store (memory/fs mode) requires nothing.
-func requiredDBStoreCapabilities(db storage.Store, runnerTokensConfigured, oidcIssuanceEnabled bool) []dbStoreRequirement {
+// atomically, and a credential could be minted after the lease ceased.
+// SecretIssuanceStore is added when a secret broker is configured: without it
+// DB mode could not re-check the lease, claim the once-only delivery and
+// append the delivery audit atomically, and a secret could be delivered after
+// the lease ceased. A nil store (memory/fs mode) requires nothing.
+func requiredDBStoreCapabilities(db storage.Store, runnerTokensConfigured, oidcIssuanceEnabled, secretIssuanceEnabled bool) []dbStoreRequirement {
 	if db == nil {
 		return nil
 	}
@@ -373,6 +376,10 @@ func requiredDBStoreCapabilities(db storage.Store, runnerTokensConfigured, oidcI
 		_, oidcIssue := db.(storage.LeaseOIDCIssueStore)
 		reqs = append(reqs, dbStoreRequirement{Name: "LeaseOIDCIssueStore", Held: oidcIssue})
 	}
+	if secretIssuanceEnabled {
+		_, secretIssue := db.(storage.SecretIssuanceStore)
+		reqs = append(reqs, dbStoreRequirement{Name: "SecretIssuanceStore", Held: secretIssue})
+	}
 	if runnerTokensConfigured {
 		_, runnerTokens := db.(storage.RunnerTokenStore)
 		reqs = append(reqs, dbStoreRequirement{Name: "RunnerTokenStore", Held: runnerTokens})
@@ -384,12 +391,12 @@ func requiredDBStoreCapabilities(db storage.Store, runnerTokensConfigured, oidcI
 // a mandatory capability for the features enabled. The failure is a hard
 // startup error, not a per-request degradation: a store that cannot fence
 // digest publication, serialize the collector, commit lease-bound metadata
-// transactionally, or commit OIDC issuances under the locked lease would
-// silently weaken those invariants across replicas. Memory/fs mode (nil db)
-// requires nothing.
-func validateDBStoreCapabilities(db storage.Store, runnerTokensConfigured, oidcIssuanceEnabled bool) error {
+// transactionally, or commit OIDC/secret issuances under the locked lease
+// would silently weaken those invariants across replicas. Memory/fs mode
+// (nil db) requires nothing.
+func validateDBStoreCapabilities(db storage.Store, runnerTokensConfigured, oidcIssuanceEnabled, secretIssuanceEnabled bool) error {
 	var missing []string
-	for _, req := range requiredDBStoreCapabilities(db, runnerTokensConfigured, oidcIssuanceEnabled) {
+	for _, req := range requiredDBStoreCapabilities(db, runnerTokensConfigured, oidcIssuanceEnabled, secretIssuanceEnabled) {
 		if !req.Held {
 			missing = append(missing, req.Name)
 		}
@@ -401,10 +408,21 @@ func validateDBStoreCapabilities(db storage.Store, runnerTokensConfigured, oidcI
 	if oidcIssuanceEnabled {
 		enforced += ", LeaseOIDCIssueStore"
 	}
+	if secretIssuanceEnabled {
+		enforced += ", SecretIssuanceStore"
+	}
 	if runnerTokensConfigured {
 		enforced += ", RunnerTokenStore"
 	}
 	return fmt.Errorf("database store lacks mandatory capabilities (%s): DB mode requires %s; refusing to start", strings.Join(missing, ", "), enforced)
+}
+
+// secretBrokerConfigured reports whether the merged configuration enables the
+// secret broker. It mirrors buildSecretBroker's non-nil decision (a named
+// provider or at least one static entry) so the startup capability check
+// enforces SecretIssuanceStore exactly when the secrets endpoint can serve.
+func secretBrokerConfigured(cfg config.SecretBrokerConfig) bool {
+	return strings.TrimSpace(cfg.Broker) != "" || len(parseStaticPairs(cfg.Static)) > 0
 }
 
 // validateProductionRunnerCredentials is the post-DB half of the production
@@ -703,7 +721,7 @@ func Server(ctx context.Context, args []string) error {
 		// weaker, non-distributed behavior). The real PostgreSQL store
 		// provides all of them; this guards custom/partial stores and
 		// regressions that drop a capability.
-		if cerr := validateDBStoreCapabilities(db, len(runnerTokens) > 0, strings.TrimSpace(externalURLV) != ""); cerr != nil {
+		if cerr := validateDBStoreCapabilities(db, len(runnerTokens) > 0, strings.TrimSpace(externalURLV) != "", secretBrokerConfigured(cfg.SecretBroker)); cerr != nil {
 			return cerr
 		}
 		if clusterStore != nil {

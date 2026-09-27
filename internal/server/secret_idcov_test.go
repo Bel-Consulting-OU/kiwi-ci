@@ -14,28 +14,8 @@ import (
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secretbroker"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
-
-// idcovFailBroker always fails resolution.
-type idcovFailBroker struct{ err error }
-
-func (b idcovFailBroker) Resolve(context.Context, string, secretbroker.SecretScope) (string, error) {
-	return "", b.err
-}
-
-// idcovBreakingBroker breaks the receipt file before failing, so the
-// compensating release cannot persist.
-type idcovBreakingBroker struct {
-	path string
-}
-
-func (b idcovBreakingBroker) Resolve(context.Context, string, secretbroker.SecretScope) (string, error) {
-	_ = os.Remove(b.path)
-	if err := os.Mkdir(b.path, 0o700); err != nil {
-		return "", err
-	}
-	return "", errors.New("broker down")
-}
 
 // idcovDelegateBroker forwards Resolve to a wrapped broker so the OneTime
 // dedupe record is reachable through the server's single-level unwrap.
@@ -62,15 +42,6 @@ func idcovSeedDBJob(t *testing.T, s *Server, f *dbFakeStore, jobID, runID string
 	}
 	f.mu.Unlock()
 	return jobID, "runner-db", token, 3
-}
-
-// idcovReleaseErrStore wraps the fake store with a failing claim release.
-type idcovReleaseErrStore struct {
-	*dbFakeStore
-}
-
-func (idcovReleaseErrStore) ReleaseSecretDelivery(context.Context, string, int64, string) error {
-	return errors.New("release failed")
 }
 
 // TestIDCovLoadSecretReceiptsPaths covers the receipt file loader.
@@ -169,79 +140,147 @@ func TestIDCovResolveBrokerAlreadyDelivered(t *testing.T) {
 	}
 }
 
-// TestIDCovDeliverSecretPostClaimFailures covers the compensation branches:
-// an already-delivered broker reply, a broken receipt release, a DB release
-// failure and an unusable ephemeral key.
-func TestIDCovDeliverSecretPostClaimFailure(t *testing.T) {
-	job := model.Job{ID: "job-1", RunID: "run-1", RepoURL: "repo", Environment: "env", Trusted: true, LeaseGeneration: 1}
+// TestIDCovDeliverSecretCommitOrdering covers the pre-commit failure branches
+// and the commit-time compensation: an already-delivered broker reply, a
+// receipt persistence failure (fail closed), an audit failure (the receipt is
+// released), a sealing failure (nothing consumed) and an unknown job.
+func TestIDCovDeliverSecretCommitOrdering(t *testing.T) {
+	seed := func(t *testing.T, s *Server) (model.Job, SecretRequest, []byte) {
+		t.Helper()
+		jobID, runnerID, token, gen := seedJob(t, s, true, []string{"tok"})
+		s.mu.Lock()
+		job := s.jobs[jobID]
+		s.mu.Unlock()
+		_, pubB64 := ephemeralKey(t)
+		pubRaw, err := base64.StdEncoding.DecodeString(pubB64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return job, SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pubB64}, pubRaw
+	}
 
 	t.Run("broker already delivered", func(t *testing.T) {
 		s := New("t")
 		// The server unwraps a direct OneTime wrapper, so the delivered
 		// marker is only observable through a delegating broker.
 		s.SecretBroker = idcovDelegateBroker{inner: &secretbroker.OneTime{Inner: secretbroker.StaticBroker{"tok": "v"}}}
-		first := SecretRequest{RunnerID: "r1", LeaseGeneration: 1, Name: "tok", EphemeralPublic: ephemeralPubForTest(t)}
+		job, req, pubRaw := seed(t, s)
 		w1 := httptest.NewRecorder()
-		s.deliverSecret(w1, httptest.NewRequest(http.MethodPost, "/", nil), job, first, "job-1", false)
+		s.deliverSecret(w1, httptest.NewRequest(http.MethodPost, "/", nil), job, req, pubRaw)
 		if w1.Code != http.StatusOK {
 			t.Fatalf("first delivery = %d: %s", w1.Code, w1.Body.String())
 		}
-		// A second job with the same scope and secret name hits the OneTime
-		// record: 409 and the fresh receipt is released.
-		second := SecretRequest{RunnerID: "r2", LeaseGeneration: 1, Name: "tok", EphemeralPublic: ephemeralPubForTest(t)}
+		// The broker's one-time record refuses the second retrieval before
+		// any commit: 409, still exactly one receipt.
+		_, pub2 := ephemeralKey(t)
+		pub2Raw, err := base64.StdEncoding.DecodeString(pub2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.EphemeralPublic = pub2
 		w2 := httptest.NewRecorder()
-		s.deliverSecret(w2, httptest.NewRequest(http.MethodPost, "/", nil), job, second, "job-2", false)
+		s.deliverSecret(w2, httptest.NewRequest(http.MethodPost, "/", nil), job, req, pub2Raw)
 		if w2.Code != http.StatusConflict {
 			t.Fatalf("already-delivered delivery = %d, want 409: %s", w2.Code, w2.Body.String())
 		}
+		if n := memSecretReceipts(s, job.ID); n != 1 {
+			t.Fatalf("receipts = %d, want 1", n)
+		}
 	})
 
-	t.Run("memory release persist failure", func(t *testing.T) {
+	t.Run("receipt persistence failure fails closed", func(t *testing.T) {
 		dir := t.TempDir()
-		path := filepath.Join(dir, secretReceiptsFile)
 		s := New("t")
 		s.dataDir = dir
-		s.SecretBroker = idcovBreakingBroker{path: path}
+		if err := os.Mkdir(filepath.Join(dir, secretReceiptsFile), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		s.SecretBroker = secretbroker.StaticBroker{"tok": "v"}
+		job, req, pubRaw := seed(t, s)
 		w := httptest.NewRecorder()
-		req := SecretRequest{RunnerID: "r1", LeaseGeneration: 1, Name: "tok", EphemeralPublic: ephemeralPubForTest(t)}
-		s.deliverSecret(w, httptest.NewRequest(http.MethodPost, "/", nil), job, req, "job-1", false)
-		if w.Code != http.StatusInternalServerError {
-			t.Fatalf("broken release = %d, want 500", w.Code)
+		s.deliverSecret(w, httptest.NewRequest(http.MethodPost, "/", nil), job, req, pubRaw)
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("broken receipt dir = %d, want 503: %s", w.Code, w.Body.String())
+		}
+		if strings.Contains(w.Body.String(), "ciphertext") {
+			t.Fatalf("envelope returned despite receipt failure: %s", w.Body.String())
 		}
 	})
 
-	t.Run("db release failure", func(t *testing.T) {
-		s := New("t")
-		s.DB = idcovReleaseErrStore{dbFakeStore: newDBFakeStore()}
-		s.SecretBroker = idcovFailBroker{err: errors.New("broker down")}
-		w := httptest.NewRecorder()
-		req := SecretRequest{RunnerID: "r1", LeaseGeneration: 1, Name: "tok", EphemeralPublic: ephemeralPubForTest(t)}
-		s.deliverSecret(w, httptest.NewRequest(http.MethodPost, "/", nil), job, req, "job-1", true)
-		if w.Code != http.StatusInternalServerError {
-			t.Fatalf("db release failure = %d, want 500", w.Code)
+	t.Run("audit failure releases the receipt", func(t *testing.T) {
+		blocker := filepath.Join(t.TempDir(), "blocker")
+		if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
 		}
-	})
-
-	t.Run("seal failure releases the claim", func(t *testing.T) {
 		s := New("t")
 		s.SecretBroker = secretbroker.StaticBroker{"tok": "v"}
-		zeros := make([]byte, 32)
-		req := SecretRequest{RunnerID: "r1", LeaseGeneration: 1, Name: "tok", EphemeralPublic: base64.StdEncoding.EncodeToString(zeros)}
+		job, req, pubRaw := seed(t, s)
+		s.store = &storage.Repository{Root: blocker}
 		w := httptest.NewRecorder()
-		s.deliverSecret(w, httptest.NewRequest(http.MethodPost, "/", nil), job, req, "job-1", false)
+		s.deliverSecret(w, httptest.NewRequest(http.MethodPost, "/", nil), job, req, pubRaw)
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("audit failure = %d, want 500: %s", w.Code, w.Body.String())
+		}
+		if n := memSecretReceipts(s, job.ID); n != 0 {
+			t.Fatalf("audit failure left %d receipts behind", n)
+		}
+		// A healthy audit sink lets the same delivery commit.
+		s.store = nil
+		_, pub2 := ephemeralKey(t)
+		pub2Raw, err := base64.StdEncoding.DecodeString(pub2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.EphemeralPublic = pub2
+		w2 := httptest.NewRecorder()
+		s.deliverSecret(w2, httptest.NewRequest(http.MethodPost, "/", nil), job, req, pub2Raw)
+		if w2.Code != http.StatusOK {
+			t.Fatalf("retry after audit recovery = %d: %s", w2.Code, w2.Body.String())
+		}
+	})
+
+	t.Run("seal failure does not consume the delivery", func(t *testing.T) {
+		s := New("t")
+		s.SecretBroker = secretbroker.StaticBroker{"tok": "v"}
+		job, req, _ := seed(t, s)
+		zeros := make([]byte, 32)
+		req.EphemeralPublic = base64.StdEncoding.EncodeToString(zeros)
+		w := httptest.NewRecorder()
+		s.deliverSecret(w, httptest.NewRequest(http.MethodPost, "/", nil), job, req, zeros)
 		if w.Code != http.StatusInternalServerError {
 			t.Fatalf("low-order key = %d, want 500: %s", w.Code, w.Body.String())
 		}
 		if !strings.Contains(w.Body.String(), "sealing secret failed") {
 			t.Fatalf("wrong failure body: %s", w.Body.String())
 		}
-		// The claim was released: retrying with a valid key succeeds.
+		// The claim was never taken: retrying with a valid key succeeds.
 		_, pubB64 := ephemeralKey(t)
-		retry := SecretRequest{RunnerID: "r1", LeaseGeneration: 1, Name: "tok", EphemeralPublic: pubB64}
+		pubRaw, err := base64.StdEncoding.DecodeString(pubB64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.EphemeralPublic = pubB64
 		w2 := httptest.NewRecorder()
-		s.deliverSecret(w2, httptest.NewRequest(http.MethodPost, "/", nil), job, retry, "job-1", false)
+		s.deliverSecret(w2, httptest.NewRequest(http.MethodPost, "/", nil), job, req, pubRaw)
 		if w2.Code != http.StatusOK {
 			t.Fatalf("retry after seal failure = %d: %s", w2.Code, w2.Body.String())
+		}
+	})
+
+	t.Run("unknown job refused", func(t *testing.T) {
+		s := New("t")
+		s.SecretBroker = secretbroker.StaticBroker{"tok": "v"}
+		job := model.Job{ID: "job-missing", RunID: "run-1", RepoURL: "repo", Trusted: true, LeaseGeneration: 1, LeaseTokenHash: []byte("hash")}
+		_, pubB64 := ephemeralKey(t)
+		pubRaw, err := base64.StdEncoding.DecodeString(pubB64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := SecretRequest{RunnerID: "r1", LeaseGeneration: 1, Name: "tok", EphemeralPublic: pubB64}
+		w := httptest.NewRecorder()
+		s.deliverSecret(w, httptest.NewRequest(http.MethodPost, "/", nil), job, req, pubRaw)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("unknown job = %d, want 404: %s", w.Code, w.Body.String())
 		}
 	})
 }

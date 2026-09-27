@@ -98,7 +98,7 @@ func TestIntegrationResourceReconcilePromotionServerPostgres(t *testing.T) {
 		t.Fatalf("bind profile = %d %s", w.Code, w.Body.String())
 	}
 	w := pgITDo(t, s, http.MethodPost, "/api/v1/runners/register", "token",
-		`{"name":"res-promo-runner","cert_serial":"`+serial+`","protocol_min":3,"protocol_max":3,"capacity":8}`, nil)
+		`{"name":"res-promo-runner","cert_serial":"`+serial+`","protocol_min":3,"protocol_max":3,"capacity":8,"capabilities":["native","container"]}`, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register = %d %s", w.Code, w.Body.String())
 	}

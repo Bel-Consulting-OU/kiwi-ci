@@ -75,8 +75,10 @@ type LeasePredicate struct {
 //   - labels: every required label is declared;
 //   - repository ACL: the canonical repo ID (or bare full name) is in the
 //     runner's allowlist (empty = unrestricted);
-//   - runtime capability: the job's runtime is declared (empty declared
-//     list = vacuous);
+//   - runtime capability: the job's runtime (default "native") must be in
+//     the runner's effective capability set. When the set is ENFORCED an
+//     empty list denies every runtime; an unenforced (legacy) empty list is
+//     unrestricted (see RuntimeAllowed);
 //   - enforced policy runtime grant: when the job's effective policy is
 //     Enforced and grants no runtime at all, no runner can take it; when it
 //     grants a set, the job's runtime must be in it;
@@ -108,7 +110,7 @@ func (p LeasePredicate) Allows() bool {
 		return false
 	}
 	runtime := JobRuntime(j)
-	if !RuntimeAllowed(r.Capabilities, runtime) {
+	if !RuntimeAllowed(r.Capabilities, r.CapabilitiesEnforced, runtime) {
 		return false
 	}
 	if !PolicyRuntimeAllowed(p.PolicyEnforced, p.PolicyRuntimes, runtime) {
@@ -129,6 +131,18 @@ func (p LeasePredicate) Allows() bool {
 // registration attributes. The profile's resource capacities (migration
 // 0030) replace the snapshot's the same way; a zero profile dimension is
 // unconstrained.
+//
+// Capabilities are the ONE attribute that is not copied: the live profile is
+// a CEILING, and the effective set is RECOMPUTED as
+// IntersectCapabilities(profile.Capabilities, r.ReportedCapabilities) on
+// every resolution. Overwriting the effective set with the profile's (the
+// pre-fix behavior) would let a live profile edit claim runtimes the runner's
+// hardware registration proved it does not provide; recomputing from the
+// reported hardware claim keeps the intersection monotone in the profile.
+// CapabilitiesEnforced is set because a linked profile makes the resulting
+// set authoritative — a recomputed empty intersection denies every runtime.
+// A legacy row without ReportedCapabilities recomputes to the empty enforced
+// set (fail closed) until it re-registers.
 func ResolveRunnerProfile(r model.Runner, profile model.RunnerProfile, linked bool) model.Runner {
 	if !linked {
 		return r
@@ -136,7 +150,8 @@ func ResolveRunnerProfile(r model.Runner, profile model.RunnerProfile, linked bo
 	r.Labels = append([]string(nil), profile.Labels...)
 	r.Region = profile.Region
 	r.AllowedRepositories = append([]string(nil), profile.Repositories...)
-	r.Capabilities = append([]string(nil), profile.Capabilities...)
+	r.Capabilities = IntersectCapabilities(profile.Capabilities, r.ReportedCapabilities)
+	r.CapabilitiesEnforced = true
 	r.Capacity = profile.MaxCapacity
 	r.ResourceCapacity = model.ResourceCapacityFromProfile(profile)
 	r.CostPerHour = profile.CostPerHour
@@ -181,7 +196,7 @@ func ClaimAllowsRunner(r model.Runner, c LeaseClaim) bool {
 	if !RepoAllowed(r.AllowedRepositories, claimRepoIdentity(c)) {
 		return false
 	}
-	if !RuntimeAllowed(r.Capabilities, c.Runtime) {
+	if !RuntimeAllowed(r.Capabilities, r.CapabilitiesEnforced, c.Runtime) {
 		return false
 	}
 	if len(c.PlacementRegions) > 0 && !containsString(c.PlacementRegions, r.Region) {
@@ -324,11 +339,63 @@ func RepoIDForRun(r model.Run) string {
 	return RepoIDFor(r.RepoID, r.Repo, r.RepoFullName)
 }
 
-// RuntimeAllowed reports whether the runtime is declared by the capability
-// list. An empty declared list makes the check vacuous; an empty runtime
-// cannot be constrained.
-func RuntimeAllowed(capabilities []string, runtime string) bool {
-	if len(capabilities) == 0 || runtime == "" {
+// IntersectCapabilities returns the elements of ceiling that are also in
+// claimed, preserving ceiling order. It is the ONE capability intersection
+// used by registration, the live profile resolution and the tests: an empty
+// ceiling (a profile granting nothing) or an empty claim (an authoritative
+// hardware deny-all, or a legacy row with no reported claim) intersects to
+// nil, and duplicates in the claim collapse.
+func IntersectCapabilities(ceiling, claimed []string) []string {
+	if len(ceiling) == 0 || len(claimed) == 0 {
+		return nil
+	}
+	have := make(map[string]bool, len(claimed))
+	for _, c := range claimed {
+		have[c] = true
+	}
+	out := make([]string, 0, len(ceiling))
+	for _, c := range ceiling {
+		if have[c] {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// NormalizeCapabilities returns a capability claim in canonical persisted
+// form: surrounding whitespace trimmed, empty entries dropped, duplicates
+// removed, order preserved. A claim that reduces to nothing is nil, which is
+// the authoritative empty claim the enforced intersection then denies.
+func NormalizeCapabilities(caps []string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, c := range caps {
+		c = strings.TrimSpace(c)
+		if c == "" || seen[c] {
+			continue
+		}
+		seen[c] = true
+		out = append(out, c)
+	}
+	return out
+}
+
+// RuntimeAllowed reports whether the job's runtime is in the runner's
+// EFFECTIVE capability set. The runtime defaults to "native" when empty (the
+// runtime a legacy/payload-less job executes as). enforced distinguishes the
+// two meanings of an empty set:
+//
+//   - enforced (profile-derived, the registration/live-resolution default):
+//     the set is authoritative, so membership is required and an empty set
+//     denies every runtime — never "no restriction";
+//   - not enforced (a legacy self-reported/unprofiled runner): the historical
+//     semantics are deliberately retained — an empty list is unrestricted,
+//     and a non-empty list still has to contain the runtime.
+func RuntimeAllowed(capabilities []string, enforced bool, runtime string) bool {
+	if runtime == "" {
+		runtime = "native"
+	}
+	if !enforced && len(capabilities) == 0 {
 		return true
 	}
 	return containsString(capabilities, runtime)

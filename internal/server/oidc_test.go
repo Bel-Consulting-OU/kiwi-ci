@@ -34,14 +34,16 @@ func newOIDCTestServer(t *testing.T, persistent bool) *Server {
 }
 
 // seedOIDCJob installs a trusted, running job with an active lease so the
-// OIDC issuance endpoint authorizes it.
+// OIDC issuance endpoint authorizes it. The job carries the compiled run
+// coordinates (ref/sha/event/environment) exactly like an enqueued job, since
+// those are the locked identity the issued token must describe.
 func seedOIDCJob(t *testing.T, s *Server, leaseToken string) (runID, jobID string) {
 	t.Helper()
 	runID, jobID = "run-oidc", "job-oidc"
 	exp := time.Now().Add(time.Minute)
 	s.mu.Lock()
 	s.runs[runID] = model.Run{ID: runID, RepoFullName: "kiwi/repo", Ref: "main", SHA: "abc123", Event: "push", Status: model.StatusRunning}
-	s.jobs[jobID] = model.Job{ID: jobID, RunID: runID, Key: "build", RepoFullName: "kiwi/repo", Status: model.StatusRunning, Trusted: true, OIDCAllowed: true, LeaseExpiresAt: &exp, LeaseTokenHash: hashLeaseToken(s.leaseKey, leaseToken), LeaseRunnerID: "runner-1"}
+	s.jobs[jobID] = model.Job{ID: jobID, RunID: runID, Key: "build", RepoFullName: "kiwi/repo", Ref: "main", SHA: "abc123", Event: "push", Environment: "production", Status: model.StatusRunning, Trusted: true, OIDCAllowed: true, LeaseExpiresAt: &exp, LeaseTokenHash: hashLeaseToken(s.leaseKey, leaseToken), LeaseRunnerID: "runner-1"}
 	s.mu.Unlock()
 	return runID, jobID
 }
@@ -433,7 +435,7 @@ func seedDBOIDCJob(t *testing.T, f *dbFakeStore, s *Server, leaseToken string) (
 	exp := time.Now().Add(time.Minute)
 	f.mu.Lock()
 	f.runs[runID] = model.Run{ID: runID, RepoFullName: "kiwi/repo", Ref: "main", SHA: "abc123", Event: "push", Status: model.StatusRunning}
-	f.jobs[jobID] = model.Job{ID: jobID, RunID: runID, Key: "build", RepoFullName: "kiwi/repo", Status: model.StatusRunning, Trusted: true, OIDCAllowed: true, LeaseExpiresAt: &exp, LeaseTokenHash: hashLeaseToken(s.leaseKey, leaseToken), LeaseRunnerID: "runner-1"}
+	f.jobs[jobID] = model.Job{ID: jobID, RunID: runID, Key: "build", RepoFullName: "kiwi/repo", Ref: "main", SHA: "abc123", Event: "push", Environment: "production", Status: model.StatusRunning, Trusted: true, OIDCAllowed: true, LeaseExpiresAt: &exp, LeaseTokenHash: hashLeaseToken(s.leaseKey, leaseToken), LeaseRunnerID: "runner-1"}
 	f.mu.Unlock()
 	return runID, jobID
 }

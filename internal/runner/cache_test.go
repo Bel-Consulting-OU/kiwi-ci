@@ -68,6 +68,35 @@ func TestCacheUploadTargetsJobScopedRoute(t *testing.T) {
 	}
 }
 
+// TestJobCacheInheritsUnifiedArchiveBound pins W5-A at the runner layer: the
+// executor's job-scoped cache client and Store leave both compressed-size
+// knobs at 0 (use the layer default), which resolves to the cache package's
+// ONE authoritative MaxArchiveBytes — the same bound the Store and the
+// control-plane endpoint enforce, and above the retired 4 GiB client cap.
+func TestJobCacheInheritsUnifiedArchiveBound(t *testing.T) {
+	ts := httptest.NewServer(http.NotFoundHandler())
+	defer ts.Close()
+	task := basicTask("version: 1\njobs:\n  build:\n    steps:\n      - run: echo hi\n")
+	r := testRunnerFor(t, ts, Config{})
+	store := r.newJobCache(task, r.Metrics)
+	if store.MaxCacheBytes != 0 {
+		t.Fatalf("job cache Store.MaxCacheBytes = %d, want 0 (shared default)", store.MaxCacheBytes)
+	}
+	tr, ok := store.Client.Transport.(*cacheTransport)
+	if !ok {
+		t.Fatalf("store transport = %T, want *cacheTransport", store.Client.Transport)
+	}
+	if tr.client.MaxCompressedBytes != 0 {
+		t.Fatalf("job cache client MaxCompressedBytes = %d, want 0 (shared default)", tr.client.MaxCompressedBytes)
+	}
+	if cache.MaxArchiveBytes != 8<<30 {
+		t.Fatalf("cache.MaxArchiveBytes = %d, want 8 GiB", cache.MaxArchiveBytes)
+	}
+	if cache.MaxArchiveBytes <= 4<<30 {
+		t.Fatalf("cache.MaxArchiveBytes = %d, not above the retired 4 GiB client cap", cache.MaxArchiveBytes)
+	}
+}
+
 // TestCacheRestoreFallsBackToJobScopedRoute verifies the restore path: a
 // miss on the job-scoped route leaves the store empty, and a subsequent hit
 // downloads and extracts the archive the server signed with a digest.

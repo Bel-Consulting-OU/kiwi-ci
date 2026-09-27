@@ -376,9 +376,9 @@ func TestQueueReasonFleetGlobalResourceCapacity(t *testing.T) {
 	f.mu.Lock()
 	for _, id := range []string{"res-a", "res-b"} {
 		prof := "prof-" + id
-		f.profiles[prof] = model.RunnerProfile{ID: prof, MaxCapacity: 8, MaxMemory: 8 << 30}
+		f.profiles[prof] = model.RunnerProfile{ID: prof, Capabilities: []string{"native"}, MaxCapacity: 8, MaxMemory: 8 << 30}
 		f.certProfiles["serial-"+id] = prof
-		f.runners[id] = model.Runner{ID: id, Name: id, Capacity: 8, CertSerial: "serial-" + id}
+		f.runners[id] = model.Runner{ID: id, Name: id, Capacity: 8, CertSerial: "serial-" + id, ReportedCapabilities: []string{"native"}}
 	}
 	f.runs["res-run"] = model.Run{ID: "res-run", Status: model.StatusQueued}
 	f.jobs["res-wait"] = model.Job{ID: "res-wait", RunID: "res-run", Key: "wait", Status: model.StatusQueued, MemoryRequest: 5 << 30, CreatedAt: time.Now().UTC()}

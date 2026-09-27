@@ -52,11 +52,11 @@ func liveProfileClaim(m *memStore, jobID, runnerID string) (model.Job, error) {
 func TestMemLeaseRunnerIDProfileLiveEdits(t *testing.T) {
 	m := newMemStore()
 	ctx := context.Background()
-	runner := model.Runner{ID: "cccccccccccccccccccccccccccccc01", Capacity: 9, Labels: []string{"snapshot-label"}, CostPerHour: 9}
+	runner := model.Runner{ID: "cccccccccccccccccccccccccccccc01", Capacity: 9, Labels: []string{"snapshot-label"}, ReportedCapabilities: []string{"native"}, CostPerHour: 9}
 	if err := m.UpsertRunner(ctx, runner); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.UpsertProfile(ctx, model.RunnerProfile{ID: "live-p", Labels: []string{"bound"}, Repositories: []string{liveProfileRepoA}, MaxCapacity: 1, CostPerHour: 3.5}); err != nil {
+	if err := m.UpsertProfile(ctx, model.RunnerProfile{ID: "live-p", Labels: []string{"bound"}, Repositories: []string{liveProfileRepoA}, Capabilities: []string{"native"}, MaxCapacity: 1, CostPerHour: 3.5}); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.LinkRunnerProfile(ctx, runner.ID, "live-p"); err != nil {
@@ -81,7 +81,7 @@ func TestMemLeaseRunnerIDProfileLiveEdits(t *testing.T) {
 	}
 
 	// Edit the profile: capacity 3, label and repository ACL replaced.
-	if err := m.UpsertProfile(ctx, model.RunnerProfile{ID: "live-p", Labels: []string{"edited"}, Repositories: []string{liveProfileRepoB}, MaxCapacity: 3}); err != nil {
+	if err := m.UpsertProfile(ctx, model.RunnerProfile{ID: "live-p", Labels: []string{"edited"}, Repositories: []string{liveProfileRepoB}, Capabilities: []string{"native"}, MaxCapacity: 3}); err != nil {
 		t.Fatal(err)
 	}
 	// The removed label no longer matches (the runner is not full: 1 < 3).
@@ -109,17 +109,17 @@ func TestMemLeaseRunnerIDProfileLiveEdits(t *testing.T) {
 func TestMemLeaseCertBindingBeatsRunnerIDBinding(t *testing.T) {
 	m := newMemStore()
 	ctx := context.Background()
-	runner := model.Runner{ID: "cccccccccccccccccccccccccccccc02", Capacity: 9, Labels: []string{"snapshot"}, CertSerial: "serial-cert"}
+	runner := model.Runner{ID: "cccccccccccccccccccccccccccccc02", Capacity: 9, Labels: []string{"snapshot"}, ReportedCapabilities: []string{"native"}, CertSerial: "serial-cert"}
 	if err := m.UpsertRunner(ctx, runner); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.UpsertProfile(ctx, model.RunnerProfile{ID: "cert-p", Labels: []string{"cert"}, MaxCapacity: 2}); err != nil {
+	if err := m.UpsertProfile(ctx, model.RunnerProfile{ID: "cert-p", Labels: []string{"cert"}, Capabilities: []string{"native"}, MaxCapacity: 2}); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.BindCertProfile(ctx, "serial-cert", "cert-p"); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.UpsertProfile(ctx, model.RunnerProfile{ID: "id-p", Labels: []string{"id"}, MaxCapacity: 5}); err != nil {
+	if err := m.UpsertProfile(ctx, model.RunnerProfile{ID: "id-p", Labels: []string{"id"}, Capabilities: []string{"native"}, MaxCapacity: 5}); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.LinkRunnerProfile(ctx, runner.ID, "id-p"); err != nil {
@@ -145,11 +145,11 @@ func TestMemLeaseCertBindingBeatsRunnerIDBinding(t *testing.T) {
 func TestMemLeaseSerialWithoutCertBindingFallsThroughToRunnerID(t *testing.T) {
 	m := newMemStore()
 	ctx := context.Background()
-	runner := model.Runner{ID: "cccccccccccccccccccccccccccccc03", Capacity: 9, Labels: []string{"snapshot"}, CertSerial: "serial-unbound"}
+	runner := model.Runner{ID: "cccccccccccccccccccccccccccccc03", Capacity: 9, Labels: []string{"snapshot"}, ReportedCapabilities: []string{"native"}, CertSerial: "serial-unbound"}
 	if err := m.UpsertRunner(ctx, runner); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.UpsertProfile(ctx, model.RunnerProfile{ID: "id-p", Labels: []string{"id"}, MaxCapacity: 1}); err != nil {
+	if err := m.UpsertProfile(ctx, model.RunnerProfile{ID: "id-p", Labels: []string{"id"}, Capabilities: []string{"native"}, MaxCapacity: 1}); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.LinkRunnerProfile(ctx, runner.ID, "id-p"); err != nil {
@@ -173,7 +173,7 @@ func TestMemLeaseDanglingCertBindingDeniesEvenWithRunnerIDBinding(t *testing.T) 
 		t.Fatal(err)
 	}
 	m.certProfiles["serial-dangling"] = "99999999999999999999999999999999"
-	if err := m.UpsertProfile(ctx, model.RunnerProfile{ID: "id-p", Labels: []string{"id"}, MaxCapacity: 5}); err != nil {
+	if err := m.UpsertProfile(ctx, model.RunnerProfile{ID: "id-p", Labels: []string{"id"}, Capabilities: []string{"native"}, MaxCapacity: 5}); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.LinkRunnerProfile(ctx, runner.ID, "id-p"); err != nil {
@@ -194,11 +194,11 @@ func TestMemLeaseDanglingCertBindingDeniesEvenWithRunnerIDBinding(t *testing.T) 
 func TestMemLeaseUnbindFallsBackToSnapshot(t *testing.T) {
 	m := newMemStore()
 	ctx := context.Background()
-	runner := model.Runner{ID: "cccccccccccccccccccccccccccccc05", Capacity: 4, Labels: []string{"snapshot"}}
+	runner := model.Runner{ID: "cccccccccccccccccccccccccccccc05", Capacity: 4, Labels: []string{"snapshot"}, ReportedCapabilities: []string{"native"}}
 	if err := m.UpsertRunner(ctx, runner); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.UpsertProfile(ctx, model.RunnerProfile{ID: "live-p", Labels: []string{"bound"}, MaxCapacity: 1}); err != nil {
+	if err := m.UpsertProfile(ctx, model.RunnerProfile{ID: "live-p", Labels: []string{"bound"}, Capabilities: []string{"native"}, MaxCapacity: 1}); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.LinkRunnerProfile(ctx, runner.ID, "live-p"); err != nil {
@@ -264,17 +264,18 @@ func TestMemLeaseUnlinkRevokesProfileSnapshot(t *testing.T) {
 		// every scheduling attribute below was copied from the profile, and
 		// the marker records that provenance.
 		ProfileID: "revoke-p", Capacity: 4, Labels: []string{"bound"},
-		AllowedRepositories: []string{liveProfileRepoA},
-		Capabilities:        []string{"container"},
-		ResourceCapacity:    model.ResourceCapacity{Memory: 8 << 30},
-		CostPerHour:         2.5, PowerWatts: 60,
+		AllowedRepositories:  []string{liveProfileRepoA},
+		Capabilities:         []string{"native", "container"},
+		ReportedCapabilities: []string{"native", "container"},
+		ResourceCapacity:     model.ResourceCapacity{Memory: 8 << 30},
+		CostPerHour:          2.5, PowerWatts: 60,
 	}
 	if err := m.UpsertRunner(ctx, runner); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.UpsertProfile(ctx, model.RunnerProfile{
 		ID: "revoke-p", Labels: []string{"bound"}, Repositories: []string{liveProfileRepoA},
-		Capabilities: []string{"container"}, MaxCapacity: 4, MaxMemory: 8 << 30, CostPerHour: 2.5, PowerWatts: 60,
+		Capabilities: []string{"native", "container"}, MaxCapacity: 4, MaxMemory: 8 << 30, CostPerHour: 2.5, PowerWatts: 60,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -337,11 +338,11 @@ func TestMemLeaseUnlinkRevokesProfileSnapshot(t *testing.T) {
 func TestMemLeaseUnlinkKeepsRunnerDeclaredSnapshot(t *testing.T) {
 	m := newMemStore()
 	ctx := context.Background()
-	runner := model.Runner{ID: "cccccccccccccccccccccccccccccc08", Capacity: 4, Labels: []string{"snapshot"}}
+	runner := model.Runner{ID: "cccccccccccccccccccccccccccccc08", Capacity: 4, Labels: []string{"snapshot"}, ReportedCapabilities: []string{"native"}}
 	if err := m.UpsertRunner(ctx, runner); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.UpsertProfile(ctx, model.RunnerProfile{ID: "live-p", Labels: []string{"bound"}, MaxCapacity: 1}); err != nil {
+	if err := m.UpsertProfile(ctx, model.RunnerProfile{ID: "live-p", Labels: []string{"bound"}, Capabilities: []string{"native"}, MaxCapacity: 1}); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.LinkRunnerProfile(ctx, runner.ID, "live-p"); err != nil {

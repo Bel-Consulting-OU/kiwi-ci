@@ -103,7 +103,7 @@ func TestIntegrationFleetViewBatchSchedulerPostgres(t *testing.T) {
 
 	// Reservation sums after real leases: two runners with live claims.
 	resProf := pgITSchedID(t)
-	if err := st.UpsertProfile(ctx, model.RunnerProfile{ID: resProf, MaxCapacity: 8, MaxCPU: 4, MaxMemory: 8 << 30}); err != nil {
+	if err := st.UpsertProfile(ctx, model.RunnerProfile{ID: resProf, Capabilities: []string{"native"}, MaxCapacity: 8, MaxCPU: 4, MaxMemory: 8 << 30}); err != nil {
 		t.Fatalf("upsert reservation profile: %v", err)
 	}
 	resSerialA, resSerialB := "sched-batch-res-a", "sched-batch-res-b"
@@ -115,7 +115,7 @@ func TestIntegrationFleetViewBatchSchedulerPostgres(t *testing.T) {
 	}
 	resRunnerA, resRunnerB := pgITSchedID(t), pgITSchedID(t)
 	for id, serial := range map[string]string{resRunnerA: resSerialA, resRunnerB: resSerialB} {
-		if err := st.UpsertRunner(ctx, model.Runner{ID: id, Name: id, Capacity: 8, CertSerial: serial}); err != nil {
+		if err := st.UpsertRunner(ctx, model.Runner{ID: id, Name: id, Capacity: 8, CertSerial: serial, ReportedCapabilities: []string{"native"}}); err != nil {
 			t.Fatalf("upsert reservation runner %s: %v", id, err)
 		}
 	}

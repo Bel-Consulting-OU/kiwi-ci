@@ -109,7 +109,7 @@ func TestIntegrationFleetRunnerViewBatchParityPostgres(t *testing.T) {
 	// serials), one runner idle.
 	resSerialA, resSerialB := "it-batch-res-serial-a", "it-batch-res-serial-b"
 	profRes := pgITNewID(t)
-	if err := st.UpsertProfile(ctx, model.RunnerProfile{ID: profRes, MaxCapacity: 8, MaxCPU: 4, MaxMemory: 8 << 30}); err != nil {
+	if err := st.UpsertProfile(ctx, model.RunnerProfile{ID: profRes, Capabilities: []string{"native", "container"}, MaxCapacity: 8, MaxCPU: 4, MaxMemory: 8 << 30}); err != nil {
 		t.Fatalf("upsert reservation profile: %v", err)
 	}
 	if err := st.BindCertProfile(ctx, resSerialA, profRes); err != nil {
@@ -120,7 +120,7 @@ func TestIntegrationFleetRunnerViewBatchParityPostgres(t *testing.T) {
 	}
 	resRunnerA, resRunnerB := pgITNewID(t), pgITNewID(t)
 	for id, serial := range map[string]string{resRunnerA: resSerialA, resRunnerB: resSerialB} {
-		if err := st.UpsertRunner(ctx, model.Runner{ID: id, Name: id, Capacity: 8, CertSerial: serial}); err != nil {
+		if err := st.UpsertRunner(ctx, model.Runner{ID: id, Name: id, Capacity: 8, CertSerial: serial, ReportedCapabilities: []string{"native", "container"}}); err != nil {
 			t.Fatalf("upsert reservation runner %s: %v", id, err)
 		}
 	}

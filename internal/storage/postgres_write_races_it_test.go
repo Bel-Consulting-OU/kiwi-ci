@@ -416,11 +416,12 @@ func TestClaimParityCrossForge(t *testing.T) {
 		t.Fatalf("scenario does not exercise cross-forge: identity collapsed")
 	}
 	assertClaimCaseParity(t, claimCase{
-		runner:  model.Runner{ID: runnerID, Name: runnerID, Capacity: 1, CertSerial: serial},
+		runner: model.Runner{ID: runnerID, Name: runnerID, Capacity: 1, CertSerial: serial,
+			ReportedCapabilities: []string{"native"}},
 		job:     job,
 		claim:   claim,
 		serial:  serial,
-		profile: &model.RunnerProfile{ID: "cross-forge-" + pgITNewID(t), MaxCapacity: 1, Repositories: []string{"gitlab/acme/widget"}},
+		profile: &model.RunnerProfile{ID: "cross-forge-" + pgITNewID(t), Capabilities: []string{"native"}, MaxCapacity: 1, Repositories: []string{"gitlab/acme/widget"}},
 		want:    false,
 	})
 }
@@ -443,11 +444,12 @@ func TestClaimParityR1Identity(t *testing.T) {
 	claim.CanonRepoID = canonical
 	claim.RepoFullName = job.RepoFullName
 	assertClaimCaseParity(t, claimCase{
-		runner:  model.Runner{ID: runnerID, Name: runnerID, Capacity: 1, CertSerial: serial},
+		runner: model.Runner{ID: runnerID, Name: runnerID, Capacity: 1, CertSerial: serial,
+			ReportedCapabilities: []string{"native"}},
 		job:     job,
 		claim:   claim,
 		serial:  serial,
-		profile: &model.RunnerProfile{ID: "r1-" + pgITNewID(t), MaxCapacity: 1, Repositories: []string{entry}},
+		profile: &model.RunnerProfile{ID: "r1-" + pgITNewID(t), Capabilities: []string{"native"}, MaxCapacity: 1, Repositories: []string{entry}},
 		want:    true,
 	})
 }

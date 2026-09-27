@@ -60,12 +60,14 @@ func TestRegisterAdvertisesDiscoveredCapsAndCertSerial(t *testing.T) {
 		mu.Lock()
 		gotPayload = in
 		mu.Unlock()
-		// The control plane replies with the profile-derived ceiling.
+		// The control plane replies with the profile-derived ceiling and the
+		// explicit enforcement flag.
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(model.Runner{
 			ID: "runner-cap", Name: "runner-cap", Capacity: 2,
-			Labels:       []string{"container"},
-			Capabilities: []string{"native", "container", "tart"},
+			Labels:               []string{"container"},
+			Capabilities:         []string{"native", "container", "tart"},
+			CapabilitiesEnforced: true,
 		})
 	}))
 	defer ts.Close()
@@ -152,21 +154,20 @@ func TestCheckCapabilityEmptyEnforcedDeniesEveryRuntime(t *testing.T) {
 	}
 }
 
-// TestRegisterCapabilityClaimPresenceEnforced pins the register-response
-// semantics: the capabilities KEY being present (even empty or null) is an
-// authoritative profile claim that enforces the intersection; only an
-// absent key is the legacy no-claim server.
-func TestRegisterCapabilityClaimPresenceEnforced(t *testing.T) {
+// TestRegisterCapabilityClaimPresenceIsNotAuthority pins that key presence
+// alone is NOT an authority signal on the register response: modern servers
+// always include capabilities, so only the explicit capabilities_enforced
+// flag turns the intersection into a restriction.
+func TestRegisterCapabilityClaimPresenceIsNotAuthority(t *testing.T) {
 	cases := []struct {
 		name         string
 		body         string
 		wantEnforced bool
-		wantCaps     int
 	}{
-		{"explicit empty list is a claim", `{"id":"runner-claim","capabilities":[]}`, true, 0},
-		{"explicit null is a claim", `{"id":"runner-claim","capabilities":null}`, true, 0},
-		{"absent key is a legacy server", `{"id":"runner-claim"}`, false, 0},
-		{"non-empty claim is enforced", `{"id":"runner-claim","capabilities":["native","container","tart"]}`, true, -1},
+		{"present empty list without flag", `{"id":"runner-claim","capabilities":[]}`, false},
+		{"present null without flag", `{"id":"runner-claim","capabilities":null}`, false},
+		{"flag true is the authority", `{"id":"runner-claim","capabilities":[],"capabilities_enforced":true}`, true},
+		{"flag false is not the authority", `{"id":"runner-claim","capabilities":["native"],"capabilities_enforced":false}`, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -181,22 +182,6 @@ func TestRegisterCapabilityClaimPresenceEnforced(t *testing.T) {
 			}
 			if r.capEnforced != tc.wantEnforced {
 				t.Fatalf("capEnforced = %t, want %t", r.capEnforced, tc.wantEnforced)
-			}
-			if tc.wantCaps >= 0 && len(r.effectiveCapabilities) != tc.wantCaps {
-				t.Fatalf("effective capabilities = %v, want %d entries", r.effectiveCapabilities, tc.wantCaps)
-			}
-			if tc.wantCaps < 0 {
-				// Never enlarge the profile: every retained capability must
-				// also be discovered on this host.
-				discovered := discoveredCapabilities()
-				for _, c := range r.effectiveCapabilities {
-					if !containsString(discovered, c) {
-						t.Fatalf("effective capability %q not discovered (%v)", c, discovered)
-					}
-				}
-				if len(r.effectiveCapabilities) == 0 {
-					t.Fatal("native must survive a profile that claims native")
-				}
 			}
 		})
 	}

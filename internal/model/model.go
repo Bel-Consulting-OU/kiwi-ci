@@ -267,12 +267,33 @@ type Runner struct {
 	Draining bool `json:"draining,omitempty"`
 
 	// Descriptive and protocol metadata reported at registration.
-	Region              string   `json:"region,omitempty"`
-	Version             string   `json:"version,omitempty"`
-	ProtocolMin         int      `json:"protocol_min,omitempty"`
-	ProtocolMax         int      `json:"protocol_max,omitempty"`
-	Capabilities        []string `json:"capabilities,omitempty"`
-	AllowedRepositories []string `json:"allowed_repositories,omitempty"`
+	Region      string `json:"region,omitempty"`
+	Version     string `json:"version,omitempty"`
+	ProtocolMin int    `json:"protocol_min,omitempty"`
+	ProtocolMax int    `json:"protocol_max,omitempty"`
+	// Capabilities is the EFFECTIVE runtime capability set the scheduler
+	// decides on. When CapabilitiesEnforced is true it is the hardware claim
+	// (ReportedCapabilities) intersected with the linked profile's ceiling;
+	// when false it is the runner's own self-reported set and an empty list
+	// keeps the historical "unrestricted" meaning. Backward compatible:
+	// deployments that predate the split persist this field unchanged and
+	// decode CapabilitiesEnforced as false.
+	Capabilities []string `json:"capabilities,omitempty"`
+	// ReportedCapabilities is the runner's normalized hardware capability
+	// claim exactly as it reported it at registration (the hardware it
+	// actually provides, e.g. ["native","container"]). It is the ONLY input
+	// the live profile intersection narrows: ResolveRunnerProfile recomputes
+	// Capabilities from this claim plus the live profile, so a profile edit
+	// can never re-widen a runner past the hardware registration proved.
+	// An explicit empty claim is authoritative (intersecting to nothing).
+	ReportedCapabilities []string `json:"reported_capabilities,omitempty"`
+	// CapabilitiesEnforced reports whether Capabilities is an authoritative
+	// (profile-derived) set: true means an empty set denies every runtime,
+	// false means legacy self-reported semantics (an empty set is
+	// unrestricted). The server sets it at registration and on every live
+	// profile resolution; a client-asserted value never survives.
+	CapabilitiesEnforced bool     `json:"capabilities_enforced,omitempty"`
+	AllowedRepositories  []string `json:"allowed_repositories,omitempty"`
 
 	// Cost accounting.
 	CostPerHour float64 `json:"cost_per_hour,omitempty"`

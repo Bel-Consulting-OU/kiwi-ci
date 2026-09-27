@@ -319,6 +319,15 @@ func TestOIDCTokenClaimsBoundToJobAndLease(t *testing.T) {
 	if claims["run_id"] != "run-oidc" || claims["job_id"] != "job-oidc" || claims["job"] != "build" {
 		t.Fatalf("job coordinates not from the store: %v", claims)
 	}
+	// Every identity-bearing claim equals the LOCKED job row, including the
+	// revision and environment fields the preliminary object used to supply
+	// unchecked.
+	if claims["ref"] != "main" || claims["sha"] != "abc123" || claims["event"] != "push" || claims["environment"] != "production" {
+		t.Fatalf("revision/environment claims not from the locked job: %v", claims)
+	}
+	if claims["repository"] != "kiwi/repo" || claims["repository_id"] != "kiwi/repo" {
+		t.Fatalf("repository claims not from the locked job: %v", claims)
+	}
 	if claims["sub"] != "repo:kiwi/repo:ref:main:job:build" {
 		t.Fatalf("subject = %v", claims["sub"])
 	}

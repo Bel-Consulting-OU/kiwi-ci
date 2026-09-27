@@ -23,7 +23,7 @@ const pgITResourceSerial = "cert-resource-serial"
 func pgITResourceProfileRunner(t *testing.T, st *PostgresStore, runnerID, profileID string, countCapacity int, capacity model.ResourceCapacity) {
 	t.Helper()
 	if err := st.UpsertProfile(context.Background(), model.RunnerProfile{
-		ID: profileID, MaxCapacity: countCapacity,
+		ID: profileID, Capabilities: []string{"native", "container"}, MaxCapacity: countCapacity,
 		MaxCPU: capacity.CPU, MaxMemory: capacity.Memory, MaxDisk: capacity.Disk, MaxPIDs: capacity.PIDs,
 	}); err != nil {
 		t.Fatalf("upsert resource profile: %v", err)
@@ -31,7 +31,7 @@ func pgITResourceProfileRunner(t *testing.T, st *PostgresStore, runnerID, profil
 	if err := st.BindCertProfile(context.Background(), pgITResourceSerial, profileID); err != nil {
 		t.Fatalf("bind profile: %v", err)
 	}
-	if err := st.UpsertRunner(context.Background(), model.Runner{ID: runnerID, Name: runnerID, Capacity: countCapacity, CertSerial: pgITResourceSerial}); err != nil {
+	if err := st.UpsertRunner(context.Background(), model.Runner{ID: runnerID, Name: runnerID, Capacity: countCapacity, CertSerial: pgITResourceSerial, ReportedCapabilities: []string{"native", "container"}}); err != nil {
 		t.Fatalf("register runner: %v", err)
 	}
 }

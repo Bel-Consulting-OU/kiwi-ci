@@ -708,9 +708,13 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now().UTC()
 	// DB mode: the store is the source of truth for the lease/audience
-	// checks; the in-memory maps are only the dev-mode mirror.
+	// checks; the in-memory maps are only the dev-mode mirror. The job payload
+	// carries the compiled run coordinates (ref/sha/event/repository), so the
+	// identity assertions below and the locked identity at commit read the
+	// SAME source and a mismatch means the record really changed. The run row
+	// is still resolved in DB mode: a job whose run vanished is a
+	// data-integrity fault and must never mint a credential.
 	var j model.Job
-	var run model.Run
 	if s.DB != nil {
 		var err error
 		j, err = s.DB.GetJob(r.Context(), jobID)
@@ -722,12 +726,11 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 			s.internalError(w, r, err, "")
 			return
 		}
-		run, err = s.DB.GetRun(r.Context(), j.RunID)
-		if errors.Is(err, storage.ErrNotFound) {
-			http.NotFound(w, r)
-			return
-		}
-		if err != nil {
+		if _, err = s.DB.GetRun(r.Context(), j.RunID); err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				http.NotFound(w, r)
+				return
+			}
 			s.internalError(w, r, err, "")
 			return
 		}
@@ -735,7 +738,6 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		ok := false
 		j, ok = s.jobs[jobID]
-		run = s.runs[j.RunID]
 		s.mu.Unlock()
 		if !ok {
 			http.NotFound(w, r)
@@ -776,33 +778,19 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 		s.serverError(w, r, http.StatusServiceUnavailable, fmt.Errorf("OIDC signer unavailable"), "OIDC unavailable")
 		return
 	}
-	// The subject and the repository_id claim use the canonical repository
-	// identity; the repository claim stays the human-readable full name.
-	repoID := repoIDForRun(run)
-	sub := "repo:" + repoID + ":ref:" + run.Ref + ":job:" + j.Key
+	// The candidate identity ASSERTIONS the handler authenticated from its
+	// preliminary read. They are never used to build the token: the commit
+	// compares every one of them against the locked job row and refuses on a
+	// mismatch, and the token is built from the identity the commit returns.
+	// The subject and repository_id use the canonical repository identity;
+	// repository stays the human-readable full name.
+	repoID := repoIDForJob(j)
 	jti, err := newID()
 	if err != nil {
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
-	claims := map[string]any{"iss": iss, "sub": sub, "aud": in.Audience, "iat": now.Unix(), "nbf": now.Add(-5 * time.Second).Unix(), "exp": now.Add(5 * time.Minute).Unix(), "jti": jti, "repository": run.RepoFullName, "repository_id": repoID, "ref": run.Ref, "sha": run.SHA, "event": run.Event, "run_id": run.ID, "job_id": j.ID, "job": j.Key, "environment": j.Environment, "trusted": j.Trusted}
-	jwt, err := s.signJWT(signer, claims)
-	if err != nil {
-		s.internalError(w, r, err, "")
-		return
-	}
-	// FINAL AUTHORITY. The preliminary read authorized the request cheaply,
-	// but the signer work above (shared key-ring refresh and a possible
-	// rotation fence) can span seconds, and a concurrent cancel/complete/
-	// revoke could land in that window. The commit re-evaluates the ENTIRE
-	// issuance predicate against the authoritative job with the durable audit
-	// append in one atomic unit (PostgreSQL: job row locked FOR UPDATE;
-	// memory/fs: s.mu held), and cross-checks the candidate claims against
-	// the locked identity. The already-signed JWT is discarded on any
-	// refusal, so no credential leaves the server without the durable audit.
-	if oidcBeforeCommitHook != nil {
-		oidcBeforeCommitHook()
-	}
+	expiresAt := now.Add(5 * time.Minute)
 	req := storage.OIDCIssuance{
 		JobID:           j.ID,
 		RunnerID:        j.LeaseRunnerID,
@@ -812,23 +800,50 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 		KID:             signer.KID,
 		JTI:             jti,
 		IssuedAt:        now,
-		ExpiresAt:       now.Add(5 * time.Minute),
+		ExpiresAt:       expiresAt,
 		Claims: map[string]string{
 			storage.OIDCClaimJobID:        j.ID,
 			storage.OIDCClaimRunID:        j.RunID,
 			storage.OIDCClaimJob:          j.Key,
 			storage.OIDCClaimRepositoryID: repoID,
-			storage.OIDCClaimRepository:   run.RepoFullName,
+			storage.OIDCClaimRepository:   j.RepoFullName,
+			storage.OIDCClaimRef:          j.Ref,
+			storage.OIDCClaimSHA:          j.SHA,
+			storage.OIDCClaimEvent:        j.Event,
+			storage.OIDCClaimEnvironment:  j.Environment,
 			storage.OIDCClaimTrusted:      strconv.FormatBool(j.Trusted),
 			storage.OIDCClaimAudience:     in.Audience,
 		},
 	}
-	if err := s.commitOIDCIssuance(r.Context(), req); err != nil {
+	// FINAL AUTHORITY. The preliminary read authorized the request cheaply,
+	// but the signer work above (shared key-ring refresh and a possible
+	// rotation fence) can span seconds, and a concurrent cancel/complete/
+	// revoke/identity change could land in that window. The commit re-evaluates
+	// the ENTIRE issuance predicate at the STORAGE commit clock against the
+	// authoritative job with the durable audit append in one atomic unit
+	// (PostgreSQL: job row locked FOR UPDATE; memory/fs: s.mu held), and
+	// cross-checks the candidate assertions against the locked identity. No
+	// token exists before the commit succeeds, so a refusal mints nothing and
+	// no identity claim can come from the stale preliminary object.
+	if oidcBeforeCommitHook != nil {
+		oidcBeforeCommitHook()
+	}
+	locked, err := s.commitOIDCIssuance(r.Context(), req)
+	if err != nil {
 		s.oidcIssuanceRefusal(w, r, err)
 		return
 	}
+	// The JWT is built from ONE canonical source: the authoritative identity
+	// the transaction derived from the locked job row. Only iss/aud/jti/iat/
+	// exp (and the signer's kid in the header) come from the candidate.
+	claims := locked.AuthoritativeIdentity().TokenClaims(iss, in.Audience, jti, req.IssuedAt, req.ExpiresAt)
+	jwt, err := s.signJWT(signer, claims)
+	if err != nil {
+		s.internalError(w, r, err, "")
+		return
+	}
 	s.metricAdd("kiwi_oidc_issues_total", 1, nil)
-	writeJSON(w, 200, map[string]any{"value": jwt, "expires_at": now.Add(5 * time.Minute)})
+	writeJSON(w, 200, map[string]any{"value": jwt, "expires_at": expiresAt})
 }
 
 // errOIDCIssuanceStoreUnsupported reports a DB-mode store that cannot commit
@@ -847,17 +862,15 @@ var errOIDCIssuanceAudit = errors.New("OIDC issuance audit failed")
 // storage mode: DB mode delegates to the store's transactional
 // CommitOIDCIssuance (optional interface), while memory/fs mode executes the
 // identical predicate, claim binding and audit append under s.mu.
-func (s *Server) commitOIDCIssuance(ctx context.Context, req storage.OIDCIssuance) error {
+func (s *Server) commitOIDCIssuance(ctx context.Context, req storage.OIDCIssuance) (storage.LockedOIDCIdentity, error) {
 	if s.DB != nil {
 		store, ok := s.DB.(storage.LeaseOIDCIssueStore)
 		if !ok {
-			return errOIDCIssuanceStoreUnsupported
+			return storage.LockedOIDCIdentity{}, errOIDCIssuanceStoreUnsupported
 		}
-		_, err := store.CommitOIDCIssuance(ctx, req)
-		return err
+		return store.CommitOIDCIssuance(ctx, req)
 	}
-	_, err := s.commitOIDCIssuanceLocked(req)
-	return err
+	return s.commitOIDCIssuanceLocked(req)
 }
 
 // commitOIDCIssuanceLocked is the memory/fs-mode issuance authority. The
@@ -877,8 +890,13 @@ func (s *Server) commitOIDCIssuanceLocked(req storage.OIDCIssuance) (storage.Loc
 	if !ok {
 		return storage.LockedOIDCIdentity{}, storage.ErrNotFound
 	}
+	// The commit clock is sampled UNDER the lock, from this mode's own clock
+	// domain, AFTER any pre-commit stall: the predicate must see a lease (or
+	// requested lifetime) that expired during signer/key-store work, not the
+	// handler-captured IssuedAt.
+	commitNow := time.Now().UTC()
 	locked := storage.LockedOIDCIdentityForJob(j)
-	if err := storage.ValidateOIDCIssuance(locked, req); err != nil {
+	if err := storage.ValidateOIDCIssuanceAt(locked, req, commitNow); err != nil {
 		return storage.LockedOIDCIdentity{}, err
 	}
 	auditID, err := newID()

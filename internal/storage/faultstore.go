@@ -1345,6 +1345,24 @@ func (f *FaultyStore) ReleaseSecretDelivery(ctx context.Context, jobID string, g
 	return inner.ReleaseSecretDelivery(ctx, jobID, generation, secretName)
 }
 
+// CommitSecretIssuance forwards the faulted backend's inner implementation
+// while injecting the configured mutation fault, exactly like the other
+// mutating extension methods: the predicate, the once-only claim and the
+// durable audit are the inner implementation's contract and the wrapper never
+// writes anything itself, so a forwarding call cannot bypass either.
+func (f *FaultyStore) CommitSecretIssuance(ctx context.Context, req SecretIssuance) error {
+	inner, ok := f.Inner.(SecretIssuanceStore)
+	if !ok {
+		return errMissingInnerInterface("SecretIssuanceStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return inner.CommitSecretIssuance(ctx, req)
+}
+
 func (f *FaultyStore) UpsertProfile(ctx context.Context, p model.RunnerProfile) error {
 	inner, ok := f.Inner.(ProfileStore)
 	if !ok {
@@ -5187,6 +5205,39 @@ func (m *memStore) ReleaseSecretDelivery(ctx context.Context, jobID string, gene
 	return nil
 }
 
+// CommitSecretIssuance is the in-memory mirror of the SQL transactional
+// delivery commit: under m.mu — this store's transaction — the authoritative
+// job is re-read, the shared issuance predicate (lease holder/generation/token
+// hash, status, expiry at the store clock, trust, declaration) is evaluated,
+// and only then are the once-only claim and the secret.issued audit event
+// recorded together. A refusal returns the same typed error as the SQL store
+// and records NOTHING.
+func (m *memStore) CommitSecretIssuance(ctx context.Context, req SecretIssuance) error {
+	if err := ValidateSecretIssuanceRequest(req); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	j, ok := m.jobs[req.JobID]
+	if !ok {
+		return ErrNotFound
+	}
+	if err := ValidateSecretIssuance(LockedSecretLeaseForJob(j), req, time.Now().UTC()); err != nil {
+		return err
+	}
+	key := fmt.Sprintf("%s|%d|%s", req.JobID, req.LeaseGeneration, req.SecretName)
+	if _, exists := m.claims[key]; exists {
+		return secretIssuanceErrorf(ErrSecretIssuanceDuplicate, "job %s generation %d secret %q", req.JobID, req.LeaseGeneration, req.SecretName)
+	}
+	auditID, err := newID()
+	if err != nil {
+		return err
+	}
+	m.claims[key] = time.Now().UTC()
+	m.audit = append(m.audit, SecretIssuanceAuditEvent(req, j.RunID, auditID))
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // runner profiles, per-runner tokens, revocations, enrollment grants
 // ---------------------------------------------------------------------------
@@ -5884,10 +5935,11 @@ func (m *memStore) DisableRunnerAndRevokeCert(ctx context.Context, runnerID, cer
 // CommitOIDCIssuance is the in-memory mirror of the SQL transactional
 // issuance commit: under m.mu — this store's transaction — the authoritative
 // job is re-read, the shared issuance predicate (lease holder/generation/
-// token hash, status, expiry, trust, permission, audience) and the claim
-// binding are evaluated, and the oidc.issued audit event is appended in the
-// same critical section. A refusal returns the same typed error as the SQL
-// store and appends NOTHING.
+// token hash, status, lease and token lifetime expiry, trust, permission,
+// audience) and the claim binding are evaluated at the store commit clock
+// (time.Now().UTC() under the lock, this store's clock domain), and the
+// oidc.issued audit event is appended in the same critical section. A refusal
+// returns the same typed error as the SQL store and appends NOTHING.
 func (m *memStore) CommitOIDCIssuance(ctx context.Context, req OIDCIssuance) (LockedOIDCIdentity, error) {
 	if err := ValidateOIDCIssuanceRequest(req); err != nil {
 		return LockedOIDCIdentity{}, err
@@ -5898,8 +5950,9 @@ func (m *memStore) CommitOIDCIssuance(ctx context.Context, req OIDCIssuance) (Lo
 	if !ok {
 		return LockedOIDCIdentity{}, ErrNotFound
 	}
+	commitNow := time.Now().UTC()
 	locked := LockedOIDCIdentityForJob(j)
-	if err := ValidateOIDCIssuance(locked, req); err != nil {
+	if err := ValidateOIDCIssuanceAt(locked, req, commitNow); err != nil {
 		return LockedOIDCIdentity{}, err
 	}
 	auditID, err := newID()

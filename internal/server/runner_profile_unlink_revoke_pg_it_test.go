@@ -70,11 +70,16 @@ func TestIntegrationRunnerProfileUnlinkRevokesCapacityPostgres(t *testing.T) {
 	// all ignored in favor of the profile, and the profile's ResourceCapacity
 	// reaches the registration response.
 	ri := pgITRegisterBearer(t, s, "token-a",
-		`{"id":"`+runnerID+`","name":"ra","protocol_min":3,"protocol_max":3,"labels":["self"],"capacity":9,`+
+		`{"id":"`+runnerID+`","name":"ra","protocol_min":3,"protocol_max":3,"labels":["self"],"capacity":9,"capabilities":["native","container"],`+
 			`"resource_capacity":{"cpu":999,"memory":4611686018427387904,"disk":4611686018427387904,"pids":1000000}}`)
 	want := model.ResourceCapacity{CPU: 4, Memory: 8 << 30, Disk: 16 << 30, PIDs: 512}
 	if ri.Capacity != 4 || ri.ResourceCapacity != want || ri.ProfileID != "revoke-pg" {
 		t.Fatalf("registration = %+v, want the profile's capacity and marker", ri)
+	}
+	if !ri.CapabilitiesEnforced || len(ri.Capabilities) != 1 || ri.Capabilities[0] != "container" ||
+		len(ri.ReportedCapabilities) != 2 {
+		t.Fatalf("registration capabilities = %v reported %v enforced %v, want the profile ∩ reported [container]",
+			ri.Capabilities, ri.ReportedCapabilities, ri.CapabilitiesEnforced)
 	}
 	if len(ri.Labels) != 1 || ri.Labels[0] != "container" || ri.Region != "east" {
 		t.Fatalf("registration labels/region = (%v, %q), want the profile's", ri.Labels, ri.Region)

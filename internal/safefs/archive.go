@@ -479,9 +479,11 @@ func underAllowed(name string, limits ExtractLimits) bool {
 // never delivers more than max bytes to the decompressor, and once the budget
 // is spent it probes the source exactly once. A clean EOF there permits
 // io.EOF (the archive ended exactly at the bound); any byte still present is
-// an ErrLimits violation and is never delivered to gzip. The error is latched
-// so a decompressor that keeps reading after the violation sees the same
-// error without further source reads.
+// an ErrLimits violation and is never delivered to gzip. An abnormal source
+// that answers the probe with (0, nil) makes no progress and reports no
+// error: that latches io.ErrNoProgress instead of permitting indefinite
+// re-probing. Every error is latched so a decompressor that keeps reading
+// after a failure sees the same error without further source reads.
 type boundedArchiveReader struct {
 	r    io.Reader
 	max  int64
@@ -510,6 +512,13 @@ func (b *boundedArchiveReader) Read(p []byte) (int, error) {
 		if err == io.EOF {
 			b.eof = true
 		}
+		if n == 0 && err == nil && len(p) > 0 {
+			// A source that returns (0, nil) makes no progress and reports
+			// no error; latch io.ErrNoProgress rather than letting the
+			// decompressor (or an io.Copy loop) re-read it forever.
+			b.err = io.ErrNoProgress
+			return 0, b.err
+		}
 		return n, err
 	}
 	if b.eof {
@@ -523,8 +532,19 @@ func (b *boundedArchiveReader) Read(p []byte) (int, error) {
 	}
 	if err == io.EOF {
 		b.eof = true
+		return 0, io.EOF
 	}
-	return 0, err
+	if err == nil {
+		// The probe made no progress and reported no error: latch
+		// io.ErrNoProgress so the single-probe contract holds and later
+		// reads never touch the source again.
+		b.err = io.ErrNoProgress
+		return 0, b.err
+	}
+	// A real probe error is latched too: repeated reads report it instead of
+	// re-reading a failed source.
+	b.err = err
+	return 0, b.err
 }
 
 // WriteTarGz writes a deterministic tar.gz of the given workspace-relative

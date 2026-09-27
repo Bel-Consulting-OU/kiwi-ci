@@ -107,14 +107,118 @@ func compiledRuntimeJSON(t *testing.T, runtime string) json.RawMessage {
 }
 
 func TestRuntimeAllowedNonVacuous(t *testing.T) {
-	if !RuntimeAllowed([]string{"container", "native"}, "container") {
+	if !RuntimeAllowed([]string{"container", "native"}, false, "container") {
 		t.Fatal("declared runtime must be allowed")
 	}
-	if RuntimeAllowed([]string{"container"}, "tart") {
+	if RuntimeAllowed([]string{"container"}, false, "tart") {
 		t.Fatal("undeclared runtime must be denied")
 	}
-	if !RuntimeAllowed(nil, "tart") || !RuntimeAllowed([]string{"container"}, "") {
-		t.Fatal("vacuous cases must allow")
+	// Legacy (unenforced) semantics: an empty list is unrestricted.
+	if !RuntimeAllowed(nil, false, "tart") {
+		t.Fatal("legacy empty list must be unrestricted")
+	}
+	// The empty runtime defaults to native, so a legacy list must contain
+	// native to admit it.
+	if !RuntimeAllowed([]string{"container", "native"}, false, "") {
+		t.Fatal("legacy list containing native must allow the default runtime")
+	}
+	if RuntimeAllowed([]string{"container"}, false, "") {
+		t.Fatal("legacy list without native must deny the default runtime")
+	}
+	// Enforced semantics: the empty list is an authoritative deny-all, and
+	// membership is required for every runtime.
+	if RuntimeAllowed(nil, true, "native") || RuntimeAllowed(nil, true, "container") {
+		t.Fatal("enforced empty list must deny every runtime")
+	}
+	if !RuntimeAllowed([]string{"native"}, true, "") || !RuntimeAllowed([]string{"native"}, true, "native") {
+		t.Fatal("enforced native only must allow the default runtime")
+	}
+	if RuntimeAllowed([]string{"native"}, true, "container") {
+		t.Fatal("enforced list must deny an undeclared runtime")
+	}
+}
+
+// TestIntersectCapabilities pins the ONE capability intersection: ceiling
+// order survives, duplicates collapse, and either empty side intersects to
+// nothing (the authoritative deny-all shape).
+func TestIntersectCapabilities(t *testing.T) {
+	got := IntersectCapabilities([]string{"native", "container", "tart"}, []string{"tart", "native", "native"})
+	if len(got) != 2 || got[0] != "native" || got[1] != "tart" {
+		t.Fatalf("intersection = %v, want [native tart] in ceiling order", got)
+	}
+	if got := IntersectCapabilities([]string{"container"}, []string{"native"}); len(got) != 0 {
+		t.Fatalf("disjoint intersection = %v, want empty", got)
+	}
+	if got := IntersectCapabilities(nil, []string{"native"}); got != nil {
+		t.Fatalf("empty ceiling = %v, want nil", got)
+	}
+	if got := IntersectCapabilities([]string{"native"}, nil); got != nil {
+		t.Fatalf("empty claim = %v, want nil", got)
+	}
+}
+
+// TestNormalizeCapabilities pins the registration claim normalization: empty
+// entries are dropped, duplicates collapse and order survives, so the
+// persisted reported set is canonical and an all-empty claim reduces to the
+// authoritative nil.
+func TestNormalizeCapabilities(t *testing.T) {
+	got := NormalizeCapabilities([]string{" native ", "", "container", "native", "  "})
+	if len(got) != 2 || got[0] != "native" || got[1] != "container" {
+		t.Fatalf("normalized = %v, want [native container]", got)
+	}
+	if got := NormalizeCapabilities([]string{"", "   "}); got != nil {
+		t.Fatalf("empty claim = %v, want nil", got)
+	}
+	if got := NormalizeCapabilities(nil); got != nil {
+		t.Fatalf("nil claim = %v, want nil", got)
+	}
+}
+
+// TestResolveRunnerProfileRecomputesIntersection is the W3-A regression: a
+// live profile resolution must NEVER overwrite the effective capability set
+// with the profile's set. The reported hardware claim is the invariant, and a
+// profile edit can only narrow it.
+func TestResolveRunnerProfileRecomputesIntersection(t *testing.T) {
+	r := predicateRunner()
+	r.ReportedCapabilities = []string{"native"}
+	r.Capabilities = []string{"native"}
+	r.CapabilitiesEnforced = true
+	got := ResolveRunnerProfile(r, model.RunnerProfile{Capabilities: []string{"native", "container"}, MaxCapacity: 2}, true)
+	if len(got.Capabilities) != 1 || got.Capabilities[0] != "native" {
+		t.Fatalf("effective capabilities = %v, want the reported intersection [native]", got.Capabilities)
+	}
+	if !got.CapabilitiesEnforced {
+		t.Fatal("a linked profile must enforce the recomputed set")
+	}
+	// A live profile WIDENING back to [native,container] must not restore
+	// container: the runner's registration proved it does not provide it.
+	got = ResolveRunnerProfile(got, model.RunnerProfile{Capabilities: []string{"native", "container"}, MaxCapacity: 2}, true)
+	if len(got.Capabilities) != 1 || got.Capabilities[0] != "native" {
+		t.Fatalf("re-resolved capabilities = %v, want [native] after the profile widening", got.Capabilities)
+	}
+	if !RuntimeAllowed(got.Capabilities, got.CapabilitiesEnforced, "native") ||
+		RuntimeAllowed(got.Capabilities, got.CapabilitiesEnforced, "container") {
+		t.Fatalf("runtime decision over %v/%v is wrong", got.Capabilities, got.CapabilitiesEnforced)
+	}
+	// An empty profile ceiling denies every runtime even with a non-empty
+	// hardware claim.
+	deny := ResolveRunnerProfile(r, model.RunnerProfile{Capabilities: nil, MaxCapacity: 1}, true)
+	if len(deny.Capabilities) != 0 || !deny.CapabilitiesEnforced ||
+		RuntimeAllowed(deny.Capabilities, deny.CapabilitiesEnforced, "native") {
+		t.Fatalf("empty profile must yield an enforced empty deny-all, got %v/%v", deny.Capabilities, deny.CapabilitiesEnforced)
+	}
+	// The recomputed slice is fresh: mutating the runner's reported claim
+	// afterwards cannot change the already-resolved effective set.
+	first := got.Capabilities
+	r.ReportedCapabilities[0] = "mutated"
+	if first[0] != "native" {
+		t.Fatalf("intersection aliased the reported slice: %v", first)
+	}
+	// An unlinked resolution never touches the effective set: the runner is
+	// returned unchanged (same capabilities and enforcement marker).
+	plain := ResolveRunnerProfile(r, model.RunnerProfile{Capabilities: []string{"container"}, MaxCapacity: 9}, false)
+	if len(plain.Capabilities) != 1 || plain.Capabilities[0] != "native" || plain.CapabilitiesEnforced != r.CapabilitiesEnforced {
+		t.Fatalf("unlinked resolution mutated the runner: %+v", plain)
 	}
 }
 
@@ -122,6 +226,7 @@ func TestResolveRunnerProfileOverlaysLinkedProfile(t *testing.T) {
 	r := predicateRunner()
 	r.CostPerHour = 1
 	r.PowerWatts = 2
+	r.ReportedCapabilities = []string{"native", "container"}
 	profile := model.RunnerProfile{
 		Labels:       []string{"gpu"},
 		Region:       "us",

@@ -31,14 +31,20 @@ import (
 
 // queueRunnerView is one active runner's effective view for the fleet-global
 // queue-reason decision: the live profile overlay is already applied by the
-// caller, exactly like the lease path's eff runner.
+// caller, exactly like the lease path's eff runner. Capabilities carry the
+// EFFECTIVE runtime set plus its enforcement flag, so the explainer applies
+// the same RuntimeAllowed predicate the lease paths do: a runner whose
+// enforced profile intersection excludes the job's runtime is not a
+// compatible runner.
 type queueRunnerView struct {
-	labels   []string
-	region   string
-	slots    int                    // job-count capacity (>= 1 for active runners)
-	active   int                    // jobs the runner currently holds
-	capacity model.ResourceCapacity // configured capacities (zero = unconstrained)
-	reserved model.ResourceCapacity // live reservations of its running jobs
+	labels       []string
+	region       string
+	slots        int                    // job-count capacity (>= 1 for active runners)
+	active       int                    // jobs the runner currently holds
+	capacity     model.ResourceCapacity // configured capacities (zero = unconstrained)
+	reserved     model.ResourceCapacity // live reservations of its running jobs
+	capabilities []string               // effective runtime capability set
+	capsEnforced bool                   // effective set is authoritative (deny-all when empty)
 }
 
 // queueReasonForJob returns the fleet-global reason a queued job waits, or
@@ -47,12 +53,13 @@ type queueRunnerView struct {
 // Precedence (each step is decided across the whole fleet):
 //
 //  1. a job-unready dependency gate wins: WAITING_DEPENDENCY (job-scoped);
-//  2. no active runner matches the required labels: NO_COMPATIBLE_RUNNER;
-//  3. no label-matching runner matches the placement regions:
+//  2. no active runner matches the job's runtime capability AND required
+//     labels: NO_COMPATIBLE_RUNNER;
+//  3. no runtime+label-matching runner matches the placement regions:
 //     REGION_UNAVAILABLE;
-//  4. no label+region-matching runner's CONFIGURED capacity can ever fit the
-//     request: NO_COMPATIBLE_RUNNER (the existing "no runner can take this"
-//     semantics, so an unsatisfiable job never looks like an infinite
+//  4. no runtime+label+region-matching runner's CONFIGURED capacity can ever
+//     fit the request: NO_COMPATIBLE_RUNNER (the existing "no runner can take
+//     this" semantics, so an unsatisfiable job never looks like an infinite
 //     capacity wait);
 //  5. the environment concurrency limit is reached: ENVIRONMENT_LOCKED;
 //  6. some compatible runner has a free slot and remaining resource
@@ -63,6 +70,7 @@ func queueReasonForJob(j model.Job, fleet []queueRunnerView, depsReady, envLocke
 	if !depsReady {
 		return queue.WaitingDependency
 	}
+	runtime := storage.JobRuntime(j)
 	labelMatch := false
 	regionMatch := false
 	everFits := false
@@ -74,6 +82,13 @@ func queueReasonForJob(j model.Job, fleet []queueRunnerView, depsReady, envLocke
 	// runner's configured capacity.
 	request := j.ReservedResources()
 	for _, r := range fleet {
+		if !storage.RuntimeAllowed(r.capabilities, r.capsEnforced, runtime) {
+			// A runtime-incompatible runner is not a compatible runner at
+			// all: it cannot make the job's labels satisfiable (the lease
+			// predicate would deny it before any label match counts), so it
+			// is skipped before label/region/capacity accounting.
+			continue
+		}
 		if !labelsSatisfied(r.labels, j.RequiredLabels) {
 			continue
 		}
@@ -246,12 +261,14 @@ func (s *Server) fleetQueueRunnerViewsDB(ctx context.Context, ri model.Runner) (
 			reserved = s.Sched.ReservedResources(ctx, eff.ID)
 		}
 		fleet = append(fleet, queueRunnerView{
-			labels:   eff.Labels,
-			region:   eff.Region,
-			slots:    eff.Capacity,
-			active:   len(eff.ActiveJobs),
-			capacity: eff.ResourceCapacity,
-			reserved: reserved,
+			labels:       eff.Labels,
+			region:       eff.Region,
+			slots:        eff.Capacity,
+			active:       len(eff.ActiveJobs),
+			capacity:     eff.ResourceCapacity,
+			reserved:     reserved,
+			capabilities: eff.Capabilities,
+			capsEnforced: eff.CapabilitiesEnforced,
 		})
 	}
 	for _, r := range runners {
@@ -379,12 +396,14 @@ func (s *Server) fleetQueueRunnerViewsLocked(ri model.Runner, reserved map[strin
 			r.Capacity = 1
 		}
 		fleet = append(fleet, queueRunnerView{
-			labels:   r.Labels,
-			region:   r.Region,
-			slots:    r.Capacity,
-			active:   len(r.ActiveJobs),
-			capacity: r.ResourceCapacity,
-			reserved: reserved[r.ID],
+			labels:       r.Labels,
+			region:       r.Region,
+			slots:        r.Capacity,
+			active:       len(r.ActiveJobs),
+			capacity:     r.ResourceCapacity,
+			reserved:     reserved[r.ID],
+			capabilities: r.Capabilities,
+			capsEnforced: r.CapabilitiesEnforced,
 		})
 	}
 	for _, r := range s.runners {

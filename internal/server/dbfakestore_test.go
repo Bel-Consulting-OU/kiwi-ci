@@ -3350,6 +3350,46 @@ func (f *dbFakeStore) ReleaseSecretDelivery(ctx context.Context, jobID string, g
 	return nil
 }
 
+// CommitSecretIssuance mirrors the transactional delivery commit: under the
+// fake's lock the authoritative job is re-read, the shared issuance predicate
+// is evaluated against the fake clock, and the once-only claim and the
+// secret.issued audit are recorded together. A claim error fails closed; an
+// audit failure rolls the claim back, exactly like the SQL transaction, so a
+// delivery is never consumed without its durable audit.
+func (f *dbFakeStore) CommitSecretIssuance(ctx context.Context, req storage.SecretIssuance) error {
+	if err := storage.ValidateSecretIssuanceRequest(req); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	j, ok := f.jobs[req.JobID]
+	if !ok {
+		return storage.ErrNotFound
+	}
+	if err := storage.ValidateSecretIssuance(storage.LockedSecretLeaseForJob(j), req, time.Now().UTC()); err != nil {
+		return err
+	}
+	if f.claimErr != nil {
+		return f.claimErr
+	}
+	key := req.JobID + "|" + itoa(req.LeaseGeneration) + "|" + req.SecretName
+	if f.secretClaims[key] {
+		return fmt.Errorf("%w: job %s generation %d secret %q", storage.ErrSecretIssuanceDuplicate, req.JobID, req.LeaseGeneration, req.SecretName)
+	}
+	f.secretClaims[key] = true
+	if f.auditErr != nil {
+		delete(f.secretClaims, key)
+		return f.auditErr
+	}
+	auditID, err := newID()
+	if err != nil {
+		delete(f.secretClaims, key)
+		return err
+	}
+	f.audit = append(f.audit, storage.SecretIssuanceAuditEvent(req, j.RunID, auditID))
+	return nil
+}
+
 func (f *dbFakeStore) UpsertProfile(ctx context.Context, p model.RunnerProfile) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -3679,8 +3719,10 @@ func (f *dbFakeStore) InsertArtifactOnceForLease(ctx context.Context, jobID, run
 
 // CommitOIDCIssuance mirrors the transactional issuer commit: under the fake's
 // single lock it re-reads the authoritative job, evaluates the shared
-// predicate/claim binding and appends the oidc.issued audit row, honoring the
-// injected audit failure exactly like AppendAudit.
+// predicate/claim binding at the fake's commit clock (time.Now().UTC() under
+// the lock, like memStore and the server's in-process path) and appends the
+// oidc.issued audit row, honoring the injected audit failure exactly like
+// AppendAudit.
 func (f *dbFakeStore) CommitOIDCIssuance(ctx context.Context, req storage.OIDCIssuance) (storage.LockedOIDCIdentity, error) {
 	if err := storage.ValidateOIDCIssuanceRequest(req); err != nil {
 		return storage.LockedOIDCIdentity{}, err
@@ -3691,8 +3733,9 @@ func (f *dbFakeStore) CommitOIDCIssuance(ctx context.Context, req storage.OIDCIs
 	if !ok {
 		return storage.LockedOIDCIdentity{}, storage.ErrNotFound
 	}
+	commitNow := time.Now().UTC()
 	locked := storage.LockedOIDCIdentityForJob(j)
-	if err := storage.ValidateOIDCIssuance(locked, req); err != nil {
+	if err := storage.ValidateOIDCIssuanceAt(locked, req, commitNow); err != nil {
 		return storage.LockedOIDCIdentity{}, err
 	}
 	if f.auditErr != nil {
@@ -3739,3 +3782,4 @@ func (f *dbFakeStore) AcquireNamedFence(ctx context.Context, namespace, key stri
 }
 
 var _ storage.DigestFenceStore = (*dbFakeStore)(nil)
+var _ storage.SecretIssuanceStore = (*dbFakeStore)(nil)

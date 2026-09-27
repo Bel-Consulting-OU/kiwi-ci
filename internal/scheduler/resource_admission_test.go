@@ -85,14 +85,14 @@ func (r *resourceFakeStore) lastClaim(t *testing.T) storage.LeaseClaim {
 func seedResourceScheduler(t *testing.T, st *resourceFakeStore, runnerID string, countCapacity int, capacity model.ResourceCapacity, jobs ...model.Job) *DBScheduler {
 	t.Helper()
 	ctx := context.Background()
-	if err := st.UpsertProfile(ctx, model.RunnerProfile{ID: "prof-" + runnerID, MaxCapacity: countCapacity,
+	if err := st.UpsertProfile(ctx, model.RunnerProfile{ID: "prof-" + runnerID, Capabilities: []string{"native"}, MaxCapacity: countCapacity,
 		MaxCPU: capacity.CPU, MaxMemory: capacity.Memory, MaxDisk: capacity.Disk, MaxPIDs: capacity.PIDs}); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.BindCertProfile(ctx, "serial-"+runnerID, "prof-"+runnerID); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.UpsertRunner(ctx, model.Runner{ID: runnerID, Name: runnerID, Capacity: countCapacity, CertSerial: "serial-" + runnerID}); err != nil {
+	if err := st.UpsertRunner(ctx, model.Runner{ID: runnerID, Name: runnerID, Capacity: countCapacity, CertSerial: "serial-" + runnerID, ReportedCapabilities: []string{"native"}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.InsertRun(ctx, model.Run{ID: "run-" + runnerID, Status: model.StatusQueued, CreatedAt: time.Now().UTC()}); err != nil {

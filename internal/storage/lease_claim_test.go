@@ -251,10 +251,10 @@ func TestMemStoreLeaseDisabledDraining(t *testing.T) {
 func TestMemStoreLeaseLiveProfileRepoACL(t *testing.T) {
 	m := newMemStore()
 	seedLeaseRun(m, leaseJobID)
-	if err := m.UpsertRunner(ctx(), model.Runner{ID: leaseRunner, Capacity: 1, CertSerial: leaseCert, AllowedRepositories: []string{"github.com/o/r"}}); err != nil {
+	if err := m.UpsertRunner(ctx(), model.Runner{ID: leaseRunner, Capacity: 1, CertSerial: leaseCert, AllowedRepositories: []string{"github.com/o/r"}, ReportedCapabilities: []string{"native"}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.UpsertProfile(ctx(), model.RunnerProfile{ID: leaseProf, Repositories: []string{"github.com/o/r"}, MaxCapacity: 1}); err != nil {
+	if err := m.UpsertProfile(ctx(), model.RunnerProfile{ID: leaseProf, Repositories: []string{"github.com/o/r"}, Capabilities: []string{"native"}, MaxCapacity: 1}); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.BindCertProfile(ctx(), leaseCert, leaseProf); err != nil {
@@ -275,7 +275,7 @@ func TestMemStoreLeaseLiveProfileRepoACL(t *testing.T) {
 	if err := m.UpdateJob(ctx(), j); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.UpsertProfile(ctx(), model.RunnerProfile{ID: leaseProf, Repositories: []string{"github.com/o/other"}, MaxCapacity: 1}); err != nil {
+	if err := m.UpsertProfile(ctx(), model.RunnerProfile{ID: leaseProf, Repositories: []string{"github.com/o/other"}, Capabilities: []string{"native"}, MaxCapacity: 1}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.AcquireLeaseAtomic(ctx(), leaseClaimFor(leaseJobID, leaseRunner, 1)); !errors.Is(err, ErrNoCapacity) {
@@ -289,11 +289,14 @@ func TestMemStoreLeaseLiveProfileRepoACL(t *testing.T) {
 }
 
 // TestMemStoreLeaseLiveProfileCapacityAndCaps: the claim uses the profile's
-// CURRENT max capacity and capability set.
+// CURRENT max capacity and capability set, INTERSECTED with the runner's
+// reported hardware claim (W3-A): a profile edit can never re-widen the
+// runner past what registration proved, and an empty intersection never
+// leases the runtime.
 func TestMemStoreLeaseLiveProfileCapacityAndCaps(t *testing.T) {
 	m := newMemStore()
 	seedLeaseRun(m, leaseJobID)
-	if err := m.UpsertRunner(ctx(), model.Runner{ID: leaseRunner, Capacity: 2, CertSerial: leaseCert, Capabilities: []string{"container"}, CostPerHour: 9}); err != nil {
+	if err := m.UpsertRunner(ctx(), model.Runner{ID: leaseRunner, Capacity: 2, CertSerial: leaseCert, Capabilities: []string{"container"}, ReportedCapabilities: []string{"container"}, CostPerHour: 9}); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.UpsertProfile(ctx(), model.RunnerProfile{ID: leaseProf, MaxCapacity: 2, Capabilities: []string{"native"}, CostPerHour: 3, PowerWatts: 7}); err != nil {

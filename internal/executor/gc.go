@@ -33,10 +33,104 @@ var (
 const boundedToolWaitDelay = 2 * time.Second
 
 // ErrExternalCommandTimeout marks an auxiliary executor command (a tart
-// delete, an ssh-keygen invocation, an xfs_quota mutation, a GC removal) that
-// did not finish within its per-tool bound. Callers can errors.Is it to
-// distinguish a wedged binary from an ordinary command failure.
+// delete, an ssh-keygen invocation, an xfs_quota mutation, a GC removal, a
+// setup command that outlived its phase ceiling, a killed process that could
+// not be reaped) that did not finish within its per-tool bound. Callers can
+// errors.Is it to distinguish a wedged binary or un-reapable process from an
+// ordinary command failure.
 var ErrExternalCommandTimeout = errors.New("external command timed out")
+
+// Phase-specific ceilings for the executor's normal setup commands. These
+// are deliberately separate from the cleanup bounds (boundedToolCommand,
+// dockerCleanupCommand): cleanup detaches from the parent with
+// context.WithoutCancel, while setup runs under the job context AND the phase
+// ceiling, whichever expires first. A job that configures no timeout must
+// still not hang forever on a wedged docker daemon or tart CLI, while the
+// job's own build commands remain governed by the job timeout alone.
+var (
+	// runtimeProbeTimeout bounds capability probes: `docker info`, `tart
+	// get`, and each `tart ip` attempt.
+	runtimeProbeTimeout = 15 * time.Second
+	// runtimeControlTimeout bounds quick control-plane mutations: `docker
+	// network create`.
+	runtimeControlTimeout = 30 * time.Second
+	// runtimeSetupTimeout bounds setup commands that legitimately take long
+	// because they pull images or clone VM disks: the job `docker run`, each
+	// service `docker run`, and `tart clone`. The long-lived `tart run` VM
+	// process itself is not a setup wait: it is governed by the job context
+	// and bounded on teardown by waitKilledCommand (CloseJob).
+	runtimeSetupTimeout = 10 * time.Minute
+)
+
+// phaseCommand runs one executor setup command (never a user build command)
+// under a context bounded by both the parent (job) context and the phase
+// ceiling. context.WithTimeout takes the earlier of the parent deadline and
+// now+phase, so a tight job deadline is never extended and a missing job
+// deadline is never unlimited. The parent is never detached: cleanup may use
+// context.WithoutCancel, but a canceled job must cancel its setup.
+//
+// On a phase-ceiling expiry with the parent still live the returned error
+// wraps ErrExternalCommandTimeout and context.DeadlineExceeded; a parent-side
+// cancellation or deadline is returned as the raw command error so callers
+// keep their own cancellation/timeout classification.
+func phaseCommand(parent context.Context, phase time.Duration, exe string, args ...string) ([]byte, error) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, phase)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, exe, args...)
+	// Bound the output-pipe drain after a kill too, so an orphaned
+	// descendant holding the pipe cannot extend a phase beyond its ceiling.
+	cmd.WaitDelay = boundedToolWaitDelay
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return out, nil
+	}
+	if parent.Err() == nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return out, fmt.Errorf("%w after %s: %w: %s %s%s", ErrExternalCommandTimeout, phase, context.DeadlineExceeded, exe, strings.Join(args, " "), boundedCleanupOutput(out))
+	}
+	return out, err
+}
+
+// waitKilledReap is a test-only seam over cmd.Wait inside
+// waitKilledCommand. Production behavior is unchanged; it lets a wait that
+// cannot complete within the grace be exercised deterministically (a process
+// wedged in an uninterruptible kernel wait cannot be fabricated portably).
+var waitKilledReap = func(cmd *exec.Cmd) error { return cmd.Wait() }
+
+// reapKilledCommand is a test-only seam over waitKilledCommand. Production
+// behavior is unchanged; it lets a bounded-reap failure be injected
+// deterministically at the CloseJob and native supervision-failure call
+// sites.
+var reapKilledCommand = waitKilledCommand
+
+// waitKilledCommand kills cmd's process and reaps it through cmd.Wait —
+// never os.Process.Wait, which bypasses exec.Cmd bookkeeping — under a
+// bounded grace. Wait runs in a goroutine whose result channel is buffered,
+// so a process that outlives the grace can never block the caller: on expiry
+// a detached reaper (reapDetached) drains the eventual result, so the reaper
+// goroutine never blocks on the send and the process is still reaped once it
+// finally exits (no zombie), and a typed ErrExternalCommandTimeout is
+// returned. A command reaped within the grace returns nil regardless of the
+// wait error: the kill makes a signaled exit the expected outcome.
+func waitKilledCommand(cmd *exec.Cmd, grace time.Duration) error {
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+	_ = cmd.Process.Kill()
+	done := make(chan error, 1)
+	go func() { done <- waitKilledReap(cmd) }()
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return nil
+	case <-timer.C:
+		reapDetached(done)
+		return fmt.Errorf("%w after %s: %w: reaping killed process %q", ErrExternalCommandTimeout, grace, context.DeadlineExceeded, cmd.Path)
+	}
+}
 
 // boundedToolCommand runs one auxiliary external command (cleanup, delete,
 // keygen, quota mutation) under a context detached from parent cancellation:

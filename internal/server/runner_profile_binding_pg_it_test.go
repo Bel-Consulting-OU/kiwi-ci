@@ -113,6 +113,9 @@ func TestIntegrationRunnerProfileBindingPostgres(t *testing.T) {
 	if len(priv.Capabilities) != 1 || priv.Capabilities[0] != "native" {
 		t.Fatalf("capabilities = %v, want the profile intersection [native]", priv.Capabilities)
 	}
+	if len(priv.ReportedCapabilities) != 2 || priv.ReportedCapabilities[0] != "native" || priv.ReportedCapabilities[1] != "tart" || !priv.CapabilitiesEnforced {
+		t.Fatalf("reported capabilities = %v enforced %v, want the payload claim [native tart] and enforced", priv.ReportedCapabilities, priv.CapabilitiesEnforced)
+	}
 	if priv.CertSerial != "" {
 		t.Fatalf("bearer runner stored a client-asserted serial: %q", priv.CertSerial)
 	}

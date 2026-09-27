@@ -260,8 +260,10 @@ func (s *DBScheduler) Enqueue(ctx context.Context, run model.Run, jobs map[strin
 // out. Leadership orders this work, it is not the safety boundary for it.
 //
 // Every scheduling attribute is resolved LIVE: when the runner has a linked
-// profile the profile's current labels/region/repo ACL/capabilities/capacity/
-// rates are used, not the registration snapshot.
+// profile the profile's current labels/region/repo ACL/capacity/rates are
+// used, not the registration snapshot, and the effective capability set is
+// the profile ceiling intersected with the runner's reported hardware claim
+// (never the profile alone — see storage.ResolveRunnerProfile).
 func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time) (*model.Job, string, time.Time, error) {
 	if !s.IsLeader(ctx) {
 		return nil, "", time.Time{}, ErrNotLeader

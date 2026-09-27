@@ -363,6 +363,23 @@ func faultyWrapperCases() map[string]wrapperCase {
 		"ReleaseSecretDelivery": {mutates: true, call: func(f *FaultyStore) error {
 			return f.ReleaseSecretDelivery(ctx(), testJob.ID, 1, "TOKEN")
 		}},
+		"CommitSecretIssuance": {mutates: true, seed: func(m *memStore) {
+			exp := time.Now().UTC().Add(time.Hour)
+			j := testJob
+			j.Status = model.StatusRunning
+			j.Trusted = true
+			j.DeclaredSecrets = []string{"TOKEN"}
+			j.LeaseRunnerID = testRunner.ID
+			j.LeaseTokenHash = []byte("hash")
+			j.LeaseGeneration = 1
+			j.LeaseExpiresAt = &exp
+			_ = m.InsertJob(ctx(), j)
+		}, call: func(f *FaultyStore) error {
+			return f.CommitSecretIssuance(ctx(), SecretIssuance{
+				JobID: testJob.ID, RunnerID: testRunner.ID, LeaseGeneration: 1,
+				LeaseTokenHash: []byte("hash"), SecretName: "TOKEN", IssuedAt: time.Now().UTC(),
+			})
+		}},
 		"UpsertProfile": {mutates: true, call: func(f *FaultyStore) error {
 			return f.UpsertProfile(ctx(), model.RunnerProfile{ID: memProfileID, MaxCapacity: 2})
 		}},
@@ -924,6 +941,9 @@ func missingOptionalInterfaceCases() map[string]missingIfaceCase {
 		}},
 		"ReleaseSecretDelivery": {mutates: true, iface: "SecretClaimReleaser", call: func(f *FaultyStore) error {
 			return f.ReleaseSecretDelivery(ctx(), "", 0, "")
+		}},
+		"CommitSecretIssuance": {mutates: true, iface: "SecretIssuanceStore", call: func(f *FaultyStore) error {
+			return f.CommitSecretIssuance(ctx(), SecretIssuance{})
 		}},
 		"RevokeRunnerLeases": {mutates: true, iface: "RecoveryStore", call: func(f *FaultyStore) error {
 			_, err := f.RevokeRunnerLeases(ctx(), "", "")

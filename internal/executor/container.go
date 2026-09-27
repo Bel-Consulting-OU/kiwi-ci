@@ -286,14 +286,16 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 	// image reference can never be reinterpreted as an option (the digest
 	// grammar also rejects flag-shaped refs for untrusted jobs, but the argv
 	// boundary is defense in depth for trusted jobs and future grammars).
+	// The run pulls the job image and is legitimately slow: it runs under the
+	// 10m setup ceiling (min with the job context).
 	args = append(args, "--", b.Image, "sh", "-c", "while :; do sleep 3600; done")
-	out, err := exec.CommandContext(ctx, docker, args...).CombinedOutput()
+	out, err := phaseCommand(ctx, runtimeSetupTimeout, docker, args...)
 	if err != nil {
 		restoreErr := errors.Join(b.restoreProvisionedWorkspace(), b.cleanupWorkspaceQuota())
 		if restoreErr != nil {
-			return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("start job container: %v: %s (workspace restore also failed: %v)", err, strings.TrimSpace(string(out)), restoreErr)}
+			return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("start job container: %w: %s (workspace restore also failed: %w)", err, strings.TrimSpace(string(out)), restoreErr)}
 		}
-		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("start job container: %v: %s", err, strings.TrimSpace(string(out)))}
+		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("start job container: %w: %s", err, strings.TrimSpace(string(out)))}
 	}
 	emit("job container started " + b.container)
 	return nil
@@ -490,11 +492,13 @@ func securityOptionsRootless(report string) bool {
 // requireRootlessDaemon requires `docker info --format {{.SecurityOptions}}`
 // to report "rootless". sandbox.rootless is an explicit promise to the job
 // author; if the daemon is a privileged rootful one we must refuse rather
-// than silently run with weaker isolation.
+// than silently run with weaker isolation. The daemon query is a probe and
+// runs under the runtime probe ceiling (min with the job context), so a
+// wedged daemon cannot stall a job that configures no timeout.
 func requireRootlessDaemon(ctx context.Context, docker string) error {
-	out, err := exec.CommandContext(ctx, docker, "info", "--format", "{{.SecurityOptions}}").CombinedOutput()
+	out, err := phaseCommand(ctx, runtimeProbeTimeout, docker, "info", "--format", "{{.SecurityOptions}}")
 	if err != nil {
-		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("inspect docker daemon: %v: %s", err, strings.TrimSpace(string(out)))}
+		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("inspect docker daemon: %w: %s", err, strings.TrimSpace(string(out)))}
 	}
 	if !securityOptionsRootless(string(out)) {
 		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("sandbox.rootless requested but the docker daemon is not rootless (security options: %s)", strings.TrimSpace(string(out)))}

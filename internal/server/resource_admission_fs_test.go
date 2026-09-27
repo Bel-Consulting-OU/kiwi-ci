@@ -54,7 +54,7 @@ func fsResourceServer(t *testing.T) (*Server, string) {
 	})
 	bindSerial(t, s, "fs-res-prof", serial)
 	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "runner-tok",
-		`{"name":"fs-res-runner","cert_serial":"`+serial+`","protocol_min":3,"protocol_max":3}`)
+		`{"name":"fs-res-runner","cert_serial":"`+serial+`","capabilities":["native","container"],"protocol_min":3,"protocol_max":3}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d %s", w.Code, w.Body.String())
 	}
@@ -351,9 +351,9 @@ func TestMemoryResourceReasonParityWithDBMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.mu.Lock()
-	f.profiles["par-prof"] = model.RunnerProfile{ID: "par-prof", MaxCapacity: 8, MaxMemory: 8 << 30}
+	f.profiles["par-prof"] = model.RunnerProfile{ID: "par-prof", Capabilities: []string{"native"}, MaxCapacity: 8, MaxMemory: 8 << 30}
 	f.certProfiles["par-serial"] = "par-prof"
-	f.runners["par-runner"] = model.Runner{ID: "par-runner", Name: "par-runner", Capacity: 8, CertSerial: "par-serial"}
+	f.runners["par-runner"] = model.Runner{ID: "par-runner", Name: "par-runner", Capacity: 8, CertSerial: "par-serial", ReportedCapabilities: []string{"native"}}
 	f.runs["par-run"] = model.Run{ID: "par-run", Status: model.StatusQueued}
 	f.jobs["par-wait"] = model.Job{ID: "par-wait", RunID: "par-run", Key: "wait", Status: model.StatusQueued, MemoryRequest: 5 << 30, CreatedAt: time.Now().UTC()}
 	f.jobs["par-over"] = model.Job{ID: "par-over", RunID: "par-run", Key: "over", Status: model.StatusQueued, MemoryRequest: 16 << 30, CreatedAt: time.Now().UTC().Add(time.Second)}

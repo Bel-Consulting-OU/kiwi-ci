@@ -220,6 +220,7 @@ func TestUnlinkRevokesProfileSnapshotInFSMode(t *testing.T) {
 	ri := registerWithToken(t, s, map[string]any{
 		"id": "runner-a", "name": "ra", "protocol_min": 3, "protocol_max": 3,
 		"labels": []string{"spoofed"}, "capacity": 99,
+		"capabilities":      []string{"native", "container"},
 		"resource_capacity": map[string]any{"memory": int64(1) << 62},
 	}, "token-a")
 	wantCapacity := model.ResourceCapacity{CPU: 4, Memory: 8 << 30, Disk: 16 << 30, PIDs: 512}
@@ -287,6 +288,7 @@ func TestUnlinkRevokesProfileSnapshotInFSMode(t *testing.T) {
 	bindRunnerProfile(t, restarted, "revoke", "runner-a", "admin-tok")
 	re := registerWithToken(t, restarted, map[string]any{
 		"id": "runner-a", "name": "ra", "protocol_min": 3, "protocol_max": 3,
+		"capabilities": []string{"native", "container"},
 	}, "token-a")
 	if re.Capacity != 4 || re.ResourceCapacity != wantCapacity || re.ProfileID != "revoke" {
 		t.Fatalf("re-registration = %+v, want the re-bound profile restored", re)
@@ -376,9 +378,12 @@ func TestUnlinkRevokesProfileMaterializedByLease(t *testing.T) {
 	s.UntrustedMemoryCeiling = 16 << 30
 	createProfile(t, s, unlinkRevokeProfile())
 
-	// Unprofiled registration first (RequireProfiles registers empty).
+	// Unprofiled registration first (RequireProfiles registers empty), with
+	// the runner's real hardware claim so the later live profile can narrow
+	// it.
 	ri := registerWithToken(t, s, map[string]any{
 		"id": "runner-a", "name": "ra", "protocol_min": 3, "protocol_max": 3,
+		"capabilities": []string{"native", "container"},
 	}, "token-a")
 	if ri.Capacity != 0 || ri.ProfileID != "" {
 		t.Fatalf("unprofiled registration = %+v, want the empty registration", ri)

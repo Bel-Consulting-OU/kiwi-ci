@@ -4,10 +4,12 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // simulateCgroupControlFiles makes a plain temporary directory behave like a
@@ -174,5 +176,69 @@ func TestRunnerCgroupDirParsesProcSelfCgroup(t *testing.T) {
 	}
 	if !strings.HasPrefix(dir, root) {
 		t.Fatalf("runner cgroup %q is not under %q", dir, root)
+	}
+}
+
+// installFakeDockerOnPath installs a `docker` shell script into a fresh directory and
+// puts it first on PATH, returning nothing. The scripts used here never touch
+// a real daemon.
+func installFakeDockerOnPath(t *testing.T, script string) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "docker"), []byte("#!/bin/sh\n"+script+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// TestDockerAcceptsCgroupPathHangingProbeBounded pins the W5-D residual: the
+// job-cgroup `docker info` probe runs under the runtime probe ceiling through
+// phaseCommand, so a wedged daemon returns a typed ErrExternalCommandTimeout
+// instead of pinning job startup when the job has no timeout. The probe
+// timeout is shrunk so the test is deterministic and fast.
+func TestDockerAcceptsCgroupPathHangingProbeBounded(t *testing.T) {
+	installFakeDockerOnPath(t, "exec sleep 300")
+	orig := runtimeProbeTimeout
+	runtimeProbeTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { runtimeProbeTimeout = orig })
+
+	begin := time.Now()
+	err := dockerAcceptsCgroupPath(context.Background())
+	elapsed := time.Since(begin)
+	if !errors.Is(err, ErrExternalCommandTimeout) {
+		t.Fatalf("hanging probe = %v, want ErrExternalCommandTimeout", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("hanging probe took %v, want it bounded near the phase ceiling", elapsed)
+	}
+}
+
+// TestDockerAcceptsCgroupPathDriverClassification pins the probe's parsing
+// and classification: cgroupfs is accepted, systemd reports the delegation
+// gap, and an empty driver is refused.
+func TestDockerAcceptsCgroupPathDriverClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		output  string
+		wantErr string
+	}{
+		{"cgroupfs accepted", "cgroupfs", ""},
+		{"systemd refused", "systemd", "systemd"},
+		{"empty refused", "", "no cgroup driver"},
+		{"unknown refused", "weird", "does not accept"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			installFakeDockerOnPath(t, "echo "+tc.output)
+			err := dockerAcceptsCgroupPath(context.Background())
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("cgroupfs probe = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("probe(%q) = %v, want %q", tc.output, err, tc.wantErr)
+			}
+		})
 	}
 }

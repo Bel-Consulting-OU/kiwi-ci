@@ -22,6 +22,17 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/safefs"
 )
 
+// MaxArchiveBytes is the ONE authoritative compressed-size bound for a cache
+// archive. Every layer of the cache contract resolves its default to this
+// single constant: the runner-side restore stream
+// (defaultMaxCompressedBytes), the Store's local and remote archive bound
+// (defaultCacheArchiveBytes), and the control plane's upload endpoint
+// (server's cacheUploadMaxBytes). One bound means an archive one layer
+// accepts can always be transferred and restored through another; the former
+// split (4 GiB client, 8 GiB store/endpoint) rejected valid large archives on
+// restore. It is a hard const, never derived per call site.
+const MaxArchiveBytes int64 = 8 << 30
+
 // cacheKeyRE is the accepted archive key shape: an alphanumeric first
 // character followed by up to 127 [A-Za-z0-9._-] characters. Keys produced
 // by Key are hex SHA-256 digests (a strict subset); the wider shape keeps
@@ -48,15 +59,6 @@ func Default() *Store {
 	home, _ := os.UserHomeDir()
 	return &Store{Root: filepath.Join(home, ".kiwi", "cache")}
 }
-
-// defaultAPITimeout is the finite total bound the legacy Store.Restore/Save
-// wrappers (and the unexported fetchRemote/pushRemote entry points) apply
-// when the Store has no caller-supplied HTTP client. It is a total deadline
-// for the convenience path only: callers that need bulk transfers or their
-// own lifetime must use RestoreContext/SaveContext (or configure Client, as
-// the runner does). It is layered UNDER the sliding storeStallTimeout
-// watchdog, which bounds every remote body in both paths.
-const defaultAPITimeout = 30 * time.Second
 
 // storeStallTimeout is the sliding inactivity bound for every remote Store
 // transfer body. The watchdog cancels the request context when no byte has
@@ -106,26 +108,28 @@ func defaultTransport() *http.Transport {
 	return t
 }
 
-// defaultContext is the context the legacy wrapper methods use. The bound is
-// layered, and no layer imposes a total-duration cap on a transfer that keeps
-// making progress:
+// defaultContext is the context the legacy wrapper methods use. It is
+// deliberately TIMEOUT-FREE: a bulk cache transfer must be able to run for
+// arbitrarily long as long as it keeps making progress, so no total
+// wall-clock deadline is imposed. The no-hang guarantee is layered instead:
 //
-//   - With no caller-supplied Client the wrapper carries the explicit finite
-//     defaultAPITimeout (30s) for the convenience path, and the default
-//     client bounds every transport phase (dial, TLS, response headers,
-//     idle).
+//   - With no caller-supplied Client the wrapper uses the default client
+//     whose transport bounds every control phase (dial, TLS handshake,
+//     response headers, idle connection).
 //   - With a caller-supplied Client the client's own bounds (and the
-//     defaultTransport phases when it has none) apply; the context is
-//     deliberately unbounded so the client owns the total policy.
+//     defaultTransport phases when it has none) apply.
 //   - In BOTH cases every remote request/response body is wrapped by the
 //     sliding storeStallTimeout watchdog, which is the Store's own
 //     enforcement and cancels a transfer that stops making progress with
 //     ErrTransferStalled.
+//
+// Callers that need an absolute wall-clock bound (or their own lifetime) must
+// use RestoreContext/SaveContext (or configure Client, as the runner does).
+// The former 30-second total body deadline on the no-client path killed a
+// continuously-progressing large restore outright, contradicting the sliding
+// watchdog layered under it.
 func (s *Store) defaultContext() (context.Context, context.CancelFunc) {
-	if s.Client != nil {
-		return context.Background(), func() {}
-	}
-	return context.WithTimeout(context.Background(), defaultAPITimeout)
+	return context.Background(), func() {}
 }
 
 // storeStallGuard is a sliding inactivity watchdog for one remote transfer.
@@ -231,30 +235,55 @@ func stallError(ctx context.Context, guard *storeStallGuard, err error) error {
 // stallGuardReader re-arms a watchdog on every successful read. It wraps
 // request (upload) bodies: when the transport stops pulling bytes because the
 // peer applies backpressure, the watchdog fires and cancels the request.
+//
+// An abnormal underlying reader that returns (0, nil) for a non-empty buffer
+// makes no progress and reports no error; retrying it would re-probe the
+// source forever. That case latches io.ErrNoProgress, exactly like the
+// bounded readers, so every later read reports the same error without
+// touching the source again. A zero-length request is a legal no-op and never
+// latches.
 type stallGuardReader struct {
 	r     io.Reader
 	guard *storeStallGuard
+	err   error
 }
 
 func (r *stallGuardReader) Read(p []byte) (int, error) {
+	if r.err != nil {
+		return 0, r.err
+	}
 	n, err := r.r.Read(p)
 	if n > 0 {
 		r.guard.progress()
+	}
+	if n == 0 && err == nil && len(p) > 0 {
+		r.err = io.ErrNoProgress
+		return 0, r.err
 	}
 	return n, err
 }
 
 // stallGuardedBody wraps a response body so every read re-arms the watchdog
-// and Close disarms it and releases the transfer context.
+// and Close disarms it and releases the transfer context. Like
+// stallGuardReader, a (0, nil) read of a non-empty buffer latches
+// io.ErrNoProgress instead of permitting an indefinite no-progress read loop.
 type stallGuardedBody struct {
 	io.ReadCloser
 	guard *storeStallGuard
+	err   error
 }
 
 func (b *stallGuardedBody) Read(p []byte) (int, error) {
+	if b.err != nil {
+		return 0, b.err
+	}
 	n, err := b.ReadCloser.Read(p)
 	if n > 0 {
 		b.guard.progress()
+	}
+	if n == 0 && err == nil && len(p) > 0 {
+		b.err = io.ErrNoProgress
+		return 0, b.err
 	}
 	return n, err
 }
@@ -300,12 +329,14 @@ func (s *Store) Key(base string, workspace string, hashFiles []string) (string, 
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// Restore is RestoreContext with the Store's default context: a caller-owned
-// Client supplies its own bounds, otherwise an explicit finite
-// defaultAPITimeout applies so a direct call cannot hang forever. In every
-// case the remote body is bounded by the sliding storeStallTimeout watchdog,
-// so a stalled transfer fails with ErrTransferStalled instead of hanging. Use
-// RestoreContext to supply the caller's context.
+// Restore is RestoreContext with the Store's default context. That context
+// carries no total wall-clock deadline: the transfer may run for as long as
+// it keeps making progress. A direct call cannot hang because the default
+// client's transport bounds every control phase (dial, TLS handshake,
+// response headers, idle connection) and the sliding storeStallTimeout
+// watchdog cancels a body that stops making progress with ErrTransferStalled.
+// Callers that need an absolute wall-clock bound supply their own context to
+// RestoreContext.
 func (s *Store) Restore(key, workspace string, paths []string) (bool, error) {
 	ctx, cancel := s.defaultContext()
 	defer cancel()
@@ -416,9 +447,10 @@ func (s *Store) readStoredDigest(key string) (string, error) {
 }
 
 // defaultCacheArchiveBytes bounds a cache archive when MaxCacheBytes is not
-// configured: 8 GiB, matching the control-plane cache endpoint's upload cap,
-// so a locally saved archive can never be unbounded on restore/download.
-const defaultCacheArchiveBytes int64 = 8 << 30
+// configured. It resolves to the ONE shared cache-archive contract
+// (MaxArchiveBytes), so the Store, the runner-side client and the
+// control-plane upload endpoint all accept the same compressed range.
+const defaultCacheArchiveBytes int64 = MaxArchiveBytes
 
 // maxStoredBytes resolves the compressed-size bound for a cache archive:
 // MaxCacheBytes when configured, otherwise defaultCacheArchiveBytes.
@@ -551,11 +583,13 @@ func openExtractRoot(workspace string) (*safefs.Root, error) {
 	return root, nil
 }
 
-// Save is SaveContext with the Store's default context: a caller-owned Client
-// supplies its own bounds, otherwise an explicit finite defaultAPITimeout
-// applies so a direct call cannot hang forever. In every case the remote body
-// is bounded by the sliding storeStallTimeout watchdog, so a stalled upload
-// fails with ErrTransferStalled instead of hanging.
+// Save is SaveContext with the Store's default context. That context carries
+// no total wall-clock deadline: the upload may run for as long as it keeps
+// making progress. A direct call cannot hang because the default client's
+// transport bounds every control phase and the sliding storeStallTimeout
+// watchdog cancels a body that stops making progress with ErrTransferStalled.
+// Callers that need an absolute wall-clock bound supply their own context to
+// SaveContext.
 func (s *Store) Save(key, workspace string, paths []string) error {
 	ctx, cancel := s.defaultContext()
 	defer cancel()

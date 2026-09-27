@@ -39,7 +39,7 @@ func TestIntegrationRunnerProfileUnlinkRevocationPostgres(t *testing.T) {
 
 	if err := st.UpsertProfile(ctx, model.RunnerProfile{
 		ID: profileID, Labels: []string{"bound"}, Region: "east",
-		Repositories: []string{liveProfileRepoA}, Capabilities: []string{"container"},
+		Repositories: []string{liveProfileRepoA}, Capabilities: []string{"native", "container"},
 		MaxCapacity: 2, MaxMemory: 8 << 30, CostPerHour: 1.5, PowerWatts: 50,
 	}); err != nil {
 		t.Fatalf("upsert profile: %v", err)
@@ -51,7 +51,7 @@ func TestIntegrationRunnerProfileUnlinkRevocationPostgres(t *testing.T) {
 	if err := st.UpsertRunner(ctx, model.Runner{
 		ID: runnerID, Name: runnerID, ProfileID: profileID,
 		Labels: []string{"stale"}, Region: "east", AllowedRepositories: []string{liveProfileRepoA},
-		Capabilities: []string{"container"}, Capacity: 2,
+		Capabilities: []string{"native", "container"}, ReportedCapabilities: []string{"native", "container"}, Capacity: 2,
 		ResourceCapacity: model.ResourceCapacity{Memory: 8 << 30},
 		CostPerHour:      1.5, PowerWatts: 50,
 	}); err != nil {
@@ -149,7 +149,8 @@ func TestIntegrationRunnerProfileUnlinkKeepsCertBindingPostgres(t *testing.T) {
 	certProfile := "cert-p-" + pgITNewID(t)
 
 	if err := st.UpsertProfile(ctx, model.RunnerProfile{
-		ID: certProfile, Labels: []string{"cert-bound"}, Repositories: []string{liveProfileRepoA}, MaxCapacity: 2,
+		ID: certProfile, Labels: []string{"cert-bound"}, Repositories: []string{liveProfileRepoA},
+		Capabilities: []string{"native"}, MaxCapacity: 2,
 	}); err != nil {
 		t.Fatalf("upsert cert profile: %v", err)
 	}
@@ -159,6 +160,7 @@ func TestIntegrationRunnerProfileUnlinkKeepsCertBindingPostgres(t *testing.T) {
 	if err := st.UpsertRunner(ctx, model.Runner{
 		ID: runnerID, Name: runnerID, CertSerial: serial, ProfileID: certProfile,
 		Labels: []string{"cert-bound"}, AllowedRepositories: []string{liveProfileRepoA}, Capacity: 2,
+		ReportedCapabilities: []string{"native"},
 	}); err != nil {
 		t.Fatalf("upsert runner: %v", err)
 	}

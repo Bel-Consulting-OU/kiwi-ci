@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -28,23 +29,54 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
 )
 
-// --- decodeProfileCapabilities / register ---------------------------------
+// --- register response capability decoding --------------------------------
 
-func TestFinalDecodeProfileCapabilities(t *testing.T) {
-	caps, claimed, err := decodeProfileCapabilities(nil)
-	if err != nil || claimed || caps != nil {
-		t.Fatalf("absent key = %v %v %v", caps, claimed, err)
+// TestFinalDecodeCapabilitiesExplicitFlag pins that the register response's
+// capabilities_enforced flag — not capabilities key presence — is the
+// authority signal: modern servers always include the capabilities field.
+func TestFinalDecodeCapabilitiesExplicitFlag(t *testing.T) {
+	cases := []struct {
+		name         string
+		body         string
+		wantEnforced bool
+		wantCaps     int
+	}{
+		{"explicit empty list with flag is enforced", `{"id":"runner-1","capabilities":[],"capabilities_enforced":true}`, true, 0},
+		{"explicit null with flag is enforced", `{"id":"runner-1","capabilities":null,"capabilities_enforced":true}`, true, 0},
+		{"flag without the capabilities key is enforced", `{"id":"runner-1","capabilities_enforced":true}`, true, 0},
+		{"empty list without the flag is legacy", `{"id":"runner-1","capabilities":[]}`, false, 0},
+		{"non-empty list without the flag is legacy", `{"id":"runner-1","capabilities":["native","container","tart"]}`, false, -1},
+		{"flag false with a list is legacy", `{"id":"runner-1","capabilities":["native"],"capabilities_enforced":false}`, false, -1},
+		{"enforced non-empty claim", `{"id":"runner-1","capabilities":["native"],"capabilities_enforced":true}`, true, -1},
 	}
-	caps, claimed, err = decodeProfileCapabilities(json.RawMessage(`["native","tart"]`))
-	if err != nil || !claimed || len(caps) != 2 || caps[0] != "native" || caps[1] != "tart" {
-		t.Fatalf("list claim = %v %v %v", caps, claimed, err)
-	}
-	caps, claimed, err = decodeProfileCapabilities(json.RawMessage(`null`))
-	if err != nil || !claimed || caps != nil {
-		t.Fatalf("null claim = %v %v %v", caps, claimed, err)
-	}
-	if _, claimed, err = decodeProfileCapabilities(json.RawMessage(`{"native":true}`)); err == nil || !claimed {
-		t.Fatalf("malformed claim = %v %v", claimed, err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer ts.Close()
+			r := &Runner{ID: "runner-1", Cfg: Config{Server: ts.URL}, Client: ts.Client(), Metrics: NewMetrics()}
+			if err := r.register(context.Background()); err != nil {
+				t.Fatalf("register: %v", err)
+			}
+			if r.capEnforced != tc.wantEnforced {
+				t.Fatalf("capEnforced = %t, want %t", r.capEnforced, tc.wantEnforced)
+			}
+			if tc.wantCaps >= 0 && len(r.effectiveCapabilities) != tc.wantCaps {
+				t.Fatalf("effective capabilities = %v, want %d entries", r.effectiveCapabilities, tc.wantCaps)
+			}
+			if tc.wantCaps < 0 {
+				// Never enlarge the profile: every retained capability must
+				// also be discovered on this host.
+				discovered := discoveredCapabilities()
+				for _, c := range r.effectiveCapabilities {
+					if !containsString(discovered, c) {
+						t.Fatalf("effective capability %q not discovered (%v)", c, discovered)
+					}
+				}
+			}
+		})
 	}
 }
 
@@ -64,28 +96,30 @@ func TestFinalRegisterServerErrorsAndCapabilityClaim(t *testing.T) {
 	if err := r.register(context.Background()); err == nil || !isHTTPStatus(err, http.StatusInternalServerError) {
 		t.Fatalf("generic register failure = %v", err)
 	}
-	// A malformed capabilities claim is refused after a successful register.
+	// A malformed capabilities claim (an object instead of a list) is a
+	// response decode failure after a successful register.
 	status.Store(http.StatusOK)
 	body.Store(`{"id":"runner-1","capabilities":{"native":true}}`)
-	if err := r.register(context.Background()); err == nil || !strings.Contains(err.Error(), "capabilities claim") {
-		t.Fatalf("malformed capabilities claim = %v", err)
+	if err := r.register(context.Background()); err == nil {
+		t.Fatal("malformed capabilities claim must fail the register response decode")
 	}
-	// An explicit empty claim enforces an empty intersection.
-	body.Store(`{"id":"runner-1","capabilities":[]}`)
+	// An explicit empty enforced claim enforces an empty intersection.
+	body.Store(`{"id":"runner-1","capabilities":[],"capabilities_enforced":true}`)
 	if err := r.register(context.Background()); err != nil {
-		t.Fatalf("register with empty claim: %v", err)
+		t.Fatalf("register with empty enforced claim: %v", err)
 	}
 	if !r.capEnforced || r.effectiveCapabilities != nil {
-		t.Fatalf("empty claim = enforced=%v caps=%v", r.capEnforced, r.effectiveCapabilities)
+		t.Fatalf("empty enforced claim = enforced=%v caps=%v", r.capEnforced, r.effectiveCapabilities)
 	}
-	// A legacy server without the key keeps the restriction off.
+	// A legacy server without the flag (even with an empty capabilities key)
+	// keeps the restriction off.
 	r = &Runner{ID: "runner-1", Cfg: Config{Server: ts.URL}, Client: ts.Client(), Metrics: NewMetrics()}
-	body.Store(`{"id":"runner-1"}`)
+	body.Store(`{"id":"runner-1","capabilities":[]}`)
 	if err := r.register(context.Background()); err != nil {
 		t.Fatalf("legacy register: %v", err)
 	}
 	if r.capEnforced {
-		t.Fatal("absent capabilities key must not enforce")
+		t.Fatal("a capabilities key without capabilities_enforced must not enforce")
 	}
 }
 

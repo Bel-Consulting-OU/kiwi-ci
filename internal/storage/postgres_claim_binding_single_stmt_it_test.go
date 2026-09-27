@@ -141,7 +141,7 @@ func TestIntegrationLiveProfileBindingSingleStatementParityPostgres(t *testing.T
 // pgITUpsertBindingProfile creates the profile row a binding points at.
 func pgITUpsertBindingProfile(t *testing.T, st *PostgresStore, profileID, label string) {
 	t.Helper()
-	if err := st.UpsertProfile(context.Background(), model.RunnerProfile{ID: profileID, Labels: []string{label}, MaxCapacity: 4}); err != nil {
+	if err := st.UpsertProfile(context.Background(), model.RunnerProfile{ID: profileID, Labels: []string{label}, Capabilities: []string{"native"}, MaxCapacity: 4}); err != nil {
 		t.Fatalf("upsert binding profile %s: %v", profileID, err)
 	}
 }
@@ -158,7 +158,7 @@ func TestIntegrationClaimDeniesDanglingBindingsPostgres(t *testing.T) {
 	runnerID := pgITNewID(t)
 	// The registration snapshot would happily admit (capacity 5, matching
 	// label); only the dangling binding may deny.
-	if err := st.UpsertRunner(ctx, model.Runner{ID: runnerID, Name: runnerID, Capacity: 5, Labels: []string{"snapshot"}}); err != nil {
+	if err := st.UpsertRunner(ctx, model.Runner{ID: runnerID, Name: runnerID, Capacity: 5, Labels: []string{"snapshot"}, ReportedCapabilities: []string{"native"}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.LinkRunnerProfile(ctx, runnerID, "dangling-"+pgITRandomHex(t, 8)); err != nil {

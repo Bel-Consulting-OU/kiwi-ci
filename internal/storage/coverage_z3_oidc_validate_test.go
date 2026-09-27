@@ -41,3 +41,34 @@ func TestValidateOIDCIssuanceRequestShapeBranches(t *testing.T) {
 		})
 	}
 }
+
+// TestValidateOIDCIssuanceAtClockBoundary pins the two commit-clock
+// conditions directly, with the strict After boundary: a lease expiring at
+// the commit instant and a lifetime expiring at the commit instant are both
+// refused, while an issuance whose lease and lifetime strictly outlive the
+// commit clock passes.
+func TestValidateOIDCIssuanceAtClockBoundary(t *testing.T) {
+	j := oidcIssueTestJob()
+	locked := LockedOIDCIdentityForJob(j)
+	req := oidcIssueTestRequest(j)
+	commitNow := time.Now().UTC()
+	if err := ValidateOIDCIssuanceAt(locked, req, commitNow); err != nil {
+		t.Fatalf("live issuance at the commit clock = %v", err)
+	}
+	if err := ValidateOIDCIssuanceAt(locked, req, *j.LeaseExpiresAt); !errors.Is(err, ErrOIDCIssuanceExpired) {
+		t.Fatalf("commit exactly at the lease expiry = %v, want ErrOIDCIssuanceExpired", err)
+	}
+
+	elapsed := req
+	elapsed.ExpiresAt = commitNow
+	if err := ValidateOIDCIssuanceAt(locked, elapsed, commitNow); !errors.Is(err, ErrOIDCIssuanceExpired) {
+		t.Fatalf("commit exactly at the lifetime expiry = %v, want ErrOIDCIssuanceExpired", err)
+	}
+
+	// A zero lease expiry is the same typed refusal (no lease at all).
+	noLease := locked
+	noLease.LeaseExpiresAt = time.Time{}
+	if err := ValidateOIDCIssuanceAt(noLease, req, commitNow); !errors.Is(err, ErrOIDCIssuanceExpired) {
+		t.Fatalf("missing lease at the commit clock = %v, want ErrOIDCIssuanceExpired", err)
+	}
+}

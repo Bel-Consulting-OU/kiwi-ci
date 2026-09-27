@@ -238,9 +238,9 @@ func TestMemoryLiveProfileRepoACLShrink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runner := model.Runner{ID: parityRunnerID, Name: "pr", Capacity: 1, Labels: []string{"container"}, CertSerial: "cert-1", AllowedRepositories: []string{"github.com/o/r"}}
+	runner := model.Runner{ID: parityRunnerID, Name: "pr", Capacity: 1, Labels: []string{"container"}, CertSerial: "cert-1", AllowedRepositories: []string{"github.com/o/r"}, ReportedCapabilities: []string{"native", "container"}}
 	s.mu.Lock()
-	s.profiles["p1"] = model.RunnerProfile{ID: "p1", MaxCapacity: 1, Labels: []string{"container"}, Repositories: []string{"github.com/o/other"}}
+	s.profiles["p1"] = model.RunnerProfile{ID: "p1", Capabilities: []string{"native", "container"}, MaxCapacity: 1, Labels: []string{"container"}, Repositories: []string{"github.com/o/other"}}
 	s.certProfiles["cert-1"] = "p1"
 	s.mu.Unlock()
 	paritySeedMemory(s, runner, parityJob("pjob-1"))
@@ -249,7 +249,7 @@ func TestMemoryLiveProfileRepoACLShrink(t *testing.T) {
 	}
 	// The live profile now allows the repository: the same job leases.
 	s.mu.Lock()
-	s.profiles["p1"] = model.RunnerProfile{ID: "p1", MaxCapacity: 1, Labels: []string{"container"}, Repositories: []string{"github.com/o/r"}}
+	s.profiles["p1"] = model.RunnerProfile{ID: "p1", Capabilities: []string{"native", "container"}, MaxCapacity: 1, Labels: []string{"container"}, Repositories: []string{"github.com/o/r"}}
 	s.mu.Unlock()
 	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/"+parityRunnerID+"/next", "token", ""); w.Code != http.StatusOK {
 		t.Fatalf("memory live-profile match next = %d, want 200: %s", w.Code, w.Body.String())
@@ -268,9 +268,9 @@ func TestDBFakeLiveProfileRepoACLShrink(t *testing.T) {
 	if err := s.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
-	runner := model.Runner{ID: parityRunnerID, Name: "pr", Capacity: 1, Labels: []string{"container"}, CertSerial: "cert-1", AllowedRepositories: []string{"github.com/o/r"}}
+	runner := model.Runner{ID: parityRunnerID, Name: "pr", Capacity: 1, Labels: []string{"container"}, CertSerial: "cert-1", AllowedRepositories: []string{"github.com/o/r"}, ReportedCapabilities: []string{"native", "container"}}
 	paritySeedDB(f, runner, parityJob("pjob-1"))
-	if err := f.UpsertProfile(context.Background(), model.RunnerProfile{ID: "p1", MaxCapacity: 1, Labels: []string{"container"}, Repositories: []string{"github.com/o/other"}}); err != nil {
+	if err := f.UpsertProfile(context.Background(), model.RunnerProfile{ID: "p1", Capabilities: []string{"native", "container"}, MaxCapacity: 1, Labels: []string{"container"}, Repositories: []string{"github.com/o/other"}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.BindCertProfile(context.Background(), "cert-1", "p1"); err != nil {
@@ -279,7 +279,7 @@ func TestDBFakeLiveProfileRepoACLShrink(t *testing.T) {
 	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/"+parityRunnerID+"/next", "token", ""); w.Code != http.StatusNoContent {
 		t.Fatalf("db live-profile mismatch next = %d, want 204", w.Code)
 	}
-	if err := f.UpsertProfile(context.Background(), model.RunnerProfile{ID: "p1", MaxCapacity: 1, Labels: []string{"container"}, Repositories: []string{"github.com/o/r"}}); err != nil {
+	if err := f.UpsertProfile(context.Background(), model.RunnerProfile{ID: "p1", Capabilities: []string{"native", "container"}, MaxCapacity: 1, Labels: []string{"container"}, Repositories: []string{"github.com/o/r"}}); err != nil {
 		t.Fatal(err)
 	}
 	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/"+parityRunnerID+"/next", "token", ""); w.Code != http.StatusOK {

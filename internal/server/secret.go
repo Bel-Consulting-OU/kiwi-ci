@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -59,8 +60,9 @@ const secretAADPrefix = "kiwi-secret-v1\x00"
 // pre-journal JSON array at the same path is detected and migrated on load.
 // The receipt set is data-dir state: a server restarted on the same dataDir
 // refuses replays of already-delivered secrets. In DB mode the once-only
-// record is the SQL secret_claims table (storage.SecretClaimStore) instead;
-// the value never leaves the broker.
+// record is the SQL secret_claims row inserted by
+// storage.SecretIssuanceStore.CommitSecretIssuance instead; the value never
+// leaves the broker.
 const secretReceiptsFile = "secrets-receipts.json"
 
 // secretReceiptsMaxEntries bounds the live receipt set kept in memory and on
@@ -372,6 +374,14 @@ func (s *Server) maybeCompactSecretReceiptsLocked() {
 func (s *Server) markSecretDelivered(key string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.markSecretDeliveredLocked(key)
+}
+
+// markSecretDeliveredLocked is markSecretDelivered with the caller already
+// holding s.mu, so the receipt decision can be made in the same critical
+// section that re-validates the lease at commit time. The caller must hold
+// s.mu.
+func (s *Server) markSecretDeliveredLocked(key string) (bool, error) {
 	if s.secretReceipts == nil {
 		s.secretReceipts = map[string]bool{}
 	}
@@ -403,6 +413,12 @@ func (s *Server) markSecretDelivered(key string) (bool, error) {
 func (s *Server) releaseSecretReceipt(key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.releaseSecretReceiptLocked(key)
+}
+
+// releaseSecretReceiptLocked is releaseSecretReceipt with the caller already
+// holding s.mu. The caller must hold s.mu.
+func (s *Server) releaseSecretReceiptLocked(key string) error {
 	if s.secretReceipts == nil {
 		s.secretReceipts = map[string]bool{}
 	}
@@ -463,18 +479,36 @@ func declaredSecrets(spec *pipeline.Spec, job pipeline.Job) []string {
 	return out
 }
 
+// secretNameRequestRegexp pins the secret identifier grammar at the delivery
+// boundary to the same env-safe grammar pipeline validation enforces
+// (pipeline.secretNameRegexp). A malformed name is answered 400 BEFORE any
+// store or broker work, because the broker and the claim are keyed by it.
+var secretNameRequestRegexp = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
+
 // issueSecret delivers one declared secret to the runner holding the job's
 // active lease, sealed with an ephemeral X25519 key the runner just minted.
-// The value never reaches server logs, audit records, or persistence. The
-// durable delivery receipt is server-owned and keyed by (jobID, generation,
-// secret name): in DB mode it is the SQL secret_claims row claimed through
-// storage.SecretClaimStore BEFORE the broker is resolved (claim-first), and
-// in memory mode it is the secrets-receipts.json file under dataDir. A
-// replayed delivery conflicts (409); a claim/persistence failure fails
-// closed (503/500) without ever returning an envelope. The sealed envelope
-// is bound to the delivery context via AEAD authenticated data.
+// The value never reaches server logs, audit records, or persistence.
+//
+// The handler order is deliberate:
+//
+//  1. cheap preliminary lease authentication (authorizeRunnerLease);
+//  2. the declaration allowlist and trust bit from that preliminary read;
+//  3. request-shape validation (secret-name grammar, ephemeral public key)
+//     BEFORE any store or broker work;
+//  4. broker resolution (may span seconds) and in-memory envelope sealing;
+//  5. CommitSecretIssuance — the FINAL authority: under the job's row lock (or
+//     s.mu in memory mode) it re-evaluates the whole lease predicate against
+//     the locked job and the database clock, and records the once-only claim
+//     plus the durable secret.issued audit in one unit;
+//  6. only then is the ciphertext written.
+//
+// Because the arbitration happens at commit time, a cancellation,
+// completion, expiry or lease replacement that lands during step 4 can no
+// longer be outrun: the commit refuses with a typed error mapped to 409 and
+// no envelope leaves the server. Because broker resolution unwraps OneTime as
+// pure retrieval, two concurrent requests may both retrieve the value, but
+// only one commit wins and only that one returns the envelope.
 func (s *Server) issueSecret(w http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("id")
 	var in SecretRequest
 	if !decode(w, r, &in) {
 		return
@@ -485,7 +519,8 @@ func (s *Server) issueSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Defense in depth: admission already strips secrets from untrusted
-	// pipelines, and the declared allowlist is compiled at enqueue time.
+	// pipelines, and the declared allowlist is compiled at enqueue time. The
+	// commit re-checks both against the locked job.
 	if !j.Trusted || !containsString(j.DeclaredSecrets, in.Name) {
 		http.Error(w, "secret not declared for this job", http.StatusForbidden)
 		return
@@ -494,75 +529,34 @@ func (s *Server) issueSecret(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "secret broker not configured", http.StatusServiceUnavailable)
 		return
 	}
-	receiptKey := secretReceiptKey(jobID, in.LeaseGeneration, in.Name)
-	if s.DB != nil {
-		// DB mode: the durable once-only record is the SQL claim row.
-		// Claim FIRST: exactly one of concurrent or replayed deliveries of
-		// the same (job, generation, name) wins, and only a successful
-		// durable claim can return the sealed envelope. Claim errors fail
-		// closed (503): an envelope is never delivered without a durable
-		// claim.
-		cs, ok := s.DB.(storage.SecretClaimStore)
-		if !ok {
-			http.Error(w, "secret delivery claims unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		claimed, err := cs.ClaimSecretDelivery(r.Context(), jobID, in.LeaseGeneration, in.Name)
-		if err != nil {
-			http.Error(w, "secret delivery claim failed", http.StatusServiceUnavailable)
-			return
-		}
-		if !claimed {
-			http.Error(w, "secret already delivered for this lease generation", http.StatusConflict)
-			return
-		}
-		s.deliverSecret(w, r, j, in, jobID, true)
+	// Reject malformed requests before any store or broker work: an invalid
+	// name must never select a broker lookup or touch the claim store, and an
+	// invalid ephemeral key must never trigger a resolution.
+	if !secretNameRequestRegexp.MatchString(in.Name) {
+		http.Error(w, "invalid secret name", http.StatusBadRequest)
 		return
 	}
-	// Memory mode: the receipt file under dataDir is the once-only record.
-	// A persistence failure is a server-side durability failure, not a client
-	// error: answer 503 with the fixed opaque body so the runner retries
-	// instead of the delivery being read as invalid — never log-and-continue
-	// for delivery state. A post-rename failure retains the published receipt
-	// (see markSecretDelivered), so a same-directory persist reconciles it.
-	claimed, err := s.markSecretDelivered(receiptKey)
-	if err != nil {
-		s.serverError(w, r, http.StatusServiceUnavailable, err, "state not durable")
+	pubRaw, err := base64.StdEncoding.DecodeString(in.EphemeralPublic)
+	if err != nil || len(pubRaw) != 32 {
+		http.Error(w, "invalid ephemeral_public: want base64-encoded 32 bytes", http.StatusBadRequest)
 		return
 	}
-	if !claimed {
-		http.Error(w, "secret already delivered for this lease generation", http.StatusConflict)
-		return
-	}
-	s.deliverSecret(w, r, j, in, jobID, false)
+	s.deliverSecret(w, r, j, in, pubRaw)
 }
 
 // deliverSecret resolves the broker, seals the value for the runner's
-// ephemeral key, and writes the response for an already-claimed delivery.
-// Any post-claim failure releases the claim (SQL row or memory receipt) so
-// a failed resolution never consumes the once-only delivery. The release
-// is a compensation that must outlive the request: it runs on its own
-// short-lived context, because a client disconnect cancels r.Context() and
-// must never strand a consumed claim.
-func (s *Server) deliverSecret(w http.ResponseWriter, r *http.Request, j model.Job, in SecretRequest, jobID string, dbClaimed bool) {
-	release := func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		if dbClaimed {
-			if rel, ok := s.DB.(storage.SecretClaimReleaser); ok {
-				if err := rel.ReleaseSecretDelivery(ctx, jobID, in.LeaseGeneration, in.Name); err != nil {
-					s.logError("secret delivery: claim release failed", "error", err.Error())
-				}
-			}
-			return
-		}
-		if err := s.releaseSecretReceipt(secretReceiptKey(jobID, in.LeaseGeneration, in.Name)); err != nil {
-			s.logError("secret receipts: release persist failed", "error", err.Error())
-		}
+// ephemeral key, crosses the commit-time issuance authority and only then
+// writes the response. The sealed envelope is kept in memory until the commit
+// succeeds; a refusal or a commit failure returns no envelope at all.
+func (s *Server) deliverSecret(w http.ResponseWriter, r *http.Request, j model.Job, in SecretRequest, pubRaw []byte) {
+	if len(pubRaw) != 32 {
+		// Defense in depth for direct callers: issueSecret already validated
+		// the encoded key before any broker work.
+		http.Error(w, "invalid ephemeral_public: want base64-encoded 32 bytes", http.StatusBadRequest)
+		return
 	}
 	value, err := s.resolveBroker(r, in.Name, secretbroker.SecretScope{Repository: j.RepoURL, Environment: j.Environment, Trusted: j.Trusted})
 	if err != nil {
-		release()
 		if errors.Is(err, secretbroker.ErrAlreadyDelivered) {
 			http.Error(w, "secret already delivered", http.StatusConflict)
 			return
@@ -570,29 +564,147 @@ func (s *Server) deliverSecret(w http.ResponseWriter, r *http.Request, j model.J
 		http.Error(w, "secret resolution failed", http.StatusInternalServerError)
 		return
 	}
-	pubRaw, err := base64.StdEncoding.DecodeString(in.EphemeralPublic)
-	if err != nil || len(pubRaw) != 32 {
-		release()
-		http.Error(w, "invalid ephemeral_public: want base64-encoded 32 bytes", http.StatusBadRequest)
-		return
-	}
 	var pub [32]byte
 	copy(pub[:], pubRaw)
-	aad := secretAAD(in.RunnerID, jobID, in.LeaseGeneration, in.Name)
+	aad := secretAAD(in.RunnerID, j.ID, in.LeaseGeneration, in.Name)
 	enc, err := secretbroker.SealEnvelope([]byte(value), pub, aad)
 	if err != nil {
-		release()
 		http.Error(w, "sealing secret failed", http.StatusInternalServerError)
 		return
 	}
-	// The audit trail records the secret name only, never the value.
-	s.auditLocked("secret.issued", in.RunnerID, j.RunID, j.ID, "secret delivered", map[string]string{"secret": in.Name, "generation": strconv.FormatInt(in.LeaseGeneration, 10)})
+	// FINAL AUTHORITY. The preliminary read authorized the request cheaply,
+	// but broker resolution and sealing can span seconds, and a concurrent
+	// cancel/complete/expiry/replacement could land in that window. The
+	// commit re-evaluates the entire predicate against the authoritative job
+	// and records the once-only claim plus the durable audit atomically
+	// (PostgreSQL: row locked FOR UPDATE; memory/fs: s.mu held). The sealed
+	// envelope is discarded on any refusal.
+	req := storage.SecretIssuance{
+		JobID:           j.ID,
+		RunnerID:        in.RunnerID,
+		LeaseGeneration: in.LeaseGeneration,
+		LeaseTokenHash:  j.LeaseTokenHash,
+		SecretName:      in.Name,
+		IssuedAt:        time.Now().UTC(),
+	}
+	if err := s.commitSecretIssuance(r.Context(), req); err != nil {
+		s.secretIssuanceRefusal(w, r, err)
+		return
+	}
 	s.metricAdd("kiwi_secret_deliveries_total", 1, nil)
-	generation := j.LeaseGeneration
 	writeJSON(w, http.StatusOK, SecretResponse{
 		Ciphertext:      base64.StdEncoding.EncodeToString(enc.Ciphertext),
 		EphemeralPublic: base64.StdEncoding.EncodeToString(enc.EphemeralPublic),
 		Nonce:           base64.StdEncoding.EncodeToString(enc.Nonce),
-		LeaseGeneration: generation,
+		LeaseGeneration: in.LeaseGeneration,
 	})
+}
+
+// errSecretIssuanceStoreUnsupported reports a DB-mode store that cannot commit
+// deliveries transactionally. It is a wiring failure (the startup capability
+// check refuses such a store) and is answered 503, never by delivering without
+// the lease-fenced claim and audit.
+var errSecretIssuanceStoreUnsupported = errors.New("server: database store lacks SecretIssuanceStore")
+
+// errSecretIssuanceReceipt marks a failure to durably record the once-only
+// delivery receipt in memory/fs mode. The handler answers 503 and no envelope
+// is returned: a delivery whose receipt is not durable is refused.
+var errSecretIssuanceReceipt = errors.New("secret issuance receipt not durable")
+
+// errSecretIssuanceAudit marks a failure to durably append the secret.issued
+// audit event on the in-process (memory/fs) commit path. The handler answers
+// 500 and the envelope is never returned.
+var errSecretIssuanceAudit = errors.New("secret issuance audit failed")
+
+// commitSecretIssuance runs the commit-time delivery authority for the
+// server's storage mode: DB mode delegates to the store's transactional
+// CommitSecretIssuance, while memory/fs mode executes the identical predicate,
+// once-only receipt and durable audit append under s.mu.
+func (s *Server) commitSecretIssuance(ctx context.Context, req storage.SecretIssuance) error {
+	if s.DB != nil {
+		store, ok := s.DB.(storage.SecretIssuanceStore)
+		if !ok {
+			return errSecretIssuanceStoreUnsupported
+		}
+		return store.CommitSecretIssuance(ctx, req)
+	}
+	return s.commitSecretIssuanceLocked(req)
+}
+
+// commitSecretIssuanceLocked is the memory/fs-mode delivery authority. The
+// authoritative job, the predicate, the once-only receipt and the durable
+// audit append all happen inside ONE s.mu critical section, so a concurrent
+// server mutation (cancel/complete/revoke/re-lease) can never interleave
+// between the check and the delivery record. The receipt is written first so
+// a returned envelope always has a durable claim; if the audit append then
+// fails the receipt is released again (best effort) so a failed delivery does
+// not consume it. A store without an audit sink (pure in-memory dev mode) has
+// no durable trail to require; every store-backed mode appends the event and
+// fails the delivery closed when the append fails.
+func (s *Server) commitSecretIssuanceLocked(req storage.SecretIssuance) error {
+	if err := storage.ValidateSecretIssuanceRequest(req); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j, ok := s.jobs[req.JobID]
+	if !ok {
+		return storage.ErrNotFound
+	}
+	if err := storage.ValidateSecretIssuance(storage.LockedSecretLeaseForJob(j), req, time.Now().UTC()); err != nil {
+		return err
+	}
+	key := secretReceiptKey(req.JobID, req.LeaseGeneration, req.SecretName)
+	claimed, err := s.markSecretDeliveredLocked(key)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errSecretIssuanceReceipt, err)
+	}
+	if !claimed {
+		return fmt.Errorf("%w: job %s generation %d secret %q", storage.ErrSecretIssuanceDuplicate, req.JobID, req.LeaseGeneration, req.SecretName)
+	}
+	if s.store != nil {
+		auditID, err := newID()
+		if err == nil {
+			err = s.store.AppendAudit(storage.SecretIssuanceAuditEvent(req, j.RunID, auditID))
+		}
+		if err != nil {
+			if relErr := s.releaseSecretReceiptLocked(key); relErr != nil {
+				s.logError("secret issuance: receipt release failed after audit failure", "error", relErr.Error())
+			}
+			return fmt.Errorf("%w: %v", errSecretIssuanceAudit, err)
+		}
+	}
+	return nil
+}
+
+// secretIssuanceRefusal maps a commit-time delivery refusal onto its HTTP
+// response: a vanished job is 404; every lease/declaration refusal and the
+// once-only duplicate is 409 (the same semantics as a stale lease at request
+// start); an unsupported store or an undurable receipt is 503; an audit
+// failure is 500. Anything else fails closed (503) — never an envelope.
+func (s *Server) secretIssuanceRefusal(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, storage.ErrNotFound):
+		http.NotFound(w, r)
+	case errors.Is(err, storage.ErrSecretIssuanceDuplicate):
+		http.Error(w, "secret already delivered for this lease generation", http.StatusConflict)
+	case errors.Is(err, storage.ErrSecretIssuanceRevoked),
+		errors.Is(err, storage.ErrSecretIssuanceRunner),
+		errors.Is(err, storage.ErrSecretIssuanceGeneration),
+		errors.Is(err, storage.ErrSecretIssuanceToken),
+		errors.Is(err, storage.ErrSecretIssuanceExpired),
+		errors.Is(err, storage.ErrSecretIssuanceUntrusted),
+		errors.Is(err, storage.ErrSecretIssuanceNotDeclared):
+		http.Error(w, "job lease is not active", http.StatusConflict)
+	case errors.Is(err, storage.ErrSecretIssuanceInvalid):
+		http.Error(w, "invalid secret issuance request", http.StatusBadRequest)
+	case errors.Is(err, errSecretIssuanceStoreUnsupported):
+		s.serverError(w, r, http.StatusServiceUnavailable, err, "secret delivery store unavailable")
+	case errors.Is(err, errSecretIssuanceReceipt):
+		s.serverError(w, r, http.StatusServiceUnavailable, err, "state not durable")
+	case errors.Is(err, errSecretIssuanceAudit):
+		s.internalError(w, r, err, "secret delivery audit failed")
+	default:
+		s.serverError(w, r, http.StatusServiceUnavailable, err, "secret delivery not durable")
+	}
 }

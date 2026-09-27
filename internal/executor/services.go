@@ -371,8 +371,11 @@ func startContainerServices(ctx context.Context, runID, jobID string, services [
 	}
 	network := serviceNetworkName(runID, jobID)
 	createArgs := append(serviceNetworkArgs(isolated), "--label", "kiwi.run="+runID, network)
-	if out, err := exec.CommandContext(ctx, docker, append([]string{"network"}, createArgs...)...).CombinedOutput(); err != nil {
-		return "", func() {}, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("create services network: %v: %s", err, strings.TrimSpace(string(out)))}
+	// Network creation is a quick control-plane mutation: bounded by the
+	// control ceiling (min with the job context), so a wedged daemon cannot
+	// stall an unbounded job.
+	if out, err := phaseCommand(ctx, runtimeControlTimeout, docker, append([]string{"network"}, createArgs...)...); err != nil {
+		return "", func() {}, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("create services network: %w: %s", err, strings.TrimSpace(string(out)))}
 	}
 	containers := make([]string, 0, len(services))
 	cleanup := func() {
@@ -418,10 +421,12 @@ func startContainerServices(ctx context.Context, runID, jobID string, services [
 		}
 		// "--" terminates docker's flag parsing before the image reference,
 		// so a flag-shaped reference can never be injected as an option.
+		// Starting a service pulls its image and is legitimately slow: it
+		// runs under the 10m setup ceiling (min with the job context).
 		args = append(args, "--", svc.Image)
-		if out, err := exec.CommandContext(ctx, docker, args...).CombinedOutput(); err != nil {
+		if out, err := phaseCommand(ctx, runtimeSetupTimeout, docker, args...); err != nil {
 			cleanupAll()
-			return "", func() {}, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("start service %q: %v: %s", display, err, strings.TrimSpace(string(out)))}
+			return "", func() {}, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("start service %q: %w: %s", display, err, strings.TrimSpace(string(out)))}
 		}
 		containers = append(containers, name)
 		emit("service " + display + " started (" + svc.Image + ")")

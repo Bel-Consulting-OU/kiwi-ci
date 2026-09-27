@@ -1602,7 +1602,11 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 	// The snapshot is the fallback scheduling view for an unlinked runner;
 	// reading the whole payload is what lets the claim enforce the SAME
 	// snapshot labels/capabilities/region/repository ACL the in-memory claim
-	// enforces instead of skipping them when no profile is linked.
+	// enforces instead of skipping them when no profile is linked. The
+	// payload carries the registration's reported_capabilities claim and
+	// capabilities_enforced marker, so the live resolution below recomputes
+	// the intersection from the SAME inputs the in-memory snapshot holds and
+	// SQL and memory can never disagree on the effective capability set.
 	var (
 		runnerPayload  []byte
 		runnerCapacity int

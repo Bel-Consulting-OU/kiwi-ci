@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -25,10 +26,11 @@ var attachChildSupervision = superviseChildNow
 var nativeWait = func(cmd *exec.Cmd) error { return cmd.Wait() }
 
 // reapDetached is a test-only seam over the detached drain started when
-// SIGKILL could not reap the process: production spawns a goroutine that
-// consumes the wait result whenever the process is finally reaped, so the
-// reaper goroutine never blocks forever on the channel send and no zombie is
-// left behind. Tests substitute a recorder to prove the drain happens.
+// SIGKILL could not reap the process (native command cancellation and
+// waitKilledCommand, see gc.go): production spawns a goroutine that consumes
+// the wait result whenever the process is finally reaped, so the reaper
+// goroutine never blocks forever on the channel send and no zombie is left
+// behind. Tests substitute a recorder to prove the drain happens.
 var reapDetached = func(wait <-chan error) {
 	go func() { <-wait }()
 }
@@ -164,9 +166,18 @@ func (*NativeBackend) Run(ctx context.Context, c Command, emit func(string)) err
 	if err != nil {
 		_ = stdoutR.Close()
 		_ = stderrR.Close()
+		// The child is unsupervised, so it must not run: terminate the tree,
+		// force-kill it, and reap it through the same bounded primitive the
+		// tart backend uses. cmd.Wait (never Process.Wait) keeps exec.Cmd
+		// bookkeeping consistent, and the reap cannot outlive killGrace even
+		// when the process cannot be reaped.
 		_ = terminateProcess(cmd)
-		_ = cmd.Wait()
-		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("attach child process supervision: %w", err)}
+		_ = killProcess(cmd)
+		baseErr := fmt.Errorf("attach child process supervision: %w", err)
+		if reapErr := reapKilledCommand(cmd, killGrace); reapErr != nil {
+			return &RunError{Kind: ErrorInfra, Err: errors.Join(baseErr, fmt.Errorf("terminate unsupervised child: %w", reapErr))}
+		}
+		return &RunError{Kind: ErrorInfra, Err: baseErr}
 	}
 	done := make(chan struct{}, 2)
 	go func() { defer func() { done <- struct{}{} }(); streamLines(stdoutR, defaultMaxLine, emit) }()

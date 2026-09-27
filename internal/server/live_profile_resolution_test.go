@@ -133,9 +133,9 @@ func TestMemoryLiveRunnerCertPrecedence(t *testing.T) {
 // profile edit changes the persisted reason.
 func TestMemoryQueueReasonUsesRunnerIDBinding(t *testing.T) {
 	s := adminProfileServer(t)
-	createProfile(t, s, model.RunnerProfile{ID: "p", Labels: []string{"bound"}, MaxCapacity: 1})
+	createProfile(t, s, model.RunnerProfile{ID: "p", Labels: []string{"bound"}, Capabilities: []string{"native"}, MaxCapacity: 1})
 	bindRunnerProfile(t, s, "p", "runner-a", "admin-tok")
-	ri := model.Runner{ID: "runner-a", Capacity: 1, Labels: []string{"snapshot"}}
+	ri := model.Runner{ID: "runner-a", Capacity: 1, Labels: []string{"snapshot"}, ReportedCapabilities: []string{"native"}}
 	seedLiveRunner(t, s, ri)
 	s.mu.Lock()
 	s.jobs["job-q"] = model.Job{ID: "job-q", RunID: "run-q", Key: "build", Status: model.StatusQueued, RequiredLabels: []string{"bound"}, RepoID: "github.com/o/r"}
@@ -151,7 +151,7 @@ func TestMemoryQueueReasonUsesRunnerIDBinding(t *testing.T) {
 
 	// Edit the profile away from the required label: the explainer reports
 	// the incompatibility on the next pass.
-	createProfile(t, s, model.RunnerProfile{ID: "p", Labels: []string{"edited"}, MaxCapacity: 1})
+	createProfile(t, s, model.RunnerProfile{ID: "p", Labels: []string{"edited"}, Capabilities: []string{"native"}, MaxCapacity: 1})
 	s.mu.Lock()
 	s.applyQueueReasonsMemoryLocked(ri)
 	reason = s.jobs["job-q"].QueueReason
@@ -168,9 +168,9 @@ func TestDBExplainUsesRunnerIDBinding(t *testing.T) {
 	ctx := context.Background()
 	s, f, _, _ := cacheFixture(t)
 	f.mu.Lock()
-	f.profiles["p"] = model.RunnerProfile{ID: "p", Labels: []string{"bound"}, MaxCapacity: 1}
+	f.profiles["p"] = model.RunnerProfile{ID: "p", Labels: []string{"bound"}, Capabilities: []string{"native"}, MaxCapacity: 1}
 	f.runnerProfiles["runner-a"] = "p"
-	f.runners["runner-a"] = model.Runner{ID: "runner-a", Name: "runner-a", Capacity: 1, Labels: []string{"snapshot"}}
+	f.runners["runner-a"] = model.Runner{ID: "runner-a", Name: "runner-a", Capacity: 1, Labels: []string{"snapshot"}, ReportedCapabilities: []string{"native"}}
 	f.jobs["job-q"] = model.Job{ID: "job-q", RunID: "run-q", Key: "build", Status: model.StatusQueued, RepoURL: "https://github.com/o/repo-a.git", RepoFullName: "o/repo-a", RequiredLabels: []string{"bound"}}
 	f.mu.Unlock()
 
@@ -189,7 +189,7 @@ func TestDBExplainUsesRunnerIDBinding(t *testing.T) {
 
 	// Profile edit: the explainer sees the new labels on the next pass.
 	f.mu.Lock()
-	f.profiles["p"] = model.RunnerProfile{ID: "p", Labels: []string{"edited"}, MaxCapacity: 1}
+	f.profiles["p"] = model.RunnerProfile{ID: "p", Labels: []string{"edited"}, Capabilities: []string{"native"}, MaxCapacity: 1}
 	f.mu.Unlock()
 	s.applyQueueReasonsDB(ctx, ri)
 	if got := f.queueReason("job-q"); got != string(queue.NoCompatibleRunner) {

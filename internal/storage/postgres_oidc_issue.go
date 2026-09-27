@@ -15,17 +15,23 @@ import (
 )
 
 // OIDCIssuance is one candidate job id_token issuance: the credentials and
-// coordinates the handler AUTHENTICATED from its preliminary read and the
-// candidate JWT it already signed. It is the request of the commit-time
-// authority (LeaseOIDCIssueStore.CommitOIDCIssuance): the store re-evaluates
-// the whole issuance predicate against the LOCKED job — status, lease
-// holder/generation/token hash, lease expiry, trust, id_token permission and
-// the audience allowlist — and cross-checks the candidate claims against the
-// locked identity before it appends the oidc.issued audit row and commits.
+// coordinates the handler AUTHENTICATED from its preliminary read, plus the
+// only values a candidate may choose — the requested audience, the generated
+// JTI, the signer KID and the intended lifetime. It is the request of the
+// commit-time authority (LeaseOIDCIssueStore.CommitOIDCIssuance): the store
+// re-evaluates the whole issuance predicate against the LOCKED job at its own
+// commit clock — status, lease holder/generation/token hash, lease and token
+// lifetime expiry, trust, id_token permission and the audience allowlist —
+// and cross-checks the candidate claims against the locked identity before it
+// appends the oidc.issued audit row and commits.
 //
-// Claims carries the identity-bearing JWT claims as strings (see the
-// OIDCClaim* keys) so the commit can prove the signed token describes the
-// LOCKED job, not the possibly stale record the handler read.
+// Claims carries the identity-bearing claims the handler AUTHENTICATED as its
+// preliminary identity (see the OIDCClaim* keys). They are ASSERTIONS, never
+// token input: the commit proves every one of them equals the LOCKED row and
+// refuses on any mismatch; the JWT that is finally returned is built from the
+// locked identity the commit returns (LockedOIDCIdentity.AuthoritativeIdentity
+// / OIDCAuthoritativeIdentity.TokenClaims), so no identity claim can ever
+// reach the token from the stale preliminary object.
 type OIDCIssuance struct {
 	JobID           string
 	RunnerID        string
@@ -48,6 +54,10 @@ const (
 	OIDCClaimJob          = "job"
 	OIDCClaimRepository   = "repository"
 	OIDCClaimRepositoryID = "repository_id"
+	OIDCClaimRef          = "ref"
+	OIDCClaimSHA          = "sha"
+	OIDCClaimEvent        = "event"
+	OIDCClaimEnvironment  = "environment"
 	OIDCClaimTrusted      = "trusted"
 	OIDCClaimAudience     = "aud"
 )
@@ -64,9 +74,17 @@ type LockedOIDCIdentity struct {
 	// PolicyRepoID/RepoURL/RepoFullName are the raw locked repository fields
 	// the identity was resolved from; RepoFullName is the human-readable
 	// claim value.
-	PolicyRepoID     string
-	RepoURL          string
-	RepoFullName     string
+	PolicyRepoID string
+	RepoURL      string
+	RepoFullName string
+	// Ref/SHA/Event/Environment come from the locked job's own compiled
+	// payload (the enqueue-time copy of the run coordinates), so the
+	// corresponding JWT claims can never describe a different revision than
+	// the locked job row.
+	Ref              string
+	SHA              string
+	Event            string
+	Environment      string
 	Trusted          bool
 	OIDCAllowed      bool
 	AllowedAudiences []string
@@ -75,6 +93,75 @@ type LockedOIDCIdentity struct {
 	LeaseGeneration  int64
 	LeaseTokenHash   []byte
 	LeaseExpiresAt   time.Time
+}
+
+// OIDCAuthoritativeIdentity is the canonical identity-bearing claim set of an
+// issued job id_token, derived exclusively from the locked job row. Every
+// identity claim the token carries comes from here; a candidate may influence
+// only the issuer, audience, JTI, signer KID and lifetime. The subject is the
+// canonical repo:<RepoID>:ref:<Ref>:job:<JobKey> coordinate.
+type OIDCAuthoritativeIdentity struct {
+	Subject      string
+	Repository   string
+	RepositoryID string
+	Ref          string
+	SHA          string
+	Event        string
+	RunID        string
+	JobID        string
+	JobKey       string
+	Environment  string
+	Trusted      bool
+}
+
+// AuthoritativeIdentity projects the locked row onto the canonical identity
+// claim set the returned JWT must describe. It is the ONLY source the server
+// builds token claims from, so a stale preliminary read cannot leak a single
+// identity claim into a credential.
+func (l LockedOIDCIdentity) AuthoritativeIdentity() OIDCAuthoritativeIdentity {
+	return OIDCAuthoritativeIdentity{
+		Subject:      "repo:" + l.RepoID + ":ref:" + l.Ref + ":job:" + l.JobKey,
+		Repository:   l.RepoFullName,
+		RepositoryID: l.RepoID,
+		Ref:          l.Ref,
+		SHA:          l.SHA,
+		Event:        l.Event,
+		RunID:        l.RunID,
+		JobID:        l.JobID,
+		JobKey:       l.JobKey,
+		Environment:  l.Environment,
+		Trusted:      l.Trusted,
+	}
+}
+
+// oidcClockSkew is the nbf backdate issued tokens carry so a verifier whose
+// clock trails the issuing server's by a few seconds still accepts them.
+const oidcClockSkew = 5 * time.Second
+
+// TokenClaims builds the complete JWT claim set for this identity plus the
+// caller-chosen issuer, audience, JTI and lifetime. issuedAt/expiresAt are the
+// intended lifetime the candidate supplied; every OTHER claim is derived from
+// the locked identity.
+func (a OIDCAuthoritativeIdentity) TokenClaims(issuer, audience, jti string, issuedAt, expiresAt time.Time) map[string]any {
+	return map[string]any{
+		"iss":           issuer,
+		"sub":           a.Subject,
+		"aud":           audience,
+		"iat":           issuedAt.Unix(),
+		"nbf":           issuedAt.Add(-oidcClockSkew).Unix(),
+		"exp":           expiresAt.Unix(),
+		"jti":           jti,
+		"repository":    a.Repository,
+		"repository_id": a.RepositoryID,
+		"ref":           a.Ref,
+		"sha":           a.SHA,
+		"event":         a.Event,
+		"run_id":        a.RunID,
+		"job_id":        a.JobID,
+		"job":           a.JobKey,
+		"environment":   a.Environment,
+		"trusted":       a.Trusted,
+	}
 }
 
 // Typed commit-time refusals. The handler maps them onto HTTP statuses:
@@ -195,6 +282,10 @@ func LockedOIDCIdentityForJob(j model.Job) LockedOIDCIdentity {
 		PolicyRepoID:     j.PolicyRepoID,
 		RepoURL:          j.RepoURL,
 		RepoFullName:     j.RepoFullName,
+		Ref:              j.Ref,
+		SHA:              j.SHA,
+		Event:            j.Event,
+		Environment:      j.Environment,
 		Trusted:          j.Trusted,
 		OIDCAllowed:      j.OIDCAllowed,
 		AllowedAudiences: append([]string(nil), j.OIDCAudiences...),
@@ -206,13 +297,30 @@ func LockedOIDCIdentityForJob(j model.Job) LockedOIDCIdentity {
 	}
 }
 
-// ValidateOIDCIssuance is the ONE issuance predicate: it evaluates the locked
-// identity against the candidate request and returns the typed refusal the
-// handler maps onto 409/403. It also cross-checks every identity-bearing
-// claim against the locked row, so a JWT signed for one job can never be
-// returned for another. PostgreSQL (row-locked), memStore and the server's
-// in-process commit path all call it, so the three can never drift.
+// ValidateOIDCIssuance evaluates the issuance predicate against the
+// candidate's own IssuedAt as the clock. It exists only for callers that hold
+// no storage commit clock (unit tests and diagnostics): every issuance COMMIT
+// must call ValidateOIDCIssuanceAt with the storage clock, otherwise the
+// stale-clock window reopens — a lease (or the requested token lifetime) that
+// expires during signer/key-store work would still pass.
 func ValidateOIDCIssuance(locked LockedOIDCIdentity, req OIDCIssuance) error {
+	return ValidateOIDCIssuanceAt(locked, req, req.IssuedAt)
+}
+
+// ValidateOIDCIssuanceAt is the ONE issuance predicate: it evaluates the
+// locked identity against the candidate request AT THE STORAGE COMMIT CLOCK
+// and returns the typed refusal the handler maps onto 409/403. commitNow must
+// come from the same clock domain that persisted the lease expiry (PostgreSQL:
+// clock_timestamp() read in the locking transaction; memory/fs: time.Now()
+// under the store lock), so no application/DB skew can launder an expired
+// lease. Both the lease expiry and the requested token lifetime are checked
+// against commitNow, not against the handler-captured IssuedAt.
+//
+// It also cross-checks every identity-bearing claim against the locked row, so
+// a JWT built for one revision/job can never be returned for another.
+// PostgreSQL (row-locked), memStore and the server's in-process commit path
+// all call it, so the three can never drift.
+func ValidateOIDCIssuanceAt(locked LockedOIDCIdentity, req OIDCIssuance, commitNow time.Time) error {
 	switch {
 	case locked.Status != model.StatusRunning:
 		return oidcIssuanceErrorf(ErrOIDCIssuanceRevoked, "job %s status %q", req.JobID, locked.Status)
@@ -222,8 +330,10 @@ func ValidateOIDCIssuance(locked LockedOIDCIdentity, req OIDCIssuance) error {
 		return oidcIssuanceErrorf(ErrOIDCIssuanceGeneration, "job %s lease generation %d, presented %d", req.JobID, locked.LeaseGeneration, req.LeaseGeneration)
 	case subtle.ConstantTimeCompare(locked.LeaseTokenHash, req.LeaseTokenHash) != 1:
 		return oidcIssuanceErrorf(ErrOIDCIssuanceToken, "job %s lease token mismatch", req.JobID)
-	case locked.LeaseExpiresAt.IsZero() || !locked.LeaseExpiresAt.After(req.IssuedAt):
-		return oidcIssuanceErrorf(ErrOIDCIssuanceExpired, "job %s lease expired at %s", req.JobID, locked.LeaseExpiresAt.UTC().Format(time.RFC3339Nano))
+	case locked.LeaseExpiresAt.IsZero() || !locked.LeaseExpiresAt.After(commitNow):
+		return oidcIssuanceErrorf(ErrOIDCIssuanceExpired, "job %s lease expired at %s (commit %s)", req.JobID, locked.LeaseExpiresAt.UTC().Format(time.RFC3339Nano), commitNow.UTC().Format(time.RFC3339Nano))
+	case req.ExpiresAt.IsZero() || !req.ExpiresAt.After(commitNow):
+		return oidcIssuanceErrorf(ErrOIDCIssuanceExpired, "job %s requested token lifetime expired at %s (commit %s)", req.JobID, req.ExpiresAt.UTC().Format(time.RFC3339Nano), commitNow.UTC().Format(time.RFC3339Nano))
 	case !locked.Trusted:
 		return oidcIssuanceErrorf(ErrOIDCIssuanceUntrusted, "job %s", req.JobID)
 	case !locked.OIDCAllowed:
@@ -231,9 +341,10 @@ func ValidateOIDCIssuance(locked LockedOIDCIdentity, req OIDCIssuance) error {
 	case len(locked.AllowedAudiences) > 0 && !containsString(locked.AllowedAudiences, req.Audience):
 		return oidcIssuanceErrorf(ErrOIDCIssuanceAudience, "job %s audience %q", req.JobID, req.Audience)
 	}
-	// The claims the JWT already carries must describe the LOCKED job. A
-	// mismatch means the token in hand was built from a record that changed
-	// between the preliminary read and this commit: it must be discarded.
+	// EVERY identity-bearing claim must describe the LOCKED job. A mismatch
+	// means the candidate authenticated a record that changed between the
+	// preliminary read and this commit: the issuance is refused and no token
+	// is built.
 	claims := req.Claims
 	for _, c := range []struct {
 		key  string
@@ -244,6 +355,10 @@ func ValidateOIDCIssuance(locked LockedOIDCIdentity, req OIDCIssuance) error {
 		{OIDCClaimJob, locked.JobKey},
 		{OIDCClaimRepositoryID, locked.RepoID},
 		{OIDCClaimRepository, locked.RepoFullName},
+		{OIDCClaimRef, locked.Ref},
+		{OIDCClaimSHA, locked.SHA},
+		{OIDCClaimEvent, locked.Event},
+		{OIDCClaimEnvironment, locked.Environment},
 		{OIDCClaimTrusted, strconv.FormatBool(locked.Trusted)},
 		{OIDCClaimAudience, req.Audience},
 	} {
@@ -273,13 +388,21 @@ func OIDCIssuanceAuditEvent(req OIDCIssuance, id string) model.AuditEvent {
 }
 
 // CommitOIDCIssuance is the PostgreSQL commit-time issuance authority. It
-// locks the job row FOR UPDATE, re-reads the authoritative lease/OIDC fields,
-// evaluates the shared predicate (so a concurrent cancel/complete/revoke/
-// replacement either commits before the lock — and fails the predicate — or
-// waits for this transaction), cross-checks the candidate claims, appends the
-// oidc.issued audit row and commits, all in one transaction. Any refusal
-// returns a typed error and rolls the transaction back: no audit row, no
-// credential.
+// locks the job row FOR UPDATE, re-reads the authoritative lease/OIDC/identity
+// fields, evaluates the shared predicate at the DATABASE commit clock
+// (clock_timestamp(), the same clock domain that persists lease_expires_at, so
+// no app/DB skew can launder an expired lease), cross-checks the candidate
+// claims, appends the oidc.issued audit row and commits, all in one
+// transaction. Any refusal returns a typed error and rolls the transaction
+// back: no audit row, no credential.
+//
+// The clock must be read ONLY after the row lock is held: a plain
+// target-list clock_timestamp() is evaluated during the scan, BEFORE
+// LockRows acquires the lock, and would therefore be stale by exactly the
+// stall this commit fences. The CTE below keeps the FOR UPDATE clause in a
+// materialized sub-plan (a CTE with a locking clause is never inlined), so the
+// outer clock_timestamp() is evaluated after the lock has been acquired —
+// verified on PostgreSQL 14.
 func (s *PostgresStore) CommitOIDCIssuance(ctx context.Context, req OIDCIssuance) (LockedOIDCIdentity, error) {
 	if err := ValidateOIDCIssuanceRequest(req); err != nil {
 		return LockedOIDCIdentity{}, err
@@ -303,17 +426,32 @@ func (s *PostgresStore) CommitOIDCIssuance(ctx context.Context, req OIDCIssuance
 		policyRepoID    string
 		repoURL         string
 		repoFullName    string
+		ref             string
+		sha             string
+		event           string
+		environment     string
+		commitNow       time.Time
 	)
-	err = tx.QueryRow(ctx, `SELECT run_id, COALESCE(key, ''),
-		COALESCE(lease_runner_id, ''), lease_generation, COALESCE(lease_token_hash, ''::bytea), lease_expires_at, status,
-		CASE WHEN jsonb_typeof(payload->'trusted') = 'boolean' THEN (payload->>'trusted')::boolean ELSE FALSE END,
-		CASE WHEN jsonb_typeof(payload->'oidc_allowed') = 'boolean' THEN (payload->>'oidc_allowed')::boolean ELSE FALSE END,
-		COALESCE(payload->'oidc_audiences', '[]'::jsonb),
-		COALESCE(payload->>'repo_id', ''), COALESCE(payload->>'policy_repo_id', ''),
-		COALESCE(payload->>'repo_url', ''), COALESCE(payload->>'repo_full_name', '')
-		FROM jobs WHERE id = $1 FOR UPDATE`, req.JobID).Scan(
+	err = tx.QueryRow(ctx, `WITH locked AS (
+		SELECT run_id, COALESCE(key, '') AS key,
+			COALESCE(lease_runner_id, '') AS lease_runner_id, lease_generation,
+			COALESCE(lease_token_hash, ''::bytea) AS lease_token_hash, lease_expires_at, status,
+			CASE WHEN jsonb_typeof(payload->'trusted') = 'boolean' THEN (payload->>'trusted')::boolean ELSE FALSE END AS trusted,
+			CASE WHEN jsonb_typeof(payload->'oidc_allowed') = 'boolean' THEN (payload->>'oidc_allowed')::boolean ELSE FALSE END AS oidc_allowed,
+			COALESCE(payload->'oidc_audiences', '[]'::jsonb) AS oidc_audiences,
+			COALESCE(payload->>'repo_id', '') AS repo_id, COALESCE(payload->>'policy_repo_id', '') AS policy_repo_id,
+			COALESCE(payload->>'repo_url', '') AS repo_url, COALESCE(payload->>'repo_full_name', '') AS repo_full_name,
+			COALESCE(payload->>'ref', '') AS ref, COALESCE(payload->>'sha', '') AS sha,
+			COALESCE(payload->>'event', '') AS event, COALESCE(payload->>'environment', '') AS environment
+		FROM jobs WHERE id = $1 FOR UPDATE
+	)
+	SELECT run_id, key, lease_runner_id, lease_generation, lease_token_hash, lease_expires_at, status,
+		trusted, oidc_allowed, oidc_audiences, repo_id, policy_repo_id, repo_url, repo_full_name,
+		ref, sha, event, environment, clock_timestamp()
+	FROM locked`, req.JobID).Scan(
 		&runID, &key, &leaseRunnerID, &leaseGeneration, &leaseTokenHash, &leaseExpiresAt, &status,
-		&trusted, &oidcAllowed, &audiencesJSON, &repoID, &policyRepoID, &repoURL, &repoFullName)
+		&trusted, &oidcAllowed, &audiencesJSON, &repoID, &policyRepoID, &repoURL, &repoFullName,
+		&ref, &sha, &event, &environment, &commitNow)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return LockedOIDCIdentity{}, ErrNotFound
 	}
@@ -328,12 +466,13 @@ func (s *PostgresStore) CommitOIDCIssuance(ctx context.Context, req OIDCIssuance
 	}
 	locked := LockedOIDCIdentityForJob(model.Job{
 		ID: req.JobID, RunID: runID, Key: key, RepoID: repoID, PolicyRepoID: policyRepoID,
-		RepoURL: repoURL, RepoFullName: repoFullName, Trusted: trusted, OIDCAllowed: oidcAllowed,
+		RepoURL: repoURL, RepoFullName: repoFullName, Ref: ref, SHA: sha, Event: event,
+		Environment: environment, Trusted: trusted, OIDCAllowed: oidcAllowed,
 		OIDCAudiences: audiences, Status: model.Status(status),
 		LeaseRunnerID: leaseRunnerID, LeaseGeneration: leaseGeneration, LeaseTokenHash: leaseTokenHash,
 		LeaseExpiresAt: leaseExpiresAt,
 	})
-	if err := ValidateOIDCIssuance(locked, req); err != nil {
+	if err := ValidateOIDCIssuanceAt(locked, req, commitNow); err != nil {
 		return LockedOIDCIdentity{}, err
 	}
 	auditID, err := newID()

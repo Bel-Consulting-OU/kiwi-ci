@@ -44,10 +44,12 @@ func limitPlusOne(limit int64) int64 {
 }
 
 // cacheUploadMaxBytes is the receiver's HTTP body cap for cache uploads: the
-// same 8 GiB safety limit the artifact path enforces. It is a variable so
-// tests can exercise the boundary with small bodies; production leaves it at
-// maxBlobBytes.
-var cacheUploadMaxBytes = maxBlobBytes
+// ONE authoritative cache-archive bound (cache.MaxArchiveBytes), shared with
+// the runner-side cache client and the local Store so every layer accepts the
+// same compressed range and an accepted save can always be restored through
+// Kiwi's own client. It is a variable so tests can exercise the boundary with
+// small bodies; production leaves it at cache.MaxArchiveBytes.
+var cacheUploadMaxBytes = cache.MaxArchiveBytes
 
 // cacheStageHook, when non-nil, runs with the staged file path and the
 // reserved byte amount immediately after the body is fully staged (inside

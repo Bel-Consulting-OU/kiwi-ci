@@ -573,7 +573,7 @@ func TestPostgresIntegrationLinkedProfileLease(t *testing.T) {
 	if err := st.BindCertProfile(ctx, "serial-1", profileID); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
-	if err := st.UpsertRunner(ctx, model.Runner{ID: runnerID, Capacity: 9, CertSerial: "serial-1"}); err != nil {
+	if err := st.UpsertRunner(ctx, model.Runner{ID: runnerID, Capacity: 9, CertSerial: "serial-1", ReportedCapabilities: []string{"native", "container"}}); err != nil {
 		t.Fatalf("runner: %v", err)
 	}
 	_, err := st.AcquireLeaseAtomic(ctx, LeaseClaim{JobID: jobID, RunnerID: runnerID, CanonRepoID: pgITRepoID, RequiredLabels: []string{"linux"}})
@@ -631,7 +631,7 @@ func TestPostgresIntegrationLinkedProfileLease(t *testing.T) {
 		t.Fatalf("bind dangling: %v", err)
 	}
 	danglingRunner := pgITNewID(t)
-	if err := st.UpsertRunner(ctx, model.Runner{ID: danglingRunner, Capacity: 2, CertSerial: "serial-2"}); err != nil {
+	if err := st.UpsertRunner(ctx, model.Runner{ID: danglingRunner, Capacity: 2, CertSerial: "serial-2", ReportedCapabilities: []string{"native"}}); err != nil {
 		t.Fatalf("dangling runner: %v", err)
 	}
 	if _, err := st.AcquireLeaseAtomic(ctx, LeaseClaim{JobID: elseJob, RunnerID: danglingRunner}); !errors.Is(err, ErrNoCapacity) {

@@ -26,10 +26,10 @@ func TestIntegrationLeaseRunnerIDProfilePrefilterPostgres(t *testing.T) {
 	ctx := context.Background()
 	runnerID := pgITSchedID(t)
 	profileID := "sched-live-" + pgITSchedRandomHex(t, 6)
-	if err := st.UpsertRunner(ctx, model.Runner{ID: runnerID, Name: runnerID, Capacity: 9, Labels: []string{"snapshot"}, CostPerHour: 9}); err != nil {
+	if err := st.UpsertRunner(ctx, model.Runner{ID: runnerID, Name: runnerID, Capacity: 9, Labels: []string{"snapshot"}, ReportedCapabilities: []string{"native"}, CostPerHour: 9}); err != nil {
 		t.Fatalf("upsert runner: %v", err)
 	}
-	if err := st.UpsertProfile(ctx, model.RunnerProfile{ID: profileID, Labels: []string{"bound"}, MaxCapacity: 0, CostPerHour: 3.5}); err != nil {
+	if err := st.UpsertProfile(ctx, model.RunnerProfile{ID: profileID, Labels: []string{"bound"}, Capabilities: []string{"native"}, MaxCapacity: 0, CostPerHour: 3.5}); err != nil {
 		t.Fatalf("upsert profile: %v", err)
 	}
 	if err := st.LinkRunnerProfile(ctx, runnerID, profileID); err != nil {
@@ -51,7 +51,7 @@ func TestIntegrationLeaseRunnerIDProfilePrefilterPostgres(t *testing.T) {
 
 	// Edit the profile: the NEXT lease honors capacity and rates without any
 	// re-registration.
-	if err := st.UpsertProfile(ctx, model.RunnerProfile{ID: profileID, Labels: []string{"bound"}, MaxCapacity: 3, CostPerHour: 4.5}); err != nil {
+	if err := st.UpsertProfile(ctx, model.RunnerProfile{ID: profileID, Labels: []string{"bound"}, Capabilities: []string{"native"}, MaxCapacity: 3, CostPerHour: 4.5}); err != nil {
 		t.Fatalf("edit profile: %v", err)
 	}
 	leased, _, _, err := sched.Lease(ctx, runnerID, time.Now().UTC())
@@ -88,7 +88,7 @@ func TestIntegrationLeaseRunnerIDProfilePrefilterPostgres(t *testing.T) {
 	// lease closed even while the runner-ID binding is live.
 	certRunner := pgITSchedID(t)
 	certSerial := "sched-dangling-" + pgITSchedRandomHex(t, 6)
-	if err := st.UpsertRunner(ctx, model.Runner{ID: certRunner, Name: certRunner, Capacity: 4, Labels: []string{"snapshot"}, CertSerial: certSerial}); err != nil {
+	if err := st.UpsertRunner(ctx, model.Runner{ID: certRunner, Name: certRunner, Capacity: 4, Labels: []string{"snapshot"}, CertSerial: certSerial, ReportedCapabilities: []string{"native"}}); err != nil {
 		t.Fatalf("upsert cert runner: %v", err)
 	}
 	if err := st.BindCertProfile(ctx, certSerial, "ghost-"+pgITSchedRandomHex(t, 8)); err != nil {

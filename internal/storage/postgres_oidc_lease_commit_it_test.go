@@ -28,6 +28,12 @@ func oidcITLeasedJob(t *testing.T, st *PostgresStore) (runID, jobID, runnerID st
 	job.Trusted = true
 	job.OIDCAllowed = true
 	job.OIDCAudiences = []string{oidcITAudience}
+	// Production-shaped compiled run coordinates: the locked job payload
+	// carries them and the issued token must describe them.
+	job.Ref = "refs/heads/main"
+	job.SHA = "abc123def456"
+	job.Event = "push"
+	job.Environment = "production"
 	req := InsertCompiledRunRequest{
 		Run:  model.Run{ID: runID, Repo: pgITRepo, Status: model.StatusQueued, CreatedAt: time.Now().UTC()},
 		Jobs: map[string]model.Job{jobID: job},
@@ -56,6 +62,10 @@ func oidcITRequest(j model.Job, audience string) OIDCIssuance {
 			OIDCClaimJob:          j.Key,
 			OIDCClaimRepositoryID: RepoIDForJob(j),
 			OIDCClaimRepository:   j.RepoFullName,
+			OIDCClaimRef:          j.Ref,
+			OIDCClaimSHA:          j.SHA,
+			OIDCClaimEvent:        j.Event,
+			OIDCClaimEnvironment:  j.Environment,
 			OIDCClaimTrusted:      "true",
 			OIDCClaimAudience:     audience,
 		},
@@ -92,6 +102,29 @@ func TestIntegrationOIDCIssuanceCommitLive(t *testing.T) {
 	}
 	if locked.LeaseRunnerID != runnerID || locked.LeaseGeneration != j.LeaseGeneration {
 		t.Fatalf("locked lease = %+v", locked)
+	}
+	// Every identity-bearing field of the locked identity describes the row,
+	// and the authoritative claim set (the ONLY source the token is built
+	// from) equals those locked values.
+	ident := locked.AuthoritativeIdentity()
+	wantClaims := map[string]any{
+		"sub":           "repo:" + RepoIDForJob(j) + ":ref:" + j.Ref + ":job:" + j.Key,
+		"repository":    j.RepoFullName,
+		"repository_id": RepoIDForJob(j),
+		"ref":           j.Ref,
+		"sha":           j.SHA,
+		"event":         j.Event,
+		"run_id":        j.RunID,
+		"job_id":        j.ID,
+		"job":           j.Key,
+		"environment":   j.Environment,
+		"trusted":       true,
+	}
+	claims := ident.TokenClaims("https://issuer.example.com", oidcITAudience, "jti-it", oidcITRequest(j, oidcITAudience).IssuedAt, oidcITRequest(j, oidcITAudience).ExpiresAt)
+	for key, want := range wantClaims {
+		if claims[key] != want {
+			t.Fatalf("token claim %q = %v, want the locked value %v", key, claims[key], want)
+		}
 	}
 	if n := oidcITIssuedAudits(t, st, jobID); n != 1 {
 		t.Fatalf("oidc.issued audits = %d, want 1", n)
@@ -136,6 +169,15 @@ func TestIntegrationOIDCIssuanceCommitRevocations(t *testing.T) {
 		{name: "id_token revoked", sql: `UPDATE jobs SET payload = payload || '{"oidc_allowed":false}'::jsonb WHERE id=$1`, want: ErrOIDCIssuanceNotAllowed},
 		{name: "audience narrowed", sql: `UPDATE jobs SET payload = payload || '{"oidc_audiences":["https://other.example.com"]}'::jsonb WHERE id=$1`, want: ErrOIDCIssuanceAudience},
 		{name: "claim identity changed", mutate: func(r *OIDCIssuance) { r.Claims[OIDCClaimRepositoryID] = "github.com/other/repo" }, want: ErrOIDCIssuanceIdentity},
+		// Every identity-bearing field changed between the candidate's
+		// preliminary read and the commit is refused, including the revision
+		// and environment claims that previously rode the token unchecked.
+		{name: "ref changed", sql: `UPDATE jobs SET payload = payload || '{"ref":"refs/heads/other"}'::jsonb WHERE id=$1`, want: ErrOIDCIssuanceIdentity},
+		{name: "sha changed", sql: `UPDATE jobs SET payload = payload || '{"sha":"ffff"}'::jsonb WHERE id=$1`, want: ErrOIDCIssuanceIdentity},
+		{name: "event changed", sql: `UPDATE jobs SET payload = payload || '{"event":"schedule"}'::jsonb WHERE id=$1`, want: ErrOIDCIssuanceIdentity},
+		{name: "environment changed", sql: `UPDATE jobs SET payload = payload || '{"environment":"staging"}'::jsonb WHERE id=$1`, want: ErrOIDCIssuanceIdentity},
+		{name: "claim ref changed", mutate: func(r *OIDCIssuance) { r.Claims[OIDCClaimRef] = "refs/heads/other" }, want: ErrOIDCIssuanceIdentity},
+		{name: "claim environment changed", mutate: func(r *OIDCIssuance) { r.Claims[OIDCClaimEnvironment] = "staging" }, want: ErrOIDCIssuanceIdentity},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -253,6 +295,84 @@ func TestIntegrationOIDCIssuanceCommitConcurrentReplacementBarrier(t *testing.T)
 	}
 	if n := oidcITIssuedAudits(t, st, jobID); n != 0 {
 		t.Fatalf("replaced issuance appended %d audit rows", n)
+	}
+}
+
+// TestIntegrationOIDCIssuanceCommitBarrierLeaseExpiry is the W2-A race
+// regression on real PostgreSQL: the handler authenticated the lease while it
+// was live (the request's IssuedAt precedes the expiry), then the signer/
+// key-ring stall (the outer transaction's row lock) outlasts the lease expiry
+// WITHOUT any row change. The blocked issuance must judge the expiry at the
+// database commit clock (clock_timestamp() evaluated after the lock is
+// acquired), refuse with ErrOIDCIssuanceExpired and write no audit row. The
+// pre-fix predicate compared the expiry to the stale IssuedAt and would have
+// committed a token here.
+func TestIntegrationOIDCIssuanceCommitBarrierLeaseExpiry(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	_, jobID, _, j := oidcITLeasedJob(t, st)
+
+	// The lease expires 500ms after it is shortened; the request's IssuedAt is
+	// taken now, BEFORE that expiry.
+	if _, err := st.pool.Exec(ctx, `UPDATE jobs SET lease_expires_at = clock_timestamp() + interval '500 milliseconds' WHERE id=$1`, jobID); err != nil {
+		t.Fatalf("shorten lease: %v", err)
+	}
+	req := oidcITRequest(j, oidcITAudience)
+
+	tx, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM jobs WHERE id=$1 FOR UPDATE`, jobID); err != nil {
+		t.Fatalf("lock job row: %v", err)
+	}
+
+	commitStarted := make(chan struct{})
+	commitDone := make(chan error, 1)
+	go func() {
+		close(commitStarted)
+		_, err := st.CommitOIDCIssuance(ctx, req)
+		commitDone <- err
+	}()
+	<-commitStarted
+	// Hold the row lock past the lease expiry: the commit is still waiting on
+	// it, so the only thing that changes is the wall clock.
+	select {
+	case err := <-commitDone:
+		t.Fatalf("commit finished before the lease expiry: %v", err)
+	case <-time.After(800 * time.Millisecond):
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("release the row lock: %v", err)
+	}
+	if err := <-commitDone; !errors.Is(err, ErrOIDCIssuanceExpired) {
+		t.Fatalf("commit after the lease expired under the barrier = %v, want ErrOIDCIssuanceExpired", err)
+	}
+	if n := oidcITIssuedAudits(t, st, jobID); n != 0 {
+		t.Fatalf("expired issuance appended %d audit rows", n)
+	}
+}
+
+// TestIntegrationOIDCIssuanceCommitRefusesElapsedLifetime pins the second
+// commit-clock condition on real PostgreSQL: a candidate whose intended
+// lifetime already elapsed (exp before the database commit clock) is refused
+// with the same typed expiry, even though the lease is still live and the
+// stale IssuedAt comparison would have accepted it.
+func TestIntegrationOIDCIssuanceCommitRefusesElapsedLifetime(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	_, jobID, _, j := oidcITLeasedJob(t, st)
+
+	req := oidcITRequest(j, oidcITAudience)
+	now := time.Now().UTC()
+	req.IssuedAt = now.Add(-2 * time.Hour)
+	req.ExpiresAt = now.Add(-time.Hour)
+	if _, err := st.CommitOIDCIssuance(ctx, req); !errors.Is(err, ErrOIDCIssuanceExpired) {
+		t.Fatalf("commit with an elapsed requested lifetime = %v, want ErrOIDCIssuanceExpired", err)
+	}
+	if n := oidcITIssuedAudits(t, st, jobID); n != 0 {
+		t.Fatalf("expired-lifetime issuance appended %d audit rows", n)
 	}
 }
 

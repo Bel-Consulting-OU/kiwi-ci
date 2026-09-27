@@ -37,8 +37,11 @@ var ErrRemoteNotFound = fmt.Errorf("cache: not found on remote")
 var ErrMissingOrInvalidDigest = fmt.Errorf("cache: missing or invalid %s digest header", HeaderCacheSHA256)
 
 // defaultMaxCompressedBytes bounds a restore download when no explicit limit
-// is configured (4 GiB, matching the extraction limits).
-const defaultMaxCompressedBytes = 4 << 30
+// is configured. It resolves to the ONE shared cache-archive contract
+// (MaxArchiveBytes): the same compressed range the Store saves/downloads and
+// the control-plane endpoint accepts, so a large archive cannot be uploaded
+// through Kiwi's own layers only to be rejected on restore by its client.
+const defaultMaxCompressedBytes = MaxArchiveBytes
 
 // Client is the runner-side cache client targeting the job-scoped cache
 // routes: GET/PUT /api/v1/jobs/{jobID}/cache/{key}. Credentials and lease
@@ -49,7 +52,7 @@ type Client struct {
 	Server string
 	Token  string
 	HTTP   *http.Client
-	// MaxCompressedBytes bounds a restore stream (0 uses the 4 GiB default).
+	// MaxCompressedBytes bounds a restore stream (0 uses MaxArchiveBytes).
 	MaxCompressedBytes int64
 	// AllowUnverifiedLegacyRestore permits a restore whose response carries
 	// no digest header at all (the historical legacy-route behavior). It is
@@ -173,9 +176,11 @@ func (c *Client) maxCompressedBytes() int64 {
 // applies to the compressed bytes on the wire, so a hostile server cannot
 // make the runner stream unbounded. It never delivers more than max bytes to
 // its consumer: at the bound it probes the underlying stream exactly once —
-// EOF is a clean end, any byte means the bound was exceeded. A limit <= 0
-// disables the bound. Errors are latched so repeated reads do not re-read a
-// failed source.
+// EOF is a clean end, any byte means the bound was exceeded. An abnormal
+// source that returns (0, nil) from that probe makes no progress and reports
+// no error, so it latches io.ErrNoProgress instead of permitting indefinite
+// re-probing. A limit <= 0 disables the bound. Errors are latched so repeated
+// reads do not re-read a failed source.
 type boundedReadCloser struct {
 	io.ReadCloser
 	n   int64
@@ -194,7 +199,15 @@ func (b *boundedReadCloser) Read(p []byte) (int, error) {
 			b.err = fmt.Errorf("cache restore exceeds %d compressed bytes", b.max)
 			return 0, b.err
 		}
-		return 0, err
+		// An abnormal source that neither delivered a byte nor reported an
+		// error must not be probed again forever: latch io.ErrNoProgress
+		// (like every other bounded reader), and latch any other probe error
+		// too, so repeated reads never re-read a failed source.
+		if err == nil {
+			err = io.ErrNoProgress
+		}
+		b.err = err
+		return 0, b.err
 	}
 	if b.max > 0 {
 		if remaining := b.max - b.n; int64(len(p)) > remaining {
@@ -203,6 +216,10 @@ func (b *boundedReadCloser) Read(p []byte) (int, error) {
 	}
 	n, err := b.ReadCloser.Read(p)
 	b.n += int64(n)
+	if n == 0 && err == nil && len(p) > 0 {
+		b.err = io.ErrNoProgress
+		return 0, b.err
+	}
 	return n, err
 }
 

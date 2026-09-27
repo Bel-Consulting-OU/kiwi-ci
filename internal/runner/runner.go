@@ -217,12 +217,13 @@ type Runner struct {
 	// effectiveCapabilities is the intersection of the hardware
 	// capabilities discovered on this host and the profile capabilities
 	// returned by the register response — it can only shrink the profile,
-	// never enlarge it. capEnforced reports whether the server declared a
-	// profile capability claim: a response carrying the capabilities key
-	// (even an explicit empty list or null) is authoritative, so an empty
-	// intersection denies every runtime instead of meaning "no
-	// restriction". Legacy servers without profiles omit the key entirely
-	// and leave capEnforced false.
+	// never enlarge it. capEnforced reports whether the server explicitly
+	// declared the response's capability set authoritative via the
+	// capabilities_enforced flag: the flag is decoded EXPLICITLY (modern
+	// servers always include the capabilities field, so its presence proves
+	// nothing), and an enforced empty intersection denies every runtime
+	// instead of meaning "no restriction". Legacy servers omit the flag and
+	// leave capEnforced false.
 	effectiveCapabilities []string
 	capEnforced           bool
 	// journalOptOut is the explicit seam that lets a caller of execute run
@@ -233,28 +234,17 @@ type Runner struct {
 	journalOptOut bool
 }
 
-// registerResponse is the register reply. Capabilities is decoded as raw
-// JSON so the runner can distinguish an ABSENT key (legacy pre-profile
-// server: no claim) from a present-but-empty list or null (an explicit
-// profile claim that grants nothing, which is an authoritative deny-all
-// ceiling rather than a missing restriction).
+// registerResponse is the register reply. Capabilities carries the effective
+// capability set and CapabilitiesEnforced is decoded EXPLICITLY as the
+// server's authority flag: modern control planes always include both keys
+// (an empty enforced set means deny-all), so key presence is no longer an
+// authority signal — only the explicit flag marks a profile claim. A legacy
+// server without the flag leaves capEnforced false and every runtime
+// accepted.
 type registerResponse struct {
 	model.Runner
-	Capabilities json.RawMessage `json:"capabilities"`
-}
-
-// decodeProfileCapabilities interprets the register response's capabilities
-// field. claimed is true whenever the key is present at all: an explicit
-// empty list or null yields a nil/empty list with claimed=true, which the
-// runner turns into an enforced empty intersection.
-func decodeProfileCapabilities(raw json.RawMessage) (caps []string, claimed bool, err error) {
-	if raw == nil {
-		return nil, false, nil
-	}
-	if err := json.Unmarshal(raw, &caps); err != nil {
-		return nil, true, fmt.Errorf("capabilities claim: %w", err)
-	}
-	return caps, true, nil
+	Capabilities         []string `json:"capabilities"`
+	CapabilitiesEnforced bool     `json:"capabilities_enforced"`
 }
 
 func (r *Runner) Run(ctx context.Context) error {
@@ -419,20 +409,17 @@ func (r *Runner) register(ctx context.Context) error {
 		return err
 	}
 	r.ID = out.ID
-	// Capability intersection: the profile capabilities in the response
-	// are the ceiling; the runner advertises (and enforces) only the
+	// Capability intersection: the profile capabilities in the response are
+	// the ceiling; the runner advertises (and enforces) only the
 	// intersection with what this host actually discovered, so a job
 	// requiring a runtime the host cannot provide never starts here. The
-	// claim is enforced whenever the server sent the capabilities key at
-	// all — an empty claim is an authoritative empty ceiling, not an
+	// claim is enforced exactly when the server set capabilities_enforced
+	// (an empty enforced claim is an authoritative empty ceiling, not an
 	// absent one, so the intersection may legitimately be empty and then
-	// denies every runtime.
-	profileCaps, claimed, err := decodeProfileCapabilities(out.Capabilities)
-	if err != nil {
-		return fmt.Errorf("register: %w", err)
-	}
-	r.capEnforced = claimed
-	r.effectiveCapabilities = intersectStringLists(profileCaps, discovered)
+	// denies every runtime); a legacy server omits the flag and imposes no
+	// restriction.
+	r.capEnforced = out.CapabilitiesEnforced
+	r.effectiveCapabilities = intersectStringLists(out.Capabilities, discovered)
 	fmt.Printf("kiwi runner %s registered (%s/%s) labels=%s caps=%s\n", r.ID, runtime.GOOS, runtime.GOARCH, strings.Join(out.Labels, ","), strings.Join(r.effectiveCapabilities, ","))
 	return nil
 }
@@ -993,24 +980,23 @@ func (r *Runner) logBatchPost(t server.Task, masker *secrets.Masker) func(contex
 // carries KIWI_TEST_SHARD_TOTAL and KIWI_TEST_SHARD_INDEX. A compiled job
 // missing the assignment is a configuration error, not something the runner
 // can reconstruct at runtime.
-// checkCapability enforces the runner-side capability intersection: when
-// the register response declared a profile capability claim, a job whose
-// runtime capability is not in the runner's effective (discovered ∩
-// profile) set is refused before execution. An enforced but EMPTY
-// intersection denies every runtime — including the default native runtime
-// (empty runtime) — because an empty claim means "run nothing", never "no
-// restriction". Without a claim (legacy server) every runtime is accepted.
-func (r *Runner) checkCapability(runtime string) error {
-	if !r.capEnforced {
+// checkCapability enforces the runner-side capability intersection through
+// the SAME predicate the control plane uses (storage.RuntimeAllowed): a job
+// whose runtime (default native) is outside the runner's effective
+// (discovered ∩ profile) set is refused before execution when the server
+// declared the set authoritative. An enforced but EMPTY intersection denies
+// every runtime — including the default native runtime (empty runtime) —
+// because an empty claim means "run nothing", never "no restriction". A
+// legacy server response without capabilities_enforced leaves the runner
+// unrestricted.
+func (r *Runner) checkCapability(runtimeName string) error {
+	if storage.RuntimeAllowed(r.effectiveCapabilities, r.capEnforced, runtimeName) {
 		return nil
 	}
-	if runtime == "" {
-		runtime = "native"
+	if runtimeName == "" {
+		runtimeName = "native"
 	}
-	if !containsString(r.effectiveCapabilities, runtime) {
-		return fmt.Errorf("runtime %q is outside this runner's profile capability intersection", runtime)
-	}
-	return nil
+	return fmt.Errorf("runtime %q is outside this runner's profile capability intersection", runtimeName)
 }
 
 func checkShardAssignment(cj pipeline.CompiledJob) error {

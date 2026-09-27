@@ -97,12 +97,16 @@ func setupJobCgroup(ctx context.Context, req jobCgroupRequest) (JobCgroupStatus,
 // accepts a delegated cgroup path as --cgroup-parent. The systemd driver
 // requires a slice unit name instead, which the runner cannot create per job
 // without systemd delegation.
+//
+// The `docker info` probe runs through phaseCommand under the runtime probe
+// ceiling, so a wedged daemon cannot pin job startup when the job itself has
+// no timeout (this is a setup probe, not user build work).
 func dockerAcceptsCgroupPath(ctx context.Context) error {
 	docker, err := exec.LookPath("docker")
 	if err != nil {
 		return fmt.Errorf("docker CLI not found: %v", err)
 	}
-	out, err := exec.CommandContext(ctx, docker, "info", "--format", "{{.CgroupDriver}}").CombinedOutput()
+	out, err := phaseCommand(ctx, runtimeProbeTimeout, docker, "info", "--format", "{{.CgroupDriver}}")
 	if err != nil {
 		return fmt.Errorf("inspect docker cgroup driver: %v: %s", err, strings.TrimSpace(string(out)))
 	}

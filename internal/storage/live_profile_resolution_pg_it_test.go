@@ -37,10 +37,10 @@ func TestIntegrationLeaseRunnerIDProfileLivePostgres(t *testing.T) {
 	st := pgITStore(t)
 	ctx := context.Background()
 	runnerID := pgITNewID(t)
-	if err := st.UpsertRunner(ctx, model.Runner{ID: runnerID, Name: runnerID, Capacity: 9, Labels: []string{"snapshot"}, CostPerHour: 9}); err != nil {
+	if err := st.UpsertRunner(ctx, model.Runner{ID: runnerID, Name: runnerID, Capacity: 9, Labels: []string{"snapshot"}, ReportedCapabilities: []string{"native"}, CostPerHour: 9}); err != nil {
 		t.Fatalf("runner: %v", err)
 	}
-	if err := st.UpsertProfile(ctx, model.RunnerProfile{ID: "live-p", Labels: []string{"bound"}, Repositories: []string{liveProfileRepoA}, MaxCapacity: 1, CostPerHour: 3.5}); err != nil {
+	if err := st.UpsertProfile(ctx, model.RunnerProfile{ID: "live-p", Labels: []string{"bound"}, Repositories: []string{liveProfileRepoA}, Capabilities: []string{"native"}, MaxCapacity: 1, CostPerHour: 3.5}); err != nil {
 		t.Fatalf("profile: %v", err)
 	}
 	if err := st.LinkRunnerProfile(ctx, runnerID, "live-p"); err != nil {
@@ -64,7 +64,7 @@ func TestIntegrationLeaseRunnerIDProfileLivePostgres(t *testing.T) {
 	}
 
 	// Edit the live profile: capacity 3, label and repository ACL replaced.
-	if err := st.UpsertProfile(ctx, model.RunnerProfile{ID: "live-p", Labels: []string{"edited"}, Repositories: []string{liveProfileRepoB}, MaxCapacity: 3}); err != nil {
+	if err := st.UpsertProfile(ctx, model.RunnerProfile{ID: "live-p", Labels: []string{"edited"}, Repositories: []string{liveProfileRepoB}, Capabilities: []string{"native"}, MaxCapacity: 3}); err != nil {
 		t.Fatalf("edit: %v", err)
 	}
 	if _, err := st.AcquireLeaseAtomic(ctx, LeaseClaim{JobID: job2, RunnerID: runnerID, CanonRepoID: liveProfileRepoA, RequiredLabels: []string{"bound"}, Generation: 1, ExpiresAt: time.Now().Add(time.Minute), TokenHash: []byte("h")}); !errors.Is(err, ErrNoCapacity) {
@@ -83,10 +83,10 @@ func TestIntegrationLeaseRunnerIDProfileCapacityRacePostgres(t *testing.T) {
 	st := pgITStore(t)
 	ctx := context.Background()
 	runnerID := pgITNewID(t)
-	if err := st.UpsertRunner(ctx, model.Runner{ID: runnerID, Name: runnerID, Capacity: 8, Labels: []string{"snapshot"}}); err != nil {
+	if err := st.UpsertRunner(ctx, model.Runner{ID: runnerID, Name: runnerID, Capacity: 8, Labels: []string{"snapshot"}, ReportedCapabilities: []string{"native"}}); err != nil {
 		t.Fatalf("runner: %v", err)
 	}
-	if err := st.UpsertProfile(ctx, model.RunnerProfile{ID: "race-p", MaxCapacity: 1}); err != nil {
+	if err := st.UpsertProfile(ctx, model.RunnerProfile{ID: "race-p", Capabilities: []string{"native"}, MaxCapacity: 1}); err != nil {
 		t.Fatalf("profile: %v", err)
 	}
 	if err := st.LinkRunnerProfile(ctx, runnerID, "race-p"); err != nil {

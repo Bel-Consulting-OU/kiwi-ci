@@ -9,13 +9,15 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
-// oidcIssueTestJob is a production-shaped running job: the lease fields and
-// the repository identity are populated exactly like an enqueued+leased job.
+// oidcIssueTestJob is a production-shaped running job: the lease fields, the
+// compiled run coordinates and the repository identity are populated exactly
+// like an enqueued+leased job.
 func oidcIssueTestJob() model.Job {
 	exp := time.Now().UTC().Add(time.Hour)
 	return model.Job{
 		ID: "job-oidc", RunID: "run-oidc", Key: "build",
 		RepoID: "github.com/acme/backend", RepoURL: "https://github.com/acme/backend.git", RepoFullName: "acme/backend",
+		Ref: "refs/heads/main", SHA: "abc123def456", Event: "push", Environment: "production",
 		Status: model.StatusRunning, Trusted: true, OIDCAllowed: true,
 		OIDCAudiences:   []string{"https://aud.example.com"},
 		LeaseRunnerID:   "runner-1",
@@ -36,6 +38,10 @@ func oidcIssueTestRequest(j model.Job) OIDCIssuance {
 			OIDCClaimJob:          j.Key,
 			OIDCClaimRepositoryID: RepoIDForJob(j),
 			OIDCClaimRepository:   j.RepoFullName,
+			OIDCClaimRef:          j.Ref,
+			OIDCClaimSHA:          j.SHA,
+			OIDCClaimEvent:        j.Event,
+			OIDCClaimEnvironment:  j.Environment,
 			OIDCClaimTrusted:      "true",
 			OIDCClaimAudience:     "https://aud.example.com",
 		},
@@ -72,6 +78,33 @@ func TestOIDCIssuanceCommitMemStoreParity(t *testing.T) {
 	if len(locked.AllowedAudiences) != 1 || locked.AllowedAudiences[0] != "https://aud.example.com" {
 		t.Fatalf("locked audiences = %v", locked.AllowedAudiences)
 	}
+	// The authoritative identity is derived from the locked job and every
+	// token claim comes from it: a happy path must carry the locked value of
+	// every identity-bearing field.
+	ident := locked.AuthoritativeIdentity()
+	if ident.Subject != "repo:github.com/acme/backend:ref:refs/heads/main:job:build" {
+		t.Fatalf("subject = %q", ident.Subject)
+	}
+	wantClaims := map[string]any{
+		"sub":           "repo:" + RepoIDForJob(j) + ":ref:" + j.Ref + ":job:" + j.Key,
+		"repository":    j.RepoFullName,
+		"repository_id": RepoIDForJob(j),
+		"ref":           j.Ref,
+		"sha":           j.SHA,
+		"event":         j.Event,
+		"run_id":        j.RunID,
+		"job_id":        j.ID,
+		"job":           j.Key,
+		"environment":   j.Environment,
+		"trusted":       true,
+	}
+	reqForClaims := oidcIssueTestRequest(j)
+	claims := ident.TokenClaims("https://issuer.example.com", "https://aud.example.com", "jti-1", reqForClaims.IssuedAt, reqForClaims.ExpiresAt)
+	for key, want := range wantClaims {
+		if claims[key] != want {
+			t.Fatalf("token claim %q = %v, want the locked value %v", key, claims[key], want)
+		}
+	}
 	events, err := m.ReadAudit(ctx(), 10)
 	if err != nil {
 		t.Fatal(err)
@@ -102,6 +135,14 @@ func TestOIDCIssuanceCommitMemStoreParity(t *testing.T) {
 		{name: "claim job mismatch", req: func(r OIDCIssuance) OIDCIssuance { r.Claims[OIDCClaimJob] = "other"; return r }, want: ErrOIDCIssuanceIdentity},
 		{name: "claim repository mismatch", req: func(r OIDCIssuance) OIDCIssuance { r.Claims[OIDCClaimRepositoryID] = "github.com/other/repo"; return r }, want: ErrOIDCIssuanceIdentity},
 		{name: "claim audience mismatch", req: func(r OIDCIssuance) OIDCIssuance { r.Claims[OIDCClaimAudience] = "https://other.example.com"; return r }, want: ErrOIDCIssuanceIdentity},
+		{name: "ref changed", mutate: func(j *model.Job) { j.Ref = "refs/heads/other" }, want: ErrOIDCIssuanceIdentity},
+		{name: "sha changed", mutate: func(j *model.Job) { j.SHA = "ffff" }, want: ErrOIDCIssuanceIdentity},
+		{name: "event changed", mutate: func(j *model.Job) { j.Event = "pull_request" }, want: ErrOIDCIssuanceIdentity},
+		{name: "environment changed", mutate: func(j *model.Job) { j.Environment = "staging" }, want: ErrOIDCIssuanceIdentity},
+		{name: "claim ref mismatch", req: func(r OIDCIssuance) OIDCIssuance { r.Claims[OIDCClaimRef] = "refs/heads/other"; return r }, want: ErrOIDCIssuanceIdentity},
+		{name: "claim sha mismatch", req: func(r OIDCIssuance) OIDCIssuance { r.Claims[OIDCClaimSHA] = "ffff"; return r }, want: ErrOIDCIssuanceIdentity},
+		{name: "claim event mismatch", req: func(r OIDCIssuance) OIDCIssuance { r.Claims[OIDCClaimEvent] = "schedule"; return r }, want: ErrOIDCIssuanceIdentity},
+		{name: "claim environment mismatch", req: func(r OIDCIssuance) OIDCIssuance { r.Claims[OIDCClaimEnvironment] = "staging"; return r }, want: ErrOIDCIssuanceIdentity},
 		{name: "empty audience", req: func(r OIDCIssuance) OIDCIssuance { r.Audience = ""; return r }, want: ErrOIDCIssuanceInvalid},
 		{name: "empty runner", req: func(r OIDCIssuance) OIDCIssuance { r.RunnerID = ""; return r }, want: ErrOIDCIssuanceInvalid},
 		{name: "empty token hash", req: func(r OIDCIssuance) OIDCIssuance { r.LeaseTokenHash = nil; return r }, want: ErrOIDCIssuanceInvalid},
@@ -136,6 +177,48 @@ func TestOIDCIssuanceCommitMemStoreParity(t *testing.T) {
 	m2 := newMemStore()
 	if _, err := m2.CommitOIDCIssuance(ctx(), oidcIssueTestRequest(j)); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown job commit = %v, want ErrNotFound", err)
+	}
+}
+
+// TestOIDCIssuanceCommitClockRefusesStaleIssuedAt is the W2-A storage-level
+// regression: the lease expiry must be judged at the STORAGE commit clock,
+// not at the handler-captured IssuedAt. The lease here expires before the
+// commit but after IssuedAt — exactly the window a slow signer/key-ring
+// rotation opens — so the pre-fix predicate (LeaseExpiresAt.After(IssuedAt))
+// accepted it. Refusal is typed ErrOIDCIssuanceExpired and appends no audit.
+func TestOIDCIssuanceCommitClockRefusesStaleIssuedAt(t *testing.T) {
+	j := oidcIssueTestJob()
+	expired := time.Now().UTC().Add(-time.Second)
+	j.LeaseExpiresAt = &expired
+	m := seedOIDCIssueMemStore(t, j)
+	req := oidcIssueTestRequest(j)
+	now := time.Now().UTC()
+	req.IssuedAt = now.Add(-time.Hour)
+	req.ExpiresAt = now.Add(5 * time.Minute)
+	if _, err := m.CommitOIDCIssuance(ctx(), req); !errors.Is(err, ErrOIDCIssuanceExpired) {
+		t.Fatalf("commit with a lease that expired after IssuedAt = %v, want ErrOIDCIssuanceExpired", err)
+	}
+	if events, err := m.ReadAudit(ctx(), 10); err != nil || len(events) != 0 {
+		t.Fatalf("refused commit audit = %+v (err %v), want none", events, err)
+	}
+}
+
+// TestOIDCIssuanceCommitClockRefusesElapsedLifetime is the twin for the
+// candidate's intended lifetime: a token whose exp already passed at the
+// commit clock must not be minted even though the lease is still live and the
+// pre-fix predicate (which compared only the lease to IssuedAt) accepted it.
+func TestOIDCIssuanceCommitClockRefusesElapsedLifetime(t *testing.T) {
+	j := oidcIssueTestJob()
+	m := seedOIDCIssueMemStore(t, j)
+	req := oidcIssueTestRequest(j)
+	now := time.Now().UTC()
+	req.IssuedAt = now.Add(-2 * time.Hour)
+	req.ExpiresAt = now.Add(-time.Hour)
+	if _, err := m.CommitOIDCIssuance(ctx(), req); !errors.Is(err, ErrOIDCIssuanceExpired) {
+		t.Fatalf("commit with an elapsed requested lifetime = %v, want ErrOIDCIssuanceExpired", err)
+	}
+	if events, err := m.ReadAudit(ctx(), 10); err != nil || len(events) != 0 {
+		t.Fatalf("refused commit audit = %+v (err %v), want none", events, err)
 	}
 }
 

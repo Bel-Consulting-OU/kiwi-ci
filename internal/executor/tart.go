@@ -71,17 +71,27 @@ var tartProbeTimeout = 15 * time.Second
 func tartRunHelp(ctx context.Context, tart string) string {
 	hctx, cancel := context.WithTimeout(ctx, tartProbeTimeout)
 	defer cancel()
-	out, _ := exec.CommandContext(hctx, tart, "run", "--help").CombinedOutput()
+	cmd := exec.CommandContext(hctx, tart, "run", "--help")
+	cmd.WaitDelay = boundedToolWaitDelay
+	out, _ := cmd.CombinedOutput()
 	return string(out)
 }
 
 // tartIPProbe asks tart for the clone's IP under a context bounded by the
-// remaining IP-wait window (and the job context), so a wedged `tart ip`
-// cannot defeat the loop's tartIPWait bound. An error or timeout yields "".
+// remaining IP-wait window, the runtime probe ceiling, and the job context,
+// whichever expires first, so a wedged `tart ip` cannot defeat the loop's
+// tartIPWait bound. An error or timeout yields "".
 func tartIPProbe(ctx context.Context, deadline time.Time, tart, clone string) string {
+	if d := time.Now().Add(runtimeProbeTimeout); d.Before(deadline) {
+		deadline = d
+	}
 	pctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
-	out, err := exec.CommandContext(pctx, tart, "ip", clone).Output()
+	cmd := exec.CommandContext(pctx, tart, "ip", clone)
+	// Bound the output-pipe drain after a kill, so an orphaned descendant
+	// cannot extend a probe past its ceiling.
+	cmd.WaitDelay = boundedToolWaitDelay
+	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}
@@ -173,10 +183,12 @@ func (b *TartBackend) StartJob(ctx context.Context, workspace string, emit func(
 		return &RunError{Kind: ErrorInfra, Err: err}
 	}
 	// "--" terminates tart's own flag parsing before the image reference, so
-	// a flag-shaped VM reference can never be injected as an option.
-	if out, err := exec.CommandContext(ctx, tart, "clone", "--", b.VM, b.clone).CombinedOutput(); err != nil {
+	// a flag-shaped VM reference can never be injected as an option. The
+	// clone pulls the base image and is legitimately slow, so it runs under
+	// the 10m setup ceiling (min with the job context).
+	if out, err := phaseCommand(ctx, runtimeSetupTimeout, tart, "clone", "--", b.VM, b.clone); err != nil {
 		_ = b.CloseJob()
-		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("tart clone: %v: %s", err, strings.TrimSpace(string(out)))}
+		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("tart clone: %w: %s", err, strings.TrimSpace(string(out)))}
 	}
 	// Resource requests map onto the tart run flags the installed CLI
 	// actually supports; unsupported requests are reported as advisory
@@ -301,11 +313,13 @@ func tartBootstrapConfigError() error {
 }
 
 // verifyBootstrapContract queries the cloned VM's labels and refuses the
-// job when the bootstrap contract is not declared.
+// job when the bootstrap contract is not declared. The query is a probe and
+// runs under the runtime probe ceiling (min with the job context), so a
+// wedged tart get cannot stall an otherwise unbounded job.
 func (b *TartBackend) verifyBootstrapContract(ctx context.Context, tart string) error {
-	out, err := exec.CommandContext(ctx, tart, tartGetArgs(b.clone)...).Output()
+	out, err := phaseCommand(ctx, runtimeProbeTimeout, tart, tartGetArgs(b.clone)...)
 	if err != nil {
-		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("tart get %s: %v: %s", b.clone, err, strings.TrimSpace(string(out)))}
+		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("tart get %s: %w: %s", b.clone, err, strings.TrimSpace(string(out)))}
 	}
 	meta, perr := parseTartGetJSON(out)
 	if perr != nil {
@@ -493,17 +507,35 @@ func (b *TartBackend) deleteCloneBounded(parent context.Context) error {
 	return nil
 }
 
-func (b *TartBackend) CloseJob() error {
-	if b.run != nil && b.run.Process != nil {
-		_ = b.run.Process.Kill()
-		_, _ = b.run.Process.Wait()
+// reapRunCommand kills and bounded-reaps the `tart run` process through
+// waitKilledCommand. The command handle is cleared only once the process has
+// actually been reaped: after a grace timeout the detached reaper still owns
+// the wait, and dropping the handle would hide an un-reaped live process from
+// a later CloseJob.
+func (b *TartBackend) reapRunCommand() error {
+	cmd := b.run
+	if cmd == nil {
+		return nil
 	}
-	err := b.deleteCloneBounded(context.Background())
+	err := reapKilledCommand(cmd, killGrace)
+	if err == nil {
+		b.run = nil
+	}
+	return err
+}
+
+func (b *TartBackend) CloseJob() error {
+	// The reap and the clone delete are independent bounded steps: a wedged
+	// `tart run` must not stop the clone from being deleted, and a
+	// successful delete must never mask a reap failure. Both errors are
+	// joined, so either failure (or both) reaches the caller.
+	reapErr := b.reapRunCommand()
+	deleteErr := b.deleteCloneBounded(context.Background())
 	if b.sshDir != "" {
 		_ = os.RemoveAll(b.sshDir)
 		b.sshDir = ""
 	}
-	return err
+	return errors.Join(reapErr, deleteErr)
 }
 
 func (b *TartBackend) keyFile() string        { return filepath.Join(b.sshDir, "id_ed25519") }

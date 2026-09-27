@@ -37,13 +37,13 @@ func TestIntegrationServiceEnvelopeLeasePostgres(t *testing.T) {
 	ctx := context.Background()
 	runnerID, profileID := pgITSchedID(t), "env-sched-"+pgITSchedRandomHex(t, 6)
 	serial := "env-sched-serial-" + pgITSchedRandomHex(t, 6)
-	if err := st.UpsertProfile(ctx, model.RunnerProfile{ID: profileID, MaxCapacity: 8, MaxMemory: 8 << 30}); err != nil {
+	if err := st.UpsertProfile(ctx, model.RunnerProfile{ID: profileID, Capabilities: []string{"native"}, MaxCapacity: 8, MaxMemory: 8 << 30}); err != nil {
 		t.Fatalf("upsert profile: %v", err)
 	}
 	if err := st.BindCertProfile(ctx, serial, profileID); err != nil {
 		t.Fatalf("bind profile: %v", err)
 	}
-	if err := st.UpsertRunner(ctx, model.Runner{ID: runnerID, Name: runnerID, Capacity: 8, CertSerial: serial}); err != nil {
+	if err := st.UpsertRunner(ctx, model.Runner{ID: runnerID, Name: runnerID, Capacity: 8, CertSerial: serial, ReportedCapabilities: []string{"native"}}); err != nil {
 		t.Fatalf("upsert runner: %v", err)
 	}
 

@@ -238,8 +238,11 @@ func (d *dripReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// TestStoreStallGuardBoundsStalledDefaultClient proves the no-client path
-// keeps its finite default context AND is watchdog-bounded.
+// TestStoreStallGuardBoundsStalledDefaultClient proves the no-client legacy
+// path is watchdog-bounded WITHOUT any total deadline (W5-B): the default
+// context is timeout-free, so a continuously-progressing transfer is never
+// cut by a wall-clock cap, while a stalled body still fails fast with
+// ErrTransferStalled through the sliding storeStallTimeout watchdog.
 func TestStoreStallGuardBoundsStalledDefaultClient(t *testing.T) {
 	shrinkStoreStallTimeout(t, 150*time.Millisecond)
 
@@ -261,8 +264,8 @@ func TestStoreStallGuardBoundsStalledDefaultClient(t *testing.T) {
 	s := &Store{Root: t.TempDir(), RemoteURL: srv.URL}
 	ctx, cancel := s.defaultContext()
 	defer cancel()
-	if _, ok := ctx.Deadline(); !ok {
-		t.Fatal("the nil-client default context must stay finite")
+	if _, ok := ctx.Deadline(); ok {
+		t.Fatal("the nil-client default context must be timeout-free; the sliding watchdog bounds the body")
 	}
 	begin := time.Now()
 	err := s.fetchRemote("deadbeef")

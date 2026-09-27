@@ -1,6 +1,8 @@
 package server
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -8,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
@@ -109,6 +112,118 @@ func TestOIDCIssuanceGenerationChangedBeforeCommitReturns409(t *testing.T) {
 			}
 			requireNoToken(t, w)
 		})
+	}
+}
+
+// TestOIDCIssuanceLeaseExpiresDuringCommitStallReturns409 is the W2-A
+// regression: the handler authenticates a still-live lease, the signer/
+// key-ring work (played by the pre-commit hook) stalls until the wall clock
+// has passed the lease expiry, and the final transaction must then refuse at
+// the STORAGE commit clock. The pre-fix commit judged the lease against the
+// handler-captured IssuedAt, so it would have returned a token here.
+func TestOIDCIssuanceLeaseExpiresDuringCommitStallReturns409(t *testing.T) {
+	for _, mode := range []string{"memory", "db"} {
+		t.Run(mode, func(t *testing.T) {
+			s, mutate := oidcScopeServer(t, mode == "db")
+			expiry := time.Now().UTC().Add(250 * time.Millisecond)
+			mutate(func(j *model.Job) { j.LeaseExpiresAt = &expiry })
+			withOIDCBeforeCommitHook(t, func() {
+				deadline := expiry.Add(20 * time.Millisecond)
+				for !time.Now().UTC().After(deadline) {
+					time.Sleep(5 * time.Millisecond)
+				}
+			})
+			w := issueOIDCForStatus(t, s, "Bearer lease1", "https://aud.example.com")
+			if w.Code != http.StatusConflict {
+				t.Fatalf("lease expiring during the commit stall = %d, want 409: %s", w.Code, w.Body.String())
+			}
+			requireNoToken(t, w)
+		})
+	}
+}
+
+// oidcTokenClaims decodes the claim set of a test-issued JWT.
+func oidcTokenClaims(t *testing.T, token string) map[string]any {
+	t.Helper()
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		t.Fatalf("malformed jwt %q", token)
+	}
+	cb, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(cb, &claims); err != nil {
+		t.Fatal(err)
+	}
+	return claims
+}
+
+// TestOIDCIssuanceClaimsDerivedFromLockedIdentity is the W2-B happy path: the
+// token returned in both storage modes carries the LOCKED job's value for
+// every identity-bearing claim (revision and environment included), proving
+// no claim is candidate-supplied or stale.
+func TestOIDCIssuanceClaimsDerivedFromLockedIdentity(t *testing.T) {
+	for _, mode := range []string{"memory", "db"} {
+		t.Run(mode, func(t *testing.T) {
+			s, mutate := oidcScopeServer(t, mode == "db")
+			// An empty mutation snapshots the authoritative job under the
+			// same lock the store uses.
+			var locked model.Job
+			mutate(func(j *model.Job) { locked = *j })
+			tok := issueOIDCToken(t, s, "job-oidc", "lease1", "https://aud.example.com")
+			claims := oidcTokenClaims(t, tok)
+			want := map[string]any{
+				"sub":           "repo:" + repoIDForJob(locked) + ":ref:" + locked.Ref + ":job:" + locked.Key,
+				"repository":    locked.RepoFullName,
+				"repository_id": repoIDForJob(locked),
+				"ref":           locked.Ref,
+				"sha":           locked.SHA,
+				"event":         locked.Event,
+				"run_id":        locked.RunID,
+				"job_id":        locked.ID,
+				"job":           locked.Key,
+				"environment":   locked.Environment,
+				"trusted":       locked.Trusted,
+				"aud":           "https://aud.example.com",
+			}
+			for key, v := range want {
+				if claims[key] != v {
+					t.Fatalf("claim %q = %v, want the locked value %v", key, claims[key], v)
+				}
+			}
+		})
+	}
+}
+
+// TestOIDCIssuanceIdentityChangedBetweenAuthAndCommitReturns409 is the W2-B
+// regression matrix: a job key, ref, sha, event or environment that changes
+// between the preliminary read and the final transaction makes the commit
+// refuse with 409 in BOTH storage modes, and the token is never built.
+func TestOIDCIssuanceIdentityChangedBetweenAuthAndCommitReturns409(t *testing.T) {
+	fields := []struct {
+		name   string
+		mutate func(*model.Job)
+	}{
+		{"job key", func(j *model.Job) { j.Key = "other" }},
+		{"ref", func(j *model.Job) { j.Ref = "refs/heads/other" }},
+		{"sha", func(j *model.Job) { j.SHA = "ffff" }},
+		{"event", func(j *model.Job) { j.Event = "schedule" }},
+		{"environment", func(j *model.Job) { j.Environment = "staging" }},
+	}
+	for _, mode := range []string{"memory", "db"} {
+		for _, f := range fields {
+			t.Run(mode+"/"+f.name, func(t *testing.T) {
+				s, mutate := oidcScopeServer(t, mode == "db")
+				withOIDCBeforeCommitHook(t, func() { mutate(f.mutate) })
+				w := issueOIDCForStatus(t, s, "Bearer lease1", "https://aud.example.com")
+				if w.Code != http.StatusConflict {
+					t.Fatalf("%s changing between auth and commit = %d, want 409: %s", f.name, w.Code, w.Body.String())
+				}
+				requireNoToken(t, w)
+			})
+		}
 	}
 }
 

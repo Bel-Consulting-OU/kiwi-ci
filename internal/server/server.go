@@ -2560,11 +2560,17 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	// Client-asserted server-owned attributes never survive: resource_capacity
 	// has no legacy self-report semantics (a zero dimension is UNCONSTRAINED,
 	// so an accepted client value would silently widen the runner's
-	// admission), and the profile marker is always derived from the resolved
-	// binding below. Both are cleared before the overlay so the only writer is
-	// the profile (or the empty registration).
+	// admission), the profile marker is always derived from the resolved
+	// binding below, and the enforcement flag is server-owned (a client
+	// cannot declare its own claim authoritative or legacy). All are cleared
+	// before the overlay so the only writers are the profile overlay and the
+	// normalized hardware claim captured from the payload's capabilities
+	// field — never the payload's reported_capabilities or
+	// capabilities_enforced keys.
 	in.ResourceCapacity = model.ResourceCapacity{}
 	in.ProfileID = ""
+	in.CapabilitiesEnforced = false
+	in.ReportedCapabilities = storage.NormalizeCapabilities(reported)
 	profile, hasProfile, perr := s.profileForRunnerBinding(r.Context(), binding)
 	if perr != nil {
 		s.logError("register: profile lookup failed", "serial", binding.Serial, "runner", binding.RunnerID, "error", perr.Error())
@@ -2572,12 +2578,13 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	if hasProfile {
 		// The SAME overlay the lease-time resolution applies
 		// (storage.ResolveRunnerProfile): labels, region, repository ACL,
-		// capabilities, both capacities and both rates come from the linked
-		// profile, never from the payload. The reported hardware capabilities
-		// then narrow the profile's ceiling (the runner can only lose
-		// capabilities, never gain them).
+		// both capacities and both rates come from the linked profile, never
+		// from the payload, and the profile makes the capability set
+		// ENFORCED. Capabilities are RECOMPUTED as the intersection of the
+		// profile ceiling and the normalized hardware claim, so the reported
+		// set can only narrow the profile, never enlarge it (and a live
+		// profile edit can never re-widen the runner past its hardware).
 		in = storage.ResolveRunnerProfile(in, profile, true)
-		in.Capabilities = intersectCapabilities(profile.Capabilities, reported)
 		in.ProfileID = profile.ID
 	} else if s.RequireProfiles {
 		// Without a linked profile the runner registers empty: no labels,

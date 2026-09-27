@@ -48,20 +48,23 @@ func TestDefaultRootsUnderUserCache(t *testing.T) {
 	}
 }
 
-// TestDefaultContextOwnership pins which layer owns the total transfer policy:
-// a caller-supplied client removes the wrapper's finite deadline, while the
-// default client path carries one.
+// TestDefaultContextOwnership pins which layer owns the total transfer policy
+// after W5-B: the wrapper NEVER imposes a total wall-clock deadline on either
+// path, because a continuously-progressing bulk transfer (up to
+// MaxArchiveBytes) must not be cut by a fixed 30-second cap. The former
+// no-client deadline is deliberately gone: with a caller-supplied client the
+// client owns its bounds, and on the default-client path the transport phase
+// bounds (dial/TLS/response headers/idle) plus the sliding storeStallTimeout
+// watchdog provide the no-hang guarantee.
 func TestDefaultContextOwnership(t *testing.T) {
-	withClient := &Store{Client: &http.Client{}}
-	ctx, cancel := withClient.defaultContext()
-	defer cancel()
-	if _, ok := ctx.Deadline(); ok {
-		t.Fatal("caller-supplied client still got a wrapper deadline")
-	}
-	defaulted := &Store{}
-	ctx2, cancel2 := defaulted.defaultContext()
-	defer cancel2()
-	if _, ok := ctx2.Deadline(); !ok {
-		t.Fatal("default client path lost its finite wrapper deadline")
+	for name, s := range map[string]*Store{
+		"caller-supplied client": {Client: &http.Client{}},
+		"default client":         {},
+	} {
+		ctx, cancel := s.defaultContext()
+		if _, ok := ctx.Deadline(); ok {
+			t.Fatalf("%s: the wrapper must not impose a total transfer deadline", name)
+		}
+		cancel()
 	}
 }

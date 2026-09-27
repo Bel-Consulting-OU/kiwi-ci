@@ -18,7 +18,7 @@ import (
 func resourceProfileRunner(t *testing.T, m *memStore, runnerID, profileID, serial string, countCapacity int, capacity model.ResourceCapacity) {
 	t.Helper()
 	if err := m.UpsertProfile(ctx(), model.RunnerProfile{
-		ID: profileID, MaxCapacity: countCapacity,
+		ID: profileID, Capabilities: []string{"native"}, MaxCapacity: countCapacity,
 		MaxCPU: capacity.CPU, MaxMemory: capacity.Memory, MaxDisk: capacity.Disk, MaxPIDs: capacity.PIDs,
 	}); err != nil {
 		t.Fatal(err)
@@ -26,7 +26,7 @@ func resourceProfileRunner(t *testing.T, m *memStore, runnerID, profileID, seria
 	if err := m.BindCertProfile(ctx(), serial, profileID); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.UpsertRunner(ctx(), model.Runner{ID: runnerID, Name: runnerID, Capacity: countCapacity, CertSerial: serial}); err != nil {
+	if err := m.UpsertRunner(ctx(), model.Runner{ID: runnerID, Name: runnerID, Capacity: countCapacity, CertSerial: serial, ReportedCapabilities: []string{"native"}}); err != nil {
 		t.Fatal(err)
 	}
 }

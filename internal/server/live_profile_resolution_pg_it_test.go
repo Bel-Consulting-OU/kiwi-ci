@@ -54,9 +54,12 @@ func TestIntegrationLeaseLiveRunnerIDProfileServerPostgres(t *testing.T) {
 	pgITBindingRunner(t, s, "live", runnerID)
 
 	ri := pgITRegisterBearer(t, s, "token-a",
-		`{"id":"`+runnerID+`","name":"ra","protocol_min":3,"protocol_max":3,"labels":["snapshot"],"capacity":8}`)
+		`{"id":"`+runnerID+`","name":"ra","protocol_min":3,"protocol_max":3,"labels":["snapshot"],"capacity":8,"capabilities":["native","container"]}`)
 	if ri.Capacity != 1 || len(ri.Labels) != 1 || ri.Labels[0] != "container" {
 		t.Fatalf("registration did not apply the bound profile: %+v", ri)
+	}
+	if !ri.CapabilitiesEnforced || len(ri.Capabilities) != 1 || ri.Capabilities[0] != "container" {
+		t.Fatalf("registration capabilities = %v enforced %v, want the profile ∩ reported [container]", ri.Capabilities, ri.CapabilitiesEnforced)
 	}
 	// A second, unprofiled runner drives the fleet explainer misses.
 	rival := pgITRegisterBearer(t, s, "token-b",

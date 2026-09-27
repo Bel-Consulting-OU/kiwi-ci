@@ -335,7 +335,7 @@ func TestOIDCClaimsCarryCanonicalRepoID(t *testing.T) {
 	exp := time.Now().Add(time.Minute)
 	s.mu.Lock()
 	s.runs["run-oidc"] = model.Run{ID: "run-oidc", RepoID: "github.com/acme/backend", Repo: "https://github.com/acme/backend.git", RepoFullName: "acme/backend", Ref: "main", SHA: "abc123", Event: "push", Status: model.StatusRunning}
-	s.jobs["job-oidc"] = model.Job{ID: "job-oidc", RunID: "run-oidc", Key: "build", RepoID: "github.com/acme/backend", RepoURL: "https://github.com/acme/backend.git", RepoFullName: "acme/backend", Status: model.StatusRunning, Trusted: true, OIDCAllowed: true, LeaseExpiresAt: &exp, LeaseTokenHash: hashLeaseToken(s.leaseKey, "lease1"), LeaseRunnerID: "runner-1"}
+	s.jobs["job-oidc"] = model.Job{ID: "job-oidc", RunID: "run-oidc", Key: "build", RepoID: "github.com/acme/backend", RepoURL: "https://github.com/acme/backend.git", RepoFullName: "acme/backend", Ref: "main", SHA: "abc123", Event: "push", Environment: "production", Status: model.StatusRunning, Trusted: true, OIDCAllowed: true, LeaseExpiresAt: &exp, LeaseTokenHash: hashLeaseToken(s.leaseKey, "lease1"), LeaseRunnerID: "runner-1"}
 	s.mu.Unlock()
 	tok := issueOIDCToken(t, s, "job-oidc", "lease1", "https://aud.example.com")
 	parts := strings.Split(tok, ".")

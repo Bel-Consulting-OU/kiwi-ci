@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -332,5 +333,198 @@ func TestGCHangingToolsBounded(t *testing.T) {
 	}
 	if elapsed > 10*time.Second {
 		t.Fatalf("GC with hanging tools took %v; the pass was not bounded", elapsed)
+	}
+}
+
+// TestWaitKilledCommandBoundedTypedTimeoutAndDrains is the W4-A primitive
+// contract: a killed command whose wait cannot complete within the grace must
+// return within the bound with a typed ErrExternalCommandTimeout (wrapping
+// context.DeadlineExceeded), and the detached reaper must drain the eventual
+// wait result once the process is finally reaped (no blocked send, no
+// zombie). The wait is injected because a process wedged in an
+// uninterruptible kernel wait cannot be fabricated portably.
+func TestWaitKilledCommandBoundedTypedTimeoutAndDrains(t *testing.T) {
+	testutil.UnixShell(t)
+	origReap, origDetach := waitKilledReap, reapDetached
+	released := make(chan struct{})
+	waitEntered := make(chan struct{})
+	waitKilledReap = func(cmd *exec.Cmd) error {
+		close(waitEntered)
+		<-released
+		return cmd.Wait()
+	}
+	drained := make(chan error, 1)
+	reapDetached = func(done <-chan error) {
+		go func() { drained <- <-done }()
+	}
+	t.Cleanup(func() { waitKilledReap, reapDetached = origReap, origDetach })
+
+	cmd := exec.Command("sleep", "300")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	err := waitKilledCommand(cmd, 50*time.Millisecond)
+	elapsed := time.Since(start)
+	if !errors.Is(err, ErrExternalCommandTimeout) {
+		t.Fatalf("bounded reap error = %v, want ErrExternalCommandTimeout", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("bounded reap error does not wrap context.DeadlineExceeded: %v", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("un-reapable kill/reap took %v; the caller was stranded", elapsed)
+	}
+	select {
+	case <-waitEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("waitKilledCommand never called cmd.Wait")
+	}
+	// The process is finally reaped: the detached reaper must drain the
+	// result, proving the reaper goroutine is not leaked with a blocked send.
+	close(released)
+	select {
+	case werr := <-drained:
+		if werr == nil {
+			t.Fatal("detached reaper received a nil wait result for a SIGKILLed process")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("detached reaper did not drain the wait result")
+	}
+}
+
+// TestWaitKilledCommandReapsKillableCommand proves the normal path: a
+// killable command is killed and reaped through cmd.Wait (Cmd bookkeeping,
+// never Process.Wait) well within the grace, with no error.
+func TestWaitKilledCommandReapsKillableCommand(t *testing.T) {
+	testutil.UnixShell(t)
+	if err := waitKilledCommand(nil, time.Second); err != nil {
+		t.Fatalf("nil command = %v", err)
+	}
+	cmd := exec.Command("sleep", "300")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if err := waitKilledCommand(cmd, 5*time.Second); err != nil {
+		t.Fatalf("killable command reap = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("killable command reap took %v", elapsed)
+	}
+	if cmd.ProcessState == nil {
+		t.Fatal("cmd.Wait bookkeeping missing: the process was not reaped through exec.Cmd")
+	}
+	if cmd.ProcessState.ExitCode() >= 0 {
+		t.Fatalf("SIGKILLed process reported exit code %d, want a signaled exit", cmd.ProcessState.ExitCode())
+	}
+}
+
+// TestTartCloseJobReapFailureNotMaskedByDeleteSuccess is the W4-A join rule:
+// a bounded-reap failure must reach the caller even when the clone delete
+// succeeds, and the command handle must not be dropped while the process is
+// un-reaped.
+func TestTartCloseJobReapFailureNotMaskedByDeleteSuccess(t *testing.T) {
+	testutil.UnixShell(t)
+	orig := reapKilledCommand
+	reapKilledCommand = func(*exec.Cmd, time.Duration) error {
+		return fmt.Errorf("%w: injected reap failure", ErrExternalCommandTimeout)
+	}
+	t.Cleanup(func() { reapKilledCommand = orig })
+
+	fake := writeCleanupScript(t, "tart", "#!/bin/sh\nexit 0\n")
+	run := exec.Command("sleep", "300")
+	if err := run.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = run.Process.Kill()
+		_ = run.Wait()
+	})
+	sshDir := t.TempDir()
+	b := &TartBackend{tart: fake, clone: "kiwi-1-0123456789abcdef", sshDir: sshDir, run: run}
+	err := b.CloseJob()
+	if !errors.Is(err, ErrExternalCommandTimeout) {
+		t.Fatalf("CloseJob with failed reap and successful delete = %v, want ErrExternalCommandTimeout", err)
+	}
+	if !strings.Contains(err.Error(), "injected reap failure") {
+		t.Fatalf("CloseJob error does not name the reap failure: %v", err)
+	}
+	if b.clone != "" {
+		t.Fatalf("CloseJob left clone state %q", b.clone)
+	}
+	if b.sshDir != "" {
+		t.Fatalf("CloseJob left ssh dir state %q", b.sshDir)
+	}
+	if _, statErr := os.Stat(sshDir); !os.IsNotExist(statErr) {
+		t.Fatalf("CloseJob did not remove the ssh dir: %v", statErr)
+	}
+	if b.run == nil {
+		t.Fatal("failed reap dropped the command handle; an un-reaped process was forgotten")
+	}
+}
+
+// TestTartCloseJobJoinsReapAndDeleteFailures proves both bounded failures are
+// joined: neither the wedged reap nor the wedged clone delete can hide the
+// other.
+func TestTartCloseJobJoinsReapAndDeleteFailures(t *testing.T) {
+	testutil.UnixShell(t)
+	origReap, origTimeout := reapKilledCommand, tartCleanupTimeout
+	tartCleanupTimeout = 150 * time.Millisecond
+	reapKilledCommand = func(*exec.Cmd, time.Duration) error {
+		return fmt.Errorf("%w: injected reap failure", ErrExternalCommandTimeout)
+	}
+	t.Cleanup(func() { reapKilledCommand, tartCleanupTimeout = origReap, origTimeout })
+
+	fake := writeCleanupScript(t, "tart", "#!/bin/sh\nexec sleep 300\n")
+	b := &TartBackend{tart: fake, clone: "kiwi-2-fedcba9876543210", run: exec.Command("sleep", "300")}
+	start := time.Now()
+	err := b.CloseJob()
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("reap and delete both failed but CloseJob reported success")
+	}
+	if !errors.Is(err, ErrExternalCommandTimeout) {
+		t.Fatalf("joined CloseJob error = %v, want ErrExternalCommandTimeout", err)
+	}
+	for _, want := range []string{"injected reap failure", "delete Tart VM"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("joined CloseJob error %q missing %q", err, want)
+		}
+	}
+	if elapsed > 10*time.Second {
+		t.Fatalf("double-failure CloseJob took %v; the runner goroutine was stranded", elapsed)
+	}
+}
+
+// TestTartCloseJobNormalPathUnchanged proves a live `tart run` process is
+// still killed, reaped through cmd.Wait, and both ownership fields are
+// cleared, with no error when the delete succeeds.
+func TestTartCloseJobNormalPathUnchanged(t *testing.T) {
+	testutil.UnixShell(t)
+	fake := writeCleanupScript(t, "tart", "#!/bin/sh\nexit 0\n")
+	run := exec.Command("sleep", "300")
+	if err := run.Start(); err != nil {
+		t.Fatal(err)
+	}
+	sshDir := t.TempDir()
+	b := &TartBackend{tart: fake, clone: "kiwi-3", sshDir: sshDir, run: run}
+	if err := b.CloseJob(); err != nil {
+		t.Fatalf("CloseJob: %v", err)
+	}
+	if b.run != nil {
+		t.Fatal("CloseJob did not clear the reaped command handle")
+	}
+	if b.clone != "" || b.sshDir != "" {
+		t.Fatalf("CloseJob did not clear session state: clone=%q sshDir=%q", b.clone, b.sshDir)
+	}
+	if run.ProcessState == nil {
+		t.Fatal("CloseJob did not reap the process through cmd.Wait")
+	}
+	if _, statErr := os.Stat(sshDir); !os.IsNotExist(statErr) {
+		t.Fatalf("CloseJob did not remove the ssh dir: %v", statErr)
+	}
+	if err := b.CloseJob(); err != nil {
+		t.Fatalf("second CloseJob: %v", err)
 	}
 }

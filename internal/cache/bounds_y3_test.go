@@ -128,20 +128,23 @@ func TestRestoreContextHonorsCancellation(t *testing.T) {
 	}
 }
 
-// TestStoreContextDefaults proves the legacy wrappers are bounded when the
-// Store owns its client and defer to a caller-supplied client otherwise.
+// TestStoreContextDefaults proves the legacy wrappers are TIMEOUT-FREE on
+// both paths (W5-B). They used to carry a 30-second TOTAL body deadline when
+// no client was supplied, which killed a continuously-progressing large
+// restore; the no-hang guarantee now comes from the transport phase bounds
+// and the sliding storeStallTimeout watchdog instead. A caller-supplied
+// client still owns its own bounds. Callers that need an absolute wall-clock
+// bound use RestoreContext/SaveContext.
 func TestStoreContextDefaults(t *testing.T) {
-	s := &Store{}
-	ctx, cancel := s.defaultContext()
-	defer cancel()
-	if _, ok := ctx.Deadline(); !ok {
-		t.Fatal("default store context must carry a finite deadline")
-	}
-	s.Client = &http.Client{}
-	ctx, cancel = s.defaultContext()
-	defer cancel()
-	if _, ok := ctx.Deadline(); ok {
-		t.Fatal("a caller-supplied client owns its own bounds; context must be unbounded")
+	for name, s := range map[string]*Store{
+		"no client":   {},
+		"with client": {Client: &http.Client{}},
+	} {
+		ctx, cancel := s.defaultContext()
+		if _, ok := ctx.Deadline(); ok {
+			t.Fatalf("%s: default store context must not impose a total deadline", name)
+		}
+		cancel()
 	}
 }
 
