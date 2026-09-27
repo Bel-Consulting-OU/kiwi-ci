@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"fmt"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/safefs"
 	"os"
 	"sort"
 	"strconv"
@@ -472,3 +473,12 @@ func runXFSProjectCleanup(xq, mountPoint, workspace string, projID uint32, fsKey
 	releaseXFSProjectID(fsKey, projID)
 	return nil
 }
+
+// WorkspaceDiskAvailable is the availability preflight Execute runs before a
+// hard workspace quota is installed: the declared budget must be free on the
+// workspace filesystem or the job fails closed (an unavailable bound is not a
+// bound). It is a variable so tests can exercise the quota gate's contract
+// (fail-closed on an unavailable bound, and the preinstalled status reaching
+// the executor) without depending on how much space the test host happens to
+// have free — the security property is the gate, not the host's disk.
+var WorkspaceDiskAvailable = safefs.FitsAvailable

@@ -19,7 +19,6 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/logging"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
-	"github.com/Bel-Consulting-OU/kiwi-ci/internal/safefs"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secrets"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/snapshot"
 )
@@ -346,7 +345,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		defer cleanup()
 	}
 	if e.Opt.WorkspaceMaxBytes > 0 {
-		if err := safefs.FitsAvailable(workspace, e.Opt.WorkspaceMaxBytes); err != nil {
+		if err := WorkspaceDiskAvailable(workspace, e.Opt.WorkspaceMaxBytes); err != nil {
 			infra := &RunError{Kind: ErrorInfra, Err: fmt.Errorf("workspace quota: %v", err)}
 			e.log(cj.ID, "workspace", infra.Error())
 			res.Status = model.StatusFailure

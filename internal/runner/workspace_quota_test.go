@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -261,6 +262,12 @@ func TestExecuteUntrustedQuotaStatusReachesExecutorAndCleansUp(t *testing.T) {
 	var limitSeen int64
 	var dirSeen string
 	stubWorkspaceQuota(t, executor.DiskQuotaStatus{Hard: true, Limit: executor.DefaultUntrustedWorkspaceMaxBytes, Detail: "fake xfs quota"}, nil, &installs, &cleanups, &limitSeen, &dirSeen)
+	// The availability PREFLIGHT is not what this test exercises, and its
+	// outcome must not depend on how much space the test host has free: stub
+	// it to succeed so the job reaches the docker lookup the assertions pin.
+	origAvailable := executor.WorkspaceDiskAvailable
+	executor.WorkspaceDiskAvailable = func(string, int64) error { return nil }
+	t.Cleanup(func() { executor.WorkspaceDiskAvailable = origAvailable })
 	gotOptions := captureExecutorOptions(t)
 
 	r := testRunnerFor(t, ts, Config{})
@@ -350,5 +357,40 @@ func TestVerifyWorkspaceQuotaPayloadJSONShape(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), `"runtime":"container"`) {
 		t.Fatalf("effective job JSON = %s", raw)
+	}
+}
+
+// TestExecuteUntrustedQuotaAvailabilityFailsClosed deterministically pins the
+// availability preflight: even when a hard bound is reported as installed,
+// the executor re-checks that the declared budget is actually free on the
+// workspace filesystem and fails the job closed (infra) when it is not — an
+// unavailable bound is not a bound. The preflight is stubbed so the assertion
+// does not depend on the test host's free space. (The preflight runs inside
+// the executor, after the runner's pre-checkout install gate, so this test
+// asserts the failure and the error shape, not a pre-checkout ordering.)
+func TestExecuteUntrustedQuotaAvailabilityFailsClosed(t *testing.T) {
+	fsrv := &fakeRunnerServer{}
+	ts := httptest.NewServer(fsrv.handler())
+	defer ts.Close()
+
+	// A hard bound IS reported by the quota install (stubbed), so the job
+	// reaches the executor's availability PREFLIGHT, which fails.
+	installs, cleanups := 0, 0
+	var limitSeen int64
+	var dirSeen string
+	stubWorkspaceQuota(t, executor.DiskQuotaStatus{Hard: true, Limit: executor.DefaultUntrustedWorkspaceMaxBytes, Detail: "fake xfs quota"}, nil, &installs, &cleanups, &limitSeen, &dirSeen)
+	origAvailable := executor.WorkspaceDiskAvailable
+	executor.WorkspaceDiskAvailable = func(workspace string, want int64) error {
+		return fmt.Errorf("safefs: %d bytes required, 0 available", want)
+	}
+	t.Cleanup(func() { executor.WorkspaceDiskAvailable = origAvailable })
+
+	r := testRunnerFor(t, ts, Config{})
+	r.Cfg.CheckoutFn = func(_ context.Context, _ model.Job, dir string) error { return nil }
+	r.execute(context.Background(), untrustedContainerTask(t))
+
+	c, _ := fsrv.lastComplete()
+	if c.Status != model.StatusFailure || !strings.Contains(c.Error, "workspace quota") {
+		t.Fatalf("complete = %+v, want the fail-closed workspace quota refusal", c)
 	}
 }
