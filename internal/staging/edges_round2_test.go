@@ -74,14 +74,18 @@ func TestLoadOrCreateInstanceIDErrorPaths(t *testing.T) {
 		t.Fatal("expected an error when the id path is a directory")
 	}
 
-	// A read-only root fails the O_EXCL open.
-	roRoot := t.TempDir()
-	if err := os.Chmod(roRoot, 0o500); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(roRoot, 0o700) })
-	if _, err := loadOrCreateInstanceID(roRoot); err == nil {
-		t.Fatal("expected an error when the root is read-only")
+	// A read-only root fails the O_EXCL open (permission injection does not
+	// apply to root: root bypasses the mode bits). The unit-nonroot lane
+	// executes this arm.
+	if os.Geteuid() != 0 {
+		roRoot := t.TempDir()
+		if err := os.Chmod(roRoot, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(roRoot, 0o700) })
+		if _, err := loadOrCreateInstanceID(roRoot); err == nil {
+			t.Fatal("expected an error when the root is read-only")
+		}
 	}
 }
 
@@ -132,17 +136,22 @@ func TestSweepSpoolFilesEdges(t *testing.T) {
 		t.Fatal("not-a-directory sweep succeeded")
 	}
 
-	ro := t.TempDir()
-	spool := filepath.Join(ro, FilePrefix+"stranded")
-	if err := os.WriteFile(spool, []byte("bytes"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(ro, 0o500); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(ro, 0o700) })
-	if _, err := sweepSpoolFiles(ro); err == nil {
-		t.Fatal("removal failure was not surfaced")
+	// A read-only root fails the spool removal (permission injection does not
+	// apply to root: root bypasses the mode bits). The unit-nonroot lane
+	// executes this arm.
+	if os.Geteuid() != 0 {
+		ro := t.TempDir()
+		spool := filepath.Join(ro, FilePrefix+"stranded")
+		if err := os.WriteFile(spool, []byte("bytes"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(ro, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(ro, 0o700) })
+		if _, err := sweepSpoolFiles(ro); err == nil {
+			t.Fatal("removal failure was not surfaced")
+		}
 	}
 }
 
@@ -163,20 +172,24 @@ func TestPruneErrorArms(t *testing.T) {
 		t.Fatalf("cancelled Prune = %v, want context.Canceled", err)
 	}
 
-	spool := filepath.Join(dir, FilePrefix+"old")
-	if err := os.WriteFile(spool, []byte("bytes"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	past := time.Now().Add(-time.Hour)
-	if err := os.Chtimes(spool, past, past); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(dir, 0o500); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
-	if _, err := b.Prune(context.Background()); err == nil {
-		t.Fatal("Prune removal failure was not surfaced")
+	// Removal failure (permission injection does not apply to root: root
+	// bypasses the mode bits). The unit-nonroot lane executes this arm.
+	if os.Geteuid() != 0 {
+		spool := filepath.Join(dir, FilePrefix+"old")
+		if err := os.WriteFile(spool, []byte("bytes"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		past := time.Now().Add(-time.Hour)
+		if err := os.Chtimes(spool, past, past); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dir, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+		if _, err := b.Prune(context.Background()); err == nil {
+			t.Fatal("Prune removal failure was not surfaced")
+		}
 	}
 }
 
@@ -251,33 +264,38 @@ func TestMigrateLegacyStagingLayoutErrorArms(t *testing.T) {
 		t.Fatal("migration under a file parent succeeded")
 	}
 
-	// A write+execute (unreadable) root fails the entry read after the lock.
-	noRead := t.TempDir()
-	if err := os.WriteFile(filepath.Join(noRead, LockFileName), []byte{}, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(noRead, 0o300); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(noRead, 0o700) })
-	if _, err := MigrateLegacyStagingLayout(context.Background(), noRead); err == nil {
-		t.Fatal("unreadable root migration succeeded")
-	}
+	// Unreadable and read-only roots (permission injection does not apply to
+	// root: root bypasses the mode bits). The unit-nonroot lane executes
+	// these arms.
+	if os.Geteuid() != 0 {
+		// A write+execute (unreadable) root fails the entry read after the lock.
+		noRead := t.TempDir()
+		if err := os.WriteFile(filepath.Join(noRead, LockFileName), []byte{}, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(noRead, 0o300); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(noRead, 0o700) })
+		if _, err := MigrateLegacyStagingLayout(context.Background(), noRead); err == nil {
+			t.Fatal("unreadable root migration succeeded")
+		}
 
-	// A read-only root fails the spool removal.
-	ro := t.TempDir()
-	if err := os.WriteFile(filepath.Join(ro, LockFileName), []byte{}, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(ro, FilePrefix+"legacy"), []byte("bytes"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(ro, 0o500); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(ro, 0o700) })
-	if _, err := MigrateLegacyStagingLayout(context.Background(), ro); err == nil {
-		t.Fatal("read-only root migration succeeded")
+		// A read-only root fails the spool removal.
+		ro := t.TempDir()
+		if err := os.WriteFile(filepath.Join(ro, LockFileName), []byte{}, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(ro, FilePrefix+"legacy"), []byte("bytes"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(ro, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(ro, 0o700) })
+		if _, err := MigrateLegacyStagingLayout(context.Background(), ro); err == nil {
+			t.Fatal("read-only root migration succeeded")
+		}
 	}
 }
 

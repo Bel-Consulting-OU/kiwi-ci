@@ -108,7 +108,7 @@ func dockerAcceptsCgroupPath(ctx context.Context) error {
 	}
 	out, err := phaseCommand(ctx, runtimeProbeTimeout, docker, "info", "--format", "{{.CgroupDriver}}")
 	if err != nil {
-		return fmt.Errorf("inspect docker cgroup driver: %v: %s", err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("inspect docker cgroup driver: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	switch driver := strings.ToLower(strings.TrimSpace(string(out))); driver {
 	case "cgroupfs":

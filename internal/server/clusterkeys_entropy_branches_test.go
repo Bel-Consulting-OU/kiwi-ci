@@ -82,15 +82,19 @@ func TestFSClusterKeyStoreInstallOrLoadUnwritableDir(t *testing.T) {
 		t.Fatalf("install into a file path = (%d bytes, %v, %v)", len(b), created, err)
 	}
 
-	// Dir exists but is read-only: the CAS temp file cannot be created.
-	readonly := filepath.Join(dir, "ro")
-	if err := os.Mkdir(readonly, 0o500); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(readonly, 0o700) })
-	ro := &FSClusterKeyStore{Dir: readonly}
-	if b, created, err := ro.InstallOrLoad(clusterKindProvenance, []byte("material")); err == nil || created || b != nil {
-		t.Fatalf("install into a read-only dir = (%d bytes, %v, %v)", len(b), created, err)
+	// Dir exists but is read-only: the CAS temp file cannot be created
+	// (permission injection does not apply to root: root bypasses the mode
+	// bits). The unit-nonroot lane executes this arm.
+	if os.Geteuid() != 0 {
+		readonly := filepath.Join(dir, "ro")
+		if err := os.Mkdir(readonly, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(readonly, 0o700) })
+		ro := &FSClusterKeyStore{Dir: readonly}
+		if b, created, err := ro.InstallOrLoad(clusterKindProvenance, []byte("material")); err == nil || created || b != nil {
+			t.Fatalf("install into a read-only dir = (%d bytes, %v, %v)", len(b), created, err)
+		}
 	}
 }
 

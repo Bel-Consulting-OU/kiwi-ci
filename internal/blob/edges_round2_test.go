@@ -96,18 +96,22 @@ func TestFSListBranches(t *testing.T) {
 		t.Fatalf("mixed List reported %d objects, want 0", seen)
 	}
 
-	// An unreadable shard surfaces the read error.
-	unreadable := NewFS(t.TempDir())
-	shard := filepath.Join(unreadable.Root, "sha256", gapKey[:2])
-	if err := os.MkdirAll(shard, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(shard, 0o300); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(shard, 0o700) })
-	if err := unreadable.List(ctx, func(Object) error { return nil }); err == nil {
-		t.Fatal("List over an unreadable shard succeeded")
+	// An unreadable shard surfaces the read error (permission injection does
+	// not apply to root: root bypasses the mode bits). The unit-nonroot lane
+	// executes this arm.
+	if os.Geteuid() != 0 {
+		unreadable := NewFS(t.TempDir())
+		shard := filepath.Join(unreadable.Root, "sha256", gapKey[:2])
+		if err := os.MkdirAll(shard, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(shard, 0o300); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(shard, 0o700) })
+		if err := unreadable.List(ctx, func(Object) error { return nil }); err == nil {
+			t.Fatal("List over an unreadable shard succeeded")
+		}
 	}
 }
 
