@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	v1 "github.com/Bel-Consulting-OU/kiwi-ci/internal/api/v1"
@@ -62,6 +63,14 @@ var ErrRunnerDisabledOrRevoked = errors.New("runner disabled or certificate revo
 // RunnerVersion is the software version reported at registration and can be
 // overridden at build time via -ldflags.
 var RunnerVersion = "dev"
+
+// backgroundDrainGrace bounds how long Run waits for work it spawned
+// (executes and maintenance passes) to finish after its context is cancelled
+// or the drain completes. Run must not return while spawned work can still
+// touch runner state; the bound keeps a job or probe that ignores
+// cancellation from pinning process shutdown forever. A var so tests can
+// shrink it.
+var backgroundDrainGrace = 30 * time.Second
 
 // Seams over the standard library used by the runner. Production behavior is
 // unchanged; they let checked failure branches be exercised deterministically:
@@ -305,7 +314,27 @@ func (r *Runner) Run(ctx context.Context) error {
 		r.startMetricsServer(ctx)
 	}
 	prewarmer := newPrewarmer(r.Cfg)
-	go prewarmer.run(ctx)
+	// background tracks every goroutine Run spawns (executes and the
+	// maintenance passes with their own lifetimes). Run must not return while
+	// spawned work can still touch runner state: the process exits after Run
+	// returns, and tests swap package seams (workspace removal, quota install,
+	// reportf) that a live execute or GC pass reads. waitBackground enforces
+	// that contract, bounded by backgroundDrainGrace.
+	var background sync.WaitGroup
+	waitBackground := func() {
+		finished := make(chan struct{})
+		go func() { background.Wait(); close(finished) }()
+		select {
+		case <-finished:
+		case <-time.After(backgroundDrainGrace):
+			fmt.Fprintf(os.Stderr, "kiwi runner %s: background work still running after %s; exiting anyway\n", r.ID, backgroundDrainGrace)
+		}
+	}
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		_ = prewarmer.run(ctx)
+	}()
 	lastPrewarm := time.Now()
 	lastGC := time.Now()
 	maint := maintenanceSchedule{GCInterval: r.Cfg.GCInterval, PrewarmInterval: r.Cfg.PrewarmInterval}
@@ -322,6 +351,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			task, drainSignal, err := r.next(ctx)
 			if err != nil {
 				if errors.Is(err, ErrRunnerDisabledOrRevoked) {
+					waitBackground()
 					return err
 				}
 				fmt.Fprintf(os.Stderr, "kiwi runner %s: next: %v\n", r.ID, err)
@@ -334,17 +364,25 @@ func (r *Runner) Run(ctx context.Context) error {
 				break
 			}
 			active++
+			background.Add(1)
 			go func(t server.Task) {
+				defer background.Done()
 				r.execute(ctx, t)
 				done <- struct{}{}
 			}(*task)
 		}
 		if draining && active == 0 {
 			fmt.Printf("kiwi runner %s drained: no active work, exiting\n", r.ID)
+			waitBackground()
 			return nil
 		}
 		select {
 		case <-ctx.Done():
+			// Stop leasing, then let the work already started finish so no
+			// execute or maintenance pass outlives Run (bounded by
+			// backgroundDrainGrace: a job that ignores cancellation must not
+			// pin process shutdown forever).
+			waitBackground()
 			return ctx.Err()
 		case <-done:
 			active--
@@ -353,11 +391,19 @@ func (r *Runner) Run(ctx context.Context) error {
 		if gcDue, prewarmDue := maint.due(time.Now(), lastGC, lastPrewarm); gcDue || prewarmDue {
 			if gcDue {
 				lastGC = time.Now()
-				go r.runGCPass(ctx)
+				background.Add(1)
+				go func() {
+					defer background.Done()
+					r.runGCPass(ctx)
+				}()
 			}
 			if prewarmDue {
 				lastPrewarm = time.Now()
-				go prewarmer.run(ctx)
+				background.Add(1)
+				go func() {
+					defer background.Done()
+					_ = prewarmer.run(ctx)
+				}()
 			}
 		}
 	}

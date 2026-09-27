@@ -151,6 +151,15 @@ func TestProvisionContainerWorkspaceRefusesForeignOwner(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = os.Chown(dir, os.Getuid(), os.Getgid()) })
 	} else {
+		// The seam simulates a runner whose identity is not the tree owner,
+		// but the tree really belongs to this test uid. The refusal needs an
+		// owner that is neither the (faked) runner nor the target workload
+		// uid; when the test uid IS the workload uid the fixture collapses
+		// into an idempotent re-provision and cannot express a foreign owner.
+		// The root lane, which really chowns the fixture, covers it.
+		if os.Getuid() == containerWorkloadUID {
+			t.Skipf("test uid %d equals the container workload uid; cannot simulate a foreign owner without root", os.Getuid())
+		}
 		orig := runnerWorkspaceOwner
 		runnerWorkspaceOwner = func() (int, int) { return foreign, os.Getegid() }
 		t.Cleanup(func() { runnerWorkspaceOwner = orig })
