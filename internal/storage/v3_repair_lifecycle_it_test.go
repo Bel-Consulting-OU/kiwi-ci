@@ -167,7 +167,10 @@ func TestPostgresIntegrationCacheManifestReplacementUpdatesCreatedAt(t *testing.
 		t.Fatal(err)
 	}
 	newer := rec
-	newer.CreatedAt = time.Now().UTC()
+	// Microsecond-aligned: PostgreSQL timestamptz has microsecond precision,
+	// and created_at is compared with time.Time.Equal after a round-trip, so a
+	// nanosecond-precise Go clock (Linux) would fail the equality.
+	newer.CreatedAt = time.Now().UTC().Truncate(time.Microsecond)
 	newer.BlobSHA256 = strings.Repeat("b", 64)
 	if err := st.PutCacheManifest(ctx, newer); err != nil {
 		t.Fatal(err)
