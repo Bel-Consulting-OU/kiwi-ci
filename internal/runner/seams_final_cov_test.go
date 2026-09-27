@@ -185,6 +185,15 @@ exit 0
 		Client: ts.Client(), Metrics: NewMetrics()}
 	runDone := make(chan error, 1)
 	go func() { runDone <- r.Run(ctx) }()
+	// Run registers before its first poll, and registration writes Run-state
+	// fields (r.ID) that the GC pass reads. Waiting for the first observed
+	// poll before driving the GC pass directly keeps the two goroutines from
+	// racing register (the checkptr lane caught exactly that), and it also
+	// guarantees the server observed a poll before cancellation below (an
+	// aborted in-flight poll never reaches the handler).
+	waitUntil(t, 10*time.Second, "the runner's first next poll", func() bool {
+		return nextCalls.Load() > 0
+	})
 	// Drive the GC pass directly: the maintenance interval is deliberately long
 	// here so the assertion never depends on scheduler timing.
 	r.runGCPass(ctx)
@@ -196,13 +205,6 @@ exit 0
 	case <-time.After(30 * time.Second):
 		t.Fatal("GC report was not printed")
 	}
-	// Run must have polled at least once BEFORE cancellation: the assertion
-	// below checks the server observed the poll, and under GOMAXPROCS=1 the
-	// first request may still be in flight when cancel lands (an aborted
-	// in-flight request never reaches the handler).
-	waitUntil(t, 10*time.Second, "the runner's first next poll", func() bool {
-		return nextCalls.Load() > 0
-	})
 	cancel()
 	select {
 	case err := <-runDone:
