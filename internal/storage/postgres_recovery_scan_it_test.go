@@ -56,7 +56,11 @@ func TestPostgresIntegrationRecoveryScanDiscoveryPagesDeterministically(t *testi
 	if err := st.InsertRun(ctx, model.Run{ID: runID, Status: model.StatusRunning, CreatedAt: time.Now().UTC()}); err != nil {
 		t.Fatalf("insert run: %v", err)
 	}
-	now := time.Now().UTC()
+	// Microsecond-aligned: PostgreSQL timestamptz has microsecond precision,
+	// and the deadline values below are compared with time.Time.Equal after a
+	// database round-trip. A nanosecond-precise Go clock (Linux) would be
+	// truncated by the storage and the equality assertions would fail.
+	now := time.Now().UTC().Truncate(time.Microsecond)
 	expired := now.Add(-time.Minute)
 	live := now.Add(time.Minute)
 	past := now.Add(-time.Minute)

@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -83,9 +84,10 @@ var (
 )
 
 // apiReadDeadline/apiWriteDeadline bound ordinary (non-streaming) API
-// requests: the body read and the response write respectively. They are
-// variables only so the socket-level tests can shrink the bound; production
-// uses these values.
+// requests: the body read and the response write respectively. The values are
+// atomic seams only so the socket-level tests can shrink the bound (including
+// while a server is live) without racing the middleware; production uses
+// these values.
 //
 // streamIdleTimeout is the SLIDING inactivity bound applied to streaming
 // routes instead: every successful body read re-arms the read deadline and
@@ -95,10 +97,25 @@ var (
 // dropped. It is a variable only so tests can shrink the bound; production
 // uses this value.
 var (
-	apiReadDeadline   = 30 * time.Second
-	apiWriteDeadline  = 60 * time.Second
+	apiReadDeadline   = newAPIDeadline(30 * time.Second)
+	apiWriteDeadline  = newAPIDeadline(60 * time.Second)
 	streamIdleTimeout = 90 * time.Second
 )
+
+// apiDeadline is an ordinary-API deadline held atomically. The middleware
+// reads it once per request; tests may shrink it before or during a server's
+// lifetime, so a plain variable would be a data race with the request path.
+type apiDeadline struct{ nanos atomic.Int64 }
+
+func newAPIDeadline(d time.Duration) *apiDeadline {
+	dl := &apiDeadline{}
+	dl.nanos.Store(int64(d))
+	return dl
+}
+
+func (d *apiDeadline) get() time.Duration { return time.Duration(d.nanos.Load()) }
+
+func (d *apiDeadline) set(v time.Duration) { d.nanos.Store(int64(v)) }
 
 // withAPIDeadlines re-applies the former global ReadTimeout/WriteTimeout
 // contract to the ordinary API routes, while leaving bulk streaming routes
@@ -141,8 +158,8 @@ func withAPIDeadlines(next http.Handler) http.Handler {
 			return
 		}
 		now := time.Now()
-		_ = rc.SetReadDeadline(now.Add(apiReadDeadline))
-		_ = rc.SetWriteDeadline(now.Add(apiWriteDeadline))
+		_ = rc.SetReadDeadline(now.Add(apiReadDeadline.get()))
+		_ = rc.SetWriteDeadline(now.Add(apiWriteDeadline.get()))
 		next.ServeHTTP(w, r)
 	})
 }
