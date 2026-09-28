@@ -99,8 +99,14 @@ func pruneLocalDir(ctx context.Context, root string, policy RetentionPolicy) (Pr
 			return res, err
 		}
 		if policy.MaxAge > 0 && now.Sub(e.modTime) > policy.MaxAge {
-			evictLocalEntry(root, e, &res)
-			continue
+			// Only an entry that was ACTUALLY removed leaves the pass's
+			// accounting. A failed expiration removal still occupies disk,
+			// so it stays in kept and is counted by the byte/count pass
+			// below instead of making the policy look satisfied while the
+			// physical tree exceeds it.
+			if evictLocalEntry(root, e, &res) {
+				continue
+			}
 		}
 		kept = append(kept, e)
 	}
@@ -117,8 +123,13 @@ func pruneLocalDir(ctx context.Context, root string, policy RetentionPolicy) (Pr
 			overBytes := policy.MaxBytes > 0 && total+e.size > policy.MaxBytes
 			overEntries := policy.MaxEntries > 0 && i > policy.MaxEntries-1
 			if overBytes || overEntries {
-				evictLocalEntry(root, e, &res)
-				continue
+				if evictLocalEntry(root, e, &res) {
+					continue
+				}
+				// Eviction failed: the entry still occupies disk and must
+				// stay in the pass's accounting (res.Failed records it), so
+				// later entries cannot be judged compliant against a total
+				// that ignores it.
 			}
 		}
 		total += e.size

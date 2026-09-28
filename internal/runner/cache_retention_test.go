@@ -262,7 +262,7 @@ func TestRunnerCacheAggregateBoundAcrossJobs(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
-	if got := runnerPublishedCacheBytes(t, filepath.Join(root, "cache")); got > 2500 {
+	if got := runnerPublishedCacheBytes(t, r.cacheRootDir()); got > 2500 {
 		t.Fatalf("published cache bytes across jobs = %d, want <= 2500", got)
 	}
 }
@@ -293,7 +293,7 @@ func TestRunnerCacheAggregateBoundIncludesConcurrentRestores(t *testing.T) {
 		CacheRoot: root, CacheMaxBytes: 2500, CacheMaxEntries: 100, CacheArchiveMaxBytes: 1200,
 	})
 	// A cold retained entry that the reservations must account for.
-	cold := filepath.Join(root, "cache")
+	cold := r.cacheRootDir()
 	if err := os.MkdirAll(cold, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -321,7 +321,7 @@ func TestRunnerCacheAggregateBoundIncludesConcurrentRestores(t *testing.T) {
 	wg.Wait()
 	for i := range stores {
 		if errs[i] != nil || !hits[i] {
-			entries, _ := os.ReadDir(filepath.Join(root, "cache"))
+			entries, _ := os.ReadDir(r.cacheRootDir())
 			var names []string
 			for _, e := range entries {
 				fi, _ := e.Info()
@@ -331,7 +331,7 @@ func TestRunnerCacheAggregateBoundIncludesConcurrentRestores(t *testing.T) {
 				i, hits[i], errs[i], stores[i].RemoteURL, served.Load(), nonCache.Load(), names)
 		}
 	}
-	if got := runnerPublishedCacheBytes(t, filepath.Join(root, "cache")); got > 2500 {
+	if got := runnerPublishedCacheBytes(t, r.cacheRootDir()); got > 2500 {
 		t.Fatalf("published cache bytes after concurrent restores = %d, want <= 2500", got)
 	}
 }
@@ -367,4 +367,90 @@ func TestRunnerPruneJobCacheReportsEvictionsAndErrors(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	r.pruneJobCache(ctx)
+}
+
+// TestRunnerCacheNamespacesAreProcessPrivate pins the P1 multi-process fix:
+// the manager's budget and locks are process-local, so each runner process
+// gets its own <cache root>/<runner instance id> directory. Two runners
+// sharing a CacheRoot can therefore never double-spend one physical budget
+// through unrelated ledgers, and each namespace stays within the policy.
+func TestRunnerCacheNamespacesAreProcessPrivate(t *testing.T) {
+	root := t.TempDir()
+	cfg := Config{CacheRoot: root, CacheMaxBytes: 2500, CacheMaxEntries: 100, CacheArchiveMaxBytes: 1200}
+	r1 := testRunnerFor(t, httptest.NewServer(http.NotFoundHandler()), cfg)
+	r2 := testRunnerFor(t, httptest.NewServer(http.NotFoundHandler()), cfg)
+	r2.ID = "runner-2"
+	dir1, dir2 := r1.cacheRootDir(), r2.cacheRootDir()
+	if dir1 == dir2 {
+		t.Fatalf("two runner identities share the cache directory %q", dir1)
+	}
+	if !strings.HasPrefix(dir1, filepath.Join(root, "cache")) || !strings.HasPrefix(dir2, filepath.Join(root, "cache")) {
+		t.Fatalf("namespaces not rooted under the configured cache root: %q %q", dir1, dir2)
+	}
+	for _, r := range []*Runner{r1, r2} {
+		store := r.newJobCache(basicTask(payloadPipeline), r.Metrics)
+		store.RemoteURL = "" // local-only saves
+		for i := 0; i < 4; i++ {
+			ws := t.TempDir()
+			writeCaptureBytes(t, filepath.Join(ws, "f.bin"), 800)
+			_ = store.SaveContext(context.Background(), fmt.Sprintf("ns%02d", i), ws, []string{"f.bin"})
+		}
+		if got := runnerPublishedCacheBytes(t, r.cacheRootDir()); got > 2500 {
+			t.Fatalf("runner %s namespace = %d bytes, policy 2500", r.ID, got)
+		}
+	}
+	// Each namespace holds its own newest entries (older ones were evicted
+	// under the policy).
+	for _, key := range []string{"ns03"} {
+		if _, err := os.Stat(filepath.Join(dir1, key+".tar.gz")); err != nil {
+			t.Fatalf("runner-1 namespace missing %s: %v", key, err)
+		}
+		if _, err := os.Stat(filepath.Join(dir2, key+".tar.gz")); err != nil {
+			t.Fatalf("runner-2 namespace missing %s: %v", key, err)
+		}
+	}
+}
+
+// TestRunnerCacheManagerFollowsConfigAcrossRestarts pins the lifecycle fix:
+// a Run started with a changed cache root or policy replaces the manager
+// instead of accounting new files against the previous ledger. Direct
+// callers keep the lazy construction.
+func TestRunnerCacheManagerFollowsConfigAcrossRestarts(t *testing.T) {
+	r := testRunnerFor(t, httptest.NewServer(http.NotFoundHandler()), Config{CacheRoot: t.TempDir(), CacheMaxBytes: 2000})
+	m1 := r.cacheManager()
+	r.configureCacheManager()
+	if r.cacheManager() != m1 {
+		t.Fatal("same-config reconfigure replaced the manager")
+	}
+	r.Cfg.CacheMaxBytes = 1234
+	r.configureCacheManager()
+	m2 := r.cacheManager()
+	if m2 == m1 {
+		t.Fatal("changed policy kept the stale manager")
+	}
+	if m2.Policy().MaxBytes != 1234 {
+		t.Fatalf("new manager policy = %+v, want 1234 bytes", m2.Policy())
+	}
+	r.Cfg.CacheRoot = t.TempDir()
+	r.configureCacheManager()
+	m3 := r.cacheManager()
+	if m3.Root() != r.cacheRootDir() {
+		t.Fatalf("manager root = %q, want %q", m3.Root(), r.cacheRootDir())
+	}
+	if m3 == m2 {
+		t.Fatal("changed root kept the stale manager")
+	}
+}
+
+// TestRunnerCacheRootDefaultsToHomeCache covers the unconfigured-root branch:
+// the default root still gains the per-runner instance namespace.
+func TestRunnerCacheRootDefaultsToHomeCache(t *testing.T) {
+	r := &Runner{ID: "default-root"}
+	dir := r.cacheRootDir()
+	if filepath.Base(dir) != runnerStagingInstanceID("default-root") {
+		t.Fatalf("default cache dir = %q, want it suffixed with the instance id", dir)
+	}
+	if !strings.HasSuffix(filepath.Dir(dir), "cache") {
+		t.Fatalf("default cache dir = %q, want it under a cache root", dir)
+	}
 }

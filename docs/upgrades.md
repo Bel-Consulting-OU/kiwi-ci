@@ -439,3 +439,17 @@ claims themselves.
   without `KIWI_RELEASE_SIGNING_KEY`. Unsigned releases are only
   possible through an explicit `KIWI_ALLOW_UNSIGNED_RELEASE=1` and must
   be treated as a disaster-recovery exception, never the norm.
+- The runner cache manager's reservation accounting is now fail-closed in
+  three more ways: a deferred release after a successful publication is a
+  no-op (it previously double-subtracted the charge, driving the ledger
+  negative and allowing oversubscription), an aborted operation whose temp
+  file cannot be removed keeps its charge as cleanup debt retried by the
+  cache maintenance pass, and an expired entry whose eviction fails stays in
+  the retention pass's byte/count accounting instead of making the policy
+  look satisfied. Each runner process now uses a private
+  `<cache root>/<runner instance id>` directory: the ledger and locks are
+  process-local, so two runners sharing a root previously each believed they
+  owned the whole budget. A `Run` started with a changed cache root or
+  policy replaces the manager, and a runner-local cache is no longer shared
+  across runner processes (the cache is a performance optimization; a real
+  disk bound wins).

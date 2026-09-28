@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"sync"
 )
@@ -39,39 +40,139 @@ type Manager struct {
 
 	inflight      int64
 	inflightCount int
+	// pendingTemps maps a temp file whose removal failed to the charge that
+	// stays counted until a retry removes it.
+	pendingTemps map[string]int64
 }
 
 // NewManager returns a manager for root with the given aggregate policy. A
 // manager with an inactive policy is still usable: reservations become
 // no-ops (there is no aggregate bound to enforce) and Prune does nothing.
 func NewManager(root string, policy RetentionPolicy) *Manager {
-	return &Manager{root: root, policy: policy}
+	return &Manager{root: root, policy: policy, pendingTemps: map[string]int64{}}
 }
 
-// Reservation is one granted aggregate-cache charge. It must be ended exactly
-// once by Release (failure or pre-publication abort) or by Manager.Publish
-// (successful publication). Both are idempotent.
+// Root returns the manager's cache directory (restart validation compares
+// it with the configured root).
+func (m *Manager) Root() string {
+	if m == nil {
+		return ""
+	}
+	return m.root
+}
+
+// Policy returns the manager's aggregate retention policy (restart
+// validation compares it with the configured policy).
+func (m *Manager) Policy() RetentionPolicy {
+	if m == nil {
+		return RetentionPolicy{}
+	}
+	return m.policy
+}
+
+// Reservation states. A reservation is OPEN while its operation may still
+// need the charge, PUBLISHED once Manager.Publish retired it because the
+// bytes became visible to scans (retained, so the charge must NOT be
+// returned again), or RELEASED when the operation aborted before publication.
+const (
+	reservationOpen = iota
+	reservationPublished
+	reservationReleased
+	// reservationRetained means the operation aborted but its temp file
+	// could not be removed: the charge stays counted against the budget as
+	// cleanup debt until Manager.RetryTempCleanup removes the file.
+	reservationRetained
+)
+
+// Reservation is one granted aggregate-cache charge. It is ended exactly
+// once: Manager.Publish retires it on successful publication, Release
+// returns the charge when the operation aborted before publication. Both are
+// idempotent, and Release is a no-op on an already published or released
+// reservation — a deferred Release after Publish must never subtract the
+// charge a second time (that would drive inflight negative and let later
+// reservations oversubscribe the physical budget).
 type Reservation struct {
 	m     *Manager
 	n     int64
-	state int // 0 open, 1 published/retired, 2 released
+	state int
 }
 
-// Release returns the reservation's charge. Retained bytes are measured from
-// the directory on the next scan, so a published archive immediately counts
-// and a failed one stops occupying reservation capacity.
+// retainLocked converts an OPEN reservation into cleanup debt for path. The
+// charge itself is unchanged (the file still occupies disk), so later
+// reservations keep seeing it; RetryTempCleanup returns it once the file is
+// gone. Callers hold m.mu.
+func (r *Reservation) retainLocked(path string) {
+	if r == nil || r.state != reservationOpen {
+		return
+	}
+	r.state = reservationRetained
+	r.m.pendingTemps[path] = r.n
+}
+
+// Release returns an OPEN reservation's charge. Retained bytes are measured
+// from the directory on the next scan, so an aborted operation stops
+// occupying reservation capacity; a published reservation is already
+// represented by those retained bytes and must not be released again.
 func (r *Reservation) Release() {
 	if r == nil || r.m == nil {
 		return
 	}
 	m := r.m
 	m.mu.Lock()
-	if r.state != 2 {
+	if r.state == reservationOpen {
 		m.inflight -= r.n
 		m.inflightCount--
-		r.state = 2
+		r.state = reservationReleased
 	}
 	m.mu.Unlock()
+}
+
+// RetainTempCleanup records that path (a temp file created under an OPEN
+// reservation) could not be removed. The charge stays counted against the
+// budget and RetryTempCleanup retries the removal; the reservation can no
+// longer be released or published. It reports whether the reservation was
+// open and is now retained.
+func (m *Manager) RetainTempCleanup(res *Reservation, path string) bool {
+	if m == nil || res == nil || path == "" {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if res.m != m || res.state != reservationOpen {
+		return false
+	}
+	res.retainLocked(path)
+	return true
+}
+
+// RetryTempCleanup retries every retained temp file's removal under the
+// manager lock. Successfully removed files return their charge to the
+// budget; failures stay pending for the next pass. The context is checked
+// between files.
+func (m *Manager) RetryTempCleanup(ctx context.Context) (int, error) {
+	if m == nil || len(m.pendingTemps) == 0 {
+		return 0, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	removed := 0
+	var firstErr error
+	for path, charge := range m.pendingTemps {
+		if err := ctx.Err(); err != nil {
+			return removed, err
+		}
+		if err := removeCacheTemp(path); err != nil && !os.IsNotExist(err) {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		delete(m.pendingTemps, path)
+		m.inflight -= charge
+		m.inflightCount--
+		removed++
+	}
+	return removed, firstErr
 }
 
 // Publish runs publish while holding the manager lock and, on success,
@@ -80,6 +181,10 @@ func (r *Reservation) Release() {
 // the worst-case charge would double-count them and make a second
 // reservation evict the entry that was just published. On failure the
 // reservation stays held and the caller must Release it.
+//
+// The reservation must belong to this manager and be OPEN; anything else is
+// a programming error and leaves the accounting untouched (the publish
+// itself still runs).
 func (m *Manager) Publish(res *Reservation, publish func() error) error {
 	if m == nil {
 		return publish()
@@ -89,10 +194,10 @@ func (m *Manager) Publish(res *Reservation, publish func() error) error {
 	if err := publish(); err != nil {
 		return err
 	}
-	if res != nil {
+	if res != nil && res.m == m && res.state == reservationOpen {
 		m.inflight -= res.n
 		m.inflightCount--
-		res.state = 1
+		res.state = reservationPublished
 	}
 	return nil
 }

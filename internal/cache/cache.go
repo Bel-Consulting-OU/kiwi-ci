@@ -439,6 +439,10 @@ var (
 	closeCacheFile  = (*os.File).Close
 	syncCacheFile   = (*os.File).Sync
 	renameCacheFile = os.Rename
+	// removeCacheTemp removes an aborted operation's temp file. A failure
+	// with a manager configured becomes retained cleanup debt (see
+	// Manager.RetainTempCleanup), never a silent charge release.
+	removeCacheTemp = os.Remove
 	copyCacheDigest = io.Copy
 )
 
@@ -731,13 +735,13 @@ func (s *Store) SaveContext(ctx context.Context, key, workspace string, paths []
 	w := safefs.NewCappedWriter(safefs.NewContextWriter(ctx, cw), bound)
 	if err := safefs.WriteTarGzFromRoot(w, root, paths); err != nil {
 		_ = f.Close()
-		_ = os.Remove(tmp)
+		s.discardTemp(tmp, reservation)
 		return err
 	}
 	syncErr := syncCacheFile(f)
 	closeErr := closeCacheFile(f)
 	if syncErr != nil || closeErr != nil {
-		_ = os.Remove(tmp)
+		s.discardTemp(tmp, reservation)
 		if syncErr != nil {
 			return syncErr
 		}
@@ -769,7 +773,7 @@ func (s *Store) SaveContext(ctx context.Context, key, workspace string, paths []
 		publishErr = publish()
 	}
 	if publishErr != nil {
-		_ = os.Remove(tmp)
+		s.discardTemp(tmp, reservation)
 		return publishErr
 	}
 	// Enforce the aggregate retention policy after every committed save: the
@@ -788,6 +792,22 @@ func (s *Store) SaveContext(ctx context.Context, key, workspace string, paths []
 		}
 	}
 	return nil
+}
+
+// discardTemp removes an aborted operation's temp file. With a manager
+// configured, a failed removal keeps the reservation as cleanup debt (the
+// file still occupies disk and stays counted against the budget) instead of
+// returning the charge; Manager.RetryTempCleanup retries it from the
+// runner's maintenance pass.
+func (s *Store) discardTemp(tmp string, res *Reservation) {
+	if tmp == "" {
+		return
+	}
+	if err := removeCacheTemp(tmp); err != nil && !os.IsNotExist(err) {
+		if s.Manager != nil {
+			s.Manager.RetainTempCleanup(res, tmp)
+		}
+	}
 }
 
 func (s *Store) client() *http.Client {
@@ -885,20 +905,20 @@ func (s *Store) fetchRemoteContext(ctx context.Context, key string) error {
 	syncErr := syncCacheFile(f)
 	cl := closeCacheFile(f)
 	if cp != nil {
-		_ = os.Remove(tmp)
+		s.discardTemp(tmp, reservation)
 		return stallError(ctx, guard, cp)
 	}
 	if syncErr != nil {
-		_ = os.Remove(tmp)
+		s.discardTemp(tmp, reservation)
 		return syncErr
 	}
 	if cl != nil {
-		_ = os.Remove(tmp)
+		s.discardTemp(tmp, reservation)
 		return cl
 	}
 	digest := hex.EncodeToString(h.Sum(nil))
 	if want := strings.TrimSpace(resp.Header.Get(HeaderCacheSHA256)); want != "" && want != digest {
-		_ = os.Remove(tmp)
+		s.discardTemp(tmp, reservation)
 		return fmt.Errorf("cache download digest mismatch: got %s, want %s", digest, want)
 	}
 	// Publish under the manager lock (when configured) so the fetched entry
@@ -925,7 +945,7 @@ func (s *Store) fetchRemoteContext(ctx context.Context, key string) error {
 		publishErr = publish()
 	}
 	if publishErr != nil {
-		_ = os.Remove(tmp)
+		s.discardTemp(tmp, reservation)
 		return publishErr
 	}
 	return nil

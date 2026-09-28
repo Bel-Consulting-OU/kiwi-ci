@@ -465,6 +465,10 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err := r.configureStaging(); err != nil {
 		return err
 	}
+	// The cache manager follows the same explicit lifecycle: a Run started
+	// with a changed cache root or policy gets a fresh manager instead of
+	// accounting against the previous Run's ledger.
+	r.configureCacheManager()
 	// The staging ledger is exposed as scrape-time gauges: Used() includes
 	// cleanup debt (bytes whose removal failed and that a maintenance retry
 	// must reclaim), and PendingCleanup() is the degraded/cleanup-required

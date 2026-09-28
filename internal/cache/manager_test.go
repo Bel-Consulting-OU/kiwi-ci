@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -626,4 +627,353 @@ func TestManagerReserveEdgeBranches(t *testing.T) {
 	if res, err := store.Prune(context.Background()); err != nil || res.Entries != 1 {
 		t.Fatalf("delegated prune = %+v, %v", res, err)
 	}
+}
+
+// TestPublishedReservationDeferredReleaseIsNoop pins the P1 accounting fix:
+// Publish already retired the charge, so a deferred Release (the normal
+// defer in every save/restore) must not subtract it again.
+func TestPublishedReservationDeferredReleaseIsNoop(t *testing.T) {
+	root := t.TempDir()
+	m := NewManager(root, RetentionPolicy{MaxBytes: 2500, MaxEntries: 10})
+	res, err := m.Reserve(context.Background(), 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Publish(res, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	inflight, count := m.inflight, m.inflightCount
+	m.mu.Unlock()
+	if inflight != 0 || count != 0 {
+		t.Fatalf("after publish inflight=%d count=%d, want 0/0", inflight, count)
+	}
+	res.Release()
+	res.Release()
+	m.mu.Lock()
+	inflight, count = m.inflight, m.inflightCount
+	m.mu.Unlock()
+	if inflight != 0 || count != 0 {
+		t.Fatalf("deferred Release corrupted accounting: inflight=%d count=%d", inflight, count)
+	}
+}
+
+// TestPublishedReservationDoesNotDriveInflightNegative is the capacity
+// regression: after a publish+deferred-release cycle the manager must still
+// refuse reservations that would exceed the physical budget.
+func TestPublishedReservationDoesNotDriveInflightNegative(t *testing.T) {
+	root := t.TempDir()
+	const maxBytes = 2000
+	m := NewManager(root, RetentionPolicy{MaxBytes: maxBytes, MaxEntries: 10})
+	res, err := m.Reserve(context.Background(), 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeEntry(t, root, "published", 1000, time.Now())
+	if err := m.Publish(res, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	res.Release() // deferred shape
+	// Retained is now 1000; a maximum-size reservation must evict it and
+	// still fit, while a request beyond the budget must be refused.
+	next, err := m.Reserve(context.Background(), 2000)
+	if err != nil {
+		t.Fatalf("max reservation after publish = %v", err)
+	}
+	next.Release()
+	// Physical truth: retained (0 after eviction) + inflight 0 <= 2000.
+	if got := publishedBytes(t, root); got > maxBytes {
+		t.Fatalf("published bytes = %d, want <= %d", got, maxBytes)
+	}
+}
+
+// TestPublishedReservationDoesNotDriveEntryCountNegative pins the entry-slot
+// accounting under the same cycle.
+func TestPublishedReservationDoesNotDriveEntryCountNegative(t *testing.T) {
+	root := t.TempDir()
+	m := NewManager(root, RetentionPolicy{MaxEntries: 1})
+	res, err := m.Reserve(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Publish(res, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	res.Release()
+	m.mu.Lock()
+	count := m.inflightCount
+	m.mu.Unlock()
+	if count != 0 {
+		t.Fatalf("inflightCount = %d after publish+release, want 0", count)
+	}
+	// The single entry slot is free again.
+	next, err := m.Reserve(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("slot after publish+release = %v", err)
+	}
+	next.Release()
+}
+
+// TestRepeatedSuccessfulSavesPreserveAggregateBound runs dozens of real
+// save/publish/deferred-release cycles through a shared manager and then
+// proves the physical tree never exceeded the policy and a maximum-size
+// reservation still cannot oversubscribe it.
+func TestRepeatedSuccessfulSavesPreserveAggregateBound(t *testing.T) {
+	root := t.TempDir()
+	const maxBytes = 2500
+	m := NewManager(root, RetentionPolicy{MaxBytes: maxBytes, MaxEntries: 100})
+	stores := []*Store{
+		{Root: root, Manager: m, MaxCacheBytes: 1200},
+		{Root: root, Manager: m, MaxCacheBytes: 1200},
+	}
+	for i := 0; i < 40; i++ {
+		ws := t.TempDir()
+		writeIncompressible(t, filepath.Join(ws, "f.bin"), 400)
+		store := stores[i%len(stores)]
+		if err := store.SaveContext(context.Background(), fmt.Sprintf("save%03d", i), ws, []string{"f.bin"}); err != nil {
+			t.Fatalf("save %d: %v", i, err)
+		}
+		if got := publishedBytes(t, root); got > maxBytes {
+			t.Fatalf("cycle %d published %d bytes, budget %d", i, got, maxBytes)
+		}
+	}
+	// A maximum-size reservation must still respect retained+inflight.
+	res, err := m.Reserve(context.Background(), 1200)
+	if err != nil {
+		t.Fatalf("max reservation after cycles: %v", err)
+	}
+	if got := publishedBytes(t, root); got+m.inflight > maxBytes {
+		t.Fatalf("retained %d + inflight %d exceeds budget %d", got, m.inflight, maxBytes)
+	}
+	res.Release()
+}
+
+// TestRepeatedSuccessfulRestoresPreserveAggregateBound runs dozens of remote
+// restore cycles (the deferred-release shape included) through a shared
+// manager and checks the physical bound throughout.
+func TestRepeatedSuccessfulRestoresPreserveAggregateBound(t *testing.T) {
+	archive := validArchiveBytes(t)
+	const maxBytes = 3000
+	root := t.TempDir()
+	m := NewManager(root, RetentionPolicy{MaxBytes: maxBytes, MaxEntries: 100})
+	started := make(chan struct{}, 1)
+	srv := remoteArchiveServer(t, archive, started, nil)
+	store := &Store{Root: root, Manager: m, MaxCacheBytes: 1200, RemoteURL: srv.URL}
+	for i := 0; i < 30; i++ {
+		key := fmt.Sprintf("restore%03d", i)
+		hit, err := store.RestoreContext(context.Background(), key, t.TempDir(), []string{"f"})
+		if err != nil || !hit {
+			t.Fatalf("restore %d = hit=%t err=%v", i, hit, err)
+		}
+		if got := publishedBytes(t, root); got > maxBytes {
+			t.Fatalf("cycle %d published %d bytes, budget %d", i, got, maxBytes)
+		}
+	}
+	res, err := m.Reserve(context.Background(), 1200)
+	if err != nil {
+		t.Fatalf("max reservation after restores: %v", err)
+	}
+	if got := publishedBytes(t, root); got+m.inflight > maxBytes {
+		t.Fatalf("retained %d + inflight %d exceeds budget %d", got, m.inflight, maxBytes)
+	}
+	res.Release()
+}
+
+// TestSaveContextTempCleanupFailureKeepsCharge pins the aborted-operation
+// hole: when the temp file cannot be removed, the charge must stay counted
+// (not silently released) until a retry removes the file.
+func TestSaveContextTempCleanupFailureKeepsCharge(t *testing.T) {
+	root := t.TempDir()
+	m := NewManager(root, RetentionPolicy{MaxBytes: 2500, MaxEntries: 10})
+	store := &Store{Root: root, Manager: m, MaxCacheBytes: 1200}
+	ws := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ws, "f"), []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	origRename, origRemove := renameCacheFile, removeCacheTemp
+	renameCacheFile = func(string, string) error { return errors.New("rename refused") }
+	removeCacheTemp = func(path string) error {
+		if strings.Contains(path, ".tmp") {
+			return errors.New("test: busy")
+		}
+		return os.Remove(path)
+	}
+	t.Cleanup(func() { renameCacheFile, removeCacheTemp = origRename, origRemove })
+
+	if err := store.SaveContext(context.Background(), "key1", ws, []string{"f"}); err == nil {
+		t.Fatal("SaveContext succeeded")
+	}
+	m.mu.Lock()
+	inflight, pending := m.inflight, len(m.pendingTemps)
+	m.mu.Unlock()
+	if inflight != 1200 || pending != 1 {
+		t.Fatalf("after failed cleanup inflight=%d pending=%d, want 1200/1", inflight, pending)
+	}
+	// The budget is truthful: a full-size reservation still evicts/refuses
+	// rather than oversubscribing.
+	held, err := m.Reserve(context.Background(), 1200)
+	if err != nil {
+		t.Fatalf("reserve under retained temp charge = %v", err)
+	}
+	held.Release()
+	removeCacheTemp = origRemove
+	if removed, err := m.RetryTempCleanup(context.Background()); err != nil || removed != 1 {
+		t.Fatalf("RetryTempCleanup = %d, %v", removed, err)
+	}
+	m.mu.Lock()
+	inflight = m.inflight
+	m.mu.Unlock()
+	if inflight != 0 {
+		t.Fatalf("inflight = %d after temp retry, want 0", inflight)
+	}
+}
+
+// TestFetchRemoteTempCleanupFailureKeepsCharge is the remote-download half of
+// the same contract.
+func TestFetchRemoteTempCleanupFailureKeepsCharge(t *testing.T) {
+	archive := validArchiveBytes(t)
+	srv := remoteArchiveServer(t, archive, nil, nil)
+	root := t.TempDir()
+	m := NewManager(root, RetentionPolicy{MaxBytes: 2500, MaxEntries: 10})
+	store := &Store{Root: root, Manager: m, MaxCacheBytes: 1200, RemoteURL: srv.URL}
+	origRename, origRemove := renameCacheFile, removeCacheTemp
+	renameCacheFile = func(string, string) error { return errors.New("rename refused") }
+	removeCacheTemp = func(path string) error {
+		if strings.Contains(path, ".tmp") {
+			return errors.New("test: busy")
+		}
+		return os.Remove(path)
+	}
+	t.Cleanup(func() { renameCacheFile, removeCacheTemp = origRename, origRemove })
+
+	if _, err := store.RestoreContext(context.Background(), "key1", t.TempDir(), []string{"f"}); err == nil {
+		t.Fatal("RestoreContext succeeded")
+	}
+	m.mu.Lock()
+	inflight, pending := m.inflight, len(m.pendingTemps)
+	m.mu.Unlock()
+	// The reservation charged the advertised Content-Length exactly.
+	if want := int64(len(archive)); inflight != want || pending != 1 {
+		t.Fatalf("after failed cleanup inflight=%d pending=%d, want %d/1", inflight, pending, want)
+	}
+	removeCacheTemp = origRemove
+	if removed, err := m.RetryTempCleanup(context.Background()); err != nil || removed != 1 {
+		t.Fatalf("RetryTempCleanup = %d, %v", removed, err)
+	}
+}
+
+// TestPruneFailedAgeEvictionStaysAccounted pins the pass-accounting fix: an
+// expired entry whose removal fails must remain part of the byte/count
+// accounting for the rest of the pass, so the policy cannot look satisfied
+// while the physical tree exceeds it.
+func TestPruneFailedAgeEvictionStaysAccounted(t *testing.T) {
+	root := t.TempDir()
+	writeEntry(t, root, "stuck", 100, time.Now().Add(-2*time.Hour))
+	writeEntry(t, root, "fresh", 100, time.Now())
+	store := &Store{Root: root, Retention: RetentionPolicy{MaxAge: time.Hour, MaxBytes: 150, MaxEntries: 10}}
+	orig := removeCacheFile
+	removeCacheFile = func(path string) error {
+		if filepath.Base(path) == "stuck.tar.gz" {
+			return errors.New("test: remove refused")
+		}
+		return os.Remove(path)
+	}
+	t.Cleanup(func() { removeCacheFile = orig })
+	res, err := store.Prune(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Entries != 0 || res.Failed < 2 {
+		t.Fatalf("prune = %+v, want the stuck entry retried and failed in both passes", res)
+	}
+	if _, err := os.Stat(filepath.Join(root, "stuck.tar.gz")); err != nil {
+		t.Fatalf("stuck entry vanished: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "fresh.tar.gz")); err != nil {
+		t.Fatalf("fresh entry vanished: %v", err)
+	}
+}
+
+// TestManagerRetryTempCleanupFailurePath pins the retry's own failure
+// handling: a still-undeletable temp keeps its charge and is reported, and
+// the next pass returns it once removal succeeds.
+func TestManagerRetryTempCleanupFailurePath(t *testing.T) {
+	root := t.TempDir()
+	m := NewManager(root, RetentionPolicy{MaxBytes: 1000})
+	ws := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ws, "f"), []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := &Store{Root: root, Manager: m, MaxCacheBytes: 500}
+	origRename, origRemove := renameCacheFile, removeCacheTemp
+	renameCacheFile = func(string, string) error { return errors.New("rename refused") }
+	removeCacheTemp = func(string) error { return errors.New("test: busy") }
+	t.Cleanup(func() { renameCacheFile, removeCacheTemp = origRename, origRemove })
+	if err := store.SaveContext(context.Background(), "key1", ws, []string{"f"}); err == nil {
+		t.Fatal("SaveContext succeeded")
+	}
+	removed, err := m.RetryTempCleanup(context.Background())
+	if removed != 0 || err == nil {
+		t.Fatalf("failing retry = %d, %v; want 0 and an error", removed, err)
+	}
+	m.mu.Lock()
+	inflight := m.inflight
+	m.mu.Unlock()
+	if inflight != 500 {
+		t.Fatalf("inflight = %d after failed retry, want the charge retained", inflight)
+	}
+	removeCacheTemp = origRemove
+	if removed, err = m.RetryTempCleanup(context.Background()); err != nil || removed != 1 {
+		t.Fatalf("recovery retry = %d, %v", removed, err)
+	}
+	// A canceled retry stops early (with a pending entry present).
+	m.mu.Lock()
+	m.pendingTemps["late"] = 1
+	m.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := m.RetryTempCleanup(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled retry = %v", err)
+	}
+}
+
+// TestManagerAccessorsAndDefensiveBranches covers the small validation
+// branches: nil accessors, foreign/released/retained reservations in
+// Publish/RetainTempCleanup, and the no-op discard of an empty temp path.
+func TestManagerAccessorsAndDefensiveBranches(t *testing.T) {
+	var nilMgr *Manager
+	if nilMgr.Root() != "" || nilMgr.Policy() != (RetentionPolicy{}) {
+		t.Fatal("nil manager accessors must be zero-valued")
+	}
+	m1 := NewManager(t.TempDir(), RetentionPolicy{MaxBytes: 1000})
+	m2 := NewManager(t.TempDir(), RetentionPolicy{MaxBytes: 1000})
+	foreign, err := m2.Reserve(context.Background(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	published := false
+	if err := m1.Publish(foreign, func() error { published = true; return nil }); err != nil || !published {
+		t.Fatalf("foreign publish = %v published=%t", err, published)
+	}
+	m1.mu.Lock()
+	if m1.inflight != 0 {
+		m1.mu.Unlock()
+		t.Fatal("foreign reservation mutated the manager")
+	}
+	m1.mu.Unlock()
+	foreign.Release()
+	closed, err := m1.Reserve(context.Background(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed.Release()
+	if m1.Publish(closed, func() error { return nil }) != nil {
+		t.Fatal("publish of a released reservation errored")
+	}
+	if m1.RetainTempCleanup(nil, "p") || m1.RetainTempCleanup(closed, "p") || m1.RetainTempCleanup(foreign, "") {
+		t.Fatal("invalid RetainTempCleanup accepted")
+	}
+	var nilStore *Store
+	nilStore.discardTemp("", nil)
+	(&Store{Root: t.TempDir()}).discardTemp("", nil)
 }

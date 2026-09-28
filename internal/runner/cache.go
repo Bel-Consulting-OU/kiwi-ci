@@ -102,12 +102,26 @@ func (t *cacheTransport) passthrough(req *http.Request) (*http.Response, error) 
 	return http.DefaultTransport.RoundTrip(req)
 }
 
-// cacheRootDir resolves the directory holding the runner-local cache tree.
-func (r *Runner) cacheRootDir() string {
+// cacheRootRoot resolves the shared-ish root above the runner-specific cache
+// namespace: <CacheRoot>/cache when configured, else the user cache root.
+func (r *Runner) cacheRootRoot() string {
 	if r.Cfg.CacheRoot != "" {
 		return filepath.Join(r.Cfg.CacheRoot, "cache")
 	}
 	return cache.Default().Root
+}
+
+// cacheRootDir resolves the runner's PRIVATE cache directory:
+// <root>/<runner instance id>. The manager's budget, reservations and locks
+// are process-local, so two runner processes sharing one directory would
+// each believe they own the whole policy — double the physical bound, with
+// unrelated eviction/publication locks. A per-runner namespace makes the
+// configured budget physically real and keeps restart reclaim deterministic
+// (a restarted runner reuses its own id-derived directory). Cross-runner
+// local cache sharing is deliberately sacrificed: the cache is a performance
+// optimization, and correctness of the disk bound wins.
+func (r *Runner) cacheRootDir() string {
+	return filepath.Join(r.cacheRootRoot(), runnerStagingInstanceID(r.ID))
 }
 
 // cacheRetentionPolicy resolves the aggregate local-cache bound: every
@@ -127,10 +141,27 @@ func (r *Runner) cacheRetentionPolicy() cache.RetentionPolicy {
 	return p
 }
 
-// cacheManager returns the runner-wide aggregate cache budget owner,
-// constructed once per runner and shared by every job's Store. The manager
-// is what makes the aggregate bound real: it serializes reservations,
-// evictions and publications across jobs that each hold their own Store.
+// configureCacheManager installs the manager for THIS Run. Run calls it
+// before any job can be leased; all work from a previous Run has joined by
+// then, so a changed root or policy replaces the manager instead of
+// accounting new files against the old ledger (which would be worse with a
+// changed root: reservations and writes would refer to different
+// directories). Direct execute callers keep the lazy construction.
+func (r *Runner) configureCacheManager() {
+	root := r.cacheRootDir()
+	policy := r.cacheRetentionPolicy()
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	if r.cacheMgr != nil && r.cacheMgr.Root() == root && r.cacheMgr.Policy() == policy {
+		return
+	}
+	r.cacheMgr = cache.NewManager(root, policy)
+}
+
+// cacheManager returns the runner-wide aggregate cache budget owner, shared
+// by every job's Store. The manager is what makes the aggregate bound real:
+// it serializes reservations, evictions and publications across jobs that
+// each hold their own Store.
 func (r *Runner) cacheManager() *cache.Manager {
 	r.cacheMu.Lock()
 	defer r.cacheMu.Unlock()
@@ -145,7 +176,16 @@ func (r *Runner) cacheManager() *cache.Manager {
 // next pass's accounting) instead of silently freeing capacity; entries
 // refreshed after ranking are skipped by the freshness fence.
 func (r *Runner) pruneJobCache(ctx context.Context) {
-	res, err := r.cacheManager().Prune(ctx)
+	mgr := r.cacheManager()
+	// Temp files whose removal failed on an aborted operation still occupy
+	// disk and still hold their charge; retry them before the retention
+	// pass so the budget reflects reality as soon as possible.
+	if removed, err := mgr.RetryTempCleanup(ctx); err != nil {
+		reportf("kiwi runner %s: cache temp cleanup retry failed (%d removed): %v\n", r.ID, removed, err)
+	} else if removed > 0 {
+		reportf("kiwi runner %s: cache temp cleanup reclaimed %d file(s)\n", r.ID, removed)
+	}
+	res, err := mgr.Prune(ctx)
 	if err != nil {
 		reportf("kiwi runner %s: cache retention: %v\n", r.ID, err)
 		return
