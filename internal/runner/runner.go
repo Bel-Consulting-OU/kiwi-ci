@@ -1083,7 +1083,13 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		masker.Add(t.LeaseToken)
 	}
 	if err := r.restoreDownloads(setupCtx, t, cj.Job.Downloads, tmp); err != nil {
-		r.complete(parent, t, model.StatusFailure, err, nil)
+		// setupCtx is the same context checkout runs under, so the same
+		// status rule applies: a deadline/cancellation that ended a
+		// dependency download is a CANCELLATION, not a failure. Without
+		// this the identical deadline produced different terminal semantics
+		// depending on which setup subphase it interrupted (checkout ->
+		// cancelled, restore -> failure).
+		r.complete(parent, t, statusForErr(setupCtx, err), err, nil)
 		return
 	}
 	// The setup phase ends here: checkout, dependency restore and
@@ -1757,16 +1763,10 @@ func runnerStagingInstanceID(id string) string {
 	return "runner-" + hex.EncodeToString(sum[:8])
 }
 
-// newStagingBudget constructs the runner-wide bounded spool budget. The
-// configured StagingDir (or the resolved spool root) is a ROOT: the budget
-// owns <root>/<instance id>, takes its exclusive ownership lock, and
-// reclaims the spool files a dead predecessor left behind. A configured
-// StagingMaxBytes wins; otherwise the default is one maximum-size artifact.
-func (r *Runner) newStagingBudget() (*staging.Budget, error) {
-	root := strings.TrimSpace(r.Cfg.StagingDir)
-	if root == "" {
-		root = r.dependencySpoolRoot()
-	}
+// desiredStagingMaxBytes resolves the runner-wide staging bound: a
+// configured StagingMaxBytes wins; otherwise the default is one maximum-size
+// artifact.
+func (r *Runner) desiredStagingMaxBytes() int64 {
 	maxBytes := r.Cfg.StagingMaxBytes
 	if maxBytes <= 0 {
 		maxBytes = dependencyArtifactMaxBytes
@@ -1774,7 +1774,19 @@ func (r *Runner) newStagingBudget() (*staging.Budget, error) {
 			maxBytes = defaultStagingMaxBytes
 		}
 	}
-	b, err := staging.NewReplicaBudget(root, runnerStagingInstanceID(r.ID), maxBytes)
+	return maxBytes
+}
+
+// newStagingBudget constructs the runner-wide bounded spool budget. The
+// configured StagingDir (or the resolved spool root) is a ROOT: the budget
+// owns <root>/<instance id>, takes its exclusive ownership lock, and
+// reclaims the spool files a dead predecessor left behind.
+func (r *Runner) newStagingBudget() (*staging.Budget, error) {
+	root := strings.TrimSpace(r.Cfg.StagingDir)
+	if root == "" {
+		root = r.dependencySpoolRoot()
+	}
+	b, err := staging.NewReplicaBudget(root, runnerStagingInstanceID(r.ID), r.desiredStagingMaxBytes())
 	if err != nil {
 		return nil, fmt.Errorf("staging: %w", err)
 	}
@@ -1783,16 +1795,28 @@ func (r *Runner) newStagingBudget() (*staging.Budget, error) {
 
 // configureStaging constructs and installs the runner-wide staging budget.
 // Run calls it exactly once, before any job can be leased, so a job can
-// never observe a runner without its bounded spool. The budget is immutable
-// after installation: nothing reassigns r.staging once set.
+// never observe a runner without its bounded spool. When a previous Run's
+// shutdown could not retire the ledger (cleanup debt remained), the OPEN
+// budget is deliberately retained on the runner: a restart with the SAME
+// bound reuses that exact ledger (maintenance keeps retrying its debt), and a
+// restart with a DIFFERENT bound fails with a clear error instead of
+// deadlocking against the retained directory lock. Only a budget whose
+// ownership was retired is ever replaced.
 func (r *Runner) configureStaging() error {
+	maxBytes := r.desiredStagingMaxBytes()
+	r.stagingMu.Lock()
+	defer r.stagingMu.Unlock()
+	if existing := r.staging; existing != nil {
+		if existing.MaxBytes() != maxBytes {
+			return fmt.Errorf("staging ownership retained with a %d-byte bound; requested %d: reuse requires the same bound while cleanup debt remains (or process exit)", existing.MaxBytes(), maxBytes)
+		}
+		return nil
+	}
 	b, err := r.newStagingBudget()
 	if err != nil {
 		return err
 	}
-	r.stagingMu.Lock()
 	r.staging = b
-	r.stagingMu.Unlock()
 	return nil
 }
 
@@ -1872,10 +1896,12 @@ func (r *Runner) maintainStaging(ctx context.Context) {
 // the directory ownership lock and the process-wide registry entry. Unlike
 // the control plane's process-lifetime budget, the runner has explicit
 // in-process restart semantics, so ownership follows the Run lifecycle. A
-// failed/expired hand-off deliberately RETAINS ownership (the budget stays
-// registered, the ledger intact) rather than releasing a directory whose
-// bytes may still be charged; process exit drops the lock, and a successor
-// Run in the same process reuses the same ledger.
+// hand-off blocked by cleanup debt deliberately RETAINS the OPEN budget (it
+// stays registered, the ledger intact, and NOT transitioned to CLOSING)
+// rather than releasing a directory whose bytes are still charged; process
+// exit drops the lock, and a successor Run in the same process reuses the
+// same open ledger, continuing its maintenance until the debt clears and a
+// later shutdown retires it.
 func (r *Runner) closeStaging() {
 	st := r.currentStaging()
 	if st == nil {
@@ -1885,6 +1911,18 @@ func (r *Runner) closeStaging() {
 	defer cancel()
 	if _, err := st.RetryCleanup(ctx); err != nil {
 		reportf("kiwi runner %s: staging cleanup before close: %v\n", r.ID, err)
+	}
+	// CloseWithContext transitions the budget to CLOSING BEFORE it waits, and
+	// it cannot complete while cleanup debt remains. Calling it with debt
+	// would therefore leave a CLOSED budget still holding the directory
+	// lock; the process registry deliberately ignores closed budgets, so an
+	// in-process restart would construct a fresh budget and deadlock against
+	// the retained lock with ErrStagingDirOwned. Retention must instead keep
+	// the ledger OPEN and registered: configureStaging reuses it and the
+	// staging maintenance pass keeps retrying the debt.
+	if used := st.Used(); used != 0 {
+		reportf("kiwi runner %s: staging ownership retained: %d byte(s) still charged (%d cleanup item(s)); the next Run reuses this ledger\n", r.ID, used, st.PendingCleanup())
+		return
 	}
 	if err := st.CloseWithContext(ctx); err != nil {
 		reportf("kiwi runner %s: staging close: %v (ownership retained; process exit releases it)\n", r.ID, err)
@@ -2112,12 +2150,15 @@ func (r *Runner) putArtifact(ctx context.Context, t server.Task, name, path stri
 // without the retry the job stays leased until expiry and is re-queued and
 // re-executed even though it already finished.
 func (r *Runner) complete(ctx context.Context, t server.Task, st model.Status, err error, outputs map[string]string) {
-	// Completion is the one delivery that must survive the job context being
-	// canceled (a timed-out job still has to report its timeout), so the job
-	// cancellation is dropped — but NOT the bound: a fresh context with its
-	// own short wall-clock grace keeps a wedged control plane from pinning
-	// the runner slot after the lease stopped being renewed.
-	completeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), completionGrace)
+	// Complete receives the RUNNER context (every production caller passes
+	// parent), never the job context, so there is no job cancellation to
+	// strip here: a timed-out job still reports. Deriving directly from the
+	// passed context keeps the two cancellations that matter correct —
+	// runner shutdown/drain immediately aborts completion, while the
+	// independent wall-clock grace keeps a healthy runner from pinning a
+	// slot on a wedged control plane. (Stripping cancellation with
+	// context.WithoutCancel would remove exactly the wrong one: shutdown.)
+	completeCtx, cancel := context.WithTimeout(ctx, completionGrace)
 	defer cancel()
 	msg := ""
 	if err != nil {

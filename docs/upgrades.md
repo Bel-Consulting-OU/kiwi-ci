@@ -332,15 +332,22 @@ claims themselves.
   longer wedge the default one-artifact budget for the life of the runner.
   The state is observable through `kiwi_runner_staging_bytes`,
   `kiwi_runner_staging_pending_cleanup` and
-  `kiwi_runner_staging_cleanup_failures_total`. A fully joined `Run` also
-  retires the staging ownership (lock + registry entry) at shutdown, so an
-  in-process restart can reconfigure its staging bound.
+  `kiwi_runner_staging_cleanup_failures_total`. A fully joined `Run` retires
+  the staging ownership (lock + registry entry) at shutdown; a shutdown
+  still blocked by cleanup debt deliberately retains the OPEN ledger, and an
+  in-process restart with the same bound reuses it (a changed bound fails
+  with a clear error) until the debt is reclaimed.
 - Post-job delivery is explicitly bounded: artifact and generated-fragment
-  uploads stay inside the declared job timeout, while test-report delivery
-  and snapshot capture get a separate `--finalize-timeout` grace (default
-  2m) and terminal completion has its own 30-second bound. A job that hits
-  its timeout can no longer occupy a runner slot indefinitely through
-  delivery retries.
+  uploads stay inside the declared job timeout, and a deadline that cuts an
+  artifact upload off now reports the job as cancelled instead of green
+  with a warning. Test-report delivery and snapshot capture get a separate
+  `--finalize-timeout` grace (default 2m), and terminal completion is
+  bounded per call (30s) while honoring runner shutdown — a timed-out job
+  still reports because completion is called with the runner context, and a
+  wedged control plane can no longer pin the runner slot.
+- A deadline during dependency restore now reports `cancelled` like a
+  deadline during checkout; the setup phase uses one status rule
+  (`statusForErr(setupCtx, err)`) for every context-bounded subphase.
 - Pre-checkout hard-quota gating for untrusted jobs is fail-closed for
   legacy/malformed tasks and does NOT trust the unverified compiled
   payload: the runtime always comes from the persisted pipeline (parse +

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -370,12 +371,15 @@ func TestRunnerRetriesDependencyStagingCleanupDebt(t *testing.T) {
 	}
 
 	// Removal succeeds: the runner maintenance retry drains the debt and the
-	// parked restore acquires the capacity it was waiting for.
+	// parked restore acquires the capacity it was waiting for. The ledger may
+	// show the restore's own reservation again as soon as the waiter wakes,
+	// so the debt check is PendingCleanup (and the drained-budget assertion
+	// comes after the restore finishes).
 	releaseDependencyCleanupDebt(t, debtPath)
 	r.maintainStaging(context.Background())
-	if used := b.Used(); used != 0 {
+	if pending := b.PendingCleanup(); pending != 0 {
 		close(release)
-		t.Fatalf("staging ledger = %d after the successful retry, want 0", used)
+		t.Fatalf("pending cleanup = %d after the successful retry, want 0", pending)
 	}
 	close(release)
 	select {
@@ -412,5 +416,121 @@ func TestRunClosesStagingOwnership(t *testing.T) {
 	}
 	if err := b.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestRunRestartReusesStagingWithCleanupDebt pins the retained-ledger
+// lifecycle: a shutdown blocked by cleanup debt must keep the budget OPEN
+// and registered, so a same-bound restart reuses that exact ledger (instead
+// of deadlocking against the retained directory lock with
+// ErrStagingDirOwned), maintenance keeps retrying the debt, and a later
+// shutdown retires ownership normally once the debt clears.
+func TestRunRestartReusesStagingWithCleanupDebt(t *testing.T) {
+	root := t.TempDir()
+	r := testRunnerFor(t, httptest.NewServer(http.NotFoundHandler()), Config{StagingDir: root, StagingMaxBytes: 1 << 20})
+	b, err := r.dependencyStaging()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := chargeDependencyCleanupDebt(t, b, 1<<20)
+
+	// Shutdown cannot retire a ledger whose bytes are still charged.
+	r.closeStaging()
+	if got := r.currentStaging(); got != b {
+		t.Fatal("closeStaging dropped a budget that still holds cleanup debt")
+	}
+
+	// A same-bound restart reuses the retained ledger.
+	if err := r.configureStaging(); err != nil {
+		t.Fatalf("restart with the same bound: %v", err)
+	}
+	if got := r.currentStaging(); got != b {
+		t.Fatal("restart did not reuse the retained staging ledger")
+	}
+
+	// The retained ledger is still open AND still full: Acquire waits rather
+	// than failing with ErrClosed.
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	if _, err := b.Acquire(ctx, 1); errors.Is(err, staging.ErrClosed) {
+		t.Fatal("retained staging budget was marked closed")
+	} else if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Acquire on the retained full budget = %v, want DeadlineExceeded", err)
+	}
+
+	// Once the debt clears, maintenance reclaims it and the next shutdown
+	// retires ownership.
+	releaseDependencyCleanupDebt(t, path)
+	r.maintainStaging(context.Background())
+	if used := b.Used(); used != 0 {
+		t.Fatalf("staging ledger = %d after cleanup, want 0", used)
+	}
+	r.closeStaging()
+	if r.currentStaging() != nil {
+		t.Fatal("staging ownership was not retired after the debt cleared")
+	}
+	// The directory is genuinely free: a different bound can now be owned.
+	fresh, err := staging.NewReplicaBudget(root, runnerStagingInstanceID(r.ID), 2<<20)
+	if err != nil {
+		t.Fatalf("directory still locked after retirement: %v", err)
+	}
+	if err := fresh.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestFailedStagingCloseDoesNotMarkRetainedBudgetUnusable is the narrower
+// regression for the close-state transition itself: a failed hand-off must
+// leave a usable OPEN ledger behind (a closed budget would reject Acquire
+// with ErrClosed while still holding the directory lock).
+func TestFailedStagingCloseDoesNotMarkRetainedBudgetUnusable(t *testing.T) {
+	root := t.TempDir()
+	r := testRunnerFor(t, httptest.NewServer(http.NotFoundHandler()), Config{StagingDir: root, StagingMaxBytes: 1 << 20})
+	b, err := r.dependencyStaging()
+	if err != nil {
+		t.Fatal(err)
+	}
+	chargeDependencyCleanupDebt(t, b, 1<<20)
+
+	r.closeStaging()
+	if err := r.configureStaging(); err != nil {
+		t.Fatalf("reconfigure after a retained hand-off: %v", err)
+	}
+	if r.currentStaging() != b {
+		t.Fatal("reconfigure replaced the retained open ledger")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	if _, err := b.Acquire(ctx, 1); errors.Is(err, staging.ErrClosed) {
+		t.Fatal("retained budget is unusable: CloseWithContext was called with debt still charged")
+	} else if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Acquire = %v, want DeadlineExceeded (open ledger, bytes still charged)", err)
+	}
+}
+
+// TestRestartWithChangedStagingBoundFailsClearlyWhileDebtRemains pins the
+// operator-facing error: a logical restart that asks for a different bound
+// while the retained ledger still holds debt fails with a clear message
+// instead of an opaque ErrStagingDirOwned deadlock.
+func TestRestartWithChangedStagingBoundFailsClearlyWhileDebtRemains(t *testing.T) {
+	root := t.TempDir()
+	r := testRunnerFor(t, httptest.NewServer(http.NotFoundHandler()), Config{StagingDir: root, StagingMaxBytes: 1 << 20})
+	b, err := r.dependencyStaging()
+	if err != nil {
+		t.Fatal(err)
+	}
+	chargeDependencyCleanupDebt(t, b, 1<<20)
+
+	r.closeStaging()
+	r.Cfg.StagingMaxBytes = 2 << 20
+	err = r.configureStaging()
+	if err == nil {
+		t.Fatal("changed-bound restart succeeded while the retained ledger held debt")
+	}
+	if !strings.Contains(err.Error(), "retained") || !strings.Contains(err.Error(), "same bound") {
+		t.Fatalf("changed-bound restart error = %v, want the retained-ownership explanation", err)
+	}
+	if r.currentStaging() != b {
+		t.Fatal("failed reconfigure disturbed the retained ledger")
 	}
 }

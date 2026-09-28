@@ -834,6 +834,21 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		res.Outputs = nil
 	}
 	e.saveArtifacts(s, cj, workspace, res.Status)
+	// Artifact delivery is part of the declared job lifetime (the runner
+	// wires ArtifactReporter to the job context), so a deadline or
+	// cancellation that lands while artifacts are being published must not
+	// leave a green job behind: the reporter surfaces the cancellation as a
+	// warning only, and without this check res.Status would still be SUCCESS
+	// even though the upload was cut off. This mirrors the canonical
+	// statusForErr rule (a context that ended makes the outcome cancelled)
+	// and the same check also catches a job whose deadline expired after the
+	// steps but before this point.
+	if cerr := ctx.Err(); cerr != nil {
+		if res.Error == "" {
+			res.Error = cerr.Error()
+		}
+		res.Status = model.StatusCancelled
+	}
 	return finish(res)
 }
 

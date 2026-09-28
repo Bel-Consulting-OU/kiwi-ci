@@ -2,14 +2,17 @@ package runner
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
 )
 
 // TestExecuteBoundsArtifactUploadByJobTimeout is the P2 lifecycle regression:
@@ -22,6 +25,8 @@ func TestExecuteBoundsArtifactUploadByJobTimeout(t *testing.T) {
 	artifactSeen := make(chan struct{}, 1)
 	release := make(chan struct{})
 	var completeCalls atomic.Int64
+	var completeMu sync.Mutex
+	var completeBodies []server.Complete
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.Contains(r.URL.Path, "/artifacts/"):
@@ -38,6 +43,11 @@ func TestExecuteBoundsArtifactUploadByJobTimeout(t *testing.T) {
 			}
 			return
 		case strings.HasSuffix(r.URL.Path, "/complete"):
+			var c server.Complete
+			_ = json.NewDecoder(r.Body).Decode(&c)
+			completeMu.Lock()
+			completeBodies = append(completeBodies, c)
+			completeMu.Unlock()
 			completeCalls.Add(1)
 			w.WriteHeader(http.StatusNoContent)
 		default:
@@ -79,6 +89,17 @@ func TestExecuteBoundsArtifactUploadByJobTimeout(t *testing.T) {
 	}
 	if completeCalls.Load() == 0 {
 		t.Fatal("job never completed")
+	}
+	// The artifact upload was cut off by the job deadline, so the terminal
+	// status must be cancelled — not a green job with a warning.
+	completeMu.Lock()
+	last := completeBodies[len(completeBodies)-1]
+	completeMu.Unlock()
+	if last.Status != model.StatusCancelled {
+		t.Fatalf("completion status = %q, want cancelled after the artifact upload hit the job deadline", last.Status)
+	}
+	if !strings.Contains(last.Error, "context deadline exceeded") && !strings.Contains(last.Error, "context canceled") {
+		t.Fatalf("completion error = %q, want the context cancellation named", last.Error)
 	}
 }
 
