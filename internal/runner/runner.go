@@ -141,6 +141,12 @@ var (
 	// the derived resource bounds (WorkspaceMaxBytes) without executing the
 	// job on a real backend. Production leaves it nil.
 	executorOptionsSeam func(executor.Options)
+	// closeStagingBudget is a seam over staging.Budget.CloseWithContext so the
+	// hand-off failure branch (ownership release failed, and the budget is
+	// finalized/CLOSING rather than open) can be exercised: the runner must
+	// then DROP the ledger pointer instead of keeping a closed budget
+	// installed for a restart to "reuse".
+	closeStagingBudget = (*staging.Budget).CloseWithContext
 )
 
 // Client policy seams. Ordinary control-plane calls (register/next/heartbeat/
@@ -1924,8 +1930,21 @@ func (r *Runner) closeStaging() {
 		reportf("kiwi runner %s: staging ownership retained: %d byte(s) still charged (%d cleanup item(s)); the next Run reuses this ledger\n", r.ID, used, st.PendingCleanup())
 		return
 	}
-	if err := st.CloseWithContext(ctx); err != nil {
-		reportf("kiwi runner %s: staging close: %v (ownership retained; process exit releases it)\n", r.ID, err)
+	if err := closeStagingBudget(st, ctx); err != nil {
+		reportf("kiwi runner %s: staging close: %v (ownership release failed; process exit drops the lock)\n", r.ID, err)
+		// CloseWithContext has already transitioned the budget to CLOSING
+		// (and finalized it when it reached the release step): it can never
+		// become the OPEN retained ledger a restart reuses, and keeping the
+		// pointer would make configureStaging "reuse" a closed ledger whose
+		// Acquire fails with ErrClosed. Drop the pointer so the next Run
+		// constructs a fresh ledger; if the directory lock actually leaked,
+		// that construction fails loudly with ErrStagingDirOwned instead of
+		// handing out reservations against retired state.
+		r.stagingMu.Lock()
+		if r.staging == st {
+			r.staging = nil
+		}
+		r.stagingMu.Unlock()
 		return
 	}
 	r.stagingMu.Lock()

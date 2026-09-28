@@ -534,3 +534,42 @@ func TestRestartWithChangedStagingBoundFailsClearlyWhileDebtRemains(t *testing.T
 		t.Fatal("failed reconfigure disturbed the retained ledger")
 	}
 }
+
+// TestFailedStagingCloseClearsPointerAndReconfigures pins the hand-off
+// failure branch: when CloseWithContext cannot release ownership (only
+// reachable after a full join, when the release itself fails), the budget is
+// finalized/CLOSING — never the OPEN retained ledger a restart may reuse.
+// The runner must drop the pointer so the next configureStaging obtains a
+// usable ledger (or fails loudly if the directory lock really leaked),
+// instead of "reusing" a closed budget whose Acquire returns ErrClosed.
+func TestFailedStagingCloseClearsPointerAndReconfigures(t *testing.T) {
+	orig := closeStagingBudget
+	closeStagingBudget = func(*staging.Budget, context.Context) error {
+		return errors.New("test: lock release failed")
+	}
+	t.Cleanup(func() { closeStagingBudget = orig })
+
+	r := testRunnerFor(t, httptest.NewServer(http.NotFoundHandler()), Config{StagingDir: t.TempDir(), StagingMaxBytes: 1 << 20})
+	if _, err := r.dependencyStaging(); err != nil {
+		t.Fatal(err)
+	}
+	r.closeStaging()
+	if got := r.currentStaging(); got != nil {
+		t.Fatalf("failed close left a finalized ledger installed: %v", got)
+	}
+	// The seam did not actually close the real ledger, so the next configure
+	// re-obtains the same open budget from the process registry; the point is
+	// that the runner no longer short-circuits on a stale pointer.
+	if err := r.configureStaging(); err != nil {
+		t.Fatalf("reconfigure after a failed close: %v", err)
+	}
+	got := r.currentStaging()
+	if got == nil {
+		t.Fatal("reconfigure left the runner without a staging ledger")
+	}
+	res, err := got.Acquire(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("reconfigured ledger is unusable: %v", err)
+	}
+	res.Release()
+}
