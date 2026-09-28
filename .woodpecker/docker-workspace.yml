@@ -7,11 +7,7 @@
 # Agent labels: `platform: linux/amd64` is the canonical GOOS/GOARCH form of
 # the built-in `platform=<GOOS>/<GOARCH>` agent label (docs: workflow syntax
 # -> labels). `capability: docker` only SELECTS an agent; it injects nothing,
-# so the daemon socket is mounted explicitly below. `docker-host: "true"`
-# narrows the selection to an agent that shares a filesystem with the daemon
-# (see the labels block): a containerized docker-backend agent is otherwise
-# equally eligible and cannot make the lane's own workspace paths visible to
-# the daemon.
+# so the daemon socket is mounted explicitly below.
 #
 # Docker access and trust: both steps below mount the agent host's socket
 # (`volumes: - /var/run/docker.sock:/var/run/docker.sock`, the exact mount
@@ -52,16 +48,6 @@
 labels:
   platform: linux/amd64
   capability: docker
-  # A docker-workspace agent must run on the SAME host as the daemon it
-  # drives: the test starts job containers with bind mounts of its own
-  # workspace path, and under Woodpecker's docker backend that path is a
-  # named volume (/woodpecker/...) that does not exist on the daemon host, so
-  # the mounts would land on empty daemon-side directories. The extra
-  # `docker-host` label selects an agent whose process, workspace and daemon
-  # share one filesystem (a docker-backend agent running on the daemon host);
-  # without it the containerized linux/amd64 agent would also match these
-  # labels and, being equally eligible, could take the lane.
-  docker-host: "true"
 
 when:
   # Trusted events only: the steps below mount /var/run/docker.sock (see the

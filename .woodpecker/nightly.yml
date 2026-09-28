@@ -2,10 +2,6 @@
 # configured on the Woodpecker repository (schedule trigger).
 labels:
   platform: linux/amd64
-  # Containerized builder: these lanes run in step containers, so they must
-  # NOT be picked by the daemon-local docker-host agent (which exists for the
-  # docker-workspace lane and would otherwise match platform-only selection).
-  executor: container
 
 when:
   - event: [cron, manual]
