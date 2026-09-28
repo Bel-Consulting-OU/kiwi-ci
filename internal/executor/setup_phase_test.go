@@ -291,7 +291,11 @@ func TestTartIPProbeHangingPhaseCeiling(t *testing.T) {
 func TestSetupPhaseLongButSuccessfulWithinCeiling(t *testing.T) {
 	testutil.UnixShell(t)
 	origProbe, origControl, origSetup := runtimeProbeTimeout, runtimeControlTimeout, runtimeSetupTimeout
-	runtimeProbeTimeout, runtimeControlTimeout, runtimeSetupTimeout = 5*time.Second, 5*time.Second, 5*time.Second
+	// The fake subcommands take 0.2s each; a 20s ceiling leaves a 100x
+	// margin so a heavily loaded host cannot turn a healthy-but-slow setup
+	// into a spurious timeout (the macOS lane hit exactly that at 5s while
+	// the integration lane was compiling).
+	runtimeProbeTimeout, runtimeControlTimeout, runtimeSetupTimeout = 20*time.Second, 20*time.Second, 20*time.Second
 	t.Cleanup(func() {
 		runtimeProbeTimeout, runtimeControlTimeout, runtimeSetupTimeout = origProbe, origControl, origSetup
 	})
