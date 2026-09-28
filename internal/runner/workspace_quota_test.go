@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executor"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
@@ -374,7 +375,9 @@ func TestExecuteUntrustedQuotaAvailabilityFailsClosed(t *testing.T) {
 	defer ts.Close()
 
 	// A hard bound IS reported by the quota install (stubbed), so the job
-	// reaches the executor's availability PREFLIGHT, which fails.
+	// reaches the runner's availability PREFLIGHT. The preflight runs on the
+	// EMPTY workspace immediately after install, so a failure must stop the
+	// job before the checkout ever runs.
 	installs, cleanups := 0, 0
 	var limitSeen int64
 	var dirSeen string
@@ -385,12 +388,113 @@ func TestExecuteUntrustedQuotaAvailabilityFailsClosed(t *testing.T) {
 	}
 	t.Cleanup(func() { executor.WorkspaceDiskAvailable = origAvailable })
 
+	checkedOut := false
 	r := testRunnerFor(t, ts, Config{})
-	r.Cfg.CheckoutFn = func(_ context.Context, _ model.Job, dir string) error { return nil }
+	r.Cfg.CheckoutFn = func(_ context.Context, _ model.Job, dir string) error {
+		checkedOut = true
+		return nil
+	}
 	r.execute(context.Background(), untrustedContainerTask(t))
 
 	c, _ := fsrv.lastComplete()
 	if c.Status != model.StatusFailure || !strings.Contains(c.Error, "workspace quota") {
 		t.Fatalf("complete = %+v, want the fail-closed workspace quota refusal", c)
+	}
+	if checkedOut {
+		t.Fatal("checkout ran despite the workspace bound being unavailable on the empty workspace")
+	}
+}
+
+// TestExecuteUntrustedQuotaOrdering pins the security-critical event order
+// for the distributed runner: create the empty workspace, install the hard
+// quota, verify the bound is actually AVAILABLE (before a single checkout
+// byte exists — a project quota caps the project but reserves nothing, so a
+// hostile checkout could otherwise consume the host's remaining free space
+// up to the limit), then check out, and finally tear down quota-before-
+// workspace. It also proves the executor does not repeat the full-capacity
+// check after checkout: availability must be observed exactly once, or a
+// 2 GiB checkout would silently raise the requirement to bound + 2 GiB.
+func TestExecuteUntrustedQuotaOrdering(t *testing.T) {
+	fsrv := &fakeRunnerServer{}
+	ts := httptest.NewServer(fsrv.handler())
+	defer ts.Close()
+
+	log := &quotaEventLog{}
+	installs, cleanups := 0, 0
+	var limitSeen int64
+	var dirSeen string
+	stubWorkspaceQuota(t, executor.DiskQuotaStatus{Hard: true, Limit: executor.DefaultUntrustedWorkspaceMaxBytes, Detail: "fake xfs quota"}, log, &installs, &cleanups, &limitSeen, &dirSeen)
+	origAvailable := executor.WorkspaceDiskAvailable
+	executor.WorkspaceDiskAvailable = func(string, int64) error {
+		log.add("availability")
+		return nil
+	}
+	t.Cleanup(func() { executor.WorkspaceDiskAvailable = origAvailable })
+	origRemove := removeJobWorkspace
+	removeJobWorkspace = func(string) error {
+		log.add("workspace-remove")
+		return nil
+	}
+	t.Cleanup(func() { removeJobWorkspace = origRemove })
+
+	r := testRunnerFor(t, ts, Config{})
+	t.Setenv("PATH", t.TempDir()) // no docker: the job fails at the lookup after checkout
+	r.Cfg.CheckoutFn = func(_ context.Context, _ model.Job, dir string) error {
+		log.add("checkout")
+		return nil
+	}
+	r.execute(context.Background(), untrustedContainerTask(t))
+
+	want := "quota-install,availability,checkout,quota-cleanup,workspace-remove"
+	if got := strings.Join(log.events, ","); got != want {
+		t.Fatalf("quota lifecycle order = %q, want %q", got, want)
+	}
+}
+
+// TestExecuteJoinsHeartbeatGoroutine pins the literal lifecycle contract: a
+// task's heartbeat goroutine is not merely signalled, it is JOINED before
+// execute returns. The heartbeat's exit is parked on the seam; execute must
+// stay blocked in its deferred join until the heartbeat is released, and
+// must finish once it is.
+func TestExecuteJoinsHeartbeatGoroutine(t *testing.T) {
+	fsrv := &fakeRunnerServer{}
+	ts := httptest.NewServer(fsrv.handler())
+	defer ts.Close()
+
+	release := make(chan struct{})
+	heartbeatExiting = func() { <-release }
+	t.Cleanup(func() { heartbeatExiting = nil })
+
+	r := testRunnerFor(t, ts, Config{})
+	r.Cfg.CheckoutFn = func(_ context.Context, _ model.Job, dir string) error {
+		return fmt.Errorf("checkout refused for the join test")
+	}
+	done := make(chan struct{})
+	go func() {
+		r.execute(context.Background(), untrustedContainerTask(t))
+		close(done)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, ok := fsrv.lastComplete(); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("task never completed")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// The task is finished, but the heartbeat is parked in its exit seam:
+	// with the join, execute must not have returned yet.
+	select {
+	case <-done:
+		t.Fatal("execute returned without joining its heartbeat goroutine")
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("execute did not finish after the heartbeat exited")
 	}
 }

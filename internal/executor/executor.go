@@ -105,6 +105,15 @@ type Options struct {
 	// containing the workspace reports fewer free bytes than the quota, so
 	// an oversized workspace never half-runs. Zero disables the check.
 	WorkspaceMaxBytes int64
+
+	// WorkspaceAvailabilityChecked records that the caller already ran the
+	// free-space availability preflight on the EMPTY workspace, before
+	// checkout (the runner does this immediately after installing the hard
+	// quota). It suppresses the executor's own full-capacity re-check: a
+	// project quota caps the project but reserves nothing, so the check
+	// must happen before any checkout bytes exist, and re-running it after
+	// checkout would silently require bound + checkout bytes of free space.
+	WorkspaceAvailabilityChecked bool
 	// LogMaxBytes caps the per-job log stream forwarded to Logs. Once the
 	// quota is exhausted, further lines are dropped after a single terminal
 	// "log quota exceeded" marker. Zero means unlimited.
@@ -344,7 +353,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		workspace = dir
 		defer cleanup()
 	}
-	if e.Opt.WorkspaceMaxBytes > 0 {
+	if e.Opt.WorkspaceMaxBytes > 0 && !e.Opt.WorkspaceAvailabilityChecked {
 		if err := WorkspaceDiskAvailable(workspace, e.Opt.WorkspaceMaxBytes); err != nil {
 			infra := &RunError{Kind: ErrorInfra, Err: fmt.Errorf("workspace quota: %v", err)}
 			e.log(cj.ID, "workspace", infra.Error())

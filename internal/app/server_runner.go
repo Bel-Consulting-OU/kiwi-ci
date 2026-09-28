@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -117,6 +118,58 @@ func (d *apiDeadline) get() time.Duration { return time.Duration(d.nanos.Load())
 
 func (d *apiDeadline) set(v time.Duration) { d.nanos.Store(int64(v)) }
 
+// idleGuard is the CONTEXT half of the streaming inactivity policy: it
+// cancels a derived request context after one idle window without progress,
+// and is re-armed on every unit of progress (socket read, write or flush).
+// Socket deadlines alone only fail the next socket operation; they do not
+// interrupt backend work (a CAS put, a database call, a spool drain) that is
+// blocked while making no socket progress. Cancelling r.Context() propagates
+// through exactly those calls, so a streaming request that makes no progress
+// for the idle window is actually terminated instead of being parked until
+// its next write.
+type idleGuard struct {
+	mu    sync.Mutex
+	timer *time.Timer
+	idle  time.Duration
+	done  bool
+}
+
+// newIdleGuard arms the guard immediately (the pre-first-byte/pre-first-read
+// gap is exactly the window it must cover) and returns it. release() disarms
+// the still-pending window on normal handler exit without cancelling.
+func newIdleGuard(cancel context.CancelFunc, idle time.Duration) *idleGuard {
+	g := &idleGuard{idle: idle}
+	g.timer = time.AfterFunc(idle, func() {
+		g.mu.Lock()
+		g.done = true
+		g.mu.Unlock()
+		cancel()
+	})
+	return g
+}
+
+// reset re-arms the window. A guard that already fired stays fired: the
+// request context is canceled and progress can no longer revive it.
+func (g *idleGuard) reset() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.done {
+		return
+	}
+	g.timer.Reset(g.idle)
+}
+
+// release disarms the guard on normal handler exit.
+func (g *idleGuard) release() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.done {
+		return
+	}
+	g.done = true
+	g.timer.Stop()
+}
+
 // withAPIDeadlines re-applies the former global ReadTimeout/WriteTimeout
 // contract to the ordinary API routes, while leaving bulk streaming routes
 // unbounded in total but bounded per idle window. The http.Server itself runs
@@ -135,8 +188,8 @@ func (d *apiDeadline) set(v time.Duration) { d.nanos.Store(int64(v)) }
 //     ReadTimeout/WriteTimeout are 0, but the middleware must not depend on
 //     that incidental reset; clearing is explicit, cheap, and a no-op on
 //     writers that do not support deadlines.
-//  2. A sliding inactivity bound replaces the absolute one, and BOTH
-//     directions are bounded across the whole streaming lifetime:
+//  2. A sliding inactivity bound replaces the absolute one, in BOTH layers,
+//     and covers the whole streaming lifetime:
 //     - upload routes arm the read bound at dispatch and transition to the
 //     write bound when the body reaches EOF, so neither the body phase nor
 //     the post-body processing/commit phase has an unbounded gap;
@@ -145,7 +198,15 @@ func (d *apiDeadline) set(v time.Duration) { d.nanos.Store(int64(v)) }
 //     on the first Write would leave the backend lookup before it
 //     unbounded);
 //     - every successful Read, Write and Flush re-arms its side's bound, so
-//     continuous progress is never cut while a stalled peer is.
+//     continuous progress is never cut while a stalled peer is;
+//     - SOCKET deadlines only fail dead socket operations; they cannot
+//     interrupt backend work. A derived request context with its own
+//     sliding idleGuard is therefore armed at dispatch too and re-armed on
+//     the same progress events, so a handler stalled in a database/CAS/
+//     spool call that honors r.Context() is actually cancelled after one
+//     idle window even though no socket write ever happens (S3-style
+//     backends may allow request timeouts of tens of minutes, which must
+//     not silently defeat the streaming inactivity policy).
 //
 // Keep the exemption list tight and in sync with the route table in
 // internal/server/server.go; any new long-lived/bulk route MUST be added
@@ -158,7 +219,21 @@ func withAPIDeadlines(next http.Handler) http.Handler {
 		// authorization decision.
 		rc := http.NewResponseController(w)
 		if streamingRoute(r.Method, r.URL.Path) {
-			sw := &streamDeadlineWriter{ResponseWriter: w, rc: rc, idle: streamIdleTimeout}
+			// Two independent mechanisms bound a stream: socket deadlines
+			// (fail dead socket operations) and a derived request context
+			// whose sliding guard cancels stalled APPLICATION work (backend
+			// calls honor r.Context(); a socket deadline does not reach
+			// them). The guard is armed here, before the handler runs, so it
+			// covers the pre-first-byte gap and zero-length uploads alike;
+			// every Read/Write/Flush below re-arms it.
+			streamCtx, cancel := context.WithCancel(r.Context())
+			guard := newIdleGuard(cancel, streamIdleTimeout)
+			defer func() {
+				guard.release()
+				cancel()
+			}()
+			r = r.WithContext(streamCtx)
+			sw := &streamDeadlineWriter{ResponseWriter: w, rc: rc, idle: streamIdleTimeout, guard: guard}
 			if streamingUpload(r.Method, r.URL.Path) {
 				// Upload: clear any inherited absolute deadlines, then arm the
 				// READ side for the body streaming phase. No socket write
@@ -169,7 +244,7 @@ func withAPIDeadlines(next http.Handler) http.Handler {
 				// unbounded.
 				_ = rc.SetReadDeadline(time.Time{})
 				_ = rc.SetWriteDeadline(time.Time{})
-				r.Body = newStreamDeadlineBody(r.Body, rc, streamIdleTimeout)
+				r.Body = newStreamDeadlineBody(r.Body, rc, streamIdleTimeout, guard)
 			} else {
 				// Download/SSE: no request body, so the response write is the
 				// only traffic. Arm the write bound IMMEDIATELY at dispatch:
@@ -195,19 +270,26 @@ func withAPIDeadlines(next http.Handler) http.Handler {
 // writer via Unwrap so http.ResponseController reaches the real connection.
 type streamDeadlineWriter struct {
 	http.ResponseWriter
-	rc   *http.ResponseController
-	idle time.Duration
+	rc    *http.ResponseController
+	idle  time.Duration
+	guard *idleGuard
 }
 
 func (w *streamDeadlineWriter) Write(p []byte) (int, error) {
 	_ = w.rc.SetWriteDeadline(time.Now().Add(w.idle))
+	if w.guard != nil {
+		w.guard.reset()
+	}
 	return w.ResponseWriter.Write(p)
 }
 
-// Flush forwards SSE flushes; a flush is progress too, so the deadline is
-// re-armed before delegating.
+// Flush forwards SSE flushes; a flush is progress too, so the deadline and
+// the context guard are re-armed before delegating.
 func (w *streamDeadlineWriter) Flush() {
 	_ = w.rc.SetWriteDeadline(time.Now().Add(w.idle))
+	if w.guard != nil {
+		w.guard.reset()
+	}
 	_ = w.rc.Flush()
 }
 
@@ -220,12 +302,17 @@ func (w *streamDeadlineWriter) Unwrap() http.ResponseWriter { return w.ResponseW
 // forever. The wrapper clears the read bound and arms the write bound when
 // the body reaches EOF (see streamDeadlineBody). Download/SSE routes carry no
 // body and take the write bound at dispatch instead.
-func newStreamDeadlineBody(body io.ReadCloser, rc *http.ResponseController, idle time.Duration) io.ReadCloser {
+func newStreamDeadlineBody(body io.ReadCloser, rc *http.ResponseController, idle time.Duration, guard *idleGuard) io.ReadCloser {
 	if body == nil || body == http.NoBody {
+		// A zero-length upload has no Read phase at all, so there is no EOF
+		// to transition on: arm the response/application bound immediately.
+		// (The context guard is already armed at dispatch and covers the
+		// handler's work until its first write re-arms both.)
+		_ = rc.SetWriteDeadline(time.Now().Add(idle))
 		return body
 	}
 	_ = rc.SetReadDeadline(time.Now().Add(idle))
-	return &streamDeadlineBody{ReadCloser: body, rc: rc, idle: idle}
+	return &streamDeadlineBody{ReadCloser: body, rc: rc, idle: idle, guard: guard}
 }
 
 // streamDeadlineBody implements the read half of the sliding bound for upload
@@ -235,16 +322,25 @@ func newStreamDeadlineBody(body io.ReadCloser, rc *http.ResponseController, idle
 // cleared and the write bound is armed for the response.
 type streamDeadlineBody struct {
 	io.ReadCloser
-	rc   *http.ResponseController
-	idle time.Duration
+	rc    *http.ResponseController
+	idle  time.Duration
+	guard *idleGuard
 }
 
 func (b *streamDeadlineBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if n > 0 {
 		_ = b.rc.SetReadDeadline(time.Now().Add(b.idle))
+		if b.guard != nil {
+			b.guard.reset()
+		}
 	}
 	if err == io.EOF {
+		// The body is fully received: no further socket reads happen while
+		// the handler hashes/commits, so the read bound is cleared and the
+		// write bound is armed. The context guard deliberately keeps running
+		// through that processing phase: a backend that honors the context
+		// is cancelled if it makes no progress for one idle window.
 		_ = b.rc.SetReadDeadline(time.Time{})
 		_ = b.rc.SetWriteDeadline(time.Now().Add(b.idle))
 	}

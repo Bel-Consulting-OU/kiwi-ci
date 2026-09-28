@@ -30,6 +30,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1100,6 +1101,118 @@ func TestStreamingUploadImplicitWriteAfterIdleFails(t *testing.T) {
 		if rerr == nil && resp.StatusCode == http.StatusOK && len(body) == 0 {
 			t.Fatal("implicit response write after the idle window succeeded; the upload EOF bound is not in force")
 		}
+	}
+}
+
+// TestStreamingStalledBackendContextCancelled is the regression for the
+// socket-deadline-only gap: a streaming handler that stalls in application
+// work (modeled as waiting on the request context, which is what a backend
+// call honoring r.Context() does) and never touches the socket must still be
+// TERMINATED after one idle window. Socket write deadlines cannot do that —
+// only the derived-context watchdog can.
+func TestStreamingStalledBackendContextCancelled(t *testing.T) {
+	prevIdle := streamIdleTimeout
+	streamIdleTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { streamIdleTimeout = prevIdle })
+
+	cancelled := make(chan struct{})
+	srv := httptest.NewServer(withAPIDeadlines(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// No socket operation at all: the guard's context cancellation is
+		// the only mechanism that can stop this handler.
+		<-r.Context().Done()
+		close(cancelled)
+	})))
+	defer srv.Close()
+	go func() {
+		resp, err := srv.Client().Get(srv.URL + "/api/v1/artifacts/" + strings.Repeat("a", 32))
+		if err == nil {
+			resp.Body.Close()
+		}
+	}()
+	select {
+	case <-cancelled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stalled streaming handler was never cancelled: socket deadlines do not bound backend work")
+	}
+}
+
+// TestStreamingProgressResetsContextGuard proves the context watchdog is
+// sliding, not a total duration: a handler that keeps writing (each write
+// re-arms both the socket deadline and the guard) runs far past the idle
+// window without cancellation.
+func TestStreamingProgressResetsContextGuard(t *testing.T) {
+	prevIdle := streamIdleTimeout
+	streamIdleTimeout = 250 * time.Millisecond
+	t.Cleanup(func() { streamIdleTimeout = prevIdle })
+
+	var sawCancel atomic.Bool
+	done := make(chan struct{})
+	srv := httptest.NewServer(withAPIDeadlines(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, _ := w.(http.Flusher)
+		defer close(done)
+		for i := 0; i < 8; i++ { // 8 x 60ms = 480ms, well past the 250ms idle
+			if _, err := w.Write([]byte("x")); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			select {
+			case <-r.Context().Done():
+				sawCancel.Store(true)
+				return
+			case <-time.After(60 * time.Millisecond):
+			}
+		}
+	})))
+	defer srv.Close()
+	go func() {
+		resp, err := srv.Client().Get(srv.URL + "/api/v1/artifacts/" + strings.Repeat("a", 32))
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("progressing streaming handler never finished")
+	}
+	if sawCancel.Load() {
+		t.Fatal("continuous progress was cancelled by the idle guard")
+	}
+}
+
+// TestStreamingNoBodyUploadArmsResponseBound pins the zero-length upload
+// edge: with no body there is no Read and therefore no EOF transition, so
+// the response/application bound must be armed at dispatch. The context
+// guard is armed for every streaming route regardless of body length.
+func TestStreamingNoBodyUploadArmsResponseBound(t *testing.T) {
+	prevIdle := streamIdleTimeout
+	streamIdleTimeout = 3 * time.Second
+	t.Cleanup(func() { streamIdleTimeout = prevIdle })
+
+	rec := &deadlineRecordingWriter{ResponseWriter: httptest.NewRecorder()}
+	noBody := false
+	ctxAlive := false
+	h := withAPIDeadlines(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		noBody = r.Body == http.NoBody
+		ctxAlive = r.Context().Err() == nil
+		if rec.writeArms == 0 {
+			t.Error("zero-length upload entered the handler with no response bound")
+		}
+	}))
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/jobs/job-1/cache/key", nil)
+	req.Body = http.NoBody
+	h.ServeHTTP(rec, req)
+	if !noBody {
+		t.Fatal("test did not exercise a body-less upload")
+	}
+	if !ctxAlive {
+		t.Fatal("dispatch cancelled the streaming context immediately")
+	}
+	if rec.readClears == 0 || rec.writeClears == 0 {
+		t.Fatal("upload dispatch did not clear the inherited deadlines")
 	}
 }
 

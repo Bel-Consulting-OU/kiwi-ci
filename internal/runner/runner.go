@@ -72,6 +72,17 @@ var RunnerVersion = "dev"
 // shrink it.
 var backgroundDrainGrace = 30 * time.Second
 
+// heartbeatExiting, when non-nil, runs as the heartbeat goroutine is about to
+// exit. It is a test seam for the join contract: holding it proves execute
+// does not return before its heartbeat has actually stopped.
+var heartbeatExiting func()
+
+// heartbeatShutdownGrace bounds execute's wait for its heartbeat goroutine
+// after the task finishes; the goroutine is signaled with close(done)+cancel
+// and should return immediately, so the bound is a diagnostic backstop for
+// the lifecycle contract, not a routine wait.
+var heartbeatShutdownGrace = 5 * time.Second
+
 // Seams over the standard library used by the runner. Production behavior is
 // unchanged; they let checked failure branches be exercised deterministically:
 // closeRunnerTempFile covers os.File.Close failures (matching the
@@ -671,8 +682,29 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	done := make(chan struct{})
-	go r.heartbeatLoop(ctx, cancel, t, done)
-	defer close(done)
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		defer func() {
+			if heartbeatExiting != nil {
+				heartbeatExiting()
+			}
+		}()
+		r.heartbeatLoop(ctx, cancel, t, done)
+	}()
+	// Joining the execute goroutine must join the goroutines execute owns:
+	// close(done) and cancel() signal the heartbeat to stop, and the bounded
+	// wait guarantees it has actually returned (with a diagnostic if it
+	// somehow does not) before the task's lifecycle ends.
+	defer func() {
+		close(done)
+		cancel()
+		select {
+		case <-heartbeatDone:
+		case <-time.After(heartbeatShutdownGrace):
+			fmt.Fprintf(os.Stderr, "kiwi runner %s: heartbeat for %s did not stop within %s\n", r.ID, t.Job.ID, heartbeatShutdownGrace)
+		}
+	}()
 
 	tmp, err := os.MkdirTemp("", "kiwi-run-*")
 	if err != nil {
@@ -716,6 +748,26 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	if requireDiskQuota && workspaceQuota != nil && !workspaceQuota.Hard && payloadRunsOnContainer(t.Job.CompiledJobPayload) {
 		r.complete(parent, t, model.StatusFailure, executor.UntrustedDiskQuotaGateError(workspaceQuota.Detail), nil)
 		return
+	}
+	// The bound must be AVAILABLE, not merely installable: a project quota
+	// caps the project but reserves nothing, so a hostile checkout could
+	// otherwise consume all remaining host free space up to the quota limit
+	// before any later availability test runs. The check runs on the EMPTY
+	// workspace, before a single checkout byte is written. It is the same
+	// preflight the executor would run after checkout, so the derived
+	// options mark it as already performed and the executor skips its
+	// redundant full-capacity re-check (a 2 GiB checkout must not silently
+	// raise the requirement to bound + 2 GiB).
+	availabilityChecked := false
+	if quotaLimit > 0 {
+		if aerr := executor.WorkspaceDiskAvailable(tmp, quotaLimit); aerr != nil {
+			r.complete(parent, t, model.StatusFailure, &executor.RunError{
+				Kind: executor.ErrorInfra,
+				Err:  fmt.Errorf("workspace quota: %w", aerr),
+			}, nil)
+			return
+		}
+		availabilityChecked = true
 	}
 	checkoutStart := time.Now()
 	if err = r.checkoutTask(ctx, t.Job, tmp); err != nil {
@@ -894,6 +946,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	}
 	workspaceMaxBytes := executor.WorkspaceBoundBytes(declaredDisk, untrusted, executor.DefaultUntrustedWorkspaceMaxBytes)
 	opts.WorkspaceMaxBytes = workspaceMaxBytes
+	opts.WorkspaceAvailabilityChecked = availabilityChecked
 	opts.Untrusted = untrusted
 	// Production untrusted policy: the step-boundary resources.disk check is
 	// not a security boundary, so an untrusted job whose workspace cannot get
