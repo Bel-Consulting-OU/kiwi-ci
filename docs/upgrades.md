@@ -326,12 +326,27 @@ claims themselves.
   Legacy records without the field get a 15-minute setup-phase ceiling
   (`--setup-timeout <duration>`), so an unreported job timeout can no
   longer mean a `git clone` may hang forever.
+- Staging cleanup debt is now maintained: a dependency spool whose removal
+  fails keeps its bytes charged (fail-closed) and a dedicated 30-second
+  maintenance pass retries the removal, so a transient unlink error can no
+  longer wedge the default one-artifact budget for the life of the runner.
+  The state is observable through `kiwi_runner_staging_bytes`,
+  `kiwi_runner_staging_pending_cleanup` and
+  `kiwi_runner_staging_cleanup_failures_total`. A fully joined `Run` also
+  retires the staging ownership (lock + registry entry) at shutdown, so an
+  in-process restart can reconfigure its staging bound.
+- Post-job delivery is explicitly bounded: artifact and generated-fragment
+  uploads stay inside the declared job timeout, while test-report delivery
+  and snapshot capture get a separate `--finalize-timeout` grace (default
+  2m) and terminal completion has its own 30-second bound. A job that hits
+  its timeout can no longer occupy a runner slot indefinitely through
+  delivery retries.
 - Pre-checkout hard-quota gating for untrusted jobs is fail-closed for
-  legacy/malformed tasks: when a required hard workspace quota cannot be
-  established, the runner resolves the effective runtime from the
-  persisted pipeline even without a compiled payload, and refuses the
-  checkout when that runtime is (or cannot be proven not to be) the
-  container backend.
+  legacy/malformed tasks and does NOT trust the unverified compiled
+  payload: the runtime always comes from the persisted pipeline (parse +
+  compile + persisted job key), and a payload that disagrees or cannot be
+  decoded refuses the checkout. The payload is only authoritative after
+  `verifyCompiledPayload`, which runs after checkout.
 
 ## Dependency upgrade policy
 

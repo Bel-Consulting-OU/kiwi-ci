@@ -1276,6 +1276,7 @@ func Runner(ctx context.Context, args []string) error {
 	stagingDir := fs.String("staging-dir", "", "staging ROOT for bounded dependency spooling (default: the cache root); the runner stages inside <dir>/<runner instance id>")
 	stagingMaxBytes := fs.String("staging-max-bytes", "", "runner-wide staging byte budget for concurrent dependency restores (default: one maximum-size artifact, 8 GiB)")
 	setupTimeout := fs.Duration("setup-timeout", 0, "ceiling for the pre-execution setup phase of jobs without a persisted job timeout (default 15m)")
+	finalizeTimeout := fs.Duration("finalize-timeout", 0, "bound for post-job finalization (test-report and snapshot delivery) after the executor returns (default 2m)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1306,6 +1307,7 @@ func Runner(ctx context.Context, args []string) error {
 		StagingDir:       strings.TrimSpace(*stagingDir),
 		StagingMaxBytes:  stagingLimit,
 		SetupTimeout:     *setupTimeout,
+		FinalizeTimeout:  *finalizeTimeout,
 	}
 	if *labels != "" {
 		cfg.Labels = strings.Split(*labels, ",")

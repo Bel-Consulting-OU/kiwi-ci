@@ -55,7 +55,32 @@ const (
 	gcInterval = time.Hour
 	// gcOlderThan is the executor.GC staleness window.
 	gcOlderThan = 24 * time.Hour
+	// stagingMaintenanceInterval is how often the runner retries dependency
+	// staging cleanup debt. It is deliberately far shorter than gcInterval:
+	// with the conservative default staging budget (one maximum artifact), a
+	// spool whose removal failed keeps its bytes charged and would otherwise
+	// wedge every future maximum-size restore for the life of the runner.
+	stagingMaintenanceInterval = 30 * time.Second
+	// stagingCloseGrace bounds the orderly staging ownership hand-off at the
+	// very end of Run, after every owned goroutine has joined. If cleanup
+	// debt cannot be reclaimed (or the lock cannot be released) within this
+	// bound, ownership is deliberately retained: process exit drops the
+	// lock, and an in-process successor reuses the same ledger.
+	stagingCloseGrace = 5 * time.Second
+	// defaultFinalizeTimeout bounds post-job finalization (test-report
+	// delivery, snapshot upload) once the executor has returned. Job-scoped
+	// work inside the executor stays under the declared job deadline; this is
+	// the separate, explicitly bounded grace for the delivery that follows
+	// it, so a job can never hold a runner slot indefinitely after its lease
+	// stopped being renewed.
+	defaultFinalizeTimeout = 2 * time.Minute
 )
+
+// completionGrace bounds one terminal completion delivery: it is derived from
+// the runner/client context WITHOUT cancellation (a timed-out job still gets
+// to report its timeout) but with its own wall-clock bound, so a wedged
+// control plane cannot pin the runner slot. A var so tests can shrink it.
+var completionGrace = 30 * time.Second
 
 // ErrRunnerDisabledOrRevoked reports that the control plane has disabled
 // this runner or revoked its certificate: the runner must be re-enrolled
@@ -228,12 +253,22 @@ type Config struct {
 	// greater concurrent restore concurrency raise it.
 	StagingMaxBytes int64
 	// SetupTimeout bounds the setup phase (workspace checkout through
-	// dependency restore) for jobs whose persisted JobTimeout is unset
-	// (legacy records). Zero means the default (15 minutes). Modern jobs are
-	// bounded by their persisted job timeout, so this ceiling is the legacy
-	// fallback that keeps "no user job timeout" from meaning "git may hang
-	// forever".
+	// dependency restore and changed-files discovery) for jobs whose
+	// persisted JobTimeout is unset (legacy records). Zero means the default
+	// (15 minutes). Modern jobs are bounded by their persisted job timeout,
+	// so this ceiling is the legacy fallback that keeps "no user job
+	// timeout" from meaning "git may hang forever".
 	SetupTimeout time.Duration
+	// StagingInterval is how often the runner retries dependency-spool
+	// cleanup debt (a spool whose removal failed keeps its bytes charged
+	// until a retry succeeds). Zero means the default (30 seconds); the
+	// heavy runtime GC keeps its own, much longer, interval.
+	StagingInterval time.Duration
+	// FinalizeTimeout bounds post-job finalization (test-report delivery and
+	// snapshot upload) after the executor returns. Zero means the default
+	// (2 minutes). Terminal completion uses its own shorter internal bound
+	// and is not affected by this value.
+	FinalizeTimeout time.Duration
 	// StateDir is the runner's durable state directory; the per-job log
 	// batch journal lives under it (keyed by job and lease generation) so a
 	// restarted runner replays unconsumed batches under their original
@@ -330,6 +365,9 @@ func (r *Runner) Run(ctx context.Context) error {
 	if r.Cfg.GCInterval <= 0 {
 		r.Cfg.GCInterval = gcInterval
 	}
+	if r.Cfg.StagingInterval <= 0 {
+		r.Cfg.StagingInterval = stagingMaintenanceInterval
+	}
 	if r.Cfg.WorkDir == "" {
 		r.Cfg.WorkDir = os.TempDir()
 	}
@@ -368,16 +406,36 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err := r.register(ctx); err != nil {
 		return err
 	}
-	// The runner-wide dependency staging budget is constructed ONCE, before
-	// any job can be leased, and lives for the process lifetime: every
-	// dependency restore reserves its exact spool size before a byte is
-	// downloaded, so the aggregate compressed spool footprint can never
-	// exceed the configured bound even with maximum runner concurrency. A
-	// failed construction (unusable directory, another live owner) fails
-	// startup instead of the first multi-GB restore.
+	// The runner-wide dependency staging budget is constructed ONCE per Run,
+	// before any job can be leased, and owned until the fully joined
+	// shutdown retires it (closeStaging): every dependency restore reserves
+	// its exact spool size before a byte is downloaded, so the aggregate
+	// compressed spool footprint can never exceed the configured bound even
+	// with maximum runner concurrency. A failed construction (unusable
+	// directory, another live owner) fails startup instead of the first
+	// multi-GB restore.
 	if err := r.configureStaging(); err != nil {
 		return err
 	}
+	// The staging ledger is exposed as scrape-time gauges: Used() includes
+	// cleanup debt (bytes whose removal failed and that a maintenance retry
+	// must reclaim), and PendingCleanup() is the degraded/cleanup-required
+	// signal. The failure counter is incremented both by a failed
+	// CleanupSpool at the end of a restore and by a failed maintenance retry.
+	r.Metrics.GaugeFunc("kiwi_runner_staging_bytes", func() float64 {
+		st := r.currentStaging()
+		if st == nil {
+			return 0
+		}
+		return float64(st.Used())
+	})
+	r.Metrics.GaugeFunc("kiwi_runner_staging_pending_cleanup", func() float64 {
+		st := r.currentStaging()
+		if st == nil {
+			return 0
+		}
+		return float64(st.PendingCleanup())
+	})
 	// runCtx is Run's private lifecycle context: everything Run spawns
 	// (executes, maintenance passes, the metrics server) runs under it, and
 	// Run cancels it before joining on EVERY return path — external
@@ -397,18 +455,26 @@ func (r *Runner) Run(ctx context.Context) error {
 	// detached waiter goroutine lives until it finishes. The grace case is
 	// reported on stderr, never silent.
 	var background sync.WaitGroup
-	waitBackground := func() {
+	waitBackground := func() bool {
 		finished := make(chan struct{})
 		go func() { background.Wait(); close(finished) }()
 		select {
 		case <-finished:
+			return true
 		case <-time.After(backgroundDrainGrace):
 			fmt.Fprintf(os.Stderr, "kiwi runner %s: background work still running after %s; exiting anyway (its context is canceled)\n", r.ID, backgroundDrainGrace)
+			return false
 		}
 	}
 	stop := func() {
 		runCancel()
-		waitBackground()
+		// Only a fully joined shutdown may retire staging ownership: if the
+		// drain grace expired while a worker is still alive, that worker can
+		// still hold (or acquire) a reservation, so retaining ownership is
+		// the safe choice.
+		if waitBackground() {
+			r.closeStaging()
+		}
 	}
 	if r.Cfg.MetricsListen != "" {
 		background.Add(1)
@@ -425,7 +491,8 @@ func (r *Runner) Run(ctx context.Context) error {
 	}()
 	lastPrewarm := time.Now()
 	lastGC := time.Now()
-	maint := maintenanceSchedule{GCInterval: r.Cfg.GCInterval, PrewarmInterval: r.Cfg.PrewarmInterval}
+	lastStaging := time.Now()
+	maint := maintenanceSchedule{GCInterval: r.Cfg.GCInterval, PrewarmInterval: r.Cfg.PrewarmInterval, StagingInterval: r.Cfg.StagingInterval}
 	done := make(chan struct{}, r.Cfg.Concurrency)
 	active := 0
 	// Draining starts from the local --drain flag; the server may also
@@ -476,7 +543,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			active--
 		case <-time.After(r.Cfg.Poll):
 		}
-		if gcDue, prewarmDue := maint.due(time.Now(), lastGC, lastPrewarm); gcDue || prewarmDue {
+		if gcDue, prewarmDue, stagingDue := maint.due(time.Now(), lastGC, lastPrewarm, lastStaging); gcDue || prewarmDue || stagingDue {
 			if gcDue {
 				lastGC = time.Now()
 				background.Add(1)
@@ -491,6 +558,14 @@ func (r *Runner) Run(ctx context.Context) error {
 				go func() {
 					defer background.Done()
 					_ = prewarmer.run(runCtx)
+				}()
+			}
+			if stagingDue {
+				lastStaging = time.Now()
+				background.Add(1)
+				go func() {
+					defer background.Done()
+					r.maintainStaging(runCtx)
 				}()
 			}
 		}
@@ -716,9 +791,11 @@ func runtimeRunsOnContainer(runtime string) bool {
 	return runtime == "container"
 }
 
-// compiledPayloadRuntime resolves the runtime from the enqueue-time compiled
-// payload's effective job. It is the authoritative source when present; a
-// malformed payload is an error (never silently "not container").
+// compiledPayloadRuntime resolves the runtime claimed by the enqueue-time
+// compiled payload's effective job. Before checkout the payload is
+// unverified persisted state, so callers only use it as a consistency check
+// against the persisted pipeline (see effectiveTaskRuntimeForSecurityGate);
+// a malformed payload is an error, never silently "not container".
 func compiledPayloadRuntime(p *model.CompiledJobPayload) (string, error) {
 	if p == nil || p.EffectiveJob == nil {
 		return "", fmt.Errorf("compiled job payload is absent")
@@ -738,18 +815,14 @@ func compiledPayloadRuntime(p *model.CompiledJobPayload) (string, error) {
 	return shape.Job.Runtime, nil
 }
 
-// effectiveTaskRuntime resolves the task's effective runtime BEFORE any
-// checkout. The verified compiled payload is authoritative when present
-// (production tasks always carry it). For legacy records without a payload
-// it compiles the persisted pipeline and resolves the persisted job key, so
-// a security gate never treats a compatibility field's absence as "not
-// container". An unresolvable runtime is an error and callers fail closed.
-func effectiveTaskRuntime(t server.Task) (string, error) {
-	if t.Job.CompiledJobPayload != nil && t.Job.CompiledJobPayload.EffectiveJob != nil {
-		return compiledPayloadRuntime(t.Job.CompiledJobPayload)
-	}
+// persistedPipelineRuntime resolves the runtime independently from the
+// persisted pipeline: it parses the canonical pipeline text and compiles the
+// persisted job key. This is the authoritative source for the pre-checkout
+// security gate because the compiled payload has NOT been digest-verified at
+// that point (verifyCompiledPayload runs only after checkout).
+func persistedPipelineRuntime(t server.Task) (string, error) {
 	if strings.TrimSpace(t.Job.Pipeline) == "" {
-		return "", fmt.Errorf("cannot resolve runtime for job %s: no compiled payload and no persisted pipeline", t.Job.ID)
+		return "", fmt.Errorf("cannot resolve runtime for job %s: no persisted pipeline", t.Job.ID)
 	}
 	spec, err := pipeline.Parse([]byte(t.Job.Pipeline))
 	if err != nil {
@@ -764,6 +837,31 @@ func effectiveTaskRuntime(t server.Task) (string, error) {
 		return "", fmt.Errorf("cannot resolve runtime for job %s: compiled job %q not found in the persisted pipeline", t.Job.ID, t.Job.Key)
 	}
 	return cj.Job.Runtime, nil
+}
+
+// effectiveTaskRuntimeForSecurityGate resolves the effective runtime used by
+// the PRE-CHECKOUT hard-quota gate. It never trusts the compiled payload on
+// its own: the payload is only digest-verified after checkout, so at this
+// point it is just persisted state that may be corrupt or inconsistent with
+// the pipeline. The runtime therefore always comes from the persisted
+// pipeline, and when a payload is present its claimed runtime must AGREE
+// with the pipeline or the gate fails closed. A missing/undecodable pipeline
+// is an error; callers refuse the checkout.
+func effectiveTaskRuntimeForSecurityGate(t server.Task) (string, error) {
+	pipelineRuntime, err := persistedPipelineRuntime(t)
+	if err != nil {
+		return "", err
+	}
+	if p := t.Job.CompiledJobPayload; p != nil && p.EffectiveJob != nil {
+		payloadRuntime, perr := compiledPayloadRuntime(p)
+		if perr != nil {
+			return "", perr
+		}
+		if payloadRuntime != pipelineRuntime {
+			return "", fmt.Errorf("cannot resolve runtime for job %s: compiled payload runtime %q disagrees with the persisted pipeline runtime %q", t.Job.ID, payloadRuntime, pipelineRuntime)
+		}
+	}
+	return pipelineRuntime, nil
 }
 
 func (r *Runner) execute(parent context.Context, t server.Task) {
@@ -844,16 +942,15 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// An untrusted job that demands a hard bound must not even check out
 	// when no hard bound could be established: the checkout itself is the
 	// window the quota protects. The gate resolves the effective runtime
-	// FAIL CLOSED: the verified compiled payload when present, otherwise the
-	// already-persisted pipeline recompiled locally. An absent/undecodable
-	// payload is NOT interpreted as "not container" — "couldn't establish
-	// the runtime" refuses the checkout exactly like a known container
-	// runtime does, so the gate does not depend on the compatibility field
-	// being populated. Non-container runtimes keep their previous behavior
-	// (the container backend is the only backend that requires the hard
-	// quota).
+	// FAIL CLOSED and independently of the not-yet-verified compiled payload:
+	// the runtime always comes from the persisted pipeline, and a payload
+	// that disagrees (or cannot be decoded) refuses the checkout. "Couldn't
+	// establish the runtime" is never interpreted as "not container", so the
+	// gate does not depend on the compatibility field being populated or
+	// trustworthy. Non-container runtimes keep their previous behavior (the
+	// container backend is the only backend that requires the hard quota).
 	if requireDiskQuota && workspaceQuota != nil && !workspaceQuota.Hard {
-		runtime, rerr := effectiveTaskRuntime(t)
+		runtime, rerr := effectiveTaskRuntimeForSecurityGate(t)
 		if rerr != nil || runtimeRunsOnContainer(runtime) {
 			detail := workspaceQuota.Detail
 			if rerr != nil {
@@ -989,6 +1086,14 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		r.complete(parent, t, model.StatusFailure, err, nil)
 		return
 	}
+	// The setup phase ends here: checkout, dependency restore and
+	// changed-files discovery are its whole contract. The legacy setup
+	// ceiling is therefore released immediately instead of lingering (as a
+	// live timer and context) through the rest of the job. The git fallback
+	// runs inside the phase it belongs to, and the resolved list is passed to
+	// the executor as a value.
+	resolvedChangedFiles := effectiveChangedFiles(setupCtx, t.Job.ChangedFiles, t.Job.ChangedFilesKnown, tmp)
+	setupCancel()
 	// The sink spools lines in memory and a dedicated sender drains them:
 	// pipe readers must never block on control-plane delivery, so a slow log
 	// endpoint cannot stall the drain and silently drop the tail. Overflow
@@ -1048,15 +1153,19 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	if r.Cfg.CacheRoot != "" {
 		artifactStore = &artifact.Store{Root: filepath.Join(r.Cfg.CacheRoot, "artifacts")}
 	}
+	// In-job artifact delivery runs under the DECLARED JOB LIFETIME, not the
+	// process lifetime: a job that exceeds its timeout must not keep
+	// uploading an artifact (and holding its runner slot) after its lease
+	// stopped being renewed.
 	reporter := func(_ string, name, path string) error {
-		return r.uploadArtifactWithAttestations(parent, t, cj, name, path)
+		return r.uploadArtifactWithAttestations(ctx, t, cj, name, path)
 	}
 	// Distributed runs always start from the clean env (InheritEnv is left
 	// false and no PassEnv allowlist is set); untrusted jobs additionally
 	// require image references pinned by digest. The untrusted floor is
 	// unconditional here: nothing may override RequireImmutableImages for
 	// an untrusted job.
-	opts := executor.Options{Workspace: tmp, RunID: t.Job.RunID, Event: t.Job.Event, Branch: branchFromRef(t.Job.Ref), ChangedFiles: effectiveChangedFiles(setupCtx, t.Job.ChangedFiles, t.Job.ChangedFilesKnown, tmp), SecretProvider: provider, Logs: logging.Func(func(job, step, line string) { sink.WriteLine(job, step, line) }), Cache: cacheStore, Artifacts: artifactStore, ArtifactReporter: reporter, DependencyStatus: t.Job.DependencyStatus, NeedsOutputs: t.Job.NeedsOutputs, CacheNamespace: cacheNamespace(t.Job), RequireImmutableImages: !t.Job.Trusted}
+	opts := executor.Options{Workspace: tmp, RunID: t.Job.RunID, Event: t.Job.Event, Branch: branchFromRef(t.Job.Ref), ChangedFiles: resolvedChangedFiles, SecretProvider: provider, Logs: logging.Func(func(job, step, line string) { sink.WriteLine(job, step, line) }), Cache: cacheStore, Artifacts: artifactStore, ArtifactReporter: reporter, DependencyStatus: t.Job.DependencyStatus, NeedsOutputs: t.Job.NeedsOutputs, CacheNamespace: cacheNamespace(t.Job), RequireImmutableImages: !t.Job.Trusted}
 	// The declared resources.disk is the job's workspace bound: it feeds the
 	// executor's pre-execution free-space check and the container backend's
 	// step-boundary workspace check, and it is what the snapshot capture
@@ -1102,7 +1211,10 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// (same fragment_id under the same lease generation) is answered with
 	// the originally created children.
 	opts.GenerateUpload = func(jobID, path string, data []byte) error {
-		if err := r.uploadGeneratedFragmentData(parent, t, path, data); err != nil {
+		// Generated-fragment delivery is part of the job (the executor fails
+		// the job when it cannot be uploaded), so it runs under the declared
+		// job lifetime exactly like a normal artifact upload.
+		if err := r.uploadGeneratedFragmentData(ctx, t, path, data); err != nil {
 			return err
 		}
 		sink.WriteLine(jobID, "generate", "generated fragment uploaded from "+path)
@@ -1115,6 +1227,17 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	}
 	ex := executor.Executor{Opt: opts, Masker: masker}
 	res := ex.RunCompiledJob(ctx, spec, cj)
+	// Post-job finalization (test-report delivery, snapshot upload) runs on
+	// an explicitly bounded grace derived from the RUNNER context, not the
+	// job context: a job whose deadline just expired still gets a short
+	// chance to deliver its final intelligence (the job's cancellation is a
+	// child of parent, so it cannot reach this context), but the grace has
+	// its own wall-clock bound and a runner shutdown still aborts it. The
+	// previous code used the unbounded runner context directly, so a wedged
+	// delivery could hold the runner slot for as long as it liked.
+	// Terminal completion has an even shorter internal bound (see complete).
+	finalizeCtx, finalizeCancel := context.WithTimeout(parent, r.finalizeTimeout())
+	defer finalizeCancel()
 	if len(cj.Job.TestReports) > 0 {
 		// Mask with the same masker the log path uses before the report is
 		// persisted and later served by the ordinary read tier. Masker.Mask
@@ -1147,8 +1270,8 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 				// is advisory intelligence and its loss must not turn a
 				// finished job into a failure, but the warning makes the
 				// permanent rejection visible in the job log.
-				er = retryDelivery(parent, func() error {
-					return r.post(parent, "/api/v1/jobs/"+t.Job.ID+"/tests", delivery.Body, nil)
+				er = retryDelivery(finalizeCtx, func() error {
+					return r.post(finalizeCtx, "/api/v1/jobs/"+t.Job.ID+"/tests", delivery.Body, nil)
 				})
 				if er != nil {
 					sink.WriteLine(cj.ID, "tests", "upload warning: "+er.Error())
@@ -1161,7 +1284,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// on captures every outcome).
 	if r.Cfg.CaptureSnapshots && snapshotRequested(cj.Job.Snapshot, res.Status) {
 		snapStart := time.Now()
-		if err := r.uploadJobSnapshot(parent, t, tmp, workspaceMaxBytes); err != nil {
+		if err := r.uploadJobSnapshot(finalizeCtx, t, tmp, workspaceMaxBytes); err != nil {
 			sink.WriteLine(cj.ID, "snapshot", "upload warning: "+err.Error())
 		} else {
 			r.Metrics.Observe("kiwi_runner_snapshot_duration_seconds", time.Since(snapStart).Seconds())
@@ -1701,6 +1824,79 @@ func (r *Runner) setupPhaseTimeout() time.Duration {
 	return defaultSetupTimeout
 }
 
+// finalizeTimeout resolves the post-job finalization bound (see
+// Config.FinalizeTimeout).
+func (r *Runner) finalizeTimeout() time.Duration {
+	if r.Cfg.FinalizeTimeout > 0 {
+		return r.Cfg.FinalizeTimeout
+	}
+	return defaultFinalizeTimeout
+}
+
+// currentStaging returns the runner-wide staging budget, or nil when none has
+// been constructed (and after a successful shutdown hand-off).
+func (r *Runner) currentStaging() *staging.Budget {
+	r.stagingMu.Lock()
+	defer r.stagingMu.Unlock()
+	return r.staging
+}
+
+// maintainStaging retries dependency-spool cleanup debt: every spool whose
+// removal failed after its bytes were no longer needed stays charged (and
+// counted by Used()) until RetryCleanup finally removes it. Without this
+// periodic pass a single transient unlink failure permanently consumed
+// staging capacity — with the default one-artifact budget, one 8 GiB spool
+// that could not be unlinked would wedge every future maximum-size restore
+// for the life of the runner. The failure counter and the
+// kiwi_runner_staging_pending_cleanup gauge are the observable degraded
+// condition. The pass is cheap when there is no debt (an empty snapshot plus
+// one mutex acquisition).
+func (r *Runner) maintainStaging(ctx context.Context) {
+	st := r.currentStaging()
+	if st == nil {
+		return
+	}
+	removed, err := st.RetryCleanup(ctx)
+	if removed > 0 {
+		reportf("kiwi runner %s: staging cleanup reclaimed %d spool file(s)\n", r.ID, removed)
+	}
+	if err != nil {
+		r.Metrics.Counter("kiwi_runner_staging_cleanup_failures_total", 1)
+		reportf("kiwi runner %s: staging cleanup retry failed (pending=%d): %v\n", r.ID, st.PendingCleanup(), err)
+	}
+}
+
+// closeStaging performs the orderly shutdown hand-off of the runner-wide
+// staging ownership: after every owned goroutine has joined (no reservation
+// can still be live), it makes one final cleanup-debt retry and then releases
+// the directory ownership lock and the process-wide registry entry. Unlike
+// the control plane's process-lifetime budget, the runner has explicit
+// in-process restart semantics, so ownership follows the Run lifecycle. A
+// failed/expired hand-off deliberately RETAINS ownership (the budget stays
+// registered, the ledger intact) rather than releasing a directory whose
+// bytes may still be charged; process exit drops the lock, and a successor
+// Run in the same process reuses the same ledger.
+func (r *Runner) closeStaging() {
+	st := r.currentStaging()
+	if st == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), stagingCloseGrace)
+	defer cancel()
+	if _, err := st.RetryCleanup(ctx); err != nil {
+		reportf("kiwi runner %s: staging cleanup before close: %v\n", r.ID, err)
+	}
+	if err := st.CloseWithContext(ctx); err != nil {
+		reportf("kiwi runner %s: staging close: %v (ownership retained; process exit releases it)\n", r.ID, err)
+		return
+	}
+	r.stagingMu.Lock()
+	if r.staging == st {
+		r.staging = nil
+	}
+	r.stagingMu.Unlock()
+}
+
 // restoreDownloads fetches the job's declared dependency artifacts through
 // the lease-bound dependency endpoint (GET /api/v1/jobs/{id}/dependencies/
 // {producer}/{artifact}) — never through the run-level artifact list API.
@@ -1816,9 +2012,18 @@ func (r *Runner) restoreDownload(ctx context.Context, t server.Task, producer, n
 		return spoolErr
 	}
 	// The spool file exists until CleanupSpool removes it; CleanupSpool
-	// releases the reservation only when the file is actually gone (a failed
-	// removal keeps the bytes charged as cleanup debt for RetryCleanup).
-	defer budget.CleanupSpool(staged, res)
+	// releases the reservation only when the file is actually gone. A failed
+	// removal keeps the bytes charged as cleanup debt that the runner's
+	// 30-second staging maintenance retries (RetryCleanup); the failure is
+	// counted and reported here so the degraded state is observable before
+	// the retry succeeds.
+	defer func() {
+		if budget.CleanupSpool(staged, res) {
+			return
+		}
+		r.Metrics.Counter("kiwi_runner_staging_cleanup_failures_total", 1)
+		reportf("kiwi runner %s: dependency spool cleanup for job %s failed; bytes stay charged until a staging retry reclaims %s\n", r.ID, t.Job.ID, staged)
+	}()
 	if want := resp.Header.Get("X-Kiwi-Content-SHA256"); want != "" {
 		if got := hex.EncodeToString(h.Sum(nil)); got != want {
 			return fmt.Errorf("artifact %s from %s integrity mismatch", name, producer)
@@ -1907,13 +2112,20 @@ func (r *Runner) putArtifact(ctx context.Context, t server.Task, name, path stri
 // without the retry the job stays leased until expiry and is re-queued and
 // re-executed even though it already finished.
 func (r *Runner) complete(ctx context.Context, t server.Task, st model.Status, err error, outputs map[string]string) {
+	// Completion is the one delivery that must survive the job context being
+	// canceled (a timed-out job still has to report its timeout), so the job
+	// cancellation is dropped — but NOT the bound: a fresh context with its
+	// own short wall-clock grace keeps a wedged control plane from pinning
+	// the runner slot after the lease stopped being renewed.
+	completeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), completionGrace)
+	defer cancel()
 	msg := ""
 	if err != nil {
 		msg = err.Error()
 	}
 	body := server.Complete{RunnerID: r.ID, LeaseToken: t.LeaseToken, LeaseGeneration: t.LeaseGeneration, Status: st, Error: msg, Outputs: outputs}
-	_ = retryDelivery(ctx, func() error {
-		return r.post(ctx, "/api/v1/jobs/"+t.Job.ID+"/complete", body, nil)
+	_ = retryDelivery(completeCtx, func() error {
+		return r.post(completeCtx, "/api/v1/jobs/"+t.Job.ID+"/complete", body, nil)
 	})
 }
 
@@ -2329,6 +2541,9 @@ func (r *Runner) prepareClient(ctx context.Context) error {
 // maintenance loop calls it on the GC interval; tests call it directly so the
 // assertion does not depend on scheduler timing.
 func (r *Runner) runGCPass(ctx context.Context) executor.GCReport {
+	// The heavyweight runtime GC also covers staging cleanup as a backstop;
+	// the dedicated 30s staging pass is the primary cadence.
+	r.maintainStaging(ctx)
 	rep := executor.GC(ctx, r.Cfg.WorkDir, gcOlderThan)
 	if rep.Containers > 0 || rep.Networks > 0 || rep.VMs > 0 {
 		reportf("kiwi runner %s: gc removed %d containers, %d networks, %d VMs\n", r.ID, rep.Containers, rep.Networks, rep.VMs)

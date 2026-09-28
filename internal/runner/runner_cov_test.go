@@ -168,18 +168,23 @@ func TestIdentityStoreLifecycle(t *testing.T) {
 func TestCovMaintenanceScheduleDue(t *testing.T) {
 	now := time.Now()
 	m := maintenanceSchedule{GCInterval: time.Minute, PrewarmInterval: 0}
-	gc, pw := m.due(now, time.Time{}, time.Time{})
-	if !gc || pw {
-		t.Fatalf("due = %v, %v", gc, pw)
+	gc, pw, st := m.due(now, time.Time{}, time.Time{}, time.Time{})
+	if !gc || pw || st {
+		t.Fatalf("due = %v, %v, %v", gc, pw, st)
 	}
-	gc, _ = m.due(now, now.Add(-30*time.Second), time.Time{})
+	gc, _, _ = m.due(now, now.Add(-30*time.Second), time.Time{}, time.Time{})
 	if gc {
 		t.Fatal("recent GC reported due")
 	}
 	m = maintenanceSchedule{GCInterval: time.Minute, PrewarmInterval: time.Minute}
-	_, pw = m.due(now, now, now.Add(-2*time.Minute))
+	_, pw, _ = m.due(now, now, now.Add(-2*time.Minute), now)
 	if !pw {
 		t.Fatal("prewarm not due")
+	}
+	m.StagingInterval = 30 * time.Second
+	_, _, st = m.due(now, now, now, now.Add(-31*time.Second))
+	if !st {
+		t.Fatal("staging cleanup not due after its interval")
 	}
 }
 

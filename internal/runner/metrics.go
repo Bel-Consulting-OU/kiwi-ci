@@ -13,21 +13,28 @@ import (
 )
 
 // Metrics is the runner's minimal Prometheus text-format metric registry.
-// It deliberately sticks to stdlib counters (cumulative values) so the
-// runner never needs a metrics dependency: duration metrics are exported as
-// cumulative seconds under their exact counter names.
+// It deliberately sticks to stdlib counters and callback gauges (cumulative
+// values and sampled values) so the runner never needs a metrics dependency:
+// duration metrics are exported as cumulative seconds under their exact
+// counter names, while gauges such as the staging ledger are evaluated at
+// scrape time through their callback so the exposed value is never staler
+// than the request.
 type Metrics struct {
 	mu       sync.Mutex
 	counters map[string]float64
+	gauges   map[string]func() float64
 }
 
 // NewMetrics returns an empty metric registry.
 func NewMetrics() *Metrics {
-	return &Metrics{counters: map[string]float64{}}
+	return &Metrics{counters: map[string]float64{}, gauges: map[string]func() float64{}}
 }
 
 // Counter adds delta to the named counter.
 func (m *Metrics) Counter(name string, delta float64) {
+	if m == nil {
+		return
+	}
 	m.mu.Lock()
 	m.counters[name] += delta
 	m.mu.Unlock()
@@ -38,22 +45,54 @@ func (m *Metrics) Observe(name string, seconds float64) {
 	m.Counter(name, seconds)
 }
 
-// Expose renders the registry in Prometheus text exposition format with
-// deterministic (sorted) name order.
-func (m *Metrics) Expose(w io.Writer) error {
+// GaugeFunc registers fn as the scrape-time value of the named gauge. The
+// callback is evaluated outside the registry lock on every scrape (and must
+// be concurrency-safe); a later registration replaces an earlier one, so a
+// restarted in-process Run can re-point a gauge at its new ledger. A gauge
+// name shadows a same-named counter.
+func (m *Metrics) GaugeFunc(name string, fn func() float64) {
+	if m == nil || name == "" || fn == nil {
+		return
+	}
 	m.mu.Lock()
-	names := make([]string, 0, len(m.counters))
-	for name := range m.counters {
+	m.gauges[name] = fn
+	m.mu.Unlock()
+}
+
+// Expose renders the registry in Prometheus text exposition format with
+// deterministic (sorted) name order. Counter values are snapshotted under
+// the lock; gauge callbacks run after it is released.
+func (m *Metrics) Expose(w io.Writer) error {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	names := make([]string, 0, len(m.counters)+len(m.gauges))
+	counters := make(map[string]float64, len(m.counters))
+	for name, v := range m.counters {
+		counters[name] = v
 		names = append(names, name)
 	}
+	gauges := make(map[string]func() float64, len(m.gauges))
+	for name, fn := range m.gauges {
+		gauges[name] = fn
+		if _, shadowed := counters[name]; !shadowed {
+			names = append(names, name)
+		}
+	}
 	sort.Strings(names)
+	m.mu.Unlock()
 	for _, name := range names {
-		if _, err := fmt.Fprintf(w, "# TYPE %s counter\n%s %v\n", name, name, m.counters[name]); err != nil {
-			m.mu.Unlock()
+		if fn, ok := gauges[name]; ok {
+			if _, err := fmt.Fprintf(w, "# TYPE %s gauge\n%s %v\n", name, name, fn()); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, err := fmt.Fprintf(w, "# TYPE %s counter\n%s %v\n", name, name, counters[name]); err != nil {
 			return err
 		}
 	}
-	m.mu.Unlock()
 	return nil
 }
 

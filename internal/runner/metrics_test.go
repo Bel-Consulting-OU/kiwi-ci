@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -62,6 +63,41 @@ func TestMetricsExpositionParses(t *testing.T) {
 		if got != wantV {
 			t.Fatalf("metric %s = %v, want %v", name, got, wantV)
 		}
+	}
+}
+
+// TestMetricsGaugeFuncExposedAtScrape pins the callback-gauge contract the
+// staging metrics rely on: a gauge is typed as such in the exposition and its
+// value is evaluated at scrape time, so a continuously changing ledger (bytes
+// staged, pending cleanup) is never reported stale.
+func TestMetricsGaugeFuncExposedAtScrape(t *testing.T) {
+	m := NewMetrics()
+	var value atomic.Int64
+	value.Store(41)
+	m.GaugeFunc("kiwi_runner_staging_bytes", func() float64 { return float64(value.Load()) })
+	m.Counter("kiwi_runner_staging_cleanup_failures_total", 2)
+
+	var buf bytes.Buffer
+	if err := m.Expose(&buf); err != nil {
+		t.Fatal(err)
+	}
+	content := buf.String()
+	if !strings.Contains(content, "# TYPE kiwi_runner_staging_bytes gauge") {
+		t.Fatalf("gauge TYPE missing:\n%s", content)
+	}
+	if !strings.Contains(content, "kiwi_runner_staging_bytes 41") {
+		t.Fatalf("gauge value missing:\n%s", content)
+	}
+	if !strings.Contains(content, "# TYPE kiwi_runner_staging_cleanup_failures_total counter") {
+		t.Fatalf("counter TYPE missing:\n%s", content)
+	}
+	value.Store(7)
+	buf.Reset()
+	if err := m.Expose(&buf); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "kiwi_runner_staging_bytes 7") {
+		t.Fatalf("gauge was not re-evaluated at scrape time:\n%s", buf.String())
 	}
 }
 
