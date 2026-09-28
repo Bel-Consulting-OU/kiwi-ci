@@ -218,3 +218,59 @@ func (s *Store) touchLocal(key string) {
 	now := time.Now()
 	_ = os.Chtimes(s.archivePath(key), now, now)
 }
+
+// ReclaimLegacyLayout removes pre-namespace cache archives that live directly
+// under root: <key>.tar.gz plus its <key>.tar.gz.sha256 sidecar. The local
+// cache is disposable and the per-runner namespace is the only supported
+// layout; without this the old shared tree (potentially a full previous cache
+// budget) would sit invisible beside the new namespace with no owner,
+// retention or accounting. Foreign names, directories and symlinks are never
+// touched; removal failures are reported so startup can log them and the
+// next startup retries.
+func ReclaimLegacyLayout(root string) (int, int64, error) {
+	entries, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return 0, 0, nil
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	var files int
+	var bytes int64
+	var firstErr error
+	for _, de := range entries {
+		if de.IsDir() {
+			continue
+		}
+		name := de.Name()
+		key := ""
+		switch {
+		case strings.HasSuffix(name, ".tar.gz"):
+			key = strings.TrimSuffix(name, ".tar.gz")
+		case strings.HasSuffix(name, ".tar.gz.sha256"):
+			key = strings.TrimSuffix(name, ".tar.gz.sha256")
+		default:
+			continue
+		}
+		if !validKey(key) {
+			continue
+		}
+		info, ierr := de.Info()
+		if ierr != nil {
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		path := filepath.Join(root, name)
+		if rerr := removeCacheFile(path); rerr != nil && !os.IsNotExist(rerr) {
+			if firstErr == nil {
+				firstErr = rerr
+			}
+			continue
+		}
+		files++
+		bytes += info.Size()
+	}
+	return files, bytes, firstErr
+}

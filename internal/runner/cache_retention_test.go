@@ -454,3 +454,94 @@ func TestRunnerCacheRootDefaultsToHomeCache(t *testing.T) {
 		t.Fatalf("default cache dir = %q, want it under a cache root", dir)
 	}
 }
+
+// TestRunnerStartupReclaimsLegacySharedCache pins the upgrade path: the
+// pre-namespace shared layout under <CacheRoot>/cache is deleted when a
+// manager is installed for the root, while the new per-runner namespace is
+// untouched.
+func TestRunnerStartupReclaimsLegacySharedCache(t *testing.T) {
+	root := t.TempDir()
+	legacyDir := filepath.Join(root, "cache")
+	if err := os.MkdirAll(legacyDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	key := strings.Repeat("d", 64)
+	legacy := filepath.Join(legacyDir, key+".tar.gz")
+	if err := os.WriteFile(legacy, []byte("legacy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacy+".sha256", []byte("digest\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := testRunnerFor(t, httptest.NewServer(http.NotFoundHandler()), Config{CacheRoot: root})
+	r.cacheManager()
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Fatalf("legacy archive survived startup (err=%v)", err)
+	}
+	if _, err := os.Stat(legacy + ".sha256"); !os.IsNotExist(err) {
+		t.Fatalf("legacy sidecar survived startup (err=%v)", err)
+	}
+	// A file inside the runner's private namespace (a subdirectory) is never
+	// touched by the legacy reclaim.
+	nsDir := r.cacheRootDir()
+	if err := os.MkdirAll(nsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	nsKey := strings.Repeat("e", 64)
+	nsFile := filepath.Join(nsDir, nsKey+".tar.gz")
+	if err := os.WriteFile(nsFile, []byte("namespaced"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r2 := testRunnerFor(t, httptest.NewServer(http.NotFoundHandler()), Config{CacheRoot: root})
+	r2.ID = "runner-2"
+	r2.cacheManager()
+	if _, err := os.Stat(nsFile); err != nil {
+		t.Fatalf("namespace file was reclaimed: %v", err)
+	}
+}
+
+// TestRunnerCacheManagerReplacementRefusedWithDebt pins the fail-closed
+// lifecycle: while the old manager still holds cleanup debt, a changed
+// policy cannot silently drop the ledger; the change is refused until the
+// debt is cleared.
+func TestRunnerCacheManagerReplacementRefusedWithDebt(t *testing.T) {
+	r := testRunnerFor(t, httptest.NewServer(http.NotFoundHandler()), Config{CacheRoot: t.TempDir(), CacheMaxBytes: 2000})
+	mgr := r.cacheManager()
+	res, err := mgr.Reserve(context.Background(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A non-empty directory at the temp path cannot be removed by a single
+	// os.Remove, so the retained charge survives.
+	debt := filepath.Join(mgr.Root(), ".debt.tar.gz-1.tmp")
+	if err := os.MkdirAll(debt, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(debt, "x"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !mgr.RetainTempCleanup(res, debt) {
+		t.Fatal("retain did not accept the open reservation")
+	}
+	r.Cfg.CacheMaxBytes = 1000
+	err = r.configureCacheManager()
+	if err == nil || !strings.Contains(err.Error(), "replacement refused") {
+		t.Fatalf("configureCacheManager = %v, want a refusal naming the retained debt", err)
+	}
+	if r.cacheManager() != mgr {
+		t.Fatal("refused replacement swapped the manager anyway")
+	}
+	// Clear the debt; the next attempt succeeds.
+	if err := os.Remove(filepath.Join(debt, "x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.configureCacheManager(); err != nil {
+		t.Fatalf("configureCacheManager after clearing debt = %v", err)
+	}
+	if got := r.cacheManager().Policy().MaxBytes; got != 1000 {
+		t.Fatalf("new manager policy = %d, want 1000", got)
+	}
+	if mgr.PendingTempCleanup() != 0 {
+		t.Fatalf("old manager still has %d pending temps", mgr.PendingTempCleanup())
+	}
+}

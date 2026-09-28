@@ -5,9 +5,17 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 )
+
+// ErrInvalidReservation reports Manager.Publish called with a nil,
+// already-ended, or foreign reservation. The publish callback is NOT run:
+// accounting authority must fail closed before creating physical bytes it
+// cannot charge.
+var ErrInvalidReservation = errors.New("cache: invalid reservation")
 
 // ErrCacheBudgetExceeded reports that an aggregate cache operation could not
 // be admitted even after evicting every cold entry: the requested archive is
@@ -49,7 +57,111 @@ type Manager struct {
 // manager with an inactive policy is still usable: reservations become
 // no-ops (there is no aggregate bound to enforce) and Prune does nothing.
 func NewManager(root string, policy RetentionPolicy) *Manager {
-	return &Manager{root: root, policy: policy, pendingTemps: map[string]int64{}}
+	m := &Manager{root: root, policy: policy, pendingTemps: map[string]int64{}}
+	// Startup reconciliation: a crash or kill while a save/restore was
+	// writing leaves dot-prefixed temp files that the normal scan ignores.
+	// Every match found before the manager is shared is provably abandoned;
+	// remove it, and account the ones that cannot be removed so the initial
+	// budget reflects physical reality instead of forgetting the bytes.
+	_, _, _ = m.ReclaimAbandonedTemps(context.Background())
+	return m
+}
+
+// ReclaimAbandonedTemps removes Kiwi-owned cache temp files
+// (.<key>.tar.gz-*.tmp and .<key>.remote-*.tmp) left behind by a crashed or
+// killed process. Symlinks and directories are never followed or removed,
+// and a removal failure keeps the file charged as cleanup debt
+// (RetryTempCleanup retries it) instead of silently freeing capacity. It is
+// idempotent and safe to call at startup; the manager lock serializes it
+// with every other accounting operation.
+func (m *Manager) ReclaimAbandonedTemps(ctx context.Context) (int, int64, error) {
+	if m == nil {
+		return 0, 0, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entries, err := os.ReadDir(m.root)
+	if os.IsNotExist(err) {
+		return 0, 0, nil
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	var files int
+	var bytes int64
+	var firstErr error
+	for _, de := range entries {
+		if err := ctx.Err(); err != nil {
+			return files, bytes, err
+		}
+		name := de.Name()
+		if de.IsDir() || !isOwnedCacheTempName(name) {
+			continue
+		}
+		info, ierr := de.Info()
+		if ierr != nil {
+			continue
+		}
+		// Lstat semantics: a symlink reports the link itself, and we never
+		// follow or remove through it.
+		if info.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		path := filepath.Join(m.root, name)
+		if _, pending := m.pendingTemps[path]; pending {
+			continue // RetryTempCleanup owns it
+		}
+		if rerr := removeCacheTemp(path); rerr != nil && !os.IsNotExist(rerr) {
+			m.pendingTemps[path] = info.Size()
+			m.inflight += info.Size()
+			m.inflightCount++
+			if firstErr == nil {
+				firstErr = rerr
+			}
+			continue
+		}
+		files++
+		bytes += info.Size()
+	}
+	return files, bytes, firstErr
+}
+
+// isOwnedCacheTempName recognizes the two Kiwi temp shapes: save temps
+// (.<key>.tar.gz-*.tmp) and remote-restore temps (.<key>.remote-*.tmp).
+func isOwnedCacheTempName(name string) bool {
+	if !strings.HasPrefix(name, ".") || !strings.HasSuffix(name, ".tmp") {
+		return false
+	}
+	body := name[1 : len(name)-len(".tmp")]
+	if i := strings.LastIndex(body, ".tar.gz-"); i > 0 && i+len(".tar.gz-") < len(body) {
+		return true
+	}
+	if i := strings.Index(body, ".remote-"); i > 0 && i+len(".remote-") < len(body) {
+		return true
+	}
+	return false
+}
+
+// PendingTempCleanup reports how many abandoned/failed temp files still hold
+// their charge (used by lifecycle decisions and metrics).
+func (m *Manager) PendingTempCleanup() int {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.pendingTemps)
+}
+
+// InflightBytes reports the total charge held by open reservations and
+// pending temp cleanup debt.
+func (m *Manager) InflightBytes() int64 {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.inflight
 }
 
 // Root returns the manager's cache directory (restart validation compares
@@ -150,11 +262,17 @@ func (m *Manager) RetainTempCleanup(res *Reservation, path string) bool {
 // budget; failures stay pending for the next pass. The context is checked
 // between files.
 func (m *Manager) RetryTempCleanup(ctx context.Context) (int, error) {
-	if m == nil || len(m.pendingTemps) == 0 {
+	if m == nil {
 		return 0, nil
 	}
+	// The empty check MUST run under the lock: RetainTempCleanup writes the
+	// map concurrently from job teardown, and a len() outside the lock is a
+	// data race (and a potential runtime fatal error).
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if len(m.pendingTemps) == 0 {
+		return 0, nil
+	}
 	removed := 0
 	var firstErr error
 	for path, charge := range m.pendingTemps {
@@ -182,23 +300,25 @@ func (m *Manager) RetryTempCleanup(ctx context.Context) (int, error) {
 // reservation evict the entry that was just published. On failure the
 // reservation stays held and the caller must Release it.
 //
-// The reservation must belong to this manager and be OPEN; anything else is
-// a programming error and leaves the accounting untouched (the publish
-// itself still runs).
+// The reservation must belong to this manager and be OPEN. Anything else is
+// refused with ErrInvalidReservation BEFORE publish runs: a resource
+// authority must never create physical bytes it cannot account for, so the
+// fail-closed behavior cannot be a mere absence of counter updates.
 func (m *Manager) Publish(res *Reservation, publish func() error) error {
 	if m == nil {
 		return publish()
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if res == nil || res.m != m || res.state != reservationOpen {
+		return ErrInvalidReservation
+	}
 	if err := publish(); err != nil {
 		return err
 	}
-	if res != nil && res.m == m && res.state == reservationOpen {
-		m.inflight -= res.n
-		m.inflightCount--
-		res.state = reservationPublished
-	}
+	m.inflight -= res.n
+	m.inflightCount--
+	res.state = reservationPublished
 	return nil
 }
 
@@ -208,8 +328,11 @@ func (m *Manager) Publish(res *Reservation, publish func() error) error {
 // never fit (for example an archive larger than the whole budget), and the
 // context error when the caller's job ended while evicting.
 func (m *Manager) Reserve(ctx context.Context, expected int64) (*Reservation, error) {
-	if m == nil || !m.policy.Active() {
+	if m == nil {
 		return &Reservation{}, nil
+	}
+	if !m.policy.Active() {
+		return &Reservation{m: m, state: reservationOpen}, nil
 	}
 	if expected < 0 {
 		expected = 0

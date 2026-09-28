@@ -600,10 +600,10 @@ func TestManagerReserveEdgeBranches(t *testing.T) {
 		t.Fatalf("un-evictable reserve = %v, want ErrCacheBudgetExceeded", err)
 	}
 
-	// Publish with no reservation still runs the callback.
+	// Publish with no reservation fails closed BEFORE running the callback.
 	published := false
-	if err := m2.Publish(nil, func() error { published = true; return nil }); err != nil || !published {
-		t.Fatalf("nil-reservation publish = %v published=%t", err, published)
+	if err := m2.Publish(nil, func() error { published = true; return nil }); !errors.Is(err, ErrInvalidReservation) || published {
+		t.Fatalf("nil-reservation publish = %v published=%t, want ErrInvalidReservation and no callback", err, published)
 	}
 	// Publish on a nil manager runs the callback directly.
 	var nilMgr *Manager
@@ -952,8 +952,8 @@ func TestManagerAccessorsAndDefensiveBranches(t *testing.T) {
 		t.Fatal(err)
 	}
 	published := false
-	if err := m1.Publish(foreign, func() error { published = true; return nil }); err != nil || !published {
-		t.Fatalf("foreign publish = %v published=%t", err, published)
+	if err := m1.Publish(foreign, func() error { published = true; return nil }); !errors.Is(err, ErrInvalidReservation) || published {
+		t.Fatalf("foreign publish = %v published=%t, want ErrInvalidReservation and no callback", err, published)
 	}
 	m1.mu.Lock()
 	if m1.inflight != 0 {
@@ -967,8 +967,19 @@ func TestManagerAccessorsAndDefensiveBranches(t *testing.T) {
 		t.Fatal(err)
 	}
 	closed.Release()
-	if m1.Publish(closed, func() error { return nil }) != nil {
-		t.Fatal("publish of a released reservation errored")
+	if err := m1.Publish(closed, func() error { return nil }); !errors.Is(err, ErrInvalidReservation) {
+		t.Fatalf("released-reservation publish = %v, want ErrInvalidReservation", err)
+	}
+	// An inactive-policy manager still grants manager-bound reservations, so
+	// publish works uniformly.
+	inactive := NewManager(t.TempDir(), RetentionPolicy{})
+	res, err := inactive.Reserve(context.Background(), 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ran := false
+	if err := inactive.Publish(res, func() error { ran = true; return nil }); err != nil || !ran {
+		t.Fatalf("inactive-policy publish = %v ran=%t", err, ran)
 	}
 	if m1.RetainTempCleanup(nil, "p") || m1.RetainTempCleanup(closed, "p") || m1.RetainTempCleanup(foreign, "") {
 		t.Fatal("invalid RetainTempCleanup accepted")
@@ -976,4 +987,280 @@ func TestManagerAccessorsAndDefensiveBranches(t *testing.T) {
 	var nilStore *Store
 	nilStore.discardTemp("", nil)
 	(&Store{Root: t.TempDir()}).discardTemp("", nil)
+}
+
+// TestManagerRetryTempCleanupConcurrentRetain is the race-oriented
+// regression for the unlocked len(pendingTemps) check: maintenance retries
+// run concurrently with job-teardown retains. Under -race this fails on the
+// unlocked map read.
+func TestManagerRetryTempCleanupConcurrentRetain(t *testing.T) {
+	m := NewManager(t.TempDir(), RetentionPolicy{MaxBytes: 1 << 20, MaxEntries: 1 << 20})
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_, _ = m.RetryTempCleanup(context.Background())
+		}
+	}()
+	retainedOnce := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(retainedOnce)
+		for i := 0; i < 5000; i++ {
+			res, err := m.Reserve(context.Background(), 1)
+			if err != nil {
+				return
+			}
+			// Paths need not exist: RetryTempCleanup treats ENOENT as gone,
+			// which keeps the interleavings dense.
+			m.RetainTempCleanup(res, filepath.Join(m.Root(), fmt.Sprintf(".k%d.remote-1.tmp", i)))
+		}
+	}()
+	<-retainedOnce
+	close(stop)
+	wg.Wait()
+	// A retain can land after the concurrent retry's last sweep; drain the
+	// remainder synchronously before asserting (the concurrent interleavings
+	// above are what the race detector sees).
+	for i := 0; i < 10000 && m.PendingTempCleanup() > 0; i++ {
+		if _, err := m.RetryTempCleanup(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if pending := m.PendingTempCleanup(); pending != 0 {
+		t.Fatalf("pending temps = %d after concurrent retries, want 0", pending)
+	}
+	if got := m.InflightBytes(); got != 0 {
+		t.Fatalf("inflight = %d after concurrent retries, want 0", got)
+	}
+}
+
+// TestManagerRestartReclaimsAbandonedSaveTemp pins crash recovery for save
+// temps: a temp file left by a killed process is removed before the manager
+// is shared, so it can never sit invisibly outside the budget.
+func TestManagerRestartReclaimsAbandonedSaveTemp(t *testing.T) {
+	root := t.TempDir()
+	tmp := filepath.Join(root, ".key1.tar.gz-12345.tmp")
+	if err := os.WriteFile(tmp, make([]byte, 128), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager(root, RetentionPolicy{MaxBytes: 1000})
+	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+		t.Fatalf("abandoned save temp survived manager construction (err=%v)", err)
+	}
+	if m.PendingTempCleanup() != 0 || m.InflightBytes() != 0 {
+		t.Fatalf("manager = pending %d inflight %d, want 0/0", m.PendingTempCleanup(), m.InflightBytes())
+	}
+}
+
+// TestManagerRestartReclaimsAbandonedRestoreTemp is the remote-download half.
+func TestManagerRestartReclaimsAbandonedRestoreTemp(t *testing.T) {
+	root := t.TempDir()
+	tmp := filepath.Join(root, ".key2.remote-9876.tmp")
+	if err := os.WriteFile(tmp, make([]byte, 64), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager(root, RetentionPolicy{MaxBytes: 1000})
+	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+		t.Fatalf("abandoned restore temp survived manager construction (err=%v)", err)
+	}
+	if m.PendingTempCleanup() != 0 {
+		t.Fatalf("pending = %d, want 0", m.PendingTempCleanup())
+	}
+}
+
+// TestManagerRestartAccountsUndeletableAbandonedTemp pins the fail-closed
+// startup accounting: an abandoned temp that cannot be removed is charged
+// until a retry removes it.
+func TestManagerRestartAccountsUndeletableAbandonedTemp(t *testing.T) {
+	root := t.TempDir()
+	tmp := filepath.Join(root, ".key3.tar.gz-42.tmp")
+	if err := os.WriteFile(tmp, make([]byte, 300), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	orig := removeCacheTemp
+	removeCacheTemp = func(path string) error {
+		if path == tmp {
+			return errors.New("test: busy")
+		}
+		return os.Remove(path)
+	}
+	t.Cleanup(func() { removeCacheTemp = orig })
+	m := NewManager(root, RetentionPolicy{MaxBytes: 1000})
+	if m.PendingTempCleanup() != 1 || m.InflightBytes() != 300 {
+		t.Fatalf("manager = pending %d inflight %d, want 1/300", m.PendingTempCleanup(), m.InflightBytes())
+	}
+	removeCacheTemp = orig
+	if removed, err := m.RetryTempCleanup(context.Background()); err != nil || removed != 1 {
+		t.Fatalf("RetryTempCleanup = %d, %v", removed, err)
+	}
+	if m.PendingTempCleanup() != 0 || m.InflightBytes() != 0 {
+		t.Fatalf("manager not drained after retry: pending %d inflight %d", m.PendingTempCleanup(), m.InflightBytes())
+	}
+}
+
+// TestCrashLeftTempCannotBypassMaxBytes is the capacity regression: bytes
+// left by a crash must count against the budget after restart, so a maximum
+// reservation cannot oversubscribe the physical tree.
+func TestCrashLeftTempCannotBypassMaxBytes(t *testing.T) {
+	root := t.TempDir()
+	tmp := filepath.Join(root, ".key4.remote-7.tmp")
+	if err := os.WriteFile(tmp, make([]byte, 900), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	orig := removeCacheTemp
+	removeCacheTemp = func(path string) error {
+		if path == tmp {
+			return errors.New("test: busy")
+		}
+		return os.Remove(path)
+	}
+	t.Cleanup(func() { removeCacheTemp = orig })
+	m := NewManager(root, RetentionPolicy{MaxBytes: 1000, MaxEntries: 10})
+	if _, err := m.Reserve(context.Background(), 200); !errors.Is(err, ErrCacheBudgetExceeded) {
+		t.Fatalf("reserve past a crash-left temp = %v, want ErrCacheBudgetExceeded", err)
+	}
+	res, err := m.Reserve(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("reserve at the remaining budget = %v", err)
+	}
+	res.Release()
+	// Only Kiwi-owned temp shapes are reclaimed: foreign names, directories
+	// and symlinks are left alone.
+	for _, name := range []string{"keep.txt", "visible.tar.gz", "dir.tar.gz-1.tmp"} {
+		path := filepath.Join(root, name)
+		if name == "dir.tar.gz-1.tmp" {
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		} else if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := filepath.Join(root, ".link.tar.gz-1.tmp")
+	if err := os.Symlink(tmp, link); err != nil {
+		t.Fatal(err)
+	}
+	removeCacheTemp = orig
+	_ = NewManager(root, RetentionPolicy{MaxBytes: 1000})
+	for _, name := range []string{"keep.txt", "visible.tar.gz", "dir.tar.gz-1.tmp", ".link.tar.gz-1.tmp"} {
+		if _, err := os.Lstat(filepath.Join(root, name)); err != nil {
+			t.Fatalf("%s was touched by reclamation: %v", name, err)
+		}
+	}
+}
+
+// TestReclaimLegacyLayout pins the upgrade reclamation: pre-namespace
+// archives directly under the shared root are deleted, while foreign names,
+// directories and symlinks are preserved.
+func TestReclaimLegacyLayout(t *testing.T) {
+	root := t.TempDir()
+	key := strings.Repeat("a", 64)
+	for _, name := range []string{key + ".tar.gz", key + ".tar.gz.sha256"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("legacy"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	foreign := filepath.Join(root, "notes.txt")
+	if err := os.WriteFile(foreign, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, strings.Repeat("b", 64)+".tar.gz")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, strings.Repeat("c", 64)+".tar.gz")
+	if err := os.Symlink(foreign, link); err != nil {
+		t.Fatal(err)
+	}
+	files, bytes, err := ReclaimLegacyLayout(root)
+	if err != nil || files != 2 || bytes <= 0 {
+		t.Fatalf("ReclaimLegacyLayout = %d, %d, %v", files, bytes, err)
+	}
+	for _, name := range []string{key + ".tar.gz", key + ".tar.gz.sha256"} {
+		if _, err := os.Stat(filepath.Join(root, name)); !os.IsNotExist(err) {
+			t.Fatalf("legacy %s survived (err=%v)", name, err)
+		}
+	}
+	for _, path := range []string{foreign, dir, link} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("non-legacy %s was touched: %v", path, err)
+		}
+	}
+}
+
+// TestReclamationEdgeBranches pins the reclamation error paths: an
+// unreadable root, a canceled context, the owned-temp name grammar, and a
+// legacy entry whose removal fails.
+func TestReclamationEdgeBranches(t *testing.T) {
+	// Owned-name grammar.
+	cases := map[string]bool{
+		".abc.tar.gz-1.tmp":   true,
+		".abc.remote-2.tmp":   true,
+		"abc.tar.gz-1.tmp":    false, // not dot-prefixed
+		".abc.tmp":            false,
+		".tar.gz-1.tmp":       false, // empty key
+		".abc.remote-.tmp":    false, // empty suffix
+		".abc.tar.gz-1.tmp.x": false,
+	}
+	for name, want := range cases {
+		if got := isOwnedCacheTempName(name); got != want {
+			t.Fatalf("isOwnedCacheTempName(%q) = %t, want %t", name, got, want)
+		}
+	}
+
+	// Unreadable root (a regular file) surfaces the ReadDir error.
+	fileRoot := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(fileRoot, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager(fileRoot, RetentionPolicy{MaxBytes: 100})
+	if _, _, err := m.ReclaimAbandonedTemps(context.Background()); err == nil {
+		t.Fatal("reclaim over an unreadable root succeeded")
+	}
+
+	// Canceled context stops the sweep (files created AFTER construction, so
+	// the constructor's own reclaim does not consume them).
+	root := t.TempDir()
+	m2 := NewManager(root, RetentionPolicy{MaxBytes: 100})
+	for i := 0; i < 3; i++ {
+		if err := os.WriteFile(filepath.Join(root, fmt.Sprintf(".k%d.tar.gz-1.tmp", i)), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := m2.ReclaimAbandonedTemps(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled reclaim = %v", err)
+	}
+
+	// Legacy removal failure is reported (and retried on the next startup).
+	legacyRoot := t.TempDir()
+	key := strings.Repeat("f", 64)
+	legacy := filepath.Join(legacyRoot, key+".tar.gz")
+	if err := os.WriteFile(legacy, []byte("legacy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	orig := removeCacheFile
+	removeCacheFile = func(string) error { return errors.New("test: busy") }
+	t.Cleanup(func() { removeCacheFile = orig })
+	files, _, err := ReclaimLegacyLayout(legacyRoot)
+	if err == nil || files != 0 {
+		t.Fatalf("failing legacy reclaim = %d, %v", files, err)
+	}
+	if _, err := os.Stat(legacy); err != nil {
+		t.Fatalf("legacy entry vanished despite the failure: %v", err)
+	}
+	// Legacy reclaim of a missing root is a no-op.
+	if files, bytes, err := ReclaimLegacyLayout(filepath.Join(t.TempDir(), "missing")); err != nil || files != 0 || bytes != 0 {
+		t.Fatalf("missing legacy root = %d, %d, %v", files, bytes, err)
+	}
 }

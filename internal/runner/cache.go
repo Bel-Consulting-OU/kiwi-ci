@@ -147,15 +147,46 @@ func (r *Runner) cacheRetentionPolicy() cache.RetentionPolicy {
 // accounting new files against the old ledger (which would be worse with a
 // changed root: reservations and writes would refer to different
 // directories). Direct execute callers keep the lazy construction.
-func (r *Runner) configureCacheManager() {
+//
+// Replacement is fail-closed against outstanding cleanup debt: the old
+// manager first retries its retained temp files, and if any charge remains
+// the change is refused — the bytes are still on disk and only that manager
+// accounts for them, so dropping the ledger would strand them invisibly.
+func (r *Runner) configureCacheManager() error {
 	root := r.cacheRootDir()
 	policy := r.cacheRetentionPolicy()
 	r.cacheMu.Lock()
 	defer r.cacheMu.Unlock()
 	if r.cacheMgr != nil && r.cacheMgr.Root() == root && r.cacheMgr.Policy() == policy {
+		return nil
+	}
+	if old := r.cacheMgr; old != nil {
+		_, _ = old.RetryTempCleanup(context.Background())
+		if pending := old.PendingTempCleanup(); pending > 0 || old.InflightBytes() > 0 {
+			return fmt.Errorf("cache manager replacement refused: %d temp cleanup item(s) and %d charged bytes remain under %s; remove them or restart the process", pending, old.InflightBytes(), old.Root())
+		}
+	}
+	mgr := cache.NewManager(root, policy)
+	r.reclaimLegacyCacheLayoutLocked(mgr)
+	r.cacheMgr = mgr
+	return nil
+}
+
+// reclaimLegacyCacheLayoutLocked deletes the pre-namespace shared layout
+// (<root>/*.tar.gz) once, when a manager is installed for this root. The
+// local cache is disposable and the per-runner namespace is the only
+// supported layout; callers hold r.cacheMu.
+func (r *Runner) reclaimLegacyCacheLayoutLocked(mgr *cache.Manager) {
+	if mgr == nil {
 		return
 	}
-	r.cacheMgr = cache.NewManager(root, policy)
+	files, bytes, err := cache.ReclaimLegacyLayout(filepath.Dir(mgr.Root()))
+	if files > 0 {
+		reportf("kiwi runner %s: reclaimed %d legacy shared cache entries (%d bytes) now superseded by %s\n", r.ID, files, bytes, mgr.Root())
+	}
+	if err != nil {
+		reportf("kiwi runner %s: legacy cache reclaim incomplete: %v (retried next startup)\n", r.ID, err)
+	}
 }
 
 // cacheManager returns the runner-wide aggregate cache budget owner, shared
@@ -166,7 +197,9 @@ func (r *Runner) cacheManager() *cache.Manager {
 	r.cacheMu.Lock()
 	defer r.cacheMu.Unlock()
 	if r.cacheMgr == nil {
-		r.cacheMgr = cache.NewManager(r.cacheRootDir(), r.cacheRetentionPolicy())
+		mgr := cache.NewManager(r.cacheRootDir(), r.cacheRetentionPolicy())
+		r.reclaimLegacyCacheLayoutLocked(mgr)
+		r.cacheMgr = mgr
 	}
 	return r.cacheMgr
 }

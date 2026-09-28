@@ -453,3 +453,16 @@ claims themselves.
   policy replaces the manager, and a runner-local cache is no longer shared
   across runner processes (the cache is a performance optimization; a real
   disk bound wins).
+- Cache temp cleanup is now crash-safe and fail-closed. Startup reclaims
+  abandoned `.<key>.tar.gz-*.tmp` / `.<key>.remote-*.tmp` files left by a
+  killed process (never following symlinks or directories) and charges any
+  file it cannot remove, so repeated abnormal restarts cannot strand
+  unaccounted multi-GiB temps. The pre-namespace shared cache layout
+  (`<root>/cache/*.tar.gz`) is reclaimed once per root on upgrade — local
+  cache is disposable, and the per-runner namespace is the only supported
+  layout. Replacing the manager across an in-process restart first retries
+  temp debt and refuses a changed root/policy while any charge remains.
+  `Manager.Publish` now rejects nil/foreign/ended reservations with
+  `ErrInvalidReservation` before running the publication callback, and the
+  temp-cleanup retry reads its pending map under the manager lock (the
+  unlocked length check was a data race).
