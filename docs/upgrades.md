@@ -348,6 +348,24 @@ claims themselves.
 - A deadline during dependency restore now reports `cancelled` like a
   deadline during checkout; the setup phase uses one status rule
   (`statusForErr(setupCtx, err)`) for every context-bounded subphase.
+- Distributed artifact packaging is now a temporary, budgeted publication
+  path instead of the persistent local artifact tree: each archive is
+  bounded by `min(8 GiB, the declaration's max_size)`, reserves its full
+  size from the runner-wide staging budget before the first byte, and is
+  deleted together with its manifest immediately after delivery. A
+  distributed job can no longer accumulate archives outside the workspace
+  quota. Cache archives now use the same 8 GiB default bound locally that
+  the restore path and the upload endpoint already enforced (previously an
+  unconfigured store wrote unbounded archives), and both cache and artifact
+  archive creation stop promptly when the job deadline expires.
+- Cancellation cleanup steps now survive only the JOB deadline, never the
+  runner lifecycle: the runner passes its lifecycle context to the executor,
+  so a shutdown aborts user cleanup immediately instead of waiting out the
+  cleanup grace past the drain window, while a job that merely hits its own
+  timeout still gets its bounded cleanup and `if: cancelled()` diagnostic
+  artifacts. Success-only cache publication is skipped as soon as the job
+  context ends, so a dead deadline can no longer spend minutes compressing
+  an archive that is then discarded.
 - Pre-checkout hard-quota gating for untrusted jobs is fail-closed for
   legacy/malformed tasks and does NOT trust the unverified compiled
   payload: the runtime always comes from the persisted pipeline (parse +

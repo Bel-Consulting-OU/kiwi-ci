@@ -1161,9 +1161,34 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		}
 	}
 	cacheStore := r.newJobCache(t, r.Metrics)
-	artifactStore := artifact.Default()
-	if r.Cfg.CacheRoot != "" {
-		artifactStore = &artifact.Store{Root: filepath.Join(r.Cfg.CacheRoot, "artifacts")}
+	// Distributed artifact packaging is a TEMPORARY, budgeted publication
+	// path, never the persistent local artifact store: the archive lives only
+	// through capture -> attest -> upload -> cleanup, is bounded by
+	// min(the global 8 GiB blob ceiling, the declaration's max_size), and
+	// every archive's full size is charged to the runner-wide staging budget
+	// BEFORE the first byte is written. That closes the escape where a
+	// distributed job could accumulate unbounded archives under CacheRoot
+	// outside the workspace quota (resources.disk and the XFS project quota
+	// cover the workspace, not the runner's artifact tree).
+	var (
+		artifactStore *artifact.Store
+		captureDir    string
+	)
+	if len(cj.Job.Artifacts) > 0 {
+		d, derr := os.MkdirTemp(r.Cfg.WorkDir, "kiwi-artifacts-"+t.Job.ID+"-*")
+		if derr != nil {
+			r.complete(parent, t, model.StatusFailure, fmt.Errorf("artifact capture directory: %w", derr), nil)
+			return
+		}
+		captureDir = d
+		// The capture directory is per job and always removed; a leftover
+		// only survives a hard runner crash, exactly like a job workspace.
+		defer func() {
+			if rerr := os.RemoveAll(captureDir); rerr != nil {
+				fmt.Fprintf(os.Stderr, "kiwi runner %s: remove artifact capture dir %s: %v\n", r.ID, captureDir, rerr)
+			}
+		}()
+		artifactStore = &artifact.Store{Root: captureDir}
 	}
 	// In-job artifact delivery runs under the DECLARED JOB LIFETIME, not the
 	// process lifetime: a job that exceeds its timeout must not keep
@@ -1177,7 +1202,28 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// require image references pinned by digest. The untrusted floor is
 	// unconditional here: nothing may override RequireImmutableImages for
 	// an untrusted job.
-	opts := executor.Options{Workspace: tmp, RunID: t.Job.RunID, Event: t.Job.Event, Branch: branchFromRef(t.Job.Ref), ChangedFiles: resolvedChangedFiles, SecretProvider: provider, Logs: logging.Func(func(job, step, line string) { sink.WriteLine(job, step, line) }), Cache: cacheStore, Artifacts: artifactStore, ArtifactReporter: reporter, DependencyStatus: t.Job.DependencyStatus, NeedsOutputs: t.Job.NeedsOutputs, CacheNamespace: cacheNamespace(t.Job), RequireImmutableImages: !t.Job.Trusted}
+	opts := executor.Options{Workspace: tmp, RunID: t.Job.RunID, Event: t.Job.Event, Branch: branchFromRef(t.Job.Ref), ChangedFiles: resolvedChangedFiles, SecretProvider: provider, Logs: logging.Func(func(job, step, line string) { sink.WriteLine(job, step, line) }), Cache: cacheStore, Artifacts: artifactStore, ArtifactReporter: reporter, DependencyStatus: t.Job.DependencyStatus, NeedsOutputs: t.Job.NeedsOutputs, CacheNamespace: cacheNamespace(t.Job), RequireImmutableImages: !t.Job.Trusted, LifecycleContext: parent}
+	if artifactStore != nil {
+		// Capture is bounded by the job context while it is alive (so a job
+		// that exceeds its declared lifetime stops publishing) and by the
+		// runner context otherwise; the executor builds the cancellation-time
+		// fallback itself from LifecycleContext.
+		opts.ArtifactCapture = &executor.ArtifactCapture{
+			Context:  ctx,
+			MaxBytes: runnerArtifactMaxBytes,
+			Reserve: func(rctx context.Context, n int64) (func(), error) {
+				budget, berr := r.dependencyStaging()
+				if berr != nil {
+					return nil, berr
+				}
+				res, aerr := budget.Acquire(rctx, n)
+				if aerr != nil {
+					return nil, aerr
+				}
+				return res.Release, nil
+			},
+		}
+	}
 	// The declared resources.disk is the job's workspace bound: it feeds the
 	// executor's pre-execution free-space check and the container backend's
 	// step-boundary workspace check, and it is what the snapshot capture
@@ -1728,6 +1774,12 @@ var ErrDependencyArtifactTooLarge = errors.New("dependency artifact exceeds maxi
 // peer cannot make the runner spool an unbounded stream. It is a variable so
 // tests can lower the bound.
 var dependencyArtifactMaxBytes int64 = 8 << 30
+
+// runnerArtifactMaxBytes is the global per-artifact capture ceiling for
+// distributed jobs: it mirrors the server's blob maximum (8 GiB), which the
+// control plane enforces regardless of what the pipeline declares. A
+// variable so tests can lower the bound.
+var runnerArtifactMaxBytes int64 = 8 << 30
 
 // defaultStagingMaxBytes is the built-in runner staging budget used when the
 // operator configures none: exactly one maximum-size dependency artifact. It

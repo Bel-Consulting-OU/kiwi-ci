@@ -1,9 +1,11 @@
 package artifact
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -50,16 +52,32 @@ func Default() *Store {
 	return &Store{Root: filepath.Join(home, ".kiwi", "artifacts")}
 }
 
-// Save writes a deterministic tar.gz artifact plus a sidecar manifest
+// Save is SaveContext with a background context and the store's configured
+// MaxArtifactBytes bound (zero means unbounded: the local-CLI persistent
+// store keeps its historical behavior).
+func (s *Store) Save(runID, jobID, name, workspace string, paths []string) (string, error) {
+	return s.SaveContext(context.Background(), runID, jobID, name, workspace, paths, s.MaxArtifactBytes)
+}
+
+// SaveContext writes a deterministic tar.gz artifact plus a sidecar manifest
 // containing the archive digest and per-entry digests. Symlinks and special
 // files are never captured, capture roots that resolve outside the workspace
-// are rejected, and the archive output is hard-capped at MaxArtifactBytes.
-// Every workspace read goes through a held safefs.WorkspaceRoot: files are
-// opened relative to the root handle (no-follow) and the manifest is built
-// from the exact bytes written into the archive, so the manifest can never
-// describe different content than the archive even when the workspace is
-// mutated mid-capture.
-func (s *Store) Save(runID, jobID, name, workspace string, paths []string) (string, error) {
+// are rejected, and the archive output is hard-capped at maxBytes (when
+// positive; zero means the caller accepts an unbounded archive, the local-CLI
+// persistent-store behavior). Every workspace read goes through a held
+// safefs.WorkspaceRoot: files are opened relative to the root handle
+// (no-follow) and the manifest is built from the exact bytes written into the
+// archive, so the manifest can never describe different content than the
+// archive even when the workspace is mutated mid-capture.
+//
+// ctx bounds the capture: every archive write observes it, so a job deadline
+// or cancellation stops a long traversal/compression pass promptly and the
+// partial file is removed instead of finishing an archive whose delivery can
+// no longer happen.
+func (s *Store) SaveContext(ctx context.Context, runID, jobID, name, workspace string, paths []string, maxBytes int64) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	wsRoot, err := safefs.OpenWorkspaceRoot(workspace)
 	if err != nil {
 		return "", fmt.Errorf("artifact: open workspace root: %w", err)
@@ -72,7 +90,7 @@ func (s *Store) Save(runID, jobID, name, workspace string, paths []string) (stri
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	if err := safefs.FitsAvailable(dir, s.MaxArtifactBytes); err != nil {
+	if err := safefs.FitsAvailable(dir, maxBytes); err != nil {
 		return "", err
 	}
 	dst := filepath.Join(dir, encodeArtifactName(name)+".tar.gz")
@@ -88,9 +106,9 @@ func (s *Store) Save(runID, jobID, name, workspace string, paths []string) (stri
 	tmp := f.Name()
 	h := sha256.New()
 	cw := &countWriter{w: io.MultiWriter(f, h)}
-	var w io.Writer = cw
-	if s.MaxArtifactBytes > 0 {
-		w = safefs.NewCappedWriter(cw, s.MaxArtifactBytes)
+	w := safefs.NewContextWriter(ctx, cw)
+	if maxBytes > 0 {
+		w = safefs.NewCappedWriter(w, maxBytes)
 	}
 	archived, err := safefs.WriteTarGzFromRootEntries(w, wsRoot, paths)
 	if err != nil {
@@ -136,6 +154,25 @@ func (s *Store) Save(runID, jobID, name, workspace string, paths []string) (stri
 		return "", err
 	}
 	return dst, nil
+}
+
+// RemoveCaptured removes a captured archive and its sidecar manifest: the
+// temporary publication path (capture -> attest -> upload -> cleanup) must
+// leave nothing behind, so a distributed runner deletes the archive as soon
+// as delivery finished, on success and failure alike. A missing file is not
+// an error (the cleanup is idempotent); actual removal failures are
+// reported so the runner can log them.
+func RemoveCaptured(archivePath string) error {
+	if archivePath == "" {
+		return nil
+	}
+	var errs []error
+	for _, p := range []string{archivePath, archivePath + ".manifest.json"} {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // verifyCaptureRoots resolves every requested capture path (directories

@@ -99,7 +99,7 @@ func TestRunnerShutdownDoesNotWaitCompletionGrace(t *testing.T) {
 	stubWorkspaceQuota(t, executor.DiskQuotaStatus{Detail: "no delegated quota here"}, nil, &installs, &cleanups, &limitSeen, &dirSeen)
 
 	task := untrustedContainerTask(t)
-	jobJSON, err := json.Marshal(task.Job)
+	jobJSON, err := json.Marshal(task)
 	if err != nil {
 		t.Fatal(err)
 	}

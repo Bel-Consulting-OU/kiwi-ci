@@ -453,8 +453,11 @@ func (s *Store) readStoredDigest(key string) (string, error) {
 // defaultCacheArchiveBytes bounds a cache archive when MaxCacheBytes is not
 // configured. It resolves to the ONE shared cache-archive contract
 // (MaxArchiveBytes), so the Store, the runner-side client and the
-// control-plane upload endpoint all accept the same compressed range.
-const defaultCacheArchiveBytes int64 = MaxArchiveBytes
+// control-plane upload endpoint all accept the same compressed range. A
+// variable so tests can shrink it and prove an UNCONFIGURED store still
+// enforces the default contract (the historical bug branched on
+// MaxCacheBytes==0 and wrote unbounded archives).
+var defaultCacheArchiveBytes int64 = MaxArchiveBytes
 
 // maxStoredBytes resolves the compressed-size bound for a cache archive:
 // MaxCacheBytes when configured, otherwise defaultCacheArchiveBytes.
@@ -601,8 +604,14 @@ func (s *Store) Save(key, workspace string, paths []string) error {
 }
 
 // SaveContext captures workspace paths into the local store and, when
-// RemoteURL is set, uploads the archive. The context bounds every remote
-// (HTTP) phase; the local archive write itself is bounded by MaxCacheBytes.
+// RemoteURL is set, uploads the archive. The bound is the SAME
+// maxStoredBytes() contract the restore path and the remote push enforce
+// (configured MaxCacheBytes, else the 8 GiB default), so a locally produced
+// archive can never exceed what Kiwi itself will upload or restore. The
+// context bounds the local archive traversal/writes as well as every remote
+// (HTTP) phase: a job deadline stops a long compression pass promptly and
+// the partial file is removed instead of finishing an archive whose upload
+// can no longer happen.
 func (s *Store) SaveContext(ctx context.Context, key, workspace string, paths []string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -610,10 +619,11 @@ func (s *Store) SaveContext(ctx context.Context, key, workspace string, paths []
 	if !validKey(key) {
 		return fmt.Errorf("cache: invalid cache key")
 	}
+	bound := s.maxStoredBytes()
 	if err := os.MkdirAll(s.Root, 0o755); err != nil {
 		return err
 	}
-	if err := safefs.FitsAvailable(s.Root, s.MaxCacheBytes); err != nil {
+	if err := safefs.FitsAvailable(s.Root, bound); err != nil {
 		return err
 	}
 	root, err := safefs.OpenWorkspaceRoot(workspace)
@@ -634,10 +644,10 @@ func (s *Store) SaveContext(ctx context.Context, key, workspace string, paths []
 	tmp := f.Name()
 	h := sha256.New()
 	cw := &countWriter{w: io.MultiWriter(f, h)}
-	var w io.Writer = cw
-	if s.MaxCacheBytes > 0 {
-		w = safefs.NewCappedWriter(cw, s.MaxCacheBytes)
-	}
+	// Order matters: the cap wraps the context writer so the recorded bytes
+	// are exactly those that reached the file, and the context is checked
+	// before each write (per tar entry/chunk).
+	w := safefs.NewCappedWriter(safefs.NewContextWriter(ctx, cw), bound)
 	if err := safefs.WriteTarGzFromRoot(w, root, paths); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmp)

@@ -49,6 +49,7 @@ type Options struct {
 	Logs             logging.Sink
 	Cache            *cache.Store
 	Artifacts        *artifact.Store
+	ArtifactCapture  *ArtifactCapture
 	ArtifactReporter func(jobID, name, path string) error
 	DependencyStatus model.Status
 	NeedsOutputs     map[string]map[string]string
@@ -118,6 +119,15 @@ type Options struct {
 	// quota is exhausted, further lines are dropped after a single terminal
 	// "log quota exceeded" marker. Zero means unlimited.
 	LogMaxBytes int64
+	// LifecycleContext is the runner/process lifecycle context, distinct
+	// from the job context. Post-deadline work that intentionally survives
+	// the JOB context ending (cancellation cleanup steps, diagnostic
+	// artifact capture) is detached from the job deadline but re-tied to
+	// this context, so a runner shutdown aborts it immediately instead of
+	// waiting out its own timeout past the drain grace. Nil falls back to
+	// the context RunCompiledJob received (the local-CLI process context);
+	// the distributed runner passes its runCtx explicitly.
+	LifecycleContext context.Context
 	// StepReporter, when set, is called once per executed step with the
 	// step's wall time (including retries and backoff). Steps that were
 	// skipped or never executed are not reported.
@@ -133,6 +143,30 @@ type Options struct {
 	// job. The distributed runner wires its fragment POST here; local runs
 	// leave it nil and only validate the read.
 	GenerateUpload func(jobID, path string, data []byte) error
+}
+
+// ArtifactCapture configures distributed artifact packaging. It replaces the
+// persistent local artifact store's defaults with a temporary, budgeted
+// publication path: each archive is bounded by min(capture.MaxBytes, the
+// declaration's max_size), charged to the runner-wide staging budget through
+// Reserve BEFORE the first byte is written, and removed (archive + sidecar
+// manifest) as soon as delivery finishes, on success and failure alike. The
+// archive therefore lives only through capture -> attest -> upload ->
+// cleanup and never accumulates outside the job workspace quota. Nil keeps
+// the local-CLI persistent-store behavior.
+type ArtifactCapture struct {
+	// Context bounds capture and delivery while the job context is alive
+	// (the distributed runner passes the job context, so a job that exceeds
+	// its declared lifetime stops publishing).
+	Context context.Context
+	// MaxBytes is the global per-artifact payload ceiling (the server's blob
+	// maximum). <=0 means no global cap.
+	MaxBytes int64
+	// Reserve charges n bytes of aggregate staging capacity before an
+	// archive is created and returns the release callback, which the
+	// executor calls after the archive has been removed. Nil fails capture
+	// closed (an unaccounted archive must never be created).
+	Reserve func(ctx context.Context, n int64) (func(), error)
 }
 
 type Executor struct {
@@ -333,6 +367,17 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		res.Status = model.StatusSkipped
 		return finish(res)
 	}
+	// The context received here is the RUNNER/PROCESS context (for the
+	// distributed runner it already carries the declared job deadline; for
+	// local execution it is the process context). Keep it: post-deadline
+	// work that must survive the JOB context (cleanup steps, diagnostic
+	// artifact capture) detaches from the job deadline below. When the
+	// caller supplied a separate lifecycle context (the distributed runner
+	// passes its runCtx), that work is re-tied to it so a runner shutdown
+	// aborts it; local callers that did not supply one keep the historical
+	// behavior (a canceled process context does not veto cleanup steps).
+	jobParent := ctx
+	lifecycle := e.Opt.LifecycleContext
 	// Shared resolution with the enqueue-time stamping
 	// (pipeline.EffectiveJobTimeout): a job-level timeout, else the pipeline
 	// defaults.timeout. The distributed runner has already started the same
@@ -737,7 +782,12 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 				currentStatus = model.StatusCancelled
 				if cleanupCtx == nil {
 					var cleanupCancel context.CancelFunc
-					cleanupCtx, cleanupCancel = context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+					// Survive the JOB deadline, never the runner lifecycle:
+					// context.WithoutCancel(ctx) alone would strip BOTH, so
+					// a user cleanup step could keep running for the whole
+					// cleanup timeout after the runner was told to shut down
+					// (longer than the runner's background drain grace).
+					cleanupCtx, cleanupCancel = detachedJobContext(jobParent, lifecycle, cleanupTimeout)
 					defer cleanupCancel()
 				}
 				if res.Error == "" {
@@ -806,11 +856,28 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			}
 		}
 	}
+	// Phase gate: the declared job context ending before publication means
+	// the job did not complete inside its lifetime. Mark it cancelled NOW,
+	// before success-only publication can spend minutes hashing and
+	// compressing the workspace under a dead deadline (the work would
+	// otherwise run to completion and be discarded by the final status
+	// correction). Artifact capture below still honors conditions that admit
+	// the cancelled status, under the bounded capture context, so diagnostic
+	// artifacts are preserved deliberately instead of as a side effect.
+	if ctx.Err() != nil && currentStatus == model.StatusSuccess {
+		currentStatus = model.StatusCancelled
+		if res.Error == "" {
+			res.Error = ctx.Err().Error()
+		}
+	}
 	if currentStatus == model.StatusSuccess {
 		for _, c := range cj.Job.Cache {
 			key, er := e.Opt.Cache.Key(e.cacheBase(c.Key)+"|"+runtime.GOOS+"|"+runtime.GOARCH+"|"+cj.Job.Runtime, workspace, c.HashFiles)
 			if er == nil {
-				if er = e.Opt.Cache.Save(key, workspace, c.Paths); er != nil {
+				// SaveContext, never Save: the legacy wrapper uses a
+				// timeout-free background context, so a big archive would
+				// ignore the job deadline entirely.
+				if er = e.Opt.Cache.SaveContext(ctx, key, workspace, c.Paths); er != nil {
 					e.log(cj.ID, "cache", "save warning: "+er.Error())
 				} else {
 					e.log(cj.ID, "cache", "saved "+cacheName(c)+" ("+key[:12]+")")
@@ -833,7 +900,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		res.Error = err.Error()
 		res.Outputs = nil
 	}
-	e.saveArtifacts(s, cj, workspace, res.Status)
+	e.saveArtifacts(cj, workspace, res.Status, jobParent, lifecycle)
 	// Artifact delivery is part of the declared job lifetime (the runner
 	// wires ArtifactReporter to the job context), so a deadline or
 	// cancellation that lands while artifacts are being published must not
@@ -904,34 +971,135 @@ func defaultCondition(cond string) string {
 // cleanupTimeout bounds the cleanup phase that runs after a job is
 // cancelled: steps whose conditions admit the cancelled state execute under
 // a fresh context with this budget because the job's own execution context
-// is already dead.
-const cleanupTimeout = 60 * time.Second
+// is already dead. A var so tests can shrink it.
+var cleanupTimeout = 60 * time.Second
+
+// artifactCaptureTimeout bounds the cancellation-time artifact capture
+// fallback (if: cancelled() diagnostics) once the job context has ended. A
+// var so tests can shrink it.
+var artifactCaptureTimeout = 60 * time.Second
+
+// detachedJobContext returns a context for work that must survive the JOB
+// context ending (the declared job deadline) while staying tied to the
+// runner/process lifecycle: it drops parent's cancellation but re-cancels
+// when lifecycle does, and it is always bounded by timeout. parent is the
+// context received before the job deadline was applied; a nil lifecycle
+// means the caller supplied no separate lifecycle, so only the timeout
+// bounds the detached work (historical local behavior).
+func detachedJobContext(parent, lifecycle context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), timeout)
+	if lifecycle == nil {
+		return ctx, cancel
+	}
+	if lifecycle.Err() != nil {
+		// Already shut down: cancel synchronously. context.AfterFunc only
+		// schedules the callback on a goroutine, so relying on it here would
+		// race a caller's immediate Err() check.
+		cancel()
+		return ctx, func() { cancel() }
+	}
+	stop := context.AfterFunc(lifecycle, cancel)
+	return ctx, func() {
+		stop()
+		cancel()
+	}
+}
 
 // maxGeneratedFragmentBytes is the hard cap for one generated graph
 // fragment read through the execution backend (mirrors the control plane's
 // upload bound).
 const maxGeneratedFragmentBytes = 256 << 10
 
-func (e *Executor) saveArtifacts(_ *pipeline.Spec, cj pipeline.CompiledJob, workspace string, status model.Status) {
+func (e *Executor) saveArtifacts(cj pipeline.CompiledJob, workspace string, status model.Status, jobParent, lifecycle context.Context) {
 	for _, a := range cj.Job.Artifacts {
 		ok, err := pipeline.Eval(a.If, pipeline.EvalContext{Status: status})
 		if err != nil || !ok {
 			continue
 		}
-		p, err := e.Opt.Artifacts.Save(e.Opt.RunID, cj.ID, a.Name, workspace, a.Paths)
-		if err != nil {
-			e.log(cj.ID, "artifact", "save warning: "+err.Error())
-			continue
+		e.saveArtifact(cj, a, workspace, jobParent, lifecycle)
+	}
+}
+
+// saveArtifact captures, reports and (in capture mode) deletes one artifact.
+// A capture failure is a warning: artifact delivery is best-effort
+// intelligence, while the job's terminal status is decided by the phase gate
+// and the final context check.
+func (e *Executor) saveArtifact(cj pipeline.CompiledJob, a pipeline.Artifact, workspace string, jobParent, lifecycle context.Context) {
+	ctx := context.Background()
+	limit := int64(0)
+	if e.Opt.Artifacts != nil {
+		limit = e.Opt.Artifacts.MaxArtifactBytes
+	}
+	capture := e.Opt.ArtifactCapture
+	var release func()
+	if capture != nil {
+		ctx = capture.Context
+		if ctx == nil || ctx.Err() != nil {
+			// The job context ended before this artifact was captured (an
+			// `if: cancelled()` diagnostic capture on a timed-out job). Use
+			// the bounded context that survives the JOB deadline but not the
+			// runner lifecycle, so the diagnostic still happens deliberately
+			// and remains bounded.
+			fallbackCtx, fallbackCancel := detachedJobContext(jobParent, lifecycle, artifactCaptureTimeout)
+			defer fallbackCancel()
+			ctx = fallbackCtx
 		}
-		e.log(cj.ID, "artifact", "saved "+p)
-		if e.Opt.ArtifactReporter != nil {
-			if err := e.Opt.ArtifactReporter(cj.ID, a.Name, p); err != nil {
-				e.log(cj.ID, "artifact", "upload warning: "+err.Error())
-			} else {
-				e.log(cj.ID, "artifact", "uploaded "+a.Name)
+		if cerr := ctx.Err(); cerr != nil {
+			// The bounded fallback itself is done (runner shutdown, or the
+			// capture window expired): skip the capture entirely instead of
+			// reserving capacity for an archive that can never be delivered.
+			e.log(cj.ID, "artifact", "capture skipped: "+cerr.Error())
+			return
+		}
+		limit = artifactCaptureLimit(capture.MaxBytes, a.MaxSize)
+		if capture.Reserve == nil {
+			e.log(cj.ID, "artifact", "capture failed: artifact staging is not configured")
+			return
+		}
+		rel, rerr := capture.Reserve(ctx, limit)
+		if rerr != nil {
+			e.log(cj.ID, "artifact", "capture failed: "+rerr.Error())
+			return
+		}
+		release = rel
+		defer release()
+	}
+	p, err := e.Opt.Artifacts.SaveContext(ctx, e.Opt.RunID, cj.ID, a.Name, workspace, a.Paths, limit)
+	if err != nil {
+		e.log(cj.ID, "artifact", "save warning: "+err.Error())
+		return
+	}
+	if capture != nil {
+		// The archive exists only through capture -> attest -> upload ->
+		// cleanup. Deletion is deferred BEFORE the release (LIFO), so the
+		// staged bytes stay charged until the file is actually gone.
+		defer func() {
+			if rerr := artifact.RemoveCaptured(p); rerr != nil {
+				e.log(cj.ID, "artifact", "cleanup warning: "+rerr.Error())
 			}
+		}()
+	}
+	e.log(cj.ID, "artifact", "saved "+p)
+	if e.Opt.ArtifactReporter != nil {
+		if err := e.Opt.ArtifactReporter(cj.ID, a.Name, p); err != nil {
+			e.log(cj.ID, "artifact", "upload warning: "+err.Error())
+		} else {
+			e.log(cj.ID, "artifact", "uploaded "+a.Name)
 		}
 	}
+}
+
+// artifactCaptureLimit intersects the global artifact payload ceiling with
+// the declaration's max_size: the distributed runner must not spend disk,
+// CPU and upload bandwidth on an archive the control plane is guaranteed to
+// reject (either bound can be the smaller one). Zero means unbounded, which
+// only a caller that configured no global ceiling at all can produce.
+func artifactCaptureLimit(global int64, declared pipeline.ByteSize) int64 {
+	limit := global
+	if d := int64(declared); d > 0 && (limit <= 0 || d < limit) {
+		limit = d
+	}
+	return limit
 }
 func (e *Executor) log(j, s, l string) {
 	if e.Opt.Logs != nil {
