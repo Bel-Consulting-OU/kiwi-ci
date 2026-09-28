@@ -23,6 +23,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	v1 "github.com/Bel-Consulting-OU/kiwi-ci/internal/api/v1"
@@ -37,6 +38,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secretbroker"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secrets"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/testintel"
 )
 
@@ -85,16 +87,13 @@ var heartbeatShutdownGrace = 5 * time.Second
 
 // Seams over the standard library used by the runner. Production behavior is
 // unchanged; they let checked failure branches be exercised deterministically:
-// closeRunnerTempFile covers os.File.Close failures (matching the
-// internal/cache closeCacheFile seam), randReader covers identifier-generation
-// failures (matching the internal/provenance randReader seam), and
-// enrollTLSConfig covers the enrollment TLS configuration so a hermetic test
-// can reach the server-CA fallback without a system-trusted listener
-// certificate.
+// randReader covers identifier-generation failures (matching the
+// internal/provenance randReader seam), and enrollTLSConfig covers the
+// enrollment TLS configuration so a hermetic test can reach the server-CA
+// fallback without a system-trusted listener certificate.
 var (
-	closeRunnerTempFile           = (*os.File).Close
-	randReader          io.Reader = rand.Reader
-	enrollTLSConfig               = runnerpki.TLSClientConfig
+	randReader      io.Reader = rand.Reader
+	enrollTLSConfig           = runnerpki.TLSClientConfig
 	// reportf writes runner maintenance reports. It is a seam so tests can
 	// observe a report from the detached GC goroutine without racing the
 	// process-wide stdout.
@@ -138,10 +137,27 @@ var (
 	// transfers: a request context is cancelled when no byte flows in either
 	// direction for this long, so an arbitrarily large object may take as
 	// long as it keeps making progress while a peer that stops transferring
-	// is disconnected. Production uses this value; the variable is a test
-	// seam.
-	streamIdleTimeout = 90 * time.Second
+	// is disconnected. It is held atomically because tests shrink it around
+	// live transfers; a plain variable would race the request path. Each
+	// guard snapshots it once at creation via get().
+	streamIdleTimeout = newAtomicDuration(90 * time.Second)
 )
+
+// atomicDuration is a duration held atomically. The runner's streaming
+// tests mutate the idle bound while transfers are live, so reads of the
+// bound from request goroutines must be race-free (the same reasoning as the
+// app middleware's apiDeadline seam).
+type atomicDuration struct{ nanos atomic.Int64 }
+
+func newAtomicDuration(d time.Duration) *atomicDuration {
+	a := &atomicDuration{}
+	a.nanos.Store(int64(d))
+	return a
+}
+
+func (a *atomicDuration) get() time.Duration { return time.Duration(a.nanos.Load()) }
+
+func (a *atomicDuration) set(v time.Duration) { a.nanos.Store(int64(v)) }
 
 type Config struct {
 	Server, Token, Name string
@@ -196,6 +212,28 @@ type Config struct {
 	// CacheRoot is the root for the runner's local cache and artifact
 	// stores (default: ~/.kiwi).
 	CacheRoot string
+	// StagingDir is the ROOT for the runner's bounded dependency spool (the
+	// scratch space a downloaded dependency artifact is written to before
+	// extraction). The runner owns one immutable staging.Budget per process
+	// and stages inside <StagingDir>/<runner instance id>, so two runners
+	// sharing a root never share one ledger. Default: the dependency spool
+	// root (CacheRoot, then WorkDir, then the system temp dir); production
+	// runners that stage multi-GB dependencies should configure a dedicated
+	// directory.
+	StagingDir string
+	// StagingMaxBytes bounds the runner-wide aggregate of concurrent
+	// dependency spool bytes. Default: one maximum-size artifact
+	// (dependencyArtifactMaxBytes, 8 GiB), which is conservative and
+	// automatically serializes maximum-sized spools; operators that want
+	// greater concurrent restore concurrency raise it.
+	StagingMaxBytes int64
+	// SetupTimeout bounds the setup phase (workspace checkout through
+	// dependency restore) for jobs whose persisted JobTimeout is unset
+	// (legacy records). Zero means the default (15 minutes). Modern jobs are
+	// bounded by their persisted job timeout, so this ceiling is the legacy
+	// fallback that keeps "no user job timeout" from meaning "git may hang
+	// forever".
+	SetupTimeout time.Duration
 	// StateDir is the runner's durable state directory; the per-job log
 	// batch journal lives under it (keyed by job and lease generation) so a
 	// restarted runner replays unconsumed batches under their original
@@ -252,6 +290,15 @@ type Runner struct {
 	// it, so the production path always fails closed when no state
 	// directory can be resolved.
 	journalOptOut bool
+	// staging is the immutable, runner-wide bounded spool budget every
+	// dependency restore reserves from before a single compressed byte is
+	// written. Run constructs it once (configureStaging); direct execute
+	// callers (tests) resolve it lazily through dependencyStaging under
+	// stagingMu. It is immutable thereafter: the budget's own ledger is
+	// concurrency-safe, and nothing reassigns the pointer after the first
+	// successful construction.
+	stagingMu sync.Mutex
+	staging   *staging.Budget
 }
 
 // registerResponse is the register reply. Capabilities carries the effective
@@ -319,6 +366,16 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.Client = server.NoRedirectClient(r.Client)
 	r.StreamClient = server.NoRedirectClient(r.StreamClient)
 	if err := r.register(ctx); err != nil {
+		return err
+	}
+	// The runner-wide dependency staging budget is constructed ONCE, before
+	// any job can be leased, and lives for the process lifetime: every
+	// dependency restore reserves its exact spool size before a byte is
+	// downloaded, so the aggregate compressed spool footprint can never
+	// exceed the configured bound even with maximum runner concurrency. A
+	// failed construction (unusable directory, another live owner) fails
+	// startup instead of the first multi-GB restore.
+	if err := r.configureStaging(); err != nil {
 		return err
 	}
 	// runCtx is Run's private lifecycle context: everything Run spawns
@@ -651,19 +708,24 @@ func workspaceQuotaLimitForTask(t server.Task) int64 {
 	return executor.WorkspaceBoundBytes(t.Job.DiskRequest, !t.Job.Trusted, executor.DefaultUntrustedWorkspaceMaxBytes)
 }
 
-// payloadRunsOnContainer reports whether the verified compiled payload's
-// effective job runs on the container backend. It lets execute apply the
-// fail-closed disk-quota gate BEFORE checkout for production (payload) tasks
-// without recompiling; a nil/undecodable payload returns false, and the
-// identical gate then runs in the container backend (defense in depth) after
-// checkout, exactly as before this lifecycle move.
-func payloadRunsOnContainer(p *model.CompiledJobPayload) bool {
+// runtimeRunsOnContainer reports whether a resolved job runtime is the
+// container backend: the only backend whose untrusted jobs require a hard
+// workspace quota (the container builder sets RequireDiskQuota from
+// Options.RequireUntrustedDiskQuota).
+func runtimeRunsOnContainer(runtime string) bool {
+	return runtime == "container"
+}
+
+// compiledPayloadRuntime resolves the runtime from the enqueue-time compiled
+// payload's effective job. It is the authoritative source when present; a
+// malformed payload is an error (never silently "not container").
+func compiledPayloadRuntime(p *model.CompiledJobPayload) (string, error) {
 	if p == nil || p.EffectiveJob == nil {
-		return false
+		return "", fmt.Errorf("compiled job payload is absent")
 	}
 	raw, err := json.Marshal(p.EffectiveJob)
 	if err != nil {
-		return false
+		return "", fmt.Errorf("compiled job payload effective job: %w", err)
 	}
 	var shape struct {
 		Job struct {
@@ -671,13 +733,54 @@ func payloadRunsOnContainer(p *model.CompiledJobPayload) bool {
 		} `json:"job"`
 	}
 	if err := json.Unmarshal(raw, &shape); err != nil {
-		return false
+		return "", fmt.Errorf("compiled job payload effective job: %w", err)
 	}
-	return shape.Job.Runtime == "container"
+	return shape.Job.Runtime, nil
+}
+
+// effectiveTaskRuntime resolves the task's effective runtime BEFORE any
+// checkout. The verified compiled payload is authoritative when present
+// (production tasks always carry it). For legacy records without a payload
+// it compiles the persisted pipeline and resolves the persisted job key, so
+// a security gate never treats a compatibility field's absence as "not
+// container". An unresolvable runtime is an error and callers fail closed.
+func effectiveTaskRuntime(t server.Task) (string, error) {
+	if t.Job.CompiledJobPayload != nil && t.Job.CompiledJobPayload.EffectiveJob != nil {
+		return compiledPayloadRuntime(t.Job.CompiledJobPayload)
+	}
+	if strings.TrimSpace(t.Job.Pipeline) == "" {
+		return "", fmt.Errorf("cannot resolve runtime for job %s: no compiled payload and no persisted pipeline", t.Job.ID)
+	}
+	spec, err := pipeline.Parse([]byte(t.Job.Pipeline))
+	if err != nil {
+		return "", fmt.Errorf("cannot resolve runtime for job %s: parse persisted pipeline: %w", t.Job.ID, err)
+	}
+	g, err := pipeline.Compile(spec)
+	if err != nil {
+		return "", fmt.Errorf("cannot resolve runtime for job %s: compile persisted pipeline: %w", t.Job.ID, err)
+	}
+	cj, ok := g.Jobs[t.Job.Key]
+	if !ok {
+		return "", fmt.Errorf("cannot resolve runtime for job %s: compiled job %q not found in the persisted pipeline", t.Job.ID, t.Job.Key)
+	}
+	return cj.Job.Runtime, nil
 }
 
 func (r *Runner) execute(parent context.Context, t server.Task) {
+	// The declared job lifetime starts HERE, before workspace/quota setup,
+	// checkout, pipeline parsing, policy and payload verification, dependency
+	// downloads, changed-files discovery and journal/cache setup: the
+	// persisted JobTimeout is the resolved compiled job timeout (else
+	// pipeline defaults.timeout, see pipeline.EffectiveJobTimeout) stamped at
+	// enqueue, exactly like the resource requests. The executor still applies
+	// its own WithTimeout to the same value; a child context can only
+	// shorten, never extend, this parent deadline, so distributed and local
+	// execution now agree on what "job timeout" covers.
 	ctx, cancel := context.WithCancel(parent)
+	if d := t.Job.JobTimeout; d > 0 {
+		cancel()
+		ctx, cancel = context.WithTimeout(parent, d)
+	}
 	defer cancel()
 	done := make(chan struct{})
 	heartbeatDone := make(chan struct{})
@@ -740,12 +843,25 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	}()
 	// An untrusted job that demands a hard bound must not even check out
 	// when no hard bound could be established: the checkout itself is the
-	// window the quota protects. The runtime is taken from the verified
-	// compiled payload (production tasks always carry it); legacy
-	// payload-less tasks defer the identical gate to the container backend.
-	if requireDiskQuota && workspaceQuota != nil && !workspaceQuota.Hard && payloadRunsOnContainer(t.Job.CompiledJobPayload) {
-		r.complete(parent, t, model.StatusFailure, executor.UntrustedDiskQuotaGateError(workspaceQuota.Detail), nil)
-		return
+	// window the quota protects. The gate resolves the effective runtime
+	// FAIL CLOSED: the verified compiled payload when present, otherwise the
+	// already-persisted pipeline recompiled locally. An absent/undecodable
+	// payload is NOT interpreted as "not container" — "couldn't establish
+	// the runtime" refuses the checkout exactly like a known container
+	// runtime does, so the gate does not depend on the compatibility field
+	// being populated. Non-container runtimes keep their previous behavior
+	// (the container backend is the only backend that requires the hard
+	// quota).
+	if requireDiskQuota && workspaceQuota != nil && !workspaceQuota.Hard {
+		runtime, rerr := effectiveTaskRuntime(t)
+		if rerr != nil || runtimeRunsOnContainer(runtime) {
+			detail := workspaceQuota.Detail
+			if rerr != nil {
+				detail = detail + "; effective runtime could not be resolved: " + rerr.Error()
+			}
+			r.complete(parent, t, model.StatusFailure, executor.UntrustedDiskQuotaGateError(detail), nil)
+			return
+		}
 	}
 	// The bound must be AVAILABLE, not merely installable: a project quota
 	// caps the project but reserves nothing, so a hostile checkout could
@@ -767,9 +883,23 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		}
 		availabilityChecked = true
 	}
+	// Legacy records carry no persisted JobTimeout, so the job context alone
+	// leaves the setup phase unbounded: a clone (exec.CommandContext(ctx,
+	// "git", ...)) that stays alive but stalls would occupy a runner slot
+	// indefinitely while the heartbeat keeps renewing the lease, and a
+	// continuously progressing multi-hour dependency download could exceed
+	// any declared job budget. When (and only when) no job timeout exists,
+	// the setup phase therefore gets its own ceiling; a modern job's
+	// persisted JobTimeout already bounds this same span.
+	setupCtx := ctx
+	setupCancel := func() {}
+	if t.Job.JobTimeout <= 0 {
+		setupCtx, setupCancel = context.WithTimeout(ctx, r.setupPhaseTimeout())
+	}
+	defer setupCancel()
 	checkoutStart := time.Now()
-	if err = r.checkoutTask(ctx, t.Job, tmp); err != nil {
-		r.complete(parent, t, statusForErr(ctx, err), err, nil)
+	if err = r.checkoutTask(setupCtx, t.Job, tmp); err != nil {
+		r.complete(parent, t, statusForErr(setupCtx, err), err, nil)
 		return
 	}
 	r.Metrics.Observe("kiwi_runner_checkout_duration_seconds", time.Since(checkoutStart).Seconds())
@@ -855,7 +985,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		cj.Job.Env["KIWI_OIDC_REQUEST_TOKEN"] = t.LeaseToken
 		masker.Add(t.LeaseToken)
 	}
-	if err := r.restoreDownloads(ctx, t, cj.Job.Downloads, tmp); err != nil {
+	if err := r.restoreDownloads(setupCtx, t, cj.Job.Downloads, tmp); err != nil {
 		r.complete(parent, t, model.StatusFailure, err, nil)
 		return
 	}
@@ -926,7 +1056,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// require image references pinned by digest. The untrusted floor is
 	// unconditional here: nothing may override RequireImmutableImages for
 	// an untrusted job.
-	opts := executor.Options{Workspace: tmp, RunID: t.Job.RunID, Event: t.Job.Event, Branch: branchFromRef(t.Job.Ref), ChangedFiles: effectiveChangedFiles(t.Job.ChangedFiles, t.Job.ChangedFilesKnown, tmp), SecretProvider: provider, Logs: logging.Func(func(job, step, line string) { sink.WriteLine(job, step, line) }), Cache: cacheStore, Artifacts: artifactStore, ArtifactReporter: reporter, DependencyStatus: t.Job.DependencyStatus, NeedsOutputs: t.Job.NeedsOutputs, CacheNamespace: cacheNamespace(t.Job), RequireImmutableImages: !t.Job.Trusted}
+	opts := executor.Options{Workspace: tmp, RunID: t.Job.RunID, Event: t.Job.Event, Branch: branchFromRef(t.Job.Ref), ChangedFiles: effectiveChangedFiles(setupCtx, t.Job.ChangedFiles, t.Job.ChangedFilesKnown, tmp), SecretProvider: provider, Logs: logging.Func(func(job, step, line string) { sink.WriteLine(job, step, line) }), Cache: cacheStore, Artifacts: artifactStore, ArtifactReporter: reporter, DependencyStatus: t.Job.DependencyStatus, NeedsOutputs: t.Job.NeedsOutputs, CacheNamespace: cacheNamespace(t.Job), RequireImmutableImages: !t.Job.Trusted}
 	// The declared resources.disk is the job's workspace bound: it feeds the
 	// executor's pre-execution free-space check and the container backend's
 	// step-boundary workspace check, and it is what the snapshot capture
@@ -1313,7 +1443,7 @@ func cacheNamespace(j model.Job) string {
 func branchFromRef(ref string) string {
 	return strings.TrimPrefix(strings.TrimPrefix(ref, "refs/heads/"), "refs/")
 }
-func effectiveChangedFiles(serverFiles []string, known bool, dir string) []string {
+func effectiveChangedFiles(ctx context.Context, serverFiles []string, known bool, dir string) []string {
 	// ChangedFilesKnown marks the server-side list as the authoritative
 	// forge-fetched diff: it is returned as-is, so a known-EMPTY list stays
 	// empty (no local git fallback). The fallback applies only when the
@@ -1324,10 +1454,15 @@ func effectiveChangedFiles(serverFiles []string, known bool, dir string) []strin
 	if len(serverFiles) > 0 {
 		return append([]string{}, serverFiles...)
 	}
-	return changedFiles(dir)
+	return changedFiles(ctx, dir)
 }
-func changedFiles(dir string) []string {
-	b, err := exec.Command("git", "-C", dir, "diff", "--name-only", "HEAD~1", "HEAD").Output()
+
+// changedFiles is the local git fallback for changed-file discovery. It runs
+// under the setup-phase context (exec.CommandContext, never a bare
+// exec.Command): a git process that stalls must be torn down by the phase
+// deadline instead of hanging the job's setup forever.
+func changedFiles(ctx context.Context, dir string) []string {
+	b, err := exec.CommandContext(ctx, "git", "-C", dir, "diff", "--name-only", "HEAD~1", "HEAD").Output()
 	if err != nil {
 		return nil
 	}
@@ -1459,23 +1594,25 @@ var ErrDependencyArtifactTooLarge = errors.New("dependency artifact exceeds maxi
 // tests can lower the bound.
 var dependencyArtifactMaxBytes int64 = 8 << 30
 
-// dependencySpoolSink wraps the spool temp file with the hard byte cap. It is
-// a test seam so bounded-write behavior can be observed before the temp file
-// is removed; production wraps the file with safefs.NewCappedWriter.
-var dependencySpoolSink = func(f *os.File, limit int64) io.Writer {
-	return safefs.NewCappedWriter(f, limit)
-}
+// defaultStagingMaxBytes is the built-in runner staging budget used when the
+// operator configures none: exactly one maximum-size dependency artifact. It
+// is conservative by design — maximum-sized spools serialize instead of
+// multiplying the runner's unbudgeted scratch footprint — while smaller
+// restores still stream concurrently. Operators that want more concurrent
+// large restores raise --staging-max-bytes.
+const defaultStagingMaxBytes int64 = 8 << 30
 
-// dependencySpoolDir is the directory a dependency body is spooled into.
-//
-// Wiring gap: the runner has no staging budget. executor.Options carries no
-// Staging field and the server-owned staging.Budget is never passed to the
-// runner process, so the runner cannot reserve a spool slot from the shared
-// budget the way cache.Client.Restore does. It falls back to the
-// runner-owned cache root (then the configured work dir, then the system temp
-// dir); the explicit artifact-size cap below — not a budget reservation — is
-// what bounds the transfer.
-func (r *Runner) dependencySpoolDir() string {
+// defaultSetupTimeout bounds the pre-execution setup phase (workspace
+// checkout through dependency restore) for jobs whose persisted JobTimeout is
+// unset (legacy records). See Config.SetupTimeout.
+const defaultSetupTimeout = 15 * time.Minute
+
+// dependencySpoolRoot resolves the ROOT under which the runner's staging
+// budget is created. Explicitly: staging.dir when configured, otherwise the
+// runner-owned cache root, then the configured work dir, then the system
+// temp dir. The budget itself owns <root>/<runner instance id> (see
+// newStagingBudget), so two runners sharing a root never share a ledger.
+func (r *Runner) dependencySpoolRoot() string {
 	if r.Cfg.CacheRoot != "" {
 		return r.Cfg.CacheRoot
 	}
@@ -1483,6 +1620,85 @@ func (r *Runner) dependencySpoolDir() string {
 		return r.Cfg.WorkDir
 	}
 	return os.TempDir()
+}
+
+// runnerStagingInstanceID derives the runner's stable staging instance id
+// from its identity: distinct runners get distinct <root>/<id> directories
+// (no ErrStagingDirOwned collision when they share a root), and a restarted
+// runner reclaims the spool files its dead predecessor left in its own
+// directory. The derivation is deterministic and path-safe for any runner id
+// (persisted identity ids are not guaranteed to satisfy the staging
+// instance-id charset).
+func runnerStagingInstanceID(id string) string {
+	sum := sha256.Sum256([]byte("runner-staging:" + id))
+	return "runner-" + hex.EncodeToString(sum[:8])
+}
+
+// newStagingBudget constructs the runner-wide bounded spool budget. The
+// configured StagingDir (or the resolved spool root) is a ROOT: the budget
+// owns <root>/<instance id>, takes its exclusive ownership lock, and
+// reclaims the spool files a dead predecessor left behind. A configured
+// StagingMaxBytes wins; otherwise the default is one maximum-size artifact.
+func (r *Runner) newStagingBudget() (*staging.Budget, error) {
+	root := strings.TrimSpace(r.Cfg.StagingDir)
+	if root == "" {
+		root = r.dependencySpoolRoot()
+	}
+	maxBytes := r.Cfg.StagingMaxBytes
+	if maxBytes <= 0 {
+		maxBytes = dependencyArtifactMaxBytes
+		if maxBytes <= 0 {
+			maxBytes = defaultStagingMaxBytes
+		}
+	}
+	b, err := staging.NewReplicaBudget(root, runnerStagingInstanceID(r.ID), maxBytes)
+	if err != nil {
+		return nil, fmt.Errorf("staging: %w", err)
+	}
+	return b, nil
+}
+
+// configureStaging constructs and installs the runner-wide staging budget.
+// Run calls it exactly once, before any job can be leased, so a job can
+// never observe a runner without its bounded spool. The budget is immutable
+// after installation: nothing reassigns r.staging once set.
+func (r *Runner) configureStaging() error {
+	b, err := r.newStagingBudget()
+	if err != nil {
+		return err
+	}
+	r.stagingMu.Lock()
+	r.staging = b
+	r.stagingMu.Unlock()
+	return nil
+}
+
+// dependencyStaging returns the runner-wide staging budget, constructing it
+// lazily when Run has not (direct execute callers in tests). Concurrent
+// first calls converge on one budget: the lock covers construction, and the
+// staging package's process-wide registry returns the same ledger for the
+// same directory and bound.
+func (r *Runner) dependencyStaging() (*staging.Budget, error) {
+	r.stagingMu.Lock()
+	defer r.stagingMu.Unlock()
+	if r.staging != nil {
+		return r.staging, nil
+	}
+	b, err := r.newStagingBudget()
+	if err != nil {
+		return nil, err
+	}
+	r.staging = b
+	return b, nil
+}
+
+// setupPhaseTimeout resolves the fallback setup-phase ceiling (see
+// Config.SetupTimeout).
+func (r *Runner) setupPhaseTimeout() time.Duration {
+	if r.Cfg.SetupTimeout > 0 {
+		return r.Cfg.SetupTimeout
+	}
+	return defaultSetupTimeout
 }
 
 // restoreDownloads fetches the job's declared dependency artifacts through
@@ -1523,13 +1739,19 @@ func (r *Runner) restoreDownloads(ctx context.Context, t server.Task, inputs []p
 }
 
 // restoreDownload fetches and extracts one declared dependency artifact. The
-// body is spooled through a hard byte cap and the temp file is removed on
-// every path; extraction resolves rel beneath the held workspace root so a
-// symlinked ancestor is rejected instead of traversed.
+// body is spooled through the runner-wide staging budget: the exact size
+// (Content-Length) is reserved BEFORE the first byte is downloaded, or the
+// hard per-artifact cap when the peer sends a chunked/unknown-length body,
+// so several concurrent downstream restores can never stage more than the
+// configured bound outside every job workspace quota. The reservation is
+// held through extraction (the compressed file is physically present until
+// extraction completes) and released with the file on every path; extraction
+// resolves rel beneath the held workspace root so a symlinked ancestor is
+// rejected instead of traversed.
 func (r *Runner) restoreDownload(ctx context.Context, t server.Task, producer, name, rel string, wsRoot *safefs.Root) error {
 	url := r.Cfg.Server + "/api/v1/jobs/" + t.Job.ID + "/dependencies/" + url.PathEscape(producer) + "/" + url.PathEscape(name)
 	reqCtx, cancel := context.WithCancel(ctx)
-	guard := newStallGuard(cancel, streamIdleTimeout)
+	guard := newStallGuard(cancel, streamIdleTimeout.get())
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
 	if err != nil {
 		guard.stop()
@@ -1556,49 +1778,55 @@ func (r *Runner) restoreDownload(ctx context.Context, t server.Task, producer, n
 	body := &stallGuardedBody{ReadCloser: resp.Body, guard: guard, cancel: cancel}
 	limit := dependencyArtifactMaxBytes
 	if limit <= 0 {
-		limit = 8 << 30
+		limit = defaultStagingMaxBytes
 	}
 	if resp.ContentLength > limit {
 		body.Close()
 		return fmt.Errorf("%w: content length %d exceeds limit %d", ErrDependencyArtifactTooLarge, resp.ContentLength, limit)
 	}
-	tmp, err := os.CreateTemp(r.dependencySpoolDir(), "kiwi-artifact-*.tar.gz")
+	budget, err := r.dependencyStaging()
 	if err != nil {
 		body.Close()
 		return err
 	}
-	tmpPath := tmp.Name()
-	removeTemp := func() { _ = os.Remove(tmpPath) }
+	// Reserve EXACTLY what the spool may occupy before a byte is written: the
+	// advertised Content-Length when known, otherwise the hard per-artifact
+	// cap (the worst case a chunked peer can produce). Acquire blocks while
+	// the runner-wide budget is exhausted; it runs on the job/setup context,
+	// so a declared job timeout (or the legacy setup ceiling) still bounds
+	// the wait. The returned reservation is held through extraction and
+	// released with the spool file.
+	reserve := limit
+	if resp.ContentLength >= 0 {
+		reserve = resp.ContentLength
+	}
+	res, err := budget.Acquire(ctx, reserve)
+	if err != nil {
+		body.Close()
+		return err
+	}
 	h := sha256.New()
-	n, cp := io.Copy(io.MultiWriter(dependencySpoolSink(tmp, limit), h), io.LimitReader(body, limit+1))
+	staged, n, spoolErr := budget.SpoolFile(io.TeeReader(body, h), reserve)
 	body.Close()
-	cl := closeRunnerTempFile(tmp)
-	if cp != nil {
-		removeTemp()
-		if errors.Is(cp, safefs.ErrCapExceeded) || n > limit {
-			return fmt.Errorf("%w: limit %d bytes", ErrDependencyArtifactTooLarge, limit)
+	if spoolErr != nil {
+		res.Release()
+		if errors.Is(spoolErr, staging.ErrTooLarge) || n > reserve {
+			return fmt.Errorf("%w: limit %d bytes", ErrDependencyArtifactTooLarge, reserve)
 		}
-		return cp
+		return spoolErr
 	}
-	if cl != nil {
-		removeTemp()
-		return cl
-	}
-	if n > limit {
-		removeTemp()
-		return fmt.Errorf("%w: limit %d bytes", ErrDependencyArtifactTooLarge, limit)
-	}
+	// The spool file exists until CleanupSpool removes it; CleanupSpool
+	// releases the reservation only when the file is actually gone (a failed
+	// removal keeps the bytes charged as cleanup debt for RetryCleanup).
+	defer budget.CleanupSpool(staged, res)
 	if want := resp.Header.Get("X-Kiwi-Content-SHA256"); want != "" {
 		if got := hex.EncodeToString(h.Sum(nil)); got != want {
-			removeTemp()
 			return fmt.Errorf("artifact %s from %s integrity mismatch", name, producer)
 		}
 	}
-	if err := artifact.Extract(tmpPath, wsRoot, rel); err != nil {
-		removeTemp()
+	if err := artifact.Extract(staged, wsRoot, rel); err != nil {
 		return err
 	}
-	removeTemp()
 	return nil
 }
 
@@ -1648,7 +1876,7 @@ func (r *Runner) putArtifact(ctx context.Context, t server.Task, name, path stri
 	url := r.Cfg.Server + "/api/v1/jobs/" + t.Job.ID + "/artifacts/" + name
 	reqCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	guard := newStallGuard(cancel, streamIdleTimeout)
+	guard := newStallGuard(cancel, streamIdleTimeout.get())
 	defer guard.stop()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPut, url, &stallGuardReader{r: f, guard: guard})
 	if err != nil {

@@ -51,6 +51,7 @@ import (
 	"os"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/blob"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/progress"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
 )
 
@@ -136,12 +137,19 @@ func (c *CAS) putMemoryBytes() int64 {
 // error as soon as the bound would be exceeded, so over-limit content is
 // never published. over defaults to ErrBlobTooLarge and is overridden by
 // PutKnown/PutFile (ErrSizeMismatch) to report advertised-size violations.
+//
+// ctx, when set, is the request context of the publication: every successful
+// read counts as a unit of real byte progress and pulses it (see
+// internal/progress), so a backend that keeps consuming an 8 GiB stream is
+// never mistaken for an idle streaming request. A nil ctx makes the reader
+// silent (direct CAS callers pay nothing).
 type countingReader struct {
 	r    io.Reader
 	max  int64
 	read int64
 	err  error
 	over error
+	ctx  context.Context
 }
 
 func (c *countingReader) Read(p []byte) (int, error) {
@@ -171,6 +179,9 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	}
 	n, err := c.r.Read(p)
 	c.read += int64(n)
+	if n > 0 {
+		progress.Pulse(c.ctx)
+	}
 	if c.read > c.max {
 		c.err = c.overError()
 		return n, c.err
@@ -213,7 +224,7 @@ func (c *CAS) Put(ctx context.Context, r io.Reader) (blob.Object, error) {
 	mem := c.putMemoryBytes()
 	h := sha256.New()
 	var buf bytes.Buffer
-	n, err := io.Copy(io.MultiWriter(&buf, h), &countingReader{r: r, max: mem})
+	n, err := io.Copy(io.MultiWriter(&buf, h), &countingReader{r: r, max: mem, ctx: ctx})
 	if err == nil {
 		// The whole stream fit in memory: publish straight from the buffer.
 		return c.putStream(ctx, hex.EncodeToString(h.Sum(nil)), n, bytes.NewReader(buf.Bytes()))
@@ -321,7 +332,11 @@ func (c *CAS) PutKnown(ctx context.Context, digest string, size int64, r io.Read
 // streaming), which is the defense in depth every publication path keeps.
 func (c *CAS) putStream(ctx context.Context, key string, size int64, r io.Reader) (blob.Object, error) {
 	h := sha256.New()
-	cr := &countingReader{r: r, max: size, over: ErrSizeMismatch}
+	// ctx is carried into the counting reader so every byte the backend
+	// consumes pulses the streaming progress callback: an S3 put of a huge
+	// staged file is real progress even though the client socket is silent
+	// for the whole publication.
+	cr := &countingReader{r: r, max: size, over: ErrSizeMismatch, ctx: ctx}
 	obj, putErr := c.Blobs.Put(ctx, key, io.TeeReader(cr, h), size)
 	// A stream that produced more than the advertised size fails the
 	// counting reader itself: an over-long object is never published.
@@ -379,12 +394,18 @@ func checkBackendObject(obj blob.Object, key string, size int64) error {
 // sha256hex: the reader hashes the bytes while they stream and reports
 // ErrDigestMismatch at EOF (or on Close when the stream was not fully
 // read) when the content does not match the requested digest.
+//
+// The returned reader carries ctx: every successful read counts as a unit of
+// real byte progress and pulses it (see internal/progress). A download that
+// spends minutes streaming a large object out of CAS/S3 before the first
+// client byte is written is therefore never mistaken for an idle streaming
+// request by the app's inactivity guard.
 func (c *CAS) Open(ctx context.Context, sha256hex string) (io.ReadCloser, blob.Object, error) {
 	rc, obj, err := c.Blobs.Open(ctx, sha256hex)
 	if err != nil {
 		return nil, blob.Object{}, err
 	}
-	return &verifyingReader{r: rc, h: sha256.New(), want: sha256hex}, obj, nil
+	return &verifyingReader{r: rc, h: sha256.New(), want: sha256hex, ctx: ctx}, obj, nil
 }
 
 // Delete removes one object unconditionally. It is not part of the write
@@ -399,13 +420,15 @@ func (c *CAS) Delete(ctx context.Context, sha256hex string) error {
 // verifyingReader is the hash-while-stream reader: bytes pass through while
 // being hashed, and the digest is compared at EOF. A mismatch turns the
 // final read (or Close) into ErrDigestMismatch so consumers can never
-// silently accept corrupted content.
+// silently accept corrupted content. ctx, when set, receives a progress
+// pulse for every successful read (see internal/progress).
 type verifyingReader struct {
 	r    io.ReadCloser
 	h    hash.Hash
 	want string
 	done bool
 	err  error
+	ctx  context.Context
 }
 
 func (v *verifyingReader) Read(p []byte) (int, error) {
@@ -415,6 +438,7 @@ func (v *verifyingReader) Read(p []byte) (int, error) {
 	n, err := v.r.Read(p)
 	if n > 0 {
 		_, _ = v.h.Write(p[:n])
+		progress.Pulse(v.ctx)
 	}
 	if err == io.EOF {
 		v.err = v.verify()

@@ -74,25 +74,44 @@ func TestWorkspaceQuotaLimitForTask(t *testing.T) {
 	}
 }
 
-// TestPayloadRunsOnContainerHint pins the early runtime hint that lets execute
-// fail an untrusted job closed before checkout without recompiling: only a
-// decodable payload whose effective job is a container job returns true.
-func TestPayloadRunsOnContainerHint(t *testing.T) {
-	if payloadRunsOnContainer(nil) {
-		t.Fatal("nil payload claimed container runtime")
+// TestEffectiveTaskRuntimeHint pins the pre-checkout runtime resolver that
+// lets execute fail an untrusted job closed without recompiling: a decodable
+// payload whose effective job is a container job resolves to "container", a
+// legacy task without a payload recompiles its persisted pipeline, and an
+// undecodable payload is an ERROR (never silently "not container").
+func TestEffectiveTaskRuntimeHint(t *testing.T) {
+	containerText := "version: 1\njobs:\n  build:\n    runtime: container\n    image: alpine:3.19\n    steps:\n      - run: echo hi\n"
+	containerJob := basicTask(containerText)
+	payload := buildPayload(t, containerText, "build")
+	containerJob.Job.CompiledJobPayload = payload
+	if rt, err := effectiveTaskRuntime(containerJob); err != nil || !runtimeRunsOnContainer(rt) {
+		t.Fatalf("container payload runtime = %q, %v", rt, err)
 	}
-	containerJob := basicTask("version: 1\njobs:\n  build:\n    runtime: container\n    image: alpine:3.19\n    steps:\n      - run: echo hi\n")
-	payload := buildPayload(t, containerJob.Job.Pipeline, "build")
-	if !payloadRunsOnContainer(payload) {
-		t.Fatal("container payload not detected")
+	nativeJob := basicTask(payloadPipeline)
+	nativeJob.Job.CompiledJobPayload = buildPayload(t, payloadPipeline, "build")
+	if rt, err := effectiveTaskRuntime(nativeJob); err != nil || runtimeRunsOnContainer(rt) {
+		t.Fatalf("native payload runtime = %q, %v", rt, err)
 	}
-	native := buildPayload(t, payloadPipeline, "build")
-	if payloadRunsOnContainer(native) {
-		t.Fatal("native payload claimed container runtime")
+	// Legacy record: no compiled payload, the persisted pipeline is the
+	// authoritative runtime source.
+	legacy := basicTask(containerText)
+	legacy.Job.CompiledJobPayload = nil
+	if rt, err := effectiveTaskRuntime(legacy); err != nil || !runtimeRunsOnContainer(rt) {
+		t.Fatalf("legacy container pipeline runtime = %q, %v", rt, err)
 	}
-	payload.EffectiveJob = "not-a-job"
-	if payloadRunsOnContainer(payload) {
-		t.Fatal("undecodable effective job claimed container runtime")
+	// A malformed payload must fail closed: the resolver reports an error
+	// instead of treating the missing runtime as "not container".
+	bad := basicTask(containerText)
+	bad.Job.CompiledJobPayload = buildPayload(t, containerText, "build")
+	bad.Job.CompiledJobPayload.EffectiveJob = "not-a-job"
+	if _, err := effectiveTaskRuntime(bad); err == nil {
+		t.Fatal("undecodable effective job resolved a runtime")
+	}
+	// An unresolvable task (no payload, no persisted pipeline) is an error.
+	empty := basicTask("")
+	empty.Job.CompiledJobPayload = nil
+	if _, err := effectiveTaskRuntime(empty); err == nil {
+		t.Fatal("task without payload and without pipeline resolved a runtime")
 	}
 }
 
@@ -250,6 +269,122 @@ func TestExecuteUntrustedQuotaFailureFailsClosedBeforeCheckout(t *testing.T) {
 	}
 }
 
+// TestExecuteLegacyUntrustedContainerFailsClosedBeforeCheckout is the P4
+// regression: a legacy/malformed task WITHOUT a compiled payload must not
+// bypass the pre-checkout hard-quota gate just because
+// CompiledJobPayload is additive/optional. The effective runtime is resolved
+// by recompiling the persisted pipeline before checkout, so an untrusted
+// container job with no hard bound still fails before the clone runs.
+func TestExecuteLegacyUntrustedContainerFailsClosedBeforeCheckout(t *testing.T) {
+	fsrv := &fakeRunnerServer{}
+	ts := httptest.NewServer(fsrv.handler())
+	defer ts.Close()
+	installs, cleanups := 0, 0
+	var limitSeen int64
+	var dirSeen string
+	stubWorkspaceQuota(t, executor.DiskQuotaStatus{Detail: "no delegated quota here"}, nil, &installs, &cleanups, &limitSeen, &dirSeen)
+
+	checkedOut := false
+	r := testRunnerFor(t, ts, Config{})
+	r.Cfg.CheckoutFn = func(context.Context, model.Job, string) error {
+		checkedOut = true
+		return nil
+	}
+	// No compiled payload at all: the runtime comes from the persisted
+	// pipeline text, exactly like a record written by a pre-payload control
+	// plane.
+	task := basicTask("version: 1\njobs:\n  build:\n    runtime: container\n    image: alpine:3.19\n    steps:\n      - run: echo hi\n")
+	task.Job.Trusted = false
+	task.Job.CompiledJobPayload = nil
+	r.execute(context.Background(), task)
+
+	if checkedOut {
+		t.Fatal("legacy untrusted container job without a hard bound checked out anyway")
+	}
+	c, ok := fsrv.lastComplete()
+	if !ok || c.Status != model.StatusFailure {
+		t.Fatalf("complete = %+v ok=%v", c, ok)
+	}
+	for _, want := range []string{"hard workspace disk quota", "no delegated quota here", executor.AllowUnquotaedUntrustedDiskEnv} {
+		if !strings.Contains(c.Error, want) {
+			t.Fatalf("gate error missing %q: %q", want, c.Error)
+		}
+	}
+}
+
+// TestExecuteLegacyUntrustedMalformedPayloadFailsClosed proves the other
+// fail-closed edge: an undecodable compiled payload cannot be interpreted as
+// "not container", so an untrusted job whose runtime cannot be established
+// never reaches checkout without the hard bound it demands.
+func TestExecuteLegacyUntrustedMalformedPayloadFailsClosed(t *testing.T) {
+	fsrv := &fakeRunnerServer{}
+	ts := httptest.NewServer(fsrv.handler())
+	defer ts.Close()
+	installs, cleanups := 0, 0
+	var limitSeen int64
+	var dirSeen string
+	stubWorkspaceQuota(t, executor.DiskQuotaStatus{Detail: "no delegated quota here"}, nil, &installs, &cleanups, &limitSeen, &dirSeen)
+
+	checkedOut := false
+	r := testRunnerFor(t, ts, Config{})
+	r.Cfg.CheckoutFn = func(context.Context, model.Job, string) error {
+		checkedOut = true
+		return nil
+	}
+	task := basicTask(payloadPipeline)
+	task.Job.Trusted = false
+	task.Job.CompiledJobPayload = &model.CompiledJobPayload{SchemaVersion: 1, EffectiveJob: json.RawMessage(`"not-a-job"`)}
+	r.execute(context.Background(), task)
+
+	if checkedOut {
+		t.Fatal("untrusted job with an undecodable payload checked out without the hard bound")
+	}
+	c, ok := fsrv.lastComplete()
+	if !ok || c.Status != model.StatusFailure {
+		t.Fatalf("complete = %+v ok=%v", c, ok)
+	}
+	if !strings.Contains(c.Error, "hard workspace disk quota") || !strings.Contains(c.Error, "could not be resolved") {
+		t.Fatalf("gate error does not name the unresolvable runtime: %q", c.Error)
+	}
+}
+
+// TestExecuteLegacyUntrustedNativeSkipsContainerGate proves the resolver
+// does not over-fire: a legacy untrusted NATIVE job has no container backend
+// to gate (the container builder is the only RequireDiskQuota consumer), so
+// checkout proceeds exactly as before when no hard bound is available.
+func TestExecuteLegacyUntrustedNativeSkipsContainerGate(t *testing.T) {
+	fsrv := &fakeRunnerServer{}
+	ts := httptest.NewServer(fsrv.handler())
+	defer ts.Close()
+	installs, cleanups := 0, 0
+	var limitSeen int64
+	var dirSeen string
+	stubWorkspaceQuota(t, executor.DiskQuotaStatus{Detail: "no delegated quota here"}, nil, &installs, &cleanups, &limitSeen, &dirSeen)
+	// The availability preflight is not what this test exercises; stub it so
+	// the assertion does not depend on the host's free space.
+	origAvailable := executor.WorkspaceDiskAvailable
+	executor.WorkspaceDiskAvailable = func(string, int64) error { return nil }
+	t.Cleanup(func() { executor.WorkspaceDiskAvailable = origAvailable })
+
+	checkedOut := false
+	r := testRunnerFor(t, ts, Config{})
+	r.Cfg.CheckoutFn = func(_ context.Context, _ model.Job, dir string) error {
+		checkedOut = true
+		return os.WriteFile(filepath.Join(dir, "hello.txt"), []byte("hi"), 0o644)
+	}
+	task := basicTask("version: 1\njobs:\n  build:\n    steps:\n      - run: echo hi\n")
+	task.Job.Trusted = false
+	task.Job.CompiledJobPayload = nil
+	r.execute(context.Background(), task)
+
+	if !checkedOut {
+		t.Fatal("legacy untrusted native job did not check out")
+	}
+	if c, _ := fsrv.lastComplete(); c.Status == model.StatusFailure && strings.Contains(c.Error, "hard workspace disk quota") {
+		t.Fatalf("native job was refused by the container quota gate: %+v", c)
+	}
+}
+
 // TestExecuteUntrustedQuotaStatusReachesExecutorAndCleansUp proves the
 // positive path: a hard bound installed before checkout is reported to the
 // executor (which skips its own probe and satisfies the untrusted gate), and
@@ -346,11 +481,11 @@ func TestWorkspaceQuotaDetailIsLogged(t *testing.T) {
 
 // TestVerifyWorkspaceQuotaPayloadJSONShape pins the payload shape
 // untrustedContainerTask relies on: the effective job JSON carries the
-// runtime, so payloadRunsOnContainer can decide before checkout.
+// runtime, so effectiveTaskRuntime can decide before checkout.
 func TestVerifyWorkspaceQuotaPayloadJSONShape(t *testing.T) {
 	task := untrustedContainerTask(t)
-	if !payloadRunsOnContainer(task.Job.CompiledJobPayload) {
-		t.Fatal("untrusted container payload not detected")
+	if rt, err := effectiveTaskRuntime(task); err != nil || !runtimeRunsOnContainer(rt) {
+		t.Fatalf("untrusted container runtime = %q, %v", rt, err)
 	}
 	raw, err := json.Marshal(task.Job.CompiledJobPayload.EffectiveJob)
 	if err != nil {

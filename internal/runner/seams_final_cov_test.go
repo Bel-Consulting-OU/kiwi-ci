@@ -47,29 +47,29 @@ func TestFinalSeamRandReaderFailures(t *testing.T) {
 	}
 }
 
-func TestFinalSeamCloseTempFailures(t *testing.T) {
-	orig := closeRunnerTempFile
-	closeRunnerTempFile = func(*os.File) error { return fmt.Errorf("close refused") }
-	t.Cleanup(func() { closeRunnerTempFile = orig })
-
-	// restoreDownloads: the close failure is surfaced and the temp file is
-	// removed rather than extracted.
+func TestFinalSeamRestoreStagingUnavailable(t *testing.T) {
+	// A staging root that cannot be created (a path under a regular file)
+	// fails restoreDownloads closed BEFORE any byte is downloaded: the
+	// runner refuses to spool an unbudgeted dependency.
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("archive-bytes"))
 	}))
 	defer ts.Close()
-	r := &Runner{ID: "r", Cfg: Config{Server: ts.URL}, Client: ts.Client(), Metrics: NewMetrics()}
+	r := &Runner{ID: "r", Cfg: Config{Server: ts.URL, StagingDir: filepath.Join(blocker, "staging")}, Client: ts.Client(), Metrics: NewMetrics()}
 	err := r.restoreDownloads(context.Background(), basicTask(payloadPipeline), []pipeline.ArtifactInput{{From: "producer", Name: "pkg"}}, t.TempDir())
-	if err == nil || !strings.Contains(err.Error(), "close refused") {
-		t.Fatalf("restoreDownloads = %v", err)
+	if err == nil || !strings.Contains(err.Error(), "staging") {
+		t.Fatalf("restoreDownloads = %v, want the staging construction failure", err)
 	}
 	// uploadJobSnapshot no longer stages the archive through a temporary file
-	// (E5-F streaming capture), so the temp-file close seam cannot affect it:
-	// it streams successfully even while the seam refuses every close. The
-	// "no temporary file at all" property is pinned by
-	// TestUploadJobSnapshotNeedsNoTempDir.
+	// (E5-F streaming capture), so an unavailable dependency staging root
+	// cannot affect it: it streams successfully. The "no temporary file at
+	// all" property is pinned by TestUploadJobSnapshotNeedsNoTempDir.
 	if err := r.uploadJobSnapshot(context.Background(), basicTask(payloadPipeline), t.TempDir(), 0); err != nil {
-		t.Fatalf("streaming uploadJobSnapshot must not depend on the temp-file seam: %v", err)
+		t.Fatalf("streaming uploadJobSnapshot must not depend on the dependency staging budget: %v", err)
 	}
 }
 

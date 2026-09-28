@@ -1,8 +1,29 @@
-# REQUIRED Docker lane: the rootless/hardened workspace invariant had a
-# production bug, so a missing/unusable Docker daemon is a FAILURE here, not
-# a skip. This workflow selects a Docker-capable agent by label; agents
-# without the label never run it. The best-effort smoke variant lives in
-# linux-amd64.yml and skips cleanly when no daemon exists.
+# NON-BLOCKING DIAGNOSTIC: the rootless/hardened workspace invariant had a
+# production bug, so this job still exercises it wherever a compatible agent
+# exists — but it is deliberately NOT a required push status. Woodpecker's
+# docker backend mounts the pipeline workspace as a NAMED VOLUME, so the
+# test's own-workspace bind mounts (docker run -v <test temp dir>) resolve on
+# the daemon host where that path does not exist; and a daemon-local agent
+# with the local backend cannot run this lane either, because the local
+# backend uses step.Image as the executable for command steps. The lane is
+# therefore impossible on the current Woodpecker topology (see commit
+# 6d2138e), and an intentionally impossible required lane makes every HEAD
+# red and trains maintainers to ignore red CI. Until a compatible
+# runner/backend (or a rewritten bind-mount-free invariant test) exists, this
+# job reports instead of gating:
+#
+#   - both steps carry `failure: ignore`, so a failure here never fails the
+#     push pipeline;
+#   - a missing/unusable Docker daemon is reported and skipped with exit 0;
+#   - a workspace NOT visible to the daemon (the documented named-volume vs
+#     daemon-host path mismatch) is detected before the test runs and skipped
+#     with an explicit diagnostic message;
+#   - the invariant test itself only fails the step (still non-blocking) when
+#     the environment is capable and the invariant genuinely breaks.
+#
+# When a compatible backend or a rewritten lane exists, promote the
+# replacement to a required push context in scripts/gh-branch-protection.sh
+# (PUSH_CONTEXTS).
 #
 # Agent labels: `platform: linux/amd64` is the canonical GOOS/GOARCH form of
 # the built-in `platform=<GOOS>/<GOARCH>` agent label (docs: workflow syntax
@@ -38,8 +59,8 @@
 #
 # Self-contained image: golang:1.27 does not guarantee a Docker CLI, so the
 # lane builds its own test image from ci/image/Dockerfile on the
-# agent's daemon and runs the next step in it. Nothing has to be published to
-# or pulled from a registry for kiwi-ci-test.
+# agent's daemon and runs the diagnostic step in it. Nothing has to be
+# published to or pulled from a registry for kiwi-ci-test.
 #
 # `pull` is a boolean step option in the Woodpecker schema (no "never" value);
 # `pull: false` is the documented "do not force a pull" setting. The image is
@@ -59,15 +80,27 @@ steps:
   build-ci-image:
     image: docker:cli@sha256:018edbc908e08fcc9dbf029c812c34251e9b4719e6f71ca0e5eae2a987d014ca
     pull: false
+    # Non-blocking diagnostic: an unavailable daemon or a failed build is
+    # reported, never a push gate.
+    failure: ignore
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     commands:
-      - docker build -f ci/image/Dockerfile -t kiwi-ci-test:go1.27 .
+      - |
+        if ! docker info >/dev/null 2>&1; then
+          echo "docker-workspace diagnostic (non-blocking): no usable Docker daemon on this agent (socket missing or permission denied); the invariant is NOT exercised here" >&2
+          docker info >&2 || true
+          exit 0
+        fi
+        docker build -f ci/image/Dockerfile -t kiwi-ci-test:go1.27 .
 
-  docker-workspace:
+  docker-workspace-diagnostic:
     image: kiwi-ci-test:go1.27
     pull: false
     depends_on: [build-ci-image]
+    # Non-blocking diagnostic (see the header): this step may fail without
+    # failing the push pipeline.
+    failure: ignore
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
@@ -80,13 +113,18 @@ steps:
       # any test executes.
       - ./scripts/toolchain-check.sh
       - |
-        if ! command -v docker >/dev/null 2>&1; then
-          echo "required docker lane: docker CLI is missing from the kiwi-ci-test image" >&2
-          exit 1
-        fi
         if ! docker info >/dev/null 2>&1; then
-          echo "required docker lane: no usable docker daemon (socket missing or permission denied)" >&2
+          echo "docker-workspace diagnostic (non-blocking): no usable Docker daemon on this agent; the invariant is NOT exercised here" >&2
           docker info >&2 || true
-          exit 1
+          exit 0
+        fi
+        # The known topology mismatch: Woodpecker's docker backend exposes the
+        # pipeline workspace as a named volume, so this path is not the same
+        # path on the daemon host. Probe it before running the invariant; a
+        # daemon that cannot see the workspace cannot run the test's own
+        # bind mounts either.
+        if ! docker run --rm -v "$PWD:/workspace" --entrypoint sh kiwi-ci-test:go1.27 -c 'test -f /workspace/go.mod' >/dev/null 2>&1; then
+          echo "docker-workspace diagnostic (non-blocking): the Docker daemon cannot see the pipeline workspace at $PWD (Woodpecker docker-backend named volume vs daemon host path); the invariant cannot run on this topology" >&2
+          exit 0
         fi
         go test -count=1 -v -timeout=20m -run RootlessHardenedContainerWorkspace ./internal/runner

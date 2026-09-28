@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/expr"
 )
@@ -19,6 +20,22 @@ type CompiledJob struct {
 	Job    Job               `json:"job"`
 	Matrix map[string]string `json:"matrix,omitempty"`
 	Needs  []string          `json:"needs,omitempty"`
+}
+
+// EffectiveJobTimeout resolves a compiled job's timeout with the one
+// precedence both the executor and the enqueue-time stamping use: the job's
+// own timeout, else the pipeline's defaults.timeout. Zero means no declared
+// timeout. Keeping the resolution here is what makes the persisted
+// model.Job.JobTimeout and the executor's runtime deadline impossible to
+// disagree.
+func EffectiveJobTimeout(cj CompiledJob, s *Spec) time.Duration {
+	if cj.Job.Timeout.Duration > 0 {
+		return cj.Job.Timeout.Duration
+	}
+	if s != nil && s.Defaults.Timeout.Duration > 0 {
+		return s.Defaults.Timeout.Duration
+	}
+	return 0
 }
 
 type Graph struct {

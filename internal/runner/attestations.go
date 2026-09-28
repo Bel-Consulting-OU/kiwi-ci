@@ -193,7 +193,7 @@ func sha256File(path string) (string, error) {
 func (r *Runner) putArtifactBytes(ctx context.Context, t server.Task, name string, body []byte, contentType string) error {
 	reqCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	guard := newStallGuard(cancel, streamIdleTimeout)
+	guard := newStallGuard(cancel, streamIdleTimeout.get())
 	defer guard.stop()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPut, r.Cfg.Server+"/api/v1/jobs/"+t.Job.ID+"/artifacts/"+name, &stallGuardReader{r: strings.NewReader(string(body)), guard: guard})
 	if err != nil {

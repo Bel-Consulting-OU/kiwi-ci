@@ -789,9 +789,9 @@ func (b *stallAfterFirstRead) Read(p []byte) (int, error) {
 // real bound: an upload that sends some bytes and then stops is terminated
 // (never accepted with 201) well before its stall ends.
 func TestStreamingStalledUploadDroppedByIdleBound(t *testing.T) {
-	prevIdle := streamIdleTimeout
-	streamIdleTimeout = 250 * time.Millisecond
-	t.Cleanup(func() { streamIdleTimeout = prevIdle })
+	prevIdle := streamIdleTimeout.get()
+	streamIdleTimeout.set(250 * time.Millisecond)
+	t.Cleanup(func() { streamIdleTimeout.set(prevIdle) })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	addr, errCh := startServerEphemeral(t, ctx, "--runner-token", "tok", "--data-dir", t.TempDir())
@@ -857,14 +857,14 @@ func TestStreamingContinuousUploadOutlivesIdleWindows(t *testing.T) {
 	// shrinking them while the server is live is race-free.
 	runner, jobID, leaseToken, leaseGeneration := leaseArtifactJob(t, client, base, "tok")
 
-	prevRead, prevWrite, prevIdle := apiReadDeadline.get(), apiWriteDeadline.get(), streamIdleTimeout
+	prevRead, prevWrite, prevIdle := apiReadDeadline.get(), apiWriteDeadline.get(), streamIdleTimeout.get()
 	apiReadDeadline.set(300 * time.Millisecond)
 	apiWriteDeadline.set(300 * time.Millisecond)
-	streamIdleTimeout = 400 * time.Millisecond
+	streamIdleTimeout.set(400 * time.Millisecond)
 	t.Cleanup(func() {
 		apiReadDeadline.set(prevRead)
 		apiWriteDeadline.set(prevWrite)
-		streamIdleTimeout = prevIdle
+		streamIdleTimeout.set(prevIdle)
 	})
 
 	// 12 chunks, one every 120ms: ~1.44s total, three-plus idle windows,
@@ -937,14 +937,14 @@ func (d *deadlineRecordingWriter) Flush() {}
 // Read. This fails against the pre-fix middleware, which dispatched the
 // stream without touching either deadline.
 func TestStreamingBranchClearsInheritedDeadlines(t *testing.T) {
-	prevRead, prevWrite, prevIdle := apiReadDeadline.get(), apiWriteDeadline.get(), streamIdleTimeout
+	prevRead, prevWrite, prevIdle := apiReadDeadline.get(), apiWriteDeadline.get(), streamIdleTimeout.get()
 	apiReadDeadline.set(5 * time.Minute)
 	apiWriteDeadline.set(5 * time.Minute)
-	streamIdleTimeout = 3 * time.Second
+	streamIdleTimeout.set(3 * time.Second)
 	t.Cleanup(func() {
 		apiReadDeadline.set(prevRead)
 		apiWriteDeadline.set(prevWrite)
-		streamIdleTimeout = prevIdle
+		streamIdleTimeout.set(prevIdle)
 	})
 
 	h := withAPIDeadlines(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -969,10 +969,10 @@ func TestStreamingBranchClearsInheritedDeadlines(t *testing.T) {
 		t.Fatalf("streaming branch did not arm the sliding deadlines: read arms=%d write arms=%d", rec.readArms, rec.writeArms)
 	}
 	if until := time.Until(rec.lastWrite); until <= time.Second || until > 4*time.Second {
-		t.Fatalf("write deadline re-armed at %v from now, want ~%v", until, streamIdleTimeout)
+		t.Fatalf("write deadline re-armed at %v from now, want ~%v", until, streamIdleTimeout.get())
 	}
 	if until := time.Until(rec.lastRead); until <= time.Second || until > 4*time.Second {
-		t.Fatalf("read deadline re-armed at %v from now, want ~%v", until, streamIdleTimeout)
+		t.Fatalf("read deadline re-armed at %v from now, want ~%v", until, streamIdleTimeout.get())
 	}
 }
 
@@ -982,9 +982,9 @@ func TestStreamingBranchClearsInheritedDeadlines(t *testing.T) {
 // pre-first-byte backend gap is never unbounded. Arming only on the first
 // Write is the regression this guards.
 func TestStreamingDownloadArmsWriteBoundBeforeFirstWrite(t *testing.T) {
-	prevIdle := streamIdleTimeout
-	streamIdleTimeout = 3 * time.Second
-	t.Cleanup(func() { streamIdleTimeout = prevIdle })
+	prevIdle := streamIdleTimeout.get()
+	streamIdleTimeout.set(3 * time.Second)
+	t.Cleanup(func() { streamIdleTimeout.set(prevIdle) })
 
 	rec := &deadlineRecordingWriter{ResponseWriter: httptest.NewRecorder()}
 	handlerEntered := false
@@ -1004,7 +1004,7 @@ func TestStreamingDownloadArmsWriteBoundBeforeFirstWrite(t *testing.T) {
 		t.Fatal("download dispatch did not clear the inherited read deadline")
 	}
 	if until := time.Until(rec.lastWrite); until <= time.Second || until > 4*time.Second {
-		t.Fatalf("write bound armed at %v from now, want ~%v", until, streamIdleTimeout)
+		t.Fatalf("write bound armed at %v from now, want ~%v", until, streamIdleTimeout.get())
 	}
 }
 
@@ -1014,9 +1014,9 @@ func TestStreamingDownloadArmsWriteBoundBeforeFirstWrite(t *testing.T) {
 // processing/commit/response phase, which otherwise has no socket bound at
 // all.
 func TestStreamingUploadArmsWriteBoundAtBodyEOF(t *testing.T) {
-	prevIdle := streamIdleTimeout
-	streamIdleTimeout = 3 * time.Second
-	t.Cleanup(func() { streamIdleTimeout = prevIdle })
+	prevIdle := streamIdleTimeout.get()
+	streamIdleTimeout.set(3 * time.Second)
+	t.Cleanup(func() { streamIdleTimeout.set(prevIdle) })
 
 	rec := &deadlineRecordingWriter{ResponseWriter: httptest.NewRecorder()}
 	writeArmsAtEOF := 0
@@ -1038,7 +1038,7 @@ func TestStreamingUploadArmsWriteBoundAtBodyEOF(t *testing.T) {
 		t.Fatal("upload dispatch did not clear the inherited deadlines")
 	}
 	if until := time.Until(rec.lastWrite); until <= time.Second || until > 4*time.Second {
-		t.Fatalf("write bound armed at %v from now, want ~%v", until, streamIdleTimeout)
+		t.Fatalf("write bound armed at %v from now, want ~%v", until, streamIdleTimeout.get())
 	}
 }
 
@@ -1050,9 +1050,9 @@ func TestStreamingUploadArmsWriteBoundAtBodyEOF(t *testing.T) {
 // response instead of a clean 200. Arming only on the first handler Write
 // leaves this gap unbounded.
 func TestStreamingGetImplicitWriteAfterIdleFails(t *testing.T) {
-	prevIdle := streamIdleTimeout
-	streamIdleTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { streamIdleTimeout = prevIdle })
+	prevIdle := streamIdleTimeout.get()
+	streamIdleTimeout.set(200 * time.Millisecond)
+	t.Cleanup(func() { streamIdleTimeout.set(prevIdle) })
 
 	srv := httptest.NewServer(withAPIDeadlines(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(400 * time.Millisecond)
@@ -1077,9 +1077,9 @@ func TestStreamingGetImplicitWriteAfterIdleFails(t *testing.T) {
 // past the idle window and returns without writing fails net/http's implicit
 // response write — the client observes a failure instead of a clean 200.
 func TestStreamingUploadImplicitWriteAfterIdleFails(t *testing.T) {
-	prevIdle := streamIdleTimeout
-	streamIdleTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { streamIdleTimeout = prevIdle })
+	prevIdle := streamIdleTimeout.get()
+	streamIdleTimeout.set(200 * time.Millisecond)
+	t.Cleanup(func() { streamIdleTimeout.set(prevIdle) })
 
 	srv := httptest.NewServer(withAPIDeadlines(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if _, err := io.Copy(io.Discard, r.Body); err != nil {
@@ -1111,9 +1111,9 @@ func TestStreamingUploadImplicitWriteAfterIdleFails(t *testing.T) {
 // TERMINATED after one idle window. Socket write deadlines cannot do that —
 // only the derived-context watchdog can.
 func TestStreamingStalledBackendContextCancelled(t *testing.T) {
-	prevIdle := streamIdleTimeout
-	streamIdleTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { streamIdleTimeout = prevIdle })
+	prevIdle := streamIdleTimeout.get()
+	streamIdleTimeout.set(200 * time.Millisecond)
+	t.Cleanup(func() { streamIdleTimeout.set(prevIdle) })
 
 	cancelled := make(chan struct{})
 	srv := httptest.NewServer(withAPIDeadlines(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1141,9 +1141,9 @@ func TestStreamingStalledBackendContextCancelled(t *testing.T) {
 // re-arms both the socket deadline and the guard) runs far past the idle
 // window without cancellation.
 func TestStreamingProgressResetsContextGuard(t *testing.T) {
-	prevIdle := streamIdleTimeout
-	streamIdleTimeout = 250 * time.Millisecond
-	t.Cleanup(func() { streamIdleTimeout = prevIdle })
+	prevIdle := streamIdleTimeout.get()
+	streamIdleTimeout.set(250 * time.Millisecond)
+	t.Cleanup(func() { streamIdleTimeout.set(prevIdle) })
 
 	var sawCancel atomic.Bool
 	done := make(chan struct{})
@@ -1188,9 +1188,9 @@ func TestStreamingProgressResetsContextGuard(t *testing.T) {
 // the response/application bound must be armed at dispatch. The context
 // guard is armed for every streaming route regardless of body length.
 func TestStreamingNoBodyUploadArmsResponseBound(t *testing.T) {
-	prevIdle := streamIdleTimeout
-	streamIdleTimeout = 3 * time.Second
-	t.Cleanup(func() { streamIdleTimeout = prevIdle })
+	prevIdle := streamIdleTimeout.get()
+	streamIdleTimeout.set(3 * time.Second)
+	t.Cleanup(func() { streamIdleTimeout.set(prevIdle) })
 
 	rec := &deadlineRecordingWriter{ResponseWriter: httptest.NewRecorder()}
 	noBody := false

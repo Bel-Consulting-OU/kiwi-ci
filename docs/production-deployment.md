@@ -283,20 +283,24 @@ The Woodpecker instance hosting it must be configured so CI reflects reality:
   required for pull requests.
 - Agents labelled `platform=linux/amd64`, `platform=linux/arm64`,
   `capability=docker`, `platform=windows/amd64` and `platform=darwin/arm64`
-  matching the workflow label sets; the `docker-workspace` lane fails
-  (never skips) when its daemon is unavailable, but it is not a required PR
-  context (see below).
-- `docker-workspace` is a trusted, push/manual/tag-only lane: it mounts the
-  agent host's Docker daemon socket in its steps. Woodpecker gates host
-  volumes on the repository-level Trusted flag alone -- there is no per-event
-  or fork gating -- so a `pull_request` run would execute PR-authored code
-  with host-daemon control (host-root equivalent). It is therefore recorded
-  as `ci/woodpecker/push/docker-workspace`, not as a required PR context;
-  re-gating pull requests needs a socket-less variant of the lane. It is
-  informational/post-merge by default: the script lists the `push/*`
-  variants (including `push/docker-workspace` and the native lanes) only so
-  an operator can require them instead for direct pushes
-  (`KIWI_PUSH_CONTEXTS`), and does not install them as required checks.
+  matching the workflow label sets.
+- `docker-workspace-diagnostic` is a trusted, push/manual/tag-only job: it
+  mounts the agent host's Docker daemon socket in its steps. Woodpecker gates
+  host volumes on the repository-level Trusted flag alone -- there is no
+  per-event or fork gating -- so a `pull_request` run would execute
+  PR-authored code with host-daemon control (host-root equivalent). It is
+  deliberately non-blocking (`failure: ignore` on every step) and is not a
+  required PR or push context; re-gating pull requests needs a socket-less
+  variant of the lane. It also cannot run its invariant on the current
+  Woodpecker topology at all: the docker backend exposes the pipeline
+  workspace as a named volume, so the test's own-workspace bind mounts
+  resolve on the daemon host where that path does not exist. The job reports
+  a missing daemon or that topology mismatch and skips; a compatible backend
+  (or a rewritten, bind-mount-free invariant) must be promoted to a required
+  push context in `scripts/gh-branch-protection.sh` when it exists. The
+  script lists the `push/*` variants of the runnable lanes only so an
+  operator can require them instead for direct pushes (`KIWI_PUSH_CONTEXTS`),
+  and does not install them as required checks.
 - The clone plugin and every workflow image are pinned by OCI digest.
 
 ### Required-check governance
@@ -320,12 +324,17 @@ intended required-check set and where each lane is enforced:
 | release-reproducibility | `repro` step, `linux-amd64` | PR-gating via `ci/woodpecker/pr/linux-amd64`; re-run by release promotion on the tag |
 | windows | `native-windows` workflow | Post-merge/release only: push/manual/tag, never a required PR check |
 | macos | `native-macos` workflow | Post-merge/release only: push/manual/tag, never a required PR check |
-| docker-integration | `docker-workspace` workflow | Post-merge only: push/manual/tag (host Docker socket, trusted events; see above) |
+| docker-integration | `docker-workspace-diagnostic` workflow | Non-blocking diagnostic only (push/manual/tag, `failure: ignore`): the current Woodpecker topology cannot run the invariant, so it reports and skips instead of gating every HEAD red |
 
 Only the three `pr/*` contexts are installed as required checks. The native
-and Docker-socket lanes are deliberately unrequirable on pull requests: a fork
-PR never schedules them, so requiring them would leave every fork PR waiting
-forever. The context list in `scripts/gh-branch-protection.sh` is validated
+and Docker-socket jobs are deliberately unrequirable: a fork PR never
+schedules them, so requiring them would leave every fork PR waiting forever,
+and the docker workspace lane additionally cannot satisfy its environment
+invariant on the current topology. When no compatible Windows agent is
+attached, the `native-windows` push context may remain pending indefinitely:
+that is a platform-availability signal, not a required gate, and it must not
+be added to `CONTEXTS`/`PUSH_CONTEXTS` unless a Windows agent is guaranteed
+to pick it up. The context list in `scripts/gh-branch-protection.sh` is validated
 against each workflow's `when` events by `go test ./internal/workflowguard/`.
 
 Apply or refresh protection with repository-admin credentials:
@@ -358,8 +367,8 @@ trusted build boundary; provision them on that basis:
   Woodpecker agent secret, scoped to that agent and rotated.
 - **Never run fork code.** The native workflows accept trusted events only
   (`push`, `manual`, `tag`). Fork pull requests run in the Docker-backend
-  lanes; the socket-mounting `docker-workspace` lane is push-only (see above),
-  so only the container-isolated Docker lanes run on PRs. Do not add
+  lanes; the socket-mounting `docker-workspace-diagnostic` job is push-only
+  (see above), so only the container-isolated Docker lanes run on PRs. Do not add
   `pull_request`/`pull_request_*` events to a local-backend workflow or a
   host-volume workflow; `internal/workflowguard` fails the build if either
   reappears.
@@ -372,12 +381,14 @@ trusted build boundary; provision them on that basis:
 
 ## CI test image
 
-The `docker-workspace` lane needs a Docker CLI and must not
+The `docker-workspace-diagnostic` job needs a Docker CLI and must not
 depend on a registry image. Its first step builds
 `ci/image/Dockerfile` locally on the agent's daemon as
-`kiwi-ci-test:go1.27`; the test step uses `pull: false`, so it runs those
-local layers. The image is based on the same digest-pinned Go 1.27 and
+`kiwi-ci-test:go1.27`; the diagnostic step uses `pull: false`, so it runs
+those local layers. The image is based on the same digest-pinned Go 1.27 and
 Docker CLI images as the other workflows and adds git, CA certificates,
 make, gcc, and libc6-dev, each probed at build time. Bump the base
 digests deliberately (re-resolve with `docker buildx imagetools inspect`)
-and re-run the lane to validate the result.
+and re-run the job to validate the result. The `ci/image/Dockerfile` header
+and CI image pin comments still use the historical lane name
+(`docker-workspace`); the file itself is unchanged by the diagnostic rename.

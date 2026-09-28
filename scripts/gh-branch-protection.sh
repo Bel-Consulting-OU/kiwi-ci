@@ -32,12 +32,22 @@
 # only (push/manual/tag) and stay post-merge gates (see NATIVE_CONTEXTS and
 # the docker-workspace note below); never add them to the required PR list.
 #
-# docker-workspace is deliberately NOT a required PR context: it mounts the
-# agent host's Docker daemon socket with host volumes, and Woodpecker gates
-# volumes on the repository-level Trusted flag alone (no PR/fork gating), so a
+# docker-workspace is deliberately NOT required anywhere. It mounts the agent
+# host's Docker daemon socket with host volumes, and Woodpecker gates volumes
+# on the repository-level Trusted flag alone (no PR/fork gating), so a
 # pull_request run would execute PR-authored code with host-daemon control.
-# Its workflow `when` is push/manual/tag only and it stays a post-merge gate as
-# `ci/woodpecker/push/docker-workspace` (see PUSH_CONTEXTS).
+# Its workflow `when` is push/manual/tag only. More importantly, the lane
+# cannot RUN on the current Woodpecker topology at all (the docker backend
+# exposes the pipeline workspace as a named volume, so the test's
+# own-workspace bind mounts resolve on the daemon host where that path does
+# not exist; see commit 6d2138e), so requiring its push context would make
+# every HEAD red forever. Its workflow is now
+# `docker-workspace-diagnostic` (non-blocking, `failure: ignore`), and it is
+# deliberately absent from CONTEXTS, PUSH_CONTEXTS and NATIVE_CONTEXTS. If
+# repository settings still require the old `ci/woodpecker/push/docker-workspace`
+# context, remove it there: no workflow publishes that context anymore. When
+# a compatible backend (or a bind-mount-free replacement lane) exists, promote
+# the replacement to a required push context here.
 #
 # The native workflows (ci/woodpecker/push/native-windows,
 # ci/woodpecker/push/native-macos) are deliberately NOT required for pull
@@ -83,8 +93,9 @@ BRANCH="${KIWI_BRANCH:-main}"
 # format is `{{context}}/{{event}}/{{workflow}}` with the pull_request event
 # mapped to the literal `pr` (verified against server/forge/common/status.go
 # in v3.18.1 and against observed statuses). Matrix axes append `/<axis_id>`;
-# none of these workflows use a matrix. docker-workspace is absent on purpose:
-# it mounts the host Docker socket and is push/manual/tag only (see the
+# none of these workflows use a matrix. docker-workspace(-diagnostic) is
+# absent on purpose: it mounts the host Docker socket, is push/manual/tag
+# only, and its current topology cannot run the invariant at all (see the
 # invariant above). One status per workflow, not per step: the lanes listed in
 # the header are enforced through these three contexts, while windows, macos
 # and docker-integration remain post-merge gates.
@@ -92,8 +103,10 @@ CONTEXTS="${KIWI_CONTEXTS:-ci/woodpecker/pr/linux-amd64 ci/woodpecker/pr/linux-a
 # Push variants are posted for every push; they are listed so operators can
 # require them for direct pushes instead (a direct push to a protected branch
 # can never satisfy only-pr contexts, and pr-only contexts block direct pushes
-# when enforce_admins is true).
-PUSH_CONTEXTS="${KIWI_PUSH_CONTEXTS:-ci/woodpecker/push/linux-amd64 ci/woodpecker/push/linux-arm64 ci/woodpecker/push/docker-workspace ci/woodpecker/push/integration-coverage}"
+# when enforce_admins is true). The docker-workspace diagnostic is NOT listed:
+# it is non-blocking by design and a required context for it would redden
+# every HEAD on the current topology.
+PUSH_CONTEXTS="${KIWI_PUSH_CONTEXTS:-ci/woodpecker/push/linux-amd64 ci/woodpecker/push/linux-arm64 ci/woodpecker/push/integration-coverage}"
 # Never added to required PR contexts: push/manual/tag-only gates (see the
 # invariant above). Listed for observability warnings only.
 NATIVE_CONTEXTS="${KIWI_NATIVE_CONTEXTS:-ci/woodpecker/push/native-windows ci/woodpecker/push/native-macos}"

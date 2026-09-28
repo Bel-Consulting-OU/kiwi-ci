@@ -233,7 +233,7 @@ and no other CI system in this repository.
 |---|---|---|
 | `linux-amd64` | `platform=linux/amd64` | format, vet, unit (`-vet=all -shuffle`), race, race-double, single-P (`GOMAXPROCS=1`), checkptr (`-d=checkptr=2 -race`), stress (`-count=10` adversarial patterns), adversarial, schema (+FILE_MAP), cross, license, docs, repro, staticcheck (`-checks=all` minus stylistic), govulncheck (`-test`), fuzz smoke (30s/target) |
 | `linux-arm64` | `platform=linux/arm64` | unit + race natively |
-| `docker-workspace` | `platform=linux/amd64`, `capability=docker` | Rootless/hardened container workspace integration; a missing/unusable Docker daemon FAILS this lane. Mounts the host Docker socket, so it is trusted push/manual/tag-only (never `pull_request`) and is informational/post-merge, not a required PR check |
+| `docker-workspace-diagnostic` | `platform=linux/amd64`, `capability=docker` | Non-blocking diagnostic for the rootless/hardened container workspace invariant. Runs the invariant when the agent can support it (trusted push/manual/tag only; it mounts the host Docker socket), reports a missing daemon or the known named-volume topology mismatch and skips, and is `failure: ignore` — never a required PR or push check |
 | `integration-coverage` | `platform=linux/amd64` | PostgreSQL service + integration tests + merged coverage with the 95% floor |
 | `native-windows` | `platform=windows/amd64` | native Windows `go vet` + full unit suite + the platform-sensitive packages (safefs, tui, executor, runner, storage, workspace, config). Trusted events only |
 | `native-macos` | `platform=darwin/arm64` | native macOS unit + race + termios/Tart-sensitive packages. Trusted events only (local backend executes on the host) |
@@ -254,24 +254,35 @@ Operational requirements for the Woodpecker instance:
   execution optimization, not semantics, so the lane pins it off rather than
   depending on JIT being safe on every agent host. `PGOPTIONS` is honored by
   pgx and applies to derived clone DSNs as well.
-- `docker-workspace` mounts the agent host's Docker socket into its steps
-  (`volumes: - /var/run/docker.sock:/var/run/docker.sock`), so the repository
-  must be marked **trusted** in Woodpecker; `capability=docker` only selects
-  an agent and injects nothing. Woodpecker gates volumes on the
+- `docker-workspace-diagnostic` mounts the agent host's Docker socket into
+  its steps (`volumes: - /var/run/docker.sock:/var/run/docker.sock`), so the
+  repository must be marked **trusted** in Woodpecker; `capability=docker`
+  only selects an agent and injects nothing. Woodpecker gates volumes on the
   repository-level Trusted flag alone (no per-event or fork gating), so the
   lane runs on trusted events only (`push`/`manual`/`tag`) and never on
   `pull_request`; running it on PRs again needs a socket-less variant. A
   dedicated agent that mounts the socket into every pipeline container
   instead can set
   `WOODPECKER_BACKEND_DOCKER_VOLUMES=/var/run/docker.sock:/var/run/docker.sock`.
+  The job is deliberately **non-blocking** (`failure: ignore` on every
+  step): the current Woodpecker docker backend exposes the pipeline
+  workspace as a named volume, so the invariant test's own-workspace bind
+  mounts resolve on the daemon host where that path does not exist, and the
+  lane cannot run at all on this topology. It reports that mismatch and
+  skips instead of reddening every HEAD; a compatible backend (or a
+  bind-mount-free replacement lane) must be promoted to a required push
+  context in `scripts/gh-branch-protection.sh` when it exists.
 - Commit-status contexts use Woodpecker's canonical
   `ci/woodpecker/<event>/<workflow>` form, with the pull_request event mapped
   to the literal `pr`, so branch protection requires names like
   `ci/woodpecker/pr/linux-amd64` (not the flat pre-event form). The native
   macOS/Windows workflows run on trusted events only, so their `push/`
   contexts are not required for, and cannot be produced by, pull requests.
-  Platform labels use the canonical `GOOS/GOARCH` slash form
-  (`platform=linux/amd64`), matching the built-in agent label.
+  When no compatible agent is attached, `native-windows` may stay pending for
+  a long time; that is an availability signal for the platform, and the lane
+  must not be turned into a required gate unless a Windows agent is
+  guaranteed to pick it up. Platform labels use the canonical `GOOS/GOARCH`
+  slash form (`platform=linux/amd64`), matching the built-in agent label.
 
 `main` is branch-protected: merges require a pull request, the required
 contexts green, and the branch up to date. Protection is applied by
@@ -279,11 +290,13 @@ contexts green, and the branch up to date. Protection is applied by
 exactly the three `pr/*` contexts as required checks —
 `ci/woodpecker/pr/linux-amd64`, `ci/woodpecker/pr/linux-arm64` and
 `ci/woodpecker/pr/integration-coverage` — and REFUSES to install any
-context it has not observed on a recent commit. The `docker-workspace`
-lane and the native macOS/Windows lanes are informational/post-merge
-unless an operator opts to require the `push/*` variants for direct
-pushes (`KIWI_PUSH_CONTEXTS`); they are never installed as required PR
-checks by default. The script emits the legacy `contexts` array by default; set
+context it has not observed on a recent commit. The
+`docker-workspace-diagnostic` job and the native macOS/Windows lanes are
+informational/post-merge unless an operator opts to require the `push/*`
+variants for direct pushes (`KIWI_PUSH_CONTEXTS`); they are never installed
+as required PR checks by default. The impossible `docker-workspace` context
+is not listed anywhere: if repository settings still require it, remove it,
+because no workflow publishes it anymore. The script emits the legacy `contexts` array by default; set
 `KIWI_WOODPECKER_APP_ID=<app-id>` to emit app-bound required checks
 (`checks: [{"context": "...", "app_id": <id>}, ...]`), which pins each
 context to the Woodpecker GitHub App instead of accepting a same-named status

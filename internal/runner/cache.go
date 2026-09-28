@@ -54,7 +54,7 @@ func (t *cacheTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		// The restore stream carries no total timeout; the sliding guard
 		// cancels the transfer when the peer stops sending bytes.
 		guardCtx, cancel := context.WithCancel(ctx)
-		guard := newStallGuard(cancel, streamIdleTimeout)
+		guard := newStallGuard(cancel, streamIdleTimeout.get())
 		rc, err := t.client.Restore(guardCtx, t.jobID, t.lease, key)
 		if errors.Is(err, cache.ErrRemoteNotFound) {
 			guard.stop()
@@ -75,7 +75,7 @@ func (t *cacheTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: &stallGuardedBody{ReadCloser: rc, guard: guard, cancel: cancel}, Header: http.Header{}, Request: req}, nil
 	case http.MethodPut:
 		guardCtx, cancel := context.WithCancel(ctx)
-		guard := newStallGuard(cancel, streamIdleTimeout)
+		guard := newStallGuard(cancel, streamIdleTimeout.get())
 		var body io.Reader = req.Body
 		if body != nil {
 			body = &stallGuardReader{r: body, guard: guard}

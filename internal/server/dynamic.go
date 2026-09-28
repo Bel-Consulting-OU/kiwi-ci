@@ -340,7 +340,7 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 				EffectivePolicy: json.RawMessage(policyJSON),
 			},
 		}
-		applyCompiledJobFields(&j, cj, now)
+		applyCompiledJobFields(&j, cj, strictSpec, now)
 		created[id] = j
 		jobContracts[id] = buildJobContracts(cj)
 	}

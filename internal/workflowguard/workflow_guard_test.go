@@ -801,7 +801,7 @@ func TestWorkflowGuardCleanRepoPasses(t *testing.T) {
 	if locals < 2 {
 		t.Fatalf("guard classified only %d local workflows, want at least native-macos and native-windows", locals)
 	}
-	for _, want := range []string{"native-macos.yml", "native-windows.yml", "linux-amd64.yml", "docker-workspace.yml"} {
+	for _, want := range []string{"native-macos.yml", "native-windows.yml", "linux-amd64.yml", "docker-workspace-diagnostic.yml"} {
 		found := false
 		for _, w := range workflows {
 			if w.File == want {
@@ -812,9 +812,10 @@ func TestWorkflowGuardCleanRepoPasses(t *testing.T) {
 			t.Fatalf("workflow %s was not parsed", want)
 		}
 	}
-	// The host-volume rule must have real coverage: docker-workspace declares
-	// the socket and must not list any pull_request-family event, and the
-	// container (non-local) workflows must not hide host volumes either.
+	// The host-volume rule must have real coverage: the docker-workspace
+	// diagnostic declares the socket and must not list any pull_request-family
+	// event, and the container (non-local) workflows must not hide host
+	// volumes either.
 	for _, w := range workflows {
 		if len(w.HostVolumeMounts()) > 0 && len(pullRequestEvents(w.Events)) > 0 {
 			t.Fatalf("%s: host volumes on %v", w.File, pullRequestEvents(w.Events))
@@ -825,8 +826,8 @@ func TestWorkflowGuardCleanRepoPasses(t *testing.T) {
 // TestWorkflowGuardParsesRequiredContexts pins the textual parse of the
 // branch-protection script so a reformat cannot silently empty the required
 // context list the guard cross-checks. All three lists are pinned, including
-// the docker-workspace push-only decision (no `pr/` entry) and the native
-// push contexts.
+// the removal of the impossible docker-workspace lane from every required
+// list and the native push contexts.
 func TestWorkflowGuardParsesRequiredContexts(t *testing.T) {
 	root := repoRoot(t)
 	script := string(mustRead(t, filepath.Join(root, "scripts", "gh-branch-protection.sh")))
@@ -852,11 +853,20 @@ func TestWorkflowGuardParsesRequiredContexts(t *testing.T) {
 	want = []string{
 		"ci/woodpecker/push/linux-amd64",
 		"ci/woodpecker/push/linux-arm64",
-		"ci/woodpecker/push/docker-workspace",
 		"ci/woodpecker/push/integration-coverage",
 	}
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Fatalf("ParseContexts(PUSH_CONTEXTS) = %v, want %v", got, want)
+	}
+	// The impossible docker-workspace lane must not be a required push
+	// status anywhere: its diagnostic replacement is non-blocking by design,
+	// and the old context is no longer published by any workflow.
+	for _, variable := range []string{"CONTEXTS", "PUSH_CONTEXTS", "NATIVE_CONTEXTS"} {
+		for _, ctx := range ParseContexts(script, variable) {
+			if strings.Contains(ctx, "docker-workspace") {
+				t.Fatalf("context %q in %s names the docker-workspace lane, which is a non-blocking diagnostic and must never gate pushes", ctx, variable)
+			}
+		}
 	}
 
 	got = ParseContexts(script, "NATIVE_CONTEXTS")
@@ -876,10 +886,11 @@ func TestWorkflowGuardParsesRequiredContexts(t *testing.T) {
 }
 
 // TestWorkflowGuardCoversRealDockerSocketLane proves the host-volume rule is
-// not vacuous on the real tree: it must see both docker-workspace socket
-// mounts, and the real workflow (trusted events only) must produce no finding.
+// not vacuous on the real tree: it must see both docker-workspace diagnostic
+// socket mounts, and the real workflow (trusted events only) must produce no
+// finding.
 func TestWorkflowGuardCoversRealDockerSocketLane(t *testing.T) {
-	w, err := LoadFile(filepath.Join(repoRoot(t), ".woodpecker", "docker-workspace.yml"))
+	w, err := LoadFile(filepath.Join(repoRoot(t), ".woodpecker", "docker-workspace-diagnostic.yml"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -894,25 +905,25 @@ func TestWorkflowGuardCoversRealDockerSocketLane(t *testing.T) {
 		}
 		steps[m.Step] = true
 	}
-	for _, want := range []string{"build-ci-image", "docker-workspace"} {
+	for _, want := range []string{"build-ci-image", "docker-workspace-diagnostic"} {
 		if !steps[want] {
 			t.Fatalf("socket mount in step %q not detected; mounts: %v", want, mounts)
 		}
 	}
 	if pr := pullRequestEvents(w.Events); len(pr) != 0 {
-		t.Fatalf("docker-workspace events include %v; the socket lane must stay on trusted events", pr)
+		t.Fatalf("docker-workspace diagnostic events include %v; the socket lane must stay on trusted events", pr)
 	}
 	if findings := CheckWorkflow(w); len(findings) != 0 {
-		t.Fatalf("real docker-workspace produced findings:\n%s", FormatFindings(findings))
+		t.Fatalf("real docker-workspace diagnostic produced findings:\n%s", FormatFindings(findings))
 	}
 }
 
 // TestWorkflowGuardDoctoredHostVolumePRFails re-adds pull_request to the real
-// docker-workspace workflow (in a temp copy) and proves the guard fails with
-// file/step/message for each socket-mounting step. The real YAML is never
-// modified (byte-compared afterwards).
+// docker-workspace diagnostic workflow (in a temp copy) and proves the guard
+// fails with file/step/message for each socket-mounting step. The real YAML
+// is never modified (byte-compared afterwards).
 func TestWorkflowGuardDoctoredHostVolumePRFails(t *testing.T) {
-	realPath := filepath.Join(repoRoot(t), ".woodpecker", "docker-workspace.yml")
+	realPath := filepath.Join(repoRoot(t), ".woodpecker", "docker-workspace-diagnostic.yml")
 	real := mustRead(t, realPath)
 	const old = "  - event: [push, manual, tag]"
 	const new = "  - event: [push, pull_request, manual, tag]"
@@ -920,7 +931,7 @@ func TestWorkflowGuardDoctoredHostVolumePRFails(t *testing.T) {
 	if doctored == string(real) {
 		t.Fatalf("doctoring %q did not apply", old)
 	}
-	path := filepath.Join(t.TempDir(), "docker-workspace.yml")
+	path := filepath.Join(t.TempDir(), "docker-workspace-diagnostic.yml")
 	mustWrite(t, path, []byte(doctored))
 	w, err := LoadFile(path)
 	if err != nil {
@@ -932,8 +943,8 @@ func TestWorkflowGuardDoctoredHostVolumePRFails(t *testing.T) {
 		if f.Kind != "host-volume-pr" {
 			continue
 		}
-		if f.File != "docker-workspace.yml" {
-			t.Fatalf("finding file = %q, want docker-workspace.yml (%s)", f.File, f.String())
+		if f.File != "docker-workspace-diagnostic.yml" {
+			t.Fatalf("finding file = %q, want docker-workspace-diagnostic.yml (%s)", f.File, f.String())
 		}
 		if !strings.Contains(f.Message, "docker.sock") || !strings.Contains(f.Message, "pull_request") {
 			t.Fatalf("finding must name the socket and the event: %s", f.String())
@@ -941,13 +952,13 @@ func TestWorkflowGuardDoctoredHostVolumePRFails(t *testing.T) {
 		got[f.Step] = true
 		t.Logf("guard finding: %s", f.String())
 	}
-	for _, step := range []string{"build-ci-image", "docker-workspace"} {
+	for _, step := range []string{"build-ci-image", "docker-workspace-diagnostic"} {
 		if !got[step] {
 			t.Fatalf("guard missed the socket mount in step %q; findings:\n%s", step, FormatFindings(findings))
 		}
 	}
 	if after := mustRead(t, realPath); !bytes.Equal(after, real) {
-		t.Fatal("guard test modified the real .woodpecker/docker-workspace.yml")
+		t.Fatal("guard test modified the real .woodpecker/docker-workspace-diagnostic.yml")
 	}
 }
 

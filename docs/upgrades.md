@@ -257,10 +257,15 @@ claims themselves.
   workers as one-shot ephemeral hosts running the agent as a dedicated
   low-privilege user with no persistent credentials and Go 1.27.x on
   `PATH` (`GOTOOLCHAIN=local` prevents Go from downloading a toolchain
-  and masking a stale worker). The `docker-workspace` lane builds its
-  digest-pinned test image locally from `ci/image/Dockerfile`
+  and masking a stale worker). The `docker-workspace-diagnostic` job builds
+  its digest-pinned test image locally from `ci/image/Dockerfile`
   (Go + git + Docker CLI + certs + make/gcc) instead of pulling one
-  from a registry; see
+  from a registry. It is a non-blocking diagnostic (`failure: ignore`):
+  the current Woodpecker topology cannot run the workspace invariant (the
+  docker backend exposes the pipeline workspace as a named volume), so the
+  old required `ci/woodpecker/push/docker-workspace` context no longer
+  exists and must be removed from any branch/ruleset that still requires it;
+  see
   [production-deployment.md](production-deployment.md#native-and-local-ci-agents).
 - fs-mode `/readiness` is now durability-aware: when a data-dir snapshot
   write fails, it answers 503 with `X-Kiwi-State: degraded` and a fixed body
@@ -305,6 +310,28 @@ claims themselves.
   service allowance. Existing untrusted pipelines with more than 8 services
   that used to fail mid-run now fail at submission; split the job or
   reduce its sidecars (the ceiling is not configurable).
+- Distributed runners now bound dependency spooling with a runner-wide
+  staging budget: every restore reserves its exact artifact size (or the
+  8 GiB per-artifact cap for chunked bodies) before downloading, so
+  concurrent restores can no longer stage an unbounded amount of
+  compressed data outside the job workspace quotas. The default budget is
+  one maximum-size object (8 GiB), which serializes maximum-size spools;
+  raise it with `--staging-max-bytes` and point
+  `--staging-dir <dir>` at a dedicated filesystem for multi-GB dependency
+  runs. A budget smaller than an artifact fails that restore closed.
+- The declared job timeout is persisted at enqueue (`job_timeout`, the
+  compiled job timeout or `defaults.timeout`) and the distributed runner
+  starts it before workspace setup and checkout, so checkout, dependency
+  restore and changed-files discovery are inside the declared budget.
+  Legacy records without the field get a 15-minute setup-phase ceiling
+  (`--setup-timeout <duration>`), so an unreported job timeout can no
+  longer mean a `git clone` may hang forever.
+- Pre-checkout hard-quota gating for untrusted jobs is fail-closed for
+  legacy/malformed tasks: when a required hard workspace quota cannot be
+  established, the runner resolves the effective runtime from the
+  persisted pipeline even without a compiled payload, and refuses the
+  checkout when that runtime is (or cannot be proven not to be) the
+  container backend.
 
 ## Dependency upgrade policy
 

@@ -161,15 +161,20 @@ func jobQueueDeadline(cj pipeline.CompiledJob, now time.Time) *time.Time {
 	return &dl
 }
 
-// applyCompiledJobFields populates the additive resource-request and queue
-// deadline fields of a model.Job from its effective compiled job at
-// enqueue. The scheduler's queue-timeout expiry reads QueueDeadline
-// (payload-based; see internal/scheduler queueDeadlineFor), and the lease
-// reservation reads ReservedResources — the job's own request plus
-// ServiceEnvelopeRequest — so a job's declared services are charged to the
-// runner too.
-func applyCompiledJobFields(j *model.Job, cj pipeline.CompiledJob, now time.Time) {
+// applyCompiledJobFields populates the additive resource-request, job
+// timeout and queue deadline fields of a model.Job from its effective
+// compiled job at enqueue. The scheduler's queue-timeout expiry reads
+// QueueDeadline (payload-based; see internal/scheduler queueDeadlineFor),
+// and the lease reservation reads ReservedResources — the job's own request
+// plus ServiceEnvelopeRequest — so a job's declared services are charged to
+// the runner too. JobTimeout is resolved with the SAME precedence the
+// executor applies (pipeline.EffectiveJobTimeout: the compiled job's timeout,
+// else spec defaults.timeout) and persisted so the distributed runner can
+// start the declared job deadline before checkout, dependency restore and
+// every other pre-execution phase.
+func applyCompiledJobFields(j *model.Job, cj pipeline.CompiledJob, spec *pipeline.Spec, now time.Time) {
 	j.CPURequest, j.MemoryRequest, j.DiskRequest, j.PIDsRequest = jobResourceRequests(cj)
+	j.JobTimeout = pipeline.EffectiveJobTimeout(cj, spec)
 	j.QueueDeadline = jobQueueDeadline(cj, now)
 	j.ServiceEnvelopeRequest = serviceEnvelopeRequest(cj)
 }

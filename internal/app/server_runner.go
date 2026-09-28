@@ -25,6 +25,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/config"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/progress"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runner"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
@@ -95,12 +96,16 @@ var (
 // every write re-arms the write deadline, so a transfer that keeps making
 // progress (an 8 GiB artifact at any sustainable rate) completes regardless
 // of how long it takes, while a peer that stops moving bytes for this long is
-// dropped. It is a variable only so tests can shrink the bound; production
-// uses this value.
+// dropped. It is an atomic seam for the same reason apiReadDeadline and
+// apiWriteDeadline are: the socket tests shrink the bound while a server is
+// live, and a plain variable would race the request path. The middleware
+// snapshots it ONCE per request (idle := streamIdleTimeout.get()) and uses
+// that value consistently for the guard, the socket deadlines and the body
+// wrapper of that request.
 var (
 	apiReadDeadline   = newAPIDeadline(30 * time.Second)
 	apiWriteDeadline  = newAPIDeadline(60 * time.Second)
-	streamIdleTimeout = 90 * time.Second
+	streamIdleTimeout = newAPIDeadline(90 * time.Second)
 )
 
 // apiDeadline is an ordinary-API deadline held atomically. The middleware
@@ -219,6 +224,10 @@ func withAPIDeadlines(next http.Handler) http.Handler {
 		// authorization decision.
 		rc := http.NewResponseController(w)
 		if streamingRoute(r.Method, r.URL.Path) {
+			// One snapshot per request: the guard, the socket deadlines and
+			// the body wrapper below all use the same idle window even if a
+			// test shrinks the atomic seam mid-request.
+			idle := streamIdleTimeout.get()
 			// Two independent mechanisms bound a stream: socket deadlines
 			// (fail dead socket operations) and a derived request context
 			// whose sliding guard cancels stalled APPLICATION work (backend
@@ -227,13 +236,29 @@ func withAPIDeadlines(next http.Handler) http.Handler {
 			// covers the pre-first-byte gap and zero-length uploads alike;
 			// every Read/Write/Flush below re-arms it.
 			streamCtx, cancel := context.WithCancel(r.Context())
-			guard := newIdleGuard(cancel, streamIdleTimeout)
+			guard := newIdleGuard(cancel, idle)
+			// Backend byte movement is real progress too: the CAS layer
+			// pulses this context on every successful read/write (an 8 GiB
+			// S3 publication at 50 MiB/s takes ~164s and must not be cut by
+			// the 90s socket-inactivity window while the client socket is
+			// necessarily silent), so the guard's invariant is "no socket OR
+			// backend byte progress for the idle window". The pulse re-arms
+			// the write SOCKET bound as well: after an upload body reaches
+			// EOF (or before a download's first byte) the only bound on the
+			// connection is that write deadline, and backend progress must
+			// keep it alive so the eventual response write does not fail on
+			// a deadline that expired while real work was advancing.
+			pulse := func() {
+				_ = rc.SetWriteDeadline(time.Now().Add(idle))
+				guard.reset()
+			}
+			streamCtx = progress.WithPulse(streamCtx, pulse)
 			defer func() {
 				guard.release()
 				cancel()
 			}()
 			r = r.WithContext(streamCtx)
-			sw := &streamDeadlineWriter{ResponseWriter: w, rc: rc, idle: streamIdleTimeout, guard: guard}
+			sw := &streamDeadlineWriter{ResponseWriter: w, rc: rc, idle: idle, guard: guard}
 			if streamingUpload(r.Method, r.URL.Path) {
 				// Upload: clear any inherited absolute deadlines, then arm the
 				// READ side for the body streaming phase. No socket write
@@ -244,7 +269,7 @@ func withAPIDeadlines(next http.Handler) http.Handler {
 				// unbounded.
 				_ = rc.SetReadDeadline(time.Time{})
 				_ = rc.SetWriteDeadline(time.Time{})
-				r.Body = newStreamDeadlineBody(r.Body, rc, streamIdleTimeout, guard)
+				r.Body = newStreamDeadlineBody(r.Body, rc, idle, guard)
 			} else {
 				// Download/SSE: no request body, so the response write is the
 				// only traffic. Arm the write bound IMMEDIATELY at dispatch:
@@ -252,7 +277,7 @@ func withAPIDeadlines(next http.Handler) http.Handler {
 				// byte gap (backend lookup/stall before any output) with no
 				// bound at all.
 				_ = rc.SetReadDeadline(time.Time{})
-				_ = rc.SetWriteDeadline(time.Now().Add(streamIdleTimeout))
+				_ = rc.SetWriteDeadline(time.Now().Add(idle))
 			}
 			next.ServeHTTP(sw, r)
 			return
@@ -1248,8 +1273,19 @@ func Runner(ctx context.Context, args []string) error {
 	metricsListen := fs.String("metrics-listen", "", "serve Prometheus text metrics on this address (e.g. :9091)")
 	sigstoreKey := fs.String("sigstore-key", "", "PKCS8 PEM Ed25519 private key for Sigstore artifact attestations (path or contents)")
 	workDir := fs.String("work-dir", "", "working directory for garbage-collection subprocesses (default: system temp)")
+	stagingDir := fs.String("staging-dir", "", "staging ROOT for bounded dependency spooling (default: the cache root); the runner stages inside <dir>/<runner instance id>")
+	stagingMaxBytes := fs.String("staging-max-bytes", "", "runner-wide staging byte budget for concurrent dependency restores (default: one maximum-size artifact, 8 GiB)")
+	setupTimeout := fs.Duration("setup-timeout", 0, "ceiling for the pre-execution setup phase of jobs without a persisted job timeout (default 15m)")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	stagingLimit := int64(0)
+	if v := strings.TrimSpace(*stagingMaxBytes); v != "" {
+		n, perr := strconv.ParseInt(v, 10, 64)
+		if perr != nil || n <= 0 {
+			return fmt.Errorf("--staging-max-bytes must be a positive integer, got %q", v)
+		}
+		stagingLimit = n
 	}
 	cfg := runner.Config{
 		Server:           strings.TrimRight(*url, "/"),
@@ -1267,6 +1303,9 @@ func Runner(ctx context.Context, args []string) error {
 		MetricsListen:    *metricsListen,
 		SigstoreKeyPath:  *sigstoreKey,
 		WorkDir:          *workDir,
+		StagingDir:       strings.TrimSpace(*stagingDir),
+		StagingMaxBytes:  stagingLimit,
+		SetupTimeout:     *setupTimeout,
 	}
 	if *labels != "" {
 		cfg.Labels = strings.Split(*labels, ",")

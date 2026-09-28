@@ -1683,7 +1683,7 @@ func (s *Server) enqueueID(ctx context.Context, in SubmitRun, preRunID string) (
 				EffectivePolicy: json.RawMessage(policyJSON),
 			},
 		}
-		applyCompiledJobFields(&j, cj, now)
+		applyCompiledJobFields(&j, cj, spec, now)
 		created[jobIDs[key]] = j
 	}
 	// Artifact contracts ride the enqueue transaction (InsertCompiledRun)

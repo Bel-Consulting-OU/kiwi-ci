@@ -3,17 +3,16 @@ package runner
 import (
 	"context"
 	"errors"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
-	"sync/atomic"
+	"strings"
 	"testing"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
-	"github.com/Bel-Consulting-OU/kiwi-ci/internal/safefs"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
 )
 
 // TestRestoreDownloadsRejectsSymlinkedAncestor is the end-to-end P0
@@ -69,22 +68,9 @@ func TestRestoreDownloadsNestedPathStillWorks(t *testing.T) {
 	}
 }
 
-// countingWriter records how many bytes reach the underlying writer and
-// forwards the write result unchanged.
-type countingWriter struct {
-	w io.Writer
-	n *int64
-}
-
-func (c *countingWriter) Write(p []byte) (int, error) {
-	n, err := c.w.Write(p)
-	atomic.AddInt64(c.n, int64(n))
-	return n, err
-}
-
 // TestRestoreDownloadsCapsSpooledBody is the P1 regression: a dependency body
-// larger than the hard cap is refused with a typed error, the spool file is
-// removed, and no more than the cap is ever written.
+// larger than the hard cap is refused with a typed error, the staged spool is
+// removed, and the staging ledger drains to zero (no bytes stay charged).
 func TestRestoreDownloadsCapsSpooledBody(t *testing.T) {
 	prevCap := dependencyArtifactMaxBytes
 	dependencyArtifactMaxBytes = 256
@@ -109,28 +95,40 @@ func TestRestoreDownloadsCapsSpooledBody(t *testing.T) {
 	defer srv.Close()
 
 	r := testRunnerFor(t, srv, Config{})
-	var spooled int64
-	prevSink := dependencySpoolSink
-	dependencySpoolSink = func(f *os.File, limit int64) io.Writer {
-		return &countingWriter{w: safefs.NewCappedWriter(f, limit), n: &spooled}
-	}
-	t.Cleanup(func() { dependencySpoolSink = prevSink })
-
 	inputs := []pipeline.ArtifactInput{{From: "build", Name: "bin"}}
 	err := r.restoreDownloads(context.Background(), downloadTask(), inputs, t.TempDir())
 	if !errors.Is(err, ErrDependencyArtifactTooLarge) {
 		t.Fatalf("error = %v, want ErrDependencyArtifactTooLarge", err)
 	}
-	if got := atomic.LoadInt64(&spooled); got > dependencyArtifactMaxBytes {
-		t.Fatalf("spooled %d bytes, cap %d", got, dependencyArtifactMaxBytes)
+	budget, berr := r.dependencyStaging()
+	if berr != nil {
+		t.Fatal(berr)
 	}
-	entries, rerr := os.ReadDir(r.Cfg.CacheRoot)
-	if rerr != nil {
-		t.Fatal(rerr)
+	if used := budget.Used(); used != 0 {
+		t.Fatalf("staging ledger = %d bytes after a refused spool, want 0", used)
 	}
+	if left := spoolFilesIn(t, budget.Dir()); len(left) != 0 {
+		t.Fatalf("partial spool left behind: %v", left)
+	}
+}
+
+// spoolFilesIn lists the staging spool files currently present in dir.
+func spoolFilesIn(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		t.Fatal(err)
+	}
+	var out []string
 	for _, e := range entries {
-		t.Fatalf("spool temp file left behind: %q", e.Name())
+		if !e.IsDir() && strings.HasPrefix(e.Name(), staging.FilePrefix) {
+			out = append(out, e.Name())
+		}
 	}
+	return out
 }
 
 // TestRestoreDownloadsRejectsOversizedContentLength proves a peer that

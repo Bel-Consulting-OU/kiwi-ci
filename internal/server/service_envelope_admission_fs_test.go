@@ -218,7 +218,7 @@ func TestServiceEnvelopeStampedForTrustedAndUntrustedJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	var tj model.Job
-	applyCompiledJobFields(&tj, trustedJob, time.Now())
+	applyCompiledJobFields(&tj, trustedJob, nil, time.Now())
 	if tj.ServiceEnvelopeRequest != (model.ResourceCapacity{CPU: 2, Memory: 2 << 30, PIDs: 256}) {
 		t.Fatalf("trusted envelope = %+v, want the declared-resource fair split {cpu:2 memory:2GiB pids:256}", tj.ServiceEnvelopeRequest)
 	}
@@ -234,7 +234,7 @@ func TestServiceEnvelopeStampedForTrustedAndUntrustedJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	var uj model.Job
-	applyCompiledJobFields(&uj, untrustedJob, time.Now())
+	applyCompiledJobFields(&uj, untrustedJob, nil, time.Now())
 	if uj.ServiceEnvelopeRequest != (model.ResourceCapacity{CPU: 2, Memory: 2 << 30, PIDs: 256}) {
 		t.Fatalf("untrusted envelope = %+v, want the ceiling-filled fair split {cpu:2 memory:2GiB pids:256}", uj.ServiceEnvelopeRequest)
 	}

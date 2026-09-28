@@ -487,7 +487,7 @@ func TestFinalChangedFilesInRepository(t *testing.T) {
 	}
 	run("add", ".")
 	run("commit", "-q", "-m", "second")
-	got := changedFiles(dir)
+	got := changedFiles(context.Background(), dir)
 	if len(got) != 1 || got[0] != "b.txt" {
 		t.Fatalf("changedFiles = %v, want [b.txt]", got)
 	}
@@ -791,7 +791,7 @@ func TestFinalHeartbeatCancelsExpiredLease(t *testing.T) {
 // --- small helpers --------------------------------------------------------
 
 func TestFinalChangedFilesFailureAndBranchRef(t *testing.T) {
-	if got := changedFiles(t.TempDir()); got != nil {
+	if got := changedFiles(context.Background(), t.TempDir()); got != nil {
 		t.Fatalf("changedFiles outside a repository = %v", got)
 	}
 	if got := branchFromRef("refs/heads/main"); got != "main" {

@@ -157,10 +157,14 @@ func TestEnqueueJobResourcePersistence(t *testing.T) {
 	cj.Job.Resources = pipeline.Resources{CPU: 2.5, Memory: 512 << 20, Disk: 2 << 30, PIDs: 100}
 	cj.Job.QueueTimeout.Duration = 5 * time.Minute
 	cj.Job.QueueTimeout.Set = true
+	cj.Job.Timeout.Duration = 30 * time.Minute
 	var j model.Job
-	applyCompiledJobFields(&j, cj, now)
+	applyCompiledJobFields(&j, cj, nil, now)
 	if j.CPURequest != 2.5 || j.MemoryRequest != 512<<20 || j.DiskRequest != 2<<30 || j.PIDsRequest != 100 {
 		t.Fatalf("resource requests = %v/%d/%d/%d, want populated", j.CPURequest, j.MemoryRequest, j.DiskRequest, j.PIDsRequest)
+	}
+	if j.JobTimeout != 30*time.Minute {
+		t.Fatalf("job timeout = %v, want the compiled job's 30m", j.JobTimeout)
 	}
 	if j.QueueDeadline == nil || !j.QueueDeadline.Equal(now.Add(5*time.Minute)) {
 		t.Fatalf("queue deadline = %v, want %v", j.QueueDeadline, now.Add(5*time.Minute))
@@ -169,7 +173,7 @@ func TestEnqueueJobResourcePersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`"cpu_request":2.5`, `"memory_request":536870912`, `"disk_request":2147483648`, `"pids_request":100`, `"queue_deadline"`} {
+	for _, want := range []string{`"cpu_request":2.5`, `"memory_request":536870912`, `"disk_request":2147483648`, `"pids_request":100`, `"job_timeout":1800000000000`, `"queue_deadline"`} {
 		if !strings.Contains(string(b), want) {
 			t.Errorf("job payload missing %s: %s", want, b)
 		}
@@ -178,15 +182,26 @@ func TestEnqueueJobResourcePersistence(t *testing.T) {
 	if err := json.Unmarshal(b, &rt); err != nil {
 		t.Fatal(err)
 	}
-	if rt.CPURequest != 2.5 || rt.QueueDeadline == nil {
+	if rt.CPURequest != 2.5 || rt.QueueDeadline == nil || rt.JobTimeout != 30*time.Minute {
 		t.Fatalf("payload round-trip lost resource/deadline fields: %+v", rt)
 	}
-	// Jobs without a queue timeout get no deadline.
+	// Jobs without a queue timeout get no deadline, and a job without its own
+	// timeout inherits the pipeline default (the same precedence the executor
+	// applies); with neither, no job timeout is stamped.
 	cj.Job.QueueTimeout.Duration = 0
 	cj.Job.QueueTimeout.Set = false
+	cj.Job.Timeout.Duration = 0
 	j2 := model.Job{}
-	applyCompiledJobFields(&j2, cj, now)
+	applyCompiledJobFields(&j2, cj, &pipeline.Spec{Defaults: pipeline.Defaults{Timeout: pipeline.Duration{Duration: 12 * time.Minute, Set: true}}}, now)
 	if j2.QueueDeadline != nil {
 		t.Fatalf("job without queue_timeout got a deadline: %v", j2.QueueDeadline)
+	}
+	if j2.JobTimeout != 12*time.Minute {
+		t.Fatalf("job timeout = %v, want the pipeline default 12m", j2.JobTimeout)
+	}
+	j3 := model.Job{}
+	applyCompiledJobFields(&j3, cj, nil, now)
+	if j3.JobTimeout != 0 {
+		t.Fatalf("job with no timeout anywhere got %v, want zero", j3.JobTimeout)
 	}
 }

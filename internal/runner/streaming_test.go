@@ -250,9 +250,9 @@ func TestControlClientTimesOutOnStalledResponse(t *testing.T) {
 // guard: a dependency download that sends some bytes and then stops is
 // cancelled after the idle bound instead of hanging forever.
 func TestStreamingIdleGuardCancelsStalledDownload(t *testing.T) {
-	prevIdle := streamIdleTimeout
-	streamIdleTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { streamIdleTimeout = prevIdle })
+	prevIdle := streamIdleTimeout.get()
+	streamIdleTimeout.set(200 * time.Millisecond)
+	t.Cleanup(func() { streamIdleTimeout.set(prevIdle) })
 
 	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -288,9 +288,9 @@ func TestStreamingIdleGuardCancelsStalledDownload(t *testing.T) {
 // sliding, not absolute: a download whose every gap is below the idle bound
 // completes even though its total duration is many idle windows.
 func TestStreamingIdleGuardKeepsSlowButContinuousRead(t *testing.T) {
-	prevIdle := streamIdleTimeout
-	streamIdleTimeout = 400 * time.Millisecond
-	t.Cleanup(func() { streamIdleTimeout = prevIdle })
+	prevIdle := streamIdleTimeout.get()
+	streamIdleTimeout.set(400 * time.Millisecond)
+	t.Cleanup(func() { streamIdleTimeout.set(prevIdle) })
 
 	body := tarGzWithFile(t, "app.txt", "slow-but-alive")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -17,16 +18,16 @@ func TestEffectiveChangedFilesKnownEmptyNoGitFallback(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "git-invoked")
 	withFakeGit(t, marker, func() {
 		// Known-empty: no git invocation, empty result.
-		got := effectiveChangedFiles(nil, true, dir)
+		got := effectiveChangedFiles(context.Background(), nil, true, dir)
 		if len(got) != 0 {
 			t.Fatalf("known-empty with nil = %v, want empty", got)
 		}
-		got = effectiveChangedFiles([]string{}, true, dir)
+		got = effectiveChangedFiles(context.Background(), []string{}, true, dir)
 		if len(got) != 0 {
 			t.Fatalf("known-empty with empty list = %v, want empty", got)
 		}
 		// Known non-empty: returned as-is, no git call.
-		got = effectiveChangedFiles([]string{"a.go"}, true, dir)
+		got = effectiveChangedFiles(context.Background(), []string{"a.go"}, true, dir)
 		if len(got) != 1 || got[0] != "a.go" {
 			t.Fatalf("known non-empty = %v", got)
 		}
@@ -34,7 +35,7 @@ func TestEffectiveChangedFilesKnownEmptyNoGitFallback(t *testing.T) {
 			t.Fatal("known lists must never invoke git")
 		}
 		// Unknown with a non-empty server list: no git call either.
-		got = effectiveChangedFiles([]string{"b.go"}, false, dir)
+		got = effectiveChangedFiles(context.Background(), []string{"b.go"}, false, dir)
 		if len(got) != 1 || got[0] != "b.go" {
 			t.Fatalf("unknown non-empty = %v", got)
 		}
@@ -42,7 +43,7 @@ func TestEffectiveChangedFilesKnownEmptyNoGitFallback(t *testing.T) {
 			t.Fatal("non-empty unknown lists must not invoke git")
 		}
 		// Unknown with an EMPTY list: the fallback path runs git.
-		got = effectiveChangedFiles(nil, false, dir)
+		got = effectiveChangedFiles(context.Background(), nil, false, dir)
 		if _, err := os.Stat(marker); err != nil {
 			t.Fatal("unknown empty list must fall back to the local git diff")
 		}

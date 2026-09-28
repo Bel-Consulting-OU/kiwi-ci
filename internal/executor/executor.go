@@ -333,10 +333,12 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		res.Status = model.StatusSkipped
 		return finish(res)
 	}
-	jobTimeout := cj.Job.Timeout.Duration
-	if jobTimeout == 0 {
-		jobTimeout = s.Defaults.Timeout.Duration
-	}
+	// Shared resolution with the enqueue-time stamping
+	// (pipeline.EffectiveJobTimeout): a job-level timeout, else the pipeline
+	// defaults.timeout. The distributed runner has already started the same
+	// deadline at the beginning of execute; this child context can only
+	// shorten it.
+	jobTimeout := pipeline.EffectiveJobTimeout(cj, s)
 	if jobTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, jobTimeout)
@@ -844,7 +846,7 @@ var absWorkspacePath = filepath.Abs
 
 // closeSnapshotFile is a test-only seam over os.File.Close. Production
 // behavior is unchanged; it lets the checked snapshot-close failure branch be
-// exercised (matching the runner's closeRunnerTempFile seam).
+// exercised.
 var closeSnapshotFile = (*os.File).Close
 
 // captureSnapshot archives the job workspace after its steps ran. It writes

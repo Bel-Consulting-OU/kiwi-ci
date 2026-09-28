@@ -511,6 +511,12 @@ func TestRunnerCommandFlagValidation(t *testing.T) {
 	if err := Runner(context.Background(), []string{"--bogus"}); err == nil {
 		t.Fatal("unknown flag succeeded")
 	}
+	if err := Runner(context.Background(), []string{"--staging-max-bytes", "not-a-number"}); err == nil {
+		t.Fatal("non-numeric --staging-max-bytes succeeded")
+	}
+	if err := Runner(context.Background(), []string{"--staging-max-bytes", "0"}); err == nil {
+		t.Fatal("zero --staging-max-bytes succeeded")
+	}
 	// Defaults point at the local control plane; an unreachable server
 	// fails registration fast.
 	tmp := t.TempDir()

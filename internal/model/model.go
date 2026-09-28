@@ -201,6 +201,16 @@ type Job struct {
 	MemoryRequest int64   `json:"memory_request,omitempty"`
 	DiskRequest   int64   `json:"disk_request,omitempty"`
 	PIDsRequest   int     `json:"pids_request,omitempty"`
+	// JobTimeout is the resolved job lifetime stamped at enqueue (the
+	// compiled job's timeout, else the pipeline's defaults.timeout), the same
+	// way CPU/memory/disk/PIDs are persisted. The distributed runner starts
+	// this deadline at the very beginning of execute — before workspace
+	// setup, checkout, dependency restore and every other pre-execution
+	// phase — so local and distributed execution agree on what the declared
+	// job timeout covers, and a stalled clone cannot outlive the job budget.
+	// Zero means no declared timeout; the runner then applies its own setup
+	// phase ceiling. Additive.
+	JobTimeout time.Duration `json:"job_timeout,omitempty"`
 	// ServiceEnvelopeRequest is the AGGREGATE CPU/memory/PIDs the job's
 	// declared service containers may consume. It is stamped at enqueue from
 	// the effective compiled job through the executor's ONE fair-split
