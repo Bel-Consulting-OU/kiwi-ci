@@ -56,10 +56,12 @@ steps:
       # it claims. scripts/ci-coverage-selftest.sh enforces its presence.
       - KIWI_TEST_POSTGRES_URL=postgres://postgres:pass@postgres:5432/postgres?sslmode=disable go test -count=1 -timeout=45m -v -run Integration -coverprofile=integration-coverage.out -covermode=atomic -coverpkg=./... ./internal/storage ./internal/scheduler ./internal/server ./internal/app
 
-  # Root guards for the packages this workflow exercises (storage, app and
-  # server carry os.Geteuid()==0 permission-failure tests). They skip under
-  # the root lanes; this step runs them as an unprivileged user so they
-  # execute here too. See .woodpecker/linux-amd64.yml unit-nonroot for the
+  # Root guards: os.Geteuid()==0 permission-failure tests skip under the root
+  # lanes, so this step runs the WHOLE unit suite as an unprivileged user and
+  # writes a coverage profile too. The root coverage step cannot see those
+  # tests, and discarding this profile made the merged 95% floor understate
+  # real coverage (and made the instrumented suite's own root-skipping tests
+  # count as uncovered). See .woodpecker/linux-amd64.yml unit-nonroot for the
   # cache-ownership rationale (workspace is 0777; caches live under /tmp).
   unit-nonroot:
     image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
@@ -74,17 +76,17 @@ steps:
       GOMODCACHE: /tmp/gopath/pkg/mod
       GOTMPDIR: /tmp
     commands:
-      - go test -count=1 -shuffle=on -timeout=45m ./internal/storage ./internal/app ./internal/server
+      - go test -count=1 -shuffle=on -timeout=45m -coverprofile=unit-nonroot.out -covermode=atomic ./...
 
   coverage:
     image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
-    depends_on: [integration-postgres]
+    depends_on: [integration-postgres, unit-nonroot]
     environment:
       GOTOOLCHAIN: local
       KC_MIN_COVERAGE: "95"
     commands:
       - go test -timeout=45m -coverprofile=coverage.out -covermode=atomic ./...
-      - ./scripts/ci-coverage-selftest.sh coverage.out integration-coverage.out
-      - ./scripts/merge-coverage.sh merged-coverage.out coverage.out integration-coverage.out
+      - ./scripts/ci-coverage-selftest.sh coverage.out integration-coverage.out unit-nonroot.out
+      - ./scripts/merge-coverage.sh merged-coverage.out coverage.out integration-coverage.out unit-nonroot.out
       - ./scripts/coverage-report.sh merged-coverage.out
       - ./scripts/coverage-floor.sh merged-coverage.out

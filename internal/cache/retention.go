@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -43,6 +44,11 @@ type PruneResult struct {
 	// and remain accounted by the next pass (a transient EBUSY/EPERM never
 	// silently frees cache capacity).
 	Failed int
+	// Skipped counts entries whose identity changed between ranking and
+	// eviction (a concurrent save refreshed the key) or whose eviction lost
+	// the freshness fence; they are deliberately left for the next pass
+	// rather than deleted on stale information.
+	Skipped int
 }
 
 // localCacheEntry is one archive found in the store root.
@@ -52,21 +58,37 @@ type localCacheEntry struct {
 	modTime time.Time
 }
 
+// pruneBeforeEvictHook, when set (tests only), observes the path a pass is
+// about to evict, after ranking and before the freshness fence. It lets a
+// test deterministically replace the entry to prove stale rankings never
+// delete a refreshed entry.
+var pruneBeforeEvictHook func(path string)
+
 // Prune evicts local cache entries until the policy holds: expired entries
 // first, then the least-recently-used entries while the byte or entry caps
 // are exceeded. Removal failures are counted and retried on the next pass;
-// the archive and its digest sidecar are removed together so a partially
-// evicted entry can only ever surface as a cache miss. The context is
-// checked between entries so a shutdown stops the pass promptly.
+// entries refreshed after ranking are skipped by the freshness fence. The
+// archive and its digest sidecar are removed together so a partially evicted
+// entry can only ever surface as a cache miss. The context is checked
+// between entries so a shutdown (or a job deadline) stops the pass promptly.
 func (s *Store) Prune(ctx context.Context) (PruneResult, error) {
-	var res PruneResult
-	policy := s.Retention
-	if !policy.Active() {
-		return res, nil
+	if s.Manager != nil {
+		return s.Manager.Prune(ctx)
+	}
+	if !s.Retention.Active() {
+		return PruneResult{}, nil
 	}
 	s.pruneMu.Lock()
 	defer s.pruneMu.Unlock()
-	entries, err := s.listLocalEntries()
+	return pruneLocalDir(ctx, s.Root, s.Retention)
+}
+
+// pruneLocalDir is the single implementation behind Store.Prune and
+// Manager.Prune: age eviction first, then LRU eviction while a cap is
+// exceeded, each eviction fenced against concurrent refreshes.
+func pruneLocalDir(ctx context.Context, root string, policy RetentionPolicy) (PruneResult, error) {
+	var res PruneResult
+	entries, err := listLocalEntriesAt(root)
 	if err != nil {
 		return res, err
 	}
@@ -77,7 +99,7 @@ func (s *Store) Prune(ctx context.Context) (PruneResult, error) {
 			return res, err
 		}
 		if policy.MaxAge > 0 && now.Sub(e.modTime) > policy.MaxAge {
-			s.evictLocal(e, &res)
+			evictLocalEntry(root, e, &res)
 			continue
 		}
 		kept = append(kept, e)
@@ -95,7 +117,7 @@ func (s *Store) Prune(ctx context.Context) (PruneResult, error) {
 			overBytes := policy.MaxBytes > 0 && total+e.size > policy.MaxBytes
 			overEntries := policy.MaxEntries > 0 && i > policy.MaxEntries-1
 			if overBytes || overEntries {
-				s.evictLocal(e, &res)
+				evictLocalEntry(root, e, &res)
 				continue
 			}
 		}
@@ -104,10 +126,10 @@ func (s *Store) Prune(ctx context.Context) (PruneResult, error) {
 	return res, nil
 }
 
-// listLocalEntries enumerates the valid archive entries in the store root.
-// Temp files (dot-prefixed), sidecars and foreign names are ignored.
-func (s *Store) listLocalEntries() ([]localCacheEntry, error) {
-	dir, err := os.ReadDir(s.Root)
+// listLocalEntriesAt enumerates the valid archive entries in dir. Temp files
+// (dot-prefixed), sidecars and foreign names are ignored.
+func listLocalEntriesAt(dir string) ([]localCacheEntry, error) {
+	d, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
@@ -115,7 +137,7 @@ func (s *Store) listLocalEntries() ([]localCacheEntry, error) {
 		return nil, err
 	}
 	var out []localCacheEntry
-	for _, de := range dir {
+	for _, de := range d {
 		name := de.Name()
 		if de.IsDir() || strings.HasPrefix(name, ".") || !strings.HasSuffix(name, ".tar.gz") {
 			continue
@@ -133,18 +155,50 @@ func (s *Store) listLocalEntries() ([]localCacheEntry, error) {
 	return out, nil
 }
 
-// evictLocal removes one entry (archive + digest sidecar). A failed archive
-// removal leaves the entry fully accounted for a later pass; the sidecar is
-// best-effort because an orphan sidecar without an archive can only ever be
-// read by a same-key save that overwrites it.
-func (s *Store) evictLocal(e localCacheEntry, res *PruneResult) {
-	if err := removeCacheFile(s.archivePath(e.key)); err != nil && !os.IsNotExist(err) {
-		res.Failed++
-		return
+// evictLocalEntry removes one entry (archive + digest sidecar) and reports
+// whether it was actually removed. The freshness fence re-stats the archive
+// after ranking: an entry whose size or mtime changed (a concurrent save
+// published a new archive under the same key) is SKIPPED, never deleted on
+// stale information, and a removal failure leaves the entry fully accounted
+// for a later pass. The sidecar is best-effort because an orphan sidecar
+// without an archive can only ever be read by a same-key save that
+// overwrites it.
+func evictLocalEntry(root string, e localCacheEntry, res *PruneResult) bool {
+	archive := archivePathAt(root, e.key)
+	if pruneBeforeEvictHook != nil {
+		pruneBeforeEvictHook(archive)
 	}
-	_ = os.Remove(s.stripChecksumPath(e.key))
+	fi, err := os.Stat(archive)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Already gone (a concurrent eviction or refresh): count as
+			// skipped, not failed; the next scan reflects reality.
+			res.Skipped++
+			return false
+		}
+		res.Failed++
+		return false
+	}
+	if fi.Size() != e.size || !fi.ModTime().Equal(e.modTime) {
+		res.Skipped++
+		return false
+	}
+	if err := removeCacheFile(archive); err != nil && !os.IsNotExist(err) {
+		res.Failed++
+		return false
+	}
+	_ = os.Remove(stripChecksumPathAt(root, e.key))
 	res.Entries++
 	res.Bytes += e.size
+	return true
+}
+
+func archivePathAt(root, key string) string {
+	return filepath.Join(root, key+".tar.gz")
+}
+
+func stripChecksumPathAt(root, key string) string {
+	return filepath.Join(root, key+".tar.gz.sha256")
 }
 
 // touchLocal marks an entry as recently used so age/LRU eviction prefers

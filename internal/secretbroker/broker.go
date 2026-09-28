@@ -22,9 +22,18 @@ import (
 
 // SecretScope describes the CI context a secret is resolved for.
 type SecretScope struct {
-	Repository  string
-	Environment string
-	Trusted     bool
+	// Repository is the CANONICAL authorization identity of the repository
+	// whose policy governs the job (storage.RepoIDForJob), never the clone
+	// transport URL: a fork PR may check out a different repository than the
+	// one whose policy and secrets apply.
+	Repository string
+	// CheckoutRepositoryURL is the transport coordinate actually cloned. It
+	// exists so a scope-aware broker that needs the checkout location can
+	// read it WITHOUT overloading the authorization identity above; the
+	// built-in cloud brokers ignore both.
+	CheckoutRepositoryURL string
+	Environment           string
+	Trusted               bool
 }
 
 // Broker resolves a named secret for a scope.

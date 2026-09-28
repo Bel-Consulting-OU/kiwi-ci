@@ -544,6 +544,21 @@ func (s *Server) issueSecret(w http.ResponseWriter, r *http.Request) {
 	s.deliverSecret(w, r, j, in, pubRaw)
 }
 
+// secretScopeForJob builds the broker scope from the job. Repository is the
+// CANONICAL authorization identity every policy/quota/cache decision uses
+// (PolicyRepoID first, then the RepoID/URL/full-name derivation) — never the
+// clone transport URL, which for a fork PR can point at a different
+// repository than the one whose policy governs the job. The checkout
+// coordinate is carried separately for scope-aware brokers that need it.
+func secretScopeForJob(j model.Job) secretbroker.SecretScope {
+	return secretbroker.SecretScope{
+		Repository:            storage.RepoIDForJob(j),
+		CheckoutRepositoryURL: j.RepoURL,
+		Environment:           j.Environment,
+		Trusted:               j.Trusted,
+	}
+}
+
 // deliverSecret resolves the broker, seals the value for the runner's
 // ephemeral key, crosses the commit-time issuance authority and only then
 // writes the response. The sealed envelope is kept in memory until the commit
@@ -555,7 +570,7 @@ func (s *Server) deliverSecret(w http.ResponseWriter, r *http.Request, j model.J
 		http.Error(w, "invalid ephemeral_public: want base64-encoded 32 bytes", http.StatusBadRequest)
 		return
 	}
-	value, err := s.resolveBroker(r, in.Name, secretbroker.SecretScope{Repository: j.RepoURL, Environment: j.Environment, Trusted: j.Trusted})
+	value, err := s.resolveBroker(r, in.Name, secretScopeForJob(j))
 	if err != nil {
 		if errors.Is(err, secretbroker.ErrAlreadyDelivered) {
 			http.Error(w, "secret already delivered", http.StatusConflict)

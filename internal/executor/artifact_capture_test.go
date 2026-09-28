@@ -340,3 +340,58 @@ func TestArtifactCaptureFallbackSkippedOnRunnerShutdown(t *testing.T) {
 		t.Fatal("shutdown-time diagnostic capture was attempted")
 	}
 }
+
+// TestArtifactCaptureFinalizeReceivesPublishedPathOnError pins the executor
+// half of finding 5: when SaveContext reports an error AFTER the archive was
+// renamed into place, the finalizer is invoked with the published path (not
+// ""), so the runner's debt-aware cleanup can account for the bytes.
+func TestArtifactCaptureFinalizeReceivesPublishedPathOnError(t *testing.T) {
+	ws := t.TempDir()
+	writeCaptureFile(t, ws, "out.bin", 2048)
+	artRoot := t.TempDir()
+	// Block the manifest path with a non-empty directory: the archive is
+	// renamed first, then SaveManifest fails, then the compensating removal
+	// succeeds and the published path is still reported.
+	manifest := filepath.Join(artRoot, "run-cap", "j", "art.tar.gz.manifest.json")
+	if err := os.MkdirAll(manifest, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(manifest, "x"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sink := &covSink{}
+	var finalizePath string
+	finalized := 0
+	ex := &Executor{Opt: Options{
+		Workspace: ws, Logs: sink, RunID: "run-cap", Artifacts: artifactStoreAt(t, artRoot),
+		ArtifactCapture: &ArtifactCapture{
+			Context:  context.Background(),
+			MaxBytes: 1 << 20,
+			Reserve: func(context.Context, int64) (func(string) error, error) {
+				return func(path string) error {
+					finalizePath = path
+					finalized++
+					return artifact.RemoveCaptured(path)
+				}, nil
+			},
+		},
+	}, Masker: &secrets.Masker{}}
+	res := ex.runJob(context.Background(), &pipeline.Spec{}, pipeline.CompiledJob{
+		ID: "j", Job: pipeline.Job{
+			Artifacts: []pipeline.Artifact{{Name: "art", Paths: []string{"out.bin"}}},
+			Steps:     []pipeline.Step{{Run: "true"}},
+		},
+	}, model.StatusSuccess, nil)
+	if res.Status != model.StatusSuccess || !sink.has("save warning") {
+		t.Fatalf("post-rename failure = %+v lines=%v", res, sink.lines)
+	}
+	if finalized != 1 {
+		t.Fatalf("finalize calls = %d, want 1", finalized)
+	}
+	if finalizePath == "" {
+		t.Fatal("finalize received an empty path for a published archive")
+	}
+	if _, err := os.Stat(finalizePath); !os.IsNotExist(err) {
+		t.Fatalf("published archive was not cleaned up (err=%v)", err)
+	}
+}

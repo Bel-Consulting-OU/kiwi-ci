@@ -366,13 +366,28 @@ claims themselves.
   artifacts. Success-only cache publication is skipped as soon as the job
   context ends, so a dead deadline can no longer spend minutes compressing
   an archive that is then discarded.
-- Runner-local caches now have an aggregate retention policy (default
-  32 GiB / 4096 entries / 14 days; `--cache-max-bytes`,
-  `--cache-max-entries`, `--cache-max-age`): entries are evicted
-  least-recently-used first after every save and on a 10-minute maintenance
-  pass, and the download preflight uses the resolved 8 GiB per-archive bound
-  instead of a raw zero that disabled it. A pipeline rotating its logical
-  cache key can no longer fill the runner disk.
+- Runner-local caches now have a REAL aggregate capacity bound: one shared
+  cache manager per runner owns the root and policy, and every per-job store
+  reserves capacity through it before a save OR a remote restore writes
+  bytes, evicting least-recently-used entries until the reservation fits
+  (default 32 GiB / 4096 entries / 14 days; `--cache-max-bytes`,
+  `--cache-max-entries`, `--cache-max-age`, with `--cache-archive-max-bytes`
+  for the per-archive bound). Inline retention uses the job context, eviction
+  re-checks the ranked entry so a concurrent refresh is never deleted on
+  stale information, and the download preflight uses the resolved per-archive
+  bound instead of a raw zero that disabled it. A pipeline rotating its
+  logical cache key can no longer fill the runner disk, even through many
+  concurrent remote restores.
+- Durable shared-cache manifests are retained per (repository, trust domain)
+  namespace: an untrusted fork-PR manifest flood can never evict the
+  protected repository's trusted entries, prune deletes only the exact
+  ranked version (`created_at` + blob digest re-matched), and fs mode
+  re-reads the manifest immediately before removal. The per-namespace byte
+  bound counts LOGICAL manifest bytes (not digest-deduplicated) and is
+  documented as a conservative upper bound. Secret broker scopes now carry
+  the canonical authorization repository id
+  (`storage.RepoIDForJob`) instead of the clone URL, with the checkout URL
+  available as a separate field.
 - Durable shared-cache manifests now have control-plane retention
   (`cache_manifest_retention`, default 30 days;
   `max_cache_manifests_per_repo`, default 4096;

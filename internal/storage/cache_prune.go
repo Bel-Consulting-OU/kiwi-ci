@@ -17,9 +17,13 @@ type CacheManifestPrunePolicy struct {
 	OlderThan time.Duration
 	// PerRepoMaxEntries bounds each repository's manifest count.
 	PerRepoMaxEntries int
-	// PerRepoMaxBytes bounds each repository's referenced blob bytes
-	// (newest manifests counted first; once the running sum exceeds the
-	// bound, that manifest and every older one are evicted).
+	// PerRepoMaxBytes bounds each namespace's LOGICAL referenced bytes: the
+	// sum of blob_size across the namespace's manifests, newest first, with
+	// no digest deduplication (fifty keys pointing at one digest count that
+	// blob fifty times). This is deliberately conservative: it is an upper
+	// bound on the physical CAS bytes the namespace can pin, and the
+	// per-namespace entry cap already bounds logical-key fanout. It is not a
+	// physical deduplicated storage measurement.
 	PerRepoMaxBytes int64
 }
 
@@ -51,10 +55,19 @@ func prunePolicyActive(p CacheManifestPrunePolicy) bool {
 }
 
 // PruneCacheManifests deletes durable cache-manifest rows that exceed the
-// policy, per repository. Only manifests that still reference a blob
+// policy, per (repository, trust domain) namespace. The trust domain
+// partition is deliberate: a fork PR runs under the base repository with
+// trust_domain=untrusted and may produce many manifests, and it must never
+// evict the protected repository's trusted entries (a cross-trust cache
+// availability DoS). Only manifests that still reference a blob
 // (blob_sha256 non-empty) participate, mirroring the CAS reference
-// enumeration; the deletion is a single statement, so an interrupted pass
-// either evicts its ranked set or nothing.
+// enumeration.
+//
+// The victim identity carries created_at AND blob_sha256, and the DELETE
+// re-matches on them: a concurrent upsert that refreshed a ranked row under
+// a row lock is re-evaluated against the new version under READ COMMITTED
+// and no longer matches, so a freshly refreshed manifest can never be
+// deleted on a stale ranking.
 func (s *PostgresStore) PruneCacheManifests(ctx context.Context, policy CacheManifestPrunePolicy) (CacheManifestPruneResult, error) {
 	var res CacheManifestPruneResult
 	if !prunePolicyActive(policy) {
@@ -66,21 +79,26 @@ func (s *PostgresStore) PruneCacheManifests(ctx context.Context, policy CacheMan
 	}
 	rows, err := s.pool.Query(ctx, `
 WITH ranked AS (
-    SELECT repo, trust_domain, logical_key, blob_size, created_at,
-           row_number() OVER (PARTITION BY repo ORDER BY created_at DESC, trust_domain DESC, logical_key DESC) AS rn,
-           sum(blob_size) OVER (PARTITION BY repo ORDER BY created_at DESC, trust_domain DESC, logical_key DESC ROWS UNBOUNDED PRECEDING) AS running_bytes
+    SELECT repo, trust_domain, logical_key, blob_sha256, blob_size, created_at,
+           row_number() OVER (PARTITION BY repo, trust_domain ORDER BY created_at DESC, logical_key DESC) AS rn,
+           sum(blob_size) OVER (PARTITION BY repo, trust_domain ORDER BY created_at DESC, logical_key DESC ROWS UNBOUNDED PRECEDING) AS running_bytes
     FROM cache_manifests
     WHERE blob_sha256 IS NOT NULL AND blob_sha256 <> ''
 ),
 victims AS (
-    SELECT repo, trust_domain, logical_key FROM ranked
+    SELECT repo, trust_domain, logical_key, blob_sha256, created_at FROM ranked
     WHERE ($1::boolean AND created_at < $2)
        OR ($3::bigint > 0 AND rn > $3)
        OR ($4::bigint > 0 AND running_bytes > $4)
 )
-DELETE FROM cache_manifests
-WHERE (repo, trust_domain, logical_key) IN (SELECT repo, trust_domain, logical_key FROM victims)
-RETURNING blob_size`,
+DELETE FROM cache_manifests c
+USING victims v
+WHERE c.repo = v.repo
+  AND c.trust_domain = v.trust_domain
+  AND c.logical_key = v.logical_key
+  AND c.created_at = v.created_at
+  AND c.blob_sha256 = v.blob_sha256
+RETURNING c.blob_size`,
 		policy.OlderThan > 0, cutoff, int64(policy.PerRepoMaxEntries), policy.PerRepoMaxBytes)
 	if err != nil {
 		return res, fmt.Errorf("storage: prune cache manifests: %w", err)
@@ -97,9 +115,19 @@ RETURNING blob_size`,
 	return res, rows.Err()
 }
 
+// cacheQuotaKey is the durable retention namespace: repository PLUS trust
+// domain. Untrusted (fork/PR) runs share the base repository but must never
+// evict the protected repository's trusted entries.
+type cacheQuotaKey struct {
+	Repo  string
+	Trust string
+}
+
 // PruneCacheManifests is the in-memory mirror of the SQL ranking: group by
-// repository, order newest-first with a deterministic tiebreak, evict expired
-// entries and everything beyond the per-repo caps.
+// (repository, trust domain), order newest-first with a deterministic
+// tiebreak, evict expired entries and everything beyond the per-namespace
+// caps. The delete re-checks the ranked identity so a concurrent refresh
+// (new CreatedAt/blob) is never deleted on stale information.
 func (m *memStore) PruneCacheManifests(ctx context.Context, policy CacheManifestPrunePolicy) (CacheManifestPruneResult, error) {
 	var res CacheManifestPruneResult
 	if !prunePolicyActive(policy) {
@@ -107,7 +135,7 @@ func (m *memStore) PruneCacheManifests(ctx context.Context, policy CacheManifest
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	byRepo := map[string][]CacheManifestRecord{}
+	byNamespace := map[cacheQuotaKey][]CacheManifestRecord{}
 	for _, rec := range m.cacheMans {
 		if ctx.Err() != nil {
 			return res, ctx.Err()
@@ -115,19 +143,17 @@ func (m *memStore) PruneCacheManifests(ctx context.Context, policy CacheManifest
 		if rec.BlobSHA256 == "" {
 			continue
 		}
-		byRepo[rec.Repo] = append(byRepo[rec.Repo], rec)
+		key := cacheQuotaKey{Repo: rec.Repo, Trust: rec.TrustDomain}
+		byNamespace[key] = append(byNamespace[key], rec)
 	}
 	cutoff := time.Time{}
 	if policy.OlderThan > 0 {
 		cutoff = time.Now().UTC().Add(-policy.OlderThan)
 	}
-	for repo, recs := range byRepo {
+	for key, recs := range byNamespace {
 		sort.Slice(recs, func(i, j int) bool {
 			if !recs[i].CreatedAt.Equal(recs[j].CreatedAt) {
 				return recs[i].CreatedAt.After(recs[j].CreatedAt)
-			}
-			if recs[i].TrustDomain != recs[j].TrustDomain {
-				return recs[i].TrustDomain > recs[j].TrustDomain
 			}
 			return recs[i].LogicalKey > recs[j].LogicalKey
 		})
@@ -147,7 +173,17 @@ func (m *memStore) PruneCacheManifests(ctx context.Context, policy CacheManifest
 			if !drop {
 				continue
 			}
-			delete(m.cacheMans, cacheManifestKey(repo, rec.TrustDomain, rec.LogicalKey))
+			mapKey := cacheManifestKey(key.Repo, key.Trust, rec.LogicalKey)
+			// Freshness fence: only delete the exact version that was
+			// ranked. memStore replaces records wholesale under the same
+			// lock, so a mismatch here can only come from a refresh between
+			// grouping and this point (kept possible by future lock
+			// refactors).
+			cur, ok := m.cacheMans[mapKey]
+			if !ok || !cur.CreatedAt.Equal(rec.CreatedAt) || cur.BlobSHA256 != rec.BlobSHA256 {
+				continue
+			}
+			delete(m.cacheMans, mapKey)
 			res.Manifests++
 			res.Bytes += rec.BlobSize
 		}

@@ -162,3 +162,63 @@ func TestSaveContextManifestFailureRemovesArchive(t *testing.T) {
 		t.Fatalf("archive left behind after manifest failure (err=%v)", err)
 	}
 }
+
+// TestSaveContextPostRenameFailureReportsPublishedPath pins finding 5: once
+// the archive has been renamed into place, every later failure (directory
+// fsync, manifest write) returns the VISIBLE PATH alongside the error, even
+// when the compensating removal also fails, so the capture caller can charge
+// cleanup debt for bytes that really exist instead of assuming nothing was
+// published.
+func TestSaveContextPostRenameFailureReportsPublishedPath(t *testing.T) {
+	cases := []struct {
+		name       string
+		syncFail   bool
+		manifest   bool
+		removeFail bool
+	}{
+		{name: "sync remove ok", syncFail: true},
+		{name: "sync remove fails", syncFail: true, removeFail: true},
+		{name: "manifest remove ok", manifest: true},
+		{name: "manifest remove fails", manifest: true, removeFail: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ws := t.TempDir()
+			writeWorkspaceFile(t, ws, "out.txt", 64)
+			store := &Store{Root: t.TempDir()}
+			if tc.manifest {
+				dir := filepath.Join(store.Root, encodeArtifactName("run"), encodeArtifactName("job"))
+				manifestPath := filepath.Join(dir, encodeArtifactName("art")+".tar.gz.manifest.json")
+				if err := os.MkdirAll(manifestPath, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(manifestPath, "x"), []byte("x"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			origSync, origRemove := syncArtifactDir, removePublishedArtifact
+			t.Cleanup(func() { syncArtifactDir, removePublishedArtifact = origSync, origRemove })
+			if tc.syncFail {
+				syncArtifactDir = func(string) error { return errors.New("test: dir sync failed") }
+			}
+			if tc.removeFail {
+				removePublishedArtifact = func(string) error { return errors.New("test: remove refused") }
+			}
+			p, err := store.SaveContext(context.Background(), "run", "job", "art", ws, []string{"out.txt"}, 1<<20)
+			if err == nil {
+				t.Fatal("SaveContext succeeded on an injected post-rename failure")
+			}
+			if p == "" {
+				t.Fatal("published path was not reported on a post-rename failure")
+			}
+			_, statErr := os.Stat(p)
+			if tc.removeFail {
+				if statErr != nil {
+					t.Fatalf("cleanup removal failed but the archive is gone: %v", statErr)
+				}
+			} else if !os.IsNotExist(statErr) {
+				t.Fatalf("archive survived a successful compensating removal (err=%v)", statErr)
+			}
+		})
+	}
+}

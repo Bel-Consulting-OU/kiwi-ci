@@ -32,6 +32,12 @@ var (
 	syncArtifactFile   = (*os.File).Sync
 	renameArtifactFile = os.Rename
 	copyDigest         = io.Copy
+	// syncArtifactDir and removePublishedArtifact cover the post-rename
+	// cleanup path: a test can fail the directory fsync (or the manifest
+	// write) AND the compensating archive removal to prove SaveContext still
+	// reports the published path so the caller charges cleanup debt.
+	syncArtifactDir         = fsutil.SyncDir
+	removePublishedArtifact = os.Remove
 )
 
 // countWriter counts the bytes written through it so Save can report the
@@ -129,11 +135,14 @@ func (s *Store) SaveContext(ctx context.Context, runID, jobID, name, workspace s
 		_ = os.Remove(tmp)
 		return "", err
 	}
-	if err := fsutil.SyncDir(dir); err != nil {
-		// The archive is visible but its rename may not survive a crash;
-		// no manifest may be written for it.
-		_ = os.Remove(dst)
-		return "", fmt.Errorf("artifact: sync archive directory: %w", err)
+	if err := syncArtifactDir(dir); err != nil {
+		// The archive is visible but its rename may not survive a crash; no
+		// manifest may be written for it. The published path is returned
+		// EVEN ON ERROR: if the compensating removal also fails, the caller
+		// must still be able to charge cleanup debt for the visible bytes
+		// instead of assuming nothing was published.
+		_ = removePublishedArtifact(dst)
+		return dst, fmt.Errorf("artifact: sync archive directory: %w", err)
 	}
 	entries := make([]ArtifactEntry, 0, len(archived))
 	for _, e := range archived {
@@ -152,11 +161,11 @@ func (s *Store) SaveContext(ctx context.Context, runID, jobID, name, workspace s
 	}
 	if _, err := s.SaveManifest(dst, m); err != nil {
 		// The archive was already renamed into place; with no manifest it can
-		// never be verified, and a capture caller never receives its path to
-		// clean up. Remove it here so a manifest failure can never leave an
-		// unaccounted archive behind.
-		_ = os.Remove(dst)
-		return "", err
+		// never be verified. Remove it, and return the published path on
+		// error: if the removal also fails, the caller must charge cleanup
+		// debt for bytes that really exist.
+		_ = removePublishedArtifact(dst)
+		return dst, err
 	}
 	return dst, nil
 }

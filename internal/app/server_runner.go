@@ -1301,6 +1301,7 @@ func Runner(ctx context.Context, args []string) error {
 	cacheMaxBytes := fs.String("cache-max-bytes", "", "runner-local cache tree byte budget (default 32 GiB; entries are evicted least-recently-used first)")
 	cacheMaxEntries := fs.String("cache-max-entries", "", "runner-local cache tree entry budget (default 4096)")
 	cacheMaxAge := fs.Duration("cache-max-age", 0, "runner-local cache entry age budget (default 336h)")
+	cacheArchiveMaxBytes := fs.String("cache-archive-max-bytes", "", "per-archive cache bound (default 8 GiB); also drives the local cap, restore verification and download preflight")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1320,29 +1321,34 @@ func Runner(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	cacheArchiveLimit, err := parsePositiveInt64Flag("--cache-archive-max-bytes", *cacheArchiveMaxBytes)
+	if err != nil {
+		return err
+	}
 	cfg := runner.Config{
-		Server:           strings.TrimRight(*url, "/"),
-		Token:            *token,
-		Name:             *name,
-		CACert:           *runnerCACert,
-		Cert:             *runnerCert,
-		Key:              *runnerKey,
-		EnrollToken:      *runnerEnrollToken,
-		EnrollLabels:     enrollLabels.values(),
-		IdentityDir:      *identityDir,
-		Drain:            *drain,
-		CaptureSnapshots: *captureSnapshots,
-		Prewarm:          prewarmRefs.values(),
-		MetricsListen:    *metricsListen,
-		SigstoreKeyPath:  *sigstoreKey,
-		WorkDir:          *workDir,
-		StagingDir:       strings.TrimSpace(*stagingDir),
-		StagingMaxBytes:  stagingLimit,
-		SetupTimeout:     *setupTimeout,
-		FinalizeTimeout:  *finalizeTimeout,
-		CacheMaxBytes:    cacheBytes,
-		CacheMaxEntries:  cacheEntries,
-		CacheMaxAge:      *cacheMaxAge,
+		Server:               strings.TrimRight(*url, "/"),
+		Token:                *token,
+		Name:                 *name,
+		CACert:               *runnerCACert,
+		Cert:                 *runnerCert,
+		Key:                  *runnerKey,
+		EnrollToken:          *runnerEnrollToken,
+		EnrollLabels:         enrollLabels.values(),
+		IdentityDir:          *identityDir,
+		Drain:                *drain,
+		CaptureSnapshots:     *captureSnapshots,
+		Prewarm:              prewarmRefs.values(),
+		MetricsListen:        *metricsListen,
+		SigstoreKeyPath:      *sigstoreKey,
+		WorkDir:              *workDir,
+		StagingDir:           strings.TrimSpace(*stagingDir),
+		StagingMaxBytes:      stagingLimit,
+		SetupTimeout:         *setupTimeout,
+		FinalizeTimeout:      *finalizeTimeout,
+		CacheMaxBytes:        cacheBytes,
+		CacheMaxEntries:      cacheEntries,
+		CacheMaxAge:          *cacheMaxAge,
+		CacheArchiveMaxBytes: cacheArchiveLimit,
 	}
 	if *labels != "" {
 		cfg.Labels = strings.Split(*labels, ",")

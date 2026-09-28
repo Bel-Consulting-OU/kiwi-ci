@@ -28,6 +28,7 @@ import (
 
 	v1 "github.com/Bel-Consulting-OU/kiwi-ci/internal/api/v1"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/artifact"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cache"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executor"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/logging"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
@@ -371,6 +372,13 @@ type Runner struct {
 	// successful construction.
 	stagingMu sync.Mutex
 	staging   *staging.Budget
+	// cacheMgr is the runner-wide aggregate cache budget owner shared by
+	// every job's cache.Store (cacheManager constructs it lazily). A
+	// per-job Store cannot enforce an aggregate bound over the shared cache
+	// directory, so reservations/eviction/publication all go through this
+	// one manager.
+	cacheMu  sync.Mutex
+	cacheMgr *cache.Manager
 }
 
 // registerResponse is the register reply. Capabilities carries the effective

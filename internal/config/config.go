@@ -57,9 +57,11 @@ type ServerConfig struct {
 	// repository. 0 uses the built-in default (4096); -1 disables the count
 	// bound.
 	MaxCacheManifestsPerRepo int `toml:"max_cache_manifests_per_repo"`
-	// MaxCacheManifestBytesPerRepo bounds the referenced blob bytes per
-	// repository (newest manifests counted first). 0 uses the built-in
-	// default (64 GiB); -1 disables the byte bound.
+	// MaxCacheManifestBytesPerRepo bounds the LOGICAL referenced blob bytes
+	// per (repository, trust domain) namespace: the sum of manifest blob
+	// sizes, newest first, without digest deduplication (conservative upper
+	// bound on pin-able CAS bytes). 0 uses the built-in default (64 GiB);
+	// -1 disables the byte bound.
 	MaxCacheManifestBytesPerRepo int64 `toml:"max_cache_manifest_bytes_per_repo"`
 }
 

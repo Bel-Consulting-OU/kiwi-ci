@@ -133,3 +133,51 @@ func TestPruneCacheManifestsDisabledPolicyIsNoop(t *testing.T) {
 		t.Fatalf("disabled policy pruned %d", res.Manifests)
 	}
 }
+
+// TestPruneCacheManifestsTrustDomainIsolation pins the namespace partition:
+// quota accounting is per (repository, trust domain), so an untrusted (fork
+// PR) manifest flood can never evict the protected repository's trusted
+// entries.
+func TestPruneCacheManifestsTrustDomainIsolation(t *testing.T) {
+	m := newMemStore()
+	ctx := context.Background()
+	base := time.Now().Add(-2 * time.Hour)
+	// Trusted entries: exactly at the cap, the oldest of them would be the
+	// victim under a repo-only partition.
+	for i := 0; i < 2; i++ {
+		if err := m.PutCacheManifest(ctx, cachePruneRec("repo", "trusted", fmt.Sprintf("t%d", i), fmt.Sprintf("td%d", i), 100, base.Add(time.Duration(i)*time.Minute))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Untrusted flood in the same repository.
+	for i := 0; i < 10; i++ {
+		if err := m.PutCacheManifest(ctx, cachePruneRec("repo", "untrusted", fmt.Sprintf("u%d", i), fmt.Sprintf("ud%d", i), 100, time.Now().Add(-time.Duration(10-i)*time.Minute))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res, err := m.PruneCacheManifests(ctx, CacheManifestPrunePolicy{PerRepoMaxEntries: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Manifests != 8 {
+		t.Fatalf("pruned %d manifests, want only the untrusted overflow (8)", res.Manifests)
+	}
+	for i := 0; i < 2; i++ {
+		if _, ok, _ := m.GetCacheManifest(ctx, "repo", "trusted", fmt.Sprintf("t%d", i)); !ok {
+			t.Fatalf("trusted entry t%d was evicted by the untrusted flood", i)
+		}
+	}
+	if _, ok, _ := m.GetCacheManifest(ctx, "repo", "untrusted", "u9"); !ok {
+		t.Fatal("newest untrusted entry was evicted")
+	}
+}
+
+// TestPostgresPruneInactivePolicyIsNoop pins the zero-policy guard on the
+// Postgres path (it must not touch the pool at all).
+func TestPostgresPruneInactivePolicyIsNoop(t *testing.T) {
+	st := &PostgresStore{}
+	res, err := st.PruneCacheManifests(context.Background(), CacheManifestPrunePolicy{})
+	if err != nil || res.Manifests != 0 {
+		t.Fatalf("inactive policy = %+v, %v", res, err)
+	}
+}

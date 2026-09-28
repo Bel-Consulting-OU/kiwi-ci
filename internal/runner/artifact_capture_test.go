@@ -282,3 +282,23 @@ func TestRunnerShutdownDoesNotWaitCleanupTimeout(t *testing.T) {
 		t.Fatalf("cleanup step ran after runner shutdown (err=%v)", err)
 	}
 }
+
+// TestExecuteArtifactCaptureDirFailure pins the checked failure branch when
+// the per-job capture directory cannot be created (for example WorkDir is a
+// regular file): the job completes as a failure before any step runs.
+func TestExecuteArtifactCaptureDirFailure(t *testing.T) {
+	fsrv := &fakeRunnerServer{}
+	ts := httptest.NewServer(fsrv.handler())
+	defer ts.Close()
+	blocked := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocked, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := testRunnerFor(t, ts, Config{WorkDir: blocked})
+	r.Cfg.CheckoutFn = func(context.Context, model.Job, string) error { return nil }
+	r.execute(context.Background(), basicTask(artifactPipeline("art", "")))
+	c, ok := fsrv.lastComplete()
+	if !ok || c.Status != model.StatusFailure || !strings.Contains(c.Error, "artifact capture directory") {
+		t.Fatalf("complete = %+v ok=%v", c, ok)
+	}
+}

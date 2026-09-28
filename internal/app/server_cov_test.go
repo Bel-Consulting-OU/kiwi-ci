@@ -523,6 +523,9 @@ func TestRunnerCommandFlagValidation(t *testing.T) {
 	if err := Runner(context.Background(), []string{"--cache-max-entries", "0"}); err == nil {
 		t.Fatal("zero --cache-max-entries succeeded")
 	}
+	if err := Runner(context.Background(), []string{"--cache-archive-max-bytes", "nope"}); err == nil {
+		t.Fatal("non-numeric --cache-archive-max-bytes succeeded")
+	}
 	// Defaults point at the local control plane; an unreachable server
 	// fails registration fast.
 	tmp := t.TempDir()

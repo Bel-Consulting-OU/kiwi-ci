@@ -127,12 +127,25 @@ func (r *Runner) cacheRetentionPolicy() cache.RetentionPolicy {
 	return p
 }
 
+// cacheManager returns the runner-wide aggregate cache budget owner,
+// constructed once per runner and shared by every job's Store. The manager
+// is what makes the aggregate bound real: it serializes reservations,
+// evictions and publications across jobs that each hold their own Store.
+func (r *Runner) cacheManager() *cache.Manager {
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	if r.cacheMgr == nil {
+		r.cacheMgr = cache.NewManager(r.cacheRootDir(), r.cacheRetentionPolicy())
+	}
+	return r.cacheMgr
+}
+
 // pruneJobCache runs one retention pass over the runner-local cache tree and
 // reports what it reclaimed. Removal failures stay in the tree (and in the
-// next pass's accounting) instead of silently freeing capacity.
+// next pass's accounting) instead of silently freeing capacity; entries
+// refreshed after ranking are skipped by the freshness fence.
 func (r *Runner) pruneJobCache(ctx context.Context) {
-	store := &cache.Store{Root: r.cacheRootDir(), Retention: r.cacheRetentionPolicy()}
-	res, err := store.Prune(ctx)
+	res, err := r.cacheManager().Prune(ctx)
 	if err != nil {
 		reportf("kiwi runner %s: cache retention: %v\n", r.ID, err)
 		return
@@ -156,6 +169,7 @@ func (r *Runner) newJobCache(t server.Task, metrics *Metrics) *cache.Store {
 	store := cache.Default()
 	store.Root = r.cacheRootDir()
 	store.Retention = r.cacheRetentionPolicy()
+	store.Manager = r.cacheManager()
 	store.MaxCacheBytes = r.Cfg.CacheArchiveMaxBytes
 	store.RemoteURL = r.Cfg.Server
 	store.Token = r.Cfg.Token

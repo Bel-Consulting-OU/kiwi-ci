@@ -55,8 +55,15 @@ type Store struct {
 	MaxCacheBytes int64
 	// Retention bounds the whole local cache tree (see RetentionPolicy).
 	// Set it before concurrent use; Prune serializes passes internally.
+	// When Manager is set, the manager owns the aggregate policy AND the
+	// cross-job serialization instead (the store's own fields are then only
+	// advisory).
 	Retention RetentionPolicy
 	pruneMu   sync.Mutex
+	// Manager, when non-nil, is the runner-wide aggregate cache budget owner:
+	// saves and remote restores reserve capacity through it before writing
+	// bytes, and Prune delegates to its shared lock.
+	Manager *Manager
 }
 
 func Default() *Store {
@@ -682,6 +689,21 @@ func (s *Store) SaveContext(ctx context.Context, key, workspace string, paths []
 	if err := os.MkdirAll(s.Root, 0o755); err != nil {
 		return err
 	}
+	// Aggregate admission first: the manager evicts cold entries until the
+	// worst-case archive fits, so the published tree can never exceed the
+	// runner-wide budget even when every job uses its own Store. The charge
+	// is released only after the archive is published (or the save failed),
+	// and retained bytes are measured from the directory itself, so a failed
+	// cleanup keeps occupying the budget.
+	var reservation *Reservation
+	if s.Manager != nil {
+		res, rerr := s.Manager.Reserve(ctx, bound)
+		if rerr != nil {
+			return rerr
+		}
+		reservation = res
+		defer reservation.Release()
+	}
 	if err := safefs.FitsAvailable(s.Root, bound); err != nil {
 		return err
 	}
@@ -721,24 +743,44 @@ func (s *Store) SaveContext(ctx context.Context, key, workspace string, paths []
 		}
 		return closeErr
 	}
-	if err := renameCacheFile(tmp, dst); err != nil {
+	// The rename and every step that makes the entry durable happen under
+	// the manager lock (when configured): the entry becomes visible and
+	// retained before any concurrent reservation can evict it, and the
+	// worst-case reservation is retired at the same instant instead of
+	// double-counting against it.
+	publish := func() error {
+		if err := renameCacheFile(tmp, dst); err != nil {
+			return err
+		}
+		if err := fsutil.SyncDir(s.Root); err != nil {
+			_ = os.Remove(dst)
+			return fmt.Errorf("cache save: sync archive directory: %w", err)
+		}
+		if err := s.writeStoredDigest(key, hex.EncodeToString(h.Sum(nil))); err != nil {
+			_ = os.Remove(dst)
+			return err
+		}
+		return nil
+	}
+	var publishErr error
+	if s.Manager != nil {
+		publishErr = s.Manager.Publish(reservation, publish)
+	} else {
+		publishErr = publish()
+	}
+	if publishErr != nil {
 		_ = os.Remove(tmp)
-		return err
-	}
-	if err := fsutil.SyncDir(s.Root); err != nil {
-		_ = os.Remove(dst)
-		return fmt.Errorf("cache save: sync archive directory: %w", err)
-	}
-	if err := s.writeStoredDigest(key, hex.EncodeToString(h.Sum(nil))); err != nil {
-		_ = os.Remove(dst)
-		return err
+		return publishErr
 	}
 	// Enforce the aggregate retention policy after every committed save: the
 	// local tree must not wait for the periodic maintenance pass to notice
 	// that the caps are exceeded. Pruning is best-effort (a removal failure
-	// stays accounted for the next pass) and never fails the save.
-	if s.Retention.Active() {
-		_, _ = s.Prune(context.Background())
+	// stays accounted for the next pass) and never fails the save. It runs
+	// under the JOB context, never a fresh Background one: if the deadline
+	// already ended, the dedicated maintenance pass finishes retention later
+	// instead of holding the runner slot.
+	if s.Manager == nil && s.Retention.Active() {
+		_, _ = s.Prune(ctx)
 	}
 	if s.RemoteURL != "" {
 		if err := s.pushRemoteContext(ctx, key); err != nil {
@@ -811,7 +853,25 @@ func (s *Store) fetchRemoteContext(ctx context.Context, key string) error {
 	// here defends callers that talk to the legacy route directly. An absent
 	// header is not an integrity claim for this "decode key, then authorize
 	// payload" endpoint.)
+	// Aggregate admission BEFORE the download writes bytes: the manager
+	// evicts cold entries until the worst case fits, which is exactly what
+	// keeps a sequence of remote restores (up to 16 per job) from blowing
+	// past the runner cache budget between maintenance passes. The exact
+	// Content-Length is used when the endpoint advertises it.
 	bound := s.maxStoredBytes()
+	var reservation *Reservation
+	if s.Manager != nil {
+		expected := bound
+		if resp.ContentLength > 0 {
+			expected = resp.ContentLength
+		}
+		res, rerr := s.Manager.Reserve(ctx, expected)
+		if rerr != nil {
+			return rerr
+		}
+		reservation = res
+		defer reservation.Release()
+	}
 	f, err := os.CreateTemp(s.Root, "."+key+".remote-*.tmp")
 	if err != nil {
 		return err
@@ -841,17 +901,32 @@ func (s *Store) fetchRemoteContext(ctx context.Context, key string) error {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("cache download digest mismatch: got %s, want %s", digest, want)
 	}
-	if err := renameCacheFile(tmp, s.archivePath(key)); err != nil {
+	// Publish under the manager lock (when configured) so the fetched entry
+	// is visible/retained before any concurrent reservation can evict it and
+	// so the worst-case reservation is retired atomically with publication.
+	publish := func() error {
+		if err := renameCacheFile(tmp, s.archivePath(key)); err != nil {
+			return err
+		}
+		if err := fsutil.SyncDir(s.Root); err != nil {
+			_ = os.Remove(s.archivePath(key))
+			return fmt.Errorf("cache download: sync archive directory: %w", err)
+		}
+		if err := s.writeStoredDigest(key, digest); err != nil {
+			_ = os.Remove(s.archivePath(key))
+			return err
+		}
+		return nil
+	}
+	var publishErr error
+	if s.Manager != nil {
+		publishErr = s.Manager.Publish(reservation, publish)
+	} else {
+		publishErr = publish()
+	}
+	if publishErr != nil {
 		_ = os.Remove(tmp)
-		return err
-	}
-	if err := fsutil.SyncDir(s.Root); err != nil {
-		_ = os.Remove(s.archivePath(key))
-		return fmt.Errorf("cache download: sync archive directory: %w", err)
-	}
-	if err := s.writeStoredDigest(key, digest); err != nil {
-		_ = os.Remove(s.archivePath(key))
-		return err
+		return publishErr
 	}
 	return nil
 }

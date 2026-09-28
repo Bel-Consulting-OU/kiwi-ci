@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secretbroker"
 )
 
@@ -249,5 +250,35 @@ func TestInvalidEphemeralKeyReleasesClaim(t *testing.T) {
 				t.Fatalf("delivery burned by invalid keys: %d %s", w.Code, w.Body.String())
 			}
 		})
+	}
+}
+
+// TestSecretScopeUsesCanonicalRepositoryID pins the authorization identity:
+// the broker scope's Repository is the canonical policy repository id (the
+// same identity policy/quota/cache decisions use), never the clone URL; a
+// fork PR's checkout coordinate is carried separately.
+func TestSecretScopeUsesCanonicalRepositoryID(t *testing.T) {
+	j := model.Job{
+		PolicyRepoID: "canonical-1",
+		RepoURL:      "https://github.com/fork/app.git",
+		RepoFullName: "fork/app",
+		Environment:  "prod",
+		Trusted:      true,
+	}
+	scope := secretScopeForJob(j)
+	if scope.Repository != "canonical-1" {
+		t.Fatalf("scope repository = %q, want the canonical policy id", scope.Repository)
+	}
+	if scope.CheckoutRepositoryURL != j.RepoURL {
+		t.Fatalf("checkout URL = %q, want %q", scope.CheckoutRepositoryURL, j.RepoURL)
+	}
+	if scope.Environment != "prod" || !scope.Trusted {
+		t.Fatalf("scope = %+v", scope)
+	}
+	// Without PolicyRepoID the derivation still prefers the normalized
+	// RepoID over the URL.
+	j2 := model.Job{RepoID: "id-2", RepoURL: "https://github.com/acme/app.git", RepoFullName: "acme/app"}
+	if got := secretScopeForJob(j2).Repository; got != "id-2" {
+		t.Fatalf("derived repository = %q, want id-2", got)
 	}
 }

@@ -101,16 +101,33 @@ func (s *Server) pruneCacheManifests(ctx context.Context, now time.Time) {
 }
 
 // fsCacheManifest is one fs-mode manifest file with the fields retention
-// needs. Repository/size/created come from the signed payload (parsed
+// needs. Repository/trust/size/created come from the signed payload (parsed
 // without verification: retention only ever deletes a manifest, and deleting
 // a tampered manifest cannot expose content that the CAS collector would
 // keep only because of it).
 type fsCacheManifest struct {
 	path      string
 	repo      string
+	trust     string
 	size      int64
+	digest    string
 	createdAt time.Time
 }
+
+// fsCacheQuotaKey is the fs-mode retention namespace: repository PLUS trust
+// domain, mirroring the SQL partition. Untrusted (fork/PR) manifests share
+// the base repository but must never evict the protected repository's
+// trusted entries.
+type fsCacheQuotaKey struct {
+	Repo  string
+	Trust string
+}
+
+// cachePruneBeforeRemove, when set (tests only), runs after a manifest has
+// been ranked and before the freshness fence re-reads it. It lets a test
+// deterministically replace the file to prove a stale ranking never deletes
+// a refreshed manifest.
+var cachePruneBeforeRemove func(path string)
 
 // pruneCacheManifestFiles applies the same per-repo policy to the fs-mode
 // manifest envelopes under <dataDir>/cache.
@@ -123,7 +140,7 @@ func (s *Server) pruneCacheManifestFiles(ctx context.Context, policy storage.Cac
 	if err != nil {
 		return res, fmt.Errorf("scan cache manifests: %w", err)
 	}
-	byRepo := map[string][]fsCacheManifest{}
+	byNamespace := map[fsCacheQuotaKey][]fsCacheManifest{}
 	for _, path := range matches {
 		if err := ctx.Err(); err != nil {
 			return res, err
@@ -140,13 +157,14 @@ func (s *Server) pruneCacheManifestFiles(ctx context.Context, policy storage.Cac
 				created = fi.ModTime()
 			}
 		}
-		byRepo[man.Repository] = append(byRepo[man.Repository], fsCacheManifest{path: path, repo: man.Repository, size: man.BlobSize, createdAt: created})
+		key := fsCacheQuotaKey{Repo: man.Repository, Trust: man.TrustDomain}
+		byNamespace[key] = append(byNamespace[key], fsCacheManifest{path: path, repo: man.Repository, trust: man.TrustDomain, size: man.BlobSize, digest: man.BlobSHA256, createdAt: created})
 	}
 	cutoff := time.Time{}
 	if policy.OlderThan > 0 {
 		cutoff = now.UTC().Add(-policy.OlderThan)
 	}
-	for _, recs := range byRepo {
+	for _, recs := range byNamespace {
 		sort.Slice(recs, func(i, j int) bool {
 			if !recs[i].createdAt.Equal(recs[j].createdAt) {
 				return recs[i].createdAt.After(recs[j].createdAt)
@@ -167,6 +185,32 @@ func (s *Server) pruneCacheManifestFiles(ctx context.Context, policy storage.Cac
 				drop = true
 			}
 			if !drop {
+				continue
+			}
+			if cachePruneBeforeRemove != nil {
+				cachePruneBeforeRemove(rec.path)
+			}
+			// Freshness fence: re-read immediately before removing and only
+			// delete the exact version that was ranked. An upload that
+			// atomically replaced the manifest between ranking and here
+			// changes the digest/created stamp, so the refreshed entry is
+			// left for the next pass instead of being deleted on stale
+			// information.
+			cur, cerr := cacheManifestFields(rec.path)
+			if cerr != nil {
+				continue
+			}
+			// Compare the SAME effective timestamp the ranking used: a
+			// manifest without a CreatedAt stamp ranked by its file mtime,
+			// so the fence must apply the identical fallback or it could
+			// never delete such an entry.
+			curCreated := cur.CreatedAt
+			if curCreated.IsZero() {
+				if fi, serr := os.Stat(rec.path); serr == nil {
+					curCreated = fi.ModTime()
+				}
+			}
+			if cur.BlobSHA256 != rec.digest || cur.BlobSize != rec.size || !curCreated.Equal(rec.createdAt) {
 				continue
 			}
 			if rerr := os.Remove(rec.path); rerr != nil && !os.IsNotExist(rerr) {

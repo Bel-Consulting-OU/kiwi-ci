@@ -1079,8 +1079,12 @@ func (e *Executor) saveArtifact(cj pipeline.CompiledJob, a pipeline.Artifact, wo
 	p, err := e.Opt.Artifacts.SaveContext(ctx, e.Opt.RunID, cj.ID, a.Name, workspace, a.Paths, limit)
 	if err != nil {
 		if finalize != nil {
-			// No archive exists; release the charge without a path.
-			if ferr := finalize(""); ferr != nil {
+			// p is non-empty whenever an archive was renamed into place
+			// before the failure (a post-rename fsync/manifest error), so
+			// the finalizer can charge cleanup debt for bytes that really
+			// exist; an empty path means publication never happened and the
+			// charge is simply released.
+			if ferr := finalize(p); ferr != nil {
 				e.log(cj.ID, "artifact", "cleanup warning: "+ferr.Error())
 			}
 		}
