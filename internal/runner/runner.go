@@ -462,15 +462,13 @@ func (r *Runner) runMetricsServer(ctx context.Context) {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
-	// Shutdown closes the listener first, so ListenAndServe returns promptly;
-	// the short select is a belt-and-braces bound, never an indefinite wait.
-	select {
-	case err := <-errCh:
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			fmt.Fprintf(os.Stderr, "kiwi runner metrics: %v\n", err)
-		}
-	case <-time.After(time.Second):
-		fmt.Fprintf(os.Stderr, "kiwi runner metrics: shutdown did not complete in time\n")
+	// Shutdown closes the listener before it waits for connections, so
+	// ListenAndServe is already returning; waiting for it here (rather than
+	// with a short timeout) is what guarantees the listen port is released
+	// before Run returns — a fallback that returned early could leave the
+	// listener bound under load and break an in-process restart.
+	if err := <-errCh; err != nil && !errors.Is(err, http.ErrServerClosed) {
+		fmt.Fprintf(os.Stderr, "kiwi runner metrics: %v\n", err)
 	}
 }
 func (r *Runner) register(ctx context.Context) error {
