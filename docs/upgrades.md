@@ -366,6 +366,21 @@ claims themselves.
   artifacts. Success-only cache publication is skipped as soon as the job
   context ends, so a dead deadline can no longer spend minutes compressing
   an archive that is then discarded.
+- Runner-local caches now have an aggregate retention policy (default
+  32 GiB / 4096 entries / 14 days; `--cache-max-bytes`,
+  `--cache-max-entries`, `--cache-max-age`): entries are evicted
+  least-recently-used first after every save and on a 10-minute maintenance
+  pass, and the download preflight uses the resolved 8 GiB per-archive bound
+  instead of a raw zero that disabled it. A pipeline rotating its logical
+  cache key can no longer fill the runner disk.
+- Durable shared-cache manifests now have control-plane retention
+  (`cache_manifest_retention`, default 30 days;
+  `max_cache_manifests_per_repo`, default 4096;
+  `max_cache_manifest_bytes_per_repo`, default 64 GiB): manifests are
+  pruned per repository oldest-first, after which the CAS collector reclaims
+  their blobs unless another reference remains. Cache key hashing and cache
+  restore now observe the declared job lifetime end to end, and cache
+  definitions are capped per job (64 absolute, 16 for untrusted runs).
 - Pre-checkout hard-quota gating for untrusted jobs is fail-closed for
   legacy/malformed tasks and does NOT trust the unverified compiled
   payload: the runtime always comes from the persisted pipeline (parse +

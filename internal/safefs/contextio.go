@@ -12,6 +12,36 @@ import (
 // errors.Is(err, context.Canceled/DeadlineExceeded) also holds.
 var ErrWriterStopped = errors.New("safefs: writer stopped by context")
 
+// ErrReaderStopped reports a read refused because the reader's context
+// ended, mirroring ErrWriterStopped for the consuming side.
+var ErrReaderStopped = errors.New("safefs: reader stopped by context")
+
+// ContextReader wraps r so every Read first observes ctx: once the context
+// is done, reads fail immediately with ctx.Err() (wrapped with
+// ErrReaderStopped) instead of continuing a long hash/extract pass the
+// caller already abandoned. It is the reader-side counterpart of
+// ContextWriter; archive verification and extraction stream through it.
+type ContextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+// NewContextReader returns r wrapped with a context check. A nil ctx or nil
+// r leaves r unwrapped (nil r is the caller's problem, as usual).
+func NewContextReader(ctx context.Context, r io.Reader) io.Reader {
+	if ctx == nil || r == nil {
+		return r
+	}
+	return &ContextReader{ctx: ctx, r: r}
+}
+
+func (c *ContextReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, errors.Join(ErrReaderStopped, err)
+	}
+	return c.r.Read(p)
+}
+
 // ContextWriter wraps w so every Write first observes ctx: once the context
 // is done, writes fail immediately with ctx.Err() (wrapped with
 // ErrWriterStopped) instead of continuing a long archive traversal or

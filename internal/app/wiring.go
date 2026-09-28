@@ -95,6 +95,23 @@ func applyQuotaConfig(srv *server.Server, cfg *config.Config) {
 			srv.RunRetention = d
 		}
 	}
+	// Durable cache-manifest retention: empty keeps the server's built-in
+	// default, "0" explicitly disables age pruning (translated to the
+	// negative sentinel), and -1 disables the per-repo caps.
+	if raw := strings.TrimSpace(cfg.Server.CacheManifestRetention); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil {
+			if d <= 0 {
+				d = -1
+			}
+			srv.CacheManifestRetention = d
+		}
+	}
+	if cfg.Server.MaxCacheManifestsPerRepo != 0 {
+		srv.MaxCacheManifestsPerRepo = cfg.Server.MaxCacheManifestsPerRepo
+	}
+	if cfg.Server.MaxCacheManifestBytesPerRepo != 0 {
+		srv.MaxCacheManifestBytesPerRepo = cfg.Server.MaxCacheManifestBytesPerRepo
+	}
 }
 
 // buildSecretBroker constructs the secret broker chain from the

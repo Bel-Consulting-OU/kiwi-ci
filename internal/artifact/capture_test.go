@@ -136,3 +136,29 @@ func TestRemoveCapturedRemovesArchiveAndManifest(t *testing.T) {
 		t.Fatal("sanity: save returned an empty path")
 	}
 }
+
+// TestSaveContextManifestFailureRemovesArchive pins the no-unaccounted-bytes
+// rule: when the sidecar manifest cannot be written after the archive was
+// renamed into place, the archive is removed before SaveContext returns an
+// error, so a capture caller that never receives a path cannot leak an
+// unaccounted archive.
+func TestSaveContextManifestFailureRemovesArchive(t *testing.T) {
+	ws := t.TempDir()
+	writeWorkspaceFile(t, ws, "out.txt", 64)
+	root := t.TempDir()
+	store := &Store{Root: root}
+	dir := filepath.Join(root, encodeArtifactName("run"), encodeArtifactName("job"))
+	manifest := filepath.Join(dir, encodeArtifactName("art")+".tar.gz.manifest.json")
+	if err := os.MkdirAll(manifest, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(manifest, "x"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SaveContext(context.Background(), "run", "job", "art", ws, []string{"out.txt"}, 1<<20); err == nil {
+		t.Fatal("SaveContext succeeded with an unwritable manifest path")
+	}
+	if _, err := os.Stat(filepath.Join(dir, encodeArtifactName("art")+".tar.gz")); !os.IsNotExist(err) {
+		t.Fatalf("archive left behind after manifest failure (err=%v)", err)
+	}
+}

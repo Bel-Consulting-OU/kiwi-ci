@@ -53,6 +53,10 @@ type Store struct {
 	Token         string
 	Client        *http.Client
 	MaxCacheBytes int64
+	// Retention bounds the whole local cache tree (see RetentionPolicy).
+	// Set it before concurrent use; Prune serializes passes internally.
+	Retention RetentionPolicy
+	pruneMu   sync.Mutex
 }
 
 func Default() *Store {
@@ -78,6 +82,14 @@ var ErrTransferStalled = errors.New("cache: transfer stalled")
 // storeStallGuardHook, when set (tests only), observes watchdog arm and stop
 // events so a test can prove every armed timer is stopped.
 var storeStallGuardHook func(armed bool)
+
+// Test-only seams over otherwise unreachable OS branches. Production
+// behavior is unchanged: removeCacheFile is os.Remove (retention eviction),
+// extractCacheArchive is safefs.Extract (local restore extraction).
+var (
+	removeCacheFile     = os.Remove
+	extractCacheArchive = safefs.Extract
+)
 
 // Bounded transport phases for cache HTTP traffic. These bound each control
 // phase of an exchange without imposing a total transfer deadline: bulk
@@ -303,6 +315,19 @@ func (b *stallGuardedBody) Close() error {
 // swapped for a symlink fails the key computation instead of hashing
 // content outside the workspace.
 func (s *Store) Key(base string, workspace string, hashFiles []string) (string, error) {
+	return s.KeyContext(context.Background(), base, workspace, hashFiles)
+}
+
+// KeyContext computes the cache key like Key while observing ctx: hashing is
+// the first thing a cache restore does, before any steps run, so a job
+// deadline must be able to stop a huge hash_files input instead of letting
+// the task goroutine hash gigabytes past its own lifetime. The context is
+// checked at entry, between glob patterns and between matched files, and the
+// reader handed to the digest copy is context-aware.
+func (s *Store) KeyContext(ctx context.Context, base string, workspace string, hashFiles []string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	h := sha256.New()
 	io.WriteString(h, base)
 	io.WriteString(h, "\x00")
@@ -313,18 +338,24 @@ func (s *Store) Key(base string, workspace string, hashFiles []string) (string, 
 	defer root.Close()
 	var files []string
 	for _, p := range hashFiles {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		matches, _ := filepath.Glob(filepath.Join(root.Canonical, p))
 		files = append(files, matches...)
 	}
 	sort.Strings(files)
 	for _, f := range files {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		rel, _ := filepath.Rel(root.Canonical, f)
 		fh, err := root.OpenRel(filepath.ToSlash(rel))
 		if err != nil {
 			return "", err
 		}
 		io.WriteString(h, rel)
-		_, cpErr := copyCacheDigest(h, fh)
+		_, cpErr := copyCacheDigest(h, safefs.NewContextReader(ctx, fh))
 		fh.Close()
 		if cpErr != nil {
 			return "", cpErr
@@ -362,8 +393,9 @@ func (s *Store) RestoreContext(ctx context.Context, key, workspace string, paths
 	if !validKey(key) {
 		return false, fmt.Errorf("cache: invalid cache key")
 	}
-	hit, err := s.restoreLocal(key, workspace, paths)
+	hit, err := s.restoreLocal(ctx, key, workspace, paths)
 	if hit {
+		s.touchLocal(key)
 		return true, nil
 	}
 	if err != nil && !errors.Is(err, errLocalUnverified) {
@@ -380,7 +412,7 @@ func (s *Store) RestoreContext(ctx context.Context, key, workspace string, paths
 		}
 		return false, ferr
 	}
-	return s.restoreLocal(key, workspace, paths)
+	return s.restoreLocal(ctx, key, workspace, paths)
 }
 
 var errRemoteNotFound = fmt.Errorf("cache entry not found on remote")
@@ -468,7 +500,20 @@ func (s *Store) maxStoredBytes() int64 {
 	return defaultCacheArchiveBytes
 }
 
-func (s *Store) restoreLocal(key, workspace string, paths []string) (bool, error) {
+// MaxStoredBytes exposes the resolved ONE logical archive bound (configured
+// MaxCacheBytes, else the shared 8 GiB default) so every consumer drives the
+// same number: the local archive cap, the restore verification, the remote
+// push cap and the runner's transfer preflight. Branching on the raw
+// MaxCacheBytes field is what previously made an unconfigured runner
+// preflight against ZERO bytes while its transfers were capped at 8 GiB.
+func (s *Store) MaxStoredBytes() int64 {
+	return s.maxStoredBytes()
+}
+
+func (s *Store) restoreLocal(ctx context.Context, key, workspace string, paths []string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	roots, err := cleanRoots(paths)
 	if err != nil {
 		return false, err
@@ -505,9 +550,14 @@ func (s *Store) restoreLocal(key, workspace string, paths []string) (bool, error
 		return false, err
 	}
 	defer f.Close()
+	// Verification reads through the context reader: a multi-gigabyte local
+	// archive must not keep hashing after the job deadline.
 	h := sha256.New()
-	n, err := copyCacheDigest(h, io.LimitReader(f, bound+1))
+	n, err := copyCacheDigest(h, safefs.NewContextReader(ctx, io.LimitReader(f, bound+1)))
 	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return false, cerr
+		}
 		return false, fmt.Errorf("cache restore: hash archive: %w", err)
 	}
 	if n > bound {
@@ -515,6 +565,9 @@ func (s *Store) restoreLocal(key, workspace string, paths []string) (bool, error
 	}
 	if got := hex.EncodeToString(h.Sum(nil)); got != want {
 		return false, fmt.Errorf("cache restore: archive digest %s does not match stored digest %s", got, want)
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
 	}
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return false, fmt.Errorf("cache restore: rewind archive: %w", err)
@@ -534,7 +587,13 @@ func (s *Store) restoreLocal(key, workspace string, paths []string) (bool, error
 		limits.Allowed = roots
 	}
 	limits.MaxArchiveBytes = bound
-	if _, err := safefs.Extract(root, f, limits); err != nil {
+	// Extraction streams through the context reader too: a large archive
+	// stops being unpacked when the job context ends instead of finishing
+	// its filesystem walk under a dead deadline.
+	if _, err := extractCacheArchive(root, safefs.NewContextReader(ctx, f), limits); err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return false, cerr
+		}
 		return false, fmt.Errorf("cache restore: %w", err)
 	}
 	return true, nil
@@ -673,6 +732,13 @@ func (s *Store) SaveContext(ctx context.Context, key, workspace string, paths []
 	if err := s.writeStoredDigest(key, hex.EncodeToString(h.Sum(nil))); err != nil {
 		_ = os.Remove(dst)
 		return err
+	}
+	// Enforce the aggregate retention policy after every committed save: the
+	// local tree must not wait for the periodic maintenance pass to notice
+	// that the caps are exceeded. Pruning is best-effort (a removal failure
+	// stays accounted for the next pass) and never fails the save.
+	if s.Retention.Active() {
+		_, _ = s.Prune(context.Background())
 	}
 	if s.RemoteURL != "" {
 		if err := s.pushRemoteContext(ctx, key); err != nil {

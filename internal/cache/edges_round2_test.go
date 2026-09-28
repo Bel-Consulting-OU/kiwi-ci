@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -49,7 +50,7 @@ func TestRestoreLocalArchiveShapeAndBound(t *testing.T) {
 	if err := os.Symlink(filepath.Join(s.Root, "elsewhere"), archive); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.restoreLocal(key, ws, []string{"f"}); err == nil || !strings.Contains(err.Error(), "symlink") {
+	if _, err := s.restoreLocal(context.Background(), key, ws, []string{"f"}); err == nil || !strings.Contains(err.Error(), "symlink") {
 		t.Fatalf("symlink archive = %v", err)
 	}
 
@@ -57,7 +58,7 @@ func TestRestoreLocalArchiveShapeAndBound(t *testing.T) {
 	if err := os.Mkdir(archive, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.restoreLocal(key, ws, []string{"f"}); err == nil || !strings.Contains(err.Error(), "regular file") {
+	if _, err := s.restoreLocal(context.Background(), key, ws, []string{"f"}); err == nil || !strings.Contains(err.Error(), "regular file") {
 		t.Fatalf("directory archive = %v", err)
 	}
 
@@ -65,7 +66,7 @@ func TestRestoreLocalArchiveShapeAndBound(t *testing.T) {
 	os.RemoveAll(archive)
 	s2, key2, ws2 := savedCache(t)
 	s2.MaxCacheBytes = 1
-	if _, err := s2.restoreLocal(key2, ws2, []string{"f"}); err == nil || !strings.Contains(err.Error(), "bound") {
+	if _, err := s2.restoreLocal(context.Background(), key2, ws2, []string{"f"}); err == nil || !strings.Contains(err.Error(), "bound") {
 		t.Fatalf("over-bound archive = %v", err)
 	}
 }

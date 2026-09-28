@@ -1246,6 +1246,27 @@ func applyRunnerTLSConfig(srv *server.Server, require bool) {
 	srv.RequireRunnerClientCerts = require
 }
 
+// parsePositiveInt64Flag parses an optional positive int64 flag value: an
+// empty string keeps the caller's default (zero) and anything else must be a
+// positive integer.
+func parsePositiveInt64Flag(name, raw string) (int64, error) {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("%s must be a positive integer, got %q", name, raw)
+	}
+	return n, nil
+}
+
+// parsePositiveIntFlag is parsePositiveInt64Flag for int flags.
+func parsePositiveIntFlag(name, raw string) (int, error) {
+	n, err := parsePositiveInt64Flag(name, raw)
+	return int(n), err
+}
+
 func Runner(ctx context.Context, args []string) error {
 	if len(args) > 0 {
 		switch args[0] {
@@ -1277,6 +1298,9 @@ func Runner(ctx context.Context, args []string) error {
 	stagingMaxBytes := fs.String("staging-max-bytes", "", "runner-wide staging byte budget for concurrent dependency restores (default: one maximum-size artifact, 8 GiB)")
 	setupTimeout := fs.Duration("setup-timeout", 0, "ceiling for the pre-execution setup phase of jobs without a persisted job timeout (default 15m)")
 	finalizeTimeout := fs.Duration("finalize-timeout", 0, "bound for post-job finalization (test-report and snapshot delivery) after the executor returns (default 2m)")
+	cacheMaxBytes := fs.String("cache-max-bytes", "", "runner-local cache tree byte budget (default 32 GiB; entries are evicted least-recently-used first)")
+	cacheMaxEntries := fs.String("cache-max-entries", "", "runner-local cache tree entry budget (default 4096)")
+	cacheMaxAge := fs.Duration("cache-max-age", 0, "runner-local cache entry age budget (default 336h)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1287,6 +1311,14 @@ func Runner(ctx context.Context, args []string) error {
 			return fmt.Errorf("--staging-max-bytes must be a positive integer, got %q", v)
 		}
 		stagingLimit = n
+	}
+	cacheBytes, err := parsePositiveInt64Flag("--cache-max-bytes", *cacheMaxBytes)
+	if err != nil {
+		return err
+	}
+	cacheEntries, err := parsePositiveIntFlag("--cache-max-entries", *cacheMaxEntries)
+	if err != nil {
+		return err
 	}
 	cfg := runner.Config{
 		Server:           strings.TrimRight(*url, "/"),
@@ -1308,6 +1340,9 @@ func Runner(ctx context.Context, args []string) error {
 		StagingMaxBytes:  stagingLimit,
 		SetupTimeout:     *setupTimeout,
 		FinalizeTimeout:  *finalizeTimeout,
+		CacheMaxBytes:    cacheBytes,
+		CacheMaxEntries:  cacheEntries,
+		CacheMaxAge:      *cacheMaxAge,
 	}
 	if *labels != "" {
 		cfg.Labels = strings.Split(*labels, ",")

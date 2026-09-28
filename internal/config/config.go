@@ -48,6 +48,19 @@ type ServerConfig struct {
 	// are pruned first. 0 uses the built-in default (10000); -1 disables the
 	// bound.
 	MaxRetainedRuns int `toml:"max_retained_runs"`
+	// CacheManifestRetention is the durable shared-cache manifest retention
+	// window as a Go duration string (e.g. "720h"). Unset uses the built-in
+	// default of 30 days; "0" disables age-based pruning. After a manifest
+	// is pruned, the CAS collector can reclaim its blob.
+	CacheManifestRetention string `toml:"cache_manifest_retention"`
+	// MaxCacheManifestsPerRepo bounds durable cache manifests per
+	// repository. 0 uses the built-in default (4096); -1 disables the count
+	// bound.
+	MaxCacheManifestsPerRepo int `toml:"max_cache_manifests_per_repo"`
+	// MaxCacheManifestBytesPerRepo bounds the referenced blob bytes per
+	// repository (newest manifests counted first). 0 uses the built-in
+	// default (64 GiB); -1 disables the byte bound.
+	MaxCacheManifestBytesPerRepo int64 `toml:"max_cache_manifest_bytes_per_repo"`
 }
 
 type DatabaseConfig struct {

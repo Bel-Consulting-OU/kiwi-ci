@@ -151,6 +151,11 @@ func (s *Store) SaveContext(ctx context.Context, runID, jobID, name, workspace s
 		CreatedAt: time.Now().UTC(),
 	}
 	if _, err := s.SaveManifest(dst, m); err != nil {
+		// The archive was already renamed into place; with no manifest it can
+		// never be verified, and a capture caller never receives its path to
+		// clean up. Remove it here so a manifest failure can never leave an
+		// unaccounted archive behind.
+		_ = os.Remove(dst)
 		return "", err
 	}
 	return dst, nil

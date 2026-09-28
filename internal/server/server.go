@@ -495,6 +495,19 @@ type Server struct {
 	RunRetention    time.Duration
 	MaxRetainedRuns int
 
+	// CacheManifestRetention bounds durable shared-cache manifests: DB-mode
+	// cache_manifests rows and fs-mode manifest envelopes. Zero selects the
+	// built-in default (30 days); a negative value disables age pruning.
+	// MaxCacheManifestsPerRepo and MaxCacheManifestBytesPerRepo bound each
+	// repository's manifest count and referenced blob bytes (newest first);
+	// zero selects the built-in defaults (4096 / 64 GiB), negative disables
+	// that dimension. Retention exists so rotated logical keys cannot pin
+	// shared CAS storage forever; after a manifest is gone the CAS collector
+	// reclaims its blob once no other reference names it. Guarded by s.mu.
+	CacheManifestRetention       time.Duration
+	MaxCacheManifestsPerRepo     int
+	MaxCacheManifestBytesPerRepo int64
+
 	// opaPolicy is the compiled OPA deny gate (nil when no rules are
 	// configured); opaBroken is set when a configured gate failed to
 	// compile, which fails every admission closed.
@@ -1595,6 +1608,13 @@ func (s *Server) enqueueID(ctx context.Context, in SubmitRun, preRunID string) (
 	// persisted or queued. Trusted specs are unchecked (they keep the
 	// absolute ceiling enforced by pipeline validation).
 	if err = s.admitUntrustedServiceQuota(spec, in.Trusted); err != nil {
+		return model.Run{}, err
+	}
+	// The untrusted cache-definition ceiling is admitted here for the same
+	// reason: each cache entry is an independent key whose archive can
+	// consume up to 8 GiB of runner disk and whose manifest pins durable CAS
+	// storage, so an unbounded declaration is rejected before signing.
+	if err = s.admitUntrustedCacheQuota(spec, in.Trusted); err != nil {
 		return model.Run{}, err
 	}
 	pipelineDigest, err := pipeline.PipelineDigest(spec)
@@ -6052,6 +6072,7 @@ func (s *Server) pruneLogBatchesForRuns(ids []string) {
 func (s *Server) Maintain(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+	lastCacheManifestPrune := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
@@ -6063,6 +6084,14 @@ func (s *Server) Maintain(ctx context.Context) {
 			// staging bound can never admit new reservations against bytes
 			// that still occupy the directory.
 			s.retryStagingCleanup(ctx)
+			// Durable cache-manifest retention runs on its own cadence: each
+			// pruned manifest releases its CAS reference so the collector can
+			// reclaim the blob, closing the rotate-the-key storage-exhaustion
+			// primitive.
+			if time.Since(lastCacheManifestPrune) >= cacheManifestPruneEvery {
+				lastCacheManifestPrune = time.Now()
+				s.pruneCacheManifests(ctx, tick.UTC())
+			}
 			if s.Sched != nil {
 				s.maintainDB(ctx, tick.UTC())
 				if s.leader {

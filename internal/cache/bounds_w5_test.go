@@ -174,14 +174,14 @@ func TestCacheBoundaryStoreLayer(t *testing.T) {
 		if err := os.WriteFile(s.archivePath(key), testPayload(t, tc.size), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := s.restoreLocal(key, t.TempDir(), []string{"."}); !errors.Is(err, errLocalUnverified) {
+		if _, err := s.restoreLocal(context.Background(), key, t.TempDir(), []string{"."}); !errors.Is(err, errLocalUnverified) {
 			t.Fatalf("%s local archive = %v, want it past the size gate (errLocalUnverified)", tc.name, err)
 		}
 	}
 	if err := os.WriteFile(s.archivePath(strings.Repeat("c", 64)), testPayload(t, archiveSeamLogicalHi), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.restoreLocal(strings.Repeat("c", 64), t.TempDir(), []string{"."}); err == nil || !strings.Contains(err.Error(), "exceeds") {
+	if _, err := s.restoreLocal(context.Background(), strings.Repeat("c", 64), t.TempDir(), []string{"."}); err == nil || !strings.Contains(err.Error(), "exceeds") {
 		t.Fatalf("seam+1 local archive = %v, want the size-gate rejection", err)
 	}
 

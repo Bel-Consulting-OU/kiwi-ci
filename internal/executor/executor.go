@@ -163,10 +163,14 @@ type ArtifactCapture struct {
 	// maximum). <=0 means no global cap.
 	MaxBytes int64
 	// Reserve charges n bytes of aggregate staging capacity before an
-	// archive is created and returns the release callback, which the
-	// executor calls after the archive has been removed. Nil fails capture
-	// closed (an unaccounted archive must never be created).
-	Reserve func(ctx context.Context, n int64) (func(), error)
+	// archive is created and returns the finalize callback. The executor
+	// invokes finalize(path) exactly once after delivery (or finalize("")
+	// when no archive was produced); finalize MUST delete the archive (and
+	// its manifest) and release the charge only once the bytes are
+	// physically gone, converting a removal failure into retryable cleanup
+	// debt instead of silently freeing accounting. Nil fails capture closed
+	// (an unaccounted archive must never be created).
+	Reserve func(ctx context.Context, n int64) (func(path string) error, error)
 }
 
 type Executor struct {
@@ -433,16 +437,25 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	jobEnv["KIWI"] = "true"
 	jobEnv["KIWI_RUN_ID"] = e.Opt.RunID
 	jobEnv["KIWI_JOB_ID"] = cj.ID
+	// Cache-definition ceiling (defense in depth): an untrusted job can
+	// reach the executor through paths that skipped enqueue admission
+	// (generated fragments), and every entry is an independent archive/key,
+	// so the trust-dependent bound is enforced here before any restore.
+	if err := pipeline.ValidateCacheCount(cj.ID, cj.Job.Cache, e.Opt.Untrusted); err != nil {
+		res.Status = model.StatusFailure
+		res.Error = err.Error()
+		return finish(res)
+	}
 	for _, c := range cj.Job.Cache {
 		bases := append([]string{c.Key}, c.RestoreKeys...)
 		restored := false
 		for i, base := range bases {
-			key, er := e.Opt.Cache.Key(e.cacheBase(base)+"|"+runtime.GOOS+"|"+runtime.GOARCH+"|"+cj.Job.Runtime, workspace, c.HashFiles)
+			key, er := e.Opt.Cache.KeyContext(ctx, e.cacheBase(base)+"|"+runtime.GOOS+"|"+runtime.GOARCH+"|"+cj.Job.Runtime, workspace, c.HashFiles)
 			if er != nil {
 				e.log(cj.ID, "cache", "key warning: "+er.Error())
 				break
 			}
-			hit, er := e.Opt.Cache.Restore(key, workspace, c.Paths)
+			hit, er := e.Opt.Cache.RestoreContext(ctx, key, workspace, c.Paths)
 			if er != nil {
 				e.log(cj.ID, "cache", "restore warning: "+er.Error())
 				break
@@ -872,7 +885,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	}
 	if currentStatus == model.StatusSuccess {
 		for _, c := range cj.Job.Cache {
-			key, er := e.Opt.Cache.Key(e.cacheBase(c.Key)+"|"+runtime.GOOS+"|"+runtime.GOARCH+"|"+cj.Job.Runtime, workspace, c.HashFiles)
+			key, er := e.Opt.Cache.KeyContext(ctx, e.cacheBase(c.Key)+"|"+runtime.GOOS+"|"+runtime.GOARCH+"|"+cj.Job.Runtime, workspace, c.HashFiles)
 			if er == nil {
 				// SaveContext, never Save: the legacy wrapper uses a
 				// timeout-free background context, so a big archive would
@@ -1031,7 +1044,7 @@ func (e *Executor) saveArtifact(cj pipeline.CompiledJob, a pipeline.Artifact, wo
 		limit = e.Opt.Artifacts.MaxArtifactBytes
 	}
 	capture := e.Opt.ArtifactCapture
-	var release func()
+	var finalize func(string) error
 	if capture != nil {
 		ctx = capture.Context
 		if ctx == nil || ctx.Err() != nil {
@@ -1056,26 +1069,33 @@ func (e *Executor) saveArtifact(cj pipeline.CompiledJob, a pipeline.Artifact, wo
 			e.log(cj.ID, "artifact", "capture failed: artifact staging is not configured")
 			return
 		}
-		rel, rerr := capture.Reserve(ctx, limit)
+		fin, rerr := capture.Reserve(ctx, limit)
 		if rerr != nil {
 			e.log(cj.ID, "artifact", "capture failed: "+rerr.Error())
 			return
 		}
-		release = rel
-		defer release()
+		finalize = fin
 	}
 	p, err := e.Opt.Artifacts.SaveContext(ctx, e.Opt.RunID, cj.ID, a.Name, workspace, a.Paths, limit)
 	if err != nil {
+		if finalize != nil {
+			// No archive exists; release the charge without a path.
+			if ferr := finalize(""); ferr != nil {
+				e.log(cj.ID, "artifact", "cleanup warning: "+ferr.Error())
+			}
+		}
 		e.log(cj.ID, "artifact", "save warning: "+err.Error())
 		return
 	}
-	if capture != nil {
+	if finalize != nil {
 		// The archive exists only through capture -> attest -> upload ->
-		// cleanup. Deletion is deferred BEFORE the release (LIFO), so the
-		// staged bytes stay charged until the file is actually gone.
+		// cleanup, and the finalize callback owns BOTH the physical deletion
+		// and the staging release: a failed removal stays charged as cleanup
+		// debt instead of freeing accounting for bytes that still occupy
+		// disk.
 		defer func() {
-			if rerr := artifact.RemoveCaptured(p); rerr != nil {
-				e.log(cj.ID, "artifact", "cleanup warning: "+rerr.Error())
+			if ferr := finalize(p); ferr != nil {
+				e.log(cj.ID, "artifact", "cleanup warning: "+ferr.Error())
 			}
 		}()
 	}

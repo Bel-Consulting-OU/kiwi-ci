@@ -3,20 +3,16 @@ package server
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/blob"
-	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cache"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
@@ -478,26 +474,9 @@ func addCASRef(refs map[string]struct{}, ref string) {
 // cacheManifestRef decodes the payload digest out of one fs-mode manifest
 // envelope file.
 func cacheManifestRef(path string) (string, error) {
-	raw, err := os.ReadFile(path)
+	manifest, err := cacheManifestFields(path)
 	if err != nil {
-		return "", fmt.Errorf("read cache manifest %s: %w", path, err)
-	}
-	var envelope struct {
-		Payload string `json:"payload"`
-	}
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return "", fmt.Errorf("decode cache manifest %s: %w", path, err)
-	}
-	if envelope.Payload == "" {
-		return "", fmt.Errorf("cache manifest %s has no signed payload", path)
-	}
-	payload, err := base64.StdEncoding.DecodeString(envelope.Payload)
-	if err != nil {
-		return "", fmt.Errorf("decode cache manifest payload %s: %w", path, err)
-	}
-	var manifest cache.CacheManifest
-	if err := json.Unmarshal(payload, &manifest); err != nil {
-		return "", fmt.Errorf("decode cache manifest statement %s: %w", path, err)
+		return "", err
 	}
 	return manifest.BlobSHA256, nil
 }

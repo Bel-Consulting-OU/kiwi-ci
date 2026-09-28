@@ -102,14 +102,61 @@ func (t *cacheTransport) passthrough(req *http.Request) (*http.Response, error) 
 	return http.DefaultTransport.RoundTrip(req)
 }
 
+// cacheRootDir resolves the directory holding the runner-local cache tree.
+func (r *Runner) cacheRootDir() string {
+	if r.Cfg.CacheRoot != "" {
+		return filepath.Join(r.Cfg.CacheRoot, "cache")
+	}
+	return cache.Default().Root
+}
+
+// cacheRetentionPolicy resolves the aggregate local-cache bound: every
+// dimension falls back to the built-in default so a distributed runner never
+// runs without one.
+func (r *Runner) cacheRetentionPolicy() cache.RetentionPolicy {
+	p := cache.RetentionPolicy{MaxBytes: r.Cfg.CacheMaxBytes, MaxEntries: r.Cfg.CacheMaxEntries, MaxAge: r.Cfg.CacheMaxAge}
+	if p.MaxBytes <= 0 {
+		p.MaxBytes = defaultCacheMaxBytes
+	}
+	if p.MaxEntries <= 0 {
+		p.MaxEntries = defaultCacheMaxEntries
+	}
+	if p.MaxAge <= 0 {
+		p.MaxAge = defaultCacheMaxAge
+	}
+	return p
+}
+
+// pruneJobCache runs one retention pass over the runner-local cache tree and
+// reports what it reclaimed. Removal failures stay in the tree (and in the
+// next pass's accounting) instead of silently freeing capacity.
+func (r *Runner) pruneJobCache(ctx context.Context) {
+	store := &cache.Store{Root: r.cacheRootDir(), Retention: r.cacheRetentionPolicy()}
+	res, err := store.Prune(ctx)
+	if err != nil {
+		reportf("kiwi runner %s: cache retention: %v\n", r.ID, err)
+		return
+	}
+	if res.Entries > 0 || res.Bytes > 0 {
+		r.Metrics.Counter("kiwi_runner_cache_evicted_entries_total", float64(res.Entries))
+		r.Metrics.Counter("kiwi_runner_cache_evicted_bytes_total", float64(res.Bytes))
+		reportf("kiwi runner %s: cache retention evicted %d entries (%d bytes)\n", r.ID, res.Entries, res.Bytes)
+	}
+	if res.Failed > 0 {
+		reportf("kiwi runner %s: cache retention could not remove %d entries; they stay accounted and are retried next pass\n", r.ID, res.Failed)
+	}
+}
+
 // newJobCache builds the executor's cache store for one job: local
 // content-addressed storage whose remote fallback targets the job-scoped
-// control-plane cache routes with the runner's lease contract headers.
+// control-plane cache routes with the runner's lease contract headers. The
+// store carries the aggregate retention policy, so every save prunes the
+// tree as soon as a cap is exceeded instead of waiting for maintenance.
 func (r *Runner) newJobCache(t server.Task, metrics *Metrics) *cache.Store {
 	store := cache.Default()
-	if r.Cfg.CacheRoot != "" {
-		store.Root = filepath.Join(r.Cfg.CacheRoot, "cache")
-	}
+	store.Root = r.cacheRootDir()
+	store.Retention = r.cacheRetentionPolicy()
+	store.MaxCacheBytes = r.Cfg.CacheArchiveMaxBytes
 	store.RemoteURL = r.Cfg.Server
 	store.Token = r.Cfg.Token
 	// Cache traffic is bulk streaming traffic: it runs on the streaming
@@ -151,8 +198,13 @@ func (r *Runner) newJobCache(t server.Task, metrics *Metrics) *cache.Store {
 				cache.HeaderLeaseToken:      t.LeaseToken,
 				cache.HeaderLeaseGeneration: fmt.Sprint(t.LeaseGeneration),
 			},
-			root:    store.Root,
-			maxDisk: store.MaxCacheBytes,
+			root: store.Root,
+			// The preflight must use the RESOLVED bound (configured
+			// MaxCacheBytes, else the shared 8 GiB default): branching on the
+			// raw field disabled the free-space preflight entirely for the
+			// normal unconfigured runner while its transfers stayed capped at
+			// 8 GiB.
+			maxDisk: store.MaxStoredBytes(),
 			metrics: metrics,
 		},
 		CheckRedirect: func(*http.Request, []*http.Request) error {

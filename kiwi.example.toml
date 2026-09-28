@@ -22,6 +22,16 @@ listen = ":8080"
 # Server mode: "dev" (in-memory state, default) or "production".
 # mode = "dev"
 
+# Durable shared-cache manifest retention. Each unique (repo, key) manifest
+# pins its referenced CAS blob, so rotated logical keys must not accumulate
+# forever. Unset uses 30 days; "0" disables age pruning.
+# cache_manifest_retention = "720h"
+# Per-repository bounds; newest manifests are kept. Unset uses 4096 entries
+# and 64 GiB; -1 disables that dimension (one repository can never consume
+# another repository's accounting).
+# max_cache_manifests_per_repo = 4096
+# max_cache_manifest_bytes_per_repo = 68719476736
+
 [database]
 # PostgreSQL connection URL; enables the durable SQL control plane.
 url = "postgres://kiwi:secret@db:5432/kiwi"

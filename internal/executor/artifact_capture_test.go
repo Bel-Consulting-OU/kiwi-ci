@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/artifact"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secrets"
@@ -70,11 +71,21 @@ func TestArtifactCaptureBoundsReservesAndCleansUp(t *testing.T) {
 		ArtifactCapture: &ArtifactCapture{
 			Context:  context.Background(),
 			MaxBytes: 1 << 20,
-			Reserve: func(_ context.Context, n int64) (func(), error) {
+			Reserve: func(_ context.Context, n int64) (func(string) error, error) {
 				mu.Lock()
 				reserved = append(reserved, n)
 				mu.Unlock()
-				return func() { mu.Lock(); released++; mu.Unlock() }, nil
+				return func(path string) error {
+					if path != "" {
+						if err := artifact.RemoveCaptured(path); err != nil {
+							return err
+						}
+					}
+					mu.Lock()
+					released++
+					mu.Unlock()
+					return nil
+				}, nil
 			},
 		},
 		ArtifactReporter: func(_ string, _ string, path string) error {
@@ -136,9 +147,15 @@ func TestArtifactCaptureDeclaredMaxSizeRefused(t *testing.T) {
 		ArtifactCapture: &ArtifactCapture{
 			Context:  context.Background(),
 			MaxBytes: 1 << 20,
-			Reserve: func(_ context.Context, n int64) (func(), error) {
+			Reserve: func(_ context.Context, n int64) (func(string) error, error) {
 				reserved = n
-				return func() { released++ }, nil
+				return func(path string) error {
+					if path != "" {
+						t.Errorf("finalize received a path for a refused archive: %q", path)
+					}
+					released++
+					return nil
+				}, nil
 			},
 		},
 		ArtifactReporter: func(string, string, string) error { reporterCalled = true; return nil },
@@ -183,9 +200,9 @@ func TestArtifactCaptureGlobalCeilingRefused(t *testing.T) {
 		ArtifactCapture: &ArtifactCapture{
 			Context:  context.Background(),
 			MaxBytes: 2048,
-			Reserve: func(_ context.Context, n int64) (func(), error) {
+			Reserve: func(_ context.Context, n int64) (func(string) error, error) {
 				reserved = n
-				return func() {}, nil
+				return func(string) error { return nil }, nil
 			},
 		},
 		ArtifactReporter: func(string, string, string) error { return errors.New("must not be called") },
@@ -223,7 +240,7 @@ func TestArtifactCaptureReserveFailureIsWarning(t *testing.T) {
 		ArtifactCapture: &ArtifactCapture{
 			Context:  context.Background(),
 			MaxBytes: 1 << 20,
-			Reserve:  func(context.Context, int64) (func(), error) { return nil, errors.New("budget exhausted") },
+			Reserve:  func(context.Context, int64) (func(string) error, error) { return nil, errors.New("budget exhausted") },
 		},
 		ArtifactReporter: func(string, string, string) error { return errors.New("must not be called") },
 	}, Masker: &secrets.Masker{}}
@@ -262,7 +279,9 @@ func TestArtifactCaptureCancelledJobUsesBoundedFallback(t *testing.T) {
 		ArtifactCapture: &ArtifactCapture{
 			Context:  jobCtx,
 			MaxBytes: 1 << 20,
-			Reserve:  func(context.Context, int64) (func(), error) { return func() {}, nil },
+			Reserve: func(context.Context, int64) (func(string) error, error) {
+				return func(path string) error { return artifact.RemoveCaptured(path) }, nil
+			},
 		},
 		ArtifactReporter: func(_ string, _ string, path string) error { archived = path; return nil },
 	}, Masker: &secrets.Masker{}}
@@ -302,9 +321,9 @@ func TestArtifactCaptureFallbackSkippedOnRunnerShutdown(t *testing.T) {
 		ArtifactCapture: &ArtifactCapture{
 			Context:  jobCtx,
 			MaxBytes: 1 << 20,
-			Reserve: func(context.Context, int64) (func(), error) {
+			Reserve: func(context.Context, int64) (func(string) error, error) {
 				reserveCalled = true
-				return func() {}, nil
+				return func(string) error { return nil }, nil
 			},
 		},
 	}, Masker: &secrets.Masker{}}

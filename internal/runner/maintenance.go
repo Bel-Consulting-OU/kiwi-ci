@@ -7,21 +7,24 @@ import (
 
 // maintenanceSchedule models the periodic runner maintenance passes. The
 // runner reaps stale runtime resources (executor.GC) every GCInterval,
-// refreshes digest-pinned prewarmed images every PrewarmInterval, and
-// retries dependency-staging cleanup debt every StagingInterval. The staging
-// cadence is deliberately much shorter than the GC interval: with the
-// conservative default staging budget (one maximum artifact), a spool whose
-// removal failed keeps its bytes charged and can wedge every future
-// maximum-size restore until RetryCleanup succeeds.
+// refreshes digest-pinned prewarmed images every PrewarmInterval, retries
+// dependency-staging cleanup debt every StagingInterval, and prunes the
+// local cache tree every CacheInterval. The staging and cache cadences are
+// deliberately much shorter than the GC interval: with the conservative
+// default staging budget (one maximum artifact), a spool whose removal
+// failed keeps its bytes charged and can wedge every future maximum-size
+// restore until RetryCleanup succeeds, and an unpruned cache tree grows
+// without bound as jobs rotate their logical keys.
 type maintenanceSchedule struct {
 	GCInterval      time.Duration
 	PrewarmInterval time.Duration
 	StagingInterval time.Duration
+	CacheInterval   time.Duration
 }
 
 // due reports which passes are due at now given their last run times. A
 // zero last run time means "never ran" and is always due.
-func (m maintenanceSchedule) due(now time.Time, lastGC, lastPrewarm, lastStaging time.Time) (gc, prewarm, staging bool) {
+func (m maintenanceSchedule) due(now time.Time, lastGC, lastPrewarm, lastStaging, lastCache time.Time) (gc, prewarm, staging, cache bool) {
 	if m.GCInterval > 0 && (lastGC.IsZero() || now.Sub(lastGC) >= m.GCInterval) {
 		gc = true
 	}
@@ -31,7 +34,10 @@ func (m maintenanceSchedule) due(now time.Time, lastGC, lastPrewarm, lastStaging
 	if m.StagingInterval > 0 && (lastStaging.IsZero() || now.Sub(lastStaging) >= m.StagingInterval) {
 		staging = true
 	}
-	return gc, prewarm, staging
+	if m.CacheInterval > 0 && (lastCache.IsZero() || now.Sub(lastCache) >= m.CacheInterval) {
+		cache = true
+	}
+	return gc, prewarm, staging, cache
 }
 
 // newMetricsServer builds the stdlib HTTP server exposing the runner's

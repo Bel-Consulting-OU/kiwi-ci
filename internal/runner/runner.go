@@ -67,6 +67,19 @@ const (
 	// bound, ownership is deliberately retained: process exit drops the
 	// lock, and an in-process successor reuses the same ledger.
 	stagingCloseGrace = 5 * time.Second
+	// defaultCacheMaxBytes/defaultCacheMaxEntries/defaultCacheMaxAge bound
+	// the runner-local cache tree when the operator configures nothing: a
+	// persistent cache whose entries are never evicted is a host-disk
+	// exhaustion primitive for any pipeline that rotates its logical keys.
+	// 32 GiB / 4096 entries / 14 days fit typical runner disks while keeping
+	// hot entries; operators tune them with the cache_max_* flags.
+	defaultCacheMaxBytes   = 32 << 30
+	defaultCacheMaxEntries = 4096
+	defaultCacheMaxAge     = 14 * 24 * time.Hour
+	// cachePruneInterval is the dedicated local-cache pruning cadence. It is
+	// deliberately independent of the hourly runtime GC: eviction must keep
+	// up with cache writes, not with container/network reaping.
+	cachePruneInterval = 10 * time.Minute
 	// defaultFinalizeTimeout bounds post-job finalization (test-report
 	// delivery, snapshot upload) once the executor has returned. Job-scoped
 	// work inside the executor stays under the declared job deadline; this is
@@ -270,6 +283,24 @@ type Config struct {
 	// until a retry succeeds). Zero means the default (30 seconds); the
 	// heavy runtime GC keeps its own, much longer, interval.
 	StagingInterval time.Duration
+	// CacheMaxBytes, CacheMaxEntries and CacheMaxAge bound the runner-local
+	// cache tree (all stored archives), distinct from the per-archive 8 GiB
+	// cap. Without an aggregate bound a pipeline that derives a fresh
+	// logical key per run can fill the runner host's disk forever, since
+	// cache archives live outside the job workspace quota. Zero uses the
+	// built-in defaults (32 GiB / 4096 entries / 14 days).
+	CacheMaxBytes   int64
+	CacheMaxEntries int
+	CacheMaxAge     time.Duration
+	// CacheArchiveMaxBytes overrides the per-archive cache bound (the shared
+	// 8 GiB default) for this runner. Zero keeps the shared contract; the
+	// same resolved value drives the local archive cap, the restore
+	// verification AND the download preflight.
+	CacheArchiveMaxBytes int64
+	// CacheInterval is how often the local cache tree is pruned. Zero uses
+	// the default (10 minutes); the hourly GC is a backstop. Saves also
+	// prune synchronously when they push the tree over a cap.
+	CacheInterval time.Duration
 	// FinalizeTimeout bounds post-job finalization (test-report delivery and
 	// snapshot upload) after the executor returns. Zero means the default
 	// (2 minutes). Terminal completion uses its own shorter internal bound
@@ -373,6 +404,9 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	if r.Cfg.StagingInterval <= 0 {
 		r.Cfg.StagingInterval = stagingMaintenanceInterval
+	}
+	if r.Cfg.CacheInterval <= 0 {
+		r.Cfg.CacheInterval = cachePruneInterval
 	}
 	if r.Cfg.WorkDir == "" {
 		r.Cfg.WorkDir = os.TempDir()
@@ -498,7 +532,8 @@ func (r *Runner) Run(ctx context.Context) error {
 	lastPrewarm := time.Now()
 	lastGC := time.Now()
 	lastStaging := time.Now()
-	maint := maintenanceSchedule{GCInterval: r.Cfg.GCInterval, PrewarmInterval: r.Cfg.PrewarmInterval, StagingInterval: r.Cfg.StagingInterval}
+	lastCache := time.Now()
+	maint := maintenanceSchedule{GCInterval: r.Cfg.GCInterval, PrewarmInterval: r.Cfg.PrewarmInterval, StagingInterval: r.Cfg.StagingInterval, CacheInterval: r.Cfg.CacheInterval}
 	done := make(chan struct{}, r.Cfg.Concurrency)
 	active := 0
 	// Draining starts from the local --drain flag; the server may also
@@ -549,7 +584,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			active--
 		case <-time.After(r.Cfg.Poll):
 		}
-		if gcDue, prewarmDue, stagingDue := maint.due(time.Now(), lastGC, lastPrewarm, lastStaging); gcDue || prewarmDue || stagingDue {
+		if gcDue, prewarmDue, stagingDue, cacheDue := maint.due(time.Now(), lastGC, lastPrewarm, lastStaging, lastCache); gcDue || prewarmDue || stagingDue || cacheDue {
 			if gcDue {
 				lastGC = time.Now()
 				background.Add(1)
@@ -572,6 +607,14 @@ func (r *Runner) Run(ctx context.Context) error {
 				go func() {
 					defer background.Done()
 					r.maintainStaging(runCtx)
+				}()
+			}
+			if cacheDue {
+				lastCache = time.Now()
+				background.Add(1)
+				go func() {
+					defer background.Done()
+					r.pruneJobCache(runCtx)
 				}()
 			}
 		}
@@ -1211,17 +1254,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		opts.ArtifactCapture = &executor.ArtifactCapture{
 			Context:  ctx,
 			MaxBytes: runnerArtifactMaxBytes,
-			Reserve: func(rctx context.Context, n int64) (func(), error) {
-				budget, berr := r.dependencyStaging()
-				if berr != nil {
-					return nil, berr
-				}
-				res, aerr := budget.Acquire(rctx, n)
-				if aerr != nil {
-					return nil, aerr
-				}
-				return res.Release, nil
-			},
+			Reserve:  r.artifactCaptureReserve(),
 		}
 	}
 	// The declared resources.disk is the job's workspace bound: it feeds the
@@ -1904,6 +1937,43 @@ func (r *Runner) setupPhaseTimeout() time.Duration {
 		return r.Cfg.SetupTimeout
 	}
 	return defaultSetupTimeout
+}
+
+// artifactCaptureReserve returns the executor's ArtifactCapture.Reserve hook
+// wired to the runner-wide staging budget. Each capture reserves its full
+// bound before the archive is created; the returned finalize callback owns
+// BOTH the physical deletion and the ledger release, so a removal failure
+// keeps the bytes charged as cleanup debt (retried by the staging
+// maintenance pass) instead of silently freeing accounting while the file
+// still occupies disk.
+func (r *Runner) artifactCaptureReserve() func(ctx context.Context, n int64) (func(string) error, error) {
+	return func(rctx context.Context, n int64) (func(string) error, error) {
+		budget, berr := r.dependencyStaging()
+		if berr != nil {
+			return nil, berr
+		}
+		res, aerr := budget.Acquire(rctx, n)
+		if aerr != nil {
+			return nil, aerr
+		}
+		return func(path string) error {
+			if path == "" {
+				// No archive was produced: just release the charge.
+				res.Release()
+				return nil
+			}
+			// The manifest is small and a failure to remove it leaves an
+			// orphan that a same-key save overwrites; the archive is what the
+			// staging ledger charges. Remove both, then hand the reservation
+			// to CleanupSpool: it releases only when the archive is actually
+			// gone and otherwise keeps the bytes charged as cleanup debt.
+			_ = artifact.RemoveCaptured(path)
+			if budget.CleanupSpool(path, res) {
+				return nil
+			}
+			return fmt.Errorf("staging cleanup of %s failed; bytes remain charged as cleanup debt", path)
+		}, nil
+	}
 }
 
 // finalizeTimeout resolves the post-job finalization bound (see
@@ -2653,9 +2723,11 @@ func (r *Runner) prepareClient(ctx context.Context) error {
 // maintenance loop calls it on the GC interval; tests call it directly so the
 // assertion does not depend on scheduler timing.
 func (r *Runner) runGCPass(ctx context.Context) executor.GCReport {
-	// The heavyweight runtime GC also covers staging cleanup as a backstop;
-	// the dedicated 30s staging pass is the primary cadence.
+	// The heavyweight runtime GC also covers staging cleanup and cache
+	// retention as backstops; the dedicated 30s staging and 10m cache passes
+	// are the primary cadences.
 	r.maintainStaging(ctx)
+	r.pruneJobCache(ctx)
 	rep := executor.GC(ctx, r.Cfg.WorkDir, gcOlderThan)
 	if rep.Containers > 0 || rep.Networks > 0 || rep.VMs > 0 {
 		reportf("kiwi runner %s: gc removed %d containers, %d networks, %d VMs\n", r.ID, rep.Containers, rep.Networks, rep.VMs)

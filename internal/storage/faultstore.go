@@ -1256,6 +1256,19 @@ func (f *FaultyStore) GetCacheManifest(ctx context.Context, repo, trustDomain, l
 	return inner.GetCacheManifest(ctx, repo, trustDomain, logicalKey)
 }
 
+func (f *FaultyStore) PruneCacheManifests(ctx context.Context, policy CacheManifestPrunePolicy) (CacheManifestPruneResult, error) {
+	inner, ok := f.Inner.(CacheManifestPruner)
+	if !ok {
+		return CacheManifestPruneResult{}, errMissingInnerInterface("CacheManifestPruner")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return CacheManifestPruneResult{}, err
+	}
+	return inner.PruneCacheManifests(ctx, policy)
+}
+
 func (f *FaultyStore) SetArtifactSidecars(ctx context.Context, artifactID, sbomPath, sbomSHA256, sigstorePath, sigstoreSHA256 string) error {
 	inner, ok := f.Inner.(ArtifactSidecarStore)
 	if !ok {
@@ -5060,14 +5073,14 @@ func (m *memStore) PutCacheManifest(ctx context.Context, rec CacheManifestRecord
 	if rec.CreatedAt.IsZero() {
 		rec.CreatedAt = time.Now().UTC()
 	}
-	m.cacheMans[rec.Repo+"\x00"+rec.TrustDomain+"\x00"+rec.LogicalKey] = rec
+	m.cacheMans[cacheManifestKey(rec.Repo, rec.TrustDomain, rec.LogicalKey)] = rec
 	return nil
 }
 
 func (m *memStore) GetCacheManifest(ctx context.Context, repo, trustDomain, logicalKey string) (CacheManifestRecord, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	rec, ok := m.cacheMans[repo+"\x00"+trustDomain+"\x00"+logicalKey]
+	rec, ok := m.cacheMans[cacheManifestKey(repo, trustDomain, logicalKey)]
 	return rec, ok, nil
 }
 

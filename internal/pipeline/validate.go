@@ -35,8 +35,20 @@ const (
 	maxCommandBytes  = 1 << 20 // 1 MiB
 	maxEnvValueBytes = 64 << 10
 	maxArtifactDefs  = 128
-	maxOutputKeys    = 256
-	maxShardsPerJob  = 1024
+	// maxCacheDefsPerJob is the absolute per-job cache declaration cap. Every
+	// cache definition is an independent key/namespace whose archive is
+	// built and (on the control plane) durably referenced, so an unbounded
+	// list is same-run storage amplification even before key rotation
+	// across runs.
+	maxCacheDefsPerJob = 64
+	// MaxUntrustedCacheDefsPerJob is the per-job cache-definition ceiling for
+	// untrusted jobs: each definition can create up to 8 GiB of local cache
+	// archive (bounded further only by the runner's aggregate cache policy)
+	// and one durable manifest per unique key, so untrusted work gets a
+	// tighter bound than trusted pipelines.
+	MaxUntrustedCacheDefsPerJob = 16
+	maxOutputKeys               = 256
+	maxShardsPerJob             = 1024
 )
 
 var (
@@ -189,6 +201,46 @@ func ValidateServiceCount(jobID string, services []Service, untrusted bool) erro
 // additional trust-aware ceiling for callers that know the trust domain
 // (runner admission and the executor before any service container starts).
 // Jobs are checked in sorted order so the error is deterministic.
+// ValidateCacheCount enforces the trust-dependent cache-definition ceiling
+// for one job: maxCacheDefsPerJob for trusted jobs,
+// MaxUntrustedCacheDefsPerJob for untrusted ones. It is the per-job form of
+// ValidateCacheQuota so paths that reach the executor without the spec-level
+// check (generated fragments) still cannot fan out cache definitions.
+func ValidateCacheCount(jobID string, cacheDefs []Cache, untrusted bool) error {
+	limit := maxCacheDefsPerJob
+	trust := "trusted"
+	if untrusted {
+		limit = MaxUntrustedCacheDefsPerJob
+		trust = "untrusted"
+	}
+	if len(cacheDefs) > limit {
+		return fmt.Errorf("job %q declares %d cache entries, limit is %d for %s jobs", jobID, len(cacheDefs), limit, trust)
+	}
+	return nil
+}
+
+// ValidateCacheQuota enforces the trust-dependent per-job cache-definition
+// ceiling on an already-parsed spec. Validate/ValidateLimits keep enforcing
+// the absolute ceiling for every pipeline; this is the additional trust-aware
+// ceiling for callers that know the trust domain. Jobs are checked in sorted
+// order so the error is deterministic.
+func ValidateCacheQuota(s *Spec, untrusted bool) error {
+	if s == nil {
+		return nil
+	}
+	ids := make([]string, 0, len(s.Jobs))
+	for id := range s.Jobs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		if err := ValidateCacheCount(id, s.Jobs[id].Cache, untrusted); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func ValidateServiceQuota(s *Spec, untrusted bool) error {
 	if s == nil {
 		return nil
@@ -240,6 +292,9 @@ func ValidateLimits(s *Spec) error {
 		}
 		if len(j.Artifacts) > maxArtifactDefs {
 			return fmt.Errorf("job %q declares %d artifacts, limit is %d", id, len(j.Artifacts), maxArtifactDefs)
+		}
+		if len(j.Cache) > maxCacheDefsPerJob {
+			return fmt.Errorf("job %q declares %d cache entries, limit is %d", id, len(j.Cache), maxCacheDefsPerJob)
 		}
 		if len(j.Outputs) > maxOutputKeys {
 			return fmt.Errorf("job %q declares %d output keys, limit is %d", id, len(j.Outputs), maxOutputKeys)

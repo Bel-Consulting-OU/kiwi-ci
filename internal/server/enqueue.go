@@ -47,6 +47,27 @@ func (s *Server) admitUntrustedServiceQuota(spec *pipeline.Spec, trusted bool) e
 	return nil
 }
 
+// admitUntrustedCacheQuota enforces the trust-dependent per-job
+// cache-definition ceiling at ADMISSION, before a run is signed, persisted
+// or scheduled. Every cache entry can produce an independent archive (up to
+// the 8 GiB per-archive bound) and a durable manifest, so an untrusted spec
+// that declares more than pipeline.MaxUntrustedCacheDefsPerJob entries is
+// rejected with an opaque 400 instead of fanning out storage work at
+// execution time.
+func (s *Server) admitUntrustedCacheQuota(spec *pipeline.Spec, trusted bool) error {
+	if trusted {
+		return nil
+	}
+	if err := pipeline.ValidateCacheQuota(spec, true); err != nil {
+		return &admissionError{
+			Status: http.StatusBadRequest,
+			Reason: "untrusted_cache_ceiling_exceeded",
+			Msg:    err.Error(),
+		}
+	}
+	return nil
+}
+
 // applyUntrustedResourceCeilings applies the server-side resource CEILINGS
 // to the compiled job of an UNTRUSTED run: an explicit request in any
 // dimension above the configured ceiling is REJECTED (never clamped — a
@@ -82,6 +103,13 @@ func (s *Server) applyUntrustedResourceCeilings(cj pipeline.CompiledJob, trusted
 		return cj, &admissionError{
 			Status: http.StatusBadRequest,
 			Reason: "untrusted_service_ceiling_exceeded",
+			Msg:    err.Error(),
+		}
+	}
+	if err := pipeline.ValidateCacheCount(cj.BaseID, cj.Job.Cache, true); err != nil {
+		return cj, &admissionError{
+			Status: http.StatusBadRequest,
+			Reason: "untrusted_cache_ceiling_exceeded",
 			Msg:    err.Error(),
 		}
 	}
