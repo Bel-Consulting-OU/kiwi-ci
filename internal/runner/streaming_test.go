@@ -386,7 +386,7 @@ func TestJobCacheUsesStreamingClientPolicy(t *testing.T) {
 		StreamClient: &http.Client{Transport: transport},
 		Metrics:      NewMetrics(),
 	}
-	store := r.newJobCache(basicTask(payloadPipeline), r.Metrics)
+	store := mustJobCache(t, r, basicTask(payloadPipeline))
 	if store.Client == nil {
 		t.Fatal("cache store has no client")
 	}

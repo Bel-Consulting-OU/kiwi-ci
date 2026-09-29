@@ -9,7 +9,18 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
+
+// ErrCacheDirOwned reports that the cache namespace directory is already
+// owned by another live process. Startup must refuse to serve: destructive
+// crash recovery (reclaiming "abandoned" temps) is only provably safe while
+// holding the exclusive namespace lock.
+var ErrCacheDirOwned = errors.New("cache: namespace directory is owned by another live process")
+
+// ErrManagerClosed reports an operation on a manager whose namespace
+// ownership has been released (Run shutdown or a failed startup rollback).
+var ErrManagerClosed = errors.New("cache: manager is closed")
 
 // ErrInvalidReservation reports Manager.Publish called with a nil,
 // already-ended, or foreign reservation. The publish callback is NOT run:
@@ -51,20 +62,63 @@ type Manager struct {
 	// pendingTemps maps a temp file whose removal failed to the charge that
 	// stays counted until a retry removes it.
 	pendingTemps map[string]int64
+	// lock is the held exclusive ownership token of the namespace directory;
+	// nil once Close released it.
+	lock   *namespaceLock
+	closed bool
 }
 
 // NewManager returns a manager for root with the given aggregate policy. A
 // manager with an inactive policy is still usable: reservations become
 // no-ops (there is no aggregate bound to enforce) and Prune does nothing.
-func NewManager(root string, policy RetentionPolicy) *Manager {
-	m := &Manager{root: root, policy: policy, pendingTemps: map[string]int64{}}
-	// Startup reconciliation: a crash or kill while a save/restore was
-	// writing leaves dot-prefixed temp files that the normal scan ignores.
-	// Every match found before the manager is shared is provably abandoned;
-	// remove it, and account the ones that cannot be removed so the initial
-	// budget reflects physical reality instead of forgetting the bytes.
+// NewManager acquires EXCLUSIVE ownership of the cache namespace directory
+// (<dir>/kiwi-cache.lock) and only then performs startup reclamation. The
+// lock is what makes "the temp files I can see are abandoned" a proof rather
+// than an assumption: a second live process with the same runner identity
+// (duplicate registration is allowed by the control plane) cannot reclaim,
+// write or prune the first process's namespace. A held lock surfaces as
+// ErrCacheDirOwned and startup must refuse.
+func NewManager(root string, policy RetentionPolicy) (*Manager, error) {
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return nil, fmt.Errorf("cache: create namespace %s: %w", root, err)
+	}
+	lock, err := acquireNamespaceLock(root)
+	if err != nil {
+		return nil, err
+	}
+	m := &Manager{root: root, policy: policy, pendingTemps: map[string]int64{}, lock: lock}
+	// Startup reconciliation runs UNDER the lock: a crash or kill while a
+	// save/restore was writing leaves dot-prefixed temp files that the
+	// normal scan ignores, and no live writer can exist while we hold the
+	// lock. Undeletable files stay charged so the initial budget reflects
+	// physical reality instead of forgetting the bytes.
 	_, _, _ = m.ReclaimAbandonedTemps(context.Background())
-	return m
+	return m, nil
+}
+
+// Close retries retained temp cleanup once and releases the namespace
+// ownership lock. Ownership must be held until every cache operation has
+// stopped; the runner calls it after its workers have joined (or to roll
+// back a startup that acquired cache ownership but failed later). It is
+// idempotent.
+func (m *Manager) Close() error {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil
+	}
+	m.closed = true
+	_, _ = m.retryTempCleanupLocked(context.Background())
+	lock := m.lock
+	m.lock = nil
+	m.mu.Unlock()
+	if lock == nil {
+		return nil
+	}
+	return lock.release()
 }
 
 // ReclaimAbandonedTemps removes Kiwi-owned cache temp files
@@ -80,6 +134,9 @@ func (m *Manager) ReclaimAbandonedTemps(ctx context.Context) (int, int64, error)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed {
+		return 0, 0, ErrManagerClosed
+	}
 	entries, err := os.ReadDir(m.root)
 	if os.IsNotExist(err) {
 		return 0, 0, nil
@@ -162,6 +219,16 @@ func (m *Manager) InflightBytes() int64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.inflight
+}
+
+// cacheOwnerIdentity is the diagnostics-only owner stamp written into the
+// namespace lock file (the lock itself is the ownership proof).
+func cacheOwnerIdentity() string {
+	host, err := os.Hostname()
+	if err != nil || strings.TrimSpace(host) == "" {
+		host = "unknown"
+	}
+	return fmt.Sprintf("pid=%d host=%s started=%s", os.Getpid(), host, time.Now().UTC().Format(time.RFC3339Nano))
 }
 
 // Root returns the manager's cache directory (restart validation compares
@@ -250,7 +317,7 @@ func (m *Manager) RetainTempCleanup(res *Reservation, path string) bool {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if res.m != m || res.state != reservationOpen {
+	if m.closed || res.m != m || res.state != reservationOpen {
 		return false
 	}
 	res.retainLocked(path)
@@ -270,6 +337,11 @@ func (m *Manager) RetryTempCleanup(ctx context.Context) (int, error) {
 	// data race (and a potential runtime fatal error).
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.retryTempCleanupLocked(ctx)
+}
+
+// retryTempCleanupLocked is the body of RetryTempCleanup with m.mu held.
+func (m *Manager) retryTempCleanupLocked(ctx context.Context) (int, error) {
 	if len(m.pendingTemps) == 0 {
 		return 0, nil
 	}
@@ -310,6 +382,9 @@ func (m *Manager) Publish(res *Reservation, publish func() error) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed {
+		return ErrManagerClosed
+	}
 	if res == nil || res.m != m || res.state != reservationOpen {
 		return ErrInvalidReservation
 	}
@@ -331,14 +406,17 @@ func (m *Manager) Reserve(ctx context.Context, expected int64) (*Reservation, er
 	if m == nil {
 		return &Reservation{}, nil
 	}
-	if !m.policy.Active() {
-		return &Reservation{m: m, state: reservationOpen}, nil
-	}
 	if expected < 0 {
 		expected = 0
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed {
+		return nil, ErrManagerClosed
+	}
+	if !m.policy.Active() {
+		return &Reservation{m: m, state: reservationOpen}, nil
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

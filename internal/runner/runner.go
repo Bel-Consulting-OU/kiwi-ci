@@ -469,6 +469,16 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err := r.configureCacheManager(); err != nil {
 		return err
 	}
+	// Transactional startup ownership: the cache namespace lock acquired
+	// above is released again if any later startup step fails before the
+	// runner lifecycle (and its stop()) takes over. Once committed, stop()
+	// closes the cache manager after all workers have joined.
+	startupCommitted := false
+	defer func() {
+		if !startupCommitted {
+			r.closeCacheManager()
+		}
+	}()
 	// The runner-wide dependency staging budget is constructed ONCE per Run,
 	// before any job can be leased, and owned until the fully joined
 	// shutdown retires it (closeStaging): every dependency restore reserves
@@ -480,6 +490,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err := r.configureStaging(); err != nil {
 		return err
 	}
+	startupCommitted = true
 	// The staging ledger is exposed as scrape-time gauges: Used() includes
 	// cleanup debt (bytes whose removal failed and that a maintenance retry
 	// must reclaim), and PendingCleanup() is the degraded/cleanup-required
@@ -537,6 +548,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		// the safe choice.
 		if waitBackground() {
 			r.closeStaging()
+			r.closeCacheManager()
 		}
 	}
 	if r.Cfg.MetricsListen != "" {
@@ -1226,7 +1238,11 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 			Client:          r.Client,
 		}
 	}
-	cacheStore := r.newJobCache(t, r.Metrics)
+	cacheStore, cacheErr := r.newJobCache(t, r.Metrics)
+	if cacheErr != nil {
+		r.complete(parent, t, model.StatusFailure, cacheErr, nil)
+		return
+	}
 	// Distributed artifact packaging is a TEMPORARY, budgeted publication
 	// path, never the persistent local artifact store: the archive lives only
 	// through capture -> attest -> upload -> cleanup, is bounded by

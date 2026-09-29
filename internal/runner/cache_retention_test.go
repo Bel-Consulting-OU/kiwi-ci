@@ -28,7 +28,7 @@ import (
 // normal unconfigured runner.
 func TestRunnerCachePreflightUsesResolvedBound(t *testing.T) {
 	r := testRunnerFor(t, httptest.NewServer(http.NotFoundHandler()), Config{})
-	store := r.newJobCache(basicTask(payloadPipeline), r.Metrics)
+	store := mustJobCache(t, r, basicTask(payloadPipeline))
 	if store.MaxCacheBytes != 0 {
 		t.Fatalf("sanity: MaxCacheBytes = %d, want the unconfigured zero", store.MaxCacheBytes)
 	}
@@ -41,7 +41,7 @@ func TestRunnerCachePreflightUsesResolvedBound(t *testing.T) {
 	}
 
 	r2 := testRunnerFor(t, httptest.NewServer(http.NotFoundHandler()), Config{CacheArchiveMaxBytes: 1 << 20})
-	store2 := r2.newJobCache(basicTask(payloadPipeline), r2.Metrics)
+	store2 := mustJobCache(t, r2, basicTask(payloadPipeline))
 	tr2 := store2.Client.Transport.(*cacheTransport)
 	if tr2.maxDisk != 1<<20 || store2.MaxStoredBytes() != 1<<20 {
 		t.Fatalf("configured bound not used consistently: maxDisk=%d MaxStoredBytes=%d", tr2.maxDisk, store2.MaxStoredBytes())
@@ -250,7 +250,7 @@ func TestRunnerCacheAggregateBoundAcrossJobs(t *testing.T) {
 	taskA := basicTask(payloadPipeline)
 	taskB := basicTask(payloadPipeline)
 	taskB.Job.ID = "job-2"
-	stores := []*cache.Store{r.newJobCache(taskA, r.Metrics), r.newJobCache(taskB, r.Metrics)}
+	stores := []*cache.Store{mustJobCache(t, r, taskA), mustJobCache(t, r, taskB)}
 
 	var wg sync.WaitGroup
 	for i := 0; i < 6; i++ {
@@ -307,7 +307,7 @@ func TestRunnerCacheAggregateBoundIncludesConcurrentRestores(t *testing.T) {
 	taskA := basicTask(payloadPipeline)
 	taskB := basicTask(payloadPipeline)
 	taskB.Job.ID = "job-2"
-	stores := []*cache.Store{r.newJobCache(taskA, r.Metrics), r.newJobCache(taskB, r.Metrics)}
+	stores := []*cache.Store{mustJobCache(t, r, taskA), mustJobCache(t, r, taskB)}
 
 	var wg sync.WaitGroup
 	errs := make([]error, 2)
@@ -389,7 +389,7 @@ func TestRunnerCacheNamespacesAreProcessPrivate(t *testing.T) {
 		t.Fatalf("namespaces not rooted under the configured cache root: %q %q", dir1, dir2)
 	}
 	for _, r := range []*Runner{r1, r2} {
-		store := r.newJobCache(basicTask(payloadPipeline), r.Metrics)
+		store := mustJobCache(t, r, basicTask(payloadPipeline))
 		store.RemoteURL = "" // local-only saves
 		for i := 0; i < 4; i++ {
 			ws := t.TempDir()
@@ -418,14 +418,24 @@ func TestRunnerCacheNamespacesAreProcessPrivate(t *testing.T) {
 // callers keep the lazy construction.
 func TestRunnerCacheManagerFollowsConfigAcrossRestarts(t *testing.T) {
 	r := testRunnerFor(t, httptest.NewServer(http.NotFoundHandler()), Config{CacheRoot: t.TempDir(), CacheMaxBytes: 2000})
-	m1 := r.cacheManager()
+	m1, err := r.cacheManager()
+	if err != nil {
+		t.Fatal(err)
+	}
 	r.configureCacheManager()
-	if r.cacheManager() != m1 {
+	m1b, err := r.cacheManager()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m1b != m1 {
 		t.Fatal("same-config reconfigure replaced the manager")
 	}
 	r.Cfg.CacheMaxBytes = 1234
 	r.configureCacheManager()
-	m2 := r.cacheManager()
+	m2, err := r.cacheManager()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if m2 == m1 {
 		t.Fatal("changed policy kept the stale manager")
 	}
@@ -434,7 +444,10 @@ func TestRunnerCacheManagerFollowsConfigAcrossRestarts(t *testing.T) {
 	}
 	r.Cfg.CacheRoot = t.TempDir()
 	r.configureCacheManager()
-	m3 := r.cacheManager()
+	m3, err := r.cacheManager()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if m3.Root() != r.cacheRootDir() {
 		t.Fatalf("manager root = %q, want %q", m3.Root(), r.cacheRootDir())
 	}
@@ -475,7 +488,9 @@ func TestRunnerStartupReclaimsLegacySharedCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := testRunnerFor(t, httptest.NewServer(http.NotFoundHandler()), Config{CacheRoot: root})
-	r.cacheManager()
+	if _, err := r.cacheManager(); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
 		t.Fatalf("legacy archive survived startup (err=%v)", err)
 	}
@@ -495,7 +510,9 @@ func TestRunnerStartupReclaimsLegacySharedCache(t *testing.T) {
 	}
 	r2 := testRunnerFor(t, httptest.NewServer(http.NotFoundHandler()), Config{CacheRoot: root})
 	r2.ID = "runner-2"
-	r2.cacheManager()
+	if _, err := r2.cacheManager(); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := os.Stat(nsFile); err != nil {
 		t.Fatalf("namespace file was reclaimed: %v", err)
 	}
@@ -507,7 +524,10 @@ func TestRunnerStartupReclaimsLegacySharedCache(t *testing.T) {
 // debt is cleared.
 func TestRunnerCacheManagerReplacementRefusedWithDebt(t *testing.T) {
 	r := testRunnerFor(t, httptest.NewServer(http.NotFoundHandler()), Config{CacheRoot: t.TempDir(), CacheMaxBytes: 2000})
-	mgr := r.cacheManager()
+	mgr, err := r.cacheManager()
+	if err != nil {
+		t.Fatal(err)
+	}
 	res, err := mgr.Reserve(context.Background(), 100)
 	if err != nil {
 		t.Fatal(err)
@@ -529,7 +549,11 @@ func TestRunnerCacheManagerReplacementRefusedWithDebt(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "replacement refused") {
 		t.Fatalf("configureCacheManager = %v, want a refusal naming the retained debt", err)
 	}
-	if r.cacheManager() != mgr {
+	mgrb, err := r.cacheManager()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mgrb != mgr {
 		t.Fatal("refused replacement swapped the manager anyway")
 	}
 	// Clear the debt; the next attempt succeeds.
@@ -539,7 +563,11 @@ func TestRunnerCacheManagerReplacementRefusedWithDebt(t *testing.T) {
 	if err := r.configureCacheManager(); err != nil {
 		t.Fatalf("configureCacheManager after clearing debt = %v", err)
 	}
-	if got := r.cacheManager().Policy().MaxBytes; got != 1000 {
+	mgrAfter, err := r.cacheManager()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := mgrAfter.Policy().MaxBytes; got != 1000 {
 		t.Fatalf("new manager policy = %d, want 1000", got)
 	}
 	if mgr.PendingTempCleanup() != 0 {
@@ -577,7 +605,10 @@ func TestCacheManagerStartupFailureDoesNotRetainStagingOwnership(t *testing.T) {
 	}, Client: ts.Client(), Metrics: NewMetrics()}
 	// Force retained cache cleanup debt, then change the policy so
 	// configureCacheManager must refuse the replacement.
-	mgr := r.cacheManager()
+	mgr, err := r.cacheManager()
+	if err != nil {
+		t.Fatal(err)
+	}
 	res, err := mgr.Reserve(context.Background(), 100)
 	if err != nil {
 		t.Fatal(err)
@@ -643,4 +674,137 @@ func TestRunnerPruneJobCacheRetriesLegacyReclaim(t *testing.T) {
 	if _, err := os.Stat(legacy + ".sha256"); !os.IsNotExist(err) {
 		t.Fatalf("legacy sidecar survived maintenance (err=%v)", err)
 	}
+}
+
+// TestCacheNamespaceOwnershipReleasedOnStartupFailure pins transactional
+// startup: Run acquires the cache namespace, then staging configuration
+// fails; the cache ownership must be rolled back so the namespace is
+// available for a later Run/process.
+func TestCacheNamespaceOwnershipReleasedOnStartupFailure(t *testing.T) {
+	served := make(chan struct{}, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/register"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"runner-1"}`))
+		default:
+			select {
+			case served <- struct{}{}:
+			default:
+			}
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	defer ts.Close()
+
+	blocked := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocked, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cacheRoot := t.TempDir()
+	r := &Runner{ID: "runner-1", Cfg: Config{
+		Server: ts.URL, Poll: time.Millisecond, Concurrency: 1,
+		IdentityDir: t.TempDir(), WorkDir: t.TempDir(),
+		StagingDir: filepath.Join(blocked, "staging"),
+		CacheRoot:  cacheRoot, CacheMaxBytes: 2000,
+	}, Client: ts.Client(), Metrics: NewMetrics()}
+
+	err := r.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "staging") {
+		t.Fatalf("Run = %v, want the staging startup failure", err)
+	}
+	if r.cacheMgr != nil {
+		t.Fatal("failed startup retained the cache manager")
+	}
+	// The cache namespace lock must be released again.
+	probe, perr := cache.NewManager(r.cacheRootDir(), r.cacheRetentionPolicy())
+	if perr != nil {
+		t.Fatalf("cache namespace ownership leaked by the failed startup: %v", perr)
+	}
+	if cerr := probe.Close(); cerr != nil {
+		t.Fatal(cerr)
+	}
+	select {
+	case <-served:
+		t.Fatal("failed startup leased a job")
+	default:
+	}
+}
+
+// TestCacheNamespaceOwnershipReleasedOnCleanShutdown pins the normal
+// lifecycle: after Run returns (cancellation/drain), the fully joined stop
+// releases the cache namespace so a successor process can own it.
+func TestCacheNamespaceOwnershipReleasedOnCleanShutdown(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/register"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"runner-1"}`))
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	defer ts.Close()
+
+	cacheRoot := t.TempDir()
+	r := &Runner{ID: "runner-1", Cfg: Config{
+		Server: ts.URL, Poll: 5 * time.Millisecond, Concurrency: 1,
+		IdentityDir: t.TempDir(), WorkDir: t.TempDir(),
+		CacheRoot: cacheRoot, CacheMaxBytes: 2000,
+	}, Client: ts.Client(), Metrics: NewMetrics()}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	// Let Run reach the lease loop, then cancel.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+	if r.cacheMgr != nil {
+		t.Fatal("shutdown retained the cache manager pointer")
+	}
+	probe, err := cache.NewManager(r.cacheRootDir(), r.cacheRetentionPolicy())
+	if err != nil {
+		t.Fatalf("cache namespace ownership leaked by shutdown: %v", err)
+	}
+	if err := probe.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestExecuteCacheNamespaceUnavailableFailsJob pins the executor-path
+// failure: when another live owner holds the cache namespace, a job that
+// needs a cache fails closed before running instead of writing unbudgeted.
+func TestExecuteCacheNamespaceUnavailableFailsJob(t *testing.T) {
+	fsrv := &fakeRunnerServer{}
+	ts := httptest.NewServer(fsrv.handler())
+	defer ts.Close()
+	r := testRunnerFor(t, ts, Config{CacheRoot: t.TempDir(), CacheMaxBytes: 2000})
+	r.Cfg.CheckoutFn = func(context.Context, model.Job, string) error { return nil }
+	foreign, ferr := cache.NewManager(r.cacheRootDir(), r.cacheRetentionPolicy())
+	if ferr != nil {
+		t.Fatal(ferr)
+	}
+	defer func() { _ = foreign.Close() }()
+	pipelineText := "version: 1\njobs:\n  build:\n    steps:\n      - run: " + nativeScript("true", "exit 0") + "\n    cache:\n      - name: c\n        key: k\n        paths: [out]\n"
+	r.execute(context.Background(), basicTask(pipelineText))
+	c, ok := fsrv.lastComplete()
+	if !ok || c.Status != model.StatusFailure || !strings.Contains(c.Error, "owned by another live process") {
+		t.Fatalf("complete = %+v ok=%v, want the ownership refusal", c, ok)
+	}
+}
+
+// TestRunnerPruneJobCacheReportsNamespaceUnavailable covers the maintenance
+// entry point when the namespace belongs to another live owner.
+func TestRunnerPruneJobCacheReportsNamespaceUnavailable(t *testing.T) {
+	r := testRunnerFor(t, httptest.NewServer(http.NotFoundHandler()), Config{CacheRoot: t.TempDir(), CacheMaxBytes: 2000})
+	foreign, err := cache.NewManager(r.cacheRootDir(), r.cacheRetentionPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = foreign.Close() }()
+	r.pruneJobCache(context.Background()) // must not panic or touch the foreign namespace
 }

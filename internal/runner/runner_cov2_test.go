@@ -70,7 +70,7 @@ func TestJobCacheStoreRoundTrip(t *testing.T) {
 	r := &Runner{ID: "runner-1", Cfg: Config{Server: ts.URL, CacheRoot: t.TempDir()},
 		Client: &http.Client{Timeout: 10 * time.Second}, Metrics: metrics}
 	task := server.Task{Job: model.Job{ID: "job-1"}, LeaseToken: "lease", LeaseGeneration: 2}
-	store := r.newJobCache(task, metrics)
+	store := mustJobCacheWithMetrics(t, r, task, metrics)
 	if store.RemoteURL != ts.URL || store.Root == "" || store.Client == nil {
 		t.Fatalf("store = %+v", store)
 	}

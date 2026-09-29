@@ -97,7 +97,7 @@ func TestSaveContextValidationAndSeamFailures(t *testing.T) {
 			name: "manager budget refusal",
 			setup: func(t *testing.T, s *Store) (string, string, string) {
 				s.MaxCacheBytes = 100
-				s.Manager = NewManager(s.Root, RetentionPolicy{MaxBytes: 50})
+				s.Manager = mustManager(t, s.Root, RetentionPolicy{MaxBytes: 50})
 				return "key1", writeWS(t), "budget"
 			},
 		},
@@ -265,7 +265,7 @@ func TestFetchRemoteContextErrors(t *testing.T) {
 			name: "manager budget refusal",
 			setup: func(t *testing.T, s *Store) (context.Context, string, string) {
 				s.MaxCacheBytes = 100
-				s.Manager = NewManager(s.Root, RetentionPolicy{MaxBytes: 50})
+				s.Manager = mustManager(t, s.Root, RetentionPolicy{MaxBytes: 50})
 				return context.Background(), "key1", "budget"
 			},
 		},

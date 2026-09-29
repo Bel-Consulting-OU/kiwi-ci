@@ -117,7 +117,7 @@ func TestFinalNewJobCacheTransportSeams(t *testing.T) {
 	r := &Runner{ID: "runner-1", Cfg: Config{Server: "http://127.0.0.1:1", CacheRoot: t.TempDir()},
 		Client: &http.Client{Transport: transport, Timeout: 5 * time.Second}, Metrics: NewMetrics()}
 	task := basicTask(payloadPipeline)
-	store := r.newJobCache(task, r.Metrics)
+	store := mustJobCache(t, r, task)
 	tr, ok := store.Client.Transport.(*cacheTransport)
 	if !ok {
 		t.Fatalf("store transport = %T", store.Client.Transport)
@@ -149,7 +149,7 @@ func TestFinalNewJobCacheLogfAndRestore(t *testing.T) {
 	r := &Runner{ID: "runner-1", Cfg: Config{Server: ts.URL, CacheRoot: t.TempDir()},
 		Client: ts.Client(), Metrics: NewMetrics()}
 	task := basicTask(payloadPipeline)
-	store := r.newJobCache(task, r.Metrics)
+	store := mustJobCache(t, r, task)
 	req := httptest.NewRequest(http.MethodGet, ts.URL+cacheRoutePrefix+"key", nil)
 	resp, err := store.Client.Transport.RoundTrip(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
@@ -169,7 +169,7 @@ func TestFinalNewJobCacheLogfAndRestore(t *testing.T) {
 	defer tsNoDigest.Close()
 	r2 := &Runner{ID: "runner-1", Cfg: Config{Server: tsNoDigest.URL, CacheRoot: t.TempDir()},
 		Client: tsNoDigest.Client(), Metrics: NewMetrics()}
-	store2 := r2.newJobCache(task, r2.Metrics)
+	store2 := mustJobCache(t, r2, task)
 	req2 := httptest.NewRequest(http.MethodGet, tsNoDigest.URL+cacheRoutePrefix+"key", nil)
 	if _, err := store2.Client.Transport.RoundTrip(req2); !errors.Is(err, cache.ErrMissingOrInvalidDigest) {
 		t.Fatalf("digest-less job-scoped restore = %v, want ErrMissingOrInvalidDigest", err)

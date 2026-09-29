@@ -17,6 +17,18 @@ import (
 	"time"
 )
 
+// mustManager acquires an owned manager for the test and releases the
+// namespace lock before the test ends.
+func mustManager(t *testing.T, root string, policy RetentionPolicy) *Manager {
+	t.Helper()
+	m, err := NewManager(root, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+	return m
+}
+
 // writeEntry creates a published archive (plus sidecar) of exactly size bytes
 // with an explicit mtime, so manager tests control the physical tree without
 // running a capture.
@@ -62,7 +74,7 @@ func TestManagerReserveEvictsColdEntries(t *testing.T) {
 	base := time.Now().Add(-time.Hour)
 	writeEntry(t, root, "aaa", 700, base)
 	writeEntry(t, root, "bbb", 700, base.Add(time.Minute))
-	m := NewManager(root, RetentionPolicy{MaxBytes: 2000, MaxEntries: 10})
+	m := mustManager(t, root, RetentionPolicy{MaxBytes: 2000, MaxEntries: 10})
 	res, err := m.Reserve(context.Background(), 700)
 	if err != nil {
 		t.Fatal(err)
@@ -77,7 +89,7 @@ func TestManagerReserveEvictsColdEntries(t *testing.T) {
 }
 
 func TestManagerReserveRejectsOversize(t *testing.T) {
-	m := NewManager(t.TempDir(), RetentionPolicy{MaxBytes: 1000})
+	m := mustManager(t, t.TempDir(), RetentionPolicy{MaxBytes: 1000})
 	if _, err := m.Reserve(context.Background(), 2000); !errors.Is(err, ErrCacheBudgetExceeded) {
 		t.Fatalf("oversize reserve = %v, want ErrCacheBudgetExceeded", err)
 	}
@@ -85,7 +97,7 @@ func TestManagerReserveRejectsOversize(t *testing.T) {
 
 func TestManagerReserveHonorsInflightAndRelease(t *testing.T) {
 	root := t.TempDir()
-	m := NewManager(root, RetentionPolicy{MaxBytes: 1000})
+	m := mustManager(t, root, RetentionPolicy{MaxBytes: 1000})
 	a, err := m.Reserve(context.Background(), 600)
 	if err != nil {
 		t.Fatal(err)
@@ -109,7 +121,7 @@ func TestManagerReserveHonorsInflightAndRelease(t *testing.T) {
 }
 
 func TestManagerReserveContextCanceled(t *testing.T) {
-	m := NewManager(t.TempDir(), RetentionPolicy{MaxBytes: 1000})
+	m := mustManager(t, t.TempDir(), RetentionPolicy{MaxBytes: 1000})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := m.Reserve(ctx, 100); !errors.Is(err, context.Canceled) {
@@ -162,7 +174,7 @@ func TestLocalPruneDoesNotDeleteFreshConcurrentSave(t *testing.T) {
 func TestCacheAggregateBoundAcrossStores(t *testing.T) {
 	root := t.TempDir()
 	const maxBytes = 2500
-	manager := NewManager(root, RetentionPolicy{MaxBytes: maxBytes, MaxEntries: 100})
+	manager := mustManager(t, root, RetentionPolicy{MaxBytes: maxBytes, MaxEntries: 100})
 	stores := []*Store{
 		{Root: root, Manager: manager, MaxCacheBytes: 1200},
 		{Root: root, Manager: manager, MaxCacheBytes: 1200},
@@ -233,7 +245,7 @@ func TestRemoteRestoreEvictsBeforeExceedingLimit(t *testing.T) {
 	archive := validArchiveBytes(t)
 	root := t.TempDir()
 	writeEntry(t, root, "aaa", 950, time.Now().Add(-2*time.Hour))
-	manager := NewManager(root, RetentionPolicy{MaxBytes: 1000, MaxEntries: 10})
+	manager := mustManager(t, root, RetentionPolicy{MaxBytes: 1000, MaxEntries: 10})
 	started := make(chan struct{}, 1)
 	gate := make(chan struct{})
 	var gateOnce sync.Once
@@ -279,7 +291,7 @@ func TestRemoteRestoreEvictsBeforeExceedingLimit(t *testing.T) {
 func TestCacheInflightReservationReleasedOnCancel(t *testing.T) {
 	archive := validArchiveBytes(t)
 	root := t.TempDir()
-	manager := NewManager(root, RetentionPolicy{MaxBytes: 1000, MaxEntries: 10})
+	manager := mustManager(t, root, RetentionPolicy{MaxBytes: 1000, MaxEntries: 10})
 	started := make(chan struct{}, 1)
 	gate := make(chan struct{})
 	var gateOnce sync.Once
@@ -319,7 +331,7 @@ func TestCacheInflightReservationReleasedOnCancel(t *testing.T) {
 func TestCacheMaxBytesNeverExceededPhysically(t *testing.T) {
 	root := t.TempDir()
 	const maxBytes = 2000
-	manager := NewManager(root, RetentionPolicy{MaxBytes: maxBytes, MaxEntries: 100})
+	manager := mustManager(t, root, RetentionPolicy{MaxBytes: maxBytes, MaxEntries: 100})
 	stores := []*Store{
 		{Root: root, Manager: manager, MaxCacheBytes: 700},
 		{Root: root, Manager: manager, MaxCacheBytes: 700},
@@ -382,7 +394,7 @@ func TestManagerPruneSerializesWithReservations(t *testing.T) {
 	base := time.Now().Add(-time.Hour)
 	writeEntry(t, root, "aaa", 500, base)
 	writeEntry(t, root, "bbb", 500, base.Add(time.Minute))
-	m := NewManager(root, RetentionPolicy{MaxBytes: 4000, MaxEntries: 1})
+	m := mustManager(t, root, RetentionPolicy{MaxBytes: 4000, MaxEntries: 1})
 	res, err := m.Prune(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -492,7 +504,7 @@ func TestReservationNilReceiverRelease(t *testing.T) {
 func TestManagerPublishIsAtomicWithVisibility(t *testing.T) {
 	root := t.TempDir()
 	writeEntry(t, root, "cold", 1200, time.Now().Add(-time.Hour))
-	m := NewManager(root, RetentionPolicy{MaxBytes: 2500, MaxEntries: 100})
+	m := mustManager(t, root, RetentionPolicy{MaxBytes: 2500, MaxEntries: 100})
 
 	a, err := m.Reserve(context.Background(), 1200)
 	if err != nil {
@@ -532,7 +544,7 @@ func TestManagerPublishIsAtomicWithVisibility(t *testing.T) {
 // returns the capacity.
 func TestManagerPublishFailureKeepsReservation(t *testing.T) {
 	root := t.TempDir()
-	m := NewManager(root, RetentionPolicy{MaxBytes: 2500, MaxEntries: 100})
+	m := mustManager(t, root, RetentionPolicy{MaxBytes: 2500, MaxEntries: 100})
 	a, err := m.Reserve(context.Background(), 1000)
 	if err != nil {
 		t.Fatal(err)
@@ -561,7 +573,7 @@ func TestManagerPublishFailureKeepsReservation(t *testing.T) {
 // entries, nil-publish, canceled prune and manager-delegated store prune.
 func TestManagerReserveEdgeBranches(t *testing.T) {
 	// Inactive policy: reservations are granted without accounting.
-	inactive := NewManager(t.TempDir(), RetentionPolicy{})
+	inactive := mustManager(t, t.TempDir(), RetentionPolicy{})
 	if r, err := inactive.Reserve(context.Background(), 1); err != nil || r == nil {
 		t.Fatalf("inactive reserve = %v, %v", r, err)
 	} else {
@@ -570,7 +582,7 @@ func TestManagerReserveEdgeBranches(t *testing.T) {
 
 	// Entry-slot exhaustion: one slot, already reserved.
 	root := t.TempDir()
-	m := NewManager(root, RetentionPolicy{MaxEntries: 1})
+	m := mustManager(t, root, RetentionPolicy{MaxEntries: 1})
 	a, err := m.Reserve(context.Background(), 1)
 	if err != nil {
 		t.Fatal(err)
@@ -580,19 +592,20 @@ func TestManagerReserveEdgeBranches(t *testing.T) {
 	}
 	a.Release()
 
-	// Scan failure: the root is a regular file.
+	// An unusable namespace root (a regular file) fails manager construction
+	// closed: ownership cannot be acquired, so no reservation is possible.
 	fileRoot := filepath.Join(t.TempDir(), "not-a-dir")
 	if err := os.WriteFile(fileRoot, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewManager(fileRoot, RetentionPolicy{MaxBytes: 10}).Reserve(context.Background(), 1); err == nil {
-		t.Fatal("reserve over an unreadable root succeeded")
+	if _, err := NewManager(fileRoot, RetentionPolicy{MaxBytes: 10}); err == nil {
+		t.Fatal("manager over an unusable root was constructed")
 	}
 
 	// Un-evictable entries: removal fails for everything.
 	root2 := t.TempDir()
 	writeEntry(t, root2, "stuck", 100, time.Now().Add(-time.Hour))
-	m2 := NewManager(root2, RetentionPolicy{MaxBytes: 50, MaxEntries: 10})
+	m2 := mustManager(t, root2, RetentionPolicy{MaxBytes: 50, MaxEntries: 10})
 	origRemove := removeCacheFile
 	removeCacheFile = func(string) error { return errors.New("test: remove refused") }
 	t.Cleanup(func() { removeCacheFile = origRemove })
@@ -619,11 +632,13 @@ func TestManagerReserveEdgeBranches(t *testing.T) {
 		t.Fatalf("canceled prune = %v, want context.Canceled", err)
 	}
 
-	// A store delegates its prune to the shared manager.
+	// A store delegates its prune to the shared manager (own namespace: the
+	// entry-slot manager above still owns root).
 	removeCacheFile = origRemove
-	store := &Store{Root: root, Manager: NewManager(root, RetentionPolicy{MaxEntries: 1})}
-	writeEntry(t, root, "aaa", 10, time.Now().Add(-2*time.Hour))
-	writeEntry(t, root, "bbb", 10, time.Now().Add(-time.Hour))
+	delRoot := t.TempDir()
+	store := &Store{Root: delRoot, Manager: mustManager(t, delRoot, RetentionPolicy{MaxEntries: 1})}
+	writeEntry(t, delRoot, "aaa", 10, time.Now().Add(-2*time.Hour))
+	writeEntry(t, delRoot, "bbb", 10, time.Now().Add(-time.Hour))
 	if res, err := store.Prune(context.Background()); err != nil || res.Entries != 1 {
 		t.Fatalf("delegated prune = %+v, %v", res, err)
 	}
@@ -634,7 +649,7 @@ func TestManagerReserveEdgeBranches(t *testing.T) {
 // defer in every save/restore) must not subtract it again.
 func TestPublishedReservationDeferredReleaseIsNoop(t *testing.T) {
 	root := t.TempDir()
-	m := NewManager(root, RetentionPolicy{MaxBytes: 2500, MaxEntries: 10})
+	m := mustManager(t, root, RetentionPolicy{MaxBytes: 2500, MaxEntries: 10})
 	res, err := m.Reserve(context.Background(), 1000)
 	if err != nil {
 		t.Fatal(err)
@@ -664,7 +679,7 @@ func TestPublishedReservationDeferredReleaseIsNoop(t *testing.T) {
 func TestPublishedReservationDoesNotDriveInflightNegative(t *testing.T) {
 	root := t.TempDir()
 	const maxBytes = 2000
-	m := NewManager(root, RetentionPolicy{MaxBytes: maxBytes, MaxEntries: 10})
+	m := mustManager(t, root, RetentionPolicy{MaxBytes: maxBytes, MaxEntries: 10})
 	res, err := m.Reserve(context.Background(), 1000)
 	if err != nil {
 		t.Fatal(err)
@@ -691,7 +706,7 @@ func TestPublishedReservationDoesNotDriveInflightNegative(t *testing.T) {
 // accounting under the same cycle.
 func TestPublishedReservationDoesNotDriveEntryCountNegative(t *testing.T) {
 	root := t.TempDir()
-	m := NewManager(root, RetentionPolicy{MaxEntries: 1})
+	m := mustManager(t, root, RetentionPolicy{MaxEntries: 1})
 	res, err := m.Reserve(context.Background(), 1)
 	if err != nil {
 		t.Fatal(err)
@@ -721,7 +736,7 @@ func TestPublishedReservationDoesNotDriveEntryCountNegative(t *testing.T) {
 func TestRepeatedSuccessfulSavesPreserveAggregateBound(t *testing.T) {
 	root := t.TempDir()
 	const maxBytes = 2500
-	m := NewManager(root, RetentionPolicy{MaxBytes: maxBytes, MaxEntries: 100})
+	m := mustManager(t, root, RetentionPolicy{MaxBytes: maxBytes, MaxEntries: 100})
 	stores := []*Store{
 		{Root: root, Manager: m, MaxCacheBytes: 1200},
 		{Root: root, Manager: m, MaxCacheBytes: 1200},
@@ -755,7 +770,7 @@ func TestRepeatedSuccessfulRestoresPreserveAggregateBound(t *testing.T) {
 	archive := validArchiveBytes(t)
 	const maxBytes = 3000
 	root := t.TempDir()
-	m := NewManager(root, RetentionPolicy{MaxBytes: maxBytes, MaxEntries: 100})
+	m := mustManager(t, root, RetentionPolicy{MaxBytes: maxBytes, MaxEntries: 100})
 	started := make(chan struct{}, 1)
 	srv := remoteArchiveServer(t, archive, started, nil)
 	store := &Store{Root: root, Manager: m, MaxCacheBytes: 1200, RemoteURL: srv.URL}
@@ -784,7 +799,7 @@ func TestRepeatedSuccessfulRestoresPreserveAggregateBound(t *testing.T) {
 // (not silently released) until a retry removes the file.
 func TestSaveContextTempCleanupFailureKeepsCharge(t *testing.T) {
 	root := t.TempDir()
-	m := NewManager(root, RetentionPolicy{MaxBytes: 2500, MaxEntries: 10})
+	m := mustManager(t, root, RetentionPolicy{MaxBytes: 2500, MaxEntries: 10})
 	store := &Store{Root: root, Manager: m, MaxCacheBytes: 1200}
 	ws := t.TempDir()
 	if err := os.WriteFile(filepath.Join(ws, "f"), []byte("payload"), 0o644); err != nil {
@@ -834,7 +849,7 @@ func TestFetchRemoteTempCleanupFailureKeepsCharge(t *testing.T) {
 	archive := validArchiveBytes(t)
 	srv := remoteArchiveServer(t, archive, nil, nil)
 	root := t.TempDir()
-	m := NewManager(root, RetentionPolicy{MaxBytes: 2500, MaxEntries: 10})
+	m := mustManager(t, root, RetentionPolicy{MaxBytes: 2500, MaxEntries: 10})
 	store := &Store{Root: root, Manager: m, MaxCacheBytes: 1200, RemoteURL: srv.URL}
 	origRename, origRemove := renameCacheFile, removeCacheTemp
 	renameCacheFile = func(string, string) error { return errors.New("rename refused") }
@@ -899,7 +914,7 @@ func TestPruneFailedAgeEvictionStaysAccounted(t *testing.T) {
 // the next pass returns it once removal succeeds.
 func TestManagerRetryTempCleanupFailurePath(t *testing.T) {
 	root := t.TempDir()
-	m := NewManager(root, RetentionPolicy{MaxBytes: 1000})
+	m := mustManager(t, root, RetentionPolicy{MaxBytes: 1000})
 	ws := t.TempDir()
 	if err := os.WriteFile(filepath.Join(ws, "f"), []byte("payload"), 0o644); err != nil {
 		t.Fatal(err)
@@ -945,8 +960,8 @@ func TestManagerAccessorsAndDefensiveBranches(t *testing.T) {
 	if nilMgr.Root() != "" || nilMgr.Policy() != (RetentionPolicy{}) {
 		t.Fatal("nil manager accessors must be zero-valued")
 	}
-	m1 := NewManager(t.TempDir(), RetentionPolicy{MaxBytes: 1000})
-	m2 := NewManager(t.TempDir(), RetentionPolicy{MaxBytes: 1000})
+	m1 := mustManager(t, t.TempDir(), RetentionPolicy{MaxBytes: 1000})
+	m2 := mustManager(t, t.TempDir(), RetentionPolicy{MaxBytes: 1000})
 	foreign, err := m2.Reserve(context.Background(), 100)
 	if err != nil {
 		t.Fatal(err)
@@ -972,7 +987,7 @@ func TestManagerAccessorsAndDefensiveBranches(t *testing.T) {
 	}
 	// An inactive-policy manager still grants manager-bound reservations, so
 	// publish works uniformly.
-	inactive := NewManager(t.TempDir(), RetentionPolicy{})
+	inactive := mustManager(t, t.TempDir(), RetentionPolicy{})
 	res, err := inactive.Reserve(context.Background(), 50)
 	if err != nil {
 		t.Fatal(err)
@@ -994,7 +1009,7 @@ func TestManagerAccessorsAndDefensiveBranches(t *testing.T) {
 // run concurrently with job-teardown retains. Under -race this fails on the
 // unlocked map read.
 func TestManagerRetryTempCleanupConcurrentRetain(t *testing.T) {
-	m := NewManager(t.TempDir(), RetentionPolicy{MaxBytes: 1 << 20, MaxEntries: 1 << 20})
+	m := mustManager(t, t.TempDir(), RetentionPolicy{MaxBytes: 1 << 20, MaxEntries: 1 << 20})
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
 	wg.Add(1)
@@ -1052,7 +1067,7 @@ func TestManagerRestartReclaimsAbandonedSaveTemp(t *testing.T) {
 	if err := os.WriteFile(tmp, make([]byte, 128), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	m := NewManager(root, RetentionPolicy{MaxBytes: 1000})
+	m := mustManager(t, root, RetentionPolicy{MaxBytes: 1000})
 	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
 		t.Fatalf("abandoned save temp survived manager construction (err=%v)", err)
 	}
@@ -1068,7 +1083,7 @@ func TestManagerRestartReclaimsAbandonedRestoreTemp(t *testing.T) {
 	if err := os.WriteFile(tmp, make([]byte, 64), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	m := NewManager(root, RetentionPolicy{MaxBytes: 1000})
+	m := mustManager(t, root, RetentionPolicy{MaxBytes: 1000})
 	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
 		t.Fatalf("abandoned restore temp survived manager construction (err=%v)", err)
 	}
@@ -1094,7 +1109,7 @@ func TestManagerRestartAccountsUndeletableAbandonedTemp(t *testing.T) {
 		return os.Remove(path)
 	}
 	t.Cleanup(func() { removeCacheTemp = orig })
-	m := NewManager(root, RetentionPolicy{MaxBytes: 1000})
+	m := mustManager(t, root, RetentionPolicy{MaxBytes: 1000})
 	if m.PendingTempCleanup() != 1 || m.InflightBytes() != 300 {
 		t.Fatalf("manager = pending %d inflight %d, want 1/300", m.PendingTempCleanup(), m.InflightBytes())
 	}
@@ -1124,7 +1139,7 @@ func TestCrashLeftTempCannotBypassMaxBytes(t *testing.T) {
 		return os.Remove(path)
 	}
 	t.Cleanup(func() { removeCacheTemp = orig })
-	m := NewManager(root, RetentionPolicy{MaxBytes: 1000, MaxEntries: 10})
+	m := mustManager(t, root, RetentionPolicy{MaxBytes: 1000, MaxEntries: 10})
 	if _, err := m.Reserve(context.Background(), 200); !errors.Is(err, ErrCacheBudgetExceeded) {
 		t.Fatalf("reserve past a crash-left temp = %v, want ErrCacheBudgetExceeded", err)
 	}
@@ -1150,7 +1165,13 @@ func TestCrashLeftTempCannotBypassMaxBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	removeCacheTemp = orig
-	_ = NewManager(root, RetentionPolicy{MaxBytes: 1000})
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	probe := mustManager(t, root, RetentionPolicy{MaxBytes: 1000})
+	if probe.PendingTempCleanup() != 0 {
+		t.Fatalf("probe manager still sees %d pending temps", probe.PendingTempCleanup())
+	}
 	for _, name := range []string{"keep.txt", "visible.tar.gz", "dir.tar.gz-1.tmp", ".link.tar.gz-1.tmp"} {
 		if _, err := os.Lstat(filepath.Join(root, name)); err != nil {
 			t.Fatalf("%s was touched by reclamation: %v", name, err)
@@ -1217,20 +1238,19 @@ func TestReclamationEdgeBranches(t *testing.T) {
 		}
 	}
 
-	// Unreadable root (a regular file) surfaces the ReadDir error.
+	// An unusable namespace root (a regular file) fails construction closed.
 	fileRoot := filepath.Join(t.TempDir(), "not-a-dir")
 	if err := os.WriteFile(fileRoot, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	m := NewManager(fileRoot, RetentionPolicy{MaxBytes: 100})
-	if _, _, err := m.ReclaimAbandonedTemps(context.Background()); err == nil {
-		t.Fatal("reclaim over an unreadable root succeeded")
+	if _, err := NewManager(fileRoot, RetentionPolicy{MaxBytes: 100}); err == nil {
+		t.Fatal("manager over an unusable root was constructed")
 	}
 
 	// Canceled context stops the sweep (files created AFTER construction, so
 	// the constructor's own reclaim does not consume them).
 	root := t.TempDir()
-	m2 := NewManager(root, RetentionPolicy{MaxBytes: 100})
+	m2 := mustManager(t, root, RetentionPolicy{MaxBytes: 100})
 	for i := 0; i < 3; i++ {
 		if err := os.WriteFile(filepath.Join(root, fmt.Sprintf(".k%d.tar.gz-1.tmp", i)), []byte("x"), 0o600); err != nil {
 			t.Fatal(err)

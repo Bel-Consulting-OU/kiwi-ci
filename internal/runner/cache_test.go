@@ -17,6 +17,7 @@ import (
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cache"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/safefs"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
 )
 
 // TestCacheUploadTargetsJobScopedRoute exercises the executor-facing store:
@@ -29,7 +30,7 @@ func TestCacheUploadTargetsJobScopedRoute(t *testing.T) {
 
 	task := basicTask("version: 1\njobs:\n  build:\n    steps:\n      - run: echo hi\n")
 	r := testRunnerFor(t, ts, Config{})
-	store := r.newJobCache(task, r.Metrics)
+	store := mustJobCache(t, r, task)
 
 	ws := t.TempDir()
 	if err := os.WriteFile(filepath.Join(ws, "f.txt"), []byte("x"), 0o644); err != nil {
@@ -80,7 +81,7 @@ func TestJobCacheInheritsUnifiedArchiveBound(t *testing.T) {
 	defer ts.Close()
 	task := basicTask("version: 1\njobs:\n  build:\n    steps:\n      - run: echo hi\n")
 	r := testRunnerFor(t, ts, Config{})
-	store := r.newJobCache(task, r.Metrics)
+	store := mustJobCache(t, r, task)
 	if store.MaxCacheBytes != 0 {
 		t.Fatalf("job cache Store.MaxCacheBytes = %d, want 0 (shared default)", store.MaxCacheBytes)
 	}
@@ -146,7 +147,7 @@ func TestCacheRestoreFallsBackToJobScopedRoute(t *testing.T) {
 	defer srv.Close()
 
 	r := testRunnerFor(t, srv, Config{})
-	store := r.newJobCache(task, r.Metrics)
+	store := mustJobCache(t, r, task)
 	dest := t.TempDir()
 	hit, err := store.Restore("k", dest, []string{"cached.txt"})
 	if err != nil {
@@ -319,4 +320,22 @@ func TestCacheRestoreCloseDrainStaysStallBounded(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Close hung: the stall guard was disarmed before the verifying drain")
 	}
+}
+
+// mustJobCache builds a job cache through the runner's ownership-checked
+// manager, failing the test when the namespace cannot be acquired.
+func mustJobCache(t *testing.T, r *Runner, task server.Task) *cache.Store {
+	t.Helper()
+	return mustJobCacheWithMetrics(t, r, task, r.Metrics)
+}
+
+// mustJobCacheWithMetrics is mustJobCache for tests that pass an explicit
+// metrics registry.
+func mustJobCacheWithMetrics(t *testing.T, r *Runner, task server.Task, metrics *Metrics) *cache.Store {
+	t.Helper()
+	store, err := r.newJobCache(task, metrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store
 }

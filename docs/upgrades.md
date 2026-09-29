@@ -472,3 +472,13 @@ claims themselves.
   externally owned staging directory lock for a Run that never started.
   Incomplete legacy-cache reclamation is retried on every cache maintenance
   pass instead of only at manager installation.
+- Each runner-local cache namespace now has a REAL cross-process ownership
+  lock (`<namespace>/kiwi-cache.lock`, flock on Unix, an atomic lock file
+  with dead-owner probing elsewhere). A second live process with the same
+  runner identity is refused at startup with `ErrCacheDirOwned` instead of
+  reclaiming the first process's live temp files; destructive crash recovery
+  only runs while the lock is held. Runner startup is transactional: if the
+  staging configuration fails after cache ownership is acquired, the cache
+  namespace is released again, and a fully joined shutdown closes it
+  alongside staging. A closed manager refuses further reservations,
+  publications and retention passes.

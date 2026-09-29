@@ -165,11 +165,37 @@ func (r *Runner) configureCacheManager() error {
 		if pending := old.PendingTempCleanup(); pending > 0 || old.InflightBytes() > 0 {
 			return fmt.Errorf("cache manager replacement refused: %d temp cleanup item(s) and %d charged bytes remain under %s; remove them or restart the process", pending, old.InflightBytes(), old.Root())
 		}
+		// The old namespace ownership must be released before the new manager
+		// can acquire it (same root) and must not outlive the replacement
+		// (changed root).
+		if err := old.Close(); err != nil {
+			return fmt.Errorf("cache: release previous namespace: %w", err)
+		}
+		r.cacheMgr = nil
 	}
-	mgr := cache.NewManager(root, policy)
+	mgr, err := cache.NewManager(root, policy)
+	if err != nil {
+		return err
+	}
 	r.reclaimLegacyCacheLayoutLocked(mgr)
 	r.cacheMgr = mgr
 	return nil
+}
+
+// closeCacheManager releases the cache namespace ownership after all cache
+// work has stopped (the same fully-joined condition as closeStaging) or to
+// roll back a startup that acquired cache ownership and then failed.
+func (r *Runner) closeCacheManager() {
+	r.cacheMu.Lock()
+	mgr := r.cacheMgr
+	r.cacheMgr = nil
+	r.cacheMu.Unlock()
+	if mgr == nil {
+		return
+	}
+	if err := mgr.Close(); err != nil {
+		reportf("kiwi runner %s: cache namespace close: %v\n", r.ID, err)
+	}
 }
 
 // reclaimLegacyCacheLayoutLocked deletes the pre-namespace shared layout
@@ -193,15 +219,19 @@ func (r *Runner) reclaimLegacyCacheLayoutLocked(mgr *cache.Manager) {
 // by every job's Store. The manager is what makes the aggregate bound real:
 // it serializes reservations, evictions and publications across jobs that
 // each hold their own Store.
-func (r *Runner) cacheManager() *cache.Manager {
+func (r *Runner) cacheManager() (*cache.Manager, error) {
 	r.cacheMu.Lock()
 	defer r.cacheMu.Unlock()
-	if r.cacheMgr == nil {
-		mgr := cache.NewManager(r.cacheRootDir(), r.cacheRetentionPolicy())
-		r.reclaimLegacyCacheLayoutLocked(mgr)
-		r.cacheMgr = mgr
+	if r.cacheMgr != nil {
+		return r.cacheMgr, nil
 	}
-	return r.cacheMgr
+	mgr, err := cache.NewManager(r.cacheRootDir(), r.cacheRetentionPolicy())
+	if err != nil {
+		return nil, err
+	}
+	r.reclaimLegacyCacheLayoutLocked(mgr)
+	r.cacheMgr = mgr
+	return mgr, nil
 }
 
 // pruneJobCache runs one retention pass over the runner-local cache tree and
@@ -209,7 +239,11 @@ func (r *Runner) cacheManager() *cache.Manager {
 // next pass's accounting) instead of silently freeing capacity; entries
 // refreshed after ranking are skipped by the freshness fence.
 func (r *Runner) pruneJobCache(ctx context.Context) {
-	mgr := r.cacheManager()
+	mgr, merr := r.cacheManager()
+	if merr != nil {
+		reportf("kiwi runner %s: cache namespace unavailable: %v\n", r.ID, merr)
+		return
+	}
 	// Temp files whose removal failed on an aborted operation still occupy
 	// disk and still hold their charge; retry them before the retention
 	// pass so the budget reflects reality as soon as possible.
@@ -248,11 +282,15 @@ func (r *Runner) pruneJobCache(ctx context.Context) {
 // control-plane cache routes with the runner's lease contract headers. The
 // store carries the aggregate retention policy, so every save prunes the
 // tree as soon as a cap is exceeded instead of waiting for maintenance.
-func (r *Runner) newJobCache(t server.Task, metrics *Metrics) *cache.Store {
+func (r *Runner) newJobCache(t server.Task, metrics *Metrics) (*cache.Store, error) {
+	mgr, err := r.cacheManager()
+	if err != nil {
+		return nil, err
+	}
 	store := cache.Default()
 	store.Root = r.cacheRootDir()
 	store.Retention = r.cacheRetentionPolicy()
-	store.Manager = r.cacheManager()
+	store.Manager = mgr
 	store.MaxCacheBytes = r.Cfg.CacheArchiveMaxBytes
 	store.RemoteURL = r.Cfg.Server
 	store.Token = r.Cfg.Token
@@ -308,5 +346,5 @@ func (r *Runner) newJobCache(t server.Task, metrics *Metrics) *cache.Store {
 			return http.ErrUseLastResponse
 		},
 	}
-	return store
+	return store, nil
 }
