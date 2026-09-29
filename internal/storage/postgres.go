@@ -1749,8 +1749,11 @@ func (s *PostgresStore) HeartbeatLease(ctx context.Context, jobID string, runner
 	// otherwise a delayed heartbeat could resurrect a lease that recovery has
 	// already been allowed to claim, and the caller's absolute instant
 	// (application clock) must never be the final authority on whether the
-	// renewal is admissible.
-	ct, err := s.pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=$4 WHERE id=$1 AND status='running' AND lease_runner_id=$2 AND lease_generation=$3 AND lease_expires_at IS NOT NULL AND lease_expires_at > clock_timestamp()`, jobID, runnerID, generation, expiresAt)
+	// renewal is admissible. This legacy absolute-time path is additionally
+	// bounded by a horizon (see legacyHeartbeatHorizonSQL): a direct caller
+	// can no longer park a lease in the year 2100, and DB-mode production
+	// uses HeartbeatLeaseWithTTL instead.
+	ct, err := s.pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=$4 WHERE id=$1 AND status='running' AND lease_runner_id=$2 AND lease_generation=$3 AND lease_expires_at IS NOT NULL AND lease_expires_at > clock_timestamp() AND $4::timestamptz <= clock_timestamp() + $5::interval`, jobID, runnerID, generation, expiresAt, legacyHeartbeatHorizonSQL)
 	if err != nil {
 		return err
 	}
@@ -1758,6 +1761,26 @@ func (s *PostgresStore) HeartbeatLease(ctx context.Context, jobID string, runner
 		return nil
 	}
 	return s.classifyHeartbeatMiss(ctx, jobID, generation)
+}
+
+// LeaseLive reports whether the job currently holds a live lease under
+// (runnerID, generation) judged by the LIVE database clock. The HTTP gate
+// uses it in DB mode so application-clock skew on the serving replica can
+// neither reject a live lease nor admit an expired one.
+func (s *PostgresStore) LeaseLive(ctx context.Context, jobID, runnerID string, generation int64) (bool, error) {
+	if err := ValidateJobID(jobID); err != nil {
+		return false, err
+	}
+	var live bool
+	err := s.pool.QueryRow(ctx, `SELECT EXISTS (
+		SELECT 1 FROM jobs
+		WHERE id=$1 AND status='running' AND COALESCE(lease_runner_id, '')=$2 AND lease_generation=$3
+		  AND lease_expires_at IS NOT NULL AND lease_expires_at > clock_timestamp())`,
+		jobID, runnerID, generation).Scan(&live)
+	if err != nil {
+		return false, err
+	}
+	return live, nil
 }
 
 // AcquireLeaseWithTTL is the database-clock-authoritative claim: the stored
@@ -1794,6 +1817,12 @@ func (s *PostgresStore) HeartbeatLeaseWithTTL(ctx context.Context, jobID, runner
 	}
 	return time.Time{}, s.classifyHeartbeatMiss(ctx, jobID, generation)
 }
+
+// legacyHeartbeatHorizonSQL bounds how far a legacy absolute-time heartbeat
+// may push a lease. LeaseClockStore is the production DB-mode contract; this
+// bound keeps a direct caller of the legacy API from parking an effectively
+// unbounded lease.
+const legacyHeartbeatHorizonSQL = "24 hours"
 
 // classifyHeartbeatMiss maps a zero-row heartbeat update to the typed reason:
 // a vanished job is ErrNotFound, a generation change is ErrGenerationMismatch,
@@ -1911,15 +1940,16 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 	defer tx.Rollback(ctx)
 
 	var (
-		curRunID  string
-		curKey    string
-		curRunner string
-		curGen    int64
-		curStatus string
-		payload   []byte
+		curRunID     string
+		curKey       string
+		curRunner    string
+		curGen       int64
+		curStatus    string
+		payload      []byte
+		leaseExpires *time.Time
 	)
-	err = tx.QueryRow(ctx, `SELECT run_id, key, COALESCE(lease_runner_id, ''), lease_generation, status, payload FROM jobs WHERE id=$1 FOR UPDATE`, jobID).
-		Scan(&curRunID, &curKey, &curRunner, &curGen, &curStatus, &payload)
+	err = tx.QueryRow(ctx, `SELECT run_id, key, COALESCE(lease_runner_id, ''), lease_generation, status, payload, lease_expires_at FROM jobs WHERE id=$1 FOR UPDATE`, jobID).
+		Scan(&curRunID, &curKey, &curRunner, &curGen, &curStatus, &payload, &leaseExpires)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -1953,6 +1983,19 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 		return ErrLeaseConflict
 	}
 
+	// Active completion (not a receipt replay, which returned above) is a
+	// lifecycle transition and must obey the SAME database-clock lease
+	// authority as every other commit: lock, sample the live DB clock, and
+	// refuse a lease that already expired while this transaction waited.
+	// Otherwise the first writer after expiry — an expired runner or
+	// recovery — would decide the outcome.
+	var dbNow time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&dbNow); err != nil {
+		return err
+	}
+	if leaseExpires == nil || !leaseExpires.After(dbNow) {
+		return ErrLeaseConflict
+	}
 	var j model.Job
 	if err := json.Unmarshal(payload, &j); err != nil {
 		return err
@@ -1974,7 +2017,10 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 			return fmt.Errorf("%w: %s", ErrRequiredArtifactMissing, missing)
 		}
 	}
-	now := time.Now().UTC()
+	// One DB timestamp for every lifecycle/accounting write in this
+	// transaction: completion ordering and durations must not depend on the
+	// serving replica's application clock.
+	now := dbNow.UTC()
 	j.Status = st
 	j.Error = errMsg
 	j.Outputs = outputs

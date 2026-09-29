@@ -504,6 +504,17 @@ type baseOnlyStore struct {
 	storage.Store
 }
 
+// LeaseLive keeps the database-clock liveness capability visible while the
+// optional extension under test is hidden: these tests pin post-authorization
+// capability gates (atomic enqueue, lease-commit), not the liveness gate.
+func (w baseOnlyStore) LeaseLive(ctx context.Context, jobID, runnerID string, generation int64) (bool, error) {
+	live, ok := w.Store.(storage.LiveLeaseStore)
+	if !ok {
+		return false, errors.New("test store has no LiveLeaseStore")
+	}
+	return live.LeaseLive(ctx, jobID, runnerID, generation)
+}
+
 // TestLeftoverInternalSchedulingError covers the fail-closed contract for a
 // store that hides InsertCompiledRun: DB startup is refused instead of
 // silently degrading the enqueue to a non-atomic scheduler path.

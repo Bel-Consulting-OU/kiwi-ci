@@ -22,7 +22,9 @@ import (
 // ScheduleStore, DeploymentStore, SnapshotStore, ArtifactContractStore,
 // QueueReasonStore) so DB-mode server tests exercise the durable paths.
 type dbFakeStore struct {
-	mu         sync.Mutex
+	mu sync.Mutex
+	// leaseNow, when set, is the fake's database clock for LeaseLive.
+	leaseNow   func() time.Time
 	checkRuns  map[string]string
 	logBatches map[string]string
 	runs       map[string]model.Run
@@ -455,6 +457,27 @@ func (f *dbFakeStore) InsertJob(ctx context.Context, job model.Job) error {
 	f.insertJobCalls = append(f.insertJobCalls, job)
 	f.jobs[job.ID] = job
 	return nil
+}
+
+// LeaseLive models the DB-clock liveness predicate: the stored lease is
+// compared against the fake's OWN clock (leaseNow, default wall clock), never
+// the serving replica's application clock — a test can skew the two
+// independently, exactly like a real database versus a skewed replica.
+func (f *dbFakeStore) LeaseLive(ctx context.Context, jobID, runnerID string, generation int64) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	j, ok := f.jobs[jobID]
+	if !ok {
+		return false, nil
+	}
+	if j.Status != model.StatusRunning || j.LeaseRunnerID != runnerID || j.LeaseGeneration != generation {
+		return false, nil
+	}
+	now := time.Now().UTC()
+	if f.leaseNow != nil {
+		now = f.leaseNow().UTC()
+	}
+	return j.LeaseExpiresAt != nil && j.LeaseExpiresAt.After(now), nil
 }
 
 func (f *dbFakeStore) GetJob(ctx context.Context, id string) (model.Job, error) {

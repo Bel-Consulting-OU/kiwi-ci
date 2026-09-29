@@ -1342,6 +1342,17 @@ type LeaseClockStore interface {
 	HeartbeatLeaseWithTTL(ctx context.Context, jobID, runnerID string, generation int64, ttl time.Duration) (time.Time, error)
 }
 
+// LiveLeaseStore is the authoritative lease-liveness predicate in the
+// store's own clock domain. DB mode uses it so the HTTP lease gate cannot
+// reject a database-live lease (or admit a database-expired one) because of a
+// serving replica's application-clock skew; single-process stores implement
+// it with their monotonic clock for parity. Mutation paths still re-check
+// liveness under their own transaction lock (LeaseCommitStore, CompleteJob),
+// because an initial check cannot stay true through a blocking commit.
+type LiveLeaseStore interface {
+	LeaseLive(ctx context.Context, jobID, runnerID string, generation int64) (bool, error)
+}
+
 // QuotaCounterStore adjusts the reserved running/queued counters for a
 // repository/team key pair (deltas may be negative; counters clamp at 0)
 // and reads the current reservation state. Completion, cancellation and

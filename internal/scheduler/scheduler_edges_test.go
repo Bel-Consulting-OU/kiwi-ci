@@ -435,7 +435,7 @@ func TestHeartbeatErrorPaths(t *testing.T) {
 		st := newInjectedStore()
 		st.leaderOK = true
 		s := NewDB(st, time.Second, nil, nil)
-		if _, err := s.Heartbeat(ctx, "missing", "runner-1", nil, 1, now); err == nil {
+		if _, _, err := s.Heartbeat(ctx, "missing", "runner-1", nil, 1, now); err == nil {
 			t.Fatal("unknown job must fail")
 		}
 	})
@@ -444,7 +444,7 @@ func TestHeartbeatErrorPaths(t *testing.T) {
 		st := newInjectedStore()
 		st.putJob(model.Job{ID: "job-1", RunID: "run-1", Status: model.StatusCancelled})
 		s := NewDB(st, time.Second, nil, nil)
-		cancelled, err := s.Heartbeat(ctx, "job-1", "runner-1", nil, 1, now)
+		cancelled, _, err := s.Heartbeat(ctx, "job-1", "runner-1", nil, 1, now)
 		if err != nil || !cancelled {
 			t.Fatalf("Heartbeat = %v,%v", cancelled, err)
 		}
@@ -464,7 +464,7 @@ func TestHeartbeatErrorPaths(t *testing.T) {
 			st.mu.Unlock()
 		}
 		s := NewDB(st, time.Second, nil, nil)
-		cancelled, err := s.Heartbeat(ctx, "job-1", "runner-1", nil, 1, now)
+		cancelled, _, err := s.Heartbeat(ctx, "job-1", "runner-1", nil, 1, now)
 		if err != nil || !cancelled {
 			t.Fatalf("Heartbeat = %v,%v", cancelled, err)
 		}
@@ -475,7 +475,7 @@ func TestHeartbeatErrorPaths(t *testing.T) {
 		st.putJob(model.Job{ID: "job-1", RunID: "run-1", Status: model.StatusRunning})
 		st.heartbeatErr = storage.ErrLeaseConflict
 		s := NewDB(st, time.Second, nil, nil)
-		if cancelled, err := s.Heartbeat(ctx, "job-1", "runner-1", nil, 1, now); err == nil || cancelled {
+		if cancelled, _, err := s.Heartbeat(ctx, "job-1", "runner-1", nil, 1, now); err == nil || cancelled {
 			t.Fatalf("Heartbeat = %v,%v", cancelled, err)
 		}
 	})
@@ -485,7 +485,7 @@ func TestHeartbeatErrorPaths(t *testing.T) {
 		st.putJob(model.Job{ID: "job-1", RunID: "run-1", Status: model.StatusRunning})
 		st.heartbeatErr = errors.New("write failed")
 		s := NewDB(st, time.Second, nil, nil)
-		if _, err := s.Heartbeat(ctx, "job-1", "runner-1", nil, 1, now); err == nil {
+		if _, _, err := s.Heartbeat(ctx, "job-1", "runner-1", nil, 1, now); err == nil {
 			t.Fatal("store failure must surface")
 		}
 	})
@@ -495,7 +495,7 @@ func TestHeartbeatErrorPaths(t *testing.T) {
 		st.putJob(model.Job{ID: "job-1", RunID: "run-1", Status: model.StatusRunning, LeaseRunnerID: "runner-1", LeaseGeneration: 1, LeaseExpiresAt: &now})
 		st.getRunnerErr = errors.New("runner gone")
 		s := NewDB(st, time.Second, nil, nil)
-		cancelled, err := s.Heartbeat(ctx, "job-1", "runner-1", nil, 1, now.Add(time.Minute))
+		cancelled, _, err := s.Heartbeat(ctx, "job-1", "runner-1", nil, 1, now.Add(time.Minute))
 		if err != nil || cancelled {
 			t.Fatalf("Heartbeat = %v,%v", cancelled, err)
 		}

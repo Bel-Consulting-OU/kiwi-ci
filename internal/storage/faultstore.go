@@ -360,6 +360,19 @@ func (f *FaultyStore) AcquireLease(ctx context.Context, jobID, runnerID string, 
 	return f.Inner.AcquireLease(ctx, jobID, runnerID, tokenHash, generation, expiresAt)
 }
 
+func (f *FaultyStore) LeaseLive(ctx context.Context, jobID, runnerID string, generation int64) (bool, error) {
+	inner, ok := f.Inner.(LiveLeaseStore)
+	if !ok {
+		return false, errMissingInnerInterface("LiveLeaseStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return false, err
+	}
+	return inner.LeaseLive(ctx, jobID, runnerID, generation)
+}
+
 func (f *FaultyStore) AcquireLeaseWithTTL(ctx context.Context, claim LeaseClaim) (model.Job, error) {
 	inner, ok := f.Inner.(LeaseClockStore)
 	if !ok {
@@ -2075,6 +2088,22 @@ func (m *memStore) InsertJob(ctx context.Context, job model.Job) error {
 	defer m.mu.Unlock()
 	m.jobs[job.ID] = job
 	return nil
+}
+
+// LeaseLive is the in-memory store's own-clock liveness predicate (see
+// LiveLeaseStore): single-process semantics need no database clock, but the
+// capability keeps the HTTP gate's code path uniform across stores.
+func (m *memStore) LeaseLive(ctx context.Context, jobID, runnerID string, generation int64) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	j, ok := m.jobs[jobID]
+	if !ok {
+		return false, nil
+	}
+	if j.Status != model.StatusRunning || j.LeaseRunnerID != runnerID || j.LeaseGeneration != generation {
+		return false, nil
+	}
+	return j.LeaseExpiresAt != nil && j.LeaseExpiresAt.After(time.Now().UTC()), nil
 }
 
 func (m *memStore) GetJob(ctx context.Context, id string) (model.Job, error) {

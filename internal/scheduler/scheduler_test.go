@@ -189,7 +189,7 @@ func TestHeartbeatReportsCancellation(t *testing.T) {
 	now := time.Now().UTC()
 	f.putJob(model.Job{ID: "job", RunID: "run", Status: model.StatusCancelled})
 	s := NewDB(f, time.Minute, nil, nil)
-	cancelled, err := s.Heartbeat(context.Background(), "job", "runner", nil, 1, now.Add(time.Minute))
+	cancelled, _, err := s.Heartbeat(context.Background(), "job", "runner", nil, 1, now.Add(time.Minute))
 	if err != nil {
 		t.Fatalf("Heartbeat cancelled job: %v", err)
 	}
@@ -199,7 +199,7 @@ func TestHeartbeatReportsCancellation(t *testing.T) {
 
 	f.putJob(model.Job{ID: "job2", RunID: "run", Status: model.StatusRunning, LeaseRunnerID: "runner", LeaseGeneration: 1})
 	exp := now.Add(time.Minute)
-	cancelled, err = s.Heartbeat(context.Background(), "job2", "runner", testHash("t"), 1, exp)
+	cancelled, _, err = s.Heartbeat(context.Background(), "job2", "runner", testHash("t"), 1, exp)
 	if err != nil {
 		t.Fatalf("Heartbeat running job: %v", err)
 	}
@@ -208,6 +208,82 @@ func TestHeartbeatReportsCancellation(t *testing.T) {
 	}
 	if len(f.heartbeatCalls) != 1 || f.heartbeatCalls[0].JobID != "job2" || !f.heartbeatCalls[0].ExpiresAt.Equal(exp) {
 		t.Errorf("heartbeat calls = %+v", f.heartbeatCalls)
+	}
+}
+
+// leaseClockStoreFake adds the LeaseClockStore capability to the behavioral
+// fake: HeartbeatLeaseWithTTL returns a FIXED store-clock expiry, so tests can
+// prove DBScheduler.Heartbeat surfaces the store's authoritative instant
+// instead of the caller's application-clock estimate.
+type leaseClockStoreFake struct {
+	*fakeStore
+	ttlExpiry time.Time
+	ttlErr    error
+	ttlCalls  []heartbeatCall
+}
+
+func (l *leaseClockStoreFake) HeartbeatLeaseWithTTL(ctx context.Context, jobID, runnerID string, generation int64, ttl time.Duration) (time.Time, error) {
+	l.ttlCalls = append(l.ttlCalls, heartbeatCall{JobID: jobID, RunnerID: runnerID, Generation: generation, ExpiresAt: l.ttlExpiry})
+	if l.ttlErr != nil {
+		return time.Time{}, l.ttlErr
+	}
+	return l.ttlExpiry, nil
+}
+
+// AcquireLeaseWithTTL exists only to satisfy storage.LeaseClockStore: these
+// heartbeat tests never claim a lease.
+func (l *leaseClockStoreFake) AcquireLeaseWithTTL(ctx context.Context, claim storage.LeaseClaim) (model.Job, error) {
+	return model.Job{}, errors.New("leaseClockStoreFake: AcquireLeaseWithTTL not used")
+}
+
+// TestHeartbeatReturnsStoreAuthoritativeExpiry pins the heartbeat return
+// contract: with a LeaseClockStore the returned instant is what the STORE
+// persisted (its own clock + TTL), never the caller's expiresAt — so the
+// server can answer the runner without a second read or an app-clock
+// fallback.
+func TestHeartbeatReturnsStoreAuthoritativeExpiry(t *testing.T) {
+	f := newFakeStore()
+	now := time.Now().UTC()
+	f.putJob(model.Job{ID: "job", RunID: "run", Status: model.StatusRunning, LeaseRunnerID: "runner", LeaseGeneration: 3})
+	authoritative := now.Add(45 * time.Second)
+	lc := &leaseClockStoreFake{fakeStore: f, ttlExpiry: authoritative}
+	s := NewDB(lc, time.Minute, nil, nil)
+	// The caller's application-clock estimate is unrelated; it must be
+	// discarded after a successful store extension.
+	appExpiry := now.Add(-2 * time.Hour)
+	cancelled, got, err := s.Heartbeat(context.Background(), "job", "runner", testHash("t"), 3, appExpiry)
+	if err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+	if cancelled {
+		t.Fatal("Heartbeat = cancelled, want not cancelled")
+	}
+	if !got.Equal(authoritative) {
+		t.Fatalf("Heartbeat expiry = %v, want the store's %v (not the caller's %v)", got, authoritative, appExpiry)
+	}
+	if len(lc.ttlCalls) != 1 || lc.ttlCalls[0].Generation != 3 {
+		t.Fatalf("TTL heartbeat calls = %+v", lc.ttlCalls)
+	}
+	if len(f.heartbeatCalls) != 0 {
+		t.Fatalf("legacy absolute-time heartbeat was used for a LeaseClockStore: %+v", f.heartbeatCalls)
+	}
+}
+
+// TestHeartbeatPropagatesStoreExpiryError pins the failure side: a store
+// extension error surfaces (never silently downgraded to the caller's
+// app-clock estimate) and no legacy heartbeat is attempted.
+func TestHeartbeatPropagatesStoreExpiryError(t *testing.T) {
+	f := newFakeStore()
+	now := time.Now().UTC()
+	f.putJob(model.Job{ID: "job", RunID: "run", Status: model.StatusRunning, LeaseRunnerID: "runner", LeaseGeneration: 1})
+	boom := errors.New("database down")
+	lc := &leaseClockStoreFake{fakeStore: f, ttlErr: boom}
+	s := NewDB(lc, time.Minute, nil, nil)
+	if _, _, err := s.Heartbeat(context.Background(), "job", "runner", nil, 1, now.Add(time.Minute)); !errors.Is(err, boom) {
+		t.Fatalf("Heartbeat = %v, want the store error", err)
+	}
+	if len(f.heartbeatCalls) != 0 {
+		t.Fatal("legacy heartbeat attempted after a TTL-store failure")
 	}
 }
 

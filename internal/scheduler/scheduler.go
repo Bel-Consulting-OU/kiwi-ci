@@ -54,7 +54,7 @@ const (
 type Scheduler interface {
 	Enqueue(ctx context.Context, run model.Run, jobs map[string]model.Job, deps map[string][]string, cancelInProgress bool) error
 	Lease(ctx context.Context, runnerID string, now time.Time) (*model.Job, string /*raw token*/, time.Time /*expires*/, error)
-	Heartbeat(ctx context.Context, jobID, runnerID string, tokenHash []byte, generation int64, expiresAt time.Time) (bool /*cancelled*/, error)
+	Heartbeat(ctx context.Context, jobID, runnerID string, tokenHash []byte, generation int64, expiresAt time.Time) (bool /*cancelled*/, time.Time /*authoritative expiry*/, error)
 	Complete(ctx context.Context, jobID string, generation int64, runnerID string, status model.Status, errMsg string, outputs map[string]string, resultHash string) error
 	CancelRun(ctx context.Context, runID, reason string) error
 	RecoverExpired(ctx context.Context, now time.Time) error
@@ -654,18 +654,29 @@ func (s *DBScheduler) reservedResources(ctx context.Context, runnerID string) mo
 // Heartbeat extends the job's lease and reports whether the job was
 // cancelled while running. The token hash is carried for contract symmetry;
 // lease authorization (runner + generation) is enforced by the store.
-func (s *DBScheduler) Heartbeat(ctx context.Context, jobID, runnerID string, tokenHash []byte, generation int64, expiresAt time.Time) (bool, error) {
+//
+// The returned instant is the expiry the store ACTUALLY persisted: a
+// LeaseClockStore (DB mode) returns clock_timestamp()+TTL directly, so the
+// caller never re-reads the job (and can never fall back to an application-
+// clock estimate after a successful extension); legacy stores get their own
+// expiresAt back.
+func (s *DBScheduler) Heartbeat(ctx context.Context, jobID, runnerID string, tokenHash []byte, generation int64, expiresAt time.Time) (bool, time.Time, error) {
 	_ = tokenHash
 	j, err := s.Store.GetJob(ctx, jobID)
 	if err != nil {
-		return false, err
+		return false, time.Time{}, err
 	}
 	if j.Status == model.StatusCancelled {
-		return true, nil
+		return true, time.Time{}, nil
 	}
+	// The authoritative expiry is the value the store actually persisted: a
+	// DB-clock store returns clock_timestamp()+TTL directly, so the caller
+	// never has to re-read (and can never fall back to an app-clock estimate
+	// after a successful extension).
+	authoritative := expiresAt
 	var hbErr error
 	if lc, ok := s.Store.(storage.LeaseClockStore); ok {
-		_, hbErr = lc.HeartbeatLeaseWithTTL(ctx, jobID, runnerID, generation, s.LeaseDuration)
+		authoritative, hbErr = lc.HeartbeatLeaseWithTTL(ctx, jobID, runnerID, generation, s.LeaseDuration)
 	} else {
 		hbErr = s.Store.HeartbeatLease(ctx, jobID, runnerID, generation, expiresAt)
 	}
@@ -674,16 +685,16 @@ func (s *DBScheduler) Heartbeat(ctx context.Context, jobID, runnerID string, tok
 			// A conflict can mean a concurrent cancellation: surface it so the
 			// runner stops instead of retrying the lease.
 			if cur, gerr := s.Store.GetJob(ctx, jobID); gerr == nil && cur.Status == model.StatusCancelled {
-				return true, nil
+				return true, time.Time{}, nil
 			}
 		}
-		return false, err
+		return false, time.Time{}, err
 	}
 	if ri, rerr := s.Store.GetRunner(ctx, runnerID); rerr == nil {
 		ri.LastSeen = time.Now().UTC()
 		_ = s.Store.UpsertRunner(ctx, ri)
 	}
-	return false, nil
+	return false, authoritative, nil
 }
 
 // Complete applies a runner completion through the store's transactional

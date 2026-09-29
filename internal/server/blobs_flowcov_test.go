@@ -431,6 +431,18 @@ func (f *fcStore) GetCacheManifest(ctx context.Context, repo, trustDomain, logic
 // cache manifest store, ...).
 type fcPlainStore struct{ storage.Store }
 
+// LeaseLive keeps the database-clock liveness capability visible (delegated
+// when the underlying store has it) while every other optional extension
+// stays hidden: capability tests that remove ONE contract must not trip the
+// liveness gate first.
+func (w fcPlainStore) LeaseLive(ctx context.Context, jobID, runnerID string, generation int64) (bool, error) {
+	live, ok := w.Store.(storage.LiveLeaseStore)
+	if !ok {
+		return false, errors.New("test store has no LiveLeaseStore")
+	}
+	return live.LeaseLive(ctx, jobID, runnerID, generation)
+}
+
 // fcNoIdemIface is the exact method surface of a store that supports
 // contracts and sidecars but NOT the idempotent artifact insert.
 type fcNoIdemIface interface {

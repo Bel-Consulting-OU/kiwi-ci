@@ -83,6 +83,17 @@ type artifactNoLeaseStore struct {
 	storage.ArtifactSidecarStore
 }
 
+// LeaseLive keeps the database-clock liveness capability visible while the
+// lease-commit extension is hidden: this fixture pins the commit-time
+// capability refusal, not the liveness gate.
+func (w artifactNoLeaseStore) LeaseLive(ctx context.Context, jobID, runnerID string, generation int64) (bool, error) {
+	live, ok := w.Store.(storage.LiveLeaseStore)
+	if !ok {
+		return false, errors.New("test store has no LiveLeaseStore")
+	}
+	return live.LeaseLive(ctx, jobID, runnerID, generation)
+}
+
 // countErrStore keeps every lease-commit capability of the fake store but
 // makes the optional preflight count fail, so the upload path must answer the
 // server error instead of silently skipping the cap check.

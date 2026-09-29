@@ -169,7 +169,7 @@ func (w *propWorld) opHeartbeat() {
 		return
 	}
 	j := running[w.rng.Intn(len(running))]
-	_, _ = w.sched.Heartbeat(w.ctx, j.ID, j.LeaseRunnerID, j.LeaseTokenHash, j.LeaseGeneration, w.now.Add(time.Minute))
+	_, _, _ = w.sched.Heartbeat(w.ctx, j.ID, j.LeaseRunnerID, j.LeaseTokenHash, j.LeaseGeneration, w.now.Add(time.Minute))
 }
 
 func (w *propWorld) opComplete() {

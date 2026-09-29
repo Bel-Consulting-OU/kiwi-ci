@@ -97,6 +97,11 @@ type Server struct {
 	PipelinePath         string
 	ExternalURL          string
 	LeaseDuration        time.Duration
+	// leaseClock, when set (tests only), replaces time.Now for lease
+	// liveness decisions of single-process stores. DB-mode liveness uses the
+	// database clock and never consults it, so a test can install an
+	// arbitrarily skewed clock to prove that.
+	leaseClock func() time.Time
 	// SecretBroker resolves declared secrets for trusted jobs holding an
 	// active lease. A nil broker disables the secrets endpoint (503).
 	SecretBroker secretbroker.Broker
@@ -1407,6 +1412,10 @@ func (s *Server) serverError(w http.ResponseWriter, r *http.Request, status int,
 func (s *Server) internalError(w http.ResponseWriter, r *http.Request, err error, clientMsg string) {
 	if errors.Is(err, errDigestFenceUnsupported) {
 		s.serverError(w, r, http.StatusServiceUnavailable, err, "distributed operation fence unavailable")
+		return
+	}
+	if errors.Is(err, errLeaseLiveUnsupported) {
+		s.serverError(w, r, http.StatusServiceUnavailable, err, "database-clock lease liveness unavailable")
 		return
 	}
 	s.serverError(w, r, http.StatusInternalServerError, err, clientMsg)
@@ -3657,12 +3666,19 @@ func (s *Server) heartbeatDB(w http.ResponseWriter, r *http.Request, jobID strin
 		writeJSON(w, http.StatusOK, HeartbeatResponse{Cancel: true})
 		return
 	}
-	if !s.validActiveLease(j, in.RunnerID, in.LeaseToken, in.LeaseGeneration, now) {
+	// Identity first, then the store's own clock domain (DB mode):
+	// the application clock cannot reject a database-live lease here.
+	live, lerr := s.authorizeLiveLease(ctx, j, in.RunnerID, in.LeaseToken, in.LeaseGeneration)
+	if lerr != nil {
+		s.internalError(w, r, lerr, "")
+		return
+	}
+	if !live {
 		http.Error(w, "stale or invalid lease", http.StatusConflict)
 		return
 	}
 	exp := now.Add(s.leaseDuration())
-	cancelled, err := s.Sched.Heartbeat(ctx, jobID, in.RunnerID, hashLeaseToken(s.leaseKey, in.LeaseToken), in.LeaseGeneration, exp)
+	cancelled, exp, err := s.Sched.Heartbeat(ctx, jobID, in.RunnerID, hashLeaseToken(s.leaseKey, in.LeaseToken), in.LeaseGeneration, exp)
 	if errors.Is(err, storage.ErrLeaseConflict) || errors.Is(err, storage.ErrGenerationMismatch) {
 		http.Error(w, "stale or invalid lease", http.StatusConflict)
 		return
@@ -3671,15 +3687,10 @@ func (s *Server) heartbeatDB(w http.ResponseWriter, r *http.Request, jobID strin
 		s.internalError(w, r, err, "")
 		return
 	}
-	// DB mode: the store extended the lease with the DATABASE clock
-	// (clock_timestamp() + TTL) and refused an already-expired lease; the
-	// runner must adopt that authoritative instant, not this replica's
-	// app-clock estimate. The pre-check above is advisory only.
-	if s.DB != nil {
-		if cur, gerr := s.DB.GetJob(ctx, jobID); gerr == nil && cur.LeaseExpiresAt != nil {
-			exp = *cur.LeaseExpiresAt
-		}
-	}
+	// exp is the store's authoritative expiry: DBScheduler surfaces the
+	// database-clock value returned by HeartbeatLeaseWithTTL directly, so no
+	// second read and no app-clock fallback can occur after a successful
+	// extension.
 	writeJSON(w, http.StatusOK, HeartbeatResponse{Cancel: cancelled, LeaseExpiresAt: exp})
 }
 
@@ -3688,6 +3699,17 @@ func (s *Server) heartbeatDB(w http.ResponseWriter, r *http.Request, jobID strin
 // async sender uses: per-line requests cannot keep up with a chatty build,
 // and the spool then overflows. Validation mirrors the single-line handler
 // per line; the whole request fails closed on the first invalid line.
+//
+// Lease posture (deliberate LATE-LOG GRACE): the request is authorized by the
+// shared DB-clock lease gate, but the append is NOT transactionally
+// lease-fenced like the artifact/cache/snapshot metadata commits. A batch
+// that raced the gate can therefore land just after the lease expired. That
+// is accepted by design: log lines carry no lifecycle, authority or
+// accounting meaning, the batch receipt is generation-scoped (a late batch
+// can never collide with a new generation's batch identity), and refusing a
+// build's final log flush at the lease boundary would lose data the job
+// already produced. Every behavior-affecting runner mutation remains
+// commit-time fenced.
 func (s *Server) logBatch(w http.ResponseWriter, r *http.Request) {
 	const maxLogBatchLines = 2000
 	jobID := r.PathValue("id")
@@ -3804,6 +3826,11 @@ func (s *Server) logBatch(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// log is POST /api/v1/jobs/{id}/log: single-line delivery under the shared
+// DB-clock lease gate. It carries the same deliberate LATE-LOG GRACE posture
+// as logBatch (see above): the append is not transactionally lease-fenced,
+// and only the memory/fs branch below (single-process, no shared DB clock)
+// re-checks the in-memory lease under s.mu.
 func (s *Server) log(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("id")
 	var in LogLine
@@ -4633,15 +4660,11 @@ func hashLeaseToken(key []byte, raw string) []byte {
 	return mac.Sum(nil)
 }
 
-// validActiveLease authorizes a runner action against a job's live lease:
-// the job must be running, the lease unexpired, the runner and generation
-// must match, and the presented token must hash to the stored digest.
-//
-// In DB mode this application-clock expiry check is ADVISORY: it rejects
-// obviously stale requests cheaply, but the authoritative lease lifetime is
-// enforced by the store against the database clock (heartbeat renewal, lease
-// commits), so a skewed serving replica can neither extend nor prematurely
-// reject a lease that the database still considers live.
+// validActiveLease is the SINGLE-PROCESS (dev/memory) lease check: status,
+// application-clock expiry, runner/generation and token hash. DB-mode
+// endpoints use authorizeLiveLease/leaseLive instead, which ask the store
+// for liveness in its own clock domain (clock_timestamp()) and never consult
+// this replica's application clock.
 func (s *Server) validActiveLease(j model.Job, runnerID, token string, generation int64, now time.Time) bool {
 	if j.Status != model.StatusRunning || j.LeaseExpiresAt == nil || !j.LeaseExpiresAt.After(now) {
 		return false

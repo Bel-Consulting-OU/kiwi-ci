@@ -394,7 +394,24 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 	// The lease must still be live at commit time.
 	if s.DB != nil {
 		current, gerr := s.jobForLease(ctx, j.ID)
-		if gerr != nil || !s.validActiveLease(current, runnerID, token, gen, time.Now().UTC()) {
+		if gerr != nil {
+			if !casMode {
+				_ = os.Remove(dst)
+			}
+			s.internalError(w, r, gerr, "")
+			return
+		}
+		// DB-clock liveness: the serving replica's application clock cannot
+		// decide this, and the store re-fences the actual metadata commit.
+		live, lerr := s.leaseLive(ctx, current, runnerID, gen)
+		if lerr != nil {
+			if !casMode {
+				_ = os.Remove(dst)
+			}
+			s.internalError(w, r, lerr, "")
+			return
+		}
+		if !live {
 			if !casMode {
 				_ = os.Remove(dst)
 			}

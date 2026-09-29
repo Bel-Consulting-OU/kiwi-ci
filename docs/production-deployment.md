@@ -407,9 +407,28 @@ In **DB mode the database clock is the authority for a lease's lifetime**:
   `clock_timestamp()` sampled after the row lock, so a recovery replica whose
   application clock is hours ahead cannot prematurely reclaim a live lease,
   and one that is hours behind can still recover an expired lease.
-- **Handler-side lease checks** (`authorizeRunnerLease` and the heartbeat
-  pre-check) are ADVISORY: they reject obviously stale requests cheaply, while
-  the authoritative lifetime is enforced inside the store as above.
+- **Completion** re-checks the locked lease against a post-lock
+  `clock_timestamp()` before applying any lifecycle transition: an expired
+  runner cannot complete a job ahead of recovery, and one database timestamp
+  stamps the completion's finished_at, runner counters and effect intents.
+- **The HTTP runner gate** (`authorizeRunnerLease` and the artifact-commit
+  re-check) asks the store for liveness in the database clock domain
+  (`LeaseLive` → `clock_timestamp()`), so a skewed serving replica can
+  neither reject a database-live lease nor admit a database-expired one.
+  Only the single-process dev/memory store falls back to the application
+  clock, where skew is not a concept; a DB store that does not implement
+  `LiveLeaseStore` is refused with 503 rather than silently downgrading to
+  replica-clock liveness.
+- **Log and test-report ingestion is deliberate late-data grace, not lease
+  authority.** Log lines/batches and test reports pass the same database-clock
+  gate at request start, but the append is not transactionally lease-fenced
+  like the artifact/cache/snapshot metadata commits: a batch or report that
+  raced the gate can land just after the lease expired. These records carry no
+  lifecycle, authority or accounting meaning, and their receipts are
+  generation-scoped, so a late write can never collide with a re-leased
+  generation. Every behavior-affecting runner mutation (completion, heartbeat,
+  cache/artifact/snapshot publication, generated jobs, OIDC, secrets) is
+  commit-time fenced.
 
 The in-memory/dev store is single-process and keeps a monotonic application
 clock, where skew is not a concept. Queue deadlines are one-shot instants

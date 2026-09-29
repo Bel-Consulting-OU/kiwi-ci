@@ -224,3 +224,71 @@ func TestIntegrationAppClockSkewCannotPrematurelyRejectLease(t *testing.T) {
 		t.Fatalf("DB-expired lease accepted by a heartbeat: %v", err)
 	}
 }
+
+// TestIntegrationCompletionRejectsLeaseExpiredWhileWaitingForLock pins the
+// completion-time authority: completion is a lifecycle transition judged
+// against the live database clock AFTER the row lock. A lease that expires
+// while the completion waits on another transaction's row lock is refused
+// with ErrLeaseConflict, so the first writer after expiry (here the old
+// runner) cannot decide the outcome ahead of recovery.
+func TestIntegrationCompletionRejectsLeaseExpiredWhileWaitingForLock(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	_, jobID, runnerID := leaseClockITSetup(t, st)
+	if _, err := st.AcquireLeaseWithTTL(ctx, leaseClockITClaim(jobID, runnerID, 800*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM jobs WHERE id=$1 FOR UPDATE`, jobID); err != nil {
+		t.Fatalf("lock job row: %v", err)
+	}
+	receipt := model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID, ResultHash: "h"}
+	done := make(chan error, 1)
+	go func() {
+		done <- st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, receipt)
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("completion returned before the row lock was released: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	// Wait past the lease expiry, then release the row WITHOUT touching it.
+	time.Sleep(900 * time.Millisecond)
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit unchanged row: %v", err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrLeaseConflict) {
+			t.Fatalf("completion after the lease expired while blocked = %v, want ErrLeaseConflict", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("completion did not finish")
+	}
+	job, err := st.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != model.StatusRunning {
+		t.Fatalf("expired completion transitioned the job: %s", job.Status)
+	}
+	var receipts int
+	if err := st.pool.QueryRow(ctx, `SELECT count(*) FROM completion_receipts WHERE job_id=$1`, jobID).Scan(&receipts); err != nil {
+		t.Fatal(err)
+	}
+	if receipts != 0 {
+		t.Fatalf("expired completion persisted %d receipts", receipts)
+	}
+	var effects int
+	if err := st.pool.QueryRow(ctx, `SELECT count(*) FROM outbox WHERE payload->>'job_id'=$1`, jobID).Scan(&effects); err != nil {
+		t.Fatal(err)
+	}
+	if effects != 0 {
+		t.Fatalf("expired completion persisted %d completion effect intents", effects)
+	}
+}

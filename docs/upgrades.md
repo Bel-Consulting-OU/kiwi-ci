@@ -515,7 +515,19 @@ claims themselves.
   claims store `clock_timestamp() + TTL`, heartbeat renewal uses the same
   clock and refuses to renew a lease that already expired at it, recovery
   discovery/application compare against a post-lock `clock_timestamp()`, and
-  handler-side expiry checks are explicitly advisory. Cross-replica
-  application-clock skew can no longer extend, prematurely reject, or
-  prematurely recover a lease; the previous NTP synchronization *requirement*
-  for lease safety is gone (NTP remains recommended hygiene).
+  handler-side expiry checks ask the store for database-clock liveness
+  (`LeaseLive`) instead of consulting the replica clock (a DB store without
+  that capability is refused with 503 rather than falling back to
+  replica-clock liveness), completion re-checks the locked lease against a
+  post-lock `clock_timestamp()` and stamps its lifecycle with the same
+  database timestamp, and heartbeat responses carry the store-returned
+  expiry directly (no second read or app-clock fallback). The legacy
+  absolute-time heartbeat is bounded by a 24-hour horizon. Log and
+  test-report ingestion is intentionally not lease-fenced (late-data grace:
+  these records carry no lifecycle authority and their receipts are
+  generation-scoped); every behavior-affecting runner mutation is
+  commit-time fenced.
+  Cross-replica application-clock skew can no longer
+  extend, prematurely reject, prematurely recover, or prematurely complete
+  a lease; the previous NTP synchronization *requirement* for lease safety
+  is gone (NTP remains recommended hygiene).
