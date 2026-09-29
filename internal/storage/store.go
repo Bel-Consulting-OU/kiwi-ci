@@ -1238,7 +1238,16 @@ type LeaseClaim struct {
 	RunnerID   string
 	TokenHash  []byte
 	Generation int64
-	ExpiresAt  time.Time
+	// ExpiresAt is the caller-computed absolute expiry. It remains for
+	// stores without a live database clock (the in-memory store) and for
+	// legacy callers; a LeaseClockStore IGNORES it in favor of TTL.
+	ExpiresAt time.Time
+	// TTL is the lease lifetime. When positive, a LeaseClockStore derives
+	// the stored expiry from its own live wall clock
+	// (clock_timestamp() + TTL) inside the claim transaction, so
+	// cross-replica application-clock skew cannot shorten or lengthen the
+	// real lease.
+	TTL time.Duration
 
 	RunnerCapacity int
 
@@ -1313,6 +1322,24 @@ func (c LeaseClaim) EnvKey() string {
 // fault-injection and server tests) with identical predicate ordering.
 type AtomicLeaseStore interface {
 	AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim) (model.Job, error)
+}
+
+// LeaseClockStore is the database-clock-authoritative lease lifetime
+// capability. A store implementing it computes initial expiry and heartbeat
+// extensions from its own live wall clock (clock_timestamp()), and refuses to
+// renew a lease that has already expired at that clock; TTL is the only
+// lifetime input, so application clocks on any replica cannot alter the real
+// lease duration. DB mode prefers it when available; the in-memory store is
+// single-process and keeps its monotonic application clock.
+type LeaseClockStore interface {
+	// AcquireLeaseWithTTL is AcquireLeaseAtomic with the TTL required: the
+	// stored expiry is derived from the database clock inside the claim
+	// transaction (claim.ExpiresAt is ignored).
+	AcquireLeaseWithTTL(ctx context.Context, claim LeaseClaim) (model.Job, error)
+	// HeartbeatLeaseWithTTL extends a RUNNING lease by ttl from the live
+	// database clock, but only while the stored lease has not already
+	// expired at that clock. It returns the authoritative stored expiry.
+	HeartbeatLeaseWithTTL(ctx context.Context, jobID, runnerID string, generation int64, ttl time.Duration) (time.Time, error)
 }
 
 // QuotaCounterStore adjusts the reserved running/queued counters for a

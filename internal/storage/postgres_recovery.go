@@ -235,7 +235,7 @@ func (s *PostgresStore) repoIDForRecoveryTx(ctx context.Context, tx pgx.Tx, runI
 // left untouched as evidence, while the relational columns carry the terminal
 // state. Retry fields (MaxInfraRetries) live in the payload and cannot be
 // trusted, so the forced transition is terminal failure — never a re-queue.
-func (s *PostgresStore) RecoverExpiredLease(ctx context.Context, jobID string, expectedGeneration int64, now time.Time) error {
+func (s *PostgresStore) RecoverExpiredLease(ctx context.Context, jobID string, expectedGeneration int64, _ time.Time) error {
 	if err := ValidateJobID(jobID); err != nil {
 		return err
 	}
@@ -266,6 +266,16 @@ func (s *PostgresStore) RecoverExpiredLease(ctx context.Context, jobID string, e
 	if err != nil {
 		return err
 	}
+	// Authority for whether this lease is recoverable is the LIVE database
+	// clock sampled AFTER the row lock, never the caller's `now`: an
+	// application clock on the sweeping replica is advisory only (it may be
+	// skewed), and a stale sample would otherwise keep an expired lease
+	// alive until the next sweep.
+	var dbNow time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&dbNow); err != nil {
+		return err
+	}
+	now := dbNow.UTC()
 	// Idempotent no-op: the job is no longer a running lease with the
 	// generation this caller observed (a concurrent recovery, completion or
 	// re-lease already moved it).
@@ -427,7 +437,6 @@ func (s *PostgresStore) ExpireQueuedJob(ctx context.Context, jobID string, deadl
 		return err
 	}
 	defer tx.Rollback(ctx)
-	now := time.Now().UTC()
 	var observed *time.Time
 	if !deadline.IsZero() {
 		observed = &deadline
@@ -448,6 +457,14 @@ func (s *PostgresStore) ExpireQueuedJob(ctx context.Context, jobID string, deadl
 	if err != nil {
 		return err
 	}
+	// The expiry decision is taken with the LIVE database clock sampled
+	// after the row lock; the caller's deadline/observed instants bound what
+	// may be expired, but the database clock decides whether it HAS elapsed.
+	var dbNow time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&dbNow); err != nil {
+		return err
+	}
+	now := dbNow.UTC()
 	if model.Status(status) != model.StatusQueued && model.Status(status) != model.StatusWaitingApproval {
 		// A concurrent lease, cancel or recovery already moved the job.
 		return tx.Commit(ctx)
@@ -552,8 +569,8 @@ const recoveryCandidateCols = "id, lease_generation, queue_deadline"
 // neither shrink the page (which used to make a corrupt row disappear from
 // every sweep) nor shadow the candidates after it. The applier re-reads and
 // re-checks every candidate inside its own transaction.
-func (s *PostgresStore) listRecoveryCandidates(ctx context.Context, query string, now time.Time, afterID string, limit int) ([]RecoveryCandidate, error) {
-	rows, err := s.pool.Query(ctx, query, now, afterID, limit)
+func (s *PostgresStore) listRecoveryCandidates(ctx context.Context, query string, afterID string, limit int) ([]RecoveryCandidate, error) {
+	rows, err := s.pool.Query(ctx, query, afterID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -582,10 +599,11 @@ func (s *PostgresStore) ListExpiredRunningJobs(ctx context.Context, now time.Tim
 	if limit <= 0 {
 		return nil, nil
 	}
+	_ = now // advisory: discovery is judged against the live database clock
 	return s.listRecoveryCandidates(ctx,
 		`SELECT id, lease_generation, NULL::timestamptz FROM jobs
-		 WHERE status='running' AND (lease_expires_at IS NULL OR lease_expires_at <= $1) AND id > $2
-		 ORDER BY id ASC LIMIT $3`, now, afterID, limit)
+		 WHERE status='running' AND (lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp()) AND id > $1
+		 ORDER BY id ASC LIMIT $2`, afterID, limit)
 }
 
 // ListQueueTimedOutJobs returns one bounded page of queued or
@@ -601,15 +619,16 @@ func (s *PostgresStore) ListQueueTimedOutJobs(ctx context.Context, now time.Time
 	if limit <= 0 {
 		return nil, nil
 	}
+	_ = now // advisory: discovery is judged against the live database clock
 	return s.listRecoveryCandidates(ctx,
 		`SELECT `+recoveryCandidateCols+` FROM jobs
 		 WHERE status IN ('queued', 'waiting_approval')
-		   AND id > $2
+		   AND id > $1
 		   AND (
-		         (queue_deadline IS NOT NULL AND queue_deadline <= $1)
+		         (queue_deadline IS NOT NULL AND queue_deadline <= clock_timestamp())
 		      OR (queue_deadline IS NULL AND (
 		              payload ? 'queue_deadline'
 		           OR payload #>> '{compiled_job_payload,effective_job,job,queue_timeout}' IS NOT NULL))
 		   )
-		 ORDER BY id ASC LIMIT $3`, now, afterID, limit)
+		 ORDER BY id ASC LIMIT $2`, afterID, limit)
 }

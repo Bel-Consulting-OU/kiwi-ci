@@ -102,11 +102,19 @@ func (t *cacheTransport) passthrough(req *http.Request) (*http.Response, error) 
 	return http.DefaultTransport.RoundTrip(req)
 }
 
-// cacheRootRoot resolves the shared-ish root above the runner-specific cache
-// namespace: <CacheRoot>/cache when configured, else the user cache root.
+// cacheRootRoot resolves the root above the runner-specific cache namespace:
+// <CacheRoot>/cache when configured, else <identity-dir>/cache (the runner
+// identity directory is per-runner and usually already isolated), else the
+// shared user cache root. Deriving from the identity directory keeps two
+// runner processes in one test environment (or two identities on one host)
+// from contending for the same namespace lock when the operator did not
+// configure an explicit cache root.
 func (r *Runner) cacheRootRoot() string {
 	if r.Cfg.CacheRoot != "" {
 		return filepath.Join(r.Cfg.CacheRoot, "cache")
+	}
+	if r.Cfg.IdentityDir != "" {
+		return filepath.Join(r.Cfg.IdentityDir, "cache")
 	}
 	return cache.Default().Root
 }

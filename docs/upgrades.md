@@ -510,3 +510,12 @@ claims themselves.
   `KIWI_RUNNER_CACHE_LAYOUT_ROOT` names the legacy directory itself, while
   `KIWI_CACHE_ROOT` names the runner base and resolves to its `/cache`
   subdirectory. The confirmation prompt prints both.
+
+- Lease lifetime is now database-clock authoritative in DB mode. Initial
+  claims store `clock_timestamp() + TTL`, heartbeat renewal uses the same
+  clock and refuses to renew a lease that already expired at it, recovery
+  discovery/application compare against a post-lock `clock_timestamp()`, and
+  handler-side expiry checks are explicitly advisory. Cross-replica
+  application-clock skew can no longer extend, prematurely reject, or
+  prematurely recover a lease; the previous NTP synchronization *requirement*
+  for lease safety is gone (NTP remains recommended hygiene).

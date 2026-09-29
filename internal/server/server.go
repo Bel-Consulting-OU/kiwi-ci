@@ -3671,6 +3671,15 @@ func (s *Server) heartbeatDB(w http.ResponseWriter, r *http.Request, jobID strin
 		s.internalError(w, r, err, "")
 		return
 	}
+	// DB mode: the store extended the lease with the DATABASE clock
+	// (clock_timestamp() + TTL) and refused an already-expired lease; the
+	// runner must adopt that authoritative instant, not this replica's
+	// app-clock estimate. The pre-check above is advisory only.
+	if s.DB != nil {
+		if cur, gerr := s.DB.GetJob(ctx, jobID); gerr == nil && cur.LeaseExpiresAt != nil {
+			exp = *cur.LeaseExpiresAt
+		}
+	}
 	writeJSON(w, http.StatusOK, HeartbeatResponse{Cancel: cancelled, LeaseExpiresAt: exp})
 }
 
@@ -4627,6 +4636,12 @@ func hashLeaseToken(key []byte, raw string) []byte {
 // validActiveLease authorizes a runner action against a job's live lease:
 // the job must be running, the lease unexpired, the runner and generation
 // must match, and the presented token must hash to the stored digest.
+//
+// In DB mode this application-clock expiry check is ADVISORY: it rejects
+// obviously stale requests cheaply, but the authoritative lease lifetime is
+// enforced by the store against the database clock (heartbeat renewal, lease
+// commits), so a skewed serving replica can neither extend nor prematurely
+// reject a lease that the database still considers live.
 func (s *Server) validActiveLease(j model.Job, runnerID, token string, generation int64, now time.Time) bool {
 	if j.Status != model.StatusRunning || j.LeaseExpiresAt == nil || !j.LeaseExpiresAt.After(now) {
 		return false

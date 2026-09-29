@@ -241,7 +241,18 @@ func TestIntegrationResourceReservationReleaseLifecyclePostgres(t *testing.T) {
 
 	t.Run("lease expiry", func(t *testing.T) {
 		st, runnerID, jobID := pgITLifecycleEnv(t)
+		// An application-clock-only expiry (the caller's now an hour ahead)
+		// must NOT release a lease the DATABASE still considers live: the
+		// store's expiry authority is the database clock.
 		if err := st.RecoverExpiredLease(context.Background(), jobID, 1, time.Now().UTC().Add(time.Hour)); err != nil {
+			t.Fatalf("skewed recovery: %v", err)
+		}
+		pgITAssertReservations(t, st, runnerID, request, 1)
+		// Expire the lease at the DATABASE clock, then recover for real.
+		if _, err := st.pool.Exec(context.Background(), `UPDATE jobs SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE id=$1`, jobID); err != nil {
+			t.Fatalf("expire at db clock: %v", err)
+		}
+		if err := st.RecoverExpiredLease(context.Background(), jobID, 1, time.Now().UTC().Add(-time.Hour)); err != nil {
 			t.Fatalf("recover expired lease: %v", err)
 		}
 		assertZero(t, st, runnerID)

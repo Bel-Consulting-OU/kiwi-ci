@@ -360,6 +360,32 @@ func (f *FaultyStore) AcquireLease(ctx context.Context, jobID, runnerID string, 
 	return f.Inner.AcquireLease(ctx, jobID, runnerID, tokenHash, generation, expiresAt)
 }
 
+func (f *FaultyStore) AcquireLeaseWithTTL(ctx context.Context, claim LeaseClaim) (model.Job, error) {
+	inner, ok := f.Inner.(LeaseClockStore)
+	if !ok {
+		return model.Job{}, errMissingInnerInterface("LeaseClockStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return model.Job{}, err
+	}
+	return inner.AcquireLeaseWithTTL(ctx, claim)
+}
+
+func (f *FaultyStore) HeartbeatLeaseWithTTL(ctx context.Context, jobID string, runnerID string, generation int64, ttl time.Duration) (time.Time, error) {
+	inner, ok := f.Inner.(LeaseClockStore)
+	if !ok {
+		return time.Time{}, errMissingInnerInterface("LeaseClockStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return time.Time{}, err
+	}
+	return inner.HeartbeatLeaseWithTTL(ctx, jobID, runnerID, generation, ttl)
+}
+
 func (f *FaultyStore) HeartbeatLease(ctx context.Context, jobID string, runnerID string, generation int64, expiresAt time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

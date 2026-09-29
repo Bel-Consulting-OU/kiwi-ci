@@ -1421,7 +1421,7 @@ func (s *PostgresStore) AcquireLease(ctx context.Context, jobID, runnerID string
 	// the FIRST lease only (COALESCE) so requeues and lost-runner re-leases
 	// preserve the original start time. A quarantined job is denied here too:
 	// the durable flag is checked in the claim statement itself.
-	err := s.pool.QueryRow(ctx, `UPDATE jobs SET status='running', attempts = attempts + 1, started_at = COALESCE(started_at, now()), lease_runner_id=$2, lease_token_hash=$3, lease_generation=$4, lease_expires_at=$5 WHERE id=$1 AND status='queued' AND COALESCE(payload->>'repo_identity_quarantined','') <> 'true' AND `+LeaseParentRunEligibleSQL+` AND (lease_expires_at IS NULL OR lease_expires_at < now()) RETURNING `+jobCols,
+	err := s.pool.QueryRow(ctx, `UPDATE jobs SET status='running', attempts = attempts + 1, started_at = COALESCE(started_at, now()), lease_runner_id=$2, lease_token_hash=$3, lease_generation=$4, lease_expires_at=$5 WHERE id=$1 AND status='queued' AND COALESCE(payload->>'repo_identity_quarantined','') <> 'true' AND `+LeaseParentRunEligibleSQL+` AND (lease_expires_at IS NULL OR lease_expires_at < clock_timestamp()) RETURNING `+jobCols,
 		jobID, runnerID, tokenHash, generation, expiresAt).Scan(jobTargets(&js)...)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return model.Job{}, ErrLeaseConflict
@@ -1679,9 +1679,15 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 	costRate, powerWatts := effective.CostPerHour, effective.PowerWatts
 
 	// Step 5: claim the job (queued -> running) with attempts/started_at.
+	// A positive TTL makes the stored expiry DATABASE-CLOCK authoritative
+	// (clock_timestamp() + TTL) inside this transaction; otherwise the
+	// caller's absolute instant is kept for stores/callers without a live DB
+	// clock. Eligibility is judged against the DB clock either way.
 	js := jobScanner{}
-	err = tx.QueryRow(ctx, `UPDATE jobs SET status='running', attempts = attempts + 1, started_at = COALESCE(started_at, now()), lease_runner_id=$2, lease_token_hash=$3, lease_generation=$4, lease_expires_at=$5 WHERE id=$1 AND status='queued' AND (lease_expires_at IS NULL OR lease_expires_at < now()) RETURNING `+jobCols,
-		claim.JobID, claim.RunnerID, claim.TokenHash, claim.Generation, claim.ExpiresAt).Scan(jobTargets(&js)...)
+	err = tx.QueryRow(ctx, `UPDATE jobs SET status='running', attempts = attempts + 1, started_at = COALESCE(started_at, now()), lease_runner_id=$2, lease_token_hash=$3, lease_generation=$4,
+			lease_expires_at = CASE WHEN $6::bigint > 0 THEN clock_timestamp() + ($6::bigint * interval '1 microsecond') ELSE $5 END
+		 WHERE id=$1 AND status='queued' AND (lease_expires_at IS NULL OR lease_expires_at < clock_timestamp()) RETURNING `+jobCols,
+		claim.JobID, claim.RunnerID, claim.TokenHash, claim.Generation, claim.ExpiresAt, claim.TTL.Microseconds()).Scan(jobTargets(&js)...)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return model.Job{}, ErrLeaseConflict
 	}
@@ -1739,19 +1745,67 @@ func (s *PostgresStore) HeartbeatLease(ctx context.Context, jobID string, runner
 	if err := ValidateJobID(jobID); err != nil {
 		return err
 	}
-	ct, err := s.pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=$4 WHERE id=$1 AND status='running' AND lease_runner_id=$2 AND lease_generation=$3`, jobID, runnerID, generation, expiresAt)
+	// Renewal requires a lease that is STILL LIVE at the database clock:
+	// otherwise a delayed heartbeat could resurrect a lease that recovery has
+	// already been allowed to claim, and the caller's absolute instant
+	// (application clock) must never be the final authority on whether the
+	// renewal is admissible.
+	ct, err := s.pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=$4 WHERE id=$1 AND status='running' AND lease_runner_id=$2 AND lease_generation=$3 AND lease_expires_at IS NOT NULL AND lease_expires_at > clock_timestamp()`, jobID, runnerID, generation, expiresAt)
 	if err != nil {
 		return err
 	}
 	if ct.RowsAffected() > 0 {
 		return nil
 	}
+	return s.classifyHeartbeatMiss(ctx, jobID, generation)
+}
+
+// AcquireLeaseWithTTL is the database-clock-authoritative claim: the stored
+// expiry is clock_timestamp() + TTL inside the claim transaction.
+func (s *PostgresStore) AcquireLeaseWithTTL(ctx context.Context, claim LeaseClaim) (model.Job, error) {
+	if claim.TTL <= 0 {
+		return model.Job{}, fmt.Errorf("storage: lease claim TTL must be positive")
+	}
+	return s.AcquireLeaseAtomic(ctx, claim)
+}
+
+// HeartbeatLeaseWithTTL extends a live lease by ttl from the LIVE database
+// clock and returns the stored expiry. The WHERE clause refuses to renew a
+// lease that already expired at that clock, so a delayed heartbeat can never
+// resurrect a recoverable lease.
+func (s *PostgresStore) HeartbeatLeaseWithTTL(ctx context.Context, jobID, runnerID string, generation int64, ttl time.Duration) (time.Time, error) {
+	if err := ValidateJobID(jobID); err != nil {
+		return time.Time{}, err
+	}
+	if ttl <= 0 {
+		return time.Time{}, fmt.Errorf("storage: lease heartbeat TTL must be positive")
+	}
+	var expires time.Time
+	err := s.pool.QueryRow(ctx, `UPDATE jobs SET lease_expires_at = clock_timestamp() + ($4::bigint * interval '1 microsecond')
+		WHERE id=$1 AND status='running' AND lease_runner_id=$2 AND lease_generation=$3
+		  AND lease_expires_at IS NOT NULL AND lease_expires_at > clock_timestamp()
+		RETURNING lease_expires_at`,
+		jobID, runnerID, generation, ttl.Microseconds()).Scan(&expires)
+	if err == nil {
+		return expires, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, err
+	}
+	return time.Time{}, s.classifyHeartbeatMiss(ctx, jobID, generation)
+}
+
+// classifyHeartbeatMiss maps a zero-row heartbeat update to the typed reason:
+// a vanished job is ErrNotFound, a generation change is ErrGenerationMismatch,
+// and everything else (runner replaced, cancelled, or expired) is
+// ErrLeaseConflict.
+func (s *PostgresStore) classifyHeartbeatMiss(ctx context.Context, jobID string, generation int64) error {
 	var (
 		curGen    int64
 		curRunner string
 		curStatus string
 	)
-	err = s.pool.QueryRow(ctx, `SELECT COALESCE(lease_runner_id, ''), lease_generation, status FROM jobs WHERE id=$1`, jobID).Scan(&curRunner, &curGen, &curStatus)
+	err := s.pool.QueryRow(ctx, `SELECT COALESCE(lease_runner_id, ''), lease_generation, status FROM jobs WHERE id=$1`, jobID).Scan(&curRunner, &curGen, &curStatus)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}

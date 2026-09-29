@@ -395,27 +395,31 @@ and CI image pin comments still use the historical lane name
 
 ## Time authority and clock skew (lease records)
 
-Kiwi stores absolute lease instants (`lease_expires_at`) and compares them at
-several points. The authority model is:
+In **DB mode the database clock is the authority for a lease's lifetime**:
 
-- **Acquire/heartbeat** compute an absolute instant from the server process
-  clock and persist it. All replicas read that stored instant; nothing is
-  derived from a local clock at read time.
-- **Commit-time fences that can block on row locks** evaluate expiry AFTER
-  the lock with the database's live wall clock (`clock_timestamp()`). Cache
-  manifest, snapshot and artifact commits are the contract here: a lease that
-  expires while the transaction waits is rejected.
-- **Recovery and queue-expiry sweeps** sample a clock before the row lock.
-  Staleness in those samples can only DELAY recovery or expiry (a later
-  comparison instant sees more expired leases), never trigger it early for an
-  unexpired lease.
+- **Initial claim** stores `clock_timestamp() + TTL` inside the claim
+  transaction (`LeaseClaim.TTL`), so a replica's application clock cannot
+  shorten or lengthen the real lease; the returned expiry is the stored one.
+- **Heartbeat renewal** writes `clock_timestamp() + TTL` and only matches
+  while the stored lease has not already expired at that clock, so a delayed
+  heartbeat can never resurrect a recoverable lease.
+- **Recovery discovery and application** compare against
+  `clock_timestamp()` sampled after the row lock, so a recovery replica whose
+  application clock is hours ahead cannot prematurely reclaim a live lease,
+  and one that is hours behind can still recover an expired lease.
+- **Handler-side lease checks** (`authorizeRunnerLease` and the heartbeat
+  pre-check) are ADVISORY: they reject obviously stale requests cheaply, while
+  the authoritative lifetime is enforced inside the store as above.
 
-The remaining assumption is **NTP-synchronized clocks across control-plane
-replicas**: a leader whose clock runs ahead of the replica that created or
-extended a lease can recover that lease early. Operators should run chrony or
-an equivalent NTP client on every server host (and on runners, whose clocks
-feed initial expiry through the control plane). The deviation bound should be
-far below the lease TTL, which the scheduler's heartbeat cadence assumes
-already. A future revision may make lease extension database-clock
-authoritative end to end; until then, do not run replicas with unsynchronized
-clocks.
+The in-memory/dev store is single-process and keeps a monotonic application
+clock, where skew is not a concept. Queue deadlines are one-shot instants
+recorded at admission; their expiration is compared against the database
+clock at sweep time, so skew can at most shift a deadline by the admission
+replica's offset (the same magnitude as any NTP deviation), not accumulate
+over a lease's lifetime.
+
+Consequently, DB-mode HA no longer depends on cross-replica wall-clock
+synchronization for lease safety; keeping hosts NTP-synchronized remains good
+operational hygiene, but a skewed replica can no longer extend, prematurely
+reject, or prematurely recover a lease.
+

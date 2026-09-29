@@ -254,8 +254,8 @@ type Config struct {
 	// MetricsListen exposes the Prometheus text metrics endpoint when set
 	// (e.g. ":9091").
 	MetricsListen string
-	// CacheRoot is the root for the runner's local cache and artifact
-	// stores (default: ~/.kiwi).
+	// CacheRoot is the root for the runner's local cache store (default:
+	// the runner identity directory's "cache" subdirectory, else ~/.kiwi).
 	CacheRoot string
 	// StagingDir is the ROOT for the runner's bounded dependency spool (the
 	// scratch space a downloaded dependency artifact is written to before

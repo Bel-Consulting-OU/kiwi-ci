@@ -386,11 +386,15 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 		expires := LeaseExpiry(now, s.LeaseDuration)
 		generation := candidate.LeaseGeneration + 1
 		claim := storage.LeaseClaim{
-			JobID:                  candidate.ID,
-			RunnerID:               runnerID,
-			TokenHash:              s.HashToken(raw),
-			Generation:             generation,
-			ExpiresAt:              expires,
+			JobID:      candidate.ID,
+			RunnerID:   runnerID,
+			TokenHash:  s.HashToken(raw),
+			Generation: generation,
+			ExpiresAt:  expires,
+			// A DB-clock store derives the stored expiry from this TTL and
+			// its own live clock, so cross-replica application-clock skew
+			// cannot shorten or lengthen the real lease.
+			TTL:                    s.LeaseDuration,
 			RunnerCapacity:         eff.Capacity,
 			Runtime:                storage.JobRuntime(candidate),
 			CanonRepoID:            storage.RepoIDForJob(candidate),
@@ -421,12 +425,27 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 		// disable/drain or overrun environment/quota limits.
 		// The separate UpsertRunner afterwards is skipped because the store
 		// already updated the runner row.
-		if as, ok := s.Store.(storage.AtomicLeaseStore); ok {
-			j, err := as.AcquireLeaseAtomic(ctx, claim)
+		clockStore, hasClock := s.Store.(storage.LeaseClockStore)
+		atomicStore, hasAtomic := s.Store.(storage.AtomicLeaseStore)
+		if hasClock || hasAtomic {
+			var j model.Job
+			var err error
+			if hasClock {
+				j, err = clockStore.AcquireLeaseWithTTL(ctx, claim)
+			} else {
+				j, err = atomicStore.AcquireLeaseAtomic(ctx, claim)
+			}
 			switch {
 			case err == nil:
 				j.NeedsOutputs = CollectNeedsOutputs(candidate, jobs)
-				return &j, raw, expires, nil
+				// Prefer the STORE-assigned expiry (a DB-clock store wrote
+				// clock_timestamp()+TTL); the app-clock instant is only the
+				// fallback for stores without a live clock.
+				exp := expires
+				if j.LeaseExpiresAt != nil {
+					exp = *j.LeaseExpiresAt
+				}
+				return &j, raw, exp, nil
 			case errors.Is(err, storage.ErrLeaseConflict):
 				continue
 			case errors.Is(err, storage.ErrNoCapacity),
@@ -644,7 +663,13 @@ func (s *DBScheduler) Heartbeat(ctx context.Context, jobID, runnerID string, tok
 	if j.Status == model.StatusCancelled {
 		return true, nil
 	}
-	if err := s.Store.HeartbeatLease(ctx, jobID, runnerID, generation, expiresAt); err != nil {
+	var hbErr error
+	if lc, ok := s.Store.(storage.LeaseClockStore); ok {
+		_, hbErr = lc.HeartbeatLeaseWithTTL(ctx, jobID, runnerID, generation, s.LeaseDuration)
+	} else {
+		hbErr = s.Store.HeartbeatLease(ctx, jobID, runnerID, generation, expiresAt)
+	}
+	if err := hbErr; err != nil {
 		if errors.Is(err, storage.ErrLeaseConflict) {
 			// A conflict can mean a concurrent cancellation: surface it so the
 			// runner stops instead of retrying the lease.
