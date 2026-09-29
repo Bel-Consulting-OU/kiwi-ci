@@ -248,9 +248,7 @@ func TestGitHubPublishCheckEdges(t *testing.T) {
 		t.Fatalf("output = %v", body["output"])
 	}
 
-	closed := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	closed.Close()
-	if err := (&GitHub{BaseURL: closed.URL}).PublishCheck(context.Background(), "o/r", "sha", "n", "queued", "", "", "", nil); err == nil {
+	if err := (&GitHub{BaseURL: failingBaseURL, Client: failingTransportClient()}).PublishCheck(context.Background(), "o/r", "sha", "n", "queued", "", "", "", nil); err == nil {
 		t.Fatal("transport error must fail")
 	}
 	if err := (&GitHub{BaseURL: "http://\x7f"}).PublishCheck(context.Background(), "o/r", "sha", "n", "queued", "", "", "", nil); err == nil {
@@ -267,9 +265,7 @@ func TestGitHubChangedFilesErrors(t *testing.T) {
 		t.Fatalf("missing shas = %+v (err %v)", res, err)
 	}
 
-	closed := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	closed.Close()
-	if _, err := (&GitHub{BaseURL: closed.URL}).ChangedFiles(context.Background(), ec); err == nil {
+	if _, err := (&GitHub{BaseURL: failingBaseURL, Client: failingTransportClient()}).ChangedFiles(context.Background(), ec); err == nil {
 		t.Fatal("transport error must fail")
 	}
 	if _, err := (&GitHub{BaseURL: "http://\x7f"}).ChangedFiles(context.Background(), ec); err == nil {

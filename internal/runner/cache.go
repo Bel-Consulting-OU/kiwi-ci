@@ -218,6 +218,16 @@ func (r *Runner) pruneJobCache(ctx context.Context) {
 	} else if removed > 0 {
 		reportf("kiwi runner %s: cache temp cleanup reclaimed %d file(s)\n", r.ID, removed)
 	}
+	// Incomplete upgrade reclamation is retried on EVERY maintenance pass
+	// until the legacy shared tree is gone: a transient EBUSY during the
+	// upgrade must not leave a large legacy cache consuming disk for the
+	// whole process lifetime, and the legacy files sit outside every
+	// per-runner manager.
+	if files, bytes, err := cache.ReclaimLegacyLayout(r.cacheRootRoot()); err != nil {
+		reportf("kiwi runner %s: legacy cache reclaim incomplete: %v\n", r.ID, err)
+	} else if files > 0 {
+		reportf("kiwi runner %s: reclaimed %d legacy shared cache entries (%d bytes)\n", r.ID, files, bytes)
+	}
 	res, err := mgr.Prune(ctx)
 	if err != nil {
 		reportf("kiwi runner %s: cache retention: %v\n", r.ID, err)

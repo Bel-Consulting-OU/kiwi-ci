@@ -19,6 +19,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cache"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
 )
 
 // TestRunnerCachePreflightUsesResolvedBound is the P2 regression: the
@@ -543,5 +544,103 @@ func TestRunnerCacheManagerReplacementRefusedWithDebt(t *testing.T) {
 	}
 	if mgr.PendingTempCleanup() != 0 {
 		t.Fatalf("old manager still has %d pending temps", mgr.PendingTempCleanup())
+	}
+}
+
+// TestCacheManagerStartupFailureDoesNotRetainStagingOwnership pins the
+// startup ordering: a cache-manager refusal must return before the staging
+// directory lock/process-registry ownership is acquired, so a Run that never
+// started cannot block a later same-identity Run with ErrStagingDirOwned.
+func TestCacheManagerStartupFailureDoesNotRetainStagingOwnership(t *testing.T) {
+	served := make(chan struct{}, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/register"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"runner-1"}`))
+		default:
+			select {
+			case served <- struct{}{}:
+			default:
+			}
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	defer ts.Close()
+
+	stagingRoot := t.TempDir()
+	r := &Runner{ID: "runner-1", Cfg: Config{
+		Server: ts.URL, Poll: time.Millisecond, Concurrency: 1,
+		IdentityDir: t.TempDir(), WorkDir: t.TempDir(),
+		StagingDir: stagingRoot, StagingMaxBytes: 1 << 20,
+		CacheRoot: t.TempDir(), CacheMaxBytes: 2000,
+	}, Client: ts.Client(), Metrics: NewMetrics()}
+	// Force retained cache cleanup debt, then change the policy so
+	// configureCacheManager must refuse the replacement.
+	mgr := r.cacheManager()
+	res, err := mgr.Reserve(context.Background(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	debt := filepath.Join(mgr.Root(), ".debt.tar.gz-1.tmp")
+	if err := os.MkdirAll(debt, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(debt, "x"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !mgr.RetainTempCleanup(res, debt) {
+		t.Fatal("retain did not accept the reservation")
+	}
+	r.Cfg.CacheMaxBytes = 1000
+
+	err = r.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "replacement refused") {
+		t.Fatalf("Run = %v, want the cache replacement refusal", err)
+	}
+	if r.currentStaging() != nil {
+		t.Fatal("staging was configured before the cache refusal")
+	}
+	// The staging directory lock is available for the same runner identity:
+	// a Run that failed at cache startup must not hold it.
+	probe, perr := staging.NewReplicaBudget(stagingRoot, runnerStagingInstanceID("runner-1"), 1<<20)
+	if perr != nil {
+		t.Fatalf("staging ownership leaked by the failed startup: %v", perr)
+	}
+	if cerr := probe.Close(); cerr != nil {
+		t.Fatal(cerr)
+	}
+	// The runner must not have leased a job either.
+	select {
+	case <-served:
+		t.Fatal("failed startup leased a job")
+	default:
+	}
+}
+
+// TestRunnerPruneJobCacheRetriesLegacyReclaim pins the periodic retry: legacy
+// shared entries created after startup are reclaimed by the maintenance pass,
+// not only at manager installation.
+func TestRunnerPruneJobCacheRetriesLegacyReclaim(t *testing.T) {
+	root := t.TempDir()
+	r := testRunnerFor(t, httptest.NewServer(http.NotFoundHandler()), Config{CacheRoot: root, CacheMaxBytes: 2000})
+	legacyDir := filepath.Join(root, "cache")
+	if err := os.MkdirAll(legacyDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	key := strings.Repeat("9", 64)
+	legacy := filepath.Join(legacyDir, key+".tar.gz")
+	if err := os.WriteFile(legacy, []byte("legacy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacy+".sha256", []byte("d\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r.pruneJobCache(context.Background())
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Fatalf("legacy archive survived maintenance (err=%v)", err)
+	}
+	if _, err := os.Stat(legacy + ".sha256"); !os.IsNotExist(err) {
+		t.Fatalf("legacy sidecar survived maintenance (err=%v)", err)
 	}
 }

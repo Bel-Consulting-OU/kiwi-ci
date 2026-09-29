@@ -454,6 +454,21 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err := r.register(ctx); err != nil {
 		return err
 	}
+	// The cache manager follows the same explicit lifecycle: a Run started
+	// with a changed cache root or policy gets a fresh manager instead of
+	// accounting against the previous Run's ledger, and the change is
+	// refused while the old manager still holds cleanup debt.
+	//
+	// It is configured BEFORE the staging budget on purpose: cache-manager
+	// construction does not depend on staging, and its refusal path returns
+	// from Run before the externally owned staging directory lock and
+	// process-registry entry are acquired. With the opposite order, a cache
+	// startup refusal left staging ownership live for a Run that never
+	// started (a later same-identity Run in the process would see
+	// ErrStagingDirOwned).
+	if err := r.configureCacheManager(); err != nil {
+		return err
+	}
 	// The runner-wide dependency staging budget is constructed ONCE per Run,
 	// before any job can be leased, and owned until the fully joined
 	// shutdown retires it (closeStaging): every dependency restore reserves
@@ -463,13 +478,6 @@ func (r *Runner) Run(ctx context.Context) error {
 	// directory, another live owner) fails startup instead of the first
 	// multi-GB restore.
 	if err := r.configureStaging(); err != nil {
-		return err
-	}
-	// The cache manager follows the same explicit lifecycle: a Run started
-	// with a changed cache root or policy gets a fresh manager instead of
-	// accounting against the previous Run's ledger, and the change is
-	// refused while the old manager still holds cleanup debt.
-	if err := r.configureCacheManager(); err != nil {
 		return err
 	}
 	// The staging ledger is exposed as scrape-time gauges: Used() includes

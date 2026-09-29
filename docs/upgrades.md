@@ -466,3 +466,9 @@ claims themselves.
   `ErrInvalidReservation` before running the publication callback, and the
   temp-cleanup retry reads its pending map under the manager lock (the
   unlocked length check was a data race).
+- Runner startup now configures the cache manager before the dependency
+  staging budget, so a cache-manager refusal (for example outstanding cleanup
+  debt from a previous Run with a changed policy) can no longer leak the
+  externally owned staging directory lock for a Run that never started.
+  Incomplete legacy-cache reclamation is retried on every cache maintenance
+  pass instead of only at manager installation.

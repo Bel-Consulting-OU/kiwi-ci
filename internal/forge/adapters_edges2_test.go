@@ -154,9 +154,7 @@ func TestGitLabParseMergeRequestEdges(t *testing.T) {
 }
 
 func TestGitLabFetchFileErrors(t *testing.T) {
-	closed := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	closed.Close()
-	if _, err := (&GitLab{BaseURL: closed.URL}).FetchFile(context.Background(), "g/p", "f", "main"); err == nil {
+	if _, err := (&GitLab{BaseURL: failingBaseURL, Client: failingTransportClient()}).FetchFile(context.Background(), "g/p", "f", "main"); err == nil {
 		t.Fatal("transport error must fail")
 	}
 	if _, err := (&GitLab{BaseURL: "http://\x7f"}).FetchFile(context.Background(), "g/p", "f", "main"); err == nil {
@@ -184,9 +182,7 @@ func TestGitLabChangedFilesEdges(t *testing.T) {
 		t.Fatalf("empty context = %+v (err %v)", res, err)
 	}
 
-	closed := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	closed.Close()
-	if _, err := (&GitLab{BaseURL: closed.URL}).ChangedFiles(context.Background(), ec); err == nil {
+	if _, err := (&GitLab{BaseURL: failingBaseURL, Client: failingTransportClient()}).ChangedFiles(context.Background(), ec); err == nil {
 		t.Fatal("transport error must fail")
 	}
 	if _, err := (&GitLab{BaseURL: "http://\x7f"}).ChangedFiles(context.Background(), ec); err == nil {
@@ -278,9 +274,7 @@ func TestGitLabPublishCheckStates(t *testing.T) {
 		}
 	}
 
-	closed := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	closed.Close()
-	if err := (&GitLab{BaseURL: closed.URL}).PublishCheck(context.Background(), "g/p", "sha", "n", "queued", "", "", "", nil); err == nil {
+	if err := (&GitLab{BaseURL: failingBaseURL, Client: failingTransportClient()}).PublishCheck(context.Background(), "g/p", "sha", "n", "queued", "", "", "", nil); err == nil {
 		t.Fatal("transport error must fail")
 	}
 	if err := (&GitLab{BaseURL: "http://\x7f"}).PublishCheck(context.Background(), "g/p", "sha", "n", "queued", "", "", "", nil); err == nil {
@@ -378,9 +372,7 @@ func TestForgejoBaseURLClientAndParse(t *testing.T) {
 }
 
 func TestForgejoFetchFileErrors(t *testing.T) {
-	closed := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	closed.Close()
-	if _, err := (&Forgejo{BaseURL: closed.URL}).FetchFile(context.Background(), "o/r", "f", "main"); err == nil {
+	if _, err := (&Forgejo{BaseURL: failingBaseURL, Client: failingTransportClient()}).FetchFile(context.Background(), "o/r", "f", "main"); err == nil {
 		t.Fatal("transport error must fail")
 	}
 	if _, err := (&Forgejo{BaseURL: "http://\x7f"}).FetchFile(context.Background(), "o/r", "f", "main"); err == nil {
@@ -413,9 +405,7 @@ func TestForgejoChangedFilesAndPublishErrors(t *testing.T) {
 	if res, err := (&Forgejo{}).ChangedFiles(context.Background(), EventContext{}); err != nil || res.Complete || res.Files != nil {
 		t.Fatalf("empty context = %+v (err %v)", res, err)
 	}
-	closed := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	closed.Close()
-	if _, err := (&Forgejo{BaseURL: closed.URL}).ChangedFiles(context.Background(), ec); err == nil {
+	if _, err := (&Forgejo{BaseURL: failingBaseURL, Client: failingTransportClient()}).ChangedFiles(context.Background(), ec); err == nil {
 		t.Fatal("transport error must fail")
 	}
 	if _, err := (&Forgejo{BaseURL: "http://\x7f"}).ChangedFiles(context.Background(), ec); err == nil {
@@ -467,7 +457,7 @@ func TestForgejoChangedFilesAndPublishErrors(t *testing.T) {
 			t.Errorf("status %q conclusion %q -> %q, want %q", tc.status, tc.conclusion, state, tc.want)
 		}
 	}
-	if err := (&Forgejo{BaseURL: closed.URL}).PublishCheck(context.Background(), "o/r", "sha", "n", "queued", "", "", "", nil); err == nil {
+	if err := (&Forgejo{BaseURL: failingBaseURL, Client: failingTransportClient()}).PublishCheck(context.Background(), "o/r", "sha", "n", "queued", "", "", "", nil); err == nil {
 		t.Fatal("transport error must fail")
 	}
 	if err := (&Forgejo{BaseURL: "http://\x7f"}).PublishCheck(context.Background(), "o/r", "sha", "n", "queued", "", "", "", nil); err == nil {
@@ -628,10 +618,9 @@ func TestAppInstallationAndLookupErrors(t *testing.T) {
 		t.Fatalf("zero id = %v", err)
 	}
 
-	closed := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	closed.Close()
 	app = NewApp(1, pemBytes)
-	app.BaseURL = closed.URL
+	app.BaseURL = failingBaseURL
+	app.Client = failingTransportClient()
 	if _, _, err := app.InstallationToken(context.Background(), 7); err == nil {
 		t.Fatal("transport error must fail")
 	}
