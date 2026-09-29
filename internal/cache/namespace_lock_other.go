@@ -63,10 +63,14 @@ func (l *namespaceLock) release() error {
 	if l == nil || !l.owned {
 		return nil
 	}
-	l.owned = false
+	// Ownership is cleared ONLY after the lock file is gone (or was already
+	// gone): a transient removal failure must leave the lock retryable, or a
+	// process would lock itself (and a successor) out indefinitely because
+	// the stale file records its own pid.
 	if err := os.Remove(l.path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("cache: remove lock file %s: %w", l.path, err)
 	}
+	l.owned = false
 	return nil
 }
 

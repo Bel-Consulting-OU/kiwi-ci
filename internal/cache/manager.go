@@ -22,6 +22,10 @@ var ErrCacheDirOwned = errors.New("cache: namespace directory is owned by anothe
 // ownership has been released (Run shutdown or a failed startup rollback).
 var ErrManagerClosed = errors.New("cache: manager is closed")
 
+// releaseNamespaceLock is a seam over the held lock's release, so the
+// retry-on-failure contract can be tested on every platform.
+var releaseNamespaceLock = func(l *namespaceLock) error { return l.release() }
+
 // ErrInvalidReservation reports Manager.Publish called with a nil,
 // already-ended, or foreign reservation. The publish callback is NOT run:
 // accounting authority must fail closed before creating physical bytes it
@@ -106,19 +110,28 @@ func (m *Manager) Close() error {
 		return nil
 	}
 	m.mu.Lock()
-	if m.closed {
+	if m.closed && m.lock == nil {
 		m.mu.Unlock()
 		return nil
 	}
 	m.closed = true
 	_, _ = m.retryTempCleanupLocked(context.Background())
 	lock := m.lock
-	m.lock = nil
 	m.mu.Unlock()
 	if lock == nil {
 		return nil
 	}
-	return lock.release()
+	if err := releaseNamespaceLock(lock); err != nil {
+		// Retain the lock handle: a failed release must be retryable, or the
+		// namespace would be lost for the life of the process.
+		return fmt.Errorf("cache: release namespace %s: %w", m.root, err)
+	}
+	m.mu.Lock()
+	if m.lock == lock {
+		m.lock = nil
+	}
+	m.mu.Unlock()
+	return nil
 }
 
 // ReclaimAbandonedTemps removes Kiwi-owned cache temp files
@@ -337,6 +350,9 @@ func (m *Manager) RetryTempCleanup(ctx context.Context) (int, error) {
 	// data race (and a potential runtime fatal error).
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed {
+		return 0, ErrManagerClosed
+	}
 	return m.retryTempCleanupLocked(ctx)
 }
 
@@ -488,5 +504,10 @@ func (m *Manager) Prune(ctx context.Context) (PruneResult, error) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// A closed manager has released namespace ownership to a successor; it
+	// must never delete entries through a stale reference.
+	if m.closed {
+		return PruneResult{}, ErrManagerClosed
+	}
 	return pruneLocalDir(ctx, m.root, m.policy)
 }

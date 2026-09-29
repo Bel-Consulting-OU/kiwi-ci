@@ -481,4 +481,20 @@ claims themselves.
   staging configuration fails after cache ownership is acquired, the cache
   namespace is released again, and a fully joined shutdown closes it
   alongside staging. A closed manager refuses further reservations,
-  publications and retention passes.
+  publications, retention passes and temp retries. A transient lock-release
+  failure is retryable: the manager (and the runner) retain the lock handle
+  instead of discarding it.
+- Legacy pre-namespace cache archives are NO LONGER deleted automatically.
+  The per-runner namespace lock cannot prove a pre-namespace process is
+  dead, so a rolling upgrade could delete a still-running old runner's cache
+  archives. Once every pre-namespace runner has drained, reclaim them
+  explicitly with
+  `kiwi storage migrate-runner-cache-layout --dir <CacheRoot>/cache [--force]`
+  (interactive confirmation; non-interactive runs without `--force` remove
+  nothing).
+- Lease-committing metadata writes (cache manifests, snapshots, artifacts)
+  now evaluate lease expiry against the live database clock AFTER the job
+  row lock, not the transaction-start timestamp. A commit that was blocked
+  on another transaction's row lock while the lease expired is now rejected
+  with `ErrLeaseLost` instead of publishing durable metadata after lease
+  authority ended.

@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/app"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cache"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/version"
 )
@@ -140,6 +141,9 @@ func storageCommand(ctx context.Context, args []string, stdin io.Reader, stdout,
 	if len(args) >= 1 && args[0] == "migrate-staging-layout" {
 		return migrateStagingLayout(ctx, args[1:], stdin, stdout, stderr)
 	}
+	if len(args) >= 1 && args[0] == "migrate-runner-cache-layout" {
+		return migrateRunnerCacheLayout(ctx, args[1:], stdin, stdout, stderr)
+	}
 	return app.Storage(ctx, args)
 }
 
@@ -188,6 +192,67 @@ func migrateStagingLayout(ctx context.Context, args []string, stdin io.Reader, s
 	return nil
 }
 
+// migrateRunnerCacheLayout implements
+// `kiwi storage migrate-runner-cache-layout --dir DIR [--force]`.
+//
+// It reclaims the pre-per-runner-namespace cache archives that older runners
+// left directly in the shared cache root (<CacheRoot>/cache/*.tar.gz plus
+// sidecars). Those files were written with NO namespace ownership lock, so
+// the new per-runner lock cannot prove an old process is dead: automatic
+// reclamation during a rolling upgrade could delete a still-live runner's
+// cache. The operator must confirm every old runner has drained, either
+// interactively or with --force; without one of those confirmations the
+// command refuses and removes nothing.
+func migrateRunnerCacheLayout(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	_ = ctx
+	fs := flag.NewFlagSet("storage migrate-runner-cache-layout", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	dir := fs.String("dir", os.Getenv("KIWI_CACHE_ROOT"), "shared cache root directory, i.e. the parent of the per-runner namespace dirs (or KIWI_CACHE_ROOT)")
+	force := fs.Bool("force", false, "confirm every pre-namespace runner has drained/stopped; skips the interactive prompt")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("storage migrate-runner-cache-layout takes no arguments")
+	}
+	root := strings.TrimSpace(*dir)
+	if root == "" {
+		return fmt.Errorf("--dir is required (or set KIWI_CACHE_ROOT)")
+	}
+	if !*force {
+		confirmed, err := confirmRunnerCacheMigration(stdin, stderr, root)
+		if err != nil {
+			return err
+		}
+		if !confirmed {
+			return fmt.Errorf("runner cache layout migration aborted: run with --force once every pre-namespace runner has drained")
+		}
+	}
+	files, bytes, err := cache.ReclaimLegacyLayout(root)
+	if err != nil {
+		return fmt.Errorf("runner cache layout migration incomplete after reclaiming %d files (%d bytes): %w", files, bytes, err)
+	}
+	fmt.Fprintf(stdout, "runner cache layout migrated: root=%s reclaimed=%d bytes=%d\n", root, files, bytes)
+	return nil
+}
+
+// confirmRunnerCacheMigration asks the operator to type "yes" before the
+// destructive pass; an unreadable or non-interactive stdin is a refusal.
+func confirmRunnerCacheMigration(stdin io.Reader, stderr io.Writer, root string) (bool, error) {
+	fmt.Fprintf(stderr, "This removes pre-namespace cache archives (<key>.tar.gz and sidecars) from %s.\n", root)
+	fmt.Fprintln(stderr, "It is only safe once EVERY pre-namespace runner has drained/stopped (its cache archives are still in use otherwise; the cache itself is disposable, so a later version could abandon them).")
+	fmt.Fprint(stderr, "Type 'yes' to continue: ")
+	scanner := bufio.NewScanner(stdin)
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			return false, fmt.Errorf("read confirmation: %w", err)
+		}
+		return false, nil
+	}
+	answer := strings.ToLower(strings.TrimSpace(scanner.Text()))
+	return answer == "yes" || answer == "y", nil
+}
+
 // confirmStagingMigration asks the operator to type "yes" before the
 // destructive pass. An unreadable or non-interactive stdin (EOF) is treated as
 // a refusal, so a cron/script invocation without --force removes nothing.
@@ -234,6 +299,7 @@ Usage:
   kiwi database migrate|status --database-url URL
   kiwi storage  reconcile-reservations --database-url URL
   kiwi storage  migrate-staging-layout --dir DIR [--force]
+  kiwi storage  migrate-runner-cache-layout --dir DIR [--force]
   kiwi repair-repo-identities [--database-url URL] [--apply] [--cancel-active]
   kiwi outbox dead-letters list|requeue|delete [--database-url URL] [ID]
   kiwi runner   --server http://127.0.0.1:8080 --token TOKEN [--drain]

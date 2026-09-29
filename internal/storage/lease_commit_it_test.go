@@ -353,3 +353,80 @@ func TestIntegrationLeaseCommitSnapshotCapCountsLockedJob(t *testing.T) {
 		t.Fatalf("job A snapshots = %d, want 1", nA)
 	}
 }
+
+// leaseCommitITJobWithLease is leaseCommitITJob for a short, explicit lease
+// TTL: it returns the absolute expiry so a test can wait past it while
+// holding the row lock.
+func leaseCommitITJobWithLease(t *testing.T, st *PostgresStore, repo string, ttl time.Duration) (runID, jobID, runnerID string, generation int64, expiresAt time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	runID = pgITNewID(t)
+	jobID = pgITNewID(t)
+	pgITEnqueueOne(t, st, runID, jobID, repo)
+	runnerID = pgITNewID(t)
+	expiresAt = time.Now().UTC().Add(ttl)
+	if _, err := st.AcquireLease(ctx, jobID, runnerID, []byte("tok"), 1, expiresAt); err != nil {
+		t.Fatalf("AcquireLease(%s): %v", jobID, err)
+	}
+	return runID, jobID, runnerID, 1, expiresAt
+}
+
+// TestIntegrationLeaseCommitRejectsLeaseThatExpiresWhileWaitingForLock is the
+// P1 clock-authority regression: a commit blocked on another transaction's
+// row lock must evaluate lease expiry against the LIVE database clock after
+// the lock is acquired, not the transaction-start now(). Here the row is
+// released UNCHANGED after the lease has already expired; a stale
+// transaction-timestamp comparison would still accept it.
+func TestIntegrationLeaseCommitRejectsLeaseThatExpiresWhileWaitingForLock(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	runID, jobID, runnerID, gen, expiresAt := leaseCommitITJobWithLease(t, st, pgITRepo, 800*time.Millisecond)
+
+	tx, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM jobs WHERE id=$1 FOR UPDATE`, jobID); err != nil {
+		t.Fatalf("lock job row: %v", err)
+	}
+	done := make(chan error, 3)
+	go func() {
+		done <- st.PutCacheManifestForLease(ctx, jobID, runnerID, gen, leaseCommitITManifest("expired-wait"))
+	}()
+	go func() {
+		done <- st.InsertSnapshotForLease(ctx, jobID, runnerID, gen, 0, model.SnapshotRecord{ID: pgITNewID(t), RunID: runID, JobID: jobID, CreatedAt: time.Now().UTC()})
+	}()
+	go func() {
+		_, _, err := st.InsertArtifactOnceForLease(ctx, jobID, runnerID, gen, model.ArtifactRecord{ID: pgITNewID(t), RunID: runID, JobID: jobID, Name: "expired", LeaseGeneration: gen, CreatedAt: time.Now().UTC()})
+		done <- err
+	}()
+	// Prove the three commits are actually blocked on the row lock.
+	select {
+	case err := <-done:
+		t.Fatalf("a commit finished before the lock was released: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	// Wait until well after the lease has expired, then release the row
+	// WITHOUT modifying it.
+	if wait := time.Until(expiresAt.Add(150 * time.Millisecond)); wait > 0 {
+		time.Sleep(wait)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit unchanged row: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := <-done; !errors.Is(err, ErrLeaseLost) {
+			t.Fatalf("commit after the lease expired while blocked = %v, want ErrLeaseLost", err)
+		}
+	}
+	if _, found, _ := st.GetCacheManifest(ctx, pgITRepoID, "untrusted", "expired-wait"); found {
+		t.Fatal("cache manifest committed after the lease expired while blocked")
+	}
+	if got, _ := st.ListSnapshotsByRun(ctx, runID); len(got) != 0 {
+		t.Fatalf("snapshot committed after the lease expired while blocked: %d", len(got))
+	}
+	if got, _ := st.ListArtifacts(ctx, runID); len(got) != 0 {
+		t.Fatalf("artifact committed after the lease expired while blocked: %d", len(got))
+	}
+}

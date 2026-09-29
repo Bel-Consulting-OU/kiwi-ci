@@ -68,6 +68,12 @@ func TestManagerClosedRefusesOperations(t *testing.T) {
 	if _, _, err := m.ReclaimAbandonedTemps(context.Background()); !errors.Is(err, ErrManagerClosed) {
 		t.Fatalf("reclaim after close = %v, want ErrManagerClosed", err)
 	}
+	if _, err := m.Prune(context.Background()); !errors.Is(err, ErrManagerClosed) {
+		t.Fatalf("prune after close = %v, want ErrManagerClosed", err)
+	}
+	if _, err := m.RetryTempCleanup(context.Background()); !errors.Is(err, ErrManagerClosed) {
+		t.Fatalf("retry temp cleanup after close = %v, want ErrManagerClosed", err)
+	}
 }
 
 // cacheHelperModeEnv selects the helper-process behavior; the helper is this
@@ -307,4 +313,87 @@ func TestNamespaceLockErrorBranches(t *testing.T) {
 	if err := nilLock.release(); err != nil {
 		t.Fatalf("nil release = %v", err)
 	}
+}
+
+// TestNamespaceLockReleaseFailureCanRetry is the P2 regression: a transient
+// lock-removal failure must leave the lock retryable, and a successor must be
+// able to acquire the namespace once the release finally succeeds. Without
+// the fix, release marked itself un-owned and the stale file recorded the
+// current pid, locking the process (and its restart) out indefinitely.
+func TestNamespaceLockReleaseFailureCanRetry(t *testing.T) {
+	root := t.TempDir()
+	m := mustManager(t, root, RetentionPolicy{MaxBytes: 1000})
+	orig := releaseNamespaceLock
+	releaseNamespaceLock = func(*namespaceLock) error { return errors.New("test: transient removal failure") }
+	t.Cleanup(func() { releaseNamespaceLock = orig })
+	if err := m.Close(); err == nil {
+		t.Fatal("Close succeeded despite the injected release failure")
+	}
+	if m.lock == nil {
+		t.Fatal("failed Close discarded the lock handle")
+	}
+	releaseNamespaceLock = orig
+	if err := m.Close(); err != nil {
+		t.Fatalf("retried Close = %v", err)
+	}
+	if m.lock != nil {
+		t.Fatal("successful Close retained the lock handle")
+	}
+	// A successor (the restart case) can now own the namespace.
+	m2, err := NewManager(root, RetentionPolicy{MaxBytes: 1000})
+	if err != nil {
+		t.Fatalf("successor manager = %v", err)
+	}
+	defer func() { _ = m2.Close() }()
+}
+
+// TestManagerCloseRetainsLockHandleOnReleaseFailure pins the handle contract
+// and the closed-manager refusals for every mutating entry point.
+func TestManagerCloseRetainsLockHandleOnReleaseFailure(t *testing.T) {
+	root := t.TempDir()
+	m := mustManager(t, root, RetentionPolicy{MaxBytes: 1000})
+	orig := releaseNamespaceLock
+	releaseNamespaceLock = func(*namespaceLock) error { return errors.New("test: transient removal failure") }
+	t.Cleanup(func() { releaseNamespaceLock = orig })
+	if err := m.Close(); err == nil {
+		t.Fatal("Close succeeded despite the injected release failure")
+	}
+	if m.lock == nil {
+		t.Fatal("lock handle not retained after a failed release")
+	}
+	if _, err := m.Reserve(context.Background(), 1); !errors.Is(err, ErrManagerClosed) {
+		t.Fatalf("Reserve after failed Close = %v, want ErrManagerClosed", err)
+	}
+	if _, err := m.Prune(context.Background()); !errors.Is(err, ErrManagerClosed) {
+		t.Fatalf("Prune after Close = %v, want ErrManagerClosed", err)
+	}
+	if _, err := m.RetryTempCleanup(context.Background()); !errors.Is(err, ErrManagerClosed) {
+		t.Fatalf("RetryTempCleanup after Close = %v, want ErrManagerClosed", err)
+	}
+}
+
+// TestRestartAfterTransientLockReleaseFailure models the runner restart:
+// shutdown's release fails, the process retries and succeeds, and only then
+// does a successor acquire the namespace.
+func TestRestartAfterTransientLockReleaseFailure(t *testing.T) {
+	root := t.TempDir()
+	m := mustManager(t, root, RetentionPolicy{MaxBytes: 1000})
+	orig := releaseNamespaceLock
+	releaseNamespaceLock = func(*namespaceLock) error { return errors.New("test: transient removal failure") }
+	t.Cleanup(func() { releaseNamespaceLock = orig })
+	if err := m.Close(); err == nil {
+		t.Fatal("first shutdown Close succeeded despite the injected failure")
+	}
+	if _, err := NewManager(root, RetentionPolicy{MaxBytes: 1000}); !errors.Is(err, ErrCacheDirOwned) {
+		t.Fatalf("restart before cleanup retry = %v, want ErrCacheDirOwned", err)
+	}
+	releaseNamespaceLock = orig
+	if err := m.Close(); err != nil {
+		t.Fatalf("retried shutdown Close = %v", err)
+	}
+	m2, err := NewManager(root, RetentionPolicy{MaxBytes: 1000})
+	if err != nil {
+		t.Fatalf("restart after cleanup retry = %v", err)
+	}
+	defer func() { _ = m2.Close() }()
 }

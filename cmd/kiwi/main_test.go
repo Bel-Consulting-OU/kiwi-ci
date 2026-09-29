@@ -446,3 +446,80 @@ func TestUsageListsCommands(t *testing.T) {
 		}
 	}
 }
+
+// TestStorageCommandRoutesMigrateRunnerCacheLayout: the cache-layout
+// migration is routed by cmd/kiwi (it only needs internal/cache).
+func TestStorageCommandRoutesMigrateRunnerCacheLayout(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("KIWI_CACHE_ROOT", "")
+	var out, errOut bytes.Buffer
+	err := storageCommand(ctx, []string{"migrate-runner-cache-layout"}, strings.NewReader(""), &out, &errOut)
+	if err == nil || !strings.Contains(err.Error(), "--dir is required") {
+		t.Fatalf("migrate-runner-cache-layout without --dir = %v", err)
+	}
+}
+
+// TestMigrateRunnerCacheLayoutCommandReclaimsWithForce: --force skips the
+// prompt and reclaims legacy archives + sidecars, reporting root and counts.
+func TestMigrateRunnerCacheLayoutCommandReclaimsWithForce(t *testing.T) {
+	root := t.TempDir()
+	key := strings.Repeat("a", 64)
+	archive := filepath.Join(root, key+".tar.gz")
+	sidecar := archive + ".sha256"
+	for _, p := range []string{archive, sidecar} {
+		if err := os.WriteFile(p, []byte("legacy"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var out, errOut bytes.Buffer
+	if err := migrateRunnerCacheLayout(context.Background(), []string{"--dir", root, "--force"}, strings.NewReader(""), &out, &errOut); err != nil {
+		t.Fatalf("migrateRunnerCacheLayout: %v (stderr %q)", err, errOut.String())
+	}
+	for _, p := range []string{archive, sidecar} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("legacy %s survived the forced migration: %v", p, err)
+		}
+	}
+	if !strings.Contains(out.String(), "reclaimed=2") || !strings.Contains(out.String(), root) {
+		t.Fatalf("migration report = %q", out.String())
+	}
+}
+
+// TestMigrateRunnerCacheLayoutCommandRequiresConfirmation pins the rolling-
+// upgrade safety: without --force nothing is removed unless the operator
+// confirms; EOF (non-interactive) is a refusal.
+func TestMigrateRunnerCacheLayoutCommandRequiresConfirmation(t *testing.T) {
+	newRoot := func(t *testing.T) (string, string) {
+		t.Helper()
+		root := t.TempDir()
+		archive := filepath.Join(root, strings.Repeat("b", 64)+".tar.gz")
+		if err := os.WriteFile(archive, []byte("legacy"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return root, archive
+	}
+	t.Setenv("KIWI_CACHE_ROOT", "")
+	for name, answer := range map[string]string{"no": "no\n", "eof": "", "junk": "maybe\n"} {
+		t.Run(name, func(t *testing.T) {
+			root, archive := newRoot(t)
+			var out, errOut bytes.Buffer
+			err := migrateRunnerCacheLayout(context.Background(), []string{"--dir", root}, strings.NewReader(answer), &out, &errOut)
+			if err == nil || !strings.Contains(err.Error(), "aborted") {
+				t.Fatalf("unconfirmed migration (%q) = %v, want an abort", answer, err)
+			}
+			if _, serr := os.Stat(archive); serr != nil {
+				t.Fatalf("unconfirmed migration removed the archive: %v", serr)
+			}
+		})
+	}
+	t.Run("yes", func(t *testing.T) {
+		root, archive := newRoot(t)
+		var out, errOut bytes.Buffer
+		if err := migrateRunnerCacheLayout(context.Background(), []string{"--dir", root}, strings.NewReader("yes\n"), &out, &errOut); err != nil {
+			t.Fatalf("confirmed migration: %v", err)
+		}
+		if _, serr := os.Stat(archive); !os.IsNotExist(serr) {
+			t.Fatalf("confirmed migration left the archive: %v", serr)
+		}
+	})
+}

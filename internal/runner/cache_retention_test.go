@@ -469,11 +469,12 @@ func TestRunnerCacheRootDefaultsToHomeCache(t *testing.T) {
 	}
 }
 
-// TestRunnerStartupReclaimsLegacySharedCache pins the upgrade path: the
-// pre-namespace shared layout under <CacheRoot>/cache is deleted when a
-// manager is installed for the root, while the new per-runner namespace is
-// untouched.
-func TestRunnerStartupReclaimsLegacySharedCache(t *testing.T) {
+// TestRunnerStartupPreservesLegacySharedCacheDuringRollingUpgrade pins the
+// mixed-version safety rule: a new per-runner namespace lock proves nothing
+// about the pre-namespace shared layout, so startup must NOT delete legacy
+// archives that a still-running old-version runner may own. Reclamation is an
+// explicit operator migration command.
+func TestRunnerStartupPreservesLegacySharedCacheDuringRollingUpgrade(t *testing.T) {
 	root := t.TempDir()
 	legacyDir := filepath.Join(root, "cache")
 	if err := os.MkdirAll(legacyDir, 0o755); err != nil {
@@ -491,30 +492,49 @@ func TestRunnerStartupReclaimsLegacySharedCache(t *testing.T) {
 	if _, err := r.cacheManager(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
-		t.Fatalf("legacy archive survived startup (err=%v)", err)
+	if _, err := os.Stat(legacy); err != nil {
+		t.Fatalf("legacy archive deleted during startup: %v", err)
 	}
-	if _, err := os.Stat(legacy + ".sha256"); !os.IsNotExist(err) {
-		t.Fatalf("legacy sidecar survived startup (err=%v)", err)
+	if _, err := os.Stat(legacy + ".sha256"); err != nil {
+		t.Fatalf("legacy sidecar deleted during startup: %v", err)
 	}
-	// A file inside the runner's private namespace (a subdirectory) is never
-	// touched by the legacy reclaim.
+	// A file inside the runner's private namespace is untouched as well.
 	nsDir := r.cacheRootDir()
 	if err := os.MkdirAll(nsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	nsKey := strings.Repeat("e", 64)
-	nsFile := filepath.Join(nsDir, nsKey+".tar.gz")
+	nsFile := filepath.Join(nsDir, strings.Repeat("e", 64)+".tar.gz")
 	if err := os.WriteFile(nsFile, []byte("namespaced"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	r2 := testRunnerFor(t, httptest.NewServer(http.NotFoundHandler()), Config{CacheRoot: root})
-	r2.ID = "runner-2"
-	if _, err := r2.cacheManager(); err != nil {
-		t.Fatal(err)
+	r.pruneJobCache(context.Background())
+	if _, err := os.Stat(legacy); err != nil {
+		t.Fatalf("legacy archive deleted by maintenance: %v", err)
 	}
 	if _, err := os.Stat(nsFile); err != nil {
-		t.Fatalf("namespace file was reclaimed: %v", err)
+		t.Fatalf("namespace file deleted by maintenance: %v", err)
+	}
+}
+
+// TestRunnerMaintenanceDoesNotDeleteLegacySharedCache pins the periodic path:
+// repeated maintenance passes never touch the pre-namespace layout.
+func TestRunnerMaintenanceDoesNotDeleteLegacySharedCache(t *testing.T) {
+	root := t.TempDir()
+	r := testRunnerFor(t, httptest.NewServer(http.NotFoundHandler()), Config{CacheRoot: root, CacheMaxBytes: 2000})
+	legacyDir := filepath.Join(root, "cache")
+	if err := os.MkdirAll(legacyDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	key := strings.Repeat("9", 64)
+	legacy := filepath.Join(legacyDir, key+".tar.gz")
+	if err := os.WriteFile(legacy, []byte("legacy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		r.pruneJobCache(context.Background())
+		if _, err := os.Stat(legacy); err != nil {
+			t.Fatalf("maintenance pass %d removed the legacy archive: %v", i, err)
+		}
 	}
 }
 
@@ -646,33 +666,6 @@ func TestCacheManagerStartupFailureDoesNotRetainStagingOwnership(t *testing.T) {
 	case <-served:
 		t.Fatal("failed startup leased a job")
 	default:
-	}
-}
-
-// TestRunnerPruneJobCacheRetriesLegacyReclaim pins the periodic retry: legacy
-// shared entries created after startup are reclaimed by the maintenance pass,
-// not only at manager installation.
-func TestRunnerPruneJobCacheRetriesLegacyReclaim(t *testing.T) {
-	root := t.TempDir()
-	r := testRunnerFor(t, httptest.NewServer(http.NotFoundHandler()), Config{CacheRoot: root, CacheMaxBytes: 2000})
-	legacyDir := filepath.Join(root, "cache")
-	if err := os.MkdirAll(legacyDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	key := strings.Repeat("9", 64)
-	legacy := filepath.Join(legacyDir, key+".tar.gz")
-	if err := os.WriteFile(legacy, []byte("legacy"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(legacy+".sha256", []byte("d\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	r.pruneJobCache(context.Background())
-	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
-		t.Fatalf("legacy archive survived maintenance (err=%v)", err)
-	}
-	if _, err := os.Stat(legacy + ".sha256"); !os.IsNotExist(err) {
-		t.Fatalf("legacy sidecar survived maintenance (err=%v)", err)
 	}
 }
 

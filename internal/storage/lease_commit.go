@@ -129,6 +129,15 @@ func cacheTrustDomain(trusted bool) string {
 // and the write. An absent row (or a row whose lease is no longer held)
 // reports false (a vanished job fails the predicate closed), never an error;
 // no lock is taken in that case because the caller writes nothing.
+//
+// Lease expiry is deliberately evaluated AFTER the lock is acquired, with
+// clock_timestamp() sampled in a follow-up statement. now()/CURRENT_TIMESTAMP
+// are the TRANSACTION START timestamp: they do not advance while this
+// transaction waits on another owner's row lock, so a lease that expires
+// during the wait would still compare unexpired and a stale upload could
+// commit durable metadata after lease authority ended. clock_timestamp()
+// reads the live database wall clock at the moment after the lock, which is
+// the authority this commit is fenced on.
 func (s *PostgresStore) lockedLeaseJobTx(ctx context.Context, tx pgx.Tx, jobID, runnerID string, generation int64) (leaseJobCoords, bool, error) {
 	var (
 		c            leaseJobCoords
@@ -136,23 +145,33 @@ func (s *PostgresStore) lockedLeaseJobTx(ctx context.Context, tx pgx.Tx, jobID, 
 		policyRepoID string
 		repoURL      string
 		repoFull     string
+		leaseExpires *time.Time
 	)
 	err := tx.QueryRow(ctx, `SELECT run_id, COALESCE(key, ''),
 		COALESCE(payload->>'repo_id', ''),
 		COALESCE(payload->>'policy_repo_id', ''),
 		COALESCE(payload->>'repo_url', ''),
 		COALESCE(payload->>'repo_full_name', ''),
-		CASE WHEN jsonb_typeof(payload->'trusted') = 'boolean' THEN (payload->>'trusted')::boolean ELSE FALSE END
+		CASE WHEN jsonb_typeof(payload->'trusted') = 'boolean' THEN (payload->>'trusted')::boolean ELSE FALSE END,
+		lease_expires_at
 		FROM jobs
 		WHERE id = $1 AND status='running' AND COALESCE(lease_runner_id, '') = $2 AND lease_generation = $3
-		  AND lease_expires_at IS NOT NULL AND lease_expires_at > now()
 		FOR UPDATE`,
-		jobID, runnerID, generation).Scan(&c.RunID, &c.JobKey, &repoID, &policyRepoID, &repoURL, &repoFull, &c.Trusted)
+		jobID, runnerID, generation).Scan(&c.RunID, &c.JobKey, &repoID, &policyRepoID, &repoURL, &repoFull, &c.Trusted, &leaseExpires)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return leaseJobCoords{}, false, nil
 	}
 	if err != nil {
 		return leaseJobCoords{}, false, err
+	}
+	// Post-lock authority check against the LIVE database clock, never the
+	// transaction timestamp.
+	var dbNow time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&dbNow); err != nil {
+		return leaseJobCoords{}, false, err
+	}
+	if leaseExpires == nil || !leaseExpires.After(dbNow) {
+		return leaseJobCoords{}, false, nil
 	}
 	c.JobID = jobID
 	c.Generation = generation

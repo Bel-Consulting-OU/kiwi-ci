@@ -177,7 +177,6 @@ func (r *Runner) configureCacheManager() error {
 	if err != nil {
 		return err
 	}
-	r.reclaimLegacyCacheLayoutLocked(mgr)
 	r.cacheMgr = mgr
 	return nil
 }
@@ -188,31 +187,21 @@ func (r *Runner) configureCacheManager() error {
 func (r *Runner) closeCacheManager() {
 	r.cacheMu.Lock()
 	mgr := r.cacheMgr
-	r.cacheMgr = nil
 	r.cacheMu.Unlock()
 	if mgr == nil {
 		return
 	}
 	if err := mgr.Close(); err != nil {
+		// Retain the manager pointer: Close is retryable and the lock handle
+		// must survive a transient release failure.
 		reportf("kiwi runner %s: cache namespace close: %v\n", r.ID, err)
-	}
-}
-
-// reclaimLegacyCacheLayoutLocked deletes the pre-namespace shared layout
-// (<root>/*.tar.gz) once, when a manager is installed for this root. The
-// local cache is disposable and the per-runner namespace is the only
-// supported layout; callers hold r.cacheMu.
-func (r *Runner) reclaimLegacyCacheLayoutLocked(mgr *cache.Manager) {
-	if mgr == nil {
 		return
 	}
-	files, bytes, err := cache.ReclaimLegacyLayout(filepath.Dir(mgr.Root()))
-	if files > 0 {
-		reportf("kiwi runner %s: reclaimed %d legacy shared cache entries (%d bytes) now superseded by %s\n", r.ID, files, bytes, mgr.Root())
+	r.cacheMu.Lock()
+	if r.cacheMgr == mgr {
+		r.cacheMgr = nil
 	}
-	if err != nil {
-		reportf("kiwi runner %s: legacy cache reclaim incomplete: %v (retried next startup)\n", r.ID, err)
-	}
+	r.cacheMu.Unlock()
 }
 
 // cacheManager returns the runner-wide aggregate cache budget owner, shared
@@ -229,7 +218,6 @@ func (r *Runner) cacheManager() (*cache.Manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	r.reclaimLegacyCacheLayoutLocked(mgr)
 	r.cacheMgr = mgr
 	return mgr, nil
 }
@@ -251,16 +239,6 @@ func (r *Runner) pruneJobCache(ctx context.Context) {
 		reportf("kiwi runner %s: cache temp cleanup retry failed (%d removed): %v\n", r.ID, removed, err)
 	} else if removed > 0 {
 		reportf("kiwi runner %s: cache temp cleanup reclaimed %d file(s)\n", r.ID, removed)
-	}
-	// Incomplete upgrade reclamation is retried on EVERY maintenance pass
-	// until the legacy shared tree is gone: a transient EBUSY during the
-	// upgrade must not leave a large legacy cache consuming disk for the
-	// whole process lifetime, and the legacy files sit outside every
-	// per-runner manager.
-	if files, bytes, err := cache.ReclaimLegacyLayout(r.cacheRootRoot()); err != nil {
-		reportf("kiwi runner %s: legacy cache reclaim incomplete: %v\n", r.ID, err)
-	} else if files > 0 {
-		reportf("kiwi runner %s: reclaimed %d legacy shared cache entries (%d bytes)\n", r.ID, files, bytes)
 	}
 	res, err := mgr.Prune(ctx)
 	if err != nil {
