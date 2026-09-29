@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -207,7 +208,7 @@ func migrateRunnerCacheLayout(ctx context.Context, args []string, stdin io.Reade
 	_ = ctx
 	fs := flag.NewFlagSet("storage migrate-runner-cache-layout", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	dir := fs.String("dir", os.Getenv("KIWI_CACHE_ROOT"), "shared cache root directory, i.e. the parent of the per-runner namespace dirs (or KIWI_CACHE_ROOT)")
+	dir := fs.String("dir", runnerCacheLayoutRootDefault(), "legacy shared cache directory holding <key>.tar.gz archives (default: $KIWI_RUNNER_CACHE_LAYOUT_ROOT, else $KIWI_CACHE_ROOT/cache)")
 	force := fs.Bool("force", false, "confirm every pre-namespace runner has drained/stopped; skips the interactive prompt")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -217,7 +218,7 @@ func migrateRunnerCacheLayout(ctx context.Context, args []string, stdin io.Reade
 	}
 	root := strings.TrimSpace(*dir)
 	if root == "" {
-		return fmt.Errorf("--dir is required (or set KIWI_CACHE_ROOT)")
+		return fmt.Errorf("--dir is required (or set KIWI_RUNNER_CACHE_LAYOUT_ROOT, or KIWI_CACHE_ROOT for its /cache subdirectory)")
 	}
 	if !*force {
 		confirmed, err := confirmRunnerCacheMigration(stdin, stderr, root)
@@ -236,9 +237,32 @@ func migrateRunnerCacheLayout(ctx context.Context, args []string, stdin io.Reade
 	return nil
 }
 
+// runnerCacheLayoutRootDefault resolves the migration's default directory.
+// KIWI_RUNNER_CACHE_LAYOUT_ROOT names the legacy directory itself;
+// KIWI_CACHE_ROOT names the runner's configured CacheRoot, whose legacy
+// shared layout lives one level down in "cache" (the same <base>/cache
+// directory the runner's cacheRootRoot resolves). Mixing the two levels
+// would scan the base for content-addressed archives that are not runner
+// cache entries.
+func runnerCacheLayoutRootDefault() string {
+	if v := strings.TrimSpace(os.Getenv("KIWI_RUNNER_CACHE_LAYOUT_ROOT")); v != "" {
+		return v
+	}
+	if base := strings.TrimSpace(os.Getenv("KIWI_CACHE_ROOT")); base != "" {
+		return filepath.Join(base, "cache")
+	}
+	return ""
+}
+
 // confirmRunnerCacheMigration asks the operator to type "yes" before the
-// destructive pass; an unreadable or non-interactive stdin is a refusal.
+// destructive pass; an unreadable or non-interactive stdin is a refusal. The
+// prompt names both the configured CacheRoot (when the default was derived
+// from it) and the resolved directory that will actually be scanned.
 func confirmRunnerCacheMigration(stdin io.Reader, stderr io.Writer, root string) (bool, error) {
+	if base := strings.TrimSpace(os.Getenv("KIWI_CACHE_ROOT")); base != "" {
+		fmt.Fprintf(stderr, "Configured cache root (KIWI_CACHE_ROOT): %s\n", base)
+	}
+	fmt.Fprintf(stderr, "Resolved legacy cache directory: %s\n", root)
 	fmt.Fprintf(stderr, "This removes pre-namespace cache archives (<key>.tar.gz and sidecars) from %s.\n", root)
 	fmt.Fprintln(stderr, "It is only safe once EVERY pre-namespace runner has drained/stopped (its cache archives are still in use otherwise; the cache itself is disposable, so a later version could abandon them).")
 	fmt.Fprint(stderr, "Type 'yes' to continue: ")

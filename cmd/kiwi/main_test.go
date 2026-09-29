@@ -523,3 +523,53 @@ func TestMigrateRunnerCacheLayoutCommandRequiresConfirmation(t *testing.T) {
 		}
 	})
 }
+
+// TestMigrateRunnerCacheLayoutEnvironmentResolvesCacheSubdirectory pins the
+// two-level environment semantics: KIWI_CACHE_ROOT names the runner's base
+// and the legacy layout lives in its "cache" subdirectory; a content-
+// addressed archive sitting directly in the base must NOT be touched.
+func TestMigrateRunnerCacheLayoutEnvironmentResolvesCacheSubdirectory(t *testing.T) {
+	base := t.TempDir()
+	legacyDir := filepath.Join(base, "cache")
+	if err := os.MkdirAll(legacyDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	key := strings.Repeat("c", 64)
+	legacy := filepath.Join(legacyDir, key+".tar.gz")
+	if err := os.WriteFile(legacy, []byte("legacy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	decoy := filepath.Join(base, strings.Repeat("d", 64)+".tar.gz")
+	if err := os.WriteFile(decoy, []byte("not-a-runner-cache-entry"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KIWI_CACHE_ROOT", base)
+	t.Setenv("KIWI_RUNNER_CACHE_LAYOUT_ROOT", "")
+	var out, errOut bytes.Buffer
+	if err := migrateRunnerCacheLayout(context.Background(), []string{"--force"}, strings.NewReader(""), &out, &errOut); err != nil {
+		t.Fatalf("migrateRunnerCacheLayout(default from KIWI_CACHE_ROOT): %v (stderr %q)", err, errOut.String())
+	}
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Fatalf("legacy archive in <base>/cache survived: %v", err)
+	}
+	if _, err := os.Stat(decoy); err != nil {
+		t.Fatalf("base-level decoy was removed: %v", err)
+	}
+	if !strings.Contains(out.String(), legacyDir) || !strings.Contains(out.String(), "reclaimed=1") {
+		t.Fatalf("migration report = %q", out.String())
+	}
+	// An explicit KIWI_RUNNER_CACHE_LAYOUT_ROOT wins verbatim.
+	direct := t.TempDir()
+	directArchive := filepath.Join(direct, strings.Repeat("e", 64)+".tar.gz")
+	if err := os.WriteFile(directArchive, []byte("legacy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KIWI_RUNNER_CACHE_LAYOUT_ROOT", direct)
+	out.Reset()
+	if err := migrateRunnerCacheLayout(context.Background(), []string{"--force"}, strings.NewReader(""), &out, &errOut); err != nil {
+		t.Fatalf("migrateRunnerCacheLayout(KIWI_RUNNER_CACHE_LAYOUT_ROOT): %v", err)
+	}
+	if _, err := os.Stat(directArchive); !os.IsNotExist(err) {
+		t.Fatalf("explicit layout root archive survived: %v", err)
+	}
+}

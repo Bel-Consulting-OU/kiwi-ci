@@ -498,3 +498,15 @@ claims themselves.
   on another transaction's row lock while the lease expired is now rejected
   with `ErrLeaseLost` instead of publishing durable metadata after lease
   authority ended.
+
+- A failed cache-namespace release at shutdown now leaves a retained CLOSED
+  manager, and the next Run with identical configuration retries the release
+  and installs a fresh open manager instead of returning early and running
+  with a manager that rejects every cache operation. `Close` is serialized
+  under the manager mutex, so concurrent/idempotent callers cannot race the
+  lock handle.
+- `kiwi storage migrate-runner-cache-layout` now resolves its default
+  directory with the runner's two-level semantics:
+  `KIWI_RUNNER_CACHE_LAYOUT_ROOT` names the legacy directory itself, while
+  `KIWI_CACHE_ROOT` names the runner base and resolves to its `/cache`
+  subdirectory. The confirmation prompt prints both.

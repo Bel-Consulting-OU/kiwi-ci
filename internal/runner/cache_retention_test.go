@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -800,4 +801,85 @@ func TestRunnerPruneJobCacheReportsNamespaceUnavailable(t *testing.T) {
 	}
 	defer func() { _ = foreign.Close() }()
 	r.pruneJobCache(context.Background()) // must not panic or touch the foreign namespace
+}
+
+// TestRunRetriesClosedCacheManagerReleaseBeforeRestart is the P2 lifecycle
+// regression: a shutdown whose namespace release fails retains a CLOSED
+// manager so the release can be retried. The next Run with identical
+// configuration must retry that release and install a fresh OPEN manager
+// instead of returning early and leaving every cache operation failing with
+// ErrManagerClosed.
+func TestRunRetriesClosedCacheManagerReleaseBeforeRestart(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/register") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"runner-1"}`))
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ts.Close()
+
+	cacheRoot := t.TempDir()
+	r := &Runner{ID: "runner-1", Cfg: Config{
+		Server: ts.URL, Poll: 5 * time.Millisecond, Concurrency: 1,
+		IdentityDir: t.TempDir(), WorkDir: t.TempDir(),
+		CacheRoot: cacheRoot, CacheMaxBytes: 2000, CacheArchiveMaxBytes: 1000,
+	}, Client: ts.Client(), Metrics: NewMetrics()}
+
+	// Run #1: the namespace release fails at shutdown, so the closed manager
+	// must be retained for a retry.
+	cache.SetNamespaceReleaseHookForTest(func() error { return errors.New("test: transient release failure") })
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	done1 := make(chan error, 1)
+	go func() { done1 <- r.Run(ctx1) }()
+	time.Sleep(80 * time.Millisecond)
+	cancel1()
+	select {
+	case <-done1:
+	case <-time.After(15 * time.Second):
+		t.Fatal("first Run did not return")
+	}
+	old := r.cacheMgr
+	if old == nil {
+		t.Fatal("failed shutdown discarded the manager instead of retaining it")
+	}
+	if !old.Closed() {
+		t.Fatal("retained manager is not closed")
+	}
+	// Restore the release primitive and drive the EXACT Run #2 startup step:
+	// it must retry the retained release and install a fresh open manager.
+	cache.SetNamespaceReleaseHookForTest(nil)
+	if err := r.configureCacheManager(); err != nil {
+		t.Fatalf("configureCacheManager after failed release = %v", err)
+	}
+	if r.cacheMgr == old {
+		t.Fatal("startup reused the closed manager as healthy")
+	}
+	if r.cacheMgr == nil || r.cacheMgr.Closed() {
+		t.Fatal("startup did not install an open manager")
+	}
+
+	// A full Run #2 with identical configuration now starts and stops
+	// cleanly, and a cache-using job succeeds afterwards.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	done2 := make(chan error, 1)
+	go func() { done2 <- r.Run(ctx2) }()
+	time.Sleep(80 * time.Millisecond)
+	cancel2()
+	select {
+	case <-done2:
+	case <-time.After(15 * time.Second):
+		t.Fatal("second Run did not return")
+	}
+	store, err := r.newJobCache(basicTask(payloadPipeline), r.Metrics)
+	if err != nil {
+		t.Fatalf("newJobCache after recovery = %v", err)
+	}
+	store.RemoteURL = ""
+	ws := t.TempDir()
+	writeCaptureBytes(t, filepath.Join(ws, "f.bin"), 200)
+	if err := store.SaveContext(context.Background(), "recovered", ws, []string{"f.bin"}); err != nil {
+		t.Fatalf("cache save after recovery = %v", err)
+	}
 }

@@ -157,21 +157,32 @@ func (r *Runner) configureCacheManager() error {
 	policy := r.cacheRetentionPolicy()
 	r.cacheMu.Lock()
 	defer r.cacheMu.Unlock()
-	if r.cacheMgr != nil && r.cacheMgr.Root() == root && r.cacheMgr.Policy() == policy {
+	if r.cacheMgr != nil && r.cacheMgr.Root() == root && r.cacheMgr.Policy() == policy && !r.cacheMgr.Closed() {
 		return nil
 	}
 	if old := r.cacheMgr; old != nil {
-		_, _ = old.RetryTempCleanup(context.Background())
-		if pending := old.PendingTempCleanup(); pending > 0 || old.InflightBytes() > 0 {
-			return fmt.Errorf("cache manager replacement refused: %d temp cleanup item(s) and %d charged bytes remain under %s; remove them or restart the process", pending, old.InflightBytes(), old.Root())
+		if old.Closed() {
+			// A previous shutdown's release failed and retained the closed
+			// manager so it could be retried. NEVER reuse it as healthy: it
+			// refuses every cache operation. Retry the release, then build a
+			// fresh open manager.
+			if err := old.Close(); err != nil {
+				return fmt.Errorf("cache: retry previous namespace release: %w", err)
+			}
+			r.cacheMgr = nil
+		} else {
+			_, _ = old.RetryTempCleanup(context.Background())
+			if pending := old.PendingTempCleanup(); pending > 0 || old.InflightBytes() > 0 {
+				return fmt.Errorf("cache manager replacement refused: %d temp cleanup item(s) and %d charged bytes remain under %s; remove them or restart the process", pending, old.InflightBytes(), old.Root())
+			}
+			// The old namespace ownership must be released before the new
+			// manager can acquire it (same root) and must not outlive the
+			// replacement (changed root).
+			if err := old.Close(); err != nil {
+				return fmt.Errorf("cache: release previous namespace: %w", err)
+			}
+			r.cacheMgr = nil
 		}
-		// The old namespace ownership must be released before the new manager
-		// can acquire it (same root) and must not outlive the replacement
-		// (changed root).
-		if err := old.Close(); err != nil {
-			return fmt.Errorf("cache: release previous namespace: %w", err)
-		}
-		r.cacheMgr = nil
 	}
 	mgr, err := cache.NewManager(root, policy)
 	if err != nil {
@@ -211,8 +222,16 @@ func (r *Runner) closeCacheManager() {
 func (r *Runner) cacheManager() (*cache.Manager, error) {
 	r.cacheMu.Lock()
 	defer r.cacheMu.Unlock()
-	if r.cacheMgr != nil {
+	if r.cacheMgr != nil && !r.cacheMgr.Closed() {
 		return r.cacheMgr, nil
+	}
+	if old := r.cacheMgr; old != nil {
+		// Retry the failed release from a previous lifecycle instead of
+		// handing out a closed manager, then reopen the namespace.
+		if err := old.Close(); err != nil {
+			return nil, fmt.Errorf("cache: retry previous namespace release: %w", err)
+		}
+		r.cacheMgr = nil
 	}
 	mgr, err := cache.NewManager(r.cacheRootDir(), r.cacheRetentionPolicy())
 	if err != nil {

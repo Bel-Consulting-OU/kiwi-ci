@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -394,6 +395,36 @@ func TestRestartAfterTransientLockReleaseFailure(t *testing.T) {
 	m2, err := NewManager(root, RetentionPolicy{MaxBytes: 1000})
 	if err != nil {
 		t.Fatalf("restart after cleanup retry = %v", err)
+	}
+	defer func() { _ = m2.Close() }()
+}
+
+// TestManagerConcurrentClose pins the serialization contract: Close is
+// idempotent AND retryable, so concurrent callers must not race the lock
+// handle's internal state. Run under -race.
+func TestManagerConcurrentClose(t *testing.T) {
+	root := t.TempDir()
+	m := mustManager(t, root, RetentionPolicy{MaxBytes: 1000})
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := m.Close(); err != nil {
+				t.Errorf("concurrent Close = %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if !m.Closed() {
+		t.Fatal("manager not closed after concurrent Close")
+	}
+	if m.lock != nil {
+		t.Fatal("lock handle retained after successful concurrent Close")
+	}
+	m2, err := NewManager(root, RetentionPolicy{MaxBytes: 1000})
+	if err != nil {
+		t.Fatalf("successor after concurrent Close = %v", err)
 	}
 	defer func() { _ = m2.Close() }()
 }

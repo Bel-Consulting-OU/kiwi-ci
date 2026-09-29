@@ -392,3 +392,30 @@ digests deliberately (re-resolve with `docker buildx imagetools inspect`)
 and re-run the job to validate the result. The `ci/image/Dockerfile` header
 and CI image pin comments still use the historical lane name
 (`docker-workspace`); the file itself is unchanged by the diagnostic rename.
+
+## Time authority and clock skew (lease records)
+
+Kiwi stores absolute lease instants (`lease_expires_at`) and compares them at
+several points. The authority model is:
+
+- **Acquire/heartbeat** compute an absolute instant from the server process
+  clock and persist it. All replicas read that stored instant; nothing is
+  derived from a local clock at read time.
+- **Commit-time fences that can block on row locks** evaluate expiry AFTER
+  the lock with the database's live wall clock (`clock_timestamp()`). Cache
+  manifest, snapshot and artifact commits are the contract here: a lease that
+  expires while the transaction waits is rejected.
+- **Recovery and queue-expiry sweeps** sample a clock before the row lock.
+  Staleness in those samples can only DELAY recovery or expiry (a later
+  comparison instant sees more expired leases), never trigger it early for an
+  unexpired lease.
+
+The remaining assumption is **NTP-synchronized clocks across control-plane
+replicas**: a leader whose clock runs ahead of the replica that created or
+extended a lease can recover that lease early. Operators should run chrony or
+an equivalent NTP client on every server host (and on runners, whose clocks
+feed initial expiry through the control plane). The deviation bound should be
+far below the lease TTL, which the scheduler's heartbeat cadence assumes
+already. A future revision may make lease extension database-clock
+authoritative end to end; until then, do not run replicas with unsynchronized
+clocks.

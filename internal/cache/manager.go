@@ -24,7 +24,22 @@ var ErrManagerClosed = errors.New("cache: manager is closed")
 
 // releaseNamespaceLock is a seam over the held lock's release, so the
 // retry-on-failure contract can be tested on every platform.
-var releaseNamespaceLock = func(l *namespaceLock) error { return l.release() }
+var releaseNamespaceLock = func(l *namespaceLock) error {
+	if namespaceReleaseHook != nil {
+		return namespaceReleaseHook()
+	}
+	return l.release()
+}
+
+// namespaceReleaseHook, when set, replaces the namespace release for tests.
+var namespaceReleaseHook func() error
+
+// SetNamespaceReleaseHookForTest installs (or clears with nil) a release hook
+// used by cross-package tests to exercise the retry contract; production
+// always runs the real release.
+func SetNamespaceReleaseHookForTest(fn func() error) {
+	namespaceReleaseHook = fn
+}
 
 // ErrInvalidReservation reports Manager.Publish called with a nil,
 // already-ended, or foreign reservation. The publish callback is NOT run:
@@ -109,29 +124,41 @@ func (m *Manager) Close() error {
 	if m == nil {
 		return nil
 	}
+	// The whole close (including the OS release) runs under m.mu: Close is
+	// documented as idempotent AND retryable, so two concurrent callers must
+	// serialize on the lock handle instead of racing its internal state. A
+	// local release is a filesystem-fast critical section.
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.closed && m.lock == nil {
-		m.mu.Unlock()
 		return nil
 	}
 	m.closed = true
 	_, _ = m.retryTempCleanupLocked(context.Background())
-	lock := m.lock
-	m.mu.Unlock()
-	if lock == nil {
+	if m.lock == nil {
 		return nil
 	}
-	if err := releaseNamespaceLock(lock); err != nil {
+	if err := releaseNamespaceLock(m.lock); err != nil {
 		// Retain the lock handle: a failed release must be retryable, or the
 		// namespace would be lost for the life of the process.
 		return fmt.Errorf("cache: release namespace %s: %w", m.root, err)
 	}
-	m.mu.Lock()
-	if m.lock == lock {
-		m.lock = nil
-	}
-	m.mu.Unlock()
+	m.lock = nil
 	return nil
+}
+
+// Closed reports whether the manager's namespace ownership has been released
+// (or a release attempt failed and Close must be retried). Callers that reuse
+// a manager across lifecycle boundaries must check this: a closed manager
+// refuses every operation with ErrManagerClosed, so treating it as healthy
+// would leave the runner operational but unable to cache.
+func (m *Manager) Closed() bool {
+	if m == nil {
+		return true
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.closed
 }
 
 // ReclaimAbandonedTemps removes Kiwi-owned cache temp files
