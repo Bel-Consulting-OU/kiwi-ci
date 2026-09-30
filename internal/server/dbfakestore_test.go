@@ -24,17 +24,20 @@ import (
 type dbFakeStore struct {
 	mu sync.Mutex
 	// leaseNow, when set, is the fake's database clock for LeaseLive.
-	leaseNow   func() time.Time
-	checkRuns  map[string]string
-	logBatches map[string]string
-	runs       map[string]model.Run
-	jobs       map[string]model.Job
-	runners    map[string]model.Runner
-	receipts   map[string]model.CompletionReceipt
-	audit      []model.AuditEvent
-	logs       []model.LogEntry
-	artifacts  []model.ArtifactRecord
-	reports    []model.TestReport
+	leaseNow func() time.Time
+	// reportCreatedAt, when set, models the SQL fence's database-clock stamp
+	// for test-report CreatedAt (LeaseTestReportStore).
+	reportCreatedAt *time.Time
+	checkRuns       map[string]string
+	logBatches      map[string]string
+	runs            map[string]model.Run
+	jobs            map[string]model.Job
+	runners         map[string]model.Runner
+	receipts        map[string]model.CompletionReceipt
+	audit           []model.AuditEvent
+	logs            []model.LogEntry
+	artifacts       []model.ArtifactRecord
+	reports         []model.TestReport
 
 	// digestFenceOnce/digestFence back the fake's DigestFenceStore surface:
 	// DB-mode handlers require the cross-replica-capability contract and fail
@@ -1330,6 +1333,9 @@ func (f *dbFakeStore) UpdateRunnerProfileFields(ctx context.Context, runner mode
 	merged.CurrentJob = existing.CurrentJob
 	merged.Completed = existing.Completed
 	merged.Failed = existing.Failed
+	// last_seen belongs to the heartbeat's narrow touch, never to a
+	// profile/admin write (mirrors mergeRunnerProfile).
+	merged.LastSeen = existing.LastSeen
 	if !existing.Registered.IsZero() {
 		merged.Registered = existing.Registered
 	}
@@ -2152,7 +2158,14 @@ func (f *dbFakeStore) InsertTestReportWithHistoryDelivery(ctx context.Context, r
 			if existing.digest != delivery.ContentDigest {
 				return storage.TestReportInsertOutcome{}, fmt.Errorf("%w: job %s generation %d delivery %s", storage.ErrTestReportDeliveryConflict, delivery.JobID, delivery.LeaseGeneration, delivery.DeliveryID)
 			}
-			return storage.TestReportInsertOutcome{Replay: true, ReportID: existing.reportID}, nil
+			createdAt := time.Time{}
+			for i := range f.reports {
+				if f.reports[i].ID == existing.reportID {
+					createdAt = f.reports[i].CreatedAt
+					break
+				}
+			}
+			return storage.TestReportInsertOutcome{Replay: true, ReportID: existing.reportID, CreatedAt: createdAt}, nil
 		}
 		f.reportDeliveries[key] = fakeReportDelivery{digest: delivery.ContentDigest, reportID: rep.ID}
 	}
@@ -2175,7 +2188,7 @@ func (f *dbFakeStore) InsertTestReportWithHistoryDelivery(ctx context.Context, r
 	}
 	f.historyVersions[repoID]++
 	f.testHistoryVersion++
-	return storage.TestReportInsertOutcome{Version: f.historyVersions[repoID], ReportID: rep.ID}, nil
+	return storage.TestReportInsertOutcome{Version: f.historyVersions[repoID], ReportID: rep.ID, CreatedAt: rep.CreatedAt}, nil
 }
 
 func (f *dbFakeStore) InsertTestReportWithHistory(ctx context.Context, rep model.TestReport, repoID string) (int64, error) {
@@ -2201,6 +2214,14 @@ func (f *dbFakeStore) InsertTestReportWithHistoryDeliveryForLease(ctx context.Co
 	}
 	if rep.JobKey == "" {
 		rep.JobKey = j.Key
+	}
+	// Mirror the SQL fence's database-clock stamp: the report's canonical
+	// CreatedAt comes from the store clock, never the serving replica's
+	// application time.
+	if f.reportCreatedAt != nil {
+		rep.CreatedAt = f.reportCreatedAt.UTC()
+	} else if f.leaseNow != nil {
+		rep.CreatedAt = f.leaseNow().UTC()
 	}
 	return f.InsertTestReportWithHistoryDelivery(ctx, rep, repoID, delivery)
 }

@@ -102,13 +102,20 @@ var (
 // in-memory job the store mutex protects (memStore); none of it is taken from
 // the record the caller presented.
 type leaseJobCoords struct {
-	JobID       string
-	RunID       string
-	JobKey      string
-	Generation  int64
-	RepoID      string
-	Trusted     bool
+	JobID      string
+	RunID      string
+	JobKey     string
+	Generation int64
+	RepoID     string
+	Trusted    bool
+	// TrustDomain is the cache trust domain derived from Trusted.
 	TrustDomain string
+	// DBNow is the database clock sampled AFTER the job row lock, i.e. the
+	// same authoritative instant the lease predicate was evaluated against.
+	// Lease-fenced commits that need to stamp an ordering/lifecycle instant
+	// reuse it so their timestamp is literally the fence time, not a second
+	// sample a few microseconds later.
+	DBNow time.Time
 }
 
 // cacheTrustDomain maps a job's trust flag onto the cache trust-domain string.
@@ -175,6 +182,7 @@ func (s *PostgresStore) lockedLeaseJobTx(ctx context.Context, tx pgx.Tx, jobID, 
 	}
 	c.JobID = jobID
 	c.Generation = generation
+	c.DBNow = dbNow.UTC()
 	// The locked row's payload carries the immutable repository identity; the
 	// shared derivation (RepoIDForJob) is the same one the scheduler, policy
 	// and server use, so the persisted namespace cannot drift. Trust is the

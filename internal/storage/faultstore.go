@@ -5635,7 +5635,15 @@ func (m *memStore) InsertTestReportWithHistoryDelivery(ctx context.Context, rep 
 			if existing.digest != delivery.ContentDigest {
 				return TestReportInsertOutcome{}, fmt.Errorf("%w: job %s generation %d delivery %s", ErrTestReportDeliveryConflict, delivery.JobID, delivery.LeaseGeneration, delivery.DeliveryID)
 			}
-			return TestReportInsertOutcome{Replay: true, ReportID: existing.reportID}, nil
+			// Return the ORIGINAL canonical report identity and instant.
+			createdAt := time.Time{}
+			for i := range m.reports {
+				if m.reports[i].ID == existing.reportID {
+					createdAt = m.reports[i].CreatedAt
+					break
+				}
+			}
+			return TestReportInsertOutcome{Replay: true, ReportID: existing.reportID, CreatedAt: createdAt}, nil
 		}
 		m.reportDeliveries[key] = memReportDelivery{digest: delivery.ContentDigest, reportID: rep.ID}
 	}
@@ -5666,7 +5674,7 @@ func (m *memStore) InsertTestReportWithHistoryDelivery(ctx context.Context, rep 
 		}
 	}
 	m.historyVersions[repoID]++
-	return TestReportInsertOutcome{Version: m.historyVersions[repoID], ReportID: rep.ID}, nil
+	return TestReportInsertOutcome{Version: m.historyVersions[repoID], ReportID: rep.ID, CreatedAt: rep.CreatedAt}, nil
 }
 
 // InsertTestReportWithHistoryDeliveryForLease is the in-memory mirror of the

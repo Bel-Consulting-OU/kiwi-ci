@@ -537,7 +537,11 @@ claims themselves.
   narrow `RunnerHeartbeatStore.TouchRunnerLastSeen`
   (`UPDATE runners SET last_seen=clock_timestamp()` in PostgreSQL) and
   touches nothing else; stores without the capability skip the advisory
-  refresh instead of falling back to the whole-row write.
+  refresh instead of falling back to the whole-row write. `last_seen` is
+  likewise no longer a profile field: `mergeRunnerProfile` preserves the
+  committed instant across every profile/admin write, and registration
+  explicitly touches it after the profile write, so a re-registration,
+  drain or enable from a stale snapshot can never move it backward.
 - Test-report uploads are now lease-fenced. Test history drives future
   shard assignment, duration balancing, the test manifest and flaky
   classification, so the delivery/report/fold transaction locks the job row,
@@ -545,10 +549,14 @@ claims themselves.
   after the lock, and refuses a report whose lease expired while the request
   (or a row-lock wait) was in flight with the same 409 as an expired upload,
   committing nothing. The report's canonical `(created_at,id)` ordering
-  instant is stamped from the same post-lock database clock, so replica clock
-  skew cannot reorder test history. A DB store without
+  instant is the fence's own database timestamp, so replica clock skew cannot
+  reorder test history, and the 201/200 body returns the canonical stored
+  report (including that instant). A DB store without
   `LeaseTestReportStore` is refused with 503 rather than committing
-  unfenced history.
+  unfenced history. Replay semantics are explicit: an identical delivery is
+  acknowledged idempotently only while the lease is still live; after the
+  lease has ended the retry is refused with 409 (the first commit stays
+  durable and folded exactly once).
 - The runner cache default root moved from the user-global cache root to the
   identity-local one (`<IdentityDir>/cache/<instance id>`) so two runner
   processes or identities sharing an account cannot contend for one

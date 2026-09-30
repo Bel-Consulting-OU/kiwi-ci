@@ -2415,8 +2415,11 @@ type testReportDelivery struct {
 // (internal/testintel/limits.go) before any upload is attempted. The
 // delivery ID is sha256(jobID, lease generation, canonical payload digest),
 // which is exactly the durable-delivery identity the server records next to
-// the report, so retrying a dropped response can neither duplicate the report
-// nor fold its history twice.
+// the report. While the lease is still active, retrying a dropped response
+// converges on the original report and can neither duplicate it nor fold its
+// history twice; once the lease has ended the server refuses the late retry
+// with 409 (the first commit stays durable), because test-report delivery is
+// an advisory lease-bound upload, not a post-lease acknowledgment channel.
 func buildTestReportDelivery(jobID string, leaseGeneration int64, runnerID, leaseToken string, report model.TestReport) (testReportDelivery, error) {
 	// The shared validator enforces the same case/message/payload budget the
 	// parser and the server apply, so an over-limit report is rejected here

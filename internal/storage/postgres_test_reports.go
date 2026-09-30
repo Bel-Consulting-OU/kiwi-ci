@@ -57,12 +57,14 @@ type TestReportDelivery struct {
 }
 
 // TestReportInsertOutcome reports what one delivery did. Replay is true when
-// the identical (delivery ID, content digest) had already committed: the
-// stored ReportID is the original report and nothing was inserted or folded.
+// the identical (delivery ID, content digest) had already committed while the
+// lease was live: the stored ReportID is the original report, CreatedAt is
+// its canonical stored creation instant, and nothing was inserted or folded.
 type TestReportInsertOutcome struct {
-	Version  int64
-	Replay   bool
-	ReportID string
+	Version   int64
+	Replay    bool
+	ReportID  string
+	CreatedAt time.Time
 }
 
 // ErrTestReportDeliveryConflict reports a delivery ID reused with a different
@@ -104,8 +106,18 @@ type LeaseTestReportStore interface {
 	// repoID (when non-empty) must equal the locked job's canonical
 	// repository identity; a mismatch commits nothing and returns an error
 	// wrapping ErrLeaseIdentityMismatch. rep.CreatedAt is overwritten with
-	// the sampled database timestamp. A delivery replay of an already
-	// committed (delivery ID, digest) still returns the original report ID.
+	// the fence's database timestamp.
+	//
+	// REPLAY CONTRACT (chosen semantics): an identical (delivery ID, digest)
+	// replay is idempotent ONLY while generation N still holds the live
+	// lease: the receipt is examined after the lease fence, so the retry
+	// returns the original report ID and canonical CreatedAt and commits
+	// nothing. Once the lease has ended (expiry, completion, recovery), the
+	// retry is refused with ErrLeaseLost like any other post-lease write.
+	// That refusal is safe — the first commit is already durable and folded
+	// exactly once, so nothing is duplicated — and it is the documented
+	// contract: test-report delivery is an advisory, lease-bound upload, not
+	// a post-lease acknowledgment channel.
 	InsertTestReportWithHistoryDeliveryForLease(ctx context.Context, jobID, runnerID string, generation int64, rep model.TestReport, repoID string, delivery TestReportDelivery) (TestReportInsertOutcome, error)
 }
 
@@ -140,7 +152,7 @@ func (s *PostgresStore) InsertTestReportWithHistoryDelivery(ctx context.Context,
 // InsertTestReportWithHistoryDelivery (see LeaseTestReportStore): the same
 // delivery/report/fold transaction, preceded by the shared post-lock
 // job-lease predicate (lockedLeaseJobTx) and with rep.CreatedAt overwritten
-// by a fresh database timestamp sampled after the lock.
+// by the fence's own database timestamp (coords.DBNow).
 func (s *PostgresStore) InsertTestReportWithHistoryDeliveryForLease(ctx context.Context, jobID, runnerID string, generation int64, rep model.TestReport, repoID string, delivery TestReportDelivery) (TestReportInsertOutcome, error) {
 	if err := validateLeaseCommitKey(jobID, runnerID, generation); err != nil {
 		return TestReportInsertOutcome{}, err
@@ -183,14 +195,10 @@ func (s *PostgresStore) InsertTestReportWithHistoryDeliveryForLease(ctx context.
 	if repoID != coords.RepoID {
 		return TestReportInsertOutcome{}, leaseIdentityErrorf("test report %s repository %q does not match leased job repository %q", rep.ID, repoID, coords.RepoID)
 	}
-	// Canonical history ordering is the (created_at,id) pair; the instant
-	// must come from the database clock that just fenced the lease, never
-	// from the serving replica's application clock.
-	var dbNow time.Time
-	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&dbNow); err != nil {
-		return TestReportInsertOutcome{}, err
-	}
-	rep.CreatedAt = dbNow.UTC()
+	// Canonical history ordering is the (created_at,id) pair; reuse the very
+	// instant the lease was validated against, so the ordering time IS the
+	// fence time, never a second sample or the serving replica's clock.
+	rep.CreatedAt = coords.DBNow
 	return commitTestReportDeliveryTx(ctx, tx, rep, repoID, delivery)
 }
 
@@ -206,9 +214,15 @@ func commitTestReportDeliveryTx(ctx context.Context, tx pgx.Tx, rep model.TestRe
 			return TestReportInsertOutcome{}, err
 		}
 		if !claimed {
-			// The identical delivery already committed: return its original
-			// report ID and commit nothing (the rollback is a no-op).
-			return TestReportInsertOutcome{Replay: true, ReportID: existingID}, nil
+			// The identical delivery already committed (while this
+			// generation held a live lease): return the ORIGINAL canonical
+			// report identity and instant, and commit nothing (the rollback
+			// is a no-op).
+			var createdAt time.Time
+			if err := tx.QueryRow(ctx, `SELECT created_at FROM test_results WHERE id=$1`, existingID).Scan(&createdAt); err != nil {
+				return TestReportInsertOutcome{}, err
+			}
+			return TestReportInsertOutcome{Replay: true, ReportID: existingID, CreatedAt: createdAt.UTC()}, nil
 		}
 	}
 	version, err := lockTestHistoryRepoTx(ctx, tx, repoID)
@@ -233,7 +247,7 @@ func commitTestReportDeliveryTx(ctx context.Context, tx pgx.Tx, rep model.TestRe
 	if err := tx.Commit(ctx); err != nil {
 		return TestReportInsertOutcome{}, err
 	}
-	return TestReportInsertOutcome{Version: version, ReportID: rep.ID}, nil
+	return TestReportInsertOutcome{Version: version, ReportID: rep.ID, CreatedAt: rep.CreatedAt}, nil
 }
 
 // claimTestReportDeliveryTx attempts to claim one delivery receipt inside the

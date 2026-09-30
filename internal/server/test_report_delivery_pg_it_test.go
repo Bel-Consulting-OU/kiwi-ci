@@ -6,6 +6,8 @@ package server
 // KIWI_TEST_POSTGRES_URL via the shared pgITServer* helpers.
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"sync"
 	"testing"
@@ -132,5 +134,36 @@ func TestPostgresIntegrationTestReportDeliveryConcurrentDuplicates(t *testing.T)
 	}
 	if got := pgITServerCount(t, env, `SELECT COALESCE(MAX(version),0)::int FROM test_history_repos WHERE repo_id=$1`, canonical); got != 1 {
 		t.Fatalf("history version after concurrent duplicates = %d, want 1", got)
+	}
+}
+
+// TestPostgresIntegrationTestReportCreateResponseEqualsStoredReport pins the
+// canonical-creation-response invariant against real PostgreSQL: the 201 body
+// (including created_at) equals the durable report an immediate read returns.
+// The store samples the database clock inside the fenced transaction, so the
+// response can never advertise the serving replica's application instant.
+func TestPostgresIntegrationTestReportCreateResponseEqualsStoredReport(t *testing.T) {
+	env := pgITServerSetup(t)
+	s, st := pgITServerWithEnv(t, env, t.TempDir())
+	pgITServerAwaitLeadership(t, s)
+	runnerID := pgITRegisterRunner(t, s)
+	run := pgITSubmit(t, s, pgITServerPipeline)
+	task := pgITNext(t, s, runnerID)
+	body := deliveryReportBody(task.Job.ID, runnerID, task.LeaseToken, task.LeaseGeneration, "canonical-resp",
+		model.TestResult{Name: "resp", Class: "C", Duration: 1, Passed: true})
+	w := pgITDo(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/tests", "token", body, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("upload = %d: %s", w.Code, w.Body.String())
+	}
+	var resp model.TestReport
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	stored, err := st.ListTestReports(context.Background(), run.ID)
+	if err != nil || len(stored) != 1 {
+		t.Fatalf("stored reports = %d err=%v, want 1", len(stored), err)
+	}
+	if resp.ID != stored[0].ID || !resp.CreatedAt.Equal(stored[0].CreatedAt) {
+		t.Fatalf("201 body (id %s, created_at %v) != stored report (id %s, created_at %v)", resp.ID, resp.CreatedAt, stored[0].ID, stored[0].CreatedAt)
 	}
 }

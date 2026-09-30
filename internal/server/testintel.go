@@ -162,6 +162,13 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		rep.ID = outcome.ReportID
+		// The response must be the CANONICAL stored report: the store
+		// stamps the database-clock CreatedAt (and returns the original
+		// one on a live replay), so a successful 201/200 can never disagree
+		// with an immediate read of the durable report on a skewed replica.
+		if !outcome.CreatedAt.IsZero() {
+			rep.CreatedAt = outcome.CreatedAt
+		}
 		if outcome.Replay {
 			// Idempotent success: the original report already committed,
 			// its history was folded once, and this retry must not

@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
 // uploadReportBody renders the POST /tests body for a leased job. The
@@ -260,5 +262,65 @@ func TestExpiredTestReportDoesNotChangeShardAssignment(t *testing.T) {
 	after := getShards()
 	if !bytes.Equal(before, after) {
 		t.Fatalf("refused report changed the shard assignment:\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+// TestUploadTestReportResponseUsesDatabaseCreatedAt pins residual finding 1:
+// the 201 body must be the CANONICAL stored report. The fake's fence stamps a
+// store-clock instant distinct from the serving replica's application time,
+// and both the create response and a live replay must carry it (never the
+// application time captured by the handler).
+func TestUploadTestReportResponseUsesDatabaseCreatedAt(t *testing.T) {
+	f := newDBFakeStore()
+	s := New("token")
+	if err := s.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.enqueue(context.Background(), SubmitRun{
+		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
+		Ref: "refs/heads/main", SHA: "abc", Event: "push",
+		Pipeline: smokePipeline, Trusted: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runnerID, task := leaseRunJob(t, s)
+	dbNow := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Second)
+	f.mu.Lock()
+	f.reportCreatedAt = &dbNow
+	f.mu.Unlock()
+
+	body := uploadReportBody(task, runnerID, []map[string]any{
+		{"name": "stamped", "duration": 1.0, "passed": true},
+	})
+	w := doJSON(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/tests", "token", body)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("upload = %d: %s", w.Code, w.Body.String())
+	}
+	var resp model.TestReport
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.CreatedAt.Equal(dbNow) {
+		t.Fatalf("create response CreatedAt = %v, want the store-clock %v", resp.CreatedAt, dbNow)
+	}
+	f.mu.Lock()
+	stored := append([]model.TestReport(nil), f.reports...)
+	f.mu.Unlock()
+	if len(stored) != 1 || !stored[0].CreatedAt.Equal(resp.CreatedAt) {
+		t.Fatalf("response CreatedAt %v != stored report CreatedAt %v", resp.CreatedAt, stored)
+	}
+
+	// A live replay returns the ORIGINAL canonical instant, not the retry's
+	// application time.
+	w = doJSON(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/tests", "token", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("replay = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	var replay model.TestReport
+	if err := json.Unmarshal(w.Body.Bytes(), &replay); err != nil {
+		t.Fatal(err)
+	}
+	if !replay.CreatedAt.Equal(dbNow) || replay.ID != resp.ID {
+		t.Fatalf("replay response = id %s created_at %v, want the canonical id %s created_at %v", replay.ID, replay.CreatedAt, resp.ID, dbNow)
 	}
 }

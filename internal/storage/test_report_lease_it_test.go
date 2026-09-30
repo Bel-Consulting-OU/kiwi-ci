@@ -232,3 +232,92 @@ func TestIntegrationReplicaClockSkewCannotReorderTestHistory(t *testing.T) {
 		t.Fatalf("folded outcomes = %v, want [false true] in database-commit order", outcomes)
 	}
 }
+
+// TestIntegrationCommittedTestReportReplayAfterLeaseExpiry pins the chosen
+// replay contract: an identical delivery replay is idempotent while the lease
+// is live (returning the original canonical report identity and instant), and
+// once the lease has ended the retry is refused with ErrLeaseLost — the first
+// commit stays durable and folded exactly once.
+func TestIntegrationCommittedTestReportReplayAfterLeaseExpiry(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	_, jobID, runnerID := leaseClockITSetup(t, st)
+	job, repo := testReportLeaseClaim(t, st, jobID, runnerID, time.Minute)
+
+	rep := testReportForLease(t, job, "replayed", true, time.Now().UTC())
+	delivery := TestReportDelivery{JobID: jobID, LeaseGeneration: job.LeaseGeneration, DeliveryID: "replay-delivery", ContentDigest: "digest-replay"}
+	first, err := st.InsertTestReportWithHistoryDeliveryForLease(ctx, jobID, runnerID, job.LeaseGeneration, rep, repo, delivery)
+	if err != nil || first.Replay || first.CreatedAt.IsZero() {
+		t.Fatalf("first delivery = %+v err=%v", first, err)
+	}
+	// Live replay: the ORIGINAL canonical identity and instant, nothing new.
+	live, err := st.InsertTestReportWithHistoryDeliveryForLease(ctx, jobID, runnerID, job.LeaseGeneration, rep, repo, delivery)
+	if err != nil || !live.Replay || live.ReportID != first.ReportID || !live.CreatedAt.Equal(first.CreatedAt) {
+		t.Fatalf("live replay = %+v err=%v, want replay of %s at %v", live, err, first.ReportID, first.CreatedAt)
+	}
+	versionBefore, statsBefore := testReportHistoryState(t, st, repo)
+	reportCount := func() int {
+		t.Helper()
+		reports, err := st.ListTestReports(ctx, job.RunID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(reports)
+	}
+	if reportCount() != 1 {
+		t.Fatalf("reports after live replay = %d, want 1", reportCount())
+	}
+	// End the lease and retry the identical delivery: refused, state intact.
+	if _, err := st.pool.Exec(ctx, `UPDATE jobs SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE id=$1`, jobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.InsertTestReportWithHistoryDeliveryForLease(ctx, jobID, runnerID, job.LeaseGeneration, rep, repo, delivery); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("post-lease replay = %v, want ErrLeaseLost", err)
+	}
+	if got := reportCount(); got != 1 {
+		t.Fatalf("reports after refused replay = %d, want 1", got)
+	}
+	versionAfter, statsAfter := testReportHistoryState(t, st, repo)
+	if versionAfter != versionBefore || !bytes.Equal(statsBefore, statsAfter) {
+		t.Fatalf("refused replay changed history: version %d -> %d", versionBefore, versionAfter)
+	}
+	var deliveries int
+	if err := st.pool.QueryRow(ctx, `SELECT count(*) FROM test_report_deliveries WHERE job_id=$1`, jobID).Scan(&deliveries); err != nil {
+		t.Fatal(err)
+	}
+	if deliveries != 1 {
+		t.Fatalf("delivery receipts = %d, want 1", deliveries)
+	}
+}
+
+// TestIntegrationDifferentRunnerCannotReplayReportReceipt proves the receipt
+// never becomes a cross-runner acknowledgment channel: another runner cannot
+// invoke the fenced commit on a lease it does not hold, even with the exact
+// delivery identifiers, so it can neither replay nor duplicate the receipt.
+func TestIntegrationDifferentRunnerCannotReplayReportReceipt(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	_, jobID, runnerA := leaseClockITSetup(t, st)
+	job, repo := testReportLeaseClaim(t, st, jobID, runnerA, time.Minute)
+
+	rep := testReportForLease(t, job, "owned", true, time.Now().UTC())
+	delivery := TestReportDelivery{JobID: jobID, LeaseGeneration: job.LeaseGeneration, DeliveryID: "owned-delivery", ContentDigest: "digest-owned"}
+	if _, err := st.InsertTestReportWithHistoryDeliveryForLease(ctx, jobID, runnerA, job.LeaseGeneration, rep, repo, delivery); err != nil {
+		t.Fatalf("owner delivery: %v", err)
+	}
+
+	runnerB := pgITNewID(t)
+	if err := st.UpsertRunner(ctx, model.Runner{ID: runnerB, Name: runnerB, Capacity: 2}); err != nil {
+		t.Fatalf("register runner B: %v", err)
+	}
+	repB := testReportForLease(t, job, "forged", true, time.Now().UTC())
+	deliveryB := TestReportDelivery{JobID: jobID, LeaseGeneration: job.LeaseGeneration, DeliveryID: "owned-delivery", ContentDigest: "digest-owned"}
+	// Runner B presents the EXACT identifiers of runner A's receipt.
+	if _, err := st.InsertTestReportWithHistoryDeliveryForLease(ctx, jobID, runnerB, job.LeaseGeneration, repB, repo, deliveryB); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("cross-runner replay = %v, want ErrLeaseLost", err)
+	}
+	reports, err := st.ListTestReports(ctx, job.RunID)
+	if err != nil || len(reports) != 1 || reports[0].ID != rep.ID {
+		t.Fatalf("reports after cross-runner attempt = %+v err=%v, want only %s", reports, err, rep.ID)
+	}
+}

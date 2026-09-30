@@ -2495,25 +2495,47 @@ func newRegisterResponse(in model.Runner, profileBound bool) registerResponse {
 // enable all intend admin fields only); the guarded store preserves the
 // committed active_jobs/busy/current_job/completed/failed under the runner
 // row lock, so a stale read can never drop a slot a concurrent claim reserved.
-// create lets registration insert a brand-new runner (the profile contract
-// never creates one); drain/enable pass false so a concurrently deleted
-// runner is a 404, not a resurrection. A legacy store without the contract
-// falls back to UpsertRunner carrying the lease-owned fields of the row that
-// was just read, which is the strongest guarantee such a store supports.
+// It also preserves the committed last_seen: that field belongs to the
+// heartbeat's narrow touch, so a profile write from a stale snapshot can
+// never move it backward. create lets registration insert a brand-new runner
+// (the profile contract never creates one); drain/enable pass false so a
+// concurrently deleted runner is a 404, not a resurrection. A legacy store
+// without the contract falls back to UpsertRunner carrying the lease-owned
+// fields of the row that was just read, which is the strongest guarantee such
+// a store supports.
+//
+// Registration IS a liveness event: after a successful create=true write the
+// row's last_seen is stamped through the narrow RunnerHeartbeatStore
+// capability on the store's own clock (best-effort, like a heartbeat), so a
+// registration from a skewed replica cannot record an application-clock
+// last_seen, and a re-registration cannot move the instant backward.
 func (s *Server) writeRunnerProfileDB(ctx context.Context, runner, old model.Runner, create bool) error {
 	if u, ok := s.DB.(storage.RunnerProfileUpdateStore); ok {
 		err := u.UpdateRunnerProfileFields(ctx, runner)
-		if errors.Is(err, storage.ErrNotFound) && create {
-			return s.DB.UpsertRunner(ctx, runner)
+		switch {
+		case errors.Is(err, storage.ErrNotFound) && create:
+			if err := s.DB.UpsertRunner(ctx, runner); err != nil {
+				return err
+			}
+		case err != nil:
+			return err
 		}
-		return err
+	} else {
+		runner.ActiveJobs = append([]string(nil), old.ActiveJobs...)
+		runner.CurrentJob = old.CurrentJob
+		runner.Completed = old.Completed
+		runner.Failed = old.Failed
+		runner.Busy = runner.Capacity > 0 && len(runner.ActiveJobs) >= runner.Capacity
+		if err := s.DB.UpsertRunner(ctx, runner); err != nil {
+			return err
+		}
 	}
-	runner.ActiveJobs = append([]string(nil), old.ActiveJobs...)
-	runner.CurrentJob = old.CurrentJob
-	runner.Completed = old.Completed
-	runner.Failed = old.Failed
-	runner.Busy = runner.Capacity > 0 && len(runner.ActiveJobs) >= runner.Capacity
-	return s.DB.UpsertRunner(ctx, runner)
+	if create {
+		if hs, ok := s.DB.(storage.RunnerHeartbeatStore); ok {
+			_ = hs.TouchRunnerLastSeen(ctx, runner.ID)
+		}
+	}
+	return nil
 }
 
 func (s *Server) register(w http.ResponseWriter, r *http.Request) {

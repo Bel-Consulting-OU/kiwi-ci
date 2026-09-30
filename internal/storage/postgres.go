@@ -2762,12 +2762,21 @@ func (s *PostgresStore) CancelRunJobs(ctx context.Context, runID string, reason 
 // original registration time. busy is recomputed from the preserved active
 // set and the caller's capacity, so a capacity edit cannot leave a stale busy
 // flag.
+// mergeRunnerProfile preserves the fields the caller must not own when it
+// writes an existing runner row: the lease-owned fields, the counters, the
+// original registration instant and last_seen. last_seen is deliberately NOT
+// a profile field: heartbeat/touch (RunnerHeartbeatStore) is its only writer
+// on the store clock, so a profile/admin write from a stale snapshot — a
+// re-registration, drain or enable that read the row before a concurrent
+// heartbeat — can never move it backward. Registration stamps it explicitly
+// through TouchRunnerLastSeen after the profile write.
 func mergeRunnerProfile(caller, existing model.Runner) model.Runner {
 	merged := caller
 	merged.ActiveJobs = append([]string(nil), existing.ActiveJobs...)
 	merged.CurrentJob = existing.CurrentJob
 	merged.Completed = existing.Completed
 	merged.Failed = existing.Failed
+	merged.LastSeen = existing.LastSeen
 	if !existing.Registered.IsZero() {
 		merged.Registered = existing.Registered
 	}

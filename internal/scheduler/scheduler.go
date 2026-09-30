@@ -488,11 +488,16 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 		if len(ri.ActiveJobs) > 0 {
 			ri.CurrentJob = ri.ActiveJobs[0]
 		}
-		ri.LastSeen = now
 		if err := s.Store.UpsertRunner(ctx, ri); err != nil {
 			// The lease is already durably held; a runner bookkeeping failure
 			// must not strand the job.
 			log.Printf("scheduler: update runner %s after lease: %v", runnerID, err)
+		}
+		// last_seen belongs to the narrow touch (the generic profile write
+		// preserves the committed value), so advance it explicitly through
+		// the capability when the store has it.
+		if hs, ok := s.Store.(storage.RunnerHeartbeatStore); ok {
+			_ = hs.TouchRunnerLastSeen(ctx, runnerID)
 		}
 		return &j, raw, expires, nil
 	}

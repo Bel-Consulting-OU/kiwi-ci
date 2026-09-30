@@ -427,19 +427,27 @@ In **DB mode the database clock is the authority for a lease's lifetime**:
   because test history drives future shard assignment, duration balancing,
   the test manifest and flaky classification. A report whose lease expired
   while the request (or a row-lock wait) was in flight is refused with 409
-  and commits nothing. Log lines/batches pass the same database-clock gate at
-  request start but are deliberately NOT transactionally lease-fenced: log
-  lines carry no lifecycle, authority or accounting meaning, and batch
-  receipts are generation-scoped, so a late batch can never collide with a
-  re-leased generation. Every behavior-affecting runner mutation (completion,
-  heartbeat, test reports, cache/artifact/snapshot publication, generated
-  jobs, OIDC, secrets) is commit-time fenced.
+  and commits nothing. The 201/200 body is the canonical stored report,
+  including that database-clock instant, so a create response can never
+  disagree with an immediate read. A dropped-response replay is idempotent
+  only while the lease is still live; after the lease has ended the retry is
+  refused with 409 (the first commit stays durable). Log lines/batches pass
+  the same database-clock gate at request start but are deliberately NOT
+  transactionally lease-fenced: log lines carry no lifecycle, authority or
+  accounting meaning, and batch receipts are generation-scoped, so a late
+  batch can never collide with a re-leased generation. Every
+  behavior-affecting runner mutation (completion, heartbeat, test reports,
+  cache/artifact/snapshot publication, generated jobs, OIDC, secrets) is
+  commit-time fenced.
 - **Heartbeats touch only `last_seen`.** The runner liveness refresh is a
   narrow `RunnerHeartbeatStore.TouchRunnerLastSeen`
   (`UPDATE runners SET last_seen=clock_timestamp()`), never a whole-row
   read-modify-write: a heartbeat that read the runner before a concurrent
   admin disable/drain/profile edit can no longer write the stale snapshot
-  back and undo the admin action.
+  back and undo the admin action. Profile/admin writes likewise never own
+  `last_seen` (the guarded merge preserves the committed instant, and
+  registration touches it explicitly afterwards), so a re-registration,
+  drain or enable from a stale snapshot cannot move it backward.
 
 The in-memory/dev store is single-process and keeps a monotonic application
 clock, where skew is not a concept. Queue deadlines are one-shot instants

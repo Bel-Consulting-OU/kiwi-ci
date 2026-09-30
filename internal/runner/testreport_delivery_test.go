@@ -98,8 +98,9 @@ func TestBuildTestReportDeliveryStableAndBounded(t *testing.T) {
 // droppedReportControlPlane is the scripted response-dropping endpoint for the
 // report upload: the first delivery of each (job, generation, delivery ID)
 // commits to a receipt store and then kills the connection without a
-// response; an identical replay is acknowledged idempotently; a reused ID
-// with a different digest is a 409.
+// response; an identical replay is acknowledged idempotently (the server
+// contract limits the replay to a still-live lease); a reused ID with a
+// different digest is a 409.
 type droppedReportControlPlane struct {
 	mu       sync.Mutex
 	attempts []reportDeliveryAttempt
