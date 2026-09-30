@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -132,6 +133,36 @@ func (r *Runner) cacheRootDir() string {
 	return filepath.Join(r.cacheRootRoot(), runnerStagingInstanceID(r.ID))
 }
 
+// legacyDefaultCacheNamespace reports the per-runner namespace this runner
+// used before the identity-local default: <user cache root>/<instance id>.
+// It applies only when no explicit CacheRoot is configured (the new default
+// is derived from the identity directory) and the old namespace still holds
+// content. The old tree is NOT read, pruned or budgeted by the new manager,
+// so an upgrade can strand it invisibly; configureCacheManager warns and
+// names the explicit reclaim command once the operator has drained every
+// pre-upgrade process (automatic deletion is deliberately refused: the old
+// process holds no namespace lock the new one can trust).
+func (r *Runner) legacyDefaultCacheNamespace() string {
+	if r.Cfg.CacheRoot != "" || r.Cfg.IdentityDir == "" {
+		return ""
+	}
+	old := filepath.Join(cache.Default().Root, runnerStagingInstanceID(r.ID))
+	if old == r.cacheRootDir() {
+		return ""
+	}
+	entries, err := os.ReadDir(old)
+	if err != nil || len(entries) == 0 {
+		return ""
+	}
+	return old
+}
+
+// legacyCacheNamespaceWarning is the operator-facing upgrade notice; a test
+// seam so the detection can be asserted without capturing process stderr.
+var legacyCacheNamespaceWarning = func(r *Runner, oldPath, newRoot string) {
+	fmt.Fprintf(os.Stderr, "kiwi runner %s: legacy default cache namespace still present at %s; the default cache root is now %s, so the old cache is no longer read, budgeted or pruned. Once every pre-upgrade runner process has drained, reclaim it with: kiwi storage migrate-runner-cache-layout --dir %q --force\n", r.ID, oldPath, newRoot, oldPath)
+}
+
 // cacheRetentionPolicy resolves the aggregate local-cache bound: every
 // dimension falls back to the built-in default so a distributed runner never
 // runs without one.
@@ -167,6 +198,13 @@ func (r *Runner) configureCacheManager() error {
 	defer r.cacheMu.Unlock()
 	if r.cacheMgr != nil && r.cacheMgr.Root() == root && r.cacheMgr.Policy() == policy && !r.cacheMgr.Closed() {
 		return nil
+	}
+	// Upgrade visibility: when the default moved from the user-global cache
+	// root to the identity-local one, the old per-runner namespace is no
+	// longer read or budgeted by this manager. Warn loudly instead of letting
+	// it become invisible disk usage.
+	if legacy := r.legacyDefaultCacheNamespace(); legacy != "" {
+		legacyCacheNamespaceWarning(r, legacy, root)
 	}
 	if old := r.cacheMgr; old != nil {
 		if old.Closed() {

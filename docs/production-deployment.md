@@ -419,16 +419,27 @@ In **DB mode the database clock is the authority for a lease's lifetime**:
   clock, where skew is not a concept; a DB store that does not implement
   `LiveLeaseStore` is refused with 503 rather than silently downgrading to
   replica-clock liveness.
-- **Log and test-report ingestion is deliberate late-data grace, not lease
-  authority.** Log lines/batches and test reports pass the same database-clock
-  gate at request start, but the append is not transactionally lease-fenced
-  like the artifact/cache/snapshot metadata commits: a batch or report that
-  raced the gate can land just after the lease expired. These records carry no
-  lifecycle, authority or accounting meaning, and their receipts are
-  generation-scoped, so a late write can never collide with a re-leased
-  generation. Every behavior-affecting runner mutation (completion, heartbeat,
-  cache/artifact/snapshot publication, generated jobs, OIDC, secrets) is
-  commit-time fenced.
+- **Test-report ingestion is lease-fenced; only log ingestion is deliberate
+  late-log grace.** Test reports commit through `LeaseTestReportStore`, which
+  locks the job row, re-validates runner/generation and
+  `lease_expires_at > clock_timestamp()` after the lock, and stamps the
+  canonical `(created_at,id)` ordering instant from that same database clock —
+  because test history drives future shard assignment, duration balancing,
+  the test manifest and flaky classification. A report whose lease expired
+  while the request (or a row-lock wait) was in flight is refused with 409
+  and commits nothing. Log lines/batches pass the same database-clock gate at
+  request start but are deliberately NOT transactionally lease-fenced: log
+  lines carry no lifecycle, authority or accounting meaning, and batch
+  receipts are generation-scoped, so a late batch can never collide with a
+  re-leased generation. Every behavior-affecting runner mutation (completion,
+  heartbeat, test reports, cache/artifact/snapshot publication, generated
+  jobs, OIDC, secrets) is commit-time fenced.
+- **Heartbeats touch only `last_seen`.** The runner liveness refresh is a
+  narrow `RunnerHeartbeatStore.TouchRunnerLastSeen`
+  (`UPDATE runners SET last_seen=clock_timestamp()`), never a whole-row
+  read-modify-write: a heartbeat that read the runner before a concurrent
+  admin disable/drain/profile edit can no longer write the stale snapshot
+  back and undo the admin action.
 
 The in-memory/dev store is single-process and keeps a monotonic application
 clock, where skew is not a concept. Queue deadlines are one-shot instants

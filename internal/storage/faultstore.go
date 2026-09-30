@@ -435,6 +435,22 @@ func (f *FaultyStore) UpsertRunner(ctx context.Context, runner model.Runner) err
 	return f.Inner.UpsertRunner(ctx, runner)
 }
 
+// TouchRunnerLastSeen forwards the narrow heartbeat liveness refresh to the
+// inner store's RunnerHeartbeatStore implementation (when present) while
+// injecting the configured mutation fault.
+func (f *FaultyStore) TouchRunnerLastSeen(ctx context.Context, runnerID string) error {
+	inner, ok := f.Inner.(RunnerHeartbeatStore)
+	if !ok {
+		return errMissingInnerInterface("RunnerHeartbeatStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return inner.TouchRunnerLastSeen(ctx, runnerID)
+}
+
 // UpdateRunnerProfileFields is the mutating wrapper over the optional
 // RunnerProfileUpdateStore contract: an armed fault fails the guarded profile
 // write before the inner store is touched.
@@ -1708,6 +1724,24 @@ func (f *FaultyStore) InsertTestReportWithHistoryDelivery(ctx context.Context, r
 	return inner.InsertTestReportWithHistoryDelivery(ctx, rep, repoID, delivery)
 }
 
+// InsertTestReportWithHistoryDeliveryForLease forwards the lease-fenced
+// report commit to the inner store's LeaseTestReportStore implementation
+// while injecting the configured mutation fault.
+func (f *FaultyStore) InsertTestReportWithHistoryDeliveryForLease(ctx context.Context, jobID, runnerID string, generation int64, rep model.TestReport, repoID string, delivery TestReportDelivery) (TestReportInsertOutcome, error) {
+	inner, ok := f.Inner.(LeaseTestReportStore)
+	if !ok {
+		return TestReportInsertOutcome{}, errMissingInnerInterface("LeaseTestReportStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return TestReportInsertOutcome{}, err
+	}
+	return inner.InsertTestReportWithHistoryDeliveryForLease(ctx, jobID, runnerID, generation, rep, repoID, delivery)
+}
+
+var _ LeaseTestReportStore = (*FaultyStore)(nil)
+
 func (f *FaultyStore) LoadRepoTestHistory(ctx context.Context, repoID string) (int64, []byte, error) {
 	inner, ok := f.Inner.(TestHistoryAggregateStore)
 	if !ok {
@@ -2504,6 +2538,24 @@ func (m *memStore) UpdateRunnerProfileFields(ctx context.Context, runner model.R
 }
 
 var _ RunnerProfileUpdateStore = (*memStore)(nil)
+
+// TouchRunnerLastSeen implements RunnerHeartbeatStore: single-process
+// semantics use the monotonic application clock, and only the advisory
+// last-seen field moves — never the profile/admin state a concurrent admin
+// action may have just written.
+func (m *memStore) TouchRunnerLastSeen(ctx context.Context, runnerID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.runners[runnerID]
+	if !ok {
+		return ErrNotFound
+	}
+	r.LastSeen = time.Now().UTC()
+	m.runners[runnerID] = r
+	return nil
+}
+
+var _ RunnerHeartbeatStore = (*memStore)(nil)
 
 func (m *memStore) GetRunner(ctx context.Context, id string) (model.Runner, error) {
 	m.mu.Lock()
@@ -5616,6 +5668,45 @@ func (m *memStore) InsertTestReportWithHistoryDelivery(ctx context.Context, rep 
 	m.historyVersions[repoID]++
 	return TestReportInsertOutcome{Version: m.historyVersions[repoID], ReportID: rep.ID}, nil
 }
+
+// InsertTestReportWithHistoryDeliveryForLease is the in-memory mirror of the
+// SQL lease-fenced delivery: it evaluates the SAME post-lock lease predicate
+// (under the store mutex, this store's transaction), binds the report and
+// delivery identity to the locked job, and only then delegates to the plain
+// delivery commit. A lease that is not held returns ErrLeaseLost and commits
+// nothing.
+func (m *memStore) InsertTestReportWithHistoryDeliveryForLease(ctx context.Context, jobID, runnerID string, generation int64, rep model.TestReport, repoID string, delivery TestReportDelivery) (TestReportInsertOutcome, error) {
+	if err := validateLeaseCommitKey(jobID, runnerID, generation); err != nil {
+		return TestReportInsertOutcome{}, err
+	}
+	if delivery.JobID != jobID || delivery.LeaseGeneration != generation {
+		return TestReportInsertOutcome{}, leaseIdentityErrorf("test report delivery (job %s, generation %d) does not match leased job %s generation %d", delivery.JobID, delivery.LeaseGeneration, jobID, generation)
+	}
+	m.mu.Lock()
+	coords, held := m.leaseJobCoordsLocked(jobID, runnerID, generation, time.Now().UTC())
+	m.mu.Unlock()
+	if !held {
+		return TestReportInsertOutcome{}, fmt.Errorf("%w: test report for job %s", ErrLeaseLost, jobID)
+	}
+	if rep.JobID != jobID || rep.RunID != coords.RunID {
+		return TestReportInsertOutcome{}, leaseIdentityErrorf("test report %s (job %s, run %s) does not match leased job %s run %s", rep.ID, rep.JobID, rep.RunID, jobID, coords.RunID)
+	}
+	if rep.JobKey != "" && rep.JobKey != coords.JobKey {
+		return TestReportInsertOutcome{}, leaseIdentityErrorf("test report %s job key %q does not match leased job key %q", rep.ID, rep.JobKey, coords.JobKey)
+	}
+	if rep.JobKey == "" {
+		rep.JobKey = coords.JobKey
+	}
+	if repoID == "" {
+		repoID = coords.RepoID
+	}
+	if repoID != coords.RepoID {
+		return TestReportInsertOutcome{}, leaseIdentityErrorf("test report %s repository %q does not match leased job repository %q", rep.ID, repoID, coords.RepoID)
+	}
+	return m.InsertTestReportWithHistoryDelivery(ctx, rep, repoID, delivery)
+}
+
+var _ LeaseTestReportStore = (*memStore)(nil)
 
 // reportIsNewestForRepoLocked reports whether rep sorts at or after every
 // OTHER durable report of repoID under the canonical (created_at,id) order

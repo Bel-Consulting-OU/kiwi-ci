@@ -22,6 +22,7 @@ type injectedStore struct {
 	listByRunErr     error
 	updateJobErr     error
 	upsertRunnerErr  error
+	touchRunnerErr   error
 	heartbeatErr     error
 	heartbeatHook    func()
 	cancelRunErr     error
@@ -83,6 +84,13 @@ func (s *injectedStore) UpsertRunner(ctx context.Context, r model.Runner) error 
 		return s.upsertRunnerErr
 	}
 	return s.fakeStore.UpsertRunner(ctx, r)
+}
+
+func (s *injectedStore) TouchRunnerLastSeen(ctx context.Context, runnerID string) error {
+	if s.touchRunnerErr != nil {
+		return s.touchRunnerErr
+	}
+	return s.fakeStore.TouchRunnerLastSeen(ctx, runnerID)
 }
 
 func (s *injectedStore) HeartbeatLease(ctx context.Context, jobID, runnerID string, generation int64, expiresAt time.Time) error {
@@ -490,10 +498,10 @@ func TestHeartbeatErrorPaths(t *testing.T) {
 		}
 	})
 
-	t.Run("runner lookup failure is tolerated", func(t *testing.T) {
+	t.Run("last-seen touch failure is tolerated", func(t *testing.T) {
 		st := newInjectedStore()
 		st.putJob(model.Job{ID: "job-1", RunID: "run-1", Status: model.StatusRunning, LeaseRunnerID: "runner-1", LeaseGeneration: 1, LeaseExpiresAt: &now})
-		st.getRunnerErr = errors.New("runner gone")
+		st.touchRunnerErr = errors.New("runner gone")
 		s := NewDB(st, time.Second, nil, nil)
 		cancelled, _, err := s.Heartbeat(ctx, "job-1", "runner-1", nil, 1, now.Add(time.Minute))
 		if err != nil || cancelled {

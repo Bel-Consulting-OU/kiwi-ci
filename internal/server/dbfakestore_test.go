@@ -214,14 +214,15 @@ type dbFakeStore struct {
 	// the delivery receipts that make a retried report upload idempotent.
 	reportDeliveries map[string]fakeReportDelivery
 
-	insertRunCalls []model.Run
-	insertJobCalls []model.Job
-	acquireCalls   []acquireArgs
-	heartbeatCalls []heartbeatArgs
-	completeCalls  []completeArgs
-	cancelRunCalls []cancelRunArgs
-	updateJobCalls []model.Job
-	compiledCalls  []storage.InsertCompiledRunRequest
+	insertRunCalls   []model.Run
+	insertJobCalls   []model.Job
+	acquireCalls     []acquireArgs
+	heartbeatCalls   []heartbeatArgs
+	touchRunnerCalls []string
+	completeCalls    []completeArgs
+	cancelRunCalls   []cancelRunArgs
+	updateJobCalls   []model.Job
+	compiledCalls    []storage.InsertCompiledRunRequest
 }
 
 type acquireArgs struct {
@@ -1376,6 +1377,26 @@ func (f *dbFakeStore) GetRunner(ctx context.Context, id string) (model.Runner, e
 	return r, nil
 }
 
+// TouchRunnerLastSeen implements storage.RunnerHeartbeatStore: the heartbeat
+// liveness refresh moves ONLY last_seen, so a concurrent admin disable/drain/
+// profile edit can never be undone by a stale whole-row write.
+func (f *dbFakeStore) TouchRunnerLastSeen(ctx context.Context, runnerID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.touchRunnerCalls = append(f.touchRunnerCalls, runnerID)
+	r, ok := f.runners[runnerID]
+	if !ok {
+		return storage.ErrNotFound
+	}
+	now := time.Now().UTC()
+	if f.leaseNow != nil {
+		now = f.leaseNow().UTC()
+	}
+	r.LastSeen = now
+	f.runners[runnerID] = r
+	return nil
+}
+
 func (f *dbFakeStore) ListRunners(ctx context.Context) ([]model.Runner, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -2164,6 +2185,27 @@ func (f *dbFakeStore) InsertTestReportWithHistory(ctx context.Context, rep model
 	}
 	return outcome.Version, nil
 }
+
+// InsertTestReportWithHistoryDeliveryForLease mirrors the SQL lease-fenced
+// delivery: the lease predicate (evaluated under the store mutex, this fake's
+// transaction) and the delivery/report/fold commit are one critical section.
+func (f *dbFakeStore) InsertTestReportWithHistoryDeliveryForLease(ctx context.Context, jobID, runnerID string, generation int64, rep model.TestReport, repoID string, delivery storage.TestReportDelivery) (storage.TestReportInsertOutcome, error) {
+	f.mu.Lock()
+	j, held := f.leaseHeldLocked(jobID, runnerID, generation)
+	f.mu.Unlock()
+	if !held {
+		return storage.TestReportInsertOutcome{}, fmt.Errorf("%w: test report for job %s", storage.ErrLeaseLost, jobID)
+	}
+	if rep.JobID != jobID || rep.RunID != j.RunID {
+		return storage.TestReportInsertOutcome{}, fmt.Errorf("%w: test report identity mismatch", storage.ErrLeaseIdentityMismatch)
+	}
+	if rep.JobKey == "" {
+		rep.JobKey = j.Key
+	}
+	return f.InsertTestReportWithHistoryDelivery(ctx, rep, repoID, delivery)
+}
+
+var _ storage.LeaseTestReportStore = (*dbFakeStore)(nil)
 
 func (f *dbFakeStore) LoadRepoTestHistory(ctx context.Context, repoID string) (int64, []byte, error) {
 	f.mu.Lock()

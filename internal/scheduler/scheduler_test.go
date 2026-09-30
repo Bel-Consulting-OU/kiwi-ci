@@ -209,6 +209,11 @@ func TestHeartbeatReportsCancellation(t *testing.T) {
 	if len(f.heartbeatCalls) != 1 || f.heartbeatCalls[0].JobID != "job2" || !f.heartbeatCalls[0].ExpiresAt.Equal(exp) {
 		t.Errorf("heartbeat calls = %+v", f.heartbeatCalls)
 	}
+	// The cancelled-job heartbeat returned before any liveness refresh; the
+	// running job's heartbeat touched last-seen exactly once, narrowly.
+	if len(f.touchCalls) != 1 || f.touchCalls[0] != "runner" {
+		t.Errorf("last-seen touches = %+v", f.touchCalls)
+	}
 }
 
 // leaseClockStoreFake adds the LeaseClockStore capability to the behavioral
@@ -267,6 +272,15 @@ func TestHeartbeatReturnsStoreAuthoritativeExpiry(t *testing.T) {
 	if len(f.heartbeatCalls) != 0 {
 		t.Fatalf("legacy absolute-time heartbeat was used for a LeaseClockStore: %+v", f.heartbeatCalls)
 	}
+	// The liveness refresh is the NARROW last-seen touch: the whole-row
+	// UpsertRunner (which is authoritative for profile/admin state) must
+	// never be the heartbeat's write path.
+	if len(f.touchCalls) != 1 || f.touchCalls[0] != "runner" {
+		t.Fatalf("last-seen touches = %+v, want exactly one for runner", f.touchCalls)
+	}
+	if len(f.upsertCalls) != 0 {
+		t.Fatalf("heartbeat wrote the whole runner row via UpsertRunner: %+v", f.upsertCalls)
+	}
 }
 
 // TestHeartbeatPropagatesStoreExpiryError pins the failure side: a store
@@ -284,6 +298,9 @@ func TestHeartbeatPropagatesStoreExpiryError(t *testing.T) {
 	}
 	if len(f.heartbeatCalls) != 0 {
 		t.Fatal("legacy heartbeat attempted after a TTL-store failure")
+	}
+	if len(f.touchCalls) != 0 || len(f.upsertCalls) != 0 {
+		t.Fatalf("failed heartbeat touched runner state: touch=%+v upsert=%+v", f.touchCalls, f.upsertCalls)
 	}
 }
 

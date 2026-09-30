@@ -80,6 +80,37 @@ type TestReportDeliveryStore interface {
 
 var _ TestReportDeliveryStore = (*PostgresStore)(nil)
 
+// LeaseTestReportStore is the LEASE-FENCED test-report commit: the report
+// receipt, the report rows, the history fold and the repository version bump
+// commit only while the job still holds a live lease in the database clock
+// domain.
+//
+// Test reports are not passive telemetry: the folded history drives future
+// test-to-shard assignment, duration balancing, the test manifest and flaky
+// classification (testShards -> TestHistoryManifest/Shard/Flaky). A report
+// whose request passed the HTTP lease gate and then committed after the lease
+// expired would let a superseded generation alter later execution behavior.
+// The fenced transaction therefore locks the job row, validates
+// runner/generation, samples clock_timestamp() after the lock, and refuses
+// the whole delivery with ErrLeaseLost when the lease already expired. It
+// also stamps the report's canonical (created_at,id) ordering instant from
+// that database timestamp, so replica clock skew cannot reorder history.
+type LeaseTestReportStore interface {
+	// InsertTestReportWithHistoryDeliveryForLease inserts one test-report
+	// delivery under (jobID, runnerID, generation) exactly like
+	// InsertTestReportWithHistoryDelivery, but only while the lease is live
+	// at the post-lock database clock. The report's job/run identity and the
+	// delivery's (job, generation) identity must match the locked job, and
+	// repoID (when non-empty) must equal the locked job's canonical
+	// repository identity; a mismatch commits nothing and returns an error
+	// wrapping ErrLeaseIdentityMismatch. rep.CreatedAt is overwritten with
+	// the sampled database timestamp. A delivery replay of an already
+	// committed (delivery ID, digest) still returns the original report ID.
+	InsertTestReportWithHistoryDeliveryForLease(ctx context.Context, jobID, runnerID string, generation int64, rep model.TestReport, repoID string, delivery TestReportDelivery) (TestReportInsertOutcome, error)
+}
+
+var _ LeaseTestReportStore = (*PostgresStore)(nil)
+
 // InsertTestReportWithHistoryDelivery is InsertTestReportWithHistory plus the
 // durable delivery receipt: the report rows, the case rows, the aggregate
 // fold and the (job, generation, delivery ID) receipt commit together. A
@@ -102,6 +133,73 @@ func (s *PostgresStore) InsertTestReportWithHistoryDelivery(ctx context.Context,
 		return TestReportInsertOutcome{}, err
 	}
 	defer tx.Rollback(ctx)
+	return commitTestReportDeliveryTx(ctx, tx, rep, repoID, delivery)
+}
+
+// InsertTestReportWithHistoryDeliveryForLease is the lease-fenced sibling of
+// InsertTestReportWithHistoryDelivery (see LeaseTestReportStore): the same
+// delivery/report/fold transaction, preceded by the shared post-lock
+// job-lease predicate (lockedLeaseJobTx) and with rep.CreatedAt overwritten
+// by a fresh database timestamp sampled after the lock.
+func (s *PostgresStore) InsertTestReportWithHistoryDeliveryForLease(ctx context.Context, jobID, runnerID string, generation int64, rep model.TestReport, repoID string, delivery TestReportDelivery) (TestReportInsertOutcome, error) {
+	if err := validateLeaseCommitKey(jobID, runnerID, generation); err != nil {
+		return TestReportInsertOutcome{}, err
+	}
+	if err := ValidateID(rep.ID); err != nil {
+		return TestReportInsertOutcome{}, err
+	}
+	if err := ValidateRunID(rep.RunID); err != nil {
+		return TestReportInsertOutcome{}, err
+	}
+	// The delivery identity is bound to the verified lease: a caller cannot
+	// attribute one lease's report to another job or generation.
+	if delivery.JobID != jobID || delivery.LeaseGeneration != generation {
+		return TestReportInsertOutcome{}, leaseIdentityErrorf("test report delivery (job %s, generation %d) does not match leased job %s generation %d", delivery.JobID, delivery.LeaseGeneration, jobID, generation)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return TestReportInsertOutcome{}, err
+	}
+	defer tx.Rollback(ctx)
+	coords, held, err := s.lockedLeaseJobTx(ctx, tx, jobID, runnerID, generation)
+	if err != nil {
+		return TestReportInsertOutcome{}, err
+	}
+	if !held {
+		return TestReportInsertOutcome{}, fmt.Errorf("%w: test report for job %s", ErrLeaseLost, jobID)
+	}
+	if rep.JobID != jobID || rep.RunID != coords.RunID {
+		return TestReportInsertOutcome{}, leaseIdentityErrorf("test report %s (job %s, run %s) does not match leased job %s run %s", rep.ID, rep.JobID, rep.RunID, jobID, coords.RunID)
+	}
+	if rep.JobKey != "" && rep.JobKey != coords.JobKey {
+		return TestReportInsertOutcome{}, leaseIdentityErrorf("test report %s job key %q does not match leased job key %q", rep.ID, rep.JobKey, coords.JobKey)
+	}
+	if rep.JobKey == "" {
+		rep.JobKey = coords.JobKey
+	}
+	if repoID == "" {
+		repoID = coords.RepoID
+	}
+	if repoID != coords.RepoID {
+		return TestReportInsertOutcome{}, leaseIdentityErrorf("test report %s repository %q does not match leased job repository %q", rep.ID, repoID, coords.RepoID)
+	}
+	// Canonical history ordering is the (created_at,id) pair; the instant
+	// must come from the database clock that just fenced the lease, never
+	// from the serving replica's application clock.
+	var dbNow time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&dbNow); err != nil {
+		return TestReportInsertOutcome{}, err
+	}
+	rep.CreatedAt = dbNow.UTC()
+	return commitTestReportDeliveryTx(ctx, tx, rep, repoID, delivery)
+}
+
+// commitTestReportDeliveryTx applies one report delivery inside the caller's
+// transaction: claim the delivery receipt, lock the repository's history
+// version, insert the report rows, fold (or rebuild) the aggregates, bump the
+// version, and commit. The lease-fenced and plain entry points share it so
+// the two can never drift.
+func commitTestReportDeliveryTx(ctx context.Context, tx pgx.Tx, rep model.TestReport, repoID string, delivery TestReportDelivery) (TestReportInsertOutcome, error) {
 	if delivery.DeliveryID != "" {
 		claimed, existingID, err := claimTestReportDeliveryTx(ctx, tx, delivery, rep.ID)
 		if err != nil {

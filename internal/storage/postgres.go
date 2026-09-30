@@ -1741,6 +1741,12 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 	return j, nil
 }
 
+// HeartbeatLease is the legacy absolute-time heartbeat (see the deprecation
+// on Store.HeartbeatLease). Deprecated: DB-mode callers use
+// HeartbeatLeaseWithTTL, whose extension is derived from the live database
+// clock. This path remains supported for out-of-tree callers, but the
+// supplied instant is bounded to the database clock plus a fixed horizon so
+// it can never park a lease far in the future.
 func (s *PostgresStore) HeartbeatLease(ctx context.Context, jobID string, runnerID string, generation int64, expiresAt time.Time) error {
 	if err := ValidateJobID(jobID); err != nil {
 		return err
@@ -2794,6 +2800,31 @@ func (s *PostgresStore) UpdateRunnerProfileFields(ctx context.Context, runner mo
 	}
 	return s.writeRunnerProfile(ctx, runner, true)
 }
+
+// TouchRunnerLastSeen refreshes ONLY the runner's advisory last-seen instant,
+// from the live database clock. Heartbeat must never write the rest of the
+// runner row: a GetRunner -> mutate -> UpsertRunner round trip is a
+// read-modify-write of the profile/admin fields, so a heartbeat that read the
+// runner before a concurrent disable/drain/profile edit would write the
+// stale snapshot back and silently undo the admin action. This narrow update
+// touches last_seen and nothing else, so it can never race such an edit into
+// oblivion. A missing runner reports ErrNotFound; the scheduler treats the
+// refresh as best-effort.
+func (s *PostgresStore) TouchRunnerLastSeen(ctx context.Context, runnerID string) error {
+	if err := ValidateRunnerID(runnerID); err != nil {
+		return err
+	}
+	tag, err := s.pool.Exec(ctx, `UPDATE runners SET last_seen=clock_timestamp() WHERE id=$1`, runnerID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+var _ RunnerHeartbeatStore = (*PostgresStore)(nil)
 
 // writeRunnerProfile is the ONE guarded runner write. It locks the runner row
 // (if any) and, on an existing row, writes the caller's profile/admin fields

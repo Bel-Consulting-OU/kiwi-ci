@@ -81,6 +81,11 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 	rep.JobID = j.ID
 	rep.JobKey = j.Key
 	rep.CreatedAt = time.Now().UTC()
+	// DB mode ignores the application instant: the lease-fenced delivery
+	// transaction overwrites rep.CreatedAt with a clock_timestamp() sampled
+	// after the job row lock, because the canonical (created_at,id) ordering
+	// must not depend on the serving replica's clock. The value above is the
+	// fs/memory-mode instant only.
 	// The AUTHORITATIVE suite identity (the job key) is what the aggregate
 	// upsert indexes; a pipeline declaration over the shared suite budget
 	// would otherwise bypass the payload validator (which ran before this
@@ -123,19 +128,34 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 	// GONE: a configured store without the delivery contract cannot
 	// deduplicate a replayed upload, so it is refused with an opaque 503
 	// instead of double-inserting the report and re-folding history.
+	//
+	// The commit is additionally LEASE-FENCED: the store transaction locks
+	// the job row, re-validates the lease against the post-lock database
+	// clock and stamps rep.CreatedAt from that clock before folding. Test
+	// history drives future shard assignment, duration balancing and flaky
+	// classification, so a report whose request passed the gate and then
+	// committed after the lease expired could let a superseded generation
+	// alter later execution; it is refused with the same 409 as an expired
+	// upload, committing nothing.
 	if s.DB != nil {
-		ds, isDelivery := s.DB.(storage.TestReportDeliveryStore)
-		if !isDelivery {
+		ls, isLeasedDelivery := s.DB.(storage.LeaseTestReportStore)
+		if !isLeasedDelivery {
 			http.Error(w, "test report delivery storage is unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		outcome, err := ds.InsertTestReportWithHistoryDelivery(r.Context(), rep, repo, delivery)
+		outcome, err := ls.InsertTestReportWithHistoryDeliveryForLease(r.Context(), j.ID, in.RunnerID, in.LeaseGeneration, rep, repo, delivery)
 		switch {
 		case errors.Is(err, storage.ErrTestReportDeliveryConflict):
 			// Same delivery identity, different payload: the stored
 			// report and history are untouched and the retry is refused
 			// explicitly instead of silently discarded.
 			http.Error(w, "test report delivery conflict: delivery_id was already used with different content", http.StatusConflict)
+			return
+		case errors.Is(err, storage.ErrLeaseLost):
+			// The lease expired between the request gate and the delivery
+			// transaction: history is untouched so a superseded generation
+			// cannot influence later shard assignment.
+			http.Error(w, "lease expired during test report delivery", http.StatusConflict)
 			return
 		case err != nil:
 			s.internalError(w, r, err, "")

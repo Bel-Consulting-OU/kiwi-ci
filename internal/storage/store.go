@@ -164,6 +164,13 @@ type Store interface {
 	// status='queued' AND (lease_expires_at IS NULL OR lease_expires_at < now())
 	// RETURNING *. A race (no row matched) returns ErrLeaseConflict.
 	AcquireLease(ctx context.Context, jobID, runnerID string, tokenHash []byte, generation int64, expiresAt time.Time) (model.Job, error)
+	// HeartbeatLease extends a lease to an absolute expiry. DEPRECATED for
+	// database-backed stores: the instant is a caller-supplied clock value
+	// that can disagree with the database clock, so prefer
+	// LeaseClockStore.HeartbeatLeaseWithTTL, which derives the extension from
+	// the live database clock and is what the DB-mode scheduler uses.
+	// PostgreSQL still bounds this legacy call (see legacyHeartbeatHorizonSQL)
+	// as defense in depth, but TTL is the supported contract.
 	HeartbeatLease(ctx context.Context, jobID string, runnerID string, generation int64, expiresAt time.Time) error
 	// CompleteJob is the one transaction for a runner completion: lock the
 	// job FOR UPDATE, verify generation+runner+status running, insert the
@@ -949,6 +956,25 @@ type RunnerProfileUpdateStore interface {
 	// failed from the locked row. A missing runner returns ErrNotFound: a
 	// profile edit never creates a runner (use UpsertRunner to register).
 	UpdateRunnerProfileFields(ctx context.Context, runner model.Runner) error
+}
+
+// RunnerHeartbeatStore is the NARROW runner liveness refresh a heartbeat is
+// allowed to perform: update the advisory last-seen instant and nothing else.
+//
+// Heartbeat used to compose GetRunner -> LastSeen=now -> UpsertRunner, which
+// is a read-modify-write of the whole runner row: a heartbeat that read the
+// runner before a concurrent admin disable/drain/profile edit would write the
+// stale snapshot back after the admin transaction committed, silently undoing
+// the disable (and the same for draining, capacity, labels, capabilities,
+// repository ACLs, resource capacity and profile state). The generic
+// UpsertRunner contract deliberately treats the caller as authoritative for
+// profile/admin fields, so it must never be the heartbeat's write path.
+// Implementations touch ONLY last_seen (PostgreSQL: clock_timestamp()) and
+// report ErrNotFound for a missing runner; the scheduler skips the refresh
+// entirely for stores without this capability rather than falling back to the
+// read-modify-write.
+type RunnerHeartbeatStore interface {
+	TouchRunnerLastSeen(ctx context.Context, runnerID string) error
 }
 
 // JobApprovalStore is the transactional approval contract for

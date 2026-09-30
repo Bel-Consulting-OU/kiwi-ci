@@ -1,12 +1,14 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 // uploadReportBody renders the POST /tests body for a leased job. The
@@ -195,5 +197,68 @@ func TestTestHistoryUpdateFailureFailsUploadClosed(t *testing.T) {
 	}
 	if got := h.Manifest("github.com/o/r", "build"); len(got) != 1 || got[0] != "second" {
 		t.Fatalf("history after healed retry = %v (stats %s)", got, stats)
+	}
+}
+
+// TestExpiredTestReportDoesNotChangeShardAssignment pins the observable
+// consequence of the report fence at the HTTP layer: an upload attempt whose
+// lease is already expired is refused (409) and the shard assignment derived
+// from repository history is byte-for-byte unchanged, with no report,
+// delivery receipt or history mutation.
+func TestExpiredTestReportDoesNotChangeShardAssignment(t *testing.T) {
+	f := newDBFakeStore()
+	s := New("token")
+	if err := s.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.enqueue(context.Background(), SubmitRun{
+		RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
+		Ref: "refs/heads/main", SHA: "abc", Event: "push",
+		Pipeline: smokePipeline, Trusted: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runnerID, task := leaseRunJob(t, s)
+	getShards := func() []byte {
+		t.Helper()
+		w := doJSONHeaders(t, s, http.MethodGet, "/api/v1/jobs/"+task.Job.ID+"/test-shards?shards=2", "token", "", leaseHeaders(task, runnerID))
+		if w.Code != http.StatusOK {
+			t.Fatalf("test-shards = %d: %s", w.Code, w.Body.String())
+		}
+		return append([]byte(nil), w.Body.Bytes()...)
+	}
+	before := getShards()
+
+	// Expire the lease at the store without changing status/runner/generation:
+	// the upload must be refused by the same DB-clock-liveness gate a real
+	// store enforces.
+	f.mu.Lock()
+	j := f.jobs[task.Job.ID]
+	past := time.Now().UTC().Add(-time.Hour)
+	j.LeaseExpiresAt = &past
+	f.jobs[task.Job.ID] = j
+	f.mu.Unlock()
+	body := uploadReportBody(task, runnerID, []map[string]any{
+		{"name": "late", "duration": 2.0, "passed": false},
+	})
+	if w := doJSON(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/tests", "token", body); w.Code != http.StatusConflict {
+		t.Fatalf("expired report upload = %d, want 409: %s", w.Code, w.Body.String())
+	}
+
+	// Restore the lease for a second shard snapshot; the refused delivery must
+	// not have changed the assignment.
+	f.mu.Lock()
+	j = f.jobs[task.Job.ID]
+	future := time.Now().UTC().Add(time.Hour)
+	j.LeaseExpiresAt = &future
+	f.jobs[task.Job.ID] = j
+	reports, deliveries := len(f.reports), len(f.reportDeliveries)
+	f.mu.Unlock()
+	if reports != 0 || deliveries != 0 {
+		t.Fatalf("refused report persisted reports=%d deliveries=%d, want none", reports, deliveries)
+	}
+	after := getShards()
+	if !bytes.Equal(before, after) {
+		t.Fatalf("refused report changed the shard assignment:\nbefore=%s\nafter=%s", before, after)
 	}
 }

@@ -39,6 +39,8 @@ type fakeStore struct {
 	insertJobCalls     []model.Job
 	acquireCalls       []acquireCall
 	heartbeatCalls     []heartbeatCall
+	touchCalls         []string
+	upsertCalls        []model.Runner
 	completeCalls      []completeCall
 	cancelRunCalls     []cancelRunCall
 	updateJobCalls     []model.Job
@@ -1047,7 +1049,23 @@ func (f *fakeStore) CancelRunJobs(ctx context.Context, runID string, reason stri
 func (f *fakeStore) UpsertRunner(ctx context.Context, runner model.Runner) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.upsertCalls = append(f.upsertCalls, runner)
 	f.runners[runner.ID] = runner
+	return nil
+}
+
+// TouchRunnerLastSeen implements storage.RunnerHeartbeatStore: heartbeat
+// moves ONLY the advisory last-seen instant, never the profile/admin state.
+func (f *fakeStore) TouchRunnerLastSeen(ctx context.Context, runnerID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.touchCalls = append(f.touchCalls, runnerID)
+	r, ok := f.runners[runnerID]
+	if !ok {
+		return storage.ErrNotFound
+	}
+	r.LastSeen = time.Now().UTC()
+	f.runners[runnerID] = r
 	return nil
 }
 

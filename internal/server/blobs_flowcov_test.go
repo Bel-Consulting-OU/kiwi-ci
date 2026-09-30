@@ -155,6 +155,15 @@ func (f *fcStore) InsertTestReportWithHistoryDelivery(ctx context.Context, rep m
 	return f.dbFakeStore.InsertTestReportWithHistoryDelivery(ctx, rep, repoID, delivery)
 }
 
+// InsertTestReportWithHistoryDeliveryForLease keeps the insertReportHistErr
+// fault injection on the lease-fenced path the DB-mode handler uses.
+func (f *fcStore) InsertTestReportWithHistoryDeliveryForLease(ctx context.Context, jobID, runnerID string, generation int64, rep model.TestReport, repoID string, delivery storage.TestReportDelivery) (storage.TestReportInsertOutcome, error) {
+	if f.insertReportHistErr != nil {
+		return storage.TestReportInsertOutcome{}, f.insertReportHistErr
+	}
+	return f.dbFakeStore.InsertTestReportWithHistoryDeliveryForLease(ctx, jobID, runnerID, generation, rep, repoID, delivery)
+}
+
 func (f *fcStore) LoadRepoTestHistory(ctx context.Context, repoID string) (int64, []byte, error) {
 	if f.loadRepoHistoryErr != nil {
 		return 0, nil, f.loadRepoHistoryErr

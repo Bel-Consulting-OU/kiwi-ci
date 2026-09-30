@@ -690,9 +690,15 @@ func (s *DBScheduler) Heartbeat(ctx context.Context, jobID, runnerID string, tok
 		}
 		return false, time.Time{}, err
 	}
-	if ri, rerr := s.Store.GetRunner(ctx, runnerID); rerr == nil {
-		ri.LastSeen = time.Now().UTC()
-		_ = s.Store.UpsertRunner(ctx, ri)
+	// Refresh the runner's advisory last-seen instant through the NARROW
+	// RunnerHeartbeatStore capability. It deliberately does NOT fall back to
+	// GetRunner -> UpsertRunner: UpsertRunner treats the caller as
+	// authoritative for the runner's profile/admin fields, so a heartbeat
+	// that read the runner before a concurrent disable/drain/profile edit
+	// would write the stale snapshot back and silently undo the admin action.
+	// A store without the capability skips the advisory refresh.
+	if hs, ok := s.Store.(storage.RunnerHeartbeatStore); ok {
+		_ = hs.TouchRunnerLastSeen(ctx, runnerID)
 	}
 	return false, authoritative, nil
 }

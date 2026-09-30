@@ -522,12 +522,39 @@ claims themselves.
   post-lock `clock_timestamp()` and stamps its lifecycle with the same
   database timestamp, and heartbeat responses carry the store-returned
   expiry directly (no second read or app-clock fallback). The legacy
-  absolute-time heartbeat is bounded by a 24-hour horizon. Log and
-  test-report ingestion is intentionally not lease-fenced (late-data grace:
-  these records carry no lifecycle authority and their receipts are
-  generation-scoped); every behavior-affecting runner mutation is
-  commit-time fenced.
+  absolute-time heartbeat is bounded by a 24-hour horizon. Log ingestion is
+  intentionally not lease-fenced (late-log grace: log lines carry no
+  lifecycle authority and batch receipts are generation-scoped); every
+  behavior-affecting runner mutation is commit-time fenced.
   Cross-replica application-clock skew can no longer
   extend, prematurely reject, prematurely recover, or prematurely complete
   a lease; the previous NTP synchronization *requirement* for lease safety
   is gone (NTP remains recommended hygiene).
+- Runner heartbeats no longer read-modify-write the whole runner row
+  (`GetRunner` -> `UpsertRunner`). A heartbeat that read the runner before a
+  concurrent admin disable/drain/profile edit could write the pre-change
+  snapshot back and silently undo the admin action. Heartbeat now uses the
+  narrow `RunnerHeartbeatStore.TouchRunnerLastSeen`
+  (`UPDATE runners SET last_seen=clock_timestamp()` in PostgreSQL) and
+  touches nothing else; stores without the capability skip the advisory
+  refresh instead of falling back to the whole-row write.
+- Test-report uploads are now lease-fenced. Test history drives future
+  shard assignment, duration balancing, the test manifest and flaky
+  classification, so the delivery/report/fold transaction locks the job row,
+  re-validates runner/generation and `lease_expires_at > clock_timestamp()`
+  after the lock, and refuses a report whose lease expired while the request
+  (or a row-lock wait) was in flight with the same 409 as an expired upload,
+  committing nothing. The report's canonical `(created_at,id)` ordering
+  instant is stamped from the same post-lock database clock, so replica clock
+  skew cannot reorder test history. A DB store without
+  `LeaseTestReportStore` is refused with 503 rather than committing
+  unfenced history.
+- The runner cache default root moved from the user-global cache root to the
+  identity-local one (`<IdentityDir>/cache/<instance id>`) so two runner
+  processes or identities sharing an account cannot contend for one
+  namespace. An enrolled runner without an explicit `CacheRoot` now detects
+  the old `<user cache root>/<instance id>` namespace at cache-manager
+  configuration and warns with the exact reclaim command
+  (`kiwi storage migrate-runner-cache-layout --dir <old namespace> --force`);
+  the old tree is deliberately not deleted automatically, because only the
+  operator can confirm every pre-upgrade process has drained.

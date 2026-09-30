@@ -49,6 +49,14 @@ func (c *historyCountingStore) InsertTestReportWithHistoryDelivery(ctx context.C
 	return c.dbFakeStore.InsertTestReportWithHistoryDelivery(ctx, rep, repoID, delivery)
 }
 
+// InsertTestReportWithHistoryDeliveryForLease is the lease-fenced path the
+// DB-mode handler uses; it counts as the same single incremental aggregate
+// transaction.
+func (c *historyCountingStore) InsertTestReportWithHistoryDeliveryForLease(ctx context.Context, jobID, runnerID string, generation int64, rep model.TestReport, repoID string, delivery storage.TestReportDelivery) (storage.TestReportInsertOutcome, error) {
+	c.incrementalOps.Add(1)
+	return c.dbFakeStore.InsertTestReportWithHistoryDeliveryForLease(ctx, jobID, runnerID, generation, rep, repoID, delivery)
+}
+
 func (c *historyCountingStore) TestReportTotals(ctx context.Context, repoIDs []string, repoQuery string) (int, int, int, error) {
 	if len(repoIDs) == 0 {
 		return 0, 0, 0, nil

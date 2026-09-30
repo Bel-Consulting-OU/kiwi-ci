@@ -113,6 +113,25 @@ func (s *composeBlockingReportStore) InsertTestReportWithHistoryDelivery(ctx con
 	return out, nil
 }
 
+// InsertTestReportWithHistoryDeliveryForLease keeps the pre-persistence
+// block and post-commit lost-ack behavior on the lease-fenced path the
+// DB-mode handler uses.
+func (s *composeBlockingReportStore) InsertTestReportWithHistoryDeliveryForLease(ctx context.Context, jobID, runnerID string, generation int64, rep model.TestReport, repoID string, delivery storage.TestReportDelivery) (storage.TestReportInsertOutcome, error) {
+	if s.blockBefore != nil {
+		s.blockOnce.Do(func() { close(s.blockBefore) })
+		<-ctx.Done()
+		return storage.TestReportInsertOutcome{}, ctx.Err()
+	}
+	out, err := s.dbFakeStore.InsertTestReportWithHistoryDeliveryForLease(ctx, jobID, runnerID, generation, rep, repoID, delivery)
+	if err != nil {
+		return out, err
+	}
+	if s.loseAck {
+		return out, errComposeLostAck
+	}
+	return out, nil
+}
+
 // composeReportPost serves one /tests upload with an explicit context.
 func composeReportPost(ctx context.Context, s *Server, jobID, body string) int {
 	r := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/"+jobID+"/tests", strings.NewReader(body)).WithContext(ctx)
