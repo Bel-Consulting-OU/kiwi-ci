@@ -197,7 +197,7 @@ func TestPostgresIntegrationServerWebhookEnqueueRace(t *testing.T) {
 	if err != nil || len(runs) != 1 {
 		t.Fatalf("durable runs = %d err=%v, want exactly 1 (no ghost duplicate)", len(runs), err)
 	}
-	got, found, err := st.FindDelivery(context.Background(), "github", delivery)
+	got, _, found, err := st.FindDelivery(context.Background(), "github", delivery)
 	if err != nil || !found || got != ids[0] {
 		t.Fatalf("delivery claim = %q found=%v err=%v, want %q", got, found, err, ids[0])
 	}

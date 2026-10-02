@@ -709,3 +709,38 @@ claims themselves.
   bounds guest SSH stderr the same way. The S3 list reader now reads limit+1
   and rejects an over-limit response instead of accepting a truncated prefix,
   with a defensive cap on the parsed key count.
+- Runner crash recovery is now immediate instead of a 24-hour GC wait: each
+  runner process has a fresh instance ID, job containers, service containers
+  and services networks carry `kiwi.runner`/`kiwi.instance` labels, and a
+  restarted runner reconciles its OWN stable runner ID's previous-incarnation
+  (or legacy unlabelled) resources BEFORE leasing new work. A SIGKILLed
+  runner's detached runtimes can no longer keep touching a workspace while
+  the replacement takes work; resources of other runners sharing the daemon
+  are never touched, and the age-based GC remains a backstop.
+- XFS project IDs are restart-safe: before allocating, the pool asks the
+  filesystem (`xfs_quota -x -c 'report -p -n'`) for every project ID already
+  present and permanently reserves them. A restarted runner can therefore
+  never hand out an ID a previous process left assigned, and a report failure
+  fails the quota capability closed instead of treating the ID space as
+  empty.
+- `RequireNonRoot` policy is enforced: `pipeline.Sandbox` gained `NonRoot`,
+  the effective policy propagates it, the container backend pins the
+  workload to `65534:65534` on rootful daemons (provisioning the workspace),
+  the documented rootless meaning is the userns-mapped container UID 0 (which
+  cannot map to host root), and native/tart runtimes are refused when the
+  requirement cannot be enforced.
+- A current-format compiled parent whose `EffectivePolicy` is missing or
+  malformed now refuses generated children instead of falling back to trust
+  defaults (which could be broader than the parent's actual enqueue-time
+  capabilities); only genuinely legacy payloads keep the documented
+  fallback.
+- Ignored webhook receipts carry the authenticated payload digest in every
+  store, so reusing a delivery ID with different signed content is a 409 for
+  ignored outcomes too (it previously short-circuited as a 204).
+- Production mode requires `KIWI_WEB_SESSION_SECRET` (a shared 32-byte hex
+  key): without it each replica minted its own dashboard session/CSRF key and
+  sessions broke on failover or restart.
+- Lease scheduling applies bounded aging: waiting time buys up to 8 priority
+  points at one point per 10 minutes, so a continuous stream of fresh
+  high-priority jobs can no longer starve an eligible low-priority job
+  indefinitely; downstream-depth priority remains the primary signal.

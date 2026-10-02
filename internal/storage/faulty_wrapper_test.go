@@ -204,7 +204,7 @@ func faultyWrapperCases() map[string]wrapperCase {
 			return f.UpsertDelivery(ctx(), "github", "d1", testRun.ID, "digest")
 		}},
 		"FindDelivery": {seed: func(m *memStore) { _ = m.UpsertDelivery(ctx(), "github", "d1", testRun.ID, "digest") }, call: func(f *FaultyStore) error {
-			_, _, err := f.FindDelivery(ctx(), "github", "d1")
+			_, _, _, err := f.FindDelivery(ctx(), "github", "d1")
 			return err
 		}},
 		"TryAcquireLeadership": {mutates: true, call: func(f *FaultyStore) error {
@@ -728,8 +728,8 @@ func (storeOnlyInner) UpsertDelivery(context.Context, string, string, string, st
 	return nil
 }
 
-func (storeOnlyInner) FindDelivery(context.Context, string, string) (string, bool, error) {
-	return "", false, nil
+func (storeOnlyInner) FindDelivery(context.Context, string, string) (string, string, bool, error) {
+	return "", "", false, nil
 }
 
 func (storeOnlyInner) TryAcquireLeadership(context.Context, string, time.Duration) (bool, error) {

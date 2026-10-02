@@ -468,6 +468,16 @@ In **DB mode the database clock is the authority for a lease's lifetime**:
   healthchecks retain a 64 KiB diagnostic prefix and drain (discarding) the
   rest, and every executor/git/prewarm capture is bounded, so a hostile
   healthcheck cannot grow the runner heap or block on a full pipe.
+- **Runner crashes are reconciled immediately.** Every runner process has an
+  instance ID; containers/services/networks are labelled with
+  `kiwi.runner`/`kiwi.instance`, and a restarted runner reaps its own
+  predecessor's runtimes BEFORE leasing. XFS project IDs already present on
+  the filesystem are discovered and reserved before allocation, so a restart
+  cannot reuse a live assignment. Production also requires a shared
+  `KIWI_WEB_SESSION_SECRET`, set `sandbox.non_root` is enforced (or the
+  runtime is refused), corrupt current-format parent policy metadata fails
+  generated children closed, and lease scheduling ages waiting jobs so
+  low-priority work cannot be starved.
 - **Runtime teardown is proven-gone before workspace protections are
   removed.** `CloseJob` keeps the container/clone identity until removal
   succeeds or the runtime is positively absent, never restores workspace

@@ -348,24 +348,28 @@ func TestFlowEffectsEnqueueCompletionEffects(t *testing.T) {
 }
 
 func TestFlowEffectsEffectiveCapsOf(t *testing.T) {
-	if _, ok := effectiveCapsOf(model.Job{}); ok {
-		t.Fatal("nil payload caps must be absent")
+	if _, state, err := effectiveCapsOf(model.Job{}); err != nil || state != storedPolicyAbsent {
+		t.Fatalf("nil payload = %v/%v, want absent", state, err)
 	}
-	if _, ok := effectiveCapsOf(model.Job{CompiledJobPayload: &model.CompiledJobPayload{}}); ok {
-		t.Fatal("nil policy caps must be absent")
+	if _, state, err := effectiveCapsOf(model.Job{CompiledJobPayload: &model.CompiledJobPayload{}}); err != nil || state != storedPolicyAbsent {
+		t.Fatalf("legacy payload = %v/%v, want absent fallback", state, err)
 	}
-	bad := model.Job{CompiledJobPayload: &model.CompiledJobPayload{EffectivePolicy: make(chan int)}}
-	if _, ok := effectiveCapsOf(bad); ok {
-		t.Fatal("unmarshalable policy must be absent")
+	// A CURRENT-format payload with no policy fails closed.
+	if _, state, err := effectiveCapsOf(model.Job{CompiledJobPayload: &model.CompiledJobPayload{SchemaVersion: 1}}); err == nil || state != storedPolicyMalformed {
+		t.Fatalf("current payload without policy = %v/%v, want malformed", state, err)
 	}
-	str := model.Job{CompiledJobPayload: &model.CompiledJobPayload{EffectivePolicy: "not-an-object"}}
-	if _, ok := effectiveCapsOf(str); ok {
-		t.Fatal("malformed policy must be absent")
+	bad := model.Job{CompiledJobPayload: &model.CompiledJobPayload{SchemaVersion: 1, EffectivePolicy: make(chan int)}}
+	if _, state, err := effectiveCapsOf(bad); err == nil || state != storedPolicyMalformed {
+		t.Fatalf("unencodable policy = %v/%v, want malformed", state, err)
 	}
-	good := model.Job{CompiledJobPayload: &model.CompiledJobPayload{EffectivePolicy: policy.Capabilities{Container: true}}}
-	caps, ok := effectiveCapsOf(good)
-	if !ok || !caps.Container {
-		t.Fatalf("valid caps = %+v %v", caps, ok)
+	str := model.Job{CompiledJobPayload: &model.CompiledJobPayload{SchemaVersion: 1, EffectivePolicy: "not-an-object"}}
+	if _, state, err := effectiveCapsOf(str); err == nil || state != storedPolicyMalformed {
+		t.Fatalf("malformed policy = %v/%v, want malformed", state, err)
+	}
+	good := model.Job{CompiledJobPayload: &model.CompiledJobPayload{SchemaVersion: 1, EffectivePolicy: policy.Capabilities{Container: true}}}
+	caps, state, err := effectiveCapsOf(good)
+	if err != nil || state != storedPolicyValid || !caps.Container {
+		t.Fatalf("valid caps = %+v %v %v", caps, state, err)
 	}
 }
 

@@ -2047,7 +2047,7 @@ func (s *Server) enqueueDB(ctx context.Context, in SubmitRun, run model.Run, cre
 		if req.WebhookClaim == nil {
 			return model.Run{}, err
 		}
-		if existingID, found, ferr := s.DB.FindDelivery(ctx, req.WebhookClaim.Forge, req.WebhookClaim.DeliveryID); ferr != nil {
+		if existingID, _, found, ferr := s.DB.FindDelivery(ctx, req.WebhookClaim.Forge, req.WebhookClaim.DeliveryID); ferr != nil {
 			return model.Run{}, fmt.Errorf("lookup delivery: %w", ferr)
 		} else if found {
 			if prior, gerr := s.DB.GetRun(ctx, existingID); gerr == nil {
@@ -2062,7 +2062,7 @@ func (s *Server) enqueueDB(ctx context.Context, in SubmitRun, run model.Run, cre
 			// The conflict came from the BODY claim: the same authenticated
 			// body arrived under a different delivery header, so return the
 			// original run.
-			if bodyID, found, ferr := s.DB.FindDelivery(ctx, req.WebhookClaim.Forge+"-body", in.deliveryDigest); ferr != nil {
+			if bodyID, _, found, ferr := s.DB.FindDelivery(ctx, req.WebhookClaim.Forge+"-body", in.deliveryDigest); ferr != nil {
 				return model.Run{}, fmt.Errorf("lookup body receipt: %w", ferr)
 			} else if found {
 				if prior, gerr := s.DB.GetRun(ctx, bodyID); gerr == nil && repoIDForRun(prior) == repoIDForRun(run) {

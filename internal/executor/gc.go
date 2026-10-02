@@ -240,6 +240,13 @@ func GC(ctx context.Context, root string, olderThan time.Duration) GCReport {
 	return rep
 }
 
+// runtimeOwner identifies one runner process incarnation for runtime
+// resource labelling and crash reconciliation.
+type runtimeOwner struct {
+	RunnerID   string
+	InstanceID string
+}
+
 // containerLabels returns the docker label flags identifying a job's
 // containers and networks so GC can match and reap them. An empty runID
 // yields no labels.
@@ -248,6 +255,93 @@ func containerLabels(runID, jobID string) []string {
 		return nil
 	}
 	return []string{"--label", "kiwi.run=" + runID, "--label", "kiwi.job=" + jobID}
+}
+
+// containerLabelsOwned adds the runner-identity labels. An empty RunnerID
+// keeps the legacy unlabelled behavior; an empty InstanceID still labels the
+// stable runner so a restart can reap pre-instance resources.
+func containerLabelsOwned(runID, jobID string, owner runtimeOwner) []string {
+	labels := containerLabels(runID, jobID)
+	if owner.RunnerID == "" {
+		return labels
+	}
+	labels = append(labels, "--label", "kiwi.runner="+owner.RunnerID)
+	if owner.InstanceID != "" {
+		labels = append(labels, "--label", "kiwi.instance="+owner.InstanceID)
+	}
+	return labels
+}
+
+// ReconcileRuntime removes runtime resources that belong to THIS runner's
+// stable identity but to a PREVIOUS process incarnation (or a legacy
+// unlabelled incarnation). It is the crash-recovery boundary: a SIGKILLed
+// runner's detached containers/services/networks must be reaped BEFORE the
+// replacement leases new work, not 24 hours later.
+//
+// Matching only kiwi.runner=<own stable id> makes this safe on a shared
+// Docker daemon: another live runner's resources carry a different runner
+// label and are never touched. Resources with no instance label (created by a
+// pre-instance Kiwi) are treated as previous-incarnation and reaped, because
+// one stable runner identity must not have two live processes.
+func ReconcileRuntime(ctx context.Context, root, runnerID, instanceID string) GCReport {
+	var rep GCReport
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if runnerID == "" {
+		return rep
+	}
+	output := func(bin string, args ...string) []byte {
+		qctx, cancel := context.WithTimeout(ctx, gcCommandTimeout)
+		defer cancel()
+		cmd := exec.CommandContext(qctx, bin, args...)
+		cmd.Dir = root
+		cmd.WaitDelay = boundedToolWaitDelay
+		out, truncated, err := executil.CaptureBounded(cmd, maxExternalCommandOutputBytes)
+		if err != nil || truncated {
+			return nil
+		}
+		return out
+	}
+	docker, err := exec.LookPath("docker")
+	if err != nil {
+		return rep
+	}
+	filter := "label=kiwi.runner=" + runnerID
+	out := output(docker, "ps", "-a", "--filter", filter, "--format", `{{.ID}} {{.Label "kiwi.instance"}}`)
+	for _, id := range parseForeignInstances(out, instanceID) {
+		if _, err := boundedToolCommand(ctx, gcCleanupTimeout, docker, "rm", "-f", id); err == nil {
+			rep.Containers++
+		}
+	}
+	out = output(docker, "network", "ls", "--filter", filter, "--format", `{{.ID}} {{.Label "kiwi.instance"}}`)
+	for _, id := range parseForeignInstances(out, instanceID) {
+		if _, err := boundedToolCommand(ctx, gcCleanupTimeout, docker, "network", "rm", id); err == nil {
+			rep.Networks++
+		}
+	}
+	return rep
+}
+
+// parseForeignInstances parses "ID <instance>" rows from docker ps/network ls
+// and returns the IDs whose instance label is missing (legacy) or differs
+// from the CURRENT process incarnation.
+func parseForeignInstances(out []byte, current string) []string {
+	var stale []string
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) == 0 || fields[0] == "" {
+			continue
+		}
+		instance := ""
+		if len(fields) > 1 {
+			instance = fields[1]
+		}
+		if instance != current {
+			stale = append(stale, fields[0])
+		}
+	}
+	return stale
 }
 
 // parseDockerContainers extracts the IDs of docker containers created before

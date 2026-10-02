@@ -228,49 +228,71 @@ func (s *Server) webhookDeliveryRun(ctx context.Context, forge, delivery, digest
 		return model.Run{}, false, false, nil
 	}
 	if digest != "" {
-		runID, found, err := s.findBodyReceipt(ctx, forge, repoID, digest)
+		runID, storedDigest, found, err := s.findBodyReceipt(ctx, forge, repoID, digest)
 		if err != nil {
 			return model.Run{}, false, false, err
 		}
 		if found {
-			return s.resolveDeliveryReceipt(ctx, runID, forge, digest, repoID)
+			return s.resolveDeliveryReceipt(ctx, runID, storedDigest, forge, digest, repoID)
 		}
 	}
-	runID, found, err := s.findDeliveryReceipt(ctx, forge, delivery)
+	runID, storedDigest, found, err := s.findDeliveryReceipt(ctx, forge, delivery)
 	if err != nil || !found {
 		return model.Run{}, false, false, err
 	}
-	return s.resolveDeliveryReceipt(ctx, runID, forge, digest, repoID)
+	return s.resolveDeliveryReceipt(ctx, runID, storedDigest, forge, digest, repoID)
 }
 
 // findDeliveryReceipt looks up a delivery-ID receipt. An empty run ID marks an
 // ignored terminal receipt; DB mode reads webhook_deliveries, memory mode the
 // persisted-run mirror.
-func (s *Server) findDeliveryReceipt(ctx context.Context, forge, deliveryID string) (string, bool, error) {
+func (s *Server) findDeliveryReceipt(ctx context.Context, forge, deliveryID string) (string, string, bool, error) {
 	if s.DB != nil {
 		return s.DB.FindDelivery(ctx, forge, deliveryID)
 	}
 	s.mu.Lock()
-	id, ok := s.deliveries[deliveryID]
+	v, ok := s.deliveries[deliveryID]
 	s.mu.Unlock()
-	return id, ok, nil
+	if !ok {
+		return "", "", false, nil
+	}
+	// Ignored receipts are encoded as "<digest>" so the same-delivery
+	// digest binding works without a run; enqueued receipts hold the run ID
+	// and their digest lives in the run metadata.
+	if strings.HasPrefix(v, ignoredDeliveryPrefix) {
+		return "", strings.TrimPrefix(v, ignoredDeliveryPrefix), true, nil
+	}
+	return v, "", true, nil
 }
 
 // findBodyReceipt looks up the per-repository body receipt: DB mode keys the
 // synthetic forge by the digest; memory mode uses the composite body key.
-func (s *Server) findBodyReceipt(ctx context.Context, forge, repoID, digest string) (string, bool, error) {
+func (s *Server) findBodyReceipt(ctx context.Context, forge, repoID, digest string) (string, string, bool, error) {
 	if s.DB != nil {
 		return s.DB.FindDelivery(ctx, forge+"-body", digest)
 	}
 	s.mu.Lock()
-	id, ok := s.deliveries[webhookBodyKey(forge, repoID, digest)]
+	v, ok := s.deliveries[webhookBodyKey(forge, repoID, digest)]
 	s.mu.Unlock()
-	return id, ok, nil
+	if !ok {
+		return "", "", false, nil
+	}
+	if strings.HasPrefix(v, ignoredDeliveryPrefix) {
+		return "", strings.TrimPrefix(v, ignoredDeliveryPrefix), true, nil
+	}
+	return v, digest, true, nil
 }
 
 // resolveDeliveryReceipt applies the repository/body-digest binding to a
 // receipt's run (or reports the ignored outcome).
-func (s *Server) resolveDeliveryReceipt(ctx context.Context, runID, forge, digest, repoID string) (model.Run, bool, bool, error) {
+func (s *Server) resolveDeliveryReceipt(ctx context.Context, runID, storedDigest, forge, digest, repoID string) (model.Run, bool, bool, error) {
+	// The stored digest is part of the replay identity for EVERY receipt,
+	// including ignored ones (which have no run metadata to compare):
+	// reusing a delivery ID with different signed content is a hard conflict,
+	// never a terminal-success replay.
+	if storedDigest != "" && digest != "" && storedDigest != digest {
+		return model.Run{}, false, false, errDeliveryDigestMismatch
+	}
 	if runID == "" {
 		// Terminal ignored receipt: replay returns the same 204 without work.
 		return model.Run{}, false, true, nil
@@ -303,6 +325,12 @@ func (s *Server) resolveDeliveryReceipt(ctx context.Context, runID, forge, diges
 	return prior, true, false, nil
 }
 
+// ignoredDeliveryPrefix encodes an in-memory IGNORED terminal receipt
+// (no run) with the authenticated body digest, so a reused delivery ID with
+// different content is still refused in fs mode. Run IDs can never contain
+// NUL, so the encoding cannot collide with a real receipt.
+const ignoredDeliveryPrefix = "ignored:"
+
 // recordIgnoredWebhook persists the terminal receipt for an authenticated
 // delivery that produced NO run, so a replay performs no forge API work and
 // returns the same terminal success. The body receipt is recorded too, which
@@ -312,13 +340,14 @@ func (s *Server) recordIgnoredWebhook(ctx context.Context, forge, repoID, delive
 		return
 	}
 	s.mu.Lock()
+	value := ignoredDeliveryPrefix + digest
 	if _, exists := s.deliveries[delivery]; !exists {
-		s.deliveries[delivery] = ""
+		s.deliveries[delivery] = value
 	}
 	if digest != "" {
 		key := webhookBodyKey(forge, repoID, digest)
 		if _, exists := s.deliveries[key]; !exists {
-			s.deliveries[key] = ""
+			s.deliveries[key] = value
 		}
 	}
 	s.mu.Unlock()

@@ -199,7 +199,11 @@ type Store interface {
 	InsertCompletionReceipt(ctx context.Context, r model.CompletionReceipt) error
 	HasCompletionReceipt(ctx context.Context, jobID string, generation int64, runnerID string) (model.CompletionReceipt, bool, error)
 	UpsertDelivery(ctx context.Context, forge, deliveryID string, runID string, payloadDigest string) error
-	FindDelivery(ctx context.Context, forge, deliveryID string) (string, bool, error)
+	// FindDelivery returns the receipt for (forge, deliveryID): runID (empty
+	// for an IGNORED terminal receipt), the stored PAYLOAD DIGEST (so callers
+	// can distinguish a replay of the same authenticated body from a reused
+	// delivery ID with different content) and whether a receipt exists.
+	FindDelivery(ctx context.Context, forge, deliveryID string) (runID string, payloadDigest string, found bool, err error)
 
 	// leader / HA
 	//

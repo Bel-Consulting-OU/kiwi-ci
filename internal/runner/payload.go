@@ -86,11 +86,10 @@ func verifyCompiledPayload(spec *pipeline.Spec, p *model.CompiledJobPayload, tru
 type effectivePolicySandbox struct {
 	Rootless       bool `json:"rootless"`
 	ReadOnlyRootFS bool `json:"read_only_rootfs"`
-	// NonRoot demands the job run as an unprivileged user. The executor's
-	// pipeline.Sandbox struct has no NonRoot field yet, so there is no
-	// backend handoff today: the value is decoded (and surfaced to tests)
-	// but enforcement is pending executor adoption (container backend
-	// --user=65534:65534).
+	// NonRoot demands the job run as an unprivileged user; the executor's
+	// container backend enforces it (rootful: --user=65534:65534; rootless:
+	// userns-mapped container UID 0, documented in pipeline.Sandbox) and
+	// refuses runtimes that cannot enforce it.
 	NonRoot bool `json:"non_root"`
 }
 
@@ -117,10 +116,9 @@ func payloadSandboxRequirements(p *model.CompiledJobPayload) (effectivePolicySan
 // into the compiled job before execution. Requirements can only strengthen:
 // a job that did not request rootless gains the requirement when the
 // effective policy demands it, and an explicit job-level request is never
-// weakened. NonRoot has no pipeline.Sandbox field to hand off to (the
-// executor honors only Rootless/ReadOnlyRootFS today), so it is decoded but
-// left for the executor's non-root adoption.
+// weakened.
 func applyEffectiveSandbox(cj *pipeline.CompiledJob, req effectivePolicySandbox) {
 	cj.Job.Sandbox.Rootless = cj.Job.Sandbox.Rootless || req.Rootless
 	cj.Job.Sandbox.ReadOnlyRootFS = cj.Job.Sandbox.ReadOnlyRootFS || req.ReadOnlyRootFS
+	cj.Job.Sandbox.NonRoot = cj.Job.Sandbox.NonRoot || req.NonRoot
 }

@@ -262,6 +262,14 @@ type projectIDPool struct {
 	free     []uint32
 	live     map[uint32]bool
 	released uint64
+	// known holds project IDs discovered in the FILESYSTEM but not allocated
+	// by this process. They stay out of the allocatable range so a restarted
+	// runner cannot hand out an ID a previous process left assigned (the
+	// kernel/filesystem outlives the Go allocator).
+	known map[uint32]bool
+	// discovered is set once the filesystem has been queried for existing
+	// project IDs.
+	discovered bool
 }
 
 func newProjectIDPool(base, size uint32) *projectIDPool {
@@ -271,7 +279,7 @@ func newProjectIDPool(base, size uint32) *projectIDPool {
 	if size == 0 || base > xfsProjectIDMax-size+1 {
 		size = min(defaultXFSProjectIDCount, xfsProjectIDMax-base+1)
 	}
-	return &projectIDPool{base: base, size: size, live: map[uint32]bool{}}
+	return &projectIDPool{base: base, size: size, live: map[uint32]bool{}, known: map[uint32]bool{}}
 }
 
 // allocate returns the next free project ID, preferring the smallest released
@@ -279,19 +287,46 @@ func newProjectIDPool(base, size uint32) *projectIDPool {
 func (p *projectIDPool) allocate() (uint32, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if len(p.free) > 0 {
+	for len(p.free) > 0 {
 		id := p.free[0]
 		p.free = p.free[1:]
+		if p.known[id] {
+			// Discovered in the filesystem: never hand it out.
+			continue
+		}
 		p.live[id] = true
 		return id, true
 	}
-	if p.used >= p.size {
-		return 0, false
+	for p.used < p.size {
+		id := p.base + p.used
+		p.used++
+		if p.known[id] {
+			continue
+		}
+		p.live[id] = true
+		return id, true
 	}
-	id := p.base + p.used
-	p.used++
-	p.live[id] = true
-	return id, true
+	return 0, false
+}
+
+// reserveKnown marks filesystem-discovered project IDs as permanently
+// unavailable to this process (idempotent).
+func (p *projectIDPool) reserveKnown(ids []uint32) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, id := range ids {
+		if id != 0 {
+			p.known[id] = true
+		}
+	}
+}
+
+// markDiscovered records that the filesystem was queried (even when the
+// report was empty) so discovery runs at most once per pool.
+func (p *projectIDPool) markDiscovered() {
+	p.mu.Lock()
+	p.discovered = true
+	p.mu.Unlock()
 }
 
 // release returns an ID to the pool. Releasing an ID that is not live is a
@@ -420,6 +455,48 @@ func runXFSQuotaCommand(xq, mountPoint, command string) error {
 	return nil
 }
 
+// discoverXFSProjectIDs queries the filesystem for project IDs that already
+// exist (assigned or with quota state) and reserves them in the pool, so a
+// restarted runner cannot allocate an ID a previous process left behind:
+// the XFS assignment and quota outlive the Go allocator. It runs at most once
+// per filesystem and FAILS CLOSED on a report error (an unknown ID space
+// cannot guarantee uniqueness).
+func discoverXFSProjectIDs(xq, mountPoint, fsKey string) error {
+	pool := projectIDPoolFor(fsKey)
+	pool.mu.Lock()
+	already := pool.discovered
+	pool.mu.Unlock()
+	if already {
+		return nil
+	}
+	out, err := boundedToolCommand(context.Background(), xfsQuotaTimeout, xq, "-x", "-c", "report -p -n", mountPoint)
+	if err != nil {
+		return fmt.Errorf("report existing XFS project ids: %w", err)
+	}
+	pool.reserveKnown(parseXFSProjectIDs(out))
+	pool.markDiscovered()
+	return nil
+}
+
+// parseXFSProjectIDs extracts numeric project IDs from `xfs_quota -x -c
+// 'report -p -n'` output, whose rows start with "#<id>".
+func parseXFSProjectIDs(out []byte) []uint32 {
+	var ids []uint32
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		id, err := strconv.ParseUint(strings.TrimPrefix(fields[0], "#"), 10, 32)
+		if err != nil || id == 0 || id > uint64(xfsProjectIDMax) {
+			continue
+		}
+		ids = append(ids, uint32(id))
+	}
+	return ids
+}
+
 // setupXFSProjectQuotaOnMount is the XFS core shared by the Linux capability
 // probe and the tests: it allocates a project ID for the workspace's
 // filesystem, assigns the workspace to it, applies the bhard limit, and
@@ -431,6 +508,11 @@ func runXFSQuotaCommand(xq, mountPoint, command string) error {
 // half-applied state is removed and the ID released (best effort).
 func setupXFSProjectQuotaOnMount(workspace string, entry mountInfoEntry, limit int64, xq string) (DiskQuotaStatus, func() error) {
 	fsKey := entry.fsKey()
+	// Restart safety: reserve every project ID the filesystem already has
+	// before handing out a new one.
+	if err := discoverXFSProjectIDs(xq, entry.mountPoint, fsKey); err != nil {
+		return DiskQuotaStatus{Detail: "enumerate existing XFS project ids: " + err.Error()}, nil
+	}
 	projID, err := allocateXFSProjectID(fsKey)
 	if err != nil {
 		return DiskQuotaStatus{Detail: "allocate XFS project id: " + err.Error()}, nil

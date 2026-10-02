@@ -490,11 +490,11 @@ func TestPostgresIntegrationReceiptsAndDeliveries(t *testing.T) {
 	if err := st.UpsertDelivery(ctx, "github", "d1", runID, "digest-2"); err != nil {
 		t.Fatalf("UpsertDelivery update: %v", err)
 	}
-	gotRun, ok, err := st.FindDelivery(ctx, "github", "d1")
+	gotRun, _, ok, err := st.FindDelivery(ctx, "github", "d1")
 	if err != nil || !ok || gotRun != runID {
 		t.Fatalf("FindDelivery = %q, %v, %v", gotRun, ok, err)
 	}
-	if _, ok, err := st.FindDelivery(ctx, "github", "missing"); err != nil || ok {
+	if _, _, ok, err := st.FindDelivery(ctx, "github", "missing"); err != nil || ok {
 		t.Fatalf("FindDelivery missing = %v, %v", ok, err)
 	}
 }

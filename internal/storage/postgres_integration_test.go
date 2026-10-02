@@ -505,7 +505,7 @@ func TestPostgresIntegrationInsertCompiledRun(t *testing.T) {
 	if err != nil || !ok || !got["dist"].Required || got["dist"].Name != "dist" {
 		t.Fatalf("contracts = %v ok=%v err=%v", got, ok, err)
 	}
-	if _, found, err := st.FindDelivery(ctx, "github", "del-new"); err != nil || !found {
+	if _, _, found, err := st.FindDelivery(ctx, "github", "del-new"); err != nil || !found {
 		t.Fatalf("delivery claim missing: found=%v err=%v", found, err)
 	}
 

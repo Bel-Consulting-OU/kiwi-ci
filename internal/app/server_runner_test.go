@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -84,9 +85,25 @@ func TestValidateProductionConfig(t *testing.T) {
 		// bound (the staging validation matrix lives in staging_test.go).
 		StagingDir:      "/var/lib/kiwi/staging",
 		StagingMaxBytes: 1 << 30,
+		// A shared dashboard session/CSRF key is required in production so
+		// sessions survive replica failover and restarts.
+		WebSessionSecret: strings.Repeat("ab", 32),
 	}
 	if err := validateProductionConfig(valid); err != nil {
 		t.Fatalf("valid production config rejected: %v", err)
+	}
+
+	// Missing or malformed session secrets are refused in production.
+	for name, mutate := range map[string]func(*productionConfig){
+		"missing session secret":   func(c *productionConfig) { c.WebSessionSecret = "" },
+		"malformed session secret": func(c *productionConfig) { c.WebSessionSecret = "not-hex" },
+		"short session secret":     func(c *productionConfig) { c.WebSessionSecret = strings.Repeat("ab", 8) },
+	} {
+		cfg := valid
+		mutate(&cfg)
+		if err := validateProductionConfig(cfg); err == nil || !strings.Contains(err.Error(), "KIWI_WEB_SESSION_SECRET") {
+			t.Fatalf("%s = %v, want a KIWI_WEB_SESSION_SECRET refusal", name, err)
+		}
 	}
 
 	// --runner-token alone is NOT rejected statically: the per-runner

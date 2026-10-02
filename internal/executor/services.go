@@ -369,6 +369,14 @@ func validateServiceImages(services []pipeline.Service, runID, jobID string, req
 // budget across the remaining services); a job whose service declarations
 // genuinely cannot fit its own resource envelope fails closed.
 func startContainerServices(ctx context.Context, runID, jobID string, services []pipeline.Service, jobResources pipeline.Resources, isolated, requireImmutable bool, cgroupParent string, emit func(string)) (string, func(), error) {
+	return startContainerServicesOwned(ctx, runID, jobID, runtimeOwner{}, services, jobResources, isolated, requireImmutable, cgroupParent, emit)
+}
+
+// startContainerServicesOwned is startContainerServices plus the owning runner
+// process incarnation: service containers and the services network carry
+// kiwi.runner/kiwi.instance labels so a restarted runner can reconcile its
+// predecessor's resources before leasing new work.
+func startContainerServicesOwned(ctx context.Context, runID, jobID string, owner runtimeOwner, services []pipeline.Service, jobResources pipeline.Resources, isolated, requireImmutable bool, cgroupParent string, emit func(string)) (string, func(), error) {
 	if err := validateServiceImages(services, runID, jobID, requireImmutable); err != nil {
 		return "", func() {}, err
 	}
@@ -378,6 +386,12 @@ func startContainerServices(ctx context.Context, runID, jobID string, services [
 	}
 	network := serviceNetworkName(runID, jobID)
 	createArgs := append(serviceNetworkArgs(isolated), "--label", "kiwi.run="+runID, network)
+	if owner.RunnerID != "" {
+		createArgs = append(createArgs, "--label", "kiwi.runner="+owner.RunnerID)
+		if owner.InstanceID != "" {
+			createArgs = append(createArgs, "--label", "kiwi.instance="+owner.InstanceID)
+		}
+	}
 	// Network creation is a quick control-plane mutation: bounded by the
 	// control ceiling (min with the job context), so a wedged daemon cannot
 	// stall an unbounded job.
@@ -422,7 +436,7 @@ func startContainerServices(ctx context.Context, runID, jobID string, services [
 		if alias := serviceAlias(svc); alias != "" {
 			args = append(args, "--network-alias", alias)
 		}
-		args = append(args, containerLabels(runID, jobID)...)
+		args = append(args, containerLabelsOwned(runID, jobID, owner)...)
 		for k, v := range svc.Env {
 			args = append(args, "-e", k+"="+v)
 		}

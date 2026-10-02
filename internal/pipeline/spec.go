@@ -294,9 +294,16 @@ func (n *NetworkPolicy) UnmarshalYAML(node *yaml.Node) error {
 // Sandbox collects job-level sandboxing requirements. Enforced by the
 // executor backends; distributed runners must honor them for untrusted jobs.
 type Sandbox struct {
-	Rootless       bool          `yaml:"rootless,omitempty" json:"rootless,omitempty"`
-	ReadOnlyRootFS bool          `yaml:"read_only_rootfs,omitempty" json:"read_only_rootfs,omitempty"`
-	Network        NetworkPolicy `yaml:"network,omitempty" json:"network,omitempty"`
+	Rootless       bool `yaml:"rootless,omitempty" json:"rootless,omitempty"`
+	ReadOnlyRootFS bool `yaml:"read_only_rootfs,omitempty" json:"read_only_rootfs,omitempty"`
+	// NonRoot demands the workload not run as container UID 0 on a ROOTFUL
+	// daemon. Under rootless Docker the hardened plan runs container UID 0
+	// inside a user namespace that cannot map to host root, which satisfies
+	// the requirement without assigning a subuid that cannot own the
+	// bind-mounted workspace (the documented meaning; enforced by the
+	// container backend, refused on runtimes that cannot enforce it).
+	NonRoot bool          `yaml:"non_root,omitempty" json:"non_root,omitempty"`
+	Network NetworkPolicy `yaml:"network,omitempty" json:"network,omitempty"`
 }
 
 // Placement steers a job towards runner regions and label sets.

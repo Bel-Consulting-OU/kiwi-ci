@@ -86,8 +86,8 @@ func TestPayloadSandboxRequirementsFromPolicyCompiledRootless(t *testing.T) {
 // explicit job-level request.
 func TestApplyEffectiveSandboxStrengthensOnly(t *testing.T) {
 	cj := &pipeline.CompiledJob{ID: "build", Job: pipeline.Job{}}
-	applyEffectiveSandbox(cj, effectivePolicySandbox{Rootless: true, ReadOnlyRootFS: true})
-	if !cj.Job.Sandbox.Rootless || !cj.Job.Sandbox.ReadOnlyRootFS {
+	applyEffectiveSandbox(cj, effectivePolicySandbox{Rootless: true, ReadOnlyRootFS: true, NonRoot: true})
+	if !cj.Job.Sandbox.Rootless || !cj.Job.Sandbox.ReadOnlyRootFS || !cj.Job.Sandbox.NonRoot {
 		t.Fatalf("requirements not copied: %+v", cj.Job.Sandbox)
 	}
 

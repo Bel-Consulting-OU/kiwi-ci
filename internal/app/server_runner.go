@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"flag"
@@ -58,6 +59,12 @@ type productionConfig struct {
 	StagingDir        string
 	StagingMaxBytes   int64
 	StagingInstanceID string
+	// WebSessionSecret is the shared dashboard session/CSRF HMAC key
+	// (64 hex chars) from KIWI_WEB_SESSION_SECRET. Production requires it:
+	// without a shared key every replica mints its own and a session created
+	// on one replica fails on the next (random logout/CSRF failures after
+	// scaling or a restart).
+	WebSessionSecret string
 }
 
 // validateProductionConfig enforces the STATIC half of the production-mode
@@ -509,6 +516,16 @@ func validateProductionConfig(cfg productionConfig) error {
 	if strings.TrimSpace(cfg.StagingDir) == "" || cfg.StagingMaxBytes <= 0 {
 		return fmt.Errorf("production mode requires --staging-dir and --staging-max-bytes (large runner uploads must stage inside a bounded directory; set staging.dir and staging.max_bytes)")
 	}
+	// Dashboard sessions must be HA-stable: every replica has to share the
+	// session/CSRF HMAC key, otherwise a cookie minted on one replica fails on
+	// the next. A process-local random key is only acceptable in dev.
+	if secret := strings.TrimSpace(cfg.WebSessionSecret); secret != "" {
+		if b, err := hex.DecodeString(secret); err != nil || len(b) != 32 {
+			return fmt.Errorf("KIWI_WEB_SESSION_SECRET must be 64 hex characters (a 32-byte shared key)")
+		}
+	} else {
+		return fmt.Errorf("production mode requires KIWI_WEB_SESSION_SECRET (a shared 32-byte hex key; HA replicas must share it so dashboard sessions survive failover)")
+	}
 	// Runner credentials are a POST-DB decision (per-runner tokens may
 	// already live in the runner_bearer_tokens table), so the static
 	// validator deliberately says nothing about --runner-token here.
@@ -835,6 +852,7 @@ func Server(ctx context.Context, args []string) error {
 		StagingDir:        cfg.Staging.Dir,
 		StagingMaxBytes:   cfg.Staging.MaxBytes,
 		StagingInstanceID: cfg.Staging.InstanceID,
+		WebSessionSecret:  strings.TrimSpace(os.Getenv("KIWI_WEB_SESSION_SECRET")),
 	}); err != nil {
 		return err
 	}

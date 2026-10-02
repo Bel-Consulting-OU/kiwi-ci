@@ -391,3 +391,36 @@ func TestFlowDynamicRepoIdentityHelpers(t *testing.T) {
 		t.Fatalf("repoIdentityOfJob stored = %+v", id)
 	}
 }
+
+// TestFlowDynamicCorruptEffectivePolicyFailsClosed pins the policy-metadata
+// rule: a current-format parent whose effective policy cannot be decoded must
+// refuse generated children instead of falling back to (possibly broader)
+// trust defaults.
+func TestFlowDynamicCorruptEffectivePolicyFailsClosed(t *testing.T) {
+	s, task := fcDynamicServer(t)
+	parent := fcStoredParent(t, s, task.Job.ID)
+	ctx := context.Background()
+
+	corrupt := parent
+	effJob, err := json.Marshal(map[string]any{"generate": map[string]any{"max_jobs": 10}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt.CompiledJobPayload = &model.CompiledJobPayload{
+		SchemaVersion:   1,
+		EffectiveJob:    json.RawMessage(effJob),
+		EffectivePolicy: json.RawMessage(`{"container":"not-a-bool"}`),
+	}
+	if _, err := s.processGeneratedFragment(ctx, corrupt, fcFragment(t, fcOneChildFragment)); err == nil || !strings.Contains(err.Error(), "effective policy") {
+		t.Fatalf("corrupt policy fragment = %v, want a fail-closed policy error", err)
+	}
+	if _, err := s.generatedChildCapabilities(corrupt); err == nil {
+		t.Fatal("corrupt parent policy produced a capability set")
+	}
+
+	missing := parent
+	missing.CompiledJobPayload = &model.CompiledJobPayload{SchemaVersion: 1}
+	if _, err := s.processGeneratedFragment(ctx, missing, fcFragment(t, fcOneChildFragment)); err == nil {
+		t.Fatal("current-format parent without an effective policy admitted a fragment")
+	}
+}

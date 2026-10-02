@@ -25,6 +25,9 @@ func validProductionStaging() productionConfig {
 		TLSKey:          "/etc/kiwi/server.key",
 		StagingDir:      "/var/lib/kiwi/staging",
 		StagingMaxBytes: 32 << 30,
+		// Shared dashboard session key (required in production; without it
+		// HA failover loses every dashboard session).
+		WebSessionSecret: strings.Repeat("cd", 32),
 	}
 }
 
@@ -87,6 +90,7 @@ func TestServerProductionRefusesMissingStagingBoundAtStartup(t *testing.T) {
 // but unusable bound fails startup when the budget is constructed, before the
 // database connection is attempted.
 func TestServerProductionRefusesUnusableStagingDirectoryAtStartup(t *testing.T) {
+	t.Setenv("KIWI_WEB_SESSION_SECRET", strings.Repeat("ab", 32))
 	file := filepath.Join(t.TempDir(), "not-a-dir")
 	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)

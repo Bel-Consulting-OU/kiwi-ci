@@ -984,3 +984,26 @@ func TestFaultInjectionReadsUnaffected(t *testing.T) {
 		t.Fatalf("PendingSidecar on empty store = %q ok=%v err=%v", digest, ok, err)
 	}
 }
+
+// TestMemStoreIgnoredDeliveryKeepsDigest pins the receipt shape for ignored
+// webhooks: FindDelivery returns the stored payload digest (not just an empty
+// presence flag) so a reused delivery ID with different content can be
+// refused.
+func TestMemStoreIgnoredDeliveryKeepsDigest(t *testing.T) {
+	m := newMemStore()
+	ctx := context.Background()
+	if err := m.UpsertDelivery(ctx, "github", "del-ignored", "", "digest-a"); err != nil {
+		t.Fatal(err)
+	}
+	runID, digest, found, err := m.FindDelivery(ctx, "github", "del-ignored")
+	if err != nil || !found || runID != "" || digest != "digest-a" {
+		t.Fatalf("ignored receipt = (%q, %q, %t, %v), want (\"\", digest-a, true, nil)", runID, digest, found, err)
+	}
+	if err := m.UpsertDelivery(ctx, "github", "del-run", "run-1", "digest-b"); err != nil {
+		t.Fatal(err)
+	}
+	runID, digest, found, err = m.FindDelivery(ctx, "github", "del-run")
+	if err != nil || !found || runID != "run-1" || digest != "digest-b" {
+		t.Fatalf("run receipt = (%q, %q, %t, %v)", runID, digest, found, err)
+	}
+}

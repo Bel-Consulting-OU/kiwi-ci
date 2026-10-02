@@ -144,9 +144,10 @@ func TestFinalRunGCReportsRemovedResources(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "gc-mark")
 	old := time.Now().Add(-48 * time.Hour).Format("2006-01-02 15:04:05 -0700 MST")
 	script := `#!/bin/sh
-if [ "$1 $2" = "ps -a" ]; then
-  if /bin/mkdir "` + marker + `" 2>/dev/null; then echo "deadbeef ` + old + `"; fi
-fi
+case "$*" in
+  *"label=kiwi.run --format"*)
+    if /bin/mkdir "` + marker + `" 2>/dev/null; then echo "deadbeef ` + old + `"; fi;;
+esac
 exit 0
 `
 	if err := os.WriteFile(filepath.Join(bin, "docker"), []byte(script), 0o755); err != nil {

@@ -399,11 +399,11 @@ func TestMemStoreArtifactReportLogAuditDelivery(t *testing.T) {
 	if err := m.UpsertDelivery(ctx, "github", "d1", memRunID, "digest"); err != nil {
 		t.Fatalf("UpsertDelivery: %v", err)
 	}
-	v, ok, err := m.FindDelivery(ctx, "github", "d1")
-	if err != nil || !ok || v != memRunID+"/digest" {
-		t.Fatalf("FindDelivery = %q, %v, %v", v, ok, err)
+	v, digest, ok, err := m.FindDelivery(ctx, "github", "d1")
+	if err != nil || !ok || v != memRunID || digest != "digest" {
+		t.Fatalf("FindDelivery = %q, %q, %v, %v", v, digest, ok, err)
 	}
-	if _, ok, err := m.FindDelivery(ctx, "github", "missing"); err != nil || ok {
+	if _, _, ok, err := m.FindDelivery(ctx, "github", "missing"); err != nil || ok {
 		t.Fatalf("FindDelivery missing = %v, %v", ok, err)
 	}
 

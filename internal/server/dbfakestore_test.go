@@ -1602,14 +1602,21 @@ func (f *dbFakeStore) UpsertDelivery(ctx context.Context, forge, deliveryID stri
 	return nil
 }
 
-func (f *dbFakeStore) FindDelivery(ctx context.Context, forge, deliveryID string) (string, bool, error) {
+func (f *dbFakeStore) FindDelivery(ctx context.Context, forge, deliveryID string) (string, string, bool, error) {
 	if f.findDeliveryErr != nil {
-		return "", false, f.findDeliveryErr
+		return "", "", false, f.findDeliveryErr
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	v, ok := f.deliveries[forge+"/"+deliveryID]
-	return v, ok, nil
+	if !ok {
+		return "", "", false, nil
+	}
+	runID, digest := v, ""
+	if i := strings.Index(v, "/"); i >= 0 {
+		runID, digest = v[:i], v[i+1:]
+	}
+	return runID, digest, true, nil
 }
 
 func (f *dbFakeStore) TryAcquireLeadership(ctx context.Context, key string, ttl time.Duration) (bool, error) {

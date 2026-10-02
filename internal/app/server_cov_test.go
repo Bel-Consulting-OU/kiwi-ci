@@ -298,6 +298,7 @@ func TestServerRejectsBadInputs(t *testing.T) {
 }
 
 func TestServerProductionRunnerTokenDecisionIsPostDB(t *testing.T) {
+	t.Setenv("KIWI_WEB_SESSION_SECRET", strings.Repeat("ab", 32))
 	// D3-D: --runner-token alone is no longer rejected by STATIC validation.
 	// The per-runner decision needs the database (rows may already be
 	// provisioned in runner_bearer_tokens), so an unreachable database must

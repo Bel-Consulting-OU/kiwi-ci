@@ -24,6 +24,8 @@ import (
 // plus the caller's runner-PKI flags.
 func productionPKIServerArgs(t *testing.T, dsn, addr string, extra ...string) []string {
 	t.Helper()
+	// Production mode requires a shared dashboard session key (HA failover).
+	t.Setenv("KIWI_WEB_SESSION_SECRET", strings.Repeat("ab", 32))
 	certFile, keyFile := writeSelfSignedTLS(t)
 	args := []string{
 		"--listen", addr, "--database-url", dsn,

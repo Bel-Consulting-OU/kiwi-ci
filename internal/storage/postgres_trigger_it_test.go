@@ -664,7 +664,7 @@ func TestPostgresIntegrationDroppedTableReadErrors(t *testing.T) {
 			return err
 		}},
 		"FindDelivery": {"webhook_deliveries", func(t *testing.T, st *PostgresStore, ids *boomerIds) error {
-			_, _, err := st.FindDelivery(ctx, "github", "d")
+			_, _, _, err := st.FindDelivery(ctx, "github", "d")
 			return err
 		}},
 		"HasReceipt": {"completion_receipts", func(t *testing.T, st *PostgresStore, ids *boomerIds) error {

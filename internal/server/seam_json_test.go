@@ -222,12 +222,12 @@ func TestSeamJSONGeneratedFragmentFailsClosed(t *testing.T) {
 	frag := `{"jobs":{"child-a":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo child"}]}},"deps":{}}`
 	body := fragmentBody(t, frag)
 
-	// Every marshal fails: the parent's stored effective-policy decode falls
-	// back to its trust defaults, which do not permit child graphs, so the
-	// request is denied rather than admitted with a degraded ceiling.
+	// Every marshal fails: the parent's stored effective policy is
+	// UNDECODABLE, so generated-child admission fails closed (a corrupt
+	// current-format policy must not fall back to broader trust defaults).
 	restore := seamJSON(t)
-	if w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", body, leaseHeaders(task, runnerID)); w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "do not permit generated child graphs") {
-		t.Fatalf("generated with failing effective-policy encoder = %d: %s; want 403 policy denial", w.Code, w.Body.String())
+	if w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", body, leaseHeaders(task, runnerID)); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "effective policy") {
+		t.Fatalf("generated with failing effective-policy encoder = %d: %s; want the fail-closed policy refusal", w.Code, w.Body.String())
 	}
 	restore()
 

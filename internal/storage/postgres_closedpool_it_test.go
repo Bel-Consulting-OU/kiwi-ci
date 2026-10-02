@@ -90,7 +90,7 @@ func TestPostgresClosedPoolErrorPaths(t *testing.T) {
 			return err
 		}},
 		{"UpsertDelivery", func() error { return st.UpsertDelivery(ctx, "github", "d", runID, "digest") }},
-		{"FindDelivery", func() error { _, _, err := st.FindDelivery(ctx, "github", "d"); return err }},
+		{"FindDelivery", func() error { _, _, _, err := st.FindDelivery(ctx, "github", "d"); return err }},
 		{"OutboxAppend", func() error { return st.OutboxAppend(ctx, OutboxItem{ID: "o", CreatedAt: now}) }},
 		{"OutboxAck", func() error { return st.OutboxAck(ctx, "o") }},
 		{"OutboxPending", func() error { _, err := st.OutboxPending(ctx); return err }},

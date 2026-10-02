@@ -238,29 +238,51 @@ func downstreamChildTrusted(j model.Job) bool {
 	if !j.Trusted {
 		return false
 	}
-	caps, ok := effectiveCapsOf(j)
-	if !ok {
+	caps, state, err := effectiveCapsOf(j)
+	if err != nil || state != storedPolicyValid {
 		return false
 	}
 	return caps.CrossRepoTrigger
 }
 
-// effectiveCapsOf decodes the job's stored effective policy into a
-// capability set. The stored value is `any` (json.RawMessage on write,
-// decoded JSON after a store round-trip), so it is re-marshaled first.
-func effectiveCapsOf(j model.Job) (policy.Capabilities, bool) {
-	if j.CompiledJobPayload == nil || j.CompiledJobPayload.EffectivePolicy == nil {
-		return policy.Capabilities{}, false
+// storedPolicyState distinguishes a genuinely legacy payload (no policy was
+// ever recorded: the documented fallback applies) from a CURRENT-format
+// payload whose policy cannot be decoded (policy metadata must fail closed,
+// never widen authority).
+type storedPolicyState int
+
+const (
+	storedPolicyAbsent storedPolicyState = iota
+	storedPolicyValid
+	storedPolicyMalformed
+)
+
+// effectiveCapsOf decodes the job's stored effective policy into a capability
+// set. The stored value is `any` (json.RawMessage on write, decoded JSON
+// after a store round-trip), so it is re-marshaled first. A current-format
+// payload (SchemaVersion >= 1) with a missing or undecodable policy reports
+// storedPolicyMalformed with an error; only payloads that never carried a
+// policy are treated as the legacy fallback.
+func effectiveCapsOf(j model.Job) (policy.Capabilities, storedPolicyState, error) {
+	if j.CompiledJobPayload == nil {
+		return policy.Capabilities{}, storedPolicyAbsent, nil
 	}
-	b, err := jsonMarshal(j.CompiledJobPayload.EffectivePolicy)
+	p := j.CompiledJobPayload
+	if p.EffectivePolicy == nil {
+		if p.SchemaVersion >= 1 {
+			return policy.Capabilities{}, storedPolicyMalformed, fmt.Errorf("compiled policy payload (schema %d) is missing the effective policy", p.SchemaVersion)
+		}
+		return policy.Capabilities{}, storedPolicyAbsent, nil
+	}
+	b, err := jsonMarshal(p.EffectivePolicy)
 	if err != nil {
-		return policy.Capabilities{}, false
+		return policy.Capabilities{}, storedPolicyMalformed, fmt.Errorf("compiled policy payload is not encodable: %w", err)
 	}
 	var caps policy.Capabilities
 	if err := json.Unmarshal(b, &caps); err != nil {
-		return policy.Capabilities{}, false
+		return policy.Capabilities{}, storedPolicyMalformed, fmt.Errorf("compiled policy payload is malformed: %w", err)
 	}
-	return caps, true
+	return caps, storedPolicyValid, nil
 }
 
 // downstreamStore resolves the durable downstream claim store in DB mode.

@@ -328,7 +328,10 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 	// Children inherit (or reduce) the parent's effective capabilities: the
 	// parent's stored effective policy is the ceiling, narrowed by the
 	// current policy file and the trust floor.
-	childCaps := s.generatedChildCapabilities(parent)
+	childCaps, cerr := s.generatedChildCapabilities(parent)
+	if cerr != nil {
+		return nil, cerr
+	}
 	// The parent's own capabilities must permit child graph generation.
 	if !childCaps.GenerateChildGraph {
 		return nil, policyDenied("parent job's capabilities do not permit generated child graphs")
@@ -623,13 +626,20 @@ func (s *Server) memoryGeneratedFragment(parentJobID string, generation int64, f
 // uses the parent's canonical RepoID (derived for legacy payloads), so a
 // policy entry for github.com/acme/api never narrows a
 // gitlab.company.com/acme/api child.
-func (s *Server) generatedChildCapabilities(parent model.Job) policy.Capabilities {
+func (s *Server) generatedChildCapabilities(parent model.Job) (policy.Capabilities, error) {
 	repo := repoIDForJob(parent)
 	caps := policy.DefaultUntrustedCapabilities()
 	if parent.Trusted {
 		caps = policy.DefaultTrustedCapabilities()
 	}
-	if stored, ok := effectiveCapsOf(parent); ok {
+	stored, state, err := effectiveCapsOf(parent)
+	if err != nil {
+		// A current-format parent whose policy is unreadable must not fall
+		// back to trust defaults (which could be BROADER than the parent's
+		// actual enqueue-time capabilities).
+		return policy.Capabilities{}, fmt.Errorf("parent effective policy unavailable: %w", err)
+	}
+	if state == storedPolicyValid {
 		caps = stored
 	}
 	if s.Policy != nil {
@@ -642,7 +652,7 @@ func (s *Server) generatedChildCapabilities(parent model.Job) policy.Capabilitie
 		caps.GenerateChildGraph = caps.GenerateChildGraph && grants.GenerateChildGraph
 		caps.CrossRepoTrigger = caps.CrossRepoTrigger && grants.CrossRepoTrigger
 	}
-	return caps.Effective(parent.Trusted)
+	return caps.Effective(parent.Trusted), nil
 }
 
 // repoFullNameOf reconstructs the parent job's repository full name for

@@ -676,7 +676,7 @@ func (f *FaultyStore) UpsertDelivery(ctx context.Context, forge, deliveryID stri
 	return f.Inner.UpsertDelivery(ctx, forge, deliveryID, runID, payloadDigest)
 }
 
-func (f *FaultyStore) FindDelivery(ctx context.Context, forge, deliveryID string) (string, bool, error) {
+func (f *FaultyStore) FindDelivery(ctx context.Context, forge, deliveryID string) (string, string, bool, error) {
 	return f.Inner.FindDelivery(ctx, forge, deliveryID)
 }
 
@@ -3353,11 +3353,19 @@ func (m *memStore) UpsertDelivery(ctx context.Context, forge, deliveryID string,
 	return nil
 }
 
-func (m *memStore) FindDelivery(ctx context.Context, forge, deliveryID string) (string, bool, error) {
+func (m *memStore) FindDelivery(ctx context.Context, forge, deliveryID string) (string, string, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	v, ok := m.deliveries[forge+"/"+deliveryID]
-	return v, ok, nil
+	if !ok {
+		return "", "", false, nil
+	}
+	// Stored encoding: "<runID>/<digest>" (runID empty for ignored receipts).
+	runID, digest := v, ""
+	if i := strings.Index(v, "/"); i >= 0 {
+		runID, digest = v[:i], v[i+1:]
+	}
+	return runID, digest, true, nil
 }
 
 func (m *memStore) TryAcquireLeadership(ctx context.Context, key string, ttl time.Duration) (bool, error) {

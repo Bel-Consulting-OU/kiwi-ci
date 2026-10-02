@@ -529,4 +529,15 @@ jobs:
 	if runs != 0 {
 		t.Fatalf("ignored deliveries created %d runs, want 0", runs)
 	}
+
+	// Reusing the SAME delivery ID with DIFFERENT authenticated content is a
+	// conflict, never a terminal-success replay (ignored receipts carry the
+	// body digest too).
+	other := pushPayload("1111111111111111111111111111111111111111")
+	if w := postWebhook(t, s, "hunter2", "push", "ignored-1", other); w.Code != http.StatusConflict {
+		t.Fatalf("ignored receipt with different content = %d: %s", w.Code, w.Body.String())
+	}
+	if api.requests.Load() != first {
+		t.Fatalf("conflicting replay performed forge work: %d -> %d", first, api.requests.Load())
+	}
 }

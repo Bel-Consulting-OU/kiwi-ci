@@ -234,7 +234,7 @@ func TestMemStoreSupersedePolicyAtomic(t *testing.T) {
 	if got, err := m.GetJob(ctx(), newJobID); err != nil || got.Status != model.StatusQueued {
 		t.Fatalf("successor job = %+v err=%v", got, err)
 	}
-	if _, ok, _ := m.FindDelivery(ctx(), "github", "del-sup"); !ok {
+	if _, _, ok, _ := m.FindDelivery(ctx(), "github", "del-sup"); !ok {
 		t.Fatal("successful enqueue lost the delivery claim")
 	}
 }

@@ -3478,16 +3478,16 @@ func (s *PostgresStore) UpsertDelivery(ctx context.Context, forge, deliveryID st
 	return err
 }
 
-func (s *PostgresStore) FindDelivery(ctx context.Context, forge, deliveryID string) (string, bool, error) {
-	var runID string
-	err := s.pool.QueryRow(ctx, `SELECT run_id FROM webhook_deliveries WHERE forge=$1 AND delivery_id=$2`, forge, deliveryID).Scan(&runID)
+func (s *PostgresStore) FindDelivery(ctx context.Context, forge, deliveryID string) (string, string, bool, error) {
+	var runID, digest string
+	err := s.pool.QueryRow(ctx, `SELECT run_id, COALESCE(payload_digest, '') FROM webhook_deliveries WHERE forge=$1 AND delivery_id=$2`, forge, deliveryID).Scan(&runID, &digest)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", false, nil
+		return "", "", false, nil
 	}
 	if err != nil {
-		return "", false, err
+		return "", "", false, err
 	}
-	return runID, true, nil
+	return runID, digest, true, nil
 }
 
 // ---------------------------------------------------------------------------

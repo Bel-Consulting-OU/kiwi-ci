@@ -7,6 +7,7 @@ package executor
 // ID stays allocated" branch).
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -270,5 +271,104 @@ func TestSetupXFSProjectQuotaAssignCleanupFailureQuarantinesID(t *testing.T) {
 	second, _ := setupXFSProjectQuotaOnMount("/mnt/xfs/ws2", entry, 1<<20, script)
 	if second.Hard || !strings.Contains(second.Detail, "allocate XFS project id") {
 		t.Fatalf("second workspace = %+v, want allocation exhaustion (no ID reuse)", second)
+	}
+}
+
+// writeXFSDiscoveryScript installs a fake xfs_quota whose `report -p -n`
+// output comes from FAKE_XFS_REPORT (printf %b so \n works) and whose exit
+// code comes from FAKE_XFS_REPORT_EXIT; every other invocation succeeds
+// silently.
+func writeXFSDiscoveryScript(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	script := filepath.Join(dir, "xfs_quota")
+	body := `#!/bin/sh
+case "$*" in
+  *"report -p -n"*) printf '%b' "${FAKE_XFS_REPORT:-}"; exit "${FAKE_XFS_REPORT_EXIT:-0}";;
+esac
+exit 0
+`
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return script
+}
+
+// TestXFSDiscoveryReservesExistingProjectIDs pins restart safety: project IDs
+// the filesystem already knows are never handed out by a fresh process.
+func TestXFSDiscoveryReservesExistingProjectIDs(t *testing.T) {
+	resetProjectIDPools(t)
+	t.Setenv(xfsProjectIDBaseEnv, "100000")
+	t.Setenv(xfsProjectIDCountEnv, "4")
+	t.Setenv("FAKE_XFS_REPORT", "#100000\n#100002\n")
+	script := writeXFSDiscoveryScript(t)
+
+	entry := mountInfoEntry{mountPoint: "/mnt/xfs", device: "8:40", fsType: "xfs"}
+	status, cleanup := setupXFSProjectQuotaOnMount("/mnt/xfs/ws", entry, 1<<20, script)
+	if !status.Hard || cleanup == nil {
+		t.Fatalf("setup with discovery = %+v cleanup=%v", status, cleanup != nil)
+	}
+	if !strings.Contains(status.Detail, "XFS project quota 100001") {
+		t.Fatalf("allocated ID detail = %q, want 100001 (known IDs skipped)", status.Detail)
+	}
+	// The next allocation must skip BOTH discovered IDs (and the live one).
+	next, err := allocateXFSProjectID("8:40")
+	if err != nil || next != 100003 {
+		t.Fatalf("next allocation = (%d, %v), want 100003 (100000/100002 discovered)", next, err)
+	}
+	releaseXFSProjectID("8:40", next)
+	if err := cleanup(); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+}
+
+// TestXFSDiscoveryFailureFailsClosed pins that an unknown project-ID space is
+// not treated as empty.
+func TestXFSDiscoveryFailureFailsClosed(t *testing.T) {
+	resetProjectIDPools(t)
+	t.Setenv(xfsProjectIDBaseEnv, "100000")
+	t.Setenv(xfsProjectIDCountEnv, "1")
+	t.Setenv("FAKE_XFS_REPORT_EXIT", "1")
+	script := writeXFSDiscoveryScript(t)
+
+	entry := mountInfoEntry{mountPoint: "/mnt/xfs", device: "8:41", fsType: "xfs"}
+	status, cleanup := setupXFSProjectQuotaOnMount("/mnt/xfs/ws", entry, 1<<20, script)
+	if status.Hard || cleanup != nil {
+		t.Fatalf("failed discovery must not report a hard bound: %+v", status)
+	}
+	if !strings.Contains(status.Detail, "enumerate existing XFS project ids") {
+		t.Fatalf("detail = %q", status.Detail)
+	}
+}
+
+// TestXFSRestartCannotReuseExistingAssignment is the process-boundary
+// regression: process A allocates an ID and leaves the kernel assignment
+// behind; after A disappears (the Go pool is reset), process B must not
+// allocate the same ID.
+func TestXFSRestartCannotReuseExistingAssignment(t *testing.T) {
+	resetProjectIDPools(t)
+	t.Setenv(xfsProjectIDBaseEnv, "100000")
+	t.Setenv(xfsProjectIDCountEnv, "1")
+	t.Setenv("FAKE_XFS_REPORT", "")
+	script := writeXFSDiscoveryScript(t)
+	entry := mountInfoEntry{mountPoint: "/mnt/xfs", device: "8:42", fsType: "xfs"}
+
+	first, cleanup := setupXFSProjectQuotaOnMount("/mnt/xfs/ws-a", entry, 1<<20, script)
+	if !first.Hard || cleanup == nil {
+		t.Fatalf("process A setup = %+v", first)
+	}
+	// Process A dies WITHOUT cleanup: the kernel assignment for 100000 stays.
+	// Process B starts with an empty Go allocator but the same filesystem.
+	xfsProjectIDPools.mu.Lock()
+	xfsProjectIDPools.m = map[string]*projectIDPool{}
+	xfsProjectIDPools.mu.Unlock()
+	t.Setenv("FAKE_XFS_REPORT", "#100000\n")
+
+	second, cleanupB := setupXFSProjectQuotaOnMount("/mnt/xfs/ws-b", entry, 1<<20, script)
+	if second.Hard || cleanupB != nil {
+		t.Fatalf("process B reused a live project ID: %+v", second)
+	}
+	if !strings.Contains(second.Detail, "allocate XFS project id") || !strings.Contains(second.Detail, "exhausted") {
+		t.Fatalf("process B detail = %q, want allocation exhaustion (no reuse)", second.Detail)
 	}
 }

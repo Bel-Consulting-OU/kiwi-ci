@@ -131,6 +131,12 @@ type ContainerBackend struct {
 	// labels applied to the job container so GC can find stale ones.
 	RunID string
 	JobID string
+	// RunnerID and InstanceID identify the owning runner process incarnation
+	// (kiwi.runner/kiwi.instance labels): a restarted runner reaps its own
+	// previous incarnation's containers immediately instead of waiting for the
+	// age-based GC backstop.
+	RunnerID   string
+	InstanceID string
 	// RequireImmutableImages rejects images that are not pinned by an
 	// @sha256: digest. Set by the executor from Options for untrusted jobs.
 	RequireImmutableImages bool
@@ -139,6 +145,9 @@ type ContainerBackend struct {
 	Rootless bool
 	// ReadOnlyRootFS mounts the job container root filesystem read-only.
 	ReadOnlyRootFS bool
+	// NonRoot demands the workload not run as container UID 0 on a rootful
+	// daemon (see pipeline.Sandbox.NonRoot for the rootless semantics).
+	NonRoot bool
 	// Resources carries the job's resource requests, rendered into docker
 	// run flags by StartJob. Values are already admission-checked by
 	// pipeline validation; zero requests produce no flags. resources.disk
@@ -267,15 +276,17 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 		args = append(args, "--cgroup-parent="+b.CgroupParent)
 	}
 	args = append(args, resourceArgsFor(b.Resources)...)
-	args = append(args, containerLabels(b.RunID, b.JobID)...)
-	if b.Rootless || b.ReadOnlyRootFS {
-		plan := planHardenedContainer(b.Rootless)
-		args = append(args,
-			"--read-only",
-			"--tmpfs", "/tmp:rw,nosuid,nodev",
-			"--tmpfs", "/run:rw,nosuid,nodev",
-			"--user="+plan.User,
-		)
+	args = append(args, containerLabelsOwned(b.RunID, b.JobID, runtimeOwner{RunnerID: b.RunnerID, InstanceID: b.InstanceID})...)
+	if b.Rootless || b.ReadOnlyRootFS || b.NonRoot {
+		plan := b.containerUserPlan()
+		args = append(args, "--user="+plan.User)
+		if b.ReadOnlyRootFS {
+			args = append(args,
+				"--read-only",
+				"--tmpfs", "/tmp:rw,nosuid,nodev",
+				"--tmpfs", "/run:rw,nosuid,nodev",
+			)
+		}
 		if plan.ProvisionWorkspace {
 			restore, perr := provisionWorkspace(abs, plan.UID, plan.GID, false)
 			if perr != nil {
@@ -725,4 +736,19 @@ func streamCommand(ctx context.Context, cmd *exec.Cmd, emit func(string)) error 
 		return &RunError{Kind: kind, Err: err}
 	}
 	return nil
+}
+
+// containerUserPlan resolves the container user/provisioning plan for the
+// configured sandbox requirements. Documented non_root semantics: on a
+// ROOTFUL daemon the workload runs as 65534:65534 (and the workspace is
+// provisioned for it); under ROOTLESS Docker container UID 0 lives in a user
+// namespace that cannot map to host root, so it satisfies non_root without
+// assigning an unmapped subuid that could not own the bind-mounted workspace.
+func (b *ContainerBackend) containerUserPlan() hardenedContainerPlan {
+	plan := planHardenedContainer(b.Rootless)
+	if b.NonRoot && b.Rootless {
+		plan.User = "0:0"
+		plan.ProvisionWorkspace = false
+	}
+	return plan
 }

@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -325,11 +326,27 @@ type Config struct {
 	// workspace provisioning). Jobs execute in the directory it populates.
 	CheckoutFn func(ctx context.Context, j model.Job, dir string) error
 }
+
+// newRunnerInstanceID returns a fresh process-incarnation identity used to
+// label runtime resources, so a restarted runner can distinguish its own
+// predecessor's containers from another live runner's.
+func newRunnerInstanceID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return hex.EncodeToString(b[:])
+}
+
 type Runner struct {
-	Cfg     Config
-	ID      string
-	Client  *http.Client
-	Metrics *Metrics
+	Cfg Config
+	ID  string
+	// instanceID is this process incarnation's identity; runtime resources
+	// are labelled with it so a restarted runner reaps only its predecessor's
+	// resources and never another live runner's.
+	instanceID string
+	Client     *http.Client
+	Metrics    *Metrics
 	// StreamClient carries bulk transfers (artifact/cache/snapshot/dependency
 	// uploads and downloads). It deliberately has no total timeout: the
 	// transport bounds dial/TLS-handshake/response-header phases and each
@@ -565,6 +582,18 @@ func (r *Runner) Run(ctx context.Context) error {
 		defer background.Done()
 		_ = prewarmer.run(runCtx)
 	}()
+	if r.instanceID == "" {
+		r.instanceID = newRunnerInstanceID()
+	}
+	// Crash recovery BEFORE the first lease: a SIGKILLed predecessor leaves
+	// detached containers/services/networks behind (their docker run --rm does
+	// not fire on a dead client). Reconcile only resources labelled with THIS
+	// stable runner ID and a previous/absent instance ID, so a replacement
+	// never inherits live runtimes and never touches another runner sharing
+	// the daemon.
+	if rep := executor.ReconcileRuntime(runCtx, r.Cfg.WorkDir, r.ID, r.instanceID); rep.Containers > 0 || rep.Networks > 0 {
+		fmt.Fprintf(os.Stderr, "kiwi runner %s: reconciled previous incarnation runtime: %d container(s), %d network(s)\n", r.ID, rep.Containers, rep.Networks)
+	}
 	lastPrewarm := time.Now()
 	lastGC := time.Now()
 	lastStaging := time.Now()
@@ -1285,7 +1314,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// require image references pinned by digest. The untrusted floor is
 	// unconditional here: nothing may override RequireImmutableImages for
 	// an untrusted job.
-	opts := executor.Options{Workspace: tmp, RunID: t.Job.RunID, Event: t.Job.Event, Branch: branchFromRef(t.Job.Ref), ChangedFiles: resolvedChangedFiles, SecretProvider: provider, Logs: logging.Func(func(job, step, line string) { sink.WriteLine(job, step, line) }), Cache: cacheStore, Artifacts: artifactStore, ArtifactReporter: reporter, DependencyStatus: t.Job.DependencyStatus, NeedsOutputs: t.Job.NeedsOutputs, CacheNamespace: cacheNamespace(t.Job), RequireImmutableImages: !t.Job.Trusted, LifecycleContext: parent}
+	opts := executor.Options{Workspace: tmp, RunID: t.Job.RunID, RunnerID: r.ID, InstanceID: r.instanceID, Event: t.Job.Event, Branch: branchFromRef(t.Job.Ref), ChangedFiles: resolvedChangedFiles, SecretProvider: provider, Logs: logging.Func(func(job, step, line string) { sink.WriteLine(job, step, line) }), Cache: cacheStore, Artifacts: artifactStore, ArtifactReporter: reporter, DependencyStatus: t.Job.DependencyStatus, NeedsOutputs: t.Job.NeedsOutputs, CacheNamespace: cacheNamespace(t.Job), RequireImmutableImages: !t.Job.Trusted, LifecycleContext: parent}
 	if artifactStore != nil {
 		// Capture is bounded by the job context while it is alive (so a job
 		// that exceeds its declared lifetime stops publishing) and by the

@@ -292,12 +292,7 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 	if err != nil {
 		return nil, "", time.Time{}, err
 	}
-	sort.Slice(queued, func(i, j int) bool {
-		if queued[i].Priority != queued[j].Priority {
-			return queued[i].Priority > queued[j].Priority
-		}
-		return queued[i].CreatedAt.Before(queued[j].CreatedAt)
-	})
+	orderQueuedJobs(queued, now)
 	repoConcurrency, teamConcurrency := s.quotaLimits()
 	runJobs := map[string]map[string]model.Job{}
 	envJobs := map[string][]model.Job{}
@@ -866,4 +861,43 @@ func defaultToken() (string, error) {
 // rule (persisted QueueDeadline first, compiled-payload queue_timeout second).
 func QueueDeadlineFor(j model.Job) *time.Time {
 	return storage.QueueDeadlineFor(j)
+}
+
+// Scheduling fairness: a static priority order starves low-priority work
+// forever when a continuous stream of fresh high-priority jobs is available,
+// because age only breaks ties WITHIN a priority class. Waiting time now buys
+// bounded priority: every eligible job becomes competitive with the highest
+// dependency class after at most schedulerAgingInterval *
+// schedulerMaxAgingBoost of waiting, and equal classes are ordered oldest
+// first. Downstream-depth priority is preserved as the primary signal.
+const (
+	schedulerAgingInterval = 10 * time.Minute
+	schedulerMaxAgingBoost = 8
+)
+
+// agedPriority is a job's scheduling priority including the bounded wait-time
+// boost.
+func agedPriority(j model.Job, now time.Time) int {
+	wait := now.Sub(j.CreatedAt)
+	if wait <= 0 {
+		return j.Priority
+	}
+	boost := int(wait / schedulerAgingInterval)
+	if boost > schedulerMaxAgingBoost {
+		boost = schedulerMaxAgingBoost
+	}
+	return j.Priority + boost
+}
+
+// orderQueuedJobs orders lease candidates by aged priority (descending) then
+// age (oldest first). The lease claim walks this order, so the ordering IS the
+// fairness policy.
+func orderQueuedJobs(queued []model.Job, now time.Time) {
+	sort.Slice(queued, func(i, j int) bool {
+		pi, pj := agedPriority(queued[i], now), agedPriority(queued[j], now)
+		if pi != pj {
+			return pi > pj
+		}
+		return queued[i].CreatedAt.Before(queued[j].CreatedAt)
+	})
 }

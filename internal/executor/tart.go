@@ -34,6 +34,9 @@ type TartBackend struct {
 	// timestamp still derive distinct VM names. Set by the executor.
 	RunID string
 	JobID string
+	// RunnerID and InstanceID identify the owning runner process incarnation.
+	RunnerID   string
+	InstanceID string
 	// RequireImmutableImages rejects VM references that are not pinned by an
 	// @sha256: digest. Set by the executor from Options for untrusted jobs.
 	RequireImmutableImages bool

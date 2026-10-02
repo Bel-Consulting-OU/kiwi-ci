@@ -5,9 +5,11 @@ package executor
 // cleanup callbacks must stay retryable until they succeed.
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -160,5 +162,59 @@ func TestTartMissingCloneClearsState(t *testing.T) {
 	}
 	if b.clone != "" {
 		t.Fatalf("clone not cleared after proven absence: %q", b.clone)
+	}
+}
+
+// TestContainerLabelsOwnedIncludesRunnerIdentity pins the label contract used
+// by crash reconciliation.
+func TestContainerLabelsOwnedIncludesRunnerIdentity(t *testing.T) {
+	got := strings.Join(containerLabelsOwned("run1", "job1", runtimeOwner{RunnerID: "runner-a", InstanceID: "inst-1"}), " ")
+	for _, want := range []string{"kiwi.run=run1", "kiwi.job=job1", "kiwi.runner=runner-a", "kiwi.instance=inst-1"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("labels %q missing %s", got, want)
+		}
+	}
+	// Legacy (no runner identity) stays unlabelled beyond run/job.
+	if got := strings.Join(containerLabelsOwned("run1", "job1", runtimeOwner{}), " "); strings.Contains(got, "kiwi.runner") {
+		t.Fatalf("empty owner produced runner labels: %q", got)
+	}
+}
+
+// TestReconcileRuntimeReapsOnlyOwnPredecessor pins the crash-recovery
+// boundary: containers/networks carrying THIS runner's stable ID with a
+// previous (or absent) instance label are removed, while the current
+// incarnation's resources and (implicitly) other runners' labels are left
+// alone.
+func TestReconcileRuntimeReapsOnlyOwnPredecessor(t *testing.T) {
+	installFakeBins(t)
+	current := "inst-current"
+	t.Setenv("FAKE_DOCKER_PS", "c-old inst-old\nc-current "+current+"\nc-legacy")
+	t.Setenv("FAKE_DOCKER_NET_LS", "net-old inst-old\nnet-current "+current)
+	log := filepath.Join(t.TempDir(), "docker.log")
+	t.Setenv("FAKE_DOCKER_LOG", log)
+
+	rep := ReconcileRuntime(context.Background(), t.TempDir(), "runner-a", current)
+	if rep.Containers != 2 || rep.Networks != 1 {
+		t.Fatalf("reconcile report = %+v, want 2 containers / 1 network", rep)
+	}
+	data, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logged := string(data)
+	for _, want := range []string{"rm -f c-old", "rm -f c-legacy", "network rm net-old"} {
+		if !strings.Contains(logged, want) {
+			t.Fatalf("reconcile did not issue %q:\n%s", want, logged)
+		}
+	}
+	for _, forbidden := range []string{"rm -f c-current", "network rm net-current"} {
+		if strings.Contains(logged, forbidden) {
+			t.Fatalf("reconcile touched the CURRENT incarnation's resource: %q", forbidden)
+		}
+	}
+
+	// No stable identity: nothing is enumerated or removed.
+	if rep := ReconcileRuntime(context.Background(), t.TempDir(), "", current); rep != (GCReport{}) {
+		t.Fatalf("empty runner id reconciled %+v", rep)
 	}
 }

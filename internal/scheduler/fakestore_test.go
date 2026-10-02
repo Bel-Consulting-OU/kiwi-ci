@@ -1202,8 +1202,8 @@ func (f *fakeStore) UpsertDelivery(ctx context.Context, forge, deliveryID string
 	return nil
 }
 
-func (f *fakeStore) FindDelivery(ctx context.Context, forge, deliveryID string) (string, bool, error) {
-	return "", false, nil
+func (f *fakeStore) FindDelivery(ctx context.Context, forge, deliveryID string) (string, string, bool, error) {
+	return "", "", false, nil
 }
 
 func (f *fakeStore) TryAcquireLeadership(ctx context.Context, key string, ttl time.Duration) (bool, error) {

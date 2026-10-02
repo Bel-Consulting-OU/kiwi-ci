@@ -34,8 +34,15 @@ type Options struct {
 	// per-task clones instead).
 	WorkspaceFor func(jobID string) (string, func(), error)
 	RunID        string
-	MaxParallel  int
-	OnlyJob      string
+	// RunnerID and InstanceID identify the owning runner process incarnation
+	// so runtime resources can be reconciled after a crash: every container,
+	// service container and network is labelled with both, and a restarted
+	// runner reaps only resources carrying ITS stable RunnerID but a previous
+	// InstanceID. Empty values keep the legacy unlabelled behavior.
+	RunnerID    string
+	InstanceID  string
+	MaxParallel int
+	OnlyJob     string
 	// OnlyStep, when set, executes just the named step (by step ID or by
 	// resolved name, including canary./verify./rollback. prefixes) of the
 	// selected job. Used by `kiwi replay RUN JOB STEP`. Steps that do not
@@ -474,6 +481,14 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			e.log(cj.ID, "cache", "miss "+cacheName(c))
 		}
 	}
+	// Sandbox requirements must never be silently unenforced: native and tart
+	// cannot pin the workload to a non-root uid, so a non_root requirement is
+	// refused there before anything starts.
+	if err := unsupportedSandboxRequirement(cj.Job.Runtime, cj.Job.Sandbox); err != nil {
+		res.Status = model.StatusFailure
+		res.Error = err.Error()
+		return finish(res)
+	}
 	networkPolicy := cj.Job.Sandbox.Network
 	if networkPolicy == pipeline.NetworkPolicyDefault && cj.Job.Network == "none" {
 		networkPolicy = pipeline.NetworkPolicyNone
@@ -542,7 +557,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		}
 		isolated := networkPolicy == pipeline.NetworkPolicyNone || networkPolicy == pipeline.NetworkPolicyServicesOnly
 		var er error
-		network, cleanupServices, er = startContainerServices(ctx, e.Opt.RunID, cj.ID, cj.Job.Services, cj.Job.Resources, isolated, e.Opt.RequireImmutableImages, cgroupParent, func(line string) { e.log(cj.ID, "service", line) })
+		network, cleanupServices, er = startContainerServicesOwned(ctx, e.Opt.RunID, cj.ID, runtimeOwner{RunnerID: e.Opt.RunnerID, InstanceID: e.Opt.InstanceID}, cj.Job.Services, cj.Job.Resources, isolated, e.Opt.RequireImmutableImages, cgroupParent, func(line string) { e.log(cj.ID, "service", line) })
 		if er != nil {
 			res.Status = model.StatusFailure
 			res.Error = er.Error()
@@ -565,8 +580,11 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		b.RequireImmutableImages = e.Opt.RequireImmutableImages
 		b.Rootless = cj.Job.Sandbox.Rootless
 		b.ReadOnlyRootFS = cj.Job.Sandbox.ReadOnlyRootFS
+		b.NonRoot = cj.Job.Sandbox.NonRoot
 		b.RunID = e.Opt.RunID
 		b.JobID = cj.ID
+		b.RunnerID = e.Opt.RunnerID
+		b.InstanceID = e.Opt.InstanceID
 		b.Resources = cj.Job.Resources
 		b.Untrusted = e.Opt.Untrusted
 		b.UntrustedDiskMaxBytes = e.Opt.UntrustedWorkspaceMaxBytes
@@ -576,6 +594,8 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	case *TartBackend:
 		b.RunID = e.Opt.RunID
 		b.JobID = cj.ID
+		b.RunnerID = e.Opt.RunnerID
+		b.InstanceID = e.Opt.InstanceID
 		b.RequireImmutableImages = e.Opt.RequireImmutableImages
 		if e.Opt.TartAgentPort > 0 {
 			b.AgentPort = e.Opt.TartAgentPort
@@ -1354,4 +1374,14 @@ func effectiveStepRetry(st pipeline.Step, job pipeline.Job, defaults pipeline.De
 		retry.Max = pipeline.MaxStepRetries
 	}
 	return retry
+}
+
+// unsupportedSandboxRequirement refuses sandbox requirements the runtime
+// cannot actually enforce. A security requirement accepted but silently
+// unenforced is worse than a refusal.
+func unsupportedSandboxRequirement(runtime string, sandbox pipeline.Sandbox) error {
+	if sandbox.NonRoot && runtime != "container" {
+		return fmt.Errorf("sandbox non_root cannot be enforced by the %s runtime", runtime)
+	}
+	return nil
 }
