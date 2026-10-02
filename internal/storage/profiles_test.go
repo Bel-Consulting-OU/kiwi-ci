@@ -63,7 +63,7 @@ func TestMemStoreProfilesAndTokens(t *testing.T) {
 func TestMemStoreConcurrentGrantConsumeOneWinner(t *testing.T) {
 	ctx := context.Background()
 	m := newMemStore()
-	if err := m.PutEnrollGrant(ctx, "digest", time.Now().Add(time.Hour), []string{"a"}); err != nil {
+	if _, err := m.PutEnrollGrantWithTTL(ctx, "digest", time.Hour, []string{"a"}); err != nil {
 		t.Fatal(err)
 	}
 	const n = 16
@@ -91,9 +91,9 @@ func TestMemStoreConcurrentGrantConsumeOneWinner(t *testing.T) {
 	if _, err := m.ConsumeEnrollGrant(ctx, "missing", "runner-x"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown digest: %v", err)
 	}
-	if err := m.PutEnrollGrant(ctx, "expired", time.Now().Add(-time.Minute), nil); err != nil {
-		t.Fatal(err)
-	}
+	m.mu.Lock()
+	m.grants["expired"] = EnrollGrantRecord{ExpiresAt: time.Now().UTC().Add(-time.Minute)}
+	m.mu.Unlock()
 	if _, err := m.ConsumeEnrollGrant(ctx, "expired", "runner-x"); !errors.Is(err, ErrGrantExpired) {
 		t.Fatalf("expired grant: %v", err)
 	}

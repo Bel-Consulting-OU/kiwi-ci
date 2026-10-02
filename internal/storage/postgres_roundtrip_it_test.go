@@ -1104,7 +1104,7 @@ func TestPostgresIntegrationProfilesTokensRevocationsGrants(t *testing.T) {
 	if _, err := st.ConsumeEnrollGrant(ctx, "unknown", "admin"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown grant = %v", err)
 	}
-	if err := st.PutEnrollGrant(ctx, "digest", time.Now().UTC().Add(time.Hour), []string{"linux"}); err != nil {
+	if _, err := st.PutEnrollGrantWithTTL(ctx, "digest", time.Hour, []string{"linux"}); err != nil {
 		t.Fatalf("PutEnrollGrant: %v", err)
 	}
 	rec, ok, err := st.GetEnrollGrant(ctx, "digest")
@@ -1121,8 +1121,11 @@ func TestPostgresIntegrationProfilesTokensRevocationsGrants(t *testing.T) {
 	if _, err := st.ConsumeEnrollGrant(ctx, "digest", "admin"); !errors.Is(err, ErrGrantConsumed) {
 		t.Fatalf("second consume = %v, want ErrGrantConsumed", err)
 	}
-	if err := st.PutEnrollGrant(ctx, "expired", time.Now().UTC().Add(-time.Minute), nil); err != nil {
+	if _, err := st.PutEnrollGrantWithTTL(ctx, "expired", time.Hour, nil); err != nil {
 		t.Fatalf("PutEnrollGrant expired: %v", err)
+	}
+	if _, err := st.pool.Exec(ctx, `UPDATE enrollment_grants SET expires_at = clock_timestamp() - interval '1 minute' WHERE digest='expired'`); err != nil {
+		t.Fatalf("expire grant: %v", err)
 	}
 	if _, err := st.ConsumeEnrollGrant(ctx, "expired", "admin"); !errors.Is(err, ErrGrantExpired) {
 		t.Fatalf("expired consume = %v, want ErrGrantExpired", err)

@@ -3,11 +3,13 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/scheduler"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
@@ -362,5 +364,41 @@ func TestScheduleStableLeaderSeesNewScheduleFromReplica(t *testing.T) {
 	}
 	if len(occ) == 0 {
 		t.Fatal("discovered schedule did not fire its due occurrence")
+	}
+}
+
+// TestDBScheduleFireTimeUsesDatabaseClockNotApplicationClock pins the due-time
+// source: DB mode evaluates schedules at the store's clock, so a leader with
+// an ahead/behind application clock cannot fire early or postpone a due
+// occurrence; a missing capability or a failed clock read skips the tick
+// instead of falling back to the replica clock.
+func TestDBScheduleFireTimeUsesDatabaseClockNotApplicationClock(t *testing.T) {
+	f := newDBFakeStore()
+	s := New("token")
+	s.DB = f
+	s.Sched = scheduler.NewDB(f, time.Minute, nil, nil)
+	wall := time.Now().UTC().Truncate(time.Microsecond)
+	dbNow := wall.Add(2 * time.Hour)
+	f.mu.Lock()
+	f.leaseNow = func() time.Time { return dbNow }
+	f.mu.Unlock()
+
+	got, ok := s.scheduleFireNow(context.Background(), wall)
+	if !ok || !got.Equal(dbNow) {
+		t.Fatalf("scheduleFireNow = (%v, %t), want the store clock %v", got, ok, dbNow)
+	}
+
+	// A failed clock read skips the tick rather than using the tick time.
+	f.mu.Lock()
+	f.clockErr = errors.New("database down")
+	f.mu.Unlock()
+	if got, ok := s.scheduleFireNow(context.Background(), wall); ok {
+		t.Fatalf("failed clock read produced a due time %v; the tick must be skipped", got)
+	}
+
+	// A DB store without the ClockStore capability also fails closed.
+	s.DB = struct{ storage.Store }{Store: f}
+	if got, ok := s.scheduleFireNow(context.Background(), wall); ok {
+		t.Fatalf("store without ClockStore produced a due time %v; the tick must be skipped", got)
 	}
 }

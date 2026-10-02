@@ -452,6 +452,16 @@ In **DB mode the database clock is the authority for a lease's lifetime**:
   `deployment.started` is audited exactly once. The explicit record endpoint
   requires an actually running job and derives `StartedAt` from the job, and
   `SwitchToDB` refuses a store without the deployment contract at startup.
+- **Enrollment grants, outbox claims, OIDC lifetimes and DB schedules share
+  the database clock.** Grant creation takes a TTL and stores
+  `clock_timestamp() + TTL`, the DB gate asks the store for liveness, and
+  consumption locks the row before sampling the clock; outbox claim due/cutoff
+  predicates and the `claimed_at` stamp are all `clock_timestamp()`
+  (TTL in SQL); the OIDC commit derives the JWT `iat`/`exp` and the audit
+  instant from its commit clock; and DB-mode schedule due evaluation reads
+  `ClockStore.Now`, skipping the tick rather than using the leader's wall
+  clock. A skewed replica can neither extend a credential or claim, steal a
+  live claim, nor fire or postpone a due schedule.
 - **Heartbeats touch only `last_seen`.** The runner liveness refresh is a
   narrow `RunnerHeartbeatStore.TouchRunnerLastSeen`
   (`UPDATE runners SET last_seen=clock_timestamp()`), never a whole-row

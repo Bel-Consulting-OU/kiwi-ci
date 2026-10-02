@@ -435,6 +435,23 @@ func (f *FaultyStore) UpsertRunner(ctx context.Context, runner model.Runner) err
 	return f.Inner.UpsertRunner(ctx, runner)
 }
 
+// Now forwards the inner store's ClockStore implementation while injecting
+// the configured mutation fault.
+func (f *FaultyStore) Now(ctx context.Context) (time.Time, error) {
+	inner, ok := f.Inner.(ClockStore)
+	if !ok {
+		return time.Time{}, errMissingInnerInterface("ClockStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return time.Time{}, err
+	}
+	return inner.Now(ctx)
+}
+
+var _ ClockStore = (*FaultyStore)(nil)
+
 // TouchRunnerLastSeen forwards the narrow heartbeat liveness refresh to the
 // inner store's RunnerHeartbeatStore implementation (when present) while
 // injecting the configured mutation fault.
@@ -1639,17 +1656,25 @@ func (f *FaultyStore) CertRevoked(ctx context.Context, serial string) (bool, err
 	return inner.CertRevoked(ctx, serial)
 }
 
-func (f *FaultyStore) PutEnrollGrant(ctx context.Context, digest string, expiresAt time.Time, boundLabels []string) error {
+func (f *FaultyStore) PutEnrollGrantWithTTL(ctx context.Context, digest string, ttl time.Duration, boundLabels []string) (time.Time, error) {
 	inner, ok := f.Inner.(EnrollGrantStore)
 	if !ok {
-		return errMissingInnerInterface("EnrollGrantStore")
+		return time.Time{}, errMissingInnerInterface("EnrollGrantStore")
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
-		return err
+		return time.Time{}, err
 	}
-	return inner.PutEnrollGrant(ctx, digest, expiresAt, boundLabels)
+	return inner.PutEnrollGrantWithTTL(ctx, digest, ttl, boundLabels)
+}
+
+func (f *FaultyStore) EnrollGrantLive(ctx context.Context, digest string) (bool, error) {
+	inner, ok := f.Inner.(EnrollGrantStore)
+	if !ok {
+		return false, errMissingInnerInterface("EnrollGrantStore")
+	}
+	return inner.EnrollGrantLive(ctx, digest)
 }
 
 func (f *FaultyStore) GetEnrollGrant(ctx context.Context, digest string) (EnrollGrantRecord, bool, error) {
@@ -2538,6 +2563,14 @@ func (m *memStore) UpdateRunnerProfileFields(ctx context.Context, runner model.R
 }
 
 var _ RunnerProfileUpdateStore = (*memStore)(nil)
+
+// Now implements ClockStore: a single process has one clock, so the
+// application clock IS the store clock here.
+func (m *memStore) Now(ctx context.Context) (time.Time, error) {
+	return time.Now().UTC(), nil
+}
+
+var _ ClockStore = (*memStore)(nil)
 
 // TouchRunnerLastSeen implements RunnerHeartbeatStore: single-process
 // semantics use the monotonic application clock, and only the advisory
@@ -5547,11 +5580,34 @@ func (m *memStore) CertRevoked(ctx context.Context, serial string) (bool, error)
 	return ok, nil
 }
 
-func (m *memStore) PutEnrollGrant(ctx context.Context, digest string, expiresAt time.Time, boundLabels []string) error {
+// PutEnrollGrantWithTTL mirrors the SQL contract in this store's own clock:
+// the expiry is derived here from the TTL, so the caller never supplies an
+// absolute instant. A duplicate digest is refused like the SQL
+// ON CONFLICT DO NOTHING (a fresh 256-bit token makes it impossible).
+func (m *memStore) PutEnrollGrantWithTTL(ctx context.Context, digest string, ttl time.Duration, boundLabels []string) (time.Time, error) {
+	if digest == "" {
+		return time.Time{}, fmt.Errorf("storage: enroll grant digest is required")
+	}
+	if ttl <= 0 {
+		return time.Time{}, fmt.Errorf("storage: enroll grant ttl must be positive")
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.grants[digest] = EnrollGrantRecord{ExpiresAt: expiresAt, BoundLabels: append([]string(nil), boundLabels...)}
-	return nil
+	if _, exists := m.grants[digest]; exists {
+		return time.Time{}, fmt.Errorf("storage: enrollment grant digest already exists")
+	}
+	expires := time.Now().UTC().Add(ttl)
+	m.grants[digest] = EnrollGrantRecord{ExpiresAt: expires, BoundLabels: append([]string(nil), boundLabels...)}
+	return expires, nil
+}
+
+// EnrollGrantLive reports liveness in this store's clock domain (single
+// process: the application clock, where skew is not a concept).
+func (m *memStore) EnrollGrantLive(ctx context.Context, digest string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rec, ok := m.grants[digest]
+	return ok && !rec.Consumed && time.Now().UTC().Before(rec.ExpiresAt), nil
 }
 
 func (m *memStore) GetEnrollGrant(ctx context.Context, digest string) (EnrollGrantRecord, bool, error) {
@@ -6128,32 +6184,34 @@ func (m *memStore) DisableRunnerAndRevokeCert(ctx context.Context, runnerID, cer
 // CommitOIDCIssuance is the in-memory mirror of the SQL transactional
 // issuance commit: under m.mu — this store's transaction — the authoritative
 // job is re-read, the shared issuance predicate (lease holder/generation/
-// token hash, status, lease and token lifetime expiry, trust, permission,
-// audience) and the claim binding are evaluated at the store commit clock
-// (time.Now().UTC() under the lock, this store's clock domain), and the
-// oidc.issued audit event is appended in the same critical section. A refusal
-// returns the same typed error as the SQL store and appends NOTHING.
-func (m *memStore) CommitOIDCIssuance(ctx context.Context, req OIDCIssuance) (LockedOIDCIdentity, error) {
+// token hash, status, lease expiry, trust, permission, audience) and the
+// claim binding are evaluated at the store commit clock (time.Now().UTC()
+// under the lock, this store's clock domain), and the oidc.issued audit
+// event is appended in the same critical section. The returned credential
+// lifetime derives from that same commit clock, so the JWT window can never
+// disagree with the predicate that authorized it. A refusal returns the same
+// typed error as the SQL store and appends NOTHING.
+func (m *memStore) CommitOIDCIssuance(ctx context.Context, req OIDCIssuance) (OIDCIssuanceResult, error) {
 	if err := ValidateOIDCIssuanceRequest(req); err != nil {
-		return LockedOIDCIdentity{}, err
+		return OIDCIssuanceResult{}, err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	j, ok := m.jobs[req.JobID]
 	if !ok {
-		return LockedOIDCIdentity{}, ErrNotFound
+		return OIDCIssuanceResult{}, ErrNotFound
 	}
 	commitNow := time.Now().UTC()
 	locked := LockedOIDCIdentityForJob(j)
 	if err := ValidateOIDCIssuanceAt(locked, req, commitNow); err != nil {
-		return LockedOIDCIdentity{}, err
+		return OIDCIssuanceResult{}, err
 	}
 	auditID, err := newID()
 	if err != nil {
-		return LockedOIDCIdentity{}, err
+		return OIDCIssuanceResult{}, err
 	}
-	m.audit = append(m.audit, OIDCIssuanceAuditEvent(req, auditID))
-	return locked, nil
+	m.audit = append(m.audit, OIDCIssuanceAuditEvent(req, auditID, commitNow))
+	return OIDCIssuanceResult{Identity: locked, IssuedAt: commitNow, ExpiresAt: commitNow.Add(req.TTL)}, nil
 }
 
 // CommitOIDCIssuance forwards the faulted backend's inner implementation
@@ -6161,15 +6219,15 @@ func (m *memStore) CommitOIDCIssuance(ctx context.Context, req OIDCIssuance) (Lo
 // mutating extension methods: the predicate and the identity binding are the
 // inner implementation's contract and the wrapper never writes anything
 // itself, so a forwarding call cannot bypass either.
-func (f *FaultyStore) CommitOIDCIssuance(ctx context.Context, req OIDCIssuance) (LockedOIDCIdentity, error) {
+func (f *FaultyStore) CommitOIDCIssuance(ctx context.Context, req OIDCIssuance) (OIDCIssuanceResult, error) {
 	inner, ok := f.Inner.(LeaseOIDCIssueStore)
 	if !ok {
-		return LockedOIDCIdentity{}, errMissingInnerInterface("LeaseOIDCIssueStore")
+		return OIDCIssuanceResult{}, errMissingInnerInterface("LeaseOIDCIssueStore")
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
-		return LockedOIDCIdentity{}, err
+		return OIDCIssuanceResult{}, err
 	}
 	return inner.CommitOIDCIssuance(ctx, req)
 }

@@ -51,11 +51,10 @@ func oidcITLeasedJob(t *testing.T, st *PostgresStore) (runID, jobID, runnerID st
 
 // oidcITRequest builds the candidate issuance for the leased job.
 func oidcITRequest(j model.Job, audience string) OIDCIssuance {
-	now := time.Now().UTC()
 	req := OIDCIssuance{
 		JobID: j.ID, RunnerID: j.LeaseRunnerID, LeaseGeneration: j.LeaseGeneration,
 		LeaseTokenHash: j.LeaseTokenHash, Audience: audience,
-		KID: "kid-1", JTI: "jti-1", IssuedAt: now, ExpiresAt: now.Add(5 * time.Minute),
+		KID: "kid-1", JTI: "jti-1", TTL: 5 * time.Minute,
 		Claims: map[string]string{
 			OIDCClaimJobID:        j.ID,
 			OIDCClaimRunID:        j.RunID,
@@ -90,10 +89,11 @@ func oidcITIssuedAudits(t *testing.T, st *PostgresStore, jobID string) int {
 func TestIntegrationOIDCIssuanceCommitLive(t *testing.T) {
 	st := pgITStore(t)
 	runID, jobID, runnerID, j := oidcITLeasedJob(t, st)
-	locked, err := st.CommitOIDCIssuance(context.Background(), oidcITRequest(j, oidcITAudience))
+	result, err := st.CommitOIDCIssuance(context.Background(), oidcITRequest(j, oidcITAudience))
 	if err != nil {
 		t.Fatalf("CommitOIDCIssuance: %v", err)
 	}
+	locked := result.Identity
 	if locked.JobID != jobID || locked.RunID != runID || locked.JobKey != j.Key {
 		t.Fatalf("locked identity = %+v", locked)
 	}
@@ -120,7 +120,7 @@ func TestIntegrationOIDCIssuanceCommitLive(t *testing.T) {
 		"environment":   j.Environment,
 		"trusted":       true,
 	}
-	claims := ident.TokenClaims("https://issuer.example.com", oidcITAudience, "jti-it", oidcITRequest(j, oidcITAudience).IssuedAt, oidcITRequest(j, oidcITAudience).ExpiresAt)
+	claims := ident.TokenClaims("https://issuer.example.com", oidcITAudience, "jti-it", result.IssuedAt, result.ExpiresAt)
 	for key, want := range wantClaims {
 		if claims[key] != want {
 			t.Fatalf("token claim %q = %v, want the locked value %v", key, claims[key], want)
@@ -300,13 +300,12 @@ func TestIntegrationOIDCIssuanceCommitConcurrentReplacementBarrier(t *testing.T)
 
 // TestIntegrationOIDCIssuanceCommitBarrierLeaseExpiry is the W2-A race
 // regression on real PostgreSQL: the handler authenticated the lease while it
-// was live (the request's IssuedAt precedes the expiry), then the signer/
-// key-ring stall (the outer transaction's row lock) outlasts the lease expiry
-// WITHOUT any row change. The blocked issuance must judge the expiry at the
-// database commit clock (clock_timestamp() evaluated after the lock is
-// acquired), refuse with ErrOIDCIssuanceExpired and write no audit row. The
-// pre-fix predicate compared the expiry to the stale IssuedAt and would have
-// committed a token here.
+// was live, then the signer/key-ring stall (the outer transaction's row lock)
+// outlasts the lease expiry WITHOUT any row change. The blocked issuance must
+// judge the expiry at the database commit clock (clock_timestamp() evaluated
+// after the lock is acquired), refuse with ErrOIDCIssuanceExpired and write
+// no audit row. The pre-fix predicate compared the expiry to a stale
+// handler-captured instant and would have committed a token here.
 func TestIntegrationOIDCIssuanceCommitBarrierLeaseExpiry(t *testing.T) {
 	st := pgITStore(t)
 	ctx := context.Background()
@@ -354,25 +353,53 @@ func TestIntegrationOIDCIssuanceCommitBarrierLeaseExpiry(t *testing.T) {
 	}
 }
 
-// TestIntegrationOIDCIssuanceCommitRefusesElapsedLifetime pins the second
-// commit-clock condition on real PostgreSQL: a candidate whose intended
-// lifetime already elapsed (exp before the database commit clock) is refused
-// with the same typed expiry, even though the lease is still live and the
-// stale IssuedAt comparison would have accepted it.
-func TestIntegrationOIDCIssuanceCommitRefusesElapsedLifetime(t *testing.T) {
+// TestIntegrationOIDCIssuanceCommitRefusesNonPositiveTTL pins the lifetime
+// shape on real PostgreSQL: the caller supplies a TTL, and a non-positive one
+// is refused before any transaction (the absolute window is derived from the
+// commit clock, so there is no caller-controlled instant to backdate or
+// extend).
+func TestIntegrationOIDCIssuanceCommitRefusesNonPositiveTTL(t *testing.T) {
 	st := pgITStore(t)
 	ctx := context.Background()
 	_, jobID, _, j := oidcITLeasedJob(t, st)
 
 	req := oidcITRequest(j, oidcITAudience)
-	now := time.Now().UTC()
-	req.IssuedAt = now.Add(-2 * time.Hour)
-	req.ExpiresAt = now.Add(-time.Hour)
-	if _, err := st.CommitOIDCIssuance(ctx, req); !errors.Is(err, ErrOIDCIssuanceExpired) {
-		t.Fatalf("commit with an elapsed requested lifetime = %v, want ErrOIDCIssuanceExpired", err)
+	req.TTL = 0
+	if _, err := st.CommitOIDCIssuance(ctx, req); !errors.Is(err, ErrOIDCIssuanceInvalid) {
+		t.Fatalf("commit with a zero token ttl = %v, want ErrOIDCIssuanceInvalid", err)
 	}
 	if n := oidcITIssuedAudits(t, st, jobID); n != 0 {
-		t.Fatalf("expired-lifetime issuance appended %d audit rows", n)
+		t.Fatalf("invalid-ttl issuance appended %d audit rows", n)
+	}
+}
+
+// TestIntegrationOIDCIssuanceLifetimeUsesCommitClock pins the credential
+// window: IssuedAt is the database commit clock and ExpiresAt is exactly that
+// instant plus the requested TTL, with the durable audit row carrying the
+// same instant. No serving-replica clock influences any of the three.
+func TestIntegrationOIDCIssuanceLifetimeUsesCommitClock(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	_, jobID, _, j := oidcITLeasedJob(t, st)
+
+	before := leaseClockITDBNow(t, st)
+	result, err := st.CommitOIDCIssuance(ctx, oidcITRequest(j, oidcITAudience))
+	if err != nil {
+		t.Fatalf("CommitOIDCIssuance: %v", err)
+	}
+	after := leaseClockITDBNow(t, st)
+	if result.IssuedAt.Before(before.Add(-time.Second)) || result.IssuedAt.After(after.Add(time.Second)) {
+		t.Fatalf("IssuedAt %v outside the database commit window [%v, %v]", result.IssuedAt, before, after)
+	}
+	if !result.ExpiresAt.Equal(result.IssuedAt.Add(5 * time.Minute)) {
+		t.Fatalf("ExpiresAt %v != IssuedAt %v + 5m", result.ExpiresAt, result.IssuedAt)
+	}
+	var createdAt time.Time
+	if err := st.pool.QueryRow(ctx, `SELECT created_at FROM audit_events WHERE action='oidc.issued' AND job_id=$1`, jobID).Scan(&createdAt); err != nil {
+		t.Fatal(err)
+	}
+	if !createdAt.UTC().Equal(result.IssuedAt) {
+		t.Fatalf("audit created_at %v != commit IssuedAt %v", createdAt.UTC(), result.IssuedAt)
 	}
 }
 

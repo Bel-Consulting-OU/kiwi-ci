@@ -24,12 +24,35 @@ func (s *Server) recordDeploymentLocked(j model.Job, startedAt time.Time) model.
 	if d, ok := s.deployments[j.ID]; ok {
 		return d
 	}
+	if j.StartedAt != nil {
+		// The job carries the authoritative first-start instant: a retried
+		// lease must not re-stamp the deployment with a later attempt's
+		// clock.
+		startedAt = *j.StartedAt
+	}
 	// ApprovedAt is nil: the job tracks ApprovedBy but not the approval
 	// timestamp.
 	d := deploy.NewDeployment(j, j.ApprovedBy, nil, &startedAt)
 	s.deployments[j.ID] = d
 	s.auditLocked("deployment.started", "scheduler", j.RunID, j.ID, "deployment started", map[string]string{"environment": j.Environment})
 	return d
+}
+
+// installDeploymentMirror caches the canonical durable deployment record for
+// one job unless a concurrent writer already installed a record. Writers
+// persist durably BEFORE touching the mirror, so a record that arrived while
+// our durable store call was in flight is at least as new as ours (the
+// completion effect can finish the row between our insert and this call):
+// the mirror must never regress to an older snapshot. It returns the record
+// the mirror holds after the call.
+func (s *Server) installDeploymentMirror(jobID string, rec model.Deployment) model.Deployment {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cur, ok := s.deployments[jobID]; ok {
+		return cur
+	}
+	s.deployments[jobID] = rec
+	return rec
 }
 
 // recordDeploymentDB creates the deployment record in DB mode. The durable
@@ -53,20 +76,29 @@ func (s *Server) recordDeploymentDB(ctx context.Context, j model.Job, startedAt 
 		// depth for direct wiring.
 		return model.Deployment{}, errDeploymentStoreUnsupported
 	}
+	if j.StartedAt != nil {
+		// The job row is the authority on when the work actually started:
+		// the claim transaction stamped started_at with the database clock,
+		// so the deployment can never disagree with the job (or float with
+		// the calling replica's clock).
+		startedAt = *j.StartedAt
+	}
 	d, created, err := ds.InsertDeploymentOnce(ctx, deploy.NewDeployment(j, j.ApprovedBy, nil, &startedAt))
 	if err != nil {
 		return model.Deployment{}, err
 	}
-	s.mu.Lock()
-	s.deployments[j.ID] = d
-	s.mu.Unlock()
+	// Install the canonical record without regressing a newer state that a
+	// concurrent writer (for example the completion effect finishing the
+	// row just created) committed while the insert was in flight.
+	result := s.installDeploymentMirror(j.ID, d)
 	if !created {
 		// Another replica (or an earlier process) already recorded it: the
 		// durable row is the canonical record and the audit evidence exists.
-		return d, nil
+		return result, nil
 	}
+	// Exactly one caller observes created=true and owns the evidence.
 	s.auditLocked("deployment.started", "scheduler", j.RunID, j.ID, "deployment started", map[string]string{"environment": j.Environment})
-	return d, nil
+	return result, nil
 }
 
 // recordDeployment is POST /api/v1/jobs/{id}/deployments: it creates (or

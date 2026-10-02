@@ -200,13 +200,22 @@ type Budget struct {
 	// increment used after Close had already retired the budget).
 	closed atomic.Bool
 
-	// finalized and done implement the exactly-once ownership release. Close
-	// sets finalized under mu when used has reached zero and then releases the
-	// lock outside mu, closing done so every concurrent/retrying Close call
-	// converges. Both are mu-guarded.
+	// finalized, releasing and done implement the exactly-once ownership
+	// release. Close sets releasing under mu once the ledger has drained and
+	// performs lock.release() OUTSIDE mu; only on success does it set
+	// finalized, unregister the budget and close done. A failed release
+	// clears releasing and leaves the budget CLOSING, registered and
+	// retryable, because the directory ownership may still be held. All three
+	// are mu-guarded.
 	finalized bool
+	releasing bool
 	done      chan struct{}
 }
+
+// releaseOwnershipLock is the test seam over the platform ownership release.
+// Tests inject transient failures to prove the CLOSING/retryable state
+// machine; production delegates straight to the lock.
+var releaseOwnershipLock = func(l *dirLock) error { return l.release() }
 
 // ownedDirs is the process-wide ownership registry: at most one live Budget
 // per staging directory per process. Two constructors for the same directory
@@ -486,17 +495,47 @@ func (b *Budget) CloseWithContext(ctx context.Context) error {
 		}
 		if b.used == 0 && b.pendingBytes == 0 {
 			// Last reservation gone and no unreclaimable spool bytes remain
-			// (or none ever existed): release ownership.
+			// (or none ever existed): attempt the ownership release BEFORE
+			// any irreversible transition. Only a successful release may
+			// finalize the budget, unregister it and close done: a transient
+			// unlink/flock failure must leave the directory owned, the budget
+			// registered and the close retryable. A successor must never
+			// start while this process still holds (or believes it holds)
+			// ownership.
+			if b.releasing {
+				// Another Close is mid-release; wait for its outcome.
+				wait := b.notify
+				b.mu.Unlock()
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-wait:
+				}
+				b.mu.Lock()
+				continue
+			}
+			b.releasing = true
+			lock := b.lock
+			b.mu.Unlock()
+			err := releaseOwnershipLock(lock)
+			b.mu.Lock()
+			b.releasing = false
+			if err != nil {
+				// Ownership was NOT relinquished: stay CLOSING, registered
+				// and retryable, and wake waiters so one of them can retry.
+				b.broadcastLocked()
+				b.mu.Unlock()
+				return err
+			}
 			b.finalized = true
 			b.activeSpools = nil
 			b.pendingCleanup = nil
 			done := b.done
-			lock := b.lock
+			b.broadcastLocked()
 			b.mu.Unlock()
 			unregisterBudget(b)
-			err := lock.release()
 			close(done)
-			return err
+			return nil
 		}
 		if err := ctx.Err(); err != nil {
 			// Keep the CLOSING state and ownership: the last Release (or a

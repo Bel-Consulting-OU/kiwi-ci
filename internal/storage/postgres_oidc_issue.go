@@ -40,9 +40,25 @@ type OIDCIssuance struct {
 	Audience        string
 	KID             string
 	JTI             string
-	IssuedAt        time.Time
-	ExpiresAt       time.Time
-	Claims          map[string]string
+	// TTL is the requested token lifetime. The commit derives the absolute
+	// IssuedAt/ExpiresAt from its OWN clock (PostgreSQL: the post-lock
+	// clock_timestamp(); memory/fs: the store clock under the server lock),
+	// exactly like lease liveness. Callers never supply absolute instants,
+	// so a skewed serving replica cannot move the JWT window forward or
+	// backward.
+	TTL    time.Duration
+	Claims map[string]string
+}
+
+// OIDCIssuanceResult is the committed credential identity plus the lifetime
+// the store actually issued: IssuedAt is the commit clock, ExpiresAt is that
+// instant plus the requested TTL. The handler builds the JWT and the audit
+// record from these values, so the credential timestamps live in the same
+// clock domain as the lease predicate that authorized them.
+type OIDCIssuanceResult struct {
+	Identity  LockedOIDCIdentity
+	IssuedAt  time.Time
+	ExpiresAt time.Time
 }
 
 // Claim keys the commit-time identity binding understands. They are exported
@@ -212,11 +228,12 @@ var (
 // audit row in the SAME transaction (PostgreSQL: under a row lock on the
 // job), so a concurrent revocation either commits first (and fails the
 // predicate) or waits for the issuance commit. It returns the authoritative
-// locked identity on success; refusal is a typed error from the ErrOIDCIssuance*
-// set and commits NOTHING, so no credential can leave the server without the
-// durable audit.
+// locked identity plus the credential lifetime derived from the commit clock
+// on success; refusal is a typed error from the ErrOIDCIssuance* set and
+// commits NOTHING, so no credential can leave the server without the durable
+// audit.
 type LeaseOIDCIssueStore interface {
-	CommitOIDCIssuance(ctx context.Context, req OIDCIssuance) (LockedOIDCIdentity, error)
+	CommitOIDCIssuance(ctx context.Context, req OIDCIssuance) (OIDCIssuanceResult, error)
 }
 
 var (
@@ -256,8 +273,8 @@ func ValidateOIDCIssuanceRequest(req OIDCIssuance) error {
 	if req.KID == "" || req.JTI == "" {
 		return oidcIssuanceErrorf(ErrOIDCIssuanceInvalid, "job %s: missing kid/jti", req.JobID)
 	}
-	if req.IssuedAt.IsZero() || !req.ExpiresAt.After(req.IssuedAt) {
-		return oidcIssuanceErrorf(ErrOIDCIssuanceInvalid, "job %s: invalid lifetime", req.JobID)
+	if req.TTL <= 0 {
+		return oidcIssuanceErrorf(ErrOIDCIssuanceInvalid, "job %s: non-positive token ttl", req.JobID)
 	}
 	if req.Claims == nil {
 		return oidcIssuanceErrorf(ErrOIDCIssuanceInvalid, "job %s: missing claims", req.JobID)
@@ -297,24 +314,26 @@ func LockedOIDCIdentityForJob(j model.Job) LockedOIDCIdentity {
 	}
 }
 
-// ValidateOIDCIssuance evaluates the issuance predicate against the
-// candidate's own IssuedAt as the clock. It exists only for callers that hold
-// no storage commit clock (unit tests and diagnostics): every issuance COMMIT
-// must call ValidateOIDCIssuanceAt with the storage clock, otherwise the
-// stale-clock window reopens — a lease (or the requested token lifetime) that
-// expires during signer/key-store work would still pass.
+// ValidateOIDCIssuance evaluates the issuance predicate against this
+// process's clock. It exists only for callers that hold no storage commit
+// clock (unit tests and diagnostics): every issuance COMMIT must call
+// ValidateOIDCIssuanceAt with the storage clock, otherwise the stale-clock
+// window reopens — a lease that expires during signer/key-store work would
+// still pass.
 func ValidateOIDCIssuance(locked LockedOIDCIdentity, req OIDCIssuance) error {
-	return ValidateOIDCIssuanceAt(locked, req, req.IssuedAt)
+	return ValidateOIDCIssuanceAt(locked, req, time.Now().UTC())
 }
 
 // ValidateOIDCIssuanceAt is the ONE issuance predicate: it evaluates the
 // locked identity against the candidate request AT THE STORAGE COMMIT CLOCK
 // and returns the typed refusal the handler maps onto 409/403. commitNow must
 // come from the same clock domain that persisted the lease expiry (PostgreSQL:
-// clock_timestamp() read in the locking transaction; memory/fs: time.Now()
-// under the store lock), so no application/DB skew can launder an expired
-// lease. Both the lease expiry and the requested token lifetime are checked
-// against commitNow, not against the handler-captured IssuedAt.
+// clock_timestamp() read after the row lock; memory/fs: time.Now() under the
+// store lock), so no application/DB skew can launder an expired lease. The
+// requested token lifetime is a TTL validated for positivity here; its
+// absolute window is derived from commitNow by the caller (OIDCIssuanceResult),
+// so the credential cannot claim a different clock domain than the lease
+// check.
 //
 // It also cross-checks every identity-bearing claim against the locked row, so
 // a JWT built for one revision/job can never be returned for another.
@@ -332,8 +351,8 @@ func ValidateOIDCIssuanceAt(locked LockedOIDCIdentity, req OIDCIssuance, commitN
 		return oidcIssuanceErrorf(ErrOIDCIssuanceToken, "job %s lease token mismatch", req.JobID)
 	case locked.LeaseExpiresAt.IsZero() || !locked.LeaseExpiresAt.After(commitNow):
 		return oidcIssuanceErrorf(ErrOIDCIssuanceExpired, "job %s lease expired at %s (commit %s)", req.JobID, locked.LeaseExpiresAt.UTC().Format(time.RFC3339Nano), commitNow.UTC().Format(time.RFC3339Nano))
-	case req.ExpiresAt.IsZero() || !req.ExpiresAt.After(commitNow):
-		return oidcIssuanceErrorf(ErrOIDCIssuanceExpired, "job %s requested token lifetime expired at %s (commit %s)", req.JobID, req.ExpiresAt.UTC().Format(time.RFC3339Nano), commitNow.UTC().Format(time.RFC3339Nano))
+	case req.TTL <= 0:
+		return oidcIssuanceErrorf(ErrOIDCIssuanceInvalid, "job %s: non-positive token ttl", req.JobID)
 	case !locked.Trusted:
 		return oidcIssuanceErrorf(ErrOIDCIssuanceUntrusted, "job %s", req.JobID)
 	case !locked.OIDCAllowed:
@@ -372,9 +391,11 @@ func ValidateOIDCIssuanceAt(locked LockedOIDCIdentity, req OIDCIssuance, commitN
 // OIDCIssuanceAuditEvent builds the oidc.issued audit event for a request
 // that has been validated against the locked identity. It is the ONE event
 // shape both the store implementations and the server's in-process commit
-// path write, so the audit trail is identical across modes. The audit never
-// carries the token, only the job/audience/kid metadata.
-func OIDCIssuanceAuditEvent(req OIDCIssuance, id string) model.AuditEvent {
+// path write, so the audit trail is identical across modes. issuedAt is the
+// STORE's commit-clock issuance instant (OIDCIssuanceResult.IssuedAt), never a
+// caller-captured application time. The audit never carries the token, only
+// the job/audience/kid metadata.
+func OIDCIssuanceAuditEvent(req OIDCIssuance, id string, issuedAt time.Time) model.AuditEvent {
 	return model.AuditEvent{
 		ID:        id,
 		Action:    "oidc.issued",
@@ -383,7 +404,7 @@ func OIDCIssuanceAuditEvent(req OIDCIssuance, id string) model.AuditEvent {
 		JobID:     req.JobID,
 		Message:   "OIDC id_token issued",
 		Metadata:  map[string]string{"job": req.Claims[OIDCClaimJob], "audience": req.Audience, "kid": req.KID},
-		CreatedAt: req.IssuedAt.UTC(),
+		CreatedAt: issuedAt.UTC(),
 	}
 }
 
@@ -403,13 +424,13 @@ func OIDCIssuanceAuditEvent(req OIDCIssuance, id string) model.AuditEvent {
 // materialized sub-plan (a CTE with a locking clause is never inlined), so the
 // outer clock_timestamp() is evaluated after the lock has been acquired —
 // verified on PostgreSQL 14.
-func (s *PostgresStore) CommitOIDCIssuance(ctx context.Context, req OIDCIssuance) (LockedOIDCIdentity, error) {
+func (s *PostgresStore) CommitOIDCIssuance(ctx context.Context, req OIDCIssuance) (OIDCIssuanceResult, error) {
 	if err := ValidateOIDCIssuanceRequest(req); err != nil {
-		return LockedOIDCIdentity{}, err
+		return OIDCIssuanceResult{}, err
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return LockedOIDCIdentity{}, err
+		return OIDCIssuanceResult{}, err
 	}
 	defer tx.Rollback(ctx)
 	var (
@@ -453,15 +474,15 @@ func (s *PostgresStore) CommitOIDCIssuance(ctx context.Context, req OIDCIssuance
 		&trusted, &oidcAllowed, &audiencesJSON, &repoID, &policyRepoID, &repoURL, &repoFullName,
 		&ref, &sha, &event, &environment, &commitNow)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return LockedOIDCIdentity{}, ErrNotFound
+		return OIDCIssuanceResult{}, ErrNotFound
 	}
 	if err != nil {
-		return LockedOIDCIdentity{}, err
+		return OIDCIssuanceResult{}, err
 	}
 	var audiences []string
 	if len(audiencesJSON) > 0 && string(audiencesJSON) != "null" {
 		if err := json.Unmarshal(audiencesJSON, &audiences); err != nil {
-			return LockedOIDCIdentity{}, fmt.Errorf("storage: decode job oidc_audiences: %w", err)
+			return OIDCIssuanceResult{}, fmt.Errorf("storage: decode job oidc_audiences: %w", err)
 		}
 	}
 	locked := LockedOIDCIdentityForJob(model.Job{
@@ -473,26 +494,26 @@ func (s *PostgresStore) CommitOIDCIssuance(ctx context.Context, req OIDCIssuance
 		LeaseExpiresAt: leaseExpiresAt,
 	})
 	if err := ValidateOIDCIssuanceAt(locked, req, commitNow); err != nil {
-		return LockedOIDCIdentity{}, err
+		return OIDCIssuanceResult{}, err
 	}
 	auditID, err := newID()
 	if err != nil {
-		return LockedOIDCIdentity{}, err
+		return OIDCIssuanceResult{}, err
 	}
-	ev := OIDCIssuanceAuditEvent(req, auditID)
+	ev := OIDCIssuanceAuditEvent(req, auditID, commitNow)
 	var meta []byte
 	if len(ev.Metadata) > 0 {
 		meta, err = jsonMarshal(ev.Metadata)
 		if err != nil {
-			return LockedOIDCIdentity{}, err
+			return OIDCIssuanceResult{}, err
 		}
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO audit_events (id, action, actor, run_id, job_id, message, metadata, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 		ev.ID, ev.Action, nullText(ev.Actor), nullText(ev.RunID), nullText(ev.JobID), nullText(ev.Message), meta, ev.CreatedAt); err != nil {
-		return LockedOIDCIdentity{}, err
+		return OIDCIssuanceResult{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return LockedOIDCIdentity{}, err
+		return OIDCIssuanceResult{}, err
 	}
-	return locked, nil
+	return OIDCIssuanceResult{Identity: locked, IssuedAt: commitNow.UTC(), ExpiresAt: commitNow.UTC().Add(req.TTL)}, nil
 }

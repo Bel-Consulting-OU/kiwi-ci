@@ -37,7 +37,7 @@ func faultyWrapperCases() map[string]wrapperCase {
 		_ = m.PutCacheManifest(ctx(), CacheManifestRecord{Repo: "github.com/o/r", TrustDomain: "td", LogicalKey: "l"})
 	}
 	grant := func(m *memStore) {
-		_ = m.PutEnrollGrant(ctx(), "digest", time.Now().UTC().Add(time.Hour), []string{"linux"})
+		_, _ = m.PutEnrollGrantWithTTL(ctx(), "digest", time.Hour, []string{"linux"})
 	}
 	reserved := func(m *memStore) {
 		_, _ = m.ReserveDownstreamLaunch(ctx(), testJob.ID, "acme/child", "refs/heads/main", "tok")
@@ -434,8 +434,9 @@ func faultyWrapperCases() map[string]wrapperCase {
 			_, err := f.CertRevoked(ctx(), "serial")
 			return err
 		}},
-		"PutEnrollGrant": {mutates: true, call: func(f *FaultyStore) error {
-			return f.PutEnrollGrant(ctx(), "digest", time.Now().UTC().Add(time.Hour), []string{"linux"})
+		"PutEnrollGrantWithTTL": {mutates: true, call: func(f *FaultyStore) error {
+			_, err := f.PutEnrollGrantWithTTL(ctx(), "digest", time.Hour, []string{"linux"})
+			return err
 		}},
 		"GetEnrollGrant": {seed: grant, call: func(f *FaultyStore) error {
 			_, _, err := f.GetEnrollGrant(ctx(), "digest")
@@ -1010,8 +1011,9 @@ func missingOptionalInterfaceCases() map[string]missingIfaceCase {
 			_, err := f.CertRevoked(ctx(), "")
 			return err
 		}},
-		"PutEnrollGrant": {mutates: true, iface: "EnrollGrantStore", call: func(f *FaultyStore) error {
-			return f.PutEnrollGrant(ctx(), "", time.Time{}, nil)
+		"PutEnrollGrantWithTTL": {mutates: true, iface: "EnrollGrantStore", call: func(f *FaultyStore) error {
+			_, err := f.PutEnrollGrantWithTTL(ctx(), "", 0, nil)
+			return err
 		}},
 		"GetEnrollGrant": {iface: "EnrollGrantStore", call: func(f *FaultyStore) error {
 			_, _, err := f.GetEnrollGrant(ctx(), "")

@@ -155,7 +155,10 @@ func TestPostgresIntegrationValidationSweep(t *testing.T) {
 		}
 		return nil
 	}(), false)
-	bad("PutEnrollGrant/empty-digest", st.PutEnrollGrant(ctx, "", time.Now().Add(time.Hour), nil), true)
+	bad("PutEnrollGrant/empty-digest", func() error {
+		_, err := st.PutEnrollGrantWithTTL(ctx, "", time.Hour, nil)
+		return err
+	}(), true)
 	bad("GetEnrollGrant/empty-digest", func() error {
 		_, ok, err := st.GetEnrollGrant(ctx, "")
 		if ok || err != nil {

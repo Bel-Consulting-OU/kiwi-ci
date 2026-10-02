@@ -26,6 +26,7 @@ func TestProductionDBStoreSatisfiesRequiredCapabilities(t *testing.T) {
 		{"AtomicLeaseStore", implementsCapability[AtomicLeaseStore](st)},
 		{"LeaseClockStore", implementsCapability[LeaseClockStore](st)},
 		{"LiveLeaseStore", implementsCapability[LiveLeaseStore](st)},
+		{"ClockStore", implementsCapability[ClockStore](st)},
 		{"LeaseCommitStore", implementsCapability[LeaseCommitStore](st)},
 		{"LeaseTestReportStore", implementsCapability[LeaseTestReportStore](st)},
 		{"RunnerHeartbeatStore", implementsCapability[RunnerHeartbeatStore](st)},

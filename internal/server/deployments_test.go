@@ -284,3 +284,64 @@ func TestDeploymentRecordRequiresRunningJob(t *testing.T) {
 		t.Fatalf("deployment records for the job = %d, want 1", n)
 	}
 }
+
+// TestDeploymentStartTracksAuthoritativeJobStart pins the start-instant
+// authority when the caller supplies a later clock: a retried claim (or a
+// skewed replica) must never re-stamp the deployment with a later attempt's
+// instant; the job's FIRST StartAt wins.
+func TestDeploymentStartTracksAuthoritativeJobStart(t *testing.T) {
+	s := New("secret")
+	firstStart := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+	j := model.Job{
+		ID: "job-start", RunID: "run-start", Environment: "production",
+		Status: model.StatusRunning, StartedAt: &firstStart,
+	}
+	d := s.recordDeploymentLocked(j, time.Now().UTC())
+	if d.StartedAt == nil || !d.StartedAt.Equal(firstStart) || !d.CreatedAt.Equal(firstStart) {
+		t.Fatalf("deployment start = %+v, want the job's authoritative first start %v", d, firstStart)
+	}
+}
+
+// TestDeploymentMirrorNeverRegressesToOlderState pins the concurrent-write
+// invariant behind installDeploymentMirror: a record installed by a
+// completion effect (durably updated) while a record call was in flight must
+// not be clobbered by the older snapshot that call inserted.
+func TestDeploymentMirrorNeverRegressesToOlderState(t *testing.T) {
+	s := New("secret")
+	finishedAt := time.Now().UTC().Truncate(time.Microsecond)
+	s.mu.Lock()
+	s.deployments["job-1"] = model.Deployment{
+		ID: "job-1", RunID: "run-1", JobID: "job-1",
+		Status: model.StatusSuccess, FinishedAt: &finishedAt,
+	}
+	s.mu.Unlock()
+
+	got := s.installDeploymentMirror("job-1", model.Deployment{
+		ID: "job-1", RunID: "run-1", JobID: "job-1",
+		Status: model.StatusRunning,
+	})
+	if got.FinishedAt == nil || got.Status != model.StatusSuccess {
+		t.Fatalf("mirror regressed to %+v, want the finished record", got)
+	}
+	s.mu.Lock()
+	kept := s.deployments["job-1"]
+	s.mu.Unlock()
+	if kept.FinishedAt == nil || kept.Status != model.StatusSuccess {
+		t.Fatalf("mirror regressed to %+v, want the finished record", kept)
+	}
+
+	// A fresh job still installs normally.
+	got = s.installDeploymentMirror("job-2", model.Deployment{
+		ID: "job-2", RunID: "run-2", JobID: "job-2",
+		Status: model.StatusRunning,
+	})
+	if got.ID != "job-2" || got.Status != model.StatusRunning {
+		t.Fatalf("fresh install = %+v, want the running record", got)
+	}
+	s.mu.Lock()
+	_, ok := s.deployments["job-2"]
+	s.mu.Unlock()
+	if !ok {
+		t.Fatal("fresh install did not cache the record")
+	}
+}

@@ -50,7 +50,7 @@ func acquireDirLock(dir string) (*dirLock, error) {
 		}
 		data, readErr := os.ReadFile(path)
 		if readErr == nil && !lockOwnerAlive(string(data)) {
-			if err := os.Remove(path); err == nil {
+			if err := removeDirLockFile(path); err == nil {
 				continue
 			}
 		}
@@ -59,16 +59,24 @@ func acquireDirLock(dir string) (*dirLock, error) {
 	return nil, fmt.Errorf("%w: %s", ErrStagingDirOwned, path)
 }
 
+// removeDirLockFile is the unlink primitive behind release (and the stale
+// reclaim), kept as a seam so tests can inject transient removal failures.
+var removeDirLockFile = os.Remove
+
 // release removes the lock file this owner created. It is nil-safe and
-// idempotent.
+// idempotent. Ownership is cleared ONLY after the lock file is actually gone:
+// a transient unlink failure (EPERM, EIO) must leave the lock retryable, so a
+// later Close can retry instead of forgetting that this process still owns
+// the directory. A successor must never see the lock file gone while this
+// process still believes it owns the directory.
 func (l *dirLock) release() error {
 	if l == nil || !l.owned {
 		return nil
 	}
-	l.owned = false
-	if err := os.Remove(l.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := removeDirLockFile(l.path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("staging: remove lock file %s: %w", l.path, err)
 	}
+	l.owned = false
 	return nil
 }
 

@@ -255,7 +255,7 @@ func TestEnrollGrantConsumeHonorsCanceledRequestContext(t *testing.T) {
 	s := New("token")
 	s.DB = store
 	digest := auth.TokenDigest("grant-tok")
-	if err := store.dbFakeStore.PutEnrollGrant(context.Background(), digest, time.Now().UTC().Add(time.Hour), []string{"container"}); err != nil {
+	if _, err := store.dbFakeStore.PutEnrollGrantWithTTL(context.Background(), digest, time.Hour, []string{"container"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -298,7 +298,7 @@ func TestEnrollGrantOKRejectsCanceledRequest(t *testing.T) {
 	s := New("token")
 	s.DB = store
 	digest := auth.TokenDigest("live-tok")
-	if err := store.PutEnrollGrant(context.Background(), digest, time.Now().UTC().Add(time.Hour), nil); err != nil {
+	if _, err := store.PutEnrollGrantWithTTL(context.Background(), digest, time.Hour, nil); err != nil {
 		t.Fatal(err)
 	}
 	if !s.enrollGrantOK(context.Background(), "live-tok") {

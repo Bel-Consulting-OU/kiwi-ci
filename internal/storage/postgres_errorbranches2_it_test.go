@@ -56,7 +56,7 @@ func TestPostgresIntegrationScannerCorruption(t *testing.T) {
 	if err := st.PutCacheManifest(ctx, CacheManifestRecord{Repo: "r", TrustDomain: "t", LogicalKey: "l", BlobSHA256: memDigest, CreatedAt: time.Now().UTC()}); err != nil {
 		t.Fatalf("manifest: %v", err)
 	}
-	if err := st.PutEnrollGrant(ctx, "digest", time.Now().Add(time.Hour), []string{"linux"}); err != nil {
+	if _, err := st.PutEnrollGrantWithTTL(ctx, "digest", time.Hour, []string{"linux"}); err != nil {
 		t.Fatalf("grant: %v", err)
 	}
 	if err := st.InsertCompletionReceipt(ctx, model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID}); err != nil {

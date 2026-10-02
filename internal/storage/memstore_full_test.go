@@ -1012,7 +1012,7 @@ func TestMemStoreRevocationsAndGrants(t *testing.T) {
 		t.Fatalf("unknown grant = %v", err)
 	}
 	expires := time.Now().UTC().Add(time.Hour)
-	if err := m.PutEnrollGrant(ctx, "digest", expires, []string{"linux"}); err != nil {
+	if _, err := m.PutEnrollGrantWithTTL(ctx, "digest", time.Until(expires), []string{"linux"}); err != nil {
 		t.Fatalf("PutEnrollGrant: %v", err)
 	}
 	rec, ok, err := m.GetEnrollGrant(ctx, "digest")
@@ -1029,9 +1029,9 @@ func TestMemStoreRevocationsAndGrants(t *testing.T) {
 	if _, err := m.ConsumeEnrollGrant(ctx, "digest", "admin"); !errors.Is(err, ErrGrantConsumed) {
 		t.Fatalf("second consume = %v, want ErrGrantConsumed", err)
 	}
-	if err := m.PutEnrollGrant(ctx, "expired", time.Now().UTC().Add(-time.Minute), nil); err != nil {
-		t.Fatalf("PutEnrollGrant expired: %v", err)
-	}
+	m.mu.Lock()
+	m.grants["expired"] = EnrollGrantRecord{ExpiresAt: time.Now().UTC().Add(-time.Minute)}
+	m.mu.Unlock()
 	if _, err := m.ConsumeEnrollGrant(ctx, "expired", "admin"); !errors.Is(err, ErrGrantExpired) {
 		t.Fatalf("expired consume = %v, want ErrGrantExpired", err)
 	}

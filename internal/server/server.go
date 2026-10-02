@@ -3588,8 +3588,9 @@ func (s *Server) nextDB(w http.ResponseWriter, r *http.Request, id string) {
 		// The lease already committed; a failed deployment insert is
 		// surfaced (logged) here, never mirrored as a started deployment.
 		// The completion deployment effect rebuilds the record from the job
-		// once the store recovers.
-		if _, derr := s.recordDeploymentDB(ctx, *j, time.Now().UTC()); derr != nil {
+		// once the store recovers. The start instant is the claim's own
+		// persisted StartedAt (database clock), never this replica's now().
+		if _, derr := s.recordDeploymentDB(ctx, *j, jobStart(*j)); derr != nil {
 			s.logError("deployment record insert failed", "job", j.ID, "error", derr.Error())
 		}
 	}
@@ -6163,7 +6164,14 @@ func (s *Server) Maintain(ctx context.Context) {
 			if s.Sched != nil {
 				s.maintainDB(ctx, tick.UTC())
 				if s.leader {
-					s.fireDueSchedules(ctx, tick.UTC())
+					// Due schedule evaluation uses the DATABASE clock in DB
+					// mode: a leader ahead of it must not fire an occurrence
+					// early and one behind it must not postpone a due one. A
+					// missing/failed clock read skips the tick rather than
+					// falling back to the replica's wall clock.
+					if fireNow, ok := s.scheduleFireNow(ctx, tick.UTC()); ok {
+						s.fireDueSchedules(ctx, fireNow)
+					}
 				}
 				s.metricObserve("kiwi_scheduler_loop_duration_seconds", time.Since(loopStart).Seconds(), nil)
 				continue

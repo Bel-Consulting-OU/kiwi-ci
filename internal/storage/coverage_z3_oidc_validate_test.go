@@ -11,11 +11,10 @@ import (
 // a non-positive token lifetime and missing claims are all typed invalid, and
 // a complete request passes.
 func TestValidateOIDCIssuanceRequestShapeBranches(t *testing.T) {
-	now := time.Now().UTC()
 	good := OIDCIssuance{
 		JobID: "job-1", RunnerID: "runner-1", LeaseGeneration: 1,
 		LeaseTokenHash: []byte("hash"), Audience: "https://aud.example.com",
-		KID: "kid", JTI: "jti", IssuedAt: now, ExpiresAt: now.Add(5 * time.Minute),
+		KID: "kid", JTI: "jti", TTL: 5 * time.Minute,
 		Claims: map[string]string{},
 	}
 	if err := ValidateOIDCIssuanceRequest(good); err != nil {
@@ -27,8 +26,8 @@ func TestValidateOIDCIssuanceRequestShapeBranches(t *testing.T) {
 		mutate func(*OIDCIssuance)
 	}{
 		{"empty job id", func(r *OIDCIssuance) { r.JobID = "  " }},
-		{"zero issued at", func(r *OIDCIssuance) { r.IssuedAt = time.Time{} }},
-		{"lifetime not positive", func(r *OIDCIssuance) { r.ExpiresAt = r.IssuedAt }},
+		{"non-positive ttl", func(r *OIDCIssuance) { r.TTL = 0 }},
+		{"negative ttl", func(r *OIDCIssuance) { r.TTL = -time.Minute }},
 		{"missing claims", func(r *OIDCIssuance) { r.Claims = nil }},
 	}
 	for _, tc := range bad {
@@ -42,11 +41,11 @@ func TestValidateOIDCIssuanceRequestShapeBranches(t *testing.T) {
 	}
 }
 
-// TestValidateOIDCIssuanceAtClockBoundary pins the two commit-clock
-// conditions directly, with the strict After boundary: a lease expiring at
-// the commit instant and a lifetime expiring at the commit instant are both
-// refused, while an issuance whose lease and lifetime strictly outlive the
-// commit clock passes.
+// TestValidateOIDCIssuanceAtClockBoundary pins the commit-clock conditions
+// directly, with the strict After boundary: a lease expiring at the commit
+// instant is refused, an issuance whose lease strictly outlives the commit
+// clock passes, and a non-positive TTL is a shape refusal (the absolute
+// window is derived from the commit clock by the caller).
 func TestValidateOIDCIssuanceAtClockBoundary(t *testing.T) {
 	j := oidcIssueTestJob()
 	locked := LockedOIDCIdentityForJob(j)
@@ -59,10 +58,12 @@ func TestValidateOIDCIssuanceAtClockBoundary(t *testing.T) {
 		t.Fatalf("commit exactly at the lease expiry = %v, want ErrOIDCIssuanceExpired", err)
 	}
 
+	// The lifetime is a TTL: a non-positive one is invalid, never a way to
+	// backdate or extend the window.
 	elapsed := req
-	elapsed.ExpiresAt = commitNow
-	if err := ValidateOIDCIssuanceAt(locked, elapsed, commitNow); !errors.Is(err, ErrOIDCIssuanceExpired) {
-		t.Fatalf("commit exactly at the lifetime expiry = %v, want ErrOIDCIssuanceExpired", err)
+	elapsed.TTL = 0
+	if err := ValidateOIDCIssuanceAt(locked, elapsed, commitNow); !errors.Is(err, ErrOIDCIssuanceInvalid) {
+		t.Fatalf("zero token ttl = %v, want ErrOIDCIssuanceInvalid", err)
 	}
 
 	// A zero lease expiry is the same typed refusal (no lease at all).

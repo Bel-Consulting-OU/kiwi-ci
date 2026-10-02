@@ -82,7 +82,7 @@ var boomSeeds = map[string]func(t *testing.T, st *PostgresStore, ids *boomerIds)
 		}
 	},
 	"enrollment_grants/Consume": func(t *testing.T, st *PostgresStore, ids *boomerIds) {
-		if err := st.PutEnrollGrant(context.Background(), "digest", time.Now().Add(time.Hour), nil); err != nil {
+		if _, err := st.PutEnrollGrantWithTTL(context.Background(), "digest", time.Hour, nil); err != nil {
 			t.Fatalf("grant: %v", err)
 		}
 	},
@@ -497,7 +497,7 @@ func TestPostgresIntegrationTriggeredSQLErrors(t *testing.T) {
 			}
 		}},
 		"enrollment_grants/Put": {"enrollment_grants", func(t *testing.T, st *PostgresStore, ids *boomerIds) {
-			if err := st.PutEnrollGrant(ctx, "digest", time.Now().Add(time.Hour), nil); err == nil {
+			if _, err := st.PutEnrollGrantWithTTL(ctx, "digest", time.Hour, nil); err == nil {
 				t.Fatal("expected the grant insert to fail")
 			}
 		}},

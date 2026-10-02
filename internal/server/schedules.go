@@ -719,6 +719,30 @@ func (s *Server) scheduleByID(ctx context.Context, id string) (storage.Schedule,
 // transaction, so a failed enqueue leaves the nominal unclaimed and the
 // next tick refires it; only successful enqueues (or occurrences claimed
 // by another instance) advance LastRun.
+// scheduleFireNow returns the instant due-schedule evaluation must use. DB
+// mode uses the shared DATABASE clock (storage.ClockStore.Now): a leader
+// whose application clock is ahead must not fire an occurrence early and one
+// behind must not postpone a due occurrence, so two leaders with opposite
+// skew agree on the same due set. A missing capability or a failed read
+// returns ok=false, and the caller SKIPS the tick rather than scheduling from
+// a replica-local clock. fs/memory mode has one clock: the tick itself.
+func (s *Server) scheduleFireNow(ctx context.Context, tick time.Time) (time.Time, bool) {
+	if s.DB == nil {
+		return tick.UTC(), true
+	}
+	cs, ok := s.DB.(storage.ClockStore)
+	if !ok {
+		s.logError("schedules: store lacks the database clock capability; skipping due evaluation")
+		return time.Time{}, false
+	}
+	now, err := cs.Now(ctx)
+	if err != nil {
+		s.logError("schedules: database clock read failed; skipping due evaluation", "error", err.Error())
+		return time.Time{}, false
+	}
+	return now.UTC(), true
+}
+
 func (s *Server) fireDueSchedules(ctx context.Context, now time.Time) {
 	// Due discovery runs on the AUTHORITATIVE rows in DB mode: a schedule
 	// created or re-cadenced on another replica while this leader stays

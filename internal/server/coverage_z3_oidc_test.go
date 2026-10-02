@@ -1,11 +1,13 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
@@ -130,5 +132,64 @@ func TestAuditOIDCIssuanceFailsClosedOnIDFailure(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/job-oidc/oidc", nil)
 	if err := s.auditOIDCIssuance(r, "runner-1", "run-oidc", "job-oidc", "kid", "build", "aud"); err == nil {
 		t.Fatal("audit append with a failing id source reported success")
+	}
+}
+
+// TestCommitOIDCIssuanceUsesStoreClockNotApplicationClock pins the credential
+// window on the DB path: IssuedAt is the STORE's commit clock and ExpiresAt is
+// exactly the requested TTL later, with the durable audit carrying the same
+// instant. The fake's store clock is deliberately two hours away from the
+// wall clock, so an implementation that used time.Now() (or a
+// handler-captured instant) for the JWT window fails.
+func TestCommitOIDCIssuanceUsesStoreClockNotApplicationClock(t *testing.T) {
+	f := newDBFakeStore()
+	s := New("token")
+	s.DB = f
+	dbNow := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Microsecond)
+	leaseExpiry := time.Now().UTC().Add(3 * time.Hour)
+	f.mu.Lock()
+	f.leaseNow = func() time.Time { return dbNow }
+	f.jobs["job-1"] = model.Job{
+		ID: "job-1", RunID: "run-1", Key: "build", Status: model.StatusRunning,
+		Trusted: true, OIDCAllowed: true,
+		LeaseRunnerID: "runner-1", LeaseGeneration: 1,
+		LeaseTokenHash: []byte("hash"), LeaseExpiresAt: &leaseExpiry,
+	}
+	f.mu.Unlock()
+
+	audience := "https://aud.example.com"
+	req := storage.OIDCIssuance{
+		JobID: "job-1", RunnerID: "runner-1", LeaseGeneration: 1,
+		LeaseTokenHash: []byte("hash"), Audience: audience,
+		KID: "kid", JTI: "jti", TTL: 5 * time.Minute,
+		Claims: map[string]string{
+			storage.OIDCClaimJobID:        "job-1",
+			storage.OIDCClaimRunID:        "run-1",
+			storage.OIDCClaimJob:          "build",
+			storage.OIDCClaimRepositoryID: "",
+			storage.OIDCClaimRepository:   "",
+			storage.OIDCClaimRef:          "",
+			storage.OIDCClaimSHA:          "",
+			storage.OIDCClaimEvent:        "",
+			storage.OIDCClaimEnvironment:  "",
+			storage.OIDCClaimTrusted:      "true",
+			storage.OIDCClaimAudience:     audience,
+		},
+	}
+	result, err := s.commitOIDCIssuance(context.Background(), req)
+	if err != nil {
+		t.Fatalf("commitOIDCIssuance: %v", err)
+	}
+	if !result.IssuedAt.Equal(dbNow) {
+		t.Fatalf("IssuedAt = %v, want the store clock %v (application clock was used)", result.IssuedAt, dbNow)
+	}
+	if !result.ExpiresAt.Equal(dbNow.Add(5 * time.Minute)) {
+		t.Fatalf("ExpiresAt = %v, want store clock + TTL %v", result.ExpiresAt, dbNow.Add(5*time.Minute))
+	}
+	f.mu.Lock()
+	events := append([]model.AuditEvent(nil), f.audit...)
+	f.mu.Unlock()
+	if len(events) != 1 || !events[0].CreatedAt.Equal(dbNow) {
+		t.Fatalf("audit = %+v, want created_at == store commit clock %v", events, dbNow)
 	}
 }

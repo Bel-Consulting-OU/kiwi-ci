@@ -790,7 +790,9 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
-	expiresAt := now.Add(5 * time.Minute)
+	// The token lifetime is a TTL: the COMMIT derives the absolute iat/exp
+	// from its own clock (PostgreSQL: the post-lock clock_timestamp), so a
+	// skewed serving replica can never move the JWT window.
 	req := storage.OIDCIssuance{
 		JobID:           j.ID,
 		RunnerID:        j.LeaseRunnerID,
@@ -799,8 +801,7 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 		Audience:        in.Audience,
 		KID:             signer.KID,
 		JTI:             jti,
-		IssuedAt:        now,
-		ExpiresAt:       expiresAt,
+		TTL:             5 * time.Minute,
 		Claims: map[string]string{
 			storage.OIDCClaimJobID:        j.ID,
 			storage.OIDCClaimRunID:        j.RunID,
@@ -828,22 +829,23 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 	if oidcBeforeCommitHook != nil {
 		oidcBeforeCommitHook()
 	}
-	locked, err := s.commitOIDCIssuance(r.Context(), req)
+	result, err := s.commitOIDCIssuance(r.Context(), req)
 	if err != nil {
 		s.oidcIssuanceRefusal(w, r, err)
 		return
 	}
 	// The JWT is built from ONE canonical source: the authoritative identity
-	// the transaction derived from the locked job row. Only iss/aud/jti/iat/
-	// exp (and the signer's kid in the header) come from the candidate.
-	claims := locked.AuthoritativeIdentity().TokenClaims(iss, in.Audience, jti, req.IssuedAt, req.ExpiresAt)
+	// the transaction derived from the locked job row, with the lifetime
+	// (iat/exp) the commit clock produced. Only iss/aud/jti and the signer's
+	// kid in the header come from the candidate.
+	claims := result.Identity.AuthoritativeIdentity().TokenClaims(iss, in.Audience, jti, result.IssuedAt, result.ExpiresAt)
 	jwt, err := s.signJWT(signer, claims)
 	if err != nil {
 		s.internalError(w, r, err, "")
 		return
 	}
 	s.metricAdd("kiwi_oidc_issues_total", 1, nil)
-	writeJSON(w, 200, map[string]any{"value": jwt, "expires_at": expiresAt})
+	writeJSON(w, 200, map[string]any{"value": jwt, "expires_at": result.ExpiresAt})
 }
 
 // errOIDCIssuanceStoreUnsupported reports a DB-mode store that cannot commit
@@ -862,11 +864,11 @@ var errOIDCIssuanceAudit = errors.New("OIDC issuance audit failed")
 // storage mode: DB mode delegates to the store's transactional
 // CommitOIDCIssuance (optional interface), while memory/fs mode executes the
 // identical predicate, claim binding and audit append under s.mu.
-func (s *Server) commitOIDCIssuance(ctx context.Context, req storage.OIDCIssuance) (storage.LockedOIDCIdentity, error) {
+func (s *Server) commitOIDCIssuance(ctx context.Context, req storage.OIDCIssuance) (storage.OIDCIssuanceResult, error) {
 	if s.DB != nil {
 		store, ok := s.DB.(storage.LeaseOIDCIssueStore)
 		if !ok {
-			return storage.LockedOIDCIdentity{}, errOIDCIssuanceStoreUnsupported
+			return storage.OIDCIssuanceResult{}, errOIDCIssuanceStoreUnsupported
 		}
 		return store.CommitOIDCIssuance(ctx, req)
 	}
@@ -880,36 +882,35 @@ func (s *Server) commitOIDCIssuance(ctx context.Context, req storage.OIDCIssuanc
 // check and the audit. A store without an audit sink (pure in-memory dev
 // mode) has no durable trail to require; every store-backed mode appends the
 // event and fails the issuance closed when the append fails.
-func (s *Server) commitOIDCIssuanceLocked(req storage.OIDCIssuance) (storage.LockedOIDCIdentity, error) {
+func (s *Server) commitOIDCIssuanceLocked(req storage.OIDCIssuance) (storage.OIDCIssuanceResult, error) {
 	if err := storage.ValidateOIDCIssuanceRequest(req); err != nil {
-		return storage.LockedOIDCIdentity{}, err
+		return storage.OIDCIssuanceResult{}, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	j, ok := s.jobs[req.JobID]
 	if !ok {
-		return storage.LockedOIDCIdentity{}, storage.ErrNotFound
+		return storage.OIDCIssuanceResult{}, storage.ErrNotFound
 	}
 	// The commit clock is sampled UNDER the lock, from this mode's own clock
-	// domain, AFTER any pre-commit stall: the predicate must see a lease (or
-	// requested lifetime) that expired during signer/key-store work, not the
-	// handler-captured IssuedAt.
+	// domain, AFTER any pre-commit stall: the predicate must see a lease that
+	// expired during signer/key-store work, not a handler-captured instant.
 	commitNow := time.Now().UTC()
 	locked := storage.LockedOIDCIdentityForJob(j)
 	if err := storage.ValidateOIDCIssuanceAt(locked, req, commitNow); err != nil {
-		return storage.LockedOIDCIdentity{}, err
+		return storage.OIDCIssuanceResult{}, err
 	}
 	auditID, err := newID()
 	if err != nil {
-		return storage.LockedOIDCIdentity{}, fmt.Errorf("%w: %v", errOIDCIssuanceAudit, err)
+		return storage.OIDCIssuanceResult{}, fmt.Errorf("%w: %v", errOIDCIssuanceAudit, err)
 	}
-	ev := storage.OIDCIssuanceAuditEvent(req, auditID)
+	ev := storage.OIDCIssuanceAuditEvent(req, auditID, commitNow)
 	if s.store != nil {
 		if err := s.store.AppendAudit(ev); err != nil {
-			return storage.LockedOIDCIdentity{}, fmt.Errorf("%w: %v", errOIDCIssuanceAudit, err)
+			return storage.OIDCIssuanceResult{}, fmt.Errorf("%w: %v", errOIDCIssuanceAudit, err)
 		}
 	}
-	return locked, nil
+	return storage.OIDCIssuanceResult{Identity: locked, IssuedAt: commitNow, ExpiresAt: commitNow.Add(req.TTL)}, nil
 }
 
 // oidcIssuanceRefusal maps a commit-time issuance refusal onto its HTTP

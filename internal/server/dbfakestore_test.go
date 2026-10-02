@@ -28,16 +28,18 @@ type dbFakeStore struct {
 	// reportCreatedAt, when set, models the SQL fence's database-clock stamp
 	// for test-report CreatedAt (LeaseTestReportStore).
 	reportCreatedAt *time.Time
-	checkRuns       map[string]string
-	logBatches      map[string]string
-	runs            map[string]model.Run
-	jobs            map[string]model.Job
-	runners         map[string]model.Runner
-	receipts        map[string]model.CompletionReceipt
-	audit           []model.AuditEvent
-	logs            []model.LogEntry
-	artifacts       []model.ArtifactRecord
-	reports         []model.TestReport
+	// clockErr, when set, makes Now (ClockStore) fail.
+	clockErr   error
+	checkRuns  map[string]string
+	logBatches map[string]string
+	runs       map[string]model.Run
+	jobs       map[string]model.Job
+	runners    map[string]model.Runner
+	receipts   map[string]model.CompletionReceipt
+	audit      []model.AuditEvent
+	logs       []model.LogEntry
+	artifacts  []model.ArtifactRecord
+	reports    []model.TestReport
 
 	// digestFenceOnce/digestFence back the fake's DigestFenceStore surface:
 	// DB-mode handlers require the cross-replica-capability contract and fail
@@ -1382,6 +1384,20 @@ func (f *dbFakeStore) GetRunner(ctx context.Context, id string) (model.Runner, e
 	}
 	return r, nil
 }
+
+// Now implements storage.ClockStore in the fake's clock domain (f.leaseNow
+// when configured, else wall time), so DB-mode code that must not use the
+// application clock can be tested deterministically.
+func (f *dbFakeStore) Now(ctx context.Context) (time.Time, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.clockErr != nil {
+		return time.Time{}, f.clockErr
+	}
+	return f.grantNowLocked(), nil
+}
+
+var _ storage.ClockStore = (*dbFakeStore)(nil)
 
 // TouchRunnerLastSeen implements storage.RunnerHeartbeatStore: the heartbeat
 // liveness refresh moves ONLY last_seen, so a concurrent admin disable/drain/
@@ -3648,11 +3664,35 @@ func (f *dbFakeStore) CertRevoked(ctx context.Context, serial string) (bool, err
 	return ok, nil
 }
 
-func (f *dbFakeStore) PutEnrollGrant(ctx context.Context, digest string, expiresAt time.Time, boundLabels []string) error {
+// grantNowLocked is the fake's enrollment-grant store clock: f.leaseNow when
+// configured (a controlled database clock), else wall time. Callers hold f.mu.
+func (f *dbFakeStore) grantNowLocked() time.Time {
+	if f.leaseNow != nil {
+		return f.leaseNow().UTC()
+	}
+	return time.Now().UTC()
+}
+
+func (f *dbFakeStore) PutEnrollGrantWithTTL(ctx context.Context, digest string, ttl time.Duration, boundLabels []string) (time.Time, error) {
+	if ttl <= 0 {
+		return time.Time{}, fmt.Errorf("enroll grant ttl must be positive")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.grants[digest] = storage.EnrollGrantRecord{ExpiresAt: expiresAt, BoundLabels: append([]string(nil), boundLabels...)}
-	return nil
+	if _, ok := f.grants[digest]; ok {
+		return time.Time{}, fmt.Errorf("storage: enrollment grant digest already exists")
+	}
+	expires := f.grantNowLocked().Add(ttl)
+	f.grants[digest] = storage.EnrollGrantRecord{ExpiresAt: expires, BoundLabels: append([]string(nil), boundLabels...)}
+	return expires, nil
+}
+
+// EnrollGrantLive mirrors the SQL gate in the fake's clock domain.
+func (f *dbFakeStore) EnrollGrantLive(ctx context.Context, digest string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	rec, ok := f.grants[digest]
+	return ok && !rec.Consumed && f.grantNowLocked().Before(rec.ExpiresAt), nil
 }
 
 func (f *dbFakeStore) GetEnrollGrant(ctx context.Context, digest string) (storage.EnrollGrantRecord, bool, error) {
@@ -3672,7 +3712,7 @@ func (f *dbFakeStore) ConsumeEnrollGrant(ctx context.Context, digest string, con
 	if rec.Consumed {
 		return storage.EnrollGrantRecord{}, storage.ErrGrantConsumed
 	}
-	if !time.Now().UTC().Before(rec.ExpiresAt) {
+	if !f.grantNowLocked().Before(rec.ExpiresAt) {
 		return storage.EnrollGrantRecord{}, storage.ErrGrantExpired
 	}
 	rec.Consumed = true
@@ -3823,30 +3863,33 @@ func (f *dbFakeStore) InsertArtifactOnceForLease(ctx context.Context, jobID, run
 // the lock, like memStore and the server's in-process path) and appends the
 // oidc.issued audit row, honoring the injected audit failure exactly like
 // AppendAudit.
-func (f *dbFakeStore) CommitOIDCIssuance(ctx context.Context, req storage.OIDCIssuance) (storage.LockedOIDCIdentity, error) {
+func (f *dbFakeStore) CommitOIDCIssuance(ctx context.Context, req storage.OIDCIssuance) (storage.OIDCIssuanceResult, error) {
 	if err := storage.ValidateOIDCIssuanceRequest(req); err != nil {
-		return storage.LockedOIDCIdentity{}, err
+		return storage.OIDCIssuanceResult{}, err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	j, ok := f.jobs[req.JobID]
 	if !ok {
-		return storage.LockedOIDCIdentity{}, storage.ErrNotFound
+		return storage.OIDCIssuanceResult{}, storage.ErrNotFound
 	}
 	commitNow := time.Now().UTC()
+	if f.leaseNow != nil {
+		commitNow = f.leaseNow().UTC()
+	}
 	locked := storage.LockedOIDCIdentityForJob(j)
 	if err := storage.ValidateOIDCIssuanceAt(locked, req, commitNow); err != nil {
-		return storage.LockedOIDCIdentity{}, err
+		return storage.OIDCIssuanceResult{}, err
 	}
 	if f.auditErr != nil {
-		return storage.LockedOIDCIdentity{}, f.auditErr
+		return storage.OIDCIssuanceResult{}, f.auditErr
 	}
 	auditID, err := newID()
 	if err != nil {
-		return storage.LockedOIDCIdentity{}, err
+		return storage.OIDCIssuanceResult{}, err
 	}
-	f.audit = append(f.audit, storage.OIDCIssuanceAuditEvent(req, auditID))
-	return locked, nil
+	f.audit = append(f.audit, storage.OIDCIssuanceAuditEvent(req, auditID, commitNow))
+	return storage.OIDCIssuanceResult{Identity: locked, IssuedAt: commitNow, ExpiresAt: commitNow.Add(req.TTL)}, nil
 }
 
 var _ storage.LeaseOIDCIssueStore = (*dbFakeStore)(nil)

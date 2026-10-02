@@ -21,15 +21,23 @@ import (
 type enrollFaultStore struct {
 	*dbFakeStore
 	putErr     error
+	liveErr    error
 	getErr     error
 	consumeErr error
 }
 
-func (f *enrollFaultStore) PutEnrollGrant(ctx context.Context, digest string, expiresAt time.Time, boundLabels []string) error {
+func (f *enrollFaultStore) PutEnrollGrantWithTTL(ctx context.Context, digest string, ttl time.Duration, boundLabels []string) (time.Time, error) {
 	if f.putErr != nil {
-		return f.putErr
+		return time.Time{}, f.putErr
 	}
-	return f.dbFakeStore.PutEnrollGrant(ctx, digest, expiresAt, boundLabels)
+	return f.dbFakeStore.PutEnrollGrantWithTTL(ctx, digest, ttl, boundLabels)
+}
+
+func (f *enrollFaultStore) EnrollGrantLive(ctx context.Context, digest string) (bool, error) {
+	if f.liveErr != nil {
+		return false, f.liveErr
+	}
+	return f.dbFakeStore.EnrollGrantLive(ctx, digest)
 }
 
 func (f *enrollFaultStore) GetEnrollGrant(ctx context.Context, digest string) (storage.EnrollGrantRecord, bool, error) {

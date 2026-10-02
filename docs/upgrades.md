@@ -589,3 +589,36 @@ claims themselves.
 - `SwitchToDB` now also requires `DeploymentStore`: a DB store without the
   contract is refused at startup instead of silently degrading deployment
   lifecycle state to the process-local mirror.
+- Enrollment-grant lifetimes are now store-clock authoritative:
+  `EnrollGrantStore.PutEnrollGrantWithTTL` takes a duration and derives
+  `expires_at` in the database (`clock_timestamp() + TTL`), the DB-mode gate
+  asks the store for liveness (`EnrollGrantLive`, no application-clock expiry
+  decision), and `ConsumeEnrollGrant` locks the grant row FIRST, samples
+  `clock_timestamp()` after the lock and only then evaluates expiry (a
+  single-statement `expires_at > clock_timestamp()` would evaluate before a
+  row-lock wait and wrongly admit the consumer). A skewed replica can
+  therefore neither extend nor pre-expire an enrollment credential, and a
+  consumer that waits past expiry loses.
+- Outbox claim leases now run entirely in the database clock: the due
+  predicate (`next_attempt_at`), the claim cutoff
+  (`claimed_at < clock_timestamp() - OutboxClaimTTL` computed in SQL) and the
+  `claimed_at = clock_timestamp()` stamp carry no application timestamp, so a
+  clock-ahead leader cannot steal another replica's live claim and a
+  clock-behind one cannot strand a dead owner's claim. The claim time is also
+  post-wait rather than transaction-start (`now()`).
+- OIDC id_token issuance now takes a TTL, not absolute `iat`/`exp`: the
+  commit returns `OIDCIssuanceResult{IssuedAt, ExpiresAt}` derived from its
+  own commit clock (PostgreSQL: the post-lock `clock_timestamp()`), and the
+  JWT and the durable `oidc.issued` audit both use those values, so the
+  credential window can never disagree with the lease predicate that
+  authorized it.
+- DB-mode schedule due evaluation uses the shared database clock
+  (`storage.ClockStore.Now`); a missing capability or a failed clock read
+  SKIPS the tick instead of falling back to the leader's wall clock, so two
+  leaders with opposite skew agree on the same due set and an ahead leader
+  cannot fire an occurrence early.
+- Non-Unix staging ownership release is retryable: a transient lock-file
+  unlink failure no longer clears ownership, and `Budget.CloseWithContext`
+  only finalizes/unregisters/closes its hand-off channel AFTER the ownership
+  release succeeds, so a retry can complete the hand-off and a successor
+  never starts while the directory may still be owned.

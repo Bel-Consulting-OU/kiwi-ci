@@ -290,7 +290,7 @@ func TestPostgresIntegrationJSONSeamSweep(t *testing.T) {
 	})
 	t.Run("PutEnrollGrant", func(t *testing.T) {
 		defer seamPGFailAll(t)()
-		if err := st.PutEnrollGrant(ctx, pgITNewID(t), time.Now().Add(time.Hour), nil); !errors.Is(err, errPGSeamJSON) {
+		if _, err := st.PutEnrollGrantWithTTL(ctx, pgITNewID(t), time.Hour, nil); !errors.Is(err, errPGSeamJSON) {
 			t.Fatalf("PutEnrollGrant = %v", err)
 		}
 	})

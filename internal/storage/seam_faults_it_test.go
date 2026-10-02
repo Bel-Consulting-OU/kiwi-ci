@@ -270,7 +270,7 @@ func TestPostgresIntegrationStatementFaults(t *testing.T) {
 	t.Run("ConsumeEnrollGrant/read", func(t *testing.T) {
 		st := pgITStore(t)
 		digest := pgITNewID(t)
-		if err := st.PutEnrollGrant(ctx, digest, time.Now().Add(time.Hour), nil); err != nil {
+		if _, err := st.PutEnrollGrantWithTTL(ctx, digest, time.Hour, nil); err != nil {
 			t.Fatal(err)
 		}
 		pgITSkipWrites(t, st, "enrollment_grants", "UPDATE")

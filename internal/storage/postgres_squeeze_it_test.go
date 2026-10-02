@@ -534,14 +534,14 @@ func TestPostgresIntegrationSimpleStatementFailures(t *testing.T) {
 	t.Run("PutEnrollGrant", func(t *testing.T) {
 		st := pgITStore(t)
 		pgITBoom(t, st, "enrollment_grants")
-		if err := st.PutEnrollGrant(context.Background(), "digest", time.Now().UTC().Add(time.Hour), nil); err == nil {
+		if _, err := st.PutEnrollGrantWithTTL(context.Background(), "digest", time.Hour, nil); err == nil {
 			t.Fatal("PutEnrollGrant over a boom trigger = nil error")
 		}
 	})
 	t.Run("ConsumeEnrollGrant", func(t *testing.T) {
 		st := pgITStore(t)
 		digest := pgITNewID(t)
-		if err := st.PutEnrollGrant(context.Background(), digest, time.Now().UTC().Add(time.Hour), nil); err != nil {
+		if _, err := st.PutEnrollGrantWithTTL(context.Background(), digest, time.Hour, nil); err != nil {
 			t.Fatal(err)
 		}
 		pgITBoom(t, st, "enrollment_grants")
@@ -805,7 +805,7 @@ func TestPostgresIntegrationCloseThenSweep(t *testing.T) {
 	if err := st.AdjustQuotaCounter(ctx, "r", "t", 1, 1); err == nil {
 		t.Fatal("AdjustQuotaCounter on a closed pool = nil error")
 	}
-	if err := st.PutEnrollGrant(ctx, "d", time.Now().UTC(), nil); err == nil {
+	if _, err := st.PutEnrollGrantWithTTL(ctx, "d", time.Hour, nil); err == nil {
 		t.Fatal("PutEnrollGrant on a closed pool = nil error")
 	}
 	if _, err := st.ConsumeEnrollGrant(ctx, "d", "cb"); err == nil {
@@ -904,7 +904,7 @@ func TestPostgresIntegrationClosedPoolBeginSweep(t *testing.T) {
 	if err := st.AppendDownstreamRun(ctx, runID, pgITNewID(t)); err == nil {
 		t.Fatal("AppendDownstreamRun on a closed pool = nil error")
 	}
-	if err := st.PutEnrollGrant(ctx, "digest", now.Add(time.Hour), nil); err == nil {
+	if _, err := st.PutEnrollGrantWithTTL(ctx, "digest", time.Hour, nil); err == nil {
 		t.Fatal("PutEnrollGrant on a closed pool = nil error")
 	}
 	if err := st.SetQueueReasons(ctx, map[string]string{jobID: "ENV"}); err == nil {

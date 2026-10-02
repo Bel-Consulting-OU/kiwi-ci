@@ -27,11 +27,10 @@ func oidcIssueTestJob() model.Job {
 }
 
 func oidcIssueTestRequest(j model.Job) OIDCIssuance {
-	now := time.Now().UTC()
 	return OIDCIssuance{
 		JobID: j.ID, RunnerID: j.LeaseRunnerID, LeaseGeneration: j.LeaseGeneration,
 		LeaseTokenHash: j.LeaseTokenHash, Audience: "https://aud.example.com",
-		KID: "kid-1", JTI: "jti-1", IssuedAt: now, ExpiresAt: now.Add(5 * time.Minute),
+		KID: "kid-1", JTI: "jti-1", TTL: 5 * time.Minute,
 		Claims: map[string]string{
 			OIDCClaimJobID:        j.ID,
 			OIDCClaimRunID:        j.RunID,
@@ -65,10 +64,11 @@ func seedOIDCIssueMemStore(t *testing.T, j model.Job) *memStore {
 func TestOIDCIssuanceCommitMemStoreParity(t *testing.T) {
 	j := oidcIssueTestJob()
 	m := seedOIDCIssueMemStore(t, j)
-	locked, err := m.CommitOIDCIssuance(ctx(), oidcIssueTestRequest(j))
+	result, err := m.CommitOIDCIssuance(ctx(), oidcIssueTestRequest(j))
 	if err != nil {
 		t.Fatalf("live commit: %v", err)
 	}
+	locked := result.Identity
 	if locked.JobID != j.ID || locked.RunID != j.RunID || locked.JobKey != j.Key {
 		t.Fatalf("locked identity = %+v", locked)
 	}
@@ -98,8 +98,7 @@ func TestOIDCIssuanceCommitMemStoreParity(t *testing.T) {
 		"environment":   j.Environment,
 		"trusted":       true,
 	}
-	reqForClaims := oidcIssueTestRequest(j)
-	claims := ident.TokenClaims("https://issuer.example.com", "https://aud.example.com", "jti-1", reqForClaims.IssuedAt, reqForClaims.ExpiresAt)
+	claims := ident.TokenClaims("https://issuer.example.com", "https://aud.example.com", "jti-1", result.IssuedAt, result.ExpiresAt)
 	for key, want := range wantClaims {
 		if claims[key] != want {
 			t.Fatalf("token claim %q = %v, want the locked value %v", key, claims[key], want)
@@ -182,43 +181,60 @@ func TestOIDCIssuanceCommitMemStoreParity(t *testing.T) {
 
 // TestOIDCIssuanceCommitClockRefusesStaleIssuedAt is the W2-A storage-level
 // regression: the lease expiry must be judged at the STORAGE commit clock,
-// not at the handler-captured IssuedAt. The lease here expires before the
-// commit but after IssuedAt — exactly the window a slow signer/key-ring
-// rotation opens — so the pre-fix predicate (LeaseExpiresAt.After(IssuedAt))
-// accepted it. Refusal is typed ErrOIDCIssuanceExpired and appends no audit.
+// not at a handler-captured instant. The lease here expired before the commit
+// (exactly the window a slow signer/key-ring rotation opens), so the commit
+// refuses with ErrOIDCIssuanceExpired and appends no audit.
 func TestOIDCIssuanceCommitClockRefusesStaleIssuedAt(t *testing.T) {
 	j := oidcIssueTestJob()
 	expired := time.Now().UTC().Add(-time.Second)
 	j.LeaseExpiresAt = &expired
 	m := seedOIDCIssueMemStore(t, j)
 	req := oidcIssueTestRequest(j)
-	now := time.Now().UTC()
-	req.IssuedAt = now.Add(-time.Hour)
-	req.ExpiresAt = now.Add(5 * time.Minute)
 	if _, err := m.CommitOIDCIssuance(ctx(), req); !errors.Is(err, ErrOIDCIssuanceExpired) {
-		t.Fatalf("commit with a lease that expired after IssuedAt = %v, want ErrOIDCIssuanceExpired", err)
+		t.Fatalf("commit with a lease that expired before the commit = %v, want ErrOIDCIssuanceExpired", err)
 	}
 	if events, err := m.ReadAudit(ctx(), 10); err != nil || len(events) != 0 {
 		t.Fatalf("refused commit audit = %+v (err %v), want none", events, err)
 	}
 }
 
-// TestOIDCIssuanceCommitClockRefusesElapsedLifetime is the twin for the
-// candidate's intended lifetime: a token whose exp already passed at the
-// commit clock must not be minted even though the lease is still live and the
-// pre-fix predicate (which compared only the lease to IssuedAt) accepted it.
-func TestOIDCIssuanceCommitClockRefusesElapsedLifetime(t *testing.T) {
+// TestOIDCIssuanceCommitRefusesNonPositiveTTL pins the lifetime shape: the
+// caller supplies a TTL and the store derives the absolute window, so a
+// non-positive TTL is a typed shape refusal and appends no audit.
+func TestOIDCIssuanceCommitRefusesNonPositiveTTL(t *testing.T) {
 	j := oidcIssueTestJob()
 	m := seedOIDCIssueMemStore(t, j)
 	req := oidcIssueTestRequest(j)
-	now := time.Now().UTC()
-	req.IssuedAt = now.Add(-2 * time.Hour)
-	req.ExpiresAt = now.Add(-time.Hour)
-	if _, err := m.CommitOIDCIssuance(ctx(), req); !errors.Is(err, ErrOIDCIssuanceExpired) {
-		t.Fatalf("commit with an elapsed requested lifetime = %v, want ErrOIDCIssuanceExpired", err)
+	req.TTL = 0
+	if _, err := m.CommitOIDCIssuance(ctx(), req); !errors.Is(err, ErrOIDCIssuanceInvalid) {
+		t.Fatalf("commit with a zero token ttl = %v, want ErrOIDCIssuanceInvalid", err)
 	}
 	if events, err := m.ReadAudit(ctx(), 10); err != nil || len(events) != 0 {
 		t.Fatalf("refused commit audit = %+v (err %v), want none", events, err)
+	}
+}
+
+// TestOIDCIssuanceLifetimeUsesCommitClock pins the memStore credential
+// window: IssuedAt is the commit clock sampled under the store lock and
+// ExpiresAt is exactly IssuedAt plus the requested TTL.
+func TestOIDCIssuanceLifetimeUsesCommitClock(t *testing.T) {
+	j := oidcIssueTestJob()
+	m := seedOIDCIssueMemStore(t, j)
+	before := time.Now().UTC()
+	result, err := m.CommitOIDCIssuance(ctx(), oidcIssueTestRequest(j))
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	after := time.Now().UTC()
+	if result.IssuedAt.Before(before.Add(-time.Second)) || result.IssuedAt.After(after.Add(time.Second)) {
+		t.Fatalf("IssuedAt %v outside the commit window [%v, %v]", result.IssuedAt, before, after)
+	}
+	if !result.ExpiresAt.Equal(result.IssuedAt.Add(5 * time.Minute)) {
+		t.Fatalf("ExpiresAt %v != IssuedAt %v + 5m", result.ExpiresAt, result.IssuedAt)
+	}
+	events, err := m.ReadAudit(ctx(), 10)
+	if err != nil || len(events) != 1 || !events[0].CreatedAt.UTC().Equal(result.IssuedAt) {
+		t.Fatalf("audit = %+v err=%v, want created_at == commit IssuedAt %v", events, err, result.IssuedAt)
 	}
 }
 
@@ -230,12 +246,12 @@ func TestOIDCIssuanceCommitFaultyStoreParity(t *testing.T) {
 	j := oidcIssueTestJob()
 	inner := seedOIDCIssueMemStore(t, j)
 	fs := &FaultyStore{Inner: inner}
-	locked, err := fs.CommitOIDCIssuance(ctx(), oidcIssueTestRequest(j))
+	result, err := fs.CommitOIDCIssuance(ctx(), oidcIssueTestRequest(j))
 	if err != nil {
 		t.Fatalf("pass-through commit: %v", err)
 	}
-	if locked.JobID != j.ID {
-		t.Fatalf("pass-through locked = %+v", locked)
+	if result.Identity.JobID != j.ID {
+		t.Fatalf("pass-through locked = %+v", result.Identity)
 	}
 	events, _ := inner.ReadAudit(ctx(), 10)
 	if len(events) != 1 {

@@ -101,12 +101,15 @@ func (s *Server) CreateEnrollGrant(ctx context.Context, ttl time.Duration, allow
 	if s.DB != nil {
 		// DB mode demands the durable grant store: a grant minted into one
 		// replica's memory map could not be consumed on any other replica
-		// (HA split-brain), so an unsupported store refuses instead.
+		// (HA split-brain), so an unsupported store refuses instead. The
+		// store derives the expiry from ITS OWN clock (PostgreSQL
+		// clock_timestamp() + TTL), so a skewed serving replica cannot
+		// extend or pre-expire an enrollment credential.
 		gs, ok := s.DB.(storage.EnrollGrantStore)
 		if !ok {
 			return "", fmt.Errorf("store does not support enrollment grants")
 		}
-		if err := gs.PutEnrollGrant(ctx, auth.TokenDigest(token), expires, allowedLabels); err != nil {
+		if _, err := gs.PutEnrollGrantWithTTL(ctx, auth.TokenDigest(token), ttl, allowedLabels); err != nil {
 			return "", err
 		}
 		return token, nil
@@ -165,11 +168,12 @@ func (s *Server) enrollGrantOK(ctx context.Context, tok string) bool {
 			// replica-local map.
 			return false
 		}
-		rec, found, err := gs.GetEnrollGrant(ctx, digest)
-		if err != nil || !found {
-			return false
-		}
-		return !rec.Consumed && time.Now().UTC().Before(rec.ExpiresAt)
+		// The liveness decision is the STORE's: PostgreSQL evaluates
+		// consumed_at IS NULL AND expires_at > clock_timestamp(), so a
+		// skewed serving replica can neither reject a live grant nor admit
+		// an expired one.
+		live, err := gs.EnrollGrantLive(ctx, digest)
+		return err == nil && live
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -255,9 +259,11 @@ func (s *Server) consumeEnrollGrant(ctx context.Context, tok string, requestLabe
 		if rec.Consumed {
 			return fmt.Errorf("enrollment grant already used")
 		}
-		if !time.Now().UTC().Before(rec.ExpiresAt) {
-			return fmt.Errorf("enrollment grant expired")
-		}
+		// No application-clock expiry decision here: the conditional UPDATE
+		// evaluates expires_at > clock_timestamp() at consumption time (and
+		// re-evaluates after any row-lock wait), so a skew cannot refuse a
+		// live grant nor consume an expired one. Labels are validated first
+		// so an unpermitted request never burns the grant.
 		if err := checkGrantAllowedLabels(rec.BoundLabels, requestLabels); err != nil {
 			return err
 		}

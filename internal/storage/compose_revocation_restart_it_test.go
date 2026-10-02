@@ -87,14 +87,14 @@ func TestComposeRevocationAndGrantStateSurvivePoolRestart(t *testing.T) {
 		t.Fatalf("disable runner: %v", err)
 	}
 	consumedDigest := "compose-consumed-grant"
-	if err := stA.PutEnrollGrant(ctx, consumedDigest, time.Now().UTC().Add(time.Hour), nil); err != nil {
+	if _, err := stA.PutEnrollGrantWithTTL(ctx, consumedDigest, time.Hour, nil); err != nil {
 		t.Fatalf("put consumed grant: %v", err)
 	}
 	if _, err := stA.ConsumeEnrollGrant(ctx, consumedDigest, "compose-tester"); err != nil {
 		t.Fatalf("consume grant: %v", err)
 	}
 	unusedDigest := "compose-unused-grant"
-	if err := stA.PutEnrollGrant(ctx, unusedDigest, time.Now().UTC().Add(time.Hour), nil); err != nil {
+	if _, err := stA.PutEnrollGrantWithTTL(ctx, unusedDigest, time.Hour, nil); err != nil {
 		t.Fatalf("put unused grant: %v", err)
 	}
 	if revoked, err := stA.CertRevoked(ctx, serial); err != nil || !revoked {

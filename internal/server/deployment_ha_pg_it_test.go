@@ -7,6 +7,8 @@ package server
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
 	"sync"
 	"testing"
 	"time"
@@ -175,6 +177,84 @@ func TestIntegrationRecordDeploymentIdentityConflictFailsClosed(t *testing.T) {
 	recs, err := st.ListDeploymentsByRun(ctx, job.RunID)
 	if err != nil || len(recs) != 1 || recs[0].Environment != "prod" {
 		t.Fatalf("deployments after conflict = %+v err=%v, want only the prod record", recs, err)
+	}
+}
+
+// TestIntegrationDeploymentEndpointRequiresRunningReplaysCanonical pins the
+// HTTP contract of POST /api/v1/jobs/{id}/deployments in real DB mode: a
+// queued job is refused, a running job's record starts at the job's
+// authoritative database-stamped StartedAt (never the handling replica's
+// request clock), and an empty-mirror replica replay returns the same
+// canonical durable record with no second audit event.
+func TestIntegrationDeploymentEndpointRequiresRunningReplaysCanonical(t *testing.T) {
+	env := pgITServerSetup(t)
+	sA, st := pgITServerWithEnv(t, env, t.TempDir())
+	pgITServerAwaitLeadership(t, sA)
+	grantDeployments(sA)
+	ctx := context.Background()
+
+	run, err := sA.enqueue(ctx, SubmitRun{
+		RepoURL: "https://github.com/kiwi/repo.git", RepoFullName: "kiwi/repo",
+		Ref: "main", SHA: "abc123", Event: "push",
+		Pipeline: deploymentPipeline, Trusted: true,
+	})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	jobs, err := st.ListJobsByRun(ctx, run.ID)
+	if err != nil || len(jobs) != 1 || jobs[0].Environment == "" {
+		t.Fatalf("jobs = %+v err=%v, want exactly one environment job", jobs, err)
+	}
+	jobID := jobs[0].ID
+
+	// Queued: the explicit endpoint must not fabricate a running deployment.
+	w := pgITDo(t, sA, http.MethodPost, "/api/v1/jobs/"+jobID+"/deployments", "token", "", nil)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("queued deployment record = %d, want 409: %s", w.Code, w.Body.String())
+	}
+	if n := deploymentHARows(t, env, jobID); n != 0 {
+		t.Fatalf("queued job has %d deployment rows, want 0", n)
+	}
+
+	// Lease it: the claim stamps started_at from the database clock and the
+	// scheduling path records the deployment automatically.
+	runnerID := pgITRegisterRunner(t, sA)
+	task := pgITNext(t, sA, runnerID)
+	if task.Job.ID != jobID || task.Job.StartedAt == nil {
+		t.Fatalf("leased task = %+v, want the environment job with an authoritative start", task.Job)
+	}
+
+	w = pgITDo(t, sA, http.MethodPost, "/api/v1/jobs/"+jobID+"/deployments", "token", "", nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("running deployment record = %d: %s", w.Code, w.Body.String())
+	}
+	var d model.Deployment
+	if err := json.Unmarshal(w.Body.Bytes(), &d); err != nil {
+		t.Fatal(err)
+	}
+	if d.StartedAt == nil || !d.StartedAt.Equal(*task.Job.StartedAt) {
+		t.Fatalf("deployment started at %v, want the job's authoritative %v", d.StartedAt, task.Job.StartedAt)
+	}
+
+	// Failover: a second replica with an empty local mirror replays through
+	// HTTP and adopts the same durable record.
+	sB, _ := pgITServerWithEnv(t, env, t.TempDir())
+	w = pgITDo(t, sB, http.MethodPost, "/api/v1/jobs/"+jobID+"/deployments", "token", "", nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("replica B deployment record = %d: %s", w.Code, w.Body.String())
+	}
+	var replayed model.Deployment
+	if err := json.Unmarshal(w.Body.Bytes(), &replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.ID != d.ID || !sameInstantPtr(replayed.StartedAt, d.StartedAt) {
+		t.Fatalf("replica B returned %+v, want the canonical %+v", replayed, d)
+	}
+	if n := deploymentHARows(t, env, jobID); n != 1 {
+		t.Fatalf("deployment rows = %d, want 1", n)
+	}
+	if n := deploymentHAStartedAudits(t, env, jobID); n != 1 {
+		t.Fatalf("deployment.started audits = %d, want 1", n)
 	}
 }
 
