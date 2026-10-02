@@ -52,6 +52,34 @@ type DiskQuotaStatus struct {
 	Hard   bool
 	Limit  int64
 	Detail string
+	// Assignment identifies the hard bound actually installed (XFS project
+	// quota only) so a caller that owns the workspace lifecycle can persist
+	// it in a crash-recovery ledger and reclaim it after a hard crash.
+	Assignment *WorkspaceQuotaAssignment
+}
+
+// WorkspaceQuotaAssignment is the durable identity of one installed XFS
+// project quota: everything needed to remove the assignment and clear the
+// hard limit after the owning process died.
+type WorkspaceQuotaAssignment struct {
+	Workspace  string `json:"workspace"`
+	MountPoint string `json:"mount_point"`
+	FsKey      string `json:"fs_key"`
+	XQ         string `json:"xq"`
+	ProjectID  uint32 `json:"project_id"`
+}
+
+// ReclaimWorkspaceQuota removes a quota assignment recorded by a previous
+// process incarnation. It positively reports failure so the caller can keep
+// the ledger entry and retry later instead of retiring ownership early.
+func ReclaimWorkspaceQuota(a WorkspaceQuotaAssignment) error {
+	if a.XQ == "" || a.MountPoint == "" || a.ProjectID == 0 {
+		return fmt.Errorf("incomplete workspace quota assignment")
+	}
+	if err := runXFSProjectCleanup(a.XQ, a.MountPoint, a.Workspace, a.ProjectID, a.FsKey); err != nil {
+		return fmt.Errorf("reclaim XFS project %d: %w", a.ProjectID, err)
+	}
+	return nil
 }
 
 // workspaceDiskQuotaSetup attempts to establish a hard OS-level bound for the
@@ -536,8 +564,11 @@ func setupXFSProjectQuotaOnMount(workspace string, entry mountInfoEntry, limit i
 		return runXFSProjectCleanup(xq, entry.mountPoint, workspace, projID, fsKey)
 	}
 	return DiskQuotaStatus{
-		Hard:   true,
-		Limit:  limit,
+		Hard:  true,
+		Limit: limit,
+		Assignment: &WorkspaceQuotaAssignment{
+			Workspace: workspace, MountPoint: entry.mountPoint, FsKey: fsKey, XQ: xq, ProjectID: projID,
+		},
 		Detail: fmt.Sprintf("XFS project quota %d enforces a hard %d-byte bound on %s (mount %s)", projID, limit, workspace, entry.mountPoint),
 	}, cleanup
 }

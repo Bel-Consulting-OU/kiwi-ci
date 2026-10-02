@@ -446,3 +446,46 @@ func TestXFSExternalAssignmentAppearingAfterInitialDiscoveryIsRespected(t *testi
 	_ = cleanup()
 	_ = cleanup2()
 }
+
+// TestWorkspaceDiskQuotaAssignmentIsReclaimable pins the crash-recovery
+// coordinate: a successful XFS setup exposes the assignment, and the exported
+// ReclaimWorkspaceQuota removes the assignment + hard limit (or reports
+// failure so the caller keeps the ledger entry).
+func TestWorkspaceDiskQuotaAssignmentIsReclaimable(t *testing.T) {
+	resetProjectIDPools(t)
+	t.Setenv(xfsProjectIDBaseEnv, "100000")
+	t.Setenv(xfsProjectIDCountEnv, "4")
+	t.Setenv("KIWI_XFS_LOCK_DIR", t.TempDir())
+	logPath := filepath.Join(t.TempDir(), "xfs.log")
+	t.Setenv("FAKE_XFS_LOG", logPath)
+	script := writeFakeXFSQuota(t, "")
+	entry := mountInfoEntry{mountPoint: "/mnt/xfs", device: "8:60", fsType: "xfs"}
+
+	status, _ := setupXFSProjectQuotaOnMount("/mnt/xfs/ws", entry, 1<<20, script)
+	if !status.Hard || status.Assignment == nil || status.Assignment.ProjectID == 0 {
+		t.Fatalf("setup status = %+v, want a hard assignment", status)
+	}
+	if err := ReclaimWorkspaceQuota(*status.Assignment); err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	cmdLog, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"project -C", "bhard=0"} {
+		if !strings.Contains(string(cmdLog), want) {
+			t.Fatalf("reclaim did not issue %q:\n%s", want, cmdLog)
+		}
+	}
+
+	// A failed cleanup is reported, never silently swallowed.
+	scriptFail := writeFakeXFSQuota(t, "project -C")
+	t.Setenv("FAKE_XFS_LOG", filepath.Join(t.TempDir(), "xfs-fail.log"))
+	status2, _ := setupXFSProjectQuotaOnMount("/mnt/xfs/ws2", entry, 1<<20, scriptFail)
+	if status2.Assignment == nil {
+		t.Fatalf("second setup = %+v", status2)
+	}
+	if err := ReclaimWorkspaceQuota(*status2.Assignment); err == nil {
+		t.Fatal("failed XFS cleanup reported success")
+	}
+}

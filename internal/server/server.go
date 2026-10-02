@@ -2740,6 +2740,12 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 			in.Capacity = 1
 		}
 		in.LastSeen = now
+		incarnation, ierr := newID()
+		if ierr != nil {
+			s.internalError(w, r, ierr, "")
+			return
+		}
+		in.Incarnation = incarnation
 		// Registration intends profile/admin fields only: the lease-owned
 		// fields are preserved by the guarded store and never supplied by
 		// this caller.
@@ -2782,6 +2788,13 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	if in.Capacity < 1 && !s.RequireProfiles {
 		in.Capacity = 1
 	}
+	incarnation, ierr := newID()
+	if ierr != nil {
+		s.mu.Unlock()
+		s.internalError(w, r, ierr, "")
+		return
+	}
+	in.Incarnation = incarnation
 	in.LastSeen = now
 	in.ActiveJobs = append([]string{}, old.ActiveJobs...)
 	// Migrate persisted pre-capacity state without losing an active lease.
@@ -3262,10 +3275,44 @@ func (s *Server) rollbackLeaseLocked(rb leaseRollback) {
 	}
 }
 
+// RunnerIncarnationHeader carries the registration session ID on runner
+// polling/heartbeat requests: a NEWER registration supersedes it, so an older
+// process sharing the stable runner ID can no longer operate. An absent header
+// (older runner during a rolling upgrade) is accepted.
+const RunnerIncarnationHeader = "X-Kiwi-Runner-Incarnation"
+
+// runnerIncarnationCurrent reports whether the request's incarnation is the
+// LATEST registration for the stable runner ID. Lookup failures fail closed
+// for a presented incarnation; legacy rows with no recorded incarnation
+// accept.
+func (s *Server) runnerIncarnationCurrent(ctx context.Context, runnerID, incarnation string) bool {
+	if strings.TrimSpace(incarnation) == "" {
+		return true
+	}
+	if s.DB != nil {
+		cur, err := s.DB.GetRunner(ctx, runnerID)
+		if err != nil {
+			return false
+		}
+		return cur.Incarnation == "" || cur.Incarnation == incarnation
+	}
+	s.mu.Lock()
+	cur, ok := s.runners[runnerID]
+	s.mu.Unlock()
+	if !ok {
+		return false
+	}
+	return cur.Incarnation == "" || cur.Incarnation == incarnation
+}
+
 func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !s.verifyRunnerIdentity(r, id) {
 		http.Error(w, "runner identity mismatch", http.StatusForbidden)
+		return
+	}
+	if !s.runnerIncarnationCurrent(r.Context(), id, r.Header.Get(RunnerIncarnationHeader)) {
+		http.Error(w, "runner session superseded by a newer registration", http.StatusConflict)
 		return
 	}
 	// Graceful drain: no new leases while the control plane is draining;
@@ -3657,6 +3704,10 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("id")
 	var in Heartbeat
 	if !decode(w, r, &in) {
+		return
+	}
+	if !s.runnerIncarnationCurrent(r.Context(), in.RunnerID, r.Header.Get(RunnerIncarnationHeader)) {
+		http.Error(w, "runner session superseded by a newer registration", http.StatusConflict)
 		return
 	}
 	_, authErr := s.authorizeRunnerLease(r, in.RunnerID, in.LeaseToken, in.LeaseGeneration)

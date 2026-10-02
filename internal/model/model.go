@@ -258,9 +258,14 @@ type Runner struct {
 	Completed  int64             `json:"completed,omitempty"`
 	Failed     int64             `json:"failed,omitempty"`
 	LastSeen   time.Time         `json:"last_seen"`
-	ActiveJobs []string          `json:"active_jobs,omitempty"`
-	CurrentJob string            `json:"current_job,omitempty"`
-	Busy       bool              `json:"busy"`
+	// Incarnation is the newest registration session for this stable runner
+	// ID: a later registration replaces it, and polling/heartbeat requests
+	// carrying an older incarnation are refused so two processes sharing one
+	// identity cannot both operate.
+	Incarnation string   `json:"incarnation,omitempty"`
+	ActiveJobs  []string `json:"active_jobs,omitempty"`
+	CurrentJob  string   `json:"current_job,omitempty"`
+	Busy        bool     `json:"busy"`
 
 	// ResourceCapacity is the runner's effective resource capacity (CPU,
 	// memory, disk, PIDs). It is overlaid from the runner's linked profile

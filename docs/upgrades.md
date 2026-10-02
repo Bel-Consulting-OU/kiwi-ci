@@ -717,12 +717,16 @@ claims themselves.
   runner's detached runtimes can no longer keep touching a workspace while
   the replacement takes work; resources of other runners sharing the daemon
   are never touched, and the age-based GC remains a backstop.
-- XFS project IDs are restart-safe: before allocating, the pool asks the
-  filesystem (`xfs_quota -x -c 'report -p -n'`) for every project ID already
-  present and permanently reserves them. A restarted runner can therefore
-  never hand out an ID a previous process left assigned, and a report failure
-  fails the quota capability closed instead of treating the ID space as
-  empty.
+- XFS project IDs are restart-safe and now RECLAIMABLE: before allocating, the
+  pool asks the filesystem (`xfs_quota -x -c 'report -p -n'`) for every
+  project ID already present and reserves them, and the acquire sequence runs
+  under a host-global per-filesystem lock with the report re-read on every
+  allocation (multi-process safe). A hard crash no longer leaks IDs forever:
+  the runner's durable runtime ledger records the installed assignment
+  (mount, project ID, tool), and the next incarnation removes the assignment
+  and hard limit before retiring the entry; a failed reclaim keeps the entry
+  and the workspace so a later run retries. A report failure fails the quota
+  capability closed instead of treating the ID space as empty.
 - `RequireNonRoot` policy is enforced: `pipeline.Sandbox` gained `NonRoot`,
   the effective policy propagates it, the container backend pins the
   workload to `65534:65534` on rootful daemons (provisioning the workspace),
@@ -777,3 +781,12 @@ claims themselves.
   becomes competitive. Runner capacity metrics report effective schedulable
   capacity (`max(capacity, 0)`), so a capacity-0 runner no longer advertises a
   phantom slot.
+
+- Runner registration now establishes a SESSION (incarnation): every
+  register response carries a fresh incarnation, polling (`/next`) and
+  heartbeat requests carry it in `X-Kiwi-Runner-Incarnation`, and a request
+  presenting a superseded incarnation is refused with 409. A copied identity
+  directory operated from another host therefore cannot keep polling beside
+  the newer process; headerless requests are accepted during a rolling
+  upgrade. Local duplicate processes are refused earlier by the identity
+  directory lifetime lock.

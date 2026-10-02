@@ -5,10 +5,13 @@ package runner
 // current-incarnation entries are never touched.
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executor"
 )
 
 func TestRuntimeLedgerReclaimsPreviousIncarnation(t *testing.T) {
@@ -66,5 +69,70 @@ func TestRuntimeLedgerReclaimsPreviousIncarnation(t *testing.T) {
 	// A replayed reconciliation is a no-op.
 	if n := r.reconcileRuntimeLedger("instance-B"); n != 0 {
 		t.Fatalf("replayed reconciliation reclaimed %d entries", n)
+	}
+}
+
+func TestRuntimeLedgerReclaimsXFSQuotaBeforeRetiring(t *testing.T) {
+	workDir := t.TempDir()
+	r := &Runner{Cfg: Config{WorkDir: workDir}}
+	ws := filepath.Join(t.TempDir(), "kiwi-run-xfs")
+	if err := os.MkdirAll(ws, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	id := r.ledgerAdd(runtimeLedgerEntry{Instance: "instance-A", JobID: "job-x", Workspace: ws})
+	r.ledgerSetXFS(id, &executor.WorkspaceQuotaAssignment{Workspace: ws, MountPoint: "/mnt/x", FsKey: "8:1", XQ: "xfs_quota", ProjectID: 123})
+
+	prev := reclaimWorkspaceQuota
+	var calls []uint32
+	reclaimWorkspaceQuota = func(a executor.WorkspaceQuotaAssignment) error {
+		calls = append(calls, a.ProjectID)
+		return nil
+	}
+	t.Cleanup(func() { reclaimWorkspaceQuota = prev })
+
+	if n := r.reconcileRuntimeLedger("instance-B"); n != 1 {
+		t.Fatalf("reclaimed %d entries, want 1", n)
+	}
+	if len(calls) != 1 || calls[0] != 123 {
+		t.Fatalf("quota reclaim calls = %v, want [123]", calls)
+	}
+	if _, err := os.Stat(ws); !os.IsNotExist(err) {
+		t.Fatalf("workspace survived a successful quota reclaim: %v", err)
+	}
+}
+
+func TestRuntimeLedgerKeepsEntryWhenXFSReclaimFails(t *testing.T) {
+	workDir := t.TempDir()
+	r := &Runner{Cfg: Config{WorkDir: workDir}}
+	ws := filepath.Join(t.TempDir(), "kiwi-run-xfs2")
+	if err := os.MkdirAll(ws, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	id := r.ledgerAdd(runtimeLedgerEntry{Instance: "instance-A", JobID: "job-x", Workspace: ws})
+	r.ledgerSetXFS(id, &executor.WorkspaceQuotaAssignment{Workspace: ws, MountPoint: "/mnt/x", FsKey: "8:1", XQ: "xfs_quota", ProjectID: 124})
+
+	prev := reclaimWorkspaceQuota
+	fail := true
+	reclaimWorkspaceQuota = func(executor.WorkspaceQuotaAssignment) error {
+		if fail {
+			return errors.New("xfs cleanup refused")
+		}
+		return nil
+	}
+	t.Cleanup(func() { reclaimWorkspaceQuota = prev })
+
+	if n := r.reconcileRuntimeLedger("instance-B"); n != 0 {
+		t.Fatalf("failed reclaim retired %d entries", n)
+	}
+	if _, err := os.Stat(ws); err != nil {
+		t.Fatalf("workspace removed before the quota was reclaimed: %v", err)
+	}
+	// Retry converges once cleanup can be proven.
+	fail = false
+	if n := r.reconcileRuntimeLedger("instance-B"); n != 1 {
+		t.Fatalf("retry reclaimed %d entries, want 1", n)
+	}
+	if _, err := os.Stat(ws); !os.IsNotExist(err) {
+		t.Fatalf("workspace survived the retry: %v", err)
 	}
 }

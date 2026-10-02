@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executor"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 )
 
@@ -15,12 +16,16 @@ import (
 // visible to the job so a hard crash leaves enough information for the next
 // incarnation to reclaim what the deferred cleanup could not.
 type runtimeLedgerEntry struct {
-	ID        string    `json:"id"`
-	Instance  string    `json:"instance"`
-	JobID     string    `json:"job"`
-	Workspace string    `json:"workspace,omitempty"`
-	Artifacts []string  `json:"artifacts,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+	ID        string   `json:"id"`
+	Instance  string   `json:"instance"`
+	JobID     string   `json:"job"`
+	Workspace string   `json:"workspace,omitempty"`
+	Artifacts []string `json:"artifacts,omitempty"`
+	// XFS is the installed project-quota assignment: after a hard crash the
+	// next incarnation removes the assignment and clears the hard limit
+	// before retiring the entry, so crashed jobs cannot leak project IDs.
+	XFS       *executor.WorkspaceQuotaAssignment `json:"xfs,omitempty"`
+	CreatedAt time.Time                          `json:"created_at"`
 }
 
 func (r *Runner) runtimeLedgerDir() string {
@@ -75,6 +80,32 @@ func (r *Runner) ledgerAddArtifacts(id, dir string) {
 	_ = fsutil.AtomicWriteFile(path, updated, 0o600)
 }
 
+// ledgerSetXFS records the installed XFS project quota on an existing entry
+// so a crash after this point is reclaimable by the next incarnation.
+func (r *Runner) ledgerSetXFS(id string, assignment *executor.WorkspaceQuotaAssignment) {
+	if id == "" || assignment == nil {
+		return
+	}
+	path := filepath.Join(r.runtimeLedgerDir(), id+".json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var entry runtimeLedgerEntry
+	if err := json.Unmarshal(b, &entry); err != nil {
+		return
+	}
+	entry.XFS = assignment
+	updated, err := json.Marshal(entry)
+	if err != nil {
+		return
+	}
+	_ = fsutil.AtomicWriteFile(path, updated, 0o600)
+}
+
+// reclaimWorkspaceQuota is the XFS-reclaim seam (tests substitute a fake).
+var reclaimWorkspaceQuota = executor.ReclaimWorkspaceQuota
+
 // ledgerRemove retires a completed job's entry.
 func (r *Runner) ledgerRemove(id string) {
 	if id == "" {
@@ -111,6 +142,15 @@ func (r *Runner) reconcileRuntimeLedger(runInstanceID string) int {
 		}
 		if entry.Instance == runInstanceID {
 			continue
+		}
+		if entry.XFS != nil {
+			// Remove the QUOTA before the workspace it bounds; if the
+			// filesystem cleanup cannot be proven, keep the entry (and the
+			// workspace) so a later run retries instead of leaking the
+			// project ID and its hard limit.
+			if err := reclaimWorkspaceQuota(*entry.XFS); err != nil {
+				continue
+			}
 		}
 		ok := true
 		paths := append([]string{entry.Workspace}, entry.Artifacts...)

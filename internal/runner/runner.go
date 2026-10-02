@@ -345,8 +345,12 @@ type Runner struct {
 	// Run start, never reused across in-process restarts); execute reads it to
 	// label runtime resources.
 	instanceID string
-	Client     *http.Client
-	Metrics    *Metrics
+	// incarnation is the SERVER-registration session ID for this stable
+	// runner identity: the server supersedes it on re-registration, so an
+	// older process with copied credentials stops polling.
+	incarnation string
+	Client      *http.Client
+	Metrics     *Metrics
 	// StreamClient carries bulk transfers (artifact/cache/snapshot/dependency
 	// uploads and downloads). It deliberately has no total timeout: the
 	// transport bounds dial/TLS-handshake/response-header phases and each
@@ -770,6 +774,7 @@ func (r *Runner) register(ctx context.Context) error {
 		return err
 	}
 	r.ID = out.ID
+	r.incarnation = out.Incarnation
 	// Capability intersection: the profile capabilities in the response are
 	// the ceiling; the runner advertises (and enforces) only the
 	// intersection with what this host actually discovered, so a job
@@ -1069,6 +1074,11 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		status, cleanup := installWorkspaceDiskQuota(tmp, quotaLimit)
 		workspaceQuota = &status
 		quotaCleanup = cleanup
+		if status.Assignment != nil {
+			// Persist the installed XFS assignment so a hard crash between
+			// here and normal teardown is reclaimable by the next Run.
+			r.ledgerSetXFS(ledgerID, status.Assignment)
+		}
 	}
 	defer func() {
 		if quotaCleanup != nil {
@@ -2662,6 +2672,9 @@ func isHTTPStatus(err error, status int) bool {
 func (r *Runner) auth(req *http.Request) {
 	if r.Cfg.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+r.Cfg.Token)
+	}
+	if r.incarnation != "" {
+		req.Header.Set(server.RunnerIncarnationHeader, r.incarnation)
 	}
 }
 
