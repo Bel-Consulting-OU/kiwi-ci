@@ -246,7 +246,7 @@ func TestComposeRunnerCancelLandsDuringQuotaInstall(t *testing.T) {
 	var limitSeen int64
 	var dirSeen string
 	origInstall := installWorkspaceDiskQuota
-	installWorkspaceDiskQuota = func(workspace string, limit int64) (executor.DiskQuotaStatus, func() error) {
+	installWorkspaceDiskQuota = func(workspace string, limit int64, _ func(executor.WorkspaceQuotaAssignment)) (executor.DiskQuotaStatus, func() error) {
 		installs++
 		limitSeen = limit
 		dirSeen = workspace

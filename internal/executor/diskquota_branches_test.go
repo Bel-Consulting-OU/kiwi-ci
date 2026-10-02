@@ -489,3 +489,66 @@ func TestWorkspaceDiskQuotaAssignmentIsReclaimable(t *testing.T) {
 		t.Fatal("failed XFS cleanup reported success")
 	}
 }
+
+// TestXFSAllocationHookFiresBeforeAssignment pins the pre-assignment
+// ownership hook: the callback receives the chosen coordinates while the
+// assignment command has NOT run yet, so a caller can persist ownership
+// before the project ID becomes externally visible.
+func TestXFSAllocationHookFiresBeforeAssignment(t *testing.T) {
+	resetProjectIDPools(t)
+	t.Setenv(xfsProjectIDBaseEnv, "100000")
+	t.Setenv(xfsProjectIDCountEnv, "2")
+	t.Setenv("KIWI_XFS_LOCK_DIR", t.TempDir())
+	logPath := filepath.Join(t.TempDir(), "xfs.log")
+	t.Setenv("FAKE_XFS_LOG", logPath)
+	script := writeFakeXFSQuota(t, "")
+	entry := mountInfoEntry{mountPoint: "/mnt/xfs", device: "8:70", fsType: "xfs"}
+
+	var hooked WorkspaceQuotaAssignment
+	var assignSeenAtHook bool
+	status, cleanup := setupXFSProjectQuotaOnMountHook("/mnt/xfs/ws", entry, 1<<20, script, func(a WorkspaceQuotaAssignment) {
+		hooked = a
+		if logged, err := os.ReadFile(logPath); err == nil {
+			assignSeenAtHook = strings.Contains(string(logged), "project -s")
+		}
+	})
+	if !status.Hard || cleanup == nil {
+		t.Fatalf("setup = %+v", status)
+	}
+	if hooked.ProjectID == 0 || hooked.ProjectID != status.Assignment.ProjectID {
+		t.Fatalf("hook assignment = %+v, status = %+v", hooked, status.Assignment)
+	}
+	if assignSeenAtHook {
+		t.Fatal("allocation hook ran AFTER the assignment command; ownership is not recorded pre-visibility")
+	}
+	if logged, err := os.ReadFile(logPath); err != nil || !strings.Contains(string(logged), "project -s") {
+		t.Fatalf("assignment command not issued: %v %s", err, logged)
+	}
+	_ = cleanup()
+}
+
+// TestReclaimWorkspaceQuotaToleratesNeverAppliedAssignment pins the crash
+// window closure: a ledger entry can exist for an assignment that never
+// reached the kernel ("no such project"), and reclaiming it succeeds (nothing
+// to remove) instead of wedging the entry forever; a genuine failure still
+// reports.
+func TestReclaimWorkspaceQuotaToleratesNeverAppliedAssignment(t *testing.T) {
+	absent := filepath.Join(t.TempDir(), "xfs_quota")
+	body := "#!/bin/sh\ncase \"$*\" in *'project -C'*) echo 'project 4242: no such project' >&2; exit 1;; esac\nexit 0\n"
+	if err := os.WriteFile(absent, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReclaimWorkspaceQuota(WorkspaceQuotaAssignment{
+		Workspace: "/mnt/xfs/never", MountPoint: "/mnt/xfs", FsKey: "8:71", XQ: absent, ProjectID: 4242,
+	}); err != nil {
+		t.Fatalf("never-applied assignment must reclaim cleanly: %v", err)
+	}
+
+	t.Setenv("FAKE_XFS_LOG", filepath.Join(t.TempDir(), "xfs.log"))
+	genuine := writeFakeXFSQuota(t, "project -C")
+	if err := ReclaimWorkspaceQuota(WorkspaceQuotaAssignment{
+		Workspace: "/mnt/xfs/ws", MountPoint: "/mnt/xfs", FsKey: "8:72", XQ: genuine, ProjectID: 4243,
+	}); err == nil || xfsCleanupAbsent(err) {
+		t.Fatalf("genuine cleanup failure = %v, want a retryable error", err)
+	}
+}

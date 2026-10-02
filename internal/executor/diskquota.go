@@ -77,9 +77,31 @@ func ReclaimWorkspaceQuota(a WorkspaceQuotaAssignment) error {
 		return fmt.Errorf("incomplete workspace quota assignment")
 	}
 	if err := runXFSProjectCleanup(a.XQ, a.MountPoint, a.Workspace, a.ProjectID, a.FsKey); err != nil {
+		// A ledger entry is written BEFORE the assignment command runs, so a
+		// crash in that window leaves coordinates for an assignment that may
+		// never have been applied. "Nothing to remove" is therefore success;
+		// any other failure keeps the entry retryable.
+		if xfsCleanupAbsent(err) {
+			return nil
+		}
 		return fmt.Errorf("reclaim XFS project %d: %w", a.ProjectID, err)
 	}
 	return nil
+}
+
+// xfsCleanupAbsent reports whether a cleanup failure means the project/path
+// was not present (a no-op cleanup), as opposed to a real removal failure.
+func xfsCleanupAbsent(err error) bool {
+	if err == nil {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	for _, needle := range []string{"no such", "not found", "does not exist", "cannot find"} {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // workspaceDiskQuotaSetup attempts to establish a hard OS-level bound for the
@@ -88,6 +110,7 @@ func ReclaimWorkspaceQuota(a WorkspaceQuotaAssignment) error {
 // diskquota_linux.go; it is a package variable so tests can substitute a
 // deterministic capability outcome.
 var workspaceDiskQuotaSetup = setupWorkspaceDiskQuota
+var workspaceDiskQuotaSetupWithHook = setupWorkspaceDiskQuotaWithHook
 
 // WorkspaceDiskQuotaSetup is the exported entry point for callers that own
 // the workspace lifecycle outside the backend (the distributed runner
@@ -95,6 +118,16 @@ var workspaceDiskQuotaSetup = setupWorkspaceDiskQuota
 // the same capability probe as the backend so the two can never disagree.
 func WorkspaceDiskQuotaSetup(workspace string, limit int64) (DiskQuotaStatus, func() error) {
 	return workspaceDiskQuotaSetup(workspace, limit)
+}
+
+// WorkspaceDiskQuotaSetupWithHook is WorkspaceDiskQuotaSetup plus an
+// allocation callback invoked UNDER the inter-process allocation lock with the
+// chosen assignment BEFORE the assignment command runs. A caller that persists
+// ownership (the runner's runtime ledger) therefore records the coordinates
+// before any external side effect exists, closing the crash window between
+// assignment and record entirely.
+func WorkspaceDiskQuotaSetupWithHook(workspace string, limit int64, onAllocated func(WorkspaceQuotaAssignment)) (DiskQuotaStatus, func() error) {
+	return workspaceDiskQuotaSetupWithHook(workspace, limit, onAllocated)
 }
 
 // WorkspaceBoundBytes derives the workspace content bound for one job with a
@@ -518,6 +551,12 @@ func parseXFSProjectIDs(out []byte) []uint32 {
 // can inherit it. On any failure before the limit was applied, the
 // half-applied state is removed and the ID released (best effort).
 func setupXFSProjectQuotaOnMount(workspace string, entry mountInfoEntry, limit int64, xq string) (DiskQuotaStatus, func() error) {
+	return setupXFSProjectQuotaOnMountHook(workspace, entry, limit, xq, nil)
+}
+
+// setupXFSProjectQuotaOnMountHook is setupXFSProjectQuotaOnMount plus the
+// pre-assignment allocation callback (see WorkspaceDiskQuotaSetupWithHook).
+func setupXFSProjectQuotaOnMountHook(workspace string, entry mountInfoEntry, limit int64, xq string, onAllocated func(WorkspaceQuotaAssignment)) (DiskQuotaStatus, func() error) {
 	fsKey := entry.fsKey()
 	// Multi-process safety: the whole acquire sequence — report existing IDs,
 	// choose a candidate, assign the workspace and apply the hard limit — runs
@@ -535,6 +574,14 @@ func setupXFSProjectQuotaOnMount(workspace string, entry mountInfoEntry, limit i
 	projID, err := allocateXFSProjectID(fsKey)
 	if err != nil {
 		return DiskQuotaStatus{Detail: "allocate XFS project id: " + err.Error()}, nil
+	}
+	assignment := WorkspaceQuotaAssignment{
+		Workspace: workspace, MountPoint: entry.mountPoint, FsKey: fsKey, XQ: xq, ProjectID: projID,
+	}
+	if onAllocated != nil {
+		// Ownership is recorded BEFORE the assignment becomes externally
+		// visible, so a crash at any later point is reclaimable.
+		onAllocated(assignment)
 	}
 	if err := runXFSQuotaCommand(xq, entry.mountPoint, xfsProjectAssignCommand(workspace, projID)); err != nil {
 		// An external-command error is NOT proof the side effect did not
@@ -564,12 +611,10 @@ func setupXFSProjectQuotaOnMount(workspace string, entry mountInfoEntry, limit i
 		return runXFSProjectCleanup(xq, entry.mountPoint, workspace, projID, fsKey)
 	}
 	return DiskQuotaStatus{
-		Hard:  true,
-		Limit: limit,
-		Assignment: &WorkspaceQuotaAssignment{
-			Workspace: workspace, MountPoint: entry.mountPoint, FsKey: fsKey, XQ: xq, ProjectID: projID,
-		},
-		Detail: fmt.Sprintf("XFS project quota %d enforces a hard %d-byte bound on %s (mount %s)", projID, limit, workspace, entry.mountPoint),
+		Hard:       true,
+		Limit:      limit,
+		Assignment: &assignment,
+		Detail:     fmt.Sprintf("XFS project quota %d enforces a hard %d-byte bound on %s (mount %s)", projID, limit, workspace, entry.mountPoint),
 	}, cleanup
 }
 

@@ -24,6 +24,12 @@ import (
 // removes the project assignment (naming the ID) and the limit, and releases
 // the ID.
 func setupWorkspaceDiskQuota(workspace string, limit int64) (DiskQuotaStatus, func() error) {
+	return setupWorkspaceDiskQuotaWithHook(workspace, limit, nil)
+}
+
+// setupWorkspaceDiskQuotaWithHook is setupWorkspaceDiskQuota plus the
+// pre-assignment allocation callback (see WorkspaceDiskQuotaSetupWithHook).
+func setupWorkspaceDiskQuotaWithHook(workspace string, limit int64, onAllocated func(WorkspaceQuotaAssignment)) (DiskQuotaStatus, func() error) {
 	data, err := os.ReadFile("/proc/self/mountinfo")
 	if err != nil {
 		return DiskQuotaStatus{Detail: fmt.Sprintf("read /proc/self/mountinfo: %v", err)}, nil
@@ -34,7 +40,7 @@ func setupWorkspaceDiskQuota(workspace string, limit int64) (DiskQuotaStatus, fu
 	}
 	switch entry.fsType {
 	case "xfs":
-		return setupXFSProjectQuota(workspace, entry, limit)
+		return setupXFSProjectQuotaWithHook(workspace, entry, limit, onAllocated)
 	case "ext4", "ext3", "ext2":
 		return DiskQuotaStatus{Detail: fmt.Sprintf("%s mounted at %s: ext4 project quotas need a prjquota mount and chattr/quotactl tooling; the executor does not apply ext4 project quotas", entry.fsType, entry.mountPoint)}, nil
 	default:
@@ -46,6 +52,12 @@ func setupWorkspaceDiskQuota(workspace string, limit int64) (DiskQuotaStatus, fu
 // (prjquota mount option, root, xfs_quota on PATH) and then applies it through
 // the portable core (setupXFSProjectQuotaOnMount).
 func setupXFSProjectQuota(workspace string, entry mountInfoEntry, limit int64) (DiskQuotaStatus, func() error) {
+	return setupXFSProjectQuotaWithHook(workspace, entry, limit, nil)
+}
+
+// setupXFSProjectQuotaWithHook is setupXFSProjectQuota plus the
+// pre-assignment allocation callback.
+func setupXFSProjectQuotaWithHook(workspace string, entry mountInfoEntry, limit int64, onAllocated func(WorkspaceQuotaAssignment)) (DiskQuotaStatus, func() error) {
 	if !hasMountOption(entry.superOptions, "prjquota") && !hasMountOption(entry.superOptions, "pquota") {
 		return DiskQuotaStatus{Detail: fmt.Sprintf("XFS mount %s is not mounted with prjquota (super options: %s)", entry.mountPoint, entry.superOptions)}, nil
 	}
@@ -56,5 +68,5 @@ func setupXFSProjectQuota(workspace string, entry mountInfoEntry, limit int64) (
 	if err != nil {
 		return DiskQuotaStatus{Detail: fmt.Sprintf("xfs_quota not found: %v", err)}, nil
 	}
-	return setupXFSProjectQuotaOnMount(workspace, entry, limit, xq)
+	return setupXFSProjectQuotaOnMountHook(workspace, entry, limit, xq, onAllocated)
 }

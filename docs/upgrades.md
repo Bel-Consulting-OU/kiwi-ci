@@ -722,10 +722,13 @@ claims themselves.
   project ID already present and reserves them, and the acquire sequence runs
   under a host-global per-filesystem lock with the report re-read on every
   allocation (multi-process safe). A hard crash no longer leaks IDs forever:
-  the runner's durable runtime ledger records the installed assignment
-  (mount, project ID, tool), and the next incarnation removes the assignment
-  and hard limit before retiring the entry; a failed reclaim keeps the entry
-  and the workspace so a later run retries. A report failure fails the quota
+  the runner's durable runtime ledger records the assignment (mount, project
+  ID, tool) via a callback that runs BEFORE the assignment command, so
+  ownership is durable before the project ID becomes externally visible, and
+  the next incarnation removes the assignment and hard limit before retiring
+  the entry; a failed reclaim keeps the entry and the workspace so a later
+  run retries (a reclaim for an assignment that never reached the kernel is
+  recognized as a clean no-op). A report failure fails the quota
   capability closed instead of treating the ID space as empty.
 - `RequireNonRoot` policy is enforced: `pipeline.Sandbox` gained `NonRoot`,
   the effective policy propagates it, the container backend pins the
@@ -783,9 +786,10 @@ claims themselves.
   phantom slot.
 
 - Runner registration now establishes a SESSION (incarnation): every
-  register response carries a fresh incarnation, polling (`/next`) and
-  heartbeat requests carry it in `X-Kiwi-Runner-Incarnation`, and a request
-  presenting a superseded incarnation is refused with 409. A copied identity
+  register response carries a fresh incarnation, and polling (`/next`),
+  heartbeat and COMPLETION requests carry it in
+  `X-Kiwi-Runner-Incarnation`; a request presenting a superseded incarnation
+  is refused with 409 (completion additionally keeps its lease fence). A copied identity
   directory operated from another host therefore cannot keep polling beside
   the newer process; headerless requests are accepted during a rolling
   upgrade. Local duplicate processes are refused earlier by the identity

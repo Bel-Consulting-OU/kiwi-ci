@@ -85,3 +85,57 @@ func TestRunnerIncarnationSupersedesOldSession(t *testing.T) {
 		t.Fatal("headerless legacy heartbeat rejected")
 	}
 }
+
+// TestCompletionRefusedForSupersededIncarnation pins the completion gate: an
+// older registration session cannot drive a completion at all (the lease
+// fence remains the second line of defense).
+func TestCompletionRefusedForSupersededIncarnation(t *testing.T) {
+	s := New("runner-tok")
+	h := s.Handler()
+	const runnerID = "runner-complete-incarnation"
+
+	register := func() string {
+		t.Helper()
+		body, _ := json.Marshal(map[string]any{
+			"id": runnerID, "name": "r", "capacity": 1,
+			"protocol_min": 3, "protocol_max": 3,
+		})
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/runners/register", strings.NewReader(string(body)))
+		req.Header.Set("Authorization", "Bearer runner-tok")
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("register = %d: %s", w.Code, w.Body.String())
+		}
+		var out registerResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+		return out.Incarnation
+	}
+	complete := func(inc string) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(map[string]any{
+			"runner_id": runnerID, "lease_token": "stale", "lease_generation": 1, "status": "success",
+		})
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/nonexistent-job/complete", strings.NewReader(string(body)))
+		req.Header.Set("Authorization", "Bearer runner-tok")
+		req.Header.Set("Content-Type", "application/json")
+		if inc != "" {
+			req.Header.Set(RunnerIncarnationHeader, inc)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		return w
+	}
+
+	first := register()
+	_ = register() // supersede
+	w := complete(first)
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "superseded") {
+		t.Fatalf("superseded completion = %d %q, want the incarnation refusal", w.Code, w.Body.String())
+	}
+	if w := complete(""); w.Code == http.StatusConflict && strings.Contains(w.Body.String(), "superseded") {
+		t.Fatal("headerless legacy completion treated as superseded")
+	}
+}

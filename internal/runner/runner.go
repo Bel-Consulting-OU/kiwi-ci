@@ -151,7 +151,7 @@ var (
 	// repository cannot fill the runner's disk during checkout or
 	// dependency restore. A seam so tests can drive the quota lifecycle
 	// without a quota-capable host filesystem.
-	installWorkspaceDiskQuota = executor.WorkspaceDiskQuotaSetup
+	installWorkspaceDiskQuota = executor.WorkspaceDiskQuotaSetupWithHook
 	// executorOptionsSeam observes the executor options derived for a job
 	// immediately before it runs. It is a test seam: it lets tests assert
 	// the derived resource bounds (WorkspaceMaxBytes) without executing the
@@ -1071,12 +1071,16 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	var workspaceQuota *executor.DiskQuotaStatus
 	var quotaCleanup func() error
 	if quotaLimit > 0 {
-		status, cleanup := installWorkspaceDiskQuota(tmp, quotaLimit)
+		status, cleanup := installWorkspaceDiskQuota(tmp, quotaLimit, func(a executor.WorkspaceQuotaAssignment) {
+			// The callback runs BEFORE the assignment command: ownership is
+			// durable before the project ID becomes externally visible, so a
+			// crash at any later point is reclaimable.
+			a.Workspace = tmp
+			r.ledgerSetXFS(ledgerID, &a)
+		})
 		workspaceQuota = &status
 		quotaCleanup = cleanup
 		if status.Assignment != nil {
-			// Persist the installed XFS assignment so a hard crash between
-			// here and normal teardown is reclaimable by the next Run.
 			r.ledgerSetXFS(ledgerID, status.Assignment)
 		}
 	}

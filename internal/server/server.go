@@ -4047,6 +4047,13 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "error message exceeds 64 KiB", http.StatusBadRequest)
 		return
 	}
+	// Completion is lease-fenced at the store, and additionally bound to the
+	// LATEST registration session so a superseded process sharing the stable
+	// runner identity cannot drive completions at all.
+	if !s.runnerIncarnationCurrent(r.Context(), in.RunnerID, r.Header.Get(RunnerIncarnationHeader)) {
+		http.Error(w, "runner session superseded by a newer registration", http.StatusConflict)
+		return
+	}
 	hash := completionResultHash(in.Status, in.Error, in.Outputs)
 	if s.Sched != nil {
 		s.completeDB(w, r, jobID, in, hash)

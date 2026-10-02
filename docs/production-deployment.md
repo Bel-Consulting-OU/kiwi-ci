@@ -479,7 +479,7 @@ In **DB mode the database clock is the authority for a lease's lifetime**:
   reclaimed from the durable ledger on the next run; runner identity
   persistence is atomic and pair-verified (Windows: protected owner-only
   DACL); and each registration issues a session incarnation that supersedes
-  older polling sessions (409). Scheduler aging is uncapped and capacity
+  older polling, heartbeat and completion sessions (409). Scheduler aging is uncapped and capacity
   metrics count effective schedulable slots.
 - **Runner crashes are reconciled immediately.** Every runner process has an
   instance ID; containers/services/networks are labelled with
