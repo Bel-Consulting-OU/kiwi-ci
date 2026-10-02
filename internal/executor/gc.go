@@ -19,6 +19,11 @@ import (
 // when it is truncated.
 const maxExternalCommandOutputBytes = 4 << 20
 
+// maxCommandStderrBytes bounds child STDERR captured for diagnostics whose
+// stdout is streamed/limited separately (container/tart ReadFile): normally
+// tiny, but a compromised guest can emit arbitrary stderr.
+const maxCommandStderrBytes = 64 << 10
+
 // errExternalOutputTooLarge reports that an external command produced more
 // than maxExternalCommandOutputBytes; parsed callers must not consume a
 // silently truncated prefix.

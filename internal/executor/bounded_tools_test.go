@@ -100,11 +100,11 @@ func TestTartCloseJobHangingDeleteBounded(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("timeout error does not wrap context.DeadlineExceeded: %v", err)
 	}
-	if !strings.Contains(err.Error(), "delete kiwi-1-0123456789abcdef") {
+	if !strings.Contains(err.Error(), "delete Tart VM kiwi-1-0123456789abcdef") {
 		t.Fatalf("CloseJob error does not name the clone delete: %v", err)
 	}
-	if b.clone != "" {
-		t.Fatalf("CloseJob left clone state %q", b.clone)
+	if b.clone != "kiwi-1-0123456789abcdef" {
+		t.Fatalf("timed-out delete must RETAIN the clone for retry, got %q", b.clone)
 	}
 	if elapsed > 10*time.Second {
 		t.Fatalf("bounded CloseJob took %v; the runner goroutine was stranded", elapsed)
@@ -131,8 +131,8 @@ func TestTartDeleteCloneBoundedTypedTimeout(t *testing.T) {
 	if !strings.Contains(err.Error(), "delete Tart VM") {
 		t.Fatalf("delete error does not name the operation: %v", err)
 	}
-	if b.clone != "" {
-		t.Fatalf("failed bounded delete left clone state %q", b.clone)
+	if b.clone != "kiwi-2-fedcba9876543210" {
+		t.Fatalf("failed bounded delete must RETAIN the clone for retry, got %q", b.clone)
 	}
 	if elapsed > 10*time.Second {
 		t.Fatalf("bounded clone delete took %v", elapsed)

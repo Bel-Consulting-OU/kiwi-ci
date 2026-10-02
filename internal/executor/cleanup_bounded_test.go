@@ -163,8 +163,8 @@ func TestContainerCloseJobHangingDockerBounded(t *testing.T) {
 	if !strings.Contains(err.Error(), "remove job container") {
 		t.Fatalf("CloseJob error does not name the container removal: %v", err)
 	}
-	if b.container != "" {
-		t.Fatalf("CloseJob left container state %q", b.container)
+	if b.container != "kiwi-job-test" {
+		t.Fatalf("failed CloseJob must RETAIN the container identity for retry, got %q", b.container)
 	}
 	if elapsed > 10*time.Second {
 		t.Fatalf("bounded CloseJob took %v", elapsed)
@@ -180,6 +180,6 @@ func TestContainerCloseJobSuccessUnchanged(t *testing.T) {
 		t.Fatalf("successful CloseJob = %v", err)
 	}
 	if b.container != "" {
-		t.Fatalf("CloseJob left container state %q", b.container)
+		t.Fatalf("successful CloseJob left container state %q", b.container)
 	}
 }

@@ -7,7 +7,9 @@ package executor
 
 import (
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -114,5 +116,25 @@ func TestHealthcheckCollectorDrainsAfterCaptureLimit(t *testing.T) {
 	}
 	if len(out) != maxHealthcheckOutputBytes || !truncated {
 		t.Fatalf("capture = %d bytes truncated=%t, want cap/true", len(out), truncated)
+	}
+}
+
+// TestContainerReadFileBoundsStderr pins the remaining unbounded stderr path:
+// `docker exec cat` normal stderr is tiny, but a hostile daemon/adapter must
+// not be able to flood the runner through it.
+func TestContainerReadFileBoundsStderr(t *testing.T) {
+	dir := t.TempDir()
+	script := "#!/bin/sh\nif [ \"$1\" = \"exec\" ]; then head -c 8388608 /dev/zero >&2; exit 1; fi\nexit 0\n"
+	docker := filepath.Join(dir, "docker")
+	if err := os.WriteFile(docker, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b := &ContainerBackend{docker: docker, container: "c1", workspace: t.TempDir()}
+	_, err := b.ReadFile(context.Background(), filepath.Join(b.workspace, "out.txt"), 1<<20)
+	if err == nil {
+		t.Fatal("spamming stderr read reported success")
+	}
+	if len(err.Error()) > maxCommandStderrBytes+4096 {
+		t.Fatalf("container stderr capture unbounded: %d bytes", len(err.Error()))
 	}
 }

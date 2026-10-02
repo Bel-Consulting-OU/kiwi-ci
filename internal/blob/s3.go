@@ -551,6 +551,14 @@ func (s *S3) listURL(continuationToken string) (string, error) {
 // objects are skipped, so the CAS GC can never mistake them for payloads.
 // The callback's error stops the walk and is returned unchanged; a truncated
 // page without a continuation token is an error rather than a silent stop.
+// maxS3ListPageBytes bounds one list-page response; maxS3ListKeys bounds the
+// parsed key count independently of the body size (a defensive cap on the XML
+// content itself).
+const (
+	maxS3ListPageBytes = 16 << 20
+	maxS3ListKeys      = 100_000
+)
+
 func (s *S3) List(ctx context.Context, fn func(Object) error) error {
 	ctx, cancel := withDeadline(ctx, s3ListTimeout)
 	defer cancel()
@@ -569,10 +577,15 @@ func (s *S3) List(ctx context.Context, fn func(Object) error) error {
 		if err != nil {
 			return err
 		}
-		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+		// Read limit+1 so an over-limit response is DETECTED rather than
+		// silently truncated into a parseable prefix.
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxS3ListPageBytes+1))
 		resp.Body.Close()
 		if readErr != nil {
 			return readErr
+		}
+		if int64(len(body)) > maxS3ListPageBytes {
+			return fmt.Errorf("blob: s3 list response exceeds %d bytes", int64(maxS3ListPageBytes))
 		}
 		if resp.StatusCode != http.StatusOK {
 			return fmt.Errorf("blob: s3 list %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
@@ -580,6 +593,9 @@ func (s *S3) List(ctx context.Context, fn func(Object) error) error {
 		var page s3ListObjectsResult
 		if err := xml.Unmarshal(body, &page); err != nil {
 			return fmt.Errorf("blob: s3 list decode: %w", err)
+		}
+		if len(page.Contents) > maxS3ListKeys {
+			return fmt.Errorf("blob: s3 list page declares %d keys, limit is %d", len(page.Contents), maxS3ListKeys)
 		}
 		for _, entry := range page.Contents {
 			digest, ok := s3DigestFromKey(entry.Key)

@@ -3460,12 +3460,18 @@ func (s *PostgresStore) HasCompletionReceipt(ctx context.Context, jobID string, 
 	return rec, true, nil
 }
 
+// UpsertDelivery records a webhook receipt. An EMPTY runID records an
+// IGNORED terminal receipt: the authenticated delivery was fully processed
+// without creating a run, and a replay must return the same terminal success
+// without repeating forge API work.
 func (s *PostgresStore) UpsertDelivery(ctx context.Context, forge, deliveryID string, runID string, payloadDigest string) error {
 	if forge == "" || deliveryID == "" {
 		return fmt.Errorf("storage: empty forge or delivery id")
 	}
-	if err := ValidateRunID(runID); err != nil {
-		return err
+	if runID != "" {
+		if err := ValidateRunID(runID); err != nil {
+			return err
+		}
 	}
 	_, err := s.pool.Exec(ctx, `INSERT INTO webhook_deliveries (forge, delivery_id, run_id, payload_digest) VALUES ($1, $2, $3, $4) ON CONFLICT (forge, delivery_id) DO UPDATE SET payload_digest=EXCLUDED.payload_digest`,
 		forge, deliveryID, runID, nullText(payloadDigest))

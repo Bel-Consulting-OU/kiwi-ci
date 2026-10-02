@@ -82,7 +82,9 @@ case "$sub" in
       ls) printf '%s\n' "$FAKE_DOCKER_NET_LS";;
       rm) exit "${FAKE_DOCKER_NET_RM_EXIT:-0}";;
     esac;;
-  rm) exit "${FAKE_DOCKER_RM_EXIT:-0}";;
+  rm)
+    if [ -n "$FAKE_DOCKER_RM_MSG" ]; then echo "$FAKE_DOCKER_RM_MSG" >&2; fi
+    exit "${FAKE_DOCKER_RM_EXIT:-0}";;
 esac
 exit 0
 `
@@ -106,7 +108,9 @@ case "$sub" in
   get)
     if [ "${FAKE_TART_GET_FAIL:-0}" = "1" ]; then echo "get failed" >&2; exit 1; fi
     if [ -n "$FAKE_TART_GET_JSON" ]; then printf '%s\n' "$FAKE_TART_GET_JSON"; else printf '%s\n' '{"name":"vm","labels":{"kiwi.ssh.bootstrap":"true"}}'; fi;;
-  delete) exit "${FAKE_TART_DELETE_EXIT:-0}";;
+  delete)
+    if [ -n "$FAKE_TART_DELETE_MSG" ]; then echo "$FAKE_TART_DELETE_MSG"; fi
+    exit "${FAKE_TART_DELETE_EXIT:-0}";;
   list) printf '%s\n' "$FAKE_TART_LIST";;
 esac
 exit 0
@@ -361,16 +365,10 @@ func TestContainerBackendCloseJob(t *testing.T) {
 	if err := b.CloseJob(); err == nil {
 		t.Fatal("failing rm accepted")
 	}
-	// "No such container" is tolerated.
+	// "No such container" is tolerated (proven absence allows teardown).
 	installFakeBins(t)
-	script := filepath.Join(fakeBinDir(t), "docker")
-	body, err := os.ReadFile(script)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(script, []byte(strings.Replace(string(body), `rm) exit "${FAKE_DOCKER_RM_EXIT:-0}";;`, `rm) echo "Error: No such container: cid" >&2; exit 1;;`, 1)), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	t.Setenv("FAKE_DOCKER_RM_EXIT", "1")
+	t.Setenv("FAKE_DOCKER_RM_MSG", "Error: No such container: cid")
 	b = &ContainerBackend{docker: "docker", container: "cid"}
 	if err := b.CloseJob(); err != nil {
 		t.Fatalf("No such container must be tolerated: %v", err)

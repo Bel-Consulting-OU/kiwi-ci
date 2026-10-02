@@ -468,6 +468,15 @@ In **DB mode the database clock is the authority for a lease's lifetime**:
   healthchecks retain a 64 KiB diagnostic prefix and drain (discarding) the
   rest, and every executor/git/prewarm capture is bounded, so a hostile
   healthcheck cannot grow the runner heap or block on a full pipe.
+- **Runtime teardown is proven-gone before workspace protections are
+  removed.** `CloseJob` keeps the container/clone identity until removal
+  succeeds or the runtime is positively absent, never restores workspace
+  ownership or drops the XFS project quota while the runtime object may still
+  exist, and keeps quota/ownership cleanup callbacks retryable until they
+  succeed. Failed webhook deliveries from an ignored terminal outcome (no
+  trigger match) persist an ignored receipt, so replays perform no forge
+  work. A corrupt current-format generation envelope fails child admission
+  closed.
 - **Retry budgets are capped and zero is explicit.** Step retries cap at 20,
   service healthcheck retries at 100 and infrastructure retries at 20,
   enforced at admission and clamped in the executor/recovery; explicit

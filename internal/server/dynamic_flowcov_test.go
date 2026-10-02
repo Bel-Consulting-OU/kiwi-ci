@@ -169,21 +169,40 @@ func TestFlowDynamicFragmentHonorsParentGenerateEnvelope(t *testing.T) {
 	}
 
 	// A legacy parent (no compiled payload) keeps the global caps.
-	if got := effectiveGeneratedJobsLimit(parent); got != maxGeneratedJobsPerFragment {
-		t.Fatalf("legacy jobs limit = %d, want the global %d", got, maxGeneratedJobsPerFragment)
+	if got, err := effectiveGeneratedJobsLimit(parent); err != nil || got != maxGeneratedJobsPerFragment {
+		t.Fatalf("legacy jobs limit = %d err=%v, want the global %d", got, err, maxGeneratedJobsPerFragment)
 	}
-	if got := effectiveGeneratedDepthLimit(parent); got != maxDynamicDepth {
-		t.Fatalf("legacy depth limit = %d, want the global %d", got, maxDynamicDepth)
+	if got, err := effectiveGeneratedDepthLimit(parent); err != nil || got != maxDynamicDepth {
+		t.Fatalf("legacy depth limit = %d err=%v, want the global %d", got, err, maxDynamicDepth)
 	}
 	// A more permissive parent cannot loosen the global caps.
 	looseRaw, _ := json.Marshal(map[string]any{"generate": map[string]any{"max_jobs": 100000, "max_depth": 100}})
 	loose := parent
 	loose.CompiledJobPayload = &model.CompiledJobPayload{EffectiveJob: json.RawMessage(looseRaw)}
-	if got := effectiveGeneratedJobsLimit(loose); got != maxGeneratedJobsPerFragment {
-		t.Fatalf("loose jobs limit = %d, want the global %d", got, maxGeneratedJobsPerFragment)
+	if got, err := effectiveGeneratedJobsLimit(loose); err != nil || got != maxGeneratedJobsPerFragment {
+		t.Fatalf("loose jobs limit = %d err=%v, want the global %d", got, err, maxGeneratedJobsPerFragment)
 	}
-	if got := effectiveGeneratedDepthLimit(loose); got != maxDynamicDepth {
-		t.Fatalf("loose depth limit = %d, want the global %d", got, maxDynamicDepth)
+	if got, err := effectiveGeneratedDepthLimit(loose); err != nil || got != maxDynamicDepth {
+		t.Fatalf("loose depth limit = %d err=%v, want the global %d", got, err, maxDynamicDepth)
+	}
+
+	// A CURRENT-format payload that cannot be decoded fails closed instead of
+	// widening the envelope back to the global caps.
+	corrupt := parent
+	corrupt.CompiledJobPayload = &model.CompiledJobPayload{SchemaVersion: 1, EffectiveJob: json.RawMessage(`{"generate":{"max_jobs":"not-a-number"}}`)}
+	if _, err := effectiveGeneratedJobsLimit(corrupt); err == nil {
+		t.Fatal("corrupt current-schema jobs envelope must fail closed")
+	}
+	if _, err := effectiveGeneratedDepthLimit(corrupt); err == nil {
+		t.Fatal("corrupt current-schema depth envelope must fail closed")
+	}
+	missing := parent
+	missing.CompiledJobPayload = &model.CompiledJobPayload{SchemaVersion: 1}
+	if _, err := effectiveGeneratedJobsLimit(missing); err == nil {
+		t.Fatal("current-schema payload without an effective job must fail closed")
+	}
+	if _, err := s.processGeneratedFragment(ctx, corrupt, fcFragment(t, fcOneChildFragment)); err == nil {
+		t.Fatal("fragment against a corrupt parent payload must be refused")
 	}
 }
 

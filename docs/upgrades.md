@@ -683,3 +683,29 @@ claims themselves.
   envelope, read from the persisted compiled parent job (and re-checked
   against the locked parent row), so a `max_jobs: 1` parent cannot be handed
   128 children.
+- Container teardown is now a proven-gone state machine: `CloseJob` retains
+  the container identity until `docker rm -f` succeeds or docker positively
+  reports the container absent, and it does NOT restore workspace ownership or
+  remove the XFS project quota while the runtime object may still exist (a
+  live bind-mounted container must not outlive the quota that bounds its
+  workspace). A failed removal leaves the job retryable; only proven absence
+  advances to teardown. Tart clone deletion follows the same rule (the clone
+  name is cleared only after `tart delete` succeeds or reports absence, and
+  per-job SSH state is kept while a delete is retryable).
+- Workspace quota/ownership cleanup callbacks are cleared ONLY on success:
+  a failed XFS cleanup (for example one that correctly quarantined its project
+  ID) stays retryable instead of leaking the allocation forever, and a partial
+  ownership restore cannot leave the checkout under the workload uid.
+- Webhook replay receipts now cover terminal no-run outcomes: a no-trigger
+  delivery persists an IGNORED receipt (delivery + authenticated-body digest),
+  so replays perform zero forge API work and return the same 204. The
+  delivery/body receipts remain the successful-run dedupe path.
+- A current-format compiled parent job whose generation envelope cannot be
+  decoded (missing/invalid effective job) now fails generated-child admission
+  closed instead of falling back to the wider global caps; only genuinely
+  legacy records keep the documented global fallback.
+- The remaining unbounded stderr paths are bounded: container ReadFile keeps a
+  64 KiB diagnostic prefix from `docker exec cat` stderr, and Tart ReadFile
+  bounds guest SSH stderr the same way. The S3 list reader now reads limit+1
+  and rejects an over-limit response instead of accepting a truncated prefix,
+  with a defensive cap on the parsed key count.

@@ -96,14 +96,19 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	digest := webhookPayloadDigest(body)
-	if prior, ok, derr := s.webhookDeliveryRun(ctx, "github", delivery, digest, repoID); derr != nil {
+	if prior, enqueued, ignored, derr := s.webhookDeliveryRun(ctx, "github", delivery, digest, repoID); derr != nil {
 		if errors.Is(derr, errDeliveryDigestMismatch) {
 			http.Error(w, "delivery id was already used with different content", http.StatusConflict)
 			return
 		}
 		s.internalError(w, r, derr, "")
 		return
-	} else if ok {
+	} else if ignored {
+		// Terminal ignored replay: the original delivery was fully processed
+		// without creating a run, so answer the same 204 with no work.
+		w.WriteHeader(http.StatusNoContent)
+		return
+	} else if enqueued {
 		writeJSON(w, http.StatusOK, prior)
 		return
 	}
@@ -130,7 +135,9 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		// The event does not match the pipeline's on section: acknowledge
 		// without enqueueing. Logged so silenced pipelines are discoverable.
+		// The terminal receipt means a replay performs no forge API work.
 		log.Printf("webhook: github %s %s ignored (trigger %q)", ec.Event, ec.Repository.FullName, matched)
+		s.recordIgnoredWebhook(ctx, "github", repoID, delivery, digest)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -204,75 +211,127 @@ func webhookDeliveryDigestKey(forge string) string {
 	return forge + "_delivery_digest"
 }
 
-// webhookDeliveryRun is the replay fast path: it returns the run already
-// created for an authenticated (forge, delivery ID) so a forge retry is
-// acknowledged BEFORE any expensive pipeline fetch/parse/trigger work. The
-// stored run must belong to the same canonical repository, and when both the
-// stored and presented digests are known they must match (a reused delivery
-// header with a different signed body fails with errDeliveryDigestMismatch).
-// In DB mode the lookup is durable (webhook_deliveries + the run row); in
-// memory mode it uses the persisted-run mirror.
-func (s *Server) webhookDeliveryRun(ctx context.Context, forge, delivery, digest, repoID string) (model.Run, bool, error) {
+// webhookDeliveryRun is the replay fast path: it resolves an authenticated
+// (forge, delivery ID) against its durable/ mirrored receipt BEFORE any
+// expensive pipeline fetch/parse/trigger work. enqueued=true returns the run
+// already created; ignored=true means the original delivery was terminally
+// processed WITHOUT creating a run (no trigger match, unsupported action,
+// branch deletion) and the replay deserves the same terminal success. A
+// stored run must belong to the same canonical repository, and when both
+// digests are known they must match (a reused delivery header with different
+// signed content fails with errDeliveryDigestMismatch). The body receipt
+// additionally suppresses the same authenticated body under a FRESH header.
+//
+// Returns: (prior, enqueued, ignored, error).
+func (s *Server) webhookDeliveryRun(ctx context.Context, forge, delivery, digest, repoID string) (model.Run, bool, bool, error) {
 	if delivery == "" {
-		return model.Run{}, false, nil
+		return model.Run{}, false, false, nil
 	}
 	if digest != "" {
-		// Strict body-replay suppression: the same AUTHENTICATED body
-		// delivered under a FRESH delivery header (provider redelivery or an
-		// attacker swapping the unauthenticated header) maps to the original
-		// run instead of enqueueing another.
-		if s.DB != nil {
-			if runID, found, err := s.DB.FindDelivery(ctx, forge+"-body", digest); err != nil {
-				return model.Run{}, false, err
-			} else if found {
-				prior, err := s.DB.GetRun(ctx, runID)
-				if err != nil && !errors.Is(err, storage.ErrNotFound) {
-					return model.Run{}, false, err
-				}
-				if err == nil {
-					if got, ok, merr := s.matchDeliveryRun(prior, forge, digest, repoID); merr != nil || ok {
-						return got, ok, merr
-					}
-				}
-			}
-		} else {
-			key := webhookBodyKey(forge, repoID, digest)
-			s.mu.Lock()
-			id, ok := s.deliveries[key]
-			prior, priorOK := s.runs[id]
-			s.mu.Unlock()
-			if ok && priorOK {
-				if got, ok, merr := s.matchDeliveryRun(prior, forge, digest, repoID); merr != nil || ok {
-					return got, ok, merr
-				}
-			}
+		runID, found, err := s.findBodyReceipt(ctx, forge, repoID, digest)
+		if err != nil {
+			return model.Run{}, false, false, err
+		}
+		if found {
+			return s.resolveDeliveryReceipt(ctx, runID, forge, digest, repoID)
 		}
 	}
+	runID, found, err := s.findDeliveryReceipt(ctx, forge, delivery)
+	if err != nil || !found {
+		return model.Run{}, false, false, err
+	}
+	return s.resolveDeliveryReceipt(ctx, runID, forge, digest, repoID)
+}
+
+// findDeliveryReceipt looks up a delivery-ID receipt. An empty run ID marks an
+// ignored terminal receipt; DB mode reads webhook_deliveries, memory mode the
+// persisted-run mirror.
+func (s *Server) findDeliveryReceipt(ctx context.Context, forge, deliveryID string) (string, bool, error) {
 	if s.DB != nil {
-		runID, found, err := s.DB.FindDelivery(ctx, forge, delivery)
-		if err != nil {
-			return model.Run{}, false, err
-		}
-		if !found {
-			return model.Run{}, false, nil
-		}
-		prior, err := s.DB.GetRun(ctx, runID)
-		if errors.Is(err, storage.ErrNotFound) {
-			return model.Run{}, false, nil
-		}
-		if err != nil {
-			return model.Run{}, false, err
-		}
-		return s.matchDeliveryRun(prior, forge, digest, repoID)
+		return s.DB.FindDelivery(ctx, forge, deliveryID)
 	}
 	s.mu.Lock()
-	id, ok := s.deliveries[delivery]
-	prior, priorOK := s.runs[id]
+	id, ok := s.deliveries[deliveryID]
 	s.mu.Unlock()
-	if !ok || !priorOK {
-		return model.Run{}, false, nil
+	return id, ok, nil
+}
+
+// findBodyReceipt looks up the per-repository body receipt: DB mode keys the
+// synthetic forge by the digest; memory mode uses the composite body key.
+func (s *Server) findBodyReceipt(ctx context.Context, forge, repoID, digest string) (string, bool, error) {
+	if s.DB != nil {
+		return s.DB.FindDelivery(ctx, forge+"-body", digest)
 	}
-	return s.matchDeliveryRun(prior, forge, digest, repoID)
+	s.mu.Lock()
+	id, ok := s.deliveries[webhookBodyKey(forge, repoID, digest)]
+	s.mu.Unlock()
+	return id, ok, nil
+}
+
+// resolveDeliveryReceipt applies the repository/body-digest binding to a
+// receipt's run (or reports the ignored outcome).
+func (s *Server) resolveDeliveryReceipt(ctx context.Context, runID, forge, digest, repoID string) (model.Run, bool, bool, error) {
+	if runID == "" {
+		// Terminal ignored receipt: replay returns the same 204 without work.
+		return model.Run{}, false, true, nil
+	}
+	var prior model.Run
+	if s.DB != nil {
+		var err error
+		prior, err = s.DB.GetRun(ctx, runID)
+		if errors.Is(err, storage.ErrNotFound) {
+			return model.Run{}, false, false, nil
+		}
+		if err != nil {
+			return model.Run{}, false, false, err
+		}
+	} else {
+		s.mu.Lock()
+		found := false
+		prior, found = s.runs[runID]
+		s.mu.Unlock()
+		if !found {
+			return model.Run{}, false, false, nil
+		}
+	}
+	if stored := strings.TrimSpace(prior.Metadata[webhookDeliveryDigestKey(forge)]); stored != "" && digest != "" && stored != digest {
+		return model.Run{}, false, false, errDeliveryDigestMismatch
+	}
+	if repoID != "" && repoIDForRun(prior) != repoID {
+		return model.Run{}, false, false, nil
+	}
+	return prior, true, false, nil
+}
+
+// recordIgnoredWebhook persists the terminal receipt for an authenticated
+// delivery that produced NO run, so a replay performs no forge API work and
+// returns the same terminal success. The body receipt is recorded too, which
+// suppresses the same signed payload under a fresh delivery header.
+func (s *Server) recordIgnoredWebhook(ctx context.Context, forge, repoID, delivery, digest string) {
+	if delivery == "" {
+		return
+	}
+	s.mu.Lock()
+	if _, exists := s.deliveries[delivery]; !exists {
+		s.deliveries[delivery] = ""
+	}
+	if digest != "" {
+		key := webhookBodyKey(forge, repoID, digest)
+		if _, exists := s.deliveries[key]; !exists {
+			s.deliveries[key] = ""
+		}
+	}
+	s.mu.Unlock()
+	if s.DB != nil {
+		if err := s.DB.UpsertDelivery(ctx, forge, delivery, "", digest); err != nil {
+			s.logError("webhook ignored receipt persist failed", "forge", forge, "error", err.Error())
+		}
+		if digest != "" {
+			if err := s.DB.UpsertDelivery(ctx, forge+"-body", digest, "", digest); err != nil {
+				s.logError("webhook ignored body receipt persist failed", "forge", forge, "error", err.Error())
+			}
+		}
+	}
 }
 
 // webhookBodyKey is the in-memory body-receipt key: one authenticated body
@@ -302,20 +361,6 @@ func (s *Server) recordWebhookDelivery(ctx context.Context, forge, repoID, deliv
 			s.logError("webhook body receipt persist failed", "forge", forge, "error", err.Error())
 		}
 	}
-}
-
-// matchDeliveryRun applies the repository and body-digest binding to a
-// candidate stored run. A digest mismatch is a hard refusal; a repository
-// mismatch is a miss (a delivery ID collision across forges/repositories can
-// never borrow another run).
-func (s *Server) matchDeliveryRun(prior model.Run, forge, digest, repoID string) (model.Run, bool, error) {
-	if stored := strings.TrimSpace(prior.Metadata[webhookDeliveryDigestKey(forge)]); stored != "" && digest != "" && stored != digest {
-		return model.Run{}, false, errDeliveryDigestMismatch
-	}
-	if repoID != "" && repoIDForRun(prior) != repoID {
-		return model.Run{}, false, nil
-	}
-	return prior, true, nil
 }
 
 // recordDelivery remembers a delivery ID after a successful enqueue. The

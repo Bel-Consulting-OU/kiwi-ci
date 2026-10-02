@@ -117,12 +117,21 @@ func verifyGeneratedFragmentGraph(snapshot, fresh model.Job, childDepth, runJobC
 	}
 	// The parent's OWN generate envelope applies in addition to the global
 	// ceilings, and it is read from the locked authoritative parent row
-	// (fresh), never from the upload request.
-	if childDepth > effectiveGeneratedDepthLimit(fresh) {
-		return fmt.Errorf("generation depth %d exceeds maximum %d", childDepth, effectiveGeneratedDepthLimit(fresh))
+	// (fresh), never from the upload request. An unreadable current-format
+	// payload fails closed here too.
+	depthLimit, derr := effectiveGeneratedDepthLimit(fresh)
+	if derr != nil {
+		return derr
 	}
-	if childCount > effectiveGeneratedJobsLimit(fresh) {
-		return fmt.Errorf("generated fragment declares %d jobs, limit is %d", childCount, effectiveGeneratedJobsLimit(fresh))
+	if childDepth > depthLimit {
+		return fmt.Errorf("generation depth %d exceeds maximum %d", childDepth, depthLimit)
+	}
+	jobsLimit, jerr := effectiveGeneratedJobsLimit(fresh)
+	if jerr != nil {
+		return jerr
+	}
+	if childCount > jobsLimit {
+		return fmt.Errorf("generated fragment declares %d jobs, limit is %d", childCount, jobsLimit)
 	}
 	if runJobCount+childCount > maxJobsPerRun {
 		return fmt.Errorf("run would grow to %d jobs, limit is %d", runJobCount+childCount, maxJobsPerRun)
@@ -130,19 +139,39 @@ func verifyGeneratedFragmentGraph(snapshot, fresh model.Job, childDepth, runJobC
 	return nil
 }
 
+// generatedEnvelope is the parent's declared generation policy decoded from
+// the persisted compiled-job payload.
+type generatedEnvelope struct {
+	MaxJobs  int
+	MaxDepth int
+	// Known is true when the parent carries a readable compiled payload. A
+	// genuinely LEGACY record (no payload, or a pre-schema payload) leaves
+	// Known=false and the documented global-cap fallback applies; a
+	// CURRENT-format payload that cannot be decoded is an ERROR, never a
+	// widened fallback: policy metadata must fail closed when unreadable.
+	Known bool
+}
+
 // parentGenerateEnvelope decodes the parent's authoritative compile-time
 // generate envelope (generate.max_jobs/max_depth) from the persisted
-// compiled-job payload — the same bytes the runner executes. A missing or
-// legacy payload yields the global ceilings only.
-func parentGenerateEnvelope(parent model.Job) (maxJobs, maxDepth int) {
-	if parent.CompiledJobPayload == nil || parent.CompiledJobPayload.EffectiveJob == nil {
-		return 0, 0
+// compiled-job payload — the same bytes the runner executes.
+func parentGenerateEnvelope(parent model.Job) (generatedEnvelope, error) {
+	if parent.CompiledJobPayload == nil {
+		return generatedEnvelope{}, nil
+	}
+	payload := parent.CompiledJobPayload
+	if payload.EffectiveJob == nil {
+		if payload.SchemaVersion >= 1 {
+			return generatedEnvelope{}, fmt.Errorf("compiled parent payload (schema %d) is missing the effective job", payload.SchemaVersion)
+		}
+		// Pre-schema record: intentional legacy fallback.
+		return generatedEnvelope{}, nil
 	}
 	// The persisted payload is raw JSON (json.RawMessage); use it directly so
 	// the admission path performs no extra marshal (and stays outside the
 	// JSON seam that integration tests use to prove fail-closed behavior).
 	var raw []byte
-	switch v := parent.CompiledJobPayload.EffectiveJob.(type) {
+	switch v := payload.EffectiveJob.(type) {
 	case json.RawMessage:
 		raw = v
 	case []byte:
@@ -150,12 +179,12 @@ func parentGenerateEnvelope(parent model.Job) (maxJobs, maxDepth int) {
 	default:
 		b, err := jsonMarshal(v)
 		if err != nil {
-			return 0, 0
+			return generatedEnvelope{}, fmt.Errorf("compiled parent payload is not decodable: %w", err)
 		}
 		raw = b
 	}
 	if len(raw) == 0 {
-		return 0, 0
+		return generatedEnvelope{}, fmt.Errorf("compiled parent payload has an empty effective job")
 	}
 	var shape struct {
 		Generate struct {
@@ -164,31 +193,38 @@ func parentGenerateEnvelope(parent model.Job) (maxJobs, maxDepth int) {
 		} `json:"generate"`
 	}
 	if err := json.Unmarshal(raw, &shape); err != nil {
-		return 0, 0
+		return generatedEnvelope{}, fmt.Errorf("compiled parent payload is malformed: %w", err)
 	}
-	return shape.Generate.MaxJobs, shape.Generate.MaxDepth
+	return generatedEnvelope{MaxJobs: shape.Generate.MaxJobs, MaxDepth: shape.Generate.MaxDepth, Known: true}, nil
 }
 
 // effectiveGeneratedJobsLimit is the global per-fragment ceiling, tightened by
-// the parent's declared generate.max_jobs (when positive).
-func effectiveGeneratedJobsLimit(parent model.Job) int {
+// the parent's declared generate.max_jobs (when positive). An unreadable
+// current-format parent payload is an error (fail closed).
+func effectiveGeneratedJobsLimit(parent model.Job) (int, error) {
 	limit := maxGeneratedJobsPerFragment
-	maxJobs, _ := parentGenerateEnvelope(parent)
-	if maxJobs > 0 && maxJobs < limit {
-		limit = maxJobs
+	env, err := parentGenerateEnvelope(parent)
+	if err != nil {
+		return 0, err
 	}
-	return limit
+	if env.Known && env.MaxJobs > 0 && env.MaxJobs < limit {
+		limit = env.MaxJobs
+	}
+	return limit, nil
 }
 
 // effectiveGeneratedDepthLimit is the global depth ceiling, tightened by the
 // parent's declared generate.max_depth (when positive).
-func effectiveGeneratedDepthLimit(parent model.Job) int {
+func effectiveGeneratedDepthLimit(parent model.Job) (int, error) {
 	limit := maxDynamicDepth
-	_, maxDepth := parentGenerateEnvelope(parent)
-	if maxDepth > 0 && maxDepth < limit {
-		limit = maxDepth
+	env, err := parentGenerateEnvelope(parent)
+	if err != nil {
+		return 0, err
 	}
-	return limit
+	if env.Known && env.MaxDepth > 0 && env.MaxDepth < limit {
+		limit = env.MaxDepth
+	}
+	return limit, nil
 }
 
 // replayGeneratedResponse rebuilds the original admission response from a
@@ -234,13 +270,22 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 	}
 	// Effective ceilings: the global caps tightened by the PARENT's declared
 	// generate envelope, read from the authoritative parent job (the persisted
-	// compiled policy), never from the upload.
-	if jobsLimit := effectiveGeneratedJobsLimit(parent); len(in.Jobs) > jobsLimit {
+	// compiled policy), never from the upload. An unreadable current-format
+	// policy payload fails the fragment closed.
+	jobsLimit, jerr := effectiveGeneratedJobsLimit(parent)
+	if jerr != nil {
+		return nil, jerr
+	}
+	if len(in.Jobs) > jobsLimit {
 		return nil, fmt.Errorf("generated fragment declares %d jobs, limit is %d", len(in.Jobs), jobsLimit)
 	}
 	// Depth: children inherit parent depth + 1 and never exceed the effective
 	// cap.
-	if depthLimit := effectiveGeneratedDepthLimit(parent); childDepth > depthLimit {
+	depthLimit, derr := effectiveGeneratedDepthLimit(parent)
+	if derr != nil {
+		return nil, derr
+	}
+	if childDepth > depthLimit {
 		return nil, fmt.Errorf("generation depth %d exceeds maximum %d", childDepth, depthLimit)
 	}
 	// Every dep edge must reference fragment keys; deps keys must exist.

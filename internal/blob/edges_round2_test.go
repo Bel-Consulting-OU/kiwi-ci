@@ -300,3 +300,23 @@ func TestS3ListErrorArms(t *testing.T) {
 		t.Fatal("list against a closed server succeeded")
 	}
 }
+
+// TestS3ListRejectsOversizedResponse pins the limit+1 rule: an endpoint that
+// appends padding after a complete, parseable XML document must be rejected
+// instead of accepting the truncated prefix.
+func TestS3ListRejectsOversizedResponse(t *testing.T) {
+	s, _, _ := s3TestServer(t)
+	oversized := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`<?xml version="1.0"?><ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>`))
+		chunk := bytes.Repeat([]byte(" "), 1<<20)
+		for i := 0; i < 17; i++ {
+			_, _ = w.Write(chunk)
+		}
+	}))
+	defer oversized.Close()
+	s.Endpoint = oversized.URL
+	err := s.List(context.Background(), func(Object) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("oversized list response = %v, want an exceeds-limit rejection", err)
+	}
+}

@@ -491,20 +491,20 @@ func wrapBase64(b []byte) string {
 }
 
 // deleteCloneBounded removes the job's VM clone through the bounded cleanup
-// helper and clears the clone name, so the call is idempotent and safe from
-// both CloseJob and the run-start failure path. A clone tart reports as
-// missing is not an error; a timeout or any other failure is returned with
-// the bounded output, never silently discarded.
+// helper. The clone name is cleared ONLY after tart confirms the deletion (or
+// reports the VM missing): a timeout or transient failure keeps the identity
+// so a later CloseJob retry can delete it instead of forgetting a live
+// runtime object. A clone tart reports as missing is not an error.
 func (b *TartBackend) deleteCloneBounded(parent context.Context) error {
 	if b.clone == "" || b.tart == "" {
 		return nil
 	}
 	clone := b.clone
-	b.clone = ""
 	out, err := boundedToolCommand(parent, tartCleanupTimeout, b.tart, "delete", clone)
 	if err != nil && !strings.Contains(string(out), "does not exist") {
-		return fmt.Errorf("delete Tart VM: %w", err)
+		return fmt.Errorf("delete Tart VM %s: %w", clone, err)
 	}
+	b.clone = ""
 	return nil
 }
 
@@ -532,7 +532,9 @@ func (b *TartBackend) CloseJob() error {
 	// joined, so either failure (or both) reaches the caller.
 	reapErr := b.reapRunCommand()
 	deleteErr := b.deleteCloneBounded(context.Background())
-	if b.sshDir != "" {
+	if deleteErr == nil && b.sshDir != "" {
+		// Only drop the per-job SSH state once the VM is proven gone; while a
+		// delete is retryable the state stays available for inspection.
 		_ = os.RemoveAll(b.sshDir)
 		b.sshDir = ""
 	}
@@ -696,7 +698,7 @@ func (b *TartBackend) ReadFile(ctx context.Context, path string, maxBytes int64)
 	var mu sync.Mutex
 	var data []byte
 	var limitExceeded bool
-	var stderrBuf bytes.Buffer
+	stderrBuf := executil.NewBoundedBuffer(maxCommandStderrBytes)
 	consumeOut := func(r io.Reader) error {
 		b, err := io.ReadAll(io.LimitReader(r, maxBytes+1))
 		if err != nil {
@@ -711,11 +713,11 @@ func (b *TartBackend) ReadFile(ctx context.Context, path string, maxBytes int64)
 		return nil
 	}
 	consumeErr := func(r io.Reader) error {
-		_, err := io.Copy(&stderrBuf, r)
+		_, err := io.Copy(stderrBuf, r)
 		return err
 	}
 	if err := b.sshRun(ctx, nil, remote, consumeOut, consumeErr); err != nil {
-		if strings.Contains(strings.ToLower(stderrBuf.String()), "no such file") {
+		if strings.Contains(strings.ToLower(string(stderrBuf.Bytes())), "no such file") {
 			return nil, os.ErrNotExist
 		}
 		return nil, fmt.Errorf("read output file from VM: %w", err)

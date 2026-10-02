@@ -362,13 +362,13 @@ func TestGitHubForgeAppBranch(t *testing.T) {
 func TestDedupeRunEdges(t *testing.T) {
 	s := New("runner-secret")
 	ctx := context.Background()
-	if _, ok, err := s.webhookDeliveryRun(ctx, "github", "", "d", "repo"); ok || err != nil {
+	if _, ok, _, err := s.webhookDeliveryRun(ctx, "github", "", "d", "repo"); ok || err != nil {
 		t.Fatalf("empty delivery must not dedupe (ok=%t err=%v)", ok, err)
 	}
 	s.mu.Lock()
 	s.deliveries["dangling"] = "no-such-run"
 	s.mu.Unlock()
-	if _, ok, err := s.webhookDeliveryRun(ctx, "github", "dangling", "d", "repo"); ok || err != nil {
+	if _, ok, _, err := s.webhookDeliveryRun(ctx, "github", "dangling", "d", "repo"); ok || err != nil {
 		t.Fatalf("delivery pointing at a missing run must not dedupe (ok=%t err=%v)", ok, err)
 	}
 
@@ -385,15 +385,15 @@ func TestDedupeRunEdges(t *testing.T) {
 	prior.Metadata = map[string]string{webhookDeliveryDigestKey("github"): "digest-a"}
 	s.runs[run.ID] = prior
 	s.mu.Unlock()
-	if _, ok, err := s.webhookDeliveryRun(ctx, "github", "cross-repo", "digest-a", "other.example/acme/backend"); ok || err != nil {
+	if _, ok, _, err := s.webhookDeliveryRun(ctx, "github", "cross-repo", "digest-a", "other.example/acme/backend"); ok || err != nil {
 		t.Fatalf("a delivery colliding across repositories must not dedupe (ok=%t err=%v)", ok, err)
 	}
-	if got, ok, err := s.webhookDeliveryRun(ctx, "github", "cross-repo", "digest-a", "github.com/acme/backend"); err != nil || !ok || got.ID != run.ID {
+	if got, ok, _, err := s.webhookDeliveryRun(ctx, "github", "cross-repo", "digest-a", "github.com/acme/backend"); err != nil || !ok || got.ID != run.ID {
 		t.Fatalf("same-repo delivery must dedupe to %s, got %+v ok=%v err=%v", run.ID, got, ok, err)
 	}
 	// The signed body digest is part of the replay identity: the same
 	// delivery header with different content is a hard conflict.
-	if _, _, err := s.webhookDeliveryRun(ctx, "github", "cross-repo", "digest-b", "github.com/acme/backend"); !errors.Is(err, errDeliveryDigestMismatch) {
+	if _, _, _, err := s.webhookDeliveryRun(ctx, "github", "cross-repo", "digest-b", "github.com/acme/backend"); !errors.Is(err, errDeliveryDigestMismatch) {
 		t.Fatalf("header swap = %v, want errDeliveryDigestMismatch", err)
 	}
 }
@@ -475,5 +475,58 @@ func TestReplayedWebhookCausesZeroForgeRequestsAfterFirstAcceptedRun(t *testing.
 	s.mu.Unlock()
 	if runs != 1 {
 		t.Fatalf("runs after replays = %d, want 1", runs)
+	}
+}
+
+// TestIgnoredWebhookReplayPerformsZeroForgeRequests pins the terminal-receipt
+// model: a no-trigger webhook is remembered even though it created no run, so
+// a replay (same delivery ID, and the same signed body under a fresh header)
+// performs ZERO forge API requests while returning the same 204.
+func TestIgnoredWebhookReplayPerformsZeroForgeRequests(t *testing.T) {
+	api := &gitHubHookAPI{}
+	api.fileBody = `version: 1
+on:
+  push:
+    branches: ["never"]
+jobs:
+  build:
+    runtime: native
+    steps:
+      - run: echo hi
+`
+	srv := api.server(t)
+	t.Cleanup(srv.Close)
+	s := newGitHubSqueezeServer(t, srv, "hunter2")
+	body := pushPayload("9049f1265b7d61be4a8904a9a27120d2064dab3b")
+
+	w := postWebhook(t, s, "hunter2", "push", "ignored-1", body)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("first ignored delivery = %d: %s", w.Code, w.Body.String())
+	}
+	first := api.requests.Load()
+	if first == 0 {
+		t.Fatal("no-trigger webhook performed no forge work; the fixture does not exercise the path")
+	}
+
+	// Same delivery ID: terminal replay with no work.
+	if w = postWebhook(t, s, "hunter2", "push", "ignored-1", body); w.Code != http.StatusNoContent {
+		t.Fatalf("ignored replay = %d: %s", w.Code, w.Body.String())
+	}
+	if api.requests.Load() != first {
+		t.Fatalf("ignored delivery replay performed forge work: %d -> %d", first, api.requests.Load())
+	}
+
+	// Same signed body under a FRESH header: the body receipt suppresses it.
+	if w = postWebhook(t, s, "hunter2", "push", "ignored-2", body); w.Code != http.StatusNoContent {
+		t.Fatalf("ignored body replay = %d: %s", w.Code, w.Body.String())
+	}
+	if api.requests.Load() != first {
+		t.Fatalf("ignored body replay performed forge work: %d -> %d", first, api.requests.Load())
+	}
+	s.mu.Lock()
+	runs := len(s.runs)
+	s.mu.Unlock()
+	if runs != 0 {
+		t.Fatalf("ignored deliveries created %d runs, want 0", runs)
 	}
 }

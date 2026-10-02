@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -522,48 +521,63 @@ func (b *ContainerBackend) CloseJob() error {
 		return b.finishJobWorkspace()
 	}
 	name := b.container
-	b.container = ""
 	err := dockerCleanupCommand(context.Background(), b.docker, "rm", "-f", name)
-	if err != nil && !strings.Contains(err.Error(), "No such container") {
-		if rerr := b.finishJobWorkspace(); rerr != nil {
-			return fmt.Errorf("remove job container: %v (workspace restore also failed: %v)", err, rerr)
-		}
-		return fmt.Errorf("remove job container: %w", err)
+	if err != nil && !isContainerAbsentError(err) {
+		// The container may STILL EXIST. Retain its identity so a later retry
+		// can remove it, and do NOT touch the workspace protections
+		// (ownership restore / project-quota removal): a live bind-mounted
+		// container must not outlive the quota and ownership state that
+		// bound it. CloseJob stays retryable in this state.
+		return fmt.Errorf("remove job container %s: %w", name, err)
 	}
+	// Docker proved the container removed (or already absent): only now may
+	// the runtime handle be dropped and the workspace teardown run.
+	b.container = ""
 	return b.finishJobWorkspace()
 }
 
+// isContainerAbsentError reports whether docker positively said the container
+// does not exist (as opposed to a transient removal failure).
+func isContainerAbsentError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "No such container")
+}
+
 // finishJobWorkspace runs the pending workspace teardown (ownership restore
-// and project-quota removal), joining both errors. Each step is idempotent
-// (the function values are cleared before use), so CloseJob and the StartJob
-// failure paths can call it unconditionally.
+// and project-quota removal), joining both errors. A failing step KEEPS its
+// callback so a retry (CloseJob can be called again) finishes it; only a
+// successful step clears its callback.
 func (b *ContainerBackend) finishJobWorkspace() error {
 	return errors.Join(b.restoreProvisionedWorkspace(), b.cleanupWorkspaceQuota())
 }
 
 // cleanupWorkspaceQuota removes the OS-level workspace project quota applied
-// by the capability probe, exactly once. Errors are returned, never
-// swallowed: a failed removal leaves quota state behind and must surface as a
-// cleanup warning.
+// by the capability probe. The callback is cleared ONLY on success: a failed
+// removal (for example an XFS project cleanup that correctly refused to
+// release its quarantined ID) must stay retryable instead of leaving the
+// project ID allocated forever.
 func (b *ContainerBackend) cleanupWorkspaceQuota() error {
-	cleanup := b.quotaCleanup
-	b.quotaCleanup = nil
-	if cleanup == nil {
+	if b.quotaCleanup == nil {
 		return nil
 	}
-	return cleanup()
+	if err := b.quotaCleanup(); err != nil {
+		return err
+	}
+	b.quotaCleanup = nil
+	return nil
 }
 
-// restoreProvisionedWorkspace runs the pending ownership restore exactly once.
-// Errors are returned, never swallowed: a failed restore leaves the checkout
-// under the workload uid and must surface as a cleanup warning.
+// restoreProvisionedWorkspace runs the pending ownership restore. The
+// callback is cleared ONLY on success: a partial chown/chmod failure must stay
+// retryable so the checkout cannot remain owned by the workload uid.
 func (b *ContainerBackend) restoreProvisionedWorkspace() error {
-	restore := b.restoreWorkspace
-	b.restoreWorkspace = nil
-	if restore == nil {
+	if b.restoreWorkspace == nil {
 		return nil
 	}
-	return restore()
+	if err := b.restoreWorkspace(); err != nil {
+		return err
+	}
+	b.restoreWorkspace = nil
+	return nil
 }
 
 // ReadFile reads a workspace file from inside the job container via
@@ -587,19 +601,20 @@ func (b *ContainerBackend) ReadFile(ctx context.Context, path string, maxBytes i
 	if err != nil {
 		return nil, err
 	}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	stderr := executil.NewBoundedBuffer(maxCommandStderrBytes)
+	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
 	data, readErr := io.ReadAll(io.LimitReader(stdout, maxBytes+1))
 	waitErr := cmd.Wait()
 	if waitErr != nil {
-		msg := strings.ToLower(stderr.String())
+		stderrText := string(stderr.Bytes())
+		msg := strings.ToLower(stderrText)
 		if strings.Contains(msg, "no such file") || strings.Contains(msg, "cannot open") {
 			return nil, os.ErrNotExist
 		}
-		return nil, fmt.Errorf("read output file in container: %v: %s", waitErr, strings.TrimSpace(stderr.String()))
+		return nil, fmt.Errorf("read output file in container: %v: %s", waitErr, strings.TrimSpace(stderrText))
 	}
 	if readErr != nil {
 		return nil, readErr

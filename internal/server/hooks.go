@@ -126,14 +126,17 @@ func (s *Server) gitlabWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	digest := webhookPayloadDigest(body)
-	if prior, ok, derr := s.webhookDeliveryRun(r.Context(), "gitlab", delivery, digest, repoID); derr != nil {
+	if prior, enqueued, ignored, derr := s.webhookDeliveryRun(r.Context(), "gitlab", delivery, digest, repoID); derr != nil {
 		if errors.Is(derr, errDeliveryDigestMismatch) {
 			http.Error(w, "delivery id was already used with different content", http.StatusConflict)
 			return
 		}
 		s.internalError(w, r, derr, "")
 		return
-	} else if ok {
+	} else if ignored {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	} else if enqueued {
 		writeJSON(w, http.StatusOK, prior)
 		return
 	}
@@ -159,6 +162,7 @@ func (s *Server) gitlabWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	if !ok {
 		log.Printf("webhook: gitlab %s %s ignored (trigger %q)", ec.Event, ec.Repository.FullName, matched)
+		s.recordIgnoredWebhook(r.Context(), "gitlab", repoID, delivery, digest)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -260,14 +264,17 @@ func (s *Server) forgejoWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	digest := webhookPayloadDigest(body)
-	if prior, ok, derr := s.webhookDeliveryRun(r.Context(), "forgejo", delivery, digest, repoID); derr != nil {
+	if prior, enqueued, ignored, derr := s.webhookDeliveryRun(r.Context(), "forgejo", delivery, digest, repoID); derr != nil {
 		if errors.Is(derr, errDeliveryDigestMismatch) {
 			http.Error(w, "delivery id was already used with different content", http.StatusConflict)
 			return
 		}
 		s.internalError(w, r, derr, "")
 		return
-	} else if ok {
+	} else if ignored {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	} else if enqueued {
 		writeJSON(w, http.StatusOK, prior)
 		return
 	}
@@ -293,6 +300,7 @@ func (s *Server) forgejoWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	if !ok {
 		log.Printf("webhook: forgejo %s %s ignored (trigger %q)", ec.Event, ec.Repository.FullName, matched)
+		s.recordIgnoredWebhook(r.Context(), "forgejo", repoID, delivery, digest)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
