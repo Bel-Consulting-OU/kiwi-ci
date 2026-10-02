@@ -621,11 +621,12 @@ func TestPostgresIntegrationDeploymentsAndSnapshots(t *testing.T) {
 	snapID := pgITNewID(t)
 
 	dep := model.Deployment{ID: depID, RunID: runID, JobID: jobID, Repository: "kiwi-it/repo", Environment: "prod", Status: model.StatusRunning, CreatedAt: time.Now().UTC()}
-	if err := st.InsertDeployment(ctx, dep); err != nil {
+	if _, _, err := st.InsertDeploymentOnce(ctx, dep); err != nil {
 		t.Fatalf("InsertDeployment: %v", err)
 	}
-	if err := st.InsertDeployment(ctx, dep); err == nil {
-		t.Fatal("duplicate deployment id must fail")
+	stored, created, err := st.InsertDeploymentOnce(ctx, dep)
+	if err != nil || created || stored.ID != depID {
+		t.Fatalf("idempotent deployment replay = (%+v, created=%t, err=%v), want the stored record", stored, created, err)
 	}
 	deps, err := st.ListDeploymentsByRun(ctx, runID)
 	if err != nil || len(deps) != 1 || deps[0].Environment != "prod" {

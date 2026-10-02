@@ -4018,20 +4018,48 @@ func (s *PostgresStore) ListOccurrences(ctx context.Context, scheduleID string) 
 // deployments
 // ---------------------------------------------------------------------------
 
-func (s *PostgresStore) InsertDeployment(ctx context.Context, d model.Deployment) error {
+// InsertDeploymentOnce inserts the deployment unless its deterministic ID
+// already exists, in which case the STORED canonical record is returned with
+// created=false (see the DeploymentStore contract). The conflict path
+// re-validates that the existing row names the same run/job/environment, so
+// a hash collision or a caller bug fails closed instead of adopting another
+// deployment's record.
+func (s *PostgresStore) InsertDeploymentOnce(ctx context.Context, d model.Deployment) (model.Deployment, bool, error) {
 	if err := ValidateID(d.ID); err != nil {
-		return err
+		return model.Deployment{}, false, err
 	}
 	if err := ValidateRunID(d.RunID); err != nil {
-		return err
+		return model.Deployment{}, false, err
 	}
 	payload, err := jsonMarshal(d)
 	if err != nil {
-		return err
+		return model.Deployment{}, false, err
 	}
-	_, err = s.pool.Exec(ctx, `INSERT INTO deployments (id, run_id, job_id, environment, created_at, payload) VALUES ($1, $2, $3, $4, $5, $6)`,
+	tag, err := s.pool.Exec(ctx, `INSERT INTO deployments (id, run_id, job_id, environment, created_at, payload) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING`,
 		d.ID, d.RunID, nullText(d.JobID), d.Environment, d.CreatedAt, payload)
-	return err
+	if err != nil {
+		return model.Deployment{}, false, err
+	}
+	if tag.RowsAffected() == 1 {
+		return d, true, nil
+	}
+	var (
+		runID       string
+		jobID       string
+		environment string
+		stored      []byte
+	)
+	if err := s.pool.QueryRow(ctx, `SELECT run_id, COALESCE(job_id, ''), environment, payload FROM deployments WHERE id=$1`, d.ID).Scan(&runID, &jobID, &environment, &stored); err != nil {
+		return model.Deployment{}, false, err
+	}
+	if runID != d.RunID || jobID != d.JobID || environment != d.Environment {
+		return model.Deployment{}, false, fmt.Errorf("%w: deployment %s", ErrDeploymentIdentityConflict, d.ID)
+	}
+	var canonical model.Deployment
+	if err := json.Unmarshal(stored, &canonical); err != nil {
+		return model.Deployment{}, false, err
+	}
+	return canonical, false, nil
 }
 
 func (s *PostgresStore) ListDeploymentsByRun(ctx context.Context, runID string) ([]model.Deployment, error) {
@@ -4696,6 +4724,11 @@ func (s *PostgresStore) QuotaCounts(ctx context.Context, repoKey, teamKey string
 // (repo, trust_domain, logical_key), overwriting an existing entry for the
 // same namespace. The full record (including the signed envelope) lives in
 // the payload column; hot-path columns are real.
+// PutCacheManifest upserts a signed cache manifest. rec.CreatedAt is
+// producer/provenance metadata kept in the payload; the relational created_at
+// column used by the retention ranking and the age pruner is the live
+// DATABASE clock at commit time, so a skewed publishing replica can neither
+// prematurely age a fresh entry nor pin a stale one in the shared ranking.
 func (s *PostgresStore) PutCacheManifest(ctx context.Context, rec CacheManifestRecord) error {
 	if rec.Repo == "" || rec.TrustDomain == "" || rec.LogicalKey == "" {
 		return fmt.Errorf("storage: incomplete cache manifest namespace")
@@ -4704,14 +4737,15 @@ func (s *PostgresStore) PutCacheManifest(ctx context.Context, rec CacheManifestR
 		return fmt.Errorf("storage: invalid cache manifest blob digest")
 	}
 	if rec.CreatedAt.IsZero() {
+		// Provenance only; the SQL column below is the authority.
 		rec.CreatedAt = time.Now().UTC()
 	}
 	payload, err := jsonMarshal(rec)
 	if err != nil {
 		return err
 	}
-	_, err = s.pool.Exec(ctx, `INSERT INTO cache_manifests (repo, trust_domain, logical_key, blob_sha256, blob_size, producer_run, producer_job, created_at, payload) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (repo, trust_domain, logical_key) DO UPDATE SET blob_sha256=EXCLUDED.blob_sha256, blob_size=EXCLUDED.blob_size, producer_run=EXCLUDED.producer_run, producer_job=EXCLUDED.producer_job, created_at=EXCLUDED.created_at, payload=EXCLUDED.payload`,
-		rec.Repo, rec.TrustDomain, rec.LogicalKey, rec.BlobSHA256, rec.BlobSize, nullText(rec.ProducerRun), nullText(rec.ProducerJob), rec.CreatedAt, payload)
+	_, err = s.pool.Exec(ctx, `INSERT INTO cache_manifests (repo, trust_domain, logical_key, blob_sha256, blob_size, producer_run, producer_job, created_at, payload) VALUES ($1, $2, $3, $4, $5, $6, $7, clock_timestamp(), $8) ON CONFLICT (repo, trust_domain, logical_key) DO UPDATE SET blob_sha256=EXCLUDED.blob_sha256, blob_size=EXCLUDED.blob_size, producer_run=EXCLUDED.producer_run, producer_job=EXCLUDED.producer_job, created_at=EXCLUDED.created_at, payload=EXCLUDED.payload`,
+		rec.Repo, rec.TrustDomain, rec.LogicalKey, rec.BlobSHA256, rec.BlobSize, nullText(rec.ProducerRun), nullText(rec.ProducerJob), payload)
 	return err
 }
 

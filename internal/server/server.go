@@ -1015,6 +1015,14 @@ func (s *Server) SwitchToDB(db storage.Store) error {
 		// refuses to start instead of discovering it on the first webhook.
 		return fmt.Errorf("server: switch to db: store lacks the atomic compiled-run enqueue contract")
 	}
+	if _, ok := db.(storage.DeploymentStore); !ok {
+		// Startup-time fail-closed: DB mode records deployments durably at
+		// lease time and converges completion through the same store. A
+		// store without the contract would silently degrade deployment
+		// lifecycle state to the process-local mirror that HA replicas and
+		// restarts cannot see, so the control plane refuses to start.
+		return fmt.Errorf("server: switch to db: store lacks the deployment record contract")
+	}
 	// Tokens are HMACed with the server lease key before persistence so the
 	// durable row validates under validActiveLease on every instance that
 	// shares the key (persisted via data-dir in production).

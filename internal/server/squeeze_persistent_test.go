@@ -399,7 +399,7 @@ func TestSqueezeFinishDeploymentDBStoreLookup(t *testing.T) {
 	if err := s.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.InsertDeployment(context.Background(), model.Deployment{ID: "d1", JobID: "job-1", RunID: "run-1", Environment: "prod"}); err != nil {
+	if _, _, err := f.InsertDeploymentOnce(context.Background(), model.Deployment{ID: "d1", JobID: "job-1", RunID: "run-1", Environment: "prod"}); err != nil {
 		t.Fatal(err)
 	}
 	s.finishDeploymentDB(context.Background(), model.Job{ID: "job-1", RunID: "run-1", Environment: "prod"}, model.StatusSuccess, time.Now().UTC())
@@ -432,13 +432,21 @@ func TestSqueezeRecordDeploymentDBPaths(t *testing.T) {
 		t.Fatalf("missing job = %d, want 404", w.Code)
 	}
 	f.getJobErr = nil
-	if err := f.InsertJob(context.Background(), model.Job{ID: "job-1", RunID: "run-1"}); err != nil {
+	now := time.Now().UTC()
+	if err := f.InsertJob(context.Background(), model.Job{ID: "job-1", RunID: "run-1", Status: model.StatusRunning, StartedAt: &now}); err != nil {
 		t.Fatal(err)
 	}
 	if w := c.do(http.MethodPost, "/api/v1/jobs/job-1/deployments", nil, nil); w.Code != http.StatusConflict {
 		t.Fatalf("no environment = %d, want 409", w.Code)
 	}
-	if err := f.InsertJob(context.Background(), model.Job{ID: "job-2", RunID: "run-1", Environment: "prod"}); err != nil {
+	// A queued environment job cannot fabricate a running deployment.
+	if err := f.InsertJob(context.Background(), model.Job{ID: "job-queued", RunID: "run-1", Environment: "prod", Status: model.StatusQueued}); err != nil {
+		t.Fatal(err)
+	}
+	if w := c.do(http.MethodPost, "/api/v1/jobs/job-queued/deployments", nil, nil); w.Code != http.StatusConflict {
+		t.Fatalf("queued job deployment = %d, want 409", w.Code)
+	}
+	if err := f.InsertJob(context.Background(), model.Job{ID: "job-2", RunID: "run-1", Environment: "prod", Status: model.StatusRunning, StartedAt: &now}); err != nil {
 		t.Fatal(err)
 	}
 	// A failing durable insert fails the request and leaves neither the
@@ -490,7 +498,7 @@ func TestSqueezeListDeploymentsDBPaths(t *testing.T) {
 	if err := f.InsertRun(context.Background(), model.Run{ID: "run-1", Status: model.StatusRunning}); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.InsertDeployment(context.Background(), model.Deployment{ID: "d1", JobID: "job-1", RunID: "run-1", CreatedAt: time.Now().UTC()}); err != nil {
+	if _, _, err := f.InsertDeploymentOnce(context.Background(), model.Deployment{ID: "d1", JobID: "job-1", RunID: "run-1", CreatedAt: time.Now().UTC()}); err != nil {
 		t.Fatal(err)
 	}
 	// A memory-mirror record not present in the store is appended.

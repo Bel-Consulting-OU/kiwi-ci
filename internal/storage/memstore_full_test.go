@@ -534,10 +534,10 @@ func TestMemStoreDeploymentsAndSnapshots(t *testing.T) {
 	m := newMemStore()
 	started := time.Now().UTC()
 	finished := started.Add(time.Minute)
-	if err := m.InsertDeployment(ctx, model.Deployment{ID: memDeployID, RunID: memRunID, Environment: "prod", Status: model.StatusRunning}); err != nil {
+	if _, _, err := m.InsertDeploymentOnce(ctx, model.Deployment{ID: memDeployID, RunID: memRunID, Environment: "prod", Status: model.StatusRunning}); err != nil {
 		t.Fatalf("InsertDeployment: %v", err)
 	}
-	if err := m.InsertDeployment(ctx, model.Deployment{ID: memSnapshotID, RunID: memRunID2, Environment: "dev"}); err != nil {
+	if _, _, err := m.InsertDeploymentOnce(ctx, model.Deployment{ID: memSnapshotID, RunID: memRunID2, Environment: "dev"}); err != nil {
 		t.Fatalf("InsertDeployment other: %v", err)
 	}
 	deps, err := m.ListDeploymentsByRun(ctx, memRunID)

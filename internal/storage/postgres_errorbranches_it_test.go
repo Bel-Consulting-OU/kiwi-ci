@@ -122,7 +122,10 @@ func TestPostgresIntegrationValidationSweep(t *testing.T) {
 	}(), true)
 	bad("InsertJobContracts/bad-job", st.InsertJobContracts(ctx, "bad", testContracts), true)
 	bad("SetQueueReasons/bad-job", st.SetQueueReasons(ctx, map[string]string{"bad": "x"}), true)
-	bad("InsertDeployment/bad-id", st.InsertDeployment(ctx, model.Deployment{ID: "bad"}), true)
+	bad("InsertDeployment/bad-id", func() error {
+		_, _, err := st.InsertDeploymentOnce(ctx, model.Deployment{ID: "bad"})
+		return err
+	}(), true)
 	bad("UpdateDeploymentStatus/bad-id", st.UpdateDeploymentStatus(ctx, "bad", model.StatusSuccess, nil), true)
 	bad("InsertSnapshotRecord/bad-id", st.InsertSnapshotRecord(ctx, model.SnapshotRecord{ID: "bad"}), true)
 	bad("ListSnapshotsByRun/bad-run", func() error { _, err := st.ListSnapshotsByRun(ctx, "bad"); return err }(), true)

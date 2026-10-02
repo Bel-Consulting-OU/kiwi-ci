@@ -58,15 +58,24 @@ The limit applies across the whole control plane, not per runner.
 `deployment.canary`, `deployment.verify`, and `deployment.rollback`
 declare the three deployment phases as step lists. The control plane
 records a deployment per environment job (`model.Deployment`): start
-time, approving actor, commit, and final status. Records are exposed
-via `POST /api/v1/jobs/{id}/deployments` (explicit record creation) and
-`GET /api/v1/runs/{id}/deployments` (listing).
+time, approving actor, commit, and final status. Start time is always the
+authoritative job `StartedAt` — the explicit endpoint refuses any job that
+is not actually running (queued, waiting approval, blocked or terminal),
+so administrative API usage cannot fabricate a running deployment.
+Records are exposed via `POST /api/v1/jobs/{id}/deployments` (explicit
+record creation; idempotent) and `GET /api/v1/runs/{id}/deployments`
+(listing).
 
 ## Persistence
 
 Deployment records persist durably: through `DeploymentStore` in
 PostgreSQL mode, and through the data-dir state file in filesystem
-mode. Snapshot records persist through `SnapshotStore` in DB mode and
-the state file otherwise. Keep deployment capability on dedicated
-runner pools and use environment concurrency to serialize production
-deployments.
+mode. `InsertDeploymentOnce` makes creation idempotent across replicas
+and restarts: the deterministic per-job deployment ID either inserts once
+or returns the canonical stored record, so a dropped response replay,
+failover or restart converges on one durable row and one
+`deployment.started` audit event. Snapshot records persist through
+`SnapshotStore` in DB mode and the state file otherwise. DB mode requires
+the deployment contract at startup (`SwitchToDB` fails closed without
+it). Keep deployment capability on dedicated runner pools and use
+environment concurrency to serialize production deployments.

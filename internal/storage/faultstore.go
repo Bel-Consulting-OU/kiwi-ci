@@ -943,17 +943,17 @@ func (f *FaultyStore) AdvanceScheduleLastRun(ctx context.Context, id string, nom
 	return inner.AdvanceScheduleLastRun(ctx, id, nominal)
 }
 
-func (f *FaultyStore) InsertDeployment(ctx context.Context, d model.Deployment) error {
+func (f *FaultyStore) InsertDeploymentOnce(ctx context.Context, d model.Deployment) (model.Deployment, bool, error) {
 	inner, ok := f.Inner.(DeploymentStore)
 	if !ok {
-		return errMissingInnerInterface("DeploymentStore")
+		return model.Deployment{}, false, errMissingInnerInterface("DeploymentStore")
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
-		return err
+		return model.Deployment{}, false, err
 	}
-	return inner.InsertDeployment(ctx, d)
+	return inner.InsertDeploymentOnce(ctx, d)
 }
 
 func (f *FaultyStore) ListDeploymentsByRun(ctx context.Context, runID string) ([]model.Deployment, error) {
@@ -3958,11 +3958,29 @@ func (m *memStore) ListOccurrences(ctx context.Context, scheduleID string) ([]Oc
 	return out, nil
 }
 
-func (m *memStore) InsertDeployment(ctx context.Context, d model.Deployment) error {
+// InsertDeploymentOnce implements the idempotent DeploymentStore contract:
+// an existing deterministic ID returns the stored record with created=false,
+// and a conflicting run/job/environment fails closed.
+func (m *memStore) InsertDeploymentOnce(ctx context.Context, d model.Deployment) (model.Deployment, bool, error) {
+	if err := ValidateID(d.ID); err != nil {
+		return model.Deployment{}, false, err
+	}
+	if err := ValidateRunID(d.RunID); err != nil {
+		return model.Deployment{}, false, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	for _, existing := range m.deployments {
+		if existing.ID != d.ID {
+			continue
+		}
+		if existing.RunID != d.RunID || existing.JobID != d.JobID || existing.Environment != d.Environment {
+			return model.Deployment{}, false, fmt.Errorf("%w: deployment %s", ErrDeploymentIdentityConflict, d.ID)
+		}
+		return existing, false, nil
+	}
 	m.deployments = append(m.deployments, d)
-	return nil
+	return d, true, nil
 }
 
 func (m *memStore) ListDeploymentsByRun(ctx context.Context, runID string) ([]model.Deployment, error) {

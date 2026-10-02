@@ -439,6 +439,19 @@ In **DB mode the database clock is the authority for a lease's lifetime**:
   behavior-affecting runner mutation (completion, heartbeat, test reports,
   cache/artifact/snapshot publication, generated jobs, OIDC, secrets) is
   commit-time fenced.
+- **Durable cache retention is database-clock authoritative.** The
+  `cache_manifests.created_at` used for age pruning and entry/byte ranking is
+  stamped with `clock_timestamp()` by both writers, and the prune cutoff is
+  computed in SQL, so a skewed publishing or pruning replica cannot evict a
+  fresh entry, pin an old one, or reorder quota eviction. The signed payload
+  keeps the producer instant as provenance only.
+- **Deployment creation is idempotent across replicas and restarts.**
+  `InsertDeploymentOnce` inserts with `ON CONFLICT (id) DO NOTHING` and
+  returns the canonical stored record on replay (a conflicting
+  run/job/environment fails closed), the server caches only that record, and
+  `deployment.started` is audited exactly once. The explicit record endpoint
+  requires an actually running job and derives `StartedAt` from the job, and
+  `SwitchToDB` refuses a store without the deployment contract at startup.
 - **Heartbeats touch only `last_seen`.** The runner liveness refresh is a
   narrow `RunnerHeartbeatStore.TouchRunnerLastSeen`
   (`UPDATE runners SET last_seen=clock_timestamp()`), never a whole-row

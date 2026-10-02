@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -347,5 +348,25 @@ func TestDBLogBatchHandlerConflictNotAcked(t *testing.T) {
 	f.mu.Unlock()
 	if stored != 1 {
 		t.Fatalf("stored lines = %d, want exactly 1", stored)
+	}
+}
+
+// TestSwitchToDBRejectsStoreWithoutDeploymentStore pins the startup
+// fail-closed capability check: a DB store that cannot persist deployments
+// durably is refused instead of silently degrading deployment lifecycle
+// state to the process-local mirror.
+func TestSwitchToDBRejectsStoreWithoutDeploymentStore(t *testing.T) {
+	f := newDBFakeStore()
+	partial := struct {
+		storage.Store
+		storage.RunEnqueueStore
+	}{Store: f, RunEnqueueStore: f}
+	s := New("token")
+	err := s.SwitchToDB(partial)
+	if err == nil || !strings.Contains(err.Error(), "deployment record contract") {
+		t.Fatalf("SwitchToDB = %v, want the deployment record contract refusal", err)
+	}
+	if s.Sched != nil || s.DB != nil {
+		t.Fatal("refused SwitchToDB left the server wired to the partial store")
 	}
 }

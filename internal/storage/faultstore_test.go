@@ -408,14 +408,15 @@ func faultOps() []opCase {
 			name:  "InsertDeployment",
 			setup: seedRunAndJob,
 			call: func(s Store) error {
-				return s.(DeploymentStore).InsertDeployment(ctx(), testDeployment)
+				_, _, err := s.(DeploymentStore).InsertDeploymentOnce(ctx(), testDeployment)
+				return err
 			},
 		},
 		{
 			name: "UpdateDeploymentStatus",
 			setup: func(m *memStore) {
 				seedRunAndJob(m)
-				_ = m.InsertDeployment(ctx(), testDeployment)
+				_, _, _ = m.InsertDeploymentOnce(ctx(), testDeployment)
 			},
 			call: func(s Store) error {
 				fin := time.Unix(20001, 0).UTC()

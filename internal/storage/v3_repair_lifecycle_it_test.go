@@ -157,30 +157,48 @@ func TestPostgresIntegrationSnapshotCapEnforcedAtCommit(t *testing.T) {
 	}
 }
 
-// TestPostgresIntegrationCacheManifestReplacementUpdatesCreatedAt pins
-// finding 9: the indexed created_at column follows a replacement.
-func TestPostgresIntegrationCacheManifestReplacementUpdatesCreatedAt(t *testing.T) {
+// TestPostgresIntegrationCacheManifestReplacementUsesDBCommitTime pins the
+// retention clock authority: the indexed created_at column (pruning/ranking)
+// is the DATABASE commit clock on insert and advances on replacement, while
+// the payload keeps the producer/provenance instant.
+func TestPostgresIntegrationCacheManifestReplacementUsesDBCommitTime(t *testing.T) {
 	st := pgITStore(t)
 	ctx := context.Background()
-	rec := CacheManifestRecord{Repo: "github.com/acme/x", TrustDomain: "trusted", LogicalKey: "k1", BlobSHA256: strings.Repeat("a", 64), BlobSize: 1, CreatedAt: time.Now().UTC().Add(-time.Hour), Envelope: []byte("{}")}
+	producer := time.Now().UTC().Add(-72 * time.Hour).Truncate(time.Microsecond)
+	rec := CacheManifestRecord{Repo: "github.com/acme/x", TrustDomain: "trusted", LogicalKey: "k1", BlobSHA256: strings.Repeat("a", 64), BlobSize: 1, CreatedAt: producer, Envelope: []byte("{}")}
 	if err := st.PutCacheManifest(ctx, rec); err != nil {
 		t.Fatal(err)
 	}
+	var colA time.Time
+	if err := st.pool.QueryRow(ctx, `SELECT created_at FROM cache_manifests WHERE repo=$1 AND trust_domain=$2 AND logical_key=$3`, rec.Repo, rec.TrustDomain, rec.LogicalKey).Scan(&colA); err != nil {
+		t.Fatal(err)
+	}
+	if colA.Before(time.Now().UTC().Add(-time.Hour)) {
+		t.Fatalf("created_at = %v kept the producer instant; want the database commit clock", colA)
+	}
+
+	// Ensure a measurable commit-time gap, then replace the manifest with a
+	// still-different producer instant and a new blob.
+	time.Sleep(2 * time.Millisecond)
 	newer := rec
-	// Microsecond-aligned: PostgreSQL timestamptz has microsecond precision,
-	// and created_at is compared with time.Time.Equal after a round-trip, so a
-	// nanosecond-precise Go clock (Linux) would fail the equality.
-	newer.CreatedAt = time.Now().UTC().Truncate(time.Microsecond)
+	newer.CreatedAt = producer.Add(time.Hour)
 	newer.BlobSHA256 = strings.Repeat("b", 64)
 	if err := st.PutCacheManifest(ctx, newer); err != nil {
 		t.Fatal(err)
 	}
-	var col time.Time
-	if err := st.pool.QueryRow(ctx, `SELECT created_at FROM cache_manifests WHERE repo=$1 AND trust_domain=$2 AND logical_key=$3`, rec.Repo, rec.TrustDomain, rec.LogicalKey).Scan(&col); err != nil {
+	var colB time.Time
+	if err := st.pool.QueryRow(ctx, `SELECT created_at FROM cache_manifests WHERE repo=$1 AND trust_domain=$2 AND logical_key=$3`, rec.Repo, rec.TrustDomain, rec.LogicalKey).Scan(&colB); err != nil {
 		t.Fatal(err)
 	}
-	if !col.Equal(newer.CreatedAt) {
-		t.Fatalf("created_at = %v, want the replacement timestamp %v", col, newer.CreatedAt)
+	if !colB.After(colA) {
+		t.Fatalf("replacement did not advance the database created_at: %v -> %v", colA, colB)
+	}
+	got, ok, err := st.GetCacheManifest(ctx, rec.Repo, rec.TrustDomain, rec.LogicalKey)
+	if err != nil || !ok {
+		t.Fatalf("get manifest: ok=%t err=%v", ok, err)
+	}
+	if !got.CreatedAt.Equal(newer.CreatedAt) {
+		t.Fatalf("payload provenance = %v, want the producer instant %v", got.CreatedAt, newer.CreatedAt)
 	}
 }
 

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"sort"
 	"time"
@@ -10,6 +11,11 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
+
+// errDeploymentStoreUnsupported is defense in depth: SwitchToDB already
+// refuses a store without the deployment contract at startup, so DB mode
+// cannot silently degrade deployment state to the process-local mirror.
+var errDeploymentStoreUnsupported = errors.New("server: deployment store unavailable")
 
 // recordDeploymentLocked creates the deployment record for a job starting
 // its environment deployment, if one does not exist yet. Idempotent per
@@ -27,11 +33,13 @@ func (s *Server) recordDeploymentLocked(j model.Job, startedAt time.Time) model.
 }
 
 // recordDeploymentDB creates the deployment record in DB mode. The durable
-// insert commits FIRST: the in-memory mirror and the deployment.started
-// audit event are only written after DeploymentStore accepted the record, so
-// a persistence failure leaves no marker behind and the caller can retry
-// (or the completion deployment effect can rebuild the record). Idempotent
-// per job ID.
+// insert commits FIRST and is genuinely IDEMPOTENT across replicas and
+// restarts: a deterministic-ID replay returns the STORED canonical record
+// (created=false), so the local mirror always caches what the database holds
+// and the deployment.started audit event is emitted only by the call that
+// actually created the row. Persistence failure leaves no marker behind and
+// the caller can retry (or the completion deployment effect can rebuild the
+// record).
 func (s *Server) recordDeploymentDB(ctx context.Context, j model.Job, startedAt time.Time) (model.Deployment, error) {
 	s.mu.Lock()
 	if d, ok := s.deployments[j.ID]; ok {
@@ -39,30 +47,37 @@ func (s *Server) recordDeploymentDB(ctx context.Context, j model.Job, startedAt 
 		return d, nil
 	}
 	s.mu.Unlock()
-	d := deploy.NewDeployment(j, j.ApprovedBy, nil, &startedAt)
-	if ds, ok := s.DB.(storage.DeploymentStore); ok {
-		if err := ds.InsertDeployment(ctx, d); err != nil {
-			return model.Deployment{}, err
-		}
+	ds, ok := s.DB.(storage.DeploymentStore)
+	if !ok {
+		// SwitchToDB refuses stores without the contract; this is defense in
+		// depth for direct wiring.
+		return model.Deployment{}, errDeploymentStoreUnsupported
+	}
+	d, created, err := ds.InsertDeploymentOnce(ctx, deploy.NewDeployment(j, j.ApprovedBy, nil, &startedAt))
+	if err != nil {
+		return model.Deployment{}, err
 	}
 	s.mu.Lock()
-	if cur, ok := s.deployments[j.ID]; ok {
-		// A concurrent create won the race; the durable row is keyed by the
-		// deterministic per-job deployment ID, so it is the same record.
-		s.mu.Unlock()
-		return cur, nil
-	}
 	s.deployments[j.ID] = d
 	s.mu.Unlock()
+	if !created {
+		// Another replica (or an earlier process) already recorded it: the
+		// durable row is the canonical record and the audit evidence exists.
+		return d, nil
+	}
 	s.auditLocked("deployment.started", "scheduler", j.RunID, j.ID, "deployment started", map[string]string{"environment": j.Environment})
 	return d, nil
 }
 
 // recordDeployment is POST /api/v1/jobs/{id}/deployments: it creates (or
-// returns the existing) deployment record for an environment job. The
-// scheduling path calls recordDeploymentLocked/recordDeploymentDB
-// automatically when such a job is leased; this endpoint exists for
-// explicit record creation and DB-mode parity.
+// returns the existing) deployment record for an environment job that is
+// ACTUALLY RUNNING. The scheduling path calls
+// recordDeploymentLocked/recordDeploymentDB automatically when such a job is
+// leased; this endpoint exists for explicit record creation and DB-mode
+// parity. It refuses any non-running job (queued, waiting approval, blocked,
+// terminal): a deployment cannot start before its job does, and
+// StartedAt is derived from the authoritative job (never the request time),
+// so administrative API usage cannot fabricate a running deployment.
 func (s *Server) recordDeployment(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("id")
 	if s.DB != nil {
@@ -79,7 +94,11 @@ func (s *Server) recordDeployment(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "job has no environment", http.StatusConflict)
 			return
 		}
-		d, err := s.recordDeploymentDB(r.Context(), j, time.Now().UTC())
+		if j.Status != model.StatusRunning || j.StartedAt == nil {
+			http.Error(w, "deployment can only be recorded for a running job", http.StatusConflict)
+			return
+		}
+		d, err := s.recordDeploymentDB(r.Context(), j, *j.StartedAt)
 		if err != nil {
 			// Fail closed: a deployment record that is not durable must not
 			// be acknowledged (no in-memory marker, no audit).
@@ -100,8 +119,12 @@ func (s *Server) recordDeployment(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "job has no environment", http.StatusConflict)
 		return
 	}
+	if j.Status != model.StatusRunning || j.StartedAt == nil {
+		http.Error(w, "deployment can only be recorded for a running job", http.StatusConflict)
+		return
+	}
 	prev, had := s.deployments[jobID]
-	d := s.recordDeploymentLocked(j, time.Now().UTC())
+	d := s.recordDeploymentLocked(j, *j.StartedAt)
 	if perr := s.persistCheckedErrLocked("deployment.record"); perr != nil {
 		// The record never became durable: restore the pre-mutation mirror
 		// (or remove the fresh entry) and fail closed, exactly like the DB
@@ -208,10 +231,13 @@ func (s *Server) finishDeploymentDB(ctx context.Context, j model.Job, status mod
 		if j.StartedAt != nil {
 			started = *j.StartedAt
 		}
-		d = deploy.NewDeployment(j, j.ApprovedBy, nil, &started)
-		if err := ds.InsertDeployment(ctx, d); err != nil {
+		stored, _, err := ds.InsertDeploymentOnce(ctx, deploy.NewDeployment(j, j.ApprovedBy, nil, &started))
+		if err != nil {
 			return err
 		}
+		// Use the canonical stored record: another replica may have created
+		// it (with its own finish state) between our read and this insert.
+		d = stored
 	}
 	if d.FinishedAt != nil {
 		return nil

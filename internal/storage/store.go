@@ -547,10 +547,25 @@ type ScheduleStore interface {
 
 // DeploymentStore is the durable deployment record contract.
 type DeploymentStore interface {
-	InsertDeployment(ctx context.Context, d model.Deployment) error
+	// InsertDeploymentOnce inserts the deployment unless a row with the same
+	// deterministic ID already exists, in which case it returns the STORED
+	// canonical record with created=false. A duplicate key is therefore an
+	// idempotent replay, not an error: the server caches the returned record
+	// and audits deployment.started only when created is true, so two HA
+	// replicas (or a retry after a restart with an empty local mirror)
+	// converge on exactly one durable record and one audit event. The
+	// existing row must agree on run/job/environment; a disagreement returns
+	// an error wrapping ErrDeploymentIdentityConflict and writes nothing.
+	InsertDeploymentOnce(ctx context.Context, d model.Deployment) (model.Deployment, bool, error)
 	ListDeploymentsByRun(ctx context.Context, runID string) ([]model.Deployment, error)
 	UpdateDeploymentStatus(ctx context.Context, id string, status model.Status, finishedAt *time.Time) error
 }
+
+// ErrDeploymentIdentityConflict reports that a deterministic deployment ID
+// already names a different run/job/environment. The existing row is
+// returned to no one and nothing is overwritten: the caller fails closed
+// instead of silently adopting an unrelated deployment record.
+var ErrDeploymentIdentityConflict = errors.New("storage: deployment id already names a different run, job or environment")
 
 // SnapshotStore is the durable workspace snapshot record contract.
 type SnapshotStore interface {

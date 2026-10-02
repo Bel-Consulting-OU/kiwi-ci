@@ -2488,14 +2488,23 @@ func (f *dbFakeStore) AdvanceScheduleLastRun(ctx context.Context, id string, nom
 	return nil
 }
 
-func (f *dbFakeStore) InsertDeployment(ctx context.Context, d model.Deployment) error {
+// InsertDeploymentOnce mirrors the idempotent DeploymentStore contract: an
+// existing deterministic ID returns the stored record with created=false and
+// a conflicting identity fails closed.
+func (f *dbFakeStore) InsertDeploymentOnce(ctx context.Context, d model.Deployment) (model.Deployment, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.deploymentInsertErr != nil {
-		return f.deploymentInsertErr
+		return model.Deployment{}, false, f.deploymentInsertErr
+	}
+	if existing, ok := f.deployments[d.ID]; ok {
+		if existing.RunID != d.RunID || existing.JobID != d.JobID || existing.Environment != d.Environment {
+			return model.Deployment{}, false, fmt.Errorf("%w: deployment %s", storage.ErrDeploymentIdentityConflict, d.ID)
+		}
+		return existing, false, nil
 	}
 	f.deployments[d.ID] = d
-	return nil
+	return d, true, nil
 }
 
 func (f *dbFakeStore) ListDeploymentsByRun(ctx context.Context, runID string) ([]model.Deployment, error) {

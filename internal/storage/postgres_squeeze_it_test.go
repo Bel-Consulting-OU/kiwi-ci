@@ -243,7 +243,7 @@ func TestPostgresIntegrationReaderScanSweep(t *testing.T) {
 		st := pgITStore(t)
 		runID := pgITNewID(t)
 		pgITEnqueueOne(t, st, runID, pgITNewID(t), pgITRepo)
-		if err := st.InsertDeployment(context.Background(), model.Deployment{ID: pgITNewID(t), RunID: runID, CreatedAt: time.Now().UTC()}); err != nil {
+		if _, _, err := st.InsertDeploymentOnce(context.Background(), model.Deployment{ID: pgITNewID(t), RunID: runID, CreatedAt: time.Now().UTC()}); err != nil {
 			t.Fatal(err)
 		}
 		pgITBreakColumn(t, st, "deployments", "payload")
@@ -473,7 +473,7 @@ func TestPostgresIntegrationSimpleStatementFailures(t *testing.T) {
 		runID := pgITNewID(t)
 		pgITEnqueueOne(t, st, runID, pgITNewID(t), pgITRepo)
 		pgITBoom(t, st, "deployments")
-		if err := st.InsertDeployment(context.Background(), model.Deployment{ID: pgITNewID(t), RunID: runID, CreatedAt: time.Now().UTC()}); err == nil {
+		if _, _, err := st.InsertDeploymentOnce(context.Background(), model.Deployment{ID: pgITNewID(t), RunID: runID, CreatedAt: time.Now().UTC()}); err == nil {
 			t.Fatal("InsertDeployment over a boom trigger = nil error")
 		}
 	})
@@ -610,7 +610,7 @@ func TestPostgresIntegrationSimpleStatementFailures(t *testing.T) {
 		runID := pgITNewID(t)
 		pgITEnqueueOne(t, st, runID, pgITNewID(t), pgITRepo)
 		deploymentID := pgITNewID(t)
-		if err := st.InsertDeployment(context.Background(), model.Deployment{ID: deploymentID, RunID: runID, CreatedAt: time.Now().UTC()}); err != nil {
+		if _, _, err := st.InsertDeploymentOnce(context.Background(), model.Deployment{ID: deploymentID, RunID: runID, CreatedAt: time.Now().UTC()}); err != nil {
 			t.Fatal(err)
 		}
 		pgITBoom(t, st, "deployments")
@@ -889,7 +889,7 @@ func TestPostgresIntegrationClosedPoolBeginSweep(t *testing.T) {
 	if err := st.InsertGeneratedJobs(ctx, jobID, 1, map[string]model.Job{job.ID: job}, nil); err == nil {
 		t.Fatal("InsertGeneratedJobs on a closed pool = nil error")
 	}
-	if err := st.InsertDeployment(ctx, model.Deployment{ID: pgITNewID(t), RunID: runID, CreatedAt: now}); err == nil {
+	if _, _, err := st.InsertDeploymentOnce(ctx, model.Deployment{ID: pgITNewID(t), RunID: runID, CreatedAt: now}); err == nil {
 		t.Fatal("InsertDeployment on a closed pool = nil error")
 	}
 	if err := st.InsertSnapshotRecord(ctx, model.SnapshotRecord{ID: pgITNewID(t), RunID: runID, CreatedAt: now}); err == nil {
@@ -1155,7 +1155,7 @@ func TestPostgresIntegrationMiscStatementBreaks(t *testing.T) {
 	})
 	t.Run("InsertDeployment bad run", func(t *testing.T) {
 		st := pgITStore(t)
-		if err := st.InsertDeployment(context.Background(), model.Deployment{ID: pgITNewID(t), RunID: "bad run id!"}); err == nil {
+		if _, _, err := st.InsertDeploymentOnce(context.Background(), model.Deployment{ID: pgITNewID(t), RunID: "bad run id!"}); err == nil {
 			t.Fatal("InsertDeployment with an invalid run id = nil error")
 		}
 	})

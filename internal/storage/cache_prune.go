@@ -63,6 +63,12 @@ func prunePolicyActive(p CacheManifestPrunePolicy) bool {
 // (blob_sha256 non-empty) participate, mirroring the CAS reference
 // enumeration.
 //
+// The age cutoff is computed by the DATABASE (`clock_timestamp()` minus the
+// policy interval), never by the pruning replica's application clock: with
+// created_at also database-stamped, retention is decided entirely in the
+// database clock domain, so a skewed replica can neither evict a fresh entry
+// nor keep an old one.
+//
 // The victim identity carries created_at AND blob_sha256, and the DELETE
 // re-matches on them: a concurrent upsert that refreshed a ranked row under
 // a row lock is re-evaluated against the new version under READ COMMITTED
@@ -72,10 +78,6 @@ func (s *PostgresStore) PruneCacheManifests(ctx context.Context, policy CacheMan
 	var res CacheManifestPruneResult
 	if !prunePolicyActive(policy) {
 		return res, nil
-	}
-	cutoff := time.Time{}
-	if policy.OlderThan > 0 {
-		cutoff = time.Now().UTC().Add(-policy.OlderThan)
 	}
 	rows, err := s.pool.Query(ctx, `
 WITH ranked AS (
@@ -87,7 +89,7 @@ WITH ranked AS (
 ),
 victims AS (
     SELECT repo, trust_domain, logical_key, blob_sha256, created_at FROM ranked
-    WHERE ($1::boolean AND created_at < $2)
+    WHERE ($1::boolean AND created_at < clock_timestamp() - make_interval(secs => $2::double precision))
        OR ($3::bigint > 0 AND rn > $3)
        OR ($4::bigint > 0 AND running_bytes > $4)
 )
@@ -99,7 +101,7 @@ WHERE c.repo = v.repo
   AND c.created_at = v.created_at
   AND c.blob_sha256 = v.blob_sha256
 RETURNING c.blob_size`,
-		policy.OlderThan > 0, cutoff, int64(policy.PerRepoMaxEntries), policy.PerRepoMaxBytes)
+		policy.OlderThan > 0, policy.OlderThan.Seconds(), int64(policy.PerRepoMaxEntries), policy.PerRepoMaxBytes)
 	if err != nil {
 		return res, fmt.Errorf("storage: prune cache manifests: %w", err)
 	}

@@ -124,7 +124,7 @@ func TestLeftoverDeploymentStatusUpdateFailure(t *testing.T) {
 	s.mu.Lock()
 	s.deployments[j.ID] = d0
 	s.mu.Unlock()
-	if err := f.InsertDeployment(context.Background(), d0); err != nil {
+	if _, _, err := f.InsertDeploymentOnce(context.Background(), d0); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.finishDeploymentDB(context.Background(), j, model.StatusFailure, time.Now().UTC()); err == nil {

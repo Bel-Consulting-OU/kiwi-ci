@@ -1258,6 +1258,7 @@ func TestFSFindingsDeploymentRecordAcknowledgesOnPersistFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	job := queuedJobForRun(t, s, run)
+	markJobRunningForTest(t, s, job.ID)
 	if w := doJSON(t, s, http.MethodPost, "/api/v1/jobs/"+job.ID+"/deployments", "token", ""); w.Code != http.StatusCreated {
 		t.Fatalf("healthy deployment record = %d: %s", w.Code, w.Body.String())
 	}
@@ -1285,6 +1286,7 @@ func TestFSFindingsDeploymentRecordAcknowledgesOnPersistFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	job3 := queuedJobForRun(t, s3, run3)
+	markJobRunningForTest(t, s3, job3.ID)
 	s3.persistFailForTest = errFSMatrixSeam
 	w := doJSON(t, s3, http.MethodPost, "/api/v1/jobs/"+job3.ID+"/deployments", "token", "")
 	if w.Code == http.StatusServiceUnavailable {
@@ -1570,4 +1572,21 @@ func TestFSFindingsScheduleCreateLeavesGhostOnJournalFailure(t *testing.T) {
 	n := len(s2.schedules)
 	s2.mu.Unlock()
 	t.Errorf("FINDING schedule create: the next successful schedules write committed %d schedule(s); the first write the client was told failed is now durable", n)
+}
+
+// markJobRunningForTest flips an fs-mode job to running with an authoritative
+// StartedAt, the state the explicit deployment-record endpoint requires.
+func markJobRunningForTest(t *testing.T, s *Server, jobID string) {
+	t.Helper()
+	now := time.Now().UTC()
+	s.mu.Lock()
+	j, ok := s.jobs[jobID]
+	if !ok {
+		s.mu.Unlock()
+		t.Fatalf("job %s not found", jobID)
+	}
+	j.Status = model.StatusRunning
+	j.StartedAt = &now
+	s.jobs[jobID] = j
+	s.mu.Unlock()
 }

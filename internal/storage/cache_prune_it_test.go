@@ -24,10 +24,19 @@ func TestIntegrationPruneCacheManifestsFencesConcurrentRefreshPostgres(t *testin
 
 	mk := func(key, digest string, size int64, created time.Time) {
 		t.Helper()
-		if err := st.PutCacheManifest(ctx, CacheManifestRecord{
+		// Seed through raw SQL with an EXPLICIT created_at: the ranking in
+		// this test is about the victim-identity fence, and the production
+		// writers stamp created_at from the database clock (covered by the
+		// cache-clock tests).
+		payload, err := jsonMarshal(CacheManifestRecord{
 			Repo: repo, TrustDomain: "t", LogicalKey: key,
 			BlobSHA256: digest, BlobSize: size, CreatedAt: created,
-		}); err != nil {
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.pool.Exec(ctx, `INSERT INTO cache_manifests (repo, trust_domain, logical_key, blob_sha256, blob_size, created_at, payload) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (repo, trust_domain, logical_key) DO UPDATE SET blob_sha256=EXCLUDED.blob_sha256, blob_size=EXCLUDED.blob_size, created_at=EXCLUDED.created_at, payload=EXCLUDED.payload`,
+			repo, "t", key, digest, size, created, payload); err != nil {
 			t.Fatal(err)
 		}
 	}

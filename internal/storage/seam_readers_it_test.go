@@ -68,7 +68,7 @@ func TestPostgresIntegrationReaderScanFailures(t *testing.T) {
 		runID := pgITNewID(t)
 		jobID := pgITNewID(t)
 		pgITEnqueueOne(t, st, runID, jobID, pgITRepo)
-		if err := st.InsertDeployment(ctx, model.Deployment{ID: pgITNewID(t), RunID: runID, JobID: jobID, Environment: "prod", CreatedAt: time.Now().UTC()}); err != nil {
+		if _, _, err := st.InsertDeploymentOnce(ctx, model.Deployment{ID: pgITNewID(t), RunID: runID, JobID: jobID, Environment: "prod", CreatedAt: time.Now().UTC()}); err != nil {
 			t.Fatal(err)
 		}
 		pgITBreakColumnToArray(t, st, "deployments", "payload")

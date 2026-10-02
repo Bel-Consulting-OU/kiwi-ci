@@ -286,8 +286,14 @@ func bindCacheManifestLeaseIdentity(jobID string, c leaseJobCoords, rec *CacheMa
 // PutCacheManifestForLease is the transactional cache-manifest commit: it
 // locks the job row, re-evaluates the live-lease predicate, validates the
 // record's namespace and producer identity against the locked job, and only
-// then upserts the manifest, all in one transaction. The stored row is
-// byte-for-byte what PutCacheManifest would write.
+// then upserts the manifest, all in one transaction.
+//
+// Retention time is NOT the producer's clock: the relational created_at
+// column (the ranking/pruning authority) is stamped with the fence's own
+// database timestamp (coords.DBNow), while rec.CreatedAt stays in the signed
+// payload as provenance. A skewed publishing replica therefore cannot make a
+// fresh entry look 72 hours old (or pin a stale one far into the future) in
+// the shared retention ranking.
 func (s *PostgresStore) PutCacheManifestForLease(ctx context.Context, jobID, runnerID string, generation int64, rec CacheManifestRecord) error {
 	if err := validateLeaseCommitKey(jobID, runnerID, generation); err != nil {
 		return err
@@ -297,9 +303,6 @@ func (s *PostgresStore) PutCacheManifestForLease(ctx context.Context, jobID, run
 	}
 	if len(rec.BlobSHA256) != 64 {
 		return fmt.Errorf("storage: invalid cache manifest blob digest")
-	}
-	if rec.CreatedAt.IsZero() {
-		rec.CreatedAt = time.Now().UTC()
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -316,12 +319,16 @@ func (s *PostgresStore) PutCacheManifestForLease(ctx context.Context, jobID, run
 	if err := bindCacheManifestLeaseIdentity(jobID, coords, &rec); err != nil {
 		return err
 	}
+	if rec.CreatedAt.IsZero() {
+		// Provenance only; the relational column below is the authority.
+		rec.CreatedAt = coords.DBNow
+	}
 	payload, err := jsonMarshal(rec)
 	if err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO cache_manifests (repo, trust_domain, logical_key, blob_sha256, blob_size, producer_run, producer_job, created_at, payload) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (repo, trust_domain, logical_key) DO UPDATE SET blob_sha256=EXCLUDED.blob_sha256, blob_size=EXCLUDED.blob_size, producer_run=EXCLUDED.producer_run, producer_job=EXCLUDED.producer_job, created_at=EXCLUDED.created_at, payload=EXCLUDED.payload`,
-		rec.Repo, rec.TrustDomain, rec.LogicalKey, rec.BlobSHA256, rec.BlobSize, nullText(rec.ProducerRun), nullText(rec.ProducerJob), rec.CreatedAt, payload); err != nil {
+		rec.Repo, rec.TrustDomain, rec.LogicalKey, rec.BlobSHA256, rec.BlobSize, nullText(rec.ProducerRun), nullText(rec.ProducerJob), coords.DBNow, payload); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

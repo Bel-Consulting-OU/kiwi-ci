@@ -41,7 +41,7 @@ func TestPostgresIntegrationScannerCorruption(t *testing.T) {
 	if err := st.UpsertSchedule(ctx, Schedule{ID: pgITNewID(t), Repository: "r", Spec: "@daily", CreatedAt: time.Now().UTC()}); err != nil {
 		t.Fatalf("schedule: %v", err)
 	}
-	if err := st.InsertDeployment(ctx, model.Deployment{ID: pgITNewID(t), RunID: runID, CreatedAt: time.Now().UTC()}); err != nil {
+	if _, _, err := st.InsertDeploymentOnce(ctx, model.Deployment{ID: pgITNewID(t), RunID: runID, CreatedAt: time.Now().UTC()}); err != nil {
 		t.Fatalf("deployment: %v", err)
 	}
 	if err := st.InsertSnapshotRecord(ctx, model.SnapshotRecord{ID: pgITNewID(t), RunID: runID, CreatedAt: time.Now().UTC()}); err != nil {
@@ -453,7 +453,7 @@ func TestPostgresIntegrationTriggerExtras(t *testing.T) {
 		st := pgITStore(t)
 		ids := boomerSeedFor(t, st, pgITRepo)
 		depID := pgITNewID(t)
-		if err := st.InsertDeployment(ctx, model.Deployment{ID: depID, RunID: ids.run, CreatedAt: time.Now().UTC()}); err != nil {
+		if _, _, err := st.InsertDeploymentOnce(ctx, model.Deployment{ID: depID, RunID: ids.run, CreatedAt: time.Now().UTC()}); err != nil {
 			t.Fatalf("deployment: %v", err)
 		}
 		if _, err := st.pool.Exec(ctx, `UPDATE deployments SET payload='"scalar"'::jsonb WHERE id=$1`, depID); err != nil {

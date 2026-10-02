@@ -232,13 +232,13 @@ func TestPostgresIntegrationJSONSeamSweep(t *testing.T) {
 	})
 	t.Run("InsertDeployment", func(t *testing.T) {
 		defer seamPGFailAll(t)()
-		if err := st.InsertDeployment(ctx, model.Deployment{ID: pgITNewID(t), RunID: runID, JobID: jobID, Environment: "prod", CreatedAt: time.Now().UTC()}); !errors.Is(err, errPGSeamJSON) {
+		if _, _, err := st.InsertDeploymentOnce(ctx, model.Deployment{ID: pgITNewID(t), RunID: runID, JobID: jobID, Environment: "prod", CreatedAt: time.Now().UTC()}); !errors.Is(err, errPGSeamJSON) {
 			t.Fatalf("InsertDeployment = %v", err)
 		}
 	})
 	t.Run("UpdateDeploymentStatus", func(t *testing.T) {
 		depID := pgITNewID(t)
-		if err := st.InsertDeployment(ctx, model.Deployment{ID: depID, RunID: runID, JobID: jobID, Environment: "prod", CreatedAt: time.Now().UTC()}); err != nil {
+		if _, _, err := st.InsertDeploymentOnce(ctx, model.Deployment{ID: depID, RunID: runID, JobID: jobID, Environment: "prod", CreatedAt: time.Now().UTC()}); err != nil {
 			t.Fatal(err)
 		}
 		defer seamPGFailAll(t)()

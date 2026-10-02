@@ -103,7 +103,7 @@ func TestPostgresClosedPoolErrorPaths(t *testing.T) {
 			return err
 		}},
 		{"ListOccurrences", func() error { _, err := st.ListOccurrences(ctx, memReportID); return err }},
-		{"InsertDeployment", func() error { return st.InsertDeployment(ctx, model.Deployment{ID: memDeployID}) }},
+		{"InsertDeployment", func() error { _, _, err := st.InsertDeploymentOnce(ctx, model.Deployment{ID: memDeployID}); return err }},
 		{"ListDeploymentsByRun", func() error { _, err := st.ListDeploymentsByRun(ctx, runID); return err }},
 		{"UpdateDeploymentStatus", func() error { return st.UpdateDeploymentStatus(ctx, memDeployID, model.StatusSuccess, nil) }},
 		{"InsertSnapshotRecord", func() error { return st.InsertSnapshotRecord(ctx, model.SnapshotRecord{ID: memSnapshotID}) }},

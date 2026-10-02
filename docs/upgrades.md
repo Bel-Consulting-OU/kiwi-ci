@@ -566,3 +566,26 @@ claims themselves.
   (`kiwi storage migrate-runner-cache-layout --dir <old namespace> --force`);
   the old tree is deliberately not deleted automatically, because only the
   operator can confirm every pre-upgrade process has drained.
+- Cache-manifest retention now runs entirely in the database clock domain:
+  `cache_manifests.created_at` (the ranking and age-pruning authority) is
+  stamped with `clock_timestamp()` on insert and replacement by BOTH the
+  plain and the lease-fenced writers, and the age cutoff is computed in SQL
+  (`clock_timestamp() - interval`) instead of from the pruning replica's
+  application clock. The signed payload keeps the producer instant as
+  provenance. A skewed replica can therefore no longer age a fresh entry
+  instantly, pin a stale one, or change which entry the per-repository
+  entry/byte quotas evict.
+- Deployment creation is now genuinely idempotent across replicas and
+  restarts: `DeploymentStore.InsertDeploymentOnce` inserts with
+  `ON CONFLICT (id) DO NOTHING` and returns the canonical STORED record with
+  `created=false` on replay (a conflicting run/job/environment fails closed
+  with `ErrDeploymentIdentityConflict`). The server caches only the stored
+  record and emits `deployment.started` exactly once, so HA replicas and
+  restarts converge on one durable row and one audit event.
+- `POST /api/v1/jobs/{id}/deployments` now records a deployment only for a
+  job that is actually RUNNING and derives `StartedAt` from the job's
+  authoritative `StartedAt` instead of the request time; queued,
+  waiting-approval, blocked and terminal jobs are refused with 409.
+- `SwitchToDB` now also requires `DeploymentStore`: a DB store without the
+  contract is refused at startup instead of silently degrading deployment
+  lifecycle state to the process-local mirror.

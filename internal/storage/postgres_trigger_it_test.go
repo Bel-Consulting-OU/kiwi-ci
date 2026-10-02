@@ -69,7 +69,7 @@ var boomSeeds = map[string]func(t *testing.T, st *PostgresStore, ids *boomerIds)
 	},
 	"deployments/UpdateDeploymentStatus": func(t *testing.T, st *PostgresStore, ids *boomerIds) {
 		ids.deployment = pgITNewID(t)
-		if err := st.InsertDeployment(context.Background(), model.Deployment{ID: ids.deployment, RunID: ids.run, Status: model.StatusRunning, CreatedAt: time.Now().UTC()}); err != nil {
+		if _, _, err := st.InsertDeploymentOnce(context.Background(), model.Deployment{ID: ids.deployment, RunID: ids.run, Status: model.StatusRunning, CreatedAt: time.Now().UTC()}); err != nil {
 			t.Fatalf("deployment: %v", err)
 		}
 	},
@@ -402,7 +402,7 @@ func TestPostgresIntegrationTriggeredSQLErrors(t *testing.T) {
 			}
 		}},
 		"deployments/InsertDeployment": {"deployments", func(t *testing.T, st *PostgresStore, ids *boomerIds) {
-			if err := st.InsertDeployment(ctx, model.Deployment{ID: pgITNewID(t), RunID: ids.run, CreatedAt: time.Now().UTC()}); err == nil {
+			if _, _, err := st.InsertDeploymentOnce(ctx, model.Deployment{ID: pgITNewID(t), RunID: ids.run, CreatedAt: time.Now().UTC()}); err == nil {
 				t.Fatal("expected the deployment insert to fail")
 			}
 		}},

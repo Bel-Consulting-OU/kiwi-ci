@@ -243,12 +243,12 @@ func faultyWrapperCases() map[string]wrapperCase {
 			_, err := f.ListOccurrences(ctx(), testSchedule.ID)
 			return err
 		}},
-		"InsertDeployment": {mutates: true, call: func(f *FaultyStore) error { return f.InsertDeployment(ctx(), testDeployment) }},
-		"ListDeploymentsByRun": {seed: func(m *memStore) { _ = m.InsertDeployment(ctx(), testDeployment) }, call: func(f *FaultyStore) error {
+		"InsertDeployment": {mutates: true, call: func(f *FaultyStore) error { _, _, err := f.InsertDeploymentOnce(ctx(), testDeployment); return err }},
+		"ListDeploymentsByRun": {seed: func(m *memStore) { _, _, _ = m.InsertDeploymentOnce(ctx(), testDeployment) }, call: func(f *FaultyStore) error {
 			_, err := f.ListDeploymentsByRun(ctx(), testRun.ID)
 			return err
 		}},
-		"UpdateDeploymentStatus": {mutates: true, seed: func(m *memStore) { _ = m.InsertDeployment(ctx(), testDeployment) }, call: func(f *FaultyStore) error {
+		"UpdateDeploymentStatus": {mutates: true, seed: func(m *memStore) { _, _, _ = m.InsertDeploymentOnce(ctx(), testDeployment) }, call: func(f *FaultyStore) error {
 			return f.UpdateDeploymentStatus(ctx(), testDeployment.ID, model.StatusSuccess, nil)
 		}},
 		"InsertSnapshotRecord": {mutates: true, call: func(f *FaultyStore) error { return f.InsertSnapshotRecord(ctx(), testSnapshot) }},
@@ -820,7 +820,8 @@ func missingOptionalInterfaceCases() map[string]missingIfaceCase {
 			return f.AdvanceScheduleLastRun(ctx(), "", time.Time{})
 		}},
 		"InsertDeployment": {mutates: true, iface: "DeploymentStore", call: func(f *FaultyStore) error {
-			return f.InsertDeployment(ctx(), model.Deployment{})
+			_, _, err := f.InsertDeploymentOnce(ctx(), model.Deployment{})
+			return err
 		}},
 		"ListDeploymentsByRun": {iface: "DeploymentStore", call: func(f *FaultyStore) error {
 			_, err := f.ListDeploymentsByRun(ctx(), "")
