@@ -973,6 +973,32 @@ func (f *FaultyStore) InsertDeploymentOnce(ctx context.Context, d model.Deployme
 	return inner.InsertDeploymentOnce(ctx, d)
 }
 
+func (f *FaultyStore) StartDeployment(ctx context.Context, d model.Deployment, audit model.AuditEvent) (model.Deployment, bool, error) {
+	inner, ok := f.Inner.(DeploymentStore)
+	if !ok {
+		return model.Deployment{}, false, errMissingInnerInterface("DeploymentStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return model.Deployment{}, false, err
+	}
+	return inner.StartDeployment(ctx, d, audit)
+}
+
+func (f *FaultyStore) FinishDeploymentOnce(ctx context.Context, id string, status model.Status, finishedAt time.Time, audit model.AuditEvent) (bool, error) {
+	inner, ok := f.Inner.(DeploymentStore)
+	if !ok {
+		return false, errMissingInnerInterface("DeploymentStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return false, err
+	}
+	return inner.FinishDeploymentOnce(ctx, id, status, finishedAt, audit)
+}
+
 func (f *FaultyStore) ListDeploymentsByRun(ctx context.Context, runID string) ([]model.Deployment, error) {
 	inner, ok := f.Inner.(DeploymentStore)
 	if !ok {
@@ -4014,6 +4040,69 @@ func (m *memStore) InsertDeploymentOnce(ctx context.Context, d model.Deployment)
 	}
 	m.deployments = append(m.deployments, d)
 	return d, true, nil
+}
+
+// StartDeployment implements the transactional deployment-start contract:
+// the same idempotent insert and, only when this call creates the row, the
+// deployment.started audit appended under the same lock (this store's
+// transaction). A replay appends nothing.
+func (m *memStore) StartDeployment(ctx context.Context, d model.Deployment, audit model.AuditEvent) (model.Deployment, bool, error) {
+	if err := ValidateID(d.ID); err != nil {
+		return model.Deployment{}, false, err
+	}
+	if err := ValidateRunID(d.RunID); err != nil {
+		return model.Deployment{}, false, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, existing := range m.deployments {
+		if existing.ID != d.ID {
+			continue
+		}
+		if existing.RunID != d.RunID || existing.JobID != d.JobID || existing.Environment != d.Environment {
+			return model.Deployment{}, false, fmt.Errorf("%w: deployment %s", ErrDeploymentIdentityConflict, d.ID)
+		}
+		return existing, false, nil
+	}
+	m.deployments = append(m.deployments, d)
+	if audit.ID != "" {
+		if audit.CreatedAt.IsZero() {
+			audit.CreatedAt = time.Now().UTC()
+		}
+		m.audit = append(m.audit, audit)
+	}
+	return d, true, nil
+}
+
+// FinishDeploymentOnce implements the exactly-once completion contract under
+// this store's lock: the finish marker and the completion audit are one
+// critical section, and an already-finished record appends nothing.
+func (m *memStore) FinishDeploymentOnce(ctx context.Context, id string, status model.Status, finishedAt time.Time, audit model.AuditEvent) (bool, error) {
+	if err := ValidateID(id); err != nil {
+		return false, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, d := range m.deployments {
+		if d.ID != id {
+			continue
+		}
+		if d.FinishedAt != nil {
+			return false, nil
+		}
+		fin := finishedAt.UTC()
+		d.Status = status
+		d.FinishedAt = &fin
+		m.deployments[i] = d
+		if audit.ID != "" {
+			if audit.CreatedAt.IsZero() {
+				audit.CreatedAt = time.Now().UTC()
+			}
+			m.audit = append(m.audit, audit)
+		}
+		return true, nil
+	}
+	return false, ErrNotFound
 }
 
 func (m *memStore) ListDeploymentsByRun(ctx context.Context, runID string) ([]model.Deployment, error) {

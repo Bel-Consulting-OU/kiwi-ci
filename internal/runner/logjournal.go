@@ -110,8 +110,37 @@ type logJournal struct {
 	// invariant means every record at or below it is consumed.
 	trustWatermark bool
 	bytes          int64
-	removed        bool
+	// pendingCleanup is the PHYSICAL cleanup debt: acked (or terminal)
+	// records whose unlink failed. Their physical bytes stay charged in
+	// j.bytes until the file is actually gone, and the journal retries the
+	// unlink on every ack flush and load instead of forgetting the path.
+	// Dropping the debt entry without a successful unlink would let
+	// undeletable records accumulate outside the advertised disk bound.
+	pendingCleanup map[int64]journalCleanupDebt
+	// closed is the logical terminal state (no more appends/acks; the
+	// in-memory payload is released); removed is the PHYSICAL terminal state,
+	// set only after the directory is gone AND its metadata durability was
+	// certified. A failed terminal remove leaves closed=true, removed=false
+	// so a retry can finish the cleanup.
+	closed  bool
+	removed bool
 }
+
+// journalCleanupDebt is one physical file whose removal failed after its
+// payload was retired: only the path and its size are retained (the log
+// payload is acked and must not stay in memory), and the size remains part
+// of the journal's disk accounting until the unlink succeeds.
+type journalCleanupDebt struct {
+	path string
+	size int64
+}
+
+// terminalJournalMarker is written into the journal directory before a
+// terminal removal is attempted. If the removal fails, a later open (or the
+// runner's startup sweep) finds the marker and retries the whole-directory
+// cleanup, so a transient unlink failure on a successful job cannot strand a
+// directory forever.
+const terminalJournalMarker = "terminal-cleanup"
 
 // logJournalFormat is the durable journal format version written into the ack
 // watermark. Format 1 (the field absent) is the pre-amortization sender,
@@ -236,6 +265,10 @@ var (
 	journalRemove    = os.Remove
 )
 
+// journalRemoveAll is the terminal directory-removal seam: tests inject
+// transient failures to prove the retryable terminal state machine.
+var journalRemoveAll = os.RemoveAll
+
 // logJournalKey derives the filesystem-safe per-job directory name: job IDs
 // are server-supplied, so the directory name is a hash and the record itself
 // carries the authoritative ID to validate against.
@@ -260,21 +293,26 @@ func openLogJournal(root, jobID string, generation int64, mask func(string) stri
 	if root == "" || jobID == "" {
 		return nil, nil
 	}
+	// A previous terminal cleanup that failed left a marker in its directory;
+	// retry those before opening anything new so a long-lived process cannot
+	// accumulate stranded directories across jobs.
+	sweepTerminalJournalDirs(root)
 	jobDir := filepath.Join(root, logJournalKey(jobID))
 	dir := filepath.Join(jobDir, "gen-"+strconv.FormatInt(generation, 10))
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("log journal: %w", err)
 	}
 	j := &logJournal{
-		root:          root,
-		dir:           dir,
-		watermarkPath: filepath.Join(dir, "ack-watermark"),
-		jobID:         jobID,
-		generation:    generation,
-		mask:          mask,
-		mem:           &logMemBudget{},
-		paths:         map[int64]string{},
-		sizes:         map[int64]int64{},
+		root:           root,
+		dir:            dir,
+		watermarkPath:  filepath.Join(dir, "ack-watermark"),
+		jobID:          jobID,
+		generation:     generation,
+		mask:           mask,
+		mem:            &logMemBudget{},
+		paths:          map[int64]string{},
+		sizes:          map[int64]int64{},
+		pendingCleanup: map[int64]journalCleanupDebt{},
 	}
 	if err := j.load(); err != nil {
 		return nil, err
@@ -357,9 +395,18 @@ func (j *logJournal) load() error {
 			// Consumed: either the format-2 contiguous watermark covers it
 			// or the format-1 legacy watermark equals it (the ack that wrote
 			// it unlinked this exact record). Reclaiming the file is best
-			// effort; a failure only delays space reclamation and never
-			// re-sends the batch.
-			_ = journalRemove(path)
+			// effort for the ACK (the batch is never re-sent), but a failed
+			// unlink is NOT ignored: the file's physical bytes stay charged
+			// as cleanup debt so the advertised disk bound remains truthful
+			// after a crash/restart, and a later flush retries the unlink.
+			if err := journalRemove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				info, ierr := ent.Info()
+				if ierr != nil {
+					return fmt.Errorf("log journal: stat covered record %s: %w", path, ierr)
+				}
+				j.pendingCleanup[rec.Sequence] = journalCleanupDebt{path: path, size: info.Size()}
+				j.bytes += info.Size()
+			}
 			continue
 		}
 		if seen[rec.Sequence] {
@@ -478,7 +525,7 @@ func (j *logJournal) append(batch logBatch) error {
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if j.removed {
+	if j.closed {
 		return fmt.Errorf("log journal: journal for (%q, %d) is closed", j.jobID, j.generation)
 	}
 	if batch.Sequence <= j.ackedSeq {
@@ -543,7 +590,7 @@ func (j *logJournal) minUnackedSequenceLocked() (int64, bool) {
 func (j *logJournal) ack(sequence int64, batchID string) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if j.removed {
+	if j.closed {
 		return nil
 	}
 	path, ok := j.paths[sequence]
@@ -588,7 +635,7 @@ func (j *logJournal) flushAcks() error {
 }
 
 func (j *logJournal) flushAcksLocked() error {
-	if j.removed {
+	if j.closed {
 		return nil
 	}
 	if j.ackedSeq > j.watermark {
@@ -627,16 +674,43 @@ func (j *logJournal) flushAcksLocked() error {
 			return fmt.Errorf("log journal: ack cleanup: %w", err)
 		}
 	}
+	// Retry physical cleanup debts from earlier failures (this run or a
+	// previous process): their bytes stay charged until the file is gone.
+	if j.retryCleanupLocked() {
+		if err := journalDirSync(j.dir); err != nil {
+			return fmt.Errorf("log journal: ack cleanup: %w", err)
+		}
+	}
 	return nil
+}
+
+// retryCleanupLocked re-attempts every physical cleanup debt whose unlink
+// failed earlier. It returns true when at least one unlink succeeded (the
+// caller batches one directory fsync) and leaves the rest charged.
+func (j *logJournal) retryCleanupLocked() bool {
+	if len(j.pendingCleanup) == 0 {
+		return false
+	}
+	dirty := false
+	for sequence, debt := range j.pendingCleanup {
+		if err := journalRemove(debt.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		delete(j.pendingCleanup, sequence)
+		j.bytes -= debt.size
+		dirty = true
+	}
+	return dirty
 }
 
 // reclaimCoveredLocked removes one durably acked record. It refuses to touch
 // a sequence the durable watermark does not cover (that record must stay for
-// replay), releases the record's share of the shared memory budget, and
-// treats a failed unlink as cleanup lag: the watermark already covers the
-// record, so a later open or the terminal remove reclaims it, and the disk
-// bytes stay accounted so the bound remains enforced. It reports whether a
-// directory entry changed (a caller batches one directory fsync).
+// replay), retires the acked payload from memory, and treats a failed unlink
+// as PHYSICAL CLEANUP DEBT: the payload is acked so it never returns to
+// memory, but the (path, size) pair is retained, the disk bytes stay charged
+// so the bound remains enforced, and a later flush/load retries the unlink
+// instead of forgetting the file. It reports whether a directory entry
+// changed (a caller batches one directory fsync).
 func (j *logJournal) reclaimCoveredLocked(sequence int64) (bool, error) {
 	path, ok := j.paths[sequence]
 	if !ok {
@@ -648,47 +722,116 @@ func (j *logJournal) reclaimCoveredLocked(sequence int64) (bool, error) {
 	size := j.sizes[sequence]
 	delete(j.paths, sequence)
 	delete(j.sizes, sequence)
-	for i, b := range j.records {
-		if b.Sequence == sequence {
-			copy(j.records[i:], j.records[i+1:])
-			j.records[len(j.records)-1] = logBatch{}
-			j.records = j.records[:len(j.records)-1]
-			break
-		}
-	}
+	j.dropPayloadLocked(sequence)
 	j.mem.release(size)
 	j.resident -= size
 	if err := journalRemove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		j.pendingCleanup[sequence] = journalCleanupDebt{path: path, size: size}
 		return false, nil
 	}
 	j.bytes -= size
 	return true, nil
 }
 
+// dropPayloadLocked removes a record's in-memory payload. The bytes stay on
+// the caller's ledger (memory is released separately) because a retained
+// cleanup debt keeps them charged on disk.
+func (j *logJournal) dropPayloadLocked(sequence int64) {
+	for i, b := range j.records {
+		if b.Sequence == sequence {
+			copy(j.records[i:], j.records[i+1:])
+			j.records[len(j.records)-1] = logBatch{}
+			j.records = j.records[:len(j.records)-1]
+			return
+		}
+	}
+}
+
 // remove deletes the whole journal for this (job, generation). It is called
-// after terminal completion (the lease is over; no same-generation resume
-// can happen anymore) so no stale records survive the job. Acked records are
-// already gone; any unconsumed record is terminal state for a completed job.
+// after terminal completion (the lease is over; no same-generation resume can
+// happen anymore) so no stale records survive the job. The state machine
+// separates LOGICAL closure (closed: no more appends/acks, the in-memory
+// payload is released) from PHYSICAL removal (removed: the directory is gone
+// AND its metadata durability was certified). A failed RemoveAll or directory
+// fsync leaves removed=false so a retry can finish; a terminal-cleanup marker
+// is written first, so even a process restart finds the stranded directory
+// (the next open sweeps marked directories, which never include a live
+// journal).
 func (j *logJournal) remove() error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.removed {
 		return nil
 	}
-	j.removed = true
-	// The in-memory payload is gone with the journal: release its share of
-	// the shared budget even if the disk removal below fails.
-	j.mem.release(j.resident)
-	j.resident = 0
-	if err := os.RemoveAll(j.dir); err != nil {
+	if !j.closed {
+		j.closed = true
+		// The in-memory payload is gone with the journal: release its share
+		// of the shared budget even if the disk removal below fails.
+		j.mem.release(j.resident)
+		j.resident = 0
+		j.records = nil
+		// The cleanup debt stays charged (j.bytes) until the directory is
+		// physically gone; the whole-directory removal below covers it.
+	}
+	// Mark the directory as terminal cleanup pending BEFORE attempting the
+	// removal, so a failed unlink stays discoverable across restarts. Best
+	// effort: a directory that blocks this write very likely blocks RemoveAll
+	// too, and the in-process retry still applies.
+	marker := filepath.Join(j.dir, terminalJournalMarker)
+	if _, err := os.Stat(marker); errors.Is(err, os.ErrNotExist) {
+		_ = durableWriteJournalRecord(marker, []byte(j.dir))
+	}
+	if err := journalRemoveAll(j.dir); err != nil {
 		return fmt.Errorf("log journal: remove %s: %w", j.dir, err)
 	}
-	// Best effort: drop the per-job directory too when it is now empty.
+	// Best effort: drop the per-job directory too when it is now empty (the
+	// parent fsync below covers it).
 	_ = os.Remove(filepath.Dir(j.dir))
+	// The directory is visibly gone; certify its metadata durability. A
+	// failure here is a distinct phase — physically absent, durability
+	// uncertain — so removed stays false and a retry re-runs the sync.
 	if err := journalDirSync(j.root); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("log journal: remove %s: %w", j.dir, err)
 	}
+	j.pendingCleanup = nil
+	j.paths = map[int64]string{}
+	j.sizes = map[int64]int64{}
+	j.bytes = 0
+	j.removed = true
 	return nil
+}
+
+// sweepTerminalJournalDirs retries terminal cleanup for journal directories
+// whose removal failed earlier. Only directories carrying the
+// terminal-cleanup marker are touched: a live journal never has one, so this
+// can never delete unconsumed records. Best effort.
+func sweepTerminalJournalDirs(root string) {
+	jobs, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	for _, job := range jobs {
+		if !job.IsDir() {
+			continue
+		}
+		jobDir := filepath.Join(root, job.Name())
+		gens, err := os.ReadDir(jobDir)
+		if err != nil {
+			continue
+		}
+		for _, gen := range gens {
+			if !gen.IsDir() || !strings.HasPrefix(gen.Name(), "gen-") {
+				continue
+			}
+			dir := filepath.Join(jobDir, gen.Name())
+			if _, err := os.Stat(filepath.Join(dir, terminalJournalMarker)); err != nil {
+				continue
+			}
+			if err := journalRemoveAll(dir); err == nil {
+				_ = os.Remove(jobDir)
+			}
+		}
+	}
 }
 
 // maskLine applies the delivery mask to a line before it is persisted, so

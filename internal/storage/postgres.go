@@ -4041,24 +4041,16 @@ func (s *PostgresStore) ListOccurrences(ctx context.Context, scheduleID string) 
 // deployments
 // ---------------------------------------------------------------------------
 
-// InsertDeploymentOnce inserts the deployment unless its deterministic ID
-// already exists, in which case the STORED canonical record is returned with
-// created=false (see the DeploymentStore contract). The conflict path
-// re-validates that the existing row names the same run/job/environment, so
-// a hash collision or a caller bug fails closed instead of adopting another
-// deployment's record.
-func (s *PostgresStore) InsertDeploymentOnce(ctx context.Context, d model.Deployment) (model.Deployment, bool, error) {
-	if err := ValidateID(d.ID); err != nil {
-		return model.Deployment{}, false, err
-	}
-	if err := ValidateRunID(d.RunID); err != nil {
-		return model.Deployment{}, false, err
-	}
+// insertDeploymentOnceTx applies the idempotent insert inside the caller's
+// transaction: ON CONFLICT DO NOTHING, then the canonical stored record (with
+// the run/job/environment identity re-validated) on replay. It returns
+// created=true only when this transaction inserted the row.
+func insertDeploymentOnceTx(ctx context.Context, tx pgx.Tx, d model.Deployment) (model.Deployment, bool, error) {
 	payload, err := jsonMarshal(d)
 	if err != nil {
 		return model.Deployment{}, false, err
 	}
-	tag, err := s.pool.Exec(ctx, `INSERT INTO deployments (id, run_id, job_id, environment, created_at, payload) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING`,
+	tag, err := tx.Exec(ctx, `INSERT INTO deployments (id, run_id, job_id, environment, created_at, payload) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING`,
 		d.ID, d.RunID, nullText(d.JobID), d.Environment, d.CreatedAt, payload)
 	if err != nil {
 		return model.Deployment{}, false, err
@@ -4072,7 +4064,7 @@ func (s *PostgresStore) InsertDeploymentOnce(ctx context.Context, d model.Deploy
 		environment string
 		stored      []byte
 	)
-	if err := s.pool.QueryRow(ctx, `SELECT run_id, COALESCE(job_id, ''), environment, payload FROM deployments WHERE id=$1`, d.ID).Scan(&runID, &jobID, &environment, &stored); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT run_id, COALESCE(job_id, ''), environment, payload FROM deployments WHERE id=$1`, d.ID).Scan(&runID, &jobID, &environment, &stored); err != nil {
 		return model.Deployment{}, false, err
 	}
 	if runID != d.RunID || jobID != d.JobID || environment != d.Environment {
@@ -4083,6 +4075,132 @@ func (s *PostgresStore) InsertDeploymentOnce(ctx context.Context, d model.Deploy
 		return model.Deployment{}, false, err
 	}
 	return canonical, false, nil
+}
+
+// startDeploymentAuditTx appends the deployment-start audit row inside the
+// same transaction, with the database clock as its instant. An empty ID skips
+// the append (repair paths with no start event to record).
+func startDeploymentAuditTx(ctx context.Context, tx pgx.Tx, audit model.AuditEvent) error {
+	if audit.ID == "" {
+		return nil
+	}
+	var meta []byte
+	if len(audit.Metadata) > 0 {
+		var err error
+		meta, err = jsonMarshal(audit.Metadata)
+		if err != nil {
+			return err
+		}
+	}
+	_, err := tx.Exec(ctx, `INSERT INTO audit_events (id, action, actor, run_id, job_id, message, metadata, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, clock_timestamp())`,
+		audit.ID, audit.Action, nullText(audit.Actor), nullText(audit.RunID), nullText(audit.JobID), nullText(audit.Message), meta)
+	return err
+}
+
+// InsertDeploymentOnce inserts the deployment unless its deterministic ID
+// already exists, in which case the STORED canonical record is returned with
+// created=false (see the DeploymentStore contract). It is the RAW primitive:
+// no audit event is written; lifecycle writers use StartDeployment.
+func (s *PostgresStore) InsertDeploymentOnce(ctx context.Context, d model.Deployment) (model.Deployment, bool, error) {
+	if err := ValidateID(d.ID); err != nil {
+		return model.Deployment{}, false, err
+	}
+	if err := ValidateRunID(d.RunID); err != nil {
+		return model.Deployment{}, false, err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return model.Deployment{}, false, err
+	}
+	defer tx.Rollback(ctx)
+	stored, created, err := insertDeploymentOnceTx(ctx, tx, d)
+	if err != nil {
+		return model.Deployment{}, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return model.Deployment{}, false, err
+	}
+	return stored, created, nil
+}
+
+// StartDeployment is the transactional deployment-start authority: the
+// insert and its deployment.started audit commit (or roll back) together, so
+// a created deployment can never lack its audit and a replay can never
+// duplicate it. See DeploymentStore.
+func (s *PostgresStore) StartDeployment(ctx context.Context, d model.Deployment, audit model.AuditEvent) (model.Deployment, bool, error) {
+	if err := ValidateID(d.ID); err != nil {
+		return model.Deployment{}, false, err
+	}
+	if err := ValidateRunID(d.RunID); err != nil {
+		return model.Deployment{}, false, err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return model.Deployment{}, false, err
+	}
+	defer tx.Rollback(ctx)
+	stored, created, err := insertDeploymentOnceTx(ctx, tx, d)
+	if err != nil {
+		return model.Deployment{}, false, err
+	}
+	if created {
+		if err := startDeploymentAuditTx(ctx, tx, audit); err != nil {
+			// The audit is part of the creation: roll the row back too.
+			return model.Deployment{}, false, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return model.Deployment{}, false, err
+	}
+	return stored, created, nil
+}
+
+// FinishDeploymentOnce locks the deployment row and, when it is not yet
+// finished, writes status/finishedAt into the payload and appends the
+// completion audit in the SAME transaction. An already-finished row returns
+// changed=false and appends nothing, so completion audits are exactly-once
+// across replicas and retries. See DeploymentStore.
+func (s *PostgresStore) FinishDeploymentOnce(ctx context.Context, id string, status model.Status, finishedAt time.Time, audit model.AuditEvent) (bool, error) {
+	if err := ValidateID(id); err != nil {
+		return false, err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+	var payload []byte
+	err = tx.QueryRow(ctx, `SELECT payload FROM deployments WHERE id=$1 FOR UPDATE`, id).Scan(&payload)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, ErrNotFound
+	}
+	if err != nil {
+		return false, err
+	}
+	var d model.Deployment
+	if err := json.Unmarshal(payload, &d); err != nil {
+		return false, err
+	}
+	if d.FinishedAt != nil {
+		return false, nil
+	}
+	fin := finishedAt.UTC()
+	d.Status = status
+	d.FinishedAt = &fin
+	dp, err := jsonMarshal(d)
+	if err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE deployments SET payload=$2 WHERE id=$1`, id, dp); err != nil {
+		return false, err
+	}
+	if err := startDeploymentAuditTx(ctx, tx, audit); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *PostgresStore) ListDeploymentsByRun(ctx context.Context, runID string) ([]model.Deployment, error) {

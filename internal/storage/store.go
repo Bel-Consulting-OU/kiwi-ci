@@ -556,8 +556,32 @@ type DeploymentStore interface {
 	// converge on exactly one durable record and one audit event. The
 	// existing row must agree on run/job/environment; a disagreement returns
 	// an error wrapping ErrDeploymentIdentityConflict and writes nothing.
+	//
+	// This is the RAW non-audited primitive (seeding/tests). Lifecycle
+	// writers must use StartDeployment, which commits the record and its
+	// audit event in ONE transaction.
 	InsertDeploymentOnce(ctx context.Context, d model.Deployment) (model.Deployment, bool, error)
+	// StartDeployment is the transactional deployment-start authority: it
+	// inserts the deployment with the same idempotent conflict semantics and,
+	// ONLY when it creates the row, appends auditEvent in the SAME
+	// transaction. A created deployment can therefore never exist without its
+	// deployment.started audit (an audit failure rolls the insert back), a
+	// replay returns the canonical stored record and appends nothing, and two
+	// concurrent replicas converge on one row and one audit event. An empty
+	// auditEvent.ID skips the audit append (repair paths that reconstruct a
+	// record from job state).
+	StartDeployment(ctx context.Context, d model.Deployment, audit model.AuditEvent) (model.Deployment, bool, error)
+	// FinishDeploymentOnce locks the deployment row and, when it is not yet
+	// finished, writes status/finishedAt and appends auditEvent in the SAME
+	// transaction, returning changed=true. An already-finished row returns
+	// changed=false and appends nothing (exactly-once completion audit across
+	// replicas/restarts). A failure rolls both the marker and the audit back,
+	// so the finish stays retryable.
+	FinishDeploymentOnce(ctx context.Context, id string, status model.Status, finishedAt time.Time, audit model.AuditEvent) (bool, error)
 	ListDeploymentsByRun(ctx context.Context, runID string) ([]model.Deployment, error)
+	// UpdateDeploymentStatus is the RAW status primitive (seeding/tests and
+	// non-lifecycle bookkeeping). Lifecycle completion must use
+	// FinishDeploymentOnce so the state marker and its audit commit together.
 	UpdateDeploymentStatus(ctx context.Context, id string, status model.Status, finishedAt *time.Time) error
 }
 

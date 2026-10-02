@@ -620,3 +620,70 @@ func TestOIDCRotationPersistBeforeActivateFileMode(t *testing.T) {
 		t.Fatalf("rotation activated despite failed ring write: active %q != old %q", active, oldKID)
 	}
 }
+
+// TestOIDCPreliminaryGateUsesDatabaseClockLeaseAuthority pins both skew
+// directions on the OIDC preliminary gate:
+//
+//   - a DB-live lease must authorize even when the serving replica's wall
+//     clock considers it expired (otherwise a skewed replica denies a valid
+//     token the commit would have accepted);
+//   - a DB-expired lease must be refused BEFORE any signer/rotation/key-store
+//     work, even when the wall clock still considers it live.
+func TestOIDCPreliminaryGateUsesDatabaseClockLeaseAuthority(t *testing.T) {
+	t.Run("replica ahead cannot reject a database-live lease", func(t *testing.T) {
+		f := newDBFakeStore()
+		s := New("secret")
+		if err := s.SwitchToDB(f); err != nil {
+			t.Fatal(err)
+		}
+		s.ExternalURL = "https://ci.example.com"
+		_, jobID := seedDBOIDCJob(t, f, s, "lease1")
+		// The store clock is an hour behind; the lease expiry is 30 minutes in
+		// the wall-clock past, so the DATABASE still considers it live while
+		// the serving replica's application clock does not.
+		f.mu.Lock()
+		j := f.jobs[jobID]
+		expiredByWall := time.Now().UTC().Add(-30 * time.Minute)
+		j.LeaseExpiresAt = &expiredByWall
+		f.jobs[jobID] = j
+		f.leaseNow = func() time.Time { return time.Now().UTC().Add(-time.Hour) }
+		f.mu.Unlock()
+
+		if tok := issueOIDCToken(t, s, jobID, "lease1", "https://aud.example.com"); tok == "" {
+			t.Fatal("no token issued for a database-live lease")
+		}
+	})
+
+	t.Run("replica behind cannot drive signer work for a database-expired lease", func(t *testing.T) {
+		f := newDBFakeStore()
+		s := New("secret")
+		if err := s.SwitchToDB(f); err != nil {
+			t.Fatal(err)
+		}
+		s.ExternalURL = "https://ci.example.com"
+		_, jobID := seedDBOIDCJob(t, f, s, "lease2") // app-live expiry
+		f.mu.Lock()
+		f.leaseNow = func() time.Time { return time.Now().UTC().Add(2 * time.Hour) } // DB-expired
+		f.mu.Unlock()
+
+		signerWork := false
+		prevHook := oidcBeforeSignerHook
+		oidcBeforeSignerHook = func() { signerWork = true }
+		t.Cleanup(func() { oidcBeforeSignerHook = prevHook })
+
+		c := newTestClient(t, s.Handler(), "lease2")
+		w := c.do(http.MethodPost, "/api/v1/jobs/"+jobID+"/oidc", map[string]any{"audience": "https://aud.example.com"}, nil)
+		if w.Code != http.StatusConflict {
+			t.Fatalf("DB-expired lease issuance = %d, want 409: %s", w.Code, w.Body.String())
+		}
+		if signerWork {
+			t.Fatal("DB-expired lease reached signer/key-ring/rotation work")
+		}
+		f.mu.Lock()
+		audits := len(f.audit)
+		f.mu.Unlock()
+		if audits != 0 {
+			t.Fatalf("DB-expired lease appended %d audit rows", audits)
+		}
+	})
+}

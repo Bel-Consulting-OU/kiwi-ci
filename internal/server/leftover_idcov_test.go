@@ -111,6 +111,15 @@ func (f deploymentStatusFaultStore) UpdateDeploymentStatus(ctx context.Context, 
 	return f.dbFakeStore.UpdateDeploymentStatus(ctx, id, status, finishedAt)
 }
 
+// FinishDeploymentOnce carries the same injected fault: the server's finish
+// path now commits the marker and the audit through the transactional form.
+func (f deploymentStatusFaultStore) FinishDeploymentOnce(ctx context.Context, id string, status model.Status, finishedAt time.Time, audit model.AuditEvent) (bool, error) {
+	if f.updateErr != nil {
+		return false, f.updateErr
+	}
+	return f.dbFakeStore.FinishDeploymentOnce(ctx, id, status, finishedAt, audit)
+}
+
 // TestLeftoverDeploymentStatusUpdateFailure covers the finish path's
 // durability contract: a failed durable status update is returned to the
 // caller (so the effect stays pending and is retried), and neither the

@@ -622,3 +622,25 @@ claims themselves.
   only finalizes/unregisters/closes its hand-off channel AFTER the ownership
   release succeeds, so a retry can complete the hand-off and a successor
   never starts while the directory may still be owned.
+- Runner log-journal cleanup is now debt-based. A failed ack-time unlink no
+  longer drops the journal's knowledge of the file: a (path, size) cleanup
+  entry stays charged against the per-(job, generation) disk budget and is
+  retried on later flushes, and a watermark-covered record whose unlink fails
+  at startup is charged the same way instead of being silently ignored — so
+  the advertised `asyncJournalBytes` physical bound stays truthful after
+  crash/restart. Terminal removal separates logical closure from physical
+  removal: `closed` releases the in-memory payload, `removed` is set only
+  after `RemoveAll` AND the parent-directory fsync succeed, and a
+  terminal-cleanup marker lets the next journal open (or the following job)
+  sweep a stranded directory, so a transient EBUSY/EPERM cannot leak it
+  across jobs or restarts.
+- The OIDC preliminary lease gate now shares the runner gate's database-clock
+  liveness authority (`LiveLeaseStore`): a skewed replica can neither reject
+  a database-live lease before the commit, nor let a database-expired lease
+  drive signer/key-ring/rotation work.
+- Deployment start/finish state and audit are transactional:
+  `StartDeployment` commits the record and its `deployment.started` audit in
+  one transaction (an audit failure rolls the record back; replays append
+  nothing), and `FinishDeploymentOnce` commits the finish marker and
+  `deployment.completed` together exactly once across concurrent replicas and
+  retries.

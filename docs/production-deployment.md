@@ -446,10 +446,12 @@ In **DB mode the database clock is the authority for a lease's lifetime**:
   fresh entry, pin an old one, or reorder quota eviction. The signed payload
   keeps the producer instant as provenance only.
 - **Deployment creation is idempotent across replicas and restarts.**
-  `InsertDeploymentOnce` inserts with `ON CONFLICT (id) DO NOTHING` and
-  returns the canonical stored record on replay (a conflicting
-  run/job/environment fails closed), the server caches only that record, and
-  `deployment.started` is audited exactly once. The explicit record endpoint
+  `StartDeployment` inserts with `ON CONFLICT (id) DO NOTHING`, returns the
+  canonical stored record on replay (a conflicting run/job/environment fails
+  closed), and commits `deployment.started` in the SAME transaction — an
+  audit failure rolls the record back. `FinishDeploymentOnce` likewise
+  commits the finish marker and `deployment.completed` together, exactly
+  once. The server caches only the stored record. The explicit record endpoint
   requires an actually running job and derives `StartedAt` from the job, and
   `SwitchToDB` refuses a store without the deployment contract at startup.
 - **Enrollment grants, outbox claims, OIDC lifetimes and DB schedules share

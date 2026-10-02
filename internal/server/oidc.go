@@ -42,6 +42,12 @@ var oidcActiveKeyMaxAge = 30 * 24 * time.Hour
 // Production code never sets it.
 var oidcBeforeCommitHook func()
 
+// oidcBeforeSignerHook is a TEST-ONLY seam: when non-nil it runs immediately
+// before the signer is resolved (the first step that may touch the signing
+// key or its shared key store). Tests use it to prove a rejected preliminary
+// gate performed no signer/rotation/key-store work. Production never sets it.
+var oidcBeforeSignerHook func()
+
 // oidcPreviousKeyRetireAfter is how long a rotated-out signing key remains
 // advertised in the JWKS so tokens it signed stay verifiable.
 var oidcPreviousKeyRetireAfter = 72 * time.Hour
@@ -759,12 +765,26 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "audience not allowed for this job", http.StatusForbidden)
 		return
 	}
-	if j.Status != model.StatusRunning || j.LeaseExpiresAt == nil || !j.LeaseExpiresAt.After(now) {
+	if len(j.LeaseTokenHash) == 0 || subtle.ConstantTimeCompare(hashLeaseToken(s.leaseKey, token), j.LeaseTokenHash) != 1 {
+		http.Error(w, "invalid job token", http.StatusUnauthorized)
+		return
+	}
+	// Lease authority shares the runner gate's clock domain: DB mode asks the
+	// store (LiveLeaseStore -> clock_timestamp()), so a skewed serving replica
+	// can neither reject a DB-live lease (denying a valid token) nor admit a
+	// DB-expired one and drive signer/key-store work from a dead lease. The
+	// in-memory path uses the application clock, where skew is not a concept.
+	if j.Status != model.StatusRunning || j.LeaseExpiresAt == nil {
 		http.Error(w, "job lease is not active", http.StatusConflict)
 		return
 	}
-	if len(j.LeaseTokenHash) == 0 || subtle.ConstantTimeCompare(hashLeaseToken(s.leaseKey, token), j.LeaseTokenHash) != 1 {
-		http.Error(w, "invalid job token", http.StatusUnauthorized)
+	live, lerr := s.leaseLive(r.Context(), j, j.LeaseRunnerID, j.LeaseGeneration)
+	if lerr != nil {
+		s.internalError(w, r, lerr, "")
+		return
+	}
+	if !live {
+		http.Error(w, "job lease is not active", http.StatusConflict)
 		return
 	}
 	// AUTHENTICATION BEFORE SIGNER WORK. The endpoint is public at the auth
@@ -773,6 +793,9 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 	// resolved — and a due rotation may do key-store I/O — only after the
 	// job, audience and lease checks have all passed. Unauthenticated traffic
 	// therefore performs zero key-store reads.
+	if oidcBeforeSignerHook != nil {
+		oidcBeforeSignerHook()
+	}
 	signer := s.ensureOIDCSigner(r.Context(), now)
 	if signer == nil {
 		s.serverError(w, r, http.StatusServiceUnavailable, fmt.Errorf("OIDC signer unavailable"), "OIDC unavailable")

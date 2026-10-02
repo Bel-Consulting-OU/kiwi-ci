@@ -2523,6 +2523,60 @@ func (f *dbFakeStore) InsertDeploymentOnce(ctx context.Context, d model.Deployme
 	return d, true, nil
 }
 
+// StartDeployment mirrors the transactional start contract: the insert and
+// its deployment.started audit are one critical section, and a replay appends
+// nothing.
+func (f *dbFakeStore) StartDeployment(ctx context.Context, d model.Deployment, audit model.AuditEvent) (model.Deployment, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.deploymentInsertErr != nil {
+		return model.Deployment{}, false, f.deploymentInsertErr
+	}
+	if existing, ok := f.deployments[d.ID]; ok {
+		if existing.RunID != d.RunID || existing.JobID != d.JobID || existing.Environment != d.Environment {
+			return model.Deployment{}, false, fmt.Errorf("%w: deployment %s", storage.ErrDeploymentIdentityConflict, d.ID)
+		}
+		return existing, false, nil
+	}
+	f.deployments[d.ID] = d
+	if audit.ID != "" {
+		if audit.CreatedAt.IsZero() {
+			audit.CreatedAt = time.Now().UTC()
+		}
+		f.audit = append(f.audit, audit)
+	}
+	return d, true, nil
+}
+
+// FinishDeploymentOnce mirrors the exactly-once completion contract under the
+// fake's lock: the finish marker and the audit commit together, and an
+// already-finished record appends nothing.
+func (f *dbFakeStore) FinishDeploymentOnce(ctx context.Context, id string, status model.Status, finishedAt time.Time, audit model.AuditEvent) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.updateDeploymentErr != nil {
+		return false, f.updateDeploymentErr
+	}
+	d, ok := f.deployments[id]
+	if !ok {
+		return false, storage.ErrNotFound
+	}
+	if d.FinishedAt != nil {
+		return false, nil
+	}
+	fin := finishedAt.UTC()
+	d.Status = status
+	d.FinishedAt = &fin
+	f.deployments[id] = d
+	if audit.ID != "" {
+		if audit.CreatedAt.IsZero() {
+			audit.CreatedAt = time.Now().UTC()
+		}
+		f.audit = append(f.audit, audit)
+	}
+	return true, nil
+}
+
 func (f *dbFakeStore) ListDeploymentsByRun(ctx context.Context, runID string) ([]model.Deployment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

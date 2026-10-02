@@ -56,13 +56,12 @@ func (s *Server) installDeploymentMirror(jobID string, rec model.Deployment) mod
 }
 
 // recordDeploymentDB creates the deployment record in DB mode. The durable
-// insert commits FIRST and is genuinely IDEMPOTENT across replicas and
-// restarts: a deterministic-ID replay returns the STORED canonical record
-// (created=false), so the local mirror always caches what the database holds
-// and the deployment.started audit event is emitted only by the call that
-// actually created the row. Persistence failure leaves no marker behind and
-// the caller can retry (or the completion deployment effect can rebuild the
-// record).
+// insert and its deployment.started audit commit in ONE transaction
+// (StartDeployment), so a created record can never exist without its audit
+// and a deterministic-ID replay (created=false) can never duplicate it; the
+// local mirror always caches the STORED canonical record. Persistence failure
+// leaves no marker behind and the caller can retry (or the completion
+// deployment effect can rebuild the record).
 func (s *Server) recordDeploymentDB(ctx context.Context, j model.Job, startedAt time.Time) (model.Deployment, error) {
 	s.mu.Lock()
 	if d, ok := s.deployments[j.ID]; ok {
@@ -83,22 +82,23 @@ func (s *Server) recordDeploymentDB(ctx context.Context, j model.Job, startedAt 
 		// the calling replica's clock).
 		startedAt = *j.StartedAt
 	}
-	d, created, err := ds.InsertDeploymentOnce(ctx, deploy.NewDeployment(j, j.ApprovedBy, nil, &startedAt))
+	auditID, err := newID()
+	if err != nil {
+		return model.Deployment{}, err
+	}
+	audit := model.AuditEvent{
+		ID: auditID, Action: "deployment.started", Actor: "scheduler",
+		RunID: j.RunID, JobID: j.ID, Message: "deployment started",
+		Metadata: map[string]string{"environment": j.Environment},
+	}
+	d, _, err := ds.StartDeployment(ctx, deploy.NewDeployment(j, j.ApprovedBy, nil, &startedAt), audit)
 	if err != nil {
 		return model.Deployment{}, err
 	}
 	// Install the canonical record without regressing a newer state that a
 	// concurrent writer (for example the completion effect finishing the
 	// row just created) committed while the insert was in flight.
-	result := s.installDeploymentMirror(j.ID, d)
-	if !created {
-		// Another replica (or an earlier process) already recorded it: the
-		// durable row is the canonical record and the audit evidence exists.
-		return result, nil
-	}
-	// Exactly one caller observes created=true and owns the evidence.
-	s.auditLocked("deployment.started", "scheduler", j.RunID, j.ID, "deployment started", map[string]string{"environment": j.Environment})
-	return result, nil
+	return s.installDeploymentMirror(j.ID, d), nil
 }
 
 // recordDeployment is POST /api/v1/jobs/{id}/deployments: it creates (or
@@ -274,13 +274,38 @@ func (s *Server) finishDeploymentDB(ctx context.Context, j model.Job, status mod
 	if d.FinishedAt != nil {
 		return nil
 	}
-	d.Status = status
-	d.FinishedAt = &finishedAt
 	if hasStore {
-		if err := ds.UpdateDeploymentStatus(ctx, d.ID, status, &finishedAt); err != nil {
+		// The finish marker and the deployment.completed audit commit in ONE
+		// transaction: an audit failure rolls the marker back, so the finish
+		// stays retryable and the exactly-once audit is not lost. changed is
+		// false when another replica finished the row first: it owns the
+		// audit, and this caller must not append a second one.
+		auditID, err := newID()
+		if err != nil {
 			return err
 		}
+		audit := model.AuditEvent{
+			ID: auditID, Action: "deployment.completed", Actor: "scheduler",
+			RunID: j.RunID, JobID: j.ID, Message: "deployment finished",
+			Metadata: map[string]string{"environment": j.Environment, "status": string(status)},
+		}
+		changed, err := ds.FinishDeploymentOnce(ctx, d.ID, status, finishedAt, audit)
+		if err != nil {
+			return err
+		}
+		d.Status = status
+		fin := finishedAt.UTC()
+		d.FinishedAt = &fin
+		s.mu.Lock()
+		s.deployments[j.ID] = d
+		s.mu.Unlock()
+		if !changed {
+			return nil
+		}
+		return nil
 	}
+	d.Status = status
+	d.FinishedAt = &finishedAt
 	s.mu.Lock()
 	s.deployments[j.ID] = d
 	s.mu.Unlock()
