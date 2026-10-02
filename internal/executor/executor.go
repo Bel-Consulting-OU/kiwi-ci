@@ -679,13 +679,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		// Job/default timeout is a total job deadline. A step timeout, when set,
 		// is an additional tighter deadline for this individual command.
 		timeout := st.Timeout.Duration
-		retry := st.Retry
-		if retry.Max == 0 {
-			retry = cj.Job.Retry
-		}
-		if retry.Max == 0 {
-			retry = s.Defaults.Retry
-		}
+		retry := effectiveStepRetry(st, cj.Job, s.Defaults)
 		attempts := retry.Max + 1
 		if attempts < 1 {
 			attempts = 1
@@ -1340,4 +1334,24 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// effectiveStepRetry resolves a step's retry policy: a step's EXPLICIT retry
+// (including max: 0, meaning zero retries) wins over the job's, which wins
+// over the defaults. Programmatic retries with Max>0 count as set. The
+// resolved value is clamped to the admission cap as defense in depth, so a
+// persisted or programmatic policy can never drive unbounded (or
+// integer-wrapping) attempt arithmetic.
+func effectiveStepRetry(st pipeline.Step, job pipeline.Job, defaults pipeline.Defaults) pipeline.Retry {
+	retry := st.Retry
+	if !retry.MaxSet && retry.Max == 0 {
+		retry = job.Retry
+	}
+	if !retry.MaxSet && retry.Max == 0 {
+		retry = defaults.Retry
+	}
+	if retry.Max > pipeline.MaxStepRetries {
+		retry.Max = pipeline.MaxStepRetries
+	}
+	return retry
 }

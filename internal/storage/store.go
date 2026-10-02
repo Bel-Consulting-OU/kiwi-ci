@@ -1228,13 +1228,19 @@ type SupersedePolicy struct {
 // list) replaces the job's Needs, so the persisted edges always match what
 // the caller compiled. Jobs without a Deps entry keep their Needs.
 type InsertCompiledRunRequest struct {
-	Run              model.Run
-	Jobs             map[string]model.Job
-	Deps             map[string][]string
-	Contracts        map[string]map[string]ArtifactContract
-	CancelPrevious   []string
-	Supersede        *SupersedePolicy
-	WebhookClaim     *WebhookClaim
+	Run            model.Run
+	Jobs           map[string]model.Job
+	Deps           map[string][]string
+	Contracts      map[string]map[string]ArtifactContract
+	CancelPrevious []string
+	Supersede      *SupersedePolicy
+	WebhookClaim   *WebhookClaim
+	// BodyClaim is the strict body-replay receipt: the authenticated webhook
+	// body digest under a synthetic forge key, claimed in the SAME
+	// transaction as the run so two concurrent deliveries of the same
+	// authenticated body (even with different delivery headers) converge on
+	// one run. A conflict rolls the enqueue back with ErrDeliveryDuplicate.
+	BodyClaim        *WebhookClaim
 	Quota            *QuotaReservation
 	ScheduleClaim    *ScheduleClaim
 	DownstreamLaunch *DownstreamLaunchClaim

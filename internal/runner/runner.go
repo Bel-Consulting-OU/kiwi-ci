@@ -29,6 +29,7 @@ import (
 	v1 "github.com/Bel-Consulting-OU/kiwi-ci/internal/api/v1"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/artifact"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cache"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executor"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/logging"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
@@ -1736,8 +1737,8 @@ func (r *Runner) checkout(ctx context.Context, j model.Job, dir string) error {
 	args := []string{"clone", "--filter=blob:none", "--no-checkout", j.RepoURL, dir}
 	cmdClone := exec.CommandContext(ctx, "git", args...)
 	cmdClone.Env = gitEnv
-	if out, err := cmdClone.CombinedOutput(); err != nil {
-		return fmt.Errorf("git clone: %v: %s", err, out)
+	if out, truncated, err := executil.CaptureBounded(cmdClone, maxGitDiagnosticBytes); err != nil {
+		return fmt.Errorf("git clone: %v: %s%s", err, out, truncationMarker(truncated))
 	}
 	ref := j.Ref
 	if j.SHA != "" {
@@ -1748,8 +1749,8 @@ func (r *Runner) checkout(ctx context.Context, j model.Job, dir string) error {
 	}
 	cmd := exec.CommandContext(ctx, "git", "-C", dir, "checkout", "--force", ref)
 	cmd.Env = gitEnv
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git checkout: %v: %s", err, out)
+	if out, truncated, err := executil.CaptureBounded(cmd, maxGitDiagnosticBytes); err != nil {
+		return fmt.Errorf("git checkout: %v: %s%s", err, out, truncationMarker(truncated))
 	}
 	return nil
 }
@@ -2991,4 +2992,17 @@ func validateServerURL(raw string) error {
 		return nil
 	}
 	return fmt.Errorf("refusing plaintext HTTP to non-loopback server %q: use https:// or set KIWI_RUNNER_ALLOW_INSECURE=1", raw)
+}
+
+// maxGitDiagnosticBytes bounds the diagnostic capture of repository-controlled
+// git commands (clone/checkout): the output only feeds error messages, so a
+// repository that streams progress forever cannot grow the runner heap.
+const maxGitDiagnosticBytes = 64 << 10
+
+// truncationMarker renders the trailing note for a bounded diagnostic capture.
+func truncationMarker(truncated bool) string {
+	if truncated {
+		return " [output truncated]"
+	}
+	return ""
 }

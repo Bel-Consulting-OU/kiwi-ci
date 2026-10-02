@@ -571,6 +571,11 @@ func (s *PostgresStore) InsertCompiledRun(ctx context.Context, req InsertCompile
 			return err
 		}
 	}
+	if req.BodyClaim != nil {
+		if err := s.insertWebhookClaimTx(ctx, tx, req.BodyClaim); err != nil {
+			return err
+		}
+	}
 	if err := s.reserveQuotaTx(ctx, tx, req.Quota); err != nil {
 		return err
 	}

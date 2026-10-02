@@ -409,6 +409,9 @@ func validateJob(s *Spec, id string, j Job) error {
 	if j.InfraRetries < 0 {
 		return fmt.Errorf("job %q has negative infra_retries", id)
 	}
+	if j.InfraRetries > MaxInfraRetries {
+		return fmt.Errorf("job %q infra_retries %d exceeds the %d limit", id, j.InfraRetries, MaxInfraRetries)
+	}
 	if j.Environment.Name != "" && !envNameRegexp.MatchString(j.Environment.Name) {
 		return fmt.Errorf("job %q has invalid environment name %q", id, j.Environment.Name)
 	}
@@ -665,6 +668,9 @@ func validateService(jobID string, svc *Service) error {
 	if svc.Retries < 0 {
 		return fmt.Errorf("job %q service %q has negative retries", jobID, svc.Name)
 	}
+	if svc.Retries > MaxServiceRetries {
+		return fmt.Errorf("job %q service %q retries %d exceeds the %d limit", jobID, svc.Name, svc.Retries, MaxServiceRetries)
+	}
 	for k, v := range svc.Env {
 		if len(v) > maxEnvValueBytes {
 			return fmt.Errorf("job %q service %q env var %q exceeds %d byte limit", jobID, svc.Name, k, maxEnvValueBytes)
@@ -848,6 +854,9 @@ func checkInputNames(names []string) error {
 func validateRetry(r Retry, where string) error {
 	if r.Max < 0 {
 		return fmt.Errorf("%s max must not be negative", where)
+	}
+	if r.Max > MaxStepRetries {
+		return fmt.Errorf("%s max %d exceeds the %d limit", where, r.Max, MaxStepRetries)
 	}
 	if r.Backoff.Set && r.Backoff.Duration <= 0 {
 		return fmt.Errorf("%s backoff must be a positive duration", where)

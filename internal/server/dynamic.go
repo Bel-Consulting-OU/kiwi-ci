@@ -111,14 +111,84 @@ func (s *Server) generateJobs(w http.ResponseWriter, r *http.Request) {
 // max-jobs-per-run cap. Lease liveness, runner, generation and token are the
 // storage layer's authority — never the request handler's clock, which a
 // skewed replica could otherwise use to accept children of an expired lease.
-func verifyGeneratedFragmentGraph(snapshot, fresh model.Job, runJobCount, childCount int) error {
+func verifyGeneratedFragmentGraph(snapshot, fresh model.Job, childDepth, runJobCount, childCount int) error {
 	if fresh.ID != snapshot.ID {
 		return fmt.Errorf("parent job changed during generation")
+	}
+	// The parent's OWN generate envelope applies in addition to the global
+	// ceilings, and it is read from the locked authoritative parent row
+	// (fresh), never from the upload request.
+	if childDepth > effectiveGeneratedDepthLimit(fresh) {
+		return fmt.Errorf("generation depth %d exceeds maximum %d", childDepth, effectiveGeneratedDepthLimit(fresh))
+	}
+	if childCount > effectiveGeneratedJobsLimit(fresh) {
+		return fmt.Errorf("generated fragment declares %d jobs, limit is %d", childCount, effectiveGeneratedJobsLimit(fresh))
 	}
 	if runJobCount+childCount > maxJobsPerRun {
 		return fmt.Errorf("run would grow to %d jobs, limit is %d", runJobCount+childCount, maxJobsPerRun)
 	}
 	return nil
+}
+
+// parentGenerateEnvelope decodes the parent's authoritative compile-time
+// generate envelope (generate.max_jobs/max_depth) from the persisted
+// compiled-job payload — the same bytes the runner executes. A missing or
+// legacy payload yields the global ceilings only.
+func parentGenerateEnvelope(parent model.Job) (maxJobs, maxDepth int) {
+	if parent.CompiledJobPayload == nil || parent.CompiledJobPayload.EffectiveJob == nil {
+		return 0, 0
+	}
+	// The persisted payload is raw JSON (json.RawMessage); use it directly so
+	// the admission path performs no extra marshal (and stays outside the
+	// JSON seam that integration tests use to prove fail-closed behavior).
+	var raw []byte
+	switch v := parent.CompiledJobPayload.EffectiveJob.(type) {
+	case json.RawMessage:
+		raw = v
+	case []byte:
+		raw = v
+	default:
+		b, err := jsonMarshal(v)
+		if err != nil {
+			return 0, 0
+		}
+		raw = b
+	}
+	if len(raw) == 0 {
+		return 0, 0
+	}
+	var shape struct {
+		Generate struct {
+			MaxJobs  int `json:"max_jobs"`
+			MaxDepth int `json:"max_depth"`
+		} `json:"generate"`
+	}
+	if err := json.Unmarshal(raw, &shape); err != nil {
+		return 0, 0
+	}
+	return shape.Generate.MaxJobs, shape.Generate.MaxDepth
+}
+
+// effectiveGeneratedJobsLimit is the global per-fragment ceiling, tightened by
+// the parent's declared generate.max_jobs (when positive).
+func effectiveGeneratedJobsLimit(parent model.Job) int {
+	limit := maxGeneratedJobsPerFragment
+	maxJobs, _ := parentGenerateEnvelope(parent)
+	if maxJobs > 0 && maxJobs < limit {
+		limit = maxJobs
+	}
+	return limit
+}
+
+// effectiveGeneratedDepthLimit is the global depth ceiling, tightened by the
+// parent's declared generate.max_depth (when positive).
+func effectiveGeneratedDepthLimit(parent model.Job) int {
+	limit := maxDynamicDepth
+	_, maxDepth := parentGenerateEnvelope(parent)
+	if maxDepth > 0 && maxDepth < limit {
+		limit = maxDepth
+	}
+	return limit
 }
 
 // replayGeneratedResponse rebuilds the original admission response from a
@@ -162,12 +232,16 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 	if len(in.Jobs) == 0 {
 		return nil, fmt.Errorf("generated fragment declares no jobs")
 	}
-	if len(in.Jobs) > maxGeneratedJobsPerFragment {
-		return nil, fmt.Errorf("generated fragment declares %d jobs, limit is %d", len(in.Jobs), maxGeneratedJobsPerFragment)
+	// Effective ceilings: the global caps tightened by the PARENT's declared
+	// generate envelope, read from the authoritative parent job (the persisted
+	// compiled policy), never from the upload.
+	if jobsLimit := effectiveGeneratedJobsLimit(parent); len(in.Jobs) > jobsLimit {
+		return nil, fmt.Errorf("generated fragment declares %d jobs, limit is %d", len(in.Jobs), jobsLimit)
 	}
-	// Depth: children inherit parent depth + 1 and never exceed the cap.
-	if childDepth > maxDynamicDepth {
-		return nil, fmt.Errorf("generation depth %d exceeds maximum %d", childDepth, maxDynamicDepth)
+	// Depth: children inherit parent depth + 1 and never exceed the effective
+	// cap.
+	if depthLimit := effectiveGeneratedDepthLimit(parent); childDepth > depthLimit {
+		return nil, fmt.Errorf("generation depth %d exceeds maximum %d", childDepth, depthLimit)
 	}
 	// Every dep edge must reference fragment keys; deps keys must exist.
 	fragment := map[string]pipeline.Job{}
@@ -291,9 +365,15 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 		id := keyIDs[key]
 		ids = append(ids, id)
 		env := cj.Job.Environment.Name
+		// `infra_retries: 0` is an explicit "never requeue after a lost
+		// runner"; an ABSENT value inherits 2. The cap is re-applied
+		// defensively for persisted/programmatic policies.
 		infraRetries := cj.Job.InfraRetries
-		if infraRetries <= 0 {
+		if !cj.Job.InfraRetriesSet && infraRetries == 0 {
 			infraRetries = 2
+		}
+		if infraRetries > pipeline.MaxInfraRetries {
+			infraRetries = pipeline.MaxInfraRetries
 		}
 		effectiveNetwork := cj.Job.Network
 		if effectiveNetwork == "" {
@@ -370,7 +450,7 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 		// committed duplicate returns the winner's receipt instead of inserting
 		// a second fragment.
 		verify := func(fresh model.Job, runJobCount int, _ time.Time) error {
-			return verifyGeneratedFragmentGraph(parent, fresh, runJobCount, len(created))
+			return verifyGeneratedFragmentGraph(parent, fresh, childDepth, runJobCount, len(created))
 		}
 		rec, replayed, err := ds.InsertGeneratedFragmentTx(ctx, storage.GeneratedFragmentRequest{
 			ParentJobID:     parent.ID,
@@ -420,7 +500,7 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 		s.mu.Unlock()
 		return nil, lerr
 	}
-	if verr := verifyGeneratedFragmentGraph(parent, current, runJobCount, len(created)); verr != nil {
+	if verr := verifyGeneratedFragmentGraph(parent, current, childDepth, runJobCount, len(created)); verr != nil {
 		s.mu.Unlock()
 		return nil, verr
 	}

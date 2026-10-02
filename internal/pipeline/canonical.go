@@ -73,10 +73,13 @@ type canonicalRetry struct {
 	Max     int               `json:"max,omitempty"`
 	Backoff canonicalDuration `json:"backoff,omitempty"`
 	On      []string          `json:"on,omitempty"`
+	// MaxSet keeps `max: 0` (explicitly zero retries) distinct from an
+	// absent max in the compiled hash, since the two execute differently.
+	MaxSet bool `json:"max_set,omitempty"`
 }
 
 func retryOf(r Retry) canonicalRetry {
-	return canonicalRetry{Max: r.Max, Backoff: durOf(r.Backoff), On: r.On}
+	return canonicalRetry{Max: r.Max, Backoff: durOf(r.Backoff), On: r.On, MaxSet: r.MaxSet}
 }
 
 // canonicalDefaults is Defaults with omittable durations.
@@ -106,42 +109,45 @@ type canonicalSpec struct {
 }
 
 type canonicalJob struct {
-	Name         string              `json:"name,omitempty"`
-	Needs        []string            `json:"needs,omitempty"`
-	If           string              `json:"if,omitempty"`
-	Runner       []string            `json:"runner,omitempty"`
-	Runtime      string              `json:"runtime,omitempty"`
-	Image        string              `json:"image,omitempty"`
-	Network      string              `json:"network,omitempty"`
-	VM           string              `json:"vm,omitempty"`
-	Shell        string              `json:"shell,omitempty"`
-	Timeout      canonicalDuration   `json:"timeout,omitempty"`
-	Retry        canonicalRetry      `json:"retry,omitempty"`
-	Env          orderedMap          `json:"env,omitempty"`
-	Matrix       orderedMap          `json:"matrix,omitempty"`
-	Paths        []string            `json:"paths,omitempty"`
-	PathsIgnore  []string            `json:"paths_ignore,omitempty"`
-	Services     []canonicalService  `json:"services,omitempty"`
-	Steps        []canonicalStep     `json:"steps"`
-	Cache        []Cache             `json:"cache,omitempty"`
-	Artifacts    []Artifact          `json:"artifacts,omitempty"`
-	Downloads    []ArtifactInput     `json:"downloads,omitempty"`
-	TestReports  []string            `json:"test_reports,omitempty"`
-	Environment  Environment         `json:"environment,omitempty"`
-	InfraRetries int                 `json:"infra_retries,omitempty"`
-	Permissions  Permissions         `json:"permissions,omitempty"`
-	Outputs      orderedMap          `json:"outputs,omitempty"`
-	Sandbox      Sandbox             `json:"sandbox,omitempty"`
-	Placement    Placement           `json:"placement,omitempty"`
-	Resources    Resources           `json:"resources,omitempty"`
-	Tests        TestConfig          `json:"tests,omitempty"`
-	Generate     GenerateSpec        `json:"generate,omitempty"`
-	Downstream   canonicalDownstream `json:"downstream,omitempty"`
-	Deployment   canonicalDeployment `json:"deployment,omitempty"`
-	Snapshot     SnapshotSpec        `json:"snapshot,omitempty"`
-	Component    string              `json:"component,omitempty"`
-	With         orderedMap          `json:"with,omitempty"`
-	QueueTimeout canonicalDuration   `json:"queue_timeout,omitempty"`
+	Name         string             `json:"name,omitempty"`
+	Needs        []string           `json:"needs,omitempty"`
+	If           string             `json:"if,omitempty"`
+	Runner       []string           `json:"runner,omitempty"`
+	Runtime      string             `json:"runtime,omitempty"`
+	Image        string             `json:"image,omitempty"`
+	Network      string             `json:"network,omitempty"`
+	VM           string             `json:"vm,omitempty"`
+	Shell        string             `json:"shell,omitempty"`
+	Timeout      canonicalDuration  `json:"timeout,omitempty"`
+	Retry        canonicalRetry     `json:"retry,omitempty"`
+	Env          orderedMap         `json:"env,omitempty"`
+	Matrix       orderedMap         `json:"matrix,omitempty"`
+	Paths        []string           `json:"paths,omitempty"`
+	PathsIgnore  []string           `json:"paths_ignore,omitempty"`
+	Services     []canonicalService `json:"services,omitempty"`
+	Steps        []canonicalStep    `json:"steps"`
+	Cache        []Cache            `json:"cache,omitempty"`
+	Artifacts    []Artifact         `json:"artifacts,omitempty"`
+	Downloads    []ArtifactInput    `json:"downloads,omitempty"`
+	TestReports  []string           `json:"test_reports,omitempty"`
+	Environment  Environment        `json:"environment,omitempty"`
+	InfraRetries int                `json:"infra_retries,omitempty"`
+	// InfraRetriesSet keeps `infra_retries: 0` (never requeue) distinct from
+	// absent in the compiled hash.
+	InfraRetriesSet bool                `json:"infra_retries_set,omitempty"`
+	Permissions     Permissions         `json:"permissions,omitempty"`
+	Outputs         orderedMap          `json:"outputs,omitempty"`
+	Sandbox         Sandbox             `json:"sandbox,omitempty"`
+	Placement       Placement           `json:"placement,omitempty"`
+	Resources       Resources           `json:"resources,omitempty"`
+	Tests           TestConfig          `json:"tests,omitempty"`
+	Generate        GenerateSpec        `json:"generate,omitempty"`
+	Downstream      canonicalDownstream `json:"downstream,omitempty"`
+	Deployment      canonicalDeployment `json:"deployment,omitempty"`
+	Snapshot        SnapshotSpec        `json:"snapshot,omitempty"`
+	Component       string              `json:"component,omitempty"`
+	With            orderedMap          `json:"with,omitempty"`
+	QueueTimeout    canonicalDuration   `json:"queue_timeout,omitempty"`
 }
 
 type canonicalService struct {
@@ -152,6 +158,8 @@ type canonicalService struct {
 	Interval    canonicalDuration `json:"interval,omitempty"`
 	Timeout     canonicalDuration `json:"timeout,omitempty"`
 	Retries     int               `json:"retries,omitempty"`
+	// RetriesSet keeps `retries: 0` (one attempt) distinct from absent.
+	RetriesSet bool `json:"retries_set,omitempty"`
 }
 
 type canonicalStep struct {
@@ -196,7 +204,7 @@ func canonicalJobOf(j Job) canonicalJob {
 		Paths: j.Paths, PathsIgnore: j.PathsIgnore,
 		Cache: j.Cache, Artifacts: j.Artifacts, Downloads: j.Downloads,
 		TestReports: j.TestReports, Environment: j.Environment,
-		InfraRetries: j.InfraRetries, Permissions: j.Permissions,
+		InfraRetries: j.InfraRetries, InfraRetriesSet: j.InfraRetriesSet, Permissions: j.Permissions,
 		Outputs: pairs(j.Outputs), Sandbox: j.Sandbox, Placement: j.Placement,
 		Resources: j.Resources, Tests: j.Tests, Generate: j.Generate,
 		Snapshot: j.Snapshot, Component: j.Component, With: pairs(j.With),
@@ -208,7 +216,7 @@ func canonicalJobOf(j Job) canonicalJob {
 			Name: j.Services[i].Name, Image: j.Services[i].Image,
 			Env: pairs(j.Services[i].Env), Healthcheck: j.Services[i].Healthcheck,
 			Interval: durOf(j.Services[i].Interval), Timeout: durOf(j.Services[i].Timeout),
-			Retries: j.Services[i].Retries,
+			Retries: j.Services[i].Retries, RetriesSet: j.Services[i].RetriesSet,
 		}
 	}
 	c.Steps = canonicalSteps(j.Steps)

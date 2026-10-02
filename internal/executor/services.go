@@ -10,8 +10,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
+
+// maxHealthcheckOutputBytes bounds the diagnostic output the runner retains
+// from ONE healthcheck attempt. The command is pipeline-controlled and may
+// print forever; the collector keeps this prefix and discards the rest while
+// continuing to drain the pipe (see executil.CaptureBounded).
+const maxHealthcheckOutputBytes = 64 << 10
 
 // serviceNetworkArgs builds the `docker network create` arguments for the
 // job's services network. A plain user-defined bridge HAS a route to the
@@ -443,10 +450,7 @@ func startContainerServices(ctx context.Context, runID, jobID string, services [
 		if timeout <= 0 {
 			timeout = 5 * time.Second
 		}
-		retries := svc.Retries
-		if retries <= 0 {
-			retries = 12
-		}
+		retries := effectiveServiceRetries(svc)
 		// Healthchecks always target the physical name: it is the container
 		// the daemon knows, the alias is network-scoped (DNS) only.
 		name := containers[i]
@@ -454,7 +458,12 @@ func startContainerServices(ctx context.Context, runID, jobID string, services [
 		for attempt := 0; attempt <= retries; attempt++ {
 			hcCtx, cancel := context.WithTimeout(ctx, timeout)
 			hcArgs := append([]string{"exec", name}, shellCommand("sh", svc.Healthcheck)...)
-			out, hcErr := exec.CommandContext(hcCtx, docker, hcArgs...).CombinedOutput()
+			// The healthcheck command is PIPELINE-CONTROLLED: its output must
+			// never be buffered unbounded in the runner process. Retain a
+			// small diagnostic prefix and drain (discarding) the rest, so a
+			// hostile `while true; do head -c 1M /dev/zero; done` cannot grow
+			// the host heap past maxHealthcheckOutputBytes.
+			out, truncated, hcErr := executil.CaptureBounded(exec.CommandContext(hcCtx, docker, hcArgs...), maxHealthcheckOutputBytes)
 			cancel()
 			if hcErr == nil {
 				emit("service " + display + " healthy")
@@ -462,7 +471,11 @@ func startContainerServices(ctx context.Context, runID, jobID string, services [
 			}
 			if attempt == retries {
 				cleanupAll()
-				return "", func() {}, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("service %q healthcheck failed: %v: %s", display, hcErr, strings.TrimSpace(string(out)))}
+				detail := strings.TrimSpace(string(out))
+				if truncated {
+					detail += " [output truncated]"
+				}
+				return "", func() {}, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("service %q healthcheck failed: %v: %s", display, hcErr, detail)}
 			}
 			select {
 			case <-ctx.Done():
@@ -473,4 +486,18 @@ func startContainerServices(ctx context.Context, runID, jobID string, services [
 		}
 	}
 	return network, cleanup, nil
+}
+
+// effectiveServiceRetries resolves the healthcheck retry budget: `retries: 0`
+// is an explicit "one attempt", only an ABSENT value inherits the 12-attempt
+// default, and the result is capped as defense in depth.
+func effectiveServiceRetries(svc pipeline.Service) int {
+	retries := svc.Retries
+	if !svc.RetriesSet && retries == 0 {
+		retries = 12
+	}
+	if retries > pipeline.MaxServiceRetries {
+		retries = pipeline.MaxServiceRetries
+	}
+	return retries
 }

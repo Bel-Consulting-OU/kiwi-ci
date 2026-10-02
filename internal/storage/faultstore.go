@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
 // FaultyStore wraps a Store and injects an error into the Nth mutating call
@@ -2881,7 +2882,7 @@ func (m *memStore) RevokeRunnerLeases(ctx context.Context, runnerID, reason stri
 	runIDs := map[string]bool{}
 	for _, id := range ids {
 		j := jobs[id]
-		requeue := j.Attempts <= j.MaxInfraRetries
+		requeue := j.Attempts <= effectiveMaxInfraRetries(j)
 		if requeue {
 			j.Status = model.StatusQueued
 			j.Error = reason + "; retrying"
@@ -2984,7 +2985,7 @@ func (m *memStore) RecoverExpiredLease(ctx context.Context, jobID string, expect
 	audit := append([]model.AuditEvent(nil), m.audit...)
 	staged := 0
 	corrupt := m.undecodableJobs[jobID]
-	requeue := !corrupt && j.Attempts <= j.MaxInfraRetries
+	requeue := !corrupt && j.Attempts <= effectiveMaxInfraRetries(j)
 	switch {
 	case corrupt:
 		// Retry policy cannot be trusted from a corrupt payload: terminal
@@ -4644,6 +4645,11 @@ func (m *memStore) InsertCompiledRun(ctx context.Context, req InsertCompiledRunR
 			return ErrDeliveryDuplicate
 		}
 	}
+	if req.BodyClaim != nil {
+		if _, exists := m.deliveries[req.BodyClaim.Forge+"/"+req.BodyClaim.DeliveryID]; exists {
+			return ErrDeliveryDuplicate
+		}
+	}
 	// Commit: from here on nothing can fail, so the staged reservations, the
 	// superseded cancellations and the new run land together.
 	if stagedDownstream != nil {
@@ -4697,6 +4703,9 @@ func (m *memStore) InsertCompiledRun(ctx context.Context, req InsertCompiledRunR
 	}
 	if req.WebhookClaim != nil {
 		m.deliveries[req.WebhookClaim.Forge+"/"+req.WebhookClaim.DeliveryID] = runID + "/" + req.WebhookClaim.PayloadDigest
+	}
+	if req.BodyClaim != nil {
+		m.deliveries[req.BodyClaim.Forge+"/"+req.BodyClaim.DeliveryID] = runID + "/" + req.BodyClaim.PayloadDigest
 	}
 	if req.ScheduleClaim != nil {
 		byNominal, ok := m.occurrences[req.ScheduleClaim.ScheduleID]
@@ -6186,7 +6195,7 @@ func (m *memStore) DisableRunnerAndRevokeCert(ctx context.Context, runnerID, cer
 	runIDs := map[string]bool{}
 	for _, id := range ids {
 		j := jobs[id]
-		requeue := j.Attempts <= j.MaxInfraRetries
+		requeue := j.Attempts <= effectiveMaxInfraRetries(j)
 		if requeue {
 			j.Status = model.StatusQueued
 			j.Error = "runner disabled; retrying"
@@ -6319,4 +6328,16 @@ func (f *FaultyStore) CommitOIDCIssuance(ctx context.Context, req OIDCIssuance) 
 		return OIDCIssuanceResult{}, err
 	}
 	return inner.CommitOIDCIssuance(ctx, req)
+}
+
+// effectiveMaxInfraRetries clamps a persisted/programmatic infrastructure
+// retry budget to the admission cap: legacy or corrupt payloads can carry
+// absurd values, and recovery repeatedly re-leases while
+// Attempts <= MaxInfraRetries, so the durable scheduling loop needs a finite
+// defense-in-depth bound even when the value never went through validation.
+func effectiveMaxInfraRetries(j model.Job) int {
+	if j.MaxInfraRetries > pipeline.MaxInfraRetries {
+		return pipeline.MaxInfraRetries
+	}
+	return j.MaxInfraRetries
 }

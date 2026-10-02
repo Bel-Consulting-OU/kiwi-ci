@@ -62,13 +62,13 @@ func fcDynamicFixtureHTTP(t *testing.T) (*Server, Task) {
 
 func TestFlowDynamicVerifyParentState(t *testing.T) {
 	base := model.Job{ID: "p", Status: model.StatusRunning}
-	if err := verifyGeneratedFragmentGraph(base, base, 0, 1); err != nil {
+	if err := verifyGeneratedFragmentGraph(base, base, 1, 0, 1); err != nil {
 		t.Fatalf("valid parent graph state = %v", err)
 	}
-	if err := verifyGeneratedFragmentGraph(base, model.Job{ID: "other", Status: model.StatusRunning}, 0, 1); err == nil || !strings.Contains(err.Error(), "changed") {
+	if err := verifyGeneratedFragmentGraph(base, model.Job{ID: "other", Status: model.StatusRunning}, 1, 0, 1); err == nil || !strings.Contains(err.Error(), "changed") {
 		t.Fatalf("identity change = %v, want a changed-parent refusal", err)
 	}
-	if err := verifyGeneratedFragmentGraph(base, base, maxJobsPerRun, 1); err == nil || !strings.Contains(err.Error(), "limit") {
+	if err := verifyGeneratedFragmentGraph(base, base, 1, maxJobsPerRun, 1); err == nil || !strings.Contains(err.Error(), "limit") {
 		t.Fatalf("run cap = %v, want the limit refusal", err)
 	}
 }
@@ -138,6 +138,52 @@ func TestFlowDynamicFragmentShapeErrors(t *testing.T) {
 	b.WriteString(`},"deps":{}}`)
 	if _, err := s.processGeneratedFragment(ctx, parent, fcFragment(t, b.String())); err == nil || !strings.Contains(err.Error(), "limit") {
 		t.Fatalf("job-count limit error = %v", err)
+	}
+}
+
+// TestFlowDynamicFragmentHonorsParentGenerateEnvelope pins the parent policy:
+// the compiled parent's generate.max_jobs/max_depth tighten the fragment
+// ceilings below the global caps, and a legacy parent without a compiled
+// payload keeps the global caps.
+func TestFlowDynamicFragmentHonorsParentGenerateEnvelope(t *testing.T) {
+	s, task := fcDynamicServer(t)
+	parent := fcStoredParent(t, s, task.Job.ID)
+	ctx := context.Background()
+
+	raw, err := json.Marshal(map[string]any{"generate": map[string]any{"max_jobs": 1, "max_depth": 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	enveloped := parent
+	enveloped.CompiledJobPayload = &model.CompiledJobPayload{EffectiveJob: json.RawMessage(raw)}
+
+	twoJobs := fcFragment(t, `{"jobs":{"child-a":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo"}]},"child-b":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo"}]}},"deps":{}}`)
+	if _, err := s.processGeneratedFragment(ctx, enveloped, twoJobs); err == nil || !strings.Contains(err.Error(), "limit is 1") {
+		t.Fatalf("parent max_jobs envelope = %v, want the limit-is-1 refusal", err)
+	}
+
+	deep := enveloped
+	deep.DynamicDepth = 1 // child depth 2 > parent max_depth 1
+	if _, err := s.processGeneratedFragment(ctx, deep, fcFragment(t, fcOneChildFragment)); err == nil || !strings.Contains(err.Error(), "maximum 1") {
+		t.Fatalf("parent max_depth envelope = %v, want the maximum-1 refusal", err)
+	}
+
+	// A legacy parent (no compiled payload) keeps the global caps.
+	if got := effectiveGeneratedJobsLimit(parent); got != maxGeneratedJobsPerFragment {
+		t.Fatalf("legacy jobs limit = %d, want the global %d", got, maxGeneratedJobsPerFragment)
+	}
+	if got := effectiveGeneratedDepthLimit(parent); got != maxDynamicDepth {
+		t.Fatalf("legacy depth limit = %d, want the global %d", got, maxDynamicDepth)
+	}
+	// A more permissive parent cannot loosen the global caps.
+	looseRaw, _ := json.Marshal(map[string]any{"generate": map[string]any{"max_jobs": 100000, "max_depth": 100}})
+	loose := parent
+	loose.CompiledJobPayload = &model.CompiledJobPayload{EffectiveJob: json.RawMessage(looseRaw)}
+	if got := effectiveGeneratedJobsLimit(loose); got != maxGeneratedJobsPerFragment {
+		t.Fatalf("loose jobs limit = %d, want the global %d", got, maxGeneratedJobsPerFragment)
+	}
+	if got := effectiveGeneratedDepthLimit(loose); got != maxDynamicDepth {
+		t.Fatalf("loose depth limit = %d, want the global %d", got, maxDynamicDepth)
 	}
 }
 

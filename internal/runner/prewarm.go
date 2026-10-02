@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 )
 
@@ -345,18 +346,21 @@ func (p *prewarmer) run(ctx context.Context) error {
 }
 
 func prewarmPull(ctx context.Context, bin, ref string) error {
-	out, err := exec.CommandContext(ctx, bin, "pull", ref).CombinedOutput()
+	out, truncated, err := executil.CaptureBounded(exec.CommandContext(ctx, bin, "pull", ref), maxGitDiagnosticBytes)
 	if err != nil {
-		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("%v: %s%s", err, strings.TrimSpace(string(out)), truncationMarker(truncated))
 	}
 	return nil
 }
 
 // listTartVMs runs `tart list --format json` and parses the output.
 func (p *prewarmer) listTartVMs(ctx context.Context) ([]tartVM, error) {
-	out, err := exec.CommandContext(ctx, p.tartPath, "list", "--format", "json").Output()
+	out, truncated, err := executil.CaptureBounded(exec.CommandContext(ctx, p.tartPath, "list", "--format", "json"), maxPrewarmListBytes)
 	if err != nil {
 		return nil, fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	}
+	if truncated {
+		return nil, fmt.Errorf("tart list output exceeds %d bytes", maxPrewarmListBytes)
 	}
 	return parseTartList(out)
 }
@@ -366,11 +370,11 @@ func (p *prewarmer) listTartVMs(ctx context.Context) ([]tartVM, error) {
 // json` that the cloned VM's source digest matches the requested digest.
 func (p *prewarmer) prewarmTart(ctx context.Context, pr prewarmRef) error {
 	ref := pr.Image + "@" + pr.Digest
-	if out, err := exec.CommandContext(ctx, p.tartPath, "pull", ref).CombinedOutput(); err != nil {
-		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	if out, truncated, err := executil.CaptureBounded(exec.CommandContext(ctx, p.tartPath, "pull", ref), maxGitDiagnosticBytes); err != nil {
+		return fmt.Errorf("%v: %s%s", err, strings.TrimSpace(string(out)), truncationMarker(truncated))
 	}
-	if out, err := exec.CommandContext(ctx, p.tartPath, "clone", ref, pr.VMName).CombinedOutput(); err != nil {
-		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	if out, truncated, err := executil.CaptureBounded(exec.CommandContext(ctx, p.tartPath, "clone", ref, pr.VMName), maxGitDiagnosticBytes); err != nil {
+		return fmt.Errorf("%v: %s%s", err, strings.TrimSpace(string(out)), truncationMarker(truncated))
 	}
 	vms, err := p.listTartVMs(ctx)
 	if err != nil {
@@ -443,3 +447,8 @@ func (p *prewarmer) saveState(st prewarmState) error {
 	// that survives the rename but not a crash (no file or directory sync).
 	return fsutil.AtomicWriteFile(p.stateFile, b, 0o600)
 }
+
+// maxPrewarmListBytes bounds the parsed `tart list --format json` capture: the
+// listing scales with host VM count, but a truncated one must fail closed
+// instead of silently dropping entries.
+const maxPrewarmListBytes = 4 << 20

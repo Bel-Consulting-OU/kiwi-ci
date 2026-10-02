@@ -114,7 +114,7 @@ func (s *PostgresStore) revokeRunnerLeasesTx(ctx context.Context, tx pgx.Tx, run
 		// Same decision RecoverExpired makes from the lease-time increment:
 		// a lease consumes exactly one attempt, the recovery path only reads
 		// the retry budget.
-		requeue := j.Attempts <= j.MaxInfraRetries
+		requeue := j.Attempts <= effectiveMaxInfraRetries(j)
 		if requeue {
 			j.Status = model.StatusQueued
 			j.Error = reason + "; retrying"
@@ -295,7 +295,7 @@ func (s *PostgresStore) RecoverExpiredLease(ctx context.Context, jobID string, e
 	if leaseExpiresAt != nil && leaseExpiresAt.After(now) {
 		return tx.Commit(ctx)
 	}
-	requeue := j.Attempts <= j.MaxInfraRetries
+	requeue := j.Attempts <= effectiveMaxInfraRetries(j)
 	if requeue {
 		j.Status = model.StatusQueued
 		j.Error = "runner lease expired; retrying"

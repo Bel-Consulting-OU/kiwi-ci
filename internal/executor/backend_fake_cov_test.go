@@ -43,6 +43,14 @@ case "$sub" in
     done
     shift
     cmd="$1"; shift
+    if [ -n "$FAKE_DOCKER_EXEC_SPAM" ]; then
+      if [ "${FAKE_DOCKER_EXEC_SPAM_FD:-1}" = "2" ]; then
+        head -c "$FAKE_DOCKER_EXEC_SPAM" /dev/zero >&2
+      else
+        head -c "$FAKE_DOCKER_EXEC_SPAM" /dev/zero
+      fi
+      exit "${FAKE_DOCKER_EXEC_SPAM_EXIT:-1}"
+    fi
     if [ "$cmd" = "cat" ]; then
       p="$1"
       case "$p" in

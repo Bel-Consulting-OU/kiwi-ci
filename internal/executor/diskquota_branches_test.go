@@ -155,8 +155,12 @@ func TestSetupXFSProjectQuotaAllocateExhaustion(t *testing.T) {
 }
 
 // TestSetupXFSProjectQuotaAssignFailureReleasesID: when the project
-// assignment fails, nothing was applied, the failure is reported with no
-// cleanup, and the ID is immediately reusable.
+// assignment command fails, the outcome is ambiguous (the kernel call may
+// have succeeded before the error), so Kiwi first tries to remove the
+// assignment with the ID-named cleanup and only then releases the ID. Here
+// the cleanup succeeds (the fake fails only "project -s"), so the ID is
+// reusable; TestSetupXFSProjectQuotaAssignCleanupFailureQuarantinesID covers
+// the case where cleanup cannot prove removal.
 func TestSetupXFSProjectQuotaAssignFailureReleasesID(t *testing.T) {
 	resetProjectIDPools(t)
 	t.Setenv(xfsProjectIDBaseEnv, "910000")
@@ -233,5 +237,38 @@ func TestXFSProjectIDPoolReusePersistsAcrossLookups(t *testing.T) {
 	}
 	if second, _ := projectIDPoolFor("8:23").allocate(); second == id {
 		t.Fatalf("ID %d handed out twice", id)
+	}
+}
+
+// TestSetupXFSProjectQuotaAssignCleanupFailureQuarantinesID pins the
+// ambiguous-side-effect rule: when the assignment command fails AND the
+// ID-named cleanup also fails, the ID must NOT return to the pool, because
+// the workspace may still carry it. A later workspace can never be handed the
+// same project ID.
+func TestSetupXFSProjectQuotaAssignCleanupFailureQuarantinesID(t *testing.T) {
+	resetProjectIDPools(t)
+	t.Setenv(xfsProjectIDBaseEnv, "910000")
+	t.Setenv(xfsProjectIDCountEnv, "1")
+	t.Setenv("FAKE_XFS_LOG", filepath.Join(t.TempDir(), "xfs.log"))
+	// Fails both the assignment ("project -s ...") and its cleanup
+	// ("project -C ..."): removal cannot be proven.
+	script := writeFakeXFSQuota(t, "project")
+
+	entry := mountInfoEntry{mountPoint: "/mnt/xfs", device: "8:30", fsType: "xfs"}
+	status, cleanup := setupXFSProjectQuotaOnMount("/mnt/xfs/ws", entry, 1<<20, script)
+	if status.Hard || cleanup != nil {
+		t.Fatalf("ambiguous assign failure = %+v cleanup=%v", status, cleanup != nil)
+	}
+	if !strings.Contains(status.Detail, "stays allocated") {
+		t.Fatalf("detail = %q, want the explicit quarantine reason", status.Detail)
+	}
+	if n := projectIDPoolFor("8:30").liveCount(); n != 1 {
+		t.Fatalf("live IDs after ambiguous assign failure = %d, want 1 (quarantined)", n)
+	}
+	// The one-ID pool is exhausted: a second workspace gets an allocation
+	// failure, never a shared project ID.
+	second, _ := setupXFSProjectQuotaOnMount("/mnt/xfs/ws2", entry, 1<<20, script)
+	if second.Hard || !strings.Contains(second.Detail, "allocate XFS project id") {
+		t.Fatalf("second workspace = %+v, want allocation exhaustion (no ID reuse)", second)
 	}
 }

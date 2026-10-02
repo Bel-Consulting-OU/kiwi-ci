@@ -380,19 +380,22 @@ type Job struct {
 	TestReports  []string          `yaml:"test_reports,omitempty" json:"test_reports,omitempty"`
 	Environment  Environment       `yaml:"environment,omitempty" json:"environment,omitempty"`
 	InfraRetries int               `yaml:"infra_retries,omitempty" json:"infra_retries,omitempty"`
-	Permissions  Permissions       `yaml:"permissions,omitempty" json:"permissions,omitempty"`
-	Outputs      map[string]string `yaml:"outputs,omitempty" json:"outputs,omitempty"`
-	Sandbox      Sandbox           `yaml:"sandbox,omitempty" json:"sandbox,omitempty"`
-	Placement    Placement         `yaml:"placement,omitempty" json:"placement,omitempty"`
-	Resources    Resources         `yaml:"resources,omitempty" json:"resources,omitempty"`
-	Tests        TestConfig        `yaml:"tests,omitempty" json:"tests,omitempty"`
-	Generate     GenerateSpec      `yaml:"generate,omitempty" json:"generate,omitempty"`
-	Downstream   DownstreamSpec    `yaml:"downstream,omitempty" json:"downstream,omitempty"`
-	Deployment   DeploymentSpec    `yaml:"deployment,omitempty" json:"deployment,omitempty"`
-	Snapshot     SnapshotSpec      `yaml:"snapshot,omitempty" json:"snapshot,omitempty"`
-	Component    string            `yaml:"component,omitempty" json:"component,omitempty"`
-	With         map[string]string `yaml:"with,omitempty" json:"with,omitempty"`
-	QueueTimeout Duration          `yaml:"queue_timeout,omitempty" json:"queue_timeout,omitempty"`
+	// InfraRetriesSet records whether infra_retries was explicitly present,
+	// so `infra_retries: 0` can mean "never requeue after a lost runner".
+	InfraRetriesSet bool              `yaml:"-" json:"-"`
+	Permissions     Permissions       `yaml:"permissions,omitempty" json:"permissions,omitempty"`
+	Outputs         map[string]string `yaml:"outputs,omitempty" json:"outputs,omitempty"`
+	Sandbox         Sandbox           `yaml:"sandbox,omitempty" json:"sandbox,omitempty"`
+	Placement       Placement         `yaml:"placement,omitempty" json:"placement,omitempty"`
+	Resources       Resources         `yaml:"resources,omitempty" json:"resources,omitempty"`
+	Tests           TestConfig        `yaml:"tests,omitempty" json:"tests,omitempty"`
+	Generate        GenerateSpec      `yaml:"generate,omitempty" json:"generate,omitempty"`
+	Downstream      DownstreamSpec    `yaml:"downstream,omitempty" json:"downstream,omitempty"`
+	Deployment      DeploymentSpec    `yaml:"deployment,omitempty" json:"deployment,omitempty"`
+	Snapshot        SnapshotSpec      `yaml:"snapshot,omitempty" json:"snapshot,omitempty"`
+	Component       string            `yaml:"component,omitempty" json:"component,omitempty"`
+	With            map[string]string `yaml:"with,omitempty" json:"with,omitempty"`
+	QueueTimeout    Duration          `yaml:"queue_timeout,omitempty" json:"queue_timeout,omitempty"`
 }
 
 type Service struct {
@@ -403,6 +406,46 @@ type Service struct {
 	Interval    Duration          `yaml:"interval,omitempty" json:"interval,omitempty"`
 	Timeout     Duration          `yaml:"timeout,omitempty" json:"timeout,omitempty"`
 	Retries     int               `yaml:"retries,omitempty" json:"retries,omitempty"`
+	// RetriesSet records whether retries was explicitly present, so
+	// `retries: 0` can mean "one healthcheck attempt".
+	RetriesSet bool `yaml:"-" json:"-"`
+}
+
+// UnmarshalYAML records the presence of "retries" alongside the decoded value.
+func (s *Service) UnmarshalYAML(value *yaml.Node) error {
+	type plain Service
+	var p plain
+	if err := value.Decode(&p); err != nil {
+		return err
+	}
+	*s = Service(p)
+	if value.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(value.Content); i += 2 {
+			if value.Content[i].Value == "retries" {
+				s.RetriesSet = true
+			}
+		}
+	}
+	return nil
+}
+
+// UnmarshalYAML records the presence of infra_retries alongside the decoded
+// value (the nested retry block records its own max presence).
+func (j *Job) UnmarshalYAML(value *yaml.Node) error {
+	type plain Job
+	var p plain
+	if err := value.Decode(&p); err != nil {
+		return err
+	}
+	*j = Job(p)
+	if value.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(value.Content); i += 2 {
+			if value.Content[i].Value == "infra_retries" {
+				j.InfraRetriesSet = true
+			}
+		}
+	}
+	return nil
 }
 
 type Step struct {
@@ -419,10 +462,41 @@ type Step struct {
 	ContinueOnError  bool              `yaml:"continue_on_error,omitempty" json:"continue_on_error,omitempty"`
 }
 
+// Retry-policy caps. They are finite policy choices enforced at admission
+// (spec and compiled validation, generated fragments) and again defensively in
+// the executor/server, so a pipeline cannot request unbounded execution or
+// wrap the executor's attempt arithmetic.
+const (
+	MaxStepRetries    = 20
+	MaxServiceRetries = 100
+	MaxInfraRetries   = 20
+)
+
 type Retry struct {
 	Max     int      `yaml:"max,omitempty" json:"max,omitempty"`
 	Backoff Duration `yaml:"backoff,omitempty" json:"backoff,omitempty"`
 	On      []string `yaml:"on,omitempty" json:"on,omitempty"`
+	// MaxSet records whether "max" was EXPLICITLY present, so `max: 0` means
+	// zero retries instead of silently inheriting the job/default budget.
+	MaxSet bool `yaml:"-" json:"-"`
+}
+
+// UnmarshalYAML records the presence of "max" alongside the decoded value.
+func (r *Retry) UnmarshalYAML(value *yaml.Node) error {
+	type plain Retry
+	var p plain
+	if err := value.Decode(&p); err != nil {
+		return err
+	}
+	*r = Retry(p)
+	if value.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(value.Content); i += 2 {
+			if value.Content[i].Value == "max" {
+				r.MaxSet = true
+			}
+		}
+	}
+	return nil
 }
 
 type Cache struct {

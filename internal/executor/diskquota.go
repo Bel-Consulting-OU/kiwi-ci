@@ -436,7 +436,18 @@ func setupXFSProjectQuotaOnMount(workspace string, entry mountInfoEntry, limit i
 		return DiskQuotaStatus{Detail: "allocate XFS project id: " + err.Error()}, nil
 	}
 	if err := runXFSQuotaCommand(xq, entry.mountPoint, xfsProjectAssignCommand(workspace, projID)); err != nil {
-		releaseXFSProjectID(fsKey, projID)
+		// An external-command error is NOT proof the side effect did not
+		// happen: xfs_quota may have applied the assignment in the kernel
+		// before a timeout/output error/kill. Releasing the ID immediately
+		// would let a later workspace inherit a project ID the current
+		// workspace may still carry, breaking the allocator's uniqueness
+		// premise. Remove the assignment first and release the ID only when
+		// cleanup positively succeeds; otherwise the ID stays allocated
+		// (quarantined) even if that leaks one ID — false retention is much
+		// safer than reuse against ambiguous filesystem state.
+		if cerr := runXFSProjectCleanup(xq, entry.mountPoint, workspace, projID, fsKey); cerr != nil {
+			return DiskQuotaStatus{Detail: fmt.Sprintf("assign XFS project quota: %v (cleanup also failed, the project id stays allocated: %v)", err, cerr)}, nil
+		}
 		return DiskQuotaStatus{Detail: "assign XFS project quota: " + err.Error()}, nil
 	}
 	if err := runXFSQuotaCommand(xq, entry.mountPoint, xfsProjectLimitCommand(limit, projID)); err != nil {

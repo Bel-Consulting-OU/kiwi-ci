@@ -8,7 +8,21 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executil"
 )
+
+// maxExternalCommandOutputBytes bounds every external-command capture in the
+// executor (docker/tart/git helpers). The cap is generous for legitimate
+// listings but finite, so a command that streams without end can never grow
+// the runner heap without bound; callers that PARSE the output fail closed
+// when it is truncated.
+const maxExternalCommandOutputBytes = 4 << 20
+
+// errExternalOutputTooLarge reports that an external command produced more
+// than maxExternalCommandOutputBytes; parsed callers must not consume a
+// silently truncated prefix.
+var errExternalOutputTooLarge = errors.New("external command output exceeded the capture limit")
 
 // GCReport counts the stale resources one GC pass removed.
 type GCReport struct {
@@ -83,7 +97,13 @@ func phaseCommand(parent context.Context, phase time.Duration, exe string, args 
 	// Bound the output-pipe drain after a kill too, so an orphaned
 	// descendant holding the pipe cannot extend a phase beyond its ceiling.
 	cmd.WaitDelay = boundedToolWaitDelay
-	out, err := cmd.CombinedOutput()
+	// Capture with a hard byte cap: an external command's output is never
+	// buffered unbounded in the runner process, and a truncated parsed
+	// output fails closed instead of silently mis-parsing a prefix.
+	out, truncated, err := executil.CaptureBounded(cmd, maxExternalCommandOutputBytes)
+	if err == nil && truncated {
+		return out, fmt.Errorf("external command %s %s: %w", exe, strings.Join(args, " "), errExternalOutputTooLarge)
+	}
 	if err == nil {
 		return out, nil
 	}
@@ -148,7 +168,10 @@ func boundedToolCommand(parent context.Context, timeout time.Duration, exe strin
 	defer cancel()
 	cmd := exec.CommandContext(ctx, exe, args...)
 	cmd.WaitDelay = boundedToolWaitDelay
-	out, err := cmd.CombinedOutput()
+	out, truncated, err := executil.CaptureBounded(cmd, maxExternalCommandOutputBytes)
+	if err == nil && truncated {
+		return out, fmt.Errorf("external command %s %s: %w", exe, strings.Join(args, " "), errExternalOutputTooLarge)
+	}
 	if err == nil {
 		return out, nil
 	}
@@ -181,8 +204,8 @@ func GC(ctx context.Context, root string, olderThan time.Duration) GCReport {
 		cmd := exec.CommandContext(qctx, bin, args...)
 		cmd.Dir = root
 		cmd.WaitDelay = boundedToolWaitDelay
-		out, err := cmd.Output()
-		if err != nil {
+		out, truncated, err := executil.CaptureBounded(cmd, maxExternalCommandOutputBytes)
+		if err != nil || truncated {
 			return nil
 		}
 		return out

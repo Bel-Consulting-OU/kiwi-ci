@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -73,9 +75,10 @@ func postWebhook(t *testing.T, s *Server, secret, event, delivery, body string) 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-GitHub-Event", event)
 	req.Header.Set("X-Hub-Signature-256", signGitHubPayload(secret, []byte(body)))
-	if delivery != "" {
-		req.Header.Set("X-GitHub-Delivery", delivery)
+	if delivery == "" {
+		delivery = nextTestDelivery()
 	}
+	req.Header.Set("X-GitHub-Delivery", delivery)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
 	return w
@@ -216,4 +219,13 @@ func TestGitHubWebhookPing(t *testing.T) {
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("want 204 got %d", w.Code)
 	}
+}
+
+// testDeliverySeq makes auto-filled delivery IDs unique per request so tests
+// that do not care about replay identity still exercise the (now mandatory)
+// delivery-header path without deduping each other.
+var testDeliverySeq atomic.Int64
+
+func nextTestDelivery() string {
+	return "test-delivery-" + strconv.FormatInt(testDeliverySeq.Add(1), 10)
 }

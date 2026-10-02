@@ -206,9 +206,10 @@ func postGitLab(t *testing.T, s *Server, token, event, delivery, body string) *h
 	if token != "" {
 		req.Header.Set("X-Gitlab-Token", token)
 	}
-	if delivery != "" {
-		req.Header.Set("X-Gitlab-Event-UUID", delivery)
+	if delivery == "" {
+		delivery = nextTestDelivery()
 	}
+	req.Header.Set("X-Gitlab-Event-UUID", delivery)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
 	return w
@@ -228,9 +229,10 @@ func postForgejo(t *testing.T, s *Server, secret, event, delivery, body string, 
 	if secret != "" {
 		req.Header.Set("X-Hub-Signature-256", signForgejo(secret, []byte(body)))
 	}
-	if delivery != "" {
-		req.Header.Set("X-Forgejo-Delivery", delivery)
+	if delivery == "" {
+		delivery = nextTestDelivery()
 	}
+	req.Header.Set("X-Forgejo-Delivery", delivery)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
 	return w

@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
@@ -93,7 +94,10 @@ func dockerCleanupCommand(parent context.Context, docker string, args ...string)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, docker, args...)
 	cmd.WaitDelay = dockerCleanupWaitDelay
-	out, err := cmd.CombinedOutput()
+	out, truncated, err := executil.CaptureBounded(cmd, maxExternalCommandOutputBytes)
+	if err == nil && truncated {
+		return fmt.Errorf("docker cleanup %s %s: %w", docker, strings.Join(args, " "), errExternalOutputTooLarge)
+	}
 	if err == nil {
 		return nil
 	}

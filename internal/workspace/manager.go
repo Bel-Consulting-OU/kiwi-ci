@@ -26,6 +26,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executil"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -156,9 +158,13 @@ func gitRepo(ctx context.Context, dir string) bool {
 // developer's current files, including uncommitted edits.
 func gitStatusClean(ctx context.Context, dir string) (bool, error) {
 	cmd := exec.CommandContext(ctx, "git", "-C", dir, "status", "--porcelain")
-	out, err := cmd.Output()
+	out, truncated, err := executil.CaptureBounded(cmd, 1<<20)
 	if err != nil {
 		return false, err
+	}
+	if truncated {
+		// Far more changes than the capture limit: definitely not clean.
+		return false, nil
 	}
 	for _, line := range strings.Split(string(out), "\n") {
 		if strings.TrimSpace(line) != "" {

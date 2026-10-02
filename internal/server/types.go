@@ -37,11 +37,16 @@ type SubmitRun struct {
 	// repo_url/repo_full_name binding check, because a fork PR's base full
 	// name legitimately differs from its head clone URL. It is never
 	// accepted from client JSON.
-	identityBound bool   `json:"-"`
-	Ref           string `json:"ref"`
-	SHA           string `json:"sha,omitempty"`
-	Event         string `json:"event,omitempty"`
-	Pipeline      string `json:"pipeline"`
+	identityBound bool `json:"-"`
+	// deliveryDigest is the SHA-256 of the AUTHENTICATED webhook body. It
+	// binds the replay identity (forge, delivery ID) to the exact bytes that
+	// were signed, so a captured signed body cannot be replayed under a fresh
+	// delivery header. It is never accepted from client JSON.
+	deliveryDigest string `json:"-"`
+	Ref            string `json:"ref"`
+	SHA            string `json:"sha,omitempty"`
+	Event          string `json:"event,omitempty"`
+	Pipeline       string `json:"pipeline"`
 	// Trusted is deliberately never accepted from client JSON: direct API
 	// submissions are untrusted. Only forge webhook handlers and internal
 	// reruns (which copy the previous run's trust) set it in Go code.

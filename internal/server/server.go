@@ -945,6 +945,10 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 		for _, key := range []string{"github_delivery", "gitlab_delivery", "forgejo_delivery"} {
 			if delivery := strings.TrimSpace(run.Metadata[key]); delivery != "" {
 				s.deliveries[delivery] = id
+				forge := strings.TrimSuffix(key, "_delivery")
+				if digest := strings.TrimSpace(run.Metadata[webhookDeliveryDigestKey(forge)]); digest != "" {
+					s.deliveries[webhookBodyKey(forge, repoIDForRun(run), digest)] = id
+				}
 			}
 		}
 	}
@@ -1672,9 +1676,15 @@ func (s *Server) enqueueID(ctx context.Context, in SubmitRun, preRunID string) (
 			needs = append(needs, jobIDs[dep])
 		}
 		env := cj.Job.Environment.Name
+		// `infra_retries: 0` is an explicit "never requeue after a lost
+		// runner"; an ABSENT value inherits 2. The cap is re-applied
+		// defensively for persisted/programmatic policies.
 		infraRetries := cj.Job.InfraRetries
-		if infraRetries <= 0 {
+		if !cj.Job.InfraRetriesSet && infraRetries == 0 {
 			infraRetries = 2
+		}
+		if infraRetries > pipeline.MaxInfraRetries {
+			infraRetries = pipeline.MaxInfraRetries
 		}
 		effectiveNetwork := cj.Job.Network
 		if effectiveNetwork == "" {
@@ -1779,11 +1789,30 @@ func (s *Server) enqueueID(ctx context.Context, in SubmitRun, preRunID string) (
 	// submission for the same delivery returns the original run instead of
 	// enqueueing a duplicate. Checked under the run lock to close the race
 	// between the handler fast path and concurrent deliveries.
-	if delivery, ok := webhookDelivery(in.Metadata); ok {
-		if existing, ok := s.deliveries[delivery]; ok {
+	if forge, _, fok := webhookDeliveryForge(in.Metadata); fok && in.deliveryDigest != "" {
+		if existing, ok := s.deliveries[webhookBodyKey(forge, policyID, in.deliveryDigest)]; ok {
 			if prior, ok := s.runs[existing]; ok && repoIDForRun(prior) == policyID {
 				s.mu.Unlock()
 				return prior, nil
+			}
+		}
+	}
+	if delivery, ok := webhookDelivery(in.Metadata); ok {
+		if existing, ok := s.deliveries[delivery]; ok {
+			if prior, ok := s.runs[existing]; ok {
+				// The replay identity includes the AUTHENTICATED body
+				// digest: the same delivery header with different content is
+				// a conflict, never a silent dedupe.
+				if forge, _, fok := webhookDeliveryForge(in.Metadata); fok {
+					if stored := strings.TrimSpace(prior.Metadata[webhookDeliveryDigestKey(forge)]); stored != "" && in.deliveryDigest != "" && stored != in.deliveryDigest {
+						s.mu.Unlock()
+						return model.Run{}, errDeliveryDigestMismatch
+					}
+				}
+				if repoIDForRun(prior) == policyID {
+					s.mu.Unlock()
+					return prior, nil
+				}
 			}
 		}
 	}
@@ -1888,6 +1917,13 @@ func (s *Server) enqueueID(ctx context.Context, in SubmitRun, preRunID string) (
 			if _, exists := s.deliveries[delivery]; !exists {
 				s.deliveries[delivery] = runID
 			}
+			if in.deliveryDigest != "" {
+				forge := strings.TrimSuffix(key, "_delivery")
+				bodyKey := webhookBodyKey(forge, policyID, in.deliveryDigest)
+				if _, exists := s.deliveries[bodyKey]; !exists {
+					s.deliveries[bodyKey] = runID
+				}
+			}
 		}
 	}
 	s.mu.Unlock()
@@ -1968,7 +2004,10 @@ func (s *Server) enqueueDB(ctx context.Context, in SubmitRun, run model.Run, cre
 		req.DownstreamLaunch = in.DownstreamLaunch
 	}
 	if forge, delivery, ok := webhookDeliveryForge(in.Metadata); ok {
-		req.WebhookClaim = &storage.WebhookClaim{Forge: forge, DeliveryID: delivery, RunID: run.ID}
+		req.WebhookClaim = &storage.WebhookClaim{Forge: forge, DeliveryID: delivery, PayloadDigest: in.deliveryDigest, RunID: run.ID}
+		if in.deliveryDigest != "" {
+			req.BodyClaim = &storage.WebhookClaim{Forge: forge + "-body", DeliveryID: in.deliveryDigest, PayloadDigest: in.deliveryDigest, RunID: run.ID}
+		}
 	}
 	req.Quota = &storage.QuotaReservation{
 		RepoKey:         repoIDForRun(run),
@@ -2011,8 +2050,24 @@ func (s *Server) enqueueDB(ctx context.Context, in SubmitRun, run model.Run, cre
 		if existingID, found, ferr := s.DB.FindDelivery(ctx, req.WebhookClaim.Forge, req.WebhookClaim.DeliveryID); ferr != nil {
 			return model.Run{}, fmt.Errorf("lookup delivery: %w", ferr)
 		} else if found {
-			if prior, gerr := s.DB.GetRun(ctx, existingID); gerr == nil && repoIDForRun(prior) == repoIDForRun(run) {
-				return prior, nil
+			if prior, gerr := s.DB.GetRun(ctx, existingID); gerr == nil {
+				if stored := strings.TrimSpace(prior.Metadata[webhookDeliveryDigestKey(req.WebhookClaim.Forge)]); stored != "" && in.deliveryDigest != "" && stored != in.deliveryDigest {
+					return model.Run{}, errDeliveryDigestMismatch
+				}
+				if repoIDForRun(prior) == repoIDForRun(run) {
+					return prior, nil
+				}
+			}
+		} else if in.deliveryDigest != "" {
+			// The conflict came from the BODY claim: the same authenticated
+			// body arrived under a different delivery header, so return the
+			// original run.
+			if bodyID, found, ferr := s.DB.FindDelivery(ctx, req.WebhookClaim.Forge+"-body", in.deliveryDigest); ferr != nil {
+				return model.Run{}, fmt.Errorf("lookup body receipt: %w", ferr)
+			} else if found {
+				if prior, gerr := s.DB.GetRun(ctx, bodyID); gerr == nil && repoIDForRun(prior) == repoIDForRun(run) {
+					return prior, nil
+				}
 			}
 		}
 		return model.Run{}, err

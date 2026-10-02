@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
@@ -73,7 +74,7 @@ func tartRunHelp(ctx context.Context, tart string) string {
 	defer cancel()
 	cmd := exec.CommandContext(hctx, tart, "run", "--help")
 	cmd.WaitDelay = boundedToolWaitDelay
-	out, _ := cmd.CombinedOutput()
+	out, _, _ := executil.CaptureBounded(cmd, 64<<10)
 	return string(out)
 }
 
@@ -91,8 +92,8 @@ func tartIPProbe(ctx context.Context, deadline time.Time, tart, clone string) st
 	// Bound the output-pipe drain after a kill, so an orphaned descendant
 	// cannot extend a probe past its ceiling.
 	cmd.WaitDelay = boundedToolWaitDelay
-	out, err := cmd.Output()
-	if err != nil {
+	out, truncated, err := executil.CaptureBounded(cmd, 64<<10)
+	if err != nil || truncated {
 		return ""
 	}
 	return strings.TrimSpace(string(out))

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/forge"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
@@ -114,6 +115,29 @@ func (s *Server) gitlabWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Replay fast path BEFORE any forge API work (see githubWebhook): the
+	// delivery ID plus the authenticated body digest identify an
+	// already-created run, so a replay performs no pipeline/changed-files
+	// fetch and no trigger evaluation.
+	repoID := s.forgeRepoID("gitlab", webhookRepoCoordinate(ec))
+	delivery := strings.TrimSpace(r.Header.Get("X-GitLab-Event-UUID"))
+	if delivery == "" {
+		http.Error(w, "missing X-GitLab-Event-UUID", http.StatusBadRequest)
+		return
+	}
+	digest := webhookPayloadDigest(body)
+	if prior, ok, derr := s.webhookDeliveryRun(r.Context(), "gitlab", delivery, digest, repoID); derr != nil {
+		if errors.Is(derr, errDeliveryDigestMismatch) {
+			http.Error(w, "delivery id was already used with different content", http.StatusConflict)
+			return
+		}
+		s.internalError(w, r, derr, "")
+		return
+	} else if ok {
+		writeJSON(w, http.StatusOK, prior)
+		return
+	}
+
 	pipelineSHA := ec.HeadSHA
 	if !ec.Trusted {
 		pipelineSHA = ec.BaseSHA
@@ -141,14 +165,6 @@ func (s *Server) gitlabWebhook(w http.ResponseWriter, r *http.Request) {
 
 	files := ec.ChangedFiles.Files
 
-	repoID := s.forgeRepoID("gitlab", webhookRepoCoordinate(ec))
-	delivery := r.Header.Get("X-GitLab-Event-UUID")
-	if delivery != "" {
-		if run, ok := s.dedupeRun(delivery, repoID); ok {
-			writeJSON(w, http.StatusOK, run)
-			return
-		}
-	}
 	checkout := checkoutCloneURL(ec)
 	in := SubmitRun{
 		RepoID:            repoID,
@@ -163,11 +179,16 @@ func (s *Server) gitlabWebhook(w http.ResponseWriter, r *http.Request) {
 		Trusted:           ec.Trusted,
 		ChangedFiles:      files,
 		ChangedFilesKnown: filesKnown,
-		Metadata:          map[string]string{"gitlab_delivery": delivery},
+		Metadata:          map[string]string{"gitlab_delivery": delivery, webhookDeliveryDigestKey("gitlab"): digest},
+		deliveryDigest:    digest,
 		identityBound:     true,
 	}
 	run, err := s.enqueue(r.Context(), in)
 	if err != nil {
+		if errors.Is(err, errDeliveryDigestMismatch) {
+			http.Error(w, "delivery id was already used with different content", http.StatusConflict)
+			return
+		}
 		// A durability failure is not a client error: answer 503 so the
 		// forge retries the delivery instead of treating it as rejected.
 		var nd *stateNotDurableError
@@ -178,7 +199,7 @@ func (s *Server) gitlabWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	s.recordDelivery(delivery, run.ID)
+	s.recordWebhookDelivery(r.Context(), "gitlab", repoID, delivery, digest, run.ID)
 	writeJSON(w, http.StatusAccepted, run)
 }
 
@@ -228,6 +249,29 @@ func (s *Server) forgejoWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Replay fast path BEFORE any forge API work (see githubWebhook): the
+	// delivery ID plus the authenticated body digest identify an
+	// already-created run, so a replay performs no pipeline/changed-files
+	// fetch and no trigger evaluation.
+	repoID := s.forgeRepoID("forgejo", webhookRepoCoordinate(ec))
+	delivery := strings.TrimSpace(r.Header.Get("X-Forgejo-Delivery"))
+	if delivery == "" {
+		http.Error(w, "missing X-Forgejo-Delivery", http.StatusBadRequest)
+		return
+	}
+	digest := webhookPayloadDigest(body)
+	if prior, ok, derr := s.webhookDeliveryRun(r.Context(), "forgejo", delivery, digest, repoID); derr != nil {
+		if errors.Is(derr, errDeliveryDigestMismatch) {
+			http.Error(w, "delivery id was already used with different content", http.StatusConflict)
+			return
+		}
+		s.internalError(w, r, derr, "")
+		return
+	} else if ok {
+		writeJSON(w, http.StatusOK, prior)
+		return
+	}
+
 	pipelineSHA := ec.HeadSHA
 	if !ec.Trusted {
 		pipelineSHA = ec.BaseSHA
@@ -255,14 +299,6 @@ func (s *Server) forgejoWebhook(w http.ResponseWriter, r *http.Request) {
 
 	files := ec.ChangedFiles.Files
 
-	repoID := s.forgeRepoID("forgejo", webhookRepoCoordinate(ec))
-	delivery := r.Header.Get("X-Forgejo-Delivery")
-	if delivery != "" {
-		if run, ok := s.dedupeRun(delivery, repoID); ok {
-			writeJSON(w, http.StatusOK, run)
-			return
-		}
-	}
 	checkout := checkoutCloneURL(ec)
 	in := SubmitRun{
 		RepoID:            repoID,
@@ -277,11 +313,16 @@ func (s *Server) forgejoWebhook(w http.ResponseWriter, r *http.Request) {
 		Trusted:           ec.Trusted,
 		ChangedFiles:      files,
 		ChangedFilesKnown: filesKnown,
-		Metadata:          map[string]string{"forgejo_delivery": delivery},
+		Metadata:          map[string]string{"forgejo_delivery": delivery, webhookDeliveryDigestKey("forgejo"): digest},
+		deliveryDigest:    digest,
 		identityBound:     true,
 	}
 	run, err := s.enqueue(r.Context(), in)
 	if err != nil {
+		if errors.Is(err, errDeliveryDigestMismatch) {
+			http.Error(w, "delivery id was already used with different content", http.StatusConflict)
+			return
+		}
 		var nd *stateNotDurableError
 		if errors.As(err, &nd) {
 			s.serverError(w, r, http.StatusServiceUnavailable, nd, "state not durable")
@@ -290,6 +331,6 @@ func (s *Server) forgejoWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	s.recordDelivery(delivery, run.ID)
+	s.recordWebhookDelivery(r.Context(), "gitlab", repoID, delivery, digest, run.ID)
 	writeJSON(w, http.StatusAccepted, run)
 }

@@ -23,7 +23,18 @@ const (
 	maxPipelineBytes = 2 << 20 // 2 MiB source limit
 	maxScalarBytes   = 1 << 20 // 1 MiB per scalar
 	maxYAMLDepth     = 100
-	maxYAMLNodes     = 1_000_000
+	// maxYAMLNodes bounds the POST-DECODE node tree. It is far above what the
+	// semantic limits can legitimately produce inside 2 MiB (every step needs
+	// tens of bytes), and the pre-decode structural budget below rejects
+	// pathological compact documents before yaml.v3 builds that tree.
+	maxYAMLNodes = 100_000
+	// maxYAMLStructuralTokens bounds the PRE-decode complexity: every YAML
+	// node requires at least one structural indicator ('-', ':', '[', '{',
+	// ',') outside quotes/comments, so a document with more indicators than
+	// this cannot become a small node tree. Counting indicators is O(bytes)
+	// and happens BEFORE yaml.v3 allocates anything, closing the
+	// input-byte-cap != parser-memory-cap gap.
+	maxYAMLStructuralTokens = 100_000
 )
 
 // allowedYAMLTags are the only tags permitted in pipeline documents. Custom
@@ -43,18 +54,18 @@ func parseYAML(data []byte, out any) error {
 		line, col := lineCol(data, off)
 		return fmt.Errorf("yaml: invalid UTF-8 at byte %d (line %d, column %d)", off, line, col)
 	}
-	dec := yaml.NewDecoder(bytes.NewReader(data))
-	var doc yaml.Node
-	if err := dec.Decode(&doc); err != nil {
+	// PRE-DECODE complexity budget: reject a document whose structural
+	// indicator count already exceeds what the node-tree cap could ever
+	// allow, so a pathological 2 MiB flow document is refused before
+	// yaml.v3 allocates its object graph.
+	if err := yamlPreflight(data); err != nil {
+		return err
+	}
+	doc, err := yamlDecodeDocument(data)
+	if err != nil {
 		if err == io.EOF {
 			return fmt.Errorf("empty pipeline")
 		}
-		return yamlError(err)
-	}
-	var extra yaml.Node
-	if err := dec.Decode(&extra); err == nil {
-		return fmt.Errorf("yaml: line %d: multiple documents are not allowed", extra.Line)
-	} else if err != io.EOF {
 		return yamlError(err)
 	}
 	if doc.Kind == 0 || (doc.Kind == yaml.DocumentNode && len(doc.Content) == 0) {
@@ -80,6 +91,87 @@ func parseYAML(data []byte, out any) error {
 	return nil
 }
 
+// yamlPreflight is the pre-decode structural-complexity seam: tests replace
+// it to prove a rejection happens before yaml.v3 is invoked.
+var yamlPreflight = preflightYAMLStructure
+
+// yamlDecodeDocument decodes the single document (and rejects a second one)
+// through yaml.v3. It is a seam so tests can assert the preflight rejected a
+// pathological document WITHOUT the decoder being called.
+var yamlDecodeDocument = func(data []byte) (yaml.Node, error) {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	var doc yaml.Node
+	if err := dec.Decode(&doc); err != nil {
+		return yaml.Node{}, err
+	}
+	var extra yaml.Node
+	if err := dec.Decode(&extra); err == nil {
+		return yaml.Node{}, fmt.Errorf("yaml: line %d: multiple documents are not allowed", extra.Line)
+	} else if err != io.EOF {
+		return yaml.Node{}, err
+	}
+	return doc, nil
+}
+
+// preflightYAMLStructure counts structural indicators in O(bytes) BEFORE any
+// node tree is allocated. Every YAML node needs at least one indicator
+// ('-', ':', '[', '{', ',') outside scalars and comments, so a document with
+// more indicators than maxYAMLStructuralTokens cannot decode into a tree
+// within the node budget: rejecting it here bounds the PEAK parser
+// allocation instead of only the post-decode node count.
+func preflightYAMLStructure(data []byte) error {
+	structural := 0
+	inSingle, inDouble, escaped, inComment := false, false, false, false
+	for i := 0; i < len(data); i++ {
+		c := data[i]
+		if inComment {
+			if c == '\n' {
+				inComment = false
+			}
+			continue
+		}
+		if inSingle {
+			if c == '\'' {
+				if i+1 < len(data) && data[i+1] == '\'' {
+					i++
+				} else {
+					inSingle = false
+				}
+			}
+			continue
+		}
+		if inDouble {
+			if escaped {
+				escaped = false
+				continue
+			}
+			switch c {
+			case '\\':
+				escaped = true
+			case '"':
+				inDouble = false
+			}
+			continue
+		}
+		switch c {
+		case '#':
+			if i == 0 || data[i-1] == ' ' || data[i-1] == '\t' || data[i-1] == '\n' {
+				inComment = true
+			}
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case '-', ':', '[', ']', '{', '}', ',':
+			structural++
+			if structural > maxYAMLStructuralTokens {
+				line, col := lineCol(data, i)
+				return fmt.Errorf("yaml: line %d, column %d: document exceeds the %d structural-token complexity budget", line, col, maxYAMLStructuralTokens)
+			}
+		}
+	}
+	return nil
+}
 func yamlError(err error) error {
 	if err == nil {
 		return nil

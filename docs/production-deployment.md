@@ -464,6 +464,20 @@ In **DB mode the database clock is the authority for a lease's lifetime**:
   `ClockStore.Now`, skipping the tick rather than using the leader's wall
   clock. A skewed replica can neither extend a credential or claim, steal a
   live claim, nor fire or postpone a due schedule.
+- **Pipeline-controlled child output is captured under a hard bound.** Service
+  healthchecks retain a 64 KiB diagnostic prefix and drain (discarding) the
+  rest, and every executor/git/prewarm capture is bounded, so a hostile
+  healthcheck cannot grow the runner heap or block on a full pipe.
+- **Retry budgets are capped and zero is explicit.** Step retries cap at 20,
+  service healthcheck retries at 100 and infrastructure retries at 20,
+  enforced at admission and clamped in the executor/recovery; explicit
+  `0` values mean zero retries / one healthcheck attempt / never requeue
+  rather than inheriting the defaults.
+- **Webhook replays are suppressed before any forge work and bound to the
+  signed body.** The delivery + authenticated-body-digest fast path runs
+  before pipeline/diff fetches, the body receipt suppresses the same signed
+  payload under a fresh delivery header, a reused delivery ID with different
+  content is a 409, and the delivery header is required.
 - **Heartbeats touch only `last_seen`.** The runner liveness refresh is a
   narrow `RunnerHeartbeatStore.TouchRunnerLastSeen`
   (`UPDATE runners SET last_seen=clock_timestamp()`), never a whole-row

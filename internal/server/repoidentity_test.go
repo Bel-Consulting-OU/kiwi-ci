@@ -503,9 +503,10 @@ func postGitLabWebhook(t *testing.T, s *Server, secret, delivery, body string) *
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Gitlab-Event", "Push Hook")
 	req.Header.Set("X-Gitlab-Token", secret)
-	if delivery != "" {
-		req.Header.Set("X-Gitlab-Event-UUID", delivery)
+	if delivery == "" {
+		delivery = nextTestDelivery()
 	}
+	req.Header.Set("X-Gitlab-Event-UUID", delivery)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
 	return w

@@ -644,3 +644,42 @@ claims themselves.
   nothing), and `FinishDeploymentOnce` commits the finish marker and
   `deployment.completed` together exactly once across concurrent replicas and
   retries.
+- Pipeline-controlled child output can no longer bypass the runner's resource
+  budgets: service healthchecks are captured through a bounded drain
+  (`executil.CaptureBounded`, 64 KiB retained, the rest discarded while the
+  pipe keeps draining) with the error reporting `[output truncated]`; the
+  executor's docker/tart helpers, repository-controlled git clone/checkout,
+  prewarm pulls and the workspace `git status` probe all use the same bounded
+  capture, so a hostile or wedged child cannot OOM the host or block on a
+  full pipe.
+- Retry policies now have finite central caps (`MaxStepRetries=20`,
+  `MaxServiceRetries=100`, `MaxInfraRetries=20`) enforced at admission
+  (defaults/job/step/service, including `math.MaxInt`, which previously
+  wrapped the attempt arithmetic) and clamped again in the executor and in
+  storage recovery for persisted legacy payloads. `retry.max: 0`,
+  `services[].retries: 0` and `infra_retries: 0` are now EXPLICIT zero
+  budgets (no retries / one healthcheck attempt / never requeue) instead of
+  silently inheriting the defaults; presence is recorded at YAML parse time
+  and included in the compiled-hash canonical form.
+- An XFS project-ID assignment failure is treated as an AMBIGUOUS side
+  effect: Kiwi removes the ID-named assignment first and releases the ID only
+  when cleanup proves the removal, otherwise the ID stays allocated
+  (quarantined). A workspace can therefore never share a project ID with a
+  workspace that still carries it.
+- Webhook replay handling is now both earlier and authenticated: the delivery
+  fast path runs immediately after signature verification and event parsing,
+  BEFORE any pipeline/changed-files fetch or trigger evaluation, and the
+  SHA-256 of the authenticated body is stored as a body receipt so the same
+  signed payload delivered under a fresh delivery header maps to the original
+  run. A reused delivery ID with different content fails with 409, and the
+  delivery header is mandatory for GitHub/GitLab/Forgejo webhooks. DB mode
+  persists the body receipt transactionally with the enqueue.
+- Pipeline YAML is rejected by an O(bytes) structural pre-decode budget
+  (100k structural indicators) before yaml.v3 allocates its node tree, and
+  the post-decode node cap is lowered to 100k, closing the
+  input-byte-cap-vs-parser-memory gap for pathological compact documents.
+- `generate.max_jobs`/`generate.max_depth` are enforced: the effective
+  fragment ceiling is the global cap tightened by the parent's declared
+  envelope, read from the persisted compiled parent job (and re-checked
+  against the locked parent row), so a `max_jobs: 1` parent cannot be handed
+  128 children.

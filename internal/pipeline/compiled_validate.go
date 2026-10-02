@@ -106,6 +106,9 @@ func ValidateCompiledJob(cj CompiledJob) error {
 	if j.InfraRetries < 0 {
 		return fmt.Errorf("%s has negative infra_retries", where)
 	}
+	if j.InfraRetries > MaxInfraRetries {
+		return fmt.Errorf("%s infra_retries %d exceeds the %d limit", where, j.InfraRetries, MaxInfraRetries)
+	}
 	if j.Environment.Name != "" && !envNameRegexp.MatchString(j.Environment.Name) {
 		return fmt.Errorf("%s has invalid environment name %q", where, j.Environment.Name)
 	}
@@ -176,6 +179,9 @@ func ValidateCompiledJob(cj CompiledJob) error {
 		}
 		if svc.Retries < 0 {
 			return fmt.Errorf("%s service %q has negative retries", where, svc.Name)
+		}
+		if svc.Retries > MaxServiceRetries {
+			return fmt.Errorf("%s service %q retries %d exceeds the %d limit", where, svc.Name, svc.Retries, MaxServiceRetries)
 		}
 		for k, v := range svc.Env {
 			if len(v) > maxEnvValueBytes {
