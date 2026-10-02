@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runnerpki"
 )
 
@@ -92,6 +94,16 @@ func (s IdentityStore) Load() (Identity, bool) {
 	} else {
 		missing++
 	}
+	if missing == 0 {
+		// Cryptographically verify the persisted material as ONE identity: a
+		// crash during a cert rotation can leave a NEW cert with the OLD key
+		// (all four files present), which would otherwise be reported complete
+		// and fail later at TLS setup. A mismatched pair is INCOMPLETE, so the
+		// runner re-enrolls instead of bricking.
+		if err := verifyIdentityKeyPair(id.CertPEM, id.KeyPEM); err != nil {
+			return id, false
+		}
+	}
 	return id, missing == 0 && id.ID != ""
 }
 
@@ -103,19 +115,25 @@ func (s IdentityStore) Save(id Identity) error {
 	if id.ID == "" || len(id.KeyPEM) == 0 || len(id.CertPEM) == 0 {
 		return fmt.Errorf("refusing to persist incomplete runner identity")
 	}
-	if err := os.MkdirAll(s.Dir, identityDirMode); err != nil {
+	if err := secureIdentityDir(s.Dir); err != nil {
 		return err
 	}
-	if err := os.WriteFile(s.path(identityIDFile), []byte(id.ID+"\n"), 0o644); err != nil {
+	// Publication order and atomicity matter across a crash: the PRIVATE KEY
+	// is written first (0600, atomic), then the certificate, CA and ID. A
+	// crash between any two leaves a store whose four files may disagree; the
+	// pair verification in Load() then reports it incomplete and the runner
+	// re-enrolls. Each individual write is temp+fsync+rename, so no file can
+	// be observed torn.
+	if err := writeOwnerOnly(s.path(identityKeyFile), id.KeyPEM); err != nil {
 		return err
 	}
-	if err := os.WriteFile(s.path(identityCertFile), id.CertPEM, 0o644); err != nil {
+	if err := fsutil.AtomicWriteFile(s.path(identityCertFile), id.CertPEM, 0o644); err != nil {
 		return err
 	}
-	if err := os.WriteFile(s.path(identityCAFile), id.CACertPEM, 0o644); err != nil {
+	if err := fsutil.AtomicWriteFile(s.path(identityCAFile), id.CACertPEM, 0o644); err != nil {
 		return err
 	}
-	return writeOwnerOnly(s.path(identityKeyFile), id.KeyPEM)
+	return fsutil.AtomicWriteFile(s.path(identityIDFile), []byte(id.ID+"\n"), 0o644)
 }
 
 // ClearCert removes the persisted certificate but keeps the runner ID (and
@@ -129,13 +147,19 @@ func (s IdentityStore) ClearCert() error {
 	return err
 }
 
-// writeOwnerOnly writes secret material with owner-only access semantics:
-// mode 0600 on Unix, where the file mode is the access-control mechanism.
-// On Windows the surrounding identity directory (created 0700) carries the
-// owner-only ACL, mirroring the executor keyfile approach. The executor's
-// WriteOwnerOnly is deliberately not reused: its Windows implementation
-// writes into a per-call temporary directory instead of the requested
-// path, which would break identity persistence.
+// verifyIdentityKeyPair checks that the persisted certificate and key form a
+// pair; it is a seam so identity-store unit tests can use placeholder PEMs
+// while production always performs the real X.509 check.
+var verifyIdentityKeyPair = func(certPEM, keyPEM []byte) error {
+	_, err := tls.X509KeyPair(certPEM, keyPEM)
+	return err
+}
+
+// writeOwnerOnly writes secret material atomically with owner-only access
+// semantics: mode 0600 on Unix, where the file mode is the access-control
+// mechanism. On Windows the surrounding identity directory carries a
+// PROTECTED owner-only DACL installed by secureIdentityDir (numeric modes do
+// not encode Windows access control).
 func writeOwnerOnly(path string, data []byte) error {
-	return os.WriteFile(path, data, 0o600)
+	return fsutil.AtomicWriteFile(path, data, 0o600)
 }

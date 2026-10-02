@@ -2270,8 +2270,8 @@ func (m *memStore) RunnerSlotTotals(ctx context.Context) (RunnerSlotTotals, erro
 	for _, r := range m.runners {
 		out.Runners++
 		c := r.Capacity
-		if c < 1 {
-			c = 1
+		if c < 0 {
+			c = 0
 		}
 		out.Capacity += c
 		out.Busy += len(r.ActiveJobs)

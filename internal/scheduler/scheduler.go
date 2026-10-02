@@ -866,27 +866,23 @@ func QueueDeadlineFor(j model.Job) *time.Time {
 // Scheduling fairness: a static priority order starves low-priority work
 // forever when a continuous stream of fresh high-priority jobs is available,
 // because age only breaks ties WITHIN a priority class. Waiting time now buys
-// bounded priority: every eligible job becomes competitive with the highest
-// dependency class after at most schedulerAgingInterval *
-// schedulerMaxAgingBoost of waiting, and equal classes are ordered oldest
-// first. Downstream-depth priority is preserved as the primary signal.
-const (
-	schedulerAgingInterval = 10 * time.Minute
-	schedulerMaxAgingBoost = 8
-)
+// UNBOUNDED priority (one point per schedulerAgingInterval): static priority
+// is downstream graph depth, which has no small maximum, so any fixed boost
+// cap smaller than a valid priority difference would still admit starvation.
+// With an uncapped boost every eligible job eventually outranks any finite
+// static priority, and equal effective priorities are ordered oldest first.
+// Downstream-depth priority is preserved as the primary signal for the
+// common case.
+const schedulerAgingInterval = 10 * time.Minute
 
-// agedPriority is a job's scheduling priority including the bounded wait-time
-// boost.
+// agedPriority is a job's scheduling priority including the unbounded
+// wait-time boost.
 func agedPriority(j model.Job, now time.Time) int {
 	wait := now.Sub(j.CreatedAt)
 	if wait <= 0 {
 		return j.Priority
 	}
-	boost := int(wait / schedulerAgingInterval)
-	if boost > schedulerMaxAgingBoost {
-		boost = schedulerMaxAgingBoost
-	}
-	return j.Priority + boost
+	return j.Priority + int(wait/schedulerAgingInterval)
 }
 
 // orderQueuedJobs orders lease candidates by aged priority (descending) then

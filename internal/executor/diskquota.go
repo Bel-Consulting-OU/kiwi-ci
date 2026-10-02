@@ -264,12 +264,10 @@ type projectIDPool struct {
 	released uint64
 	// known holds project IDs discovered in the FILESYSTEM but not allocated
 	// by this process. They stay out of the allocatable range so a restarted
-	// runner cannot hand out an ID a previous process left assigned (the
-	// kernel/filesystem outlives the Go allocator).
+	// (or concurrent) runner cannot hand out an ID another process left
+	// assigned (the kernel/filesystem outlives the Go allocator). Every
+	// allocation re-reports under the host-global lock, so this is a cache.
 	known map[uint32]bool
-	// discovered is set once the filesystem has been queried for existing
-	// project IDs.
-	discovered bool
 }
 
 func newProjectIDPool(base, size uint32) *projectIDPool {
@@ -319,14 +317,6 @@ func (p *projectIDPool) reserveKnown(ids []uint32) {
 			p.known[id] = true
 		}
 	}
-}
-
-// markDiscovered records that the filesystem was queried (even when the
-// report was empty) so discovery runs at most once per pool.
-func (p *projectIDPool) markDiscovered() {
-	p.mu.Lock()
-	p.discovered = true
-	p.mu.Unlock()
 }
 
 // release returns an ID to the pool. Releasing an ID that is not live is a
@@ -455,26 +445,19 @@ func runXFSQuotaCommand(xq, mountPoint, command string) error {
 	return nil
 }
 
-// discoverXFSProjectIDs queries the filesystem for project IDs that already
-// exist (assigned or with quota state) and reserves them in the pool, so a
-// restarted runner cannot allocate an ID a previous process left behind:
-// the XFS assignment and quota outlive the Go allocator. It runs at most once
-// per filesystem and FAILS CLOSED on a report error (an unknown ID space
-// cannot guarantee uniqueness).
-func discoverXFSProjectIDs(xq, mountPoint, fsKey string) error {
-	pool := projectIDPoolFor(fsKey)
-	pool.mu.Lock()
-	already := pool.discovered
-	pool.mu.Unlock()
-	if already {
-		return nil
-	}
+// refreshXFSProjectIDs queries the filesystem for project IDs that already
+// exist (assigned or with quota state) and reserves them in the pool. It is
+// called on EVERY allocation while the inter-process allocation lock is held
+// and FAILS CLOSED on a report error (an unknown ID space cannot guarantee
+// uniqueness). The per-process pool cache is an optimization only; the
+// filesystem is the source of truth because another runner process may have
+// published an assignment since the last report.
+func refreshXFSProjectIDs(xq, mountPoint, fsKey string) error {
 	out, err := boundedToolCommand(context.Background(), xfsQuotaTimeout, xq, "-x", "-c", "report -p -n", mountPoint)
 	if err != nil {
 		return fmt.Errorf("report existing XFS project ids: %w", err)
 	}
-	pool.reserveKnown(parseXFSProjectIDs(out))
-	pool.markDiscovered()
+	projectIDPoolFor(fsKey).reserveKnown(parseXFSProjectIDs(out))
 	return nil
 }
 
@@ -508,9 +491,17 @@ func parseXFSProjectIDs(out []byte) []uint32 {
 // half-applied state is removed and the ID released (best effort).
 func setupXFSProjectQuotaOnMount(workspace string, entry mountInfoEntry, limit int64, xq string) (DiskQuotaStatus, func() error) {
 	fsKey := entry.fsKey()
-	// Restart safety: reserve every project ID the filesystem already has
-	// before handing out a new one.
-	if err := discoverXFSProjectIDs(xq, entry.mountPoint, fsKey); err != nil {
+	// Multi-process safety: the whole acquire sequence — report existing IDs,
+	// choose a candidate, assign the workspace and apply the hard limit — runs
+	// under a host-global per-filesystem lock, and the report is re-read on
+	// every allocation so an assignment published by ANOTHER runner process
+	// (or a previous incarnation) is respected.
+	unlock, lerr := lockXFSAllocation(fsKey)
+	if lerr != nil {
+		return DiskQuotaStatus{Detail: "lock XFS project allocator: " + lerr.Error()}, nil
+	}
+	defer unlock()
+	if err := refreshXFSProjectIDs(xq, entry.mountPoint, fsKey); err != nil {
 		return DiskQuotaStatus{Detail: "enumerate existing XFS project ids: " + err.Error()}, nil
 	}
 	projID, err := allocateXFSProjectID(fsKey)

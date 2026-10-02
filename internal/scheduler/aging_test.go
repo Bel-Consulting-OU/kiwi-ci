@@ -44,8 +44,16 @@ func TestOrderQueuedJobsAgingPreventsStarvation(t *testing.T) {
 		t.Fatalf("tie-break not oldest-first: %s", older[0].ID)
 	}
 
-	// The boost is bounded: a very old job cannot exceed the cap.
-	if got := agedPriority(model.Job{Priority: 0, CreatedAt: now.Add(-100 * time.Hour)}, now); got != schedulerMaxAgingBoost {
-		t.Fatalf("aged priority = %d, want the %d cap", got, schedulerMaxAgingBoost)
+	// The boost is UNCAPPED so it can cross any finite static-priority gap
+	// (downstream depth has no small maximum): a job old enough beats even a
+	// priority-100 fresh stream.
+	deep := model.Job{ID: "very-old", Priority: 0, CreatedAt: now.Add(-100 * time.Hour)}
+	queued = []model.Job{deep}
+	for i := 0; i < 5; i++ {
+		queued = append(queued, model.Job{ID: "fresh-deep", Priority: 100, CreatedAt: now})
+	}
+	orderQueuedJobs(queued, now)
+	if queued[0].ID != "very-old" {
+		t.Fatalf("uncapped aging failed against priority-100 work: first = %s", queued[0].ID)
 	}
 }

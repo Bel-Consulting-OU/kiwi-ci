@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestWorkspaceDiskQuotaSetupRoutesThroughProbe proves the exported entry
@@ -371,4 +372,77 @@ func TestXFSRestartCannotReuseExistingAssignment(t *testing.T) {
 	if !strings.Contains(second.Detail, "allocate XFS project id") || !strings.Contains(second.Detail, "exhausted") {
 		t.Fatalf("process B detail = %q, want allocation exhaustion (no reuse)", second.Detail)
 	}
+}
+
+// TestXFSAllocationSerializedAcrossProcesses proves the acquire sequence is
+// serialized by the host-global lock: while another holder owns the
+// filesystem lock, a second acquisition blocks instead of racing the report
+// and choosing the same ID. flock is per open file description, so a second
+// acquisition in this process behaves like a second process.
+func TestXFSAllocationSerializedAcrossProcesses(t *testing.T) {
+	resetProjectIDPools(t)
+	t.Setenv(xfsProjectIDBaseEnv, "100000")
+	t.Setenv(xfsProjectIDCountEnv, "1")
+	t.Setenv("KIWI_XFS_LOCK_DIR", t.TempDir())
+	t.Setenv("FAKE_XFS_REPORT", "")
+	script := writeXFSDiscoveryScript(t)
+	entry := mountInfoEntry{mountPoint: "/mnt/xfs", device: "8:50", fsType: "xfs"}
+
+	holder, err := lockXFSAllocation(entry.fsKey())
+	if err != nil {
+		t.Fatalf("hold lock: %v", err)
+	}
+	done := make(chan DiskQuotaStatus, 1)
+	go func() {
+		status, cleanup := setupXFSProjectQuotaOnMount("/mnt/xfs/ws-A", entry, 1<<20, script)
+		if cleanup != nil {
+			_ = cleanup()
+		}
+		done <- status
+	}()
+	select {
+	case status := <-done:
+		t.Fatalf("second allocation completed while the filesystem lock was held: %+v", status)
+	case <-time.After(150 * time.Millisecond):
+	}
+	holder()
+	select {
+	case status := <-done:
+		if !status.Hard {
+			t.Fatalf("second allocation after release = %+v, want success", status)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("second allocation never completed after the lock was released")
+	}
+}
+
+// TestXFSExternalAssignmentAppearingAfterInitialDiscoveryIsRespected pins the
+// re-report rule: an assignment published by another process AFTER this
+// process's first discovery must be seen by the next allocation (the pool's
+// cached knowledge is not authoritative).
+func TestXFSExternalAssignmentAppearingAfterInitialDiscoveryIsRespected(t *testing.T) {
+	resetProjectIDPools(t)
+	t.Setenv(xfsProjectIDBaseEnv, "100000")
+	t.Setenv(xfsProjectIDCountEnv, "4")
+	t.Setenv("KIWI_XFS_LOCK_DIR", t.TempDir())
+	t.Setenv("FAKE_XFS_REPORT", "")
+	script := writeXFSDiscoveryScript(t)
+	entry := mountInfoEntry{mountPoint: "/mnt/xfs", device: "8:51", fsType: "xfs"}
+
+	first, cleanup := setupXFSProjectQuotaOnMount("/mnt/xfs/ws-A", entry, 1<<20, script)
+	if !first.Hard || cleanup == nil {
+		t.Fatalf("first setup = %+v", first)
+	}
+	// Another process publishes 100000 (the ID this process just allocated is
+	// irrelevant); the next report includes it plus a foreign 100002.
+	t.Setenv("FAKE_XFS_REPORT", "#100000\n#100002\n")
+	second, cleanup2 := setupXFSProjectQuotaOnMount("/mnt/xfs/ws-B", entry, 1<<20, script)
+	if !second.Hard || cleanup2 == nil {
+		t.Fatalf("second setup = %+v", second)
+	}
+	if !strings.Contains(second.Detail, "XFS project quota 100001") {
+		t.Fatalf("second allocation detail = %q, want 100001 (100000 is live, 100002 foreign)", second.Detail)
+	}
+	_ = cleanup()
+	_ = cleanup2()
 }

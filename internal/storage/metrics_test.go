@@ -121,7 +121,7 @@ func metricsAggregateWant() (map[model.Status]int, map[model.Status]int, map[str
 		"WAITING_APPROVAL":     1,
 		"WAITING_DEPENDENCY":   1,
 	}
-	slots := RunnerSlotTotals{Runners: 3, Capacity: 1 + 4 + 2, Busy: 3}
+	slots := RunnerSlotTotals{Runners: 3, Capacity: 0 + 4 + 2, Busy: 3}
 	return runs, jobs, reasons, slots
 }
 

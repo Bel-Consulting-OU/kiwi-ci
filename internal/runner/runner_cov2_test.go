@@ -271,6 +271,10 @@ func TestRunMetricsListenerAndCancellation(t *testing.T) {
 	}))
 	defer ts.Close()
 	addr := freeRunnerAddr(t)
+	// Crash reconciliation must not consult the host's real docker: an empty
+	// PATH makes LookPath fail, which the runner treats as "no Docker
+	// subsystem" (this test exercises metrics/registration, not runtimes).
+	t.Setenv("PATH", t.TempDir())
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &Runner{ID: "runner-1", Cfg: Config{Server: ts.URL, Name: "cov", MetricsListen: addr,
 		WorkDir: t.TempDir(), IdentityDir: t.TempDir(), Poll: 10 * time.Millisecond,

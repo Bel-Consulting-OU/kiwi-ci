@@ -283,44 +283,106 @@ func containerLabelsOwned(runID, jobID string, owner runtimeOwner) []string {
 // label and are never touched. Resources with no instance label (created by a
 // pre-instance Kiwi) are treated as previous-incarnation and reaped, because
 // one stable runner identity must not have two live processes.
-func ReconcileRuntime(ctx context.Context, root, runnerID, instanceID string) GCReport {
+// ReconcileRuntime returns an error when runtime absence CANNOT BE PROVEN or
+// when a stale resource cannot be removed: the caller (runner startup) must
+// refuse to lease new work rather than treat a discovery/removal failure as
+// "nothing stale". A docker binary that is not installed is treated as "this
+// host has no Docker subsystem" (nil error); a present-but-failing docker
+// (daemon down, timeout, truncated output) is a hard error. Removal failures
+// other than a positively reported absence are hard errors too.
+func ReconcileRuntime(ctx context.Context, root, runnerID, instanceID string) (GCReport, error) {
 	var rep GCReport
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if runnerID == "" {
-		return rep
+		return rep, nil
 	}
-	output := func(bin string, args ...string) []byte {
+	output := func(bin string, args ...string) ([]byte, error) {
 		qctx, cancel := context.WithTimeout(ctx, gcCommandTimeout)
 		defer cancel()
 		cmd := exec.CommandContext(qctx, bin, args...)
 		cmd.Dir = root
 		cmd.WaitDelay = boundedToolWaitDelay
 		out, truncated, err := executil.CaptureBounded(cmd, maxExternalCommandOutputBytes)
-		if err != nil || truncated {
-			return nil
+		if err != nil {
+			return nil, fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), err)
 		}
-		return out
+		if truncated {
+			return nil, fmt.Errorf("%s %s: output exceeded the discovery bound", bin, strings.Join(args, " "))
+		}
+		return out, nil
 	}
-	docker, err := exec.LookPath("docker")
-	if err != nil {
-		return rep
+	docker, lookErr := exec.LookPath("docker")
+	if lookErr != nil {
+		return rep, nil
 	}
 	filter := "label=kiwi.runner=" + runnerID
-	out := output(docker, "ps", "-a", "--filter", filter, "--format", `{{.ID}} {{.Label "kiwi.instance"}}`)
+	out, err := output(docker, "ps", "-a", "--filter", filter, "--format", `{{.ID}} {{.Label "kiwi.instance"}}`)
+	if err != nil {
+		return rep, fmt.Errorf("cannot prove prior container absence: %w", err)
+	}
 	for _, id := range parseForeignInstances(out, instanceID) {
-		if _, err := boundedToolCommand(ctx, gcCleanupTimeout, docker, "rm", "-f", id); err == nil {
-			rep.Containers++
+		if _, err := boundedToolCommand(ctx, gcCleanupTimeout, docker, "rm", "-f", id); err != nil && !isContainerAbsentError(err) {
+			return rep, fmt.Errorf("cannot remove stale container %s: %w", id, err)
+		}
+		rep.Containers++
+	}
+	out, err = output(docker, "network", "ls", "--filter", filter, "--format", `{{.ID}} {{.Label "kiwi.instance"}}`)
+	if err != nil {
+		return rep, fmt.Errorf("cannot prove prior network absence: %w", err)
+	}
+	for _, id := range parseForeignInstances(out, instanceID) {
+		if _, err := boundedToolCommand(ctx, gcCleanupTimeout, docker, "network", "rm", id); err != nil {
+			return rep, fmt.Errorf("cannot remove stale network %s: %w", id, err)
+		}
+		rep.Networks++
+	}
+	// Tart: clones encode the runner/instance ownership in their names.
+	if tart, terr := exec.LookPath("tart"); terr == nil && instanceID != "" {
+		out, err := output(tart, "list")
+		if err != nil {
+			return rep, fmt.Errorf("cannot prove prior VM absence: %w", err)
+		}
+		for _, name := range parseForeignTartClones(out, runnerID, instanceID) {
+			if _, err := boundedToolCommand(ctx, gcCleanupTimeout, tart, "delete", name); err != nil {
+				return rep, fmt.Errorf("cannot remove stale Tart VM %s: %w", name, err)
+			}
+			rep.VMs++
 		}
 	}
-	out = output(docker, "network", "ls", "--filter", filter, "--format", `{{.ID}} {{.Label "kiwi.instance"}}`)
-	for _, id := range parseForeignInstances(out, instanceID) {
-		if _, err := boundedToolCommand(ctx, gcCleanupTimeout, docker, "network", "rm", id); err == nil {
-			rep.Networks++
+	return rep, nil
+}
+
+// parseForeignTartClones extracts kiwi-owned clone names belonging to the
+// SAME stable runner ID but a DIFFERENT (or absent) incarnation. Clone names
+// are kiwi-<nano>-<runhash16>-<runnerhash8>-<instancehash8>; only the
+// runner-hash verifies ownership, and a different/absent instance hash marks
+// a previous incarnation.
+func parseForeignTartClones(out []byte, runnerID, instanceID string) []string {
+	wantRunner := identityHash8(runnerID)
+	wantInstance := identityHash8(instanceID)
+	var stale []string
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) == 0 {
+			continue
+		}
+		name := fields[0]
+		if !strings.HasPrefix(name, "kiwi-") {
+			continue
+		}
+		parts := strings.Split(name, "-")
+		if len(parts) < 4 {
+			continue
+		}
+		owner := parts[len(parts)-2]
+		instance := parts[len(parts)-1]
+		if owner == wantRunner && instance != wantInstance {
+			stale = append(stale, name)
 		}
 	}
-	return rep
+	return stale
 }
 
 // parseForeignInstances parses "ID <instance>" rows from docker ps/network ls

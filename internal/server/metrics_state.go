@@ -96,8 +96,8 @@ func (s *Server) metricsMemory(w http.ResponseWriter, r *http.Request) {
 	for _, ri := range s.runners {
 		fam.runners.Runners++
 		c := ri.Capacity
-		if c < 1 {
-			c = 1
+		if c < 0 {
+			c = 0
 		}
 		fam.runners.Capacity += c
 		fam.runners.Busy += len(ri.ActiveJobs)

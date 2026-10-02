@@ -158,7 +158,7 @@ func TestTartCloneNameUniqueParseableAndGCCompatible(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			names[i] = tartCloneName("run-1", "job-1")
+			names[i] = tartCloneName("run-1", "job-1", "runner-1", "inst-1")
 		}(i)
 	}
 	wg.Wait()
@@ -174,8 +174,9 @@ func TestTartCloneNameUniqueParseableAndGCCompatible(t *testing.T) {
 		if _, err := strconv.ParseInt(parts[0], 10, 64); err != nil {
 			t.Fatalf("clone name %q timestamp is not numeric: %v", name, err)
 		}
-		if len(parts[1]) != 16 {
-			t.Fatalf("clone name %q hash suffix = %q, want 16 hex characters", name, parts[1])
+		tags := strings.Split(parts[1], "-")
+		if len(tags) != 3 || len(tags[0]) != 16 || len(tags[1]) != 8 || len(tags[2]) != 8 {
+			t.Fatalf("clone name %q suffix = %q, want hash16-runner8-instance8", name, parts[1])
 		}
 		if len(name) > maxTartCloneNameLen {
 			t.Fatalf("clone name %q exceeds the %d-character tart name budget", name, maxTartCloneNameLen)
@@ -196,13 +197,13 @@ func TestTartCloneNameUniqueParseableAndGCCompatible(t *testing.T) {
 // identical nanosecond timestamp must never share a name.
 func TestTartCloneNameSameNanoDistinctIdentities(t *testing.T) {
 	const nano = int64(1758888888888888888)
-	a := tartCloneNameFor("run-1", "job-1", nano)
-	b := tartCloneNameFor("run-1", "job-2", nano)
-	c := tartCloneNameFor("run-2", "job-1", nano)
+	a := tartCloneNameFor("run-1", "job-1", nano, "runner-1", "inst-1")
+	b := tartCloneNameFor("run-1", "job-2", nano, "runner-1", "inst-1")
+	c := tartCloneNameFor("run-2", "job-1", nano, "runner-1", "inst-1")
 	if a == b || a == c || b == c {
 		t.Fatalf("same-nano clones collided: %q %q %q", a, b, c)
 	}
-	if again := tartCloneNameFor("run-1", "job-1", nano); again != a {
+	if again := tartCloneNameFor("run-1", "job-1", nano, "runner-1", "inst-1"); again != a {
 		t.Fatalf("naming is not deterministic: %q != %q", again, a)
 	}
 }

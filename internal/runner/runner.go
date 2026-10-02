@@ -341,9 +341,9 @@ func newRunnerInstanceID() string {
 type Runner struct {
 	Cfg Config
 	ID  string
-	// instanceID is this process incarnation's identity; runtime resources
-	// are labelled with it so a restarted runner reaps only its predecessor's
-	// resources and never another live runner's.
+	// instanceID is THIS Run call's incarnation identity (freshly generated at
+	// Run start, never reused across in-process restarts); execute reads it to
+	// label runtime resources.
 	instanceID string
 	Client     *http.Client
 	Metrics    *Metrics
@@ -458,6 +458,19 @@ func (r *Runner) Run(ctx context.Context) error {
 		r.ID = id
 	}
 	r.resolveIdentityDir()
+	// One stable runner identity may have at most ONE live process: without
+	// this, a copied/mounted identity directory could start a second process
+	// whose startup reconciliation (same runner ID, different instance ID)
+	// would treat the FIRST, LIVE process's containers as a crashed
+	// predecessor's and kill them. The lifetime lock is held for the whole
+	// Run.
+	if r.Cfg.IdentityDir != "" {
+		release, lerr := acquireRunnerIdentityLock(r.Cfg.IdentityDir)
+		if lerr != nil {
+			return fmt.Errorf("runner %s: %w", r.ID, lerr)
+		}
+		defer release()
+	}
 	if err := r.resolveStateDir(); err != nil {
 		return err
 	}
@@ -582,17 +595,27 @@ func (r *Runner) Run(ctx context.Context) error {
 		defer background.Done()
 		_ = prewarmer.run(runCtx)
 	}()
-	if r.instanceID == "" {
-		r.instanceID = newRunnerInstanceID()
-	}
+	// Incarnation identity belongs to THIS Run call, not the Runner struct: an
+	// in-process Run restart must get a fresh instance ID, otherwise leftover
+	// resources from the previous run would be classified as current and
+	// skipped by reconciliation.
+	runInstanceID := newRunnerInstanceID()
+	r.instanceID = runInstanceID
 	// Crash recovery BEFORE the first lease: a SIGKILLed predecessor leaves
-	// detached containers/services/networks behind (their docker run --rm does
-	// not fire on a dead client). Reconcile only resources labelled with THIS
-	// stable runner ID and a previous/absent instance ID, so a replacement
-	// never inherits live runtimes and never touches another runner sharing
-	// the daemon.
-	if rep := executor.ReconcileRuntime(runCtx, r.Cfg.WorkDir, r.ID, r.instanceID); rep.Containers > 0 || rep.Networks > 0 {
-		fmt.Fprintf(os.Stderr, "kiwi runner %s: reconciled previous incarnation runtime: %d container(s), %d network(s)\n", r.ID, rep.Containers, rep.Networks)
+	// detached containers/services/networks/VMs behind (their cleanup does not
+	// fire on a dead client). Reconcile only resources carrying THIS stable
+	// runner ID and a previous/absent instance ID, so a replacement never
+	// inherits live runtimes and never touches another runner sharing the
+	// daemon. Reconciliation FAILING (docker/tart unavailable, discovery
+	// error, removal refused) refuses to lease new work: "cannot prove absence"
+	// is not "nothing stale".
+	rep, rerr := executor.ReconcileRuntime(runCtx, r.Cfg.WorkDir, r.ID, runInstanceID)
+	if rerr != nil {
+		stop()
+		return fmt.Errorf("runner %s: crash reconciliation failed; refusing to lease new work: %w", r.ID, rerr)
+	}
+	if rep.Containers > 0 || rep.Networks > 0 || rep.VMs > 0 {
+		fmt.Fprintf(os.Stderr, "kiwi runner %s: reconciled previous incarnation runtime: %d container(s), %d network(s), %d VM(s)\n", r.ID, rep.Containers, rep.Networks, rep.VMs)
 	}
 	lastPrewarm := time.Now()
 	lastGC := time.Now()
@@ -1024,6 +1047,11 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		r.complete(parent, t, model.StatusFailure, err, nil)
 		return
 	}
+	// Durable ownership BEFORE the workspace becomes visible to the job: a
+	// hard crash leaves this ledger entry for the next incarnation to reclaim
+	// (the deferred removals never run on SIGKILL).
+	ledgerID := r.ledgerAdd(runtimeLedgerEntry{Instance: r.instanceID, JobID: t.Job.ID, Workspace: tmp})
+	defer r.ledgerRemove(ledgerID)
 	untrusted := !t.Job.Trusted
 	requireDiskQuota := untrusted && !executor.AllowUnquotaedUntrustedDisk()
 	// The workspace quota lifecycle is OWNED by execute, not by the backend:

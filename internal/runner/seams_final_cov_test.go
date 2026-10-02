@@ -219,3 +219,46 @@ exit 0
 		t.Fatal("next was never polled")
 	}
 }
+
+// TestRunnerRefusesLeasingWhenRuntimeDiscoveryFails pins the crash-recovery
+// gate at the lifecycle level: when prior runtime absence cannot be proven,
+// Run fails startup WITHOUT polling for work.
+func TestRunnerRefusesLeasingWhenRuntimeDiscoveryFails(t *testing.T) {
+	testutil.UnixShell(t)
+	bin := t.TempDir()
+	script := "#!/bin/sh\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(bin, "docker"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+
+	var nextCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/register") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"runner-1"}`))
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/next") {
+			nextCalls.Add(1)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ts.Close()
+
+	r := &Runner{
+		ID: "runner-1",
+		Cfg: Config{
+			Server: ts.URL, Poll: time.Millisecond, WorkDir: t.TempDir(),
+			IdentityDir: t.TempDir(), PrewarmInterval: time.Hour,
+		},
+		Client: ts.Client(), Metrics: NewMetrics(),
+	}
+	err := r.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "crash reconciliation failed") {
+		t.Fatalf("Run = %v, want the reconciliation refusal", err)
+	}
+	if nextCalls.Load() != 0 {
+		t.Fatalf("runner polled for work %d time(s) after failed reconciliation", nextCalls.Load())
+	}
+}

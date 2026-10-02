@@ -140,7 +140,7 @@ func (s *PostgresStore) QueuedJobQueueReasonCounts(ctx context.Context) (map[str
 // runner payload is never read.
 func (s *PostgresStore) RunnerSlotTotals(ctx context.Context) (RunnerSlotTotals, error) {
 	var out RunnerSlotTotals
-	err := s.pool.QueryRow(ctx, `SELECT COUNT(*), COALESCE(SUM(GREATEST(capacity, 1)), 0), COALESCE(SUM(jsonb_array_length(COALESCE(active_jobs, '[]'::jsonb))), 0) FROM runners`).
+	err := s.pool.QueryRow(ctx, `SELECT COUNT(*), COALESCE(SUM(GREATEST(capacity, 0)), 0), COALESCE(SUM(jsonb_array_length(COALESCE(active_jobs, '[]'::jsonb))), 0) FROM runners`).
 		Scan(&out.Runners, &out.Capacity, &out.Busy)
 	if err != nil {
 		return RunnerSlotTotals{}, err

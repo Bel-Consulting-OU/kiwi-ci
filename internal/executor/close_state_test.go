@@ -193,9 +193,9 @@ func TestReconcileRuntimeReapsOnlyOwnPredecessor(t *testing.T) {
 	log := filepath.Join(t.TempDir(), "docker.log")
 	t.Setenv("FAKE_DOCKER_LOG", log)
 
-	rep := ReconcileRuntime(context.Background(), t.TempDir(), "runner-a", current)
-	if rep.Containers != 2 || rep.Networks != 1 {
-		t.Fatalf("reconcile report = %+v, want 2 containers / 1 network", rep)
+	rep, rerr := ReconcileRuntime(context.Background(), t.TempDir(), "runner-a", current)
+	if rerr != nil || rep.Containers != 2 || rep.Networks != 1 {
+		t.Fatalf("reconcile = %+v err=%v, want 2 containers / 1 network", rep, rerr)
 	}
 	data, err := os.ReadFile(log)
 	if err != nil {
@@ -214,7 +214,57 @@ func TestReconcileRuntimeReapsOnlyOwnPredecessor(t *testing.T) {
 	}
 
 	// No stable identity: nothing is enumerated or removed.
-	if rep := ReconcileRuntime(context.Background(), t.TempDir(), "", current); rep != (GCReport{}) {
-		t.Fatalf("empty runner id reconciled %+v", rep)
+	if rep, err := ReconcileRuntime(context.Background(), t.TempDir(), "", current); err != nil || rep != (GCReport{}) {
+		t.Fatalf("empty runner id reconciled %+v err=%v", rep, err)
+	}
+}
+
+// TestReconcileRuntimeDiscoveryFailureFailsClosed pins the crash-recovery
+// contract: docker being unable to enumerate (daemon down, timeout) must be
+// an ERROR, never "nothing stale".
+func TestReconcileRuntimeDiscoveryFailureFailsClosed(t *testing.T) {
+	installFakeBins(t)
+	t.Setenv("FAKE_DOCKER_PS_EXIT", "1")
+	if _, err := ReconcileRuntime(context.Background(), t.TempDir(), "runner-a", "inst"); err == nil {
+		t.Fatal("docker ps failure was treated as proven absence")
+	}
+}
+
+// TestReconcileRuntimeDiscoveryTruncationFailsClosed pins the parser-bound
+// case: an over-limit discovery response is an error, not empty output.
+func TestReconcileRuntimeDiscoveryTruncationFailsClosed(t *testing.T) {
+	installFakeBins(t)
+	// The fake ps handler prints the env value; 4 MiB+ exceeds the executor's
+	// 4 MiB capture bound.
+	t.Setenv("FAKE_DOCKER_PS", strings.Repeat("x", (4<<20)+16))
+	if _, err := ReconcileRuntime(context.Background(), t.TempDir(), "runner-a", "inst"); err == nil {
+		t.Fatal("truncated discovery output was treated as proven absence")
+	}
+}
+
+// TestReconcileRuntimeRemovalFailureFailsClosed pins that a failed rm of a
+// stale predecessor container refuses reconciliation (the runner must not
+// lease while the old runtime may still exist).
+func TestReconcileRuntimeRemovalFailureFailsClosed(t *testing.T) {
+	installFakeBins(t)
+	t.Setenv("FAKE_DOCKER_PS", "c-old inst-old")
+	t.Setenv("FAKE_DOCKER_PS_EXIT", "0")
+	t.Setenv("FAKE_DOCKER_RM_EXIT", "1")
+	t.Setenv("FAKE_DOCKER_RM_MSG", "operation not permitted")
+	if _, err := ReconcileRuntime(context.Background(), t.TempDir(), "runner-a", "inst-current"); err == nil {
+		t.Fatal("failed stale-container removal was tolerated")
+	}
+}
+
+// TestReconcileRuntimeAbsenceIsDistinctFromDiscoveryFailure: a positively
+// absent container (rm reports "No such container") is not an error.
+func TestReconcileRuntimeAbsenceIsDistinctFromDiscoveryFailure(t *testing.T) {
+	installFakeBins(t)
+	t.Setenv("FAKE_DOCKER_PS", "c-old inst-old")
+	t.Setenv("FAKE_DOCKER_RM_EXIT", "1")
+	t.Setenv("FAKE_DOCKER_RM_MSG", "Error: No such container: c-old")
+	rep, err := ReconcileRuntime(context.Background(), t.TempDir(), "runner-a", "inst-current")
+	if err != nil || rep.Containers != 1 {
+		t.Fatalf("proven-absent container = %+v err=%v, want counted success", rep, err)
 	}
 }

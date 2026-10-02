@@ -744,3 +744,36 @@ claims themselves.
   points at one point per 10 minutes, so a continuous stream of fresh
   high-priority jobs can no longer starve an eligible low-priority job
   indefinitely; downstream-depth priority remains the primary signal.
+- Crash reconciliation now FAILS CLOSED: `ReconcileRuntime` returns an error
+  when docker/tart liveness cannot be enumerated (`docker ps` failing,
+  truncated discovery output) or a stale resource cannot be removed (other
+  than a positively reported absence), and the runner refuses to lease new
+  work until reconciliation succeeds. Tart clones now carry
+  `kiwi-<nano>-<runhash16>-<runnerhash8>-<instancehash8>` ownership tags, so a
+  restarted runner immediately reaps its own predecessor's VMs too (pure-Tart
+  macOS hosts included).
+- Runner incarnation identity is per `Run()` call (fresh instance ID each
+  run, never reused across in-process restarts), runtime resources are
+  reconciled against it before the first lease, and a durable runtime ledger
+  records each job's workspace and artifact scratch directories so a SIGKILLed
+  job's host state is reclaimed by the next run instead of leaking.
+- One stable runner identity may have at most ONE live process: Run holds an
+  exclusive lifetime lock on `<IdentityDir>/runner.lock` and a duplicate
+  process fails startup instead of treating the live process's containers as a
+  crashed predecessor's and killing them.
+- XFS project allocation is serialized ACROSS PROCESSES: a host-global
+  per-filesystem flock wraps report + choose + assign + hard-limit, and the
+  filesystem report is re-read on every allocation, so two runner processes
+  (or one restarted process) can never publish the same project ID.
+- Runner identity persistence is atomic and crash-safe: the private key is
+  written first with temp+fsync+rename, every identity file is published
+  atomically, and Load cryptographically verifies the certificate/key pair —
+  a crash during rotation is reported incomplete and re-enrolls instead of
+  bricking startup. On Windows the identity directory gets a PROTECTED
+  current-user-only DACL (numeric modes do not encode access control).
+- Scheduler aging is now uncapped relative to static priority: because
+  dependency depth has no small maximum, any fixed boost could still starve,
+  so waiting time keeps adding priority and every eligible job eventually
+  becomes competitive. Runner capacity metrics report effective schedulable
+  capacity (`max(capacity, 0)`), so a capacity-0 runner no longer advertises a
+  phantom slot.

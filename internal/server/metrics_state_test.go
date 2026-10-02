@@ -89,8 +89,8 @@ func metricsStateExpectedLines() []string {
 		`kiwi_runs{status="queued"} 1`,
 		`kiwi_runs{status="running"} 2`,
 		`kiwi_runs{status="success"} 100`,
-		"kiwi_runner_saturation 0.42857142857142855",
-		"kiwi_runner_slots 7",
+		"kiwi_runner_saturation 0.5",
+		"kiwi_runner_slots 6",
 		"kiwi_runner_slots_busy 3",
 		"kiwi_runners 3",
 	}

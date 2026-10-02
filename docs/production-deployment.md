@@ -468,6 +468,17 @@ In **DB mode the database clock is the authority for a lease's lifetime**:
   healthchecks retain a 64 KiB diagnostic prefix and drain (discarding) the
   rest, and every executor/git/prewarm capture is bounded, so a hostile
   healthcheck cannot grow the runner heap or block on a full pipe.
+- **Runner crash recovery is closed and fail-closed.** Reconciliation errors
+  (discovery or removal) block leasing; Tart clones carry runner/instance
+  ownership tags and are reaped like Docker resources; each `Run()` gets a
+  fresh incarnation ID; a durable runtime ledger reclaims crashed workspaces
+  and artifact scratch; one stable runner identity is protected by a lifetime
+  lock so a duplicate process cannot reap the live process's workloads; XFS
+  allocation is serialized across processes with a host-global lock and
+  re-reads the filesystem on every allocation; and runner identity
+  persistence is atomic and pair-verified (Windows: protected owner-only
+  DACL). Scheduler aging is uncapped and capacity metrics count effective
+  schedulable slots.
 - **Runner crashes are reconciled immediately.** Every runner process has an
   instance ID; containers/services/networks are labelled with
   `kiwi.runner`/`kiwi.instance`, and a restarted runner reaps its own

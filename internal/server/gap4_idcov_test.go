@@ -125,7 +125,7 @@ func TestIDCovMetricsMemoryState(t *testing.T) {
 	for _, want := range []string{
 		`kiwi_runs{status="running"} 1`,
 		"kiwi_jobs_queue_reason",
-		"kiwi_runner_slots 1",
+		"kiwi_runner_slots 0",
 		"kiwi_runner_slots_busy 1",
 	} {
 		if !strings.Contains(body, want) {

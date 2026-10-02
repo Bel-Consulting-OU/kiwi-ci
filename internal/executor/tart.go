@@ -127,23 +127,34 @@ func identityHash16(identity string) string {
 	return hex.EncodeToString(sum[:8])
 }
 
+// identityHash8 is a short (8 hex char) ownership tag for clone names.
+func identityHash8(identity string) string {
+	sum := sha256.Sum256([]byte(identity))
+	return hex.EncodeToString(sum[:4])
+}
+
 // tartCloneNameFor is the pure naming rule behind tartCloneName: the physical
-// name of a disposable VM clone is kiwi-<unix-nano>-<hash16>, where hash16 is
-// the first 8 bytes of the SHA-256 of the full run/job identity. The
-// monotonic timestamp keeps two clones from one process distinct even on a
-// coarse clock; the identity hash keeps clones from different run/job
-// identities distinct even when two processes generate the same nanosecond.
-// The name is passed through boundedNormalizedName so it can never exceed the
-// executor's tart name budget, and the GC grammar (parseTartVMs) accepts both
-// this form and the legacy kiwi-<unix-nano>.
-func tartCloneNameFor(runID, jobID string, nano int64) string {
-	return boundedNormalizedName(fmt.Sprintf("kiwi-%d-%s", nano, identityHash16(runID+"\x00"+jobID)), maxTartCloneNameLen)
+// name of a disposable VM clone is
+// kiwi-<unix-nano>-<hash16>-<runnerhash8>-<instancehash8>, where hash16 is the
+// run/job identity and the last two tags encode the owning runner process
+// incarnation. The monotonic timestamp keeps two clones from one process
+// distinct even on a coarse clock; the identity hash keeps clones from
+// different run/job identities distinct even when two processes generate the
+// same nanosecond; and the ownership tags let a RESTARTED runner immediately
+// reap its own predecessor's clones (same runner tag, different instance tag)
+// without touching another live runner's VMs. The name is passed through
+// boundedNormalizedName so it can never exceed the executor's tart name
+// budget; legacy names without ownership tags are only handled by the age GC.
+func tartCloneNameFor(runID, jobID string, nano int64, runnerID, instanceID string) string {
+	name := fmt.Sprintf("kiwi-%d-%s", nano, identityHash16(runID+"\x00"+jobID))
+	name += "-" + identityHash8(runnerID) + "-" + identityHash8(instanceID)
+	return boundedNormalizedName(name, maxTartCloneNameLen)
 }
 
 // tartCloneName derives the clone name with this process's next monotonic
 // timestamp.
-func tartCloneName(runID, jobID string) string {
-	return tartCloneNameFor(runID, jobID, nextPhysicalNano())
+func tartCloneName(runID, jobID, runnerID, instanceID string) string {
+	return tartCloneNameFor(runID, jobID, nextPhysicalNano(), runnerID, instanceID)
 }
 
 // StartJob clones and boots one disposable Tart VM for the entire CI job.
@@ -181,7 +192,7 @@ func (b *TartBackend) StartJob(ctx context.Context, workspace string, emit func(
 		return &RunError{Kind: ErrorInfra, Err: err}
 	}
 	b.tart, b.ssh, b.workspace = tart, ssh, abs
-	b.clone = tartCloneName(b.RunID, b.JobID)
+	b.clone = tartCloneName(b.RunID, b.JobID, b.RunnerID, b.InstanceID)
 	if err := b.setupSSHDir(); err != nil {
 		_ = b.CloseJob()
 		return &RunError{Kind: ErrorInfra, Err: err}

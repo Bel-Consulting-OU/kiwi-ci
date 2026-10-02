@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -11,6 +12,7 @@ import (
 // field must survive, and the private key must be owner-only (0600) with
 // the store directory created 0700.
 func TestIdentityStoreRoundTrip(t *testing.T) {
+	defer stubIdentityPairCheck(t)()
 	// The store directory is created on first Save (0700), so point the
 	// store at a not-yet-existing subdirectory to exercise the creation
 	// mode instead of the parent test temp dir's own mode.
@@ -54,8 +56,8 @@ func TestIdentityStoreRoundTrip(t *testing.T) {
 	}
 
 	if runtime.GOOS == "windows" {
-		// Windows file modes do not encode permissions; the 0700 store
-		// directory ACL is the owner-only boundary there.
+		// Windows numeric modes do not encode permissions; secureIdentityDir
+		// installs a PROTECTED owner-only DACL instead (tested on Windows CI).
 		return
 	}
 	fi, err := os.Stat(filepath.Join(dir, identityKeyFile))
@@ -113,5 +115,47 @@ func TestIdentityStoreClearCertKeepsID(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, identityKeyFile)); err != nil {
 		t.Fatal("key.pem must be kept for re-enrollment")
+	}
+}
+
+// stubIdentityPairCheck makes placeholder PEMs acceptable for store
+// round-trip tests; the real X.509 pair verification has its own test.
+func stubIdentityPairCheck(t *testing.T) func() {
+	t.Helper()
+	prev := verifyIdentityKeyPair
+	verifyIdentityKeyPair = func([]byte, []byte) error { return nil }
+	return func() { verifyIdentityKeyPair = prev }
+}
+
+// TestVerifyIdentityKeyPairRejectsGarbage pins the real verification seam.
+func TestVerifyIdentityKeyPairRejectsGarbage(t *testing.T) {
+	if err := verifyIdentityKeyPair([]byte("cert"), []byte("key")); err == nil {
+		t.Fatal("garbage cert/key pair verified")
+	}
+}
+
+// TestIdentityStoreMismatchedPairIsIncomplete pins the anti-brick rule: a
+// store whose four files are present but whose key does not match the
+// certificate (a crash during rotation) is reported INCOMPLETE so the runner
+// re-enrolls instead of failing later at TLS setup.
+func TestIdentityStoreMismatchedPairIsIncomplete(t *testing.T) {
+	prev := verifyIdentityKeyPair
+	verifyIdentityKeyPair = func([]byte, []byte) error { return errors.New("mismatch") }
+	t.Cleanup(func() { verifyIdentityKeyPair = prev })
+
+	dir := t.TempDir()
+	for name, data := range map[string]string{
+		identityIDFile: "runner-1", identityKeyFile: "key", identityCertFile: "cert", identityCAFile: "ca",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	id, complete := IdentityStore{Dir: dir}.Load()
+	if complete {
+		t.Fatalf("mismatched pair reported complete: %+v", id)
+	}
+	if id.ID != "runner-1" {
+		t.Fatalf("partial load must still return the runner ID, got %q", id.ID)
 	}
 }

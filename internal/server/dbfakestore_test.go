@@ -582,8 +582,8 @@ func (f *dbFakeStore) RunnerSlotTotals(ctx context.Context) (storage.RunnerSlotT
 	for _, r := range f.runners {
 		out.Runners++
 		c := r.Capacity
-		if c < 1 {
-			c = 1
+		if c < 0 {
+			c = 0
 		}
 		out.Capacity += c
 		out.Busy += len(r.ActiveJobs)

@@ -96,6 +96,7 @@ func TestNewMetricsServerServes(t *testing.T) {
 }
 
 func TestIdentityStoreLifecycle(t *testing.T) {
+	defer stubIdentityPairCheck(t)()
 	dir := filepath.Join(t.TempDir(), "identity")
 	store := IdentityStore{Dir: dir}
 	if id, ok := store.LoadID(); ok || id != "" {
