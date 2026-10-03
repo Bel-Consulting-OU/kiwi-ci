@@ -11,9 +11,19 @@ import (
 // existing server/runner call sites; the server should migrate to
 // ValidateAdmissionWithCapabilities once per-repository capability
 // compilation lands.
+//
+// For TRUSTED runs, deployments are deferred to the caller's effective-policy
+// check: deployments are an opt-in POLICY grant (repository/organization
+// configuration the runner cannot see), not a sandbox bound, so the bare
+// trust-domain default must not refuse a job the control plane explicitly
+// granted. The runner's signed compiled payload carries that effective policy
+// and is validated immediately after this baseline check; an untrusted run
+// keeps the hard no-deployments floor.
 func ValidateAdmission(s *pipeline.Spec, trusted bool) error {
 	caps := DefaultTrustedCapabilities()
-	if !trusted {
+	if trusted {
+		caps.Deployments = true
+	} else {
 		caps = DefaultUntrustedCapabilities()
 	}
 	return ValidatePipeline(s, caps)

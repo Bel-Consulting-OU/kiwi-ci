@@ -28,6 +28,16 @@ case "$sub" in
     exit "${FAKE_DOCKER_INFO_EXIT:-0}";;
   run)
     if [ -n "$FAKE_DOCKER_RUN_FAIL" ]; then echo "run failed"; exit 1; fi
+    if [ -n "$FAKE_DOCKER_RUN_INIT_EPERM" ]; then
+      case " $* " in
+        *" --init "*) 
+          if [ ! -e "$FAKE_DOCKER_RUN_INIT_EPERM_MARKER" ]; then
+            touch "$FAKE_DOCKER_RUN_INIT_EPERM_MARKER"
+            echo 'exec /sbin/docker-init: operation not permitted' >&2
+            exit 255
+          fi;;
+      esac
+    fi
     echo "fake-container-$$"
     exit 0;;
   exec)

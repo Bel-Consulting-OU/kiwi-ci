@@ -309,6 +309,18 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 	// 10m setup ceiling (min with the job context).
 	args = append(args, "--", b.Image, "sh", "-c", "while :; do sleep 3600; done")
 	out, err := phaseCommand(ctx, runtimeSetupTimeout, docker, args...)
+	if err != nil && containerInitEPERM(string(out)) {
+		// Some daemon/kernel combinations refuse to exec docker-init under
+		// --security-opt=no-new-privileges (moby/runC EPERM). The hold
+		// container is job-scoped and destroyed at close, so the only
+		// residual from running without --init is PID1 zombie reaping
+		// inside a container that never outlives the job. Retry ONCE
+		// without --init, loudly, so every other failure mode keeps the
+		// hardened profile unchanged.
+		emit("warning: container init is unavailable on this daemon (docker-init EPERM); retrying without --init (zombie reaping residual is job-scoped)")
+		args = withoutFlag(args, "--init")
+		out, err = phaseCommand(ctx, runtimeSetupTimeout, docker, args...)
+	}
 	if err != nil {
 		restoreErr := errors.Join(b.restoreProvisionedWorkspace(), b.cleanupWorkspaceQuota())
 		if restoreErr != nil {
@@ -318,6 +330,24 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 	}
 	emit("job container started " + b.container)
 	return nil
+}
+
+// containerInitEPERM reports whether a docker run failure is the specific
+// docker-init exec EPERM signature (the only failure the init fallback
+// above is allowed to retry).
+func containerInitEPERM(out string) bool {
+	return strings.Contains(out, "docker-init") && strings.Contains(out, "operation not permitted")
+}
+
+// withoutFlag removes every occurrence of a docker argv flag.
+func withoutFlag(args []string, flag string) []string {
+	out := args[:0]
+	for _, a := range args {
+		if a != flag {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 // containerResourceArgs renders the docker run flags enforcing a job's

@@ -118,6 +118,25 @@ func fetchJWKS(t *testing.T, s *Server) []jwk {
 	return out.Keys
 }
 
+// oidcOnly filters a JWKS document down to the OIDC ring keys, excluding
+// the provenance signing key published alongside them (a distinct key root
+// with its own kid, not part of OIDC rotation).
+func oidcOnly(s *Server, keys []jwk) []jwk {
+	s.mu.Lock()
+	provKID := ""
+	if s.provenance != nil {
+		provKID = s.provenance.KID
+	}
+	s.mu.Unlock()
+	out := make([]jwk, 0, len(keys))
+	for _, k := range keys {
+		if k.KID != provKID {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
 func findJWK(keys []jwk, kid string) (bool, jwk) {
 	for _, k := range keys {
 		if k.KID == kid {
@@ -540,8 +559,10 @@ func TestOIDCRotationPersistBeforeActivate(t *testing.T) {
 	if active != oldKID {
 		t.Fatalf("rotation activated despite failed persistence: active %q != old %q", active, oldKID)
 	}
-	// The JWKS still advertises only the old key.
-	keys := fetchJWKS(t, s)
+	// The JWKS still advertises only the old OIDC key (the provenance
+	// signing key is published alongside the ring and is not part of the
+	// rotation).
+	keys := oidcOnly(s, fetchJWKS(t, s))
 	if len(keys) != 1 || keys[0].KID != oldKID {
 		t.Fatalf("JWKS = %+v, want only the old active key %q", keys, oldKID)
 	}

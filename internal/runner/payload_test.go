@@ -193,3 +193,41 @@ func TestVerifyCompiledPayloadBindsEffectiveJobToLocalCompile(t *testing.T) {
 		t.Fatalf("self-hashed tampered payload = %v, want the local-compilation refusal", err)
 	}
 }
+
+// TestApplyPersistedResourceRequests: the payload records the
+// spec-deterministic compile (unfilled resources); the persisted relational
+// request fields (server ceiling fill) are re-applied over the verified job
+// so execution bounds match the scheduler's reservations. Zero persisted
+// fields leave the payload untouched (trusted jobs, no fill).
+func TestApplyPersistedResourceRequests(t *testing.T) {
+	var cj pipeline.CompiledJob
+	cj.Job.Resources = pipeline.Resources{CPU: 1, Memory: 1, Disk: 1, PIDs: 1}
+	applyPersistedResourceRequests(&cj, model.Job{CPURequest: 2, MemoryRequest: 4 << 30, DiskRequest: 10 << 30, PIDsRequest: 256})
+	if cj.Job.Resources.CPU != 2 || cj.Job.Resources.Memory != 4<<30 || cj.Job.Resources.Disk != 10<<30 || cj.Job.Resources.PIDs != 256 {
+		t.Fatalf("resources = %+v, want the persisted values", cj.Job.Resources)
+	}
+	applyPersistedResourceRequests(&cj, model.Job{})
+	if cj.Job.Resources.CPU != 2 {
+		t.Fatalf("empty persisted fields must not zero the resources: %+v", cj.Job.Resources)
+	}
+}
+
+// TestVerifyCompiledPayloadAcceptsUnfilledCeilingPayload: the enqueue no
+// longer fills untrusted ceilings into the payload, so a payload built
+// straight from a local compile (zero-declared resources) must verify; the
+// ceiling fill arrives via the persisted relational fields instead.
+func TestVerifyCompiledPayloadAcceptsUnfilledCeilingPayload(t *testing.T) {
+	base := "version: 1\njobs:\n  build:\n    runtime: container\n    image: alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc\n    steps:\n      - run: echo hi\n"
+	spec, err := pipeline.Parse([]byte(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := buildPayload(t, base, "build")
+	cj, _, _, err := verifyCompiledPayload(spec, "build", payload, true)
+	if err != nil {
+		t.Fatalf("unfilled payload verification: %v", err)
+	}
+	if cj.Job.Resources.CPU != 0 {
+		t.Fatalf("payload resources = %+v, want the unfilled compile", cj.Job.Resources)
+	}
+}

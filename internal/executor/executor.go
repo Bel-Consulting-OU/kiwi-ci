@@ -19,6 +19,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/logging"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/safefs"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secrets"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/snapshot"
 )
@@ -67,6 +68,12 @@ type Options struct {
 	Artifacts        *artifact.Store
 	ArtifactCapture  *ArtifactCapture
 	ArtifactReporter func(jobID, name, path string) error
+	// LocalDownloads enables restoring declared dependency downloads from
+	// this run's locally saved artifacts (kiwi run parity with the
+	// distributed runner's restoreDownloads). Off for the distributed
+	// runner (it restores through the control plane) and for replay (the
+	// workspace snapshot already contains the restored files).
+	LocalDownloads   bool
 	DependencyStatus model.Status
 	NeedsOutputs     map[string]map[string]string
 	CacheNamespace   string
@@ -197,6 +204,34 @@ type Executor struct {
 	// backend instead of host-side path opens. It must stay a pointer: runJob
 	// makes shallow copies of Executor for its log-quota scoping.
 	sessions *sessionRegistry
+	// artifacts records locally saved artifacts of THIS run (run/job/name →
+	// archive path) so downstream jobs can restore their declared downloads
+	// without a server round trip. Pointer for the same shallow-copy reason.
+	artifacts *artifactRegistry
+}
+
+// artifactRegistry maps a (producer job, artifact name) pair to the local
+// archive path published by that job in this run.
+type artifactRegistry struct {
+	mu    sync.Mutex
+	paths map[string]string
+}
+
+func newArtifactRegistry() *artifactRegistry {
+	return &artifactRegistry{paths: map[string]string{}}
+}
+
+func (r *artifactRegistry) record(jobID, name, path string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.paths[jobID+"\x00"+name] = path
+}
+
+func (r *artifactRegistry) lookup(jobID, name string) (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	p, ok := r.paths[jobID+"\x00"+name]
+	return p, ok
 }
 
 // sessionRegistry maps job IDs to their live backend sessions. A session is
@@ -271,6 +306,9 @@ func (e *Executor) prepare() {
 	}
 	if e.sessions == nil {
 		e.sessions = &sessionRegistry{}
+	}
+	if e.artifacts == nil {
+		e.artifacts = newArtifactRegistry()
 	}
 }
 
@@ -488,6 +526,18 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		}
 		if !restored {
 			e.log(cj.ID, "cache", "miss "+cacheName(c))
+		}
+	}
+	// Local downloads parity: declared dependency artifacts are restored
+	// from this run's local artifact store before any step runs, exactly as
+	// the distributed runner restores them through the control plane. A
+	// declared artifact its producer did not publish is a hard failure (the
+	// server answers the same download with 404).
+	if e.Opt.LocalDownloads && len(cj.Job.Downloads) > 0 {
+		if err := e.restoreLocalDownloads(cj.Job.Downloads, workspace); err != nil {
+			res.Status = model.StatusFailure
+			res.Error = err.Error()
+			return finish(res)
 		}
 	}
 	// Sandbox requirements must never be silently unenforced: native and tart
@@ -1133,6 +1183,11 @@ func (e *Executor) saveArtifact(cj pipeline.CompiledJob, a pipeline.Artifact, wo
 		}()
 	}
 	e.log(cj.ID, "artifact", "saved "+p)
+	if capture == nil && e.artifacts != nil {
+		// Local store mode: make the archive resolvable for downstream jobs'
+		// declared downloads in this run.
+		e.artifacts.record(cj.ID, a.Name, p)
+	}
 	if e.Opt.ArtifactReporter != nil {
 		if err := e.Opt.ArtifactReporter(cj.ID, a.Name, p); err != nil {
 			e.log(cj.ID, "artifact", "upload warning: "+err.Error())
@@ -1140,6 +1195,68 @@ func (e *Executor) saveArtifact(cj pipeline.CompiledJob, a pipeline.Artifact, wo
 			e.log(cj.ID, "artifact", "uploaded "+a.Name)
 		}
 	}
+}
+
+// restoreLocalDownloads restores the job's declared dependency downloads from
+// this run's locally saved artifacts. The workspace root is opened once
+// (no-follow) and every destination is resolved beneath that held handle by
+// artifact.Extract, so a symlink left by the checkout can never redirect an
+// extraction outside the workspace. A missing producer artifact is an error:
+// validation guarantees `from` is a needs dependency, so its absence means
+// the producer did not publish what the consumer declared.
+func (e *Executor) restoreLocalDownloads(inputs []pipeline.ArtifactInput, workspace string) error {
+	wsRoot, err := safefs.OpenWorkspaceRoot(workspace)
+	if err != nil {
+		return fmt.Errorf("downloads: open workspace root: %w", err)
+	}
+	defer wsRoot.Close()
+	for _, in := range inputs {
+		rel, err := localDownloadDest(in.Path)
+		if err != nil {
+			return err
+		}
+		from := strings.TrimSpace(in.From)
+		name := strings.TrimSpace(in.Name)
+		if from == "" || name == "" {
+			return fmt.Errorf("invalid download declaration (from=%q name=%q)", in.From, in.Name)
+		}
+		archive, ok := e.artifacts.lookup(from, name)
+		if !ok {
+			return fmt.Errorf("dependency artifact %q from %q was not produced by this run", name, from)
+		}
+		if err := artifact.Extract(archive, wsRoot.Root, rel); err != nil {
+			return fmt.Errorf("download %q from %q: %w", name, from, err)
+		}
+		e.log(wsRootID(workspace), "download", fmt.Sprintf("restored %s from %s", name, from))
+	}
+	return nil
+}
+
+// wsRootID renders a short workspace identity for download log lines (the
+// job ID is not available in the download path).
+func wsRootID(workspace string) string {
+	base := filepath.Base(workspace)
+	if len(base) > 16 {
+		base = base[:16]
+	}
+	return base
+}
+
+// localDownloadDest validates a declared download destination for local
+// runs: relative, confined, no backslashes (the portable-absolute check
+// covers both separators).
+func localDownloadDest(inPath string) (string, error) {
+	if inPath == "" {
+		return "", nil
+	}
+	clean := filepath.Clean(inPath)
+	if pipeline.IsPortableAbsPath(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) || strings.ContainsRune(clean, '\\') {
+		return "", fmt.Errorf("unsafe download path %q", inPath)
+	}
+	if clean == "." {
+		return "", nil
+	}
+	return filepath.ToSlash(clean), nil
 }
 
 // artifactCaptureLimit intersects the global artifact payload ceiling with

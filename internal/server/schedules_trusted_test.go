@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -184,5 +185,44 @@ func TestManualTriggerRechecksTrustedRun(t *testing.T) {
 	w = doJSON(t, s, http.MethodPost, "/api/v1/schedules/"+sc.ID+"/trigger", "creator", "")
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("manual trigger with trusted_run = %d, want 202: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestManualTriggerPolicyViolationMapsToForbidden: a schedule whose stored
+// spec targets an environment (a deployment) while the effective policy
+// denies deployments must answer 403 with the machine-readable violation
+// kind, exactly like the runs API — never a blanket 500 that hides an
+// authorization refusal as a server defect.
+func TestManualTriggerPolicyViolationMapsToForbidden(t *testing.T) {
+	s := storeServer(t, "", map[string]auth.Principal{
+		"ops": {Subject: "ops", Roles: []auth.Role{auth.RoleAdmin}},
+	})
+	const spec = `version: 1
+on:
+  schedule:
+    cron: "0 0 * * *"
+jobs:
+  deploy:
+    runtime: native
+    environment:
+      name: prod
+    steps:
+      - run: echo hi
+`
+	body := `{"repository":"acme/service","repo_url":"https://gitlab.com/acme/service.git","trusted":true,"spec":` + jsonString(spec) + `}`
+	w := doJSON(t, s, http.MethodPut, "/api/v1/schedules", "ops", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("put = %d: %s", w.Code, w.Body.String())
+	}
+	var sc storage.Schedule
+	if err := json.Unmarshal(w.Body.Bytes(), &sc); err != nil {
+		t.Fatal(err)
+	}
+	w = doJSON(t, s, http.MethodPost, "/api/v1/schedules/"+sc.ID+"/trigger", "ops", "")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("policy-denied trigger = %d, want 403: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"reason":"deployments"`) {
+		t.Fatalf("trigger body = %s, want reason deployments", w.Body.String())
 	}
 }

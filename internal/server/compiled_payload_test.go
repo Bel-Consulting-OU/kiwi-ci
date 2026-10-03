@@ -45,13 +45,9 @@ func TestCompiledJobPayloadInTask(t *testing.T) {
 	if !ok {
 		t.Fatalf("no compiled job for key %q", task.Job.Key)
 	}
-	// The enqueue applies the untrusted resource ceilings to the compiled
-	// job BEFORE marshaling the payload, so the recomputation must mirror
-	// that step to derive the same digest.
-	cj, err = s.applyUntrustedResourceCeilings(cj, task.Job.Trusted)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// The payload records the SPEC-DETERMINISTIC compile (the untrusted
+	// ceiling fill is applied only to the persisted relational fields, so
+	// the runner can verify the payload against its own recompilation).
 	cjJSON, err := json.Marshal(cj)
 	if err != nil {
 		t.Fatal(err)

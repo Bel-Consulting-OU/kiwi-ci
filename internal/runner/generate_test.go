@@ -236,6 +236,11 @@ func TestSnapshotRequested(t *testing.T) {
 		{"unlisted status not captured", []string{"failure"}, model.StatusSuccess, false},
 		{"cancelled not captured when unlisted", []string{"success", "failure"}, model.StatusCancelled, false},
 		{"multi-list match", []string{"success", "failure", "cancelled"}, model.StatusCancelled, true},
+		{"always captures success", []string{"always"}, model.StatusSuccess, true},
+		{"always captures failure", []string{"always"}, model.StatusFailure, true},
+		{"never captures nothing", []string{"never"}, model.StatusSuccess, false},
+		{"never overrides a positive entry", []string{"success", "never"}, model.StatusSuccess, false},
+		{"always with spacing/case", []string{" Always "}, model.StatusFailure, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

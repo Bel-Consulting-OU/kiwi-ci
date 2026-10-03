@@ -92,3 +92,43 @@ func TestContainerReadFileOversizeDoesNotHang(t *testing.T) {
 		t.Fatalf("oversize ReadFile = (%d bytes, %v), want a limit error", len(out), err)
 	}
 }
+
+func TestContainerInitEPERMDetection(t *testing.T) {
+	if !containerInitEPERM("docker: Error response from daemon: failed to create task: exec /sbin/docker-init: operation not permitted") {
+		t.Fatal("docker-init EPERM signature not detected")
+	}
+	if containerInitEPERM("docker: image pull failed: manifest unknown") {
+		t.Fatal("unrelated failure misclassified as init EPERM")
+	}
+	got := withoutFlag([]string{"run", "--init", "-d", "--init", "x"}, "--init")
+	if strings.Join(got, " ") != "run -d x" {
+		t.Fatalf("withoutFlag = %v", got)
+	}
+}
+
+// TestStartJobRetriesWithoutInitOnEPERM: when the daemon refuses docker-init
+// under no-new-privileges, StartJob retries once without --init and still
+// starts the hold container; any other run failure keeps failing.
+func TestStartJobRetriesWithoutInitOnEPERM(t *testing.T) {
+	dir := t.TempDir()
+	installFakeBins(t)
+	t.Setenv("FAKE_DOCKER_RUN_INIT_EPERM", "1")
+	t.Setenv("FAKE_DOCKER_RUN_INIT_EPERM_MARKER", filepath.Join(dir, "init-eperm-marker"))
+	b := &ContainerBackend{
+		RunID:    "run-init-retry",
+		JobID:    "job",
+		Image:    "alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc",
+		Rootless: true,
+	}
+	var lines []string
+	if err := b.StartJob(context.Background(), dir, func(s string) { lines = append(lines, s) }); err != nil {
+		t.Fatalf("StartJob with init EPERM retry: %v", err)
+	}
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "retrying without --init") {
+		t.Fatalf("retry warning missing: %s", joined)
+	}
+	if !strings.Contains(joined, "job container started") {
+		t.Fatalf("container did not start after retry: %s", joined)
+	}
+}

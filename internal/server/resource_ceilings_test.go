@@ -64,16 +64,21 @@ func TestUntrustedResourceCeilingsAppliedAtEnqueue(t *testing.T) {
 	if job.PIDsRequest != 256 {
 		t.Fatalf("PIDsRequest = %d, want 256", job.PIDsRequest)
 	}
-	// The effective compiled job payload carries the ceilings too (the
-	// executor reads it, so the limits are actually applied).
+	// The effective compiled job payload is the SPEC-DETERMINISTIC compile
+	// (unfilled) so the runner can verify it against its own recompilation;
+	// the ceiling values reach execution through the persisted relational
+	// request fields above, which the runner re-applies over the verified
+	// payload.
 	raw, err := json.Marshal(job.CompiledJobPayload.EffectiveJob)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`"cpu":2`, `"memory":4294967296`, `"disk":10737418240`, `"pids":256`} {
-		if !strings.Contains(string(raw), want) {
-			t.Fatalf("effective job payload missing %s: %s", want, raw)
-		}
+	var eff pipeline.CompiledJob
+	if err := json.Unmarshal(raw, &eff); err != nil {
+		t.Fatal(err)
+	}
+	if eff.Job.Resources != (pipeline.Resources{}) {
+		t.Fatalf("payload resources = %+v, want the unfilled spec-deterministic compile", eff.Job.Resources)
 	}
 }
 

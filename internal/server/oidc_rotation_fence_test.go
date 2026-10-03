@@ -364,3 +364,14 @@ func TestOIDCJWTAlwaysUsesPublishedActiveKey(t *testing.T) {
 		t.Fatalf("issued token kid %q != published active kid %q", header.KID, published.KID)
 	}
 }
+
+// TestOIDCJWKSPublishesProvenanceKey: the documented `kiwi verify` flow
+// resolves artifact DSSE key ids against the server JWKS, so the JWKS must
+// include the dedicated provenance signing key alongside the OIDC ring.
+func TestOIDCJWKSPublishesProvenanceKey(t *testing.T) {
+	s := New("token")
+	prov := s.ensureProvenanceKey()
+	if !containsKID(oidcJWKSKids(t, s), prov.KID) {
+		t.Fatalf("JWKS does not publish the provenance key %q: %v", prov.KID, oidcJWKSKids(t, s))
+	}
+}

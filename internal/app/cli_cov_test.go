@@ -89,6 +89,25 @@ func TestRunLocalNativePipeline(t *testing.T) {
 	}
 }
 
+// TestRunLocalBranchConditionParity: a job guarded by `if: branch == 'main'`
+// must RUN under kiwi run on branch main (the same context kiwi explain
+// --why uses), and a job whose condition references another branch must
+// skip. Each job fails on purpose when it runs, so the returned error names
+// exactly the jobs whose condition let them run.
+func TestRunLocalBranchConditionParity(t *testing.T) {
+	dir := t.TempDir()
+	initGitRepo(t, dir)
+	path := writePipeline(t, dir, "version: 1\njobs:\n  on-main:\n    if: \"branch == 'main'\"\n    steps:\n      - run: exit 1\n  on-other:\n    if: \"branch == 'other'\"\n    steps:\n      - run: exit 1\n")
+	chdir(t, dir)
+	err := RunLocal(context.Background(), []string{"-f", path})
+	if err == nil || !strings.Contains(err.Error(), "on-main") {
+		t.Fatalf("RunLocal err = %v, want the on-main job to run (branch == 'main') and fail", err)
+	}
+	if strings.Contains(err.Error(), "on-other") {
+		t.Fatalf("RunLocal err = %v; the on-other job ran under branch main, its condition did not skip it", err)
+	}
+}
+
 func TestRunLocalErrors(t *testing.T) {
 	dir := t.TempDir()
 	chdir(t, dir)

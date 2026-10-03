@@ -1216,6 +1216,13 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 				return
 			}
 		}
+		// The signed payload records the spec-deterministic compile; the
+		// server fills untrusted zero-declared requests with its configured
+		// ceilings only in the PERSISTED relational fields (the payload
+		// cannot carry them: the runner cannot reproduce operator
+		// configuration). Re-apply the persisted values so execution bounds
+		// and the scheduler's reservations agree.
+		applyPersistedResourceRequests(&cj, t.Job)
 	} else {
 		g, gerr := pipeline.Compile(spec)
 		if gerr != nil {
@@ -1649,6 +1656,27 @@ func checkShardAssignment(cj pipeline.CompiledJob) error {
 // declaration) inherits the ceiling. The result is written into the
 // compiled job's sandbox.network, which the executor backend derives
 // isolation from.
+// applyPersistedResourceRequests overlays the persisted relational request
+// fields onto the verified compiled job. The payload records the
+// spec-deterministic compile (untrusted zero-declared requests are NOT
+// filled there, because the fill depends on operator ceilings the runner
+// cannot reproduce); the persisted fields carry the values the scheduler
+// reserved, so execution bounds and reservations stay identical.
+func applyPersistedResourceRequests(cj *pipeline.CompiledJob, j model.Job) {
+	if j.CPURequest > 0 {
+		cj.Job.Resources.CPU = j.CPURequest
+	}
+	if j.MemoryRequest > 0 {
+		cj.Job.Resources.Memory = pipeline.ByteSize(j.MemoryRequest)
+	}
+	if j.DiskRequest > 0 {
+		cj.Job.Resources.Disk = pipeline.ByteSize(j.DiskRequest)
+	}
+	if j.PIDsRequest > 0 {
+		cj.Job.Resources.PIDs = j.PIDsRequest
+	}
+}
+
 func applyEffectiveNetwork(cj *pipeline.CompiledJob, caps policy.Capabilities) error {
 	requested := requestedNetworkPolicy(cj.Job)
 	ceiling := caps.Network
@@ -1921,11 +1949,23 @@ func gitEnvForRepo(repoURL string, osEnv []string) ([]string, error) {
 }
 
 func isLoopbackHost(host string) bool {
-	switch host {
-	case "127.0.0.1", "localhost", "::1":
+	h := strings.TrimSpace(host)
+	if h == "" || strings.EqualFold(h, "localhost") {
 		return true
 	}
-	return false
+	// The canonical host may carry a port. Bracketed IPv6 splits directly;
+	// an unbracketed IPv6+port form ("::1:39418", which canonHostPort
+	// produces) is ambiguous, so only split off a numeric tail when the
+	// remainder still parses as an address.
+	if hh, _, err := net.SplitHostPort(h); err == nil {
+		h = hh
+	} else if i := strings.LastIndex(h, ":"); i >= 0 {
+		if tail := net.ParseIP(h[:i]); tail != nil {
+			h = h[:i]
+		}
+	}
+	ip := net.ParseIP(strings.Trim(h, "[]"))
+	return ip != nil && ip.IsLoopback()
 }
 
 func containsHost(list []string, host string) bool {
@@ -2564,12 +2604,26 @@ func buildTestReportDelivery(jobID string, leaseGeneration int64, runnerID, leas
 }
 
 // snapshotRequested reports whether the job's snapshot declaration captures
-// this final status. An empty snapshot.on captures every outcome; a
-// non-empty list captures only the listed final status strings
-// (success/failure/cancelled). The caller applies CaptureSnapshots as the
-// master switch before consulting this predicate.
+// this final status. An empty snapshot.on captures every outcome; the
+// documented keywords capture every outcome ("always") or nothing ("never"),
+// with "never" overriding any positive entry; other entries match the final
+// status string (success/failure/cancelled). The caller applies
+// CaptureSnapshots as the master switch before consulting this predicate.
 func snapshotRequested(s pipeline.SnapshotSpec, st model.Status) bool {
 	if len(s.On) == 0 {
+		return true
+	}
+	always := false
+	for _, o := range s.On {
+		switch strings.ToLower(strings.TrimSpace(o)) {
+		case "never":
+			// Explicit deny wins over any positive entry in the list.
+			return false
+		case "always":
+			always = true
+		}
+	}
+	if always {
 		return true
 	}
 	for _, o := range s.On {

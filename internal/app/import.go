@@ -18,7 +18,10 @@ import (
 // silently approximates behavior: unsupported constructs are reported as
 // warnings and TODO placeholders with a confidence score.
 func Import(args []string) error {
-	if len(args) == 0 {
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		// `kiwi import --help` (or a missing tool) must print the usage
+		// instead of treating the flag as a source tool and failing in file
+		// detection.
 		return fmt.Errorf("usage: kiwi import <github-actions|gitlab|circleci|woodpecker> [--file <path>] [--out <path>] [--list-unsupported]")
 	}
 	tool := args[0]

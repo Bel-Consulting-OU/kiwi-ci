@@ -430,16 +430,20 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 		if !parent.Trusted && cj.Job.Runtime == "container" {
 			effectiveNetwork = "none"
 		}
-		// Untrusted children get the server-side resource ceilings just
-		// like initial enqueues, BEFORE the compiled payload is marshaled:
-		// an explicit request above a ceiling rejects the whole fragment.
-		cj, err = s.applyUntrustedResourceCeilings(cj, parent.Trusted)
-		if err != nil {
-			return nil, err
-		}
+		// The payload is marshaled BEFORE the ceiling fill so the runner can
+		// recompile the fragment's own pipeline (stored in Job.Pipeline) and
+		// match it byte-exactly; the filled request values reach execution
+		// through the persisted relational fields the runner re-applies.
 		cjJSON, mErr := jsonMarshal(cj)
 		if mErr != nil {
 			return nil, mErr
+		}
+		// Untrusted children get the server-side resource ceilings just
+		// like initial enqueues: an explicit request above a ceiling
+		// rejects the whole fragment.
+		cj, err = s.applyUntrustedResourceCeilings(cj, parent.Trusted)
+		if err != nil {
+			return nil, err
 		}
 		digestSum := sha256.Sum256(cjJSON)
 		needs := []string{parent.ID}

@@ -393,3 +393,24 @@ func TestViolationClassification(t *testing.T) {
 		t.Fatalf("Error() without detail = %q", got)
 	}
 }
+
+// TestValidateAdmissionTrustedDeferrsDeployments: the bare runner baseline
+// admits a trusted deployment (deployments are an opt-in CONTROL-PLANE grant
+// carried by the signed effective policy, not a trust-domain sandbox bound),
+// while an untrusted run keeps the hard no-deployments floor.
+func TestValidateAdmissionTrustedDeferrsDeployments(t *testing.T) {
+	deploy := mustParse(t, `version: 1
+jobs:
+  ship:
+    steps:
+      - run: echo deploy
+    environment:
+      name: prod
+`)
+	if err := ValidateAdmission(deploy, true); err != nil {
+		t.Fatalf("trusted deployment baseline = %v, want deferred to the effective policy", err)
+	}
+	if err := ValidateAdmission(deploy, false); err == nil {
+		t.Fatal("untrusted deployment must be denied by the hard floor")
+	}
+}

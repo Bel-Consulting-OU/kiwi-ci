@@ -662,12 +662,21 @@ func (s *Server) oidcJWKS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	keys := make([]any, 0, 1+len(signer.Previous))
+	keys := make([]any, 0, 2+len(signer.Previous))
 	keys = append(keys, oidcJWK(signer.KID, signer.Public))
 	for _, p := range signer.Previous {
 		if p.RetireAfter.After(now) {
 			keys = append(keys, oidcJWK(p.KID, p.Public))
 		}
+	}
+	// The provenance signing key is published in the same set: the
+	// documented `kiwi verify` flow resolves artifact DSSE key ids against
+	// the server JWKS (docs/artifacts.md), and without this entry every
+	// server-signed artifact failed with "unknown verification key" — the
+	// provenance key is a distinct key root with its own kid, so OIDC
+	// consumers still select strictly by kid.
+	if s.provenance != nil {
+		keys = append(keys, oidcJWK(s.provenance.KID, s.provenance.Public))
 	}
 	body, err := jsonMarshal(map[string]any{"keys": keys})
 	if err != nil {

@@ -15,6 +15,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 	"gopkg.in/yaml.v3"
 )
@@ -675,11 +676,29 @@ func (s *Server) triggerSchedule(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// A non-durable enqueue is the same server-side condition as on every
 		// other ingress: 503 + the fixed opaque "state not durable" body.
-		// Any other fire error (invalid stored identity, ID generation, a
-		// failed durable re-read) stays the generic 500.
 		if s.respondNotDurableError(w, r, err) {
 			return
 		}
+		// A policy/admission rejection is a client-visible refusal carrying
+		// its own status and reason, exactly like the runs API; only
+		// genuinely unexpected failures are 500.
+		var adm *admissionError
+		if errors.As(err, &adm) {
+			writeJSON(w, adm.Status, map[string]string{"error": adm.Msg, "reason": adm.Reason})
+			return
+		}
+		var denial *opaDenialError
+		if errors.As(err, &denial) {
+			http.Error(w, denial.Error(), http.StatusForbidden)
+			return
+		}
+		var violation *policy.Violation
+		if errors.As(err, &violation) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": violation.Error(), "reason": violation.Kind})
+			return
+		}
+		// Any other fire error (invalid stored identity, ID generation, a
+		// failed durable re-read) stays the generic 500.
 		s.internalError(w, r, err, "")
 		return
 	}

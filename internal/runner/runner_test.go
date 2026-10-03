@@ -126,6 +126,17 @@ func TestGitEnvForRepo(t *testing.T) {
 		if _, err := gitEnvForRepo("http://127.0.0.1/repo.git", nil); err != nil {
 			t.Fatalf("loopback with opt-in should be allowed: %v", err)
 		}
+		// A non-default port is still loopback (the canonical host carries
+		// host:port; the port must not defeat the loopback check).
+		if _, err := gitEnvForRepo("http://127.0.0.1:39418/owner/repo.git", nil); err != nil {
+			t.Fatalf("loopback host with port should be allowed: %v", err)
+		}
+		if _, err := gitEnvForRepo("http://[::1]:39418/owner/repo.git", nil); err != nil {
+			t.Fatalf("ipv6 loopback host with port should be allowed: %v", err)
+		}
+		if _, err := gitEnvForRepo("http://10.0.0.1:39418/owner/repo.git", nil); err == nil {
+			t.Fatal("non-loopback host with port must be rejected")
+		}
 	})
 	t.Run("file and git schemes rejected", func(t *testing.T) {
 		if _, err := gitEnvForRepo("file:///etc/passwd", nil); err == nil {

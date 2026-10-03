@@ -1703,24 +1703,29 @@ func (s *Server) enqueueID(ctx context.Context, in SubmitRun, preRunID string) (
 		if !in.Trusted && cj.Job.Runtime == "container" {
 			effectiveNetwork = "none"
 		}
-		// Untrusted jobs without declared resources get the server-side
-		// ceilings BEFORE the compiled payload is marshaled, so both the
-		// effective-job record and the persisted request fields carry them
-		// and the executor always applies limits to untrusted work. An
-		// explicit request above a ceiling is rejected here, before the job
-		// digest is signed and anything is persisted.
-		cj, err = s.applyUntrustedResourceCeilings(cj, in.Trusted)
-		if err != nil {
-			return model.Run{}, err
-		}
 		// The compiled job payload is the deterministic enqueue-time record
-		// the runner can verify its own recompilation against.
+		// the runner can verify against its OWN recompilation of the same
+		// pipeline text. It is marshaled BEFORE the untrusted resource
+		// ceiling fill below: the fill depends on operator configuration the
+		// runner cannot know, so it must not enter the spec-deterministic
+		// payload. The filled values still reach execution through the
+		// persisted relational request fields (applyCompiledJobFields), which
+		// the runner re-applies over the verified payload.
 		cjJSON, mErr := jsonMarshal(cj)
 		if mErr != nil {
 			return model.Run{}, mErr
 		}
 		digestSum := sha256.Sum256(cjJSON)
 		jobDigest := hex.EncodeToString(digestSum[:])
+		// Untrusted jobs without declared resources get the server-side
+		// ceilings in the PERSISTED request fields (the executor always
+		// applies limits to untrusted work; the scheduler reserves them).
+		// An explicit request above a ceiling is rejected here, before
+		// anything is persisted.
+		cj, err = s.applyUntrustedResourceCeilings(cj, in.Trusted)
+		if err != nil {
+			return model.Run{}, err
+		}
 		jobContracts[jobIDs[key]] = buildJobContracts(cj)
 		j := model.Job{
 			ID: jobIDs[key], RunID: runID, Key: key, BaseKey: cj.BaseID, RepoID: in.RepoID, PolicyRepoID: policyID, CheckoutRepoURL: checkoutURL, ForgeKind: in.ForgeKind, ForgeHost: in.ForgeHost,
