@@ -1396,6 +1396,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// in depth and never re-probes when execute reported one.
 	opts.RequireUntrustedDiskQuota = requireDiskQuota
 	opts.WorkspaceQuota = workspaceQuota
+	opts.OnCgroupCreated = func(parent string) { r.ledgerSetCgroup(ledgerID, parent) }
 	// Step durations come from the executor's wall-clock step measurements
 	// (StepReporter), never from sink-derived log timing.
 	applyStepReporter(&opts, r.Metrics)

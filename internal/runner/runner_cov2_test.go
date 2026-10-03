@@ -524,3 +524,43 @@ func canonicalRunnerDir(t *testing.T) string {
 	}
 	return dir
 }
+
+// TestRunGetsFreshInstanceIDPerCall pins the per-Run incarnation: an
+// in-process Run restart must never reuse the previous run's instance ID,
+// otherwise reconciliation would classify the first incarnation's leftovers
+// as current.
+func TestRunGetsFreshInstanceIDPerCall(t *testing.T) {
+	// A failing docker discovery stops Run AFTER the instance ID is assigned
+	// but before any lease, so two consecutive Run calls can be compared.
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "docker"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/register") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"runner-instance"}`))
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ts.Close()
+	r := &Runner{
+		ID:  "runner-instance",
+		Cfg: Config{Server: ts.URL, WorkDir: t.TempDir(), IdentityDir: t.TempDir(), Poll: time.Millisecond},
+	}
+	if err := r.Run(context.Background()); err == nil {
+		t.Fatal("Run with failing reconciliation succeeded")
+	}
+	first := r.instanceID
+	if first == "" {
+		t.Fatal("Run did not assign an instance ID")
+	}
+	if err := r.Run(context.Background()); err == nil {
+		t.Fatal("second Run with failing reconciliation succeeded")
+	}
+	if r.instanceID == first {
+		t.Fatalf("in-process Run restart reused instance ID %q", first)
+	}
+}

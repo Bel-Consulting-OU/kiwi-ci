@@ -136,3 +136,72 @@ func TestRuntimeLedgerKeepsEntryWhenXFSReclaimFails(t *testing.T) {
 		t.Fatalf("workspace survived the retry: %v", err)
 	}
 }
+
+func TestRuntimeLedgerReclaimsCgroupBeforeRetiring(t *testing.T) {
+	r := &Runner{Cfg: Config{WorkDir: t.TempDir()}}
+	ws := filepath.Join(t.TempDir(), "kiwi-run-cg")
+	if err := os.MkdirAll(ws, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	id := r.ledgerAdd(runtimeLedgerEntry{Instance: "instance-A", JobID: "job-cg", Workspace: ws})
+	r.ledgerSetCgroup(id, "/delegated/kiwi-job-cg")
+
+	prev := reclaimJobCgroup
+	calls := 0
+	fail := false
+	reclaimJobCgroup = func(parent string) error {
+		calls++
+		if fail {
+			return errors.New("cgroup busy")
+		}
+		if parent != "/delegated/kiwi-job-cg" {
+			t.Errorf("reclaim parent = %q", parent)
+		}
+		return nil
+	}
+	t.Cleanup(func() { reclaimJobCgroup = prev })
+
+	fail = true
+	if n := r.reconcileRuntimeLedger("instance-B"); n != 0 {
+		t.Fatalf("failed cgroup reclaim retired %d entries", n)
+	}
+	fail = false
+	if n := r.reconcileRuntimeLedger("instance-B"); n != 1 {
+		t.Fatalf("retry reclaimed %d entries, want 1", n)
+	}
+	if calls != 2 {
+		t.Fatalf("cgroup reclaim calls = %d, want 2", calls)
+	}
+}
+
+// TestRuntimeLedgerConvergesManyCrashedJobs pins convergence at scale: many
+// previous-incarnation entries are reclaimed in one pass.
+func TestRuntimeLedgerConvergesManyCrashedJobs(t *testing.T) {
+	r := &Runner{Cfg: Config{WorkDir: t.TempDir()}}
+	prev := reclaimJobCgroup
+	reclaimJobCgroup = func(string) error { return nil }
+	t.Cleanup(func() { reclaimJobCgroup = prev })
+	for i := 0; i < 100; i++ {
+		ws := filepath.Join(t.TempDir(), "kiwi-run-bulk")
+		if err := os.MkdirAll(ws, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		id := r.ledgerAdd(runtimeLedgerEntry{Instance: "instance-old", JobID: "job", Workspace: ws})
+		r.ledgerSetCgroup(id, "/delegated/kiwi-job-old")
+	}
+	if n := r.reconcileRuntimeLedger("instance-new"); n != 100 {
+		t.Fatalf("reclaimed %d entries, want 100", n)
+	}
+	files, err := os.ReadDir(r.runtimeLedgerDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range files {
+		if strings.HasSuffix(f.Name(), ".json") {
+			b, _ := os.ReadFile(filepath.Join(r.runtimeLedgerDir(), f.Name()))
+			if len(b) > 0 {
+				t.Fatalf("unreclaimed ledger entry %s", f.Name())
+			}
+		}
+	}
+}

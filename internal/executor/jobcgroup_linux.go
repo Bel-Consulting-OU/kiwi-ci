@@ -173,3 +173,28 @@ func runnerCgroupDir(root string) (string, bool) {
 	}
 	return "", false
 }
+
+// ReclaimJobCgroup removes a job-scoped parent cgroup left behind by a
+// crashed process incarnation. It is called only AFTER runtime reconciliation
+// proved the job's containers gone, so the cgroup should be empty; a
+// populated/busy cgroup reports an error and the caller keeps the ledger
+// entry retryable instead of leaking the kernel state.
+func ReclaimJobCgroup(parent string) error {
+	parent = strings.TrimSpace(parent)
+	if parent == "" {
+		return nil
+	}
+	if !strings.HasPrefix(parent, "/") || strings.Contains(parent, "..") {
+		return fmt.Errorf("refusing to reclaim malformed job cgroup path %q", parent)
+	}
+	root := jobCgroupRoot()
+	dir := filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(parent, "/")))
+	rel, err := filepath.Rel(root, dir)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("job cgroup %q escapes the cgroup root %s", parent, root)
+	}
+	if err := os.Remove(dir); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove job cgroup %s: %w", dir, err)
+	}
+	return nil
+}

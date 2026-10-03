@@ -221,3 +221,18 @@ func TestTartIdentityHashMatchesBoundedNormalizedNameSuffix(t *testing.T) {
 		t.Fatalf("tart identity hash %q != boundedNormalizedName suffix %q", got, want)
 	}
 }
+
+// TestParseForeignTartClonesUsesOwnershipTags pins crash reconciliation for
+// Tart: only same-runner/different-instance clones are reaped.
+func TestParseForeignTartClonesUsesOwnershipTags(t *testing.T) {
+	const runnerID, current = "runner-1", "instance-new"
+	stale := tartCloneNameFor("run-1", "job-1", 123, runnerID, "instance-old")
+	live := tartCloneNameFor("run-1", "job-2", 124, runnerID, current)
+	otherRunner := tartCloneNameFor("run-1", "job-3", 125, "runner-2", "instance-old")
+	legacy := "kiwi-1700000000000000000"
+	out := strings.Join([]string{stale, live, otherRunner, legacy}, "\n")
+	got := parseForeignTartClones([]byte(out), runnerID, current)
+	if len(got) != 1 || got[0] != stale {
+		t.Fatalf("parseForeignTartClones = %v, want only %q", got, stale)
+	}
+}

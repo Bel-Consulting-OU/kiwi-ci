@@ -39,10 +39,14 @@ type Options struct {
 	// service container and network is labelled with both, and a restarted
 	// runner reaps only resources carrying ITS stable RunnerID but a previous
 	// InstanceID. Empty values keep the legacy unlabelled behavior.
-	RunnerID    string
-	InstanceID  string
-	MaxParallel int
-	OnlyJob     string
+	RunnerID   string
+	InstanceID string
+	// OnCgroupCreated, when set, receives the job-scoped cgroup path as soon
+	// as it exists so the caller (the runner's runtime ledger) can reclaim it
+	// after a hard crash.
+	OnCgroupCreated func(parent string)
+	MaxParallel     int
+	OnlyJob         string
 	// OnlyStep, when set, executes just the named step (by step ID or by
 	// resolved name, including canary./verify./rollback. prefixes) of the
 	// selected job. Used by `kiwi replay RUN JOB STEP`. Steps that do not
@@ -544,6 +548,9 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		})
 		if cgStatus.Enabled && cgCleanup != nil {
 			cgroupParent = cgStatus.Parent
+			if e.Opt.OnCgroupCreated != nil {
+				e.Opt.OnCgroupCreated(cgStatus.Parent)
+			}
 			// Registered before the services/backend cleanup defers below,
 			// so it runs AFTER the containers are gone (LIFO).
 			defer func() {

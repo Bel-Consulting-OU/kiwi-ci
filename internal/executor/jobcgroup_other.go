@@ -11,3 +11,6 @@ import "context"
 func setupJobCgroup(context.Context, jobCgroupRequest) (JobCgroupStatus, func() error) {
 	return JobCgroupStatus{Detail: "job resource cgroups (docker --cgroup-parent) require a Linux host with a delegated cgroup v2 hierarchy"}, nil
 }
+
+// ReclaimJobCgroup is a no-op where job cgroups are never created.
+func ReclaimJobCgroup(string) error { return nil }

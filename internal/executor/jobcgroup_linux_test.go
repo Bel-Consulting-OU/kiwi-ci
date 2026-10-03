@@ -242,3 +242,35 @@ func TestDockerAcceptsCgroupPathDriverClassification(t *testing.T) {
 		})
 	}
 }
+
+// TestReclaimJobCgroupRemovesEmptyAndRetainsBusy pins crash cgroup recovery:
+// an empty job cgroup is removed; a populated one is a retryable error.
+func TestReclaimJobCgroupRemovesEmptyAndRetainsBusy(t *testing.T) {
+	simulateCgroupControlFiles(t)
+	root, _ := writeCgroupRoot(t, true)
+	t.Setenv(jobCgroupRootEnv, root)
+	parent := "/delegated/kiwi-job-reclaim"
+	dir := filepath.Join(root, "delegated", "kiwi-job-reclaim")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReclaimJobCgroup(parent); err != nil {
+		t.Fatalf("reclaim empty cgroup: %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("empty cgroup survived: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "child"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReclaimJobCgroup(parent); err == nil {
+		t.Fatal("populated cgroup reclaim reported success")
+	}
+	// Missing cgroup is a no-op; malformed paths are refused.
+	if err := ReclaimJobCgroup(""); err != nil {
+		t.Fatalf("empty cgroup path: %v", err)
+	}
+	if err := ReclaimJobCgroup("../escape"); err == nil {
+		t.Fatal("traversal cgroup path accepted")
+	}
+}
