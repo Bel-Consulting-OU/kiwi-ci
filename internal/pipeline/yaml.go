@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"strings"
 	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
@@ -113,65 +114,136 @@ var yamlDecodeDocument = func(data []byte) (yaml.Node, error) {
 	return doc, nil
 }
 
-// preflightYAMLStructure counts structural indicators in O(bytes) BEFORE any
-// node tree is allocated. Every YAML node needs at least one indicator
-// ('-', ':', '[', '{', ',') outside scalars and comments, so a document with
-// more indicators than maxYAMLStructuralTokens cannot decode into a tree
-// within the node budget: rejecting it here bounds the PEAK parser
-// allocation instead of only the post-decode node count.
+// preflightYAMLStructure counts structural indicators in O(bytes) BEFORE
+// any node tree is allocated, with a plain-scalar-aware scanner:
+//
+//   - quote characters only open a quoted scalar at a scalar-start position
+//     (after ':', '-', '[', '{', ',' or line start); a quote inside a plain
+//     scalar ("name: it's") is literal and must NOT swallow the rest of the
+//     document;
+//   - quotes never span a line in this scanner (a plain scalar cannot), so an
+//     unterminated quote simply stops counting at end of line;
+//   - block scalars (|, >, with +/-/digits) skip their more-indented body;
+//   - '#' starts a comment only at line start or after whitespace.
 func preflightYAMLStructure(data []byte) error {
 	structural := 0
-	inSingle, inDouble, escaped, inComment := false, false, false, false
-	for i := 0; i < len(data); i++ {
-		c := data[i]
-		if inComment {
-			if c == '\n' {
-				inComment = false
-			}
+	blockIndent := -1
+	lineNo := 0
+	start := 0
+	for i := 0; i <= len(data); i++ {
+		if i != len(data) && data[i] != '\n' {
 			continue
 		}
-		if inSingle {
-			if c == '\'' {
-				if i+1 < len(data) && data[i+1] == '\'' {
-					i++
-				} else {
-					inSingle = false
-				}
-			}
-			continue
-		}
-		if inDouble {
-			if escaped {
-				escaped = false
+		lineNo++
+		line := data[start:i]
+		start = i + 1
+		indent := yamlLineIndent(line)
+		if blockIndent >= 0 {
+			if indent > blockIndent {
 				continue
 			}
-			switch c {
-			case '\\':
-				escaped = true
-			case '"':
-				inDouble = false
-			}
+			blockIndent = -1
+		}
+		if yamlOpensBlockScalar(line) {
+			blockIndent = indent
 			continue
 		}
-		switch c {
-		case '#':
-			if i == 0 || data[i-1] == ' ' || data[i-1] == '\t' || data[i-1] == '\n' {
-				inComment = true
-			}
-		case '\'':
-			inSingle = true
-		case '"':
-			inDouble = true
-		case '-', ':', '[', ']', '{', '}', ',':
-			structural++
-			if structural > maxYAMLStructuralTokens {
-				line, col := lineCol(data, i)
-				return fmt.Errorf("yaml: line %d, column %d: document exceeds the %d structural-token complexity budget", line, col, maxYAMLStructuralTokens)
-			}
+		n, err := countYAMLStructuralTokens(line)
+		if err != nil {
+			return fmt.Errorf("yaml: line %d: %w", lineNo, err)
+		}
+		structural += n
+		if structural > maxYAMLStructuralTokens {
+			return fmt.Errorf("yaml: line %d: document exceeds the %d structural-token complexity budget", lineNo, maxYAMLStructuralTokens)
 		}
 	}
 	return nil
 }
+
+// yamlLineIndent returns the count of leading spaces/tabs of a line.
+func yamlLineIndent(line []byte) int {
+	n := 0
+	for _, c := range line {
+		if c != ' ' && c != '\t' {
+			break
+		}
+		n++
+	}
+	return n
+}
+
+// countYAMLStructuralTokens counts '-', ':', '[', ']', '{', '}', ',' outside
+// quoted scalars and comments on one line.
+func countYAMLStructuralTokens(line []byte) (int, error) {
+	count := 0
+	var quote byte
+	prevNonSpace := byte(0)
+	atLineStart := true
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		if quote != 0 {
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case ' ', '\t':
+			continue
+		case '#':
+			if atLineStart || prevNonSpace == ' ' || prevNonSpace == '\t' || prevNonSpace == 0 {
+				return count, nil
+			}
+		case '\'', '"':
+			if yamlScalarStart(prevNonSpace) || atLineStart {
+				quote = c
+			}
+		case '-', ':', '[', ']', '{', '}', ',':
+			count++
+			if count > maxYAMLStructuralTokens {
+				return count, nil
+			}
+		}
+		prevNonSpace = c
+		atLineStart = false
+	}
+	return count, nil
+}
+
+// yamlScalarStart reports whether a quote at this position opens a scalar.
+func yamlScalarStart(prev byte) bool {
+	switch prev {
+	case ':', '-', '[', '{', ',', '?':
+		return true
+	}
+	return false
+}
+
+// yamlOpensBlockScalar reports whether a line ends with a block-scalar
+// indicator (| or > plus optional chomping/indent digits) at a value
+// position.
+func yamlOpensBlockScalar(line []byte) bool {
+	trimmed := strings.TrimRight(string(line), " \t")
+	if trimmed == "" {
+		return false
+	}
+	// Strip an unquoted trailing comment.
+	if idx := strings.Index(trimmed, " #"); idx >= 0 {
+		trimmed = strings.TrimSpace(trimmed[:idx])
+	}
+	indicator := trimmed[len(trimmed)-1]
+	if indicator != '|' && indicator != '>' {
+		return false
+	}
+	body := strings.TrimRight(trimmed[:len(trimmed)-1], "+-0123456789")
+	if body == "" || !strings.HasSuffix(body, " ") {
+		return false
+	}
+	// Require a mapping key before the indicator; a bare expression ending in
+	// '>' must not suppress counting.
+	return strings.Contains(body, ":")
+}
+
 func yamlError(err error) error {
 	if err == nil {
 		return nil
@@ -280,7 +352,7 @@ var knownFieldTables = map[string]map[string]bool{
 	"defaults":       {"shell": true, "timeout": true, "retry": true},
 	"concurrency":    {"group": true, "cancel_in_progress": true},
 	"permissions":    {"id_token": true},
-	"defaults.retry": {"max": true, "backoff": true, "on": true},
+	"defaults.retry": {"max": true, "backoff": true, "on": true, "max_set": true},
 	"on.*": {
 		"branches": true, "branches_ignore": true, "tags": true, "tags_ignore": true,
 		"paths": true, "paths_ignore": true, "actions": true, "draft": true,
@@ -299,8 +371,9 @@ var knownFieldTables = map[string]map[string]bool{
 		"placement": true, "sandbox": true, "resources": true,
 		"tests": true, "generate": true, "downstream": true, "deployment": true,
 		"snapshot": true, "component": true, "with": true, "queue_timeout": true,
+		"infra_retries_set": true,
 	},
-	"jobs.*.retry":                       {"max": true, "backoff": true, "on": true},
+	"jobs.*.retry":                       {"max": true, "backoff": true, "on": true, "max_set": true},
 	"jobs.*.environment":                 {"name": true, "url": true, "approval": true, "branches": true, "concurrency": true},
 	"jobs.*.sandbox":                     {"rootless": true, "read_only_rootfs": true, "network": true},
 	"jobs.*.placement":                   {"regions": true, "labels": true},
@@ -310,9 +383,9 @@ var knownFieldTables = map[string]map[string]bool{
 	"jobs.*.downstream":                  {"repository": true, "ref": true, "event": true, "inputs": true, "wait": true},
 	"jobs.*.snapshot":                    {"on": true},
 	"jobs.*.deployment":                  {"canary": true, "verify": true, "rollback": true},
-	"jobs.*.services.*":                  {"name": true, "image": true, "env": true, "healthcheck": true, "interval": true, "timeout": true, "retries": true},
+	"jobs.*.services.*":                  {"name": true, "image": true, "env": true, "healthcheck": true, "interval": true, "timeout": true, "retries": true, "retries_set": true},
 	"jobs.*.steps.*":                     {"id": true, "name": true, "run": true, "if": true, "shell": true, "working_directory": true, "env": true, "secrets": true, "timeout": true, "retry": true, "continue_on_error": true},
-	"jobs.*.steps.*.retry":               {"max": true, "backoff": true, "on": true},
+	"jobs.*.steps.*.retry":               {"max": true, "backoff": true, "on": true, "max_set": true},
 	"jobs.*.cache.*":                     {"name": true, "paths": true, "key": true, "hash_files": true, "restore_keys": true},
 	"jobs.*.artifacts.*":                 {"name": true, "paths": true, "if": true, "retention": true, "sbom": true, "sigstore": true, "required": true, "max_size": true},
 	"jobs.*.artifacts.*.sigstore":        {"required": true, "issuer": true, "identity": true},
@@ -320,8 +393,8 @@ var knownFieldTables = map[string]map[string]bool{
 	"jobs.*.deployment.canary.*":         {"id": true, "name": true, "run": true, "if": true, "shell": true, "working_directory": true, "env": true, "secrets": true, "timeout": true, "retry": true, "continue_on_error": true},
 	"jobs.*.deployment.verify.*":         {"id": true, "name": true, "run": true, "if": true, "shell": true, "working_directory": true, "env": true, "secrets": true, "timeout": true, "retry": true, "continue_on_error": true},
 	"jobs.*.deployment.rollback.*":       {"id": true, "name": true, "run": true, "if": true, "shell": true, "working_directory": true, "env": true, "secrets": true, "timeout": true, "retry": true, "continue_on_error": true},
-	"jobs.*.deployment.canary.*.retry":   {"max": true, "backoff": true, "on": true},
-	"jobs.*.deployment.verify.*.retry":   {"max": true, "backoff": true, "on": true},
+	"jobs.*.deployment.canary.*.retry":   {"max": true, "backoff": true, "on": true, "max_set": true},
+	"jobs.*.deployment.verify.*.retry":   {"max": true, "backoff": true, "on": true, "max_set": true},
 	"jobs.*.deployment.rollback.*.retry": {"max": true, "backoff": true, "on": true},
 }
 

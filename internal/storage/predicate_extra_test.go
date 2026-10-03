@@ -434,9 +434,16 @@ func TestLeasePolicyRuntimesPayloadEncodings(t *testing.T) {
 	}
 
 	// Unmarshalable and unmarshal-failing payloads fail closed.
-	bad := model.Job{CompiledJobPayload: &model.CompiledJobPayload{EffectivePolicy: json.RawMessage(`{`)}}
-	if runtimes, enforced := LeasePolicyRuntimes(bad); enforced || runtimes != nil {
-		t.Fatalf("corrupt policy = %v, %v", runtimes, enforced)
+	// A CURRENT-schema corrupt policy fails CLOSED: enforced with an empty
+	// runtimes set (no runtime may lease it). A legacy payload without a
+	// schema/policy keeps the documented permissive fallback.
+	bad := model.Job{CompiledJobPayload: &model.CompiledJobPayload{SchemaVersion: 1, EffectivePolicy: json.RawMessage(`{`)}}
+	if runtimes, enforced := LeasePolicyRuntimes(bad); !enforced || runtimes != nil {
+		t.Fatalf("corrupt current policy = %v, %v; want enforced with no runtimes", runtimes, enforced)
+	}
+	legacy := model.Job{CompiledJobPayload: &model.CompiledJobPayload{EffectivePolicy: json.RawMessage(`{`)}}
+	if runtimes, enforced := LeasePolicyRuntimes(legacy); enforced || runtimes != nil {
+		t.Fatalf("legacy corrupt policy = %v, %v; want permissive fallback", runtimes, enforced)
 	}
 	unsupported := model.Job{CompiledJobPayload: &model.CompiledJobPayload{EffectivePolicy: func() {}}}
 	if runtimes, enforced := LeasePolicyRuntimes(unsupported); enforced || runtimes != nil {
@@ -446,6 +453,18 @@ func TestLeasePolicyRuntimesPayloadEncodings(t *testing.T) {
 	// No payload at all.
 	if runtimes, enforced := LeasePolicyRuntimes(model.Job{}); enforced || runtimes != nil {
 		t.Fatalf("missing payload = %v, %v", runtimes, enforced)
+	}
+
+	// A CURRENT-schema payload MISSING the effective policy fails closed
+	// (the compiler always writes one, so its absence is corruption); a
+	// legacy payload without one keeps the permissive fallback.
+	missing := model.Job{CompiledJobPayload: &model.CompiledJobPayload{SchemaVersion: 1, EffectiveJob: json.RawMessage(`{"job":{"runtime":"container"}}`)}}
+	if runtimes, enforced := LeasePolicyRuntimes(missing); !enforced || runtimes != nil {
+		t.Fatalf("current payload missing policy = %v, %v; want enforced with no runtimes", runtimes, enforced)
+	}
+	legacyMissing := model.Job{CompiledJobPayload: &model.CompiledJobPayload{EffectiveJob: json.RawMessage(`{"job":{"runtime":"container"}}`)}}
+	if runtimes, enforced := LeasePolicyRuntimes(legacyMissing); enforced || runtimes != nil {
+		t.Fatalf("legacy payload missing policy = %v, %v; want permissive fallback", runtimes, enforced)
 	}
 }
 

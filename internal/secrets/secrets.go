@@ -380,6 +380,11 @@ func maskForms(values []string) []string {
 		add(base32HexNoPad.EncodeToString(b))
 		add(strings.ToLower(base32.StdEncoding.EncodeToString(b)))
 		add(strings.ToLower(base32.HexEncoding.EncodeToString(b)))
+		// Unpadded lower-case forms are a common CLI encoding; omitting them
+		// lets a lowercase-unpadded base32 rendering bypass both masking and
+		// output taint checks.
+		add(strings.ToLower(base32NoPad.EncodeToString(b)))
+		add(strings.ToLower(base32HexNoPad.EncodeToString(b)))
 		add(hex.EncodeToString(b))
 		add(strings.ToUpper(hex.EncodeToString(b)))
 		add(strconv.Quote(v))

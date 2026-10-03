@@ -149,11 +149,13 @@ func TestTaintCheckBase32Forms(t *testing.T) {
 	}
 	b := []byte(secret)
 	forms := map[string]string{
-		"base32":           base32.StdEncoding.EncodeToString(b),
-		"base32 nopad":     base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b),
-		"base32 hex":       base32.HexEncoding.EncodeToString(b),
-		"base32 lower":     strings.ToLower(base32.StdEncoding.EncodeToString(b)),
-		"base32 hex lower": strings.ToLower(base32.HexEncoding.EncodeToString(b)),
+		"base32":                 base32.StdEncoding.EncodeToString(b),
+		"base32 nopad":           base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b),
+		"base32 hex":             base32.HexEncoding.EncodeToString(b),
+		"base32 lower":           strings.ToLower(base32.StdEncoding.EncodeToString(b)),
+		"base32 hex lower":       strings.ToLower(base32.HexEncoding.EncodeToString(b)),
+		"base32 nopad lower":     strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b)),
+		"base32 hex nopad lower": strings.ToLower(base32.HexEncoding.WithPadding(base32.NoPadding).EncodeToString(b)),
 	}
 	for label, f := range forms {
 		if !m.ContainsSecret("out=" + f) {

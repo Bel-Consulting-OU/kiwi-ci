@@ -415,6 +415,15 @@ func yamlFieldTags(t reflect.Type) map[string]bool {
 	return tags
 }
 
+// canonicalOnlyPresenceKeys are the canonical round-trip presence markers
+// accepted by the strict walker but recorded by custom UnmarshalYAML rather
+// than a struct tag.
+var canonicalOnlyPresenceKeys = map[string]bool{
+	"max_set":           true,
+	"infra_retries_set": true,
+	"retries_set":       true,
+}
+
 // TestKnownFieldTablesMatchStructTags asserts that every known-field key in
 // the structural tables maps to a real struct field (via its yaml tag), so a
 // field removed from pipeline.Job (or any section struct) fails CI instead
@@ -429,6 +438,13 @@ func TestKnownFieldTablesMatchStructTags(t *testing.T) {
 		}
 		tags := yamlFieldTags(typ)
 		for key := range table {
+			if canonicalOnlyPresenceKeys[key] {
+				// Canonical JSON carries explicit-presence markers that have
+				// no yaml struct field (MaxSet/InfraRetriesSet/RetriesSet are
+				// recorded by custom UnmarshalYAML), so they are allowed in
+				// the admission table without a struct tag.
+				continue
+			}
 			if !tags[key] {
 				t.Errorf("known-field table %q lists %q, which is not a yaml field of %s", path, key, typ)
 			}

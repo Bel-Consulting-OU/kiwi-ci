@@ -1111,3 +1111,43 @@ func TestSnapshotMkdirFailure(t *testing.T) {
 		t.Fatalf("snapshot mkdir failure = %+v", res)
 	}
 }
+
+// TestGCScopedNeverTouchesOtherRunners pins ownership safety: age GC reaps
+// legacy unlabelled and own-previous-incarnation resources, but a labelled
+// resource of ANOTHER runner (possibly a live long job on a shared daemon) is
+// never deleted.
+func TestGCScopedNeverTouchesOtherRunners(t *testing.T) {
+	installFakeBins(t)
+	root := t.TempDir()
+	old := time.Now().Add(-48 * time.Hour).Format("2006-01-02 15:04:05 -0700 MST")
+	otherRunner := identityHash8("runner-B")
+	otherInstance := identityHash8("instance-B")
+	ownOldInstance := identityHash8("instance-old")
+	ownRunner := identityHash8("runner-A")
+	t.Setenv("FAKE_DOCKER_PS", strings.Join([]string{
+		"legacy " + old, // unlabelled: reaped
+		"own-old " + old + " " + ownRunner + " " + ownOldInstance,     // own predecessor: reaped
+		"other-live " + old + " " + otherRunner + " " + otherInstance, // never touched
+	}, "\n"))
+	t.Setenv("FAKE_DOCKER_NET_LS", "net-other "+old+" "+otherRunner+" "+otherInstance)
+	t.Setenv("FAKE_DOCKER_LOG", filepath.Join(t.TempDir(), "docker.log"))
+
+	rep := GCScoped(context.Background(), root, "runner-A", "instance-current", time.Hour)
+	if rep.Containers != 2 || rep.Networks != 0 {
+		t.Fatalf("scoped GC report = %+v, want 2 containers / 0 networks", rep)
+	}
+	logged, err := os.ReadFile(os.Getenv("FAKE_DOCKER_LOG"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"rm -f legacy", "rm -f own-old"} {
+		if !strings.Contains(string(logged), want) {
+			t.Fatalf("scoped GC did not issue %q:\n%s", want, logged)
+		}
+	}
+	for _, forbidden := range []string{"other-live", "rm net-other"} {
+		if strings.Contains(string(logged), forbidden) {
+			t.Fatalf("scoped GC touched another runner's resource %q:\n%s", forbidden, logged)
+		}
+	}
+}

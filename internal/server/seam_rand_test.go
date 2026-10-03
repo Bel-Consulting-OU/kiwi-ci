@@ -77,7 +77,7 @@ func TestSeamRandIdentifierHelpersFailClosed(t *testing.T) {
 	if kid, err := newOIDCKID(); err == nil || kid != "" {
 		t.Fatalf("newOIDCKID with failing entropy = %q, %v; want empty, error", kid, err)
 	}
-	if v, exp, err := newWebToken([]byte("secret"), "web"); err == nil || v != "" || exp != 0 {
+	if v, exp, err := newWebToken([]byte("secret"), "web", "fp"); err == nil || v != "" || exp != 0 {
 		t.Fatalf("newWebToken with failing entropy = %q, %d, %v; want empty, 0, error", v, exp, err)
 	}
 	if b, err := createWebSessionKey(); err == nil || b != nil {

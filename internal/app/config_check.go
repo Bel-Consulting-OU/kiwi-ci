@@ -4,6 +4,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"os"
+	"strings"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/config"
 )
@@ -29,6 +31,30 @@ func ConfigCheck(ctx context.Context, args []string) error {
 	}
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("invalid config: %w", err)
+	}
+	// Production-mode parity with `kiwi server`: the same static hardening
+	// contract, so a config that passes `config check` cannot fail startup
+	// for a static reason (missing shared session key, disabled untrusted
+	// ceilings, missing staging bound, weak admin token, ...).
+	if strings.TrimSpace(cfg.Server.Mode) == "production" {
+		if err := validateProductionConfig(productionConfig{
+			Mode:                   cfg.Server.Mode,
+			DatabaseURL:            cfg.Database.URL,
+			RunnerToken:            cfg.Auth.RunnerToken,
+			AdminToken:             cfg.Auth.AdminToken,
+			ExternalURL:            cfg.Server.ExternalURL,
+			TLSCert:                cfg.Server.TLSCert,
+			TLSKey:                 cfg.Server.TLSKey,
+			StagingDir:             cfg.Staging.Dir,
+			StagingMaxBytes:        cfg.Staging.MaxBytes,
+			StagingInstanceID:      cfg.Staging.InstanceID,
+			WebSessionSecret:       strings.TrimSpace(os.Getenv("KIWI_WEB_SESSION_SECRET")),
+			UntrustedCPUCeiling:    cfg.Quota.UntrustedCPUCeiling,
+			UntrustedMemoryCeiling: cfg.Quota.UntrustedMemoryCeiling,
+			UntrustedDiskCeiling:   cfg.Quota.UntrustedDiskCeiling,
+		}); err != nil {
+			return fmt.Errorf("invalid production config: %w", err)
+		}
 	}
 	summary := map[string]string{
 		"mode":           cfg.Server.Mode,

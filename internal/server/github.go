@@ -37,7 +37,9 @@ func (s *Server) gitHubForge() *forge.GitHub {
 func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 	ctx, span := s.startSpan(r.Context(), "forge.webhook.github")
 	defer span.End()
-	span.SetAttributes(attribute.String("kiwi.event", r.Header.Get("X-GitHub-Event")))
+	// Event header values are attacker-controlled and pre-authentication: only
+	// a bounded, known vocabulary may reach the span.
+	span.SetAttributes(attribute.String("kiwi.event", knownGitHubEvent(r.Header.Get("X-GitHub-Event"))))
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4<<20))
 	if err != nil {
 		http.Error(w, "invalid body", http.StatusBadRequest)
@@ -62,6 +64,15 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad webhook payload: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := validateWebhookRepoBinding(ec.Repository); err != nil {
+		http.Error(w, "webhook repository identity mismatch: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := validateWebhookRepoBinding(ec.HeadRepository); err != nil {
+		http.Error(w, "webhook head repository identity mismatch: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	if ec.Event == "" {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -405,4 +416,16 @@ func (s *Server) recordDelivery(delivery, runID string) {
 		s.deliveries[delivery] = runID
 	}
 	s.mu.Unlock()
+}
+
+// knownGitHubEvent maps the untrusted X-GitHub-Event header onto a bounded
+// vocabulary (unknown values collapse to "other").
+func knownGitHubEvent(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "push", "pull_request", "pull_request_review", "ping", "issues",
+		"issue_comment", "release", "workflow_dispatch", "check_run", "check_suite":
+		return strings.ToLower(strings.TrimSpace(raw))
+	default:
+		return "other"
+	}
 }

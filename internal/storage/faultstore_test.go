@@ -264,7 +264,7 @@ func withGeneratedLease(req GeneratedFragmentRequest, generation int64) Generate
 
 func seedRunningJob(m *memStore) {
 	seedRunAndJob(m)
-	exp := time.Unix(2000, 0).UTC()
+	exp := time.Now().UTC().Add(time.Hour)
 	_, _ = m.AcquireLease(ctx(), testJob.ID, testRunner.ID, []byte("hash"), 1, exp)
 }
 
@@ -315,7 +315,7 @@ func faultOps() []opCase {
 			name:  "HeartbeatLease",
 			setup: func(m *memStore) { seedRunningJob(m); seedRunner(m) },
 			call: func(s Store) error {
-				return s.HeartbeatLease(ctx(), testJob.ID, testRunner.ID, 1, time.Unix(3000, 0).UTC())
+				return s.HeartbeatLease(ctx(), testJob.ID, testRunner.ID, 1, time.Now().UTC().Add(time.Minute))
 			},
 		},
 		{

@@ -11,6 +11,8 @@ package runner
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -293,7 +295,9 @@ func TestStreamingIdleGuardKeepsSlowButContinuousRead(t *testing.T) {
 	t.Cleanup(func() { streamIdleTimeout.set(prevIdle) })
 
 	body := tarGzWithFile(t, "app.txt", "slow-but-alive")
+	sum := sha256.Sum256(body)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Kiwi-Content-SHA256", hex.EncodeToString(sum[:]))
 		fl, ok := w.(http.Flusher)
 		if !ok {
 			t.Error("stream test writer is not flushable")

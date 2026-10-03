@@ -76,8 +76,8 @@ func TestValidateProductionConfig(t *testing.T) {
 	valid := productionConfig{
 		Mode:        "production",
 		DatabaseURL: "postgres://db",
-		RunnerToken: "runner",
-		AdminToken:  "admin",
+		RunnerToken: "runner-token-long-enough",
+		AdminToken:  "admin-token-long-enough",
 		ExternalURL: "https://ci.example.com",
 		TLSCert:     "cert.pem",
 		TLSKey:      "key.pem",
@@ -87,7 +87,10 @@ func TestValidateProductionConfig(t *testing.T) {
 		StagingMaxBytes: 1 << 30,
 		// A shared dashboard session/CSRF key is required in production so
 		// sessions survive replica failover and restarts.
-		WebSessionSecret: strings.Repeat("ab", 32),
+		WebSessionSecret:       strings.Repeat("ab", 32),
+		UntrustedCPUCeiling:    2,
+		UntrustedMemoryCeiling: 4 << 30,
+		UntrustedDiskCeiling:   10 << 30,
 	}
 	if err := validateProductionConfig(valid); err != nil {
 		t.Fatalf("valid production config rejected: %v", err)
@@ -110,7 +113,7 @@ func TestValidateProductionConfig(t *testing.T) {
 	// decision is post-DB, because per-runner bearer credentials may
 	// already be provisioned in runner_bearer_tokens (D3-D).
 	runnerTokenOnly := valid
-	runnerTokenOnly.AdminToken = "admin"
+	runnerTokenOnly.AdminToken = "admin-token-long-enough"
 	if err := validateProductionConfig(runnerTokenOnly); err != nil {
 		t.Fatalf("production config with only --runner-token rejected statically: %v", err)
 	}
@@ -134,6 +137,7 @@ func TestValidateProductionConfig(t *testing.T) {
 		{"missing tls cert", func(c *productionConfig) { c.TLSCert = "" }, "--tls-cert"},
 		{"missing tls key", func(c *productionConfig) { c.TLSKey = "" }, "--tls-key"},
 		{"unknown mode", func(c *productionConfig) { c.Mode = "staging" }, "--mode"},
+		{"short admin token", func(c *productionConfig) { c.AdminToken = "short" }, "at least 16 characters"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

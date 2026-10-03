@@ -435,6 +435,16 @@ type Server struct {
 	// this; dev mode keeps the legacy self-reported registration.
 	RequireProfiles bool
 
+	// RequireRunnerIncarnation makes the registration-session header
+	// MANDATORY on polling/heartbeat/completion: dropping it cannot bypass
+	// supersession. Enabled in production; dev keeps the headerless
+	// rolling-upgrade tolerance.
+	RequireRunnerIncarnation bool
+
+	// MetricsPublic permits the dedicated metrics listener to bind a
+	// non-loopback address (explicit operator opt-in).
+	MetricsPublic bool
+
 	// profiles, certProfiles and runnerProfiles are the memory-mode mirror
 	// of the durable runner_profiles/cert_profile_links/runner_profile_links
 	// tables (profiles.go, runner_profile_bindings.go); DB mode reads and
@@ -2909,7 +2919,17 @@ func (s *Server) listServingRunners(w http.ResponseWriter, r *http.Request) {
 		if len(visibleJobs) == 0 {
 			continue
 		}
-		dto = append(dto, v1.RunnerServingDTOFrom(ri, visibleJobs))
+		projected := v1.RunnerServingDTOFrom(ri, visibleJobs)
+		if len(visibleJobs) != len(ri.ActiveJobs) {
+			// Jobs were redacted by repository authorization: activity state
+			// derived from ALL jobs (busy beyond the visible set, and
+			// heartbeat-driven last_seen) would disclose other tenants'
+			// scheduling. Derive busy from the visible set only and hide the
+			// heartbeat instant.
+			projected.Busy = ri.Capacity > 0 && len(visibleJobs) >= ri.Capacity
+			projected.LastSeen = time.Time{}
+		}
+		dto = append(dto, projected)
 	}
 	writeJSON(w, http.StatusOK, dto)
 }
@@ -3287,7 +3307,10 @@ const RunnerIncarnationHeader = "X-Kiwi-Runner-Incarnation"
 // accept.
 func (s *Server) runnerIncarnationCurrent(ctx context.Context, runnerID, incarnation string) bool {
 	if strings.TrimSpace(incarnation) == "" {
-		return true
+		// Production requires the wire incarnation so an attacker holding a
+		// copied credential cannot bypass supersession by dropping the
+		// header. Dev keeps the rolling-upgrade tolerance.
+		return !s.RequireRunnerIncarnation
 	}
 	if s.DB != nil {
 		cur, err := s.DB.GetRunner(ctx, runnerID)
@@ -6055,6 +6078,13 @@ func decodeLimit(w http.ResponseWriter, r *http.Request, v any, max int64) bool 
 	return true
 }
 func writeJSON(w http.ResponseWriter, status int, v any) {
+	// Authenticated API/JSON responses must never be stored by shared caches:
+	// a cookie-keyed response cached by URL alone could serve private data to
+	// another caller. Handlers that set an explicit caching policy (OIDC
+	// discovery/JWKS) keep theirs.
+	if w.Header().Get("Cache-Control") == "" {
+		w.Header().Set("Cache-Control", "no-store")
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)

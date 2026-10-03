@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -1365,12 +1366,20 @@ func TestPostgresIntegrationMigrateHelpers(t *testing.T) {
 	if err != nil || version == 0 {
 		t.Fatalf("SchemaVersion = %d, %v", version, err)
 	}
-	// A migration recorded with a future version does not disturb the run.
+	// A migration recorded with a future version REFUSES the run: this
+	// binary is older than the recorded schema and must never operate on
+	// tables it does not know. Removing the stray row restores operation.
 	if _, err := st.pool.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES (9999)`); err != nil {
 		t.Fatalf("insert future migration: %v", err)
 	}
+	if err := st.Migrate(ctx); err == nil || !strings.Contains(err.Error(), "newer than this binary") {
+		t.Fatalf("migrate with future version = %v, want a newer-schema refusal", err)
+	}
+	if _, err := st.pool.Exec(ctx, `DELETE FROM schema_migrations WHERE version=9999`); err != nil {
+		t.Fatalf("delete future migration: %v", err)
+	}
 	if err := st.Migrate(ctx); err != nil {
-		t.Fatalf("migrate with future version: %v", err)
+		t.Fatalf("migrate after removing the future version: %v", err)
 	}
 	// A failing statement rolls the migration transaction back and surfaces
 	// the error without recording the version.

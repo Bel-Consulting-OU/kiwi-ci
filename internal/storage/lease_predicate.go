@@ -426,6 +426,14 @@ func PolicyRuntimeAllowed(enforced bool, runtimes []string, jobRuntime string) b
 // an effective policy are not enforced.
 func LeasePolicyRuntimes(j model.Job) (runtimes []string, enforced bool) {
 	if j.CompiledJobPayload == nil || j.CompiledJobPayload.EffectivePolicy == nil {
+		if j.CompiledJobPayload != nil && j.CompiledJobPayload.SchemaVersion >= 1 {
+			// CURRENT-format payload with no decodable policy: fail CLOSED
+			// (enforced with an empty runtimes set), matching the
+			// effectiveCapsOf/LeasePolicy corruption contract. Treating it
+			// as legacy here would let a corrupt persisted policy lease the
+			// job onto a runtime the policy may have denied.
+			return nil, true
+		}
 		return nil, false
 	}
 	var b []byte
@@ -439,13 +447,17 @@ func LeasePolicyRuntimes(j model.Job) (runtimes []string, enforced bool) {
 	default:
 		var err error
 		if b, err = json.Marshal(v); err != nil {
-			return nil, false
+			return nil, j.CompiledJobPayload.SchemaVersion >= 1
 		}
 	}
 	var caps policy.Capabilities
 	if err := json.Unmarshal(b, &caps); err != nil {
-		return nil, false
+		// Current-format corruption fails closed; a pre-schema payload keeps
+		// the historical permissive fallback.
+		return nil, j.CompiledJobPayload.SchemaVersion >= 1
 	}
+	// A policy that enforces NOTHING (all runtimes false) still counts as
+	// enforced by capabilityEnforced; leave that contract untouched.
 	if !capabilityEnforced(caps) {
 		return nil, false
 	}

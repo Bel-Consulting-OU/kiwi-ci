@@ -120,8 +120,10 @@ func TestImportEdgeFixture(t *testing.T) {
 	if len(edge.Needs) != 0 {
 		t.Fatalf("needs must drop unknown/empty references, got %v", edge.Needs)
 	}
-	if edge.If != "" {
-		t.Fatalf("unmappable condition must not be set, got %q", edge.If)
+	if edge.If != "false" {
+		// Fail closed: an unmappable condition must disable the job instead
+		// of silently making it unconditional.
+		t.Fatalf("unmappable condition must disable the job (if: false), got %q", edge.If)
 	}
 	if edge.Env["A"] != "1" || edge.Outputs["out"] != "x" {
 		t.Fatalf("env/outputs = %v / %v", edge.Env, edge.Outputs)

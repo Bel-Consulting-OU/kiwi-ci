@@ -621,6 +621,13 @@ func (r *Runner) Run(ctx context.Context) error {
 	if rep.Containers > 0 || rep.Networks > 0 || rep.VMs > 0 {
 		fmt.Fprintf(os.Stderr, "kiwi runner %s: reconciled previous incarnation runtime: %d container(s), %d network(s), %d VM(s)\n", r.ID, rep.Containers, rep.Networks, rep.VMs)
 	}
+	// Reclaim host state recorded by previous incarnations (workspaces,
+	// artifact scratch, XFS quota assignments, cgroups) AFTER the runtime
+	// resources are proven gone and BEFORE leasing new work. A failed reclaim
+	// keeps its ledger entry for the next run.
+	if reclaimed := r.reconcileRuntimeLedger(runInstanceID); reclaimed > 0 {
+		fmt.Fprintf(os.Stderr, "kiwi runner %s: reclaimed %d crashed job resource(s)\n", r.ID, reclaimed)
+	}
 	lastPrewarm := time.Now()
 	lastGC := time.Now()
 	lastStaging := time.Now()
@@ -871,15 +878,15 @@ func (r *Runner) next(ctx context.Context) (*server.Task, bool, error) {
 		return nil, true, nil
 	}
 	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
-		b, _ := io.ReadAll(resp.Body)
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return nil, false, r.onDisabled(fmt.Errorf("%w (server: %s: %s)", ErrRunnerDisabledOrRevoked, resp.Status, strings.TrimSpace(string(b))))
 	}
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return nil, false, fmt.Errorf("next: %s: %s", resp.Status, b)
 	}
 	var t server.Task
-	if err := json.NewDecoder(resp.Body).Decode(&t); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxControlResponseBytes)).Decode(&t); err != nil {
 		return nil, false, err
 	}
 	return &t, false, nil
@@ -1056,7 +1063,6 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// hard crash leaves this ledger entry for the next incarnation to reclaim
 	// (the deferred removals never run on SIGKILL).
 	ledgerID := r.ledgerAdd(runtimeLedgerEntry{Instance: r.instanceID, JobID: t.Job.ID, Workspace: tmp})
-	defer r.ledgerRemove(ledgerID)
 	untrusted := !t.Job.Trusted
 	requireDiskQuota := untrusted && !executor.AllowUnquotaedUntrustedDisk()
 	// The workspace quota lifecycle is OWNED by execute, not by the backend:
@@ -1084,15 +1090,34 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 			r.ledgerSetXFS(ledgerID, status.Assignment)
 		}
 	}
+	// Runtime teardown may fail to prove container removal; the callback sets
+	// this so the deferred cleanup RETAINS the workspace, the XFS quota and
+	// the ledger entry for the next incarnation instead of deleting a tree a
+	// live bind-mounted container may still own.
+	runtimeCloseFailed := false
 	defer func() {
-		if quotaCleanup != nil {
+		cleanupOK := !runtimeCloseFailed
+		if runtimeCloseFailed {
+			fmt.Fprintf(os.Stderr, "kiwi runner %s: runtime removal for %s was not proven; retaining workspace, quota and crash-recovery entry\n", r.ID, t.Job.ID)
+		} else if quotaCleanup != nil {
 			if qerr := quotaCleanup(); qerr != nil {
-				fmt.Fprintf(os.Stderr, "kiwi runner %s: remove workspace quota for %s: %v\n", r.ID, t.Job.ID, qerr)
+				fmt.Fprintf(os.Stderr, "kiwi runner %s: remove workspace quota for %s: %v (entry retained for reclaim)\n", r.ID, t.Job.ID, qerr)
+				cleanupOK = false
 			}
 			quotaCleanup = nil
 		}
-		if rerr := removeJobWorkspace(tmp); rerr != nil {
-			fmt.Fprintf(os.Stderr, "kiwi runner %s: remove job workspace %s: %v\n", r.ID, tmp, rerr)
+		if cleanupOK {
+			if rerr := removeJobWorkspace(tmp); rerr != nil {
+				fmt.Fprintf(os.Stderr, "kiwi runner %s: remove job workspace %s: %v\n", r.ID, tmp, rerr)
+				cleanupOK = false
+			}
+		}
+		if cleanupOK {
+			r.ledgerRemove(ledgerID)
+		} else if !runtimeCloseFailed {
+			// Quota-only failure: the runtime is gone, so the next run's
+			// ledger reclaim removes the quota and then the workspace.
+			fmt.Fprintf(os.Stderr, "kiwi runner %s: keeping crash-recovery ledger entry %s for %s\n", r.ID, ledgerID, t.Job.ID)
 		}
 	}()
 	// An untrusted job that demands a hard bound must not even check out
@@ -1176,7 +1201,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	if t.Job.CompiledJobPayload != nil {
 		var caps policy.Capabilities
 		var policyOK bool
-		cj, caps, policyOK, err = verifyCompiledPayload(spec, t.Job.CompiledJobPayload, t.Job.Trusted)
+		cj, caps, policyOK, err = verifyCompiledPayload(spec, t.Job.Key, t.Job.CompiledJobPayload, t.Job.Trusted)
 		if err != nil {
 			r.complete(parent, t, model.StatusFailure, err, nil)
 			return
@@ -1236,7 +1261,12 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		}
 		cj.Job.Env["KIWI_OIDC_REQUEST_URL"] = r.Cfg.Server + "/api/v1/jobs/" + t.Job.ID + "/oidc"
 		cj.Job.Env["KIWI_OIDC_REQUEST_TOKEN"] = t.LeaseToken
-		masker.Add(t.LeaseToken)
+		if err := masker.AddStrict(t.LeaseToken); err != nil {
+			// An unmaskable lease token would leak into logs/outputs; fail the
+			// job instead of running without masking coverage.
+			r.complete(parent, t, model.StatusFailure, fmt.Errorf("lease token cannot be registered with the masker: %w", err), nil)
+			return
+		}
 	}
 	if err := r.restoreDownloads(setupCtx, t, cj.Job.Downloads, tmp); err != nil {
 		// setupCtx is the same context checkout runs under, so the same
@@ -1397,6 +1427,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	opts.RequireUntrustedDiskQuota = requireDiskQuota
 	opts.WorkspaceQuota = workspaceQuota
 	opts.OnCgroupCreated = func(parent string) { r.ledgerSetCgroup(ledgerID, parent) }
+	opts.OnRuntimeCloseError = func(error) { runtimeCloseFailed = true }
 	// Step durations come from the executor's wall-clock step measurements
 	// (StepReporter), never from sink-derived log timing.
 	applyStepReporter(&opts, r.Metrics)
@@ -1708,11 +1739,15 @@ func (r *Runner) heartbeatLoop(ctx context.Context, cancel context.CancelFunc, t
 			return
 		case <-done:
 			return
-		case now := <-ticker.C:
+		case <-ticker.C:
 			var out server.HeartbeatResponse
 			err := r.post(ctx, "/api/v1/jobs/"+t.Job.ID+"/heartbeat", server.Heartbeat{RunnerID: r.ID, LeaseToken: t.LeaseToken, LeaseGeneration: t.LeaseGeneration}, &out)
+			// Decide against the CURRENT time, not the tick timestamp sampled
+			// before the (possibly stalled) request: a heartbeat that returns
+			// after the lease expired must self-cancel, or recovery would
+			// requeue the job while this runner keeps executing it.
 			var cancelNow bool
-			deadline, cancelNow = heartbeatTick(now, deadline, &out, err)
+			deadline, cancelNow = heartbeatTick(time.Now().UTC(), deadline, &out, err)
 			if cancelNow {
 				cancel()
 				return
@@ -2315,10 +2350,15 @@ func (r *Runner) restoreDownload(ctx context.Context, t server.Task, producer, n
 		r.Metrics.Counter("kiwi_runner_staging_cleanup_failures_total", 1)
 		reportf("kiwi runner %s: dependency spool cleanup for job %s failed; bytes stay charged until a staging retry reclaims %s\n", r.ID, t.Job.ID, staged)
 	}()
-	if want := resp.Header.Get("X-Kiwi-Content-SHA256"); want != "" {
-		if got := hex.EncodeToString(h.Sum(nil)); got != want {
-			return fmt.Errorf("artifact %s from %s integrity mismatch", name, producer)
-		}
+	// The digest header is MANDATORY on dependency downloads, exactly like
+	// the cache client: a proxy that strips it must not turn verified
+	// extraction into unverified extraction.
+	want := strings.ToLower(strings.TrimSpace(resp.Header.Get("X-Kiwi-Content-SHA256")))
+	if want == "" || len(want) != 64 {
+		return fmt.Errorf("artifact %s from %s is missing its content digest header", name, producer)
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != want {
+		return fmt.Errorf("artifact %s from %s integrity mismatch", name, producer)
 	}
 	if err := artifact.Extract(staged, wsRoot, rel); err != nil {
 		return err
@@ -2617,14 +2657,23 @@ func (r *Runner) post(ctx context.Context, path string, in, out any) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		bb, _ := io.ReadAll(resp.Body)
+		bb, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return &HTTPStatusError{StatusCode: resp.StatusCode, Body: string(bb)}
 	}
 	if out != nil {
-		return json.NewDecoder(resp.Body).Decode(out)
+		// Bound CONTROL-PLANE responses too: a malicious or buggy server must
+		// not be able to OOM the runner (and every co-tenant job) by
+		// streaming a multi-GB JSON body.
+		if err := json.NewDecoder(io.LimitReader(resp.Body, maxControlResponseBytes)).Decode(out); err != nil {
+			return err
+		}
 	}
 	return nil
 }
+
+// maxControlResponseBytes bounds every control-plane JSON response the runner
+// decodes (64 MiB is far above the largest legitimate compiled task).
+const maxControlResponseBytes = 64 << 20
 
 // HTTPStatusError is returned by r.post for a non-2xx control-plane
 // response. The typed status lets callers classify failures (permanent vs
@@ -2846,7 +2895,7 @@ func (r *Runner) runGCPass(ctx context.Context) executor.GCReport {
 	// are the primary cadences.
 	r.maintainStaging(ctx)
 	r.pruneJobCache(ctx)
-	rep := executor.GC(ctx, r.Cfg.WorkDir, gcOlderThan)
+	rep := executor.GCScoped(ctx, r.Cfg.WorkDir, r.ID, r.instanceID, gcOlderThan)
 	if rep.Containers > 0 || rep.Networks > 0 || rep.VMs > 0 {
 		reportf("kiwi runner %s: gc removed %d containers, %d networks, %d VMs\n", r.ID, rep.Containers, rep.Networks, rep.VMs)
 	}
@@ -3005,7 +3054,7 @@ func (r *Runner) enroll(ctx context.Context, caPEM, csrPEM []byte) (*server.Enro
 		return nil, fmt.Errorf("enroll: %s: %s", resp.Status, bb)
 	}
 	var out server.EnrollResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxControlResponseBytes)).Decode(&out); err != nil {
 		return nil, err
 	}
 	return &out, nil

@@ -29,9 +29,13 @@ type dirLock struct {
 // reclaim and to Prune, which only match FilePrefix).
 func acquireDirLock(dir string) (*dirLock, error) {
 	path := filepath.Join(dir, LockFileName)
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("staging: open lock file %s: %w", path, err)
+	}
+	if info, serr := f.Stat(); serr != nil || !info.Mode().IsRegular() || !sameEUID(info) || info.Mode().Perm()&0o022 != 0 {
+		_ = f.Close()
+		return nil, fmt.Errorf("staging: lock file %s is not a trustworthy regular file owned by this user", path)
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		_ = f.Close()
@@ -39,6 +43,11 @@ func acquireDirLock(dir string) (*dirLock, error) {
 			return nil, fmt.Errorf("%w: %s is held by another live process", ErrStagingDirOwned, path)
 		}
 		return nil, fmt.Errorf("staging: lock %s: %w", path, err)
+	}
+	if onDisk, lerr := os.Lstat(path); lerr != nil || !os.SameFile(mustStat(f), onDisk) {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+		return nil, fmt.Errorf("%w: %s was replaced during lock acquisition", ErrStagingDirOwned, path)
 	}
 	// Owner identity is diagnostics only; the flock is the lock.
 	_ = f.Truncate(0)
@@ -49,6 +58,20 @@ func acquireDirLock(dir string) (*dirLock, error) {
 	}
 	_ = f.Sync()
 	return &dirLock{file: f}, nil
+}
+
+// sameEUID reports whether the file belongs to this process's effective user.
+func sameEUID(info os.FileInfo) bool {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	return ok && st.Uid == uint32(os.Geteuid())
+}
+
+func mustStat(f *os.File) os.FileInfo {
+	info, err := f.Stat()
+	if err != nil {
+		return nil
+	}
+	return info
 }
 
 // release drops the ownership lock. It is nil-safe and idempotent.

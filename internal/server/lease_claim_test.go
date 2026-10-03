@@ -426,7 +426,7 @@ func TestLeaseDecisionParityMemoryVsDBFake(t *testing.T) {
 			runner: baseRunner,
 			jobs: func() []model.Job {
 				j := parityJob("pjob-1")
-				j.CompiledJobPayload = &model.CompiledJobPayload{SchemaVersion: 1, EffectiveJob: containerRuntime}
+				j.CompiledJobPayload = &model.CompiledJobPayload{SchemaVersion: 1, EffectiveJob: containerRuntime, EffectivePolicy: policy.Capabilities{}}
 				return []model.Job{j}
 			},
 			lease: true,
@@ -474,7 +474,7 @@ func TestLeaseDecisionParityMemoryVsDBFake(t *testing.T) {
 			},
 			jobs: func() []model.Job {
 				j := parityJob("pjob-1")
-				j.CompiledJobPayload = &model.CompiledJobPayload{SchemaVersion: 1, EffectiveJob: containerRuntime}
+				j.CompiledJobPayload = &model.CompiledJobPayload{SchemaVersion: 1, EffectiveJob: containerRuntime, EffectivePolicy: policy.Capabilities{}}
 				return []model.Job{j}
 			},
 			lease: false,
@@ -594,7 +594,7 @@ func TestLeaseDecisionParityMemoryVsDBFake(t *testing.T) {
 			},
 			jobs: func() []model.Job {
 				j := parityJob("pjob-1")
-				j.CompiledJobPayload = &model.CompiledJobPayload{SchemaVersion: 1, EffectiveJob: containerRuntime}
+				j.CompiledJobPayload = &model.CompiledJobPayload{SchemaVersion: 1, EffectiveJob: containerRuntime, EffectivePolicy: policy.Capabilities{}}
 				return []model.Job{j}
 			},
 			lease: false,

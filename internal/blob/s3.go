@@ -278,6 +278,16 @@ func (s *S3) resolveEndpoint() error {
 // keeps any endpoint path prefix and appends the bucket to it; virtual-hosted
 // style prefixes the bucket to the endpoint host and requires the
 // endpoint/bucket combination validated by resolveS3Target.
+// validateKey is the single key guard: every S3 operation must present a
+// canonical 64-hex digest, so a caller-supplied key can never inject path
+// segments or query parameters into the signed request URL.
+func (s *S3) validateKey(key string) error {
+	if !keyRE.MatchString(key) {
+		return fmt.Errorf("blob: invalid s3 key %q", key)
+	}
+	return nil
+}
+
 func (s *S3) objectURL(key string) (string, error) {
 	if err := s.resolveEndpoint(); err != nil {
 		return "", err
@@ -557,12 +567,15 @@ func (s *S3) listURL(continuationToken string) (string, error) {
 const (
 	maxS3ListPageBytes = 16 << 20
 	maxS3ListKeys      = 100_000
+	maxS3ListPages     = 10_000
 )
 
 func (s *S3) List(ctx context.Context, fn func(Object) error) error {
 	ctx, cancel := withDeadline(ctx, s3ListTimeout)
 	defer cancel()
 	token := ""
+	seenTokens := map[string]bool{}
+	pages := 0
 	for {
 		rawURL, err := s.listURL(token)
 		if err != nil {
@@ -612,12 +625,25 @@ func (s *S3) List(ctx context.Context, fn func(Object) error) error {
 		if page.NextContinuationToken == "" {
 			return fmt.Errorf("blob: s3 list truncated without a continuation token")
 		}
+		pages++
+		if pages > maxS3ListPages {
+			return fmt.Errorf("blob: s3 list exceeded %d pages", maxS3ListPages)
+		}
+		if seenTokens[page.NextContinuationToken] {
+			return fmt.Errorf("blob: s3 list repeated a continuation token")
+		}
+		seenTokens[page.NextContinuationToken] = true
 		token = page.NextContinuationToken
 	}
 }
 
 // Stat issues a HeadObject request and reports size and Last-Modified.
 func (s *S3) Stat(ctx context.Context, key string) (Object, error) {
+	if err := s.validateKey(key); err != nil {
+		return Object{}, err
+	}
+	ctx, cancel := withDeadline(ctx, 2*time.Minute)
+	defer cancel()
 	rawURL, err := s.objectURL(key)
 	if err != nil {
 		return Object{}, err

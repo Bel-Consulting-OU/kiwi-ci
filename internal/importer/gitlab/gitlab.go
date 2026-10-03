@@ -77,6 +77,21 @@ func (i *Importer) Import(src string) (*importer.Result, error) {
 	if wf := importer.Key(doc, "workflow"); wf != nil {
 		res.AddWarning("workflow: rules are not converted; Kiwi triggering is configured server-side (on: triggers)")
 	}
+	// Constructs that silently change WHAT runs must never be dropped:
+	// include: pulls in templates (often security gates), and global
+	// before_script/after_script run around every job.
+	if inc := importer.Key(doc, "include"); inc != nil {
+		res.AddUnsupported("top-level include: is not converted; the included templates (jobs, security gates, variables) are MISSING from the imported pipeline")
+		res.AddTODO("inline the included templates and re-import, or port them by hand")
+	}
+	if bs := importer.Key(doc, "before_script"); bs != nil {
+		res.AddUnsupported("top-level before_script is not converted; its setup steps would run before every job and are MISSING")
+		res.AddTODO("add the global before_script commands to each job")
+	}
+	if as := importer.Key(doc, "after_script"); as != nil {
+		res.AddUnsupported("top-level after_script is not converted; its cleanup/collection steps are MISSING")
+		res.AddTODO("add the global after_script commands to each job")
+	}
 
 	// Stages define the implicit needs ordering.
 	stageOrder := []string{}
@@ -465,6 +480,11 @@ func parseGitLabDuration(s string) (time.Duration, bool) {
 		}
 		switch part[len(part)-1] {
 		case 'h':
+			// Bound hours BEFORE multiplying: an overflowing positive
+			// product would otherwise wrap into a plausible duration.
+			if n > maxGitLabTimeoutHours {
+				return 0, false
+			}
 			total += time.Duration(n) * time.Hour
 		case 'm':
 			total += time.Duration(n) * time.Minute
@@ -473,9 +493,19 @@ func parseGitLabDuration(s string) (time.Duration, bool) {
 		default:
 			return 0, false
 		}
+		if total > maxGitLabTimeout {
+			return 0, false
+		}
 	}
 	return total, true
 }
+
+// GitLab timeout bounds: 30 days is far beyond any legitimate CI job and
+// keeps the hour multiplication inside int64.
+const (
+	maxGitLabTimeoutHours = 24 * 30
+	maxGitLabTimeout      = time.Duration(maxGitLabTimeoutHours) * time.Hour
+)
 
 func needsArtifacts(needs *yaml.Node) bool {
 	if needs == nil || needs.Kind != yaml.SequenceNode {

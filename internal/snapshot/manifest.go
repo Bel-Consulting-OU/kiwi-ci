@@ -322,7 +322,22 @@ func ParseWithLimits(r io.Reader, limits safefs.ExtractLimits) (Manifest, error)
 		}
 		expanded += manifestHeaderBytes
 		seen[key] = true
-		if h.Typeflag != tar.TypeReg {
+		if h.Typeflag != tar.TypeReg && h.Typeflag != tar.TypeDir {
+			// Extraction accepts only regular files and directories; a
+			// manifest produced from an archive containing links/devices
+			// would describe a snapshot that can NEVER be restored. Refuse it
+			// at upload time so a job cannot poison its own snapshot history.
+			return Manifest{}, fmt.Errorf("snapshot: %w", safefs.ErrUnsafeEntry)
+		}
+		if h.Typeflag == tar.TypeDir {
+			// Directory entries are skipped for content, but their names are
+			// still subject to the path limits below.
+			if len(name) > limits.MaxPathLength {
+				return Manifest{}, fmt.Errorf("snapshot: %w", safefs.ErrLimits)
+			}
+			if strings.Count(name, "/")+1 > limits.MaxDepth {
+				return Manifest{}, fmt.Errorf("snapshot: %w", safefs.ErrLimits)
+			}
 			continue
 		}
 		if h.Size > limits.MaxFileBytes {

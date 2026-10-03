@@ -194,7 +194,20 @@ func boundedToolCommand(parent context.Context, timeout time.Duration, exe strin
 // is not installed the corresponding pass is skipped and the report stays at
 // zero for it. Discovery and removals are explicitly bounded (gcCommandTimeout
 // / gcCleanupTimeout): a wedged docker or tart binary cannot strand the pass.
+// GC is the owner-agnostic legacy sweep: it reaps only resources that carry
+// NO runner-ownership label (pre-instance Kiwi) and are older than the
+// threshold. Prefer GCScoped from a live runner.
 func GC(ctx context.Context, root string, olderThan time.Duration) GCReport {
+	return GCScoped(ctx, root, "", "", olderThan)
+}
+
+// GCScoped is the age-based backstop with OWNERSHIP SAFETY: a labelled
+// resource is reaped only when it belongs to THIS runner's stable ID but a
+// previous incarnation (startup reconciliation normally handles those
+// immediately) or when it carries no ownership label at all (legacy). Another
+// runner's labelled resources are NEVER touched, so a long-running job of a
+// sibling runner sharing the daemon cannot be killed by age.
+func GCScoped(ctx context.Context, root, runnerID, instanceID string, olderThan time.Duration) GCReport {
 	var rep GCReport
 	if ctx == nil {
 		ctx = context.Background()
@@ -216,14 +229,14 @@ func GC(ctx context.Context, root string, olderThan time.Duration) GCReport {
 		return out
 	}
 	if docker, err := exec.LookPath("docker"); err == nil {
-		out := output(docker, "ps", "-a", "--filter", "label=kiwi.run", "--format", "{{.ID}} {{.CreatedAt}}")
-		for _, id := range parseDockerContainers(out, cutoff) {
+		out := output(docker, "ps", "-a", "--filter", "label=kiwi.run", "--format", `{{.ID}} {{.CreatedAt}} {{.Label "kiwi.runner"}} {{.Label "kiwi.instance"}}`)
+		for _, id := range parseScopedDocker(out, cutoff, runnerID, instanceID) {
 			if _, err := boundedToolCommand(ctx, gcCleanupTimeout, docker, "rm", "-f", id); err == nil {
 				rep.Containers++
 			}
 		}
-		out = output(docker, "network", "ls", "--filter", "label=kiwi.run", "--format", "{{.ID}} {{.CreatedAt}}")
-		for _, id := range parseIDCreatedAt(out, cutoff) {
+		out = output(docker, "network", "ls", "--filter", "label=kiwi.run", "--format", `{{.ID}} {{.CreatedAt}} {{.Label "kiwi.runner"}} {{.Label "kiwi.instance"}}`)
+		for _, id := range parseScopedDocker(out, cutoff, runnerID, instanceID) {
 			if _, err := boundedToolCommand(ctx, gcCleanupTimeout, docker, "network", "rm", id); err == nil {
 				rep.Networks++
 			}
@@ -231,13 +244,101 @@ func GC(ctx context.Context, root string, olderThan time.Duration) GCReport {
 	}
 	if tart, err := exec.LookPath("tart"); err == nil {
 		out := output(tart, "list")
-		for _, name := range parseTartVMs(out, cutoff) {
+		for _, name := range parseScopedTartVMs(out, cutoff, runnerID, instanceID) {
 			if _, err := boundedToolCommand(ctx, gcCleanupTimeout, tart, "delete", name); err == nil {
 				rep.VMs++
 			}
 		}
 	}
 	return rep
+}
+
+// parseScopedDocker parses "ID CREATED RUNNER INSTANCE" rows and returns IDs
+// that are older than the cutoff AND owned by this runner's previous
+// incarnation (or unlabelled legacy). Another runner's labelled resources are
+// never returned. Docker renders missing labels as empty trailing columns, so
+// the label tags are peeled from the END only when the remaining prefix still
+// parses as a docker timestamp.
+func parseScopedDocker(out []byte, cutoff time.Time, runnerID, instanceID string) []string {
+	ownRunner := identityHash8(runnerID)
+	ownInstance := identityHash8(instanceID)
+	var stale []string
+	for _, line := range strings.Split(string(out), "\n") {
+		parts := strings.SplitN(strings.TrimSpace(line), " ", 2)
+		if len(parts) != 2 || parts[0] == "" {
+			continue
+		}
+		id := parts[0]
+		rest := strings.Fields(parts[1])
+		var (
+			created  time.Time
+			ok       bool
+			owner    string
+			instance string
+		)
+		maxPeel := len(rest) - 4
+		if maxPeel > 2 {
+			maxPeel = 2
+		}
+		for peel := maxPeel; peel >= 0; peel-- {
+			candidate := strings.Join(rest[:len(rest)-peel], " ")
+			if t, err := parseDockerTime(candidate); err == nil {
+				created, ok = t, true
+				if peel == 2 {
+					owner, instance = rest[len(rest)-2], rest[len(rest)-1]
+				} else if peel == 1 {
+					owner = rest[len(rest)-1]
+				}
+				break
+			}
+		}
+		if !ok || !created.Before(cutoff) {
+			continue
+		}
+		switch {
+		case owner == "":
+			stale = append(stale, id) // legacy: no ownership label
+		case runnerID != "" && owner == ownRunner && instance != ownInstance:
+			stale = append(stale, id)
+		}
+	}
+	return stale
+}
+
+// parseScopedTartVMs returns legacy (untagged) clones older than the cutoff
+// plus clones of THIS runner's previous incarnation. Other owners' clones are
+// never touched.
+func parseScopedTartVMs(out []byte, cutoff time.Time, runnerID, instanceID string) []string {
+	var stale []string
+	legacy := map[string]bool{}
+	for _, name := range parseTartVMs(out, cutoff) {
+		legacy[name] = true
+	}
+	ownRunner := identityHash8(runnerID)
+	ownInstance := identityHash8(instanceID)
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) == 0 {
+			continue
+		}
+		name := fields[0]
+		if !strings.HasPrefix(name, "kiwi-") {
+			continue
+		}
+		parts := strings.Split(name, "-")
+		if len(parts) < 4 {
+			// Legacy name: age-only (parseTartVMs already applied the cutoff).
+			if legacy[name] {
+				stale = append(stale, name)
+			}
+			continue
+		}
+		owner, instance := parts[len(parts)-2], parts[len(parts)-1]
+		if runnerID != "" && owner == ownRunner && instance != ownInstance {
+			stale = append(stale, name)
+		}
+	}
+	return stale
 }
 
 // runtimeOwner identifies one runner process incarnation for runtime

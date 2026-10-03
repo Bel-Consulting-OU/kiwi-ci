@@ -710,6 +710,13 @@ func (f *dbFakeStore) HeartbeatLease(ctx context.Context, jobID string, runnerID
 	if j.Status != model.StatusRunning || j.LeaseRunnerID != runnerID || j.LeaseGeneration != generation {
 		return storage.ErrLeaseConflict
 	}
+	now := time.Now().UTC()
+	if f.leaseNow != nil {
+		now = f.leaseNow().UTC()
+	}
+	if (j.LeaseExpiresAt != nil && !j.LeaseExpiresAt.After(now)) || expiresAt.After(now.Add(24*time.Hour)) {
+		return storage.ErrLeaseConflict
+	}
 	j.LeaseExpiresAt = &expiresAt
 	f.jobs[jobID] = j
 	return nil
@@ -731,8 +738,11 @@ func (f *dbFakeStore) CompleteJob(ctx context.Context, jobID string, generation 
 	}
 	key := jobID + "|" + itoa(generation) + "|" + runnerID
 	if j.Status != model.StatusRunning || j.LeaseRunnerID != runnerID || j.LeaseGeneration != generation {
-		if _, dup := f.receipts[key]; dup {
-			return nil
+		if rec, dup := f.receipts[key]; dup {
+			if rec.ResultHash == receipt.ResultHash {
+				return nil
+			}
+			return storage.ErrCompletionConflict
 		}
 		return storage.ErrGenerationMismatch
 	}
@@ -750,7 +760,9 @@ func (f *dbFakeStore) CompleteJob(ctx context.Context, jobID string, generation 
 			}
 			found := false
 			for _, a := range f.artifacts {
-				if a.JobID == jobID && a.Name == name {
+				// Generation-bound: an artifact uploaded under a PREVIOUS
+				// lease generation must not satisfy this completion.
+				if a.JobID == jobID && a.Name == name && a.LeaseGeneration == generation {
 					found = true
 					break
 				}
@@ -1581,7 +1593,13 @@ func (f *dbFakeStore) ReadAudit(ctx context.Context, limit int) ([]model.AuditEv
 func (f *dbFakeStore) InsertCompletionReceipt(ctx context.Context, r model.CompletionReceipt) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.receipts[r.JobID+"|"+itoa(r.Generation)+"|"+r.RunnerID] = r
+	key := r.JobID + "|" + itoa(r.Generation) + "|" + r.RunnerID
+	if _, exists := f.receipts[key]; exists {
+		// First-wins, mirroring the SQL ON CONFLICT DO NOTHING: overwriting
+		// would flip later conflict detection to the newer hash.
+		return nil
+	}
+	f.receipts[key] = r
 	return nil
 }
 
@@ -1937,6 +1955,18 @@ func (f *dbFakeStore) OutboxDue(ctx context.Context) ([]storage.OutboxItem, erro
 // the error is retained, the claim is dropped, and the next attempt is
 // deferred with bounded backoff. maxAttempts == 0 means NEVER dead-letter
 // (completion_reconcile's unbounded convergence policy).
+// OutboxRetryClaimed mirrors the SQL claim guard: the fake records claims, so
+// a retry from a non-owning claimer is a no-op.
+func (f *dbFakeStore) OutboxRetryClaimed(ctx context.Context, id, claimer string, dispatchErr error, maxAttempts int) error {
+	f.mu.Lock()
+	owner := f.outboxClaims[id]
+	f.mu.Unlock()
+	if claimer != "" && owner.claimer != "" && owner.claimer != claimer {
+		return nil
+	}
+	return f.OutboxRetry(ctx, id, dispatchErr, maxAttempts)
+}
+
 func (f *dbFakeStore) OutboxRetry(ctx context.Context, id string, dispatchErr error, maxAttempts int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -3012,6 +3042,14 @@ func (f *dbFakeStore) InsertCompiledRun(ctx context.Context, req storage.InsertC
 			return storage.ErrDeliveryDuplicate
 		}
 	}
+	if req.BodyClaim != nil {
+		// Strict body-replay receipt (see InsertCompiledRunRequest.BodyClaim):
+		// the fake must dedupe it too, or DB-mode tests cannot catch a
+		// regression in the strict replay suppression.
+		if _, exists := f.deliveries[req.BodyClaim.Forge+"/"+req.BodyClaim.DeliveryID]; exists {
+			return storage.ErrDeliveryDuplicate
+		}
+	}
 	// Commit: nothing below can fail, so every staged reservation and
 	// cancellation lands together with the new run.
 	if stagedDownstream != nil {
@@ -3061,6 +3099,9 @@ func (f *dbFakeStore) InsertCompiledRun(ctx context.Context, req storage.InsertC
 	}
 	if req.WebhookClaim != nil {
 		f.deliveries[req.WebhookClaim.Forge+"/"+req.WebhookClaim.DeliveryID] = req.Run.ID
+	}
+	if req.BodyClaim != nil {
+		f.deliveries[req.BodyClaim.Forge+"/"+req.BodyClaim.DeliveryID] = req.Run.ID
 	}
 	if req.ScheduleClaim != nil {
 		f.occurrences[req.ScheduleClaim.ScheduleID] = append(f.occurrences[req.ScheduleClaim.ScheduleID], storage.Occurrence{ScheduleID: req.ScheduleClaim.ScheduleID, Nominal: req.ScheduleClaim.Nominal, RunID: req.Run.ID})

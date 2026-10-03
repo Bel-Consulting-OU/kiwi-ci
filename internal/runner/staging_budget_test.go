@@ -2,6 +2,8 @@ package runner
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -67,6 +69,8 @@ func TestDependencyStagingBudgetSerializesConcurrentRestores(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
 		w.Header().Set("Content-Type", "application/gzip")
+		sum := sha256.Sum256(body)
+		w.Header().Set("X-Kiwi-Content-SHA256", hex.EncodeToString(sum[:]))
 		half := len(body) / 2
 		_, _ = w.Write(body[:half])
 		if fl, ok := w.(http.Flusher); ok {
@@ -320,6 +324,8 @@ func TestRunnerRetriesDependencyStagingCleanupDebt(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
 		w.Header().Set("Content-Type", "application/gzip")
+		sum := sha256.Sum256(body)
+		w.Header().Set("X-Kiwi-Content-SHA256", hex.EncodeToString(sum[:]))
 		half := len(body) / 2
 		_, _ = w.Write(body[:half])
 		if fl, ok := w.(http.Flusher); ok {

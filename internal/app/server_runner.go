@@ -59,6 +59,14 @@ type productionConfig struct {
 	StagingDir        string
 	StagingMaxBytes   int64
 	StagingInstanceID string
+	// Untrusted*Ceiling are the fork/PR resource ceilings. Production
+	// requires every dimension to be POSITIVE: a zero silently disables the
+	// limit (config.Validate documents 0 as "disables that dimension"), which
+	// for production would let untrusted pipelines request unbounded
+	// resources.
+	UntrustedCPUCeiling    float64
+	UntrustedMemoryCeiling float64
+	UntrustedDiskCeiling   float64
 	// WebSessionSecret is the shared dashboard session/CSRF HMAC key
 	// (64 hex chars) from KIWI_WEB_SESSION_SECRET. Production requires it:
 	// without a shared key every replica mints its own and a session created
@@ -516,6 +524,27 @@ func validateProductionConfig(cfg productionConfig) error {
 	if strings.TrimSpace(cfg.StagingDir) == "" || cfg.StagingMaxBytes <= 0 {
 		return fmt.Errorf("production mode requires --staging-dir and --staging-max-bytes (large runner uploads must stage inside a bounded directory; set staging.dir and staging.max_bytes)")
 	}
+	// The admin token is the dashboard's only credential: a short or
+	// guessable value is online-brute-forceable, so production demands real
+	// entropy (16+ characters; generated tokens are far longer).
+	if len(strings.TrimSpace(cfg.AdminToken)) < 16 {
+		return fmt.Errorf("production mode requires an admin token of at least 16 characters")
+	}
+	for name, ceiling := range map[string]float64{
+		"quota.untrusted_cpu_ceiling":    cfg.UntrustedCPUCeiling,
+		"quota.untrusted_memory_ceiling": cfg.UntrustedMemoryCeiling,
+		"quota.untrusted_disk_ceiling":   cfg.UntrustedDiskCeiling,
+	} {
+		if ceiling <= 0 {
+			return fmt.Errorf("production mode requires a positive %s (untrusted resource limits must not be disabled)", name)
+		}
+	}
+	// A production-looking deployment must not silently run in dev mode:
+	// requiring mode=production keeps the shared runner token, session key,
+	// and other hardening checks in force.
+	if strings.TrimSpace(cfg.Mode) != "production" && cfg.DatabaseURL != "" && cfg.ExternalURL != "" && cfg.TLSCert != "" {
+		return fmt.Errorf("a database URL, external URL and TLS are configured but mode is %q: set mode=production to enable the production hardening checks (or remove the database/TLS settings for dev)", cfg.Mode)
+	}
 	// Dashboard sessions must be HA-stable: every replica has to share the
 	// session/CSRF HMAC key, otherwise a cookie minted on one replica fails on
 	// the next. A process-local random key is only acceptable in dev.
@@ -841,18 +870,21 @@ func Server(ctx context.Context, args []string) error {
 		return err
 	}
 	if err := validateProductionConfig(productionConfig{
-		Mode:              modeV,
-		DatabaseURL:       databaseURLV,
-		RunnerToken:       tokenV,
-		AdminToken:        adminTokenV,
-		ExternalURL:       externalURLV,
-		TLSCert:           tlsCertV,
-		TLSKey:            tlsKeyV,
-		AllowSharedToken:  *allowSharedToken,
-		StagingDir:        cfg.Staging.Dir,
-		StagingMaxBytes:   cfg.Staging.MaxBytes,
-		StagingInstanceID: cfg.Staging.InstanceID,
-		WebSessionSecret:  strings.TrimSpace(os.Getenv("KIWI_WEB_SESSION_SECRET")),
+		Mode:                   modeV,
+		DatabaseURL:            databaseURLV,
+		RunnerToken:            tokenV,
+		AdminToken:             adminTokenV,
+		ExternalURL:            externalURLV,
+		TLSCert:                tlsCertV,
+		TLSKey:                 tlsKeyV,
+		AllowSharedToken:       *allowSharedToken,
+		StagingDir:             cfg.Staging.Dir,
+		StagingMaxBytes:        cfg.Staging.MaxBytes,
+		StagingInstanceID:      cfg.Staging.InstanceID,
+		WebSessionSecret:       strings.TrimSpace(os.Getenv("KIWI_WEB_SESSION_SECRET")),
+		UntrustedCPUCeiling:    cfg.Quota.UntrustedCPUCeiling,
+		UntrustedMemoryCeiling: cfg.Quota.UntrustedMemoryCeiling,
+		UntrustedDiskCeiling:   cfg.Quota.UntrustedDiskCeiling,
 	}); err != nil {
 		return err
 	}
@@ -1038,6 +1070,7 @@ func Server(ctx context.Context, args []string) error {
 		// scheduling attributes are ignored and only a certificate-bound
 		// runner profile supplies them (a profile-less runner registers with
 		// capacity 0). Dev mode keeps the legacy self-reported registration.
+		srv.RequireRunnerIncarnation = true
 		srv.RequireProfiles = true
 		// A production DB control plane without a shared cluster key store
 		// would mint per-replica signing material: replicas could not verify
@@ -1192,6 +1225,7 @@ func Server(ctx context.Context, args []string) error {
 	// Dedicated metrics listener: when observability.metrics_listen is set,
 	// the Prometheus surface binds on its own address (binding failure is a
 	// startup error). The main listener keeps its /metrics route.
+	srv.MetricsPublic = cfg.Observability.MetricsPublic
 	if maddr := strings.TrimSpace(cfg.Observability.MetricsListen); maddr != "" {
 		_, stop, merr := startMetricsListener(srv, maddr)
 		if merr != nil {

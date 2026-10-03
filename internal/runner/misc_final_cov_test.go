@@ -29,12 +29,12 @@ func TestFinalVerifyCompiledPayloadNilAndPipelineDigestError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cj, _, policyOK, err := verifyCompiledPayload(spec, nil, true)
+	cj, _, policyOK, err := verifyCompiledPayload(spec, "x", nil, true)
 	if err != nil || policyOK || cj.ID != "" {
 		t.Fatalf("nil payload = %+v %v %v", cj, policyOK, err)
 	}
 	payload := buildPayload(t, payloadPipeline, "build")
-	if _, _, _, err := verifyCompiledPayload(nil, payload, true); err == nil || !strings.Contains(err.Error(), "pipeline digest") {
+	if _, _, _, err := verifyCompiledPayload(nil, "x", payload, true); err == nil || !strings.Contains(err.Error(), "pipeline digest") {
 		t.Fatalf("nil spec = %v", err)
 	}
 }
@@ -48,25 +48,25 @@ func TestFinalVerifyCompiledPayloadEncodeDecodeErrors(t *testing.T) {
 	// EffectiveJob is not valid JSON: the encode of the effective job fails.
 	p := buildPayload(t, payloadPipeline, "build")
 	p.EffectiveJob = json.RawMessage("{")
-	if _, _, _, err := verifyCompiledPayload(spec, p, true); err == nil || !strings.Contains(err.Error(), "encode effective job") {
+	if _, _, _, err := verifyCompiledPayload(spec, "build", p, true); err == nil || !strings.Contains(err.Error(), "encode effective job") {
 		t.Fatalf("invalid effective job = %v", err)
 	}
 	// EffectiveJob is valid JSON but not a compiled job object.
 	p = buildPayload(t, payloadPipeline, "build")
 	p.EffectiveJob = json.RawMessage("[]")
-	if _, _, _, err := verifyCompiledPayload(spec, p, true); err == nil || !strings.Contains(err.Error(), "decode effective job") {
+	if _, _, _, err := verifyCompiledPayload(spec, "build", p, true); err == nil || !strings.Contains(err.Error(), "decode effective job") {
 		t.Fatalf("array effective job = %v", err)
 	}
 	// EffectivePolicy is not valid JSON: the encode of the effective policy fails.
 	p = buildPayload(t, payloadPipeline, "build")
 	p.EffectivePolicy = json.RawMessage("{")
-	if _, _, _, err := verifyCompiledPayload(spec, p, true); err == nil || !strings.Contains(err.Error(), "encode effective policy") {
+	if _, _, _, err := verifyCompiledPayload(spec, "build", p, true); err == nil || !strings.Contains(err.Error(), "encode effective policy") {
 		t.Fatalf("invalid effective policy = %v", err)
 	}
 	// EffectivePolicy is valid JSON but not a capabilities object.
 	p = buildPayload(t, payloadPipeline, "build")
 	p.EffectivePolicy = json.RawMessage("[]")
-	if _, _, _, err := verifyCompiledPayload(spec, p, true); err == nil || !strings.Contains(err.Error(), "decode effective policy") {
+	if _, _, _, err := verifyCompiledPayload(spec, "build", p, true); err == nil || !strings.Contains(err.Error(), "decode effective policy") {
 		t.Fatalf("array effective policy = %v", err)
 	}
 }

@@ -132,6 +132,9 @@ type ObservabilityConfig struct {
 	OTelEndpoint string `toml:"otel_endpoint"`
 	// MetricsListen optionally serves /metrics on a separate address.
 	MetricsListen string `toml:"metrics_listen"`
+	// MetricsPublic explicitly permits a non-loopback metrics bind (the
+	// dedicated listener has no auth middleware).
+	MetricsPublic bool `toml:"metrics_public"`
 }
 
 // RateLimitConfig holds per-class request rate limits. PerSecond and Burst
@@ -718,11 +721,21 @@ func (c *Config) ApplyEnv() error {
 			// check). The mode in particular is security-bearing, so an
 			// empty value is ignored rather than coerced; a whitespace-only
 			// value is left to Validate, which rejects it.
-			if e.name == "KIWI_SERVER_MODE" && v == "" {
+			if v == "" && (e.name == "KIWI_SERVER_MODE" || sensitiveEnvOverride(e.name)) {
+				// An empty orchestrator expansion must never CLEAR a
+				// configured credential (KIWI_ADMIN_TOKEN="" would collapse
+				// admin auth onto the shared runner token).
 				continue
 			}
 			*e.dst = v
 		}
+	}
+	if v, ok := os.LookupEnv("KIWI_METRICS_PUBLIC"); ok && strings.TrimSpace(v) != "" {
+		b, err := strconv.ParseBool(strings.TrimSpace(v))
+		if err != nil {
+			return fmt.Errorf("KIWI_METRICS_PUBLIC: %w", err)
+		}
+		c.Observability.MetricsPublic = b
 	}
 	if v, ok := os.LookupEnv("KIWI_DATABASE_MAX_CONNECTIONS"); ok {
 		n, err := strconv.Atoi(v)
@@ -1020,6 +1033,18 @@ func flagFloat(f *flag.Flag, dst *float64) error {
 	return nil
 }
 
+// sensitiveEnvOverride reports env names whose EMPTY value must be ignored:
+// clearing a credential through an unset-variable expansion is never
+// intentional.
+func sensitiveEnvOverride(name string) bool {
+	for _, needle := range []string{"TOKEN", "SECRET", "PASSWORD", "_KEY"} {
+		if strings.Contains(name, needle) {
+			return true
+		}
+	}
+	return false
+}
+
 // RateLimitClasses returns the effective per-class rates: each class uses
 // its *_per_second override, falling back to the global PerSecond.
 func (c *Config) RateLimitClasses() map[string]float64 {
@@ -1029,6 +1054,17 @@ func (c *Config) RateLimitClasses() map[string]float64 {
 			return v
 		}
 		return base
+	}
+	// Login is never unlimited: online brute force of the admin token must
+	// always pay a rate cost even when the operator configured no limits.
+	pickLogin := func(v float64) float64 {
+		if v > 0 {
+			return v
+		}
+		if base > 0 {
+			return base
+		}
+		return 1
 	}
 	return map[string]float64{
 		ratelimit.ClassEnroll:         pick(c.RateLimit.EnrollPerSecond),
@@ -1042,7 +1078,7 @@ func (c *Config) RateLimitClasses() map[string]float64 {
 		ratelimit.ClassCacheUpload:    pick(c.RateLimit.CacheUploadPerSecond),
 		ratelimit.ClassDispatch:       pick(c.RateLimit.DispatchPerSecond),
 		ratelimit.ClassWebhooks:       pick(c.RateLimit.WebhooksPerSecond),
-		ratelimit.ClassLogin:          pick(c.RateLimit.LoginPerSecond),
+		ratelimit.ClassLogin:          pickLogin(c.RateLimit.LoginPerSecond),
 		ratelimit.ClassDefault:        base,
 	}
 }

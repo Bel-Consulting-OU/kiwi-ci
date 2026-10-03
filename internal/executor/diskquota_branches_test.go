@@ -458,6 +458,8 @@ func TestWorkspaceDiskQuotaAssignmentIsReclaimable(t *testing.T) {
 	t.Setenv("KIWI_XFS_LOCK_DIR", t.TempDir())
 	logPath := filepath.Join(t.TempDir(), "xfs.log")
 	t.Setenv("FAKE_XFS_LOG", logPath)
+	restoreValidate := stubQuotaAssignmentValidation(t)
+	defer restoreValidate()
 	script := writeFakeXFSQuota(t, "")
 	entry := mountInfoEntry{mountPoint: "/mnt/xfs", device: "8:60", fsType: "xfs"}
 
@@ -533,6 +535,8 @@ func TestXFSAllocationHookFiresBeforeAssignment(t *testing.T) {
 // to remove) instead of wedging the entry forever; a genuine failure still
 // reports.
 func TestReclaimWorkspaceQuotaToleratesNeverAppliedAssignment(t *testing.T) {
+	restoreValidate := stubQuotaAssignmentValidation(t)
+	defer restoreValidate()
 	absent := filepath.Join(t.TempDir(), "xfs_quota")
 	body := "#!/bin/sh\ncase \"$*\" in *'project -C'*) echo 'project 4242: no such project' >&2; exit 1;; esac\nexit 0\n"
 	if err := os.WriteFile(absent, []byte(body), 0o755); err != nil {
@@ -550,5 +554,50 @@ func TestReclaimWorkspaceQuotaToleratesNeverAppliedAssignment(t *testing.T) {
 		Workspace: "/mnt/xfs/ws", MountPoint: "/mnt/xfs", FsKey: "8:72", XQ: genuine, ProjectID: 4243,
 	}); err == nil || xfsCleanupAbsent(err) {
 		t.Fatalf("genuine cleanup failure = %v, want a retryable error", err)
+	}
+}
+
+// stubQuotaAssignmentValidation replaces the host-state proof for tests whose
+// fake mount point and tool cannot exist on the test host.
+func stubQuotaAssignmentValidation(t *testing.T) func() {
+	t.Helper()
+	prev := validateQuotaAssignmentFn
+	validateQuotaAssignmentFn = func(WorkspaceQuotaAssignment) error { return nil }
+	return func() { validateQuotaAssignmentFn = prev }
+}
+
+// TestValidateQuotaAssignmentRefusesForgedLedgerEntries pins the privileged
+// cleanup guard: a recorded tool that is not an euid-owned executable, a
+// relative path, and a mount point that is not a prjquota XFS mount are all
+// refused before any command runs.
+func TestValidateQuotaAssignmentRefusesForgedLedgerEntries(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "xfs_quota")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Tool checks.
+	if err := validatePrivilegedTool("relative/tool"); err == nil {
+		t.Fatal("relative tool path accepted")
+	}
+	if err := validatePrivilegedTool(filepath.Join(dir, "missing")); err == nil {
+		t.Fatal("missing tool accepted")
+	}
+	nonExec := filepath.Join(dir, "nonexec")
+	if err := os.WriteFile(nonExec, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePrivilegedTool(nonExec); err == nil {
+		t.Fatal("non-executable tool accepted")
+	}
+	if err := validatePrivilegedTool(script); err != nil {
+		t.Fatalf("valid tool refused: %v", err)
+	}
+	// Mount proof: an unmounted fake path is refused.
+	err := validateQuotaAssignment(WorkspaceQuotaAssignment{
+		Workspace: "/tmp/x", MountPoint: "/definitely-not-mounted", XQ: script, ProjectID: 5,
+	})
+	if err == nil {
+		t.Fatal("unmounted ledger mount point accepted")
 	}
 }

@@ -26,12 +26,17 @@ func productionPKIServerArgs(t *testing.T, dsn, addr string, extra ...string) []
 	t.Helper()
 	// Production mode requires a shared dashboard session key (HA failover).
 	t.Setenv("KIWI_WEB_SESSION_SECRET", strings.Repeat("ab", 32))
+	// Production requires positive untrusted resource ceilings (a zero
+	// disables the limit) and an admin token with real entropy.
+	t.Setenv("KIWI_QUOTA_UNTRUSTED_CPU_CEILING", "2")
+	t.Setenv("KIWI_QUOTA_UNTRUSTED_MEMORY_CEILING", "4294967296")
+	t.Setenv("KIWI_QUOTA_UNTRUSTED_DISK_CEILING", "10737418240")
 	certFile, keyFile := writeSelfSignedTLS(t)
 	args := []string{
 		"--listen", addr, "--database-url", dsn,
 		"--mode", "production", "--external-url", "https://ci.example.com",
 		"--tls-cert", certFile, "--tls-key", keyFile,
-		"--admin-token", "admin",
+		"--admin-token", "admin-token-pki-long-enough",
 		// Production requires a bounded staging area for large runner uploads.
 		"--staging-dir", t.TempDir(), "--staging-max-bytes", "67108864",
 	}

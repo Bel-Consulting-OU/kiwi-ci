@@ -753,6 +753,9 @@ func validateStep(jobID string, idx int, st *Step, seenIDs map[string]bool) erro
 // surfacing later as an opaque job failure. An empty condition is valid and
 // behaves like success().
 func validateCondition(condition, where string) error {
+	if len(condition) > maxConditionBytes {
+		return fmt.Errorf("%s exceeds the %d byte condition limit", where, maxConditionBytes)
+	}
 	if strings.TrimSpace(condition) == "" {
 		return nil
 	}

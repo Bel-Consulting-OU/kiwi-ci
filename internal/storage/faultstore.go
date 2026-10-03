@@ -852,8 +852,14 @@ func (f *FaultyStore) ReleaseOutboxClaims(ctx context.Context, ids []string, cla
 // OutboxRetry delegates the retry/dead-letter transition to the inner store
 // (the fault-injection memStore implements the same policy as the SQL store).
 func (f *FaultyStore) OutboxRetry(ctx context.Context, id string, dispatchErr error, maxAttempts int) error {
+	return f.OutboxRetryClaimed(ctx, id, "", dispatchErr, maxAttempts)
+}
+
+// OutboxRetryClaimed forwards the claim-guarded retry variant used by the
+// flusher (an empty claimer keeps the legacy unguarded behavior).
+func (f *FaultyStore) OutboxRetryClaimed(ctx context.Context, id, claimer string, dispatchErr error, maxAttempts int) error {
 	inner, ok := f.Inner.(interface {
-		OutboxRetry(context.Context, string, error, int) error
+		OutboxRetryClaimed(context.Context, string, string, error, int) error
 	})
 	if !ok {
 		return errMissingInnerInterface("OutboxRetry")
@@ -863,7 +869,7 @@ func (f *FaultyStore) OutboxRetry(ctx context.Context, id string, dispatchErr er
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return inner.OutboxRetry(ctx, id, dispatchErr, maxAttempts)
+	return inner.OutboxRetryClaimed(ctx, id, claimer, dispatchErr, maxAttempts)
 }
 
 func (f *FaultyStore) OutboxDeadLetters(ctx context.Context) ([]OutboxDeadLetter, error) {
@@ -2415,6 +2421,12 @@ func (m *memStore) HeartbeatLease(ctx context.Context, jobID string, runnerID st
 	if j.Status != model.StatusRunning || j.LeaseRunnerID != runnerID || j.LeaseGeneration != generation {
 		return ErrLeaseConflict
 	}
+	now := time.Now().UTC()
+	// A heartbeat must not resurrect an already-expired lease (the recovery
+	// path owns it then), and the legacy absolute-time bound matches SQL.
+	if (j.LeaseExpiresAt != nil && !j.LeaseExpiresAt.After(now)) || expiresAt.After(now.Add(24*time.Hour)) {
+		return ErrLeaseConflict
+	}
 	j.LeaseExpiresAt = &expiresAt
 	m.jobs[jobID] = j
 	return nil
@@ -3566,6 +3578,20 @@ func (m *memStore) OutboxMarkDelivered(ctx context.Context, logicalKey string, v
 // scheduled with bounded exponential backoff. After maxAttempts the row is
 // dead-lettered instead of hot-looping. An unknown id is a no-op (the row was
 // already acked).
+// OutboxRetryClaimed mirrors the SQL claim guard for the in-memory store.
+func (m *memStore) OutboxRetryClaimed(ctx context.Context, id, claimer string, dispatchErr error, maxAttempts int) error {
+	if claimer != "" {
+		m.mu.Lock()
+		owner := m.outboxClaims[id]
+		m.mu.Unlock()
+		if owner.claimer != "" && owner.claimer != claimer {
+			// Another flusher owns the (possibly fresh) claim: never clear it.
+			return nil
+		}
+	}
+	return m.OutboxRetry(ctx, id, dispatchErr, maxAttempts)
+}
+
 func (m *memStore) OutboxRetry(ctx context.Context, id string, dispatchErr error, maxAttempts int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

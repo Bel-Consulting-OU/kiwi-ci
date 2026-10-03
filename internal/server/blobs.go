@@ -1528,6 +1528,14 @@ func cleanBlobName(s string) string {
 	s = strings.ReplaceAll(s, "\\", "_")
 	s = strings.ReplaceAll(s, "/", "_")
 	s = strings.ReplaceAll(s, "..", "_")
+	// Header-parameter metacharacters: without stripping these, a
+	// pipeline-controlled artifact name could inject extra
+	// Content-Disposition parameters (filename*=..., RFC5987 spoofing).
+	s = strings.ReplaceAll(s, `"`, "_")
+	s = strings.ReplaceAll(s, ";", "_")
+	s = strings.ReplaceAll(s, ",", "_")
+	s = strings.ReplaceAll(s, "\r", "_")
+	s = strings.ReplaceAll(s, "\n", "_")
 	s = strings.Trim(s, " .")
 	if len(s) > 160 {
 		s = s[:160]

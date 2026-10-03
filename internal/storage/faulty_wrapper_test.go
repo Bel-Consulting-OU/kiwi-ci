@@ -63,7 +63,7 @@ func faultyWrapperCases() map[string]wrapperCase {
 			j.LeaseExpiresAt = &expired
 			_ = m.InsertJob(ctx(), j)
 		}, call: func(f *FaultyStore) error {
-			_, err := f.ListExpiredRunningJobs(ctx(), time.Unix(3000, 0).UTC(), "", 10)
+			_, err := f.ListExpiredRunningJobs(ctx(), time.Now().UTC().Add(time.Minute), "", 10)
 			return err
 		}},
 		"ListQueueTimedOutJobs": {seed: func(m *memStore) {
@@ -102,7 +102,7 @@ func faultyWrapperCases() map[string]wrapperCase {
 			return err
 		}},
 		"HeartbeatLease": {mutates: true, seed: func(m *memStore) { seedRunningJob(m); seedRunner(m) }, call: func(f *FaultyStore) error {
-			return f.HeartbeatLease(ctx(), testJob.ID, testRunner.ID, 1, time.Unix(3000, 0).UTC())
+			return f.HeartbeatLease(ctx(), testJob.ID, testRunner.ID, 1, time.Now().UTC().Add(time.Minute))
 		}},
 		"CompleteJob": {mutates: true, seed: func(m *memStore) { seedRunningJob(m); seedRunner(m) }, call: func(f *FaultyStore) error {
 			return f.CompleteJob(ctx(), testJob.ID, 1, testRunner.ID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: testJob.ID, Generation: 1, RunnerID: testRunner.ID})
@@ -138,7 +138,7 @@ func faultyWrapperCases() map[string]wrapperCase {
 			return err
 		}},
 		"RecoverExpiredLease": {mutates: true, seed: func(m *memStore) { seedRunningJob(m); seedRunner(m) }, call: func(f *FaultyStore) error {
-			return f.RecoverExpiredLease(ctx(), testJob.ID, 1, time.Unix(3000, 0).UTC())
+			return f.RecoverExpiredLease(ctx(), testJob.ID, 1, time.Now().UTC().Add(time.Minute))
 		}},
 		"ExpireQueuedJob": {mutates: true, seed: func(m *memStore) {
 			dl := time.Unix(1500, 0).UTC()

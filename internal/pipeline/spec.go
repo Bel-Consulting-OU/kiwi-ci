@@ -216,12 +216,28 @@ func (t *Trigger) UnmarshalYAML(node *yaml.Node) error {
 			}
 		}
 		if hasCron {
-			var entry CronEntry
-			if err := node.Decode(&entry); err != nil {
-				return err
+			// Two shapes carry cron: the human form maps "cron" directly to
+			// a scalar entry; the canonical JSON form maps "cron" to the full
+			// sequence of entries. Accept both.
+			for i := 0; i+1 < len(node.Content); i += 2 {
+				if node.Content[i].Value != "cron" {
+					continue
+				}
+				if node.Content[i+1].Kind == yaml.SequenceNode {
+					var entries []CronEntry
+					if err := node.Content[i+1].Decode(&entries); err != nil {
+						return err
+					}
+					t.Cron = entries
+					return nil
+				}
+				var entry CronEntry
+				if err := node.Decode(&entry); err != nil {
+					return err
+				}
+				t.Cron = []CronEntry{entry}
+				return nil
 			}
-			t.Cron = []CronEntry{entry}
-			return nil
 		}
 		type plain Trigger
 		var p plain
@@ -428,7 +444,8 @@ func (s *Service) UnmarshalYAML(value *yaml.Node) error {
 	*s = Service(p)
 	if value.Kind == yaml.MappingNode {
 		for i := 0; i+1 < len(value.Content); i += 2 {
-			if value.Content[i].Value == "retries" {
+			switch value.Content[i].Value {
+			case "retries", "retries_set":
 				s.RetriesSet = true
 			}
 		}
@@ -447,7 +464,8 @@ func (j *Job) UnmarshalYAML(value *yaml.Node) error {
 	*j = Job(p)
 	if value.Kind == yaml.MappingNode {
 		for i := 0; i+1 < len(value.Content); i += 2 {
-			if value.Content[i].Value == "infra_retries" {
+			switch value.Content[i].Value {
+			case "infra_retries", "infra_retries_set":
 				j.InfraRetriesSet = true
 			}
 		}
@@ -498,7 +516,10 @@ func (r *Retry) UnmarshalYAML(value *yaml.Node) error {
 	*r = Retry(p)
 	if value.Kind == yaml.MappingNode {
 		for i := 0; i+1 < len(value.Content); i += 2 {
-			if value.Content[i].Value == "max" {
+			switch value.Content[i].Value {
+			case "max", "max_set":
+				// "max_set" is the canonical round-trip marker for an
+				// explicit max: 0; either key records presence.
 				r.MaxSet = true
 			}
 		}

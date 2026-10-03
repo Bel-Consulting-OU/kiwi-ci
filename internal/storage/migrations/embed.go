@@ -57,6 +57,14 @@ func load(fsys fs.FS) ([]Migration, error) {
 		out = append(out, Migration{Version: version, Name: e.Name(), Statements: stmts})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Version < out[j].Version })
+	for i := 1; i < len(out); i++ {
+		if out[i].Version == out[i-1].Version {
+			// Two files for one version would silently skip one of them
+			// (the version row already exists), producing schema drift that
+			// only shows up in production.
+			return nil, fmt.Errorf("migrations: duplicate version %d (%s and %s)", out[i].Version, out[i-1].Name, out[i].Name)
+		}
+	}
 	return out, nil
 }
 

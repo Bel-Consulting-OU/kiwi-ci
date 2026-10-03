@@ -148,6 +148,10 @@ type ContainerBackend struct {
 	// NonRoot demands the workload not run as container UID 0 on a rootful
 	// daemon (see pipeline.Sandbox.NonRoot for the rootless semantics).
 	NonRoot bool
+	// runnerClientEnv is the runner's own docker client-control environment
+	// (captured once at StartJob) so job-declared values can never redirect
+	// the CLI or its config/trust.
+	runnerClientEnv []string
 	// Resources carries the job's resource requests, rendered into docker
 	// run flags by StartJob. Values are already admission-checked by
 	// pipeline validation; zero requests produce no flags. resources.disk
@@ -203,6 +207,7 @@ func (*ContainerBackend) Name() string { return "container" }
 // Every step is executed with docker exec so package installs and process state
 // behave like developers expect from a job while the checkout remains mounted.
 func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit func(string)) error {
+	b.runnerClientEnv = runnerClientEnv()
 	if b.Image == "" {
 		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("container runtime requires job.image")}
 	}
@@ -614,10 +619,17 @@ func (b *ContainerBackend) ReadFile(ctx context.Context, path string, maxBytes i
 	}
 	stderr := executil.NewBoundedBuffer(maxCommandStderrBytes)
 	cmd.Stderr = stderr
+	// Bound the output-pipe drain after a context kill too, so a killed
+	// `cat` cannot leave a descendant holding the pipe.
+	cmd.WaitDelay = 15 * time.Second
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
 	data, readErr := io.ReadAll(io.LimitReader(stdout, maxBytes+1))
+	// DRAIN the remainder before waiting: stopping at the limit would leave
+	// the child blocked writing into a full pipe and cmd.Wait would hang
+	// forever on a job with no timeout.
+	_, _ = io.Copy(io.Discard, stdout)
 	waitErr := cmd.Wait()
 	if waitErr != nil {
 		stderrText := string(stderr.Bytes())
@@ -634,6 +646,78 @@ func (b *ContainerBackend) ReadFile(ctx context.Context, path string, maxBytes i
 		return nil, fmt.Errorf("output file exceeds %d byte limit", maxBytes)
 	}
 	return data, nil
+}
+
+// dockerClientEnvName reports whether an environment variable controls the
+// docker CLI's own client behavior (daemon endpoint, context, TLS material,
+// config location, proxy, trust store). Pipeline-controlled values for these
+// must NEVER reach the CLI process: they could redirect it to an attacker
+// daemon or config and exfiltrate every secret the CLI resolves for `-e NAME`.
+func dockerClientEnvName(name string) bool {
+	switch strings.ToUpper(strings.TrimSpace(name)) {
+	case "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS", "DOCKER_TLS_VERIFY",
+		"DOCKER_CERT_PATH", "DOCKER_CONFIG", "DOCKER_API_VERSION",
+		"DOCKER_CUSTOM_HEADERS", "DOCKER_HIDE_LEGACY_COMMANDS",
+		"HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
+		"SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+		"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY":
+		return true
+	}
+	return false
+}
+
+// dockerClientEnv builds the docker CLI child environment for one step: the
+// job's variables (needed so `-e NAME` resolves values client-side) with every
+// CLIENT-CONTROL name REPLACED by the runner's own value. Variables whose
+// names are client-control are forwarded to the container by VALUE instead
+// (see Run), so a job can still declare e.g. its own HTTP_PROXY for the
+// container without redirecting the CLI.
+func dockerClientEnv(jobEnv, runnerEnv []string) []string {
+	replaced := map[string]bool{}
+	var out []string
+	for _, e := range jobEnv {
+		name := e
+		if i := strings.IndexByte(e, '='); i > 0 {
+			name = e[:i]
+		}
+		if dockerClientEnvName(name) {
+			// Client-control variable: the job's value is forwarded to the
+			// CONTAINER by value; it never enters the CLI environment.
+			continue
+		}
+		out = append(out, e)
+	}
+	for _, e := range runnerEnv {
+		name := e
+		if i := strings.IndexByte(e, '='); i > 0 {
+			name = e[:i]
+		}
+		if !dockerClientEnvName(name) {
+			continue
+		}
+		key := strings.ToUpper(name)
+		if replaced[key] {
+			continue
+		}
+		replaced[key] = true
+		out = append(out, e)
+	}
+	return out
+}
+
+// runnerClientEnv extracts the runner's own client-control variables once.
+func runnerClientEnv() []string {
+	var out []string
+	for _, e := range os.Environ() {
+		name := e
+		if i := strings.IndexByte(e, '='); i > 0 {
+			name = e[:i]
+		}
+		if dockerClientEnvName(name) {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 func (b *ContainerBackend) Run(ctx context.Context, c Command, emit func(string)) error {
@@ -654,11 +738,20 @@ func (b *ContainerBackend) Run(ctx context.Context, c Command, emit func(string)
 		containerDir += "/" + filepath.ToSlash(rel)
 	}
 	args := []string{"exec", "-w", containerDir}
+	cliEnv := make([]string, 0, len(c.Env))
 	for _, e := range c.Env {
 		if i := strings.IndexByte(e, '='); i > 0 {
+			if dockerClientEnvName(e[:i]) {
+				// Client-control variable: forward the JOB's value to the
+				// container by value (host argv only) so it never reaches the
+				// docker CLI's own environment.
+				args = append(args, "-e", e)
+				continue
+			}
 			// Passing only the variable name keeps secret values out of host argv;
 			// Docker reads the value from cmd.Env.
 			args = append(args, "-e", e[:i])
+			cliEnv = append(cliEnv, e)
 		}
 	}
 	// An already over-bound workspace never starts another step: the check
@@ -669,7 +762,7 @@ func (b *ContainerBackend) Run(ctx context.Context, c Command, emit func(string)
 	args = append(args, b.container)
 	args = append(args, shellCommand(c.Shell, c.Script)...)
 	cmd := exec.CommandContext(ctx, b.docker, args...)
-	cmd.Env = c.Env
+	cmd.Env = dockerClientEnv(cliEnv, b.runnerClientEnv)
 	err = streamCommand(ctx, cmd, emit)
 	if err == nil {
 		// Catch growth caused by this step. A bind mount cannot be capped by

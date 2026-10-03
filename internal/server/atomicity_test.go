@@ -533,7 +533,8 @@ func TestCompleteDBRequiresDeclaredArtifacts(t *testing.T) {
 	// Upload the required artifact and retry: the completion succeeds.
 	if err := f.InsertArtifact(context.Background(), model.ArtifactRecord{
 		ID: strings.Repeat("a", 32), RunID: j.RunID, JobID: j.ID, Name: "bin",
-		Size: 3, SHA256: "abc", CreatedAt: time.Now().UTC(),
+		LeaseGeneration: task.LeaseGeneration,
+		Size:            3, SHA256: "abc", CreatedAt: time.Now().UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}

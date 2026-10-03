@@ -108,7 +108,10 @@ func (s *Server) tracingMiddleware(next http.Handler) http.Handler {
 		}
 		ctx, span := s.startSpan(r.Context(), "http "+r.Method+" "+metricsPathClass(r.URL.Path),
 			attribute.String("http.method", r.Method),
-			attribute.String("http.route", r.URL.Path),
+			// The RAW path is attacker-controlled (any unauthenticated client
+			// can mint a unique route): export only the bounded path class so
+			// tracing cardinality and off-host ID leaks stay bounded.
+			attribute.String("http.route", metricsPathClass(r.URL.Path)),
 		)
 		defer span.End()
 		rec := &statusRecorder{ResponseWriter: w}

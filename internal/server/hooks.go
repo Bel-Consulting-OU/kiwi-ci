@@ -97,6 +97,15 @@ func (s *Server) gitlabWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad webhook payload: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := validateWebhookRepoBinding(ec.Repository); err != nil {
+		http.Error(w, "webhook repository identity mismatch: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := validateWebhookRepoBinding(ec.HeadRepository); err != nil {
+		http.Error(w, "webhook head repository identity mismatch: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	if ec.Event == "" {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -235,6 +244,15 @@ func (s *Server) forgejoWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad webhook payload: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := validateWebhookRepoBinding(ec.Repository); err != nil {
+		http.Error(w, "webhook repository identity mismatch: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := validateWebhookRepoBinding(ec.HeadRepository); err != nil {
+		http.Error(w, "webhook head repository identity mismatch: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	if ec.Event == "" {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -339,6 +357,6 @@ func (s *Server) forgejoWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	s.recordWebhookDelivery(r.Context(), "gitlab", repoID, delivery, digest, run.ID)
+	s.recordWebhookDelivery(r.Context(), "forgejo", repoID, delivery, digest, run.ID)
 	writeJSON(w, http.StatusAccepted, run)
 }

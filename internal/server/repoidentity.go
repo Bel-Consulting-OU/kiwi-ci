@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/giturl"
+	"net/url"
 	"strings"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
@@ -349,4 +350,45 @@ func checkoutCloneURL(ec forge.EventContext) string {
 // derivation so every counter mutation uses the same key.
 func repoTeamKey(repoID string) string {
 	return storage.RepoTeamKey(repoID)
+}
+
+// validateWebhookRepoBinding refuses a signed webhook whose clone URL does
+// not correspond to the repository coordinates in the same payload. Without
+// this check a repository that knows the shared webhook secret could declare
+// a trusted repository's full_name while pointing the checkout at its own
+// clone URL, so the cloned code would run under the victim's identity,
+// cache namespace and secrets. Only a mismatch is refused: providers that
+// omit one side are left to the identity binding that follows.
+func validateWebhookRepoBinding(repo forge.Repository) error {
+	if strings.TrimSpace(repo.FullName) == "" || strings.TrimSpace(repo.CloneURL) == "" {
+		return nil
+	}
+	u, err := url.Parse(repo.CloneURL)
+	if err != nil {
+		return fmt.Errorf("invalid clone URL %q", repo.CloneURL)
+	}
+	if u.User != nil {
+		return fmt.Errorf("clone URL %q carries credentials", repo.CloneURL)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https", "http", "ssh", "git":
+	default:
+		return fmt.Errorf("clone URL %q has unsupported scheme %q", repo.CloneURL, u.Scheme)
+	}
+	var path string
+	if u.Host == "" {
+		// scp-like git@host:owner/repo (url.Parse treats it as a path).
+		parts := strings.SplitN(strings.TrimPrefix(repo.CloneURL, "git@"), ":", 2)
+		if len(parts) != 2 {
+			return fmt.Errorf("unsupported clone URL %q", repo.CloneURL)
+		}
+		path = parts[1]
+	} else {
+		path = strings.TrimPrefix(u.Path, "/")
+	}
+	path = strings.TrimSuffix(path, ".git")
+	if !strings.EqualFold(path, strings.TrimSpace(repo.FullName)) {
+		return fmt.Errorf("clone URL %q does not match repository %q", repo.CloneURL, repo.FullName)
+	}
+	return nil
 }

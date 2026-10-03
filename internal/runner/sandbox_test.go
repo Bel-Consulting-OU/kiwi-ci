@@ -107,7 +107,7 @@ func TestVerifyCompiledPayloadKeepsPolicyDecodingStrict(t *testing.T) {
 		t.Fatal(err)
 	}
 	payload := buildPayload(t, payloadPipeline, "build")
-	_, caps, policyOK, err := verifyCompiledPayload(spec, payload, true)
+	_, caps, policyOK, err := verifyCompiledPayload(spec, "build", payload, true)
 	if err != nil || !policyOK || !caps.NativeExecution {
 		t.Fatalf("capability round trip disturbed: caps=%+v policyOK=%t err=%v", caps, policyOK, err)
 	}

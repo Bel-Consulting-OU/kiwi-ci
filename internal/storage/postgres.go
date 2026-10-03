@@ -1258,7 +1258,7 @@ func (s *PostgresStore) CountRunningJobs(ctx context.Context) (int, error) {
 // spellings of one repository return the same set while same-named
 // repositories on different hosts do not.
 func (s *PostgresStore) ListJobsByEnvironment(ctx context.Context, repoID, environment string) ([]model.Job, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+jobCols+` FROM jobs WHERE `+canonicalRepoIDSQLExpr("repo_url")+`=$1 AND payload->>'environment'=$2 ORDER BY created_at ASC, id ASC`, repoID, environment)
+	rows, err := s.pool.Query(ctx, `SELECT `+jobCols+` FROM jobs WHERE `+canonicalPolicyRepoIDSQLExpr("repo_url")+`=$1 AND payload->>'environment'=$2 ORDER BY created_at ASC, id ASC`, repoID, environment)
 	if err != nil {
 		return nil, err
 	}
@@ -1593,7 +1593,7 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 			return model.Job{}, err
 		}
 		var running int
-		if err := tx.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE status='running' AND `+canonicalRepoIDSQLExpr("repo_url")+`=$1 AND payload->>'environment'=$2 AND id<>$3`,
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE status='running' AND `+canonicalPolicyRepoIDSQLExpr("repo_url")+`=$1 AND payload->>'environment'=$2 AND id<>$3`,
 			claim.CanonRepoID, claim.Environment, claim.JobID).Scan(&running); err != nil {
 			return model.Job{}, err
 		}
@@ -1889,7 +1889,7 @@ var completionReceiptTTLSeconds = CompletionReceiptTTL.Seconds()
 // instantly, and the TTL (the behavior-affecting bound) is enforced exactly.
 func pruneCompletionReceiptsTx(ctx context.Context, tx pgx.Tx) error {
 	if _, err := tx.Exec(ctx, `DELETE FROM completion_receipts WHERE ctid IN (
-		SELECT ctid FROM completion_receipts WHERE created_at < now() - make_interval(secs => $1) ORDER BY created_at LIMIT $2 FOR UPDATE SKIP LOCKED
+		SELECT ctid FROM completion_receipts WHERE created_at < clock_timestamp() - make_interval(secs => $1) ORDER BY created_at LIMIT $2 FOR UPDATE SKIP LOCKED
 	)`, completionReceiptTTLSeconds, completionReceiptPruneBatch); err != nil {
 		return fmt.Errorf("storage: prune completion receipts: %w", err)
 	}
@@ -1916,7 +1916,7 @@ func pruneCompletionReceiptsTx(ctx context.Context, tx pgx.Tx) error {
 // same snapshot as the insert/update it guards.
 func completionReceiptHashTx(ctx context.Context, tx pgx.Tx, jobID string, generation int64, runnerID string) (string, bool, error) {
 	var hash string
-	err := tx.QueryRow(ctx, `SELECT result_hash FROM completion_receipts WHERE job_id=$1 AND generation=$2 AND runner_id=$3 AND created_at >= now() - make_interval(secs => $4)`,
+	err := tx.QueryRow(ctx, `SELECT result_hash FROM completion_receipts WHERE job_id=$1 AND generation=$2 AND runner_id=$3 AND created_at >= clock_timestamp() - make_interval(secs => $4)`,
 		jobID, generation, runnerID, completionReceiptTTLSeconds).Scan(&hash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", false, nil
@@ -2086,7 +2086,7 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 		// The conflicting row has aged out of the retention TTL and would
 		// have been reclaimed by pruneCompletionReceiptsTx below: treat it as
 		// absent, reclaim it, and retry the insert once.
-		if _, err := tx.Exec(ctx, `DELETE FROM completion_receipts WHERE job_id=$1 AND generation=$2 AND runner_id=$3 AND created_at < now() - make_interval(secs => $4)`,
+		if _, err := tx.Exec(ctx, `DELETE FROM completion_receipts WHERE job_id=$1 AND generation=$2 AND runner_id=$3 AND created_at < clock_timestamp() - make_interval(secs => $4)`,
 			receipt.JobID, receipt.Generation, receipt.RunnerID, completionReceiptTTLSeconds); err != nil {
 			return err
 		}
@@ -3449,7 +3449,7 @@ func (s *PostgresStore) HasCompletionReceipt(ctx context.Context, jobID string, 
 		rec  model.CompletionReceipt
 		hash string
 	)
-	err := s.pool.QueryRow(ctx, `SELECT result_hash FROM completion_receipts WHERE job_id=$1 AND generation=$2 AND runner_id=$3 AND created_at >= now() - make_interval(secs => $4)`, jobID, generation, runnerID, completionReceiptTTLSeconds).Scan(&hash)
+	err := s.pool.QueryRow(ctx, `SELECT result_hash FROM completion_receipts WHERE job_id=$1 AND generation=$2 AND runner_id=$3 AND created_at >= clock_timestamp() - make_interval(secs => $4)`, jobID, generation, runnerID, completionReceiptTTLSeconds).Scan(&hash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return model.CompletionReceipt{}, false, nil
 	}
@@ -4838,10 +4838,7 @@ func (s *PostgresStore) AdjustQuotaCounter(ctx context.Context, repoKey, teamKey
 		return err
 	}
 	defer tx.Rollback(ctx)
-	for _, key := range []string{repoKey, teamKey} {
-		if key == "" {
-			continue
-		}
+	for _, key := range quotaKeysDedup(repoKey, teamKey) {
 		if _, err := tx.Exec(ctx, `UPDATE quota_reservations SET running = GREATEST(running + $2, 0), queued = GREATEST(queued + $3, 0), updated_at = now() WHERE key = $1`, key, runningDelta, queuedDelta); err != nil {
 			return err
 		}
@@ -4849,13 +4846,26 @@ func (s *PostgresStore) AdjustQuotaCounter(ctx context.Context, repoKey, teamKey
 	return tx.Commit(ctx)
 }
 
+// quotaKeysDedup returns the non-empty quota keys with duplicates removed:
+// the repo and team key are frequently equal (repo-scoped quota), and
+// applying/summing the same row twice would double-charge or double-read.
+func quotaKeysDedup(repoKey, teamKey string) []string {
+	if repoKey == "" && teamKey == "" {
+		return nil
+	}
+	if repoKey == "" {
+		return []string{teamKey}
+	}
+	if teamKey == "" || teamKey == repoKey {
+		return []string{repoKey}
+	}
+	return []string{repoKey, teamKey}
+}
+
 // QuotaCounts reads the reserved running/queued counters for the key pair.
 // Missing rows read as zero.
 func (s *PostgresStore) QuotaCounts(ctx context.Context, repoKey, teamKey string) (running, queued int, err error) {
-	for _, key := range []string{repoKey, teamKey} {
-		if key == "" {
-			continue
-		}
+	for _, key := range quotaKeysDedup(repoKey, teamKey) {
 		var kr, kq int
 		qerr := s.pool.QueryRow(ctx, `SELECT running, queued FROM quota_reservations WHERE key=$1`, key).Scan(&kr, &kq)
 		if qerr == nil {
@@ -5362,10 +5372,32 @@ func (s *PostgresStore) ReleaseLeadership(ctx context.Context, key string) error
 // Migrate applies pending migrations in version order, each inside its own
 // transaction guarded by a transaction-scoped advisory lock so concurrent
 // instances cannot apply the same migration twice.
+// maxAppliedMigration reports the newest schema version recorded in the
+// database (0 when the table is absent).
+func (s *PostgresStore) maxAppliedMigration(ctx context.Context) (int, error) {
+	var haveTable bool
+	if err := s.pool.QueryRow(ctx, `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&haveTable); err != nil {
+		return 0, err
+	}
+	if !haveTable {
+		return 0, nil
+	}
+	var max int
+	if err := s.pool.QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&max); err != nil {
+		return 0, err
+	}
+	return max, nil
+}
+
 func (s *PostgresStore) Migrate(ctx context.Context) error {
 	all, err := migrations.All()
 	if err != nil {
 		return err
+	}
+	if max, merr := s.maxAppliedMigration(ctx); merr != nil {
+		return merr
+	} else if len(all) > 0 && max > all[len(all)-1].Version {
+		return fmt.Errorf("storage: database schema version %d is newer than this binary's %d; refusing to run an old binary against a newer schema", max, all[len(all)-1].Version)
 	}
 	for _, m := range all {
 		if err := s.applyMigration(ctx, m); err != nil {
@@ -5797,7 +5829,19 @@ func containsString(in []string, v string) bool {
 // with bounded exponential backoff + jitter. After maxAttempts the row is
 // DEAD-LETTERED, so a permanently broken integration (revoked credentials,
 // invalid payload) cannot hot-loop forever.
+// OutboxRetry records a failed dispatch and releases the claim in ONE atomic
+// statement, so overlapping retries cannot lose an increment (the old
+// SELECT-then-UPDATE let two writers store the same attempts and defeat the
+// dead-letter budget), and the claim is only cleared while it is still held
+// by this claimer (a flusher whose claim lease expired must not clear the
+// NEW owner's claim and let a third publisher run).
 func (s *PostgresStore) OutboxRetry(ctx context.Context, id string, dispatchErr error, maxAttempts int) error {
+	return s.OutboxRetryClaimed(ctx, id, "", dispatchErr, maxAttempts)
+}
+
+// OutboxRetryClaimed is OutboxRetry with the ownership guard: an empty
+// claimer keeps the legacy unguarded behavior for direct callers.
+func (s *PostgresStore) OutboxRetryClaimed(ctx context.Context, id, claimer string, dispatchErr error, maxAttempts int) error {
 	if id == "" {
 		return fmt.Errorf("storage: empty outbox id")
 	}
@@ -5805,23 +5849,22 @@ func (s *PostgresStore) OutboxRetry(ctx context.Context, id string, dispatchErr 
 	if dispatchErr != nil {
 		msg = dispatchErr.Error()
 	}
-	backoff := time.Second
-	var attempts int
-	if err := s.pool.QueryRow(ctx, `SELECT attempts FROM outbox WHERE id=$1`, id).Scan(&attempts); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil
-		}
-		return err
-	}
-	for i := 0; i < attempts && backoff < time.Minute; i++ {
-		backoff *= 2
-	}
-	jitter := time.Duration(time.Now().UnixNano() % int64(backoff/4+1))
-	if maxAttempts > 0 && attempts+1 >= maxAttempts {
-		_, err := s.pool.Exec(ctx, `UPDATE outbox SET attempts=attempts+1, last_error=$2, claimed_at=NULL, claimed_by=NULL, dead_lettered_at=now() WHERE id=$1`, id, msg)
-		return err
-	}
-	_, err := s.pool.Exec(ctx, `UPDATE outbox SET attempts=attempts+1, last_error=$2, claimed_at=NULL, claimed_by=NULL, next_attempt_at=now()+$3 WHERE id=$1`, id, msg, backoff+jitter)
+	// Backoff: 2^min(attempts,6) seconds capped at one minute, plus a
+	// deterministic per-row jitter derived from the row id hash, all computed
+	// from the locked row's CURRENT attempts inside the statement.
+	_, err := s.pool.Exec(ctx, `
+UPDATE outbox SET
+    attempts = attempts + 1,
+    last_error = $2,
+    claimed_at = NULL,
+    claimed_by = NULL,
+    dead_lettered_at = CASE WHEN $3::int > 0 AND attempts + 1 >= $3 THEN now() ELSE dead_lettered_at END,
+    next_attempt_at = CASE
+        WHEN $3::int > 0 AND attempts + 1 >= $3 THEN next_attempt_at
+        ELSE clock_timestamp() + make_interval(secs => LEAST(power(2, LEAST(attempts, 6))::double precision, 60) + (hashtext(id) % 1000)::double precision / 4000.0)
+    END
+WHERE id = $1
+  AND ($4 = '' OR claimed_by IS NULL OR claimed_by = $4)`, id, msg, maxAttempts, claimer)
 	return err
 }
 

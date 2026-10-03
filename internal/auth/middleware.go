@@ -162,8 +162,19 @@ func tokenMatches(got, want string) bool {
 }
 
 func requestIDFrom(r *http.Request) string {
-	if id := r.Header.Get("X-Kiwi-Request-ID"); id != "" {
+	if id := boundedRequestID(r.Header.Get("X-Kiwi-Request-ID")); id != "" {
 		return id
 	}
 	return "-"
+}
+
+// boundedRequestID truncates an unvalidated request ID for logging: the
+// header is attacker-chosen, and a 100 KB value would balloon every auth
+// log line (the server middleware mints/validates its own ID separately).
+func boundedRequestID(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if len(raw) > 128 {
+		raw = raw[:128]
+	}
+	return raw
 }

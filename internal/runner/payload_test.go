@@ -59,7 +59,7 @@ func TestVerifyCompiledPayloadMatching(t *testing.T) {
 		t.Fatal(err)
 	}
 	payload := buildPayload(t, payloadPipeline, "build")
-	cj, caps, policyOK, err := verifyCompiledPayload(spec, payload, true)
+	cj, caps, policyOK, err := verifyCompiledPayload(spec, "build", payload, true)
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestVerifyCompiledPayloadTampered(t *testing.T) {
 	t.Run("pipeline digest", func(t *testing.T) {
 		payload := buildPayload(t, payloadPipeline, "build")
 		payload.PipelineDigest = strings.Repeat("0", 64)
-		_, _, _, err := verifyCompiledPayload(spec, payload, true)
+		_, _, _, err := verifyCompiledPayload(spec, "build", payload, true)
 		if err == nil || !strings.Contains(err.Error(), "compiled payload digest mismatch") {
 			t.Fatalf("tampered pipeline digest accepted: %v", err)
 		}
@@ -90,7 +90,7 @@ func TestVerifyCompiledPayloadTampered(t *testing.T) {
 	t.Run("job digest", func(t *testing.T) {
 		payload := buildPayload(t, payloadPipeline, "build")
 		payload.JobDigest = strings.Repeat("1", 64)
-		_, _, _, err := verifyCompiledPayload(spec, payload, true)
+		_, _, _, err := verifyCompiledPayload(spec, "build", payload, true)
 		if err == nil || !strings.Contains(err.Error(), "compiled payload digest mismatch") {
 			t.Fatalf("tampered job digest accepted: %v", err)
 		}
@@ -98,7 +98,7 @@ func TestVerifyCompiledPayloadTampered(t *testing.T) {
 	t.Run("schema version", func(t *testing.T) {
 		payload := buildPayload(t, payloadPipeline, "build")
 		payload.SchemaVersion = 2
-		_, _, _, err := verifyCompiledPayload(spec, payload, true)
+		_, _, _, err := verifyCompiledPayload(spec, "build", payload, true)
 		if err == nil || !strings.Contains(err.Error(), "schema version") {
 			t.Fatalf("unknown schema version accepted: %v", err)
 		}
@@ -112,13 +112,13 @@ func TestVerifyCompiledPayloadUntrustedPolicyFloor(t *testing.T) {
 	}
 	payload := buildPayload(t, payloadPipeline, "build")
 	// Trusted capabilities exceed the untrusted floor (native execution).
-	_, _, _, err = verifyCompiledPayload(spec, payload, false)
+	_, _, _, err = verifyCompiledPayload(spec, "build", payload, false)
 	if err == nil || !strings.Contains(err.Error(), "untrusted capability floor") {
 		t.Fatalf("floor violation accepted: %v", err)
 	}
 	// A floor-conformant untrusted policy passes.
 	payload.EffectivePolicy = mustJSON(t, policy.DefaultUntrustedCapabilities())
-	cj, caps, policyOK, err := verifyCompiledPayload(spec, payload, false)
+	cj, caps, policyOK, err := verifyCompiledPayload(spec, "build", payload, false)
 	if err != nil {
 		t.Fatalf("floor-conformant policy rejected: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestVerifyCompiledPayloadMissingPolicy(t *testing.T) {
 	}
 	payload := buildPayload(t, payloadPipeline, "build")
 	payload.EffectivePolicy = nil
-	_, _, policyOK, err := verifyCompiledPayload(spec, payload, true)
+	_, _, policyOK, err := verifyCompiledPayload(spec, "build", payload, true)
 	if err != nil {
 		t.Fatalf("payload without policy rejected: %v", err)
 	}
@@ -150,4 +150,46 @@ func mustJSON(t *testing.T, v any) json.RawMessage {
 		t.Fatal(err)
 	}
 	return json.RawMessage(b)
+}
+
+// stubPayloadLocalBinding disables the local-recompilation binding for
+// fixtures whose PURPOSE is a different executor path; the binding itself is
+// covered by TestExecuteCompiledPayloadRunsEffectiveJob and
+// TestVerifyCompiledPayload*.
+func stubPayloadLocalBinding(t *testing.T) func() {
+	t.Helper()
+	prev := payloadLocalBindingCheck
+	payloadLocalBindingCheck = false
+	return func() { payloadLocalBindingCheck = prev }
+}
+
+// TestVerifyCompiledPayloadBindsEffectiveJobToLocalCompile is the direct
+// regression for the self-referential digest: a payload whose EffectiveJob
+// was replaced (and whose JobDigest was recomputed to match) alongside a
+// digest-verified pipeline must be REFUSED because it does not match a local
+// recompilation of that pipeline.
+func TestVerifyCompiledPayloadBindsEffectiveJobToLocalCompile(t *testing.T) {
+	base := "version: 1\njobs:\n  build:\n    steps:\n      - run: echo hi\n"
+	spec, err := pipeline.Parse([]byte(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := buildPayload(t, base, "build")
+	raw, ok := payload.EffectiveJob.(json.RawMessage)
+	if !ok {
+		t.Fatalf("effective job = %T", payload.EffectiveJob)
+	}
+	var eff pipeline.CompiledJob
+	if err := json.Unmarshal(raw, &eff); err != nil {
+		t.Fatal(err)
+	}
+	eff.Job.Steps = append(eff.Job.Steps, pipeline.Step{ID: "evil", Run: "touch /tmp/pwned"})
+	evilJSON := mustJSON(t, eff)
+	sum := sha256.Sum256(evilJSON)
+	payload.EffectiveJob = evilJSON
+	payload.JobDigest = hex.EncodeToString(sum[:])
+
+	if _, _, _, err := verifyCompiledPayload(spec, "build", payload, true); err == nil || !strings.Contains(err.Error(), "local compilation") {
+		t.Fatalf("self-hashed tampered payload = %v, want the local-compilation refusal", err)
+	}
 }

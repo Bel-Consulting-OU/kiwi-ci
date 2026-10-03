@@ -898,6 +898,16 @@ func (s *Server) adjustRunForChildrenDB(ctx context.Context, runID string) error
 		if err := s.DB.UpdateRunStatus(ctx, runID, model.StatusCancelled, nil, &fin); err != nil {
 			return fmt.Errorf("downstream: finalize parent cancelled: %w", err)
 		}
+	case run.Status != model.StatusSuccess:
+		// All children succeeded and the run was reopened while they were in
+		// flight: finalize it back to success. Without this the parent stayed
+		// running forever (wait=true runs never terminated in DB mode) and
+		// forge status/aggregation never completed.
+		fin := time.Now().UTC()
+		if err := s.DB.UpdateRunStatus(ctx, runID, model.StatusSuccess, nil, &fin); err != nil {
+			return fmt.Errorf("downstream: finalize parent success: %w", err)
+		}
+		s.auditLocked("run.downstream.completed", "scheduler", runID, "", "downstream children completed", nil)
 	}
 	return nil
 }

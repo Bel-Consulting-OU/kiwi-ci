@@ -123,10 +123,12 @@ func convertOn(res *importer.Result, on *yaml.Node, spec *pipeline.Spec) {
 	if spec.On == nil {
 		spec.On = map[string]pipeline.Trigger{}
 	}
+	mapped := false
 	add := func(event string, cfg *yaml.Node) {
 		switch event {
 		case "push", "pull_request":
 			spec.On[event] = triggerFrom(cfg)
+			mapped = true
 		default:
 			res.AddUnsupported("trigger %q has no Kiwi equivalent; Kiwi triggers on push/pull_request webhooks only", event)
 		}
@@ -154,6 +156,15 @@ func convertOn(res *importer.Result, on *yaml.Node, spec *pipeline.Spec) {
 		}
 	default:
 		res.AddUnsupported("trigger `on` must be an event name, a list of event names, or an event mapping")
+	}
+	if !mapped {
+		// Every declared event was unmappable (workflow_dispatch, schedule,
+		// release, ...). An EMPTY on: matches every webhook, which would turn
+		// a manual-only workflow into a run-on-everything pipeline; emit a
+		// branch sentinel that can never match instead.
+		spec.On["push"] = pipeline.Trigger{Branches: []string{"kiwi-import-unsupported-trigger"}}
+		res.AddUnsupported("no workflow trigger could be mapped; the imported pipeline is gated to a never-matching branch so it cannot run until the trigger is reviewed")
+		res.AddTODO("replace the placeholder trigger with the intended Kiwi trigger")
 	}
 }
 
@@ -200,8 +211,11 @@ func convertJob(res *importer.Result, jobsNode *yaml.Node, name string, ids map[
 	if ifc := importer.Key(jobNode, "if"); ifc != nil {
 		expr, ok := importer.MapCondition(importer.StrScalar(ifc))
 		if !ok {
-			res.AddUnsupported("job %q: condition %q uses contexts Kiwi cannot evaluate; the job keeps the default success() gate", name, importer.StrScalar(ifc))
-			res.AddTODO("job %q: review the condition %q by hand", name, importer.StrScalar(ifc))
+			// Dropping an unmappable condition would make a GATED job
+			// unconditional; emit it disabled so a human must review it.
+			j.If = "false"
+			res.AddUnsupported("job %q: condition %q uses contexts Kiwi cannot evaluate; the job is disabled until reviewed", name, importer.StrScalar(ifc))
+			res.AddTODO("job %q: review the condition %q by hand and re-enable", name, importer.StrScalar(ifc))
 		} else {
 			j.If = expr
 		}
@@ -213,6 +227,9 @@ func convertJob(res *importer.Result, jobsNode *yaml.Node, name string, ids map[
 	}
 	if env := importer.Key(jobNode, "env"); env != nil {
 		j.Env = importer.EnvMap(env)
+		if guardUnresolvedExpressions(res, fmt.Sprintf("job %q", name), j.Env, "") {
+			j.If = "false"
+		}
 	}
 	if out := importer.Key(jobNode, "outputs"); out != nil {
 		j.Outputs = importer.EnvMap(out)
@@ -365,14 +382,18 @@ func convertStep(res *importer.Result, job string, step *yaml.Node) (pipeline.St
 	if ifc := importer.Key(step, "if"); ifc != nil {
 		expr, ok := importer.MapCondition(importer.StrScalar(ifc))
 		if !ok {
-			res.AddUnsupported("job %q step %q: condition %q uses contexts Kiwi cannot evaluate; dropped", job, name, importer.StrScalar(ifc))
-			res.AddTODO("job %q step %q: review the condition %q by hand", job, name, importer.StrScalar(ifc))
+			st.If = "false"
+			res.AddUnsupported("job %q step %q: condition %q uses contexts Kiwi cannot evaluate; the step is disabled until reviewed", job, name, importer.StrScalar(ifc))
+			res.AddTODO("job %q step %q: review the condition %q by hand and re-enable", job, name, importer.StrScalar(ifc))
 		} else {
 			st.If = expr
 		}
 	}
 	if with := importer.Key(step, "with"); with != nil {
 		res.AddTODO("job %q step %q: `with` parameters (%s) need manual conversion into the run script or env", job, name, strings.Join(mapKeys(with), ", "))
+	}
+	if guardUnresolvedExpressions(res, fmt.Sprintf("job %q step %q", job, name), st.Env, st.Run) {
+		st.If = "false"
 	}
 	return st, true
 }
@@ -384,4 +405,35 @@ func mapKeys(n *yaml.Node) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// unresolvedExpressionContexts marks expressions Kiwi does NOT substitute
+// after import. Copying them verbatim would make a workflow that expects a
+// populated credential run with the literal "${{ secrets.X }}" text, so the
+// affected job/step is disabled instead.
+var unresolvedExpressionContexts = []string{"${{ secrets.", "${{ vars.", "${{ env."}
+
+func containsUnresolvedExpression(v string) bool {
+	for _, needle := range unresolvedExpressionContexts {
+		if strings.Contains(v, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// guardUnresolvedExpressions disables a job or step whose env or script
+// copied an unresolved expression context, reporting why.
+func guardUnresolvedExpressions(res *importer.Result, scope string, env map[string]string, run string) bool {
+	for key, value := range env {
+		if containsUnresolvedExpression(value) {
+			res.AddUnsupported("%s: env %q uses an expression context Kiwi does not resolve; disabled until reviewed", scope, key)
+			return true
+		}
+	}
+	if containsUnresolvedExpression(run) {
+		res.AddUnsupported("%s: script uses an expression context Kiwi does not resolve; disabled until reviewed", scope)
+		return true
+	}
+	return false
 }

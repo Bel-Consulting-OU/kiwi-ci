@@ -22,3 +22,9 @@ func setupWorkspaceDiskQuota(workspace string, limit int64) (DiskQuotaStatus, fu
 func setupWorkspaceDiskQuotaWithHook(workspace string, limit int64, onAllocated func(WorkspaceQuotaAssignment)) (DiskQuotaStatus, func() error) {
 	return DiskQuotaStatus{Detail: fmt.Sprintf("OS-level project quotas are only implemented on Linux (this host is %s); the workspace bound is step-boundary only", runtime.GOOS)}, nil
 }
+
+// validateQuotaAssignment refuses ledger-recorded quota cleanups off Linux:
+// project quotas are never created there, so no valid assignment exists.
+func validateQuotaAssignment(WorkspaceQuotaAssignment) error {
+	return fmt.Errorf("XFS project quotas are not supported on this platform")
+}

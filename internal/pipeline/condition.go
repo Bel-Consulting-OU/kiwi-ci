@@ -14,10 +14,32 @@ type EvalContext struct {
 	Branch string
 }
 
+// maxConditionBytes bounds an `if`/condition expression. The evaluator is
+// linear-time, but admission still caps the input so a pathological scalar
+// cannot make parsing/scheduling hot paths expensive.
+const maxConditionBytes = 8 << 10
+
 func Eval(expr string, c EvalContext) (bool, error) {
-	expr = strings.TrimSpace(expr)
-	for hasOuterParens(expr) {
-		expr = strings.TrimSpace(expr[1 : len(expr)-1])
+	if len(expr) > maxConditionBytes {
+		return false, fmt.Errorf("condition exceeds %d bytes", maxConditionBytes)
+	}
+	expr = stripOuterParens(expr)
+	if strings.HasPrefix(expr, "!") {
+		negated := true
+		expr = strings.TrimSpace(expr[1:])
+		for strings.HasPrefix(expr, "!") {
+			negated = !negated
+			expr = strings.TrimSpace(expr[1:])
+		}
+		expr = stripOuterParens(expr)
+		ok, err := Eval(expr, c)
+		if err != nil {
+			return false, err
+		}
+		if negated {
+			return !ok, nil
+		}
+		return ok, nil
 	}
 	if expr == "" || expr == "true" {
 		return true, nil
@@ -199,12 +221,24 @@ func indexTopLevelFrom(s, needle string, from int) int {
 	}
 	return -1
 }
+
+// hasOuterParens reports whether s is wrapped in fully-enclosing parentheses
+// (kept for the evaluator's historical tests; stripOuterParens implements the
+// linear-time replacement).
 func hasOuterParens(s string) bool {
+	return stripOuterParens(s) != strings.TrimSpace(s)
+}
+
+// stripOuterParens removes every layer of fully-enclosing parentheses in ONE
+// linear pass (matching pairs recorded on a stack), so a deeply nested
+// expression like "((((x))))" costs O(n) rather than O(n^2) per evaluation.
+func stripOuterParens(s string) string {
 	s = strings.TrimSpace(s)
 	if len(s) < 2 || s[0] != '(' || s[len(s)-1] != ')' {
-		return false
+		return s
 	}
-	depth := 0
+	closes := make(map[int]int, len(s)/2)
+	var stack []int
 	var quote byte
 	for i := 0; i < len(s); i++ {
 		ch := s[i]
@@ -214,20 +248,35 @@ func hasOuterParens(s string) bool {
 			}
 			continue
 		}
-		if ch == '\'' || ch == '"' {
+		switch ch {
+		case '\'', '"':
 			quote = ch
-			continue
-		}
-		if ch == '(' {
-			depth++
-		} else if ch == ')' {
-			depth--
-			if depth == 0 && i != len(s)-1 {
-				return false
+		case '(':
+			stack = append(stack, i)
+		case ')':
+			if len(stack) == 0 {
+				return s
 			}
+			open := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			closes[open] = i
 		}
 	}
-	return depth == 0
+	if len(stack) != 0 {
+		return s
+	}
+	layers := 0
+	for j := 0; j < len(s)/2; j++ {
+		closeAt, ok := closes[j]
+		if !ok || closeAt != len(s)-1-j {
+			break
+		}
+		layers++
+	}
+	if layers == 0 {
+		return s
+	}
+	return strings.TrimSpace(s[layers : len(s)-layers])
 }
 
 // ConditionAllows reports whether a job whose dependencies reached the given

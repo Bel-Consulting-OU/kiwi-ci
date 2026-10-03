@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 )
 
 // setupWorkspaceDiskQuota is the Linux capability probe: it inspects the
@@ -69,4 +71,51 @@ func setupXFSProjectQuotaWithHook(workspace string, entry mountInfoEntry, limit 
 		return DiskQuotaStatus{Detail: fmt.Sprintf("xfs_quota not found: %v", err)}, nil
 	}
 	return setupXFSProjectQuotaOnMountHook(workspace, entry, limit, xq, onAllocated)
+}
+
+// validateQuotaAssignment proves a ledger-recorded assignment against HOST
+// state before any privileged cleanup runs: the mount point must be a
+// currently mounted XFS filesystem with project quotas, and the tool must be
+// an absolute executable regular file owned by the effective user.
+func validateQuotaAssignment(a WorkspaceQuotaAssignment) error {
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return fmt.Errorf("read /proc/self/mountinfo: %w", err)
+	}
+	found := false
+	for _, line := range strings.Split(string(data), "\n") {
+		entry, ok := parseMountInfoLine(line)
+		if !ok || entry.mountPoint != a.MountPoint {
+			continue
+		}
+		if entry.fsType != "xfs" || (!hasMountOption(entry.superOptions, "prjquota") && !hasMountOption(entry.superOptions, "pquota")) {
+			return fmt.Errorf("recorded mount %s is not a prjquota XFS mount", a.MountPoint)
+		}
+		found = true
+		break
+	}
+	if !found {
+		return fmt.Errorf("recorded mount %s is not currently mounted", a.MountPoint)
+	}
+	return validatePrivilegedTool(a.XQ)
+}
+
+// validatePrivilegedTool proves a recorded helper before executing it as the
+// runner (root for XFS): absolute path, regular executable file, owned by the
+// effective user.
+func validatePrivilegedTool(path string) error {
+	if !filepath.IsAbs(path) || strings.Contains(path, "..") {
+		return fmt.Errorf("recorded tool path %q is not a safe absolute path", path)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat recorded tool %s: %w", path, err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		return fmt.Errorf("recorded tool %s is not an executable regular file", path)
+	}
+	if !lockFileOwnerOK(info) {
+		return fmt.Errorf("recorded tool %s is not owned by the runner", path)
+	}
+	return nil
 }

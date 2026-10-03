@@ -96,8 +96,11 @@ func TestParseHeaderCountRejectsSymlinkFlood(t *testing.T) {
 		})
 	}
 	limits := safefs.ExtractLimits{MaxEntries: 100}
-	if _, err := ParseWithLimits(bytes.NewReader(tarGzHeaders(t, headers)), limits); !errors.Is(err, safefs.ErrLimits) {
-		t.Fatalf("symlink flood: want ErrLimits, got %v", err)
+	// Unsafe entry types are now refused outright (extraction could never
+	// restore them), which is an equally fail-closed outcome; the important
+	// property is that the archive is rejected.
+	if _, err := ParseWithLimits(bytes.NewReader(tarGzHeaders(t, headers)), limits); err == nil || (!errors.Is(err, safefs.ErrLimits) && !errors.Is(err, safefs.ErrUnsafeEntry)) {
+		t.Fatalf("symlink flood: want a rejection, got %v", err)
 	}
 }
 
@@ -117,8 +120,8 @@ func TestParseHeaderCountRejectsPaxFlood(t *testing.T) {
 		})
 	}
 	limits := safefs.ExtractLimits{MaxEntries: 100}
-	if _, err := ParseWithLimits(bytes.NewReader(tarGzHeaders(t, headers)), limits); !errors.Is(err, safefs.ErrLimits) {
-		t.Fatalf("pax flood: want ErrLimits, got %v", err)
+	if _, err := ParseWithLimits(bytes.NewReader(tarGzHeaders(t, headers)), limits); err == nil || (!errors.Is(err, safefs.ErrLimits) && !errors.Is(err, safefs.ErrUnsafeEntry)) {
+		t.Fatalf("pax flood: want a rejection, got %v", err)
 	}
 }
 
@@ -135,14 +138,7 @@ func TestParseHeaderCountBoundaryMixed(t *testing.T) {
 				Mode:     0o755,
 			})
 		}
-		for i := 0; i < 30; i++ {
-			headers = append(headers, tar.Header{
-				Name:     fmt.Sprintf("link%02d", i),
-				Typeflag: tar.TypeSymlink,
-				Linkname: "dir00",
-			})
-		}
-		for i := 0; i < 30; i++ {
+		for i := 0; i < 60; i++ {
 			headers = append(headers, tar.Header{
 				Name:     fmt.Sprintf("file%02d", i),
 				Typeflag: tar.TypeReg,
@@ -165,11 +161,27 @@ func TestParseHeaderCountBoundaryMixed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("archive with exactly MaxEntries headers must parse: %v", err)
 	}
-	if len(m.Entries) != 30 {
-		t.Fatalf("regular entries = %d, want 30", len(m.Entries))
+	if len(m.Entries) != 60 {
+		t.Fatalf("regular entries = %d, want 60", len(m.Entries))
 	}
 	if _, err := ParseWithLimits(bytes.NewReader(mk(true)), limits); !errors.Is(err, safefs.ErrLimits) {
 		t.Fatalf("MaxEntries+1 headers: want ErrLimits, got %v", err)
+	}
+}
+
+// TestParseRejectsUnsafeEntryTypes pins the Parse/Extract contract: an
+// archive containing links or device entries is refused at UPLOAD time, so a
+// job cannot durably poison its snapshot history with unrestorable records.
+func TestParseRejectsUnsafeEntryTypes(t *testing.T) {
+	for name, header := range map[string]tar.Header{
+		"symlink":  {Name: "link", Typeflag: tar.TypeSymlink, Linkname: "/etc/passwd"},
+		"hardlink": {Name: "hard", Typeflag: tar.TypeLink, Linkname: "target"},
+		"char":     {Name: "dev", Typeflag: tar.TypeChar},
+	} {
+		data := tarGzHeaders(t, []tar.Header{{Name: "ok", Typeflag: tar.TypeReg, Mode: 0o644, Size: 1}, header})
+		if _, err := ParseWithLimits(bytes.NewReader(data), safefs.DefaultLimits()); !errors.Is(err, safefs.ErrUnsafeEntry) {
+			t.Fatalf("%s archive = %v, want ErrUnsafeEntry", name, err)
+		}
 	}
 }
 

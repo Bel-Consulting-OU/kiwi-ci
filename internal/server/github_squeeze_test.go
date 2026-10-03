@@ -541,3 +541,36 @@ jobs:
 		t.Fatalf("conflicting replay performed forge work: %d -> %d", first, api.requests.Load())
 	}
 }
+
+// TestWebhookCloneURLMustMatchRepository pins the anti-hijack binding: a
+// signed body cannot declare a trusted repository while pointing the checkout
+// at another host, and such deliveries are refused before any forge work.
+func TestWebhookCloneURLMustMatchRepository(t *testing.T) {
+	api := &gitHubHookAPI{}
+	srv := api.server(t)
+	t.Cleanup(srv.Close)
+	s := newGitHubSqueezeServer(t, srv, "hunter2")
+
+	body := `{"ref":"refs/heads/main","before":"x","after":"9049f1265b7d61be4a8904a9a27120d2064dab3b",` +
+		`"repository":{"id":1,"full_name":"victim/app","clone_url":"https://attacker.tld/evil.git","html_url":"https://github.com/victim/app"}}`
+	w := postWebhook(t, s, "hunter2", "push", "mismatch-1", body)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("mismatched clone URL = %d: %s", w.Code, w.Body.String())
+	}
+	if api.requests.Load() != 0 {
+		t.Fatalf("mismatched delivery performed %d forge requests", api.requests.Load())
+	}
+	s.mu.Lock()
+	runs := len(s.runs)
+	s.mu.Unlock()
+	if runs != 0 {
+		t.Fatalf("mismatched delivery created %d runs", runs)
+	}
+
+	// A consistent payload still works.
+	ok := `{"ref":"refs/heads/main","before":"x","after":"9049f1265b7d61be4a8904a9a27120d2064dab3b",` +
+		`"repository":{"id":1,"full_name":"victim/app","clone_url":"https://github.com/victim/app.git","html_url":"https://github.com/victim/app"}}`
+	if w := postWebhook(t, s, "hunter2", "push", "bound-1", ok); w.Code != http.StatusAccepted {
+		t.Fatalf("consistent delivery = %d: %s", w.Code, w.Body.String())
+	}
+}

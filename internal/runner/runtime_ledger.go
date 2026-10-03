@@ -2,6 +2,7 @@ package runner
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -150,6 +151,18 @@ func (r *Runner) ledgerRemove(id string) {
 // It returns the number of entries fully reclaimed.
 func (r *Runner) reconcileRuntimeLedger(runInstanceID string) int {
 	dir := r.runtimeLedgerDir()
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return 0
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !fileOwnedByEUID(info) {
+		fmt.Fprintf(os.Stderr, "kiwi runner %s: refusing to reclaim through untrusted ledger directory %s\n", r.ID, dir)
+		return 0
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		// We created this directory; tighten it rather than trust it.
+		_ = os.Chmod(dir, 0o700)
+	}
 	files, err := os.ReadDir(dir)
 	if err != nil {
 		return 0
@@ -160,6 +173,10 @@ func (r *Runner) reconcileRuntimeLedger(runInstanceID string) int {
 			continue
 		}
 		path := filepath.Join(dir, f.Name())
+		entryInfo, err := os.Lstat(path)
+		if err != nil || !entryInfo.Mode().IsRegular() || !fileOwnedByEUID(entryInfo) || entryInfo.Mode().Perm()&0o022 != 0 {
+			continue
+		}
 		b, err := os.ReadFile(path)
 		if err != nil {
 			continue

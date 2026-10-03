@@ -200,15 +200,18 @@ func TestExecuteCompiledPayloadRunsEffectiveJob(t *testing.T) {
 	}
 	r.execute(context.Background(), task)
 
-	if _, err := os.Stat(marker); err != nil {
-		t.Fatalf("payload's EffectiveJob did not run (marker missing): %v", err)
+	// The payload's digest is internally consistent, but the compiled job
+	// does NOT match a local recompilation of the digest-verified pipeline:
+	// the injected step must be refused, never executed.
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("injected EffectiveJob step ran despite not matching the trusted pipeline")
 	}
 	c, ok := fsrv.lastComplete()
 	if !ok {
 		t.Fatal("no completion recorded")
 	}
-	if c.Status != model.StatusSuccess {
-		t.Fatalf("status = %s (%s), want success", c.Status, c.Error)
+	if c.Status != model.StatusFailure || !strings.Contains(c.Error, "local compilation") {
+		t.Fatalf("status = %s (%s), want a local-compilation refusal", c.Status, c.Error)
 	}
 }
 
@@ -242,6 +245,7 @@ func TestExecuteTamperedPayloadRefuses(t *testing.T) {
 }
 
 func TestExecuteUploadsAttestationsBeforePayloadAndSnapshot(t *testing.T) {
+	defer stubPayloadLocalBinding(t)()
 	fsrv := &fakeRunnerServer{}
 	ts := httptest.NewServer(fsrv.handler())
 	defer ts.Close()
@@ -431,6 +435,7 @@ func TestExecuteInjectsTestShardEnv(t *testing.T) {
 }
 
 func TestExecuteRefusesCompiledJobWithoutShardAssignment(t *testing.T) {
+	defer stubPayloadLocalBinding(t)()
 	fsrv := &fakeRunnerServer{}
 	ts := httptest.NewServer(fsrv.handler())
 	defer ts.Close()

@@ -303,6 +303,12 @@ func TestFinalExecuteLegacyNetworkAssignmentRuns(t *testing.T) {
 // compiled job for key after mutate runs on it, keeping the digests coherent.
 func payloadWithEffectiveJob(t *testing.T, text, key string, mutate func(*pipeline.CompiledJob)) *model.CompiledJobPayload {
 	t.Helper()
+	// These fixtures deliberately build a mutated compiled job to exercise
+	// downstream executor logic; the production local-compilation binding has
+	// its own tests, so it is disabled only for this helper.
+	prev := payloadLocalBindingCheck
+	payloadLocalBindingCheck = false
+	t.Cleanup(func() { payloadLocalBindingCheck = prev })
 	payload := buildPayload(t, text, key)
 	raw, ok := payload.EffectiveJob.(json.RawMessage)
 	if !ok {

@@ -247,6 +247,17 @@ func buildComponentRegistry(cfg config.ComponentsConfig) (components.Registry, e
 	}
 }
 
+// isLoopbackHost reports whether a bind host is loopback ("", "localhost",
+// 127.0.0.0/8 or ::1).
+func isLoopbackHost(host string) bool {
+	h := strings.TrimSpace(host)
+	if h == "" || strings.EqualFold(h, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(h, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
 // startMetricsListener binds the dedicated metrics listener and serves the
 // server's Prometheus surface on it. Binding is synchronous so an
 // observability.metrics_listen address that cannot be bound fails startup;
@@ -254,6 +265,16 @@ func buildComponentRegistry(cfg config.ComponentsConfig) (components.Registry, e
 // the actual bound address (useful when the configured address uses port
 // 0).
 func startMetricsListener(srv *server.Server, addr string) (bound string, stop func(), err error) {
+	// The dedicated listener has no authentication middleware: refuse a
+	// non-loopback bind unless the operator explicitly opted in
+	// (observability.metrics_public).
+	host, _, splitErr := net.SplitHostPort(addr)
+	if splitErr != nil {
+		return "", nil, fmt.Errorf("observability.metrics_listen %q: %w", addr, splitErr)
+	}
+	if !srv.MetricsPublic && !isLoopbackHost(host) {
+		return "", nil, fmt.Errorf("observability.metrics_listen %q is not loopback and metrics_public is not set", addr)
+	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return "", nil, fmt.Errorf("metrics listener %s: %w", addr, err)

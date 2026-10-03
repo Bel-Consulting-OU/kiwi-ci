@@ -18,8 +18,8 @@ func validProductionStaging() productionConfig {
 	return productionConfig{
 		Mode:            "production",
 		DatabaseURL:     "postgres://kiwi:secret@db:5432/kiwi",
-		RunnerToken:     "runner",
-		AdminToken:      "admin",
+		RunnerToken:     "runner-token-long-enough",
+		AdminToken:      "admin-token-long-enough",
 		ExternalURL:     "https://ci.example.com",
 		TLSCert:         "/etc/kiwi/server.crt",
 		TLSKey:          "/etc/kiwi/server.key",
@@ -27,7 +27,10 @@ func validProductionStaging() productionConfig {
 		StagingMaxBytes: 32 << 30,
 		// Shared dashboard session key (required in production; without it
 		// HA failover loses every dashboard session).
-		WebSessionSecret: strings.Repeat("cd", 32),
+		WebSessionSecret:       strings.Repeat("cd", 32),
+		UntrustedCPUCeiling:    2,
+		UntrustedMemoryCeiling: 4 << 30,
+		UntrustedDiskCeiling:   10 << 30,
 	}
 }
 
@@ -76,7 +79,7 @@ func TestServerProductionRefusesMissingStagingBoundAtStartup(t *testing.T) {
 		"--database-url", "postgres://postgres@127.0.0.1:1/postgres?sslmode=disable",
 		"--external-url", "https://ci.example.com",
 		"--tls-cert", "c.pem", "--tls-key", "k.pem",
-		"--admin-token", "admin", "--runner-token", "runner",
+		"--admin-token", "admin-token-long-enough", "--runner-token", "runner-token-long-enough",
 	})
 	if err == nil {
 		t.Fatal("production Server without a staging bound started")
@@ -100,7 +103,7 @@ func TestServerProductionRefusesUnusableStagingDirectoryAtStartup(t *testing.T) 
 		"--database-url", "postgres://postgres@127.0.0.1:1/postgres?sslmode=disable",
 		"--external-url", "https://ci.example.com",
 		"--tls-cert", "c.pem", "--tls-key", "k.pem",
-		"--admin-token", "admin", "--runner-token", "runner",
+		"--admin-token", "admin-token-long-enough", "--runner-token", "runner-token-long-enough",
 		"--staging-dir", filepath.Join(file, "staging"), "--staging-max-bytes", "1048576",
 	})
 	if err == nil {

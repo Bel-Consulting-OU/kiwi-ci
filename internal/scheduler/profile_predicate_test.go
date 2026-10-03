@@ -8,12 +8,15 @@ import (
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 // compiledJobWithRuntime builds a job whose compiled payload declares the
 // given runtime capability, so the capability predicate has something to
-// derive from.
+// derive from. The payload mirrors a real compiled payload: a current-schema
+// payload ALWAYS carries an effective policy (non-enforced here), so a
+// missing one is the corruption contract the fail-closed predicate rejects.
 func compiledJobWithRuntime(id, runID, repoURL, fullName, runtime string) model.Job {
 	return model.Job{
 		ID: id, RunID: runID, Key: "build", Status: model.StatusQueued,
@@ -21,8 +24,9 @@ func compiledJobWithRuntime(id, runID, repoURL, fullName, runtime string) model.
 		Priority:  0,
 		CreatedAt: time.Now().UTC().Add(-time.Minute),
 		CompiledJobPayload: &model.CompiledJobPayload{
-			SchemaVersion: 1,
-			EffectiveJob:  pipeline.CompiledJob{Job: pipeline.Job{Runtime: runtime}},
+			SchemaVersion:   1,
+			EffectiveJob:    pipeline.CompiledJob{Job: pipeline.Job{Runtime: runtime}},
+			EffectivePolicy: policy.Capabilities{Enforced: false},
 		},
 	}
 }

@@ -440,10 +440,15 @@ func TestMemStoreLeaseEnforcedEmptyPolicyDeniesAll(t *testing.T) {
 }
 
 // compiledPayloadWithRuntime builds a compiled payload carrying a runtime.
+// The payload mirrors a real compiled payload: a current-schema payload
+// ALWAYS carries an effective policy (the compiler writes one even when it
+// enforces nothing), so a missing policy is the corruption contract the
+// fail-closed lease predicate rejects.
 func compiledPayloadWithRuntime(runtimeName string) *model.CompiledJobPayload {
 	return &model.CompiledJobPayload{
-		SchemaVersion: 1,
-		EffectiveJob:  map[string]any{"job": map[string]any{"runtime": runtimeName}},
+		SchemaVersion:   1,
+		EffectiveJob:    map[string]any{"job": map[string]any{"runtime": runtimeName}},
+		EffectivePolicy: policy.Capabilities{Enforced: false},
 	}
 }
 

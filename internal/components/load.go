@@ -10,6 +10,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// maxComponentFileBytes bounds one registry entry read at startup.
+const maxComponentFileBytes = 4 << 20
+
 // specFileExts are the component spec file extensions recognized by the
 // directory loader.
 var specFileExts = map[string]bool{".yaml": true, ".yml": true, ".json": true}
@@ -29,6 +32,18 @@ func NewLocalRegistryFromDir(dir string) (*LocalRegistry, error) {
 		}
 		if d.IsDir() {
 			return nil
+		}
+		// Registry files must be regular files: a symlink (or device) planted
+		// in a shared registry directory must never be followed and parsed.
+		info, err := d.Info()
+		if err != nil {
+			return fmt.Errorf("component registry: stat %s: %w", path, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("component registry: %s is not a regular file", path)
+		}
+		if info.Size() > maxComponentFileBytes {
+			return fmt.Errorf("component registry: %s exceeds %d bytes", path, maxComponentFileBytes)
 		}
 		if !specFileExts[strings.ToLower(filepath.Ext(d.Name()))] {
 			return nil

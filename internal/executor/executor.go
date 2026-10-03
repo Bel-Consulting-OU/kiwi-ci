@@ -45,8 +45,13 @@ type Options struct {
 	// as it exists so the caller (the runner's runtime ledger) can reclaim it
 	// after a hard crash.
 	OnCgroupCreated func(parent string)
-	MaxParallel     int
-	OnlyJob         string
+	// OnRuntimeCloseError, when set, is called when the runtime backend could
+	// NOT prove its resource removed (for example docker rm failed). The
+	// caller must then RETAIN the workspace, quota and crash-recovery ledger
+	// entry: the runtime may still hold the bind mount.
+	OnRuntimeCloseError func(error)
+	MaxParallel         int
+	OnlyJob             string
 	// OnlyStep, when set, executes just the named step (by step ID or by
 	// resolved name, including canary./verify./rollback. prefixes) of the
 	// selected job. Used by `kiwi replay RUN JOB STEP`. Steps that do not
@@ -633,6 +638,9 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		if closeJob != nil {
 			if err := closeJob(); err != nil {
 				e.log(cj.ID, "runtime", "cleanup warning: "+err.Error())
+				if e.Opt.OnRuntimeCloseError != nil {
+					e.Opt.OnRuntimeCloseError(err)
+				}
 			}
 		}
 		e.sessions.delete(cj.ID)

@@ -311,7 +311,7 @@ func TestServerProductionRunnerTokenDecisionIsPostDB(t *testing.T) {
 		"--database-url", "postgres://postgres@127.0.0.1:1/postgres?sslmode=disable",
 		"--external-url", "https://ci.example.com",
 		"--tls-cert", "c.pem", "--tls-key", "k.pem",
-		"--admin-token", "admin", "--runner-token", "runner",
+		"--admin-token", "admin-token-long-enough", "--runner-token", "runner-token-long-enough",
 		"--staging-dir", t.TempDir(), "--staging-max-bytes", "1073741824",
 	})
 	if err == nil {

@@ -364,6 +364,25 @@ func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "lease expired during upload", http.StatusConflict)
 		return
 	}
+	// Commit-time per-job cap under the SAME mutex as the insert: the
+	// preflight count at request start cannot see concurrent uploads whose
+	// bodies are still streaming, so the cap must be re-checked atomically
+	// with the record insertion (mirrors the PostgreSQL branch).
+	if max := s.snapshotMaxPerJob; max > 0 {
+		count := 0
+		for _, existing := range s.snapshots {
+			if existing.JobID == j.ID {
+				count++
+			}
+		}
+		if count >= max {
+			s.mu.Unlock()
+			_ = os.Remove(dst)
+			_ = os.Remove(dst + ".manifest.json")
+			http.Error(w, "snapshot limit reached for this job", http.StatusConflict)
+			return
+		}
+	}
 	s.snapshots[id] = rec
 	persistErr := s.persistLocked()
 	if persistErr != nil {

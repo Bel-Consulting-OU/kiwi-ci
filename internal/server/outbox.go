@@ -1163,13 +1163,22 @@ func (e *unknownOutboxKindError) Unwrap() error { return errUnknownOutboxKind }
 //     only a newer replica can process, so the row survives the rolling
 //     upgrade with bounded backoff instead of hot-looping.
 func (o *Outbox) retryOutboxRow(ctx context.Context, it forge.OutboxItem, dispatchErr error) error {
+	maxAttempts := maxOutboxAttempts
+	if errors.Is(dispatchErr, errUnknownOutboxKind) || storage.InternalCompletionEffectKind(it.Kind) {
+		maxAttempts = 0
+	}
+	if rs, ok := o.db.(interface {
+		OutboxRetryClaimed(context.Context, string, string, error, int) error
+	}); ok {
+		// The claimer guard prevents a flusher whose claim lease already
+		// expired from clearing its successor's claim.
+		return rs.OutboxRetryClaimed(ctx, it.ID, o.claimerID(), dispatchErr, maxAttempts)
+	}
+	// Rolling-upgrade fallback: a store that only implements the legacy
+	// unguarded retry still records the failure rather than dropping it.
 	if rs, ok := o.db.(interface {
 		OutboxRetry(context.Context, string, error, int) error
 	}); ok {
-		maxAttempts := maxOutboxAttempts
-		if errors.Is(dispatchErr, errUnknownOutboxKind) || storage.InternalCompletionEffectKind(it.Kind) {
-			maxAttempts = 0
-		}
 		return rs.OutboxRetry(ctx, it.ID, dispatchErr, maxAttempts)
 	}
 	return nil

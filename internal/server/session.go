@@ -76,7 +76,7 @@ func webMAC(secret []byte, tag, payload string) string {
 // newWebToken mints a fresh random nonce and returns the signed token
 // value (nonce|mac|expiry) plus its expiry, or an error when the entropy
 // source fails.
-func newWebToken(secret []byte, tag string) (value string, expiry int64, err error) {
+func newWebToken(secret []byte, tag, fingerprint string) (value string, expiry int64, err error) {
 	nonce := make([]byte, webSessionNonceSz)
 	if _, err = io.ReadFull(randReader, nonce); err != nil {
 		return "", 0, err
@@ -84,7 +84,16 @@ func newWebToken(secret []byte, tag string) (value string, expiry int64, err err
 	nonceHex := hex.EncodeToString(nonce)
 	expiry = time.Now().UTC().Add(webSessionTTL).Unix()
 	expStr := strconv.FormatInt(expiry, 10)
-	return nonceHex + "|" + webMAC(secret, tag, nonceHex+":"+expStr) + "|" + expStr, expiry, nil
+	return nonceHex + "|" + webMAC(secret, tag, nonceHex+":"+expStr+":"+fingerprint) + "|" + expStr, expiry, nil
+}
+
+// adminTokenFingerprint binds a dashboard session to the admin credential it
+// was minted against: rotating the admin token invalidates every existing
+// session immediately instead of leaving stolen cookies valid for the full
+// TTL.
+func adminTokenFingerprint(adminToken string) string {
+	sum := sha256.Sum256([]byte("kiwi-admin-token:" + adminToken))
+	return hex.EncodeToString(sum[:8])
 }
 
 // parseWebToken splits a token value into its nonce, MAC and expiry parts.
@@ -99,7 +108,7 @@ func parseWebToken(v string) (nonce, mac, expStr string, ok bool) {
 // webTokenOK validates a signed token: a valid MAC (constant time) over a
 // non-expired nonce+expiry pair. Structurally empty parts are rejected
 // outright — a well-formed token always carries all three components.
-func webTokenOK(secret []byte, tag, v string) bool {
+func webTokenOK(secret []byte, tag, v, fingerprint string) bool {
 	nonce, mac, expStr, ok := parseWebToken(v)
 	if !ok || nonce == "" || mac == "" || expStr == "" {
 		return false
@@ -108,7 +117,7 @@ func webTokenOK(secret []byte, tag, v string) bool {
 	if err != nil || time.Now().Unix() > expiry {
 		return false
 	}
-	want := webMAC(secret, tag, nonce+":"+expStr)
+	want := webMAC(secret, tag, nonce+":"+expStr+":"+fingerprint)
 	return subtle.ConstantTimeCompare([]byte(mac), []byte(want)) == 1
 }
 
@@ -123,17 +132,23 @@ func (s *Server) webLogin(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
+	fingerprint := adminTokenFingerprint(s.AdminToken)
 	if s.AdminToken == "" || !constantTimeString(in.Token, s.AdminToken) {
+		// Failed logins are audited (source address only; the attempted
+		// token is never recorded) so brute force is visible even though the
+		// token comparison itself is constant time.
+		s.auditLocked("web.login.failed", "anonymous", "", "", "invalid admin token", map[string]string{"source": clientSource(r)})
 		http.Error(w, "invalid token", http.StatusUnauthorized)
 		return
 	}
-	sessionValue, expiry, err := newWebToken(s.WebSessionSecret, "web")
+	s.auditLocked("web.login", "web", "", "", "dashboard session created", map[string]string{"source": clientSource(r)})
+	sessionValue, expiry, err := newWebToken(s.WebSessionSecret, "web", fingerprint)
 	if err != nil {
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 	nonce, _, expStr, _ := parseWebToken(sessionValue)
-	csrfValue := nonce + "|" + webMAC(s.WebSessionSecret, "csrf", nonce+":"+expStr) + "|" + expStr
+	csrfValue := nonce + "|" + webMAC(s.WebSessionSecret, "csrf", nonce+":"+expStr+":"+fingerprint) + "|" + expStr
 	http.SetCookie(w, &http.Cookie{
 		Name:     webSessionCookie,
 		Value:    sessionValue,
@@ -192,7 +207,7 @@ func (s *Server) webSessionOK(r *http.Request) bool {
 	if err != nil || c.Value == "" {
 		return false
 	}
-	return webTokenOK(s.WebSessionSecret, "web", c.Value)
+	return webTokenOK(s.WebSessionSecret, "web", c.Value, adminTokenFingerprint(s.AdminToken))
 }
 
 // webCSRFOK validates the double-submit CSRF token for a cookie-authenticated
@@ -217,8 +232,19 @@ func (s *Server) webCSRFOK(r *http.Request) bool {
 	if !constantTimeString(cNonce, hNonce) || !constantTimeString(cExp, hExp) {
 		return false
 	}
-	want := webMAC(s.WebSessionSecret, "csrf", hNonce+":"+hExp)
+	want := webMAC(s.WebSessionSecret, "csrf", hNonce+":"+hExp+":"+adminTokenFingerprint(s.AdminToken))
 	return subtle.ConstantTimeCompare([]byte(hMAC), []byte(want)) == 1
+}
+
+// clientSource is the audited login source: the immediate peer address only
+// (no forwarded headers are trusted), bounded so attacker-controlled text
+// cannot flood the audit record.
+func clientSource(r *http.Request) string {
+	addr := r.RemoteAddr
+	if len(addr) > 64 {
+		addr = addr[:64]
+	}
+	return addr
 }
 
 // webMutatingMethod reports whether the method mutates server state and so

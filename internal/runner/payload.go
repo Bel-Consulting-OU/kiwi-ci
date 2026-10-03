@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -24,7 +25,12 @@ import (
 //
 // Any mismatch refuses execution: the runner never runs bytes the control
 // plane did not compile deterministically.
-func verifyCompiledPayload(spec *pipeline.Spec, p *model.CompiledJobPayload, trusted bool) (cj pipeline.CompiledJob, caps policy.Capabilities, policyOK bool, err error) {
+// payloadLocalBindingCheck gates the local-recompilation binding. It is a
+// test seam for fixtures that deliberately construct a mutated compiled job
+// to exercise downstream executor logic; production runs with binding ON.
+var payloadLocalBindingCheck = true
+
+func verifyCompiledPayload(spec *pipeline.Spec, key string, p *model.CompiledJobPayload, trusted bool) (cj pipeline.CompiledJob, caps policy.Capabilities, policyOK bool, err error) {
 	if p == nil {
 		return cj, caps, false, nil
 	}
@@ -52,6 +58,36 @@ func verifyCompiledPayload(spec *pipeline.Spec, p *model.CompiledJobPayload, tru
 	sum := sha256.Sum256(cjJSON)
 	if got := hex.EncodeToString(sum[:]); got != p.JobDigest {
 		return cj, caps, false, fmt.Errorf("compiled payload digest mismatch: job digest %q does not match %q", p.JobDigest, got)
+	}
+	if payloadLocalBindingCheck {
+		// The job digest above only proves the payload is internally consistent.
+		// Bind the payload to a LOCAL recompilation of the digest-verified
+		// pipeline spec: a malicious control plane could otherwise serve a benign
+		// spec (digest passes) alongside an arbitrary compiled job (steps, image,
+		// sandbox/network, env) whose self-hash it also controls.
+		recompiled, cerr := pipeline.Compile(spec)
+		if cerr != nil {
+			return cj, caps, false, fmt.Errorf("compiled payload: recompile pipeline: %w", cerr)
+		}
+		local, ok := recompiled.Jobs[key]
+		if !ok {
+			return cj, caps, false, fmt.Errorf("compiled payload: pipeline has no job %q", key)
+		}
+		localRaw, err := json.Marshal(local)
+		if err != nil {
+			return cj, caps, false, fmt.Errorf("compiled payload: encode local job: %w", err)
+		}
+		var localNorm pipeline.CompiledJob
+		if err := json.Unmarshal(localRaw, &localNorm); err != nil {
+			return cj, caps, false, fmt.Errorf("compiled payload: decode local job: %w", err)
+		}
+		localJSON, err := json.Marshal(localNorm)
+		if err != nil {
+			return cj, caps, false, fmt.Errorf("compiled payload: re-encode local job: %w", err)
+		}
+		if !bytes.Equal(localJSON, cjJSON) {
+			return cj, caps, false, fmt.Errorf("compiled payload does not match the digest-verified pipeline's local compilation")
+		}
 	}
 	if p.EffectivePolicy == nil {
 		return cj, caps, false, nil

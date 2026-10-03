@@ -76,6 +76,12 @@ func ReclaimWorkspaceQuota(a WorkspaceQuotaAssignment) error {
 	if a.XQ == "" || a.MountPoint == "" || a.ProjectID == 0 {
 		return fmt.Errorf("incomplete workspace quota assignment")
 	}
+	// A ledger entry is attacker-influenced if the ledger directory was ever
+	// writable by another principal; never execute a recorded tool or touch a
+	// recorded mount without proving both against host state.
+	if err := validateQuotaAssignmentFn(a); err != nil {
+		return err
+	}
 	if err := runXFSProjectCleanup(a.XQ, a.MountPoint, a.Workspace, a.ProjectID, a.FsKey); err != nil {
 		// A ledger entry is written BEFORE the assignment command runs, so a
 		// crash in that window leaves coordinates for an assignment that may
@@ -88,6 +94,10 @@ func ReclaimWorkspaceQuota(a WorkspaceQuotaAssignment) error {
 	}
 	return nil
 }
+
+// validateQuotaAssignmentFn is the host-state validation seam (tests
+// substitute a fake; production always proves the mount and tool).
+var validateQuotaAssignmentFn = validateQuotaAssignment
 
 // xfsCleanupAbsent reports whether a cleanup failure means the project/path
 // was not present (a no-op cleanup), as opposed to a real removal failure.
@@ -368,16 +378,19 @@ func (p *projectIDPool) allocate() (uint32, bool) {
 	return 0, false
 }
 
-// reserveKnown marks filesystem-discovered project IDs as permanently
-// unavailable to this process (idempotent).
-func (p *projectIDPool) reserveKnown(ids []uint32) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+// syncKnown REPLACES the known set with the current filesystem report. It is
+// called under the inter-process allocation lock, where no other process can
+// be mid-assignment, so an ID absent from the report is genuinely free.
+func (p *projectIDPool) syncKnown(ids []uint32) {
+	next := make(map[uint32]bool, len(ids))
 	for _, id := range ids {
 		if id != 0 {
-			p.known[id] = true
+			next[id] = true
 		}
 	}
+	p.mu.Lock()
+	p.known = next
+	p.mu.Unlock()
 }
 
 // release returns an ID to the pool. Releasing an ID that is not live is a
@@ -518,7 +531,11 @@ func refreshXFSProjectIDs(xq, mountPoint, fsKey string) error {
 	if err != nil {
 		return fmt.Errorf("report existing XFS project ids: %w", err)
 	}
-	projectIDPoolFor(fsKey).reserveKnown(parseXFSProjectIDs(out))
+	// SYNC (not just add) the known set with the live filesystem report: an ID
+	// that is no longer present was released by some process, so permanently
+	// blacklisting it would monotonically exhaust the pool under normal
+	// concurrent use (each job's refresh would ban the previous job's ID).
+	projectIDPoolFor(fsKey).syncKnown(parseXFSProjectIDs(out))
 	return nil
 }
 
