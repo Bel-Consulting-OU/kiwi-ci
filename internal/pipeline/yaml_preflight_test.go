@@ -64,3 +64,23 @@ func TestYAMLPreflightAcceptsLegitimatePipelineDocument(t *testing.T) {
 		t.Fatalf("legitimate document failed to parse: %v", err)
 	}
 }
+
+// TestYAMLCommentOnlyLineDoesNotPanic is the FuzzYAML regression for the
+// crash input "0:\n  0 \n #00000000000": a line whose only content is a
+// comment must not be treated as a block-scalar opener (and must never
+// index the now-empty trimmed line).
+func TestYAMLCommentOnlyLineDoesNotPanic(t *testing.T) {
+	if yamlOpensBlockScalar([]byte(" #00000000000")) {
+		t.Fatal("comment-only line reported as a block scalar opener")
+	}
+	for _, in := range []string{
+		"0:\n  0 \n #00000000000",
+		" #comment",
+		"  # spaced",
+		"key: value # trailing",
+	} {
+		if _, err := Parse([]byte(in)); err == nil {
+			t.Fatalf("Parse(%q) succeeded, want a validation error", in)
+		}
+	}
+}

@@ -230,6 +230,13 @@ func yamlOpensBlockScalar(line []byte) bool {
 	// Strip an unquoted trailing comment.
 	if idx := strings.Index(trimmed, " #"); idx >= 0 {
 		trimmed = strings.TrimSpace(trimmed[:idx])
+		if trimmed == "" {
+			// A comment-only line (e.g. " #note"): nothing but the comment
+			// remains, so there is no block-scalar indicator. Without this
+			// guard the index below reads position -1 and panics on
+			// attacker-submitted pipeline text.
+			return false
+		}
 	}
 	indicator := trimmed[len(trimmed)-1]
 	if indicator != '|' && indicator != '>' {
