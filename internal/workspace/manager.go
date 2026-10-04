@@ -184,12 +184,27 @@ func removeWorktree(source, target string) {
 }
 
 // copyTree recursively copies src into dst (created if missing), skipping
-// the .git directory and the in-repo .kiwi/cache directory. Symlinks are
-// preserved as symlinks.
+// the .git directory, the in-repo .kiwi/cache directory and the DESTINATION
+// subtree itself. The destination exclusion matters when the workspace root
+// lives under the source (a TMPDIR inside the repository): without it the
+// walk descends into the half-copied workspace and copies it into itself
+// until the path length explodes.
 func copyTree(src, dst string) error {
+	dstAbs, err := filepath.Abs(dst)
+	if err != nil {
+		return err
+	}
 	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
+		}
+		if pathAbs, aerr := filepath.Abs(path); aerr == nil {
+			if pathAbs == dstAbs || strings.HasPrefix(pathAbs, dstAbs+string(filepath.Separator)) {
+				if info.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
 		}
 		rel, err := filepath.Rel(src, path)
 		if err != nil {

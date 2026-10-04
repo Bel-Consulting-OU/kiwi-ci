@@ -11,6 +11,27 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secrets"
 )
 
+// checkEnvName rejects environment variable names that cannot survive the
+// exec boundary unambiguously: a control character (including NUL, newline,
+// vertical tab, ESC) or '=' lets a name inject into logs, docker -e
+// arguments or the child environment, while never being referenceable from a
+// shell. Dotted/dashed names stay allowed (referenced via printenv).
+func checkEnvName(name string) error {
+	if name == "" {
+		return fmt.Errorf("env var name cannot be empty")
+	}
+	if len(name) > 256 {
+		return fmt.Errorf("env var name exceeds 256 bytes")
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c <= 0x1f || c == 0x7f || c == '=' {
+			return fmt.Errorf("env var name %q contains a control character or '='", name)
+		}
+	}
+	return nil
+}
+
 const (
 	maxDeclaredJobs   = 1024
 	maxExpandedJobs   = 4096
@@ -130,6 +151,9 @@ func validateSpec(s *Spec, relaxComponentJobs bool) error {
 		return err
 	}
 	for name, v := range s.Env {
+		if err := checkEnvName(name); err != nil {
+			return fmt.Errorf("pipeline env: %w", err)
+		}
 		if len(v) > maxEnvValueBytes {
 			return fmt.Errorf("env var %q exceeds %d byte limit", name, maxEnvValueBytes)
 		}
@@ -302,6 +326,11 @@ func ValidateLimits(s *Spec) error {
 		if len(j.Env) > maxEnvVarsPerJob {
 			return fmt.Errorf("job %q declares %d env vars, limit is %d", id, len(j.Env), maxEnvVarsPerJob)
 		}
+		for name := range j.Env {
+			if err := checkEnvName(name); err != nil {
+				return fmt.Errorf("job %q env: %w", id, err)
+			}
+		}
 		secretCount := len(s.Secrets)
 		allSteps := make([]Step, 0, totalSteps)
 		allSteps = append(allSteps, j.Steps...)
@@ -315,6 +344,11 @@ func ValidateLimits(s *Spec) error {
 			secretCount += len(st.Secrets)
 			if len(st.Env) > maxEnvVarsPerJob {
 				return fmt.Errorf("job %q step %q declares %d env vars, limit is %d", id, st.ID, len(st.Env), maxEnvVarsPerJob)
+			}
+			for name := range st.Env {
+				if err := checkEnvName(name); err != nil {
+					return fmt.Errorf("job %q step %q env: %w", id, st.ID, err)
+				}
 			}
 		}
 		if secretCount > maxSecretsPerJob {

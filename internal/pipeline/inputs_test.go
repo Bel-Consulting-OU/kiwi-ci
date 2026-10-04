@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -75,4 +76,60 @@ func TestValidateRunInputsContract(t *testing.T) {
 	if _, err := ValidateRunInputs(nil, nil); err == nil {
 		t.Fatal("nil spec accepted")
 	}
+}
+
+// TestEnvNamesRejectControlCharacters: env names must not smuggle control
+// characters or '=' past the exec boundary (log/argv/environment injection);
+// dotted and dashed names stay valid for printenv-style access.
+func TestEnvNamesRejectControlCharacters(t *testing.T) {
+	bad := []string{"A\x0bB", "A\nB", "A\rB", "A\x00B", "A\x1b[31m", "A=B", "", string(make([]byte, 300))}
+	for _, name := range bad {
+		src := "version: 1\njobs:\n  x:\n    env:\n      " + yamlQuote(name) + ": v\n    steps:\n      - run: echo hi\n"
+		if _, err := Parse([]byte(src)); err == nil {
+			t.Fatalf("job env name %q accepted, want rejection", name)
+		}
+	}
+	for _, name := range []string{"A", "_x1", "A.B", "A-B", "lower_case"} {
+		src := "version: 1\njobs:\n  x:\n    env:\n      " + yamlQuote(name) + ": v\n    steps:\n      - run: echo hi\n"
+		if _, err := Parse([]byte(src)); err != nil {
+			t.Fatalf("env name %q rejected: %v", name, err)
+		}
+	}
+	// pipeline-level and step-level are covered by the same helper
+	if _, err := Parse([]byte("version: 1\nenv:\n  \"A\\x0bB\": v\njobs:\n  x:\n    steps:\n      - run: echo hi\n")); err == nil {
+		t.Fatal("pipeline-level control-char env accepted")
+	}
+	if _, err := Parse([]byte("version: 1\njobs:\n  x:\n    steps:\n      - run: echo hi\n        env:\n          \"A\\x0bB\": v\n")); err == nil {
+		t.Fatal("step-level control-char env accepted")
+	}
+}
+
+// yamlQuote renders a YAML double-quoted scalar with Go-style escapes.
+func yamlQuote(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; c {
+		case '\\', '"':
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		case '\n':
+			b.WriteString("\\n")
+		case '\r':
+			b.WriteString("\\r")
+		case '\t':
+			b.WriteString("\\t")
+		default:
+			if c < 0x20 || c == 0x7f {
+				b.WriteString("\\x")
+				const hex = "0123456789abcdef"
+				b.WriteByte(hex[c>>4])
+				b.WriteByte(hex[c&0xf])
+			} else {
+				b.WriteByte(c)
+			}
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }

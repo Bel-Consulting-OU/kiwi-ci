@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/artifact"
@@ -234,4 +235,77 @@ func TestLocalDownloadsMatrixBaseResolution(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "ambiguous") {
 		t.Fatalf("ambiguous matrix download = %v, want an ambiguity error", err)
 	}
+}
+
+// TestLocalArtifactDeclaredMaxSizeEnforced: the per-artifact max_size must
+// bound the LOCAL store path too, not only the distributed capture path; an
+// oversized artifact is refused with a warning and never saved.
+func TestLocalArtifactDeclaredMaxSizeEnforced(t *testing.T) {
+	spec := &pipeline.Spec{
+		Version: 1,
+		Jobs: map[string]pipeline.Job{
+			"a": {
+				Runtime: "native",
+				Steps:   []pipeline.Step{{Name: "make", Run: `head -c 2097152 /dev/zero > big.bin && echo done`}},
+				Artifacts: []pipeline.Artifact{{
+					Name: "big", MaxSize: 1 << 10, Paths: []string{"big.bin"},
+				}},
+			},
+		},
+	}
+	root := t.TempDir()
+	arts := &artifact.Store{Root: filepath.Join(root, "arts")}
+	g, err := pipeline.Compile(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lines []string
+	ex := Executor{Opt: Options{
+		Workspace:   filepath.Join(root, "ws"),
+		MaxParallel: 1,
+		Artifacts:   arts,
+		Logs:        &recordingSink{lines: &lines},
+	}}
+	if err := os.MkdirAll(filepath.Join(root, "ws"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ex.Run(context.Background(), g)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res["a"].Status != model.StatusSuccess {
+		t.Fatalf("job = %v (%s)", res["a"].Status, res["a"].Error)
+	}
+	found := false
+	_ = filepath.Walk(filepath.Join(root, "arts"), func(_ string, info os.FileInfo, _ error) error {
+		if info != nil && !info.IsDir() {
+			found = true
+		}
+		return nil
+	})
+	if found {
+		t.Fatal("oversized artifact was saved despite max_size")
+	}
+	warned := false
+	for _, l := range lines {
+		if strings.Contains(l, "exceeds cap") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Fatalf("no cap warning in logs: %v", lines)
+	}
+}
+
+// recordingSink captures log lines for assertions. Stream goroutines write
+// concurrently, so the append is mutex-guarded.
+type recordingSink struct {
+	mu    sync.Mutex
+	lines *[]string
+}
+
+func (r *recordingSink) WriteLine(_, _, line string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	*r.lines = append(*r.lines, line)
 }

@@ -1160,6 +1160,11 @@ func (e *Executor) saveArtifact(cj pipeline.CompiledJob, a pipeline.Artifact, wo
 	if e.Opt.Artifacts != nil {
 		limit = e.Opt.Artifacts.MaxArtifactBytes
 	}
+	// The DECLARATION's own max_size applies on every path, the local store
+	// included: a pipeline must never save an archive larger than it
+	// declared (previously only the distributed capture path intersected it,
+	// so a local run saved unbounded archives for a max_size: 1MiB entry).
+	limit = artifactCaptureLimit(limit, a.MaxSize)
 	capture := e.Opt.ArtifactCapture
 	var finalize func(string) error
 	if capture != nil {

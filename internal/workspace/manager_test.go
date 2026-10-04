@@ -247,3 +247,31 @@ func TestCloseSerializesWithPrepare(t *testing.T) {
 		t.Fatalf("workspace root survived Close: %v", err)
 	}
 }
+
+// TestCopyTreeExcludesItsOwnDestination: a destination under the source (a
+// TMPDIR inside the repository) must not be copied into itself; without the
+// exclusion the walk recurses until ENAMETOOLONG.
+func TestCopyTreeExcludesItsOwnDestination(t *testing.T) {
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "file.txt"), []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(src, "tmp", "workspace")
+	done := make(chan error, 1)
+	go func() { done <- copyTree(src, dst) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("copyTree: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("copyTree did not terminate (recursive self-copy)")
+	}
+	if data, err := os.ReadFile(filepath.Join(dst, "file.txt")); err != nil || string(data) != "data" {
+		t.Fatalf("copied file = %q, %v", data, err)
+	}
+	// The destination subtree must not appear inside itself.
+	if _, err := os.Stat(filepath.Join(dst, "tmp")); !os.IsNotExist(err) {
+		t.Fatalf("destination copied into itself: %v", err)
+	}
+}
