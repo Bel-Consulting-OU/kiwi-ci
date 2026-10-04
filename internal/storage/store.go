@@ -146,6 +146,10 @@ type Store interface {
 	// "zero active jobs" from an incomplete or errored walk. An error means
 	// the count is UNKNOWN, never zero.
 	CountRunningJobs(ctx context.Context) (int, error)
+	// SchemaCompatibilityFloor returns the newest compatibility floor
+	// recorded by applied migrations: the oldest binary schema allowed to
+	// keep operating. In-memory stores have no migrations and return 0.
+	SchemaCompatibilityFloor(ctx context.Context) (int, error)
 	// ListJobsByEnvironment returns all jobs holding the given
 	// repository-scoped environment, for environment concurrency accounting.
 	// repoID is the CANONICAL repository identity ("<host>/<owner>/<name>",

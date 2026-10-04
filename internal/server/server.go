@@ -45,6 +45,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secretbroker"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage/migrations"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/version"
 	"go.opentelemetry.io/otel/codes"
 )
@@ -146,6 +147,12 @@ type Server struct {
 	runs    map[string]model.Run
 	jobs    map[string]model.Job
 	runners map[string]model.Runner
+	// schemaFloor caches the database's migration compatibility floor so the
+	// readiness probe and the lease/submit gates do not query per request.
+	schemaFloor      int
+	schemaFloorBad   bool
+	schemaFloorOK    bool
+	schemaFloorCheck time.Time
 	// runnerProto records the protocol negotiated at each runner's latest
 	// registration IN THIS PROCESS, and how many registrations this process
 	// has seen for that identity. Headerless compatibility (non-production)
@@ -3407,7 +3414,53 @@ func (s *Server) runnerIncarnationCurrent(ctx context.Context, runnerID, incarna
 	return cur.Incarnation == "" || cur.Incarnation == incarnation
 }
 
+// schemaFloorIncompatible reports whether the database's recorded
+// compatibility floor demands a NEWER binary than this one: an old replica
+// that keeps mutating after a newer replica migrated the schema would
+// operate on shapes it does not understand. The probe is cached for a short
+// window; a probe error is never reported as incompatible (readiness's
+// store-availability check owns that signal).
+func (s *Server) schemaFloorIncompatible(ctx context.Context) bool {
+	if s.DB == nil {
+		return false
+	}
+	s.mu.Lock()
+	if s.schemaFloorOK && time.Since(s.schemaFloorCheck) < 10*time.Second {
+		bad := s.schemaFloorBad
+		s.mu.Unlock()
+		return bad
+	}
+	s.mu.Unlock()
+	floor, err := s.DB.SchemaCompatibilityFloor(ctx)
+	if err != nil {
+		s.mu.Lock()
+		s.schemaFloorCheck = time.Now()
+		s.schemaFloorOK = false
+		s.mu.Unlock()
+		return false
+	}
+	maxV, err := migrations.MaxVersion()
+	if err != nil {
+		return false
+	}
+	bad := floor > maxV
+	s.mu.Lock()
+	s.schemaFloor = floor
+	s.schemaFloorBad = bad
+	s.schemaFloorOK = true
+	s.schemaFloorCheck = time.Now()
+	s.mu.Unlock()
+	if bad {
+		s.logError("database schema requires a newer binary; refusing new work", "floor", floor, "binary_max", maxV)
+	}
+	return bad
+}
+
 func (s *Server) next(w http.ResponseWriter, r *http.Request) {
+	if s.schemaFloorIncompatible(r.Context()) {
+		http.Error(w, "database schema requires a newer binary", http.StatusServiceUnavailable)
+		return
+	}
 	id := r.PathValue("id")
 	if !s.verifyRunnerIdentity(r, id) {
 		http.Error(w, "runner identity mismatch", http.StatusForbidden)

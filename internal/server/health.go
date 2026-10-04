@@ -54,5 +54,10 @@ func (s *Server) readiness(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "store unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	if s.schemaFloorIncompatible(ctx) {
+		w.Header().Set("X-Kiwi-State", "schema-incompatible")
+		http.Error(w, "database schema requires a newer binary", http.StatusServiceUnavailable)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 }

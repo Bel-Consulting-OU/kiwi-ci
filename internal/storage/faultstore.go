@@ -707,6 +707,11 @@ func (f *FaultyStore) Migrate(ctx context.Context) error {
 	return f.Inner.Migrate(ctx)
 }
 
+// SchemaCompatibilityFloor delegates to the wrapped store.
+func (f *FaultyStore) SchemaCompatibilityFloor(ctx context.Context) (int, error) {
+	return f.Inner.SchemaCompatibilityFloor(ctx)
+}
+
 func (f *FaultyStore) SchemaVersion(ctx context.Context) (int, error) {
 	return f.Inner.SchemaVersion(ctx)
 }
@@ -3426,6 +3431,9 @@ func (m *memStore) fenceLeader() error {
 }
 
 func (m *memStore) Migrate(ctx context.Context) error { return nil }
+
+// SchemaCompatibilityFloor: the in-memory store has no migrations.
+func (m *memStore) SchemaCompatibilityFloor(ctx context.Context) (int, error) { return 0, nil }
 
 func (m *memStore) SchemaVersion(ctx context.Context) (int, error) { return 1, nil }
 

@@ -1224,6 +1224,9 @@ func (f *fakeStore) ReleaseLeadership(ctx context.Context, key string) error {
 
 func (f *fakeStore) Migrate(ctx context.Context) error { return nil }
 
+// SchemaCompatibilityFloor: the fake has no migration history.
+func (f *fakeStore) SchemaCompatibilityFloor(ctx context.Context) (int, error) { return 0, nil }
+
 func (f *fakeStore) SchemaVersion(ctx context.Context) (int, error) { return 1, nil }
 
 // script helpers ------------------------------------------------------------

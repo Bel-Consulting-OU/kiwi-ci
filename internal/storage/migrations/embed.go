@@ -5,7 +5,9 @@
 package migrations
 
 import (
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"fmt"
 	"io/fs"
 	"sort"
@@ -20,9 +22,20 @@ var FS embed.FS
 
 // Migration is one numbered schema migration.
 type Migration struct {
-	Version    int
-	Name       string
-	Statements []string
+	Version int
+	Name    string
+	// Digest is the SHA-256 of the immutable raw migration content: the
+	// database records it at apply time, so editing an already-applied
+	// migration is detected as schema-history divergence instead of being
+	// silently skipped because the version row exists.
+	Digest string
+	// CompatibleFrom is the oldest binary schema that may keep operating
+	// after this migration is applied. A file may declare
+	// `-- kiwi:compatible-from N` (expand/contract migrations that old
+	// binaries still tolerate); the default is the file's own version, which
+	// requires older binaries to drain before mutating.
+	CompatibleFrom int
+	Statements     []string
 }
 
 // All returns the embedded migrations sorted by version.
@@ -54,7 +67,18 @@ func load(fsys fs.FS) ([]Migration, error) {
 		if len(stmts) == 0 {
 			return nil, fmt.Errorf("migrations: %s has no statements", e.Name())
 		}
-		out = append(out, Migration{Version: version, Name: e.Name(), Statements: stmts})
+		sum := sha256.Sum256(raw)
+		compatibleFrom, err := compatibleFromOf(string(raw), version)
+		if err != nil {
+			return nil, fmt.Errorf("migrations: %s: %w", e.Name(), err)
+		}
+		out = append(out, Migration{
+			Version:        version,
+			Name:           e.Name(),
+			Digest:         hex.EncodeToString(sum[:]),
+			CompatibleFrom: compatibleFrom,
+			Statements:     stmts,
+		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Version < out[j].Version })
 	for i := 1; i < len(out); i++ {
@@ -66,6 +90,42 @@ func load(fsys fs.FS) ([]Migration, error) {
 		}
 	}
 	return out, nil
+}
+
+// compatibleFromOf extracts the optional `-- kiwi:compatible-from N`
+// directive. The default floor is the migration's own version: applying it
+// requires binaries that know the new shape. A declared floor must be
+// positive and no newer than the migration itself.
+func compatibleFromOf(raw string, version int) (int, error) {
+	floor := version
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		const prefix = "-- kiwi:compatible-from "
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		v, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, prefix)))
+		if err != nil || v <= 0 {
+			return 0, fmt.Errorf("invalid compatible-from directive %q", line)
+		}
+		if v > version {
+			return 0, fmt.Errorf("compatible-from %d is newer than the migration version %d", v, version)
+		}
+		floor = v
+	}
+	return floor, nil
+}
+
+// MaxVersion returns the newest embedded migration version (0 when none).
+func MaxVersion() (int, error) {
+	all, err := All()
+	if err != nil {
+		return 0, err
+	}
+	if len(all) == 0 {
+		return 0, nil
+	}
+	return all[len(all)-1].Version, nil
 }
 
 // versionOf parses the leading numeric version of a migration filename.

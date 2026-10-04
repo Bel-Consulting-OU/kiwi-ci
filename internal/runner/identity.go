@@ -127,6 +127,9 @@ func (s IdentityStore) Save(id Identity) error {
 	if err := writeOwnerOnly(s.path(identityKeyFile), id.KeyPEM); err != nil {
 		return err
 	}
+	if err := secureIdentityFile(s.path(identityKeyFile)); err != nil {
+		return err
+	}
 	if err := fsutil.AtomicWriteFile(s.path(identityCertFile), id.CertPEM, 0o644); err != nil {
 		return err
 	}
@@ -161,5 +164,10 @@ var verifyIdentityKeyPair = func(certPEM, keyPEM []byte) error {
 // PROTECTED owner-only DACL installed by secureIdentityDir (numeric modes do
 // not encode Windows access control).
 func writeOwnerOnly(path string, data []byte) error {
-	return fsutil.AtomicWriteFile(path, data, 0o600)
+	if err := fsutil.AtomicWriteFile(path, data, 0o600); err != nil {
+		return err
+	}
+	// Windows: prove the final file's DACL (directory inheritance is not the
+	// same guarantee as a Unix mode); Unix: no-op.
+	return secureIdentityFile(path)
 }

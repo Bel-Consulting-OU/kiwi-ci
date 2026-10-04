@@ -628,6 +628,8 @@ var _ Store = storeOnlyInner{}
 
 func (storeOnlyInner) Close() error { return nil }
 
+func (storeOnlyInner) SchemaCompatibilityFloor(context.Context) (int, error) { return 0, nil }
+
 func (storeOnlyInner) InsertRun(context.Context, model.Run) error { return nil }
 
 func (storeOnlyInner) GetRun(context.Context, string) (model.Run, error) {

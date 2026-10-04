@@ -1703,6 +1703,9 @@ func (f *dbFakeStore) ListAllPendingSidecarDigests(ctx context.Context) ([]strin
 
 func (f *dbFakeStore) Migrate(ctx context.Context) error { return nil }
 
+// SchemaCompatibilityFloor: the fake has no migration history.
+func (f *dbFakeStore) SchemaCompatibilityFloor(ctx context.Context) (int, error) { return 0, nil }
+
 func (f *dbFakeStore) SchemaVersion(ctx context.Context) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

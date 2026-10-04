@@ -23,3 +23,7 @@ func secureIdentityDir(dir string) error {
 	}
 	return nil
 }
+
+// secureIdentityFile is a no-op on Unix: the file mode (0600) IS the access
+// control, installed atomically by writeOwnerOnly.
+func secureIdentityFile(string) error { return nil }

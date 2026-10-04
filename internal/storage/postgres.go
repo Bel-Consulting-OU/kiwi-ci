@@ -5407,6 +5407,18 @@ func (s *PostgresStore) Migrate(ctx context.Context) error {
 	return nil
 }
 
+// migrationIdentityColumns are the idempotent additions to schema_migrations
+// that carry a migration's immutable identity. They run INSIDE the same
+// transaction as the migration: migration 0001 creates the table itself (it
+// must not be edited after ship), so the columns can only be added after the
+// CREATE statements have executed.
+var migrationIdentityColumns = []string{
+	`ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS name text`,
+	`ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS sha256 text`,
+	`ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS compatible_from int NOT NULL DEFAULT 0`,
+	`ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS applied_at timestamptz NOT NULL DEFAULT now()`,
+}
+
 func (s *PostgresStore) applyMigration(ctx context.Context, m migrations.Migration) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -5416,22 +5428,52 @@ func (s *PostgresStore) applyMigration(ctx context.Context, m migrations.Migrati
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('kiwi_schema_migrations'))`); err != nil {
 		return err
 	}
-	// schema_migrations may not exist yet (fresh schema, migration 0001).
-	// Resolve the table with to_regclass BEFORE touching it: a plain EXISTS
-	// probe would raise undefined_table (42P01) inside this transaction,
-	// aborting it (25P02) and making Migrate unable to bootstrap a fresh
-	// database. to_regclass answers "present?" without an error.
+	// schema_migrations may not exist yet (fresh schema, migration 0001):
+	// resolve presence with to_regclass before touching it, then ensure the
+	// identity columns INSIDE this transaction (idempotent DDL) so both the
+	// applied-probe and the INSERT can use the full column set.
 	var haveTable bool
 	if err := tx.QueryRow(ctx, `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&haveTable); err != nil {
 		return err
 	}
 	applied := false
+	storedDigest, storedName := "", ""
 	if haveTable {
-		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version=$1)`, m.Version).Scan(&applied); err != nil {
+		for _, stmt := range migrationIdentityColumns {
+			if _, err := tx.Exec(ctx, stmt); err != nil {
+				return err
+			}
+		}
+		if err := tx.QueryRow(ctx,
+			`SELECT COALESCE(sha256,''), COALESCE(name,'') FROM schema_migrations WHERE version=$1`, m.Version).
+			Scan(&storedDigest, &storedName); err == nil {
+			applied = true
+		} else if !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
 	}
 	if applied {
+		// Integrity: an applied migration's recorded digest must match the
+		// binary's immutable content. A mismatch means the file was edited
+		// AFTER it shipped (or the row was tampered with): the database and
+		// the binary disagree about schema history, which no migration run
+		// can reconcile — refuse.
+		if storedDigest != "" && storedDigest != m.Digest {
+			return fmt.Errorf("schema history divergence: migration %d (%s) recorded digest %s but this binary carries %s; never edit an applied migration, add a new one", m.Version, m.Name, storedDigest, m.Digest)
+		}
+		if storedName != "" && storedName != m.Name {
+			return fmt.Errorf("schema history divergence: migration %d recorded name %q but this binary carries %q", m.Version, storedName, m.Name)
+		}
+		if storedDigest == "" || storedName == "" {
+			// Pre-identity row (upgraded database): record the digest once.
+			// This is trust-on-first-use for migrations applied before the
+			// identity columns existed; every later run verifies it.
+			if _, err := tx.Exec(ctx,
+				`UPDATE schema_migrations SET name=$2, sha256=$3, compatible_from=GREATEST(compatible_from,$4) WHERE version=$1`,
+				m.Version, m.Name, m.Digest, m.CompatibleFrom); err != nil {
+				return err
+			}
+		}
 		return tx.Commit(ctx)
 	}
 	for _, stmt := range m.Statements {
@@ -5439,10 +5481,36 @@ func (s *PostgresStore) applyMigration(ctx context.Context, m migrations.Migrati
 			return err
 		}
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ($1)`, m.Version); err != nil {
+	for _, stmt := range migrationIdentityColumns {
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO schema_migrations (version, name, sha256, compatible_from) VALUES ($1,$2,$3,$4)`,
+		m.Version, m.Name, m.Digest, m.CompatibleFrom); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// SchemaCompatibilityFloor returns the newest compatibility floor recorded
+// by applied migrations: the oldest binary schema that may keep operating.
+// A running binary whose own max migration version is BELOW the floor must
+// stop mutating (readiness 503) and drain.
+func (s *PostgresStore) SchemaCompatibilityFloor(ctx context.Context) (int, error) {
+	var exists bool
+	if err := s.pool.QueryRow(ctx, `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&exists); err != nil {
+		return 0, err
+	}
+	if !exists {
+		return 0, nil
+	}
+	var floor int
+	if err := s.pool.QueryRow(ctx, `SELECT COALESCE(MAX(compatible_from),0) FROM schema_migrations`).Scan(&floor); err != nil {
+		return 0, err
+	}
+	return floor, nil
 }
 
 func (s *PostgresStore) SchemaVersion(ctx context.Context) (int, error) {

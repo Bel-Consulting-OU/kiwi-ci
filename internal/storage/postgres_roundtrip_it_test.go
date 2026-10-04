@@ -1391,9 +1391,29 @@ func TestPostgresIntegrationMigrateHelpers(t *testing.T) {
 	if err := st.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version=9998)`).Scan(&recorded); err != nil || recorded {
 		t.Fatalf("failed migration must not be recorded: %v, %v", recorded, err)
 	}
-	// An already-applied version commits without re-running statements.
-	if err := st.applyMigration(ctx, migrations.Migration{Version: version, Name: "already"}); err != nil {
+	// An already-applied version commits without re-running statements when
+	// its recorded identity matches; any drift (wrong digest/name) is the
+	// dedicated divergence case above.
+	all, aerr := migrations.All()
+	if aerr != nil {
+		t.Fatal(aerr)
+	}
+	var applied migrations.Migration
+	for _, m := range all {
+		if m.Version == version {
+			applied = m
+		}
+	}
+	if applied.Version == 0 {
+		t.Fatalf("embedded migration %d not found", version)
+	}
+	if err := st.applyMigration(ctx, applied); err != nil {
 		t.Fatalf("applied migration no-op: %v", err)
+	}
+	drifted := applied
+	drifted.Digest = "0000000000000000000000000000000000000000000000000000000000000000"
+	if err := st.applyMigration(ctx, drifted); err == nil || !strings.Contains(err.Error(), "divergence") {
+		t.Fatalf("drifted applied migration = %v, want divergence", err)
 	}
 	// SchemaVersion reads zero before the bootstrap table exists. The clone is
 	// deliberately unmigrated, so the empty-template database is required.
