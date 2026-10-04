@@ -54,7 +54,14 @@ type runtimeLedgerEntry struct {
 // of the path.
 func (r *Runner) runtimeLedgerDir() string {
 	sum := sha256.Sum256([]byte(r.ID))
-	return filepath.Join(r.Cfg.WorkDir, ".kiwi-runtime", hex.EncodeToString(sum[:]), "ledger")
+	// Mirror the documented CLI default: an unset WorkDir means the system
+	// temp dir, never the process CWD (a relative ledger would pollute
+	// whatever directory the runner happens to start in).
+	workDir := strings.TrimSpace(r.Cfg.WorkDir)
+	if workDir == "" {
+		workDir = os.TempDir()
+	}
+	return filepath.Join(workDir, ".kiwi-runtime", hex.EncodeToString(sum[:]), "ledger")
 }
 
 // ledgerAdd records one job's runtime ownership atomically. A failure is

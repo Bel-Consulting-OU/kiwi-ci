@@ -304,7 +304,7 @@ func TestExecuteDiskBoundAndSnapshotCapEndToEnd(t *testing.T) {
 	rsrv := &reportServer{}
 	ts := httptest.NewServer(rsrv.handler())
 	defer ts.Close()
-	r := testRunnerFor(t, ts, Config{CaptureSnapshots: true})
+	r := testRunnerFor(t, ts, Config{CaptureSnapshots: true, WorkDir: t.TempDir()})
 	tmpRoot := t.TempDir()
 	t.Setenv("TMPDIR", tmpRoot)
 	r.Cfg.CheckoutFn = func(_ context.Context, _ model.Job, dir string) error {

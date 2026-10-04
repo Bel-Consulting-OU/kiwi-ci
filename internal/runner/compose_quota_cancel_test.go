@@ -64,7 +64,7 @@ func TestComposeRunnerUntrustedNoHardBoundFailsClosedBeforeCheckout(t *testing.T
 	stubWorkspaceQuota(t, executor.DiskQuotaStatus{Hard: false, Detail: "no xfs prjquota on this host"}, nil, &installs, &cleanups, &limitSeen, &dirSeen)
 
 	checkoutRan := false
-	r := testRunnerFor(t, ts, Config{})
+	r := testRunnerFor(t, ts, Config{WorkDir: t.TempDir()})
 	r.Cfg.CheckoutFn = func(_ context.Context, _ model.Job, dir string) error {
 		checkoutRan = true
 		return os.WriteFile(dir+"/hello.txt", []byte("hi"), 0o644)
@@ -112,7 +112,7 @@ func TestComposeRunnerUntrustedNoHardBoundFailsClosedBeforeCheckout(t *testing.T
 	}
 
 	// The next task on the same runner succeeds cleanly.
-	r2 := testRunnerFor(t, ts, Config{})
+	r2 := testRunnerFor(t, ts, Config{WorkDir: t.TempDir()})
 	r2.Cfg.CheckoutFn = func(_ context.Context, _ model.Job, dir string) error {
 		return os.WriteFile(dir+"/hello.txt", []byte("hi"), 0o644)
 	}
@@ -151,7 +151,7 @@ func TestComposeRunnerCancelUnderQuotaReleasesQuotaAndWorkspace(t *testing.T) {
 	t.Cleanup(func() { removeJobWorkspace = origRemove })
 
 	checkoutStarted := make(chan struct{})
-	r := testRunnerFor(t, ts, Config{Heartbeat: 5 * time.Millisecond})
+	r := testRunnerFor(t, ts, Config{Heartbeat: 5 * time.Millisecond, WorkDir: t.TempDir()})
 	r.Cfg.CheckoutFn = func(ctx context.Context, _ model.Job, dir string) error {
 		close(checkoutStarted)
 		<-ctx.Done()
@@ -209,7 +209,7 @@ func TestComposeRunnerCancelUnderQuotaReleasesQuotaAndWorkspace(t *testing.T) {
 	}
 
 	// The next task through the same lifecycle succeeds.
-	r2 := testRunnerFor(t, ts, Config{})
+	r2 := testRunnerFor(t, ts, Config{WorkDir: t.TempDir()})
 	r2.Cfg.CheckoutFn = func(_ context.Context, _ model.Job, dir string) error {
 		return os.WriteFile(dir+"/hello.txt", []byte("hi"), 0o644)
 	}
@@ -273,7 +273,7 @@ func TestComposeRunnerCancelLandsDuringQuotaInstall(t *testing.T) {
 
 	var checkoutCtxErr error
 	checkoutWrote := false
-	r := testRunnerFor(t, ts, Config{Heartbeat: 5 * time.Millisecond})
+	r := testRunnerFor(t, ts, Config{Heartbeat: 5 * time.Millisecond, WorkDir: t.TempDir()})
 	r.Cfg.CheckoutFn = func(ctx context.Context, _ model.Job, dir string) error {
 		// The real checkout honors the task context; a cancelled task must
 		// not clone a repository.
@@ -330,7 +330,7 @@ func TestComposeRunnerCancelLandsDuringQuotaInstall(t *testing.T) {
 	}
 
 	// The next task through the same lifecycle succeeds.
-	r2 := testRunnerFor(t, ts, Config{})
+	r2 := testRunnerFor(t, ts, Config{WorkDir: t.TempDir()})
 	r2.Cfg.CheckoutFn = func(_ context.Context, _ model.Job, dir string) error {
 		return os.WriteFile(dir+"/hello.txt", []byte("hi"), 0o644)
 	}
