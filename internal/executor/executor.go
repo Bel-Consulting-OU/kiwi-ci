@@ -210,28 +210,59 @@ type Executor struct {
 	artifacts *artifactRegistry
 }
 
-// artifactRegistry maps a (producer job, artifact name) pair to the local
-// archive path published by that job in this run.
+// artifactRegistry maps a locally saved artifact of THIS run to the archive
+// path published by its job. Entries are keyed by the producer's compiled id
+// plus the artifact name; every producer's base id is recorded so a consumer
+// that declares `from: <base>` for a matrix producer resolves exactly like
+// the control plane's dependency endpoint (BaseKey == producer or Key ==
+// producer, then exactly one matching artifact record).
 type artifactRegistry struct {
 	mu    sync.Mutex
 	paths map[string]string
+	bases map[string]string
 }
 
 func newArtifactRegistry() *artifactRegistry {
-	return &artifactRegistry{paths: map[string]string{}}
+	return &artifactRegistry{paths: map[string]string{}, bases: map[string]string{}}
 }
 
-func (r *artifactRegistry) record(jobID, name, path string) {
+func (r *artifactRegistry) record(jobID, baseID, name, path string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.paths[jobID+"\x00"+name] = path
+	if baseID != "" {
+		r.bases[jobID] = baseID
+	}
 }
 
-func (r *artifactRegistry) lookup(jobID, name string) (string, bool) {
+// lookup resolves a declared (producer, artifact name) pair against this
+// run's recorded artifacts. The producer may be the compiled id or the base
+// id of a matrix producer; ambiguity (several variants publishing the same
+// name) is an error, matching the server's exactly-one contract.
+func (r *artifactRegistry) lookup(producer, name string) (string, bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	p, ok := r.paths[jobID+"\x00"+name]
-	return p, ok
+	if p, ok := r.paths[producer+"\x00"+name]; ok {
+		return p, true, nil
+	}
+	matches := make([]string, 0, 2)
+	for key, p := range r.paths {
+		id, n, ok := strings.Cut(key, "\x00")
+		if !ok || n != name {
+			continue
+		}
+		if r.bases[id] == producer {
+			matches = append(matches, p)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return "", false, nil
+	case 1:
+		return matches[0], true, nil
+	default:
+		return "", false, fmt.Errorf("dependency artifact %q from %q is ambiguous: %d matrix variants published it", name, producer, len(matches))
+	}
 }
 
 // sessionRegistry maps job IDs to their live backend sessions. A session is
@@ -533,6 +564,13 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	// the distributed runner restores them through the control plane. A
 	// declared artifact its producer did not publish is a hard failure (the
 	// server answers the same download with 404).
+	if cj.Job.Generate != (pipeline.GenerateSpec{}) && e.Opt.ArtifactCapture == nil {
+		// Local runs execute the generator step (its output fragment is a
+		// runtime artifact); expanding the fragment into child jobs is a
+		// control-plane feature. Say so instead of silently running a
+		// partial graph.
+		e.log(cj.ID, "generate", "child job expansion is a control-plane feature; this local run executes the generator step only")
+	}
 	if e.Opt.LocalDownloads && len(cj.Job.Downloads) > 0 {
 		if err := e.restoreLocalDownloads(cj.Job.Downloads, workspace); err != nil {
 			res.Status = model.StatusFailure
@@ -1186,7 +1224,7 @@ func (e *Executor) saveArtifact(cj pipeline.CompiledJob, a pipeline.Artifact, wo
 	if capture == nil && e.artifacts != nil {
 		// Local store mode: make the archive resolvable for downstream jobs'
 		// declared downloads in this run.
-		e.artifacts.record(cj.ID, a.Name, p)
+		e.artifacts.record(cj.ID, cj.BaseID, a.Name, p)
 	}
 	if e.Opt.ArtifactReporter != nil {
 		if err := e.Opt.ArtifactReporter(cj.ID, a.Name, p); err != nil {
@@ -1220,7 +1258,10 @@ func (e *Executor) restoreLocalDownloads(inputs []pipeline.ArtifactInput, worksp
 		if from == "" || name == "" {
 			return fmt.Errorf("invalid download declaration (from=%q name=%q)", in.From, in.Name)
 		}
-		archive, ok := e.artifacts.lookup(from, name)
+		archive, ok, lookupErr := e.artifacts.lookup(from, name)
+		if lookupErr != nil {
+			return lookupErr
+		}
 		if !ok {
 			return fmt.Errorf("dependency artifact %q from %q was not produced by this run", name, from)
 		}

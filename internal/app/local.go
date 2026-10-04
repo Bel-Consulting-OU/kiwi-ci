@@ -68,6 +68,14 @@ func RunLocal(ctx context.Context, args []string) error {
 	if *job != "" && !graphHasJob(g, *job) {
 		return fmt.Errorf("unknown job %q", *job)
 	}
+	// Component references are resolved by the control plane (the resolved
+	// steps are merged server-side); a local run cannot resolve them, and
+	// silently running the raw job would ignore the reference entirely.
+	for _, cj := range g.Jobs {
+		if cj.Job.Component != "" {
+			return fmt.Errorf("job %q references component %q, which requires the control plane: run it through kiwi dispatch/server", cj.ID, cj.Job.Component)
+		}
+	}
 	wd, err := os.Getwd()
 	if err != nil {
 		return err

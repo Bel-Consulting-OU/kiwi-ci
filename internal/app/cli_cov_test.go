@@ -593,3 +593,16 @@ func TestRunLocalCancelledContextFails(t *testing.T) {
 		t.Fatalf("cancelled RunLocal err = %v, want a cancelled-run error", err)
 	}
 }
+
+// TestRunLocalRejectsComponentJobs: component references are resolved by the
+// control plane; a local run must refuse them instead of silently running
+// the raw job and ignoring the reference.
+func TestRunLocalRejectsComponentJobs(t *testing.T) {
+	dir := t.TempDir()
+	path := writePipeline(t, dir, "version: 1\njobs:\n  a:\n    component: tools@sha256:0000000000000000000000000000000000000000000000000000000000000000\n    steps:\n      - run: echo hi\n")
+	chdir(t, dir)
+	err := RunLocal(context.Background(), []string{"-f", path})
+	if err == nil || !strings.Contains(err.Error(), "component") {
+		t.Fatalf("RunLocal with component job = %v, want a component refusal", err)
+	}
+}

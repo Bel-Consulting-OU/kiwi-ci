@@ -134,3 +134,104 @@ func writeFile(t *testing.T, path, content string) {
 type discardSink struct{}
 
 func (discardSink) WriteLine(job, step, line string) {}
+
+// TestLocalDownloadsMatrixBaseResolution: a consumer declaring `from: <base>`
+// for a matrix producer resolves the unique variant artifact, exactly like
+// the control plane's dependency endpoint; two variants publishing the SAME
+// name is ambiguous and fails.
+func TestLocalDownloadsMatrixBaseResolution(t *testing.T) {
+	spec := &pipeline.Spec{
+		Version: 1,
+		Jobs: map[string]pipeline.Job{
+			"build": {
+				Runtime: "native",
+				Matrix:  map[string][]any{"OS": {"linux", "darwin"}},
+				Steps:   []pipeline.Step{{Name: "make", Run: `echo x > "app-$KIWI_MATRIX_OS.txt"`}},
+				Artifacts: []pipeline.Artifact{{
+					Name:  "app-${{ matrix.OS }}",
+					Paths: []string{"app-$KIWI_MATRIX_OS.txt"},
+				}},
+			},
+			"verify": {
+				Needs:   []string{"build"},
+				Runtime: "native",
+				Downloads: []pipeline.ArtifactInput{{
+					From: "build", Name: "app-linux", Path: ".",
+				}},
+				Steps: []pipeline.Step{{Name: "check", Run: `test -f app-linux.txt || test -f "app-$KIWI_MATRIX_OS.txt" || ls`}},
+			},
+		},
+	}
+	root := t.TempDir()
+	g, err := pipeline.Compile(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ex := Executor{Opt: Options{
+		WorkspaceFor: func(jobID string) (string, func(), error) {
+			dir := filepath.Join(root, "ws-"+jobID)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return "", nil, err
+			}
+			return dir, func() {}, nil
+		},
+		MaxParallel:    1,
+		Artifacts:      &artifact.Store{Root: filepath.Join(root, "arts")},
+		LocalDownloads: true,
+		Logs:           discardSink{},
+	}}
+	res, err := ex.Run(context.Background(), g)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for _, id := range []string{"build[OS=linux]", "build[OS=darwin]", "verify"} {
+		if res[id].Status != model.StatusSuccess {
+			t.Fatalf("job %s = %v (%s), want success", id, res[id].Status, res[id].Error)
+		}
+	}
+
+	// Ambiguity: both variants publish the same artifact name.
+	amb := &pipeline.Spec{
+		Version: 1,
+		Jobs: map[string]pipeline.Job{
+			"build": {
+				Runtime: "native",
+				Matrix:  map[string][]any{"OS": {"linux", "darwin"}},
+				Steps:   []pipeline.Step{{Run: `echo x > app.txt`}},
+				Artifacts: []pipeline.Artifact{{
+					Name: "app", Paths: []string{"app.txt"},
+				}},
+			},
+			"verify": {
+				Needs:   []string{"build"},
+				Runtime: "native",
+				Downloads: []pipeline.ArtifactInput{{
+					From: "build", Name: "app", Path: ".",
+				}},
+				Steps: []pipeline.Step{{Run: `true`}},
+			},
+		},
+	}
+	root2 := t.TempDir()
+	g2, err := pipeline.Compile(amb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ex2 := Executor{Opt: Options{
+		WorkspaceFor: func(jobID string) (string, func(), error) {
+			dir := filepath.Join(root2, "ws-"+jobID)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return "", nil, err
+			}
+			return dir, func() {}, nil
+		},
+		MaxParallel:    1,
+		Artifacts:      &artifact.Store{Root: filepath.Join(root2, "arts")},
+		LocalDownloads: true,
+		Logs:           discardSink{},
+	}}
+	_, err = ex2.Run(context.Background(), g2)
+	if err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("ambiguous matrix download = %v, want an ambiguity error", err)
+	}
+}
