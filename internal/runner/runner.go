@@ -3240,28 +3240,34 @@ func truncationMarker(truncated bool) string {
 // mode. The name keys a distinct identity per runner name so two runners on
 // one host never share an identity file (which would make the server
 // supersede their sessions); an unnamed runner uses the single default.
-func (r *Runner) bearerRunnerIDPath() string {
+func (r *Runner) bearerRunnerIDPath() (string, error) {
 	base := strings.TrimSpace(r.Cfg.IdentityDir)
 	if base == "" {
 		base = strings.TrimSpace(r.Cfg.StateDir)
 	}
 	if base == "" {
-		home, _ := os.UserHomeDir()
+		home, err := os.UserHomeDir()
+		if err != nil || strings.TrimSpace(home) == "" {
+			return "", fmt.Errorf("runner identity: no identity/state dir and no home directory to persist it in")
+		}
 		base = filepath.Join(home, ".kiwi")
 	}
 	name := strings.TrimSpace(r.Cfg.Name)
 	if name == "" {
-		return filepath.Join(base, "runner-id")
+		return filepath.Join(base, "runner-id"), nil
 	}
 	sum := sha256.Sum256([]byte(name))
-	return filepath.Join(base, "runner-id-"+hex.EncodeToString(sum[:8]))
+	return filepath.Join(base, "runner-id-"+hex.EncodeToString(sum[:8])), nil
 }
 
 // persistedBearerRunnerID loads the stable runner id or creates it. A
 // present-but-invalid file is FATAL: regenerating would orphan the ledger
 // namespace and audit history under the old identity.
 func (r *Runner) persistedBearerRunnerID() (string, error) {
-	path := r.bearerRunnerIDPath()
+	path, err := r.bearerRunnerIDPath()
+	if err != nil {
+		return "", err
+	}
 	if b, err := os.ReadFile(path); err == nil {
 		id := strings.TrimSpace(string(b))
 		if !validRunnerIDShape(id) {
@@ -3282,7 +3288,10 @@ func (r *Runner) persistedBearerRunnerID() (string, error) {
 }
 
 func (r *Runner) persistBearerRunnerID(id string) error {
-	path := r.bearerRunnerIDPath()
+	path, err := r.bearerRunnerIDPath()
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
