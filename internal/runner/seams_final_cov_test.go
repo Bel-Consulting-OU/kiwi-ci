@@ -35,8 +35,9 @@ func TestFinalSeamRandReaderFailures(t *testing.T) {
 	if _, err := newRunnerID(); err == nil {
 		t.Fatal("identifier generation succeeded without entropy")
 	}
-	// Run fails while minting a fresh identity.
-	r := &Runner{ID: "", Cfg: Config{Server: "http://127.0.0.1:1"}, Metrics: NewMetrics()}
+	// Run fails while minting a fresh identity (an isolated identity dir
+	// guarantees no earlier test's persisted id is loaded instead).
+	r := &Runner{ID: "", Cfg: Config{Server: "http://127.0.0.1:1", IdentityDir: t.TempDir()}, Metrics: NewMetrics()}
 	if err := r.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "entropy unavailable") {
 		t.Fatalf("Run = %v", err)
 	}

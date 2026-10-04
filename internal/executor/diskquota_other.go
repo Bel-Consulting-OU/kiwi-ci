@@ -13,14 +13,15 @@ import (
 // untrusted default budget plus step-boundary enforcement, and the caller
 // fails untrusted jobs closed unless the operator escape hatch is set.
 func setupWorkspaceDiskQuota(workspace string, limit int64) (DiskQuotaStatus, func() error) {
-	return setupWorkspaceDiskQuotaWithHook(workspace, limit, nil)
+	status, cleanup, _ := setupWorkspaceDiskQuotaWithHook(workspace, limit, nil)
+	return status, cleanup
 }
 
 // setupWorkspaceDiskQuotaWithHook accepts the allocation callback for
 // interface symmetry; no assignment can exist on platforms without project
 // quotas, so the hook is never invoked.
-func setupWorkspaceDiskQuotaWithHook(workspace string, limit int64, onAllocated func(WorkspaceQuotaAssignment)) (DiskQuotaStatus, func() error) {
-	return DiskQuotaStatus{Detail: fmt.Sprintf("OS-level project quotas are only implemented on Linux (this host is %s); the workspace bound is step-boundary only", runtime.GOOS)}, nil
+func setupWorkspaceDiskQuotaWithHook(workspace string, limit int64, onAllocated func(WorkspaceQuotaAssignment) error) (DiskQuotaStatus, func() error, error) {
+	return DiskQuotaStatus{Detail: fmt.Sprintf("OS-level project quotas are only implemented on Linux (this host is %s); the workspace bound is step-boundary only", runtime.GOOS)}, nil, nil
 }
 
 // validateQuotaAssignment refuses ledger-recorded quota cleanups off Linux:

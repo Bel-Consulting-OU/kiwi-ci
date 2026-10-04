@@ -1,10 +1,9 @@
 package runner
 
-// Crash-ledger regressions: workspace ownership recorded by a PREVIOUS
-// incarnation is reclaimed before the next incarnation leases work, while
-// current-incarnation entries are never touched.
-
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -14,194 +13,254 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executor"
 )
 
-func TestRuntimeLedgerReclaimsPreviousIncarnation(t *testing.T) {
+// newLedgerRunner builds a runner whose only relevant configuration is the
+// stable id and a shared WorkDir.
+func newLedgerRunner(id, workDir string) *Runner {
+	return &Runner{ID: id, Cfg: Config{WorkDir: workDir}}
+}
+
+// TestRuntimeLedgerNamespaceIncludesStableRunner: the ledger directory is
+// keyed by the hash of the stable runner id, so runners sharing a WorkDir
+// are physically separated.
+func TestRuntimeLedgerNamespaceIncludesStableRunner(t *testing.T) {
 	workDir := t.TempDir()
-	r := &Runner{Cfg: Config{WorkDir: workDir}}
-
-	// A crashed job's workspace + artifact scratch, recorded by instance A.
-	staleWS := filepath.Join(t.TempDir(), "kiwi-run-dead")
-	staleArtifacts := filepath.Join(workDir, "kiwi-artifacts-dead")
-	if err := os.MkdirAll(staleWS, 0o700); err != nil {
-		t.Fatal(err)
+	a := newLedgerRunner("runner-A", workDir)
+	b := newLedgerRunner("runner-B", workDir)
+	dirA, dirB := a.runtimeLedgerDir(), b.runtimeLedgerDir()
+	if dirA == dirB {
+		t.Fatal("runners share a ledger directory")
 	}
-	if err := os.MkdirAll(staleArtifacts, 0o700); err != nil {
-		t.Fatal(err)
+	sumA := sha256.Sum256([]byte("runner-A"))
+	wantA := filepath.Join(workDir, ".kiwi-runtime", hex.EncodeToString(sumA[:]), "ledger")
+	if dirA != wantA {
+		t.Fatalf("ledger dir = %s, want %s", dirA, wantA)
 	}
-	idA := r.ledgerAdd(runtimeLedgerEntry{Instance: "instance-A", JobID: "job-a", Workspace: staleWS})
-	r.ledgerAddArtifacts(idA, staleArtifacts)
-	if idA == "" {
-		t.Fatal("ledger entry not written")
-	}
-
-	// A CURRENT-incarnation entry must survive reconciliation.
-	liveWS := filepath.Join(t.TempDir(), "kiwi-run-live")
-	if err := os.MkdirAll(liveWS, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	r.ledgerAdd(runtimeLedgerEntry{Instance: "instance-B", JobID: "job-b", Workspace: liveWS})
-
-	if n := r.reconcileRuntimeLedger("instance-B"); n != 1 {
-		t.Fatalf("reclaimed %d entries, want 1", n)
-	}
-	if _, err := os.Stat(staleWS); !os.IsNotExist(err) {
-		t.Fatalf("previous-incarnation workspace survived: %v", err)
-	}
-	if _, err := os.Stat(staleArtifacts); !os.IsNotExist(err) {
-		t.Fatalf("previous-incarnation artifact scratch survived: %v", err)
-	}
-	if _, err := os.Stat(liveWS); err != nil {
-		t.Fatalf("current-incarnation workspace removed: %v", err)
-	}
-	// The reclaimed entry is retired; the live one remains.
-	files, err := os.ReadDir(r.runtimeLedgerDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, f := range files {
-		b, _ := os.ReadFile(filepath.Join(r.runtimeLedgerDir(), f.Name()))
-		if string(b) == "" {
-			continue
-		}
-		if strings.Contains(string(b), `"instance":"instance-B"`) {
-			continue
-		}
-	}
-	// A replayed reconciliation is a no-op.
-	if n := r.reconcileRuntimeLedger("instance-B"); n != 0 {
-		t.Fatalf("replayed reconciliation reclaimed %d entries", n)
+	if !strings.HasPrefix(dirA, workDir) {
+		t.Fatalf("ledger dir escapes WorkDir: %s", dirA)
 	}
 }
 
-func TestRuntimeLedgerReclaimsXFSQuotaBeforeRetiring(t *testing.T) {
-	workDir := t.TempDir()
-	r := &Runner{Cfg: Config{WorkDir: workDir}}
-	ws := filepath.Join(t.TempDir(), "kiwi-run-xfs")
-	if err := os.MkdirAll(ws, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	id := r.ledgerAdd(runtimeLedgerEntry{Instance: "instance-A", JobID: "job-x", Workspace: ws})
-	r.ledgerSetXFS(id, &executor.WorkspaceQuotaAssignment{Workspace: ws, MountPoint: "/mnt/x", FsKey: "8:1", XQ: "xfs_quota", ProjectID: 123})
-
-	prev := reclaimWorkspaceQuota
-	var calls []uint32
-	reclaimWorkspaceQuota = func(a executor.WorkspaceQuotaAssignment) error {
-		calls = append(calls, a.ProjectID)
-		return nil
-	}
-	t.Cleanup(func() { reclaimWorkspaceQuota = prev })
-
-	if n := r.reconcileRuntimeLedger("instance-B"); n != 1 {
-		t.Fatalf("reclaimed %d entries, want 1", n)
-	}
-	if len(calls) != 1 || calls[0] != 123 {
-		t.Fatalf("quota reclaim calls = %v, want [123]", calls)
-	}
-	if _, err := os.Stat(ws); !os.IsNotExist(err) {
-		t.Fatalf("workspace survived a successful quota reclaim: %v", err)
-	}
-}
-
-func TestRuntimeLedgerKeepsEntryWhenXFSReclaimFails(t *testing.T) {
-	workDir := t.TempDir()
-	r := &Runner{Cfg: Config{WorkDir: workDir}}
-	ws := filepath.Join(t.TempDir(), "kiwi-run-xfs2")
-	if err := os.MkdirAll(ws, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	id := r.ledgerAdd(runtimeLedgerEntry{Instance: "instance-A", JobID: "job-x", Workspace: ws})
-	r.ledgerSetXFS(id, &executor.WorkspaceQuotaAssignment{Workspace: ws, MountPoint: "/mnt/x", FsKey: "8:1", XQ: "xfs_quota", ProjectID: 124})
-
-	prev := reclaimWorkspaceQuota
-	fail := true
-	reclaimWorkspaceQuota = func(executor.WorkspaceQuotaAssignment) error {
-		if fail {
-			return errors.New("xfs cleanup refused")
-		}
-		return nil
-	}
-	t.Cleanup(func() { reclaimWorkspaceQuota = prev })
-
-	if n := r.reconcileRuntimeLedger("instance-B"); n != 0 {
-		t.Fatalf("failed reclaim retired %d entries", n)
-	}
-	if _, err := os.Stat(ws); err != nil {
-		t.Fatalf("workspace removed before the quota was reclaimed: %v", err)
-	}
-	// Retry converges once cleanup can be proven.
-	fail = false
-	if n := r.reconcileRuntimeLedger("instance-B"); n != 1 {
-		t.Fatalf("retry reclaimed %d entries, want 1", n)
-	}
-	if _, err := os.Stat(ws); !os.IsNotExist(err) {
-		t.Fatalf("workspace survived the retry: %v", err)
-	}
-}
-
-func TestRuntimeLedgerReclaimsCgroupBeforeRetiring(t *testing.T) {
-	r := &Runner{Cfg: Config{WorkDir: t.TempDir()}}
-	ws := filepath.Join(t.TempDir(), "kiwi-run-cg")
-	if err := os.MkdirAll(ws, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	id := r.ledgerAdd(runtimeLedgerEntry{Instance: "instance-A", JobID: "job-cg", Workspace: ws})
-	r.ledgerSetCgroup(id, "/delegated/kiwi-job-cg")
-
-	prev := reclaimJobCgroup
-	calls := 0
-	fail := false
-	reclaimJobCgroup = func(parent string) error {
-		calls++
-		if fail {
-			return errors.New("cgroup busy")
-		}
-		if parent != "/delegated/kiwi-job-cg" {
-			t.Errorf("reclaim parent = %q", parent)
-		}
-		return nil
-	}
-	t.Cleanup(func() { reclaimJobCgroup = prev })
-
-	fail = true
-	if n := r.reconcileRuntimeLedger("instance-B"); n != 0 {
-		t.Fatalf("failed cgroup reclaim retired %d entries", n)
-	}
-	fail = false
-	if n := r.reconcileRuntimeLedger("instance-B"); n != 1 {
-		t.Fatalf("retry reclaimed %d entries, want 1", n)
-	}
-	if calls != 2 {
-		t.Fatalf("cgroup reclaim calls = %d, want 2", calls)
-	}
-}
-
-// TestRuntimeLedgerConvergesManyCrashedJobs pins convergence at scale: many
-// previous-incarnation entries are reclaimed in one pass.
-func TestRuntimeLedgerConvergesManyCrashedJobs(t *testing.T) {
-	r := &Runner{Cfg: Config{WorkDir: t.TempDir()}}
-	prev := reclaimJobCgroup
-	reclaimJobCgroup = func(string) error { return nil }
-	t.Cleanup(func() { reclaimJobCgroup = prev })
-	for i := 0; i < 100; i++ {
-		ws := filepath.Join(t.TempDir(), "kiwi-run-bulk")
-		if err := os.MkdirAll(ws, 0o700); err != nil {
+// ledgerFixture records one crashed job for runner A (workspace + artifact
+// scratch + fake XFS/cgroup coordinates) and returns the workspace paths.
+func ledgerFixture(t *testing.T, a *Runner) (liveWS, artifacts, entryID string) {
+	t.Helper()
+	liveWS = filepath.Join(t.TempDir(), "kiwi-run-A-live")
+	artifacts = filepath.Join(a.Cfg.WorkDir, "kiwi-artifacts-A-live")
+	for _, d := range []string{liveWS, artifacts} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		id := r.ledgerAdd(runtimeLedgerEntry{Instance: "instance-old", JobID: "job", Workspace: ws})
-		r.ledgerSetCgroup(id, "/delegated/kiwi-job-old")
 	}
-	if n := r.reconcileRuntimeLedger("instance-new"); n != 100 {
-		t.Fatalf("reclaimed %d entries, want 100", n)
+	id, err := a.ledgerAdd(runtimeLedgerEntry{Instance: "instance-A", JobID: "job-a", Workspace: liveWS})
+	if err != nil {
+		t.Fatalf("ledgerAdd: %v", err)
 	}
-	files, err := os.ReadDir(r.runtimeLedgerDir())
+	if err := a.ledgerAddArtifacts(id, artifacts); err != nil {
+		t.Fatalf("ledgerAddArtifacts: %v", err)
+	}
+	if err := a.ledgerSetXFS(id, &executor.WorkspaceQuotaAssignment{Workspace: liveWS, MountPoint: "/mnt/xfs", FsKey: "8:70", XQ: "/usr/sbin/xfs_quota", ProjectID: 100123}); err != nil {
+		t.Fatalf("ledgerSetXFS: %v", err)
+	}
+	if err := a.ledgerSetCgroup(id, "/sys/fs/cgroup/kiwi/job-a"); err != nil {
+		t.Fatalf("ledgerSetCgroup: %v", err)
+	}
+	return liveWS, artifacts, id
+}
+
+type reclaimCalls struct {
+	xfs    []uint32
+	cgroup []string
+}
+
+func stubReclaimSeams(t *testing.T, calls *reclaimCalls) {
+	t.Helper()
+	origXFS, origCG := reclaimWorkspaceQuota, reclaimJobCgroup
+	reclaimWorkspaceQuota = func(a executor.WorkspaceQuotaAssignment) error {
+		calls.xfs = append(calls.xfs, a.ProjectID)
+		return nil
+	}
+	reclaimJobCgroup = func(path string) error {
+		calls.cgroup = append(calls.cgroup, path)
+		return nil
+	}
+	t.Cleanup(func() { reclaimWorkspaceQuota, reclaimJobCgroup = origXFS, origCG })
+}
+
+// TestRunnerBCannotReclaimRunnerALiveWorkspace is the P1 isolation test: B's
+// reconciliation must not touch A's crashed-state artifacts, XFS quota or
+// cgroup while A is a DIFFERENT runner (even though A is not currently live:
+// B never reclaims another runner's namespace).
+func TestRunnerBCannotReclaimRunnerALiveWorkspace(t *testing.T) {
+	workDir := t.TempDir()
+	a := newLedgerRunner("runner-A", workDir)
+	b := newLedgerRunner("runner-B", workDir)
+	liveWS, artifacts, _ := ledgerFixture(t, a)
+	calls := &reclaimCalls{}
+	stubReclaimSeams(t, calls)
+
+	res, err := b.reconcileRuntimeLedger("instance-B")
+	if err != nil {
+		t.Fatalf("B reconcile: %v", err)
+	}
+	if res.Reclaimed != 0 {
+		t.Fatalf("B reclaimed %d entries from A", res.Reclaimed)
+	}
+	if len(calls.xfs) != 0 || len(calls.cgroup) != 0 {
+		t.Fatalf("B reclaimed A's quotas/cgroups: %+v", calls)
+	}
+	if _, err := os.Stat(liveWS); err != nil {
+		t.Fatalf("B removed A's workspace: %v", err)
+	}
+	if _, err := os.Stat(artifacts); err != nil {
+		t.Fatalf("B removed A's artifact scratch: %v", err)
+	}
+}
+
+// TestRunnerBCannotClearRunnerAXFSQuota and CannotRemoveRunnerACgroup are
+// covered by the seam assertions above; this focused variant proves A's own
+// restart DOES reclaim its coordinates.
+func TestCorrectRunnerRestartReclaimsItsOwnPreviousState(t *testing.T) {
+	workDir := t.TempDir()
+	a := newLedgerRunner("runner-A", workDir)
+	liveWS, artifacts, _ := ledgerFixture(t, a)
+	calls := &reclaimCalls{}
+	stubReclaimSeams(t, calls)
+
+	res, err := a.reconcileRuntimeLedger("instance-A-next")
+	if err != nil {
+		t.Fatalf("A restart reconcile: %v", err)
+	}
+	if res.Reclaimed != 1 {
+		t.Fatalf("reclaimed %d, want 1", res.Reclaimed)
+	}
+	if len(calls.xfs) != 1 || calls.xfs[0] != 100123 {
+		t.Fatalf("XFS reclaim = %v", calls.xfs)
+	}
+	if len(calls.cgroup) != 1 || calls.cgroup[0] != "/sys/fs/cgroup/kiwi/job-a" {
+		t.Fatalf("cgroup reclaim = %v", calls.cgroup)
+	}
+	if _, err := os.Stat(liveWS); !os.IsNotExist(err) {
+		t.Fatalf("own crashed workspace survived: %v", err)
+	}
+	if _, err := os.Stat(artifacts); !os.IsNotExist(err) {
+		t.Fatalf("own crashed artifact scratch survived: %v", err)
+	}
+}
+
+// TestRuntimeLedgerCurrentInstanceEntriesSurvive: a live instance's entries
+// are never reclaimed.
+func TestRuntimeLedgerCurrentInstanceEntriesSurvive(t *testing.T) {
+	workDir := t.TempDir()
+	a := newLedgerRunner("runner-A", workDir)
+	liveWS, _, _ := ledgerFixture(t, a)
+	calls := &reclaimCalls{}
+	stubReclaimSeams(t, calls)
+	res, err := a.reconcileRuntimeLedger("instance-A")
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.Reclaimed != 0 || len(calls.xfs) != 0 {
+		t.Fatalf("current instance entries were reclaimed: %+v", res)
+	}
+	if _, err := os.Stat(liveWS); err != nil {
+		t.Fatal("current instance workspace removed")
+	}
+}
+
+// TestRuntimeLedgerPublishFailuresAreFatal: every publication point must
+// surface a durable-write failure so the caller can refuse to create the
+// external state the entry exists for.
+func TestRuntimeLedgerPublishFailuresAreFatal(t *testing.T) {
+	workDir := t.TempDir()
+	r := newLedgerRunner("runner-A", workDir)
+	orig := atomicWriteFile
+	fail := true
+	atomicWriteFile = func(path string, data []byte, mode os.FileMode) error {
+		if fail {
+			return errors.New("disk full")
+		}
+		return orig(path, data, mode)
+	}
+	t.Cleanup(func() { atomicWriteFile = orig })
+
+	if _, err := r.ledgerAdd(runtimeLedgerEntry{Instance: "i1", JobID: "j1", Workspace: "/tmp/kiwi-run-x"}); err == nil {
+		t.Fatal("ledgerAdd ignored a durable-write failure")
+	}
+	fail = false
+	id, err := r.ledgerAdd(runtimeLedgerEntry{Instance: "i1", JobID: "j1", Workspace: "/tmp/kiwi-run-x"})
+	if err != nil {
+		t.Fatalf("ledgerAdd: %v", err)
+	}
+	fail = true
+	if err := r.ledgerAddArtifacts(id, "/tmp/kiwi-artifacts-x"); err == nil {
+		t.Fatal("ledgerAddArtifacts ignored a durable-write failure")
+	}
+	if err := r.ledgerSetXFS(id, &executor.WorkspaceQuotaAssignment{ProjectID: 1}); err == nil {
+		t.Fatal("ledgerSetXFS ignored a durable-write failure")
+	}
+	if err := r.ledgerSetCgroup(id, "/cg"); err == nil {
+		t.Fatal("ledgerSetCgroup ignored a durable-write failure")
+	}
+}
+
+// TestRuntimeLedgerUnresolvedDebtFailsReconcile: corrupt entries and reclaim
+// failures inside THIS runner's namespace are unresolved recovery debt and
+// must be reported (the caller refuses to lease), unlike the old
+// silently-ignored behavior.
+func TestRuntimeLedgerUnresolvedDebtFailsReconcile(t *testing.T) {
+	workDir := t.TempDir()
+	a := newLedgerRunner("runner-A", workDir)
+	dir := a.runtimeLedgerDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// corrupt JSON
+	if err := os.WriteFile(filepath.Join(dir, "broken.json"), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.reconcileRuntimeLedger("instance-new"); err == nil {
+		t.Fatal("corrupt entry did not surface as debt")
+	}
+	// foreign runner id inside our namespace
+	if err := os.Remove(filepath.Join(dir, "broken.json")); err != nil {
+		t.Fatal(err)
+	}
+	writeLedgerEntry(t, dir, "foreign.json", runtimeLedgerEntry{RunnerID: "runner-B", Instance: "ib", JobID: "j"})
+	if _, err := a.reconcileRuntimeLedger("instance-new"); err == nil {
+		t.Fatal("foreign runner entry did not surface as debt")
+	}
+	// reclaim failure on our own entry
+	if err := os.Remove(filepath.Join(dir, "foreign.json")); err != nil {
+		t.Fatal(err)
+	}
+	ws := filepath.Join(t.TempDir(), "kiwi-run-A")
+	if err := os.MkdirAll(ws, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeLedgerEntry(t, dir, "a.json", runtimeLedgerEntry{RunnerID: "runner-A", Instance: "ia", JobID: "j", Workspace: ws, Cgroup: "/cg"})
+	orig := reclaimJobCgroup
+	reclaimJobCgroup = func(string) error { return errors.New("cgroup busy") }
+	t.Cleanup(func() { reclaimJobCgroup = orig })
+	res, err := a.reconcileRuntimeLedger("instance-new")
+	if err == nil {
+		t.Fatal("reclaim failure did not surface as debt")
+	}
+	if res.Pending != 1 {
+		t.Fatalf("pending = %d, want 1", res.Pending)
+	}
+}
+
+func writeLedgerEntry(t *testing.T, dir, name string, entry runtimeLedgerEntry) {
+	t.Helper()
+	b, err := jsonMarshalEntry(entry)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, f := range files {
-		if strings.HasSuffix(f.Name(), ".json") {
-			b, _ := os.ReadFile(filepath.Join(r.runtimeLedgerDir(), f.Name()))
-			if len(b) > 0 {
-				t.Fatalf("unreclaimed ledger entry %s", f.Name())
-			}
-		}
+	if err := os.WriteFile(filepath.Join(dir, name), b, 0o600); err != nil {
+		t.Fatal(err)
 	}
+}
+
+func jsonMarshalEntry(e runtimeLedgerEntry) ([]byte, error) {
+	return json.Marshal(e)
 }

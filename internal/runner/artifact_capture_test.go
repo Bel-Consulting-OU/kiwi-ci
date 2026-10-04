@@ -284,21 +284,30 @@ func TestRunnerShutdownDoesNotWaitCleanupTimeout(t *testing.T) {
 }
 
 // TestExecuteArtifactCaptureDirFailure pins the checked failure branch when
-// the per-job capture directory cannot be created (for example WorkDir is a
-// regular file): the job completes as a failure before any step runs.
+// the artifact scratch directory cannot be durably registered (its ownership
+// record fails): the job completes as a failure before any step runs and the
+// scratch directory never survives.
 func TestExecuteArtifactCaptureDirFailure(t *testing.T) {
 	fsrv := &fakeRunnerServer{}
 	ts := httptest.NewServer(fsrv.handler())
 	defer ts.Close()
-	blocked := filepath.Join(t.TempDir(), "not-a-dir")
-	if err := os.WriteFile(blocked, []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
+	workDir := t.TempDir()
+	orig := atomicWriteFile
+	atomicWriteFile = func(path string, data []byte, mode os.FileMode) error {
+		if strings.Contains(path, "kiwi-artifacts-") || (strings.Contains(path, "ledger") && strings.Contains(string(data), "kiwi-artifacts-")) {
+			return fmt.Errorf("capture ledger unavailable")
+		}
+		return orig(path, data, mode)
 	}
-	r := testRunnerFor(t, ts, Config{WorkDir: blocked})
+	t.Cleanup(func() { atomicWriteFile = orig })
+	r := testRunnerFor(t, ts, Config{WorkDir: workDir})
 	r.Cfg.CheckoutFn = func(context.Context, model.Job, string) error { return nil }
 	r.execute(context.Background(), basicTask(artifactPipeline("art", "")))
 	c, ok := fsrv.lastComplete()
-	if !ok || c.Status != model.StatusFailure || !strings.Contains(c.Error, "artifact capture directory") {
+	if !ok || c.Status != model.StatusFailure || !strings.Contains(c.Error, "artifact capture ledger") {
 		t.Fatalf("complete = %+v ok=%v", c, ok)
+	}
+	if leftovers, _ := filepath.Glob(filepath.Join(workDir, "kiwi-artifacts-*")); len(leftovers) != 0 {
+		t.Fatalf("artifact scratch survived the failed registration: %v", leftovers)
 	}
 }

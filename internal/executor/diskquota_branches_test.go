@@ -7,6 +7,7 @@ package executor
 // ID stays allocated" branch).
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -508,14 +509,15 @@ func TestXFSAllocationHookFiresBeforeAssignment(t *testing.T) {
 
 	var hooked WorkspaceQuotaAssignment
 	var assignSeenAtHook bool
-	status, cleanup := setupXFSProjectQuotaOnMountHook("/mnt/xfs/ws", entry, 1<<20, script, func(a WorkspaceQuotaAssignment) {
+	status, cleanup, hookErr := setupXFSProjectQuotaOnMountHook("/mnt/xfs/ws", entry, 1<<20, script, func(a WorkspaceQuotaAssignment) error {
 		hooked = a
 		if logged, err := os.ReadFile(logPath); err == nil {
 			assignSeenAtHook = strings.Contains(string(logged), "project -s")
 		}
+		return nil
 	})
-	if !status.Hard || cleanup == nil {
-		t.Fatalf("setup = %+v", status)
+	if hookErr != nil || !status.Hard || cleanup == nil {
+		t.Fatalf("setup = %+v err=%v", status, hookErr)
 	}
 	if hooked.ProjectID == 0 || hooked.ProjectID != status.Assignment.ProjectID {
 		t.Fatalf("hook assignment = %+v, status = %+v", hooked, status.Assignment)
@@ -599,5 +601,33 @@ func TestValidateQuotaAssignmentRefusesForgedLedgerEntries(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("unmounted ledger mount point accepted")
+	}
+}
+
+// TestXFSHookFailureAbortsBeforeAssignment: a failed ownership record must
+// abort BEFORE the assignment command, so no external state ever exists.
+func TestXFSHookFailureAbortsBeforeAssignment(t *testing.T) {
+	resetProjectIDPools(t)
+	t.Setenv(xfsProjectIDBaseEnv, "100000")
+	t.Setenv(xfsProjectIDCountEnv, "2")
+	t.Setenv("KIWI_XFS_LOCK_DIR", t.TempDir())
+	logPath := filepath.Join(t.TempDir(), "xfs.log")
+	t.Setenv("FAKE_XFS_LOG", logPath)
+	script := writeFakeXFSQuota(t, "")
+	entry := mountInfoEntry{mountPoint: "/mnt/xfs", device: "8:70", fsType: "xfs"}
+
+	status, cleanup, hookErr := setupXFSProjectQuotaOnMountHook("/mnt/xfs/ws", entry, 1<<20, script,
+		func(WorkspaceQuotaAssignment) error { return errors.New("ledger unavailable") })
+	if hookErr == nil {
+		t.Fatalf("hook failure did not surface: status=%+v cleanup!=nil=%v", status, cleanup != nil)
+	}
+	if cleanup != nil {
+		t.Fatalf("cleanup returned for an aborted assignment")
+	}
+	if status.Hard || status.Assignment != nil {
+		t.Fatalf("assignment reported despite the failed record: %+v", status)
+	}
+	if logged, err := os.ReadFile(logPath); err == nil && strings.Contains(string(logged), "project -s") {
+		t.Fatalf("assignment command ran after the ownership record failed: %s", logged)
 	}
 }

@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -333,5 +334,50 @@ func TestRunJobWithoutServicesSkipsJobCgroup(t *testing.T) {
 	}
 	if strings.Contains(readFakeLog(t, "FAKE_DOCKER_LOG"), "--cgroup-parent") {
 		t.Fatal("--cgroup-parent passed without a job cgroup")
+	}
+}
+
+// TestRunJobCgroupOwnershipFailureRollsBackBeforeContainers: when the
+// ownership record for the freshly created cgroup cannot be written, the
+// cgroup is removed immediately and NO service or job container may run —
+// nothing externally visible survives without a durable owner.
+func TestRunJobCgroupOwnershipFailureRollsBackBeforeContainers(t *testing.T) {
+	installFakeBins(t)
+	ws := t.TempDir()
+	t.Setenv("FAKE_WS", ws)
+	setFakeWS(t, ws)
+	cleaned := 0
+	orig := jobCgroupSetup
+	jobCgroupSetup = func(context.Context, jobCgroupRequest) (JobCgroupStatus, func() error) {
+		return JobCgroupStatus{Enabled: true, Parent: "/kiwi-job-ownership-test", Detail: "stub"}, func() error {
+			cleaned++
+			return nil
+		}
+	}
+	t.Cleanup(func() { jobCgroupSetup = orig })
+
+	sink := &covSink{}
+	services := []pipeline.Service{{Name: "db", Image: "postgres:16"}}
+	spec := &pipeline.Spec{Version: 1, Jobs: map[string]pipeline.Job{
+		"build": {Runtime: "container", Image: "alpine:3.19", Services: services, Steps: []pipeline.Step{{Run: "echo hi"}}},
+	}}
+	j := pipeline.CompiledJob{ID: "build", BaseID: "build", Job: pipeline.Job{
+		Runtime:   "container",
+		Image:     "alpine:3.19",
+		Resources: pipeline.Resources{CPU: 2, Memory: 4 << 30, PIDs: 512},
+		Services:  services,
+		Steps:     []pipeline.Step{{Run: "echo hi"}},
+	}}
+	ex := &Executor{Opt: Options{Workspace: ws, RunID: "r", Logs: sink,
+		OnCgroupCreated: func(string) error { return errors.New("ledger unavailable") }}, Masker: &secrets.Masker{}}
+	res := ex.runJob(context.Background(), spec, j, "success", nil)
+	if res.Status != "failure" || !strings.Contains(res.Error, "record job cgroup ownership") {
+		t.Fatalf("runJob = %q / %q, want an ownership failure", res.Status, res.Error)
+	}
+	if cleaned != 1 {
+		t.Fatalf("cgroup cleanups = %d, want 1 (rollback)", cleaned)
+	}
+	if runs := runLines(readFakeLog(t, "FAKE_DOCKER_LOG")); len(runs) != 0 {
+		t.Fatalf("containers ran without an owned cgroup: %v", runs)
 	}
 }

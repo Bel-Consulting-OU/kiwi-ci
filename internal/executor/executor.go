@@ -45,7 +45,7 @@ type Options struct {
 	// OnCgroupCreated, when set, receives the job-scoped cgroup path as soon
 	// as it exists so the caller (the runner's runtime ledger) can reclaim it
 	// after a hard crash.
-	OnCgroupCreated func(parent string)
+	OnCgroupCreated func(parent string) error
 	// OnRuntimeCloseError, when set, is called when the runtime backend could
 	// NOT prove its resource removed (for example docker rm failed). The
 	// caller must then RETAIN the workspace, quota and crash-recovery ledger
@@ -642,7 +642,17 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		if cgStatus.Enabled && cgCleanup != nil {
 			cgroupParent = cgStatus.Parent
 			if e.Opt.OnCgroupCreated != nil {
-				e.Opt.OnCgroupCreated(cgStatus.Parent)
+				if hookErr := e.Opt.OnCgroupCreated(cgStatus.Parent); hookErr != nil {
+					// Ownership could not be durably recorded: remove the
+					// just-created cgroup before anything can run in it and
+					// fail the job (never keep an unowned external cgroup).
+					if cerr := cgCleanup(); cerr != nil {
+						e.log(cj.ID, "service", "job cgroup rollback after ownership failure: "+cerr.Error())
+					}
+					res.Status = model.StatusFailure
+					res.Error = fmt.Sprintf("record job cgroup ownership: %v", hookErr)
+					return finish(res)
+				}
 			}
 			// Registered before the services/backend cleanup defers below,
 			// so it runs AFTER the containers are gone (LIFO).

@@ -136,7 +136,10 @@ func WorkspaceDiskQuotaSetup(workspace string, limit int64) (DiskQuotaStatus, fu
 // ownership (the runner's runtime ledger) therefore records the coordinates
 // before any external side effect exists, closing the crash window between
 // assignment and record entirely.
-func WorkspaceDiskQuotaSetupWithHook(workspace string, limit int64, onAllocated func(WorkspaceQuotaAssignment)) (DiskQuotaStatus, func() error) {
+// The callback returns an error when ownership cannot be durably recorded:
+// the assignment command MUST NOT run, and the error is surfaced so the
+// caller refuses to populate the workspace the quota was supposed to bound.
+func WorkspaceDiskQuotaSetupWithHook(workspace string, limit int64, onAllocated func(WorkspaceQuotaAssignment) error) (DiskQuotaStatus, func() error, error) {
 	return workspaceDiskQuotaSetupWithHook(workspace, limit, onAllocated)
 }
 
@@ -568,12 +571,13 @@ func parseXFSProjectIDs(out []byte) []uint32 {
 // can inherit it. On any failure before the limit was applied, the
 // half-applied state is removed and the ID released (best effort).
 func setupXFSProjectQuotaOnMount(workspace string, entry mountInfoEntry, limit int64, xq string) (DiskQuotaStatus, func() error) {
-	return setupXFSProjectQuotaOnMountHook(workspace, entry, limit, xq, nil)
+	status, cleanup, _ := setupXFSProjectQuotaOnMountHook(workspace, entry, limit, xq, nil)
+	return status, cleanup
 }
 
 // setupXFSProjectQuotaOnMountHook is setupXFSProjectQuotaOnMount plus the
 // pre-assignment allocation callback (see WorkspaceDiskQuotaSetupWithHook).
-func setupXFSProjectQuotaOnMountHook(workspace string, entry mountInfoEntry, limit int64, xq string, onAllocated func(WorkspaceQuotaAssignment)) (DiskQuotaStatus, func() error) {
+func setupXFSProjectQuotaOnMountHook(workspace string, entry mountInfoEntry, limit int64, xq string, onAllocated func(WorkspaceQuotaAssignment) error) (DiskQuotaStatus, func() error, error) {
 	fsKey := entry.fsKey()
 	// Multi-process safety: the whole acquire sequence — report existing IDs,
 	// choose a candidate, assign the workspace and apply the hard limit — runs
@@ -582,23 +586,28 @@ func setupXFSProjectQuotaOnMountHook(workspace string, entry mountInfoEntry, lim
 	// (or a previous incarnation) is respected.
 	unlock, lerr := lockXFSAllocation(fsKey)
 	if lerr != nil {
-		return DiskQuotaStatus{Detail: "lock XFS project allocator: " + lerr.Error()}, nil
+		return DiskQuotaStatus{Detail: "lock XFS project allocator: " + lerr.Error()}, nil, nil
 	}
 	defer unlock()
 	if err := refreshXFSProjectIDs(xq, entry.mountPoint, fsKey); err != nil {
-		return DiskQuotaStatus{Detail: "enumerate existing XFS project ids: " + err.Error()}, nil
+		return DiskQuotaStatus{Detail: "enumerate existing XFS project ids: " + err.Error()}, nil, nil
 	}
 	projID, err := allocateXFSProjectID(fsKey)
 	if err != nil {
-		return DiskQuotaStatus{Detail: "allocate XFS project id: " + err.Error()}, nil
+		return DiskQuotaStatus{Detail: "allocate XFS project id: " + err.Error()}, nil, nil
 	}
 	assignment := WorkspaceQuotaAssignment{
 		Workspace: workspace, MountPoint: entry.mountPoint, FsKey: fsKey, XQ: xq, ProjectID: projID,
 	}
 	if onAllocated != nil {
 		// Ownership is recorded BEFORE the assignment becomes externally
-		// visible, so a crash at any later point is reclaimable.
-		onAllocated(assignment)
+		// visible, so a crash at any later point is reclaimable. A failed
+		// record aborts BEFORE the assignment command: nothing external
+		// exists, so there is nothing to roll back and nothing to leak.
+		if hookErr := onAllocated(assignment); hookErr != nil {
+			return DiskQuotaStatus{Detail: "record workspace quota ownership: " + hookErr.Error()}, nil,
+				fmt.Errorf("record workspace quota ownership: %w", hookErr)
+		}
 	}
 	if err := runXFSQuotaCommand(xq, entry.mountPoint, xfsProjectAssignCommand(workspace, projID)); err != nil {
 		// An external-command error is NOT proof the side effect did not
@@ -611,18 +620,18 @@ func setupXFSProjectQuotaOnMountHook(workspace string, entry mountInfoEntry, lim
 		// (quarantined) even if that leaks one ID — false retention is much
 		// safer than reuse against ambiguous filesystem state.
 		if cerr := runXFSProjectCleanup(xq, entry.mountPoint, workspace, projID, fsKey); cerr != nil {
-			return DiskQuotaStatus{Detail: fmt.Sprintf("assign XFS project quota: %v (cleanup also failed, the project id stays allocated: %v)", err, cerr)}, nil
+			return DiskQuotaStatus{Detail: fmt.Sprintf("assign XFS project quota: %v (cleanup also failed, the project id stays allocated: %v)", err, cerr)}, nil, nil
 		}
-		return DiskQuotaStatus{Detail: "assign XFS project quota: " + err.Error()}, nil
+		return DiskQuotaStatus{Detail: "assign XFS project quota: " + err.Error()}, nil, nil
 	}
 	if err := runXFSQuotaCommand(xq, entry.mountPoint, xfsProjectLimitCommand(limit, projID)); err != nil {
 		// Leave nothing half-applied: drop the project assignment again with
 		// the same cleanup used on the normal path (it names the ID and
 		// releases it only when both commands succeed).
 		if cerr := runXFSProjectCleanup(xq, entry.mountPoint, workspace, projID, fsKey); cerr != nil {
-			return DiskQuotaStatus{Detail: fmt.Sprintf("apply XFS project hard limit: %v (cleanup also failed, the project id stays allocated: %v)", err, cerr)}, nil
+			return DiskQuotaStatus{Detail: fmt.Sprintf("apply XFS project hard limit: %v (cleanup also failed, the project id stays allocated: %v)", err, cerr)}, nil, nil
 		}
-		return DiskQuotaStatus{Detail: "apply XFS project hard limit: " + err.Error()}, nil
+		return DiskQuotaStatus{Detail: "apply XFS project hard limit: " + err.Error()}, nil, nil
 	}
 	cleanup := func() error {
 		return runXFSProjectCleanup(xq, entry.mountPoint, workspace, projID, fsKey)
@@ -632,7 +641,7 @@ func setupXFSProjectQuotaOnMountHook(workspace string, entry mountInfoEntry, lim
 		Limit:      limit,
 		Assignment: &assignment,
 		Detail:     fmt.Sprintf("XFS project quota %d enforces a hard %d-byte bound on %s (mount %s)", projID, limit, workspace, entry.mountPoint),
-	}, cleanup
+	}, cleanup, nil
 }
 
 // runXFSProjectCleanup removes the assignment and the hard limit for projID,

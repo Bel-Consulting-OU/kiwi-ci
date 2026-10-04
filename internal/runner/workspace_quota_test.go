@@ -30,7 +30,7 @@ func (l *quotaEventLog) add(event string) { l.events = append(l.events, event) }
 func stubWorkspaceQuota(t *testing.T, status executor.DiskQuotaStatus, log *quotaEventLog, installs, cleanups *int, limitSeen *int64, dirSeen *string) {
 	t.Helper()
 	orig := installWorkspaceDiskQuota
-	installWorkspaceDiskQuota = func(workspace string, limit int64, _ func(executor.WorkspaceQuotaAssignment)) (executor.DiskQuotaStatus, func() error) {
+	installWorkspaceDiskQuota = func(workspace string, limit int64, _ func(executor.WorkspaceQuotaAssignment) error) (executor.DiskQuotaStatus, func() error, error) {
 		*installs++
 		*limitSeen = limit
 		*dirSeen = workspace
@@ -38,7 +38,7 @@ func stubWorkspaceQuota(t *testing.T, status executor.DiskQuotaStatus, log *quot
 			log.add("quota-install")
 		}
 		if !status.Hard {
-			return status, nil
+			return status, nil, nil
 		}
 		return status, func() error {
 			*cleanups++
@@ -46,7 +46,7 @@ func stubWorkspaceQuota(t *testing.T, status executor.DiskQuotaStatus, log *quot
 				log.add("quota-cleanup")
 			}
 			return nil
-		}
+		}, nil
 	}
 	t.Cleanup(func() { installWorkspaceDiskQuota = orig })
 }

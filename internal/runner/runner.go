@@ -32,6 +32,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cache"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executor"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/logging"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
@@ -454,14 +455,26 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err := validateServerURL(r.Cfg.Server); err != nil {
 		return err
 	}
-	if r.ID == "" {
-		id, err := newRunnerID()
-		if err != nil {
-			return err
-		}
-		r.ID = id
-	}
 	r.resolveIdentityDir()
+	if r.ID == "" {
+		if r.Cfg.Cert == "" && r.Cfg.EnrollToken == "" {
+			// Bearer-token mode has no certificate identity: persist a
+			// stable runner id so restarts reuse the SAME identity. The
+			// runtime ledger namespace, audit history and server-side
+			// incarnation supersession all key on it.
+			id, err := r.persistedBearerRunnerID()
+			if err != nil {
+				return err
+			}
+			r.ID = id
+		} else {
+			id, err := newRunnerID()
+			if err != nil {
+				return err
+			}
+			r.ID = id
+		}
+	}
 	// One stable runner identity may have at most ONE live process: without
 	// this, a copied/mounted identity directory could start a second process
 	// whose startup reconciliation (same runner ID, different instance ID)
@@ -621,12 +634,19 @@ func (r *Runner) Run(ctx context.Context) error {
 	if rep.Containers > 0 || rep.Networks > 0 || rep.VMs > 0 {
 		fmt.Fprintf(os.Stderr, "kiwi runner %s: reconciled previous incarnation runtime: %d container(s), %d network(s), %d VM(s)\n", r.ID, rep.Containers, rep.Networks, rep.VMs)
 	}
-	// Reclaim host state recorded by previous incarnations (workspaces,
-	// artifact scratch, XFS quota assignments, cgroups) AFTER the runtime
-	// resources are proven gone and BEFORE leasing new work. A failed reclaim
-	// keeps its ledger entry for the next run.
-	if reclaimed := r.reconcileRuntimeLedger(runInstanceID); reclaimed > 0 {
-		fmt.Fprintf(os.Stderr, "kiwi runner %s: reclaimed %d crashed job resource(s)\n", r.ID, reclaimed)
+	// Reclaim host state recorded by previous incarnations of THIS runner
+	// (workspaces, artifact scratch, XFS quota assignments, cgroups) AFTER
+	// the runtime resources are proven gone and BEFORE leasing new work. A
+	// failed reclaim or an unreadable entry is unresolved recovery debt and
+	// REFUSES new leasing, mirroring runtime reconciliation: the runner must
+	// never lease past state it cannot prove it cleaned up.
+	lres, lerr := r.reconcileRuntimeLedger(runInstanceID)
+	if lerr != nil {
+		stop()
+		return fmt.Errorf("runner %s: crash-recovery ledger has unresolved debt; refusing to lease new work: %w", r.ID, lerr)
+	}
+	if lres.Reclaimed > 0 {
+		fmt.Fprintf(os.Stderr, "kiwi runner %s: reclaimed %d crashed job resource(s)\n", r.ID, lres.Reclaimed)
 	}
 	lastPrewarm := time.Now()
 	lastGC := time.Now()
@@ -782,6 +802,16 @@ func (r *Runner) register(ctx context.Context) error {
 	}
 	r.ID = out.ID
 	r.incarnation = out.Incarnation
+	if r.Cfg.Cert == "" && r.Cfg.EnrollToken == "" && validRunnerIDShape(r.ID) {
+		// The server may normalize the identity; record the authoritative
+		// value so the next restart re-registers under the same identity. A
+		// non-conforming claimed id (test harnesses, custom tooling) is
+		// never written to the identity file: the file holds only ids this
+		// runner can regenerate/verify.
+		if perr := r.persistBearerRunnerID(r.ID); perr != nil {
+			return fmt.Errorf("persist runner identity: %w", perr)
+		}
+	}
 	// Capability intersection: the profile capabilities in the response are
 	// the ceiling; the runner advertises (and enforces) only the
 	// intersection with what this host actually discovered, so a job
@@ -1062,7 +1092,15 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// Durable ownership BEFORE the workspace becomes visible to the job: a
 	// hard crash leaves this ledger entry for the next incarnation to reclaim
 	// (the deferred removals never run on SIGKILL).
-	ledgerID := r.ledgerAdd(runtimeLedgerEntry{Instance: r.instanceID, JobID: t.Job.ID, Workspace: tmp})
+	ledgerID, ledgerErr := r.ledgerAdd(runtimeLedgerEntry{Instance: r.instanceID, JobID: t.Job.ID, Workspace: tmp})
+	if ledgerErr != nil {
+		// No durable ownership record means a crash here would leak the
+		// workspace unreclaimably: refuse before any checkout or external
+		// resource creation.
+		_ = os.RemoveAll(tmp)
+		r.complete(parent, t, model.StatusFailure, fmt.Errorf("crash-recovery ledger: %w", ledgerErr), nil)
+		return
+	}
 	untrusted := !t.Job.Trusted
 	requireDiskQuota := untrusted && !executor.AllowUnquotaedUntrustedDisk()
 	// The workspace quota lifecycle is OWNED by execute, not by the backend:
@@ -1077,18 +1115,24 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	var workspaceQuota *executor.DiskQuotaStatus
 	var quotaCleanup func() error
 	if quotaLimit > 0 {
-		status, cleanup := installWorkspaceDiskQuota(tmp, quotaLimit, func(a executor.WorkspaceQuotaAssignment) {
+		status, cleanup, setupErr := installWorkspaceDiskQuota(tmp, quotaLimit, func(a executor.WorkspaceQuotaAssignment) error {
 			// The callback runs BEFORE the assignment command: ownership is
 			// durable before the project ID becomes externally visible, so a
-			// crash at any later point is reclaimable.
+			// crash at any later point is reclaimable. A failed record aborts
+			// the installation entirely — nothing external exists to leak.
 			a.Workspace = tmp
-			r.ledgerSetXFS(ledgerID, &a)
+			return r.ledgerSetXFS(ledgerID, &a)
 		})
+		if setupErr != nil {
+			// No workspace may be populated (checkout, dependency restore)
+			// without the hard bound its ledger ownership record exists for.
+			r.ledgerRemove(ledgerID)
+			_ = os.RemoveAll(tmp)
+			r.complete(parent, t, model.StatusFailure, fmt.Errorf("workspace disk quota ownership: %w", setupErr), nil)
+			return
+		}
 		workspaceQuota = &status
 		quotaCleanup = cleanup
-		if status.Assignment != nil {
-			r.ledgerSetXFS(ledgerID, status.Assignment)
-		}
 	}
 	// Runtime teardown may fail to prove container removal; the callback sets
 	// this so the deferred cleanup RETAINS the workspace, the XFS quota and
@@ -1371,6 +1415,13 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 			r.complete(parent, t, model.StatusFailure, fmt.Errorf("artifact capture directory: %w", derr), nil)
 			return
 		}
+		if lerr := r.ledgerAddArtifacts(ledgerID, d); lerr != nil {
+			// The scratch tree must be crash-reclaimable before it can hold
+			// data: refuse and remove it otherwise.
+			_ = os.RemoveAll(d)
+			r.complete(parent, t, model.StatusFailure, fmt.Errorf("artifact capture ledger: %w", lerr), nil)
+			return
+		}
 		captureDir = d
 		// The capture directory is per job and always removed; a leftover
 		// only survives a hard runner crash, exactly like a job workspace.
@@ -1393,7 +1444,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// require image references pinned by digest. The untrusted floor is
 	// unconditional here: nothing may override RequireImmutableImages for
 	// an untrusted job.
-	opts := executor.Options{Workspace: tmp, RunID: t.Job.RunID, RunnerID: r.ID, InstanceID: r.instanceID, Event: t.Job.Event, Branch: branchFromRef(t.Job.Ref), ChangedFiles: resolvedChangedFiles, SecretProvider: provider, Logs: logging.Func(func(job, step, line string) { sink.WriteLine(job, step, line) }), Cache: cacheStore, Artifacts: artifactStore, ArtifactReporter: reporter, DependencyStatus: t.Job.DependencyStatus, NeedsOutputs: t.Job.NeedsOutputs, CacheNamespace: cacheNamespace(t.Job), RequireImmutableImages: !t.Job.Trusted, LifecycleContext: parent}
+	opts := executor.Options{Workspace: tmp, RunID: t.Job.RunID, RunnerID: r.ID, InstanceID: r.instanceID, Event: t.Job.Event, Branch: branchFromRef(t.Job.Ref), ChangedFiles: resolvedChangedFiles, SecretProvider: provider, Logs: logging.Func(func(job, step, line string) { sink.WriteLine(job, step, line) }), Cache: cacheStore, Artifacts: artifactStore, ArtifactReporter: reporter, DependencyStatus: t.Job.DependencyStatus, NeedsOutputs: t.Job.NeedsOutputs, CacheNamespace: cacheNamespace(t.Job), RequireImmutableImages: !t.Job.Trusted, LifecycleContext: parent, OnCgroupCreated: func(parent string) error { return r.ledgerSetCgroup(ledgerID, parent) }}
 	if artifactStore != nil {
 		// Capture is bounded by the job context while it is alive (so a job
 		// that exceeds its declared lifetime stops publishing) and by the
@@ -1433,7 +1484,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// in depth and never re-probes when execute reported one.
 	opts.RequireUntrustedDiskQuota = requireDiskQuota
 	opts.WorkspaceQuota = workspaceQuota
-	opts.OnCgroupCreated = func(parent string) { r.ledgerSetCgroup(ledgerID, parent) }
+
 	opts.OnRuntimeCloseError = func(error) { runtimeCloseFailed = true }
 	// Step durations come from the executor's wall-clock step measurements
 	// (StepReporter), never from sink-derived log timing.
@@ -3183,4 +3234,71 @@ func truncationMarker(truncated bool) string {
 		return " [output truncated]"
 	}
 	return ""
+}
+
+// bearerRunnerIDPath is the persisted stable-identity file for bearer-token
+// mode. The name keys a distinct identity per runner name so two runners on
+// one host never share an identity file (which would make the server
+// supersede their sessions); an unnamed runner uses the single default.
+func (r *Runner) bearerRunnerIDPath() string {
+	base := strings.TrimSpace(r.Cfg.IdentityDir)
+	if base == "" {
+		base = strings.TrimSpace(r.Cfg.StateDir)
+	}
+	if base == "" {
+		home, _ := os.UserHomeDir()
+		base = filepath.Join(home, ".kiwi")
+	}
+	name := strings.TrimSpace(r.Cfg.Name)
+	if name == "" {
+		return filepath.Join(base, "runner-id")
+	}
+	sum := sha256.Sum256([]byte(name))
+	return filepath.Join(base, "runner-id-"+hex.EncodeToString(sum[:8]))
+}
+
+// persistedBearerRunnerID loads the stable runner id or creates it. A
+// present-but-invalid file is FATAL: regenerating would orphan the ledger
+// namespace and audit history under the old identity.
+func (r *Runner) persistedBearerRunnerID() (string, error) {
+	path := r.bearerRunnerIDPath()
+	if b, err := os.ReadFile(path); err == nil {
+		id := strings.TrimSpace(string(b))
+		if !validRunnerIDShape(id) {
+			return "", fmt.Errorf("runner identity file %s is corrupt; remove it only if you accept a new runner identity", path)
+		}
+		return id, nil
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("read runner identity file: %w", err)
+	}
+	id, err := newRunnerID()
+	if err != nil {
+		return "", err
+	}
+	if err := r.persistBearerRunnerID(id); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+func (r *Runner) persistBearerRunnerID(id string) error {
+	path := r.bearerRunnerIDPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return fsutil.AtomicWriteFile(path, []byte(id+"\n"), 0o600)
+}
+
+// validRunnerIDShape pins the identity format (32 lowercase hex chars).
+func validRunnerIDShape(id string) bool {
+	if len(id) != 32 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
