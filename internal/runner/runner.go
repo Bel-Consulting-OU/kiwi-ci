@@ -3248,7 +3248,7 @@ func (r *Runner) bearerRunnerIDPath() (string, error) {
 	if base == "" {
 		home, err := os.UserHomeDir()
 		if err != nil || strings.TrimSpace(home) == "" {
-			return "", fmt.Errorf("runner identity: no identity/state dir and no home directory to persist it in")
+			return "", fmt.Errorf("runner identity: no identity or state directory configured and no home directory to persist the runner identity in")
 		}
 		base = filepath.Join(home, ".kiwi")
 	}
