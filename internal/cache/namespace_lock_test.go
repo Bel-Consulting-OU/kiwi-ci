@@ -99,7 +99,13 @@ func TestCacheNamespaceHelperProcess(t *testing.T) {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(3)
 		}
-		_ = m
+		// Pin the manager for the PROCESS lifetime. The exclusive flock is
+		// held through the manager's *os.File, whose finalizer closes the
+		// descriptor when the manager becomes unreachable: without this
+		// reference a GC under load would release the lock while the holder
+		// process is still alive, and the "second process" assertion below
+		// would flake.
+		helperHeldManager = m
 		f, err := os.CreateTemp(root, ".live.tar.gz-*.tmp")
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -148,6 +154,10 @@ func startCacheHelper(t *testing.T, root, mode string) *exec.Cmd {
 	cmd.Env = append(os.Environ(), cacheHelperModeEnv+"="+mode, cacheHelperRootEnv+"="+root)
 	return cmd
 }
+
+// helperHeldManager pins the lock-holding manager of the hold-live-temp
+// helper process (see the helper's comment).
+var helperHeldManager *Manager
 
 // TestCacheNamespaceSecondProcessCannotReclaimLiveTemp is the critical
 // multi-process mutation test: process A holds the namespace and a live

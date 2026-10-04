@@ -1,6 +1,7 @@
 #!/bin/sh
-# docs-links-check.sh fails on relative Markdown links in every git-tracked
-# Markdown file whose local target does not exist, and on links whose
+# docs-links-check.sh fails on relative Markdown links in every Markdown
+# file (git-tracked in a git working tree, otherwise every Markdown file in
+# the snapshot workspace) whose local target does not exist, and on links whose
 # #fragment does not match a heading in the target Markdown file.
 #
 # Usage: scripts/docs-links-check.sh
@@ -24,9 +25,13 @@ export LC_ALL
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 cd "$ROOT"
 
-if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-	echo "docs-links-check: $ROOT is not a git working tree" >&2
-	exit 1
+# When running inside a git working tree, only git-tracked Markdown files are
+# checked (the CI contract). A kiwi local-run workspace is a snapshot without
+# .git, so fall back to every Markdown file present in the tree: the snapshot
+# content IS the workspace, and checking all of it is the equivalent gate.
+GIT_TREE=0
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+	GIT_TREE=1
 fi
 
 TMP="$(mktemp -d)"
@@ -114,7 +119,12 @@ AWK
 
 # Every tracked Markdown file is in scope; generated ones (for example
 # FILE_MAP.md) are cheap to scan and contain no relative links.
-git ls-files '*.md' > "$FILES"
+if [ "$GIT_TREE" = 1 ]; then
+	git ls-files '*.md' > "$FILES"
+else
+	# Snapshot workspace: every Markdown file except VCS/tooling trees.
+	find . -name '*.md' -not -path './.git/*' -not -path './node_modules/*' -not -path './vendor/*' -print | sed 's|^\./||' | sort > "$FILES"
+fi
 if [ ! -s "$FILES" ]; then
 	echo "docs-links-check: no tracked Markdown files under $ROOT" >&2
 	exit 1
