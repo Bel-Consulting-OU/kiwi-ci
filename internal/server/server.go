@@ -1485,6 +1485,11 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	in.identityBound = true
+	// Forge identity for status publication: the ingest derives it from the
+	// clone URL host (never from client JSON). A self-managed instance host
+	// is ambiguous, so the kind stays empty and nothing is published.
+	in.ForgeHost = forgeHostFromCloneURL(in.RepoURL)
+	in.ForgeKind = recognizedForgeKind(in.ForgeHost)
 	if !s.requireAction(w, r, auth.ActionRun, in.RepoID, false) {
 		return
 	}
@@ -5060,6 +5065,7 @@ func (s *Server) rerunRun(w http.ResponseWriter, r *http.Request) {
 	}
 	run, err := s.enqueue(r.Context(), SubmitRun{RepoID: repoID, PolicyRepoID: policyID, CheckoutRepoURL: checkoutURLForRun(old),
 		RepoURL: old.Repo, RepoFullName: old.RepoFullName, Ref: old.Ref, SHA: old.SHA, Event: old.Event, Pipeline: pipelineText,
+		ForgeKind: old.ForgeKind, ForgeHost: old.ForgeHost,
 		Trusted: rerunTrusted(r, old), Metadata: meta, identityBound: true})
 	if err != nil {
 		// A non-durable enqueue is answered like every other ingress (503 +
@@ -5124,6 +5130,7 @@ func (s *Server) rerunRunDB(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	run, err := s.enqueue(r.Context(), SubmitRun{RepoID: repoID, PolicyRepoID: policyID, CheckoutRepoURL: checkoutURLForRun(old),
 		RepoURL: old.Repo, RepoFullName: old.RepoFullName, Ref: old.Ref, SHA: old.SHA, Event: old.Event, Pipeline: pipelineText,
+		ForgeKind: old.ForgeKind, ForgeHost: old.ForgeHost,
 		Trusted: rerunTrusted(r, old), Metadata: meta, identityBound: true})
 	if err != nil {
 		// Same durability mapping as rerunRun: persistence failures answer

@@ -166,6 +166,9 @@ func TestGitHubWebhookMoreBranches(t *testing.T) {
 		if run.Event != "pull_request" || run.SHA != "headsha" {
 			t.Fatalf("bad run: %+v", run)
 		}
+		if run.ForgeKind != "github" || run.ForgeHost != "github.com" {
+			t.Fatalf("forge identity = %q/%q, want github/github.com", run.ForgeKind, run.ForgeHost)
+		}
 	})
 
 	t.Run("pull request ready_for_review", func(t *testing.T) {

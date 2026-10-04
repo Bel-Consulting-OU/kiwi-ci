@@ -170,6 +170,8 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 		Event:             ec.Event,
 		Pipeline:          content,
 		Trusted:           ec.Trusted,
+		ForgeKind:         "github",
+		ForgeHost:         forgeHostFromCloneURL(checkout),
 		ChangedFiles:      files,
 		ChangedFilesKnown: filesKnown,
 		Metadata:          map[string]string{"github_delivery": delivery, webhookDeliveryDigestKey("github"): digest},

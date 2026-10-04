@@ -345,6 +345,34 @@ func checkoutCloneURL(ec forge.EventContext) string {
 	return strings.TrimSpace(ec.Repository.CloneURL)
 }
 
+// forgeHostFromCloneURL returns the clone URL's host for the run's forge
+// identity (empty for an unparsable URL). The host is the forge coordinate
+// commit-status publication groups by, not a trust input.
+func forgeHostFromCloneURL(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
+}
+
+// recognizedForgeKind maps a WELL-KNOWN public forge host to its adapter
+// kind for direct submissions. Self-managed instances are ambiguous from a
+// bare host, so they stay unresolved (no status publication) unless the
+// ingress knows the delivering forge — webhook handlers always do.
+func recognizedForgeKind(host string) string {
+	h := strings.ToLower(strings.TrimSpace(host))
+	switch {
+	case h == "github.com" || strings.HasSuffix(h, ".github.com"):
+		return "github"
+	case h == "gitlab.com" || strings.HasSuffix(h, ".gitlab.com"):
+		return "gitlab"
+	case h == "codeberg.org" || strings.HasSuffix(h, ".codeberg.org"):
+		return "forgejo"
+	}
+	return ""
+}
+
 // repoTeamKey returns the quota team key of a canonical repository identity:
 // the forge host plus the owner segment. It delegates to the storage
 // derivation so every counter mutation uses the same key.

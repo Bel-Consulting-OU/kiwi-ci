@@ -672,3 +672,33 @@ jobs:
 		}
 	})
 }
+
+// TestWebhookRunsCarryForgeIdentity: the run's forge kind/host is what
+// commit-status publication gates on; webhook ingresses know the delivering
+// forge and must persist it (a missing identity silently disabled all forge
+// checks). Forgejo/GitLab share the handler shape, so the Forgejo push case
+// plus the GitHub PR case (github_squeeze_test.go) cover both wirings.
+func TestWebhookRunsCarryForgeIdentity(t *testing.T) {
+	api := (&hookAPI{}).server(t)
+	s := newForgejoSqueezeServer(t, api, "tok")
+
+	w := postForgejo(t, s, "tok", "push", "d-forge", forgejoPushEvent, false)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("forgejo push = %d: %s", w.Code, w.Body.String())
+	}
+	runID, _ := decodeRun(t, w)
+	s.mu.Lock()
+	run := s.runs[runID]
+	s.mu.Unlock()
+	if run.ForgeKind != "forgejo" {
+		t.Fatalf("forgejo run kind = %q, want forgejo", run.ForgeKind)
+	}
+	if run.ForgeHost != "forgejo.example" {
+		t.Fatalf("forgejo run host = %q, want forgejo.example", run.ForgeHost)
+	}
+	// A completion intent must be publishable: the identity the run carries
+	// is exactly what publishForgeStatus gates on.
+	if !s.forgePublishingConfigured(run.ForgeKind) {
+		t.Fatalf("forge publishing not configured for %q", run.ForgeKind)
+	}
+}
