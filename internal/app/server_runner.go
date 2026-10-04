@@ -1346,6 +1346,7 @@ func Runner(ctx context.Context, args []string) error {
 	metricsListen := fs.String("metrics-listen", "", "serve Prometheus text metrics on this address (e.g. :9091)")
 	sigstoreKey := fs.String("sigstore-key", "", "PKCS8 PEM Ed25519 private key for Sigstore artifact attestations (path or contents)")
 	workDir := fs.String("work-dir", "", "working directory for garbage-collection subprocesses (default: system temp)")
+	singleRunnerHost := fs.Bool("single-runner-host", false, "this host runs exactly one kiwi runner: allow age-based cleanup of UNLABELLED legacy runtime resources (unsafe on a shared host during a rolling upgrade)")
 	stagingDir := fs.String("staging-dir", "", "staging ROOT for bounded dependency spooling (default: the cache root); the runner stages inside <dir>/<runner instance id>")
 	stagingMaxBytes := fs.String("staging-max-bytes", "", "runner-wide staging byte budget for concurrent dependency restores (default: one maximum-size artifact, 8 GiB)")
 	setupTimeout := fs.Duration("setup-timeout", 0, "ceiling for the pre-execution setup phase of jobs without a persisted job timeout (default 15m)")
@@ -1393,6 +1394,7 @@ func Runner(ctx context.Context, args []string) error {
 		MetricsListen:        *metricsListen,
 		SigstoreKeyPath:      *sigstoreKey,
 		WorkDir:              *workDir,
+		SingleRunnerHost:     *singleRunnerHost,
 		StagingDir:           strings.TrimSpace(*stagingDir),
 		StagingMaxBytes:      stagingLimit,
 		SetupTimeout:         *setupTimeout,

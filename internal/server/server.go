@@ -142,10 +142,18 @@ type Server struct {
 	AuthStore *auth.TokenStore
 	AuthFile  string
 
-	mu          sync.Mutex
-	runs        map[string]model.Run
-	jobs        map[string]model.Job
-	runners     map[string]model.Runner
+	mu      sync.Mutex
+	runs    map[string]model.Run
+	jobs    map[string]model.Job
+	runners map[string]model.Runner
+	// runnerProto records the protocol negotiated at each runner's latest
+	// registration IN THIS PROCESS, and how many registrations this process
+	// has seen for that identity. Headerless compatibility (non-production)
+	// is granted to legacy (protocol <= 2) sessions and to a modern session
+	// that has never been superseded; once a modern identity re-registers, a
+	// headerless client can no longer ride either session (the split-brain
+	// the incarnation fence exists to stop).
+	runnerProto map[string]runnerRegInfo
 	artifacts   map[string]model.ArtifactRecord
 	reports     map[string]model.TestReport
 	deliveries  map[string]string
@@ -2554,6 +2562,47 @@ func (s *Server) acquireDigestFence(ctx context.Context, digest string) (func(),
 // registerResponse always carries the capability claim, even when it is an
 // empty (enforced) list: model.Runner's omitempty would drop an empty claim
 // and the runner would misread a profile-bound deny-all as "no restriction".
+// maxRunnerProtocol is the newest wire protocol the server implements.
+const maxRunnerProtocol = 3
+
+// runnerRegInfo is one runner's negotiated protocol and registration count
+// as observed by THIS process.
+type runnerRegInfo struct {
+	proto         int
+	registrations int
+}
+
+// runnerProtocol returns the protocol negotiated at this runner's latest
+// registration in THIS process (unknown means cross-replica or pre-upgrade).
+func (s *Server) runnerProtocol(runnerID string) (runnerRegInfo, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.runnerProto[runnerID]
+	return p, ok
+}
+
+// recordRunnerRegistration notes the protocol and increments the
+// registration count for a SUCCESSFUL registration only (a rejected
+// registration is not a supersession).
+func (s *Server) recordRunnerRegistration(runnerID string, proto int) {
+	s.setRunnerProtocol(runnerID, proto)
+}
+
+func (s *Server) setRunnerProtocol(runnerID string, p int) {
+	if p > maxRunnerProtocol {
+		p = maxRunnerProtocol
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.runnerProto == nil {
+		s.runnerProto = map[string]runnerRegInfo{}
+	}
+	info := s.runnerProto[runnerID]
+	info.proto = p
+	info.registrations++
+	s.runnerProto[runnerID] = info
+}
+
 type registerResponse struct {
 	model.Runner
 	Capabilities         []string `json:"capabilities"`
@@ -2787,6 +2836,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		in.Busy = in.Capacity > 0 && len(in.ActiveJobs) >= in.Capacity
 		in.Completed, in.Failed = old.Completed, old.Failed
 		s.auditLocked("runner.register", in.Name, "", "", "runner registered", nil)
+		s.recordRunnerRegistration(in.ID, in.ProtocolMax)
 		writeJSON(w, http.StatusOK, newRegisterResponse(in, s.RequireProfiles || hasProfile))
 		return
 	}
@@ -2832,6 +2882,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	// re-registers once the store heals.
 	s.persistCheckedLocked("runner.register")
 	s.mu.Unlock()
+	s.recordRunnerRegistration(in.ID, in.ProtocolMax)
 	writeJSON(w, http.StatusOK, newRegisterResponse(in, s.RequireProfiles || hasProfile))
 }
 
@@ -3317,10 +3368,28 @@ const RunnerIncarnationHeader = "X-Kiwi-Runner-Incarnation"
 // accept.
 func (s *Server) runnerIncarnationCurrent(ctx context.Context, runnerID, incarnation string) bool {
 	if strings.TrimSpace(incarnation) == "" {
-		// Production requires the wire incarnation so an attacker holding a
-		// copied credential cannot bypass supersession by dropping the
-		// header. Dev keeps the rolling-upgrade tolerance.
-		return !s.RequireRunnerIncarnation
+		// Compatibility is tied to the PROTOCOL the runner negotiated, not
+		// to header absence alone:
+		//  - production (RequireRunnerIncarnation) always requires the wire
+		//    incarnation, so a copied credential cannot bypass supersession;
+		//  - in compatibility mode a legacy (protocol <= 2) session keeps
+		//    the rolling-upgrade tolerance, while a MODERN session that has
+		//    ever been superseded refuses headerless requests: an old client
+		//    can neither ride the modern session nor re-register and keep
+		//    operating headerless (each re-registration advances the count).
+		if s.RequireRunnerIncarnation {
+			return false
+		}
+		info, ok := s.runnerProtocol(runnerID)
+		if !ok {
+			// Unknown to this process (pre-upgrade/pre-seeded): dev keeps
+			// the historical tolerance; production was handled above.
+			return true
+		}
+		if info.proto <= 2 {
+			return true
+		}
+		return info.registrations <= 1
 	}
 	if s.DB != nil {
 		cur, err := s.DB.GetRunner(ctx, runnerID)

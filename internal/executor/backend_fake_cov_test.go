@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -1122,10 +1123,10 @@ func TestSnapshotMkdirFailure(t *testing.T) {
 	}
 }
 
-// TestGCScopedNeverTouchesOtherRunners pins ownership safety: age GC reaps
-// legacy unlabelled and own-previous-incarnation resources, but a labelled
-// resource of ANOTHER runner (possibly a live long job on a shared daemon) is
-// never deleted.
+// TestGCScopedNeverTouchesOtherRunners pins ownership safety: with the
+// single-runner-host opt-in, age GC reaps legacy unlabelled and
+// own-previous-incarnation resources, but a labelled resource of ANOTHER
+// runner (possibly a live long job on a shared daemon) is never deleted.
 func TestGCScopedNeverTouchesOtherRunners(t *testing.T) {
 	installFakeBins(t)
 	root := t.TempDir()
@@ -1142,7 +1143,7 @@ func TestGCScopedNeverTouchesOtherRunners(t *testing.T) {
 	t.Setenv("FAKE_DOCKER_NET_LS", "net-other "+old+" "+otherRunner+" "+otherInstance)
 	t.Setenv("FAKE_DOCKER_LOG", filepath.Join(t.TempDir(), "docker.log"))
 
-	rep := GCScoped(context.Background(), root, "runner-A", "instance-current", time.Hour)
+	rep := GCScoped(context.Background(), root, "runner-A", "instance-current", time.Hour, true)
 	if rep.Containers != 2 || rep.Networks != 0 {
 		t.Fatalf("scoped GC report = %+v, want 2 containers / 0 networks", rep)
 	}
@@ -1159,5 +1160,68 @@ func TestGCScopedNeverTouchesOtherRunners(t *testing.T) {
 		if strings.Contains(string(logged), forbidden) {
 			t.Fatalf("scoped GC touched another runner's resource %q:\n%s", forbidden, logged)
 		}
+	}
+}
+
+// TestGCScopedUnknownOwnershipRequiresOptIn is the rolling-upgrade guard: an
+// unlabelled legacy resource older than the cutoff belongs to an old binary's
+// POSSIBLY LIVE long job, so the default must leave it alone; only the
+// explicit single-runner-host opt-in may remove it.
+func TestGCScopedUnknownOwnershipRequiresOptIn(t *testing.T) {
+	installFakeBins(t)
+	root := t.TempDir()
+	old := time.Now().Add(-48 * time.Hour).Format("2006-01-02 15:04:05 -0700 MST")
+	ownRunner := identityHash8("runner-A")
+	ownOld := identityHash8("instance-old")
+	t.Setenv("FAKE_DOCKER_PS", strings.Join([]string{
+		"legacy-live " + old, // unlabelled: MUST survive by default
+		"own-old " + old + " " + ownRunner + " " + ownOld,
+	}, "\n"))
+	t.Setenv("FAKE_DOCKER_LOG", filepath.Join(t.TempDir(), "docker.log"))
+
+	rep := GCScoped(context.Background(), root, "runner-A", "instance-current", time.Hour, false)
+	if rep.Containers != 1 {
+		t.Fatalf("default GC report = %+v, want only the own-previous incarnation", rep)
+	}
+	logged, _ := os.ReadFile(os.Getenv("FAKE_DOCKER_LOG"))
+	if strings.Contains(string(logged), "legacy-live") {
+		t.Fatalf("default GC deleted an unlabelled legacy resource:\n%s", logged)
+	}
+	if !strings.Contains(string(logged), "own-old") {
+		t.Fatalf("own-previous incarnation not reaped:\n%s", logged)
+	}
+}
+
+// TestReconcileRuntimeTartWithoutDocker is the pure-Tart (macOS) case: no
+// docker CLI must not skip Tart reconciliation.
+func TestReconcileRuntimeTartWithoutDocker(t *testing.T) {
+	installFakeBins(t)
+	root := t.TempDir()
+	// PATH contains the fake bin dir (tart) but no docker.
+	onlyTart := t.TempDir()
+	dockerPath, _ := exec.LookPath("docker")
+	if dockerPath == "" {
+		t.Fatal("fake docker missing")
+	}
+	for _, name := range []string{"tart", "ssh", "osascript", "pwsh"} {
+		if p, err := exec.LookPath(name); err == nil {
+			_ = os.Symlink(p, filepath.Join(onlyTart, name))
+		}
+	}
+	t.Setenv("PATH", onlyTart)
+	name := "kiwi-1234-0123456789abcdef-" + identityHash8("runner-A") + "-" + identityHash8("instance-previous")
+	t.Setenv("FAKE_TART_LIST", name)
+	t.Setenv("FAKE_TART_LOG", filepath.Join(t.TempDir(), "tart.log"))
+
+	rep, err := ReconcileRuntime(context.Background(), root, "runner-A", "instance-current")
+	if err != nil {
+		t.Fatalf("ReconcileRuntime without docker: %v", err)
+	}
+	if rep.VMs != 1 {
+		t.Fatalf("tart reconciliation without docker = %+v, want the stale VM reaped", rep)
+	}
+	logged, _ := os.ReadFile(os.Getenv("FAKE_TART_LOG"))
+	if !strings.Contains(string(logged), "delete "+name) {
+		t.Fatalf("stale Tart VM not deleted:\n%s", logged)
 	}
 }

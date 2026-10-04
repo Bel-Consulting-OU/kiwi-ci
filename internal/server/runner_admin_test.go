@@ -146,12 +146,17 @@ func TestRunnerDrainDisableEnable(t *testing.T) {
 		t.Fatalf("enable did not clear flags: %+v", r)
 	}
 
-	// Drain: no new work, header advertises the state.
+	// Drain: no new work, header advertises the state. The final next carries
+	// the CURRENT incarnation: the identity was re-registered above, so a
+	// headerless request is refused by the supersession fence.
 	w = c.do(http.MethodPost, "/api/v1/runners/"+id+"/drain", nil, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("drain: %d %s", w.Code, w.Body.String())
 	}
-	w = c.do(http.MethodPost, "/api/v1/runners/"+id+"/next", map[string]any{}, nil)
+	s.mu.Lock()
+	inc := s.runners[id].Incarnation
+	s.mu.Unlock()
+	w = c.do(http.MethodPost, "/api/v1/runners/"+id+"/next", map[string]any{}, map[string]string{RunnerIncarnationHeader: inc})
 	if w.Code != http.StatusNoContent || w.Header().Get("X-Kiwi-Draining") != "true" {
 		t.Fatalf("draining next: %d header=%q", w.Code, w.Header().Get("X-Kiwi-Draining"))
 	}

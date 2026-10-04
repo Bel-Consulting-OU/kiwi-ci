@@ -183,7 +183,11 @@ exit 0
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	r := &Runner{ID: "runner-1", Cfg: Config{Server: ts.URL, Poll: time.Millisecond, Concurrency: 1,
-		WorkDir: t.TempDir(), GCInterval: time.Hour, PrewarmInterval: time.Hour, IdentityDir: t.TempDir()},
+		WorkDir: t.TempDir(), GCInterval: time.Hour, PrewarmInterval: time.Hour, IdentityDir: t.TempDir(),
+		// The fake resource is unlabelled legacy: age-based removal requires
+		// the explicit single-runner-host opt-in under the rolling-upgrade
+		// safety rule.
+		SingleRunnerHost: true},
 		Client: ts.Client(), Metrics: NewMetrics()}
 	runDone := make(chan error, 1)
 	go func() { runDone <- r.Run(ctx) }()

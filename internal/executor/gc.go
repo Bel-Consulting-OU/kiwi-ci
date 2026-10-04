@@ -198,16 +198,24 @@ func boundedToolCommand(parent context.Context, timeout time.Duration, exe strin
 // NO runner-ownership label (pre-instance Kiwi) and are older than the
 // threshold. Prefer GCScoped from a live runner.
 func GC(ctx context.Context, root string, olderThan time.Duration) GCReport {
-	return GCScoped(ctx, root, "", "", olderThan)
+	// The operator-run backstop explicitly consents to legacy (unlabelled)
+	// cleanup: there is no live runner whose ownership could be mistaken.
+	return GCScoped(ctx, root, "", "", olderThan, true)
 }
 
 // GCScoped is the age-based backstop with OWNERSHIP SAFETY: a labelled
 // resource is reaped only when it belongs to THIS runner's stable ID but a
 // previous incarnation (startup reconciliation normally handles those
-// immediately) or when it carries no ownership label at all (legacy). Another
-// runner's labelled resources are NEVER touched, so a long-running job of a
-// sibling runner sharing the daemon cannot be killed by age.
-func GCScoped(ctx context.Context, root, runnerID, instanceID string, olderThan time.Duration) GCReport {
+// immediately). Another runner's labelled resources are NEVER touched, so a
+// long-running job of a sibling runner sharing the daemon cannot be killed by
+// age.
+//
+// UNKNOWN ownership (no runner/instance label, e.g. resources created by a
+// pre-ownership binary during a rolling upgrade) is NOT proof of abandonment:
+// age alone must never delete a live legacy job. Such resources are reaped
+// only when deleteLegacy is set — an explicit single-runner-host opt-in, or
+// the operator-invoked backstop — and otherwise stay for operator review.
+func GCScoped(ctx context.Context, root, runnerID, instanceID string, olderThan time.Duration, deleteLegacy bool) GCReport {
 	var rep GCReport
 	if ctx == nil {
 		ctx = context.Background()
@@ -230,13 +238,13 @@ func GCScoped(ctx context.Context, root, runnerID, instanceID string, olderThan 
 	}
 	if docker, err := exec.LookPath("docker"); err == nil {
 		out := output(docker, "ps", "-a", "--filter", "label=kiwi.run", "--format", `{{.ID}} {{.CreatedAt}} {{.Label "kiwi.runner"}} {{.Label "kiwi.instance"}}`)
-		for _, id := range parseScopedDocker(out, cutoff, runnerID, instanceID) {
+		for _, id := range parseScopedDocker(out, cutoff, runnerID, instanceID, deleteLegacy) {
 			if _, err := boundedToolCommand(ctx, gcCleanupTimeout, docker, "rm", "-f", id); err == nil {
 				rep.Containers++
 			}
 		}
 		out = output(docker, "network", "ls", "--filter", "label=kiwi.run", "--format", `{{.ID}} {{.CreatedAt}} {{.Label "kiwi.runner"}} {{.Label "kiwi.instance"}}`)
-		for _, id := range parseScopedDocker(out, cutoff, runnerID, instanceID) {
+		for _, id := range parseScopedDocker(out, cutoff, runnerID, instanceID, deleteLegacy) {
 			if _, err := boundedToolCommand(ctx, gcCleanupTimeout, docker, "network", "rm", id); err == nil {
 				rep.Networks++
 			}
@@ -244,7 +252,7 @@ func GCScoped(ctx context.Context, root, runnerID, instanceID string, olderThan 
 	}
 	if tart, err := exec.LookPath("tart"); err == nil {
 		out := output(tart, "list")
-		for _, name := range parseScopedTartVMs(out, cutoff, runnerID, instanceID) {
+		for _, name := range parseScopedTartVMs(out, cutoff, runnerID, instanceID, deleteLegacy) {
 			if _, err := boundedToolCommand(ctx, gcCleanupTimeout, tart, "delete", name); err == nil {
 				rep.VMs++
 			}
@@ -259,7 +267,7 @@ func GCScoped(ctx context.Context, root, runnerID, instanceID string, olderThan 
 // never returned. Docker renders missing labels as empty trailing columns, so
 // the label tags are peeled from the END only when the remaining prefix still
 // parses as a docker timestamp.
-func parseScopedDocker(out []byte, cutoff time.Time, runnerID, instanceID string) []string {
+func parseScopedDocker(out []byte, cutoff time.Time, runnerID, instanceID string, deleteLegacy bool) []string {
 	ownRunner := identityHash8(runnerID)
 	ownInstance := identityHash8(instanceID)
 	var stale []string
@@ -297,7 +305,11 @@ func parseScopedDocker(out []byte, cutoff time.Time, runnerID, instanceID string
 		}
 		switch {
 		case owner == "":
-			stale = append(stale, id) // legacy: no ownership label
+			// Unknown ownership: age is not proof of abandonment. Only an
+			// explicit legacy-cleanup opt-in may remove it.
+			if deleteLegacy {
+				stale = append(stale, id)
+			}
 		case runnerID != "" && owner == ownRunner && instance != ownInstance:
 			stale = append(stale, id)
 		}
@@ -308,7 +320,7 @@ func parseScopedDocker(out []byte, cutoff time.Time, runnerID, instanceID string
 // parseScopedTartVMs returns legacy (untagged) clones older than the cutoff
 // plus clones of THIS runner's previous incarnation. Other owners' clones are
 // never touched.
-func parseScopedTartVMs(out []byte, cutoff time.Time, runnerID, instanceID string) []string {
+func parseScopedTartVMs(out []byte, cutoff time.Time, runnerID, instanceID string, deleteLegacy bool) []string {
 	var stale []string
 	legacy := map[string]bool{}
 	for _, name := range parseTartVMs(out, cutoff) {
@@ -327,8 +339,9 @@ func parseScopedTartVMs(out []byte, cutoff time.Time, runnerID, instanceID strin
 		}
 		parts := strings.Split(name, "-")
 		if len(parts) < 4 {
-			// Legacy name: age-only (parseTartVMs already applied the cutoff).
-			if legacy[name] {
+			// Legacy name: age-only, allowed only under the explicit
+			// legacy-cleanup opt-in (parseTartVMs applied the cutoff).
+			if legacy[name] && deleteLegacy {
 				stale = append(stale, name)
 			}
 			continue
@@ -414,30 +427,32 @@ func ReconcileRuntime(ctx context.Context, root, runnerID, instanceID string) (G
 		}
 		return out, nil
 	}
-	docker, lookErr := exec.LookPath("docker")
-	if lookErr != nil {
-		return rep, nil
-	}
-	filter := "label=kiwi.runner=" + runnerID
-	out, err := output(docker, "ps", "-a", "--filter", filter, "--format", `{{.ID}} {{.Label "kiwi.instance"}}`)
-	if err != nil {
-		return rep, fmt.Errorf("cannot prove prior container absence: %w", err)
-	}
-	for _, id := range parseForeignInstances(out, instanceID) {
-		if _, err := boundedToolCommand(ctx, gcCleanupTimeout, docker, "rm", "-f", id); err != nil && !isContainerAbsentError(err) {
-			return rep, fmt.Errorf("cannot remove stale container %s: %w", id, err)
+	// Runtime subsystems are reconciled INDEPENDENTLY: a host without the
+	// docker CLI is a perfectly normal pure-Tart (macOS) configuration, and
+	// a missing docker binary must never skip Tart reconciliation — the
+	// crash-containment guarantee is per-subsystem.
+	if docker, lookErr := exec.LookPath("docker"); lookErr == nil {
+		filter := "label=kiwi.runner=" + runnerID
+		out, err := output(docker, "ps", "-a", "--filter", filter, "--format", `{{.ID}} {{.Label "kiwi.instance"}}`)
+		if err != nil {
+			return rep, fmt.Errorf("cannot prove prior container absence: %w", err)
 		}
-		rep.Containers++
-	}
-	out, err = output(docker, "network", "ls", "--filter", filter, "--format", `{{.ID}} {{.Label "kiwi.instance"}}`)
-	if err != nil {
-		return rep, fmt.Errorf("cannot prove prior network absence: %w", err)
-	}
-	for _, id := range parseForeignInstances(out, instanceID) {
-		if _, err := boundedToolCommand(ctx, gcCleanupTimeout, docker, "network", "rm", id); err != nil {
-			return rep, fmt.Errorf("cannot remove stale network %s: %w", id, err)
+		for _, id := range parseForeignInstances(out, instanceID) {
+			if _, err := boundedToolCommand(ctx, gcCleanupTimeout, docker, "rm", "-f", id); err != nil && !isContainerAbsentError(err) {
+				return rep, fmt.Errorf("cannot remove stale container %s: %w", id, err)
+			}
+			rep.Containers++
 		}
-		rep.Networks++
+		out, err = output(docker, "network", "ls", "--filter", filter, "--format", `{{.ID}} {{.Label "kiwi.instance"}}`)
+		if err != nil {
+			return rep, fmt.Errorf("cannot prove prior network absence: %w", err)
+		}
+		for _, id := range parseForeignInstances(out, instanceID) {
+			if _, err := boundedToolCommand(ctx, gcCleanupTimeout, docker, "network", "rm", id); err != nil {
+				return rep, fmt.Errorf("cannot remove stale network %s: %w", id, err)
+			}
+			rep.Networks++
+		}
 	}
 	// Tart: clones encode the runner/instance ownership in their names.
 	if tart, terr := exec.LookPath("tart"); terr == nil && instanceID != "" {

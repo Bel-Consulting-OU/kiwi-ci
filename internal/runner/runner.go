@@ -227,6 +227,12 @@ type Config struct {
 	// its certificate stays valid; an expired or revoked certificate is
 	// re-enrolled once under the same runner ID.
 	EnrollToken string
+	// SingleRunnerHost declares that THIS host runs exactly one kiwi
+	// runner, making age-based cleanup of UNLABELLED legacy runtime
+	// resources safe. Without it, unknown ownership is never deleted by the
+	// periodic GC: during a rolling upgrade an old binary's live long job
+	// carries no ownership label, and age is not proof of abandonment.
+	SingleRunnerHost bool
 	// IdentityDir is the directory for the persisted enrollment identity
 	// (default: ~/.kiwi/runner).
 	IdentityDir string
@@ -3000,7 +3006,7 @@ func (r *Runner) runGCPass(ctx context.Context) executor.GCReport {
 	// are the primary cadences.
 	r.maintainStaging(ctx)
 	r.pruneJobCache(ctx)
-	rep := executor.GCScoped(ctx, r.Cfg.WorkDir, r.ID, r.instanceID, gcOlderThan)
+	rep := executor.GCScoped(ctx, r.Cfg.WorkDir, r.ID, r.instanceID, gcOlderThan, r.Cfg.SingleRunnerHost)
 	if rep.Containers > 0 || rep.Networks > 0 || rep.VMs > 0 {
 		reportf("kiwi runner %s: gc removed %d containers, %d networks, %d VMs\n", r.ID, rep.Containers, rep.Networks, rep.VMs)
 	}
@@ -3155,8 +3161,12 @@ func (r *Runner) enroll(ctx context.Context, caPEM, csrPEM []byte) (*server.Enro
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		bb, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("enroll: %s: %s", resp.Status, bb)
+		// Bounded and sanitized: the error body is chosen by a possibly
+		// malicious or broken reverse proxy, and a multi-gigabyte 4xx/5xx
+		// must not be buffered into the runner's memory (the HTTP timeout
+		// bounds duration, not bytes).
+		bb, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("enroll: %s: %s", resp.Status, sanitizeControlBytes(bb))
 	}
 	var out server.EnrollResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxControlResponseBytes)).Decode(&out); err != nil {
@@ -3310,4 +3320,19 @@ func validRunnerIDShape(id string) bool {
 		}
 	}
 	return true
+}
+
+// sanitizeControlBytes renders an untrusted diagnostic body printable:
+// control characters (including newlines and ESC) become spaces so a hostile
+// response cannot inject multi-line log entries or terminal sequences.
+func sanitizeControlBytes(b []byte) string {
+	out := make([]byte, 0, len(b))
+	for _, c := range b {
+		if c < 0x20 || c == 0x7f {
+			out = append(out, ' ')
+			continue
+		}
+		out = append(out, c)
+	}
+	return strings.TrimSpace(string(out))
 }

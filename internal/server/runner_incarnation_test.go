@@ -69,9 +69,12 @@ func TestRunnerIncarnationSupersedesOldSession(t *testing.T) {
 	if code := next(second); code == http.StatusConflict {
 		t.Fatalf("current incarnation refused: %d", code)
 	}
-	// Legacy runners during a rolling upgrade omit the header: accepted.
-	if code := next(""); code == http.StatusConflict {
-		t.Fatalf("headerless legacy poll = %d, want accepted", code)
+	// Compatibility is tied to the negotiated PROTOCOL: this runner
+	// negotiated protocol 3, so a headerless (legacy-style) request is
+	// refused — an old client cannot ride a superseded modern session by
+	// dropping the header.
+	if code := next(""); code != http.StatusConflict {
+		t.Fatalf("protocol-3 headerless poll = %d, want 409", code)
 	}
 	// The heartbeat gate uses the same authority.
 	ctx := context.Background()
@@ -81,8 +84,86 @@ func TestRunnerIncarnationSupersedesOldSession(t *testing.T) {
 	if !s.runnerIncarnationCurrent(ctx, runnerID, second) {
 		t.Fatal("current incarnation rejected")
 	}
-	if !s.runnerIncarnationCurrent(ctx, runnerID, "") {
-		t.Fatal("headerless legacy heartbeat rejected")
+	if s.runnerIncarnationCurrent(ctx, runnerID, "") {
+		t.Fatal("protocol-3 headerless heartbeat accepted")
+	}
+}
+
+// registerProtoAt registers runnerID with the given protocol range.
+func registerProtoAt(t *testing.T, s *Server, runnerID string, min, max int) string {
+	t.Helper()
+	body, _ := json.Marshal(map[string]any{
+		"id": runnerID, "name": "r", "capacity": 1,
+		"protocol_min": min, "protocol_max": max,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/runners/register", strings.NewReader(string(body)))
+	req.Header.Set("Authorization", "Bearer runner-tok")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("register(%d-%d) = %d: %s", min, max, w.Code, w.Body.String())
+	}
+	var out registerResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	return out.Incarnation
+}
+
+func headerlessNext(t *testing.T, s *Server, runnerID string) int {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/runners/"+runnerID+"/next", strings.NewReader("{}"))
+	req.Header.Set("Authorization", "Bearer runner-tok")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	return w.Code
+}
+
+// TestModernHeaderlessRefusedAfterSupersession is the modern-session
+// fencing contract: a modern (protocol 3) identity that has been superseded
+// refuses headerless session calls, so an old client can neither ride the
+// superseded session nor re-register and keep operating headerless. The
+// first registration keeps the dev rolling-upgrade tolerance, and
+// production refuses headerless unconditionally.
+func TestModernHeaderlessRefusedAfterSupersession(t *testing.T) {
+	s := New("runner-tok")
+	registerProtoAt(t, s, "modern-runner", 3, 3)
+	if code := headerlessNext(t, s, "modern-runner"); code == http.StatusConflict {
+		t.Fatalf("first-registration headerless poll refused in dev: %d", code)
+	}
+	registerProtoAt(t, s, "modern-runner", 3, 3) // supersede
+	if code := headerlessNext(t, s, "modern-runner"); code != http.StatusConflict {
+		t.Fatalf("superseded modern headerless poll = %d, want 409", code)
+	}
+	if s.runnerIncarnationCurrent(context.Background(), "modern-runner", "") {
+		t.Fatal("superseded modern headerless heartbeat accepted")
+	}
+
+	prod := New("runner-tok")
+	prod.RequireRunnerIncarnation = true
+	registerProtoAt(t, prod, "modern-runner", 3, 3)
+	if code := headerlessNext(t, prod, "modern-runner"); code != http.StatusConflict {
+		t.Fatalf("production headerless poll = %d, want 409", code)
+	}
+	if prod.runnerIncarnationCurrent(context.Background(), "modern-runner", "") {
+		t.Fatal("production headerless heartbeat accepted")
+	}
+}
+
+// TestUnknownProtocolHeaderlessOnlyOutsideProduction: a runner unknown to
+// this process (cross-replica/pre-upgrade) keeps the dev tolerance but is
+// refused headerless in production.
+func TestUnknownProtocolHeaderlessOnlyOutsideProduction(t *testing.T) {
+	s := New("runner-tok")
+	if !s.runnerIncarnationCurrent(context.Background(), "never-registered", "") {
+		t.Fatal("dev headerless tolerance missing for an unknown runner")
+	}
+	prod := New("runner-tok")
+	prod.RequireRunnerIncarnation = true
+	if prod.runnerIncarnationCurrent(context.Background(), "never-registered", "") {
+		t.Fatal("production granted headerless compatibility to an unknown runner")
 	}
 }
 
@@ -135,7 +216,9 @@ func TestCompletionRefusedForSupersededIncarnation(t *testing.T) {
 	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "superseded") {
 		t.Fatalf("superseded completion = %d %q, want the incarnation refusal", w.Code, w.Body.String())
 	}
-	if w := complete(""); w.Code == http.StatusConflict && strings.Contains(w.Body.String(), "superseded") {
-		t.Fatal("headerless legacy completion treated as superseded")
+	// A protocol-3 runner completing headerless is refused as superseded
+	// (compatibility is protocol-tied, not header-absence-tied).
+	if w := complete(""); w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "superseded") {
+		t.Fatalf("protocol-3 headerless completion = %d %q, want superseded", w.Code, w.Body.String())
 	}
 }
