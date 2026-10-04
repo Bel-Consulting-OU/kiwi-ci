@@ -245,7 +245,7 @@ func TestRunWriteFailure(t *testing.T) {
 
 func TestSkipFileNames(t *testing.T) {
 	root := t.TempDir()
-	for _, name := range []string{".DS_Store", "Thumbs.db", "desktop.ini", "x.tmp", "y.prof", "z.out"} {
+	for _, name := range []string{".DS_Store", "Thumbs.db", "desktop.ini", "x.tmp", "y.prof", "z.out", ".git"} {
 		writeFile(t, filepath.Join(root, name), "data")
 	}
 	writeFile(t, filepath.Join(root, "go.sum"), "sums")
@@ -261,7 +261,7 @@ func TestSkipFileNames(t *testing.T) {
 	for _, e := range entries {
 		seen[e.Name()] = skipFile(root, e.Name(), e)
 	}
-	for _, name := range []string{".DS_Store", "Thumbs.db", "desktop.ini", "x.tmp", "y.prof", "z.out"} {
+	for _, name := range []string{".DS_Store", "Thumbs.db", "desktop.ini", "x.tmp", "y.prof", "z.out", ".git"} {
 		if !seen[name] {
 			t.Errorf("skipFile(%q) = false, want true", name)
 		}
@@ -269,6 +269,40 @@ func TestSkipFileNames(t *testing.T) {
 	for _, name := range []string{"go.sum", "keep.txt"} {
 		if seen[name] {
 			t.Errorf("skipFile(%q) = true, want false", name)
+		}
+	}
+}
+
+// TestWorktreeGitPointerNotIndexed is the dogfooding regression: a git
+// worktree (kiwi's preferred local snapshot strategy) carries ".git" as a
+// pointer FILE, not a directory. The walker must skip that file and keep
+// walking the rest of the root; indexing it made --check fail in every
+// worktree workspace.
+func TestWorktreeGitPointerNotIndexed(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, ".git"), "gitdir: /somewhere/.git/worktrees/x\n")
+	writeFile(t, filepath.Join(root, "aaa.go"), "// Package a does a.\npackage a\n")
+	writeFile(t, filepath.Join(root, "zzz.go"), "// Package z does z.\npackage z\n")
+	out := filepath.Join(t.TempDir(), "map.md")
+	var stdout, stderr bytes.Buffer
+	var code int
+	withFlagSet(t, func() {
+		code = run([]string{"-root", root, "-out", out}, &stdout, &stderr)
+	})
+	if code != 0 {
+		t.Fatalf("run = %d, stderr = %q", code, stderr.String())
+	}
+	body, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "| `.git` |") {
+		t.Fatalf("map indexed the .git pointer file:\n%s", body)
+	}
+	// The root files after ".git" alphabetically must still be indexed.
+	for _, want := range []string{"aaa.go", "zzz.go"} {
+		if !strings.Contains(string(body), "| `"+want+"` |") {
+			t.Fatalf("map missing %q after the .git file:\n%s", want, body)
 		}
 	}
 }

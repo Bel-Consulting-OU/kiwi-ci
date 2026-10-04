@@ -120,6 +120,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 // root, never against the process working directory.
 func skipFile(root, rel string, d fs.DirEntry) bool {
 	name := d.Name()
+	if name == ".git" {
+		// A git WORKTREE (and kiwi's preferred local snapshot strategy)
+		// carries ".git" as a regular pointer FILE; indexing it would make
+		// the map differ between a checkout and a worktree and fail
+		// --check everywhere a worktree is used. It is never content.
+		return true
+	}
 	if name == ".DS_Store" || name == "Thumbs.db" || name == "desktop.ini" {
 		return true
 	}
