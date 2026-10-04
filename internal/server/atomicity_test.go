@@ -729,7 +729,7 @@ func TestDownstreamForgeIdentityPersisted(t *testing.T) {
 	}
 	// The derived clone URL uses the persisted base URL and the bare target
 	// repository name (the canonical RepoID is the identity, not a path).
-	if got := downstreamCloneURL(link.TargetForge, link.TargetBaseURL, link.TargetRepo); got != "https://forgejo.internal.example/acme/child" {
+	if got := downstreamCloneURL(link.TargetForge, link.TargetBaseURL, link.TargetRepo); got != "https://forgejo.internal.example/acme/child.git" {
 		t.Fatalf("clone url = %q", got)
 	}
 }
@@ -1104,3 +1104,60 @@ func TestSidecarFSModeLegacyFilesStillWork(t *testing.T) {
 
 var _ = bytes.NewReader
 var _ = forge.OutboxKindDownstream
+
+// TestDownstreamCloneURLKeepsBaseSchemeAndGitSuffix: a self-managed forge
+// base URL keeps its SCHEME (forcing https broke http/self-signed instances)
+// and the clone URL carries the canonical .git suffix instead of relying on
+// a forge redirect.
+func TestDownstreamCloneURLKeepsBaseSchemeAndGitSuffix(t *testing.T) {
+	if got := downstreamCloneURL("forgejo", "http://127.0.0.1:3900", "acme/child"); got != "http://127.0.0.1:3900/acme/child.git" {
+		t.Fatalf("self-managed clone url = %q", got)
+	}
+	if got := downstreamCloneURL("github", "", "acme/child"); got != "https://github.com/acme/child.git" {
+		t.Fatalf("public clone url = %q", got)
+	}
+	if got := downstreamCloneURL("github", "", "acme/child.git"); got != "https://github.com/acme/child.git" {
+		t.Fatalf("existing suffix duplicated: %q", got)
+	}
+}
+
+// TestDownstreamRoutingUsesPersistedForgeKind: when the parent run carries a
+// persisted forge identity (webhook ingress), the child dispatch must use it
+// even though the host heuristic cannot classify a self-managed/loopback
+// host; otherwise the child lands on the public forge default.
+func TestDownstreamRoutingUsesPersistedForgeKind(t *testing.T) {
+	f := newDBFakeStore()
+	s, err := NewPersistent("token", "token", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	s.SetForgeBaseURL("forgejo", "http://127.0.0.1:3977")
+	s.Policy = &policy.Config{Repositories: map[string]policy.RepoPolicy{"o/r": {CrossRepoTrigger: boolPtr(true)}}}
+	if _, err := s.enqueue(context.Background(), SubmitRun{
+		RepoURL: "http://127.0.0.1:3977/o/r.git", RepoFullName: "o/r",
+		Ref: "refs/heads/main", SHA: "abc", Event: "push",
+		ForgeKind: "forgejo", ForgeHost: "127.0.0.1:3977",
+		Pipeline: downstreamPipeline, Trusted: true,
+	}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	runnerID, task := leaseRunJob(t, s)
+	if w := completeTask(t, s, task, runnerID, "success"); w.Code != http.StatusNoContent {
+		t.Fatalf("complete = %d: %s", w.Code, w.Body.String())
+	}
+	f.mu.Lock()
+	link, ok := f.downstreamLinks[task.Job.ID+"\x00acme/child\x00refs/heads/main"]
+	f.mu.Unlock()
+	if !ok {
+		t.Fatal("link missing")
+	}
+	if link.TargetForge != "forgejo" || link.TargetBaseURL != "http://127.0.0.1:3977" {
+		t.Fatalf("forge identity = %+v", link)
+	}
+	if got := downstreamCloneURL(link.TargetForge, link.TargetBaseURL, link.TargetRepo); got != "http://127.0.0.1:3977/acme/child.git" {
+		t.Fatalf("clone url = %q", got)
+	}
+}

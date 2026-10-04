@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
+	"net/url"
 	"strings"
 	"time"
 
@@ -76,7 +77,14 @@ func (s *Server) recordDownstreamIntents(ctx context.Context, j model.Job, run m
 	if err != nil {
 		return err
 	}
-	forgeKind := forgeKindForHost(repoHost(repoIDForRun(run)))
+	// The parent run's PERSISTED forge identity is authoritative (the
+	// delivering webhook knew the forge); the host heuristic is only a
+	// fallback for runs recorded before the identity existed. A self-managed
+	// host heuristic alone would leave the child on the public forge default.
+	forgeKind := strings.TrimSpace(run.ForgeKind)
+	if forgeKind == "" {
+		forgeKind = forgeKindForHost(repoHost(repoIDForRun(run)))
+	}
 	baseURL := s.forgeBaseURL(forgeKind)
 	link := storage.DownstreamLink{
 		ParentJobID: j.ID,
@@ -768,7 +776,16 @@ func forgeKindForHost(host string) string {
 // persisted forge coordinates: the base URL override (self-hosted) wins,
 // otherwise the forge's public host.
 func downstreamCloneURL(forgeKind, baseURL, repo string) string {
-	return "https://" + downstreamForgeHost(forgeKind, baseURL) + "/" + repo
+	repo = strings.TrimSuffix(strings.TrimSpace(repo), ".git")
+	// A self-hosted base URL wins and keeps its SCHEME: forcing https broke
+	// http/self-signed self-managed forges, and the missing .git suffix made
+	// the clone depend on a redirect.
+	if base := strings.TrimSpace(baseURL); base != "" {
+		if u, err := url.Parse(base); err == nil && u.Host != "" {
+			return u.Scheme + "://" + u.Host + "/" + repo + ".git"
+		}
+	}
+	return "https://" + publicForgeHost(forgeKind) + "/" + repo + ".git"
 }
 
 // downstreamForgeHost resolves the target forge host of a downstream child
