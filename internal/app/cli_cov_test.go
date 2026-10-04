@@ -75,7 +75,7 @@ func initGitRepo(t *testing.T, dir string) {
 
 func TestRunLocalNativePipeline(t *testing.T) {
 	dir := t.TempDir()
-	pipelinePath := writePipeline(t, dir, "version: 1\njobs:\n  build:\n    steps:\n      - name: hello\n        run: echo local-ok\n")
+	pipelinePath := writePipeline(t, dir, "version: 1\ninputs:\n  env:\n    default: dev\njobs:\n  build:\n    steps:\n      - name: hello\n        run: echo local-ok\n")
 	writeFile(t, filepath.Join(dir, "marker.txt"), "x")
 	chdir(t, dir)
 	if err := RunLocal(context.Background(), []string{"-f", pipelinePath, "--json", "--changed-file", "marker.txt,a b,,c", "--max-parallel", "1"}); err != nil {
@@ -534,5 +534,44 @@ func runGit(t *testing.T, dir string, args ...string) {
 	cmd := exec.Command("git", append([]string{"-C", dir, "-c", "user.email=t@example.com", "-c", "user.name=t"}, args...)...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %v: %v: %s", args, err, out)
+	}
+}
+
+// TestRunLocalUnknownJob: selecting a job that does not exist (and has no
+// matrix variants) is a client error, never a silent empty run.
+func TestRunLocalUnknownJob(t *testing.T) {
+	dir := t.TempDir()
+	path := writePipeline(t, dir, "version: 1\njobs:\n  build:\n    steps:\n      - run: echo hi\n")
+	chdir(t, dir)
+	err := RunLocal(context.Background(), []string{"-f", path, "--job", "ghost"})
+	if err == nil || !strings.Contains(err.Error(), "ghost") {
+		t.Fatalf("RunLocal --job ghost = %v, want an unknown-job error", err)
+	}
+	if err := RunLocal(context.Background(), []string{"-f", path, "--job", "build"}); err != nil {
+		t.Fatalf("RunLocal --job build: %v", err)
+	}
+}
+
+// TestDetectCurrentBranchUnbornAndDetached: an unborn HEAD (fresh repository)
+// still reports its branch, and a detached HEAD reports no branch (never the
+// literal "HEAD", which a condition could accidentally match).
+func TestDetectCurrentBranchUnbornAndDetached(t *testing.T) {
+	dir := t.TempDir()
+	if got := detectCurrentBranch(dir); got != "" {
+		t.Fatalf("non-repo branch = %q, want empty", got)
+	}
+	runGit(t, dir, "init", "-q", "-b", "feature")
+	if got := detectCurrentBranch(dir); got != "feature" {
+		t.Fatalf("unborn HEAD branch = %q, want feature", got)
+	}
+	writeFile(t, filepath.Join(dir, "f.txt"), "x")
+	runGit(t, dir, "add", "-A")
+	runGit(t, dir, "-c", "user.email=e@t", "-c", "user.name=t", "commit", "-qm", "init")
+	if got := detectCurrentBranch(dir); got != "feature" {
+		t.Fatalf("branch = %q, want feature", got)
+	}
+	runGit(t, dir, "checkout", "-q", "--detach")
+	if got := detectCurrentBranch(dir); got != "" {
+		t.Fatalf("detached branch = %q, want empty", got)
 	}
 }

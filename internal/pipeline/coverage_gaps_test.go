@@ -1115,3 +1115,26 @@ func TestValidateAgainstSchemaBranches(t *testing.T) {
 		})
 	}
 }
+
+// TestSandboxFlagsRejectedOnNative: rootless / read_only_rootfs / non_root
+// promise container isolation the host cannot provide; accepting them on a
+// native job would silently discard the hardening the pipeline declared.
+func TestSandboxFlagsRejectedOnNative(t *testing.T) {
+	for _, frag := range []string{
+		"sandbox:\n      rootless: true\n",
+		"sandbox:\n      read_only_rootfs: true\n",
+		"sandbox:\n      non_root: true\n",
+	} {
+		src := "version: 1\njobs:\n  a:\n    runtime: native\n    " + frag + "    steps:\n      - run: echo hi\n"
+		if _, err := Parse([]byte(src)); err == nil {
+			t.Fatalf("native job with %q accepted, want rejection", frag)
+		}
+		if _, err := Parse([]byte("version: 1\njobs:\n  a:\n    " + frag + "    steps:\n      - run: echo hi\n")); err == nil {
+			t.Fatalf("default-runtime job with %q accepted, want rejection", frag)
+		}
+	}
+	// network is a policy ceiling valid on every runtime; it stays accepted.
+	if _, err := Parse([]byte("version: 1\njobs:\n  a:\n    runtime: native\n    sandbox:\n      network: none\n    steps:\n      - run: echo hi\n")); err != nil {
+		t.Fatalf("native sandbox.network rejected: %v", err)
+	}
+}

@@ -394,6 +394,14 @@ func validateJob(s *Spec, id string, j Job) error {
 	if j.Sandbox.Network < NetworkPolicyDefault || j.Sandbox.Network > NetworkPolicyInternet {
 		return fmt.Errorf("job %q has invalid sandbox.network value %d", id, j.Sandbox.Network)
 	}
+	// The container-isolation sandbox flags cannot be honored on the host:
+	// accepting them silently would let a pipeline believe it runs with
+	// hardening (rootless user namespace, read-only root filesystem,
+	// non-root container user) that does not exist. native execution is
+	// exactly the trusted host path those flags are meant to avoid.
+	if (j.Runtime == "" || j.Runtime == "native") && (j.Sandbox.Rootless || j.Sandbox.ReadOnlyRootFS || j.Sandbox.NonRoot) {
+		return fmt.Errorf("job %q: sandbox.rootless/read_only_rootfs/non_root require the container runtime; native execution cannot enforce them", id)
+	}
 	if !shellNames[j.Shell] {
 		return fmt.Errorf("job %q has unsupported shell %q", id, j.Shell)
 	}

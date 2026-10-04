@@ -51,13 +51,22 @@ func RunLocal(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	var inputsMap map[string]string
-	if len(inputs.pairs) > 0 {
-		inputsMap = inputs.pairs
+	// The same input contract the server enforces at enqueue: defaults are
+	// applied, required values must be present, unknown names and typed
+	// violations are rejected, so local dispatch can never diverge.
+	inputsMap, err := pipeline.ValidateRunInputs(spec, inputs.pairs)
+	if err != nil {
+		return err
+	}
+	if len(inputsMap) == 0 {
+		inputsMap = nil
 	}
 	g, err := pipeline.CompileWithInputs(spec, inputsMap)
 	if err != nil {
 		return err
+	}
+	if *job != "" && !graphHasJob(g, *job) {
+		return fmt.Errorf("unknown job %q", *job)
 	}
 	wd, err := os.Getwd()
 	if err != nil {
@@ -248,6 +257,17 @@ func detectChangedFilesOpts(workspace, base, head, mergeBase, changedFile string
 		}
 	}
 	return out
+}
+
+// graphHasJob reports whether a job name matches a compiled job or one of its
+// matrix variants (every variant shares the declared base id).
+func graphHasJob(g *pipeline.Graph, name string) bool {
+	for _, cj := range g.Jobs {
+		if cj.ID == name || cj.BaseID == name {
+			return true
+		}
+	}
+	return false
 }
 
 func printSummary(res map[string]model.JobResult) {

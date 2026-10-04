@@ -102,12 +102,26 @@ func printWhy(w *explain.Why) {
 // detectCurrentBranch returns the current git branch, or "" when git is
 // unavailable or the repository has no branch checked out.
 func detectCurrentBranch(workspace string) string {
-	cmd := exec.Command("git", "-C", workspace, "rev-parse", "--abbrev-ref", "HEAD")
-	b, err := cmd.Output()
+	// symbolic-ref resolves the branch even on an UNBORN HEAD (a repository
+	// with no commits yet), which rev-parse --abbrev-ref rejects; a detached
+	// HEAD is not a symbolic ref, so it falls through to the rev-parse
+	// fallback and is reported as no branch (never the literal "HEAD", which
+	// a condition could accidentally match).
+	if out, err := exec.Command("git", "-C", workspace, "symbolic-ref", "--short", "-q", "HEAD").Output(); err == nil {
+		if b := strings.TrimSpace(string(out)); b != "" {
+			return b
+		}
+	}
+	out, err := exec.Command("git", "-C", workspace, "rev-parse", "--abbrev-ref", "HEAD").Output()
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(b))
+	b := strings.TrimSpace(string(out))
+	if b == "HEAD" {
+		// Detached HEAD: no branch context.
+		return ""
+	}
+	return b
 }
 
 // lockfileDigest computes the SHA-256 cache-key digest of a job's lock
