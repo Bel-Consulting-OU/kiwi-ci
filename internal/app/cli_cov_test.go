@@ -575,3 +575,21 @@ func TestDetectCurrentBranchUnbornAndDetached(t *testing.T) {
 		t.Fatalf("detached branch = %q, want empty", got)
 	}
 }
+
+// TestRunLocalCancelledContextFails: a cancelled context (SIGINT or any
+// parent cancellation) must make `kiwi run` fail, never exit 0 with a
+// cancelled job. The harness observed a 0 exit for an interrupted run.
+func TestRunLocalCancelledContextFails(t *testing.T) {
+	dir := t.TempDir()
+	path := writePipeline(t, dir, "version: 1\njobs:\n  slow:\n    steps:\n      - run: sleep 30\n")
+	chdir(t, dir)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := RunLocal(ctx, []string{"-f", path})
+	if err == nil {
+		t.Fatal("cancelled RunLocal returned nil, want a cancelled-run error")
+	}
+	if !strings.Contains(err.Error(), "cancelled") {
+		t.Fatalf("cancelled RunLocal err = %v, want a cancelled-run error", err)
+	}
+}

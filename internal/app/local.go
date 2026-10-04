@@ -114,6 +114,17 @@ func RunLocal(ctx context.Context, args []string) error {
 	} else {
 		printSummary(res)
 	}
+	// A cancelled run is never a success: an interrupt (SIGINT/SIGTERM) or a
+	// parent-scoped cancellation must exit non-zero, or a `kiwi run && ...`
+	// chain would treat an aborted CI run as passing.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("run cancelled: %w", ctxErr)
+	}
+	for id, r := range res {
+		if r.Status == model.StatusCancelled {
+			return fmt.Errorf("run cancelled: job %s was cancelled", id)
+		}
+	}
 	return runErr
 }
 
