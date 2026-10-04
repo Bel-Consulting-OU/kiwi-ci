@@ -374,3 +374,48 @@ base_url = "https://gitlab.internal.example"
 		t.Fatal("app id without private key accepted by config check")
 	}
 }
+
+// TestApplyAuthConfigRegistersBuiltinAdmin: with a principal store active,
+// the flag admin token must resolve to a store principal, otherwise
+// admin-created trusted schedules record an empty creator and the
+// revocation re-check treats them as revoked (trigger answered 500).
+func TestApplyAuthConfigRegistersBuiltinAdmin(t *testing.T) {
+	dir := t.TempDir()
+	// A file principal unrelated to the admin token.
+	tokens := map[string]map[string]any{
+		"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855": {"subject": "someone"},
+	}
+	data, err := json.Marshal(tokens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "tokens.json")
+	if err := os.WriteFile(file, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv := server.New("runner-secret")
+	srv.AdminToken = "flag-admin-token"
+	cfg := &config.Config{}
+	cfg.Auth.TokensFile = file
+	if err := applyAuthConfig(srv, cfg); err != nil {
+		t.Fatalf("applyAuthConfig: %v", err)
+	}
+	p, ok := srv.AuthStore.PrincipalBySubject("builtin:admin")
+	if !ok || !p.Has(auth.RoleAdmin) {
+		t.Fatalf("built-in admin principal missing: %+v ok=%v", p, ok)
+	}
+	if !auth.Authorize(p, auth.ActionTrustedRun, "github.com/owner/repo", true) {
+		t.Fatal("built-in admin principal cannot authorize trusted_run")
+	}
+	// Clearing the flag token removes the built-in principal.
+	srv2 := server.New("runner-secret")
+	srv2.AdminToken = ""
+	cfg2 := &config.Config{}
+	cfg2.Auth.TokensFile = file
+	if err := applyAuthConfig(srv2, cfg2); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := srv2.AuthStore.PrincipalBySubject("builtin:admin"); ok {
+		t.Fatal("built-in admin registered without an admin token")
+	}
+}

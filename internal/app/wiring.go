@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
 	"net"
 	"net/http"
 	"os"
@@ -56,6 +57,23 @@ func applyAuthConfig(srv *server.Server, cfg *config.Config) error {
 	}
 	if err := srv.AuthStore.Load(cfg.Auth.TokensFile); err != nil {
 		return fmt.Errorf("auth tokens file: %w", err)
+	}
+	// The flag ADMIN token is a server-configured root credential, but it is
+	// not part of the token FILE, so with a principal store active no store
+	// principal represented it: admin-authenticated requests carried no
+	// principal, schedules created with the flag token recorded an EMPTY
+	// creator, and the trusted-schedule revocation re-check (which requires a
+	// resolvable creator subject once a store exists) treated every such
+	// schedule as revoked. Registering the flag token as a built-in admin
+	// principal keeps it authoritative while it remains configured; clearing
+	// the flag revokes it.
+	if srv.AdminToken != "" {
+		if err := srv.AuthStore.AddToken(srv.AdminToken, auth.Principal{
+			Subject: "builtin:admin",
+			Roles:   []auth.Role{auth.RoleAdmin},
+		}); err != nil {
+			return fmt.Errorf("auth tokens file: register built-in admin: %w", err)
+		}
 	}
 	return nil
 }

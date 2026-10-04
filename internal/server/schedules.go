@@ -697,6 +697,12 @@ func (s *Server) triggerSchedule(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": violation.Error(), "reason": violation.Kind})
 			return
 		}
+		if errors.Is(err, errScheduleUnauthorized) {
+			// The creator's trusted_run grant was revoked (or the creator is
+			// unresolvable): a client-visible refusal, not a server defect.
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "trusted schedule authorization revoked", "reason": "TRUSTED_RUN_REVOKED"})
+			return
+		}
 		// Any other fire error (invalid stored identity, ID generation, a
 		// failed durable re-read) stays the generic 500.
 		s.internalError(w, r, err, "")
