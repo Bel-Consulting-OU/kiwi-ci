@@ -697,6 +697,18 @@ func (s *Server) triggerSchedule(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": violation.Error(), "reason": violation.Kind})
 			return
 		}
+		if errors.Is(err, storage.ErrStaleLeader) {
+			// The schedule fired against a leader that changed mid-write:
+			// retryable, like the runs API's mapping.
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "scheduler leader changed; retry", "reason": "STALE_LEADER"})
+			return
+		}
+		if errors.Is(err, storage.ErrStaleLeader) {
+			// The trigger reached a replica whose leadership changed before
+			// the enqueue write: retryable against the current leader.
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "scheduler leader changed; retry", "reason": "STALE_LEADER"})
+			return
+		}
 		if errors.Is(err, errScheduleUnauthorized) {
 			// The creator's trusted_run grant was revoked (or the creator is
 			// unresolvable): a client-visible refusal, not a server defect.
@@ -817,6 +829,12 @@ func (s *Server) fireDueSchedules(ctx context.Context, now time.Time) {
 				if aerr := s.advanceSchedulePast(ctx, d.sc, d.nominal); aerr != nil {
 					s.logError("schedule advance failed", "schedule", d.sc.ID, "error", aerr.Error())
 				}
+				continue
+			}
+			if errors.Is(err, storage.ErrStaleLeader) {
+				// Leadership changed mid-fire: end this tick; the new
+				// leader's tick retries the occurrence.
+				s.logError("schedule fire lost leadership; retrying next tick", "schedule", d.sc.ID)
 				continue
 			}
 			if errors.Is(err, errScheduleUnauthorized) {

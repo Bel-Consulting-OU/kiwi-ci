@@ -1530,6 +1530,14 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": budget.Error(), "reason": budget.Reason})
 			return
 		}
+		// Leadership changed between the fence check and the write (a rolling
+		// upgrade elects a new scheduler): the mutation is retryable against
+		// the current leader, so answer 409 with a machine-readable reason
+		// instead of an opaque 500.
+		if errors.Is(err, storage.ErrStaleLeader) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "scheduler leader changed; retry", "reason": "STALE_LEADER"})
+			return
+		}
 		// A failed snapshot write is a server-side durability failure, not a
 		// client error: answer 503 so the caller retries instead of treating
 		// the submission as invalid.
