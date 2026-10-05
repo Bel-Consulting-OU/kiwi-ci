@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage/migrations"
@@ -118,5 +119,56 @@ func TestCompatibleFloorIsNeverCachedAcrossAnIncompatibleMigration(t *testing.T)
 	}
 	if w := c.do(http.MethodGet, "/readiness", nil, nil); w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("readiness after the floor advanced = %d, want 503", w.Code)
+	}
+}
+
+// countingFloorStore counts compatibility-floor reads.
+type countingFloorStore struct {
+	*floorStore
+	reads atomic.Int32
+}
+
+func (c *countingFloorStore) SchemaCompatibilityFloor(ctx context.Context) (int, error) {
+	c.reads.Add(1)
+	return c.floorStore.SchemaCompatibilityFloor(ctx)
+}
+
+// TestSchemaFenceRunsAfterAuth: an unauthenticated mutation must be rejected
+// by authentication BEFORE the fence can issue a database compatibility
+// query — otherwise the fence is an anonymous DB-amplification endpoint.
+func TestSchemaFenceRunsAfterAuth(t *testing.T) {
+	maxV, err := migrations.MaxVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := &countingFloorStore{floorStore: &floorStore{dbFakeStore: newDBFakeStore(), floor: maxV}}
+	s, err := NewPersistent("token", "token", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SwitchToDB(fs); err != nil {
+		t.Fatal(err)
+	}
+	c := &testClient{t: t, h: s.Handler()}
+	w := c.do(http.MethodPost, "/api/v1/runs", submitBody(), map[string]string{"Authorization": "Bearer wrong-token"})
+	if w.Code != http.StatusUnauthorized && w.Code != http.StatusForbidden {
+		t.Fatalf("invalid bearer = %d, want 401/403", w.Code)
+	}
+	if fs.reads.Load() != 0 {
+		t.Fatalf("unauthenticated request triggered %d schema floor read(s)", fs.reads.Load())
+	}
+	// A valid mutation does read the floor (and passes). The pipeline must be
+	// untrusted-admissible, so use a digest-pinned container job.
+	container := map[string]any{"repo_url": "https://github.com/o/r.git", "repo_full_name": "o/r",
+		"ref": "refs/heads/main",
+		"pipeline": "version: 1\njobs:\n  a:\n    runtime: container\n" +
+			"    image: alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc\n" +
+			"    steps:\n      - run: echo hi\n"}
+	w = c.do(http.MethodPost, "/api/v1/runs", container, map[string]string{"Authorization": "Bearer token"})
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("valid submit = %d: %s", w.Code, w.Body.String())
+	}
+	if fs.reads.Load() == 0 {
+		t.Fatal("authenticated mutation did not verify schema compatibility")
 	}
 }

@@ -20,6 +20,14 @@ import (
 // created without a durable ownership record.
 var atomicWriteFile = fsutil.AtomicWriteFile
 
+// removeArtifactScratch is the artifact-scratch removal seam: a failed
+// removal must raise recovery debt and retain the ledger entry.
+var removeArtifactScratch = os.RemoveAll
+
+// removeLedgerPath is the ledger-reclaim removal seam (workspaces and
+// artifact scratch): tests force failures to prove the entry is retained.
+var removeLedgerPath = os.RemoveAll
+
 // runtimeLedgerEntry is the durable ownership record for one job's
 // externally-visible host state. It is written BEFORE the workspace becomes
 // visible to the job so a hard crash leaves enough information for the next
@@ -277,7 +285,7 @@ func (r *Runner) reconcileRuntimeLedger(runInstanceID string) (ledgerReconcileRe
 			if !ledgerPathIsRunnerOwned(p) {
 				continue
 			}
-			if err := os.RemoveAll(p); err != nil && !os.IsNotExist(err) {
+			if err := removeLedgerPath(p); err != nil && !os.IsNotExist(err) {
 				ok = false
 			}
 		}

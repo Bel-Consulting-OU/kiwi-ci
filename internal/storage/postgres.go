@@ -1044,9 +1044,16 @@ func (s *PostgresStore) InsertRun(ctx context.Context, run model.Run) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.pool.Exec(ctx, `INSERT INTO runs (id, status, started_at, finished_at, created_at, `+normalizedRunRepoIdentityColumn+`, `+normalizedRunRepoFullNameColumn+`, payload) VALUES ($1, $2, $3, $4, $5, `+normalizedRunRepoIdentitySQL("$6")+`, `+normalizedRunRepoFullNameSQL("$6")+`, $6)`,
-		run.ID, string(run.Status), run.StartedAt, run.FinishedAt, run.CreatedAt, payload)
-	return err
+	tx, err := s.beginSchemaCompatibleTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `INSERT INTO runs (id, status, started_at, finished_at, created_at, `+normalizedRunRepoIdentityColumn+`, `+normalizedRunRepoFullNameColumn+`, payload) VALUES ($1, $2, $3, $4, $5, `+normalizedRunRepoIdentitySQL("$6")+`, `+normalizedRunRepoFullNameSQL("$6")+`, $6)`,
+		run.ID, string(run.Status), run.StartedAt, run.FinishedAt, run.CreatedAt, payload); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *PostgresStore) GetRun(ctx context.Context, id string) (model.Run, error) {
@@ -1064,7 +1071,7 @@ func (s *PostgresStore) UpdateRunStatus(ctx context.Context, id string, status m
 	if err := ValidateRunID(id); err != nil {
 		return err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return err
 	}
@@ -1200,7 +1207,7 @@ func (s *PostgresStore) InsertJob(ctx context.Context, job model.Job) error {
 	if err := ValidateRunID(job.RunID); err != nil {
 		return err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return err
 	}
@@ -1345,7 +1352,7 @@ func (s *PostgresStore) UpdateJob(ctx context.Context, job model.Job) error {
 	if err != nil {
 		return err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return err
 	}
@@ -1533,7 +1540,7 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 	if claim.RunnerID == "" {
 		return model.Job{}, fmt.Errorf("storage: empty runner id")
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return model.Job{}, err
 	}
@@ -1562,29 +1569,6 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 	for _, r := range claim.PlacementRegions {
 		if err := validateClaimText("placement region", r); err != nil {
 			return model.Job{}, err
-		}
-	}
-
-	// Schema-compatibility fence SERIALIZED against migrations. READ
-	// COMMITTED alone does NOT close this race: the floor SELECT and the
-	// later UPDATE are separate snapshots, so a migration committing between
-	// them would still let this transaction issue a lease. The fix is the
-	// advisory-lock protocol migrations already use:
-	//   - migrations take pg_advisory_xact_lock('kiwi_schema_migrations'),
-	//   - this transaction takes the SHARED form, then reads the floor.
-	// Ordering is therefore total: either the lease's shared lock blocks the
-	// migration until the lease commits, or the migration committed first and
-	// the floor read below observes the new floor and refuses.
-	if s.binarySchemaVersion > 0 {
-		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(hashtext('kiwi_schema_migrations'))`); err != nil {
-			return model.Job{}, fmt.Errorf("%w: acquire schema consistency lock: %v", ErrSchemaIncompatible, err)
-		}
-		var floor int
-		if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(compatible_from),0) FROM schema_migrations`).Scan(&floor); err != nil {
-			return model.Job{}, fmt.Errorf("%w: read schema compatibility floor: %v", ErrSchemaIncompatible, err)
-		}
-		if floor > s.binarySchemaVersion {
-			return model.Job{}, fmt.Errorf("%w (floor %d, binary %d)", ErrSchemaIncompatible, floor, s.binarySchemaVersion)
 		}
 	}
 
@@ -1978,7 +1962,7 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 	if receipt.JobID != jobID || receipt.Generation != generation || receipt.RunnerID != runnerID {
 		return fmt.Errorf("storage: completion receipt identity mismatch")
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return err
 	}
@@ -5533,6 +5517,36 @@ func (s *PostgresStore) applyMigration(ctx context.Context, m migrations.Migrati
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// beginSchemaCompatibleTx starts a transaction that participates in the
+// migration/mutation lock protocol: it takes the SHARED schema advisory
+// lock (migrations hold the exclusive form) and refuses when the recorded
+// compatibility floor demands a newer binary. Holding the shared lock until
+// commit closes the check/write window the HTTP middleware cannot.
+//
+// Every mutation whose shape can change across migrations must use it.
+func (s *PostgresStore) beginSchemaCompatibleTx(ctx context.Context) (pgx.Tx, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if s.binarySchemaVersion > 0 {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(hashtext('kiwi_schema_migrations'))`); err != nil {
+			_ = tx.Rollback(ctx)
+			return nil, fmt.Errorf("%w: acquire schema consistency lock: %v", ErrSchemaIncompatible, err)
+		}
+		var floor int
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(compatible_from),0) FROM schema_migrations`).Scan(&floor); err != nil {
+			_ = tx.Rollback(ctx)
+			return nil, fmt.Errorf("%w: read schema compatibility floor: %v", ErrSchemaIncompatible, err)
+		}
+		if floor > s.binarySchemaVersion {
+			_ = tx.Rollback(ctx)
+			return nil, fmt.Errorf("%w (floor %d, binary %d)", ErrSchemaIncompatible, floor, s.binarySchemaVersion)
+		}
+	}
+	return tx, nil
 }
 
 // SchemaCompatibilityFloor returns the newest compatibility floor recorded

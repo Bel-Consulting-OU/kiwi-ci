@@ -365,8 +365,13 @@ type Runner struct {
 	recoveryDebt atomic.Bool
 	// recoveryDebtReason is the first debt report, for the exit error.
 	recoveryDebtReason atomic.Value // string
-	Client             *http.Client
-	Metrics            *Metrics
+	// pollCancel cancels the LEASE-POLL context only: cleanup debt stops
+	// new polls immediately without cancelling in-flight jobs, and a fresh
+	// context is created after a clean reconciliation.
+	pollMu     sync.Mutex
+	pollCancel context.CancelFunc
+	Client     *http.Client
+	Metrics    *Metrics
 	// StreamClient carries bulk transfers (artifact/cache/snapshot/dependency
 	// uploads and downloads). It deliberately has no total timeout: the
 	// transport bounds dial/TLS-handshake/response-header phases and each
@@ -641,24 +646,13 @@ func (r *Runner) Run(ctx context.Context) error {
 	// daemon. Reconciliation FAILING (docker/tart unavailable, discovery
 	// error, removal refused) refuses to lease new work: "cannot prove absence"
 	// is not "nothing stale".
-	rep, rerr := executor.ReconcileRuntime(runCtx, r.Cfg.WorkDir, r.ID, runInstanceID)
+	rep, lres, rerr := r.reconcileIncarnation(runCtx, runInstanceID)
 	if rerr != nil {
 		stop()
 		return fmt.Errorf("runner %s: crash reconciliation failed; refusing to lease new work: %w", r.ID, rerr)
 	}
 	if rep.Containers > 0 || rep.Networks > 0 || rep.VMs > 0 {
 		fmt.Fprintf(os.Stderr, "kiwi runner %s: reconciled previous incarnation runtime: %d container(s), %d network(s), %d VM(s)\n", r.ID, rep.Containers, rep.Networks, rep.VMs)
-	}
-	// Reclaim host state recorded by previous incarnations of THIS runner
-	// (workspaces, artifact scratch, XFS quota assignments, cgroups) AFTER
-	// the runtime resources are proven gone and BEFORE leasing new work. A
-	// failed reclaim or an unreadable entry is unresolved recovery debt and
-	// REFUSES new leasing, mirroring runtime reconciliation: the runner must
-	// never lease past state it cannot prove it cleaned up.
-	lres, lerr := r.reconcileRuntimeLedger(runInstanceID)
-	if lerr != nil {
-		stop()
-		return fmt.Errorf("runner %s: crash-recovery ledger has unresolved debt; refusing to lease new work: %w", r.ID, lerr)
 	}
 	if lres.Reclaimed > 0 {
 		fmt.Fprintf(os.Stderr, "kiwi runner %s: reclaimed %d crashed job resource(s)\n", r.ID, lres.Reclaimed)
@@ -670,6 +664,9 @@ func (r *Runner) Run(ctx context.Context) error {
 	maint := maintenanceSchedule{GCInterval: r.Cfg.GCInterval, PrewarmInterval: r.Cfg.PrewarmInterval, StagingInterval: r.Cfg.StagingInterval, CacheInterval: r.Cfg.CacheInterval}
 	done := make(chan struct{}, r.Cfg.Concurrency)
 	active := 0
+	pollCtx, cancelPoll := context.WithCancel(runCtx)
+	defer cancelPoll()
+	r.setLeasePollCancel(cancelPoll)
 	// Draining starts from the local --drain flag; the server may also
 	// advertise the state on next() responses (an admin drained the runner
 	// remotely), which flips this to true mid-run.
@@ -685,6 +682,10 @@ func (r *Runner) Run(ctx context.Context) error {
 					stop()
 					return fmt.Errorf("runner %s: %w", r.ID, err)
 				}
+				// Debt cleared: a fresh lease-poll context resumes polling.
+				cancelPoll()
+				pollCtx, cancelPoll = context.WithCancel(runCtx)
+				r.setLeasePollCancel(cancelPoll)
 			} else {
 				select {
 				case <-done:
@@ -700,11 +701,19 @@ func (r *Runner) Run(ctx context.Context) error {
 		// Fill every free local execution slot before sleeping. The control plane
 		// independently capacity-checks this runner, so a race cannot over-lease it.
 		for active < r.Cfg.Concurrency {
-			task, drainSignal, err := r.next(runCtx)
+			// Debt may be raised by a worker between iterations: never fill
+			// another slot once it exists.
+			if r.recoveryDebt.Load() {
+				break
+			}
+			task, drainSignal, err := r.next(pollCtx)
 			if err != nil {
 				if errors.Is(err, ErrRunnerDisabledOrRevoked) {
 					stop()
 					return err
+				}
+				if errors.Is(err, context.Canceled) && r.recoveryDebt.Load() {
+					break
 				}
 				fmt.Fprintf(os.Stderr, "kiwi runner %s: next: %v\n", r.ID, err)
 				break
@@ -713,6 +722,14 @@ func (r *Runner) Run(ctx context.Context) error {
 				if drainSignal {
 					draining = true
 				}
+				break
+			}
+			if r.recoveryDebt.Load() {
+				// The response raced a debt report: do NOT start the job.
+				// The lease is left to expire and the server's recovery
+				// requeues it (starting it would run work while the runner
+				// is quarantined).
+				fmt.Fprintf(os.Stderr, "kiwi runner %s: lease %s raced cleanup debt; not starting it (lease recovers by expiry)\n", r.ID, task.Job.ID)
 				break
 			}
 			active++
@@ -1194,11 +1211,16 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// the ledger entry for the next incarnation instead of deleting a tree a
 	// live bind-mounted container may still own.
 	runtimeCloseFailed := false
+	// jobDebt is THIS job's retention decision: a process-wide debt from a
+	// SIBLING must stop new leasing but must not multiply the retention set
+	// for a job whose own teardown was clean.
+	var jobDebt atomic.Bool
 	defer func() {
-		// Debt reported during THIS job covers main-runtime, services and
-		// cgroup cleanup alike: retain the workspace, the quota and the
-		// crash-recovery entry so the next pass can reclaim them.
-		if r.recoveryDebt.Load() {
+		// Debt reported during THIS job covers main-runtime, services,
+		// cgroup, quota teardown, workspace removal and artifact scratch
+		// alike: retain the workspace, the quota and the crash-recovery
+		// entry so the next pass can reclaim them.
+		if jobDebt.Load() {
 			runtimeCloseFailed = true
 		}
 		cleanupOK := !runtimeCloseFailed
@@ -1207,6 +1229,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		} else if quotaCleanup != nil {
 			if qerr := quotaCleanup(); qerr != nil {
 				fmt.Fprintf(os.Stderr, "kiwi runner %s: remove workspace quota for %s: %v (entry retained for reclaim)\n", r.ID, t.Job.ID, qerr)
+				r.recordJobDebt(&jobDebt, executor.CleanupWorkspaceQuota, tmp, qerr)
 				cleanupOK = false
 			}
 			quotaCleanup = nil
@@ -1214,6 +1237,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		if cleanupOK {
 			if rerr := removeJobWorkspace(tmp); rerr != nil {
 				fmt.Fprintf(os.Stderr, "kiwi runner %s: remove job workspace %s: %v\n", r.ID, tmp, rerr)
+				r.recordJobDebt(&jobDebt, executor.CleanupWorkspace, tmp, rerr)
 				cleanupOK = false
 			}
 		}
@@ -1487,8 +1511,12 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		// The capture directory is per job and always removed; a leftover
 		// only survives a hard runner crash, exactly like a job workspace.
 		defer func() {
-			if rerr := os.RemoveAll(captureDir); rerr != nil {
+			if rerr := removeArtifactScratch(captureDir); rerr != nil {
 				fmt.Fprintf(os.Stderr, "kiwi runner %s: remove artifact capture dir %s: %v\n", r.ID, captureDir, rerr)
+				// The scratch tree is in the durable ledger: a failed
+				// removal must keep the entry (and stop new leases) instead
+				// of letting the outer defer retire the only coordinates.
+				r.recordJobDebt(&jobDebt, executor.CleanupArtifactScratch, captureDir, rerr)
 			}
 		}()
 		artifactStore = &artifact.Store{Root: captureDir}
@@ -1546,7 +1574,10 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	opts.RequireUntrustedDiskQuota = requireDiskQuota
 	opts.WorkspaceQuota = workspaceQuota
 
-	opts.OnCleanupDebt = r.noteRecoveryDebt
+	opts.OnCleanupDebt = func(d executor.CleanupDebt) {
+		jobDebt.Store(true)
+		r.noteRecoveryDebt(d)
+	}
 	// Step durations come from the executor's wall-clock step measurements
 	// (StepReporter), never from sink-derived log timing.
 	applyStepReporter(&opts, r.Metrics)
@@ -3127,22 +3158,58 @@ func (r *Runner) streamClient() *http.Client {
 type stallGuard struct {
 	cancel context.CancelFunc
 	idle   time.Duration
+	mu     sync.Mutex
 	timer  *time.Timer
+	// last is the most recent successful progress instant.
+	last time.Time
+	// done latches the guard once it has cancelled or been stopped.
+	done bool
 }
 
 func newStallGuard(cancel context.CancelFunc, idle time.Duration) *stallGuard {
-	g := &stallGuard{cancel: cancel, idle: idle}
-	g.timer = time.AfterFunc(idle, cancel)
+	g := &stallGuard{cancel: cancel, idle: idle, last: time.Now()}
+	g.timer = time.AfterFunc(idle, g.onIdle)
 	return g
+}
+
+// onIdle fires when the timer elapses. Timer.Reset cannot revoke a callback
+// that has already been dispatched: if progress arrived after this callback
+// was scheduled, cancelling here would abort an ACTIVE transfer exactly at
+// the idle boundary. The callback therefore re-checks the progress instant
+// under the lock and re-arms for the remainder of the window instead of
+// cancelling; only a window with no progress at all cancels.
+func (g *stallGuard) onIdle() {
+	g.mu.Lock()
+	if g.done {
+		g.mu.Unlock()
+		return
+	}
+	if left := g.idle - time.Since(g.last); left > 0 {
+		g.timer.Reset(left)
+		g.mu.Unlock()
+		return
+	}
+	g.done = true
+	g.mu.Unlock()
+	g.cancel()
 }
 
 // progress re-arms the inactivity timer after a successful transfer.
 func (g *stallGuard) progress() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.done {
+		return
+	}
+	g.last = time.Now()
 	g.timer.Reset(g.idle)
 }
 
 // stop disarms the timer once the request has finished.
 func (g *stallGuard) stop() {
+	g.mu.Lock()
+	g.done = true
+	g.mu.Unlock()
 	g.timer.Stop()
 }
 
@@ -3392,6 +3459,16 @@ func sanitizeControlBytes(b []byte) string {
 	return strings.TrimSpace(string(out))
 }
 
+// recordJobDebt raises BOTH the per-job retention bit and the process-wide
+// no-new-leases state for a teardown failure the runner itself observed.
+func (r *Runner) recordJobDebt(jobDebt *atomic.Bool, kind executor.CleanupKind, resource string, err error) {
+	if err == nil {
+		return
+	}
+	jobDebt.Store(true)
+	r.noteRecoveryDebt(executor.CleanupDebt{Kind: kind, Resource: resource, Err: err})
+}
+
 // noteRecoveryDebt records one cleanup-debt report from the executor and
 // degrades the runner: no new leases until reconciliation clears it.
 func (r *Runner) noteRecoveryDebt(d executor.CleanupDebt) {
@@ -3401,25 +3478,64 @@ func (r *Runner) noteRecoveryDebt(d executor.CleanupDebt) {
 	if !r.recoveryDebt.Swap(true) {
 		fmt.Fprintf(os.Stderr, "kiwi runner %s: cleanup debt (%s %s): %v; no new leases until reconciled\n", r.ID, d.Kind, d.Resource, d.Err)
 	}
+	r.cancelLeasePoll()
+}
+
+// cancelLeasePoll aborts an in-flight /next request (and any further poll)
+// without touching running jobs.
+func (r *Runner) cancelLeasePoll() {
+	r.pollMu.Lock()
+	cancel := r.pollCancel
+	r.pollMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (r *Runner) setLeasePollCancel(cancel context.CancelFunc) {
+	r.pollMu.Lock()
+	r.pollCancel = cancel
+	r.pollMu.Unlock()
+}
+
+// reconcileIncarnation is the ONE recovery sequence, shared by process
+// startup and in-process debt recovery: runtime objects are proven gone
+// FIRST, and only then are the host-level protections (cgroups, XFS
+// assignments, workspaces, artifact scratch) reclaimed from the ledger.
+// Running the ledger pass first would remove the cgroup/quota/workspace out
+// from under a possibly-live leaked container — exactly the ordering the
+// runtime reconciler exists to prevent.
+func (r *Runner) reconcileIncarnation(ctx context.Context, staleInstanceID string) (executor.GCReport, ledgerReconcileResult, error) {
+	rep, err := executor.ReconcileRuntime(ctx, r.Cfg.WorkDir, r.ID, staleInstanceID)
+	if err != nil {
+		return rep, ledgerReconcileResult{}, err
+	}
+	lres, err := r.reconcileRuntimeLedger(staleInstanceID)
+	if err != nil {
+		return rep, lres, err
+	}
+	return rep, lres, nil
 }
 
 // reconcileRecoveryDebt attempts one bounded in-process reclaim pass over
 // this runner's ledger entries (including current-incarnation ones: no jobs
-// are in flight when it runs). A clean pass clears the debt and the runner
-// may resume leasing; any unresolved entry keeps the debt and returns the
-// error, which Run surfaces as a non-zero exit.
+// are in flight when it runs). The SAME runtime-first sequence as startup is
+// used with a synthetic stale incarnation, so a leaked container is proven
+// removed before its cgroup/XFS/workspace are touched. A clean pass clears
+// the debt and the runner may resume leasing; any unresolved step keeps the
+// debt and returns the error, which Run surfaces as a non-zero exit.
 func (r *Runner) reconcileRecoveryDebt(ctx context.Context) error {
 	if !r.recoveryDebt.Load() {
 		return nil
 	}
-	// A synthetic instance id different from ours makes the pass treat
-	// current-incarnation entries as reclaimable (all jobs have finished).
-	res, err := r.reconcileRuntimeLedger(r.instanceID + "-recovery")
-	if err != nil {
+	// The synthetic id makes current-incarnation entries reclaimable: every
+	// job has finished (active == 0) when this runs.
+	synthetic := r.instanceID + "-recovery"
+	if _, _, err := r.reconcileIncarnation(ctx, synthetic); err != nil {
 		return fmt.Errorf("recovery debt unresolved: %w", err)
 	}
 	r.recoveryDebt.Store(false)
 	r.recoveryDebtReason.Store("")
-	fmt.Fprintf(os.Stderr, "kiwi runner %s: recovered %d debt entr(ies); resuming leases\n", r.ID, res.Reclaimed)
+	fmt.Fprintf(os.Stderr, "kiwi runner %s: recovery complete; resuming leases\n", r.ID)
 	return nil
 }

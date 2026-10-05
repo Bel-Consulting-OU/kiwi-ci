@@ -1333,6 +1333,10 @@ const (
 	CleanupService     CleanupKind = "service-container-or-network"
 	CleanupCgroup      CleanupKind = "job-cgroup"
 	CleanupXFSQuota    CleanupKind = "xfs-project-quota"
+	// Runner-observed teardown failures (reported by the runner itself).
+	CleanupWorkspaceQuota  CleanupKind = "workspace-quota-teardown"
+	CleanupWorkspace       CleanupKind = "workspace-removal"
+	CleanupArtifactScratch CleanupKind = "artifact-scratch-removal"
 )
 
 // CleanupDebt is one unproven-removal report: the durable recovery ledger

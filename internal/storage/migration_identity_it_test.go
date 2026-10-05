@@ -257,3 +257,62 @@ func TestMigrationWaitsForLeaseSharedLock(t *testing.T) {
 		t.Fatal("migration never proceeded after the lease committed")
 	}
 }
+
+// TestPostgresIntegrationNonLeaseMutationFencedAgainstMigration: ordinary
+// writes (not just leases) participate in the migration lock protocol, so a
+// migration committing between the HTTP middleware check and the write still
+// refuses the write.
+func TestPostgresIntegrationNonLeaseMutationFencedAgainstMigration(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	maxV, err := migrations.MaxVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Exclusive migration lock held, floor advanced, not committed.
+	conn, err := st.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(`+schemaLockKeySQL+`)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE schema_migrations SET compatible_from=$1 WHERE version=$2`, maxV+1, maxV); err != nil {
+		t.Fatal(err)
+	}
+
+	runID := pgITNewID(t)
+	done := make(chan error, 1)
+	go func() {
+		done <- st.InsertRun(ctx, model.Run{ID: runID, Repo: pgITRepo, RepoFullName: "kiwi-it/repo", RepoID: pgITRepoID, Status: model.StatusQueued, CreatedAt: time.Now().UTC()})
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("mutation did not serialize against the migration: %v", err)
+	case <-time.After(1200 * time.Millisecond):
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrSchemaIncompatible) {
+			t.Fatalf("mutation after the migration committed = %v, want ErrSchemaIncompatible", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("mutation never returned")
+	}
+	var exists bool
+	if err := st.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM runs WHERE id=$1)`, runID).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Fatal("incompatible mutation committed a run row")
+	}
+}

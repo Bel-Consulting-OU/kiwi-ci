@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -173,5 +174,309 @@ func TestQuotaCleanupPendingStopsNewLeases(t *testing.T) {
 	}
 	if nextCalls.Load() != 1 {
 		t.Fatalf("next calls = %d, want 1 (the second queued job must never be leased)", nextCalls.Load())
+	}
+}
+
+// TestQuotaTeardownFailureStopsNewLeases: a quota teardown failure AFTER a
+// successful job retains the ledger, raises debt, and must prevent the next
+// queued job from being leased while the reclaim remains unresolved.
+func TestQuotaTeardownFailureStopsNewLeases(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "docker.log")
+	installFakeDockerForRunner(t, logPath)
+	var served, nextCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v1/runners/register":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"runner-1"}`))
+		case r.URL.Path == "/api/v1/runners/runner-1/next":
+			nextCalls.Add(1)
+			if served.Add(1) <= 2 {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(server.Task{
+					Job:        model.Job{ID: fmt.Sprintf("job-%d", served.Load()), Key: "build", Trusted: false, DiskRequest: 1 << 20, Pipeline: payloadPipeline},
+					LeaseToken: "tok", LeaseGeneration: 1,
+				})
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+	r := &Runner{ID: "runner-1", Cfg: Config{Server: ts.URL, Poll: time.Millisecond, Concurrency: 1,
+		WorkDir: t.TempDir(), GCInterval: time.Hour, PrewarmInterval: time.Hour, IdentityDir: t.TempDir()},
+		Client: ts.Client(), Metrics: NewMetrics()}
+	r.Cfg.CheckoutFn = func(context.Context, model.Job, string) error { return nil }
+
+	origInstall := installWorkspaceDiskQuota
+	installWorkspaceDiskQuota = func(workspace string, limit int64, onAllocated func(executor.WorkspaceQuotaAssignment) error) (executor.DiskQuotaStatus, func() error, error) {
+		a := executor.WorkspaceQuotaAssignment{Workspace: workspace, MountPoint: "/mnt/xfs", FsKey: "8:70", XQ: "/usr/sbin/xfs_quota", ProjectID: 999}
+		if onAllocated != nil {
+			if herr := onAllocated(a); herr != nil {
+				return executor.DiskQuotaStatus{}, nil, herr
+			}
+		}
+		return executor.DiskQuotaStatus{Hard: true, Limit: limit, Assignment: &a, Detail: "stub"}, func() error {
+			return errors.New("teardown fails")
+		}, nil
+	}
+	t.Cleanup(func() { installWorkspaceDiskQuota = origInstall })
+	origXFS, origCG := reclaimWorkspaceQuota, reclaimJobCgroup
+	reclaimWorkspaceQuota = func(executor.WorkspaceQuotaAssignment) error { return errors.New("still unreclaimable") }
+	reclaimJobCgroup = func(string) error { return nil }
+	t.Cleanup(func() { reclaimWorkspaceQuota, reclaimJobCgroup = origXFS, origCG })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := r.Run(ctx)
+	if err == nil {
+		t.Fatal("Run succeeded with unresolved quota-teardown debt")
+	}
+	if nextCalls.Load() != 1 {
+		t.Fatalf("next calls = %d, want 1 (the queued second job must not be leased)", nextCalls.Load())
+	}
+}
+
+// TestArtifactCaptureRemoveFailureRetainsLedgerAndStopsLeases: a failed
+// artifact-scratch removal must keep the ledger entry (the only durable
+// coordinates) and quarantine the runner; a restart must reclaim it.
+func TestArtifactCaptureRemoveFailureRetainsLedgerAndStopsLeases(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "docker.log")
+	installFakeDockerForRunner(t, logPath)
+	scratchRoot := t.TempDir()
+	var served, nextCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v1/runners/register":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"runner-1"}`))
+		case r.URL.Path == "/api/v1/runners/runner-1/next":
+			nextCalls.Add(1)
+			if served.Add(1) == 1 {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(server.Task{
+					Job:        model.Job{ID: "job-art", Key: "build", Trusted: true, Pipeline: artifactScratchPipeline},
+					LeaseToken: "tok", LeaseGeneration: 1,
+				})
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+	r := &Runner{ID: "runner-1", Cfg: Config{Server: ts.URL, Poll: time.Millisecond, Concurrency: 1,
+		WorkDir: scratchRoot, GCInterval: time.Hour, PrewarmInterval: time.Hour, IdentityDir: t.TempDir()},
+		Client: ts.Client(), Metrics: NewMetrics()}
+	r.Cfg.CheckoutFn = func(context.Context, model.Job, string) error { return nil }
+
+	origRemove := removeArtifactScratch
+	removeArtifactScratch = func(string) error { return errors.New("scratch is undeletable") }
+	origReclaimRemove := removeLedgerPath
+	removeLedgerPath = func(string) error { return errors.New("scratch is undeletable") }
+	t.Cleanup(func() { removeArtifactScratch = origRemove; removeLedgerPath = origReclaimRemove })
+	// Recovery cannot clear the scratch debt: keep the runner quarantined.
+	origXFS, origCG := reclaimWorkspaceQuota, reclaimJobCgroup
+	reclaimWorkspaceQuota = func(executor.WorkspaceQuotaAssignment) error { return nil }
+	reclaimJobCgroup = func(string) error { return nil }
+	t.Cleanup(func() { reclaimWorkspaceQuota, reclaimJobCgroup = origXFS, origCG })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := r.Run(ctx)
+	if err == nil {
+		t.Fatal("Run succeeded although the artifact scratch could not be removed")
+	}
+	entries, _ := filepath.Glob(filepath.Join(r.runtimeLedgerDir(), "*.json"))
+	if len(entries) != 1 {
+		t.Fatalf("ledger entries = %d, want the retained scratch coordinates", len(entries))
+	}
+	if nextCalls.Load() != 1 {
+		t.Fatalf("next calls = %d, want 1", nextCalls.Load())
+	}
+}
+
+// artifactScratchPipeline declares one artifact so the runner creates (and
+// must later remove) a capture directory.
+const artifactScratchPipeline = `version: 1
+jobs:
+  build:
+    runtime: native
+    steps:
+      - run: echo hi > out.txt
+    artifacts:
+      - name: out
+        paths: ["out.txt"]
+`
+
+// TestConcurrentDebtCancelsInFlightPoll pins the concurrency>1 race: when one
+// worker raises debt while another /next request is already in flight, that
+// request is canceled and the fill loop must not lease further slots.
+func TestConcurrentDebtCancelsInFlightPoll(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "docker.log")
+	installFakeDockerForRunner(t, logPath)
+	secondPoll := make(chan struct{})
+	var nextCalls, served atomic.Int32
+	var completions atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v1/runners/register":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"runner-1"}`))
+		case fullPathNext(r):
+			n := nextCalls.Add(1)
+			switch n {
+			case 1:
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(server.Task{
+					Job:        model.Job{ID: "job-debt", Key: "build", Trusted: false, DiskRequest: 1 << 20, Pipeline: payloadPipeline},
+					LeaseToken: "tok", LeaseGeneration: 1,
+				})
+				return
+			case 2:
+				// Hold the response until the debt has been raised; the
+				// runner's poll cancellation must abort this request.
+				w.Header().Set("Content-Type", "application/json")
+				select {
+				case <-secondPoll:
+				case <-time.After(2 * time.Second):
+				}
+				if served.Add(1) == 1 {
+					_ = json.NewEncoder(w).Encode(server.Task{
+						Job:        model.Job{ID: "job-2", Key: "build", Trusted: false, DiskRequest: 1 << 20, Pipeline: payloadPipeline},
+						LeaseToken: "tok", LeaseGeneration: 1,
+					})
+					return
+				}
+				w.WriteHeader(http.StatusNoContent)
+			default:
+				w.WriteHeader(http.StatusNoContent)
+			}
+		case r.URL.Path == "/api/v1/jobs/job-2/complete":
+			completions.Add(1)
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	r := &Runner{ID: "runner-1", Cfg: Config{Server: ts.URL, Poll: time.Millisecond, Concurrency: 4,
+		WorkDir: t.TempDir(), GCInterval: time.Hour, PrewarmInterval: time.Hour, IdentityDir: t.TempDir()},
+		Client: ts.Client(), Metrics: NewMetrics()}
+	r.Cfg.CheckoutFn = func(context.Context, model.Job, string) error { return nil }
+
+	origInstall := installWorkspaceDiskQuota
+	installWorkspaceDiskQuota = func(workspace string, limit int64, onAllocated func(executor.WorkspaceQuotaAssignment) error) (executor.DiskQuotaStatus, func() error, error) {
+		// Fresh per call: this test runs concurrent workers, so a shared
+		// pending struct would be a data race.
+		pending := executor.QuotaCleanupPendingError{
+			Assignment: executor.WorkspaceQuotaAssignment{Workspace: workspace, MountPoint: "/mnt/xfs", FsKey: "8:70", XQ: "/usr/sbin/xfs_quota", ProjectID: 321},
+			Cause:      errors.New("ambiguous"),
+		}
+		if onAllocated != nil {
+			if herr := onAllocated(pending.Assignment); herr != nil {
+				return executor.DiskQuotaStatus{}, nil, herr
+			}
+		}
+		return executor.DiskQuotaStatus{Detail: "ambiguous"}, nil, &pending
+	}
+	t.Cleanup(func() { installWorkspaceDiskQuota = origInstall })
+	origXFS, origCG := reclaimWorkspaceQuota, reclaimJobCgroup
+	reclaimWorkspaceQuota = func(executor.WorkspaceQuotaAssignment) error { return errors.New("unresolved") }
+	reclaimJobCgroup = func(string) error { return nil }
+	t.Cleanup(func() { reclaimWorkspaceQuota, reclaimJobCgroup = origXFS, origCG })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	// Wait until the second poll is in flight, then release it and let the
+	// debt/cancellation decide the outcome.
+	// Release the held response only after the debt is OBSERVED: releasing
+	// earlier could let the fill loop start the raced task before the worker
+	// reports, which is not the interleaving under test.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && (nextCalls.Load() < 2 || !r.recoveryDebt.Load()) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(secondPoll)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not exit after the unresolved debt")
+	}
+	// A third poll would mean the fill loop kept leasing after the debt.
+	time.Sleep(200 * time.Millisecond)
+	if nextCalls.Load() > 2 {
+		t.Fatalf("next calls = %d, want at most 2 (no polling after debt)", nextCalls.Load())
+	}
+	if completions.Load() != 0 {
+		t.Fatal("the raced second job was started after the debt")
+	}
+}
+
+func fullPathNext(r *http.Request) bool {
+	return strings.HasSuffix(r.URL.Path, "/next")
+}
+
+// TestWorkspaceRemoveFailureStopsNewLeases: a failed workspace removal after
+// a successful job retains the ledger and quarantines the runner.
+func TestWorkspaceRemoveFailureStopsNewLeases(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "docker.log")
+	installFakeDockerForRunner(t, logPath)
+	var served, nextCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v1/runners/register":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"runner-1"}`))
+		case r.URL.Path == "/api/v1/runners/runner-1/next":
+			nextCalls.Add(1)
+			if served.Add(1) <= 2 {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(server.Task{
+					Job:        model.Job{ID: fmt.Sprintf("job-%d", served.Load()), Key: "build", Trusted: true, Pipeline: payloadPipeline},
+					LeaseToken: "tok", LeaseGeneration: 1,
+				})
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+	r := &Runner{ID: "runner-1", Cfg: Config{Server: ts.URL, Poll: time.Millisecond, Concurrency: 1,
+		WorkDir: t.TempDir(), GCInterval: time.Hour, PrewarmInterval: time.Hour, IdentityDir: t.TempDir()},
+		Client: ts.Client(), Metrics: NewMetrics()}
+	r.Cfg.CheckoutFn = func(context.Context, model.Job, string) error { return nil }
+
+	origRemove := removeJobWorkspace
+	removeJobWorkspace = func(string) error { return errors.New("workspace busy") }
+	t.Cleanup(func() { removeJobWorkspace = origRemove })
+	origXFS, origCG, origLedgerRemove := reclaimWorkspaceQuota, reclaimJobCgroup, removeLedgerPath
+	reclaimWorkspaceQuota = func(executor.WorkspaceQuotaAssignment) error { return nil }
+	reclaimJobCgroup = func(string) error { return nil }
+	removeLedgerPath = func(string) error { return errors.New("workspace busy") }
+	t.Cleanup(func() {
+		reclaimWorkspaceQuota, reclaimJobCgroup, removeLedgerPath = origXFS, origCG, origLedgerRemove
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := r.Run(ctx)
+	if err == nil {
+		t.Fatal("Run succeeded although the workspace could not be removed")
+	}
+	if nextCalls.Load() != 1 {
+		t.Fatalf("next calls = %d, want 1", nextCalls.Load())
+	}
+	entries, _ := filepath.Glob(filepath.Join(r.runtimeLedgerDir(), "*.json"))
+	if len(entries) != 1 {
+		t.Fatalf("ledger entries = %d, want 1", len(entries))
 	}
 }

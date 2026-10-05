@@ -411,3 +411,31 @@ func TestJobCacheUsesStreamingClientPolicy(t *testing.T) {
 		t.Fatalf("inner cache client transport = %T, want the streaming transport", tr.client.HTTP.Transport)
 	}
 }
+
+// TestStallGuardStaleCallbackDoesNotCancelActiveTransfer is the
+// deterministic stale-callback regression: a timer callback that was already
+// dispatched when progress arrived must re-arm instead of cancelling the
+// transfer at the idle boundary.
+func TestStallGuardStaleCallbackDoesNotCancelActiveTransfer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	g := newStallGuard(cancel, 50*time.Millisecond)
+	defer g.stop()
+
+	// Simulate the dispatched-but-blocked callback racing real progress:
+	// progress updates `last`, then the stale callback runs.
+	g.progress()
+	g.onIdle()
+	if ctx.Err() != nil {
+		t.Fatal("stale idle callback cancelled an active transfer")
+	}
+	// The re-armed guard still fires once the window truly elapses with no
+	// further progress (backdate the progress instant deterministically).
+	g.mu.Lock()
+	g.last = time.Now().Add(-time.Second)
+	g.mu.Unlock()
+	g.onIdle()
+	if ctx.Err() == nil {
+		t.Fatal("guard did not cancel after a full idle window without progress")
+	}
+}
