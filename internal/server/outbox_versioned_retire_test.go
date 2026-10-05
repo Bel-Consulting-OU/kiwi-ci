@@ -24,7 +24,7 @@ func TestOutboxFSVersionedRetirementFailureNeverPublishesOlder(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	store := storage.New(dir)
-	o := NewOutbox(store)
+	o := mustNewOutboxForTest(store)
 	key := forgeCheckLogicalKey("github.com", "run-retire", "Pipeline")
 	oldItem := forge.OutboxItem{
 		ID: forgeCheckRowID(key, 1), Kind: forge.OutboxKindGitHubCheck,
@@ -129,7 +129,7 @@ func TestOutboxFSVersionedRetirementFailureNeverPublishesOlder(t *testing.T) {
 	if !strings.Contains(string(done), newItem.ID) {
 		t.Fatalf("done journal lacks the newer version's ack: %s", done)
 	}
-	o2 := NewOutbox(store)
+	o2 := mustNewOutboxForTest(store)
 	if pending := o2.Pending(); len(pending) != 0 {
 		t.Fatalf("restart replayed %+v, want nothing (the newer watermark retires the old line)", pending)
 	}

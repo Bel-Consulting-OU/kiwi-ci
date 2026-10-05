@@ -6,9 +6,12 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage/migrations"
 )
 
@@ -66,5 +69,51 @@ func TestPostgresIntegrationSchemaCompatibilityFloor(t *testing.T) {
 	}
 	if floor != maxV+5 {
 		t.Fatalf("floor = %d, want %d", floor, maxV+5)
+	}
+}
+
+// TestPostgresIntegrationLeaseFenceRejectsIncompatibleFloor: the
+// compatibility assertion lives INSIDE the lease transaction, so a floor
+// that advanced after an old replica's check still refuses the claim — no
+// check/claim race window.
+func TestPostgresIntegrationLeaseFenceRejectsIncompatibleFloor(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	maxV, err := migrations.MaxVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runnerID := pgITNewID(t)
+	if err := st.UpsertRunner(ctx, model.Runner{ID: runnerID, Name: runnerID, Capacity: 1,
+		ReportedCapabilities: []string{"native"}, Capabilities: []string{"native"}, CapabilitiesEnforced: true}); err != nil {
+		t.Fatalf("seed runner: %v", err)
+	}
+	runID, jobID := pgITNewID(t), pgITNewID(t)
+	pgITEnqueueOne(t, st, runID, jobID, pgITRepo)
+
+	// Sanity: the claim leases while compatible.
+	claim := LeaseClaim{JobID: jobID, RunnerID: runnerID, TokenHash: []byte("h"), Generation: 1,
+		Runtime: "native", ExpiresAt: time.Now().UTC().Add(time.Hour)}
+	if _, err := st.AcquireLeaseAtomic(ctx, claim); err != nil {
+		t.Fatalf("compatible claim: %v", err)
+	}
+	if _, err := st.pool.Exec(ctx, `UPDATE jobs SET status='queued', lease_token_hash=NULL, lease_runner_id=NULL WHERE id=$1`, jobID); err != nil {
+		t.Fatal(err)
+	}
+
+	// A newer replica commits a migration whose floor is above this binary.
+	if _, err := st.pool.Exec(ctx, `UPDATE schema_migrations SET compatible_from=$1 WHERE version=$2`, maxV+1, maxV); err != nil {
+		t.Fatal(err)
+	}
+	_, err = st.AcquireLeaseAtomic(ctx, claim)
+	if !errors.Is(err, ErrSchemaIncompatible) {
+		t.Fatalf("claim under an incompatible floor = %v, want ErrSchemaIncompatible", err)
+	}
+	var status string
+	if err := st.pool.QueryRow(ctx, `SELECT status FROM jobs WHERE id=$1`, jobID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("job status = %q, want queued (no lease issued)", status)
 	}
 }

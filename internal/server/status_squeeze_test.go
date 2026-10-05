@@ -90,7 +90,7 @@ func TestSqueezePublishGitHubStatus(t *testing.T) {
 	fs.outboxAppendErr = errors.New("outbox down")
 	s2 := New("secret")
 	s2.gitHubAPIBase = "https://api.github.example"
-	s2.outbox = NewOutbox(nil)
+	s2.outbox = mustNewOutboxForTest(nil)
 	s2.outbox.AttachDB(fs)
 	s2.mu.Lock()
 	s2.jobs["j1"] = model.Job{ID: "j1", RunID: "r1", Key: "build", Status: model.StatusSuccess}
@@ -181,7 +181,7 @@ func TestSqueezeOutboxClaimerID(t *testing.T) {
 
 	fs := newDBFakeStore()
 	fs.outboxAppendErr = errors.New("append down")
-	ob := NewOutbox(nil)
+	ob := mustNewOutboxForTest(nil)
 	ob.AttachDB(fs)
 	if err := ob.Enqueue(context.Background(), forge.OutboxItem{}); err == nil {
 		t.Fatal("durable append failure = nil error")

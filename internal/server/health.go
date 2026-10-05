@@ -54,8 +54,11 @@ func (s *Server) readiness(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "store unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	if s.schemaFloorIncompatible(ctx) {
+	if err := s.checkSchemaCompatibility(ctx); err != nil {
 		w.Header().Set("X-Kiwi-State", "schema-incompatible")
+		// A floor READ failure is intentionally indistinguishable from an
+		// incompatible floor here: both mean "compatibility unproven" and
+		// readiness must not report 200.
 		http.Error(w, "database schema requires a newer binary", http.StatusServiceUnavailable)
 		return
 	}

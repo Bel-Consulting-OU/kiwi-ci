@@ -404,9 +404,9 @@ func TestOutboxDBConcurrentStaleClaimReclaimedOnce(t *testing.T) {
 	f.mu.Lock()
 	f.outboxClaims["stuck"] = fakeOutboxClaim{claimer: "crashed-flusher", at: time.Now().UTC().Add(-2 * storage.OutboxClaimTTL)}
 	f.mu.Unlock()
-	o1 := NewOutbox(nil)
+	o1 := mustNewOutboxForTest(nil)
 	o1.AttachDB(f)
-	o2 := NewOutbox(nil)
+	o2 := mustNewOutboxForTest(nil)
 	o2.AttachDB(f)
 	d := newOutboxDispatcher()
 	start := make(chan struct{})

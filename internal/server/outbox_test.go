@@ -20,7 +20,7 @@ func testOutboxItem(t *testing.T, kind, payload string) forge.OutboxItem {
 }
 
 func TestOutboxFlushDispatchesAndEmpties(t *testing.T) {
-	o := NewOutbox(nil)
+	o := mustNewOutboxForTest(nil)
 	a := testOutboxItem(t, forge.OutboxKindGitHubCheck, `{"repo_full_name":"octocat/hello-world","sha":"s"}`)
 	b := testOutboxItem(t, forge.OutboxKindGitHubStatus, `{"repo_full_name":"octocat/hello-world","sha":"s"}`)
 	if err := o.Enqueue(context.Background(), a); err != nil {
@@ -46,7 +46,7 @@ func TestOutboxFlushDispatchesAndEmpties(t *testing.T) {
 }
 
 func TestOutboxFlushStopsOnFailure(t *testing.T) {
-	o := NewOutbox(nil)
+	o := mustNewOutboxForTest(nil)
 	a := testOutboxItem(t, forge.OutboxKindGitHubCheck, `{}`)
 	b := testOutboxItem(t, forge.OutboxKindGitHubCheck, `{}`)
 	_ = o.Enqueue(context.Background(), a)
@@ -82,7 +82,7 @@ func TestOutboxFlushStopsOnFailure(t *testing.T) {
 func TestOutboxRestartReplay(t *testing.T) {
 	dir := t.TempDir()
 	store := storage.New(dir)
-	o1 := NewOutbox(store)
+	o1 := mustNewOutboxForTest(store)
 	a := testOutboxItem(t, forge.OutboxKindGitHubCheck, `{"repo_full_name":"r"}`)
 	b := testOutboxItem(t, forge.OutboxKindGitHubCheck, `{"repo_full_name":"r"}`)
 	c := testOutboxItem(t, forge.OutboxKindGitHubCheck, `{"repo_full_name":"r"}`)
@@ -107,7 +107,7 @@ func TestOutboxRestartReplay(t *testing.T) {
 
 	// A restarted control plane replays the unflushed intents (b, c) and
 	// skips the processed one (a).
-	o2 := NewOutbox(store)
+	o2 := mustNewOutboxForTest(store)
 	pending := o2.Pending()
 	if len(pending) != 2 {
 		t.Fatalf("replay loaded %d items, want 2", len(pending))
@@ -132,14 +132,14 @@ func TestOutboxRestartReplay(t *testing.T) {
 
 	// A second restart finds an empty queue: done markers filtered
 	// everything.
-	o3 := NewOutbox(store)
+	o3 := mustNewOutboxForTest(store)
 	if len(o3.Pending()) != 0 {
 		t.Fatalf("post-restart queue not empty: %d", len(o3.Pending()))
 	}
 }
 
 func TestOutboxInMemoryPersistenceOptional(t *testing.T) {
-	o := NewOutbox(nil)
+	o := mustNewOutboxForTest(nil)
 	it := testOutboxItem(t, forge.OutboxKindGitHubCheck, `{}`)
 	if err := o.Enqueue(context.Background(), it); err != nil {
 		t.Fatalf("in-memory enqueue must not fail: %v", err)
@@ -155,7 +155,7 @@ func TestOutboxInMemoryPersistenceOptional(t *testing.T) {
 // different payload or kind is a typed invariant conflict that must not
 // silently succeed or mutate the queued intent.
 func TestOutboxEnqueueSameIDConflictFS(t *testing.T) {
-	o := NewOutbox(nil)
+	o := mustNewOutboxForTest(nil)
 	first := forge.OutboxItem{ID: "fixed-intent", Kind: forge.OutboxKindGitHubStatus, Payload: []byte(`{"a":1}`)}
 	if err := o.Enqueue(context.Background(), first); err != nil {
 		t.Fatalf("first enqueue: %v", err)
@@ -180,7 +180,7 @@ func TestOutboxEnqueueSameIDConflictFS(t *testing.T) {
 		t.Fatalf("conflict mutated the queue: %+v", got)
 	}
 	// An empty payload is the same intent as "{}", mirroring OutboxAppend.
-	o2 := NewOutbox(nil)
+	o2 := mustNewOutboxForTest(nil)
 	if err := o2.Enqueue(context.Background(), forge.OutboxItem{ID: "empty-payload", Kind: "k", Payload: nil}); err != nil {
 		t.Fatal(err)
 	}

@@ -176,13 +176,18 @@ func TestRunnerProcessBoundaryLedgerIsolation(t *testing.T) {
 
 	// A trusted schedule whose single job holds the runner for a while.
 	spec := "version: 1\non:\n  schedule:\n    cron: \"0 0 * * *\"\njobs:\n  hold:\n    runtime: native\n    steps:\n      - name: hold\n        run: |\n          echo alive > hold.txt\n          sleep 6\n"
-	code, _, raw := apiJSON(t, http.MethodPut, base+"/api/v1/schedules",
-		"admin-token-pbt", map[string]any{"id": "pbt", "repository": "owner/repo",
-			"repo_url": repoURL, "spec": spec, "trusted": true, "enabled": true})
-	if code != 200 && code != 201 {
-		t.Fatalf("schedule put = %d: %s", code, raw)
+	// Distinct schedules per phase: firing is deduplicated per schedule and
+	// nominal minute, so one schedule per trigger avoids minute-boundary
+	// sleeps (keeps this heavy test inside the package timeout).
+	for _, id := range []string{"pbt-1", "pbt-2", "pbt-3"} {
+		code, _, raw := apiJSON(t, http.MethodPut, base+"/api/v1/schedules",
+			"admin-token-pbt", map[string]any{"id": id, "repository": "owner/repo",
+				"repo_url": repoURL, "spec": spec, "trusted": true, "enabled": true})
+		if code != 200 && code != 201 {
+			t.Fatalf("schedule %s put = %d: %s", id, code, raw)
+		}
 	}
-	code, run, raw := apiJSON(t, http.MethodPost, base+"/api/v1/schedules/pbt/trigger", "admin-token-pbt", map[string]any{})
+	code, run, raw := apiJSON(t, http.MethodPost, base+"/api/v1/schedules/pbt-1/trigger", "admin-token-pbt", map[string]any{})
 	if code != 202 {
 		t.Fatalf("trigger = %d: %s", code, raw)
 	}
@@ -255,11 +260,8 @@ func TestRunnerProcessBoundaryLedgerIsolation(t *testing.T) {
 	})
 
 	// Crash scenario: trigger another run, kill A mid-job, restart A, and
-	// prove the replacement reclaims its OWN previous state. Schedule firing
-	// is deduplicated per nominal minute (by design), so wait for the next
-	// minute before the next trigger.
-	time.Sleep(time.Duration(61-(time.Now().Unix()%60)) * time.Second)
-	code, run2, raw := apiJSON(t, http.MethodPost, base+"/api/v1/schedules/pbt/trigger", "admin-token-pbt", map[string]any{})
+	// prove the replacement reclaims its OWN previous state.
+	code, run2, raw := apiJSON(t, http.MethodPost, base+"/api/v1/schedules/pbt-2/trigger", "admin-token-pbt", map[string]any{})
 	if code != 202 {
 		t.Fatalf("second trigger = %d: %s", code, raw)
 	}
@@ -318,8 +320,7 @@ func TestRunnerProcessBoundaryLedgerIsolation(t *testing.T) {
 		_ = err
 	}
 	// The replacement must keep serving: a fresh run completes normally.
-	time.Sleep(time.Duration(61-(time.Now().Unix()%60)) * time.Second)
-	code, run3, raw := apiJSON(t, http.MethodPost, base+"/api/v1/schedules/pbt/trigger", "admin-token-pbt", map[string]any{})
+	code, run3, raw := apiJSON(t, http.MethodPost, base+"/api/v1/schedules/pbt-3/trigger", "admin-token-pbt", map[string]any{})
 	if code != 202 {
 		t.Fatalf("third trigger = %d: %s", code, raw)
 	}

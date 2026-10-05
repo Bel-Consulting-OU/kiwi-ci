@@ -76,7 +76,7 @@ func TestPostgresIntegrationOutboxCancelledFlushBatchRelease(t *testing.T) {
 	}
 
 	counter := &outboxBatchCallCounter{PostgresStore: stA}
-	o := NewOutbox(nil)
+	o := mustNewOutboxForTest(nil)
 	o.AttachDB(counter)
 
 	flushCtx, cancel := context.WithCancel(ctx)

@@ -249,9 +249,9 @@ func TestForgeCheckSupersedeRaceNewestSurvives(t *testing.T) {
 	successRun := run
 	successRun.Status = model.StatusSuccess
 	itemV3 := s.checkIntent(successRun, "Pipeline", "completed", "success", "ok", nil)
-	o1 := NewOutbox(nil)
+	o1 := mustNewOutboxForTest(nil)
 	o1.AttachDB(f)
-	o2 := NewOutbox(nil)
+	o2 := mustNewOutboxForTest(nil)
 	o2.AttachDB(f)
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -498,7 +498,7 @@ func TestOutboxFSVersionedSupersedeSurvivesRestart(t *testing.T) {
 	v2 := forge.OutboxItem{ID: forgeCheckRowID(key, 2), Kind: forge.OutboxKindGitHubCheck,
 		Payload: []byte(`{"state_version":2}`), LogicalKey: key, StateVersion: 2}
 
-	o1 := NewOutbox(store)
+	o1 := mustNewOutboxForTest(store)
 	if err := o1.Enqueue(context.Background(), v1); err != nil {
 		t.Fatal(err)
 	}
@@ -511,7 +511,7 @@ func TestOutboxFSVersionedSupersedeSurvivesRestart(t *testing.T) {
 	}
 	// Restart BEFORE any flush: the JSONL still holds the superseded v1 line,
 	// which must not be replayed as pending.
-	o2 := NewOutbox(store)
+	o2 := mustNewOutboxForTest(store)
 	pending = o2.Pending()
 	if len(pending) != 1 || pending[0].StateVersion != 2 {
 		t.Fatalf("fs restart replay = %+v, want only v2", pending)
@@ -520,7 +520,7 @@ func TestOutboxFSVersionedSupersedeSurvivesRestart(t *testing.T) {
 	if _, err := o2.Flush(context.Background(), func(context.Context, forge.OutboxItem) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
-	o3 := NewOutbox(store)
+	o3 := mustNewOutboxForTest(store)
 	if err := o3.Enqueue(context.Background(), v1); err != nil {
 		t.Fatal(err)
 	}

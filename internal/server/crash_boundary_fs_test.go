@@ -285,7 +285,7 @@ func TestCrashCompletionDurableBeforeEffectsRestartFS(t *testing.T) {
 // restart finds the durable done marker and replays nothing.
 func TestCrashOutboxDurableBeforeDispatchRestartFS(t *testing.T) {
 	dir := t.TempDir()
-	o1 := NewOutbox(storage.New(dir))
+	o1 := mustNewOutboxForTest(storage.New(dir))
 	a := testOutboxItem(t, forge.OutboxKindGitHubCheck, `{"repo_full_name":"r","sha":"s"}`)
 	b := testOutboxItem(t, forge.OutboxKindGitHubStatus, `{"repo_full_name":"r","sha":"s"}`)
 	for _, it := range []forge.OutboxItem{a, b} {
@@ -294,7 +294,7 @@ func TestCrashOutboxDurableBeforeDispatchRestartFS(t *testing.T) {
 		}
 	}
 	// Crash before any dispatch: no Flush ran.
-	o2 := NewOutbox(storage.New(dir))
+	o2 := mustNewOutboxForTest(storage.New(dir))
 	pending := o2.Pending()
 	if len(pending) != 2 {
 		t.Fatalf("restart replay = %d intents, want 2", len(pending))
@@ -308,7 +308,7 @@ func TestCrashOutboxDurableBeforeDispatchRestartFS(t *testing.T) {
 			t.Fatalf("intent %s dispatched %d times, want exactly 1", it.ID, got)
 		}
 	}
-	o3 := NewOutbox(storage.New(dir))
+	o3 := mustNewOutboxForTest(storage.New(dir))
 	if replay := o3.Pending(); len(replay) != 0 {
 		t.Fatalf("third restart replayed acked intents: %+v", replay)
 	}

@@ -17,6 +17,12 @@ import (
 // new leader has already published a strictly greater epoch.
 var ErrStaleLeader = errors.New("storage: stale leader epoch")
 
+// ErrSchemaIncompatible reports that the database's recorded migration
+// compatibility floor demands a NEWER binary than this one: every mutation an
+// old replica could make must be refused (the schema may already be shaped
+// for newer code).
+var ErrSchemaIncompatible = errors.New("storage: database schema requires a newer binary")
+
 // LeaderFenceStore is the leadership-epoch contract behind the fenced
 // leader-only operations. The store retains the epoch published by its own
 // successful advisory-lock acquisition (TryAcquireLeadership, on the same

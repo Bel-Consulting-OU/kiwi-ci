@@ -77,17 +77,17 @@ func (f *fcOutboxStore) ClaimOutbox(ctx context.Context, claimer string, limit i
 func (f *fcOutboxStore) ReleaseOutboxClaim(ctx context.Context, id, claimer string) error { return nil }
 
 func TestFlowOutboxReplayDBBranches(t *testing.T) {
-	if err := NewOutbox(nil).ReplayDB(context.Background()); err != nil {
+	if err := mustNewOutboxForTest(nil).ReplayDB(context.Background()); err != nil {
 		t.Fatalf("replay without db = %v", err)
 	}
 	os := &fcOutboxStore{pendingErr: errors.New("pending read down")}
-	o := NewOutbox(nil)
+	o := mustNewOutboxForTest(nil)
 	o.db = os
 	if err := o.ReplayDB(context.Background()); err == nil {
 		t.Fatal("replay pending failure must propagate")
 	}
 	// Duplicate IDs are skipped; new IDs are appended in FIFO order.
-	o2 := NewOutbox(nil)
+	o2 := mustNewOutboxForTest(nil)
 	o2.db = &fcOutboxStore{pending: []storage.OutboxItem{
 		{ID: "dup", Kind: storage.OutboxKindUsageAccount},
 		{ID: "fresh", Kind: storage.OutboxKindRunAggregate},
@@ -108,12 +108,9 @@ func TestFlowOutboxReadItemsErrors(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, outboxFile), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	o := NewOutbox(storage.New(root))
-	if len(o.Pending()) != 0 {
-		t.Fatal("corrupt JSONL must start empty")
-	}
-	if _, err := o.readItems(); err == nil {
-		t.Fatal("directory decode must be an error")
+	o, err := NewOutbox(storage.New(root))
+	if err == nil || o != nil {
+		t.Fatalf("corrupt JSONL must fail construction (o=%v err=%v)", o, err)
 	}
 	// An open failure that is not ENOENT: every path under a regular file
 	// resolves to ENOTDIR, which the OS reports for any euid.
@@ -121,7 +118,7 @@ func TestFlowOutboxReadItemsErrors(t *testing.T) {
 	if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	o2 := NewOutbox(nil)
+	o2 := mustNewOutboxForTest(nil)
 	o2.store = storage.New(filepath.Join(blocker, "data"))
 	if _, err := o2.readItems(); err == nil {
 		t.Fatal("unreadable root must be an error")
@@ -132,7 +129,7 @@ func TestFlowOutboxReadItemsErrors(t *testing.T) {
 }
 
 func TestFlowOutboxEnqueueLocalBranches(t *testing.T) {
-	o := NewOutbox(nil)
+	o := mustNewOutboxForTest(nil)
 	o.EnqueueLocal(forge.OutboxItem{ID: "a", Kind: forge.OutboxKindWebhookCall})
 	if o.Pending()[0].CreatedAt.IsZero() {
 		t.Fatal("EnqueueLocal must stamp CreatedAt")
@@ -144,13 +141,13 @@ func TestFlowOutboxEnqueueLocalBranches(t *testing.T) {
 }
 
 func TestFlowOutboxAppendJSONLBranches(t *testing.T) {
-	o := NewOutbox(nil)
+	o := mustNewOutboxForTest(nil)
 	if err := o.appendJSONLLocked("x.jsonl", map[string]string{"a": "b"}); err != nil {
 		t.Fatalf("nil store append = %v", err)
 	}
 	// Encode failure.
 	root := t.TempDir()
-	o2 := NewOutbox(storage.New(root))
+	o2 := mustNewOutboxForTest(storage.New(root))
 	if err := o2.appendJSONLLocked("x.jsonl", make(chan int)); err == nil {
 		t.Fatal("unencodable value must fail")
 	}
@@ -160,7 +157,7 @@ func TestFlowOutboxAppendJSONLBranches(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(blocked, "x.jsonl"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	o3 := NewOutbox(nil)
+	o3 := mustNewOutboxForTest(nil)
 	o3.store = storage.New(blocked)
 	if err := o3.appendJSONLLocked("x.jsonl", map[string]string{"a": "b"}); err == nil {
 		t.Fatal("directory at the append path must fail the append")
@@ -173,7 +170,7 @@ func TestFlowOutboxAppendJSONLBranches(t *testing.T) {
 	if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	o4 := NewOutbox(nil)
+	o4 := mustNewOutboxForTest(nil)
 	o4.store = storage.New(filepath.Join(blocker, "data"))
 	if err := o4.Enqueue(context.Background(), forge.OutboxItem{Kind: forge.OutboxKindWebhookCall}); err == nil {
 		t.Fatal("Enqueue must surface the fs persistence error")
@@ -184,7 +181,7 @@ func TestFlowOutboxAppendJSONLBranches(t *testing.T) {
 }
 
 func TestFlowOutboxFlushNilDispatch(t *testing.T) {
-	o := NewOutbox(nil)
+	o := mustNewOutboxForTest(nil)
 	if n, err := o.Flush(context.Background(), nil); n != 0 || err != nil {
 		t.Fatalf("nil dispatch flush = %d %v", n, err)
 	}
@@ -192,7 +189,7 @@ func TestFlowOutboxFlushNilDispatch(t *testing.T) {
 
 func TestFlowOutboxDBBatchBound(t *testing.T) {
 	store := &fcOutboxStore{}
-	o := NewOutbox(nil)
+	o := mustNewOutboxForTest(nil)
 	o.db = store
 	d := newOutboxDispatcher()
 	n, err := o.Flush(context.Background(), d.dispatch)
@@ -211,7 +208,7 @@ func TestFlowOutboxDBBatchBound(t *testing.T) {
 }
 
 func TestFlowOutboxDBClaimError(t *testing.T) {
-	o := NewOutbox(nil)
+	o := mustNewOutboxForTest(nil)
 	o.db = &fcOutboxStore{claimErr: errors.New("claim down")}
 	if _, err := o.Flush(context.Background(), func(context.Context, forge.OutboxItem) error { return nil }); err == nil {
 		t.Fatal("claim failure must propagate")
@@ -220,7 +217,7 @@ func TestFlowOutboxDBClaimError(t *testing.T) {
 
 func TestFlowOutboxDBPrunePendingError(t *testing.T) {
 	store := &fcOutboxStore{pendingErr: errors.New("pending read down"), maxClaims: 1}
-	o := NewOutbox(nil)
+	o := mustNewOutboxForTest(nil)
 	o.db = store
 	n, err := o.Flush(context.Background(), func(context.Context, forge.OutboxItem) error { return nil })
 	if err != nil {

@@ -14,7 +14,7 @@ import (
 // most-recent outboxDoneMaxIDs entries survive, the done map matches, and the
 // next compaction threshold is raised.
 func TestTrimDoneLockedBoundsMemory(t *testing.T) {
-	o := NewOutbox(nil)
+	o := mustNewOutboxForTest(nil)
 	for i := 0; i < outboxDoneMaxIDs+50; i++ {
 		id := fmt.Sprintf("id-%d", i)
 		o.doneOrder = append(o.doneOrder, id)
@@ -44,7 +44,7 @@ func TestTrimDoneLockedBoundsMemory(t *testing.T) {
 // rewrite (with its error log arm) when a repository is attached.
 func TestCompactDoneIfNeededPaths(t *testing.T) {
 	// Below the trigger: no-op.
-	o := NewOutbox(nil)
+	o := mustNewOutboxForTest(nil)
 	o.doneOrder = []string{"a"}
 	o.done["a"] = true
 	o.doneCompactAt = 10
@@ -54,7 +54,7 @@ func TestCompactDoneIfNeededPaths(t *testing.T) {
 	}
 
 	// No store: the in-memory trim path.
-	mem := NewOutbox(nil)
+	mem := mustNewOutboxForTest(nil)
 	for i := 0; i < outboxDoneMaxIDs+1; i++ {
 		id := fmt.Sprintf("m-%d", i)
 		mem.doneOrder = append(mem.doneOrder, id)
@@ -68,7 +68,7 @@ func TestCompactDoneIfNeededPaths(t *testing.T) {
 
 	// With a repository: the fs journal is rewritten.
 	dir := t.TempDir()
-	fs := NewOutbox(&storage.Repository{Root: dir})
+	fs := mustNewOutboxForTest(&storage.Repository{Root: dir})
 	fs.items = []forge.OutboxItem{{ID: "pending-1"}}
 	fs.delivered["logical"] = 3
 	for i := 0; i < outboxDoneMaxIDs+1; i++ {
@@ -93,7 +93,9 @@ func TestCompactDoneIfNeededPaths(t *testing.T) {
 	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	bad := NewOutbox(&storage.Repository{Root: blocker})
+	// Constructed directly: NewOutbox on an unreadable root now fails closed
+	// by design, while this test pins compaction's log-not-fatal behavior.
+	bad := &Outbox{store: &storage.Repository{Root: blocker}, done: map[string]bool{}, delivered: map[string]int64{}, doneCompactAt: outboxDoneMaxIDs}
 	for i := 0; i < outboxDoneMaxIDs+1; i++ {
 		bad.doneOrder = append(bad.doneOrder, fmt.Sprintf("b-%d", i))
 	}

@@ -698,15 +698,13 @@ func (s *Server) triggerSchedule(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, storage.ErrStaleLeader) {
-			// The schedule fired against a leader that changed mid-write:
-			// retryable, like the runs API's mapping.
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "scheduler leader changed; retry", "reason": "STALE_LEADER"})
-			return
-		}
-		if errors.Is(err, storage.ErrStaleLeader) {
 			// The trigger reached a replica whose leadership changed before
 			// the enqueue write: retryable against the current leader.
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "scheduler leader changed; retry", "reason": "STALE_LEADER"})
+			return
+		}
+		if errors.Is(err, storage.ErrSchemaIncompatible) {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "database schema requires a newer binary", "reason": "SCHEMA_INCOMPATIBLE"})
 			return
 		}
 		if errors.Is(err, errScheduleUnauthorized) {
@@ -832,10 +830,13 @@ func (s *Server) fireDueSchedules(ctx context.Context, now time.Time) {
 				continue
 			}
 			if errors.Is(err, storage.ErrStaleLeader) {
-				// Leadership changed mid-fire: end this tick; the new
-				// leader's tick retries the occurrence.
-				s.logError("schedule fire lost leadership; retrying next tick", "schedule", d.sc.ID)
-				continue
+				// Leadership changed mid-fire: STOP this tick. Walking the
+				// remaining due occurrences would make every one hit the
+				// leader fence, producing avoidable DB work, failures and
+				// latency during the takeover; the new leader's tick retries
+				// them.
+				s.logError("schedule fire lost leadership; ending tick", "schedule", d.sc.ID)
+				return
 			}
 			if errors.Is(err, errScheduleUnauthorized) {
 				// Trust revoked: skip this occurrence (already audited) and

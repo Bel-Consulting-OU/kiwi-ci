@@ -539,7 +539,7 @@ func TestPostgresIntegrationServerOutboxCancelledFlushReleasesClaims(t *testing.
 		}
 	}
 
-	o := NewOutbox(nil)
+	o := mustNewOutboxForTest(nil)
 	o.AttachDB(stA)
 	flushCtx, cancel := context.WithCancel(ctx)
 	defer cancel()

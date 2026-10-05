@@ -605,6 +605,10 @@ func setupXFSProjectQuotaOnMountHook(workspace string, entry mountInfoEntry, lim
 		// record aborts BEFORE the assignment command: nothing external
 		// exists, so there is nothing to roll back and nothing to leak.
 		if hookErr := onAllocated(assignment); hookErr != nil {
+			// Nothing external exists yet (the hook runs BEFORE the command):
+			// release the just-allocated ID so repeated record failures
+			// cannot drain the process-local pool.
+			releaseXFSProjectID(fsKey, projID)
 			return DiskQuotaStatus{Detail: "record workspace quota ownership: " + hookErr.Error()}, nil,
 				fmt.Errorf("record workspace quota ownership: %w", hookErr)
 		}
@@ -620,7 +624,12 @@ func setupXFSProjectQuotaOnMountHook(workspace string, entry mountInfoEntry, lim
 		// (quarantined) even if that leaks one ID — false retention is much
 		// safer than reuse against ambiguous filesystem state.
 		if cerr := runXFSProjectCleanup(xq, entry.mountPoint, workspace, projID, fsKey); cerr != nil {
-			return DiskQuotaStatus{Detail: fmt.Sprintf("assign XFS project quota: %v (cleanup also failed, the project id stays allocated: %v)", err, cerr)}, nil, nil
+			// Ambiguous side effect with unproven cleanup: this is NOT a
+			// soft "no quota" status. The coordinates stay durably owned via
+			// the caller's ledger entry (written before the command) so the
+			// next incarnation retries the reclaim; the job must not run.
+			return DiskQuotaStatus{Detail: fmt.Sprintf("assign XFS project quota: %v (cleanup also failed, the project id stays allocated: %v)", err, cerr)}, nil,
+				&QuotaCleanupPendingError{Assignment: assignment, Cause: err}
 		}
 		return DiskQuotaStatus{Detail: "assign XFS project quota: " + err.Error()}, nil, nil
 	}
@@ -629,7 +638,10 @@ func setupXFSProjectQuotaOnMountHook(workspace string, entry mountInfoEntry, lim
 		// the same cleanup used on the normal path (it names the ID and
 		// releases it only when both commands succeed).
 		if cerr := runXFSProjectCleanup(xq, entry.mountPoint, workspace, projID, fsKey); cerr != nil {
-			return DiskQuotaStatus{Detail: fmt.Sprintf("apply XFS project hard limit: %v (cleanup also failed, the project id stays allocated: %v)", err, cerr)}, nil, nil
+			// The limit command failed ambiguously and cleanup is unproven:
+			// retain durable ownership (see the assign branch).
+			return DiskQuotaStatus{Detail: fmt.Sprintf("apply XFS project hard limit: %v (cleanup also failed, the project id stays allocated: %v)", err, cerr)}, nil,
+				&QuotaCleanupPendingError{Assignment: assignment, Cause: err}
 		}
 		return DiskQuotaStatus{Detail: "apply XFS project hard limit: " + err.Error()}, nil, nil
 	}
@@ -674,3 +686,21 @@ func runXFSProjectCleanup(xq, mountPoint, workspace string, projID uint32, fsKey
 // can drive the gate without depending on how much space the test host has
 // free — the security property is the gate, not the host's disk.
 var WorkspaceDiskAvailable = safefs.FitsAvailable
+
+// QuotaCleanupPendingError reports an AMBIGUOUS XFS side effect whose cleanup
+// could not be proven: an assignment or hard-limit command failed in a way
+// that may still have applied (timeout, kill, output error), and removing it
+// failed as well. This is NOT the soft "no hard quota available" status: the
+// caller must keep the durable ownership record (the runtime ledger entry)
+// and the workspace intact so the next incarnation retries
+// ReclaimWorkspaceQuota, and the job must not run.
+type QuotaCleanupPendingError struct {
+	Assignment WorkspaceQuotaAssignment
+	Cause      error
+}
+
+func (e *QuotaCleanupPendingError) Error() string {
+	return fmt.Sprintf("workspace quota side effect may exist and cleanup is pending (project %d on %s): %v", e.Assignment.ProjectID, e.Assignment.MountPoint, e.Cause)
+}
+
+func (e *QuotaCleanupPendingError) Unwrap() error { return e.Cause }

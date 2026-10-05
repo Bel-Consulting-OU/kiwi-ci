@@ -78,6 +78,11 @@ type PostgresStore struct {
 	// session, key change, fence mismatch); it is never decremented, and the
 	// durable epoch is only ever advanced with epoch + 1.
 	leaderEpoch atomic.Int64
+	// binarySchemaVersion is this binary's max embedded migration version: the
+	// lease transaction fences against the database's recorded compatibility
+	// floor so a replica that fell behind a newer migration can never claim
+	// new work, even in the check/claim race window.
+	binarySchemaVersion int
 
 	// repoIdentityRepairHooks is a test-only seam for the repository-identity
 	// repair pass (a deterministic barrier for concurrent-writer and
@@ -167,6 +172,12 @@ func NewPostgresOpt(ctx context.Context, dsn string, opts ...PostgresOption) (*P
 		return nil, fmt.Errorf("storage: ping: %w", err)
 	}
 	st := &PostgresStore{pool: pool}
+	// The lease fence needs the binary's max migration version; an embedded
+	// migrations failure is a programming/build error and disables the fence
+	// rather than blocking startup (Migrate would fail loudly anyway).
+	if maxV, err := migrations.MaxVersion(); err == nil {
+		st.binarySchemaVersion = maxV
+	}
 	// Eager advisory-pool initialization: a startup failure surfaces here
 	// instead of during the first fenced operation.
 	if _, err := st.advisoryPool(); err != nil {
@@ -1551,6 +1562,22 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 	for _, r := range claim.PlacementRegions {
 		if err := validateClaimText("placement region", r); err != nil {
 			return model.Job{}, err
+		}
+	}
+
+	// Schema-compatibility fence INSIDE the lease transaction: a newer
+	// replica may apply a migration while an old one is between its check
+	// and this claim. Reading the floor in the same transaction (and with
+	// READ COMMITTED re-evaluating it for the UPDATE below) makes the claim
+	// and the compatibility assertion atomic: if the migration committed
+	// first, this transaction must not issue the lease.
+	if s.binarySchemaVersion > 0 {
+		var floor int
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(compatible_from),0) FROM schema_migrations`).Scan(&floor); err != nil {
+			return model.Job{}, fmt.Errorf("%w: read schema compatibility floor: %v", ErrSchemaIncompatible, err)
+		}
+		if floor > s.binarySchemaVersion {
+			return model.Job{}, fmt.Errorf("%w (floor %d, binary %d)", ErrSchemaIncompatible, floor, s.binarySchemaVersion)
 		}
 	}
 

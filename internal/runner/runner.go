@@ -1130,6 +1130,16 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 			return r.ledgerSetXFS(ledgerID, &a)
 		})
 		if setupErr != nil {
+			var pending *executor.QuotaCleanupPendingError
+			if errors.As(setupErr, &pending) {
+				// The quota command failed in a way that may still have
+				// applied, and its cleanup could not be proven. The ledger
+				// entry (already carrying the assignment coordinates) and
+				// the workspace are RETAINED so the next incarnation retries
+				// ReclaimWorkspaceQuota; the job never runs.
+				r.complete(parent, t, model.StatusFailure, fmt.Errorf("workspace disk quota cleanup pending: %w", setupErr), nil)
+				return
+			}
 			// No workspace may be populated (checkout, dependency restore)
 			// without the hard bound its ledger ownership record exists for.
 			r.ledgerRemove(ledgerID)

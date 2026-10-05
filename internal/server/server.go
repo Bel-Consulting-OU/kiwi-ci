@@ -151,7 +151,6 @@ type Server struct {
 	// readiness probe and the lease/submit gates do not query per request.
 	schemaFloor      int
 	schemaFloorBad   bool
-	schemaFloorOK    bool
 	schemaFloorCheck time.Time
 	// runnerProto records the protocol negotiated at each runner's latest
 	// registration IN THIS PROCESS, and how many registrations this process
@@ -611,7 +610,7 @@ func newServer(token string) *Server {
 		UntrustedDiskCeiling:   10 << 30,
 		UntrustedPIDCeiling:    256,
 		runs:                   map[string]model.Run{}, jobs: map[string]model.Job{}, runners: map[string]model.Runner{}, artifacts: map[string]model.ArtifactRecord{}, reports: map[string]model.TestReport{}, deliveries: map[string]string{}, completions: map[string]model.CompletionReceipt{}, completionReceiptAt: map[string]time.Time{}, generatedFragments: map[string]storage.GeneratedFragmentReceipt{}, leaseKey: key, oidc: newOIDCSigner(),
-		outbox:            NewOutbox(nil),
+		outbox:            mustNewOutbox(nil),
 		AuthStore:         auth.NewTokenStore(),
 		deployments:       map[string]model.Deployment{},
 		snapshots:         map[string]model.SnapshotRecord{},
@@ -789,7 +788,11 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 		}
 	}
 	s.store = storage.New(dataDir)
-	s.outbox = NewOutbox(s.store)
+	ob, oerr := NewOutbox(s.store)
+	if oerr != nil {
+		return nil, oerr
+	}
+	s.outbox = ob
 	// Large runner uploads stage through a shared, bounded budget: default
 	// it under the data dir (never a bare system temp directory) so every
 	// persistent server has a bound. The app wiring supplies the budget it
@@ -1191,7 +1194,43 @@ func (s *Server) Handler() http.Handler {
 	}, h, s.logf)
 	h = s.observeHTTP(h)
 	h = s.tracingMiddleware(h)
+	// Outermost of the semantic wrappers: every DB MUTATION must prove schema
+	// compatibility before it can reach a handler. Readiness-based load
+	// balancer removal is useful but not a transactional boundary — existing
+	// connections, direct URLs, propagation delay or a misconfigured LB can
+	// still route a mutation to a stale replica. A floor READ failure also
+	// refuses (fail closed).
+	h = s.schemaMutationFence(h)
 	return requestID(s.recoverer(s.statusLogger(h)))
+}
+
+// schemaMutationFence refuses every non-read DB request while the database's
+// schema compatibility floor is incompatible with this binary or cannot be
+// read. GET/HEAD/OPTIONS and the health probes stay reachable so
+// orchestration can observe the state.
+func (s *Server) schemaMutationFence(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.DB == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			next.ServeHTTP(w, r)
+			return
+		}
+		switch r.URL.Path {
+		case "/liveness", "/readiness", "/metrics":
+			next.ServeHTTP(w, r)
+			return
+		}
+		if err := s.checkSchemaCompatibility(r.Context()); err != nil {
+			w.Header().Set("X-Kiwi-State", "schema-incompatible")
+			http.Error(w, "database schema requires a newer binary", http.StatusServiceUnavailable)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) auth(next http.Handler) http.Handler {
@@ -1536,6 +1575,10 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		// instead of an opaque 500.
 		if errors.Is(err, storage.ErrStaleLeader) {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "scheduler leader changed; retry", "reason": "STALE_LEADER"})
+			return
+		}
+		if errors.Is(err, storage.ErrSchemaIncompatible) {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "database schema requires a newer binary", "reason": "SCHEMA_INCOMPATIBLE"})
 			return
 		}
 		// A failed snapshot write is a server-side durability failure, not a
@@ -2618,6 +2661,15 @@ func (s *Server) setRunnerProtocol(runnerID string, p int) {
 	s.runnerProto[runnerID] = info
 }
 
+// mustNewOutbox constructs the in-memory outbox (nil store can never fail).
+func mustNewOutbox(store *storage.Repository) *Outbox {
+	o, err := NewOutbox(store)
+	if err != nil {
+		panic(err)
+	}
+	return o
+}
+
 type registerResponse struct {
 	model.Runner
 	Capabilities         []string `json:"capabilities"`
@@ -3422,50 +3474,58 @@ func (s *Server) runnerIncarnationCurrent(ctx context.Context, runnerID, incarna
 	return cur.Incarnation == "" || cur.Incarnation == incarnation
 }
 
-// schemaFloorIncompatible reports whether the database's recorded
-// compatibility floor demands a NEWER binary than this one: an old replica
-// that keeps mutating after a newer replica migrated the schema would
-// operate on shapes it does not understand. The probe is cached for a short
-// window; a probe error is never reported as incompatible (readiness's
-// store-availability check owns that signal).
-func (s *Server) schemaFloorIncompatible(ctx context.Context) bool {
+// checkSchemaCompatibility is the fail-closed compatibility gate for DB
+// mutations. It returns nil only when the database's recorded migration
+// compatibility floor has been POSITIVELY read and is at or below this
+// binary's max migration version:
+//   - a floor read failure returns the error (an old replica must never
+//     mutate on an unproven compatibility state; readiness answers 503),
+//   - an incompatible floor returns storage.ErrSchemaIncompatible.
+//
+// Only the INCOMPATIBLE state is cached (aggressively): a stale refusal is
+// safe and cheap, while a cached "compatible" could outlive a newer
+// replica's migration. The lease path additionally asserts the floor inside
+// its own transaction, so the check/claim race window is closed there.
+func (s *Server) checkSchemaCompatibility(ctx context.Context) error {
 	if s.DB == nil {
-		return false
+		return nil
 	}
 	s.mu.Lock()
-	if s.schemaFloorOK && time.Since(s.schemaFloorCheck) < 10*time.Second {
-		bad := s.schemaFloorBad
+	if s.schemaFloorBad && time.Since(s.schemaFloorCheck) < 60*time.Second {
+		floor, ok := s.schemaFloor, true
 		s.mu.Unlock()
-		return bad
+		if !ok {
+			floor = 0
+		}
+		return fmt.Errorf("%w (floor %d)", storage.ErrSchemaIncompatible, floor)
 	}
 	s.mu.Unlock()
 	floor, err := s.DB.SchemaCompatibilityFloor(ctx)
 	if err != nil {
-		s.mu.Lock()
-		s.schemaFloorCheck = time.Now()
-		s.schemaFloorOK = false
-		s.mu.Unlock()
-		return false
+		return fmt.Errorf("read schema compatibility floor: %w", err)
 	}
 	maxV, err := migrations.MaxVersion()
 	if err != nil {
-		return false
+		return fmt.Errorf("read binary schema version: %w", err)
 	}
 	bad := floor > maxV
 	s.mu.Lock()
 	s.schemaFloor = floor
 	s.schemaFloorBad = bad
-	s.schemaFloorOK = true
 	s.schemaFloorCheck = time.Now()
 	s.mu.Unlock()
 	if bad {
 		s.logError("database schema requires a newer binary; refusing new work", "floor", floor, "binary_max", maxV)
+		return fmt.Errorf("%w (floor %d, binary %d)", storage.ErrSchemaIncompatible, floor, maxV)
 	}
-	return bad
+	return nil
 }
 
 func (s *Server) next(w http.ResponseWriter, r *http.Request) {
-	if s.schemaFloorIncompatible(r.Context()) {
+	if err := s.checkSchemaCompatibility(r.Context()); err != nil {
+		// Fail closed on both an incompatible floor and a floor READ failure:
+		// a runner must never lease from a replica whose compatibility is
+		// unproven.
 		http.Error(w, "database schema requires a newer binary", http.StatusServiceUnavailable)
 		return
 	}

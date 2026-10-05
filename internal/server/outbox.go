@@ -96,15 +96,21 @@ type Outbox struct {
 
 // NewOutbox creates an outbox. When store is non-nil, unflushed intents
 // from a previous process are replayed into the queue.
-func NewOutbox(store *storage.Repository) *Outbox {
+// NewOutbox constructs the filesystem outbox. A corrupt or unreadable
+// journal FAILS construction instead of silently starting empty: the outbox
+// is a durable external-effect component, and manufacturing an empty queue
+// would make every pending intent permanently invisible. The caller must
+// repair or explicitly discard the journal (the error names the file) before
+// the server can start.
+func NewOutbox(store *storage.Repository) (*Outbox, error) {
 	o := &Outbox{store: store, done: map[string]bool{}, delivered: map[string]int64{}, doneCompactAt: outboxDoneMaxIDs}
 	if store == nil {
-		return o
+		return o, nil
 	}
 	if err := o.loadLocked(); err != nil {
-		log.Printf("outbox: replay failed, starting empty: %v", err)
+		return nil, fmt.Errorf("outbox: refusing to start with an unreadable durable journal: %w", err)
 	}
-	return o
+	return o, nil
 }
 
 // AttachDB wires a durable SQL outbox store. DB and fs persistence are
@@ -179,10 +185,17 @@ func (o *Outbox) loadLocked() error {
 	f, err := os.Open(filepath.Join(o.store.Root, outboxDoneFile))
 	if err == nil {
 		sc := bufio.NewScanner(f)
+		line := 0
 		for sc.Scan() {
+			line++
 			var rec outboxDoneRecord
 			if json.Unmarshal(sc.Bytes(), &rec) != nil {
-				continue
+				// A corrupt ACK record must not be skipped: an item whose
+				// acknowledgment is unreadable may look pending and replay a
+				// completed external effect (or hide one that never
+				// completed). Refuse to start until the journal is repaired.
+				_ = f.Close()
+				return fmt.Errorf("%s line %d: corrupt acknowledgment record: %w", outboxDoneFile, line, json.Unmarshal(sc.Bytes(), &rec))
 			}
 			if rec.ID != "" && !done[rec.ID] {
 				done[rec.ID] = true
@@ -191,6 +204,10 @@ func (o *Outbox) loadLocked() error {
 			if rec.LogicalKey != "" && rec.StateVersion > 0 && rec.StateVersion > delivered[rec.LogicalKey] {
 				delivered[rec.LogicalKey] = rec.StateVersion
 			}
+		}
+		if scErr := sc.Err(); scErr != nil {
+			_ = f.Close()
+			return fmt.Errorf("%s: read: %w", outboxDoneFile, scErr)
 		}
 		_ = f.Close()
 	} else if !errors.Is(err, os.ErrNotExist) {

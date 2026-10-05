@@ -126,7 +126,7 @@ func TestOutboxEnqueueHonorsCanceledRequestContext(t *testing.T) {
 		gate:        make(chan struct{}),
 		entered:     make(chan struct{}, 1),
 	}
-	o := NewOutbox(nil)
+	o := mustNewOutboxForTest(nil)
 	o.AttachDB(store)
 
 	canceledEnqueue(t, o, store, forge.OutboxItem{
@@ -154,7 +154,7 @@ func TestOutboxEnqueueHonorsCanceledRequestContext(t *testing.T) {
 // never persisted.
 func TestOutboxVersionedEnqueueCanceledKeepsExistingRow(t *testing.T) {
 	store := &ctxAwareOutboxStore{dbFakeStore: newDBFakeStore()}
-	o := NewOutbox(nil)
+	o := mustNewOutboxForTest(nil)
 	o.AttachDB(store)
 	older := storage.OutboxItem{
 		ID: "logical#1", Kind: forge.OutboxKindGitHubCheck, Payload: []byte(`{"state":"queued"}`),
@@ -214,7 +214,7 @@ func canceledEnqueue(t *testing.T, o *Outbox, store *ctxAwareOutboxStore, item f
 // nothing and ACKing nothing.
 func TestOutboxFlushCanceledContextNeverAcks(t *testing.T) {
 	store := &ctxHonoringOutboxStore{dbFakeStore: newDBFakeStore()}
-	o := NewOutbox(nil)
+	o := mustNewOutboxForTest(nil)
 	o.AttachDB(store)
 	item := forge.OutboxItem{ID: "durable-1", Kind: forge.OutboxKindGitHubStatus, Payload: []byte("{}")}
 	if err := o.Enqueue(context.Background(), item); err != nil {
@@ -321,7 +321,7 @@ func TestBoundedDetachPersistsWhenOriginCanceled(t *testing.T) {
 		gate:        make(chan struct{}),
 		entered:     make(chan struct{}, 1),
 	}
-	o := NewOutbox(nil)
+	o := mustNewOutboxForTest(nil)
 	o.AttachDB(store)
 
 	origin, cancelOrigin := context.WithCancel(context.Background())
@@ -363,7 +363,7 @@ func TestBoundedDetachPersistsWhenOriginCanceled(t *testing.T) {
 // it forever, and the timed-out write leaves nothing behind.
 func TestBoundedDetachIsBounded(t *testing.T) {
 	store := &ctxAwareOutboxStore{dbFakeStore: newDBFakeStore()} // nil gate: waits for the context
-	o := NewOutbox(nil)
+	o := mustNewOutboxForTest(nil)
 	o.AttachDB(store)
 
 	origin, cancelOrigin := context.WithCancel(context.Background())

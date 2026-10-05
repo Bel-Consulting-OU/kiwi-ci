@@ -58,7 +58,7 @@ func (d *outboxDispatcher) total() int {
 // idempotently.
 func TestOutboxDBAckFailureKeepsPendingAndRetries(t *testing.T) {
 	f := newDBFakeStore()
-	o := NewOutbox(nil)
+	o := mustNewOutboxForTest(nil)
 	o.AttachDB(f)
 	item := forge.OutboxItem{Kind: forge.OutboxKindGitHubCheck, Payload: []byte(`{}`)}
 	if err := o.Enqueue(context.Background(), item); err != nil {
@@ -118,7 +118,7 @@ func TestOutboxDBAckFailureKeepsPendingAndRetries(t *testing.T) {
 // queue for the next tick.
 func TestOutboxFSAckFailureKeepsPendingAndRetries(t *testing.T) {
 	dir := t.TempDir()
-	o := NewOutbox(storage.New(dir))
+	o := mustNewOutboxForTest(storage.New(dir))
 	item := testOutboxItem(t, forge.OutboxKindGitHubCheck, `{}`)
 	if err := o.Enqueue(context.Background(), item); err != nil {
 		t.Fatal(err)
@@ -149,7 +149,7 @@ func TestOutboxFSAckFailureKeepsPendingAndRetries(t *testing.T) {
 		t.Fatalf("dispatch calls = %d, want 2 with the stable ID", got)
 	}
 	// A restarted outbox skips the acked intent (done file committed).
-	o2 := NewOutbox(storage.New(dir))
+	o2 := mustNewOutboxForTest(storage.New(dir))
 	if len(o2.Pending()) != 0 {
 		t.Fatalf("replayed pending after ack = %d, want 0", len(o2.Pending()))
 	}
@@ -194,9 +194,9 @@ func TestOutboxDBClaimBatchesDisjoint(t *testing.T) {
 // durable outbox drains.
 func TestOutboxDBConcurrentFlushNoDoubleDispatch(t *testing.T) {
 	f := newDBFakeStore()
-	o1 := NewOutbox(nil)
+	o1 := mustNewOutboxForTest(nil)
 	o1.AttachDB(f)
-	o2 := NewOutbox(nil)
+	o2 := mustNewOutboxForTest(nil)
 	o2.AttachDB(f)
 	const items = 12
 	ids := make([]string, 0, items)
@@ -256,7 +256,7 @@ func TestOutboxDBStaleClaimReclaimed(t *testing.T) {
 	if _, err := f.ClaimOutbox(context.Background(), "crashed-flusher", 1); err != nil {
 		t.Fatal(err)
 	}
-	o := NewOutbox(nil)
+	o := mustNewOutboxForTest(nil)
 	o.AttachDB(f)
 	d := newOutboxDispatcher()
 	// The fresh claim is honored: the replacement flusher gets nothing.
@@ -287,7 +287,7 @@ func TestOutboxDBStaleClaimReclaimed(t *testing.T) {
 // on a crash.
 func TestOutboxDBAppendFailureNeverDispatches(t *testing.T) {
 	f := newDBFakeStore()
-	o := NewOutbox(nil)
+	o := mustNewOutboxForTest(nil)
 	o.AttachDB(f)
 	f.mu.Lock()
 	f.outboxAppendErr = errors.New("db down")
@@ -323,7 +323,7 @@ func TestOutboxDBAppendFailureNeverDispatches(t *testing.T) {
 // of lingering (and is never redispatched).
 func TestOutboxDBReplayPrunesAckedByOtherReplica(t *testing.T) {
 	f := newDBFakeStore()
-	o := NewOutbox(nil)
+	o := mustNewOutboxForTest(nil)
 	o.AttachDB(f)
 	it := forge.OutboxItem{ID: "shared", Kind: forge.OutboxKindGitHubCheck, Payload: []byte("{}")}
 	if err := o.Enqueue(context.Background(), it); err != nil {
@@ -558,7 +558,7 @@ func TestUnknownOutboxKindSurvivesRollingUpgrade(t *testing.T) {
 // (the unknown-kind error included) leaves the item queued instead of
 // removing it, so a downgraded/upgraded binary cannot lose the intent.
 func TestUnknownOutboxKindFSPending(t *testing.T) {
-	o := NewOutbox(nil)
+	o := mustNewOutboxForTest(nil)
 	item := testOutboxItem(t, "future_v2_intent", `{"job_id":"j"}`)
 	if err := o.Enqueue(context.Background(), item); err != nil {
 		t.Fatal(err)

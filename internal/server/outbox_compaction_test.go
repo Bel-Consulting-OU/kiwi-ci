@@ -61,7 +61,7 @@ func TestOutboxDoneJournalCompactionBoundsRestartLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	o := NewOutbox(storage.New(root))
+	o := mustNewOutboxForTest(storage.New(root))
 	// The flush path triggers compaction even with an empty queue.
 	if _, err := o.Flush(context.Background(), func(context.Context, forge.OutboxItem) error { return nil }); err != nil {
 		t.Fatal(err)
@@ -75,7 +75,7 @@ func TestOutboxDoneJournalCompactionBoundsRestartLoad(t *testing.T) {
 	}
 
 	// A restart loads a bounded done set.
-	o2 := NewOutbox(storage.New(root))
+	o2 := mustNewOutboxForTest(storage.New(root))
 	o2.mu.Lock()
 	loaded := len(o2.done)
 	o2.mu.Unlock()
