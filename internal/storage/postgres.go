@@ -1206,7 +1206,7 @@ func (s *PostgresStore) InsertJob(ctx context.Context, job model.Job) error {
 	if err := ValidateRunID(job.RunID); err != nil {
 		return err
 	}
-	tx, err := s.beginSchemaCompatibleTx(ctx)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
@@ -1351,7 +1351,7 @@ func (s *PostgresStore) UpdateJob(ctx context.Context, job model.Job) error {
 	if err != nil {
 		return err
 	}
-	tx, err := s.beginSchemaCompatibleTx(ctx)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
