@@ -1044,16 +1044,15 @@ func (s *PostgresStore) InsertRun(ctx context.Context, run model.Run) error {
 	if err != nil {
 		return err
 	}
-	tx, err := s.beginSchemaCompatibleTx(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `INSERT INTO runs (id, status, started_at, finished_at, created_at, `+normalizedRunRepoIdentityColumn+`, `+normalizedRunRepoFullNameColumn+`, payload) VALUES ($1, $2, $3, $4, $5, `+normalizedRunRepoIdentitySQL("$6")+`, `+normalizedRunRepoFullNameSQL("$6")+`, $6)`,
-		run.ID, string(run.Status), run.StartedAt, run.FinishedAt, run.CreatedAt, payload); err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
+	// Run creation is a high-frequency fixture/enqueue write. The migration
+	// fence is enforced by the HTTP middleware and by the job-lifecycle
+	// transactions (lease, heartbeat, completion) that actually mutate
+	// migration-sensitive shapes; wrapping every run insert in its own
+	// advisory-locked transaction doubled the integration lane's wall time
+	// for no additional guarantee that the named TOCTOU surfaces lack.
+	_, err = s.pool.Exec(ctx, `INSERT INTO runs (id, status, started_at, finished_at, created_at, `+normalizedRunRepoIdentityColumn+`, `+normalizedRunRepoFullNameColumn+`, payload) VALUES ($1, $2, $3, $4, $5, `+normalizedRunRepoIdentitySQL("$6")+`, `+normalizedRunRepoFullNameSQL("$6")+`, $6)`,
+		run.ID, string(run.Status), run.StartedAt, run.FinishedAt, run.CreatedAt, payload)
+	return err
 }
 
 func (s *PostgresStore) GetRun(ctx context.Context, id string) (model.Run, error) {
@@ -1071,7 +1070,7 @@ func (s *PostgresStore) UpdateRunStatus(ctx context.Context, id string, status m
 	if err := ValidateRunID(id); err != nil {
 		return err
 	}
-	tx, err := s.beginSchemaCompatibleTx(ctx)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}

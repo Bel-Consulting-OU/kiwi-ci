@@ -287,10 +287,15 @@ func TestPostgresIntegrationNonLeaseMutationFencedAgainstMigration(t *testing.T)
 		t.Fatal(err)
 	}
 
-	runID := pgITNewID(t)
+	// InsertJob is a fenced job-lifecycle write (the audit's named
+	// non-lease mutation surfaces are heartbeat/completion/enqueue).
+	runID, _ := pgITNewID(t), pgITNewID(t)
+	pgITEnqueueOne(t, st, runID, pgITNewID(t), pgITRepo)
+	newJobID := pgITNewID(t)
+	newJob := pgITJob(runID, newJobID, pgITRepo)
 	done := make(chan error, 1)
 	go func() {
-		done <- st.InsertRun(ctx, model.Run{ID: runID, Repo: pgITRepo, RepoFullName: "kiwi-it/repo", RepoID: pgITRepoID, Status: model.StatusQueued, CreatedAt: time.Now().UTC()})
+		done <- st.InsertJob(ctx, newJob)
 	}()
 	select {
 	case err := <-done:
@@ -309,10 +314,10 @@ func TestPostgresIntegrationNonLeaseMutationFencedAgainstMigration(t *testing.T)
 		t.Fatal("mutation never returned")
 	}
 	var exists bool
-	if err := st.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM runs WHERE id=$1)`, runID).Scan(&exists); err != nil {
+	if err := st.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM jobs WHERE id=$1)`, newJobID).Scan(&exists); err != nil {
 		t.Fatal(err)
 	}
 	if exists {
-		t.Fatal("incompatible mutation committed a run row")
+		t.Fatal("incompatible mutation committed a job row")
 	}
 }
