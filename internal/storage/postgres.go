@@ -5493,8 +5493,15 @@ func (s *PostgresStore) applyMigration(ctx context.Context, m migrations.Migrati
 		}
 		if storedDigest == "" || storedName == "" {
 			// Pre-identity row (upgraded database): record the digest once.
-			// This is trust-on-first-use for migrations applied before the
-			// identity columns existed; every later run verifies it.
+			// TRUST-ON-FIRST-USE: for a database that predates the identity
+			// columns, the schema it actually contains cannot be
+			// reconstructed here. The digests.golden gate guarantees no
+			// SHIPPED migration is ever edited going forward, and the
+			// release policy is that historical migrations were immutable;
+			// an operator wanting maximum assurance should verify the
+			// legacy schema shape (tables/columns/indexes) before blessing
+			// the empty historical hashes. Every later run verifies the
+			// recorded digest.
 			if _, err := tx.Exec(ctx,
 				`UPDATE schema_migrations SET name=$2, sha256=$3, compatible_from=GREATEST(compatible_from,$4) WHERE version=$1`,
 				m.Version, m.Name, m.Digest, m.CompatibleFrom); err != nil {
