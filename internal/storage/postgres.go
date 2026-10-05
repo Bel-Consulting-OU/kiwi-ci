@@ -1565,13 +1565,20 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 		}
 	}
 
-	// Schema-compatibility fence INSIDE the lease transaction: a newer
-	// replica may apply a migration while an old one is between its check
-	// and this claim. Reading the floor in the same transaction (and with
-	// READ COMMITTED re-evaluating it for the UPDATE below) makes the claim
-	// and the compatibility assertion atomic: if the migration committed
-	// first, this transaction must not issue the lease.
+	// Schema-compatibility fence SERIALIZED against migrations. READ
+	// COMMITTED alone does NOT close this race: the floor SELECT and the
+	// later UPDATE are separate snapshots, so a migration committing between
+	// them would still let this transaction issue a lease. The fix is the
+	// advisory-lock protocol migrations already use:
+	//   - migrations take pg_advisory_xact_lock('kiwi_schema_migrations'),
+	//   - this transaction takes the SHARED form, then reads the floor.
+	// Ordering is therefore total: either the lease's shared lock blocks the
+	// migration until the lease commits, or the migration committed first and
+	// the floor read below observes the new floor and refuses.
 	if s.binarySchemaVersion > 0 {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(hashtext('kiwi_schema_migrations'))`); err != nil {
+			return model.Job{}, fmt.Errorf("%w: acquire schema consistency lock: %v", ErrSchemaIncompatible, err)
+		}
 		var floor int
 		if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(compatible_from),0) FROM schema_migrations`).Scan(&floor); err != nil {
 			return model.Job{}, fmt.Errorf("%w: read schema compatibility floor: %v", ErrSchemaIncompatible, err)

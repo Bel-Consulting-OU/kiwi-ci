@@ -117,3 +117,143 @@ func TestPostgresIntegrationLeaseFenceRejectsIncompatibleFloor(t *testing.T) {
 		t.Fatalf("job status = %q, want queued (no lease issued)", status)
 	}
 }
+
+// schemaLockKey is the advisory-lock namespace migrations and the lease
+// fence share.
+const schemaLockKeySQL = `hashtext('kiwi_schema_migrations')`
+
+// TestLeaseSchemaFloorFenceSerializesAgainstMigration is a REAL two-
+// transaction interleaving test, not a sequential one: while a migration
+// transaction holds the exclusive schema lock (uncommitted), a lease claim
+// must BLOCK on the shared lock; committing the migration first makes the
+// claim observe the new incompatible floor and refuse without touching the
+// job row.
+func TestLeaseSchemaFloorFenceSerializesAgainstMigration(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	maxV, err := migrations.MaxVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runnerID := pgITNewID(t)
+	if err := st.UpsertRunner(ctx, model.Runner{ID: runnerID, Name: runnerID, Capacity: 1,
+		ReportedCapabilities: []string{"native"}, Capabilities: []string{"native"}, CapabilitiesEnforced: true}); err != nil {
+		t.Fatalf("seed runner: %v", err)
+	}
+	runID, jobID := pgITNewID(t), pgITNewID(t)
+	pgITEnqueueOne(t, st, runID, jobID, pgITRepo)
+	claim := LeaseClaim{JobID: jobID, RunnerID: runnerID, TokenHash: []byte("h"), Generation: 1,
+		Runtime: "native", ExpiresAt: time.Now().UTC().Add(time.Hour)}
+
+	// The migration transaction: exclusive lock + floor advance, NOT committed.
+	migConn, err := st.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migConn.Release()
+	migTx, err := migConn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migTx.Rollback(ctx)
+	if _, err := migTx.Exec(ctx, `SELECT pg_advisory_xact_lock(`+schemaLockKeySQL+`)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := migTx.Exec(ctx, `UPDATE schema_migrations SET compatible_from=$1 WHERE version=$2`, maxV+1, maxV); err != nil {
+		t.Fatal(err)
+	}
+
+	// The lease claim must block: it cannot acquire the shared lock while
+	// the exclusive migration lock is held.
+	type res struct {
+		job model.Job
+		err error
+	}
+	done := make(chan res, 1)
+	go func() {
+		j, err := st.AcquireLeaseAtomic(ctx, claim)
+		done <- res{j, err}
+	}()
+	select {
+	case r := <-done:
+		t.Fatalf("lease did not serialize against the migration: got (%v, %v)", r.job.ID, r.err)
+	case <-time.After(1200 * time.Millisecond):
+	}
+	// Commit the migration: the claim unblocks and must observe the new
+	// incompatible floor.
+	if err := migTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-done:
+		if !errors.Is(r.err, ErrSchemaIncompatible) {
+			t.Fatalf("claim after the migration committed = %v, want ErrSchemaIncompatible", r.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("claim never returned after the migration committed")
+	}
+	var status string
+	if err := st.pool.QueryRow(ctx, `SELECT status FROM jobs WHERE id=$1`, jobID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("job status = %q, want queued (no lease committed)", status)
+	}
+}
+
+// TestMigrationWaitsForLeaseSharedLock is the inverse ordering: a lease
+// transaction holding the shared lock keeps a migration's exclusive lock
+// waiting until the lease commits.
+func TestMigrationWaitsForLeaseSharedLock(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	holder, err := st.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Release()
+	holderTx, err := holder.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holderTx.Rollback(ctx)
+	if _, err := holderTx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(`+schemaLockKeySQL+`)`); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		mig, err := st.pool.Acquire(ctx)
+		if err != nil {
+			done <- err
+			return
+		}
+		defer mig.Release()
+		tx, err := mig.Begin(ctx)
+		if err != nil {
+			done <- err
+			return
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(`+schemaLockKeySQL+`)`); err != nil {
+			done <- err
+			return
+		}
+		done <- tx.Commit(ctx)
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("migration did not wait for the shared schema lock: %v", err)
+	case <-time.After(1200 * time.Millisecond):
+	}
+	if err := holderTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("migration after the lease released: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("migration never proceeded after the lease committed")
+	}
+}
