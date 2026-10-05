@@ -1200,6 +1200,14 @@ func (s *Server) Handler() http.Handler {
 	// connections, direct URLs, propagation delay or a misconfigured LB can
 	// still route a mutation to a stale replica. A floor READ failure also
 	// refuses (fail closed).
+	//
+	// Residual scope: this check runs BEFORE the handler, so a migration
+	// committing in the window between the check and the handler's write is
+	// not excluded by it alone. The LEASE path (the one that assigns host
+	// work) additionally takes the shared schema lock and re-reads the floor
+	// inside its own transaction; other storage mutations use the fence plus
+	// their own transactions and are expected to keep using the same shared
+	// lock when they gain multi-statement shapes.
 	h = s.schemaMutationFence(h)
 	return requestID(s.recoverer(s.statusLogger(h)))
 }
