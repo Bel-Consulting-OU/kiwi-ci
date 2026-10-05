@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strconv"
@@ -368,7 +369,7 @@ func validateServiceImages(services []pipeline.Service, runID, jobID string, req
 // the documented fair split of the job's envelope (allocating the remaining
 // budget across the remaining services); a job whose service declarations
 // genuinely cannot fit its own resource envelope fails closed.
-func startContainerServices(ctx context.Context, runID, jobID string, services []pipeline.Service, jobResources pipeline.Resources, isolated, requireImmutable bool, cgroupParent string, emit func(string)) (string, func(), error) {
+func startContainerServices(ctx context.Context, runID, jobID string, services []pipeline.Service, jobResources pipeline.Resources, isolated, requireImmutable bool, cgroupParent string, emit func(string)) (string, func() error, error) {
 	return startContainerServicesOwned(ctx, runID, jobID, runtimeOwner{}, services, jobResources, isolated, requireImmutable, cgroupParent, emit)
 }
 
@@ -376,13 +377,14 @@ func startContainerServices(ctx context.Context, runID, jobID string, services [
 // process incarnation: service containers and the services network carry
 // kiwi.runner/kiwi.instance labels so a restarted runner can reconcile its
 // predecessor's resources before leasing new work.
-func startContainerServicesOwned(ctx context.Context, runID, jobID string, owner runtimeOwner, services []pipeline.Service, jobResources pipeline.Resources, isolated, requireImmutable bool, cgroupParent string, emit func(string)) (string, func(), error) {
+func startContainerServicesOwned(ctx context.Context, runID, jobID string, owner runtimeOwner, services []pipeline.Service, jobResources pipeline.Resources, isolated, requireImmutable bool, cgroupParent string, emit func(string)) (string, func() error, error) {
+	noopCleanup := func() error { return nil }
 	if err := validateServiceImages(services, runID, jobID, requireImmutable); err != nil {
-		return "", func() {}, err
+		return "", noopCleanup, err
 	}
 	docker, err := exec.LookPath("docker")
 	if err != nil {
-		return "", func() {}, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("docker not found: %w", err)}
+		return "", noopCleanup, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("docker not found: %w", err)}
 	}
 	network := serviceNetworkName(runID, jobID)
 	createArgs := append(serviceNetworkArgs(isolated), "--label", "kiwi.run="+runID, network)
@@ -396,24 +398,28 @@ func startContainerServicesOwned(ctx context.Context, runID, jobID string, owner
 	// control ceiling (min with the job context), so a wedged daemon cannot
 	// stall an unbounded job.
 	if out, err := phaseCommand(ctx, runtimeControlTimeout, docker, append([]string{"network"}, createArgs...)...); err != nil {
-		return "", func() {}, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("create services network: %w: %s", err, strings.TrimSpace(string(out)))}
+		return "", noopCleanup, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("create services network: %w: %s", err, strings.TrimSpace(string(out)))}
 	}
 	containers := make([]string, 0, len(services))
-	cleanup := func() {
+	cleanup := func() error {
+		var errs []error
 		for _, name := range containers {
 			if err := dockerCleanupCommand(ctx, docker, "rm", "-f", name); err != nil {
 				emit("cleanup required: " + err.Error())
+				errs = append(errs, fmt.Errorf("remove service container %s: %w", name, err))
 			}
 		}
 		if err := dockerCleanupCommand(ctx, docker, "network", "rm", network); err != nil {
 			emit("cleanup required: " + err.Error())
+			errs = append(errs, fmt.Errorf("remove service network %s: %w", network, err))
 		}
+		return errors.Join(errs...)
 	}
-	cleanupAll := func() { cleanup() }
+	cleanupAll := func() { _ = cleanup() }
 	plan, planErr := serviceAllocationPlan(jobResources, services)
 	if planErr != nil {
 		cleanupAll()
-		return "", func() {}, &RunError{Kind: ErrorPolicy, Err: planErr}
+		return "", noopCleanup, &RunError{Kind: ErrorPolicy, Err: planErr}
 	}
 	for i, svc := range services {
 		name := serviceContainerName(runID, jobID, i)
@@ -447,7 +453,7 @@ func startContainerServicesOwned(ctx context.Context, runID, jobID string, owner
 		args = append(args, "--", svc.Image)
 		if out, err := phaseCommand(ctx, runtimeSetupTimeout, docker, args...); err != nil {
 			cleanupAll()
-			return "", func() {}, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("start service %q: %w: %s", display, err, strings.TrimSpace(string(out)))}
+			return "", func() error { return nil }, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("start service %q: %w: %s", display, err, strings.TrimSpace(string(out)))}
 		}
 		containers = append(containers, name)
 		emit("service " + display + " started (" + svc.Image + ")")
@@ -489,12 +495,12 @@ func startContainerServicesOwned(ctx context.Context, runID, jobID string, owner
 				if truncated {
 					detail += " [output truncated]"
 				}
-				return "", func() {}, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("service %q healthcheck failed: %v: %s", display, hcErr, detail)}
+				return "", func() error { return nil }, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("service %q healthcheck failed: %v: %s", display, hcErr, detail)}
 			}
 			select {
 			case <-ctx.Done():
 				cleanupAll()
-				return "", func() {}, &RunError{Kind: ErrorCancelled, Err: ctx.Err()}
+				return "", func() error { return nil }, &RunError{Kind: ErrorCancelled, Err: ctx.Err()}
 			case <-time.After(interval):
 			}
 		}

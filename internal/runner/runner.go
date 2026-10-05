@@ -356,8 +356,17 @@ type Runner struct {
 	// runner identity: the server supersedes it on re-registration, so an
 	// older process with copied credentials stops polling.
 	incarnation string
-	Client      *http.Client
-	Metrics     *Metrics
+	// recoveryDebt marks cleanup failures discovered DURING this
+	// incarnation: external state whose removal could not be proven. While
+	// set the runner accepts no new leases; once in-flight jobs finish it
+	// attempts one bounded in-process reconciliation, and if that cannot
+	// clear the debt Run exits non-zero so the supervisor restarts it and
+	// startup reconciliation (fail-closed) owns the recovery.
+	recoveryDebt atomic.Bool
+	// recoveryDebtReason is the first debt report, for the exit error.
+	recoveryDebtReason atomic.Value // string
+	Client             *http.Client
+	Metrics            *Metrics
 	// StreamClient carries bulk transfers (artifact/cache/snapshot/dependency
 	// uploads and downloads). It deliberately has no total timeout: the
 	// transport bounds dial/TLS-handshake/response-header phases and each
@@ -666,6 +675,28 @@ func (r *Runner) Run(ctx context.Context) error {
 	// remotely), which flips this to true mid-run.
 	draining := r.Cfg.Drain
 	for {
+		// Cleanup debt from THIS incarnation stops new leases immediately.
+		// In-flight jobs may finish; when the last one does, one bounded
+		// reconciliation pass either clears the debt (resume) or fails Run
+		// so the process restarts and startup reconciliation owns recovery.
+		if r.recoveryDebt.Load() {
+			if active == 0 {
+				if err := r.reconcileRecoveryDebt(runCtx); err != nil {
+					stop()
+					return fmt.Errorf("runner %s: %w", r.ID, err)
+				}
+			} else {
+				select {
+				case <-done:
+					active--
+				case <-time.After(r.Cfg.Poll):
+				case <-runCtx.Done():
+					stop()
+					return runCtx.Err()
+				}
+				continue
+			}
+		}
 		// Fill every free local execution slot before sleeping. The control plane
 		// independently capacity-checks this runner, so a race cannot over-lease it.
 		for active < r.Cfg.Concurrency {
@@ -1136,7 +1167,15 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 				// applied, and its cleanup could not be proven. The ledger
 				// entry (already carrying the assignment coordinates) and
 				// the workspace are RETAINED so the next incarnation retries
-				// ReclaimWorkspaceQuota; the job never runs.
+				// ReclaimWorkspaceQuota; the job never runs. The runner also
+				// enters its no-new-lease debt state: identical debt noticed
+				// at startup fails closed, and runtime debt must not be
+				// weaker.
+				r.noteRecoveryDebt(executor.CleanupDebt{
+					Kind:     executor.CleanupXFSQuota,
+					Resource: fmt.Sprintf("project %d on %s", pending.Assignment.ProjectID, pending.Assignment.MountPoint),
+					Err:      setupErr,
+				})
 				r.complete(parent, t, model.StatusFailure, fmt.Errorf("workspace disk quota cleanup pending: %w", setupErr), nil)
 				return
 			}
@@ -1156,9 +1195,15 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// live bind-mounted container may still own.
 	runtimeCloseFailed := false
 	defer func() {
+		// Debt reported during THIS job covers main-runtime, services and
+		// cgroup cleanup alike: retain the workspace, the quota and the
+		// crash-recovery entry so the next pass can reclaim them.
+		if r.recoveryDebt.Load() {
+			runtimeCloseFailed = true
+		}
 		cleanupOK := !runtimeCloseFailed
 		if runtimeCloseFailed {
-			fmt.Fprintf(os.Stderr, "kiwi runner %s: runtime removal for %s was not proven; retaining workspace, quota and crash-recovery entry\n", r.ID, t.Job.ID)
+			fmt.Fprintf(os.Stderr, "kiwi runner %s: cleanup for %s was not proven (debt retained); keeping workspace, quota and crash-recovery entry\n", r.ID, t.Job.ID)
 		} else if quotaCleanup != nil {
 			if qerr := quotaCleanup(); qerr != nil {
 				fmt.Fprintf(os.Stderr, "kiwi runner %s: remove workspace quota for %s: %v (entry retained for reclaim)\n", r.ID, t.Job.ID, qerr)
@@ -1501,7 +1546,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	opts.RequireUntrustedDiskQuota = requireDiskQuota
 	opts.WorkspaceQuota = workspaceQuota
 
-	opts.OnRuntimeCloseError = func(error) { runtimeCloseFailed = true }
+	opts.OnCleanupDebt = r.noteRecoveryDebt
 	// Step durations come from the executor's wall-clock step measurements
 	// (StepReporter), never from sink-derived log timing.
 	applyStepReporter(&opts, r.Metrics)
@@ -3345,4 +3390,36 @@ func sanitizeControlBytes(b []byte) string {
 		out = append(out, c)
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// noteRecoveryDebt records one cleanup-debt report from the executor and
+// degrades the runner: no new leases until reconciliation clears it.
+func (r *Runner) noteRecoveryDebt(d executor.CleanupDebt) {
+	if reason, _ := r.recoveryDebtReason.Load().(string); reason == "" {
+		r.recoveryDebtReason.Store(fmt.Sprintf("%s %s: %v", d.Kind, d.Resource, d.Err))
+	}
+	if !r.recoveryDebt.Swap(true) {
+		fmt.Fprintf(os.Stderr, "kiwi runner %s: cleanup debt (%s %s): %v; no new leases until reconciled\n", r.ID, d.Kind, d.Resource, d.Err)
+	}
+}
+
+// reconcileRecoveryDebt attempts one bounded in-process reclaim pass over
+// this runner's ledger entries (including current-incarnation ones: no jobs
+// are in flight when it runs). A clean pass clears the debt and the runner
+// may resume leasing; any unresolved entry keeps the debt and returns the
+// error, which Run surfaces as a non-zero exit.
+func (r *Runner) reconcileRecoveryDebt(ctx context.Context) error {
+	if !r.recoveryDebt.Load() {
+		return nil
+	}
+	// A synthetic instance id different from ours makes the pass treat
+	// current-incarnation entries as reclaimable (all jobs have finished).
+	res, err := r.reconcileRuntimeLedger(r.instanceID + "-recovery")
+	if err != nil {
+		return fmt.Errorf("recovery debt unresolved: %w", err)
+	}
+	r.recoveryDebt.Store(false)
+	r.recoveryDebtReason.Store("")
+	fmt.Fprintf(os.Stderr, "kiwi runner %s: recovered %d debt entr(ies); resuming leases\n", r.ID, res.Reclaimed)
+	return nil
 }

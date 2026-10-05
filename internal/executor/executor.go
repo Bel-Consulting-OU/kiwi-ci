@@ -46,13 +46,16 @@ type Options struct {
 	// as it exists so the caller (the runner's runtime ledger) can reclaim it
 	// after a hard crash.
 	OnCgroupCreated func(parent string) error
-	// OnRuntimeCloseError, when set, is called when the runtime backend could
-	// NOT prove its resource removed (for example docker rm failed). The
-	// caller must then RETAIN the workspace, quota and crash-recovery ledger
-	// entry: the runtime may still hold the bind mount.
-	OnRuntimeCloseError func(error)
-	MaxParallel         int
-	OnlyJob             string
+	// OnCleanupDebt, when set, is called whenever ANY runtime cleanup
+	// primitive cannot prove its resource removed: the main backend, a
+	// service container, the service network, or the job-scoped cgroup. The
+	// caller must treat every report uniformly: RETAIN the workspace, quota
+	// and crash-recovery ledger entry AND stop accepting new leases until
+	// reconciliation clears the debt (a bounded in-process pass may clear it;
+	// otherwise the runner exits so startup reconciliation owns recovery).
+	OnCleanupDebt func(CleanupDebt)
+	MaxParallel   int
+	OnlyJob       string
 	// OnlyStep, when set, executes just the named step (by step ID or by
 	// resolved name, including canary./verify./rollback. prefixes) of the
 	// selected job. Used by `kiwi replay RUN JOB STEP`. Steps that do not
@@ -591,7 +594,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		networkPolicy = pipeline.NetworkPolicyNone
 	}
 	network := cj.Job.Network
-	var cleanupServices func()
+	var cleanupServices func() error
 	// sandbox.rootless is a promise about the daemon, not the container:
 	// verify it before any service container or job container is started on
 	// that daemon, so services never run on a rootful daemon for a job that
@@ -659,6 +662,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			defer func() {
 				if cerr := cgCleanup(); cerr != nil {
 					e.log(cj.ID, "service", "job cgroup cleanup warning: "+cerr.Error())
+					e.reportCleanupDebt(CleanupCgroup, cgroupParent, cerr)
 				}
 			}()
 			e.log(cj.ID, "service", "job resource cgroup: "+cgStatus.Detail)
@@ -673,7 +677,15 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			res.Error = er.Error()
 			return finish(res)
 		}
-		defer cleanupServices()
+		defer func() {
+			if cerr := cleanupServices(); cerr != nil {
+				// A service container or the service network could not be
+				// proven removed: the job cgroup keeps hosting it, so the
+				// runner must retain the workspace/quota/ledger and stop new
+				// leases until reconciliation clears the debt.
+				e.reportCleanupDebt(CleanupService, cj.ID, cerr)
+			}
+		}()
 	} else if networkPolicy == pipeline.NetworkPolicyNone || networkPolicy == pipeline.NetworkPolicyServicesOnly {
 		// No services to reach: fully disable networking. The container
 		// backend honors network "none"; the tart backend fails closed.
@@ -736,9 +748,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		if closeJob != nil {
 			if err := closeJob(); err != nil {
 				e.log(cj.ID, "runtime", "cleanup warning: "+err.Error())
-				if e.Opt.OnRuntimeCloseError != nil {
-					e.Opt.OnRuntimeCloseError(err)
-				}
+				e.reportCleanupDebt(CleanupMainRuntime, cj.ID, err)
 			}
 		}
 		e.sessions.delete(cj.ID)
@@ -1313,6 +1323,33 @@ func localDownloadDest(inPath string) (string, error) {
 		return "", nil
 	}
 	return filepath.ToSlash(clean), nil
+}
+
+// CleanupKind names the runtime subsystem whose removal could not be proven.
+type CleanupKind string
+
+const (
+	CleanupMainRuntime CleanupKind = "main-runtime"
+	CleanupService     CleanupKind = "service-container-or-network"
+	CleanupCgroup      CleanupKind = "job-cgroup"
+	CleanupXFSQuota    CleanupKind = "xfs-project-quota"
+)
+
+// CleanupDebt is one unproven-removal report: the durable recovery ledger
+// must keep the coordinates and no new leases may be accepted until the debt
+// is reconciled.
+type CleanupDebt struct {
+	Kind     CleanupKind
+	Resource string
+	Err      error
+}
+
+// reportCleanupDebt forwards one cleanup-debt report to the caller.
+func (e *Executor) reportCleanupDebt(kind CleanupKind, resource string, err error) {
+	if err == nil || e.Opt.OnCleanupDebt == nil {
+		return
+	}
+	e.Opt.OnCleanupDebt(CleanupDebt{Kind: kind, Resource: resource, Err: err})
 }
 
 // artifactCaptureLimit intersects the global artifact payload ceiling with
