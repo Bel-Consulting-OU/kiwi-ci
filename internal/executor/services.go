@@ -73,17 +73,20 @@ func boundedNormalizedName(raw string, limit int) string {
 const maxServiceContainerNameLen = 200
 
 // serviceContainerName derives the globally unique physical docker container
-// name for one declared service: kiwi-svc-<run>-<job>-<index>. The name is
-// ALWAYS physical, never the user-facing alias, because docker container names
-// are global to the daemon: two concurrent jobs on one runner may both declare
-// a service aliased "postgres", and each must get its own container. The
-// user-facing alias is attached separately with --network-alias (see
-// serviceAlias), scoped to the job's own network, where uniqueness is
-// guaranteed by pipeline validation. Over-long identities are bounded by
-// boundedNormalizedName, which hashes the full identity, so two sanitized
-// names sharing a long prefix can never collapse onto one container.
+// name for one declared service: kiwi-svc-<run>-<job>-<index>-<unique-nano>.
+// The name is ALWAYS physical, never the user-facing alias, because docker
+// container names are global to the daemon: two concurrent jobs on one runner
+// may both declare a service aliased "postgres", and each must get its own
+// container. The user-facing alias is attached separately with
+// --network-alias (see serviceAlias), scoped to the job's own network, where
+// uniqueness is guaranteed by pipeline validation. The per-attempt monotonic
+// suffix keeps retries and concurrent attempts for the same run/job from
+// addressing (or removing) each other's same-identity containers. Over-long
+// identities are bounded by boundedNormalizedName, which hashes the full
+// identity INCLUDING the suffix, so two sanitized names sharing a long prefix
+// can never collapse onto one container.
 func serviceContainerName(runID, jobID string, index int) string {
-	return boundedNormalizedName(fmt.Sprintf("kiwi-svc-%s-%s-%d", runID, jobID, index+1), maxServiceContainerNameLen)
+	return boundedNormalizedName(fmt.Sprintf("kiwi-svc-%s-%s-%d-%d", runID, jobID, index+1, nextPhysicalNano()), maxServiceContainerNameLen)
 }
 
 // maxServiceNetworkNameLen bounds the job's physical docker network name.
@@ -95,13 +98,16 @@ func serviceContainerName(runID, jobID string, index int) string {
 const maxServiceNetworkNameLen = 60
 
 // serviceNetworkName derives the physical docker network name for one job:
-// kiwi-net-<run>-<job>, normalized and bounded by boundedNormalizedName. When
-// the full normalized identity exceeds 60 characters the name becomes
-// full[:60-17] + "-" + the first 16 hex characters of the SHA-256 of the FULL
-// identity, so distinct jobs always own distinct networks (isolation and
-// cleanup stay injective) and short identities keep their historical name.
+// kiwi-net-<run>-<job>-<unique-nano>, normalized and bounded by
+// boundedNormalizedName. The per-attempt monotonic suffix keeps a retried or
+// concurrent attempt for the same run/job from addressing (and removing) a
+// network a different attempt/owner created. When the full normalized
+// identity exceeds 60 characters the name becomes full[:60-17] + "-" + the
+// first 16 hex characters of the SHA-256 of the FULL identity (including the
+// suffix), so distinct identities always own distinct networks (isolation and
+// cleanup stay injective) and the kiwi-net- prefix survives bounding.
 func serviceNetworkName(runID, jobID string) string {
-	return boundedNormalizedName(fmt.Sprintf("kiwi-net-%s-%s", runID, jobID), maxServiceNetworkNameLen)
+	return boundedNormalizedName(fmt.Sprintf("kiwi-net-%s-%s-%d", runID, jobID, nextPhysicalNano()), maxServiceNetworkNameLen)
 }
 
 // serviceAlias derives the user-facing network alias for one service: the
@@ -120,12 +126,15 @@ func serviceAlias(svc pipeline.Service) string {
 }
 
 // serviceDisplayName is the name used in user-facing messages and errors: the
-// declared alias when there is one, the physical container name otherwise.
-func serviceDisplayName(runID, jobID string, index int, svc pipeline.Service) string {
+// declared alias when there is one, the caller-supplied physical container
+// name otherwise. The physical name is passed in (instead of re-derived) so
+// the display name is always the SAME unique name the container actually
+// carries: physical names are per-attempt unique now.
+func serviceDisplayName(physical string, svc pipeline.Service) string {
 	if alias := serviceAlias(svc); alias != "" {
 		return alias
 	}
-	return serviceContainerName(runID, jobID, index)
+	return physical
 }
 
 // Per-service resource defaults: the limits one service container gets when
@@ -339,7 +348,7 @@ func serviceEnvelopeSummary(jobResources pipeline.Resources, services []pipeline
 // daemon can never mask an unpinned service image.
 func validateServiceImages(services []pipeline.Service, runID, jobID string, requireImmutable bool) error {
 	for i, svc := range services {
-		name := serviceDisplayName(runID, jobID, i, svc)
+		name := serviceDisplayName(serviceContainerName(runID, jobID, i), svc)
 		if svc.Image == "" {
 			return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("service %q has no image", name)}
 		}
@@ -396,7 +405,7 @@ func startContainerServicesOwned(ctx context.Context, runID, jobID string, owner
 		return "", noopCleanup, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("docker not found: %w", err)}
 	}
 	network := serviceNetworkName(runID, jobID)
-	createArgs := append(serviceNetworkArgs(isolated), "--label", "kiwi.run="+runID, network)
+	createArgs := append(serviceNetworkArgs(isolated), "--label", "kiwi.run="+runID, "--label", "kiwi.job="+jobID, network)
 	if owner.RunnerID != "" {
 		createArgs = append(createArgs, "--label", "kiwi.runner="+owner.RunnerID)
 		if owner.InstanceID != "" {
@@ -443,7 +452,7 @@ func startContainerServicesOwned(ctx context.Context, runID, jobID string, owner
 	}
 	for i, svc := range services {
 		name := serviceContainerName(runID, jobID, i)
-		display := serviceDisplayName(runID, jobID, i, svc)
+		display := serviceDisplayName(name, svc)
 		alloc := plan[i]
 		// Every service runs maximally hardened. The user is hard-coded to
 		// 65534:65534 (nobody) rather than omitted: images known to require
@@ -499,7 +508,7 @@ func startContainerServicesOwned(ctx context.Context, runID, jobID string, owner
 		// Healthchecks always target the physical name: it is the container
 		// the daemon knows, the alias is network-scoped (DNS) only.
 		name := containers[i]
-		display := serviceDisplayName(runID, jobID, i, svc)
+		display := serviceDisplayName(name, svc)
 		for attempt := 0; attempt <= retries; attempt++ {
 			hcCtx, cancel := context.WithTimeout(ctx, timeout)
 			hcArgs := append([]string{"exec", name}, shellCommand("sh", svc.Healthcheck)...)

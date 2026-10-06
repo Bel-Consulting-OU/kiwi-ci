@@ -319,9 +319,24 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 		// --security-opt=no-new-privileges (moby/runC EPERM). The hold
 		// container is job-scoped and destroyed at close, so the only
 		// residual from running without --init is PID1 zombie reaping
-		// inside a container that never outlives the job. Retry ONCE
-		// without --init, loudly, so every other failure mode keeps the
-		// hardened profile unchanged.
+		// inside a container that never outlives the job.
+		//
+		// The failed run may still have CREATED the container before the
+		// init exec failed (ambiguous create). Retrying with the SAME name
+		// without proving absence would then fail with "container already
+		// exists" and lose the init fallback while a bare container kept
+		// running. Bounded remove-by-name is the only proof: rm exiting 0
+		// or reporting "No such container" allows the retry, anything else
+		// keeps the identity (and every workspace protection) and reports
+		// cleanup debt instead of retrying.
+		if rmErr := dockerCleanupCommand(ctx, b.docker, "rm", "-f", b.container); rmErr != nil && !isContainerAbsentError(rmErr) {
+			if b.ReportCleanupDebt != nil {
+				b.ReportCleanupDebt(CleanupMainRuntime, b.container, err)
+			}
+			return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("start job container: %w: %s (container may exist; init fallback not attempted: %v)", err, strings.TrimSpace(string(out)), rmErr)}
+		}
+		// Absence proven: Retry ONCE without --init, loudly, so every other
+		// failure mode keeps the hardened profile unchanged.
 		emit("warning: container init is unavailable on this daemon (docker-init EPERM); retrying without --init (zombie reaping residual is job-scoped)")
 		args = withoutFlag(args, "--init")
 		out, err = phaseCommand(ctx, runtimeSetupTimeout, docker, args...)

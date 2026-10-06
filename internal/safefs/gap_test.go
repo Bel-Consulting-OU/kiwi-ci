@@ -776,11 +776,45 @@ func TestExtractMkdirPermissionError(t *testing.T) {
 }
 
 // TestExtractTruncatedEntry proves a truncated regular entry fails the
-// extraction copy.
+// extraction copy and leaves no partial member behind.
 func TestExtractTruncatedEntry(t *testing.T) {
+	dest := t.TempDir()
 	data := truncatedTarGz(t, "f.txt", 64, []byte("short"))
-	if err := extract(t, data, t.TempDir()); err == nil {
+	if err := extract(t, data, dest); err == nil {
 		t.Fatal("truncated entry accepted")
+	}
+	if _, err := os.Lstat(filepath.Join(dest, "f.txt")); !os.IsNotExist(err) {
+		t.Fatalf("partial file survived a truncated entry: %v", err)
+	}
+	// A truncated entry after a completed one still removes only its own
+	// partial file.
+	dest2 := t.TempDir()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	if err := tw.WriteHeader(&tar.Header{Name: "good.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: 4}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte("good")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: "bad.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: 64}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte("short")); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := extract(t, buf.Bytes(), dest2); err == nil {
+		t.Fatal("truncated second entry accepted")
+	}
+	if _, err := os.Lstat(filepath.Join(dest2, "bad.txt")); !os.IsNotExist(err) {
+		t.Fatalf("partial second file survived: %v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(dest2, "good.txt")); err != nil || string(b) != "good" {
+		t.Fatalf("completed member = %q, %v", b, err)
 	}
 }
 

@@ -55,19 +55,20 @@ func TestPrecedenceEnvBeatsFile(t *testing.T) {
 
 func TestRateLimitClassesAndMiddleware(t *testing.T) {
 	cfg := Default()
-	// The login endpoint is NEVER unlimited: the default config installs a
-	// login-only limiter even when the operator configured no limits, while
-	// every other class stays unlimited (zero rate -> no bucket).
+	// Public/body-authenticated classes are finite OUT OF THE BOX; login
+	// keeps its always-on floor as well.
 	defaultClasses := cfg.RateLimitClasses()
-	if defaultClasses["login"] <= 0 {
-		t.Fatalf("default login rate = %v, want the always-on floor", defaultClasses["login"])
-	}
-	if defaultClasses["logs"] != 0 || defaultClasses["next"] != 0 {
-		t.Fatalf("default non-login classes = %v, want unlimited", defaultClasses)
+	for _, class := range []string{"login", "webhooks", "oidc", "enroll", "register", "next", "heartbeat", "logs", "artifact_upload", "cache_upload", "dispatch", "secrets"} {
+		if defaultClasses[class] <= 0 {
+			t.Fatalf("default class %q = %v, want a finite built-in rate", class, defaultClasses[class])
+		}
 	}
 	if cfg.RateLimitMiddleware() == nil {
-		t.Fatal("default config must install the always-on login rate limiter")
+		t.Fatal("default config must install the finite rate limiter")
 	}
+	// An explicit per_second override still wins over the per-class
+	// fallback for classes the operator zeroed.
+	cfg.RateLimit.NextPerSecond = 0
 	cfg.RateLimit.PerSecond = 10
 	cfg.RateLimit.Burst = 7
 	cfg.RateLimit.LogsPerSecond = 25

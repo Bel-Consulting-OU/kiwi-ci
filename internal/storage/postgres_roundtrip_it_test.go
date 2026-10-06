@@ -32,15 +32,38 @@ func TestPostgresNewStoreOptions(t *testing.T) {
 	if err := st.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	// WithMaxConnections applies positive values and ignores non-positive.
-	withCap, err := NewPostgresOpt(context.Background(), dsn, WithMaxConnections(3))
+	// WithMaxConnections sets the TOTAL Kiwi PostgreSQL ceiling: the
+	// operational pool receives total - advisoryPoolMaxConns -
+	// leaderConnReserve. Values <= 0 keep the pgxpool default (no ceiling).
+	const total = 7
+	wantOperational := int32(total - advisoryPoolMaxConns - leaderConnReserve)
+	withCap, err := NewPostgresOpt(context.Background(), dsn, WithMaxConnections(total))
 	if err != nil {
 		t.Fatalf("NewPostgresOpt: %v", err)
 	}
-	if withCap.pool.Config().MaxConns != 3 {
-		t.Fatalf("MaxConns = %d, want 3", withCap.pool.Config().MaxConns)
+	if got := withCap.OperationalMaxConns(); got != int(wantOperational) {
+		t.Fatalf("OperationalMaxConns = %d, want %d", got, wantOperational)
+	}
+	if got := withCap.pool.Config().MaxConns; got != wantOperational {
+		t.Fatalf("operational MaxConns = %d, want %d", got, wantOperational)
+	}
+	op, adv := withCap.PoolStats()
+	if !op.Present || op.Max != wantOperational {
+		t.Fatalf("operational pool stats = %+v, want Max=%d", op, wantOperational)
+	}
+	if !adv.Present || adv.Max != advisoryPoolMaxConns {
+		t.Fatalf("advisory pool stats = %+v, want Max=%d", adv, advisoryPoolMaxConns)
+	}
+	if withCap.LeaderSessionHeld() {
+		t.Fatal("fresh store reports a held leadership session")
 	}
 	_ = withCap.Close()
+	// A total below the fixed minimum (advisory + leader + one operational)
+	// is rejected BEFORE any connection is attempted: the unreachable host
+	// would otherwise fail much later at ping time.
+	if _, err := NewPostgresOpt(context.Background(), "postgres://nobody@nonexistent.invalid:5432/nope?sslmode=disable&connect_timeout=1", WithMaxConnections(5)); err == nil || !strings.Contains(err.Error(), "minimum") {
+		t.Fatalf("below-minimum total ceiling = %v, want a minimum-budget error", err)
+	}
 	noCap, err := NewPostgresOpt(context.Background(), dsn, WithMaxConnections(0))
 	if err != nil {
 		t.Fatalf("NewPostgresOpt zero: %v", err)

@@ -60,7 +60,7 @@ func TestQueuedJobsPageMemoryOrderingCursorAndLimits(t *testing.T) {
 	want := []string{"d", "f", "e", "c", "b", "g", "a"}
 
 	// limit <= 0 selects the default: everything fits, no more data.
-	all, err := m.ListQueuedJobsPage(ctx, nil, 0, now)
+	all, err := m.ListQueuedJobsPage(ctx, QueuedJobFilter{}, nil, 0, now)
 	if err != nil {
 		t.Fatalf("ListQueuedJobsPage(default): %v", err)
 	}
@@ -81,7 +81,7 @@ func TestQueuedJobsPageMemoryOrderingCursorAndLimits(t *testing.T) {
 	var after *QueuedJobCursor
 	pages := 0
 	for {
-		page, err := m.ListQueuedJobsPage(ctx, after, 3, now)
+		page, err := m.ListQueuedJobsPage(ctx, QueuedJobFilter{}, after, 3, now)
 		if err != nil {
 			t.Fatalf("page %d: %v", pages+1, err)
 		}
@@ -155,7 +155,7 @@ func TestQueuedJobsPageMemoryDeadlinePushdown(t *testing.T) {
 		model.Job{ID: "none", RunID: "run-1", Key: "none", Status: model.StatusQueued, CreatedAt: now.Add(-time.Minute)},
 		payloadPast,
 	)
-	page, err := m.ListQueuedJobsPage(ctx, nil, 10, now)
+	page, err := m.ListQueuedJobsPage(ctx, QueuedJobFilter{}, nil, 10, now)
 	if err != nil {
 		t.Fatalf("ListQueuedJobsPage: %v", err)
 	}
@@ -189,7 +189,7 @@ func TestQueuedJobsPageFaultyStoreDelegation(t *testing.T) {
 	)
 	fault := &FaultyStore{Inner: m, FailAfter: 1, Err: ErrNotFound}
 	ctx := context.Background()
-	page, err := fault.ListQueuedJobsPage(ctx, nil, 1, now)
+	page, err := fault.ListQueuedJobsPage(ctx, QueuedJobFilter{}, nil, 1, now)
 	if err != nil {
 		t.Fatalf("ListQueuedJobsPage through FaultyStore: %v", err)
 	}
@@ -200,7 +200,7 @@ func TestQueuedJobsPageFaultyStoreDelegation(t *testing.T) {
 		t.Fatalf("read consumed %d write fault(s)", fault.Mutations())
 	}
 	missing := &FaultyStore{Inner: storeOnlyInner{}}
-	if _, err := missing.ListQueuedJobsPage(ctx, nil, 1, now); err == nil || !strings.Contains(err.Error(), "QueuedJobPageStore") {
+	if _, err := missing.ListQueuedJobsPage(ctx, QueuedJobFilter{}, nil, 1, now); err == nil || !strings.Contains(err.Error(), "QueuedJobPageStore") {
 		t.Fatalf("missing inner capability = %v, want QueuedJobPageStore error", err)
 	}
 }

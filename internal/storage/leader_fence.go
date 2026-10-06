@@ -125,9 +125,20 @@ func (s *PostgresStore) fenceLeaderTx(ctx context.Context, tx pgx.Tx) error {
 // pool error keeps its own error contract (a closed/exhausted pool fails at
 // Begin, exactly as before fencing); a fence failure rolls the transaction
 // back and returns ErrStaleLeader with nothing mutated.
+//
+// The transaction ALSO passes the schema floor fence (the same shared-lock +
+// floor assertion beginSchemaCompatibleTx applies) before the leader check:
+// a leader-epoch transaction is still an N-era mutation, and a stale replica
+// that happens to retain a valid epoch must not commit schema-sensitive
+// writes after migration N+1. Both fences share applySchemaFence so they can
+// never drift.
 func (s *PostgresStore) beginFencedTx(ctx context.Context) (pgx.Tx, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.applySchemaFence(ctx, tx); err != nil {
+		_ = tx.Rollback(ctx)
 		return nil, err
 	}
 	if err := s.fenceLeaderTx(ctx, tx); err != nil {

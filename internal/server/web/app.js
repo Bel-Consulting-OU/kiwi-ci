@@ -31,6 +31,8 @@
   const jobsBody = $("#jobs tbody");
   const detail = $("#detail");
   const errorEl = $("#error");
+  const pausedEl = $("#paused");
+  const runNote = $("#run-note");
 
   function el(tag, cls, text) {
     const node = document.createElement(tag);
@@ -74,16 +76,26 @@
     logoutBtn.classList.remove("hidden");
   }
 
+  // setPaged toggles history mode. While older pages are on screen the runs
+  // table must not be replaced by auto-refresh, so the toolbar explicitly
+  // says live updates are paused instead of freezing silently.
+  function setPaged(paged) {
+    state.paged = !!paged;
+    pausedEl.classList.toggle("hidden", !state.paged);
+  }
+
   function setSignedOut() {
     state.authed = false;
     state.csrf = "";
     state.selectedRun = null;
-    state.paged = false;
+    setPaged(false);
     state.loadedRuns = [];
     setNextCursor("");
     loginForm.classList.remove("hidden");
     logoutBtn.classList.add("hidden");
     detail.classList.add("hidden");
+    runNote.classList.add("hidden");
+    runNote.textContent = "";
     runsBody.replaceChildren();
     statsEl.replaceChildren();
   }
@@ -155,8 +167,11 @@
       else if (run.status === "running" || run.status === "queued" || run.status === "pending") counts.running++;
       else counts.other++;
     }
+    // While paged the stats cover the loaded history, not the newest page:
+    // label the population explicitly so "loaded runs" cannot be mistaken
+    // for a live total.
     const rows = [
-      ["runs", counts.total],
+      [state.paged ? "loaded runs" : "runs", counts.total],
       ["active", counts.running],
       ["success", counts.success],
       ["failure", counts.failure],
@@ -259,7 +274,7 @@
       // cover every loaded run. Auto-refresh pauses while older pages are
       // shown (see the interval below), so this page is not replaced under the
       // reader; Refresh returns to the newest page explicitly.
-      state.paged = true;
+      setPaged(true);
       state.loadedRuns = state.loadedRuns.concat(page.runs);
       appendRuns(page.runs);
       renderStats(state.loadedRuns);
@@ -275,6 +290,8 @@
   async function selectRun(runID) {
     state.selectedRun = runID;
     detail.classList.remove("hidden");
+    runNote.classList.add("hidden");
+    runNote.textContent = "";
     jobsBody.replaceChildren(el("tr", null, "loading"));
     try {
       const jobs = await api("/api/v1/runs/" + encodeURIComponent(runID) + "/jobs");
@@ -282,6 +299,30 @@
     } catch (err) {
       jobsBody.replaceChildren();
       showError("Could not load jobs: " + err.message);
+    }
+  }
+
+  // refreshSelectedQuiet is the paged-mode live path: it keeps the SELECTED
+  // run's jobs pane current without touching the runs table (no
+  // replaceChildren while history is on screen). A transient failure leaves
+  // the pane as-is; only a vanished run (404) surfaces, as a small note.
+  async function refreshSelectedQuiet() {
+    const runID = state.selectedRun;
+    if (!runID) return;
+    try {
+      const jobs = await api("/api/v1/runs/" + encodeURIComponent(runID) + "/jobs");
+      if (state.selectedRun !== runID) return; // selection changed mid-flight
+      runNote.classList.add("hidden");
+      runNote.textContent = "";
+      renderJobs(jobs);
+      setConn(true);
+    } catch (err) {
+      if (String(err.message).indexOf("404") >= 0) {
+        if (state.selectedRun === runID) {
+          runNote.textContent = "run unavailable";
+          runNote.classList.remove("hidden");
+        }
+      }
     }
   }
 
@@ -305,7 +346,7 @@
       const page = await runsPage("");
       setConn(true);
       showError("");
-      state.paged = false;
+      setPaged(false);
       state.loadedRuns = page.runs;
       renderRuns(page.runs);
       setNextCursor(page.nextCursor);
@@ -321,7 +362,12 @@
   refresh();
   setInterval(() => {
     // Auto-refresh keeps the newest page current until the reader loads older
-    // runs: then the table is left alone so the appended pages survive.
-    if (!state.paged) refresh();
+    // runs: then the table is left alone so the appended pages survive, and
+    // the selected run's jobs pane keeps refreshing through the quiet path.
+    if (state.paged) {
+      refreshSelectedQuiet();
+      return;
+    }
+    refresh();
   }, POLL_MS);
 })();

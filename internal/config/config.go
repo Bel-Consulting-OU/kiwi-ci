@@ -68,8 +68,13 @@ type ServerConfig struct {
 type DatabaseConfig struct {
 	// URL is the PostgreSQL connection URL; when set the durable SQL
 	// control plane is enabled.
-	URL            string `toml:"url"`
-	MaxConnections int    `toml:"max_connections"`
+	URL string `toml:"url"`
+	// MaxConnections is Kiwi's TOTAL PostgreSQL connection ceiling. It is
+	// split as: operational pool = MaxConnections - 5, a fixed 4-connection
+	// advisory-lock pool (CAS fences / collector lease) and one reserved
+	// direct leadership session. 0 keeps the driver default (no ceiling);
+	// a positive value must be at least 6.
+	MaxConnections int `toml:"max_connections"`
 }
 
 type RunnerPKIConfig struct {
@@ -137,9 +142,14 @@ type ObservabilityConfig struct {
 	MetricsPublic bool `toml:"metrics_public"`
 }
 
-// RateLimitConfig holds per-class request rate limits. PerSecond and Burst
-// are the defaults applied to every class; the *_per_second keys override
-// PerSecond for their class. A rate of 0 (the default) disables limiting.
+// RateLimitConfig holds per-class request rate limits. Every public /
+// body-authenticated class has a finite built-in default (see Default), so a
+// config that never mentions rate_limit still bounds unauthenticated intake;
+// the *_per_second keys override their class, and PerSecond is the fallback
+// for classes without one. An operator may explicitly set a class (or
+// PerSecond) to 0 to disable limiting for it in dev mode; production refuses
+// an all-zero public class outright (see Validate). Login is never unlimited
+// unless an operator explicitly configures it.
 type RateLimitConfig struct {
 	PerSecond float64 `toml:"per_second"`
 	Burst     int     `toml:"burst"`
@@ -208,11 +218,12 @@ type QuotaConfig struct {
 // SchedulerConfig tunes the bounded lease candidate scan. CandidatePageSize
 // and MaxCandidateRows bound the queued candidates one /next poll
 // materializes (0 keeps the scheduler's built-in defaults 256/4096);
-// ReservationWait is a Go duration string ("30s") that delays a
-// resource-blocked candidate from becoming the reservation head, granting a
-// grace period to backfill already fitting the runner. Empty/"0s" keeps the
-// immediate default. A page size of 0 keeps the default; only an explicit
-// positive value installs one.
+// MaxCandidateRows above MaxSchedulerMaxCandidateRows is rejected (the
+// scheduler clamps library callers to the same hard bound). ReservationWait
+// is a Go duration string ("30s") that delays a resource-blocked candidate
+// from becoming the reservation head, granting a grace period to backfill
+// already fitting the runner. Empty/"0s" keeps the immediate default. A page
+// size of 0 keeps the default; only an explicit positive value installs one.
 type SchedulerConfig struct {
 	CandidatePageSize int    `toml:"candidate_page_size"`
 	MaxCandidateRows  int    `toml:"max_candidate_rows"`
@@ -223,6 +234,12 @@ type SchedulerConfig struct {
 // an absurd page size defeats the bounded scan's purpose and would make one
 // store round trip materialize an unbounded row set.
 const MaxSchedulerCandidatePageSize = 10000
+
+// MaxSchedulerMaxCandidateRows is the largest accepted per-attempt candidate
+// row budget. The scheduler clamps to the same hard bound
+// (scheduler.MaxCandidateRowsCap), so even a config that bypasses this
+// validator cannot disable the bounded scan.
+const MaxSchedulerMaxCandidateRows = 100000
 
 // SecretBrokerConfig selects the secret backend (vault, aws, gcp, azure,
 // onepassword or static) and its credentials. Only the fields of the
@@ -340,7 +357,26 @@ func Default() *Config {
 			MaxCandidateRows:  4096,
 			ReservationWait:   "0s",
 		},
-		RateLimit: RateLimitConfig{Burst: 100},
+		RateLimit: RateLimitConfig{
+			// Conservative finite defaults: every public/body-authenticated
+			// class is rate bounded out of the box instead of unlimited. An
+			// explicit 0 (or a config that overrides these) still means
+			// unlimited outside production; production validation requires
+			// the public classes to stay positive.
+			Burst:                   100,
+			NextPerSecond:           1000,
+			HeartbeatPerSecond:      1000,
+			LogsPerSecond:           200,
+			ArtifactUploadPerSecond: 100,
+			CacheUploadPerSecond:    100,
+			DispatchPerSecond:       100,
+			WebhooksPerSecond:       200,
+			EnrollPerSecond:         30,
+			RegisterPerSecond:       30,
+			OIDCPerSecond:           200,
+			SecretsPerSecond:        200,
+			LoginPerSecond:          30,
+		},
 	}
 }
 
@@ -394,6 +430,23 @@ func (c *Config) Validate() error {
 	if mode == "production" {
 		if c.Server.ExternalURL == "" {
 			return fmt.Errorf("server.external_url is required in production mode (the OIDC issuer always serves in production)")
+		}
+		// Public/body-authenticated intake must be rate bounded in
+		// production: the built-in Default() values are finite, so only a
+		// fixture/operator that explicitly zeroes one is refused.
+		for _, rl := range []struct {
+			name string
+			rate float64
+		}{
+			{"webhooks", c.RateLimit.WebhooksPerSecond},
+			{"oidc", c.RateLimit.OIDCPerSecond},
+			{"enroll", c.RateLimit.EnrollPerSecond},
+			{"register", c.RateLimit.RegisterPerSecond},
+			{"login", c.RateLimit.LoginPerSecond},
+		} {
+			if rl.rate <= 0 {
+				return fmt.Errorf("rate_limit.%s_per_second must be positive in production: public/body-authenticated intake must be rate bounded", rl.name)
+			}
 		}
 	}
 	if c.Server.MaxSchedules < -1 {
@@ -484,6 +537,13 @@ func (c *Config) Validate() error {
 	if c.Database.MaxConnections < 0 {
 		return fmt.Errorf("database.max_connections must not be negative, got %d", c.Database.MaxConnections)
 	}
+	// max_connections is Kiwi's TOTAL PostgreSQL ceiling, not just the
+	// operational pool: it must cover the fixed 4-connection advisory-lock
+	// pool, one reserved leadership session and at least one operational
+	// connection (the same minimum enforced by storage.NewPostgresOpt).
+	if c.Database.MaxConnections > 0 && c.Database.MaxConnections < 6 {
+		return fmt.Errorf("database.max_connections must be at least 6 when set (total ceiling: advisory pool 4 + leadership session 1 + at least 1 operational connection), got %d", c.Database.MaxConnections)
+	}
 	ql := quotas.Limits{
 		RepoConcurrency: c.Quota.RepoConcurrency,
 		TeamConcurrency: c.Quota.TeamConcurrency,
@@ -511,6 +571,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Scheduler.MaxCandidateRows < 0 {
 		return fmt.Errorf("scheduler.max_candidate_rows must be >= 0 (0 = built-in default 4096), got %d", c.Scheduler.MaxCandidateRows)
+	}
+	if c.Scheduler.MaxCandidateRows > MaxSchedulerMaxCandidateRows {
+		return fmt.Errorf("scheduler.max_candidate_rows must be <= %d (the hard bounded-scan cap), got %d", MaxSchedulerMaxCandidateRows, c.Scheduler.MaxCandidateRows)
 	}
 	if raw := strings.TrimSpace(c.Scheduler.ReservationWait); raw != "" {
 		d, err := time.ParseDuration(raw)

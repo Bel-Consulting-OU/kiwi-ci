@@ -54,6 +54,11 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid webhook signature", http.StatusUnauthorized)
 		return
 	}
+	// The HMAC authenticated the sender: only now does the schema gate run,
+	// so an invalid signature can never drive a compatibility DB query.
+	if !s.requireSchemaCompatible(w, r) {
+		return
+	}
 	event := r.Header.Get("X-GitHub-Event")
 	if event == "ping" {
 		w.WriteHeader(http.StatusNoContent)

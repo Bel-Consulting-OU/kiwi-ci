@@ -670,7 +670,7 @@ func (s *PostgresStore) repairRepoIdentityTable(ctx context.Context, mode RepoId
 	for {
 		var records []repoIdentityRepairRow
 		if mode == RepoIdentityRepairApply {
-			tx, err := s.pool.Begin(ctx)
+			tx, err := s.beginSchemaCompatibleTx(ctx)
 			if err != nil {
 				return err
 			}

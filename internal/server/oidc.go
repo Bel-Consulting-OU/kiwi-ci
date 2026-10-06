@@ -796,6 +796,12 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "job lease is not active", http.StatusConflict)
 		return
 	}
+	// The lease token authenticated the caller: only now does the schema gate
+	// run, before any signer/key-store work or issuance commit, so an invalid
+	// lease can never drive a compatibility DB query.
+	if !s.requireSchemaCompatible(w, r) {
+		return
+	}
 	// AUTHENTICATION BEFORE SIGNER WORK. The endpoint is public at the auth
 	// layer (the lease token is the credential), so nothing above this point
 	// may touch the signing key or its shared key store: the signer is

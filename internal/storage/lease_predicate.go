@@ -156,6 +156,11 @@ func ResolveRunnerProfile(r model.Runner, profile model.RunnerProfile, linked bo
 	r.ResourceCapacity = model.ResourceCapacityFromProfile(profile)
 	r.CostPerHour = profile.CostPerHour
 	r.PowerWatts = profile.PowerWatts
+	// The job-scoped cgroup capability is server-owned like every other
+	// profile attribute: it travels to the effective runner so the claim
+	// can reserve the job request alone when the kernel bounds the
+	// aggregate (LeaseClaim.IgnoreServiceEnvelope).
+	r.JobCgroup = profile.JobCgroup
 	return r
 }
 

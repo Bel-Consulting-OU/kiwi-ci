@@ -428,7 +428,7 @@ func (s *PostgresStore) CommitOIDCIssuance(ctx context.Context, req OIDCIssuance
 	if err := ValidateOIDCIssuanceRequest(req); err != nil {
 		return OIDCIssuanceResult{}, err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return OIDCIssuanceResult{}, err
 	}

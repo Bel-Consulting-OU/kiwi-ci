@@ -247,6 +247,7 @@ reservation_wait = "30s"
 		{"negative page size", func(c *Config) { c.Scheduler.CandidatePageSize = -1 }, "candidate_page_size"},
 		{"page size above cap", func(c *Config) { c.Scheduler.CandidatePageSize = MaxSchedulerCandidatePageSize + 1 }, "candidate_page_size"},
 		{"negative max rows", func(c *Config) { c.Scheduler.MaxCandidateRows = -1 }, "max_candidate_rows"},
+		{"max rows above hard cap", func(c *Config) { c.Scheduler.MaxCandidateRows = MaxSchedulerMaxCandidateRows + 1 }, "max_candidate_rows"},
 		{"malformed wait", func(c *Config) { c.Scheduler.ReservationWait = "soon" }, "reservation_wait"},
 		{"negative wait", func(c *Config) { c.Scheduler.ReservationWait = "-1s" }, "reservation_wait"},
 	}
@@ -262,6 +263,13 @@ reservation_wait = "30s"
 				t.Errorf("error %q does not mention %q", err, tc.want)
 			}
 		})
+	}
+
+	// The hard cap itself is accepted.
+	atCap := Default()
+	atCap.Scheduler.MaxCandidateRows = MaxSchedulerMaxCandidateRows
+	if err := atCap.Validate(); err != nil {
+		t.Fatalf("max_candidate_rows at the hard cap rejected: %v", err)
 	}
 }
 
@@ -364,13 +372,25 @@ func TestStripCommentEscapeAware(t *testing.T) {
 		{"double backslash before closing quote strips comment", `key = "a\\" # comment`, `key = "a\\" `},
 		{"full line comment", `# full line`, ``},
 		{"comment after single-quoted string", `key = 'a#b' # comment`, `key = 'a#b' `},
+		{"hash before an unterminated quote is a comment", `key = 1 # it's fine`, `key = 1 `},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := stripComment(c.in); got != c.want {
+			got, err := stripComment(c.in)
+			if err != nil {
+				t.Fatalf("stripComment(%q) = %v", c.in, err)
+			}
+			if got != c.want {
 				t.Fatalf("stripComment(%q) = %q, want %q", c.in, got, c.want)
 			}
 		})
+	}
+	// An unterminated quote at end of line is a startup error, not an
+	// accepted value that swallows the rest of the line.
+	for _, in := range []string{`key = "unterminated`, `key = "unterminated # x`, `key = 'unterminated`} {
+		if _, err := stripComment(in); err == nil {
+			t.Errorf("stripComment(%q) = nil error, want unterminated-quote failure", in)
+		}
 	}
 	// The escaped-quote value survives a full Load: the # stays part of the
 	// string value and a trailing comment is stripped.
@@ -480,7 +500,9 @@ func TestForgeBaseURLTransportContract(t *testing.T) {
 		{"bad scheme", "production", "ftp://gitlab.example.com", true},
 	}
 	for _, tc := range cases {
-		cfg := &Config{Server: ServerConfig{Mode: tc.mode, ExternalURL: "https://ci.example.com"}, Quota: QuotaConfig{RepoQueueDepth: 1}}
+		cfg := Default()
+		cfg.Server.Mode = tc.mode
+		cfg.Server.ExternalURL = "https://ci.example.com"
 		cfg.GitLab.BaseURL = tc.url
 		cfg.Forgejo.BaseURL = "https://forgejo.example.com"
 		err := cfg.Validate()

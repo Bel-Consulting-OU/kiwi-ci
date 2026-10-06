@@ -55,7 +55,7 @@ func (s *PostgresStore) DisableRunnerAndRevokeCert(ctx context.Context, runnerID
 	if err := ValidateRunnerID(runnerID); err != nil {
 		return 0, err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return 0, err
 	}

@@ -21,13 +21,18 @@ import (
 
 // pgITBulkInsertQueuedJobs seeds queued job rows with ONE statement (the same
 // rows InsertJob writes: the jsonMarshal payload and the relational columns).
+// The materialized scheduling key is seeded to the value the promotion sweep
+// would compute for the row's age (floor(age/600s)), so the aged index order
+// matches a freshly promoted table exactly.
 func pgITBulkInsertQueuedJobs(t *testing.T, st *PostgresStore, runID string, jobs []model.Job) {
 	t.Helper()
 	if len(jobs) == 0 {
 		return
 	}
+	seedNow := time.Now().UTC()
 	ids := make([]string, len(jobs))
 	priorities := make([]int32, len(jobs))
+	boosts := make([]int32, len(jobs))
 	created := make([]string, len(jobs))
 	deadlines := make([]string, len(jobs))
 	payloads := make([]string, len(jobs))
@@ -41,6 +46,7 @@ func pgITBulkInsertQueuedJobs(t *testing.T, st *PostgresStore, runID string, job
 		}
 		ids[i] = j.ID
 		priorities[i] = int32(j.Priority)
+		boosts[i] = int32(queuedJobComputedBoost(j, seedNow))
 		created[i] = j.CreatedAt.UTC().Format(time.RFC3339Nano)
 		if j.QueueDeadline != nil {
 			deadlines[i] = j.QueueDeadline.UTC().Format(time.RFC3339Nano)
@@ -48,12 +54,12 @@ func pgITBulkInsertQueuedJobs(t *testing.T, st *PostgresStore, runID string, job
 		payloads[i] = string(p)
 	}
 	_, err := st.pool.Exec(context.Background(), `
-		INSERT INTO jobs (id, run_id, key, status, dependency_status, priority, attempts, created_at, queue_deadline, payload)
-		SELECT u.id, $1, 'build', 'queued', 'success', u.priority, 0,
+		INSERT INTO jobs (id, run_id, key, status, dependency_status, priority, queue_boost, attempts, created_at, queue_deadline, payload)
+		SELECT u.id, $1, 'build', 'queued', 'success', u.priority, u.queue_boost, 0,
 		       u.created_at::timestamptz, NULLIF(u.queue_deadline,'')::timestamptz, u.payload::jsonb
-		FROM unnest($2::text[], $3::int[], $4::text[], $5::text[], $6::text[])
-		     AS u(id, priority, created_at, queue_deadline, payload)`,
-		runID, ids, priorities, created, deadlines, payloads)
+		FROM unnest($2::text[], $3::int[], $4::int[], $5::text[], $6::text[], $7::text[])
+		     AS u(id, priority, queue_boost, created_at, queue_deadline, payload)`,
+		runID, ids, priorities, boosts, created, deadlines, payloads)
 	if err != nil {
 		t.Fatalf("bulk insert %d jobs: %v", len(jobs), err)
 	}
@@ -112,7 +118,7 @@ func TestPostgresIntegrationQueuedJobsPageBoundedWalk(t *testing.T) {
 	var after *QueuedJobCursor
 	pages := 0
 	for {
-		page, err := st.ListQueuedJobsPage(ctx, after, pageSize, now)
+		page, err := st.ListQueuedJobsPage(ctx, QueuedJobFilter{}, after, pageSize, now)
 		if err != nil {
 			t.Fatalf("page %d: %v", pages+1, err)
 		}
@@ -165,7 +171,7 @@ func TestPostgresIntegrationQueuedJobsPageBoundedWalk(t *testing.T) {
 	}
 
 	// A page strictly after the final cursor is empty and terminal.
-	page, err := st.ListQueuedJobsPage(ctx, &QueuedJobCursor{
+	page, err := st.ListQueuedJobsPage(ctx, QueuedJobFilter{}, &QueuedJobCursor{
 		AgedPriority: queuedJobAgedPriority(expectedJobs[len(expectedJobs)-1], now),
 		CreatedAt:    expectedJobs[len(expectedJobs)-1].CreatedAt,
 		ID:           expectedJobs[len(expectedJobs)-1].ID,
@@ -209,11 +215,11 @@ func TestPostgresIntegrationQueuedJobsPageMemoryParity(t *testing.T) {
 	}
 	var after *QueuedJobCursor
 	for page := 1; ; page++ {
-		pgPage, err := st.ListQueuedJobsPage(ctx, after, 4, now)
+		pgPage, err := st.ListQueuedJobsPage(ctx, QueuedJobFilter{}, after, 4, now)
 		if err != nil {
 			t.Fatalf("pg page %d: %v", page, err)
 		}
-		memPage, err := mem.ListQueuedJobsPage(ctx, after, 4, now)
+		memPage, err := mem.ListQueuedJobsPage(ctx, QueuedJobFilter{}, after, 4, now)
 		if err != nil {
 			t.Fatalf("mem page %d: %v", page, err)
 		}

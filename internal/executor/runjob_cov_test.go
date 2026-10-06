@@ -196,21 +196,63 @@ func TestRunJobCacheFallbackAndWarnings(t *testing.T) {
 	if res.Status != model.StatusSuccess || !sink.has("via fallback") {
 		t.Fatalf("cache fallback = %+v (%v)", res, sink.lines)
 	}
-	// A restore error logs a warning and falls through to a miss + save.
+	// A cache restore error is a hard job failure before any step runs: the
+	// store root is a regular file, so opening the archive fails. Continuing
+	// would let the steps run against a hybrid workspace.
 	sink.lines = nil
 	fileAsRoot := filepath.Join(t.TempDir(), "cache-root")
 	if err := os.WriteFile(fileAsRoot, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ex3 := &Executor{Opt: Options{Workspace: canonicalTempDir(t), Logs: sink, RunID: "r", Cache: &cache.Store{Root: fileAsRoot}}, Masker: &secrets.Masker{}}
-	res = ex3.runJob(context.Background(), &pipeline.Spec{}, pipeline.CompiledJob{
+	badStore := &cache.Store{Root: fileAsRoot}
+	ex3 := &Executor{Opt: Options{Workspace: canonicalTempDir(t), Logs: sink, RunID: "r", Cache: badStore}, Masker: &secrets.Masker{}}
+	badJob := pipeline.CompiledJob{
 		ID: "j3", Job: pipeline.Job{
 			Cache: []pipeline.Cache{{Name: "bad", Key: "k", Paths: []string{"data"}}},
-			Steps: []pipeline.Step{{Run: "true"}},
+			Steps: []pipeline.Step{{Run: "echo cache-step-ran"}},
+		},
+	}
+	res = ex3.runJob(context.Background(), &pipeline.Spec{}, badJob, model.StatusSuccess, nil)
+	if res.Status != model.StatusFailure || !strings.Contains(res.Error, "cache restore") {
+		t.Fatalf("cache restore error = %+v", res)
+	}
+	if sink.has("cache-step-ran") || sink.has("running on") {
+		t.Fatalf("step ran after a cache restore failure: %v", sink.lines)
+	}
+	if sink.has("restore warning") {
+		t.Fatalf("restore error was still logged as a warning: %v", sink.lines)
+	}
+
+	// The same failure under an already-expired job deadline is reported as
+	// cancelled, never as a failure.
+	sink.lines = nil
+	deadline, cancelDeadline := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancelDeadline()
+	res = ex3.runJob(deadline, &pipeline.Spec{}, badJob, model.StatusSuccess, nil)
+	if res.Status != model.StatusCancelled {
+		t.Fatalf("deadline cache restore = %+v, want cancelled", res)
+	}
+	if !strings.Contains(res.Error, "cache key") {
+		t.Fatalf("deadline cache restore error = %q, want the cache key failure described", res.Error)
+	}
+	if sink.has("cache-step-ran") {
+		t.Fatalf("step ran after a deadline cache failure: %v", sink.lines)
+	}
+
+	// A cache SAVE failure keeps its warning behavior: the restore misses
+	// cleanly, the 64-byte archive cap rejects the save, and the job still
+	// succeeds.
+	sink.lines = nil
+	saveStore := &cache.Store{Root: filepath.Join(t.TempDir(), "cache"), MaxCacheBytes: 64}
+	ex4 := &Executor{Opt: Options{Workspace: canonicalTempDir(t), Logs: sink, RunID: "r", Cache: saveStore}, Masker: &secrets.Masker{}}
+	res = ex4.runJob(context.Background(), &pipeline.Spec{}, pipeline.CompiledJob{
+		ID: "j4", Job: pipeline.Job{
+			Cache: []pipeline.Cache{{Name: "big", Key: "big-key", Paths: []string{"data"}}},
+			Steps: []pipeline.Step{{Run: "mkdir -p data && dd if=/dev/urandom of=data/big bs=4096 count=1 2>/dev/null"}},
 		},
 	}, model.StatusSuccess, nil)
-	if res.Status != model.StatusSuccess || !sink.has("restore warning") || !sink.has("save warning") {
-		t.Fatalf("cache warning paths = %+v (%v)", res, sink.lines)
+	if res.Status != model.StatusSuccess || !sink.has("save warning") {
+		t.Fatalf("cache save warning = %+v (%v)", res, sink.lines)
 	}
 }
 

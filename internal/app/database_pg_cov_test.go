@@ -89,7 +89,7 @@ func TestServerDBModeProvisioning(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := startServer(t, ctx, "--listen", addr, "--database-url", dsn,
 		"--data-dir", dataDir, "--cluster-key-dir", clusterDir,
-		"--runner-tokens-file", writeRunnerTokensFile(t), "--database-max-connections", "3")
+		"--runner-tokens-file", writeRunnerTokensFile(t), "--database-max-connections", "6")
 	waitTCPUp(t, addr, errCh, 15*time.Second)
 	if err := stopServer(t, cancel, errCh); err != nil {
 		t.Fatalf("DB-mode Server returned %v", err)

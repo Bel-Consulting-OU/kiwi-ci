@@ -28,7 +28,7 @@ func (s *PostgresStore) PutCheckRun(ctx context.Context, key, checkRunID string)
 	if key == "" || checkRunID == "" {
 		return fmt.Errorf("storage: check-run store requires key and id")
 	}
-	_, err := s.pool.Exec(ctx, `INSERT INTO check_runs (key, check_run_id, created_at) VALUES ($1, $2, now())
+	_, err := s.execSchemaFenced(ctx, `INSERT INTO check_runs (key, check_run_id, created_at) VALUES ($1, $2, now())
 		ON CONFLICT (key) DO UPDATE SET check_run_id = EXCLUDED.check_run_id, created_at = now()`, key, checkRunID)
 	return err
 }

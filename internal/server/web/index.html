@@ -23,6 +23,7 @@
   <section id="stats" class="stats"></section>
   <section class="toolbar">
     <h1>Runs</h1>
+    <span id="paused" class="pill paused hidden">live updates paused (viewing history)</span>
     <button id="refresh">Refresh</button>
   </section>
   <div id="error" class="error hidden"></div>
@@ -41,7 +42,7 @@
     <tbody></tbody>
   </table>
   <section id="detail" class="hidden">
-    <div class="toolbar"><h1>Jobs</h1></div>
+    <div class="toolbar"><h1>Jobs</h1><span id="run-note" class="note hidden"></span></div>
     <table id="jobs">
       <thead>
         <tr><th>ID</th><th>Key</th><th>Status</th><th>Attempts</th><th>Runner</th></tr>

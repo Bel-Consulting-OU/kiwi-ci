@@ -718,9 +718,17 @@ func TestPostgresIntegrationLeadershipAndMigrateErrors(t *testing.T) {
 		if cfg.MaxConns != 0 {
 			t.Fatalf("WithMaxConnections(0) set %d", cfg.MaxConns)
 		}
+		// A valid TOTAL maps to the operational remainder after the fixed
+		// advisory pool and the leader reserve.
 		WithMaxConnections(7)(cfg)
-		if cfg.MaxConns != 7 {
-			t.Fatalf("WithMaxConnections(7) set %d", cfg.MaxConns)
+		if want := int32(7 - advisoryPoolMaxConns - leaderConnReserve); cfg.MaxConns != want {
+			t.Fatalf("WithMaxConnections(7) set %d, want %d", cfg.MaxConns, want)
+		}
+		// A below-minimum TOTAL leaves the non-positive sentinel that
+		// NewPostgresOpt rejects before connecting.
+		WithMaxConnections(5)(cfg)
+		if cfg.MaxConns > 0 {
+			t.Fatalf("WithMaxConnections(5) set %d, want a non-positive sentinel", cfg.MaxConns)
 		}
 	})
 }
@@ -1116,7 +1124,8 @@ func TestPostgresIntegrationMiscStatementBreaks(t *testing.T) {
 		// the column type changes: PostgreSQL cannot re-evaluate the predicate
 		// for a text[] column. jobs_queued_priority_idx is the migration 0038
 		// queued-candidate index and carries the same status predicate.
-		if _, err := st.pool.Exec(context.Background(), `DROP INDEX jobs_running_lease_recovery_idx, jobs_queue_deadline_recovery_idx, jobs_queued_priority_idx`); err != nil {
+		if _, err := st.pool.Exec(context.Background(), `DROP INDEX jobs_running_lease_recovery_idx, jobs_queue_deadline_recovery_idx, jobs_queued_priority_idx,
+			jobs_queued_aged_idx, jobs_queued_boost_sweep_idx, jobs_queued_runtime_idx, jobs_queued_labels_idx, jobs_queued_regions_idx`); err != nil {
 			t.Fatal(err)
 		}
 		pgITBreakColumnToArray(t, st, "jobs", "status")

@@ -46,6 +46,15 @@ type Options struct {
 	// as it exists so the caller (the runner's runtime ledger) can reclaim it
 	// after a hard crash.
 	OnCgroupCreated func(parent string) error
+	// RequireJobCgroup makes the job-scoped parent cgroup MANDATORY for a
+	// job whose runtime starts services: when the setup seam reports it
+	// unavailable, the job fails with an infra error BEFORE any service or
+	// main container starts. The runner sets it from the server task's
+	// job_cgroup flag (Task.JobCgroup), which the control plane advertises
+	// when the effective profile reserved only the job's own request under
+	// model.CapabilityJobCgroup; false keeps the historical per-container
+	// fallback (logged, job continues).
+	RequireJobCgroup bool
 	// OnCleanupDebt, when set, is called whenever ANY runtime cleanup
 	// primitive cannot prove its resource removed: the main backend, a
 	// service container, the service network, or the job-scoped cgroup. The
@@ -534,19 +543,32 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		res.Error = err.Error()
 		return finish(res)
 	}
+	// A cache restore is either fully applied or not at all: a key or
+	// restore error means the job would run against a hybrid workspace
+	// (some cache members plus checkout files), so it is a hard failure
+	// before any step or service starts, never a warning that lets the
+	// build continue on incorrect inputs. A job context that already ended
+	// is reported as cancelled, matching the runner's statusForErr rule.
+	cacheFail := func(msg string) model.JobResult {
+		res.Error = msg
+		res.Status = model.StatusFailure
+		if ctx.Err() != nil {
+			res.Status = model.StatusCancelled
+		}
+		e.log(cj.ID, "cache", msg)
+		return finish(res)
+	}
 	for _, c := range cj.Job.Cache {
 		bases := append([]string{c.Key}, c.RestoreKeys...)
 		restored := false
 		for i, base := range bases {
 			key, er := e.Opt.Cache.KeyContext(ctx, e.cacheBase(base)+"|"+runtime.GOOS+"|"+runtime.GOARCH+"|"+cj.Job.Runtime, workspace, c.HashFiles)
 			if er != nil {
-				e.log(cj.ID, "cache", "key warning: "+er.Error())
-				break
+				return cacheFail("cache key: " + er.Error())
 			}
 			hit, er := e.Opt.Cache.RestoreContext(ctx, key, workspace, c.Paths)
 			if er != nil {
-				e.log(cj.ID, "cache", "restore warning: "+er.Error())
-				break
+				return cacheFail("cache restore: " + er.Error())
 			}
 			if hit {
 				label := "primary"
@@ -667,6 +689,18 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			}()
 			e.log(cj.ID, "service", "job resource cgroup: "+cgStatus.Detail)
 		} else {
+			if e.Opt.RequireJobCgroup {
+				// The control plane reserved only the job's own request
+				// because the runner profile promised the job-scoped cgroup
+				// bounds the aggregate at the kernel. Running without it
+				// would enforce less than was reserved, so fail closed
+				// before any service or job container starts.
+				infra := &RunError{Kind: ErrorInfra, Err: fmt.Errorf("job-scoped cgroup required by the runner profile but unavailable: %s", cgStatus.Detail)}
+				e.log(cj.ID, "service", infra.Error())
+				res.Status = model.StatusFailure
+				res.Error = infra.Error()
+				return finish(res)
+			}
 			e.log(cj.ID, "service", "job resource cgroup unavailable ("+cgStatus.Detail+"); per-container caps apply, and the aggregate service request ("+serviceEnvelopeSummary(cj.Job.Resources, cj.Job.Services)+") must be reserved by the scheduler to bound aggregate host usage")
 		}
 		isolated := networkPolicy == pipeline.NetworkPolicyNone || networkPolicy == pipeline.NetworkPolicyServicesOnly

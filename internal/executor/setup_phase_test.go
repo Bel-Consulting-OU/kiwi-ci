@@ -173,7 +173,7 @@ exit 0
 	if readErr != nil {
 		t.Fatalf("fake docker did not run: %v", readErr)
 	}
-	if !strings.Contains(string(data), "network rm "+serviceNetworkName("r", "j")) {
+	if !strings.Contains(string(data), "network rm kiwi-net-r-j-") {
 		t.Fatalf("failed service start did not run the bounded network cleanup:\n%s", data)
 	}
 }

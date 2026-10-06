@@ -103,7 +103,7 @@ func (s *PostgresStore) AppendLogBatch(ctx context.Context, entries []model.LogE
 		return false, fmt.Errorf("storage: empty log batch")
 	}
 	digest := LogBatchPayloadDigest(r, entries)
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return false, err
 	}

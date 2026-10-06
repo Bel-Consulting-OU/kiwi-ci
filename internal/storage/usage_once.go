@@ -39,7 +39,7 @@ func (s *PostgresStore) RecordUsageOnce(ctx context.Context, jobID string, cost,
 	if err := ValidateJobID(jobID); err != nil {
 		return false, err
 	}
-	ct, err := s.pool.Exec(ctx, `UPDATE jobs
+	ct, err := s.execSchemaFenced(ctx, `UPDATE jobs
 		SET payload = payload || jsonb_build_object('usage_recorded', true, 'cost', $2::double precision, 'energy_wh', $3::double precision)
 		WHERE id=$1 AND COALESCE(payload->>'usage_recorded', 'false') <> 'true'`,
 		jobID, cost, energyWh)

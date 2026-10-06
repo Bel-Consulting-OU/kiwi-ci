@@ -13,14 +13,22 @@ import (
 
 // TestServiceContainerNameIsAlwaysPhysical proves the physical docker
 // container name never equals the declared alias, keeps the service index
-// even for over-long run/job IDs, and stays distinct between concurrent jobs.
+// (and identity components) for short run/job IDs, carries a per-attempt
+// suffix so two attempts never share a name, and stays distinct between
+// concurrent jobs even under bounding.
 func TestServiceContainerNameIsAlwaysPhysical(t *testing.T) {
-	if got := serviceContainerName("run-1", "job-1", 2); got != "kiwi-svc-run-1-job-1-3" {
-		t.Fatalf("physical name = %q", got)
+	got := serviceContainerName("run-1", "job-1", 2)
+	if !strings.HasPrefix(got, "kiwi-svc-run-1-job-1-3-") {
+		t.Fatalf("physical name = %q, want the kiwi-svc-run-1-job-1-3- prefix", got)
 	}
 	// The alias must never be the physical name.
 	if got := serviceContainerName("r", "j", 0); got == "postgres" {
 		t.Fatalf("alias leaked into physical name: %q", got)
+	}
+	// Two calls for the same identity (two attempts) never collide.
+	attemptA, attemptB := serviceContainerName("r", "j", 0), serviceContainerName("r", "j", 0)
+	if attemptA == attemptB {
+		t.Fatalf("per-attempt physical name %q was reused", attemptA)
 	}
 	seen := map[string]bool{}
 	for i := 0; i < 4; i++ {
@@ -30,15 +38,20 @@ func TestServiceContainerNameIsAlwaysPhysical(t *testing.T) {
 		}
 		seen[n] = true
 	}
-	// Over-long IDs are truncated to a bounded name but stay distinct and
-	// keep the index-bearing suffix deterministic.
+	// Over-long IDs are bounded but stay distinct; the per-attempt suffix
+	// also keeps two calls of the SAME identity apart after bounding.
 	long := strings.Repeat("a", 300)
 	first := serviceContainerName(long, long, 0)
-	second := serviceContainerName(long, long, 1)
 	if len(first) > maxServiceContainerNameLen {
 		t.Fatalf("physical name %d chars exceeds %d", len(first), maxServiceContainerNameLen)
 	}
-	if first == second {
+	if !strings.HasPrefix(first, "kiwi-svc-") {
+		t.Fatalf("bounded physical name %q lost the prefix", first)
+	}
+	if again := serviceContainerName(long, long, 0); again == first {
+		t.Fatal("per-attempt physical name collided after truncation")
+	}
+	if second := serviceContainerName(long, long, 1); second == first {
 		t.Fatal("services of one job collided after truncation")
 	}
 	if other := serviceContainerName(long+"b", long, 0); other == first {
@@ -83,13 +96,29 @@ func TestConcurrentJobsSameServiceAliasBothStartAndCleanup(t *testing.T) {
 	if strings.Contains(log, "--name postgres") {
 		t.Fatalf("bare alias used as a docker container name:\n%s", log)
 	}
-	for _, ids := range jobs {
-		physical := serviceContainerName(ids[0], ids[1], 0)
-		if !strings.Contains(log, "--name "+physical) {
-			t.Fatalf("physical name %q missing from docker log:\n%s", physical, log)
+	// Each job got its own unique physical name (with the job identity in the
+	// prefix), and cleanup removed exactly those names.
+	physical := map[string]bool{}
+	for _, line := range runLines(log) {
+		if name := flagValue(line, "--name"); name != "" {
+			physical[name] = true
 		}
-		if !strings.Contains(log, "rm -f "+physical) {
-			t.Fatalf("cleanup did not kill physical name %q:\n%s", physical, log)
+	}
+	if len(physical) != len(jobs) {
+		t.Fatalf("physical container names = %v, want %d distinct", physical, len(jobs))
+	}
+	for name := range physical {
+		if !strings.Contains(log, "rm -f "+name) {
+			t.Fatalf("cleanup did not kill physical name %q:\n%s", name, log)
+		}
+	}
+	for _, ids := range jobs {
+		prefix := strings.ToLower("kiwi-svc-" + ids[0] + "-" + ids[1] + "-1-")
+		if !strings.Contains(log, "--name "+prefix) {
+			t.Fatalf("physical name with prefix %q missing from docker log:\n%s", prefix, log)
+		}
+		if !strings.Contains(log, "rm -f "+prefix) {
+			t.Fatalf("cleanup did not kill the physical name with prefix %q:\n%s", prefix, log)
 		}
 	}
 	if got := strings.Count(log, "--network-alias postgres"); got != len(jobs) {
@@ -112,15 +141,21 @@ func TestServiceWithoutNameKeepsPhysicalNameBehavior(t *testing.T) {
 	}
 	defer cleanup()
 	log := readFakeLog(t, "FAKE_DOCKER_LOG")
-	physical := serviceContainerName("r", "j", 0)
-	if !strings.Contains(log, "--name "+physical) {
-		t.Fatalf("physical name missing:\n%s", log)
+	runs := runLines(log)
+	if len(runs) != 1 {
+		t.Fatalf("docker run lines = %d, want 1:\n%s", len(runs), log)
+	}
+	physical := flagValue(runs[0], "--name")
+	if !strings.HasPrefix(physical, "kiwi-svc-r-j-1-") {
+		t.Fatalf("physical name = %q, want the kiwi-svc-r-j-1- prefix:\n%s", physical, log)
 	}
 	if strings.Contains(log, "--network-alias") {
 		t.Fatalf("nameless service got an alias:\n%s", log)
 	}
+	// The display name is the SAME physical name the container was created
+	// with, never a re-derived (hence different) one.
 	if !containsLine(emitted, "service "+physical+" started") {
-		t.Fatalf("emitted = %v", emitted)
+		t.Fatalf("emitted = %v, want the physical-name display %q", emitted, physical)
 	}
 }
 
@@ -333,6 +368,18 @@ func runLines(log string) []string {
 	return out
 }
 
+// flagValue extracts the value following flag in one fake-docker log line
+// (arguments are logged space-separated).
+func flagValue(line, flag string) string {
+	fields := strings.Fields(line)
+	for i, f := range fields {
+		if f == flag && i+1 < len(fields) {
+			return fields[i+1]
+		}
+	}
+	return ""
+}
+
 // TestStartContainerServicesFairSplitsEnvelope proves the started containers
 // carry the fair-split flags: two services on a 4 CPU / 3 GiB / 700 PID job
 // share the envelope evenly (2 CPU and 1.5 GiB each) instead of the second
@@ -420,10 +467,8 @@ func TestStartContainerServicesRejectsGenuinelyOversubscribedEnvelope(t *testing
 	if got := len(runLines(log)); got != 0 {
 		t.Fatalf("docker run count = %d, want 0 (the plan is refused before any container):\n%s", got, log)
 	}
-	for i := 0; i < len(services); i++ {
-		if strings.Contains(log, "--name "+serviceContainerName("r", "j", i)) {
-			t.Fatalf("service %d started despite the exhausted envelope:\n%s", i+1, log)
-		}
+	if strings.Contains(log, "--name kiwi-svc-") {
+		t.Fatalf("a service started despite the exhausted envelope:\n%s", log)
 	}
 	// The just-created network is removed again on the failure path.
 	if !strings.Contains(log, "network rm ") {

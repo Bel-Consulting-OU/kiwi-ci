@@ -98,6 +98,10 @@ func (s *PostgresStore) TryAcquireCASGCLease(ctx context.Context, key string) (C
 	if err != nil {
 		return nil, false, err
 	}
+	if err := s.applySchemaFence(ctx, tx); err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, false, err
+	}
 	if err := s.fenceLeaderTx(ctx, tx); err != nil {
 		_ = tx.Rollback(ctx)
 		return nil, false, err

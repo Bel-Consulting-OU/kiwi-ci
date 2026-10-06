@@ -928,18 +928,23 @@ func TestRunJobCacheBranches(t *testing.T) {
 	if res.Status != model.StatusSuccess || !sink.has("restored c") {
 		t.Fatalf("cache restore = %+v", res)
 	}
-	// A hash_files entry that cannot be hashed (a symlink) logs a key warning.
+	// A hash_files entry that cannot be hashed (a symlink) is a hard job
+	// failure before any step starts, never a warning.
 	if err := os.Symlink(filepath.Join(ws, "elsewhere"), filepath.Join(ws, "hashed.lock")); err != nil {
 		t.Fatal(err)
 	}
+	sink.lines = nil
 	res = ex.runJob(context.Background(), &pipeline.Spec{}, pipeline.CompiledJob{
 		ID: "j3", Job: pipeline.Job{
 			Cache: []pipeline.Cache{{Name: "bad", Key: "k", HashFiles: []string{"hashed.lock"}, Paths: []string{"data"}}},
-			Steps: []pipeline.Step{{Run: "true"}},
+			Steps: []pipeline.Step{{Run: "echo key-step-ran"}},
 		},
 	}, model.StatusSuccess, nil)
-	if res.Status != model.StatusSuccess || !sink.has("key warning") {
-		t.Fatalf("cache key warning = %+v", res)
+	if res.Status != model.StatusFailure || !strings.Contains(res.Error, "cache key") {
+		t.Fatalf("cache key error = %+v", res)
+	}
+	if sink.has("key-step-ran") {
+		t.Fatalf("step ran after a cache key failure: %v", sink.lines)
 	}
 }
 

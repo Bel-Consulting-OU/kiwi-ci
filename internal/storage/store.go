@@ -253,6 +253,18 @@ type Store interface {
 	SchemaVersion(ctx context.Context) (int, error)
 }
 
+// QueuedBoostPromoter is the optional materialized-scheduling-key capability:
+// PromoteQueuedJobBoosts recomputes jobs.queue_boost — the aged-wait term of
+// the queued scheduling key (floor(max(0, now-created_at)/10min)) — for the
+// queued rows whose stored value is stale, in bounded batches, and returns how
+// many rows it promoted. The recomputation is ABSOLUTE and idempotent (any
+// replica may run it any number of times), so it is safe to call from the DB
+// leader's maintenance loop; stores without stored boosts (memory/fs) simply
+// omit it.
+type QueuedBoostPromoter interface {
+	PromoteQueuedJobBoosts(ctx context.Context, now time.Time, batchLimit int) (int64, error)
+}
+
 // ---------------------------------------------------------------------------
 // DB-mode extension stores
 // ---------------------------------------------------------------------------
@@ -1425,21 +1437,33 @@ type LeaseClaim struct {
 	// without room for the aggregate never takes the job.
 	ServiceEnvelopeRequest model.ResourceCapacity
 
+	// IgnoreServiceEnvelope relaxes the reservation to the job's OWN request
+	// when the runner can establish a job-scoped parent cgroup
+	// (model.CapabilityJobCgroup / Runner.JobCgroup): the kernel then bounds
+	// the main container and every service together, so the union is not
+	// needed as the cross-replica capacity bound. Unset (false) keeps the
+	// historical job+envelope union, so every existing caller and ledger
+	// stays byte-identical.
+	IgnoreServiceEnvelope bool
+
 	// Quarantined mirrors model.Job.RepoIdentityQuarantined: the claim's job
 	// carries the durable repo_identity_quarantined flag, so no runner may
 	// lease it (ClaimAllowsRunner denies independent of the repository ACL).
 	Quarantined bool
 }
 
-// RequestedResources returns the TOTAL resources the claim reserves against
-// the runner: the job's own declared request plus its aggregate service
-// envelope. It is model.Job.ReservedResources through one shared summation
-// (model.AddResourceCapacity), so every admission and ledger path charges
-// exactly the same total.
+// RequestedResources returns the resources the claim reserves against the
+// runner: the job's own declared request plus its aggregate service envelope
+// (disabled by IgnoreServiceEnvelope, i.e. when the runner's job-scoped cgroup
+// already bounds the aggregate at the kernel). It is model.Job.ReservedResources
+// through one shared summation (model.AddResourceCapacity), so every admission
+// and ledger path charges exactly the same total.
 func (c LeaseClaim) RequestedResources() model.ResourceCapacity {
-	return model.AddResourceCapacity(
-		model.ResourceCapacity{CPU: c.CPURequest, Memory: c.MemoryRequest, Disk: c.DiskRequest, PIDs: c.PIDsRequest},
-		c.ServiceEnvelopeRequest)
+	job := model.ResourceCapacity{CPU: c.CPURequest, Memory: c.MemoryRequest, Disk: c.DiskRequest, PIDs: c.PIDsRequest}
+	if c.IgnoreServiceEnvelope {
+		return job
+	}
+	return model.AddResourceCapacity(job, c.ServiceEnvelopeRequest)
 }
 
 // EnvKey names the environment concurrency key: the CANONICAL repository

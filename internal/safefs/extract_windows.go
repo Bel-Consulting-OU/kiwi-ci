@@ -3,6 +3,7 @@
 package safefs
 
 import (
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -101,6 +102,15 @@ func writeFileNoFollow(root *Root, name string, r io.Reader, size int64, limits 
 		return ErrSymlinkParent
 	}
 	if _, err := io.CopyN(f, r, size); err != nil {
+		// The entry is truncated. The partial file must not survive: a
+		// caller that retries or inspects the destination would otherwise
+		// observe a hybrid of completed and truncated members. Windows
+		// cannot remove an open file, so close it first, then remove the
+		// target; the copy error stays primary if the removal fails.
+		_ = f.Close()
+		if rmErr := os.Remove(target); rmErr != nil && !os.IsNotExist(rmErr) {
+			return errors.Join(err, rmErr)
+		}
 		return err
 	}
 	return nil

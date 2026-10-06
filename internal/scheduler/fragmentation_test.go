@@ -190,6 +190,61 @@ func TestSchedulerReservationWaitAllowsInitialBackfill(t *testing.T) {
 	}
 }
 
+// TestSchedulerJobCgroupHeadFitsAlongsideRelaxedEnvelope: on a JobCgroup
+// runner the head-fits-alongside check charges each side's own request (the
+// kernel bounds the aggregate), so a memory-only small job whose SERVICE
+// ENVELOPE would occupy the head's starved CPU dimension is admitted instead
+// of being refused. The union control on the same fixture refuses it.
+func TestSchedulerJobCgroupHeadFitsAlongsideRelaxedEnvelope(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	newFixture := func(jobCgroup bool) (*resourceFakeStore, *DBScheduler, string) {
+		st := newResourceFakeStore()
+		runnerID := "runner-frag-cgroup"
+		jobs := []model.Job{
+			// The aged CPU head cannot fit the remaining 2 CPU (6 reserved
+			// + 4 > 8) but is satisfiable once they drain.
+			{ID: "job-cpu-big", CPURequest: 4, CreatedAt: now.Add(-2 * time.Hour)},
+			// Memory-only job whose SERVICE ENVELOPE requests 2 CPU: the
+			// union occupies the head's starved CPU dimension, the relaxed
+			// request does not.
+			{ID: "job-small", MemoryRequest: 1 << 30, ServiceEnvelopeRequest: model.ResourceCapacity{CPU: 2},
+				CreatedAt: now.Add(-time.Minute)},
+		}
+		s := seedJobCgroupScheduler(t, st, runnerID, 8, model.ResourceCapacity{CPU: 8, Memory: 4 << 30}, jobCgroup, jobs...)
+		st.mu.Lock()
+		st.reserved = model.ResourceCapacity{CPU: 6}
+		st.mu.Unlock()
+		return st, s, runnerID
+	}
+
+	// Union: the small job's envelope adds 2 CPU to the head-starved
+	// dimension, so the admission pre-filter rejects it outright.
+	st, s, runnerID := newFixture(false)
+	if _, _, _, err := s.Lease(ctx, runnerID, now); !errors.Is(err, ErrNoJobs) {
+		t.Fatalf("union head lease = %v, want ErrNoJobs", err)
+	}
+	if st.claimCount() != 0 {
+		t.Fatalf("union claims = %d, want 0 while the CPU head waits", st.claimCount())
+	}
+
+	// Relaxed: the candidate touches no CPU of its own, so it fits alongside
+	// the CPU-blocked head and is leased; the claim reserves the job-only
+	// request.
+	st, s, runnerID = newFixture(true)
+	j, _, _, err := s.Lease(ctx, runnerID, now)
+	if err != nil {
+		t.Fatalf("JobCgroup head lease: %v", err)
+	}
+	if j.ID != "job-small" {
+		t.Fatalf("leased %s, want job-small alongside the CPU head", j.ID)
+	}
+	claim := st.lastClaim(t)
+	if !claim.IgnoreServiceEnvelope || claim.RequestedResources() != (model.ResourceCapacity{Memory: 1 << 30}) {
+		t.Fatalf("claim = %+v (reserved %+v), want the relaxed memory-only job request", claim, claim.RequestedResources())
+	}
+}
+
 // TestSchedulerAgedLargeJobNotStarvedByDimension repeats the anti-backfill
 // property for the memory and PIDs dimensions and for a mixed CPU+memory
 // request: the reservation guard is dimension-generic, so each variant must

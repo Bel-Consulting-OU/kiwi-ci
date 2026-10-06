@@ -328,7 +328,7 @@ func (s *PostgresStore) LinkRunnerProfile(ctx context.Context, runnerID, profile
 	if profileID == "" {
 		return fmt.Errorf("storage: profile id is required")
 	}
-	_, err := s.pool.Exec(ctx, `INSERT INTO runner_profile_links (runner_id, profile_id) VALUES ($1,$2) ON CONFLICT (runner_id) DO UPDATE SET profile_id=EXCLUDED.profile_id`, runnerID, profileID)
+	_, err := s.execSchemaFenced(ctx, `INSERT INTO runner_profile_links (runner_id, profile_id) VALUES ($1,$2) ON CONFLICT (runner_id) DO UPDATE SET profile_id=EXCLUDED.profile_id`, runnerID, profileID)
 	return err
 }
 
@@ -364,7 +364,7 @@ func (s *PostgresStore) UnlinkRunnerProfile(ctx context.Context, runnerID string
 	if runnerID == "" {
 		return fmt.Errorf("storage: runner id is required")
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return err
 	}

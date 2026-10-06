@@ -140,7 +140,7 @@ func (s *PostgresStore) InsertTestReportWithHistoryDelivery(ctx context.Context,
 	if strings.TrimSpace(repoID) == "" {
 		return TestReportInsertOutcome{}, fmt.Errorf("storage: test history repository identity is required")
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return TestReportInsertOutcome{}, err
 	}
@@ -168,7 +168,7 @@ func (s *PostgresStore) InsertTestReportWithHistoryDeliveryForLease(ctx context.
 	if delivery.JobID != jobID || delivery.LeaseGeneration != generation {
 		return TestReportInsertOutcome{}, leaseIdentityErrorf("test report delivery (job %s, generation %d) does not match leased job %s generation %d", delivery.JobID, delivery.LeaseGeneration, jobID, generation)
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return TestReportInsertOutcome{}, err
 	}

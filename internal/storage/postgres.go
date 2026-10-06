@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
@@ -36,11 +37,12 @@ type PostgresStore struct {
 	// fencePool is a SEPARATE connection pool used exclusively for
 	// advisory locks (CAS digest fences and the collector lease). Holding a
 	// lock on the operational pool would deadlock fenced operations that
-	// then need the same pool for their own reads/writes: at
-	// max_connections=1 the writer would hold its lock connection and block
-	// forever committing its reference, and the collector needs a lock
+	// then need the same pool for their own reads/writes: with a single
+	// operational connection the writer would hold its lock connection and
+	// block forever committing its reference, and the collector needs a lock
 	// connection plus a references connection plus its fence connection.
-	// Sized independently and small; created from the same DSN.
+	// Sized independently and small (advisoryPoolMaxConns, part of the TOTAL
+	// database.max_connections budget); created from the same DSN.
 	//
 	// fencePoolMu serializes lazy initialization. A FAILED attempt (e.g. a
 	// canceled startup context) leaves fencePool nil, so the next caller
@@ -150,13 +152,48 @@ func NewPostgres(ctx context.Context, dsn string) (*PostgresStore, error) {
 // PostgresOption mutates the pool configuration before the pool opens.
 type PostgresOption func(*pgxpool.Config)
 
-// WithMaxConnections caps the connection pool size (wired from
-// database.max_connections). Values <= 0 keep the pgxpool default.
+// The TOTAL PostgreSQL budget constants. database.max_connections is Kiwi's
+// total ceiling, not just the operational pool size: the advisory-lock pool
+// and the leader's direct session are Kiwi-owned connections too.
+const (
+	// advisoryPoolMaxConns is the fixed maximum size of the dedicated
+	// advisory-lock pool (CAS digest fences, collector lease, check-run
+	// publication fences). It must never be drawn from the operational pool:
+	// a fenced writer holds its lock while doing ordinary DB work, so sharing
+	// would deadlock as soon as the operational pool is exhausted.
+	advisoryPoolMaxConns = 4
+	// leaderConnReserve is the one direct PostgreSQL connection a leader
+	// holds for its leadership advisory-lock session (outside both pools).
+	leaderConnReserve = 1
+	// minTotalMaxConns is the smallest meaningful total ceiling: the advisory
+	// pool, the leader reserve and at least one operational connection.
+	minTotalMaxConns = advisoryPoolMaxConns + leaderConnReserve + 1
+)
+
+// operationalMaxConnsForTotal splits a TOTAL ceiling into the operational
+// pool size: everything left after the fixed advisory pool and the leader
+// reserve.
+func operationalMaxConnsForTotal(n int) int {
+	return n - advisoryPoolMaxConns - leaderConnReserve
+}
+
+// WithMaxConnections sets Kiwi's TOTAL PostgreSQL connection ceiling (wired
+// from database.max_connections): the operational pool gets
+// n - advisoryPoolMaxConns - leaderConnReserve connections, so the total
+// Kiwi-owned connections (operational + advisory + one leader session) never
+// exceed n. Values <= 0 keep the pgxpool default (no ceiling).
+//
+// The option type cannot return an error, so an out-of-range TOTAL is
+// encoded as a non-positive MaxConns sentinel. pgxpool.ParseConfig can never
+// produce MaxConns <= 0 (pool_max_conns must be >= 1 and the unset default is
+// >= 4), so NewPostgresOpt recognizes the sentinel and fails BEFORE opening
+// any connection.
 func WithMaxConnections(n int) PostgresOption {
 	return func(c *pgxpool.Config) {
-		if n > 0 {
-			c.MaxConns = int32(n)
+		if n <= 0 {
+			return
 		}
+		c.MaxConns = int32(operationalMaxConnsForTotal(n))
 	}
 }
 
@@ -169,6 +206,13 @@ func NewPostgresOpt(ctx context.Context, dsn string, opts ...PostgresOption) (*P
 	}
 	for _, o := range opts {
 		o(cfg)
+	}
+	// WithMaxConnections encodes a below-minimum TOTAL as a non-positive
+	// sentinel (see above): reject it BEFORE opening a pool so the operator
+	// sees a clear total-budget error instead of a pgxpool validation error.
+	if cfg.MaxConns <= 0 {
+		total := int(cfg.MaxConns) + advisoryPoolMaxConns + leaderConnReserve
+		return nil, fmt.Errorf("storage: max_connections total ceiling %d is below the minimum %d (advisory pool %d + leadership session %d + at least 1 operational connection)", total, minTotalMaxConns, advisoryPoolMaxConns, leaderConnReserve)
 	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
@@ -207,6 +251,80 @@ func (s *PostgresStore) EnableSchemaFence() { s.schemaFence = true }
 
 // DisableSchemaFenceForTests turns the assertion off for a store; tests only.
 func (s *PostgresStore) DisableSchemaFenceForTests() { s.schemaFence = false }
+
+// OperationalMaxConns reports the operational pool's configured maximum
+// (the total database.max_connections ceiling minus the advisory pool and
+// leader reserve). Zero means the store has no operational pool (nil
+// receiver or a store that never opened one). It is the accounting
+// counterpart of WithMaxConnections.
+func (s *PostgresStore) OperationalMaxConns() int {
+	if s == nil || s.pool == nil {
+		return 0
+	}
+	cfg := s.pool.Config()
+	if cfg == nil {
+		return 0
+	}
+	return int(cfg.MaxConns)
+}
+
+// PoolStatView is a snapshot of one pgxpool's gauges. Present=false means the
+// pool does not exist (nil receiver, never created, or the store was closed):
+// the remaining fields are then zero. It is intentionally a small,
+// storage-local value so the server can export pool gauges without importing
+// pgxpool.
+type PoolStatView struct {
+	Present bool
+	InUse   int32 // AcquiredConns: currently checked out
+	Idle    int32 // IdleConns: open and idle
+	Total   int32 // TotalConns: open (idle + in use)
+	Max     int32 // MaxConns: configured ceiling
+}
+
+// poolStatView snapshots one pool; nil pools yield a zero (absent) view, so
+// callers can render gauges without nil checks.
+func poolStatView(p *pgxpool.Pool) PoolStatView {
+	if p == nil {
+		return PoolStatView{}
+	}
+	st := p.Stat()
+	return PoolStatView{
+		Present: true,
+		InUse:   st.AcquiredConns(),
+		Idle:    st.IdleConns(),
+		Total:   st.TotalConns(),
+		Max:     st.MaxConns(),
+	}
+}
+
+// PoolStats returns nil-safe snapshots of the operational and advisory
+// pools. Either view is absent (Present=false) when that pool does not exist;
+// the advisory pool is created lazily, so a NewPostgresFromPool store that
+// never fenced anything reports it absent.
+func (s *PostgresStore) PoolStats() (operational, advisory PoolStatView) {
+	if s == nil {
+		return PoolStatView{}, PoolStatView{}
+	}
+	operational = poolStatView(s.pool)
+	s.fencePoolMu.Lock()
+	advisory = poolStatView(s.fencePool)
+	s.fencePoolMu.Unlock()
+	return operational, advisory
+}
+
+// LeaderSessionHeld reports whether this store currently retains a live
+// cached leadership session (the direct advisory-lock connection acquired by
+// TryAcquireLeadership). It is a gauge accessor: false also covers a store
+// that never held leadership, released it, or lost the session. Read-only and
+// nil-safe.
+func (s *PostgresStore) LeaderSessionHeld() bool {
+	if s == nil {
+		return false
+	}
+	s.leaderMu.Lock()
+	defer s.leaderMu.Unlock()
+	return s.leaderConn != nil && !s.leaderConn.IsClosed()
+}
 
 // advisoryPoolConnect is a test-only seam over opening and pinging the
 // dedicated advisory-lock pool. Production always uses pgxpool.NewWithConfig
@@ -266,8 +384,9 @@ func (s *PostgresStore) advisoryPool(ctx context.Context) (*pgxpool.Pool, error)
 		cfg.ConnConfig = src.ConnConfig.Copy()
 	}
 	// Explicit cap: the lock pool exists to be INDEPENDENT of the
-	// operational pool, not to mirror its size.
-	cfg.MaxConns = 4
+	// operational pool, not to mirror its size. The max is part of Kiwi's
+	// TOTAL database.max_connections budget (see advisoryPoolMaxConns).
+	cfg.MaxConns = advisoryPoolMaxConns
 	cfg.MinConns = 1
 	pool, err := advisoryPoolConnect(ctx, cfg)
 	if err != nil {
@@ -301,12 +420,13 @@ func (s *PostgresStore) Close() error {
 // SELECT and RETURNING so scanned jobs/runs/runners are always complete.
 // ---------------------------------------------------------------------------
 
-const jobCols = "id, run_id, key, status, dependency_status, priority, attempts, COALESCE(error, ''), COALESCE(outputs, '{}'::jsonb), COALESCE(lease_runner_id, ''), COALESCE(lease_token_hash, ''::bytea), lease_generation, lease_expires_at, started_at, finished_at, created_at, payload"
+const jobCols = "id, run_id, key, status, dependency_status, priority, queue_boost, attempts, COALESCE(error, ''), COALESCE(outputs, '{}'::jsonb), COALESCE(lease_runner_id, ''), COALESCE(lease_token_hash, ''::bytea), lease_generation, lease_expires_at, started_at, finished_at, created_at, payload"
 
 type jobScanner struct {
 	id, runID, key        string
 	status, depStatus     string
 	priority, attempts    int
+	queueBoost            int
 	errMsg                string
 	outputsJSON           []byte
 	leaseRunnerID         string
@@ -322,7 +442,7 @@ type jobScanner struct {
 func jobTargets(js *jobScanner) []any {
 	return []any{
 		&js.id, &js.runID, &js.key, &js.status, &js.depStatus,
-		&js.priority, &js.attempts,
+		&js.priority, &js.queueBoost, &js.attempts,
 		&js.errMsg, &js.outputsJSON,
 		&js.leaseRunnerID, &js.leaseTokenHash, &js.leaseGeneration,
 		&js.leaseExpiresAt, &js.startedAt, &js.finishedAt, &js.createdAt,
@@ -341,6 +461,12 @@ func (js *jobScanner) job() (model.Job, error) {
 	j.Status = model.Status(js.status)
 	j.DependencyStatus = model.Status(js.depStatus)
 	j.Priority = js.priority
+	// queue_boost is materialized in its own column (migration 0039): the
+	// scanned value is authoritative over any payload copy, and BoostKnown
+	// marks the row as store-backed so the aged-priority helper uses it
+	// instead of recomputing from CreatedAt.
+	j.QueueBoost = js.queueBoost
+	j.BoostKnown = true
 	j.Attempts = js.attempts
 	j.Error = js.errMsg
 	j.LeaseRunnerID = js.leaseRunnerID
@@ -1053,7 +1179,7 @@ func (s *PostgresStore) PruneRunIdempotency(ctx context.Context, olderThan time.
 	if limit <= 0 {
 		limit = 1000
 	}
-	ct, err := s.pool.Exec(ctx, `DELETE FROM run_idempotency WHERE (repo_id, idempotency_key) IN (
+	ct, err := s.execSchemaFenced(ctx, `DELETE FROM run_idempotency WHERE (repo_id, idempotency_key) IN (
 		SELECT repo_id, idempotency_key FROM run_idempotency WHERE created_at < $1 ORDER BY created_at, repo_id, idempotency_key LIMIT $2
 	)`, olderThan, limit)
 	if err != nil {
@@ -1158,13 +1284,10 @@ func (s *PostgresStore) InsertRun(ctx context.Context, run model.Run) error {
 	if err != nil {
 		return err
 	}
-	// Run creation is a high-frequency fixture/enqueue write. The migration
-	// fence is enforced by the HTTP middleware and by the job-lifecycle
-	// transactions (lease, heartbeat, completion) that actually mutate
-	// migration-sensitive shapes; wrapping every run insert in its own
-	// advisory-locked transaction doubled the integration lane's wall time
-	// for no additional guarantee that the named TOCTOU surfaces lack.
-	_, err = s.pool.Exec(ctx, `INSERT INTO runs (id, status, started_at, finished_at, created_at, `+normalizedRunRepoIdentityColumn+`, `+normalizedRunRepoFullNameColumn+`, payload) VALUES ($1, $2, $3, $4, $5, `+normalizedRunRepoIdentitySQL("$6")+`, `+normalizedRunRepoFullNameSQL("$6")+`, $6)`,
+	// Run creation is a mutation: the schema fence applies like every other
+	// write, so a replica behind the compatibility floor cannot insert an
+	// N-era run row after migration N+1.
+	_, err = s.execSchemaFenced(ctx, `INSERT INTO runs (id, status, started_at, finished_at, created_at, `+normalizedRunRepoIdentityColumn+`, `+normalizedRunRepoFullNameColumn+`, payload) VALUES ($1, $2, $3, $4, $5, `+normalizedRunRepoIdentitySQL("$6")+`, `+normalizedRunRepoFullNameSQL("$6")+`, $6)`,
 		run.ID, string(run.Status), run.StartedAt, run.FinishedAt, run.CreatedAt, payload)
 	return err
 }
@@ -1184,7 +1307,7 @@ func (s *PostgresStore) UpdateRunStatus(ctx context.Context, id string, status m
 	if err := ValidateRunID(id); err != nil {
 		return err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return err
 	}
@@ -1320,7 +1443,7 @@ func (s *PostgresStore) InsertJob(ctx context.Context, job model.Job) error {
 	if err := ValidateRunID(job.RunID); err != nil {
 		return err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return err
 	}
@@ -1465,7 +1588,7 @@ func (s *PostgresStore) UpdateJob(ctx context.Context, job model.Job) error {
 	if err != nil {
 		return err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return err
 	}
@@ -1492,7 +1615,7 @@ func (s *PostgresStore) ApproveJob(ctx context.Context, jobID, actor string) (mo
 	if err := ValidateJobID(jobID); err != nil {
 		return model.Job{}, err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return model.Job{}, err
 	}
@@ -1556,9 +1679,12 @@ func (s *PostgresStore) AcquireLease(ctx context.Context, jobID, runnerID string
 	// attempts increments exactly once per lease; started_at is stamped on
 	// the FIRST lease only (COALESCE) so requeues and lost-runner re-leases
 	// preserve the original start time. A quarantined job is denied here too:
-	// the durable flag is checked in the claim statement itself.
-	err := s.pool.QueryRow(ctx, `UPDATE jobs SET status='running', attempts = attempts + 1, started_at = COALESCE(started_at, now()), lease_runner_id=$2, lease_token_hash=$3, lease_generation=$4, lease_expires_at=$5 WHERE id=$1 AND status='queued' AND COALESCE(payload->>'repo_identity_quarantined','') <> 'true' AND `+LeaseParentRunEligibleSQL+` AND (lease_expires_at IS NULL OR lease_expires_at < clock_timestamp()) RETURNING `+jobCols,
-		jobID, runnerID, tokenHash, generation, expiresAt).Scan(jobTargets(&js)...)
+	// the durable flag is checked in the claim statement itself. The write
+	// runs in a schema-fenced transaction like every other mutation.
+	err := s.queryRowSchemaCompatible(ctx, `UPDATE jobs SET status='running', attempts = attempts + 1, started_at = COALESCE(started_at, now()), lease_runner_id=$2, lease_token_hash=$3, lease_generation=$4, lease_expires_at=$5 WHERE id=$1 AND status='queued' AND COALESCE(payload->>'repo_identity_quarantined','') <> 'true' AND `+LeaseParentRunEligibleSQL+` AND (lease_expires_at IS NULL OR lease_expires_at < clock_timestamp()) RETURNING `+jobCols,
+		[]any{jobID, runnerID, tokenHash, generation, expiresAt}, func(row pgx.Row) error {
+			return row.Scan(jobTargets(&js)...)
+		})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return model.Job{}, ErrLeaseConflict
 	}
@@ -2896,7 +3022,7 @@ func (s *PostgresStore) CancelRunJobs(ctx context.Context, runID string, reason 
 	if err := ValidateRunID(runID); err != nil {
 		return nil, err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -3009,7 +3135,7 @@ func (s *PostgresStore) TouchRunnerLastSeen(ctx context.Context, runnerID string
 	if err := ValidateRunnerID(runnerID); err != nil {
 		return err
 	}
-	tag, err := s.pool.Exec(ctx, `UPDATE runners SET last_seen=clock_timestamp() WHERE id=$1`, runnerID)
+	tag, err := s.execSchemaFenced(ctx, `UPDATE runners SET last_seen=clock_timestamp() WHERE id=$1`, runnerID)
 	if err != nil {
 		return err
 	}
@@ -3040,7 +3166,7 @@ var _ ClockStore = (*PostgresStore)(nil)
 // while preserving the lease-owned fields; requireExisting fails closed with
 // ErrNotFound instead of creating a row.
 func (s *PostgresStore) writeRunnerProfile(ctx context.Context, runner model.Runner, requireExisting bool) error {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return err
 	}
@@ -3164,7 +3290,7 @@ func (s *PostgresStore) ReleaseRunnerJob(ctx context.Context, runnerID, jobID st
 	if err := ValidateJobID(jobID); err != nil {
 		return err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return err
 	}
@@ -3306,7 +3432,7 @@ func (s *PostgresStore) ClaimSecretDelivery(ctx context.Context, jobID string, g
 	if strings.TrimSpace(secretName) == "" {
 		return false, fmt.Errorf("storage: empty secret name")
 	}
-	ct, err := s.pool.Exec(ctx, `INSERT INTO secret_claims (job_id, generation, secret_name) VALUES ($1, $2, $3) ON CONFLICT (job_id, generation, secret_name) DO NOTHING`,
+	ct, err := s.execSchemaFenced(ctx, `INSERT INTO secret_claims (job_id, generation, secret_name) VALUES ($1, $2, $3) ON CONFLICT (job_id, generation, secret_name) DO NOTHING`,
 		jobID, generation, secretName)
 	if err != nil {
 		return false, err
@@ -3326,7 +3452,7 @@ func (s *PostgresStore) ReleaseSecretDelivery(ctx context.Context, jobID string,
 	if strings.TrimSpace(secretName) == "" {
 		return fmt.Errorf("storage: empty secret name")
 	}
-	_, err := s.pool.Exec(ctx, `DELETE FROM secret_claims WHERE job_id=$1 AND generation=$2 AND secret_name=$3`,
+	_, err := s.execSchemaFenced(ctx, `DELETE FROM secret_claims WHERE job_id=$1 AND generation=$2 AND secret_name=$3`,
 		jobID, generation, secretName)
 	return err
 }
@@ -3346,7 +3472,7 @@ func (s *PostgresStore) InsertArtifact(ctx context.Context, a model.ArtifactReco
 	if err != nil {
 		return err
 	}
-	_, err = s.pool.Exec(ctx, `INSERT INTO artifacts (id, run_id, job_id, job_key, name, size, sha256, created_at, expires_at, job_generation, payload) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+	_, err = s.execSchemaFenced(ctx, `INSERT INTO artifacts (id, run_id, job_id, job_key, name, size, sha256, created_at, expires_at, job_generation, payload) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 		a.ID, a.RunID, nullText(a.JobID), nullText(a.JobKey), a.Name, a.Size, nullText(a.SHA256), a.CreatedAt, a.ExpiresAt, a.LeaseGeneration, payload)
 	return err
 }
@@ -3368,7 +3494,7 @@ func (s *PostgresStore) InsertArtifactOnce(ctx context.Context, a model.Artifact
 	if err != nil {
 		return model.ArtifactRecord{}, false, err
 	}
-	ct, err := s.pool.Exec(ctx, `INSERT INTO artifacts (id, run_id, job_id, job_key, name, size, sha256, created_at, expires_at, job_generation, payload) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (job_id, job_generation, name) DO NOTHING`,
+	ct, err := s.execSchemaFenced(ctx, `INSERT INTO artifacts (id, run_id, job_id, job_key, name, size, sha256, created_at, expires_at, job_generation, payload) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (job_id, job_generation, name) DO NOTHING`,
 		a.ID, a.RunID, nullText(a.JobID), nullText(a.JobKey), a.Name, a.Size, nullText(a.SHA256), a.CreatedAt, a.ExpiresAt, a.LeaseGeneration, payload)
 	if err != nil {
 		return model.ArtifactRecord{}, false, err
@@ -3461,7 +3587,7 @@ func (s *PostgresStore) InsertTestReport(ctx context.Context, rep model.TestRepo
 	if err := ValidateRunID(rep.RunID); err != nil {
 		return err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return err
 	}
@@ -3515,8 +3641,10 @@ func (s *PostgresStore) AppendLog(ctx context.Context, e model.LogEntry) error {
 	if err := ValidateRunID(e.RunID); err != nil {
 		return err
 	}
-	err := s.pool.QueryRow(ctx, `INSERT INTO log_entries (run_id, job_id, job_key, step, line, created_at) VALUES ($1, $2, $3, $4, $5, $6) RETURNING seq`,
-		e.RunID, nullText(e.JobID), nullText(e.JobKey), nullText(e.Step), e.Line, e.CreatedAt).Scan(&e.Seq)
+	err := s.queryRowSchemaCompatible(ctx, `INSERT INTO log_entries (run_id, job_id, job_key, step, line, created_at) VALUES ($1, $2, $3, $4, $5, $6) RETURNING seq`,
+		[]any{e.RunID, nullText(e.JobID), nullText(e.JobKey), nullText(e.Step), e.Line, e.CreatedAt}, func(row pgx.Row) error {
+			return row.Scan(&e.Seq)
+		})
 	return err
 }
 
@@ -3556,7 +3684,7 @@ func (s *PostgresStore) AppendAudit(ctx context.Context, e model.AuditEvent) err
 		}
 		meta = m
 	}
-	_, err := s.pool.Exec(ctx, `INSERT INTO audit_events (id, action, actor, run_id, job_id, message, metadata, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+	_, err := s.execSchemaFenced(ctx, `INSERT INTO audit_events (id, action, actor, run_id, job_id, message, metadata, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 		e.ID, e.Action, nullText(e.Actor), nullText(e.RunID), nullText(e.JobID), nullText(e.Message), meta, e.CreatedAt)
 	return err
 }
@@ -3603,7 +3731,7 @@ func (s *PostgresStore) InsertCompletionReceipt(ctx context.Context, r model.Com
 	if err := ValidateJobID(r.JobID); err != nil {
 		return err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return err
 	}
@@ -3654,7 +3782,7 @@ func (s *PostgresStore) UpsertDelivery(ctx context.Context, forge, deliveryID st
 			return err
 		}
 	}
-	_, err := s.pool.Exec(ctx, `INSERT INTO webhook_deliveries (forge, delivery_id, run_id, payload_digest) VALUES ($1, $2, $3, $4) ON CONFLICT (forge, delivery_id) DO UPDATE SET payload_digest=EXCLUDED.payload_digest`,
+	_, err := s.execSchemaFenced(ctx, `INSERT INTO webhook_deliveries (forge, delivery_id, run_id, payload_digest) VALUES ($1, $2, $3, $4) ON CONFLICT (forge, delivery_id) DO UPDATE SET payload_digest=EXCLUDED.payload_digest`,
 		forge, deliveryID, runID, nullText(payloadDigest))
 	return err
 }
@@ -3711,7 +3839,7 @@ func (s *PostgresStore) OutboxAppend(ctx context.Context, e OutboxItem) error {
 	default:
 		return err
 	}
-	_, err = s.pool.Exec(ctx, `INSERT INTO outbox (id, kind, payload, created_at, logical_key, state_version) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING`,
+	_, err = s.execSchemaFenced(ctx, `INSERT INTO outbox (id, kind, payload, created_at, logical_key, state_version) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING`,
 		e.ID, e.Kind, payload, e.CreatedAt, nullText(e.LogicalKey), e.StateVersion)
 	if err != nil {
 		return err
@@ -3806,7 +3934,7 @@ func (s *PostgresStore) OutboxMarkDelivered(ctx context.Context, logicalKey stri
 	if logicalKey == "" || version <= 0 {
 		return fmt.Errorf("storage: mark delivered requires a logical key and a positive version")
 	}
-	_, err := s.pool.Exec(ctx, `INSERT INTO forge_check_state (logical_key, delivered_version, updated_at)
+	_, err := s.execSchemaFenced(ctx, `INSERT INTO forge_check_state (logical_key, delivered_version, updated_at)
 		VALUES ($1, $2, now())
 		ON CONFLICT (logical_key) DO UPDATE
 			SET delivered_version = GREATEST(forge_check_state.delivered_version, EXCLUDED.delivered_version),
@@ -3842,7 +3970,7 @@ func (s *PostgresStore) OutboxEnqueueVersioned(ctx context.Context, e OutboxItem
 	if len(payload) == 0 {
 		payload = []byte("{}")
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return VersionedEnqueued, err
 	}
@@ -3979,7 +4107,7 @@ func (s *PostgresStore) OutboxRequeue(ctx context.Context, id string) error {
 	if id == "" {
 		return fmt.Errorf("storage: empty outbox id")
 	}
-	tag, err := s.pool.Exec(ctx, `UPDATE outbox SET attempts=0, last_error='', next_attempt_at=now(), claimed_at=NULL, claimed_by=NULL, dead_lettered_at=NULL WHERE id=$1 AND dead_lettered_at IS NOT NULL`, id)
+	tag, err := s.execSchemaFenced(ctx, `UPDATE outbox SET attempts=0, last_error='', next_attempt_at=now(), claimed_at=NULL, claimed_by=NULL, dead_lettered_at=NULL WHERE id=$1 AND dead_lettered_at IS NOT NULL`, id)
 	if err != nil {
 		return err
 	}
@@ -3996,7 +4124,7 @@ func (s *PostgresStore) OutboxDelete(ctx context.Context, id string) error {
 	if id == "" {
 		return fmt.Errorf("storage: empty outbox id")
 	}
-	tag, err := s.pool.Exec(ctx, `DELETE FROM outbox WHERE id=$1 AND dead_lettered_at IS NOT NULL`, id)
+	tag, err := s.execSchemaFenced(ctx, `DELETE FROM outbox WHERE id=$1 AND dead_lettered_at IS NOT NULL`, id)
 	if err != nil {
 		return err
 	}
@@ -4129,7 +4257,7 @@ func (s *PostgresStore) UpsertSchedule(ctx context.Context, sc Schedule) error {
 	if sc.ID == "" {
 		return fmt.Errorf("storage: empty schedule id")
 	}
-	_, err := s.pool.Exec(ctx, `INSERT INTO schedules (id, repository, repo_id, repo_url, forge, trusted, spec, enabled, last_run, created_at, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (id) DO UPDATE SET repository=EXCLUDED.repository, repo_id=EXCLUDED.repo_id, repo_url=EXCLUDED.repo_url, forge=EXCLUDED.forge, trusted=EXCLUDED.trusted, spec=EXCLUDED.spec, enabled=EXCLUDED.enabled, last_run=EXCLUDED.last_run, created_by=EXCLUDED.created_by`,
+	_, err := s.execSchemaFenced(ctx, `INSERT INTO schedules (id, repository, repo_id, repo_url, forge, trusted, spec, enabled, last_run, created_at, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (id) DO UPDATE SET repository=EXCLUDED.repository, repo_id=EXCLUDED.repo_id, repo_url=EXCLUDED.repo_url, forge=EXCLUDED.forge, trusted=EXCLUDED.trusted, spec=EXCLUDED.spec, enabled=EXCLUDED.enabled, last_run=EXCLUDED.last_run, created_by=EXCLUDED.created_by`,
 		sc.ID, sc.Repository, sc.RepoID, sc.RepoURL, sc.Forge, sc.Trusted, sc.Spec, sc.Enabled, sc.LastRun, sc.CreatedAt, sc.CreatedBy)
 	return err
 }
@@ -4300,7 +4428,7 @@ func (s *PostgresStore) InsertDeploymentOnce(ctx context.Context, d model.Deploy
 	if err := ValidateRunID(d.RunID); err != nil {
 		return model.Deployment{}, false, err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return model.Deployment{}, false, err
 	}
@@ -4326,7 +4454,7 @@ func (s *PostgresStore) StartDeployment(ctx context.Context, d model.Deployment,
 	if err := ValidateRunID(d.RunID); err != nil {
 		return model.Deployment{}, false, err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return model.Deployment{}, false, err
 	}
@@ -4356,7 +4484,7 @@ func (s *PostgresStore) FinishDeploymentOnce(ctx context.Context, id string, sta
 	if err := ValidateID(id); err != nil {
 		return false, err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -4428,7 +4556,7 @@ func (s *PostgresStore) UpdateDeploymentStatus(ctx context.Context, id string, s
 	if err := ValidateID(id); err != nil {
 		return err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return err
 	}
@@ -4474,7 +4602,7 @@ func (s *PostgresStore) InsertSnapshotRecord(ctx context.Context, rec model.Snap
 	if err != nil {
 		return err
 	}
-	_, err = s.pool.Exec(ctx, `INSERT INTO workspace_snapshots (id, run_id, job_id, created_at, payload) VALUES ($1, $2, $3, $4, $5)`,
+	_, err = s.execSchemaFenced(ctx, `INSERT INTO workspace_snapshots (id, run_id, job_id, created_at, payload) VALUES ($1, $2, $3, $4, $5)`,
 		rec.ID, rec.RunID, nullText(rec.JobID), rec.CreatedAt, payload)
 	return err
 }
@@ -4520,7 +4648,7 @@ func (s *PostgresStore) InsertJobContracts(ctx context.Context, jobID string, co
 	if err != nil {
 		return err
 	}
-	ct, err := s.pool.Exec(ctx, `UPDATE jobs SET payload = jsonb_set(payload, '{artifact_contracts}', $2::jsonb, true) WHERE id=$1`, jobID, cp)
+	ct, err := s.execSchemaFenced(ctx, `UPDATE jobs SET payload = jsonb_set(payload, '{artifact_contracts}', $2::jsonb, true) WHERE id=$1`, jobID, cp)
 	if err != nil {
 		return err
 	}
@@ -4561,7 +4689,7 @@ func (s *PostgresStore) GetJobContracts(ctx context.Context, jobID string) (map[
 // queue_reason key so reads never observe a stale reason; missing jobs are
 // skipped (the scheduling pass may have raced a cancellation).
 func (s *PostgresStore) SetQueueReasons(ctx context.Context, reasons map[string]string) error {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return err
 	}
@@ -4595,7 +4723,7 @@ func (s *PostgresStore) InsertGeneratedJobs(ctx context.Context, parentJobID str
 	if err := ValidateJobID(parentJobID); err != nil {
 		return err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return err
 	}
@@ -4666,7 +4794,7 @@ func (s *PostgresStore) InsertGeneratedFragmentTx(ctx context.Context, req Gener
 	if req.FragmentID == "" {
 		return GeneratedFragmentReceipt{}, false, fmt.Errorf("storage: empty fragment id")
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return GeneratedFragmentReceipt{}, false, err
 	}
@@ -4800,7 +4928,7 @@ func (s *PostgresStore) InsertDownstreamLink(ctx context.Context, l DownstreamLi
 	if l.ReservedAt != nil {
 		reservedAt = l.ReservedAt
 	}
-	_, err := s.pool.Exec(ctx, `INSERT INTO downstream_links (parent_job_id, target_repo, target_ref, launch_token, child_run_id, reserved, reserved_at, target_forge, target_base_url, target_repo_id, stable_child_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (parent_job_id, target_repo, target_ref) DO NOTHING`,
+	_, err := s.execSchemaFenced(ctx, `INSERT INTO downstream_links (parent_job_id, target_repo, target_ref, launch_token, child_run_id, reserved, reserved_at, target_forge, target_base_url, target_repo_id, stable_child_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (parent_job_id, target_repo, target_ref) DO NOTHING`,
 		l.ParentJobID, l.TargetRepo, l.TargetRef, l.LaunchToken, l.ChildRunID, l.Reserved, reservedAt, l.TargetForge, l.TargetBaseURL, l.TargetRepoID, l.StableChildID, l.CreatedAt)
 	return err
 }
@@ -4848,7 +4976,7 @@ func (s *PostgresStore) ReserveDownstreamLaunch(ctx context.Context, parentJobID
 	if err := validateDownstreamReservation(parentJobID, targetRepo, targetRef, launchToken); err != nil {
 		return false, err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -4927,7 +5055,7 @@ func (s *PostgresStore) MarkDownstreamLaunched(ctx context.Context, parentJobID,
 	if childRunID == "" {
 		return fmt.Errorf("storage: empty child run id")
 	}
-	_, err := s.pool.Exec(ctx, `UPDATE downstream_links SET child_run_id=$4, reserved=FALSE, reserved_at=NULL WHERE parent_job_id=$1 AND target_repo=$2 AND target_ref=$3 AND (child_run_id IS NULL OR child_run_id='')`,
+	_, err := s.execSchemaFenced(ctx, `UPDATE downstream_links SET child_run_id=$4, reserved=FALSE, reserved_at=NULL WHERE parent_job_id=$1 AND target_repo=$2 AND target_ref=$3 AND (child_run_id IS NULL OR child_run_id='')`,
 		parentJobID, targetRepo, targetRef, childRunID)
 	return err
 }
@@ -4944,7 +5072,7 @@ func (s *PostgresStore) ReleaseDownstreamReservation(ctx context.Context, parent
 	if err := ValidateJobID(parentJobID); err != nil {
 		return err
 	}
-	_, err := s.pool.Exec(ctx, `UPDATE downstream_links SET reserved=FALSE, reserved_at=NULL WHERE parent_job_id=$1 AND target_repo=$2 AND target_ref=$3 AND reserved AND (child_run_id IS NULL OR child_run_id='')`,
+	_, err := s.execSchemaFenced(ctx, `UPDATE downstream_links SET reserved=FALSE, reserved_at=NULL WHERE parent_job_id=$1 AND target_repo=$2 AND target_ref=$3 AND reserved AND (child_run_id IS NULL OR child_run_id='')`,
 		parentJobID, targetRepo, targetRef)
 	return err
 }
@@ -5014,7 +5142,7 @@ func (s *PostgresStore) AdjustQuotaCounter(ctx context.Context, repoKey, teamKey
 	if repoKey == "" && teamKey == "" {
 		return nil
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return err
 	}
@@ -5087,7 +5215,7 @@ func (s *PostgresStore) PutCacheManifest(ctx context.Context, rec CacheManifestR
 	if err != nil {
 		return err
 	}
-	_, err = s.pool.Exec(ctx, `INSERT INTO cache_manifests (repo, trust_domain, logical_key, blob_sha256, blob_size, producer_run, producer_job, created_at, payload) VALUES ($1, $2, $3, $4, $5, $6, $7, clock_timestamp(), $8) ON CONFLICT (repo, trust_domain, logical_key) DO UPDATE SET blob_sha256=EXCLUDED.blob_sha256, blob_size=EXCLUDED.blob_size, producer_run=EXCLUDED.producer_run, producer_job=EXCLUDED.producer_job, created_at=EXCLUDED.created_at, payload=EXCLUDED.payload`,
+	_, err = s.execSchemaFenced(ctx, `INSERT INTO cache_manifests (repo, trust_domain, logical_key, blob_sha256, blob_size, producer_run, producer_job, created_at, payload) VALUES ($1, $2, $3, $4, $5, $6, $7, clock_timestamp(), $8) ON CONFLICT (repo, trust_domain, logical_key) DO UPDATE SET blob_sha256=EXCLUDED.blob_sha256, blob_size=EXCLUDED.blob_size, producer_run=EXCLUDED.producer_run, producer_job=EXCLUDED.producer_job, created_at=EXCLUDED.created_at, payload=EXCLUDED.payload`,
 		rec.Repo, rec.TrustDomain, rec.LogicalKey, rec.BlobSHA256, rec.BlobSize, nullText(rec.ProducerRun), nullText(rec.ProducerJob), payload)
 	return err
 }
@@ -5127,7 +5255,7 @@ func (s *PostgresStore) AppendDownstreamRun(ctx context.Context, runID, childRun
 	if childRunID == "" {
 		return fmt.Errorf("storage: empty child run id")
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return err
 	}
@@ -5195,7 +5323,7 @@ func (s *PostgresStore) ReopenRunForChildren(ctx context.Context, runID string) 
 	if err := ValidateRunID(runID); err != nil {
 		return err
 	}
-	_, err := s.pool.Exec(ctx, `UPDATE runs SET status='running', finished_at=NULL, payload = jsonb_set(payload, '{status}', '"running"', true), `+normalizedRunRepoIdentityColumn+`=`+normalizedRunRepoIdentitySQL("payload")+`, `+normalizedRunRepoFullNameColumn+`=`+normalizedRunRepoFullNameSQL("payload")+` WHERE id=$1 AND status='success'`, runID)
+	_, err := s.execSchemaFenced(ctx, `UPDATE runs SET status='running', finished_at=NULL, payload = jsonb_set(payload, '{status}', '"running"', true), `+normalizedRunRepoIdentityColumn+`=`+normalizedRunRepoIdentitySQL("payload")+`, `+normalizedRunRepoFullNameColumn+`=`+normalizedRunRepoFullNameSQL("payload")+` WHERE id=$1 AND status='success'`, runID)
 	return err
 }
 
@@ -5228,8 +5356,10 @@ func (s *PostgresStore) SaveTestHistory(ctx context.Context, stats []byte) (int6
 		stats = []byte("{}")
 	}
 	var version int64
-	err := s.pool.QueryRow(ctx, `INSERT INTO test_history (id, version, stats) VALUES (1, 1, $1::jsonb) ON CONFLICT (id) DO UPDATE SET version = test_history.version + 1, stats = EXCLUDED.stats, updated_at = now() RETURNING version`,
-		string(stats)).Scan(&version)
+	err := s.queryRowSchemaCompatible(ctx, `INSERT INTO test_history (id, version, stats) VALUES (1, 1, $1::jsonb) ON CONFLICT (id) DO UPDATE SET version = test_history.version + 1, stats = EXCLUDED.stats, updated_at = now() RETURNING version`,
+		[]any{string(stats)}, func(row pgx.Row) error {
+			return row.Scan(&version)
+		})
 	return version, err
 }
 
@@ -5682,34 +5812,109 @@ func (s *PostgresStore) applyMigration(ctx context.Context, m migrations.Migrati
 	return tx.Commit(ctx)
 }
 
+// Schema-fence exemptions (the ONLY non-fence-helper raw-pool writes allowed
+// in production code; enforced by schema_fence_architecture_test.go):
+//
+//   - applyMigration: the migrator itself. It holds the EXCLUSIVE
+//     kiwi_schema_migrations advisory lock and writes the floor every other
+//     transaction reads; fencing it against itself would deadlock.
+//   - EnsureClusterKeySchema: additive bootstrap DDL (cluster_keys) that runs
+//     under the same exclusive schema-migrations lock and before keys load;
+//     there is no floor to check against yet on a fresh schema.
+//   - ensureRepoIdentityQuarantineSchema: additive repair DDL, same pattern.
+//   - beginSchemaCompatibleTx/beginFencedTx/applySchemaFence: the fence
+//     helpers themselves (they open the transaction the fence is applied to).
+//   - raw READS (SELECT-only pool.QueryRow/Query) do not mutate and carry no
+//     fence; the architecture test recognizes them by their SQL verb.
+//
+// Every production MUTATION must go through applySchemaFence (via one of the
+// begin* helpers) or assertLeaderEpoch+applySchemaFence (TryAcquireCASGCLease)
+// so an old replica can never commit an N-era assumption after migration
+// N+1's exclusive lock has been released.
+
+// applySchemaFence takes the SHARED schema advisory lock (migrations hold the
+// exclusive form) and refuses when the recorded compatibility floor demands a
+// newer binary. Holding the shared lock until commit closes the check/write
+// window the HTTP middleware cannot. It is the ONE implementation shared by
+// beginSchemaCompatibleTx and beginFencedTx so the two can never drift, and a
+// no-op when fencing is disabled (binarySchemaVersion == 0 or schemaFence
+// false), which keeps fixture stores and dev mode on plain transactions.
+func (s *PostgresStore) applySchemaFence(ctx context.Context, tx pgx.Tx) error {
+	if s.binarySchemaVersion <= 0 || !s.schemaFence {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(hashtext('kiwi_schema_migrations'))`); err != nil {
+		return fmt.Errorf("%w: acquire schema consistency lock: %v", ErrSchemaIncompatible, err)
+	}
+	var floor int
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(compatible_from),0) FROM schema_migrations`).Scan(&floor); err != nil {
+		return fmt.Errorf("%w: read schema compatibility floor: %v", ErrSchemaIncompatible, err)
+	}
+	if floor > s.binarySchemaVersion {
+		return fmt.Errorf("%w (floor %d, binary %d)", ErrSchemaIncompatible, floor, s.binarySchemaVersion)
+	}
+	return nil
+}
+
 // beginSchemaCompatibleTx starts a transaction that participates in the
 // migration/mutation lock protocol: it takes the SHARED schema advisory
 // lock (migrations hold the exclusive form) and refuses when the recorded
 // compatibility floor demands a newer binary. Holding the shared lock until
 // commit closes the check/write window the HTTP middleware cannot.
 //
-// Every mutation whose shape can change across migrations must use it.
+// Every mutation whose shape can change across migrations must use it (via
+// withSchemaCompatibleTx/execSchemaFenced/queryRowSchemaCompatible below).
 func (s *PostgresStore) beginSchemaCompatibleTx(ctx context.Context) (pgx.Tx, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if s.binarySchemaVersion > 0 && s.schemaFence {
-		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(hashtext('kiwi_schema_migrations'))`); err != nil {
-			_ = tx.Rollback(ctx)
-			return nil, fmt.Errorf("%w: acquire schema consistency lock: %v", ErrSchemaIncompatible, err)
-		}
-		var floor int
-		if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(compatible_from),0) FROM schema_migrations`).Scan(&floor); err != nil {
-			_ = tx.Rollback(ctx)
-			return nil, fmt.Errorf("%w: read schema compatibility floor: %v", ErrSchemaIncompatible, err)
-		}
-		if floor > s.binarySchemaVersion {
-			_ = tx.Rollback(ctx)
-			return nil, fmt.Errorf("%w (floor %d, binary %d)", ErrSchemaIncompatible, floor, s.binarySchemaVersion)
-		}
+	if err := s.applySchemaFence(ctx, tx); err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, err
 	}
 	return tx, nil
+}
+
+// withSchemaCompatibleTx runs fn inside a schema-fenced transaction: the
+// shared schema lock is held until commit (rollback on error), so a migration
+// cannot commit between fn's floor check and fn's writes. When fencing is
+// disabled it still works exactly like beginSchemaCompatibleTx: a plain
+// Begin/Commit pair.
+func (s *PostgresStore) withSchemaCompatibleTx(ctx context.Context, fn func(pgx.Tx) error) error {
+	tx, err := s.beginSchemaCompatibleTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// execSchemaFenced runs one write statement inside a schema-fenced
+// transaction and returns its command tag, so single-statement writes get the
+// same migration fence as the multi-statement transactions.
+func (s *PostgresStore) execSchemaFenced(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	var tag pgconn.CommandTag
+	err := s.withSchemaCompatibleTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		tag, err = tx.Exec(ctx, sql, args...)
+		return err
+	})
+	return tag, err
+}
+
+// queryRowSchemaCompatible runs a single-row query (typically an INSERT or
+// UPDATE ... RETURNING) inside a schema-fenced transaction and invokes scan
+// with the row before committing; a scan error rolls the write back. It is the
+// single-row counterpart of execSchemaFenced for writes whose result the
+// caller consumes.
+func (s *PostgresStore) queryRowSchemaCompatible(ctx context.Context, sql string, args []any, scan func(pgx.Row) error) error {
+	return s.withSchemaCompatibleTx(ctx, func(tx pgx.Tx) error {
+		return scan(tx.QueryRow(ctx, sql, args...))
+	})
 }
 
 // SchemaCompatibilityFloor returns the newest compatibility floor recorded
@@ -5780,8 +5985,9 @@ func scanProfile(row pgx.Row) (model.RunnerProfile, error) {
 		maxPIDs     int
 		cost        float64
 		watts       float64
+		jobCgroup   bool
 	)
-	err := row.Scan(&p.ID, &labels, &region, &repos, &caps, &maxCapacity, &maxCPU, &maxMemory, &maxDisk, &maxPIDs, &cost, &watts, &p.CreatedAt)
+	err := row.Scan(&p.ID, &labels, &region, &repos, &caps, &maxCapacity, &maxCPU, &maxMemory, &maxDisk, &maxPIDs, &cost, &watts, &jobCgroup, &p.CreatedAt)
 	if err != nil {
 		return p, err
 	}
@@ -5802,14 +6008,15 @@ func scanProfile(row pgx.Row) (model.RunnerProfile, error) {
 	p.MaxPIDs = maxPIDs
 	p.CostPerHour = cost
 	p.PowerWatts = watts
+	p.JobCgroup = jobCgroup
 	return p, nil
 }
 
-const profileCols = "id, labels, region, repositories, capabilities, max_capacity, max_cpu, max_memory, max_disk, max_pids, cost_per_hour, power_watts, created_at"
+const profileCols = "id, labels, region, repositories, capabilities, max_capacity, max_cpu, max_memory, max_disk, max_pids, cost_per_hour, power_watts, job_cgroup, created_at"
 
 // profileColsAliased is profileCols qualified with a table alias for the
 // cert_profile_links join; the two lists MUST stay in the same order.
-const profileColsAliased = "rp.id, rp.labels, rp.region, rp.repositories, rp.capabilities, rp.max_capacity, rp.max_cpu, rp.max_memory, rp.max_disk, rp.max_pids, rp.cost_per_hour, rp.power_watts, rp.created_at"
+const profileColsAliased = "rp.id, rp.labels, rp.region, rp.repositories, rp.capabilities, rp.max_capacity, rp.max_cpu, rp.max_memory, rp.max_disk, rp.max_pids, rp.cost_per_hour, rp.power_watts, rp.job_cgroup, rp.created_at"
 
 func (s *PostgresStore) UpsertProfile(ctx context.Context, p model.RunnerProfile) error {
 	if p.ID == "" {
@@ -5840,8 +6047,8 @@ func (s *PostgresStore) UpsertProfile(ctx context.Context, p model.RunnerProfile
 	if created.IsZero() {
 		created = time.Now().UTC()
 	}
-	_, err = s.pool.Exec(ctx, `INSERT INTO runner_profiles (id, labels, region, repositories, capabilities, max_capacity, max_cpu, max_memory, max_disk, max_pids, cost_per_hour, power_watts, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (id) DO UPDATE SET labels=EXCLUDED.labels, region=EXCLUDED.region, repositories=EXCLUDED.repositories, capabilities=EXCLUDED.capabilities, max_capacity=EXCLUDED.max_capacity, max_cpu=EXCLUDED.max_cpu, max_memory=EXCLUDED.max_memory, max_disk=EXCLUDED.max_disk, max_pids=EXCLUDED.max_pids, cost_per_hour=EXCLUDED.cost_per_hour, power_watts=EXCLUDED.power_watts`,
-		p.ID, labels, p.Region, repos, caps, p.MaxCapacity, p.MaxCPU, p.MaxMemory, p.MaxDisk, p.MaxPIDs, p.CostPerHour, p.PowerWatts, created)
+	_, err = s.execSchemaFenced(ctx, `INSERT INTO runner_profiles (id, labels, region, repositories, capabilities, max_capacity, max_cpu, max_memory, max_disk, max_pids, cost_per_hour, power_watts, job_cgroup, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT (id) DO UPDATE SET labels=EXCLUDED.labels, region=EXCLUDED.region, repositories=EXCLUDED.repositories, capabilities=EXCLUDED.capabilities, max_capacity=EXCLUDED.max_capacity, max_cpu=EXCLUDED.max_cpu, max_memory=EXCLUDED.max_memory, max_disk=EXCLUDED.max_disk, max_pids=EXCLUDED.max_pids, cost_per_hour=EXCLUDED.cost_per_hour, power_watts=EXCLUDED.power_watts, job_cgroup=EXCLUDED.job_cgroup`,
+		p.ID, labels, p.Region, repos, caps, p.MaxCapacity, p.MaxCPU, p.MaxMemory, p.MaxDisk, p.MaxPIDs, p.CostPerHour, p.PowerWatts, p.JobCgroup, created)
 	return err
 }
 
@@ -5877,7 +6084,7 @@ func (s *PostgresStore) BindCertProfile(ctx context.Context, serial, profileID s
 	if profileID == "" {
 		return fmt.Errorf("storage: profile id is required")
 	}
-	if _, err := s.pool.Exec(ctx, `INSERT INTO cert_profile_links (serial, profile_id) VALUES ($1,$2) ON CONFLICT (serial) DO UPDATE SET profile_id=EXCLUDED.profile_id`, serial, profileID); err != nil {
+	if _, err := s.execSchemaFenced(ctx, `INSERT INTO cert_profile_links (serial, profile_id) VALUES ($1,$2) ON CONFLICT (serial) DO UPDATE SET profile_id=EXCLUDED.profile_id`, serial, profileID); err != nil {
 		return err
 	}
 	return nil
@@ -5904,7 +6111,7 @@ func (s *PostgresStore) UpsertRunnerToken(ctx context.Context, runnerID, tokenDi
 	if tokenDigest == "" {
 		return fmt.Errorf("storage: token digest is required")
 	}
-	_, err := s.pool.Exec(ctx, `INSERT INTO runner_bearer_tokens (runner_id, token_digest) VALUES ($1,$2) ON CONFLICT (runner_id) DO UPDATE SET token_digest=EXCLUDED.token_digest`, runnerID, tokenDigest)
+	_, err := s.execSchemaFenced(ctx, `INSERT INTO runner_bearer_tokens (runner_id, token_digest) VALUES ($1,$2) ON CONFLICT (runner_id) DO UPDATE SET token_digest=EXCLUDED.token_digest`, runnerID, tokenDigest)
 	return err
 }
 
@@ -5963,7 +6170,10 @@ func (s *PostgresStore) PutEnrollGrantWithTTL(ctx context.Context, digest string
 		labels = []byte("[]")
 	}
 	var expires time.Time
-	err = s.pool.QueryRow(ctx, `INSERT INTO enrollment_grants (digest, expires_at, bound_labels) VALUES ($1, clock_timestamp() + make_interval(secs => $2::double precision), $3) ON CONFLICT (digest) DO NOTHING RETURNING expires_at`, digest, ttl.Seconds(), labels).Scan(&expires)
+	err = s.queryRowSchemaCompatible(ctx, `INSERT INTO enrollment_grants (digest, expires_at, bound_labels) VALUES ($1, clock_timestamp() + make_interval(secs => $2::double precision), $3) ON CONFLICT (digest) DO NOTHING RETURNING expires_at`,
+		[]any{digest, ttl.Seconds(), labels}, func(row pgx.Row) error {
+			return row.Scan(&expires)
+		})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return time.Time{}, fmt.Errorf("storage: enrollment grant digest already exists")
 	}
@@ -6028,7 +6238,7 @@ func (s *PostgresStore) ConsumeEnrollGrant(ctx context.Context, digest string, c
 	if digest == "" {
 		return EnrollGrantRecord{}, ErrNotFound
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return EnrollGrantRecord{}, err
 	}
@@ -6138,7 +6348,7 @@ func (s *PostgresStore) OutboxRetryClaimed(ctx context.Context, id, claimer stri
 	// Backoff: 2^min(attempts,6) seconds capped at one minute, plus a
 	// deterministic per-row jitter derived from the row id hash, all computed
 	// from the locked row's CURRENT attempts inside the statement.
-	_, err := s.pool.Exec(ctx, `
+	_, err := s.execSchemaFenced(ctx, `
 UPDATE outbox SET
     attempts = attempts + 1,
     last_error = $2,

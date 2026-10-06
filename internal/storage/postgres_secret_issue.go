@@ -225,7 +225,7 @@ func (s *PostgresStore) CommitSecretIssuance(ctx context.Context, req SecretIssu
 	if err := ValidateSecretIssuanceRequest(req); err != nil {
 		return err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return err
 	}

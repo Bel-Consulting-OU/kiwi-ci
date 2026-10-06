@@ -53,10 +53,30 @@ const (
 	// DefaultMaxCandidateRows bounds the queued candidates one lease attempt
 	// materializes across all pages.
 	DefaultMaxCandidateRows = 4096
+	// MaxCandidateRowsCap is the hard upper bound SetLeaseScanLimits clamps
+	// maxRows to, so a library caller cannot disable the bounded scan. It
+	// mirrors config.MaxSchedulerMaxCandidateRows, the ceiling the config
+	// validator applies to scheduler.max_candidate_rows.
+	MaxCandidateRowsCap = 100000
+	// queuedScanCursorTTL is how long a per-runner continuation cursor stays
+	// usable: an unused cursor older than this is discarded so a queue that
+	// changed shape underneath it is re-scanned from the head instead of
+	// resuming at a stale position forever.
+	queuedScanCursorTTL = 15 * time.Minute
 	// DefaultReservationWait is the default reservation-head wait: zero makes
 	// a resource-blocked candidate block starving backfill immediately.
 	DefaultReservationWait = time.Duration(0)
 )
+
+// queuedScanState is one runner's continuation cursor: after names the last
+// queued candidate the previous lease attempt actually evaluated, touched is
+// when that attempt finished. It is request-local bookkeeping only; a claim
+// race between two concurrent leases for the same runner is resolved by the
+// store's atomic claim, never by this state.
+type queuedScanState struct {
+	after   storage.QueuedJobCursor
+	touched time.Time
+}
 
 // Scheduler is the control-plane scheduling contract. Implementations operate
 // on a storage.Store and must be safe for concurrent use.
@@ -104,6 +124,18 @@ type DBScheduler struct {
 	maxCandidateRows  int
 	reservationWait   time.Duration
 
+	// scanMu guards scan, the per-runner continuation position of the
+	// bounded queued-candidate walk: when one lease attempt exhausts its
+	// maxRows budget while the page store still has more candidates, the
+	// last EVALUATED cursor is remembered here so the next poll for the
+	// same runner resumes after it instead of re-materializing the same
+	// incompatible prefix. A cursor older than queuedScanCursorTTL is
+	// discarded. Correctness never depends on exclusive ownership: two
+	// concurrent leases may scan from the same position, and their claim
+	// race is resolved by the store's atomic lease.
+	scanMu sync.Mutex
+	scan   map[string]queuedScanState
+
 	// leader is true while this instance holds the leadership claim.
 	// Access is atomic: Lease and IsLeader can run concurrently from
 	// runner poll goroutines.
@@ -133,14 +165,18 @@ func (s *DBScheduler) quotaLimits() (repo, team float64) {
 // keyset-page size, the maximum candidate rows one Lease attempt may
 // materialize across pages, and the reservation-head wait. Non-positive
 // pageSize/maxRows select DefaultCandidatePageSize/DefaultMaxCandidateRows;
-// a negative reservationWait is clamped to zero (immediate head activation).
-// Safe for concurrent use with Lease.
+// maxRows above MaxCandidateRowsCap is clamped to it, so a library caller
+// cannot disable the bounded scan. A negative reservationWait is clamped to
+// zero (immediate head activation). Safe for concurrent use with Lease.
 func (s *DBScheduler) SetLeaseScanLimits(pageSize, maxRows int, reservationWait time.Duration) {
 	if pageSize <= 0 {
 		pageSize = DefaultCandidatePageSize
 	}
 	if maxRows <= 0 {
 		maxRows = DefaultMaxCandidateRows
+	}
+	if maxRows > MaxCandidateRowsCap {
+		maxRows = MaxCandidateRowsCap
 	}
 	if reservationWait < 0 {
 		reservationWait = 0
@@ -163,6 +199,12 @@ func (s *DBScheduler) leaseScanLimits() (pageSize, maxRows int, reservationWait 
 	}
 	if maxRows <= 0 {
 		maxRows = DefaultMaxCandidateRows
+	}
+	// Defensive second clamp: the fields are unexported, but an in-package
+	// caller can still install them directly, and the hard bound must hold
+	// for every reader.
+	if maxRows > MaxCandidateRowsCap {
+		maxRows = MaxCandidateRowsCap
 	}
 	if reservationWait < 0 {
 		reservationWait = 0
@@ -319,6 +361,19 @@ func (s *DBScheduler) Enqueue(ctx context.Context, run model.Run, jobs map[strin
 // orderQueuedJobs), the same order the page store returns, so bounding the
 // scan never changes the fairness policy.
 //
+// The read carries the effective runner's coarse eligibility pushdown
+// (storage.QueuedJobFilter: runtimes, labels, region, capacity and the
+// job-scoped-cgroup envelope relaxation), so candidates the shared lease
+// predicate would reject are skipped by the store instead of being
+// materialized. Every lease attempt starts with a HEAD WINDOW page (newly
+// enqueued/high-priority candidates are always seen), then resumes from a
+// fresh per-runner continuation cursor when the previous attempt exhausted
+// its maxRows budget mid-queue — so a long prefix of candidates that pass
+// the coarse filter but fail the Go gates (deadlines, dependencies,
+// environment/policy concurrency) cannot pin the scan to the same rows
+// forever. Cursors older than queuedScanCursorTTL are discarded, and a claim
+// or an exhausted queue clears the cursor.
+//
 // RESERVATION POLICY (anti-backfill): the first resource-blocked candidate
 // in aged order that is still eligible on every other gate becomes the
 // request's RESERVATION HEAD — the job that would run on this runner once
@@ -392,58 +447,48 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 		runJobs:         map[string]map[string]model.Job{},
 		envJobs:         map[string][]model.Job{},
 	}
+	// The runner-coarse eligibility pushdown is built ONCE per attempt from
+	// the effective runner and used by BOTH paths: the page store applies it
+	// in SQL/memory, and the fallback applies the ONE shared matcher before
+	// ordering. It is a conservative coarse prefilter only — the Go
+	// predicate set (queue deadline, resource admission, environment,
+	// enforced-policy, dependencies) still decides every candidate.
+	filter := runnerQueuedJobFilter(eff)
 	scanned := 0
 	pageStore, hasPages := s.Store.(storage.QueuedJobPageStore)
 	if hasPages {
-		var after *storage.QueuedJobCursor
-		for scanned < maxRows {
-			pageLimit := pageSize
-			if remaining := maxRows - scanned; remaining < pageLimit {
-				pageLimit = remaining
-			}
-			page, err := pageStore.ListQueuedJobsPage(ctx, after, pageLimit, now)
-			if err != nil {
-				return nil, "", time.Time{}, err
-			}
-			if len(page.Jobs) == 0 {
-				break
-			}
-			// The page store already returns the aged order; re-applying the
-			// local ordering keeps the in-page decision identical to the
-			// historical whole-queue walk even if a store returns a page in
-			// a looser order.
-			orderQueuedJobs(page.Jobs, now)
-			scanned += len(page.Jobs)
-			for _, candidate := range page.Jobs {
-				res := walk.consider(candidate)
-				if res.err != nil {
-					return nil, "", time.Time{}, res.err
-				}
-				if res.claimed {
-					return res.job, res.raw, res.expires, nil
-				}
-			}
-			if !page.HasMore || scanned >= maxRows {
-				break
-			}
-			cursor := page.Last
-			after = &cursor
+		res, err := s.leasePaged(ctx, pageStore, filter, walk, runnerID, pageSize, maxRows, now)
+		if err != nil {
+			return nil, "", time.Time{}, err
+		}
+		if res.claimed {
+			return res.job, res.raw, res.expires, nil
 		}
 	} else {
 		// Historical fallback for stores without the paged candidate
-		// contract: materialize the whole queue and walk it in the same aged
-		// order, still bounded by maxCandidateRows.
+		// contract: materialize the whole queue, apply the SAME coarse
+		// matcher the page store applies, and walk it in the same aged
+		// order, still bounded by maxCandidateRows. The per-runner
+		// continuation cursor is not applied here: this path is a legacy
+		// store contract, and the whole-queue read already bounds the
+		// candidate set.
 		queued, err := s.Store.ListQueuedJobs(ctx)
 		if err != nil {
 			return nil, "", time.Time{}, err
 		}
-		orderQueuedJobs(queued, now)
-		for i := range queued {
+		eligible := make([]model.Job, 0, len(queued))
+		for _, j := range queued {
+			if storage.QueuedJobMatchesFilter(j, filter) {
+				eligible = append(eligible, j)
+			}
+		}
+		orderQueuedJobs(eligible, now)
+		for i := range eligible {
 			if scanned >= maxRows {
 				break
 			}
 			scanned++
-			res := walk.consider(queued[i])
+			res := walk.consider(eligible[i])
 			if res.err != nil {
 				return nil, "", time.Time{}, res.err
 			}
@@ -453,6 +498,176 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 		}
 	}
 	return nil, "", time.Time{}, ErrNoJobs
+}
+
+// leasePaged runs the bounded paged candidate walk of ONE lease attempt over
+// a storage.QueuedJobPageStore:
+//
+//  1. HEAD WINDOW: one page at the head (after=nil) is fetched and walked
+//     first, so newly enqueued or highest-aged candidates are always seen
+//     promptly, even while the runner is resuming deeper in the queue.
+//  2. CONTINUATION: while budget remains, pages are fetched from a FRESH
+//     per-runner cursor when one exists, otherwise strictly after the head
+//     window's Last. Every fetched page is walked in full, so the cursor
+//     only ever advances past rows this attempt actually evaluated.
+//  3. STATE: a claim clears the cursor; exhaustion (!HasMore) clears it; a
+//     maxRows exhaustion with HasMore stores the last evaluated position so
+//     the next poll for the same runner resumes instead of re-materializing
+//     the same prefix. An interactive reservation head that leaves every
+//     candidate unclaimed simply stores (or keeps) the position the same
+//     way, so the next poll continues rather than restarting.
+func (s *DBScheduler) leasePaged(ctx context.Context, pageStore storage.QueuedJobPageStore, filter storage.QueuedJobFilter, walk *leaseCandidateWalk, runnerID string, pageSize, maxRows int, now time.Time) (leaseWalkResult, error) {
+	headLimit := pageSize
+	if maxRows < headLimit {
+		headLimit = maxRows
+	}
+	scanned := 0
+	head, err := pageStore.ListQueuedJobsPage(ctx, filter, nil, headLimit, now)
+	if err != nil {
+		return leaseWalkResult{}, err
+	}
+	// The page store already returns the aged order; re-applying the local
+	// ordering keeps the in-page decision identical to the historical
+	// whole-queue walk even if a store returns a page in a looser order.
+	orderQueuedJobs(head.Jobs, now)
+	scanned += len(head.Jobs)
+	if res := walk.walkPage(head.Jobs); res.claimed || res.err != nil {
+		if res.claimed {
+			s.clearScanCursor(runnerID)
+		}
+		return res, nil
+	}
+	last, hasMore := head.Last, head.HasMore
+	if len(head.Jobs) == 0 {
+		hasMore = false
+	}
+	after, hasAfter := head.Last, hasMore
+	if stored, ok := s.loadScanCursor(runnerID, now); ok {
+		after, hasAfter = stored, true
+	}
+	for hasAfter && scanned < maxRows {
+		pageLimit := pageSize
+		if remaining := maxRows - scanned; remaining < pageLimit {
+			pageLimit = remaining
+		}
+		page, err := pageStore.ListQueuedJobsPage(ctx, filter, &after, pageLimit, now)
+		if err != nil {
+			return leaseWalkResult{}, err
+		}
+		if len(page.Jobs) == 0 {
+			hasMore = false
+			break
+		}
+		orderQueuedJobs(page.Jobs, now)
+		scanned += len(page.Jobs)
+		if res := walk.walkPage(page.Jobs); res.claimed || res.err != nil {
+			if res.claimed {
+				s.clearScanCursor(runnerID)
+			}
+			return res, nil
+		}
+		last, hasMore = page.Last, page.HasMore
+		if !hasMore {
+			break
+		}
+		after = page.Last
+	}
+	if hasMore && scanned >= maxRows {
+		// Budget exhausted with candidates still unscanned: remember the
+		// last position the walk actually evaluated, so the next poll
+		// resumes behind it instead of re-scanning the same prefix.
+		s.saveScanCursor(runnerID, last, now)
+	} else {
+		s.clearScanCursor(runnerID)
+	}
+	return leaseWalkResult{}, nil
+}
+
+// walkPage considers every candidate of one page in order, stopping at the
+// first claim or fatal error. Every row of the page is evaluated before the
+// page is considered walked, which is what lets the continuation cursor be
+// saved at a page boundary without skipping an unevaluated row.
+func (w *leaseCandidateWalk) walkPage(candidates []model.Job) leaseWalkResult {
+	for _, candidate := range candidates {
+		res := w.consider(candidate)
+		if res.claimed || res.err != nil {
+			return res
+		}
+	}
+	return leaseWalkResult{}
+}
+
+// loadScanCursor returns the runner's fresh continuation cursor. A cursor at
+// or past queuedScanCursorTTL is discarded, so a queue that changed shape
+// underneath a stale position is re-scanned from the head.
+func (s *DBScheduler) loadScanCursor(runnerID string, now time.Time) (storage.QueuedJobCursor, bool) {
+	s.scanMu.Lock()
+	defer s.scanMu.Unlock()
+	st, ok := s.scan[runnerID]
+	if !ok {
+		return storage.QueuedJobCursor{}, false
+	}
+	if now.Sub(st.touched) > queuedScanCursorTTL {
+		delete(s.scan, runnerID)
+		return storage.QueuedJobCursor{}, false
+	}
+	return st.after, true
+}
+
+// saveScanCursor records the runner's continuation position. Concurrent
+// leases for one runner may overwrite each other; the last writer wins and
+// the worst case is one redundant re-scan, never a skipped claim (the store's
+// atomic claim is the race boundary).
+func (s *DBScheduler) saveScanCursor(runnerID string, after storage.QueuedJobCursor, now time.Time) {
+	s.scanMu.Lock()
+	defer s.scanMu.Unlock()
+	if s.scan == nil {
+		s.scan = map[string]queuedScanState{}
+	}
+	s.scan[runnerID] = queuedScanState{after: after, touched: now}
+}
+
+// clearScanCursor drops the runner's continuation position (a claim, an
+// exhausted queue, or any state that would otherwise be re-scanned next
+// poll).
+func (s *DBScheduler) clearScanCursor(runnerID string) {
+	s.scanMu.Lock()
+	defer s.scanMu.Unlock()
+	delete(s.scan, runnerID)
+}
+
+// runnerQueuedJobFilter derives the storage.QueuedJobFilter for one effective
+// runner, mirroring EXACTLY the coarse dimensions of the shared lease
+// predicate:
+//
+//   - Runtimes is nil for the legacy-unrestricted case (not enforced and no
+//     capabilities: every runtime is accepted), otherwise a non-nil copy of
+//     the effective capability set — an ENFORCED empty set stays non-nil and
+//     matches nothing, exactly like RuntimeAllowed;
+//   - RunnerLabels is ALWAYS non-nil (an empty slice when the runner holds
+//     none), because a label-less runner must exclude jobs with required
+//     labels, and a nil slice would mean "unconstrained";
+//   - RunnerRegion/ MaxRequested / IgnoreServiceEnvelope carry the runner's
+//     placement region, configured resource capacity and job-scoped cgroup
+//     capability, so the coarse capacity predicate evaluates the same
+//     effective request (job request, plus envelope unless JobCgroup) the
+//     scheduler and the claim reserve.
+func runnerQueuedJobFilter(eff model.Runner) storage.QueuedJobFilter {
+	filter := storage.QueuedJobFilter{
+		RunnerRegion:          eff.Region,
+		MaxRequested:          eff.ResourceCapacity,
+		IgnoreServiceEnvelope: eff.JobCgroup,
+	}
+	if !eff.CapabilitiesEnforced && len(eff.Capabilities) == 0 {
+		filter.Runtimes = nil
+	} else {
+		filter.Runtimes = append([]string{}, eff.Capabilities...)
+	}
+	labels := make([]string, 0, len(eff.Labels))
+	labels = append(labels, eff.Labels...)
+	sort.Strings(labels)
+	filter.RunnerLabels = labels
+	return filter
 }
 
 // leaseCandidateWalk is the request-local state of ONE Lease candidate scan:
@@ -503,13 +718,15 @@ func (w *leaseCandidateWalk) consider(candidate model.Job) leaseWalkResult {
 	// Resource admission pre-filter: a candidate that cannot fit the
 	// runner's remaining resource capacity waits for room on this runner
 	// (or a lease on another one) instead of being claimed and rolling
-	// back. The requested total is the job's OWN request plus its aggregate
-	// service envelope (model.Job.ReservedResources) — the same total the
-	// claim transaction and the fs/dev path charge.
+	// back. The requested total is effectiveJobRequest: the job's OWN
+	// request plus its aggregate service envelope, unless the runner
+	// establishes a job-scoped parent cgroup (JobCgroup), in which case the
+	// kernel bounds the aggregate and only the job request is charged — the
+	// same total the claim transaction and the fs/dev path charge.
 	adm := storage.ResourceAdmission{
 		Capacity:  w.eff.ResourceCapacity,
 		Reserved:  w.reserved,
-		Requested: candidate.ReservedResources(),
+		Requested: effectiveJobRequest(candidate, w.eff.JobCgroup),
 	}
 	if !adm.Allows() {
 		if w.head != nil || !adm.EverSatisfiable() {
@@ -581,6 +798,11 @@ func (w *leaseCandidateWalk) consider(candidate model.Job) leaseWalkResult {
 		// transaction reserves job request + envelope in the ONE
 		// ledger row (LeaseClaim.RequestedResources).
 		ServiceEnvelopeRequest: candidate.ServiceEnvelopeRequest,
+		// A runner that can establish a job-scoped parent cgroup bounds the
+		// main container and every service together at the kernel, so the
+		// claim reserves only the job's own request (the SAME relaxation
+		// the pre-filter and headFitsAlongside applied).
+		IgnoreServiceEnvelope: w.eff.JobCgroup,
 		// A quarantined candidate carries the durable identity flag, so
 		// the SQL claim denies it independently of every allowlist just
 		// as the in-memory predicate does (R1-6).
@@ -757,8 +979,12 @@ func (w *leaseCandidateWalk) eligible(candidate model.Job) (map[string]model.Job
 // A false result means admitting C could permanently occupy capacity the
 // head needs; the candidate is skipped.
 func (w *leaseCandidateWalk) headFitsAlongside(candidate model.Job) bool {
-	add := candidate.ReservedResources()
-	head := w.head.ReservedResources()
+	// Both sides use the runner's effective request: on a JobCgroup runner
+	// the kernel bounds the candidate and the head together by their own
+	// declared requests, so their service envelopes are not charged here
+	// (nor by the pre-filter, the filter or the claim).
+	add := effectiveJobRequest(candidate, w.eff.JobCgroup)
+	head := effectiveJobRequest(*w.head, w.eff.JobCgroup)
 	capacity := w.eff.ResourceCapacity
 	if capacity.CPU > 0 && add.CPU > 0 && w.reserved.CPU+add.CPU+head.CPU > capacity.CPU {
 		return false
@@ -773,6 +999,20 @@ func (w *leaseCandidateWalk) headFitsAlongside(candidate model.Job) bool {
 		return false
 	}
 	return true
+}
+
+// effectiveJobRequest returns the resources a lease on j reserves against a
+// runner: the job's own declared request plus its aggregate service envelope
+// (model.Job.ReservedResources). On a runner that can establish a job-scoped
+// parent cgroup (ignoreEnvelope, from Runner.JobCgroup) the kernel bounds the
+// main container and every service together by the job's declared envelope,
+// so only the job's own request is charged — the SAME relaxation
+// storage.LeaseClaim.IgnoreServiceEnvelope gives the claim transaction.
+func effectiveJobRequest(j model.Job, ignoreEnvelope bool) model.ResourceCapacity {
+	if ignoreEnvelope {
+		return j.ResourceRequest()
+	}
+	return j.ReservedResources()
 }
 
 // effectiveRunner resolves the runner's LIVE scheduling view at lease time
@@ -791,6 +1031,18 @@ func (w *leaseCandidateWalk) headFitsAlongside(candidate model.Job) bool {
 // (without dangling detection, since those report only found/not-found); the
 // claim transaction remains the authoritative decision.
 func (s *DBScheduler) effectiveRunner(ctx context.Context, ri model.Runner) model.Runner {
+	eff, _ := s.effectiveRunnerChecked(ctx, ri)
+	return eff
+}
+
+// effectiveRunnerChecked is effectiveRunner with an explicit resolution
+// outcome: ok=false means the live-profile read failed and the returned
+// runner is the registration snapshot. The scheduler's own prefilter/claim
+// keeps the snapshot fallback (the claim re-reads inside its transaction and
+// decides with its own error), while a caller that ADVERTISES a
+// profile-derived capability to the runner — the /next task's job_cgroup
+// flag — must treat a failed resolution conservatively and not advertise it.
+func (s *DBScheduler) effectiveRunnerChecked(ctx context.Context, ri model.Runner) (model.Runner, bool) {
 	if lr, ok := s.Store.(storage.LiveProfileResolver); ok {
 		resolution, err := lr.ResolveLiveRunnerProfile(ctx, ri.ID, ri.CertSerial)
 		if err != nil {
@@ -798,9 +1050,9 @@ func (s *DBScheduler) effectiveRunner(ctx context.Context, ri model.Runner) mode
 			// snapshot and the claim (which re-reads inside its transaction)
 			// decides with its own error.
 			log.Printf("scheduler: resolve live profile for runner %s: %v", ri.ID, err)
-			return ri
+			return ri, false
 		}
-		return applyLiveResolution(ri, resolution)
+		return applyLiveResolution(ri, resolution), true
 	}
 	var runnerLookup storage.ProfileBindingLookup
 	if ls, ok := s.Store.(storage.RunnerProfileLinkStore); ok {
@@ -819,9 +1071,9 @@ func (s *DBScheduler) effectiveRunner(ctx context.Context, ri model.Runner) mode
 	resolution, err := storage.ResolveLiveProfileBinding(ri.CertSerial, certLookup, runnerLookup)
 	if err != nil {
 		log.Printf("scheduler: resolve live profile for runner %s: %v", ri.ID, err)
-		return ri
+		return ri, false
 	}
-	return applyLiveResolution(ri, resolution)
+	return applyLiveResolution(ri, resolution), true
 }
 
 // applyLiveResolution overlays one live-profile resolution on the runner's
@@ -848,6 +1100,15 @@ func applyLiveResolution(ri model.Runner, resolution storage.LiveProfileResoluti
 // without a profile contract return the runner unchanged.
 func (s *DBScheduler) EffectiveRunner(ctx context.Context, ri model.Runner) model.Runner {
 	return s.effectiveRunner(ctx, ri)
+}
+
+// EffectiveRunnerChecked is EffectiveRunner with an explicit resolution
+// outcome. ok=false means the live-profile read failed and the returned
+// runner is the registration snapshot; the /next handler uses it to LEAVE
+// the advertised job_cgroup capability false on a failed resolution, so a
+// transient read error can never advertise an unenforced kernel bound.
+func (s *DBScheduler) EffectiveRunnerChecked(ctx context.Context, ri model.Runner) (model.Runner, bool) {
+	return s.effectiveRunnerChecked(ctx, ri)
 }
 
 // EffectiveRunnerBatch resolves the LIVE scheduling view of every runner in

@@ -489,3 +489,151 @@ func TestHeartbeatSchemaFenceSerializesAgainstMigration(t *testing.T) {
 		t.Fatalf("heartbeat committed despite the migration: %v -> %v", before, after)
 	}
 }
+
+// pgITSchemaFenceBarrier proves that one mutation serializes against a real
+// exclusive migration lock: call is started while a background transaction
+// holds pg_advisory_xact_lock(hashtext('kiwi_schema_migrations')) and has
+// advanced the recorded floor above this binary (uncommitted), it must BLOCK
+// (no result within the observation window), and after the migration commits
+// it must return ErrSchemaIncompatible. The caller asserts separately that
+// the method wrote nothing.
+func pgITSchemaFenceBarrier(t *testing.T, st *PostgresStore, call func(context.Context) error) {
+	t.Helper()
+	st.EnableSchemaFence()
+	ctx := context.Background()
+	maxV, err := migrations.MaxVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The migration transaction: exclusive lock + floor advance, NOT
+	// committed (verbatim from TestLeaseSchemaFloorFenceSerializesAgainstMigration).
+	migConn, err := st.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migConn.Release()
+	migTx, err := migConn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migTx.Rollback(ctx)
+	if _, err := migTx.Exec(ctx, `SELECT pg_advisory_xact_lock(`+schemaLockKeySQL+`)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := migTx.Exec(ctx, `UPDATE schema_migrations SET compatible_from=$1 WHERE version=$2`, maxV+1, maxV); err != nil {
+		t.Fatal(err)
+	}
+
+	// The mutation must block: it cannot acquire the shared schema lock
+	// while the exclusive migration lock is held.
+	done := make(chan error, 1)
+	go func() { done <- call(ctx) }()
+	select {
+	case err := <-done:
+		t.Fatalf("mutation did not serialize against the migration: got %v", err)
+	case <-time.After(1200 * time.Millisecond):
+	}
+	// Commit the migration: the mutation unblocks and must observe the new
+	// incompatible floor and commit nothing.
+	if err := migTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrSchemaIncompatible) {
+			t.Fatalf("mutation after the migration committed = %v, want ErrSchemaIncompatible", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("mutation never returned after the migration committed")
+	}
+}
+
+// TestPostgresIntegrationOutboxAppendSchemaFenceBarrier: OutboxAppend was a
+// raw single-statement pool write before the fence conversion; it must now
+// block on the migration lock and refuse after an incompatible floor.
+func TestPostgresIntegrationOutboxAppendSchemaFenceBarrier(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	id := pgITNewID(t)
+	pgITSchemaFenceBarrier(t, st, func(ctx context.Context) error {
+		return st.OutboxAppend(ctx, OutboxItem{ID: id, Kind: "test.fence", CreatedAt: time.Now().UTC()})
+	})
+	var n int
+	if err := st.pool.QueryRow(ctx, `SELECT count(*) FROM outbox WHERE id=$1`, id).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("OutboxAppend wrote %d row(s) across an incompatible migration floor", n)
+	}
+}
+
+// TestPostgresIntegrationUpsertScheduleSchemaFenceBarrier: UpsertSchedule was
+// a plain pool transaction before the fence conversion; it must now block on
+// the migration lock and refuse after an incompatible floor.
+func TestPostgresIntegrationUpsertScheduleSchemaFenceBarrier(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	id := pgITNewID(t)
+	pgITSchemaFenceBarrier(t, st, func(ctx context.Context) error {
+		return st.UpsertSchedule(ctx, Schedule{ID: id, Repository: pgITRepo, RepoURL: pgITRepo, Spec: "version: 1", CreatedAt: time.Now().UTC()})
+	})
+	var n int
+	if err := st.pool.QueryRow(ctx, `SELECT count(*) FROM schedules WHERE id=$1`, id).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("UpsertSchedule wrote %d row(s) across an incompatible migration floor", n)
+	}
+}
+
+// TestPostgresIntegrationCommitSecretIssuanceSchemaFenceBarrier:
+// CommitSecretIssuance was a plain pool transaction before the fence
+// conversion; it must now block on the migration lock and refuse after an
+// incompatible floor (before it can even read the job row).
+func TestPostgresIntegrationCommitSecretIssuanceSchemaFenceBarrier(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	jobID := pgITNewID(t)
+	pgITSchemaFenceBarrier(t, st, func(ctx context.Context) error {
+		return st.CommitSecretIssuance(ctx, SecretIssuance{
+			JobID:           jobID,
+			RunnerID:        pgITNewID(t),
+			LeaseGeneration: 1,
+			LeaseTokenHash:  []byte("fence-token"),
+			SecretName:      "DEPLOY_TOKEN",
+			IssuedAt:        time.Now().UTC(),
+		})
+	})
+	var n int
+	if err := st.pool.QueryRow(ctx, `SELECT count(*) FROM secret_claims WHERE job_id=$1`, jobID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("CommitSecretIssuance wrote %d claim row(s) across an incompatible migration floor", n)
+	}
+}
+
+// TestPostgresIntegrationClaimOutboxSchemaFenceBarrier: ClaimOutbox runs in a
+// beginFencedTx transaction (leadership epoch + schema floor). An armed
+// replica must still block on the migration lock and refuse after an
+// incompatible floor, claiming nothing.
+func TestPostgresIntegrationClaimOutboxSchemaFenceBarrier(t *testing.T) {
+	st := pgITStore(t) // pgITStore arms the durable leadership epoch.
+	ctx := context.Background()
+	st.EnableSchemaFence()
+	id := pgITNewID(t)
+	if err := st.OutboxAppend(ctx, OutboxItem{ID: id, Kind: "test.fence", CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("seed outbox row: %v", err)
+	}
+	pgITSchemaFenceBarrier(t, st, func(ctx context.Context) error {
+		_, err := st.ClaimOutbox(ctx, "schema-fence-barrier", 10)
+		return err
+	})
+	var claimed bool
+	if err := st.pool.QueryRow(ctx, `SELECT claimed_at IS NOT NULL FROM outbox WHERE id=$1`, id).Scan(&claimed); err != nil {
+		t.Fatal(err)
+	}
+	if claimed {
+		t.Fatal("ClaimOutbox claimed a row across an incompatible migration floor")
+	}
+}

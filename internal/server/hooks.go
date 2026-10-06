@@ -88,6 +88,11 @@ func (s *Server) gitlabWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid webhook token", http.StatusUnauthorized)
 		return
 	}
+	// The token authenticated the sender: only now does the schema gate run,
+	// so an invalid token can never drive a compatibility DB query.
+	if !s.requireSchemaCompatible(w, r) {
+		return
+	}
 	if r.Header.Get("X-Gitlab-Event") == "Ping Hook" {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -231,6 +236,11 @@ func (s *Server) forgejoWebhook(w http.ResponseWriter, r *http.Request) {
 	fg := s.forgejoForge()
 	if err := fg.VerifyWebhook(body, s.ForgejoWebhookSecret, r.Header); err != nil {
 		http.Error(w, "invalid webhook signature", http.StatusUnauthorized)
+		return
+	}
+	// The HMAC authenticated the sender: only now does the schema gate run,
+	// so an invalid signature can never drive a compatibility DB query.
+	if !s.requireSchemaCompatible(w, r) {
 		return
 	}
 	event := r.Header.Get("X-Forgejo-Event")

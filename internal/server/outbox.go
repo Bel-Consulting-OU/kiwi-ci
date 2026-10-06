@@ -58,6 +58,22 @@ const outboxDBMirrorWindow = storage.OutboxClaimBatch
 // their outbox lines no longer exist, so there is nothing for them to filter.
 const outboxDoneMaxIDs = 4096
 
+// outboxDeliveredMaxKeys bounds the delivered-watermark cardinality kept in
+// memory AND rewritten into outbox.done.jsonl. delivered maps one logical
+// key to its highest delivered state_version, so a stale (legacy or
+// versioned) state re-enqueued after a restart cannot publish over a newer
+// delivered state. The map is otherwise lifetime-accumulating — one entry
+// per logical key ever delivered, in fs mode and in DB mode — which is
+// unbounded for a long-lived process. Once the cap is exceeded the OLDEST
+// watermark (by delivery recency, mirroring doneOrder) is evicted. That
+// eviction has the same class of tradeoff as the retained done-ID window
+// above: a resurrected stale item for a logical key that has been quiet
+// longer than the window may be re-delivered, because its watermark (and its
+// idempotency evidence) was forgotten. The window is far larger than the
+// live check set and re-publication is idempotent by stable identity, so
+// this is accepted; it MUST stay called out here.
+const outboxDeliveredMaxKeys = 4096
+
 // outboxDoneRecord is one line of the fs done journal. ID is the acked
 // intent. LogicalKey/StateVersion form an optional DELIVERED WATERMARK marker:
 // legacy (pre-0018) forge-check rows carry no versioned identity on their own
@@ -105,8 +121,12 @@ type Outbox struct {
 	// It mirrors forge_check_state in DB mode (where the durable guard is
 	// authoritative) and is the fs-mode supersede watermark: it is rebuilt
 	// from the done file on load, so a stale state re-enqueued after a newer
-	// one was delivered is dropped instead of published late.
-	delivered map[string]int64
+	// one was delivered is dropped instead of published late. Its cardinality
+	// is bounded by outboxDeliveredMaxKeys; deliveredOrder records delivery
+	// recency (oldest first, mirroring doneOrder) so the oldest watermarks
+	// are evicted first.
+	delivered      map[string]int64
+	deliveredOrder []string
 	// claimer uniquely identifies this process in the durable outbox claim
 	// lease. Lazily initialized.
 	claimer string
@@ -217,6 +237,22 @@ func (o *Outbox) loadLocked() error {
 	done := map[string]bool{}
 	var doneOrder []string
 	delivered := map[string]int64{}
+	var deliveredOrder []string
+	// recordWatermark applies one watermark observation in journal order
+	// (later records are newer). The explicit watermark fields and the
+	// versioned row ID are both consulted: journals written before the
+	// explicit fields existed carry the identity only in the versioned ID.
+	recordWatermark := func(key string, version int64) {
+		if key == "" || version <= 0 {
+			// Empty watermarks are dropped, never kept.
+			return
+		}
+		if cur, ok := delivered[key]; ok && version <= cur {
+			return
+		}
+		delivered[key] = version
+		deliveredOrder = touchOrderedKey(deliveredOrder, key)
+	}
 	f, err := os.Open(filepath.Join(o.store.Root, outboxDoneFile))
 	if err == nil {
 		sc := bufio.NewScanner(f)
@@ -236,9 +272,12 @@ func (o *Outbox) loadLocked() error {
 				done[rec.ID] = true
 				doneOrder = append(doneOrder, rec.ID)
 			}
-			if rec.LogicalKey != "" && rec.StateVersion > 0 && rec.StateVersion > delivered[rec.LogicalKey] {
-				delivered[rec.LogicalKey] = rec.StateVersion
+			if rec.ID != "" {
+				if key, version, ok := parseVersionedRowID(rec.ID); ok {
+					recordWatermark(key, version)
+				}
 			}
+			recordWatermark(rec.LogicalKey, rec.StateVersion)
 		}
 		if scErr := sc.Err(); scErr != nil {
 			_ = f.Close()
@@ -251,17 +290,13 @@ func (o *Outbox) loadLocked() error {
 	o.done = done
 	o.doneOrder = doneOrder
 	o.doneCompactAt = outboxDoneMaxIDs
-	// Rebuild the fs-mode delivered watermark from the done IDs too: versioned
-	// IDs carry their logical key and version, so a stale state re-enqueued
-	// after a restart is still recognized as older than what was delivered.
-	// This keeps journals written before the explicit watermark records above
-	// readable.
-	for id := range done {
-		if key, version, ok := parseVersionedRowID(id); ok && version > delivered[key] {
-			delivered[key] = version
-		}
-	}
+	// Rebuild the fs-mode delivered watermark from the done records, then
+	// bound it: only the most-recent outboxDeliveredMaxKeys logical keys
+	// survive the load (the oldest are forgotten, with the stale re-delivery
+	// tradeoff documented at outboxDeliveredMaxKeys).
 	o.delivered = delivered
+	o.deliveredOrder = deliveredOrder
+	o.boundDeliveredLocked()
 
 	items, err := o.readItems()
 	if err != nil {
@@ -600,18 +635,89 @@ func (o *Outbox) supersedeLocked(logicalKey string, version int64) {
 	o.items = kept
 }
 
-// recordDeliveredLocked advances the local delivered watermark for a
-// versioned item. The caller holds o.mu.
-func (o *Outbox) recordDeliveredLocked(it forge.OutboxItem) {
-	if it.LogicalKey == "" || it.StateVersion <= 0 {
+// touchOrderedKey moves key to the most-recent end of a recency order,
+// appending it when absent and preserving the relative order of every other
+// key. It backs both the done and delivered recency orders.
+func touchOrderedKey(order []string, key string) []string {
+	for i, k := range order {
+		if k == key {
+			order = append(order[:i], order[i+1:]...)
+			break
+		}
+	}
+	return append(order, key)
+}
+
+// trimDeliveredOrder drops the oldest keys of a delivered watermark map
+// beyond outboxDeliveredMaxKeys and returns the trimmed order. The map and
+// order are kept in sync by every production writer; direct map writes are
+// reconciled by boundDeliveredLocked.
+func trimDeliveredOrder(delivered map[string]int64, order []string) []string {
+	if len(order) <= outboxDeliveredMaxKeys {
+		return order
+	}
+	drop := len(order) - outboxDeliveredMaxKeys
+	for _, key := range order[:drop] {
+		delete(delivered, key)
+	}
+	return append([]string(nil), order[drop:]...)
+}
+
+// boundDeliveredLocked reconciles deliveredOrder with the delivered map and
+// evicts the oldest watermarks beyond outboxDeliveredMaxKeys. It drops empty
+// watermarks (empty key, non-positive version) and duplicate order entries,
+// and appends map keys missing from the order. This is the load/compaction
+// entry point; the per-ack fast path is setDeliveredLocked. The caller holds
+// o.mu.
+func (o *Outbox) boundDeliveredLocked() {
+	if o.delivered == nil {
+		o.delivered = map[string]int64{}
+	}
+	seen := make(map[string]bool, len(o.deliveredOrder))
+	kept := o.deliveredOrder[:0]
+	for _, key := range o.deliveredOrder {
+		version, ok := o.delivered[key]
+		if key == "" || !ok || version <= 0 || seen[key] {
+			continue
+		}
+		seen[key] = true
+		kept = append(kept, key)
+	}
+	o.deliveredOrder = kept
+	for key, version := range o.delivered {
+		if key == "" || version <= 0 {
+			delete(o.delivered, key)
+			continue
+		}
+		if !seen[key] {
+			o.deliveredOrder = append(o.deliveredOrder, key)
+		}
+	}
+	o.deliveredOrder = trimDeliveredOrder(o.delivered, o.deliveredOrder)
+}
+
+// setDeliveredLocked advances the in-memory delivered watermark for one
+// logical key and updates its recency, evicting the oldest watermark once
+// the cap is exceeded. It never lowers an existing watermark and ignores
+// empty identities (empty key, non-positive version). The caller holds o.mu.
+func (o *Outbox) setDeliveredLocked(key string, version int64) {
+	if key == "" || version <= 0 {
 		return
 	}
 	if o.delivered == nil {
 		o.delivered = map[string]int64{}
 	}
-	if it.StateVersion > o.delivered[it.LogicalKey] {
-		o.delivered[it.LogicalKey] = it.StateVersion
+	if cur, ok := o.delivered[key]; ok && version <= cur {
+		return
 	}
+	o.delivered[key] = version
+	o.deliveredOrder = trimDeliveredOrder(o.delivered, touchOrderedKey(o.deliveredOrder, key))
+}
+
+// recordDeliveredLocked advances the local delivered watermark for a
+// versioned item. The caller holds o.mu.
+func (o *Outbox) recordDeliveredLocked(it forge.OutboxItem) {
+	o.setDeliveredLocked(it.LogicalKey, it.StateVersion)
 }
 
 // Superseded reports whether a forge-check state must not be published in
@@ -642,7 +748,9 @@ func (o *Outbox) Superseded(logicalKey string, version int64) bool {
 // without this stamp a stale state re-enqueued after the restart could
 // publish over a newer delivered one. Versioned items keep advancing the
 // watermark through their ack (recordDeliveredLocked); this method is
-// idempotent and never lowers it.
+// idempotent and never lowers it. Advancing also moves the key to the most
+// recent end of deliveredOrder, bounding the map/journal cardinality at
+// outboxDeliveredMaxKeys (see the stale re-delivery tradeoff there).
 func (o *Outbox) MarkDelivered(logicalKey string, version int64) error {
 	if logicalKey == "" || version <= 0 {
 		return nil
@@ -660,10 +768,7 @@ func (o *Outbox) MarkDelivered(logicalKey string, version int64) error {
 			return err
 		}
 	}
-	if o.delivered == nil {
-		o.delivered = map[string]int64{}
-	}
-	o.delivered[logicalKey] = version
+	o.setDeliveredLocked(logicalKey, version)
 	return nil
 }
 
@@ -812,8 +917,11 @@ func (o *Outbox) compactDoneIfNeeded() {
 }
 
 // trimDoneLocked keeps only the most-recent outboxDoneMaxIDs acked IDs in
-// memory. The caller holds o.mu.
+// memory and bounds the delivered watermark cardinality (the DB-mode
+// compaction path has no fs journal to rewrite, so this is where its
+// watermark order is trimmed). The caller holds o.mu.
 func (o *Outbox) trimDoneLocked() {
+	o.boundDeliveredLocked()
 	if len(o.doneOrder) <= outboxDoneMaxIDs {
 		return
 	}
@@ -858,9 +966,17 @@ func (o *Outbox) compactLocked() error {
 	if len(keep) > outboxDoneMaxIDs {
 		keep = keep[len(keep)-outboxDoneMaxIDs:]
 	}
+	// Bound the delivered watermarks: the rewritten journal holds at most
+	// outboxDeliveredMaxKeys watermark lines, oldest evicted first (with the
+	// stale re-delivery tradeoff documented at outboxDeliveredMaxKeys).
+	o.boundDeliveredLocked()
 	var done bytes.Buffer
 	denc := json.NewEncoder(&done)
-	for key, version := range o.delivered {
+	for _, key := range o.deliveredOrder {
+		version, ok := o.delivered[key]
+		if !ok || key == "" || version <= 0 {
+			continue
+		}
 		if err := denc.Encode(outboxDoneRecord{LogicalKey: key, StateVersion: version}); err != nil {
 			return fmt.Errorf("outbox: encode watermark %s: %w", key, err)
 		}

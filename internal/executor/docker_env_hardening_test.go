@@ -132,3 +132,86 @@ func TestStartJobRetriesWithoutInitOnEPERM(t *testing.T) {
 		t.Fatalf("container did not start after retry: %s", joined)
 	}
 }
+
+func initEPERMBackend(t *testing.T) (*ContainerBackend, string) {
+	t.Helper()
+	installFakeBins(t)
+	state := t.TempDir()
+	t.Setenv("FAKE_DOCKER_STATE", state)
+	t.Setenv("FAKE_DOCKER_RUN_INIT_EPERM", "1")
+	t.Setenv("FAKE_DOCKER_RUN_INIT_EPERM_MARKER", filepath.Join(t.TempDir(), "init-eperm-marker"))
+	t.Setenv("FAKE_DOCKER_RUN_INIT_EPERM_CREATE", "1")
+	b := &ContainerBackend{
+		RunID:    "run-init-create",
+		JobID:    "job",
+		Image:    "alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc",
+		Rootless: true,
+	}
+	return b, state
+}
+
+// TestStartJobInitEPERMAfterCreateRemovesBeforeRetry: the docker-init EPERM
+// can arrive AFTER the daemon created the container. Retrying with the SAME
+// name without proving absence would then fail with "container already
+// exists"; the fixed path removes the possibly-created container first and
+// only then retries without --init.
+func TestStartJobInitEPERMAfterCreateRemovesBeforeRetry(t *testing.T) {
+	b, _ := initEPERMBackend(t)
+	var lines []string
+	if err := b.StartJob(context.Background(), t.TempDir(), func(s string) { lines = append(lines, s) }); err != nil {
+		t.Fatalf("StartJob with init EPERM after create: %v", err)
+	}
+	log := readFakeLog(t, "FAKE_DOCKER_LOG")
+	runs := runLines(log)
+	if len(runs) != 2 {
+		t.Fatalf("docker run lines = %d, want 2 (EPERM attempt + retry):\n%s", len(runs), log)
+	}
+	if !strings.Contains(runs[0], "--init") || strings.Contains(runs[1], "--init") {
+		t.Fatalf("init profile changed across attempts: %v", runs)
+	}
+	rmIdx := strings.Index(log, "rm -f "+b.container)
+	retryIdx := strings.LastIndex(log, "run -d ")
+	if rmIdx < 0 || retryIdx < 0 || rmIdx > retryIdx {
+		t.Fatalf("remove-by-name must precede the retry (rm@%d, retry@%d):\n%s", rmIdx, retryIdx, log)
+	}
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "retrying without --init") || !strings.Contains(joined, "job container started") {
+		t.Fatalf("emitted = %s", joined)
+	}
+	if b.container == "" || b.docker == "" {
+		t.Fatal("session state not set after retry")
+	}
+}
+
+// TestStartJobInitEPERMAfterCreateRemovalFailureReportsDebt: when the
+// post-EPERM remove cannot prove absence, the init fallback must NOT be
+// attempted (a retry would collide with the possibly-created container and
+// hide it). The identity stays, cleanup debt is reported, and StartJob fails
+// with a "may exist" error.
+func TestStartJobInitEPERMAfterCreateRemovalFailureReportsDebt(t *testing.T) {
+	b, state := initEPERMBackend(t)
+	t.Setenv("FAKE_DOCKER_RM_EXIT", "1")
+	var debts []CleanupDebt
+	b.ReportCleanupDebt = backendDebtCollector(&debts)
+	var lines []string
+	err := b.StartJob(context.Background(), t.TempDir(), func(s string) { lines = append(lines, s) })
+	if err == nil || !strings.Contains(err.Error(), "may exist") || !strings.Contains(err.Error(), "init fallback not attempted") {
+		t.Fatalf("unproven absence after init EPERM = %v, want a may-exist error", err)
+	}
+	if kind := errorKind(err); kind != ErrorInfra {
+		t.Fatalf("kind = %q, want %q", kind, ErrorInfra)
+	}
+	log := readFakeLog(t, "FAKE_DOCKER_LOG")
+	if got := len(runLines(log)); got != 1 {
+		t.Fatalf("docker run lines = %d, want exactly 1 (no retry):\n%s", got, log)
+	}
+	if len(debts) != 1 || debts[0].Kind != CleanupMainRuntime || debts[0].Resource != b.container || debts[0].Err == nil {
+		t.Fatalf("debts = %+v, want one %s debt for %q", debts, CleanupMainRuntime, b.container)
+	}
+	if strings.Contains(strings.Join(lines, "\n"), "retrying without --init") {
+		t.Fatalf("init fallback was retried despite unproven absence: %v", lines)
+	}
+	if _, statErr := os.Stat(filepath.Join(state, b.container)); statErr != nil {
+		t.Fatalf("container may exist, but its fake state is gone: %v", statErr)
+	}
+}

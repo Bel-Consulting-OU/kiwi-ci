@@ -134,7 +134,10 @@ func lockfileDigest(workspace string, hashFiles []string) (string, error) {
 	io.WriteString(h, "\x00")
 	var files []string
 	for _, p := range hashFiles {
-		matches, _ := filepath.Glob(filepath.Join(workspace, p))
+		matches, err := filepath.Glob(filepath.Join(workspace, p))
+		if err != nil {
+			return "", fmt.Errorf("hash_files %q: %w", p, err)
+		}
 		files = append(files, matches...)
 	}
 	sort.Strings(files)
@@ -143,7 +146,10 @@ func lockfileDigest(workspace string, hashFiles []string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		rel, _ := filepath.Rel(workspace, f)
+		rel, err := filepath.Rel(workspace, f)
+		if err != nil {
+			return "", fmt.Errorf("hash_files: %w", err)
+		}
 		io.WriteString(h, rel)
 		h.Write(b)
 	}

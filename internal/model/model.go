@@ -25,6 +25,14 @@ func (s Status) Terminal() bool {
 	}
 }
 
+// CapabilityJobCgroup is the runner capability name for a job-scoped parent
+// cgroup: a runner that can establish one bounds the main container and every
+// service together by the job's declared envelope at the kernel, so its lease
+// may reserve the job's own request instead of the job+services union
+// (storage.LeaseClaim.IgnoreServiceEnvelope). The capability travels through
+// RunnerProfile.JobCgroup and Runner.JobCgroup.
+const CapabilityJobCgroup = "job-cgroup"
+
 type Run struct {
 	ID string `json:"id"`
 	// RepoID is the immutable canonical repository identity, derived ONCE at
@@ -133,9 +141,24 @@ type Job struct {
 	// and every step secret of this job, compiled at enqueue time. It is the
 	// per-step scoping allowlist the control plane enforces when a runner
 	// requests a secret value.
-	DeclaredSecrets []string                     `json:"declared_secrets,omitempty"`
-	Status          Status                       `json:"status"`
-	Priority        int                          `json:"priority,omitempty"`
+	DeclaredSecrets []string `json:"declared_secrets,omitempty"`
+	Status          Status   `json:"status"`
+	Priority        int      `json:"priority,omitempty"`
+	// QueueBoost is the MATERIALIZED aged-wait term of the scheduling key:
+	// floor(max(0, now-created_at)/10min), recomputed by the bounded
+	// PromoteQueuedJobBoosts sweep into the jobs.queue_boost column. The
+	// aged order is (priority + queue_boost) DESC, created_at ASC, id ASC,
+	// which the jobs_queued_aged_idx expression index serves directly, so
+	// the page walk stops at limit+1 index entries instead of sorting the
+	// whole queued population. Memory stores leave it zero and compute the
+	// same term on the fly (BoostKnown false); SQL rows are scanned with
+	// BoostKnown true and the stored value authoritative.
+	QueueBoost int `json:"queue_boost,omitempty"`
+	// BoostKnown reports whether QueueBoost was read from a materialized
+	// store column. It is never persisted (json:"-") and memory stores
+	// leave it false, so consumers compute the aged term from CreatedAt
+	// instead.
+	BoostKnown      bool                         `json:"-"`
 	MaxInfraRetries int                          `json:"max_infra_retries,omitempty"`
 	CreatedAt       time.Time                    `json:"created_at"`
 	StartedAt       *time.Time                   `json:"started_at,omitempty"`
@@ -277,6 +300,15 @@ type Runner struct {
 	// every lease.
 	ResourceCapacity ResourceCapacity `json:"resource_capacity,omitempty"`
 
+	// JobCgroup is the resolved job-scoped cgroup capability (see
+	// CapabilityJobCgroup): copied from the runner's linked profile by
+	// storage.ResolveRunnerProfile, so an unlinked runner stays false.
+	// When true, a lease on this runner may reserve only the job's own
+	// request because the kernel bounds the main container and every
+	// service together. Additive: false keeps the job+services union
+	// reservation.
+	JobCgroup bool `json:"job_cgroup,omitempty"`
+
 	// Admission control.
 	Disabled bool `json:"disabled,omitempty"`
 	Draining bool `json:"draining,omitempty"`
@@ -358,6 +390,12 @@ type RunnerProfile struct {
 	CostPerHour  float64   `json:"cost_per_hour,omitempty"`
 	PowerWatts   float64   `json:"power_watts,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
+	// JobCgroup is the profile's job-scoped cgroup capability (see
+	// CapabilityJobCgroup): when set, ResolveRunnerProfile copies it onto
+	// the effective runner and a lease on that runner may reserve the job
+	// request alone instead of the job+services union. Additive: false
+	// keeps the union reservation.
+	JobCgroup bool `json:"job_cgroup,omitempty"`
 }
 
 // ResourceCapacity is one entity's resource quantities: a runner's

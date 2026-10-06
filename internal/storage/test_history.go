@@ -526,7 +526,7 @@ func (s *PostgresStore) RebuildRepoTestHistory(ctx context.Context, repoID strin
 	if repoID == "" {
 		return 0, fmt.Errorf("storage: test history repository identity is required")
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return 0, err
 	}

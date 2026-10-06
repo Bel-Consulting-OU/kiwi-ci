@@ -57,7 +57,7 @@ func faultyWrapperCases() map[string]wrapperCase {
 		}},
 		"ListQueuedJobs": {seed: seedRunAndJob, call: func(f *FaultyStore) error { _, err := f.ListQueuedJobs(ctx()); return err }},
 		"ListQueuedJobsPage": {seed: seedRunAndJob, call: func(f *FaultyStore) error {
-			_, err := f.ListQueuedJobsPage(ctx(), nil, 10, time.Now().UTC())
+			_, err := f.ListQueuedJobsPage(ctx(), QueuedJobFilter{}, nil, 10, time.Now().UTC())
 			return err
 		}},
 		"ListExpiredRunningJobs": {seed: func(m *memStore) {
@@ -1106,7 +1106,7 @@ func missingOptionalInterfaceCases() map[string]missingIfaceCase {
 			return err
 		}},
 		"ListQueuedJobsPage": {iface: "QueuedJobPageStore", call: func(f *FaultyStore) error {
-			_, err := f.ListQueuedJobsPage(ctx(), nil, 10, time.Now().UTC())
+			_, err := f.ListQueuedJobsPage(ctx(), QueuedJobFilter{}, nil, 10, time.Now().UTC())
 			return err
 		}},
 	}

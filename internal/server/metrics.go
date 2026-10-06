@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 // Metrics is a dependency-free Prometheus-style registry: cumulative
@@ -100,6 +102,7 @@ func NewMetrics() *Metrics {
 	m.declare("kiwi_downstream_launches_total", "Cross-repo downstream runs launched", "counter", nil)
 	m.declare("kiwi_downstream_skips_total", "Cross-repo downstream dispatches skipped (already launched)", "counter", nil)
 	m.declare("kiwi_idempotency_receipts_pruned_total", "Durable run-idempotency receipts aged out by maintenance", "counter", nil)
+	m.declare("kiwi_scheduler_boost_promotions_total", "Queued jobs whose materialized scheduling-key boost was promoted", "counter", nil)
 	return m
 }
 
@@ -364,6 +367,46 @@ func (s *Server) metricSet(name string, v float64, labels map[string]string) {
 	if s.Metrics != nil {
 		s.Metrics.SetGauge(name, v, labels)
 	}
+}
+
+// dbPoolStatsStore is the optional store contract behind the kiwi_db_pool
+// pool and leadership gauges. storage.PostgresStore implements it; a custom
+// store that does not is simply skipped (the scrape never fails because an
+// optional capability is absent).
+type dbPoolStatsStore interface {
+	PoolStats() (operational, advisory storage.PoolStatView)
+	LeaderSessionHeld() bool
+}
+
+// refreshDBPoolMetrics exports the kiwi_db_pool gauges at scrape time: one
+// {pool,stat} series per configured pool plus a 0/1 leadership-session
+// gauge. It is nil-safe: without a DB, or with a store lacking the optional
+// contract, it is a no-op.
+func (s *Server) refreshDBPoolMetrics() {
+	if s.DB == nil {
+		return
+	}
+	stats, ok := s.DB.(dbPoolStatsStore)
+	if !ok {
+		return
+	}
+	op, adv := stats.PoolStats()
+	write := func(pool string, view storage.PoolStatView) {
+		if !view.Present {
+			return
+		}
+		s.metricSet("kiwi_db_pool", float64(view.InUse), map[string]string{"pool": pool, "stat": "in_use"})
+		s.metricSet("kiwi_db_pool", float64(view.Idle), map[string]string{"pool": pool, "stat": "idle"})
+		s.metricSet("kiwi_db_pool", float64(view.Total), map[string]string{"pool": pool, "stat": "total"})
+		s.metricSet("kiwi_db_pool", float64(view.Max), map[string]string{"pool": pool, "stat": "max"})
+	}
+	write("operational", op)
+	write("advisory", adv)
+	held := float64(0)
+	if stats.LeaderSessionHeld() {
+		held = 1
+	}
+	s.metricSet("kiwi_db_pool", held, map[string]string{"pool": "leader", "stat": "session_held"})
 }
 
 // observeHTTP records kiwi_http_requests_total and the request latency

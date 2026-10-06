@@ -137,10 +137,10 @@ exit 0
 	if readErr != nil {
 		t.Fatalf("fake docker did not run: %v", readErr)
 	}
-	if !strings.Contains(string(data), "rm -f "+serviceContainerName("r", "j", 0)) {
+	if !strings.Contains(string(data), "rm -f kiwi-svc-r-j-1-") {
 		t.Fatalf("service container removal was not attempted:\n%s", data)
 	}
-	if !strings.Contains(string(data), "network rm "+serviceNetworkName("r", "j")) {
+	if !strings.Contains(string(data), "network rm kiwi-net-r-j-") {
 		t.Fatalf("network removal was not attempted:\n%s", data)
 	}
 }

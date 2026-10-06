@@ -320,12 +320,12 @@ func (f *FaultyStore) ListQueuedJobs(ctx context.Context) ([]model.Job, error) {
 // to Inner when it implements QueuedJobPageStore, and fails closed with a
 // diagnosable capability error otherwise. Like ListRunsPage it is a READ: the
 // FailAfter mutation counter is never consumed.
-func (f *FaultyStore) ListQueuedJobsPage(ctx context.Context, after *QueuedJobCursor, limit int, now time.Time) (QueuedJobPage, error) {
+func (f *FaultyStore) ListQueuedJobsPage(ctx context.Context, filter QueuedJobFilter, after *QueuedJobCursor, limit int, now time.Time) (QueuedJobPage, error) {
 	inner, ok := f.Inner.(QueuedJobPageStore)
 	if !ok {
 		return QueuedJobPage{}, errMissingInnerInterface("QueuedJobPageStore")
 	}
-	return inner.ListQueuedJobsPage(ctx, after, limit, now)
+	return inner.ListQueuedJobsPage(ctx, filter, after, limit, now)
 }
 
 func (f *FaultyStore) ListJobsByEnvironment(ctx context.Context, repoID, environment string) ([]model.Job, error) {
@@ -2360,47 +2360,6 @@ func (m *memStore) ListQueuedJobs(ctx context.Context) ([]model.Job, error) {
 		}
 	}
 	return out, nil
-}
-
-// ListQueuedJobsPage implements QueuedJobPageStore over the in-memory job
-// map: the same aged order (priority + wait/10min DESC, created_at ASC,
-// id ASC), the same persisted-deadline pushdown the SQL page applies (a row
-// carrying an elapsed queue_deadline column is never a candidate; the
-// scheduler still evaluates payload-derived deadlines in Go), and the same
-// keyset cursor semantics. The map under m.mu is a complete view, so paging
-// is deterministic.
-func (m *memStore) ListQueuedJobsPage(ctx context.Context, after *QueuedJobCursor, limit int, now time.Time) (QueuedJobPage, error) {
-	limit = NormalizeQueuedJobPageLimit(limit)
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	eligible := make([]model.Job, 0, len(m.jobs))
-	for _, j := range m.jobs {
-		if j.Status != model.StatusQueued {
-			continue
-		}
-		if j.QueueDeadline != nil && !j.QueueDeadline.After(now) {
-			continue
-		}
-		if after != nil && !queuedJobAfterCursor(j, *after, now) {
-			continue
-		}
-		eligible = append(eligible, j)
-	}
-	sortQueuedJobsAged(eligible, now)
-	page := QueuedJobPage{Jobs: eligible}
-	if len(eligible) > limit {
-		page.Jobs = eligible[:limit]
-		page.HasMore = true
-	}
-	if len(page.Jobs) > 0 {
-		last := page.Jobs[len(page.Jobs)-1]
-		page.Last = QueuedJobCursor{
-			AgedPriority: queuedJobAgedPriority(last, now),
-			CreatedAt:    last.CreatedAt,
-			ID:           last.ID,
-		}
-	}
-	return page, nil
 }
 
 // ListJobsByEnvironment mirrors the SQL store: jobs are matched on the

@@ -563,6 +563,9 @@ func validateJob(s *Spec, id string, j Job) error {
 		if err := checkRelPath(fmt.Sprintf("job %q cache %d hash_files", id, i), j.Cache[i].HashFiles...); err != nil {
 			return err
 		}
+		if err := checkHashFilesGlob(fmt.Sprintf("job %q cache %d", id, i), j.Cache[i].HashFiles); err != nil {
+			return err
+		}
 		for _, v := range append(append([]string{}, j.Cache[i].Paths...), j.Cache[i].HashFiles...) {
 			if err := checkInterpolation(v, fmt.Sprintf("job %q cache", id)); err != nil {
 				return err
@@ -953,6 +956,24 @@ func checkRelPath(where string, paths ...string) error {
 			if part == ".." {
 				return fmt.Errorf("%s: path %q contains a .. component", where, p)
 			}
+		}
+	}
+	return nil
+}
+
+// checkHashFilesGlob validates every hash_files pattern's glob grammar up
+// front. filepath.Glob reports a malformed pattern (for example "[bad") only
+// when a Store computes the key during a restore, so without this admission
+// check an invalid pipeline would be accepted and then fail the job at cache
+// time (or, for direct Store callers, silently discard the pattern). paths
+// are literal prefixes, not globs, and are deliberately not checked here.
+func checkHashFilesGlob(where string, patterns []string) error {
+	for _, p := range patterns {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		if _, err := filepath.Match(p, ""); err != nil {
+			return fmt.Errorf("%s hash_files %q: invalid glob syntax: %w", where, p, err)
 		}
 	}
 	return nil

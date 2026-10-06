@@ -118,6 +118,92 @@ func seedResourceScheduler(t *testing.T, st *resourceFakeStore, runnerID string,
 	return s
 }
 
+// seedJobCgroupScheduler is seedResourceScheduler with the linked profile's
+// job-scoped cgroup capability pinned, so the relaxation under
+// model.CapabilityJobCgroup can be exercised end to end through the walk and
+// the claim payload.
+func seedJobCgroupScheduler(t *testing.T, st *resourceFakeStore, runnerID string, countCapacity int, capacity model.ResourceCapacity, jobCgroup bool, jobs ...model.Job) *DBScheduler {
+	t.Helper()
+	ctx := context.Background()
+	if err := st.UpsertProfile(ctx, model.RunnerProfile{ID: "prof-" + runnerID, Capabilities: []string{"native"}, MaxCapacity: countCapacity,
+		MaxCPU: capacity.CPU, MaxMemory: capacity.Memory, MaxDisk: capacity.Disk, MaxPIDs: capacity.PIDs, JobCgroup: jobCgroup}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.BindCertProfile(ctx, "serial-"+runnerID, "prof-"+runnerID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertRunner(ctx, model.Runner{ID: runnerID, Name: runnerID, Capacity: countCapacity, CertSerial: "serial-" + runnerID, ReportedCapabilities: []string{"native"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.InsertRun(ctx, model.Run{ID: "run-" + runnerID, Status: model.StatusQueued, CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	for i, j := range jobs {
+		j.RunID = "run-" + runnerID
+		if j.Key == "" {
+			j.Key = fmt.Sprintf("job%d", i)
+		}
+		j.Status = model.StatusQueued
+		if j.CreatedAt.IsZero() {
+			j.CreatedAt = time.Now().UTC().Add(time.Duration(i) * time.Second)
+		}
+		if err := st.InsertJob(ctx, j); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := NewDB(st, time.Minute, nil, nil)
+	if !s.IsLeader(ctx) {
+		t.Fatal("not leader")
+	}
+	return s
+}
+
+// TestSchedulerJobCgroupReservesOnlyJobRequest: a JobCgroup runner reserves
+// the job's OWN request (claim.IgnoreServiceEnvelope true, RequestedResources
+// == job request), so a job whose job+envelope union would exceed the
+// runner's capacity still leases, and the relaxed amount is what the claim
+// ledger records.
+func TestSchedulerJobCgroupReservesOnlyJobRequest(t *testing.T) {
+	ctx := context.Background()
+	st := newResourceFakeStore()
+	runnerID := "runner-cgroup"
+	job := model.Job{ID: "job-cgroup", CPURequest: 3, ServiceEnvelopeRequest: model.ResourceCapacity{CPU: 2}}
+	s := seedJobCgroupScheduler(t, st, runnerID, 8, model.ResourceCapacity{CPU: 4}, true, job)
+
+	j, _, _, err := s.Lease(ctx, runnerID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("JobCgroup lease: %v", err)
+	}
+	if j.ID != "job-cgroup" {
+		t.Fatalf("leased %s, want job-cgroup", j.ID)
+	}
+	claim := st.lastClaim(t)
+	if !claim.IgnoreServiceEnvelope {
+		t.Fatal("claim must set IgnoreServiceEnvelope for a JobCgroup runner")
+	}
+	if got := claim.RequestedResources(); got != (model.ResourceCapacity{CPU: 3}) {
+		t.Fatalf("reserved = %+v, want only the 3-CPU job request (relaxed envelope)", got)
+	}
+}
+
+// TestSchedulerUnionReservationWithoutJobCgroup is the control: the same job
+// on a runner WITHOUT the job-scoped cgroup capability reserves the union
+// (3+2 CPU against a 4-CPU profile), so it is never claimed.
+func TestSchedulerUnionReservationWithoutJobCgroup(t *testing.T) {
+	ctx := context.Background()
+	st := newResourceFakeStore()
+	runnerID := "runner-union"
+	job := model.Job{ID: "job-union", CPURequest: 3, ServiceEnvelopeRequest: model.ResourceCapacity{CPU: 2}}
+	s := seedJobCgroupScheduler(t, st, runnerID, 8, model.ResourceCapacity{CPU: 4}, false, job)
+
+	if _, _, _, err := s.Lease(ctx, runnerID, time.Now().UTC()); !errors.Is(err, ErrNoJobs) {
+		t.Fatalf("union lease = %v, want ErrNoJobs (3+2 CPU exceeds the 4-CPU profile)", err)
+	}
+	if st.claimCount() != 0 {
+		t.Fatalf("claims attempted = %d, want 0 for the over-capacity union", st.claimCount())
+	}
+}
+
 // TestSchedulerResourceAdmissionPrefilter: a candidate above the runner's
 // profile capacity is never claimed (it waits or goes elsewhere), and an
 // admitted candidate carries its requests into the claim.

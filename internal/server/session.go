@@ -141,6 +141,11 @@ func (s *Server) webLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid token", http.StatusUnauthorized)
 		return
 	}
+	// The admin token authenticated the request: only now does the schema
+	// gate run, so a failed login attempt performs no compatibility DB reads.
+	if !s.requireSchemaCompatible(w, r) {
+		return
+	}
 	s.auditLocked("web.login", "web", "", "", "dashboard session created", map[string]string{"source": clientSource(r)})
 	sessionValue, expiry, err := newWebToken(s.WebSessionSecret, "web", fingerprint)
 	if err != nil {
@@ -174,6 +179,12 @@ func (s *Server) webLogin(w http.ResponseWriter, r *http.Request) {
 func (s *Server) webLogout(w http.ResponseWriter, r *http.Request) {
 	if !s.webSessionOK(r) || !s.webCSRFOK(r) {
 		http.Error(w, "invalid csrf token", http.StatusForbidden)
+		return
+	}
+	// The session cookie + CSRF proof authenticated the request: only now
+	// does the schema gate run, so a request without a valid session performs
+	// no compatibility DB reads.
+	if !s.requireSchemaCompatible(w, r) {
 		return
 	}
 	http.SetCookie(w, &http.Cookie{

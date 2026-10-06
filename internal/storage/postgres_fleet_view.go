@@ -117,6 +117,7 @@ type fleetProfileRow struct {
 	maxPIDs     int
 	cost        float64
 	watts       float64
+	jobCgroup   bool
 	createdAt   time.Time
 }
 
@@ -124,7 +125,7 @@ func (p *fleetProfileRow) targets() []any {
 	return []any{
 		&p.id, &p.labels, &p.region, &p.repos, &p.caps,
 		&p.maxCapacity, &p.maxCPU, &p.maxMemory, &p.maxDisk, &p.maxPIDs,
-		&p.cost, &p.watts, &p.createdAt,
+		&p.cost, &p.watts, &p.jobCgroup, &p.createdAt,
 	}
 }
 
@@ -150,6 +151,7 @@ func (p *fleetProfileRow) profile() (model.RunnerProfile, error) {
 	out.MaxPIDs = p.maxPIDs
 	out.CostPerHour = p.cost
 	out.PowerWatts = p.watts
+	out.JobCgroup = p.jobCgroup
 	out.CreatedAt = p.createdAt
 	return out, nil
 }
@@ -167,11 +169,11 @@ func jsonUnmarshalColumn(raw []byte, dest any, what string) error {
 // certificate-serial join, qualified with the cp alias and COALESCEd so a
 // missing binding/profile row scans as the zero profile. The list MUST stay
 // in fleetProfileRow.targets order and mirror profileCols.
-const fleetCertProfileCols = "COALESCE(cp.id, ''), COALESCE(cp.labels, '[]'::jsonb), COALESCE(cp.region, ''), COALESCE(cp.repositories, '[]'::jsonb), COALESCE(cp.capabilities, '[]'::jsonb), COALESCE(cp.max_capacity, 0), COALESCE(cp.max_cpu, 0), COALESCE(cp.max_memory, 0), COALESCE(cp.max_disk, 0), COALESCE(cp.max_pids, 0), COALESCE(cp.cost_per_hour, 0), COALESCE(cp.power_watts, 0), COALESCE(cp.created_at, to_timestamp(0))"
+const fleetCertProfileCols = "COALESCE(cp.id, ''), COALESCE(cp.labels, '[]'::jsonb), COALESCE(cp.region, ''), COALESCE(cp.repositories, '[]'::jsonb), COALESCE(cp.capabilities, '[]'::jsonb), COALESCE(cp.max_capacity, 0), COALESCE(cp.max_cpu, 0), COALESCE(cp.max_memory, 0), COALESCE(cp.max_disk, 0), COALESCE(cp.max_pids, 0), COALESCE(cp.cost_per_hour, 0), COALESCE(cp.power_watts, 0), COALESCE(cp.job_cgroup, false), COALESCE(cp.created_at, to_timestamp(0))"
 
 // fleetRunnerIDProfileCols is fleetCertProfileCols for the runner-ID join
 // (the rp alias). The two lists MUST stay identical apart from the alias.
-const fleetRunnerIDProfileCols = "COALESCE(rp.id, ''), COALESCE(rp.labels, '[]'::jsonb), COALESCE(rp.region, ''), COALESCE(rp.repositories, '[]'::jsonb), COALESCE(rp.capabilities, '[]'::jsonb), COALESCE(rp.max_capacity, 0), COALESCE(rp.max_cpu, 0), COALESCE(rp.max_memory, 0), COALESCE(rp.max_disk, 0), COALESCE(rp.max_pids, 0), COALESCE(rp.cost_per_hour, 0), COALESCE(rp.power_watts, 0), COALESCE(rp.created_at, to_timestamp(0))"
+const fleetRunnerIDProfileCols = "COALESCE(rp.id, ''), COALESCE(rp.labels, '[]'::jsonb), COALESCE(rp.region, ''), COALESCE(rp.repositories, '[]'::jsonb), COALESCE(rp.capabilities, '[]'::jsonb), COALESCE(rp.max_capacity, 0), COALESCE(rp.max_cpu, 0), COALESCE(rp.max_memory, 0), COALESCE(rp.max_disk, 0), COALESCE(rp.max_pids, 0), COALESCE(rp.cost_per_hour, 0), COALESCE(rp.power_watts, 0), COALESCE(rp.job_cgroup, false), COALESCE(rp.created_at, to_timestamp(0))"
 
 // FleetRunnerProfileBindings implements FleetRunnerViewStore: ONE query over
 // runners LEFT JOINed to both binding sources and their profiles. The join

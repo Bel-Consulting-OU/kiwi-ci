@@ -36,7 +36,12 @@ listen = ":8080"
 # PostgreSQL connection URL; enables the durable SQL control plane.
 url = "postgres://kiwi:secret@db:5432/kiwi"
 
-# Maximum connections in the pgx pool. Default: driver default.
+# TOTAL PostgreSQL connection ceiling for Kiwi (all of its pools). The
+# operational pool receives max_connections - 5 connections; the rest of the
+# budget is a fixed 4-connection advisory-lock pool (CAS digest fences,
+# collector lease) plus 1 reserved connection for the leader's leadership
+# session. When set it must be at least 6. Default: driver default (no
+# ceiling).
 max_connections = 25
 
 [runner_pki]
@@ -211,6 +216,21 @@ untrusted_cpu_ceiling = 2                # cores
 untrusted_memory_ceiling = 4294967296    # 4 GiB
 untrusted_disk_ceiling = 10737418240     # 10 GiB
 untrusted_pids_ceiling = 256
+
+[scheduler]
+# Bounded lease candidate scan (DB mode). One /next poll materializes at most
+# max_candidate_rows queued candidates, requested in keyset pages of at most
+# candidate_page_size (0 keeps the built-in defaults 256/4096). A successful
+# scan that exhausts the row budget resumes from a fresh per-runner cursor on
+# the next poll instead of re-scanning the same prefix. max_candidate_rows is
+# capped at 100000 and values above it are rejected.
+candidate_page_size = 256
+max_candidate_rows = 4096
+
+# reservation_wait delays a resource-blocked candidate from becoming the
+# runner's reservation head, granting a grace period to backfill that already
+# fits the runner. Empty/"0s" (the default) activates immediately.
+# reservation_wait = "0s"
 
 [secret_broker]
 # Secret backend: "vault", "aws", "gcp", "azure", "onepassword" or "static"

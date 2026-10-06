@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -348,7 +349,10 @@ func (s *Store) KeyContext(ctx context.Context, base string, workspace string, h
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		matches, _ := filepath.Glob(filepath.Join(root.Canonical, p))
+		matches, err := filepath.Glob(filepath.Join(root.Canonical, p))
+		if err != nil {
+			return "", fmt.Errorf("cache hash_files %q: %w", p, err)
+		}
 		files = append(files, matches...)
 	}
 	sort.Strings(files)
@@ -356,7 +360,10 @@ func (s *Store) KeyContext(ctx context.Context, base string, workspace string, h
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		rel, _ := filepath.Rel(root.Canonical, f)
+		rel, err := filepath.Rel(root.Canonical, f)
+		if err != nil {
+			return "", fmt.Errorf("cache hash_files: %w", err)
+		}
 		fh, err := root.OpenRel(filepath.ToSlash(rel))
 		if err != nil {
 			return "", err
@@ -598,16 +605,230 @@ func (s *Store) restoreLocal(ctx context.Context, key, workspace string, paths [
 		limits.Allowed = roots
 	}
 	limits.MaxArchiveBytes = bound
-	// Extraction streams through the context reader too: a large archive
-	// stops being unpacked when the job context ends instead of finishing
-	// its filesystem walk under a dead deadline.
-	if _, err := extractCacheArchive(root, safefs.NewContextReader(ctx, f), limits); err != nil {
+	// Restores are transactional: the archive is extracted into a fresh
+	// job-private staging directory on the SAME filesystem as the
+	// destination (a sibling under the opened extract root) and is only
+	// published after the whole extraction and every collision check
+	// succeeded. Extraction streams through the context reader too: a large
+	// archive stops being unpacked when the job context ends instead of
+	// finishing its filesystem walk under a dead deadline.
+	stageName, err := newCacheStageName()
+	if err != nil {
+		return false, fmt.Errorf("cache restore: staging name: %w", err)
+	}
+	stage, err := safefs.OpenRootBeneath(root, stageName)
+	if err != nil {
+		return false, fmt.Errorf("cache restore: create staging directory: %w", err)
+	}
+	stageDir := stage.Canonical
+	if _, err := extractCacheArchive(stage, safefs.NewContextReader(ctx, f), limits); err != nil {
+		_ = stage.Close()
+		_ = os.RemoveAll(stageDir)
 		if cerr := ctx.Err(); cerr != nil {
 			return false, cerr
 		}
 		return false, fmt.Errorf("cache restore: %w", err)
 	}
+	// Close the staging handle before any cleanup: Windows cannot remove an
+	// open directory.
+	if err := stage.Close(); err != nil {
+		_ = os.RemoveAll(stageDir)
+		return false, fmt.Errorf("cache restore: close staging directory: %w", err)
+	}
+	entries, err := collectStagedEntries(stageDir)
+	if err != nil {
+		_ = os.RemoveAll(stageDir)
+		return false, fmt.Errorf("cache restore: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		_ = os.RemoveAll(stageDir)
+		return false, err
+	}
+	// Nothing before this point touched the live workspace; publishStaged
+	// pre-checks every destination path and rolls back every path it created
+	// on failure, so a restore error leaves the workspace byte-for-byte
+	// unchanged (no new files, no removed files, no overwritten files).
+	if err := publishStaged(root, stageDir, entries); err != nil {
+		_ = os.RemoveAll(stageDir)
+		return false, fmt.Errorf("cache restore: %w", err)
+	}
+	if err := os.RemoveAll(stageDir); err != nil {
+		return false, fmt.Errorf("cache restore: remove staging directory: %w", err)
+	}
 	return true, nil
+}
+
+// cacheStagePrefix names the job-private staging directory a local cache
+// restore extracts into before publishing. The staging directory is created
+// beneath the opened destination root with the safefs no-follow Root API, so
+// staged bytes are always on the same filesystem as their final paths and
+// every publish rename is a same-filesystem atomic move.
+const cacheStagePrefix = ".kiwi-cache-stage-"
+
+// newCacheStageName returns a fresh staging directory name. The random
+// suffix keeps the staged tree private to this restore: a collision with
+// workspace content (or a concurrent restore) is not practically possible,
+// and an existing symlink at the name is rejected by OpenRootBeneath.
+func newCacheStageName() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return cacheStagePrefix + hex.EncodeToString(b[:]), nil
+}
+
+// stagedEntry is one directory or regular file extracted into the staging
+// tree, identified by its workspace-relative slash path.
+type stagedEntry struct {
+	rel   string
+	isDir bool
+}
+
+// collectStagedEntries walks the staging tree without following symlinks and
+// returns every entry parent-first (a directory always precedes its
+// children, so publishing creates parents before their contents). Extraction
+// only ever writes real directories and O_EXCL regular files, so any other
+// entry type is rejected as an invariant violation instead of being
+// published.
+func collectStagedEntries(stageDir string) ([]stagedEntry, error) {
+	var out []stagedEntry
+	var walk func(rel string) error
+	walk = func(rel string) error {
+		dir := stageDir
+		if rel != "" {
+			dir = filepath.Join(stageDir, filepath.FromSlash(rel))
+		}
+		items, err := os.ReadDir(dir)
+		if err != nil {
+			return err
+		}
+		sort.Slice(items, func(i, j int) bool { return items[i].Name() < items[j].Name() })
+		for _, item := range items {
+			child := item.Name()
+			if rel != "" {
+				child = rel + "/" + item.Name()
+			}
+			info, err := item.Info()
+			if err != nil {
+				return err
+			}
+			mode := info.Mode()
+			if mode&os.ModeSymlink != 0 {
+				return fmt.Errorf("staging entry %q is a symlink", child)
+			}
+			if mode.IsDir() {
+				out = append(out, stagedEntry{rel: child, isDir: true})
+				if err := walk(child); err != nil {
+					return err
+				}
+				continue
+			}
+			if !mode.IsRegular() {
+				return fmt.Errorf("staging entry %q is not a regular file", child)
+			}
+			out = append(out, stagedEntry{rel: child})
+		}
+		return nil
+	}
+	if err := walk(""); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// publishStaged moves every staged entry into the destination workspace,
+// which must be the opened extract root the staging tree was created under.
+//
+// Merge-safe, overwrite-hostile semantics: a cache is routinely restored OVER
+// an existing repository checkout, so an existing destination DIRECTORY is
+// merged (the staged directory reuses it and the restore continues inside).
+// Everything else is a collision detected up front, before a single entry
+// moves: an existing regular file/symlink/special where the archive stages a
+// file or a directory, and an existing regular file where the archive stages
+// a directory. Nothing ever overwrites a pre-existing path, and the
+// workspace stays byte-for-byte unchanged on any error.
+//
+// Entries are published parent-first: files are renamed from the staging tree
+// (atomic within one filesystem) and only the directories extraction created
+// are recreated at the destination with their extracted mode. Every
+// destination path this publish CREATES is tracked, and any failure rolls
+// those paths back in reverse order; pre-existing directories are never
+// tracked, so a mid-publish failure cannot delete workspace content that was
+// already there.
+//
+// Every destination parent is re-verified through safefs.OpenRootBeneath,
+// which walks each component relative to the held root descriptor with
+// O_NOFOLLOW and rejects a symlink anywhere in the chain exactly like
+// extraction does.
+func publishStaged(dst *safefs.Root, stageDir string, entries []stagedEntry) error {
+	// Pre-check: reject overwrites before anything moves. Existing
+	// directories are legal merge points only for staged directories; every
+	// other pre-existing destination is a collision.
+	for _, e := range entries {
+		p := filepath.Join(dst.Canonical, filepath.FromSlash(e.rel))
+		fi, err := os.Lstat(p)
+		switch {
+		case err == nil:
+			if e.isDir && fi.IsDir() && fi.Mode()&os.ModeSymlink == 0 {
+				continue // merge into the existing real directory
+			}
+			return fmt.Errorf("publish destination %q already exists", e.rel)
+		case !os.IsNotExist(err):
+			return fmt.Errorf("publish destination %q: %w", e.rel, err)
+		}
+	}
+	created := make([]stagedEntry, 0, len(entries))
+	rollback := func() {
+		for i := len(created) - 1; i >= 0; i-- {
+			p := filepath.Join(dst.Canonical, filepath.FromSlash(created[i].rel))
+			if created[i].isDir {
+				// Only directories this publish created are tracked, so
+				// RemoveAll cannot delete pre-existing workspace content.
+				_ = os.RemoveAll(p)
+			} else {
+				_ = os.Remove(p)
+			}
+		}
+	}
+	for _, e := range entries {
+		parent, err := safefs.OpenRootBeneath(dst, path.Dir(e.rel))
+		if err != nil {
+			rollback()
+			return fmt.Errorf("publish %q: %w", e.rel, err)
+		}
+		if err := parent.Close(); err != nil {
+			rollback()
+			return fmt.Errorf("publish %q: %w", e.rel, err)
+		}
+		dest := filepath.Join(dst.Canonical, filepath.FromSlash(e.rel))
+		if e.isDir {
+			// The pre-check established that dest is either absent or an
+			// existing real directory. Re-check under the no-follow parent:
+			// a racing or swapped entry is a collision, never a merge.
+			if fi, err := os.Lstat(dest); err == nil {
+				if fi.IsDir() && fi.Mode()&os.ModeSymlink == 0 {
+					continue
+				}
+				rollback()
+				return fmt.Errorf("publish destination %q already exists", e.rel)
+			} else if !os.IsNotExist(err) {
+				rollback()
+				return fmt.Errorf("publish %q: %w", e.rel, err)
+			}
+			if err := os.Mkdir(dest, 0o755); err != nil {
+				rollback()
+				return fmt.Errorf("publish %q: %w", e.rel, err)
+			}
+		} else {
+			src := filepath.Join(stageDir, filepath.FromSlash(e.rel))
+			if err := os.Rename(src, dest); err != nil {
+				rollback()
+				return fmt.Errorf("publish %q: %w", e.rel, err)
+			}
+		}
+		created = append(created, e)
+	}
+	return nil
 }
 
 // openExtractRoot opens the cache extraction destination without following a

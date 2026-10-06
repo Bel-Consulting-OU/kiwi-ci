@@ -70,6 +70,15 @@ header {
 
 .login { display: flex; gap: 8px; }
 
+/* History mode: auto-refresh of the runs table is paused while older pages
+   are on screen; the toolbar says so instead of silently freezing. */
+#paused {
+  color: var(--yellow);
+  border-color: rgba(241, 200, 102, 0.45);
+}
+
+.note { color: var(--muted); font-size: 12px; }
+
 .login input {
   background: var(--panel);
   border: 1px solid var(--line);

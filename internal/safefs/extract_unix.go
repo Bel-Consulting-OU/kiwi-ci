@@ -159,6 +159,14 @@ func writeFileNoFollow(root *Root, name string, r io.Reader, size int64, limits 
 	f := os.NewFile(uintptr(fd), filepath.Join(root.Canonical, filepath.FromSlash(name)))
 	defer f.Close()
 	if _, err := io.CopyN(f, r, size); err != nil {
+		// The entry is truncated. The partial file must not survive: a
+		// caller that retries or inspects the destination would otherwise
+		// observe a hybrid of completed and truncated members. Remove it
+		// through the same held parent descriptor it was created with,
+		// keeping the copy error primary if the removal itself fails.
+		if rmErr := unix.Unlinkat(parentFd, base, 0); rmErr != nil && !errors.Is(rmErr, unix.ENOENT) {
+			return errors.Join(err, rmErr)
+		}
 		return err
 	}
 	return nil

@@ -158,7 +158,10 @@ func (s *Server) applyQueueReasonsDB(ctx context.Context, ri model.Runner) {
 	// contract keep the historical ListQueuedJobs read.
 	var jobs []model.Job
 	if ps, ok := s.DB.(storage.QueuedJobPageStore); ok {
-		page, err := ps.ListQueuedJobsPage(ctx, nil, s.leaseCandidatePageBound(), time.Now().UTC())
+		// The fleet-global explainer must see EVERY queued candidate, so it
+		// passes the zero-value UNCONSTRAINED filter (no runtime/label/region/
+		// capacity predicate at all).
+		page, err := ps.ListQueuedJobsPage(ctx, storage.QueuedJobFilter{}, nil, s.leaseCandidatePageBound(), time.Now().UTC())
 		if err != nil {
 			return
 		}

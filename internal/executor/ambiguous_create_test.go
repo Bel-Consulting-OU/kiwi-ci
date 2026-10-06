@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -125,9 +126,12 @@ func TestServiceNetworkAmbiguousCreateReportsDebt(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "create services network") {
 		t.Fatalf("ambiguous network create = %v, want the create error", err)
 	}
-	want := serviceNetworkName("r", "j")
-	if len(debts) != 1 || debts[0].Kind != CleanupNetwork || debts[0].Resource != want {
-		t.Fatalf("debts = %+v, want one %s debt for %q", debts, CleanupNetwork, want)
+	if len(debts) != 1 || debts[0].Kind != CleanupNetwork || debts[0].Err == nil {
+		t.Fatalf("debts = %+v, want one %s debt", debts, CleanupNetwork)
+	}
+	want := debts[0].Resource
+	if !strings.HasPrefix(want, "kiwi-net-r-j-") {
+		t.Fatalf("network debt resource = %q, want the kiwi-net-r-j- prefix", want)
 	}
 	log := readFakeLog(t, "FAKE_DOCKER_LOG")
 	if !strings.Contains(log, "network rm "+want) {
@@ -150,15 +154,14 @@ func TestServiceContainerAmbiguousCreateIsInOwnedSet(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "start service") {
 		t.Fatalf("ambiguous service run = %v, want the start error", err)
 	}
-	want := serviceContainerName("r", "j", 0)
-	found := false
+	want := ""
 	for _, d := range debts {
-		if d.Kind == CleanupService && d.Err != nil && strings.Contains(d.Err.Error(), want) {
-			found = true
+		if d.Kind == CleanupService && d.Err != nil && strings.HasPrefix(d.Resource, "kiwi-svc-r-j-1-") {
+			want = d.Resource
 		}
 	}
-	if !found {
-		t.Fatalf("debts = %+v, want a %s debt naming %q", debts, CleanupService, want)
+	if want == "" {
+		t.Fatalf("debts = %+v, want a %s debt for the kiwi-svc-r-j-1- container", debts, CleanupService)
 	}
 	log := readFakeLog(t, "FAKE_DOCKER_LOG")
 	if !strings.Contains(log, "rm -f "+want) {
@@ -166,7 +169,7 @@ func TestServiceContainerAmbiguousCreateIsInOwnedSet(t *testing.T) {
 	}
 	// The bounded network removal still runs even though the container rm
 	// failed.
-	if !strings.Contains(log, "network rm "+serviceNetworkName("r", "j")) {
+	if !strings.Contains(log, "network rm kiwi-net-r-j-") {
 		t.Fatalf("service network cleanup was not attempted:\n%s", log)
 	}
 }
@@ -268,5 +271,194 @@ func TestTartRunStartCleanupFailureReportsDebt(t *testing.T) {
 	}
 	if len(debts) != 1 || debts[0].Kind != CleanupVM || debts[0].Resource != b.clone || debts[0].Err == nil {
 		t.Fatalf("debts = %+v, want one %s debt for %q", debts, CleanupVM, b.clone)
+	}
+}
+
+// TestServiceCleanupNeverTouchesAnotherOwnersResource is the ownership proof
+// for the unique service names: a container/network seeded under the LEGACY
+// deterministic name (kiwi-svc-<run>-<job>-1 / kiwi-net-<run>-<job>) by a
+// different attempt/owner must never be addressed by this attempt's cleanup.
+// Only the attempt's own per-attempt names may appear in rm/network rm lines,
+// and the seeded resources must survive.
+func TestServiceCleanupNeverTouchesAnotherOwnersResource(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(dir, "state")
+	if err := os.MkdirAll(state, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacyContainer := "kiwi-svc-runa-joba-1"
+	legacyNetwork := "kiwi-net-runa-joba"
+	for _, legacy := range []string{legacyContainer, legacyNetwork} {
+		if err := os.MkdirAll(filepath.Join(state, legacy), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	logPath := filepath.Join(dir, "docker.log")
+	script := `#!/bin/sh
+echo "$@" >> "` + logPath + `"
+sub="$1"; shift
+case "$sub" in
+  network)
+    case "$1" in
+      create)
+        net=""
+        for a in "$@"; do net="$a"; done
+        mkdir -p "` + state + `/$net"
+        echo netid; exit 0;;
+      rm)
+        rm -rf "` + state + `/$2"
+        exit 0;;
+    esac;;
+  run)
+    name=""
+    prev=""
+    for a in "$@"; do
+      if [ "$prev" = "--name" ]; then name="$a"; fi
+      prev="$a"
+    done
+    if [ -e "` + state + `/attempts" ]; then echo "second service refused" >&2; exit 1; fi
+    : > "` + state + `/attempts"
+    mkdir -p "` + state + `/$name"
+    echo "fake-container-$$"; exit 0;;
+  rm)
+    name="$1"
+    if [ "$name" = "-f" ] && [ -n "$2" ]; then name="$2"; fi
+    rm -rf "` + state + `/$name"
+    exit 0;;
+esac
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(dir, "docker"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	// The SECOND service fails, so cleanupAll must remove the first service's
+	// container (and the newly created network) by their unique names.
+	_, _, err := startContainerServices(context.Background(), "runa", "joba",
+		[]pipeline.Service{{Name: "db", Image: "postgres:16"}, {Name: "cache", Image: "redis:7"}},
+		pipeline.Resources{}, false, false, "", func(string) {})
+	if err == nil || !strings.Contains(err.Error(), "start service") {
+		t.Fatalf("failing second service = %v, want the start error", err)
+	}
+	data, readErr := os.ReadFile(logPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	log := string(data)
+	ownContainers := map[string]bool{}
+	removedNetworks := []string{}
+	for _, line := range strings.Split(log, "\n") {
+		if name, ok := strings.CutPrefix(line, "rm -f "); ok {
+			if !strings.HasPrefix(name, "kiwi-svc-runa-joba-") {
+				t.Fatalf("cleanup removed a foreign container %q:\n%s", name, log)
+			}
+			ownContainers[name] = true
+		}
+		if name, ok := strings.CutPrefix(line, "network rm "); ok {
+			removedNetworks = append(removedNetworks, name)
+		}
+	}
+	if len(ownContainers) == 0 {
+		t.Fatalf("the attempt's own unique containers were never removed:\n%s", log)
+	}
+	if len(removedNetworks) != 1 || !strings.HasPrefix(removedNetworks[0], "kiwi-net-runa-joba-") {
+		t.Fatalf("network cleanup = %v, want the attempt's own unique network:\n%s", removedNetworks, log)
+	}
+	// The seeded foreign resources were never addressed and still exist.
+	for _, legacy := range []string{legacyContainer, legacyNetwork} {
+		if strings.Contains(log, "rm -f "+legacy+"\n") || strings.Contains(log, "network rm "+legacy+"\n") {
+			t.Fatalf("cleanup addressed the seeded foreign resource %q:\n%s", legacy, log)
+		}
+		if _, statErr := os.Stat(filepath.Join(state, legacy)); statErr != nil {
+			t.Fatalf("seeded foreign resource %q was removed: %v", legacy, statErr)
+		}
+	}
+}
+
+// TestServiceNamesUniqueAcrossAttempts proves two successive start/cleanup
+// attempts for the SAME run/job use disjoint physical container and network
+// names (each attempt removes exactly its own), while the user-facing service
+// alias stays identical across attempts.
+func TestServiceNamesUniqueAcrossAttempts(t *testing.T) {
+	installFakeBins(t)
+	ctx := context.Background()
+	services := []pipeline.Service{{Name: "db", Image: "postgres:16"}}
+	var networks []string
+	for attempt := 0; attempt < 2; attempt++ {
+		network, cleanup, err := startContainerServices(ctx, "runU", "jobU", services, pipeline.Resources{}, false, false, "", func(string) {})
+		if err != nil {
+			t.Fatalf("attempt %d: %v", attempt, err)
+		}
+		networks = append(networks, network)
+		cleanup()
+	}
+	if networks[0] == networks[1] {
+		t.Fatalf("network name reused across attempts: %v", networks)
+	}
+	log := readFakeLog(t, "FAKE_DOCKER_LOG")
+	runs := runLines(log)
+	if len(runs) != 2 {
+		t.Fatalf("docker run lines = %d, want 2:\n%s", len(runs), log)
+	}
+	var containers []string
+	for _, line := range runs {
+		name := flagValue(line, "--name")
+		if name == "" {
+			t.Fatalf("run line without --name: %s", line)
+		}
+		containers = append(containers, name)
+	}
+	if containers[0] == containers[1] {
+		t.Fatalf("container name reused across attempts: %v", containers)
+	}
+	for i := 0; i < 2; i++ {
+		if !strings.HasPrefix(containers[i], "kiwi-svc-runu-jobu-1-") {
+			t.Fatalf("attempt %d container %q lost the identity prefix", i, containers[i])
+		}
+		if !strings.HasPrefix(networks[i], "kiwi-net-runu-jobu-") {
+			t.Fatalf("attempt %d network %q lost the identity prefix", i, networks[i])
+		}
+		if !strings.Contains(log, "rm -f "+containers[i]) {
+			t.Fatalf("attempt %d did not remove its own container %q:\n%s", i, containers[i], log)
+		}
+		if !strings.Contains(log, "network rm "+networks[i]) {
+			t.Fatalf("attempt %d did not remove its own network %q:\n%s", i, networks[i], log)
+		}
+	}
+	if got := strings.Count(log, "--network-alias db"); got != 2 {
+		t.Fatalf("--network-alias db count = %d, want 2 (alias stable across attempts):\n%s", got, log)
+	}
+}
+
+// TestServiceNetworkCreateCarriesOwnershipLabels pins the label contract on
+// the services network: kiwi.run and kiwi.job always, plus kiwi.runner and
+// kiwi.instance when the starting runner has an identity (crash
+// reconciliation depends on them).
+func TestServiceNetworkCreateCarriesOwnershipLabels(t *testing.T) {
+	installFakeBins(t)
+	_, cleanup, err := startContainerServicesOwned(context.Background(), "runL", "jobL",
+		runtimeOwner{RunnerID: "runner-a", InstanceID: "inst-1"},
+		[]pipeline.Service{{Name: "db", Image: "postgres:16"}},
+		pipeline.Resources{}, false, false, "", func(string) {}, nil)
+	if err != nil {
+		t.Fatalf("startContainerServicesOwned: %v", err)
+	}
+	cleanup()
+	log := readFakeLog(t, "FAKE_DOCKER_LOG")
+	createLine := ""
+	for _, line := range strings.Split(log, "\n") {
+		if strings.HasPrefix(line, "network create ") {
+			createLine = line
+			break
+		}
+	}
+	if createLine == "" {
+		t.Fatalf("no network create line:\n%s", log)
+	}
+	for _, want := range []string{"kiwi.run=runL", "kiwi.job=jobL", "kiwi.runner=runner-a", "kiwi.instance=inst-1"} {
+		if !strings.Contains(createLine, want) {
+			t.Fatalf("network create %q missing label %s", createLine, want)
+		}
 	}
 }

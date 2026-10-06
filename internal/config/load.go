@@ -37,7 +37,11 @@ func (c *Config) applyTOML(data []byte, path string) error {
 
 	for i, raw := range strings.Split(string(data), "\n") {
 		lineNo := i + 1
-		line := strings.TrimSpace(stripComment(raw))
+		stripped, serr := stripComment(raw)
+		if serr != nil {
+			return fmt.Errorf("%s:%d: %v", path, lineNo, serr)
+		}
+		line := strings.TrimSpace(stripped)
 		if line == "" {
 			continue
 		}
@@ -106,8 +110,10 @@ func fieldByTag(v reflect.Value, name string) reflect.Value {
 // escape-aware: inside a basic ("...") string a backslash escapes the next
 // character, so \" does not toggle the in-string state (and \\ before "
 // keeps the quote opening the string), while '#' stays a literal inside
-// any quoted string.
-func stripComment(s string) string {
+// any quoted string. An unterminated quote at end of line is an error: the
+// old behavior accepted `key = "unterminated # x` and swallowed the rest of
+// the line, silently truncating the value.
+func stripComment(s string) (string, error) {
 	var quote byte
 	for i := 0; i < len(s); i++ {
 		if quote == '"' && s[i] == '\\' && i+1 < len(s) {
@@ -126,15 +132,40 @@ func stripComment(s string) string {
 			}
 		case '#':
 			if quote == 0 {
-				return s[:i]
+				return s[:i], nil
 			}
 		}
 	}
-	return s
+	if quote != 0 {
+		return "", fmt.Errorf("unterminated quoted string")
+	}
+	return s, nil
+}
+
+// basicStringClose returns the index of the closing quote of the basic
+// ("...") string whose opening quote is s[0]. It is escape-aware: a
+// backslash escapes the next byte, so \" never closes the string and \\"
+// closes after the escaped backslash. An unterminated string is an error.
+// Error messages never echo the scalar: it may carry a secret.
+func basicStringClose(s string) (int, error) {
+	for i := 1; i < len(s); i++ {
+		switch s[i] {
+		case '\\':
+			i++
+		case '"':
+			return i, nil
+		}
+	}
+	return 0, fmt.Errorf("unterminated quoted string")
 }
 
 // parseScalar parses a TOML scalar of the supported kinds: quoted string
-// (basic "..." or literal '...'), bool, integer, or float.
+// (basic "..." or literal '...'), bool, integer, or float. Quoted strings
+// are strict: the matching closing quote must be the FINAL byte of the
+// scalar, so `"abc"junk`, `"abc" junk`, an interior unescaped quote and a
+// lone `"` are all rejected (the old prefix/suffix check accepted
+// `"a"b"` and panicked on a single `"`). Literal strings take no escapes,
+// so an interior `'` is the same class of error.
 func parseScalar(s string) (any, error) {
 	switch s {
 	case "true":
@@ -142,11 +173,26 @@ func parseScalar(s string) (any, error) {
 	case "false":
 		return false, nil
 	}
-	if strings.HasPrefix(s, `"`) && strings.HasSuffix(s, `"`) {
-		return unquote(s[1 : len(s)-1])
+	if strings.HasPrefix(s, `"`) {
+		close, err := basicStringClose(s)
+		if err != nil {
+			return nil, err
+		}
+		if close != len(s)-1 {
+			return nil, fmt.Errorf("unexpected characters after the closing quote")
+		}
+		return unquote(s[1:close])
 	}
-	if strings.HasPrefix(s, `'`) && strings.HasSuffix(s, `'`) {
-		return s[1 : len(s)-1], nil
+	if strings.HasPrefix(s, `'`) {
+		close := strings.IndexByte(s[1:], '\'')
+		if close < 0 {
+			return nil, fmt.Errorf("unterminated literal string")
+		}
+		close++ // index into s
+		if close != len(s)-1 {
+			return nil, fmt.Errorf("unexpected characters after the closing quote")
+		}
+		return s[1:close], nil
 	}
 	if strings.ContainsAny(s, ".eE") {
 		if f, err := strconv.ParseFloat(s, 64); err == nil {

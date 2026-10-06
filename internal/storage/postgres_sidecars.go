@@ -108,7 +108,7 @@ func (s *PostgresStore) SetArtifactSidecars(ctx context.Context, artifactID, sbo
 	if err := ValidateID(artifactID); err != nil {
 		return err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return err
 	}
@@ -149,7 +149,7 @@ func (s *PostgresStore) RememberPendingSidecar(ctx context.Context, jobID string
 	if err := validatePendingSidecarDigest(digest); err != nil {
 		return err
 	}
-	_, err := s.pool.Exec(ctx, `INSERT INTO artifact_pending_sidecars (job_id, job_generation, artifact_name, kind, digest) VALUES ($1, $2, $3, $4, $5)
+	_, err := s.execSchemaFenced(ctx, `INSERT INTO artifact_pending_sidecars (job_id, job_generation, artifact_name, kind, digest) VALUES ($1, $2, $3, $4, $5)
 		ON CONFLICT (job_id, job_generation, artifact_name, kind) DO UPDATE SET digest = EXCLUDED.digest, created_at = now()`,
 		jobID, generation, artifactName, kind, digest)
 	return err
@@ -186,7 +186,7 @@ func (s *PostgresStore) ConsumePendingSidecar(ctx context.Context, jobID string,
 	if err := validatePendingSidecarDigest(digest); err != nil {
 		return err
 	}
-	_, err := s.pool.Exec(ctx, `DELETE FROM artifact_pending_sidecars WHERE job_id=$1 AND job_generation=$2 AND artifact_name=$3 AND kind=$4 AND digest=$5`,
+	_, err := s.execSchemaFenced(ctx, `DELETE FROM artifact_pending_sidecars WHERE job_id=$1 AND job_generation=$2 AND artifact_name=$3 AND kind=$4 AND digest=$5`,
 		jobID, generation, artifactName, kind, digest)
 	return err
 }

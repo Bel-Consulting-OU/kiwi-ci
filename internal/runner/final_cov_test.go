@@ -193,10 +193,15 @@ func TestFinalNextTransportErrorServerErrorAndTask(t *testing.T) {
 		t.Fatalf("non-200 next = %v", err)
 	}
 	status.Store(http.StatusOK)
-	body.Store(`{"job":{"id":"job-1"},"lease_token":"lease","lease_generation":2}`)
+	body.Store(`{"job":{"id":"job-1"},"lease_token":"lease","lease_generation":2,"job_cgroup":true}`)
 	task, drain, err := r.next(context.Background())
 	if err != nil || drain || task == nil || task.Job.ID != "job-1" || task.LeaseToken != "lease" {
 		t.Fatalf("next task = %+v drain=%v err=%v", task, drain, err)
+	}
+	// The additive job-scoped-cgroup flag is decoded into the task struct the
+	// executor options are built from (RequireJobCgroup).
+	if !task.JobCgroup {
+		t.Fatalf("next task did not decode job_cgroup: %+v", task)
 	}
 }
 

@@ -42,6 +42,67 @@ func TestLoadTOMLSyntaxErrors(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsMalformedQuotedScalars(t *testing.T) {
+	// Startup must reject a malformed quoted scalar instead of silently
+	// accepting a truncated or trailing-token value. A bare `"` used to
+	// panic in parseScalar; it is now a plain error.
+	rejected := map[string]string{
+		"trailing chars after basic string": "[server]\nlisten = \"abc\"garbage\"\n",
+		"trailing token after basic string": "[server]\nlisten = \"abc\" junk\n",
+		"interior unescaped quote":          "[server]\nlisten = \"a\"b\"\n",
+		"bare quote":                        "[server]\nlisten = \"\n",
+		"unterminated basic string":         "[server]\nlisten = \"abc\n",
+		"unterminated before comment":       "[server]\nlisten = \"abc # comment\n",
+		"trailing chars after literal":      "[server]\nlisten = 'abc'junk\n",
+		"interior literal quote":            "[server]\nlisten = 'a'b'\n",
+		"unterminated literal string":       "[server]\nlisten = 'abc\n",
+	}
+	for name, body := range rejected {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("Load panicked for:\n%s\npanic: %v", body, r)
+				}
+			}()
+			if _, err := loadToml(t, body); err == nil {
+				t.Fatalf("expected an error for:\n%s", body)
+			}
+		})
+	}
+
+	// Valid quoted scalars keep loading: escapes, a # inside quotes and a
+	// quoted URL with a port must all survive.
+	cfg, err := loadToml(t, `
+[server]
+listen = ":8443"
+external_url = "https://ci.example.com:8443/base#frag"
+mode = "dev" # trailing comment
+`)
+	if err != nil {
+		t.Fatalf("valid quoted values must load: %v", err)
+	}
+	if cfg.Server.Listen != ":8443" {
+		t.Fatalf("listen = %q", cfg.Server.Listen)
+	}
+	if cfg.Server.ExternalURL != "https://ci.example.com:8443/base#frag" {
+		t.Fatalf("external_url = %q (a # inside quotes is not a comment)", cfg.Server.ExternalURL)
+	}
+}
+
+func TestDatabaseMaxConnectionsBelowTotalMinimum(t *testing.T) {
+	cfg := Default()
+	cfg.Database.MaxConnections = 3
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "max_connections") {
+		t.Fatalf("Validate(max_connections=3) = %v, want a max_connections error", err)
+	}
+	cfg = Default()
+	cfg.Database.MaxConnections = 6
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate(max_connections=6) = %v, want success (the minimum total ceiling)", err)
+	}
+}
+
 func TestParseScalarKindsAndErrors(t *testing.T) {
 	cases := []struct {
 		in   string
@@ -60,6 +121,18 @@ func TestParseScalarKindsAndErrors(t *testing.T) {
 		{"1.2.3", nil, false},
 		{"unquoted", nil, false},
 		{`"unterminated`, nil, false},
+		// Strict quoted scalars: the closing quote must be final.
+		{`"abc"garbage"`, nil, false},
+		{`"abc" junk`, nil, false},
+		{`"a"b"`, nil, false},
+		{`"`, nil, false},
+		{`'abc'junk`, nil, false},
+		{`'abc'junk'`, nil, false},
+		{`'`, nil, false},
+		{`''`, "", true},
+		{`"a\"b"`, `a"b`, true},
+		{`"a\\"`, `a\`, true},
+		{`"a#b"`, "a#b", true},
 	}
 	for _, tc := range cases {
 		got, err := parseScalar(tc.in)

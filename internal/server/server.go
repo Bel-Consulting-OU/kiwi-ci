@@ -238,6 +238,14 @@ type Server struct {
 	// Cleared on demotion, so the next promotion reconciles again.
 	resourceReconciled atomic.Bool
 
+	// boostPromoteMu guards lastBoostPromote, the interval gate that keeps
+	// the materialized queued-boost sweep (storage.QueuedBoostPromoter) at
+	// most once per queuedBoostPromoteInterval on the DB leader. The sweep
+	// itself is bounded, absolute and idempotent (cross-replica safe); the
+	// gate only bounds how often one leader runs it.
+	boostPromoteMu   sync.Mutex
+	lastBoostPromote time.Time
+
 	// Forge API base overrides, used by tests to point adapters at local
 	// HTTP servers; empty means the public API endpoints.
 	gitHubAPIBase  string
@@ -1245,13 +1253,68 @@ func (s *Server) schemaMutationFence(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if err := s.checkSchemaCompatibility(r.Context()); err != nil {
-			w.Header().Set("X-Kiwi-State", "schema-incompatible")
-			http.Error(w, "database schema requires a newer binary", http.StatusServiceUnavailable)
+		if schemaFenceDeferredPath(r) {
+			// Deferred-auth public route: the handler authenticates with the
+			// webhook HMAC / job lease token / session cookie and calls
+			// requireSchemaCompatible itself, so an invalid credential can
+			// never trigger a compatibility DB read.
+			next.ServeHTTP(w, r)
+			return
+		}
+		if !s.requireSchemaCompatible(w, r) {
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// schemaFenceDeferredPath reports whether r targets a tierPublic route whose
+// real authentication lives in the handler (webhook HMAC, job lease token,
+// dashboard session). Those routes skip the middleware fence and call
+// requireSchemaCompatible immediately after authenticating, so invalid
+// HMAC/lease/junk POSTs perform zero compatibility DB queries. The predicate
+// is shared with the tests, so the deferred route set cannot drift silently.
+func schemaFenceDeferredPath(r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	path := r.URL.Path
+	if strings.HasPrefix(path, "/hooks/") {
+		return true
+	}
+	switch path {
+	case "/api/v1/login", "/api/v1/logout":
+		return true
+	}
+	return isJobOIDCPostPath(path)
+}
+
+// isJobOIDCPostPath mirrors auth.PublicRoute's EXACT route shape
+// POST /api/v1/jobs/{id}/oidc (a single non-empty {id} segment): a lookalike
+// path that merely ends in /oidc is never treated as deferred.
+func isJobOIDCPostPath(path string) bool {
+	rest, ok := strings.CutPrefix(path, "/api/v1/jobs/")
+	if !ok {
+		return false
+	}
+	id, ok := strings.CutSuffix(rest, "/oidc")
+	if !ok || id == "" || strings.Contains(id, "/") {
+		return false
+	}
+	return true
+}
+
+// requireSchemaCompatible is the shared compatibility gate for the middleware
+// and the deferred-auth handlers: on refusal it writes the same 503 body and
+// X-Kiwi-State header the middleware uses, and returns false so the caller
+// stops before any mutation.
+func (s *Server) requireSchemaCompatible(w http.ResponseWriter, r *http.Request) bool {
+	if err := s.checkSchemaCompatibility(r.Context()); err != nil {
+		w.Header().Set("X-Kiwi-State", "schema-incompatible")
+		http.Error(w, "database schema requires a newer binary", http.StatusServiceUnavailable)
+		return false
+	}
+	return true
 }
 
 func (s *Server) auth(next http.Handler) http.Handler {
@@ -3768,17 +3831,28 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		// Resource admission: the SAME shared predicate the SQL claim and the
-		// in-memory stores apply. A candidate whose TOTAL request (its own
-		// request plus the aggregate service envelope, model.Job.
-		// ReservedResources) does not fit the runner's REMAINING resource
-		// capacity waits (it will be leased when one of this runner's jobs
-		// finishes, or by another runner with room) instead of oversubscribing
-		// this one. The count-capacity gate above
-		// (len(ri.ActiveJobs) >= ri.Capacity) stays authoritative for slots.
+		// in-memory stores apply. A candidate whose effective request does
+		// not fit the runner's REMAINING resource capacity waits (it will be
+		// leased when one of this runner's jobs finishes, or by another
+		// runner with room) instead of oversubscribing this one. The
+		// effective request is the job's own request plus its aggregate
+		// service envelope (model.Job.ReservedResources), UNLESS the
+		// effective runner can establish a job-scoped parent cgroup
+		// (ri.JobCgroup, from the live profile): the kernel then bounds the
+		// main container and every service together by the declared
+		// envelope, so only the job's own request is charged — the same
+		// relaxation scheduler.effectiveJobRequest and
+		// storage.LeaseClaim.IgnoreServiceEnvelope apply. The count-capacity
+		// gate above (len(ri.ActiveJobs) >= ri.Capacity) stays authoritative
+		// for slots.
+		requested := j.ReservedResources()
+		if ri.JobCgroup {
+			requested = j.ResourceRequest()
+		}
 		if !(storage.ResourceAdmission{
 			Capacity:  ri.ResourceCapacity,
 			Reserved:  reserved,
-			Requested: j.ReservedResources(),
+			Requested: requested,
 		}).Allows() {
 			continue
 		}
@@ -3917,7 +3991,11 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	if checkout := strings.TrimSpace(j.CheckoutRepoURL); checkout != "" {
 		taskJob.RepoURL = checkout
 	}
-	task := Task{Job: taskJob, LeaseToken: rawToken, LeaseGeneration: j.LeaseGeneration, LeaseExpiresAt: exp}
+	// The effective runner the admission decision charged is the one
+	// liveRunnerLocked just resolved, so its job-scoped cgroup capability is
+	// exactly what the relaxed/union admission assumed; advertise it so the
+	// executor can enforce the same bound at the kernel.
+	task := Task{Job: taskJob, LeaseToken: rawToken, LeaseGeneration: j.LeaseGeneration, LeaseExpiresAt: exp, JobCgroup: ri.JobCgroup}
 	leaseSpan.End()
 	writeJSON(w, http.StatusOK, task)
 }
@@ -4013,7 +4091,18 @@ func (s *Server) nextDB(w http.ResponseWriter, r *http.Request, id string) {
 	if checkout := strings.TrimSpace(j.CheckoutRepoURL); checkout != "" {
 		taskJob.RepoURL = checkout
 	}
-	task := Task{Job: taskJob, LeaseToken: rawToken, LeaseGeneration: j.LeaseGeneration, LeaseExpiresAt: exp}
+	// The job-scoped-cgroup capability the claim reserved under is advertised
+	// so the executor can enforce the aggregate at the kernel. The effective
+	// runner is resolved with the SAME live-profile precedence
+	// (storage.ResolveLiveProfileBinding / ResolveRunnerProfile) the
+	// scheduler's prefilter and claim used; a failed resolution leaves the
+	// flag false (conservative union), so a transient profile-read error can
+	// never advertise an unenforced kernel bound.
+	taskJobCgroup := false
+	if eff, ok := s.Sched.EffectiveRunnerChecked(ctx, ri); ok {
+		taskJobCgroup = eff.JobCgroup
+	}
+	task := Task{Job: taskJob, LeaseToken: rawToken, LeaseGeneration: j.LeaseGeneration, LeaseExpiresAt: exp, JobCgroup: taskJobCgroup}
 	if j.Environment != "" {
 		// The lease already committed; a failed deployment insert is
 		// surfaced (logged) here, never mirrored as a started deployment.
@@ -6376,6 +6465,9 @@ func cloneStrings(in []string) []string {
 func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	if s.DB != nil {
+		// Pool/leadership gauges are sampled at scrape time from the store
+		// when it exposes the optional dbPoolStatsStore contract.
+		s.refreshDBPoolMetrics()
 		s.metricsDB(w, r)
 	} else {
 		s.metricsMemory(w, r)
@@ -6830,6 +6922,64 @@ func (s *Server) reconcileResourceLedger(ctx context.Context, rs storage.Resourc
 // surfaces that error first; this tick then demotes immediately and skips the
 // rest of the leader-only work instead of logging a stale leader's failures
 // every tick.
+// Queued-boost promotion cadence: the aged scheduling key (priority +
+// queue_boost) gains one point per 10-minute wait, so promoting more often
+// than that would only rewrite a column no scheduling decision can see yet.
+// The sweep itself stays bounded by QueuedBoostPromoteBatch and idempotent.
+const (
+	queuedBoostPromoteInterval = time.Minute
+	queuedBoostPromoteBatch    = 20000
+	// queuedBoostPromoteMaxBatchesPerTick bounds one maintenance tick: at
+	// steady state a queue of Q waiting jobs crosses an aging boundary at
+	// roughly Q per 10 minutes, so 5 batches/minute (100k promotions/minute)
+	// keeps materialized boosts current up to a million-job backlog while
+	// never letting the sweep run unbounded inside Maintain.
+	queuedBoostPromoteMaxBatchesPerTick = 5
+)
+
+// maybePromoteQueuedBoosts runs the materialized queued-boost sweep on the DB
+// leader at most once per queuedBoostPromoteInterval, with a bounded batch,
+// and records kiwi_scheduler_boost_promotions_total. Stores without stored
+// boosts (fs/memory mode) do not implement storage.QueuedBoostPromoter, so
+// this is a no-op there. The sweep is absolute and idempotent (any replica may
+// run it), so no coordination beyond the interval gate is needed.
+func (s *Server) maybePromoteQueuedBoosts(ctx context.Context, now time.Time) {
+	if s.DB == nil {
+		return
+	}
+	promoter, ok := s.DB.(storage.QueuedBoostPromoter)
+	if !ok {
+		return
+	}
+	s.boostPromoteMu.Lock()
+	if !s.lastBoostPromote.IsZero() && now.Sub(s.lastBoostPromote) < queuedBoostPromoteInterval {
+		s.boostPromoteMu.Unlock()
+		return
+	}
+	s.lastBoostPromote = now
+	s.boostPromoteMu.Unlock()
+	// Drain in bounded batches so a large backlog of due promotions cannot
+	// either stall one maintenance tick or fall arbitrarily behind: each
+	// call is a bounded UPDATE and the loop stops at the per-tick ceiling
+	// (the next tick, one minute later, continues where this one stopped).
+	var promoted int64
+	for i := 0; i < queuedBoostPromoteMaxBatchesPerTick; i++ {
+		n, err := promoter.PromoteQueuedJobBoosts(ctx, now, queuedBoostPromoteBatch)
+		if err != nil {
+			s.logError("queued boost promotion", "error", err.Error())
+			break
+		}
+		promoted += n
+		if n < int64(queuedBoostPromoteBatch) {
+			break
+		}
+	}
+	if promoted > 0 {
+		s.metricAdd("kiwi_scheduler_boost_promotions_total", float64(promoted), nil)
+		s.logInfo("queued boosts promoted", "count", promoted)
+	}
+}
+
 func (s *Server) maintainDB(ctx context.Context, now time.Time) {
 	if !s.leader {
 		if !s.Sched.IsLeader(ctx) {
@@ -6874,6 +7024,9 @@ func (s *Server) maintainDB(ctx context.Context, now time.Time) {
 		if err := s.reloadSchedulesFromStore(ctx); err != nil {
 			s.logError("post-promotion schedule reload", "error", err.Error())
 		}
+		// The promotion bootstrap is the newest leader's first chance to
+		// refresh the materialized scheduling key.
+		s.maybePromoteQueuedBoosts(ctx, now)
 		return
 	}
 	if !s.Sched.IsLeader(ctx) {
@@ -6898,6 +7051,7 @@ func (s *Server) maintainDB(ctx context.Context, now time.Time) {
 		}
 	}
 	s.recoverDownstreamReservations(ctx, now)
+	s.maybePromoteQueuedBoosts(ctx, now)
 	s.flushOutbox(ctx)
 	s.GC(ctx, now)
 	s.maybeRunCASGC(ctx, now)

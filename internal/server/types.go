@@ -86,6 +86,15 @@ type Task struct {
 	LeaseToken      string    `json:"lease_token"`
 	LeaseGeneration int64     `json:"lease_generation"`
 	LeaseExpiresAt  time.Time `json:"lease_expires_at"`
+	// JobCgroup advertises that the leased runner's effective profile can
+	// establish a job-scoped parent cgroup (model.CapabilityJobCgroup). The
+	// scheduler reserved only the job's own request for this lease; the
+	// runner's executor must establish the shared cgroup and fails the job
+	// closed when it cannot (executor.Options.RequireJobCgroup). Additive:
+	// an older runner ignores the field and keeps the per-container
+	// envelope enforcement, while the conservative default (false) keeps
+	// the historical union reservation.
+	JobCgroup bool `json:"job_cgroup,omitempty"`
 }
 
 // RunnerInfo carries the registration fields validated server-side by

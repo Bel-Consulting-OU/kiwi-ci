@@ -56,7 +56,7 @@ func (s *PostgresStore) RevokeRunnerLeases(ctx context.Context, runnerID, reason
 	if err := ValidateRunnerID(runnerID); err != nil {
 		return nil, err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return nil, err
 	}

@@ -43,13 +43,25 @@ func TestServiceNetworkNameLongCommonPrefixDoesNotCollide(t *testing.T) {
 	}
 }
 
-func TestServiceNetworkNameDeterministic(t *testing.T) {
+// TestServiceNetworkNameUniquePerAttempt pins the ownership fix: the network
+// name carries a per-attempt monotonic suffix, so two attempts for the same
+// run/job never share a physical network (a same-identity network created by
+// a different attempt/owner can therefore never be addressed by this
+// attempt's cleanup).
+func TestServiceNetworkNameUniquePerAttempt(t *testing.T) {
 	runID := strings.Repeat("x", 300)
 	jobID := strings.Repeat("y", 300)
-	want := serviceNetworkName(runID, jobID)
-	for i := 0; i < 8; i++ {
-		if got := serviceNetworkName(runID, jobID); got != want {
-			t.Fatalf("call %d = %q, want the deterministic %q", i, got, want)
+	first := serviceNetworkName(runID, jobID)
+	second := serviceNetworkName(runID, jobID)
+	if first == second {
+		t.Fatalf("two attempts shared the network name %q", first)
+	}
+	for _, got := range []string{first, second} {
+		if !strings.HasPrefix(got, "kiwi-net-") {
+			t.Fatalf("network name %q lost the kiwi-net- prefix", got)
+		}
+		if len(got) > maxServiceNetworkNameLen {
+			t.Fatalf("network name %q is %d chars, exceeds %d", got, len(got), maxServiceNetworkNameLen)
 		}
 	}
 }
@@ -71,12 +83,63 @@ func TestServiceNetworkNameWithinDockerLimit(t *testing.T) {
 	}
 }
 
-func TestServiceNetworkNameNormalShortIdentityUnchanged(t *testing.T) {
-	if got := serviceNetworkName("run-1", "job-1"); got != "kiwi-net-run-1-job-1" {
+// TestServiceNetworkNameShortIdentityKeepsComponents: a short identity keeps
+// its (sanitized) run/job components under the kiwi-net- prefix, with only the
+// trailing per-attempt suffix varying between calls.
+func TestServiceNetworkNameShortIdentityKeepsComponents(t *testing.T) {
+	if got := serviceNetworkName("run-1", "job-1"); !strings.HasPrefix(got, "kiwi-net-run-1-job-1-") {
 		t.Fatalf("short identity changed: %q", got)
 	}
-	if got := serviceNetworkName("Run 1", "Job/1"); got != "kiwi-net-run-1-job-1" {
+	got := serviceNetworkName("Run 1", "Job/1")
+	if !strings.HasPrefix(got, "kiwi-net-run-1-job-1-") {
 		t.Fatalf("sanitization changed for short identities: %q", got)
+	}
+	if strings.ContainsAny(got, " /") {
+		t.Fatalf("sanitized network name still carries unsafe characters: %q", got)
+	}
+}
+
+// TestServicePhysicalNamesUniqueAcrossAttemptsAndBounded is the bounded
+// uniqueness proof for both generated service names: very long run/job IDs
+// still produce prefixed, docker-bounded names, and two calls for the same
+// identity differ because the full identity (suffix included) feeds the
+// boundedNormalizedName hash.
+func TestServicePhysicalNamesUniqueAcrossAttemptsAndBounded(t *testing.T) {
+	long := strings.Repeat("a", 400)
+	job := strings.Repeat("b", 400)
+	containers := []string{serviceContainerName(long, job, 0), serviceContainerName(long, job, 0)}
+	networks := []string{serviceNetworkName(long, job), serviceNetworkName(long, job)}
+	if containers[0] == containers[1] {
+		t.Fatalf("two attempts shared container name %q", containers[0])
+	}
+	if networks[0] == networks[1] {
+		t.Fatalf("two attempts shared network name %q", networks[0])
+	}
+	for _, got := range containers {
+		if !strings.HasPrefix(got, "kiwi-svc-") || len(got) > maxServiceContainerNameLen {
+			t.Fatalf("bounded container name = %q (%d chars)", got, len(got))
+		}
+	}
+	for _, got := range networks {
+		if !strings.HasPrefix(got, "kiwi-net-") || len(got) > maxServiceNetworkNameLen {
+			t.Fatalf("bounded network name = %q (%d chars)", got, len(got))
+		}
+	}
+	// Distinct identities never collide, on either axis.
+	if serviceContainerName(long, job, 1) == containers[0] {
+		t.Fatal("distinct service indexes collided")
+	}
+	if serviceContainerName(long+"z", job, 0) == containers[0] {
+		t.Fatal("distinct long run IDs collided")
+	}
+	if serviceContainerName(long, job+"z", 0) == containers[0] {
+		t.Fatal("distinct long job IDs collided")
+	}
+	if serviceNetworkName(long+"z", job) == networks[0] {
+		t.Fatal("distinct long run IDs collided on the network axis")
+	}
+	if serviceNetworkName(long, job+"z") == networks[0] {
+		t.Fatal("distinct long job IDs collided on the network axis")
 	}
 }
 

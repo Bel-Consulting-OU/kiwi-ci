@@ -304,7 +304,7 @@ func (s *PostgresStore) PutCacheManifestForLease(ctx context.Context, jobID, run
 	if len(rec.BlobSHA256) != 64 {
 		return fmt.Errorf("storage: invalid cache manifest blob digest")
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return err
 	}
@@ -361,7 +361,7 @@ func (s *PostgresStore) InsertSnapshotForLease(ctx context.Context, jobID, runne
 	if err := ValidateRunID(rec.RunID); err != nil {
 		return err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return err
 	}
@@ -417,7 +417,7 @@ func (s *PostgresStore) InsertArtifactOnceForLease(ctx context.Context, jobID, r
 	if err := ValidateRunID(a.RunID); err != nil {
 		return model.ArtifactRecord{}, false, err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return model.ArtifactRecord{}, false, err
 	}

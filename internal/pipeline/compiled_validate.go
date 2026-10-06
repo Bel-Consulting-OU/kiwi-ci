@@ -221,6 +221,9 @@ func ValidateCompiledJob(cj CompiledJob) error {
 		if err := checkRelPath(fmt.Sprintf("%s cache %d hash_files", where, i), j.Cache[i].HashFiles...); err != nil {
 			return err
 		}
+		if err := checkHashFilesGlob(fmt.Sprintf("%s cache %d", where, i), j.Cache[i].HashFiles); err != nil {
+			return err
+		}
 	}
 	seenArtifacts := map[string]bool{}
 	for i := range j.Artifacts {

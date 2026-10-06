@@ -29,22 +29,26 @@ case "$sub" in
     exit "${FAKE_DOCKER_INFO_EXIT:-0}";;
   run)
     if [ -n "$FAKE_DOCKER_RUN_FAIL" ]; then echo "run failed"; exit 1; fi
+    name=""
+    prev=""
+    for a in "$@"; do
+      if [ "$prev" = "--name" ]; then name="$a"; fi
+      prev="$a"
+    done
     if [ -n "$FAKE_DOCKER_RUN_INIT_EPERM" ]; then
       case " $* " in
         *" --init "*) 
           if [ ! -e "$FAKE_DOCKER_RUN_INIT_EPERM_MARKER" ]; then
             touch "$FAKE_DOCKER_RUN_INIT_EPERM_MARKER"
+            if [ -n "$FAKE_DOCKER_RUN_INIT_EPERM_CREATE" ] && [ -n "$name" ] && [ -n "$FAKE_DOCKER_STATE" ]; then
+              mkdir -p "$FAKE_DOCKER_STATE/$name"
+            fi
             echo 'exec /sbin/docker-init: operation not permitted' >&2
             exit 255
           fi;;
       esac
     fi
     if [ -n "$FAKE_DOCKER_RUN_CREATE_THEN_FAIL" ]; then
-      name=""
-      while [ $# -gt 0 ]; do
-        if [ "$1" = "--name" ]; then shift; name="$1"; fi
-        shift
-      done
       if [ -n "$name" ]; then
         if [ -n "$FAKE_DOCKER_STATE" ] && [ -e "$FAKE_DOCKER_STATE/$name" ]; then
           echo "container $name already exists" >&2
@@ -54,6 +58,10 @@ case "$sub" in
         echo "create happened but run failed" >&2
         exit 1
       fi
+    fi
+    if [ -n "$FAKE_DOCKER_STATE" ] && [ -n "$name" ] && [ -e "$FAKE_DOCKER_STATE/$name" ]; then
+      echo "container $name already exists" >&2
+      exit 1
     fi
     echo "fake-container-$$"
     exit 0;;
@@ -118,14 +126,14 @@ case "$sub" in
       ls) printf '%s\n' "$FAKE_DOCKER_NET_LS";;
       rm)
         name="$2"
-        if [ -n "$FAKE_DOCKER_STATE" ] && [ -n "$name" ]; then rm -rf "$FAKE_DOCKER_STATE/$name"; fi
+        if [ "${FAKE_DOCKER_NET_RM_EXIT:-0}" = "0" ] && [ -n "$FAKE_DOCKER_STATE" ] && [ -n "$name" ]; then rm -rf "$FAKE_DOCKER_STATE/$name"; fi
         if [ -n "$FAKE_DOCKER_NET_RM_MSG" ]; then echo "$FAKE_DOCKER_NET_RM_MSG" >&2; fi
         exit "${FAKE_DOCKER_NET_RM_EXIT:-0}";;
     esac;;
   rm)
     name="$1"
     if [ "$name" = "-f" ] && [ -n "$2" ]; then name="$2"; fi
-    if [ -n "$FAKE_DOCKER_STATE" ] && [ -n "$name" ]; then rm -rf "$FAKE_DOCKER_STATE/$name"; fi
+    if [ "${FAKE_DOCKER_RM_EXIT:-0}" = "0" ] && [ -n "$FAKE_DOCKER_STATE" ] && [ -n "$name" ]; then rm -rf "$FAKE_DOCKER_STATE/$name"; fi
     if [ -n "$FAKE_DOCKER_RM_MSG" ]; then echo "$FAKE_DOCKER_RM_MSG" >&2; fi
     exit "${FAKE_DOCKER_RM_EXIT:-0}";;
 esac
@@ -546,11 +554,15 @@ func TestServiceNetworkAndNameHelpers(t *testing.T) {
 		t.Fatalf("isolated args = %v", got)
 	}
 	// The physical name is ALWAYS the unique kiwi-svc-<run>-<job>-<index>
-	// form, even when the service declares an alias: aliases are attached as
-	// network aliases, never as docker container names.
-	got := serviceContainerName("r", "j", 0)
-	if got != "kiwi-svc-r-j-1" {
-		t.Fatalf("default name = %q", got)
+	// form (plus a per-attempt suffix), even when the service declares an
+	// alias: aliases are attached as network aliases, never as docker
+	// container names.
+	first := serviceContainerName("r", "j", 0)
+	if !strings.HasPrefix(first, "kiwi-svc-r-j-1-") {
+		t.Fatalf("default name = %q, want the kiwi-svc-r-j-1- prefix", first)
+	}
+	if again := serviceContainerName("r", "j", 0); again == first {
+		t.Fatalf("two attempts shared the physical name %q", first)
 	}
 	if got := serviceContainerName("r", "j", 0); strings.Contains(got, "db") {
 		t.Fatalf("alias leaked into the physical name: %q", got)

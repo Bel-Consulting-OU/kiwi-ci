@@ -144,7 +144,7 @@ func (s *PostgresStore) CreateClusterKey(ctx context.Context, kind string, data 
 	if err := s.requireClusterKeyPool(); err != nil {
 		return nil, false, err
 	}
-	tag, err := s.pool.Exec(ctx,
+	tag, err := s.execSchemaFenced(ctx,
 		`INSERT INTO cluster_keys (kind, data) VALUES ($1, $2) ON CONFLICT (kind) DO NOTHING`,
 		kind, data)
 	if err != nil {
@@ -174,7 +174,7 @@ func (s *PostgresStore) PutClusterKey(ctx context.Context, kind string, data []b
 	if err := s.requireClusterKeyPool(); err != nil {
 		return err
 	}
-	tag, err := s.pool.Exec(ctx, `
+	tag, err := s.execSchemaFenced(ctx, `
 		INSERT INTO cluster_keys (kind, data) VALUES ($1, $2)
 		ON CONFLICT (kind) DO UPDATE
 		SET data = EXCLUDED.data, version = cluster_keys.version + 1, updated_at = now()`,

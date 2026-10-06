@@ -218,7 +218,7 @@ func TestRunJobServicesShareJobCgroupParent(t *testing.T) {
 		return JobCgroupStatus{Enabled: true, Parent: "/kiwi-job-test-1", Detail: "stub job cgroup"}, func() error {
 			cleaned++
 			log := readFakeLog(t, "FAKE_DOCKER_LOG")
-			if strings.Contains(log, "rm -f kiwi-job-") && strings.Contains(log, "rm -f "+serviceContainerName("r", "build", 0)) {
+			if strings.Contains(log, "rm -f kiwi-job-") && strings.Contains(log, "rm -f kiwi-svc-r-build-1-") {
 				cleanedAfterRemoval = true
 			}
 			return nil
@@ -308,6 +308,46 @@ func TestRunJobServicesWithoutJobCgroupReportsAggregate(t *testing.T) {
 	}
 	if strings.Contains(readFakeLog(t, "FAKE_DOCKER_LOG"), "--cgroup-parent") {
 		t.Fatalf("--cgroup-parent passed without a job cgroup:\n%s", readFakeLog(t, "FAKE_DOCKER_LOG"))
+	}
+}
+
+// TestRunJobRequireJobCgroupFailsClosedWhenUnavailable: when the runner
+// advertised the job-scoped cgroup capability (the control plane reserved
+// only the job's own request under it), a platform that cannot provide the
+// parent cgroup must FAIL the job with an infra error BEFORE any service or
+// main container starts — never fall back to per-container caps.
+func TestRunJobRequireJobCgroupFailsClosedWhenUnavailable(t *testing.T) {
+	installFakeBins(t)
+	ws := t.TempDir()
+	t.Setenv("FAKE_WS", ws)
+	setFakeWS(t, ws)
+	calls, cleanups := stubJobCgroup(t, JobCgroupStatus{Detail: "no delegated cgroup here"})
+
+	sink := &covSink{}
+	services := []pipeline.Service{{Name: "db", Image: "postgres:16"}}
+	spec := &pipeline.Spec{Version: 1, Jobs: map[string]pipeline.Job{
+		"build": {Runtime: "container", Image: "alpine:3.19", Services: services, Steps: []pipeline.Step{{Run: "echo hi"}}},
+	}}
+	j := pipeline.CompiledJob{ID: "build", BaseID: "build", Job: pipeline.Job{
+		Runtime:   "container",
+		Image:     "alpine:3.19",
+		Resources: pipeline.Resources{CPU: 2, Memory: 4 << 30, PIDs: 512},
+		Services:  services,
+		Steps:     []pipeline.Step{{Run: "echo hi"}},
+	}}
+	ex := &Executor{Opt: Options{Workspace: ws, RunID: "r", Logs: sink, RequireJobCgroup: true}, Masker: &secrets.Masker{}}
+	res := ex.runJob(context.Background(), spec, j, "success", nil)
+	if res.Status != "failure" {
+		t.Fatalf("runJob = %q / %q, want a fail-closed failure", res.Status, res.Error)
+	}
+	if !strings.HasPrefix(res.Error, ErrorInfra+": ") || !strings.Contains(res.Error, "job-scoped cgroup required") {
+		t.Fatalf("runJob error = %q, want an %s error naming the missing job cgroup", res.Error, ErrorInfra)
+	}
+	if *calls != 1 || *cleanups != 0 {
+		t.Fatalf("job cgroup setup/cleanup = (%d, %d), want (1, 0)", *calls, *cleanups)
+	}
+	if runs := runLines(readFakeLog(t, "FAKE_DOCKER_LOG")); len(runs) != 0 {
+		t.Fatalf("require_job_cgroup ran containers without the required cgroup: %v", runs)
 	}
 }
 
