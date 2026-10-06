@@ -97,11 +97,28 @@ func (s *DBClusterKeyStore) seedBytes(kind string) ([]byte, bool, error) {
 // migrated into the table (create-if-absent) first, mirroring the filesystem
 // store's legacy-file migration.
 func (s *DBClusterKeyStore) Lookup(kind string) ([]byte, bool, error) {
+	ctx, cancel := s.opCtx()
+	defer cancel()
+	return s.lookupWithContext(ctx, kind)
+}
+
+// LookupContext is the caller-cancellation-aware form: a JWKS/refresh
+// request that is abandoned aborts the underlying read immediately instead
+// of leaving its goroutine waiting for the store's own 10-second bound. The
+// caller's deadline is honored but never EXTENDED past that bound.
+func (s *DBClusterKeyStore) LookupContext(ctx context.Context, kind string) ([]byte, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, clusterKeyStoreOpTimeout)
+	defer cancel()
+	return s.lookupWithContext(ctx, kind)
+}
+
+func (s *DBClusterKeyStore) lookupWithContext(ctx context.Context, kind string) ([]byte, bool, error) {
 	if s.Blobs == nil {
 		return nil, false, errors.New("cluster keys: database-backed store requires a blob store")
 	}
-	ctx, cancel := s.opCtx()
-	defer cancel()
 	b, ok, err := s.Blobs.GetClusterKey(ctx, kind)
 	if err != nil {
 		return nil, false, err

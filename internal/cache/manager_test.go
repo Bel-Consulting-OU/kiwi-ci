@@ -1284,3 +1284,52 @@ func TestReclamationEdgeBranches(t *testing.T) {
 		t.Fatalf("missing legacy root = %d, %d, %v", files, bytes, err)
 	}
 }
+
+// Cache startup classification failures: an unreadable Kiwi temp must fail
+// manager construction, never produce a "healthy" manager with unaccounted
+// occupancy.
+
+func TestCacheManagerStartupReadDirFailureFailsClosed(t *testing.T) {
+	orig := readCacheDir
+	readCacheDir = func(string) ([]os.DirEntry, error) { return nil, errors.New("readdir denied") }
+	t.Cleanup(func() { readCacheDir = orig })
+	if _, err := NewManager(t.TempDir(), RetentionPolicy{MaxBytes: 1 << 20}); err == nil {
+		t.Fatal("manager constructed despite a readdir failure")
+	}
+}
+
+func TestCacheManagerStartupStatFailureFailsClosed(t *testing.T) {
+	root := t.TempDir()
+	// Plant an owned-looking temp so classification runs.
+	if err := os.WriteFile(filepath.Join(root, ".k.tar.gz-123.tmp"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	orig := cacheEntryInfo
+	cacheEntryInfo = func(os.DirEntry) (os.FileInfo, error) { return nil, errors.New("stat denied") }
+	t.Cleanup(func() { cacheEntryInfo = orig })
+	if _, err := NewManager(root, RetentionPolicy{MaxBytes: 1 << 20}); err == nil {
+		t.Fatal("manager constructed despite an unmeasurable cache temp")
+	}
+}
+
+// TestUnknownAbandonedTempCannotDisappearFromAccounting: with healthy
+// classification the temp is measured (removed here) and the manager is
+// constructed with accounting intact.
+func TestUnknownAbandonedTempCannotDisappearFromAccounting(t *testing.T) {
+	root := t.TempDir()
+	temp := filepath.Join(root, ".k.tar.gz-123.tmp")
+	if err := os.WriteFile(temp, []byte("bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m, err := NewManager(root, RetentionPolicy{MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	defer m.Close()
+	if _, err := os.Stat(temp); !os.IsNotExist(err) {
+		t.Fatalf("reconciled temp still present: %v", err)
+	}
+	if m.inflight != 0 || m.inflightCount != 0 {
+		t.Fatalf("healthy reconciliation left accounting residue: %d/%d", m.inflight, m.inflightCount)
+	}
+}

@@ -152,20 +152,40 @@ type idleGuard struct {
 	timer *time.Timer
 	idle  time.Duration
 	done  bool
+	// last is the most recent progress instant. Timer.Reset cannot revoke a
+	// callback that has already been dispatched, so the callback re-checks
+	// this under the lock and re-arms for the remainder instead of
+	// cancelling a transfer that just made progress.
+	last time.Time
 }
 
 // newIdleGuard arms the guard immediately (the pre-first-byte/pre-first-read
 // gap is exactly the window it must cover) and returns it. release() disarms
 // the still-pending window on normal handler exit without cancelling.
 func newIdleGuard(cancel context.CancelFunc, idle time.Duration) *idleGuard {
-	g := &idleGuard{idle: idle}
-	g.timer = time.AfterFunc(idle, func() {
-		g.mu.Lock()
-		g.done = true
-		g.mu.Unlock()
-		cancel()
-	})
+	g := &idleGuard{idle: idle, last: time.Now()}
+	g.timer = time.AfterFunc(idle, func() { g.onIdle(cancel) })
 	return g
+}
+
+// onIdle is the timer callback (a method so tests can drive the stale-callback
+// interleaving deterministically).
+func (g *idleGuard) onIdle(cancel context.CancelFunc) {
+	g.mu.Lock()
+	if g.done {
+		g.mu.Unlock()
+		return
+	}
+	if left := g.idle - time.Since(g.last); left > 0 {
+		// A stale callback raced real progress: re-arm for the rest of the
+		// window instead of cancelling an active transfer.
+		g.timer.Reset(left)
+		g.mu.Unlock()
+		return
+	}
+	g.done = true
+	g.mu.Unlock()
+	cancel()
 }
 
 // reset re-arms the window. A guard that already fired stays fired: the
@@ -176,6 +196,7 @@ func (g *idleGuard) reset() {
 	if g.done {
 		return
 	}
+	g.last = time.Now()
 	g.timer.Reset(g.idle)
 }
 

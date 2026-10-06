@@ -509,7 +509,7 @@ func (s *PostgresStore) InsertCompiledRun(ctx context.Context, req InsertCompile
 	if err := ValidateRunID(req.Run.ID); err != nil {
 		return err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return err
 	}
@@ -1793,14 +1793,38 @@ func (s *PostgresStore) HeartbeatLease(ctx context.Context, jobID string, runner
 	// bounded by a horizon (see legacyHeartbeatHorizonSQL): a direct caller
 	// can no longer park a lease in the year 2100, and DB-mode production
 	// uses HeartbeatLeaseWithTTL instead.
-	ct, err := s.pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=$4 WHERE id=$1 AND status='running' AND lease_runner_id=$2 AND lease_generation=$3 AND lease_expires_at IS NOT NULL AND lease_expires_at > clock_timestamp() AND $4::timestamptz <= clock_timestamp() + $5::interval`, jobID, runnerID, generation, expiresAt, legacyHeartbeatHorizonSQL)
+	query := `UPDATE jobs SET lease_expires_at=$4 WHERE id=$1 AND status='running' AND lease_runner_id=$2 AND lease_generation=$3 AND lease_expires_at IS NOT NULL AND lease_expires_at > clock_timestamp() AND $4::timestamptz <= clock_timestamp() + $5::interval`
+	args := []any{jobID, runnerID, generation, expiresAt, legacyHeartbeatHorizonSQL}
+	// Single-statement compatibility guard: the floor read and the mutation
+	// share ONE statement snapshot, so an already-committed incompatible
+	// migration refuses the renewal without a separate lock round trip (the
+	// heartbeat is far too hot to serialize behind the advisory lock).
+	if s.schemaFence && s.binarySchemaVersion > 0 {
+		query += ` AND NOT EXISTS (SELECT 1 FROM schema_migrations WHERE compatible_from > $6)`
+		args = append(args, s.binarySchemaVersion)
+	}
+	ct, err := s.pool.Exec(ctx, query, args...)
 	if err != nil {
 		return err
 	}
 	if ct.RowsAffected() > 0 {
 		return nil
 	}
+	if s.schemaFloorExceeded(ctx) {
+		return fmt.Errorf("%w: heartbeat refused", ErrSchemaIncompatible)
+	}
 	return s.classifyHeartbeatMiss(ctx, jobID, generation)
+}
+
+// schemaFloorExceeded reports whether the database's committed floor now
+// demands a newer binary than this store's (used to classify a zero-row
+// guarded write).
+func (s *PostgresStore) schemaFloorExceeded(ctx context.Context) bool {
+	if !s.schemaFence || s.binarySchemaVersion == 0 {
+		return false
+	}
+	floor, err := s.SchemaCompatibilityFloor(ctx)
+	return err == nil && floor > s.binarySchemaVersion
 }
 
 // LeaseLive reports whether the job currently holds a live lease under
@@ -1843,17 +1867,25 @@ func (s *PostgresStore) HeartbeatLeaseWithTTL(ctx context.Context, jobID, runner
 	if ttl <= 0 {
 		return time.Time{}, fmt.Errorf("storage: lease heartbeat TTL must be positive")
 	}
-	var expires time.Time
-	err := s.pool.QueryRow(ctx, `UPDATE jobs SET lease_expires_at = clock_timestamp() + ($4::bigint * interval '1 microsecond')
+	query := `UPDATE jobs SET lease_expires_at = clock_timestamp() + ($4::bigint * interval '1 microsecond')
 		WHERE id=$1 AND status='running' AND lease_runner_id=$2 AND lease_generation=$3
-		  AND lease_expires_at IS NOT NULL AND lease_expires_at > clock_timestamp()
-		RETURNING lease_expires_at`,
-		jobID, runnerID, generation, ttl.Microseconds()).Scan(&expires)
+		  AND lease_expires_at IS NOT NULL AND lease_expires_at > clock_timestamp()`
+	args := []any{jobID, runnerID, generation, ttl.Microseconds()}
+	if s.schemaFence && s.binarySchemaVersion > 0 {
+		query += ` AND NOT EXISTS (SELECT 1 FROM schema_migrations WHERE compatible_from > $5)`
+		args = append(args, s.binarySchemaVersion)
+	}
+	query += ` RETURNING lease_expires_at`
+	var expires time.Time
+	err := s.pool.QueryRow(ctx, query, args...).Scan(&expires)
 	if err == nil {
 		return expires, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return time.Time{}, err
+	}
+	if s.schemaFloorExceeded(ctx) {
+		return time.Time{}, fmt.Errorf("%w: heartbeat refused", ErrSchemaIncompatible)
 	}
 	return time.Time{}, s.classifyHeartbeatMiss(ctx, jobID, generation)
 }

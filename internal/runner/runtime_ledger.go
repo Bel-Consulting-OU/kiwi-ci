@@ -80,7 +80,11 @@ func (r *Runner) ledgerAdd(entry runtimeLedgerEntry) (string, error) {
 		return "", fmt.Errorf("crash-recovery ledger: runner identity is empty")
 	}
 	entry.RunnerID = r.ID
-	entry.ID = newRunnerInstanceID()
+	entryID, err := newRunnerInstanceID()
+	if err != nil {
+		return "", err
+	}
+	entry.ID = entryID
 	entry.CreatedAt = time.Now().UTC()
 	b, err := json.Marshal(entry)
 	if err != nil {

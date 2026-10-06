@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -478,5 +479,98 @@ func TestWorkspaceRemoveFailureStopsNewLeases(t *testing.T) {
 	entries, _ := filepath.Glob(filepath.Join(r.runtimeLedgerDir(), "*.json"))
 	if len(entries) != 1 {
 		t.Fatalf("ledger entries = %d, want 1", len(entries))
+	}
+}
+
+// TestRunBackgroundDrainTimeoutPoisonsRunner: a worker that ignores
+// cancellation past the drain grace means Kiwi can no longer prove the old
+// execution authority is gone; the Runner instance must be poisoned.
+func TestRunBackgroundDrainTimeoutPoisonsRunner(t *testing.T) {
+	var nextCalls, registerCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v1/runners/register":
+			registerCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"runner-1"}`))
+		case strings.HasSuffix(r.URL.Path, "/next"):
+			nextCalls.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	origGrace := backgroundDrainGrace
+	backgroundDrainGrace = 200 * time.Millisecond
+	t.Cleanup(func() { backgroundDrainGrace = origGrace })
+	origHook := runBackgroundTestHook
+	runBackgroundTestHook = func(wg *sync.WaitGroup) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {} // ignores cancellation entirely
+		}()
+	}
+	t.Cleanup(func() { runBackgroundTestHook = origHook })
+
+	r := &Runner{ID: "runner-1", Cfg: Config{Server: ts.URL, Poll: time.Millisecond, Concurrency: 1,
+		WorkDir: t.TempDir(), GCInterval: time.Hour, PrewarmInterval: time.Hour, IdentityDir: t.TempDir()},
+		Client: ts.Client(), Metrics: NewMetrics()}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = r.Run(ctx)
+	if !r.lifecyclePoisoned.Load() {
+		t.Fatal("runner not poisoned after the background drain grace expired")
+	}
+	// A SECOND Run on the same instance must be refused before it can
+	// register, reconcile, or take identity ownership.
+	if err := r.Run(context.Background()); !errors.Is(err, ErrRunnerRequiresProcessRestart) {
+		t.Fatalf("second Run = %v, want ErrRunnerRequiresProcessRestart", err)
+	}
+	if registerCalls.Load() != 1 {
+		t.Fatalf("register calls = %d, want 1 (the refused second Run must not register)", registerCalls.Load())
+	}
+	// A FRESH Runner (a restarted process) with its own identity still works.
+	fresh := &Runner{ID: "runner-2", Cfg: Config{Server: ts.URL, Poll: time.Millisecond, Concurrency: 1,
+		WorkDir: t.TempDir(), GCInterval: time.Hour, PrewarmInterval: time.Hour, IdentityDir: t.TempDir()},
+		Client: ts.Client(), Metrics: NewMetrics()}
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel2()
+	if err := fresh.Run(ctx2); err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		t.Fatalf("fresh process Run = %v", err)
+	}
+}
+
+// TestRunnerRefusesStartupWhenInstanceEntropyFails: the incarnation ID is an
+// ownership namespace, so missing secure randomness must refuse startup
+// before registration/reconciliation instead of degrading to a timestamp.
+func TestRunnerRefusesStartupWhenInstanceEntropyFails(t *testing.T) {
+	var registerCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/register") {
+			registerCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"runner-1"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	origRand := randReader
+	randReader = failingReader{}
+	t.Cleanup(func() { randReader = origRand })
+
+	// r.ID preset so the failure is unambiguously the INSTANCE identity.
+	r := &Runner{ID: "runner-1", Cfg: Config{Server: ts.URL, Poll: time.Millisecond, Concurrency: 1,
+		WorkDir: t.TempDir(), GCInterval: time.Hour, PrewarmInterval: time.Hour, IdentityDir: t.TempDir()},
+		Client: ts.Client(), Metrics: NewMetrics()}
+	err := r.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "randomness") {
+		t.Fatalf("Run with failing entropy = %v, want an instance-identity refusal", err)
+	}
+	if registerCalls.Load() != 0 {
+		t.Fatalf("registration happened despite failed instance entropy (%d calls)", registerCalls.Load())
 	}
 }

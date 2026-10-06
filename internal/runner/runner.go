@@ -21,7 +21,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -99,6 +98,12 @@ const (
 // control plane cannot pin the runner slot. A var so tests can shrink it.
 var completionGrace = 30 * time.Second
 
+// ErrRunnerRequiresProcessRestart reports that a previous Run on this
+// Runner instance could not join all of its spawned work: the old execution
+// authority may still be alive, so no new incarnation may be started
+// in-process.
+var ErrRunnerRequiresProcessRestart = errors.New("runner requires a fresh process: a previous run could not join its background work")
+
 // ErrRunnerDisabledOrRevoked reports that the control plane has disabled
 // this runner or revoked its certificate: the runner must be re-enrolled
 // with fresh credentials and must not loop re-registering.
@@ -107,6 +112,10 @@ var ErrRunnerDisabledOrRevoked = errors.New("runner disabled or certificate revo
 // RunnerVersion is the software version reported at registration and can be
 // overridden at build time via -ldflags.
 var RunnerVersion = "dev"
+
+// runBackgroundTestHook, when set, spawns extra tracked background work in
+// Run: tests use it to model a worker that ignores cancellation.
+var runBackgroundTestHook func(*sync.WaitGroup)
 
 // backgroundDrainGrace bounds how long Run waits for work it spawned
 // (executes and maintenance passes) to finish after its context is cancelled
@@ -337,12 +346,18 @@ type Config struct {
 // newRunnerInstanceID returns a fresh process-incarnation identity used to
 // label runtime resources, so a restarted runner can distinguish its own
 // predecessor's containers from another live runner's.
-func newRunnerInstanceID() string {
+// newRunnerInstanceID returns the 128-bit incarnation identity. The value is
+// an OWNERSHIP namespace (current incarnation vs reclaimable predecessor),
+// so secure randomness is mandatory: an entropy failure must refuse startup
+// instead of degrading to a timestamp a cloned process or a frozen clock
+// could collide with (which would make stale resources look current, or two
+// authorities produce resources that appear to belong to one incarnation).
+func newRunnerInstanceID() (string, error) {
 	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return strconv.FormatInt(time.Now().UnixNano(), 36)
+	if _, err := io.ReadFull(randReader, b[:]); err != nil {
+		return "", fmt.Errorf("runner instance identity: secure randomness unavailable: %w", err)
 	}
-	return hex.EncodeToString(b[:])
+	return hex.EncodeToString(b[:]), nil
 }
 
 type Runner struct {
@@ -370,8 +385,14 @@ type Runner struct {
 	// context is created after a clean reconciliation.
 	pollMu     sync.Mutex
 	pollCancel context.CancelFunc
-	Client     *http.Client
-	Metrics    *Metrics
+	// lifecyclePoisoned latches when a Run could not fully join its spawned
+	// work (the background drain grace expired). The old execution authority
+	// may still be alive and able to touch the identity, ledger, workspaces
+	// and control plane, so a second Run on this instance must be refused:
+	// only a fresh process may establish a new incarnation.
+	lifecyclePoisoned atomic.Bool
+	Client            *http.Client
+	Metrics           *Metrics
 	// StreamClient carries bulk transfers (artifact/cache/snapshot/dependency
 	// uploads and downloads). It deliberately has no total timeout: the
 	// transport bounds dial/TLS-handshake/response-header phases and each
@@ -438,6 +459,9 @@ type registerResponse struct {
 }
 
 func (r *Runner) Run(ctx context.Context) error {
+	if r.lifecyclePoisoned.Load() {
+		return ErrRunnerRequiresProcessRestart
+	}
 	if r.Cfg.Poll == 0 {
 		r.Cfg.Poll = 2 * time.Second
 	}
@@ -495,6 +519,17 @@ func (r *Runner) Run(ctx context.Context) error {
 			r.ID = id
 		}
 	}
+	// Incarnation identity belongs to THIS Run call, not the Runner struct:
+	// an in-process Run restart must get a fresh instance ID, otherwise
+	// leftover resources from the previous run would be classified as
+	// current and skipped by reconciliation. It is minted BEFORE the
+	// identity lock and registration: without a trustworthy incarnation
+	// namespace no ownership decision this process makes can be sound.
+	runInstanceID, instErr := newRunnerInstanceID()
+	if instErr != nil {
+		return instErr
+	}
+	r.instanceID = runInstanceID
 	// One stable runner identity may have at most ONE live process: without
 	// this, a copied/mounted identity directory could start a second process
 	// whose startup reconciliation (same runner ID, different instance ID)
@@ -597,6 +632,9 @@ func (r *Runner) Run(ctx context.Context) error {
 	// detached waiter goroutine lives until it finishes. The grace case is
 	// reported on stderr, never silent.
 	var background sync.WaitGroup
+	if runBackgroundTestHook != nil {
+		runBackgroundTestHook(&background)
+	}
 	waitBackground := func() bool {
 		finished := make(chan struct{})
 		go func() { background.Wait(); close(finished) }()
@@ -604,7 +642,13 @@ func (r *Runner) Run(ctx context.Context) error {
 		case <-finished:
 			return true
 		case <-time.After(backgroundDrainGrace):
-			fmt.Fprintf(os.Stderr, "kiwi runner %s: background work still running after %s; exiting anyway (its context is canceled)\n", r.ID, backgroundDrainGrace)
+			// The worker ignored cancellation past the grace: we have lost
+			// the ability to prove it is gone, so this Runner instance is
+			// terminally poisoned and may never start another incarnation
+			// in-process (the old authority could still be mutating state a
+			// fresh instance would treat as its own predecessor).
+			r.lifecyclePoisoned.Store(true)
+			fmt.Fprintf(os.Stderr, "kiwi runner %s: background work still running after %s; exiting anyway (its context is canceled); this runner instance is poisoned and requires a fresh process\n", r.ID, backgroundDrainGrace)
 			return false
 		}
 	}
@@ -632,12 +676,6 @@ func (r *Runner) Run(ctx context.Context) error {
 		defer background.Done()
 		_ = prewarmer.run(runCtx)
 	}()
-	// Incarnation identity belongs to THIS Run call, not the Runner struct: an
-	// in-process Run restart must get a fresh instance ID, otherwise leftover
-	// resources from the previous run would be classified as current and
-	// skipped by reconciliation.
-	runInstanceID := newRunnerInstanceID()
-	r.instanceID = runInstanceID
 	// Crash recovery BEFORE the first lease: a SIGKILLed predecessor leaves
 	// detached containers/services/networks/VMs behind (their cleanup does not
 	// fire on a dead client). Reconcile only resources carrying THIS stable

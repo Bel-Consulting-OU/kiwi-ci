@@ -111,9 +111,30 @@ func NewManager(root string, policy RetentionPolicy) (*Manager, error) {
 	// normal scan ignores, and no live writer can exist while we hold the
 	// lock. Undeletable files stay charged so the initial budget reflects
 	// physical reality instead of forgetting the bytes.
-	_, _, _ = m.ReclaimAbandonedTemps(context.Background())
+	// Startup reconciliation runs under exclusive ownership. A Kiwi temp
+	// that cannot even be CLASSIFIED/measured (readdir or stat failure) means
+	// the manager cannot uphold its core invariant (physical bytes plus
+	// reservations never exceed the budget), so construction fails closed
+	// instead of returning a healthy manager with unaccounted disk
+	// occupancy. A temp that merely cannot be DELETED is retained as charged
+	// pending debt and the manager still starts: the bytes are accounted and
+	// a retry removes them.
+	if _, _, rerr := m.ReclaimAbandonedTemps(context.Background()); rerr != nil {
+		var classifyErr *cacheTempClassifyError
+		if errors.As(rerr, &classifyErr) {
+			_ = m.lock.release()
+			return nil, fmt.Errorf("cache: startup reconciliation of %s: %w", root, rerr)
+		}
+	}
 	return m, nil
 }
+
+// cacheTempClassifyError marks an unable-to-classify/measure discovered temp
+// (as opposed to an undeletable one, which is charged pending debt).
+type cacheTempClassifyError struct{ err error }
+
+func (e *cacheTempClassifyError) Error() string { return e.err.Error() }
+func (e *cacheTempClassifyError) Unwrap() error { return e.err }
 
 // Close retries retained temp cleanup once and releases the namespace
 // ownership lock. Ownership must be held until every cache operation has
@@ -177,12 +198,14 @@ func (m *Manager) ReclaimAbandonedTemps(ctx context.Context) (int, int64, error)
 	if m.closed {
 		return 0, 0, ErrManagerClosed
 	}
-	entries, err := os.ReadDir(m.root)
+	entries, err := readCacheDir(m.root)
 	if os.IsNotExist(err) {
 		return 0, 0, nil
 	}
 	if err != nil {
-		return 0, 0, err
+		// Enumeration failure is a classification failure: nothing can be
+		// measured, so startup must fail closed.
+		return 0, 0, &cacheTempClassifyError{err: fmt.Errorf("enumerate cache temps: %w", err)}
 	}
 	var files int
 	var bytes int64
@@ -195,9 +218,17 @@ func (m *Manager) ReclaimAbandonedTemps(ctx context.Context) (int, int64, error)
 		if de.IsDir() || !isOwnedCacheTempName(name) {
 			continue
 		}
-		info, ierr := de.Info()
+		info, ierr := cacheEntryInfo(de)
 		if ierr != nil {
-			continue
+			// Cannot classify or measure a Kiwi-owned temp: that is
+			// unaccountable physical occupancy, not something to skip.
+			// Fail the scan immediately with a typed error so startup can
+			// distinguish it from undeletable-but-measured debt.
+			err := &cacheTempClassifyError{err: fmt.Errorf("classify cache temp %s: %w", name, ierr)}
+			if firstErr == nil {
+				firstErr = err
+			}
+			return files, bytes, firstErr
 		}
 		// Lstat semantics: a symlink reports the link itself, and we never
 		// follow or remove through it.
@@ -222,6 +253,12 @@ func (m *Manager) ReclaimAbandonedTemps(ctx context.Context) (int, int64, error)
 	}
 	return files, bytes, firstErr
 }
+
+// readCacheDir is the directory-enumeration seam (startup failure tests).
+var readCacheDir = os.ReadDir
+
+// cacheEntryInfo is the entry-measurement seam (startup failure tests).
+var cacheEntryInfo = func(de os.DirEntry) (os.FileInfo, error) { return de.Info() }
 
 // isOwnedCacheTempName recognizes the two Kiwi temp shapes: save temps
 // (.<key>.tar.gz-*.tmp) and remote-restore temps (.<key>.remote-*.tmp).

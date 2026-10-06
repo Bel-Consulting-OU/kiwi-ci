@@ -333,3 +333,83 @@ func TestPostgresIntegrationNonLeaseMutationFencedAgainstMigration(t *testing.T)
 		t.Fatalf("job status = %q, want running (the incompatible completion wrote nothing)", status)
 	}
 }
+
+// TestHeartbeatCannotCrossIncompatibleMigration: after a newer replica
+// commits an incompatible floor, both heartbeat paths refuse and the stored
+// expiry is untouched (the floor read and the mutation are one statement).
+func TestHeartbeatCannotCrossIncompatibleMigration(t *testing.T) {
+	st := pgITStore(t)
+	st.EnableSchemaFence()
+	ctx := context.Background()
+	maxV, err := migrations.MaxVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runnerID := pgITNewID(t)
+	if err := st.UpsertRunner(ctx, model.Runner{ID: runnerID, Name: runnerID, Capacity: 1,
+		ReportedCapabilities: []string{"native"}, Capabilities: []string{"native"}, CapabilitiesEnforced: true}); err != nil {
+		t.Fatalf("seed runner: %v", err)
+	}
+	runID, jobID := pgITNewID(t), pgITNewID(t)
+	pgITEnqueueOne(t, st, runID, jobID, pgITRepo)
+	if _, err := st.AcquireLeaseAtomic(ctx, LeaseClaim{JobID: jobID, RunnerID: runnerID, TokenHash: []byte("h"), Generation: 1,
+		Runtime: "native", ExpiresAt: time.Now().UTC().Add(time.Hour)}); err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+	var before time.Time
+	if err := st.pool.QueryRow(ctx, `SELECT lease_expires_at FROM jobs WHERE id=$1`, jobID).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	// A newer replica commits an incompatible floor.
+	if _, err := st.pool.Exec(ctx, `UPDATE schema_migrations SET compatible_from=$1 WHERE version=$2`, maxV+1, maxV); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.HeartbeatLease(ctx, jobID, runnerID, 1, time.Now().UTC().Add(2*time.Hour)); !errors.Is(err, ErrSchemaIncompatible) {
+		t.Fatalf("legacy heartbeat under an incompatible floor = %v, want ErrSchemaIncompatible", err)
+	}
+	if _, err := st.HeartbeatLeaseWithTTL(ctx, jobID, runnerID, 1, time.Hour); !errors.Is(err, ErrSchemaIncompatible) {
+		t.Fatalf("TTL heartbeat under an incompatible floor = %v, want ErrSchemaIncompatible", err)
+	}
+	var after time.Time
+	if err := st.pool.QueryRow(ctx, `SELECT lease_expires_at FROM jobs WHERE id=$1`, jobID).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if !after.Equal(before) {
+		t.Fatalf("heartbeat mutated the lease expiry across an incompatible migration: %v -> %v", before, after)
+	}
+}
+
+// TestInsertCompiledRunCannotCrossIncompatibleMigration: the compiled-run
+// enqueue transaction (the production enqueue path, also used by schedules
+// and internal enqueue) refuses and writes nothing once a newer replica has
+// committed an incompatible floor.
+func TestInsertCompiledRunCannotCrossIncompatibleMigration(t *testing.T) {
+	st := pgITStore(t)
+	st.EnableSchemaFence()
+	ctx := context.Background()
+	maxV, err := migrations.MaxVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.pool.Exec(ctx, `UPDATE schema_migrations SET compatible_from=$1 WHERE version=$2`, maxV+1, maxV); err != nil {
+		t.Fatal(err)
+	}
+	runID, jobID := pgITNewID(t), pgITNewID(t)
+	req := InsertCompiledRunRequest{
+		Run:  model.Run{ID: runID, Repo: pgITRepo, Status: model.StatusQueued, CreatedAt: time.Now().UTC()},
+		Jobs: map[string]model.Job{jobID: pgITJob(runID, jobID, pgITRepo)},
+	}
+	if err := st.InsertCompiledRun(ctx, req); !errors.Is(err, ErrSchemaIncompatible) {
+		t.Fatalf("enqueue under an incompatible floor = %v, want ErrSchemaIncompatible", err)
+	}
+	var runs, jobs bool
+	if err := st.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM runs WHERE id=$1)`, runID).Scan(&runs); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM jobs WHERE id=$1)`, jobID).Scan(&jobs); err != nil {
+		t.Fatal(err)
+	}
+	if runs || jobs {
+		t.Fatalf("incompatible enqueue wrote rows: run=%v job=%v", runs, jobs)
+	}
+}
