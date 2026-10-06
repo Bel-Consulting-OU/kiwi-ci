@@ -413,3 +413,79 @@ func TestInsertCompiledRunCannotCrossIncompatibleMigration(t *testing.T) {
 		t.Fatalf("incompatible enqueue wrote rows: run=%v job=%v", runs, jobs)
 	}
 }
+
+// TestHeartbeatSchemaFenceSerializesAgainstMigration is the true
+// two-connection interleaving: a migration holds the exclusive schema lock
+// (uncommitted floor change) while a heartbeat runs; the heartbeat must
+// BLOCK on the shared lock, and after the migration commits it must observe
+// the new floor and refuse without touching the lease.
+func TestHeartbeatSchemaFenceSerializesAgainstMigration(t *testing.T) {
+	st := pgITStore(t)
+	st.EnableSchemaFence()
+	ctx := context.Background()
+	maxV, err := migrations.MaxVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runnerID := pgITNewID(t)
+	if err := st.UpsertRunner(ctx, model.Runner{ID: runnerID, Name: runnerID, Capacity: 1,
+		ReportedCapabilities: []string{"native"}, Capabilities: []string{"native"}, CapabilitiesEnforced: true}); err != nil {
+		t.Fatalf("seed runner: %v", err)
+	}
+	runID, jobID := pgITNewID(t), pgITNewID(t)
+	pgITEnqueueOne(t, st, runID, jobID, pgITRepo)
+	if _, err := st.AcquireLeaseAtomic(ctx, LeaseClaim{JobID: jobID, RunnerID: runnerID, TokenHash: []byte("h"), Generation: 1,
+		Runtime: "native", ExpiresAt: time.Now().UTC().Add(time.Hour)}); err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+	var before time.Time
+	if err := st.pool.QueryRow(ctx, `SELECT lease_expires_at FROM jobs WHERE id=$1`, jobID).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := st.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	migTx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migTx.Rollback(ctx)
+	if _, err := migTx.Exec(ctx, `SELECT pg_advisory_xact_lock(`+schemaLockKeySQL+`)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := migTx.Exec(ctx, `UPDATE schema_migrations SET compatible_from=$1 WHERE version=$2`, maxV+1, maxV); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, herr := st.HeartbeatLeaseWithTTL(ctx, jobID, runnerID, 1, time.Hour)
+		done <- herr
+	}()
+	select {
+	case herr := <-done:
+		t.Fatalf("heartbeat did not serialize against the migration: %v", herr)
+	case <-time.After(1200 * time.Millisecond):
+	}
+	if err := migTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case herr := <-done:
+		if !errors.Is(herr, ErrSchemaIncompatible) {
+			t.Fatalf("heartbeat after the migration committed = %v, want ErrSchemaIncompatible", herr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("heartbeat never returned")
+	}
+	var after time.Time
+	if err := st.pool.QueryRow(ctx, `SELECT lease_expires_at FROM jobs WHERE id=$1`, jobID).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if !after.Equal(before) {
+		t.Fatalf("heartbeat committed despite the migration: %v -> %v", before, after)
+	}
+}

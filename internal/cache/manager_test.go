@@ -1333,3 +1333,47 @@ func TestUnknownAbandonedTempCannotDisappearFromAccounting(t *testing.T) {
 		t.Fatalf("healthy reconciliation left accounting residue: %d/%d", m.inflight, m.inflightCount)
 	}
 }
+
+// TestCacheManagerRollbackReleaseFailurePreservesRetry is the constructor
+// rollback case: a classification failure plus a failed lock release must
+// return BOTH errors and leave the ownership retryable, so a later
+// constructor can clean up instead of finding a stale same-PID lock.
+func TestCacheManagerRollbackReleaseFailurePreservesRetry(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, ".k.tar.gz-1.tmp"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	origInfo := cacheEntryInfo
+	cacheEntryInfo = func(os.DirEntry) (os.FileInfo, error) { return nil, errors.New("stat denied") }
+	t.Cleanup(func() { cacheEntryInfo = origInfo })
+
+	failures := 1
+	origRelease := releaseNamespaceLock
+	releaseNamespaceLock = func(l *namespaceLock) error {
+		if failures > 0 {
+			failures--
+			return errors.New("unlink denied")
+		}
+		return l.release()
+	}
+	t.Cleanup(func() { releaseNamespaceLock = origRelease })
+
+	_, err := NewManager(root, RetentionPolicy{MaxBytes: 1 << 20})
+	if err == nil {
+		t.Fatal("constructor succeeded despite classification failure")
+	}
+	if !strings.Contains(err.Error(), "stat denied") || !strings.Contains(err.Error(), "unlink denied") {
+		t.Fatalf("rollback error = %v, want both the classification and release failures", err)
+	}
+	// A later constructor first retries the retained release (now healthy)
+	// and then proceeds normally once classification also works.
+	cacheEntryInfo = origInfo
+	m, err := NewManager(root, RetentionPolicy{MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatalf("constructor after rollback retry: %v", err)
+	}
+	m.Close()
+	if failures != 0 {
+		t.Fatalf("retained release not retried (remaining failures %d)", failures)
+	}
+}

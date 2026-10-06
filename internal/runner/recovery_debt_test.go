@@ -532,7 +532,32 @@ func TestRunBackgroundDrainTimeoutPoisonsRunner(t *testing.T) {
 	if registerCalls.Load() != 1 {
 		t.Fatalf("register calls = %d, want 1 (the refused second Run must not register)", registerCalls.Load())
 	}
-	// A FRESH Runner (a restarted process) with its own identity still works.
+	// A FRESH Runner object with the SAME stable identity and identity
+	// directory must ALSO be refused: the poisoned run retained the identity
+	// lock, so the still-live old authority cannot be raced by a new
+	// incarnation inside the same process.
+	sharedIdentity := t.TempDir()
+	identityA := &Runner{ID: "runner-shared", Cfg: Config{Server: ts.URL, Poll: time.Millisecond, Concurrency: 1,
+		WorkDir: t.TempDir(), GCInterval: time.Hour, PrewarmInterval: time.Hour, IdentityDir: sharedIdentity},
+		Client: ts.Client(), Metrics: NewMetrics()}
+	ctxA, cancelA := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelA()
+	_ = identityA.Run(ctxA)
+	if !identityA.lifecyclePoisoned.Load() {
+		t.Fatal("shared-identity run not poisoned")
+	}
+	regBefore := registerCalls.Load()
+	identityB := &Runner{ID: "runner-shared", Cfg: Config{Server: ts.URL, Poll: time.Millisecond, Concurrency: 1,
+		WorkDir: t.TempDir(), GCInterval: time.Hour, PrewarmInterval: time.Hour, IdentityDir: sharedIdentity},
+		Client: ts.Client(), Metrics: NewMetrics()}
+	if err := identityB.Run(context.Background()); err == nil {
+		t.Fatal("a new Runner object acquired the poisoned stable identity")
+	}
+	if registerCalls.Load() != regBefore {
+		t.Fatalf("the refused same-identity Run registered (%d -> %d)", regBefore, registerCalls.Load())
+	}
+
+	// A fresh Runner with its own identity still works.
 	fresh := &Runner{ID: "runner-2", Cfg: Config{Server: ts.URL, Poll: time.Millisecond, Concurrency: 1,
 		WorkDir: t.TempDir(), GCInterval: time.Hour, PrewarmInterval: time.Hour, IdentityDir: t.TempDir()},
 		Client: ts.Client(), Metrics: NewMetrics()}

@@ -113,6 +113,21 @@ var ErrRunnerDisabledOrRevoked = errors.New("runner disabled or certificate revo
 // overridden at build time via -ldflags.
 var RunnerVersion = "dev"
 
+// retainedIdentityLocks keeps the stable-identity lock handles of poisoned
+// runs alive for the process lifetime: dropping the handle would let the
+// *os.File finalizer close the descriptor, silently releasing the flock.
+var retainedIdentityLocks struct {
+	mu      sync.Mutex
+	handles []func()
+}
+
+func retainIdentityLock(release func()) {
+	retainedIdentityLocks.mu.Lock()
+	retainedIdentityLocks.handles = append(retainedIdentityLocks.handles, release)
+	retainedIdentityLocks.mu.Unlock()
+	fmt.Fprintf(os.Stderr, "kiwi runner: a run could not join its background work; its stable identity lock is retained until process exit\n")
+}
+
 // runBackgroundTestHook, when set, spawns extra tracked background work in
 // Run: tests use it to model a worker that ignores cancellation.
 var runBackgroundTestHook func(*sync.WaitGroup)
@@ -536,12 +551,24 @@ func (r *Runner) Run(ctx context.Context) error {
 	// would treat the FIRST, LIVE process's containers as a crashed
 	// predecessor's and kill them. The lifetime lock is held for the whole
 	// Run.
+	// unjoinedIdentity latches when this Run's shutdown could not join all
+	// spawned work: the stable identity ownership must then PERSIST until
+	// process exit. Releasing it would let a NEW Runner object in the same
+	// process acquire the same identity and treat the still-live old
+	// authority's resources as a dead predecessor's.
+	unjoinedIdentity := false
 	if r.Cfg.IdentityDir != "" {
 		release, lerr := acquireRunnerIdentityLock(r.Cfg.IdentityDir)
 		if lerr != nil {
 			return fmt.Errorf("runner %s: %w", r.ID, lerr)
 		}
-		defer release()
+		defer func() {
+			if unjoinedIdentity || r.lifecyclePoisoned.Load() {
+				retainIdentityLock(release)
+				return
+			}
+			release()
+		}()
 	}
 	if err := r.resolveStateDir(); err != nil {
 		return err
@@ -654,14 +681,16 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	stop := func() {
 		runCancel()
-		// Only a fully joined shutdown may retire staging ownership: if the
-		// drain grace expired while a worker is still alive, that worker can
-		// still hold (or acquire) a reservation, so retaining ownership is
-		// the safe choice.
+		// Only a fully joined shutdown may retire staging ownership or the
+		// stable runner identity: if the drain grace expired while a worker
+		// is still alive, that worker can still hold (or acquire) resources,
+		// so retaining ownership is the safe choice.
 		if waitBackground() {
 			r.closeStaging()
 			r.closeCacheManager()
+			return
 		}
+		unjoinedIdentity = true
 	}
 	if r.Cfg.MetricsListen != "" {
 		background.Add(1)

@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 )
 
 // acquireRunnerIdentityLock takes an exclusive <IdentityDir>/runner.lock via
@@ -20,10 +18,22 @@ func acquireRunnerIdentityLock(dir string) (func(), error) {
 		return nil, err
 	}
 	path := filepath.Join(dir, "runner.lock")
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := 0; attempt < 3; attempt++ {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err == nil {
-			_, _ = fmt.Fprintf(f, "%d\n", os.Getpid())
+			// The PID publication must be CHECKED: a failed write leaves a
+			// lock file whose owner cannot be proven, and reporting success
+			// on it would be worse than refusing.
+			if _, werr := fmt.Fprintf(f, "%d\n", os.Getpid()); werr != nil {
+				_ = f.Close()
+				_ = os.Remove(path)
+				return nil, fmt.Errorf("write runner identity lock: %w", werr)
+			}
+			if serr := f.Sync(); serr != nil {
+				_ = f.Close()
+				_ = os.Remove(path)
+				return nil, fmt.Errorf("sync runner identity lock: %w", serr)
+			}
 			return func() {
 				_ = f.Close()
 				_ = os.Remove(path)
@@ -34,13 +44,16 @@ func acquireRunnerIdentityLock(dir string) (func(), error) {
 		}
 		b, rerr := os.ReadFile(path)
 		if rerr != nil {
-			return nil, fmt.Errorf("runner identity %s is already active in another process; refusing to start a duplicate", dir)
+			// Unreadable: cannot prove anyone dead. Doubt is LIVE.
+			return nil, fmt.Errorf("runner identity %s has an unreadable lock; refusing to start a duplicate", dir)
 		}
-		pid, perr := strconv.Atoi(strings.TrimSpace(string(b)))
-		if perr == nil && pid > 0 && processAlive(pid) {
-			return nil, fmt.Errorf("runner identity %s is already active in process %d; refusing to start a duplicate", dir, pid)
+		if classifyIdentityLock(b, processAlive) == identityLockLive {
+			return nil, fmt.Errorf("runner identity %s is already active; refusing to start a duplicate", dir)
 		}
-		_ = os.Remove(path)
+		if rmErr := os.Remove(path); rmErr != nil {
+			// Reclaim raced another creator: refuse rather than spin.
+			return nil, fmt.Errorf("runner identity %s is already active; refusing to start a duplicate", dir)
+		}
 	}
 	return nil, fmt.Errorf("runner identity lock %s could not be acquired", path)
 }

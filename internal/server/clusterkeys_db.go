@@ -66,7 +66,7 @@ func (s *DBClusterKeyStore) LoadOrCreate(kind string) ([]byte, error) {
 	} else if ok {
 		return b, nil
 	}
-	b, ok, err := s.seedBytes(kind)
+	b, ok, err := s.seedBytes(ctx, kind)
 	if err != nil {
 		return nil, err
 	}
@@ -81,15 +81,39 @@ func (s *DBClusterKeyStore) LoadOrCreate(kind string) ([]byte, error) {
 
 // seedBytes resolves pre-existing node-local material for kind without
 // creating any. ok=false means the seed store has nothing.
-func (s *DBClusterKeyStore) seedBytes(kind string) ([]byte, bool, error) {
+func (s *DBClusterKeyStore) seedBytes(ctx context.Context, kind string) ([]byte, bool, error) {
 	if s.Seed == nil {
 		return nil, false, nil
+	}
+	// A context-aware seed aborts with the caller (the advertised contract:
+	// an abandoned JWKS/refresh read terminates promptly).
+	if cl, ok := s.Seed.(contextClusterKeyLookup); ok {
+		return cl.LookupContext(ctx, kind)
 	}
 	lookup, ok := s.Seed.(ClusterKeyLookup)
 	if !ok {
 		return nil, false, nil
 	}
-	return lookup.Lookup(kind)
+	// Legacy seed without context support: run the lookup in its own
+	// goroutine and give up at the caller's context. The goroutine lives
+	// until the store returns (bounded by the store's own behavior); the
+	// caller is not parked on it.
+	type seedResult struct {
+		b     []byte
+		found bool
+		err   error
+	}
+	done := make(chan seedResult, 1)
+	go func() {
+		b, found, err := lookup.Lookup(kind)
+		done <- seedResult{b, found, err}
+	}()
+	select {
+	case res := <-done:
+		return res.b, res.found, res.err
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	}
 }
 
 // Lookup reports the shared blob for kind without generating material. When
@@ -126,7 +150,7 @@ func (s *DBClusterKeyStore) lookupWithContext(ctx context.Context, kind string) 
 	if ok {
 		return b, true, nil
 	}
-	seed, seeded, err := s.seedBytes(kind)
+	seed, seeded, err := s.seedBytes(ctx, kind)
 	if err != nil {
 		return nil, false, err
 	}

@@ -1803,12 +1803,21 @@ func (s *PostgresStore) HeartbeatLease(ctx context.Context, jobID string, runner
 		query += ` AND NOT EXISTS (SELECT 1 FROM schema_migrations WHERE compatible_from > $6)`
 		args = append(args, s.binarySchemaVersion)
 	}
-	ct, err := s.pool.Exec(ctx, query, args...)
+	// The UPDATE runs inside a schema-compatible transaction: the shared
+	// advisory lock orders this heartbeat against migrations, so a migration
+	// can never commit between this statement's snapshot and its commit and
+	// leave the renewal based on a stale compatibility view.
+	tx, err := s.beginSchemaCompatibleTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	ct, err := tx.Exec(ctx, query, args...)
 	if err != nil {
 		return err
 	}
 	if ct.RowsAffected() > 0 {
-		return nil
+		return tx.Commit(ctx)
 	}
 	if s.schemaFloorExceeded(ctx) {
 		return fmt.Errorf("%w: heartbeat refused", ErrSchemaIncompatible)
@@ -1876,9 +1885,18 @@ func (s *PostgresStore) HeartbeatLeaseWithTTL(ctx context.Context, jobID, runner
 		args = append(args, s.binarySchemaVersion)
 	}
 	query += ` RETURNING lease_expires_at`
+	// Schema-compatible transaction: see HeartbeatLease.
+	tx, err := s.beginSchemaCompatibleTx(ctx)
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer tx.Rollback(ctx)
 	var expires time.Time
-	err := s.pool.QueryRow(ctx, query, args...).Scan(&expires)
+	err = tx.QueryRow(ctx, query, args...).Scan(&expires)
 	if err == nil {
+		if cerr := tx.Commit(ctx); cerr != nil {
+			return time.Time{}, cerr
+		}
 		return expires, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {

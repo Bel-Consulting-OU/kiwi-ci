@@ -98,6 +98,9 @@ type Manager struct {
 // write or prune the first process's namespace. A held lock surfaces as
 // ErrCacheDirOwned and startup must refuse.
 func NewManager(root string, policy RetentionPolicy) (*Manager, error) {
+	// A previous constructor rollback may have been unable to release its
+	// namespace lock (non-Unix unlink failure): retry before competing.
+	retryPendingNamespaceReleases()
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, fmt.Errorf("cache: create namespace %s: %w", root, err)
 	}
@@ -122,11 +125,45 @@ func NewManager(root string, policy RetentionPolicy) (*Manager, error) {
 	if _, _, rerr := m.ReclaimAbandonedTemps(context.Background()); rerr != nil {
 		var classifyErr *cacheTempClassifyError
 		if errors.As(rerr, &classifyErr) {
-			_ = m.lock.release()
+			// Rollback must not discard a failed ownership release: a lock
+			// file left by THIS process would look alive to every later
+			// constructor and wedge the namespace for the process lifetime.
+			if relErr := releaseNamespaceLock(m.lock); relErr != nil {
+				registerPendingNamespaceRelease(m.lock)
+				return nil, errors.Join(
+					fmt.Errorf("cache: startup reconciliation of %s: %w", root, rerr),
+					fmt.Errorf("cache: release namespace lock during rollback: %w", relErr),
+				)
+			}
 			return nil, fmt.Errorf("cache: startup reconciliation of %s: %w", root, rerr)
 		}
 	}
 	return m, nil
+}
+
+// pendingNamespaceReleases keeps locks whose constructor rollback could not
+// release them: every later constructor retries before acquiring.
+var pendingNamespaceReleases struct {
+	mu    sync.Mutex
+	locks []*namespaceLock
+}
+
+func registerPendingNamespaceRelease(l *namespaceLock) {
+	pendingNamespaceReleases.mu.Lock()
+	pendingNamespaceReleases.locks = append(pendingNamespaceReleases.locks, l)
+	pendingNamespaceReleases.mu.Unlock()
+}
+
+func retryPendingNamespaceReleases() {
+	pendingNamespaceReleases.mu.Lock()
+	defer pendingNamespaceReleases.mu.Unlock()
+	remaining := pendingNamespaceReleases.locks[:0]
+	for _, l := range pendingNamespaceReleases.locks {
+		if err := releaseNamespaceLock(l); err != nil {
+			remaining = append(remaining, l)
+		}
+	}
+	pendingNamespaceReleases.locks = remaining
 }
 
 // cacheTempClassifyError marks an unable-to-classify/measure discovered temp
