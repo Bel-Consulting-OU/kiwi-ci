@@ -83,6 +83,12 @@ type PostgresStore struct {
 	// floor so a replica that fell behind a newer migration can never claim
 	// new work, even in the check/claim race window.
 	binarySchemaVersion int
+	// schemaFence enables the shared-lock/floor assertion on fenced write
+	// transactions (AcquireLeaseAtomic, CompleteJob). Production keeps it
+	// ON; the fixture-heavy integration stores disable it because every
+	// fixture write would otherwise contend with concurrent template
+	// migrations, and the dedicated fence tests enable it explicitly.
+	schemaFence bool
 
 	// repoIdentityRepairHooks is a test-only seam for the repository-identity
 	// repair pass (a deterministic barrier for concurrent-writer and
@@ -171,7 +177,7 @@ func NewPostgresOpt(ctx context.Context, dsn string, opts ...PostgresOption) (*P
 		pool.Close()
 		return nil, fmt.Errorf("storage: ping: %w", err)
 	}
-	st := &PostgresStore{pool: pool}
+	st := &PostgresStore{pool: pool, schemaFence: true}
 	// The lease fence needs the binary's max migration version; an embedded
 	// migrations failure is a programming/build error and disables the fence
 	// rather than blocking startup (Migrate would fail loudly anyway).
@@ -190,8 +196,14 @@ func NewPostgresOpt(ctx context.Context, dsn string, opts ...PostgresOption) (*P
 // NewPostgresFromPool adopts an existing pool (tests, wiring). The fence
 // pool is derived from the pool's DSN on first use.
 func NewPostgresFromPool(pool *pgxpool.Pool) *PostgresStore {
-	return &PostgresStore{pool: pool}
+	return &PostgresStore{pool: pool, schemaFence: true}
 }
+
+// EnableSchemaFence re-enables the compatibility assertion (default true).
+func (s *PostgresStore) EnableSchemaFence() { s.schemaFence = true }
+
+// DisableSchemaFenceForTests turns the assertion off for a store; tests only.
+func (s *PostgresStore) DisableSchemaFenceForTests() { s.schemaFence = false }
 
 // advisoryPool returns the dedicated advisory-lock pool, creating it from
 // the operational pool's configuration on first use. A dedicated pool can
@@ -5530,7 +5542,7 @@ func (s *PostgresStore) beginSchemaCompatibleTx(ctx context.Context) (pgx.Tx, er
 	if err != nil {
 		return nil, err
 	}
-	if s.binarySchemaVersion > 0 {
+	if s.binarySchemaVersion > 0 && s.schemaFence {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(hashtext('kiwi_schema_migrations'))`); err != nil {
 			_ = tx.Rollback(ctx)
 			return nil, fmt.Errorf("%w: acquire schema consistency lock: %v", ErrSchemaIncompatible, err)

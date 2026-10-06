@@ -78,6 +78,7 @@ func TestPostgresIntegrationSchemaCompatibilityFloor(t *testing.T) {
 // check/claim race window.
 func TestPostgresIntegrationLeaseFenceRejectsIncompatibleFloor(t *testing.T) {
 	st := pgITStore(t)
+	st.EnableSchemaFence()
 	ctx := context.Background()
 	maxV, err := migrations.MaxVersion()
 	if err != nil {
@@ -130,6 +131,7 @@ const schemaLockKeySQL = `hashtext('kiwi_schema_migrations')`
 // job row.
 func TestLeaseSchemaFloorFenceSerializesAgainstMigration(t *testing.T) {
 	st := pgITStore(t)
+	st.EnableSchemaFence()
 	ctx := context.Background()
 	maxV, err := migrations.MaxVersion()
 	if err != nil {
@@ -206,6 +208,7 @@ func TestLeaseSchemaFloorFenceSerializesAgainstMigration(t *testing.T) {
 // waiting until the lease commits.
 func TestMigrationWaitsForLeaseSharedLock(t *testing.T) {
 	st := pgITStore(t)
+	st.EnableSchemaFence()
 	ctx := context.Background()
 	holder, err := st.pool.Acquire(ctx)
 	if err != nil {
@@ -258,17 +261,31 @@ func TestMigrationWaitsForLeaseSharedLock(t *testing.T) {
 	}
 }
 
-// TestPostgresIntegrationNonLeaseMutationFencedAgainstMigration: ordinary
-// writes (not just leases) participate in the migration lock protocol, so a
-// migration committing between the HTTP middleware check and the write still
-// refuses the write.
+// TestPostgresIntegrationNonLeaseMutationFencedAgainstMigration: a terminal
+// COMPLETION (the audit's named non-lease mutation surface) participates in
+// the migration lock protocol, so a floor that advanced while the replica
+// was between its middleware check and the write still refuses the write.
 func TestPostgresIntegrationNonLeaseMutationFencedAgainstMigration(t *testing.T) {
 	st := pgITStore(t)
+	st.EnableSchemaFence()
 	ctx := context.Background()
 	maxV, err := migrations.MaxVersion()
 	if err != nil {
 		t.Fatal(err)
 	}
+	runnerID := pgITNewID(t)
+	if err := st.UpsertRunner(ctx, model.Runner{ID: runnerID, Name: runnerID, Capacity: 1,
+		ReportedCapabilities: []string{"native"}, Capabilities: []string{"native"}, CapabilitiesEnforced: true}); err != nil {
+		t.Fatalf("seed runner: %v", err)
+	}
+	runID, jobID := pgITNewID(t), pgITNewID(t)
+	pgITEnqueueOne(t, st, runID, jobID, pgITRepo)
+	token := []byte("fence-token")
+	if _, err := st.AcquireLeaseAtomic(ctx, LeaseClaim{JobID: jobID, RunnerID: runnerID, TokenHash: token, Generation: 1,
+		Runtime: "native", ExpiresAt: time.Now().UTC().Add(time.Hour)}); err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+
 	// Exclusive migration lock held, floor advanced, not committed.
 	conn, err := st.pool.Acquire(ctx)
 	if err != nil {
@@ -287,19 +304,14 @@ func TestPostgresIntegrationNonLeaseMutationFencedAgainstMigration(t *testing.T)
 		t.Fatal(err)
 	}
 
-	// InsertJob is a fenced job-lifecycle write (the audit's named
-	// non-lease mutation surfaces are heartbeat/completion/enqueue).
-	runID, _ := pgITNewID(t), pgITNewID(t)
-	pgITEnqueueOne(t, st, runID, pgITNewID(t), pgITRepo)
-	newJobID := pgITNewID(t)
-	newJob := pgITJob(runID, newJobID, pgITRepo)
+	receipt := model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID}
 	done := make(chan error, 1)
 	go func() {
-		done <- st.InsertJob(ctx, newJob)
+		done <- st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, receipt)
 	}()
 	select {
 	case err := <-done:
-		t.Fatalf("mutation did not serialize against the migration: %v", err)
+		t.Fatalf("completion did not serialize against the migration: %v", err)
 	case <-time.After(1200 * time.Millisecond):
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -308,16 +320,16 @@ func TestPostgresIntegrationNonLeaseMutationFencedAgainstMigration(t *testing.T)
 	select {
 	case err := <-done:
 		if !errors.Is(err, ErrSchemaIncompatible) {
-			t.Fatalf("mutation after the migration committed = %v, want ErrSchemaIncompatible", err)
+			t.Fatalf("completion after the migration committed = %v, want ErrSchemaIncompatible", err)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("mutation never returned")
+		t.Fatal("completion never returned")
 	}
-	var exists bool
-	if err := st.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM jobs WHERE id=$1)`, newJobID).Scan(&exists); err != nil {
+	var status string
+	if err := st.pool.QueryRow(ctx, `SELECT status FROM jobs WHERE id=$1`, jobID).Scan(&status); err != nil {
 		t.Fatal(err)
 	}
-	if exists {
-		t.Fatal("incompatible mutation committed a job row")
+	if status != "running" {
+		t.Fatalf("job status = %q, want running (the incompatible completion wrote nothing)", status)
 	}
 }

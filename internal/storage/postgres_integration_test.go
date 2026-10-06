@@ -207,6 +207,10 @@ func (e *pgITEnv) open(t *testing.T) *PostgresStore {
 		t.Fatalf("open store on %s: %v", e.base, err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
+	// Fixture-dominated workload: the shared-lock assertion contends with
+	// concurrent template migrations and multiplies suite wall time. The
+	// dedicated fence tests re-enable it explicitly; production keeps it on.
+	st.DisableSchemaFenceForTests()
 	return st
 }
 
