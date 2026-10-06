@@ -41,13 +41,13 @@ type PostgresStore struct {
 	// forever committing its reference, and the collector needs a lock
 	// connection plus a references connection plus its fence connection.
 	// Sized independently and small; created from the same DSN.
-	fencePoolOnce sync.Once
-	fencePool     *pgxpool.Pool
-	// fencePoolErr records the FIRST advisory-pool initialization failure.
-	// A sync.Once body is skipped on later calls, so an error held only in a
-	// closure-local variable would vanish and callers would observe a nil
-	// pool with no error.
-	fencePoolErr error
+	//
+	// fencePoolMu serializes lazy initialization. A FAILED attempt (e.g. a
+	// canceled startup context) leaves fencePool nil, so the next caller
+	// retries with its own live context instead of latching a permanent
+	// error; it is never held across unrelated store operations.
+	fencePoolMu sync.Mutex
+	fencePool   *pgxpool.Pool
 
 	// leaderMu guards the cached leader-session fields only. It is never held
 	// across a network round-trip: the liveness probe, the candidate
@@ -128,6 +128,7 @@ var (
 	_ ArtifactLookupStore   = (*PostgresStore)(nil)
 	_ RunnerJobStore        = (*PostgresStore)(nil)
 	_ RunEnqueueStore       = (*PostgresStore)(nil)
+	_ RunIdempotencyStore   = (*PostgresStore)(nil)
 	_ AtomicLeaseStore      = (*PostgresStore)(nil)
 	_ QuotaCounterStore     = (*PostgresStore)(nil)
 	_ CacheManifestStore    = (*PostgresStore)(nil)
@@ -185,8 +186,10 @@ func NewPostgresOpt(ctx context.Context, dsn string, opts ...PostgresOption) (*P
 		st.binarySchemaVersion = maxV
 	}
 	// Eager advisory-pool initialization: a startup failure surfaces here
-	// instead of during the first fenced operation.
-	if _, err := st.advisoryPool(); err != nil {
+	// instead of during the first fenced operation. It uses the STARTUP ctx
+	// so a canceled startup aborts promptly; a failed attempt does not
+	// poison the lazy path (advisoryPool retries on the next caller).
+	if _, err := st.advisoryPool(ctx); err != nil {
 		pool.Close()
 		return nil, err
 	}
@@ -205,6 +208,22 @@ func (s *PostgresStore) EnableSchemaFence() { s.schemaFence = true }
 // DisableSchemaFenceForTests turns the assertion off for a store; tests only.
 func (s *PostgresStore) DisableSchemaFenceForTests() { s.schemaFence = false }
 
+// advisoryPoolConnect is a test-only seam over opening and pinging the
+// dedicated advisory-lock pool. Production always uses pgxpool.NewWithConfig
+// followed by Ping with the caller's context; tests override it to inject a
+// first-attempt failure and prove the lazy initialization can be retried.
+var advisoryPoolConnect = func(ctx context.Context, cfg *pgxpool.Config) (*pgxpool.Pool, error) {
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("storage: open advisory pool: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("storage: ping advisory pool: %w", err)
+	}
+	return pool, nil
+}
+
 // advisoryPool returns the dedicated advisory-lock pool, creating it from
 // the operational pool's configuration on first use. A dedicated pool can
 // never be exhausted by ordinary operations.
@@ -216,53 +235,55 @@ func (s *PostgresStore) DisableSchemaFenceForTests() { s.schemaFence = false }
 // ConnConfig (hosts, TLS, credentials, RuntimeParams such as search_path)
 // rather than re-parsing the original DSN, which would silently drop
 // programmatic connection settings.
-func (s *PostgresStore) advisoryPool() (*pgxpool.Pool, error) {
-	s.fencePoolOnce.Do(func() {
-		dsn := ""
-		if s.pool != nil && s.pool.Config() != nil {
-			dsn = s.pool.Config().ConnString()
-		}
-		if dsn == "" {
-			s.fencePoolErr = fmt.Errorf("storage: cannot derive a DSN for the advisory-lock pool")
-			return
-		}
-		cfg, err := pgxpool.ParseConfig(dsn)
-		if err != nil {
-			s.fencePoolErr = fmt.Errorf("storage: parse dsn for advisory pool: %w", err)
-			return
-		}
-		if src := s.pool.Config(); src != nil && src.ConnConfig != nil {
-			cfg.ConnConfig = src.ConnConfig.Copy()
-		}
-		// Explicit cap: the lock pool exists to be INDEPENDENT of the
-		// operational pool, not to mirror its size.
-		cfg.MaxConns = 4
-		cfg.MinConns = 1
-		pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
-		if err != nil {
-			s.fencePoolErr = fmt.Errorf("storage: open advisory pool: %w", err)
-			return
-		}
-		if err := pool.Ping(context.Background()); err != nil {
-			pool.Close()
-			s.fencePoolErr = fmt.Errorf("storage: ping advisory pool: %w", err)
-			return
-		}
-		s.fencePool = pool
-	})
-	if s.fencePoolErr != nil {
-		return nil, s.fencePoolErr
+//
+// ctx is the STARTUP context in NewPostgresOpt and the caller's request
+// context on the lazy NewPostgresFromPool path. A canceled ctx aborts
+// promptly (checked before opening and honored by connect/ping). A failed
+// attempt does NOT latch: fencePool stays nil and the next caller retries
+// with its own context, so a canceled startup attempt can never permanently
+// poison later fenced operations.
+func (s *PostgresStore) advisoryPool(ctx context.Context) (*pgxpool.Pool, error) {
+	s.fencePoolMu.Lock()
+	defer s.fencePoolMu.Unlock()
+	if s.fencePool != nil {
+		return s.fencePool, nil
 	}
-	if s.fencePool == nil {
-		return nil, fmt.Errorf("storage: advisory pool unavailable")
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	return s.fencePool, nil
+	dsn := ""
+	if s.pool != nil && s.pool.Config() != nil {
+		dsn = s.pool.Config().ConnString()
+	}
+	if dsn == "" {
+		return nil, fmt.Errorf("storage: cannot derive a DSN for the advisory-lock pool")
+	}
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("storage: parse dsn for advisory pool: %w", err)
+	}
+	if src := s.pool.Config(); src != nil && src.ConnConfig != nil {
+		cfg.ConnConfig = src.ConnConfig.Copy()
+	}
+	// Explicit cap: the lock pool exists to be INDEPENDENT of the
+	// operational pool, not to mirror its size.
+	cfg.MaxConns = 4
+	cfg.MinConns = 1
+	pool, err := advisoryPoolConnect(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	s.fencePool = pool
+	return pool, nil
 }
 
 func (s *PostgresStore) Close() error {
-	if s.fencePool != nil {
-		s.fencePool.Close()
-		s.fencePool = nil
+	s.fencePoolMu.Lock()
+	fencePool := s.fencePool
+	s.fencePool = nil
+	s.fencePoolMu.Unlock()
+	if fencePool != nil {
+		fencePool.Close()
 	}
 	s.leaderMu.Lock()
 	// Closing the session releases its advisory lock; clear the whole cache
@@ -541,6 +562,15 @@ func (s *PostgresStore) InsertCompiledRun(ctx context.Context, req InsertCompile
 	// closed.
 	if req.DownstreamLaunch != nil {
 		if err := s.claimDownstreamLaunchTx(ctx, tx, req.DownstreamLaunch, req.Run.ID); err != nil {
+			return err
+		}
+	}
+	// The idempotency receipt is claimed BEFORE the run row is inserted, so
+	// a replay or a key conflict rolls back without ever creating a second
+	// run. A first submission inserts the receipt and proceeds; the run and
+	// the receipt commit together.
+	if req.Idempotency != nil {
+		if err := s.claimRunIdempotencyTx(ctx, tx, req.Idempotency); err != nil {
 			return err
 		}
 	}
@@ -976,6 +1006,78 @@ func (s *PostgresStore) insertWebhookClaimTx(ctx context.Context, tx pgx.Tx, c *
 		return ErrDeliveryDuplicate
 	}
 	return nil
+}
+
+// claimRunIdempotencyTx records the run-idempotency receipt in the same
+// transaction as the run it acknowledges. The insert is ON CONFLICT DO
+// NOTHING: on a conflict the STORED receipt decides:
+//
+//   - same request digest: the enqueue is a replay, so the transaction rolls
+//     back with *IdempotentReplayError carrying the original run ID;
+//   - different digest: the client reused one key for a different
+//     submission, so the transaction rolls back with
+//     ErrIdempotencyKeyConflict.
+//
+// The receipt is inserted before the run row, so a replay/conflict never
+// leaves a partially inserted run: the deferred rollback discards nothing
+// but the receipt attempt.
+func (s *PostgresStore) claimRunIdempotencyTx(ctx context.Context, tx pgx.Tx, c *RunIdempotencyClaim) error {
+	if c.RepoID == "" || c.Key == "" {
+		return fmt.Errorf("storage: incomplete idempotency claim")
+	}
+	if err := ValidateRunID(c.RunID); err != nil {
+		return err
+	}
+	ct, err := tx.Exec(ctx, `INSERT INTO run_idempotency (repo_id, idempotency_key, request_digest, run_id) VALUES ($1, $2, $3, $4) ON CONFLICT (repo_id, idempotency_key) DO NOTHING`,
+		c.RepoID, c.Key, c.Digest, c.RunID)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() > 0 {
+		return nil
+	}
+	var storedRunID, storedDigest string
+	if err := tx.QueryRow(ctx, `SELECT run_id, request_digest FROM run_idempotency WHERE repo_id=$1 AND idempotency_key=$2`, c.RepoID, c.Key).Scan(&storedRunID, &storedDigest); err != nil {
+		return err
+	}
+	if storedDigest == c.Digest {
+		return &IdempotentReplayError{RunID: storedRunID}
+	}
+	return ErrIdempotencyKeyConflict
+}
+
+// PruneRunIdempotency deletes up to limit receipts created before olderThan,
+// oldest first, so the durable receipt table stays bounded independently of
+// run retention. A receipt past its TTL simply stops deduplicating.
+func (s *PostgresStore) PruneRunIdempotency(ctx context.Context, olderThan time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	ct, err := s.pool.Exec(ctx, `DELETE FROM run_idempotency WHERE (repo_id, idempotency_key) IN (
+		SELECT repo_id, idempotency_key FROM run_idempotency WHERE created_at < $1 ORDER BY created_at, repo_id, idempotency_key LIMIT $2
+	)`, olderThan, limit)
+	if err != nil {
+		return 0, err
+	}
+	return ct.RowsAffected(), nil
+}
+
+// FindRunIdempotency re-reads one durable run-idempotency receipt. A missing
+// row is (found=false, nil): the first submission of a key has no receipt
+// yet.
+func (s *PostgresStore) FindRunIdempotency(ctx context.Context, repoID, key string) (string, string, bool, error) {
+	if repoID == "" || key == "" {
+		return "", "", false, fmt.Errorf("storage: idempotency lookup requires a repository and key")
+	}
+	var runID, digest string
+	err := s.pool.QueryRow(ctx, `SELECT run_id, request_digest FROM run_idempotency WHERE repo_id=$1 AND idempotency_key=$2`, repoID, key).Scan(&runID, &digest)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, err
+	}
+	return runID, digest, true, nil
 }
 
 // insertScheduleClaimTx inserts the schedule occurrence claim in the same

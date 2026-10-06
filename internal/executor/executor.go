@@ -671,7 +671,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		}
 		isolated := networkPolicy == pipeline.NetworkPolicyNone || networkPolicy == pipeline.NetworkPolicyServicesOnly
 		var er error
-		network, cleanupServices, er = startContainerServicesOwned(ctx, e.Opt.RunID, cj.ID, runtimeOwner{RunnerID: e.Opt.RunnerID, InstanceID: e.Opt.InstanceID}, cj.Job.Services, cj.Job.Resources, isolated, e.Opt.RequireImmutableImages, cgroupParent, func(line string) { e.log(cj.ID, "service", line) })
+		network, cleanupServices, er = startContainerServicesOwned(ctx, e.Opt.RunID, cj.ID, runtimeOwner{RunnerID: e.Opt.RunnerID, InstanceID: e.Opt.InstanceID}, cj.Job.Services, cj.Job.Resources, isolated, e.Opt.RequireImmutableImages, cgroupParent, func(line string) { e.log(cj.ID, "service", line) }, func(d CleanupDebt) { e.reportCleanupDebt(d.Kind, d.Resource, d.Err) })
 		if er != nil {
 			res.Status = model.StatusFailure
 			res.Error = er.Error()
@@ -691,7 +691,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		// backend honors network "none"; the tart backend fails closed.
 		network = "none"
 	}
-	backend, err := BackendForNetwork(cj.Job.Runtime, cj.Job.Image, cj.Job.VM, network)
+	backend, err := backendForNetwork(cj.Job.Runtime, cj.Job.Image, cj.Job.VM, network)
 	if err != nil {
 		res.Status = model.StatusFailure
 		res.Error = err.Error()
@@ -713,12 +713,14 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		b.RequireDiskQuota = e.Opt.RequireUntrustedDiskQuota
 		b.WorkspaceQuota = e.Opt.WorkspaceQuota
 		b.CgroupParent = cgroupParent
+		b.ReportCleanupDebt = e.reportCleanupDebt
 	case *TartBackend:
 		b.RunID = e.Opt.RunID
 		b.JobID = cj.ID
 		b.RunnerID = e.Opt.RunnerID
 		b.InstanceID = e.Opt.InstanceID
 		b.RequireImmutableImages = e.Opt.RequireImmutableImages
+		b.ReportCleanupDebt = e.reportCleanupDebt
 		if e.Opt.TartAgentPort > 0 {
 			b.AgentPort = e.Opt.TartAgentPort
 		}
@@ -734,6 +736,15 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	var closeJob func() error
 	if lifecycle, ok := backend.(JobLifecycle); ok {
 		if err := lifecycle.StartJob(ctx, workspace, func(line string) { e.log(cj.ID, "runtime", line) }); err != nil {
+			// A failed start may still have created (and retained) external
+			// state: CloseJob is the backend's partial-safe cleanup, run
+			// synchronously so an ambiguous start can never leak quietly. A
+			// close failure means removal could not be proven, so the runner
+			// must retain the ledger/workspace and stop leasing.
+			if cerr := lifecycle.CloseJob(); cerr != nil {
+				e.log(cj.ID, "runtime", "cleanup warning: "+cerr.Error())
+				e.reportCleanupDebt(CleanupMainRuntime, cj.ID, cerr)
+			}
 			res.Status = model.StatusFailure
 			res.Error = err.Error()
 			return finish(res)
@@ -1076,6 +1087,11 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 // reproduced on darwin, where getcwd keeps resolving an unlinked directory.
 var absWorkspacePath = filepath.Abs
 
+// backendForNetwork is a test-only seam over BackendForNetwork. Production
+// behavior is unchanged; it lets runJob's backend lifecycle error paths
+// (StartJob fails, CloseJob then fails) be exercised with a fake backend.
+var backendForNetwork = BackendForNetwork
+
 // closeSnapshotFile is a test-only seam over os.File.Close. Production
 // behavior is unchanged; it lets the checked snapshot-close failure branch be
 // exercised.
@@ -1331,6 +1347,8 @@ type CleanupKind string
 const (
 	CleanupMainRuntime CleanupKind = "main-runtime"
 	CleanupService     CleanupKind = "service-container-or-network"
+	CleanupNetwork     CleanupKind = "service-network"
+	CleanupVM          CleanupKind = "tart-vm"
 	CleanupCgroup      CleanupKind = "job-cgroup"
 	CleanupXFSQuota    CleanupKind = "xfs-project-quota"
 	// Runner-observed teardown failures (reported by the runner itself).

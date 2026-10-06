@@ -88,12 +88,15 @@ func TestRequireRootlessDaemonHangingProbeBounded(t *testing.T) {
 }
 
 // TestStartContainerServicesHangingNetworkCreateBounded proves the service
-// network create is bounded by the control ceiling.
+// network create is bounded by the control ceiling. The failed create also
+// triggers the bounded network remove-by-name, which the same hanging fake
+// answers with a sleep, so the cleanup ceiling is shrunk too.
 func TestStartContainerServicesHangingNetworkCreateBounded(t *testing.T) {
 	testutil.UnixShell(t)
-	origControl := runtimeControlTimeout
+	origControl, origCleanup := runtimeControlTimeout, dockerCleanupTimeout
 	runtimeControlTimeout = 150 * time.Millisecond
-	t.Cleanup(func() { runtimeControlTimeout = origControl })
+	dockerCleanupTimeout = 150 * time.Millisecond
+	t.Cleanup(func() { runtimeControlTimeout, dockerCleanupTimeout = origControl, origCleanup })
 
 	dir := t.TempDir()
 	script := "#!/bin/sh\ncase \"$1\" in\n  network) exec sleep 300;;\nesac\nexit 0\n"
@@ -176,12 +179,15 @@ exit 0
 }
 
 // TestContainerBackendStartJobHangingRunBounded proves the job container
-// `docker run` is bounded by the setup ceiling even with no job timeout.
+// `docker run` is bounded by the setup ceiling even with no job timeout. The
+// failed run also triggers the bounded remove-by-name, which the same
+// hanging fake answers with a sleep, so the cleanup ceiling is shrunk too.
 func TestContainerBackendStartJobHangingRunBounded(t *testing.T) {
 	testutil.UnixShell(t)
-	origSetup := runtimeSetupTimeout
+	origSetup, origCleanup := runtimeSetupTimeout, dockerCleanupTimeout
 	runtimeSetupTimeout = 150 * time.Millisecond
-	t.Cleanup(func() { runtimeSetupTimeout = origSetup })
+	dockerCleanupTimeout = 150 * time.Millisecond
+	t.Cleanup(func() { runtimeSetupTimeout, dockerCleanupTimeout = origSetup, origCleanup })
 
 	fake := writeCleanupScript(t, "docker", "#!/bin/sh\nexec sleep 300\n")
 	t.Setenv("PATH", filepath.Dir(fake)+string(os.PathListSeparator)+os.Getenv("PATH"))

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 // tempFileMaxAge is how long orphaned *.tmp files may survive in the store
@@ -39,7 +40,11 @@ func (s *Server) GC(ctx context.Context, now time.Time) GCStats {
 	// dedupe records are visible to pruneDeliveriesLocked in the same pass.
 	prunedRuns := s.pruneRunsLocked(now)
 	stats.RunsRemoved = len(prunedRuns)
-	if stats.RunsRemoved > 0 {
+	// Run-idempotency receipts are aged out (and receipts of pruned runs
+	// dropped) in the same pass, so state.json stays bounded even when run
+	// retention is disabled.
+	receiptsPruned := s.pruneRunIdempotencyLocked(now, prunedRuns)
+	if stats.RunsRemoved > 0 || receiptsPruned > 0 {
 		// Bound state.json: persist the pruned set immediately instead of
 		// waiting for the next unrelated mutation. A failure only degrades
 		// readiness (the in-memory set is already pruned and the next tick
@@ -75,10 +80,47 @@ func (s *Server) GC(ctx context.Context, now time.Time) GCStats {
 	// pruned here: the durable table in DB mode, the dev-mode mirror
 	// otherwise. Pruning never deletes CAS blobs.
 	s.pruneExpiredPendingSidecars(ctx, now)
+	// Durable run-idempotency receipts age out on the same maintenance
+	// cadence (bounded batch per tick) so the table cannot grow forever.
+	if s.DB != nil {
+		if rs, ok := s.DB.(storage.RunIdempotencyStore); ok {
+			if n, err := rs.PruneRunIdempotency(ctx, now.Add(-storage.IdempotencyReceiptTTL), 500); err != nil {
+				s.logError("idempotency receipt prune failed", "error", err.Error())
+			} else if n > 0 {
+				s.metricAdd("kiwi_idempotency_receipts_pruned_total", float64(n), nil)
+			}
+		}
+	}
 	if s.store != nil {
 		stats.TempFilesRemoved = sweepTempFiles(s.store.Root, now)
 	}
 	return stats
+}
+
+// pruneRunIdempotencyLocked drops fs-mode idempotency receipts that belong
+// to pruned runs or have outlived storage.IdempotencyReceiptTTL. The caller
+// holds s.mu and persists when anything changed. Returns the number removed.
+func (s *Server) pruneRunIdempotencyLocked(now time.Time, prunedRuns []string) int {
+	if len(s.idempotency) == 0 {
+		return 0
+	}
+	pruned := make(map[string]bool, len(prunedRuns))
+	for _, id := range prunedRuns {
+		pruned[id] = true
+	}
+	removed := 0
+	for k, rec := range s.idempotency {
+		if pruned[rec.RunID] {
+			delete(s.idempotency, k)
+			removed++
+			continue
+		}
+		if !rec.CreatedAt.IsZero() && now.Sub(rec.CreatedAt) > storage.IdempotencyReceiptTTL {
+			delete(s.idempotency, k)
+			removed++
+		}
+	}
+	return removed
 }
 
 // pruneRunsLocked applies the fs-mode run retention policy and cascades the

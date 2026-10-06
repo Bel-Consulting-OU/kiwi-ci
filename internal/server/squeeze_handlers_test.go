@@ -575,8 +575,10 @@ jobs:
 	}
 }
 
-// TestSqueezeSwitchToDBReplayFailures covers the outbox replay and schedule
-// reload failure logs during the switch.
+// TestSqueezeSwitchToDBReplayFailures covers the schedule reload failure log
+// during the switch. The outbox pending read is never consulted at startup
+// (SwitchToDB does not mirror the backlog), so a broken store read must not
+// fail the switch either; the injected error stays to pin that property.
 func TestSqueezeSwitchToDBReplayFailures(t *testing.T) {
 	s, err := NewPersistent("secret", "secret", t.TempDir())
 	if err != nil {

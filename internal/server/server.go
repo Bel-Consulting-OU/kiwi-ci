@@ -164,6 +164,11 @@ type Server struct {
 	reports     map[string]model.TestReport
 	deliveries  map[string]string
 	completions map[string]model.CompletionReceipt
+	// idempotency holds the fs-mode run-idempotency receipts keyed by
+	// canonical repository scope + client key (runIdempotencyReceiptKey).
+	// Guarded by s.mu; persisted in the SAME snapshot write as the run it
+	// acknowledges. DB mode uses the store's run_idempotency table instead.
+	idempotency map[string]storage.IdempotencyReceipt
 	// completionReceiptAt records when each in-memory receipt was recorded
 	// so the persisted receipt set can be aged out and capped on restart.
 	// Guarded by s.mu, like completions.
@@ -271,6 +276,15 @@ type Server struct {
 	// QuotaLimits bounds per-repository and per-team concurrency and queue
 	// depth at enqueue (quotas.Limits; every field 0 means unlimited).
 	QuotaLimits quotas.Limits
+	// LeaseCandidatePageSize/LeaseMaxCandidateRows/LeaseReservationWait are
+	// the scheduler's bounded lease-scan policy, re-applied on every DB-mode
+	// lease (see scheduler.DBScheduler.SetLeaseScanLimits) and used to bound
+	// the queue-reason explainer's candidate fetch. Defaults: 256, 4096, 0s
+	// (immediate reservation-head activation); the app wiring fills them from
+	// the scheduler config section.
+	LeaseCandidatePageSize int
+	LeaseMaxCandidateRows  int
+	LeaseReservationWait   time.Duration
 	// DailyCostLimit/DailyEnergyLimit bound the trailing-24h cost and
 	// energy budget; exceeding them refuses new leases (0 = unlimited).
 	DailyCostLimit   float64
@@ -605,11 +619,14 @@ func newServer(token string) *Server {
 	return &Server{
 		Token: token, RunnerToken: token, AdminToken: token,
 		LeaseDuration:          defaultLeaseDuration,
+		LeaseCandidatePageSize: scheduler.DefaultCandidatePageSize,
+		LeaseMaxCandidateRows:  scheduler.DefaultMaxCandidateRows,
+		LeaseReservationWait:   scheduler.DefaultReservationWait,
 		UntrustedCPUCeiling:    2.0,
 		UntrustedMemoryCeiling: 4 << 30,
 		UntrustedDiskCeiling:   10 << 30,
 		UntrustedPIDCeiling:    256,
-		runs:                   map[string]model.Run{}, jobs: map[string]model.Job{}, runners: map[string]model.Runner{}, artifacts: map[string]model.ArtifactRecord{}, reports: map[string]model.TestReport{}, deliveries: map[string]string{}, completions: map[string]model.CompletionReceipt{}, completionReceiptAt: map[string]time.Time{}, generatedFragments: map[string]storage.GeneratedFragmentReceipt{}, leaseKey: key, oidc: newOIDCSigner(),
+		runs:                   map[string]model.Run{}, jobs: map[string]model.Job{}, runners: map[string]model.Runner{}, artifacts: map[string]model.ArtifactRecord{}, reports: map[string]model.TestReport{}, deliveries: map[string]string{}, idempotency: map[string]storage.IdempotencyReceipt{}, completions: map[string]model.CompletionReceipt{}, completionReceiptAt: map[string]time.Time{}, generatedFragments: map[string]storage.GeneratedFragmentReceipt{}, leaseKey: key, oidc: newOIDCSigner(),
 		outbox:            mustNewOutbox(nil),
 		AuthStore:         auth.NewTokenStore(),
 		deployments:       map[string]model.Deployment{},
@@ -947,6 +964,7 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 	// receipt instead of re-applying its effects.
 	s.mu.Lock()
 	s.restoreCompletionReceiptsLocked(snap.CompletionReceipts)
+	s.restoreRunIdempotencyLocked(snap.RunIdempotency)
 	s.mu.Unlock()
 	// The trailing-24h cost/energy budget window is rebuilt from the restored
 	// jobs: only live completions append to s.usage, so without this an fs
@@ -1069,6 +1087,9 @@ func (s *Server) SwitchToDB(db storage.Store) error {
 	// The server reapplies them on every lease (SetQuotaLimits), so config
 	// applied after SwitchToDB is still enforced.
 	sched.SetQuotaLimits(s.QuotaLimits.RepoConcurrency, s.QuotaLimits.TeamConcurrency)
+	// The bounded lease-scan policy travels with the quota limits: config
+	// applied after SwitchToDB is re-applied on every lease as well.
+	sched.SetLeaseScanLimits(s.LeaseCandidatePageSize, s.LeaseMaxCandidateRows, s.LeaseReservationWait)
 	s.Sched = sched
 	s.DB = db
 	// The SQL store is now the source of truth and persistLocked returns
@@ -1079,11 +1100,13 @@ func (s *Server) SwitchToDB(db storage.Store) error {
 	s.LeaderKey = sched.LeaderKey
 	s.leader = sched.IsLeader(context.Background()) // allow-background: startup leader probe runs before any request exists
 	// DB mode: the durable outbox, schedules and artifact contracts move
-	// into the SQL store.
+	// into the SQL store. The outbox is deliberately NOT replayed into
+	// memory at startup: flushDB claims bounded OutboxClaimBatch batches
+	// through ClaimOutbox and mirrors exactly the rows it owns, so
+	// materializing the whole durable backlog here would be unbounded
+	// startup work for a queue the dispatch path never reads. An explicit,
+	// window-bounded ReplayDB remains available for tools/tests.
 	s.outbox.AttachDB(db)
-	if err := s.outbox.ReplayDB(context.Background()); err != nil { // allow-background: startup outbox replay, no request origin exists
-		s.logError("outbox: db replay failed", "error", err.Error())
-	}
 	if err := s.reloadSchedulesDB(context.Background()); err != nil { // allow-background: startup schedule load, no request origin exists
 		s.logError("schedules: db load failed", "error", err.Error())
 	}
@@ -1516,9 +1539,19 @@ func (s *Server) respondNotDurableError(w http.ResponseWriter, r *http.Request, 
 }
 
 func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
+	// The idempotency key is read BEFORE the body so an invalid key fails
+	// fast, and bound to the canonical client-visible digest after decode.
+	idempotencyKey, hasIdempotencyKey, keyOK := readIdempotencyKey(w, r)
+	if !keyOK {
+		return
+	}
 	var in SubmitRun
 	if !decode(w, r, &in) {
 		return
+	}
+	if hasIdempotencyKey {
+		in.idempotencyKey = idempotencyKey
+		in.idempotencyDigest = submissionIdempotencyDigest(&in, "submit", "")
 	}
 	// The canonical repository identity is derived at ingress from repo_url
 	// through the STRICT clone-URL parser. A client-supplied repo_id is
@@ -1573,6 +1606,13 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		// instead of an opaque 500.
 		if errors.Is(err, storage.ErrStaleLeader) {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "scheduler leader changed; retry", "reason": "STALE_LEADER"})
+			return
+		}
+		// The same Idempotency-Key was reused for a DIFFERENT request (or its
+		// original run is gone): answer 409 and enqueue nothing, so a client
+		// bug can never execute the second operation.
+		if errors.Is(err, errIdempotencyKeyConflict) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error(), "reason": "IDEMPOTENCY_KEY_REUSED"})
 			return
 		}
 		if errors.Is(err, storage.ErrSchemaIncompatible) {
@@ -1651,6 +1691,23 @@ func (s *Server) enqueueID(ctx context.Context, in SubmitRun, preRunID string) (
 		return model.Run{}, &admissionError{Status: 400, Reason: "repo_identity_required", Msg: "repository identity could not be resolved"}
 	}
 	checkoutURL := submittedCheckoutURL(in)
+	// Idempotency fast path (DB mode): a key whose original submission
+	// committed returns that run BEFORE any pipeline resolution, admission
+	// or ID generation. A replay must stay a replay even when the repository
+	// policy or components changed after the first attempt, and it must
+	// never re-run external resolution for an operation that already
+	// happened. Concurrent first submissions still race safely: the loser's
+	// InsertCompiledRun sees the receipt and replays (or conflicts) inside
+	// its own transaction.
+	if in.idempotencyKey != "" {
+		prior, found, ierr := s.checkRunIdempotencyDB(ctx, policyID, in.idempotencyKey, in.idempotencyDigest)
+		if ierr != nil {
+			return model.Run{}, ierr
+		}
+		if found {
+			return prior, nil
+		}
+	}
 	// Server-side pipeline resolution: components are resolved and merged,
 	// inputs validated and injected, and the canonical pipeline text
 	// replaces the submission so every persisted job carries a
@@ -1832,6 +1889,23 @@ func (s *Server) enqueueID(ctx context.Context, in SubmitRun, preRunID string) (
 		s.mu.Unlock()
 		return model.Run{}, err
 	}
+	// Run-idempotency replay (fs mode): checked under the state lock BEFORE
+	// the first mutation, so a retry of a committed submission returns the
+	// original run and a reused key with a different digest fails closed.
+	// The receipt joins the same snapshot write as the run below.
+	if in.idempotencyKey != "" {
+		rec, ok := s.idempotency[runIdempotencyReceiptKey(policyID, in.idempotencyKey)]
+		if ok {
+			s.mu.Unlock()
+			if rec.Digest != in.idempotencyDigest {
+				return model.Run{}, errIdempotencyKeyConflict
+			}
+			if prior, ok := s.runs[rec.RunID]; ok {
+				return prior, nil
+			}
+			return model.Run{}, fmt.Errorf("%w: receipt run %s is no longer retained; retry with a new key", errIdempotencyKeyConflict, rec.RunID)
+		}
+	}
 	// Schedule occurrence atomicity (memory mode): a conflicting claim for
 	// the same nominal aborts before anything is inserted, and the claim
 	// itself lands only after the run and its jobs are committed to the
@@ -1933,6 +2007,15 @@ func (s *Server) enqueueID(ctx context.Context, in SubmitRun, preRunID string) (
 		s.jobs[id] = j
 		if contracts, ok := jobContracts[id]; ok {
 			s.contracts[id] = contracts
+		}
+	}
+	if in.idempotencyKey != "" {
+		// The receipt lands in the SAME snapshot write as the run it
+		// acknowledges (the persistCheckedErrLocked below), so a commit whose
+		// response was lost can never be missing its replay identity and a
+		// failed persist rolls both back together.
+		s.idempotency[runIdempotencyReceiptKey(policyID, in.idempotencyKey)] = storage.IdempotencyReceipt{
+			RepoID: policyID, Key: in.idempotencyKey, Digest: in.idempotencyDigest, RunID: runID, CreatedAt: now,
 		}
 	}
 	if in.ScheduleClaim != nil {
@@ -2087,6 +2170,15 @@ func (s *Server) enqueueDB(ctx context.Context, in SubmitRun, run model.Run, cre
 	if in.DownstreamLaunch != nil {
 		req.DownstreamLaunch = in.DownstreamLaunch
 	}
+	if in.idempotencyKey != "" {
+		// The receipt is claimed INSIDE the enqueue transaction, so the run
+		// and its replay identity are one commit. The pre-check above only
+		// avoids recompiling a replay; this claim closes the concurrent
+		// first-submission race and returns the winner's run to the loser.
+		req.Idempotency = &storage.RunIdempotencyClaim{
+			RepoID: repoIDForRun(run), Key: in.idempotencyKey, Digest: in.idempotencyDigest, RunID: run.ID, CreatedAt: now,
+		}
+	}
 	if forge, delivery, ok := webhookDeliveryForge(in.Metadata); ok {
 		req.WebhookClaim = &storage.WebhookClaim{Forge: forge, DeliveryID: delivery, PayloadDigest: in.deliveryDigest, RunID: run.ID}
 		if in.deliveryDigest != "" {
@@ -2155,6 +2247,18 @@ func (s *Server) enqueueDB(ctx context.Context, in SubmitRun, run model.Run, cre
 			}
 		}
 		return model.Run{}, err
+	case errors.Is(err, storage.ErrIdempotencyKeyReplay):
+		// A concurrent first submission with the same key committed while
+		// this request compiled: return the WINNER's run, never a duplicate.
+		var replay *storage.IdempotentReplayError
+		if errors.As(err, &replay) {
+			if prior, gerr := s.DB.GetRun(ctx, replay.RunID); gerr == nil && repoIDForRun(prior) == repoIDForRun(run) {
+				return prior, nil
+			}
+		}
+		return model.Run{}, err
+	case errors.Is(err, storage.ErrIdempotencyKeyConflict):
+		return model.Run{}, errIdempotencyKeyConflict
 	case errors.Is(err, storage.ErrScheduleClaimLost):
 		return model.Run{}, err
 	case errors.Is(err, storage.ErrDownstreamLaunched):
@@ -3879,6 +3983,9 @@ func (s *Server) nextDB(w http.ResponseWriter, r *http.Request, id string) {
 	// Quota limits are re-applied on every lease: the scheduler enforces
 	// them inside the claim's conditional queued->running transition.
 	s.Sched.SetQuotaLimits(s.QuotaLimits.RepoConcurrency, s.QuotaLimits.TeamConcurrency)
+	// The bounded lease-scan policy is re-applied here too, so config loaded
+	// after SwitchToDB takes effect on the next poll.
+	s.Sched.SetLeaseScanLimits(s.LeaseCandidatePageSize, s.LeaseMaxCandidateRows, s.LeaseReservationWait)
 	j, rawToken, exp, err := s.Sched.Lease(ctx, id, time.Now().UTC())
 	switch {
 	case errors.Is(err, scheduler.ErrNotLeader):
@@ -4804,6 +4911,7 @@ type stateRollback struct {
 	runners         map[string]model.Runner
 	contracts       map[string]map[string]storage.ArtifactContract
 	deliveries      map[string]string
+	idempotency     map[string]storage.IdempotencyReceipt
 	downstreamLinks map[string]storage.DownstreamLink
 	occurrences     map[string]map[int64]string
 	deployments     map[string]model.Deployment
@@ -4822,6 +4930,7 @@ func (s *Server) captureStateRollbackLocked() stateRollback {
 		runners:         make(map[string]model.Runner, len(s.runners)),
 		contracts:       make(map[string]map[string]storage.ArtifactContract, len(s.contracts)),
 		deliveries:      make(map[string]string, len(s.deliveries)),
+		idempotency:     make(map[string]storage.IdempotencyReceipt, len(s.idempotency)),
 		downstreamLinks: make(map[string]storage.DownstreamLink, len(s.downstreamLinks)),
 		occurrences:     make(map[string]map[int64]string, len(s.occurrences)),
 		deployments:     make(map[string]model.Deployment, len(s.deployments)),
@@ -4846,6 +4955,9 @@ func (s *Server) captureStateRollbackLocked() stateRollback {
 	}
 	for k, v := range s.deliveries {
 		rb.deliveries[k] = v
+	}
+	for k, v := range s.idempotency {
+		rb.idempotency[k] = v
 	}
 	for k, v := range s.downstreamLinks {
 		rb.downstreamLinks[k] = v
@@ -4913,6 +5025,7 @@ func (s *Server) rollbackStateLocked(rb stateRollback) {
 	restoreMap(s.runners, rb.runners)
 	restoreMap(s.contracts, rb.contracts)
 	restoreMap(s.deliveries, rb.deliveries)
+	restoreMap(s.idempotency, rb.idempotency)
 	restoreMap(s.downstreamLinks, rb.downstreamLinks)
 	restoreMap(s.occurrences, rb.occurrences)
 	restoreMap(s.deployments, rb.deployments)
@@ -5210,6 +5323,10 @@ func (s *Server) rerunRun(w http.ResponseWriter, r *http.Request) {
 		s.rerunRunDB(w, r, id)
 		return
 	}
+	idempotencyKey, hasIdempotencyKey, keyOK := readIdempotencyKey(w, r)
+	if !keyOK {
+		return
+	}
 	s.mu.Lock()
 	old, ok := s.runs[id]
 	var pipelineText string
@@ -5251,14 +5368,23 @@ func (s *Server) rerunRun(w http.ResponseWriter, r *http.Request) {
 	if repoID == "" {
 		repoID = policyID
 	}
-	run, err := s.enqueue(r.Context(), SubmitRun{RepoID: repoID, PolicyRepoID: policyID, CheckoutRepoURL: checkoutURLForRun(old),
+	in := SubmitRun{RepoID: repoID, PolicyRepoID: policyID, CheckoutRepoURL: checkoutURLForRun(old),
 		RepoURL: old.Repo, RepoFullName: old.RepoFullName, Ref: old.Ref, SHA: old.SHA, Event: old.Event, Pipeline: pipelineText,
 		ForgeKind: old.ForgeKind, ForgeHost: old.ForgeHost,
-		Trusted: rerunTrusted(r, old), Metadata: meta, identityBound: true})
+		Trusted: rerunTrusted(r, old), Metadata: meta, identityBound: true}
+	if hasIdempotencyKey {
+		in.idempotencyKey = idempotencyKey
+		in.idempotencyDigest = submissionIdempotencyDigest(&in, "rerun", id)
+	}
+	run, err := s.enqueue(r.Context(), in)
 	if err != nil {
 		// A non-durable enqueue is answered like every other ingress (503 +
 		// opaque body); only a genuine validation error keeps its message.
 		if s.respondNotDurableError(w, r, err) {
+			return
+		}
+		if errors.Is(err, errIdempotencyKeyConflict) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error(), "reason": "IDEMPOTENCY_KEY_REUSED"})
 			return
 		}
 		http.Error(w, err.Error(), 400)
@@ -5271,6 +5397,10 @@ func (s *Server) rerunRun(w http.ResponseWriter, r *http.Request) {
 // then enqueues through the DB path.
 func (s *Server) rerunRunDB(w http.ResponseWriter, r *http.Request, id string) {
 	ctx := r.Context()
+	idempotencyKey, hasIdempotencyKey, keyOK := readIdempotencyKey(w, r)
+	if !keyOK {
+		return
+	}
 	old, err := s.DB.GetRun(ctx, id)
 	if errors.Is(err, storage.ErrNotFound) {
 		http.NotFound(w, r)
@@ -5316,14 +5446,23 @@ func (s *Server) rerunRunDB(w http.ResponseWriter, r *http.Request, id string) {
 	if repoID == "" {
 		repoID = policyID
 	}
-	run, err := s.enqueue(r.Context(), SubmitRun{RepoID: repoID, PolicyRepoID: policyID, CheckoutRepoURL: checkoutURLForRun(old),
+	in := SubmitRun{RepoID: repoID, PolicyRepoID: policyID, CheckoutRepoURL: checkoutURLForRun(old),
 		RepoURL: old.Repo, RepoFullName: old.RepoFullName, Ref: old.Ref, SHA: old.SHA, Event: old.Event, Pipeline: pipelineText,
 		ForgeKind: old.ForgeKind, ForgeHost: old.ForgeHost,
-		Trusted: rerunTrusted(r, old), Metadata: meta, identityBound: true})
+		Trusted: rerunTrusted(r, old), Metadata: meta, identityBound: true}
+	if hasIdempotencyKey {
+		in.idempotencyKey = idempotencyKey
+		in.idempotencyDigest = submissionIdempotencyDigest(&in, "rerun", id)
+	}
+	run, err := s.enqueue(r.Context(), in)
 	if err != nil {
 		// Same durability mapping as rerunRun: persistence failures answer
 		// 503 with the fixed opaque body, validation errors keep their 400.
 		if s.respondNotDurableError(w, r, err) {
+			return
+		}
+		if errors.Is(err, errIdempotencyKeyConflict) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error(), "reason": "IDEMPOTENCY_KEY_REUSED"})
 			return
 		}
 		http.Error(w, err.Error(), 400)
@@ -5840,7 +5979,7 @@ func (s *Server) persistLocked() error {
 		s.notePersistResult(s.persistFailForTest)
 		return s.persistFailForTest
 	}
-	err := s.store.Save(storage.Snapshot{Version: 1, Runs: s.runs, Jobs: s.jobs, Runners: s.runners, Artifacts: s.artifacts, Reports: s.reports, DownstreamLinks: s.downstreamLinks, Profiles: s.profiles, CertProfileLinks: s.certProfiles, RunnerProfileLinks: s.runnerProfiles, Snapshots: s.snapshots, CompletionReceipts: s.completionReceiptRecordsLocked(), Deployments: s.deployments, CRL: s.crl, PendingSidecars: s.pendingSidecarSnapshotLocked()})
+	err := s.store.Save(storage.Snapshot{Version: 1, Runs: s.runs, Jobs: s.jobs, Runners: s.runners, Artifacts: s.artifacts, Reports: s.reports, DownstreamLinks: s.downstreamLinks, Profiles: s.profiles, CertProfileLinks: s.certProfiles, RunnerProfileLinks: s.runnerProfiles, Snapshots: s.snapshots, CompletionReceipts: s.completionReceiptRecordsLocked(), Deployments: s.deployments, CRL: s.crl, PendingSidecars: s.pendingSidecarSnapshotLocked(), RunIdempotency: s.idempotency})
 	s.noteSnapshotPersistResult(err)
 	return err
 }

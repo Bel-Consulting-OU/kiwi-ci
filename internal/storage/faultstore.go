@@ -182,6 +182,7 @@ var (
 	_ RunPageAuthorizedStore         = (*FaultyStore)(nil)
 	_ RunnerProfileLinkStore         = (*FaultyStore)(nil)
 	_ LiveProfileResolver            = (*FaultyStore)(nil)
+	_ QueuedJobPageStore             = (*FaultyStore)(nil)
 )
 
 func (f *FaultyStore) Close() error { return f.Inner.Close() }
@@ -313,6 +314,18 @@ func (f *FaultyStore) SetCountRunningJobsError(err error) {
 
 func (f *FaultyStore) ListQueuedJobs(ctx context.Context) ([]model.Job, error) {
 	return f.Inner.ListQueuedJobs(ctx)
+}
+
+// ListQueuedJobsPage delegates the bounded keyset-paged queued-candidate read
+// to Inner when it implements QueuedJobPageStore, and fails closed with a
+// diagnosable capability error otherwise. Like ListRunsPage it is a READ: the
+// FailAfter mutation counter is never consumed.
+func (f *FaultyStore) ListQueuedJobsPage(ctx context.Context, after *QueuedJobCursor, limit int, now time.Time) (QueuedJobPage, error) {
+	inner, ok := f.Inner.(QueuedJobPageStore)
+	if !ok {
+		return QueuedJobPage{}, errMissingInnerInterface("QueuedJobPageStore")
+	}
+	return inner.ListQueuedJobsPage(ctx, after, limit, now)
 }
 
 func (f *FaultyStore) ListJobsByEnvironment(ctx context.Context, repoID, environment string) ([]model.Job, error) {
@@ -678,6 +691,31 @@ func (f *FaultyStore) UpsertDelivery(ctx context.Context, forge, deliveryID stri
 
 func (f *FaultyStore) FindDelivery(ctx context.Context, forge, deliveryID string) (string, string, bool, error) {
 	return f.Inner.FindDelivery(ctx, forge, deliveryID)
+}
+
+// FindRunIdempotency delegates the durable idempotency-receipt read to Inner
+// when it implements RunIdempotencyStore, and fails closed with a
+// diagnosable capability error otherwise. It is a READ: the FailAfter
+// mutation counter is never consumed.
+func (f *FaultyStore) FindRunIdempotency(ctx context.Context, repoID, key string) (string, string, bool, error) {
+	inner, ok := f.Inner.(RunIdempotencyStore)
+	if !ok {
+		return "", "", false, errMissingInnerInterface("RunIdempotencyStore")
+	}
+	return inner.FindRunIdempotency(ctx, repoID, key)
+}
+
+func (f *FaultyStore) PruneRunIdempotency(ctx context.Context, olderThan time.Time, limit int) (int64, error) {
+	inner, ok := f.Inner.(RunIdempotencyStore)
+	if !ok {
+		return 0, errMissingInnerInterface("RunIdempotencyStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return 0, err
+	}
+	return inner.PruneRunIdempotency(ctx, olderThan, limit)
 }
 
 func (f *FaultyStore) TryAcquireLeadership(ctx context.Context, key string, ttl time.Duration) (bool, error) {
@@ -1906,16 +1944,20 @@ type memStore struct {
 	// key, mirroring migration 0018's forge_check_state table.
 	forgeState map[string]int64
 	// fragments is the generated-fragment idempotency receipt table.
-	fragments   map[string]GeneratedFragmentReceipt
-	schedules   map[string]Schedule
-	occurrences map[string]map[time.Time]string
-	deployments []model.Deployment
-	snapshots   []model.SnapshotRecord
-	contracts   map[string]map[string]ArtifactContract
-	downstream  map[string]DownstreamLink
-	quotas      map[string]quotaCounts
-	cacheMans   map[string]CacheManifestRecord
-	claims      map[string]time.Time
+	fragments map[string]GeneratedFragmentReceipt
+	// runIdempotency mirrors migration 0037's run_idempotency rows: the
+	// durable (repository, client key) receipts written in the same critical
+	// section that publishes the run.
+	runIdempotency map[string]RunIdempotencyClaim
+	schedules      map[string]Schedule
+	occurrences    map[string]map[time.Time]string
+	deployments    []model.Deployment
+	snapshots      []model.SnapshotRecord
+	contracts      map[string]map[string]ArtifactContract
+	downstream     map[string]DownstreamLink
+	quotas         map[string]quotaCounts
+	cacheMans      map[string]CacheManifestRecord
+	claims         map[string]time.Time
 	// pendingSidecars mirrors artifact_pending_sidecars (migration 0012).
 	pendingSidecars map[string]pendingSidecar
 
@@ -2027,6 +2069,7 @@ func newMemStore() *memStore {
 		outboxMeta:        map[string]outboxMeta{},
 		forgeState:        map[string]int64{},
 		fragments:         map[string]GeneratedFragmentReceipt{},
+		runIdempotency:    map[string]RunIdempotencyClaim{},
 		schedules:         map[string]Schedule{},
 		occurrences:       map[string]map[time.Time]string{},
 		contracts:         map[string]map[string]ArtifactContract{},
@@ -2076,6 +2119,7 @@ var (
 	_ ArtifactLookupStore            = (*memStore)(nil)
 	_ RunnerJobStore                 = (*memStore)(nil)
 	_ RunEnqueueStore                = (*memStore)(nil)
+	_ RunIdempotencyStore            = (*memStore)(nil)
 	_ AtomicLeaseStore               = (*memStore)(nil)
 	_ QuotaCounterStore              = (*memStore)(nil)
 	_ LiveProfileResolver            = (*memStore)(nil)
@@ -2316,6 +2360,47 @@ func (m *memStore) ListQueuedJobs(ctx context.Context) ([]model.Job, error) {
 		}
 	}
 	return out, nil
+}
+
+// ListQueuedJobsPage implements QueuedJobPageStore over the in-memory job
+// map: the same aged order (priority + wait/10min DESC, created_at ASC,
+// id ASC), the same persisted-deadline pushdown the SQL page applies (a row
+// carrying an elapsed queue_deadline column is never a candidate; the
+// scheduler still evaluates payload-derived deadlines in Go), and the same
+// keyset cursor semantics. The map under m.mu is a complete view, so paging
+// is deterministic.
+func (m *memStore) ListQueuedJobsPage(ctx context.Context, after *QueuedJobCursor, limit int, now time.Time) (QueuedJobPage, error) {
+	limit = NormalizeQueuedJobPageLimit(limit)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	eligible := make([]model.Job, 0, len(m.jobs))
+	for _, j := range m.jobs {
+		if j.Status != model.StatusQueued {
+			continue
+		}
+		if j.QueueDeadline != nil && !j.QueueDeadline.After(now) {
+			continue
+		}
+		if after != nil && !queuedJobAfterCursor(j, *after, now) {
+			continue
+		}
+		eligible = append(eligible, j)
+	}
+	sortQueuedJobsAged(eligible, now)
+	page := QueuedJobPage{Jobs: eligible}
+	if len(eligible) > limit {
+		page.Jobs = eligible[:limit]
+		page.HasMore = true
+	}
+	if len(page.Jobs) > 0 {
+		last := page.Jobs[len(page.Jobs)-1]
+		page.Last = QueuedJobCursor{
+			AgedPriority: queuedJobAgedPriority(last, now),
+			CreatedAt:    last.CreatedAt,
+			ID:           last.ID,
+		}
+	}
+	return page, nil
 }
 
 // ListJobsByEnvironment mirrors the SQL store: jobs are matched on the
@@ -3368,6 +3453,49 @@ func (m *memStore) UpsertDelivery(ctx context.Context, forge, deliveryID string,
 	defer m.mu.Unlock()
 	m.deliveries[forge+"/"+deliveryID] = runID + "/" + payloadDigest
 	return nil
+}
+
+// memIdempotencyKey namespaces one client key by its canonical repository
+// scope. NUL cannot occur in either part (both are validated text), so the
+// composite is unambiguous.
+func memIdempotencyKey(repoID, key string) string { return repoID + "\x00" + key }
+
+func (m *memStore) FindRunIdempotency(ctx context.Context, repoID, key string) (string, string, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.runIdempotency[memIdempotencyKey(repoID, key)]
+	if !ok {
+		return "", "", false, nil
+	}
+	return r.RunID, r.Digest, true, nil
+}
+
+func (m *memStore) PruneRunIdempotency(ctx context.Context, olderThan time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	type candidate struct {
+		key string
+		at  time.Time
+	}
+	var candidates []candidate
+	for k, r := range m.runIdempotency {
+		if r.CreatedAt.IsZero() || r.CreatedAt.Before(olderThan) {
+			candidates = append(candidates, candidate{key: k, at: r.CreatedAt})
+		}
+	}
+	// Oldest first; a zero timestamp (legacy/incomplete receipt) sorts first
+	// so it is aged out before live ones.
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].at.Before(candidates[j].at) })
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	for _, c := range candidates {
+		delete(m.runIdempotency, c.key)
+	}
+	return int64(len(candidates)), nil
 }
 
 func (m *memStore) FindDelivery(ctx context.Context, forge, deliveryID string) (string, string, bool, error) {
@@ -4692,6 +4820,19 @@ func (m *memStore) InsertCompiledRun(ctx context.Context, req InsertCompiledRunR
 			return ErrDeliveryDuplicate
 		}
 	}
+	// The run-idempotency receipt is validated against the staged request,
+	// mirroring the SQL transaction where the receipt insert precedes the
+	// run insert: a same-digest replay returns the original run and a
+	// different-digest reuse of the key fails closed, both without touching
+	// any committed row.
+	if req.Idempotency != nil {
+		if stored, exists := m.runIdempotency[memIdempotencyKey(req.Idempotency.RepoID, req.Idempotency.Key)]; exists {
+			if stored.Digest == req.Idempotency.Digest {
+				return &IdempotentReplayError{RunID: stored.RunID}
+			}
+			return ErrIdempotencyKeyConflict
+		}
+	}
 	// Commit: from here on nothing can fail, so the staged reservations, the
 	// superseded cancellations and the new run land together.
 	if stagedDownstream != nil {
@@ -4748,6 +4889,9 @@ func (m *memStore) InsertCompiledRun(ctx context.Context, req InsertCompiledRunR
 	}
 	if req.BodyClaim != nil {
 		m.deliveries[req.BodyClaim.Forge+"/"+req.BodyClaim.DeliveryID] = runID + "/" + req.BodyClaim.PayloadDigest
+	}
+	if req.Idempotency != nil {
+		m.runIdempotency[memIdempotencyKey(req.Idempotency.RepoID, req.Idempotency.Key)] = *req.Idempotency
 	}
 	if req.ScheduleClaim != nil {
 		byNominal, ok := m.occurrences[req.ScheduleClaim.ScheduleID]

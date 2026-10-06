@@ -47,6 +47,15 @@ const (
 	// DefaultLeaderKey names the leadership lock slot shared by every
 	// instance of the same control plane.
 	DefaultLeaderKey = "kiwi-scheduler"
+	// DefaultCandidatePageSize is the queued-candidate page size used when
+	// none is configured.
+	DefaultCandidatePageSize = 256
+	// DefaultMaxCandidateRows bounds the queued candidates one lease attempt
+	// materializes across all pages.
+	DefaultMaxCandidateRows = 4096
+	// DefaultReservationWait is the default reservation-head wait: zero makes
+	// a resource-blocked candidate block starving backfill immediately.
+	DefaultReservationWait = time.Duration(0)
 )
 
 // Scheduler is the control-plane scheduling contract. Implementations operate
@@ -85,6 +94,16 @@ type DBScheduler struct {
 	repoConcurrency float64
 	teamConcurrency float64
 
+	// Lease scan bounds: the queued-candidate page size, the total candidate
+	// rows one lease attempt may materialize, and the reservation-head wait
+	// (see Lease). Installed through SetLeaseScanLimits, mutex-guarded like
+	// the quota limits because Lease can run concurrently from runner poll
+	// goroutines.
+	leaseScanMu       sync.Mutex
+	candidatePageSize int
+	maxCandidateRows  int
+	reservationWait   time.Duration
+
 	// leader is true while this instance holds the leadership claim.
 	// Access is atomic: Lease and IsLeader can run concurrently from
 	// runner poll goroutines.
@@ -108,6 +127,47 @@ func (s *DBScheduler) quotaLimits() (repo, team float64) {
 	s.quotaMu.Lock()
 	defer s.quotaMu.Unlock()
 	return s.repoConcurrency, s.teamConcurrency
+}
+
+// SetLeaseScanLimits installs the lease candidate-scan bounds: the
+// keyset-page size, the maximum candidate rows one Lease attempt may
+// materialize across pages, and the reservation-head wait. Non-positive
+// pageSize/maxRows select DefaultCandidatePageSize/DefaultMaxCandidateRows;
+// a negative reservationWait is clamped to zero (immediate head activation).
+// Safe for concurrent use with Lease.
+func (s *DBScheduler) SetLeaseScanLimits(pageSize, maxRows int, reservationWait time.Duration) {
+	if pageSize <= 0 {
+		pageSize = DefaultCandidatePageSize
+	}
+	if maxRows <= 0 {
+		maxRows = DefaultMaxCandidateRows
+	}
+	if reservationWait < 0 {
+		reservationWait = 0
+	}
+	s.leaseScanMu.Lock()
+	s.candidatePageSize = pageSize
+	s.maxCandidateRows = maxRows
+	s.reservationWait = reservationWait
+	s.leaseScanMu.Unlock()
+}
+
+// leaseScanLimits returns the current lease candidate-scan bounds, applying
+// the built-in defaults to a scheduler that was never configured.
+func (s *DBScheduler) leaseScanLimits() (pageSize, maxRows int, reservationWait time.Duration) {
+	s.leaseScanMu.Lock()
+	pageSize, maxRows, reservationWait = s.candidatePageSize, s.maxCandidateRows, s.reservationWait
+	s.leaseScanMu.Unlock()
+	if pageSize <= 0 {
+		pageSize = DefaultCandidatePageSize
+	}
+	if maxRows <= 0 {
+		maxRows = DefaultMaxCandidateRows
+	}
+	if reservationWait < 0 {
+		reservationWait = 0
+	}
+	return pageSize, maxRows, reservationWait
 }
 
 // NewDB constructs a DBScheduler backed by store and attempts to acquire the
@@ -250,6 +310,32 @@ func (s *DBScheduler) Enqueue(ctx context.Context, run model.Run, jobs map[strin
 // dimensions zero, the documented default) admits every candidate: only the
 // job-count capacity applies.
 //
+// BOUNDED CANDIDATE SCAN: one /next poll materializes at most
+// maxCandidateRows queued candidates, requested in keyset pages of at most
+// candidatePageSize from a store implementing storage.QueuedJobPageStore
+// (the durable and in-memory stores do); a store without the contract falls
+// back to the historical whole-queue ListQueuedJobs read. Pages are walked
+// in the aged order (aged priority DESC, created_at ASC, id ASC — see
+// orderQueuedJobs), the same order the page store returns, so bounding the
+// scan never changes the fairness policy.
+//
+// RESERVATION POLICY (anti-backfill): the first resource-blocked candidate
+// in aged order that is still eligible on every other gate becomes the
+// request's RESERVATION HEAD — the job that would run on this runner once
+// its current reservations drain. A candidate above the runner's configured
+// capacity (never satisfiable) can never become the head: an oversized job
+// must not block backfill. While a head is active, a resource-fitting
+// candidate is claimed only when the head would still fit after admitting it
+// (reserved + candidate + head against the configured capacity, checked on
+// the dimensions the candidate actually requests): a conflicting backfill
+// that would occupy the head's starved dimension is skipped, while a
+// non-conflicting one — e.g. a memory-only job alongside a CPU-blocked head —
+// is admitted, so free capacity is not wasted and a stream of individually
+// fitting backfills cannot re-accumulate into starvation. reservationWait
+// delays head activation so a freshly queued large job grants a grace period
+// to backfill already fitting the runner. The head is request-local and
+// never persisted; a successful claim ends the walk.
+//
 // Deliberately NOT epoch-fenced, unlike the leader-only housekeeping
 // mutations: the lease claim is itself a single atomic conditional
 // transaction (AcquireLeaseAtomic / AcquireLease) whose mutual exclusion comes
@@ -288,215 +374,405 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 	// lock). A store without the reservation contract reports zero, which
 	// makes the pre-filter vacuous.
 	reserved := s.reservedResources(ctx, runnerID)
-	queued, err := s.Store.ListQueuedJobs(ctx)
-	if err != nil {
-		return nil, "", time.Time{}, err
-	}
-	orderQueuedJobs(queued, now)
+	// One lease attempt materializes at most maxCandidateRows candidates in
+	// keyset pages of at most candidatePageSize (see SetLeaseScanLimits).
+	pageSize, maxRows, reservationWait := s.leaseScanLimits()
 	repoConcurrency, teamConcurrency := s.quotaLimits()
-	runJobs := map[string]map[string]model.Job{}
-	envJobs := map[string][]model.Job{}
-	for _, candidate := range queued {
-		// Queue-timeout expiry: a candidate whose queue deadline has passed
-		// is never leased; RecoverExpired cancels it. Both the atomic-lease
-		// and the plain-lease branches below share this gate.
-		if dl := QueueDeadlineFor(candidate); dl != nil && !dl.After(now) {
-			continue
-		}
-		// Resource admission pre-filter: a candidate that cannot fit the
-		// runner's remaining resource capacity waits for room on this
-		// runner (or a lease on another one) instead of being claimed and
-		// rolling back. The requested total is the job's OWN request plus
-		// its aggregate service envelope (model.Job.ReservedResources) —
-		// the same total the claim transaction and the fs/dev path charge.
-		if !(storage.ResourceAdmission{
-			Capacity:  eff.ResourceCapacity,
-			Reserved:  reserved,
-			Requested: candidate.ReservedResources(),
-		}).Allows() {
-			continue
-		}
-		// The shared predicate is the same decision the SQL claim and the
-		// in-memory stores apply: admission state (disabled/draining,
-		// capacity), labels, canonical repo ACL, runtime capability,
-		// enforced-policy runtime grant, placement regions and environment
-		// concurrency.
-		envRunning := 0
-		if candidate.Environment != "" && candidate.EnvironmentConcurrency > 0 {
-			// The environment concurrency key is the CANONICAL repository
-			// identity plus the environment name (LeaseClaim.EnvKey): the
-			// same repository submitted via HTTPS and via SSH shares one
-			// slot pool, and a same-named environment on another repository
-			// never shares it.
-			repoID := storage.RepoIDForJob(candidate)
-			key := repoID + "\x00" + candidate.Environment
-			active, ok := envJobs[key]
-			if !ok {
-				all, err := s.Store.ListJobsByEnvironment(ctx, repoID, candidate.Environment)
-				if err != nil {
-					return nil, "", time.Time{}, err
-				}
-				envJobs[key] = all
-				active = all
+	walk := &leaseCandidateWalk{
+		s:               s,
+		ctx:             ctx,
+		now:             now,
+		runnerID:        runnerID,
+		ri:              ri,
+		eff:             eff,
+		reserved:        reserved,
+		repoConcurrency: repoConcurrency,
+		teamConcurrency: teamConcurrency,
+		reservationWait: reservationWait,
+		runJobs:         map[string]map[string]model.Job{},
+		envJobs:         map[string][]model.Job{},
+	}
+	scanned := 0
+	pageStore, hasPages := s.Store.(storage.QueuedJobPageStore)
+	if hasPages {
+		var after *storage.QueuedJobCursor
+		for scanned < maxRows {
+			pageLimit := pageSize
+			if remaining := maxRows - scanned; remaining < pageLimit {
+				pageLimit = remaining
 			}
-			for _, other := range active {
-				if other.ID != candidate.ID && other.Status == model.StatusRunning {
-					envRunning++
-				}
-			}
-		}
-		policyRuntimes, policyEnforced := storage.LeasePolicyRuntimes(candidate)
-		if !(storage.LeasePredicate{
-			Runner:         eff,
-			Job:            candidate,
-			EnvRunning:     envRunning,
-			PolicyEnforced: policyEnforced,
-			PolicyRuntimes: policyRuntimes,
-		}).Allows() {
-			continue
-		}
-		jobs, ok := runJobs[candidate.RunID]
-		if !ok {
-			all, err := s.Store.ListJobsByRun(ctx, candidate.RunID)
+			page, err := pageStore.ListQueuedJobsPage(ctx, after, pageLimit, now)
 			if err != nil {
 				return nil, "", time.Time{}, err
 			}
-			jobs = make(map[string]model.Job, len(all))
-			for _, j := range all {
-				jobs[j.ID] = j
+			if len(page.Jobs) == 0 {
+				break
 			}
-			runJobs[candidate.RunID] = jobs
-		}
-		ready, outcome := DependencyOutcome(candidate.Needs, nil, func(id string) (model.Status, bool) {
-			d, ok := jobs[id]
-			return d.Status, ok
-		})
-		if !ready || (outcome != model.StatusSuccess && !ConditionAllows(candidate.Condition, outcome)) {
-			continue
-		}
-		raw, err := s.NewToken()
-		if err != nil {
-			return nil, "", time.Time{}, err
-		}
-		expires := LeaseExpiry(now, s.LeaseDuration)
-		generation := candidate.LeaseGeneration + 1
-		claim := storage.LeaseClaim{
-			JobID:      candidate.ID,
-			RunnerID:   runnerID,
-			TokenHash:  s.HashToken(raw),
-			Generation: generation,
-			ExpiresAt:  expires,
-			// A DB-clock store derives the stored expiry from this TTL and
-			// its own live clock, so cross-replica application-clock skew
-			// cannot shorten or lengthen the real lease.
-			TTL:                    s.LeaseDuration,
-			RunnerCapacity:         eff.Capacity,
-			Runtime:                storage.JobRuntime(candidate),
-			CanonRepoID:            storage.RepoIDForJob(candidate),
-			RepoFullName:           candidate.RepoFullName,
-			RequiredLabels:         candidate.RequiredLabels,
-			PlacementRegions:       candidate.PlacementRegions,
-			Environment:            candidate.Environment,
-			EnvironmentConcurrency: candidate.EnvironmentConcurrency,
-			RepoConcurrency:        repoConcurrency,
-			TeamConcurrency:        teamConcurrency,
-			CPURequest:             candidate.CPURequest,
-			MemoryRequest:          candidate.MemoryRequest,
-			DiskRequest:            candidate.DiskRequest,
-			PIDsRequest:            candidate.PIDsRequest,
-			// The aggregate service envelope rides the claim so the claim
-			// transaction reserves job request + envelope in the ONE
-			// ledger row (LeaseClaim.RequestedResources).
-			ServiceEnvelopeRequest: candidate.ServiceEnvelopeRequest,
-			// A quarantined candidate carries the durable identity flag, so
-			// the SQL claim denies it independently of every allowlist just
-			// as the in-memory predicate does (R1-6).
-			Quarantined: candidate.RepoIdentityQuarantined,
-		}
-		// Capacity-atomic lease: the job claim, every predicate above, the
-		// resource reservation and the runner's active-jobs append happen in
-		// ONE transaction, so two concurrent leases can never exceed the
-		// runner's capacity — count or resources — bypass a concurrent
-		// disable/drain or overrun environment/quota limits.
-		// The separate UpsertRunner afterwards is skipped because the store
-		// already updated the runner row.
-		clockStore, hasClock := s.Store.(storage.LeaseClockStore)
-		atomicStore, hasAtomic := s.Store.(storage.AtomicLeaseStore)
-		if hasClock || hasAtomic {
-			var j model.Job
-			var err error
-			if hasClock {
-				j, err = clockStore.AcquireLeaseWithTTL(ctx, claim)
-			} else {
-				j, err = atomicStore.AcquireLeaseAtomic(ctx, claim)
-			}
-			switch {
-			case err == nil:
-				j.NeedsOutputs = CollectNeedsOutputs(candidate, jobs)
-				// Prefer the STORE-assigned expiry (a DB-clock store wrote
-				// clock_timestamp()+TTL); the app-clock instant is only the
-				// fallback for stores without a live clock.
-				exp := expires
-				if j.LeaseExpiresAt != nil {
-					exp = *j.LeaseExpiresAt
+			// The page store already returns the aged order; re-applying the
+			// local ordering keeps the in-page decision identical to the
+			// historical whole-queue walk even if a store returns a page in
+			// a looser order.
+			orderQueuedJobs(page.Jobs, now)
+			scanned += len(page.Jobs)
+			for _, candidate := range page.Jobs {
+				res := walk.consider(candidate)
+				if res.err != nil {
+					return nil, "", time.Time{}, res.err
 				}
-				return &j, raw, exp, nil
-			case errors.Is(err, storage.ErrLeaseConflict):
-				continue
-			case errors.Is(err, storage.ErrNoCapacity),
-				errors.Is(err, storage.ErrEnvConcurrency),
-				errors.Is(err, storage.ErrResourceCapacity),
-				errors.Is(err, storage.ErrQuotaExceeded):
-				// A predicate lost a race (filled capacity slot, taken
-				// environment slot, exhausted resource capacity or quota) or
-				// this candidate is not eligible for this runner: try the
-				// next candidate.
-				continue
-			default:
-				return nil, "", time.Time{}, err
+				if res.claimed {
+					return res.job, res.raw, res.expires, nil
+				}
 			}
+			if !page.HasMore || scanned >= maxRows {
+				break
+			}
+			cursor := page.Last
+			after = &cursor
 		}
-		j, err := s.Store.AcquireLease(ctx, candidate.ID, runnerID, s.HashToken(raw), generation, expires)
-		if errors.Is(err, storage.ErrLeaseConflict) {
-			// Another leader raced us (or the row moved); try the next candidate.
-			continue
-		}
+	} else {
+		// Historical fallback for stores without the paged candidate
+		// contract: materialize the whole queue and walk it in the same aged
+		// order, still bounded by maxCandidateRows.
+		queued, err := s.Store.ListQueuedJobs(ctx)
 		if err != nil {
 			return nil, "", time.Time{}, err
 		}
-		// The plain-lease fallback persists no rates (its signature has no
-		// rate source): freeze the live rates on the returned job and
-		// persist them so completion accounting stays identical to the
-		// atomic path.
-		j.CostRate = eff.CostPerHour
-		j.PowerWatts = eff.PowerWatts
-		if j.StartedAt == nil {
-			j.StartedAt = &now
+		orderQueuedJobs(queued, now)
+		for i := range queued {
+			if scanned >= maxRows {
+				break
+			}
+			scanned++
+			res := walk.consider(queued[i])
+			if res.err != nil {
+				return nil, "", time.Time{}, res.err
+			}
+			if res.claimed {
+				return res.job, res.raw, res.expires, nil
+			}
 		}
-		j.NeedsOutputs = CollectNeedsOutputs(candidate, jobs)
-		if err := s.Store.UpdateJob(ctx, j); err != nil {
-			log.Printf("scheduler: persist frozen rates for %s: %v", j.ID, err)
-		}
-		ri.ActiveJobs = appendUnique(ri.ActiveJobs, j.ID)
-		ri.Busy = len(ri.ActiveJobs) >= ri.Capacity
-		ri.CurrentJob = ""
-		if len(ri.ActiveJobs) > 0 {
-			ri.CurrentJob = ri.ActiveJobs[0]
-		}
-		if err := s.Store.UpsertRunner(ctx, ri); err != nil {
-			// The lease is already durably held; a runner bookkeeping failure
-			// must not strand the job.
-			log.Printf("scheduler: update runner %s after lease: %v", runnerID, err)
-		}
-		// last_seen belongs to the narrow touch (the generic profile write
-		// preserves the committed value), so advance it explicitly through
-		// the capability when the store has it.
-		if hs, ok := s.Store.(storage.RunnerHeartbeatStore); ok {
-			_ = hs.TouchRunnerLastSeen(ctx, runnerID)
-		}
-		return &j, raw, expires, nil
 	}
 	return nil, "", time.Time{}, ErrNoJobs
+}
+
+// leaseCandidateWalk is the request-local state of ONE Lease candidate scan:
+// the effective runner, the live reservation snapshot, the memo caches and
+// the reservation head (see Lease).
+type leaseCandidateWalk struct {
+	s               *DBScheduler
+	ctx             context.Context
+	now             time.Time
+	runnerID        string
+	ri              model.Runner
+	eff             model.Runner
+	reserved        model.ResourceCapacity
+	repoConcurrency float64
+	teamConcurrency float64
+	reservationWait time.Duration
+	runJobs         map[string]map[string]model.Job
+	envJobs         map[string][]model.Job
+	// head is the reservation head: the first resource-blocked but otherwise
+	// eligible candidate in aged order. Nil while none was seen.
+	head *model.Job
+}
+
+// leaseWalkResult is the outcome of considering one candidate: a successful
+// claim, a fatal error, or "keep scanning" (every field zero).
+type leaseWalkResult struct {
+	job     *model.Job
+	raw     string
+	expires time.Time
+	claimed bool
+	err     error
+}
+
+// consider runs the per-candidate decision in the required order: queue
+// deadline, resource admission, then (for a resource-blocked candidate that
+// may become the reservation head, and for a resource-fitting candidate
+// before claiming) environment concurrency, the shared lease predicate and
+// dependency readiness. A blocked candidate is never claimed — it only
+// records the reservation head; a fitting candidate that would starve an
+// active head is skipped before any of its other gates are evaluated.
+func (w *leaseCandidateWalk) consider(candidate model.Job) leaseWalkResult {
+	// Queue-timeout expiry: a candidate whose queue deadline has passed is
+	// never leased; RecoverExpired cancels it. Both the atomic-lease and the
+	// plain-lease branches below share this gate.
+	if dl := QueueDeadlineFor(candidate); dl != nil && !dl.After(w.now) {
+		return leaseWalkResult{}
+	}
+	// Resource admission pre-filter: a candidate that cannot fit the
+	// runner's remaining resource capacity waits for room on this runner
+	// (or a lease on another one) instead of being claimed and rolling
+	// back. The requested total is the job's OWN request plus its aggregate
+	// service envelope (model.Job.ReservedResources) — the same total the
+	// claim transaction and the fs/dev path charge.
+	adm := storage.ResourceAdmission{
+		Capacity:  w.eff.ResourceCapacity,
+		Reserved:  w.reserved,
+		Requested: candidate.ReservedResources(),
+	}
+	if !adm.Allows() {
+		if w.head != nil || !adm.EverSatisfiable() {
+			return leaseWalkResult{}
+		}
+		// Reservation head candidate: evaluate the remaining gates so a job
+		// that cannot run on this runner for a non-resource reason (labels,
+		// runtime, region, environment, dependencies) never blocks backfill.
+		_, eligible, err := w.eligible(candidate)
+		if err != nil {
+			return leaseWalkResult{err: err}
+		}
+		if !eligible {
+			return leaseWalkResult{}
+		}
+		// Head activation wait: two-phase fairness, and zero (the default)
+		// activates immediately.
+		if w.reservationWait > 0 && w.now.Sub(candidate.CreatedAt) < w.reservationWait {
+			return leaseWalkResult{}
+		}
+		head := candidate
+		w.head = &head
+		return leaseWalkResult{}
+	}
+	if w.head != nil && !w.headFitsAlongside(candidate) {
+		// Claiming this candidate would consume capacity the head needs
+		// once the runner's current reservations drain: skip it so a stream
+		// of smaller backfill jobs cannot starve the head.
+		return leaseWalkResult{}
+	}
+	jobs, eligible, err := w.eligible(candidate)
+	if err != nil {
+		return leaseWalkResult{err: err}
+	}
+	if !eligible {
+		return leaseWalkResult{}
+	}
+	raw, err := w.s.NewToken()
+	if err != nil {
+		return leaseWalkResult{err: err}
+	}
+	expires := LeaseExpiry(w.now, w.s.LeaseDuration)
+	generation := candidate.LeaseGeneration + 1
+	claim := storage.LeaseClaim{
+		JobID:      candidate.ID,
+		RunnerID:   w.runnerID,
+		TokenHash:  w.s.HashToken(raw),
+		Generation: generation,
+		ExpiresAt:  expires,
+		// A DB-clock store derives the stored expiry from this TTL and
+		// its own live clock, so cross-replica application-clock skew
+		// cannot shorten or lengthen the real lease.
+		TTL:                    w.s.LeaseDuration,
+		RunnerCapacity:         w.eff.Capacity,
+		Runtime:                storage.JobRuntime(candidate),
+		CanonRepoID:            storage.RepoIDForJob(candidate),
+		RepoFullName:           candidate.RepoFullName,
+		RequiredLabels:         candidate.RequiredLabels,
+		PlacementRegions:       candidate.PlacementRegions,
+		Environment:            candidate.Environment,
+		EnvironmentConcurrency: candidate.EnvironmentConcurrency,
+		RepoConcurrency:        w.repoConcurrency,
+		TeamConcurrency:        w.teamConcurrency,
+		CPURequest:             candidate.CPURequest,
+		MemoryRequest:          candidate.MemoryRequest,
+		DiskRequest:            candidate.DiskRequest,
+		PIDsRequest:            candidate.PIDsRequest,
+		// The aggregate service envelope rides the claim so the claim
+		// transaction reserves job request + envelope in the ONE
+		// ledger row (LeaseClaim.RequestedResources).
+		ServiceEnvelopeRequest: candidate.ServiceEnvelopeRequest,
+		// A quarantined candidate carries the durable identity flag, so
+		// the SQL claim denies it independently of every allowlist just
+		// as the in-memory predicate does (R1-6).
+		Quarantined: candidate.RepoIdentityQuarantined,
+	}
+	// Capacity-atomic lease: the job claim, every predicate above, the
+	// resource reservation and the runner's active-jobs append happen in
+	// ONE transaction, so two concurrent leases can never exceed the
+	// runner's capacity — count or resources — bypass a concurrent
+	// disable/drain or overrun environment/quota limits.
+	// The separate UpsertRunner afterwards is skipped because the store
+	// already updated the runner row.
+	clockStore, hasClock := w.s.Store.(storage.LeaseClockStore)
+	atomicStore, hasAtomic := w.s.Store.(storage.AtomicLeaseStore)
+	if hasClock || hasAtomic {
+		var j model.Job
+		var err error
+		if hasClock {
+			j, err = clockStore.AcquireLeaseWithTTL(w.ctx, claim)
+		} else {
+			j, err = atomicStore.AcquireLeaseAtomic(w.ctx, claim)
+		}
+		switch {
+		case err == nil:
+			j.NeedsOutputs = CollectNeedsOutputs(candidate, jobs)
+			// Prefer the STORE-assigned expiry (a DB-clock store wrote
+			// clock_timestamp()+TTL); the app-clock instant is only the
+			// fallback for stores without a live clock.
+			exp := expires
+			if j.LeaseExpiresAt != nil {
+				exp = *j.LeaseExpiresAt
+			}
+			return leaseWalkResult{job: &j, raw: raw, expires: exp, claimed: true}
+		case errors.Is(err, storage.ErrLeaseConflict):
+			return leaseWalkResult{}
+		case errors.Is(err, storage.ErrNoCapacity),
+			errors.Is(err, storage.ErrEnvConcurrency),
+			errors.Is(err, storage.ErrResourceCapacity),
+			errors.Is(err, storage.ErrQuotaExceeded):
+			// A predicate lost a race (filled capacity slot, taken
+			// environment slot, exhausted resource capacity or quota) or
+			// this candidate is not eligible for this runner: try the
+			// next candidate.
+			return leaseWalkResult{}
+		default:
+			return leaseWalkResult{err: err}
+		}
+	}
+	j, err := w.s.Store.AcquireLease(w.ctx, candidate.ID, w.runnerID, w.s.HashToken(raw), generation, expires)
+	if errors.Is(err, storage.ErrLeaseConflict) {
+		// Another leader raced us (or the row moved); try the next candidate.
+		return leaseWalkResult{}
+	}
+	if err != nil {
+		return leaseWalkResult{err: err}
+	}
+	// The plain-lease fallback persists no rates (its signature has no
+	// rate source): freeze the live rates on the returned job and
+	// persist them so completion accounting stays identical to the
+	// atomic path.
+	j.CostRate = w.eff.CostPerHour
+	j.PowerWatts = w.eff.PowerWatts
+	if j.StartedAt == nil {
+		j.StartedAt = &w.now
+	}
+	j.NeedsOutputs = CollectNeedsOutputs(candidate, jobs)
+	if err := w.s.Store.UpdateJob(w.ctx, j); err != nil {
+		log.Printf("scheduler: persist frozen rates for %s: %v", j.ID, err)
+	}
+	ri := w.ri
+	ri.ActiveJobs = appendUnique(ri.ActiveJobs, j.ID)
+	ri.Busy = len(ri.ActiveJobs) >= ri.Capacity
+	ri.CurrentJob = ""
+	if len(ri.ActiveJobs) > 0 {
+		ri.CurrentJob = ri.ActiveJobs[0]
+	}
+	if err := w.s.Store.UpsertRunner(w.ctx, ri); err != nil {
+		// The lease is already durably held; a runner bookkeeping failure
+		// must not strand the job.
+		log.Printf("scheduler: update runner %s after lease: %v", w.runnerID, err)
+	}
+	// last_seen belongs to the narrow touch (the generic profile write
+	// preserves the committed value), so advance it explicitly through
+	// the capability when the store has it.
+	if hs, ok := w.s.Store.(storage.RunnerHeartbeatStore); ok {
+		_ = hs.TouchRunnerLastSeen(w.ctx, w.runnerID)
+	}
+	return leaseWalkResult{job: &j, raw: raw, expires: expires, claimed: true}
+}
+
+// eligible evaluates the non-resource gates for one candidate — environment
+// concurrency, the shared lease predicate and dependency readiness — and
+// returns the candidate run's job map on success (the claim's
+// CollectNeedsOutputs input). The environment listing and the run's jobs are
+// memoized per lease attempt, exactly as the historical walk did.
+func (w *leaseCandidateWalk) eligible(candidate model.Job) (map[string]model.Job, bool, error) {
+	// The shared predicate is the same decision the SQL claim and the
+	// in-memory stores apply: admission state (disabled/draining,
+	// capacity), labels, canonical repo ACL, runtime capability,
+	// enforced-policy runtime grant, placement regions and environment
+	// concurrency.
+	envRunning := 0
+	if candidate.Environment != "" && candidate.EnvironmentConcurrency > 0 {
+		// The environment concurrency key is the CANONICAL repository
+		// identity plus the environment name (LeaseClaim.EnvKey): the
+		// same repository submitted via HTTPS and via SSH shares one
+		// slot pool, and a same-named environment on another repository
+		// never shares it.
+		repoID := storage.RepoIDForJob(candidate)
+		key := repoID + "\x00" + candidate.Environment
+		active, ok := w.envJobs[key]
+		if !ok {
+			all, err := w.s.Store.ListJobsByEnvironment(w.ctx, repoID, candidate.Environment)
+			if err != nil {
+				return nil, false, err
+			}
+			w.envJobs[key] = all
+			active = all
+		}
+		for _, other := range active {
+			if other.ID != candidate.ID && other.Status == model.StatusRunning {
+				envRunning++
+			}
+		}
+	}
+	policyRuntimes, policyEnforced := storage.LeasePolicyRuntimes(candidate)
+	if !(storage.LeasePredicate{
+		Runner:         w.eff,
+		Job:            candidate,
+		EnvRunning:     envRunning,
+		PolicyEnforced: policyEnforced,
+		PolicyRuntimes: policyRuntimes,
+	}).Allows() {
+		return nil, false, nil
+	}
+	jobs, ok := w.runJobs[candidate.RunID]
+	if !ok {
+		all, err := w.s.Store.ListJobsByRun(w.ctx, candidate.RunID)
+		if err != nil {
+			return nil, false, err
+		}
+		jobs = make(map[string]model.Job, len(all))
+		for _, j := range all {
+			jobs[j.ID] = j
+		}
+		w.runJobs[candidate.RunID] = jobs
+	}
+	ready, outcome := DependencyOutcome(candidate.Needs, nil, func(id string) (model.Status, bool) {
+		d, ok := jobs[id]
+		return d.Status, ok
+	})
+	if !ready || (outcome != model.StatusSuccess && !ConditionAllows(candidate.Condition, outcome)) {
+		return nil, false, nil
+	}
+	return jobs, true, nil
+}
+
+// headFitsAlongside reports whether the reservation head would still fit the
+// runner's configured capacity after candidate C is admitted alongside it.
+// The check is dimension-scoped and cumulative:
+//
+//   - cumulative: the runner's CURRENT reservations are what the head is
+//     waiting to drain, but admitting C adds a new occupant that only drains
+//     later, so the comparison is reserved + C + head against the configured
+//     capacity. A per-candidate-only comparison would let a stream of
+//     individually-fitting backfills re-accumulate and starve the head again
+//     (e.g. a 4-CPU head with a stream of 4-CPU jobs on an 8-CPU runner).
+//   - dimension-scoped: only dimensions C actually requests can cause the
+//     starvation, so a candidate with a zero request in the head's starved
+//     dimension is admitted (a memory-only job alongside a CPU-blocked
+//     head). Including a dimension C does not touch would waste free
+//     capacity without protecting the head.
+//
+// A false result means admitting C could permanently occupy capacity the
+// head needs; the candidate is skipped.
+func (w *leaseCandidateWalk) headFitsAlongside(candidate model.Job) bool {
+	add := candidate.ReservedResources()
+	head := w.head.ReservedResources()
+	capacity := w.eff.ResourceCapacity
+	if capacity.CPU > 0 && add.CPU > 0 && w.reserved.CPU+add.CPU+head.CPU > capacity.CPU {
+		return false
+	}
+	if capacity.Memory > 0 && add.Memory > 0 && w.reserved.Memory+add.Memory+head.Memory > capacity.Memory {
+		return false
+	}
+	if capacity.Disk > 0 && add.Disk > 0 && w.reserved.Disk+add.Disk+head.Disk > capacity.Disk {
+		return false
+	}
+	if capacity.PIDs > 0 && add.PIDs > 0 && w.reserved.PIDs+add.PIDs+head.PIDs > capacity.PIDs {
+		return false
+	}
+	return true
 }
 
 // effectiveRunner resolves the runner's LIVE scheduling view at lease time

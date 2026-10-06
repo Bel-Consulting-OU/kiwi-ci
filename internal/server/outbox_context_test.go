@@ -541,8 +541,11 @@ func TestOwnedFilesPinContextCoupling(t *testing.T) {
 		"s.publishForgeStatus(pubCtx, run)",
 		"s.flushOutbox(ctx)",
 		"s.startSpan(ctx, \"server.enqueue\")",
+		// Both rerun handlers build in := SubmitRun{...} (now carrying the
+		// Idempotency-Key fields) and enqueue it on the request context:
+		// the pinned call shape below must appear at least once, which the
+		// two rerun paths guarantee.
 		"s.enqueue(r.Context(), in)",
-		"s.enqueue(r.Context(), SubmitRun{",
 		"s.enqueueID(ctx, in, \"\")",
 		"s.enqueueDB(ctx, in, run, created, jobContracts, group,",
 		"s.auditFirstLocked(r.Context(), \"runner.drain\",",

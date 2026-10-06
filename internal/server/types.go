@@ -68,6 +68,17 @@ type SubmitRun struct {
 	// (ChildRunID + StableChildID) commit atomically. It is never accepted
 	// from client JSON.
 	DownstreamLaunch *storage.DownstreamLaunchClaim `json:"-"`
+	// idempotencyKey is the client-supplied Idempotency-Key header of a
+	// direct API submission or rerun (never accepted from client JSON). It
+	// names one INTENDED operation: a retry after a lost response replays the
+	// durable receipt and returns the original run instead of enqueueing a
+	// duplicate.
+	idempotencyKey string `json:"-"`
+	// idempotencyDigest is the canonical digest of the request the key is
+	// bound to (the client-visible fields of a submit, the source run ID of
+	// a rerun). A replay with the same key but a different digest fails
+	// closed with 409.
+	idempotencyDigest string `json:"-"`
 }
 
 type Task struct {

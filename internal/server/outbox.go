@@ -27,6 +27,27 @@ const (
 	outboxDoneFile = "outbox.done.jsonl"
 )
 
+// outboxFSMaxBytes caps the fs pending journal read at startup. The journal is
+// an untrusted local file: a bug, a crash loop or tampering must not make the
+// server decode an unbounded amount of JSON into memory before it can serve.
+// Construction FAILS CLOSED when the cap is exceeded (see readItems): an
+// operator compacts or repairs the journal instead of the process silently
+// dropping intents.
+const outboxFSMaxBytes = 64 << 20
+
+// outboxFSMaxItems caps the number of decoded entries of the fs pending
+// journal, so a pathologically large journal made of many tiny lines is
+// bounded even below the byte cap. Construction FAILS CLOSED (see readItems).
+const outboxFSMaxItems = 100000
+
+// outboxDBMirrorWindow bounds how many due durable rows a DB-mode ReplayDB
+// call may mirror into memory. The DB dispatch path does NOT need the mirror:
+// flushDB claims bounded OutboxClaimBatch batches through ClaimOutbox and
+// mirrors exactly the rows it owns for the duration of the batch, so startup
+// never mirrors the durable backlog. ReplayDB remains for explicit callers
+// and is capped at this window; it is deliberately not called by SwitchToDB.
+const outboxDBMirrorWindow = storage.OutboxClaimBatch
+
 // outboxDoneMaxIDs bounds the acked-id set kept by the fs done journal and in
 // memory. The journal is append-only between compactions; compaction rewrites
 // outbox.jsonl to the currently-pending intents (dropping every acked line)
@@ -148,10 +169,17 @@ func (o *Outbox) dbMirrorItems(ctx context.Context) ([]storage.OutboxItem, error
 	return o.db.OutboxPending(ctx)
 }
 
-// ReplayDB loads unacked intents from the SQL store into memory (FIFO).
-// Only intents dispatchable now are mirrored (see dbMirrorItems): a delayed
-// row is left to the durable claim that fires once its backoff elapses, and
-// a dead letter is never resident.
+// ReplayDB loads unacked intents from the SQL store into memory (FIFO). Only
+// intents dispatchable now are mirrored (see dbMirrorItems): a delayed row is
+// left to the durable claim that fires once its backoff elapses, and a dead
+// letter is never resident.
+//
+// The mirror is BOUNDED to outboxDBMirrorWindow: dispatch never depends on it
+// (flushDB claims its own OutboxClaimBatch batches via ClaimOutbox and mirrors
+// exactly the claimed rows), and SwitchToDB deliberately does not call this
+// at all, so a large durable backlog is never materialized at startup. The
+// store interface returns a full slice, so the cap bounds the RESIDENT mirror;
+// only explicit callers pay the (still unbounded) store read.
 func (o *Outbox) ReplayDB(ctx context.Context) error {
 	if o.db == nil {
 		return nil
@@ -159,6 +187,13 @@ func (o *Outbox) ReplayDB(ctx context.Context) error {
 	items, err := o.dbMirrorItems(ctx)
 	if err != nil {
 		return err
+	}
+	// Bound the resident mirror BEFORE taking the lock. The store interface
+	// returns the full active slice, so this caps o.items (memory that
+	// outlives the call); the transient store read is bounded only by the
+	// store, which is exactly why startup does not call ReplayDB at all.
+	if len(items) > outboxDBMirrorWindow {
+		items = items[:outboxDBMirrorWindow]
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -272,6 +307,19 @@ func (o *Outbox) readItems() ([]forge.OutboxItem, error) {
 		return nil, err
 	}
 	defer f.Close()
+	// Bound the startup decode BEFORE decoding anything. The pending journal
+	// is decoded in full (unlike the append/ack paths, which touch one line),
+	// so an oversized or pathological journal would otherwise materialize
+	// unbounded memory and stall startup. Fail closed with a repair
+	// instruction: NewOutbox already refuses to start on an unreadable
+	// journal, and silently truncating would make pending intents invisible.
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if fi.Size() > outboxFSMaxBytes {
+		return nil, fmt.Errorf("%s: journal is %d bytes, over the %d-byte startup limit: compact or repair the journal before restarting", outboxFile, fi.Size(), outboxFSMaxBytes)
+	}
 	var out []forge.OutboxItem
 	dec := json.NewDecoder(f)
 	for {
@@ -283,6 +331,9 @@ func (o *Outbox) readItems() ([]forge.OutboxItem, error) {
 			return out, err
 		}
 		out = append(out, it)
+		if len(out) > outboxFSMaxItems {
+			return nil, fmt.Errorf("%s: more than %d pending entries: compact or repair the journal before restarting", outboxFile, outboxFSMaxItems)
+		}
 	}
 	return out, nil
 }

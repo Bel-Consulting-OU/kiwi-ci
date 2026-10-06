@@ -37,6 +37,27 @@ const (
 	MaxCompletionReceipts = 10_000
 )
 
+// IdempotencyReceipt is one fs-mode run-idempotency receipt (the
+// run_idempotency equivalents, migration 0037): a client Idempotency-Key
+// bound to the canonical repository scope, the canonical request digest and
+// the run the first submission produced. The receipt is written in the SAME
+// atomic snapshot as the run, so a commit whose response was lost replays to
+// the original run and never duplicates work. CreatedAt lets load prune
+// receipts past the TTL so the durable set stays bounded.
+type IdempotencyReceipt struct {
+	RepoID    string    `json:"repo_id"`
+	Key       string    `json:"key"`
+	Digest    string    `json:"digest"`
+	RunID     string    `json:"run_id"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// IdempotencyReceiptTTL bounds how long an fs-mode run-idempotency receipt
+// is honored. Past the window the receipt is dropped at load (the run's own
+// retention applies independently), so a client that reuses an ancient key
+// simply starts a new operation instead of pinning unbounded state.
+const IdempotencyReceiptTTL = 7 * 24 * time.Hour
+
 // Snapshot is the durable control-plane state. The filesystem implementation is
 // intentionally boring: one atomically replaced JSON snapshot plus append-only
 // log/audit files. It keeps Kiwi single-binary and dependency-free while making
@@ -98,6 +119,12 @@ type Snapshot struct {
 	// legacy state (multiple candidates with no pointer fail closed).
 	// See pending_sidecar_snapshot.go.
 	PendingSidecars []PendingSidecarPointer `json:"pending_sidecars,omitempty"`
+	// RunIdempotency persists the fs-mode run-idempotency receipts (the
+	// run_idempotency equivalents) keyed by the composite repository scope +
+	// client key. Additive; older snapshots load with a nil map and the
+	// server treats it as empty. Entries past IdempotencyReceiptTTL are
+	// dropped at load.
+	RunIdempotency map[string]IdempotencyReceipt `json:"run_idempotency,omitempty"`
 }
 
 type Repository struct {

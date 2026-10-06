@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"sync/atomic"
+	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/queue"
@@ -122,6 +123,16 @@ func queueReasonForJob(j model.Job, fleet []queueRunnerView, depsReady, envLocke
 	}
 }
 
+// leaseCandidatePageBound is the number of queued candidates ONE
+// queue-reason pass materializes: the configured maximum candidate rows, or
+// the scheduler default for a server built without the config wiring.
+func (s *Server) leaseCandidatePageBound() int {
+	if s.LeaseMaxCandidateRows > 0 {
+		return s.LeaseMaxCandidateRows
+	}
+	return scheduler.DefaultMaxCandidateRows
+}
+
 // applyQueueReasonsDB recomputes the queue reasons for every leasable
 // candidate and persists them through QueueReasonStore. It runs on a DB
 // lease miss so the SQL store's queue_reason column stays populated without
@@ -140,9 +151,24 @@ func (s *Server) applyQueueReasonsDB(ctx context.Context, ri model.Runner) {
 	if !ok {
 		return
 	}
-	jobs, err := s.DB.ListQueuedJobs(ctx)
-	if err != nil {
-		return
+	// Bounded candidate fetch: when the store offers the keyset page
+	// contract (the durable store does), one /next miss materializes at
+	// most leaseCandidatePageBound candidates in the same aged order the
+	// lease walk uses, instead of the whole backlog. Stores without the
+	// contract keep the historical ListQueuedJobs read.
+	var jobs []model.Job
+	if ps, ok := s.DB.(storage.QueuedJobPageStore); ok {
+		page, err := ps.ListQueuedJobsPage(ctx, nil, s.leaseCandidatePageBound(), time.Now().UTC())
+		if err != nil {
+			return
+		}
+		jobs = page.Jobs
+	} else {
+		all, err := s.DB.ListQueuedJobs(ctx)
+		if err != nil {
+			return
+		}
+		jobs = all
 	}
 	fleet, fleetComplete := s.fleetQueueRunnerViewsDB(ctx, ri)
 	reasons := map[string]string{}

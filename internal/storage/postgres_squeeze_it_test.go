@@ -1114,8 +1114,9 @@ func TestPostgresIntegrationMiscStatementBreaks(t *testing.T) {
 		}
 		// Every partial index with a status predicate must be dropped before
 		// the column type changes: PostgreSQL cannot re-evaluate the predicate
-		// for a text[] column.
-		if _, err := st.pool.Exec(context.Background(), `DROP INDEX jobs_running_lease_recovery_idx, jobs_queue_deadline_recovery_idx`); err != nil {
+		// for a text[] column. jobs_queued_priority_idx is the migration 0038
+		// queued-candidate index and carries the same status predicate.
+		if _, err := st.pool.Exec(context.Background(), `DROP INDEX jobs_running_lease_recovery_idx, jobs_queue_deadline_recovery_idx, jobs_queued_priority_idx`); err != nil {
 			t.Fatal(err)
 		}
 		pgITBreakColumnToArray(t, st, "jobs", "status")

@@ -101,6 +101,76 @@ func (c *opsClient) do(ctx context.Context, method, path string, in, out any) er
 	return nil
 }
 
+// doIdempotent is do plus the retry contract every run-CREATING command
+// needs: ONE Idempotency-Key per invocation, reused unchanged by every
+// bounded retry, so a commit whose response was lost replays to the original
+// run. Transport failures and 429/5xx responses are retried; a 409
+// (IDEMPOTENCY_KEY_REUSED) is final because retrying cannot change it.
+func (c *opsClient) doIdempotent(ctx context.Context, method, path string, in, out any) error {
+	b, err := json.Marshal(in)
+	if err != nil {
+		return err
+	}
+	opKey, err := newLocalRunID()
+	if err != nil {
+		return err
+	}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-time.After(time.Duration(attempt) * 500 * time.Millisecond):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		req, err := http.NewRequestWithContext(ctx, method, c.base+path, bytes.NewReader(b))
+		if err != nil {
+			return err
+		}
+		if c.token != "" {
+			req.Header.Set("Authorization", "Bearer "+c.token)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", opKey)
+		resp, err := c.client.Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return err
+			}
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode == http.StatusConflict {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			_ = resp.Body.Close()
+			return fmt.Errorf("%s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(body)))
+		}
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			_ = resp.Body.Close()
+			lastErr = fmt.Errorf("%s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(body)))
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			_ = resp.Body.Close()
+			return fmt.Errorf("%s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(body)))
+		}
+		if out != nil {
+			err := json.NewDecoder(resp.Body).Decode(out)
+			_ = resp.Body.Close()
+			if err != nil {
+				return fmt.Errorf("decode response from %s %s: %w", method, path, err)
+			}
+		} else {
+			_ = resp.Body.Close()
+		}
+		return nil
+	}
+	return fmt.Errorf("%s %s: %w", method, path, lastErr)
+}
+
 func opsFlags(name string, args []string) (serverURL, token string, rest []string, err error) {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	srv := fs.String("server", "http://127.0.0.1:8080", "Kiwi server URL")
@@ -299,7 +369,18 @@ func opsMutateRun(ctx context.Context, sub string, args []string) error {
 		return fmt.Errorf("kiwi %s requires a run ID", sub)
 	}
 	var run model.Run
-	if err := newOpsClient(serverURL, token).do(ctx, http.MethodPost, "/api/v1/runs/"+rest[0]+"/"+sub, struct{}{}, &run); err != nil {
+	client := newOpsClient(serverURL, token)
+	path := "/api/v1/runs/" + rest[0] + "/" + sub
+	if sub == "rerun" {
+		// A rerun creates a new run: one operation key per invocation is
+		// reused by the bounded retries, so a lost 202 replays to the same
+		// rerun instead of launching it twice. Cancel is naturally
+		// idempotent and keeps the single-shot path.
+		err = client.doIdempotent(ctx, http.MethodPost, path, struct{}{}, &run)
+	} else {
+		err = client.do(ctx, http.MethodPost, path, struct{}{}, &run)
+	}
+	if err != nil {
 		return err
 	}
 	fmt.Printf("run %s: %s\n", run.ID, run.Status)

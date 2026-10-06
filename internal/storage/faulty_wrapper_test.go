@@ -56,6 +56,10 @@ func faultyWrapperCases() map[string]wrapperCase {
 			return err
 		}},
 		"ListQueuedJobs": {seed: seedRunAndJob, call: func(f *FaultyStore) error { _, err := f.ListQueuedJobs(ctx()); return err }},
+		"ListQueuedJobsPage": {seed: seedRunAndJob, call: func(f *FaultyStore) error {
+			_, err := f.ListQueuedJobsPage(ctx(), nil, 10, time.Now().UTC())
+			return err
+		}},
 		"ListExpiredRunningJobs": {seed: func(m *memStore) {
 			expired := time.Unix(2000, 0).UTC()
 			j := testJob
@@ -205,6 +209,18 @@ func faultyWrapperCases() map[string]wrapperCase {
 		}},
 		"FindDelivery": {seed: func(m *memStore) { _ = m.UpsertDelivery(ctx(), "github", "d1", testRun.ID, "digest") }, call: func(f *FaultyStore) error {
 			_, _, _, err := f.FindDelivery(ctx(), "github", "d1")
+			return err
+		}},
+		"FindRunIdempotency": {seed: func(m *memStore) {
+			m.runIdempotency[memIdempotencyKey(RepoIDForRun(testRun), "k1")] = RunIdempotencyClaim{RepoID: RepoIDForRun(testRun), Key: "k1", Digest: "d", RunID: testRun.ID}
+		}, call: func(f *FaultyStore) error {
+			_, _, _, err := f.FindRunIdempotency(ctx(), RepoIDForRun(testRun), "k1")
+			return err
+		}},
+		"PruneRunIdempotency": {mutates: true, seed: func(m *memStore) {
+			m.runIdempotency[memIdempotencyKey(RepoIDForRun(testRun), "k1")] = RunIdempotencyClaim{RepoID: RepoIDForRun(testRun), Key: "k1", Digest: "d", RunID: testRun.ID, CreatedAt: time.Unix(1, 0).UTC()}
+		}, call: func(f *FaultyStore) error {
+			_, err := f.PruneRunIdempotency(ctx(), time.Unix(1000, 0).UTC(), 10)
 			return err
 		}},
 		"TryAcquireLeadership": {mutates: true, call: func(f *FaultyStore) error {
@@ -884,6 +900,14 @@ func missingOptionalInterfaceCases() map[string]missingIfaceCase {
 		"InsertCompiledRun": {mutates: true, iface: "RunEnqueueStore", call: func(f *FaultyStore) error {
 			return f.InsertCompiledRun(ctx(), InsertCompiledRunRequest{})
 		}},
+		"FindRunIdempotency": {iface: "RunIdempotencyStore", call: func(f *FaultyStore) error {
+			_, _, _, err := f.FindRunIdempotency(ctx(), "", "")
+			return err
+		}},
+		"PruneRunIdempotency": {mutates: true, iface: "RunIdempotencyStore", call: func(f *FaultyStore) error {
+			_, err := f.PruneRunIdempotency(ctx(), time.Unix(1000, 0).UTC(), 10)
+			return err
+		}},
 		"AcquireLeaseAtomic": {mutates: true, iface: "AtomicLeaseStore", call: func(f *FaultyStore) error {
 			_, err := f.AcquireLeaseAtomic(ctx(), LeaseClaim{})
 			return err
@@ -1079,6 +1103,10 @@ func missingOptionalInterfaceCases() map[string]missingIfaceCase {
 		}},
 		"RunnerSlotTotals": {iface: "MetricsAggregateStore", call: func(f *FaultyStore) error {
 			_, err := f.RunnerSlotTotals(ctx())
+			return err
+		}},
+		"ListQueuedJobsPage": {iface: "QueuedJobPageStore", call: func(f *FaultyStore) error {
+			_, err := f.ListQueuedJobsPage(ctx(), nil, 10, time.Now().UTC())
 			return err
 		}},
 	}

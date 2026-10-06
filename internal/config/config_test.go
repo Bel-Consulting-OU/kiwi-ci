@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -215,6 +216,52 @@ func TestValidate(t *testing.T) {
 	}
 	if err := Default().Validate(); err != nil {
 		t.Errorf("default config rejected: %v", err)
+	}
+}
+
+// TestSchedulerConfigShapeAndValidation pins the scheduler section: the
+// loader accepts the keys, and Validate rejects negative/absurd page sizes,
+// negative row bounds and malformed or negative reservation waits.
+func TestSchedulerConfigShapeAndValidation(t *testing.T) {
+	loaded, err := Load(writeTemp(t, `
+[scheduler]
+candidate_page_size = 64
+max_candidate_rows = 512
+reservation_wait = "30s"
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.Scheduler.CandidatePageSize != 64 || loaded.Scheduler.MaxCandidateRows != 512 || loaded.Scheduler.ReservationWait != "30s" {
+		t.Fatalf("loaded scheduler = %+v", loaded.Scheduler)
+	}
+	if err := loaded.Validate(); err != nil {
+		t.Fatalf("valid scheduler config rejected: %v", err)
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{"negative page size", func(c *Config) { c.Scheduler.CandidatePageSize = -1 }, "candidate_page_size"},
+		{"page size above cap", func(c *Config) { c.Scheduler.CandidatePageSize = MaxSchedulerCandidatePageSize + 1 }, "candidate_page_size"},
+		{"negative max rows", func(c *Config) { c.Scheduler.MaxCandidateRows = -1 }, "max_candidate_rows"},
+		{"malformed wait", func(c *Config) { c.Scheduler.ReservationWait = "soon" }, "reservation_wait"},
+		{"negative wait", func(c *Config) { c.Scheduler.ReservationWait = "-1s" }, "reservation_wait"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Default()
+			tc.mutate(cfg)
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("Validate accepted config, want error mentioning %q", tc.want)
+			}
+			if !contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not mention %q", err, tc.want)
+			}
+		})
 	}
 }
 
@@ -433,7 +480,7 @@ func TestForgeBaseURLTransportContract(t *testing.T) {
 		{"bad scheme", "production", "ftp://gitlab.example.com", true},
 	}
 	for _, tc := range cases {
-		cfg := &Config{Server: ServerConfig{Mode: tc.mode, ExternalURL: "https://ci.example.com"}}
+		cfg := &Config{Server: ServerConfig{Mode: tc.mode, ExternalURL: "https://ci.example.com"}, Quota: QuotaConfig{RepoQueueDepth: 1}}
 		cfg.GitLab.BaseURL = tc.url
 		cfg.Forgejo.BaseURL = "https://forgejo.example.com"
 		err := cfg.Validate()
@@ -443,5 +490,35 @@ func TestForgeBaseURLTransportContract(t *testing.T) {
 		if !tc.wantErr && err != nil {
 			t.Errorf("%s: validation rejected %q: %v", tc.name, tc.url, err)
 		}
+	}
+}
+
+// TestValidateProductionRequiresQueueBound pins the production queue bound:
+// an unbounded queue (both depths 0) is refused in production, one positive
+// scope is enough, and development keeps the explicit 0 = unlimited
+// semantics.
+func TestValidateProductionRequiresQueueBound(t *testing.T) {
+	cfg := Default()
+	cfg.Server.Mode = "production"
+	cfg.Server.ExternalURL = "https://ci.example.com"
+	cfg.Quota.RepoQueueDepth = 0
+	cfg.Quota.TeamQueueDepth = 0
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "queue_depth") {
+		t.Fatalf("unbounded production queue = %v, want a queue_depth error", err)
+	}
+	cfg.Quota.TeamQueueDepth = 100
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("production with a team queue bound = %v", err)
+	}
+	cfg.Quota.TeamQueueDepth = 0
+	cfg.Quota.RepoQueueDepth = 100
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("production with a repo queue bound = %v", err)
+	}
+	dev := Default()
+	dev.Quota.RepoQueueDepth = 0
+	if err := dev.Validate(); err != nil {
+		t.Fatalf("dev keeps 0 = unlimited: %v", err)
 	}
 }

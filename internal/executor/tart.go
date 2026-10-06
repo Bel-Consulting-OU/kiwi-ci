@@ -40,6 +40,11 @@ type TartBackend struct {
 	// RequireImmutableImages rejects VM references that are not pinned by an
 	// @sha256: digest. Set by the executor from Options for untrusted jobs.
 	RequireImmutableImages bool
+	// ReportCleanupDebt, when non-nil, receives one report when a failed
+	// clone/run start could not prove the disposable VM removed. The executor
+	// wires it to its cleanup-debt sink in runJob; nil is safe (direct
+	// backend users).
+	ReportCleanupDebt func(kind CleanupKind, resource string, err error)
 	// Resources carries the job's resource requests. CPU/memory map onto
 	// the tart run flags the installed CLI supports; disk is advisory.
 	// PIDs requests never reach here (admission rejects them for tart).
@@ -202,7 +207,14 @@ func (b *TartBackend) StartJob(ctx context.Context, workspace string, emit func(
 	// clone pulls the base image and is legitimately slow, so it runs under
 	// the 10m setup ceiling (min with the job context).
 	if out, err := phaseCommand(ctx, runtimeSetupTimeout, tart, "clone", "--", b.VM, b.clone); err != nil {
-		_ = b.CloseJob()
+		clone := b.clone
+		if cerr := b.CloseJob(); cerr != nil {
+			// The clone may have been created before the command errored and
+			// the bounded delete could not prove it gone: report debt instead
+			// of silently dropping a possibly-live VM (CloseJob keeps the
+			// clone identity for a later retry).
+			b.reportCleanupDebt(CleanupVM, clone, cerr)
+		}
 		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("tart clone: %w: %s", err, strings.TrimSpace(string(out)))}
 	}
 	// Resource requests map onto the tart run flags the installed CLI
@@ -221,9 +233,12 @@ func (b *TartBackend) StartJob(ctx context.Context, workspace string, emit func(
 		// run process never started: delete it through the bounded cleanup
 		// path (so a wedged tart cannot strand this goroutine) and fold a
 		// cleanup failure into the returned error instead of discarding it.
+		// A deletion that is not proven also reports cleanup debt.
+		clone := b.clone
 		cerr := b.deleteCloneBounded(ctx)
 		_ = b.CloseJob()
 		if cerr != nil {
+			b.reportCleanupDebt(CleanupVM, clone, cerr)
 			return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("start tart VM: %w (clone cleanup: %v)", err, cerr)}
 		}
 		return &RunError{Kind: ErrorInfra, Err: err}
@@ -520,6 +535,15 @@ func (b *TartBackend) deleteCloneBounded(parent context.Context) error {
 	}
 	b.clone = ""
 	return nil
+}
+
+// reportCleanupDebt forwards one unproven-removal report to the executor
+// (nil-safe for direct backend users).
+func (b *TartBackend) reportCleanupDebt(kind CleanupKind, resource string, err error) {
+	if b.ReportCleanupDebt == nil || err == nil {
+		return
+	}
+	b.ReportCleanupDebt(kind, resource, err)
 }
 
 // reapRunCommand kills and bounded-reaps the `tart run` process through

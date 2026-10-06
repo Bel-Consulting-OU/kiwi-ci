@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -82,18 +84,62 @@ func TestOutboxDBRoundTrip(t *testing.T) {
 	}
 }
 
-func TestOutboxReplayDBOnStartup(t *testing.T) {
+// TestOutboxSwitchToDBDoesNotMirrorBacklog pins the bounded-startup
+// contract: SwitchToDB attaches the durable store but does NOT mirror the
+// durable backlog into memory (an unbounded ReplayDB used to materialize
+// every due row). DB dispatch does not need the mirror: Flush claims bounded
+// storage.OutboxClaimBatch batches and drains the whole backlog. An explicit
+// ReplayDB call stays available and is capped at outboxDBMirrorWindow.
+func TestOutboxSwitchToDBDoesNotMirrorBacklog(t *testing.T) {
 	f := newDBFakeStore()
-	if err := f.OutboxAppend(context.Background(), storage.OutboxItem{ID: "pending-1", Kind: forge.OutboxKindGitHubCheck, Payload: []byte("{}")}); err != nil {
-		t.Fatal(err)
+	ctx := context.Background()
+	base := time.Now().UTC().Add(-time.Minute)
+	total := storage.OutboxClaimBatch*3 + 7
+	for i := 0; i < total; i++ {
+		if err := f.OutboxAppend(ctx, storage.OutboxItem{
+			ID: fmt.Sprintf("backlog-%04d", i), Kind: storage.OutboxKindUsageAccount,
+			Payload:   []byte(`{"job_id":"gone"}`),
+			CreatedAt: base.Add(time.Duration(i) * time.Millisecond),
+		}); err != nil {
+			t.Fatal(err)
+		}
 	}
+
 	s := New("token")
 	if err := s.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
-	pending := s.outbox.Pending()
-	if len(pending) != 1 || pending[0].ID != "pending-1" {
-		t.Fatalf("replayed pending = %+v", pending)
+	if got := len(s.outbox.Pending()); got != 0 {
+		t.Fatalf("SwitchToDB mirrored %d backlog rows into memory, want 0 (dispatch claims bounded batches)", got)
+	}
+
+	// The explicit replay path stays available and mirrors only the bounded
+	// first page.
+	if err := s.outbox.ReplayDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(s.outbox.Pending()); got != outboxDBMirrorWindow {
+		t.Fatalf("ReplayDB resident window = %d, want %d", got, outboxDBMirrorWindow)
+	}
+
+	// Dispatch still drains the WHOLE durable backlog from claim batches,
+	// without a startup mirror.
+	var dispatched []string
+	n, err := s.outbox.Flush(ctx, func(_ context.Context, it forge.OutboxItem) error {
+		dispatched = append(dispatched, it.ID)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != total || len(dispatched) != total {
+		t.Fatalf("flush drained n=%d dispatched=%d, want all %d durable intents", n, len(dispatched), total)
+	}
+	if got := len(s.outbox.Pending()); got != 0 {
+		t.Fatalf("resident after drain = %d, want 0", got)
+	}
+	if pending, _ := f.OutboxPending(ctx); len(pending) != 0 {
+		t.Fatalf("durable rows after drain = %d, want 0", len(pending))
 	}
 }
 
@@ -381,6 +427,11 @@ func TestOutboxReplayDBMirrorsOnlyDueRows(t *testing.T) {
 	if err := s.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
+	// SwitchToDB no longer mirrors the backlog; invoke the (bounded) replay
+	// explicitly to pin the due-only mirror semantics.
+	if err := s.outbox.ReplayDB(ctx); err != nil {
+		t.Fatal(err)
+	}
 	ids := outboxPendingIDSet(s.outbox)
 	if !ids["due"] || ids["delayed"] || ids["dead"] {
 		t.Fatalf("resident after ReplayDB = %v, want only the due row", ids)
@@ -479,5 +530,57 @@ func TestOutboxEnqueueSameIDConflictDB(t *testing.T) {
 	s.outbox.mu.Unlock()
 	if err := s.outbox.Enqueue(context.Background(), forge.OutboxItem{ID: "db-fixed-intent", Kind: forge.OutboxKindGitHubStatus, Payload: []byte(`{"a":3}`)}); err == nil {
 		t.Fatal("durable same-ID/different-content enqueue must fail")
+	}
+}
+
+// outboxBacklogProbeStore answers OutboxPending/OutboxDue with a pre-built
+// backlog and counts every read, so a startup path that mirrors the outbox
+// can be detected independently of how large the backlog is.
+type outboxBacklogProbeStore struct {
+	*dbFakeStore
+	mu           sync.Mutex
+	pendingCalls int
+	dueCalls     int
+	rows         []storage.OutboxItem
+}
+
+func (p *outboxBacklogProbeStore) OutboxPending(ctx context.Context) ([]storage.OutboxItem, error) {
+	p.mu.Lock()
+	p.pendingCalls++
+	p.mu.Unlock()
+	return p.rows, nil
+}
+
+func (p *outboxBacklogProbeStore) OutboxDue(ctx context.Context) ([]storage.OutboxItem, error) {
+	p.mu.Lock()
+	p.dueCalls++
+	p.mu.Unlock()
+	return p.rows, nil
+}
+
+// TestOutboxStartupDoesNotReadLargeDBBacklog is the scale half of the
+// bounded-startup contract: with 100k due durable intents available,
+// SwitchToDB must read NONE of them (DB dispatch claims bounded batches
+// directly; there is no startup mirror). The probe makes the assertion
+// read-count based, so it fails if a future change reintroduces ReplayDB —
+// even one that only mirrors a bounded window.
+func TestOutboxStartupDoesNotReadLargeDBBacklog(t *testing.T) {
+	rows := make([]storage.OutboxItem, 100000)
+	for i := range rows {
+		rows[i] = storage.OutboxItem{ID: fmt.Sprintf("scale-%06d", i), Kind: storage.OutboxKindUsageAccount, Payload: []byte(`{"job_id":"gone"}`)}
+	}
+	probe := &outboxBacklogProbeStore{dbFakeStore: newDBFakeStore(), rows: rows}
+	s := New("token")
+	if err := s.SwitchToDB(probe); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(s.outbox.Pending()); got != 0 {
+		t.Fatalf("SwitchToDB mirrored %d backlog rows, want 0", got)
+	}
+	probe.mu.Lock()
+	pc, dc := probe.pendingCalls, probe.dueCalls
+	probe.mu.Unlock()
+	if pc != 0 || dc != 0 {
+		t.Fatalf("startup read the durable backlog: OutboxPending calls=%d OutboxDue calls=%d, want 0", pc, dc)
 	}
 }

@@ -39,6 +39,22 @@ case "$sub" in
           fi;;
       esac
     fi
+    if [ -n "$FAKE_DOCKER_RUN_CREATE_THEN_FAIL" ]; then
+      name=""
+      while [ $# -gt 0 ]; do
+        if [ "$1" = "--name" ]; then shift; name="$1"; fi
+        shift
+      done
+      if [ -n "$name" ]; then
+        if [ -n "$FAKE_DOCKER_STATE" ] && [ -e "$FAKE_DOCKER_STATE/$name" ]; then
+          echo "container $name already exists" >&2
+          exit 1
+        fi
+        if [ -n "$FAKE_DOCKER_STATE" ]; then mkdir -p "$FAKE_DOCKER_STATE/$name"; fi
+        echo "create happened but run failed" >&2
+        exit 1
+      fi
+    fi
     echo "fake-container-$$"
     exit 0;;
   exec)
@@ -89,11 +105,27 @@ case "$sub" in
     printf '%s\n' "$FAKE_DOCKER_PS";;
   network)
     case "$1" in
-      create) if [ -n "$FAKE_DOCKER_NET_FAIL" ]; then echo "net fail"; exit 1; fi; echo "netid";;
+      create)
+        if [ -n "$FAKE_DOCKER_NET_FAIL" ]; then echo "net fail"; exit 1; fi
+        if [ -n "$FAKE_DOCKER_NET_CREATE_THEN_FAIL" ]; then
+          net=""
+          for a in "$@"; do net="$a"; done
+          if [ -n "$FAKE_DOCKER_STATE" ] && [ -n "$net" ]; then mkdir -p "$FAKE_DOCKER_STATE/$net"; fi
+          echo "create happened but network create failed" >&2
+          exit 1
+        fi
+        echo "netid";;
       ls) printf '%s\n' "$FAKE_DOCKER_NET_LS";;
-      rm) exit "${FAKE_DOCKER_NET_RM_EXIT:-0}";;
+      rm)
+        name="$2"
+        if [ -n "$FAKE_DOCKER_STATE" ] && [ -n "$name" ]; then rm -rf "$FAKE_DOCKER_STATE/$name"; fi
+        if [ -n "$FAKE_DOCKER_NET_RM_MSG" ]; then echo "$FAKE_DOCKER_NET_RM_MSG" >&2; fi
+        exit "${FAKE_DOCKER_NET_RM_EXIT:-0}";;
     esac;;
   rm)
+    name="$1"
+    if [ "$name" = "-f" ] && [ -n "$2" ]; then name="$2"; fi
+    if [ -n "$FAKE_DOCKER_STATE" ] && [ -n "$name" ]; then rm -rf "$FAKE_DOCKER_STATE/$name"; fi
     if [ -n "$FAKE_DOCKER_RM_MSG" ]; then echo "$FAKE_DOCKER_RM_MSG" >&2; fi
     exit "${FAKE_DOCKER_RM_EXIT:-0}";;
 esac

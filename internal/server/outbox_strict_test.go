@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -109,5 +110,57 @@ func TestHealthyOutboxJournalLoads(t *testing.T) {
 	}
 	if len(o.items) != 1 || o.items[0].ID != "live-1" {
 		t.Fatalf("items = %+v, want only the unfinished intent", o.items)
+	}
+}
+
+// TestFSOutboxRejectsOversizedJournal pins the byte bound of the fs pending
+// journal: startup decodes the journal in full, so a journal over
+// outboxFSMaxBytes must fail construction (naming the file for repair)
+// instead of materializing unbounded memory or silently truncating.
+func TestFSOutboxRejectsOversizedJournal(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, outboxFile)
+	if err := os.WriteFile(path, []byte(pendingLine(t, "ok-1")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Only the stat size is checked before decoding, so a sparse file keeps
+	// the test fast while genuinely exceeding the bound.
+	if err := os.Truncate(path, outboxFSMaxBytes+1); err != nil {
+		t.Fatal(err)
+	}
+	_, err := NewOutbox(storage.New(dir))
+	if err == nil {
+		t.Fatal("oversized pending journal started an outbox")
+	}
+	if !strings.Contains(err.Error(), outboxFile) {
+		t.Fatalf("error must name the journal for repair, got %v", err)
+	}
+}
+
+// TestFSOutboxRejectsTooManyItems pins the entry bound of the fs pending
+// journal: many tiny valid lines stay below the byte cap, so the item count
+// must fail construction (naming the file for repair) rather than decoding an
+// unbounded number of entries.
+func TestFSOutboxRejectsTooManyItems(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// "{}" is a valid (empty) outbox record; outboxFSMaxItems+1 of them are a
+	// few hundred kilobytes, far below outboxFSMaxBytes.
+	journal := bytes.Repeat([]byte("{}\n"), outboxFSMaxItems+1)
+	path := filepath.Join(dir, outboxFile)
+	if err := os.WriteFile(path, journal, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := NewOutbox(storage.New(dir))
+	if err == nil {
+		t.Fatal("pending journal with too many entries started an outbox")
+	}
+	if !strings.Contains(err.Error(), outboxFile) {
+		t.Fatalf("error must name the journal for repair, got %v", err)
 	}
 }

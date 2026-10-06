@@ -445,10 +445,12 @@ func TestPostgresIntegrationServerCrossInstance(t *testing.T) {
 }
 
 // TestPostgresIntegrationServerOutboxDueOnlyMirror pins J2-3 against real
-// PostgreSQL: the due-only read (OutboxDue) is what ReplayDB and pruneDB
-// mirror, so a backoff-delayed row is not resident, a dead letter is never
-// resident and stays operator-visible only through the dead-letter API, and
-// the delayed row becomes claimable once its backoff elapses.
+// PostgreSQL: the due-only read (OutboxDue) is what an explicit ReplayDB and
+// pruneDB mirror, so a backoff-delayed row is not resident, a dead letter is
+// never resident and stays operator-visible only through the dead-letter API,
+// and the delayed row becomes claimable once its backoff elapses. SwitchToDB
+// itself mirrors NOTHING (bounded startup); the first flush drains the due
+// row from a bounded claim batch.
 func TestPostgresIntegrationServerOutboxDueOnlyMirror(t *testing.T) {
 	env := pgITServerSetup(t)
 	st := env.open(t)
@@ -477,9 +479,31 @@ func TestPostgresIntegrationServerOutboxDueOnlyMirror(t *testing.T) {
 	if err := s.SwitchToDB(st); err != nil {
 		t.Fatalf("SwitchToDB: %v", err)
 	}
+	// Startup does NOT mirror the durable backlog: dispatch claims bounded
+	// batches, so nothing is resident after the switch even with due rows.
+	if ids := outboxPendingIDSet(s.outbox); len(ids) != 0 {
+		t.Fatalf("resident after SwitchToDB = %v, want none (no startup backlog mirror)", ids)
+	}
+	// An explicit replay mirrors only the due rows: the delayed row and the
+	// dead letter never become resident.
+	if err := s.outbox.ReplayDB(ctx); err != nil {
+		t.Fatalf("ReplayDB: %v", err)
+	}
 	ids := outboxPendingIDSet(s.outbox)
 	if !ids["pg-due"] || ids["pg-delayed"] || ids["pg-dead"] {
 		t.Fatalf("resident after ReplayDB = %v, want only pg-due", ids)
+	}
+	// Durable dispatch does not depend on the mirror either: a flush claims
+	// the due row and ACKs it while delayed/dead rows stay out of the batch.
+	var flushed []string
+	if _, ferr := s.outbox.Flush(ctx, func(_ context.Context, it forge.OutboxItem) error {
+		flushed = append(flushed, it.ID)
+		return nil
+	}); ferr != nil {
+		t.Fatalf("flush due rows: %v", ferr)
+	}
+	if len(flushed) != 1 || flushed[0] != "pg-due" {
+		t.Fatalf("flushed = %v, want only pg-due", flushed)
 	}
 	dead, err := st.OutboxDeadLetters(ctx)
 	if err != nil || len(dead) != 1 || dead[0].ID != "pg-dead" {

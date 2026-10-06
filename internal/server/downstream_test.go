@@ -328,9 +328,14 @@ func TestDownstreamDBModeExactlyOnce(t *testing.T) {
 
 	// A second server on the same store replays the pending outbox intents
 	// (the completion effects created inside the completion transaction
-	// plus the downstream dispatch intent).
+	// plus the downstream dispatch intent). Startup assigns no implicit
+	// mirror, so the (bounded) explicit replay is what restores visibility
+	// before the direct dispatch below.
 	s2 := New("token")
 	if err := s2.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	if err := s2.outbox.ReplayDB(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	s2.DownstreamAllowlist = map[string][]string{"acme/child": {"o/r"}}

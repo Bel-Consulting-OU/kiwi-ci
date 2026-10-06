@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/components"
@@ -106,10 +107,15 @@ func TestApplyQuotaConfig(t *testing.T) {
 		UntrustedDiskCeiling:   20 << 30,
 		UntrustedPIDsCeiling:   1024,
 	}
+	cfg.Scheduler = config.SchedulerConfig{CandidatePageSize: 64, MaxCandidateRows: 512, ReservationWait: "45s"}
 	srv := server.New("r")
 	applyQuotaConfig(srv, cfg)
 	if srv.QuotaLimits.RepoConcurrency != 4 || srv.QuotaLimits.TeamConcurrency != 12 || srv.QuotaLimits.RepoQueueDepth != 8 || srv.QuotaLimits.TeamQueueDepth != 24 {
 		t.Errorf("limits = %+v", srv.QuotaLimits)
+	}
+	if srv.LeaseCandidatePageSize != 64 || srv.LeaseMaxCandidateRows != 512 || srv.LeaseReservationWait != 45*time.Second {
+		t.Errorf("lease scan policy = %d/%d/%v, want 64/512/45s",
+			srv.LeaseCandidatePageSize, srv.LeaseMaxCandidateRows, srv.LeaseReservationWait)
 	}
 	if srv.DailyCostLimit != 1.5 || srv.DailyEnergyLimit != 2500 || !srv.QuotaFailOpen {
 		t.Errorf("budgets = %g %g failOpen=%t", srv.DailyCostLimit, srv.DailyEnergyLimit, srv.QuotaFailOpen)

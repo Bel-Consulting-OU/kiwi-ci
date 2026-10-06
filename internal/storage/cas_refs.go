@@ -90,7 +90,7 @@ func (s *PostgresStore) TryAcquireCASGCLease(ctx context.Context, key string) (C
 	if key == "" {
 		return nil, false, fmt.Errorf("storage: empty cas gc lease key")
 	}
-	pool, err := s.advisoryPool()
+	pool, err := s.advisoryPool(ctx)
 	if err != nil {
 		return nil, false, err
 	}

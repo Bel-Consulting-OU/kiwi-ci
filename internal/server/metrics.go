@@ -99,6 +99,7 @@ func NewMetrics() *Metrics {
 	m.declare("kiwi_dynamic_jobs_rejected_total", "Dynamically generated child jobs rejected", "counter", nil)
 	m.declare("kiwi_downstream_launches_total", "Cross-repo downstream runs launched", "counter", nil)
 	m.declare("kiwi_downstream_skips_total", "Cross-repo downstream dispatches skipped (already launched)", "counter", nil)
+	m.declare("kiwi_idempotency_receipts_pruned_total", "Durable run-idempotency receipts aged out by maintenance", "counter", nil)
 	return m
 }
 

@@ -945,6 +945,25 @@ func Server(ctx context.Context, args []string) error {
 	// initialized and still needs the store to probe provisioned
 	// per-runner bearer credentials.
 	var db storage.Store
+	// Ordered teardown: every resource that must be released when Server
+	// returns registers here in construction order and is released in
+	// reverse order (metrics listener, tracing, DB), matching the previous
+	// LIFO defers. The serving phase passes teardown to runServerWorkers as
+	// its closeDeps, so dependencies are closed only AFTER maintenance has
+	// been JOINED; early startup errors still release whatever was
+	// constructed through the deferred call.
+	var (
+		teardownFns  []func()
+		teardownOnce sync.Once
+	)
+	teardown := func() {
+		teardownOnce.Do(func() {
+			for i := len(teardownFns) - 1; i >= 0; i-- {
+				teardownFns[i]()
+			}
+		})
+	}
+	defer teardown()
 	if *clusterKeyDir != "" {
 		if *dataDir == "" {
 			return fmt.Errorf("--cluster-key-dir requires --data-dir (the persistent state root)")
@@ -965,7 +984,7 @@ func Server(ctx context.Context, args []string) error {
 		if derr != nil {
 			return derr
 		}
-		defer db.Close()
+		teardownFns = append(teardownFns, func() { _ = db.Close() })
 		if merr := db.Migrate(ctx); merr != nil {
 			return fmt.Errorf("auto-migrate: %w", merr)
 		}
@@ -1171,7 +1190,7 @@ func Server(ctx context.Context, args []string) error {
 		if err := srv.ConfigureTracing(ctx, ep); err != nil {
 			return fmt.Errorf("otel: %w", err)
 		}
-		defer srv.ShutdownTracing(context.Background())
+		teardownFns = append(teardownFns, func() { srv.ShutdownTracing(context.Background()) })
 	}
 	if cfg.Policy.File != "" {
 		pol, perr := policy.Load(cfg.Policy.File)
@@ -1242,31 +1261,23 @@ func Server(ctx context.Context, args []string) error {
 		}
 		h.TLSConfig = tlsConf
 	}
-	go srv.Maintain(ctx)
 	// Dedicated metrics listener: when observability.metrics_listen is set,
 	// the Prometheus surface binds on its own address (binding failure is a
-	// startup error). The main listener keeps its /metrics route.
+	// startup error). The main listener keeps its /metrics route. It binds
+	// BEFORE any worker starts: every listener is constructed and bound
+	// first, so a metrics bind failure returns without ever starting
+	// maintenance (Maintain previously started first, so an unbound metrics
+	// address returned from Server while Maintain was still running against
+	// the store and the deferred db.Close ran underneath it).
 	srv.MetricsPublic = cfg.Observability.MetricsPublic
 	if maddr := strings.TrimSpace(cfg.Observability.MetricsListen); maddr != "" {
 		_, stop, merr := startMetricsListener(srv, maddr)
 		if merr != nil {
 			return merr
 		}
-		defer stop()
+		teardownFns = append(teardownFns, stop)
 		fmt.Printf("Kiwi metrics listening on http://%s\n", maddr)
 	}
-	go func() {
-		<-ctx.Done()
-		if drainDone != nil {
-			select {
-			case <-drainDone:
-			case <-time.After(drainTimeout):
-			}
-		}
-		c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = h.Shutdown(c)
-	}()
 	// Bind explicitly so the socket-level tests can observe the address and
 	// server actually in force; Serve/ServeTLS have the same semantics as
 	// ListenAndServe/ListenAndServeTLS (listener tracking for Shutdown,
@@ -1285,21 +1296,94 @@ func Server(ctx context.Context, args []string) error {
 		scheme = "https"
 	}
 	fmt.Printf("Kiwi server listening on %s://%s\n", scheme, ln.Addr())
-	var serveErr error
-	if tlsCertV != "" {
-		// The TLS serving point. The certificate comes from Server.TLSConfig
-		// (h.TLSConfig.Certificates is populated), so the empty filenames are
-		// intentional and correct. Calling ListenAndServe() here would open a
-		// PLAINTEXT listener and never exercise the constructed TLS
-		// 1.2+/client-CA configuration (the P0 defect).
-		serveErr = h.ServeTLS(ln, "", "")
-	} else {
-		serveErr = h.Serve(ln)
-	}
+	// Every listener is bound; only now start the serving phase. It owns the
+	// server's run context (maintenance and the shutdown watcher start under
+	// it), so a serve failure cancels maintenance even while the caller's
+	// parent context is live, and runServerWorkers JOINS the workers before
+	// the ordered teardown closes the DB/tracing/metrics dependencies.
+	serveErr := runServerWorkers(ctx,
+		func(runCtx context.Context) { srv.Maintain(runCtx) },
+		func() error {
+			if tlsCertV != "" {
+				// The TLS serving point. The certificate comes from
+				// Server.TLSConfig (h.TLSConfig.Certificates is populated),
+				// so the empty filenames are intentional and correct.
+				// Calling ListenAndServe() here would open a PLAINTEXT
+				// listener and never exercise the constructed TLS
+				// 1.2+/client-CA configuration (the P0 defect).
+				return h.ServeTLS(ln, "", "")
+			}
+			return h.Serve(ln)
+		},
+		func() { shutdownHTTPServer(h, ctx, drainDone) },
+		teardown,
+	)
 	if serveErr == http.ErrServerClosed {
 		return nil
 	}
 	return serveErr
+}
+
+// runServerWorkers owns the serving-phase lifecycle so the ordered teardown
+// cannot race the workers it must outlive:
+//
+//  1. it derives a server-owned run context from parent, so a serve failure
+//     cancels maintenance even while the caller's parent context is live;
+//  2. it starts maintain under that context plus a shutdown watcher that
+//     stops accepting requests (http.Server.Shutdown) as soon as the run
+//     context ends — parent cancellation or a serve failure;
+//  3. it runs serve and waits for it to return;
+//  4. it cancels the run context, then JOINS every background worker
+//     (maintenance and the shutdown watcher) before calling closeDeps.
+//
+// closeDeps is the ordered dependency teardown (metrics listener, tracing,
+// DB/CAS). Joining first is the contract: the previous control flow started
+// Maintain before the metrics listener bound, so a metrics bind failure
+// returned from Server while Maintain was still running against the store
+// and the deferred closes (db.Close included) ran underneath it. serve's
+// error is returned unchanged (Server maps http.ErrServerClosed to nil, as
+// before).
+func runServerWorkers(parent context.Context, maintain func(context.Context), serve func() error, shutdown func(), closeDeps func()) error {
+	runCtx, cancel := context.WithCancel(parent)
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() {
+		defer workers.Done()
+		maintain(runCtx)
+	}()
+	go func() {
+		defer workers.Done()
+		<-runCtx.Done()
+		shutdown()
+	}()
+	serveErr := serve()
+	// Any serve outcome (graceful shutdown after parent cancellation or a
+	// serve failure with the parent still live) ends the run context, then
+	// the workers are joined before the dependencies are torn down.
+	cancel()
+	workers.Wait()
+	closeDeps()
+	return serveErr
+}
+
+// shutdownHTTPServer is the shutdown half of the serving lifecycle: it stops
+// the control-plane listener from accepting and waits (5s bound) for
+// in-flight requests to finish. When --drain-on-sigterm is active and the
+// PARENT context ended (the signal path), it first waits for the drain
+// goroutine, exactly as before. A serve failure cancels the run context
+// while the parent is still live: there is no signal drain to wait for, and
+// parking shutdown on drainDone for up to drainTimeout would delay the
+// failure return by 30s, so the drain wait is skipped on that path.
+func shutdownHTTPServer(h *http.Server, parent context.Context, drainDone <-chan struct{}) {
+	if drainDone != nil && parent.Err() != nil {
+		select {
+		case <-drainDone:
+		case <-time.After(drainTimeout):
+		}
+	}
+	c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = h.Shutdown(c)
 }
 
 // applyRunnerTLSConfig populates the server's runner client certificate

@@ -205,6 +205,25 @@ type QuotaConfig struct {
 	UntrustedPIDsCeiling   float64 `toml:"untrusted_pids_ceiling"`
 }
 
+// SchedulerConfig tunes the bounded lease candidate scan. CandidatePageSize
+// and MaxCandidateRows bound the queued candidates one /next poll
+// materializes (0 keeps the scheduler's built-in defaults 256/4096);
+// ReservationWait is a Go duration string ("30s") that delays a
+// resource-blocked candidate from becoming the reservation head, granting a
+// grace period to backfill already fitting the runner. Empty/"0s" keeps the
+// immediate default. A page size of 0 keeps the default; only an explicit
+// positive value installs one.
+type SchedulerConfig struct {
+	CandidatePageSize int    `toml:"candidate_page_size"`
+	MaxCandidateRows  int    `toml:"max_candidate_rows"`
+	ReservationWait   string `toml:"reservation_wait"`
+}
+
+// MaxSchedulerCandidatePageSize is the largest accepted candidate page size;
+// an absurd page size defeats the bounded scan's purpose and would make one
+// store round trip materialize an unbounded row set.
+const MaxSchedulerCandidatePageSize = 10000
+
 // SecretBrokerConfig selects the secret backend (vault, aws, gcp, azure,
 // onepassword or static) and its credentials. Only the fields of the
 // selected broker are required.
@@ -294,6 +313,7 @@ type Config struct {
 	RateLimit     RateLimitConfig     `toml:"rate_limit"`
 	Auth          AuthConfig          `toml:"auth"`
 	Quota         QuotaConfig         `toml:"quota"`
+	Scheduler     SchedulerConfig     `toml:"scheduler"`
 	SecretBroker  SecretBrokerConfig  `toml:"secret_broker"`
 	Components    ComponentsConfig    `toml:"components"`
 	Staging       StagingConfig       `toml:"staging"`
@@ -306,10 +326,19 @@ func Default() *Config {
 		Server: ServerConfig{Listen: ":8080", Mode: "dev"},
 		Blob:   BlobConfig{Backend: "fs"},
 		Quota: QuotaConfig{
+			// Built-in per-repository queue bound: production refuses the
+			// explicit 0 = unlimited pair (see Validate), so a config that
+			// never mentions quota depths still starts with a finite queue.
+			RepoQueueDepth:         10000,
 			UntrustedCPUCeiling:    2,
 			UntrustedMemoryCeiling: 4 << 30,
 			UntrustedDiskCeiling:   10 << 30,
 			UntrustedPIDsCeiling:   256,
+		},
+		Scheduler: SchedulerConfig{
+			CandidatePageSize: 256,
+			MaxCandidateRows:  4096,
+			ReservationWait:   "0s",
 		},
 		RateLimit: RateLimitConfig{Burst: 100},
 	}
@@ -468,6 +497,29 @@ func (c *Config) Validate() error {
 	}
 	if err := validateUntrustedCeilings(c.Quota); err != nil {
 		return err
+	}
+	// A production control plane must bound its queue in at least one scope.
+	// Both queue depths default to 0 (unlimited), and an unbounded queue lets
+	// any principal that may start runs park an arbitrarily large backlog:
+	// storage grows without limit and every enqueue/admission count has to
+	// scan it. Development keeps the explicit 0 = unlimited semantics.
+	if mode == "production" && c.Quota.RepoQueueDepth <= 0 && c.Quota.TeamQueueDepth <= 0 {
+		return fmt.Errorf("quota.repo_queue_depth or quota.team_queue_depth must be positive in production: an unbounded queue lets a submitter grow the backlog without limit")
+	}
+	if c.Scheduler.CandidatePageSize < 0 || c.Scheduler.CandidatePageSize > MaxSchedulerCandidatePageSize {
+		return fmt.Errorf("scheduler.candidate_page_size must be between 0 and %d (0 = built-in default 256), got %d", MaxSchedulerCandidatePageSize, c.Scheduler.CandidatePageSize)
+	}
+	if c.Scheduler.MaxCandidateRows < 0 {
+		return fmt.Errorf("scheduler.max_candidate_rows must be >= 0 (0 = built-in default 4096), got %d", c.Scheduler.MaxCandidateRows)
+	}
+	if raw := strings.TrimSpace(c.Scheduler.ReservationWait); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return fmt.Errorf("scheduler.reservation_wait must be a duration such as \"30s\": %v", err)
+		}
+		if d < 0 {
+			return fmt.Errorf("scheduler.reservation_wait must not be negative, got %q", raw)
+		}
 	}
 	if err := validateSecretBroker(c.SecretBroker); err != nil {
 		return err

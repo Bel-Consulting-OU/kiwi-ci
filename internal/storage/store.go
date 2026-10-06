@@ -93,7 +93,32 @@ var (
 	// state: approval can never move a terminal job. The handler maps it to
 	// 409.
 	ErrJobTerminal = errors.New("storage: job is already terminal")
+	// ErrIdempotencyKeyReplay means a run-idempotency receipt already exists
+	// for the same (repository, key) with the SAME request digest: the
+	// enqueue transaction rolled back and the caller must return the
+	// original run named by *IdempotentReplayError.
+	ErrIdempotencyKeyReplay = errors.New("storage: idempotency key already recorded")
+	// ErrIdempotencyKeyConflict means a run-idempotency receipt already
+	// exists for the same (repository, key) with a DIFFERENT request digest:
+	// the client reused one key for two different submissions. The handler
+	// fails closed with 409 and never enqueues the second request.
+	ErrIdempotencyKeyConflict = errors.New("storage: idempotency key reused with a different request")
 )
+
+// IdempotentReplayError is returned inside InsertCompiledRun when the
+// request carries an idempotency claim whose (repository, key) already
+// exists with the same digest. The transaction rolls back and the caller
+// returns the run named by RunID: the durable receipt and the run row were
+// committed together, so the original is authoritative.
+type IdempotentReplayError struct {
+	RunID string
+}
+
+func (e *IdempotentReplayError) Error() string {
+	return "storage: idempotency key already recorded for run " + e.RunID
+}
+
+func (e *IdempotentReplayError) Unwrap() error { return ErrIdempotencyKeyReplay }
 
 // QuotaExceededError is returned by quota admission inside InsertCompiledRun
 // when the reserved counters would exceed a configured limit. Reason carries
@@ -1252,6 +1277,44 @@ type InsertCompiledRunRequest struct {
 	Quota            *QuotaReservation
 	ScheduleClaim    *ScheduleClaim
 	DownstreamLaunch *DownstreamLaunchClaim
+	// Idempotency, when set, records the durable (repository, key) receipt
+	// in the SAME transaction as the run: a commit whose response was lost
+	// is replayed to the original run instead of a duplicate. A conflicting
+	// digest rolls the enqueue back with ErrIdempotencyKeyConflict, and an
+	// equal-digest replay rolls back with *IdempotentReplayError carrying
+	// the original run ID.
+	Idempotency *RunIdempotencyClaim
+}
+
+// RunIdempotencyClaim is the durable client-operation identity of one run
+// submission. RepoID scopes the key to the canonical CHECKOUT repository
+// (storage.RepoIDForRun), Digest is the canonical request digest the key is
+// bound to, and RunID is the run this submission will create.
+type RunIdempotencyClaim struct {
+	RepoID string
+	Key    string
+	Digest string
+	RunID  string
+	// CreatedAt is the receipt timestamp. The SQL store stamps its own
+	// created_at DEFAULT now(); memory stores persist this value so pruning
+	// has a stable age. A zero value is treated as oldest by prune.
+	CreatedAt time.Time
+}
+
+// RunIdempotencyStore is the durable idempotency contract: the receipt is
+// written atomically with the run by InsertCompiledRun (see
+// InsertCompiledRunRequest.Idempotency), and FindRunIdempotency re-reads it
+// for the pre-compile replay fast path and for concurrent races that lose
+// the in-transaction claim. A missing row is (found=false, nil error), never
+// ErrNotFound, because "no receipt yet" is the normal first-submission
+// state.
+type RunIdempotencyStore interface {
+	FindRunIdempotency(ctx context.Context, repoID, key string) (runID, digest string, found bool, err error)
+	// PruneRunIdempotency deletes up to limit receipts created before
+	// olderThan, oldest first, and reports how many rows were removed. A
+	// receipt is small but unbounded in count, so leader maintenance ages
+	// them out independently of run retention.
+	PruneRunIdempotency(ctx context.Context, olderThan time.Time, limit int) (int64, error)
 }
 
 // effectiveNeeds resolves the dependency edges persisted for one enqueued

@@ -102,30 +102,65 @@ func Dispatch(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(*serverURL, "/")+"/api/v1/runs", bytes.NewReader(payload))
+	// ONE client-operation key per intended dispatch, reused by every
+	// bounded retry: a lost 202 (commit succeeded, response vanished) is
+	// replayed by the server to the original run instead of executing the
+	// pipeline twice.
+	opKey, err := newLocalRunID()
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if *token != "" {
-		req.Header.Set("Authorization", "Bearer "+*token)
-	}
+	endpoint := strings.TrimRight(*serverURL, "/") + "/api/v1/runs"
 	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-time.After(time.Duration(attempt) * 500 * time.Millisecond):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", opKey)
+		if *token != "" {
+			req.Header.Set("Authorization", "Bearer "+*token)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return err
+			}
+			lastErr = err
+			continue
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusConflict {
+			// The server refused to reuse the key for a different operation
+			// (or the original run is no longer retained): retrying cannot
+			// change the answer, so surface it immediately.
+			return fmt.Errorf("dispatch: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		}
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("dispatch: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return fmt.Errorf("dispatch: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		}
+		var run model.Run
+		if err := json.Unmarshal(body, &run); err != nil {
+			return err
+		}
+		fmt.Printf("dispatched run %s (%s) %s %s\n", run.ID, run.Event, run.RepoFullName, run.Ref)
+		return nil
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("dispatch: %s: %s", resp.Status, strings.TrimSpace(string(body)))
-	}
-	var run model.Run
-	if err := json.Unmarshal(body, &run); err != nil {
-		return err
-	}
-	fmt.Printf("dispatched run %s (%s) %s %s\n", run.ID, run.Event, run.RepoFullName, run.Ref)
-	return nil
+	return fmt.Errorf("dispatch: %w", lastErr)
 }
 
 // forgeAdapterFor builds the forge adapter used to fetch the pipeline from

@@ -185,6 +185,11 @@ type ContainerBackend struct {
 	// caller's reason. Nil (direct backend users) keeps the historical
 	// probe-at-StartJob behavior.
 	WorkspaceQuota *DiskQuotaStatus
+	// ReportCleanupDebt, when non-nil, receives one report when an external
+	// create (docker run) failed ambiguously and the bounded remove-by-name
+	// could not prove the container absent. The executor wires it to its
+	// cleanup-debt sink in runJob; nil is safe (direct backend users).
+	ReportCleanupDebt func(kind CleanupKind, resource string, err error)
 	// CgroupParent, when non-empty, is the job's scoped parent cgroup (see
 	// jobcgroup.go): the container is placed in it with --cgroup-parent so
 	// the main container and the job's service containers together can never
@@ -322,6 +327,20 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 		out, err = phaseCommand(ctx, runtimeSetupTimeout, docker, args...)
 	}
 	if err != nil {
+		// A docker run command error is NOT proof the container was not
+		// created (`docker run -d` can fail after the daemon accepted the
+		// create). Bounded remove-by-name is the only way to prove absence:
+		// rm exiting 0 or reporting "No such container" proves the container
+		// is gone, and only then may the workspace protections be torn down.
+		// Anything else means the container may be alive on a bind mount that
+		// the workspace ownership/quota still bounds: KEEP every protection
+		// and report cleanup debt instead.
+		if rmErr := dockerCleanupCommand(ctx, b.docker, "rm", "-f", b.container); rmErr != nil && !isContainerAbsentError(rmErr) {
+			if b.ReportCleanupDebt != nil {
+				b.ReportCleanupDebt(CleanupMainRuntime, b.container, err)
+			}
+			return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("start job container: %w: %s (container may exist; not removed: %v)", err, strings.TrimSpace(string(out)), rmErr)}
+		}
 		restoreErr := errors.Join(b.restoreProvisionedWorkspace(), b.cleanupWorkspaceQuota())
 		if restoreErr != nil {
 			return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("start job container: %w: %s (workspace restore also failed: %w)", err, strings.TrimSpace(string(out)), restoreErr)}

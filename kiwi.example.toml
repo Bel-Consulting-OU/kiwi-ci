@@ -186,10 +186,14 @@ admin_token = "change-me"
 # runner_tokens_file = "/etc/kiwi/runner-tokens.json"
 
 [quota]
-# Repository/team admission and cost budgets. 0 means unlimited.
+# Repository/team admission and cost budgets. 0 means unlimited, except that
+# production requires at least one of repo_queue_depth/team_queue_depth to be
+# positive: an unbounded queue lets any submitter grow the backlog without
+# limit. The built-in default when the field is omitted is repo_queue_depth =
+# 10000.
 repo_concurrency = 0
 team_concurrency = 0
-repo_queue_depth = 0
+repo_queue_depth = 10000
 team_queue_depth = 0
 daily_cost_limit = 0
 daily_energy_limit = 0

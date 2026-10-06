@@ -370,15 +370,24 @@ func validateServiceImages(services []pipeline.Service, runID, jobID string, req
 // budget across the remaining services); a job whose service declarations
 // genuinely cannot fit its own resource envelope fails closed.
 func startContainerServices(ctx context.Context, runID, jobID string, services []pipeline.Service, jobResources pipeline.Resources, isolated, requireImmutable bool, cgroupParent string, emit func(string)) (string, func() error, error) {
-	return startContainerServicesOwned(ctx, runID, jobID, runtimeOwner{}, services, jobResources, isolated, requireImmutable, cgroupParent, emit)
+	return startContainerServicesOwned(ctx, runID, jobID, runtimeOwner{}, services, jobResources, isolated, requireImmutable, cgroupParent, emit, nil)
 }
 
 // startContainerServicesOwned is startContainerServices plus the owning runner
 // process incarnation: service containers and the services network carry
 // kiwi.runner/kiwi.instance labels so a restarted runner can reconcile its
-// predecessor's resources before leasing new work.
-func startContainerServicesOwned(ctx context.Context, runID, jobID string, owner runtimeOwner, services []pipeline.Service, jobResources pipeline.Resources, isolated, requireImmutable bool, cgroupParent string, emit func(string)) (string, func() error, error) {
+// predecessor's resources before leasing new work. onDebt, when non-nil,
+// receives one report for every unproven removal on the service start path
+// (ambiguous network create or service create whose bounded remove failed);
+// the caller retains the job cgroup/workspace and stops leasing until
+// reconciliation clears the debt.
+func startContainerServicesOwned(ctx context.Context, runID, jobID string, owner runtimeOwner, services []pipeline.Service, jobResources pipeline.Resources, isolated, requireImmutable bool, cgroupParent string, emit func(string), onDebt func(CleanupDebt)) (string, func() error, error) {
 	noopCleanup := func() error { return nil }
+	reportDebt := func(kind CleanupKind, resource string, err error) {
+		if onDebt != nil && err != nil {
+			onDebt(CleanupDebt{Kind: kind, Resource: resource, Err: err})
+		}
+	}
 	if err := validateServiceImages(services, runID, jobID, requireImmutable); err != nil {
 		return "", noopCleanup, err
 	}
@@ -398,7 +407,16 @@ func startContainerServicesOwned(ctx context.Context, runID, jobID string, owner
 	// control ceiling (min with the job context), so a wedged daemon cannot
 	// stall an unbounded job.
 	if out, err := phaseCommand(ctx, runtimeControlTimeout, docker, append([]string{"network"}, createArgs...)...); err != nil {
-		return "", noopCleanup, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("create services network: %w: %s", err, strings.TrimSpace(string(out)))}
+		runErr := &RunError{Kind: ErrorInfra, Err: fmt.Errorf("create services network: %w: %s", err, strings.TrimSpace(string(out)))}
+		// A network create command error is NOT proof the network was not
+		// created. Bounded remove-by-name proves absence: rm exiting 0 or
+		// reporting the network missing returns the error as before; anything
+		// else means the network may still exist (and the job cgroup may keep
+		// hosting service containers attached to it), so report cleanup debt.
+		if rmErr := dockerCleanupCommand(ctx, docker, "network", "rm", network); rmErr != nil && !isNetworkAbsentError(rmErr) {
+			reportDebt(CleanupNetwork, network, rmErr)
+		}
+		return "", noopCleanup, runErr
 	}
 	containers := make([]string, 0, len(services))
 	cleanup := func() error {
@@ -415,10 +433,12 @@ func startContainerServicesOwned(ctx context.Context, runID, jobID string, owner
 		}
 		return errors.Join(errs...)
 	}
-	cleanupAll := func() { _ = cleanup() }
+	cleanupAll := func() error { return cleanup() }
 	plan, planErr := serviceAllocationPlan(jobResources, services)
 	if planErr != nil {
-		cleanupAll()
+		if cerr := cleanupAll(); cerr != nil {
+			reportDebt(CleanupService, network, cerr)
+		}
 		return "", noopCleanup, &RunError{Kind: ErrorPolicy, Err: planErr}
 	}
 	for i, svc := range services {
@@ -451,11 +471,16 @@ func startContainerServicesOwned(ctx context.Context, runID, jobID string, owner
 		// Starting a service pulls its image and is legitimately slow: it
 		// runs under the 10m setup ceiling (min with the job context).
 		args = append(args, "--", svc.Image)
+		// The prospective container name joins the owned set BEFORE the
+		// create command: an ambiguous `docker run` failure may have created
+		// the container, so cleanupAll must be able to remove it.
+		containers = append(containers, name)
 		if out, err := phaseCommand(ctx, runtimeSetupTimeout, docker, args...); err != nil {
-			cleanupAll()
+			if cerr := cleanupAll(); cerr != nil {
+				reportDebt(CleanupService, name, cerr)
+			}
 			return "", func() error { return nil }, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("start service %q: %w: %s", display, err, strings.TrimSpace(string(out)))}
 		}
-		containers = append(containers, name)
 		emit("service " + display + " started (" + svc.Image + ")")
 	}
 	for i, svc := range services {
@@ -490,7 +515,9 @@ func startContainerServicesOwned(ctx context.Context, runID, jobID string, owner
 				break
 			}
 			if attempt == retries {
-				cleanupAll()
+				if cerr := cleanupAll(); cerr != nil {
+					reportDebt(CleanupService, name, cerr)
+				}
 				detail := strings.TrimSpace(string(out))
 				if truncated {
 					detail += " [output truncated]"
@@ -499,13 +526,26 @@ func startContainerServicesOwned(ctx context.Context, runID, jobID string, owner
 			}
 			select {
 			case <-ctx.Done():
-				cleanupAll()
+				if cerr := cleanupAll(); cerr != nil {
+					reportDebt(CleanupService, name, cerr)
+				}
 				return "", func() error { return nil }, &RunError{Kind: ErrorCancelled, Err: ctx.Err()}
 			case <-time.After(interval):
 			}
 		}
 	}
 	return network, cleanup, nil
+}
+
+// isNetworkAbsentError reports whether docker positively said the network does
+// not exist (as opposed to a transient removal failure), so a failed
+// `docker network rm` after an ambiguous create still proves absence.
+func isNetworkAbsentError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no such network") || strings.Contains(msg, "not found")
 }
 
 // effectiveServiceRetries resolves the healthcheck retry budget: `retries: 0`

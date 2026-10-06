@@ -314,3 +314,147 @@ func TestBuildBlobStoreFSPathPrecedence(t *testing.T) {
 		t.Fatalf("fs root = %q, want explicit blob.path", fs.Root)
 	}
 }
+
+// errServeFailed is the serve error the lifecycle test expects runServerWorkers
+// to return unchanged.
+var errServeFailed = errors.New("serve failed")
+
+// TestServerMaintenanceJoinedBeforeStoreClose pins the finding-6 lifecycle
+// Server() is wired through: runServerWorkers derives a server-owned run
+// context, a serve failure (parent context still live) must cancel and JOIN
+// maintenance before closeDeps runs, and the dependency teardown must never
+// observe a still-running maintenance function.
+func TestServerMaintenanceJoinedBeforeStoreClose(t *testing.T) {
+	t.Run("teardown waits for blocked maintenance", func(t *testing.T) {
+		maintainEntered := make(chan struct{})
+		release := make(chan struct{})
+		maintainDone := make(chan struct{})
+		serveFailed := make(chan struct{})
+		closeEntered := make(chan struct{})
+		var closeBeforeJoin atomic.Bool
+
+		maintain := func(ctx context.Context) {
+			close(maintainEntered)
+			select {
+			case <-release:
+			case <-closeEntered:
+				// A helper that skipped the join reaches closeDeps while
+				// maintenance is still blocked. Record the violation and
+				// unblock closeDeps so the negative assertion below stays
+				// deterministic: only a genuinely early close can win this
+				// select.
+				closeBeforeJoin.Store(true)
+			}
+			close(maintainDone)
+		}
+		serve := func() error {
+			<-maintainEntered
+			close(serveFailed)
+			return errServeFailed
+		}
+		shutdown := func() {}
+		closeDeps := func() {
+			close(closeEntered)
+			// In the correct helper the join already completed; in the
+			// mutated one this parks until maintain observes closeEntered.
+			<-maintainDone
+		}
+
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- runServerWorkers(context.Background(), maintain, serve, shutdown, closeDeps)
+		}()
+
+		<-serveFailed
+		// The correct helper is blocked joining maintain, so closeDeps must
+		// not be entered. The bounded wait is a violation detector, never a
+		// synchronization of the passing path: the correct implementation
+		// cannot reach closeDeps before maintain is released.
+		select {
+		case <-closeEntered:
+			t.Fatal("closeDeps entered while maintenance was still blocked (join removed)")
+		case <-time.After(250 * time.Millisecond):
+		}
+		if closeBeforeJoin.Load() {
+			t.Fatal("closeDeps observed a still-running maintenance")
+		}
+		close(release)
+		if err := <-errCh; !errors.Is(err, errServeFailed) {
+			t.Fatalf("runServerWorkers = %v, want the serve error unchanged", err)
+		}
+		if closeBeforeJoin.Load() {
+			t.Fatal("closeDeps ran before maintenance finished")
+		}
+		select {
+		case <-maintainDone:
+		default:
+			t.Fatal("runServerWorkers returned before maintenance finished")
+		}
+	})
+
+	t.Run("serve failure cancels ctx-only maintenance", func(t *testing.T) {
+		maintainEntered := make(chan struct{})
+		cancelObserved := make(chan struct{})
+		shutdownRan := make(chan struct{})
+		var sawCancel, sawShutdownBeforeClose atomic.Bool
+
+		maintain := func(ctx context.Context) {
+			close(maintainEntered)
+			// Exits ONLY on cancellation: a helper that fails to cancel the
+			// server-owned run context deadlocks in its join.
+			<-ctx.Done()
+			close(cancelObserved)
+		}
+		serve := func() error {
+			<-maintainEntered
+			return errServeFailed
+		}
+		shutdown := func() { close(shutdownRan) }
+		closeDeps := func() {
+			select {
+			case <-cancelObserved:
+				sawCancel.Store(true)
+			default:
+			}
+			select {
+			case <-shutdownRan:
+				sawShutdownBeforeClose.Store(true)
+			default:
+			}
+		}
+
+		parent, parentCancel := context.WithCancel(context.Background())
+		defer parentCancel()
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- runServerWorkers(parent, maintain, serve, shutdown, closeDeps)
+		}()
+		select {
+		case err := <-errCh:
+			if !errors.Is(err, errServeFailed) {
+				t.Fatalf("runServerWorkers = %v, want the serve error unchanged", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("runServerWorkers did not return: a serve failure must cancel maintenance")
+		}
+		if parent.Err() != nil {
+			t.Fatal("parent context was canceled: a serve failure must use the server-owned run context")
+		}
+		select {
+		case <-cancelObserved:
+		default:
+			t.Fatal("maintenance never observed run-context cancellation")
+		}
+		select {
+		case <-shutdownRan:
+		default:
+			t.Fatal("shutdown watcher never ran")
+		}
+		if !sawCancel.Load() {
+			t.Fatal("closeDeps ran before maintenance observed cancellation")
+		}
+		if !sawShutdownBeforeClose.Load() {
+			t.Fatal("closeDeps ran before the shutdown watcher finished")
+		}
+	})
+}

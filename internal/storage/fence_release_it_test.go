@@ -117,7 +117,7 @@ func TestPostgresIntegrationFenceReleaseBoundedAndIdempotent(t *testing.T) {
 		}
 		rel()
 	}
-	pool, err := st.advisoryPool()
+	pool, err := st.advisoryPool(ctx)
 	if err != nil {
 		t.Fatalf("advisory pool: %v", err)
 	}

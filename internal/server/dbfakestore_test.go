@@ -79,10 +79,13 @@ type dbFakeStore struct {
 	queueReasonsErrs int
 	downstreamLinks  map[string]storage.DownstreamLink
 	deliveries       map[string]string
-	quotas           map[string][2]int
-	cacheMans        map[string]storage.CacheManifestRecord
-	cacheManErr      error
-	secretClaims     map[string]bool
+	// runIdempotency mirrors the real store's run_idempotency table: the
+	// durable (repository, key) receipt committed with the run.
+	runIdempotency map[string]storage.RunIdempotencyClaim
+	quotas         map[string][2]int
+	cacheMans      map[string]storage.CacheManifestRecord
+	cacheManErr    error
+	secretClaims   map[string]bool
 	// pendingSidecars mirrors artifact_pending_sidecars (migration 0012):
 	// durable pending SBOM/sigstore digests across replicas.
 	pendingSidecars map[string]fakePendingSidecar
@@ -278,6 +281,7 @@ var _ storage.ArtifactLookupStore = (*dbFakeStore)(nil)
 var _ storage.RunnerJobStore = (*dbFakeStore)(nil)
 var _ storage.RecoveryStore = (*dbFakeStore)(nil)
 var _ storage.RunEnqueueStore = (*dbFakeStore)(nil)
+var _ storage.RunIdempotencyStore = (*dbFakeStore)(nil)
 var _ storage.AtomicLeaseStore = (*dbFakeStore)(nil)
 var _ storage.QuotaCounterStore = (*dbFakeStore)(nil)
 var _ storage.CacheManifestStore = (*dbFakeStore)(nil)
@@ -348,6 +352,7 @@ func newDBFakeStore() *dbFakeStore {
 		queueReasons:      map[string]string{},
 		downstreamLinks:   map[string]storage.DownstreamLink{},
 		deliveries:        map[string]string{},
+		runIdempotency:    map[string]storage.RunIdempotencyClaim{},
 		quotas:            map[string][2]int{},
 		cacheMans:         map[string]storage.CacheManifestRecord{},
 		secretClaims:      map[string]bool{},
@@ -3053,6 +3058,17 @@ func (f *dbFakeStore) InsertCompiledRun(ctx context.Context, req storage.InsertC
 			return storage.ErrDeliveryDuplicate
 		}
 	}
+	// The run-idempotency receipt mirrors the SQL claim: a same-digest replay
+	// returns the original run's ID, a different-digest reuse of the key
+	// fails closed, and neither mutates committed state.
+	if req.Idempotency != nil {
+		if stored, exists := f.runIdempotency[dbFakeIdempotencyKey(req.Idempotency.RepoID, req.Idempotency.Key)]; exists {
+			if stored.Digest == req.Idempotency.Digest {
+				return &storage.IdempotentReplayError{RunID: stored.RunID}
+			}
+			return storage.ErrIdempotencyKeyConflict
+		}
+	}
 	// Commit: nothing below can fail, so every staged reservation and
 	// cancellation lands together with the new run.
 	if stagedDownstream != nil {
@@ -3106,10 +3122,46 @@ func (f *dbFakeStore) InsertCompiledRun(ctx context.Context, req storage.InsertC
 	if req.BodyClaim != nil {
 		f.deliveries[req.BodyClaim.Forge+"/"+req.BodyClaim.DeliveryID] = req.Run.ID
 	}
+	if req.Idempotency != nil {
+		f.runIdempotency[dbFakeIdempotencyKey(req.Idempotency.RepoID, req.Idempotency.Key)] = *req.Idempotency
+	}
 	if req.ScheduleClaim != nil {
 		f.occurrences[req.ScheduleClaim.ScheduleID] = append(f.occurrences[req.ScheduleClaim.ScheduleID], storage.Occurrence{ScheduleID: req.ScheduleClaim.ScheduleID, Nominal: req.ScheduleClaim.Nominal, RunID: req.Run.ID})
 	}
 	return nil
+}
+
+// dbFakeIdempotencyKey namespaces a client key by repository scope, exactly
+// like the real store's (repo_id, idempotency_key) primary key.
+func dbFakeIdempotencyKey(repoID, key string) string { return repoID + "\x00" + key }
+
+func (f *dbFakeStore) FindRunIdempotency(ctx context.Context, repoID, key string) (string, string, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.runIdempotency[dbFakeIdempotencyKey(repoID, key)]
+	if !ok {
+		return "", "", false, nil
+	}
+	return r.RunID, r.Digest, true, nil
+}
+
+func (f *dbFakeStore) PruneRunIdempotency(ctx context.Context, olderThan time.Time, limit int) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if limit <= 0 {
+		limit = 1000
+	}
+	var removed int64
+	for k, r := range f.runIdempotency {
+		if removed >= int64(limit) {
+			break
+		}
+		if olderThan.IsZero() || r.CreatedAt.Before(olderThan) || r.CreatedAt.IsZero() {
+			delete(f.runIdempotency, k)
+			removed++
+		}
+	}
+	return removed, nil
 }
 
 // supersededJobIDsLocked resolves a supersede policy against the currently

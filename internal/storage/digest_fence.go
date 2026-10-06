@@ -120,7 +120,7 @@ func (s *PostgresStore) AcquireNamedFence(ctx context.Context, namespace, key st
 	if namespace == "" || key == "" || len(namespace)+len(key) > 512 {
 		return nil, fmt.Errorf("storage: named fence requires a namespace and key")
 	}
-	pool, err := s.advisoryPool()
+	pool, err := s.advisoryPool(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -152,7 +152,7 @@ func (s *PostgresStore) AcquireDigestFence(ctx context.Context, digest string) (
 	// itself performs ordinary reads/writes through the operational pool,
 	// and holding the lock on that pool would deadlock as soon as it is
 	// exhausted (max_connections=1 stalls immediately).
-	pool, err := s.advisoryPool()
+	pool, err := s.advisoryPool(ctx)
 	if err != nil {
 		return nil, err
 	}

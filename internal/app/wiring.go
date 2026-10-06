@@ -130,6 +130,20 @@ func applyQuotaConfig(srv *server.Server, cfg *config.Config) {
 	if cfg.Server.MaxCacheManifestBytesPerRepo != 0 {
 		srv.MaxCacheManifestBytesPerRepo = cfg.Server.MaxCacheManifestBytesPerRepo
 	}
+	// Bounded lease-scan policy: 0 keeps the server's built-in defaults
+	// (256/4096), and an empty reservation_wait keeps the immediate default.
+	// The scheduler installs these on every DB-mode lease.
+	if cfg.Scheduler.CandidatePageSize != 0 {
+		srv.LeaseCandidatePageSize = cfg.Scheduler.CandidatePageSize
+	}
+	if cfg.Scheduler.MaxCandidateRows != 0 {
+		srv.LeaseMaxCandidateRows = cfg.Scheduler.MaxCandidateRows
+	}
+	if raw := strings.TrimSpace(cfg.Scheduler.ReservationWait); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil {
+			srv.LeaseReservationWait = d
+		}
+	}
 }
 
 // buildSecretBroker constructs the secret broker chain from the
