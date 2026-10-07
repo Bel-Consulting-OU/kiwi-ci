@@ -7,10 +7,13 @@ package server
 // and DB-fake modes alike. A retry presenting a different key stays 409.
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secretbroker"
@@ -113,33 +116,49 @@ func TestSecretRetrySameKeyReplaysAfterJournalRestart(t *testing.T) {
 	}
 	firstEnv := decodeSecretResponse(t, first.Body.Bytes())
 
-	// Pressure: 16,384 unrelated terminal receipts make the live receipt the
-	// only non-evictable record, so compaction must retain it (and its
-	// envelope) rather than trimming by recency.
-	s.mu.Lock()
-	for i := 0; i < secretReceiptsMaxEntries; i++ {
-		s.secretReceipts[fmt.Sprintf("dead-job-%06d|1|tok", i)] = secretReceipt{}
-	}
+	// Pressure that actually exercises lifecycle retention: the JOURNAL must
+	// hold the live receipt as its OLDEST record followed by 16,384 dead
+	// records, so recency-only trimming would drop exactly the live claim.
+	// (Putting the dead keys only in the in-memory map would be compacted
+	// away by the journal rebuild and prove nothing.)
 	liveKey := secretReceiptKey(jobID, gen, "tok")
+	journalPath := filepath.Join(dir, secretReceiptsFile)
+	raw, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	buf.Write(raw)
+	if len(raw) > 0 && raw[len(raw)-1] != '\n' {
+		buf.WriteByte('\n')
+	}
+	enc := json.NewEncoder(&buf)
+	for i := 0; i < secretReceiptsMaxEntries; i++ {
+		if err := enc.Encode(secretReceiptRecord{Key: fmt.Sprintf("dead-job-%06d|1|tok", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(journalPath, buf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.loadSecretReceipts(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	s.mu.Lock()
 	if _, ok := s.secretReceipts[liveKey]; !ok {
 		s.mu.Unlock()
 		t.Fatal("live receipt missing before compaction")
 	}
-	persistErr := s.persistSecretReceiptsLocked()
-	s.mu.Unlock()
-	if persistErr != nil {
-		t.Fatal(persistErr)
-	}
-
-	s.mu.Lock()
+	s.maybeCompactSecretReceiptsLocked()
 	_, liveRetained := s.secretReceipts[liveKey]
 	receiptCount := len(s.secretReceipts)
 	s.mu.Unlock()
 	if !liveRetained {
-		t.Fatal("compaction evicted the live sealed receipt")
+		t.Fatal("compaction evicted the live sealed receipt because it was the oldest journal record (recency-only trimming)")
 	}
-	if receiptCount > secretReceiptsMaxEntries {
-		t.Fatalf("receipts after compaction = %d, want <= %d", receiptCount, secretReceiptsMaxEntries)
+	if receiptCount > secretReceiptsMaxEntries+1 {
+		t.Fatalf("receipts after compaction = %d, want the cap plus at most the live overshoot", receiptCount)
 	}
 
 	// Restart on the same data dir. The broker is armed to fail: a replay
